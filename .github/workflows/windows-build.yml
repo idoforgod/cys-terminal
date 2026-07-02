@@ -276,7 +276,7 @@ jobs:
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
           if (-not $inst) { throw "T4: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName; $cys = Join-Path $dir 'cys.exe'; $cysd = $inst.FullName
-          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           if (-not $setup) { throw "T4: setup.exe 미발견" }
 
           # ① 데몬 기동 + PID 기록 + 라이브 세션(role=master 셸) 생성
