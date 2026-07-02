@@ -106,14 +106,17 @@
       무해하며, accepted는 팩 전체 교체·재설치를 **견뎌야 하는** anti-replay 기준선이라
       pack_dir 밖(parent)에 두는 현행 배치가 의도적 설계다 — pack_dir 내 병합 시 재설치가
       기준선을 소실시킨다).
-      **self-heal 규정(v5 강화 — R4 codex major 결착)**: 검증 통과 manifest에 대해
-      ①manifest 튜플(base, channel, pro_revision) == `.pack-state.json` 튜플 ②state.base ==
-      `.pack-version` ③**설치된 디스크 트리 해시 == manifest.files 전항 일치**(기존
-      verify_files는 staging만 검증 — 디스크 대조가 필수) ④signed_at > accepted.signed_at —
-      **4조건 전부** 충족 시에만 파일 반영 없이 accepted 갱신. ③ 불일치 = typed
-      "same-version content mismatch" 거부(동일 버전 재서명 콘텐츠 드리프트를 기준선에
-      기록하는 것 차단) → 새 pro_revision 발급 또는 repair 요구. 회귀 테스트: 동일
-      버전·동일 pro_revision·더 새 signed_at·다른 파일 해시 번들.
+      **self-heal 규정(v5 강화 — R4 codex major 결착 · T1 구현 정밀화)**: 검증 통과 manifest에
+      대해 ①manifest 튜플(base, channel, pro_revision) == `.pack-state.json` 튜플 ②state.base ==
+      `.pack-version` ③**적용된 콘텐츠 == manifest.files** — 판정 기준은 라이브 디스크가 아니라
+      `.install-manifest.json`(설치-당시 해시 = '무엇이 적용됐나'의 SOT) 동치. 라이브 디스크
+      대조는 정당한 사용자 수정 파일(preserve-gate 철학)이 오탐을 만들므로 구현에서 정밀화
+      ④signed_at > accepted.signed_at(1차 게이트가 보장) — **4조건 전부** 충족 시에만 파일
+      반영 없이 accepted 갱신. ③ 불일치 = **self-heal 거부**(accepted 미갱신 = 드리프트 은닉
+      없음) + loud typed 진단("same-version-content-mismatch" — 재서명 드리프트면 새
+      pro_revision 필요). 명령 자체는 UpToDate no-op 성공 — 무해 케이스(구설치본·동일 버전
+      재제안)를 에러로 만들지 않는다. 회귀 테스트: 동일 버전·동일 pro_revision·더 새
+      signed_at·다른 파일 해시 번들.
       **락 규칙(v6 — R5 codex minor)**: self-heal의 state/accepted 판독 → 디스크 트리
       해시 대조 → accepted 갱신은 pack-update apply lock **보유 중** 수행(경합 감지 시
       typed abort·재시도) — 대조 중 파일 변경 경합 차단.

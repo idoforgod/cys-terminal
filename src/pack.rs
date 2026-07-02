@@ -115,6 +115,153 @@ fn setup_isolated_config_dir() {
 const INSTALL_MANIFEST: &str = ".install-manifest.json";
 const PACK_VERSION_FILE: &str = ".pack-version";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// free/pro 채널 상태 계약 (DESIGN-free-pro-distribution.md v6 §3·§5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 디스크 측 채널·튜플 SOT — pack_dir/.pack-state.json. `.pack-version`(최종 커밋 마커)과
+/// 별개 파일이되, 트랜잭션 journal 편입 + 정합 검사(base_version ↔ .pack-version)로
+/// 원자성을 보장한다(v4 — agy 병합안 변형 수용: 검증된 복구 기계 보존).
+pub const PACK_STATE_FILE: &str = ".pack-state.json";
+
+/// post-commit accepted 기록 실패 시 전용 경고 exit code(v5 §3 — EXIT_REINJECT_DEGRADED 동형:
+/// 디스크 반영은 성공이라 롤백하지 않되 성공으로 침묵 포장하지 않는 구분 신호).
+pub const EXIT_ACCEPTED_DEGRADED: i32 = 4;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PackState {
+    /// "free" | "pro" 단 둘. 미지 값 = 손상 취급(보존 방향).
+    #[serde(default = "crate::packsig::default_channel")]
+    pub channel: String,
+    /// 이 팩의 base semver — `.pack-version`과 일치해야 정상(불일치 = 손상 간주·§3 정합 검사).
+    #[serde(default)]
+    pub base_version: String,
+    /// pro 채널 단조 증분(free = 0).
+    #[serde(default)]
+    pub pro_revision: u32,
+}
+
+/// 상태 판독 3상 — 부재(구 설치 = free/0 자연 마이그레이션) / 정상 / 손상(보존 방향).
+#[derive(Debug)]
+pub enum PackStateRead {
+    Absent,
+    Valid(PackState),
+    /// 파싱 불가·미지 channel 값 — pro 간주(보존: 무음 파괴 차단이 최우선) + loud 진단 대상.
+    Corrupt(String),
+}
+
+pub fn read_pack_state(dir: &Path) -> PackStateRead {
+    let path = dir.join(PACK_STATE_FILE);
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PackStateRead::Absent,
+        Err(e) => return PackStateRead::Corrupt(format!("읽기 실패: {e}")),
+    };
+    match serde_json::from_str::<PackState>(&s) {
+        Ok(st) if st.channel == "free" || st.channel == "pro" => PackStateRead::Valid(st),
+        Ok(st) => PackStateRead::Corrupt(format!("미지 channel 값: {}", st.channel)),
+        Err(e) => PackStateRead::Corrupt(format!("파싱 실패: {e}")),
+    }
+}
+
+pub fn write_pack_state(dir: &Path, st: &PackState) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(st).map_err(|e| format!("state 직렬화 실패: {e}"))?;
+    write_atomic(&dir.join(PACK_STATE_FILE), &json)
+        .map_err(|e| format!("state 기록 실패: {e}"))
+}
+
+/// 무중단 채널 반영 판정의 튜플 확장(v6 §3): (base semver, pro_revision) 튜플로 strictly-newer.
+/// fail-CLOSED — 어느 한쪽 base 파싱 실패 = false(반영 거부). free 경로는 rev=0 동치 무회귀.
+pub fn remote_is_newer_tuple(remote: (&str, u32), disk: (&str, u32)) -> bool {
+    match (parse_semver(remote.0), parse_semver(disk.0)) {
+        (Some(r), Some(d)) => (r, remote.1) > (d, disk.1),
+        _ => false,
+    }
+}
+
+/// pro 전용 파일 실재 증거(v6 §5 음성 증거 검사의 ②축): install-manifest에 기록된 설치 파일 중
+/// 임베드 트리(PACK_ALL)에 없는 것이 있으면 pro overlay 실재로 본다. (판독 실패 = 증거 없음 —
+/// ①축 accepted.channel이 1차 권위라 이 축은 보조 휴리스틱이다.)
+pub fn pro_file_evidence(dir: &Path) -> bool {
+    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
+        return false;
+    };
+    let embedded: std::collections::HashSet<&str> = PACK_ALL.iter().map(|(rel, _)| *rel).collect();
+    m.keys().any(|k| !embedded.contains(k.as_str()))
+}
+
+/// 내장(비트랜잭션) install 경로의 채널 가드 + 제한적 자가치유(v6 §5).
+/// 반환 Some(사유) = 내장 install 전체 생략(쓰기 0 + prune 0 — 보존). None = 진행.
+fn channel_guard_and_heal(dir: &Path) -> Option<String> {
+    match read_pack_state(dir) {
+        PackStateRead::Absent => None, // 부재 = free/0 (구 설치 자연 마이그레이션)
+        PackStateRead::Corrupt(e) => Some(format!(
+            "PACK_CHANNEL_PRESERVED ⚠ .pack-state.json 손상({e}) → 보존 모드(pro 간주)·내장 팩 미반영. \
+             복구: cys pack-repair-channel"
+        )),
+        PackStateRead::Valid(st) if st.channel == "pro" => Some(
+            "PACK_CHANNEL_PRESERVED channel=pro — 내장 팩 미반영(pro 팩 보존). \
+             free 복귀는 cys pack-downgrade-to-free 전용"
+                .to_string(),
+        ),
+        PackStateRead::Valid(st) => {
+            // channel=free — 정합 검사(state.base ↔ .pack-version).
+            let disk_v = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if st.base_version == disk_v {
+                return None;
+            }
+            // 불일치 — 음성 pro 증거 검사(v6·R5 codex 결착: "정상 JSON이지만 거짓 free" 차단).
+            // ①accepted.channel=pro ②pro 전용 파일 실재 → 자가치유 금지·보존+repair 유도.
+            let accepted = dir
+                .parent()
+                .map(|p| p.join(".pack-accepted.json"))
+                .unwrap_or_else(|| PathBuf::from(".pack-accepted.json"));
+            match crate::packsig::read_accepted_evidence(&accepted) {
+                Ok(Some((channel, _, _))) if channel == "pro" => {
+                    return Some(
+                        "PACK_CHANNEL_PRESERVED state=free이나 accepted 기록=pro(거짓 free 의심) \
+                         → 보존·내장 팩 미반영. 복구: cys pack-repair-channel"
+                            .to_string(),
+                    )
+                }
+                Err(_) => {
+                    // accepted 손상 = 증거 판독 불가 → fail-closed(보존).
+                    return Some(
+                        "PACK_CHANNEL_PRESERVED accepted 기록 손상 — 증거 판독 불가 → 보존. \
+                         복구: cys pack-repair-channel"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+            if pro_file_evidence(dir) {
+                return Some(
+                    "PACK_CHANNEL_PRESERVED state=free이나 pro 전용 파일 실재(거짓 free 의심) \
+                     → 보존·내장 팩 미반영. 복구: cys pack-repair-channel"
+                        .to_string(),
+                );
+            }
+            // 증거 없음 → 제한적 자가치유: base_version만 동기화(loud) 후 진행.
+            let mut healed = st;
+            let old = std::mem::replace(&mut healed.base_version, disk_v);
+            healed.pro_revision = 0;
+            match write_pack_state(dir, &healed) {
+                Ok(()) => eprintln!(
+                    "[init-pack] state 자가치유: base {old:?} → {:?} (channel=free·pro 증거 없음)",
+                    healed.base_version
+                ),
+                Err(e) => eprintln!("[init-pack] ⚠ state 자가치유 기록 실패(다음 기동 재시도): {e}"),
+            }
+            None
+        }
+    }
+}
+
 /// semver(major.minor.patch) 비교 — a > b. 'v' 접두·prerelease/build suffix('-rc','+build') 분리,
 /// major 결측·비숫자는 파싱 실패로 본다. ★fail-CLOSED: 디스크 버전(a) 파싱 실패 시 보수적으로
 /// true(=다운그레이드로 간주, 보존)를 반환해 사일런트 회귀를 막는다(0 폴백의 fail-OPEN 방지).
@@ -250,6 +397,15 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
     let items: Vec<(&str, &str)> = items.into_iter().collect();
     let dir = pack_dir();
+    // ★채널 가드(v6 §5 — 내장/비트랜잭션 경로만): state=pro·손상이면 쓰기+prune **전체 생략**
+    // (내장 free 팩이 pro 팩을 파괴하는 R1 실증 재앙 차단). pack-update(transactional=true)는
+    // 자체 채널·버전 게이트를 통과한 서명 팩이므로 이 가드를 타지 않는다.
+    if !transactional {
+        if let Some(reason) = channel_guard_and_heal(&dir) {
+            println!("[init-pack] {reason}");
+            return Ok((0, 0));
+        }
+    }
     let manifest_path = dir.join(INSTALL_MANIFEST);
     let mut manifest: std::collections::BTreeMap<String, String> = std::fs::read_to_string(
         &manifest_path,
@@ -387,10 +543,30 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         }
     }
     // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(target_version으로 갱신).
-    // ★pack-update 트랜잭션(transactional=true)은 여기서 쓰지 않는다 — record_accepted
-    // 성공 후 apply_pack_transactional이 마지막 hard commit marker로 직접(검사) 기록한다.
+    // ★pack-update 트랜잭션(transactional=true)은 여기서 쓰지 않는다 — apply_pack_transactional이
+    // 마지막 hard commit marker로 직접(검사) 기록한다.
+    // v5 checked 쓰기 순서(R4 codex 결착 — 구 best-effort는 state 동기와 결합 시 불일치 유발):
+    // `.pack-version` checked 먼저(실패 = loud + state 미갱신 = 불일치 미생성) → 성공 후에만
+    // `.pack-state.json` 동기(존재 시 {free, target, 0} — v4 자체 발견: 오탐 동결 차단).
     if !transactional {
-        let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
+        match write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
+            Ok(()) => {
+                if let PackStateRead::Valid(mut st) = read_pack_state(&dir) {
+                    if st.channel == "free" && st.base_version != target_version {
+                        st.base_version = target_version.to_string();
+                        st.pro_revision = 0;
+                        if let Err(e) = write_pack_state(&dir, &st) {
+                            eprintln!(
+                                "[init-pack] ⚠ .pack-state.json 동기 실패(다음 기동 자가치유로 수렴): {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "[init-pack] ⚠ .pack-version 기록 실패 — state 미갱신(불일치 미생성): {e}"
+            ),
+        }
     }
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
@@ -569,16 +745,21 @@ pub fn recover_pack_journal() -> Result<bool, String> {
     Ok(true)
 }
 
-/// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b). 호출 전제: apply-lock 보유(writer 배타).
-/// 순서: ⓪orphan 저널 자가치유 → ①backup journal(변경·삭제 대상 전체 기존 bytes fsync) →
-/// ②install_from_iter(파일 반영, `.pack-version` 미기록) → ③commit_extra(record_accepted 등 필수
-/// 단계) → ④`.pack-version` = 마지막 hard commit marker(write_atomic + 결과 검사) → ⑤저널 삭제.
-/// 어느 단계든 실패 시 rollback(pre-state 복원)·`.pack-version` 미기록·Err 반환(부분적용 0).
+/// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b + free/pro v4 §3 상태 계약). 호출 전제:
+/// apply-lock 보유(writer 배타).
+/// 순서: ⓪orphan 저널 자가치유 → ①backup journal(변경·삭제 대상 + `.pack-state.json` 포함) →
+/// ②install_from_iter(파일 반영, `.pack-version` 미기록) → ③`.pack-state.json` 기록(journal
+/// 편입 — 실패 시 rollback) → ④`.pack-version` = 마지막 hard commit marker(결과 검사) →
+/// ⑤post_commit(record_accepted — ★커밋 **이후**: R3 codex blocking 결착. 실패해도 rollback
+/// 없음 — 낡은 accepted는 안전 방향(버전 게이트·신선도 창이 방어)이며 self-heal이 수렴.
+/// loud + 반환 bool로 구분 보고) → ⑥저널 삭제.
+/// ③까지 실패 시 rollback(pre-state 복원·부분적용 0). 반환: (written, kept, post_commit_ok).
 pub fn apply_pack_transactional<F>(
     items: &[(&str, &str)],
     target_version: &str,
-    commit_extra: F,
-) -> Result<(usize, usize), String>
+    state: &PackState,
+    post_commit: F,
+) -> Result<(usize, usize, bool), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
@@ -586,7 +767,7 @@ where
     recover_pack_journal()?;
     let dir = pack_dir();
     // ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
-    //    ∪ .install-manifest.json 자체. install_from_iter가 생성·덮어쓰기·삭제할 수 있는 전부.
+    //    ∪ .install-manifest.json ∪ .pack-state.json(v4 — rollback이 state도 pre-state로 복원).
     let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (rel, _) in items {
         backup_set.insert((*rel).to_string());
@@ -599,6 +780,7 @@ where
         }
     }
     backup_set.insert(INSTALL_MANIFEST.to_string());
+    backup_set.insert(PACK_STATE_FILE.to_string());
     write_journal(target_version, &backup_set)?;
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
@@ -610,19 +792,30 @@ where
                 return Err(format!("파일 반영 실패(rollback 완료): {e}"));
             }
         };
-    // ③ 필수 commit 단계(record_accepted 등) — 실패 시 rollback(best-effort 흡수 금지·R2CODE #2).
-    if let Err(e) = commit_extra() {
+    // ③ `.pack-state.json` 기록 — journal 백업 대상이므로 실패 시 rollback으로 전체 복원.
+    if let Err(e) = write_pack_state(&dir, state) {
         let _ = rollback_journal();
-        return Err(format!("commit 단계 실패(rollback 완료): {e}"));
+        return Err(format!("state 기록 실패(rollback 완료): {e}"));
     }
     // ④ .pack-version = 마지막 hard commit marker(결과 검사 — best-effort 금지).
     if let Err(e) = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
         let _ = rollback_journal();
         return Err(format!(".pack-version 커밋 실패(rollback 완료): {e}"));
     }
-    // ⑤ 커밋 성공 → 저널 삭제.
+    // ⑤ post-commit(record_accepted) — 커밋은 이미 유효. 실패 = loud + false 반환(침묵 포장 금지).
+    let post_commit_ok = match post_commit() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "[pack-update] ⚠ post-commit accepted 기록 실패 — 디스크 반영은 성공(롤백 없음). \
+                 replay 기준선이 낡음(안전 방향) → 다음 pack-update self-heal이 수렴: {e}"
+            );
+            false
+        }
+    };
+    // ⑥ 커밋 성공 → 저널 삭제.
     let _ = std::fs::remove_dir_all(pack_journal_dir());
-    Ok((written, kept))
+    Ok((written, kept, post_commit_ok))
 }
 
 pub fn role_directive_path(role: &str) -> Option<PathBuf> {
@@ -1214,6 +1407,15 @@ mod tests {
 
     /// pre-state(.pack-version·soul.md·.install-manifest)를 base/pack에 깔고 env를 세팅한다.
     /// 반환: (base, pd). 정리는 호출처가 remove_dir_all(base).
+    /// 트랜잭션 테스트 공용 free 상태(v6 §3 — 시그니처 확장에 따른 헬퍼).
+    fn test_free_state(base: &str) -> PackState {
+        PackState {
+            channel: "free".to_string(),
+            base_version: base.to_string(),
+            pro_revision: 0,
+        }
+    }
+
     fn txn_prestate(tag: &str, files: &[(&str, &str)], version: &str) -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("cys-journal-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1264,7 +1466,7 @@ mod tests {
         // soul.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
         let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", || {
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
             Ok(())
         });
@@ -1277,8 +1479,9 @@ mod tests {
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
-        let (w, _k) = res.expect("commit 실패");
-        assert!(committed.get(), "commit_extra(record_accepted) 미호출");
+        let (w, _k, post_ok) = res.expect("commit 실패");
+        assert!(committed.get(), "post_commit(record_accepted) 미호출");
+        assert!(post_ok, "post_commit 성공인데 false 보고");
         assert_eq!(pv.trim(), "2.0.0", ".pack-version commit marker 미기록");
         assert_eq!(soul, "NEW-SOUL", "soul.md 갱신 안됨");
         assert_eq!(newf, "NEW", "new.txt 추가 안됨");
@@ -1302,7 +1505,7 @@ mod tests {
         // 파일이라 create_dir_all 실패) = mid-apply fault.
         let items: Vec<(&str, &str)> =
             vec![("soul.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
-        let res = apply_pack_transactional(&items, "2.0.0", || Ok(()));
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
 
         let post_fp = fingerprint_dir(&pd);
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
@@ -1316,10 +1519,12 @@ mod tests {
         assert_eq!(pre_fp, post_fp, "rollback이 pre-state로 복원 못함(부분적용 잔존)");
     }
 
-    /// record_accepted(commit_extra) 실패 시 이미 쓰여진 파일·prune이 전부 rollback되고
-    /// .pack-version이 기록되지 않는다(best-effort 흡수 금지 — R2CODE #2).
+    /// v4 §3 재배치 핀(R3 codex blocking 결착): record_accepted는 post-commit — 실패해도
+    /// 커밋(파일·state·.pack-version)은 유효하게 남고 rollback하지 않으며, 성공으로 침묵
+    /// 포장하지 않고 post_ok=false로 구분 보고한다. (구 동작: pre-commit이라 실패 시 전체
+    /// rollback → 낡은 accepted가 정품 번들 재시도를 replay 거부하는 crash 교착의 원천이었다.)
     #[test]
-    fn commit_extra_failure_rolls_back() {
+    fn post_commit_failure_keeps_commit_and_reports() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
@@ -1328,25 +1533,26 @@ mod tests {
             &[("soul.md", "OLD-SOUL"), ("stale.txt", "STALE")],
             "1.0.0",
         );
-        let pre_fp = fingerprint_dir(&pd);
 
-        // 파일 반영·prune은 성공하지만 record_accepted가 실패 → 전체 rollback.
+        // 파일 반영·prune·커밋은 성공, post-commit record_accepted만 실패.
         let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
-        let res = apply_pack_transactional(&items, "2.0.0", || Err("record_accepted boom".into()));
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+            Err("record_accepted boom".into())
+        });
 
-        let post_fp = fingerprint_dir(&pd);
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let stale_exists = pd.join("stale.txt").exists();
         let journal_exists = pack_journal_dir().exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
-        assert!(res.is_err(), "record_accepted 실패인데 성공 반환(best-effort 흡수)");
-        assert_eq!(pv.trim(), "1.0.0", ".pack-version 기록되면 안됨");
-        assert!(!journal_exists, "rollback 후 저널 잔존");
-        assert_eq!(
-            pre_fp, post_fp,
-            "record 실패 rollback이 soul.md/new.txt/stale.txt prune까지 복원 못함"
-        );
+        let (_w, _k, post_ok) = res.expect("post-commit 실패가 Err로 승격되면 안됨(커밋은 유효)");
+        assert!(!post_ok, "post_commit 실패인데 true 보고(침묵 포장)");
+        assert_eq!(pv.trim(), "2.0.0", "커밋 마커는 유효해야 함(rollback 금지)");
+        assert_eq!(soul, "NEW-SOUL", "파일 반영은 유지돼야 함");
+        assert!(!stale_exists, "prune 결과도 유지돼야 함");
+        assert!(!journal_exists, "커밋 성공 경로 — 저널 정리돼야 함");
     }
 
     /// orphan 저널 recovery: 디스크 .pack-version != 저널 target(미커밋)이면 rollback으로
@@ -1437,7 +1643,7 @@ mod tests {
 
         let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", || {
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
             Ok(())
         });
@@ -1484,5 +1690,230 @@ mod tests {
         assert!(res.is_ok(), "embed 경로(best-effort)인데 매니페스트 실패로 Err 반환");
         assert!(new_exists, "embed 경로 신규 파일(new.txt) 반영 안됨");
         assert_eq!(pv.trim(), "2.0.0", "embed 경로 .pack-version 기록 안됨(외부 동작 변경)");
+    }
+
+    // ── free/pro 채널 상태 계약(v6 §3·§5) ──────────────────────────────────────
+
+    #[test]
+    fn pack_state_read_three_way() {
+        let base = std::env::temp_dir().join(format!("cys-state3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // 부재 = Absent (구 설치 자연 마이그레이션 = free/0)
+        assert!(matches!(read_pack_state(&base), PackStateRead::Absent));
+        // 정상 free
+        write_pack_state(&base, &test_free_state("1.0.0")).unwrap();
+        assert!(matches!(read_pack_state(&base), PackStateRead::Valid(st) if st.channel == "free"));
+        // 손상(파싱 불가) = Corrupt(보존 방향)
+        std::fs::write(base.join(PACK_STATE_FILE), b"{garbage").unwrap();
+        assert!(matches!(read_pack_state(&base), PackStateRead::Corrupt(_)));
+        // 미지 channel 값 = Corrupt(fail-closed)
+        std::fs::write(
+            base.join(PACK_STATE_FILE),
+            br#"{"channel":"enterprise","base_version":"1.0.0","pro_revision":0}"#,
+        )
+        .unwrap();
+        assert!(matches!(read_pack_state(&base), PackStateRead::Corrupt(_)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// v6 §3 튜플 비교기 — 전이 케이스(설계 의무: free→pro/pro.N+1/역행/rebase/fail-closed).
+    #[test]
+    fn remote_is_newer_tuple_transitions() {
+        assert!(remote_is_newer_tuple(("0.8.0", 1), ("0.8.0", 0)), "free→pro 전환");
+        assert!(remote_is_newer_tuple(("0.8.0", 2), ("0.8.0", 1)), "pro.N→pro.N+1 증분");
+        assert!(!remote_is_newer_tuple(("0.8.0", 1), ("0.8.0", 2)), "pro 역행 거부");
+        assert!(remote_is_newer_tuple(("0.9.0", 1), ("0.8.0", 5)), "base rebase(base 우선)");
+        assert!(!remote_is_newer_tuple(("0.8.0", 1), ("0.8.0", 1)), "동일 튜플 = 반영 아님");
+        assert!(!remote_is_newer_tuple(("garbage", 9), ("0.8.0", 0)), "파싱 실패 fail-closed");
+        // 기존 free 경로 무회귀(rev 0 동치).
+        assert!(remote_is_newer_tuple(("0.4.2", 0), ("0.4.1", 0)));
+        assert!(!remote_is_newer_tuple(("0.4.1", 0), ("0.4.1", 0)));
+    }
+
+    /// ★회귀 핀(v6 §5 의무): 앱 업데이트(내장 install 신버전)가 marker=pro 설치에서
+    /// **쓰기 0 + prune 0** — pro 전용 파일 전수 생존.
+    #[test]
+    fn embed_guard_pro_state_preserves_pro_files() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate(
+            "proguard",
+            &[("soul.md", "OLD-SOUL"), ("pro-only/skill.md", "PRO-SKILL")],
+            "1.0.0",
+        );
+        write_pack_state(
+            &pd,
+            &PackState { channel: "pro".into(), base_version: "1.0.0".into(), pro_revision: 1 },
+        )
+        .unwrap();
+
+        // 내장 install 시뮬레이션: 신버전 2.0.0, items에 pro-only 파일 부재(=구현 전이라면 prune 대상).
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let st_after = read_pack_state(&pd);
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (w, k) = res.expect("가드 경로는 Ok((0,0))이어야 함");
+        assert_eq!((w, k), (0, 0), "marker=pro인데 내장 install이 뭔가를 썼다");
+        assert_eq!(pro_file, "PRO-SKILL", "★pro 전용 파일이 prune됨(R1 재앙 재현)");
+        assert_eq!(soul, "OLD-SOUL", "pro 팩 파일이 내장본으로 덮임");
+        assert_eq!(pv.trim(), "1.0.0", ".pack-version이 변경됨(가드 위반)");
+        assert!(
+            matches!(st_after, PackStateRead::Valid(st) if st.channel == "pro" && st.pro_revision == 1),
+            "state가 변경됨(가드 위반)"
+        );
+    }
+
+    /// 손상 state = 보존 모드(pro 간주) — 내장 install 전체 생략(v6 §5 fail-closed 방향).
+    #[test]
+    fn embed_guard_corrupt_state_preserves() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate("corruptguard", &[("soul.md", "OLD")], "1.0.0");
+        std::fs::write(pd.join(PACK_STATE_FILE), b"{not json").unwrap();
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(res.expect("가드 경로 Ok"), (0, 0));
+        assert_eq!(soul, "OLD", "손상 state인데 파일이 변경됨(보존 위반)");
+    }
+
+    /// channel=free 정합 불일치 + 음성 pro 증거 없음 → 제한적 자가치유 후 install 진행(v6 §5).
+    #[test]
+    fn embed_free_mismatch_heals_without_evidence() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        // install-manifest 키는 임베드 트리에 실재하는 rel만(soul.md) — pro 파일 증거 없음.
+        let (base, pd) = txn_prestate("healok", &[("soul.md", "OLD")], "1.0.0");
+        write_pack_state(&pd, &test_free_state("0.9.0")).unwrap(); // base 불일치(0.9.0 ≠ 1.0.0)
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let st_after = read_pack_state(&pd);
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (w, _k) = res.expect("자가치유 후 install 진행돼야 함");
+        assert!(w >= 1, "install이 진행되지 않음(자가치유 미발동?)");
+        assert_eq!(soul, "NEW", "비수정 파일 자동 갱신 안됨");
+        // checked 쓰기 순서: .pack-version(2.0.0) 성공 후 state 동기까지 수렴.
+        assert!(
+            matches!(st_after, PackStateRead::Valid(st) if st.channel == "free" && st.base_version == "2.0.0"),
+            "state 동기 갱신 실패"
+        );
+    }
+
+    /// v6 음성 증거 ①: state=free이나 accepted 기록=pro(거짓 free) → 자가치유 금지·보존.
+    /// (R5 codex major 회귀 핀: pro 설치에서 state만 valid free로 오염 → prune 미수행)
+    #[test]
+    fn embed_free_mismatch_with_accepted_pro_preserved() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate(
+            "falsefree",
+            &[("soul.md", "OLD"), ("pro-only/skill.md", "PRO")],
+            "1.0.0",
+        );
+        write_pack_state(&pd, &test_free_state("0.9.0")).unwrap(); // 거짓 free + 불일치
+        // parent(.pack-accepted.json)에 pro 수용 이력.
+        std::fs::write(
+            base.join(".pack-accepted.json"),
+            br#"{"pack_version":"1.0.0","signed_at":1000,"channel":"pro","pro_revision":1}"#,
+        )
+        .unwrap();
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(res.expect("보존 경로 Ok"), (0, 0), "거짓 free인데 install 진행됨");
+        assert_eq!(pro_file, "PRO", "★거짓 free 자가치유가 pro 파일을 prune(R5 재앙 재현)");
+        assert_eq!(soul, "OLD", "거짓 free인데 파일 덮임");
+    }
+
+    /// v6 음성 증거 ②: accepted 부재여도 pro 전용 파일 실재(임베드 외 설치 기록) → 자가치유 금지.
+    #[test]
+    fn embed_free_mismatch_with_pro_file_evidence_preserved() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        // install-manifest에 임베드 트리 밖 rel(pro-only/skill.md) = pro 파일 증거.
+        let (base, pd) = txn_prestate(
+            "proevidence",
+            &[("soul.md", "OLD"), ("pro-only/skill.md", "PRO")],
+            "1.0.0",
+        );
+        write_pack_state(&pd, &test_free_state("0.9.0")).unwrap();
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(res.expect("보존 경로 Ok"), (0, 0));
+        assert_eq!(pro_file, "PRO", "pro 파일 증거 무시하고 진행됨");
+    }
+
+    /// v5 checked 쓰기 순서 fault-injection: `.pack-version` 쓰기 실패(경로가 디렉터리) 시
+    /// loud 처리 + state 미생성(불일치 미생성) + install 자체는 Ok(기존 best-effort 외부 동작).
+    #[test]
+    fn embed_version_write_failure_creates_no_state_mismatch() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let base = std::env::temp_dir().join(format!("cys-vfault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::env::set_var(ENV_PACK_DIR, &pd);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg"));
+        // .pack-version 경로를 디렉터리로 만들어 write_atomic(rename) 실패 주입.
+        std::fs::create_dir_all(pd.join(PACK_VERSION_FILE).join("child")).unwrap();
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let state_exists = pd.join(PACK_STATE_FILE).exists();
+        let soul_exists = pd.join("soul.md").exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_ok(), "version 쓰기 실패는 loud 경고일 뿐 Err 아님(기존 외부 동작)");
+        assert!(soul_exists, "파일 반영 자체는 수행돼야 함");
+        assert!(!state_exists, "version 실패인데 state가 생성됨(불일치 생성 = v5 위반)");
+    }
+
+    /// write_pack_state 실패(경로가 디렉터리)가 Err로 표면화됨을 핀 — 내장 경로의 state 동기
+    /// 실패 loud 분기(Err 수신)가 실재 오류를 받는다는 보장.
+    #[test]
+    fn write_pack_state_failure_is_reported() {
+        let base = std::env::temp_dir().join(format!("cys-sfault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(PACK_STATE_FILE).join("child")).unwrap();
+        assert!(write_pack_state(&base, &test_free_state("1.0.0")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

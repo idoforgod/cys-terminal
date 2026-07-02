@@ -50,16 +50,33 @@ pub struct PackManifest {
     pub signed_at: i64,
     /// 서명 만료 시각(Unix epoch 초).
     pub expires_at: i64,
+    /// 배포 채널(free/pro 이원 배포 v6 §3) — "free"(기본 = 구 manifest 하위호환) | "pro".
+    /// 그 외 값은 검증 ⓐ-2에서 거부(fail-closed).
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    /// pro 채널 단조 증분(base semver 동일 시의 증분 배포 축). free = 0 동치.
+    #[serde(default)]
+    pub pro_revision: u32,
     /// rel → sha256(파일 바이트). pack.rs content_hash와 동일 산식.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
 }
 
+pub(crate) fn default_channel() -> String {
+    "free".to_string()
+}
+
 /// 마지막으로 수용한 팩 기록(~/.cys/.pack-accepted.json) — replay 단조 게이트의 기준선.
+/// channel·pro_revision은 #[serde(default)] = 구 포맷 파일이 free/0으로 판독(v4 §3 마이그레이션
+/// 명세 — 미지 필드 무시·구 파일 하위호환).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AcceptedPack {
     pack_version: String,
     signed_at: i64,
+    #[serde(default = "default_channel")]
+    channel: String,
+    #[serde(default)]
+    pro_revision: u32,
 }
 
 /// embed 키링(TRUSTED_KEYS_JSON) 파싱 — 프로덕션 검증 경로(verify_manifest)와 P4 `cys pack-update`가
@@ -91,6 +108,19 @@ pub fn verify_with_keyring(
     // ⓐ JSON 파싱 — 필수 필드(key_id/signed_at/expires_at) 부재 = 거부.
     let m: PackManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|e| format!("manifest 파싱 실패(필수 필드 부재 포함): {e}"))?;
+
+    // ⓐ-2 채널 검증(v6 §3): channel은 free|pro 단 둘 — 미지 값 거부(fail-closed).
+    //     channel=pro는 min_binary_version **필수·파싱 가능**(version_gates 이전 거부 —
+    //     구 바이너리 × 신 pro 팩 호환 파손 차단, R1 누락 보강 + R3 codex minor).
+    if m.channel != "free" && m.channel != "pro" {
+        return Err(format!("미지 channel: {} (free|pro만 유효)", m.channel));
+    }
+    if m.channel == "pro" && crate::pack::parse_semver(&m.min_binary_version).is_none() {
+        return Err(format!(
+            "channel=pro manifest는 min_binary_version 필수(비어있음/파싱불가: {:?})",
+            m.min_binary_version
+        ));
+    }
 
     // ⓑ 키링 대조 — 폐기/미지/만료/not_after 부재 = 거부.
     if keyring.revoked_key_ids.iter().any(|k| k == &m.key_id) {
@@ -142,15 +172,19 @@ pub fn verify_with_keyring(
                 m.signed_at, acc.signed_at
             ));
         }
-        // 보조 단조: pack_version도 수용본보다 높아야 한다(둘 다 파싱 가능할 때).
+        // 보조 단조(v6 §3 튜플 확장): (base semver, pro_revision) 튜플이 수용본보다 **strictly
+        // 낮으면** replay 거부. ★동일 튜플은 통과시킨다 — 1차 게이트가 signed_at > 수용본을 이미
+        // 보장하므로, 동일 튜플 + 더 새 서명 = self-heal 후보(파일 반영은 version_gates가
+        // UpToDate로 차단하고, accepted 갱신은 디스크 트리 해시 4조건 검사를 통과해야만 한다).
+        // free 경로는 pro_revision=0 동치라 기존 `<=` 거부와 실효 동일(무회귀).
         if let (Some(new_v), Some(acc_v)) = (
             crate::pack::parse_semver(&m.pack_version),
             crate::pack::parse_semver(&acc.pack_version),
         ) {
-            if new_v <= acc_v {
+            if (new_v, m.pro_revision) < (acc_v, acc.pro_revision) {
                 return Err(format!(
-                    "replay 거부: pack_version {} <= 수용본 {}",
-                    m.pack_version, acc.pack_version
+                    "replay 거부: 튜플 {}(pro.{}) < 수용본 {}(pro.{})",
+                    m.pack_version, m.pro_revision, acc.pack_version, acc.pro_revision
                 ));
             }
         }
@@ -159,15 +193,25 @@ pub fn verify_with_keyring(
     Ok(m)
 }
 
-/// 수용 시 {pack_version, signed_at}를 원자 기록(pack::write_atomic). 다음 검증의 replay 기준선.
+/// 수용 시 {pack_version, signed_at, channel, pro_revision}을 원자 기록(pack::write_atomic).
+/// 다음 검증의 replay 기준선 + repair 권위 증거(accepted.channel — v4 §5).
 pub fn record_accepted(accepted_path: &Path, m: &PackManifest) -> Result<(), String> {
     let acc = AcceptedPack {
         pack_version: m.pack_version.clone(),
         signed_at: m.signed_at,
+        channel: m.channel.clone(),
+        pro_revision: m.pro_revision,
     };
     let json = serde_json::to_vec_pretty(&acc).map_err(|e| format!("accepted 직렬화 실패: {e}"))?;
     crate::pack::write_atomic(accepted_path, &json)
         .map_err(|e| format!("accepted 기록 실패 {}: {e}", accepted_path.display()))
+}
+
+/// repair 권위·자가치유 증거 판독(free/pro v4 §5) — accepted 기록의 (channel, pro_revision,
+/// pack_version). 부재 = Ok(None)(순수 free 설치 — pack-update 이력 전무 = pro 증거 없음).
+/// 손상 = Err(fail-closed — 증거 판독 불가는 보존 방향으로 처리하라는 신호).
+pub fn read_accepted_evidence(path: &Path) -> Result<Option<(String, u32, String)>, String> {
+    Ok(read_accepted(path)?.map(|a| (a.channel, a.pro_revision, a.pack_version)))
 }
 
 /// 파일별 sha256 == manifest.files 대조(§7-⑤ post-verify, staging 트리용·P4 호출).
@@ -571,6 +615,8 @@ mod tests {
             key_id: "K".into(),
             signed_at: 0,
             expires_at: 0,
+            channel: default_channel(),
+            pro_revision: 0,
             files,
         };
         assert!(verify_files(&m, &root).is_ok(), "일치인데 거부");
@@ -608,6 +654,8 @@ mod tests {
             key_id: "K".into(),
             signed_at: 0,
             expires_at: 0,
+            channel: default_channel(),
+            pro_revision: 0,
             files,
         };
         assert!(verify_no_extra_files(&m, &root).is_ok(), "동치 집합인데 거부");
@@ -620,5 +668,137 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── free/pro 채널·튜플 replay(v6 §3) ────────────────────────────────────────
+
+    fn manifest_json_pro(
+        key_id: &str,
+        pack_version: &str,
+        pro_revision: u32,
+        signed_at: i64,
+        expires_at: i64,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "pack_version": pack_version,
+            "min_binary_version": "0.4.1",
+            "key_id": key_id,
+            "signed_at": signed_at,
+            "expires_at": expires_at,
+            "channel": "pro",
+            "pro_revision": pro_revision,
+            "files": {}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// R1 실증 결함의 교정 핀: 동일 base의 pro 증분(pro.1→pro.2)이 replay 게이트를 통과하고,
+    /// pro 역행은 거부되며, ★동일 튜플 + 더 새 서명은 통과한다(self-heal 후보 — v4 §3).
+    #[test]
+    fn replay_tuple_pro_increment_passes_regression_rejected() {
+        let (pk, sign) = gen_key_and_signer();
+        let kr = keyring_with("K1", &pk, "2099-01-01T00:00:00Z", &[]);
+        let acc = tmp_accepted("protuple");
+        let _ = std::fs::remove_file(&acc);
+        // 수용 기준선: 0.8.0 pro.1 (signed 1000).
+        std::fs::write(
+            &acc,
+            br#"{"pack_version":"0.8.0","signed_at":1000,"channel":"pro","pro_revision":1}"#,
+        )
+        .unwrap();
+
+        // pro.2 (signed 2000) → 통과 (구현 전: parse_semver 접미 절단으로 replay 거부되던 경로).
+        let m2 = manifest_json_pro("K1", "0.8.0", 2, 2000, 9_000_000_000);
+        let s2 = sign(&m2);
+        verify_with_keyring(&m2, s2.as_bytes(), 5000, &acc, &kr).expect("pro.2 증분이 거부됨");
+
+        // pro 역행(pro.0, signed 3000) → 튜플 strictly-less = 거부.
+        let m0 = manifest_json_pro("K1", "0.8.0", 0, 3000, 9_000_000_000);
+        let s0 = sign(&m0);
+        assert!(
+            verify_with_keyring(&m0, s0.as_bytes(), 5000, &acc, &kr).is_err(),
+            "pro 역행인데 통과"
+        );
+
+        // 동일 튜플(pro.1) + 더 새 서명(signed 4000) → 통과(self-heal 후보 핀).
+        let m1 = manifest_json_pro("K1", "0.8.0", 1, 4000, 9_000_000_000);
+        let s1 = sign(&m1);
+        verify_with_keyring(&m1, s1.as_bytes(), 5000, &acc, &kr)
+            .expect("동일 튜플·신서명(self-heal 후보)이 거부됨");
+
+        // 동일 튜플 + 같은/낡은 서명(signed 1000) → 1차 게이트가 replay 거부.
+        let mr = manifest_json_pro("K1", "0.8.0", 1, 1000, 9_000_000_000);
+        let sr = sign(&mr);
+        assert!(
+            verify_with_keyring(&mr, sr.as_bytes(), 5000, &acc, &kr).is_err(),
+            "낡은 서명 replay인데 통과"
+        );
+
+        let _ = std::fs::remove_file(&acc);
+    }
+
+    /// v4 §3 마이그레이션 명세 핀: 구 포맷 accepted({pack_version, signed_at}만)는
+    /// channel=free·pro_revision=0으로 판독되고(read_accepted_evidence 포함) 검증이 정상 동작.
+    #[test]
+    fn accepted_old_format_reads_as_free_zero() {
+        let (pk, sign) = gen_key_and_signer();
+        let kr = keyring_with("K1", &pk, "2099-01-01T00:00:00Z", &[]);
+        let acc = tmp_accepted("oldfmt");
+        std::fs::write(&acc, br#"{"pack_version":"1.0.0","signed_at":1000}"#).unwrap();
+
+        let ev = read_accepted_evidence(&acc).expect("구 포맷 판독 실패");
+        assert_eq!(ev, Some(("free".to_string(), 0, "1.0.0".to_string())));
+
+        // 신버전 free 번들(1.1.0, rev 0, signed 2000) 검증 정상 통과(무회귀).
+        let m = manifest_json("K1", "1.1.0", 2000, 9_000_000_000);
+        let s = sign(&m);
+        verify_with_keyring(&m, s.as_bytes(), 5000, &acc, &kr).expect("구 포맷 기준선 위 신버전 거부됨");
+
+        let _ = std::fs::remove_file(&acc);
+    }
+
+    /// v6 ⓐ-2 핀: channel=pro는 min_binary_version 필수(비어있음 = 거부), 미지 channel = 거부.
+    #[test]
+    fn pro_manifest_requires_min_binary_and_known_channel() {
+        let (pk, sign) = gen_key_and_signer();
+        let kr = keyring_with("K1", &pk, "2099-01-01T00:00:00Z", &[]);
+        let acc = tmp_accepted("chanvalid");
+        let _ = std::fs::remove_file(&acc);
+
+        // channel=pro + min_binary 빈 값 → 거부.
+        let m = serde_json::json!({
+            "pack_version": "0.8.0", "min_binary_version": "", "key_id": "K1",
+            "signed_at": 1000, "expires_at": 9_000_000_000i64,
+            "channel": "pro", "pro_revision": 1, "files": {}
+        })
+        .to_string()
+        .into_bytes();
+        let s = sign(&m);
+        assert!(
+            verify_with_keyring(&m, s.as_bytes(), 5000, &acc, &kr).is_err(),
+            "pro + 빈 min_binary인데 통과"
+        );
+
+        // 미지 channel → 거부.
+        let m2 = serde_json::json!({
+            "pack_version": "0.8.0", "min_binary_version": "0.4.1", "key_id": "K1",
+            "signed_at": 1000, "expires_at": 9_000_000_000i64,
+            "channel": "enterprise", "pro_revision": 0, "files": {}
+        })
+        .to_string()
+        .into_bytes();
+        let s2 = sign(&m2);
+        assert!(
+            verify_with_keyring(&m2, s2.as_bytes(), 5000, &acc, &kr).is_err(),
+            "미지 channel인데 통과"
+        );
+
+        // 구 포맷(channel 필드 자체 부재) = free 기본 → 통과(하위호환 무회귀).
+        let m3 = manifest_json("K1", "1.0.0", 1000, 9_000_000_000);
+        let s3 = sign(&m3);
+        verify_with_keyring(&m3, s3.as_bytes(), 5000, &acc, &kr).expect("구 포맷 manifest 거부됨");
+
+        let _ = std::fs::remove_file(&acc);
     }
 }

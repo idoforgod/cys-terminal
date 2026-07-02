@@ -336,6 +336,29 @@ enum Command {
         #[command(subcommand)]
         action: LicenseAction,
     },
+    /// pro 팩 설치를 free(내장 팩)로 강등 — 유일한 pro→free 경로 (license-aware·v3 §5)
+    #[command(name = "pack-downgrade-to-free")]
+    PackDowngradeToFree {
+        /// 실제 실행(생략 시 현재 상태·계획만 출력)
+        #[arg(long)]
+        yes: bool,
+        /// 유효 pro 라이선스가 실재해도 강행(기본 거부 — pro 앱 기능 ↔ free 팩 불일치 방지)
+        #[arg(long)]
+        override_valid_license: bool,
+    },
+    /// .pack-state.json(채널 상태) 진단·복구 — 권위 = accepted 기록 + pro 파일 증거 (v4 §5)
+    #[command(name = "pack-repair-channel")]
+    PackRepairChannel {
+        /// 복구 대상 채널(free|pro). 생략 시 진단만 출력
+        #[arg(long)]
+        to: Option<String>,
+        /// 실제 실행(생략 시 진단만)
+        #[arg(long)]
+        yes: bool,
+        /// 증거 없는 전환 강행(전문가 전용 — loud 경고 동반)
+        #[arg(long)]
+        expert_override: bool,
+    },
     /// 임베드 PACK+PACK_SKILLS에서 권위 manifest(pack-manifest.json)를 stdout JSON으로 방출.
     /// CI(release.yml)가 standalone 팩 manifest의 단일 SOT로 쓴다(임베드 콘텐츠→tree 동일성 게이트).
     #[command(name = "pack-manifest")]
@@ -1451,6 +1474,14 @@ fn run(command: Command) -> i32 {
                     return 0;
                 }
             }
+        }
+
+        Command::PackDowngradeToFree { yes, override_valid_license } => {
+            return run_pack_downgrade_to_free(yes, override_valid_license);
+        }
+
+        Command::PackRepairChannel { to, yes, expert_override } => {
+            return run_pack_repair_channel(to, yes, expert_override);
         }
 
         Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
@@ -4134,12 +4165,19 @@ enum VersionGate {
     BinaryTooOld,
 }
 
-/// 3축 버전 비교(§7-④) — remote→disk 반영 판정(remote_is_newer, fail-CLOSED) ∧ remote→running
+/// 3축 버전 비교(§7-④ + free/pro v6 §3 튜플 확장) — remote→disk 반영 판정
+/// ((base semver, pro_revision) 튜플 strictly-newer, fail-CLOSED) ∧ remote→running
 /// 호환 게이트(min_binary ≤ running). disk→embed 다운그레이드 가드는 install_from_iter가 담당.
-/// min_binary가 빈 문자열이면 제약 없음(manifest #[serde(default)] 호환)으로 본다.
-fn version_gates(remote_pack: &str, disk_pack: &str, min_binary: &str, running: &str) -> VersionGate {
-    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야(파싱 실패=거부=no-op).
-    if !cys::pack::remote_is_newer(remote_pack, disk_pack) {
+/// min_binary가 빈 문자열이면 제약 없음(manifest #[serde(default)] 호환 — 단 channel=pro는
+/// packsig ⓐ-2가 min_binary 필수를 이미 강제해 여기 도달 전 거부된다).
+fn version_gates(
+    remote_pack: (&str, u32),
+    disk_pack: (&str, u32),
+    min_binary: &str,
+    running: &str,
+) -> VersionGate {
+    // 축1 반영 판정: remote 튜플이 디스크 튜플보다 strictly-newer 여야(파싱 실패=거부=no-op).
+    if !cys::pack::remote_is_newer_tuple(remote_pack, disk_pack) {
         return VersionGate::UpToDate;
     }
     // 축2 호환 게이트: min_binary ≤ running. 빈 값=제약 없음. 파싱 실패·초과=거부.
@@ -4460,6 +4498,9 @@ struct PackUpdateOutcome {
     pack_version: String,
     written: usize,
     kept: usize,
+    /// post-commit accepted 기록 성공 여부(v5 §3) — false = 디스크 반영은 성공했으나 replay
+    /// 기준선이 낡음. run_pack_update가 EXIT_ACCEPTED_DEGRADED로 구분 보고(침묵 포장 금지).
+    accepted_recorded: bool,
 }
 
 /// `--from` 핵심 경로(검증+버전게이트+apply). 테스트 가능: keyring/now/running/accepted_path를
@@ -4518,38 +4559,118 @@ fn pack_update_from_dir(
         return Err(format!("staging 트리 커버리지 검증 실패: {e}"));
     }
 
-    // 버전 3축 게이트(§7-④).
-    let disk_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
+    // ─ free/pro 채널·상태 게이트(v6 §3·§5) — 버전 게이트 전에 디스크 상태를 확정한다. ─
+    let pack_dir = cys::pack::pack_dir();
+    let disk_version = std::fs::read_to_string(pack_dir.join(".pack-version"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    let (disk_channel, disk_pro_rev) = match cys::pack::read_pack_state(&pack_dir) {
+        cys::pack::PackStateRead::Absent => ("free".to_string(), 0u32),
+        cys::pack::PackStateRead::Corrupt(e) => {
+            // 손상 상태의 튜플은 신뢰 불가 — typed 거부, repair 선행 요구(v4 §5).
+            return Err(format!(
+                "[pack-state-corrupt] .pack-state.json 손상({e}) — pack-update 거부. \
+                 cys pack-repair-channel 로 복구 후 재시도하라"
+            ));
+        }
+        cys::pack::PackStateRead::Valid(st) => {
+            if st.base_version != disk_version {
+                // 정합 불일치 = 손상 간주(v4 §3). cysd 기동/init-pack의 제한적 자가치유가
+                // 선행 경로 — pack-update는 보수적으로 거부한다.
+                return Err(format!(
+                    "[pack-state-mismatch] state.base {:?} ≠ .pack-version {:?} — pack-update 거부. \
+                     cys init-pack(자가치유) 또는 cys pack-repair-channel 후 재시도하라",
+                    st.base_version, disk_version
+                ));
+            }
+            (st.channel, st.pro_revision)
+        }
+    };
+    // 채널 전이 규칙: pro 설치에 free 번들 = 다운그레이드 시도 — 전용 명령만 허용(v2 §5).
+    if disk_channel == "pro" && manifest.channel == "free" {
+        return Err(
+            "[pack-channel-refused] pro 설치에 free 번들 — pro→free 전환은 \
+             cys pack-downgrade-to-free 전용 명령만 허용된다"
+                .to_string(),
+        );
+    }
+
+    // 버전 3축 게이트(§7-④ · v6 튜플).
     let gate = version_gates(
-        &manifest.pack_version,
-        &disk_version,
+        (&manifest.pack_version, manifest.pro_revision),
+        (&disk_version, disk_pro_rev),
         &manifest.min_binary_version,
         running_binary,
     );
 
     let mut written = 0;
     let mut kept = 0;
+    let mut accepted_recorded = true;
     if gate == VersionGate::Apply && do_apply {
         // 반영: apply-lock 배타 → apply_pack_transactional(backup journal → install_from_iter →
-        // record_accepted[필수] → .pack-version=마지막 hard commit marker → 저널 삭제). 어느 단계든
-        // 실패 시 rollback(pre-state 복원·부분적용 0)·Err. record_accepted는 best-effort가 아니라
-        // commit 필수 단계로 격상돼 실패 시 이 rollback 경로로 떨어진다(R2CODE HIGH #1·MED #2).
+        // .pack-state.json[journal 편입] → .pack-version=마지막 hard commit marker →
+        // ★post-commit record_accepted(v4 — R3 codex blocking 결착: 커밋 이후로 이동. 실패 =
+        // rollback 없음·loud·EXIT_ACCEPTED_DEGRADED 구분 보고·self-heal 수렴) → 저널 삭제.
         let tree = collect_tree(staging)?;
         let pv = manifest.pack_version.clone();
         let manifest_acc = manifest.clone();
         let acc_path = accepted_path.to_path_buf();
+        let new_state = cys::pack::PackState {
+            channel: manifest.channel.clone(),
+            base_version: manifest.pack_version.clone(),
+            pro_revision: manifest.pro_revision,
+        };
         let res = with_apply_lock(lock_path, move || {
             let items: Vec<(&str, &str)> =
                 tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-            cys::pack::apply_pack_transactional(&items, &pv, || {
+            cys::pack::apply_pack_transactional(&items, &pv, &new_state, || {
                 cys::packsig::record_accepted(&acc_path, &manifest_acc)
             })
         })?;
-        let (w, k) = res?;
+        let (w, k, post_ok) = res?;
         written = w;
         kept = k;
+        accepted_recorded = post_ok;
+    } else if gate == VersionGate::UpToDate
+        && do_apply
+        && manifest.channel == disk_channel
+        && manifest.pro_revision == disk_pro_rev
+        && manifest.pack_version == disk_version
+    {
+        // ─ self-heal(v5 §3 — 4조건·apply lock 보유 중): 동일 튜플 + 더 새 서명(1차 게이트가
+        // 이미 보장 — 낡은 signed_at이면 verify가 replay 거부) 번들로 accepted 기준선만 수렴.
+        // 조건③ "적용된 콘텐츠 == manifest.files"의 판정 기준 = `.install-manifest.json`
+        // (설치-당시 해시 기록 = '무엇이 적용됐나'의 SOT). 라이브 디스크 대조는 정당한 사용자
+        // 수정 파일(preserve-gate 철학)이 오탐을 만든다 — 구현 정밀화. 불일치 = **self-heal
+        // 거부**(accepted 미갱신 = 드리프트 은닉 없음·R4 codex 결착) + loud typed 진단.
+        // 명령 자체는 UpToDate no-op 성공(무해 케이스: 구설치본·재제안 번들을 에러로 만들지 않음).
+        let manifest_acc = manifest.clone();
+        let acc_path = accepted_path.to_path_buf();
+        let pd = pack_dir.clone();
+        with_apply_lock(lock_path, move || {
+            let installed: Option<std::collections::BTreeMap<String, String>> =
+                std::fs::read_to_string(pd.join(".install-manifest.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok());
+            match installed {
+                Some(m) if m == manifest_acc.files => {
+                    match cys::packsig::record_accepted(&acc_path, &manifest_acc) {
+                        Ok(()) => eprintln!(
+                            "[pack-update] self-heal: 동일 튜플·적용 콘텐츠 일치 — accepted 기준선 갱신"
+                        ),
+                        Err(e) => eprintln!("[pack-update] ⚠ self-heal accepted 기록 실패: {e}"),
+                    }
+                }
+                Some(_) => eprintln!(
+                    "[pack-update] ⚠ same-version-content-mismatch: 동일 튜플 번들의 파일 해시가 \
+                     설치 기록(.install-manifest.json)과 불일치 — self-heal 거부(기준선 미갱신 = \
+                     드리프트 은닉 없음). 재서명 드리프트면 새 pro_revision 발급이 필요하다."
+                ),
+                None => eprintln!(
+                    "[pack-update] self-heal 생략: 설치 기록 부재(구설치본) — 기준선 미갱신."
+                ),
+            }
+        })?;
     }
 
     Ok(PackUpdateOutcome {
@@ -4557,6 +4678,7 @@ fn pack_update_from_dir(
         pack_version: manifest.pack_version,
         written,
         kept,
+        accepted_recorded,
     })
 }
 
@@ -4566,6 +4688,172 @@ fn pack_state_base() -> std::path::PathBuf {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// `cys pack-downgrade-to-free`(free/pro v3 §5) — 유일한 pro→free 전환 경로. license-aware:
+/// 유효 pro 라이선스 실재 시 기본 거부(--override-valid-license로만 통과). 실행 = state를
+/// free로 전환 후 내장 팩 재설치(prune이 pro 전용 파일 제거 — 의도된 강등 동작).
+fn run_pack_downgrade_to_free(yes: bool, override_valid_license: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let now = chrono::Utc::now().timestamp();
+    let license_line = cys::license::render_status(now);
+    println!("라이선스: {license_line}");
+    let st = match cys::pack::read_pack_state(&dir) {
+        cys::pack::PackStateRead::Absent => {
+            println!("팩 상태: state 부재(=free) — 강등 대상 없음. no-op.");
+            return 0;
+        }
+        cys::pack::PackStateRead::Valid(st) if st.channel == "free" => {
+            println!("팩 상태: 이미 channel=free (base {}) — no-op.", st.base_version);
+            return 0;
+        }
+        cys::pack::PackStateRead::Valid(st) => st,
+        cys::pack::PackStateRead::Corrupt(e) => {
+            eprintln!("팩 상태 손상({e}) — 먼저 cys pack-repair-channel 로 복구하라.");
+            return 1;
+        }
+    };
+    println!(
+        "팩 상태: channel=pro (base {}, pro.{}) — free 강등 시 pro 전용 파일이 제거된다.",
+        st.base_version, st.pro_revision
+    );
+    // license-aware 게이트(R2 양 리뷰어 합의): 유효 pro 라이선스 실재 = 기본 거부.
+    if cys::license::is_pro(now) && !override_valid_license {
+        eprintln!(
+            "거부 — 유효 pro 라이선스가 실재한다(팩만 free로 강등되면 pro 앱 기능과 불일치). \
+             정말 강등하려면 --override-valid-license 를 함께 지정하라."
+        );
+        return 1;
+    }
+    if !yes {
+        println!("계획만 출력했다. 실제 강등은 --yes 를 지정하라.");
+        return 0;
+    }
+    // 실행: state → free(base = 현재 .pack-version, rev 0) → 내장 팩 재설치(prune 포함).
+    let disk_v = std::fs::read_to_string(dir.join(".pack-version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let free_state = cys::pack::PackState {
+        channel: "free".to_string(),
+        base_version: disk_v,
+        pro_revision: 0,
+    };
+    if let Err(e) = cys::pack::write_pack_state(&dir, &free_state) {
+        eprintln!("error: state 전환 실패 — {e}");
+        return 1;
+    }
+    match cys::pack::install(false) {
+        Ok((written, kept)) => {
+            println!("[downgrade] free 전환 완료 — 내장 팩 재설치: {written} written, {kept} preserved.");
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "[downgrade] ⚠ state는 free로 전환됐으나 내장 재설치 실패: {e} — cys init-pack 으로 재시도하라."
+            );
+            1
+        }
+    }
+}
+
+/// `cys pack-repair-channel`(free/pro v4 §5) — 채널 상태 진단·복구. 재기록 권위 =
+/// accepted 기록(서명 검증 이력) + pro 전용 파일 증거. 라이선스는 정보 표시(단독 권위 아님).
+fn run_pack_repair_channel(to: Option<String>, yes: bool, expert_override: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let base = pack_state_base();
+    let now = chrono::Utc::now().timestamp();
+    // ─ 진단 리포트 ─
+    let disk_v = std::fs::read_to_string(dir.join(".pack-version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let state_desc = match cys::pack::read_pack_state(&dir) {
+        cys::pack::PackStateRead::Absent => "부재(=free/0)".to_string(),
+        cys::pack::PackStateRead::Valid(st) => format!(
+            "channel={} base={} pro.{}{}",
+            st.channel,
+            st.base_version,
+            st.pro_revision,
+            if st.base_version == disk_v { "" } else { " ⚠ .pack-version 불일치" }
+        ),
+        cys::pack::PackStateRead::Corrupt(e) => format!("★손상: {e}"),
+    };
+    let accepted_path = base.join(".pack-accepted.json");
+    let accepted = cys::packsig::read_accepted_evidence(&accepted_path);
+    let accepted_desc = match &accepted {
+        Ok(None) => "부재(pack-update 이력 없음)".to_string(),
+        Ok(Some((ch, rev, v))) => format!("channel={ch} {v} pro.{rev}"),
+        Err(e) => format!("★손상: {e}"),
+    };
+    let pro_files = cys::pack::pro_file_evidence(&dir);
+    println!("── pack channel 진단 ──");
+    println!(".pack-version : {disk_v}");
+    println!(".pack-state   : {state_desc}");
+    println!("accepted 기록 : {accepted_desc}");
+    println!("pro 파일 증거 : {}", if pro_files { "있음(임베드 외 설치 파일 실재)" } else { "없음" });
+    println!("라이선스      : {}", cys::license::render_status(now));
+
+    let Some(to) = to else {
+        println!("(진단만 출력 — 복구는 --to free|pro --yes)");
+        return 0;
+    };
+    if to != "free" && to != "pro" {
+        eprintln!("error: --to 는 free|pro 만 유효");
+        return 1;
+    }
+    // ─ 권위 규칙(v4 §5) ─
+    let accepted_pro = matches!(&accepted, Ok(Some((ch, _, _))) if ch == "pro");
+    if to == "pro" && !accepted_pro && !expert_override {
+        eprintln!(
+            "거부 — pro 재기록은 accepted 기록(서명 검증 이력)의 channel=pro 증거가 필요하다. \
+             (순수 free 설치의 pro 자가 마킹 = 내장 갱신 자가 차단 사고 방지) \
+             정말 강행하려면 --expert-override."
+        );
+        return 1;
+    }
+    if to == "free" {
+        if cys::license::is_pro(now) && !expert_override {
+            eprintln!(
+                "거부 — 유효 pro 라이선스 실재 중 free 재기록은 downgrade와 동일한 위험 \
+                 (다음 내장 install이 pro 파일을 prune). 강등은 cys pack-downgrade-to-free, \
+                 강행은 --expert-override."
+            );
+            return 1;
+        }
+        if (accepted_pro || pro_files) && !expert_override {
+            eprintln!(
+                "거부 — pro 증거(accepted={accepted_pro}·pro 파일={pro_files})가 실재한다. \
+                 free 재기록 시 다음 내장 install이 pro 파일을 제거한다. 강행은 --expert-override."
+            );
+            return 1;
+        }
+    }
+    if !yes {
+        println!("(계획만 — 실제 재기록은 --yes)");
+        return 0;
+    }
+    // ─ 재기록: base = 현재 .pack-version(정합 복원), rev = accepted(pro) 또는 0 ─
+    let pro_rev = match &accepted {
+        Ok(Some((ch, rev, _))) if ch == "pro" && to == "pro" => *rev,
+        _ => 0,
+    };
+    if to == "pro" && !accepted_pro {
+        eprintln!("⚠ expert-override: accepted 증거 없는 pro 재기록 — pro_revision=0으로 기록한다.");
+    }
+    let st = cys::pack::PackState {
+        channel: to.clone(),
+        base_version: disk_v,
+        pro_revision: pro_rev,
+    };
+    match cys::pack::write_pack_state(&dir, &st) {
+        Ok(()) => {
+            println!("[repair] 재기록 완료: channel={} base={} pro.{}", st.channel, st.base_version, st.pro_revision);
+            0
+        }
+        Err(e) => {
+            eprintln!("error: 재기록 실패 — {e}");
+            1
+        }
+    }
 }
 
 /// 어댑터 prompt-ready predicate(§7-⑨): ready_marker 정의 어댑터(claude·gemini)는 화면에
@@ -4872,6 +5160,9 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
             "[pack-update] 팩 {} 반영 완료 ({} written, {} preserved). 노드 reinject 점검…",
             outcome.pack_version, outcome.written, outcome.kept
         );
+        // v5 §3: post-commit accepted 실패는 디스크 반영 성공과 구분 보고(침묵 포장 금지) —
+        // 아래 reinject 결과와 무관하게 최종 종료코드를 EXIT_ACCEPTED_DEGRADED로 승격한다.
+        let accepted_degraded = !outcome.accepted_recorded;
 
         // 6) 살아있는 노드 reinject(§7-②) — 베스트에포트(데몬 미가동 시 경고만).
         //    디스크 반영은 이미 성공(commit). reinject 결과는 별도 신호로 전파한다:
@@ -4915,11 +5206,17 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                         rep.failed, outcome.pack_version
                     );
                 }
+                if accepted_degraded {
+                    return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
+                }
                 Ok(reinject_exit_code(rep.failed))
             }
             // 데몬 미가동 등으로 reinject 자체를 못 함 — 디스크 반영은 성공(무중단 정책상 0).
             Err(e) => {
                 eprintln!("[pack-update] reinject 스킵(데몬 점검 필요): {e}");
+                if accepted_degraded {
+                    return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
+                }
                 Ok(0)
             }
         }
@@ -5140,6 +5437,54 @@ mod tests {
         std::fs::write(from_dir.join("pack-manifest.json.minisig"), sig).unwrap();
     }
 
+    /// pro 채널 서명 번들(v6 §3 — channel/pro_revision 포함). build_signed_pack의 pro 변형.
+    #[allow(clippy::too_many_arguments)]
+    fn build_signed_pack_pro(
+        from_dir: &std::path::Path,
+        files: &[(&str, &str)],
+        key_id: &str,
+        pack_version: &str,
+        pro_revision: u32,
+        min_binary: &str,
+        signed_at: i64,
+        expires_at: i64,
+        sign: &impl Fn(&[u8]) -> String,
+    ) {
+        let tree = from_dir.join("tree");
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(&tree).unwrap();
+        let mut files_map = serde_json::Map::new();
+        for (rel, content) in files {
+            let p = tree.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            files_map.insert(rel.to_string(), json!(sha256_of(content.as_bytes())));
+        }
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(from_dir.join("pack.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .expect("tar czf");
+        assert!(status.success(), "tar czf 실패");
+        let manifest = json!({
+            "pack_version": pack_version,
+            "min_binary_version": min_binary,
+            "key_id": key_id,
+            "signed_at": signed_at,
+            "expires_at": expires_at,
+            "channel": "pro",
+            "pro_revision": pro_revision,
+            "files": files_map,
+        });
+        let mbytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(from_dir.join("pack-manifest.json"), &mbytes).unwrap();
+        let sig = sign(&mbytes);
+        std::fs::write(from_dir.join("pack-manifest.json.minisig"), sig).unwrap();
+    }
+
     fn test_keyring(key_id: &str, pubkey: &str) -> cys::packsig::Keyring {
         cys::packsig::Keyring {
             keys: vec![cys::packsig::TrustedKey {
@@ -5186,24 +5531,39 @@ mod tests {
         assert_eq!(v2["min_binary_version"], json!(""), "min_binary_version 기본 빈문자열");
     }
 
-    /// 버전 3축 게이트 — 반영 판정·호환 게이트·빈 min_binary·파싱 실패.
+    /// 버전 3축 게이트 — 반영 판정·호환 게이트·빈 min_binary·파싱 실패 (v6 튜플 확장).
     #[test]
     fn version_gates_three_axes() {
         // remote newer + min_binary ok → Apply
-        assert_eq!(version_gates("1.1.0", "1.0.0", "0.4.1", "1.0.0"), VersionGate::Apply);
+        assert_eq!(version_gates(("1.1.0", 0), ("1.0.0", 0), "0.4.1", "1.0.0"), VersionGate::Apply);
         // remote 같음/낮음 → UpToDate(멱등)
-        assert_eq!(version_gates("1.0.0", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
-        assert_eq!(version_gates("0.9.0", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
+        assert_eq!(version_gates(("1.0.0", 0), ("1.0.0", 0), "", "1.0.0"), VersionGate::UpToDate);
+        assert_eq!(version_gates(("0.9.0", 0), ("1.0.0", 0), "", "1.0.0"), VersionGate::UpToDate);
         // remote 파싱 실패 → UpToDate(fail-CLOSED 반영거부)
-        assert_eq!(version_gates("garbage", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
+        assert_eq!(version_gates(("garbage", 0), ("1.0.0", 0), "", "1.0.0"), VersionGate::UpToDate);
         // min_binary 초과 → BinaryTooOld
-        assert_eq!(version_gates("2.0.0", "1.0.0", "99.0.0", "1.0.0"), VersionGate::BinaryTooOld);
+        assert_eq!(version_gates(("2.0.0", 0), ("1.0.0", 0), "99.0.0", "1.0.0"), VersionGate::BinaryTooOld);
         // min_binary 빈 값 → 제약 없음(Apply)
-        assert_eq!(version_gates("2.0.0", "1.0.0", "", "0.4.1"), VersionGate::Apply);
+        assert_eq!(version_gates(("2.0.0", 0), ("1.0.0", 0), "", "0.4.1"), VersionGate::Apply);
         // min_binary == running → Apply (≤)
-        assert_eq!(version_gates("2.0.0", "1.0.0", "1.0.0", "1.0.0"), VersionGate::Apply);
+        assert_eq!(version_gates(("2.0.0", 0), ("1.0.0", 0), "1.0.0", "1.0.0"), VersionGate::Apply);
         // min_binary 파싱 실패 → BinaryTooOld(fail-CLOSED)
-        assert_eq!(version_gates("2.0.0", "1.0.0", "junk", "1.0.0"), VersionGate::BinaryTooOld);
+        assert_eq!(version_gates(("2.0.0", 0), ("1.0.0", 0), "junk", "1.0.0"), VersionGate::BinaryTooOld);
+    }
+
+    /// v6 튜플 전이 케이스(설계 §3 의무): free→pro / pro.N→pro.N+1 / pro 역행 / base rebase.
+    #[test]
+    fn version_gates_pro_revision_tuple_transitions() {
+        // free→pro 전환(동일 base + pro.1) → Apply — 구 parse_semver 접미 절단이 이중 차단하던 경로.
+        assert_eq!(version_gates(("0.8.0", 1), ("0.8.0", 0), "0.8.0", "0.8.0"), VersionGate::Apply);
+        // pro.N → pro.N+1 (동일 base 증분) → Apply — R1 실증 결함(replay/UpToDate 이중 차단)의 교정 핀.
+        assert_eq!(version_gates(("0.8.0", 2), ("0.8.0", 1), "0.8.0", "0.8.0"), VersionGate::Apply);
+        // pro 역행(pro.1 ← pro.2 설치) → UpToDate(반영 거부).
+        assert_eq!(version_gates(("0.8.0", 1), ("0.8.0", 2), "0.8.0", "0.8.0"), VersionGate::UpToDate);
+        // base rebase: 0.8.0-pro.5 설치 위에 0.9.0-pro.1 → Apply (base 우선 비교).
+        assert_eq!(version_gates(("0.9.0", 1), ("0.8.0", 5), "0.9.0", "0.9.0"), VersionGate::Apply);
+        // 동일 튜플 → UpToDate (self-heal 후보 — 파일 반영은 없다).
+        assert_eq!(version_gates(("0.8.0", 1), ("0.8.0", 1), "0.8.0", "0.8.0"), VersionGate::UpToDate);
     }
 
     /// reinject 3단 게이트 결정 — unchanged·dedup·defer·inject.
@@ -5591,6 +5951,92 @@ mod tests {
         assert_eq!(r3.expect("구버전 검증 자체는 통과").gate, VersionGate::UpToDate);
         assert_eq!(r4.expect("min_binary 검증 자체는 통과").gate, VersionGate::BinaryTooOld);
         assert_eq!(disk_after.trim(), "1.0.0", "거부/no-op인데 디스크 버전 변경됨");
+    }
+
+    /// ★free/pro e2e(v6 §3·§5 전이 의무 테스트): free 설치 → pro.1 전환(Apply) → pro.2 증분
+    /// (Apply — R1 실증 이중 차단의 교정 핀) → free 번들 거부(전용 명령 강제) → pro 역행 거부.
+    /// 각 단계에서 state·accepted가 계약대로 영속되는지 검증.
+    #[test]
+    fn pack_update_pro_channel_e2e() {
+        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pu-pro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        std::fs::write(pack_dir.join(".pack-version"), "1.0.0").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+        let accepted = td.join("base").join(".pack-accepted.json");
+        std::fs::create_dir_all(td.join("base")).unwrap();
+
+        // ① free(1.0.0) → pro.1(동일 base) 전환 — Apply여야 한다.
+        let d1 = td.join("pro1");
+        std::fs::create_dir_all(&d1).unwrap();
+        let files1 = [("soul.md", "SOUL\n"), ("pro-only/skill.md", "PRO v1\n")];
+        build_signed_pack_pro(&d1, &files1, "TESTKEY", "1.0.0", 1, "0.4.1", 2000, 9_000_000_000, &sign);
+        let r1 = pack_update_from_dir(&d1, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true);
+
+        // ② pro.1 → pro.2 증분(동일 base) — Apply여야 한다(구현 전: replay+UpToDate 이중 차단).
+        let d2 = td.join("pro2");
+        std::fs::create_dir_all(&d2).unwrap();
+        let files2 = [("soul.md", "SOUL\n"), ("pro-only/skill.md", "PRO v2\n")];
+        build_signed_pack_pro(&d2, &files2, "TESTKEY", "1.0.0", 2, "0.4.1", 3000, 9_000_000_000, &sign);
+        let r2 = pack_update_from_dir(&d2, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true);
+
+        // ③ pro 설치에 free 번들(1.1.0 신버전이어도) → 전용 명령 강제 typed 거부.
+        let d3 = td.join("free-on-pro");
+        std::fs::create_dir_all(&d3).unwrap();
+        build_signed_pack(&d3, &[("soul.md", "FREE\n")], "TESTKEY", "1.1.0", "0.4.1", 4000, 9_000_000_000, &sign);
+        let r3 = pack_update_from_dir(&d3, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true);
+
+        // ④ pro 역행(pro.1 재배포·신서명) → replay 튜플 거부.
+        let d4 = td.join("pro-regress");
+        std::fs::create_dir_all(&d4).unwrap();
+        build_signed_pack_pro(&d4, &files1, "TESTKEY", "1.0.0", 1, "0.4.1", 5000, 9_000_000_000, &sign);
+        let r4 = pack_update_from_dir(&d4, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true);
+
+        let restore = || {
+            match &saved {
+                Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+            }
+            match &saved_cfg {
+                Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+            }
+        };
+        let pro_content = std::fs::read_to_string(pack_dir.join("pro-only/skill.md")).unwrap_or_default();
+        let state = cys::pack::read_pack_state(&pack_dir);
+        let acc_ev = cys::packsig::read_accepted_evidence(&accepted);
+        restore();
+        let _ = std::fs::remove_dir_all(&td);
+
+        let o1 = r1.expect("① free→pro.1 실패");
+        assert_eq!(o1.gate, VersionGate::Apply, "① free→pro.1이 Apply가 아님");
+        assert!(o1.accepted_recorded, "① accepted 미기록");
+        let o2 = r2.expect("② pro.1→pro.2 실패(R1 이중 차단 재발?)");
+        assert_eq!(o2.gate, VersionGate::Apply, "② pro 증분이 Apply가 아님");
+        assert_eq!(pro_content, "PRO v2\n", "② pro.2 콘텐츠 미반영");
+        let e3 = r3.expect_err("③ pro 설치에 free 번들이 통과됨");
+        assert!(e3.contains("pack-channel-refused"), "③ typed 사유 아님: {e3}");
+        assert!(r4.is_err(), "④ pro 역행이 통과됨");
+        assert!(
+            matches!(state, cys::pack::PackStateRead::Valid(ref st)
+                if st.channel == "pro" && st.base_version == "1.0.0" && st.pro_revision == 2),
+            "state 계약 위반: {state:?}"
+        );
+        assert_eq!(
+            acc_ev.expect("accepted 판독 실패"),
+            Some(("pro".to_string(), 2, "1.0.0".to_string())),
+            "accepted 채널·rev 계약 위반"
+        );
     }
 
     /// ★오프라인 통합(Fix1 §7-① 역방향 커버리지): 서명 manifest에 없는 파일을 tarball에 주입한
