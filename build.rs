@@ -99,6 +99,29 @@ fn main() {
     );
     fs::write(Path::new(&out_dir).join("pack_keyring.rs"), keyring_code)
         .expect("pack_keyring.rs 생성 실패");
+
+    // DESIGN-pro-license §5: pro 라이선스 폐기 명단 embed + ★빌드타임 형태 검증.
+    // 손상·형태 불일치 폐기 명단은 빌드 실패로 출하 자체를 차단한다(런타임 도달 0).
+    // 소스는 repo 루트(팩 트리 밖 — pro 팩에 사본을 두지 않는 단일 SOT).
+    println!("cargo:rerun-if-changed=revoked-licenses.json");
+    let revoked_src =
+        fs::read_to_string("revoked-licenses.json").expect("revoked-licenses.json 읽기 실패");
+    let parsed: serde_json::Value = serde_json::from_str(&revoked_src)
+        .expect("revoked-licenses.json 파싱 실패 — 손상 폐기 명단 출하 금지(빌드 중단)");
+    let ids = parsed
+        .get("revoked_license_ids")
+        .and_then(|v| v.as_array())
+        .expect("revoked-licenses.json에 revoked_license_ids 배열 부재 — 빌드 중단");
+    for id in ids {
+        if !id.is_string() {
+            panic!("revoked_license_ids에 문자열 아닌 항목: {id} — 빌드 중단");
+        }
+    }
+    let revoked_code = format!(
+        "/// build.rs 자동 생성 — revoked-licenses.json embed(빌드타임 형태 검증 통과본).\npub const REVOKED_LICENSES_JSON: &str = r####\"{revoked_src}\"####;\n"
+    );
+    fs::write(Path::new(&out_dir).join("license_revoked.rs"), revoked_code)
+        .expect("license_revoked.rs 생성 실패");
 }
 
 /// tauri.conf.json 등에서 `"key": "value"` 첫 매치의 value를 추출(JSON 파서 build-dep 없이).

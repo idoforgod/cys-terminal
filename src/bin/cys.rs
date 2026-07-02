@@ -331,6 +331,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
+    License {
+        #[command(subcommand)]
+        action: LicenseAction,
+    },
     /// 임베드 PACK+PACK_SKILLS에서 권위 manifest(pack-manifest.json)를 stdout JSON으로 방출.
     /// CI(release.yml)가 standalone 팩 manifest의 단일 SOT로 쓴다(임베드 콘텐츠→tree 동일성 게이트).
     #[command(name = "pack-manifest")]
@@ -417,6 +422,14 @@ enum Command {
         #[command(subcommand)]
         action: ApprovalAction,
     },
+}
+
+#[derive(Subcommand)]
+enum LicenseAction {
+    /// 열쇠 번들(디렉터리 또는 파일 경로 + 형제 .minisig) 전건 검증 후 설치 — 실패 시 기존 무손상
+    Install { path: String },
+    /// typed 진단: free|pro|expired|revoked|invalid|key-expired + 서명키 잔여 수명 상시 병기
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1416,6 +1429,28 @@ fn run(command: Command) -> i32 {
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version } => {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version);
+        }
+
+        Command::License { action } => {
+            let now = chrono::Utc::now().timestamp();
+            match action {
+                LicenseAction::Install { path } => {
+                    match cys::license::install(std::path::Path::new(&path), now) {
+                        Ok(msg) => {
+                            println!("{msg}");
+                            return 0;
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return 1;
+                        }
+                    }
+                }
+                LicenseAction::Status => {
+                    println!("{}", cys::license::render_status(now));
+                    return 0;
+                }
+            }
         }
 
         Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {

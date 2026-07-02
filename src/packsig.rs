@@ -232,7 +232,8 @@ fn read_accepted(path: &Path) -> Result<Option<AcceptedPack>, String> {
 }
 
 /// RFC3339(예 "2030-01-01T00:00:00Z") → Unix epoch 초. 빈 문자열·파싱불가 = None.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+/// pub(crate): license.rs가 동일 시각 규칙을 공유한다(이중 구현 드리프트 차단).
+pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -244,7 +245,8 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 
 /// minisign 서명 검증. pubkey는 tauri식(전체 .pub 파일 base64) 또는 raw 키라인 base64 모두 수용.
 /// allow_legacy=true: prehashed(tauri 기본)·legacy ed25519 서명 모두 수용(둘 다 암호학적으로 안전).
-fn verify_minisign(pubkey: &str, data: &[u8], sig_bytes: &[u8]) -> Result<(), String> {
+/// pub(crate): license.rs가 동일 검증 코어를 재사용한다(신뢰근원·검증 규칙 단일화).
+pub(crate) fn verify_minisign(pubkey: &str, data: &[u8], sig_bytes: &[u8]) -> Result<(), String> {
     use minisign_verify::Signature;
     let pk = load_public_key(pubkey)?;
     let sig_str = std::str::from_utf8(sig_bytes).map_err(|e| format!("서명 UTF-8 아님: {e}"))?;
