@@ -2818,6 +2818,7 @@ fn boot_agent_on_surface(
     spec: &Value,
     resume: bool,
     session_id: Option<&str>,
+    restore: bool,
 ) -> Result<(), String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
     if resume {
@@ -2882,7 +2883,15 @@ fn boot_agent_on_surface(
 
     // 2) 준비 감지 폴링: 폴더 신뢰 프롬프트는 자동 확인, ready_marker가 보이면 주입 단계로
     let ready_marker = spec["ready_marker"].as_str().map(|s| s.to_string());
-    let max_wait_secs = delay.max(30) * 2;
+    // ★Phase 5 ①b: restore 모드에선 역할별 readiness 대기를 짧게 캡한다(타임아웃+continue). 한
+    // 역할이 readiness에서 stall해도 run_restore가 실패로 처리해 다음 역할로 진행하게 해, 한 노드
+    // stall이 로스터 전체를 멈추는 것을 막는다(DRILL_LIVE_1: worker spawn 후 중단처럼 보인 근원).
+    // agent_meta는 위에서 이미 등록됐으므로(①a) 짧은 캡에도 사망감지·status는 정상 동작한다.
+    let max_wait_secs = if restore {
+        (delay.max(30) * 2).min(20)
+    } else {
+        delay.max(30) * 2
+    };
     let mut waited = 0u64;
     let mut ready = false;
     let mut last_screen = String::new();
@@ -3052,7 +3061,7 @@ fn run_todo_path() -> i32 {
 }
 
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
-    run_launch_agent_opts(role, agent, cwd, false, None)
+    run_launch_agent_opts(role, agent, cwd, false, None, false)
 }
 
 /// 절대지침(앵커1-b): 탭(타이틀) = 워크플로우 폴더명 — "{role}-{agent} · {폴더}".
@@ -3077,6 +3086,7 @@ fn run_launch_agent_opts(
     cwd: Option<String>,
     resume: bool,
     session_id: Option<String>,
+    restore: bool,
 ) -> i32 {
     // 절대지침(앵커1-b): 워커는 워크플로우 폴더에서 산다 — cwd 미지정이면 호출 폴더가
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
@@ -3120,7 +3130,7 @@ fn run_launch_agent_opts(
         let sid = r["surface_id"].as_u64().ok_or("create returned no id")?;
         created = Some(sid);
         eprintln!("[launch-agent] {} created (role={role})", surface_ref(sid));
-        boot_agent_on_surface(sid, role, agent, &spec, resume, session_id.as_deref())?;
+        boot_agent_on_surface(sid, role, agent, &spec, resume, session_id.as_deref(), restore)?;
         println!("{}", surface_ref(sid));
         Ok(())
     })();
@@ -4007,7 +4017,7 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         // (4b) topology에 영속된 session_id가 있으면 정확한 세션 재개(없으면 fallback)
         let sess = entry["session_id"].as_str().map(String::from);
-        boot_agent_on_surface(sid, &role_name, &agent, &spec, true, sess.as_deref())?;
+        boot_agent_on_surface(sid, &role_name, &agent, &spec, true, sess.as_deref(), false)?;
         inject_text(sid, "[RECOVER] 너는 방금 재기동되었다. _round/SESSION_STATE.md와 자기 TODO 파일을 읽어 작업 기억을 복원한 뒤 master에게 복귀를 1줄 push로 보고하라. 작업 재개는 master 지시를 따른다.")?;
         println!("recovered surface:{sid} ({agent})");
         Ok(())
@@ -4060,7 +4070,7 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
             println!("· {role}: {agent} 재기동…");
             // (4b) saved entry의 session_id를 꺼내 정확한 세션 재개(없으면 fallback)
             let sess = entry["session_id"].as_str().map(String::from);
-            if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess) == 0 {
+            if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess, true) == 0 {
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
                     if let Some(sid) = r["surface_id"].as_u64() {
