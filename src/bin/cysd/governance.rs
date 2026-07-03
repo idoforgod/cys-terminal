@@ -1351,6 +1351,12 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
     if daemon.paused.load(Ordering::Relaxed) {
         return;
     }
+    // ★Phase 5 ①c: WAL로 살아난 restored_queue를 같은 role의 살아있는 surface로 재홈한 뒤 배달.
+    // (Phase 3에서 restored_queue가 배달 경로에 미배선이라, 재기동 생존 메시지가 idle에도 미배달로
+    // 잔존하던 갭을 닫는다 — role 앵커 재타겟.)
+    if daemon.rehome_restored_queue() > 0 {
+        daemon.persist_queue_state();
+    }
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     for s in surfaces {

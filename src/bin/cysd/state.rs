@@ -807,11 +807,15 @@ impl Daemon {
         {
             let surfaces = self.surfaces.lock().unwrap();
             for s in surfaces.values() {
+                // ★Phase 5 ①c: 재배달 재타겟 키로 role을 함께 기록한다. surface_id는 재기동 시
+                // 소멸하므로(재사용 없음), WAL 생존 메시지를 재기동 후 같은 role의 새 surface로
+                // 배달하려면 role 앵커가 필요하다.
+                let role = s.role.lock().unwrap().clone();
                 let q = s.pending_queue.lock().unwrap();
                 for text in q.iter() {
                     let mid = queue_mid(s.id, text);
                     if seen.insert(mid.clone()) {
-                        entries.push(json!({"mid": mid, "surface_id": s.id, "text": text}));
+                        entries.push(json!({"mid": mid, "surface_id": s.id, "text": text, "role": role}));
                     }
                 }
             }
@@ -826,6 +830,42 @@ impl Daemon {
         if let Ok(content) = serde_json::to_string(&entries) {
             let _ = crate::governance::write_json_atomic(&dir, "queue-state.json", &content);
         }
+    }
+
+    /// ★Phase 5 ①c: 큐 재배달 갭 수리. WAL로 살아난 restored_queue 항목을 **같은 role의 살아있는
+    /// surface**의 pending_queue로 옮겨, deliver_queued가 그 surface가 idle일 때 배달하게 한다.
+    /// restored_queue는 queue.list에 보이기만 하고 배달 경로(surface.pending_queue)에 없었다(Phase 3 갭).
+    /// surface_id는 재기동 시 소멸하므로 role을 앵커로 재타겟한다. role 미기록/무매칭 항목은 보존(정직).
+    /// 반환: 재홈된 항목 수(>0이면 호출자가 persist_queue_state로 스냅샷 최신화).
+    pub fn rehome_restored_queue(&self) -> usize {
+        let mut restored = self.restored_queue.lock().unwrap();
+        if restored.is_empty() {
+            return 0;
+        }
+        // role → 살아있는(미exit) surface 매핑
+        let mut role_surface: HashMap<String, Arc<Surface>> = HashMap::new();
+        for s in self.surfaces.lock().unwrap().values() {
+            if s.exited.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(role) = s.role.lock().unwrap().clone() {
+                role_surface.entry(role).or_insert_with(|| s.clone());
+            }
+        }
+        let mut rehomed = 0usize;
+        restored.retain(|it| {
+            let role = it.get("role").and_then(|v| v.as_str());
+            let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(r) = role {
+                if let Some(surf) = role_surface.get(r) {
+                    surf.pending_queue.lock().unwrap().push_back(text.to_string());
+                    rehomed += 1;
+                    return false; // restored_queue에서 제거(pending_queue로 이관)
+                }
+            }
+            true // role 무매칭/미기록 — 보존(재기동 더 기다림·정직)
+        });
+        rehomed
     }
 
     /// Spawn a new PTY surface running the user's shell (or an explicit command).
