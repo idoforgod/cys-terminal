@@ -811,6 +811,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"bytes": text.len(), "depth": depth,
                            "from": params.get("from").cloned().unwrap_or(Value::Null)}),
                 );
+                // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
+                daemon.persist_queue_state();
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "queued": true, "depth": depth}),
@@ -948,6 +950,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"bytes": 0, "depth": depth, "key": "Return",
                            "from": params.get("from").cloned().unwrap_or(Value::Null)}),
                 );
+                // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
+                daemon.persist_queue_state();
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "key": key, "queued": true, "depth": depth}),
@@ -2752,6 +2756,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }));
                 }
             }
+            // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
+            for it in daemon.restored_queue.lock().unwrap().iter() {
+                let sid_v = it.get("surface_id").cloned().unwrap_or(Value::Null);
+                if let Some(f) = filter_sid {
+                    if sid_v.as_u64() != Some(f) {
+                        continue;
+                    }
+                }
+                let text = it.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                out.push(json!({
+                    "surface_id": sid_v, "restored": true,
+                    "mid": it.get("mid").cloned().unwrap_or(Value::Null),
+                    "bytes": text.len(),
+                    "preview": text.chars().take(80).collect::<String>(),
+                }));
+            }
             Reply::Single(ok_response(&id, json!({"entries": out})))
         }
 
@@ -2802,6 +2822,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                            "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
                 );
             }
+            // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
+            daemon.persist_queue_state();
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "cleared": dropped.len()}),

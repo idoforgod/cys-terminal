@@ -722,7 +722,7 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
 /// 손상-안전 원자 JSON 쓰기: 같은 디렉터리 temp에 write + fsync(file) → rename(원자 교체)
 /// → fsync(dir). rename 원자성 ≠ 데이터 내구성이므로 fsync(file)로 데이터를, fsync(dir)로
 /// rename을 영속한다(dir fsync 없으면 rename이 캐시에만 남아 크래시 시 옛 이름 복귀). 실패 시 temp 정리.
-fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     let target = dir.join(name);
     let tmp = dir.join(format!(".{name}.tmp"));
@@ -1417,6 +1417,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
                 Some(s.id),
                 serde_json::json!({"bytes": text.len(), "remaining": remaining}),
             );
+            // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
+            daemon.persist_queue_state();
         }
     }
 }

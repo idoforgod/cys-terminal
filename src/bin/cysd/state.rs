@@ -415,6 +415,10 @@ pub struct Daemon {
     /// 대용량 body가 분할 write되면 다른 동시 appender의 라인이 끼어들어 JSONL이
     /// 손상되고 복원(replay)에서 pending 항목이 무음 유실될 수 있다.
     pub feed_persist_lock: Mutex<()>,
+    /// 큐 WAL(P7): 미배달 `--queued` 메시지의 데몬 재기동 생존분(queue-state.json replay).
+    /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
+    /// queue.list가 라이브 큐와 함께 노출한다. mid(안정 해시)로 이중 replay를 dedup한다.
+    pub restored_queue: Mutex<Vec<serde_json::Value>>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -599,6 +603,34 @@ pub fn sibling_cli_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// 큐 WAL(P7)의 안정 메시지 id — FNV-1a 64로 (surface_id, text)에서 파생.
+/// 재기동을 넘어 동일 논리 메시지가 같은 mid를 갖게 해, queue-state.json 이중 replay 시
+/// dedup이 성립한다. (동일 surface의 동일 텍스트는 하나로 수렴 — MVP 멱등, Phase 4에서 enqueue-seq 태깅 승격.)
+fn queue_mid(sid: u64, text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{sid}\u{0}{text}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("q{h:016x}")
+}
+
+/// queue-state.json replay: {mid, surface_id, text} 배열을 mid로 dedup해 복원한다.
+/// 파일 부재/파손이면 빈 벡터(fail-safe — 큐 없음이 기본).
+fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut by_mid: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string(dir.join("queue-state.json")) {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+            for it in arr {
+                if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
+                    by_mid.entry(mid.to_string()).or_insert(it); // 이중 replay dedup
+                }
+            }
+        }
+    }
+    by_mid.into_values().collect()
+}
+
 impl Daemon {
     pub fn new(socket_path: PathBuf) -> Arc<Self> {
         let dir = state_dir(&socket_path);
@@ -691,6 +723,8 @@ impl Daemon {
             feed_items: Mutex::new(restored),
             feed_waiters: Mutex::new(HashMap::new()),
             feed_persist_lock: Mutex::new(()),
+            // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
+            restored_queue: Mutex::new(load_queue_state(&dir)),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -756,6 +790,41 @@ impl Daemon {
             .open(dir.join("feed.jsonl"))
         {
             let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+            // §9.1-1: append 후 fsync — 재부팅에도 미배달 승인요청(feed)이 디스크에 확정된다.
+            // (파일별 내구성 불균일 해소: topology는 이미 fsync, feed.jsonl은 누락돼 있었다.)
+            let _ = f.sync_all();
+        }
+    }
+
+    /// 큐 WAL 스냅샷을 원자적으로 영속(P7·§9.1-1). enqueue/pop/clear 뒤 호출한다.
+    /// 라이브 surface 큐 + 아직 미소비 restored_queue를 합쳐 mid로 dedup해 쓴다 —
+    /// 미배달 `--queued` 메시지가 데몬 재기동을 생존한다(HARNESS 4-a VOLATILE 수리).
+    /// ★락 순서 주의: 호출자는 어떤 pending_queue 락도 쥐지 않은 상태여야 한다(재진입 데드락 방지).
+    pub fn persist_queue_state(&self) {
+        let dir = state_dir(&self.socket_path);
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let surfaces = self.surfaces.lock().unwrap();
+            for s in surfaces.values() {
+                let q = s.pending_queue.lock().unwrap();
+                for text in q.iter() {
+                    let mid = queue_mid(s.id, text);
+                    if seen.insert(mid.clone()) {
+                        entries.push(json!({"mid": mid, "surface_id": s.id, "text": text}));
+                    }
+                }
+            }
+        }
+        for it in self.restored_queue.lock().unwrap().iter() {
+            if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
+                if seen.insert(mid.to_string()) {
+                    entries.push(it.clone());
+                }
+            }
+        }
+        if let Ok(content) = serde_json::to_string(&entries) {
+            let _ = crate::governance::write_json_atomic(&dir, "queue-state.json", &content);
         }
     }
 
