@@ -2866,6 +2866,15 @@ fn boot_agent_on_surface(
         "surface.send_key",
         json!({"surface_id": sid, "key": "Return", "authoritative": true}),
     )?;
+    // ★Phase 5 ①a: agent_meta를 기동 직후(readiness 폴링 前)에 등록한다. 등록이 폴링 뒤(step 5)에만
+    // 있으면 readiness 미확인·restore 중 stall 시 meta=None으로 남아 → 사망감지 스킵(governance.rs)
+    // → agent_seen 영원히 false → status 허위 DEAD → task-prompt 생존게이트가 '미기동' 오판(DRILL_LIVE_1).
+    // 스폰 시점에 의도가 확정되므로 여기서 등록하는 것이 정직하다(§3-1 진단의 수리).
+    let bin = extract_bin(&cmd, agent).to_string();
+    request(
+        "surface.set_meta",
+        json!({"surface_id": sid, "agent": agent, "agent_bin": bin}),
+    )?;
     eprintln!(
         "[launch-agent] {agent} starting… (polling readiness, max {}s)",
         delay.max(30) * 2
@@ -2967,15 +2976,9 @@ fn boot_agent_on_surface(
         eprintln!("[launch-agent] warning: directive not visible on screen — verify with `cys read-screen --surface {}`", surface_ref(sid));
     }
 
-    // 5) T2-5 에이전트 메타 등록 — 사망 감지·status 보드·approval 스캔의 기반
-    // boot 설치판정과 동일한 extract_bin으로 env-prefix(KEY=VAL)를 건너뛴다 — 그러지 않으면
-    // claude cmd의 `CLAUDE_CONFIG_DIR=...`가 agent_bin으로 저장돼 governance.rs 사망 감지의
-    // cmdline 매칭이 깨진다 (codex R1 REVISE).
-    let bin = extract_bin(&cmd, agent).to_string();
-    request(
-        "surface.set_meta",
-        json!({"surface_id": sid, "agent": agent, "agent_bin": bin}),
-    )?;
+    // 5) T2-5 에이전트 메타 등록은 ★Phase 5 ①a로 기동 직후(위)로 이동했다 — readiness 폴링/주입
+    // 성공에 의존하지 않게. 여기서 재등록하면 set_meta가 agent_seen을 false로 리셋해, 이미 사망감지가
+    // 관측한(agent_seen=true) 노드를 일시 허위 DEAD로 되돌리므로 재호출하지 않는다.
     Ok(())
 }
 
