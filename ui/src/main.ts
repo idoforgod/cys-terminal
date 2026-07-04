@@ -1542,10 +1542,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // input 핸들러에서 무시되고 onData(고속에서 발화 비결정)도 못 받쳐 통째로 유실된다
   // — "4자 치면 2자" 절반 유실의 주 경로.
   const isHangulText = (t: string) => /^[\u3131-\u318E\u1100-\u11FF\uAC00-\uD7A3]+$/.test(t);
-  // Incomplete jamo only (composing lead/medial \u2014 excludes complete syllables AC00-D7A3).
-  // Used by onData to detect whether a leftover `pendingHangul` is the composing jamo of the
-  // same syllable xterm just completed, so it can be dropped instead of leaked ahead of it.
-  const isIncompleteJamo = (t: string) => /^[\u3131-\u318E\u1100-\u11FF]+$/.test(t);
+  // WKWebView \uD310\uC815\uC744 onData\uBCF4\uB2E4 \uBA3C\uC800 \uC0B0\uCD9C(\uC720\uC608 \uB85C\uC9C1\uC774 \uCC38\uC870) \u2014 \uC544\uB798 input \uBA38\uC2E0 \uBD84\uAE30\uC640 \uB3D9\uC77C \uAE30\uC900.
+  const isWKWebViewRT = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent);
   // IME 계측(사람 단계 재현용): localStorage.cysImeDebug="1" 설정 시 이벤트 시퀀스를
   // /tmp/cys-ime.log에 기록 — 유실 경로를 결정론으로 확정하는 채널. 평시 비용 0.
   const imeDbg = localStorage.getItem("cysImeDebug") === "1";
@@ -1560,23 +1558,39 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     }
   };
 
+  // ★한글 이중배달 차단 — onData 유예(defer) 방식 (2026-07-04 실기기 계측 확정):
+  // 이 WKWebView는 한글 키 입력마다 ①xterm onData(조합 시작 자모 "ㅇ"·또는 완성 음절 "히")와
+  // ②input 이벤트 머신(insertText→insertReplacementText 체인, pending 버퍼) **두 경로가 같은
+  // 글자를 모두 배달**한다. onData가 즉시 sendRaw하면 자모 유출("좋ㅇ아")+음절 복제("히히")가
+  // 된다. 해법: 한글 onData는 즉시 보내지 않고 잠깐(40ms) 유예 — 같은 tick에 input 머신이
+  // 같은 글자를 받아가면(insertText 등) 유예분을 **취소**(머신이 pending으로 배달), 아무 input
+  // 이벤트도 안 오면(insertFromComposition만 쓰는 다른 WebKit 변종) 유예분을 **그대로 전송**
+  // (과거 "는 다" 전량 유실 회귀 방지 — 차단이 아니라 유예라 유실 0).
+  let deferredHangul = "";
+  let deferredTimer: number | undefined;
+  const cancelDeferred = (why: string) => {
+    if (deferredTimer !== undefined) { clearTimeout(deferredTimer); deferredTimer = undefined; }
+    if (deferredHangul) { dbg(`DEFER-cancel(${why}) "${deferredHangul}"`); deferredHangul = ""; }
+  };
+  const sendDeferredNow = (why: string) => {
+    if (deferredTimer !== undefined) { clearTimeout(deferredTimer); deferredTimer = undefined; }
+    if (deferredHangul) { const d = deferredHangul; deferredHangul = ""; dbg(`DEFER-send(${why}) "${d}"`); sendRaw(d); }
+  };
+
   term.onData((data) => {
-    // 한글 음절: 이 WebKit은 조합을 표준 composition inputType(insertFromComposition)으로
-    // 확정하고, 그때 xterm이 완성 음절을 onData로 정확히 1회 발화한다 — 차단 없이 그대로
-    // PTY로 보낸다. (구 isHangulText 차단은 insertText 기반 상태머신을 전제했으나, 실기기
-    // WebKit은 insertCompositionText/insertFromComposition을 보내 그 머신이 작동한 적이
-    // 없었고, 차단만 살아 순수 한글 음절을 통째로 유실시켰다 — "너는 마스터다"→"는 다".)
-    // ★한글 초성 이중방출 차단: 이 WebKit은 input(insertText, 초성 자모)로 pending에 초성을
-    // 버퍼한 뒤, 같은 음절을 composition 경로로 onData(완성 음절)까지 발화한다. 여기서 무조건
-    // flushPending하면 버퍼된 초성이 완성 음절 앞으로 새어 "ㅎ한"이 된다. → pending이 '조합중
-    // 자모'(완성 음절 아님)이고 지금 data가 한글 음절이면, 그 자모는 이 음절의 조합중 상태이므로
-    // 폐기한다(유출 금지). pending이 완성형(진짜 직전 음절)이면 기존대로 flush해 순서 보존.
-    if (pendingHangul && isIncompleteJamo(pendingHangul) && isHangulText(data)) {
-      dbg(`DROP-pending "${pendingHangul}" (초성 조합중) superseded by onData "${data}"`);
-      pendingHangul = "";
-    } else {
-      flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
+    dbg(`onData recv "${data}" pending="${pendingHangul}" deferred="${deferredHangul}"`);
+    if (isWKWebViewRT && isHangulText(data)) {
+      deferredHangul += data;
+      if (deferredTimer !== undefined) clearTimeout(deferredTimer);
+      deferredTimer = window.setTimeout(() => {
+        deferredTimer = undefined;
+        if (deferredHangul) { const d = deferredHangul; deferredHangul = ""; dbg(`DEFER-timeout send "${d}"`); sendRaw(d); }
+      }, 40);
+      return;
     }
+    // 비한글: 순서 보존 — 유예분·pending을 먼저 내보낸 뒤 이번 데이터 전송
+    sendDeferredNow("onData-nonhangul");
+    flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
     sendRaw(data);
   });
 
@@ -1594,6 +1608,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
         const ie = e as InputEvent;
         dbg(`input ${ie.inputType} data="${ie.data ?? "∅"}" pending="${pendingHangul}"`);
         if (ie.inputType === "insertText" && ie.data && isHangulText(ie.data)) {
+          // ★input 머신이 이 글자를 받아간다 — onData가 유예해 둔 동일 글자를 취소(이중배달 차단).
+          cancelDeferred("insertText");
           // 직전 조합 확정 후 새 커밋을 '수정 가능 창'(pending)에 둔다. 병합 커밋
           // (2음절+)은 마지막 음절만 수정 창에 — 앞 음절들은 확정분이므로 즉시 전송
           // (replacement 재조합은 마지막 음절 단위로 온다).
@@ -1604,6 +1620,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
           }
           pendingHangul = ie.data.slice(-1);
         } else if (ie.inputType === "insertReplacementText" && ie.data) {
+          cancelDeferred("insertReplacementText"); // 조합 계속 — 머신 소유(이중배달 차단)
           if (pendingHangul) {
             pendingHangul = ie.data; // 조합 갱신 (하→한)
           } else {
