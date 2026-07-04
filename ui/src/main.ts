@@ -1542,6 +1542,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // input 핸들러에서 무시되고 onData(고속에서 발화 비결정)도 못 받쳐 통째로 유실된다
   // — "4자 치면 2자" 절반 유실의 주 경로.
   const isHangulText = (t: string) => /^[\u3131-\u318E\u1100-\u11FF\uAC00-\uD7A3]+$/.test(t);
+  // Incomplete jamo only (composing lead/medial \u2014 excludes complete syllables AC00-D7A3).
+  // Used by onData to detect whether a leftover `pendingHangul` is the composing jamo of the
+  // same syllable xterm just completed, so it can be dropped instead of leaked ahead of it.
+  const isIncompleteJamo = (t: string) => /^[\u3131-\u318E\u1100-\u11FF]+$/.test(t);
   // IME 계측(사람 단계 재현용): localStorage.cysImeDebug="1" 설정 시 이벤트 시퀀스를
   // /tmp/cys-ime.log에 기록 — 유실 경로를 결정론으로 확정하는 채널. 평시 비용 0.
   const imeDbg = localStorage.getItem("cysImeDebug") === "1";
@@ -1562,7 +1566,17 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // PTY로 보낸다. (구 isHangulText 차단은 insertText 기반 상태머신을 전제했으나, 실기기
     // WebKit은 insertCompositionText/insertFromComposition을 보내 그 머신이 작동한 적이
     // 없었고, 차단만 살아 순수 한글 음절을 통째로 유실시켰다 — "너는 마스터다"→"는 다".)
-    flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
+    // ★한글 초성 이중방출 차단: 이 WebKit은 input(insertText, 초성 자모)로 pending에 초성을
+    // 버퍼한 뒤, 같은 음절을 composition 경로로 onData(완성 음절)까지 발화한다. 여기서 무조건
+    // flushPending하면 버퍼된 초성이 완성 음절 앞으로 새어 "ㅎ한"이 된다. → pending이 '조합중
+    // 자모'(완성 음절 아님)이고 지금 data가 한글 음절이면, 그 자모는 이 음절의 조합중 상태이므로
+    // 폐기한다(유출 금지). pending이 완성형(진짜 직전 음절)이면 기존대로 flush해 순서 보존.
+    if (pendingHangul && isIncompleteJamo(pendingHangul) && isHangulText(data)) {
+      dbg(`DROP-pending "${pendingHangul}" (초성 조합중) superseded by onData "${data}"`);
+      pendingHangul = "";
+    } else {
+      flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
+    }
     sendRaw(data);
   });
 
