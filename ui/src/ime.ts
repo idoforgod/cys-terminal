@@ -18,9 +18,11 @@ export interface ImeState {
    * (insertText→insertReplacementText) 두 경로가 같은 글자를 모두 배달한다. 0.12.20 업스트림
    * 리듀서 재작성 때 1차 수리(defer)가 소실되어 onData 즉시 send가 부활 — 초성 선유출
    * ("ㅁ마")·음절 복제("다다")가 재발했다. 한글 onData는 여기 buffered 후 DEFER_MS 유예:
-   * input 머신이 받아가면 취소(동일=전체·앞부분=부분·초성흡수=전체), 아무도 안 받아가면
-   * 타임아웃 전송(insertFromComposition만 쓰는 WebKit 변종 유실 0 — 차단이 아닌 유예).
-   * 방출 시 pending(구분)이 유예분보다 먼저 나간다(시간순 보존).
+   * input 머신이 받아가면 취소(containment 양방향 4분기 — cancelDeferredIfTaken), 아무도
+   * 안 받아가면 타임아웃 전송. ★onData 도착 계약: 실측 전 프로필에서 composition 확정분은
+   * onData로 별도 도착한다 — 그래서 composition inputType에서 직접 send하지 않아도 유예
+   * 타임아웃이 유실 0을 보장한다(차단이 아닌 유예). 방출 시 pending(구분)이 유예분보다
+   * 먼저 나간다(시간순 보존).
    */
   deferred: string;
 }
@@ -89,9 +91,13 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
     }
   };
   // input 머신이 이 글자를 받아갔다 — 유예분 취소(이중배달 차단). 기본은 exact match
-  // (1차 실측 불변식: 두 경로가 같은 문자열을 배달)이나, 리뷰 R1 보강 2건:
-  // ①다중 onData 누적(예: "ㅁ"+"마"="ㅁ마") 중 앞쪽만 받아가면 그만큼만 부분 취소
-  // ②유예 홑자모가 머신 커밋 음절의 초성이면(예: 유예 "ㅁ" ⊂ 커밋 "마") 흡수 — 전체 취소.
+  // (1차 실측 불변식: 두 경로가 같은 문자열을 배달)이나, 리뷰 R1·R2 보강 — containment
+  // 양방향 4분기(순서 고정):
+  // ①동일 → 전체 취소 ②deferred가 data로 시작(다중 onData 누적 "ㅁ마" 중 "ㅁ"만 받아감)
+  //   → 받아간 만큼 부분 취소 ③data가 deferred로 시작(머신이 유예분을 포함한 병합 커밋
+  //   "마스"·R2 inverse-prefix — 유예분은 그 병합분에 소비됨) → 전체 취소(전송은 머신
+  //   경로의 multi-head/pending이 담당 — 여기서 중복 head 송신 차단) ④유예 홑자모가 커밋
+  //   음절의 초성(유예 "ㅁ" ⊂ 커밋 "마") → 흡수·전체 취소.
   // 과잉 취소는 유실, 과소 취소는 40ms 뒤 복제 — 받아간 만큼만 정확히 지운다.
   const cancelDeferredIfTaken = (data: string, why: string) => {
     if (!deferred || !data) return;
@@ -101,6 +107,9 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
     } else if (deferred.startsWith(data)) {
       actions.push({ debug: `DEFER-cancel-partial(${why}) "${data}" 잔여 "${deferred.slice(data.length)}"` });
       deferred = deferred.slice(data.length);
+    } else if (data.startsWith(deferred)) {
+      actions.push({ debug: `DEFER-cancel-subsumed(${why}) "${deferred}" ⊂ merged "${data}"` });
+      deferred = "";
     } else if (isChoseongOf(deferred, data)) {
       actions.push({ debug: `DEFER-cancel-absorbed(${why}) "${deferred}" ⊂ "${data}"` });
       deferred = "";
@@ -235,7 +244,8 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
     }
     case "deferTimeout": {
       // DEFER_MS 동안 아무 input 머신 이벤트도 이 글자를 받아가지 않았다 —
-      // insertFromComposition만 쓰는 WebKit 변종(머신 미작동)이므로 유예분을 그대로 전송.
+      // 머신이 받아가지 않은 확정분(onData 도착 계약 — composition inputType은 직접 send하지
+      // 않고 onData가 나른다)이므로 유예분을 그대로 전송한다(유실 0).
       releaseDeferred("timeout");
       break;
     }

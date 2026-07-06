@@ -233,7 +233,7 @@ describe("3차 재발(2026-07-06) — 이중배달 defer 회귀: 초성 선유�
   });
 });
 
-describe("defer 타임아웃 — 머신 미작동 변종(insertFromComposition만) 유실 0", () => {
+describe("defer 타임아웃 — onData 도착 계약: 머신이 안 받아간 유예분은 타임아웃 전송(유실 0)", () => {
   it("onData '히'(wk) → 타임아웃 ⇒ '히' 전송 (차단이 아닌 유예 — 유실 0)", () => {
     const r = run([onDataWk("히"), deferTimeout()]);
     expect(r.bytes).toBe("히");
@@ -380,5 +380,37 @@ describe("R1 리뷰 보강 회귀(2026-07-06) — 누적·역전·U+1100 초성"
       keydown(32, " "),
     ], { pending: "완" });
     expect(r.bytes).toBe("완료");
+  });
+});
+
+describe("R2 리뷰 보강 회귀(2026-07-06) — inverse-prefix: 병합 커밋이 유예분을 포함", () => {
+  it("R2-①: onData '마' → insertText '마스'(병합) ⇒ '마스' (유예분 subsumed 취소 — 마마스 차단)", () => {
+    const r = run([
+      onDataWk("마"),
+      input("insertText", "마스"),
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마스"); // 수정 전에는 "마마스" (stale 방출 + multi-head 중복)
+    expect(r.state.deferred).toBe("");
+  });
+
+  it("R2-①b: onData '마' → insertText '마스터'(3음절 병합) ⇒ '마스터'", () => {
+    const r = run([
+      onDataWk("마"),
+      input("insertText", "마스터"),
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마스터"); // 수정 전에는 "마마스터"
+  });
+
+  it("R2-①c: replacement 경로 — insertText 'ㅁ' → onData '마' → RT '마스' ⇒ '마스' (마스마 차단)", () => {
+    const r = run([
+      input("insertText", "ㅁ"),
+      onDataWk("마"),
+      input("insertReplacementText", "마스"),
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마스"); // 수정 전에는 "마스마" (RT 무취소 → 경계에서 유예분 후행 방출)
+    expect(r.state.deferred).toBe("");
   });
 });
