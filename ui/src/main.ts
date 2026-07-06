@@ -4,7 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { imeStep, initialImeState, type ImeEvent } from "./ime";
+import { imeStep, initialImeState, DEFER_MS, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -1610,29 +1610,41 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   const dbg = (line: string) => {
     if (imeDbg) invoke("log_ime", { line: `[s${sid}] ${line}` }).catch(() => {});
   };
+  // ★F: 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium 계열은
+  // xterm.js 네이티브 composition이 완성 음절을 onData로 정확히 1회 발화하므로, 이 우회를 함께 켜면
+  // input 핸들러가 pending에 버퍼한 글자를 리듀서가 보내고 onData의 send(data)가 다시 보내
+  // 이중 전송된다("너"->"너너" 전 글자 중복 — Windows 실측).
+  // ∴ WKWebView(AppleWebKit, 비-Chromium)에서만 input/keydown/blur/composition 리스너를 붙이고
+  // onData의 한글 defer 경로(wk 플래그)도 이 판정과 동일 기준으로만 켠다(Windows 회귀 0).
+  const _ua = navigator.userAgent;
+  const isWKWebView = /AppleWebKit/.test(_ua) && !/Chrome|Chromium|Edg\//.test(_ua);
   let imeState = initialImeState();
+  // ★한글 onData 유예 타이머 (3차 재발 수리 — 리듀서의 armDefer 액션이 (재)장전 지시):
+  // 리듀서는 순수 함수라 시간을 모른다 — 타이머만 여기서 돌리고, 만료 시 deferTimeout 이벤트로
+  // 되먹인다. 취소는 리듀서 상태(deferred="")가 담당하므로 타이머 자체는 만료 시 no-op이어도 안전.
+  let imeDeferTimer: number | undefined;
   const applyIme = (event: ImeEvent) => {
     const { state, actions } = imeStep(imeState, event);
     imeState = state;
     for (const a of actions) {
       if ("send" in a) sendRaw(a.send);
-      else dbg(a.debug);
+      else if ("armDefer" in a) {
+        if (imeDeferTimer !== undefined) clearTimeout(imeDeferTimer);
+        imeDeferTimer = window.setTimeout(() => {
+          imeDeferTimer = undefined;
+          applyIme({ kind: "deferTimeout" });
+        }, DEFER_MS);
+      } else dbg(a.debug);
     }
   };
 
   term.onData((data) => {
     // 완성 음절은 그대로 PTY로 — 잔여 pending이 있으면 리듀서가 순서 보존 후 함께 전송(안전장치).
     // Windows 등 비-WKWebView에선 input 핸들러 미배선이라 pending이 항상 비어 순수 send(data)와 동일.
-    applyIme({ kind: "onData", data });
+    // wk=true(WKWebView)면 한글 data는 리듀서가 유예(defer)해 이중배달을 흡수한다(3차 재발 수리).
+    dbg(`onData recv "${data}" pending="${imeState.pending}" deferred="${imeState.deferred}"`);
+    applyIme({ kind: "onData", data, wk: isWKWebView });
   });
-
-  // ★F: 위 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium 계열은
-  // xterm.js 네이티브 composition이 완성 음절을 onData로 정확히 1회 발화하므로, 이 우회를 함께 켜면
-  // input 핸들러가 pending에 버퍼한 글자를 리듀서가 보내고 onData의 send(data)가 다시 보내
-  // 이중 전송된다("너"->"너너" 전 글자 중복 — Windows 실측).
-  // ∴ WKWebView(AppleWebKit, 비-Chromium)에서만 input/keydown/blur/composition 리스너를 붙인다(macOS 회귀 0).
-  const _ua = navigator.userAgent;
-  const isWKWebView = /AppleWebKit/.test(_ua) && !/Chrome|Chromium|Edg\//.test(_ua);
   if (isWKWebView) {
     const ta = term.textarea;
     if (ta) {

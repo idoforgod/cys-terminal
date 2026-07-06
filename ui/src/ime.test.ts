@@ -3,27 +3,32 @@
 // 각 프로필은 실기기 WebKit이 발화한 DOM 이벤트 순서다. 리듀서를 그 순서로 돌려
 // PTY로 나가는 바이트(sends)와 잔여 조합 상태(pending)를 검증한다.
 import { describe, it, expect } from "bun:test";
-import { imeStep, initialImeState, isHangulText, type ImeEvent, type ImeState } from "./ime";
+import { imeStep, initialImeState, isHangulText, isChoseongOf, type ImeEvent, type ImeState } from "./ime";
 
-/** 이벤트 시퀀스를 리듀서에 흘려 전송 바이트·debug·최종 state를 수집한다. */
-function run(events: ImeEvent[], start: ImeState = initialImeState()) {
-  let state = start;
+/** 이벤트 시퀀스를 리듀서에 흘려 전송 바이트·debug·armDefer 횟수·최종 state를 수집한다. */
+function run(events: ImeEvent[], start?: Partial<ImeState>) {
+  let state: ImeState = { ...initialImeState(), ...start };
   const sends: string[] = [];
   const debugs: string[] = [];
+  let armDefers = 0;
   for (const ev of events) {
     const r = imeStep(state, ev);
     state = r.state;
     for (const a of r.actions) {
       if ("send" in a) sends.push(a.send);
+      else if ("armDefer" in a) armDefers++;
       else debugs.push(a.debug);
     }
   }
-  return { state, sends, debugs, bytes: sends.join("") };
+  return { state, sends, debugs, armDefers, bytes: sends.join("") };
 }
 
 const input = (inputType: string, data: string | null): ImeEvent => ({ kind: "input", inputType, data });
 const keydown = (keyCode: number, key: string): ImeEvent => ({ kind: "keydown", keyCode, key });
 const onData = (data: string): ImeEvent => ({ kind: "onData", data });
+/** macOS WKWebView 배선의 onData(wk=true) — 한글 defer 경로 활성. */
+const onDataWk = (data: string): ImeEvent => ({ kind: "onData", data, wk: true });
+const deferTimeout = (): ImeEvent => ({ kind: "deferTimeout" });
 
 describe("Profile C — 혼성(신규 버그): insertText 자모 커밋 후 표준 composition 진행", () => {
   it("insertText 'ㄴ' → compositionstart → onData '너' ⇒ 정확히 '너'만 전송(자모 유출 없음)", () => {
@@ -169,6 +174,141 @@ describe("빈 onData 유출 가드 — 조합중 홑자모 (2026-07-06 실기기
     expect(r.bytes).toBe("안"); // 유실 0 — "안"은 PTY로 나간다
     expect(r.sends).toContain("안");
     expect(r.state.pending).toBe("");
+  });
+});
+
+describe("3차 재발(2026-07-06) — 이중배달 defer 회귀: 초성 선유출·음절 복제", () => {
+  // 주인님 실증 샘플(master pane 실타이핑): "ㅁ마스터다"·"ㅎ화"·"ㄷ되"(패턴 A 초성 선유출),
+  // "다다"·"해해"(패턴 B 음절 복제). 0.12.20 업스트림 리듀서 재작성 때 1차 defer(017e20e)가
+  // 소실되어 onData 즉시 send가 부활한 것 — 아래 시퀀스는 수리 전 리듀서에서 샘플과 동일한
+  // 바이트열을 재생함을 확인했다(패턴A: "ㅁ"+"마"+DEL"마"→화면 "ㅁ마" · 패턴B: "다다").
+  it("패턴 A: insertText 'ㅁ' → onData '마' → RT '마' ⇒ '마'만 (초성 선유출 차단)", () => {
+    const r = run([
+      input("insertText", "ㅁ"), // 머신이 초성 커밋 → pending "ㅁ"
+      onDataWk("마"), // xterm 이중배달(완성 음절) — 수리 전: flush가 "ㅁ" 유출 + "마" 즉시 send
+      input("insertReplacementText", "마"), // 머신이 같은 글자를 받아감 → 유예분 취소
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마"); // 수리 전: "ㅁ마\x7f마" (화면 "ㅁ마")
+    expect(r.state.deferred).toBe("");
+    expect(r.debugs).toContain('DEFER-cancel(insertReplacementText) "마"');
+  });
+
+  it("패턴 A 키마다 이중배달(1차 프로필): onData 'ㅁ'→insertText 'ㅁ'→onData '마'→RT '마' ⇒ '마'만", () => {
+    const r = run([
+      onDataWk("ㅁ"), // xterm이 조합 시작 자모도 배달 — 수리 전: 즉시 send(자모 유출)
+      input("insertText", "ㅁ"), // 머신이 받아감 → 유예 취소, pending "ㅁ"
+      onDataWk("마"),
+      input("insertReplacementText", "마"),
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마"); // 수리 전: "ㅁㅁ마\x7f마"
+    expect(r.debugs).toContain('DEFER-cancel(insertText) "ㅁ"');
+  });
+
+  it("패턴 B: insertText 'ㄷ' → RT '다' → onData '다' ⇒ '다'만 (음절 복제 차단)", () => {
+    const r = run([
+      input("insertText", "ㄷ"),
+      input("insertReplacementText", "다"), // pending "다"
+      onDataWk("다"), // xterm 이중배달 — 수리 전: flush "다" + send "다" = "다다"
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("다"); // 수리 전: "다다"
+    expect(r.debugs).toContain('DUP-drop(onData) "다" (== pending)');
+  });
+
+  it("실증 샘플 재생: '너는' 어절 — 이중배달 혼입에도 '너는' 정확 출력", () => {
+    // 너(ㄴ+ㅓ) 는(ㄴ+ㅡ+ㄴ): 머신 체인 + 간헐 onData 이중배달 혼입 시퀀스
+    const r = run([
+      input("insertText", "ㄴ"), // pending "ㄴ"
+      onDataWk("너"), // 이중배달
+      input("insertReplacementText", "너"), // 취소·pending "너"
+      input("insertText", "ㄴ"), // 다음 음절 초성 → flush "너", pending "ㄴ"
+      input("insertReplacementText", "느"), // pending "느"
+      onDataWk("는"), // 이중배달(완성)
+      input("insertReplacementText", "는"), // 취소·pending "는"
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("너는"); // 수리 전: "너너는..." 류 복제/유출
+  });
+});
+
+describe("defer 타임아웃 — 머신 미작동 변종(insertFromComposition만) 유실 0", () => {
+  it("onData '히'(wk) → 타임아웃 ⇒ '히' 전송 (차단이 아닌 유예 — 유실 0)", () => {
+    const r = run([onDataWk("히"), deferTimeout()]);
+    expect(r.bytes).toBe("히");
+    expect(r.armDefers).toBe(1); // 배선에 타이머 장전 지시
+    expect(r.state.deferred).toBe("");
+  });
+
+  it("취소된 유예분은 타임아웃에 전송 없음 (복제 0)", () => {
+    const r = run([onDataWk("ㅁ"), input("insertText", "ㅁ"), deferTimeout(), keydown(13, "Enter")]);
+    expect(r.bytes).toBe("ㅁ"); // Enter가 pending "ㅁ" flush — 유예분 복제 없음
+  });
+
+  it("타임아웃 시 pending 초성이 유예 음절에 흡수된 상태면 폐기 (유출 0)", () => {
+    // 머신이 insertText까지만 발화하고 멈춘 변종: pending "ㅁ" + deferred "마"
+    const r = run([input("insertText", "ㅁ"), onDataWk("마"), deferTimeout()]);
+    expect(r.bytes).toBe("마"); // "ㅁ마" 아님 — 초성은 그 음절의 조합중 상태
+    expect(r.state.pending).toBe("");
+    expect(r.debugs).toContain('DROP(absorbed-by-deferred) "ㅁ"');
+  });
+
+  it("keydown(Enter)이 타임아웃보다 먼저 와도 경계 유출 없음", () => {
+    const r = run([input("insertText", "ㅁ"), onDataWk("마"), keydown(13, "Enter")]);
+    expect(r.bytes).toBe("마"); // releaseDeferred(keydown)가 흡수 해소 후 방출
+  });
+
+  it("비한글 onData는 유예분 먼저 방출 후 데이터 전송 (순서 보존)", () => {
+    const r = run([onDataWk("가"), onDataWk("\r")]);
+    expect(r.sends).toEqual(["가", "\r"]);
+  });
+});
+
+describe("wk 프로필 재생 — 기존 프로필 A·C의 defer 경로 등가", () => {
+  it("Profile C(wk): insertText 'ㄴ' → compositionstart → onData '너' → 타임아웃 ⇒ '너'", () => {
+    const r = run([
+      input("insertText", "ㄴ"),
+      { kind: "compositionstart" },
+      onDataWk("너"),
+      deferTimeout(),
+    ]);
+    expect(r.bytes).toBe("너");
+    expect(r.state.pending).toBe("");
+  });
+
+  it("Profile A(wk): composition 3종 → onData '한' → 타임아웃 ⇒ '한' 1회", () => {
+    const r = run([
+      { kind: "compositionstart" },
+      { kind: "compositionupdate" },
+      { kind: "compositionend" },
+      onDataWk("한"),
+      deferTimeout(),
+    ]);
+    expect(r.sends).toEqual(["한"]);
+  });
+
+  it("영문·비한글(wk)은 유예 없이 즉시 전송 (지연 0·회귀 0)", () => {
+    const r = run([onDataWk("a"), onDataWk("1")]);
+    expect(r.sends).toEqual(["a", "1"]);
+    expect(r.armDefers).toBe(0);
+  });
+
+  it("비wk 배선(Windows WebView2)은 한글 onData도 종전 즉시 send (회귀 0)", () => {
+    const r = run([onData("너")]);
+    expect(r.sends).toEqual(["너"]);
+    expect(r.armDefers).toBe(0);
+  });
+});
+
+describe("isChoseongOf — 초성 흡수 판별", () => {
+  it("초성 매칭만 참", () => {
+    expect(isChoseongOf("ㅁ", "마")).toBe(true);
+    expect(isChoseongOf("ㅎ", "화")).toBe(true);
+    expect(isChoseongOf("ㄴ", "마")).toBe(false);
+    expect(isChoseongOf("ㅁㅁ", "마")).toBe(false);
+    expect(isChoseongOf("ㅁ", "")).toBe(false);
+    expect(isChoseongOf("ㅁ", "m")).toBe(false);
   });
 });
 
