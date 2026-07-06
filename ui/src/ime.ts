@@ -38,6 +38,12 @@ export const initialImeState = (): ImeState => ({ pending: "" });
 const HANGUL_TEXT = /^[ㄱ-ㆎᄀ-ᇿ가-힣]+$/;
 export const isHangulText = (t: string) => HANGUL_TEXT.test(t);
 
+// 조합 중 자모만(호환자모 ㄱ-ㆎ·조합자모 ᄀ-ᇿ) — 완성형 음절(가-힣)은 제외.
+// 빈 onData가 도착했을 때 pending이 '아직 조합 중인 자모'인지 판별해, 완성음절 앞으로
+// 유출시키지 않고 조합 지속으로 두기 위한 기준.
+const INCOMPLETE_JAMO = /^[ㄱ-ㆎᄀ-ᇿ]+$/;
+export const isIncompleteJamo = (t: string) => INCOMPLETE_JAMO.test(t);
+
 export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
   const actions: ImeAction[] = [];
   let pending = state.pending;
@@ -111,6 +117,16 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
       break;
     }
     case "onData": {
+      // ★빈 onData 유출 가드 (2026-07-06 실기기 계측 확정): 사용자가 조합 중 홑자모까지
+      // 되돌린 상태(pending='ㅎ' 등)에서 데이터 없는 onData("")가 도착하면, 아래 flush가 그
+      // 조합중 자모를 완성음절 앞으로 유출시킨다(실 PTY 유출 5건: ㅇㅈㅇㅎㄱ). 빈 onData는
+      // 완성분을 나르지 않으므로 조합중 자모는 flush하지 않고 pending에 그대로 둔다 — 후속
+      // 조합/input 이벤트가 흡수(drop)하거나 완성 커밋한다(유출0·유실0). 완성형 pending(가-힣)은
+      // 진짜 직전 음절이므로 종전대로 flush(순서 보존).
+      if (event.data === "" && isIncompleteJamo(pending)) {
+        actions.push({ debug: `onData(empty) keep composing jamo "${pending}"` });
+        break;
+      }
       // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송) 뒤이어 완성 음절을 그대로 PTY로.
       flush("onData");
       actions.push({ send: event.data });

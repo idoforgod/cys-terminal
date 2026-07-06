@@ -140,6 +140,38 @@ describe("keydown/blur flush · 229 무전송 · onData 순서 보존", () => {
   });
 });
 
+describe("빈 onData 유출 가드 — 조합중 홑자모 (2026-07-06 실기기 계측 회귀)", () => {
+  // 실캡처($TMPDIR/cys-ime.log · 오늘 세션): 사용자가 조합 중 홑자모까지 되돌린 상태에서
+  // 데이터 없는 onData("")가 도착 → 수정 전에는 flush("onData")가 그 자모를 완성음절 앞으로
+  // 유출(실 PTY 유출 5건: ㅇㅈㅇㅎㄱ). 수정 후에는 유출 0·유실 0.
+  it("pending 'ㅎ'(조합중) + onData('') ⇒ 전송 0, pending 'ㅎ' 유지(유출 차단)", () => {
+    const r = run([onData("")], { pending: "ㅎ" });
+    expect(r.sends).toEqual([]); // 수정 전에는 ["ㅎ"] (자모 유출)
+    expect(r.state.pending).toBe("ㅎ"); // 조합 지속 — 후속 이벤트가 흡수/완성
+    expect(r.debugs).toContain('onData(empty) keep composing jamo "ㅎ"');
+  });
+
+  it("실캡처 재생: insertReplacementText로 홑자모 복귀 후 빈 onData ⇒ 자모 미유출", () => {
+    // 로그: ...RT '하'←'합'←'하'←'ㅎ' 후 onData recv "" pending="ㅎ" → FLUSH(onData) "ㅎ"(버그)
+    const r = run([
+      input("insertReplacementText", "합"), // pending "하" → "합"  (seed pending "하")
+      input("insertReplacementText", "하"), // 재조합 "합" → "하"
+      input("insertReplacementText", "ㅎ"), // 홑자모까지 되돌림 pending "ㅎ"
+      onData(""), // 빈 onData — 유출 지점
+    ], { pending: "하" });
+    expect(r.bytes).toBe(""); // 조합중 자모는 새어나가지 않는다
+    expect(r.state.pending).toBe("ㅎ");
+  });
+
+  it("완성형 pending은 빈 onData에도 종전대로 flush(유실 방지 — 가드는 조합중 자모 한정)", () => {
+    const r = run([onData("")], { pending: "안" });
+    // 완성음절은 진짜 직전 음절 → 순서 보존 flush 유지(뒤따르는 빈 data send는 무해 no-op).
+    expect(r.bytes).toBe("안"); // 유실 0 — "안"은 PTY로 나간다
+    expect(r.sends).toContain("안");
+    expect(r.state.pending).toBe("");
+  });
+});
+
 describe("isHangulText — 자모·완성형만 참", () => {
   it("자모/완성형 참, 그 외 거짓", () => {
     expect(isHangulText("ㄴ")).toBe(true);
