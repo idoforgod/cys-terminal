@@ -18,8 +18,9 @@ export interface ImeState {
    * (insertText→insertReplacementText) 두 경로가 같은 글자를 모두 배달한다. 0.12.20 업스트림
    * 리듀서 재작성 때 1차 수리(defer)가 소실되어 onData 즉시 send가 부활 — 초성 선유출
    * ("ㅁ마")·음절 복제("다다")가 재발했다. 한글 onData는 여기 buffered 후 DEFER_MS 유예:
-   * 같은 글자를 input 머신이 받아가면(exact match) 취소, 아무도 안 받아가면 타임아웃 전송
-   * (insertFromComposition만 쓰는 WebKit 변종 유실 0 — 차단이 아닌 유예).
+   * input 머신이 받아가면 취소(동일=전체·앞부분=부분·초성흡수=전체), 아무도 안 받아가면
+   * 타임아웃 전송(insertFromComposition만 쓰는 WebKit 변종 유실 0 — 차단이 아닌 유예).
+   * 방출 시 pending(구분)이 유예분보다 먼저 나간다(시간순 보존).
    */
   deferred: string;
 }
@@ -60,14 +61,19 @@ export const isHangulText = (t: string) => HANGUL_TEXT.test(t);
 const INCOMPLETE_JAMO = /^[ㄱ-ㆎᄀ-ᇿ]+$/;
 export const isIncompleteJamo = (t: string) => INCOMPLETE_JAMO.test(t);
 
-// 완성형 음절의 초성(호환자모) — pending 홑자모가 deferred 첫 음절의 조합중 초성인지 판별용.
-// (예: pending "ㅁ"은 deferred "마"의 초성 → 그 음절에 흡수된 조합중 상태이므로 별도 전송 금지)
+// 완성형 음절의 초성 — pending/deferred 홑자모가 어느 음절의 조합중 초성인지 판별용.
+// (예: "ㅁ"은 "마"의 초성 → 그 음절에 흡수된 조합중 상태이므로 별도 전송 금지)
+// 호환자모(ㄱ-ㅎ)와 조합자모 초성(U+1100-1112) 둘 다 판별한다 — U+1100 범위는 완성형
+// 초성 인덱스와 동일 순서라 직접 대조(리뷰 R1: 호환자모 한정이라 "마ᄆ" 흡수 실패하던 갭).
 const CHOSEONG = ["ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"];
 export const isChoseongOf = (jamo: string, syllable: string) => {
   if (jamo.length !== 1 || !syllable) return false;
   const c = syllable.codePointAt(0)! - 0xac00;
   if (c < 0 || c > 11171) return false;
-  return CHOSEONG[Math.floor(c / 588)] === jamo;
+  const li = Math.floor(c / 588);
+  const j = jamo.codePointAt(0)!;
+  if (j >= 0x1100 && j <= 0x1112) return j - 0x1100 === li;
+  return CHOSEONG[li] === jamo;
 };
 
 export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
@@ -82,17 +88,29 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
       pending = "";
     }
   };
-  // input 머신이 같은 글자를 받아갔다 — 유예분 취소(이중배달 차단). exact match 한정:
-  // 과잉 취소(≠)는 유실, 과소 취소는 40ms 뒤 복제이므로, 이중배달 프로필이 두 경로에
-  // 문자열을 동일하게 배달한다는 1차 실측 불변식에 정확히 맞춘다.
+  // input 머신이 이 글자를 받아갔다 — 유예분 취소(이중배달 차단). 기본은 exact match
+  // (1차 실측 불변식: 두 경로가 같은 문자열을 배달)이나, 리뷰 R1 보강 2건:
+  // ①다중 onData 누적(예: "ㅁ"+"마"="ㅁ마") 중 앞쪽만 받아가면 그만큼만 부분 취소
+  // ②유예 홑자모가 머신 커밋 음절의 초성이면(예: 유예 "ㅁ" ⊂ 커밋 "마") 흡수 — 전체 취소.
+  // 과잉 취소는 유실, 과소 취소는 40ms 뒤 복제 — 받아간 만큼만 정확히 지운다.
   const cancelDeferredIfTaken = (data: string, why: string) => {
-    if (deferred && deferred === data) {
+    if (!deferred || !data) return;
+    if (deferred === data) {
       actions.push({ debug: `DEFER-cancel(${why}) "${deferred}"` });
+      deferred = "";
+    } else if (deferred.startsWith(data)) {
+      actions.push({ debug: `DEFER-cancel-partial(${why}) "${data}" 잔여 "${deferred.slice(data.length)}"` });
+      deferred = deferred.slice(data.length);
+    } else if (isChoseongOf(deferred, data)) {
+      actions.push({ debug: `DEFER-cancel-absorbed(${why}) "${deferred}" ⊂ "${data}"` });
       deferred = "";
     }
   };
-  // 유예분 방출 — pending이 그 첫 음절의 조합중 초성이면 흡수된 상태이므로 폐기(유출 금지),
-  // pending이 유예분과 동일하면 이중배달이므로 한쪽만 전송.
+  // 유예분 방출 — pending과의 관계를 해소한 뒤 시간순으로 내보낸다:
+  // ①pending == deferred → 이중배달, 한쪽만 전송 ②pending이 deferred 첫 음절의 조합중
+  // 초성 → 흡수된 상태이므로 폐기(유출 금지) ③그 외 pending은 유예분보다 먼저 커밋된
+  // 구분(舊分) → 먼저 flush해 시간순 보존(리뷰 R1: 유예분 선전송이 "나"+"가"를 "가나"로
+  // 뒤집던 역전 수정).
   const releaseDeferred = (why: string) => {
     if (!deferred) return;
     if (pending && pending === deferred) {
@@ -101,6 +119,8 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
     } else if (pending && isChoseongOf(pending, deferred)) {
       actions.push({ debug: `DROP(absorbed-by-deferred) "${pending}"` });
       pending = "";
+    } else if (pending) {
+      flush(`${why}·pending-first`);
     }
     actions.push({ debug: `DEFER-send(${why}) "${deferred}"` });
     actions.push({ send: deferred });
@@ -124,8 +144,14 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
         // 표준 composition inputType 관측 → 조합이 pending 자모를 흡수했다 → drop.
         dropSuperseded();
       } else if (inputType === "insertText" && data && isHangulText(data)) {
-        // ★머신이 이 글자를 받아간다 — onData가 유예해 둔 동일 글자를 취소(이중배달 차단).
+        // ★머신이 이 글자를 받아간다 — onData가 유예해 둔 동일/포함 글자를 취소(이중배달 차단).
+        const deferredBefore = deferred;
         cancelDeferredIfTaken(data, "insertText");
+        // 취소가 전혀 안 맞았을 때만: 남은 유예분 = 머신이 받아가지 않은 구(舊) 확정분
+        // (조합전용 프로필의 직전 음절) — 새 커밋을 pending에 앉히기 전에 방출해 시간순 보존
+        // (리뷰 R1 역전: "가" 유예 후 "나" 커밋 = "가나"). 부분 취소가 일어난 잔여분은 반대로
+        // 머신이 소비 중인 누적 스트림(신분)이므로 방출하지 않는다 — 후속 취소/타임아웃이 처리.
+        if (deferred && deferred === deferredBefore) releaseDeferred("insertText·stale");
         // 직전 조합 확정 후 새 커밋을 '수정 가능 창'(pending)에 둔다. 병합 커밋(2음절+)은
         // 마지막 음절만 수정 창에 — 앞 음절들은 확정분이므로 즉시 전송.
         flush("insertText");

@@ -322,3 +322,63 @@ describe("isHangulText — 자모·완성형만 참", () => {
     expect(isHangulText("")).toBe(false);
   });
 });
+
+describe("R1 리뷰 보강 회귀(2026-07-06) — 누적·역전·U+1100 초성", () => {
+  it("R1-①: 다중 onData 누적 'ㅁ'+'마' → insertText 'ㅁ' 부분취소 → RT '마' 취소 ⇒ '마' 1회", () => {
+    const r = run([
+      onDataWk("ㅁ"), // deferred "ㅁ"
+      onDataWk("마"), // deferred "ㅁ마" (누적 — 타이머 미만료 고속 입력)
+      input("insertText", "ㅁ"), // 앞부분만 받아감 → 부분취소, 잔여 "마"
+      input("insertReplacementText", "마"), // 잔여도 받아감 → 전체 취소
+      keydown(32, " "), // 경계
+    ]);
+    expect(r.bytes).toBe("마"); // 수정 전에는 "마ㅁ마"류 복제
+    expect(r.state.deferred).toBe("");
+  });
+
+  it("R1-①b: 유예 홑자모가 머신 커밋 음절의 초성이면 흡수 취소 (유예 'ㅁ' ⊂ 커밋 '마')", () => {
+    const r = run([
+      onDataWk("ㅁ"),
+      input("insertText", "마"), // 머신이 조합 완성분을 직접 커밋
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("마"); // 수정 전에는 타임아웃/경계에서 "ㅁ" 유출
+  });
+
+  it("R1-②: pending(구분) '나' + 유예(신분) '가' → keydown ⇒ '나가' (시간순 — 역전 차단)", () => {
+    const r = run([onDataWk("가"), keydown(13, "Enter")], { pending: "나" });
+    expect(r.bytes).toBe("나가"); // 수정 전에는 "가나" (유예분 선전송 역전)
+  });
+
+  it("R1-②b: 유예(구분) '가' 잔존 중 insertText '나' 신규 커밋 ⇒ '가' 먼저 방출 (가나)", () => {
+    const r = run([
+      onDataWk("가"), // 조합전용 프로필의 직전 음절 — 머신이 안 받아감
+      input("insertText", "나"), // 다음 음절 신규 커밋 (유예분보다 신분)
+      keydown(13, "Enter"),
+    ]);
+    expect(r.bytes).toBe("가나"); // 시간순: 가(구) → 나(신)
+    expect(r.state.deferred).toBe("");
+  });
+
+  it("R1-②c: deferTimeout도 pending(구분) 우선 — pending '나' + 유예 '가' ⇒ '나가'", () => {
+    const r = run([onDataWk("가"), deferTimeout()], { pending: "나" });
+    expect(r.bytes).toBe("나가");
+  });
+
+  it("R1-③: U+1100 조합자모 초성도 흡수 판별 — pending 'ᄆ'(U+1106) + 유예 '마' ⇒ '마'만", () => {
+    const r = run([onDataWk("마"), deferTimeout()], { pending: "ᄆ" });
+    expect(r.bytes).toBe("마"); // 수정 전에는 "마ᄆ"류 (흡수 실패 → 자모 유출)
+    expect(isChoseongOf("ᄆ", "마")).toBe(true);
+    expect(isChoseongOf("ᄂ", "마")).toBe(false); // ᄂ은 마의 초성 아님
+  });
+
+  it("기존 불변 재확인: 정상 페어링(onData 자모→insertText 동일)은 종전과 동일 경로", () => {
+    const r = run([
+      onDataWk("ㄹ"),
+      input("insertText", "ㄹ"),
+      input("insertReplacementText", "료"),
+      keydown(32, " "),
+    ], { pending: "완" });
+    expect(r.bytes).toBe("완료");
+  });
+});
