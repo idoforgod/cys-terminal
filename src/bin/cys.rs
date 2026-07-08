@@ -3936,6 +3936,19 @@ fn screen_shows_launch_failure(flat: &str) -> bool {
         || flat.contains("isnotrecognizedasaninternalorexternalcommand")
 }
 
+/// 기동 화면(공백 제거 평탄화)에 claude 최초 실행 'Bypass Permissions mode' 수락 메뉴가
+/// 떠 있는지 판정. 이 메뉴는 ready_marker(❯)를 포함하므로 폴링 루프가 ready 이전에 이 술어로
+/// 감지해 안전 선택지('Yes, I accept')로 확정해야 한다 — 그러지 않으면 기본 커서 'No, exit'가
+/// 조기 주입 Return에 선택돼 노드가 죽는다(Windows 크루 전멸의 근본원인). 실행 중 표시
+/// ("bypass permissions on")는 메뉴가 아니므로 수락 옵션 문자열까지 함께 요구해 오탐을 배제한다.
+/// folder-trust와 대칭인 first-run 게이트 술어.
+/// ★관찰 기준(2026-07·Claude Code): 정확한 문구 'Bypass Permissions mode'/'Yes, I accept'에
+/// 고정(대소문자 구분). Anthropic이 이 문구·대소문자를 바꾸면 술어가 조용히 false→회귀하므로,
+/// 문구 변경 시 이 토큰과 아래 bypass_menu_detection 테스트 픽스처를 함께 갱신하라.
+fn screen_needs_bypass_accept(flat: &str) -> bool {
+    flat.contains("BypassPermissionsmode") && flat.contains("Yes,Iaccept")
+}
+
 /// 살아있는 surface 위에서: 에이전트 기동 → 준비 폴링 → 지침 주입 → 메타 등록.
 /// RC-3(B′): agents.json env 값의 셸 확장을 Rust에서 해소한다(Windows용 — unix는 셸이 직접 전개).
 /// 지원 패턴: `${VAR:-default}`(현 agents.json 패턴)·`$HOME`·선두 `~`. HOME은 Windows에서
@@ -4162,6 +4175,23 @@ fn boot_agent_on_surface(
         }
         if flat.contains("trustthisfolder") || flat.contains("Doyoutrust") {
             eprintln!("[launch-agent] folder-trust prompt detected → confirming");
+            request(
+                "surface.send_key",
+                json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+            )?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        }
+        // bypass-permissions 수락 메뉴(folder-trust와 대칭인 first-run 게이트): 화면에 ❯가 있어
+        // 아래 ready_marker에 오탐되기 전에 여기서 감지해 안전 선택지로 확정한다. 기본 커서는 위험한
+        // 'No, exit'라 'Yes, I accept'(2번)로 Down 이동 후 Return 확정 → continue(ready 오판 금지).
+        if screen_needs_bypass_accept(&flat) {
+            eprintln!("[launch-agent] bypass-permissions prompt detected → accepting");
+            request(
+                "surface.send_key",
+                json!({"surface_id": sid, "key": "Down", "authoritative": true}),
+            )?;
+            std::thread::sleep(std::time::Duration::from_millis(300)); // Down 반영 후 Return(순서 보장)
             request(
                 "surface.send_key",
                 json!({"surface_id": sid, "key": "Return", "authoritative": true}),
@@ -6315,7 +6345,12 @@ fn adapter_ready(agent: &Option<String>, idle: bool, idle_secs: u64, scrollback_
         .and_then(|a| load_agent_spec(a).ok())
         .and_then(|spec| spec["ready_marker"].as_str().map(|s| s.to_string()));
     match marker {
-        Some(m) if !m.is_empty() => scrollback_tail.contains(&m),
+        // ready_marker(❯)는 first-run 수락 메뉴에도 나타나 오탐할 수 있으므로, bypass 메뉴가
+        // 떠 있으면 아직 ready로 보지 않는다(reinject 경로 방어 — launch-agent 루프와 대칭).
+        Some(m) if !m.is_empty() => {
+            let flat: String = scrollback_tail.chars().filter(|c| !c.is_whitespace()).collect();
+            scrollback_tail.contains(&m) && !screen_needs_bypass_accept(&flat)
+        }
         _ => idle && idle_secs >= QUIET_THRESHOLD_SECS, // ready_marker 부재 → fallback
     }
 }
@@ -8642,6 +8677,38 @@ mod tests {
         )));
         // 빈 화면
         assert!(!screen_shows_launch_failure(&flatten_ws("")));
+    }
+
+    /// ★회귀 박제: bypass-permissions 수락 메뉴 감지 — ready_marker(❯) 오탐으로 노드가 죽던
+    /// 근본버그(Windows 크루 전멸)의 회귀 잠금. 메뉴=수락필요, 실행중/폴더신뢰/실제프롬프트=아님.
+    #[test]
+    fn bypass_menu_detection() {
+        // 양성: 실제 bypass 수락 메뉴(❯ 포함) → 수락 필요
+        assert!(
+            screen_needs_bypass_accept(&flatten_ws(
+                "WARNING: Claude Code running in Bypass Permissions mode\n\n\
+                 By proceeding, you accept all responsibility for actions ...\n\
+                 ❯ 1. No, exit\n  2. Yes, I accept\n\nEnter to confirm · Esc to cancel"
+            )),
+            "bypass 수락 메뉴를 감지하지 못함"
+        );
+        // 음성: 실행 중 표시(❯ 포함하지만 메뉴 아님) → 오판 금지
+        assert!(
+            !screen_needs_bypass_accept(&flatten_ws(
+                "Opus 4.8 (1M context)\n⏵⏵ bypass permissions on (shift+tab to cycle)\n❯ "
+            )),
+            "실행 중 'bypass permissions on' 표시를 메뉴로 오판"
+        );
+        // 음성: folder-trust 메뉴(별도 핸들러 소관) → bypass 메뉴 아님
+        assert!(
+            !screen_needs_bypass_accept(&flatten_ws(
+                "Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder\n  2. No, exit"
+            )),
+            "folder-trust 메뉴를 bypass 메뉴로 오판"
+        );
+        // 음성: 정상 프롬프트 / 빈 화면
+        assert!(!screen_needs_bypass_accept(&flatten_ws("Welcome to Claude Code\n\n❯ ")));
+        assert!(!screen_needs_bypass_accept(&flatten_ws("")));
     }
 
     #[test]
