@@ -76,7 +76,9 @@ def _extract_verb(argv):
     if not argv:
         return None
     first = os.path.basename(str(argv[0]))
-    if first != "cys":
+    # Windows 는 shutil.which 가 'cys.EXE'(대문자·.cmd/.bat) 로 해소 — 확장자·케이스 허용해
+    # basename!='cys' 오탐 차단(cys.py 등 비바이너리는 여전히 미인식). unix('cys')는 그대로.
+    if first.lower() not in ("cys", "cys.exe", "cys.cmd", "cys.bat"):
         return None
     i = 1
     while i < len(argv):
