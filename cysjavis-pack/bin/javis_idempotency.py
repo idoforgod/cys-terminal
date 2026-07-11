@@ -76,6 +76,11 @@ def _extract_verb(argv):
     if not argv:
         return None
     first = os.path.basename(str(argv[0]))
+    # Windows: shutil.which("cys")가 'cys.EXE' 풀패스를 반환 — 실행 확장자를 벗겨 비교한다.
+    # 미탈피 시 verb=None → self-test spy가 cys 호출을 전부 놓쳐 C53이 Windows에서만 FAIL.
+    root, ext = os.path.splitext(first)
+    if ext.lower() in (".exe", ".cmd", ".bat", ".com"):
+        first = root
     if first != "cys":
         return None
     i = 1
