@@ -340,6 +340,11 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
         // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
         || rel == "schedule.json"
+        // agents.json 도 schedule.json 과 같은 혼합 파일이다: 사용자가 머신별 에이전트 실경로(cmd)와
+        // 격리 환경(env)을 편집한다(특히 Windows — 템플릿의 ~/.local/bin 류 POSIX 경로는 미해석이라
+        // 사용자 수정이 필수). 강제갱신이 덮으면 노드 기동이 즉사하고, 매 heal 마다 재적용이 강요된다.
+        // 템플릿 전진분은 user-owned 규약대로 `<rel>.new` 병치로 가시화된다(pack-merge 검토 경로 동일).
+        || rel == "agents.json"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
