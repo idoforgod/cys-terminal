@@ -14,6 +14,8 @@ import sys
 import threading
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # safe_path(-P) guard for sibling imports (same idiom as javis_replay.py)
+
 MAX_MEMOS = 2
 MAX_BODY = 4096
 MAX_PER_SESSION = 5

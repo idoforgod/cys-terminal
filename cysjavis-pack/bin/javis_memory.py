@@ -30,6 +30,8 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # safe_path(-P) guard for sibling imports (same idiom as javis_replay.py)
+
 # P0.2 메모리 포이즌 WARN 게이트(구현설계서 v2 §3) — javis_skillscan(같은 bin) 있으면 활성.
 #   WARN 전용: 메모리 쓰기를 절대 차단하지 않는다(생명선·자기충돌·자율주행 증류 굶주림 방지 — 성찰 B-2).
 # ★G14(cokacdir 성찰 2026-07-04): 스캐너 부재의 '조용한 fail-open' 제거 — 쓰기는 규약대로

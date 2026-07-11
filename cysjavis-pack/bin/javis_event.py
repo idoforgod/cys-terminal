@@ -10,9 +10,11 @@ exit codes: 0 ok · 2 usage · 6 invalid(타입/스키마 위반)
 """
 import argparse
 import json
+import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # safe_path(-P) guard for sibling imports (same idiom as javis_replay.py)
 import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
 
 EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
