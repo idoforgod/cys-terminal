@@ -199,6 +199,17 @@ fn is_rollback(new_issued: Option<i64>, installed_issued: Option<i64>) -> bool {
 /// 열쇠 설치(§7) — src(디렉터리 또는 license.json 경로)의 번들을 §4 전건 검증 후에만
 /// 원자 반영. 실패 = 기존 라이선스 무손상 + 사유 Err.
 pub fn install(src: &Path, now_unix: i64) -> Result<String, String> {
+    // 공개 래퍼: 설치 base(pack_dir 부모)를 **여기서 1회** 해석해 base-파라미터 코어에 넘긴다.
+    // 코어는 전역 env(CYS_PACK_DIR)를 재해석하지 않는다 — 외부 호출처(cys license install) 동작 불변.
+    let (lic_dst, _) = license_paths();
+    let base =
+        lic_dst.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    install_at(&base, src, now_unix)
+}
+
+/// install의 base-파라미터 코어 — license.json/.minisig를 쓸 base 디렉터리를 명시 주입받는다.
+/// 테스트는 tmp base를 직접 넘겨 전역 env 변이 없이 격리한다(license_paths()의 pack_dir() 재해석 우회).
+fn install_at(base: &Path, src: &Path, now_unix: i64) -> Result<String, String> {
     let lic_src = if src.is_dir() { src.join("license.json") } else { src.to_path_buf() };
     let sig_src = PathBuf::from(format!("{}.minisig", lic_src.display()));
     let lic_bytes =
@@ -209,7 +220,8 @@ pub fn install(src: &Path, now_unix: i64) -> Result<String, String> {
     let revoked = embedded_revoked()?;
     match evaluate_bytes(&lic_bytes, &sig_bytes, now_unix, &keyring, &revoked) {
         LicenseStatus::Pro { client_id, license_id, expires, key_days_left } => {
-            let (lic_dst, sig_dst) = license_paths();
+            let lic_dst = base.join("license.json");
+            let sig_dst = base.join("license.json.minisig");
             // R-SIG-3 anti-rollback 앵커: 기설치 라이선스보다 낮은 issued_at 열쇠 설치를 거부한다
             // (서명 유효한 구 라이선스로의 다운그레이드/롤백 차단 — packsig accepted-pack replay 게이트
             // 동형). 신 issued_at ≥ 기설치 issued_at만 허용. 기설치 부재·파싱불가는 앵커 없음으로
@@ -498,37 +510,35 @@ mod tests {
 
     #[test]
     fn install_roundtrip_and_reject_paths() {
-        let _g = crate::pack::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 유효 열쇠 설치 성공 + 무효(만료) 열쇠 설치 거부를 임시 HOME 격리로 검증.
-        let tmp = std::env::temp_dir().join(format!("cys-license-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).expect("tmp 생성 실패");
-        // CYS_PACK_DIR 오버라이드로 license_paths()의 base를 tmp로 격리.
-        let saved_pack_dir = std::env::var(crate::pack::ENV_PACK_DIR).ok();
-        std::env::set_var(crate::pack::ENV_PACK_DIR, tmp.join("pack").display().to_string());
+        // 전역 CYS_PACK_DIR을 변이하지 않고 base를 직접 주입한다(install_at/evaluate_at 경로 주입) —
+        // 프로세스 전역 env 경합 원천 제거 → PACK_ENV_LOCK 불필요.
+        let base = std::env::temp_dir().join(format!("cys-license-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base 생성 실패");
+        // 프로덕션 license_paths()가 base에 두는 파일명과 동일(license.json/.minisig).
+        let lic_dst = base.join("license.json");
+        let sig_dst = base.join("license.json.minisig");
 
         let (pk, sign) = gen_key_and_signer();
         // 테스트 키링을 쓸 수 없는 install()(embed 키링 고정) 대신 evaluate_bytes 경로는 위에서
         // 검증했으므로, 여기서는 파일 부재 = Free(에러 아님)와 설치 실패 시 무손상만 확인한다.
-        let (lic_dst, _) = license_paths();
-        assert!(matches!(evaluate(NOW), LicenseStatus::Free), "부재 = Free여야 함");
+        assert!(
+            matches!(evaluate_at(&lic_dst, &sig_dst, NOW), LicenseStatus::Free),
+            "부재 = Free여야 함"
+        );
 
         // 무효 번들(embed 키링에 없는 키) 설치 시도 → 거부 + 기존(부재) 무손상.
-        let src_dir = tmp.join("bundle");
+        let src_dir = base.join("bundle");
         std::fs::create_dir_all(&src_dir).expect("bundle dir");
         let lic = license_json("PRO-X", "pro", "UNKNOWN-KEY", NOW - 1, "never");
         std::fs::write(src_dir.join("license.json"), &lic).expect("write lic");
         std::fs::write(src_dir.join("license.json.minisig"), sign(&lic)).expect("write sig");
         let _ = pk; // pk는 embed 키링에 없음 — install은 거부돼야 한다.
-        let err = install(&src_dir, NOW).expect_err("미지 키 열쇠는 설치 거부돼야 함");
+        let err = install_at(&base, &src_dir, NOW).expect_err("미지 키 열쇠는 설치 거부돼야 함");
         assert!(err.contains("설치 거부"), "거부 사유 명시: {err}");
         assert!(!lic_dst.exists(), "실패 설치가 파일을 남기면 안 됨(무손상)");
 
-        match saved_pack_dir {
-            Some(v) => std::env::set_var(crate::pack::ENV_PACK_DIR, v),
-            None => std::env::remove_var(crate::pack::ENV_PACK_DIR),
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // R-SIG-3: 롤백 앵커 — 기설치보다 낮은 issued_at은 거부, 동일·상위·앵커부재는 통과.

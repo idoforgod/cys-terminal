@@ -95,10 +95,17 @@ pub fn session_start_hook_command(pack_dir: &Path) -> String {
 /// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
 /// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). pack_dir 형제(~/.cys/claude).
 pub fn config_dir() -> PathBuf {
+    config_dir_for(&pack_dir())
+}
+
+/// config_dir의 pack-dir 파라미터 코어 — 트랜잭션 진입점이 1회 캡처한 pack_dir을 스레딩하는
+/// config 셋업 경로가 쓴다(전역 pack_dir() 재해석 금지). CYS_CONFIG_DIR 명시값은 종전대로 최우선
+/// (별개 env — 외부 동작 불변), 부재 시 **주입된** pack_dir의 형제(~/.cys/claude)로 파생한다.
+fn config_dir_for(pack_dir: &Path) -> PathBuf {
     if let Some(d) = crate::env_compat(ENV_CONFIG_DIR) {
         return PathBuf::from(d);
     }
-    pack_dir()
+    pack_dir
         .parent()
         .map(|p| p.join("claude"))
         .unwrap_or_else(|| PathBuf::from(".cys/claude"))
@@ -107,8 +114,8 @@ pub fn config_dir() -> PathBuf {
 /// 격리 config dir 셋업: cys 라우터(CLAUDE.md)와 SessionStart hook(settings.json)을 설치한다.
 /// ★보존 모드 — 기존 파일은 덮지 않는다(사용자 커스터마이즈 불가침). best-effort(실패해도
 /// pack 설치 자체는 유효). 사용자 ~/.claude 는 절대 건드리지 않는다(격리의 핵심).
-fn setup_isolated_config_dir() {
-    let cfg = config_dir();
+fn setup_isolated_config_dir(pack_dir: &Path) {
+    let cfg = config_dir_for(pack_dir);
     if std::fs::create_dir_all(&cfg).is_err() {
         return;
     }
@@ -124,7 +131,7 @@ fn setup_isolated_config_dir() {
     if !settings.exists() {
         // RC-2: OS-aware 공용 함수 사용 — Windows는 bash(Git Bash가 bash.exe만 보장·cmd/PowerShell은
         // .sh를 인터프리터 없이 못 실행). 구 `sh` 하드코딩 제거(격리 config dir·init-pack 경로 일치).
-        let hook = session_start_hook_command(&pack_dir());
+        let hook = session_start_hook_command(pack_dir);
         let json = serde_json::json!({
             "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": hook } ] } ] }
         });
@@ -971,7 +978,10 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // ★staging 경로(install_staged)는 setup_config=false로 여기서 건너뛰고, atomic swap 후 실
     // pack_dir에 대해 한 번 셋업한다(격리 config는 pack_dir 형제라 staging 대상이 아님).
     if setup_config {
-        setup_isolated_config_dir();
+        // ★캡처한 dir을 config 셋업에 스레딩 — 트랜잭션 경로(apply_pack_transactional_in)에서
+        // 전역 pack_dir()/config_dir() 재해석으로 잘못된 pack 경로를 참조하는 hook·config 기록을
+        // 구조적으로 차단한다(issue2). 비트랜잭션 경로(install_from_iter, dir==pack_dir())는 동일 값이라 무변경.
+        setup_isolated_config_dir(&dir);
     }
     #[cfg(unix)]
     {
@@ -1152,7 +1162,8 @@ pub fn install_staged(force: bool) -> Result<(usize, usize), String> {
         return Err(e);
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
-    setup_isolated_config_dir();
+    //    1회 캡처한 dir(=pack_dir())을 스레딩(setup_isolated_config_dir 시그니처 정합 — 값 동일·무변경).
+    setup_isolated_config_dir(&dir);
     Ok((written, kept))
 }
 
@@ -1167,9 +1178,9 @@ pub fn install_staged(force: bool) -> Result<(usize, usize), String> {
 const PACK_JOURNAL_DIR: &str = ".pack-journal";
 
 /// 백업 저널 디렉터리(~/.cys/.pack-journal) — pack_dir 형제(staging·lock·accepted와 동일 루트).
-pub fn pack_journal_dir() -> PathBuf {
-    pack_dir()
-        .parent()
+/// pack_dir을 명시 인자로 받는다(트랜잭션 진입점이 1회 캡처한 dir을 스레딩 — 전역 env 재해석 금지).
+pub(crate) fn pack_journal_dir(dir: &Path) -> PathBuf {
+    dir.parent()
         .map(|p| p.join(PACK_JOURNAL_DIR))
         .unwrap_or_else(|| PathBuf::from(PACK_JOURNAL_DIR))
 }
@@ -1192,15 +1203,15 @@ struct JournalIndex {
 /// apply 전 backup journal 작성: backup_set의 각 파일 기존 bytes를 저널에 복사(+fsync)하고
 /// 인덱스(목표 버전·existed 플래그)를 기록(+fsync)한다. 잔존 저널은 먼저 비운다.
 fn write_journal(
+    dir: &Path,
     target_version: &str,
     backup_set: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
-    let jdir = pack_journal_dir();
+    let jdir = pack_journal_dir(dir);
     let _ = std::fs::remove_dir_all(&jdir);
     let files_dir = jdir.join("files");
     std::fs::create_dir_all(&files_dir)
         .map_err(|e| format!("journal files dir 생성 실패 {}: {e}", files_dir.display()))?;
-    let dir = pack_dir();
     let mut entries = Vec::new();
     for rel in backup_set {
         let src = dir.join(rel);
@@ -1234,14 +1245,13 @@ fn write_journal(
 /// 저널에서 pre-state로 복원: existed=true는 백업 bytes를 원위치 atomic 복원, existed=false는
 /// (신규 생성분) 삭제. `.pack-version`은 저널에 없으므로 손대지 않는다(미커밋 = old 유지). 복원
 /// 후 저널 삭제. ★커밋 마커(.pack-version==target)가 아닐 때만 호출(recover_pack_journal이 판정).
-pub fn rollback_journal() -> Result<(), String> {
-    let jdir = pack_journal_dir();
+pub(crate) fn rollback_journal(dir: &Path) -> Result<(), String> {
+    let jdir = pack_journal_dir(dir);
     let index_path = jdir.join("index.json");
     let s = std::fs::read_to_string(&index_path)
         .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패: {e}"))?;
-    let dir = pack_dir();
     let files_dir = jdir.join("files");
     for entry in &index.entries {
         let target = dir.join(&entry.rel);
@@ -1283,7 +1293,14 @@ pub fn rollback_journal() -> Result<(), String> {
 /// 원본 미변경이므로 잔존 저널만 폐기. 저널 완전 부재면 no-op. 반환: 복구를 수행했으면 true.
 /// ★pack-update 착수 시·cysd 기동 시(install(false) 전)에 호출해 부분적용을 선치유한다.
 pub fn recover_pack_journal() -> Result<bool, String> {
-    let jdir = pack_journal_dir();
+    recover_pack_journal_in(&pack_dir())
+}
+
+/// recover_pack_journal의 dir-파라미터 코어 — pack_dir을 1회 캡처해 스레딩하는 트랜잭션 진입점
+/// (apply_pack_transactional_in)과 외부 standalone 호출(공개 래퍼)이 공유한다. 내부에서 pack_dir()을
+/// 재해석하지 않는다(전역 env 재해석으로 인한 실 pack_dir 오탐·mass-prune 방지 — 구조적 차단).
+pub fn recover_pack_journal_in(dir: &Path) -> Result<bool, String> {
+    let jdir = pack_journal_dir(dir);
     let index_path = jdir.join("index.json");
     if !index_path.is_file() {
         // 인덱스 없는 잔존 디렉터리 = 백업 미완(원본 미변경) → 통째 폐기.
@@ -1297,7 +1314,7 @@ pub fn recover_pack_journal() -> Result<bool, String> {
         .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
     let index: JournalIndex =
         serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패(손상): {e}"))?;
-    let disk_version = std::fs::read_to_string(pack_dir().join(PACK_VERSION_FILE))
+    let disk_version = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if !disk_version.is_empty() && disk_version == index.target_version {
@@ -1305,7 +1322,7 @@ pub fn recover_pack_journal() -> Result<bool, String> {
         let _ = std::fs::remove_dir_all(&jdir);
     } else {
         // 미커밋 → 롤백(pre-state 복원 + 저널 삭제).
-        rollback_journal()?;
+        rollback_journal(dir)?;
     }
     Ok(true)
 }
@@ -1328,9 +1345,26 @@ pub fn apply_pack_transactional<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    // 공개 래퍼: pack_dir을 **여기서 1회** 캡처해 dir-파라미터 코어에 스레딩한다. 코어 안의 어떤
+    // 하위 함수도 pack_dir()을 재해석하지 않으므로, 트랜잭션 도중 CYS_PACK_DIR가 바뀌어도 이 트랜잭션이
+    // 실 pack_dir을 mass-prune하는 버그 클래스가 구조적으로 불가능하다(외부 호출처 시그니처 불변).
+    apply_pack_transactional_in(&pack_dir(), items, target_version, state, post_commit)
+}
+
+/// apply_pack_transactional의 dir-파라미터 코어. `dir`은 트랜잭션 진입점이 1회 캡처한 pack_dir이며
+/// journal·rollback·install(prune)·state·commit marker 전 계층이 **이 한 값만** 사용한다(재해석 0).
+pub fn apply_pack_transactional_in<F>(
+    dir: &Path,
+    items: &[(&str, &str)],
+    target_version: &str,
+    state: &PackState,
+    post_commit: F,
+) -> Result<(usize, usize, bool), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     // ⓪ 직전 crash로 남은 orphan 저널 자가치유(새 트랜잭션 전 pre-state 확정).
-    recover_pack_journal()?;
-    let dir = pack_dir();
+    recover_pack_journal_in(dir)?;
     // ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
     //    ∪ .install-manifest.json ∪ .pack-state.json(v4 — rollback이 state도 pre-state로 복원).
     let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1362,25 +1396,33 @@ where
         .collect();
     backup_set.extend(side_paths);
     backup_set.insert(MERGE_PENDING_FILE.to_string());
-    write_journal(target_version, &backup_set)?;
+    write_journal(dir, target_version, &backup_set)?;
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
-    let (written, kept) =
-        match install_from_iter(items.iter().copied(), false, target_version, true) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = rollback_journal();
-                return Err(format!("파일 반영 실패(rollback 완료): {e}"));
-            }
-        };
+    //    캡처한 dir을 install_into에 직접 넘긴다(install_from_iter의 pack_dir() 재해석 우회 —
+    //    setup_config=true는 install_from_iter와 동일: 외부 동작 불변).
+    let (written, kept) = match install_into(
+        dir.to_path_buf(),
+        items.iter().copied(),
+        false,
+        target_version,
+        true,
+        true,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = rollback_journal(dir);
+            return Err(format!("파일 반영 실패(rollback 완료): {e}"));
+        }
+    };
     // ③ `.pack-state.json` 기록 — journal 백업 대상이므로 실패 시 rollback으로 전체 복원.
-    if let Err(e) = write_pack_state(&dir, state) {
-        let _ = rollback_journal();
+    if let Err(e) = write_pack_state(dir, state) {
+        let _ = rollback_journal(dir);
         return Err(format!("state 기록 실패(rollback 완료): {e}"));
     }
     // ④ .pack-version = 마지막 hard commit marker(결과 검사 — best-effort 금지).
     if let Err(e) = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
-        let _ = rollback_journal();
+        let _ = rollback_journal(dir);
         return Err(format!(".pack-version 커밋 실패(rollback 완료): {e}"));
     }
     // ⑤ post-commit(record_accepted) — 커밋은 이미 유효. 실패 = loud + false 반환(침묵 포장 금지).
@@ -1395,7 +1437,7 @@ where
         }
     };
     // ⑥ 커밋 성공 → 저널 삭제.
-    let _ = std::fs::remove_dir_all(pack_journal_dir());
+    let _ = std::fs::remove_dir_all(pack_journal_dir(dir));
     Ok((written, kept, post_commit_ok))
 }
 
@@ -2262,6 +2304,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
         std::fs::create_dir_all(&pd).unwrap();
+        // ENV_PACK_DIR은 install_from_iter/install_staged 계열 테스트(이 fixture 공유·미변경 경로)가
+        // pack_dir()을 env로 해석하므로 계속 설정한다. txn 테스트(_in 코어 호출)는 이 값에 의존하지 않고
+        // pd를 dir 인자로 직접 주입해 파괴 경로(journal·prune·rollback)를 격리한다.
         std::env::set_var(ENV_PACK_DIR, &pd);
         std::env::set_var(ENV_CONFIG_DIR, base.join("cfg"));
         std::fs::write(pd.join(PACK_VERSION_FILE), version).unwrap();
@@ -2307,7 +2352,7 @@ mod tests {
         // README.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
             Ok(())
         });
@@ -2316,7 +2361,7 @@ mod tests {
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let newf = std::fs::read_to_string(pd.join("new.txt")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2346,11 +2391,11 @@ mod tests {
         // 파일이라 create_dir_all 실패) = mid-apply fault.
         let items: Vec<(&str, &str)> =
             vec![("README.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
+        let res = apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
 
         let post_fp = fingerprint_dir(&pd);
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2377,14 +2422,14 @@ mod tests {
 
         // 파일 반영·prune·커밋은 성공, post-commit record_accepted만 실패.
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || {
             Err("record_accepted boom".into())
         });
 
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2407,7 +2452,7 @@ mod tests {
         let (base, pd) = txn_prestate("orphan-rb", &[("README.md", "PARTIAL-NEW")], "1.0.0");
         std::fs::write(pd.join("new.txt"), "ORPHAN-NEW").unwrap();
         // 저널 수작업 조립: target 2.0.0, README.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
-        let jdir = pack_journal_dir();
+        let jdir = pack_journal_dir(&pd);
         let files_dir = jdir.join("files");
         std::fs::create_dir_all(&files_dir).unwrap();
         std::fs::write(files_dir.join("README.md"), "OLD-SOUL").unwrap();
@@ -2420,12 +2465,12 @@ mod tests {
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
 
-        let recovered = recover_pack_journal();
+        let recovered = recover_pack_journal_in(&pd);
 
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2445,7 +2490,7 @@ mod tests {
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         // 커밋 성공: .pack-version=2.0.0, README.md=NEW-SOUL(새 내용).
         let (base, pd) = txn_prestate("orphan-commit", &[("README.md", "NEW-SOUL")], "2.0.0");
-        let jdir = pack_journal_dir();
+        let jdir = pack_journal_dir(&pd);
         let files_dir = jdir.join("files");
         std::fs::create_dir_all(&files_dir).unwrap();
         std::fs::write(files_dir.join("README.md"), "OLD-SOUL").unwrap(); // 커밋 전 백업본
@@ -2455,10 +2500,10 @@ mod tests {
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
 
-        let recovered = recover_pack_journal();
+        let recovered = recover_pack_journal_in(&pd);
 
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2484,7 +2529,7 @@ mod tests {
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
             Ok(())
         });
@@ -2492,7 +2537,7 @@ mod tests {
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        let journal_exists = pack_journal_dir().exists();
+        let journal_exists = pack_journal_dir(&pd).exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2502,6 +2547,99 @@ mod tests {
         assert!(!new_exists, "rollback이 신규 new.txt를 제거 못함(부분적용 잔존)");
         assert_eq!(pv.trim(), "1.0.0", ".pack-version 불변이어야(미커밋)");
         assert!(!journal_exists, "rollback 후 저널 잔존");
+    }
+
+    /// ★격리 회귀(issue4 — 2026-07-15 팩소실 재발 방지의 결정적 증거): 트랜잭션은 **주입된 dir**만
+    /// 파괴 대상으로 삼고, 전역 CYS_PACK_DIR(env)이 가리키는 실 pack은 절대 건드리지 않음을 증명한다.
+    /// 기존 txn 테스트는 env와 주입 dir을 같은 pd로 두어(txn_prestate가 env=pd 설정), 트랜잭션이
+    /// pack_dir()을 재해석해도 같은 pd로 수렴해 통과하는 false-green이었다. 여기서는 env를 **POISON**
+    /// (주입 dir과 다른 별도 temp)으로 돌려, 회귀(내부 pack_dir() 재해석)가 있으면 POISON이 prune/overwrite
+    /// 당해 아래 assert가 실패하도록 만든다. 이 테스트가 있었다면 2026-07-15 재앙을 잡았다.
+    #[test]
+    fn apply_transactional_ignores_env_uses_injected_dir() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+
+        // 주입 대상(pd): 트랜잭션이 실제로 작업해야 하는 격리 pack dir. txn_prestate는 마지막에
+        // env(ENV_PACK_DIR)=pd로 설정하므로, 아래에서 POISON으로 덮어써 env≠주입 dir을 만든다.
+        let (base, pd) = txn_prestate(
+            "env-inject",
+            &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            "1.0.0",
+        );
+
+        // POISON: 전역 env가 가리키는 "실 pack dir" 스탠드인. 별도 base라 parent(.pack-journal 위치)도
+        // pd와 분리된다. 회귀가 있으면 여기가 prune/overwrite/journal 대상이 된다.
+        let poison_base =
+            std::env::temp_dir().join(format!("cys-journal-POISON-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&poison_base);
+        let poison_pd = poison_base.join("pack");
+        std::fs::create_dir_all(&poison_pd).unwrap();
+        std::fs::write(poison_pd.join(PACK_VERSION_FILE), "9.9.9").unwrap();
+        std::fs::write(poison_pd.join("README.md"), "POISON-SOUL").unwrap();
+        std::fs::write(poison_pd.join("stale.txt"), "POISON-STALE").unwrap();
+        let mut pmani = serde_json::Map::new();
+        pmani.insert(
+            "README.md".to_string(),
+            serde_json::json!(content_hash("POISON-SOUL")),
+        );
+        pmani.insert(
+            "stale.txt".to_string(),
+            serde_json::json!(content_hash("POISON-STALE")),
+        );
+        std::fs::write(
+            poison_pd.join(INSTALL_MANIFEST),
+            serde_json::Value::Object(pmani).to_string(),
+        )
+        .unwrap();
+
+        // 전역 env를 POISON으로 돌린다 — 트랜잭션 도중 CYS_PACK_DIR 변조 재현(2026-07-15 재앙 조건).
+        std::env::set_var(ENV_PACK_DIR, &poison_pd);
+        std::env::set_var(ENV_CONFIG_DIR, poison_base.join("cfg"));
+
+        // 주입 dir(pd)로 트랜잭션 실행. stale.txt는 items 부재 → prune 대상.
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let res =
+            apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
+
+        // 주입 dir 효과 관측(파괴·prune·commit은 여기에만 착지).
+        let pd_pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let pd_soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
+        let pd_stale_exists = pd.join("stale.txt").exists();
+        // POISON(전역 env 경로) 무손상 관측.
+        let poison_pv = std::fs::read_to_string(poison_pd.join(PACK_VERSION_FILE)).unwrap();
+        let poison_soul = std::fs::read_to_string(poison_pd.join("README.md")).unwrap();
+        let poison_stale_exists = poison_pd.join("stale.txt").exists();
+        let poison_journal_exists = pack_journal_dir(&poison_pd).exists();
+
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&poison_base);
+
+        // 주입 dir에 파괴/prune/commit 효과가 착지했다.
+        assert!(res.is_ok(), "주입 dir 트랜잭션 실패: {res:?}");
+        assert_eq!(pd_pv.trim(), "2.0.0", "주입 dir에 commit marker 미기록");
+        assert_eq!(pd_soul, "NEW-SOUL", "주입 dir README.md 미갱신");
+        assert!(!pd_stale_exists, "주입 dir stale.txt prune 안됨");
+        // POISON(전역 env 경로)은 완전 무손상 — prune/overwrite/journal 0(env 재해석 회귀 시 실패).
+        assert_eq!(
+            poison_pv.trim(),
+            "9.9.9",
+            "POISON .pack-version 오염됨 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
+        assert_eq!(
+            poison_soul, "POISON-SOUL",
+            "POISON README.md 덮임 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
+        assert!(
+            poison_stale_exists,
+            "POISON stale.txt가 prune됨 — 전역 env pack mass-prune 회귀(2026-07-15 재앙 클래스)!"
+        );
+        assert!(
+            !poison_journal_exists,
+            "POISON 부모에 저널 생성됨 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
     }
 
     /// ★대조(외부 동작 불변): embed/cysd/init-pack 경로(transactional=false)는 .install-manifest.json이
