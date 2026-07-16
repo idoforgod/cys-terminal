@@ -498,12 +498,14 @@ mod tests {
 
     #[test]
     fn install_roundtrip_and_reject_paths() {
+        let _g = crate::pack::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 유효 열쇠 설치 성공 + 무효(만료) 열쇠 설치 거부를 임시 HOME 격리로 검증.
         let tmp = std::env::temp_dir().join(format!("cys-license-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("tmp 생성 실패");
         // CYS_PACK_DIR 오버라이드로 license_paths()의 base를 tmp로 격리.
-        std::env::set_var("CYS_PACK_DIR", tmp.join("pack").display().to_string());
+        let saved_pack_dir = std::env::var(crate::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(crate::pack::ENV_PACK_DIR, tmp.join("pack").display().to_string());
 
         let (pk, sign) = gen_key_and_signer();
         // 테스트 키링을 쓸 수 없는 install()(embed 키링 고정) 대신 evaluate_bytes 경로는 위에서
@@ -522,7 +524,10 @@ mod tests {
         assert!(err.contains("설치 거부"), "거부 사유 명시: {err}");
         assert!(!lic_dst.exists(), "실패 설치가 파일을 남기면 안 됨(무손상)");
 
-        std::env::remove_var("CYS_PACK_DIR");
+        match saved_pack_dir {
+            Some(v) => std::env::set_var(crate::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(crate::pack::ENV_PACK_DIR),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
