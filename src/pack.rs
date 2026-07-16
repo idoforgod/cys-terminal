@@ -101,6 +101,11 @@ pub fn config_dir() -> PathBuf {
 /// config_dir의 pack-dir 파라미터 코어 — 트랜잭션 진입점이 1회 캡처한 pack_dir을 스레딩하는
 /// config 셋업 경로가 쓴다(전역 pack_dir() 재해석 금지). CYS_CONFIG_DIR 명시값은 종전대로 최우선
 /// (별개 env — 외부 동작 불변), 부재 시 **주입된** pack_dir의 형제(~/.cys/claude)로 파생한다.
+///
+/// ★계약 명문화(codex R5 issue3): `CYS_CONFIG_DIR`는 **의도적·독립적인 config 목적지 override**이며
+/// pack dir이 아니다. 이 값은 pack prune/journal을 절대 retarget할 수 없다(별개 env·config 전용).
+/// config/hook 부수효과는 pack-path 콘텐츠에는 주입된 pack_dir을 쓰되, config **목적지**만 이 별개
+/// override를 존중한다. 코드 동작 불변 — 계약 문서화 목적.
 fn config_dir_for(pack_dir: &Path) -> PathBuf {
     if let Some(d) = crate::env_compat(ENV_CONFIG_DIR) {
         return PathBuf::from(d);
@@ -1179,6 +1184,10 @@ const PACK_JOURNAL_DIR: &str = ".pack-journal";
 
 /// 백업 저널 디렉터리(~/.cys/.pack-journal) — pack_dir 형제(staging·lock·accepted와 동일 루트).
 /// pack_dir을 명시 인자로 받는다(트랜잭션 진입점이 1회 캡처한 dir을 스레딩 — 전역 env 재해석 금지).
+///
+/// ★API 계약(codex R5 issue1): 이 함수는 **crate 내부 트랜잭션 헬퍼**이며 지원되는 공개 API가
+/// 아니다(구 `pub` → `pub(crate)` 강등은 의도적 — 외부 호출처 0 검증됨, 우발적 breaking change 아님).
+/// 지원되는 공개 표면은 3개 래퍼뿐: `apply_pack_transactional`·`recover_pack_journal`·`license::install`.
 pub(crate) fn pack_journal_dir(dir: &Path) -> PathBuf {
     dir.parent()
         .map(|p| p.join(PACK_JOURNAL_DIR))
@@ -1245,6 +1254,10 @@ fn write_journal(
 /// 저널에서 pre-state로 복원: existed=true는 백업 bytes를 원위치 atomic 복원, existed=false는
 /// (신규 생성분) 삭제. `.pack-version`은 저널에 없으므로 손대지 않는다(미커밋 = old 유지). 복원
 /// 후 저널 삭제. ★커밋 마커(.pack-version==target)가 아닐 때만 호출(recover_pack_journal이 판정).
+///
+/// ★API 계약(codex R5 issue1): 이 함수는 **crate 내부 트랜잭션 헬퍼**이며 지원되는 공개 API가
+/// 아니다(구 `pub` → `pub(crate)` 강등은 의도적 — 외부 호출처 0 검증됨, 우발적 breaking change 아님).
+/// 지원되는 공개 표면은 3개 래퍼뿐: `apply_pack_transactional`·`recover_pack_journal`·`license::install`.
 pub(crate) fn rollback_journal(dir: &Path) -> Result<(), String> {
     let jdir = pack_journal_dir(dir);
     let index_path = jdir.join("index.json");
@@ -2622,6 +2635,177 @@ mod tests {
         assert_eq!(pd_pv.trim(), "2.0.0", "주입 dir에 commit marker 미기록");
         assert_eq!(pd_soul, "NEW-SOUL", "주입 dir README.md 미갱신");
         assert!(!pd_stale_exists, "주입 dir stale.txt prune 안됨");
+        // POISON(전역 env 경로)은 완전 무손상 — prune/overwrite/journal 0(env 재해석 회귀 시 실패).
+        assert_eq!(
+            poison_pv.trim(),
+            "9.9.9",
+            "POISON .pack-version 오염됨 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
+        assert_eq!(
+            poison_soul, "POISON-SOUL",
+            "POISON README.md 덮임 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
+        assert!(
+            poison_stale_exists,
+            "POISON stale.txt가 prune됨 — 전역 env pack mass-prune 회귀(2026-07-15 재앙 클래스)!"
+        );
+        assert!(
+            !poison_journal_exists,
+            "POISON 부모에 저널 생성됨 — 트랜잭션이 전역 env pack을 재해석함(회귀)"
+        );
+    }
+
+    /// ★격리 회귀(issue2 — codex R5, 필수 산출물): recovery/rollback 경로도 **주입된 dir**만
+    /// 자가치유 대상으로 삼고 전역 CYS_PACK_DIR(env)이 가리키는 실 pack은 절대 건드리지 않음을
+    /// 증명한다. 기존 orphan_journal_recovery_rolls_back는 env=주입 dir이 같은 pd라
+    /// recover_pack_journal_in이 pack_dir()을 재해석해도 같은 pd로 수렴하는 false-green이었다 —
+    /// 저널 생성·최종 정리가 둘 다 poison으로 재해석되면 주입 pd의 rollback이 깨져도 통과했다.
+    /// 여기서는 env를 POISON으로 돌려, 회귀(내부 재해석)가 있으면 주입 dir의 orphan이 롤백되지
+    /// 않거나 POISON이 오염돼 아래 assert가 실패하게 만든다.
+    #[test]
+    fn recover_journal_ignores_env_uses_injected_dir() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+
+        // 주입 dir(pd): crash 후 부분적용 — .pack-version 옛 1.0.0(미커밋) + README.md 부분반영
+        // + new.txt 신규생성. txn_prestate가 마지막에 env=pd로 설정하므로 아래서 POISON으로 덮는다.
+        let (base, pd) =
+            txn_prestate("recover-env-inject", &[("README.md", "PARTIAL-NEW")], "1.0.0");
+        std::fs::write(pd.join("new.txt"), "ORPHAN-NEW").unwrap();
+        // 주입 dir에 orphan 저널 수작업 조립(orphan_journal_recovery_rolls_back와 동일 기법):
+        // target 2.0.0, README.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
+        let jdir = pack_journal_dir(&pd);
+        let files_dir = jdir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        std::fs::write(files_dir.join("README.md"), "OLD-SOUL").unwrap();
+        let index = serde_json::json!({
+            "target_version": "2.0.0",
+            "entries": [
+                {"rel": "README.md", "existed": true},
+                {"rel": "new.txt", "existed": false}
+            ]
+        });
+        std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+
+        // POISON: 전역 env가 가리키는 "실 pack dir" 스탠드인 — 저널 없음(회귀 시 여기서 생성/제거되면 실패).
+        let poison_base =
+            std::env::temp_dir().join(format!("cys-recover-POISON-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&poison_base);
+        let poison_pd = poison_base.join("pack");
+        std::fs::create_dir_all(&poison_pd).unwrap();
+        std::fs::write(poison_pd.join(PACK_VERSION_FILE), "9.9.9").unwrap();
+        std::fs::write(poison_pd.join("README.md"), "POISON-SOUL").unwrap();
+        std::env::set_var(ENV_PACK_DIR, &poison_pd);
+        std::env::set_var(ENV_CONFIG_DIR, poison_base.join("cfg"));
+
+        // 주입 dir(pd)로 recovery 실행 — env(POISON)이 아니라 pd의 orphan을 롤백해야 한다.
+        let recovered = recover_pack_journal_in(&pd);
+
+        // 주입 dir 관측(rollback 착지).
+        let pd_soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
+        let pd_new_exists = pd.join("new.txt").exists();
+        let pd_pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let pd_journal_exists = pack_journal_dir(&pd).exists();
+        // POISON(전역 env 경로) 무손상 관측.
+        let poison_pv = std::fs::read_to_string(poison_pd.join(PACK_VERSION_FILE)).unwrap();
+        let poison_soul = std::fs::read_to_string(poison_pd.join("README.md")).unwrap();
+        let poison_journal_exists = pack_journal_dir(&poison_pd).exists();
+
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&poison_base);
+
+        // 주입 dir에 rollback이 착지했다(pre-state 자가치유).
+        assert_eq!(recovered.expect("recover 실패"), true, "주입 dir orphan 미발견");
+        assert_eq!(pd_soul, "OLD-SOUL", "주입 dir README.md rollback 안됨");
+        assert!(!pd_new_exists, "주입 dir 신규 new.txt 삭제 안됨");
+        assert_eq!(pd_pv.trim(), "1.0.0", "주입 dir .pack-version 변경됨(미커밋인데)");
+        assert!(!pd_journal_exists, "주입 dir recovery 후 저널 잔존");
+        // POISON(전역 env 경로)은 완전 무손상 — rollback/journal 0(env 재해석 회귀 시 실패).
+        assert_eq!(
+            poison_pv.trim(),
+            "9.9.9",
+            "POISON .pack-version 오염됨 — recovery가 전역 env pack을 재해석함(회귀)"
+        );
+        assert_eq!(
+            poison_soul, "POISON-SOUL",
+            "POISON README.md 덮임 — recovery가 전역 env pack을 재해석함(회귀)"
+        );
+        assert!(
+            !poison_journal_exists,
+            "POISON 부모에 저널 생성/제거됨 — recovery가 전역 env pack을 재해석함(회귀)"
+        );
+    }
+
+    /// ★격리 회귀(issue3 best-effort — codex R5): apply 도중 fault로 rollback을 강제해도 **주입된
+    /// dir**만 복원 대상이고 전역 CYS_PACK_DIR(env)이 가리키는 실 pack은 무손상임을 증명한다.
+    /// mid_apply_fault_rolls_back_to_prestate의 collide fault 기법 + env-inject의 POISON 분리를 결합한다.
+    #[test]
+    fn apply_fault_rollback_ignores_env_uses_injected_dir() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+
+        let (base, pd) = txn_prestate(
+            "fault-env-inject",
+            &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            "1.0.0",
+        );
+        let pre_fp = fingerprint_dir(&pd);
+
+        // POISON: 전역 env가 가리키는 "실 pack dir" 스탠드인.
+        let poison_base =
+            std::env::temp_dir().join(format!("cys-fault-POISON-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&poison_base);
+        let poison_pd = poison_base.join("pack");
+        std::fs::create_dir_all(&poison_pd).unwrap();
+        std::fs::write(poison_pd.join(PACK_VERSION_FILE), "9.9.9").unwrap();
+        std::fs::write(poison_pd.join("README.md"), "POISON-SOUL").unwrap();
+        std::fs::write(poison_pd.join("stale.txt"), "POISON-STALE").unwrap();
+        let mut pmani = serde_json::Map::new();
+        pmani.insert(
+            "README.md".to_string(),
+            serde_json::json!(content_hash("POISON-SOUL")),
+        );
+        pmani.insert(
+            "stale.txt".to_string(),
+            serde_json::json!(content_hash("POISON-STALE")),
+        );
+        std::fs::write(
+            poison_pd.join(INSTALL_MANIFEST),
+            serde_json::Value::Object(pmani).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(ENV_PACK_DIR, &poison_pd);
+        std::env::set_var(ENV_CONFIG_DIR, poison_base.join("cfg"));
+
+        // collide fault: README.md 갱신(성공) → collide 파일(성공) → collide/child(부모가 파일이라
+        // create_dir_all 실패) = mid-apply fault → rollback 강제.
+        let items: Vec<(&str, &str)> =
+            vec![("README.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
+        let res =
+            apply_pack_transactional_in(&pd, &items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
+
+        // 주입 dir 관측(rollback 착지).
+        let post_fp = fingerprint_dir(&pd);
+        let pd_pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let pd_journal_exists = pack_journal_dir(&pd).exists();
+        // POISON(전역 env 경로) 무손상 관측.
+        let poison_pv = std::fs::read_to_string(poison_pd.join(PACK_VERSION_FILE)).unwrap();
+        let poison_soul = std::fs::read_to_string(poison_pd.join("README.md")).unwrap();
+        let poison_stale_exists = poison_pd.join("stale.txt").exists();
+        let poison_journal_exists = pack_journal_dir(&poison_pd).exists();
+
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&poison_base);
+
+        // 주입 dir: fault → rollback으로 pre-state 복원·미커밋.
+        assert!(res.is_err(), "mid-apply fault인데 성공 반환");
+        assert_eq!(pd_pv.trim(), "1.0.0", "주입 dir .pack-version 불변이어야(미커밋)");
+        assert!(!pd_journal_exists, "주입 dir rollback 후 저널 잔존");
+        assert_eq!(pre_fp, post_fp, "주입 dir rollback이 pre-state로 복원 못함(부분적용 잔존)");
         // POISON(전역 env 경로)은 완전 무손상 — prune/overwrite/journal 0(env 재해석 회귀 시 실패).
         assert_eq!(
             poison_pv.trim(),
