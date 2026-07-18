@@ -26,6 +26,7 @@ CLI:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -73,6 +74,52 @@ def default_pack_bin():
     if os.path.isfile(os.path.join(here, "javis_report.py")):
         return here
     return os.path.join(os.path.expanduser("~"), ".cys", "pack", "bin")
+
+
+def resolve_pack_dir():
+    """게이트가 소속을 판단하는 pack_dir(=default_pack_bin의 부모). 데몬 pack 해석과 동일 규칙."""
+    d = os.environ.get("CYS_PACK_DIR") or os.environ.get("JAVIS_PACK_DIR")
+    if d:
+        return d
+    return os.path.dirname(default_pack_bin())
+
+
+# ── 외부 데몬 가드(핫픽스): socket-pack 정합 검사 ──────────────────────────────
+# 실측 결함: 부서 데몬(env 오염 — CYS_PACK_DIR=본사 팩 + CYS_SOCKET=dept 소켓)이 본사
+# schedule.json을 로드해 command 잡을 중복 실행한다(action:command는 push와 달리 if_absent
+# 게이트가 없어 모든 로더에서 실행됨). 부서 데몬 자체 수정은 ACL 금지 → 게이트 자기방어로 해결.
+# 정합 규칙:
+#   - 본사 팩(realpath == $HOME/.cys/pack): CYS_SOCKET unset 또는 기본 소켓이어야 정합.
+#     set인데 기본 소켓이 아니면 = 외부 데몬 컨텍스트 → SKIP.
+#   - 부서 팩(basename == pack-dept-<X>): CYS_SOCKET 경로에 cys-dept-<X> 포함 요구(미래 부서 게이트 호환).
+#   - 그 외(worktree·테스트 등): 판단 보류 → 정상 진행.
+# 가드 자체 오류는 fail-open(정상 진행) — 가드가 본사 실행을 죽이면 안 된다.
+DEFAULT_SOCKET = os.path.join("~", ".local", "state", "cys", "cys.sock")
+
+
+def foreign_daemon_verdict():
+    """정합이면 None, 외부 데몬 컨텍스트면 (verdict, reason)."""
+    try:
+        sock = os.environ.get("CYS_SOCKET")
+        pack = os.path.realpath(resolve_pack_dir())
+        base = os.path.basename(pack)
+        m = re.match(r"pack-dept-(.+)$", base)
+        if m:
+            token = "cys-dept-%s" % m.group(1)
+            if sock and token in sock:
+                return None                      # 부서 데몬 정합 → 정상
+            return ("SKIPPED_FOREIGN_DAEMON",
+                    "dept pack(%s)엔 CYS_SOCKET에 '%s' 필요 — 실제=%s" % (base, token, sock))
+        hq = os.path.realpath(os.path.expanduser(os.path.join("~", ".cys", "pack")))
+        if pack == hq:
+            default_sock = os.path.realpath(os.path.expanduser(DEFAULT_SOCKET))
+            if sock and os.path.realpath(os.path.expanduser(sock)) != default_sock:
+                return ("SKIPPED_FOREIGN_DAEMON",
+                        "본사 팩인데 CYS_SOCKET=%s (기본 소켓 아님) = 외부 데몬 컨텍스트" % sock)
+            return None                          # 본사 정합(unset 또는 기본 소켓)
+        return None                              # 그 외(worktree·테스트) → 판단 보류·정상 진행
+    except Exception:                            # noqa: BLE001 — 가드 오류=fail-open(정상 진행)
+        return None
 
 
 def resolve_cys_bin():
@@ -504,6 +551,20 @@ class Gate:
         _write_json_atomic(self.counters_path, counters)
 
     def run(self, shadow=False):
+        # ★외부 데몬 가드(핫픽스·락 획득 전): socket-pack 부정합(부서 데몬이 본사 팩 로드)이면
+        #   대장에 SKIPPED_FOREIGN_DAEMON 1줄만 기록하고 즉시 exit 0 — 카운터·배달·stall 무접촉.
+        foreign = foreign_daemon_verdict()
+        if foreign is not None:
+            verdict, reason = foreign
+            try:
+                ledger_append(self.state_dir, {"ts": self.now_iso_fn(),
+                                               "ts_epoch": self.now_epoch_fn(),
+                                               "verdict": verdict, "reasons": [reason],
+                                               "delta_fields": [], "delivered": "none"})
+            except OSError:
+                pass
+            self._summary(verdict, "none", [reason])
+            return 0
         # ★최상위 fail-open(P1): 락 획득·state_dir 접근의 OSError(PermissionError/ENOSPC/EROFS
         #   포함)가 exit 1로 죽는 경로를 봉쇄한다 — 대장 기록이 불가한 상황이라도 최소한 master에
         #   직송을 시도하고 exit 0으로 종료한다(schedule.error만으론 아무도 안 깨기 때문).

@@ -40,8 +40,10 @@ class FakeRunner:
         self.emit_rc, self.drain_delivered = emit_rc, drain_delivered
         self.collect_raises = collect_raises
         self.emits, self.enqueues, self.drains, self.sends = [], [], [], []
+        self.collect_calls = 0
 
     def collect_report(self):
+        self.collect_calls += 1
         if self.collect_raises:
             raise RuntimeError("주입된 내부 오류")
         return self.report_ok, self.rep, self.err
@@ -442,6 +444,55 @@ class LaunchdMinimalEnv(unittest.TestCase):
             rc = gate(t, r).run()
             self.assertEqual(rc, 0)
             self.assertEqual(ledger_entries(t)[-1]["verdict"], "WARN")
+
+
+class ForeignDaemonGuard(unittest.TestCase):
+    """외부 데몬 가드 — socket-pack 부정합(부서 데몬이 본사 팩 로드) 시 SKIP(핫픽스)."""
+
+    def _with_env(self, env, fn):
+        saved = dict(os.environ)
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            return fn()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def test_hq_pack_with_dept_socket_skips_no_state_touch(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = {"HOME": os.path.expanduser("~"),
+                   "CYS_PACK_DIR": os.path.expanduser("~/.cys/pack"),
+                   "CYS_SOCKET": "/tmp/cys-dept-1/cys.sock"}   # 본사 팩 + dept 소켓 = 오염
+            r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
+            rc = self._with_env(env, lambda: gate(t, r).run())
+            self.assertEqual(rc, 0)
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "SKIPPED_FOREIGN_DAEMON")
+            self.assertIn("cys-dept-1", e["reasons"][0])        # socket 값 포함
+            self.assertFalse(os.path.isfile(os.path.join(t, "counters.json")))  # 카운터 무접촉
+            self.assertEqual(r.collect_calls, 0)                # 수집·stall 무접촉
+            self.assertEqual(r.enqueues, [])                    # 배달 무접촉
+
+    def test_hq_pack_socket_unset_proceeds(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = {"HOME": os.path.expanduser("~"),
+                   "CYS_PACK_DIR": os.path.expanduser("~/.cys/pack")}   # 소켓 unset = 정합
+            r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
+            self._with_env(env, lambda: gate(t, r).run())
+            self.assertEqual(ledger_entries(t)[-1]["verdict"], "BASELINE")  # 정상 진행
+
+    def test_dept_pack_matching_socket_proceeds(self):
+        with tempfile.TemporaryDirectory() as t:
+            deptpack = os.path.join(t, "pack-dept-1")
+            os.makedirs(deptpack)
+            sd = os.path.join(t, "state")
+            env = {"HOME": os.path.expanduser("~"),
+                   "CYS_PACK_DIR": deptpack,
+                   "CYS_SOCKET": "/tmp/cys-dept-1/cys.sock"}    # 부서 팩 + 해당 dept 소켓 = 정합
+            r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
+            self._with_env(env, lambda: gate(sd, r).run())
+            self.assertEqual(ledger_entries(sd)[-1]["verdict"], "BASELINE")  # 미래 부서 게이트 호환
 
 
 class C16ReportScheduleGate(unittest.TestCase):
