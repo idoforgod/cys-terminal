@@ -8,6 +8,22 @@ import { join } from "node:path";
 
 const BROWSERD_DIR = join(import.meta.dir, "..");
 
+// ★자식 프로세스 stderr 회수 — **실패했을 때만**, 그리고 **절대 무한 대기하지 않는다**.
+// proc.kill() 로 bun 을 죽여도 playwright 가 띄운 Chrome 이 그 파이프를 상속해 살아있으면
+// 스트림이 EOF 에 도달하지 않아 `.text()` 가 영원히 멈춘다(테스트 180초 타임아웃으로 발현 —
+// 단언 실패가 아니라 정리 블록의 교착이었다). 진단 정보를 잃는 것보다 **게이트가 멈추는 것이
+// 더 나쁘다** — 3초 안에 못 읽으면 그 사실만 기록하고 넘어간다.
+async function readStderr(proc: any, ms = 3000): Promise<string> {
+  try {
+    return await Promise.race([
+      new Response(proc.stderr).text(),
+      new Promise<string>((r) => setTimeout(() => r("(stderr 수집 타임아웃 — 자식 프로세스가 파이프 보유 중)"), ms)),
+    ]);
+  } catch {
+    return "(stderr 수집 실패)";
+  }
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -139,9 +155,13 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     expect(clicked).toBeGreaterThanOrEqual(1);
 
     // ③ http navigate(자기 앱 페이지) → nav 메시지
-    const navP = nextMsg(ws, (m) => m.type === "nav", 15000, "nav message");
-    // 스킴 대소문자 변형(HtTp:)은 통과가 정상 — 정규식이 /^https?:\/\//i 라서. nav 도달로 단언.
+    // Phase 3: nav 는 **로딩 시작 시점에도** 온다(진행 바 근거) — 그때 url 은 아직 이전 주소다.
+    // 따라서 "첫 nav" 가 아니라 **정착한 nav**(목적지 + loading=false)를 기다린다(핀 강화).
+    const navLoading = nextMsg(ws, (m) => m.type === "nav" && m.loading === true, 15000, "로딩 시작 nav");
+    const navP = nextMsg(ws, (m) => m.type === "nav" && String(m.url).includes("/cast/") && m.loading === false, 20000, "정착 nav");
+    // 스킴 대소문자 변형(HtTp:)은 통과가 정상 — 스킴 판정이 대소문자 무관이라서. nav 도달로 단언.
     ws.send(JSON.stringify({ type: "navigate", url: `HtTp://127.0.0.1:${port}/${token}/cast/` }));
+    await navLoading; // 로딩 시작이 사람에게 알려진다(pre-commit 구간 포함)
     const nav = await navP;
     expect(String(nav.url)).toContain("/cast/");
 
@@ -165,10 +185,8 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     throw e;
   } finally {
     proc.kill();
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -295,9 +313,14 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
     // 따라서 릴레이 증가분은 push 증가분을 넘을 수 없다(dedup 제거 시 ≈2배가 되어 실패).
     const pushedDelta = dedupAfter.framesPushed - dedupBefore.framesPushed;
     const relayDelta = dedupAfter.ackRelayed - dedupBefore.ackRelayed;
-    console.log(`[ack dedup] push=${pushedDelta} relay=${relayDelta} (relay ≤ push 이어야 함)`);
+    console.log(`[ack dedup] push=${pushedDelta} relay=${relayDelta} (relay ≤ push+1 이어야 함)`);
     expect(pushedDelta).toBeGreaterThan(0);
-    expect(relayDelta).toBeLessThanOrEqual(pushedDelta);
+    // ★경계 표본 오차 +1 허용: before/after 두 status 스냅샷은 서로 다른 순간에 찍히므로,
+    // before 직전에 push 된 프레임이 before 직후에 ack 되면 relay 가 push 보다 1 커 보인다
+    // (제품 결함이 아니라 계측 경계 현상 — 부하가 있을 때 ~5회 중 1회 재현).
+    // dedup 이 없으면 relay 는 push 의 **약 2배**가 되므로 +1 여유는 계약을 전혀 무르게 하지 않는다.
+    expect(relayDelta).toBeLessThanOrEqual(pushedDelta + 1);
+    expect(relayDelta).toBeLessThan(pushedDelta * 2 - 5); // dedup 제거 시 ≈2배 → 그때는 반드시 실패
     // 선행 ack(미발급 fid 200건)가 서버 상태를 오염시키지 않았음 — 측정 구간 내내 스트림이 살아있었다.
     expect(statBefore.framesPushed).toBeGreaterThan(0);
 
@@ -340,10 +363,8 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
       } catch {}
     }
     proc.kill();
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -461,10 +482,8 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
       } catch {}
     }
     proc.kill();
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -489,6 +508,9 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
     const port: number = st.port;
     const token: string = st.token;
 
+    // ★PRE-2: human 프로필 요청은 context 인자와 무관하게 cid "human" 으로 강제 분리된다.
+    // (요청은 "humanctx" 로 보내지만 서버가 "human" 으로 낙착시킨다 — sot/observe 가 context 를
+    //  안 실어 "default" 로 떨어지던 경로를 구조적으로 막는다.)
     const opened = await rpc(port, token, "open", {
       url: STATIC_URL,
       profile: "human",
@@ -497,8 +519,9 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
     });
     expect(opened.ok).toBe(true);
     expect(opened.result.profile).toBe("human");
+    expect(opened.result.context).toBe("human");
 
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=humanctx`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=human`);
     sockets.push(ws);
     expect(await wsOpen(ws, 10000)).toBe(true);
     const err = await nextMsg(ws, (m) => m.type === "err", 15000, "HUMAN_PROFILE_PROTECTED");
@@ -520,10 +543,8 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
       } catch {}
     }
     proc.kill();
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -615,10 +636,8 @@ test("cast 고아 hub 레이스: cold-start 중 즉시 close 후에도 신규 �
       } catch {}
     }
     proc.kill();
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -724,10 +743,8 @@ test("cast 팝업 채택: window.open → 새 페이지 프레임·nav 수신 + 
     }
     proc.kill();
     fixture.stop(true);
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
@@ -783,10 +800,8 @@ test("browserd console 캡처: console.log·pageerror 를 snapshot 에 UNTRUSTED
   } finally {
     proc.kill();
     fixture.stop(true);
-    try {
-      const errText = await new Response(proc.stderr).text();
-      if (failed && errText) console.error("=== server stderr ===\n" + errText);
-    } catch {}
+    // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}

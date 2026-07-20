@@ -81,11 +81,15 @@ jobs:
           # ★대상 파일 존재를 먼저 단언한다 — `bun test <f>`의 인자는 경로가 아니라 **필터**라, 지정 파일이
           #   체크아웃에 없어도 다른 필터가 하나라도 맞으면 exit 0으로 조용히 통과한다(실측: 존재+부재 혼합
           #   = exit 0). 신규 cast 파일이 untracked로 누락되면 게이트가 '초록 거짓말'이 되므로 여기서 막는다.
-          for f in tests/cast.test.ts tests/unit.test.ts; do
+          # ★실행은 순수 단위만(통합은 Chromium 의존이라 제외) — 그러나 **존재 단언은 통합 파일까지**
+          #   건다. 1,000줄 넘는 회귀 핀 본체가 untracked 로 남아 add 누락 시 무음 소실되기 때문이다
+          #   (`bun test <f>` 의 인자는 경로가 아니라 필터라 파일이 없어도 조용히 통과한다).
+          for f in tests/cast.test.ts tests/unit.test.ts tests/phase3-unit.test.ts \
+                   tests/cast-integration.test.ts tests/phase3.test.ts; do
             [ -f "$f" ] || { echo "browserd 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           done
           bun install --frozen-lockfile
-          bun test tests/cast.test.ts tests/unit.test.ts
+          bun test tests/cast.test.ts tests/unit.test.ts tests/phase3-unit.test.ts
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

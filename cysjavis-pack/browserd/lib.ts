@@ -8,7 +8,10 @@ import { homedir } from "node:os";
 
 export const SNAPSHOT_LIMIT = 200 * 1024; // 200KB
 export const IDLE_TIMEOUT_MS = 15 * 60 * 1000; // 15분
-export const MAX_CONTEXTS = 2;
+// 2 → 3. PRE-2 가 human 프로필을 cid "human" 으로 강제 분리하면서 SOT 세션이 **상주 슬롯 하나를
+// 점유**한다 — 2 면 `default`+`human` 으로 즉시 포화해 에이전트가 두 번째 작업 컨텍스트를 못 연다
+// (BUSY). 4 이상은 Chromium 자원(프로세스·메모리)이 그만큼 늘어나므로 **최소 여유 하나만** 준다.
+export const MAX_CONTEXTS = 3;
 
 // 웹 텍스트 비신뢰 라벨 — snapshot 출력 최상단 고정 헤더.
 export const UNTRUSTED_HEADER =

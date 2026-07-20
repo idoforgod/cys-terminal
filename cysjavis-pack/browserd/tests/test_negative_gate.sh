@@ -14,7 +14,9 @@ export CYS_BROWSER_HEADLESS=1
 export CYS_ROLE="worker-test"
 
 WORK="$(mktemp -d)"
-EVID="$WORK/evidence"
+# ★evidence 는 봉인된 루트(~/.cys/browser/evidence) 하위만 허용된다(P0-D③) — mktemp 경로는
+# EVIDENCE_PATH_DENIED(18)로 거부된다. 실행마다 고유 하위 디렉터리를 쓰고 종료 시 지운다.
+EVID="$HOME/.cys/browser/evidence/negative-gate-$$"
 FAILED=0
 
 log(){ printf '\n=== %s ===\n' "$1"; }
@@ -24,6 +26,7 @@ cleanup(){
   python3 "$CLI" stop >/dev/null 2>&1 || true
   [ -n "${HTTP_PID:-}" ] && kill "$HTTP_PID" 2>/dev/null || true
   rm -rf "$WORK"
+  [ -n "${EVID:-}" ] && rm -rf "$EVID"
 }
 trap cleanup EXIT
 

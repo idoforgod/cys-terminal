@@ -9,7 +9,15 @@
 
 결정론 exit 코드:
   0 성공 · 2 BUSY · 3 APPROVAL_REQUIRED · 4 기동실패 · 5 verify FAIL · 6 HUMAN_ACTIVE
-  · 7 HUMAN_PROFILE_PROTECTED · 8 PICK_TIMEOUT · 1 기타
+  · 7 HUMAN_PROFILE_PROTECTED · 8 PICK_TIMEOUT · 9 사용례 오류 · 10 NAV_FAILED
+  · 11 NAV_UNAVAILABLE · 12 TAB_LIMIT · 13 NO_TAB · 14 SCHEME_DENIED · 15 BAD_SELECTOR
+  · 16 NOT_VISIBLE · 17 NO_CONTEXT · 18 EVIDENCE_PATH_DENIED
+  · 19 HUMAN_CID_RESERVED · 20 HUMAN_CID_REQUIRED · 21 PROFILE_MISMATCH(프로필 격리=보안 거부)
+  · 1 기타
+
+★9(사용례 오류)가 따로 있는 이유(4-T-10): argparse 는 미지 서브커맨드·인자 오류에 **고정 종료코드
+  2**를 쓰는데, 그 2가 문서화된 `BUSY(2)="backoff 후 재시도"` 와 정확히 충돌한다. 서버에 동사를
+  넣고 CLI 배선을 빠뜨리면 에이전트가 "바쁘다"로 오판해 **무한 백오프**(원인불명 hang)에 빠진다.
 
 stdlib only (오피스 브리지 계보).
 """
@@ -29,13 +37,35 @@ AUDIT_PATH = BROWSER_ROOT / "audit.jsonl"
 BROWSERD_DIR = Path(__file__).resolve().parent.parent / "browserd"
 SERVER_TS = BROWSERD_DIR / "server.ts"
 
-# 에러 코드 → exit 코드 매핑
+# 에러 코드 → exit 코드 매핑.
+# ★신규 에러 코드는 반드시 여기 등재한다(4-T-10) — 미등재는 전부 exit 1 로 뭉개져 결정론 계약이
+#   죽는다("실패했다"만 알고 "무엇이 실패했는지"를 잃는다).
 EXIT_BY_ERROR = {
     "BUSY": 2,
     "APPROVAL_REQUIRED": 3,
     "HUMAN_ACTIVE": 6,
     "HUMAN_PROFILE_PROTECTED": 7,
     "PICK_TIMEOUT": 8,
+    # 사용례 오류 계열 — argparse 오류(9)와 같은 의미축으로 모은다.
+    "BAD_ARGS": 9,
+    "UNKNOWN_VERB": 9,
+    # Phase 3 신규
+    "NAV_FAILED": 10,
+    "NAV_UNAVAILABLE": 11,
+    "TAB_LIMIT": 12,
+    "NO_TAB": 13,
+    "SCHEME_DENIED": 14,
+    "BAD_SELECTOR": 15,
+    "NOT_VISIBLE": 16,
+    "NO_CONTEXT": 17,
+    "EVIDENCE_PATH_DENIED": 18,
+    # ★프로필 격리 위반(보안 거부) — exit 1(기타)로 뭉개면 에이전트가 "일반 오류"로 오판해
+    #   재시도할지 중단할지 판정하지 못한다(4-T-10 ③ 미등재 문제의 정확한 사례).
+    #   세 코드는 cid↔profile 상호 예약(P0-A)의 같은 가족이라 **함께** 등재한다 — 하나만 등재하면
+    #   같은 위반이 방향에 따라 19 와 1 로 갈려 결정론 계약이 오히려 깨진다.
+    "HUMAN_CID_RESERVED": 19,
+    "HUMAN_CID_REQUIRED": 20,
+    "PROFILE_MISMATCH": 21,
 }
 EXIT_OK = 0
 EXIT_OTHER = 1
@@ -44,6 +74,22 @@ EXIT_VERIFY_FAIL = 5
 EXIT_APPROVAL_REQUIRED = 3
 EXIT_HUMAN_PROFILE_PROTECTED = 7
 EXIT_PICK_TIMEOUT = 8
+EXIT_USAGE = 9  # argparse 사용례 오류 — BUSY(2)와의 충돌을 끊는다
+
+# CLI 이름 → 서버 동사. `stop` 은 데몬 종료가 선점했으므로 페이지 로딩 중지는 `stop-loading`.
+VERB_ALIAS = {"stop-loading": "stop"}
+
+
+class _NoConflictParser(argparse.ArgumentParser):
+    """argparse 사용례 오류를 exit 2 → **exit 9** 로 옮긴다(4-T-10).
+
+    argparse 기본값 2는 문서화된 BUSY(2)와 충돌해, CLI 미배선을 에이전트가 '서버가 바쁘다'로
+    오판하고 무한 백오프한다. 서브파서까지 같은 클래스를 쓰도록 parser_class 로 전파한다."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: 사용례 오류: {message}\n")
+        sys.exit(EXIT_USAGE)
 
 BRIEFS_DIR = BROWSER_ROOT / "briefs"
 NOTEBOOKLM_URL = "https://notebooklm.google.com/"
@@ -348,11 +394,18 @@ def run_verb(verb: str, args: dict, headless: bool) -> int:
 
 
 def build_args(a) -> dict:
-    """argparse 네임스페이스 → RPC args (None 제거)."""
+    """argparse 네임스페이스 → RPC args (None 제거).
+
+    ★4-S-12 함정: 여기 등재하지 않은 인자는 argparse 가 파싱해도 **RPC 에 실리지 않는다**.
+      서버는 인자 없이 동작하고 CLI 는 exit 0 으로 잘못된 결과를 낸다(exit0 거짓말 계열).
+      신규 동사에 새 인자를 붙일 때마다 이 목록을 함께 갱신해야 하며, 회귀 핀이 이를 지킨다."""
     keys = [
         "url", "profile", "context", "ref", "selector", "value", "text", "key",
         "expression", "path", "timeout", "load", "expect_text", "expect_selector",
         "action", "actor", "evidence_dir", "full_page", "approved",
+        # --- Phase 3 신규 ---
+        "what", "attr", "property", "dx", "dy", "width", "height", "id",
+        "function", "snapshot_after",
     ]
     out = {}
     for k in keys:
@@ -363,9 +416,10 @@ def build_args(a) -> dict:
 
 
 def main():
-    p = argparse.ArgumentParser(prog="javis_browser", description="browserd 배선 CLI (P1)")
+    p = _NoConflictParser(prog="javis_browser", description="browserd 배선 CLI (P1)")
     p.add_argument("--headless", action="store_true", help="browserd를 headless로 기동")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # parser_class 전파 — 서브커맨드 인자 오류도 exit 9 로 떨어져야 한다(4-T-10).
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=_NoConflictParser)
 
     sub.add_parser("doctor", help="설치·경로·버전 결정론 점검")
     sub.add_parser("start", help="browserd 기동")
@@ -374,7 +428,12 @@ def main():
 
     def add_common(sp):
         sp.add_argument("--context", default=None)
-        sp.add_argument("--evidence-dir", dest="evidence_dir", default=None)
+        sp.add_argument(
+            "--evidence-dir",
+            dest="evidence_dir",
+            default=None,
+            help="evidence 번들 경로 — ~/.cys/browser/evidence/ 하위만 허용(상대 경로는 그 아래로 해석). 루트 이탈은 EVIDENCE_PATH_DENIED(18)",
+        )
 
     sp = sub.add_parser("open"); sp.add_argument("url"); sp.add_argument("--profile", default=None); add_common(sp)
     sp = sub.add_parser("snapshot"); add_common(sp)
@@ -394,7 +453,59 @@ def main():
     # P4 디자인 모드: 사람이 요소 클릭 → 워커 브리프 md 생성.
     sp = sub.add_parser("pick", help="디자인 모드 — 요소 선택→브리프 md"); sp.add_argument("--timeout", type=int); add_common(sp)
 
+    # ════════ Phase 3 신규 동사 (서버 dispatch 와 1:1 · README 3면 일치) ════════
+    def add_target(sp):
+        sp.add_argument("--ref"); sp.add_argument("--selector"); sp.add_argument("--timeout", type=int)
+
+    def add_snap(sp):
+        # 변경성 동사 공통 플래그 — 성공 후 스냅샷 동봉(4-S-11 부분 성공 계약).
+        sp.add_argument("--snapshot-after", dest="snapshot_after", action="store_true", default=None,
+                        help="성공 후 스냅샷을 결과에 동봉(실패 시 snapshot=null + snapshot_error)")
+
+    # 내비게이션
+    sp = sub.add_parser("goto", help="현재 컨텍스트를 이동(open 과 달리 컨텍스트를 만들지 않음)")
+    sp.add_argument("url"); sp.add_argument("--timeout", type=int); add_snap(sp); add_common(sp)
+    # ★`stop` 은 이미 "browserd 데몬 종료"가 선점한 이름이다 — 페이지 로딩 중지는 `stop-loading`
+    #   으로 노출하고 서버 동사 `stop` 으로 옮긴다(VERB_ALIAS). 같은 이름을 재사용하면 데몬을
+    #   죽이려던 명령이 로딩만 멈추는(또는 그 반대) 치명적 혼동이 된다.
+    for v, h in (("back", "뒤로"), ("forward", "앞으로"), ("reload", "새로고침"), ("stop-loading", "페이지 로딩 중지")):
+        sp = sub.add_parser(v, help=h); add_snap(sp); add_common(sp)
+
+    # 조회 — what 은 위치인자(기존 `control <action>` 관례와 동일)
+    sp = sub.add_parser("get", help="페이지 조회(웹 문자열은 UNTRUSTED 경계 아래로 반환)")
+    sp.add_argument("what", choices=["url", "title", "text", "html", "value", "attr", "count", "box", "styles"])
+    sp.add_argument("--attr", help="what=attr 일 때 속성 이름")
+    sp.add_argument("--property", action="append", help="what=styles 일 때 CSS 속성(반복 지정 가능)")
+    add_target(sp); add_common(sp)
+
+    # 상호작용
+    for v, h in (("dblclick", "더블클릭"), ("hover", "마우스 올리기"), ("focus", "포커스"),
+                 ("check", "체크박스 켜기"), ("uncheck", "체크박스 끄기")):
+        sp = sub.add_parser(v, help=h); add_target(sp); add_snap(sp); add_common(sp)
+    sp = sub.add_parser("select", help="select 요소 값 선택")
+    sp.add_argument("--value", action="append", required=True, help="선택할 값(반복 지정 가능)")
+    add_target(sp); add_snap(sp); add_common(sp)
+    sp = sub.add_parser("scroll", help="스크롤(대상만 주면 화면 안으로)")
+    sp.add_argument("--dx", type=int); sp.add_argument("--dy", type=int)
+    add_target(sp); add_snap(sp); add_common(sp)
+
+    # 탭
+    sp = sub.add_parser("tab", help="탭 목록·생성·전환·닫기")
+    sp.add_argument("action", choices=["list", "new", "switch", "activate", "close"])
+    sp.add_argument("--id", help="대상 탭 id(tab list 로 확인)")
+    sp.add_argument("--url", help="tab new 시 이동할 주소")
+    sp.add_argument("--timeout", type=int); add_common(sp)
+
+    # 뷰포트
+    sp = sub.add_parser("viewport", help="뷰포트 지정/해제(지정은 사람 pane 리사이즈보다 우선)")
+    sp.add_argument("action", nargs="?", choices=["reset"], default=None, help="reset=고정 해제")
+    sp.add_argument("--width", type=int); sp.add_argument("--height", type=int)
+    add_common(sp)
+
     a = p.parse_args()
+    # CLI 는 브라우저 관례어 `switch` 를 받고 서버 계약어 `activate` 로 옮긴다(서버 단일 명칭 유지).
+    if getattr(a, "cmd", None) == "tab" and getattr(a, "action", None) == "switch":
+        a.action = "activate"
     headless = a.headless
 
     if a.cmd == "doctor":
@@ -440,7 +551,7 @@ def main():
         if rc is not None:
             sys.exit(rc)
 
-    sys.exit(run_verb(a.cmd, args, headless))
+    sys.exit(run_verb(VERB_ALIAS.get(a.cmd, a.cmd), args, headless))
 
 
 def gate_human(verb: str, args: dict):
@@ -491,12 +602,16 @@ def cmd_observe(verb_label: str, url: str, profile, evidence_dir, headless_flag:
     rc = guard_headful_required(verb_label, {"url": url, "profile": profile or "agent"})
     if rc:
         return rc
-    args = {"url": url, "context": None}
-    args = {k: v for k, v in args.items() if v is not None}
+    args = {"url": url}
     if evidence_dir:
         args["evidence_dir"] = evidence_dir
     if profile == "human":
         args["profile"] = "human"
+        # ★PRE-2: human 은 전용 cid "human" 에만 산다. 여기서 context 를 안 실으면 서버가
+        # "default" 로 낙하시켜 **로그인 세션이 모든 cast pane·에이전트 동사의 기본 컨텍스트를
+        # 점유**한다(sot 한 번이면 지구본 버튼이 human 화면을 가리키게 된다).
+        # 서버도 profile=human 이면 cid 를 강제 분리하지만, CLI 도 명시해 두 층에서 고정한다.
+        args["context"] = "human"
         rc = gate_human("observe", args)
         if rc is not None:
             return rc
