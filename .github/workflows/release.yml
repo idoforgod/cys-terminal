@@ -140,7 +140,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sh ui/build.sh
+          # ★cys-app 컴파일은 tauri build script 를 통과해야 하고, 그 스크립트는 tauri.conf.json 의
+          #   bundle 자원 **실재**를 전부 요구한다(v0.13.0 CI 실패의 실제 원인 — 사이드카만이 아니었다).
+          #   클린 체크아웃 실측 필수 목록: ①ui/dist(frontendDist·generate_context!) ②binaries/cys-<triple>
+          #   ③binaries/cysd-<triple> ④resources/pack.tar.gz ⑤resources/pack-manifest.json ⑥runtime/.
+          #   ①~⑤는 bundle-prep.sh(= beforeBuildCommand 와 **같은 스크립트**)가 실제 내용으로 만든다.
+          #   여기서 개별 복사로 흉내내면 tauri.conf.json 이 바뀔 때 조용히 어긋나므로 표준 스크립트를
+          #   그대로 부른다(드리프트 0). 뒤 release 빌드가 같은 산출물을 재사용해 순비용도 거의 0.
+          #   ⑥runtime/ 만 뒤 '동봉 런타임 준비' 스텝 소관이라, 존재 검사만 충족하도록 빈 디렉터리를
+          #   미리 만든다(내용은 그 스텝이 채운다). CYS_TARGET 미설정 = 호스트 트리플(이 레그와 일치).
+          mkdir -p src-tauri/runtime
+          bash scripts/bundle-prep.sh
           CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app
 
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
