@@ -633,11 +633,12 @@ fn ensure_view_bridge() -> Result<Value, String> {
     Err("view bridge state 대기 타임아웃(10s)".into())
 }
 
-/// 지구본 버튼 진입점 — browserd headful(실 Chromium) 창을 띄운다. 사람이 직접 클릭하는
-/// 신뢰 표면이므로 ensure_view_bridge와 동형으로 GUI가 직접 spawn한다(데몬 caps 게이트는
-/// GUI 프로세스를 surface로 해석 못 해 fail-closed로 사람 버튼을 막으므로 우회 — 시뮬 F1).
-/// 에이전트 경로(`cys browser`)만 데몬 RPC의 caps 게이트를 탄다. 첫 기동은 browserd 시작에
-/// 수 초 걸리므로 detached spawn 후 즉시 반환한다(창은 지연 등장·GUI toast가 피드백).
+/// 지구본 버튼 진입점 — browserd headful(실 Chromium) 창을 띄운다. GUI·`cys browser` CLI
+/// 둘 다 javis_browser를 직접 spawn한다(caps 게이트 없음 — 브라우저는 에이전트 도구이고,
+/// 진짜 경계는 browserd 프로필 격리다. 설계 §3-★). detached spawn 후 즉시 반환한다(첫 기동은
+/// browserd 시작에 수 초 — 창은 지연 등장·GUI toast가 피드백). ★단일 인스턴스 보장은 이 함수가
+/// 아니라 엔진 ensure_browserd의 파일락에 있다(리뷰어1 F1 — GUI Mutex는 CLI 동시성을 못 막으므로
+/// 크로스프로세스 락이 정답. 여기서 ensure_view_bridge식 Mutex+대기를 흉내내지 않는다).
 #[tauri::command]
 fn browser_open(url: Option<String>) -> Result<Value, String> {
     let script = cys::pack::pack_dir().join("bin").join("javis_browser.py");
@@ -659,7 +660,11 @@ fn browser_open(url: Option<String>) -> Result<Value, String> {
         .stderr(std::process::Stdio::null());
     no_console(&mut cmd);
     cmd.spawn().map_err(|e| format!("browser 기동 실패: {e}"))?;
-    Ok(serde_json::json!({"opening": true, "url": target, "profile": "agent"}))
+    // 정직 계약(리뷰어1 F3): detached spawn이라 여기서 아는 것은 "spawn 성공"뿐 — 브라우저가
+    // 실제로 떴다는 보장이 아니다(bun/playwright 미설치·browserd 타임아웃·observe 실패는 여기서
+    // 안 잡힌다). 'opened'로 거짓 단언하지 않고 'spawned'로 의미를 정직화한다(exit0 거짓말 원장).
+    // 실제 실패는 browserd.log·audit.jsonl에 남고, 창 부재가 사용자 신호다.
+    Ok(serde_json::json!({"spawned": true, "url": target, "profile": "agent"}))
 }
 
 /// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).

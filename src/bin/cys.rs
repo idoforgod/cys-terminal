@@ -1624,8 +1624,17 @@ fn run(command: Command) -> i32 {
             }
             let target = url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "about:blank".into());
             // 포그라운드 실행 — javis_browser의 JSON 출력·browserd 기동 로그·exit code를 그대로
-            // 전달(첫 기동은 수 초 소요, 사람에겐 정직한 진행 피드백). skillscan_warn 선례와 동형.
-            let status = std::process::Command::new("python3")
+            // 전달(첫 기동은 수 초 소요, 사람에겐 정직한 진행 피드백).
+            let mut cmd = std::process::Command::new("python3");
+            // 동봉 runtime(python3·bun) PATH 주입 — GUI browser_open과 대칭(리뷰어1 F4). 최소 PATH
+            // 에이전트 pane·Windows 동봉 python3.exe 환경에서 CLI만 해소 실패하는 비대칭 제거.
+            if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                let cur = std::env::var("PATH").unwrap_or_default();
+                if let Some(newp) = cys::runtime_prefixed_path(&exe_dir, &cur) {
+                    cmd.env("PATH", newp);
+                }
+            }
+            let status = cmd
                 .arg(&script)
                 .arg("observe")
                 .arg(&target)

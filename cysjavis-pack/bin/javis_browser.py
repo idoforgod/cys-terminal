@@ -141,11 +141,37 @@ def start_browserd(headless: bool, timeout: float = 20.0):
     return None, f"browserd 기동 타임아웃({timeout}s)\n{tail}"
 
 
+def _cross_process_lock(fh):
+    """배타 파일락(블로킹) — POSIX fcntl / Windows msvcrt. 미지원 플랫폼은 best-effort no-op."""
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return
+    except ImportError:
+        pass
+    try:
+        import msvcrt
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    except Exception:
+        pass  # 락 미지원 → best-effort(락 없던 종전 거동으로 폴백)
+
+
 def ensure_browserd(headless: bool):
     st = _live_state()
     if st:
         return st, None
-    return start_browserd(headless)
+    # ★동시 cold-start 경쟁 방지(리뷰어1 F1): ensure_browserd는 락 없는 check-then-act(TOCTOU)라
+    # 두 진입(지구본 버튼 + cys browser)이 state.json 기록 전 창에 겹치면 browserd(bun+Chromium)가
+    # 2개 뜨고, 사람과 에이전트가 서로 다른 창을 조작해 '하나의 브라우저 공유'가 무음 붕괴한다.
+    # 파일락 임계구역 — 락 안에서 재확인(double-check) 후에만 spawn한다. start_browserd가 state
+    # 등장까지 대기하므로, 락을 기다린 2차 호출은 fast-path로 1차의 live state를 재사용한다.
+    BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
+    with open(BROWSER_ROOT / "browserd.lock", "w") as lf:
+        _cross_process_lock(lf)
+        st = _live_state()
+        if st:
+            return st, None
+        return start_browserd(headless)
 
 
 def rpc(st, verb: str, args: dict):

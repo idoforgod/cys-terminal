@@ -5704,7 +5704,9 @@ document.getElementById("btn-browser")?.addEventListener("click", async () => {
   browserOpening = true;
   try {
     await invoke("browser_open", { url: null });
-    toast("browser", "🌐 브라우저 여는 중", "Chrome 창이 곧 뜹니다 — 안 뜨면 browserd 준비 확인(doctor)");
+    // 정직 표현(F3): spawn만 확인됨 — 창 등장은 browserd 준비에 달림(첫 기동 수 초). 창이 안
+    // 뜨면 browserd 미준비(bun/playwright)이며 doctor로 확인. spawn 자체 실패는 catch로 온다.
+    toast("browser", "🌐 브라우저 시작 요청", "Chrome 창이 곧 뜹니다 — 수 초 후에도 없으면 browserd 준비 확인(cys browser doctor)");
   } catch (e) {
     toast("browser", "브라우저 열기 실패", String(e));
   } finally {
