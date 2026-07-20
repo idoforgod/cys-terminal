@@ -667,6 +667,133 @@ fn browser_open(url: Option<String>) -> Result<Value, String> {
     Ok(serde_json::json!({"spawned": true, "url": target, "profile": "agent"}))
 }
 
+/// ~/.cys/browser/state.json 을 읽어 pid 생존이면 (port, token, headless) 반환, 부재/손상/사멸이면 None.
+/// browserd 엔진(lib.ts writeState)이 {pid, port, token, headless?} 를 0600 원자 기록한다.
+/// ★headless 는 3-상태다 — 키가 있으면 Some(값), **없거나 bool 이 아니면 None=unknown**. 이 키를 안 쓰던
+/// 구버전 browserd 도 실제로는 headless 로 떠 있을 수 있어, 부재를 false 로 단정하면 GUI 가 "기존 headful
+/// 세션 재사용 — 외부 창 병존" toast 를 **거짓 고지**한다(창이 없는데 있다고 말함 = exit0 거짓말 계열).
+/// unknown 은 JSON 에 null 로 나가고, GUI 의 `state.headless === false` 엄격 비교가 자연히 침묵한다
+/// (모르면 말하지 않는다).
+/// pid 생존 판정은 read_live_view_state 와 동형(kill(pid,0): ESRCH=사멸).
+fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bool>)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = v.get("pid").and_then(|p| p.as_i64())?;
+    let port = v.get("port").and_then(|p| p.as_u64())?;
+    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
+    let headless = v.get("headless").and_then(|h| h.as_bool()); // 부재·비-bool = None(unknown)
+    // pid 생존 확인 — kill(pid, 0): 0=생존, ESRCH=사멸. (windows는 생존 가정 — 스테일이면 상위 계약이 흡수)
+    #[cfg(unix)]
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return None;
+    }
+    let _ = pid;
+    let port = u16::try_from(port).ok()?;
+    Some((port, token, headless))
+}
+
+/// 지구본 버튼 in-pane(cast) 경로 진입점 — browserd 를 **headless** 로 확보하고 cast 앱이 쓸
+/// {port, token, headless} 좌표를 반환한다. browser_open(detached·즉시 반환)과 달리 이 커맨드는
+/// `javis_browser.py --headless start` 를 **동기 실행**해 browserd 가 실제로 뜰 때까지 기다린다
+/// (엔진 start 는 state 등장까지 최대 20s 블로킹). 그래서 async fn — Tauri 가 별도 스레드에서
+/// 돌려 cold-start 가 GUI 메인 스레드를 점유하지 않는다(시뮬 F1). 블로킹 대기는 파일 내 관례대로
+/// spawn_blocking 으로 tokio 워커에서 격리한다.
+/// ★단일 인스턴스 보장은 이 함수가 아니라 엔진 ensure_browserd 의 파일락에 있다(browser_open 과
+/// 동일 원칙 — 진입점 Mutex 흉내 금지, 크로스프로세스 락이 정답). live browserd 가 이미 있으면
+/// kill 없이 그대로 재사용되고 state.headless 를 정직 반환한다(세션 공유 원칙).
+#[tauri::command]
+async fn ensure_browserd_cast() -> Result<Value, String> {
+    let script = cys::pack::pack_dir().join("bin").join("javis_browser.py");
+    if !script.exists() {
+        return Err(format!("browser 스크립트 없음: {}", script.display()));
+    }
+    let state_path = cys::home_dir().join(".cys/browser/state.json");
+    tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let mut cmd = std::process::Command::new("python3");
+        inject_runtime_path(&mut cmd); // 동봉 runtime(python3) PATH 주입 — browser_open 동형
+        cmd.arg(&script)
+            .arg("--headless") // 전역 플래그(subcommand 앞) — javis_browser argparse 정의와 정합
+            .arg("start")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        no_console(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| format!("browserd 기동 실패: {e}"))?;
+        // 완료까지 대기(타임아웃 30s — 엔진 20s 블로킹에 여유). try_wait 폴링으로 무한 대기 방지.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // 파이프 잔여 출력 수거(start 출력은 JSON 한 줄 — 버퍼 초과 없음).
+                    use std::io::Read;
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    if let Some(mut o) = child.stdout.take() {
+                        let _ = o.read_to_string(&mut stdout);
+                    }
+                    if let Some(mut e) = child.stderr.take() {
+                        let _ = e.read_to_string(&mut stderr);
+                    }
+                    if !status.success() {
+                        // 정직 계약 — 거짓 성공 금지. 원인(stderr/stdout 말미 각 500자) 노출.
+                        let tail = |s: &str, n: usize| -> String {
+                            let t = s.trim();
+                            let cs: Vec<char> = t.chars().collect();
+                            if cs.len() <= n {
+                                t.to_string()
+                            } else {
+                                cs[cs.len() - n..].iter().collect()
+                            }
+                        };
+                        let code =
+                            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+                        return Err(format!(
+                            "browserd start 실패(exit {code}) — stderr: {} / stdout: {}",
+                            tail(&stderr, 500),
+                            tail(&stdout, 500)
+                        ));
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err("browserd start 타임아웃(30s) — kill".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                Err(e) => return Err(format!("browserd start 대기 실패: {e}")),
+            }
+        }
+        // exit 0 — state.json 으로 browserd live + 좌표를 검증(정직 계약: 프레임 도달은 pane 이 검증).
+        match read_browserd_state(&state_path) {
+            Some((port, token, headless)) => {
+                Ok(json!({"port": port, "token": token, "headless": headless}))
+            }
+            None => Err("browserd start 는 exit0 이나 state.json 부재/손상/pid 사망 — 확보 실패".into()),
+        }
+    })
+    .await
+    .map_err(|e| format!("browserd 확보 태스크 실패(join): {e}"))?
+}
+
+/// browserd 생존 조회 전용 — **spawn 절대 없음**(auto-spawn 회귀 차단, 설계 D7). GUI 복원 경로가
+/// 부팅 시 Chromium 을 자동 기동하지 않고 browserd 생존만 확인하는 용도. live 면
+/// {alive:true, port, token, headless}, 부재·손상·pid 사망이면 {alive:false} 반환(Err 아님 —
+/// 정상 상태 조회이므로 실패가 아니다).
+#[tauri::command]
+fn browserd_state() -> Value {
+    let state_path = cys::home_dir().join(".cys/browser/state.json");
+    match read_browserd_state(&state_path) {
+        Some((port, token, headless)) => {
+            json!({"alive": true, "port": port, "token": token, "headless": headless})
+        }
+        None => json!({"alive": false}),
+    }
+}
+
 /// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
 /// open_path와 동일한 실재 경로 게이트 — URL 스킴·비존재 문자열 차단.
 #[tauri::command]
@@ -3089,6 +3216,8 @@ fn main() {
             read_text_head,
             ensure_view_bridge,
             browser_open,
+            ensure_browserd_cast,
+            browserd_state,
             home_dir_path,
             open_url,
             send_key,
@@ -3250,6 +3379,63 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             let r = open_path(p.to_string_lossy().into_owned(), None);
             assert_eq!(r, Err("executable_confirm".to_string()));
+        }
+    }
+
+    /// [W2] browserd state 파싱 — headless 3-상태(true/false/unknown)·pid 결손 None·손상 JSON None.
+    /// 생존 pid 는 테스트 프로세스 자신(std::process::id())으로 대체(kill(self,0)=생존).
+    #[test]
+    fn browserd_state_parse_and_liveness() {
+        let dir = std::env::temp_dir().join("cys-browserd-state-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+
+        // 정상 JSON(headless:true)·생존 pid → Some, 값 정확 전사.
+        let p1 = dir.join("ok.json");
+        std::fs::write(&p1, format!(r#"{{"pid":{me},"port":51234,"token":"tok-abc","headless":true}}"#))
+            .unwrap();
+        assert_eq!(read_browserd_state(&p1), Some((51234u16, "tok-abc".to_string(), Some(true))));
+
+        // headless:false 명시 → Some(false). GUI 가 병존 toast 를 띄우는 **유일한** 경우다.
+        let p1b = dir.join("headful.json");
+        std::fs::write(&p1b, format!(r#"{{"pid":{me},"port":51235,"token":"t1b","headless":false}}"#))
+            .unwrap();
+        assert_eq!(read_browserd_state(&p1b), Some((51235u16, "t1b".to_string(), Some(false))));
+
+        // ★headless 키 부재 → unknown(None) — false 로 단정 금지(정직성 회귀 핀). 구버전 browserd 가
+        // 실제로는 headless 로 떠 있어도 false 로 채우면 GUI 가 "외부 창 병존"을 거짓 고지한다.
+        let p2 = dir.join("nohl.json");
+        std::fs::write(&p2, format!(r#"{{"pid":{me},"port":6000,"token":"t2"}}"#)).unwrap();
+        assert_eq!(read_browserd_state(&p2), Some((6000u16, "t2".to_string(), None)));
+
+        // headless 가 bool 이 아님(손상·타입 드리프트) → 역시 unknown(None).
+        let p2b = dir.join("badhl.json");
+        std::fs::write(&p2b, format!(r#"{{"pid":{me},"port":6001,"token":"t2b","headless":"yes"}}"#))
+            .unwrap();
+        assert_eq!(read_browserd_state(&p2b), Some((6001u16, "t2b".to_string(), None)));
+
+        // unknown 은 JSON 에서 null 로 나가야 GUI 의 `=== false` 엄격 비교가 침묵한다(고지 계약).
+        assert!(json!({"headless": None::<bool>})["headless"].is_null(), "unknown=null 직렬화");
+
+        // pid 필드 결손 → None(파싱 실패).
+        let p3 = dir.join("nopid.json");
+        std::fs::write(&p3, r#"{"port":6000,"token":"t3"}"#).unwrap();
+        assert_eq!(read_browserd_state(&p3), None);
+
+        // 손상 JSON → None.
+        let p4 = dir.join("corrupt.json");
+        std::fs::write(&p4, "{not json").unwrap();
+        assert_eq!(read_browserd_state(&p4), None);
+
+        // 파일 부재 → None.
+        assert_eq!(read_browserd_state(&dir.join("absent.json")), None);
+
+        // pid 사망 → None(browserd_state 의 alive:false 근거) — 존재 불가 pid.
+        #[cfg(unix)]
+        {
+            let p5 = dir.join("dead.json");
+            std::fs::write(&p5, format!(r#"{{"pid":{},"port":6000,"token":"t5"}}"#, i32::MAX)).unwrap();
+            assert_eq!(read_browserd_state(&p5), None, "존재 불가 pid 는 사멸로 간주");
         }
     }
 

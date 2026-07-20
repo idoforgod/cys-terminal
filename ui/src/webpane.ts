@@ -110,7 +110,126 @@ export function loadPersistedLayout(getItem: (key: string) => string | null): an
   return null;
 }
 
-// 레이아웃 저장 — v3에만 쓴다(v2 미변경 = 다운그레이드 안전 불변식).
+// 레이아웃 저장 — v3에만 쓴다(v2 미변경 = 다운그레이드 안전 불변식). 저장 직전 cast 노드의 실 토큰을
+// pending으로 치환한다(sanitizeLayoutForPersist) — v3를 쓰는 단일 choke point라 우회 저장 경로가 없다.
 export function persistLayout(setItem: (key: string, value: string) => void, data: unknown): void {
-  setItem(LAYOUT_KEY_V3, JSON.stringify(data));
+  setItem(LAYOUT_KEY_V3, JSON.stringify(sanitizeLayoutForPersist(data)));
+}
+
+// ─── cast web pane (browserd CDP screencast) ──────────────────────────────
+// 뷰어 web pane과 같은 iframe 표면·같은 WebNode 스키마(url 내용만 다름)를 쓰되, URL이 browserd가
+// 자기 origin에서 서빙하는 screencast 앱을 가리킨다. 뷰어와 구분되는 순수 판단부만 여기 모은다
+// (DOM 무의존·bun test 대상). isAllowedWebPaneUrl 하드가드는 cast URL도 그대로 통과한다.
+
+// cast 앱 URL 조립 — `http://127.0.0.1:<port>/<token>/cast/?context=<c>`. context는 encodeURIComponent.
+export function castAppUrl(port: number, token: string, context: string): string {
+  return `http://127.0.0.1:${port}/${token}/cast/?context=${encodeURIComponent(context)}`;
+}
+
+// cast URL 판정 — pathname 2번째 세그먼트가 "cast"면 true(토큰 무관·순수). 뷰어 URL(2번째="app")·
+// 손상 URL은 false. 조립 전 pending URL(port 0·token "pending")도 cast로 인식해야 한다.
+export function isCastUrl(url: string): boolean {
+  try {
+    const segs = new URL(url).pathname.split("/").filter((s) => s.length > 0);
+    return segs[1] === "cast";
+  } catch {
+    return false;
+  }
+}
+
+// cast 노드의 context 회수 — 복원·재연결 시 같은 context로 재조립하기 위함. 없으면 "default".
+export function castContextOf(url: string): string {
+  try {
+    return new URL(url).searchParams.get("context") ?? "default";
+  } catch {
+    return "default";
+  }
+}
+
+// cast 앱이 보고한 페이지 제목 → pane 헤더 문구(순수). 값의 출처가 **3자 페이지**라 공백 정규화 +
+// 길이 상한으로 헤더 파괴를 막는다(문자열로만 다루므로 마크업 주입 표면은 없다 — 호출측 textContent).
+// 빈 값·비문자열은 ""를 돌려 호출측이 기본 제목("브라우저")을 유지하게 한다.
+export function castPaneTitle(title: unknown, maxLen = 60): string {
+  if (typeof title !== "string") return "";
+  const one = title.replace(/\s+/g, " ").trim();
+  return one.length <= maxLen ? one : `${one.slice(0, maxLen)}…`;
+}
+
+// cast 앱이 보고한 페이지 URL → 헤더 축약 표시(순수). 스킴·쿼리를 걷어 host+path만 보인다(전체 URL은
+// 호출측이 title 속성으로 단다). 비URL(about:blank 등)은 원문을 축약해 그대로 쓴다.
+export function castDisplayUrl(url: unknown, maxLen = 60): string {
+  if (typeof url !== "string") return "";
+  const one = url.replace(/\s+/g, " ").trim();
+  if (!one) return "";
+  let shown = one;
+  try {
+    const u = new URL(one);
+    if (u.host) shown = `${u.host}${u.pathname === "/" ? "" : u.pathname}`;
+  } catch {
+    // 비URL은 원문 축약으로 낙하(무음 실패 아님 — 사용자는 보고된 값을 그대로 본다)
+  }
+  return shown.length <= maxLen ? shown : `${shown.slice(0, maxLen)}…`;
+}
+
+// postMessage origin 하드 가드 — origin은 경로 없는 `scheme://host:port` 형태다. isAllowedWebPaneUrl과
+// 같은 원칙(loopback+명시 포트·양끝 고정)으로 userinfo(@)·서브도메인 위장을 차단한다. 포트는 가변이라
+// 값이 아니라 형태만 본다 — 발신자 실체 대조는 ownsSource(iframe contentWindow)가 맡는 2중 게이트.
+export function isLoopbackOrigin(origin: unknown): boolean {
+  return typeof origin === "string" && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin);
+}
+
+// cast 노드의 저장용 URL 치환(순수) — browserd 토큰의 localStorage 평문 영속을 없앤다.
+// 근거: cast pane은 로드할 때마다 browserd_state/ensure_browserd_cast로 최신 {port,token}을 다시 받아
+// URL을 재조립하므로 **저장된 토큰은 한 번도 쓰이지 않는다**(순수 잔여물 — 지워도 기능 손실 0). 반면 이
+// 토큰은 RPC eval로 임의 JS 실행이 가능해 뷰어 토큰과 권한 등급이 다르다. context는 복원 시 같은
+// 컨텍스트로 재연결해야 하므로 **반드시 보존**한다.
+// ★변경 없는 서브트리는 원본 참조를 그대로 돌려준다 — 뷰어·터미널 노드 직렬화는 바이트 불변이고,
+// 런타임 트리는 변형하지 않는다(실 토큰은 메모리에만 남아 iframe 로드·재조립이 그대로 동작).
+export function sanitizeCastNodes(node: any): any {
+  if (!node) return node;
+  if (node.type === "web") {
+    if (!isCastUrl(node.url)) return node; // 뷰어 노드 무변경
+    return { ...node, url: castAppUrl(0, "pending", castContextOf(node.url)) };
+  }
+  if (node.type === "split") {
+    const a = sanitizeCastNodes(node.a);
+    const b = sanitizeCastNodes(node.b);
+    return a === node.a && b === node.b ? node : { ...node, a, b };
+  }
+  return node; // 터미널 pane 등 무변경
+}
+
+// 레이아웃 전체에 위 치환 적용(workspaces[].tree만 훑는다). 저장 시점 전용 — 런타임 상태 무영향.
+export function sanitizeLayoutForPersist(data: any): any {
+  if (!data || !Array.isArray(data.workspaces)) return data;
+  return {
+    ...data,
+    workspaces: data.workspaces.map((w: any) => {
+      if (!w || !w.tree) return w;
+      const tree = sanitizeCastNodes(w.tree);
+      return tree === w.tree ? w : { ...w, tree };
+    }),
+  };
+}
+
+// ensure_browserd_cast 실패 원인을 사용자 노출용 한 줄 문구로 정규화 — 무음 금지의 순수부.
+// 원인을 UI에서 버리면 신선 머신 최빈 실패("bun 미설치 — https://bun.sh")가 "브라우저 꺼짐"으로
+// 위장돼 사용자가 클릭만 반복하며 원인을 영영 모른다. 개행·연속 공백을 접고 maxLen 초과분은 "…"로
+// 절단한다(placeholder가 좁아 앞부분만 싣는다 — 전문은 toast가 나른다). 빈 에러·null은 ""(호출측이
+// 원인 없는 기본 문구로 낙하).
+export function castFailureReason(err: unknown, maxLen = 120): string {
+  const one = (err === null || err === undefined ? "" : String(err)).replace(/\s+/g, " ").trim();
+  return one.length <= maxLen ? one : `${one.slice(0, maxLen)}…`;
+}
+
+// 레이아웃 트리에서 web 노드 url을 전부 수집(collectWebPaths 동형 순수 walk). openCastPane의 dup
+// 판정(현재 ws 트리에 cast pane 이미 있으면 새 pane 대신 포커스만)에 쓴다.
+export function collectWebUrls(node: any, out: string[] = []): string[] {
+  if (!node) return out;
+  if (node.type === "web") out.push(node.url);
+  else if (node.type === "split") {
+    collectWebUrls(node.a, out);
+    collectWebUrls(node.b, out);
+  }
+  return out;
 }

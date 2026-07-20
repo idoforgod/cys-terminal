@@ -28,6 +28,14 @@ import {
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
+  castAppUrl,
+  isCastUrl,
+  castContextOf,
+  castFailureReason,
+  castPaneTitle,
+  castDisplayUrl,
+  isLoopbackOrigin,
+  collectWebUrls,
 } from "./webpane";
 
 declare global {
@@ -2165,6 +2173,11 @@ function destroyPaneRuntime(sid: number, socket?: string) {
 interface WebPaneView extends PaneView {
   wid: number;
   node: WebNode;
+  // cast pane 전용(뷰어 pane엔 undefined): 재연결(active ensure) 트리거 · postMessage 발신 iframe 식별
+  // · cast 앱 nav 보고를 pane 헤더에 반영.
+  castReconnect?: () => void;
+  ownsSource?: (src: unknown) => boolean;
+  castTitle?: (title: unknown, url: unknown) => void;
 }
 
 const VIEW_BRIDGE_RETRY_MS = 5000;
@@ -2202,6 +2215,7 @@ function makeWebPane(node: WebNode): WebPaneView {
   let retryTimer: number | undefined;
   let disposed = false;
   let themeCache: { bg: string; fg: string } | null = null;
+  const isCast = isCastUrl(node.url); // cast 노드는 뷰어와 다른 로드 경로(아래 분기). 생성 시 확정.
 
   const showPlaceholder = (msg: string) => {
     placeholder.textContent = msg;
@@ -2228,6 +2242,7 @@ function makeWebPane(node: WebNode): WebPaneView {
   // 사이드카 확보 → 최신 {port,token}으로 URL 재조립 → iframe 로드. 실패=플레이스홀더+재시도.
   const ensureAndLoad = async () => {
     if (disposed) return;
+    if (isCast) return castPassiveLoad(); // cast 분기 — 마운트·복원·재시도 기본은 passive(auto-spawn 금지). 아래 뷰어 경로 불변.
     const path = extractViewerPath(node.url);
     if (path === null) return showPlaceholder("잘못된 뷰어 경로 — 열 수 없음");
     let bridge: { port: number; token: string };
@@ -2247,6 +2262,107 @@ function makeWebPane(node: WebNode): WebPaneView {
     frame.src = url;
   };
 
+  // ── cast pane 로드 경로(뷰어 ensure_view_bridge 경로와 분리 — 공유는 showPlaceholder·scheduleRetry·
+  // frame·urlEl·placeholder·node뿐, 뷰어 동작 불변). passive=조회 전용(spawn 없음)·active=ensure(spawn).
+  let castLoadGen = 0; // 마운트 passive와 버튼 active가 경합하면 최신 로드만 반영(느린 invoke 결과 폐기)
+  let castHeadfulToasted = false; // 기존 headful 재사용 고지 1회 상한
+  let castLastFailure = ""; // 직전 ensure 실패 원인 — toast(8s)가 사라진 뒤에도 placeholder가 계속 인다
+  let castLastToasted = ""; // 같은 원인 연속 실패 시 toast 1회만(폭주 상한)
+  let castReconnectClick: ((e: MouseEvent) => void) | undefined;
+  const clearCastReconnectClick = () => {
+    if (!castReconnectClick) return;
+    placeholder.removeEventListener("click", castReconnectClick);
+    placeholder.style.cursor = "";
+    castReconnectClick = undefined;
+  };
+  // {port,token}으로 cast URL 재조립·하드가드·iframe 로드·node.url 갱신(뷰어 2243 동형 — 토큰 회전 저장).
+  const loadCastFrame = (port: number, token: string) => {
+    const url = castAppUrl(port, token, castContextOf(node.url));
+    if (!isAllowedWebPaneUrl(url)) return showPlaceholder("차단된 URL — 로드 거부"); // 하드 가드
+    castLastFailure = ""; // 로드 성공 = 직전 실패 해소(다음 실패는 다시 고지된다)
+    castLastToasted = "";
+    node.url = url;
+    urlEl.textContent = `127.0.0.1:${port}`;
+    urlEl.title = url;
+    showPlaceholder("로딩 중…");
+    frame.src = url;
+  };
+  // active ensure — ensure_browserd_cast(spawn 허용). 버튼·재연결 클릭·postMessage 전용(=사람 의지).
+  const castActiveEnsure = async () => {
+    if (disposed) return;
+    const gen = ++castLoadGen;
+    clearCastReconnectClick();
+    showPlaceholder("브라우저 준비 중…");
+    let state: { port: number; token: string; headless: boolean };
+    try {
+      state = (await invoke("ensure_browserd_cast")) as { port: number; token: string; headless: boolean };
+    } catch (e) {
+      if (disposed || gen !== castLoadGen) return;
+      // 실패 원인을 버리지 않는다(무음 금지) — 원인이 소실되면 신선 머신 최빈 실패인 "bun 미설치"가
+      // "브라우저 꺼짐"으로 위장돼, 사용자는 클릭마다 수십 초를 날리며 원인을 영영 모른다.
+      // 주 전달 경로는 toast(전문), placeholder는 좁으므로 앞부분 요약만 싣는다.
+      const reason = castFailureReason(e);
+      castLastFailure = reason; // toast는 8s 후 사라진다 — placeholder가 원인을 계속 인다
+      if (reason !== castLastToasted) {
+        castLastToasted = reason; // 같은 원인 반복 클릭은 toast 1회만(폭주 상한·placeholder는 매번 갱신)
+        toast("browser", "브라우저 준비 실패", String(e));
+      }
+      showPlaceholder(reason ? `브라우저 준비 실패 — ${reason} · 재시도…` : "브라우저 준비 실패 — 재시도…");
+      return scheduleRetry(); // 재시도는 ensureAndLoad→passive(자동 재spawn 금지·자원 거버넌스)
+    }
+    if (disposed || gen !== castLoadGen) return;
+    // 기존 headful 세션 재사용(kill 금지·공유 원칙) — 외부 창과 병존함을 1회 정직 고지.
+    if (state.headless === false && !castHeadfulToasted) {
+      castHeadfulToasted = true;
+      toast("browser", "기존 headful 세션 재사용", "외부 브라우저 창과 병존합니다");
+    }
+    loadCastFrame(state.port, state.token);
+  };
+  // cast 앱 nav 보고 → pane 헤더 갱신(설계 §3-1 "주소창·pane 헤더 갱신"의 부모 측 절반).
+  // ★node.url은 절대 건드리지 않는다 — 그건 cast 앱 로드 URL이고, 페이지 URL로 덮으면 isCastUrl이
+  // 깨져 복원·재연결 경로가 통째로 무너진다(표시용 페이지 URL은 비영속·헤더에만 산다).
+  const applyCastTitle = (rawTitle: unknown, rawUrl: unknown) => {
+    if (disposed) return;
+    const t = castPaneTitle(rawTitle);
+    node.title = t || "브라우저"; // 빈 제목이면 기본값 유지. title은 레이아웃에 영속(민감정보 아님)
+    titleEl.textContent = node.title;
+    const shown = castDisplayUrl(rawUrl);
+    if (shown) {
+      urlEl.textContent = shown; // 축약 표시
+      urlEl.title = typeof rawUrl === "string" ? rawUrl : shown; // 전체 URL은 툴팁
+    }
+  };
+  // "클릭해 재연결" placeholder — 복원·끊김 시 auto-spawn 대신 사람 클릭을 spawn 게이트로 둔다.
+  // ★직전 ensure 실패 원인을 함께 인다: 실패 5s 뒤 재시도가 passive로 낙하하면서 이 문구로 덮이는데,
+  // 원인을 빼면 바로 그 "브라우저 꺼짐 위장"이 되살아난다(P1-1 회귀의 실제 소실 지점).
+  const showCastReconnectPlaceholder = (msg: string) => {
+    showPlaceholder(castLastFailure ? `${msg} (직전 실패: ${castLastFailure})` : msg);
+    clearCastReconnectClick();
+    placeholder.style.cursor = "pointer";
+    castReconnectClick = () => { clearCastReconnectClick(); castActiveEnsure(); }; // 클릭=사람 의지 → spawn 허용
+    placeholder.addEventListener("click", castReconnectClick);
+  };
+  // passive load — 조회 전용(browserd_state·spawn 없음). 부팅·복원이 Chromium을 자동 기동하지 않는다:
+  // alive면 재연결, 아니면 "클릭해 재연결" placeholder(사람 클릭에서만 active ensure).
+  const castPassiveLoad = async () => {
+    if (disposed) return;
+    const gen = ++castLoadGen;
+    let state: { alive: boolean; port?: number; token?: string; headless?: boolean };
+    try {
+      state = (await invoke("browserd_state")) as {
+        alive: boolean; port?: number; token?: string; headless?: boolean;
+      };
+    } catch {
+      if (disposed || gen !== castLoadGen) return;
+      return showCastReconnectPlaceholder("브라우저 상태 확인 실패 — 클릭해 재연결"); // 조회 실패도 spawn 금지
+    }
+    if (disposed || gen !== castLoadGen) return;
+    if (!state.alive || state.port === undefined || state.token === undefined) {
+      return showCastReconnectPlaceholder("브라우저 꺼짐 — 클릭해 재연결");
+    }
+    loadCastFrame(state.port, state.token);
+  };
+
   closeBtn.addEventListener("click", () => closeWebPane(node.wid));
   header.addEventListener("mousedown", () => focusWebPane(node.wid));
   showPlaceholder("계기 대기 중…");
@@ -2259,8 +2375,24 @@ function makeWebPane(node: WebNode): WebPaneView {
     resize: () => { /* iframe은 CSS flex로 자동 리사이즈 — no-op */ },
     applyTheme: (bg, fg) => { themeCache = { bg, fg }; postTheme(); },
     setFocused: (focused) => { el.classList.toggle("focused", focused); },
-    dispose: () => { disposed = true; clearTimeout(retryTimer); el.remove(); },
+    dispose: () => {
+      disposed = true;
+      clearTimeout(retryTimer);
+      clearCastReconnectClick();
+      // 리스크 7 — iframe 제거만으로도 브라우저가 WS를 닫지만 그 보장에 **단독 의존하지 않는다**:
+      // about:blank로 갈아끼워 WS 종료를 명시 유발한다(clients 0 → browserd가 screencast 중단).
+      // 늦은 정리로 screencast가 계속 도는 창을 닫는다. 뷰어 pane은 무변경(cast 분기 전용).
+      if (isCast) frame.src = "about:blank";
+      el.remove();
+    },
   };
+  if (isCast) {
+    // cast pane만: 버튼·재연결 클릭·postMessage가 active ensure를 재실행하고, postMessage 발신
+    // iframe(event.source)이 이 pane인지 frame.contentWindow로 식별한다.
+    view.castReconnect = castActiveEnsure;
+    view.ownsSource = (src) => src != null && src === frame.contentWindow;
+    view.castTitle = applyCastTitle;
+  }
   webPanes.set(node.wid, view);
   return view;
 }
@@ -2304,6 +2436,36 @@ async function openViewerPane(path: string, focus = true): Promise<void> {
   if (focus) focusWebPane(wid);
 }
 (window as unknown as { cysOpenViewer: (p: string) => Promise<void> }).cysOpenViewer = openViewerPane;
+
+// 지구본 버튼 → 현재 워크스페이스 트리에 cast web pane 신설(openViewerPane 동형·browserd 라이브 렌더).
+// 뷰어와 달리 focus=true: 사람이 버튼을 눌렀다(데몬 이벤트의 포커스 강탈 금지와 구분되는 의도적 선택).
+function openCastPane(): void {
+  const ws = current();
+  if (!ws || ws.pending) {
+    // 무음 금지 — 버튼은 눌렸는데 화면에 아무것도 없는 상태를 만들지 않는다(viewer not-ready 동형).
+    toast("browser", "브라우저 열기 보류", "워크스페이스 준비 중 — 잠시 후 다시 시도");
+    return;
+  }
+  // dup 범위 = 현재 ws 트리(viewer.open과 동일 원칙 — 전역 스캔은 타 ws pane 오판). 이미 있으면 포커스만.
+  if (collectWebUrls(ws.tree).some(isCastUrl)) {
+    const castWid = collectWebWids(ws.tree).find((wid) => isCastUrl(webPanes.get(wid)?.node.url ?? ""));
+    if (castWid != null) focusWebPane(castWid);
+    toast("browser", "이미 열려 있음", "브라우저 pane으로 포커스 이동");
+    return;
+  }
+  if (webPanes.size >= 8) {
+    toast("browser", "브라우저 pane 상한(8)", "기존 pane을 닫고 다시 시도"); // 뷰어와 상한 공유
+    return;
+  }
+  const wid = webWidCounter++;
+  // 초기 URL은 pending(port 0·token pending) — makeWebPane가 active ensure로 실제 재조립.
+  const node = makeWebNode(wid, castAppUrl(0, "pending", "default"), "브라우저");
+  const view = makeWebPane(node);
+  ws.tree = ws.tree ? { type: "split", dir: "row", a: ws.tree, b: node } : node;
+  render();
+  focusWebPane(wid); // 사람이 버튼을 눌렀다 — focus=true가 의도
+  view.castReconnect?.(); // 생성 즉시 active ensure(버튼=사람 의지=spawn 허용)
+}
 
 // ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------
 
@@ -5696,23 +5858,27 @@ async function start() {
 // ---------- ui wiring ----------
 
 document.getElementById("btn-new")!.addEventListener("click", actionNew);
-// 지구본 버튼 — browserd 실브라우저(headful) 열기. in-flight 가드로 연타 시 1회만(시뮬 적대
-// 발견: 버튼은 GUI 직접 spawn이라 데몬 rate 미경유 → UI측 debounce가 폭주 방벽).
-let browserOpening = false;
-document.getElementById("btn-browser")?.addEventListener("click", async () => {
-  if (browserOpening) return;
-  browserOpening = true;
-  try {
-    await invoke("browser_open", { url: null });
-    // 정직 표현(F3·N2): spawn만 확인됨 — 창 등장은 browserd 준비에 달림(첫 기동 수 초). 창이 안
-    // 뜨면 browserd 미준비(bun/playwright). ★진단 명령은 실재 경로로만 안내한다 — `cys browser`는
-    // url 인자뿐이라 서브커맨드가 없다(안내에 `cys browser doctor` 금지 — 무동작·N2).
-    toast("browser", "🌐 브라우저 시작 요청", "Chrome 창이 곧 뜹니다 — 수 초 후에도 없으면 browserd 준비 미비(bun·playwright 설치 확인)");
-  } catch (e) {
-    toast("browser", "브라우저 열기 실패", String(e));
-  } finally {
-    setTimeout(() => { browserOpening = false; }, 1500);
+// 지구본 버튼 → 현재 워크스페이스 pane 안에서 browserd(headless) 라이브 렌더를 연다(Phase 2 in-pane).
+// 연타 안전은 openCastPane의 dup 판정이 보장(동기 생성 → 재클릭 시 트리에 cast pane 존재 → 포커스만).
+document.getElementById("btn-browser")?.addEventListener("click", () => openCastPane());
+// cast 앱 → 부모: 연결 끊김 후 사람이 "재연결" 클릭 시 postMessage. 발신 iframe을 event.source로
+// 특정해 그 cast pane만 active ensure 재실행(spawn=사람 의지·타 pane 무영향).
+window.addEventListener("message", (event) => {
+  const data = event.data as { type?: string; title?: unknown; url?: unknown } | null;
+  const type = data?.type;
+  // 재연결(spawn 유발)과 nav 보고(헤더 갱신)를 같은 리스너·같은 게이트로 처리한다 — 신규 표면 0.
+  if (type !== "cys-cast-reconnect" && type !== "cys-cast-title") return;
+  // 방어심층 2중 게이트 — 재연결은 프로세스 spawn을 유발하므로 발신자를 두 번 확인한다:
+  // ①origin이 loopback 형태인가(장차 cast iframe이 3자 콘텐츠를 실어도 형태 게이트가 남는다)
+  // ②발신 iframe이 실제 우리 cast pane인가(ownsSource — 현재의 실질 방어). 둘 다 통과해야 반영.
+  if (!isLoopbackOrigin(event.origin)) return;
+  let target: WebPaneView | undefined;
+  for (const v of webPanes.values()) {
+    if (v.ownsSource?.(event.source)) { target = v; break; }
   }
+  if (!target) return;
+  if (type === "cys-cast-reconnect") target.castReconnect?.();
+  else target.castTitle?.(data?.title, data?.url);
 });
 document.getElementById("btn-split-h")!.addEventListener("click", () => actionSplit("row"));
 document.getElementById("btn-split-v")!.addEventListener("click", () => actionSplit("col"));

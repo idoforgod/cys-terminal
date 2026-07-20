@@ -16,6 +16,16 @@ import {
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
+  castAppUrl,
+  isCastUrl,
+  castContextOf,
+  castFailureReason,
+  castPaneTitle,
+  castDisplayUrl,
+  isLoopbackOrigin,
+  sanitizeCastNodes,
+  sanitizeLayoutForPersist,
+  collectWebUrls,
 } from "./webpane";
 
 // 테스트용 in-memory localStorage 대역(getItem/setItem만).
@@ -250,5 +260,187 @@ describe("viewer.open 이벤트 판정 — decideViewerOpen", () => {
     expect(decideViewerOpen({ ...all, wsReady: true })).toBe("stale");
     expect(decideViewerOpen({ ...all, wsReady: true, nowEpoch: 1001 })).toBe("dup");
     expect(decideViewerOpen({ ...all, wsReady: true, nowEpoch: 1001, existingPaths: [] })).toBe("cap");
+  });
+});
+
+describe("cast web pane — URL 조립·판정(browserd screencast)", () => {
+  it("castAppUrl 형식 — loopback+토큰+/cast/+context, context는 encodeURIComponent", () => {
+    expect(castAppUrl(51234, "tok-en_123", "default")).toBe(
+      "http://127.0.0.1:51234/tok-en_123/cast/?context=default",
+    );
+    // context 특수문자는 인코딩(주소 위장 방지)
+    expect(castAppUrl(8080, "t", "부서 1/a")).toBe("http://127.0.0.1:8080/t/cast/?context=%EB%B6%80%EC%84%9C%201%2Fa");
+  });
+
+  it("castAppUrl은 isAllowedWebPaneUrl 하드가드를 통과한다(loopback+포트+경로)", () => {
+    expect(isAllowedWebPaneUrl(castAppUrl(51234, "tok", "default"))).toBe(true);
+    expect(isAllowedWebPaneUrl(castAppUrl(0, "pending", "default"))).toBe(true); // pending도 통과
+  });
+
+  it("isCastUrl — 정상 cast=true·pending=true·뷰어 URL=false·손상=false", () => {
+    expect(isCastUrl(castAppUrl(51234, "tok", "default"))).toBe(true);
+    expect(isCastUrl("http://127.0.0.1:0/pending/cast/?context=default")).toBe(true); // 조립 전 pending
+    expect(isCastUrl("http://127.0.0.1:51234/tok/cast/ws?context=default")).toBe(true); // ws 경로도 cast 계열
+    expect(isCastUrl(viewerAppUrl(51234, "tok", "/tmp/a.md"))).toBe(false); // 뷰어(2번째="app")
+    expect(isCastUrl("not a url")).toBe(false); // 손상
+    expect(isCastUrl("http://127.0.0.1:51234/")).toBe(false); // 세그먼트 부족
+  });
+
+  it("castContextOf — 지정 context 회수·없으면 default", () => {
+    expect(castContextOf(castAppUrl(51234, "tok", "dept-2"))).toBe("dept-2");
+    expect(castContextOf("http://127.0.0.1:51234/tok/cast/")).toBe("default"); // context 파라미터 없음
+    expect(castContextOf("not a url")).toBe("default"); // 손상 URL도 default
+  });
+
+  it("collectWebUrls — 트리에서 web 노드 url 전부 수집(cast dup 판정 재료)", () => {
+    const cast = makeWebNode(1, castAppUrl(51234, "tok", "default"), "브라우저");
+    const viewer = makeWebNode(2, viewerAppUrl(51234, "tok", "/a.md"), "a.md");
+    const tree = {
+      type: "split", dir: "row",
+      a: { type: "pane", sid: 7 }, // 터미널 pane은 건너뜀
+      b: { type: "split", dir: "col", a: cast, b: viewer },
+    };
+    expect(collectWebUrls(tree)).toEqual([cast.url, viewer.url]);
+    expect(collectWebUrls(tree).some(isCastUrl)).toBe(true); // dup 판정 형태
+    expect(collectWebUrls(null)).toEqual([]);
+  });
+
+  it("castFailureReason — ensure 실패 원인이 사용자 노출 문구로 보존된다(무음 금지 회귀 핀)", () => {
+    // 신선 머신 최빈 실패: 이 문자열이 UI에서 소실되면 "브라우저 꺼짐"으로 위장된다(P1-1).
+    expect(castFailureReason("bun 미설치 — https://bun.sh")).toBe("bun 미설치 — https://bun.sh");
+    // Rust가 stderr/stdout을 여러 줄로 올려도 placeholder 한 줄로 접힌다
+    expect(castFailureReason("ensure 실패\n  stderr: bun: command not found\n")).toBe(
+      "ensure 실패 stderr: bun: command not found",
+    );
+    // Error 객체도 메시지가 살아남는다
+    expect(castFailureReason(new Error("state.json 없음"))).toBe("Error: state.json 없음");
+  });
+
+  it("castFailureReason — 긴 원인은 절단(placeholder 폭)·경계는 무절단·빈 값은 빈 문자열", () => {
+    expect(castFailureReason("x".repeat(120))).toBe("x".repeat(120)); // 경계: 정확히 maxLen이면 그대로
+    expect(castFailureReason("x".repeat(121))).toBe(`${"x".repeat(120)}…`); // 초과분만 "…"
+    expect(castFailureReason("abcdef", 3)).toBe("abc…"); // maxLen 주입
+    // 원인이 비면 "" — 호출측이 원인 없는 기본 문구로 낙하한다(빈 괄호 노출 방지)
+    expect(castFailureReason("")).toBe("");
+    expect(castFailureReason("   \n  ")).toBe("");
+    expect(castFailureReason(null)).toBe("");
+    expect(castFailureReason(undefined)).toBe("");
+  });
+
+  it("castPaneTitle — 3자 페이지 제목의 헤더 반영(정규화·상한·빈값은 기본 제목에 양보)", () => {
+    expect(castPaneTitle("예시 문서 — example.com")).toBe("예시 문서 — example.com");
+    expect(castPaneTitle("줄바꿈\n섞인   제목\t")).toBe("줄바꿈 섞인 제목"); // 헤더 파괴 방지
+    expect(castPaneTitle("가".repeat(60))).toBe("가".repeat(60)); // 경계: 무절단
+    expect(castPaneTitle("가".repeat(61))).toBe(`${"가".repeat(60)}…`);
+    // 빈값·비문자열은 "" → 호출측이 기본 "브라우저"를 유지한다(제목 소실 방지)
+    expect(castPaneTitle("")).toBe("");
+    expect(castPaneTitle("   ")).toBe("");
+    expect(castPaneTitle(null)).toBe("");
+    expect(castPaneTitle(undefined)).toBe("");
+    expect(castPaneTitle(123)).toBe("");
+  });
+
+  it("castDisplayUrl — 페이지 URL 축약 표시(스킴·쿼리 제거·비URL 폴백)", () => {
+    expect(castDisplayUrl("https://example.com/docs/a?x=1#f")).toBe("example.com/docs/a"); // 스킴·쿼리·해시 제거·경로는 보존
+    expect(castDisplayUrl("https://example.com/")).toBe("example.com"); // 루트 경로는 생략
+    expect(castDisplayUrl("about:blank")).toBe("about:blank"); // host 없는 스킴은 원문 유지
+    expect(castDisplayUrl("not a url")).toBe("not a url"); // 비URL 폴백
+    expect(castDisplayUrl(`https://example.com/${"p".repeat(80)}`)).toHaveLength(61); // 60자+"…"
+    expect(castDisplayUrl("")).toBe("");
+    expect(castDisplayUrl(null)).toBe("");
+  });
+
+  it("isLoopbackOrigin — postMessage origin 하드 가드(spawn 유발 핸들러의 1차 게이트)", () => {
+    expect(isLoopbackOrigin("http://127.0.0.1:51234")).toBe(true);
+    expect(isLoopbackOrigin("http://localhost:8642")).toBe(true);
+    expect(isLoopbackOrigin("http://evil.example")).toBe(false);
+    expect(isLoopbackOrigin("http://127.0.0.1.evil.com")).toBe(false); // 서브도메인 위장
+    expect(isLoopbackOrigin("http://127.0.0.1:80@evil")).toBe(false); // userinfo 위장
+    expect(isLoopbackOrigin("https://127.0.0.1:51234")).toBe(false); // https는 우리 origin이 아니다
+    expect(isLoopbackOrigin("http://127.0.0.1")).toBe(false); // 포트 없음
+    expect(isLoopbackOrigin("http://127.0.0.1:51234/tok/cast/")).toBe(false); // origin에 경로가 붙을 수 없다
+    expect(isLoopbackOrigin("")).toBe(false);
+    expect(isLoopbackOrigin(null)).toBe(false);
+    expect(isLoopbackOrigin(undefined)).toBe(false);
+  });
+
+  it("다운그레이드 안전 — 구 빌드가 cast 노드를 읽으면 extractViewerPath=null → 무해 placeholder 낙하", () => {
+    // cast URL엔 ?path= 가 없다. 구 빌드(cast 미인지)의 ensureAndLoad는 extractViewerPath에서 null을
+    // 받아 "잘못된 뷰어 경로" placeholder로 무해하게 떨어진다(트리·v2 불변·auto-spawn 없음).
+    expect(extractViewerPath(castAppUrl(51234, "tok", "default"))).toBeNull();
+  });
+});
+
+describe("cast 토큰 평문 영속 제거 — sanitizeCastNodes / sanitizeLayoutForPersist", () => {
+  const REAL_TOKEN = "s3cr3t-browserd-token_XYZ";
+
+  it("cast 노드 url에서 실 토큰이 사라지고 context는 보존된다", () => {
+    const cast = makeWebNode(1, castAppUrl(51234, REAL_TOKEN, "dept-2"), "브라우저");
+    const out = sanitizeCastNodes(cast);
+    expect(out.url).not.toContain(REAL_TOKEN); // 평문 영속 금지 — 이 토큰은 RPC eval 권한을 준다
+    expect(out.url).toBe(castAppUrl(0, "pending", "dept-2"));
+    expect(castContextOf(out.url)).toBe("dept-2"); // context는 복원 재연결에 필요 → 보존
+    expect(isCastUrl(out.url)).toBe(true); // 복원 시 cast 분기가 성립해야 한다
+    expect(out.wid).toBe(1); // 나머지 필드 보존
+    expect(out.title).toBe("브라우저");
+  });
+
+  it("뷰어 노드·터미널 노드·split 구조는 무변경(참조까지 동일 = 직렬화 바이트 불변)", () => {
+    const viewer = makeWebNode(2, viewerAppUrl(51234, REAL_TOKEN, "/a.md"), "a.md");
+    const term = { type: "pane", sid: 7 };
+    const tree = { type: "split", dir: "row", ratio: 0.5, a: term, b: viewer };
+    const out = sanitizeCastNodes(tree);
+    expect(out).toBe(tree); // cast가 없으면 원본 참조 그대로
+    expect(JSON.stringify(out)).toBe(JSON.stringify(tree));
+    expect(viewer.url).toContain(REAL_TOKEN); // 뷰어 토큰 관례는 이 브리프 범위 밖 — 건드리지 않았다
+  });
+
+  it("혼합 트리 — cast만 치환·형제는 참조 보존·★런타임 원본 트리는 변형되지 않는다", () => {
+    const cast = makeWebNode(1, castAppUrl(51234, REAL_TOKEN, "default"), "브라우저");
+    const viewer = makeWebNode(2, viewerAppUrl(51234, REAL_TOKEN, "/a.md"), "a.md");
+    const term = { type: "pane", sid: 7 };
+    const tree = {
+      type: "split", dir: "row", ratio: 0.5, a: term,
+      b: { type: "split", dir: "col", ratio: 0.25, a: cast, b: viewer },
+    };
+    const before = JSON.stringify(tree);
+    const out = sanitizeCastNodes(tree);
+    expect(out).not.toBe(tree); // cast가 있으니 새 트리
+    expect(out.a).toBe(term); // 터미널 서브트리 참조 보존
+    expect(out.b.b).toBe(viewer); // 뷰어 노드 참조 보존
+    expect(out.b.a.url).toBe(castAppUrl(0, "pending", "default"));
+    expect(out.dir).toBe("row"); // split 메타 보존
+    expect(out.b.ratio).toBe(0.25);
+    // ★런타임 트리 무변형 — 실 토큰은 메모리에만 남아 iframe 로드·재조립이 그대로 동작한다
+    expect(JSON.stringify(tree)).toBe(before);
+    expect(cast.url).toContain(REAL_TOKEN);
+  });
+
+  it("persistLayout 저장물에 browserd 토큰이 없다(단일 choke point 관통 핀)", () => {
+    const s = fakeStore();
+    const cast = makeWebNode(1, castAppUrl(51234, REAL_TOKEN, "dept-2"), "브라우저");
+    persistLayout(s.setItem, { workspaces: [{ id: 1, name: "ws1", tree: cast }], groups: [], active: 0 });
+    expect(s.raw.get(LAYOUT_KEY_V3)!).not.toContain(REAL_TOKEN);
+    // 복원 경로는 성립해야 한다 — 되읽으면 cast로 판정되고 context가 살아 있다
+    const loaded = loadPersistedLayout(s.getItem);
+    expect(isCastUrl(loaded.workspaces[0].tree.url)).toBe(true);
+    expect(castContextOf(loaded.workspaces[0].tree.url)).toBe("dept-2");
+  });
+
+  it("cast 없는 레이아웃은 저장 바이트가 불변(기존 직렬화 회귀 0)", () => {
+    const data = layoutWithWeb(); // 뷰어 노드만 담긴 기존 픽스처
+    const s = fakeStore();
+    persistLayout(s.setItem, data);
+    expect(s.raw.get(LAYOUT_KEY_V3)).toBe(JSON.stringify(data)); // sanitize 전후 동일 바이트
+    expect(sanitizeLayoutForPersist(data)).toEqual(data);
+  });
+
+  it("비정형 입력에도 안전(workspaces 없음·null·tree null)", () => {
+    expect(sanitizeLayoutForPersist(null)).toBeNull();
+    expect(sanitizeLayoutForPersist({ tag: "no-workspaces" })).toEqual({ tag: "no-workspaces" });
+    expect(sanitizeLayoutForPersist({ workspaces: [{ id: 1, name: "x", tree: null }] })).toEqual({
+      workspaces: [{ id: 1, name: "x", tree: null }],
+    });
+    expect(sanitizeCastNodes(null)).toBeNull();
   });
 });

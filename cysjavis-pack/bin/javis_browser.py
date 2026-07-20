@@ -462,9 +462,35 @@ def gate_human(verb: str, args: dict):
     return None
 
 
+def guard_headful_required(verb_label: str, args: dict) -> int:
+    """headful이 본질인 동사(observe·sot·pick) 앞 게이트.
+
+    ensure_browserd는 live state가 있으면 headless 인자를 무시하고 재사용한다. 그래서 GUI cast가
+    browserd를 --headless로 먼저 띄운 뒤 observe/pick/sot를 부르면 headful을 요구했는데도 살아있는
+    headless가 재사용되어 **창이 안 뜨는데 exit 0 성공**을 보고한다(exit0 거짓말). 무음 거짓 성공
+    대신 fail-loud 거부한다. 남의 세션은 죽이지 않는다(자동 kill·재기동 금지 — 세션 공유 원칙).
+    구버전 state에 headless 키가 없으면 False로 간주해 기존 거동을 유지한다."""
+    st = _live_state()
+    if st and st.get("headless", False):
+        audit(verb_label, args, None, EXIT_START_FAIL)
+        _emit({"ok": False, "error": {
+            "code": "HEADLESS_ACTIVE",
+            "message": (
+                f"browserd가 headless로 상주 중(pid {st['pid']}) — headful 관측 불가. "
+                f"cast pane을 닫고 'javis_browser.py stop' 후 재시도하라"
+            ),
+        }})
+        return EXIT_START_FAIL
+    return 0
+
+
 def cmd_observe(verb_label: str, url: str, profile, evidence_dir, headless_flag: bool) -> int:
     """P2-a 관측 — headful로 열고 관측 상태 반환. human 프로필은 결재 경유.
     관측은 headful이 본질(사람이 창을 봄) → --headless 무시하고 headful 강제."""
+    # 결재(gate_human)보다 먼저 — 어차피 못 여는 관측에 CEO 결재를 소모하지 않는다.
+    rc = guard_headful_required(verb_label, {"url": url, "profile": profile or "agent"})
+    if rc:
+        return rc
     args = {"url": url, "context": None}
     args = {k: v for k, v in args.items() if v is not None}
     if evidence_dir:
@@ -483,6 +509,10 @@ def cmd_pick(a, headless_flag: bool) -> int:
     if headless_flag:
         _emit({"ok": False, "error": {"code": "PICK_HEADLESS", "message": "pick은 headful 필요 — 사람이 요소를 클릭한다(--headless 불가)"}})
         return EXIT_OTHER
+    # live browserd가 headless면 오버레이를 클릭할 창이 없어 60초 뒤 PICK_TIMEOUT — 미리 거부.
+    rc = guard_headful_required("pick", {})
+    if rc:
+        return rc
     BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     shot = str(BRIEFS_DIR / f"{ts}-pick.png")

@@ -33,7 +33,10 @@ bash tests/test_negative_gate.sh              # 음성 게이트 E2E (verify FAI
 
 ## 전송·상태
 - 127.0.0.1 HTTP, port 0-bind, 경로 `/<token>/rpc` (POST JSON `{verb, args}`).
-- `~/.cys/browser/state.json` {pid, port, token} 0600 원자 기록. 스테일=pid 사망 시 교체.
+- `~/.cys/browser/state.json` {pid, port, token, headless} 0600 원자 기록. 스테일=pid 사망 시 교체.
+  `headless`=기동 모드(Phase 2 cast 추가). 소비자 키 검사는 pid/port/token 3키만 — 하위호환.
+  live browserd가 headless면 `observe`/`pick`/`sot`는 exit 4(HEADLESS_ACTIVE)로 거부한다
+  (재사용 시 창이 안 뜨는데 성공 보고하는 것을 막는다 — 자동 kill 없음).
 - 감사로그: `~/.cys/browser/audit.jsonl` (전 동사 append — reviewer2 감사 대상).
 
 ## 결정론 exit 코드 (CLI)

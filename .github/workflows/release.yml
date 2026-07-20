@@ -70,6 +70,23 @@ jobs:
         shell: bash
         run: cd ui && bun test
 
+      # browserd cast 순수 단위 게이트 — castRoute 파서·parseClientMsg 검증·mapInput 좌표 변환.
+      # ★cast-integration.test.ts는 의도적으로 제외한다 — 실제 Chrome/Chromium 기동이 필요해 러너 환경에
+      #   의존하고, 브라우저가 없으면 CI가 무관한 이유로 실패한다. 통합 테스트는 로컬 게이트에서 실행한다.
+      - name: browserd 순수 단위 테스트 (bun test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd cysjavis-pack/browserd
+          # ★대상 파일 존재를 먼저 단언한다 — `bun test <f>`의 인자는 경로가 아니라 **필터**라, 지정 파일이
+          #   체크아웃에 없어도 다른 필터가 하나라도 맞으면 exit 0으로 조용히 통과한다(실측: 존재+부재 혼합
+          #   = exit 0). 신규 cast 파일이 untracked로 누락되면 게이트가 '초록 거짓말'이 되므로 여기서 막는다.
+          for f in tests/cast.test.ts tests/unit.test.ts; do
+            [ -f "$f" ] || { echo "browserd 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          done
+          bun install --frozen-lockfile
+          bun test tests/cast.test.ts tests/unit.test.ts
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -107,6 +124,20 @@ jobs:
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
+
+      # src-tauri(cys-app) 단위 게이트 — 위 phoenix 스텝의 `cargo test --bin cysd|--lib`는 둘 다 루트
+      # crate(cys-terminal)라 src-tauri crate 테스트(browserd state 파싱 등 Tauri command 단위)가 CI에서
+      # 한 번도 돌지 않았다. host-아키텍처 무관 순수 로직이라 phoenix 게이트와 동일하게 네이티브 레그 1회만 돈다.
+      # ★ui/dist 선행 빌드 필수 — generate_context!(tauri-codegen)가 frontendDist 부재 시 컴파일 패닉
+      #   ("The `frontendDist` configuration is set to ... but this path doesn't exist"). ui/dist는 .gitignore
+      #   대상이라 체크아웃엔 없고, 평소엔 뒤 build 스텝의 beforeBuildCommand(bundle-prep)가 만든다.
+      - name: src-tauri 단위 테스트 (cargo test -p cys-app · macOS 네이티브)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh ui/build.sh
+          CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app
 
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
       # tauri.windows.conf.json bundle.resources("runtime/")가 이 트리를 NSIS에 싣는다.

@@ -46,6 +46,10 @@ SERVER_PATTERNS = [
 SERVER_EXCLUDE_PATTERNS = [
     r"langserver", r"language[-_ ]?server", r"\blsp\b", r"mcp[-_ ]?server",
     r"tsserver", r"copilot",
+    # ★browserd(`bun run …/browserd/server.ts`)는 엔진 파일락이 싱글톤을 강제하므로 '누적되는 dev 서버'가
+    # 아니다 — 계수되면 cast pane 1개가 전 노드 착수를 막고, enforce --kill의 pid-tree kill이 사람이 보고
+    # 있는 Chromium까지 죽인다(_server_procs가 이 목록을 공유하므로 계수·집행 양쪽이 함께 면제된다).
+    r"browserd/server\.ts",
 ]
 NODE_PATTERNS = [r"claude(\s|$)", r"\bagy\b", r"\bcodex\b", r"\bgemini\b"]
 # ★2026-07-11 CSO(CEO B승인): codex 노드 1개 = node wrapper + darwin-arm64 vendor native 2프로세스가
