@@ -5696,6 +5696,21 @@ async function start() {
 // ---------- ui wiring ----------
 
 document.getElementById("btn-new")!.addEventListener("click", actionNew);
+// 지구본 버튼 — browserd 실브라우저(headful) 열기. in-flight 가드로 연타 시 1회만(시뮬 적대
+// 발견: 버튼은 GUI 직접 spawn이라 데몬 rate 미경유 → UI측 debounce가 폭주 방벽).
+let browserOpening = false;
+document.getElementById("btn-browser")?.addEventListener("click", async () => {
+  if (browserOpening) return;
+  browserOpening = true;
+  try {
+    await invoke("browser_open", { url: null });
+    toast("browser", "🌐 브라우저 여는 중", "Chrome 창이 곧 뜹니다 — 안 뜨면 browserd 준비 확인(doctor)");
+  } catch (e) {
+    toast("browser", "브라우저 열기 실패", String(e));
+  } finally {
+    setTimeout(() => { browserOpening = false; }, 1500);
+  }
+});
 document.getElementById("btn-split-h")!.addEventListener("click", () => actionSplit("row"));
 document.getElementById("btn-split-v")!.addEventListener("click", () => actionSplit("col"));
 document.getElementById("btn-equalize")!.addEventListener("click", actionEqualize);

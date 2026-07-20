@@ -104,6 +104,13 @@ enum Command {
         /// 렌더할 파일 경로 (절대/상대 — 실재하는 파일이어야 함)
         path: String,
     },
+    /// browserd 실브라우저(headful Chromium)를 연다 — 사람·에이전트가 공유하는 agent 프로필.
+    /// 지구본 버튼(GUI)의 CLI 짝. url 생략 시 빈 페이지. browserd 프로필 격리가 유일 경계라
+    /// caps 게이트 없음(에이전트도 리뷰·검증·시행에 브라우저를 써야 함).
+    Browser {
+        /// 열 URL (생략 시 about:blank)
+        url: Option<String>,
+    },
     /// T5 사용량 관측: 이 세션의 트랜스크립트 경로를 pane에 등록 (SessionStart hook 전용 plumbing)
     UsageRegister {
         /// 세션 트랜스크립트 절대경로 (.jsonl)
@@ -1604,6 +1611,31 @@ fn run(command: Command) -> i32 {
                 std::process::exit(3);
             }
             println!("OK → viewer.open ({})", abs.display());
+            Ok(())
+        })(),
+
+        Command::Browser { url } => (|| -> Result<(), String> {
+            // browserd 실브라우저를 연다 — javis_browser.py를 직접 실행한다(GUI 지구본 버튼과
+            // 동일 엔진·단일 인스턴스). ensure_browserd가 단일 인스턴스를 보장하고 profile 격리가
+            // 경계다. observe=headful 관측(사람이 창 직접 봄)·agent 프로필(에이전트 자동화 허용).
+            let script = cys::pack::pack_dir().join("bin/javis_browser.py");
+            if !script.exists() {
+                return Err(format!("browser 스크립트 없음: {}", script.display()));
+            }
+            let target = url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "about:blank".into());
+            // 포그라운드 실행 — javis_browser의 JSON 출력·browserd 기동 로그·exit code를 그대로
+            // 전달(첫 기동은 수 초 소요, 사람에겐 정직한 진행 피드백). skillscan_warn 선례와 동형.
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .arg("observe")
+                .arg(&target)
+                .arg("--profile")
+                .arg("agent")
+                .status()
+                .map_err(|e| format!("browser 실행 실패: {e}"))?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
             Ok(())
         })(),
 

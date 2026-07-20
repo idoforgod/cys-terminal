@@ -633,6 +633,35 @@ fn ensure_view_bridge() -> Result<Value, String> {
     Err("view bridge state 대기 타임아웃(10s)".into())
 }
 
+/// 지구본 버튼 진입점 — browserd headful(실 Chromium) 창을 띄운다. 사람이 직접 클릭하는
+/// 신뢰 표면이므로 ensure_view_bridge와 동형으로 GUI가 직접 spawn한다(데몬 caps 게이트는
+/// GUI 프로세스를 surface로 해석 못 해 fail-closed로 사람 버튼을 막으므로 우회 — 시뮬 F1).
+/// 에이전트 경로(`cys browser`)만 데몬 RPC의 caps 게이트를 탄다. 첫 기동은 browserd 시작에
+/// 수 초 걸리므로 detached spawn 후 즉시 반환한다(창은 지연 등장·GUI toast가 피드백).
+#[tauri::command]
+fn browser_open(url: Option<String>) -> Result<Value, String> {
+    let script = cys::pack::pack_dir().join("bin").join("javis_browser.py");
+    if !script.exists() {
+        return Err(format!("browser 스크립트 없음: {}", script.display()));
+    }
+    // observe = headful 관측(사람이 창 직접 봄) · agent 프로필(자동화 허용 — 에이전트 공유).
+    // url 미지정 시 시작 페이지(about:blank).
+    let target = url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "about:blank".into());
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd);
+    cmd.arg(&script)
+        .arg("observe")
+        .arg(&target)
+        .arg("--profile")
+        .arg("agent")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    cmd.spawn().map_err(|e| format!("browser 기동 실패: {e}"))?;
+    Ok(serde_json::json!({"opening": true, "url": target, "profile": "agent"}))
+}
+
 /// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
 /// open_path와 동일한 실재 경로 게이트 — URL 스킴·비존재 문자열 차단.
 #[tauri::command]
@@ -3054,6 +3083,7 @@ fn main() {
             reveal_path,
             read_text_head,
             ensure_view_bridge,
+            browser_open,
             home_dir_path,
             open_url,
             send_key,
