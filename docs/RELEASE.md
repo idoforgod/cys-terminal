@@ -1,7 +1,7 @@
 # 릴리스 절차 (cys 터미널)
 
 > **현행 표준 절차(2026-07 정정)**: 릴리스는 **release.yml 자동화**가 정본이다 —
-> ①버전 범프(아래 §0 4곳)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
+> ①버전 범프(아래 §0 — **게이트가 강제하는 6곳**)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
 > ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
 > ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
 > ⑤릴리스 자산·`latest.json`(tauri v2 — darwin-aarch64·darwin-x86_64·windows-x86_64 3키) 실측 확인.
@@ -54,7 +54,11 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
   (2026-07-12 도입 — 종전의 "스윕 실행 → 다운그레이드 가드 no-op" 소음 제거). 수동 `cys init-pack`은
   게이트를 타지 않고 여전히 다운그레이드 가드에 막힌다(동일 최종 상태·이중 방어).
 
-## 0. 버전 위치 (범프 시 모두 갱신 — 실측 4곳)
+## 0. 버전 위치 (범프 시 모두 갱신 — **게이트 강제 6곳**)
+
+> ★제목 정정(2026-07-20): 이전 표기 "실측 4곳"은 **게이트와 어긋난다**. `scripts/version-check.sh`와
+> `release.yml`이 wxs 2곳을 포함한 **6곳을 하드 게이트로 강제**하므로, 4곳만 범프하면 **태그 CI가 즉사**한다.
+> 아래 취소선(legacy 표기)은 배포 자산 기준의 역사 맥락이고, **범프 대상은 6곳 전부**다.
 
 - `Cargo.toml` / `src-tauri/Cargo.toml` — `version`
 - `src-tauri/tauri.conf.json` — `version`
