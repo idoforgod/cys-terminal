@@ -141,19 +141,32 @@ def start_browserd(headless: bool, timeout: float = 20.0):
     return None, f"browserd 기동 타임아웃({timeout}s)\n{tail}"
 
 
-def _cross_process_lock(fh):
-    """배타 파일락(블로킹) — POSIX fcntl / Windows msvcrt. 미지원 플랫폼은 best-effort no-op."""
+def _acquire_lock(fh, deadline: float) -> bool:
+    """배타 파일락(데드라인까지 블로킹). POSIX fcntl / Windows msvcrt non-blocking 재시도.
+    반환 True=락 획득 · False=미지원/오류/데드라인 초과 → best-effort(락 없이 진행·크래시 금지).
+    ★리뷰어1 N1: msvcrt.LK_LOCK은 ~10초 후 OSError를 던져(browserd 기동 20s와 불일치) 무음
+      재개방을 유발 → LK_NBLCK non-blocking + 데드라인 재시도로 1차 cold-start를 끝까지 기다린다.
+    ★리뷰어1 N3: fcntl 런타임 OSError(NFS·ENOLCK)를 삼켜 크래시를 막고 best-effort로 폴백한다."""
     try:
         import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        return
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)  # 블로킹 배타락(with 블록 동안 유지)
+        return True
     except ImportError:
-        pass
+        pass  # 비-POSIX → 아래 msvcrt
+    except OSError:
+        return False  # 네트워크FS 등 락 미지원 → best-effort
     try:
         import msvcrt
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        while time.time() < deadline:
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # non-blocking 1바이트
+                return True
+            except OSError:
+                time.sleep(0.3)  # busy → 데드라인까지 재시도(1차 cold-start 대기)
+        return False
     except Exception:
-        pass  # 락 미지원 → best-effort(락 없던 종전 거동으로 폴백)
+        return False
 
 
 def ensure_browserd(headless: bool):
@@ -164,10 +177,11 @@ def ensure_browserd(headless: bool):
     # 두 진입(지구본 버튼 + cys browser)이 state.json 기록 전 창에 겹치면 browserd(bun+Chromium)가
     # 2개 뜨고, 사람과 에이전트가 서로 다른 창을 조작해 '하나의 브라우저 공유'가 무음 붕괴한다.
     # 파일락 임계구역 — 락 안에서 재확인(double-check) 후에만 spawn한다. start_browserd가 state
-    # 등장까지 대기하므로, 락을 기다린 2차 호출은 fast-path로 1차의 live state를 재사용한다.
+    # 등장까지 대기하므로(20s), 락을 기다린 2차 호출은 fast-path로 1차의 live state를 재사용한다.
+    # 데드라인은 start 타임아웃(20s) + 여유. "a+"=truncate 없이 열기(byte-range 락과 충돌 회피·N1).
     BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
-    with open(BROWSER_ROOT / "browserd.lock", "w") as lf:
-        _cross_process_lock(lf)
+    with open(BROWSER_ROOT / "browserd.lock", "a+") as lf:
+        _acquire_lock(lf, time.time() + 22.0)
         st = _live_state()
         if st:
             return st, None

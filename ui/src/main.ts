@@ -5704,9 +5704,10 @@ document.getElementById("btn-browser")?.addEventListener("click", async () => {
   browserOpening = true;
   try {
     await invoke("browser_open", { url: null });
-    // 정직 표현(F3): spawn만 확인됨 — 창 등장은 browserd 준비에 달림(첫 기동 수 초). 창이 안
-    // 뜨면 browserd 미준비(bun/playwright)이며 doctor로 확인. spawn 자체 실패는 catch로 온다.
-    toast("browser", "🌐 브라우저 시작 요청", "Chrome 창이 곧 뜹니다 — 수 초 후에도 없으면 browserd 준비 확인(cys browser doctor)");
+    // 정직 표현(F3·N2): spawn만 확인됨 — 창 등장은 browserd 준비에 달림(첫 기동 수 초). 창이 안
+    // 뜨면 browserd 미준비(bun/playwright). ★진단 명령은 실재 경로로만 안내한다 — `cys browser`는
+    // url 인자뿐이라 서브커맨드가 없다(안내에 `cys browser doctor` 금지 — 무동작·N2).
+    toast("browser", "🌐 브라우저 시작 요청", "Chrome 창이 곧 뜹니다 — 수 초 후에도 없으면 browserd 준비 미비(bun·playwright 설치 확인)");
   } catch (e) {
     toast("browser", "브라우저 열기 실패", String(e));
   } finally {
