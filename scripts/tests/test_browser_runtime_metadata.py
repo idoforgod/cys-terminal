@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "browser-runtime-metadata.py"
@@ -16,6 +17,30 @@ SPEC.loader.exec_module(module)
 
 
 class BrowserRuntimeMetadataTests(unittest.TestCase):
+    def test_minisign_uses_noninteractive_unencrypted_release_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload.json"
+            signature = root / "payload.json.minisig"
+            secret_key = root / "release.key"
+
+            with mock.patch.object(module.subprocess, "run") as run:
+                module.minisign(payload, signature, secret_key)
+
+            run.assert_called_once_with(
+                [
+                    "minisign",
+                    "-W",
+                    "-Sm",
+                    str(payload),
+                    "-s",
+                    str(secret_key),
+                    "-x",
+                    str(signature),
+                ],
+                check=True,
+            )
+
     def test_tree_hash_binds_relative_path_size_and_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
