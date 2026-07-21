@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""javis_browser.py — browserd 배선 CLI (P1 · 팩 인큐베이션).
+"""javis_browser.py — Browser v2 operation adapter.
 
-설계: _research/cmux-distillation/DESIGN-v1.2-2026-07-19.md §2B.
-- browserd(bun+playwright-core)에 127.0.0.1 HTTP로 동사를 중계한다.
-- browserd 미기동 시 자동 기동(백그라운드 spawn + state 대기, 타임아웃 20s).
+Production lifecycle authority belongs exclusively to cysd.  This adapter sends
+typed ensure/operation intents through ``cys`` and never selects or spawns a
+browser executable, owns a process lock, or signals an engine PID.  The old
+source browserd path remains available only with ``CYS_BROWSER_DEV=1`` for the
+isolated browserd test harness.
+
+- packaged mode: cys -> cysd BrowserAuthorityExtension -> private supervisor.
+- explicit dev mode: browserd(bun+playwright-core) loopback RPC.
 - 모든 동사를 ~/.cys/browser/audit.jsonl 에 append (reviewer2 감사 대상).
-- P1은 cys 데몬·제품 코드 무변경. 제품 `cys browser` 승격은 제품화 게이트 이후.
 
 결정론 exit 코드:
   0 성공 · 2 BUSY · 3 APPROVAL_REQUIRED · 4 기동실패 · 5 verify FAIL · 6 HUMAN_ACTIVE
@@ -151,8 +155,36 @@ def _chrome_available() -> bool:
     return False
 
 
-def start_browserd(headless: bool, timeout: float = 20.0):
-    """browserd를 백그라운드 spawn하고 live state가 뜰 때까지 대기."""
+def _development_mode() -> bool:
+    """Source runtime is opt-in; no truthy aliases that packaging can set by accident."""
+    return os.environ.get("CYS_BROWSER_DEV") == "1"
+
+
+def _cys_command(args, timeout: float = 65.0):
+    cys = _which("cys")
+    if not cys:
+        return None, "cys 바이너리 부재 — Browser Runtime authority에 연결할 수 없음"
+    try:
+        completed = subprocess.run(
+            [cys, *args],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, f"cysd Browser Runtime 요청 실패: {error}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown failure").strip()
+        return None, f"cysd Browser Runtime 거부(exit {completed.returncode}): {detail}"
+    try:
+        return json.loads(completed.stdout), None
+    except (TypeError, json.JSONDecodeError) as error:
+        return None, f"cysd Browser Runtime 응답 파싱 실패: {error}"
+
+
+def _start_development_browserd(headless: bool, timeout: float = 20.0):
+    """Explicit development-only source spawn. Never reachable in packaged mode."""
     bun = _which("bun")
     if not bun:
         return None, "bun 미설치 — https://bun.sh"
@@ -219,30 +251,58 @@ def _acquire_lock(fh, deadline: float) -> bool:
 
 
 def ensure_browserd(headless: bool):
-    st = _live_state()
-    if st:
-        return st, None
-    # ★동시 cold-start 경쟁 방지(리뷰어1 F1): ensure_browserd는 락 없는 check-then-act(TOCTOU)라
-    # 두 진입(지구본 버튼 + cys browser)이 state.json 기록 전 창에 겹치면 browserd(bun+Chromium)가
-    # 2개 뜨고, 사람과 에이전트가 서로 다른 창을 조작해 '하나의 브라우저 공유'가 무음 붕괴한다.
-    # 파일락 임계구역 — 락 안에서 재확인(double-check) 후에만 spawn한다. start_browserd가 state
-    # 등장까지 대기하므로(20s), 락을 기다린 2차 호출은 fast-path로 1차의 live state를 재사용한다.
-    # 데드라인은 start 타임아웃(20s) + 여유. "a+"=truncate 없이 열기(byte-range 락과 충돌 회피·N1).
-    BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
-    with open(BROWSER_ROOT / "browserd.lock", "a+") as lf:
-        _acquire_lock(lf, time.time() + 22.0)
+    if _development_mode():
         st = _live_state()
         if st:
-            return st, None
-        return start_browserd(headless)
+            return {**st, "transport": "dev-direct"}, None
+        # Development still serializes its source-only singleton. Production never
+        # enters this block and therefore never owns browserd.lock.
+        BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
+        with open(BROWSER_ROOT / "browserd.lock", "a+") as lf:
+            _acquire_lock(lf, time.time() + 22.0)
+            st = _live_state()
+            if st:
+                return {**st, "transport": "dev-direct"}, None
+            st, error = _start_development_browserd(headless)
+            if st:
+                st = {**st, "transport": "dev-direct"}
+            return st, error
+
+    # The shared production key is unconditionally headless. The flag is kept in
+    # the adapter ABI for old callers but cannot widen the broker contract.
+    result, error = _cys_command(["browser-runtime-ensure", "--headless"])
+    if error:
+        return None, error
+    return {"transport": "broker", "status": result}, None
 
 
 def rpc(st, verb: str, args: dict):
+    if st.get("transport") == "broker":
+        result, error = _cys_command(
+            ["browser-runtime-operation", json.dumps({"verb": verb, "args": args}, separators=(",", ":"))]
+        )
+        if error:
+            raise urllib.error.URLError(error)
+        return result
     url = f"http://127.0.0.1:{st['port']}/{st['token']}/rpc"
     data = json.dumps({"verb": verb, "args": args}).encode("utf8")
     req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf8"))
+
+
+def stop_browserd():
+    """Never let an adapter tear down a shared production runtime."""
+    if not _development_mode():
+        return False, "공유 Browser Runtime 수명주기는 cysd가 소유함 — adapter stop 거부"
+    st = _live_state()
+    if not st:
+        return True, "미기동"
+    try:
+        os.kill(st["pid"], 15)
+    except ProcessLookupError:
+        pass
+    return True, f"개발 runtime SIGTERM → pid {st['pid']}"
 
 
 def audit(verb: str, args: dict, evidence_path, exit_code: int, extra: dict = None):
@@ -519,20 +579,16 @@ def main():
         if not st:
             _emit({"ok": False, "error": {"code": "START_FAIL", "message": err}})
             sys.exit(EXIT_START_FAIL)
-        _emit({"ok": True, "result": {"pid": st["pid"], "port": st["port"]}})
+        if st.get("transport") == "broker":
+            _emit({"ok": True, "result": st["status"]})
+        else:
+            _emit({"ok": True, "result": {"pid": st["pid"], "port": st["port"], "development": True}})
         sys.exit(EXIT_OK)
 
     if a.cmd == "stop":
-        st = _live_state()
-        if not st:
-            _emit({"ok": True, "result": "미기동"})
-            sys.exit(EXIT_OK)
-        try:
-            os.kill(st["pid"], 15)
-        except ProcessLookupError:
-            pass
-        _emit({"ok": True, "result": f"SIGTERM → pid {st['pid']}"})
-        sys.exit(EXIT_OK)
+        ok, message = stop_browserd()
+        _emit({"ok": ok, "result" if ok else "error": message})
+        sys.exit(EXIT_OK if ok else EXIT_START_FAIL)
 
     # --- sot = observe --profile human notebooklm 축약 ---
     if a.cmd == "sot":
@@ -584,6 +640,18 @@ def guard_headful_required(verb_label: str, args: dict) -> int:
     headless가 재사용되어 **창이 안 뜨는데 exit 0 성공**을 보고한다(exit0 거짓말). 무음 거짓 성공
     대신 fail-loud 거부한다. 남의 세션은 죽이지 않는다(자동 kill·재기동 금지 — 세션 공유 원칙).
     구버전 state에 headless 키가 없으면 False로 간주해 기존 거동을 유지한다."""
+    if not _development_mode():
+        audit(verb_label, args, None, EXIT_START_FAIL)
+        _emit({"ok": False, "error": {
+            "code": "HEADFUL_UNAVAILABLE",
+            "message": (
+                "production Browser Runtime은 shared-default in-pane(headless) 전용 — "
+                "일반 탐색은 'cys browser <url>' 또는 GUI Browser pane을 사용하고, "
+                "headful 개발 관측은 CYS_BROWSER_DEV=1에서만 실행하라"
+            ),
+        }})
+        return EXIT_START_FAIL
+
     st = _live_state()
     if st and st.get("headless", False):
         audit(verb_label, args, None, EXIT_START_FAIL)
@@ -591,7 +659,7 @@ def guard_headful_required(verb_label: str, args: dict) -> int:
             "code": "HEADLESS_ACTIVE",
             "message": (
                 f"browserd가 headless로 상주 중(pid {st['pid']}) — headful 관측 불가. "
-                f"cast pane을 닫고 'javis_browser.py stop' 후 재시도하라"
+                f"개발 cast pane을 닫고 'javis_browser.py stop' 후 재시도하라"
             ),
         }})
         return EXIT_START_FAIL

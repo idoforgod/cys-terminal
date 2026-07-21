@@ -3,6 +3,10 @@
 use cys::browser_runtime::{
     EngineKey, RuntimeManifest, RuntimePaths, RuntimeStateV2, TargetTriple, VerifiedBrokerHello,
 };
+use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::Sha256;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -103,6 +107,9 @@ pub struct EngineLaunchSpec {
     pub chromium_revision: String,
     pub engine_key: EngineKey,
     pub engine_state_dir: PathBuf,
+    pub instance_id: String,
+    pub engine_generation: u64,
+    pub engine_auth_key: [u8; 32],
 }
 
 pub struct EngineProcess {
@@ -243,6 +250,8 @@ impl Supervisor {
             .verify_pinned_executables(assets)
             .map_err(map_runtime_error)?;
         let engine_key = EngineKey::shared_default();
+        let instance_id = random_instance_id()?;
+        let engine_generation = 1;
         let engine = launcher.launch(&EngineLaunchSpec {
             engine: paths.engine,
             chromium: paths.chromium,
@@ -250,6 +259,9 @@ impl Supervisor {
             chromium_revision: manifest.chromium.revision.clone(),
             engine_key: engine_key.clone(),
             engine_state_dir: parent.join("engine"),
+            instance_id: instance_id.clone(),
+            engine_generation,
+            engine_auth_key: broker.challenge,
         })?;
         if engine.pid == 0 || engine.process_group == 0 || engine.port == 0 {
             return Err(SupervisorError::new(
@@ -259,8 +271,8 @@ impl Supervisor {
         }
         let state = RuntimeStateV2 {
             schema_version: 2,
-            instance_id: random_instance_id()?,
-            engine_generation: 1,
+            instance_id,
+            engine_generation,
             supervisor_pid: std::process::id(),
             engine_pid: engine.pid,
             port: engine.port,
@@ -448,6 +460,97 @@ pub struct CommandEngineLauncher {
     startup_timeout: std::time::Duration,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineReadyState {
+    schema_version: u16,
+    pid: u32,
+    port: u16,
+    token: String,
+    cast_token: String,
+    runtime_id: String,
+    process_start_time: u64,
+    headless: bool,
+    instance_id: String,
+    engine_generation: u64,
+    state_mac: String,
+}
+
+fn verified_engine_ready_port(
+    text: &str,
+    pid: u32,
+    spec: &EngineLaunchSpec,
+) -> Result<u16, SupervisorError> {
+    let state: EngineReadyState = serde_json::from_str(text).map_err(|error| {
+        SupervisorError::new(
+            "ENGINE_STATE_INVALID",
+            format!("engine endpoint state is invalid: {error}"),
+        )
+    })?;
+    if state.schema_version != 2
+        || state.pid != pid
+        || state.port == 0
+        || state.token.len() != 32
+        || state.cast_token.len() != 32
+        || state.token == state.cast_token
+        || state.runtime_id != spec.runtime_id
+        || state.process_start_time == 0
+        || !state.headless
+        || state.instance_id != spec.instance_id
+        || state.engine_generation != spec.engine_generation
+    {
+        return Err(SupervisorError::new(
+            "ENGINE_IDENTITY_MISMATCH",
+            "engine readiness identity does not match the supervised launch",
+        ));
+    }
+    let supplied = decode_hex_mac(&state.state_mac)?;
+    let payload = serde_json::to_vec(&json!([
+        state.schema_version,
+        state.pid,
+        state.port,
+        state.token,
+        state.cast_token,
+        state.runtime_id,
+        state.process_start_time,
+        state.headless,
+        state.instance_id,
+        state.engine_generation,
+    ]))
+    .map_err(|error| SupervisorError::new("ENGINE_STATE_INVALID", error.to_string()))?;
+    let mut verifier = Hmac::<Sha256>::new_from_slice(&spec.engine_auth_key)
+        .map_err(|_| SupervisorError::new("ENGINE_STATE_INVALID", "invalid engine MAC key"))?;
+    verifier.update(b"cys.browser.engine-state.v1\0");
+    verifier.update(&payload);
+    verifier.verify_slice(&supplied).map_err(|_| {
+        SupervisorError::new(
+            "ENGINE_STATE_UNAUTHENTICATED",
+            "engine readiness MAC does not match the inherited broker session",
+        )
+    })?;
+    Ok(state.port)
+}
+
+fn decode_hex_mac(input: &str) -> Result<[u8; 32], SupervisorError> {
+    if input.len() != 64 || !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SupervisorError::new(
+            "ENGINE_STATE_UNAUTHENTICATED",
+            "engine readiness MAC is not lowercase hex",
+        ));
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, slot) in decoded.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = u8::from_str_radix(&input[offset..offset + 2], 16).map_err(|_| {
+            SupervisorError::new(
+                "ENGINE_STATE_UNAUTHENTICATED",
+                "engine readiness MAC is invalid",
+            )
+        })?;
+    }
+    Ok(decoded)
+}
+
 impl Default for CommandEngineLauncher {
     fn default() -> Self {
         Self {
@@ -471,6 +574,18 @@ impl EngineLauncher for CommandEngineLauncher {
             .env("CYS_BROWSER_V2_ENGINE_ROOT", &spec.engine_state_dir)
             .env("CYS_BROWSER_CHROMIUM_PATH", &spec.chromium)
             .env("CYS_BROWSER_RUNTIME_ID", &spec.runtime_id)
+            .env("CYS_BROWSER_INSTANCE_ID", &spec.instance_id)
+            .env(
+                "CYS_BROWSER_ENGINE_GENERATION",
+                spec.engine_generation.to_string(),
+            )
+            .env(
+                "CYS_BROWSER_ENGINE_AUTH_KEY",
+                spec.engine_auth_key
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
             .env("CYS_BROWSER_STRICT_RUNTIME", "1")
             .env_remove("PATH")
             .stdin(Stdio::null())
@@ -493,21 +608,31 @@ impl EngineLauncher for CommandEngineLauncher {
         let pid = child.id();
         let process_group = pid;
         let state_path = spec.engine_state_dir.join("state.json");
+        match std::fs::remove_file(&state_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let mut process = EngineProcess::from_child(child, process_group, 1);
+                terminate_engine_group(&mut process);
+                return Err(SupervisorError::new(
+                    "ENGINE_START_FAILED",
+                    format!("stale engine state cleanup failed: {error}"),
+                ));
+            }
+        }
         let deadline = std::time::Instant::now() + self.startup_timeout;
         loop {
             if let Ok(text) = std::fs::read_to_string(&state_path) {
-                match cys::browser_runtime::parse_runtime_state(&text) {
-                    Ok(cys::browser_runtime::ParsedRuntimeState::LegacyIncompatible(state))
-                        if state.pid == pid && state.port != 0 =>
-                    {
-                        return Ok(EngineProcess::from_child(child, process_group, state.port));
+                match verified_engine_ready_port(&text, pid, spec) {
+                    Ok(port) => {
+                        return Ok(EngineProcess::from_child(child, process_group, port));
                     }
-                    Ok(cys::browser_runtime::ParsedRuntimeState::V2(state))
-                        if state.engine_pid == pid && state.port != 0 =>
-                    {
-                        return Ok(EngineProcess::from_child(child, process_group, state.port));
+                    Err(error) if error.code() == "ENGINE_STATE_INVALID" => {}
+                    Err(error) => {
+                        let mut process = EngineProcess::from_child(child, process_group, 1);
+                        terminate_engine_group(&mut process);
+                        return Err(error);
                     }
-                    _ => {}
                 }
             }
             if let Some(status) = child.try_wait().map_err(|e| {
@@ -619,7 +744,7 @@ mod tests {
             "engine_sha256":sha256(&engine),
             "chromium_archive_url":"https://example.invalid/chromium.zip",
             "chromium_archive_sha256":"a".repeat(64),
-            "chromium_tree_sha256":"b".repeat(64),
+            "chromium_tree_sha256":cys::browser_runtime::hash_tree(&target_root.join("chromium")).unwrap(),
             "chromium_executable":chromium_rel,
             "license_files":["LICENSE.chromium"]
         });
@@ -643,6 +768,88 @@ mod tests {
             policy_epoch: 1,
             policy_hash: format!("sha256:{}", "5".repeat(64)),
         }
+    }
+
+    fn engine_spec() -> EngineLaunchSpec {
+        EngineLaunchSpec {
+            engine: PathBuf::from("/signed/engine"),
+            chromium: PathBuf::from("/signed/chromium"),
+            runtime_id: format!("sha256:{}", "a".repeat(64)),
+            chromium_revision: "1148".into(),
+            engine_key: EngineKey::shared_default(),
+            engine_state_dir: PathBuf::from("/private/state"),
+            instance_id: "b".repeat(32),
+            engine_generation: 7,
+            engine_auth_key: [0xcc; 32],
+        }
+    }
+
+    fn authenticated_engine_state(spec: &EngineLaunchSpec, pid: u32) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "schema_version":2,
+            "pid":pid,
+            "port":53111,
+            "token":"d".repeat(32),
+            "cast_token":"e".repeat(32),
+            "runtime_id":spec.runtime_id,
+            "process_start_time":1234,
+            "headless":true,
+            "instance_id":spec.instance_id,
+            "engine_generation":spec.engine_generation,
+        });
+        let payload = serde_json::to_vec(&serde_json::json!([
+            value["schema_version"],
+            value["pid"],
+            value["port"],
+            value["token"],
+            value["cast_token"],
+            value["runtime_id"],
+            value["process_start_time"],
+            value["headless"],
+            value["instance_id"],
+            value["engine_generation"],
+        ]))
+        .unwrap();
+        let mut signer = Hmac::<Sha256>::new_from_slice(&spec.engine_auth_key).unwrap();
+        signer.update(b"cys.browser.engine-state.v1\0");
+        signer.update(&payload);
+        value["state_mac"] = serde_json::Value::String(
+            signer
+                .finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        value
+    }
+
+    #[test]
+    fn engine_readiness_uses_endpoint_schema_and_inherited_session_mac() {
+        let spec = engine_spec();
+        let mut state = authenticated_engine_state(&spec, 4242);
+        assert_eq!(
+            verified_engine_ready_port(&serde_json::to_string(&state).unwrap(), 4242, &spec)
+                .unwrap(),
+            53111
+        );
+
+        state["instance_id"] = serde_json::Value::String("f".repeat(32));
+        assert_eq!(
+            verified_engine_ready_port(&serde_json::to_string(&state).unwrap(), 4242, &spec)
+                .unwrap_err()
+                .code(),
+            "ENGINE_IDENTITY_MISMATCH"
+        );
+
+        let mut forged = authenticated_engine_state(&spec, 4242);
+        forged["state_mac"] = serde_json::Value::String("0".repeat(64));
+        assert_eq!(
+            verified_engine_ready_port(&serde_json::to_string(&forged).unwrap(), 4242, &spec)
+                .unwrap_err()
+                .code(),
+            "ENGINE_STATE_UNAUTHENTICATED"
+        );
     }
 
     #[test]

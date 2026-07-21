@@ -1,14 +1,17 @@
-# browserd — 자비스 브라우저 엔진 사이드카 (P1 · 팩 인큐베이션)
+# browserd — 자비스 Browser v2 엔진
 
 워커가 웹 산출물을 **실제 크로미움**에서 자기검증하고, 그 증거(evidence 번들)를
 done 게이트에 흘려보내기 위한 엔진 사이드카. 설계 근거:
 `_research/cmux-distillation/DESIGN-v1.2-2026-07-19.md` §2A·§2B·§8-1.
 
-## 클린룸·라이선스
-- **클린룸**: cmux(GPL-3.0) 코드·마크업 무참조. 설계 md만 참조해 자작.
-- 외부 의존 = **playwright-core (Apache-2.0)** 단독. 버전 핀 `1.49.1` + `bun.lock` 커밋.
-- 브라우저 바이너리: 설치된 **Google Chrome** 채널 우선(`channel:"chrome"`), 없으면
-  playwright chromium 폴백(`bunx playwright install chromium` 필요).
+## 제품 runtime·라이선스
+- **클린룸**: cmux(GPL-3.0) 코드·마크업 무참조. 설계 문서만 참조해 자작.
+- `playwright-core`와 Chromium 버전·revision·license·target hash는 서명된
+  `browser-runtime.lock.json`에 고정한다.
+- 제품은 앱에 포함된 engine과 Chromium만 절대경로로 실행한다. 사용자 Bun, system Chrome,
+  `PATH`, `node_modules`, source `server.ts` 폴백은 금지한다.
+- `cysd`의 lazy `BrowserAuthorityExtension`이 유일한 public lifecycle authority이고 private
+  supervisor가 `shared-default/headless` EngineKey의 process group과 lock을 소유한다.
 
 ## 부트체인 무접점
 lazy 사이드카. launchd 등록·`cys boot` 4종 의무 노드·`javis_preflight`·SessionStart hook
@@ -16,27 +19,34 @@ lazy 사이드카. launchd 등록·`cys boot` 4종 의무 노드·`javis_preflig
 
 ## 실행
 ```bash
-cd cysjavis-pack/browserd
-bun install                                   # playwright-core 1.49.1 설치 + lockfile
-python3 ../bin/javis_browser.py doctor        # 설치·경로·버전 결정론 점검 (exit 0/1)
-
-# 동사 (browserd 자동 기동)
+# 제품: worker surface의 CLI는 cysd에 intent를 제출한다. endpoint/token은 반환되지 않는다.
 python3 ../bin/javis_browser.py open https://example.com
 python3 ../bin/javis_browser.py snapshot
 python3 ../bin/javis_browser.py verify --expect-text "..." --evidence-dir ./evi
-python3 ../bin/javis_browser.py --headless open ...   # GUI 세션 없는 컨텍스트
+
+# source 개발/격리 테스트만 명시적으로 opt-in
+cd cysjavis-pack/browserd
+bun install
+CYS_BROWSER_DEV=1 python3 ../bin/javis_browser.py --headless open https://example.com
 
 # 테스트
-bun test                                      # 순수 로직 단위 (토큰·state·상한)
+bun run test                                  # unit 계약 + 실-Chromium E2E 직렬 실행
+bun run test:negative                         # verify/evidence 음성 게이트
 bash tests/test_negative_gate.sh              # 음성 게이트 E2E (verify FAIL/PASS + evidence)
 ```
 
+실-Chromium 파일을 raw `bun test` 기본 동시성으로 실행하면 여러 cold-start가 한꺼번에
+Playwright/Chromium을 열어 머신 부하에 따라 state timeout이 날 수 있다. CI와 개발자의 canonical
+명령은 `bun run test`이며 테스트를 줄이지 않고 unit 단계 뒤 `pick` → cast integration → phase3를
+직렬 실행한다.
+
 ## 전송·상태
-- 127.0.0.1 HTTP, port 0-bind, 경로 `/<token>/rpc` (POST JSON `{verb, args}`).
-- `~/.cys/browser/state.json` {pid, port, token, headless} 0600 원자 기록. 스테일=pid 사망 시 교체.
-  `headless`=기동 모드(Phase 2 cast 추가). 소비자 키 검사는 pid/port/token 3키만 — 하위호환.
-  live browserd가 headless면 `observe`/`pick`/`sot`는 exit 4(HEADLESS_ACTIVE)로 거부한다
-  (재사용 시 창이 안 뜨는데 성공 보고하는 것을 막는다 — 자동 kill 없음).
+- engine endpoint는 supervisor 소유 instance root에만 0600으로 기록한다. cysd가 signed runtime
+  identity, pid, port, generation을 대조한 뒤 내부 RPC를 proxy한다.
+- Python과 `cys` adapter는 executable·PID·port·control token·lock을 읽거나 소유하지 않는다.
+- GUI는 control token 대신 generation·pane·origin에 결박된 `EmbedDescriptor`만 받는다. 복원은
+  passive descriptor 조회만 하며 runtime을 시작하지 않는다.
+- source 개발 모드만 `~/.cys/browser/state.json`과 직접 loopback RPC를 사용한다.
 - 감사로그: `~/.cys/browser/audit.jsonl` (전 동사 append — reviewer2 감사 대상).
 
 ## 동사표 (서버 dispatch ↔ CLI ↔ 이 표는 **3면이 일치해야 완성**이다)
@@ -124,8 +134,8 @@ pane 에 그려지는 프레임 크기(`metadata.deviceWidth/Height`)는 **CSS �
 - human 프로필 동사 = `APPROVAL_REQUIRED`(P1은 무조건 거부, feed 배선은 P3).
 - 조작권 컨텍스트별 `control=agent|human`. control=human 중 에이전트 변경성 동사 = `HUMAN_ACTIVE`.
   ★`control` 자체가 A등급이라 **에이전트는 조작권을 되찾을 수 없다**. 회수 경로는 ①cast pane 접속 후
-  이탈(마지막 클라이언트 이탈 시 `agent` 자동 복구) ②`javis_browser.py stop` 재기동 둘뿐이다 —
-  `control acquire --actor human` 을 pane 없이 걸어두면 그 컨텍스트는 재기동까지 A등급이 잠긴다.
+  이탈 후 reconnect grace와 lease 만료를 거쳐 `agent`로 복구한다. production adapter의 `stop`은
+  공유 runtime을 SIGTERM하지 않으며 cysd의 수명주기 정책을 우회할 수 없다.
 - 스냅샷 크기 상한 200KB + 절단 마커. 네이티브 다이얼로그 자동 dismiss + 로그.
 - **감사 원장의 공백과 그 보완**: `audit.jsonl` 은 CLI(`javis_browser.py`)가 기록한다. 서버는
   `args.approved` 를 그대로 신뢰하므로 `state.json` 을 읽어 **RPC 로 직행하면 CLI 원장을 통째로

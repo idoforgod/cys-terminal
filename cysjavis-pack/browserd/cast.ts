@@ -65,6 +65,7 @@ export class CastEmbedTicketRegistry {
   private readonly entries = new Map<string, {
     descriptor: CastEmbedTicketDescriptor;
     expiresAt: number;
+    appLoaded: boolean;
     consumed: boolean;
   }>();
 
@@ -90,12 +91,32 @@ export class CastEmbedTicketRegistry {
     this.entries.set(descriptor.ticket, {
       descriptor: { ...descriptor },
       expiresAt: now + this.ttlMs,
+      appLoaded: false,
       consumed: false,
     });
     return "issued";
   }
 
+  openApp(descriptor: CastEmbedTicketDescriptor, now = Date.now()): CastEmbedTicketConsume {
+    const result = this.match(descriptor, now);
+    if (result !== "accepted") return result;
+    const entry = this.entries.get(descriptor.ticket)!;
+    if (entry.appLoaded || entry.consumed) return "replayed";
+    entry.appLoaded = true;
+    return "accepted";
+  }
+
   consume(descriptor: CastEmbedTicketDescriptor, now = Date.now()): CastEmbedTicketConsume {
+    const result = this.match(descriptor, now);
+    if (result !== "accepted") return result;
+    const entry = this.entries.get(descriptor.ticket)!;
+    if (!entry.appLoaded) return "missing";
+    if (entry.consumed) return "replayed";
+    entry.consumed = true;
+    return "accepted";
+  }
+
+  private match(descriptor: CastEmbedTicketDescriptor, now: number): CastEmbedTicketConsume {
     if (!validCastEmbedTicket(descriptor)) return "mismatch";
     const entry = this.entries.get(descriptor.ticket);
     if (!entry) return "missing";
@@ -109,8 +130,6 @@ export class CastEmbedTicketRegistry {
       || expected.paneId !== descriptor.paneId
       || expected.parentOrigin !== descriptor.parentOrigin
     ) return "mismatch";
-    if (entry.consumed) return "replayed";
-    entry.consumed = true;
     return "accepted";
   }
 }

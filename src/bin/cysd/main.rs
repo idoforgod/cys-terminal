@@ -371,8 +371,9 @@ fn acquire_startup_lock(
         Ok(f) => f,
         Err(_) => return None, // 락 파일 생성 실패 — 기존 connect 점검만으로 진행
     };
-    let try_flock =
-        |f: &std::fs::File| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    let try_flock = |f: &std::fs::File| unsafe {
+        libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+    };
 
     if try_flock(&file) {
         deadman::claim_lock(&mut file, state_dir);
@@ -503,11 +504,16 @@ fn decide_auto_restore(
 /// CYS_NO_OFFICE_BRIDGE=1 opt-out · 팩에 브리지 부재(구팩)면 조용히 skip.
 /// python 해석·PATH·cys 주입은 auto-restore(★B3)와 동일 SOT(bundled_python3·runtime_prefixed_path).
 fn spawn_office_bridge(state_dir: std::path::PathBuf) {
-    if cys::env_compat("CYS_NO_OFFICE_BRIDGE").map(|v| v == "1").unwrap_or(false) {
+    if cys::env_compat("CYS_NO_OFFICE_BRIDGE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("[cysd] office-bridge skipped (CYS_NO_OFFICE_BRIDGE=1)");
         return;
     }
-    let script = cys::pack::pack_dir().join("bin").join("javis_hud_bridge.py");
+    let script = cys::pack::pack_dir()
+        .join("bin")
+        .join("javis_hud_bridge.py");
     if !script.is_file() {
         return; // 구팩(브리지 미배포) — 다음 팩 업데이트가 채운다.
     }
@@ -519,12 +525,17 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     tokio::spawn(async move {
-        let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        let exe_dir_ref = exe_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let python = bundled_python3(exe_dir_ref).unwrap_or_else(|| "python3".to_string());
         let log_path = state_dir.join("office-bridge.log");
         loop {
             // 단일 인스턴스 가드 — 이미 서비스 중(선행 데몬·수동 기동)이면 스폰하지 않고 재확인만.
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
             }
@@ -553,7 +564,11 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
             if cys_path.is_file() {
                 cmd.env("HUD_CYS_BIN", &cys_path); // 사이드카 cys 절대경로(PHOENIX_CYS 주입과 동일 패턴)
             }
-            match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
                 Ok(log) => {
                     if let Ok(err) = log.try_clone() {
                         cmd.stderr(err);
@@ -561,7 +576,8 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
                     cmd.stdout(log);
                 }
                 Err(_) => {
-                    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    cmd.stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
                 }
             }
             match cmd.spawn() {
@@ -626,13 +642,25 @@ fn spawn_auto_restore(
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let current_path = std::env::var("PATH").unwrap_or_default();
-    let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+    let exe_dir_ref = exe_dir
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let socket = socket_path.to_string_lossy();
-    match decide_auto_restore(&cys::pack::pack_dir(), opted_out, exe_dir_ref, &current_path, &socket) {
+    match decide_auto_restore(
+        &cys::pack::pack_dir(),
+        opted_out,
+        exe_dir_ref,
+        &current_path,
+        &socket,
+    ) {
         AutoRestore::OptedOut => {
             eprintln!("[cysd] auto-restore skipped (CYS_NO_AUTORESTORE=1)");
         }
-        AutoRestore::Ready { program, mut args, env } => {
+        AutoRestore::Ready {
+            program,
+            mut args,
+            env,
+        } => {
             // args = [disk_phoenix, "restore", "--auto"]. disk_phoenix 는 B1 폴백 후보.
             let disk_phoenix = std::path::PathBuf::from(args.remove(0));
             let tail = args; // ["restore","--auto"]
@@ -658,7 +686,9 @@ fn spawn_auto_restore(
                             }
                         }
                         PhoenixResolve::Failed(reason) => {
-                            eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
+                            eprintln!(
+                                "[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}"
+                            );
                             daemon.push_feed_notification(
                                 "error",
                                 "auto-restore 중단",
@@ -771,7 +801,10 @@ fn resolve_phoenix_source(
     match extract_phoenix_embed(state_dir) {
         Ok((root, script)) => {
             if phoenix_self_test(python, &script) {
-                return PhoenixResolve::Ready { script, cleanup: Some(root) };
+                return PhoenixResolve::Ready {
+                    script,
+                    cleanup: Some(root),
+                };
             }
             let _ = std::fs::remove_dir_all(&root); // temp 누수 0(self-test 실패분 즉시 정리)
             eprintln!("[cysd] phoenix 임베드 self-test 실패 — 디스크 폴백 시도");
@@ -904,7 +937,9 @@ where
                 return attempt;
             }
             Some(6) => {
-                eprintln!("[cysd] auto-restore CORRUPT/identity (exit=6) — 재시도 금지(사람 개입 필요)");
+                eprintln!(
+                    "[cysd] auto-restore CORRUPT/identity (exit=6) — 재시도 금지(사람 개입 필요)"
+                );
                 return attempt;
             }
             other => {
@@ -979,11 +1014,16 @@ fn guard_restore_panic<F: FnOnce()>(log_path: &std::path::Path, body: F) -> bool
                 .map(|s| (*s).to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic payload".to_string());
-            eprintln!("[cysd] ★auto-restore 스레드 panic 포착(P0-5 침묵사 차단·재스폰 안 함): {msg}");
+            eprintln!(
+                "[cysd] ★auto-restore 스레드 panic 포착(P0-5 침묵사 차단·재스폰 안 함): {msg}"
+            );
             // phoenix-restore.log 에도 남겨 관측성 확보(빈 로그 → panic 기록으로 원인 직결).
             if let Some(mut f) = open_restore_log(log_path) {
                 use std::io::Write;
-                let _ = writeln!(f, "[cysd] AUTO-RESTORE THREAD PANIC (P0-5 차단·재스폰 안 함): {msg}");
+                let _ = writeln!(
+                    f,
+                    "[cysd] AUTO-RESTORE THREAD PANIC (P0-5 차단·재스폰 안 함): {msg}"
+                );
             }
             false
         }
@@ -1384,6 +1424,409 @@ async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
 
 const MAX_REQUEST_LINE: usize = 10 * 1024 * 1024; // 지침 주입(수백 KB)에 충분한 10MB
 
+async fn dispatch_request_isolated(
+    daemon: Arc<Daemon>,
+    req: Request,
+    caller_pid: Option<u32>,
+) -> Reply {
+    if !req.method.starts_with("browser.runtime.") {
+        return handlers::dispatch(&daemon, req, caller_pid);
+    }
+    let id = req.id.clone();
+    if req.method == "browser.runtime.cancel" {
+        let caller_pid = match caller_pid.filter(|pid| *pid != 0) {
+            Some(pid) => pid,
+            None => {
+                return Reply::Single(cys::err_response(
+                    &id,
+                    "AUTHORITY_REJECTED",
+                    "Browser cancellation requires a kernel-authenticated peer",
+                ))
+            }
+        };
+        let pane_nonce = req
+            .params
+            .get("pane_nonce")
+            .and_then(serde_json::Value::as_str);
+        let request_id = req
+            .params
+            .get("request_id")
+            .and_then(serde_json::Value::as_str);
+        let (Some(pane_nonce), Some(request_id)) = (pane_nonce, request_id) else {
+            return Reply::Single(cys::err_response(
+                &id,
+                "INVALID_PARAMS",
+                "Browser cancellation requires pane_nonce and request_id",
+            ));
+        };
+        if !valid_browser_request_credential(pane_nonce)
+            || !valid_browser_request_credential(request_id)
+        {
+            return Reply::Single(cys::err_response(
+                &id,
+                "INVALID_PARAMS",
+                "Browser cancellation identity must be 32-byte lowercase hex",
+            ));
+        }
+        let cancelled = browser_request_registry().cancel(caller_pid, pane_nonce, request_id);
+        return Reply::Single(cys::ok_response(
+            &id,
+            serde_json::json!({"cancelled": cancelled}),
+        ));
+    }
+    let request_guard = if req.method == "browser.runtime.ensure"
+        && req
+            .params
+            .get("authority_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("user_gesture")
+    {
+        let caller_pid = match caller_pid.filter(|pid| *pid != 0) {
+            Some(pid) => pid,
+            None => {
+                return Reply::Single(cys::err_response(
+                    &id,
+                    "AUTHORITY_REJECTED",
+                    "Browser launch requires a kernel-authenticated GUI peer",
+                ))
+            }
+        };
+        let pane_nonce = req
+            .params
+            .get("pane_nonce")
+            .and_then(serde_json::Value::as_str);
+        let request_id = req
+            .params
+            .get("request_id")
+            .and_then(serde_json::Value::as_str);
+        let (Some(pane_nonce), Some(request_id)) = (pane_nonce, request_id) else {
+            return Reply::Single(cys::err_response(
+                &id,
+                "INVALID_PARAMS",
+                "GUI Browser launch requires pane_nonce and request_id",
+            ));
+        };
+        if !valid_browser_request_credential(pane_nonce)
+            || !valid_browser_request_credential(request_id)
+        {
+            return Reply::Single(cys::err_response(
+                &id,
+                "INVALID_PARAMS",
+                "Browser launch identity must be 32-byte lowercase hex",
+            ));
+        }
+        match browser_request_registry().register(
+            caller_pid,
+            pane_nonce.to_string(),
+            request_id.to_string(),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                return Reply::Single(cys::err_response(&id, "BROWSER_REQUEST_CONFLICT", &error))
+            }
+        }
+    } else {
+        None
+    };
+    let timeout = if req.method == "browser.runtime.operation" {
+        std::time::Duration::from_secs(70)
+    } else {
+        cys::browser_runtime::ENSURE_WORKER_DEADLINE
+    };
+    let cancellation = request_guard
+        .as_ref()
+        .map(|guard| guard.cancellation.clone())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    match run_browser_job_bounded_with_cancellation(
+        browser_job_gate(),
+        timeout,
+        cancellation,
+        move |cancelled| {
+            let _request_guard = request_guard;
+            authority_broker::with_browser_cancellation(cancelled, || {
+                handlers::dispatch(&daemon, req, caller_pid)
+            })
+        },
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) if error == "backpressure" => Reply::Single(cys::err_response(
+            &id,
+            "BROWSER_BACKPRESSURE",
+            "another Browser RPC is already in flight; retry after it completes",
+        )),
+        Err(error) if error != "timeout" => Reply::Single(cys::err_response(
+            &id,
+            "BROWSER_WORKER_FAILED",
+            &format!("Browser RPC worker failed: {error}"),
+        )),
+        Err(_) => Reply::Single(cys::err_response(
+            &id,
+            "BROWSER_TIMEOUT",
+            "Browser RPC exceeded its bounded worker deadline",
+        )),
+    }
+}
+
+fn valid_browser_request_credential(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BrowserRequestKey {
+    caller_pid: u32,
+    pane_nonce: String,
+    request_id: String,
+}
+
+#[derive(Default)]
+struct BrowserRequestRegistry {
+    requests: std::sync::Mutex<
+        std::collections::HashMap<BrowserRequestKey, Arc<std::sync::atomic::AtomicBool>>,
+    >,
+}
+
+struct BrowserRequestGuard {
+    registry: Arc<BrowserRequestRegistry>,
+    key: BrowserRequestKey,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BrowserRequestRegistry {
+    fn register(
+        self: &Arc<Self>,
+        caller_pid: u32,
+        pane_nonce: String,
+        request_id: String,
+    ) -> Result<BrowserRequestGuard, String> {
+        if caller_pid == 0
+            || !valid_browser_request_credential(&pane_nonce)
+            || !valid_browser_request_credential(&request_id)
+        {
+            return Err("invalid Browser request identity".into());
+        }
+        let key = BrowserRequestKey {
+            caller_pid,
+            pane_nonce,
+            request_id,
+        };
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut requests = self.requests.lock().unwrap();
+        if requests.contains_key(&key) {
+            return Err("duplicate Browser request identity".into());
+        }
+        requests.insert(key.clone(), cancellation.clone());
+        drop(requests);
+        Ok(BrowserRequestGuard {
+            registry: self.clone(),
+            key,
+            cancellation,
+        })
+    }
+
+    fn cancel(&self, caller_pid: u32, pane_nonce: &str, request_id: &str) -> bool {
+        let key = BrowserRequestKey {
+            caller_pid,
+            pane_nonce: pane_nonce.to_string(),
+            request_id: request_id.to_string(),
+        };
+        let cancellation = self.requests.lock().unwrap().get(&key).cloned();
+        if let Some(cancellation) = cancellation {
+            cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for BrowserRequestGuard {
+    fn drop(&mut self) {
+        let mut requests = self.registry.requests.lock().unwrap();
+        let remove = requests
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation));
+        if remove {
+            requests.remove(&self.key);
+        }
+    }
+}
+
+fn browser_request_registry() -> &'static Arc<BrowserRequestRegistry> {
+    static REGISTRY: std::sync::OnceLock<Arc<BrowserRequestRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Arc::new(BrowserRequestRegistry::default()))
+}
+
+struct BrowserJobGate {
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl BrowserJobGate {
+    fn new(max_in_flight: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+        }
+    }
+}
+
+fn browser_job_gate() -> &'static BrowserJobGate {
+    static GATE: std::sync::OnceLock<BrowserJobGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| BrowserJobGate::new(1))
+}
+
+async fn run_browser_job_bounded<T, F>(
+    gate: &BrowserJobGate,
+    timeout: std::time::Duration,
+    job: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<std::sync::atomic::AtomicBool>) -> T + Send + 'static,
+{
+    run_browser_job_bounded_with_cancellation(
+        gate,
+        timeout,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        job,
+    )
+    .await
+}
+
+async fn run_browser_job_bounded_with_cancellation<T, F>(
+    gate: &BrowserJobGate,
+    timeout: std::time::Duration,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    job: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<std::sync::atomic::AtomicBool>) -> T + Send + 'static,
+{
+    let permit = gate
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "backpressure".to_string())?;
+    let worker_cancelled = cancelled.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job(worker_cancelled)
+    });
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("timeout".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod browser_rpc_isolation_tests {
+    use super::{run_browser_job_bounded, BrowserJobGate, BrowserRequestRegistry};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_browser_start_does_not_starve_other_async_rpc_work() {
+        let gate = BrowserJobGate::new(1);
+        let slow = run_browser_job_bounded(&gate, std::time::Duration::from_secs(1), |_| {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            "browser-ready"
+        });
+        let other_rpc = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            "pty-ping"
+        };
+        let (slow_result, ping_result) = tokio::join!(slow, other_rpc);
+        assert_eq!(ping_result, "pty-ping");
+        assert_eq!(slow_result.unwrap(), "browser-ready");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_worker_deadline_is_bounded() {
+        let gate = BrowserJobGate::new(1);
+        let launched = Arc::new(AtomicUsize::new(0));
+        let launched_in_job = launched.clone();
+        let result = run_browser_job_bounded(
+            &gate,
+            std::time::Duration::from_millis(10),
+            move |cancelled| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                if !cancelled.load(Ordering::SeqCst) {
+                    launched_in_job.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            launched.load(Ordering::SeqCst),
+            0,
+            "timed-out work must observe cancellation before a late spawn"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_worker_gate_rejects_backpressure_instead_of_queueing() {
+        let gate = Arc::new(BrowserJobGate::new(1));
+        let release = Arc::new(AtomicBool::new(false));
+        let first_gate = gate.clone();
+        let first_release = release.clone();
+        let first = tokio::spawn(async move {
+            run_browser_job_bounded(&first_gate, std::time::Duration::from_secs(1), move |_| {
+                while !first_release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        let second =
+            run_browser_job_bounded(&gate, std::time::Duration::from_millis(20), |_| ()).await;
+        assert_eq!(second.unwrap_err(), "backpressure");
+        release.store(true, Ordering::SeqCst);
+        first.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn pane_cancel_uses_peer_and_request_identity_and_leaves_no_late_commit() {
+        let registry = Arc::new(BrowserRequestRegistry::default());
+        let pane_nonce = "b".repeat(64);
+        let request_id = "a".repeat(64);
+        let guard = registry
+            .register(77, pane_nonce.clone(), request_id.clone())
+            .unwrap();
+        let committed = Arc::new(AtomicUsize::new(0));
+        let committed_by_job = committed.clone();
+        let worker_cancelled = guard.cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if !worker_cancelled.load(Ordering::SeqCst) {
+                committed_by_job.fetch_add(1, Ordering::SeqCst);
+            }
+            drop(guard);
+        });
+        assert!(!registry.cancel(78, &pane_nonce, &request_id));
+        assert!(!registry.cancel(77, &"c".repeat(64), &request_id));
+        assert!(registry.cancel(77, &pane_nonce, &request_id));
+        worker.join().unwrap();
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.len(), 0);
+    }
+}
+
 async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Option<u32>) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -1405,7 +1848,7 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
             }
         };
 
-        match handlers::dispatch(&daemon, req, caller_pid) {
+        match dispatch_request_isolated(daemon.clone(), req, caller_pid).await {
             Reply::Single(resp) => {
                 if write_line(&mut write_half, &resp).await.is_err() {
                     return;
@@ -1522,8 +1965,8 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
                 since_line,
             } => {
                 // T3-14 완료 대기: 데몬 내부 폴링(토큰 비용 0) — plain-line 마커 규약 전제.
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(timeout_secs);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let mut cursor = since_line;
                 let resp = loop {
                     let Some(surface) = daemon.get_surface(surface_id) else {
@@ -1593,7 +2036,9 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
 /// 폴백해 한 줄은 항상 내보낸다(가용성 보존 — 격리 판정은 Severity 로그가 담당).
 fn abi_severity(e: &cys::wire::AbiError) -> severity::Severity {
     match e {
-        cys::wire::AbiError::Drift | cys::wire::AbiError::LenMismatch => severity::Severity::Critical,
+        cys::wire::AbiError::Drift | cys::wire::AbiError::LenMismatch => {
+            severity::Severity::Critical
+        }
         cys::wire::AbiError::VersionSkew { .. } => severity::Severity::Recoverable,
     }
 }
@@ -1797,7 +2242,10 @@ mod abi_severity_tests {
     /// Drift/LenMismatch=Critical(격리), VersionSkew=Recoverable(graceful).
     #[test]
     fn abi_error_to_severity() {
-        assert_eq!(super::abi_severity(&cys::wire::AbiError::Drift), Severity::Critical);
+        assert_eq!(
+            super::abi_severity(&cys::wire::AbiError::Drift),
+            Severity::Critical
+        );
         assert_eq!(
             super::abi_severity(&cys::wire::AbiError::LenMismatch),
             Severity::Critical
@@ -2026,7 +2474,11 @@ mod feed_wait_disconnect_tests {
 
         // waiter 등록 대기 (FeedWait 진입 확인).
         let registered = wait_until(Duration::from_secs(5), || {
-            daemon.feed_waiters.lock().unwrap().contains_key("disc-test-1")
+            daemon
+                .feed_waiters
+                .lock()
+                .unwrap()
+                .contains_key("disc-test-1")
         })
         .await;
         assert!(registered, "feed.push --wait가 waiter를 등록하지 못함");
@@ -2199,7 +2651,10 @@ mod auto_restore_tests {
         let ok2 = guard_restore_panic(&log, || {
             ran.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        assert!(ok2 && ran.load(std::sync::atomic::Ordering::SeqCst), "정상 body 는 true·실행");
+        assert!(
+            ok2 && ran.load(std::sync::atomic::Ordering::SeqCst),
+            "정상 body 는 true·실행"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2225,7 +2680,11 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&dir).unwrap();
         match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { args, .. } => {
-                assert!(args[0].ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
+                assert!(
+                    args[0].ends_with("bin/javis_phoenix.py"),
+                    "폴백 후보 경로: {}",
+                    args[0]
+                );
                 // args = [phoenix, "--socket", <sock>, "restore", "--auto"] — W6/E1 소켓 명시 전달.
                 assert_eq!(args[1], "--socket");
                 assert_eq!(&args[3..], &["restore".to_string(), "--auto".to_string()]);
@@ -2283,7 +2742,10 @@ mod auto_restore_tests {
                     py_path.to_string_lossy(),
                     "동봉 python3 실존 시 program 은 절대경로여야 한다(리터럴 'python3' 아님)"
                 );
-                assert_ne!(program, "python3", "리터럴 폴백이면 D4 결함(절대경로 미해석)");
+                assert_ne!(
+                    program, "python3",
+                    "리터럴 폴백이면 D4 결함(절대경로 미해석)"
+                );
             }
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -2303,7 +2765,13 @@ mod auto_restore_tests {
         let cys_path = bin.join(cys_name);
         std::fs::write(&cys_path, "#!/bin/sh\n").unwrap();
         // GUI/데몬 최소 PATH 모사 — exe_dir 미포함이라 선두주입이 일어나야 한다.
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin:/usr/sbin:/sbin", "sock:test") {
+        match decide_auto_restore(
+            &dir,
+            false,
+            &bin,
+            "/usr/bin:/bin:/usr/sbin:/sbin",
+            "sock:test",
+        ) {
             AutoRestore::Ready { env, .. } => {
                 let cys_env = env
                     .iter()
@@ -2386,15 +2854,24 @@ mod auto_restore_tests {
             std::fs::write(&p, content).unwrap();
         }
         let disk_phoenix = bin.join("javis_phoenix.py");
-        assert!(disk_fallback_verify(&disk_phoenix).is_ok(), "전 closure 일치 → verified");
+        assert!(
+            disk_fallback_verify(&disk_phoenix).is_ok(),
+            "전 closure 일치 → verified"
+        );
         // 형제 stale: snapshot.py 를 변조 → 거부(rel 명시).
         std::fs::write(bin.join("javis_state_snapshot.py"), "STALE-SNAPSHOT-DRIFT").unwrap();
         let e = disk_fallback_verify(&disk_phoenix).unwrap_err();
-        assert!(e.contains("javis_state_snapshot.py"), "stale 형제 rel 미보고: {e}");
+        assert!(
+            e.contains("javis_state_snapshot.py"),
+            "stale 형제 rel 미보고: {e}"
+        );
         // 형제 부재: snapshot.py 삭제 → 거부(부재 명시).
         std::fs::remove_file(bin.join("javis_state_snapshot.py")).unwrap();
         let e2 = disk_fallback_verify(&disk_phoenix).unwrap_err();
-        assert!(e2.contains("javis_state_snapshot.py") && e2.contains("부재"), "부재 형제 미보고: {e2}");
+        assert!(
+            e2.contains("javis_state_snapshot.py") && e2.contains("부재"),
+            "부재 형제 미보고: {e2}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
@@ -2427,7 +2904,10 @@ mod auto_restore_tests {
     /// ★B1③: 추출된 실 phoenix 가 --selftest 를 통과한다(python3 가용 시). self-test 게이트 실증.
     #[test]
     fn b1_self_test_passes_on_real_embed() {
-        let py = match std::process::Command::new("python3").arg("--version").output() {
+        let py = match std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+        {
             Ok(o) if o.status.success() => "python3".to_string(),
             _ => {
                 eprintln!("python3 미가용 — self-test 게이트 skip");
@@ -2468,7 +2948,6 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-
     /// ★B3: 동봉 runtime python3 가 있으면 program 은 그 절대경로(리터럴 "python3" 아님). mac 레이아웃
     /// (runtime/python/bin/python3)으로 검증 — 순정 Windows/mac CLT 미설치 첫 스폰 단절 수리의 핵심.
     #[cfg(target_os = "macos")]
@@ -2483,10 +2962,17 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&pybin).unwrap();
         let py = pybin.join("python3");
         std::fs::write(&py, "#!/bin/sh\n").unwrap();
-        assert_eq!(bundled_python3(&bin).as_deref(), Some(py.to_string_lossy().as_ref()));
+        assert_eq!(
+            bundled_python3(&bin).as_deref(),
+            Some(py.to_string_lossy().as_ref())
+        );
         match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { program, .. } => {
-                assert_eq!(program, py.to_string_lossy(), "동봉 python3 절대경로여야 한다");
+                assert_eq!(
+                    program,
+                    py.to_string_lossy(),
+                    "동봉 python3 절대경로여야 한다"
+                );
             }
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -2516,11 +3002,19 @@ mod auto_restore_tests {
         // 1차=exit 1(비0) → 2차=exit 0(수동 복원 후 재산정 NOOP). 스폰은 각 attempt 1회씩만(중복 0).
         let scripted = |attempt: u32| -> Option<i32> {
             calls.borrow_mut().push(attempt);
-            if attempt == 0 { Some(1) } else { Some(0) }
+            if attempt == 0 {
+                Some(1)
+            } else {
+                Some(0)
+            }
         };
         let runs = loop_auto_restore_with(scripted, Duration::from_millis(0));
         assert_eq!(runs, 2, "1차 비0→2차 실행이어야 한다(정확히 2회)");
-        assert_eq!(*calls.borrow(), vec![0, 1], "attempt 0,1 각 1회 — 중복 스폰 0");
+        assert_eq!(
+            *calls.borrow(),
+            vec![0, 1],
+            "attempt 0,1 각 1회 — 중복 스폰 0"
+        );
     }
 
     /// ★재시도 소진: 2차도 비0이면 무한 재시도 금지(정확히 2회에서 종료).
@@ -2597,7 +3091,11 @@ mod auto_restore_tests {
         // ① 정상 스코프: 등록 중 1개, 스코프 종료(drop) 후 빔.
         {
             let _g = RestoreRootGuard::new(daemon.clone(), 4242, 111);
-            assert_eq!(daemon.restore_roots.lock().unwrap().len(), 1, "등록 중 1개여야");
+            assert_eq!(
+                daemon.restore_roots.lock().unwrap().len(),
+                1,
+                "등록 중 1개여야"
+            );
         }
         assert!(
             daemon.restore_roots.lock().unwrap().is_empty(),
@@ -2625,7 +3123,11 @@ mod auto_restore_tests {
                     1,
                     "attempt 중 정확히 1개여야(누적 0)"
                 );
-                if attempt == 0 { Some(1) } else { Some(0) } // 1차 비0 → 2차 실행
+                if attempt == 0 {
+                    Some(1)
+                } else {
+                    Some(0)
+                } // 1차 비0 → 2차 실행
             },
             Duration::from_millis(0),
         );
@@ -2661,7 +3163,11 @@ mod auto_restore_tests {
             &[],
             &log,
         );
-        assert_eq!(code, Some(7), "exit code 계약 매핑이 깨졌다(status().code() 동형)");
+        assert_eq!(
+            code,
+            Some(7),
+            "exit code 계약 매핑이 깨졌다(status().code() 동형)"
+        );
         assert!(
             daemon.restore_roots.lock().unwrap().is_empty(),
             "run_auto_restore_once 종료 후 guard drop 으로 restore_roots 가 비어야 한다 (L1)"

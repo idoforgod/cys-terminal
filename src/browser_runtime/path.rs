@@ -85,8 +85,88 @@ impl RuntimePaths {
     pub fn verify_pinned_executables(&self, assets: &TargetAssets) -> Result<(), BrowserError> {
         verify_file_hash(&self.supervisor, &assets.supervisor_sha256, "supervisor")?;
         verify_file_hash(&self.engine, &assets.engine_sha256, "engine")?;
+        let chromium_root = self.target_root.join("chromium");
+        let actual_tree = hash_tree(&chromium_root)?;
+        if actual_tree != assets.chromium_tree_sha256.to_ascii_lowercase() {
+            return Err(BrowserError::runtime_integrity(
+                "Chromium tree hash mismatch",
+            ));
+        }
         Ok(())
     }
+}
+
+pub fn hash_tree(root: &Path) -> Result<String, BrowserError> {
+    if !root.is_dir() {
+        return Err(BrowserError::runtime_integrity(
+            "Chromium tree root is not a directory",
+        ));
+    }
+    let mut files = Vec::new();
+    collect_tree_files(root, root, &mut files)?;
+    files.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"cys.browser.chromium-tree.v1\0");
+    for relative in files {
+        let relative_bytes = relative.to_string_lossy().replace('\\', "/").into_bytes();
+        digest.update((relative_bytes.len() as u64).to_be_bytes());
+        digest.update(&relative_bytes);
+        let path = root.join(&relative);
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            BrowserError::runtime_integrity(format!("Chromium tree file open failed: {error}"))
+        })?;
+        let size = file
+            .metadata()
+            .map_err(|error| {
+                BrowserError::runtime_integrity(format!("Chromium tree metadata failed: {error}"))
+            })?
+            .len();
+        digest.update(size.to_be_bytes());
+        std::io::copy(&mut file, &mut digest).map_err(|error| {
+            BrowserError::runtime_integrity(format!("Chromium tree hash failed: {error}"))
+        })?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn collect_tree_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), BrowserError> {
+    let entries = std::fs::read_dir(current).map_err(|error| {
+        BrowserError::runtime_integrity(format!("Chromium tree read failed: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            BrowserError::runtime_integrity(format!("Chromium tree entry failed: {error}"))
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            BrowserError::runtime_integrity(format!("Chromium tree metadata failed: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(BrowserError::runtime_integrity(
+                "Chromium tree contains a symlink",
+            ));
+        }
+        if metadata.is_dir() {
+            collect_tree_files(root, &path, output)?;
+        } else if metadata.is_file() {
+            output.push(
+                path.strip_prefix(root)
+                    .map_err(|_| {
+                        BrowserError::runtime_integrity("Chromium tree path escaped its root")
+                    })?
+                    .to_path_buf(),
+            );
+        } else {
+            return Err(BrowserError::runtime_integrity(
+                "Chromium tree contains a non-regular entry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_file_hash(path: &Path, expected: &str, label: &str) -> Result<(), BrowserError> {

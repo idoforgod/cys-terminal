@@ -34,6 +34,7 @@
     "resources": {
       "resources/pack.tar.gz": "./",
       "resources/pack-manifest.json": "./",
+      "resources/browser-runtime/": "browser-runtime/",
       "runtime/": "runtime/"
     },
     "icon": [

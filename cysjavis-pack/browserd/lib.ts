@@ -1,9 +1,9 @@
 // lib.ts — browserd 순수 유틸 (부작용 없는 로직만: 토큰·state·크기 상한).
 // bun 단위 테스트 대상. 브라우저/네트워크 의존을 두지 않는다.
 
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 
 export const SNAPSHOT_LIMIT = 200 * 1024; // 200KB
@@ -84,13 +84,75 @@ export interface BrowserState {
   pid: number;
   port: number;
   token: string;
+  cast_token: string;
   runtime_id: string;
   process_start_time: number;
   headless?: boolean; // Phase 2 cast: 기동 모드 정직 노출. readState 는 기존 3키만 검증(하위호환·추가만).
+  instance_id: string;
+  engine_generation: number;
+  state_mac: string;
+}
+
+export type UnsignedBrowserState = Omit<BrowserState, "state_mac">;
+
+export function signEngineState(state: UnsignedBrowserState, keyHex: string): string {
+  if (!/^[0-9a-f]{64}$/.test(keyHex)) {
+    throw new Error("managed engine state requires a 32-byte lowercase-hex authentication key");
+  }
+  const payload = JSON.stringify([
+    state.schema_version,
+    state.pid,
+    state.port,
+    state.token,
+    state.cast_token,
+    state.runtime_id,
+    state.process_start_time,
+    state.headless === true,
+    state.instance_id,
+    state.engine_generation,
+  ]);
+  return createHmac("sha256", Buffer.from(keyHex, "hex"))
+    .update("cys.browser.engine-state.v1\0", "utf8")
+    .update(payload, "utf8")
+    .digest("hex");
+}
+
+export function signPrivateControlRequest(body: Uint8Array, keyHex: string): string {
+  if (!/^[0-9a-f]{64}$/.test(keyHex)) {
+    throw new Error("private engine control requires a 32-byte lowercase-hex authentication key");
+  }
+  return createHmac("sha256", Buffer.from(keyHex, "hex"))
+    .update("cys.browser.private-control.v1\0", "utf8")
+    .update(body)
+    .digest("hex");
+}
+
+export function privateControlRequestAccepted(
+  supplied: string | null,
+  body: Uint8Array,
+  keyHex: string,
+): boolean {
+  if (!supplied || !/^[0-9a-f]{64}$/.test(supplied)) return false;
+  let expected: string;
+  try {
+    expected = signPrivateControlRequest(body, keyHex);
+  } catch {
+    return false;
+  }
+  return timingSafeEqual(Buffer.from(supplied, "hex"), Buffer.from(expected, "hex"));
+}
+
+export function resolveBrowserRoot(home: string, engineRoot: string | undefined, strict: string | undefined): string {
+  if (strict === "1" && engineRoot && isAbsolute(engineRoot)) return engineRoot;
+  return join(home, ".cys", "browser");
 }
 
 export function browserRoot(): string {
-  return join(homedir(), ".cys", "browser");
+  return resolveBrowserRoot(
+    homedir(),
+    process.env.CYS_BROWSER_V2_ENGINE_ROOT,
+    process.env.CYS_BROWSER_STRICT_RUNTIME,
+  );
 }
 export function statePath(): string {
   return join(browserRoot(), "state.json");
@@ -101,6 +163,40 @@ export function profileDir(profile: "agent" | "human"): string {
 
 export function genToken(): string {
   return randomBytes(16).toString("hex"); // 32 hex chars
+}
+
+export function castCredentialAccepted(
+  given: string,
+  controlToken: string,
+  castToken: string,
+  strict: string | undefined,
+): boolean {
+  const equal = (left: string, right: string) => {
+    const a = Buffer.from(left, "utf8");
+    const b = Buffer.from(right, "utf8");
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  if (equal(given, castToken)) return true;
+  return strict !== "1" && equal(given, controlToken);
+}
+
+export function resolveRuntimeIdentity(configured: string | undefined, strict: string | undefined): string {
+  if (strict !== "1") return genToken();
+  if (!configured || !/^sha256:[0-9a-f]{64}$/.test(configured)) {
+    throw new Error("strict Browser Runtime requires a signed sha256 runtime identity");
+  }
+  return configured;
+}
+
+export function strictChromiumExecutable(
+  configured: string | undefined,
+  strict: string | undefined,
+): string | null {
+  if (strict !== "1") return null;
+  if (!configured || !isAbsolute(configured)) {
+    throw new Error("strict Browser Runtime requires an absolute supervisor-pinned Chromium path");
+  }
+  return configured;
 }
 
 // 크기 상한 + 절단 마커. 반환 {text, truncated}.

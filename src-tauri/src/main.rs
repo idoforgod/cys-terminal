@@ -82,6 +82,155 @@ async fn connect() -> Result<Stream, String> {
 type ConnCell = std::sync::Arc<tokio::sync::Mutex<Option<tokio::io::BufReader<Stream>>>>;
 static RPC_POOL: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, ConnCell>>> =
     std::sync::OnceLock::new();
+static BROWSER_APP_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
+    std::sync::OnceLock::new();
+
+const NATIVE_ACTIVATION_TTL_MS: u64 = 2_000;
+const TAURI_BROWSER_ENSURE_DEADLINE_SECS: u64 =
+    cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs() + 5;
+
+#[derive(Default)]
+struct NativeActivationRegistry {
+    windows: HashMap<String, NativeWindowActivation>,
+}
+
+struct NativeWindowActivation {
+    bootstrap_capability: String,
+    pending: Option<PendingNativeActivation>,
+}
+
+struct PendingNativeActivation {
+    _nonce: String,
+    expires_at_ms: u64,
+}
+
+impl NativeActivationRegistry {
+    fn install_window(&mut self, label: &str, capability: &str) -> Result<(), String> {
+        validate_lower_hex(capability, "Browser bootstrap capability")?;
+        if label.is_empty() || label.len() > 64 || self.windows.contains_key(label) {
+            return Err("invalid or duplicate Browser activation window".into());
+        }
+        self.windows.insert(
+            label.into(),
+            NativeWindowActivation {
+                bootstrap_capability: capability.into(),
+                pending: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn arm(&mut self, label: &str, capability: &str, now_ms: u64) -> Result<(), String> {
+        validate_lower_hex(capability, "Browser bootstrap capability")?;
+        let window = self
+            .windows
+            .get_mut(label)
+            .ok_or_else(|| "Browser activation window is not registered".to_string())?;
+        if window.bootstrap_capability != capability {
+            window.pending = None;
+            return Err("Browser bootstrap capability mismatch".into());
+        }
+        window.pending = Some(PendingNativeActivation {
+            _nonce: random_secret_hex()?,
+            expires_at_ms: now_ms.saturating_add(NATIVE_ACTIVATION_TTL_MS),
+        });
+        Ok(())
+    }
+
+    fn consume(&mut self, label: &str, now_ms: u64) -> Result<(), String> {
+        let window = self
+            .windows
+            .get_mut(label)
+            .ok_or_else(|| "Browser activation window is not registered".to_string())?;
+        let pending = window
+            .pending
+            .take()
+            .ok_or_else(|| "trusted native Browser activation is required".to_string())?;
+        if pending.expires_at_ms <= now_ms {
+            return Err("trusted native Browser activation expired".into());
+        }
+        Ok(())
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn validate_lower_hex(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} must be 32-byte lowercase hex"));
+    }
+    Ok(())
+}
+
+fn random_secret_hex() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| format!("OS CSPRNG unavailable: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn browser_activation_initialization_script(capability: &str) -> String {
+    format!(
+        r##"(() => {{
+  'use strict';
+  const capability = '{capability}';
+  const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
+  const nativeClick = HTMLElement.prototype.click;
+  document.addEventListener('click', (event) => {{
+    if (!event.isTrusted || !navigator.userActivation.isActive) return;
+    const raw = event.target;
+    if (!(raw instanceof Element)) return;
+    const target = raw.closest("#btn-browser, [data-browser-reconnect='true']");
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    invoke('arm_browser_native_activation', {{ bootstrapCapability: capability }})
+      .then(() => nativeClick.call(target))
+      .catch(() => undefined);
+  }}, true);
+}})();"##
+    )
+}
+
+fn browser_session_params(mut params: Value) -> Result<Value, String> {
+    let session = BROWSER_APP_SESSION
+        .get()
+        .ok_or_else(|| "Browser GUI peer registration is unavailable".to_string())?;
+    let object = params
+        .as_object_mut()
+        .ok_or_else(|| "Browser RPC params must be an object".to_string())?;
+    object.insert("app_session".into(), Value::String(session.clone()));
+    Ok(params)
+}
+
+async fn register_browser_gui_peer() -> Result<(), String> {
+    let challenge = rpc("browser.runtime.gui_challenge", json!({})).await?;
+    let registration_secret = challenge["registration_challenge"]
+        .as_str()
+        .ok_or_else(|| "cysd returned no Browser GUI registration challenge".to_string())?;
+    let registration = rpc(
+        "browser.runtime.register_gui",
+        json!({"registration_secret":registration_secret}),
+    )
+    .await?;
+    let session = registration["app_session"]
+        .as_str()
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| "cysd returned an invalid Browser GUI session".to_string())?
+        .to_string();
+    BROWSER_APP_SESSION
+        .set(session)
+        .map_err(|_| "Browser GUI peer was already registered".to_string())
+}
 
 /// 풀에서 소켓의 연결 셀을 얻는다 — 외부 std Mutex는 Arc 클론만 짧게 잡고 즉시 푼다(await 경계 안 넘김).
 fn conn_cell(socket: &std::path::Path) -> ConnCell {
@@ -671,261 +820,218 @@ fn ensure_view_bridge() -> Result<Value, String> {
     Err("view bridge state 대기 타임아웃(10s)".into())
 }
 
-/// 지구본 버튼 진입점 — cysd 권한 브로커에 browserd headful 확보를 요청한다.
-/// Tauri/CLI는 모두 broker RPC를 사용하며, 런타임 프로세스의 기동·단일 인스턴스·파일락은
-/// broker의 BrowserRuntimeManager가 소유한다. 브로커가 없으면 disabled-safe로 실패한다.
+/// 인증 정보가 없는 구형 Tauri 진입점. Browser v2의 검증된 pane/gesture identity를 만들 수
+/// 없으므로 disabled-safe로 거부한다. 실제 지구본 버튼은 `ensure_browserd_cast`를 사용한다.
 #[tauri::command]
 fn browser_open(url: Option<String>) -> Result<Value, String> {
     let target = url
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| "about:blank".into());
-    browser_runtime_rpc(
-        "browser.runtime.ensure",
-        serde_json::json!({
-            "authority_kind": "user_gesture", "subject": "tauri-browser", "profile": "agent", "url": target
-        }),
-    )
+    Err(format!(
+        "BROWSER_DISABLED_SAFE [USER_GESTURE_REQUIRED]: legacy browser_open cannot authorize or navigate {target}; use the in-pane Browser reconnect action"
+    ))
 }
 
-/// Browser lifecycle is owned by cysd's authority broker. Tauri never starts
-/// javis_browser.py directly; missing/unsupported broker is disabled-safe.
-fn browser_runtime_rpc(method: &str, params: Value) -> Result<Value, String> {
-    use std::io::{BufRead, BufReader, Write};
-    #[cfg(unix)]
-    let mut stream = std::os::unix::net::UnixStream::connect(cys::socket_path())
-        .map_err(|e| format!("BROWSER_DISABLED_SAFE: cysd unavailable: {e}"))?;
-    #[cfg(unix)]
-    {
-        let request = serde_json::json!({"id":"tauri-browser", "method":method, "params":params});
-        writeln!(stream, "{}", request)
-            .map_err(|e| format!("BROWSER_DISABLED_SAFE: rpc write: {e}"))?;
-        let mut line = String::new();
-        BufReader::new(stream)
-            .read_line(&mut line)
-            .map_err(|e| format!("BROWSER_DISABLED_SAFE: rpc read: {e}"))?;
-        let response: Value = serde_json::from_str(&line)
-            .map_err(|e| format!("BROWSER_DISABLED_SAFE: invalid rpc response: {e}"))?;
-        if response.get("ok").and_then(Value::as_bool) != Some(true) {
-            let code = response
-                .pointer("/error/code")
-                .and_then(Value::as_str)
-                .unwrap_or("RUNTIME_DISABLED");
-            let message = response
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Browser runtime disabled");
-            return Err(format!("BROWSER_DISABLED_SAFE [{code}]: {message}"));
-        }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (method, params);
-        Err("BROWSER_DISABLED_SAFE: broker transport unavailable".into())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BrowserdStateRecord {
-    pid: u32,
-    port: u16,
-    token: String,
-    runtime_id: String,
-    process_start_time: u64,
-    headless: Option<bool>,
-}
-
-#[derive(Clone, Debug)]
-struct BrowserdProcessIdentity {
-    command: String,
-    start_time: u64,
-}
-
-fn strict_lower_hex(value: &str, len: usize) -> bool {
-    value.len() == len
-        && value
+fn browser_user_gesture_intent(
+    window_label: &str,
+    pane_nonce: &str,
+    gesture_receipt: &str,
+) -> Result<Value, String> {
+    if window_label.is_empty()
+        || window_label.len() > 64
+        || !window_label
             .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-fn parse_browserd_state(raw: &str) -> Option<BrowserdStateRecord> {
-    let v: Value = serde_json::from_str(raw).ok()?;
-    if v.get("schema_version").and_then(Value::as_u64) != Some(2) {
-        return None;
-    }
-    let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
-    if pid == 0 {
-        return None;
-    }
-    let port = u16::try_from(v.get("port")?.as_u64()?).ok()?;
-    if port == 0 {
-        return None;
-    }
-    let token = v.get("token")?.as_str()?.to_string();
-    let runtime_id = v.get("runtime_id")?.as_str()?.to_string();
-    if !strict_lower_hex(&token, 32) || !strict_lower_hex(&runtime_id, 32) {
-        return None;
-    }
-    let process_start_time = v.get("process_start_time")?.as_u64()?;
-    if process_start_time == 0 {
-        return None;
-    }
-    let headless = match v.get("headless") {
-        Some(Value::Bool(v)) => Some(*v),
-        Some(_) => return None,
-        None => None,
-    };
-    Some(BrowserdStateRecord {
-        pid,
-        port,
-        token,
-        runtime_id,
-        process_start_time,
-        headless,
-    })
-}
-
-fn inspect_browserd_process(pid: u32) -> Option<BrowserdProcessIdentity> {
-    let mut sys = sysinfo::System::new();
-    let pid = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    let process = sys.process(pid)?;
-    let mut command = process
-        .cmd()
-        .iter()
-        .map(|s| s.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if command.is_empty() {
-        command = process.name().to_string_lossy().into_owned();
-    }
-    Some(BrowserdProcessIdentity {
-        command,
-        start_time: process.start_time(),
-    })
-}
-
-fn browserd_command_matches(command: &str) -> bool {
-    let c = command.to_ascii_lowercase();
-    (c.contains("bun") && c.contains("server.ts") && c.contains("browserd"))
-        || c.contains("cys-browserd")
-}
-
-fn probe_browserd_health(state: &BrowserdStateRecord) -> bool {
-    use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-    use std::time::Duration;
-
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, state.port);
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr.into(), Duration::from_millis(500))
-    else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(700)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(700)));
-    let body = r#"{"verb":"status","args":{}}"#;
-    let request = format!(
-        "POST /{}/rpc HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        state.token, state.port, body.len(), body
-    );
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-    let mut bytes = Vec::new();
-    if stream.take(65_537).read_to_end(&mut bytes).is_err() || bytes.len() > 65_536 {
-        return false;
-    }
-    let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(head) = std::str::from_utf8(&bytes[..split]) else {
-        return false;
-    };
-    if !(head.starts_with("HTTP/1.1 200 ") || head.starts_with("HTTP/1.0 200 ")) {
-        return false;
-    }
-    let Ok(v) = serde_json::from_slice::<Value>(&bytes[split + 4..]) else {
-        return false;
-    };
-    let Some(result) = v.get("result") else {
-        return false;
-    };
-    v.get("ok").and_then(Value::as_bool) == Some(true)
-        && result.get("schema_version").and_then(Value::as_u64) == Some(2)
-        && result.get("pid").and_then(Value::as_u64) == Some(u64::from(state.pid))
-        && result.get("runtime_id").and_then(Value::as_str) == Some(state.runtime_id.as_str())
-        && result.get("process_start_time").and_then(Value::as_u64)
-            == Some(state.process_start_time)
-}
-
-fn read_browserd_state_with<F, P>(
-    path: &std::path::Path,
-    inspect: F,
-    probe: P,
-) -> Option<(u16, String, Option<bool>)>
-where
-    F: FnOnce(u32) -> Option<BrowserdProcessIdentity>,
-    P: FnOnce(&BrowserdStateRecord) -> bool,
-{
-    let state = parse_browserd_state(&std::fs::read_to_string(path).ok()?)?;
-    let identity = inspect(state.pid)?;
-    if !browserd_command_matches(&identity.command)
-        || identity.start_time.abs_diff(state.process_start_time) > 2
-        || !probe(&state)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return None;
+        return Err("invalid Browser window label".into());
     }
-    Some((state.port, state.token, state.headless))
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(pane_nonce) || !valid_credential(gesture_receipt) {
+        return Err("Browser pane/gesture receipt must be 32-byte lowercase hex".into());
+    }
+    Ok(json!({
+        "authority_kind":"user_gesture",
+        "realm":"shared-default",
+        "mode":"headless",
+        "window_label":window_label,
+        "pane_nonce":pane_nonce,
+        "gesture_receipt":gesture_receipt,
+    }))
 }
 
-/// ~/.cys/browser/state.json 은 schema/runtime/process identity와 authenticated loopback health가
-/// 모두 같은 인스턴스를 가리킬 때만 live로 인정한다. PID 생존만으로는 PID 재사용·무관 프로세스를
-/// browserd로 오인하므로 부족하다.
-/// ★headless 는 3-상태다 — 키가 있으면 Some(값), **없거나 bool 이 아니면 None=unknown**. 이 키를 안 쓰던
-/// 구버전 browserd 도 실제로는 headless 로 떠 있을 수 있어, 부재를 false 로 단정하면 GUI 가 "기존 headful
-/// 세션 재사용 — 외부 창 병존" toast 를 **거짓 고지**한다(창이 없는데 있다고 말함 = exit0 거짓말 계열).
-/// unknown 은 JSON 에 null 로 나가고, GUI 의 `state.headless === false` 엄격 비교가 자연히 침묵한다
-/// (모르면 말하지 않는다).
-/// pid 생존 판정은 read_live_view_state 와 동형(kill(pid,0): ESRCH=사멸).
-fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bool>)> {
-    read_browserd_state_with(path, inspect_browserd_process, probe_browserd_health)
-}
-
-/// 지구본 버튼 in-pane(cast) 경로 진입점 — browserd 를 **headless** 로 확보하고 cast 앱이 쓸
-/// {port, token, headless} 좌표를 반환한다. browser_open과 달리 이 커맨드는 broker에
-/// **동기 ensure**를 요청해 browserd가 실제로 뜰 때까지 기다린다
-/// (엔진 start는 state 등장까지 최대 20s 블로킹). 그래서 async fn — Tauri가 별도 스레드에서
-/// 돌려 cold-start 가 GUI 메인 스레드를 점유하지 않는다(시뮬 F1). 블로킹 대기는 파일 내 관례대로
-/// spawn_blocking 으로 tokio 워커에서 격리한다.
-/// ★단일 인스턴스 보장은 이 함수가 아니라 엔진 ensure_browserd 의 파일락에 있다(browser_open 과
-/// 동일 원칙 — 진입점 Mutex 흉내 금지, 크로스프로세스 락이 정답). live browserd 가 이미 있으면
-/// kill 없이 그대로 재사용되고 state.headless 를 정직 반환한다(세션 공유 원칙).
 #[tauri::command]
-async fn ensure_browserd_cast() -> Result<Value, String> {
-    tokio::task::spawn_blocking(|| {
-        browser_runtime_rpc(
-                "browser.runtime.ensure",
-            json!({
-                "authority_kind": "user_gesture", "subject": "tauri-browser", "profile": "shared_default", "headless": true
-            }),
-        )
-    })
-    .await
-    .map_err(|e| format!("browserd 확보 태스크 실패(join): {e}"))?
+fn arm_browser_native_activation(
+    window: tauri::WebviewWindow,
+    bootstrap_capability: String,
+) -> Result<(), String> {
+    NATIVE_BROWSER_ACTIVATIONS
+        .get()
+        .ok_or_else(|| "Browser native activation registry is unavailable".to_string())?
+        .lock()
+        .unwrap()
+        .arm(window.label(), &bootstrap_capability, unix_millis_now())
 }
 
-/// browserd 생존 조회 전용 — **spawn 절대 없음**(auto-spawn 회귀 차단, 설계 D7). GUI 복원 경로가
-/// 부팅 시 Chromium 을 자동 기동하지 않고 browserd 생존만 확인하는 용도. live 면
-/// {alive:true, port, token, headless}, 부재·손상·pid 사망이면 {alive:false} 반환(Err 아님 —
-/// 정상 상태 조회이므로 실패가 아니다).
+fn browser_embed_intent(
+    pane_id: &str,
+    embed_ticket: &str,
+    embed_generation: u64,
+    parent_origin: &str,
+) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let expected_origin = if cfg!(windows) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    };
+    if !valid_credential(pane_id)
+        || !valid_credential(embed_ticket)
+        || embed_generation == 0
+        || parent_origin != expected_origin
+    {
+        return Err("invalid Browser embed request".into());
+    }
+    Ok(json!({
+        "context":"default",
+        "protocol_version":2,
+        "embed_generation":embed_generation,
+        "parent_origin":parent_origin,
+        "embed_ticket":embed_ticket,
+        "pane_id":pane_id,
+    }))
+}
+
+/// 지구본 버튼의 active Browser 진입점. 검증된 사용자 제스처를 `cysd`의 lazy
+/// BrowserAuthorityExtension에 제출하고, 호환 runtime이 준비된 뒤 짧은 수명의
+/// `EmbedDescriptor`만 반환한다. Tauri는 실행 파일·PID·port·control token·process lock을
+/// 읽거나 소유하지 않는다. cold start는 bounded RPC timeout 안에서 일어나며 앱 부트/복원
+/// 경로에서는 이 명령을 호출하지 않는다.
 #[tauri::command]
-fn browserd_state() -> Value {
-    let state_path = cys::home_dir().join(".cys/browser/state.json");
-    match read_browserd_state(&state_path) {
-        Some((port, token, headless)) => {
-            json!({"alive": true, "port": port, "token": token, "headless": headless})
+async fn ensure_browserd_cast(
+    window: tauri::WebviewWindow,
+    pane_nonce: String,
+    request_id: String,
+    embed_generation: u64,
+    parent_origin: String,
+    embed_ticket: String,
+) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(&request_id) {
+        return Err("invalid Browser request identity".into());
+    }
+    NATIVE_BROWSER_ACTIVATIONS
+        .get()
+        .ok_or_else(|| "BROWSER_DISABLED_SAFE: native activation registry unavailable".to_string())?
+        .lock()
+        .unwrap()
+        .consume(window.label(), unix_millis_now())
+        .map_err(|error| format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}"))?;
+    let issue_params = browser_session_params(json!({
+        "window_label":window.label(),
+        "pane_nonce":pane_nonce,
+    }))?;
+    let issued = rpc("browser.runtime.issue_gesture", issue_params)
+        .await
+        .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+    let gesture_receipt = issued["gesture_receipt"].as_str().ok_or_else(|| {
+        "BROWSER_DISABLED_SAFE: broker returned no activation receipt".to_string()
+    })?;
+    let mut intent = browser_user_gesture_intent(window.label(), &pane_nonce, &gesture_receipt)?;
+    intent
+        .as_object_mut()
+        .ok_or_else(|| "invalid Browser launch intent".to_string())?
+        .insert("request_id".into(), Value::String(request_id.clone()));
+    let ensure = tokio::time::timeout(
+        std::time::Duration::from_secs(TAURI_BROWSER_ENSURE_DEADLINE_SECS),
+        rpc_oneshot(
+            &default_socket(),
+            "browser.runtime.ensure",
+            browser_session_params(intent)?,
+        ),
+    )
+    .await;
+    match ensure {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(format!("BROWSER_DISABLED_SAFE: {error}")),
+        Err(_) => {
+            let _ = cancel_browser_request(&pane_nonce, &request_id).await;
+            return Err(format!(
+                "BROWSER_DISABLED_SAFE [RUNTIME_START_TIMEOUT]: broker did not answer in {}s",
+                TAURI_BROWSER_ENSURE_DEADLINE_SECS
+            ));
         }
-        None => json!({"alive": false}),
+    }
+    let embed = browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)?;
+    rpc(
+        "browser.runtime.prepare_embed",
+        browser_session_params(embed)?,
+    )
+    .await
+    .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))
+}
+
+async fn cancel_browser_request(pane_nonce: &str, request_id: &str) -> Result<Value, String> {
+    rpc_oneshot(
+        &default_socket(),
+        "browser.runtime.cancel",
+        browser_session_params(json!({
+            "pane_nonce":pane_nonce,
+            "request_id":request_id,
+        }))?,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn cancel_browserd_cast(pane_nonce: String, request_id: String) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(&pane_nonce) || !valid_credential(&request_id) {
+        return Err("invalid Browser cancellation identity".into());
+    }
+    cancel_browser_request(&pane_nonce, &request_id).await
+}
+
+/// 복원용 passive descriptor 조회. `prepare_embed`은 cysd의 이미 호환 판정된 live runtime에만
+/// descriptor를 발급하며 절대 ensure/spawn하지 않는다. live면
+/// `{alive:true,descriptor:EmbedDescriptor}`, 부재·손상·불일치면 `{alive:false}`다.
+#[tauri::command]
+async fn browserd_state(
+    pane_nonce: String,
+    embed_generation: u64,
+    parent_origin: String,
+    embed_ticket: String,
+) -> Value {
+    let Ok(embed) =
+        browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)
+    else {
+        return json!({"alive":false});
+    };
+    let Ok(embed) = browser_session_params(embed) else {
+        return json!({"alive":false});
+    };
+    match rpc("browser.runtime.prepare_embed", embed).await {
+        Ok(descriptor) => json!({"alive":true,"descriptor":descriptor}),
+        Err(_) => json!({"alive":false}),
     }
 }
 
@@ -3394,7 +3500,17 @@ async fn stop_running_daemon() {
 }
 
 fn main() {
+    let bootstrap_capability = random_secret_hex().expect("Browser activation CSPRNG unavailable");
+    let mut activation_registry = NativeActivationRegistry::default();
+    activation_registry
+        .install_window("main", &bootstrap_capability)
+        .expect("Browser activation registry initialization failed");
+    NATIVE_BROWSER_ACTIVATIONS
+        .set(Mutex::new(activation_registry))
+        .unwrap_or_else(|_| panic!("Browser activation registry already initialized"));
+    let activation_script = browser_activation_initialization_script(&bootstrap_capability);
     tauri::Builder::default()
+        .append_invoke_initialization_script(activation_script)
         // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
         // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
         // 무엇이든(설치기 재실행·바로가기 이중클릭·OS 재기동 복원) 단일 인스턴스가 보장된다.
@@ -3449,7 +3565,9 @@ fn main() {
             read_text_head,
             ensure_view_bridge,
             browser_open,
+            arm_browser_native_activation,
             ensure_browserd_cast,
+            cancel_browserd_cast,
             browserd_state,
             home_dir_path,
             open_url,
@@ -3559,6 +3677,10 @@ fn main() {
                     );
                     return;
                 }
+                if let Err(error) = register_browser_gui_peer().await {
+                    eprintln!("[cys-app] Browser GUI registration failed closed: {error}");
+                    let _ = handle.emit("browser-disabled-safe", error);
+                }
                 let _ = handle.emit("daemon-ready", ());
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
@@ -3596,6 +3718,44 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tauri_browser_deadline_outlives_cysd_worker_deadline() {
+        assert!(
+            TAURI_BROWSER_ENSURE_DEADLINE_SECS
+                > cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs()
+        );
+    }
+
+    #[test]
+    fn native_browser_activation_is_window_bound_ttl_and_single_consume() {
+        let mut registry = NativeActivationRegistry::default();
+        let capability = "a".repeat(64);
+        registry.install_window("main", &capability).unwrap();
+        assert!(registry.arm("other", &capability, 1_000).is_err());
+        assert!(registry.arm("main", &"b".repeat(64), 1_000).is_err());
+        registry.arm("main", &capability, 1_000).unwrap();
+        registry.consume("main", 1_001).unwrap();
+        assert!(registry.consume("main", 1_002).is_err());
+        registry.arm("main", &capability, 2_000).unwrap();
+        assert!(registry
+            .consume("main", 2_000 + NATIVE_ACTIVATION_TTL_MS + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn initialization_script_keeps_capability_lexical_and_requires_trusted_activation() {
+        let capability = "c".repeat(64);
+        let script = browser_activation_initialization_script(&capability);
+        assert!(script.contains("event.isTrusted"));
+        assert!(script.contains("navigator.userActivation.isActive"));
+        assert!(script.contains("#btn-browser"));
+        assert!(script.contains("[data-browser-reconnect='true']"));
+        assert!(script.contains("arm_browser_native_activation"));
+        assert_eq!(script.matches(&capability).count(), 1);
+        assert!(!script.contains("window.browser"));
+        assert!(!script.contains("globalThis.browser"));
+    }
+
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
     /// 비존재 경로는 metadata 게이트에서 거절(스폰 없음). force 경로는 실제 스폰이라 여기서 검사하지 않는다.
     #[test]
@@ -3615,85 +3775,36 @@ mod tests {
         }
     }
 
-    /// state는 PID 생존 하나가 아니라 schema+runtime+process identity+authenticated probe의 교집합이다.
     #[test]
-    fn browserd_state_parse_and_liveness() {
-        let dir = std::env::temp_dir().join("cys-browserd-state-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let me = std::process::id();
-        let p1 = dir.join("ok.json");
-        let token = "a".repeat(32);
-        let runtime = "b".repeat(32);
-        let valid = format!(
-            r#"{{"schema_version":2,"pid":{me},"port":51234,"token":"{token}","runtime_id":"{runtime}","process_start_time":123456,"headless":true}}"#
-        );
-        std::fs::write(&p1, &valid).unwrap();
-        let good_identity = |_| {
-            Some(BrowserdProcessIdentity {
-                command: "/runtime/bun run /pack/browserd/server.ts --headless".into(),
-                start_time: 123456,
-            })
-        };
-        assert_eq!(
-            read_browserd_state_with(&p1, good_identity, |_| true),
-            Some((51234, token.clone(), Some(true)))
-        );
-
-        // 같은 PID라도 command/start-time/probe 중 하나가 다르면 모두 stale이다.
-        assert_eq!(
-            read_browserd_state_with(
-                &p1,
-                |_| Some(BrowserdProcessIdentity {
-                    command: "/usr/bin/unrelated-live-process".into(),
-                    start_time: 123456,
-                }),
-                |_| true
-            ),
-            None
-        );
-        assert_eq!(
-            read_browserd_state_with(
-                &p1,
-                |_| Some(BrowserdProcessIdentity {
-                    command: "/runtime/bun run /pack/browserd/server.ts".into(),
-                    start_time: 1,
-                }),
-                |_| true
-            ),
-            None
-        );
-        assert_eq!(
-            read_browserd_state_with(
-                &p1,
-                |_| Some(BrowserdProcessIdentity {
-                    command: "/runtime/bun run /pack/browserd/server.ts".into(),
-                    start_time: 123456,
-                }),
-                |_| false
-            ),
-            None
-        );
-
-        // 살아 있는 테스트 프로세스 PID를 끼운 stale state도 실제 reader에서는 alive가 아니다.
-        assert_eq!(
-            read_browserd_state(&p1),
-            None,
-            "unrelated live PID를 browserd로 오인 금지"
-        );
-
-        for bad in [
-            valid.replace("\"schema_version\":2", "\"schema_version\":1"),
-            valid.replace(&token, "short"),
-            valid.replace("\"port\":51234", "\"port\":0"),
-            valid.replace(&runtime, &"G".repeat(32)),
-            valid.replace("\"headless\":true", "\"headless\":\"yes\""),
-        ] {
-            assert!(
-                parse_browserd_state(&bad).is_none(),
-                "strict schema/token/port/runtime validation"
-            );
-        }
-        assert!(parse_browserd_state("{not json").is_none());
+    fn browser_user_gesture_intent_matches_broker_public_contract() {
+        let intent = browser_user_gesture_intent(
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        assert_eq!(intent["authority_kind"], "user_gesture");
+        assert_eq!(intent["realm"], "shared-default");
+        assert_eq!(intent["mode"], "headless");
+        assert_eq!(intent["window_label"], "main");
+        assert_eq!(intent["pane_nonce"], "a".repeat(64));
+        assert_eq!(intent["gesture_receipt"], "b".repeat(64));
+        assert!(browser_user_gesture_intent("main", "short", &"b".repeat(64)).is_err());
+        let embed = browser_embed_intent(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            7,
+            if cfg!(windows) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            },
+        )
+        .unwrap();
+        assert_eq!(embed["context"], "default");
+        assert_eq!(embed["protocol_version"], 2);
+        assert_eq!(embed["embed_generation"], 7);
+        assert!(embed.get("token").is_none());
     }
 
     /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.
@@ -3761,8 +3872,6 @@ mod tests {
         );
     }
 
-    /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
-    #[test]
     /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
     /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
     /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.

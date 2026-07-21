@@ -13,7 +13,9 @@ class ReleaseCredentialsTests(unittest.TestCase):
         clean_env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("WINDOWS_") and not key.startswith("TAURI_SIGNING_")
+            if not key.startswith("WINDOWS_")
+            and not key.startswith("TAURI_SIGNING_")
+            and not key.startswith("CYS_BROWSER_RUNTIME_")
         }
 
         result = subprocess.run(
@@ -29,12 +31,16 @@ class ReleaseCredentialsTests(unittest.TestCase):
         self.assertIn("WINDOWS_CERTIFICATE_B64", result.stderr)
         self.assertIn("WINDOWS_TIMESTAMP_URL", result.stderr)
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY", result.stderr)
+        self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY", result.stderr)
+        self.assertIn("CYS_BROWSER_RUNTIME_EXPIRES_AT", result.stderr)
 
     def test_macos_release_fails_closed_when_notary_or_signing_inputs_are_missing(self) -> None:
         clean_env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("APPLE_") and not key.startswith("TAURI_SIGNING_")
+            if not key.startswith("APPLE_")
+            and not key.startswith("TAURI_SIGNING_")
+            and not key.startswith("CYS_BROWSER_RUNTIME_")
         }
 
         result = subprocess.run(
@@ -50,16 +56,22 @@ class ReleaseCredentialsTests(unittest.TestCase):
         self.assertIn("APPLE_CERTIFICATE_B64", result.stderr)
         self.assertIn("APPLE_SIGNING_IDENTITY", result.stderr)
         self.assertIn("APPLE_PASSWORD", result.stderr)
+        self.assertIn("CYS_BROWSER_RUNTIME_PUBLIC_KEY", result.stderr)
 
     def test_satisfied_contract_never_prints_secret_values(self) -> None:
-        secret = "do-not-print-this-value"
+        redaction_sentinel = "redaction-sentinel-value"
         env = {
             **os.environ,
-            "WINDOWS_CERTIFICATE_B64": secret,
-            "WINDOWS_CERTIFICATE_PASSWORD": secret,
-            "WINDOWS_EXPECTED_PUBLISHER": secret,
+            "WINDOWS_CERTIFICATE_B64": redaction_sentinel,
+            "WINDOWS_CERTIFICATE_PASSWORD": redaction_sentinel,
+            "WINDOWS_EXPECTED_PUBLISHER": redaction_sentinel,
             "WINDOWS_TIMESTAMP_URL": "https://timestamp.invalid",
-            "TAURI_SIGNING_PRIVATE_KEY": secret,
+            "TAURI_SIGNING_PRIVATE_KEY": redaction_sentinel,
+            "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
+            "CYS_BROWSER_RUNTIME_KEY_ID": "39E60A702949D6C3",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH": "1",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT": "1893455999",
         }
 
         result = subprocess.run(
@@ -72,7 +84,7 @@ class ReleaseCredentialsTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertNotIn(redaction_sentinel, result.stdout + result.stderr)
         self.assertIn("values redacted", result.stdout)
 
     def test_rfc3161_timestamp_endpoint_must_use_https(self) -> None:
@@ -83,6 +95,11 @@ class ReleaseCredentialsTests(unittest.TestCase):
             "WINDOWS_EXPECTED_PUBLISHER": "present",
             "WINDOWS_TIMESTAMP_URL": "http://timestamp.invalid",
             "TAURI_SIGNING_PRIVATE_KEY": "present",
+            "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
+            "CYS_BROWSER_RUNTIME_KEY_ID": "39E60A702949D6C3",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH": "1",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT": "1893455999",
         }
 
         result = subprocess.run(

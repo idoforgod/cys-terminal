@@ -32,10 +32,48 @@ artifact**로만 넘긴다. 공개 저장소의 Actions artifact는 읽기 권�
   `WINDOWS_EXPECTED_PUBLISHER`, `TAURI_SIGNING_PRIVATE_KEY`
 - Windows variable: `WINDOWS_TIMESTAMP_URL`(HTTPS RFC3161 TSA)
 - 공통 secret: `RELEASE_HANDOFF_KEY`(무작위 32자 이상, 공개 저장소 Actions handoff 암호화)
+- Browser Runtime 공통 secrets: `CYS_BROWSER_RUNTIME_SECRET_KEY_B64`,
+  `CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64`, `CYS_BROWSER_RUNTIME_KEY_ID`,
+  `CYS_BROWSER_RUNTIME_POLICY_EPOCH`, `CYS_BROWSER_RUNTIME_EXPIRES_AT`. 앞의 두 값은 minisign
+  키 파일 전체 바이트의 base64이며, workflow가 러너 임시 디렉터리에만 복원하고 항상 삭제한다.
+  key id와 public key는 바이너리에 컴파일된 active/non-revoked 신뢰근원과 일치해야 한다.
+
+GitHub 저장소 설정도 코드 밖의 차단 게이트다. 공개 승격 전에 다음 조회가 성공하고,
+`release-production` Environment에 required reviewers와 publish용 secrets가 설정되어 있어야 한다.
+404/빈 protection rule이면 태그·draft를 공개하지 않는다.
+
+```sh
+gh api repos/idoforgod/cys-terminal/environments/release-production \
+  --jq '{name:.name, protection_rules:.protection_rules}'
+```
 
 입력이 하나라도 비거나 형식이 잘못되면 빌드를 시작하지 않는다. macOS arm64/x64는 각각 앱과
 DMG 공증 제출·staple·Gatekeeper 검증을 통과해야 한다. Windows sidecar와 NSIS 설치 파일은
 SHA-256 Authenticode 서명, HTTPS RFC3161 타임스탬프, 게시자 일치 검증을 통과해야 한다.
+
+### Browser Runtime 소스·스테이징·서명 계약
+
+`release/browser-runtime-sources.json`이 Rust 1.95.0, Bun 1.3.8, Playwright 1.49.1과
+세 플랫폼의 Bun compiler 및 Chromium 131.0.6778.33 headless-shell archive를 URL·바이트 수·
+SHA-256으로 고정한다. 릴리스 잡은 태그의 동일 source object에서 supervisor와 engine을 빌드하고,
+archive 경로·형식·크기·대상 아키텍처·라이선스를 검증해 Tauri resource tree에 원자적으로
+stage하며 archive 안의 symbolic link는 내부 상대경로라도 전부 거부한다. 전체 `Chromium.app`
+archive는 framework symlink를 실파일로 펼쳤을 때 서명 bundle이
+모호해지는 것이 확인되어 사용하지 않는다. 제품 런타임은 headless CDP이므로 symlink가 없는 공식
+Playwright headless-shell archive를 사용한다.
+
+순서는 반드시 **stage → 플랫폼 코드 서명/검증 → 최종 파일·트리 hash 계산 → minisign
+attestation/policy 생성·검증 → Tauri bundle**이다. macOS는 staged tree의 모든 Mach-O를
+Developer ID hardened-runtime으로 inside-out 서명하고, Windows는 모든 EXE/DLL을 SHA-256
+Authenticode와 RFC3161 timestamp로 서명·검증한다. 코드 서명이 바이트를 바꾸므로 이보다 앞서
+생성한 runtime hash는 출시 근거가 될 수 없다.
+
+Bun standalone compiler는 source 절대경로를 결과물에 포함할 수 있으므로 이 계약은 서로 다른
+workspace 사이의 byte-for-byte 재현성을 주장하지 않는다. 대신 source·도구체인·입력을 고정하고,
+해당 릴리스에서 실제로 생성·플랫폼 서명된 출력 digest를 최종 runtime metadata에 묶어 minisign한다.
+로컬 macOS arm64에서 stage 후 Developer ID 검증과 실제 persistent-context 첫 페이지 smoke가
+통과했지만, macOS 두 target의 공증 DMG와 Windows CI Authenticode/NSIS 결과는 매 릴리스의 독립
+필수 게이트이며 문서상의 로컬 증거로 대체할 수 없다.
 
 ### 바이너리 릴리스의 정확한 공개 자산 14개
 

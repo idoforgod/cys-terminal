@@ -10,6 +10,10 @@ PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "release-publish.yml"
 PACK_WORKFLOW = ROOT / ".github" / "workflows" / "pack-release.yml"
 MACOS_BUILD = ROOT / "scripts" / "build-macos-signed.sh"
 WINDOWS_SIGN = ROOT / "scripts" / "windows-authenticode.ps1"
+BROWSER_RUNTIME_SOURCES = ROOT / "release" / "browser-runtime-sources.json"
+WINDOWS_BUILD = ROOT / "scripts" / "build-windows-signed.ps1"
+BROWSER_MAC_SIGN = ROOT / "scripts" / "runtime-stage-sign-macos.sh"
+BROWSER_WINDOWS_SIGN = ROOT / "scripts" / "runtime-stage-sign-windows.ps1"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -79,6 +83,81 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn(required, windows)
         self.assertIn("TimeStamperCertificate", windows)
         self.assertIn("Get-AuthenticodeSignature", windows)
+
+    def test_browser_runtime_release_credentials_and_minisign_are_wired_for_every_target(self) -> None:
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        for name in (
+            "CYS_BROWSER_RUNTIME_SECRET_KEY",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY",
+            "CYS_BROWSER_RUNTIME_KEY_ID",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT",
+        ):
+            self.assertGreaterEqual(candidate.count(name), 2, f"missing cross-platform wiring: {name}")
+        self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY_B64", candidate)
+        self.assertIn("CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64", candidate)
+        self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign --version"))
+        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign --version"))
+
+    def test_browser_runtime_is_built_and_staged_from_pinned_sources_before_signing(self) -> None:
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        sources = json.loads(BROWSER_RUNTIME_SOURCES.read_text(encoding="utf-8"))
+
+        self.assertEqual(sources["schema_version"], 1)
+        self.assertEqual(set(sources["targets"]), {
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        })
+        for target, assets in sources["targets"].items():
+            self.assertTrue(assets["chromium_archive_url"].startswith("https://"), target)
+            self.assertRegex(assets["chromium_archive_sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(assets["chromium_archive_bytes"], 50_000_000)
+            self.assertTrue(assets["chromium_required_files"])
+            self.assertTrue(assets["bun_compiler_archive_url"].startswith("https://"), target)
+            self.assertRegex(assets["bun_compiler_archive_sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(assets["bun_compiler_archive_bytes"], 20_000_000)
+            self.assertTrue(assets["bun_compiler_member"])
+        serialized = json.dumps(sources)
+        self.assertNotIn("example.invalid", serialized)
+        self.assertNotIn("placeholder", serialized.lower())
+
+        self.assertIn("BROWSER_RUST_TOOLCHAIN: '1.95.0'", candidate)
+        self.assertIn("BROWSER_BUN_VERSION: '1.3.8'", candidate)
+        self.assertIn("cargo build --locked --release --target", candidate)
+        for bun_target in ("bun-darwin-arm64", "bun-darwin-x64", "bun-windows-x64"):
+            self.assertIn(bun_target, candidate)
+        self.assertIn("scripts/runtime-stage.py", candidate)
+        self.assertIn("scripts/runtime-stage-toolchain.py", candidate)
+        self.assertIn("--compile-executable-path=\"$BUN_COMPILER\"", candidate)
+        self.assertIn("release/browser-runtime-sources.json", candidate)
+        self.assertIn("src-tauri/resources/browser-runtime", candidate)
+        self.assertLess(
+            candidate.index("Stage verified Browser Runtime"),
+            candidate.index("Build, notarize, staple and normalize macOS candidate"),
+        )
+
+    def test_browser_runtime_platform_signing_precedes_final_metadata_hashes(self) -> None:
+        macos = MACOS_BUILD.read_text(encoding="utf-8")
+        windows = WINDOWS_BUILD.read_text(encoding="utf-8")
+        mac_sign = BROWSER_MAC_SIGN.read_text(encoding="utf-8")
+        win_sign = BROWSER_WINDOWS_SIGN.read_text(encoding="utf-8")
+
+        self.assertLess(
+            macos.index("runtime-stage-sign-macos.sh"),
+            macos.index("browser-runtime-metadata.py prepare"),
+        )
+        self.assertLess(
+            windows.index("runtime-stage-sign-windows.ps1"),
+            windows.index("browser-runtime-metadata.py prepare"),
+        )
+        for required in ("codesign --force", "--timestamp", "--options runtime", "codesign --verify"):
+            self.assertIn(required, mac_sign)
+        self.assertIn("find \"$TARGET_ROOT\"", mac_sign)
+        self.assertRegex(win_sign, re.compile(r"windows-authenticode\.ps1\"? -Mode Sign"))
+        self.assertRegex(win_sign, re.compile(r"windows-authenticode\.ps1\"? -Mode Verify"))
+        self.assertIn("*.exe", win_sign)
+        self.assertIn("*.dll", win_sign)
 
 
 if __name__ == "__main__":

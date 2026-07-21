@@ -11,6 +11,7 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 
 - `baseline`: behavior existed at v0.13.1 and is protected by a named test.
 - `slice-green`: implemented in the current Browser v2 vertical slice with a public-interface test.
+- `implementation-under-re-audit`: source implementation exists, but independent re-audit has not accepted it.
 - `deferred-P0`: required before Browser v2 release; not implemented by the current packet.
 - `release-gate`: evidence must come from packaged or remote artifacts, not a unit test.
 - `freeze`: byte/behavior preservation contract; Browser work may not alter the owning subsystem.
@@ -23,12 +24,13 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-G02 | Internet content executes only in isolated Chromium; Tauri receives pixels and sends validated input. | browserd CDP/cast + sandbox iframe | browserd integration + packaged security E2E | baseline |
 | B2-G03 | `SHELL_READY`, painted `FRAME_READY`, `LIVE`, `DEGRADED`, `FAILED`, and `CLOSED` are distinct; spawn/load is never success. | protocol/state machine | state-transition unit + child protocol test; packaged first-frame E2E | slice-green; packaged paint evidence remains release-gate |
 | B2-G04 | Only HTTP/HTTPS navigation is permitted for product browsing. | browserd navigation policy | initial, redirect, popup, external-protocol, download tests | slice-green; internal `about:blank` is private and URL-less |
-| B2-G05 | Browser startup is lazy: boot and layout restore perform state lookup only; explicit globe/reconnect may start it. | UI → Tauri runtime manager | restore/boot process census | baseline UI behavior; runtime-manager migration deferred-P0 |
-| B2-G06 | Official builds do not require user Bun, `node_modules`, or system Chrome. | signed browser runtime bundle | clean HOME/PATH packaged E2E | deferred-P0; ADR-0002 |
-| B2-G07 | GUI, browserd protocol/build, and Chromium build form one compatibility unit. | runtime manifest + compatibility gate | skew matrix | deferred-P0 |
-| B2-G08 | Browser failure cannot stop cysd, PTYs, organization boot, or terminal panes. | lifecycle isolation | failure-injection packaged E2E | release-gate |
-| B2-G09 | The default pane is the shared `default` agent context and is labelled as shared; human profile is never cast. | session/control + GUI | control/profile integration tests | baseline server gate; label E2E deferred-P0 |
-| B2-G10 | Human control blocks agent mutations until explicit handoff or lease expiry. | context arbiter | concurrent human/agent integration | baseline; generation-safe lease audit deferred-P0 |
+| B2-G05 | Browser startup is lazy: boot and layout restore perform state/embed lookup only; explicit globe/reconnect may start it. | UI → Tauri adapter → lazy cysd authority broker | `passive_probe_never_launches_or_writes`, authority broker single-flight tests; restore/boot process census | slice-green; packaged census remains release-gate |
+| B2-G06 | Official builds do not require user Bun, `node_modules`, or system Chrome. | signed browser runtime bundle | strict absolute Chromium-path test, executable/tree mutation tests; clean-machine packaged E2E | runtime code slice-green; actual target bundle evidence release-gate; ADR-0002 |
+| B2-G07 | GUI, browserd protocol/build, and Chromium build form one compatibility unit. | runtime manifest + compatibility gate | manifest identity tests + packaged skew matrix | slice-green contract; packaged skew matrix release-gate |
+| B2-G08 | Browser failure cannot stop cysd, PTYs, organization boot, or terminal panes. | lifecycle isolation | bounded one-at-a-time Browser worker, immediate backpressure, timeout cancellation and real-child reap tests; failure-injection packaged E2E | implementation-under-re-audit; packaged cysd/PTY/process evidence remains release-gate |
+| B2-G09 | The default pane is the shared `default` agent context and is labelled as shared; human profile is never cast. | session/control + GUI | control/profile integration tests + packaged label E2E | slice-green; packaged label evidence release-gate |
+| B2-G10 | Human control blocks agent mutations until explicit handoff or lease expiry. | context arbiter | concurrent human/agent integration | slice-green including pane/session/generation lease ownership |
+| B2-G11 | Runtime start from the GUI requires a registered signed app identity and a trusted, short-lived native activation; UI assertions and iframe messages are not authority. | kernel peer PID → signed/canonical GUI registration → lexical Tauri initialization capability → one-time cysd receipt | basename-spoof/PID-incarnation/replay tests, native window/TTL/single-consume tests, no-postMessage-ensure UI contract | implementation-under-re-audit; packaged macOS designated-requirement, Windows Authenticode signer parity and physical click-to-start evidence remain release-gates |
 
 ## Cast Protocol v2
 
@@ -44,19 +46,20 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-P08 | A dropped, evicted, detached, or rendered frame is eventually acked so CDP cannot stall. | `LatestFrameFlow` integration | stream/resize/rebind integration | slice-green; full browserd integration green |
 | B2-P09 | A transient zero-client interval keeps the cast session through a bounded reconnect grace. | `reconnectGraceDecision` + server timer | unit + disconnect/reconnect integration | slice-green; timed integration green |
 | B2-P10 | Each client has at most one outstanding render and paints before sending `ack(fid)`. | `cysjavis-pack/browserd/server.ts` frameRecipients + `cysjavis-pack/browserd/cast.ts` CAST_APP_HTML | slow-client browser E2E | server rejects stale/duplicate/non-recipient ack; per-client slow-client E2E remains deferred-P0 |
-| B2-P11 | One-time embed credentials are TTL-bound to runtime instance/context/embed generation and cannot be replayed. | `CastEmbedTicketRegistry`, app GET issue → WS consume | unit + real WS replay/legacy-bypass integration | slice-green |
+| B2-P11 | One-time embed credentials are broker-pre-registered over an inherited-session-key-authenticated private channel, TTL-bound to runtime/context/embed generation/pane/origin, opened by exactly one app GET and consumed by exactly one WS. No control or cast token is returned in `EmbedDescriptor`. | broker `prepare_embed`, `CastEmbedTicketRegistry` | request-MAC tamper tests, exact preregistration/header/DTO test, GET/WS replay integration | slice-green; packaged exact-origin E2E release-gate |
 
 ## Runtime, persistence, and resource lifecycle
 
 | ID | Requirement / invariant | Evidence | Status |
 |---|---|---|---|
-| B2-R01 | Tauri `BrowserRuntimeManager` is the sole production lifecycle owner; Python remains a compatibility adapter and never independently races a spawn. | lifecycle concurrency tests | deferred-P0 |
-| B2-R02 | Production uses verified absolute paths and a signed runtime manifest; external Bun fallback is development-only. | clean-machine package inspection | deferred-P0; ADR-0002 |
+| B2-R01 | The lazy cysd authority broker is the sole public lifecycle owner; its private supervisor owns process/lock state. Disk JSON alone is never authority: a live runtime must match the broker-retained session, state MAC, exact PID incarnation and authenticated health response. The authenticated endpoint is returned as one immutable snapshot; dead sessions/keys are pruned from a hard-bounded registry. Tauri, `cys`, and Python are adapters and never independently race a spawn. | disk-state denial, endpoint replacement-race regression, state-MAC/PID-incarnation validation, crash-loop cleanup, restart single-flight and supervisor-lock tests | implementation-under-re-audit; packaged process/key-lifecycle census remains release-gate; ADR-0002 |
+| B2-R02 | Production uses verified absolute paths, a hash of the complete Chromium tree, and minisign-verified runtime attestation/policy bytes rooted in the compiled active/non-revoked keyring. External Bun/Chrome fallback is development-only. | strict path/tree-mutation and minisign trust-root tests; `release/browser-runtime-sources.json` pins exact Rust/Bun/Playwright/headless-shell inputs; atomic stage rejects digest/size/path/link/type/architecture/license drift; platform code signing precedes final metadata hashes | implementation-under-re-audit; both notarized macOS target bundles, Windows Authenticode/NSIS and installed-artifact proof remain release-gates; ADR-0002 |
 | B2-R03 | Layout persistence never stores token, port, ticket, or live generation; restore reconstructs a pending descriptor. | `webpane.test.ts` | slice-green |
-| B2-R04 | Retry is single-flight, bounded by attempts and wall time, cancellable on pane close, and never runs from passive restore. | `src/browser_runtime/lifecycle.rs` + unit tests in `src/browser_runtime/mod.rs` | typed policy contract green; Tauri single-flight/pane-close integration remains deferred-P0 |
+| B2-R04 | Retry is single-flight, bounded by attempts and wall time, cancellable on pane close, and never runs from passive restore. | broker mutex + `src/browser_runtime/lifecycle.rs` + UI generation/dispose guards | typed policy/single-flight green; pane-close packaged integration release-gate |
 | B2-R05 | Reconnect grace precedes screencast/CDP release; final idle lease reclaims browser resources without killing cysd/PTYs. | process/CDP census | slice-green grace; idle packaged evidence deferred-P0 |
 | B2-R06 | Runtime update is stage → signature/hash verify → atomic select → health → commit/rollback journal. | `src/browser_runtime/lifecycle.rs` + unit tests in `src/browser_runtime/mod.rs` | typed journal contract green; filesystem/update integration remains deferred-P0 |
 | B2-R07 | Rollback never mutates a signed app bundle in place or falls back to an unqualified external runtime. | signed rollback drill | deferred-P0; ADR-0004 |
+| B2-R08 | The public `cys browser` compatibility command targets the shared in-pane context; headful-only development verbs never report production success without a visible window. | CLI/adapter tests + observe runbook | slice-green |
 
 ## Freeze zones and release integrity
 
@@ -66,11 +69,34 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-F02 | Runtime PATH ordering, bundled Node/npm/npx/Python/Git, Unix `~/.local/bin`, and fresh Windows user PATH remain unchanged. | `cargo test --lib`; byte-equivalent PATH snapshot | freeze |
 | B2-F03 | Claude installed into `~/.local/bin` is found in the same pane without restart; Codex/Antigravity adapters remain discoverable. | clean HOME installation E2E | freeze; release-gate |
 | B2-F04 | User-owned agent configuration, bare-shell reinject skip, and role-declaration bootstrap order remain unchanged. | pack/boot regression suites | freeze |
-| B2-F05 | Browser code never changes process-global PATH, PTY creation, cysd boot, or organization topology. | `git diff -- src src-tauri` for this packet + regression suite | freeze |
+| B2-F05 | Browser code never changes process-global PATH, PTY creation, cysd boot, or organization topology. | freeze-zone diff audit (`src/bin/cysd/governance.rs` must be byte-identical to HEAD), PATH/PTY/boot regression suites | freeze |
 | B2-L01 | Two notarized/stapled macOS DMGs, Windows installer, Windows ZIP, complete SHA256SUMS, and one promoted download manifest represent the same version. | artifact manifest + remote verification | release-gate |
 | B2-L02 | Windows downloads retain the Defender guidance section and remote verification asserts its presence. | local and remote content grep | release-gate |
 | B2-L03 | Release requires independent adversarial review and dependency/packaging audit; producer self-score is not acceptance. | reviewer 1/2 evidence bundle | release-gate |
 
-## Current packet boundary
+## Current implementation boundary
 
-This packet may change browserd cast/server code, web-pane browser wiring, tests, and Browser v2 documentation. It must not implement the Tauri runtime sidecar or edit release workflows/assets. It must not change `src/`, `src-tauri/`, `cysjavis-pack/bin/javis_browser.py`, PATH/PTY/onboarding/pack bootstrap logic, or user-owned configuration semantics.
+The earlier protocol-only packet boundary is superseded by the owner-authorized Browser v2 implementation scope. Browser runtime, Tauri adapter, UI, browserd and release-contract files may change together when traced in this ledger. This wording does not assert release completion: packaged first-frame/slow-client/idle/update/rollback tests, qualified target resources, signed/notarized artifacts and remote promotion remain explicit blockers above. PATH synthesis, PTY creation, ordinary-pane ordering, onboarding, pack reinject, organization bootstrap and user-owned configuration remain freeze zones: Browser work may test them but must not change their semantics.
+
+The accepted simulation contracts are versioned in `docs/browser-v2/SIMULATION-CONTRACTS-2026-07-21.md`. A `slice-green` status never substitutes for packaged, signed, notarized, OS-specific or remote release evidence.
+
+## Round 2 verification snapshot
+
+The following source-level evidence was reproduced on 2026-07-21. Counts are test cases, not assertions.
+
+| Command / gate | Result |
+|---|---|
+| browserd `bun run test`, serial canonical run 1 and run 2 | 93/93 each, exit 0 |
+| UI `bun test` + `bun run build` | 178/178 + production bundle, exit 0 |
+| `cargo test -p cys-browserd --lib` | 3/3, exit 0 |
+| cysd Browser cancellation/runtime/signer focused suites | 4/4 + 6/6 + 1/1, exit 0 |
+| cysd serial regression | 465/465, exit 0; pre-existing host `hwmon::` tests and `governance::tests::corrupt_topology_isolated_not_silently_empty` (reads the real user generation root) were explicitly excluded |
+| root library / `cys` / `cys-app` | prior snapshot 150/150 + 88/88; current `cys-app` 32/32, exit 0 |
+| release-script canonical discovery | 46/46, exit 0 |
+| Python Browser adapter | 4/4, exit 0 |
+| Browser negative gate | all assertions passed, exit 0 |
+| eight primary Browser Rust modules (`supervisor`, Tauri, cysd broker/launcher/main, runtime lifecycle/mod/path) `rustfmt --check`; Python/Bash/PowerShell syntax; `git diff --check` | exit 0 |
+| full tracked-tree secret scan | 731 files, clean, exit 0 |
+| `src/bin/cysd/governance.rs` freeze check | HEAD and working-tree SHA-256 both `ca932b0abb344ec40267f1045102857c866727b5c1914e5604e106f591bc09b3` |
+
+This snapshot is not packaged-release evidence. `src-tauri/resources/browser-runtime/` still requires qualified per-target runtime bytes and the external `release-production` GitHub Environment must exist with its protection rules and credentials before candidate/publish workflows can pass.

@@ -83,12 +83,15 @@ test("CastEmbedTicketRegistry — runtime/context/generation 결합, TTL, WS 1�
 
   expect(registry.issue(base, 1_000)).toBe("issued");
   expect(registry.issue(base, 1_001)).toBe("duplicate"); // iframe URL replay도 거부
+  expect(registry.openApp(base, 1_001)).toBe("accepted");
+  expect(registry.openApp(base, 1_002)).toBe("replayed"); // stale descriptor cannot mint another WS ticket
   expect(registry.consume({ ...base, embedGeneration: 8 }, 1_002)).toBe("mismatch");
   expect(registry.consume({ ...base, paneId: "other".padEnd(64, "b") }, 1_002)).toBe("mismatch");
   expect(registry.consume(base, 1_003)).toBe("accepted");
   expect(registry.consume(base, 1_004)).toBe("replayed");
 
   const expired = { ...base, ticket: "B".repeat(43), embedGeneration: 8 };
+  expect(registry.openApp(expired, 1_999)).toBe("missing");
   expect(registry.issue(expired, 2_000)).toBe("issued");
   expect(registry.consume(expired, 17_000)).toBe("expired"); // 경계값은 만료
   expect(registry.size).toBeLessThanOrEqual(32);

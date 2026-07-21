@@ -788,6 +788,7 @@ version = "0.13.1"
 dependencies = [
  "base64 0.22.1",
  "cys-terminal",
+ "getrandom 0.3.4",
  "libc",
  "serde",
  "serde_json",
@@ -807,6 +808,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cys-terminal",
+ "hmac",
  "libc",
  "serde",
  "serde_json",
@@ -840,6 +842,7 @@ dependencies = [
  "tokio",
  "vt100",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

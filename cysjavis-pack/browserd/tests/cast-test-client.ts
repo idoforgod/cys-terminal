@@ -10,6 +10,7 @@ export interface IssuedCastEmbed {
   generation: number;
   parentOrigin: string;
   paneId: string;
+  contentSecurityPolicy: string;
 }
 
 // 실제 GUI와 같은 app GET(issue) → WS(consume) 순서를 테스트에서 재사용한다. bare WS 우회는 없다.
@@ -40,5 +41,6 @@ export async function issueCastEmbed(
     generation,
     parentOrigin,
     paneId,
+    contentSecurityPolicy: response.headers.get("content-security-policy") || "",
   };
 }

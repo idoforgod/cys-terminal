@@ -74,6 +74,29 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   exit 2
 fi
 
+# Browser Runtime qualification is a signed release input, never a mutable
+# manifest flag. Hash every executable/tree and verify the freshly generated
+# attestation/policy signatures before Tauri can copy resources into the app.
+: "${CYS_BROWSER_RUNTIME_SECRET_KEY:?Browser Runtime minisign secret-key path required}"
+: "${CYS_BROWSER_RUNTIME_PUBLIC_KEY:?Browser Runtime minisign public-key path required}"
+: "${CYS_BROWSER_RUNTIME_KEY_ID:?Browser Runtime trust-root key id required}"
+: "${CYS_BROWSER_RUNTIME_POLICY_EPOCH:?Browser Runtime policy epoch required}"
+: "${CYS_BROWSER_RUNTIME_EXPIRES_AT:?Browser Runtime metadata expiry epoch required}"
+# Signing mutates every executable/tree digest. It must complete before the
+# final runtime lock hashes, attestation and policy minisign files are emitted.
+bash scripts/runtime-stage-sign-macos.sh "$TARGET"
+python3 scripts/browser-runtime-metadata.py prepare \
+  --resource-root src-tauri/resources/browser-runtime \
+  --target "$TARGET" \
+  --key-id "$CYS_BROWSER_RUNTIME_KEY_ID" \
+  --secret-key "$CYS_BROWSER_RUNTIME_SECRET_KEY" \
+  --public-key "$CYS_BROWSER_RUNTIME_PUBLIC_KEY" \
+  --trusted-keys cysjavis-pack/trusted-keys.json \
+  --tauri-config src-tauri/tauri.conf.json \
+  --policy-epoch "$CYS_BROWSER_RUNTIME_POLICY_EPOCH" \
+  --expires-at "$CYS_BROWSER_RUNTIME_EXPIRES_AT"
+export CYS_BROWSER_V2_RELEASE_QUALIFIED=1
+
 # ── 동봉 런타임 준비 + inside-out 재서명 (RC-22/T6b — 공증 필수) ──
 # tauri.conf.json bundle.resources("runtime/")는 Contents/Resources/runtime 으로 실리지만 Tauri는
 # resources 내 Mach-O를 자동 서명하지 않는다(#12001) → ad-hoc(python·uv)/타팀(node) 서명 그대로면

@@ -223,7 +223,7 @@ async function withServer(
   const fixture = startFixtureServer();
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
     cwd: BROWSERD_DIR,
-    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
+    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1", CYS_BROWSER_DEV: "1" },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -307,6 +307,21 @@ async function waitHumanLease(msgs: any[], ms = 10000): Promise<string> {
     await sleep(50);
   }
   throw new Error("human control lease 대기 타임아웃");
+}
+
+async function waitCollected(
+  msgs: any[],
+  pred: (message: any) => boolean,
+  ms: number,
+  label: string,
+): Promise<any> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const found = [...msgs].reverse().find(pred);
+    if (found) return found;
+    await sleep(50);
+  }
+  throw new Error(`타임아웃 수집 대기: ${label}`);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -816,16 +831,9 @@ test("W-B wirePage 멱등: 채택 경로가 두 번 돌아도 콘솔이 2배가 
 test("W-C 뷰포트: pane 크기 반영 + mapInput 정합 + 면적 캡 + 고정/해제", async () => {
   await withServer("p3-vp-", async ({ port, token, fx, sockets }) => {
     expect((await rpc(port, token, "open", { url: `${fx}/click` })).ok).toBe(true);
-    const ws = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
-    sockets.push(ws);
-    expect(await wsOpen(ws, 10000)).toBe(true);
+    const { ws, frames: vpFrames, msgs } = await connectCast(port, token, sockets);
     let lastMeta: any = null;
-    const vpFrames: any[] = [];
-    autoAck(ws, (m) => {
-      lastMeta = m.metadata;
-      vpFrames.push(m); // ★수집 — "지금부터 올 메시지"만 보면 이미 지나간 프레임을 영영 기다린다
-    });
-    await nextMsg(ws, (m) => m.type === "frame", 25000, "첫 프레임");
+    lastMeta = vpFrames[vpFrames.length - 1].metadata;
     expect(lastMeta.deviceWidth).toBe(1280);
     // ※옛 주석은 "metadata.deviceHeight 는 CSS 뷰포트보다 일정하게 작다(렌더 위젯 높이)"고 적어
     //   **결함을 정상 특성으로 못박고 있었다**. 그 차이가 곧 하단 143px 잘림이었다(세션별 emulation
@@ -833,7 +841,8 @@ test("W-C 뷰포트: pane 크기 반영 + mapInput 정합 + 면적 캡 + 고정/
 
     // ① 사람 pane 리사이즈 → 페이지가 실제로 그 크기로 레이아웃된다(1280×800 고정 탈피)
     ws.send(JSON.stringify({ type: "viewport", width: 900, height: 600 }));
-    await waitFrame(vpFrames, (md) => md.deviceWidth === 900, 20000, "meta 가로 900");
+    const resized = await waitFrame(vpFrames, (md) => md.deviceWidth === 900, 20000, "meta 가로 900");
+    lastMeta = resized.metadata;
     const inner = await rpc(port, token, "eval", { expression: "window.innerWidth + 'x' + window.innerHeight" });
     console.log(`[W-C ①] inner=${inner.result.result} meta=${lastMeta.deviceWidth}x${lastMeta.deviceHeight}`);
     expect(inner.result.result).toBe("900x600");
@@ -1027,7 +1036,7 @@ test("CLI: 사용례 오류는 exit 9(BUSY 2와 비충돌) + 신규 인자가 �
   const fx = `http://127.0.0.1:${fixture.port}`;
   const run = async (args: string[]) => {
     const p = Bun.spawn(["python3", CLI, "--headless", ...args], {
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, CYS_BROWSER_DEV: "1" },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1086,7 +1095,7 @@ test("CLI: 사용례 오류는 exit 9(BUSY 2와 비충돌) + 신규 인자가 �
     const tabs = await run(["tab", "list"]);
     expect(tabs.code).toBe(0);
   } finally {
-    await Bun.spawn(["python3", CLI, "stop"], { env: { ...process.env, HOME: home }, stdout: "ignore", stderr: "ignore" }).exited;
+    await Bun.spawn(["python3", CLI, "stop"], { env: { ...process.env, HOME: home, CYS_BROWSER_DEV: "1" }, stdout: "ignore", stderr: "ignore" }).exited;
     fixture.stop(true);
     try {
       rmSync(home, { recursive: true, force: true });
@@ -1151,7 +1160,7 @@ test("dialog: control=agent 는 자동 dismiss · control=human 은 사람에게
     mouse("pressed"); // ★이 입력이 조작권을 human 으로 만든다(서버가 CDP 전달 전에 acquire 한다)
     mouse("released");
     const leaseId = await waitHumanLease(msgs);
-    const dlg = await nextMsg(ws, (m) => m.type === "dialog", 12000, "dialog 렌더");
+    const dlg = await waitCollected(msgs, (m) => m.type === "dialog", 12000, "dialog 렌더");
     expect((await ctxOf(port, token))?.control).toBe("human"); // 클릭이 조작권을 먼저 가져갔다
     console.log(`[4-T-12] kind=${dlg.kind} message=${dlg.message}`);
     expect(dlg.kind).toBe("confirm");
@@ -1302,11 +1311,25 @@ test("P1-2/F2 rebind 사후 정리 + fid 프로세스 수명 단조: 전 클라�
     rpc(port, token, "tab", { action: "activate", id: ids[0] }).catch(() => {});
     a.ws.close();
     await sleep(2000);
-    const cs = await castOf(port, token);
-    console.log(`[P1-2] 이탈 후 hubs=${cs.hubs} clients=${cs.clients} started=${cs.started} stopped=${cs.stopped}`);
-    expect(cs.hubs).toBe(0); // 고아 hub 없음
-    expect(cs.clients).toBe(0);
-    expect(cs.stopped).toBe(cs.started); // screencast 도 함께 내려갔다(클라이언트 0인데 도는 세션 금지)
+    const duringGrace = await castOf(port, token);
+    console.log(`[P1-2] grace 중 hubs=${duringGrace.hubs} clients=${duringGrace.clients} started=${duringGrace.started} stopped=${duringGrace.stopped}`);
+    expect(duringGrace.hubs).toBe(1); // 순간 단절은 reconnect grace 동안 세션 의미를 보존한다.
+    expect(duringGrace.clients).toBe(0);
+    expect(duringGrace.stopped).toBe(duringGrace.started); // rebind 중 고아 screencast는 즉시 정리한다.
+
+    // grace 경계 뒤에는 hub와 CDP가 모두 회수돼야 한다. 고정 sleep 한 번으로 타이머 스케줄링
+    // 지연을 오판하지 않고, public status가 CLOSED 자원 상태로 수렴할 때까지 bounded poll한다.
+    const cleanupDeadline = Date.now() + RECONNECT_GRACE_MS + 3000;
+    let afterGrace = duringGrace;
+    while (Date.now() < cleanupDeadline) {
+      afterGrace = await castOf(port, token);
+      if (afterGrace.hubs === 0 && afterGrace.clients === 0 && afterGrace.stopped === afterGrace.started) break;
+      await sleep(100);
+    }
+    console.log(`[P1-2] grace 후 hubs=${afterGrace.hubs} clients=${afterGrace.clients} started=${afterGrace.started} stopped=${afterGrace.stopped}`);
+    expect(afterGrace.hubs).toBe(0);
+    expect(afterGrace.clients).toBe(0);
+    expect(afterGrace.stopped).toBe(afterGrace.started);
 
     // ★F2: hub 가 삭제됐다 재생성돼도 fid 는 프로세스 수명 동안 이어진다(hub 필드였다면 0부터).
     const b = await connectCast(port, token, sockets);
@@ -1322,15 +1345,10 @@ test("P1-2/F2 rebind 사후 정리 + fid 프로세스 수명 단조: 전 클라�
 test("P1-3 CSP 회귀 핀: cast 앱 응답 헤더의 exfil 차단 조각이 그대로 유지된다", async () => {
   await withServer("p3-csp-", async ({ port, token }) => {
     const parentOrigin = process.platform === "win32" ? "http://tauri.localhost" : "tauri://localhost";
-    const query = new URLSearchParams({
-      protocolVersion: "2",
-      embedGeneration: "1",
-      parentOrigin,
-      embedTicket: "a".repeat(64),
-    });
-    const res = await fetch(`http://127.0.0.1:${port}/${token}/cast/?${query}`);
-    expect(res.status).toBe(200);
-    const csp = res.headers.get("content-security-policy") || "";
+    // 실제 GUI와 같은 token-protected app GET이 ticket을 발급한다. 임의 ticket으로 GET 200을
+    // 기대하면 one-time credential 계약을 우회하므로, 최초 발급 응답의 CSP를 그대로 검사한다.
+    const issued = await issueCastEmbed(port, token);
+    const csp = issued.contentSecurityPolicy;
     console.log(`[P1-3] CSP=${csp}`);
     expect(csp).toContain("default-src 'none'"); // 기본 전면 차단
     expect(csp).toContain("img-src data:"); // ★프레임은 data: 만 — https: 가 붙으면 exfil 이 열린다

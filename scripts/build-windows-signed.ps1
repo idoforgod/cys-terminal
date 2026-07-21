@@ -11,6 +11,33 @@ if ($env:WINDOWS_CERTIFICATE_THUMBPRINT -notmatch '^[0-9A-Fa-f]{40}$') {
 
 $target = 'x86_64-pc-windows-msvc'
 $env:CYS_TARGET = $target
+foreach ($name in @(
+  'CYS_BROWSER_RUNTIME_SECRET_KEY',
+  'CYS_BROWSER_RUNTIME_PUBLIC_KEY',
+  'CYS_BROWSER_RUNTIME_KEY_ID',
+  'CYS_BROWSER_RUNTIME_POLICY_EPOCH',
+  'CYS_BROWSER_RUNTIME_EXPIRES_AT'
+)) {
+  if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+    throw "Browser Runtime release metadata variable missing: $name"
+  }
+}
+# Authenticode mutates PE bytes. Sign and verify the entire staged executable
+# set before final hashes, attestation and policy minisign metadata are emitted.
+& scripts/runtime-stage-sign-windows.ps1 -Target $target -Thumbprint $env:WINDOWS_CERTIFICATE_THUMBPRINT
+if ($LASTEXITCODE -ne 0) { throw 'Browser Runtime Authenticode stage failed' }
+python scripts/browser-runtime-metadata.py prepare `
+  --resource-root src-tauri/resources/browser-runtime `
+  --target $target `
+  --key-id $env:CYS_BROWSER_RUNTIME_KEY_ID `
+  --secret-key $env:CYS_BROWSER_RUNTIME_SECRET_KEY `
+  --public-key $env:CYS_BROWSER_RUNTIME_PUBLIC_KEY `
+  --trusted-keys cysjavis-pack/trusted-keys.json `
+  --tauri-config src-tauri/tauri.conf.json `
+  --policy-epoch $env:CYS_BROWSER_RUNTIME_POLICY_EPOCH `
+  --expires-at $env:CYS_BROWSER_RUNTIME_EXPIRES_AT
+if ($LASTEXITCODE -ne 0) { throw 'Browser Runtime metadata signing/verification failed' }
+$env:CYS_BROWSER_V2_RELEASE_QUALIFIED = '1'
 bash scripts/bundle-prep.sh
 if ($LASTEXITCODE -ne 0) { throw 'bundle-prep failed' }
 

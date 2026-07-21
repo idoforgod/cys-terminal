@@ -19,12 +19,16 @@ pub use manifest::{
     ChromiumPin, EnginePin, PlaywrightPin, RuntimeManifest, SupervisorPin, TargetAssets,
     TargetTriple,
 };
-pub use path::RuntimePaths;
+pub use path::{hash_tree, RuntimePaths};
 pub use private_protocol::{BrokerHello, VerifiedBrokerHello};
 pub use state::{
     parse_runtime_state, EngineKey, EngineMode, LegacyRuntimeState, ParsedRuntimeState,
     ProtocolRange, RuntimeStateV2,
 };
+
+/// cysd's bounded GUI ensure worker deadline. UI adapters must use a strictly
+/// longer transport deadline so the broker can cancel and reap first.
+pub const ENSURE_WORKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
 
 #[cfg(test)]
 mod tests {
@@ -155,6 +159,52 @@ mod tests {
             RuntimePaths::resolve_existing(&root, &TargetTriple::Aarch64AppleDarwin, &assets)
                 .expect_err("symlinked supervisor must never be executable authority");
         assert_eq!(error.code(), BrowserErrorCode::RuntimePathRejected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chromium_tree_hash_binds_the_actual_executable_bytes() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-tree-test-{}",
+            std::process::id()
+        ));
+        let target_root = root.join("aarch64-apple-darwin");
+        let supervisor = target_root.join("supervisor/cys-browserd");
+        let engine = target_root.join("engine/cys-browser-engine");
+        let chromium = target_root.join("chromium/Chromium.app/Contents/MacOS/Chromium");
+        for (path, bytes) in [
+            (&supervisor, b"supervisor".as_slice()),
+            (&engine, b"engine"),
+            (&chromium, b"chromium-v1"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut assets = TargetAssets {
+            architecture: "arm64".into(),
+            supervisor_sha256: format!("{:x}", Sha256::digest(b"supervisor")),
+            engine_sha256: format!("{:x}", Sha256::digest(b"engine")),
+            chromium_archive_url: "https://example.invalid/chromium.zip".into(),
+            chromium_archive_sha256: "c".repeat(64),
+            chromium_tree_sha256: hash_tree(&target_root.join("chromium")).unwrap(),
+            chromium_executable: "chromium/Chromium.app/Contents/MacOS/Chromium".into(),
+            license_files: vec!["LICENSE.chromium".into()],
+        };
+        let paths =
+            RuntimePaths::resolve_existing(&root, &TargetTriple::Aarch64AppleDarwin, &assets)
+                .unwrap();
+        paths.verify_pinned_executables(&assets).unwrap();
+        std::fs::write(&chromium, b"chromium-v2").unwrap();
+        assert_eq!(
+            paths.verify_pinned_executables(&assets).unwrap_err().code(),
+            BrowserErrorCode::RuntimeIntegrityFailed
+        );
+        assets.chromium_tree_sha256 = hash_tree(&target_root.join("chromium")).unwrap();
+        paths.verify_pinned_executables(&assets).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

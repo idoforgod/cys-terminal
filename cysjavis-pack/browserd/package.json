@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "start": "bun run server.ts",
-    "test": "bun test"
+    "test": "bun run test:unit && bun run test:integration",
+    "test:unit": "bun test tests/unit.test.ts tests/cast.test.ts tests/phase3-unit.test.ts",
+    "test:integration": "bun test --max-concurrency 1 tests/pick.test.ts && bun test --max-concurrency 1 tests/cast-integration.test.ts && bun test --max-concurrency 1 tests/phase3.test.ts",
+    "test:negative": "bash tests/test_negative_gate.sh"
   },
   "dependencies": {
     "playwright-core": "1.49.1"

@@ -19,8 +19,13 @@ import {
   UNTRUSTED_HEADER,
   browserRoot,
   capText,
+  castCredentialAccepted,
   genToken,
   profileDir,
+  resolveRuntimeIdentity,
+  privateControlRequestAccepted,
+  signEngineState,
+  strictChromiumExecutable,
   writeState,
 } from "./lib";
 import {
@@ -697,7 +702,7 @@ function resolveCid(args: any): string {
   return args?.context || "default";
 }
 
-// --- 브라우저 기동 (Chrome 채널 우선, 폴백 chromium) ---
+// --- 브라우저 기동 ---
 // 프로필별 persistentContext를 각각 기동한다. agent/human user-data-dir가 분리되어
 // human 인증 세션(SOT)이 agent 검증 트래픽과 섞이지 않는다(§2A 프로필 2원화).
 async function launchProfileCtx(profile: "agent" | "human"): Promise<BrowserContext> {
@@ -709,11 +714,22 @@ async function launchProfileCtx(profile: "agent" | "human"): Promise<BrowserCont
     args: ["--no-first-run", "--no-default-browser-check"],
   };
   let ctx: BrowserContext;
-  try {
-    ctx = await chromium.launchPersistentContext(dir, { ...common, channel: "chrome" });
-  } catch (e) {
-    // 설치된 Chrome 없음 → playwright chromium 폴백
-    ctx = await chromium.launchPersistentContext(dir, common);
+  const pinnedChromium = strictChromiumExecutable(
+    process.env.CYS_BROWSER_CHROMIUM_PATH,
+    process.env.CYS_BROWSER_STRICT_RUNTIME,
+  );
+  if (pinnedChromium) {
+    ctx = await chromium.launchPersistentContext(dir, {
+      ...common,
+      executablePath: pinnedChromium,
+    });
+  } else {
+    try {
+      ctx = await chromium.launchPersistentContext(dir, { ...common, channel: "chrome" });
+    } catch (e) {
+      // Explicit source development only: installed Chrome then Playwright discovery.
+      ctx = await chromium.launchPersistentContext(dir, common);
+    }
   }
   // 팝업·새 탭(window.open·target=_blank) 감시 — 소유 판별 후 채택한다.
   ctx.on("page", (p: Page) => {
@@ -2089,10 +2105,19 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
 
 // --- HTTP 서버 (127.0.0.1, port 0) ---
 const token = genToken();
+// Cast receives a capability-limited bearer. In strict packaged mode the long-lived
+// control token is accepted only by /rpc and never appears in an EmbedDescriptor URL.
+const castToken = genToken();
 // 프로세스마다 바뀌는 비공개 runtime identity. ticket이 구 browserd 재기동을 넘어 재사용되지 않게
 // registry descriptor와 authenticated state/health 응답에 결합한다.
-const castRuntimeId = genToken();
+const castRuntimeId = resolveRuntimeIdentity(
+  process.env.CYS_BROWSER_RUNTIME_ID,
+  process.env.CYS_BROWSER_STRICT_RUNTIME,
+);
 const processStartTime = Math.floor(Date.now() / 1000 - process.uptime());
+const engineInstanceId = process.env.CYS_BROWSER_INSTANCE_ID || genToken();
+const engineGeneration = Number(process.env.CYS_BROWSER_ENGINE_GENERATION || 1);
+const engineAuthKey = process.env.CYS_BROWSER_ENGINE_AUTH_KEY || genToken() + genToken();
 const castEmbedTickets = new CastEmbedTicketRegistry();
 
 // 상수시간 토큰 비교(F6) — 길이 불일치는 즉시 false(timingSafeEqual은 길이 다르면 throw).
@@ -2115,10 +2140,36 @@ const server = Bun.serve({
   async fetch(req, srv) {
     const url = new URL(req.url);
 
+    const privateParts = url.pathname.split("/").filter(Boolean);
+    if (privateParts.length === 2 && privateParts[1] === "embed-ticket") {
+      if (req.method !== "POST" || !tokenEqual(privateParts[0], token)) {
+        return new Response(JSON.stringify({ ok: false, error: { code: "FORBIDDEN", message: "private embed registration denied" } }), { status: 403 });
+      }
+      try {
+        const body = new Uint8Array(await req.arrayBuffer());
+        if (!privateControlRequestAccepted(req.headers.get("x-cys-engine-auth"), body, engineAuthKey)) {
+          return new Response(JSON.stringify({ ok: false, error: { code: "FORBIDDEN", message: "private embed registration is unauthenticated" } }), { status: 403 });
+        }
+        const descriptor = JSON.parse(new TextDecoder().decode(body));
+        const result = castEmbedTickets.issue(descriptor as any);
+        return new Response(JSON.stringify({ ok: result === "issued", result }), {
+          status: result === "issued" ? 200 : 409,
+          headers: { "content-type": "application/json" },
+        });
+      } catch {
+        return new Response(JSON.stringify({ ok: false, error: { code: "BAD_JSON", message: "invalid embed registration" } }), { status: 400 });
+      }
+    }
+
     // cast 라우트(신규) — RPC 경로와 병렬. 토큰·Origin·CSP 3중 게이트.
     const route = castRoute(url.pathname);
     if (route) {
-      if (!tokenEqual(route.token, token)) {
+      const strictRuntime = process.env.CYS_BROWSER_STRICT_RUNTIME === "1";
+      const requestedTicket = url.searchParams.get("embedTicket") || "";
+      if (
+        (strictRuntime && !tokenEqual(route.token, requestedTicket))
+        || (!strictRuntime && !castCredentialAccepted(route.token, token, castToken, undefined))
+      ) {
         return new Response(JSON.stringify({ ok: false, error: { code: "FORBIDDEN", message: "bad token" } }), { status: 403 });
       }
       if (req.method !== "GET") {
@@ -2150,7 +2201,7 @@ const server = Bun.serve({
           });
         }
         const context = url.searchParams.get("context") || "default";
-        const ticketIssue = castEmbedTickets.issue({
+        const descriptor = {
           ticket: embedTicket,
           runtimeId: castRuntimeId,
           context,
@@ -2158,11 +2209,13 @@ const server = Bun.serve({
           embedGeneration: generation,
           paneId,
           parentOrigin,
-        });
-        if (ticketIssue !== "issued") {
-          const code = ticketIssue === "duplicate" ? "EMBED_TICKET_REPLAY" : "EMBED_TICKET_INVALID";
+        };
+        const ticketIssue = strictRuntime ? "issued" : castEmbedTickets.issue(descriptor);
+        const appResult = ticketIssue === "issued" ? castEmbedTickets.openApp(descriptor) : "replayed";
+        if (ticketIssue !== "issued" || appResult !== "accepted") {
+          const code = ticketIssue === "invalid" ? "EMBED_TICKET_INVALID" : "EMBED_TICKET_REPLAY";
           return new Response(JSON.stringify({ ok: false, error: { code, message: "cast embed ticket denied" } }), {
-            status: ticketIssue === "duplicate" ? 409 : 401,
+            status: ticketIssue === "invalid" ? 401 : 409,
           });
         }
         return new Response(CAST_APP_HTML, {
@@ -2677,14 +2730,21 @@ function releaseHuman(cid: string, ws: ServerWebSocket<CastData>, leaseId: strin
   return true;
 }
 
-const state: BrowserState = {
+const unsignedState = {
   schema_version: 2,
   pid: process.pid,
   port: server.port,
   token,
+  cast_token: castToken,
   runtime_id: castRuntimeId,
   process_start_time: processStartTime,
   headless: HEADLESS,
+  instance_id: engineInstanceId,
+  engine_generation: engineGeneration,
+} satisfies Omit<BrowserState, "state_mac">;
+const state: BrowserState = {
+  ...unsignedState,
+  state_mac: signEngineState(unsignedState, engineAuthKey),
 };
 writeState(state);
 
