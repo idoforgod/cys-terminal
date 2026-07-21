@@ -22,7 +22,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ -n "$VERSION" ] && [ -n "$RELEASE_DIR" ] && [ -n "$SITE_ROOT" ] || usage
+if [ -z "$VERSION" ] || [ -z "$RELEASE_DIR" ] || [ -z "$SITE_ROOT" ]; then
+  usage
+fi
 case "$SITE_ROOT" in
   https://*) ;;
   http://127.0.0.1:*|http://localhost:*) ;;
