@@ -26,6 +26,26 @@ async function readStderr(proc: any, ms = 3000): Promise<string> {
   }
 }
 
+// Browserd owns a Playwright/Chromium child.  Killing only the Bun parent
+// leaves that child holding inherited pipes (and occasionally the listener),
+// which makes the next test nondeterministically hang or hit EADDRINUSE.
+async function terminateServer(proc: any): Promise<void> {
+  try { proc.kill("SIGTERM"); } catch {}
+  try {
+    await Promise.race([
+      proc.exited,
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+  } catch {}
+  try { proc.kill("SIGKILL"); } catch {}
+  try {
+    await Promise.race([
+      proc.exited,
+      new Promise((resolve) => setTimeout(resolve, 1000)),
+    ]);
+  } catch {}
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -142,7 +162,7 @@ test("control lease는 owner pane/session/generation만 반환할 수 있다", a
     throw e;
   } finally {
     for (const ws of sockets) try { ws.close(); } catch {}
-    proc.kill();
+    await terminateServer(proc);
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try { rmSync(home, { recursive: true, force: true }); } catch {}
   }
@@ -246,7 +266,7 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     failed = true;
     throw e;
   } finally {
-    proc.kill();
+    await terminateServer(proc);
     // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {

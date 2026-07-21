@@ -671,12 +671,9 @@ fn ensure_view_bridge() -> Result<Value, String> {
     Err("view bridge state 대기 타임아웃(10s)".into())
 }
 
-/// 지구본 버튼 진입점 — browserd headful(실 Chromium) 창을 띄운다. GUI·`cys browser` CLI
-/// 둘 다 javis_browser를 직접 spawn한다(caps 게이트 없음 — 브라우저는 에이전트 도구이고,
-/// 진짜 경계는 browserd 프로필 격리다. 설계 §3-★). detached spawn 후 즉시 반환한다(첫 기동은
-/// browserd 시작에 수 초 — 창은 지연 등장·GUI toast가 피드백). ★단일 인스턴스 보장은 이 함수가
-/// 아니라 엔진 ensure_browserd의 파일락에 있다(리뷰어1 F1 — GUI Mutex는 CLI 동시성을 못 막으므로
-/// 크로스프로세스 락이 정답. 여기서 ensure_view_bridge식 Mutex+대기를 흉내내지 않는다).
+/// 지구본 버튼 진입점 — cysd 권한 브로커에 browserd headful 확보를 요청한다.
+/// Tauri/CLI는 모두 broker RPC를 사용하며, 런타임 프로세스의 기동·단일 인스턴스·파일락은
+/// broker의 BrowserRuntimeManager가 소유한다. 브로커가 없으면 disabled-safe로 실패한다.
 #[tauri::command]
 fn browser_open(url: Option<String>) -> Result<Value, String> {
     let target = url
@@ -895,9 +892,9 @@ fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bo
 }
 
 /// 지구본 버튼 in-pane(cast) 경로 진입점 — browserd 를 **headless** 로 확보하고 cast 앱이 쓸
-/// {port, token, headless} 좌표를 반환한다. browser_open(detached·즉시 반환)과 달리 이 커맨드는
-/// `javis_browser.py --headless start` 를 **동기 실행**해 browserd 가 실제로 뜰 때까지 기다린다
-/// (엔진 start 는 state 등장까지 최대 20s 블로킹). 그래서 async fn — Tauri 가 별도 스레드에서
+/// {port, token, headless} 좌표를 반환한다. browser_open과 달리 이 커맨드는 broker에
+/// **동기 ensure**를 요청해 browserd가 실제로 뜰 때까지 기다린다
+/// (엔진 start는 state 등장까지 최대 20s 블로킹). 그래서 async fn — Tauri가 별도 스레드에서
 /// 돌려 cold-start 가 GUI 메인 스레드를 점유하지 않는다(시뮬 F1). 블로킹 대기는 파일 내 관례대로
 /// spawn_blocking 으로 tokio 워커에서 격리한다.
 /// ★단일 인스턴스 보장은 이 함수가 아니라 엔진 ensure_browserd 의 파일락에 있다(browser_open 과
