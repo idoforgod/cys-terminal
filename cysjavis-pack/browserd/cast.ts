@@ -41,6 +41,7 @@ export interface CastEmbedTicketDescriptor {
   context: string;
   protocolVersion: number;
   embedGeneration: number;
+  paneId: string;
   parentOrigin: string;
 }
 
@@ -53,6 +54,7 @@ function validCastEmbedTicket(d: CastEmbedTicketDescriptor): boolean {
     && d.context.length >= 1 && d.context.length <= 128 && !/[\u0000-\u001f\u007f]/.test(d.context)
     && d.protocolVersion === CAST_PROTOCOL_VERSION
     && Number.isSafeInteger(d.embedGeneration) && d.embedGeneration > 0
+    && /^[A-Za-z0-9_-]{43,128}$/.test(d.paneId)
     && /^(tauri:\/\/localhost|http:\/\/tauri\.localhost|http:\/\/(127\.0\.0\.1|localhost):\d+)$/.test(d.parentOrigin);
 }
 
@@ -104,6 +106,7 @@ export class CastEmbedTicketRegistry {
       || expected.context !== descriptor.context
       || expected.protocolVersion !== descriptor.protocolVersion
       || expected.embedGeneration !== descriptor.embedGeneration
+      || expected.paneId !== descriptor.paneId
       || expected.parentOrigin !== descriptor.parentOrigin
     ) return "mismatch";
     if (entry.consumed) return "replayed";
@@ -214,7 +217,7 @@ export type ServerMsg =
       viewportPinned: boolean;
     }
   | { type: typeof MSG.TABS; seq: number; tabs: TabInfo[] }
-  | { type: typeof MSG.CONTROL; control: "agent" | "human" }
+  | { type: typeof MSG.CONTROL; control: "agent" | "human"; leaseId?: string }
   | { type: typeof MSG.ERR; code: string; message: string; detail?: string; retry?: boolean }
   | { type: typeof MSG.DIALOG; id: number; kind: string; message: string; defaultValue: string }
   | { type: typeof MSG.CLOSED; reason: string };
@@ -235,8 +238,8 @@ export function msgNav(f: {
 export function msgTabs(seq: number, tabs: TabInfo[]): ServerMsg {
   return { type: MSG.TABS, seq, tabs };
 }
-export function msgControl(control: "agent" | "human"): ServerMsg {
-  return { type: MSG.CONTROL, control };
+export function msgControl(control: "agent" | "human", leaseId?: string): ServerMsg {
+  return leaseId ? { type: MSG.CONTROL, control, leaseId } : { type: MSG.CONTROL, control };
 }
 export function msgErr(code: string, message: string, detail?: string, retry?: boolean): ServerMsg {
   return { type: MSG.ERR, code, message, detail, retry };
@@ -267,7 +270,7 @@ export type ClientMsg =
   | { type: typeof CMSG.KEY; kind: "down" | "up"; key: string; code: string; text: string; modifiers: number }
   | { type: typeof CMSG.INSERT_TEXT; text: string }
   | { type: typeof CMSG.NAVIGATE; url: string }
-  | { type: typeof CMSG.CONTROL; action: "release" }
+  | { type: typeof CMSG.CONTROL; action: "release"; leaseId: string }
   | { type: typeof CMSG.NAV_ACTION; action: "back" | "forward" | "reload" | "stop" }
   | { type: typeof CMSG.TAB; action: "activate" | "close" | "new"; id: string }
   | { type: typeof CMSG.VIEWPORT; width: number; height: number; unpin: boolean }
@@ -349,7 +352,10 @@ export function parseClientMsg(raw: string): ClientMsg | null {
     }
     case CMSG.CONTROL: {
       if (m.action !== "release") return null;
-      return { type: CMSG.CONTROL, action: "release" };
+      // 사람이 획득할 때 서버가 해당 pane/session에만 발급한 불투명 증명이다. action 문자열만으로
+      // release를 허용하면 다른(또는 stale) WS가 사람의 조작권을 임의로 반환시킬 수 있다.
+      if (typeof m.leaseId !== "string" || !/^[A-Za-z0-9_-]{43,128}$/.test(m.leaseId)) return null;
+      return { type: CMSG.CONTROL, action: "release", leaseId: m.leaseId };
     }
     case CMSG.NAV_ACTION: {
       const acts = ["back", "forward", "reload", "stop"];
@@ -603,12 +609,14 @@ export const CAST_APP_HTML = `<!doctype html>
   var context = params.get('context') || 'default';
   var protocolVersion = Number(params.get('protocolVersion'));
   var embedGeneration = Number(params.get('embedGeneration'));
+  var paneId = params.get('paneId') || '';
   var parentOrigin = params.get('parentOrigin') || '';
   var embedTicket = params.get('embedTicket') || '';
   var wsParams = new URLSearchParams({
     context: context,
     protocolVersion: String(protocolVersion),
     embedGeneration: String(embedGeneration),
+    paneId: paneId,
     parentOrigin: parentOrigin,
     embedTicket: embedTicket
   });
@@ -650,6 +658,7 @@ export const CAST_APP_HTML = `<!doctype html>
   var loading = false;
   var seenSeq = -1;       // 4-S-7: 자기가 본 최대 seq 미만 메시지는 무시(늦게 온 옛 상태 차단)
   var dlgId = null;
+  var controlLeaseId = null;
 
   function mods(e){ return (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0); }
   function btn(e){ return e.button===0?'left':(e.button===1?'middle':(e.button===2?'right':'none')); }
@@ -658,11 +667,13 @@ export const CAST_APP_HTML = `<!doctype html>
   function postParent(type, fields){
     if (protocolVersion !== SUPPORTED_PROTOCOL || !Number.isSafeInteger(embedGeneration) || embedGeneration < 1 || !parentOrigin) return;
     if (!/^[A-Za-z0-9_-]{43,128}$/.test(embedTicket)) return;
+    if (!/^[A-Za-z0-9_-]{43,128}$/.test(paneId)) return;
     var envelope = Object.assign({
       type:type,
       protocolVersion:protocolVersion,
       embedGeneration:embedGeneration,
-      embedTicket:embedTicket
+      embedTicket:embedTicket,
+      paneId:paneId
     }, fields || {});
     try { window.parent.postMessage(envelope, parentOrigin); } catch(e){}
   }
@@ -856,7 +867,11 @@ export const CAST_APP_HTML = `<!doctype html>
         postParent('cys-cast-title', { title: cap(msg.title || ''), url: msg.url || '' });
       }
       else if (msg.type === MSG.TABS) { renderTabs(msg.tabs); }
-      else if (msg.type === MSG.CONTROL) { ctrlLabel.textContent = (msg.control === 'human') ? '사람 조작 중' : '에이전트'; }
+      else if (msg.type === MSG.CONTROL) {
+        controlLeaseId = msg.control === 'human' && typeof msg.leaseId === 'string' ? msg.leaseId : null;
+        ctrlLabel.textContent = (msg.control === 'human') ? '사람 조작 중' : '에이전트';
+        handBtn.disabled = !controlLeaseId;
+      }
       else if (msg.type === MSG.DIALOG) { showDialog(msg); }
       else if (msg.type === MSG.CLOSED) {
         hasFrame = false;
@@ -948,7 +963,10 @@ export const CAST_APP_HTML = `<!doctype html>
   relBtn.addEventListener('click', function(){ send({ type:CMSG.NAV_ACTION, action: loading ? 'stop' : 'reload' }); });
 
   // --- control: 에이전트에게 넘기기 ---
-  handBtn.addEventListener('click', function(){ send({ type:CMSG.CONTROL, action:'release' }); });
+  handBtn.addEventListener('click', function(){
+    if (!controlLeaseId) return;
+    send({ type:CMSG.CONTROL, action:'release', leaseId:controlLeaseId });
+  });
 
   connect();
 })();

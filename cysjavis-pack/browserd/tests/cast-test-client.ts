@@ -9,10 +9,16 @@ export interface IssuedCastEmbed {
   ticket: string;
   generation: number;
   parentOrigin: string;
+  paneId: string;
 }
 
 // 실제 GUI와 같은 app GET(issue) → WS(consume) 순서를 테스트에서 재사용한다. bare WS 우회는 없다.
-export async function issueCastEmbed(port: number, token: string, context = "default"): Promise<IssuedCastEmbed> {
+export async function issueCastEmbed(
+  port: number,
+  token: string,
+  context = "default",
+  paneId = randomBytes(32).toString("hex"),
+): Promise<IssuedCastEmbed> {
   const generation = ++generationSeq;
   const ticket = randomBytes(32).toString("hex");
   const parentOrigin = process.platform === "win32" ? "http://tauri.localhost" : "tauri://localhost";
@@ -22,6 +28,7 @@ export async function issueCastEmbed(port: number, token: string, context = "def
     embedGeneration: String(generation),
     parentOrigin,
     embedTicket: ticket,
+    paneId,
   });
   const appUrl = `http://127.0.0.1:${port}/${token}/cast/?${query.toString()}`;
   const response = await fetch(appUrl);
@@ -32,5 +39,6 @@ export async function issueCastEmbed(port: number, token: string, context = "def
     ticket,
     generation,
     parentOrigin,
+    paneId,
   };
 }

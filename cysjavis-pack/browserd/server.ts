@@ -54,6 +54,12 @@ const CAST_BUILD_MODE = process.env.CYS_BROWSER_DEV === "1" ? "development" : "p
 const CAST_DEVELOPMENT_PARENT_ORIGIN = process.env.CYS_BROWSER_PARENT_ORIGIN || null;
 
 type Control = "agent" | "human";
+interface ControlLease {
+  id: string;
+  paneId: string;
+  clientId: string;
+  embedGeneration: number;
+}
 // 콘솔 링버퍼 항목 — 웹 페이지가 낸 출력이라 비신뢰 데이터다(UNTRUSTED 라벨 아래에서만 노출).
 interface ConsoleEntry {
   ts: string;
@@ -69,6 +75,7 @@ interface Ctx {
   page: Page; // 활성 탭
   pages: Page[]; // ★생성순 유지(4-S-5-1). 활성 여부와 무관 — 인덱스로 활성을 판정하지 않는다
   control: Control;
+  controlLease: ControlLease | null;
   profile: "agent" | "human";
   consoleBuf: ConsoleEntry[]; // 페이지 교체와 무관하게 유지되는 링버퍼
   loading: boolean; // 활성 탭이 로딩 중인가(진행 바 근거)
@@ -132,6 +139,9 @@ const recreatingBlank = new Set<string>();
 interface CastData {
   context: string;
   badMsg: number; // 클라이언트당 불량 메시지 err 폭주 상한 카운터
+  paneId: string; // GUI pane 수명 동안 안정적인 비밀 아닌 소유 식별자
+  clientId: string; // 이 WS 연결에만 귀속되는 서버 발급 세션 식별자
+  embedGeneration: number; // iframe load 세대 — stale document/WS 구분
 }
 interface CastEntry {
   cdp: CDPSession | null;
@@ -442,6 +452,7 @@ function castCleanupIfEmpty(cid: string, expect?: CastEntry) {
   // 변경성 동사가 HUMAN_ACTIVE(exit 6)로 거부된다(자율주행 중 워커가 원인불명으로 막힘).
   if (c && c.control === "human") {
     c.control = "agent";
+    c.controlLease = null;
     // ★P1-1: 반복 다이얼로그 카운터도 함께 되돌린다. 안 그러면 사람이 상한까지 소비하고 pane 을
     // 닫았을 때 카운터가 잔존해, **재접속 후 사람이 띄운 confirm 이 무음 자동 dismiss** 된다 —
     // "사람 행위를 조용히 무효화하는 오동작"의 재입장이다.
@@ -839,6 +850,7 @@ async function ensureInternalBlankContext(cid: string, profile: "agent" | "human
     page,
     pages: [page],
     control: "agent",
+    controlLease: null,
     profile,
     consoleBuf: [],
     loading: false,
@@ -1751,14 +1763,28 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
       const c = getCtx(cid);
       const action = args.action;
       if (action === "acquire") {
-        c.control = args.actor === "human" ? "human" : "agent";
+        if (args.actor !== "human" && args.actor !== "agent") {
+          throw new RpcError("BAD_ARGS", "actor=human|agent 필요");
+        }
+        if (args.actor === "human") {
+          const hub = castHub.get(cid);
+          const clients = hub ? [...hub.clients].filter((ws) => ws.readyState === 1) : [];
+          // RPC는 WS 신원을 직접 갖지 않는다. 유일한 live pane이 있을 때만 그 세션에 귀속시킨다.
+          // 0개에서 만드는 ownerless lease와 2개 중 임의 선택은 둘 다 fail-closed 한다.
+          if (clients.length !== 1) {
+            throw new RpcError("CONTROL_OWNER_REQUIRED", "human acquire에는 정확히 하나의 live cast pane이 필요합니다.");
+          }
+          if (!acquireHuman(cid, clients[0])) {
+            throw new RpcError("CONTROL_LEASE_MISMATCH", "다른 pane/session이 이미 사람 조작권을 소유합니다.");
+          }
+        } else {
+          resetHumanControl(cid);
+        }
       } else if (action === "release") {
-        c.control = "agent";
-        c.dialogSeen = 0; // P1-1 — WS release 와 대칭
+        resetHumanControl(cid);
       } else {
         throw new RpcError("BAD_ARGS", "action=acquire|release 필요");
       }
-      castBroadcastTo(cid, msgControl(c.control));
       return { context: cid, control: c.control };
     }
 
@@ -2074,6 +2100,7 @@ const server = Bun.serve({
         const protocolRaw = url.searchParams.get("protocolVersion");
         const generationRaw = url.searchParams.get("embedGeneration");
         const embedTicket = url.searchParams.get("embedTicket") || "";
+        const paneId = url.searchParams.get("paneId") || "";
         const generation = Number(generationRaw);
         if (Number(protocolRaw) !== CAST_PROTOCOL_VERSION || !Number.isSafeInteger(generation) || generation < 1) {
           return new Response(JSON.stringify({ ok: false, error: { code: "PROTOCOL_MISMATCH", message: "unsupported cast embed" } }), {
@@ -2087,6 +2114,7 @@ const server = Bun.serve({
           context,
           protocolVersion: CAST_PROTOCOL_VERSION,
           embedGeneration: generation,
+          paneId,
           parentOrigin,
         });
         if (ticketIssue !== "issued") {
@@ -2121,12 +2149,14 @@ const server = Bun.serve({
         developmentOrigin: CAST_DEVELOPMENT_PARENT_ORIGIN,
       });
       const generation = Number(url.searchParams.get("embedGeneration"));
+      const paneId = url.searchParams.get("paneId") || "";
       const ticketResult = parentOrigin ? castEmbedTickets.consume({
         ticket: url.searchParams.get("embedTicket") || "",
         runtimeId: castRuntimeId,
         context,
         protocolVersion: Number(url.searchParams.get("protocolVersion")),
         embedGeneration: generation,
+        paneId,
         parentOrigin,
       }) : "mismatch";
       if (ticketResult !== "accepted") {
@@ -2135,7 +2165,9 @@ const server = Bun.serve({
           error: { code: `EMBED_TICKET_${ticketResult.toUpperCase()}`, message: "cast websocket ticket denied" },
         }), { status: 401 });
       }
-      const upgraded = srv.upgrade<CastData>(req, { data: { context, badMsg: 0 } });
+      const upgraded = srv.upgrade<CastData>(req, {
+        data: { context, badMsg: 0, paneId, clientId: genToken(), embedGeneration: generation },
+      });
       if (upgraded) return undefined; // Bun 이 업그레이드 응답 처리
       return new Response(JSON.stringify({ ok: false, error: { code: "UPGRADE_FAILED", message: "ws upgrade failed" } }), {
         status: 400,
@@ -2202,6 +2234,7 @@ const server = Bun.serve({
         };
         castHub.set(cid, hub);
       }
+      const reconnectingFromEmpty = hub.clients.size === 0 && hub.emptySince !== null;
       cancelReconnectGrace(hub);
       hub.clients.add(ws);
       const h = hub;
@@ -2241,6 +2274,22 @@ const server = Bun.serve({
         h.clients.delete(ws);
         castCleanupIfEmpty(cid, h);
         return;
+      }
+      if (c.control === "human") {
+        const lease = c.controlLease;
+        if (reconnectingFromEmpty && lease?.paneId === ws.data.paneId) {
+          // 같은 GUI pane의 grace 재접속만 소유권을 이어받는다. 새 WS/generation에는 새 lease를
+          // 발급해 이전 document가 보유한 lease를 즉시 stale로 만든다.
+          c.controlLease = {
+            id: genToken() + genToken(),
+            paneId: ws.data.paneId,
+            clientId: ws.data.clientId,
+            embedGeneration: ws.data.embedGeneration,
+          };
+        } else if (reconnectingFromEmpty || !lease) {
+          // 다른 pane이 빈 hub를 되살렸거나 손상된 ownerless 상태라면 사람 상태를 넘겨주지 않는다.
+          resetHumanControl(cid);
+        }
       }
       // "첫 클라이언트"를 clients.size 로 판정하면 동시 접속 2건이 서로를 2번째로 오인해
       // 아무도 스크린캐스트를 걸지 않는다 → cdp 부재 + 진행중 플래그로 판정한다.
@@ -2284,7 +2333,7 @@ const server = Bun.serve({
       // 4-S-6 초기 상태 동기화 — nav·tabs·control 3종을 즉시 push(현행은 control 만이라
       // 툴바 버튼·탭 스트립이 첫 이벤트가 올 때까지 비어 있었다).
       try {
-        ws.send(JSON.stringify(msgControl(c.control)));
+        ws.send(JSON.stringify(controlMessageFor(c, ws)));
       } catch {}
       await pushNav(cid).catch(() => {});
       await pushTabs(cid).catch(() => {});
@@ -2307,6 +2356,13 @@ const server = Bun.serve({
       // 이동한다** → 실제 디스패치 시점에 contexts 를 재조회한다.
       if (!hub || !contexts.get(cid)) return;
       try {
+        const current = contexts.get(cid)!;
+        // ACK는 스트림 배압 신호라 모든 viewer가 보낼 수 있다. 그 외 메시지는 human lease 동안
+        // 정확한 owner만 허용해 두 번째 pane이 입력·탭·viewport까지 끼어드는 우회를 막는다.
+        if (m.type !== "ack" && current.control === "human" && !isControlOwner(current, ws)) {
+          rejectControlOwner(ws);
+          return;
+        }
         switch (m.type) {
           case "ack": {
             // fid당 첫 ack만 릴레이(dedup) — 맵에서 삭제되는 순간이 곧 "이미 ack 했다"는 표시라
@@ -2329,7 +2385,7 @@ const server = Bun.serve({
             // cast 앱은 mousemove 를 30ms 스로틀로 상시 발신하므로 moved·wheel 까지 포함하면
             // 커서가 지나가기만 해도 조작권을 뺏어 에이전트 동사가 HUMAN_ACTIVE 로 막힌다.
             const intentional = m.type !== "mouse" || m.kind === "pressed";
-            if (intentional) acquireHuman(cid);
+            if (intentional && !acquireHuman(cid, ws)) break;
             if (!hub.cdp) break;
             if (m.type === "mouse") {
               // lastMeta 가 null(rebind 직후)이면 mapInput 이 null 을 돌려 입력이 무시된다 —
@@ -2376,7 +2432,7 @@ const server = Bun.serve({
               ws.send(JSON.stringify(msgErr("SCHEME_DENIED", String(e?.message || e))));
               break;
             }
-            acquireHuman(cid); // 4-S-8: 실제로 수행되는 이동만 조작 의사로 인정
+            if (!acquireHuman(cid, ws)) break; // 4-S-8: 실제로 수행되는 이동만 조작 의사로 인정
             const c = contexts.get(cid)!;
             const page = c.page;
             setLoading(cid, page, true);
@@ -2399,7 +2455,7 @@ const server = Bun.serve({
           }
           case "nav-action": {
             touch();
-            acquireHuman(cid); // 4-S-8: back/forward/reload/stop 은 사람이 직접 누른 것
+            if (!acquireHuman(cid, ws)) break; // 4-S-8: back/forward/reload/stop 은 사람이 직접 누른 것
             try {
               await navAction(cid, m.action);
             } catch (e: any) {
@@ -2420,7 +2476,7 @@ const server = Bun.serve({
           }
           case "tab": {
             touch();
-            acquireHuman(cid); // 4-S-8
+            if (!acquireHuman(cid, ws)) break; // 4-S-8
             try {
               const c = contexts.get(cid)!;
               if (m.action === "new") {
@@ -2468,11 +2524,7 @@ const server = Bun.serve({
             break;
           }
           case "control": {
-            // action=release → 에이전트에게 반환.
-            const c = contexts.get(cid)!;
-            c.control = "agent";
-            c.dialogSeen = 0;
-            castBroadcast(hub, msgControl("agent"));
+            releaseHuman(cid, ws, m.leaseId);
             break;
           }
         }
@@ -2488,18 +2540,86 @@ const server = Bun.serve({
       const cid = ws.data.context;
       const hub = castHub.get(cid);
       if (!hub) return; // hub 는 open 진입 즉시 등록되므로 여기 도달 = 이미 정리됨
+      const c = contexts.get(cid);
+      const wasOwner = !!c && isControlOwner(c, ws);
       hub.clients.delete(ws);
+      // owner가 사라졌지만 다른 pane이 남아 있으면 그 pane으로 lease를 암묵 이전하지 않는다.
+      // 빈 hub일 때만 같은 pane의 짧은 reconnect grace가 이어받을 기회를 갖는다.
+      if (wasOwner && hub.clients.size > 0) resetHumanControl(cid);
       scheduleReconnectCleanup(cid, hub);
     },
   },
 });
 
-// 사람 조작 의사 표시 입력에서 control 을 획득한다(4-S-8 표).
-function acquireHuman(cid: string) {
+function isControlOwner(c: Ctx, ws: ServerWebSocket<CastData>): boolean {
+  const lease = c.controlLease;
+  return c.control === "human" && !!lease
+    && lease.paneId === ws.data.paneId
+    && lease.clientId === ws.data.clientId
+    && lease.embedGeneration === ws.data.embedGeneration;
+}
+
+function controlMessageFor(c: Ctx, ws: ServerWebSocket<CastData>): ServerMsg {
+  return msgControl(c.control, isControlOwner(c, ws) ? c.controlLease!.id : undefined);
+}
+
+// control 상태는 모든 pane에 보이되 lease 증명은 정확한 owner WS 한 곳에만 보낸다.
+function broadcastControlState(cid: string) {
   const c = contexts.get(cid);
-  if (!c || c.control === "human") return;
+  const hub = castHub.get(cid);
+  if (!c || !hub) return;
+  for (const client of hub.clients) {
+    try { client.send(JSON.stringify(controlMessageFor(c, client))); } catch {}
+  }
+}
+
+function resetHumanControl(cid: string) {
+  const c = contexts.get(cid);
+  if (!c) return;
+  c.control = "agent";
+  c.controlLease = null;
+  c.dialogSeen = 0;
+  broadcastControlState(cid);
+}
+
+function rejectControlOwner(ws: ServerWebSocket<CastData>) {
+  try {
+    ws.send(JSON.stringify(msgErr(
+      "CONTROL_LEASE_MISMATCH",
+      "이 pane/session/generation은 사람 조작권 소유자가 아닙니다."
+    )));
+  } catch {}
+}
+
+// 사람 조작 의사 표시 입력에서 control 을 획득한다(4-S-8 표). lease는 pane뿐 아니라 현재 WS
+// session과 iframe generation에 함께 묶여, 복제·늦은 문서·다른 pane의 반환을 모두 거부한다.
+function acquireHuman(cid: string, ws: ServerWebSocket<CastData>): boolean {
+  const c = contexts.get(cid);
+  if (!c) return false;
+  if (c.control === "human") {
+    if (isControlOwner(c, ws)) return true;
+    rejectControlOwner(ws);
+    return false;
+  }
   c.control = "human";
-  castBroadcastTo(cid, msgControl("human"));
+  c.controlLease = {
+    id: genToken() + genToken(),
+    paneId: ws.data.paneId,
+    clientId: ws.data.clientId,
+    embedGeneration: ws.data.embedGeneration,
+  };
+  broadcastControlState(cid);
+  return true;
+}
+
+function releaseHuman(cid: string, ws: ServerWebSocket<CastData>, leaseId: string): boolean {
+  const c = contexts.get(cid);
+  if (!c || !isControlOwner(c, ws) || !c.controlLease || !tokenEqual(leaseId, c.controlLease.id)) {
+    rejectControlOwner(ws);
+    return false;
+  }
+  resetHumanControl(cid);
+  return true;
 }
 
 const state: BrowserState = { pid: process.pid, port: server.port, token, headless: HEADLESS };

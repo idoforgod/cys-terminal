@@ -336,17 +336,19 @@ describe("cast web pane — URL 조립·판정(browserd screencast)", () => {
 
   it("Cast Protocol v2 — 현재 embed generation·정확 origin·실제 iframe source만 수용한다", () => {
     const ticket = "a".repeat(64);
+    const paneId = "p".repeat(64);
     const url = castAppUrl(51234, "tok", "default", {
       protocolVersion: CAST_PROTOCOL_VERSION,
       embedGeneration: 7,
       parentOrigin: "tauri://localhost",
       embedTicket: ticket,
+      paneId,
     });
     const good = {
       frameUrl: url,
       eventOrigin: "http://127.0.0.1:51234",
       sourceMatches: true,
-      data: { type: "cys-cast-title", protocolVersion: CAST_PROTOCOL_VERSION, embedGeneration: 7, embedTicket: ticket },
+      data: { type: "cys-cast-title", protocolVersion: CAST_PROTOCOL_VERSION, embedGeneration: 7, embedTicket: ticket, paneId },
     };
 
     expect(acceptsCastMessage(good)).toBe(true);
@@ -355,7 +357,9 @@ describe("cast web pane — URL 조립·판정(browserd screencast)", () => {
     expect(acceptsCastMessage({ ...good, data: { ...good.data, protocolVersion: 1 } })).toBe(false);
     expect(acceptsCastMessage({ ...good, data: { ...good.data, embedGeneration: 6 } })).toBe(false);
     expect(acceptsCastMessage({ ...good, data: { ...good.data, embedTicket: "b".repeat(64) } })).toBe(false);
+    expect(acceptsCastMessage({ ...good, data: { ...good.data, paneId: "q".repeat(64) } })).toBe(false);
     expect(new URL(url).searchParams.get("embedTicket")).toBe(ticket);
+    expect(new URL(url).searchParams.get("paneId")).toBe(paneId);
     expect(newCastEmbedTicket()).toMatch(/^[a-f0-9]{64}$/);
   });
 

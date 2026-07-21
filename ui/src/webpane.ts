@@ -215,6 +215,7 @@ export interface CastEmbedOptions {
   embedGeneration: number;
   parentOrigin: string;
   embedTicket: string;
+  paneId: string;
 }
 
 export function newCastEmbedTicket(): string {
@@ -250,7 +251,8 @@ export function castAppUrl(port: number, token: string, context: string, embed?:
   return `${base}&protocolVersion=${encodeURIComponent(String(embed.protocolVersion))}`
     + `&embedGeneration=${encodeURIComponent(String(embed.embedGeneration))}`
     + `&parentOrigin=${encodeURIComponent(embed.parentOrigin)}`
-    + `&embedTicket=${encodeURIComponent(embed.embedTicket)}`;
+    + `&embedTicket=${encodeURIComponent(embed.embedTicket)}`
+    + `&paneId=${encodeURIComponent(embed.paneId)}`;
 }
 
 // 부모가 처리할 cast postMessage의 단일 검증 경계. origin "형태"가 아니라 현재 iframe URL의
@@ -272,18 +274,22 @@ export function acceptsCastMessage(args: {
   const protocolVersion = Number(url.searchParams.get("protocolVersion"));
   const embedGeneration = Number(url.searchParams.get("embedGeneration"));
   const embedTicket = url.searchParams.get("embedTicket");
+  const paneId = url.searchParams.get("paneId");
   if (
     protocolVersion !== CAST_PROTOCOL_VERSION
     || !Number.isSafeInteger(embedGeneration)
     || embedGeneration < 1
     || !embedTicket
     || !/^[A-Za-z0-9_-]{43,128}$/.test(embedTicket)
+    || !paneId
+    || !/^[A-Za-z0-9_-]{43,128}$/.test(paneId)
   ) return false;
   if (!args.data || typeof args.data !== "object") return false;
-  const data = args.data as { protocolVersion?: unknown; embedGeneration?: unknown; embedTicket?: unknown };
+  const data = args.data as { protocolVersion?: unknown; embedGeneration?: unknown; embedTicket?: unknown; paneId?: unknown };
   return data.protocolVersion === protocolVersion
     && data.embedGeneration === embedGeneration
-    && data.embedTicket === embedTicket;
+    && data.embedTicket === embedTicket
+    && data.paneId === paneId;
 }
 
 // cast URL 판정 — pathname 2번째 세그먼트가 "cast"면 true(토큰 무관·순수). 뷰어 URL(2번째="app")·

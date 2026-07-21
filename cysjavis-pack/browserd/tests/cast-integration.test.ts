@@ -96,6 +96,58 @@ async function rpc(port: number, token: string, verb: string, args?: any): Promi
   return res.json();
 }
 
+async function controlOf(port: number, token: string, cid = "default"): Promise<string | undefined> {
+  const status = await rpc(port, token, "status", {});
+  return (status?.result?.contexts || []).find((x: any) => x.id === cid)?.control;
+}
+
+test("control lease는 owner pane/session/generation만 반환할 수 있다", async () => {
+  const home = mkdtempSync(join(tmpdir(), "cast-lease-"));
+  const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
+    cwd: BROWSERD_DIR,
+    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const sockets: WebSocket[] = [];
+  let failed = false;
+  try {
+    const { port, token } = await waitState(home, 30000);
+    expect((await rpc(port, token, "open", { url: "https://example.com" })).ok).toBe(true);
+
+    const ownerPane = "a".repeat(64);
+    const owner = new WebSocket((await issueCastEmbed(port, token, "default", ownerPane)).wsUrl);
+    sockets.push(owner);
+    expect(await wsOpen(owner, 10000)).toBe(true);
+    const leaseP = nextMsg(owner, (m) => m.type === "control" && m.control === "human", 10000, "owner lease");
+    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
+    const lease = await leaseP;
+    expect(lease.leaseId).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
+
+    const other = new WebSocket((await issueCastEmbed(port, token, "default", "b".repeat(64))).wsUrl);
+    sockets.push(other);
+    expect(await wsOpen(other, 10000)).toBe(true);
+    const deniedP = nextMsg(other, (m) => m.type === "err" && m.code === "CONTROL_LEASE_MISMATCH", 10000, "stale/other release denied");
+    other.send(JSON.stringify({ type: "control", action: "release", leaseId: lease.leaseId }));
+    expect((await deniedP).code).toBe("CONTROL_LEASE_MISMATCH");
+    expect(await controlOf(port, token)).toBe("human");
+    expect((await rpc(port, token, "eval", { expression: "1+1" })).error.code).toBe("HUMAN_ACTIVE");
+
+    owner.send(JSON.stringify({ type: "control", action: "release", leaseId: lease.leaseId }));
+    for (let i = 0; i < 50 && (await controlOf(port, token)) !== "agent"; i++) await sleep(100);
+    expect(await controlOf(port, token)).toBe("agent");
+    expect((await rpc(port, token, "eval", { expression: "1+1" })).ok).toBe(true);
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    for (const ws of sockets) try { ws.close(); } catch {}
+    proc.kill();
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  }
+}, 180000);
+
 test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·생존", async () => {
   const home = mkdtempSync(join(tmpdir(), "cast-it-"));
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
@@ -147,9 +199,11 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     // cw/ch=metadata 값 → scale 1·letterbox 0 → 중앙 클릭이 뷰포트 중앙에 매핑.
     const cx = Math.floor(dw / 2);
     const cy = Math.floor(dh / 2);
+    const clickLeaseP = nextMsg(ws, (m) => m.type === "control" && m.control === "human" && m.leaseId, 5000, "click control lease");
     ws.send(JSON.stringify({ type: "mouse", kind: "pressed", x: cx, y: cy, cw: dw, ch: dh, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
     ws.send(JSON.stringify({ type: "mouse", kind: "released", x: cx, y: cy, cw: dw, ch: dh, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
-    ws.send(JSON.stringify({ type: "control", action: "release" })); // control 반환 → eval 판독 가능
+    const clickLease = await clickLeaseP;
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId: clickLease.leaseId })); // control 반환 → eval 판독 가능
     let clicked = 0;
     for (let i = 0; i < 40; i++) {
       const r = await rpc(port, token, "eval", { expression: "window.__t" });
@@ -408,16 +462,17 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
     const port: number = st.port;
     const token: string = st.token;
     expect((await rpc(port, token, "open", { url: staticUrl })).ok).toBe(true);
-    // cast 클라이언트가 붙기 전에 이미 human 인 상태를 만든다(에이전트 CLI 가 조작권을 잡은 상황).
-    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
-    expect(await controlOf(port, token)).toBe("human");
-
-    // ① 첫 클라이언트도 현재 control 을 받아야 한다(툴바 stale 표시 방지).
-    const a = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    const paneId = "r".repeat(64);
+    const a = new WebSocket((await issueCastEmbed(port, token, "default", paneId)).wsUrl);
     sockets.push(a);
     expect(await wsOpen(a, 10000)).toBe(true);
-    const ctlMsg = await nextMsg(a, (m) => m.type === "control", 20000, "첫 클라이언트 control 초기 상태");
+    const ctlMsgP = nextMsg(a, (m) => m.type === "control" && m.control === "human", 20000, "owner control lease");
+    // RPC acquire도 임의/ownerless 상태를 만들지 않고 유일한 live pane에 귀속된다.
+    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
+    expect(await controlOf(port, token)).toBe("human");
+    const ctlMsg = await ctlMsgP;
     expect(ctlMsg.control).toBe("human");
+    expect(ctlMsg.leaseId).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
 
     // ③ 순간 WS 단절은 reconnect grace 동안 human lease와 CDP를 유지한다.
     a.close();
@@ -425,7 +480,7 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
     expect(await controlOf(port, token)).toBe("human");
 
     // grace 안 재접속은 기존 lease를 이어받는다. 이후 사람이 명시 handoff하고 입력 경계를 검증한다.
-    const a2 = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    const a2 = new WebSocket((await issueCastEmbed(port, token, "default", paneId)).wsUrl);
     sockets.push(a2);
     let lastFidA2 = -1;
     a2.addEventListener("message", (ev) => {
@@ -445,7 +500,8 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
     expect(await wsOpen(a2, 10000)).toBe(true);
     const reconnectControl = await reconnectControlP;
     expect(reconnectControl.control).toBe("human");
-    a2.send(JSON.stringify({ type: "control", action: "release" }));
+    expect(reconnectControl.leaseId).not.toBe(ctlMsg.leaseId); // 새 WS/generation은 새 lease
+    a2.send(JSON.stringify({ type: "control", action: "release", leaseId: reconnectControl.leaseId }));
     await sleep(300);
     expect(await controlOf(port, token)).toBe("agent");
     const f = await reconnectFrameP;

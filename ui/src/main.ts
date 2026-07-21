@@ -2290,6 +2290,7 @@ function makeWebPane(node: WebNode): WebPaneView {
   // ── cast pane 로드 경로(뷰어 ensure_view_bridge 경로와 분리 — 공유는 showPlaceholder·scheduleRetry·
   // frame·urlEl·placeholder·node뿐, 뷰어 동작 불변). passive=조회 전용(spawn 없음)·active=ensure(spawn).
   let castLoadGen = 0; // 마운트 passive와 버튼 active가 경합하면 최신 로드만 반영(느린 invoke 결과 폐기)
+  const castPaneId = newCastEmbedTicket(); // pane 수명 동안 안정, 저장/복원에는 남기지 않는 임대 소유 식별자
   let castHeadfulToasted = false; // 기존 headful 재사용 고지 1회 상한
   let castLastFailure = ""; // 직전 ensure 실패 원인 — toast(8s)가 사라진 뒤에도 placeholder가 계속 인다
   let castLastToasted = ""; // 같은 원인 연속 실패 시 toast 1회만(폭주 상한)
@@ -2315,6 +2316,7 @@ function makeWebPane(node: WebNode): WebPaneView {
       embedGeneration,
       parentOrigin,
       embedTicket: newCastEmbedTicket(),
+      paneId: castPaneId,
     });
     if (!isAllowedWebPaneUrl(url)) return showPlaceholder("차단된 URL — 로드 거부"); // 하드 가드
     castLastFailure = ""; // 로드 성공 = 직전 실패 해소(다음 실패는 다시 고지된다)

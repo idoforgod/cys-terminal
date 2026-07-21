@@ -88,6 +88,7 @@ allowlist라 통과하는데 evidence 번들의 `dom.html`이 **원본 DOM 전�
 `11` NAV_UNAVAILABLE · `12` TAB_LIMIT · `13` NO_TAB · `14` SCHEME_DENIED ·
 `15` BAD_SELECTOR · `16` NOT_VISIBLE · `17` NO_CONTEXT · `18` EVIDENCE_PATH_DENIED ·
 **`19` HUMAN_CID_RESERVED · `20` HUMAN_CID_REQUIRED · `21` PROFILE_MISMATCH**(프로필 격리 위반=보안 거부) ·
+`22` CONTROL_OWNER_REQUIRED · `23` CONTROL_LEASE_MISMATCH ·
 `1` 기타.
 
 > ★19~21 이 따로 있는 이유: 이 셋은 **보안 거부**다. exit 1(기타)로 뭉개지면 에이전트가 일반 오류와

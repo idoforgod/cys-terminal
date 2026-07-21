@@ -77,12 +77,14 @@ test("CastEmbedTicketRegistry — runtime/context/generation 결합, TTL, WS 1�
     context: "default",
     protocolVersion: CAST_PROTOCOL_VERSION,
     embedGeneration: 7,
+    paneId: "pane".padEnd(64, "a"),
     parentOrigin: "tauri://localhost",
   };
 
   expect(registry.issue(base, 1_000)).toBe("issued");
   expect(registry.issue(base, 1_001)).toBe("duplicate"); // iframe URL replay도 거부
   expect(registry.consume({ ...base, embedGeneration: 8 }, 1_002)).toBe("mismatch");
+  expect(registry.consume({ ...base, paneId: "other".padEnd(64, "b") }, 1_002)).toBe("mismatch");
   expect(registry.consume(base, 1_003)).toBe("accepted");
   expect(registry.consume(base, 1_004)).toBe("replayed");
 
@@ -129,14 +131,20 @@ test("parseClientMsg: 전 type 정상 통과", () => {
   });
   expect(parseClientMsg(JSON.stringify({ type: "insertText", text: "안녕" }))).toEqual({ type: "insertText", text: "안녕" });
   expect(parseClientMsg(JSON.stringify({ type: "navigate", url: "https://x.com" }))).toEqual({ type: "navigate", url: "https://x.com" });
-  expect(parseClientMsg(JSON.stringify({ type: "control", action: "release" }))).toEqual({ type: "control", action: "release" });
+  const leaseId = "c".repeat(64);
+  expect(parseClientMsg(JSON.stringify({ type: "control", action: "release", leaseId }))).toEqual({
+    type: "control",
+    action: "release",
+    leaseId,
+  });
 });
 
 test("parseClientMsg: 미지 type·불량 JSON은 null", () => {
   expect(parseClientMsg(JSON.stringify({ type: "explode" }))).toBeNull();
   expect(parseClientMsg("not json")).toBeNull();
   expect(parseClientMsg(JSON.stringify(42))).toBeNull();
-  expect(parseClientMsg(JSON.stringify({ type: "control", action: "acquire" }))).toBeNull(); // release 만 허용
+  expect(parseClientMsg(JSON.stringify({ type: "control", action: "acquire", leaseId: "c".repeat(64) }))).toBeNull(); // release 만 허용
+  expect(parseClientMsg(JSON.stringify({ type: "control", action: "release" }))).toBeNull(); // owner lease 증명 필수
 });
 
 test("parseClientMsg: 좌표 NaN·비유한은 null", () => {

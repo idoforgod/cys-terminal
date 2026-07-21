@@ -299,6 +299,16 @@ async function connectCast(port: number, token: string, sockets: WebSocket[], ci
   return { ws, frames, msgs, lastOf, waitFor };
 }
 
+async function waitHumanLease(msgs: any[], ms = 10000): Promise<string> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const control = [...msgs].reverse().find((m) => m.type === "control" && m.control === "human" && m.leaseId);
+    if (control) return control.leaseId;
+    await sleep(50);
+  }
+  throw new Error("human control lease 대기 타임아웃");
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // ① 선행 수리 (4-T-0)
 // ════════════════════════════════════════════════════════════════════════
@@ -422,8 +432,9 @@ test("4-S-2 deny-by-default: 표에 없는 동사·하위동작은 실행되지 
 }, 180000);
 
 test("4-S-2 A군은 control=human 에서 거부 · B/C군은 허용(축이 분리돼 있다)", async () => {
-  await withServer("p3-ctrl-", async ({ port, token, fx }) => {
+  await withServer("p3-ctrl-", async ({ port, token, fx, sockets }) => {
     expect((await rpc(port, token, "open", { url: `${fx}/form` })).ok).toBe(true);
+    await connectCast(port, token, sockets);
     expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
     // A군 거부
     for (const [verb, args] of [
@@ -581,6 +592,7 @@ test("4-S-4 ①중지는 오류가 아니다 — stop 이 유발한 abort 로 er
     });
     expect(await waitLoading(port, token, false)).toBe(true); // 시작 전 정착
     ws.send(JSON.stringify({ type: "navigate", url: `${fx}/slow` }));
+    const leaseId = await waitHumanLease(msgs);
     expect(await waitLoading(port, token, true)).toBe(true);
     // ★4-S-8: navigate 는 사람이 직접 누른 것 → 즉시 control 획득(이 시점에 확정적으로 검사한다.
     //   나중에 다시 보면 pane 연결이 끊긴 경우 정상적으로 agent 로 복구돼 있어 시간 의존이 된다).
@@ -595,7 +607,7 @@ test("4-S-4 ①중지는 오류가 아니다 — stop 이 유발한 abort 로 er
     expect(await waitLoading(port, token, false, 15000)).toBe(true); // 로딩 표시도 결국 꺼진다
 
     // 중지 뒤에도 세션은 살아있다 — 조작권을 돌려주면 다음 이동이 정상 동작한다.
-    ws.send(JSON.stringify({ type: "control", action: "release" }));
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId }));
     await sleep(400);
     expect((await rpc(port, token, "goto", { url: `${fx}/c` })).ok).toBe(true);
     let navC: any = null;
@@ -837,7 +849,7 @@ test("W-C 뷰포트: pane 크기 반영 + mapInput 정합 + 면적 캡 + 고정/
     const expected = mapInput({ x: px, y: py, cw, ch }, meta)!;
     ws.send(JSON.stringify({ type: "mouse", kind: "pressed", x: px, y: py, cw, ch, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
     ws.send(JSON.stringify({ type: "mouse", kind: "released", x: px, y: py, cw, ch, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
-    ws.send(JSON.stringify({ type: "control", action: "release" }));
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId: await waitHumanLease(msgs) }));
     let pt: any = null;
     for (let i = 0; i < 40; i++) {
       const r = await rpc(port, token, "eval", { expression: "window.__pt" });
@@ -1138,6 +1150,7 @@ test("dialog: control=agent 는 자동 dismiss · control=human 은 사람에게
       ws.send(JSON.stringify({ type: "mouse", kind, x: px, y: py, cw, ch, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
     mouse("pressed"); // ★이 입력이 조작권을 human 으로 만든다(서버가 CDP 전달 전에 acquire 한다)
     mouse("released");
+    const leaseId = await waitHumanLease(msgs);
     const dlg = await nextMsg(ws, (m) => m.type === "dialog", 12000, "dialog 렌더");
     expect((await ctxOf(port, token))?.control).toBe("human"); // 클릭이 조작권을 먼저 가져갔다
     console.log(`[4-T-12] kind=${dlg.kind} message=${dlg.message}`);
@@ -1150,7 +1163,7 @@ test("dialog: control=agent 는 자동 dismiss · control=human 은 사람에게
     // ★조작권 반환은 **사람 경로(WS control)** 로 한다 — RPC control 은 A등급이라 control=human 에서
     //   거부된다(P0-C). 에이전트가 스스로 게이트를 끌 수 없다는 것이 P0-C 의 요점이다.
     await sleep(300);
-    ws.send(JSON.stringify({ type: "control", action: "release" }));
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId }));
     for (let i = 0; i < 40 && (await ctxOf(port, token))?.control !== "agent"; i++) await sleep(100);
     expect((await ctxOf(port, token))?.control).toBe("agent");
     let got: any = null;
@@ -1345,10 +1358,11 @@ test("P1-3 CSP 회귀 핀: cast 앱 응답 헤더의 exfil 차단 조각이 그�
 test("★P0-C control=A: 에이전트는 조작권 게이트를 스스로 끌 수 없다(사람 WS release 는 그대로 동작)", async () => {
   await withServer("p3-p0c-", async ({ port, token, fx, sockets }) => {
     expect((await rpc(port, token, "open", { url: `${fx}/form` })).ok).toBe(true);
-    const { ws } = await connectCast(port, token, sockets);
+    const { ws, msgs } = await connectCast(port, token, sockets);
 
     // 사람이 조작 중인 상태를 만든다.
     expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
+    const leaseId = await waitHumanLease(msgs);
     expect((await ctxOf(port, token))?.control).toBe("human");
 
     // ① 사람 조작 중 eval → HUMAN_ACTIVE (P0-B 게이트 동작 확인)
@@ -1368,7 +1382,7 @@ test("★P0-C control=A: 에이전트는 조작권 게이트를 스스로 끌 �
     expect((await rpc(port, token, "click", { selector: "#dbl" })).error.code).toBe("HUMAN_ACTIVE");
 
     // ④ ★대조 핀 — 사람이 놓는 경로(WS control release)는 손실되지 않았다.
-    ws.send(JSON.stringify({ type: "control", action: "release" }));
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId }));
     for (let i = 0; i < 50 && (await ctxOf(port, token))?.control !== "agent"; i++) await sleep(100);
     expect((await ctxOf(port, token))?.control).toBe("agent");
     expect((await rpc(port, token, "eval", { expression: "1+1" })).ok).toBe(true); // 반환 후엔 정상 동작
