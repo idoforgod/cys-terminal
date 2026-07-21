@@ -33,7 +33,7 @@ pub const ENSURE_WORKER_DEADLINE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(test)]
 mod tests {
-    use super::lifecycle::{UpdateJournal, UpdatePhase};
+    use super::lifecycle::{RuntimeSelection, RuntimeSelectionStore, UpdateJournal, UpdatePhase};
     use super::*;
 
     #[test]
@@ -54,6 +54,95 @@ mod tests {
         }
         assert!(journal.is_terminal());
         assert!(journal.rollback().is_err());
+    }
+
+    #[test]
+    fn runtime_selection_rolls_back_without_mutating_sealed_units() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let units = root.join("sealed-units");
+        let state = root.join("state");
+        let old_id = format!("sha256:{}", "a".repeat(64));
+        let new_id = format!("sha256:{}", "b".repeat(64));
+        std::fs::create_dir_all(units.join("old")).unwrap();
+        std::fs::create_dir_all(units.join("new")).unwrap();
+        std::fs::write(units.join("old/runtime.bin"), b"old-sealed").unwrap();
+        std::fs::write(units.join("new/runtime.bin"), b"new-sealed").unwrap();
+
+        let store = RuntimeSelectionStore::open(&state).unwrap();
+        store
+            .initialize(RuntimeSelection::new(1, old_id.clone()).unwrap())
+            .unwrap();
+        let mut update = store.begin(2, new_id.clone()).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        assert_eq!(store.current().unwrap().runtime_id(), new_id);
+        update.rollback().unwrap();
+        assert_eq!(store.current().unwrap().runtime_id(), old_id);
+        assert_eq!(
+            std::fs::read(units.join("old/runtime.bin")).unwrap(),
+            b"old-sealed"
+        );
+        assert_eq!(
+            std::fs::read(units.join("new/runtime.bin")).unwrap(),
+            b"new-sealed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_selection_recovers_previous_generation_after_interrupted_select() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_id = format!("sha256:{}", "c".repeat(64));
+        let new_id = format!("sha256:{}", "d".repeat(64));
+        let store = RuntimeSelectionStore::open(&root).unwrap();
+        store
+            .initialize(RuntimeSelection::new(5, old_id.clone()).unwrap())
+            .unwrap();
+        let mut update = store.begin(9, new_id).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        drop(update);
+
+        let recovered = RuntimeSelectionStore::open(&root).unwrap();
+        let current = recovered.current().unwrap();
+        assert_eq!(current.runtime_id(), old_id);
+        assert_eq!(current.generation(), 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_selection_commits_only_after_health_and_reopens_cleanly() {
+        let root =
+            std::env::temp_dir().join(format!("cys-browser-runtime-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_id = format!("sha256:{}", "e".repeat(64));
+        let new_id = format!("sha256:{}", "f".repeat(64));
+        let store = RuntimeSelectionStore::open(&root).unwrap();
+        store
+            .initialize(RuntimeSelection::new(1, old_id).unwrap())
+            .unwrap();
+        let mut update = store.begin(2, new_id.clone()).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        assert!(update.advance(UpdatePhase::Commit).is_err());
+        update.advance(UpdatePhase::Health).unwrap();
+        update.advance(UpdatePhase::Commit).unwrap();
+
+        let reopened = RuntimeSelectionStore::open(&root).unwrap();
+        let current = reopened.current().unwrap();
+        assert_eq!(current.runtime_id(), new_id);
+        assert_eq!(current.generation(), 2);
+        let next_id = format!("sha256:{}", "1".repeat(64));
+        assert!(reopened.begin(3, next_id).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
