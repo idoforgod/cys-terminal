@@ -58,7 +58,16 @@ def write_json(path: Path, value: dict) -> None:
 
 def minisign(path: Path, signature: Path, secret_key: Path) -> None:
     subprocess.run(
-        ["minisign", "-Sm", str(path), "-s", str(secret_key), "-x", str(signature)],
+        [
+            "minisign",
+            "-W",
+            "-Sm",
+            str(path),
+            "-s",
+            str(secret_key),
+            "-x",
+            str(signature),
+        ],
         check=True,
     )
 

@@ -35,8 +35,11 @@ artifact**로만 넘긴다. 공개 저장소의 Actions artifact는 읽기 권�
 - Browser Runtime 공통 secrets: `CYS_BROWSER_RUNTIME_SECRET_KEY_B64`,
   `CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64`, `CYS_BROWSER_RUNTIME_KEY_ID`,
   `CYS_BROWSER_RUNTIME_POLICY_EPOCH`, `CYS_BROWSER_RUNTIME_EXPIRES_AT`. 앞의 두 값은 minisign
-  키 파일 전체 바이트의 base64이며, workflow가 러너 임시 디렉터리에만 복원하고 항상 삭제한다.
-  key id와 public key는 바이너리에 컴파일된 active/non-revoked 신뢰근원과 일치해야 한다.
+  **원시 키 파일** 전체 바이트의 base64이며, workflow가 러너 임시 디렉터리에만 복원하고 항상
+  삭제한다. 비밀키는 무인 CI에서 TTY 암호 프롬프트가 생기지 않도록 `minisign -C -W`로 암호 외피를
+  제거한 릴리스 전용 복사본이어야 한다(원본 Tauri updater key는 변경하지 않는다). 메타데이터
+  서명기는 `minisign -W`로 이 계약을 강제한다. key id와 public key는 바이너리에 컴파일된
+  active/non-revoked 신뢰근원과 일치해야 한다.
 
 GitHub 저장소 설정도 코드 밖의 차단 게이트다. 공개 승격 전에 다음 조회가 성공하고,
 `release-production` Environment에 required reviewers와 publish용 secrets가 설정되어 있어야 한다.
