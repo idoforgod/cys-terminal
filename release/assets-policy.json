@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "repository": "idoforgod/cys-terminal",
+  "input_assets": [
+    "cys_{version}_aarch64.dmg",
+    "cys_{version}_x64.dmg",
+    "cys_{version}_x64-setup.exe",
+    "cys_{version}_aarch64.app.tar.gz",
+    "cys_{version}_aarch64.app.tar.gz.sig",
+    "cys_{version}_x64.app.tar.gz",
+    "cys_{version}_x64.app.tar.gz.sig",
+    "cys_{version}_x64-setup.exe.sig",
+    "pack.tar.gz",
+    "pack-manifest.json",
+    "pack-manifest.json.minisig"
+  ],
+  "generated_assets": [
+    "cys_{version}_x64-setup.zip",
+    "latest.json",
+    "SHA256SUMS.txt"
+  ],
+  "install_assets": [
+    "cys_{version}_aarch64.dmg",
+    "cys_{version}_x64.dmg",
+    "cys_{version}_x64-setup.exe",
+    "cys_{version}_x64-setup.zip"
+  ],
+  "defender_marker": "data-cys-release-marker=\"windows-defender-guidance-v1\"",
+  "recovery_marker": "data-cys-release-marker=\"release-recovery-v1\""
+}

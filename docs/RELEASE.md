@@ -1,12 +1,80 @@
 # 릴리스 절차 (cys 터미널)
 
-> **현행 표준 절차(2026-07 정정)**: 릴리스는 **release.yml 자동화**가 정본이다 —
-> ①버전 범프(아래 §0 — **게이트가 강제하는 6곳**)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
-> ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
-> ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
-> ⑤릴리스 자산·`latest.json`(tauri v2 — darwin-aarch64·darwin-x86_64·windows-x86_64 3키) 실측 확인.
-> Windows 인스톨러는 **NSIS**다(`src-tauri/tauri.windows.conf.json targets:["nsis"]`) — 아래 §2·부록의
-> 수동 MSI/WiX 경로는 **legacy(폐기·참고용)**이며 따르지 마라.
+## 0-0. 현행 릴리스 폐쇄 절차 (2026-07-21 정본)
+
+> 이 절과 `release/assets-policy.json`, `release/credential-contract.json`,
+> `.github/workflows/release*.yml`이 현행 정본이다. 아래 절과 충돌하는 종전 수동 발행·직접 공개
+> 설명은 역사적 참고(legacy)로만 읽는다. Windows 인스톨러는 NSIS이며 MSI/WiX 경로는 폐기됐다.
+
+바이너리 태그 `vX.Y.Z`를 push하면 `release.yml`은 플랫폼별 서명 산출물을 **암호화된 Actions
+artifact**로만 넘긴다. 공개 저장소의 Actions artifact는 읽기 권한자에게 노출될 수 있으므로
+평문 후보를 직접 업로드하지 않는다. 단일 조립 잡만 전달물을 복호화해 정확한 자산 집합과 해시를
+검증하고 GitHub Release를
+**draft 한 개**로 생성한다. 이 워크플로에는 공개 전환 경로가 없다. 업로드가 일부라도 실패하면
+불완전 draft를 삭제하고 실패한다.
+
+공개 전환은 다음 조건을 모두 만족한 뒤 `release-publish.yml`을 수동 실행할 때만 가능하다.
+
+1. `release-production` GitHub Environment의 필수 승인 통과
+2. 입력 태그가 기존 draft이고 소스 버전과 일치
+3. 검토한 `SHA256SUMS.txt` 자체의 SHA-256을 `release_bundle_sha256` 입력으로 제공
+4. 허용목록·중복 0·누락 0, 전 자산 해시, Windows ZIP 구조, updater 3플랫폼을 재검증
+5. `confirm` 입력이 정확히 `PUBLISH`
+
+### 필수 CI 입력 이름
+
+값은 GitHub Secrets/Variables에만 저장하고 문서·로그·명령행 출력에 기록하지 않는다.
+
+- macOS secrets: `APPLE_CERTIFICATE_B64`, `APPLE_CERTIFICATE_PASSWORD`,
+  `APPLE_KEYCHAIN_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`,
+  `APPLE_TEAM_ID`, `TAURI_SIGNING_PRIVATE_KEY`
+- Windows secrets: `WINDOWS_CERTIFICATE_B64`, `WINDOWS_CERTIFICATE_PASSWORD`,
+  `WINDOWS_EXPECTED_PUBLISHER`, `TAURI_SIGNING_PRIVATE_KEY`
+- Windows variable: `WINDOWS_TIMESTAMP_URL`(HTTPS RFC3161 TSA)
+- 공통 secret: `RELEASE_HANDOFF_KEY`(무작위 32자 이상, 공개 저장소 Actions handoff 암호화)
+
+입력이 하나라도 비거나 형식이 잘못되면 빌드를 시작하지 않는다. macOS arm64/x64는 각각 앱과
+DMG 공증 제출·staple·Gatekeeper 검증을 통과해야 한다. Windows sidecar와 NSIS 설치 파일은
+SHA-256 Authenticode 서명, HTTPS RFC3161 타임스탬프, 게시자 일치 검증을 통과해야 한다.
+
+### 바이너리 릴리스의 정확한 공개 자산 14개
+
+`X.Y.Z`는 태그에서 `v`를 제외한 버전이다. 이 목록 이외 자산은 조립과 공개를 실패시킨다.
+
+- 설치본 4개: `cys_X.Y.Z_aarch64.dmg`, `cys_X.Y.Z_x64.dmg`,
+  `cys_X.Y.Z_x64-setup.exe`, `cys_X.Y.Z_x64-setup.zip`
+- updater 6개: `cys_X.Y.Z_aarch64.app.tar.gz`, 같은 이름의 `.sig`,
+  `cys_X.Y.Z_x64.app.tar.gz`, 같은 이름의 `.sig`,
+  `cys_X.Y.Z_x64-setup.exe.sig`, `latest.json`
+- pack 3개: `pack.tar.gz`, `pack-manifest.json`, `pack-manifest.json.minisig`
+- 무결성 1개: `SHA256SUMS.txt`(나머지 13개 전부, 누락 0·중복 0)
+
+Windows ZIP은 설치 EXE 하나만 루트에 담는 결정론적 flat ZIP이다. 다운로드 페이지의 Windows
+Defender 안내는 `data-cys-release-marker="windows-defender-guidance-v1"`로 보존한다.
+
+### 홈페이지 승격과 원격 폐쇄 검증
+
+조립 잡의 `assembled-vX.Y.Z` artifact에는 암호화된 `assembled-vX.Y.Z.tgz.enc` 한 파일만
+들어 있다. 보안 저장소에서 `RELEASE_HANDOFF_KEY`를 환경으로 불러온 뒤
+`bash scripts/release-handoff.sh unpack <암호문> <검토 디렉터리>`로 복호화하면 검토 대상
+`release-out/`, 홈페이지 반영본 `release-site/downloads/`, `release-bundle.sha256`이 나온다.
+승인 후 검토된 동일 바이트를 Hostinger의 `/downloads/`에 승격하고, 다운로드 인덱스와 복구
+페이지까지 원격 검증한다.
+
+```sh
+bash scripts/verify-release-remote.sh \
+  --version X.Y.Z \
+  --release-dir /path/to/reviewed/release-out \
+  --site-root https://www.cysinsight.com
+```
+
+검증기는 다운로드 인덱스의 Defender 안내 marker/문구, macOS 격리 우회 문구 부재, 복구 페이지,
+원격 `SHA256SUMS.txt`의 검토본 일치, 체크섬에 적힌 **모든 원격 자산의 실제 바이트 해시**를
+fail-closed로 확인한다.
+
+팩-only 태그는 `pack-release.yml`이 5개 자산을 별도 draft로만 만든다. 공개는 검토한
+`PACK_SHA256SUMS.txt` digest와 `release-production` 승인을 받는
+`pack-release-publish.yml`에서만 수행한다. 바이너리/팩 후보 워크플로에서는 공개 업로드가 0이다.
 
 ## 0-A. 업데이트 발행 이원화 정책 (2026-07-12 오너 확정)
 

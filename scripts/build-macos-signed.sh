@@ -195,8 +195,18 @@ if spctl -a -vv "$APP" 2>&1 | grep -qi "accepted"; then
 else
   echo "  ✗ spctl 거부 — 공증 실패. 위 notarytool 결과를 확인하라"; exit 1
 fi
-xcrun stapler validate "$APP" >/dev/null 2>&1 && echo "  ✓ app 공증 티켓 stapled" || echo "  ⚠ app staple 미확인"
-xcrun stapler validate "$DMG" >/dev/null 2>&1 && echo "  ✓ DMG 공증 티켓 stapled" || echo "  ⚠ DMG staple 미확인(앱 공증되면 설치는 정상)"
+if xcrun stapler validate "$APP" >/dev/null 2>&1; then
+  echo "  ✓ app 공증 티켓 stapled"
+else
+  echo "  ✗ app staple 검증 실패" >&2
+  exit 1
+fi
+if xcrun stapler validate "$DMG" >/dev/null 2>&1; then
+  echo "  ✓ DMG 공증 티켓 stapled"
+else
+  echo "  ✗ DMG staple 검증 실패" >&2
+  exit 1
+fi
 # DMG 자체 Gatekeeper 게이트 — .app spctl만으론 DMG 서명 누락을 못 잡는다(2026-07-04 실측 갭).
 if spctl -a -t open --context context:primary-signature -vv "$DMG" 2>&1 | grep -qi "accepted"; then
   echo "  ✓ DMG spctl: accepted (primary-signature)"
@@ -207,6 +217,8 @@ fi
 echo "== 배포본 정리 + 자동업데이트 매니페스트 =="
 mkdir -p dist-mac
 cp "$DMG" "dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
-sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal >/dev/null 2>&1 || true
+CYS_RELEASE_BUNDLE_ROOT="$BUNDLE_BASE" \
+  sh scripts/make-update-manifest.sh \
+    "$VERSION" idoforgod cys-terminal "$TARGET"
 echo "✓ 공증 빌드 완료: dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
 echo "  → ad-hoc 재서명·xattr 우회 불필요. gh release 발행은 오너 승인 후."

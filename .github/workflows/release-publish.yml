@@ -1,0 +1,66 @@
+name: release-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed draft tag (vX.Y.Z)
+        required: true
+        type: string
+      release_bundle_sha256:
+        description: SHA-256 of the reviewed SHA256SUMS.txt
+        required: true
+        type: string
+      confirm:
+        description: Type PUBLISH to request public promotion
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-public-promotion
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: inputs.confirm == 'PUBLISH'
+    environment: release-production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Re-download and verify the exact draft subject
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          EXPECTED_BUNDLE_SHA256: ${{ inputs.release_bundle_sha256 }}
+          SRC_REPO: idoforgod/cys-terminal
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid tag" >&2; exit 2; }
+          [[ "$EXPECTED_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid release digest" >&2; exit 2; }
+          sh scripts/version-check.sh "$TAG"
+          IS_DRAFT="$(gh release view "$TAG" -R "$SRC_REPO" --json isDraft --jq .isDraft)"
+          [ "$IS_DRAFT" = "true" ] || { echo "release is not a draft" >&2; exit 1; }
+          mkdir reviewed-release
+          gh release download "$TAG" -R "$SRC_REPO" --dir reviewed-release
+          VERSION="${TAG#v}"
+          python3 scripts/release-verify.py \
+            --version "$VERSION" --release-dir reviewed-release
+          ACTUAL_BUNDLE_SHA256="$(shasum -a 256 reviewed-release/SHA256SUMS.txt | awk '{print $1}')"
+          [ "$ACTUAL_BUNDLE_SHA256" = "$EXPECTED_BUNDLE_SHA256" ] || {
+            echo "reviewed release digest mismatch" >&2
+            exit 1
+          }
+
+      - name: Public promotion (environment approval required)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SRC_REPO: idoforgod/cys-terminal
+        run: gh release edit "$TAG" -R "$SRC_REPO" --draft=false --latest
