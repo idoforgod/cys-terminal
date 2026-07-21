@@ -7,7 +7,7 @@
 
 import { chromium, type BrowserContext, type Page, type Dialog, type CDPSession } from "playwright-core";
 import type { ServerWebSocket } from "bun";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual, randomInt } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, rmSync, renameSync } from "node:fs";
 import { join, resolve as resolvePath, sep } from "node:path";
 import {
@@ -412,7 +412,11 @@ async function castRebind(cid: string) {
     if (castHub.get(cid) !== hub || hub.clients.size === 0) {
       await sess.detach().catch(() => {});
       hub.rebinding = false;
-      castCleanupIfEmpty(cid, hub);
+      // A rebind may overlap the last WS close. Preserve the reconnect grace
+      // contract until the async rebind has settled; immediate cleanup here
+      // would reset human control before a short-lived pane reconnects.
+      if (hub.clients.size === 0) scheduleReconnectCleanup(cid, hub);
+      else castCleanupIfEmpty(cid, hub);
       return;
     }
     await castAttach(cid, hub, target, sess);
@@ -436,7 +440,10 @@ async function castRebind(cid: string) {
       // (Page.enable·getFrameTree·startScreencast) 중에 마지막 클라이언트가 나가면 rebinding
       // 플래그가 castCleanupIfEmpty 를 막아 **클라이언트 0인데 screencast 가 도는 고아 세션**이
       // 된다(WS open 경로엔 attach 후 재확인이 있는데 rebind 만 비대칭이었다).
-      castCleanupIfEmpty(cid, hub);
+      // Rebind completion can race the final WS close. Keep the hub and the
+      // human lease through reconnect grace; only the grace timer may clean it.
+      if (hub.clients.size === 0) scheduleReconnectCleanup(cid, hub);
+      else castCleanupIfEmpty(cid, hub);
     }
   }
 }
@@ -449,13 +456,25 @@ function castCleanupIfEmpty(cid: string, expect?: CastEntry) {
   if (!hub || hub.clients.size > 0) return;
   if (expect && hub !== expect) return; // 이미 교체된 hub 는 건드리지 않는다
   if (hub.starting || hub.rebinding) return; // 진행중 경로가 끝나며 스스로 정리한다
+  // Any empty hub is eligible for reconnect grace. This also covers async
+  // open/attach continuations that notice a closed socket before its close
+  // callback records emptySince.
+  if (hub.emptySince === null) {
+    scheduleReconnectCleanup(cid, hub);
+    return;
+  }
   if (hub.reconnectTimer) clearTimeout(hub.reconnectTimer);
   hub.reconnectTimer = null;
   hub.emptySince = null;
   const c = contexts.get(cid);
   // 조작권 복구: 안 되돌리면 pane 을 닫아도 control=human 으로 고착해 이후 모든 에이전트
   // 변경성 동사가 HUMAN_ACTIVE(exit 6)로 거부된다(자율주행 중 워커가 원인불명으로 막힘).
-  if (c && c.control === "human") {
+  // While a reconnect grace is active, retain the human lease. Immediate
+  // cleanup callers can race an async attach/rebind; the grace timer clears
+  // emptySince before invoking this function to authorize final reset.
+  const graceExpired = hub.emptySince !== null && hub.reconnectTimer === null
+    && Date.now() - hub.emptySince >= RECONNECT_GRACE_MS;
+  if (c && c.control === "human" && graceExpired) {
     c.control = "agent";
     c.controlLease = null;
     // ★P1-1: 반복 다이얼로그 카운터도 함께 되돌린다. 안 그러면 사람이 상한까지 소비하고 pane 을
@@ -490,7 +509,16 @@ function scheduleReconnectCleanup(cid: string, expect: CastEntry) {
       emptySince: expect.emptySince,
       now: Date.now(),
     });
-    if (decision === "cleanup") castCleanupIfEmpty(cid, expect);
+    if (decision === "cleanup") {
+      // Lease expiry is independent of CDP teardown; make the transition
+      // explicit before cleanup so a lingering async rebind cannot preserve
+      // human control after the grace deadline.
+      if (expect.clients.size === 0) {
+        const c = contexts.get(cid);
+        if (c?.control === "human") resetHumanControl(cid);
+      }
+      castCleanupIfEmpty(cid, expect);
+    }
     else if (expect.clients.size === 0) scheduleReconnectCleanup(cid, expect);
   }, waitMs);
 }
@@ -2076,9 +2104,14 @@ function tokenEqual(given: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
+// Bun 1.3.x on macOS rejects port 0 (despite the documented ephemeral-port
+// behaviour). Pick a high ephemeral candidate instead; callers may pin one
+// through CYS_BROWSER_PORT for managed-runtime allocation.
+const requestedPort = Number(process.env.CYS_BROWSER_PORT || 0);
+const listenPort = requestedPort > 0 ? requestedPort : randomInt(30000, 60000);
 const server = Bun.serve({
   hostname: "127.0.0.1",
-  port: 0,
+  port: listenPort,
   async fetch(req, srv) {
     const url = new URL(req.url);
 
@@ -2287,7 +2320,12 @@ const server = Bun.serve({
       }
       if (c.control === "human") {
         const lease = c.controlLease;
-        if (reconnectingFromEmpty && lease?.paneId === ws.data.paneId) {
+        // Reconnect grace normally implies an empty hub, but an observer pane
+        // may remain attached while the owner iframe reloads. In that case the
+        // same pane must still renew the lease; otherwise the stale clientId
+        // makes an explicit release fail closed forever.
+        if (lease?.paneId === ws.data.paneId
+          && lease.embedGeneration !== ws.data.embedGeneration) {
           // 같은 GUI pane의 grace 재접속만 소유권을 이어받는다. 새 WS/generation에는 새 lease를
           // 발급해 이전 document가 보유한 lease를 즉시 stale로 만든다.
           c.controlLease = {
@@ -2558,7 +2596,11 @@ const server = Bun.serve({
       hub.clients.delete(ws);
       // owner가 사라졌지만 다른 pane이 남아 있으면 그 pane으로 lease를 암묵 이전하지 않는다.
       // 빈 hub일 때만 같은 pane의 짧은 reconnect grace가 이어받을 기회를 갖는다.
-      if (wasOwner && hub.clients.size > 0) resetHumanControl(cid);
+      // Do not revoke the lease on a transient owner close. The hub remains
+      // inside reconnect grace even when another observer is still attached;
+      // a reconnect from the same pane can therefore prove and renew it.
+      // A non-owner/new pane is rejected by the lease checks until explicit
+      // handoff, while grace expiry performs the final reset.
       scheduleReconnectCleanup(cid, hub);
     },
   },
