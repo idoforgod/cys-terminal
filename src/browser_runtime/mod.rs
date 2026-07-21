@@ -5,6 +5,7 @@
 
 mod compatibility;
 mod error;
+pub mod lifecycle;
 mod manifest;
 mod path;
 mod private_protocol;
@@ -32,7 +33,28 @@ pub const ENSURE_WORKER_DEADLINE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(test)]
 mod tests {
+    use super::lifecycle::{UpdateJournal, UpdatePhase};
     use super::*;
+
+    #[test]
+    fn update_journal_requires_ordered_health_checked_commit() {
+        let mut journal = UpdateJournal::new(7).expect("positive generation");
+        assert_eq!(journal.phase(), UpdatePhase::Stage);
+
+        assert!(journal.advance(UpdatePhase::Commit).is_err());
+        assert_eq!(journal.phase(), UpdatePhase::Stage);
+
+        for phase in [
+            UpdatePhase::Verify,
+            UpdatePhase::Select,
+            UpdatePhase::Health,
+            UpdatePhase::Commit,
+        ] {
+            journal.advance(phase).expect("ordered transition");
+        }
+        assert!(journal.is_terminal());
+        assert!(journal.rollback().is_err());
+    }
 
     #[test]
     fn legacy_state_is_parsed_but_never_compatible() {

@@ -57,7 +57,7 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-R03 | Layout persistence never stores token, port, ticket, or live generation; restore reconstructs a pending descriptor. | `webpane.test.ts` | slice-green |
 | B2-R04 | Retry is single-flight, bounded by attempts and wall time, cancellable on pane close, and never runs from passive restore. | broker mutex + `src/browser_runtime/lifecycle.rs` + UI generation/dispose guards | typed policy/single-flight green; pane-close packaged integration release-gate |
 | B2-R05 | Reconnect grace precedes screencast/CDP release; final idle lease reclaims browser resources without killing cysd/PTYs. | process/CDP census | slice-green grace; idle packaged evidence deferred-P0 |
-| B2-R06 | Runtime update is stage → signature/hash verify → atomic select → health → commit/rollback journal. | `src/browser_runtime/lifecycle.rs` + unit tests in `src/browser_runtime/mod.rs` | typed journal contract green; filesystem/update integration remains deferred-P0 |
+| B2-R06 | Runtime update is stage → signature/hash verify → atomic select → health → commit/rollback journal. | compiled `src/browser_runtime/lifecycle.rs` state machine + unit tests in `src/browser_runtime/mod.rs` | slice-green ordered journal contract; durable filesystem selection/update integration remains deferred-P0 |
 | B2-R07 | Rollback never mutates a signed app bundle in place or falls back to an unqualified external runtime. | signed rollback drill | deferred-P0; ADR-0004 |
 | B2-R08 | The public `cys browser` compatibility command targets the shared in-pane context; headful-only development verbs never report production success without a visible window. | CLI/adapter tests + observe runbook | slice-green |
 
@@ -106,6 +106,8 @@ This snapshot is not packaged-release evidence. `src-tauri/resources/browser-run
 | Command / gate | Result |
 |---|---|
 | browserd `bun run test`, including per-client slow-frame flow | 94/94, exit 0; slow client remains at one unacknowledged frame, catches up to the latest frame after ack, and does not stall a fast client |
+| root library `cargo test --lib` | 151/151, exit 0; Browser update journal is now part of the compiled module graph and rejects skipped or post-terminal transitions |
+| changed Browser Rust modules `rustfmt --check` | exit 0 |
 | `git diff --check` | exit 0 |
 
 This closes the source-level B2-P10 deferred item only. Packaged GUI and signed-artifact evidence remain release gates.

@@ -35,21 +35,81 @@ pub enum UpdatePhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpdateJournal {
-    pub generation: u64,
-    pub phase: UpdatePhase,
+    generation: u64,
+    phase: UpdatePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateJournalError {
+    InvalidGeneration,
+    InvalidTransition { from: UpdatePhase, to: UpdatePhase },
+}
+
+impl std::fmt::Display for UpdateJournalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidGeneration => formatter.write_str("runtime generation must be positive"),
+            Self::InvalidTransition { from, to } => {
+                write!(
+                    formatter,
+                    "invalid runtime update transition: {from:?} -> {to:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpdateJournalError {}
+
+fn invalid_transition(from: UpdatePhase, to: UpdatePhase) -> UpdateJournalError {
+    UpdateJournalError::InvalidTransition { from, to }
 }
 
 impl UpdateJournal {
-    pub fn new(generation: u64) -> Self {
-        Self {
+    pub fn new(generation: u64) -> Result<Self, UpdateJournalError> {
+        if generation == 0 {
+            return Err(UpdateJournalError::InvalidGeneration);
+        }
+        Ok(Self {
             generation,
             phase: UpdatePhase::Stage,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn phase(&self) -> UpdatePhase {
+        self.phase
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.phase, UpdatePhase::Commit | UpdatePhase::Rollback)
+    }
+
+    pub fn advance(&mut self, phase: UpdatePhase) -> Result<(), UpdateJournalError> {
+        let expected = match self.phase {
+            UpdatePhase::Stage => UpdatePhase::Verify,
+            UpdatePhase::Verify => UpdatePhase::Select,
+            UpdatePhase::Select => UpdatePhase::Health,
+            UpdatePhase::Health => UpdatePhase::Commit,
+            UpdatePhase::Commit | UpdatePhase::Rollback => {
+                return Err(invalid_transition(self.phase, phase));
+            }
+        };
+        if phase != expected {
+            return Err(invalid_transition(self.phase, phase));
         }
-    }
-    pub fn advance(&mut self, phase: UpdatePhase) {
         self.phase = phase;
+        Ok(())
     }
-    pub fn rollback(&mut self) {
+
+    pub fn rollback(&mut self) -> Result<(), UpdateJournalError> {
+        if self.is_terminal() {
+            return Err(invalid_transition(self.phase, UpdatePhase::Rollback));
+        }
         self.phase = UpdatePhase::Rollback;
+        Ok(())
     }
 }
