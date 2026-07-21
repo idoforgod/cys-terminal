@@ -814,13 +814,15 @@ test("W-B wirePage 멱등: 채택 경로가 두 번 돌아도 콘솔이 2배가 
   await withServer("p3-wire-", async ({ port, token, fx }) => {
     expect((await rpc(port, token, "open", { url: `${fx}/a` })).ok).toBe(true);
     expect((await rpc(port, token, "tab", { action: "new" })).ok).toBe(true);
-    const before = (await ctxOf(port, token)).console_lines;
-    // 같은 페이지에 콘솔 1줄 — 이중 배선이면 2줄로 잡힌다.
+    // 같은 페이지의 고유 콘솔 마커 1줄 — 이중 배선이면 snapshot에 2번 잡힌다.
+    // 새 탭 직후 Chromium 자체의 비동기 console 메시지가 끼어들 수 있으므로 전체
+    // console_lines 증분을 세면 제품 결함이 아닌 로그 타이밍으로 오탐한다.
     await rpc(port, token, "eval", { expression: "console.log('WIRE-ONCE'),1" });
     await sleep(600);
-    const after = (await ctxOf(port, token)).console_lines;
-    console.log(`[W-B 멱등] console_lines ${before} → ${after}`);
-    expect(after - before).toBe(1);
+    const snapshot = await rpc(port, token, "snapshot", {});
+    const occurrences = (String(snapshot.result?.text || "").match(/WIRE-ONCE/g) || []).length;
+    console.log(`[W-B 멱등] WIRE-ONCE 출현=${occurrences}`);
+    expect(occurrences).toBe(1);
   });
 }, 180000);
 
