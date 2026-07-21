@@ -791,6 +791,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sysinfo",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",

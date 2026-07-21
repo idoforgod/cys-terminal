@@ -80,9 +80,12 @@ export const PICK_OVERLAY_JS = `(() => {
 })()`;
 
 export interface BrowserState {
+  schema_version: 2;
   pid: number;
   port: number;
   token: string;
+  runtime_id: string;
+  process_start_time: number;
   headless?: boolean; // Phase 2 cast: 기동 모드 정직 노출. readState 는 기존 3키만 검증(하위호환·추가만).
 }
 

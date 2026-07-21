@@ -667,8 +667,121 @@ fn browser_open(url: Option<String>) -> Result<Value, String> {
     Ok(serde_json::json!({"spawned": true, "url": target, "profile": "agent"}))
 }
 
-/// ~/.cys/browser/state.json 을 읽어 pid 생존이면 (port, token, headless) 반환, 부재/손상/사멸이면 None.
-/// browserd 엔진(lib.ts writeState)이 {pid, port, token, headless?} 를 0600 원자 기록한다.
+#[derive(Clone, Debug)]
+struct BrowserdStateRecord {
+    pid: u32,
+    port: u16,
+    token: String,
+    runtime_id: String,
+    process_start_time: u64,
+    headless: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserdProcessIdentity {
+    command: String,
+    start_time: u64,
+}
+
+fn strict_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn parse_browserd_state(raw: &str) -> Option<BrowserdStateRecord> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    if v.get("schema_version").and_then(Value::as_u64) != Some(2) {
+        return None;
+    }
+    let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let port = u16::try_from(v.get("port")?.as_u64()?).ok()?;
+    if port == 0 {
+        return None;
+    }
+    let token = v.get("token")?.as_str()?.to_string();
+    let runtime_id = v.get("runtime_id")?.as_str()?.to_string();
+    if !strict_lower_hex(&token, 32) || !strict_lower_hex(&runtime_id, 32) {
+        return None;
+    }
+    let process_start_time = v.get("process_start_time")?.as_u64()?;
+    if process_start_time == 0 {
+        return None;
+    }
+    let headless = match v.get("headless") {
+        Some(Value::Bool(v)) => Some(*v),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(BrowserdStateRecord { pid, port, token, runtime_id, process_start_time, headless })
+}
+
+fn inspect_browserd_process(pid: u32) -> Option<BrowserdProcessIdentity> {
+    let mut sys = sysinfo::System::new();
+    let pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    let process = sys.process(pid)?;
+    let mut command = process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
+    if command.is_empty() {
+        command = process.name().to_string_lossy().into_owned();
+    }
+    Some(BrowserdProcessIdentity { command, start_time: process.start_time() })
+}
+
+fn browserd_command_matches(command: &str) -> bool {
+    let c = command.to_ascii_lowercase();
+    (c.contains("bun") && c.contains("server.ts") && c.contains("browserd")) || c.contains("cys-browserd")
+}
+
+fn probe_browserd_health(state: &BrowserdStateRecord) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, state.port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr.into(), Duration::from_millis(500)) else { return false };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(700)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(700)));
+    let body = r#"{"verb":"status","args":{}}"#;
+    let request = format!(
+        "POST /{}/rpc HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        state.token, state.port, body.len(), body
+    );
+    if stream.write_all(request.as_bytes()).is_err() { return false; }
+    let mut bytes = Vec::new();
+    if stream.take(65_537).read_to_end(&mut bytes).is_err() || bytes.len() > 65_536 { return false; }
+    let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+    let Ok(head) = std::str::from_utf8(&bytes[..split]) else { return false };
+    if !(head.starts_with("HTTP/1.1 200 ") || head.starts_with("HTTP/1.0 200 ")) { return false; }
+    let Ok(v) = serde_json::from_slice::<Value>(&bytes[split + 4..]) else { return false };
+    let Some(result) = v.get("result") else { return false };
+    v.get("ok").and_then(Value::as_bool) == Some(true)
+        && result.get("schema_version").and_then(Value::as_u64) == Some(2)
+        && result.get("pid").and_then(Value::as_u64) == Some(u64::from(state.pid))
+        && result.get("runtime_id").and_then(Value::as_str) == Some(state.runtime_id.as_str())
+        && result.get("process_start_time").and_then(Value::as_u64) == Some(state.process_start_time)
+}
+
+fn read_browserd_state_with<F, P>(path: &std::path::Path, inspect: F, probe: P) -> Option<(u16, String, Option<bool>)>
+where
+    F: FnOnce(u32) -> Option<BrowserdProcessIdentity>,
+    P: FnOnce(&BrowserdStateRecord) -> bool,
+{
+    let state = parse_browserd_state(&std::fs::read_to_string(path).ok()?)?;
+    let identity = inspect(state.pid)?;
+    if !browserd_command_matches(&identity.command)
+        || identity.start_time.abs_diff(state.process_start_time) > 2
+        || !probe(&state)
+    {
+        return None;
+    }
+    Some((state.port, state.token, state.headless))
+}
+
+/// ~/.cys/browser/state.json 은 schema/runtime/process identity와 authenticated loopback health가
+/// 모두 같은 인스턴스를 가리킬 때만 live로 인정한다. PID 생존만으로는 PID 재사용·무관 프로세스를
+/// browserd로 오인하므로 부족하다.
 /// ★headless 는 3-상태다 — 키가 있으면 Some(값), **없거나 bool 이 아니면 None=unknown**. 이 키를 안 쓰던
 /// 구버전 browserd 도 실제로는 headless 로 떠 있을 수 있어, 부재를 false 로 단정하면 GUI 가 "기존 headful
 /// 세션 재사용 — 외부 창 병존" toast 를 **거짓 고지**한다(창이 없는데 있다고 말함 = exit0 거짓말 계열).
@@ -676,21 +789,7 @@ fn browser_open(url: Option<String>) -> Result<Value, String> {
 /// (모르면 말하지 않는다).
 /// pid 생존 판정은 read_live_view_state 와 동형(kill(pid,0): ESRCH=사멸).
 fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bool>)> {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let pid = v.get("pid").and_then(|p| p.as_i64())?;
-    let port = v.get("port").and_then(|p| p.as_u64())?;
-    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
-    let headless = v.get("headless").and_then(|h| h.as_bool()); // 부재·비-bool = None(unknown)
-    // pid 생존 확인 — kill(pid, 0): 0=생존, ESRCH=사멸. (windows는 생존 가정 — 스테일이면 상위 계약이 흡수)
-    #[cfg(unix)]
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    {
-        return None;
-    }
-    let _ = pid;
-    let port = u16::try_from(port).ok()?;
-    Some((port, token, headless))
+    read_browserd_state_with(path, inspect_browserd_process, probe_browserd_health)
 }
 
 /// 지구본 버튼 in-pane(cast) 경로 진입점 — browserd 를 **headless** 로 확보하고 cast 앱이 쓸
@@ -3382,61 +3481,52 @@ mod tests {
         }
     }
 
-    /// [W2] browserd state 파싱 — headless 3-상태(true/false/unknown)·pid 결손 None·손상 JSON None.
-    /// 생존 pid 는 테스트 프로세스 자신(std::process::id())으로 대체(kill(self,0)=생존).
+    /// state는 PID 생존 하나가 아니라 schema+runtime+process identity+authenticated probe의 교집합이다.
     #[test]
     fn browserd_state_parse_and_liveness() {
         let dir = std::env::temp_dir().join("cys-browserd-state-test");
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
-
-        // 정상 JSON(headless:true)·생존 pid → Some, 값 정확 전사.
         let p1 = dir.join("ok.json");
-        std::fs::write(&p1, format!(r#"{{"pid":{me},"port":51234,"token":"tok-abc","headless":true}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p1), Some((51234u16, "tok-abc".to_string(), Some(true))));
+        let token = "a".repeat(32);
+        let runtime = "b".repeat(32);
+        let valid = format!(
+            r#"{{"schema_version":2,"pid":{me},"port":51234,"token":"{token}","runtime_id":"{runtime}","process_start_time":123456,"headless":true}}"#
+        );
+        std::fs::write(&p1, &valid).unwrap();
+        let good_identity = |_| Some(BrowserdProcessIdentity {
+            command: "/runtime/bun run /pack/browserd/server.ts --headless".into(),
+            start_time: 123456,
+        });
+        assert_eq!(
+            read_browserd_state_with(&p1, good_identity, |_| true),
+            Some((51234, token.clone(), Some(true)))
+        );
 
-        // headless:false 명시 → Some(false). GUI 가 병존 toast 를 띄우는 **유일한** 경우다.
-        let p1b = dir.join("headful.json");
-        std::fs::write(&p1b, format!(r#"{{"pid":{me},"port":51235,"token":"t1b","headless":false}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p1b), Some((51235u16, "t1b".to_string(), Some(false))));
+        // 같은 PID라도 command/start-time/probe 중 하나가 다르면 모두 stale이다.
+        assert_eq!(read_browserd_state_with(&p1, |_| Some(BrowserdProcessIdentity {
+            command: "/usr/bin/unrelated-live-process".into(), start_time: 123456,
+        }), |_| true), None);
+        assert_eq!(read_browserd_state_with(&p1, |_| Some(BrowserdProcessIdentity {
+            command: "/runtime/bun run /pack/browserd/server.ts".into(), start_time: 1,
+        }), |_| true), None);
+        assert_eq!(read_browserd_state_with(&p1, |_| Some(BrowserdProcessIdentity {
+            command: "/runtime/bun run /pack/browserd/server.ts".into(), start_time: 123456,
+        }), |_| false), None);
 
-        // ★headless 키 부재 → unknown(None) — false 로 단정 금지(정직성 회귀 핀). 구버전 browserd 가
-        // 실제로는 headless 로 떠 있어도 false 로 채우면 GUI 가 "외부 창 병존"을 거짓 고지한다.
-        let p2 = dir.join("nohl.json");
-        std::fs::write(&p2, format!(r#"{{"pid":{me},"port":6000,"token":"t2"}}"#)).unwrap();
-        assert_eq!(read_browserd_state(&p2), Some((6000u16, "t2".to_string(), None)));
+        // 살아 있는 테스트 프로세스 PID를 끼운 stale state도 실제 reader에서는 alive가 아니다.
+        assert_eq!(read_browserd_state(&p1), None, "unrelated live PID를 browserd로 오인 금지");
 
-        // headless 가 bool 이 아님(손상·타입 드리프트) → 역시 unknown(None).
-        let p2b = dir.join("badhl.json");
-        std::fs::write(&p2b, format!(r#"{{"pid":{me},"port":6001,"token":"t2b","headless":"yes"}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p2b), Some((6001u16, "t2b".to_string(), None)));
-
-        // unknown 은 JSON 에서 null 로 나가야 GUI 의 `=== false` 엄격 비교가 침묵한다(고지 계약).
-        assert!(json!({"headless": None::<bool>})["headless"].is_null(), "unknown=null 직렬화");
-
-        // pid 필드 결손 → None(파싱 실패).
-        let p3 = dir.join("nopid.json");
-        std::fs::write(&p3, r#"{"port":6000,"token":"t3"}"#).unwrap();
-        assert_eq!(read_browserd_state(&p3), None);
-
-        // 손상 JSON → None.
-        let p4 = dir.join("corrupt.json");
-        std::fs::write(&p4, "{not json").unwrap();
-        assert_eq!(read_browserd_state(&p4), None);
-
-        // 파일 부재 → None.
-        assert_eq!(read_browserd_state(&dir.join("absent.json")), None);
-
-        // pid 사망 → None(browserd_state 의 alive:false 근거) — 존재 불가 pid.
-        #[cfg(unix)]
-        {
-            let p5 = dir.join("dead.json");
-            std::fs::write(&p5, format!(r#"{{"pid":{},"port":6000,"token":"t5"}}"#, i32::MAX)).unwrap();
-            assert_eq!(read_browserd_state(&p5), None, "존재 불가 pid 는 사멸로 간주");
+        for bad in [
+            valid.replace("\"schema_version\":2", "\"schema_version\":1"),
+            valid.replace(&token, "short"),
+            valid.replace("\"port\":51234", "\"port\":0"),
+            valid.replace(&runtime, &"G".repeat(32)),
+            valid.replace("\"headless\":true", "\"headless\":\"yes\""),
+        ] {
+            assert!(parse_browserd_state(&bad).is_none(), "strict schema/token/port/runtime validation");
         }
+        assert!(parse_browserd_state("{not json").is_none());
     }
 
     /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.

@@ -1516,7 +1516,10 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
   switch (verb) {
     case "status": {
       return {
+        schema_version: 2,
         pid: process.pid,
+        runtime_id: castRuntimeId,
+        process_start_time: processStartTime,
         headless: HEADLESS,
         contexts: [...contexts.entries()].map(([id, c]) => ({
           id,
@@ -2054,8 +2057,9 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
 // --- HTTP 서버 (127.0.0.1, port 0) ---
 const token = genToken();
 // 프로세스마다 바뀌는 비공개 runtime identity. ticket이 구 browserd 재기동을 넘어 재사용되지 않게
-// registry descriptor에 결합한다. state/로그/응답에는 노출하지 않는다.
+// registry descriptor와 authenticated state/health 응답에 결합한다.
 const castRuntimeId = genToken();
+const processStartTime = Math.floor(Date.now() / 1000 - process.uptime());
 const castEmbedTickets = new CastEmbedTicketRegistry();
 
 // 상수시간 토큰 비교(F6) — 길이 불일치는 즉시 false(timingSafeEqual은 길이 다르면 throw).
@@ -2622,7 +2626,15 @@ function releaseHuman(cid: string, ws: ServerWebSocket<CastData>, leaseId: strin
   return true;
 }
 
-const state: BrowserState = { pid: process.pid, port: server.port, token, headless: HEADLESS };
+const state: BrowserState = {
+  schema_version: 2,
+  pid: process.pid,
+  port: server.port,
+  token,
+  runtime_id: castRuntimeId,
+  process_start_time: processStartTime,
+  headless: HEADLESS,
+};
 writeState(state);
 
 // 유휴 자동 종료 + 로딩 표시 워치독.
