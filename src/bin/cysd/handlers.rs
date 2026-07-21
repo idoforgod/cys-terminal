@@ -222,7 +222,7 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
 
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
 /// (cys CLI 프로세스는 pane 셸의 자손이므로 조상 추적으로 소속 pane이 확정된다)
-fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
+pub(crate) fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
     {
         let cache = daemon.caller_cache.lock().unwrap();
         if let Some((sid, ts, cached_start)) = cache.get(&caller_pid) {
@@ -975,6 +975,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
     // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
     if let Some(sub) = req.method.strip_prefix("channel.") {
         return crate::channels::handle(daemon, sub, &params, &id, caller_pid);
+    }
+    if let Some(operation) = req.method.strip_prefix("browser.runtime.") {
+        return Reply::Single(match crate::authority_broker::handle(
+            daemon,
+            operation,
+            &params,
+            caller_pid,
+        ) {
+            Ok(result) => ok_response(&id, result),
+            Err(error) => err_response(&id, &error.code, &error.message),
+        });
     }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),

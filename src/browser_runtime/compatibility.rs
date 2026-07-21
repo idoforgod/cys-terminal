@@ -37,7 +37,11 @@ impl CompatibilityRequirement {
         protocol: ProtocolRequirement,
         engine_key: EngineKey,
     ) -> Self {
-        Self { runtime_id: runtime_id.into(), protocol, engine_key }
+        Self {
+            runtime_id: runtime_id.into(),
+            protocol,
+            engine_key,
+        }
     }
 }
 
@@ -83,11 +87,17 @@ pub fn evaluate_compatibility(
     }
     for capability in &state.protocol.required_capabilities {
         if !required.protocol.required_capabilities.contains(capability) {
-            issues.push(CompatibilityIssue::PeerRequiredCapability(capability.clone()));
+            issues.push(CompatibilityIssue::PeerRequiredCapability(
+                capability.clone(),
+            ));
         }
     }
     if state.engine_key != required.engine_key {
         issues.push(CompatibilityIssue::EngineKey);
     }
-    if issues.is_empty() { Compatibility::Compatible } else { Compatibility::Incompatible(issues) }
+    if issues.is_empty() {
+        Compatibility::Compatible
+    } else {
+        Compatibility::Incompatible(issues)
+    }
 }

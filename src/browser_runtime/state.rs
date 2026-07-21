@@ -26,7 +26,10 @@ pub struct EngineKey {
 
 impl EngineKey {
     pub fn shared_default() -> Self {
-        Self { realm: "shared-default".into(), mode: EngineMode::Headless }
+        Self {
+            realm: "shared-default".into(),
+            mode: EngineMode::Headless,
+        }
     }
 }
 
@@ -76,17 +79,23 @@ impl RuntimeStateV2 {
             || self.engine_generation == 0
             || self.profile_epoch == 0
         {
-            return Err(BrowserError::corrupt_state("v2 state has a zero identity or endpoint"));
+            return Err(BrowserError::corrupt_state(
+                "v2 state has a zero identity or endpoint",
+            ));
         }
         if !is_hex_id(&self.instance_id, 32)
             || !is_sha256_id(&self.runtime_id)
             || !is_sha256_id(&self.attestation_id)
             || !is_sha256_id(&self.policy_hash)
         {
-            return Err(BrowserError::corrupt_state("v2 state contains a malformed identity"));
+            return Err(BrowserError::corrupt_state(
+                "v2 state contains a malformed identity",
+            ));
         }
         if self.protocol.min_minor > self.protocol.max_minor || self.engine_key.realm.is_empty() {
-            return Err(BrowserError::corrupt_state("v2 state protocol or engine key is invalid"));
+            return Err(BrowserError::corrupt_state(
+                "v2 state protocol or engine key is invalid",
+            ));
         }
         Ok(())
     }
@@ -159,5 +168,7 @@ fn is_hex_id(value: &str, len: usize) -> bool {
 }
 
 fn is_sha256_id(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|v| is_hex_id(v, 64))
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|v| is_hex_id(v, 64))
 }

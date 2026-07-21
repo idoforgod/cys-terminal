@@ -38,6 +38,7 @@ libc = "0.2"
 chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+hmac = "0.12"
 # 무중단 팩 채널 manifest 서명검증(§7-①): verify-only 순수 Rust(서명키 미포함=공격면 최소).
 minisign-verify = "0.2"
 # tauri 형식 pubkey(전체 .pub 파일 base64)·서명 자산 디코드용(verify 경로 한정).

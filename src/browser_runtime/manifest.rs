@@ -111,9 +111,9 @@ impl RuntimeManifest {
 
     pub fn runtime_id_for_value(value: &Value) -> Result<String, BrowserError> {
         let mut value = value.clone();
-        let object = value.as_object_mut().ok_or_else(|| {
-            BrowserError::invalid_manifest("manifest root must be a JSON object")
-        })?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| BrowserError::invalid_manifest("manifest root must be a JSON object"))?;
         object.remove("runtime_id");
         object.remove("signature");
         object.remove("attestation");
@@ -152,7 +152,9 @@ impl RuntimeManifest {
             || self.chromium.license.is_empty()
             || self.chromium.profile_schema_epoch == 0
         {
-            return Err(BrowserError::invalid_manifest("manifest identity or protocol is incomplete"));
+            return Err(BrowserError::invalid_manifest(
+                "manifest identity or protocol is incomplete",
+            ));
         }
         for (target, assets) in &self.targets {
             let expected_arch = match target {
@@ -187,7 +189,9 @@ fn safe_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
         && !value.starts_with('\\')
-        && value.split(['/', '\\']).all(|part| !matches!(part, "" | "." | ".."))
+        && value
+            .split(['/', '\\'])
+            .all(|part| !matches!(part, "" | "." | ".."))
 }
 
 fn write_canonical(value: &Value, output: &mut String) -> Result<(), BrowserError> {
@@ -217,9 +221,11 @@ fn write_canonical(value: &Value, output: &mut String) -> Result<(), BrowserErro
                 if index != 0 {
                     output.push(',');
                 }
-                output.push_str(&serde_json::to_string(key).map_err(|e| {
-                    BrowserError::invalid_manifest(format!("key encoding: {e}"))
-                })?);
+                output.push_str(
+                    &serde_json::to_string(key).map_err(|e| {
+                        BrowserError::invalid_manifest(format!("key encoding: {e}"))
+                    })?,
+                );
                 output.push(':');
                 write_canonical(&values[key], output)?;
             }

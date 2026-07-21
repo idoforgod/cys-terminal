@@ -5,8 +5,16 @@ use cys::browser_runtime::{
     ProtocolRequirement, RuntimeManifest, RuntimeStateV2, TargetTriple,
 };
 use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+mod runtime_launcher;
+
+static SHARED_BROKER: OnceLock<
+    Result<AuthorityBroker<runtime_launcher::RealSupervisorLauncher>, BrokerFailure>,
+> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
@@ -17,6 +25,32 @@ pub struct BrokerConfig {
 }
 
 impl BrokerConfig {
+    pub fn bundled() -> Result<Self, BrokerFailure> {
+        let executable = std::env::current_exe().map_err(|error| {
+            BrokerFailure::new(
+                "RUNTIME_NOT_FOUND",
+                format!("cysd path unavailable: {error}"),
+            )
+        })?;
+        let executable_dir = executable.parent().ok_or_else(|| {
+            BrokerFailure::new("RUNTIME_NOT_FOUND", "cysd has no containing directory")
+        })?;
+        #[cfg(target_os = "macos")]
+        let resource_root = executable_dir.join("../Resources/browser-runtime");
+        #[cfg(windows)]
+        let resource_root = executable_dir.join("browser-runtime");
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let resource_root = executable_dir.join("browser-runtime");
+        let state_root = cys::home_dir().join(".cys/browser/instances/v2/shared-default-headless");
+        Ok(Self {
+            manifest_path: resource_root.join("browser-runtime.lock.json"),
+            runtime_root: resource_root.join("runtime"),
+            state_path: state_root.join("state.json"),
+            target: TargetTriple::current()
+                .map_err(|error| BrokerFailure::new(error.code().as_str(), error.to_string()))?,
+        })
+    }
+
     #[cfg(test)]
     fn for_test(manifest_path: PathBuf, runtime_root: PathBuf, state_path: PathBuf) -> Self {
         Self {
@@ -31,9 +65,11 @@ impl BrokerConfig {
 #[derive(Clone, Debug)]
 pub struct LaunchRequest {
     pub manifest: RuntimeManifest,
+    pub manifest_path: PathBuf,
     pub target: TargetTriple,
     pub runtime_root: PathBuf,
     pub state_path: PathBuf,
+    pub authority: VerifiedAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +104,9 @@ pub struct VerifiedAuthority {
     pub kind: AuthorityKind,
     pub caller_pid: u32,
     pub subject: String,
+    pub receipt_id: String,
+    pub normalized_request_hash: String,
+    pub subject_hash: String,
 }
 
 impl VerifiedAuthority {
@@ -77,12 +116,18 @@ impl VerifiedAuthority {
             kind: AuthorityKind::UserGesture,
             caller_pid: std::process::id(),
             subject: "test-user-gesture".into(),
+            receipt_id: "test-receipt".into(),
+            normalized_request_hash: format!("sha256:{}", "8".repeat(64)),
+            subject_hash: format!("sha256:{}", "9".repeat(64)),
         }
     }
 
     fn permits_shared_start(&self) -> bool {
         self.caller_pid != 0
             && !self.subject.is_empty()
+            && !self.receipt_id.is_empty()
+            && self.normalized_request_hash.starts_with("sha256:")
+            && self.subject_hash.starts_with("sha256:")
             && matches!(
                 self.kind,
                 AuthorityKind::UserGesture
@@ -210,9 +255,11 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
             .map_err(|error| BrokerFailure::new(error.code().as_str(), error.to_string()))?;
         let state = self.launcher.launch(&LaunchRequest {
             manifest,
+            manifest_path: self.config.manifest_path.clone(),
             target: self.config.target.clone(),
             runtime_root: self.config.runtime_root.clone(),
             state_path: self.config.state_path.clone(),
+            authority: authority.clone(),
         })?;
         let status = self.status_for_v2(state.clone());
         if !matches!(status, BrokerStatus::Compatible { .. }) {
@@ -282,6 +329,168 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
             },
         }
     }
+}
+
+/// cysd dispatch adapter. It is the only public entry to the Browser extension;
+/// callers submit logical intent and never executable or state paths.
+pub fn handle(
+    daemon: &crate::state::Daemon,
+    operation: &str,
+    params: &Value,
+    caller_pid: Option<u32>,
+) -> Result<Value, BrokerFailure> {
+    let broker = shared_broker()?;
+    match operation {
+        "probe" => serde_json::to_value(broker.probe()).map_err(|error| {
+            BrokerFailure::new(
+                "BROWSER_UNAVAILABLE",
+                format!("status encode failed: {error}"),
+            )
+        }),
+        "ensure" => {
+            let authority = verified_authority(daemon, params, caller_pid)?;
+            serde_json::to_value(broker.ensure_shared(&authority)?).map_err(|error| {
+                BrokerFailure::new(
+                    "BROWSER_UNAVAILABLE",
+                    format!("status encode failed: {error}"),
+                )
+            })
+        }
+        _ => Err(BrokerFailure::new(
+            "METHOD_NOT_FOUND",
+            format!("unknown Browser Runtime operation {operation}"),
+        )),
+    }
+}
+
+fn shared_broker(
+) -> Result<&'static AuthorityBroker<runtime_launcher::RealSupervisorLauncher>, BrokerFailure> {
+    match SHARED_BROKER.get_or_init(|| {
+        BrokerConfig::bundled().map(|config| {
+            AuthorityBroker::new(config, Arc::new(runtime_launcher::RealSupervisorLauncher))
+        })
+    }) {
+        Ok(broker) => Ok(broker),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn verified_authority(
+    daemon: &crate::state::Daemon,
+    params: &Value,
+    caller_pid: Option<u32>,
+) -> Result<VerifiedAuthority, BrokerFailure> {
+    let caller_pid = caller_pid
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| BrokerFailure::new("AUTHORITY_REJECTED", "peer process is unavailable"))?;
+    let requested = params
+        .get("authority_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BrokerFailure::new("AUTHORITY_REJECTED", "authority_kind is required"))?;
+    let caller_surface = crate::handlers::resolve_caller_surface(daemon, caller_pid);
+    let role = caller_surface.and_then(|surface_id| {
+        daemon
+            .get_surface(surface_id)
+            .and_then(|surface| surface.role.lock().unwrap().clone())
+    });
+    let (kind, subject) = match requested {
+        "user_gesture"
+            if caller_surface.is_none()
+                && process_basename(caller_pid).as_deref() == Some(app_name()) =>
+        {
+            let window = required_param(params, "window_label")?;
+            let pane = required_param(params, "pane_nonce")?;
+            let gesture = required_param(params, "gesture_id")?;
+            (
+                AuthorityKind::UserGesture,
+                format!("PanePrepare:{window}:{pane}:{gesture}:shared-default/headless"),
+            )
+        }
+        "authorized_worker_operation"
+            if role.as_deref().is_some_and(|role| {
+                role == "worker" || role.starts_with("worker-") || role.starts_with("worker_")
+            }) =>
+        {
+            let task = required_param(params, "task_id")?;
+            (
+                AuthorityKind::AuthorizedWorkerOperation,
+                format!("OperationStart:{task}:shared-default/headless"),
+            )
+        }
+        "direct_user_cli" => {
+            return Err(BrokerFailure::new(
+                "DIRECT_USER_CONFIRMATION_REQUIRED",
+                "TTY or a roleless cys process is not sufficient DirectUserCli authority",
+            ));
+        }
+        "reviewer_verification_job" => {
+            return Err(BrokerFailure::new(
+                "AUTHORITY_REJECTED",
+                "reviewer verification cannot start shared-default Browser Runtime",
+            ));
+        }
+        _ => {
+            return Err(BrokerFailure::new(
+                "AUTHORITY_REJECTED",
+                format!(
+                    "caller role/process does not match requested Browser authority (role={})",
+                    role.as_deref().unwrap_or("unregistered")
+                ),
+            ));
+        }
+    };
+    let normalized = json!({
+        "method":"browser.runtime.ensure",
+        "authority_kind":requested,
+        "caller_pid":caller_pid,
+        "subject":subject,
+    });
+    let request_hash = sha256_id(&serde_json::to_vec(&normalized).unwrap_or_default());
+    let subject_hash = sha256_id(subject.as_bytes());
+    let receipt_id = crate::channels::random_token_hex()
+        .map_err(|error| BrokerFailure::new("AUTHORITY_UNAVAILABLE", error))?;
+    Ok(VerifiedAuthority {
+        kind,
+        caller_pid,
+        subject,
+        receipt_id,
+        normalized_request_hash: request_hash,
+        subject_hash,
+    })
+}
+
+fn required_param(params: &Value, key: &str) -> Result<String, BrokerFailure> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .map(str::to_owned)
+        .ok_or_else(|| BrokerFailure::new("AUTHORITY_REJECTED", format!("{key} is required")))
+}
+
+fn sha256_id(input: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(input))
+}
+
+fn app_name() -> &'static str {
+    if cfg!(windows) {
+        "cys-app.exe"
+    } else {
+        "cys-app"
+    }
+}
+
+fn process_basename(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    system
+        .process(Pid::from_u32(pid))?
+        .exe()?
+        .file_name()?
+        .to_str()?
+        .to_owned()
+        .into()
 }
 
 #[cfg(test)]

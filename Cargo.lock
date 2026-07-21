@@ -811,6 +811,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo",
  "windows-sys 0.59.0",
 ]
 
@@ -823,6 +824,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "hmac",
  "libc",
  "minisign",
  "minisign-verify",

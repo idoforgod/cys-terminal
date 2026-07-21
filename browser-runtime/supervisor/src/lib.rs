@@ -1,7 +1,7 @@
 //! Native Browser Runtime supervisor.
 
 use cys::browser_runtime::{
-    EngineKey, RuntimeManifest, RuntimePaths, RuntimeStateV2, TargetTriple,
+    EngineKey, RuntimeManifest, RuntimePaths, RuntimeStateV2, TargetTriple, VerifiedBrokerHello,
 };
 use std::fs::File;
 use std::path::PathBuf;
@@ -13,14 +13,14 @@ pub struct SupervisorError {
 }
 
 impl SupervisorError {
-    fn authority(message: impl Into<String>) -> Self {
+    pub fn authority(message: impl Into<String>) -> Self {
         Self {
             code: "AUTHORITY_REJECTED",
             message: message.into(),
         }
     }
 
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -64,9 +64,35 @@ impl SupervisorConfig {
 
 #[derive(Debug)]
 pub struct BrokerChannel {
+    pub broker_pid: u32,
+    pub broker_session_id: String,
     pub command_sequence: u64,
     pub challenge: [u8; 32],
+    pub consumed_receipt_id: String,
+    pub normalized_request_hash: String,
+    pub subject_hash: String,
     pub expected_runtime_id: String,
+    pub attestation_id: String,
+    pub policy_epoch: u64,
+    pub policy_hash: String,
+}
+
+impl BrokerChannel {
+    pub fn from_verified(hello: VerifiedBrokerHello, session_key: [u8; 32]) -> Self {
+        Self {
+            broker_pid: hello.broker_pid,
+            broker_session_id: hello.broker_session_id,
+            command_sequence: hello.command_sequence,
+            challenge: session_key,
+            consumed_receipt_id: hello.consumed_receipt_id,
+            normalized_request_hash: hello.normalized_request_hash,
+            subject_hash: hello.subject_hash,
+            expected_runtime_id: hello.expected_runtime_id,
+            attestation_id: hello.attestation_id,
+            policy_epoch: hello.policy_epoch,
+            policy_hash: hello.policy_hash,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,14 +192,24 @@ impl Supervisor {
                 "an inherited cysd broker channel is required",
             ));
         };
-        if broker.command_sequence == 0 || broker.challenge.iter().all(|byte| *byte == 0) {
+        if broker.broker_pid == 0
+            || broker.command_sequence != 1
+            || broker.challenge.iter().all(|byte| *byte == 0)
+            || broker.consumed_receipt_id.is_empty()
+            || broker.normalized_request_hash.is_empty()
+            || broker.subject_hash.is_empty()
+        {
             return Err(SupervisorError::authority(
-                "invalid broker session challenge",
+                "invalid broker session identity or start command",
             ));
         }
-        if broker.expected_runtime_id.is_empty() {
+        if broker.expected_runtime_id.is_empty()
+            || broker.attestation_id.is_empty()
+            || broker.policy_epoch == 0
+            || broker.policy_hash.is_empty()
+        {
             return Err(SupervisorError::authority(
-                "broker omitted expected runtime identity",
+                "broker omitted runtime attestation or policy identity",
             ));
         }
         let parent = config.state_path.parent().ok_or_else(|| {
@@ -231,9 +267,9 @@ impl Supervisor {
             supervisor_build_id: manifest.supervisor.build_id.clone(),
             engine_build_id: manifest.engine.build_id.clone(),
             runtime_id: manifest.runtime_id,
-            attestation_id: format!("sha256:{}", "0".repeat(64)),
-            policy_epoch: 1,
-            policy_hash: format!("sha256:{}", "0".repeat(64)),
+            attestation_id: broker.attestation_id,
+            policy_epoch: broker.policy_epoch,
+            policy_hash: broker.policy_hash,
             protocol: manifest.browser_protocol,
             chromium_revision: manifest.chromium.revision,
             engine_key,
@@ -595,9 +631,17 @@ mod tests {
 
     fn channel(runtime_id: String) -> BrokerChannel {
         BrokerChannel {
+            broker_pid: 99,
+            broker_session_id: format!("sha256:{}", "1".repeat(64)),
             command_sequence: 1,
             challenge: [7; 32],
+            consumed_receipt_id: "test-receipt".into(),
+            normalized_request_hash: format!("sha256:{}", "2".repeat(64)),
+            subject_hash: format!("sha256:{}", "3".repeat(64)),
             expected_runtime_id: runtime_id,
+            attestation_id: format!("sha256:{}", "4".repeat(64)),
+            policy_epoch: 1,
+            policy_hash: format!("sha256:{}", "5".repeat(64)),
         }
     }
 

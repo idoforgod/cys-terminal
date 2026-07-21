@@ -3,12 +3,12 @@
 //! Callers see typed state and compatibility decisions. Filesystem shape,
 //! legacy parsing and runtime validation stay behind this module boundary.
 
-mod error;
 mod compatibility;
-mod state;
+mod error;
 mod manifest;
 mod path;
-mod lifecycle;
+mod private_protocol;
+mod state;
 
 pub use compatibility::{
     evaluate_compatibility, Compatibility, CompatibilityIssue, CompatibilityRequirement,
@@ -20,33 +20,15 @@ pub use manifest::{
     TargetTriple,
 };
 pub use path::RuntimePaths;
+pub use private_protocol::{BrokerHello, VerifiedBrokerHello};
 pub use state::{
     parse_runtime_state, EngineKey, EngineMode, LegacyRuntimeState, ParsedRuntimeState,
     ProtocolRange, RuntimeStateV2,
 };
-pub use lifecycle::{RetryPolicy, RetryState, UpdateJournal, UpdatePhase};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retry_is_bounded_and_cancellable() {
-        let p = RetryPolicy { max_attempts: 3, max_elapsed_ms: 1000 };
-        assert!(p.allows(RetryState { attempts: 0, started_ms: 10, cancelled: false }, 10));
-        assert!(!p.allows(RetryState { attempts: 3, started_ms: 10, cancelled: false }, 10));
-        assert!(!p.allows(RetryState { attempts: 0, started_ms: 10, cancelled: true }, 10));
-        assert!(!p.allows(RetryState { attempts: 1, started_ms: 10, cancelled: false }, 1010));
-    }
-
-    #[test]
-    fn update_journal_never_mutates_in_place_and_can_rollback() {
-        let mut j = UpdateJournal::new(7);
-        j.advance(UpdatePhase::Verify);
-        j.advance(UpdatePhase::Health);
-        j.rollback();
-        assert_eq!(j, UpdateJournal { generation: 7, phase: UpdatePhase::Rollback });
-    }
 
     #[test]
     fn legacy_state_is_parsed_but_never_compatible() {
@@ -89,7 +71,10 @@ mod tests {
             EngineKey::shared_default(),
         );
 
-        assert_eq!(evaluate_compatibility(&parsed, &required), Compatibility::Compatible);
+        assert_eq!(
+            evaluate_compatibility(&parsed, &required),
+            Compatibility::Compatible
+        );
     }
 
     #[test]
@@ -124,7 +109,13 @@ mod tests {
             .expect("release-qualified manifest");
 
         assert_eq!(manifest.runtime_id, id);
-        assert_eq!(manifest.target(&TargetTriple::Aarch64AppleDarwin).unwrap().architecture, "arm64");
+        assert_eq!(
+            manifest
+                .target(&TargetTriple::Aarch64AppleDarwin)
+                .unwrap()
+                .architecture,
+            "arm64"
+        );
     }
 
     #[cfg(unix)]
@@ -160,13 +151,42 @@ mod tests {
             license_files: vec!["LICENSE.chromium".into()],
         };
 
-        let error = RuntimePaths::resolve_existing(
-            &root,
-            &TargetTriple::Aarch64AppleDarwin,
-            &assets,
-        )
-        .expect_err("symlinked supervisor must never be executable authority");
+        let error =
+            RuntimePaths::resolve_existing(&root, &TargetTriple::Aarch64AppleDarwin, &assets)
+                .expect_err("symlinked supervisor must never be executable authority");
         assert_eq!(error.code(), BrowserErrorCode::RuntimePathRejected);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_broker_hello_is_parent_bound_mac_verified_and_single_sequence() {
+        let session_key = [0x5a; 32];
+        let hello = BrokerHello::signed(
+            4242,
+            1,
+            "receipt-1",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            7,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            session_key,
+        )
+        .expect("broker can create a private hello");
+
+        let verified = hello
+            .verify(4242, session_key)
+            .expect("the inherited peer and MAC agree");
+        assert_eq!(verified.command_sequence, 1);
+        assert_eq!(verified.policy_epoch, 7);
+        assert!(
+            hello.verify(7, session_key).is_err(),
+            "forged parent is rejected"
+        );
+        assert!(
+            hello.verify(4242, [0x33; 32]).is_err(),
+            "wrong session key is rejected"
+        );
     }
 }
