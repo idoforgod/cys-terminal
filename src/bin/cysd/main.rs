@@ -11,6 +11,7 @@ mod alerts;
 mod analytics;
 mod approval;
 mod approval_risk;
+mod authority_broker;
 mod caps;
 mod channels;
 mod classifier;

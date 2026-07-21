@@ -1,4 +1,5 @@
 use crate::browser_runtime::{BrowserError, TargetAssets, TargetTriple};
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,7 +27,9 @@ impl RuntimePaths {
             .map_err(|e| BrowserError::runtime_path(format!("runtime root unavailable: {e}")))?;
         let target_root = resolve_without_links(&root, Path::new(target.as_str()))?;
         if !target_root.is_dir() {
-            return Err(BrowserError::runtime_path("target runtime root is not a directory"));
+            return Err(BrowserError::runtime_path(
+                "target runtime root is not a directory",
+            ));
         }
         let suffix = target.executable_suffix();
         let supervisor = resolve_without_links(
@@ -55,7 +58,11 @@ impl RuntimePaths {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for (kind, path) in [("supervisor", &supervisor), ("engine", &engine), ("chromium", &chromium)] {
+            for (kind, path) in [
+                ("supervisor", &supervisor),
+                ("engine", &engine),
+                ("chromium", &chromium),
+            ] {
                 let mode = std::fs::metadata(path)
                     .map_err(|e| BrowserError::runtime_path(format!("{kind} metadata: {e}")))?
                     .permissions()
@@ -67,15 +74,43 @@ impl RuntimePaths {
                 }
             }
         }
-        Ok(Self { target_root, supervisor, engine, chromium })
+        Ok(Self {
+            target_root,
+            supervisor,
+            engine,
+            chromium,
+        })
     }
+
+    pub fn verify_pinned_executables(&self, assets: &TargetAssets) -> Result<(), BrowserError> {
+        verify_file_hash(&self.supervisor, &assets.supervisor_sha256, "supervisor")?;
+        verify_file_hash(&self.engine, &assets.engine_sha256, "engine")?;
+        Ok(())
+    }
+}
+
+fn verify_file_hash(path: &Path, expected: &str, label: &str) -> Result<(), BrowserError> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| BrowserError::runtime_integrity(format!("{label} open failed: {e}")))?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)
+        .map_err(|e| BrowserError::runtime_integrity(format!("{label} hash failed: {e}")))?;
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected.to_ascii_lowercase() {
+        return Err(BrowserError::runtime_integrity(format!(
+            "{label} hash mismatch"
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_without_links(base: &Path, relative: &Path) -> Result<PathBuf, BrowserError> {
     let mut current = base.to_path_buf();
     for component in relative.components() {
         let Component::Normal(part) = component else {
-            return Err(BrowserError::runtime_path("runtime path contains a non-normal segment"));
+            return Err(BrowserError::runtime_path(
+                "runtime path contains a non-normal segment",
+            ));
         };
         current.push(part);
         reject_symlink(&current, "runtime path segment")?;
@@ -84,7 +119,9 @@ fn resolve_without_links(base: &Path, relative: &Path) -> Result<PathBuf, Browse
         .canonicalize()
         .map_err(|e| BrowserError::runtime_path(format!("runtime path unavailable: {e}")))?;
     if !canonical.starts_with(base) {
-        return Err(BrowserError::runtime_path("runtime path escapes target root"));
+        return Err(BrowserError::runtime_path(
+            "runtime path escapes target root",
+        ));
     }
     Ok(canonical)
 }
@@ -93,7 +130,9 @@ fn reject_symlink(path: &Path, label: &str) -> Result<(), BrowserError> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| BrowserError::runtime_path(format!("{label} unavailable: {e}")))?;
     if metadata.file_type().is_symlink() {
-        return Err(BrowserError::runtime_path(format!("{label} must not be a symlink")));
+        return Err(BrowserError::runtime_path(format!(
+            "{label} must not be a symlink"
+        )));
     }
     Ok(())
 }
