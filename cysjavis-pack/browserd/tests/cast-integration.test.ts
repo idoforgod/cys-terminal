@@ -5,6 +5,8 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RECONNECT_GRACE_MS } from "../cast";
+import { issueCastEmbed } from "./cast-test-client";
 
 const BROWSERD_DIR = join(import.meta.dir, "..");
 
@@ -22,6 +24,26 @@ async function readStderr(proc: any, ms = 3000): Promise<string> {
   } catch {
     return "(stderr 수집 실패)";
   }
+}
+
+// Browserd owns a Playwright/Chromium child.  Killing only the Bun parent
+// leaves that child holding inherited pipes (and occasionally the listener),
+// which makes the next test nondeterministically hang or hit EADDRINUSE.
+async function terminateServer(proc: any): Promise<void> {
+  try { proc.kill("SIGTERM"); } catch {}
+  try {
+    await Promise.race([
+      proc.exited,
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+  } catch {}
+  try { proc.kill("SIGKILL"); } catch {}
+  try {
+    await Promise.race([
+      proc.exited,
+      new Promise((resolve) => setTimeout(resolve, 1000)),
+    ]);
+  } catch {}
 }
 
 function sleep(ms: number) {
@@ -94,6 +116,58 @@ async function rpc(port: number, token: string, verb: string, args?: any): Promi
   return res.json();
 }
 
+async function controlOf(port: number, token: string, cid = "default"): Promise<string | undefined> {
+  const status = await rpc(port, token, "status", {});
+  return (status?.result?.contexts || []).find((x: any) => x.id === cid)?.control;
+}
+
+test("control lease는 owner pane/session/generation만 반환할 수 있다", async () => {
+  const home = mkdtempSync(join(tmpdir(), "cast-lease-"));
+  const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
+    cwd: BROWSERD_DIR,
+    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const sockets: WebSocket[] = [];
+  let failed = false;
+  try {
+    const { port, token } = await waitState(home, 30000);
+    expect((await rpc(port, token, "open", { url: "https://example.com" })).ok).toBe(true);
+
+    const ownerPane = "a".repeat(64);
+    const owner = new WebSocket((await issueCastEmbed(port, token, "default", ownerPane)).wsUrl);
+    sockets.push(owner);
+    expect(await wsOpen(owner, 10000)).toBe(true);
+    const leaseP = nextMsg(owner, (m) => m.type === "control" && m.control === "human", 10000, "owner lease");
+    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
+    const lease = await leaseP;
+    expect(lease.leaseId).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
+
+    const other = new WebSocket((await issueCastEmbed(port, token, "default", "b".repeat(64))).wsUrl);
+    sockets.push(other);
+    expect(await wsOpen(other, 10000)).toBe(true);
+    const deniedP = nextMsg(other, (m) => m.type === "err" && m.code === "CONTROL_LEASE_MISMATCH", 10000, "stale/other release denied");
+    other.send(JSON.stringify({ type: "control", action: "release", leaseId: lease.leaseId }));
+    expect((await deniedP).code).toBe("CONTROL_LEASE_MISMATCH");
+    expect(await controlOf(port, token)).toBe("human");
+    expect((await rpc(port, token, "eval", { expression: "1+1" })).error.code).toBe("HUMAN_ACTIVE");
+
+    owner.send(JSON.stringify({ type: "control", action: "release", leaseId: lease.leaseId }));
+    for (let i = 0; i < 50 && (await controlOf(port, token)) !== "agent"; i++) await sleep(100);
+    expect(await controlOf(port, token)).toBe("agent");
+    expect((await rpc(port, token, "eval", { expression: "1+1" })).ok).toBe(true);
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    for (const ws of sockets) try { ws.close(); } catch {}
+    await terminateServer(proc);
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  }
+}, 180000);
+
 test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·생존", async () => {
   const home = mkdtempSync(join(tmpdir(), "cast-it-"));
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
@@ -107,11 +181,16 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     const st = await waitState(home, 30000);
     const port: number = st.port;
     const token: string = st.token;
-    const base = `ws://127.0.0.1:${port}/${token}/cast/ws?context=default`;
+    const base = (await issueCastEmbed(port, token)).wsUrl;
 
     // ① WS 접속(Origin 없음) → 첫 frame 수신 → ack
     const ws = new WebSocket(base);
     expect(await wsOpen(ws, 10000)).toBe(true);
+    // 같은 embed ticket의 두 번째 WS와 descriptor 없는 legacy WS는 모두 fail-closed다.
+    const replay = new WebSocket(base);
+    expect(await wsOpen(replay, 5000)).toBe(false);
+    const bare = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=default`);
+    expect(await wsOpen(bare, 5000)).toBe(false);
     const frame = await nextMsg(ws, (m) => m.type === "frame", 20000, "first frame");
     expect(frame.metadata).toBeTruthy();
     const dw: number = frame.metadata.deviceWidth;
@@ -140,9 +219,11 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     // cw/ch=metadata 값 → scale 1·letterbox 0 → 중앙 클릭이 뷰포트 중앙에 매핑.
     const cx = Math.floor(dw / 2);
     const cy = Math.floor(dh / 2);
+    const clickLeaseP = nextMsg(ws, (m) => m.type === "control" && m.control === "human" && m.leaseId, 5000, "click control lease");
     ws.send(JSON.stringify({ type: "mouse", kind: "pressed", x: cx, y: cy, cw: dw, ch: dh, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
     ws.send(JSON.stringify({ type: "mouse", kind: "released", x: cx, y: cy, cw: dw, ch: dh, button: "left", clickCount: 1, modifiers: 0, deltaX: 0, deltaY: 0 }));
-    ws.send(JSON.stringify({ type: "control", action: "release" })); // control 반환 → eval 판독 가능
+    const clickLease = await clickLeaseP;
+    ws.send(JSON.stringify({ type: "control", action: "release", leaseId: clickLease.leaseId })); // control 반환 → eval 판독 가능
     let clicked = 0;
     for (let i = 0; i < 40; i++) {
       const r = await rpc(port, token, "eval", { expression: "window.__t" });
@@ -173,7 +254,8 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     expect(await wsOpen(badTok, 5000)).toBe(false);
 
     // ⑥ 잘못된 Origin → 실패
-    const badOrigin = new WebSocket(base, { headers: { Origin: "http://evil.example" } } as any);
+    const badOriginUrl = (await issueCastEmbed(port, token)).wsUrl;
+    const badOrigin = new WebSocket(badOriginUrl, { headers: { Origin: "http://evil.example" } } as any);
     expect(await wsOpen(badOrigin, 5000)).toBe(false);
 
     // ⑦ RPC status → 프로세스 생존
@@ -184,7 +266,7 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
     failed = true;
     throw e;
   } finally {
-    proc.kill();
+    await terminateServer(proc);
     // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
@@ -193,15 +275,12 @@ test("cast WS 통합: 프레임·입력 왕복·스킴/토큰/Origin 게이트·
   }
 }, 90000);
 
-// 연속 애니메이션 페이지 — 매 프레임 paint 를 만들어 스트림이 흐르는지 직접 관측한다.
-const ANIM_URL =
-  "data:text/html,<style>@keyframes s{from{transform:translateX(0)}to{transform:translateX(600px)}}" +
-  "div{width:200px;height:200px;background:red;animation:s .8s linear infinite}</style><div></div>";
-
 // 회귀 핀: CDP sessionId 를 dedup 키로 쓰면 첫 ack 이후 전부 차단되어 스트림이 영구 스톨한다(0fps).
 // fid dedup 이어야 계속 흐른다. 동시에 30fps 상한이 실제로 걸리는지도 단언한다.
 test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린다 + 다중 클라이언트 dedup", async () => {
   const home = mkdtempSync(join(tmpdir(), "cast-stream-"));
+  const fixture = startFixtureServer();
+  const animUrl = `http://127.0.0.1:${fixture.port}/anim`;
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
     cwd: BROWSERD_DIR,
     env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
@@ -214,14 +293,12 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
     const st = await waitState(home, 30000);
     const port: number = st.port;
     const token: string = st.token;
-    const wsUrl = `ws://127.0.0.1:${port}/${token}/cast/ws?context=default`;
-
     // 애니메이션 페이지를 먼저 로드(RPC open — 이 시점 control=agent).
-    const opened = await rpc(port, token, "open", { url: ANIM_URL });
+    const opened = await rpc(port, token, "open", { url: animUrl });
     expect(opened.ok).toBe(true);
 
     // --- 1단계: 단일 클라이언트 지속 스트림 ---
-    const a = new WebSocket(wsUrl);
+    const a = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(a);
     expect(await wsOpen(a, 10000)).toBe(true);
 
@@ -259,7 +336,7 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
     for (let i = 1; i < fidsA.length; i++) expect(fidsA[i]).toBeGreaterThan(fidsA[i - 1]); // fid 단조 증가
 
     // --- 2단계: 클라이언트 2개가 같은 fid 를 각각 ack 해도 스트림 유지(dedup) ---
-    const b = new WebSocket(wsUrl);
+    const b = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(b);
     expect(await wsOpen(b, 10000)).toBe(true);
 
@@ -331,7 +408,7 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
     b.close();
     await sleep(800); // 마지막 close 처리(stop+detach) 여유
 
-    const c = new WebSocket(wsUrl);
+    const c = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(c);
     expect(await wsOpen(c, 10000)).toBe(true);
     let count3 = 0;
@@ -363,11 +440,83 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
       } catch {}
     }
     proc.kill();
+    fixture.stop(true);
     // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {}
+  }
+}, 120000);
+
+test("cast 느린 클라이언트: 확인 전 렌더 1개만, 확인 후 최신 프레임으로 수렴", async () => {
+  const home = mkdtempSync(join(tmpdir(), "cast-slow-client-"));
+  const fixture = startFixtureServer();
+  const animUrl = `http://127.0.0.1:${fixture.port}/anim`;
+  const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
+    cwd: BROWSERD_DIR,
+    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let failed = false;
+  const sockets: WebSocket[] = [];
+  try {
+    const { port, token } = await waitState(home, 30000);
+    expect((await rpc(port, token, "open", { url: animUrl })).ok).toBe(true);
+
+    const slow = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    sockets.push(slow);
+    const slowFids: number[] = [];
+    slow.addEventListener("message", (ev) => {
+      try {
+        const m = JSON.parse(ev.data as string);
+        if (m.type === "frame") slowFids.push(m.fid);
+      } catch {}
+    });
+    expect(await wsOpen(slow, 10000)).toBe(true);
+
+    const fast = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    sockets.push(fast);
+    let fastFrames = 0;
+    fast.addEventListener("message", (ev) => {
+      try {
+        const m = JSON.parse(ev.data as string);
+        if (m.type !== "frame") return;
+        fastFrames++;
+        fast.send(JSON.stringify({ type: "ack", fid: m.fid }));
+      } catch {}
+    });
+    expect(await wsOpen(fast, 10000)).toBe(true);
+
+    for (let i = 0; i < 100 && (slowFids.length < 1 || fastFrames < 5); i++) await sleep(100);
+    expect(slowFids.length).toBe(1);
+    expect(fastFrames).toBeGreaterThanOrEqual(5);
+    const firstSlowFid = slowFids[0];
+
+    await sleep(1500);
+    expect(slowFids).toEqual([firstSlowFid]);
+    const fastBeforeResume = fastFrames;
+
+    slow.send(JSON.stringify({ type: "ack", fid: firstSlowFid }));
+    for (let i = 0; i < 50 && slowFids.length < 2; i++) await sleep(100);
+    expect(slowFids.length).toBe(2);
+    expect(slowFids[1]).toBeGreaterThan(firstSlowFid);
+
+    await sleep(800);
+    expect(slowFids.length).toBe(2);
+    expect(fastFrames).toBeGreaterThan(fastBeforeResume);
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    for (const ws of sockets) {
+      try { ws.close(); } catch {}
+    }
+    await terminateServer(proc);
+    fixture.stop(true);
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
   }
 }, 120000);
 
@@ -384,12 +533,13 @@ async function controlOf(port: number, token: string, cid = "default"): Promise<
   return found?.control;
 }
 
-const STATIC_URL = "data:text/html,<h1>static</h1>";
-
 // 회귀 핀: ①control 초기 상태를 첫 클라이언트에도 전송 ②hover(mousemove)로 조작권 탈취 금지
-// ③전 클라이언트 close 시 control 복구 ④정적 페이지에서 두 번째 클라이언트가 캐시 프레임 즉시 수신.
+// ③전 클라이언트 close 시 reconnect grace 동안 control 유지 후 복구
+// ④정적 페이지에서 두 번째 클라이언트가 캐시 프레임 즉시 수신.
 test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", async () => {
   const home = mkdtempSync(join(tmpdir(), "cast-ctrl-"));
+  const fixture = startFixtureServer();
+  const staticUrl = `http://127.0.0.1:${fixture.port}/static`;
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
     cwd: BROWSERD_DIR,
     env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
@@ -402,29 +552,27 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
     const st = await waitState(home, 30000);
     const port: number = st.port;
     const token: string = st.token;
-    const wsUrl = `ws://127.0.0.1:${port}/${token}/cast/ws?context=default`;
-
-    expect((await rpc(port, token, "open", { url: STATIC_URL })).ok).toBe(true);
-    // cast 클라이언트가 붙기 전에 이미 human 인 상태를 만든다(에이전트 CLI 가 조작권을 잡은 상황).
-    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
-    expect(await controlOf(port, token)).toBe("human");
-
-    // ① 첫 클라이언트도 현재 control 을 받아야 한다(툴바 stale 표시 방지).
-    const a = new WebSocket(wsUrl);
+    expect((await rpc(port, token, "open", { url: staticUrl })).ok).toBe(true);
+    const paneId = "r".repeat(64);
+    const a = new WebSocket((await issueCastEmbed(port, token, "default", paneId)).wsUrl);
     sockets.push(a);
     expect(await wsOpen(a, 10000)).toBe(true);
-    const ctlMsg = await nextMsg(a, (m) => m.type === "control", 20000, "첫 클라이언트 control 초기 상태");
+    const ctlMsgP = nextMsg(a, (m) => m.type === "control" && m.control === "human", 20000, "owner control lease");
+    // RPC acquire도 임의/ownerless 상태를 만들지 않고 유일한 live pane에 귀속된다.
+    expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
+    expect(await controlOf(port, token)).toBe("human");
+    const ctlMsg = await ctlMsgP;
     expect(ctlMsg.control).toBe("human");
+    expect(ctlMsg.leaseId).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
 
-    // ③ 마지막 클라이언트가 나가면 control 은 agent 로 복구된다(고착 방지).
+    // ③ 순간 WS 단절은 reconnect grace 동안 human lease와 CDP를 유지한다.
     a.close();
     await sleep(800);
-    expect(await controlOf(port, token)).toBe("agent");
+    expect(await controlOf(port, token)).toBe("human");
 
-    // 재접속해서 입력 경계 검증.
-    const a2 = new WebSocket(wsUrl);
+    // grace 안 재접속은 기존 lease를 이어받는다. 이후 사람이 명시 handoff하고 입력 경계를 검증한다.
+    const a2 = new WebSocket((await issueCastEmbed(port, token, "default", paneId)).wsUrl);
     sockets.push(a2);
-    expect(await wsOpen(a2, 10000)).toBe(true);
     let lastFidA2 = -1;
     a2.addEventListener("message", (ev) => {
       let m: any;
@@ -437,7 +585,17 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
       lastFidA2 = m.fid;
       a2.send(JSON.stringify({ type: "ack", fid: m.fid }));
     });
-    const f = await nextMsg(a2, (m) => m.type === "frame", 20000, "정적 페이지 첫 프레임");
+    // 기존 hub의 캐시 frame/control은 open 직후 즉시 올 수 있으므로 open 대기보다 먼저 구독한다.
+    const reconnectFrameP = nextMsg(a2, (m) => m.type === "frame", 20000, "정적 페이지 첫 프레임");
+    const reconnectControlP = nextMsg(a2, (m) => m.type === "control", 5000, "grace 재접속 control");
+    expect(await wsOpen(a2, 10000)).toBe(true);
+    const reconnectControl = await reconnectControlP;
+    expect(reconnectControl.control).toBe("human");
+    expect(reconnectControl.leaseId).not.toBe(ctlMsg.leaseId); // 새 WS/generation은 새 lease
+    a2.send(JSON.stringify({ type: "control", action: "release", leaseId: reconnectControl.leaseId }));
+    await sleep(300);
+    expect(await controlOf(port, token)).toBe("agent");
+    const f = await reconnectFrameP;
     const dw: number = f.metadata.deviceWidth;
     const dh: number = f.metadata.deviceHeight;
 
@@ -460,17 +618,19 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
     // ④ 정적 페이지 — 두 번째 클라이언트는 새 프레임이 영영 안 오므로 캐시 프레임을 즉시 받아야 한다.
     await sleep(500);
     const fidBefore = lastFidA2;
-    const b = new WebSocket(wsUrl);
+    const b = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(b);
     expect(await wsOpen(b, 10000)).toBe(true);
     const bFrame = await nextMsg(b, (m) => m.type === "frame", 3000, "두 번째 클라이언트 캐시 프레임");
     // 캐시본이므로 새로 생성된 프레임이 아니다(fid 가 앞서 본 최신 fid 를 넘지 않는다).
     expect(bFrame.fid).toBeLessThanOrEqual(fidBefore);
 
-    // ③' 클라이언트가 2개여도 전부 나가면 복구된다.
+    // ③' 클라이언트가 2개여도 전부 나가면 grace 뒤 복구된다.
     a2.close();
     b.close();
     await sleep(800);
+    expect(await controlOf(port, token)).toBe("human");
+    await sleep(RECONNECT_GRACE_MS);
     expect(await controlOf(port, token)).toBe("agent");
   } catch (e) {
     failed = true;
@@ -482,6 +642,7 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
       } catch {}
     }
     proc.kill();
+    fixture.stop(true);
     // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
@@ -495,6 +656,8 @@ test("cast control 경계·복구 + 신규 클라이언트 캐시 프레임", as
 // (CLI 의 cys feed 결재 게이트는 이 경로 바깥 — 서버 계약만 검증한다).
 test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부", async () => {
   const home = mkdtempSync(join(tmpdir(), "cast-human-"));
+  const fixture = startFixtureServer();
+  const staticUrl = `http://127.0.0.1:${fixture.port}/static`;
   const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
     cwd: BROWSERD_DIR,
     env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
@@ -512,7 +675,7 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
     // (요청은 "humanctx" 로 보내지만 서버가 "human" 으로 낙착시킨다 — sot/observe 가 context 를
     //  안 실어 "default" 로 떨어지던 경로를 구조적으로 막는다.)
     const opened = await rpc(port, token, "open", {
-      url: STATIC_URL,
+      url: staticUrl,
       profile: "human",
       approved: true,
       context: "humanctx",
@@ -521,14 +684,14 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
     expect(opened.result.profile).toBe("human");
     expect(opened.result.context).toBe("human");
 
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=human`);
+    const ws = new WebSocket((await issueCastEmbed(port, token, "human")).wsUrl);
     sockets.push(ws);
     expect(await wsOpen(ws, 10000)).toBe(true);
     const err = await nextMsg(ws, (m) => m.type === "err", 15000, "HUMAN_PROFILE_PROTECTED");
     expect(err.code).toBe("HUMAN_PROFILE_PROTECTED");
 
     // agent 프로필 컨텍스트는 정상 통과해야 한다(거부가 무차별이 아님을 대조 확인).
-    const okWs = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=default`);
+    const okWs = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(okWs);
     expect(await wsOpen(okWs, 10000)).toBe(true);
     const frame = await nextMsg(okWs, (m) => m.type === "frame", 20000, "agent 프로필 프레임");
@@ -543,6 +706,7 @@ test("cast: human 프로필 컨텍스트는 HUMAN_PROFILE_PROTECTED 로 거부",
       } catch {}
     }
     proc.kill();
+    fixture.stop(true);
     // 정상 경로에서는 stderr 를 아예 읽지 않는다(무한 대기 위험을 감수할 이유가 없다).
     if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
     try {
@@ -570,11 +734,9 @@ test("cast 고아 hub 레이스: cold-start 중 즉시 close 후에도 신규 �
     const st = await waitState(home, 30000);
     const port: number = st.port;
     const token: string = st.token;
-    const wsUrl = `ws://127.0.0.1:${port}/${token}/cast/ws?context=default`;
-
     // 컨텍스트가 아직 없는 상태에서 접속 → open() 이 Chromium cold-start 를 await 한다.
     // 그 창에서 즉시 끊는다(pane 닫기·GUI 종료·iframe 재로드와 동일 상황).
-    const doomed = new WebSocket(wsUrl);
+    const doomed = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(doomed);
     expect(await wsOpen(doomed, 10000)).toBe(true);
     doomed.close();
@@ -608,7 +770,7 @@ test("cast 고아 hub 레이스: cold-start 중 즉시 close 후에도 신규 �
 
     // 이후 신규 접속이 정상적으로 프레임을 받아야 한다(고아 hub 면 영구 0).
     for (let i = 1; i <= 2; i++) {
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
       sockets.push(ws);
       expect(await wsOpen(ws, 10000)).toBe(true);
       const f = await nextMsg(ws, (m) => m.type === "frame", 25000, `재접속 ${i} 프레임`);
@@ -618,8 +780,13 @@ test("cast 고아 hub 레이스: cold-start 중 즉시 close 후에도 신규 �
       await sleep(600);
     }
 
-    // 전부 닫힌 뒤: hub 잔여 0 + stop 이 start 만큼 실제로 호출됐어야 한다(자원 누수 차단 계약).
+    // 전부 닫힌 직후에는 reconnect grace 때문에 hub가 살아 있어야 한다.
     await sleep(800);
+    const duringGrace = await castStat(port, token);
+    expect(duringGrace.hubs).toBe(1);
+    expect(duringGrace.clients).toBe(0);
+    // grace 뒤: hub 잔여 0 + stop 이 start 만큼 실제로 호출됐어야 한다(자원 누수 차단 계약).
+    await sleep(RECONNECT_GRACE_MS);
     const cs = await castStat(port, token);
     console.log(`[고아 hub] hubs=${cs.hubs} clients=${cs.clients} started=${cs.started} stopped=${cs.stopped}`);
     expect(cs.hubs).toBe(0);
@@ -653,6 +820,11 @@ function startFixtureServer() {
     fetch(req) {
       const path = new URL(req.url).pathname;
       const html = (b: string) => new Response(`<!doctype html><meta charset=utf-8>${b}`, { headers: { "content-type": "text/html; charset=utf-8" } });
+      if (path === "/static") return html("<h1>STATIC-PAGE</h1>");
+      if (path === "/anim") return html(
+        "<style>@keyframes s{from{transform:translateX(0)}to{transform:translateX(600px)}}" +
+          "div{width:200px;height:200px;background:red;animation:s .8s linear infinite}</style><div></div>"
+      );
       if (path === "/orig") return html("<h1 id=t>ORIGINAL-PAGE</h1>");
       if (path === "/popup") return html("<h1 id=p>POPUP-PAGE</h1>");
       if (path === "/console") return html("<h1>CONSOLE</h1><script>console.log('HELLO-LOG');setTimeout(function(){throw new Error('BOOM-ERR')},0);</script>");
@@ -684,7 +856,7 @@ test("cast 팝업 채택: window.open → 새 페이지 프레임·nav 수신 + 
 
     expect((await rpc(port, token, "open", { url: `${fx}/orig` })).ok).toBe(true);
 
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=default`);
+    const ws = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(ws);
     expect(await wsOpen(ws, 10000)).toBe(true);
     ws.addEventListener("message", (ev) => {

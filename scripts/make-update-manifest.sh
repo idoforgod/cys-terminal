@@ -1,60 +1,85 @@
 #!/bin/sh
-# 자동 업데이트 manifest(latest.json) 생성 — tauri build가 만든 서명(.sig)을 모아
-# Tauri updater가 읽는 표준 포맷으로 묶는다.
-#
-# 전제: `bun x @tauri-apps/cli build`를 TAURI_SIGNING_PRIVATE_KEY(+PASSWORD)로 실행해
-#       createUpdaterArtifacts 산출물(.app.tar.gz + .app.tar.gz.sig)이 생성돼 있어야 한다.
-#
-# 사용:  sh scripts/make-update-manifest.sh <version> <github_owner> [repo]
-# 예:    sh scripts/make-update-manifest.sh 0.2.0 cysfuturist cys-terminal
-set -e
+# Emit one architecture-correct updater fragment and normalized updater assets.
+# The release assembler is the sole writer that merges these fragments into the
+# final latest.json. No signing credential is read here.
+set -eu
+
 cd "$(dirname "$0")/.."
 
-VERSION="${1:?usage: make-update-manifest.sh <version> <owner> [repo]}"
+VERSION="${1:?usage: make-update-manifest.sh <version> <owner> [repo] [target]}"
 OWNER="${2:?owner required}"
 REPO="${3:-cys-terminal}"
-NOTES="${UPDATE_NOTES:-cys $VERSION}"
+TARGET="${4:-}"
 
-BUNDLE="target/release/bundle/macos"
-SIG_FILE="$BUNDLE/cys.app.tar.gz.sig"
-TARBALL="$BUNDLE/cys.app.tar.gz"
-
-if [ ! -f "$SIG_FILE" ]; then
-  echo "error: $SIG_FILE 없음 — 먼저 서명 키로 tauri build를 실행하라:" >&2
-  echo "  TAURI_SIGNING_PRIVATE_KEY=\$(cat ~/.tauri/cys-updater.key) bun x @tauri-apps/cli build" >&2
-  exit 1
+if [ -z "$TARGET" ]; then
+  case "$(uname -m)" in
+    arm64) TARGET=aarch64-apple-darwin ;;
+    x86_64) TARGET=x86_64-apple-darwin ;;
+    *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 2 ;;
+  esac
 fi
 
-SIGNATURE="$(cat "$SIG_FILE")"
-# 업로드 자산 이름(릴리스에 올릴 표준 이름) — latest.json의 url과 일치해야 한다
-ASSET="cys-${VERSION}-macos-aarch64.app.tar.gz"
-URL="https://github.com/${OWNER}/${REPO}/releases/download/v${VERSION}/${ASSET}"
+case "$TARGET" in
+  aarch64-apple-darwin)
+    ARCH=aarch64
+    PLATFORM=darwin-aarch64
+    ;;
+  x86_64-apple-darwin)
+    ARCH=x64
+    PLATFORM=darwin-x86_64
+    ;;
+  *)
+    echo "unsupported updater target: $TARGET" >&2
+    exit 2
+    ;;
+esac
+
+if [ -n "${CYS_RELEASE_BUNDLE_ROOT:-}" ]; then
+  BUNDLE="$CYS_RELEASE_BUNDLE_ROOT"
+elif [ -d "target/$TARGET/release/bundle/macos" ]; then
+  BUNDLE="target/$TARGET/release/bundle"
+else
+  BUNDLE="target/release/bundle"
+fi
+OUTPUT="${CYS_RELEASE_OUTPUT_DIR:-dist-update}"
+TARBALL="$BUNDLE/macos/cys.app.tar.gz"
+SIG_FILE="$TARBALL.sig"
+
+[ -s "$TARBALL" ] || { echo "missing updater archive: $TARBALL" >&2; exit 1; }
+[ -s "$SIG_FILE" ] || { echo "missing updater signature: $SIG_FILE" >&2; exit 1; }
+mkdir -p "$OUTPUT"
+
+ASSET="cys_${VERSION}_${ARCH}.app.tar.gz"
+SIG_ASSET="$ASSET.sig"
+cp "$TARBALL" "$OUTPUT/$ASSET"
+cp "$SIG_FILE" "$OUTPUT/$SIG_ASSET"
+
 PUBDATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 - "$VERSION" "$OWNER" "$REPO" "$PLATFORM" "$ASSET" \
+  "$OUTPUT/$SIG_ASSET" "$OUTPUT/latest-$PLATFORM.json" "$PUBDATE" <<'PY'
+import json
+import pathlib
+import sys
 
-mkdir -p dist-update
-cp "$TARBALL" "dist-update/${ASSET}"
-cat > dist-update/latest.json <<JSON
-{
-  "version": "${VERSION}",
-  "notes": "${NOTES}",
-  "pub_date": "${PUBDATE}",
-  "platforms": {
-    "darwin-aarch64": {
-      "signature": "${SIGNATURE}",
-      "url": "${URL}"
-    }
-  }
+version, owner, repo, platform, asset, sig_path, output, pub_date = sys.argv[1:]
+signature = pathlib.Path(sig_path).read_text(encoding="utf-8").strip()
+if not signature:
+    raise SystemExit("empty updater signature")
+payload = {
+    "version": version,
+    "notes": f"cys {version}",
+    "pub_date": pub_date,
+    "platforms": {
+        platform: {
+            "signature": signature,
+            "url": f"https://github.com/{owner}/{repo}/releases/download/v{version}/{asset}",
+        }
+    },
 }
-JSON
+pathlib.Path(output).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 
-echo "생성됨:"
-echo "  dist-update/latest.json"
-echo "  dist-update/${ASSET}"
-echo ""
-echo "GitHub 릴리스에 올릴 자산: 위 두 파일 + DMG"
-echo "  gh release create v${VERSION} \\"
-echo "    dist-update/latest.json \\"
-echo "    dist-update/${ASSET} \\"
-echo "    dist-mac/cys-${VERSION}-macos-arm64.dmg"
-echo ""
-echo "⚠ Intel(x86_64)·Windows 플랫폼 키는 각 타깃 빌드 후 platforms에 추가하라(RELEASE.md)."
+echo "updater fragment complete: $OUTPUT/latest-$PLATFORM.json"

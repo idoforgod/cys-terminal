@@ -38,7 +38,7 @@ jobs:
       # 비상시에만 오버라이드(구버전 전용 패치 등 · 값 지정 시 실패→경고로 강등·근거를 커밋에 남길 것).
       PACK_TAG_GATE_OVERRIDE: ''
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Derive pack version from tag
         run: |
@@ -100,13 +100,13 @@ jobs:
         run: bash scripts/secret-scan.sh --all
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: pack-release
 
@@ -250,7 +250,7 @@ jobs:
       # ★해법②: '하한 호환' 선언을 매 릴리스 기계 증명 — min_binary '실물' 검증기로도 통과해야
       # 발행. 하한 태그 소스를 빌드(최초 1회 비용)하고 이후는 바이너리 캐시로 즉시.
       - name: Cache min_binary verifier
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .minbin-cache
           key: minbin-${{ env.MIN_BINARY }}-${{ runner.os }}
@@ -284,14 +284,27 @@ jobs:
           gh release download "$PREV" -R "$SRC_REPO" --pattern latest.json
           python3 -c "import json; d=json.load(open('latest.json')); print('carry-forward latest.json: binary', d.get('version'), 'from', '$PREV')"
 
-      - name: Create pack release + upload assets
+      - name: Create reviewed pack checksum
+        run: |
+          set -euo pipefail
+          shasum -a 256 \
+            latest.json pack-manifest.json pack-manifest.json.minisig pack.tar.gz \
+            > PACK_SHA256SUMS.txt
+
+      - name: Create non-public pack draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" -R "$SRC_REPO" \
+            --verify-tag --draft \
             --title "pack $PACK_VERSION (팩-only 무중단)" \
-            --notes "팩-only 릴리스 — 본체 버전 불변(min_binary $MIN_BINARY+ 무중단 적용). latest.json은 직전 본체 릴리스 캐리포워드." \
-            pack.tar.gz pack-manifest.json pack-manifest.json.minisig latest.json
-          gh release edit "$GITHUB_REF_NAME" -R "$SRC_REPO" --latest --draft=false
-          echo "✅ pack-only 릴리스 발행: $GITHUB_REF_NAME (pack_version=$PACK_VERSION)"
+            --notes "팩-only 릴리스 — 본체 버전 불변(min_binary $MIN_BINARY+ 무중단 적용). latest.json은 직전 본체 릴리스 캐리포워드."
+          if ! gh release upload "$GITHUB_REF_NAME" -R "$SRC_REPO" \
+            pack.tar.gz pack-manifest.json pack-manifest.json.minisig latest.json \
+            PACK_SHA256SUMS.txt; then
+            echo "pack candidate upload failed; deleting the incomplete draft" >&2
+            gh release delete "$GITHUB_REF_NAME" -R "$SRC_REPO" --yes
+            exit 1
+          fi
+          echo "✅ pack-only draft 생성: $GITHUB_REF_NAME (public promotion 별도 승인 필요)"

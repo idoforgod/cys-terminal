@@ -104,13 +104,21 @@ enum Command {
         /// 렌더할 파일 경로 (절대/상대 — 실재하는 파일이어야 함)
         path: String,
     },
-    /// browserd 실브라우저(headful Chromium)를 연다 — 사람·에이전트가 공유하는 agent 프로필.
-    /// 지구본 버튼(GUI)의 CLI 짝. url 생략 시 빈 페이지. browserd 프로필 격리가 유일 경계라
-    /// caps 게이트 없음(에이전트도 리뷰·검증·시행에 브라우저를 써야 함).
+    /// shared-default Browser 컨텍스트에서 URL을 연다. 수명주기는 cysd가 소유하며
+    /// 결과는 GUI의 격리된 in-pane cast에서 관측한다.
     Browser {
         /// 열 URL (생략 시 about:blank)
         url: Option<String>,
     },
+    /// Packaged Browser Runtime ensure adapter. Lifecycle decisions remain in cysd.
+    #[command(name = "browser-runtime-ensure", hide = true)]
+    BrowserRuntimeEnsure {
+        #[arg(long)]
+        headless: bool,
+    },
+    /// Proxy one worker Browser operation without exposing the private engine endpoint.
+    #[command(name = "browser-runtime-operation", hide = true)]
+    BrowserRuntimeOperation { request_json: String },
     /// T5 사용량 관측: 이 세션의 트랜스크립트 경로를 pane에 등록 (SessionStart hook 전용 plumbing)
     UsageRegister {
         /// 세션 트랜스크립트 절대경로 (.jsonl)
@@ -932,6 +940,23 @@ enum FeedAction {
     },
 }
 
+fn browser_worker_authority_params(operation: Option<Value>) -> Value {
+    let task_id = std::env::var("CYS_TASK_ID")
+        .ok()
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .unwrap_or_else(|| format!("browser-cli-{}", std::process::id()));
+    let mut params = json!({
+        "authority_kind":"authorized_worker_operation",
+        "realm":"shared-default",
+        "mode":"headless",
+        "task_id":task_id,
+    });
+    if let Some(Value::Object(fields)) = operation {
+        params.as_object_mut().unwrap().extend(fields);
+    }
+    params
+}
+
 fn main() {
     // 파이프(head 등)로 출력이 끊겨도 패닉하지 않도록 SIGPIPE 기본 동작 복원
     #[cfg(unix)]
@@ -1615,20 +1640,23 @@ fn run(command: Command) -> i32 {
         })(),
 
         Command::Browser { url } => (|| -> Result<(), String> {
-            // browserd 실브라우저를 연다 — javis_browser.py를 직접 실행한다(GUI 지구본 버튼과
-            // 동일 엔진·단일 인스턴스). ensure_browserd가 단일 인스턴스를 보장하고 profile 격리가
-            // 경계다. observe=headful 관측(사람이 창 직접 봄)·agent 프로필(에이전트 자동화 허용).
+            // Public compatibility surface. Python only translates the operation; cysd remains
+            // the sole lifecycle authority and the private supervisor owns the engine process.
             let script = cys::pack::pack_dir().join("bin/javis_browser.py");
             if !script.exists() {
                 return Err(format!("browser 스크립트 없음: {}", script.display()));
             }
-            let target = url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "about:blank".into());
-            // 포그라운드 실행 — javis_browser의 JSON 출력·browserd 기동 로그·exit code를 그대로
-            // 전달(첫 기동은 수 초 소요, 사람에겐 정직한 진행 피드백).
+            let target = url
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "about:blank".into());
+            // 포그라운드 adapter 실행 — JSON·결정론 exit code를 그대로 전달한다.
             let mut cmd = std::process::Command::new("python3");
-            // 동봉 runtime(python3·bun) PATH 주입 — GUI browser_open과 대칭(리뷰어1 F4). 최소 PATH
-            // 에이전트 pane·Windows 동봉 python3.exe 환경에서 CLI만 해소 실패하는 비대칭 제거.
-            if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            // 동봉 Python adapter PATH만 보강한다. Browser engine/Bun/Chromium 선택은 cysd의
+            // signed runtime authority가 담당하며 이 command는 PATH discovery로 engine을 고르지 않는다.
+            if let Some(exe_dir) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            {
                 let cur = std::env::var("PATH").unwrap_or_default();
                 if let Some(newp) = cys::runtime_prefixed_path(&exe_dir, &cur) {
                     cmd.env("PATH", newp);
@@ -1636,15 +1664,52 @@ fn run(command: Command) -> i32 {
             }
             let status = cmd
                 .arg(&script)
-                .arg("observe")
+                .arg("open")
                 .arg(&target)
-                .arg("--profile")
-                .arg("agent")
                 .status()
                 .map_err(|e| format!("browser 실행 실패: {e}"))?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }
+            Ok(())
+        })(),
+
+        Command::BrowserRuntimeEnsure { headless } => (|| -> Result<(), String> {
+            if !headless {
+                return Err("shared Browser Runtime is fixed to headless mode".into());
+            }
+            let result = request(
+                "browser.runtime.ensure",
+                browser_worker_authority_params(None),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        })(),
+
+        Command::BrowserRuntimeOperation { request_json } => (|| -> Result<(), String> {
+            let operation: Value = serde_json::from_str(&request_json)
+                .map_err(|error| format!("invalid Browser operation JSON: {error}"))?;
+            let verb = operation
+                .get("verb")
+                .and_then(Value::as_str)
+                .filter(|verb| !verb.is_empty() && verb.len() <= 64)
+                .ok_or_else(|| "Browser operation verb is required".to_string())?;
+            let args = operation
+                .get("args")
+                .filter(|args| args.is_object())
+                .cloned()
+                .ok_or_else(|| "Browser operation args must be an object".to_string())?;
+            let result = request(
+                "browser.runtime.operation",
+                browser_worker_authority_params(Some(json!({"verb":verb,"args":args}))),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|e| e.to_string())?
+            );
             Ok(())
         })(),
 

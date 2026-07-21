@@ -1,0 +1,353 @@
+//! Browser v2 runtime contract.
+//!
+//! Callers see typed state and compatibility decisions. Filesystem shape,
+//! legacy parsing and runtime validation stay behind this module boundary.
+
+mod compatibility;
+mod error;
+pub mod lifecycle;
+mod manifest;
+mod path;
+mod private_protocol;
+mod state;
+
+pub use compatibility::{
+    evaluate_compatibility, Compatibility, CompatibilityIssue, CompatibilityRequirement,
+    ProtocolRequirement,
+};
+pub use error::{BrowserError, BrowserErrorCode};
+pub use manifest::{
+    ChromiumPin, EnginePin, PlaywrightPin, RuntimeManifest, SupervisorPin, TargetAssets,
+    TargetTriple,
+};
+pub use path::{hash_tree, RuntimePaths};
+pub use private_protocol::{BrokerHello, VerifiedBrokerHello};
+pub use state::{
+    parse_runtime_state, EngineKey, EngineMode, LegacyRuntimeState, ParsedRuntimeState,
+    ProtocolRange, RuntimeStateV2,
+};
+
+/// cysd's bounded GUI ensure worker deadline. UI adapters must use a strictly
+/// longer transport deadline so the broker can cancel and reap first.
+pub const ENSURE_WORKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
+
+#[cfg(test)]
+mod tests {
+    use super::lifecycle::{RuntimeSelection, RuntimeSelectionStore, UpdateJournal, UpdatePhase};
+    use super::*;
+
+    #[test]
+    fn update_journal_requires_ordered_health_checked_commit() {
+        let mut journal = UpdateJournal::new(7).expect("positive generation");
+        assert_eq!(journal.phase(), UpdatePhase::Stage);
+
+        assert!(journal.advance(UpdatePhase::Commit).is_err());
+        assert_eq!(journal.phase(), UpdatePhase::Stage);
+
+        for phase in [
+            UpdatePhase::Verify,
+            UpdatePhase::Select,
+            UpdatePhase::Health,
+            UpdatePhase::Commit,
+        ] {
+            journal.advance(phase).expect("ordered transition");
+        }
+        assert!(journal.is_terminal());
+        assert!(journal.rollback().is_err());
+    }
+
+    #[test]
+    fn runtime_selection_rolls_back_without_mutating_sealed_units() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let units = root.join("sealed-units");
+        let state = root.join("state");
+        let old_id = format!("sha256:{}", "a".repeat(64));
+        let new_id = format!("sha256:{}", "b".repeat(64));
+        std::fs::create_dir_all(units.join("old")).unwrap();
+        std::fs::create_dir_all(units.join("new")).unwrap();
+        std::fs::write(units.join("old/runtime.bin"), b"old-sealed").unwrap();
+        std::fs::write(units.join("new/runtime.bin"), b"new-sealed").unwrap();
+
+        let store = RuntimeSelectionStore::open(&state).unwrap();
+        store
+            .initialize(RuntimeSelection::new(1, old_id.clone()).unwrap())
+            .unwrap();
+        let mut update = store.begin(2, new_id.clone()).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        assert_eq!(store.current().unwrap().runtime_id(), new_id);
+        update.rollback().unwrap();
+        assert_eq!(store.current().unwrap().runtime_id(), old_id);
+        assert_eq!(
+            std::fs::read(units.join("old/runtime.bin")).unwrap(),
+            b"old-sealed"
+        );
+        assert_eq!(
+            std::fs::read(units.join("new/runtime.bin")).unwrap(),
+            b"new-sealed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_selection_recovers_previous_generation_after_interrupted_select() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_id = format!("sha256:{}", "c".repeat(64));
+        let new_id = format!("sha256:{}", "d".repeat(64));
+        let store = RuntimeSelectionStore::open(&root).unwrap();
+        store
+            .initialize(RuntimeSelection::new(5, old_id.clone()).unwrap())
+            .unwrap();
+        let mut update = store.begin(9, new_id).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        drop(update);
+
+        let recovered = RuntimeSelectionStore::open(&root).unwrap();
+        let current = recovered.current().unwrap();
+        assert_eq!(current.runtime_id(), old_id);
+        assert_eq!(current.generation(), 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_selection_commits_only_after_health_and_reopens_cleanly() {
+        let root =
+            std::env::temp_dir().join(format!("cys-browser-runtime-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old_id = format!("sha256:{}", "e".repeat(64));
+        let new_id = format!("sha256:{}", "f".repeat(64));
+        let store = RuntimeSelectionStore::open(&root).unwrap();
+        store
+            .initialize(RuntimeSelection::new(1, old_id).unwrap())
+            .unwrap();
+        let mut update = store.begin(2, new_id.clone()).unwrap();
+        update.advance(UpdatePhase::Verify).unwrap();
+        update.advance(UpdatePhase::Select).unwrap();
+        assert!(update.advance(UpdatePhase::Commit).is_err());
+        update.advance(UpdatePhase::Health).unwrap();
+        update.advance(UpdatePhase::Commit).unwrap();
+
+        let reopened = RuntimeSelectionStore::open(&root).unwrap();
+        let current = reopened.current().unwrap();
+        assert_eq!(current.runtime_id(), new_id);
+        assert_eq!(current.generation(), 2);
+        let next_id = format!("sha256:{}", "1".repeat(64));
+        assert!(reopened.begin(3, next_id).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_state_is_parsed_but_never_compatible() {
+        let parsed = parse_runtime_state(r#"{"pid":42,"port":53111,"token":"legacy"}"#)
+            .expect("legacy state remains diagnosable");
+
+        assert!(matches!(parsed, ParsedRuntimeState::LegacyIncompatible(_)));
+        assert_eq!(parsed.compatibility_code(), "LEGACY_INCOMPATIBLE");
+    }
+
+    #[test]
+    fn v2_state_requires_exact_runtime_and_compatible_protocol() {
+        let parsed = parse_runtime_state(
+            r#"{
+              "schema_version":2,
+              "instance_id":"00112233445566778899aabbccddeeff",
+              "engine_generation":3,
+              "supervisor_pid":42,
+              "engine_pid":43,
+              "port":53111,
+              "supervisor_build_id":"sup-1",
+              "engine_build_id":"eng-1",
+              "runtime_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "attestation_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "policy_epoch":7,
+              "policy_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "protocol":{"major":2,"min_minor":0,"max_minor":2,
+                "capabilities":["scoped-ticket","paint-ack"],
+                "required_capabilities":["scoped-ticket"]},
+              "chromium_revision":"1148",
+              "engine_key":{"realm":"shared-default","mode":"headless"},
+              "profile_epoch":1,
+              "started_at":"2026-07-21T00:00:00Z"
+            }"#,
+        )
+        .expect("valid v2 state");
+        let required = CompatibilityRequirement::new(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ProtocolRequirement::new(2, 1, 3, ["scoped-ticket", "paint-ack"]),
+            EngineKey::shared_default(),
+        );
+
+        assert_eq!(
+            evaluate_compatibility(&parsed, &required),
+            Compatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn manifest_runtime_id_binds_target_hashes_and_licenses() {
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "release_ready": true,
+            "runtime_id": "sha256:placeholder",
+            "browser_protocol": {"major":2,"min_minor":0,"max_minor":0,
+              "capabilities":["scoped-ticket"],"required_capabilities":["scoped-ticket"]},
+            "supervisor": {"build_id":"sup-1","rust_toolchain":"1.88.0"},
+            "engine": {"build_id":"eng-1","bun_version":"1.3.8"},
+            "playwright": {"version":"1.49.1"},
+            "chromium": {"revision":"1148","version":"131.0.6778.33","major":131,
+              "profile_schema_epoch":1,"license":"Chromium-BSD"},
+            "targets": {
+              "aarch64-apple-darwin": {
+                "architecture":"arm64",
+                "supervisor_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "engine_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "chromium_archive_url":"https://example.invalid/chromium-1148-mac-arm64.zip",
+                "chromium_archive_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "chromium_tree_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "chromium_executable":"chromium/Chromium.app/Contents/MacOS/Chromium",
+                "license_files":["LICENSE.chromium","THIRD_PARTY_NOTICES.chromium"]
+              }
+            }
+        });
+        let id = RuntimeManifest::runtime_id_for_value(&value).expect("canonical manifest id");
+        value["runtime_id"] = serde_json::Value::String(id.clone());
+        let manifest = RuntimeManifest::parse(&serde_json::to_string(&value).unwrap())
+            .expect("release-qualified manifest");
+
+        assert_eq!(manifest.runtime_id, id);
+        assert_eq!(
+            manifest
+                .target(&TargetTriple::Aarch64AppleDarwin)
+                .unwrap()
+                .architecture,
+            "arm64"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolver_rejects_symlinked_runtime_executable() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-path-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let target_root = root.join("aarch64-apple-darwin");
+        std::fs::create_dir_all(target_root.join("supervisor")).unwrap();
+        std::fs::create_dir_all(target_root.join("engine")).unwrap();
+        std::fs::create_dir_all(target_root.join("chromium/Chromium.app/Contents/MacOS")).unwrap();
+        let outside = root.join("outside-browserd");
+        std::fs::write(&outside, b"not the bundled supervisor").unwrap();
+        symlink(&outside, target_root.join("supervisor/cys-browserd")).unwrap();
+        std::fs::write(target_root.join("engine/cys-browser-engine"), b"engine").unwrap();
+        std::fs::write(
+            target_root.join("chromium/Chromium.app/Contents/MacOS/Chromium"),
+            b"chromium",
+        )
+        .unwrap();
+        let assets = TargetAssets {
+            architecture: "arm64".into(),
+            supervisor_sha256: "a".repeat(64),
+            engine_sha256: "b".repeat(64),
+            chromium_archive_url: "https://example.invalid/chromium.zip".into(),
+            chromium_archive_sha256: "c".repeat(64),
+            chromium_tree_sha256: "d".repeat(64),
+            chromium_executable: "chromium/Chromium.app/Contents/MacOS/Chromium".into(),
+            license_files: vec!["LICENSE.chromium".into()],
+        };
+
+        let error =
+            RuntimePaths::resolve_existing(&root, &TargetTriple::Aarch64AppleDarwin, &assets)
+                .expect_err("symlinked supervisor must never be executable authority");
+        assert_eq!(error.code(), BrowserErrorCode::RuntimePathRejected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chromium_tree_hash_binds_the_actual_executable_bytes() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-runtime-tree-test-{}",
+            std::process::id()
+        ));
+        let target_root = root.join("aarch64-apple-darwin");
+        let supervisor = target_root.join("supervisor/cys-browserd");
+        let engine = target_root.join("engine/cys-browser-engine");
+        let chromium = target_root.join("chromium/Chromium.app/Contents/MacOS/Chromium");
+        for (path, bytes) in [
+            (&supervisor, b"supervisor".as_slice()),
+            (&engine, b"engine"),
+            (&chromium, b"chromium-v1"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut assets = TargetAssets {
+            architecture: "arm64".into(),
+            supervisor_sha256: format!("{:x}", Sha256::digest(b"supervisor")),
+            engine_sha256: format!("{:x}", Sha256::digest(b"engine")),
+            chromium_archive_url: "https://example.invalid/chromium.zip".into(),
+            chromium_archive_sha256: "c".repeat(64),
+            chromium_tree_sha256: hash_tree(&target_root.join("chromium")).unwrap(),
+            chromium_executable: "chromium/Chromium.app/Contents/MacOS/Chromium".into(),
+            license_files: vec!["LICENSE.chromium".into()],
+        };
+        let paths =
+            RuntimePaths::resolve_existing(&root, &TargetTriple::Aarch64AppleDarwin, &assets)
+                .unwrap();
+        paths.verify_pinned_executables(&assets).unwrap();
+        std::fs::write(&chromium, b"chromium-v2").unwrap();
+        assert_eq!(
+            paths.verify_pinned_executables(&assets).unwrap_err().code(),
+            BrowserErrorCode::RuntimeIntegrityFailed
+        );
+        assets.chromium_tree_sha256 = hash_tree(&target_root.join("chromium")).unwrap();
+        paths.verify_pinned_executables(&assets).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_broker_hello_is_parent_bound_mac_verified_and_single_sequence() {
+        let session_key = [0x5a; 32];
+        let hello = BrokerHello::signed(
+            4242,
+            1,
+            "receipt-1",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            7,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            session_key,
+        )
+        .expect("broker can create a private hello");
+
+        let verified = hello
+            .verify(4242, session_key)
+            .expect("the inherited peer and MAC agree");
+        assert_eq!(verified.command_sequence, 1);
+        assert_eq!(verified.policy_epoch, 7);
+        assert!(
+            hello.verify(7, session_key).is_err(),
+            "forged parent is rejected"
+        );
+        assert!(
+            hello.verify(4242, [0x33; 32]).is_err(),
+            "wrong session key is rejected"
+        );
+    }
+}

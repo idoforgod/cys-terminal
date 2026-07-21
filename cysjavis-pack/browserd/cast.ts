@@ -32,6 +32,189 @@ export const CMSG = {
   DIALOG_REPLY: "dialog-reply",
 } as const;
 
+export const CAST_PROTOCOL_VERSION = 2;
+export const CAST_EMBED_TICKET_TTL_MS = 15_000;
+
+export interface CastEmbedTicketDescriptor {
+  ticket: string;
+  runtimeId: string;
+  context: string;
+  protocolVersion: number;
+  embedGeneration: number;
+  paneId: string;
+  parentOrigin: string;
+}
+
+export type CastEmbedTicketIssue = "issued" | "duplicate" | "invalid";
+export type CastEmbedTicketConsume = "accepted" | "missing" | "expired" | "mismatch" | "replayed";
+
+function validCastEmbedTicket(d: CastEmbedTicketDescriptor): boolean {
+  return /^[A-Za-z0-9_-]{43,128}$/.test(d.ticket)
+    && d.runtimeId.length >= 8 && d.runtimeId.length <= 128
+    && d.context.length >= 1 && d.context.length <= 128 && !/[\u0000-\u001f\u007f]/.test(d.context)
+    && d.protocolVersion === CAST_PROTOCOL_VERSION
+    && Number.isSafeInteger(d.embedGeneration) && d.embedGeneration > 0
+    && /^[A-Za-z0-9_-]{43,128}$/.test(d.paneId)
+    && /^(tauri:\/\/localhost|http:\/\/tauri\.localhost|http:\/\/(127\.0\.0\.1|localhost):\d+)$/.test(d.parentOrigin);
+}
+
+// iframe 문서 GET에서 issue하고, 그 문서가 여는 인증 WS에서 consume한다. 레지스트리는 browserd
+// 프로세스(runtime instance)에 귀속되며 descriptor의 runtime/context/generation을 모두 재대조한다.
+// 소비·만료 항목도 bounded tombstone으로 남겨 같은 URL의 재발급/재생을 조용히 허용하지 않는다.
+export class CastEmbedTicketRegistry {
+  private readonly entries = new Map<string, {
+    descriptor: CastEmbedTicketDescriptor;
+    expiresAt: number;
+    appLoaded: boolean;
+    consumed: boolean;
+  }>();
+
+  constructor(
+    private readonly ttlMs = CAST_EMBED_TICKET_TTL_MS,
+    private readonly maxEntries = 4096,
+  ) {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1) throw new Error("ticket ttl must be a positive integer");
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error("ticket capacity must be a positive integer");
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  issue(descriptor: CastEmbedTicketDescriptor, now = Date.now()): CastEmbedTicketIssue {
+    if (!validCastEmbedTicket(descriptor)) return "invalid";
+    if (this.entries.has(descriptor.ticket)) return "duplicate";
+    while (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next().value as string;
+      this.entries.delete(oldest);
+    }
+    this.entries.set(descriptor.ticket, {
+      descriptor: { ...descriptor },
+      expiresAt: now + this.ttlMs,
+      appLoaded: false,
+      consumed: false,
+    });
+    return "issued";
+  }
+
+  openApp(descriptor: CastEmbedTicketDescriptor, now = Date.now()): CastEmbedTicketConsume {
+    const result = this.match(descriptor, now);
+    if (result !== "accepted") return result;
+    const entry = this.entries.get(descriptor.ticket)!;
+    if (entry.appLoaded || entry.consumed) return "replayed";
+    entry.appLoaded = true;
+    return "accepted";
+  }
+
+  consume(descriptor: CastEmbedTicketDescriptor, now = Date.now()): CastEmbedTicketConsume {
+    const result = this.match(descriptor, now);
+    if (result !== "accepted") return result;
+    const entry = this.entries.get(descriptor.ticket)!;
+    if (!entry.appLoaded) return "missing";
+    if (entry.consumed) return "replayed";
+    entry.consumed = true;
+    return "accepted";
+  }
+
+  private match(descriptor: CastEmbedTicketDescriptor, now: number): CastEmbedTicketConsume {
+    if (!validCastEmbedTicket(descriptor)) return "mismatch";
+    const entry = this.entries.get(descriptor.ticket);
+    if (!entry) return "missing";
+    if (now >= entry.expiresAt) return "expired";
+    const expected = entry.descriptor;
+    if (
+      expected.runtimeId !== descriptor.runtimeId
+      || expected.context !== descriptor.context
+      || expected.protocolVersion !== descriptor.protocolVersion
+      || expected.embedGeneration !== descriptor.embedGeneration
+      || expected.paneId !== descriptor.paneId
+      || expected.parentOrigin !== descriptor.parentOrigin
+    ) return "mismatch";
+    return "accepted";
+  }
+}
+
+export type CastBuildMode = "production" | "development";
+
+// Tauri 2의 패키징 origin은 Windows(WebView2)와 그 외 플랫폼(Wry custom protocol)이 다르다.
+// 개발 origin은 환경에서 명시한 단 하나의 loopback origin만 추가하며 임의 host/scheme은 받지 않는다.
+export function resolveCastParentOrigin(args: {
+  platform: string;
+  mode: CastBuildMode;
+  requested: string | null;
+  developmentOrigin?: string | null;
+}): string | null {
+  const packaged = args.platform === "win32" ? "http://tauri.localhost" : "tauri://localhost";
+  if (args.requested === packaged) return packaged;
+  if (args.mode !== "development" || !args.developmentOrigin || args.requested !== args.developmentOrigin) return null;
+  return /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(args.developmentOrigin) ? args.developmentOrigin : null;
+}
+
+// cast HTML route 전용 CSP. 호출자는 resolveCastParentOrigin을 통과한 정확 origin만 넘긴다.
+export function castContentSecurityPolicy(serverPort: number, parentOrigin: string): string {
+  if (!/^(tauri:\/\/localhost|http:\/\/tauri\.localhost|http:\/\/(127\.0\.0\.1|localhost):\d+)$/.test(parentOrigin)) {
+    throw new Error("invalid cast parent origin");
+  }
+  return `default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; `
+    + `connect-src ws://127.0.0.1:${serverPort}; frame-ancestors ${parentOrigin}`;
+}
+
+// 서버가 push한 fid와 원본 CDP sessionId의 수명주기. offer는 상한을 넘긴 가장 오래된 프레임을
+// 즉시 ack 대상으로 돌려주고 최신 항목만 보존한다. acknowledge/drain은 항목을 제거하면서 값을
+// 한 번만 반환하므로 다중 client ack와 detach가 겹쳐도 같은 fid를 두 번 릴레이하지 않는다.
+export class LatestFrameFlow<T> {
+  private readonly pending = new Map<number, T>();
+
+  constructor(private readonly limit = 1) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("frame flow limit must be a positive integer");
+  }
+
+  get size(): number {
+    return this.pending.size;
+  }
+
+  offer(fid: number, value: T): T[] {
+    this.pending.set(fid, value);
+    const evicted: T[] = [];
+    while (this.pending.size > this.limit) {
+      const oldest = this.pending.keys().next().value as number;
+      evicted.push(this.pending.get(oldest)!);
+      this.pending.delete(oldest);
+    }
+    return evicted;
+  }
+
+  acknowledge(fid: number): T | null {
+    const value = this.pending.get(fid);
+    if (value === undefined) return null;
+    this.pending.delete(fid);
+    return value;
+  }
+
+  drain(): T[] {
+    const values = [...this.pending.values()];
+    this.pending.clear();
+    return values;
+  }
+}
+
+export const RECONNECT_GRACE_MS = 5_000;
+export type ReconnectGraceDecision = "keep" | "cleanup";
+
+// presence lease의 순수 시간 판정. client가 돌아오면 무조건 유지하고, 마지막 이탈 시각이 없으면
+// 예약 근거가 없으므로 정리한다. 경계값은 cleanup으로 고정해 타이머 재예약 루프를 막는다.
+export function reconnectGraceDecision(args: {
+  clientCount: number;
+  emptySince: number | null;
+  now: number;
+  graceMs?: number;
+}): ReconnectGraceDecision {
+  if (args.clientCount > 0) return "keep";
+  if (args.emptySince === null) return "cleanup";
+  const graceMs = args.graceMs ?? RECONNECT_GRACE_MS;
+  return args.now - args.emptySince >= graceMs ? "cleanup" : "keep";
+}
+
 export interface TabInfo {
   id: string;
   title: string;
@@ -53,7 +236,7 @@ export type ServerMsg =
       viewportPinned: boolean;
     }
   | { type: typeof MSG.TABS; seq: number; tabs: TabInfo[] }
-  | { type: typeof MSG.CONTROL; control: "agent" | "human" }
+  | { type: typeof MSG.CONTROL; control: "agent" | "human"; leaseId?: string }
   | { type: typeof MSG.ERR; code: string; message: string; detail?: string; retry?: boolean }
   | { type: typeof MSG.DIALOG; id: number; kind: string; message: string; defaultValue: string }
   | { type: typeof MSG.CLOSED; reason: string };
@@ -74,8 +257,8 @@ export function msgNav(f: {
 export function msgTabs(seq: number, tabs: TabInfo[]): ServerMsg {
   return { type: MSG.TABS, seq, tabs };
 }
-export function msgControl(control: "agent" | "human"): ServerMsg {
-  return { type: MSG.CONTROL, control };
+export function msgControl(control: "agent" | "human", leaseId?: string): ServerMsg {
+  return leaseId ? { type: MSG.CONTROL, control, leaseId } : { type: MSG.CONTROL, control };
 }
 export function msgErr(code: string, message: string, detail?: string, retry?: boolean): ServerMsg {
   return { type: MSG.ERR, code, message, detail, retry };
@@ -106,7 +289,7 @@ export type ClientMsg =
   | { type: typeof CMSG.KEY; kind: "down" | "up"; key: string; code: string; text: string; modifiers: number }
   | { type: typeof CMSG.INSERT_TEXT; text: string }
   | { type: typeof CMSG.NAVIGATE; url: string }
-  | { type: typeof CMSG.CONTROL; action: "release" }
+  | { type: typeof CMSG.CONTROL; action: "release"; leaseId: string }
   | { type: typeof CMSG.NAV_ACTION; action: "back" | "forward" | "reload" | "stop" }
   | { type: typeof CMSG.TAB; action: "activate" | "close" | "new"; id: string }
   | { type: typeof CMSG.VIEWPORT; width: number; height: number; unpin: boolean }
@@ -188,7 +371,10 @@ export function parseClientMsg(raw: string): ClientMsg | null {
     }
     case CMSG.CONTROL: {
       if (m.action !== "release") return null;
-      return { type: CMSG.CONTROL, action: "release" };
+      // 사람이 획득할 때 서버가 해당 pane/session에만 발급한 불투명 증명이다. action 문자열만으로
+      // release를 허용하면 다른(또는 stale) WS가 사람의 조작권을 임의로 반환시킬 수 있다.
+      if (typeof m.leaseId !== "string" || !/^[A-Za-z0-9_-]{43,128}$/.test(m.leaseId)) return null;
+      return { type: CMSG.CONTROL, action: "release", leaseId: m.leaseId };
     }
     case CMSG.NAV_ACTION: {
       const acts = ["back", "forward", "reload", "stop"];
@@ -261,10 +447,8 @@ export function mapInput(
 // open·goto·navigate(주소창)·tab new·에러 배너 재시도가 전부 여기를 지난다.
 // 근거: `open` 이 스킴 무검증이면 `file:///…/.ssh/id_rsa` 를 렌더한 뒤 `get text` 로 읽어낼 수
 // 있다 — "cast 는 픽셀만 나가니 안전"이라는 Phase 2 논거가 조회 동사 도입 순간 무너진다.
-// 허용 = http·https·about:blank·data:.
-//   ※data: 를 허용하는 이유: 내용이 URL 안에 인라인돼 있어 **로컬 파일을 읽을 수 없다** —
-//     PRE-3 이 막으려는 위협(로컬 파일 탈취)의 대상이 아니다. file:·chrome:·view-source:·
-//     javascript:·blob: 는 전부 거부된다.
+// Browser v2 제품 허용 = http·https만. about:blank는 서버 내부 탭 생성 경로에서만 사용하고 공개
+// RPC/WS 입력에는 허용하지 않는다. data/file/chrome/view-source/javascript/blob 등은 전부 거부한다.
 // 순수 함수(bun test). 반환 null=통과, 문자열=거부 사유.
 export function navigableUrlError(url: unknown): string | null {
   if (typeof url !== "string" || !url) return "url 필요";
@@ -277,12 +461,7 @@ export function navigableUrlError(url: unknown): string | null {
   }
   const scheme = u.protocol.toLowerCase();
   if (scheme === "http:" || scheme === "https:") return null;
-  // data: 는 허용한다 — 렌더 대상이 **요청 문자열 그 자체**라 로컬 파일·내부망에 도달하지 못한다
-  // (거부 근거인 file://·내부 스킴의 "가진 것을 읽어낸다"가 성립하지 않는다). 문구도 실제 허용
-  // 집합을 그대로 말해야 한다 — "http/https만"이라고 적으면 코드와 메시지가 어긋난다.
-  if (scheme === "data:") return null;
-  if (scheme === "about:" && url.toLowerCase() === "about:blank") return null;
-  return `스킴 '${u.protocol}' 거부 — http·https·data·about:blank 만 이동할 수 있다`;
+  return `스킴 '${u.protocol}' 거부 — http·https 주소만 이동할 수 있다`;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -441,12 +620,26 @@ export const CAST_APP_HTML = `<!doctype html>
   var MSG = ${JSON.stringify(MSG)};
   var CMSG = ${JSON.stringify(CMSG)};
   var UI_CAP = ${JSON.stringify(UI_TEXT_CAP)};
+  var SUPPORTED_PROTOCOL = ${JSON.stringify(CAST_PROTOCOL_VERSION)};
 
   var seg = location.pathname.split('/').filter(Boolean);
   var token = seg[0] || '';
   var params = new URLSearchParams(location.search);
   var context = params.get('context') || 'default';
-  var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/' + token + '/cast/ws?context=' + encodeURIComponent(context);
+  var protocolVersion = Number(params.get('protocolVersion'));
+  var embedGeneration = Number(params.get('embedGeneration'));
+  var paneId = params.get('paneId') || '';
+  var parentOrigin = params.get('parentOrigin') || '';
+  var embedTicket = params.get('embedTicket') || '';
+  var wsParams = new URLSearchParams({
+    context: context,
+    protocolVersion: String(protocolVersion),
+    embedGeneration: String(embedGeneration),
+    paneId: paneId,
+    parentOrigin: parentOrigin,
+    embedTicket: embedTicket
+  });
+  var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/' + token + '/cast/ws?' + wsParams.toString();
 
   var canvas = document.getElementById('screen');
   var g = canvas.getContext('2d');
@@ -478,15 +671,31 @@ export const CAST_APP_HTML = `<!doctype html>
 
   var ws = null;
   var hasFrame = false;   // 첫 frame(metadata) 전에는 입력 무시(설계 D3)
+  var painted = false;    // canvas 유효 draw 완료 — iframe load/process spawn과 분리된 성공 근거
+  var reportedLive = false;
   var lastMoveSent = 0;
   var loading = false;
   var seenSeq = -1;       // 4-S-7: 자기가 본 최대 seq 미만 메시지는 무시(늦게 온 옛 상태 차단)
   var dlgId = null;
+  var controlLeaseId = null;
 
   function mods(e){ return (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0); }
   function btn(e){ return e.button===0?'left':(e.button===1?'middle':(e.button===2?'right':'none')); }
   function send(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
   function cap(s){ s = (typeof s === 'string') ? s : ''; return s.length > UI_CAP ? s.slice(0, UI_CAP) + '…' : s; }
+  function postParent(type, fields){
+    if (protocolVersion !== SUPPORTED_PROTOCOL || !Number.isSafeInteger(embedGeneration) || embedGeneration < 1 || !parentOrigin) return;
+    if (!/^[A-Za-z0-9_-]{43,128}$/.test(embedTicket)) return;
+    if (!/^[A-Za-z0-9_-]{43,128}$/.test(paneId)) return;
+    var envelope = Object.assign({
+      type:type,
+      protocolVersion:protocolVersion,
+      embedGeneration:embedGeneration,
+      embedTicket:embedTicket,
+      paneId:paneId
+    }, fields || {});
+    try { window.parent.postMessage(envelope, parentOrigin); } catch(e){}
+  }
 
   // --- 연결 상태 오버레이(전면) — 연결 자체가 없을 때만 쓴다 ---
   function showOverlay(text, action){
@@ -500,7 +709,7 @@ export const CAST_APP_HTML = `<!doctype html>
   function runOverlayAction(){
     if (overlay._action === 'reconnect') {
       // GUI 가 ensure 재발동·iframe 재로드하도록 부모에 알린다.
-      try { window.parent.postMessage({ type: 'cys-cast-reconnect' }, '*'); } catch(e){}
+      postParent('cys-cast-reconnect');
     }
   }
   ovBtn.addEventListener('click', function(e){ e.stopPropagation(); runOverlayAction(); });
@@ -585,23 +794,42 @@ export const CAST_APP_HTML = `<!doctype html>
     g.fillStyle = '#1a1a1a';
     g.fillRect(0, 0, cw, ch);
     var iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
-    if (!iw || !ih) return;
+    if (!iw || !ih || !(cw > 0 && ch > 0)) return false;
     var scale = Math.min(cw / iw, ch / ih);
     var dw = iw * scale, dh = ih * scale;
     g.drawImage(img, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    return true;
   }
 
   function onFrame(msg){
     var img = new Image();
     img.onload = function(){
-      drawFrame(img);
+      if (!drawFrame(img)) {
+        send({ type: CMSG.ACK, fid: msg.fid });
+        return;
+      }
       var first = !hasFrame;
       hasFrame = true;
+      painted = true;
       hideOverlay();
       // 4-S-6: 첫 프레임 후 pane 실제 크기를 1회 자발 송신(리사이즈 이벤트만 기다리면 최초
       // pane 크기가 영영 반영되지 않는다).
       if (first) sendViewport(false);
       send({ type: CMSG.ACK, fid: msg.fid }); // 그린 뒤 ack — e2e 배압
+      if (first) {
+        // drawImage 호출 완료가 아니라 compositor가 최소 한 paint 경계를 지난 뒤에만 FRAME_READY.
+        // 두 rAF 사이에 실제 paint가 들어가므로 검은 canvas를 성공으로 오판하지 않는다.
+        requestAnimationFrame(function(){ requestAnimationFrame(function(){
+          if (!painted || !hasFrame) return;
+          postParent('cys-cast-phase', { phase: 'FRAME_READY' });
+          requestAnimationFrame(function(){
+            if (!reportedLive && painted && hasFrame) {
+              reportedLive = true;
+              postParent('cys-cast-phase', { phase: 'LIVE' });
+            }
+          });
+        }); });
+      }
     };
     // 디코드 실패해도 ack 는 보낸다 — 안 보내면 CDP 스트림이 영구 스톨한다.
     img.onerror = function(){ send({ type: CMSG.ACK, fid: msg.fid }); };
@@ -628,13 +856,18 @@ export const CAST_APP_HTML = `<!doctype html>
 
   function connect(){
     showOverlay('연결 중...', null);
-    try { ws = new WebSocket(wsUrl); } catch(e){ showOverlay('연결 실패 — 클릭해 재연결', 'reconnect'); return; }
+    try { ws = new WebSocket(wsUrl); } catch(e){
+      showOverlay('연결 실패 — 클릭해 재연결', 'reconnect');
+      postParent('cys-cast-phase', { phase: 'FAILED', errorCode: 'WS_CONNECT_FAILED' });
+      return;
+    }
     ws.onopen = function(){
       // ★재접속 시 seq 역전 방지: seenSeq 는 connect() 바깥 변수라 재연결에도 남는다. 서버 seq 가
       //   새 hub 에서 낮은 값부터 다시 오르면 클라이언트가 **초기 동기화 nav·tabs 를 전부 무시**해
       //   주소창·탭이 stale 로 고착한다(4-S-7 의 순서 계약이 재접속을 못 본 자리).
       seenSeq = -1;
       showOverlay('화면 대기 중...', null);
+      postParent('cys-cast-phase', { phase: 'SHELL_READY' });
     };
     ws.onmessage = function(ev){
       var msg; try { msg = JSON.parse(ev.data); } catch(e){ return; }
@@ -650,19 +883,37 @@ export const CAST_APP_HTML = `<!doctype html>
         if (msg.title) document.title = cap(msg.title);
         applyNav(msg);
         // 부모(cys GUI)의 pane 헤더 갱신용 — 수신·반영은 GUI 측 담당.
-        try { window.parent.postMessage({ type: 'cys-cast-title', title: cap(msg.title || ''), url: msg.url || '' }, '*'); } catch(e){}
+        postParent('cys-cast-title', { title: cap(msg.title || ''), url: msg.url || '' });
       }
       else if (msg.type === MSG.TABS) { renderTabs(msg.tabs); }
-      else if (msg.type === MSG.CONTROL) { ctrlLabel.textContent = (msg.control === 'human') ? '사람 조작 중' : '에이전트'; }
+      else if (msg.type === MSG.CONTROL) {
+        controlLeaseId = msg.control === 'human' && typeof msg.leaseId === 'string' ? msg.leaseId : null;
+        ctrlLabel.textContent = (msg.control === 'human') ? '사람 조작 중' : '에이전트';
+        handBtn.disabled = !controlLeaseId;
+      }
       else if (msg.type === MSG.DIALOG) { showDialog(msg); }
-      else if (msg.type === MSG.CLOSED) { hasFrame = false; showOverlay('브라우저 컨텍스트가 닫혔습니다 — 클릭해 재연결', 'reconnect'); }
+      else if (msg.type === MSG.CLOSED) {
+        hasFrame = false;
+        postParent('cys-cast-phase', { phase: 'CLOSED' });
+        showOverlay('브라우저 컨텍스트가 닫혔습니다 — 클릭해 재연결', 'reconnect');
+      }
       else if (msg.type === MSG.ERR) {
         // ★전면 오버레이가 아니라 배너(4-S-4) — 정적 페이지에서 오버레이가 영구 고착하던 결함 제거.
         showBanner((msg.message || '오류') + ' [' + (msg.code || '') + ']', !!msg.retry);
+        if (msg.code === 'SCREENCAST_FAILED' || msg.code === 'PAGE_CRASHED') {
+          postParent('cys-cast-phase', { phase: 'FAILED', errorCode: msg.code });
+        }
         if (msg.retry) { loading = false; prog.className = ''; relBtn.textContent = '⟳'; }
       }
     };
-    ws.onclose = function(){ hasFrame = false; showOverlay('연결 끊김 — 클릭해 재연결', 'reconnect'); };
+    ws.onclose = function(){
+      var hadPaintedFrame = painted && hasFrame;
+      hasFrame = false;
+      postParent('cys-cast-phase', hadPaintedFrame
+        ? { phase: 'DEGRADED' }
+        : { phase: 'FAILED', errorCode: 'WS_CLOSED_BEFORE_FRAME' });
+      showOverlay('연결 끊김 — 클릭해 재연결', 'reconnect');
+    };
     ws.onerror = function(){ /* onclose 가 뒤따른다 */ };
   }
 
@@ -731,7 +982,10 @@ export const CAST_APP_HTML = `<!doctype html>
   relBtn.addEventListener('click', function(){ send({ type:CMSG.NAV_ACTION, action: loading ? 'stop' : 'reload' }); });
 
   // --- control: 에이전트에게 넘기기 ---
-  handBtn.addEventListener('click', function(){ send({ type:CMSG.CONTROL, action:'release' }); });
+  handBtn.addEventListener('click', function(){
+    if (!controlLeaseId) return;
+    send({ type:CMSG.CONTROL, action:'release', leaseId:controlLeaseId });
+  });
 
   connect();
 })();

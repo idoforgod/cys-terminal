@@ -17,7 +17,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # ★시크릿/개인정보 발행 hard-gate (빌드·임베드 전 최우선 — fail-fast). git-추적 전 트리를
       # fail-closed로 스캔해 개인 홈경로·개인 프로필 디렉토리·개인 계정 핸들·이메일·키토큰
@@ -27,13 +27,13 @@ jobs:
         run: bash scripts/secret-scan.sh --all
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Setup Rust (x86_64-pc-windows-msvc = 러너 네이티브)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: windows-x64-feasibility
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Upload NSIS installer artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cys-windows-x64-nsis
           path: |

@@ -784,13 +784,15 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "cys-app"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "base64 0.22.1",
  "cys-terminal",
+ "getrandom 0.3.4",
  "libc",
  "serde",
  "serde_json",
+ "sysinfo",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",
@@ -801,14 +803,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cys-browserd"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cys-terminal",
+ "hmac",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "cys-terminal"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
  "dirs",
  "flate2",
+ "hmac",
  "libc",
  "minisign",
  "minisign-verify",
@@ -824,6 +842,7 @@ dependencies = [
  "tokio",
  "vt100",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

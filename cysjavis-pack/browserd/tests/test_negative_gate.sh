@@ -11,6 +11,9 @@ PACK="$(cd "$HERE/../.." && pwd)"
 CLI="$PACK/bin/javis_browser.py"
 FIX="$HERE/fixtures"
 export CYS_BROWSER_HEADLESS=1
+# Source E2E is an explicit development authority. Without this flag the
+# production adapter must delegate to the installed cysd and never spawn Bun.
+export CYS_BROWSER_DEV=1
 export CYS_ROLE="worker-test"
 
 WORK="$(mktemp -d)"

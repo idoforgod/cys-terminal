@@ -74,6 +74,29 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   exit 2
 fi
 
+# Browser Runtime qualification is a signed release input, never a mutable
+# manifest flag. Hash every executable/tree and verify the freshly generated
+# attestation/policy signatures before Tauri can copy resources into the app.
+: "${CYS_BROWSER_RUNTIME_SECRET_KEY:?Browser Runtime minisign secret-key path required}"
+: "${CYS_BROWSER_RUNTIME_PUBLIC_KEY:?Browser Runtime minisign public-key path required}"
+: "${CYS_BROWSER_RUNTIME_KEY_ID:?Browser Runtime trust-root key id required}"
+: "${CYS_BROWSER_RUNTIME_POLICY_EPOCH:?Browser Runtime policy epoch required}"
+: "${CYS_BROWSER_RUNTIME_EXPIRES_AT:?Browser Runtime metadata expiry epoch required}"
+# Signing mutates every executable/tree digest. It must complete before the
+# final runtime lock hashes, attestation and policy minisign files are emitted.
+bash scripts/runtime-stage-sign-macos.sh "$TARGET"
+python3 scripts/browser-runtime-metadata.py prepare \
+  --resource-root src-tauri/resources/browser-runtime \
+  --target "$TARGET" \
+  --key-id "$CYS_BROWSER_RUNTIME_KEY_ID" \
+  --secret-key "$CYS_BROWSER_RUNTIME_SECRET_KEY" \
+  --public-key "$CYS_BROWSER_RUNTIME_PUBLIC_KEY" \
+  --trusted-keys cysjavis-pack/trusted-keys.json \
+  --tauri-config src-tauri/tauri.conf.json \
+  --policy-epoch "$CYS_BROWSER_RUNTIME_POLICY_EPOCH" \
+  --expires-at "$CYS_BROWSER_RUNTIME_EXPIRES_AT"
+export CYS_BROWSER_V2_RELEASE_QUALIFIED=1
+
 # ── 동봉 런타임 준비 + inside-out 재서명 (RC-22/T6b — 공증 필수) ──
 # tauri.conf.json bundle.resources("runtime/")는 Contents/Resources/runtime 으로 실리지만 Tauri는
 # resources 내 Mach-O를 자동 서명하지 않는다(#12001) → ad-hoc(python·uv)/타팀(node) 서명 그대로면
@@ -195,8 +218,18 @@ if spctl -a -vv "$APP" 2>&1 | grep -qi "accepted"; then
 else
   echo "  ✗ spctl 거부 — 공증 실패. 위 notarytool 결과를 확인하라"; exit 1
 fi
-xcrun stapler validate "$APP" >/dev/null 2>&1 && echo "  ✓ app 공증 티켓 stapled" || echo "  ⚠ app staple 미확인"
-xcrun stapler validate "$DMG" >/dev/null 2>&1 && echo "  ✓ DMG 공증 티켓 stapled" || echo "  ⚠ DMG staple 미확인(앱 공증되면 설치는 정상)"
+if xcrun stapler validate "$APP" >/dev/null 2>&1; then
+  echo "  ✓ app 공증 티켓 stapled"
+else
+  echo "  ✗ app staple 검증 실패" >&2
+  exit 1
+fi
+if xcrun stapler validate "$DMG" >/dev/null 2>&1; then
+  echo "  ✓ DMG 공증 티켓 stapled"
+else
+  echo "  ✗ DMG staple 검증 실패" >&2
+  exit 1
+fi
 # DMG 자체 Gatekeeper 게이트 — .app spctl만으론 DMG 서명 누락을 못 잡는다(2026-07-04 실측 갭).
 if spctl -a -t open --context context:primary-signature -vv "$DMG" 2>&1 | grep -qi "accepted"; then
   echo "  ✓ DMG spctl: accepted (primary-signature)"
@@ -207,6 +240,8 @@ fi
 echo "== 배포본 정리 + 자동업데이트 매니페스트 =="
 mkdir -p dist-mac
 cp "$DMG" "dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
-sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal >/dev/null 2>&1 || true
+CYS_RELEASE_BUNDLE_ROOT="$BUNDLE_BASE" \
+  sh scripts/make-update-manifest.sh \
+    "$VERSION" idoforgod cys-terminal "$TARGET"
 echo "✓ 공증 빌드 완료: dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
 echo "  → ad-hoc 재서명·xattr 우회 불필요. gh release 발행은 오너 승인 후."

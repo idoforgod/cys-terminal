@@ -121,9 +121,175 @@ export function persistLayout(setItem: (key: string, value: string) => void, dat
 // 자기 origin에서 서빙하는 screencast 앱을 가리킨다. 뷰어와 구분되는 순수 판단부만 여기 모은다
 // (DOM 무의존·bun test 대상). isAllowedWebPaneUrl 하드가드는 cast URL도 그대로 통과한다.
 
-// cast 앱 URL 조립 — `http://127.0.0.1:<port>/<token>/cast/?context=<c>`. context는 encodeURIComponent.
-export function castAppUrl(port: number, token: string, context: string): string {
-  return `http://127.0.0.1:${port}/${token}/cast/?context=${encodeURIComponent(context)}`;
+export const CAST_PROTOCOL_VERSION = 2;
+
+export type CastPanePhase =
+  | "PENDING"
+  | "SHELL_READY"
+  | "FRAME_READY"
+  | "LIVE"
+  | "DEGRADED"
+  | "FAILED"
+  | "CLOSED";
+
+export interface CastPaneState {
+  phase: CastPanePhase;
+  generation: number;
+  paintedFrames: number;
+  errorCode?: string;
+}
+
+export type CastPaneEvent =
+  | { type: "IFRAME_LOADED"; generation: number }
+  | { type: "SHELL_READY"; generation: number }
+  | { type: "FRAME_READY"; generation: number }
+  | { type: "LIVE"; generation: number }
+  | { type: "TIMEOUT"; generation: number }
+  | { type: "DISCONNECTED"; generation: number }
+  | { type: "FAIL"; generation: number; errorCode: string }
+  | { type: "CLOSED"; generation: number };
+
+export function initialCastPaneState(generation: number): CastPaneState {
+  return { phase: "PENDING", generation, paintedFrames: 0 };
+}
+
+// Cast pane 수명주기의 순수 전이 경계. iframe load는 관측 신호일 뿐 성공이 아니며,
+// generation이 다른 document의 늦은 이벤트는 기존 객체를 그대로 반환해 무효화한다.
+export function reduceCastPaneState(state: CastPaneState, event: CastPaneEvent): CastPaneState {
+  if (event.generation !== state.generation) return state;
+  switch (event.type) {
+    case "IFRAME_LOADED":
+      return state;
+    case "SHELL_READY":
+      return state.phase === "PENDING" || state.phase === "DEGRADED"
+        ? { ...state, phase: "SHELL_READY", errorCode: undefined }
+        : state;
+    case "FRAME_READY":
+      if (state.phase !== "SHELL_READY") {
+        return { ...state, phase: "FAILED", errorCode: "PROTOCOL_ORDER" };
+      }
+      return { ...state, phase: "FRAME_READY", paintedFrames: 1 };
+    case "LIVE":
+      return state.phase === "FRAME_READY" || state.phase === "LIVE"
+        ? { ...state, phase: "LIVE", paintedFrames: Math.max(1, state.paintedFrames) }
+        : { ...state, phase: "FAILED", errorCode: "PROTOCOL_ORDER" };
+    case "TIMEOUT":
+      if (state.phase === "PENDING") return { ...state, phase: "FAILED", errorCode: "SHELL_TIMEOUT" };
+      if (state.phase === "SHELL_READY") return { ...state, phase: "FAILED", errorCode: "FIRST_FRAME_TIMEOUT" };
+      return state;
+    case "DISCONNECTED":
+      return state.paintedFrames > 0
+        ? { ...state, phase: "DEGRADED", errorCode: "WS_DISCONNECTED" }
+        : { ...state, phase: "FAILED", errorCode: "WS_CLOSED_BEFORE_FRAME" };
+    case "FAIL":
+      return { ...state, phase: "FAILED", errorCode: event.errorCode };
+    case "CLOSED":
+      return { ...state, phase: "CLOSED" };
+  }
+}
+
+// postMessage의 phase 필드를 내부 상태 이벤트로 좁힌다. 문자열을 그대로 UI 상태/오류 코드로
+// 사용하지 않아 미지 phase의 조용한 폴백과 무제한 오류 문자열 렌더를 함께 막는다.
+export function castPhaseEvent(data: unknown, generation: number): CastPaneEvent | null {
+  if (!Number.isSafeInteger(generation) || generation < 1 || !data || typeof data !== "object") return null;
+  const payload = data as { phase?: unknown; errorCode?: unknown };
+  switch (payload.phase) {
+    case "SHELL_READY":
+    case "FRAME_READY":
+    case "LIVE":
+      return { type: payload.phase, generation };
+    case "DEGRADED":
+      return { type: "DISCONNECTED", generation };
+    case "CLOSED":
+      return { type: "CLOSED", generation };
+    case "FAILED":
+      if (typeof payload.errorCode !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(payload.errorCode)) return null;
+      return { type: "FAIL", generation, errorCode: payload.errorCode };
+    default:
+      return null;
+  }
+}
+
+export interface CastEmbedOptions {
+  protocolVersion: number;
+  embedGeneration: number;
+  parentOrigin: string;
+  embedTicket: string;
+  paneId: string;
+}
+
+export function newCastEmbedTicket(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Tauri custom protocol의 location.origin은 WebKit에서 "null"일 수 있으므로 protocol+host로
+// canonical origin을 만든다. 그 외에는 현재 배포 origin 또는 명시 포트의 loopback 개발 origin만 허용한다.
+export function castParentOrigin(location: {
+  protocol: string;
+  host: string;
+  origin: string;
+}): string | null {
+  if (location.protocol === "tauri:" && location.host === "localhost") return "tauri://localhost";
+  if (location.protocol === "http:" && location.host === "tauri.localhost" && location.origin === "http://tauri.localhost") {
+    return location.origin;
+  }
+  if (location.protocol === "http:" && /^((127\.0\.0\.1)|localhost):\d+$/.test(location.host)) {
+    const expected = `http://${location.host}`;
+    return location.origin === expected ? expected : null;
+  }
+  return null;
+}
+
+// cast 앱 URL 조립 — 저장용 3인자 호출은 기존 URL 바이트를 보존한다. 실제 iframe 로드는
+// protocol/generation/parentOrigin 을 함께 실어, 같은 contentWindow가 navigation 뒤 재사용돼도
+// 이전 document의 늦은 postMessage를 generation으로 거부할 수 있게 한다.
+export function castAppUrl(port: number, token: string, context: string, embed?: CastEmbedOptions): string {
+  const base = `http://127.0.0.1:${port}/${token}/cast/?context=${encodeURIComponent(context)}`;
+  if (!embed) return base;
+  return `${base}&protocolVersion=${encodeURIComponent(String(embed.protocolVersion))}`
+    + `&embedGeneration=${encodeURIComponent(String(embed.embedGeneration))}`
+    + `&parentOrigin=${encodeURIComponent(embed.parentOrigin)}`
+    + `&embedTicket=${encodeURIComponent(embed.embedTicket)}`
+    + `&paneId=${encodeURIComponent(embed.paneId)}`;
+}
+
+// 부모가 처리할 cast postMessage의 단일 검증 경계. origin "형태"가 아니라 현재 iframe URL의
+// 정확 origin을 대조하고, source 일치와 protocol/embed generation을 모두 요구한다.
+export function acceptsCastMessage(args: {
+  frameUrl: string;
+  eventOrigin: unknown;
+  sourceMatches: boolean;
+  data: unknown;
+}): boolean {
+  if (!args.sourceMatches || typeof args.eventOrigin !== "string") return false;
+  let url: URL;
+  try {
+    url = new URL(args.frameUrl);
+  } catch {
+    return false;
+  }
+  if (!isLoopbackOrigin(url.origin) || args.eventOrigin !== url.origin) return false;
+  const protocolVersion = Number(url.searchParams.get("protocolVersion"));
+  const embedGeneration = Number(url.searchParams.get("embedGeneration"));
+  const embedTicket = url.searchParams.get("embedTicket");
+  const paneId = url.searchParams.get("paneId");
+  if (
+    protocolVersion !== CAST_PROTOCOL_VERSION
+    || !Number.isSafeInteger(embedGeneration)
+    || embedGeneration < 1
+    || !embedTicket
+    || !/^[A-Za-z0-9_-]{43,128}$/.test(embedTicket)
+    || !paneId
+    || !/^[A-Za-z0-9_-]{43,128}$/.test(paneId)
+  ) return false;
+  if (!args.data || typeof args.data !== "object") return false;
+  const data = args.data as { protocolVersion?: unknown; embedGeneration?: unknown; embedTicket?: unknown; paneId?: unknown };
+  return data.protocolVersion === protocolVersion
+    && data.embedGeneration === embedGeneration
+    && data.embedTicket === embedTicket
+    && data.paneId === paneId;
 }
 
 // cast URL 판정 — pathname 2번째 세그먼트가 "cast"면 true(토큰 무관·순수). 뷰어 URL(2번째="app")·

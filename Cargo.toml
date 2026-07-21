@@ -1,11 +1,11 @@
 [workspace]
-members = ["src-tauri"]
+members = ["src-tauri", "browser-runtime/supervisor"]
 # 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)는 워크스페이스 멤버가 아니라 path 의존이다.
 exclude = ["vendor/portable-pty"]
 
 [package]
 name = "cys-terminal"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 description = "cys — the CYSJavis terminal: bidirectional socket IPC, multi-agent OS (CYSJavis Pack), governance, heartbeat"
 license = "MIT"
@@ -38,6 +38,8 @@ libc = "0.2"
 chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+hmac = "0.12"
+zeroize = "1"
 # 무중단 팩 채널 manifest 서명검증(§7-①): verify-only 순수 Rust(서명키 미포함=공격면 최소).
 minisign-verify = "0.2"
 # tauri 형식 pubkey(전체 .pub 파일 base64)·서명 자산 디코드용(verify 경로 한정).
@@ -69,4 +71,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",   # ★D3(W5): OpenProcess(자식 pid → Job 편입)
     "Win32_Security_Cryptography",  # R-CLI-1: BCryptGenRandom(CNG CSPRNG) — 브리지 토큰 예측가능 폴백 제거
     "Win32_System_Registry",    # ★stale PATH: RegGetValueW(HKLM/HKCU Environment\Path 신선 재합성)
+    "Win32_Storage_FileSystem", # Browser Runtime selector atomic replace (MoveFileExW)
 ] }

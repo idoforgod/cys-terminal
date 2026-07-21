@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "cys",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "identifier": "com.cysjavis.terminal",
   "build": {
     "frontendDist": "../ui/dist",
@@ -34,6 +34,7 @@
     "resources": {
       "resources/pack.tar.gz": "./",
       "resources/pack-manifest.json": "./",
+      "resources/browser-runtime/": "browser-runtime/",
       "runtime/": "runtime/"
     },
     "icon": [

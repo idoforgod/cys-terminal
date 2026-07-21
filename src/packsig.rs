@@ -110,6 +110,47 @@ pub fn verify_manifest(
     verify_with_keyring(manifest_bytes, sig_bytes, now_unix, accepted_path, &keyring)
 }
 
+/// Verify an arbitrary release metadata blob against the embedded minisign
+/// trust root. Browser Runtime attestation and policy snapshots use this
+/// narrow entrypoint so non-empty or self-declared signatures can never
+/// qualify executable bytes.
+pub fn verify_release_metadata_signature(
+    key_id: &str,
+    data: &[u8],
+    signature: &[u8],
+    now_unix: i64,
+) -> Result<(), String> {
+    let keyring = embedded_keyring()?;
+    verify_release_metadata_with_keyring(key_id, data, signature, now_unix, &keyring)
+}
+
+pub fn verify_release_metadata_with_keyring(
+    key_id: &str,
+    data: &[u8],
+    signature: &[u8],
+    now_unix: i64,
+    keyring: &Keyring,
+) -> Result<(), String> {
+    if keyring
+        .revoked_key_ids
+        .iter()
+        .any(|revoked| revoked == key_id)
+    {
+        return Err(format!("폐기된 key_id: {key_id}"));
+    }
+    let key = keyring
+        .keys
+        .iter()
+        .find(|key| key.key_id == key_id)
+        .ok_or_else(|| format!("알 수 없는 key_id: {key_id}"))?;
+    let not_after = parse_rfc3339(&key.not_after)
+        .ok_or_else(|| format!("key_id {key_id} not_after 부재/파싱불가 — 키 거부"))?;
+    if now_unix >= not_after {
+        return Err(format!("만료된 키 {key_id}"));
+    }
+    verify_minisign(&key.pubkey, data, signature)
+}
+
 /// 검증 코어(전건 fail-CLOSED). 키링 주입형 — 테스트·키 회전 오버라이드·P4 오프라인 통합테스트가
 /// 임의 키링을 넘긴다.
 pub fn verify_with_keyring(
@@ -547,6 +588,39 @@ mod tests {
             "올바른 키 서명인데 거부 — ⓒ 대조 실패"
         );
         let _ = std::fs::remove_file(&acc);
+    }
+
+    #[test]
+    fn release_metadata_requires_a_trusted_cryptographic_signature() {
+        let (pk, sign) = gen_key_and_signer();
+        let (_, wrong_sign) = gen_key_and_signer();
+        let keyring = keyring_with("RUNTIME", &pk, "2030-01-01T00:00:00Z", &[]);
+        let payload = br#"{"runtime_id":"sha256:abc","epoch":7}"#;
+        let signature = sign(payload);
+        verify_release_metadata_with_keyring(
+            "RUNTIME",
+            payload,
+            signature.as_bytes(),
+            1_700_000_000,
+            &keyring,
+        )
+        .expect("trusted release metadata signature");
+        assert!(verify_release_metadata_with_keyring(
+            "RUNTIME",
+            payload,
+            wrong_sign(payload).as_bytes(),
+            1_700_000_000,
+            &keyring,
+        )
+        .is_err());
+        assert!(verify_release_metadata_with_keyring(
+            "UNKNOWN",
+            payload,
+            signature.as_bytes(),
+            1_700_000_000,
+            &keyring,
+        )
+        .is_err());
     }
 
     // (e-corrupt) 손상된 accepted 기록 = fail-closed 거부(부재와 구분) ──────────────

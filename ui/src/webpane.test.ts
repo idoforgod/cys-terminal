@@ -23,6 +23,13 @@ import {
   castPaneTitle,
   castDisplayUrl,
   isLoopbackOrigin,
+  CAST_PROTOCOL_VERSION,
+  acceptsCastMessage,
+  castParentOrigin,
+  newCastEmbedTicket,
+  initialCastPaneState,
+  reduceCastPaneState,
+  castPhaseEvent,
   sanitizeCastNodes,
   sanitizeLayoutForPersist,
   collectWebUrls,
@@ -264,6 +271,107 @@ describe("viewer.open 이벤트 판정 — decideViewerOpen", () => {
 });
 
 describe("cast web pane — URL 조립·판정(browserd screencast)", () => {
+  it("Cast Pane 상태 머신 — load/spawn은 성공이 아니며 SHELL_READY 뒤 실제 painted frame만 열린다", () => {
+    let s = initialCastPaneState(11);
+    expect(s.phase).toBe("PENDING");
+
+    // iframe load 자체는 성공 신호가 아니며 상태를 바꾸지 않는다.
+    s = reduceCastPaneState(s, { type: "IFRAME_LOADED", generation: 11 });
+    expect(s.phase).toBe("PENDING");
+
+    // 순서를 건너뛴 FRAME_READY는 fail-closed다.
+    const skipped = reduceCastPaneState(s, { type: "FRAME_READY", generation: 11 });
+    expect(skipped).toMatchObject({ phase: "FAILED", errorCode: "PROTOCOL_ORDER" });
+
+    s = reduceCastPaneState(s, { type: "SHELL_READY", generation: 11 });
+    expect(s.phase).toBe("SHELL_READY");
+    s = reduceCastPaneState(s, { type: "FRAME_READY", generation: 11 });
+    expect(s.phase).toBe("FRAME_READY");
+    expect(s.paintedFrames).toBe(1);
+    s = reduceCastPaneState(s, { type: "LIVE", generation: 11 });
+    expect(s.phase).toBe("LIVE");
+
+    // 이전 document의 늦은 메시지는 현재 generation을 절대 움직이지 못한다.
+    expect(reduceCastPaneState(s, { type: "CLOSED", generation: 10 })).toBe(s);
+  });
+
+  it("Cast Pane 실패 전이 — 셸/첫 프레임 timeout을 구분하고 live 단절은 마지막 화면을 유지한다", () => {
+    const pending = initialCastPaneState(3);
+    expect(reduceCastPaneState(pending, { type: "TIMEOUT", generation: 3 })).toMatchObject({
+      phase: "FAILED",
+      errorCode: "SHELL_TIMEOUT",
+    });
+
+    const shell = reduceCastPaneState(pending, { type: "SHELL_READY", generation: 3 });
+    expect(reduceCastPaneState(shell, { type: "TIMEOUT", generation: 3 })).toMatchObject({
+      phase: "FAILED",
+      errorCode: "FIRST_FRAME_TIMEOUT",
+    });
+
+    const frame = reduceCastPaneState(shell, { type: "FRAME_READY", generation: 3 });
+    const degraded = reduceCastPaneState(frame, { type: "DISCONNECTED", generation: 3 });
+    expect(degraded).toMatchObject({ phase: "DEGRADED", paintedFrames: 1, errorCode: "WS_DISCONNECTED" });
+    expect(reduceCastPaneState(degraded, { type: "SHELL_READY", generation: 3 }).phase).toBe("SHELL_READY");
+
+    expect(reduceCastPaneState(pending, {
+      type: "FAIL",
+      generation: 3,
+      errorCode: "PROTOCOL_MISMATCH",
+    })).toMatchObject({ phase: "FAILED", errorCode: "PROTOCOL_MISMATCH" });
+  });
+
+  it("Cast phase payload — 허용 phase와 bounded error code만 상태 이벤트로 변환한다", () => {
+    expect(castPhaseEvent({ phase: "SHELL_READY" }, 5)).toEqual({ type: "SHELL_READY", generation: 5 });
+    expect(castPhaseEvent({ phase: "FRAME_READY" }, 5)).toEqual({ type: "FRAME_READY", generation: 5 });
+    expect(castPhaseEvent({ phase: "LIVE" }, 5)).toEqual({ type: "LIVE", generation: 5 });
+    expect(castPhaseEvent({ phase: "DEGRADED" }, 5)).toEqual({ type: "DISCONNECTED", generation: 5 });
+    expect(castPhaseEvent({ phase: "FAILED", errorCode: "CDP_FAILED" }, 5)).toEqual({
+      type: "FAIL",
+      generation: 5,
+      errorCode: "CDP_FAILED",
+    });
+    expect(castPhaseEvent({ phase: "FAILED", errorCode: "x".repeat(65) }, 5)).toBeNull();
+    expect(castPhaseEvent({ phase: "PWNED" }, 5)).toBeNull();
+  });
+
+  it("Cast Protocol v2 — 현재 embed generation·정확 origin·실제 iframe source만 수용한다", () => {
+    const ticket = "a".repeat(64);
+    const paneId = "p".repeat(64);
+    const url = castAppUrl(51234, "tok", "default", {
+      protocolVersion: CAST_PROTOCOL_VERSION,
+      embedGeneration: 7,
+      parentOrigin: "tauri://localhost",
+      embedTicket: ticket,
+      paneId,
+    });
+    const good = {
+      frameUrl: url,
+      eventOrigin: "http://127.0.0.1:51234",
+      sourceMatches: true,
+      data: { type: "cys-cast-title", protocolVersion: CAST_PROTOCOL_VERSION, embedGeneration: 7, embedTicket: ticket, paneId },
+    };
+
+    expect(acceptsCastMessage(good)).toBe(true);
+    expect(acceptsCastMessage({ ...good, eventOrigin: "http://localhost:51234" })).toBe(false);
+    expect(acceptsCastMessage({ ...good, sourceMatches: false })).toBe(false);
+    expect(acceptsCastMessage({ ...good, data: { ...good.data, protocolVersion: 1 } })).toBe(false);
+    expect(acceptsCastMessage({ ...good, data: { ...good.data, embedGeneration: 6 } })).toBe(false);
+    expect(acceptsCastMessage({ ...good, data: { ...good.data, embedTicket: "b".repeat(64) } })).toBe(false);
+    expect(acceptsCastMessage({ ...good, data: { ...good.data, paneId: "q".repeat(64) } })).toBe(false);
+    expect(new URL(url).searchParams.get("embedTicket")).toBe(ticket);
+    expect(new URL(url).searchParams.get("paneId")).toBe(paneId);
+    expect(newCastEmbedTicket()).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("castParentOrigin — 패키징 Tauri와 명시 loopback 개발 origin만 exact 값으로 만든다", () => {
+    expect(castParentOrigin({ protocol: "tauri:", host: "localhost", origin: "null" })).toBe("tauri://localhost");
+    expect(castParentOrigin({ protocol: "http:", host: "tauri.localhost", origin: "http://tauri.localhost" }))
+      .toBe("http://tauri.localhost");
+    expect(castParentOrigin({ protocol: "http:", host: "localhost:1420", origin: "http://localhost:1420" }))
+      .toBe("http://localhost:1420");
+    expect(castParentOrigin({ protocol: "https:", host: "evil.example", origin: "https://evil.example" })).toBeNull();
+  });
+
   it("castAppUrl 형식 — loopback+토큰+/cast/+context, context는 encodeURIComponent", () => {
     expect(castAppUrl(51234, "tok-en_123", "default")).toBe(
       "http://127.0.0.1:51234/tok-en_123/cast/?context=default",

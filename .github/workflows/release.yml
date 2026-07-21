@@ -1,28 +1,46 @@
 name: release
 
-# 릴리스 통합(Phase 2 완결·2026-07-03) — 공개 소스 repo의 릴리스가 곧 공개 배포다.
-#   build         : tag(vX.Y.Z) push → 앱 빌드·서명 → 이 repo에 public 릴리스 발행(updater 대상)
-#   pack-artifacts: 팩 서명 자산 업로드 + latest 마킹 결정론 강제
-#   (P0 이력: --draft 는 수동 Publish 누락 시 채널 영구 정지 → 자동 발행 유지.
-#    구 배포 repo cys-terminal-releases는 Archive — 마지막 미러가 구 설치본 이주 경로로 영구 생존.)
-# 사용: 버전 6곳 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
-#       (수동 실행도 가능 — Actions 탭 Run workflow)
-# 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY
+# Candidate-only release workflow. Target jobs upload encrypted Actions
+# artifacts; a single assembler may upload one collaborator-visible GitHub draft. This workflow has
+# no path that makes a release public. Public promotion lives in
+# release-publish.yml and is digest-bound behind the release-production gate.
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
-  contents: write          # 비공개 repo에 릴리스 생성·자산 업로드(+ relocate 단계 다운로드)에 필요
+  contents: read
 
 env:
   SRC_REPO: idoforgod/cys-terminal              # 공개 소스 repo = 공개 배포 원본 (updater 대상)
+  BROWSER_RUST_TOOLCHAIN: '1.95.0'
+  BROWSER_BUN_VERSION: '1.3.8'
 
 jobs:
+  release-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Release closure unit and static tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -v
+          shellcheck \
+            scripts/build-macos-signed.sh \
+            scripts/import-macos-signing-certificate.sh \
+            scripts/make-update-manifest.sh \
+            scripts/release-handoff.sh \
+            scripts/runtime-stage-sign-macos.sh \
+            scripts/verify-release-remote.sh
+          # PowerShell owns the single-quoted program.
+          # shellcheck disable=SC2016
+          pwsh -NoProfile -Command '$failed=$false; Get-ChildItem scripts/*.ps1 | ForEach-Object { $tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors); if($errors.Count -gt 0){$failed=$true; $errors | ForEach-Object { Write-Error $_.Message }} }; if($failed){exit 1}'
+
   build:
+    needs: release-contracts
     strategy:
       fail-fast: false     # 한 타깃이 실패해도 나머지는 계속
       matrix:
@@ -34,12 +52,17 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc  # Windows x64 — NSIS 자기완결(PortableGit+Python 동봉).
                                             # createUpdaterArtifacts=true(tauri.windows.conf.json) + 서명키로
-                                            # setup.exe(.sig) 생성 → tauri-action이 latest.json에 windows-x86_64 병합.
-                                            # Authenticode 미서명(인증서 미보유) — SmartScreen 경고는 감수.
+                                            # setup.exe는 Authenticode+RFC3161 뒤 updater 서명을 다시 생성한다.
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Confidential handoff key contract
+        shell: bash
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: bash scripts/release-handoff.sh check
 
       # ★시크릿/개인정보 발행 hard-gate (빌드·임베드 전 최우선 — 셋업보다도 먼저 fail-fast).
       # git-추적 전 트리를 fail-closed로 스캔해 개인 홈경로·개인 프로필 디렉토리·개인 계정
@@ -62,7 +85,9 @@ jobs:
 
       # 프런트엔드 번들러(ui/build.sh가 bun 사용). beforeBuildCommand가 bun을 호출하므로 PATH 필수.
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BROWSER_BUN_VERSION }}
 
       # UI 회귀 게이트 — 한글 IME 리듀서(ui/src/ime.ts) 프로필 A/B/C/Windows 시퀀스 테스트.
       # 실패=릴리스 차단. 배경: WKWebView 프로필별 자모 유출·이중전송 재발 방지(fix/ime-hybrid-profile).
@@ -92,12 +117,13 @@ jobs:
           bun test tests/cast.test.ts tests/unit.test.ts tests/phase3-unit.test.ts
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: ${{ env.BROWSER_RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: './src-tauri -> target'
           key: ${{ matrix.target }}
@@ -199,73 +225,295 @@ jobs:
         shell: bash
         run: bash scripts/prep-mac-runtime.sh "${{ matrix.target }}"
 
-      # ★RC-23 git-core dedup (macOS 전용) — Tauri 번들러가 bundle.resources 심볼릭링크를 역참조(upstream
-      #   #13219, 미해결)해 runtime/git 을 141MB→608MB(중복 464MB)·DMG 434MB로 부풀린다. tauri-action에 그대로
-      #   맡기면 fat DMG가 나오므로, 여기서 '앱만 빌드 → dedup → hdiutil UDZO DMG → 업데이터 재생성'까지 하고,
-      #   아래 tauri-action은 mac 레그에서 tauriScript=true(빌드 no-op)로 이 slim 산출물을 그대로 수집·업로드·
-      #   latest.json 병합만 하게 한다. tauri-action은 표준 번들 경로(bundle/dmg/<name>_<ver>_<arch>.dmg,
-      #   bundle/macos/<name>.app.tar.gz[.sig])를 existsSync로 수집하므로 아래 파일명이 정확히 일치해야 한다.
-      #   CI는 인증서 미보유 → 미서명(현행과 동일 · Gatekeeper 경고 감수). 서명·공증은 로컬 build-macos-signed.sh 경로.
-      - name: git-core dedup + UDZO DMG + 업데이터 재생성 (macOS 전용)
+      # Browser Runtime은 release tag의 source object와 고정 도구체인으로 supervisor/engine을
+      # 빌드하고, Playwright가 고정한 Chromium archive를 정적 source manifest의 byte/SHA pin으로
+      # 검증한 뒤에만 Tauri resource tree에 원자적으로 stage한다. metadata prepare/minisign은 뒤의
+      # 플랫폼 build script가 이 stage의 실제 executable/tree hashes를 다시 계산해 서명한다.
+      - name: Stage verified Browser Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(bun --version)" = "$BROWSER_BUN_VERSION" || {
+            echo "Browser Runtime Bun toolchain drift" >&2; exit 1;
+          }
+          case "$(rustc --version)" in
+            "rustc $BROWSER_RUST_TOOLCHAIN "*) ;;
+            *) echo "Browser Runtime Rust toolchain drift" >&2; exit 1 ;;
+          esac
+
+          BUILD_ROOT="$RUNNER_TEMP/browser-runtime-build"
+          rm -rf "$BUILD_ROOT"
+          mkdir -p "$BUILD_ROOT"
+          cargo build --locked --release --target "${{ matrix.target }}" -p cys-browserd
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              BUN_TARGET=bun-darwin-arm64
+              EXE_SUFFIX=
+              ;;
+            x86_64-apple-darwin)
+              BUN_TARGET=bun-darwin-x64
+              EXE_SUFFIX=
+              ;;
+            x86_64-pc-windows-msvc)
+              BUN_TARGET=bun-windows-x64
+              EXE_SUFFIX=.exe
+              ;;
+            *) echo "unsupported Browser Runtime target" >&2; exit 1 ;;
+          esac
+          SUPERVISOR="$PWD/target/${{ matrix.target }}/release/cys-browserd${EXE_SUFFIX}"
+          ENGINE="$BUILD_ROOT/cys-browser-engine${EXE_SUFFIX}"
+          BUN_COMPILER="$BUILD_ROOT/bun-compiler${EXE_SUFFIX}"
+          BUN_COMPILER_URL="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["targets"][sys.argv[2]]["bun_compiler_archive_url"])' \
+            release/browser-runtime-sources.json "${{ matrix.target }}")"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$BUILD_ROOT/bun-compiler.zip" "$BUN_COMPILER_URL"
+          python3 scripts/runtime-stage-toolchain.py \
+            --source-manifest release/browser-runtime-sources.json \
+            --target "${{ matrix.target }}" \
+            --archive "$BUILD_ROOT/bun-compiler.zip" \
+            --output "$BUN_COMPILER"
+          (
+            cd cysjavis-pack/browserd
+            bun install --frozen-lockfile
+            bun build --compile --target="$BUN_TARGET" \
+              --compile-executable-path="$BUN_COMPILER" \
+              --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
+              --external chromium-bidi --external electron \
+              --outfile "$ENGINE" server.ts
+          )
+
+          CHROMIUM_URL="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["targets"][sys.argv[2]]["chromium_archive_url"])' \
+            release/browser-runtime-sources.json "${{ matrix.target }}")"
+          LICENSE_URL="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))["chromium"]["license_url"])' \
+            release/browser-runtime-sources.json)"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$BUILD_ROOT/chromium.zip" "$CHROMIUM_URL"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$BUILD_ROOT/Chromium-LICENSE" "$LICENSE_URL"
+
+          python3 scripts/runtime-stage.py \
+            --source-manifest release/browser-runtime-sources.json \
+            --target "${{ matrix.target }}" \
+            --supervisor "$SUPERVISOR" \
+            --engine "$ENGINE" \
+            --chromium-archive "$BUILD_ROOT/chromium.zip" \
+            --chromium-license "$BUILD_ROOT/Chromium-LICENSE" \
+            --playwright-root cysjavis-pack/browserd/node_modules/playwright-core \
+            --source-revision "$GITHUB_SHA" \
+            --output src-tauri/resources/browser-runtime
+
+      - name: Install Browser Runtime minisign verifier (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install minisign
+          minisign --version
+
+      - name: Install Browser Runtime minisign verifier (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install minisign --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
+          minisign --version
+          if ($LASTEXITCODE -ne 0) { throw 'minisign verification failed' }
+
+      - name: Materialize Browser Runtime release trust inputs (macOS)
         if: matrix.platform == 'macos-latest'
         shell: bash
         env:
-          CYS_TARGET: ${{ matrix.target }}                         # bundle-prep.sh 크로스빌드 타깃
+          CYS_BROWSER_RUNTIME_SECRET_KEY_B64: ${{ secrets.CYS_BROWSER_RUNTIME_SECRET_KEY_B64 }}
+          CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64: ${{ secrets.CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64 }}
+          CYS_BROWSER_RUNTIME_KEY_ID_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_KEY_ID }}
+          CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_POLICY_EPOCH }}
+          CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_EXPIRES_AT }}
+        run: |
+          set -euo pipefail
+          : "${CYS_BROWSER_RUNTIME_SECRET_KEY_B64:?Browser Runtime secret key is missing}"
+          : "${CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64:?Browser Runtime public key is missing}"
+          : "${CYS_BROWSER_RUNTIME_KEY_ID_INPUT:?Browser Runtime key id is missing}"
+          : "${CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT:?Browser Runtime policy epoch is missing}"
+          : "${CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT:?Browser Runtime expiry is missing}"
+          export CYS_BROWSER_RUNTIME_SECRET_KEY="$RUNNER_TEMP/browser-runtime-release.key"
+          export CYS_BROWSER_RUNTIME_PUBLIC_KEY="$RUNNER_TEMP/browser-runtime-release.pub"
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          for source, destination in (
+              ("CYS_BROWSER_RUNTIME_SECRET_KEY_B64", "CYS_BROWSER_RUNTIME_SECRET_KEY"),
+              ("CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64", "CYS_BROWSER_RUNTIME_PUBLIC_KEY"),
+          ):
+              Path(os.environ[destination]).write_bytes(base64.b64decode(os.environ[source], validate=True))
+          PY
+          chmod 600 "$CYS_BROWSER_RUNTIME_SECRET_KEY" "$CYS_BROWSER_RUNTIME_PUBLIC_KEY"
+          {
+            echo "CYS_BROWSER_RUNTIME_SECRET_KEY=$CYS_BROWSER_RUNTIME_SECRET_KEY"
+            echo "CYS_BROWSER_RUNTIME_PUBLIC_KEY=$CYS_BROWSER_RUNTIME_PUBLIC_KEY"
+            echo "CYS_BROWSER_RUNTIME_KEY_ID=$CYS_BROWSER_RUNTIME_KEY_ID_INPUT"
+            echo "CYS_BROWSER_RUNTIME_POLICY_EPOCH=$CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT"
+            echo "CYS_BROWSER_RUNTIME_EXPIRES_AT=$CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT"
+          } >> "$GITHUB_ENV"
+
+      - name: Materialize Browser Runtime release trust inputs (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          CYS_BROWSER_RUNTIME_SECRET_KEY_B64: ${{ secrets.CYS_BROWSER_RUNTIME_SECRET_KEY_B64 }}
+          CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64: ${{ secrets.CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64 }}
+          CYS_BROWSER_RUNTIME_KEY_ID_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_KEY_ID }}
+          CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_POLICY_EPOCH }}
+          CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT: ${{ secrets.CYS_BROWSER_RUNTIME_EXPIRES_AT }}
+        run: |
+          foreach ($name in @(
+            'CYS_BROWSER_RUNTIME_SECRET_KEY_B64',
+            'CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64',
+            'CYS_BROWSER_RUNTIME_KEY_ID_INPUT',
+            'CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT',
+            'CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT'
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Browser Runtime release input missing: $name"
+            }
+          }
+          $secretPath = Join-Path $env:RUNNER_TEMP 'browser-runtime-release.key'
+          $publicPath = Join-Path $env:RUNNER_TEMP 'browser-runtime-release.pub'
+          [IO.File]::WriteAllBytes($secretPath, [Convert]::FromBase64String($env:CYS_BROWSER_RUNTIME_SECRET_KEY_B64))
+          [IO.File]::WriteAllBytes($publicPath, [Convert]::FromBase64String($env:CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64))
+          @(
+            "CYS_BROWSER_RUNTIME_SECRET_KEY=$secretPath",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY=$publicPath",
+            "CYS_BROWSER_RUNTIME_KEY_ID=$env:CYS_BROWSER_RUNTIME_KEY_ID_INPUT",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH=$env:CYS_BROWSER_RUNTIME_POLICY_EPOCH_INPUT",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT=$env:CYS_BROWSER_RUNTIME_EXPIRES_AT_INPUT"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: macOS credential contract (fail closed)
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE_B64: ${{ secrets.APPLE_CERTIFICATE_B64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: python3 scripts/release-credentials-check.py macos
+
+      - name: Import Developer ID into ephemeral keychain
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE_B64: ${{ secrets.APPLE_CERTIFICATE_B64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: bash scripts/import-macos-signing-certificate.sh
+
+      - name: Build, notarize, staple and normalize macOS candidate
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         run: |
           set -euo pipefail
-          TRIPLE="${{ matrix.target }}"
-          BUNDLE="target/$TRIPLE/release/bundle"
-          APP="$BUNDLE/macos/cys.app"
-          VERSION="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')"
-          case "$TRIPLE" in
-            aarch64-apple-darwin) ARCH=aarch64 ;;
-            x86_64-apple-darwin)  ARCH=x64 ;;
-            *) echo "unexpected target: $TRIPLE"; exit 1 ;;
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/build-macos-signed.sh "${{ matrix.target }}"
+          mkdir -p release-candidate
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              cp "dist-mac/cys-${VERSION}-macos-arm64.dmg" \
+                "release-candidate/cys_${VERSION}_aarch64.dmg"
+              cp "dist-update/cys_${VERSION}_aarch64.app.tar.gz"* release-candidate/
+              ;;
+            x86_64-apple-darwin)
+              cp "dist-mac/cys-${VERSION}-macos-x64.dmg" \
+                "release-candidate/cys_${VERSION}_x64.dmg"
+              cp "dist-update/cys_${VERSION}_x64.app.tar.gz"* release-candidate/
+              ;;
+            *) exit 2 ;;
           esac
-          # ① 앱 번들만 빌드(--bundles app) — beforeBuildCommand(bundle-prep)가 UI·cys/cysd·pack 빌드. fat DMG는 생략.
-          bun x @tauri-apps/cli@2 build --bundles app --target "$TRIPLE"
-          # ② git-core dedup (역참조 되돌리기 · build-macos-signed.sh와 동일 공유 스크립트) → runtime/git 608→~144MB
-          bash scripts/dedup-git-core.sh "$APP"
-          # ③ 업데이터 tar.gz 재생성(dedup 반영·심볼릭링크 보존) + 재서명 → tauri-action이 이 .sig로 latest.json 작성
-          ( cd "$BUNDLE/macos" && tar czf cys.app.tar.gz cys.app )
-          bun x @tauri-apps/cli@2 signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$BUNDLE/macos/cys.app.tar.gz"
-          # ④ dedup된 .app으로 UDZO DMG(hdiutil · Tauri 기본 포맷 동일). 파일명 cys_<ver>_<arch>.dmg = tauri-action 표준 수집명.
-          STAGE="$(mktemp -d)"; ditto "$APP" "$STAGE/cys.app"; ln -s /Applications "$STAGE/Applications"
-          mkdir -p "$BUNDLE/dmg"
-          hdiutil create -volname "cys" -srcfolder "$STAGE" -ov -format UDZO "$BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg"
-          rm -rf "$STAGE"
-          echo "✓ macOS slim 산출물 준비: $BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg + $BUNDLE/macos/cys.app.tar.gz(.sig)"
 
-      # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
-      # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
-      # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
-      # ★macOS는 위 스텝이 slim 산출물을 이미 만들었으므로 tauriScript=true 로 빌드를 no-op 시킨다(재빌드=fat 재역참조
-      #   방지). tauri-action은 표준 경로의 그 산출물을 수집·업로드·latest.json 병합만 수행한다. Windows는 tauriScript=''
-      #   → getRunner가 falsy로 무시하고 기본 러너로 정상 빌드(동작 불변 — tauri-action src/runner.ts 실측 확인).
-      - name: Build, sign, and release (private)
-        uses: tauri-apps/tauri-action@v0
+      - name: Windows credential contract (fail closed)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CYS_TARGET: ${{ matrix.target }}    # bundle-prep.sh가 매트릭스 타깃으로 사이드카(cys-<target>)를 크로스 빌드
-          PYTHONUTF8: '1'                     # Windows 러너 python 한국어 print cp1252 크래시 방지(타 OS 무해)
-          # ── 업데이트 무결성 서명 (필수 — 없으면 .sig·latest.json 미생성) ──
+          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''    # 이 키는 무암호로 생성됨(실측 확인) → 빈 문자열. 별도 시크릿 불필요.
-          # ── macOS 코드사이닝 + 공증은 Developer ID 인증서 취득 후 추가. ──
-          # ★빈 APPLE_* env 를 넘기면 tauri 번들러가 빈 인증서를 security import 하려다 실패하므로,
-          #   인증서가 없는 동안에는 APPLE_* 를 아예 전달하지 않는다(=미서명 빌드 → Gatekeeper 경고 감수).
+        run: python scripts/release-credentials-check.py windows
+
+      - name: Import Windows signing certificate
+        if: matrix.platform == 'windows-latest'
+        id: windows_certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
+        run: ./scripts/windows-authenticode.ps1 -Mode Import
+
+      - name: Build Authenticode + RFC3161 Windows candidate
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ steps.windows_certificate.outputs.thumbprint }}
+          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PYTHONUTF8: '1'
+        run: ./scripts/build-windows-signed.ps1
+
+      - name: Remove ephemeral signing material
+        if: always() && matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
+          foreach ($path in @($env:CYS_BROWSER_RUNTIME_SECRET_KEY, $env:CYS_BROWSER_RUNTIME_PUBLIC_KEY)) {
+            if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force }
+          }
+
+      - name: Remove ephemeral macOS keychain
+        if: always() && matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/cys-release-signing.keychain-db" 2>/dev/null || true
+          rm -f "${CYS_BROWSER_RUNTIME_SECRET_KEY:-$RUNNER_TEMP/browser-runtime-release.key}" \
+            "${CYS_BROWSER_RUNTIME_PUBLIC_KEY:-$RUNNER_TEMP/browser-runtime-release.pub}"
+
+      - name: Encrypt signed target handoff
+        shell: bash
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: >-
+          bash scripts/release-handoff.sh pack release-candidate
+          "release-${{ matrix.target }}.tgz.enc"
+
+      - name: Upload encrypted signed target handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          # macOS='true'(빌드 no-op → 위 스텝의 slim 산출물 수집) · Windows=''(falsy → 기본 러너 정상 빌드, 불변).
-          tauriScript: ${{ matrix.platform == 'macos-latest' && 'true' || '' }}
-          tagName: ${{ github.ref_name }}
-          # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
-          releaseName: 'cys ${{ github.ref_name }}'
-          releaseBody: 'cys 터미널 ${{ github.ref_name }}. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.'
-          releaseDraft: false     # 실태그 자동 발행 — updater가 releases/latest를 즉시 인식
-          prerelease: false
-          args: --target ${{ matrix.target }}
+          name: release-${{ matrix.target }}
+          path: release-${{ matrix.target }}.tgz.enc
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
   # ── 무중단 팩 채널 아티팩트 (DESIGN-noshutdown-pack-update §2-①/§5/§7) ──
   # 기존 build/서명/updater 잡과 독립·가산. cys 바이너리를 네이티브로 빌드(팩 콘텐츠는 플랫폼 무관)해
@@ -283,7 +531,12 @@ jobs:
       # vendor 골격으로 클로버한다(2026-07 실사고 계열). 새 팩이 더 새로운 바이너리 RPC에 의존할 때만 상향.
       PACK_MIN_BINARY: '0.12.48'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Confidential handoff key contract
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: bash scripts/release-handoff.sh check
 
       # ★시크릿/개인정보 발행 hard-gate (팩 바이너리 빌드·임베드 전 최우선). 아래 scan-pack-secrets.sh는
       # cysjavis-pack 트리만·개인 계정 핸들 허용이라, 여기서 whole-repo 엄격 스캔(secret-scan.sh --all:
@@ -293,13 +546,13 @@ jobs:
         run: bash scripts/secret-scan.sh --all
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: pack-artifacts
 
@@ -494,19 +747,114 @@ jobs:
           ./target/release/cys pack-update --from . --dry-run
           echo "✅ 실서명 아티팩트가 실검증기를 통과(서명+신선도+파일+커버리지) — 폐포 확인"
 
-      # 비공개 릴리스(build 잡이 생성)에 팩 자산 업로드 → relocate가 공개 repo로 옮긴다.
-      - name: Upload pack artifacts to source release
+      - name: Encrypt signed pack handoff
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
         run: |
           set -euo pipefail
-          gh release upload "${{ github.ref_name }}" \
-            pack.tar.gz pack-manifest.json pack-manifest.json.minisig \
-            -R "$SRC_REPO" --clobber
-          # Phase 2: 소스 repo 릴리스가 updater 엔드포인트(releases/latest) — latest 마킹을 결정론 강제
-          gh release edit "${{ github.ref_name }}" -R "$SRC_REPO" --latest --draft=false
-          echo "✅ 팩 아티팩트 업로드 + latest 마킹 완료"
+          mkdir release-pack-candidate
+          cp pack.tar.gz pack-manifest.json pack-manifest.json.minisig release-pack-candidate/
+          bash scripts/release-handoff.sh pack release-pack-candidate release-pack.tgz.enc
 
-  # (Phase 2-4 완결·2026-07-03) 전환기 미러(relocate) 잡 제거 — 구 repo(cys-terminal-releases)는
-  # Archive됨. 마지막 미러(v0.10.0·자산 URL=소스 repo)가 읽기 전용으로 영구 생존하므로,
-  # 늦게 업데이트하는 구 설치본도 그 경로로 이주 가능하다.
+      - name: Upload encrypted signed pack handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-pack
+          path: release-pack.tgz.enc
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble-draft:
+    needs: [build, pack-artifacts]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Confidential handoff key contract
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: bash scripts/release-handoff.sh check
+
+      - name: Download all target handoffs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: candidate-input
+
+      - name: Decrypt the four exact target handoffs
+        shell: bash
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' HANDOFFS < <(find candidate-input -type f -name '*.tgz.enc' -print0 | sort -z)
+          [ "${#HANDOFFS[@]}" -eq 4 ] || {
+            echo "expected four encrypted target handoffs, got ${#HANDOFFS[@]}" >&2
+            exit 1
+          }
+          mkdir candidate-plain
+          INDEX=0
+          for HANDOFF in "${HANDOFFS[@]}"; do
+            bash scripts/release-handoff.sh unpack \
+              "$HANDOFF" "candidate-plain/handoff-$INDEX"
+            INDEX=$((INDEX + 1))
+          done
+
+      - name: Assemble and verify exact release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PUB_DATE="$(git show -s --format=%cI "$GITHUB_REF_NAME")"
+          python3 scripts/release-assemble.py \
+            --version "$VERSION" \
+            --input candidate-plain \
+            --output reviewed-candidate/release-out \
+            --site-output reviewed-candidate/release-site \
+            --repository "$SRC_REPO" \
+            --pub-date "$PUB_DATE"
+          python3 scripts/release-verify.py \
+            --version "$VERSION" --release-dir reviewed-candidate/release-out
+          shasum -a 256 reviewed-candidate/release-out/SHA256SUMS.txt \
+            > reviewed-candidate/release-bundle.sha256
+
+      - name: Encrypt reviewed candidate and homepage snapshot
+        env:
+          RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
+        run: >-
+          bash scripts/release-handoff.sh pack reviewed-candidate
+          "assembled-${GITHUB_REF_NAME}.tgz.enc"
+
+      - name: Retain encrypted reviewed candidate and homepage snapshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: assembled-${{ github.ref_name }}
+          path: assembled-${{ github.ref_name }}.tgz.enc
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create one non-public GitHub draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" -R "$SRC_REPO" >/dev/null 2>&1; then
+            echo "release already exists; refusing to clobber an existing draft or public release" >&2
+            exit 1
+          fi
+          BUNDLE_SHA="$(awk '{print $1}' reviewed-candidate/release-bundle.sha256)"
+          gh release create "$GITHUB_REF_NAME" -R "$SRC_REPO" \
+            --verify-tag --draft \
+            --title "cys $GITHUB_REF_NAME" \
+            --notes "Candidate only. SHA256SUMS digest: $BUNDLE_SHA"
+          if ! gh release upload "$GITHUB_REF_NAME" -R "$SRC_REPO" \
+            reviewed-candidate/release-out/*; then
+            echo "candidate upload failed; deleting the incomplete draft" >&2
+            gh release delete "$GITHUB_REF_NAME" -R "$SRC_REPO" --yes
+            exit 1
+          fi

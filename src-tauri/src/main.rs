@@ -82,6 +82,155 @@ async fn connect() -> Result<Stream, String> {
 type ConnCell = std::sync::Arc<tokio::sync::Mutex<Option<tokio::io::BufReader<Stream>>>>;
 static RPC_POOL: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, ConnCell>>> =
     std::sync::OnceLock::new();
+static BROWSER_APP_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
+    std::sync::OnceLock::new();
+
+const NATIVE_ACTIVATION_TTL_MS: u64 = 2_000;
+const TAURI_BROWSER_ENSURE_DEADLINE_SECS: u64 =
+    cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs() + 5;
+
+#[derive(Default)]
+struct NativeActivationRegistry {
+    windows: HashMap<String, NativeWindowActivation>,
+}
+
+struct NativeWindowActivation {
+    bootstrap_capability: String,
+    pending: Option<PendingNativeActivation>,
+}
+
+struct PendingNativeActivation {
+    _nonce: String,
+    expires_at_ms: u64,
+}
+
+impl NativeActivationRegistry {
+    fn install_window(&mut self, label: &str, capability: &str) -> Result<(), String> {
+        validate_lower_hex(capability, "Browser bootstrap capability")?;
+        if label.is_empty() || label.len() > 64 || self.windows.contains_key(label) {
+            return Err("invalid or duplicate Browser activation window".into());
+        }
+        self.windows.insert(
+            label.into(),
+            NativeWindowActivation {
+                bootstrap_capability: capability.into(),
+                pending: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn arm(&mut self, label: &str, capability: &str, now_ms: u64) -> Result<(), String> {
+        validate_lower_hex(capability, "Browser bootstrap capability")?;
+        let window = self
+            .windows
+            .get_mut(label)
+            .ok_or_else(|| "Browser activation window is not registered".to_string())?;
+        if window.bootstrap_capability != capability {
+            window.pending = None;
+            return Err("Browser bootstrap capability mismatch".into());
+        }
+        window.pending = Some(PendingNativeActivation {
+            _nonce: random_secret_hex()?,
+            expires_at_ms: now_ms.saturating_add(NATIVE_ACTIVATION_TTL_MS),
+        });
+        Ok(())
+    }
+
+    fn consume(&mut self, label: &str, now_ms: u64) -> Result<(), String> {
+        let window = self
+            .windows
+            .get_mut(label)
+            .ok_or_else(|| "Browser activation window is not registered".to_string())?;
+        let pending = window
+            .pending
+            .take()
+            .ok_or_else(|| "trusted native Browser activation is required".to_string())?;
+        if pending.expires_at_ms <= now_ms {
+            return Err("trusted native Browser activation expired".into());
+        }
+        Ok(())
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn validate_lower_hex(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} must be 32-byte lowercase hex"));
+    }
+    Ok(())
+}
+
+fn random_secret_hex() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| format!("OS CSPRNG unavailable: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn browser_activation_initialization_script(capability: &str) -> String {
+    format!(
+        r##"(() => {{
+  'use strict';
+  const capability = '{capability}';
+  const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
+  const nativeClick = HTMLElement.prototype.click;
+  document.addEventListener('click', (event) => {{
+    if (!event.isTrusted || !navigator.userActivation.isActive) return;
+    const raw = event.target;
+    if (!(raw instanceof Element)) return;
+    const target = raw.closest("#btn-browser, [data-browser-reconnect='true']");
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    invoke('arm_browser_native_activation', {{ bootstrapCapability: capability }})
+      .then(() => nativeClick.call(target))
+      .catch(() => undefined);
+  }}, true);
+}})();"##
+    )
+}
+
+fn browser_session_params(mut params: Value) -> Result<Value, String> {
+    let session = BROWSER_APP_SESSION
+        .get()
+        .ok_or_else(|| "Browser GUI peer registration is unavailable".to_string())?;
+    let object = params
+        .as_object_mut()
+        .ok_or_else(|| "Browser RPC params must be an object".to_string())?;
+    object.insert("app_session".into(), Value::String(session.clone()));
+    Ok(params)
+}
+
+async fn register_browser_gui_peer() -> Result<(), String> {
+    let challenge = rpc("browser.runtime.gui_challenge", json!({})).await?;
+    let registration_secret = challenge["registration_challenge"]
+        .as_str()
+        .ok_or_else(|| "cysd returned no Browser GUI registration challenge".to_string())?;
+    let registration = rpc(
+        "browser.runtime.register_gui",
+        json!({"registration_secret":registration_secret}),
+    )
+    .await?;
+    let session = registration["app_session"]
+        .as_str()
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| "cysd returned an invalid Browser GUI session".to_string())?
+        .to_string();
+    BROWSER_APP_SESSION
+        .set(session)
+        .map_err(|_| "Browser GUI peer was already registered".to_string())
+}
 
 /// 풀에서 소켓의 연결 셀을 얻는다 — 외부 std Mutex는 Arc 클론만 짧게 잡고 즉시 푼다(await 경계 안 넘김).
 fn conn_cell(socket: &std::path::Path) -> ConnCell {
@@ -182,7 +331,12 @@ async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Resu
 
 #[tauri::command]
 async fn daemon_status(socket: Option<String>) -> Result<Value, String> {
-    rpc_on(&resolve_socket(&socket), "system.identify", json!({"caller": "ui"})).await
+    rpc_on(
+        &resolve_socket(&socket),
+        "system.identify",
+        json!({"caller": "ui"}),
+    )
+    .await
 }
 
 /// GUI(cys-app) 자기 버전 — 데몬 버전(system.identify .version)과 비교해 rename-swap 후
@@ -207,7 +361,11 @@ async fn org_status(socket: Option<String>) -> Result<Value, String> {
 /// 공유 풀(conn_cell)을 desync로 오염시키지 않는다(같은 부서로 가는 send_key/org_status 응답 귀속 보호).
 /// 적대검증 R-1 교정: rpc_on을 timeout으로 감싸면 취소 시 풀 연결이 미수신 응답을 남겨 후속 RPC가
 /// stale 응답을 잘못 읽는다 — 일회성 연결은 드롭이 곧 연결 종료라 공유 상태를 건드리지 않는다.
-async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+async fn rpc_oneshot(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
@@ -216,7 +374,10 @@ async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> R
     stream.flush().await.map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
-    let n = reader.read_line(&mut resp).await.map_err(|e| e.to_string())?;
+    let n = reader
+        .read_line(&mut resp)
+        .await
+        .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("connection closed".into());
     }
@@ -241,8 +402,11 @@ async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> R
 async fn org_fleet() -> Result<Value, String> {
     use std::time::Duration;
     // (소켓, name, display_name) — 본부 먼저, 그다음 depts.json 등록순.
-    let mut targets: Vec<(std::path::PathBuf, String, String)> =
-        vec![(default_socket(), "_hq".to_string(), "본부 · CEO".to_string())];
+    let mut targets: Vec<(std::path::PathBuf, String, String)> = vec![(
+        default_socket(),
+        "_hq".to_string(),
+        "본부 · CEO".to_string(),
+    )];
     if let Ok(reg) = list_depts() {
         if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
             for (name, meta) in depts {
@@ -265,9 +429,11 @@ async fn org_fleet() -> Result<Value, String> {
         let slug = sock_slug(&sock);
         let socket_str = sock.to_string_lossy().to_string();
         // R-1 교정: 공유 풀(rpc_on) 대신 일회성 연결(rpc_oneshot) — timeout 취소가 풀을 오염시키지 않게.
-        let call =
-            tokio::time::timeout(Duration::from_secs(2), rpc_oneshot(&sock, "org.status", json!({})))
-                .await;
+        let call = tokio::time::timeout(
+            Duration::from_secs(2),
+            rpc_oneshot(&sock, "org.status", json!({})),
+        )
+        .await;
         let base = json!({"name": name, "display_name": display_name,
                           "socket": socket_str, "socket_slug": slug});
         let entry = match call {
@@ -361,17 +527,33 @@ async fn control_weekly() -> Result<Value, String> {
 
 #[tauri::command]
 async fn control_sessions(window: Option<String>, redact: Option<bool>) -> Result<Value, String> {
-    rpc("control.sessions", json!({ "window": window, "redact": redact })).await
+    rpc(
+        "control.sessions",
+        json!({ "window": window, "redact": redact }),
+    )
+    .await
 }
 
 #[tauri::command]
 async fn control_session_detail(session_id: String) -> Result<Value, String> {
-    rpc("control.session_detail", json!({ "session_id": session_id })).await
+    rpc(
+        "control.session_detail",
+        json!({ "session_id": session_id }),
+    )
+    .await
 }
 
 #[tauri::command]
-async fn control_session_star(session_id: String, starred: bool, note: Option<String>) -> Result<Value, String> {
-    rpc("control.session_star", json!({ "session_id": session_id, "starred": starred, "note": note })).await
+async fn control_session_star(
+    session_id: String,
+    starred: bool,
+    note: Option<String>,
+) -> Result<Value, String> {
+    rpc(
+        "control.session_star",
+        json!({ "session_id": session_id, "starred": starred, "note": note }),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -420,7 +602,9 @@ fn log_ime(line: String) {
 /// 최종 사용자가 켤 수 없다 → ~/.cys/ime-debug 파일 존재 또는 CYS_IME_DEBUG=1이면 계측 활성.
 #[tauri::command]
 fn ime_debug_enabled() -> bool {
-    std::env::var("CYS_IME_DEBUG").map(|v| v == "1").unwrap_or(false)
+    std::env::var("CYS_IME_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
         || cys::home_dir().join(".cys/ime-debug").exists()
 }
 
@@ -535,8 +719,8 @@ fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
         // Windows: 실행비트가 없어 확장자 게이트 — 스크립트·핸들러 실행형 전반
         #[cfg(windows)]
         if [
-            "exe", "bat", "cmd", "com", "scr", "ps1", "msi", "vbs", "vbe", "js", "jse",
-            "wsf", "wsh", "hta", "lnk", "reg", "jar", "pif", "scf", "cpl", "msc",
+            "exe", "bat", "cmd", "com", "scr", "ps1", "msi", "vbs", "vbe", "js", "jse", "wsf",
+            "wsh", "hta", "lnk", "reg", "jar", "pif", "scf", "cpl", "msc",
         ]
         .contains(&ext_of(&path).as_str())
         {
@@ -606,11 +790,13 @@ fn ensure_view_bridge() -> Result<Value, String> {
     // 임계구역 진입: spawn 은 프로세스 내 한 번에 하나만.
     let lock = VIEW_BRIDGE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner()); // poison 무시(임계구역 상태 무보유)
-    // 락 획득 후 재확인(double-checked) — 대기 중 다른 invoke가 이미 기동했으면 spawn 생략.
+                                                                 // 락 획득 후 재확인(double-checked) — 대기 중 다른 invoke가 이미 기동했으면 spawn 생략.
     if let Some(v) = read_live_view_state(&state_path) {
         return Ok(v);
     }
-    let script = cys::pack::pack_dir().join("bin").join("javis_view_bridge.py");
+    let script = cys::pack::pack_dir()
+        .join("bin")
+        .join("javis_view_bridge.py");
     if !script.exists() {
         return Err(format!("view bridge 스크립트 없음: {}", script.display()));
     }
@@ -621,7 +807,8 @@ fn ensure_view_bridge() -> Result<Value, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     no_console(&mut cmd);
-    cmd.spawn().map_err(|e| format!("view bridge 기동 실패: {e}"))?;
+    cmd.spawn()
+        .map_err(|e| format!("view bridge 기동 실패: {e}"))?;
     // state 대기(0.2s 간격·최대 10s) — 사이드카가 0-bind 포트 확정 후 state.json 을 원자 기록한다.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -633,164 +820,218 @@ fn ensure_view_bridge() -> Result<Value, String> {
     Err("view bridge state 대기 타임아웃(10s)".into())
 }
 
-/// 지구본 버튼 진입점 — browserd headful(실 Chromium) 창을 띄운다. GUI·`cys browser` CLI
-/// 둘 다 javis_browser를 직접 spawn한다(caps 게이트 없음 — 브라우저는 에이전트 도구이고,
-/// 진짜 경계는 browserd 프로필 격리다. 설계 §3-★). detached spawn 후 즉시 반환한다(첫 기동은
-/// browserd 시작에 수 초 — 창은 지연 등장·GUI toast가 피드백). ★단일 인스턴스 보장은 이 함수가
-/// 아니라 엔진 ensure_browserd의 파일락에 있다(리뷰어1 F1 — GUI Mutex는 CLI 동시성을 못 막으므로
-/// 크로스프로세스 락이 정답. 여기서 ensure_view_bridge식 Mutex+대기를 흉내내지 않는다).
+/// 인증 정보가 없는 구형 Tauri 진입점. Browser v2의 검증된 pane/gesture identity를 만들 수
+/// 없으므로 disabled-safe로 거부한다. 실제 지구본 버튼은 `ensure_browserd_cast`를 사용한다.
 #[tauri::command]
 fn browser_open(url: Option<String>) -> Result<Value, String> {
-    let script = cys::pack::pack_dir().join("bin").join("javis_browser.py");
-    if !script.exists() {
-        return Err(format!("browser 스크립트 없음: {}", script.display()));
-    }
-    // observe = headful 관측(사람이 창 직접 봄) · agent 프로필(자동화 허용 — 에이전트 공유).
-    // url 미지정 시 시작 페이지(about:blank).
-    let target = url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "about:blank".into());
-    let mut cmd = std::process::Command::new("python3");
-    inject_runtime_path(&mut cmd);
-    cmd.arg(&script)
-        .arg("observe")
-        .arg(&target)
-        .arg("--profile")
-        .arg("agent")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    no_console(&mut cmd);
-    cmd.spawn().map_err(|e| format!("browser 기동 실패: {e}"))?;
-    // 정직 계약(리뷰어1 F3): detached spawn이라 여기서 아는 것은 "spawn 성공"뿐 — 브라우저가
-    // 실제로 떴다는 보장이 아니다(bun/playwright 미설치·browserd 타임아웃·observe 실패는 여기서
-    // 안 잡힌다). 'opened'로 거짓 단언하지 않고 'spawned'로 의미를 정직화한다(exit0 거짓말 원장).
-    // 실제 실패는 browserd.log·audit.jsonl에 남고, 창 부재가 사용자 신호다.
-    Ok(serde_json::json!({"spawned": true, "url": target, "profile": "agent"}))
+    let target = url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "about:blank".into());
+    Err(format!(
+        "BROWSER_DISABLED_SAFE [USER_GESTURE_REQUIRED]: legacy browser_open cannot authorize or navigate {target}; use the in-pane Browser reconnect action"
+    ))
 }
 
-/// ~/.cys/browser/state.json 을 읽어 pid 생존이면 (port, token, headless) 반환, 부재/손상/사멸이면 None.
-/// browserd 엔진(lib.ts writeState)이 {pid, port, token, headless?} 를 0600 원자 기록한다.
-/// ★headless 는 3-상태다 — 키가 있으면 Some(값), **없거나 bool 이 아니면 None=unknown**. 이 키를 안 쓰던
-/// 구버전 browserd 도 실제로는 headless 로 떠 있을 수 있어, 부재를 false 로 단정하면 GUI 가 "기존 headful
-/// 세션 재사용 — 외부 창 병존" toast 를 **거짓 고지**한다(창이 없는데 있다고 말함 = exit0 거짓말 계열).
-/// unknown 은 JSON 에 null 로 나가고, GUI 의 `state.headless === false` 엄격 비교가 자연히 침묵한다
-/// (모르면 말하지 않는다).
-/// pid 생존 판정은 read_live_view_state 와 동형(kill(pid,0): ESRCH=사멸).
-fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bool>)> {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let pid = v.get("pid").and_then(|p| p.as_i64())?;
-    let port = v.get("port").and_then(|p| p.as_u64())?;
-    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
-    let headless = v.get("headless").and_then(|h| h.as_bool()); // 부재·비-bool = None(unknown)
-    // pid 생존 확인 — kill(pid, 0): 0=생존, ESRCH=사멸. (windows는 생존 가정 — 스테일이면 상위 계약이 흡수)
-    #[cfg(unix)]
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+fn browser_user_gesture_intent(
+    window_label: &str,
+    pane_nonce: &str,
+    gesture_receipt: &str,
+) -> Result<Value, String> {
+    if window_label.is_empty()
+        || window_label.len() > 64
+        || !window_label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return None;
+        return Err("invalid Browser window label".into());
     }
-    let _ = pid;
-    let port = u16::try_from(port).ok()?;
-    Some((port, token, headless))
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(pane_nonce) || !valid_credential(gesture_receipt) {
+        return Err("Browser pane/gesture receipt must be 32-byte lowercase hex".into());
+    }
+    Ok(json!({
+        "authority_kind":"user_gesture",
+        "realm":"shared-default",
+        "mode":"headless",
+        "window_label":window_label,
+        "pane_nonce":pane_nonce,
+        "gesture_receipt":gesture_receipt,
+    }))
 }
 
-/// 지구본 버튼 in-pane(cast) 경로 진입점 — browserd 를 **headless** 로 확보하고 cast 앱이 쓸
-/// {port, token, headless} 좌표를 반환한다. browser_open(detached·즉시 반환)과 달리 이 커맨드는
-/// `javis_browser.py --headless start` 를 **동기 실행**해 browserd 가 실제로 뜰 때까지 기다린다
-/// (엔진 start 는 state 등장까지 최대 20s 블로킹). 그래서 async fn — Tauri 가 별도 스레드에서
-/// 돌려 cold-start 가 GUI 메인 스레드를 점유하지 않는다(시뮬 F1). 블로킹 대기는 파일 내 관례대로
-/// spawn_blocking 으로 tokio 워커에서 격리한다.
-/// ★단일 인스턴스 보장은 이 함수가 아니라 엔진 ensure_browserd 의 파일락에 있다(browser_open 과
-/// 동일 원칙 — 진입점 Mutex 흉내 금지, 크로스프로세스 락이 정답). live browserd 가 이미 있으면
-/// kill 없이 그대로 재사용되고 state.headless 를 정직 반환한다(세션 공유 원칙).
 #[tauri::command]
-async fn ensure_browserd_cast() -> Result<Value, String> {
-    let script = cys::pack::pack_dir().join("bin").join("javis_browser.py");
-    if !script.exists() {
-        return Err(format!("browser 스크립트 없음: {}", script.display()));
+fn arm_browser_native_activation(
+    window: tauri::WebviewWindow,
+    bootstrap_capability: String,
+) -> Result<(), String> {
+    NATIVE_BROWSER_ACTIVATIONS
+        .get()
+        .ok_or_else(|| "Browser native activation registry is unavailable".to_string())?
+        .lock()
+        .unwrap()
+        .arm(window.label(), &bootstrap_capability, unix_millis_now())
+}
+
+fn browser_embed_intent(
+    pane_id: &str,
+    embed_ticket: &str,
+    embed_generation: u64,
+    parent_origin: &str,
+) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let expected_origin = if cfg!(windows) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    };
+    if !valid_credential(pane_id)
+        || !valid_credential(embed_ticket)
+        || embed_generation == 0
+        || parent_origin != expected_origin
+    {
+        return Err("invalid Browser embed request".into());
     }
-    let state_path = cys::home_dir().join(".cys/browser/state.json");
-    tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        let mut cmd = std::process::Command::new("python3");
-        inject_runtime_path(&mut cmd); // 동봉 runtime(python3) PATH 주입 — browser_open 동형
-        cmd.arg(&script)
-            .arg("--headless") // 전역 플래그(subcommand 앞) — javis_browser argparse 정의와 정합
-            .arg("start")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        no_console(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| format!("browserd 기동 실패: {e}"))?;
-        // 완료까지 대기(타임아웃 30s — 엔진 20s 블로킹에 여유). try_wait 폴링으로 무한 대기 방지.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // 파이프 잔여 출력 수거(start 출력은 JSON 한 줄 — 버퍼 초과 없음).
-                    use std::io::Read;
-                    let mut stdout = String::new();
-                    let mut stderr = String::new();
-                    if let Some(mut o) = child.stdout.take() {
-                        let _ = o.read_to_string(&mut stdout);
-                    }
-                    if let Some(mut e) = child.stderr.take() {
-                        let _ = e.read_to_string(&mut stderr);
-                    }
-                    if !status.success() {
-                        // 정직 계약 — 거짓 성공 금지. 원인(stderr/stdout 말미 각 500자) 노출.
-                        let tail = |s: &str, n: usize| -> String {
-                            let t = s.trim();
-                            let cs: Vec<char> = t.chars().collect();
-                            if cs.len() <= n {
-                                t.to_string()
-                            } else {
-                                cs[cs.len() - n..].iter().collect()
-                            }
-                        };
-                        let code =
-                            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-                        return Err(format!(
-                            "browserd start 실패(exit {code}) — stderr: {} / stdout: {}",
-                            tail(&stderr, 500),
-                            tail(&stdout, 500)
-                        ));
-                    }
-                    break;
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err("browserd start 타임아웃(30s) — kill".into());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                }
-                Err(e) => return Err(format!("browserd start 대기 실패: {e}")),
-            }
+    Ok(json!({
+        "context":"default",
+        "protocol_version":2,
+        "embed_generation":embed_generation,
+        "parent_origin":parent_origin,
+        "embed_ticket":embed_ticket,
+        "pane_id":pane_id,
+    }))
+}
+
+/// 지구본 버튼의 active Browser 진입점. 검증된 사용자 제스처를 `cysd`의 lazy
+/// BrowserAuthorityExtension에 제출하고, 호환 runtime이 준비된 뒤 짧은 수명의
+/// `EmbedDescriptor`만 반환한다. Tauri는 실행 파일·PID·port·control token·process lock을
+/// 읽거나 소유하지 않는다. cold start는 bounded RPC timeout 안에서 일어나며 앱 부트/복원
+/// 경로에서는 이 명령을 호출하지 않는다.
+#[tauri::command]
+async fn ensure_browserd_cast(
+    window: tauri::WebviewWindow,
+    pane_nonce: String,
+    request_id: String,
+    embed_generation: u64,
+    parent_origin: String,
+    embed_ticket: String,
+) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(&request_id) {
+        return Err("invalid Browser request identity".into());
+    }
+    NATIVE_BROWSER_ACTIVATIONS
+        .get()
+        .ok_or_else(|| "BROWSER_DISABLED_SAFE: native activation registry unavailable".to_string())?
+        .lock()
+        .unwrap()
+        .consume(window.label(), unix_millis_now())
+        .map_err(|error| format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}"))?;
+    let issue_params = browser_session_params(json!({
+        "window_label":window.label(),
+        "pane_nonce":pane_nonce,
+    }))?;
+    let issued = rpc("browser.runtime.issue_gesture", issue_params)
+        .await
+        .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+    let gesture_receipt = issued["gesture_receipt"].as_str().ok_or_else(|| {
+        "BROWSER_DISABLED_SAFE: broker returned no activation receipt".to_string()
+    })?;
+    let mut intent = browser_user_gesture_intent(window.label(), &pane_nonce, &gesture_receipt)?;
+    intent
+        .as_object_mut()
+        .ok_or_else(|| "invalid Browser launch intent".to_string())?
+        .insert("request_id".into(), Value::String(request_id.clone()));
+    let ensure = tokio::time::timeout(
+        std::time::Duration::from_secs(TAURI_BROWSER_ENSURE_DEADLINE_SECS),
+        rpc_oneshot(
+            &default_socket(),
+            "browser.runtime.ensure",
+            browser_session_params(intent)?,
+        ),
+    )
+    .await;
+    match ensure {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(format!("BROWSER_DISABLED_SAFE: {error}")),
+        Err(_) => {
+            let _ = cancel_browser_request(&pane_nonce, &request_id).await;
+            return Err(format!(
+                "BROWSER_DISABLED_SAFE [RUNTIME_START_TIMEOUT]: broker did not answer in {}s",
+                TAURI_BROWSER_ENSURE_DEADLINE_SECS
+            ));
         }
-        // exit 0 — state.json 으로 browserd live + 좌표를 검증(정직 계약: 프레임 도달은 pane 이 검증).
-        match read_browserd_state(&state_path) {
-            Some((port, token, headless)) => {
-                Ok(json!({"port": port, "token": token, "headless": headless}))
-            }
-            None => Err("browserd start 는 exit0 이나 state.json 부재/손상/pid 사망 — 확보 실패".into()),
-        }
-    })
+    }
+    let embed = browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)?;
+    rpc(
+        "browser.runtime.prepare_embed",
+        browser_session_params(embed)?,
+    )
     .await
-    .map_err(|e| format!("browserd 확보 태스크 실패(join): {e}"))?
+    .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))
 }
 
-/// browserd 생존 조회 전용 — **spawn 절대 없음**(auto-spawn 회귀 차단, 설계 D7). GUI 복원 경로가
-/// 부팅 시 Chromium 을 자동 기동하지 않고 browserd 생존만 확인하는 용도. live 면
-/// {alive:true, port, token, headless}, 부재·손상·pid 사망이면 {alive:false} 반환(Err 아님 —
-/// 정상 상태 조회이므로 실패가 아니다).
+async fn cancel_browser_request(pane_nonce: &str, request_id: &str) -> Result<Value, String> {
+    rpc_oneshot(
+        &default_socket(),
+        "browser.runtime.cancel",
+        browser_session_params(json!({
+            "pane_nonce":pane_nonce,
+            "request_id":request_id,
+        }))?,
+    )
+    .await
+}
+
 #[tauri::command]
-fn browserd_state() -> Value {
-    let state_path = cys::home_dir().join(".cys/browser/state.json");
-    match read_browserd_state(&state_path) {
-        Some((port, token, headless)) => {
-            json!({"alive": true, "port": port, "token": token, "headless": headless})
-        }
-        None => json!({"alive": false}),
+async fn cancel_browserd_cast(pane_nonce: String, request_id: String) -> Result<Value, String> {
+    let valid_credential = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_credential(&pane_nonce) || !valid_credential(&request_id) {
+        return Err("invalid Browser cancellation identity".into());
+    }
+    cancel_browser_request(&pane_nonce, &request_id).await
+}
+
+/// 복원용 passive descriptor 조회. `prepare_embed`은 cysd의 이미 호환 판정된 live runtime에만
+/// descriptor를 발급하며 절대 ensure/spawn하지 않는다. live면
+/// `{alive:true,descriptor:EmbedDescriptor}`, 부재·손상·불일치면 `{alive:false}`다.
+#[tauri::command]
+async fn browserd_state(
+    pane_nonce: String,
+    embed_generation: u64,
+    parent_origin: String,
+    embed_ticket: String,
+) -> Value {
+    let Ok(embed) =
+        browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)
+    else {
+        return json!({"alive":false});
+    };
+    let Ok(embed) = browser_session_params(embed) else {
+        return json!({"alive":false});
+    };
+    match rpc("browser.runtime.prepare_embed", embed).await {
+        Ok(descriptor) => json!({"alive":true,"descriptor":descriptor}),
+        Err(_) => json!({"alive":false}),
     }
 }
 
@@ -800,7 +1041,10 @@ fn browserd_state() -> Value {
 fn reveal_path(path: String) -> Result<(), String> {
     std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
     #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    let r = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&path)
+        .spawn();
     #[cfg(target_os = "windows")]
     let r = std::process::Command::new("explorer")
         .arg(format!("/select,{path}"))
@@ -822,9 +1066,14 @@ fn reveal_path(path: String) -> Result<(), String> {
 /// 기본 목록은 코드 봉인, 사용자 도메인은 로컬 설정으로 확장(공개 배포에서 기관 도메인 하드코딩 제거):
 /// ~/.cys/url-allow-hosts(줄당 1도메인 — GUI 경로) 또는 $CYS_URL_ALLOW_HOSTS(콤마 구분).
 fn url_host_allowed(url: &str) -> Result<(), String> {
-    let rest = url.strip_prefix("https://").ok_or_else(|| "https only".to_string())?;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "https only".to_string())?;
     // authority는 첫 '/', '?'(query), '#'(fragment) 전까지(RFC 3986) — query/fragment 사칭 우회 차단.
-    let authority = rest.split(|c: char| c == '/' || c == '?' || c == '#').next().unwrap_or("");
+    let authority = rest
+        .split(|c: char| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority); // userinfo(@) 제거 — 위장 host 차단
     let host = host.split(':').next().unwrap_or(host); // port 제거
     let extras = user_allow_hosts();
@@ -850,10 +1099,18 @@ fn host_in_allowlist(host: &str, extras: &[String]) -> bool {
 fn user_allow_hosts() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(s) = std::fs::read_to_string(cys::home_dir().join(".cys/url-allow-hosts")) {
-        out.extend(s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')));
+        out.extend(
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#')),
+        );
     }
     if let Ok(env) = std::env::var("CYS_URL_ALLOW_HOSTS") {
-        out.extend(env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        out.extend(
+            env.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
     }
     out
 }
@@ -1036,11 +1293,7 @@ fn translocation_guidance(verdict: BootPathVerdict) -> String {
 }
 
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
-fn build_install_script(
-    cys: &std::path::Path,
-    cysd: &std::path::Path,
-    target_dir: &str,
-) -> String {
+fn build_install_script(cys: &std::path::Path, cysd: &std::path::Path, target_dir: &str) -> String {
     format!(
         "mkdir -p {td} && ln -sf {c} {tc} && ln -sf {d} {tdd}",
         td = sh_squote(target_dir),
@@ -1134,10 +1387,7 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
     {
         let target_dir = "/usr/local/bin";
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let macos_dir = exe
-            .parent()
-            .ok_or("번들 디렉토리 해석 실패")?
-            .to_path_buf();
+        let macos_dir = exe.parent().ok_or("번들 디렉토리 해석 실패")?.to_path_buf();
 
         let plan = plan_cli_install(&macos_dir, target_dir)?;
         if !plan.cys_src.exists() || !plan.cysd_src.exists() {
@@ -1288,13 +1538,14 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         PendingUpdatePlan::Apply => {}
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
-    let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+    let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+        "cys.exe"
+    } else {
+        "cys"
+    }));
     init_cmd.arg("init-pack").arg("--no-install-hook");
     no_console(&mut init_cmd);
-    let pack_ok = init_cmd
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let pack_ok = init_cmd.status().map(|s| s.success()).unwrap_or(false);
     if !pack_ok {
         // 실패 — 마커·스탬프를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
         // 조용히 각성하는 것을 막고 사용자에게 알린다.
@@ -1315,7 +1566,11 @@ fn maybe_apply_pending_update(app: &AppHandle) {
 /// autostart되는 것을 막는다(살아있는 대상에만 호출하므로 평시 무영향인 심층방어). 반환=성공 여부.
 async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+            "cys.exe"
+        } else {
+            "cys"
+        }));
         cmd.arg("restore").arg("--include-master");
         cmd.env("CYS_NO_AUTOSTART", "1"); // 죽은 소켓에 빈 데몬 autostart 금지(사이드카 CLI 가드)
         if let Some(sock) = socket {
@@ -1371,9 +1626,13 @@ fn spawn_org_restore(app: AppHandle) {
                 .await
                 .ok()
                 .and_then(|v| {
-                    v.get("dept_tombstones").and_then(|a| a.as_array()).map(|a| {
-                        a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
-                    })
+                    v.get("dept_tombstones")
+                        .and_then(|a| a.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
                 })
                 .unwrap_or_default();
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
@@ -1400,10 +1659,8 @@ fn spawn_org_restore(app: AppHandle) {
                     if tombs.contains(name.as_str()) {
                         let mut detail = "삭제-의도 묘비 — 재기동 제외".to_string();
                         if alive {
-                            let _ = stop_dept_daemon_by_socket(
-                                sock.to_string_lossy().to_string(),
-                            )
-                            .await;
+                            let _ = stop_dept_daemon_by_socket(sock.to_string_lossy().to_string())
+                                .await;
                             // ★R4(D-IMPL-4): teardown 함수는 실패를 삼키므로(무조건 Ok) 재프로브로
                             // 결과를 가시화 — 여전히 생존이면 WARN 라벨(차회 부팅 재시도가 수렴 경로).
                             let still = tokio::time::timeout(
@@ -1460,8 +1717,13 @@ fn spawn_org_restore(app: AppHandle) {
 /// human 플래그 미사용(데몬 send_key 핸들러는 전부 프로그램 경로 — 읽지 않음).
 #[tauri::command]
 async fn send_key(socket: Option<String>, surface_id: u64, key: String) -> Result<(), String> {
-    rpc_on(&resolve_socket(&socket), "surface.send_key",
-        json!({"surface_id": surface_id, "key": key})).await.map(|_| ())
+    rpc_on(
+        &resolve_socket(&socket),
+        "surface.send_key",
+        json!({"surface_id": surface_id, "key": key}),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// D5/SB-1: 스킬 버튼 보드 카탈로그 읽기(pack/board-catalog.json) — 정적 파일 read(데몬 무변경).
@@ -1490,13 +1752,23 @@ fn make_run_id(slug: Option<&str>, task: &str) -> String {
     let base: String = slug
         .unwrap_or(task)
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let base = if base.is_empty() { "skill".to_string() } else { base };
+    let base = if base.is_empty() {
+        "skill".to_string()
+    } else {
+        base
+    };
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1533,7 +1805,16 @@ fn make_ticket(
     orch_cmd
         .arg(&script)
         .arg("task-prompt")
-        .args(["--task", &task, "--scope", &scope_full, "--success", &success, "--to", &to])
+        .args([
+            "--task",
+            &task,
+            "--scope",
+            &scope_full,
+            "--success",
+            &success,
+            "--to",
+            &to,
+        ])
         .arg("--no-survival-gate")
         .args(["--output-format", &out_fmt]);
     no_console(&mut orch_cmd);
@@ -1541,7 +1822,10 @@ fn make_ticket(
         .output()
         .map_err(|e| format!("javis_orchestra 실행 실패: {e}"))?;
     if !output.status.success() {
-        return Err(format!("task-prompt 실패: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "task-prompt 실패: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(json!({"ticket": String::from_utf8_lossy(&output.stdout).to_string(), "run_id": run_id}))
 }
@@ -1561,7 +1845,9 @@ fn run_skill(
     }
     let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
     let mut cmd = std::process::Command::new(&cys);
-    cmd.arg("skill").arg("run").arg(&name)
+    cmd.arg("skill")
+        .arg("run")
+        .arg(&name)
         .args(["--ticket", &ticket])
         .args(["--agent", agent.as_deref().unwrap_or("claude")]);
     if let Some(ca) = close_after {
@@ -1588,7 +1874,9 @@ async fn skill_runs(limit: Option<u64>) -> Result<Value, String> {
 /// (게이트가 보드를 죽이지 않는다 — fail-open, 게이트 자체는 사전 경고 장치).
 #[tauri::command]
 fn resource_gate_check() -> Result<Value, String> {
-    let script = cys::pack::pack_dir().join("bin").join("javis_resource_gate.py");
+    let script = cys::pack::pack_dir()
+        .join("bin")
+        .join("javis_resource_gate.py");
     if !script.exists() {
         return Ok(json!({"exit_code": 0, "report": Value::Null}));
     }
@@ -1599,8 +1887,7 @@ fn resource_gate_check() -> Result<Value, String> {
     match cmd.output() {
         Ok(out) => {
             let code = out.status.code().unwrap_or(0);
-            let report =
-                serde_json::from_slice::<Value>(&out.stdout).unwrap_or(Value::Null);
+            let report = serde_json::from_slice::<Value>(&out.stdout).unwrap_or(Value::Null);
             Ok(json!({"exit_code": code, "report": report}))
         }
         Err(_) => Ok(json!({"exit_code": 0, "report": Value::Null})),
@@ -1666,8 +1953,14 @@ async fn usage_accounts_all() -> Result<Value, String> {
     }
     let mut accounts: Vec<Value> = merged.into_values().collect();
     accounts.sort_by(|x, y| {
-        (x["provider"].as_str().unwrap_or(""), x["label"].as_str().unwrap_or(""))
-            .cmp(&(y["provider"].as_str().unwrap_or(""), y["label"].as_str().unwrap_or("")))
+        (
+            x["provider"].as_str().unwrap_or(""),
+            x["label"].as_str().unwrap_or(""),
+        )
+            .cmp(&(
+                y["provider"].as_str().unwrap_or(""),
+                y["label"].as_str().unwrap_or(""),
+            ))
     });
     Ok(json!({"accounts": accounts}))
 }
@@ -1682,7 +1975,11 @@ fn skill_out_dir() -> String {
 }
 
 #[tauri::command]
-async fn rename_surface(socket: Option<String>, surface_id: u64, title: String) -> Result<(), String> {
+async fn rename_surface(
+    socket: Option<String>,
+    surface_id: u64,
+    title: String,
+) -> Result<(), String> {
     rpc_on(
         &resolve_socket(&socket),
         "surface.rename",
@@ -2190,7 +2487,10 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
 /// ＋부서 자동화(패치5): `catalog_key`=Some(k) → `cys-dept create <k>`(카탈로그 기반 부서명·계정·미션·각성),
 /// None → `cys-dept allocate`(레거시 무변경). create 경로는 레지스트리에서 display_name 을 조회해 반환한다.
 #[tauri::command]
-async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Result<Value, String> {
+async fn allocate_dept_daemon(
+    app: AppHandle,
+    catalog_key: Option<String>,
+) -> Result<Value, String> {
     let tool = dept_tool();
     let ck = catalog_key.clone();
     let out = tokio::task::spawn_blocking(move || {
@@ -2271,9 +2571,7 @@ async fn stop_dept_daemon(name: String) -> Result<(), String> {
 fn list_depts() -> Result<Value, String> {
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir().join(".cys/depts.json")
-        });
+        .unwrap_or_else(|_| cys::home_dir().join(".cys/depts.json"));
     match std::fs::read_to_string(&reg) {
         Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
         Err(_) => Ok(json!({ "depts": {} })),
@@ -2285,9 +2583,7 @@ fn list_depts() -> Result<Value, String> {
 fn dept_display_name(name: &str) -> Option<String> {
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir().join(".cys/depts.json")
-        });
+        .unwrap_or_else(|_| cys::home_dir().join(".cys/depts.json"));
     let s = std::fs::read_to_string(&reg).ok()?;
     let v: Value = serde_json::from_str(&s).ok()?;
     v.get("depts")?
@@ -2303,10 +2599,7 @@ fn dept_display_name(name: &str) -> Option<String> {
 fn read_dept_catalog() -> Result<Value, String> {
     let cat = std::env::var("CYS_DEPT_CATALOG")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir()
-                .join(".cys/dept-catalog.json")
-        });
+        .unwrap_or_else(|_| cys::home_dir().join(".cys/dept-catalog.json"));
     match std::fs::read_to_string(&cat) {
         Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
         Err(_) => Ok(json!({ "departments": {} })),
@@ -2329,7 +2622,12 @@ fn dept_name_from_socket(sock: &str) -> Option<String> {
 async fn dept_tombstone_by_socket(socket: String) -> Result<Value, String> {
     let name = dept_name_from_socket(&socket)
         .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
-    rpc_oneshot(&cys::socket_path(), "dept_tombstone.set", json!({"name": name})).await
+    rpc_oneshot(
+        &cys::socket_path(),
+        "dept_tombstone.set",
+        json!({"name": name}),
+    )
+    .await
 }
 
 /// ★WP-3 리바이버 게이트 소스: base 데몬의 dept 묘비 목록(프론트 복원이 유령 판정에 사용).
@@ -2338,7 +2636,11 @@ async fn dept_tombstones() -> Result<Vec<String>, String> {
     let v = rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({})).await?;
     Ok(v.get("dept_tombstones")
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default())
 }
 
@@ -2352,7 +2654,11 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
         cmd.env_remove("CYS_SOCKET");
-        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        cmd.arg("launch-agent")
+            .arg("--role")
+            .arg("master")
+            .arg("--agent")
+            .arg("claude");
         no_console(&mut cmd);
         cmd.output()
     })
@@ -2491,7 +2797,11 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
         cmd.env("CYS_SOCKET", &socket);
-        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        cmd.arg("launch-agent")
+            .arg("--role")
+            .arg("master")
+            .arg("--agent")
+            .arg("claude");
         no_console(&mut cmd);
         cmd.output()
     })
@@ -2644,7 +2954,12 @@ async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> 
 /// rotate_daemon 동형이되 대상이 부서 소켓이라 세션 카운트를 dept_live_session_count(부서소켓 surface.list)로
 /// 산출한다(live_session_count는 메인 전용이라 재사용 불가). 반환=새 데몬 identify(+rotate_log) — UI 스큐 해소 판정.
 #[tauri::command]
-async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drain: bool) -> Result<Value, String> {
+async fn rotate_dept_daemon(
+    app: AppHandle,
+    name: String,
+    force: bool,
+    skip_drain: bool,
+) -> Result<Value, String> {
     let sock = dept_socket_path(&name);
     // 세션 가드(rotate_daemon 동형). ★F1(리뷰): force=false는 카운트 실패를 0으로 접지 않고
     // Err("live_sessions:unknown")로 보류한다 — 세션 보유 부서를 무확인 교대할 위험 차단(UI가 held 분류·다음
@@ -2662,7 +2977,11 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
     if !skip_drain {
         let dsock = sock.to_string_lossy().into_owned();
         let _ = tokio::task::spawn_blocking(move || {
-            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+                "cys.exe"
+            } else {
+                "cys"
+            }));
             cmd.env(cys::ENV_SOCKET, &dsock);
             cmd.arg("drain");
             no_console(&mut cmd);
@@ -2795,7 +3114,12 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
     .await;
     let out = match joined {
         Ok(Ok(out)) if out.status.success() => out,
-        Ok(Ok(out)) => return Err(format!("pack-manifest HTTP 실패(code {:?})", out.status.code())),
+        Ok(Ok(out)) => {
+            return Err(format!(
+                "pack-manifest HTTP 실패(code {:?})",
+                out.status.code()
+            ))
+        }
         Ok(Err(e)) => return Err(format!("curl 실행 실패: {e}")),
         Err(e) => return Err(format!("curl join 실패: {e}")),
     };
@@ -2814,7 +3138,8 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
         return Ok(None);
     }
     // 축2 호환 게이트: min_binary_version ≤ 실행 바이너리(env CARGO_PKG_VERSION = 단일 버전선).
-    let binary_too_old = pack_binary_too_old(&manifest.min_binary_version, env!("CARGO_PKG_VERSION"));
+    let binary_too_old =
+        pack_binary_too_old(&manifest.min_binary_version, env!("CARGO_PKG_VERSION"));
     Ok(Some(json!({
         "pack_version": manifest.pack_version,
         "min_binary_version": manifest.min_binary_version,
@@ -2831,7 +3156,10 @@ fn pack_binary_too_old(min_binary: &str, running: &str) -> bool {
     if min.is_empty() {
         return false;
     }
-    match (cys::pack::parse_semver(min), cys::pack::parse_semver(running)) {
+    match (
+        cys::pack::parse_semver(min),
+        cys::pack::parse_semver(running),
+    ) {
         (Some(m), Some(r)) => m > r,
         _ => true,
     }
@@ -2889,7 +3217,11 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 자체 watchdog(12s)로 hang 시에도 종료되므로 별도 timeout 없이 await해도 업데이트가 멈추지 않는다.
     let _ = app.emit("update-progress", json!({"phase": "drain"}));
     let _ = tokio::task::spawn_blocking(|| {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+            "cys.exe"
+        } else {
+            "cys"
+        }));
         cmd.arg("drain");
         no_console(&mut cmd);
         cmd.status()
@@ -2932,7 +3264,11 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
     // 이중 drain을 생략한다. 기존 무손실 자동교대·수동 '바로 재시작'은 skip_drain=false로 거동 불변(회귀 0).
     if !skip_drain {
         let _ = tokio::task::spawn_blocking(|| {
-            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+                "cys.exe"
+            } else {
+                "cys"
+            }));
             cmd.arg("drain");
             no_console(&mut cmd);
             cmd.status()
@@ -2980,8 +3316,11 @@ fn classify_drain_verify_failure(exit_code: Option<i32>, stderr: &str) -> String
 #[tauri::command]
 async fn drain_verify(timeout: u64) -> Result<Value, String> {
     let out = tokio::task::spawn_blocking(move || {
-        let mut cmd =
-            std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) {
+            "cys.exe"
+        } else {
+            "cys"
+        }));
         cmd.arg("drain")
             .arg("--verify")
             .arg("--timeout")
@@ -3161,7 +3500,17 @@ async fn stop_running_daemon() {
 }
 
 fn main() {
+    let bootstrap_capability = random_secret_hex().expect("Browser activation CSPRNG unavailable");
+    let mut activation_registry = NativeActivationRegistry::default();
+    activation_registry
+        .install_window("main", &bootstrap_capability)
+        .expect("Browser activation registry initialization failed");
+    NATIVE_BROWSER_ACTIVATIONS
+        .set(Mutex::new(activation_registry))
+        .unwrap_or_else(|_| panic!("Browser activation registry already initialized"));
+    let activation_script = browser_activation_initialization_script(&bootstrap_capability);
     tauri::Builder::default()
+        .append_invoke_initialization_script(activation_script)
         // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
         // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
         // 무엇이든(설치기 재실행·바로가기 이중클릭·OS 재기동 복원) 단일 인스턴스가 보장된다.
@@ -3216,7 +3565,9 @@ fn main() {
             read_text_head,
             ensure_view_bridge,
             browser_open,
+            arm_browser_native_activation,
             ensure_browserd_cast,
+            cancel_browserd_cast,
             browserd_state,
             home_dir_path,
             open_url,
@@ -3326,6 +3677,10 @@ fn main() {
                     );
                     return;
                 }
+                if let Err(error) = register_browser_gui_peer().await {
+                    eprintln!("[cys-app] Browser GUI registration failed closed: {error}");
+                    let _ = handle.emit("browser-disabled-safe", error);
+                }
                 let _ = handle.emit("daemon-ready", ());
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
@@ -3363,6 +3718,44 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tauri_browser_deadline_outlives_cysd_worker_deadline() {
+        assert!(
+            TAURI_BROWSER_ENSURE_DEADLINE_SECS
+                > cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs()
+        );
+    }
+
+    #[test]
+    fn native_browser_activation_is_window_bound_ttl_and_single_consume() {
+        let mut registry = NativeActivationRegistry::default();
+        let capability = "a".repeat(64);
+        registry.install_window("main", &capability).unwrap();
+        assert!(registry.arm("other", &capability, 1_000).is_err());
+        assert!(registry.arm("main", &"b".repeat(64), 1_000).is_err());
+        registry.arm("main", &capability, 1_000).unwrap();
+        registry.consume("main", 1_001).unwrap();
+        assert!(registry.consume("main", 1_002).is_err());
+        registry.arm("main", &capability, 2_000).unwrap();
+        assert!(registry
+            .consume("main", 2_000 + NATIVE_ACTIVATION_TTL_MS + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn initialization_script_keeps_capability_lexical_and_requires_trusted_activation() {
+        let capability = "c".repeat(64);
+        let script = browser_activation_initialization_script(&capability);
+        assert!(script.contains("event.isTrusted"));
+        assert!(script.contains("navigator.userActivation.isActive"));
+        assert!(script.contains("#btn-browser"));
+        assert!(script.contains("[data-browser-reconnect='true']"));
+        assert!(script.contains("arm_browser_native_activation"));
+        assert_eq!(script.matches(&capability).count(), 1);
+        assert!(!script.contains("window.browser"));
+        assert!(!script.contains("globalThis.browser"));
+    }
+
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
     /// 비존재 경로는 metadata 게이트에서 거절(스폰 없음). force 경로는 실제 스폰이라 여기서 검사하지 않는다.
     #[test]
@@ -3382,61 +3775,36 @@ mod tests {
         }
     }
 
-    /// [W2] browserd state 파싱 — headless 3-상태(true/false/unknown)·pid 결손 None·손상 JSON None.
-    /// 생존 pid 는 테스트 프로세스 자신(std::process::id())으로 대체(kill(self,0)=생존).
     #[test]
-    fn browserd_state_parse_and_liveness() {
-        let dir = std::env::temp_dir().join("cys-browserd-state-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let me = std::process::id();
-
-        // 정상 JSON(headless:true)·생존 pid → Some, 값 정확 전사.
-        let p1 = dir.join("ok.json");
-        std::fs::write(&p1, format!(r#"{{"pid":{me},"port":51234,"token":"tok-abc","headless":true}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p1), Some((51234u16, "tok-abc".to_string(), Some(true))));
-
-        // headless:false 명시 → Some(false). GUI 가 병존 toast 를 띄우는 **유일한** 경우다.
-        let p1b = dir.join("headful.json");
-        std::fs::write(&p1b, format!(r#"{{"pid":{me},"port":51235,"token":"t1b","headless":false}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p1b), Some((51235u16, "t1b".to_string(), Some(false))));
-
-        // ★headless 키 부재 → unknown(None) — false 로 단정 금지(정직성 회귀 핀). 구버전 browserd 가
-        // 실제로는 headless 로 떠 있어도 false 로 채우면 GUI 가 "외부 창 병존"을 거짓 고지한다.
-        let p2 = dir.join("nohl.json");
-        std::fs::write(&p2, format!(r#"{{"pid":{me},"port":6000,"token":"t2"}}"#)).unwrap();
-        assert_eq!(read_browserd_state(&p2), Some((6000u16, "t2".to_string(), None)));
-
-        // headless 가 bool 이 아님(손상·타입 드리프트) → 역시 unknown(None).
-        let p2b = dir.join("badhl.json");
-        std::fs::write(&p2b, format!(r#"{{"pid":{me},"port":6001,"token":"t2b","headless":"yes"}}"#))
-            .unwrap();
-        assert_eq!(read_browserd_state(&p2b), Some((6001u16, "t2b".to_string(), None)));
-
-        // unknown 은 JSON 에서 null 로 나가야 GUI 의 `=== false` 엄격 비교가 침묵한다(고지 계약).
-        assert!(json!({"headless": None::<bool>})["headless"].is_null(), "unknown=null 직렬화");
-
-        // pid 필드 결손 → None(파싱 실패).
-        let p3 = dir.join("nopid.json");
-        std::fs::write(&p3, r#"{"port":6000,"token":"t3"}"#).unwrap();
-        assert_eq!(read_browserd_state(&p3), None);
-
-        // 손상 JSON → None.
-        let p4 = dir.join("corrupt.json");
-        std::fs::write(&p4, "{not json").unwrap();
-        assert_eq!(read_browserd_state(&p4), None);
-
-        // 파일 부재 → None.
-        assert_eq!(read_browserd_state(&dir.join("absent.json")), None);
-
-        // pid 사망 → None(browserd_state 의 alive:false 근거) — 존재 불가 pid.
-        #[cfg(unix)]
-        {
-            let p5 = dir.join("dead.json");
-            std::fs::write(&p5, format!(r#"{{"pid":{},"port":6000,"token":"t5"}}"#, i32::MAX)).unwrap();
-            assert_eq!(read_browserd_state(&p5), None, "존재 불가 pid 는 사멸로 간주");
-        }
+    fn browser_user_gesture_intent_matches_broker_public_contract() {
+        let intent = browser_user_gesture_intent(
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+        assert_eq!(intent["authority_kind"], "user_gesture");
+        assert_eq!(intent["realm"], "shared-default");
+        assert_eq!(intent["mode"], "headless");
+        assert_eq!(intent["window_label"], "main");
+        assert_eq!(intent["pane_nonce"], "a".repeat(64));
+        assert_eq!(intent["gesture_receipt"], "b".repeat(64));
+        assert!(browser_user_gesture_intent("main", "short", &"b".repeat(64)).is_err());
+        let embed = browser_embed_intent(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            7,
+            if cfg!(windows) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            },
+        )
+        .unwrap();
+        assert_eq!(embed["context"], "default");
+        assert_eq!(embed["protocol_version"], 2);
+        assert_eq!(embed["embed_generation"], 7);
+        assert!(embed.get("token").is_none());
     }
 
     /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.
@@ -3448,19 +3816,34 @@ mod tests {
             Some(2),
             "error: unexpected argument '--verify' found\n\nUsage: cys drain [OPTIONS]",
         );
-        assert!(e1.starts_with("unsupported:"), "구버전 미지원은 unsupported: {e1}");
+        assert!(
+            e1.starts_with("unsupported:"),
+            "구버전 미지원은 unsupported: {e1}"
+        );
         // ① exit 코드 미상이어도 stderr usage+--verify 패턴이면 unsupported
         let e1b = classify_drain_verify_failure(None, "Usage: cys drain --verify ...");
-        assert!(e1b.starts_with("unsupported:"), "usage+--verify는 unsupported: {e1b}");
+        assert!(
+            e1b.starts_with("unsupported:"),
+            "usage+--verify는 unsupported: {e1b}"
+        );
         // ② 하드캡 백스톱(exit 3) → verify_failed
         let e2 = classify_drain_verify_failure(Some(3), "");
-        assert!(e2.starts_with("verify_failed:"), "exit3 백스톱은 verify_failed: {e2}");
+        assert!(
+            e2.starts_with("verify_failed:"),
+            "exit3 백스톱은 verify_failed: {e2}"
+        );
         // ② 시그널 사망(code=None)·usage 무관 stderr → verify_failed
         let e2b = classify_drain_verify_failure(None, "thread 'main' panicked at ...");
-        assert!(e2b.starts_with("verify_failed:"), "크래시는 verify_failed: {e2b}");
+        assert!(
+            e2b.starts_with("verify_failed:"),
+            "크래시는 verify_failed: {e2b}"
+        );
         // 정상 exit 1(부분 실패)은 JSON 경로라 여기 안 오지만, 분류가 오면 verify_failed(안전)
         let e2c = classify_drain_verify_failure(Some(1), "");
-        assert!(e2c.starts_with("verify_failed:"), "exit1 무JSON은 verify_failed: {e2c}");
+        assert!(
+            e2c.starts_with("verify_failed:"),
+            "exit1 무JSON은 verify_failed: {e2c}"
+        );
     }
 
     /// A안 회귀 박제(2026-07-11 오너 승인): 교대 게이트는 role/agent 붙은 세션만 지킨다.
@@ -3473,41 +3856,95 @@ mod tests {
         let roled = json!({"exited": false, "role": "master", "agent": null});
         let agented = json!({"exited": false, "role": null, "agent": "claude"});
         let empty_strings = json!({"exited": false, "role": "", "agent": ""});
-        assert!(!session_blocks_rotation(&bare), "맨 pane은 자동 교대를 막지 않는다");
-        assert!(!session_blocks_rotation(&exited_agent), "죽은 세션은 세지 않는다");
+        assert!(
+            !session_blocks_rotation(&bare),
+            "맨 pane은 자동 교대를 막지 않는다"
+        );
+        assert!(
+            !session_blocks_rotation(&exited_agent),
+            "죽은 세션은 세지 않는다"
+        );
         assert!(session_blocks_rotation(&roled), "role claim 세션은 보호");
         assert!(session_blocks_rotation(&agented), "agent 세션은 보호");
-        assert!(!session_blocks_rotation(&empty_strings), "빈 문자열은 미부착으로 취급");
+        assert!(
+            !session_blocks_rotation(&empty_strings),
+            "빈 문자열은 미부착으로 취급"
+        );
     }
 
-    /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
-    #[test]
     /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
     /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
     /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
     #[test]
     fn needs_gui_onboard_only_skips_on_exact_version_match() {
-        assert!(needs_gui_onboard(None, "0.12.53"), "마커 부재 = 온보딩(신선·직전 실패)");
-        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53"), "정확 일치 = 스킵");
-        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53"), "개행 trim 후 일치 = 스킵");
-        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53"), "구버전 = 온보딩(업그레이드)");
-        assert!(needs_gui_onboard(Some("garbage"), "0.12.53"), "손상 = 온보딩(fail-open)");
+        assert!(
+            needs_gui_onboard(None, "0.12.53"),
+            "마커 부재 = 온보딩(신선·직전 실패)"
+        );
+        assert!(
+            !needs_gui_onboard(Some("0.12.53"), "0.12.53"),
+            "정확 일치 = 스킵"
+        );
+        assert!(
+            !needs_gui_onboard(Some("0.12.53\n"), "0.12.53"),
+            "개행 trim 후 일치 = 스킵"
+        );
+        assert!(
+            needs_gui_onboard(Some("0.12.52"), "0.12.53"),
+            "구버전 = 온보딩(업그레이드)"
+        );
+        assert!(
+            needs_gui_onboard(Some("garbage"), "0.12.53"),
+            "손상 = 온보딩(fail-open)"
+        );
     }
 
     #[test]
     fn decide_pending_update_marker_or_version_change() {
         use PendingUpdatePlan::*;
         // 마커 최우선 — 스탬프·prior_state와 무관하게 Apply(구버전이 이 릴리스로 올라올 때 남긴 마커).
-        assert_eq!(decide_pending_update(true, None, "0.12.51", false), Apply, "마커=Apply(스탬프 부재)");
-        assert_eq!(decide_pending_update(true, Some("0.12.51"), "0.12.51", false), Apply, "마커=Apply(스탬프 동일해도)");
+        assert_eq!(
+            decide_pending_update(true, None, "0.12.51", false),
+            Apply,
+            "마커=Apply(스탬프 부재)"
+        );
+        assert_eq!(
+            decide_pending_update(true, Some("0.12.51"), "0.12.51", false),
+            Apply,
+            "마커=Apply(스탬프 동일해도)"
+        );
         // ★결함2: 스탬프 부재 × prior_state — 기존 설치 증거로 전환기 홈페이지 설치 vs 진짜 최초 설치를 가른다.
-        assert_eq!(decide_pending_update(false, None, "0.12.51", true), Apply, "스탬프 부재+기존설치=전환기 홈페이지설치=Apply");
-        assert_eq!(decide_pending_update(false, None, "0.12.51", false), RecordStampOnly, "스탬프 부재+기존설치 없음=진짜 최초설치");
+        assert_eq!(
+            decide_pending_update(false, None, "0.12.51", true),
+            Apply,
+            "스탬프 부재+기존설치=전환기 홈페이지설치=Apply"
+        );
+        assert_eq!(
+            decide_pending_update(false, None, "0.12.51", false),
+            RecordStampOnly,
+            "스탬프 부재+기존설치 없음=진짜 최초설치"
+        );
         // 버전변경/동일은 prior_state와 무관(회귀 핀 — Some(stamp)이면 prior_state를 보지 않는다).
-        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", false), Apply, "버전변경(홈페이지 수동설치)=Apply");
-        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", true), Apply, "버전변경=Apply(prior_state 무관)");
-        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", false), Skip, "동일 버전·마커 없음=Skip");
-        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", true), Skip, "동일 버전=Skip(prior_state 무관)");
+        assert_eq!(
+            decide_pending_update(false, Some("0.12.50"), "0.12.51", false),
+            Apply,
+            "버전변경(홈페이지 수동설치)=Apply"
+        );
+        assert_eq!(
+            decide_pending_update(false, Some("0.12.50"), "0.12.51", true),
+            Apply,
+            "버전변경=Apply(prior_state 무관)"
+        );
+        assert_eq!(
+            decide_pending_update(false, Some("0.12.51"), "0.12.51", false),
+            Skip,
+            "동일 버전·마커 없음=Skip"
+        );
+        assert_eq!(
+            decide_pending_update(false, Some("0.12.51"), "0.12.51", true),
+            Skip,
+            "동일 버전=Skip(prior_state 무관)"
+        );
     }
 
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
@@ -3515,15 +3952,42 @@ mod tests {
     fn open_url_whitelist_blocks_spoofed_and_nonhttps() {
         assert!(url_host_allowed("https://notebooklm.google.com/notebook/abc").is_ok());
         assert!(url_host_allowed("https://github.com/cys/repo").is_ok());
-        assert!(url_host_allowed("https://www.cysinsight.com/").is_ok(), "홈페이지(본체 다운로드) 허용");
-        assert!(url_host_allowed("https://cysinsight.com/download").is_ok(), "홈페이지 apex 허용");
-        assert!(url_host_allowed("http://notebooklm.google.com/").is_err(), "http 차단");
-        assert!(url_host_allowed("https://evil.com/notebooklm.google.com").is_err(), "경로 사칭 차단");
-        assert!(url_host_allowed("https://notebooklm.google.com.evil.com/").is_err(), "서브도메인 사칭 차단");
-        assert!(url_host_allowed("https://notebooklm.google.com@evil.example.com/").is_err(), "userinfo 사칭 차단");
-        assert!(url_host_allowed("https://evil.com#.github.com/").is_err(), "fragment 사칭 차단");
-        assert!(url_host_allowed("https://evil.com?.github.com").is_err(), "query 사칭 차단");
-        assert!(url_host_allowed("https://evil.com?x=.github.com").is_err(), "query 파라미터 사칭 차단");
+        assert!(
+            url_host_allowed("https://www.cysinsight.com/").is_ok(),
+            "홈페이지(본체 다운로드) 허용"
+        );
+        assert!(
+            url_host_allowed("https://cysinsight.com/download").is_ok(),
+            "홈페이지 apex 허용"
+        );
+        assert!(
+            url_host_allowed("http://notebooklm.google.com/").is_err(),
+            "http 차단"
+        );
+        assert!(
+            url_host_allowed("https://evil.com/notebooklm.google.com").is_err(),
+            "경로 사칭 차단"
+        );
+        assert!(
+            url_host_allowed("https://notebooklm.google.com.evil.com/").is_err(),
+            "서브도메인 사칭 차단"
+        );
+        assert!(
+            url_host_allowed("https://notebooklm.google.com@evil.example.com/").is_err(),
+            "userinfo 사칭 차단"
+        );
+        assert!(
+            url_host_allowed("https://evil.com#.github.com/").is_err(),
+            "fragment 사칭 차단"
+        );
+        assert!(
+            url_host_allowed("https://evil.com?.github.com").is_err(),
+            "query 사칭 차단"
+        );
+        assert!(
+            url_host_allowed("https://evil.com?x=.github.com").is_err(),
+            "query 파라미터 사칭 차단"
+        );
     }
 
     // 사용자 확장 allowlist(순수 판정) — 정확일치·서브도메인 허용, 사칭·빈 항목 차단.
@@ -3531,10 +3995,19 @@ mod tests {
     fn host_allowlist_user_extension() {
         let extras = vec!["example-inst.org".to_string()];
         assert!(host_in_allowlist("example-inst.org", &extras));
-        assert!(host_in_allowlist("docs.example-inst.org", &extras), "확장 도메인 서브도메인 허용");
-        assert!(!host_in_allowlist("example-inst.org.evil.com", &extras), "사칭 차단");
+        assert!(
+            host_in_allowlist("docs.example-inst.org", &extras),
+            "확장 도메인 서브도메인 허용"
+        );
+        assert!(
+            !host_in_allowlist("example-inst.org.evil.com", &extras),
+            "사칭 차단"
+        );
         assert!(!host_in_allowlist("evil.com", &extras));
-        assert!(!host_in_allowlist("anything.com", &vec!["".to_string()]), "빈 확장 항목 무시");
+        assert!(
+            !host_in_allowlist("anything.com", &vec!["".to_string()]),
+            "빈 확장 항목 무시"
+        );
     }
 
     // #3: 사이드카 stdout의 PACK_UPDATE_RESULT 토큰에서 reinject failed/deferred를 파싱해
@@ -3544,7 +4017,11 @@ mod tests {
         let out = "[pack-update] 팩 2.0.0 반영 완료 (3 written, 1 preserved). 노드 reinject 점검…\n\
                    [pack-update] reinject: 2 injected, 1 skipped, 3 deferred, 4 failed.\n\
                    PACK_UPDATE_RESULT pack_version=2.0.0 injected=2 skipped=1 deferred=3 failed=4\n";
-        assert_eq!(parse_reinject_counts(out), (4, 3), "failed=4 deferred=3 파싱");
+        assert_eq!(
+            parse_reinject_counts(out),
+            (4, 3),
+            "failed=4 deferred=3 파싱"
+        );
 
         // 토큰 부재 → (0,0) 보수적(경고 미발화).
         assert_eq!(parse_reinject_counts("아무 의미 없는 출력\n"), (0, 0));
@@ -3552,12 +4029,16 @@ mod tests {
 
         // failed=0 deferred=0 → (0,0)(완전 성공, 경고 없음).
         assert_eq!(
-            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=2.0.0 injected=5 skipped=0 deferred=0 failed=0"),
+            parse_reinject_counts(
+                "PACK_UPDATE_RESULT pack_version=2.0.0 injected=5 skipped=0 deferred=0 failed=0"
+            ),
             (0, 0)
         );
         // deferred만 있는 경우(busy 노드) — 경고 발화 대상.
         assert_eq!(
-            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=1.2.3 injected=0 skipped=0 deferred=2 failed=0"),
+            parse_reinject_counts(
+                "PACK_UPDATE_RESULT pack_version=1.2.3 injected=0 skipped=0 deferred=2 failed=0"
+            ),
             (0, 2)
         );
     }
@@ -3636,7 +4117,9 @@ mod tests {
                     let mut br = BufReader::new(r);
                     let mut l = String::new();
                     let _ = br.read_line(&mut l).await;
-                    let _ = w.write_all(b"{\"ok\":true,\"result\":{\"surfaces\":[]}}\n").await;
+                    let _ = w
+                        .write_all(b"{\"ok\":true,\"result\":{\"surfaces\":[]}}\n")
+                        .await;
                     let _ = w.flush().await;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
@@ -3710,7 +4193,9 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             BundleKind::Backup
         );
         assert_eq!(
-            classify_bundle_dir(Path::new("/Applications/cys.app.prev-210050/Contents/MacOS")),
+            classify_bundle_dir(Path::new(
+                "/Applications/cys.app.prev-210050/Contents/MacOS"
+            )),
             BundleKind::Backup
         );
         assert_eq!(
@@ -3725,12 +4210,16 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // ★/Volumes 가드(reviewer1): DMG·외장 마운트 안의 Applications 폴더/심링크 경유 실행은
         // ends_with("/Applications")를 만족해도 Canonical 이 아니다(언마운트 시 죽은 경로 → 자기삭제 재발).
         assert_ne!(
-            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            classify_bundle_dir(Path::new(
+                "/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS"
+            )),
             BundleKind::Canonical,
             "/Volumes 하위 Applications 는 Canonical 오판 금지",
         );
         assert_eq!(
-            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            classify_bundle_dir(Path::new(
+                "/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS"
+            )),
             BundleKind::NonStandard,
         );
         // 정규 경로 불변(회귀 핀).
@@ -3772,14 +4261,18 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     fn plan_cli_install_refuses_translocated_and_backup() {
         // translocated → Err
         assert!(plan_cli_install(
-            std::path::Path::new("/private/var/folders/x/AppTranslocation/Y/d/cys.app/Contents/MacOS"),
+            std::path::Path::new(
+                "/private/var/folders/x/AppTranslocation/Y/d/cys.app/Contents/MacOS"
+            ),
             "/usr/local/bin"
-        ).is_err());
+        )
+        .is_err());
         // backup → Err
         assert!(plan_cli_install(
             std::path::Path::new("/Applications/cys.app.bak-044/Contents/MacOS"),
             "/usr/local/bin"
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
@@ -3787,10 +4280,22 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // 무음 launchd 자동등록은 plan_cli_install 보다 엄격하다(의도적 divergence): Canonical 만 허용.
         // NonStandard(~/Downloads·/Volumes 등)도 거부 — 휘발/이동 경로가 plist 에 각인되면 언마운트·삭제
         // 시 죽은 경로 데몬 무한 스폰(리뷰어1 F1). 비-Canonical 은 ensure_daemon 런타임 폴백으로 안전.
-        assert!(autoregister_allowed(&BundleKind::Canonical), "정규 번들(/Applications·~/Applications)만 자동등록 허용");
-        assert!(!autoregister_allowed(&BundleKind::Translocated), "임시 경로는 자동등록 거부");
-        assert!(!autoregister_allowed(&BundleKind::Backup), "백업 번들은 자동등록 거부");
-        assert!(!autoregister_allowed(&BundleKind::NonStandard), "비표준(Downloads·USB 등)도 자동등록 거부");
+        assert!(
+            autoregister_allowed(&BundleKind::Canonical),
+            "정규 번들(/Applications·~/Applications)만 자동등록 허용"
+        );
+        assert!(
+            !autoregister_allowed(&BundleKind::Translocated),
+            "임시 경로는 자동등록 거부"
+        );
+        assert!(
+            !autoregister_allowed(&BundleKind::Backup),
+            "백업 번들은 자동등록 거부"
+        );
+        assert!(
+            !autoregister_allowed(&BundleKind::NonStandard),
+            "비표준(Downloads·USB 등)도 자동등록 거부"
+        );
     }
 
     // ── T4: 부트 안전모드 감지 게이트 ─────────────────────────────────────
@@ -3832,10 +4337,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             "/Applications 정규 설치 = Canonical",
         );
         assert_eq!(
-            boot_path_verdict(
-                Path::new("/Users/x/dev/cys/target/release/cys-app"),
-                true,
-            ),
+            boot_path_verdict(Path::new("/Users/x/dev/cys/target/release/cys-app"), true,),
             BootPathVerdict::Canonical,
             "CYS_ALLOW_NONCANONICAL=1(escape env) = 무조건 Canonical(개발·CI 자기감금 방지)",
         );
@@ -3855,17 +4357,16 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // escape env 는 translocation 경로마저 Canonical 로 덮는다(무조건 = 최우선 단락).
         assert_eq!(
             boot_path_verdict(
-                Path::new("/private/var/folders/ab/AppTranslocation/x/cys.app/Contents/MacOS/cys-app"),
+                Path::new(
+                    "/private/var/folders/ab/AppTranslocation/x/cys.app/Contents/MacOS/cys-app"
+                ),
                 true,
             ),
             BootPathVerdict::Canonical,
         );
         // escape 없는 개발 target/ 는 NonCanonical(하네스가 env 로 스스로 풀어야 함).
         assert_eq!(
-            boot_path_verdict(
-                Path::new("/Users/x/dev/cys/target/debug/cys-app"),
-                false,
-            ),
+            boot_path_verdict(Path::new("/Users/x/dev/cys/target/debug/cys-app"), false,),
             BootPathVerdict::NonCanonical,
         );
     }
@@ -3875,8 +4376,14 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     fn translocation_guidance_carries_recovery_steps() {
         // 안내는 ①Applications 드래그 ②구버전 종료·교체 ③xattr quarantine 제거를 모두 담아야 한다.
         let g = translocation_guidance(BootPathVerdict::Translocated);
-        assert!(g.contains("Applications"), "① Applications 드래그 설치 안내 포함");
-        assert!(g.contains("구버전") && g.contains("종료"), "② 구버전 종료·교체 안내 포함");
+        assert!(
+            g.contains("Applications"),
+            "① Applications 드래그 설치 안내 포함"
+        );
+        assert!(
+            g.contains("구버전") && g.contains("종료"),
+            "② 구버전 종료·교체 안내 포함"
+        );
         assert!(
             g.contains("xattr -d com.apple.quarantine /Applications/cys.app"),
             "③ quarantine 제거 명령 포함",
@@ -3895,13 +4402,20 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // CYS_ALLOW_NONCANONICAL 은 이 커맨드 외 어떤 테스트도 읽지 않아 병렬 간섭 없음.
         std::env::remove_var("CYS_ALLOW_NONCANONICAL");
         let g = boot_verdict();
-        assert!(g.is_some(), "비정규 실행(test 하네스 경로)에서 pull 은 안내 문구를 반환");
         assert!(
-            g.unwrap().contains("xattr -d com.apple.quarantine /Applications/cys.app"),
+            g.is_some(),
+            "비정규 실행(test 하네스 경로)에서 pull 은 안내 문구를 반환"
+        );
+        assert!(
+            g.unwrap()
+                .contains("xattr -d com.apple.quarantine /Applications/cys.app"),
             "pull 이 반환한 안내에 복구 명령 포함(프론트 stickyToast 본문)",
         );
         std::env::set_var("CYS_ALLOW_NONCANONICAL", "1");
-        assert!(boot_verdict().is_none(), "escape env 에서는 None(정상 부트 — 안내 미표시)");
+        assert!(
+            boot_verdict().is_none(),
+            "escape env 에서는 None(정상 부트 — 안내 미표시)"
+        );
         std::env::remove_var("CYS_ALLOW_NONCANONICAL");
     }
 
@@ -3909,23 +4423,30 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     fn plan_cli_install_warns_on_nonstandard_but_proceeds() {
         let plan = plan_cli_install(
             std::path::Path::new("/Users/x/Downloads/cys.app/Contents/MacOS"),
-            "/usr/local/bin"
-        ).expect("nonstandard는 경고와 함께 진행");
+            "/usr/local/bin",
+        )
+        .expect("nonstandard는 경고와 함께 진행");
         assert!(plan.osascript_arg.contains("with administrator privileges"));
         assert!(plan.warnings.iter().any(|w| w.contains("표준 위치")));
-        assert_eq!(plan.cys_src, std::path::PathBuf::from("/Users/x/Downloads/cys.app/Contents/MacOS/cys"));
+        assert_eq!(
+            plan.cys_src,
+            std::path::PathBuf::from("/Users/x/Downloads/cys.app/Contents/MacOS/cys")
+        );
     }
 
     #[test]
     fn plan_cli_install_canonical_has_no_location_warning() {
         let plan = plan_cli_install(
             std::path::Path::new("/Applications/cys.app/Contents/MacOS"),
-            "/usr/local/bin"
-        ).expect("정규 번들은 진행");
+            "/usr/local/bin",
+        )
+        .expect("정규 번들은 진행");
         assert!(plan.warnings.iter().all(|w| !w.contains("표준 위치")));
         // osascript 인자는 do shell script + 승격 + 멱등 스크립트를 감싼다(AppleScript 큰따옴표 리터럴)
         assert!(plan.osascript_arg.starts_with("do shell script \""));
-        assert!(plan.osascript_arg.ends_with("\" with administrator privileges"));
+        assert!(plan
+            .osascript_arg
+            .ends_with("\" with administrator privileges"));
     }
 
     #[test]
@@ -3945,7 +4466,9 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         )
         .unwrap();
         assert!(plan.osascript_arg.starts_with("do shell script \""));
-        assert!(plan.osascript_arg.ends_with("\" with administrator privileges"));
+        assert!(plan
+            .osascript_arg
+            .ends_with("\" with administrator privileges"));
         assert!(!plan.osascript_arg.starts_with("do shell script '"));
         assert!(plan.osascript_arg.contains("'/usr/local/bin/cys'"));
         assert!(plan.osascript_arg.contains("ln -sf"));
@@ -3961,11 +4484,18 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         let start = src
             .find("async fn purge_dept_daemon_by_socket")
             .expect("purge_dept_daemon_by_socket 정의 소실 — 트립와이어 재배선 필요");
-        let seg = &src[start..start + src[start..].find("\n#[tauri::command]").unwrap_or(src.len() - start)];
+        let seg = &src[start
+            ..start
+                + src[start..]
+                    .find("\n#[tauri::command]")
+                    .unwrap_or(src.len() - start)];
         assert!(
             !seg.contains("--purge-workdir"),
             "GUI purge 가 --purge-workdir 를 다시 요청함 — 홈 파괴 경로 재개방(실사고 2026-07-16 재발)"
         );
-        assert!(seg.contains("--purge-state"), "purge 명령 골격 변형 — 트립와이어 재검토 필요");
+        assert!(
+            seg.contains("--purge-state"),
+            "purge 명령 골격 변형 — 트립와이어 재검토 필요"
+        );
     }
 }

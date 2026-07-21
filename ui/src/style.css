@@ -241,6 +241,7 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-usage.stale { opacity: .45; }
 /* web pane(뷰어 iframe) — 타이틀 스트립 + iframe 본체 + 로드 대기/실패 플레이스홀더 */
 .pane .web-url { color: #6e7681; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+.pane .browser-shared-label { color: #d29922; white-space: nowrap; }
 .pane .web-body { position: relative; flex: 1; min-height: 0; }
 .pane .web-frame { width: 100%; height: 100%; border: none; background: var(--bg); }
 .pane .web-placeholder {
