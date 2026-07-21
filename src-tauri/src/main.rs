@@ -683,9 +683,9 @@ fn browser_open(url: Option<String>) -> Result<Value, String> {
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| "about:blank".into());
     browser_runtime_rpc(
-        "runtime.ensure",
+        "browser.runtime.ensure",
         serde_json::json!({
-            "authority": "user_gesture", "profile": "agent", "url": target
+            "authority_kind": "user_gesture", "subject": "tauri-browser", "profile": "agent", "url": target
         }),
     )
 }
@@ -907,9 +907,9 @@ fn read_browserd_state(path: &std::path::Path) -> Option<(u16, String, Option<bo
 async fn ensure_browserd_cast() -> Result<Value, String> {
     tokio::task::spawn_blocking(|| {
         browser_runtime_rpc(
-            "runtime.ensure",
+                "browser.runtime.ensure",
             json!({
-                "authority": "user_gesture", "profile": "shared_default", "headless": true
+                "authority_kind": "user_gesture", "subject": "tauri-browser", "profile": "shared_default", "headless": true
             }),
         )
     })
