@@ -1178,7 +1178,13 @@ pub fn load_dept_tombstones_from_disk(
     }
 }
 
-pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {
+fn load_tombstones_from_disk_with_recovery<F>(
+    socket_path: &std::path::Path,
+    recover: F,
+) -> std::collections::HashSet<String>
+where
+    F: FnOnce() -> std::collections::HashSet<String>,
+{
     let dir = crate::state::state_dir(socket_path);
     let p = dir.join("topology.json");
     let s = match std::fs::read_to_string(&p) {
@@ -1192,7 +1198,7 @@ pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collecti
             let ts = now_epoch() as u64;
             let corrupt = dir.join(format!("topology.json.corrupt-{ts}"));
             let _ = std::fs::rename(&p, &corrupt);
-            let recovered = tombstones_from_latest_generation();
+            let recovered = recover();
             eprintln!(
                 "[cysd] ★P0-3 topology.json 손상({e}) — {} isolate + 세대 스냅샷 tombstones 폴백({}개 복구)",
                 corrupt.display(),
@@ -1201,6 +1207,10 @@ pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collecti
             recovered
         }
     }
+}
+
+pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {
+    load_tombstones_from_disk_with_recovery(socket_path, tombstones_from_latest_generation)
 }
 
 /// ★W2/A-S1: topology.json 의 tombstones_rev 를 읽어 기동 카운터를 시드(재시작 넘어 단조성 유지).
@@ -2735,8 +2745,9 @@ mod tests {
     // ─────────── ★묘비 게이트: reap≠묘비, owner-close=묘비 (부활 불변식) ───────────
 
     use super::{
-        close_surface, load_tombstones_from_disk, load_tombstones_rev_from_disk, now_epoch,
-        persist_topology, reap_exited_surfaces, CloseCause, Daemon,
+        close_surface, load_tombstones_from_disk, load_tombstones_from_disk_with_recovery,
+        load_tombstones_rev_from_disk, now_epoch, persist_topology, reap_exited_surfaces, CloseCause,
+        Daemon,
     };
     use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -2892,7 +2903,7 @@ mod tests {
         let daemon = drill_daemon("p0-3");
         let dir = crate::state::state_dir(&daemon.socket_path);
         std::fs::write(dir.join("topology.json"), "{ corrupt ]]] not json").unwrap();
-        let tombs = load_tombstones_from_disk(&daemon.socket_path);
+        let tombs = load_tombstones_from_disk_with_recovery(&daemon.socket_path, Default::default);
         assert!(tombs.is_empty(), "격리 dir 스냅샷 없음 → 빈 폴백");
         let corrupt_isolated = std::fs::read_dir(&dir)
             .unwrap()

@@ -33,6 +33,8 @@ class ReleaseError(ValueError):
 
 def load_policy(path: Path, version: str) -> dict[str, object]:
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("windows_release_mode") != "unsigned":
+        raise ReleaseError("Windows release mode must be unsigned")
     for field in ("input_assets", "generated_assets", "install_assets"):
         if not isinstance(raw.get(field), list):
             raise ReleaseError(f"policy field {field!r} must be a list")
@@ -131,7 +133,9 @@ def write_site_bundle(version: str, release_dir: Path, site_output: Path, policy
     </ul>
     <section {policy['defender_marker']}>
       <h2>Windows Defender 안내</h2>
-      <p>설치 전 SHA256SUMS.txt와 다운로드 파일의 SHA-256을 대조하세요. 차단되면 Windows 보안의 보호 기록을 확인하세요.</p>
+      <p>Windows 설치 파일은 의도적으로 Authenticode 서명되지 않았습니다. 따라서 Chrome, SmartScreen 또는 Defender에서 “알 수 없는 게시자” 경고가 나타날 수 있습니다.</p>
+      <p>EXE 직접 다운로드가 차단되면 ZIP을 받아 압축을 푼 뒤 같은 설치 파일을 사용할 수 있습니다. 실행 전 반드시 SHA256SUMS.txt와 다운로드 파일의 SHA-256을 대조하세요.</p>
+      <p>해시가 일치할 때만 Windows 보안의 보호 기록에서 허용 여부를 직접 판단하세요. Defender나 브라우저의 보호 기능을 끄지 마세요.</p>
     </section>
   </main>
 </body>

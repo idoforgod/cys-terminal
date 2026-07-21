@@ -11,7 +11,7 @@ PACK_WORKFLOW = ROOT / ".github" / "workflows" / "pack-release.yml"
 MACOS_BUILD = ROOT / "scripts" / "build-macos-signed.sh"
 WINDOWS_SIGN = ROOT / "scripts" / "windows-authenticode.ps1"
 BROWSER_RUNTIME_SOURCES = ROOT / "release" / "browser-runtime-sources.json"
-WINDOWS_BUILD = ROOT / "scripts" / "build-windows-signed.ps1"
+WINDOWS_BUILD = ROOT / "scripts" / "build-windows-unsigned.ps1"
 BROWSER_MAC_SIGN = ROOT / "scripts" / "runtime-stage-sign-macos.sh"
 BROWSER_WINDOWS_SIGN = ROOT / "scripts" / "runtime-stage-sign-windows.ps1"
 
@@ -84,6 +84,28 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("TimeStamperCertificate", windows)
         self.assertIn("Get-AuthenticodeSignature", windows)
 
+    def test_windows_unsigned_build_pins_the_exact_gui_hash_without_authenticode(self) -> None:
+        windows = WINDOWS_BUILD.read_text(encoding="utf-8")
+
+        self.assertIn("unsigned-acknowledged", windows)
+        self.assertIn("Get-FileHash", windows)
+        self.assertIn("CYS_WINDOWS_GUI_SHA256", windows)
+        self.assertIn("Unsigned Windows GUI hash drifted during Tauri build", windows)
+        self.assertNotIn("windows-authenticode.ps1", windows)
+        self.assertNotIn("certificateThumbprint", windows)
+
+    def test_candidate_workflow_wires_only_the_explicit_unsigned_windows_policy(self) -> None:
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("CYS_WINDOWS_RELEASE_MODE: unsigned-acknowledged", candidate)
+        self.assertIn("./scripts/build-windows-unsigned.ps1", candidate)
+        self.assertNotIn("secrets.WINDOWS_CERTIFICATE", candidate)
+        self.assertNotIn("WINDOWS_EXPECTED_PUBLISHER", candidate)
+        self.assertNotIn("Import Windows signing certificate", candidate)
+        self.assertIn("Windows installer is intentionally not Authenticode signed", candidate)
+        self.assertIn("SmartScreen warnings are expected", candidate)
+        self.assertIn("verify SHA256SUMS.txt before allowing it", candidate)
+
     def test_browser_runtime_release_credentials_and_minisign_are_wired_for_every_target(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         for name in (
@@ -137,7 +159,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             candidate.index("Build, notarize, staple and normalize macOS candidate"),
         )
 
-    def test_browser_runtime_platform_signing_precedes_final_metadata_hashes(self) -> None:
+    def test_browser_runtime_qualification_precedes_final_metadata_hashes(self) -> None:
         macos = MACOS_BUILD.read_text(encoding="utf-8")
         windows = WINDOWS_BUILD.read_text(encoding="utf-8")
         mac_sign = BROWSER_MAC_SIGN.read_text(encoding="utf-8")
@@ -147,9 +169,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             macos.index("runtime-stage-sign-macos.sh"),
             macos.index("browser-runtime-metadata.py prepare"),
         )
+        self.assertNotIn("runtime-stage-sign-windows.ps1", windows)
         self.assertLess(
-            windows.index("runtime-stage-sign-windows.ps1"),
             windows.index("browser-runtime-metadata.py prepare"),
+            windows.index("cargo build --locked --release --target"),
         )
         for required in ("codesign --force", "--timestamp", "--options runtime", "codesign --verify"):
             self.assertIn(required, mac_sign)

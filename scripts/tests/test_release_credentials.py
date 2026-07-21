@@ -9,7 +9,7 @@ CHECKER = ROOT / "scripts" / "release-credentials-check.py"
 
 
 class ReleaseCredentialsTests(unittest.TestCase):
-    def test_windows_release_fails_closed_when_signing_or_timestamp_inputs_are_missing(self) -> None:
+    def test_windows_unsigned_release_needs_no_authenticode_credentials(self) -> None:
         clean_env = {
             key: value
             for key, value in os.environ.items()
@@ -17,6 +17,15 @@ class ReleaseCredentialsTests(unittest.TestCase):
             and not key.startswith("TAURI_SIGNING_")
             and not key.startswith("CYS_BROWSER_RUNTIME_")
         }
+        clean_env.update({
+            "CYS_WINDOWS_RELEASE_MODE": "unsigned-acknowledged",
+            "TAURI_SIGNING_PRIVATE_KEY": "updater-key",
+            "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
+            "CYS_BROWSER_RUNTIME_KEY_ID": "39E60A702949D6C3",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH": "1",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT": "1893455999",
+        })
 
         result = subprocess.run(
             ["python3", str(CHECKER), "windows"],
@@ -27,12 +36,33 @@ class ReleaseCredentialsTests(unittest.TestCase):
             check=False,
         )
 
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("WINDOWS_CERTIFICATE", result.stdout + result.stderr)
+        self.assertNotIn("WINDOWS_EXPECTED_PUBLISHER", result.stdout + result.stderr)
+
+    def test_windows_unsigned_release_requires_exact_operator_acknowledgement(self) -> None:
+        env = {
+            **os.environ,
+            "CYS_WINDOWS_RELEASE_MODE": "unsigned",
+            "TAURI_SIGNING_PRIVATE_KEY": "updater-key",
+            "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
+            "CYS_BROWSER_RUNTIME_KEY_ID": "39E60A702949D6C3",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH": "1",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT": "1893455999",
+        }
+
+        result = subprocess.run(
+            ["python3", str(CHECKER), "windows"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("WINDOWS_CERTIFICATE_B64", result.stderr)
-        self.assertIn("WINDOWS_TIMESTAMP_URL", result.stderr)
-        self.assertIn("TAURI_SIGNING_PRIVATE_KEY", result.stderr)
-        self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY", result.stderr)
-        self.assertIn("CYS_BROWSER_RUNTIME_EXPIRES_AT", result.stderr)
+        self.assertIn("CYS_WINDOWS_RELEASE_MODE", result.stderr)
 
     def test_macos_release_fails_closed_when_notary_or_signing_inputs_are_missing(self) -> None:
         clean_env = {
@@ -62,10 +92,7 @@ class ReleaseCredentialsTests(unittest.TestCase):
         redaction_sentinel = "redaction-sentinel-value"
         env = {
             **os.environ,
-            "WINDOWS_CERTIFICATE_B64": redaction_sentinel,
-            "WINDOWS_CERTIFICATE_PASSWORD": redaction_sentinel,
-            "WINDOWS_EXPECTED_PUBLISHER": redaction_sentinel,
-            "WINDOWS_TIMESTAMP_URL": "https://timestamp.invalid",
+            "CYS_WINDOWS_RELEASE_MODE": "unsigned-acknowledged",
             "TAURI_SIGNING_PRIVATE_KEY": redaction_sentinel,
             "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
             "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
@@ -87,13 +114,9 @@ class ReleaseCredentialsTests(unittest.TestCase):
         self.assertNotIn(redaction_sentinel, result.stdout + result.stderr)
         self.assertIn("values redacted", result.stdout)
 
-    def test_rfc3161_timestamp_endpoint_must_use_https(self) -> None:
+    def test_windows_unsigned_release_fails_closed_without_operator_acknowledgement(self) -> None:
         env = {
             **os.environ,
-            "WINDOWS_CERTIFICATE_B64": "present",
-            "WINDOWS_CERTIFICATE_PASSWORD": "present",
-            "WINDOWS_EXPECTED_PUBLISHER": "present",
-            "WINDOWS_TIMESTAMP_URL": "http://timestamp.invalid",
             "TAURI_SIGNING_PRIVATE_KEY": "present",
             "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
             "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
@@ -112,7 +135,7 @@ class ReleaseCredentialsTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must use https", result.stderr)
+        self.assertIn("CYS_WINDOWS_RELEASE_MODE", result.stderr)
 
 
 if __name__ == "__main__":

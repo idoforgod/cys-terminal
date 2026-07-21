@@ -6,7 +6,7 @@
 > `.github/workflows/release*.yml`이 현행 정본이다. 아래 절과 충돌하는 종전 수동 발행·직접 공개
 > 설명은 역사적 참고(legacy)로만 읽는다. Windows 인스톨러는 NSIS이며 MSI/WiX 경로는 폐기됐다.
 
-바이너리 태그 `vX.Y.Z`를 push하면 `release.yml`은 플랫폼별 서명 산출물을 **암호화된 Actions
+바이너리 태그 `vX.Y.Z`를 push하면 `release.yml`은 플랫폼별 릴리스 산출물을 **암호화된 Actions
 artifact**로만 넘긴다. 공개 저장소의 Actions artifact는 읽기 권한자에게 노출될 수 있으므로
 평문 후보를 직접 업로드하지 않는다. 단일 조립 잡만 전달물을 복호화해 정확한 자산 집합과 해시를
 검증하고 GitHub Release를
@@ -28,9 +28,10 @@ artifact**로만 넘긴다. 공개 저장소의 Actions artifact는 읽기 권�
 - macOS secrets: `APPLE_CERTIFICATE_B64`, `APPLE_CERTIFICATE_PASSWORD`,
   `APPLE_KEYCHAIN_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`,
   `APPLE_TEAM_ID`, `TAURI_SIGNING_PRIVATE_KEY`
-- Windows secrets: `WINDOWS_CERTIFICATE_B64`, `WINDOWS_CERTIFICATE_PASSWORD`,
-  `WINDOWS_EXPECTED_PUBLISHER`, `TAURI_SIGNING_PRIVATE_KEY`
-- Windows variable: `WINDOWS_TIMESTAMP_URL`(HTTPS RFC3161 TSA)
+- Windows secret: `TAURI_SIGNING_PRIVATE_KEY`(Tauri updater 서명용). 현행 Windows 설치 파일은
+  유료 Authenticode 인증서 없이 배포하므로 인증서·게시자·RFC3161 입력을 요구하지 않는다.
+  workflow가 `CYS_WINDOWS_RELEASE_MODE=unsigned-acknowledged`를 정확히 주입하지 않으면 빌드는
+  시작되지 않는다.
 - 공통 secret: `RELEASE_HANDOFF_KEY`(무작위 32자 이상, 공개 저장소 Actions handoff 암호화)
 - Browser Runtime 공통 secrets: `CYS_BROWSER_RUNTIME_SECRET_KEY_B64`,
   `CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64`, `CYS_BROWSER_RUNTIME_KEY_ID`,
@@ -51,8 +52,11 @@ gh api repos/idoforgod/cys-terminal/environments/release-production \
 ```
 
 입력이 하나라도 비거나 형식이 잘못되면 빌드를 시작하지 않는다. macOS arm64/x64는 각각 앱과
-DMG 공증 제출·staple·Gatekeeper 검증을 통과해야 한다. Windows sidecar와 NSIS 설치 파일은
-SHA-256 Authenticode 서명, HTTPS RFC3161 타임스탬프, 게시자 일치 검증을 통과해야 한다.
+DMG 공증 제출·staple·Gatekeeper 검증을 통과해야 한다. Windows NSIS 설치 파일은 의도적으로
+Authenticode 서명하지 않는다. 대신 정식 빌드의 정확한 `cys-app.exe` SHA-256을 `cysd.exe`에
+컴파일해 GUI 권한 등록을 동일 바이트에만 허용하고, EXE와 그 EXE 하나를 담은 ZIP을 함께 제공한다.
+Chrome·SmartScreen·Defender의 알 수 없는 게시자 경고는 예상된 동작이며, 사용자는 보호 기능을
+끄지 않고 `SHA256SUMS.txt` 일치를 확인한 뒤 실행 여부를 직접 결정한다.
 
 ### Browser Runtime 소스·스테이징·서명 계약
 
@@ -65,17 +69,17 @@ archive는 framework symlink를 실파일로 펼쳤을 때 서명 bundle이
 모호해지는 것이 확인되어 사용하지 않는다. 제품 런타임은 headless CDP이므로 symlink가 없는 공식
 Playwright headless-shell archive를 사용한다.
 
-순서는 반드시 **stage → 플랫폼 코드 서명/검증 → 최종 파일·트리 hash 계산 → minisign
+순서는 반드시 **stage → 플랫폼별 최종 바이트 확정 → 최종 파일·트리 hash 계산 → minisign
 attestation/policy 생성·검증 → Tauri bundle**이다. macOS는 staged tree의 모든 Mach-O를
-Developer ID hardened-runtime으로 inside-out 서명하고, Windows는 모든 EXE/DLL을 SHA-256
-Authenticode와 RFC3161 timestamp로 서명·검증한다. 코드 서명이 바이트를 바꾸므로 이보다 앞서
-생성한 runtime hash는 출시 근거가 될 수 없다.
+Developer ID hardened-runtime으로 inside-out 서명한 뒤 hash를 계산한다. Windows PE는
+Authenticode 서명 없이 최종 hash를 계산하고, supervisor·engine·Chromium 전체 트리의 정확한
+hash가 컴파일된 신뢰근원의 minisign 서명 metadata에 모두 포함되지 않으면 bundle을 만들지 않는다.
 
 Bun standalone compiler는 source 절대경로를 결과물에 포함할 수 있으므로 이 계약은 서로 다른
 workspace 사이의 byte-for-byte 재현성을 주장하지 않는다. 대신 source·도구체인·입력을 고정하고,
-해당 릴리스에서 실제로 생성·플랫폼 서명된 출력 digest를 최종 runtime metadata에 묶어 minisign한다.
+해당 릴리스에서 실제로 생성된 최종 출력 digest를 runtime metadata에 묶어 minisign한다.
 로컬 macOS arm64에서 stage 후 Developer ID 검증과 실제 persistent-context 첫 페이지 smoke가
-통과했지만, macOS 두 target의 공증 DMG와 Windows CI Authenticode/NSIS 결과는 매 릴리스의 독립
+통과했지만, macOS 두 target의 공증 DMG와 Windows CI 무서명 NSIS/GUI-hash-pin 결과는 매 릴리스의 독립
 필수 게이트이며 문서상의 로컬 증거로 대체할 수 없다.
 
 ### 바이너리 릴리스의 정확한 공개 자산 14개
@@ -90,8 +94,10 @@ workspace 사이의 byte-for-byte 재현성을 주장하지 않는다. 대신 so
 - pack 3개: `pack.tar.gz`, `pack-manifest.json`, `pack-manifest.json.minisig`
 - 무결성 1개: `SHA256SUMS.txt`(나머지 13개 전부, 누락 0·중복 0)
 
-Windows ZIP은 설치 EXE 하나만 루트에 담는 결정론적 flat ZIP이다. 다운로드 페이지의 Windows
-Defender 안내는 `data-cys-release-marker="windows-defender-guidance-v1"`로 보존한다.
+Windows ZIP은 동일한 설치 EXE 하나만 루트에 담는 결정론적 flat ZIP이다. 다운로드 페이지의
+Windows Defender 안내는 `data-cys-release-marker="windows-defender-guidance-v1"`로 보존하며,
+Authenticode 무서명·Chrome/SmartScreen 경고·EXE/ZIP 선택·`SHA256SUMS.txt` 확인·보호 기능 유지
+문구 중 하나라도 원격에서 사라지면 승격 검증이 실패한다.
 
 ### 홈페이지 승격과 원격 폐쇄 검증
 

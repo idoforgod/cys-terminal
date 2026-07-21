@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "repository": "idoforgod/cys-terminal",
+  "windows_release_mode": "unsigned",
   "input_assets": [
     "cys_{version}_aarch64.dmg",
     "cys_{version}_x64.dmg",
