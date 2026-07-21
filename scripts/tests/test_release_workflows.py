@@ -14,9 +14,15 @@ BROWSER_RUNTIME_SOURCES = ROOT / "release" / "browser-runtime-sources.json"
 WINDOWS_BUILD = ROOT / "scripts" / "build-windows-unsigned.ps1"
 BROWSER_MAC_SIGN = ROOT / "scripts" / "runtime-stage-sign-macos.sh"
 BROWSER_WINDOWS_SIGN = ROOT / "scripts" / "runtime-stage-sign-windows.ps1"
+REMOTE_VERIFIER = ROOT / "scripts" / "verify-release-remote.sh"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_remote_verifier_avoids_shellcheck_ambiguous_boolean_chains(self) -> None:
+        verifier = REMOTE_VERIFIER.read_text(encoding="utf-8")
+
+        self.assertNotRegex(verifier, re.compile(r"\]\s*&&\s*\[.*\]\s*\|\|\s*usage"))
+
     def test_candidate_workflow_has_one_draft_assembler_and_no_public_publish(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         publish = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
