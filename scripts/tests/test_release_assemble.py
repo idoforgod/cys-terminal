@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ASSEMBLER = ROOT / "scripts" / "release-assemble.py"
 VERIFIER = ROOT / "scripts" / "release-verify.py"
+ASSETS_POLICY = ROOT / "release" / "assets-policy.json"
 
 
 class ReleaseAssembleTests(unittest.TestCase):
@@ -38,7 +39,13 @@ class ReleaseAssembleTests(unittest.TestCase):
         for name, content in payloads.items():
             (self.inputs / name).write_bytes(content)
 
-    def run_assembler(self, version: str, *, site_output: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run_assembler(
+        self,
+        version: str,
+        *,
+        site_output: Path | None = None,
+        policy: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         command = [
                 "python3",
                 str(ASSEMBLER),
@@ -55,6 +62,8 @@ class ReleaseAssembleTests(unittest.TestCase):
             ]
         if site_output is not None:
             command.extend(["--site-output", str(site_output)])
+        if policy is not None:
+            command.extend(["--policy", str(policy)])
         return subprocess.run(
             command,
             cwd=ROOT,
@@ -115,6 +124,24 @@ class ReleaseAssembleTests(unittest.TestCase):
                 hashlib.sha256((self.output / filename).read_bytes()).hexdigest(),
             )
 
+    def test_policy_explicitly_records_unsigned_windows_distribution(self) -> None:
+        policy = json.loads(ASSETS_POLICY.read_text(encoding="utf-8"))
+
+        self.assertEqual(policy["windows_release_mode"], "unsigned")
+
+    def test_assembler_rejects_a_windows_release_mode_policy_drift(self) -> None:
+        version = "9.8.7"
+        self.write_candidate_inputs(version)
+        policy = json.loads(ASSETS_POLICY.read_text(encoding="utf-8"))
+        policy["windows_release_mode"] = "signed"
+        policy_path = self.work / "drifted-policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+        result = self.run_assembler(version, policy=policy_path)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Windows release mode must be unsigned", result.stderr)
+
     def test_target_handoffs_may_be_nested_but_are_assembled_by_asset_name(self) -> None:
         version = "9.8.7"
         self.write_candidate_inputs(version)
@@ -143,6 +170,11 @@ class ReleaseAssembleTests(unittest.TestCase):
         recovery = (downloads / "recovery" / "index.html").read_text(encoding="utf-8")
         self.assertIn('data-cys-release-marker="windows-defender-guidance-v1"', index)
         self.assertIn("Windows Defender", index)
+        self.assertIn("Authenticode 서명되지 않았습니다", index)
+        self.assertIn("SmartScreen", index)
+        self.assertIn("ZIP", index)
+        self.assertIn("SHA256SUMS.txt", index)
+        self.assertIn("보호 기능을 끄지 마세요", index)
         self.assertNotIn("xattr -d", index)
         self.assertIn('data-cys-release-marker="release-recovery-v1"', recovery)
         for filename in (

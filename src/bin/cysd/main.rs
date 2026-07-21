@@ -731,6 +731,13 @@ fn phoenix_embed_files() -> Vec<(&'static str, &'static str)> {
 fn extract_phoenix_embed(
     state_dir: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    extract_phoenix_embed_with_failure_after(state_dir, None)
+}
+
+fn extract_phoenix_embed_with_failure_after(
+    state_dir: &std::path::Path,
+    fail_after: Option<u32>,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let version = env!("CARGO_PKG_VERSION");
     let uniq = {
         let nanos = std::time::SystemTime::now()
@@ -749,8 +756,8 @@ fn extract_phoenix_embed(
             }
             std::fs::write(&path, content)?;
             written += 1;
-            // 테스트 seam: root+일부 파일 생성 후 강제 실패 주입(중간 실패 정리 결정론 검증).
-            if written == 1 && std::env::var("CYS_PHOENIX_EXTRACT_FAIL").is_ok() {
+            // 함수 인자로만 실패를 주입해 병렬 테스트의 프로세스 전역 env 간섭을 차단한다.
+            if fail_after == Some(written) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "injected mid-extraction failure",
@@ -2818,20 +2825,18 @@ mod auto_restore_tests {
     }
 
     use super::{
-        bundled_python3, disk_fallback_verify, extract_phoenix_embed, phoenix_embed_files,
-        phoenix_self_test,
+        bundled_python3, disk_fallback_verify, extract_phoenix_embed,
+        extract_phoenix_embed_with_failure_after, phoenix_embed_files, phoenix_self_test,
     };
     use std::cell::RefCell;
     use std::time::Duration;
 
-    /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
+    /// ★codex W4 fix1: 함수 인자로 추출 중간 실패를 주입해도 partial root 즉시 정리 — phoenix-embed 잔여 0.
     #[test]
     fn b1_extract_mid_failure_leaves_no_partial_root() {
         let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
-        std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
-        let res = extract_phoenix_embed(&sd);
-        std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        let res = extract_phoenix_embed_with_failure_after(&sd, Some(1));
         assert!(res.is_err(), "주입된 중간 실패가 Err 여야 한다");
         // phoenix-embed 하위 child dir 0(즉시 정리 — 다음 부팅 prune 의존 금지).
         let root = sd.join("phoenix-embed");

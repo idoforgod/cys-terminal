@@ -98,6 +98,20 @@ class VerifyReleaseRemoteTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing the Defender marker", result.stderr)
 
+    def test_missing_unsigned_windows_warning_blocks_remote_promotion(self) -> None:
+        index = self.site / "downloads" / "index.html"
+        index.write_text(
+            index.read_text(encoding="utf-8").replace(
+                "Authenticode 서명되지 않았습니다", "서명 상태 안내"
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_verifier()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing unsigned Windows guidance", result.stderr)
+
     def test_remote_byte_tampering_blocks_promotion(self) -> None:
         target = self.site / "downloads" / f"cys_{self.version}_x64-setup.exe"
         target.write_bytes(b"tampered")

@@ -1290,6 +1290,26 @@ fn same_windows_signer(expected: &WindowsSignerIdentity, actual: &WindowsSignerI
         && expected.subject == actual.subject
 }
 
+fn verify_windows_release_gui_hash(expected: &str, actual: &str) -> Result<String, BrokerFailure> {
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BrokerFailure::new(
+            "GUI_IDENTITY_REJECTED",
+            "compiled Windows release GUI hash is missing or invalid",
+        ));
+    }
+    if actual != format!("sha256:{expected}") {
+        return Err(BrokerFailure::new(
+            "GUI_IDENTITY_REJECTED",
+            "unsigned Windows GUI does not match the release-pinned executable hash",
+        ));
+    }
+    Ok(format!("windows-release-sha256:{expected}"))
+}
+
 impl GuiPeerVerifier for PlatformGuiPeerVerifier {
     fn verify(&self, pid: u32) -> Result<GuiExecutableIdentity, BrokerFailure> {
         inspect_gui_executable_identity(pid)
@@ -1322,19 +1342,20 @@ fn inspect_gui_executable_identity(pid: u32) -> Result<GuiExecutableIdentity, Br
             "GUI process start time is unavailable",
         ));
     }
-    let code_sign_identity = verify_gui_code_identity(&canonical)?;
     let bytes = std::fs::read(&canonical).map_err(|error| {
         BrokerFailure::new(
             "GUI_IDENTITY_REJECTED",
             format!("GUI executable cannot be hashed: {error}"),
         )
     })?;
+    let executable_sha256 = sha256_id(&bytes);
+    let code_sign_identity = verify_gui_code_identity(&canonical, &executable_sha256)?;
     Ok(GuiExecutableIdentity {
         pid,
         start_time,
         canonical_executable: canonical.to_string_lossy().into_owned(),
         code_sign_identity,
-        executable_sha256: sha256_id(&bytes),
+        executable_sha256,
     })
 }
 
@@ -1342,7 +1363,12 @@ fn explicit_gui_dev_mode() -> bool {
     cfg!(debug_assertions) && std::env::var("CYS_BROWSER_DEV").as_deref() == Ok("1")
 }
 
-fn verify_gui_code_identity(path: &std::path::Path) -> Result<String, BrokerFailure> {
+fn verify_gui_code_identity(
+    path: &std::path::Path,
+    executable_sha256: &str,
+) -> Result<String, BrokerFailure> {
+    #[cfg(not(windows))]
+    let _ = executable_sha256;
     if explicit_gui_dev_mode() {
         let path_text = path.to_string_lossy().replace('\\', "/");
         let local_target = path_text.ends_with("/target/debug/cys-app")
@@ -1403,6 +1429,9 @@ fn verify_gui_code_identity(path: &std::path::Path) -> Result<String, BrokerFail
                 "GUI_IDENTITY_REJECTED",
                 "production GUI is not the canonical packaged cys-app.exe",
             ));
+        }
+        if let Some(expected_hash) = option_env!("CYS_WINDOWS_GUI_SHA256") {
+            return verify_windows_release_gui_hash(expected_hash, executable_sha256);
         }
         let cysd_path = std::env::current_exe()
             .map_err(|error| {
@@ -1933,6 +1962,19 @@ mod tests {
             subject: "CN=Other Valid Publisher".into(),
         };
         assert!(!same_windows_signer(&cysd, &attacker));
+    }
+
+    #[test]
+    fn windows_unsigned_release_accepts_only_the_compiled_gui_digest() {
+        let digest = "ab".repeat(32);
+        let identity = verify_windows_release_gui_hash(&digest, &format!("sha256:{digest}"))
+            .expect("the exact release GUI hash must be accepted");
+        assert_eq!(identity, format!("windows-release-sha256:{digest}"));
+
+        let mismatch =
+            verify_windows_release_gui_hash(&digest, &format!("sha256:{}", "cd".repeat(32)))
+                .expect_err("a different unsigned executable must be rejected");
+        assert_eq!(mismatch.code, "GUI_IDENTITY_REJECTED");
     }
 
     #[test]

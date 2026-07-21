@@ -64,6 +64,17 @@ grep -Fq 'Windows Defender' "$TMP_DIR/index.html" || {
   echo "remote downloads index is missing Windows Defender guidance" >&2
   exit 1
 }
+for REQUIRED_GUIDANCE in \
+  'Authenticode 서명되지 않았습니다' \
+  'SmartScreen' \
+  'ZIP' \
+  'SHA256SUMS.txt' \
+  '보호 기능을 끄지 마세요'; do
+  grep -Fq "$REQUIRED_GUIDANCE" "$TMP_DIR/index.html" || {
+    echo "remote downloads index is missing unsigned Windows guidance: $REQUIRED_GUIDANCE" >&2
+    exit 1
+  }
+done
 if grep -Fq 'xattr -d' "$TMP_DIR/index.html"; then
   echo "remote downloads index contains a forbidden macOS quarantine bypass" >&2
   exit 1

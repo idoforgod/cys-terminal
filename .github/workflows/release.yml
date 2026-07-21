@@ -52,7 +52,7 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc  # Windows x64 — NSIS 자기완결(PortableGit+Python 동봉).
                                             # createUpdaterArtifacts=true(tauri.windows.conf.json) + 서명키로
-                                            # setup.exe는 Authenticode+RFC3161 뒤 updater 서명을 다시 생성한다.
+                                            # updater 서명은 유지하되 Authenticode는 의도적으로 생략한다.
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -451,41 +451,23 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         env:
-          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          CYS_WINDOWS_RELEASE_MODE: unsigned-acknowledged
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: python scripts/release-credentials-check.py windows
 
-      - name: Import Windows signing certificate
-        if: matrix.platform == 'windows-latest'
-        id: windows_certificate
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
-        run: ./scripts/windows-authenticode.ps1 -Mode Import
-
-      - name: Build Authenticode + RFC3161 Windows candidate
+      - name: Build acknowledged unsigned Windows candidate
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         env:
-          WINDOWS_CERTIFICATE_B64: ${{ secrets.WINDOWS_CERTIFICATE_B64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ steps.windows_certificate.outputs.thumbprint }}
-          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          CYS_WINDOWS_RELEASE_MODE: unsigned-acknowledged
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           PYTHONUTF8: '1'
-        run: ./scripts/build-windows-signed.ps1
+        run: ./scripts/build-windows-unsigned.ps1
 
-      - name: Remove ephemeral signing material
+      - name: Remove ephemeral Browser Runtime signing material
         if: always() && matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
           foreach ($path in @($env:CYS_BROWSER_RUNTIME_SECRET_KEY, $env:CYS_BROWSER_RUNTIME_PUBLIC_KEY)) {
             if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force }
           }
@@ -498,7 +480,7 @@ jobs:
           rm -f "${CYS_BROWSER_RUNTIME_SECRET_KEY:-$RUNNER_TEMP/browser-runtime-release.key}" \
             "${CYS_BROWSER_RUNTIME_PUBLIC_KEY:-$RUNNER_TEMP/browser-runtime-release.pub}"
 
-      - name: Encrypt signed target handoff
+      - name: Encrypt target handoff
         shell: bash
         env:
           RELEASE_HANDOFF_KEY: ${{ secrets.RELEASE_HANDOFF_KEY }}
@@ -506,7 +488,7 @@ jobs:
           bash scripts/release-handoff.sh pack release-candidate
           "release-${{ matrix.target }}.tgz.enc"
 
-      - name: Upload encrypted signed target handoff
+      - name: Upload encrypted target handoff
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
@@ -851,7 +833,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" -R "$SRC_REPO" \
             --verify-tag --draft \
             --title "cys $GITHUB_REF_NAME" \
-            --notes "Candidate only. SHA256SUMS digest: $BUNDLE_SHA"
+            --notes "Candidate only. Windows installer is intentionally not Authenticode signed; Chrome/SmartScreen warnings are expected. Use the EXE or ZIP, then verify SHA256SUMS.txt before allowing it. SHA256SUMS digest: $BUNDLE_SHA"
           if ! gh release upload "$GITHUB_REF_NAME" -R "$SRC_REPO" \
             reviewed-candidate/release-out/*; then
             echo "candidate upload failed; deleting the incomplete draft" >&2

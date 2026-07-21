@@ -27,12 +27,22 @@ def main() -> int:
         for name in contract.get("https_url", [])
         if os.environ.get(name) and not os.environ[name].startswith("https://")
     ]
-    if missing or invalid_urls:
+    invalid_exact = [
+        name
+        for name, expected in contract.get("exact", {}).items()
+        if os.environ.get(name) and os.environ[name] != expected
+    ]
+    if missing or invalid_urls or invalid_exact:
         if missing:
             print(f"missing release inputs: {', '.join(missing)}", file=sys.stderr)
         if invalid_urls:
             print(
                 f"release URL inputs must use https: {', '.join(invalid_urls)}",
+                file=sys.stderr,
+            )
+        if invalid_exact:
+            print(
+                f"release inputs do not match the required policy: {', '.join(invalid_exact)}",
                 file=sys.stderr,
             )
         return 1
