@@ -155,6 +155,8 @@ interface CastEntry {
   pendingAcks: LatestFrameFlow<number>; // fid → 원본 CDP sessionId, 최신 1개만 보존·fid별 exactly-once
   // client별 render receipt. 서버는 해당 client에 실제 전송한 fid만 ack로 인정한다.
   frameRecipients: Map<number, Set<string>>;
+  // 한 client에는 미확인 frame을 하나만 보낸다. ack 뒤 lastFrame으로 최신 상태를 따라잡는다.
+  clientFrames: Map<string, number>;
   lastPushAt: number; // 프레임률 상한용 마지막 push 시각
   lastFrame: { fid: number; data: string; metadata: any } | null; // 신규 클라이언트 즉시 렌더용
   starting: boolean; // 최초 스크린캐스트 기동 진행중(동시 접속이 이중 start 하지 않게)
@@ -204,6 +206,35 @@ function castBroadcast(hub: CastEntry, obj: ServerMsg) {
 function castBroadcastTo(cid: string, obj: ServerMsg) {
   const hub = castHub.get(cid);
   if (hub) castBroadcast(hub, obj);
+}
+
+function castSendFrame(
+  hub: CastEntry,
+  client: ServerWebSocket<CastData>,
+  frame: { fid: number; data: string; metadata: any },
+): boolean {
+  const clientId = client.data.clientId;
+  if (hub.clientFrames.has(clientId)) return false;
+  try {
+    if (client.send(JSON.stringify({ type: "frame", ...frame })) === 0) return false;
+  } catch {
+    return false;
+  }
+  hub.clientFrames.set(clientId, frame.fid);
+  const recipients = hub.frameRecipients.get(frame.fid) ?? new Set<string>();
+  recipients.add(clientId);
+  hub.frameRecipients.set(frame.fid, recipients);
+  return true;
+}
+
+function castForgetClientFrame(hub: CastEntry, clientId: string): number | null {
+  const fid = hub.clientFrames.get(clientId);
+  if (fid === undefined) return null;
+  hub.clientFrames.delete(clientId);
+  const recipients = hub.frameRecipients.get(fid);
+  recipients?.delete(clientId);
+  if (recipients?.size === 0) hub.frameRecipients.delete(fid);
+  return fid;
 }
 
 // 스크린캐스트 부착 — WS 최초 접속 경로와 탭 전환 재구성 경로가 **같은 함수**를 쓴다.
@@ -283,10 +314,8 @@ async function castAttach(cid: string, h: CastEntry, page: Page, cdp?: CDPSessio
     }
     // 신규 클라이언트 즉시 렌더용 캐시(정적 페이지는 다음 프레임이 영영 안 온다).
     h.lastFrame = { fid, data: params.data, metadata: params.metadata };
-    h.frameRecipients.set(fid, new Set([...h.clients].map((c) => c.data.clientId)));
-    while (h.frameRecipients.size > 8) h.frameRecipients.delete(h.frameRecipients.keys().next().value!);
     castStats.framesPushed++;
-    castBroadcast(h, { type: "frame", fid, data: params.data, metadata: params.metadata });
+    for (const client of h.clients) castSendFrame(h, client, h.lastFrame);
     // touch() 하지 않음 — 방치 pane 이 Chromium 을 영구 상주시키지 않게(자원 거버넌스).
   });
 
@@ -357,6 +386,7 @@ function castDetach(hub: CastEntry, keepFrame = false) {
   hub.navPage = null;
   const pending = hub.pendingAcks.drain();
   hub.frameRecipients.clear();
+  hub.clientFrames.clear();
   hub.lastMeta = null;
   if (!keepFrame) hub.lastFrame = null;
   const cdp = hub.cdp;
@@ -2312,6 +2342,7 @@ const server = Bun.serve({
           lastMeta: null,
           pendingAcks: new LatestFrameFlow<number>(1),
           frameRecipients: new Map(),
+          clientFrames: new Map(),
           lastPushAt: 0,
           lastFrame: null,
           starting: false,
@@ -2426,10 +2457,7 @@ const server = Bun.serve({
         // 후속 클라이언트: 새 프레임을 기다리면 정적 페이지에서 영영 못 받는다(hasFrame=false 고착
         // → 입력도 전부 무시). 캐시된 마지막 프레임을 즉시 1회 送 — 중복 ack 는 fid dedup 이 흡수.
         if (h.lastFrame) {
-          try {
-            ws.send(JSON.stringify({ type: "frame", ...h.lastFrame }));
-            h.frameRecipients.get(h.lastFrame.fid)?.add(ws.data.clientId);
-          } catch {}
+          castSendFrame(h, ws, h.lastFrame);
         }
       }
       // 4-S-6 초기 상태 동기화 — nav·tabs·control 3종을 즉시 push(현행은 control 만이라
@@ -2473,12 +2501,14 @@ const server = Bun.serve({
             // 않은 fid 만 유효하다. 미발급·이미 처리된 fid 는 상태를 건드리지 않고 조용히 무시한다.
             // (4-S-8: ack 는 조작 의사가 아니므로 control 을 절대 acquire 하지 않는다.)
             const recipients = hub.frameRecipients.get(m.fid);
-            if (!recipients || !recipients.delete(ws.data.clientId)) break; // stale/duplicate/client-not-rendered
+            if (hub.clientFrames.get(ws.data.clientId) !== m.fid || !recipients?.has(ws.data.clientId)) break;
+            castForgetClientFrame(hub, ws.data.clientId);
             const sid = hub.pendingAcks.acknowledge(m.fid);
             if (hub.cdp && sid !== null) {
               await hub.cdp.send("Page.screencastFrameAck", { sessionId: sid });
               castStats.ackRelayed++;
             }
+            if (hub.lastFrame && hub.lastFrame.fid !== m.fid) castSendFrame(hub, ws, hub.lastFrame);
             break;
           }
           case "mouse":
@@ -2647,6 +2677,7 @@ const server = Bun.serve({
       const c = contexts.get(cid);
       const wasOwner = !!c && isControlOwner(c, ws);
       hub.clients.delete(ws);
+      castForgetClientFrame(hub, ws.data.clientId);
       // owner가 사라졌지만 다른 pane이 남아 있으면 그 pane으로 lease를 암묵 이전하지 않는다.
       // 빈 hub일 때만 같은 pane의 짧은 reconnect grace가 이어받을 기회를 갖는다.
       // Do not revoke the lease on a transient owner close. The hub remains

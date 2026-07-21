@@ -449,6 +449,77 @@ test("cast 지속 스트림: fid ack 로 계속 흐르고 30fps 상한이 걸린
   }
 }, 120000);
 
+test("cast 느린 클라이언트: 확인 전 렌더 1개만, 확인 후 최신 프레임으로 수렴", async () => {
+  const home = mkdtempSync(join(tmpdir(), "cast-slow-client-"));
+  const fixture = startFixtureServer();
+  const animUrl = `http://127.0.0.1:${fixture.port}/anim`;
+  const proc = Bun.spawn(["bun", "run", "server.ts", "--headless"], {
+    cwd: BROWSERD_DIR,
+    env: { ...process.env, HOME: home, CYS_BROWSER_HEADLESS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let failed = false;
+  const sockets: WebSocket[] = [];
+  try {
+    const { port, token } = await waitState(home, 30000);
+    expect((await rpc(port, token, "open", { url: animUrl })).ok).toBe(true);
+
+    const slow = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    sockets.push(slow);
+    const slowFids: number[] = [];
+    slow.addEventListener("message", (ev) => {
+      try {
+        const m = JSON.parse(ev.data as string);
+        if (m.type === "frame") slowFids.push(m.fid);
+      } catch {}
+    });
+    expect(await wsOpen(slow, 10000)).toBe(true);
+
+    const fast = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
+    sockets.push(fast);
+    let fastFrames = 0;
+    fast.addEventListener("message", (ev) => {
+      try {
+        const m = JSON.parse(ev.data as string);
+        if (m.type !== "frame") return;
+        fastFrames++;
+        fast.send(JSON.stringify({ type: "ack", fid: m.fid }));
+      } catch {}
+    });
+    expect(await wsOpen(fast, 10000)).toBe(true);
+
+    for (let i = 0; i < 100 && (slowFids.length < 1 || fastFrames < 5); i++) await sleep(100);
+    expect(slowFids.length).toBe(1);
+    expect(fastFrames).toBeGreaterThanOrEqual(5);
+    const firstSlowFid = slowFids[0];
+
+    await sleep(1500);
+    expect(slowFids).toEqual([firstSlowFid]);
+    const fastBeforeResume = fastFrames;
+
+    slow.send(JSON.stringify({ type: "ack", fid: firstSlowFid }));
+    for (let i = 0; i < 50 && slowFids.length < 2; i++) await sleep(100);
+    expect(slowFids.length).toBe(2);
+    expect(slowFids[1]).toBeGreaterThan(firstSlowFid);
+
+    await sleep(800);
+    expect(slowFids.length).toBe(2);
+    expect(fastFrames).toBeGreaterThan(fastBeforeResume);
+  } catch (e) {
+    failed = true;
+    throw e;
+  } finally {
+    for (const ws of sockets) {
+      try { ws.close(); } catch {}
+    }
+    await terminateServer(proc);
+    fixture.stop(true);
+    if (failed) console.error("=== server stderr ===\n" + (await readStderr(proc)));
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  }
+}, 120000);
+
 // status 의 cast 계측(hubs·clients·started·stopped·framesPushed·ackRelayed) 관측.
 async function castStat(port: number, token: string): Promise<any> {
   const r = await rpc(port, token, "status", {});

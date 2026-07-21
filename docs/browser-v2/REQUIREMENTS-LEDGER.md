@@ -45,7 +45,7 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-P07 | A fid causes at most one CDP ack; unacknowledged backlog is bounded and latest-frame-wins. | `LatestFrameFlow` | `cast.test.ts`; stream integration | slice-green |
 | B2-P08 | A dropped, evicted, detached, or rendered frame is eventually acked so CDP cannot stall. | `LatestFrameFlow` integration | stream/resize/rebind integration | slice-green; full browserd integration green |
 | B2-P09 | A transient zero-client interval keeps the cast session through a bounded reconnect grace. | `reconnectGraceDecision` + server timer | unit + disconnect/reconnect integration | slice-green; timed integration green |
-| B2-P10 | Each client has at most one outstanding render and paints before sending `ack(fid)`. | `cysjavis-pack/browserd/server.ts` frameRecipients + `cysjavis-pack/browserd/cast.ts` CAST_APP_HTML | slow-client browser E2E | server rejects stale/duplicate/non-recipient ack; per-client slow-client E2E remains deferred-P0 |
+| B2-P10 | Each client has at most one outstanding render and paints before sending `ack(fid)`. | `cysjavis-pack/browserd/server.ts` client frame receipts + `cysjavis-pack/browserd/cast.ts` CAST_APP_HTML | real-Chromium slow-client WS integration: one outstanding render, latest-frame catch-up, independent fast-client continuity | slice-green; packaged slow-client GUI evidence remains release-gate |
 | B2-P11 | One-time embed credentials are broker-pre-registered over an inherited-session-key-authenticated private channel, TTL-bound to runtime/context/embed generation/pane/origin, opened by exactly one app GET and consumed by exactly one WS. No control or cast token is returned in `EmbedDescriptor`. | broker `prepare_embed`, `CastEmbedTicketRegistry` | request-MAC tamper tests, exact preregistration/header/DTO test, GET/WS replay integration | slice-green; packaged exact-origin E2E release-gate |
 
 ## Runtime, persistence, and resource lifecycle
@@ -100,3 +100,12 @@ The following source-level evidence was reproduced on 2026-07-21. Counts are tes
 | `src/bin/cysd/governance.rs` freeze check | HEAD and working-tree SHA-256 both `ca932b0abb344ec40267f1045102857c866727b5c1914e5604e106f591bc09b3` |
 
 This snapshot is not packaged-release evidence. `src-tauri/resources/browser-runtime/` still requires qualified per-target runtime bytes and the external `release-production` GitHub Environment must exist with its protection rules and credentials before candidate/publish workflows can pass.
+
+## 2026-07-22 continuation snapshot
+
+| Command / gate | Result |
+|---|---|
+| browserd `bun run test`, including per-client slow-frame flow | 94/94, exit 0; slow client remains at one unacknowledged frame, catches up to the latest frame after ack, and does not stall a fast client |
+| `git diff --check` | exit 0 |
+
+This closes the source-level B2-P10 deferred item only. Packaged GUI and signed-artifact evidence remain release gates.

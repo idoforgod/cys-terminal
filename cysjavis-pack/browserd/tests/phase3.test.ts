@@ -1681,18 +1681,28 @@ test("★M2 rebind 시 pendingAcks 정리: 옛 세대 fid 의 ack 는 새 세션
     console.log(`[M2] 옛 fid=${oldFids[0]} ack → ackRelayed ${a0}→${a1} · err=${errs.length}건`);
     expect(a1).toBe(a0); // 정리 누락이면 Δ1 (옛 sessionId 로 릴레이된다)
 
-    // ③ ★양성 대조 — latest-frame-wins에서는 오래 보관한 fid가 새 프레임에 의해 이미 eviction될 수
-    // 있으므로, 다음 프레임을 수신 즉시 ack한다. 이게 없으면 "계수기가 멈춰서 Δ0" 을 못 가른다.
+    // ③ ★양성 대조 — client별 미확인 렌더는 하나뿐이므로, 먼저 현 세대의 outstanding frame을
+    // 공개 ack 경로로 비운다. 그 뒤 viewport가 만든 다음 frame을 수신 즉시 ack한다. 이게 없으면
+    // "계수기가 멈춰서 Δ0" 을 못 가른다.
+    drainAcks = true;
+    for (const f of fids) ws.send(JSON.stringify({ type: "ack", fid: f }));
+    for (let i = 0; i < 40; i++) {
+      await sleep(100);
+      for (const f of fids) ws.send(JSON.stringify({ type: "ack", fid: f }));
+      if ((await castOf(port, token)).pending_acks === 0) break;
+    }
+    drainAcks = false;
+    const positiveBaseline = (await castOf(port, token)).ackRelayed;
     ackNextFrame = true;
     ws.send(JSON.stringify({ type: "viewport", width: 901, height: 601, unpin: false }));
-    let a2 = a1;
-    for (let i = 0; i < 40 && (a2 === a1 || positiveAckFid < 0); i++) {
+    let a2 = positiveBaseline;
+    for (let i = 0; i < 40 && (a2 === positiveBaseline || positiveAckFid < 0); i++) {
       await sleep(150);
       a2 = (await castOf(port, token)).ackRelayed;
     }
-    console.log(`[M2] 현 세대 fid=${positiveAckFid} ack → ackRelayed ${a1}→${a2}`);
+    console.log(`[M2] 현 세대 fid=${positiveAckFid} ack → ackRelayed ${positiveBaseline}→${a2}`);
     expect(positiveAckFid).toBeGreaterThan(0);
-    expect(a2).toBe(a1 + 1);
+    expect(a2).toBe(positiveBaseline + 1);
 
     // ④ ★미-ack 장부의 직접 관측 — 현 세대를 **전부 ack 해 비우면** 장부는 0 이어야 한다.
     //   정리를 안 했다면 옛 세대 엔트리가 남아 0 이 되지 않는다(옛 fid 는 다시 발급되지 않으니
