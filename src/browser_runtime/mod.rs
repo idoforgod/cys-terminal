@@ -8,6 +8,7 @@ mod compatibility;
 mod state;
 mod manifest;
 mod path;
+mod lifecycle;
 
 pub use compatibility::{
     evaluate_compatibility, Compatibility, CompatibilityIssue, CompatibilityRequirement,
@@ -23,10 +24,29 @@ pub use state::{
     parse_runtime_state, EngineKey, EngineMode, LegacyRuntimeState, ParsedRuntimeState,
     ProtocolRange, RuntimeStateV2,
 };
+pub use lifecycle::{RetryPolicy, RetryState, UpdateJournal, UpdatePhase};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_is_bounded_and_cancellable() {
+        let p = RetryPolicy { max_attempts: 3, max_elapsed_ms: 1000 };
+        assert!(p.allows(RetryState { attempts: 0, started_ms: 10, cancelled: false }, 10));
+        assert!(!p.allows(RetryState { attempts: 3, started_ms: 10, cancelled: false }, 10));
+        assert!(!p.allows(RetryState { attempts: 0, started_ms: 10, cancelled: true }, 10));
+        assert!(!p.allows(RetryState { attempts: 1, started_ms: 10, cancelled: false }, 1010));
+    }
+
+    #[test]
+    fn update_journal_never_mutates_in_place_and_can_rollback() {
+        let mut j = UpdateJournal::new(7);
+        j.advance(UpdatePhase::Verify);
+        j.advance(UpdatePhase::Health);
+        j.rollback();
+        assert_eq!(j, UpdateJournal { generation: 7, phase: UpdatePhase::Rollback });
+    }
 
     #[test]
     fn legacy_state_is_parsed_but_never_compatible() {

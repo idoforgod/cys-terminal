@@ -43,7 +43,7 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-P07 | A fid causes at most one CDP ack; unacknowledged backlog is bounded and latest-frame-wins. | `LatestFrameFlow` | `cast.test.ts`; stream integration | slice-green |
 | B2-P08 | A dropped, evicted, detached, or rendered frame is eventually acked so CDP cannot stall. | `LatestFrameFlow` integration | stream/resize/rebind integration | slice-green; full browserd integration green |
 | B2-P09 | A transient zero-client interval keeps the cast session through a bounded reconnect grace. | `reconnectGraceDecision` + server timer | unit + disconnect/reconnect integration | slice-green; timed integration green |
-| B2-P10 | Each client has at most one outstanding render and paints before sending `ack(fid)`. | cast client render loop | slow-client browser E2E | server backlog bounded; per-client render queue deferred-P0 |
+| B2-P10 | Each client has at most one outstanding render and paints before sending `ack(fid)`. | `cysjavis-pack/browserd/server.ts` frameRecipients + `cysjavis-pack/browserd/cast.ts` CAST_APP_HTML | slow-client browser E2E | server rejects stale/duplicate/non-recipient ack; per-client slow-client E2E remains deferred-P0 |
 | B2-P11 | One-time embed credentials are TTL-bound to runtime instance/context/embed generation and cannot be replayed. | `CastEmbedTicketRegistry`, app GET issue → WS consume | unit + real WS replay/legacy-bypass integration | slice-green |
 
 ## Runtime, persistence, and resource lifecycle
@@ -53,9 +53,9 @@ The PRD owns goals, scope, user-visible acceptance criteria, and invariants. The
 | B2-R01 | Tauri `BrowserRuntimeManager` is the sole production lifecycle owner; Python remains a compatibility adapter and never independently races a spawn. | lifecycle concurrency tests | deferred-P0 |
 | B2-R02 | Production uses verified absolute paths and a signed runtime manifest; external Bun fallback is development-only. | clean-machine package inspection | deferred-P0; ADR-0002 |
 | B2-R03 | Layout persistence never stores token, port, ticket, or live generation; restore reconstructs a pending descriptor. | `webpane.test.ts` | slice-green |
-| B2-R04 | Retry is single-flight, bounded by attempts and wall time, cancellable on pane close, and never runs from passive restore. | fault-injection UI/Tauri tests | partial baseline; deferred-P0 |
+| B2-R04 | Retry is single-flight, bounded by attempts and wall time, cancellable on pane close, and never runs from passive restore. | `src/browser_runtime/lifecycle.rs` + unit tests in `src/browser_runtime/mod.rs` | typed policy contract green; Tauri single-flight/pane-close integration remains deferred-P0 |
 | B2-R05 | Reconnect grace precedes screencast/CDP release; final idle lease reclaims browser resources without killing cysd/PTYs. | process/CDP census | slice-green grace; idle packaged evidence deferred-P0 |
-| B2-R06 | Runtime update is stage → signature/hash verify → atomic select → health → commit/rollback journal. | update fault matrix | deferred-P0 |
+| B2-R06 | Runtime update is stage → signature/hash verify → atomic select → health → commit/rollback journal. | `src/browser_runtime/lifecycle.rs` + unit tests in `src/browser_runtime/mod.rs` | typed journal contract green; filesystem/update integration remains deferred-P0 |
 | B2-R07 | Rollback never mutates a signed app bundle in place or falls back to an unqualified external runtime. | signed rollback drill | deferred-P0; ADR-0004 |
 
 ## Freeze zones and release integrity

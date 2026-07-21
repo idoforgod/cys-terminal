@@ -148,6 +148,8 @@ interface CastEntry {
   clients: Set<ServerWebSocket<CastData>>;
   lastMeta: { deviceWidth: number; deviceHeight: number } | null;
   pendingAcks: LatestFrameFlow<number>; // fid → 원본 CDP sessionId, 최신 1개만 보존·fid별 exactly-once
+  // client별 render receipt. 서버는 해당 client에 실제 전송한 fid만 ack로 인정한다.
+  frameRecipients: Map<number, Set<string>>;
   lastPushAt: number; // 프레임률 상한용 마지막 push 시각
   lastFrame: { fid: number; data: string; metadata: any } | null; // 신규 클라이언트 즉시 렌더용
   starting: boolean; // 최초 스크린캐스트 기동 진행중(동시 접속이 이중 start 하지 않게)
@@ -276,6 +278,8 @@ async function castAttach(cid: string, h: CastEntry, page: Page, cdp?: CDPSessio
     }
     // 신규 클라이언트 즉시 렌더용 캐시(정적 페이지는 다음 프레임이 영영 안 온다).
     h.lastFrame = { fid, data: params.data, metadata: params.metadata };
+    h.frameRecipients.set(fid, new Set([...h.clients].map((c) => c.data.clientId)));
+    while (h.frameRecipients.size > 8) h.frameRecipients.delete(h.frameRecipients.keys().next().value!);
     castStats.framesPushed++;
     castBroadcast(h, { type: "frame", fid, data: params.data, metadata: params.metadata });
     // touch() 하지 않음 — 방치 pane 이 Chromium 을 영구 상주시키지 않게(자원 거버넌스).
@@ -347,6 +351,7 @@ function castDetach(hub: CastEntry, keepFrame = false) {
   hub.navHandler = null;
   hub.navPage = null;
   const pending = hub.pendingAcks.drain();
+  hub.frameRecipients.clear();
   hub.lastMeta = null;
   if (!keepFrame) hub.lastFrame = null;
   const cdp = hub.cdp;
@@ -2220,6 +2225,7 @@ const server = Bun.serve({
           clients: new Set(),
           lastMeta: null,
           pendingAcks: new LatestFrameFlow<number>(1),
+          frameRecipients: new Map(),
           lastPushAt: 0,
           lastFrame: null,
           starting: false,
@@ -2331,6 +2337,7 @@ const server = Bun.serve({
         if (h.lastFrame) {
           try {
             ws.send(JSON.stringify({ type: "frame", ...h.lastFrame }));
+            h.frameRecipients.get(h.lastFrame.fid)?.add(ws.data.clientId);
           } catch {}
         }
       }
@@ -2374,6 +2381,8 @@ const server = Bun.serve({
             // 클라이언트가 준 fid 를 서버 상태로 신뢰하지 않는다 — 서버가 발급하고 아직 확인되지
             // 않은 fid 만 유효하다. 미발급·이미 처리된 fid 는 상태를 건드리지 않고 조용히 무시한다.
             // (4-S-8: ack 는 조작 의사가 아니므로 control 을 절대 acquire 하지 않는다.)
+            const recipients = hub.frameRecipients.get(m.fid);
+            if (!recipients || !recipients.delete(ws.data.clientId)) break; // stale/duplicate/client-not-rendered
             const sid = hub.pendingAcks.acknowledge(m.fid);
             if (hub.cdp && sid !== null) {
               await hub.cdp.send("Page.screencastFrameAck", { sessionId: sid });
