@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub mod action_catalog;
+pub mod browser_runtime;
 pub mod directive_compose;
 pub mod edit_kinds;
 pub mod license;
