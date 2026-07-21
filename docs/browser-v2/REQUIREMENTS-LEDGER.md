@@ -108,7 +108,12 @@ This snapshot is not packaged-release evidence. `src-tauri/resources/browser-run
 | browserd `bun run test`, including per-client slow-frame flow | 94/94, exit 0; slow client remains at one unacknowledged frame, catches up to the latest frame after ack, and does not stall a fast client |
 | root library `cargo test --lib` | 154/154, exit 0; Browser update journal is compiled, rejects skipped/post-terminal transitions, rolls back interrupted selection with the exact previous generation, and commits only after health |
 | Windows library cross-check `cargo check --locked --lib --target x86_64-pc-windows-gnu` | exit 0 with the rustup toolchain; `MoveFileExW` atomic replacement path compiles |
+| local arm64 Browser Runtime stage/sign/smoke | exit 0; pinned inputs verified, six Mach-O files Developer ID signed and verified, signed engine launched the bundled absolute Chromium path and completed HTTP open + snapshot; see `LOCAL-RUNTIME-SMOKE-2026-07-22.md` |
+| Browser Runtime metadata unit tests | 3/3, exit 0; final signed-tree rehash and trust-root contracts remain covered without materializing a release secret |
 | changed Browser Rust modules `rustfmt --check` | exit 0 |
 | `git diff --check` | exit 0 |
 
-This closes the source-level B2-P10 deferred item only. Packaged GUI and signed-artifact evidence remain release gates.
+This closes the source-level B2-P10 gap and compiles/tests the B2-R06 journal and
+selection-store slice. The local arm64 package smoke reduces staging risk but is
+not notarized, installed, GUI, multi-target, or remote release evidence; those
+release gates remain open.
