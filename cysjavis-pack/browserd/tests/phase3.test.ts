@@ -7,8 +7,9 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mapInput } from "../cast";
+import { mapInput, RECONNECT_GRACE_MS } from "../cast";
 import { MAX_CONTEXTS } from "../lib";
+import { issueCastEmbed } from "./cast-test-client";
 
 const BROWSERD_DIR = join(import.meta.dir, "..");
 const CLI = join(BROWSERD_DIR, "..", "bin", "javis_browser.py");
@@ -138,6 +139,17 @@ function startFixtureServer() {
       if (path === "/a") return html("<title>A</title><h1>PAGE-A</h1><a id=l href='/b'>b</a>");
       if (path === "/b") return html("<title>B</title><h1>PAGE-B</h1><a id=l href='/c'>c</a>");
       if (path === "/c") return html("<title>C</title><h1>PAGE-C</h1>");
+      if (path === "/redirect-about") {
+        return new Response(null, { status: 302, headers: { location: "about:blank" } });
+      }
+      if (path === "/attachment") {
+        return new Response("DOWNLOAD-CONTENT", {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-disposition": "attachment; filename=blocked.txt",
+          },
+        });
+      }
       if (path === "/popup") return html("<title>POP</title><h1>POPUP-PAGE</h1>");
       if (path === "/click")
         return html(
@@ -260,7 +272,7 @@ async function waitLoading(port: number, token: string, want: boolean, ms = 2500
 
 // 첫 프레임까지 붙는 표준 cast 클라이언트.
 async function connectCast(port: number, token: string, sockets: WebSocket[], cid = "default") {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=${cid}`);
+  const ws = new WebSocket((await issueCastEmbed(port, token, cid)).wsUrl);
   sockets.push(ws);
   // ★수집은 open 직후부터 — 초기 동기화(nav·tabs·control)는 첫 프레임 전후로 지나가므로
   //   나중에 nextMsg 로 기다리면 이미 흘러간 뒤라 영원히 안 온다.
@@ -668,6 +680,42 @@ test("W-A 뒤로/앞으로: about:blank 를 건너뛴다 + canBack/canForward �
   });
 }, 180000);
 
+test("Browser v2 navigation policy — DOM scheme 전환·redirect·popup·download도 browserd가 차단한다", async () => {
+  await withServer("p3-nav-policy-", async ({ port, token, fx, sockets }) => {
+    expect((await rpc(port, token, "open", { url: `${fx}/a` })).ok).toBe(true);
+    const { ws } = await connectCast(port, token, sockets);
+
+    // 공개 RPC는 data/about을 허용하지 않는다(내부 newPage blank와 경계 분리).
+    expect((await rpc(port, token, "goto", { url: "data:text/html,blocked" })).error.code).toBe("SCHEME_DENIED");
+    expect((await rpc(port, token, "goto", { url: "about:blank" })).error.code).toBe("SCHEME_DENIED");
+
+    // 페이지 JS가 공개 메시지 게이트를 우회해 top-level scheme을 바꿔도 wirePage backstop이 복귀시킨다.
+    const domDenied = nextMsg(ws, (m) => m.type === "err" && m.code === "SCHEME_DENIED", 15000, "DOM scheme 차단");
+    await rpc(port, token, "eval", { expression: "setTimeout(function(){location.href='about:blank'},0),'armed'" });
+    await domDenied;
+    for (let i = 0; i < 50 && !(await rpc(port, token, "get", { what: "url" })).result?.url?.includes("/a"); i++) {
+      await sleep(100);
+    }
+    expect((await rpc(port, token, "get", { what: "url" })).result.url).toContain("/a");
+
+    // HTTP 시작점 뒤 금지 scheme redirect는 성공으로 보고되지 않고 금지 문서가 활성화되지 않는다.
+    const redirected = await rpc(port, token, "goto", { url: `${fx}/redirect-about` });
+    expect(redirected.ok).toBe(false);
+    expect((await rpc(port, token, "get", { what: "url" })).result.url).not.toBe("about:blank");
+
+    // popup은 commit 전/후 어느 쪽이든 금지 URL이 탭 목록에 잔류하지 않는다.
+    await rpc(port, token, "eval", { expression: "window.open('data:text/html,POP-BLOCKED','_blank')&&'opened'" });
+    await sleep(800);
+    const tabs = (await rpc(port, token, "tab", { action: "list" })).result.tabs;
+    expect(tabs.some((t: any) => String(t.url).startsWith("data:"))).toBe(false);
+
+    // navigation-triggered download는 임시 파일로 완료시키지 않고 typed error로 취소한다.
+    const downloadDenied = nextMsg(ws, (m) => m.type === "err" && m.code === "DOWNLOAD_DENIED", 15000, "download 차단");
+    await rpc(port, token, "eval", { expression: `location.href=${JSON.stringify(`${fx}/attachment`)},'armed'` });
+    await downloadDenied;
+  });
+}, 180000);
+
 // ════════════════════════════════════════════════════════════════════════
 // ⑤ W-B 탭 모델 (4-S-5 + 4-T-14)
 // ════════════════════════════════════════════════════════════════════════
@@ -756,7 +804,7 @@ test("W-B wirePage 멱등: 채택 경로가 두 번 돌아도 콘솔이 2배가 
 test("W-C 뷰포트: pane 크기 반영 + mapInput 정합 + 면적 캡 + 고정/해제", async () => {
   await withServer("p3-vp-", async ({ port, token, fx, sockets }) => {
     expect((await rpc(port, token, "open", { url: `${fx}/click` })).ok).toBe(true);
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=default`);
+    const ws = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(ws);
     expect(await wsOpen(ws, 10000)).toBe(true);
     let lastMeta: any = null;
@@ -1203,18 +1251,26 @@ test("P1-1 dialogSeen 리셋 대칭: pane 을 닫았다 재접속하면 사람 �
       a.ws.send(JSON.stringify({ type: "dialog-reply", id: d.id, action: "dismiss", text: "" }));
       await sleep(150);
     }
-    // pane 을 닫는다 → 마지막 클라이언트 이탈로 control 이 agent 로 복구되고 카운터도 함께 리셋돼야 한다.
+    // pane 을 닫아도 순간 재접속 grace 동안은 사람 lease를 유지하고, 경계 뒤 agent 복구와 함께
+    // dialogSeen이 리셋돼야 한다.
     a.ws.close();
     await sleep(1000);
+    expect((await ctxOf(port, token)).control).toBe("human");
+    await sleep(RECONNECT_GRACE_MS);
     expect((await ctxOf(port, token)).control).toBe("agent");
 
     // 재접속 후 사람이 다시 조작 → 다이얼로그가 **다시 사람에게 렌더**돼야 한다.
+    // 위 interval은 grace 동안 남은 alert를 모두 소진할 수 있다. 새 alert를 agent 상태에서 지연 예약한
+    // 뒤 human을 acquire해, 카운터 리셋 계약 자체만 결정론적으로 검증한다.
     const b = await connectCast(port, token, sockets);
+    expect((await rpc(port, token, "eval", {
+      expression: "(setTimeout(function(){alert('AFTER-RECONNECT')},500),'armed')",
+    })).ok).toBe(true);
     expect((await rpc(port, token, "control", { action: "acquire", actor: "human" })).ok).toBe(true);
     // 카운터가 잔존했다면 이 다이얼로그는 **무음 자동 dismiss** 되어 여기서 타임아웃한다.
     const again = await nextMsg(b.ws, (m) => m.type === "dialog", 15000, "재접속 후 dialog");
     console.log(`[P1-1] 재접속 후 사람 렌더=${again.message}`);
-    expect(String(again.message)).toContain("LOOP-");
+    expect(String(again.message)).toBe("AFTER-RECONNECT");
     b.ws.send(JSON.stringify({ type: "dialog-reply", id: again.id, action: "dismiss", text: "" }));
   });
 }, 180000);
@@ -1252,7 +1308,14 @@ test("P1-2/F2 rebind 사후 정리 + fid 프로세스 수명 단조: 전 클라�
 // 임의 호스트로 연결이 가능해진다 — 조용히 완화되기 가장 쉬운 자리다.
 test("P1-3 CSP 회귀 핀: cast 앱 응답 헤더의 exfil 차단 조각이 그대로 유지된다", async () => {
   await withServer("p3-csp-", async ({ port, token }) => {
-    const res = await fetch(`http://127.0.0.1:${port}/${token}/cast/`);
+    const parentOrigin = process.platform === "win32" ? "http://tauri.localhost" : "tauri://localhost";
+    const query = new URLSearchParams({
+      protocolVersion: "2",
+      embedGeneration: "1",
+      parentOrigin,
+      embedTicket: "a".repeat(64),
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/${token}/cast/?${query}`);
     expect(res.status).toBe(200);
     const csp = res.headers.get("content-security-policy") || "";
     console.log(`[P1-3] CSP=${csp}`);
@@ -1260,9 +1323,15 @@ test("P1-3 CSP 회귀 핀: cast 앱 응답 헤더의 exfil 차단 조각이 그�
     expect(csp).toContain("img-src data:"); // ★프레임은 data: 만 — https: 가 붙으면 exfil 이 열린다
     expect(csp).not.toContain("img-src data: https:");
     expect(csp).toContain(`connect-src ws://127.0.0.1:${port}`); // 자기 origin WS 만
-    expect(csp).toContain("frame-ancestors 'self'");
+    expect(csp).toContain(`frame-ancestors ${parentOrigin}`);
+    expect(csp).not.toContain("frame-ancestors 'self'");
+    expect(csp).not.toContain("*");
     // 파비콘 1차 드롭(4-T-4) — tabs 페이로드에 favicon 이 실리지 않는다(실리면 img-src 를 열어야 한다).
     expect(csp).not.toContain("https:");
+    const stale = await fetch(`http://127.0.0.1:${port}/${token}/cast/?protocolVersion=1&embedGeneration=1&parentOrigin=${encodeURIComponent(parentOrigin)}`);
+    expect(stale.status).toBe(409);
+    const hostile = await fetch(`http://127.0.0.1:${port}/${token}/cast/?protocolVersion=2&embedGeneration=1&parentOrigin=${encodeURIComponent("http://evil.example")}`);
+    expect(hostile.status).toBe(403);
   });
 }, 120000);
 
@@ -1534,17 +1603,25 @@ test("★M2 rebind 시 pendingAcks 정리: 옛 세대 fid 의 ack 는 새 세션
     expect((await rpc(port, token, "open", { url: `${fx}/a` })).ok).toBe(true);
 
     // ★자동 ack 하지 않는 클라이언트 — 프레임을 미-ack 로 남겨야 pendingAcks 에 엔트리가 쌓인다.
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/${token}/cast/ws?context=default`);
+    const ws = new WebSocket((await issueCastEmbed(port, token)).wsUrl);
     sockets.push(ws);
     const fids: number[] = [];
     const errs: any[] = [];
     let drainAcks = false; // ④단계 전까지는 **일부러 ack 하지 않는다**(미-ack 엔트리를 남겨야 한다)
+    let ackNextFrame = false;
+    let positiveAckFid = -1;
     ws.addEventListener("message", (ev: any) => {
       let m: any;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === "frame") {
         fids.push(m.fid);
-        if (drainAcks) ws.send(JSON.stringify({ type: "ack", fid: m.fid }));
+        if (drainAcks || ackNextFrame) {
+          ws.send(JSON.stringify({ type: "ack", fid: m.fid }));
+          if (ackNextFrame) {
+            positiveAckFid = m.fid;
+            ackNextFrame = false;
+          }
+        }
       }
       if (m.type === "err") errs.push(m);
     });
@@ -1572,14 +1649,17 @@ test("★M2 rebind 시 pendingAcks 정리: 옛 세대 fid 의 ack 는 새 세션
     console.log(`[M2] 옛 fid=${oldFids[0]} ack → ackRelayed ${a0}→${a1} · err=${errs.length}건`);
     expect(a1).toBe(a0); // 정리 누락이면 Δ1 (옛 sessionId 로 릴레이된다)
 
-    // ③ ★양성 대조 — 현 세대 fid 는 릴레이된다. 이게 없으면 "계수기가 멈춰서 Δ0" 을 못 가른다.
-    ws.send(JSON.stringify({ type: "ack", fid: newFids[newFids.length - 1] }));
+    // ③ ★양성 대조 — latest-frame-wins에서는 오래 보관한 fid가 새 프레임에 의해 이미 eviction될 수
+    // 있으므로, 다음 프레임을 수신 즉시 ack한다. 이게 없으면 "계수기가 멈춰서 Δ0" 을 못 가른다.
+    ackNextFrame = true;
+    ws.send(JSON.stringify({ type: "viewport", width: 901, height: 601, unpin: false }));
     let a2 = a1;
-    for (let i = 0; i < 20 && a2 === a1; i++) {
+    for (let i = 0; i < 40 && (a2 === a1 || positiveAckFid < 0); i++) {
       await sleep(150);
       a2 = (await castOf(port, token)).ackRelayed;
     }
-    console.log(`[M2] 현 세대 fid=${newFids[newFids.length - 1]} ack → ackRelayed ${a1}→${a2}`);
+    console.log(`[M2] 현 세대 fid=${positiveAckFid} ack → ackRelayed ${a1}→${a2}`);
+    expect(positiveAckFid).toBeGreaterThan(0);
     expect(a2).toBe(a1 + 1);
 
     // ④ ★미-ack 장부의 직접 관측 — 현 세대를 **전부 ack 해 비우면** 장부는 0 이어야 한다.

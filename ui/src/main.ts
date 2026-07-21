@@ -34,7 +34,14 @@ import {
   castFailureReason,
   castPaneTitle,
   castDisplayUrl,
-  isLoopbackOrigin,
+  CAST_PROTOCOL_VERSION,
+  acceptsCastMessage,
+  castParentOrigin,
+  newCastEmbedTicket,
+  initialCastPaneState,
+  reduceCastPaneState,
+  castPhaseEvent,
+  type CastPaneState,
   collectWebUrls,
 } from "./webpane";
 
@@ -2177,7 +2184,9 @@ interface WebPaneView extends PaneView {
   // · cast 앱 nav 보고를 pane 헤더에 반영.
   castReconnect?: () => void;
   ownsSource?: (src: unknown) => boolean;
+  acceptsCastEvent?: (origin: unknown, data: unknown) => boolean;
   castTitle?: (title: unknown, url: unknown) => void;
+  castPhase?: (data: unknown) => void;
 }
 
 const VIEW_BRIDGE_RETRY_MS = 5000;
@@ -2216,6 +2225,9 @@ function makeWebPane(node: WebNode): WebPaneView {
   let disposed = false;
   let themeCache: { bg: string; fg: string } | null = null;
   const isCast = isCastUrl(node.url); // cast 노드는 뷰어와 다른 로드 경로(아래 분기). 생성 시 확정.
+  let castState: CastPaneState = initialCastPaneState(0);
+  let castShellTimer: number | undefined;
+  let castFrameTimer: number | undefined;
 
   const showPlaceholder = (msg: string) => {
     placeholder.textContent = msg;
@@ -2224,14 +2236,27 @@ function makeWebPane(node: WebNode): WebPaneView {
   };
   const postTheme = () => {
     if (!themeCache) return;
+    let targetOrigin: string;
+    try {
+      targetOrigin = new URL(frame.src).origin;
+    } catch {
+      return;
+    }
+    if (!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(targetOrigin)) return;
     frame.contentWindow?.postMessage(
       { type: "cys-theme", vars: { "--bg": themeCache.bg, "--fg": themeCache.fg } },
-      "*",
+      targetOrigin,
     );
   };
   frame.addEventListener("load", () => {
-    placeholder.style.display = "none";
-    frame.style.visibility = "";
+    if (!isCast) {
+      placeholder.style.display = "none";
+      frame.style.visibility = "";
+    } else {
+      // iframe load는 HTTP 문서가 왔다는 뜻뿐이다. 인증 WS와 painted frame 이전에는 열지 않는다.
+      castState = reduceCastPaneState(castState, { type: "IFRAME_LOADED", generation: castState.generation });
+      el.dataset.castPhase = castState.phase;
+    }
     postTheme(); // 뷰어 색 = 터미널 테마(§14)
   });
 
@@ -2269,6 +2294,12 @@ function makeWebPane(node: WebNode): WebPaneView {
   let castLastFailure = ""; // 직전 ensure 실패 원인 — toast(8s)가 사라진 뒤에도 placeholder가 계속 인다
   let castLastToasted = ""; // 같은 원인 연속 실패 시 toast 1회만(폭주 상한)
   let castReconnectClick: ((e: MouseEvent) => void) | undefined;
+  const clearCastPhaseTimers = () => {
+    clearTimeout(castShellTimer);
+    clearTimeout(castFrameTimer);
+    castShellTimer = undefined;
+    castFrameTimer = undefined;
+  };
   const clearCastReconnectClick = () => {
     if (!castReconnectClick) return;
     placeholder.removeEventListener("click", castReconnectClick);
@@ -2276,15 +2307,30 @@ function makeWebPane(node: WebNode): WebPaneView {
     castReconnectClick = undefined;
   };
   // {port,token}으로 cast URL 재조립·하드가드·iframe 로드·node.url 갱신(뷰어 2243 동형 — 토큰 회전 저장).
-  const loadCastFrame = (port: number, token: string) => {
-    const url = castAppUrl(port, token, castContextOf(node.url));
+  const loadCastFrame = (port: number, token: string, embedGeneration: number) => {
+    const parentOrigin = castParentOrigin(window.location);
+    if (!parentOrigin) return showPlaceholder("지원하지 않는 앱 origin — 브라우저 로드 거부");
+    const url = castAppUrl(port, token, castContextOf(node.url), {
+      protocolVersion: CAST_PROTOCOL_VERSION,
+      embedGeneration,
+      parentOrigin,
+      embedTicket: newCastEmbedTicket(),
+    });
     if (!isAllowedWebPaneUrl(url)) return showPlaceholder("차단된 URL — 로드 거부"); // 하드 가드
     castLastFailure = ""; // 로드 성공 = 직전 실패 해소(다음 실패는 다시 고지된다)
     castLastToasted = "";
     node.url = url;
     urlEl.textContent = `127.0.0.1:${port}`;
     urlEl.title = url;
-    showPlaceholder("로딩 중…");
+    clearCastPhaseTimers();
+    castState = initialCastPaneState(embedGeneration);
+    renderCastState();
+    const generation = embedGeneration;
+    castShellTimer = window.setTimeout(() => {
+      if (disposed || castState.generation !== generation) return;
+      castState = reduceCastPaneState(castState, { type: "TIMEOUT", generation });
+      renderCastState();
+    }, 15_000);
     frame.src = url;
   };
   // active ensure — ensure_browserd_cast(spawn 허용). 버튼·재연결 클릭·postMessage 전용(=사람 의지).
@@ -2316,7 +2362,7 @@ function makeWebPane(node: WebNode): WebPaneView {
       castHeadfulToasted = true;
       toast("browser", "기존 headful 세션 재사용", "외부 브라우저 창과 병존합니다");
     }
-    loadCastFrame(state.port, state.token);
+    loadCastFrame(state.port, state.token, gen);
   };
   // cast 앱 nav 보고 → pane 헤더 갱신(설계 §3-1 "주소창·pane 헤더 갱신"의 부모 측 절반).
   // ★node.url은 절대 건드리지 않는다 — 그건 cast 앱 로드 URL이고, 페이지 URL로 덮으면 isCastUrl이
@@ -2342,6 +2388,39 @@ function makeWebPane(node: WebNode): WebPaneView {
     castReconnectClick = () => { clearCastReconnectClick(); castActiveEnsure(); }; // 클릭=사람 의지 → spawn 허용
     placeholder.addEventListener("click", castReconnectClick);
   };
+  const renderCastState = () => {
+    el.dataset.castPhase = castState.phase;
+    if (castState.phase === "FRAME_READY" || castState.phase === "LIVE" || castState.phase === "DEGRADED") {
+      // DEGRADED는 child의 마지막 canvas+재연결 overlay를 그대로 보존한다.
+      placeholder.style.display = "none";
+      frame.style.visibility = "";
+      return;
+    }
+    if (castState.phase === "SHELL_READY") return showPlaceholder("첫 화면 대기 중…");
+    if (castState.phase === "PENDING") return showPlaceholder("브라우저 셸 연결 중…");
+    const code = castState.errorCode ? ` [${castState.errorCode}]` : "";
+    if (castState.phase === "CLOSED") return showCastReconnectPlaceholder(`브라우저 세션 종료${code} — 클릭해 재연결`);
+    return showCastReconnectPlaceholder(`브라우저 연결 실패${code} — 클릭해 재연결`);
+  };
+  const applyCastPhase = (data: unknown) => {
+    const event = castPhaseEvent(data, castState.generation);
+    if (!event) return;
+    castState = reduceCastPaneState(castState, event);
+    if (castState.phase === "SHELL_READY") {
+      clearTimeout(castShellTimer);
+      castShellTimer = undefined;
+      clearTimeout(castFrameTimer);
+      const generation = castState.generation;
+      castFrameTimer = window.setTimeout(() => {
+        if (disposed || castState.generation !== generation) return;
+        castState = reduceCastPaneState(castState, { type: "TIMEOUT", generation });
+        renderCastState();
+      }, 20_000);
+    } else if (castState.phase !== "PENDING") {
+      clearCastPhaseTimers();
+    }
+    renderCastState();
+  };
   // passive load — 조회 전용(browserd_state·spawn 없음). 부팅·복원이 Chromium을 자동 기동하지 않는다:
   // alive면 재연결, 아니면 "클릭해 재연결" placeholder(사람 클릭에서만 active ensure).
   const castPassiveLoad = async () => {
@@ -2360,7 +2439,7 @@ function makeWebPane(node: WebNode): WebPaneView {
     if (!state.alive || state.port === undefined || state.token === undefined) {
       return showCastReconnectPlaceholder("브라우저 꺼짐 — 클릭해 재연결");
     }
-    loadCastFrame(state.port, state.token);
+    loadCastFrame(state.port, state.token, gen);
   };
 
   closeBtn.addEventListener("click", () => closeWebPane(node.wid));
@@ -2378,6 +2457,7 @@ function makeWebPane(node: WebNode): WebPaneView {
     dispose: () => {
       disposed = true;
       clearTimeout(retryTimer);
+      clearCastPhaseTimers();
       clearCastReconnectClick();
       // 리스크 7 — iframe 제거만으로도 브라우저가 WS를 닫지만 그 보장에 **단독 의존하지 않는다**:
       // about:blank로 갈아끼워 WS 종료를 명시 유발한다(clients 0 → browserd가 screencast 중단).
@@ -2391,7 +2471,14 @@ function makeWebPane(node: WebNode): WebPaneView {
     // iframe(event.source)이 이 pane인지 frame.contentWindow로 식별한다.
     view.castReconnect = castActiveEnsure;
     view.ownsSource = (src) => src != null && src === frame.contentWindow;
+    view.acceptsCastEvent = (origin, data) => acceptsCastMessage({
+      frameUrl: frame.src,
+      eventOrigin: origin,
+      sourceMatches: true,
+      data,
+    });
     view.castTitle = applyCastTitle;
+    view.castPhase = applyCastPhase;
   }
   webPanes.set(node.wid, view);
   return view;
@@ -5864,21 +5951,26 @@ document.getElementById("btn-browser")?.addEventListener("click", () => openCast
 // cast 앱 → 부모: 연결 끊김 후 사람이 "재연결" 클릭 시 postMessage. 발신 iframe을 event.source로
 // 특정해 그 cast pane만 active ensure 재실행(spawn=사람 의지·타 pane 무영향).
 window.addEventListener("message", (event) => {
-  const data = event.data as { type?: string; title?: unknown; url?: unknown } | null;
+  const data = event.data as {
+    type?: string;
+    title?: unknown;
+    url?: unknown;
+    protocolVersion?: unknown;
+    embedGeneration?: unknown;
+  } | null;
   const type = data?.type;
   // 재연결(spawn 유발)과 nav 보고(헤더 갱신)를 같은 리스너·같은 게이트로 처리한다 — 신규 표면 0.
-  if (type !== "cys-cast-reconnect" && type !== "cys-cast-title") return;
-  // 방어심층 2중 게이트 — 재연결은 프로세스 spawn을 유발하므로 발신자를 두 번 확인한다:
-  // ①origin이 loopback 형태인가(장차 cast iframe이 3자 콘텐츠를 실어도 형태 게이트가 남는다)
-  // ②발신 iframe이 실제 우리 cast pane인가(ownsSource — 현재의 실질 방어). 둘 다 통과해야 반영.
-  if (!isLoopbackOrigin(event.origin)) return;
+  if (type !== "cys-cast-reconnect" && type !== "cys-cast-title" && type !== "cys-cast-phase") return;
+  // source·현재 iframe의 exact origin·protocolVersion·embedGeneration 네 조건을 모두 통과해야 한다.
+  // 같은 contentWindow가 navigation 뒤 재사용돼도 이전 document의 늦은 메시지는 generation에서 탈락한다.
   let target: WebPaneView | undefined;
   for (const v of webPanes.values()) {
-    if (v.ownsSource?.(event.source)) { target = v; break; }
+    if (v.ownsSource?.(event.source) && v.acceptsCastEvent?.(event.origin, data)) { target = v; break; }
   }
   if (!target) return;
   if (type === "cys-cast-reconnect") target.castReconnect?.();
-  else target.castTitle?.(data?.title, data?.url);
+  else if (type === "cys-cast-title") target.castTitle?.(data?.title, data?.url);
+  else target.castPhase?.(data);
 });
 document.getElementById("btn-split-h")!.addEventListener("click", () => actionSplit("row"));
 document.getElementById("btn-split-v")!.addEventListener("click", () => actionSplit("col"));

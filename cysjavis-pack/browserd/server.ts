@@ -25,7 +25,14 @@ import {
 } from "./lib";
 import {
   CAST_APP_HTML,
+  CAST_PROTOCOL_VERSION,
   castRoute,
+  resolveCastParentOrigin,
+  castContentSecurityPolicy,
+  LatestFrameFlow,
+  CastEmbedTicketRegistry,
+  RECONNECT_GRACE_MS,
+  reconnectGraceDecision,
   parseClientMsg,
   mapInput,
   navErrorMessage,
@@ -43,6 +50,8 @@ import {
 } from "./cast";
 
 const HEADLESS = process.argv.includes("--headless") || process.env.CYS_BROWSER_HEADLESS === "1";
+const CAST_BUILD_MODE = process.env.CYS_BROWSER_DEV === "1" ? "development" : "production";
+const CAST_DEVELOPMENT_PARENT_ORIGIN = process.env.CYS_BROWSER_PARENT_ORIGIN || null;
 
 type Control = "agent" | "human";
 // 콘솔 링버퍼 항목 — 웹 페이지가 낸 출력이라 비신뢰 데이터다(UNTRUSTED 라벨 아래에서만 노출).
@@ -113,6 +122,8 @@ const pickBound = new WeakSet<Page>();
 const pickResolvers = new Map<Page, (data: any) => void>();
 // 4-T-14: wirePage 멱등화 — "adoptPage 재사용" 문구가 이중 배선을 유도한다(콘솔 2배·유령 탭).
 const wiredPages = new WeakSet<Page>();
+const lastAllowedPageUrl = new WeakMap<Page, string>();
+const quarantiningPage = new WeakSet<Page>();
 // 마지막 탭이 닫힐 때 about:blank 재생성이 두 경로(명시 호출 + close 이벤트)에서 겹치는 것을 막는다.
 const recreatingBlank = new Set<string>();
 
@@ -126,7 +137,7 @@ interface CastEntry {
   cdp: CDPSession | null;
   clients: Set<ServerWebSocket<CastData>>;
   lastMeta: { deviceWidth: number; deviceHeight: number } | null;
-  pendingAcks: Map<number, number>; // fid → 원본 CDP sessionId. 존재=미-ack, 삭제=ack 완료(=fid dedup)
+  pendingAcks: LatestFrameFlow<number>; // fid → 원본 CDP sessionId, 최신 1개만 보존·fid별 exactly-once
   lastPushAt: number; // 프레임률 상한용 마지막 push 시각
   lastFrame: { fid: number; data: string; metadata: any } | null; // 신규 클라이언트 즉시 렌더용
   starting: boolean; // 최초 스크린캐스트 기동 진행중(동시 접속이 이중 start 하지 않게)
@@ -142,6 +153,8 @@ interface CastEntry {
   // 크기·탭 변경 직후 30fps 상한을 면제하는 창(epoch ms). 정적 페이지는 변경 후 프레임을 딱
   // 1장 내는데 그게 33ms 상한에 걸려 버려지면 **복구 프레임이 영영 없다**(구현 중 실측 재현).
   forceUntil: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  emptySince: number | null;
 }
 const castHub = new Map<string, CastEntry>();
 // ★fid 는 **browserd 프로세스 수명 동안** 단조 증가하며 어떤 이유로도 리셋하지 않는다(4-T-2).
@@ -157,7 +170,6 @@ const BAD_MSG_CAP = 10;
 // 그래서 dedup 키는 서버 부여 fid 여야 하고, CDP 에는 매 프레임 ack 가 도달해야 한다.
 // ack 가 한 프레임이라도 누락되면 스트림이 영구 스톨한다(대조 실측: 무-ack 0fps).
 const MIN_FRAME_INTERVAL_MS = 33; // ≈30fps 상한(무제한 시 ~92fps — 대역·CPU 과다)
-const PENDING_ACK_CAP = 64; // 미-ack 누적 상한(클라이언트 무응답·이탈 시 누수 차단)
 const FORCE_FRAME_WINDOW_MS = 1000; // attach·탭 전환 직후 상한 면제 창
 // 뷰포트 변경은 더 길게 연다. 정적 페이지는 크기 변경 후 프레임을 1장만 내는데, 부하가 걸리면
 // 그 1장이 창 밖으로 밀려 버려지고 **복구 프레임이 영영 없다**(전체 스위트 동시 실행에서 재현).
@@ -247,12 +259,9 @@ async function castAttach(cid: string, h: CastEntry, page: Page, cdp?: CDPSessio
     }
     h.lastPushAt = now;
     const fid = ++frameIdSeq; // ★리셋 금지(4-T-2) — 모듈 전역이라 hub 재생성에도 이어진다
-    h.pendingAcks.set(fid, params.sessionId);
-    // 미-ack 누적 상한 — 최고참을 CDP ack 후 폐기해 누수와 스톨을 동시에 막는다.
-    while (h.pendingAcks.size > PENDING_ACK_CAP) {
-      const oldest: number = h.pendingAcks.keys().next().value;
-      const sid = h.pendingAcks.get(oldest)!;
-      h.pendingAcks.delete(oldest);
+    // 최신 프레임 하나만 미확인으로 둔다. 느린/중단 client 때문에 구 프레임이 남아 있으면
+    // controller가 즉시 방출하고 여기서 CDP ack해 backlog와 스트림 stall을 동시에 막는다.
+    for (const sid of h.pendingAcks.offer(fid, params.sessionId)) {
       sess.send("Page.screencastFrameAck", { sessionId: sid }).catch(() => {});
     }
     // 신규 클라이언트 즉시 렌더용 캐시(정적 페이지는 다음 프레임이 영영 안 온다).
@@ -327,13 +336,16 @@ function castDetach(hub: CastEntry, keepFrame = false) {
   if (hub.navPage && hub.navHandler) hub.navPage.off("framenavigated", hub.navHandler);
   hub.navHandler = null;
   hub.navPage = null;
-  hub.pendingAcks.clear();
+  const pending = hub.pendingAcks.drain();
   hub.lastMeta = null;
   if (!keepFrame) hub.lastFrame = null;
   const cdp = hub.cdp;
   hub.cdp = null;
   if (!cdp) return;
   (async () => {
+    for (const sid of pending) {
+      await cdp.send("Page.screencastFrameAck", { sessionId: sid }).catch(() => {});
+    }
     await cdp
       .send("Page.stopScreencast")
       .then(() => {
@@ -422,6 +434,9 @@ function castCleanupIfEmpty(cid: string, expect?: CastEntry) {
   if (!hub || hub.clients.size > 0) return;
   if (expect && hub !== expect) return; // 이미 교체된 hub 는 건드리지 않는다
   if (hub.starting || hub.rebinding) return; // 진행중 경로가 끝나며 스스로 정리한다
+  if (hub.reconnectTimer) clearTimeout(hub.reconnectTimer);
+  hub.reconnectTimer = null;
+  hub.emptySince = null;
   const c = contexts.get(cid);
   // 조작권 복구: 안 되돌리면 pane 을 닫아도 control=human 으로 고착해 이후 모든 에이전트
   // 변경성 동사가 HUMAN_ACTIVE(exit 6)로 거부된다(자율주행 중 워커가 원인불명으로 막힘).
@@ -435,6 +450,33 @@ function castCleanupIfEmpty(cid: string, expect?: CastEntry) {
   if (hub.tabsTimer) clearTimeout(hub.tabsTimer);
   castHub.delete(cid);
   castDetach(hub);
+}
+
+function cancelReconnectGrace(hub: CastEntry) {
+  if (hub.reconnectTimer) clearTimeout(hub.reconnectTimer);
+  hub.reconnectTimer = null;
+  hub.emptySince = null;
+}
+
+// 정상적으로 살아 있던 WS의 마지막 close만 grace를 탄다. cold-start 실패·context close 같은
+// 명시 실패 경로는 castCleanupIfEmpty를 직접 호출해 즉시 정리한다.
+function scheduleReconnectCleanup(cid: string, expect: CastEntry) {
+  if (castHub.get(cid) !== expect || expect.clients.size > 0) return;
+  if (expect.emptySince === null) expect.emptySince = Date.now();
+  if (expect.reconnectTimer) return;
+  const elapsed = Date.now() - expect.emptySince;
+  const waitMs = Math.max(0, RECONNECT_GRACE_MS - elapsed);
+  expect.reconnectTimer = setTimeout(() => {
+    expect.reconnectTimer = null;
+    if (castHub.get(cid) !== expect) return;
+    const decision = reconnectGraceDecision({
+      clientCount: expect.clients.size,
+      emptySince: expect.emptySince,
+      now: Date.now(),
+    });
+    if (decision === "cleanup") castCleanupIfEmpty(cid, expect);
+    else if (expect.clients.size === 0) scheduleReconnectCleanup(cid, expect);
+  }, waitMs);
 }
 
 function touch() {
@@ -657,6 +699,13 @@ async function onNewPage(newPage: Page) {
     }
   }
   if (!cid) return; // 우리가 추적하는 페이지의 자식이 아니면 무시
+  const initialUrl = newPage.url();
+  const initialError = navigableUrlError(initialUrl);
+  if (initialUrl !== BLANK_URL && initialError) {
+    reportNavigationPolicyDenied(cid, "SCHEME_DENIED", `popup 이동 차단 — ${initialError}`);
+    await newPage.close().catch(() => {});
+    return;
+  }
   await adoptPage(cid, newPage, true).catch(() => {});
 }
 
@@ -769,11 +818,69 @@ async function ensureBrowser(profile: "agent" | "human" = "agent"): Promise<Brow
   return launchingCtx.agent;
 }
 
+// 공개 navigation 게이트를 우회하는 유일한 내부 blank 생성 경로. Chromium newPage()의 초기
+// about:blank를 그대로 사용하며 URL 인자를 받지 않으므로 RPC/WS 사용자가 특권 스킴을 밀어 넣을
+// 수 없다. cast cold-start와 마지막 탭 재생성만 이 의미를 공유한다.
+async function ensureInternalBlankContext(cid: string, profile: "agent" | "human"): Promise<Ctx> {
+  assertCidProfileMatch(cid, profile);
+  const prior = contexts.get(cid);
+  if (prior) {
+    if (prior.profile !== profile) {
+      throw new RpcError("PROFILE_MISMATCH", `컨텍스트 '${cid}' 는 ${prior.profile} 프로필이다 — ${profile} 요청 거부`);
+    }
+    return prior;
+  }
+  if (contexts.size >= MAX_CONTEXTS) {
+    throw new RpcError("BUSY", `context 동시 상한 ${MAX_CONTEXTS} 초과 — backoff 후 재시도`);
+  }
+  const bc = await ensureBrowser(profile);
+  const page = await bc.newPage();
+  const created: Ctx = {
+    page,
+    pages: [page],
+    control: "agent",
+    profile,
+    consoleBuf: [],
+    loading: false,
+    loadingSince: 0,
+    viewport: { ...DEFAULT_VIEWPORT },
+    viewportPin: null,
+    viewportHuman: null,
+    dialogSeen: 0,
+  };
+  contexts.set(cid, created); // wire 훅이 즉시 context를 조회할 수 있게 등록이 먼저다
+  wirePage(page, cid);
+  return created;
+}
+
 // 페이지 공통 배선 — open·팝업 채택·tab new 가 **같은 헬퍼**를 쓴다(4-S-13 공통화).
 // ★WeakSet 멱등화(4-T-14): 같은 페이지에 두 번 불려도 훅이 2배로 붙지 않는다.
 function wirePage(page: Page, cid: string) {
   if (wiredPages.has(page)) return;
   wiredPages.add(page);
+  const initialUrl = page.url();
+  if (!navigableUrlError(initialUrl)) lastAllowedPageUrl.set(page, initialUrl);
+  else if (initialUrl !== BLANK_URL) {
+    quarantinePageNavigation(cid, page, initialUrl, navigableUrlError(initialUrl)!).catch(() => {});
+  }
+  page.on("framenavigated", (frame: any) => {
+    if (frame !== page.mainFrame() || quarantiningPage.has(page)) return;
+    const url = frame.url();
+    const policyError = navigableUrlError(url);
+    if (!policyError) {
+      lastAllowedPageUrl.set(page, url);
+      return;
+    }
+    // DOM redirect/location, popup commit, history 등 공개 함수 밖에서 발생한 top-level 이동의 backstop.
+    // Chromium이 commit한 직후 즉시 격리하고 마지막 HTTP(S) 문서로 복귀한다.
+    quarantinePageNavigation(cid, page, url, policyError).catch(() => {});
+  });
+  page.on("download", (download: any) => {
+    // 이번 범위는 다운로드 관리자/OS 파일 통합이 아니다. 임시 파일까지 남기지 않고 즉시 취소하며
+    // 사람에게 typed error를 보낸다. 브라우징 실패로 프로세스를 죽이지 않는다.
+    download.cancel().catch(() => {});
+    reportNavigationPolicyDenied(cid, "DOWNLOAD_DENIED", "다운로드는 이 버전에서 지원하지 않습니다.");
+  });
   page.on("dialog", (d: Dialog) => {
     handleDialog(cid, page, d).catch(() => {});
   });
@@ -805,6 +912,36 @@ function wirePage(page: Page, cid: string) {
   page.on("close", () => {
     onPageClosed(cid, page).catch(() => {});
   });
+}
+
+function reportNavigationPolicyDenied(cid: string, code: string, message: string) {
+  pushConsole(cid, "navigation-policy", `${code}: ${message}`, contexts.get(cid)?.page.url() || "");
+  castBroadcastTo(cid, msgErr(code, message));
+}
+
+async function quarantinePageNavigation(cid: string, page: Page, deniedUrl: string, policyError: string) {
+  if (quarantiningPage.has(page) || page.isClosed()) return;
+  quarantiningPage.add(page);
+  const scheme = (() => { try { return new URL(deniedUrl).protocol; } catch { return "unknown:"; } })();
+  reportNavigationPolicyDenied(cid, "SCHEME_DENIED", `${scheme} top-level 이동 차단 — ${policyError}`);
+  try {
+    // history 복귀가 원래 문서와 상태를 가장 잘 보존한다. 실패/부재 시 마지막 검증 HTTP(S) URL,
+    // 그것도 없으면 내부 blank로만 낙하한다(공개 URL 입력을 받지 않는 private recovery).
+    await page.goBack({ waitUntil: "commit", timeout: 10_000 }).catch(() => null);
+    if (navigableUrlError(page.url())) {
+      const fallback = lastAllowedPageUrl.get(page);
+      if (fallback && !navigableUrlError(fallback)) {
+        await page.goto(fallback, { waitUntil: "commit", timeout: 10_000 }).catch(() => null);
+      }
+    }
+    if (navigableUrlError(page.url())) {
+      await page.goto(BLANK_URL, { waitUntil: "commit", timeout: 10_000 }).catch(() => null);
+    }
+    if (!navigableUrlError(page.url())) lastAllowedPageUrl.set(page, page.url());
+  } finally {
+    quarantiningPage.delete(page);
+    await pushNav(cid).catch(() => {});
+  }
 }
 
 // 다이얼로그(alert/confirm/prompt) — control=human 이면 사람에게 렌더하고, 아니면 자동 dismiss.
@@ -898,8 +1035,9 @@ async function navState(cid: string, page: Page) {
     const h: any = await withCdp(cid, page, (s) => s.send("Page.getNavigationHistory" as any));
     const entries: any[] = h?.entries || [];
     const idx: number = h?.currentIndex ?? 0;
-    canBack = entries.slice(0, idx).some((e) => e?.url !== BLANK_URL);
-    canForward = idx >= 0 && idx < entries.length - 1;
+    canBack = entries.slice(0, idx).some((e) => typeof e?.url === "string" && !navigableUrlError(e.url));
+    canForward = idx >= 0 && idx < entries.length - 1
+      && typeof entries[idx + 1]?.url === "string" && !navigableUrlError(entries[idx + 1].url);
   } catch {
     // 페이지가 닫히는 중이면 히스토리를 못 읽는다 — fail-closed(이동 불가로 판정).
   }
@@ -1020,6 +1158,7 @@ async function navAction(cid: string, action: "back" | "forward" | "reload" | "s
     return { ok: true, url: page.url() };
   }
   if (action === "reload") {
+    if (page.url() !== BLANK_URL) assertNavigableUrl(page.url());
     setLoading(cid, page, true);
     try {
       // ★reject 를 반드시 다룬다(4-S-13) — 중지가 유발한 abort 는 오류가 아니다.
@@ -1039,7 +1178,7 @@ async function navAction(cid: string, action: "back" | "forward" | "reload" | "s
   let target: any = null;
   if (action === "back") {
     for (let i = idx - 1; i >= 0; i--) {
-      if (entries[i]?.url !== BLANK_URL) {
+      if (typeof entries[i]?.url === "string" && !navigableUrlError(entries[i].url)) {
         target = entries[i];
         break;
       }
@@ -1049,6 +1188,7 @@ async function navAction(cid: string, action: "back" | "forward" | "reload" | "s
   }
   // 연타 시맨틱(4-S-13): 인덱스를 **선계산**해 이동 불가면 즉시 거부한다(버튼도 비활성 상태다).
   if (!target) throw new RpcError("NAV_UNAVAILABLE", `${action} 불가 — 이동할 기록이 없다`);
+  assertNavigableUrl(target.url); // v1 잔존/외부 변조 history도 재진입시키지 않는다
   setLoading(cid, page, true);
   const settled = waitMainNav(page, 15000);
   await withCdp(cid, page, (s) => s.send("Page.navigateToHistoryEntry" as any, { entryId: target.id }));
@@ -1083,10 +1223,9 @@ async function applyViewport(cid: string, width: number, height: number) {
   if (hub?.cdp) {
     // ★재발행 전에 미-ack 를 CDP 로 흘려보내고 비운다. 그냥 비우면 그 프레임의 ack 가 영영
     // CDP 에 도달하지 않아 스트림이 그 자리에서 영구 스톨한다(구현 중 실측 재현 — 프레임 0).
-    for (const [, sid] of hub.pendingAcks) {
+    for (const sid of hub.pendingAcks.drain()) {
       await hub.cdp.send("Page.screencastFrameAck", { sessionId: sid }).catch(() => {});
     }
-    hub.pendingAcks.clear();
     hub.forceUntil = Date.now() + VIEWPORT_FORCE_WINDOW_MS;
     hub.capW = vp.width;
     hub.capH = vp.height;
@@ -1425,29 +1564,7 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
       if (prior && prior.profile !== profile) {
         throw new RpcError("PROFILE_MISMATCH", `컨텍스트 '${cid}' 는 ${prior.profile} 프로필이다 — ${profile} 요청 거부`);
       }
-      if (!contexts.has(cid) && contexts.size >= MAX_CONTEXTS) {
-        throw new RpcError("BUSY", `context 동시 상한 ${MAX_CONTEXTS} 초과 — backoff 후 재시도`);
-      }
-      const bc = await ensureBrowser(profile);
-      let c = contexts.get(cid);
-      if (!c) {
-        const page = await bc.newPage();
-        c = {
-          page,
-          pages: [page],
-          control: "agent",
-          profile,
-          consoleBuf: [],
-          loading: false,
-          loadingSince: 0,
-          viewport: { ...DEFAULT_VIEWPORT },
-          viewportPin: null,
-          viewportHuman: null,
-          dialogSeen: 0,
-        };
-        contexts.set(cid, c);
-        wirePage(page, cid); // 배선은 contexts 등록 뒤 — 콘솔 훅이 ctx 를 찾을 수 있어야 한다
-      }
+      const c = await ensureInternalBlankContext(cid, profile);
       // ★PRE-1: 기존 컨텍스트 재사용도 프로필 게이트 대상이다. 이게 없으면 에이전트가
       // 박사님 로그인 세션을 임의 URL 로 이동시키고 조회 동사로 그 내용을 읽는다.
       // (dispatch 의 중앙 게이트가 이미 걸지만, 컨텍스트가 이 case 안에서 생성될 수도 있어
@@ -1910,6 +2027,10 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
 
 // --- HTTP 서버 (127.0.0.1, port 0) ---
 const token = genToken();
+// 프로세스마다 바뀌는 비공개 runtime identity. ticket이 구 browserd 재기동을 넘어 재사용되지 않게
+// registry descriptor에 결합한다. state/로그/응답에는 노출하지 않는다.
+const castRuntimeId = genToken();
+const castEmbedTickets = new CastEmbedTicketRegistry();
 
 // 상수시간 토큰 비교(F6) — 길이 불일치는 즉시 false(timingSafeEqual은 길이 다르면 throw).
 // 둘 다 hex 토큰이라 latin1 바이트 인코딩으로 충분하고, 길이 정보 누출은 토큰 자릿수 고정이라 무해.
@@ -1936,14 +2057,52 @@ const server = Bun.serve({
         return new Response(JSON.stringify({ ok: false, error: { code: "BAD_METHOD", message: "GET only" } }), { status: 405 });
       }
       if (route.kind === "app") {
+        const packagedParent = process.platform === "win32" ? "http://tauri.localhost" : "tauri://localhost";
+        const requestedParent = url.searchParams.get("parentOrigin") || packagedParent;
+        const parentOrigin = resolveCastParentOrigin({
+          platform: process.platform,
+          mode: CAST_BUILD_MODE,
+          requested: requestedParent,
+          developmentOrigin: CAST_DEVELOPMENT_PARENT_ORIGIN,
+        });
+        if (!parentOrigin) {
+          return new Response(JSON.stringify({ ok: false, error: { code: "BAD_PARENT_ORIGIN", message: "parent origin denied" } }), {
+            status: 403,
+          });
+        }
+        // Protocol v2는 legacy fallback이 없다. 네 필드 중 하나라도 없거나 버전이 다르면 명시 실패한다.
+        const protocolRaw = url.searchParams.get("protocolVersion");
+        const generationRaw = url.searchParams.get("embedGeneration");
+        const embedTicket = url.searchParams.get("embedTicket") || "";
+        const generation = Number(generationRaw);
+        if (Number(protocolRaw) !== CAST_PROTOCOL_VERSION || !Number.isSafeInteger(generation) || generation < 1) {
+          return new Response(JSON.stringify({ ok: false, error: { code: "PROTOCOL_MISMATCH", message: "unsupported cast embed" } }), {
+            status: 409,
+          });
+        }
+        const context = url.searchParams.get("context") || "default";
+        const ticketIssue = castEmbedTickets.issue({
+          ticket: embedTicket,
+          runtimeId: castRuntimeId,
+          context,
+          protocolVersion: CAST_PROTOCOL_VERSION,
+          embedGeneration: generation,
+          parentOrigin,
+        });
+        if (ticketIssue !== "issued") {
+          const code = ticketIssue === "duplicate" ? "EMBED_TICKET_REPLAY" : "EMBED_TICKET_INVALID";
+          return new Response(JSON.stringify({ ok: false, error: { code, message: "cast embed ticket denied" } }), {
+            status: ticketIssue === "duplicate" ? 409 : 401,
+          });
+        }
         return new Response(CAST_APP_HTML, {
           headers: {
             "content-type": "text/html; charset=utf-8",
-            // 외부 exfil 차단. 프레임=data: 이미지, WS=자기 origin 만.
-            // frame-ancestors 'self' — 이 앱은 자기 origin(cys pane iframe)에서만 임베드된다(방어심층).
+            // 외부 exfil 차단. 프레임=data: 이미지, WS=자기 origin 만. frame-ancestors는
+            // 요청 descriptor를 exact platform parent로 검증한 값 하나뿐이다.
             // ★4-T-4: 파비콘을 URL 로 로드하려면 img-src 에 https: 를 열어야 하고 그 순간 외부
             //   exfil 차단이 사라진다 → 1차에서 파비콘은 드롭한다(이 문자열은 회귀 핀으로 고정).
-            "content-security-policy": `default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src ws://127.0.0.1:${srv.port}; frame-ancestors 'self'`,
+            "content-security-policy": castContentSecurityPolicy(srv.port, parentOrigin),
           },
         });
       }
@@ -1954,6 +2113,28 @@ const server = Bun.serve({
         return new Response(JSON.stringify({ ok: false, error: { code: "FORBIDDEN", message: "bad origin" } }), { status: 403 });
       }
       const context = url.searchParams.get("context") || "default";
+      const requestedParent = url.searchParams.get("parentOrigin");
+      const parentOrigin = resolveCastParentOrigin({
+        platform: process.platform,
+        mode: CAST_BUILD_MODE,
+        requested: requestedParent,
+        developmentOrigin: CAST_DEVELOPMENT_PARENT_ORIGIN,
+      });
+      const generation = Number(url.searchParams.get("embedGeneration"));
+      const ticketResult = parentOrigin ? castEmbedTickets.consume({
+        ticket: url.searchParams.get("embedTicket") || "",
+        runtimeId: castRuntimeId,
+        context,
+        protocolVersion: Number(url.searchParams.get("protocolVersion")),
+        embedGeneration: generation,
+        parentOrigin,
+      }) : "mismatch";
+      if (ticketResult !== "accepted") {
+        return new Response(JSON.stringify({
+          ok: false,
+          error: { code: `EMBED_TICKET_${ticketResult.toUpperCase()}`, message: "cast websocket ticket denied" },
+        }), { status: 401 });
+      }
       const upgraded = srv.upgrade<CastData>(req, { data: { context, badMsg: 0 } });
       if (upgraded) return undefined; // Bun 이 업그레이드 응답 처리
       return new Response(JSON.stringify({ ok: false, error: { code: "UPGRADE_FAILED", message: "ws upgrade failed" } }), {
@@ -2002,7 +2183,7 @@ const server = Bun.serve({
           cdp: null,
           clients: new Set(),
           lastMeta: null,
-          pendingAcks: new Map(),
+          pendingAcks: new LatestFrameFlow<number>(1),
           lastPushAt: 0,
           lastFrame: null,
           starting: false,
@@ -2016,9 +2197,12 @@ const server = Bun.serve({
           capW: DEFAULT_VIEWPORT.width,
           capH: DEFAULT_VIEWPORT.height,
           forceUntil: 0,
+          reconnectTimer: null,
+          emptySince: null,
         };
         castHub.set(cid, hub);
       }
+      cancelReconnectGrace(hub);
       hub.clients.add(ws);
       const h = hub;
 
@@ -2029,7 +2213,7 @@ const server = Bun.serve({
       if (!c) {
         // open 동사 재사용 — agent 프로필·dialog 핸들러·MAX_CONTEXTS 게이트 자동 승계.
         try {
-          await dispatch("open", { url: BLANK_URL, context: cid });
+          await ensureInternalBlankContext(cid, "agent");
         } catch (e: any) {
           try {
             ws.send(JSON.stringify(msgErr(e?.code || "OPEN_FAILED", String(e?.message || e))));
@@ -2130,9 +2314,8 @@ const server = Bun.serve({
             // 클라이언트가 준 fid 를 서버 상태로 신뢰하지 않는다 — 서버가 발급하고 아직 확인되지
             // 않은 fid 만 유효하다. 미발급·이미 처리된 fid 는 상태를 건드리지 않고 조용히 무시한다.
             // (4-S-8: ack 는 조작 의사가 아니므로 control 을 절대 acquire 하지 않는다.)
-            const sid = hub.pendingAcks.get(m.fid);
-            if (hub.cdp && sid !== undefined) {
-              hub.pendingAcks.delete(m.fid); // 삭제=이미 ack 함 → fid당 1회만 릴레이(dedup)
+            const sid = hub.pendingAcks.acknowledge(m.fid);
+            if (hub.cdp && sid !== null) {
               await hub.cdp.send("Page.screencastFrameAck", { sessionId: sid });
               castStats.ackRelayed++;
             }
@@ -2306,7 +2489,7 @@ const server = Bun.serve({
       const hub = castHub.get(cid);
       if (!hub) return; // hub 는 open 진입 즉시 등록되므로 여기 도달 = 이미 정리됨
       hub.clients.delete(ws);
-      castCleanupIfEmpty(cid, hub);
+      scheduleReconnectCleanup(cid, hub);
     },
   },
 });

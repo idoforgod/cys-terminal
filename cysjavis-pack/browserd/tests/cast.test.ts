@@ -1,9 +1,96 @@
 // cast.test.ts — cast 순수 로직 단위 테스트(bun test). 브라우저 미기동.
 // castRoute·parseClientMsg·mapInput·CAST_APP_HTML 마커.
 import { test, expect } from "bun:test";
-import { castRoute, parseClientMsg, mapInput, CAST_APP_HTML } from "../cast";
+import {
+  castRoute,
+  parseClientMsg,
+  mapInput,
+  CAST_APP_HTML,
+  CAST_PROTOCOL_VERSION,
+  resolveCastParentOrigin,
+  castContentSecurityPolicy,
+  LatestFrameFlow,
+  RECONNECT_GRACE_MS,
+  reconnectGraceDecision,
+  CastEmbedTicketRegistry,
+} from "../cast";
 
 const TOK = "abc123def456";
+
+test("Cast embed policy — 플랫폼별 exact parent origin과 wildcard 없는 CSP/targetOrigin", () => {
+  expect(CAST_PROTOCOL_VERSION).toBe(2);
+  expect(resolveCastParentOrigin({ platform: "darwin", mode: "production", requested: "tauri://localhost" }))
+    .toBe("tauri://localhost");
+  expect(resolveCastParentOrigin({ platform: "win32", mode: "production", requested: "http://tauri.localhost" }))
+    .toBe("http://tauri.localhost");
+  expect(resolveCastParentOrigin({ platform: "darwin", mode: "production", requested: "http://tauri.localhost" }))
+    .toBeNull();
+  expect(resolveCastParentOrigin({
+    platform: "darwin",
+    mode: "development",
+    requested: "http://localhost:1420",
+    developmentOrigin: "http://localhost:1420",
+  })).toBe("http://localhost:1420");
+  expect(resolveCastParentOrigin({
+    platform: "darwin",
+    mode: "development",
+    requested: "http://evil.example",
+    developmentOrigin: "http://evil.example",
+  })).toBeNull();
+
+  const csp = castContentSecurityPolicy(51234, "tauri://localhost");
+  expect(csp).toContain("frame-ancestors tauri://localhost");
+  expect(csp).not.toContain("frame-ancestors 'self'");
+  expect(csp).not.toContain("*");
+  expect(CAST_APP_HTML).not.toContain("postMessage({ type: 'cys-cast-reconnect' }, '*')");
+  expect(CAST_APP_HTML).not.toContain("}, '*')");
+});
+
+test("LatestFrameFlow — bounded latest-frame-wins와 fid별 CDP ack exactly-once", () => {
+  const flow = new LatestFrameFlow<string>(1);
+  expect(flow.offer(1, "cdp-1")).toEqual([]);
+  expect(flow.offer(2, "cdp-2")).toEqual(["cdp-1"]); // 구 프레임은 즉시 drop+ack 대상
+  expect(flow.size).toBe(1);
+  expect(flow.acknowledge(1)).toBeNull(); // 이미 eviction으로 처리됨
+  expect(flow.acknowledge(2)).toBe("cdp-2");
+  expect(flow.acknowledge(2)).toBeNull(); // 같은 fid 두 번째 ack는 릴레이 금지
+  expect(flow.size).toBe(0);
+
+  flow.offer(3, "cdp-3");
+  expect(flow.drain()).toEqual(["cdp-3"]); // detach에서도 미확인 프레임을 정확히 한 번 회수
+  expect(flow.drain()).toEqual([]);
+});
+
+test("reconnectGraceDecision — 순간 WS 0명은 grace 동안 유지하고 경계 뒤 cleanup한다", () => {
+  const emptySince = 10_000;
+  expect(reconnectGraceDecision({ clientCount: 1, emptySince, now: 99_999 })).toBe("keep");
+  expect(reconnectGraceDecision({ clientCount: 0, emptySince, now: emptySince + RECONNECT_GRACE_MS - 1 })).toBe("keep");
+  expect(reconnectGraceDecision({ clientCount: 0, emptySince, now: emptySince + RECONNECT_GRACE_MS })).toBe("cleanup");
+  expect(reconnectGraceDecision({ clientCount: 0, emptySince: null, now: emptySince + RECONNECT_GRACE_MS })).toBe("cleanup");
+});
+
+test("CastEmbedTicketRegistry — runtime/context/generation 결합, TTL, WS 1회 소비와 replay 차단", () => {
+  const registry = new CastEmbedTicketRegistry(15_000, 32);
+  const base = {
+    ticket: "A".repeat(43),
+    runtimeId: "runtime-a",
+    context: "default",
+    protocolVersion: CAST_PROTOCOL_VERSION,
+    embedGeneration: 7,
+    parentOrigin: "tauri://localhost",
+  };
+
+  expect(registry.issue(base, 1_000)).toBe("issued");
+  expect(registry.issue(base, 1_001)).toBe("duplicate"); // iframe URL replay도 거부
+  expect(registry.consume({ ...base, embedGeneration: 8 }, 1_002)).toBe("mismatch");
+  expect(registry.consume(base, 1_003)).toBe("accepted");
+  expect(registry.consume(base, 1_004)).toBe("replayed");
+
+  const expired = { ...base, ticket: "B".repeat(43), embedGeneration: 8 };
+  expect(registry.issue(expired, 2_000)).toBe("issued");
+  expect(registry.consume(expired, 17_000)).toBe("expired"); // 경계값은 만료
+  expect(registry.size).toBeLessThanOrEqual(32);
+});
 
 // --- castRoute ---
 test("castRoute: /<token>/cast/ → app (끝 슬래시 필수)", () => {
@@ -125,4 +212,11 @@ test("CAST_APP_HTML: 필수 마커 존재", () => {
   for (const marker of ["canvas", "WebSocket", "insertText", "cys-cast-reconnect", "isComposing"]) {
     expect(CAST_APP_HTML).toContain(marker);
   }
+});
+
+test("CAST_APP_HTML: 인증 WS 뒤 SHELL_READY, 유효 canvas paint 뒤 FRAME_READY/LIVE를 보고한다", () => {
+  expect(CAST_APP_HTML).toContain("phase: 'SHELL_READY'");
+  expect(CAST_APP_HTML).toContain("phase: 'FRAME_READY'");
+  expect(CAST_APP_HTML).toContain("phase: 'LIVE'");
+  expect(CAST_APP_HTML).toContain("painted");
 });

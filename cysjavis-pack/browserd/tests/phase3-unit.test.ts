@@ -107,12 +107,12 @@ test("parseClientMsg: dialog-reply 계약", () => {
 });
 
 // ════════ PRE-3 단일 내비 게이트 ════════
-test("PRE-3 navigableUrlError: http·https·data·about:blank 만 통과", () => {
+test("Browser v2 navigableUrlError: 제품 내비게이션은 http·https만 통과", () => {
   expect(navigableUrlError("http://example.com/")).toBeNull();
   expect(navigableUrlError("https://example.com/x?y=1")).toBeNull();
   expect(navigableUrlError("HtTps://EXAMPLE.com/")).toBeNull(); // 스킴 대소문자 무관
-  expect(navigableUrlError("data:text/html,<h1>x</h1>")).toBeNull(); // 로컬 파일 접근 불가 → 위협 대상 아님
-  expect(navigableUrlError("about:blank")).toBeNull();
+  expect(navigableUrlError("data:text/html,<h1>x</h1>")).toContain("거부");
+  expect(navigableUrlError("about:blank")).toContain("거부"); // blank는 서버 내부 생성 경로만 사용
 });
 
 test("PRE-3 navigableUrlError: ★로컬 파일·특권 스킴은 거부(get text 로 읽어내는 경로 차단)", () => {
