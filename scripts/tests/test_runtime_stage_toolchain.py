@@ -1,15 +1,22 @@
+import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "runtime-stage-toolchain.py"
+SPEC = importlib.util.spec_from_file_location("runtime_stage_toolchain", SCRIPT)
+module = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(module)
 
 
 class RuntimeStageToolchainTests(unittest.TestCase):
@@ -53,6 +60,42 @@ class RuntimeStageToolchainTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(output.read_bytes(), payload)
             self.assertTrue(output.stat().st_mode & 0o111)
+
+    def test_closes_temporary_compiler_before_validation_and_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, source, _ = self.fixture(directory)
+            output = root / "compiler"
+            handles = []
+            real_named_temporary_file = tempfile.NamedTemporaryFile
+
+            def recording_named_temporary_file(*args, **kwargs):
+                handle = real_named_temporary_file(*args, **kwargs)
+                handles.append(handle)
+                return handle
+
+            def assert_closed(*_args):
+                self.assertTrue(handles)
+                self.assertTrue(handles[0].closed)
+
+            args = argparse.Namespace(
+                source_manifest=source,
+                target="aarch64-apple-darwin",
+                archive=archive,
+                output=output,
+            )
+            with (
+                mock.patch.object(
+                    module.tempfile,
+                    "NamedTemporaryFile",
+                    side_effect=recording_named_temporary_file,
+                ),
+                mock.patch.object(module.runtime_stage, "assert_target", side_effect=assert_closed),
+            ):
+                module.extract(args)
+
+            self.assertEqual(len(handles), 1)
+            self.assertTrue(output.is_file())
 
     def test_rejects_same_size_compiler_archive_digest_drift(self):
         with tempfile.TemporaryDirectory() as directory:
