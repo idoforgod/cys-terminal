@@ -54,20 +54,23 @@ def extract(args: argparse.Namespace) -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         if args.output.exists():
             runtime_stage.fail("Bun compiler output already exists")
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{args.output.name}.", dir=args.output.parent, delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            try:
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{args.output.name}.", dir=args.output.parent, delete=False
+            ) as temporary:
+                temporary_path = Path(temporary.name)
                 with archive.open(member) as payload:
                     while chunk := payload.read(1024 * 1024):
                         temporary.write(chunk)
                 temporary.flush()
-                temporary_path.chmod(0o755)
-                expected_arch = runtime_stage.TARGETS[args.target][0]
-                runtime_stage.assert_target(temporary_path, expected_arch, "Bun compiler")
-                temporary_path.replace(args.output)
-            finally:
+
+            temporary_path.chmod(0o755)
+            expected_arch = runtime_stage.TARGETS[args.target][0]
+            runtime_stage.assert_target(temporary_path, expected_arch, "Bun compiler")
+            temporary_path.replace(args.output)
+        finally:
+            if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
 
