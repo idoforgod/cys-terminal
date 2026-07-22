@@ -127,6 +127,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign --version"))
         self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign --version"))
 
+    def test_macos_minisign_install_removes_only_the_known_untrusted_aws_tap(self) -> None:
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        safe_install = """if brew tap | grep -Fxq 'aws/tap'; then
+            brew untap aws/tap
+          fi
+          brew install minisign"""
+
+        self.assertIn(safe_install, candidate)
+        self.assertNotIn("HOMEBREW_NO_VERIFY_ATTESTATIONS", candidate)
+
     def test_browser_runtime_is_built_and_staged_from_pinned_sources_before_signing(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         sources = json.loads(BROWSER_RUNTIME_SOURCES.read_text(encoding="utf-8"))
