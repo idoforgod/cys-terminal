@@ -39,7 +39,7 @@ case "$MODE" in
     mkdir -p "$(dirname "$OUTPUT")"
     PARTIAL="${OUTPUT}.partial.$$"
     trap 'rm -f "$PARTIAL"' EXIT
-    tar -C "$INPUT_DIR" -czf - . | openssl enc -aes-256-cbc -salt \
+    COPYFILE_DISABLE=1 tar -C "$INPUT_DIR" -czf - . | openssl enc -aes-256-cbc -salt \
       -pbkdf2 -iter 200000 -md sha256 -pass env:RELEASE_HANDOFF_KEY \
       -out "$PARTIAL"
     [ -s "$PARTIAL" ] || { echo "encrypted handoff is empty" >&2; exit 1; }

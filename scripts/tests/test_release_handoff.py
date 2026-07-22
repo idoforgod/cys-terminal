@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +44,35 @@ class ReleaseHandoffTests(unittest.TestCase):
             (self.unpacked / "candidate.bin").read_bytes(),
             b"signed-release-candidate",
         )
+
+    def test_pack_disables_macos_copyfile_sidecars(self) -> None:
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar)
+        wrapper_dir = self.work / "bin"
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / "tar"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "[ \"${COPYFILE_DISABLE:-}\" = 1 ] || { "
+            "echo 'COPYFILE_DISABLE was not set' >&2; exit 97; }\n"
+            "exec \"$CYS_REAL_TAR\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(HANDOFF), "pack", str(self.source), str(self.encrypted)],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "PATH": f"{wrapper_dir}{os.pathsep}{os.environ['PATH']}",
+                "CYS_REAL_TAR": str(real_tar),
+                "RELEASE_HANDOFF_KEY": "x" * 48,
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_short_or_wrong_key_fails_closed(self) -> None:
         missing = subprocess.run(
