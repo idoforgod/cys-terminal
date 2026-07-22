@@ -1171,6 +1171,74 @@ class OwnerStandby(unittest.TestCase):
             gate(t, r).run(); gate(t, r).run()
             self.assertIn("gate-idle-worker", self._tasks(r))      # 만료 → 억제 안 됨
 
+    # ── ①codex(missing): 미래 epoch/비유한(Inf/NaN)/손상 declared_epoch·ttl 마커는 억제 안 함(fail-open) ──
+    def test_epoch_validation_fails_open(self):
+        with tempfile.TemporaryDirectory() as t:
+            # 미래(now+100k·유예 300s 초과) → 만료 판정 무력화 위험 → fail-open 제외
+            _write_standby(t, ["worker"], declared_epoch=1_000_000 + 100_000, ttl_secs=21_600)
+            self.assertEqual(G.load_owner_standby(t, 1_000_000), frozenset(), "미래 epoch fail-open")
+            # 비유한 declared_epoch(Inf/NaN) → fail-open
+            _write_standby(t, ["worker"], declared_epoch=float("inf"), ttl_secs=21_600)
+            self.assertEqual(G.load_owner_standby(t, 1_000_000), frozenset(), "Inf epoch fail-open")
+            _write_standby(t, ["worker"], declared_epoch=float("nan"), ttl_secs=21_600)
+            self.assertEqual(G.load_owner_standby(t, 1_000_000), frozenset(), "NaN epoch fail-open")
+            # 비유한 ttl도 만료 판정을 무력화 → fail-open
+            _write_standby(t, ["worker"], declared_epoch=1_000_000, ttl_secs=float("inf"))
+            self.assertEqual(G.load_owner_standby(t, 1_000_000), frozenset(), "Inf ttl fail-open")
+            # 대조군1: 유예 내 미세 미래(now+100s)는 정상 유효(시계 스큐 흡수)
+            _write_standby(t, ["worker"], declared_epoch=1_000_000 + 100, ttl_secs=21_600)
+            self.assertIn("worker", G.load_owner_standby(t, 1_000_000), "유예 내 미세 미래는 유효")
+            # 대조군2: 정상 유한 마커는 유효(fail-open이 정상 억제까지 죽이지 않음)
+            _write_standby(t, ["worker"], declared_epoch=1_000_000, ttl_secs=21_600)
+            self.assertIn("worker", G.load_owner_standby(t, 1_000_000))
+
+    # ── ②codex(P2): 정규화 충돌(서로 다른 raw가 같은 canonical)은 그 키 fail-open 제외 ──
+    def test_canonical_collision_fails_open(self):
+        with tempfile.TemporaryDirectory() as t:
+            # reviewer-codex 와 reviewer_codex 는 서로 다른 raw지만 canonical=reviewer_codex 로 병합
+            _write_standby(t, ["reviewer-codex", "reviewer_codex"])
+            self.assertNotIn("reviewer_codex", G.load_owner_standby(t, 1_000_000),
+                             "충돌 canonical 키는 fail-open 제외(어느 노드 억제인지 모호)")
+            # 단일 마커의 하이픈↔언더스코어 무구분 매칭은 충돌 아님 → 유지(본래 목적 보존)
+            _write_standby(t, ["reviewer-codex"])
+            self.assertIn("reviewer_codex", G.load_owner_standby(t, 1_000_000),
+                          "단일 마커 정규화 매칭은 유지(충돌과 구분)")
+
+    # ── ②codex(missing): standby 중 stall 카운터 누적·승격만 억제 → 만료 시 승격+카운터 유지 ──
+    def test_stall_accumulates_during_standby_then_promotes(self):
+        rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}])
+        counters = {}
+        # standby 중 3주기: 카운터는 증가하되 승격만 억제(stall_cycles=2·node live 미기재→idle None→승격 가능)
+        for _ in range(3):
+            sup = []
+            stalls = G.build_stall_warnings(counters, rep, 5, 2, "t", frozenset({"worker"}), sup)
+            self.assertEqual(stalls, [], "standby 중 stall 승격 억제")
+        self.assertGreaterEqual(counters["nodes"]["worker"]["count"], 2,
+                                "카운터는 standby 중에도 누적(억제 대상은 승격뿐)")
+        acc = counters["nodes"]["worker"]["count"]
+        # 만료(standby 해제) → 누적 카운터로 즉시 승격
+        stalls = G.build_stall_warnings(counters, rep, 5, 2, "t", frozenset(), None)
+        self.assertTrue(any(s["task"] == "gate-stall-worker" for s in stalls),
+                        "만료 시 누적 카운터로 stall 승격")
+        self.assertGreater(counters["nodes"]["worker"]["count"], acc,
+                           "승격 후에도 카운터는 계속(리셋 아님)")
+
+    # ── ②codex(missing): idle_edge armed 유지(standby 중 disarm 없음) → 만료 후 정상 쿨다운 재발화 ──
+    def test_idle_edge_armed_retained_refires_after_standby(self):
+        rep = report(idle_nodes=[{"role": "worker", "idle_secs": 600}])  # 무배정 idle → 엣지 경로
+        counters = {"idle_edge": {}}
+        # standby: 엣지 진입 전 억제(continue) → armed 비트 미변경(extract_warnings 순수)
+        sup = []
+        w = G.extract_warnings(rep, counters, 1_000_000, 900, frozenset({"worker"}), sup)
+        self.assertFalse(any(x["reason"].startswith("idle_edge:") for x in w),
+                         "standby 중 idle 엣지 억제")
+        self.assertTrue(any("idle:worker" in s for s in sup), "억제 감사 기록")
+        self.assertEqual(counters["idle_edge"], {}, "armed 비트 불변(disarm 없음)")
+        # 만료(standby 해제) → armed True(기본)+쿨다운 통과 → 엣지 재발화
+        w2 = G.extract_warnings(rep, counters, 1_000_000, 900, frozenset(), None)
+        self.assertTrue(any(x["reason"] == "idle_edge:worker" for x in w2),
+                        "만료 후 정상 쿨다운으로 엣지 재발화")
+
 
 if __name__ == "__main__":
     unittest.main()

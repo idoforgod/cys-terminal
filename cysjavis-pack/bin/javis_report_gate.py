@@ -25,6 +25,7 @@ CLI:
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -201,29 +202,58 @@ def _norm_role(r):
     return (r or "").strip().lower().replace("-", "_")
 
 
+# owner_standby 마커의 미래 declared_epoch 허용 유예(시계 미세 스큐 흡수). 이를 넘는 미래
+# epoch는 시계 역행·오기록으로 간주해 fail-open(억제 제외).
+STANDBY_FUTURE_GRACE_SECS = 300
+
+
 def load_owner_standby(state_dir, now_epoch):
     """owner_standby.json(오너/CSO 선언 standby 마커)을 읽어 유효(TTL 미경과) role의
     **정규화 집합**을 반환한다. 파일 부재·파손·필드 결손·만료는 조용히 제외(fail-open).
     마커 없으면 빈 집합 → 억제 0·회귀 0. role 키는 _norm_role로 정규화해 report roles와
-    구분자(하이픈/언더스코어) 무관하게 매칭한다(SF: 별도 등재)."""
+    구분자(하이픈/언더스코어) 무관하게 매칭한다(SF: 별도 등재).
+
+    ★fail-open 계약(codex P1 finding·2026-07-23):
+    (1) 비유한(NaN/Inf)·손상 또는 미래(now+STANDBY_FUTURE_GRACE_SECS 초과) declared_epoch,
+        비유한 ttl은 만료 판정을 무력화해 idle/stall을 **무기한** 봉인한다(시계 역행·오기록
+        마커) — fail-open 계약 위반이므로 제외한다.
+    (2) 정규화 충돌: 서로 다른 raw role(구분자 변형 a-b vs a_b·선후 공백 변형)이 같은
+        canonical 키로 병합되면 어느 노드를 억제할지 모호하다 — 해당 canonical 키를 억제
+        집합에서 **제외(fail-open)**한다. 단일 마커의 하이픈↔언더스코어 무구분 매칭
+        (_norm_role 본래 목적)은 충돌이 아니므로 그대로 유지된다."""
     data = _load_json(os.path.join(state_dir, "owner_standby.json"), None)
     nodes = data.get("nodes") if isinstance(data, dict) else None
     if not isinstance(nodes, dict):
         return frozenset()
     out = set()
+    seen_raw = {}          # canonical → 그 키를 만든 raw role(충돌 검출)
+    collided = set()       # 서로 다른 raw가 병합된 canonical(fail-open 제외)
     for role, meta in nodes.items():
         if not isinstance(meta, dict):
             continue
         dec = meta.get("declared_epoch")
         ttl = meta.get("ttl_secs")
+        # bool은 int 하위형 — epoch/ttl 값으로는 손상 마커이므로 배제(True/False 오해 차단).
+        if isinstance(dec, bool) or isinstance(ttl, bool):
+            continue
         if not isinstance(dec, (int, float)) or not isinstance(ttl, (int, float)):
             continue
+        if not math.isfinite(dec) or not math.isfinite(ttl):
+            continue                       # 비유한(NaN/Inf) → fail-open 제외
+        if now_epoch is not None and dec > now_epoch + STANDBY_FUTURE_GRACE_SECS:
+            continue                       # 미래 epoch(유예 초과) → fail-open 제외
         if now_epoch is not None and (now_epoch - dec) >= ttl:
             continue                       # 만료 → 제외
         nr = _norm_role(role)
-        if nr:
-            out.add(nr)
-    return frozenset(out)
+        if not nr:
+            continue
+        prev = seen_raw.get(nr)
+        if prev is not None and prev != role:
+            collided.add(nr)               # 서로 다른 raw → 같은 canonical(충돌)
+            continue
+        seen_raw[nr] = role
+        out.add(nr)
+    return frozenset(out - collided)
 
 
 def _write_json_atomic(path, obj):
