@@ -1312,7 +1312,8 @@ def peek_surface(key, socket=None, lines=12):
 
 def run_json(args, timeout=10):
     try:
-        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout, **NOWIN)
+        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout,
+                             env={**os.environ, "CYS_NO_AUTOSTART": "1"}, **NOWIN)
         if out.returncode != 0:
             return None
         return json.loads(out.stdout)
@@ -1372,7 +1373,8 @@ class SubscriptionSupervisor:
                     ["events", "--reconnect", "--cursor-file", cursor]
         while not stop.is_set():
             proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                                    env={**os.environ, "CYS_NO_AUTOSTART": "1"}, **NOWIN)
             holder[0] = proc
             try:
                 for line in proc.stdout:

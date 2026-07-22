@@ -105,6 +105,25 @@ def build_checklist(cmd, state, round_dir, timeout=PREFLIGHT_TIMEOUT):
 
 
 def main(argv=None):
+    # ── 레인↔팩 정합 가드 (argparse·preflight 이전 선차단) ──
+    # 소켓 부서(CYS_SOCKET)와 팩 부서(CYS_PACK_DIR)가 불일치한 컨텍스트에서 SessionStart
+    # 체크리스트가 preflight를 도는 것 자체가 stray-cysd 재생성 트리거다. 불일치면 preflight에
+    # 도달하기 전에 시끄럽게 차단한다. exit 8: bootstrap의 레인↔팩 exit 8과 동일 코드로 통일.
+    # javis_bootstrap CLI는 __main__ 가드 아래라 import 무부작용(확인). import 실패는 fail-open —
+    # 체크리스트는 세션을 절대 크래시시키면 안 되므로 경고만 하고 통과한다.
+    try:
+        import javis_bootstrap  # 동일 디렉터리(sys.path[0]) — 인자 없는 호출은 env로 판정
+        mismatch = javis_bootstrap._lane_pack_mismatch()
+    except ImportError as e:
+        print('■ 레인↔팩 가드 생략 — javis_bootstrap import 실패(fail-open): %s' % e,
+              file=sys.stderr)
+        mismatch = None
+    if mismatch is not None:
+        sock_dept, pack_dept = mismatch
+        print('■ 레인↔팩 불일치 — preflight 차단(stray-cysd 재생성 방지): '
+              'socket-dept=%s vs pack-dept=%s' % (sock_dept, pack_dept), file=sys.stderr)
+        return 8
+
     ap = argparse.ArgumentParser(
         description='세션 시작 주입용 실측 체크리스트 래퍼(전부 실측·LLM 없음).')
     ap.add_argument('--preflight-cmd', default=DEFAULT_PREFLIGHT,

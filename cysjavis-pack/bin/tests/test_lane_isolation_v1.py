@@ -22,6 +22,8 @@ import unittest
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
 BOOTSTRAP = os.path.join(BIN, "javis_bootstrap.py")
 HOOK = os.path.join(os.path.dirname(BIN), "hooks", "role-bootstrap.sh")     # cysjavis-pack/hooks/...
+sys.path.insert(0, BIN)
+import javis_bootstrap as B                                                # noqa: E402
 
 
 def _mock_cys(mockbin, surface_role="", exit_code=1):
@@ -132,6 +134,33 @@ class EmbeddedSelfTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, "내장 self-test 실패:\n%s\n%s" % (r.stdout, r.stderr))
         self.assertIn("self-test OK", r.stdout)
+
+
+class LanePackMismatchPure(unittest.TestCase):
+    """_lane_pack_mismatch 순수 판정 핀 — 정합이면 None, 불일치면 (sock_dept, pack_dept).
+    내장 self-test(javis_bootstrap.py:799-806)와 동일 케이스를 in-process로도 고정한다."""
+
+    def test_base_socket_main_pack_none(self):
+        self.assertIsNone(B._lane_pack_mismatch("", "/h/.cys/pack"))
+
+    def test_matched_dept_none(self):
+        self.assertIsNone(B._lane_pack_mismatch(
+            "/s/cys-dept-dept-1/cys.sock", "/h/.cys/pack-dept-dept-1"))
+
+    def test_dept_socket_main_pack_mismatch(self):
+        self.assertEqual(
+            B._lane_pack_mismatch("/s/cys-dept-dept-1/cys.sock", "/h/.cys/pack"),
+            ("dept-1", None))
+
+    def test_base_socket_dept_pack_mismatch(self):
+        self.assertEqual(
+            B._lane_pack_mismatch("", "/h/.cys/pack-dept-dept-2"),
+            (None, "dept-2"))
+
+    def test_cross_dept_mismatch(self):
+        self.assertEqual(
+            B._lane_pack_mismatch("/s/cys-dept-dept-1/cys.sock", "/h/.cys/pack-dept-dept-2"),
+            ("dept-1", "dept-2"))
 
 
 if __name__ == "__main__":
