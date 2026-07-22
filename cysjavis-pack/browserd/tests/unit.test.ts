@@ -57,12 +57,12 @@ test("UNTRUSTED_HEADER: 지시 무시 문구 포함", () => {
 });
 
 test("strict packaged engine stores endpoint only under supervisor-owned root", () => {
-  expect(resolveBrowserRoot("/home/user", "/private/engine", "1")).toBe("/private/engine");
-  expect(resolveBrowserRoot("/home/user", "/private/engine", "0")).toBe(
-    join("/home/user", ".cys", "browser"),
+  expect(resolveBrowserRoot("/home/you", "/private/engine", "1")).toBe("/private/engine");
+  expect(resolveBrowserRoot("/home/you", "/private/engine", "0")).toBe(
+    join("/home/you", ".cys", "browser"),
   );
-  expect(resolveBrowserRoot("/home/user", undefined, "1")).toBe(
-    join("/home/user", ".cys", "browser"),
+  expect(resolveBrowserRoot("/home/you", undefined, "1")).toBe(
+    join("/home/you", ".cys", "browser"),
   );
 });
 
