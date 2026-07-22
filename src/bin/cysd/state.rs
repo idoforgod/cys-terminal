@@ -16,6 +16,10 @@ use tokio::sync::broadcast;
 const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
+/// 재기동을 넘겨 복원된 큐(restored_queue) 항목이 재배달될 때 앞에 붙는 표식.
+/// 수신자가 "지금 온 지시"와 "재기동 전 옛 큐의 재생"을 구분하게 한다 — 무표식 stale 재생 봉인
+/// (2026-07-23 실사고: 07-20 하달이 codex 재기동 시 현행처럼 배달됨). SF-QUEUE-REPLAY-STALE.
+pub const STALE_REPLAY_STAMP: &str = "[재생·오래된큐] ";
 
 // ★D3(W5): Windows Job Object — PTY 자식 동반사망(KILL_ON_JOB_CLOSE). unix 는 setsid+killpg/SIGKILL 로 이미
 //   동반사망이 성립하지만 Windows 는 자식이 데몬 사후 생존해 잔존/중복 노드가 됐다(P2-9). 데몬 소유 Job 에
@@ -1600,7 +1604,15 @@ impl Daemon {
             let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(r) = role {
                 if let Some(surf) = role_surface.get(r) {
-                    surf.pending_queue.lock().unwrap().push_back(text.to_string());
+                    // restored_queue 항목은 정의상 재기동을 넘긴 stale 재생분이다 — 배달 전 표식을
+                    // 붙여 수신자가 옛 큐 재생을 현행 지시로 오독하지 않게 한다(SF-QUEUE-REPLAY-STALE).
+                    // 멱등: 여러 재기동을 거쳐 이미 표식된 텍스트는 중복 부여하지 않는다.
+                    let stamped = if text.starts_with(STALE_REPLAY_STAMP) {
+                        text.to_string()
+                    } else {
+                        format!("{}{}", STALE_REPLAY_STAMP, text)
+                    };
+                    surf.pending_queue.lock().unwrap().push_back(stamped);
                     rehomed += 1;
                     return false; // restored_queue에서 제거(pending_queue로 이관)
                 }
@@ -2667,6 +2679,35 @@ mod tests {
             .unwrap();
         assert!(daemon.master_claimed_at.lock().unwrap().is_some(),
                 "master 부활 시 master_claimed_at 스탬프돼야 approval.sign 가능(P1-2)");
+    }
+
+    /// SF-QUEUE-REPLAY-STALE: 재기동을 넘겨 복원된 큐(restored_queue)를 rehome할 때, 옛 지시임을
+    /// 알리는 '[재생·오래된큐]' 표식을 텍스트 앞에 부여해야 한다(무표식 stale 재생 봉인).
+    /// 이미 표식된 항목(다중 재기동)은 이중 부여하지 않는다(멱등).
+    #[test]
+    fn rehome_stamps_stale_replay() {
+        let daemon = Daemon::new(isolated_sock("stale-replay-stamp"));
+        // 살아있는 worker surface — restored_queue의 role 앵커 매칭 대상
+        let s = daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+            .unwrap();
+        // 재기동 생존 스냅샷 모사: 미표식 옛 지시 + 이미 표식된 항목(멱등 검증)
+        {
+            let mut r = daemon.restored_queue.lock().unwrap();
+            r.push(json!({"mid": "m1", "role": "worker", "text": "옛 지시 본문"}));
+            r.push(json!({"mid": "m2", "role": "worker",
+                          "text": format!("{}이미 표식된 지시", STALE_REPLAY_STAMP)}));
+        }
+        let n = daemon.rehome_restored_queue();
+        assert_eq!(n, 2, "두 항목 모두 살아있는 worker로 rehome");
+        let q = s.pending_queue.lock().unwrap();
+        assert_eq!(q.len(), 2, "두 항목 배달 경로(pending_queue)로 이관");
+        // 미표식 stale 재생분 → '[재생·오래된큐]' 표식 부여
+        assert_eq!(q[0], format!("{}옛 지시 본문", STALE_REPLAY_STAMP),
+                   "미표식 stale 재생분에 표식 부여");
+        // 이미 표식된 항목 → 이중 부여 금지(멱등)
+        assert_eq!(q[1], format!("{}이미 표식된 지시", STALE_REPLAY_STAMP),
+                   "이미 표식된 항목은 이중 표식 금지(멱등)");
     }
 
     /// (W1-6 a·d) 계정 config_dir 영속 라운드트립 + 구 topology 하위호환.
