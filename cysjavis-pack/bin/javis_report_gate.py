@@ -193,6 +193,39 @@ def _load_json(path, default):
         return default
 
 
+def _norm_role(r):
+    """role 라벨을 정규화해 하이픈↔언더스코어·대소문자 차이를 무구분 매칭한다.
+    report roles(reviewer-codex·하이픈)와 owner_standby.json 마커 키(reviewer_codex·
+    언더스코어)가 구분자만 달라 미스매치로 억제가 부분 실패(worker만 억제)하던 결함을
+    봉인한다. 정규형=소문자+하이픈→언더스코어."""
+    return (r or "").strip().lower().replace("-", "_")
+
+
+def load_owner_standby(state_dir, now_epoch):
+    """owner_standby.json(오너/CSO 선언 standby 마커)을 읽어 유효(TTL 미경과) role의
+    **정규화 집합**을 반환한다. 파일 부재·파손·필드 결손·만료는 조용히 제외(fail-open).
+    마커 없으면 빈 집합 → 억제 0·회귀 0. role 키는 _norm_role로 정규화해 report roles와
+    구분자(하이픈/언더스코어) 무관하게 매칭한다(SF: 별도 등재)."""
+    data = _load_json(os.path.join(state_dir, "owner_standby.json"), None)
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, dict):
+        return frozenset()
+    out = set()
+    for role, meta in nodes.items():
+        if not isinstance(meta, dict):
+            continue
+        dec = meta.get("declared_epoch")
+        ttl = meta.get("ttl_secs")
+        if not isinstance(dec, (int, float)) or not isinstance(ttl, (int, float)):
+            continue
+        if now_epoch is not None and (now_epoch - dec) >= ttl:
+            continue                       # 만료 → 제외
+        nr = _norm_role(role)
+        if nr:
+            out.add(nr)
+    return frozenset(out)
+
+
 def _write_json_atomic(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = "%s.tmp.%d" % (path, os.getpid())
@@ -350,7 +383,8 @@ def rearm_idle_edge(counters, report):
 #   collect → EVT 매핑 없음 → wake 전용
 #   DELTA   → task_progress {task, stage, [pct]}
 #   날짜변경 → briefing {counts:{running,inbox,approvals,alerts}}
-def extract_warnings(report, counters, now, edge_cooldown):
+def extract_warnings(report, counters, now, edge_cooldown,
+                     standby_roles=frozenset(), suppressed_out=None):
     """원문 report에서 WARN 트리거 목록 추출(순수 — counters 읽기 전용). 각 항목:
     trigger/reason/wake_body/(evt_type,evt_fields)/idem/(edge_role).
 
@@ -359,6 +393,11 @@ def extract_warnings(report, counters, now, edge_cooldown):
       - 무배정(todo 파일 부재) idle: **엣지 1회 wake**(armed 비트 + 쿨다운 게이트). disarm은 배달 성공
         확인 후 라우팅 측(_route_warn)에서만 하므로 이 함수는 counters를 변이하지 않는다(원자성·순수).
       - done==total idle: 무발화(현행 억제 보존 — QUIET·park 도달성 유지).
+
+    owner-standby 억제(additive): standby_roles(load_owner_standby 결과·정규화 집합)에 든 role의
+    idle WARN(배정·무배정 공통)만 억제하고 suppressed_out(있으면)에 'idle:<role>' 기록(감사·은폐
+    아님). 기본 인자(빈 집합·None)면 억제 0·기록 0으로 현행과 100% 동일(회귀 0). ★death는 이 함수
+    소관 아님 — 진짜 사망은 standby 중에도 경보(별도 경로·억제 금지).
     """
     warns = []
     proc = ("read-screen 확인·재지시.")
@@ -379,6 +418,12 @@ def extract_warnings(report, counters, now, edge_cooldown):
         if not role:
             continue
         mins = (n.get("idle_secs") or 0) // 60
+        if _norm_role(role) in standby_roles:
+            # owner-directed-standby 선언 role → idle WARN(배정 idle·무배정 idle_edge 공통) 억제.
+            # 감사 로그만(경보 로직 무변경). 무배정 엣지는 armed 유지(만료 시 즉시 재발화 가능).
+            if suppressed_out is not None:
+                suppressed_out.append("idle:%s" % role)
+            continue
         if role in pending:
             # active pending-todo idle → 레벨 WARN(현행 동등·억제 없음)
             warns.append({
@@ -435,12 +480,16 @@ def extract_warnings(report, counters, now, edge_cooldown):
     return warns
 
 
-def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso):
+def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
+                         standby_roles=frozenset(), suppressed_out=None):
     """태스크(노드) 단위 stall 카운터 갱신 + 승격 대상 WARN 생성.
 
     전역 diff 카운터 금지 — 다른 태스크의 변화가 특정 태스크의 정체를 은폐한다(적대 검증 A6).
     승격 조건: 진행 시그니처 무변화 ≥stall_cycles **AND 담당 노드 idle**(데몬 실측). 노드 busy면
     정상 장기 라운드(리뷰 40분+ 등)이므로 카운터만 증가·승격 보류(오탐 억제 S1-2).
+
+    owner-standby 억제(additive): standby_roles에 든 노드는 **stall 승격만** 억제하고 카운터는 계속
+    증가시킨다(만료 시 즉시 재승격). suppressed_out(있으면)에 'stall:<label>' 기록. 기본 인자면 회귀 0.
     """
     prev = counters.get("nodes", {}) or {}
     new_nodes = {}
@@ -460,6 +509,11 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso)
 
         in_progress = n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)
         if in_progress and count >= stall_cycles:
+            if _norm_role(label) in standby_roles:
+                # owner-standby 선언 노드 → stall 승격만 억제(카운터는 위에서 이미 증가·만료 시 재승격).
+                if suppressed_out is not None:
+                    suppressed_out.append("stall:%s" % label)
+                continue
             idle = node_is_idle(report, label)
             if idle is False:
                 continue              # 노드 busy → 승격 보류(카운터는 이미 증가)
@@ -823,11 +877,20 @@ class Gate:
             init_idle_edge(counters, report)
 
         # ── 분류 ──
+        # owner-directed-standby 명시 억제(오너/CSO 선언): 유효 선언 role의 idle/stall WARN만 억제한다.
+        #   suppressed는 감사용(아래 ledger reasons에 실려 은폐 아님). 마커 없으면 빈 집합=회귀 0.
+        #   ★death는 억제하지 않는다(build_death_warnings에 standby 미전달) — 진짜 사망은 standby
+        #    중에도 경보(master 기결·별도 결함으로 런타임 death 억제는 base 미유입).
+        standby_roles = load_owner_standby(self.state_dir, now_epoch)
+        suppressed = []
         rearm_idle_edge(counters, report)                   # 활동 재개 role 엣지 재무장(§3.2)
-        warns = extract_warnings(report, counters, now_epoch, self.edge_cooldown)
-        warns += build_death_warnings(old_snap, report, counters)   # 사망 엣지(§3.3)
+        warns = extract_warnings(report, counters, now_epoch, self.edge_cooldown,
+                                 standby_roles, suppressed)
+        warns += build_death_warnings(old_snap, report, counters)   # 사망 엣지(§3.3·standby 무관 발화)
         warns += build_stall_warnings(counters, report, self.cycle_minutes,
-                                      self.stall_cycles, now_iso)
+                                      self.stall_cycles, now_iso, standby_roles, suppressed)
+        if suppressed:
+            reasons.append("suppressed(owner-standby):%s" % ",".join(suppressed))
         delta_fields = diff_top_fields(old_snap, new_snap)
 
         if warns:

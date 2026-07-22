@@ -1081,5 +1081,96 @@ class C71GateGuardBehavior(unittest.TestCase):
             self.assertIn("가드 회귀", res["detail"])
 
 
+def _write_standby(state_dir, roles, declared_epoch=1_000_000, ttl_secs=21_600):
+    """owner_standby.json 마커 기록(정규화 매칭·억제 검증용)."""
+    nodes = {r: {"declared_epoch": declared_epoch, "ttl_secs": ttl_secs} for r in roles}
+    with open(os.path.join(state_dir, "owner_standby.json"), "w", encoding="utf-8") as f:
+        json.dump({"nodes": nodes}, f)
+
+
+class OwnerStandby(unittest.TestCase):
+    """owner-directed-standby 억제 — idle/stall만 억제·정규화 매칭(하이픈↔언더스코어)·
+    ★death는 standby 중에도 경보(억제 금지·master 기결). 마커 없으면 회귀 0(기존 65 테스트 green)."""
+
+    def _tasks(self, r):
+        return [task for _to, task, _r, _i in r.enqueues]
+
+    # ── 정규화 매칭: 언더스코어 마커가 하이픈 role의 idle을 억제(SF 결함 봉인) ──
+    def test_underscore_marker_suppresses_hyphen_role_idle(self):
+        with tempfile.TemporaryDirectory() as t:
+            _write_standby(t, ["reviewer_codex"])                  # 마커=언더스코어
+            rep = report(nodes=[{"node": "reviewer-codex", "done": 1, "total": 5, "pct": 20}],
+                         idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600}])  # role=하이픈
+            r = FakeRunner(rep=rep)
+            gate(t, r).run()                                       # baseline
+            gate(t, r).run()                                       # idle → 억제
+            self.assertNotIn("gate-idle-reviewer-codex", self._tasks(r))
+            e = ledger_entries(t)[-1]
+            self.assertTrue(any("suppressed(owner-standby)" in x and "idle:reviewer-codex" in x
+                                for x in e["reasons"]), e["reasons"])
+
+    # ── 정규화 매칭 역방향: 하이픈 마커가 언더스코어 role의 idle을 억제(무구분) ──
+    def test_hyphen_marker_suppresses_underscore_role_idle(self):
+        with tempfile.TemporaryDirectory() as t:
+            _write_standby(t, ["reviewer-codex"])                  # 마커=하이픈
+            rep = report(nodes=[{"node": "reviewer_codex", "done": 1, "total": 5, "pct": 20}],
+                         idle_nodes=[{"role": "reviewer_codex", "idle_secs": 600}])  # role=언더스코어
+            r = FakeRunner(rep=rep)
+            gate(t, r).run(); gate(t, r).run()
+            self.assertNotIn("gate-idle-reviewer_codex", self._tasks(r))
+
+    # ── 5노드 전원 억제: 마커(혼합 구분자)로 하이픈 리뷰어 포함 5노드 idle 전원 억제('worker만 억제' 봉인) ──
+    def test_five_nodes_all_suppressed(self):
+        with tempfile.TemporaryDirectory() as t:
+            roles = ["cso", "worker", "reviewer-gemini", "reviewer-codex", "master"]
+            _write_standby(t, ["cso", "worker", "reviewer_gemini", "reviewer_codex", "master"])
+            rep = report(nodes=[{"node": h, "done": 1, "total": 5, "pct": 20} for h in roles],
+                         idle_nodes=[{"role": h, "idle_secs": 600} for h in roles])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run(); gate(t, r).run()
+            for h in roles:
+                self.assertNotIn("gate-idle-%s" % h, self._tasks(r),
+                                 "%s idle 억제 실패(정규화 결함 재현)" % h)
+
+    # ── 무배정 idle_edge 억제: standby role의 무배정 idle 엣지 미발화 ──
+    def test_suppresses_unassigned_idle_edge(self):
+        with tempfile.TemporaryDirectory() as t:
+            _write_standby(t, ["worker"])
+            active = report(live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 10}])
+            idle = report(live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 600}],
+                          idle_nodes=[{"role": "worker", "idle_secs": 600}])
+            gate(t, FakeRunner(rep=active)).run()                  # baseline active
+            r = FakeRunner(rep=idle)
+            gate(t, r).run()                                       # 무배정 idle → 엣지 억제
+            self.assertNotIn("gate-idle-worker", self._tasks(r))
+            e = ledger_entries(t)[-1]
+            self.assertTrue(any("idle:worker" in x for x in e["reasons"]), e["reasons"])
+
+    # ── ★death는 standby 중에도 WARN 발화(억제 금지·master 기결·별도 결함 미유입) ──
+    def test_death_fires_during_standby(self):
+        with tempfile.TemporaryDirectory() as t:
+            _write_standby(t, ["worker"])
+            alive = report(live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 10}])
+            dead = report(live_nodes=[{"role": "worker", "agent_alive": False}])
+            gate(t, FakeRunner(rep=alive)).run()                   # baseline alive
+            gate(t, FakeRunner(rep=dead)).run()                    # 시딩
+            r = FakeRunner(rep=dead)
+            gate(t, r).run()                                       # 확정 → death WARN(standby 무관)
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "WARN")
+            self.assertIn("gate-death-worker",
+                          [task for _to, task, _r, _i in r.enqueues if _to == "master"])
+
+    # ── 만료 마커는 억제 안 함(TTL 경과 → idle WARN 정상 발화) ──
+    def test_expired_marker_does_not_suppress(self):
+        with tempfile.TemporaryDirectory() as t:
+            _write_standby(t, ["worker"], declared_epoch=1_000_000 - 30_000, ttl_secs=21_600)  # 만료
+            rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                         idle_nodes=[{"role": "worker", "idle_secs": 600}])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run(); gate(t, r).run()
+            self.assertIn("gate-idle-worker", self._tasks(r))      # 만료 → 억제 안 됨
+
+
 if __name__ == "__main__":
     unittest.main()
