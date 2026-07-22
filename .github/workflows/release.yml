@@ -311,6 +311,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if brew tap | grep -Fxq 'aws/tap'; then
+            brew untap aws/tap
+          fi
           brew install minisign
           minisign --version
 
