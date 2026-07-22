@@ -125,7 +125,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY_B64", candidate)
         self.assertIn("CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64", candidate)
         self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+command -v minisign"))
-        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+Get-Command minisign"))
+        self.assertRegex(candidate, re.compile(r"minisign-0\.12-win64\.zip[\s\S]+Get-Command minisign"))
+        self.assertIn("37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479", candidate)
+        self.assertIn("Get-FileHash", candidate)
+        self.assertNotIn("choco install minisign", candidate)
         self.assertNotIn("minisign --version", candidate)
 
     def test_macos_minisign_install_removes_only_the_known_untrusted_aws_tap(self) -> None:
