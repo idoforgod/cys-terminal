@@ -1347,7 +1347,8 @@ def _cys_list_masters():
     if not cys:
         return None
     try:
-        r = subprocess.run([cys, "list"], capture_output=True, timeout=10)
+        r = subprocess.run([cys, "list"], capture_output=True, timeout=10,
+                           env={**os.environ, "CYS_NO_AUTOSTART": "1"})
     except Exception:
         return None
     if r.returncode != 0:

@@ -1300,7 +1300,8 @@ def peek_surface(key, socket=None, lines=12):
         args += ["--socket", socket]
     args += ["read-screen", "--surface", bare, "--lines", "40"]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **NOWIN)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10,
+                           env={**os.environ, "CYS_NO_AUTOSTART": "1"}, **NOWIN)
         if r.returncode != 0:
             return None
         txt = ANSI_RE.sub("", r.stdout)
