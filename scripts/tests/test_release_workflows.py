@@ -97,6 +97,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("Get-FileHash", windows)
         self.assertIn("CYS_WINDOWS_GUI_SHA256", windows)
         self.assertIn("Unsigned Windows GUI hash drifted during Tauri build", windows)
+        compile_gui = "bunx '@tauri-apps/cli@2' build --no-bundle"
+        patch_gui = "python scripts/patch-tauri-bundle-type.py"
+        bundle_gui = "bunx '@tauri-apps/cli@2' bundle --bundles nsis"
+        self.assertEqual(windows.count(compile_gui), 1)
+        self.assertEqual(windows.count(patch_gui), 1)
+        self.assertEqual(windows.count(bundle_gui), 1)
+        compiled_gui = windows.index(compile_gui)
+        patched_gui = windows.index(patch_gui)
+        measured_hash = windows.index("$guiHash =")
+        pinned_hash = windows.index("$env:CYS_WINDOWS_GUI_SHA256 = $guiHash")
+        release_bundle = windows.index(bundle_gui)
+        self.assertLess(compiled_gui, patched_gui)
+        self.assertLess(patched_gui, measured_hash)
+        self.assertLess(measured_hash, pinned_hash)
+        self.assertLess(pinned_hash, release_bundle)
         self.assertNotIn("windows-authenticode.ps1", windows)
         self.assertNotIn("certificateThumbprint", windows)
 
@@ -200,7 +215,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("runtime-stage-sign-windows.ps1", windows)
         self.assertLess(
             windows.index("browser-runtime-metadata.py prepare"),
-            windows.index("cargo build --locked --release --target"),
+            windows.index("bunx '@tauri-apps/cli@2' build --no-bundle"),
         )
         for required in ("codesign --force", "--timestamp", "--options runtime", "codesign --verify"):
             self.assertIn(required, mac_sign)

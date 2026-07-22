@@ -40,25 +40,13 @@ python scripts/browser-runtime-metadata.py prepare `
 if ($LASTEXITCODE -ne 0) { throw 'Browser Runtime metadata signing/verification failed' }
 $env:CYS_BROWSER_V2_RELEASE_QUALIFIED = '1'
 
-# First build the exact unsigned GUI executable. The final cysd sidecar embeds
-# this digest and accepts Browser authority registrations only from this byte-
-# identical canonical sibling, replacing CA-backed publisher identity without
-# weakening the process/path/incarnation checks.
+# A plain `cargo build` omits Tauri's release features, while a full Tauri build
+# temporarily patches the GUI only inside the NSIS copy and restores the
+# unpatched executable afterwards. Compile once with Tauri's exact release
+# settings but without bundling, then apply the same official UNK -> NSS marker
+# substitution before hashing. `tauri bundle` consumes that already-built PE;
+# the final comparison remains fail-closed if any later step changes it.
 Remove-Item Env:\CYS_WINDOWS_GUI_SHA256 -ErrorAction SilentlyContinue
-bash scripts/bundle-prep.sh
-if ($LASTEXITCODE -ne 0) { throw 'preliminary bundle-prep failed' }
-cargo build --locked --release --target $target -p cys-app
-if ($LASTEXITCODE -ne 0) { throw 'preliminary unsigned Windows GUI build failed' }
-$gui = (Resolve-Path "target\$target\release\cys-app.exe").Path
-$guiHash = (Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($guiHash -notmatch '^[0-9a-f]{64}$') { throw 'Unsigned Windows GUI SHA-256 is invalid' }
-$env:CYS_WINDOWS_GUI_SHA256 = $guiHash
-
-# Rebuild cysd with the release GUI digest, then let Tauri run the same
-# bundle-prep once more under the identical environment before NSIS packaging.
-bash scripts/bundle-prep.sh
-if ($LASTEXITCODE -ne 0) { throw 'hash-pinned bundle-prep failed' }
-
 $configPath = Join-Path $env:RUNNER_TEMP 'tauri-release-windows-unsigned.json'
 $config = @{
   bundle = @{
@@ -67,8 +55,26 @@ $config = @{
   }
 }
 $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
-bunx '@tauri-apps/cli@2' build --target $target --config $configPath
-if ($LASTEXITCODE -ne 0) { throw 'Tauri unsigned Windows release build failed' }
+bunx '@tauri-apps/cli@2' build --no-bundle --target $target --config $configPath
+if ($LASTEXITCODE -ne 0) { throw 'Tauri exact Windows GUI compile failed' }
+
+$gui = (Resolve-Path "target\$target\release\cys-app.exe").Path
+python scripts/patch-tauri-bundle-type.py --executable $gui --bundle-type nsis
+if ($LASTEXITCODE -ne 0) { throw 'Tauri NSIS bundle marker patch failed' }
+$guiHash = (Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($guiHash -notmatch '^[0-9a-f]{64}$') { throw 'Unsigned Windows GUI SHA-256 is invalid' }
+$env:CYS_WINDOWS_GUI_SHA256 = $guiHash
+
+# Rebuild and restage cysd with the exact installed-GUI digest. Bundle the
+# already-built, already-patched PE without invoking a second Cargo app build.
+bash scripts/bundle-prep.sh
+if ($LASTEXITCODE -ne 0) { throw 'hash-pinned bundle-prep failed' }
+$nsisDir = "target\$target\release\bundle\nsis"
+if (Test-Path -LiteralPath $nsisDir) {
+  Remove-Item -LiteralPath $nsisDir -Recurse -Force
+}
+bunx '@tauri-apps/cli@2' bundle --bundles nsis --target $target --config $configPath
+if ($LASTEXITCODE -ne 0) { throw 'Tauri unsigned Windows release bundle failed' }
 
 $finalGuiHash = (Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($finalGuiHash -ne $guiHash) {
