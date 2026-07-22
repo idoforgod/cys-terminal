@@ -155,30 +155,6 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
 
-      # src-tauri(cys-app) 단위 게이트 — 위 phoenix 스텝의 `cargo test --bin cysd|--lib`는 둘 다 루트
-      # crate(cys-terminal)라 src-tauri crate 테스트(browserd state 파싱 등 Tauri command 단위)가 CI에서
-      # 한 번도 돌지 않았다. host-아키텍처 무관 순수 로직이라 phoenix 게이트와 동일하게 네이티브 레그 1회만 돈다.
-      # ★ui/dist 선행 빌드 필수 — generate_context!(tauri-codegen)가 frontendDist 부재 시 컴파일 패닉
-      #   ("The `frontendDist` configuration is set to ... but this path doesn't exist"). ui/dist는 .gitignore
-      #   대상이라 체크아웃엔 없고, 평소엔 뒤 build 스텝의 beforeBuildCommand(bundle-prep)가 만든다.
-      - name: src-tauri 단위 테스트 (cargo test -p cys-app · macOS 네이티브)
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # ★cys-app 컴파일은 tauri build script 를 통과해야 하고, 그 스크립트는 tauri.conf.json 의
-          #   bundle 자원 **실재**를 전부 요구한다(v0.13.0 CI 실패의 실제 원인 — 사이드카만이 아니었다).
-          #   클린 체크아웃 실측 필수 목록: ①ui/dist(frontendDist·generate_context!) ②binaries/cys-<triple>
-          #   ③binaries/cysd-<triple> ④resources/pack.tar.gz ⑤resources/pack-manifest.json ⑥runtime/.
-          #   ①~⑤는 bundle-prep.sh(= beforeBuildCommand 와 **같은 스크립트**)가 실제 내용으로 만든다.
-          #   여기서 개별 복사로 흉내내면 tauri.conf.json 이 바뀔 때 조용히 어긋나므로 표준 스크립트를
-          #   그대로 부른다(드리프트 0). 뒤 release 빌드가 같은 산출물을 재사용해 순비용도 거의 0.
-          #   ⑥runtime/ 만 뒤 '동봉 런타임 준비' 스텝 소관이라, 존재 검사만 충족하도록 빈 디렉터리를
-          #   미리 만든다(내용은 그 스텝이 채운다). CYS_TARGET 미설정 = 호스트 트리플(이 레그와 일치).
-          mkdir -p src-tauri/runtime
-          bash scripts/bundle-prep.sh
-          CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app
-
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
       # tauri.windows.conf.json bundle.resources("runtime/")가 이 트리를 NSIS에 싣는다.
       - name: 동봉 런타임 준비 (PortableGit + Python embeddable — Windows 전용)
@@ -305,6 +281,21 @@ jobs:
             --playwright-root cysjavis-pack/browserd/node_modules/playwright-core \
             --source-revision "$GITHUB_SHA" \
             --output src-tauri/resources/browser-runtime
+
+      # src-tauri(cys-app) 단위 게이트 — 위 phoenix 스텝의 `cargo test --bin cysd|--lib`는 둘 다 루트
+      # crate(cys-terminal)라 src-tauri crate 테스트(browserd state 파싱 등 Tauri command 단위)가 CI에서
+      # 한 번도 돌지 않았다. host-아키텍처 무관 순수 로직이라 phoenix 게이트와 동일하게 네이티브 레그 1회만 돈다.
+      # ★Tauri build script는 tauri.conf.json의 모든 bundle 자원이 실제로 있어야 한다. 따라서 고정
+      #   Browser Runtime을 위 단계에서 검증·스테이징한 뒤에만 이 테스트를 실행한다. ui/dist, sidecar,
+      #   pack 자산은 표준 beforeBuildCommand와 같은 bundle-prep.sh로 만들며, 런타임 트리는 앞 단계의
+      #   실제 산출물을 그대로 사용한다.
+      - name: src-tauri 단위 테스트 (cargo test -p cys-app · macOS 네이티브)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/bundle-prep.sh
+          CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app
 
       - name: Install Browser Runtime minisign verifier (macOS)
         if: matrix.platform == 'macos-latest'

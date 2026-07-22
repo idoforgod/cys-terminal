@@ -176,6 +176,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
             candidate.index("Build, notarize, staple and normalize macOS candidate"),
         )
 
+    def test_native_macos_app_tests_run_after_verified_browser_runtime_staging(self) -> None:
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertLess(
+            candidate.index("- name: Stage verified Browser Runtime"),
+            candidate.index("- name: src-tauri 단위 테스트"),
+        )
+
     def test_browser_runtime_qualification_precedes_final_metadata_hashes(self) -> None:
         macos = MACOS_BUILD.read_text(encoding="utf-8")
         windows = WINDOWS_BUILD.read_text(encoding="utf-8")
