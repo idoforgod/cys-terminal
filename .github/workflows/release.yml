@@ -315,7 +315,7 @@ jobs:
             brew untap aws/tap
           fi
           brew install minisign
-          minisign --version
+          test -x "$(command -v minisign)"
 
       - name: Install Browser Runtime minisign verifier (Windows)
         if: matrix.platform == 'windows-latest'
@@ -323,8 +323,7 @@ jobs:
         run: |
           choco install minisign --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
-          minisign --version
-          if ($LASTEXITCODE -ne 0) { throw 'minisign verification failed' }
+          Get-Command minisign -ErrorAction Stop | Out-Null
 
       - name: Materialize Browser Runtime release trust inputs (macOS)
         if: matrix.platform == 'macos-latest'

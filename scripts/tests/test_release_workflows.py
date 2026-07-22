@@ -124,8 +124,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertGreaterEqual(candidate.count(name), 2, f"missing cross-platform wiring: {name}")
         self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY_B64", candidate)
         self.assertIn("CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64", candidate)
-        self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign --version"))
-        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign --version"))
+        self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+command -v minisign"))
+        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+Get-Command minisign"))
+        self.assertNotIn("minisign --version", candidate)
 
     def test_macos_minisign_install_removes_only_the_known_untrusted_aws_tap(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
