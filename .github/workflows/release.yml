@@ -312,8 +312,24 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install minisign --yes --no-progress
-          if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $installRoot = Join-Path $env:RUNNER_TEMP 'minisign-0.12'
+          $expectedSha256 = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip' `
+            -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "minisign archive SHA256 mismatch: $actualSha256"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $installRoot
+          $minisignDirectory = Join-Path $installRoot 'minisign-win64\x86_64'
+          $minisignExecutable = Join-Path $minisignDirectory 'minisign.exe'
+          if (-not (Test-Path -LiteralPath $minisignExecutable -PathType Leaf)) {
+            throw 'minisign executable is missing from the pinned archive'
+          }
+          $env:PATH = "$minisignDirectory;$env:PATH"
+          $minisignDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           Get-Command minisign -ErrorAction Stop | Out-Null
 
       - name: Materialize Browser Runtime release trust inputs (macOS)
