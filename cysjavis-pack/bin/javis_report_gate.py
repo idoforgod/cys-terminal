@@ -233,17 +233,24 @@ def load_owner_standby(state_dir, now_epoch):
             continue
         dec = meta.get("declared_epoch")
         ttl = meta.get("ttl_secs")
-        # bool은 int 하위형 — epoch/ttl 값으로는 손상 마커이므로 배제(True/False 오해 차단).
-        if isinstance(dec, bool) or isinstance(ttl, bool):
-            continue
-        if not isinstance(dec, (int, float)) or not isinstance(ttl, (int, float)):
-            continue
-        if not math.isfinite(dec) or not math.isfinite(ttl):
-            continue                       # 비유한(NaN/Inf) → fail-open 제외
-        if now_epoch is not None and dec > now_epoch + STANDBY_FUTURE_GRACE_SECS:
-            continue                       # 미래 epoch(유예 초과) → fail-open 제외
-        if now_epoch is not None and (now_epoch - dec) >= ttl:
-            continue                       # 만료 → 제외
+        # ★항목별 수치 검증 예외 격리(codex P1 잔여·2026-07-23): math.isfinite는 거대 int
+        # (예: 10**400)에서 OverflowError('int too large to convert to float')를 던진다. 마커
+        # 파싱 예외가 게이트 밖으로 탈출하면 load_owner_standby 호출 전체가 무너져 경보 전멸
+        # (억제 해제보다 나쁨) — 예외는 해당 항목만 무효(fail-open)로 삼키고 다음으로 넘어간다.
+        try:
+            # bool은 int 하위형 — epoch/ttl 값으로는 손상 마커이므로 배제(True/False 오해 차단).
+            if isinstance(dec, bool) or isinstance(ttl, bool):
+                continue
+            if not isinstance(dec, (int, float)) or not isinstance(ttl, (int, float)):
+                continue
+            if not math.isfinite(dec) or not math.isfinite(ttl):
+                continue                   # 비유한(NaN/Inf) → fail-open 제외
+            if now_epoch is not None and dec > now_epoch + STANDBY_FUTURE_GRACE_SECS:
+                continue                   # 미래 epoch(유예 초과) → fail-open 제외
+            if now_epoch is not None and (now_epoch - dec) >= ttl:
+                continue                   # 만료 → 제외
+        except (OverflowError, TypeError, ValueError):
+            continue                       # 마커 파싱 예외 → 해당 항목만 fail-open(게이트 밖 탈출 금지)
         nr = _norm_role(role)
         if not nr:
             continue

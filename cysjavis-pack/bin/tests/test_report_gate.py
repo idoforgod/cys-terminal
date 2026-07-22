@@ -1192,6 +1192,29 @@ class OwnerStandby(unittest.TestCase):
             _write_standby(t, ["worker"], declared_epoch=1_000_000, ttl_secs=21_600)
             self.assertIn("worker", G.load_owner_standby(t, 1_000_000))
 
+    # ── ①codex(잔여 P1): 거대 정수 epoch/ttl은 항목만 fail-open(예외가 게이트 밖 탈출 금지) ──
+    def test_huge_int_marker_fails_open_isolated(self):
+        # math.isfinite(10**400) → OverflowError. 예외가 load_owner_standby를 벗어나면 게이트
+        # 전체가 무너져 경보 전멸 — 손상 항목만 무효화하고 정상 항목은 살아야 한다.
+        huge = 10 ** 400
+        with tempfile.TemporaryDirectory() as t:
+            # 거대 epoch 손상 마커 + 정상 마커 공존
+            nodes = {"worker": {"declared_epoch": huge, "ttl_secs": 21_600},
+                     "cso": {"declared_epoch": 1_000_000, "ttl_secs": 21_600}}
+            with open(os.path.join(t, "owner_standby.json"), "w", encoding="utf-8") as f:
+                json.dump({"nodes": nodes}, f)
+            got = G.load_owner_standby(t, 1_000_000)   # 예외 던지면 여기서 에러(=결함)
+            self.assertNotIn("worker", got, "거대 epoch 항목은 fail-open 제외")
+            self.assertIn("cso", got, "예외가 게이트를 무너뜨리지 않고 정상 항목은 유효")
+            # 거대 ttl도 동일(isfinite(huge ttl) OverflowError)
+            nodes2 = {"worker": {"declared_epoch": 1_000_000, "ttl_secs": huge},
+                      "cso": {"declared_epoch": 1_000_000, "ttl_secs": 21_600}}
+            with open(os.path.join(t, "owner_standby.json"), "w", encoding="utf-8") as f:
+                json.dump({"nodes": nodes2}, f)
+            got2 = G.load_owner_standby(t, 1_000_000)
+            self.assertNotIn("worker", got2, "거대 ttl 항목은 fail-open 제외")
+            self.assertIn("cso", got2, "정상 항목 유효")
+
     # ── ②codex(P2): 정규화 충돌(서로 다른 raw가 같은 canonical)은 그 키 fail-open 제외 ──
     def test_canonical_collision_fails_open(self):
         with tempfile.TemporaryDirectory() as t:
