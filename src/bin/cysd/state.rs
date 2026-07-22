@@ -2710,6 +2710,73 @@ mod tests {
                    "이미 표식된 항목은 이중 표식 금지(멱등)");
     }
 
+    /// SF-QUEUE-REPLAY-STALE E2E: 실제 persist→(새 Daemon)load→rehome 왕복을 **2회**(재기동 2회
+    /// 모사) 거쳐도 표식이 정확히 1개만 붙고 원문이 보존되는지 핀한다. 단위테스트
+    /// rehome_stamps_stale_replay가 restored_queue에 직접 주입해 rehome의 표식 부여·멱등을 핀한다면,
+    /// 이 테스트는 그 사이의 실제 큐 WAL 경계(persist_queue_state→queue-state.json→load_queue_state)를
+    /// 건너 멱등이 in-memory가 아니라 재기동을 넘겨서도 성립함을 핀한다. 같은 socket PathBuf를
+    /// 재사용하면 state_dir이 동일해 새 Daemon::new가 직전 스냅샷을 재로드한다(=재기동 모사).
+    #[test]
+    fn e2e_stale_replay_survives_two_restarts_single_stamp() {
+        let sock = isolated_sock("stale-replay-e2e");
+        const RAW: &str = "옛 지시 본문(재기동 생존 대상)";
+        let expected = format!("{}{}", STALE_REPLAY_STAMP, RAW);
+
+        // ── 재기동 #0(원 데몬): 미표식 --queued 메시지가 worker 큐에 미배달로 남고 persist ──
+        {
+            let d0 = Daemon::new(sock.clone());
+            let s = d0
+                .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+                .unwrap();
+            s.pending_queue.lock().unwrap().push_back(RAW.to_string());
+            d0.persist_queue_state(); // queue-state.json 기록(mid·surface_id·text·role)
+        }
+
+        // ── 재기동 #1: 새 Daemon이 스냅샷 재로드 → 새 worker로 rehome(표식 1회 부여) ──
+        {
+            let d1 = Daemon::new(sock.clone()); // load_queue_state로 restored_queue 채움(재기동)
+            assert_eq!(d1.restored_queue.lock().unwrap().len(), 1,
+                       "persist된 미배달 큐가 재기동을 넘겨 restored_queue로 복원");
+            let s1 = d1
+                .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+                .unwrap();
+            assert_eq!(d1.rehome_restored_queue(), 1, "복원 항목 1건 rehome");
+            {
+                let q = s1.pending_queue.lock().unwrap();
+                assert_eq!(q.len(), 1, "rehome 후 배달 경로(pending_queue)에 정확히 1건");
+                assert_eq!(q[0], expected, "1차 재기동: 미표식 원문에 표식 1회 부여");
+            }
+            d1.persist_queue_state(); // 이제 표식된 텍스트가 스냅샷에 기록된다
+        }
+
+        // ── 재기동 #2: 표식된 스냅샷을 다시 재로드 → rehome 멱등(이중 표식 금지) + deliver 페이로드 ──
+        {
+            let d2 = Daemon::new(sock.clone());
+            assert_eq!(d2.restored_queue.lock().unwrap().len(), 1,
+                       "표식된 큐도 재기동을 넘겨 복원");
+            let s2 = d2
+                .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+                .unwrap();
+            assert_eq!(d2.rehome_restored_queue(), 1, "복원 항목 1건 rehome(2차)");
+            // deliver 경로 검증(하네스 가능 범위): production deliver_queued의 임계영역과 동일 순서
+            // (락→front().cloned()→인계→pop_front)를 국소 미러링해 배달 페이로드가 '표식 1개 원문'임을
+            // 핀한다. deliver_queued 자체는 private·타이밍 의존이라 직접 호출하지 않는다(governance.rs의
+            // deliver_one_atomic 테스트 프리미티브와 동일 근거).
+            let delivered = {
+                let mut q = s2.pending_queue.lock().unwrap();
+                assert_eq!(q.len(), 1, "2차 재기동 rehome 후에도 정확히 1건(누적 아님)");
+                let front = q.front().cloned().expect("배달 대상 존재");
+                q.pop_front(); // 인계 성공 모사(front→pop)
+                front
+            };
+            assert_eq!(delivered, expected,
+                       "2회 재기동을 넘겨도 표식은 정확히 1개(멱등)·원문 보존 = deliver 페이로드");
+            // 이중 표식 회귀 가드: 표식 프리픽스 이후 본문이 또 표식으로 시작하면 안 된다.
+            assert!(!delivered[STALE_REPLAY_STAMP.len()..].starts_with(STALE_REPLAY_STAMP),
+                    "표식이 이중으로 붙지 않았다(원문 보존)");
+        }
+    }
+
     /// (W1-6 a·d) 계정 config_dir 영속 라운드트립 + 구 topology 하위호환.
     #[test]
     fn w1_topology_persists_config_dir_and_old_compat() {

@@ -1058,8 +1058,8 @@ SILENT_FAILURES = [
      "kind": "deterministic"},
     {"id": "SF-QUEUE-REPLAY-STALE",
      "source": "큐 영속·재기동 재배달(cysd rehome_restored_queue) — 2026-07-23 실사고(07-20 하달이 codex 재기동 시 무표식 재생·3중 정지선으로 차단)",
-     "constraint": "재기동을 넘겨 복원된 큐(restored_queue) 항목은 배달 시 '[재생·오래된큐]' 표식 필수 — 구세대 지시가 현행 지시처럼 무표식 재생 금지",
-     "detection": "rehome_restored_queue가 restored_queue 항목을 살아있는 role surface의 pending_queue로 이관할 때 텍스트에 '[재생·오래된큐]' 프리픽스를 부여하지 않으면 위반(재기동 생존 큐=stale). cysd 단위테스트 rehome_stamps_stale_replay가 결정론 검증",
+     "constraint": "재기동을 넘겨 복원된 큐(restored_queue) 항목은 배달 시 '[재생·오래된큐]' 표식 필수 — 구세대 지시가 현행 지시처럼 무표식 재생 금지. 설계 결정: 표식이 '[master→…]' 라벨 앞에 붙어 엄격 라벨 게이트에 반려되는 것은 의도된 보수 동작(재기동 생존 지시=stale 가능→노드 반려·master 조회가 실사고 실증 정답 경로)",
+     "detection": "rehome_restored_queue가 restored_queue 항목을 살아있는 role surface의 pending_queue로 이관할 때 텍스트에 '[재생·오래된큐]' 프리픽스를 부여하지 않으면 위반(재기동 생존 큐=stale). 단위테스트 rehome_stamps_stale_replay가 rehome의 표식 부여·멱등을, E2E 테스트 e2e_stale_replay_survives_two_restarts_single_stamp가 실제 persist→load→rehome 2회 왕복(재기동 2회)의 단일 표식·원문 보존·deliver 페이로드를 결정론 핀",
      "kind": "deterministic"},
 ]
 
