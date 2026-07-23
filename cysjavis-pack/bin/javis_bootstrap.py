@@ -234,7 +234,8 @@ def _surface_id_env():
     """순수 판정: 자기 surface id env를 우선순위대로 읽어 _sid_norm 적용값 반환(없으면 None).
     우선순위 AITERM_SURFACE_ID → JAVIS_SURFACE_ID → CYS_SURFACE_ID — orchestra `_surface_id_env`
     (cys::env_compat AITERM_*→JAVIS_*→CYS_* 정합)와 동일. 첫 비어있지 않은 값에 _sid_norm 적용
-    (비숫자면 None). 셋 다 미설정(외부 셸)이면 None."""
+    (비숫자면 None). 셋 다 미설정(외부 셸)이면 None.
+    ★계약 복제 고지: javis_orchestra.py `_surface_id_env`(env 3종 우선순위)/`_cys_list_masters`(탭 고정 컬럼)와 동일 계약 — cys list 형식·env 규약 변경 시 **두 파일 동시 수정**(샷건 서저리 방지 상호참조)."""
     for k in ("AITERM_SURFACE_ID", "JAVIS_SURFACE_ID", "CYS_SURFACE_ID"):
         v = os.environ.get(k, "").strip()
         if v:
@@ -256,7 +257,8 @@ def _parse_role_holder(list_output, role="master"):
         (계약 위반 = '모름' → S6 강등). 빈 입력은 (None, True)=정상 부재.
       - 어떤 예외도 (None, False) — 파싱 실패는 '모름'이지 '부재'가 아니다(부재=(None, True)).
       - 반환 holder 는 _sid_norm 적용값.
-    상류에 `cys list --json` 제안(§L3)이 수용되면 이 함수만 교체한다(호출부 불변)."""
+    상류에 `cys list --json` 제안(§L3)이 수용되면 이 함수만 교체한다(호출부 불변).
+    ★계약 복제 고지: javis_orchestra.py `_surface_id_env`(env 3종 우선순위)/`_cys_list_masters`(탭 고정 컬럼)와 동일 계약 — cys list 형식·env 규약 변경 시 **두 파일 동시 수정**(샷건 서저리 방지 상호참조)."""
     if list_output is None:
         return (None, False)
     text = str(list_output)
