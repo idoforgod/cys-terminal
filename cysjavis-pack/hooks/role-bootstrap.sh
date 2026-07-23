@@ -77,6 +77,17 @@ fi
 STATE="$HOME/.cys/state"; mkdir -p "$STATE" 2>/dev/null
 LOG="$STATE/role-bootstrap.log"
 
+# ── L1-a 선(先)-claim: 고아화 전(훅 셸=pane 계보 내) 신원 의존 작업(claim)을 끝낸다 ──
+# 계약: 유계 5s·완전 fail-open·결과 무해석(판정 단일 소유자=bootstrap step ③)
+"$CYS_PY" - <<'PY' 2>/dev/null || true
+import subprocess
+try:
+    subprocess.run(["cys", "claim-role", "master", "--takeover-empty-seat"],
+                   capture_output=True, timeout=5)
+except Exception:
+    pass
+PY
+
 # 결정론 부트스트랩 백그라운드 발화(env 상속). 부모(claude) 종료와 무관하게 완주.
 if command -v setsid >/dev/null 2>&1; then
   setsid "$CYS_PY" "$BOOT" >"$LOG" 2>&1 &
