@@ -302,6 +302,75 @@ def _classify_claim_step(self_sid, pre_holder, pre_parse_ok,
     return ("exit10", False, "S4 거부 후 재실측 보유자 부재 — 신원 해석 실패 확정(좌석 경합 아님)")
 
 
+# ── ③′ 버그 B(master 권한 플래그 부재) 감지용 순수 함수 ──
+def _pane_shell_pid(list_output, self_sid):
+    """순수 판정: cys list 텍스트에서 자기 surface(self_sid) 행의 pid(pane 셸) → int|None.
+    self_sid 는 _sid_norm 값. 파싱 불가/미발견/예외 → None."""
+    if not self_sid:
+        return None
+    try:
+        for line in str(list_output).splitlines():
+            toks = line.split()
+            if not toks or not toks[0].startswith("surface:"):
+                continue
+            if _sid_norm(toks[0]) != self_sid:
+                continue
+            for t in toks:
+                if t.startswith("pid="):
+                    v = t[len("pid="):].strip()
+                    return int(v) if v.isdigit() else None
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _parse_ps_snapshot(ps_output):
+    """순수 판정: `ps -axo pid=,ppid=,args=` 텍스트 → [(pid, ppid, args), ...]. 파싱 불가 행 skip."""
+    rows = []
+    for line in str(ps_output).splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        rows.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) > 2 else ""))
+    return rows
+
+
+def _descendant_claude_missing_flag(ps_rows, root_pid):
+    """순수 판정: root_pid 자손 트리(★하향 — bootstrap 은 고아라 상향 불가, §10-R3 발견 6)에서
+    args 에 'claude' 포함 프로세스를 찾아 판정. 반환:
+      True  = claude 발견 & 그중 하나라도 --dangerously-skip-permissions 부재(경고 대상)
+      False = claude 발견 & 전부 플래그 보유
+      None  = claude 미발견/root None(판정 불가 — 무경고 skip: 오탐보다 미탐이 안전)."""
+    if root_pid is None:
+        return None
+    children = {}
+    argmap = {}
+    for pid, ppid, args in ps_rows:
+        children.setdefault(ppid, []).append(pid)
+        argmap[pid] = args
+    seen = set()
+    stack = [root_pid]
+    found_claude = False
+    missing = False
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        a = argmap.get(cur, "")
+        if "claude" in a:
+            found_claude = True
+            if "--dangerously-skip-permissions" not in a:
+                missing = True
+        for ch in children.get(cur, []):
+            if ch not in seen:
+                stack.append(ch)
+    if not found_claude:
+        return None
+    return missing
+
+
 def _notify_loud(title, body):
     """실패를 시끄럽게 알림 — feed push(승인 채널) 우선, 실패 시 cys send --queued --to master 폴백.
     둘 다 best-effort·짧은 timeout(데몬 부재 시 행 금지·graceful). 성공 채널명 또는 'none' 반환(흔적)."""
@@ -801,6 +870,28 @@ def cmd_run():
             return log.fail("③claim-role", 1, msg, 10)
         if warn:
             _progress("⚠ ③ " + detail)
+
+    # ── ③′ 버그 B 감지(③ 통과 직후·비치명·모든 실패 무해 skip) ──
+    # master pane 에서 도는 claude 에 --dangerously-skip-permissions 부재 시 Feed 경고 1회.
+    # ★고아 내성(§10-R3 발견 6): bootstrap 자신은 고아(parent=launchd)라 ppid 상향으로 claude 에
+    #   절대 도달 못 한다 — pane 셸 pid 기준 자손(하향) 탐색으로 방향을 뒤집는다. claude 미발견·판정
+    #   불가 = 무경고 skip(오탐보다 미탐이 안전 — 경고는 편의 기능이지 게이트가 아니다).
+    try:
+        _lc_code, _lc_out = _run(["cys", "list"], timeout=15)
+        _pane_pid = _pane_shell_pid(_lc_out, self_sid) if _lc_code == 0 else None
+        if _pane_pid is not None:
+            _ps_code, _ps_out = _run(["ps", "-axo", "pid=,ppid=,args="], timeout=15)
+            if _ps_code == 0 and _descendant_claude_missing_flag(
+                    _parse_ps_snapshot(_ps_out), _pane_pid) is True:
+                _run(["cys", "feed", "push", "--kind", "bootstrap-warn",
+                      "--title", "master 권한 플래그 부재",
+                      "--body", ("이 pane 의 claude 에 --dangerously-skip-permissions 가 없습니다 — master 는 "
+                                 "무승인 모드로 기동해야 워커·리뷰어·CSO 의 승인 프롬프트에 즉시 응답할 수 "
+                                 "있습니다. `claude --dangerously-skip-permissions`(또는 alias "
+                                 "claude-master)로 재기동을 권장합니다.")], timeout=10)
+                log.step("③′flag-warn", 0, "claude 권한 플래그 부재 — Feed 경고 1회 push")
+    except Exception:
+        pass  # ③′는 완전 비치명 — 어떤 실패도 부트를 막지 않는다
 
     # ── 증분2 ⓐ CEO 티켓 권한 게이트(P7) — 부서 레인 팀 기동 전. 티켓 부재/만료=단독 각성 강등(exit 0) ──
     dept = _socket_dept()

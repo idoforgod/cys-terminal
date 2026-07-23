@@ -1,5 +1,5 @@
 {
-  "_doc": "T1-3 송신 ACL — role→role stdin 주입 정책. 데몬이 발신자 신원을 커널 peer pid로 직접 도출해 평가한다 (클라이언트 자기신고 from은 검증으로 대체). 규칙은 위에서부터 첫 매칭 승리, 글롭(*)은 역할명 패턴. from 특수값: 'external'=pane 밖 프로세스(오너 셸·Tauri 등), '(pane)'=역할 없는 pane. default: allow | deny.",
+  "_doc": "T1-3 송신 ACL — role→role stdin 주입 정책. 데몬이 발신자 신원을 커널 peer pid로 직접 도출해 평가한다 (클라이언트 자기신고 from은 검증으로 대체). 규칙은 위에서부터 첫 매칭 승리, 글롭(*)은 역할명 패턴. from 특수값: 'external'=pane 밖 프로세스(오너 셸·Tauri 등), '(pane)'=역할 없는 pane. default: allow | deny. ★계약: ACL 규칙 변경 시 부트스트랩 경로(고아=external 신원) 회귀 테스트 필수 — external 차단은 팀 부트를 침묵 파손한다.",
   "default": "allow",
   "rules": [
     { "from": "reviewer-*", "to": "worker*", "allow": false,
