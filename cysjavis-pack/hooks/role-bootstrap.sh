@@ -36,7 +36,10 @@ except Exception: print('')" 2>/dev/null)
 # ── role-aware 게이트(arch#1): 이 pane의 데몬 권위 역할이 비-마스터면 오발화 금지 ──
 # 워커/CSO/리뷰어 pane이 "너는 마스터다"를 포함한 프롬프트(위임 과제·인용·이 성찰문 자체)를 받아도
 # 마스터 부트를 발화하면 안 된다. cys surface-role은 CYS_SURFACE_ID로 자기 surface 역할을 반환(미claim=빈).
-MYROLE="$(cys surface-role 2>/dev/null | head -1 | tr -d '[:space:]')"
+# ★surface-role 조회는 exit code를 POSIX-안전하게 포집한다(파이프 내 rc 소실 금지 — 원시 출력을
+# 변수에 먼저 받고 rc를 저장한 뒤 후처리). rc는 아래 L1-a 선-claim fail-closed 게이트에서 쓴다.
+MYROLE_RAW="$(cys surface-role 2>/dev/null)"; MYROLE_RC=$?
+MYROLE="$(printf '%s' "$MYROLE_RAW" | head -1 | tr -d '[:space:]')"
 case "$MYROLE" in
   worker|cso|reviewer-*|reviewer) exit 0 ;;   # 비-마스터 pane — 마스터 부트 금지
 esac
@@ -77,7 +80,12 @@ fi
 STATE="$HOME/.cys/state"; mkdir -p "$STATE" 2>/dev/null
 LOG="$STATE/role-bootstrap.log"
 
-# ── L1-a 선(先)-claim: 고아화 전(훅 셸=pane 계보 내) 신원 의존 작업(claim)을 끝낸다 ──
+# ── L1-a 선(先)-claim fail-closed 게이트(reviewer P2): 고아화 전(훅 셸=pane 계보 내) 신원 의존
+#    작업(claim)을 끝내되, surface-role 판정 불가(rc≠0) 시 선-claim만 skip한다. surface-role 일시
+#    실패 시 워커 pane에서 in-tree 선-claim이 오발화하는 증폭면을 차단(고아 bootstrap은 신원 게이트
+#    (step ③)에서 안전하게 실패하므로 선-claim skip에 따른 위험이 없다 — 부트스트랩 발화는 기존대로).
+#    rc=0이고 역할이 빈값(미claim) 또는 master일 때만 선-claim 실행한다. ──
+if [ "$MYROLE_RC" -eq 0 ] && { [ -z "$MYROLE" ] || [ "$MYROLE" = "master" ]; }; then
 # 계약: 유계 5s·완전 fail-open·결과 무해석(판정 단일 소유자=bootstrap step ③)
 "$CYS_PY" - <<'PY' 2>/dev/null || true
 import subprocess
@@ -87,6 +95,7 @@ try:
 except Exception:
     pass
 PY
+fi
 
 # 결정론 부트스트랩 백그라운드 발화(env 상속). 부모(claude) 종료와 무관하게 완주.
 if command -v setsid >/dev/null 2>&1; then

@@ -230,49 +230,90 @@ def _sid_norm(s):
     return t if t.isdigit() else None
 
 
+def _surface_id_env():
+    """순수 판정: 자기 surface id env를 우선순위대로 읽어 _sid_norm 적용값 반환(없으면 None).
+    우선순위 AITERM_SURFACE_ID → JAVIS_SURFACE_ID → CYS_SURFACE_ID — orchestra `_surface_id_env`
+    (cys::env_compat AITERM_*→JAVIS_*→CYS_* 정합)와 동일. 첫 비어있지 않은 값에 _sid_norm 적용
+    (비숫자면 None). 셋 다 미설정(외부 셸)이면 None."""
+    for k in ("AITERM_SURFACE_ID", "JAVIS_SURFACE_ID", "CYS_SURFACE_ID"):
+        v = os.environ.get(k, "").strip()
+        if v:
+            return _sid_norm(v)
+    return None
+
+
 def _parse_role_holder(list_output, role="master"):
     """순수 판정: cys list 텍스트에서 role 보유 surface id → (holder_sid_norm|None, parse_ok bool).
-    ★파싱 계약(취약 계약의 명시적 통제):
-      - 행 단위, 탭/공백 분리 토큰. 첫 토큰이 'surface:' 접두가 아니면 그 행 skip(헤더·경고행 내성).
-      - 정확히 'role=<role>' 토큰 완전일치(부분문자열 금지 — 'role=master' 가 'role=master-x' 에
-        오매칭되지 않게 토큰 == 비교).
-      - exited=true 토큰이 있는 행은 생존 좌석 아님 → 보유자로 세지 않는다.
+    ★파싱 계약(orchestra `_cys_list_masters` 고정 컬럼 계약과 정합):
+      cys list 라인 = '{surface:N}\\trole={role}\\tpid={pid}\\texited={bool}\\t{title}\\t{cwd}'.
+      - **탭 고정 컬럼**(line.split('\\t')): f[0]=surface:N · f[1]=role=X · f[3]=exited=bool.
+        임의 토큰 매칭이 아니라 컬럼 위치로 판정 — pane 제목/cwd(f[4]/f[5])에 'role=master'·
+        'exited=true'가 들어가도 오판 없음(악성 제목 내성).
+      - 컬럼 4개 미만이거나 f[0]이 'surface:' 접두 아니면 그 행 skip(헤더·경고행 내성).
+      - role은 f[1]의 'role=' 접두 제거 후 완전일치(== 비교 — 'master-x' 오매칭 차단).
+      - f[3] exited=true 행은 생존 좌석 아님 → 보유자로 세지 않는다.
+      - ★구조 드리프트: 비어있지 않은 입력인데 탭 있는(surface:) 행이 0개면 parse_ok=False
+        (계약 위반 = '모름' → S6 강등). 빈 입력은 (None, True)=정상 부재.
       - 어떤 예외도 (None, False) — 파싱 실패는 '모름'이지 '부재'가 아니다(부재=(None, True)).
       - 반환 holder 는 _sid_norm 적용값.
     상류에 `cys list --json` 제안(§L3)이 수용되면 이 함수만 교체한다(호출부 불변)."""
     if list_output is None:
         return (None, False)
-    target = "role=" + role
+    text = str(list_output)
     try:
-        for line in str(list_output).splitlines():
-            toks = line.split()
-            if not toks or not toks[0].startswith("surface:"):
+        saw_tab_row = False
+        holder = None
+        for line in text.splitlines():
+            f = line.split("\t")
+            if len(f) < 4 or not f[0].startswith("surface:"):
                 continue
-            if any(t == "exited=true" for t in toks):
+            saw_tab_row = True
+            r = f[1][len("role="):] if f[1].startswith("role=") else ""
+            if f[3].strip().endswith("true"):  # exited surface 무시
                 continue
-            if any(t == target for t in toks):
-                return (_sid_norm(toks[0]), True)
-        return (None, True)
+            if r == role and holder is None:
+                holder = _sid_norm(f[0])
+        # 구조 드리프트: 비어있지 않은데 탭 고정 컬럼 행 0개 → parse_ok=False(S6 강등)
+        if not saw_tab_row and text.strip():
+            return (None, False)
+        return (holder, True)
     except Exception:
         return (None, False)
 
 
+# step ③ 판정표 v3에서 사용하는 거부 사유 힌트:
+#  _LIVE_HOLDER_HINTS — 데몬(cysd handlers.rs)이 살아있는 보유자 때문에 거부할 때의 실측 문자열.
+#    실제 거부문: "claim_role denied: privileged role '{role}' is held by live surface {N}".
+#    이 신호는 **데몬의 권위적 거부**이므로 list skew(재실측이 빈 경우 등)와 무관하게 exit 7로 판정한다
+#    (원사고의 거울상 방지 — 데몬이 명시 거부했는데 list 비면 거짓 'master 부재·재선언' 안내가 나가던 결함).
+_LIVE_HOLDER_HINTS = ("held by live surface",)
+
+
 def _classify_claim_step(self_sid, pre_holder, pre_parse_ok,
-                         claim_attempted, claim_ok, post_holder, post_parse_ok):
-    """순수 판정: step ③ 판정표 v2(§3-2-1 · SIM2 개정판). subprocess 미접촉 — 관측만 받아 판정.
+                         claim_attempted, claim_ok, post_holder, post_parse_ok,
+                         claim_out=""):
+    """순수 판정: step ③ 판정표 v3(§3-2-1 · 거부 사유 tie-break 복권). subprocess 미접촉 — 관측만 받아 판정.
     반환: (verdict, warn, detail)  verdict ∈ 'pass'|'exit7'|'exit10'|'fallback'.
     관측 규약:
-      self_sid       = _sid_norm(CYS_SURFACE_ID)  (None=자기 신원 미상)
+      self_sid       = _surface_id_env()  (None=자기 신원 미상)
       pre_holder     = 선-claim(claim 시도 전) list 실측 보유자 _sid_norm (None=부재/미상)
       pre_parse_ok   = 선-claim list 파싱 성공 여부
       claim_attempted= S1로 생략됐으면 False, 아니면 True
       claim_ok       = claim 성공(True)/거부(False)/미시도(None)
       post_holder/post_parse_ok = claim 거부 후 재실측 보유자/파싱성공(미시도 시 (None, None) 관례)
-    판정 흐름: S6 파싱 실패→fallback / S1 보유자==자기→pass(claim 0회) / S2 그 외→claim 1회(호출부) /
-      S3 성공→pass / 거부 후 재실측: S4 부재→exit10 · S5 타 보유자→exit7 · S7 자기→pass+경고 ·
-      재실측 파싱 실패→fallback. ★U2-x 승계 회귀 봉인: S1 아님(보유자 존재 등)인데 claim 미시도로
-      들어오면 --takeover-empty-seat 빈 좌석 승계 경로를 우회하는 v1 회귀이므로 통과로 새지 않게
-      fallback(+경고)으로 가둔다."""
+      claim_out      = claim 거부 시 데몬 출력 텍스트(사유 판별용 — v3 tie-break)
+    판정 흐름(v3): S6 선-파싱 실패→fallback / S1 보유자==자기→pass(claim 0회) / U2-x claim 미시도→fallback /
+      S3 성공→pass / **거부 후**:
+        (v3-a) claim_out에 live-holder 힌트 → exit7 (list와 무관 — 데몬의 권위적 거부 복권)
+        (v3-b) 재실측 파싱 실패 → fallback(L2 강등)
+        (v3-c) 재실측 보유자==자기 → pass+경고(S7)
+        (v3-d) 재실측 타 보유자 → exit7(S5)
+        (v3-e) 재실측 부재 AND claim_out에 신원 힌트 확증 → exit10(S4 강화)
+        (v3-f) 재실측 부재 + 어떤 힌트도 없음(미지 사유) → fallback(L2 강등 — 검증된 구본 분류가 미지의 안전망)
+    ★v3 핵심(원사고의 거울상 봉인): 종전 v2는 거부 후 post-list가 비면 무조건 exit10을 냈다. 데몬이
+    'live surface가 쥐고 있다'고 명시 거부해도 list skew 시 거짓 'master 부재·재선언' 안내가 나갔다.
+    v3-a로 데몬 권위 거부를 복권하고(exit7), v3-e로 exit10을 '신원 힌트 확증' 시로 강화하며, 미지 사유는
+    v3-f로 검증된 L2 fallback에 가둔다(미지의 안전망은 보수적 구본 분류)."""
     # S6: 선-실측 파싱 실패 → 검증된 L2 경로로 강등(신규 코드가 구본보다 나빠지지 않게)
     if not pre_parse_ok:
         return ("fallback", False, "선-claim list 파싱 실패(parse_ok=False) — L2 경로 강등(S6)")
@@ -287,38 +328,50 @@ def _classify_claim_step(self_sid, pre_holder, pre_parse_ok,
     # S3: claim 성공 → 통과(정상 등록 또는 정당 승계)
     if claim_ok:
         return ("pass", False, "S3 claim 성공 — 정상 등록 또는 빈 좌석 정당 승계")
-    # claim 거부 → 재실측 판별
+    # ── claim 거부 → v3 tie-break 판별 ──
+    claim_out = claim_out or ""
+    # v3-a: 데몬 권위 거부(live-holder 힌트) → list 무관 exit7(데몬 거부 신호 복권)
+    if any(h in claim_out for h in _LIVE_HOLDER_HINTS):
+        return ("exit7", False,
+                "v3-a 거부 출력에 live-holder 힌트('held by live surface') — 데몬 권위 거부·즉시 판정(list 무관)")
+    # v3-b: 재실측 파싱 실패 → L2 강등
     if not post_parse_ok:
         return ("fallback", False, "claim 거부 후 재실측 list 파싱 실패 — L2 경로 강등(S6)")
-    # S7: 재실측 보유자==자기 → 통과+경고(희귀 경합 — 목적 상태 달성이 사실)
+    # v3-c(S7): 재실측 보유자==자기 → 통과+경고(희귀 경합 — 목적 상태 달성이 사실)
     if self_sid is not None and post_holder is not None and post_holder == self_sid:
         return ("pass", True,
                 "S7 거부 후 재실측 보유자==자기(surface:%s) — 목적 상태 달성·경합 이상 신호 기록" % self_sid)
-    # S5: 재실측 타 보유자 → exit 7(유령 master 차단 불변·백오프 재시도 없음)
+    # v3-d(S5): 재실측 타 보유자 → exit7(유령 master 차단 불변)
     if post_holder is not None:
         return ("exit7", False,
                 "S5 거부 후 재실측 살아있는 타 보유자(surface:%s) — 유령 master 차단·즉시 판정" % post_holder)
-    # S4: 재실측 보유자 없음 → exit 10(신원 해석 실패 확정)
-    return ("exit10", False, "S4 거부 후 재실측 보유자 부재 — 신원 해석 실패 확정(좌석 경합 아님)")
+    # v3-e(S4 강화): 재실측 부재 + 신원 힌트 확증 → exit10(신원 해석 실패 확정)
+    if any(h in claim_out for h in _IDENTITY_HINTS):
+        return ("exit10", False,
+                "S4 거부 후 재실측 부재 + 신원 힌트 확증(_IDENTITY_HINTS) — 신원 해석 실패 확정(좌석 경합 아님)")
+    # v3-f: 재실측 부재 + 어떤 힌트도 없음(미지 사유) → 검증된 L2 fallback(미지의 안전망)
+    return ("fallback", False,
+            "거부 후 재실측 부재이나 live-holder·신원 힌트 모두 없음(미지 사유) — 검증된 L2 경로로 강등(구본 보수 분류)")
 
 
 # ── ③′ 버그 B(master 권한 플래그 부재) 감지용 순수 함수 ──
 def _pane_shell_pid(list_output, self_sid):
     """순수 판정: cys list 텍스트에서 자기 surface(self_sid) 행의 pid(pane 셸) → int|None.
-    self_sid 는 _sid_norm 값. 파싱 불가/미발견/예외 → None."""
+    ★탭 고정 컬럼(orchestra 계약 정합): f[0]=surface:N · f[2]=pid=N. 임의 토큰 매칭이 아니라
+    컬럼 위치로 판정 — 제목/cwd에 'pid=...'가 들어가도 오판 없음. self_sid 는 _sid_norm 값.
+    파싱 불가/미발견/예외 → None."""
     if not self_sid:
         return None
     try:
         for line in str(list_output).splitlines():
-            toks = line.split()
-            if not toks or not toks[0].startswith("surface:"):
+            f = line.split("\t")
+            if len(f) < 4 or not f[0].startswith("surface:"):
                 continue
-            if _sid_norm(toks[0]) != self_sid:
+            if _sid_norm(f[0]) != self_sid:
                 continue
-            for t in toks:
-                if t.startswith("pid="):
-                    v = t[len("pid="):].strip()
-                    return int(v) if v.isdigit() else None
+            if f[2].startswith("pid="):
+                v = f[2][len("pid="):].strip()
+                return int(v) if v.isdigit() else None
             return None
         return None
     except Exception:
@@ -823,8 +876,8 @@ def cmd_run():
     #   보존, 생략 금지) / S3 성공→통과 / 거부 후 재실측: S4 부재→exit 10 · S5 타 보유자→exit 7 ·
     #   S7 자기→통과+경고 / S6 list 파싱 실패→검증된 L2 경로로 강등. 판정 로직은 _classify_claim_step
     #   (순수 함수·self-test U2) 단일 소유.
-    _progress("③ master 역할 등록(registry 실측 판정 v2)…")
-    self_sid = _sid_norm(os.environ.get("CYS_SURFACE_ID", ""))
+    _progress("③ master 역할 등록(registry 실측 판정 v3)…")
+    self_sid = _surface_id_env()
     pre_code, pre_out = _run(["cys", "list"], timeout=15)
     pre_holder, pre_parse_ok = _parse_role_holder(pre_out) if pre_code == 0 else (None, False)
 
@@ -845,29 +898,32 @@ def cmd_run():
             post_holder, post_parse_ok = _parse_role_holder(post_out) if post_code == 0 else (None, False)
 
     verdict, warn, detail = _classify_claim_step(
-        self_sid, pre_holder, pre_parse_ok, claim_attempted, claim_ok, post_holder, post_parse_ok)
+        self_sid, pre_holder, pre_parse_ok, claim_attempted, claim_ok, post_holder, post_parse_ok,
+        claim_out)
 
     if verdict == "fallback":
-        # S6 강등: registry 실측/재실측 파싱 실패 — 검증된 L2 방어선(문자열 판별+백오프 재시도)로 후퇴
+        # S6 강등: registry 실측/재실측 파싱 실패·미지 사유 — 검증된 L2 방어선(문자열 판별+백오프)로 후퇴
         _progress("③ registry 실측 판정 불가(%s) — L2 방어선으로 강등" % detail)
         rc = _claim_step_l2_fallback(log)
         if rc is not None:
             return rc
+    elif verdict == "exit7":
+        # ★FIX-5: 선행 log.step 제거 — log.fail이 내부에서 step을 단일 기록(detail은 fail 메시지에 통합)
+        msg = ("이 surface는 master가 아님(claim 거부·재실측 살아있는 보유자 확인). 살아있는 master가 "
+               "레지스트리에 존재한다 — 선언을 중단하고 기존 master에 인계하라.\n[판정] %s\n%s"
+               % (detail, (claim_out or "").strip()))
+        return log.fail("③claim-role", 1, msg, 7)
+    elif verdict == "exit10":
+        msg = ("claim 거부 사유 = **신원 해석 실패**(좌석 경합 아님·재실측 master 부재 확인). 데몬이 "
+               "이 호출자의 소속 pane 계보를 확정하지 못했다 — 주원인은 호출이 pane 프로세스 계보 "
+               "밖(고아화·외부 셸)에서 실행된 것.\n"
+               "※ 이것은 '이미 master가 있다'는 뜻이 **아니다** — cys list 로 실측하라. pane 안에서 "
+               "직접 재선언하거나, 이 pane 을 cys 에서 다시 띄워라(cys launch-agent --role master).\n"
+               "[판정] %s\n%s" % (detail, (claim_out or "").strip()))
+        return log.fail("③claim-role", 1, msg, 10)
     else:
-        log.step("③claim-role", 0 if verdict == "pass" else 1,
-                 "%s\n%s" % (detail, (claim_out or "").strip()))
-        if verdict == "exit7":
-            msg = ("이 surface는 master가 아님(claim 거부·재실측 살아있는 보유자 확인). 살아있는 master가 "
-                   "레지스트리에 존재한다 — 선언을 중단하고 기존 master에 인계하라.\n%s" % (claim_out or ""))
-            return log.fail("③claim-role", 1, msg, 7)
-        if verdict == "exit10":
-            msg = ("claim 거부 사유 = **신원 해석 실패**(좌석 경합 아님·재실측 master 부재 확인). 데몬이 "
-                   "이 호출자의 소속 pane 계보를 확정하지 못했다 — 주원인은 호출이 pane 프로세스 계보 "
-                   "밖(고아화·외부 셸)에서 실행된 것.\n"
-                   "※ 이것은 '이미 master가 있다'는 뜻이 **아니다** — cys list 로 실측하라. pane 안에서 "
-                   "직접 재선언하거나, 이 pane 을 cys 에서 다시 띄워라(cys launch-agent --role master).\n%s"
-                   % (claim_out or ""))
-            return log.fail("③claim-role", 1, msg, 10)
+        # pass/S7 경로만 log.step 단일 기록(FIX-5: 실패 경로는 log.fail이 단일 소유)
+        log.step("③claim-role", 0, "%s\n%s" % (detail, (claim_out or "").strip()))
         if warn:
             _progress("⚠ ③ " + detail)
 
@@ -1168,6 +1224,17 @@ def cmd_self_test():
         # 오매칭 방지: role=master-x 는 master 아님(부분문자열 오매칭 차단)
         h, ok = _parse_role_holder("surface:9\trole=master-x\tpid=1\texited=false\tt\t/x")
         assert ok and h is None, "role=master-x 가 master로 오매칭: %r" % h
+        # ★악성 제목 내성(FIX-3): 제목 컬럼(f[4])에 'role=master'가 들어가도 고정 컬럼 파싱은 오판 없음
+        h, ok = _parse_role_holder(
+            "surface:7\trole=worker\tpid=102\texited=false\trole=master 위장제목\t/x")
+        assert ok and h is None, "제목의 role=master가 보유자로 오매칭(고정 컬럼 파싱 실패): %r" % h
+        # ★악성 제목 내성 2: 제목에 'exited=true'가 들어가도 f[3]=exited=false면 생존 보유자
+        h, ok = _parse_role_holder(
+            "surface:6\trole=master\tpid=1\texited=false\texited=true 위장\t/x")
+        assert ok and h == "6", "제목의 exited=true가 생존 보유자를 부재로 오판: %r" % h
+        # ★구조 드리프트(FIX-3): 비어있지 않은데 탭 고정 컬럼 행 0개 → parse_ok=False(S6 강등)
+        h, ok = _parse_role_holder("완전히 다른 형식의 출력\n탭 없는 비정형 라인")
+        assert h is None and ok is False, "탭 없는 비정형 출력이 (None,False) 아님: %r,%r" % (h, ok)
         # 헤더/경고행 내성(surface: 접두 아닌 행 skip)
         h, ok = _parse_role_holder(
             "NODE\tROLE\tPID\n경고: 데몬 재시작 중\nsurface:6\trole=master\tp\texited=false\tt\t/x")
@@ -1182,19 +1249,31 @@ def cmd_self_test():
         h, ok = _parse_role_holder("surface:6\trole=master\tpid=1\texited=true\tt\t/x")
         assert ok and h is None, "exited=true master가 생존 보유자로 오판: %r" % h
 
-        # ── U2: 판정표 v2(_classify_claim_step) S1~S7 각 1케이스 + U2-x 승계 회귀 봉인 ──
+        # ── U2: 판정표 v3(_classify_claim_step) S1~S7 + v3 거부 사유 tie-break + U2-x 승계 회귀 봉인 ──
+        _HINT_LIVE = "claim_role denied: privileged role 'master' is held by live surface 9"
+        _HINT_IDENT = "claim_denied: caller (surface None) may only claim its own surface, not 6"
         v, w, _d = _classify_claim_step("6", "6", True, False, None, None, None)
         assert v == "pass" and not w, "S1(보유자==자기) 통과 아님: %s" % v
         v, w, _d = _classify_claim_step("6", None, True, True, True, None, None)
         assert v == "pass", "S3(claim 성공) 통과 아님: %s" % v
-        v, w, _d = _classify_claim_step("6", None, True, True, False, None, True)
-        assert v == "exit10", "S4(부재인데 거부) exit10 아님: %s" % v
+        # ★v3-e(S4 강화): 재실측 부재 + 신원 힌트 확증 → exit10
+        v, w, _d = _classify_claim_step("6", None, True, True, False, None, True, _HINT_IDENT)
+        assert v == "exit10", "S4(부재+신원힌트 확증) exit10 아님: %s" % v
+        # ★v3-a(거부 사유 tie-break 복권): live-holder 힌트 → list 무관 exit7(post 부재여도)
+        v, w, _d = _classify_claim_step("6", None, True, True, False, None, True, _HINT_LIVE)
+        assert v == "exit7", "v3-a(live-holder 힌트·list 무관) exit7 아님: %s" % v
+        # ★v3-a는 재실측 파싱 실패(post_parse_ok=False)여도 데몬 권위 거부를 우선 → exit7
+        v, w, _d = _classify_claim_step("6", None, True, True, False, None, False, _HINT_LIVE)
+        assert v == "exit7", "v3-a(live-holder 힌트·재실측 파싱 실패) exit7 아님: %s" % v
+        # ★v3-f(원사고의 거울상 봉인): 재실측 부재 + 어떤 힌트도 없음(미지 사유) → fallback(L2 강등)
+        v, w, _d = _classify_claim_step("6", None, True, True, False, None, True, "some unknown daemon error")
+        assert v == "fallback", "v3-f(미지 사유 거부·부재) fallback 아님(거짓 exit10 회귀): %s" % v
         v, w, _d = _classify_claim_step("6", None, True, True, False, "9", True)
         assert v == "exit7", "S5(살아있는 타 보유자 거부) exit7 아님: %s" % v
         v, w, _d = _classify_claim_step("6", None, False, False, None, None, None)
         assert v == "fallback", "S6(선-실측 파싱 실패) fallback 아님: %s" % v
         v, w, _d = _classify_claim_step("6", None, True, True, False, None, False)
-        assert v == "fallback", "S6'(재실측 파싱 실패) fallback 아님: %s" % v
+        assert v == "fallback", "S6'(재실측 파싱 실패·힌트 없음) fallback 아님: %s" % v
         v, w, _d = _classify_claim_step("6", None, True, True, False, "6", True)
         assert v == "pass" and w, "S7(거부 후 재실측 자기) pass+경고 아님: %s,%s" % (v, w)
         # ★U2-x 승계 회귀 봉인: 보유자 존재(타 surface·S1 아님)면 claim이 반드시 시도돼야 한다.
@@ -1206,9 +1285,9 @@ def cmd_self_test():
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
     print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
-          "신원 파싱·정규화(U1) + 판정표 v2 S1~S7·승계 회귀 봉인(U2·U2-x) — "
-          "base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·자원 게이트 결정·구성 결손·"
-          "_sid_norm·_parse_role_holder·_classify_claim_step)")
+          "신원 파싱·정규화·악성 제목/구조 드리프트 내성(U1) + 판정표 v3 S1~S7·거부 사유 tie-break"
+          "(v3-a/e/f)·승계 회귀 봉인(U2·U2-x) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
+          "자원 게이트 결정·구성 결손·_sid_norm·_surface_id_env·_parse_role_holder·_classify_claim_step)")
     return 0
 
 

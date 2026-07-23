@@ -32,10 +32,12 @@ def check(name, cond, detail=""):
 
 def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
              check_fail_times=0, check_final=0, socket="", check_needs_reviewers=False,
-             br_exit=0, pack_dept=None):
+             br_exit=0, pack_dept=None, claim_reject_msg=None, list_rows=None):
     """임시 HOME + 가짜 팩 + 스텁 생성 → 환경 dict 반환.
     pack_dept=<부서명>: 팩을 ~/.cys/pack-dept-<부서명>에 만들고 CYS_PACK_DIR로 지정
-    (증분1 레인↔팩 정합 가드 — 부서 소켓 레인은 같은 부서 팩 페어링 필수·불일치=exit 8)."""
+    (증분1 레인↔팩 정합 가드 — 부서 소켓 레인은 같은 부서 팩 페어링 필수·불일치=exit 8).
+    claim_reject_msg=<str>: claim-role 거부 시 데몬이 stderr로 내는 사유 문자열(step ③ v3 tie-break용).
+      기본값=일반 좌석 경합 메시지. list_rows=<str>: 스텁 `cys list` 가 낼 탭 구분 행(없으면 빈 출력)."""
     home = os.path.join(tmp, "home")
     pack = os.path.join(home, ".cys",
                         "pack-dept-%s" % pack_dept if pack_dept else "pack")
@@ -48,16 +50,23 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
             f.write(body)
         os.chmod(path, mode)
 
-    # 스텁 cys — 서브커맨드별 exit·호출 기록(calls.log)
+    # step ③ v3 tie-break 재현: 거부 사유·list 출력을 파일로 주입(셸 escaping 회피)
+    w(os.path.join(tmp, "claim_reject.msg"),
+      (claim_reject_msg or "claim_denied: privileged role held by live surface") + "\n", 0o644)
+    if list_rows is not None:
+        w(os.path.join(tmp, "list.out"), list_rows if list_rows.endswith("\n") else list_rows + "\n", 0o644)
+
+    # 스텁 cys — 서브커맨드별 exit·호출 기록(calls.log). claim 거부문·list 출력은 파일에서 읽는다.
     w(os.path.join(bindir, "cys"), (
         "#!/bin/sh\n"
         "echo \"cys $@\" >> \"%s/calls.log\"\n"
         "case \"$1\" in\n"
         "  ping) exit %d;;\n"
-        "  claim-role) [ %d -ne 0 ] && echo 'claim_denied: privileged role held by live surface' >&2; exit %d;;\n"
+        "  claim-role) [ %d -ne 0 ] && cat \"%s/claim_reject.msg\" >&2; exit %d;;\n"
         "  boot) exit %d;;\n"
+        "  list) [ -f \"%s/list.out\" ] && cat \"%s/list.out\"; exit 0;;\n"
         "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
-        "esac\nexit 0\n") % (tmp, ping_exit, claim_exit, claim_exit, boot_exit))
+        "esac\nexit 0\n") % (tmp, ping_exit, claim_exit, tmp, claim_exit, boot_exit, tmp, tmp))
     # 스텁 preflight
     w(os.path.join(pack, "bin", "javis_preflight.py"),
       "import sys; sys.exit(%d)\n" % preflight_exit, 0o644)
@@ -83,6 +92,9 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
       "#!/bin/sh\necho \"cys-dept $@\" >> \"%s/calls.log\"\nexit 0\n" % tmp)
 
     env = dict(os.environ)
+    # ★_surface_id_env 우선순위(AITERM_→JAVIS_→CYS_)에서 CYS_SURFACE_ID=7이 권위를 갖도록 상위 키 제거
+    env.pop("AITERM_SURFACE_ID", None)
+    env.pop("JAVIS_SURFACE_ID", None)
     env.update({"HOME": home, "PATH": bindir + os.pathsep + env.get("PATH", ""),
                 "CYS_BOOT_CHECK_RETRIES": "4", "CYS_BOOT_CHECK_INTERVAL_S": "0.05",
                 "CYS_SURFACE_ID": "7"})
@@ -202,14 +214,42 @@ attempts = int(open(os.path.join(tmp, "check.count"), encoding="utf-8").read())
 check("4c 시도수=상한(4)", attempts == 4, "attempts=%d" % attempts)
 shutil.rmtree(tmp)
 
-# ── 5. claim 거부 → exit 7·boot 미호출·마커 무 ──
+# ── 5. claim 거부(살아있는 보유자) → exit 7·boot 미호출·마커 무 (v3 계약) ──
+# 스텁 cys: (a) claim-role을 "...is held by live surface 9"로 거부(데몬 권위 거부 신호),
+#          (b) list가 살아있는 master 행(surface:9·탭 구분)을 냄 → v3-a/S5 둘 다 exit7 수렴.
 tmp = tempfile.mkdtemp(prefix="boot-t5-")
-env, home = make_env(tmp, claim_exit=1)
+env, home = make_env(
+    tmp, claim_exit=1,
+    claim_reject_msg="claim_role denied: privileged role 'master' is held by live surface 9",
+    list_rows="surface:9\trole=master\tpid=999\texited=false\t제목\t/cwd")
 code, out, err = run(env)
-check("5a claim 거부 exit 7", code == 7, "exit=%d" % code)
+check("5a claim 거부(live-holder) exit 7", code == 7, "exit=%d err=%s" % (code, err[-200:]))
 check("5b 마커 미생성", not os.path.exists(marker_path(home)))
 check("5c 거부 후 boot 미호출", "cys boot" not in calls(tmp))
 check("5d 인계 지시 출력", "인계" in err)
+shutil.rmtree(tmp)
+
+# ── 5i. 신원 해석 실패 거부("surface None") + list 빈 출력 → exit 10 + "재선언" 안내 (v3-e) ──
+tmp = tempfile.mkdtemp(prefix="boot-t5i-")
+env, home = make_env(
+    tmp, claim_exit=1,
+    claim_reject_msg="claim_denied: caller (surface None) may only claim its own surface, not 6")
+code, out, err = run(env)
+check("5i-a 신원 거부+빈 list → exit 10", code == 10, "exit=%d err=%s" % (code, err[-200:]))
+check("5i-b 마커 미생성", not os.path.exists(marker_path(home)))
+check("5i-c 재선언 안내 출력(거짓 인계 아님)", "재선언" in err, err[-300:])
+shutil.rmtree(tmp)
+
+# ── 5ii. 미지 사유 거부 + list 빈 출력 → L2 fallback 경유 exit 7(구본 보수 기본값) (v3-f) ──
+# 원사고의 거울상 봉인 검증: post-list가 비어도 거짓 exit10(master 부재)로 새지 않고, live/신원 힌트가
+# 모두 없는 미지 사유는 검증된 L2 방어선으로 강등 → L2가 신원 힌트 없음을 확인하고 보수적 exit 7.
+tmp = tempfile.mkdtemp(prefix="boot-t5ii-")
+env, home = make_env(
+    tmp, claim_exit=1, claim_reject_msg="claim_denied: some unknown daemon condition")
+code, out, err = run(env)
+check("5ii-a 미지 사유 거부 → L2 경유 exit 7", code == 7, "exit=%d err=%s" % (code, err[-200:]))
+check("5ii-b 마커 미생성", not os.path.exists(marker_path(home)))
+check("5ii-c 거부 후 boot 미호출", "cys boot" not in calls(tmp))
 shutil.rmtree(tmp)
 
 # ── 6. 선행 단계 실패 exit 매핑: ping=3 · boot=4 (부팅-치명 전제 위반) ──

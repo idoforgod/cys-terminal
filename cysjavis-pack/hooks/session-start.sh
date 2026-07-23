@@ -39,6 +39,7 @@ list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' �
    (preflight→claim-role→boot→orchestra check→완료 마커를 exit-code 체인으로 수행.
     "기동 완료"는 이 스크립트의 최종 JSON을 인용할 때만 선언할 수 있다 — 다른 근거 인용 금지.)
    · exit 7 = 이 surface는 master가 아니다(살아있는 master 존재) — 선언을 중단하고 기존 master에 인계하라.
+   · exit 10 = 신원 해석 실패(좌석 경합 아님) — master 부재일 수 있으니 cys list로 실측 후 pane 안에서 재선언.
    · 그 외 비0 exit = 부트 실패 — 출력의 단계·원인을 그대로 보고하라(자연어 재추론 금지).
 3) 마스터 외 역할은 \`cys claim-role <worker|cso|reviewer>\` 로 자기 surface를 역할 주소로 등록한다.
 (역할 선언이 없으면 이 안내는 무시해도 된다.)
