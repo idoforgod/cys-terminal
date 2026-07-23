@@ -21,6 +21,7 @@ exit: 0=부트 완료(또는 부서장 단독 각성 — CEO 티켓 부재) / 2=
       7=claim 거부(이 surface는 master 아님 — 지휘 중단·인계) / 4=boot / 6=check 최종 실패
       5=assert-ready 게이트 실패(하위 게이트 전용)
       8=레인↔팩 정합 실패(부서 소켓↔부서 팩 교차 오염 차단 — 팀 기동 전 중단)
+      10=claim 신원 해석 실패(좌석 경합 아님 — 재시도 3회 소진·master 부재일 수 있음)
       9=자원 hard_block(결손 기준 자원 사전 게이트 — 팀 기동 전 착수 거부·CEO escalation)
 안전밸브: CYS_BOOT_GATE=warn(assert-ready 실패를 경고로 강등)|off(게이트 무력).
 
@@ -261,10 +262,19 @@ class _Log:
         # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — feed 알림으로
         # 승격(best-effort·데몬 다운 등 실패 무해). ②ping 실패(데몬 자체 부재)는 feed도 불가라 skip.
         if name != "②ping":
-            hint = {"③claim-role": "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
-                    "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
-                    "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요."
-                    }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
+            # ★결함수리(2026-07-23): ③claim-role 힌트가 exit 코드와 무관하게 "다른 pane이 이미
+            # master"로 고정돼 있어, 신원 해석 실패(exit 10)에도 존재하지 않는 master를 찾으라는
+            # 거짓 안내가 Feed로 나갔다. 사유별로 분기한다.
+            if name == "③claim-role":
+                hint = ("이 pane의 신원(소속 pane 계보)을 데몬이 확정하지 못해 master 등록에 실패했습니다 — "
+                        "master 좌석 경합이 아닙니다. cys list로 master 부재를 확인하고, pane 안에서 "
+                        "재선언하거나 cys launch-agent --role master --agent claude 로 다시 띄우세요."
+                        ) if exit_code == 10 else (
+                        "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).")
+            else:
+                hint = {"④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
+                        "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요."
+                        }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
             try:
                 subprocess.run(["cys", "feed", "push", "--kind", "bootstrap-fail",
                                 "--title", "부트스트랩 미완(%s)" % name, "--body", hint],
@@ -597,10 +607,37 @@ def cmd_run():
     #   --takeover-empty-seat 는 **요청**일 뿐이다: 데몬이 커널 사실(자손 프로세스 0·agent 메타 없음·
     #   최근 입력 없음)로 재판정해 정말 빈 좌석일 때만 승계를 허용하고, agent 가 붙은 정당한 master 는
     #   종전대로 거부한다(유령 master 차단 규칙 불변 — 살아있는 master 가 있으면 여전히 exit 7).
+    # ★결함수리(2026-07-23 master 실사고): 종전엔 claim-role 의 **모든** 실패를 exit 7("살아있는
+    #   master 가 존재 — 지휘 중단·인계")로 단일 분류했고 재시도가 없었다. 실제 사고에서는 데몬이
+    #   호출자 신원을 해석하지 못한 거부("claim_denied: caller (surface None) may only claim its own
+    #   surface, not 6")였는데 이것이 좌석 경합으로 오분류돼 (a) 1차 부트가 즉사하고 (b) 레지스트리에
+    #   master 가 하나도 없는 상태(cys list 실측 role=- )에서 진짜 master 에게 "너는 master 가 아니다,
+    #   기존 master 에게 인계하라"는 **거짓 지시**가 전달됐다. 오분류는 자체로 치명이다 — 사용자는
+    #   존재하지 않는 master 를 찾아 헤매고 팀은 영영 안 뜬다.
+    # 수리: 거부 **사유를 판별**한다. 신원 미해석은 일시 상태일 수 있으므로 백오프 재시도하고, 소진 시
+    #   exit 10(신원 해석 실패)으로 **분리 보고**한다. 살아있는 보유자에 의한 거부만 종전대로 exit 7 —
+    #   유령 master 차단 규칙은 불변이며 재시도도 하지 않는다(즉시 판정).
     _progress("③ master 역할 등록…")
-    code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"], timeout=15)
+    _IDENTITY_HINTS = ("surface None", "CYS_SURFACE_ID", "no --surface", "unknown surface")
+    code, out = 1, ""
+    for _attempt in (1, 2, 3):
+        code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"], timeout=15)
+        if code == 0:
+            break
+        if not any(h in out for h in _IDENTITY_HINTS):
+            break  # 좌석 경합 등 — 재시도해도 결과가 바뀌지 않는다
+        if _attempt < 3:
+            _progress("③ 신원 해석 실패 — 재시도 %d/2 (데몬 레지스트리 준비 대기)…" % _attempt)
+            time.sleep(1.5 * _attempt)
     log.step("③claim-role", code, out)
     if code != 0:
+        if any(h in out for h in _IDENTITY_HINTS):
+            msg = ("claim 거부 사유 = **신원 해석 실패**(좌석 경합 아님). 데몬이 이 호출자의 소속 pane "
+                   "계보를 확정하지 못했다 — 주원인은 호출이 pane 프로세스 계보 밖(고아화·외부 셸)에서 "
+                   "실행된 것. 재시도 3회 소진.\n"
+                   "※ 이것은 '이미 master가 있다'는 뜻이 **아니다** — cys list 로 실측하라. pane 안에서 "
+                   "직접 재선언하거나, 이 pane 을 cys 에서 다시 띄워라(cys launch-agent --role master).\n%s" % out)
+            return log.fail("③claim-role", code, msg, 10)
         msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
                "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
         return log.fail("③claim-role", code, msg, 7)
