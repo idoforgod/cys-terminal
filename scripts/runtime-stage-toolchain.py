@@ -8,6 +8,7 @@ import importlib.util
 import json
 from pathlib import Path, PurePosixPath
 import stat
+import sys
 import tempfile
 import zipfile
 
@@ -66,9 +67,24 @@ def extract(args: argparse.Namespace) -> None:
                 temporary_path.chmod(0o755)
                 expected_arch = runtime_stage.TARGETS[args.target][0]
                 runtime_stage.assert_target(temporary_path, expected_arch, "Bun compiler")
-                temporary_path.replace(args.output)
+                # Windows AV/indexer may briefly hold the just-written .exe; ride out
+                # the share-lock (WinError 32) so the atomic rename lands. Fail-closed
+                # on exhaustion (re-raise) — no unbounded wait.
+                runtime_stage.retry_on_windows_lock(lambda: temporary_path.replace(args.output))
             finally:
-                temporary_path.unlink(missing_ok=True)
+                # Best-effort temp cleanup. This only has work to do when the replace
+                # above failed (a successful replace leaves nothing to unlink); in that
+                # path the same share-lock can still be held, so retry it too. If a
+                # primary exception is already propagating, swallow a residual lock
+                # rather than mask it — the job still fails closed on the primary error.
+                pending = sys.exc_info()[0]
+                try:
+                    runtime_stage.retry_on_windows_lock(
+                        lambda: temporary_path.unlink(missing_ok=True)
+                    )
+                except PermissionError:
+                    if pending is None:
+                        raise
 
 
 def main() -> int:
