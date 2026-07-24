@@ -55,6 +55,12 @@ jobs:
                                             # setup.exe는 Authenticode+RFC3161 뒤 updater 서명을 다시 생성한다.
     runs-on: ${{ matrix.platform }}
 
+    # Explicit, auditable opt-out for the unsigned Windows distribution model
+    # (unsigned exe + zip + Windows Defender guidance). Only ALLOW_UNSIGNED_WINDOWS=='1'
+    # skips Authenticode; unset/other values keep the fail-closed default unchanged.
+    env:
+      ALLOW_UNSIGNED_WINDOWS: ${{ vars.ALLOW_UNSIGNED_WINDOWS }}
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -461,7 +467,7 @@ jobs:
         run: python scripts/release-credentials-check.py windows
 
       - name: Import Windows signing certificate
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && env.ALLOW_UNSIGNED_WINDOWS != '1'
         id: windows_certificate
         shell: pwsh
         env:
@@ -487,7 +493,11 @@ jobs:
         if: always() && matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
+          # Authenticode cert removal only runs when a cert was imported (signed mode).
+          # Browser Runtime minisign key cleanup always runs — it exists in both modes.
+          if ($env:ALLOW_UNSIGNED_WINDOWS -ne '1') {
+            ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
+          }
           foreach ($path in @($env:CYS_BROWSER_RUNTIME_SECRET_KEY, $env:CYS_BROWSER_RUNTIME_PUBLIC_KEY)) {
             if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force }
           }

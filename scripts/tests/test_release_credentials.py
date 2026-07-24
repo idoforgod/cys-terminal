@@ -87,6 +87,85 @@ class ReleaseCredentialsTests(unittest.TestCase):
         self.assertNotIn(redaction_sentinel, result.stdout + result.stderr)
         self.assertIn("values redacted", result.stdout)
 
+    def _base_env_without_release_inputs(self) -> dict:
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("WINDOWS_")
+            and not key.startswith("TAURI_SIGNING_")
+            and not key.startswith("CYS_BROWSER_RUNTIME_")
+            and key != "ALLOW_UNSIGNED_WINDOWS"
+        }
+
+    def test_windows_unsigned_optout_passes_without_authenticode_inputs(self) -> None:
+        env = {
+            **self._base_env_without_release_inputs(),
+            "ALLOW_UNSIGNED_WINDOWS": "1",
+            # Authenticode signing inputs intentionally absent.
+            "WINDOWS_TIMESTAMP_URL": "https://timestamp.invalid",
+            "TAURI_SIGNING_PRIVATE_KEY": "present",
+            "CYS_BROWSER_RUNTIME_SECRET_KEY": "/private/runtime.key",
+            "CYS_BROWSER_RUNTIME_PUBLIC_KEY": "/private/runtime.pub",
+            "CYS_BROWSER_RUNTIME_KEY_ID": "39E60A702949D6C3",
+            "CYS_BROWSER_RUNTIME_POLICY_EPOCH": "1",
+            "CYS_BROWSER_RUNTIME_EXPIRES_AT": "1893455999",
+        }
+
+        result = subprocess.run(
+            ["python3", str(CHECKER), "windows"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UNSIGNED WINDOWS RELEASE (explicit opt-out)", result.stdout)
+        self.assertIn("values redacted", result.stdout)
+
+    def test_windows_unsigned_optout_still_requires_updater_and_runtime_inputs(self) -> None:
+        env = {
+            **self._base_env_without_release_inputs(),
+            "ALLOW_UNSIGNED_WINDOWS": "1",
+            "WINDOWS_TIMESTAMP_URL": "https://timestamp.invalid",
+            # TAURI_SIGNING_PRIVATE_KEY and CYS_BROWSER_RUNTIME_* intentionally absent.
+        }
+
+        result = subprocess.run(
+            ["python3", str(CHECKER), "windows"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TAURI_SIGNING_PRIVATE_KEY", result.stderr)
+        self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY", result.stderr)
+        # The opt-out never waives the non-Authenticode required inputs.
+        self.assertNotIn("WINDOWS_CERTIFICATE_B64", result.stderr)
+
+    def test_windows_fail_closed_default_holds_for_non_exact_optout_values(self) -> None:
+        for flag in ("0", "true", "yes", "", "TRUE"):
+            env = {
+                **self._base_env_without_release_inputs(),
+                "ALLOW_UNSIGNED_WINDOWS": flag,
+            }
+
+            result = subprocess.run(
+                ["python3", str(CHECKER), "windows"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0, f"flag={flag!r} should stay fail-closed")
+            self.assertIn("WINDOWS_CERTIFICATE_B64", result.stderr)
+
     def test_rfc3161_timestamp_endpoint_must_use_https(self) -> None:
         env = {
             **os.environ,
