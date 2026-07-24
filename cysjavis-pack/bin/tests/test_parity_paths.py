@@ -22,6 +22,11 @@ import sys
 SELF = os.path.dirname(os.path.abspath(__file__))
 MODULE = os.path.normpath(os.path.join(SELF, "..", "javis_formation.py"))
 FIXTURE = os.path.join(SELF, "fixtures", "mock-agent.sh")
+# ★밀폐(hermetic) 고정 — load() 전에 설정해야 모듈 import 시점 PACK_DIR 이 리포 팩으로 잡힌다.
+# 비밀폐 결함 수리(master 재검증): CYS_PACK_DIR 미설정 환경에서 javis_formation._directives_dir()
+# 가 라이브 팩(~/.cys/pack — 현재 반쪽마스터 스텁)으로 폴백해 C03 이 FAIL 했다(4/5). 테스트는
+# 환경을 상속하지 않고 결정론적으로 리포 팩(테스트 파일 상대 경로)만 읽는다 = 라이브 무접촉.
+os.environ["CYS_PACK_DIR"] = os.path.normpath(os.path.join(SELF, "..", ".."))  # cysjavis-pack/
 fails = []
 _total = [0]
 

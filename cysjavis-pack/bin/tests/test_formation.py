@@ -21,6 +21,10 @@ import sys
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 MODULE = os.path.normpath(os.path.join(SELF, "..", "javis_formation.py"))
+# ★밀폐(hermetic) 고정 — javis_formation 을 로드하는 테스트는 라이브 팩(~/.cys/pack) 상속을 금지하고
+# 리포 팩만 읽는다(환경 무관 결정론·라이브 무접촉). classify 는 순수라 현 검사엔 팩 읽기가 없으나,
+# 동일 모듈을 쓰는 테스트의 비밀폐 방어(parity_paths 결함과 동류) 차원의 선제 고정.
+os.environ["CYS_PACK_DIR"] = os.path.normpath(os.path.join(SELF, "..", ".."))  # cysjavis-pack/
 fails = []
 _total = [0]
 

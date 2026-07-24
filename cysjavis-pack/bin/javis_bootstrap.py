@@ -17,7 +17,7 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
   - ★소켓 격리: CYS_SOCKET이 base가 아니면(부서 pane 부트) write하지 않는다 — 부서장 부트가
     base 마커를 오염시키면 CEO 승격 게이트(cys-dept)가 오개방된다.
 
-exit: 0=부트 완료(또는 부서장 단독 각성 — CEO 티켓 부재) / 2=preflight / 3=ping
+exit: 0=부트 완료(W2: 부서 레인도 조건화 상비 편성 — 단독 각성 강등 폐지) / 2=preflight / 3=ping
       7=claim 거부(이 surface는 master 아님 — 지휘 중단·인계) / 4=boot / 6=check 최종 실패
       5=assert-ready 게이트 실패(하위 게이트 전용)
       8=레인↔팩 정합 실패(부서 소켓↔부서 팩 교차 오염 차단 — 팀 기동 전 중단)
@@ -34,10 +34,13 @@ exit: 0=부트 완료(또는 부서장 단독 각성 — CEO 티켓 부재) / 2=
   빈 좌석 승계 보존) / S3 성공→통과 / 거부 후 재실측: S4 부재→exit 10 · S5 타 보유자→exit 7 ·
   S7 자기→통과+경고 / S6 list 파싱 실패→검증된 L2 경로(문자열 판별+백오프) 강등.
 
-부서 교리 게이트 (증분2 — D1 옵션 1'):
-  ⓐ CEO 티켓 권한 게이트(P7): 부서 레인(CYS_SOCKET=부서 소켓)의 팀 기동은 CEO 발급 티켓 필수.
-     티켓 부재/만료 → 실패가 아니라 '부서장 단독 각성'으로 강등(팀 기동만 생략·역할 등록/프리플라이트는
-     정상·exit 0). 발급은 base 레인에서 `issue-ticket --dept <name>` 로만.
+부서 교리 게이트:
+  ⓐ (폐지·W2 DD-4) CEO 티켓 권한 게이트(P7)는 제거됐다. 종전 "부서 레인 팀 기동 = CEO 발급 티켓
+     필수, 부재 시 부서장 단독 각성 강등" 교리는 W2 조건화 상비 편성으로 대체됐다 — 그 자리(step ③″)
+     에서 `javis_formation.py ensure` 를 인라인 발화해 base·부서 레인이 동일하게 설치 CLI 기준으로
+     상비 편성한다(C3 동등성 수렴점). `issue-ticket` 서브커맨드는 deprecated no-op 으로만 잔존
+     (하위호환·exit 0·1개 마이너 릴리스 후 삭제 예정). dept-boot-tickets 저장소는 더 이상 생성/소비
+     되지 않는다. ★미래 수정자 경고: 이 파일에 티켓 발급/소비/강등 로직을 되살리지 마라(폐지 확정).
   ⓑ 결손 기준 자원 게이트: 팀 기동 직전 결손을 cys list 라이브 노드의 **구성 판정**으로 산출 —
      cso≥1 ∧ worker≥1 ∧ reviewer계열≥2 전부 충족 시에만 결손 0(구 총수 4 비교는 reviewer 4개+
      cso/worker 사망을 결손 0으로 오판 — 폐기). 결손 0(재선언)이면 게이트와 ④ cys boot 호출 자체를
@@ -46,7 +49,7 @@ exit: 0=부트 완료(또는 부서장 단독 각성 — CEO 티켓 부재) / 2=
      진행 / soft=매번 경고 후 진행 — 결손 0이면 게이트 자체를 생략하므로 soft 경고는 실팀기동
      시에만 발생, 소음 아니라 신호). 이 게이트는 base 포함 전 레인에 적용된다.
 
-신뢰 모델: 티켓·마커·구성 게이트는 LLM 드리프트 차단용 결정론 가드이지 보안 경계가 아니다
+신뢰 모델: 마커·구성 게이트는 LLM 드리프트 차단용 결정론 가드이지 보안 경계가 아니다
 (동일 $HOME 신뢰 도메인 — 파일 권한으로 악의 행위자를 막는 설계가 아님).
 """
 import json
@@ -133,9 +136,9 @@ def _run(cmd, timeout=120):
 def _socket_is_base(sock):
     """순수 판정: 소켓 경로 문자열 → base 여부(§4.1 소켓 격리). CYS_SOCKET 미설정('')=base.
     ★보수성(아키텍트 성찰): base = (미설정) 또는 (basename이 cys/cys.sock **AND** cys-dept- 성분
-    없음). 커스텀 소켓(/tmp/whatever.sock)은 구코드처럼 **비-base·비-dept**다 — base 마커 무접촉·
-    issue-ticket 불허·티켓 게이트 비적용(구동작 보존). "cys-dept- 성분 없으면 전부 base"는 미지
-    소켓에 base 특권(마커 write·티켓 발급)을 주던 과관용이었다.
+    없음). 커스텀 소켓(/tmp/whatever.sock)은 구코드처럼 **비-base·비-dept**다 — base 마커 무접촉
+    (구동작 보존). "cys-dept- 성분 없으면 전부 base"는 미지 소켓에 base 특권(마커 write)을 주던
+    과관용이었다. (구 티켓 발급 특권은 W2로 폐지 — 마커 write 특권만 남는다.)
     ★경로 기반 dept 판정(basename 아님): 부서 소켓 ~/.local/state/cys-dept-<name>/cys.sock 은
     basename이 본부와 동일한 'cys.sock'이라 basename 단독 판정이 부서를 base로 오판했다
     (마커 오염·ceo_promote 오개방) — cys-dept- 성분이 있으면 무조건 비-base.
