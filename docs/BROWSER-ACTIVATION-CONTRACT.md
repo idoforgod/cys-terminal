@@ -17,7 +17,7 @@
 ### 1.1 주입 경로
 
 활성화 스크립트는 tauri `Builder::append_invoke_initialization_script`로 주입된다
-(`src-tauri/src/main.rs:3529-3531`):
+(`src-tauri/src/main.rs:3541-3543`):
 
 ```rust
 let activation_script = browser_activation_initialization_script(&bootstrap_capability);
@@ -37,8 +37,8 @@ tauri::Builder::default()
 7d 29 28 29 0a   →   }  )  (  )  \n   →   "})()\n"
 ```
 
-(근거: 소스 주석 `src-tauri/src/main.rs:181-184`, 회귀 테스트 주석
-`src-tauri/src/main.rs:3780-3782` "선행 기본 스크립트(ipc-protocol.js)는 `})()` + 개행(식)으로
+(근거: 소스 주석 `src-tauri/src/main.rs:181-193`, 회귀 테스트 주석
+`src-tauri/src/main.rs:3794-3796` "선행 기본 스크립트(ipc-protocol.js)는 `})()` + 개행(식)으로
 끝난다(2.11.2 실측)". 바이트 `7d 29 28 29` = `})()` 는 이 문서 작성 시 `printf '%s' '})()' | xxd`로
 재확인.)
 
@@ -62,7 +62,7 @@ JavaScript 자동 세미콜론 삽입(ASI)은 **다음 토큰이 현재 식의 �
 
 뒤 스크립트의 첫 바이트를 `;`(빈 문장 분리자)로 두면 연결 지점이
 `})()\n;(() => {…})()` 가 되어 앞 식이 `;`에서 결정론적으로 종료된다. 삼킴 연쇄가 성립할 수
-없다. 실물 생성 함수(`src-tauri/src/main.rs:188-211`)는 `;(() => {`로 시작한다:
+없다. 실물 생성 함수(`src-tauri/src/main.rs:194-223`)는 `;(() => {`로 시작한다:
 
 ```rust
 fn browser_activation_initialization_script(capability: &str) -> String {
@@ -79,6 +79,21 @@ fn browser_activation_initialization_script(capability: &str) -> String {
 (installed / armed-ok / arm-failed:) ③ arm 실패에도 클릭 재생(무반응 버튼 대신 백엔드 거부 사유가
 UI로 노출).
 
+### 1.5 v0.13.7 후일담 — 삼킴 해소가 노출시킨 2차 잠복 결함
+
+삼킴을 `;`로 해소하자 스크립트는 비로소 **실행**됐지만, 이번엔 그 실행 첫머리에서 죽는 2차
+결함이 드러났다. 활성화 스크립트는 tauri 2.11.2 실측 순서상 **invoke init(ipc-protocol) 단계**에서
+실행되는데, `window.__TAURI_INTERNALS__.invoke`는 그보다 **뒤인 core.js에서야**
+`Object.defineProperty`로 정의된다. 그런데 초기 수정본은 설치 시점(리스너 등록 전)에
+`const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);`를 실행했다 —
+이 시점 `.invoke`는 `undefined`이므로 `undefined.bind`가 **TypeError**로 죽고, `mark('installed')`는
+이미 찍힌 뒤라 표식은 `installed`에 정지, **클릭 리스너가 영영 등록되지 않는다**. 라이브 증상:
+재연결 클릭 → `NATIVE_ACTIVATION_REQUIRED · (진단: 인터셉터 설치됨·이 클릭 미인터셉트)`.
+
+근본 교정: **설치 시점 코드는 `__TAURI_INTERNALS__`를 일절 접촉하지 않고**, invoke 조회를 클릭
+핸들러 안에서 **지연 수행**한다(`main.rs:212-219`). arm 불가(핸들러 시점에도 invoke 부재) 시에도
+`arm-failed:`를 찍고 클릭을 재생해 기존 계약을 유지한다. 이 불변식은 §2 **C5**가 집행한다.
+
 ---
 
 ## 2. 경계 계약 (불변식 — 수정자 필독)
@@ -91,20 +106,20 @@ UI로 노출).
 - 소스 계약: `src-tauri/src/main.rs:181` "invoke 초기화 스크립트에 push_str 연결되므로 **반드시
   `;`로 시작**해야 한다".
 - 회귀 테스트 `activation_script_survives_ipc_protocol_concatenation`
-  (`src-tauri/src/main.rs:3792-3801`): `assert_eq!(script.as_bytes().first(), Some(&b';'));`
+  (`src-tauri/src/main.rs:3807-3815`): `assert_eq!(script.as_bytes().first(), Some(&b';'));`
 - 술어 테스트 `initialization_script_keeps_capability_lexical_and_requires_trusted_activation`
-  (`src-tauri/src/main.rs:3775`): `assert!(script.starts_with(';'), "push_str 연결 경계 — 파스
+  (`src-tauri/src/main.rs:3789`): `assert!(script.starts_with(';'), "push_str 연결 경계 — 파스
   분리자 필수");`
 
 ### C2. concatenation 회귀 테스트 2종을 삭제하지 마라
 
 다음 두 테스트는 경계 계약의 집행기다. **삭제·약화 금지**:
 
-1. **`activation_script_survives_ipc_protocol_concatenation`** (`src-tauri/src/main.rs:3792-3801`)
+1. **`activation_script_survives_ipc_protocol_concatenation`** (`src-tauri/src/main.rs:3807-3815`)
    — 활성화 스크립트가 삼킴 위험이 없는지(첫 바이트 `;`) 검사. 술어
-   `concatenation_swallow_hazard`(`main.rs:3785-3790`)로 `( [ ` . + - * / , ?` 등 식-연속 시작
+   `concatenation_swallow_hazard`(`main.rs:3799-3804`)로 `( [ ` . + - * / , ?` 등 식-연속 시작
    토큰을 위험으로 판정한다.
-2. **`concatenation_detector_catches_the_original_swallow_bug`** (`src-tauri/src/main.rs:3803-3815`)
+2. **`concatenation_detector_catches_the_original_swallow_bug`** (`src-tauri/src/main.rs:3818-3829`)
    — **음성 대조군(계측 타당성 게이트)**. 현행 스크립트에서 선두 `;`를 벗겨낸 v0.13.6 실사고 형태를
    탐지기가 실제로 잡는지 스스로 증명한다. 이게 없으면 탐지기 자체가 무력화돼도 알 수 없다.
 
@@ -121,7 +136,36 @@ UI로 노출).
 
 주입 스크립트의 `capability`는 IIFE 클로저 안에만 있어야 한다(`window`/`globalThis` 유출 금지).
 테스트가 `script.matches(&capability).count() == 1` 및 `!contains("window.browser")` /
-`!contains("globalThis.browser")`로 강제한다(`src-tauri/src/main.rs:3772-3774`).
+`!contains("globalThis.browser")`로 강제한다(`src-tauri/src/main.rs:3786-3787`).
+
+### C5. 설치 시점 `__TAURI_INTERNALS__` 접촉 금지 (invoke는 클릭 시점 지연 조회)
+
+활성화 스크립트는 **core.js의 invoke 정의 이전에 실행된다**. tauri 2.11.2
+`prepare_pending_webview` 초기화 순서(실측):
+
+1. `isTauri`
+2. `__TAURI_INTERNALS__ = { plugins: {} }` ← 이 시점엔 `.invoke` 없음
+3. 메타(convertFileSrc 등)
+4. **invoke init script = ipc-protocol + 본 활성화 스크립트** ← 활성화 스크립트가 여기서 실행
+5. pattern
+6. ipc
+7. **core.js ← `Object.defineProperty(__TAURI_INTERNALS__, 'invoke', …)` = invoke 정의 지점**
+8. …(plugin init 등)
+
+따라서 설치 시점(리스너 등록 전)에 `window.__TAURI_INTERNALS__.invoke.bind(...)`처럼
+`__TAURI_INTERNALS__`를 접촉하면 `.invoke`가 `undefined`이라 `undefined.bind` **TypeError**로 죽고,
+`mark('installed')`는 이미 찍힌 뒤라 **클릭 리스너가 미등록**된다(v0.13.7 실사고). 불변식: 설치
+시점 코드는 `__TAURI_INTERNALS__`를 일절 접촉하지 않고(`mark('installed')`→`nativeClick`
+캡처→`addEventListener`만), invoke 조회는 **클릭 핸들러 안에서 지연 수행**한다
+(`src-tauri/src/main.rs:212-219`). 집행 테스트 2종:
+
+1. **`activation_script_defers_invoke_lookup_past_install_time`** (`src-tauri/src/main.rs:3846-3853`)
+   — 술어 `install_time_internals_capture`(`main.rs:3837-3843`: `addEventListener` 첫 등장 이전
+   구간에 `__TAURI_INTERNALS__`가 있으면 위험)로 현행 스크립트가 안전(false)인지 검사.
+2. **`install_time_capture_detector_catches_the_v0137_bug`** (`src-tauri/src/main.rs:3856-3872`)
+   — **음성 대조군**. `mark('installed');` 직후에 v0.13.7 실사고 라인
+   (`const invoke = window.__TAURI_INTERNALS__.invoke.bind(...)`)을 합성 삽입한 형태를 탐지기가
+   실제로 잡는지 증명한다. C2의 삼킴 탐지기 쌍과 같은 철학(계측 타당성 게이트)이다.
 
 ---
 
@@ -134,9 +178,9 @@ UI로 노출).
 | 표식 상태 | 기록 지점 | 의미 | UI 진단 문구 (webpane.ts) |
 |---|---|---|---|
 | **(부재 / undefined·null)** | 표식이 한 번도 안 써짐 | 활성화 스크립트 **미설치**(삼킴 결함) — 원인 확정 | `활성화 스크립트 미설치(빌드 결함 — 재설치 필요) · {raw}` (`webpane.ts:401-402`) |
-| **`installed`** | `mark('installed')` 주입 직후 (`main.rs:194`) | 인터셉터는 살아있으나 이 클릭이 미인터셉트 — 선택자 드리프트 의심 | `{raw} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 의심)` (`webpane.ts:405-406`) |
-| **`armed-ok`** | arm 성공 `.then` (`main.rs:206`) | arm 성공 이력인데 소모 실패 — TTL 만료/이중 소모 의심 | `{raw} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)` (`webpane.ts:407-408`) |
-| **`arm-failed: <e>`** | arm 거부 `.catch` (`main.rs:207`) | arm 거부 — 원인 확정. 클릭은 재생됨 | `{marker.slice(0,80)} · {raw}` (`webpane.ts:404`, 80자 캡: 장문 사유가 백엔드 코드를 placeholder에서 축출 못 하게) |
+| **`installed`** | `mark('installed')` 주입 직후 (`main.rs:200`) | 인터셉터는 살아있으나 이 클릭이 미인터셉트 — 선택자 드리프트 **또는 설치 직후 코드가 죽어 리스너 미등록(C5 위반)** 의심 | `{raw} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 또는 설치 직후 크래시 의심)` (`webpane.ts:405-406`) |
+| **`armed-ok`** | arm 성공 `.then` (`main.rs:218`) | arm 성공 이력인데 소모 실패 — TTL 만료/이중 소모 의심 | `{raw} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)` (`webpane.ts:407-408`) |
+| **`arm-failed: <e>`** | arm 거부 `.catch` (`main.rs:219`), 또는 클릭 시점 invoke 부재(C5) `main.rs:214` | arm 거부 — 원인 확정. 클릭은 재생됨 | `{marker.slice(0,80)} · {raw}` (`webpane.ts:404`, 80자 캡: 장문 사유가 백엔드 코드를 placeholder에서 축출 못 하게) |
 | **(미지 값 / 위조)** | — | 무보강 — 오진 금지, 백엔드 원문 유지 | `{raw}` (`webpane.ts:409`) |
 
 상태 흐름: `installed`(주입 시) → 신뢰 클릭 시 arm 시도 → 성공이면 `armed-ok`(그 후 nativeClick

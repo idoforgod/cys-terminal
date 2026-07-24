@@ -20,6 +20,14 @@ v0.13.7이 고친 결함(내부 브라우저 활성화 인터셉터가 통째로
 - **`sim_e2e.swift`** — 활성화 전 경로(설계 확정 D1 주입 스크립트 + D2 진단 순수함수)를 동일
   WebKit에서 구동하는 3시나리오 하네스. tauri `append_invoke_initialization_script`의 `push_str`
   연결(선행 ipc-protocol.js 동형 말미 `})()\n` + 뒤 `;`-시작 활성화 스크립트)을 그대로 재현한다.
+  **스텁 주입 순서는 계약이다** — tauri 2.11.2 실측 순서를 그대로 세운다: **(a)** 먼저
+  `__TAURI_INTERNALS__={plugins:{}}` 골격만 정의(invoke 없음) → **(b)** ipc-protocol 동형 스텁
+  (`postMessage`만 정의, `})()\n`로 끝) + push_str 연결된 활성화 스크립트 → **(c) 그 뒤**에야
+  core.js 동형 스텁이 `Object.defineProperty(window.__TAURI_INTERNALS__, 'invoke', …)`로 invoke를
+  정의한다. 즉 **invoke는 활성화 스크립트 실행 이후에야 존재한다** — 활성화 스크립트가 설치
+  시점에 invoke를 잡으려 하면 `undefined.bind`로 죽어 리스너가 미등록된다(v0.13.7 실사고).
+  이 순서를 틀리게(invoke를 처음부터 정의) 세우면 시뮬이 바로 그 결함을 놓친다 — v0.13.7 이전
+  하네스가 실제로 놓쳤다. 초기화 로그(`invoke defined=undefined`→`…=function`)가 순서를 실증한다.
   - **A = 정상**: arm 성공 → `armed-ok` 표식 → `ensure_browserd_cast` 성공.
   - **B = arm 실패**: arm 거부 → `arm-failed:<사유>` 표식 → 클릭 재생 → enriched 진단 노출.
   - **C = 연타**: 두 번째 클릭은 dup 판정(focus-only) → 이중 `ensure` 금지.
@@ -40,6 +48,10 @@ macOS·Xcode 커맨드라인 툴 필요(WebKit·Cocoa 링크). 인자 없이 `./
 
 ## 기대 출력
 
+- **초기화 순서(전 시나리오 공통)**: `internals-base-ran (invoke defined=undefined)` →
+  `ipc-init-ran (invoke defined=undefined)` → `core-init-ran (invoke defined=function)`. 즉 invoke는
+  ipc-protocol+활성화 스크립트 단계에선 `undefined`이고 core.js 뒤에야 `function`이 된다 — 이게
+  이번 결함(설치 시점 invoke 접촉 금지)을 시뮬이 잡을 수 있게 하는 순서 계약이다.
 - **A (정상)**: `interceptor-marker=installed` → 클릭 → `invoke:arm_browser_native_activation` →
   표식 `armed-ok` → `invoke:ensure_browserd_cast` → `ensure OK (calls=1)`.
 - **B (arm 실패)**: 표식 `arm-failed: ...`(백엔드 거부 사유) → **클릭 재생됨**(무반응 버튼 아님) →

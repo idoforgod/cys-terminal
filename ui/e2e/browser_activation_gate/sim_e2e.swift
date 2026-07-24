@@ -17,29 +17,36 @@ let handler = Handler()
 let config = WKWebViewConfiguration()
 config.userContentController.add(handler, name: "log")
 
-// [1] ipc-protocol.js 동형 말미(`})()\n`) — 스텁 invoke가 백엔드 레지스트리(arm/consume TTL 제외)를 재현
+// ── 주입 순서는 계약이다 ─────────────────────────────────────────────────────
+// tauri 2.11.2 실측 초기화 순서를 재현한다(이 순서를 틀리면 이번 결함=설치 시점 invoke
+// 접촉을 시뮬이 놓친다): ① __TAURI_INTERNALS__={plugins:{}} 먼저 정의 → ② ipc-protocol
+// 동형 스텁(postMessage만 정의, `})()\n`로 끝) + push_str 연결된 활성화 스크립트 → ③ **그
+// 뒤** core.js 동형 스텁이 __TAURI_INTERNALS__.invoke를 정의한다. 즉 invoke는 활성화
+// 스크립트 실행 이후에야 존재한다 — 활성화 스크립트가 설치 시점에 invoke를 잡으려 하면
+// undefined.bind로 죽는다(v0.13.7 실사고). 설계 확정본은 invoke를 클릭 시점에 지연 조회한다.
+
 let armBehavior = scenario == "B" ? "return Promise.reject('Browser bootstrap capability mismatch (simulated)');" : "S.pending = true; return Promise.resolve(null);"
-let tail = """
+
+// [a] __TAURI_INTERNALS__ 골격({plugins:{}}) — core.js 이전에 존재하나 invoke는 아직 없다.
+let internalsBase = """
+;(() => {
+  Object.defineProperty(window, '__TAURI_INTERNALS__', { value: { plugins: {} }, configurable: true });
+  window.webkit.messageHandlers.log.postMessage('internals-base-ran (invoke defined=' + (typeof window.__TAURI_INTERNALS__.invoke) + ')');
+})()
+"""
+
+// [b] ipc-protocol.js 동형 말미(`})()\n`) — postMessage만 정의(invoke 없음). 실물처럼 식으로 끝난다.
+let ipcProtocol = """
 (function () {
   const log = (m) => window.webkit.messageHandlers.log.postMessage(m);
-  const S = { pending: false };
-  window.__TAURI_INTERNALS__ = {
-    invoke(cmd, args) {
-      log('invoke:' + cmd);
-      if (cmd === 'arm_browser_native_activation') { \(armBehavior) }
-      if (cmd === 'ensure_browserd_cast') {
-        if (!S.pending) return Promise.reject('BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: trusted native Browser activation is required');
-        S.pending = false; return Promise.resolve({ url: 'stub' });
-      }
-      return Promise.reject('unknown cmd');
-    }
-  };
-  log('ipc-init-ran');
+  Object.defineProperty(window.__TAURI_INTERNALS__, 'postMessage', { value: function (msg) { /* stub */ }, configurable: true });
+  log('ipc-init-ran (invoke defined=' + (typeof window.__TAURI_INTERNALS__.invoke) + ')');
 })()
 
 """
 
-// [2] D1 스크립트 — 설계 확정본 그대로(capability는 64hex 예시로 인스턴스화)
+// [b'] D1 활성화 스크립트 — 실물(main.rs)에서 재추출(README '재추출 규칙': {{→{, {capability}→64hex).
+// invoke를 설치 시점에 잡지 않고 클릭 핸들러 안에서 지연 조회한다.
 let capability = String(repeating: "c", count: 64)
 let d1 = """
 ;(() => {
@@ -47,28 +54,58 @@ let d1 = """
   const capability = '\(capability)';
   const mark = (s) => { try { window.__CYS_BROWSER_ACTIVATION__ = s; } catch (_) {} };
   mark('installed');
-  const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
   const nativeClick = HTMLElement.prototype.click;
   document.addEventListener('click', (event) => {
-    if (!event.isTrusted || !navigator.userActivation.isActive) return;
+    if (!event.isTrusted) return;
+    const ua = navigator.userActivation;
+    if (ua && ua.isActive === false) return;
     const raw = event.target;
     if (!(raw instanceof Element)) return;
     const target = raw.closest("#btn-browser, [data-browser-reconnect='true']");
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    invoke('arm_browser_native_activation', { bootstrapCapability: capability })
+    const internals = window.__TAURI_INTERNALS__;
+    if (!internals || typeof internals.invoke !== 'function') {
+      mark('arm-failed: __TAURI_INTERNALS__.invoke unavailable at click time');
+      return nativeClick.call(target);
+    }
+    internals.invoke('arm_browser_native_activation', { bootstrapCapability: capability })
       .then(() => { mark('armed-ok'); nativeClick.call(target); })
       .catch((e) => { mark('arm-failed: ' + e); nativeClick.call(target); });
   }, true);
 })();
 """
-let concatenated = tail + d1  // append_invoke_initialization_script push_str 동형
+let concatenated = ipcProtocol + d1  // append_invoke_initialization_script push_str 동형
+
+// [c] core.js 동형 — **활성화 스크립트 뒤에** invoke를 정의한다(arm/ensure 레지스트리, TTL 제외).
+let coreJs = """
+;(() => {
+  const log = (m) => window.webkit.messageHandlers.log.postMessage(m);
+  const S = { pending: false };
+  Object.defineProperty(window.__TAURI_INTERNALS__, 'invoke', {
+    value: function (cmd, args) {
+      log('invoke:' + cmd);
+      if (cmd === 'arm_browser_native_activation') { \(armBehavior) }
+      if (cmd === 'ensure_browserd_cast') {
+        if (!S.pending) return Promise.reject('BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: trusted native Browser activation is required');
+        S.pending = false; return Promise.resolve({ url: 'stub' });
+      }
+      return Promise.reject('unknown cmd');
+    },
+    configurable: true
+  });
+  log('core-init-ran (invoke defined=' + (typeof window.__TAURI_INTERNALS__.invoke) + ')');
+})()
+"""
 
 config.userContentController.addUserScript(WKUserScript(source: """
 window.addEventListener('error', (e) => window.webkit.messageHandlers.log.postMessage('WINDOW-ERROR: ' + e.message));
 """, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+// 실물 tauri 순서: (a) __TAURI_INTERNALS__ 골격 → (b) ipc-protocol+활성화 스크립트 → (c) core.js가 invoke 정의
+config.userContentController.addUserScript(WKUserScript(source: internalsBase, injectionTime: .atDocumentStart, forMainFrameOnly: true))
 config.userContentController.addUserScript(WKUserScript(source: concatenated, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+config.userContentController.addUserScript(WKUserScript(source: coreJs, injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
 // [3] 페이지 — openCastPane dup 판정 + castActiveEnsure + D2 진단(설계 확정 순수함수) 재현
 let html = """

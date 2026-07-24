@@ -185,6 +185,12 @@ fn random_secret_hex() -> Result<String, String> {
 /// 표식 `__CYS_BROWSER_ACTIVATION__`은 진단 전용(installed→armed-ok|arm-failed:) —
 /// 권위 없음(판정자는 백엔드 consume). capability는 클로저 격리 유지. arm 실패도 클릭을
 /// 재생한다 — 무반응 버튼 대신 백엔드의 정확한 거부 사유가 UI 배관으로 노출되게.
+///
+/// 이 스크립트는 invoke init(ipc-protocol) 단계에서 실행 — core.js가 `.invoke`를 정의하기
+/// **이전**이다(tauri 2.11.2 실측 순서). 설치 시점에 `__TAURI_INTERNALS__`를 접촉하면
+/// `undefined.bind` TypeError로 리스너가 미등록된다(v0.13.7 실사고: 표식 `installed` 정지·
+/// 클릭 영영 미인터셉트). invoke는 반드시 클릭 시점 지연 조회 — 설치 시점 코드
+/// (리스너 등록 전)는 `__TAURI_INTERNALS__`를 일절 접촉하지 않는다.
 fn browser_activation_initialization_script(capability: &str) -> String {
     format!(
         r##";(() => {{
@@ -192,17 +198,23 @@ fn browser_activation_initialization_script(capability: &str) -> String {
   const capability = '{capability}';
   const mark = (s) => {{ try {{ window.__CYS_BROWSER_ACTIVATION__ = s; }} catch (_) {{}} }};
   mark('installed');
-  const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
   const nativeClick = HTMLElement.prototype.click;
   document.addEventListener('click', (event) => {{
-    if (!event.isTrusted || !navigator.userActivation.isActive) return;
+    if (!event.isTrusted) return;
+    const ua = navigator.userActivation;
+    if (ua && ua.isActive === false) return;
     const raw = event.target;
     if (!(raw instanceof Element)) return;
     const target = raw.closest("#btn-browser, [data-browser-reconnect='true']");
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    invoke('arm_browser_native_activation', {{ bootstrapCapability: capability }})
+    const internals = window.__TAURI_INTERNALS__;
+    if (!internals || typeof internals.invoke !== 'function') {{
+      mark('arm-failed: __TAURI_INTERNALS__.invoke unavailable at click time');
+      return nativeClick.call(target);
+    }}
+    internals.invoke('arm_browser_native_activation', {{ bootstrapCapability: capability }})
       .then(() => {{ mark('armed-ok'); nativeClick.call(target); }})
       .catch((e) => {{ mark('arm-failed: ' + e); nativeClick.call(target); }});
   }}, true);
@@ -3765,7 +3777,9 @@ mod tests {
         let capability = "c".repeat(64);
         let script = browser_activation_initialization_script(&capability);
         assert!(script.contains("event.isTrusted"));
-        assert!(script.contains("navigator.userActivation.isActive"));
+        // 방어적 userActivation 가드(API 부재 시 통과) — isTrusted가 1차 게이트.
+        assert!(script.contains("navigator.userActivation"));
+        assert!(script.contains("isActive"));
         assert!(script.contains("#btn-browser"));
         assert!(script.contains("[data-browser-reconnect='true']"));
         assert!(script.contains("arm_browser_native_activation"));
@@ -3811,6 +3825,49 @@ mod tests {
         assert!(
             concatenation_swallow_hazard(buggy),
             "탐지기가 원본 결함(호출 연쇄 삼킴)을 잡지 못하면 계측 무효"
+        );
+    }
+
+    /// tauri 2.11.2 실측 초기화 순서상 활성화 스크립트는 invoke init(ipc-protocol) 단계에서
+    /// 실행되고, `__TAURI_INTERNALS__.invoke`는 그보다 뒤인 core.js에서야 정의된다. 따라서
+    /// **설치 시점(리스너 등록 전) 코드가 `__TAURI_INTERNALS__`를 접촉하면** `undefined.bind`
+    /// TypeError로 리스너가 미등록된다(v0.13.7 실사고). 술어: 스크립트에서 `addEventListener`
+    /// 첫 등장 이전 구간에 `__TAURI_INTERNALS__`가 포함되면 위험(true). invoke 조회는 반드시
+    /// 클릭 핸들러(=`addEventListener` 콜백) 안에서 지연 수행돼야 한다.
+    fn install_time_internals_capture(script: &str) -> bool {
+        match script.find("addEventListener") {
+            Some(idx) => script[..idx].contains("__TAURI_INTERNALS__"),
+            // addEventListener가 아예 없으면 리스너 미등록 — 접촉 여부와 무관하게 위험 취급.
+            None => true,
+        }
+    }
+
+    #[test]
+    fn activation_script_defers_invoke_lookup_past_install_time() {
+        let script = browser_activation_initialization_script(&"c".repeat(64));
+        assert!(
+            !install_time_internals_capture(&script),
+            "설치 시점(리스너 등록 전)에 __TAURI_INTERNALS__를 접촉하면 core.js 이전 실행이라 \
+             undefined.bind TypeError로 리스너가 미등록된다 — invoke는 클릭 시점 지연 조회여야 한다"
+        );
+    }
+
+    #[test]
+    fn install_time_capture_detector_catches_the_v0137_bug() {
+        // 음성 대조군(계측 타당성 게이트) — v0.13.7 실사고 형태(설치 시점에 invoke를 bind하는
+        // 라인)를 탐지기가 실제로 잡는지 스스로 증명한다. 현행 스크립트의 `mark('installed');`
+        // 직후에 실사고 라인을 합성 삽입해 addEventListener 이전 구간에 __TAURI_INTERNALS__를
+        // 넣는다. 이 테스트가 없으면 탐지기 자체가 무력화돼도 알 수 없다.
+        let current = browser_activation_initialization_script(&"c".repeat(64));
+        let buggy = current.replacen(
+            "mark('installed');",
+            "mark('installed');\n  const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);",
+            1,
+        );
+        assert_ne!(buggy, current, "양성 전제: 합성 삽입이 실제로 일어나야 한다");
+        assert!(
+            install_time_internals_capture(&buggy),
+            "탐지기가 v0.13.7 실사고(설치 시점 __TAURI_INTERNALS__.invoke 접촉)를 잡지 못하면 계측 무효"
         );
     }
 

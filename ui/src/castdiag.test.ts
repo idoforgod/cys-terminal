@@ -29,9 +29,9 @@ describe("castActivationDiagnostics — 표식 기반 진단 보강", () => {
     expect(castActivationDiagnostics(NATIVE, marker)).toBe(`${capped} · ${NATIVE}`);
   });
 
-  it("4) 'installed' → 원문 + '선택자 불일치 의심' 힌트 후행", () => {
+  it("4) 'installed' → 원문 + '선택자 불일치 또는 설치 직후 크래시 의심' 힌트 후행", () => {
     expect(castActivationDiagnostics(NATIVE, "installed")).toBe(
-      `${NATIVE} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 의심)`,
+      `${NATIVE} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 또는 설치 직후 크래시 의심)`,
     );
   });
 
