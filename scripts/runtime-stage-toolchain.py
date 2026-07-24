@@ -55,28 +55,34 @@ def extract(args: argparse.Namespace) -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         if args.output.exists():
             runtime_stage.fail("Bun compiler output already exists")
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{args.output.name}.", dir=args.output.parent, delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            try:
+        temporary_path = None
+        try:
+            # ★진범(5차 CI): temp 쓰기 핸들은 이 with 블록 안에서만 열어둔다 — 블록을 나가며
+            #   close된다. Windows는 열린 fd를 가진 파일의 rename을 sharing violation(WinError 32)
+            #   으로 거부하므로, chmod·assert·replace는 반드시 블록 밖(핸들 close 후)에서 실행해야
+            #   한다. 잠금 보유자는 AV가 아니라 우리 자신의 미close 핸들이었고(flush만 하고 close
+            #   전 replace 호출), 그래서 재시도는 자기 핸들 상대라 결정론 실패했다. POSIX는 열린
+            #   fd rename을 허용해 mac에선 무증상이었다.
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{args.output.name}.", dir=args.output.parent, delete=False
+            ) as temporary:
+                temporary_path = Path(temporary.name)
                 with archive.open(member) as payload:
                     while chunk := payload.read(1024 * 1024):
                         temporary.write(chunk)
                 temporary.flush()
-                temporary_path.chmod(0o755)
-                expected_arch = runtime_stage.TARGETS[args.target][0]
-                runtime_stage.assert_target(temporary_path, expected_arch, "Bun compiler")
-                # Windows AV/indexer may briefly hold the just-written .exe; ride out
-                # the share-lock (WinError 32) so the atomic rename lands. Fail-closed
-                # on exhaustion (re-raise) — no unbounded wait.
-                runtime_stage.retry_on_windows_lock(lambda: temporary_path.replace(args.output))
-            finally:
-                # Best-effort temp cleanup. This only has work to do when the replace
-                # above failed (a successful replace leaves nothing to unlink); in that
-                # path the same share-lock can still be held, so retry it too. If a
-                # primary exception is already propagating, swallow a residual lock
-                # rather than mask it — the job still fails closed on the primary error.
+            # 여기서 temp 핸들은 닫혀 있다(위 with 블록 종료).
+            temporary_path.chmod(0o755)
+            expected_arch = runtime_stage.TARGETS[args.target][0]
+            runtime_stage.assert_target(temporary_path, expected_arch, "Bun compiler")
+            # retry 헬퍼는 진짜 AV/인덱서 간섭 대비로 유지(자기 핸들은 이미 위에서 close).
+            runtime_stage.retry_on_windows_lock(lambda: temporary_path.replace(args.output))
+        finally:
+            # Best-effort temp cleanup. Only has work when the replace failed or an
+            # earlier step raised (a successful replace leaves nothing to unlink). If a
+            # primary exception is already propagating, swallow a residual lock rather
+            # than mask it — the job still fails closed on the primary error.
+            if temporary_path is not None:
                 pending = sys.exc_info()[0]
                 try:
                     runtime_stage.retry_on_windows_lock(

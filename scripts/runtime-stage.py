@@ -34,12 +34,15 @@ def fail(message: str) -> None:
 def retry_on_windows_lock(operation, *, attempts=10, base_delay=0.5, max_delay=4.0, max_total=30.0):
     """Run *operation*, retrying transient Windows share-lock failures (WinError 32).
 
-    A just-written executable is briefly held open by an antivirus scanner or the
-    search indexer, so an atomic rename/replace over it raises PermissionError with
-    winerror == 32. Exponential backoff (total budget ~30s) rides out that window.
-    POSIX never sets winerror, so any PermissionError there is a real error and is
-    re-raised immediately — the wrapper is a no-op on the happy path. On exhaustion
-    the last exception is re-raised (fail-closed — never an unbounded wait)."""
+    This rides out an *external* holder (antivirus scanner / search indexer briefly
+    holding a just-written file), so an atomic rename/replace over it raises
+    PermissionError with winerror == 32. NOTE: retrying is useless against a lock we
+    hold ourselves — the caller MUST close its own write handle before invoking this
+    (the 5th-run CI failure was exactly a self-held fd, and 56s of backoff could not
+    clear our own handle). Exponential backoff (total budget ~30s) rides out the
+    external window. POSIX never sets winerror, so any PermissionError there is a real
+    error and is re-raised immediately — the wrapper is a no-op on the happy path. On
+    exhaustion the last exception is re-raised (fail-closed — never an unbounded wait)."""
     delay = base_delay
     waited = 0.0
     for attempt in range(1, attempts + 1):
