@@ -462,6 +462,36 @@ def _binary_version():
     return out.strip().splitlines()[0] if code == 0 and out.strip() else "unknown"
 
 
+# ── W3(DD-3): 배너 진실 — 부트 실패 hint 를 formation 상태 기반으로 분기(오진 제거) ──
+# 종전 ④boot hint 는 원인 무관 "claude CLI 설치를 확인하세요"로 하드코딩(오진)이었다 — 실제 원인은
+# formation 상태가 진실(T2 이후). pending-cli 는 기능1(인앱 CLI 설치 온보딩) UI 를 보존한다.
+def _formation_hint(formation):
+    """formation 상태 dict(boot-last.json 의 formation 필드) → 원인별 안내문(또는 None).
+    None = complete/미상 → 호출부가 기존 boot 메시지로 폴백. 순수 함수(테스트 대상)."""
+    f = formation or {}
+    kind = (f.get("kind") or "").strip()
+    state = (f.get("state") or "").strip()
+    if kind == "pending-cli":
+        # ★기능1(인앱 CLI 설치 온보딩) UI 보존 — 제거 금지(설치 안내 + 단독 사용 가능 + 자동 완결).
+        return ("claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 "
+                "가능). `curl -fsSL https://claude.ai/install.sh | bash` 로 설치하면 자동으로 "
+                "편성이 완결됩니다.")
+    if kind == "pending-resource":
+        return ("곱셈 자원 예산 초과로 팀 편성이 대기 중입니다 — 유휴 서버·노드를 정리하면 자동 "
+                "재시도됩니다. 상세: boot-last.json 의 formation 필드.")
+    if kind == "partial":
+        missing = state.split(":", 1)[1] if ":" in state else ""
+        tail = (" (부족 CLI: %s)" % missing) if (missing and missing != "booting") else ""
+        return ("설치된 CLI 로 가능한 노드만 기동했습니다%s — 나머지 CLI 설치 시 편성이 자동 "
+                "완결됩니다." % tail)
+    if kind == "failed":
+        cause = (state.split(":", 1)[1] if ":" in state else state) or "원인 미상"
+        return ("팀 편성 실패(%s) — boot-last.json 의 formation 필드와 formation 상태 파일"
+                "(<CYS_STATE_DIR 또는 ~/.cys/state>/formation/<소켓키>.json)에서 원인을 "
+                "확인하세요." % cause)
+    return None
+
+
 class _Log:
     """단계 결과를 boot-last.json에 누적(진단 가시성 — 각 retry 시도 포함)."""
 
@@ -493,9 +523,17 @@ class _Log:
                         ) if exit_code == 10 else (
                         "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).")
             else:
-                hint = {"④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
-                        "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요."
-                        }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
+                # ★W3(DD-3): 원인은 formation 상태가 진실 — 하드코딩 오진 대신 상태 기반 분기.
+                fh = _formation_hint(self.data.get("formation"))
+                if name == "④boot":
+                    hint = fh or ("팀(CSO·워커·리뷰어) 기동이 완결되지 않았습니다 — cys list·"
+                                  "boot-last.json(formation 필드)로 원인을 확인하세요.")
+                elif name == "⑤check":
+                    hint = fh or ("팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 "
+                                  "재선언하세요.")
+                else:
+                    hint = ("부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인."
+                            % name)
             try:
                 subprocess.run(["cys", "feed", "push", "--kind", "bootstrap-fail",
                                 "--title", "부트스트랩 미완(%s)" % name, "--body", hint],

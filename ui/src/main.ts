@@ -9,6 +9,7 @@ import { shellQuote } from "./shellquote";
 import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
 import { transferTrees } from "./transfer";
 import { updatePlan } from "./updateplan";
+import { bootBannerDecision, isFormationKind } from "./bootbanner";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
@@ -5563,6 +5564,20 @@ function onDaemonEvent(event: Record<string, unknown>) {
         : JSON.stringify(payload).slice(0, 120);
     toast("watchdog", `🐕 ${name}`, detail);
   } else if (category === "feed") {
+    // ★W3(T3): 편성 상태 표면화(kind=formation-*)는 승인 요청이 아니라 배너 수명 신호다 —
+    // 승인 토스트/전환 유예 경로를 타지 않고, boot-warn 배너를 소멸(complete)/갱신(partial)한다.
+    if (name === "feed.item.created" && isFormationKind(String(payload.kind ?? ""))) {
+      const decision = bootBannerDecision(String(payload.kind ?? ""));
+      if (decision.action === "dismiss") {
+        dismissToast("boot-warn"); // 편성 완결 → "팀 기동 경고" 배너 제거(멱등)
+      } else if (decision.action === "update" && stickyToasts.has("boot-warn")) {
+        // 부분 편성: 배너가 떠 있을 때만 문구 갱신(제거 아님 — 아직 미완). 없으면 새로 만들지 않는다.
+        stickyToast("boot-warn", "health", "팀 기동 경고", decision.text);
+      }
+      refreshFeed();
+      refreshSidebarStatus();
+      return;
+    }
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만

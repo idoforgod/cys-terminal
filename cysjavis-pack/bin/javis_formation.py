@@ -352,33 +352,73 @@ def _write_state(socket, state, detail, roles_booted):
     return path
 
 
-def _feed(title, body):
-    """편성 상태 표면화(EVT 신규 타입 등록은 T3 몫 — 여기서는 기존 feed push 관례 사용).
+def _feed(title, body, kind="formation"):
+    """편성 상태 표면화(데몬 feed 버스 → UI onDaemonEvent). kind=formation-*(배너 수명 신호).
     데몬 부재 등 실패는 무시(best-effort·부트 무해)."""
-    _run(["cys", "feed", "push", "--kind", "formation", "--title", title, "--body", body],
+    _run(["cys", "feed", "push", "--kind", kind, "--title", title, "--body", body],
          timeout=10)
 
 
 def _feed_for_state(state):
     kind = state_kind(state)
+    fk = feed_kind_for_state(state)   # UI 배너 판정용 --kind(complete=소멸·partial=갱신)
     if kind == "pending-cli":
         _feed("부서 팀 편성 대기(CLI 미설치)",
               "claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 "
               "가능). `curl -fsSL https://claude.ai/install.sh | bash` 로 설치하면 자동으로 "
-              "편성이 완결됩니다.")
+              "편성이 완결됩니다.", fk)
     elif kind == "partial":
         _feed("부서 팀 부분 편성", "설치된 CLI 로 가능한 노드만 기동했습니다(%s). 나머지 CLI "
-              "설치 시 자동으로 편성이 완결됩니다." % state)
+              "설치 시 자동으로 편성이 완결됩니다." % state, fk)
     elif kind == "pending-resource":
-        _feed("부서 팀 편성 대기(자원)", "곱셈 자원 예산 초과 — 자원 정리 후 자동 재시도됩니다.")
+        _feed("부서 팀 편성 대기(자원)", "곱셈 자원 예산 초과 — 자원 정리 후 자동 재시도됩니다.", fk)
     elif kind == "complete":
         _feed("부서 팀 편성 완결", "master + 4종 의무 노드(cso·worker·reviewer-gemini·"
-              "reviewer-codex) 전부 기동 완료.")
+              "reviewer-codex) 전부 기동 완료.", fk)
+    elif kind == "failed":
+        _feed("부서 팀 편성 실패", "편성에 실패했습니다(%s) — boot-last.json·formation 상태 "
+              "파일에서 원인을 확인하세요." % state, fk)
+
+
+def _read_state(socket):
+    """저장된 이전 상태 문자열(전이 감지용) — 없으면 None. best-effort."""
+    path = os.path.join(_state_root(), _sanitize_key(socket) + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("state")
+    except (OSError, ValueError):
+        return None
+
+
+def _emit_evt(evt_type, fields):
+    """javis_event.py emit(EVT v2 · 음성/HUD 트랙 — UI 배너와 별개 층). best-effort·부트 무해(R10)."""
+    ev = os.path.join(SELF_DIR, "javis_event.py")
+    if not os.path.isfile(ev):
+        ev = os.path.join(PACK_DIR, "bin", "javis_event.py")
+        if not os.path.isfile(ev):
+            return
+    py = sys.executable or "python3"
+    argv = [py, ev, "emit", evt_type, "--spool"]
+    for k, v in fields.items():
+        argv += ["--field", "%s=%s" % (k, v)]
+    _run(argv, timeout=10)
+
+
+def _surface(socket, prev_state, state):
+    """상태 표면화 — (1) UI 배너 수명 신호(feed --kind) (2) 음성/HUD EVT. kind 전이 또는 최초
+    관측 시에만 발화(심박 스팸 억제·'전이 시' 계약). 전부 best-effort·부트 무해(R10)."""
+    if prev_state is not None and state_kind(prev_state) == state_kind(state):
+        return  # 상태 kind 무변화 → 재표면화 생략(배너 dismiss 는 멱등이나 스팸 억제)
+    _feed_for_state(state)
+    evt = evt_type_for_state(state)
+    if evt:
+        _emit_evt(evt, {"socket": socket or "", "state": state, "kind": state_kind(state)})
 
 
 # ── ensure: 상태 기계 전이 주체 ──
 def ensure(socket=None, cwd=None):
     """편성 전이(멱등·싱글플라이트). 반환: (state, detail). 모든 실패 graceful."""
+    prev = _read_state(socket)   # 전이 감지용(배너 수명 신호는 전이 시에만 표면화)
     # ① kill-switch
     if not gate_check():
         # paused: 현 관측 기준 상태를 계산해 기록만(기동 없이 pending 유지).
@@ -405,7 +445,7 @@ def ensure(socket=None, cwd=None):
             state = "pending-resource"
             detail = "곱셈 자원 예산 hard — 편성 대기"
             _write_state(socket, state, detail, live)
-            _feed_for_state(state)
+            _surface(socket, prev, state)
             return state, detail
 
         # CLI 전무 → pending-cli(빈 셸 유지·온보딩 보존)
@@ -414,7 +454,7 @@ def ensure(socket=None, cwd=None):
             state = classify(installed=installed, live=live, resource_ok=True)
             detail = "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)"
             _write_state(socket, state, detail, live)
-            _feed_for_state(state)
+            _surface(socket, prev, state)
             return state, detail
 
         # ⑤⑥ 설치된 CLI 기준 최대 편성. master 먼저(입양 경로) → CSO → 나머지.

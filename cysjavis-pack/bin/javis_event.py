@@ -94,6 +94,14 @@ SCHEMA = {
     "task.unblocked": ["task"],
     "briefing": ["counts"],
     "task_progress": ["task", "stage"],  # v2(ViMax OPP-14): 작업 내부 스테이지 — pct·detail·cost_usd_cum 선택
+    # ★W3(능력파리티 T3 · 2026-07-24): 편성 상태 수명 이벤트(음성/HUD 트랙). UI 배너 소멸/갱신은
+    # 데몬 feed 버스(feed.item.created, payload.kind=formation-*)가 담당하는 별개 층이다
+    # (handlers.rs:2814 층 분리 주석 참조). 계약 SOT=_round/EVENT_CONTRACT.md(이 리포 체크아웃엔
+    # 부재 — 이 SCHEMA/SPEAK 항목과 아래 주석이 리포 내 소스 계약). 방출자=javis_formation._emit_evt.
+    "boot.formation.complete": ["socket", "state", "kind"],
+    "boot.formation.partial": ["socket", "state", "kind"],
+    "boot.formation.pending": ["socket", "state", "kind"],
+    "boot.formation.failed": ["socket", "state", "kind"],
 }
 
 SPEAK = {
@@ -111,6 +119,10 @@ SPEAK = {
     "briefing": ("가동 {running}건, 처리할 일 {inbox}건, "
                  "승인대기 {approvals}건, 경보 {alerts}건입니다."),
     "task_progress": "{task} 작업이 {stage} 단계입니다.",
+    "boot.formation.complete": "팀 편성이 완결됐습니다(마스터+4종 의무 노드).",
+    "boot.formation.partial": "팀이 일부만 편성됐습니다({state}). 나머지 CLI 설치 시 자동 완결됩니다.",
+    "boot.formation.pending": "팀 편성이 대기 중입니다({state}).",
+    "boot.formation.failed": "팀 편성에 실패했습니다({state}).",
 }
 
 

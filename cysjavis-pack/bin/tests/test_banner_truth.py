@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""test_banner_truth.py — W3/T3 배너 진실·수명 계약 핀.
+
+계약(구현 후 통과 기준):
+  A) javis_formation.feed_kind_for_state: 상태→UI 배너 신호 kind
+     (complete=formation-complete·partial=formation-partial·그 외=formation-pending/failed).
+  B) javis_formation.evt_type_for_state: 상태→EVT v2 타입(boot.formation.*).
+  C) javis_formation._surface: kind 전이 시에만 표면화(심박 스팸 억제 — '전이 시' 계약).
+  D) javis_bootstrap._formation_hint: 부트 실패 hint 를 formation 상태로 분기(오진 제거),
+     pending-cli 는 기능1 온보딩 UI(설치 안내) 보존, failed 는 상태 파일 포인터.
+  E) javis_event: boot.formation.* 4종이 계약에 등재(deny-by-default 통과) + 미지 타입은 여전히 거부.
+
+실행: python3 test_banner_truth.py   (exit 0=PASS / 1=FAIL)
+"""
+import importlib.util
+import os
+import subprocess
+import sys
+
+SELF = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.normpath(os.path.join(SELF, ".."))
+sys.path.insert(0, BIN)  # 형제 모듈(javis_scrub·javis_cli_probe) 해석 — 로드 대상의 import 충족
+# 밀폐 고정(라이브 팩 상속 금지 — 리포 팩만). test_formation 관례 승계.
+os.environ["CYS_PACK_DIR"] = os.path.normpath(os.path.join(SELF, "..", ".."))  # cysjavis-pack/
+fails = []
+
+
+def check(name, cond, detail=""):
+    print("%s %s%s" % ("PASS" if cond else "FAIL", name, (" — " + detail) if detail else ""))
+    if not cond:
+        fails.append(name)
+
+
+def _load(mod_name, filename):
+    path = os.path.join(BIN, filename)
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+# ── A/B/C: javis_formation ──
+fm = _load("javis_formation", "javis_formation.py")
+check("A0.formation import", fm is not None)
+if fm:
+    # A) feed_kind_for_state
+    check("A1.complete→formation-complete", fm.feed_kind_for_state("complete") == "formation-complete")
+    check("A2.partial→formation-partial", fm.feed_kind_for_state("partial:agy,codex") == "formation-partial")
+    check("A3.pending-cli→formation-pending",
+          fm.feed_kind_for_state("pending-cli:master,cso") == "formation-pending")
+    check("A4.pending-resource→formation-pending",
+          fm.feed_kind_for_state("pending-resource") == "formation-pending")
+    check("A5.failed→formation-failed", fm.feed_kind_for_state("failed:boom") == "formation-failed")
+
+    # B) evt_type_for_state
+    check("B1.complete EVT", fm.evt_type_for_state("complete") == "boot.formation.complete")
+    check("B2.partial EVT", fm.evt_type_for_state("partial:agy") == "boot.formation.partial")
+    check("B3.pending-cli EVT", fm.evt_type_for_state("pending-cli:x") == "boot.formation.pending")
+    check("B4.pending-resource EVT", fm.evt_type_for_state("pending-resource") == "boot.formation.pending")
+    check("B5.failed EVT", fm.evt_type_for_state("failed:x") == "boot.formation.failed")
+
+    # C) _surface 전이 게이팅 — _feed_for_state·_emit_evt 를 스파이로 교체
+    calls = {"feed": [], "evt": []}
+    fm._feed_for_state = lambda state: calls["feed"].append(state)
+    fm._emit_evt = lambda evt, fields: calls["evt"].append((evt, fields))
+
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface(None, None, "complete")  # 최초 관측(prev None) → 발화
+    check("C1.최초 관측 발화", len(calls["feed"]) == 1 and calls["evt"] == [("boot.formation.complete",
+          {"socket": "", "state": "complete", "kind": "complete"})])
+
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface(None, "complete", "complete")  # kind 무변화 → 무발화(스팸 억제)
+    check("C2.kind 무변화 무발화", calls["feed"] == [] and calls["evt"] == [])
+
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface("sock", "pending-cli:x", "complete")  # pending→complete 승급 → 발화
+    check("C3.pending→complete 승급 발화",
+          calls["feed"] == ["complete"] and calls["evt"][0][0] == "boot.formation.complete")
+
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface(None, "pending-cli:x", "partial:agy")  # pending→partial 승급 → 발화
+    check("C4.pending→partial 승급 발화",
+          calls["feed"] == ["partial:agy"] and calls["evt"][0][0] == "boot.formation.partial")
+
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface(None, "partial:agy", "partial:codex")  # 같은 kind(partial) → 무발화
+    check("C5.partial 유지 무발화", calls["feed"] == [] and calls["evt"] == [])
+
+# ── D: javis_bootstrap._formation_hint ──
+bs = _load("javis_bootstrap", "javis_bootstrap.py")
+check("D0.bootstrap import", bs is not None)
+if bs:
+    h_cli = bs._formation_hint({"kind": "pending-cli", "state": "pending-cli:master,cso"})
+    check("D1.pending-cli 온보딩 UI 보존(설치 안내)",
+          h_cli is not None and "claude.ai/install.sh" in h_cli and "단독 사용" in h_cli)
+    h_res = bs._formation_hint({"kind": "pending-resource", "state": "pending-resource"})
+    check("D2.pending-resource 자원 안내", h_res is not None and "자원" in h_res)
+    h_par = bs._formation_hint({"kind": "partial", "state": "partial:agy,codex"})
+    check("D3.partial 부족 CLI 목록", h_par is not None and "agy,codex" in h_par)
+    h_fail = bs._formation_hint({"kind": "failed", "state": "failed:boom"})
+    check("D4.failed 상태 파일 포인터",
+          h_fail is not None and "formation" in h_fail and "boot-last.json" in h_fail)
+    check("D5.complete/미상 → None(기존 메시지 폴백)",
+          bs._formation_hint({"kind": "complete", "state": "complete"}) is None
+          and bs._formation_hint({}) is None
+          and bs._formation_hint(None) is None)
+    # 오진 제거 확증: pending-resource 원인인데 "claude CLI 설치" 로 오진하지 않는다.
+    check("D6.오진 제거(자원 원인에 CLI 오안내 금지)", "claude" not in (h_res or ""))
+
+# ── E: javis_event 계약 등재 ──
+ev = _load("javis_event", "javis_event.py")
+check("E0.event import", ev is not None)
+if ev:
+    for t in ("boot.formation.complete", "boot.formation.partial",
+              "boot.formation.pending", "boot.formation.failed"):
+        ok, err = ev.validate(t, {"socket": "s", "state": "complete", "kind": "complete"})
+        check("E1.%s 등재·검증 통과" % t, ok, err or "")
+        check("E2.%s SPEAK 대본 존재" % t, t in ev.SPEAK)
+    # 필수 키 누락 거부
+    ok, _ = ev.validate("boot.formation.complete", {"socket": "s"})
+    check("E3.필수 키 누락 거부", not ok)
+    # 미지 타입은 여전히 deny-by-default
+    ok, _ = ev.validate("boot.formation.unknown", {"socket": "s"})
+    check("E4.미지 boot.formation.* 거부(deny-by-default 불변)", not ok)
+    # speak 렌더 무예외
+    try:
+        line = ev.speak("boot.formation.partial", {"socket": "s", "state": "partial:agy", "kind": "partial"})
+        check("E5.speak 렌더", "partial:agy" in line)
+    except Exception as e:
+        check("E5.speak 렌더", False, str(e))
+
+# ── F: bash -n 등가(파이썬 컴파일) 스모크 — 방출 CLI 왕복(계약 위반 0) ──
+if ev:
+    r = subprocess.run([sys.executable, os.path.join(BIN, "javis_event.py"), "emit",
+                        "boot.formation.complete", "--field", "socket=s",
+                        "--field", "state=complete", "--field", "kind=complete"],
+                       capture_output=True, text=True)
+    check("F1.emit 왕복 exit 0", r.returncode == 0, r.stderr.strip())
+    check("F1b.emit wire 라인", "[EVT v2] boot.formation.complete" in r.stdout)
+
+print("\n%s: %d fail(s) %s" % ("FAIL" if fails else "PASS", len(fails), fails or ""))
+sys.exit(1 if fails else 0)
