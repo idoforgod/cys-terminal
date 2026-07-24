@@ -167,6 +167,50 @@ UI로 노출).
    (`const invoke = window.__TAURI_INTERNALS__.invoke.bind(...)`)을 합성 삽입한 형태를 탐지기가
    실제로 잡는지 증명한다. C2의 삼킴 탐지기 쌍과 같은 철학(계측 타당성 게이트)이다.
 
+### C6. GUI peer 등록·검증 계약 (cysd codesign + Tauri 등록·TTL)
+
+v0.13.8 실기: C5(브라우저 활성화 게이트)는 통과했으나 그 뒤 단계에서 4건이 연쇄 노출됐다(전부
+이 머신 실기 재현). 계약과 근거:
+
+**① codesign requirement 문법 (치명·전 맥 영구 실패였음)** — `authority_broker/mod.rs`의
+`verify_gui_code_identity`는 GUI peer의 코드 정체성을 codesign `-R=`로 검증한다. `-R=`는 **단일
+requirement** 문법만 받는다. v0.13.8은 requirement-set 접두(`designated => `)를 붙여
+`format!("-R{req}")`로 넘겨, codesign이 `Requirement syntax error: unexpected token: designated`로
+**모든 맥에서 항상 파스 실패**했다(실측). 결과: "GUI designated code requirement did not verify" →
+GUI peer 등록 영구 실패 → ensure가 "Browser GUI peer registration is unavailable". **계약**:
+requirement는 접두 없는 순수 형태(`const GUI_CODE_REQUIREMENT`)로 정의하고 `-R=`를 붙인다.
+
+**② 번들 자기오염 vs strict 리소스 seal** — 앱은 첫 구동에서 번들 내
+`Resources/runtime/python/**/__pycache__/*.pyc` 수백 개를 자가 생성해 리소스 seal을 스스로
+깨뜨린다(실측: file added 170여 + modified 3). 문법을 고쳐도 기본 검증(리소스 워크 포함)은 설치 후
+첫 사용부터 실패한다. **계약**: `--ignore-resources`를 추가한다 — Mach-O 코드·인증서 체인·identifier
+검증은 유지되고, 앱이 스스로 깨는 리소스 seal만 제외한다(오염 번들·실행 중 pid 모두
+`satisfies its Designated Requirement` 통과 실측).
+
+**③ 대상 = pid(실행 중 peer)** — 검증 대상을 경로가 아니라 **pid 문자열**로 넘겨 살아있는 peer
+프로세스 자체를 검증한다(경로 검증 후 바이너리 교체 TOCTOU 창 축소). 정규 경로 게이트
+(/Applications 고정)는 별도로 유지한다.
+
+**④ 등록 fail-closed-forever → 지연 재시도 1회** — 부팅 시 1회 `register_browser_gui_peer()`가
+데몬 교체·부팅 경합으로 실패하면 재시도가 없어 영구 불능이었다(`main.rs`). **계약**: 등록은
+**부팅 1회 + ensure 시 지연 재시도 1회**다 — `ensure_browserd_cast`에서 신뢰된 클릭 소모 직후
+`BROWSER_APP_SESSION`이 비어 있으면 1회만 재시도하고, 실패하면 그 에러를 `BROWSER_DISABLED_SAFE`로
+반환한다(fail-closed 의미 유지·무한루프 없음·OnceLock 이중 set 무해).
+
+**⑤ 네이티브 활성화 TTL** — arm→consume 유효시간이 2s였으나, 부팅 직후 부하에서 첫 클릭의
+arm→consume이 2s를 초과해 "trusted native Browser activation expired"를 유발했다(실측; 두 번째
+클릭은 통과). **계약**: `NATIVE_ACTIVATION_TTL_MS = 10_000`. 여전히 one-time·window-bound 단일
+소모라 보안 성질(재생 불가)은 불변이다.
+
+**집행 테스트** (`authority_broker/mod.rs` `#[cfg(all(test, target_os = "macos"))]`):
+1. **양성** `gui_code_requirement_compiles` — `GUI_CODE_REQUIREMENT`(순수 형태)가 `csreq -r -t`로
+   컴파일(exit 0)되고 codesign `-R=` 경로에서도 파스 에러가 아님을 확인.
+2. **음성 대조군** `designated_prefix_requirement_is_a_codesign_parse_error` — `designated =>` 접두
+   형태가 codesign `-R=`에서 **파스 에러**(`unexpected token: designated`)가 남을 증명(탐지 타당성
+   게이트). ※ `csreq`는 두 형태를 모두 받아들여 결함을 숨기므로(실측), 음성 대조군은 반드시
+   codesign 기반이어야 한다. TTL은 `native_browser_activation_is_window_bound_ttl_and_single_consume`
+   (`main.rs`)가 상수 기준으로 만료 경계를 집행한다.
+
 ---
 
 ## 3. 표식 상태기계 (UI 진단 대응)

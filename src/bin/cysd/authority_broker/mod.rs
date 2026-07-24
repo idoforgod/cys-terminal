@@ -1322,7 +1322,7 @@ fn inspect_gui_executable_identity(pid: u32) -> Result<GuiExecutableIdentity, Br
             "GUI process start time is unavailable",
         ));
     }
-    let code_sign_identity = verify_gui_code_identity(&canonical)?;
+    let code_sign_identity = verify_gui_code_identity(&canonical, pid)?;
     let bytes = std::fs::read(&canonical).map_err(|error| {
         BrokerFailure::new(
             "GUI_IDENTITY_REJECTED",
@@ -1342,7 +1342,24 @@ fn explicit_gui_dev_mode() -> bool {
     cfg!(debug_assertions) && std::env::var("CYS_BROWSER_DEV").as_deref() == Ok("1")
 }
 
-fn verify_gui_code_identity(path: &std::path::Path) -> Result<String, BrokerFailure> {
+/// GUI peer 코드 서명 요구사항(codesign `-R` 대상 텍스트, 선두 `=`·`-R` 미포함 순수 형태).
+/// 회귀 테스트가 이 상수를 공유해 컴파일 가능성을 집행한다(양성=csreq, 음성=designated 접두 파스 실패).
+#[cfg(target_os = "macos")]
+const GUI_CODE_REQUIREMENT: &str = "anchor apple generic and identifier \"com.cysjavis.terminal\" and certificate leaf[subject.OU] = \"Q43YA2NMF9\"";
+
+/// 실행 중 GUI peer 프로세스의 코드 정체성을 검증한다.
+///
+/// 경계 계약 (v0.13.8 실사고에서 확정 — 위반 시 전 맥 영구 실패):
+/// ① codesign `-R=`는 **단일 requirement** 문법만 받는다. requirement-set 접두(`designated =>`)를
+///    넣으면 codesign이 `Requirement syntax error: unexpected token: designated`(실측)로 **모든 맥에서
+///    항상 파스 실패**한다 — GUI_CODE_REQUIREMENT는 반드시 `designated =>` 접두 없는 순수 요구사항이다.
+///    (csreq는 두 형태를 모두 받아들여 이 결함을 숨기므로, 음성 대조군은 codesign 기반이어야 한다.)
+/// ② `--ignore-resources` — 앱은 첫 구동에서 번들 내 `Resources/runtime/python/**/__pycache__/*.pyc`를
+///    자가 생성해 리소스 seal을 스스로 깨뜨린다(실측: file added 170여). 리소스 워크를 제외해도
+///    Mach-O 코드·인증서 체인·identifier 검증은 그대로 유지되므로 코드 정체성 보증은 불변이다.
+/// ③ 대상 = **pid 문자열**(경로 아님) — 살아있는 peer 프로세스 자체를 검증해 TOCTOU 창을 축소한다
+///    (경로 검증 후 바이너리 교체 회피). 정규 경로 게이트(/Applications 고정)는 별도로 유지한다.
+fn verify_gui_code_identity(path: &std::path::Path, pid: u32) -> Result<String, BrokerFailure> {
     if explicit_gui_dev_mode() {
         let path_text = path.to_string_lossy().replace('\\', "/");
         let local_target = path_text.ends_with("/target/debug/cys-app")
@@ -1366,11 +1383,11 @@ fn verify_gui_code_identity(path: &std::path::Path) -> Result<String, BrokerFail
                 "production GUI must be the canonical /Applications cys executable",
             ));
         }
-        let requirement = "=designated => anchor apple generic and identifier \"com.cysjavis.terminal\" and certificate leaf[subject.OU] = \"Q43YA2NMF9\"";
+        // 대상은 pid(실행 중 peer). requirement는 `designated =>` 접두 없는 순수 형태 + `-R=`.
         let status = std::process::Command::new("/usr/bin/codesign")
-            .args(["--verify", "--strict", "--verbose=2"])
-            .arg(format!("-R{requirement}"))
-            .arg(path)
+            .args(["--verify", "--strict", "--verbose=2", "--ignore-resources"])
+            .arg(format!("-R={GUI_CODE_REQUIREMENT}"))
+            .arg(pid.to_string())
             .status()
             .map_err(|error| {
                 BrokerFailure::new(
@@ -1537,6 +1554,56 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 양성: GUI peer 요구사항 문자열(선두 `=`·`-R` 미포함 순수 형태)이 실제로 컴파일되는지 검증한다.
+    /// csreq로 컴파일(exit 0)되고, codesign `-R=` 경로에서도 **파스 에러가 아님**을 함께 확인한다
+    /// (임의 애플 서명 바이너리 /bin/ls는 요구 불충족으로 실패하더라도 문법 오류는 아니어야 한다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_code_requirement_compiles() {
+        let csreq = std::process::Command::new("/usr/bin/csreq")
+            .arg(format!("-r={GUI_CODE_REQUIREMENT}"))
+            .arg("-t")
+            .status()
+            .expect("csreq must be available on macOS");
+        assert!(
+            csreq.success(),
+            "GUI_CODE_REQUIREMENT must compile as a valid single code requirement (csreq -r -t)"
+        );
+
+        // codesign `-R=`가 순수 요구사항을 파스해 실제 평가에 진입함을 확인(파스 에러 부재).
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict", "--verbose=2", "--ignore-resources"])
+            .arg(format!("-R={GUI_CODE_REQUIREMENT}"))
+            .arg("/bin/ls")
+            .output()
+            .expect("codesign must be available on macOS");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            !stderr.contains("syntax error") && !stderr.contains("unexpected token"),
+            "GUI_CODE_REQUIREMENT must parse under codesign -R= (no requirement syntax error); got: {stderr}"
+        );
+    }
+
+    /// 음성 대조군(탐지 타당성 게이트): v0.13.8 실사고 형태(`designated =>` 접두)를 codesign `-R=`에
+    /// 넣으면 requirement-set 문법 미지원으로 **파스 에러**(`unexpected token: designated`, 실측)가
+    /// 나야 한다. 미래에 누군가 접두를 되살리면 이 테스트가 즉시 검출한다. csreq는 두 형태를 모두
+    /// 받아들여 결함을 숨기므로(실측), 음성 대조군은 반드시 codesign 기반이어야 한다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn designated_prefix_requirement_is_a_codesign_parse_error() {
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict", "--verbose=2", "--ignore-resources"])
+            .arg(format!("-R=designated => {GUI_CODE_REQUIREMENT}"))
+            .arg("/bin/ls")
+            .output()
+            .expect("codesign must be available on macOS");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            stderr.contains("syntax error") || stderr.contains("unexpected token"),
+            "`designated =>` prefix must be a codesign requirement parse error (v0.13.8 regression guard); got: {stderr}"
+        );
+    }
 
     #[derive(Default)]
     struct CountingLauncher(AtomicUsize);

@@ -86,7 +86,10 @@ static BROWSER_APP_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::n
 static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
     std::sync::OnceLock::new();
 
-const NATIVE_ACTIVATION_TTL_MS: u64 = 2_000;
+// 신뢰된 네이티브 Browser 활성화 창의 arm→consume 유효시간. 2s는 부팅 직후 부하에서 첫 클릭의
+// arm→consume이 초과해 "trusted native Browser activation expired"를 유발했다(v0.13.8 실사고).
+// 10s로 상향해도 활성화는 여전히 one-time·window-bound 단일 소모라 보안 성질(재생 불가)은 불변이다.
+const NATIVE_ACTIVATION_TTL_MS: u64 = 10_000;
 const TAURI_BROWSER_ENSURE_DEADLINE_SECS: u64 =
     cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs() + 5;
 
@@ -962,6 +965,14 @@ async fn ensure_browserd_cast(
         .unwrap()
         .consume(window.label(), unix_millis_now())
         .map_err(|error| format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}"))?;
+    // 지연 재시도(fail-closed는 유지, 무한루프 없음): 부팅 시 1회 등록이 데몬 교체·부팅 경합으로
+    // 실패해 세션이 비어 있으면, 신뢰된 클릭 소모 직후 여기서 1회만 재시도한다. OnceLock이라
+    // 이중 set은 자연 무해(이미 등록됐으면 즉시 통과). 재시도 후에도 실패하면 그 에러로 거부한다.
+    if BROWSER_APP_SESSION.get().is_none() {
+        register_browser_gui_peer()
+            .await
+            .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+    }
     let issue_params = browser_session_params(json!({
         "window_label":window.label(),
         "pane_nonce":pane_nonce,
