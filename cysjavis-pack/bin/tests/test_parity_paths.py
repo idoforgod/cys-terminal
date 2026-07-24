@@ -108,8 +108,10 @@ def _run_mock_agent(role, directive_path):
 
 def inject_e2e(m):
     """T2 R2 인계 실물화: 노드 수가 아니라 **주입된 지침의 온전함**을 실 mock-agent 실행으로 검증.
-    tautological(파일 재읽기 해시 비교) 아님 — (1) 별도 프로세스가 (2) 독립 해셔(shasum)로 다시 해싱하고
-    (3) 음성 대조군으로 주입 파손을 실제 탐지함을 증명한다."""
+    tautological(파일 재읽기 해시 비교) 아님:
+      (1) 별도 프로세스(mock-agent)가 (2) 독립 해셔(shasum/sha256sum)로 실제 주입 디렉티브를 다시 해싱
+      (3) 그 전달 해시를 button·manual **두 RosterPlan 이 각자 독립 산출한 claim(python hashlib)** 과
+          대조(=두 경로 파리티를 '실 전달'로 확증) (4) 음성 대조군으로 주입 파손 탐지를 증명."""
     ok, why = _e2e_supported()
     if not ok:
         check("5 주입-해시 e2e (환경 스킵)", True, why)
@@ -122,30 +124,37 @@ def inject_e2e(m):
               "주입 조립 심볼 부재")
         return
 
-    # 두 경로(button·manual)가 각 역할에 주입할 디렉티브를 실제 mock-agent 로 캡처.
-    button_caps, manual_caps = {}, {}
+    # 두 경로의 계획(RosterPlan)을 각자 유도 — 각 plan.directive_hashes 는 그 경로가 **독립적으로**
+    # 산출한 role→주입 디렉티브 해시(claim)다(REVISE1: 동일 path 2회 호출 tautology 제거).
+    button_plan = m.plan_roster("button")
+    manual_plan = m.plan_roster("manual")
+    bh = getattr(button_plan, "directive_hashes", {}) or {}
+    mh = getattr(manual_plan, "directive_hashes", {}) or {}
+
+    delivered = {}          # role → mock-agent(독립 해셔)가 실제 전달받아 캡처한 해시
     all_present = True
     hasher_agrees = True
+    two_path_parity = True
     for role, fn in role_file.items():
         path = os.path.join(ddir, fn)
-        expect = _py_sha256(path)      # python hashlib(조립부 _sha256_file 과 동일 계약)
-        b = _run_mock_agent(role, path)   # 버튼 경로 주입 캡처(독립 해셔)
-        mnl = _run_mock_agent(role, path)  # 수동 경로 주입 캡처(동일 조립 → 동일 해시여야 파리티)
-        button_caps[role] = b
-        manual_caps[role] = mnl
-        if b == "none" or mnl == "none":
+        expect = _py_sha256(path)          # python hashlib(조립부 _sha256_file 과 동일 계약)
+        cap = _run_mock_agent(role, path)  # 실 mock-agent 1회 실행 — 독립 해셔로 전달분 재해싱
+        delivered[role] = cap
+        if cap == "none":
             all_present = False
-        # 독립 해셔(shasum/sha256sum) 결과가 조립부 python hashlib 과 일치해야 = 실 전달 무결.
-        if expect is None or b != expect:
+        # (a) 전달 무결: 독립 해셔(shell) == 조립부(python hashlib) 재해싱.
+        if expect is None or cap != expect:
             hasher_agrees = False
+        # (b) 두 경로 파리티(실 전달로): 전달 해시가 button·manual **양 plan 의 독립 claim** 과 일치.
+        if cap == "none" or bh.get(role) != cap or mh.get(role) != cap:
+            two_path_parity = False
 
     check("5 주입 e2e: 전 역할 디렉티브 실제 전달(none 0 — '편성됐지만 미주입' 탐지)",
-          all_present, "captured=%r" % button_caps)
+          all_present, "delivered=%r" % delivered)
     check("6 주입 e2e: 독립 해셔(shasum)↔조립부(hashlib) 해시 일치(실 전달 무결)",
-          hasher_agrees, "button=%r" % button_caps)
-    check("7 주입 e2e: 두 경로(button·manual) 캡처 해시 동일(파리티 — 노드 수 아닌 지침 온전함)",
-          button_caps == manual_caps,
-          "button=%r manual=%r" % (button_caps, manual_caps))
+          hasher_agrees, "delivered=%r" % delivered)
+    check("7 주입 e2e: 전달 해시가 button·manual 두 plan 의 독립 claim 과 일치(두 경로 파리티·실 전달)",
+          two_path_parity, "delivered=%r button_claim=%r manual_claim=%r" % (delivered, bh, mh))
 
     # ★음성 대조군(non-tautology 증명): 주입 소스가 깨지면(존재하지 않는 경로) mock-agent 가
     #   directive_sha=none 을 내야 한다 = 이 e2e 가 '주입 파손'을 실제로 탐지함을 보증한다.

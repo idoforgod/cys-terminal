@@ -4124,11 +4124,60 @@ def emit_drift():
     return 0
 
 
+# ── W4 C03 전핀 밀폐 게이트 (텍스트 침식형 반쪽마스터 차단 — CI 4레인 blocking) ──
+# 배경(리뷰어1 BLOCK 필수2): C03 의 `_c03_pass`(formation) 대표 마커 3개만으로는 51핀이 지키는
+# 텍스트 침식(조항 1줄씩 삭제)을 통과시킨다 — 07-22 수리를 증발시킨 팩 업데이트 경로가 정확히
+# 이것이다. 이 게이트는 CYS_PACK_DIR/directives 에 대해 **CONTENT_PINS 전 핀**을 대조해 소실≥1이면
+# 목록 출력 + 비0 exit 한다. 순수 python·환경 무의존(env -i 에서 리포 팩 대상 결정론 동작).
+# release.yml:167 에러메시지가 약속하는 'C03 커버'의 실물(대표마커→전핀).
+def gate_c03():
+    """CONTENT_PINS 전 핀을 CYS_PACK_DIR/directives 에 대해 대조. 소실 0 → exit 0 / ≥1 → 목록+exit 1.
+
+    ★is_dept_pack() 스킵을 쓰지 않는다(의도적): 그 술어는 'pack_dir≠~/.cys/pack 이면 부서/CEO'라
+    판정하는데, CI 는 CYS_PACK_DIR=$GITHUB_WORKSPACE/cysjavis-pack(표준 릴리스 팩)을 가리키므로
+    is_dept_pack() 이 항상 True → 게이트 전면 스킵이 되어 목적이 증발한다(리뷰어1 BLOCK 핵심).
+    이 게이트는 '표준 팩'의 디렉티브 무결성을 명시적으로 집행하는 CI blocking 진입점이라, 대상은
+    언제나 넘겨받은 CYS_PACK_DIR 의 directives 다(부서 팩에 이 게이트를 거는 호출 자체가 없다)."""
+    ddir = os.path.join(pack_dir(), "directives")
+    total_pins = 0
+    lost = []          # (file, pin, label)
+    missing_files = []
+    for fn, pins in CONTENT_PINS.items():
+        path = os.path.join(ddir, fn)
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            missing_files.append(fn)
+            lost.extend((fn, pin, label) for pin, label in pins)
+            total_pins += len(pins)
+            continue
+        for pin, label in pins:
+            total_pins += 1
+            if pin not in text:
+                lost.append((fn, pin, label))
+    print("[gate-c03] CONTENT_PINS 전핀 대조 — 팩=%s · 검사 %d핀/%d파일"
+          % (pack_dir(), total_pins, len(CONTENT_PINS)))
+    if missing_files:
+        print("[gate-c03] ★디렉티브 파일 부재: %s" % ", ".join(missing_files))
+    if lost:
+        print("[gate-c03] ✗ 소실 핀 %d개 — 텍스트 침식형 반쪽마스터 차단(릴리스/팩 게이트 RED):" % len(lost))
+        for fn, pin, label in lost:
+            print("    - %-24s %-44r ← %s" % (fn, pin, label))
+        print("[gate-c03] 복원: 디렉티브에 조항을 되살리거나(의도치 않은 소실), 정말 제거한 조항이면 "
+              "javis_preflight.py CONTENT_PINS 에서 해당 핀을 함께 삭제하라(그 판단은 오너/설계 결정). "
+              "`--emit-drift` 로 소실/신규 후보를 함께 확인.")
+        return 1
+    print("[gate-c03] ✓ 전핀 존재 — 침식 0")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="CYSJavis 결정론 부트 프리플라이트")
     ap.add_argument("--fix", action="store_true", help="수리 가능한 항목 자동 수리")
     ap.add_argument("--emit-drift", action="store_true",
                     help="DD-6 핀-드리프트 리포트만 출력(CONTENT_PINS↔디렉티브 소실/신규 — 리포트 전용·exit 0)")
+    ap.add_argument("--gate-c03", action="store_true",
+                    help="W4 C03 전핀 밀폐 게이트(CONTENT_PINS 전 핀 대조 — 소실≥1이면 exit 1·CI blocking)")
     # OPP-17: --fix 의 시스템 변경을 단일 Mutation 게이트로 수렴.
     ap.add_argument("--dry-run", action="store_true",
                     help="변경 없이 --fix 가 무엇을 할지 미리보기('[dry-run] Would …')")
@@ -4144,6 +4193,10 @@ def main():
     # DD-6: 핀-드리프트 리포트 모드 — 다른 검사 없이 리포트만 내고 exit 0(리포트 전용).
     if getattr(args, "emit_drift", False):
         return emit_drift()
+
+    # W4: C03 전핀 밀폐 게이트 — 다른 검사 없이 전핀만 대조(소실≥1=exit 1). CI blocking 전용.
+    if getattr(args, "gate_c03", False):
+        return gate_c03()
 
     if args.safe and (args.dry_run or args.fix):
         ap.error("--safe 는 --dry-run/--fix 와 동시 사용 불가")

@@ -104,7 +104,41 @@ def main():
     # 7. paused → pending (gate-check 선행)
     check("7 paused→pending(gate-check 선행) API 존재",
           callable(getattr(m, "gate_check", None)) or hasattr(m, "PAUSE_HONORED"),
-          "kill-switch 존중 훅 미구현(RED)")
+          "kill-switch 존중 훅 실측 미구현(RED)")
+
+    # 8. ★싱글플라이트 락 **실행 스모크** (REVISE2 — 크로스플랫폼 락 헬퍼 실경로 커버).
+    #    _singleflight.__enter__ 은 posix=fcntl.flock / Windows=msvcrt.locking 을 실제로 호출한다.
+    #    이 스모크는 windows-pack 잡에서 **msvcrt.locking 분기를 실행**시켜(어느 CI 에서도 안 돌던
+    #    Windows 락 경로) 획득·해제·상호배제를 실측한다. env -i 밀폐(CYS_STATE_DIR temp).
+    _singleflight = getattr(m, "_singleflight", None)
+    if callable(_singleflight):
+        import tempfile
+        saved_state = os.environ.get("CYS_STATE_DIR")
+        td = tempfile.mkdtemp(prefix="fmlk-")
+        os.environ["CYS_STATE_DIR"] = td
+        try:
+            key = "lock-smoke"
+            with _singleflight(key) as a:
+                # 1차 획득 성공 = _lk(fcntl.flock/msvcrt.locking)가 예외 없이 실행됨(플랫폼 락 경로 실행 증명).
+                check("8a 싱글플라이트 락 획득(락 헬퍼 실행 — Windows=msvcrt.locking)",
+                      a.acquired is True, "acquired=%r" % a.acquired)
+                # 2차(같은 키) 획득 시도 = 상호배제로 실패해야(동시 2회 편성 1회로 억제 계약).
+                with _singleflight(key) as b:
+                    check("8b 같은 키 재획득 차단(상호배제 — 동시 편성 억제)",
+                          b.acquired is False, "second acquired=%r (False 여야 함)" % b.acquired)
+            # 해제(__exit__=_ulk 실행) 후 재획득 가능해야(락 정상 반납 — msvcrt 언락 경로도 실행).
+            with _singleflight(key) as c:
+                check("8c 해제 후 재획득 가능(_ulk 반납 실행)",
+                      c.acquired is True, "reacquired=%r" % c.acquired)
+        finally:
+            if saved_state is None:
+                os.environ.pop("CYS_STATE_DIR", None)
+            else:
+                os.environ["CYS_STATE_DIR"] = saved_state
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+    else:
+        check("8a 싱글플라이트 락 실행 스모크", False, "_singleflight 미구현")
 
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1

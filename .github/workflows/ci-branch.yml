@@ -67,10 +67,13 @@ jobs:
         run: cargo check --workspace
 
       # 능력 파리티 7종(반쪽마스터·편성 회귀 조기 차단). 어느 하나 비0이면 set -e 로 잡 실패.
-      - name: 능력 파리티 팩 테스트 (macOS)
+      - name: 능력 파리티 팩 테스트 + C03 전핀 게이트 (macOS)
         shell: bash
         run: |
           set -euo pipefail
+          # C03 전핀 밀폐 게이트(텍스트 침식형 반쪽마스터 차단 — 리뷰어1 BLOCK 필수2).
+          CYS_PACK_DIR="$GITHUB_WORKSPACE/cysjavis-pack" \
+            python3 cysjavis-pack/bin/javis_preflight.py --gate-c03
           for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
                    test_heal test_budget test_banner_truth; do
             f="cysjavis-pack/bin/tests/$t.py"
@@ -129,6 +132,10 @@ jobs:
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
           "$PY" --version
+          # C03 전핀 밀폐 게이트(순수 python — Windows 에서도 동작·리뷰어1 BLOCK 필수2 4레인 배선).
+          CYS_PACK_DIR="$GITHUB_WORKSPACE/cysjavis-pack" \
+            "$PY" cysjavis-pack/bin/javis_preflight.py --gate-c03
+          # test_formation 8a~8c 가 Windows 에서 **msvcrt.locking** 락 경로를 실행(REVISE2 커버).
           for t in test_cli_probe test_formation test_parity_paths test_budget test_banner_truth; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }

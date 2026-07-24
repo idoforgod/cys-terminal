@@ -156,6 +156,15 @@ jobs:
           # ★test_dept_teardown_atomicity 는 게이트 제외 — baseline v0.13.3 부터의 **선재 실패**(down) 블록
           #   소스-스캔 드리프트·우리 회귀 아님, git stash 로 baseline 동일 확인분). 업스트림(teardown 담당)
           #   수리 권고. 여기 포함하면 무관한 이유로 릴리스가 영구 차단된다.
+          # ★C03 전핀 밀폐 게이트(리뷰어1 BLOCK 필수2) — 대표마커 3개가 아니라 CONTENT_PINS 전 핀
+          #   대조로 텍스트 침식형 반쪽마스터를 차단(:167 에러메시지가 약속하는 C03 커버의 실물).
+          echo "== C03 전핀 게이트 =="
+          if ! CYS_PACK_DIR="$GITHUB_WORKSPACE/cysjavis-pack" \
+               python3 cysjavis-pack/bin/javis_preflight.py --gate-c03; then
+            echo "::error::C03 전핀 게이트 실패 — 텍스트 침식형 반쪽마스터. 릴리스 차단." >&2
+            echo "  javis_preflight.py --emit-drift 로 소실/신규 핀 확인 후 디렉티브·CONTENT_PINS 동기화." >&2
+            exit 1
+          fi
           echo "== 능력 파리티 7종 게이트 =="
           for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
                    test_heal test_budget test_banner_truth; do

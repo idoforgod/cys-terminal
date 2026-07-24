@@ -113,6 +113,30 @@ jobs:
       - name: Scan pack content (pre-build hard-gate)
         run: bash scripts/scan-pack-secrets.sh
 
+      # ── ★능력 파리티 + C03 전핀 hard-gate (팩-only 레인 — 리뷰어1 BLOCK 필수1·2) ──
+      # 이 레인(pack-v*)이 파리티/C03 게이트를 통째 우회하면 **반쪽마스터 팩이 draft→공개 승격까지
+      # GREEN 통과**한다(07-22 수리를 증발시킨 팩 업데이트 경로가 정확히 이것). 팩 빌드/gh release
+      # create 보다 **앞의 blocking 스텝**으로 배치해 반쪽마스터·편성 회귀·텍스트 침식을 차단한다.
+      # ubuntu-latest 는 실 bash·python3 보유 → 파리티 7종 전건(bash cys-dept 포함) 실행 가능.
+      - name: 능력 파리티 7종 + C03 전핀 게이트 (pack-only pre-build blocking)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # (1) C03 전핀 밀폐 게이트 — CONTENT_PINS 전 핀 대조(텍스트 침식형 반쪽마스터 차단).
+          CYS_PACK_DIR="$GITHUB_WORKSPACE/cysjavis-pack" \
+            python3 cysjavis-pack/bin/javis_preflight.py --gate-c03
+          # (2) 파리티 7종(존재-단언 + 비0=차단). teardown_atomicity 제외(baseline 선재).
+          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
+                   test_heal test_budget test_banner_truth; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== pack-parity: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::팩-only 릴리스 파리티/반쪽마스터 게이트 실패($t) — 팩 승격 차단." >&2
+              exit 1
+            fi
+          done
+
       # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
       # 오염시키는 회귀 차단(release.yml과 동일).
       - name: cargo clean (스테일 생성표 무효화)
