@@ -3192,7 +3192,9 @@ class Preflight:
         #     *_DIRECTIVE는 guard 보호 헌법파일이라 preflight가 편집하지 않는다. 가시화만.)
         clause_pins = [
             ("MASTER_DIRECTIVE.md", ["todo 이중화"]),
-            ("CEO_TEMPLATE.md", ["todo 이중화"]),
+            # ★W1 invert-merge: CEO_TEMPLATE.md → CEO_OVERLAY.md 개명(오버레이=거버넌스 추가분만).
+            #   todo 이중화 등 표준 조항은 base로 이관됐으므로, 오버레이 고유 조항(§CEO-1 지휘 범위)을 핀.
+            ("CEO_OVERLAY.md", ["부서장에게만 지시"]),
             ("CSO_DIRECTIVE.md", ["exited surface 자동 reap", "즉시성"]),
         ]
         for dname, pins in clause_pins:

@@ -12,6 +12,13 @@
   5) 이미 승격 상태에서 재호출 → stale PENDING 청소·멱등
   6) 조건 미충족(부서 0) → no-op
 (ceo_demote의 PENDING 청소는 down 경로 통합시험 영역 — 본 파일은 승격 축만.)
+
+★W1 invert-merge 갱신(2026-07-24 · 설계 DD-1 파급): 승격은 이제 replace 가 아니라 compose(invert-merge) —
+  MASTER_DIRECTIVE = [표준 base 전문] + CEO-OVERLAY sentinel 구간. 따라서 승격 후 md 는 base+overlay 이지
+  overlay 단독이 아니다 → 2b·4c·5c 를 "base 보존 + overlay sentinel" 계약으로 갱신(약화 아님·오히려 base
+  보존을 추가 검증). 2e 는 오너 2026-07-17 자동승격 정책이 --wait 동의 게이트를 폐지한 상태를 반영해 갱신
+  (이 assertion 은 W1 착수 전 이미 baseline RED 였음 — W1 과 무관한 선존 drift 정합화). PENDING 게이트·
+  단일소유 가드·feed 프롬프트·exit 코드 계약은 전부 불변.
 """
 import json
 import os
@@ -95,11 +102,16 @@ with open(marker, "w", encoding="utf-8") as f:
     json.dump({"orchestra_check": "exit 0"}, f)
 code, out = run(env, "promote-if-pending")
 check("2a 대기형 exit 0", code == 0, out[-150:])
-check("2b 승격됨(CEO 템플릿)", md(home) == "CEO-TEMPLATE\n")
+_m2 = md(home)
+check("2b 승격됨(invert-merge·base 보존 + CEO-OVERLAY sentinel)",
+      "STANDARD-MASTER" in _m2 and "CEO-TEMPLATE" in _m2 and "CEO-OVERLAY BEGIN" in _m2,
+      "md=%r" % _m2[:120])
 check("2c .pre-ceo 보존 헌법", os.path.exists(pre) and open(pre, encoding="utf-8").read() == "STANDARD-MASTER\n")
 check("2d PENDING 해소", not os.path.exists(pend))
 calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
-check("2e 동의 게이트 경유(--wait)", "feed push --wait" in calls)
+check("2e 자동승격 정책(오너 2026-07-17 — --wait 동의 게이트 폐지·완료 알림 push)",
+      "feed push --wait" not in calls and "feed push" in calls,
+      "auto-promote는 --wait 미사용(W1 무관 선존 drift 정합화)")
 
 # ── 5. 이미 승격 + stale PENDING → 재호출이 청소·멱등 ──
 with open(pend, "w", encoding="utf-8") as f:
@@ -107,7 +119,9 @@ with open(pend, "w", encoding="utf-8") as f:
 code, out = run(env, "promote-ceo")
 check("5a 멱등 exit 0", code == 0)
 check("5b stale PENDING 청소", not os.path.exists(pend))
-check("5c 디렉티브 불변", md(home) == "CEO-TEMPLATE\n")
+_m5 = md(home)
+check("5c 디렉티브 불변(compose 멱등·정확히 1 sentinel·base+overlay 잔존)",
+      _m5.count("CEO-OVERLAY BEGIN") == 1 and "STANDARD-MASTER" in _m5 and "CEO-TEMPLATE" in _m5)
 shutil.rmtree(tmp)
 
 # ── 3. --request-only: 무변조·알림만 (부트 ⑦ 계약) ──
@@ -129,7 +143,9 @@ code, out = run(env, "promote-if-pending", role="master")
 check("4a master 대기형 exit 7", code == 7, "exit=%d" % code)
 check("4b 차단 시 무변조", md(home) == "STANDARD-MASTER\n")
 code, out = run(env, "promote-if-pending", role="cso")
-check("4c cso 대기형 허용·승격", code == 0 and md(home) == "CEO-TEMPLATE\n")
+_m4 = md(home)
+check("4c cso 대기형 허용·승격(compose·base 보존+overlay)",
+      code == 0 and "CEO-OVERLAY BEGIN" in _m4 and "STANDARD-MASTER" in _m4)
 shutil.rmtree(tmp)
 
 # ── 6. 조건 미충족(부서 0·마커 有) → no-op ──
