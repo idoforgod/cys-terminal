@@ -71,6 +71,61 @@ def _active_dept_count():
     return len(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB)))
 
 
+# ── ★W6 곱셈 자원 예산(설계 DD-3/W6·오너 2026-07-24) ──
+# 부서 수 × 편성 크기 곱셈으로 조직 전체의 투영 에이전트 수를 예산과 대조한다. 역할 중립(CEO·부서장·
+# base 동일 물리법칙) · **hard-fail 아님** — 초과 시 편성은 pending-resource 로 '대기·자동 재시도'
+# (기존 hard/soft 의미론 보존: 게이트는 master/편성 부트 플로우가 호출하므로 조직 기동을 영영 막지 않는다).
+FORMATION_BUDGET_ENV = "CYS_FORMATION_BUDGET"
+# 기본 20 근거: complete 편성 1레인 = master+4종 의무 노드(CSO·worker·agy·codex) = 5노드.
+#   20 = base + 3부서까지 동시 full 편성(4레인×5) 여유 — 기존 nodes_hard 계열(정적 floor 18·부서당 +5)과
+#   같은 자릿수로 정렬(자원 거버넌스 실사고 상한). env CYS_FORMATION_BUDGET 로 하드웨어별 오버라이드.
+FORMATION_BUDGET_DEFAULT = 20
+
+
+def _formation_budget_value(explicit=None):
+    """예산 해석 우선순위: 명시 인자 > CYS_FORMATION_BUDGET env > 기본 20. 파싱 실패는 기본값(보수)."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(FORMATION_BUDGET_ENV)
+    if raw is None:
+        return FORMATION_BUDGET_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return FORMATION_BUDGET_DEFAULT
+
+
+class BudgetVerdict:
+    """곱셈 편성 예산 판정 결과. blocked=True → pending-resource(대기·자동 재시도·hard-fail 아님)."""
+
+    def __init__(self, blocked, projected, budget, live_agents, formation_size, dept_count):
+        self.blocked = blocked
+        self.projected = projected
+        self.budget = budget
+        self.live_agents = live_agents
+        self.formation_size = formation_size
+        self.dept_count = dept_count
+        self.state = "pending-resource" if blocked else "ok"
+
+    def __repr__(self):
+        rel = ">" if self.blocked else "<="
+        return "%s(projected=%d%sbudget=%d · live=%d + depts=%d×size=%d)" % (
+            self.state, self.projected, rel, self.budget,
+            self.live_agents, self.dept_count, self.formation_size)
+
+    __str__ = __repr__
+
+
+def formation_budget_check(live_agents, formation_size, dept_count=1, budget=None):
+    """곱셈 편성 예산: projected = live_agents + max(1,dept_count)×formation_size 가 budget 초과면 차단.
+    역할 중립 · hard-fail 아님(초과=pending-resource 대기). 반환: BudgetVerdict(.blocked·.state)."""
+    budget = _formation_budget_value(budget)
+    dept_count = max(1, int(dept_count or 1))
+    projected = int(live_agents or 0) + dept_count * int(formation_size or 0)
+    return BudgetVerdict(projected > budget, projected, budget,
+                         int(live_agents or 0), int(formation_size or 0), dept_count)
+
+
 def _ps_lines():
     # 측정 실패는 None으로 신호(빈 리스트로 위장하면 '0=건강'으로 조용히 통과 — P-ORCH-1).
     try:
@@ -233,6 +288,18 @@ def evaluate(m, a):
 def cmd_check(a):
     m = measure(a)
     worst, checks = evaluate(m, a)
+    # ★W6 곱셈 편성 예산 축(opt-in — --formation-size N>0 일 때만). 투영 = 측정 노드 + 부서수×편성크기.
+    #   초과=hard(→ 편성 소비자에서 pending-resource 로 대기). formation-size 미지정 시 완전 무영향.
+    if getattr(a, "formation_size", 0):
+        live = m["nodes"] if m["nodes"] is not None else 0
+        depts = a.dept_count if getattr(a, "dept_count", None) else max(1, m["active_depts"])
+        bv = formation_budget_check(live_agents=live, formation_size=a.formation_size,
+                                    dept_count=depts, budget=a.formation_budget)
+        checks.append({"metric": "formation_budget", "value": bv.projected,
+                       "soft": bv.budget, "hard": bv.budget + 1,
+                       "level": "hard" if bv.blocked else "ok"})
+        if bv.blocked:
+            worst = "hard"
     verdict = {"ok": "allow", "soft": "soft_warn", "hard": "hard_block"}[worst]
     trips = [c for c in checks if c["level"] != "ok"]
     warnings = []
@@ -442,6 +509,13 @@ def main(argv=None):
     c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
     c.add_argument("--rate-override", default=None,
                    help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
+    # ★W6 곱셈 편성 예산(opt-in): --formation-size>0 일 때만 예산 축 발화. 초과=hard(pending-resource).
+    c.add_argument("--formation-size", dest="formation_size", type=int, default=0,
+                   help="편성 로스터 크기(W6 곱셈 예산 발화 — 0=축 비활성)")
+    c.add_argument("--dept-count", dest="dept_count", type=int, default=None,
+                   help="부서 수(미지정 시 활성 소켓 수 측정값 사용)")
+    c.add_argument("--formation-budget", dest="formation_budget", type=int, default=None,
+                   help="편성 예산 한도(미지정 시 CYS_FORMATION_BUDGET env 또는 기본 20)")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")

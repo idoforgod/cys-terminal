@@ -433,6 +433,9 @@ sys.exit(3)' 2>/dev/null) || true
 #   stale 정책(설계 §4.1): 이 게이트는 마커 '존재만' 본다(버전 무관 — 승격은 조직 사실).
 BOOT_MARKER="$HOME/.cys/.master-bootstrapped"
 CEO_PENDING="$HOME/.cys/state/ceo-pending"
+# ★T4 인계 #2: demote post-verify 불완전(exit 4) 표면화 마커 — 상위 `|| true`(lifecycle 견고성)에
+#   신호가 삼켜지지 않도록 상태 파일+feed 로 노출(C6 침묵 금지). 존재=수동 점검·치유 필요.
+DEMOTE_INCOMPLETE="$HOME/.cys/state/ceo-demote-incomplete"
 
 # ★W1 invert-merge 공용 헬퍼(설계 DD-1). sentinel 규약:
 #   `<!-- CEO-OVERLAY BEGIN v1 sha256:<overlay 파일 sha256> -->` … `<!-- CEO-OVERLAY END -->`.
@@ -596,6 +599,23 @@ try:
     tmp=md+'.recompose.tmp.%d'%os.getpid()
     with open(tmp,'w',encoding='utf-8') as f: f.write(out); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,md)
+    # ★T4 인계 #1(리뷰어1 fix#2 동형 이식·C6 침묵 금지): recompose 후 post-verify를 _ceo_strip 과 동형으로.
+    #   단 recompose 는 want=True 시 정상적으로 sentinel 1쌍·§CEO-1 을 포함하므로 모드별로 판정한다(무분별
+    #   BEGIN/END 잔존 검사는 want 경로에서 영구 오탐). 불완전 = stderr + exit 4(침묵 통과 차단).
+    final=open(md,encoding='utf-8').read()
+    begins=re.findall(r'(?m)^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$',final)
+    ends=re.findall(r'(?m)^<!-- CEO-OVERLAY END -->$',final)
+    bad=[]
+    if want:
+        if not (len(begins)==1 and len(ends)==1 and SENT.search(final)):
+            bad.append("overlay append 후 sentinel 1쌍 불성립(begins=%d ends=%d)"%(len(begins),len(ends)))
+        if "§CEO-1" not in final: bad.append("overlay append했으나 §CEO-1 부재(오버레이 손상)")
+    else:
+        if begins or ends: bad.append("no-overlay인데 sentinel 행 잔존(dangling)")
+        if "§CEO-1" in final: bad.append("no-overlay인데 오버레이 고유 헤딩(§CEO-1) 잔존")
+    if bad:
+        sys.stderr.write("[cys-dept] ERROR: recompose 불완전 — %s (C6 침묵 금지·수동 점검 필요)\n"%", ".join(bad))
+        sys.exit(4)
     print("[cys-dept] recompose 완료(overlay=%s·부서=%d)"%("append" if want else "none",ndepts))
 finally: lf.close()
 PY
@@ -660,7 +680,20 @@ ceo_demote(){
   [ -f "$md" ] || return 0
   # ★W1 DD-1: 통복원(cp .pre-ceo) → sentinel strip(base 무손상). .pre-ceo는 치유 소스라 삭제하지 않음.
   #   레거시(sentinel 부재 스텁 + .pre-ceo)만 구방식 cp 복원. post-verify 내장(demote 무검증 FIX-5).
-  _ceo_strip "$md"
+  # ★T4 인계 #2: _ceo_strip post-verify exit 4(demote 불완전)가 상위 호출부 `|| true`(teardown 견고성
+  #   위해 유지)에 삼켜지지 않도록 여기서 rc 포착 → 상태 마커+feed 로 표면화(C6 침묵 금지). demote 자체는
+  #   teardown 견고성을 위해 계속 진행(신호만 살린다·rc 재전파 안 함 — 강등이 부서 정리를 막지 않는다).
+  local _rc=0
+  _ceo_strip "$md" || _rc=$?
+  if [ "$_rc" != "0" ]; then
+    mkdir -p "$(dirname "$DEMOTE_INCOMPLETE")" 2>/dev/null || true
+    printf 'demote incomplete rc=%s at %s\n' "$_rc" "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$DEMOTE_INCOMPLETE" 2>/dev/null || true
+    env -u CYS_SOCKET "$CYS" feed push --title "CEO 강등 불완전(수동 점검 필요)" \
+      --body "표준 master 복귀(demote) post-verify가 잔존 오염(sentinel 행/§CEO-1)을 감지했습니다(rc=$_rc). MASTER_DIRECTIVE.md를 수동 점검하거나 cys doctor --fix 로 치유하세요. 마커: $DEMOTE_INCOMPLETE" >/dev/null 2>&1 || true
+    echo "[cys-dept] WARN: demote 불완전(rc=$_rc) — 상태 마커·feed 로 표면화(teardown은 계속)" >&2
+  else
+    rm -f "$DEMOTE_INCOMPLETE" 2>/dev/null || true   # 정상 강등 = 이전 미해소 마커 청소(멱등)
+  fi
   ceo_reinject_master "표준 master 복귀"
 }
 

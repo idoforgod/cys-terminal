@@ -55,15 +55,24 @@ def main():
             base = json.load(f)
     stub_shas = {h["sha256"] for h in (heal or {}).get("hashes", [])}
     check("1a heal_hashes.json 존재·스텁 다수 수집", len(stub_shas) >= 2, "수집=%d" % len(stub_shas))
-    live_master = "/Users/cys-macbook/.cys/pack/directives/MASTER_DIRECTIVE.md"
-    if os.path.exists(live_master):
-        import hashlib
-        with open(live_master, "rb") as f:
-            lsha = hashlib.sha256(f.read()).hexdigest()
-        check("1b 라이브 반쪽마스터가 스텁 대장에 탐지됨(현 라이브 재발 확증)",
-              lsha in stub_shas, "live sha=%s.." % lsha[:16])
+    # 1b (밀폐화·T4 인계 #3): 하드코딩 라이브 경로(:58) 제거 — 라이브 무접촉. 리포 스텁 대장 해시와
+    #   모듈의 sentinel base-추출 파이프라인만으로 치유 탐지를 핀한다(env -i 에서도 GREEN).
+    m0 = load()
+    if m0 is not None and stub_shas:
+        a_stub = sorted(stub_shas)[0]
+        needs = getattr(m0, "needs_heal", None)
+        detected = callable(needs) and needs(a_stub) is True
+        # sentinel 합성물에서 base 부분만 추출(치유 전처리 파서 — T1 독립행 앵커 동형).
+        base_txt = "표준 base 전문\n본문 여러 줄\n"
+        composite = (base_txt + "<!-- CEO-OVERLAY BEGIN v1 sha256:%s -->\n오버레이 본문\n"
+                     "<!-- CEO-OVERLAY END -->\n" % ("0" * 64))
+        xb = getattr(m0, "extract_base", None)
+        extracted_ok = callable(xb) and xb(composite) == base_txt
+        check("1b 스텁 대장 탐지 + sentinel base 추출(라이브 무접촉)",
+              detected and extracted_ok, "detected=%s extract_ok=%s" % (detected, extracted_ok))
     else:
-        check("1b 라이브 반쪽마스터가 스텁 대장에 탐지됨", True, "라이브 부재 — skip(대장 자체는 유효)")
+        check("1b 스텁 대장 탐지 + sentinel base 추출(라이브 무접촉)", False,
+              "javis_directive_heal.py 미구현 — T4 대상(RED)")
     check("1c base_hashes.json 존재·표준 다수 수집",
           len((base or {}).get("hashes", [])) >= 2, "수집=%d" % len((base or {}).get("hashes", [])))
 

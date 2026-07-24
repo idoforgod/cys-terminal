@@ -200,6 +200,27 @@ def state_kind(state):
     return state.split(":", 1)[0]
 
 
+# ── W3(T3): 배너 수명 신호 매핑 — feed --kind(UI 배너 판정) · EVT 타입(음성/HUD 트랙) ──
+# UI 배너 소멸/갱신은 데몬 feed 버스(feed.item.created, payload.kind)가 담당하고(ui bootbanner.ts),
+# EVT 는 별개 층(음성·HUD, javis_event.py 계약)이다 — handlers.rs:2814 층 분리 주석과 정합.
+_STATE_FEED_KIND = {"complete": "formation-complete", "partial": "formation-partial",
+                    "pending-cli": "formation-pending", "pending-resource": "formation-pending",
+                    "failed": "formation-failed"}
+_STATE_EVT = {"complete": "boot.formation.complete", "partial": "boot.formation.partial",
+              "pending-cli": "boot.formation.pending", "pending-resource": "boot.formation.pending",
+              "failed": "boot.formation.failed"}
+
+
+def feed_kind_for_state(state):
+    """상태 → cys feed --kind. complete=배너 소멸·partial=배너 갱신·그 외=정보성(순수·테스트 대상)."""
+    return _STATE_FEED_KIND.get(state_kind(state), "formation")
+
+
+def evt_type_for_state(state):
+    """상태 → EVT v2 타입(boot.formation.*) 또는 None(순수·테스트 대상)."""
+    return _STATE_EVT.get(state_kind(state))
+
+
 # ── 라이브 로스터 관측(cys list) ──
 def _live_roles(socket):
     """cys list(소켓 문맥) → 라이브(미exited) 역할 집합. 파싱 불가/데몬 부재 → None."""
@@ -254,13 +275,16 @@ def _installed_clis():
 
 # ── ④ 곱셈 자원 예산(W6 접점 — hard=pending-resource) ──
 def _resource_ok(socket):
-    """javis_resource_gate.py check → 편성 착수 자원 여유(hard=False). 게이트 부재/내부오류=True(보수)."""
+    """javis_resource_gate.py check → 편성 착수 자원 여유(hard=False). 게이트 부재/내부오류=True(보수).
+    ★W6 곱셈 편성 예산(T4): --formation-size 로 이 레인 편성 크기를 전달 → 게이트가 투영(측정 노드 +
+    부서수×편성크기)을 CYS_FORMATION_BUDGET 과 대조해 초과 시 hard(exit 2)→여기서 False→pending-resource."""
     gate = os.path.join(PACK_DIR, "bin", "javis_resource_gate.py")
     if not os.path.isfile(gate):
         return True
     py = sys.executable or "python3"
-    code, _out, _err = _run([py, gate, "check", "--json"], timeout=30)
-    # exit 2 = hard block. 그 외(0 allow·1 soft·기타 내부오류)=진행.
+    code, _out, _err = _run(
+        [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], timeout=30)
+    # exit 2 = hard block(자원 hard 또는 W6 예산 초과). 그 외(0 allow·1 soft·기타 내부오류)=진행.
     return code != 2
 
 
