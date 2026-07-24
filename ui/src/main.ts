@@ -2365,13 +2365,17 @@ function makeWebPane(node: WebNode): WebPaneView {
   // arm한 뒤 재생한 지구본/재연결 클릭에서만 호출된다. 웹 self-assertion은 Tauri에서 거부된다.
   const castActiveEnsure = async () => {
     if (disposed) return;
+    if (activeCastRequestId) return; // ensure 진행 중 재트리거 무시 — 활성화는 1회용이라 겹치면 뒤가 이중 소모(NATIVE_ACTIVATION_REQUIRED)로 죽는다(2026-07-25 오너 실사고). 진행 중 ensure가 UI를 갱신한다. castLoadGen 세대 가드(늦은 결과 폐기)와 층위가 다른 '동시 시작 차단'이며, castLoadGen 증가 전에 둬 진행 중 ensure의 gen을 무효화하지 않는다.
     const gen = ++castLoadGen;
     const requestId = newCastEmbedTicket();
     activeCastRequestId = requestId;
     clearCastReconnectClick();
     showPlaceholder("브라우저 준비 중…");
     const parentOrigin = castParentOrigin(window.location);
-    if (!parentOrigin) return showPlaceholder("지원하지 않는 앱 origin — 브라우저 로드 거부");
+    if (!parentOrigin) {
+      if (activeCastRequestId === requestId) activeCastRequestId = null; // try 진입 전 이탈은 finally를 못 타므로 여기서 수명 해제 — 새 가드가 데드락(영구 true) 되지 않게
+      return showPlaceholder("지원하지 않는 앱 origin — 브라우저 로드 거부");
+    }
     let state: CastEmbedDescriptor;
     try {
       state = (await invoke("ensure_browserd_cast", {

@@ -392,6 +392,7 @@ export function castFailureReason(err: unknown, maxLen = 120): string {
 // 클릭 차단·권위 부여 금지: 판정자는 항상 백엔드 consume이다. 표식 상태별 진단:
 //   부재       = 활성화 스크립트 미설치(빌드 결함) — 원인 확정이라 진단 선행
 //   arm-failed = arm 거부 — 원인 확정이라 진단 선행(80자 캡: 장문 사유가 백엔드 코드를 placeholder에서 축출 금지)
+//   skip-*     = 인터셉터 살아있으나 클릭이 특정 가드(untrusted·inactive-ua·not-element·nomatch)에서 탈락 — 탈락 지점 확정이라 진단 선행(80자 캡)
 //   installed  = 인터셉터 살아있는데 이 클릭 미인터셉트 — 선택자 드리프트 또는 설치 직후 크래시(C5) 의심, 힌트 후행
 //   armed-ok   = arm 성공 이력인데 소모 실패 — TTL 만료/이중 소모 의심, 힌트 후행
 //   미지 값(위조 포함) = 무보강 — 백엔드 원문 유지(오진 금지)
@@ -402,10 +403,11 @@ export function castActivationDiagnostics(err: unknown, marker: unknown): string
     return `활성화 스크립트 미설치(빌드 결함 — 재설치 필요) · ${raw}`;
   const m = String(marker);
   if (m.startsWith("arm-failed")) return `${m.slice(0, 80)} · ${raw}`;
+  if (m.startsWith("skip-")) return `${m.slice(0, 80)} · ${raw}`; // 인터셉터 가드 탈락 지점 — 실사고 특정용
   if (m === "installed")
     return `${raw} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 또는 설치 직후 크래시 의심)`;
   if (m === "armed-ok")
-    return `${raw} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)`;
+    return `${raw} · (진단: 직전 활성화가 이미 사용됨 — 한 번 더 클릭하면 연결됩니다)`;
   return raw;
 }
 

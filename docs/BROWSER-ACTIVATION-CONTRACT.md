@@ -242,6 +242,7 @@ v0.13.10 실사고 재발), `ensure_browserd_cast`는 issue_gesture가 등록 �
 | **`installed`** | `mark('installed')` 주입 직후 (`main.rs:200`) | 인터셉터는 살아있으나 이 클릭이 미인터셉트 — 선택자 드리프트 **또는 설치 직후 코드가 죽어 리스너 미등록(C5 위반)** 의심 | `{raw} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 또는 설치 직후 크래시 의심)` (`webpane.ts:405-406`) |
 | **`armed-ok`** | arm 성공 `.then` (`main.rs:218`) | arm 성공 이력인데 소모 실패 — TTL 만료/이중 소모 의심 | `{raw} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)` (`webpane.ts:407-408`) |
 | **`arm-failed: <e>`** | arm 거부 `.catch` (`main.rs:219`), 또는 클릭 시점 invoke 부재(C5) `main.rs:214` | arm 거부 — 원인 확정. 클릭은 재생됨 | `{marker.slice(0,80)} · {raw}` (`webpane.ts:404`, 80자 캡: 장문 사유가 백엔드 코드를 placeholder에서 축출 못 하게) |
+| **`skip-*`** (skip-untrusted·skip-inactive-ua·skip-not-element·skip-nomatch:`<id/tag>`) | 클릭 핸들러 각 조기 return (`main.rs`) | **진단 전용·권위 없음**. 인터셉터는 살아있으나 클릭이 특정 가드에서 탈락 — `installed`(미인터셉트 통칭)를 탈락 지점별로 세분한다. skip-untrusted는 arm 성공 후 nativeClick 재생(합성 클릭)에서도 발생하므로 armed 접두면 기록을 보류해 armed-ok를 최종 상태로 보존 | `{marker.slice(0,80)} · {raw}` (`webpane.ts`, installed 분기보다 **앞**) |
 | **(미지 값 / 위조)** | — | 무보강 — 오진 금지, 백엔드 원문 유지 | `{raw}` (`webpane.ts:409`) |
 
 상태 흐름: `installed`(주입 시) → 신뢰 클릭 시 arm 시도 → 성공이면 `armed-ok`(그 후 nativeClick

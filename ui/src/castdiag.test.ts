@@ -1,8 +1,8 @@
 // castActivationDiagnostics 순수 함수 회귀 테스트 (bun test — 신규 의존성 0).
 //
 // NATIVE_ACTIVATION_REQUIRED 실패의 진단 보강 — 표식(window.__CYS_BROWSER_ACTIVATION__)은
-// 게이트가 아니라 문구 재료다. 판정자는 항상 백엔드 consume. 7분기 전수 검증(표식 상태별 진단 +
-// 비활성화 무간섭 + 미지 표식 무보강 + 빈 입력).
+// 게이트가 아니라 문구 재료다. 판정자는 항상 백엔드 consume. 8분기 전수 검증(표식 상태별 진단 +
+// 비활성화 무간섭 + 미지 표식 무보강 + 빈 입력 + skip-* 가드 탈락).
 import { describe, it, expect } from "bun:test";
 import { castActivationDiagnostics } from "./webpane";
 
@@ -35,9 +35,9 @@ describe("castActivationDiagnostics — 표식 기반 진단 보강", () => {
     );
   });
 
-  it("5) 'armed-ok' → 원문 + 'TTL 만료/이중 소모 의심' 힌트 후행", () => {
+  it("5) 'armed-ok' → 원문 + '직전 활성화가 이미 사용됨' 힌트 후행", () => {
     expect(castActivationDiagnostics(NATIVE, "armed-ok")).toBe(
-      `${NATIVE} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)`,
+      `${NATIVE} · (진단: 직전 활성화가 이미 사용됨 — 한 번 더 클릭하면 연결됩니다)`,
     );
   });
 
@@ -48,5 +48,10 @@ describe("castActivationDiagnostics — 표식 기반 진단 보강", () => {
   it("7) 빈 문자열·null 에러 → '' (빈 결과)", () => {
     expect(castActivationDiagnostics("", "installed")).toBe("");
     expect(castActivationDiagnostics(null, undefined)).toBe("");
+  });
+
+  it("8) 'skip-*'(가드 탈락) → 접두 + 80자 캡(installed보다 앞서 세분 진단)", () => {
+    const marker = "skip-nomatch:btn-close";
+    expect(castActivationDiagnostics(NATIVE, marker)).toBe(`${marker} · ${NATIVE}`);
   });
 });

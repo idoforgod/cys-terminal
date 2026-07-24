@@ -194,7 +194,9 @@ fn random_secret_hex() -> Result<String, String> {
 /// ipc-protocol.js가 `})()`(식)로 끝나 ASI가 발동하지 않고, `(`로 시작하면 호출 연쇄로
 /// 삼켜져 인터셉터가 통째로 미설치된다(v0.13.6 실사고). 경계 계약은 동파일 테스트
 /// `activation_script_survives_ipc_protocol_concatenation`이 봉쇄한다.
-/// 표식 `__CYS_BROWSER_ACTIVATION__`은 진단 전용(installed→armed-ok|arm-failed:) —
+/// 표식 `__CYS_BROWSER_ACTIVATION__`은 진단 전용(installed→armed-ok|arm-failed:|skip-*) —
+/// skip-*는 인터셉터가 살아있으나 클릭이 특정 가드(untrusted·inactive-ua·not-element·nomatch)에서
+/// 탈락한 지점을 특정한다(설치됨=installed 상태에서 클릭 미인터셉트 원인 세분화).
 /// 권위 없음(판정자는 백엔드 consume). capability는 클로저 격리 유지. arm 실패도 클릭을
 /// 재생한다 — 무반응 버튼 대신 백엔드의 정확한 거부 사유가 UI 배관으로 노출되게.
 ///
@@ -212,13 +214,18 @@ fn browser_activation_initialization_script(capability: &str) -> String {
   mark('installed');
   const nativeClick = HTMLElement.prototype.click;
   document.addEventListener('click', (event) => {{
-    if (!event.isTrusted) return;
+    // 각 조기 return에 skip-* 진단 표식 — 클릭이 어느 가드에서 탈락하는지 실사고 특정용.
+    // ★skip-untrusted만은 마커를 덮지 않는다: arm 성공 후 nativeClick 재생(합성 클릭)은
+    // isTrusted=false라 이 가드로 매번 재진입한다. mark('armed-ok')가 재생보다 먼저 찍히므로
+    // 무조건 덮으면 최종 상태가 armed-ok→skip-untrusted로 오염된다. armed 접두면 기록을 보류해
+    // armed-ok가 최종 상태로 남게 한다(진단 진실 보존). 마커 값은 UI 노출되므로 id/tagName만.
+    if (!event.isTrusted) {{ if (!String(window.__CYS_BROWSER_ACTIVATION__ || '').startsWith('armed')) mark('skip-untrusted'); return; }}
     const ua = navigator.userActivation;
-    if (ua && ua.isActive === false) return;
+    if (ua && ua.isActive === false) {{ mark('skip-inactive-ua'); return; }}
     const raw = event.target;
-    if (!(raw instanceof Element)) return;
+    if (!(raw instanceof Element)) {{ mark('skip-not-element'); return; }}
     const target = raw.closest("#btn-browser, [data-browser-reconnect='true']");
-    if (!target) return;
+    if (!target) {{ mark('skip-nomatch:' + (raw.id || raw.tagName || '?')); return; }}
     event.preventDefault();
     event.stopImmediatePropagation();
     const internals = window.__TAURI_INTERNALS__;
@@ -912,6 +919,13 @@ fn arm_browser_native_activation(
         .lock()
         .unwrap()
         .arm(window.label(), &bootstrap_capability, unix_millis_now())
+        .map_err(|error| {
+            eprintln!(
+                "[cys-app] native activation arm rejected: {error} (window={})",
+                window.label()
+            );
+            error
+        })
 }
 
 fn browser_embed_intent(
@@ -977,7 +991,13 @@ async fn ensure_browserd_cast(
         .lock()
         .unwrap()
         .consume(window.label(), unix_millis_now())
-        .map_err(|error| format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}"))?;
+        .map_err(|error| {
+            eprintln!(
+                "[cys-app] native activation consume rejected: {error} (window={})",
+                window.label()
+            );
+            format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}")
+        })?;
     // 지연 재시도(fail-closed는 유지, 무한루프 없음): 부팅 시 1회 등록이 데몬 교체·부팅 경합으로
     // 실패해 세션이 비어 있으면, 신뢰된 클릭 소모 직후 여기서 등록한다. 이미 등록됐으면 통과.
     if BROWSER_APP_SESSION.read().unwrap().is_none() {
@@ -3830,6 +3850,13 @@ mod tests {
         assert!(script.starts_with(';'), "push_str 연결 경계 — 파스 분리자 필수");
         assert!(script.contains("__CYS_BROWSER_ACTIVATION__"));
         assert!(script.contains("arm-failed"));
+        // 가드 탈락 진단 표식 — 각 조기 return 지점을 skip-*로 특정한다.
+        assert!(script.contains("skip-untrusted"));
+        assert!(script.contains("skip-inactive-ua"));
+        assert!(script.contains("skip-not-element"));
+        assert!(script.contains("skip-nomatch:"));
+        // replay(합성 클릭)가 armed-ok를 덮지 않도록 armed 접두 가드가 존재해야 한다.
+        assert!(script.contains("startsWith('armed')"));
     }
 
     /// tauri Builder::append_invoke_initialization_script는 push_str 문자열 연결이고, 선행
