@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -10,6 +11,14 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "runtime-stage-toolchain.py"
+
+
+def _call_name(func):
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
 
 
 class RuntimeStageToolchainTests(unittest.TestCase):
@@ -92,6 +101,66 @@ class RuntimeStageToolchainTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not a regular file", result.stderr)
             self.assertFalse(output.exists())
+
+
+class ToolchainHandleClosedBeforeReplaceTests(unittest.TestCase):
+    """Source-level seal for the 5th-run Windows failure (unreproducible on macOS).
+
+    The atomic rename previously ran INSIDE the NamedTemporaryFile with-block, so the
+    write fd was still open and Windows refused the rename with WinError 32 — a
+    self-inflicted share-lock that no retry could clear (POSIX allows renaming an open
+    fd, which hid the defect on macOS). This asserts, structurally, that no .replace()
+    rename lives inside the temp-file with-block; it must run only after the handle
+    closes."""
+
+    def _temp_with_node(self):
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        temp_withs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and _call_name(item.context_expr.func) == "NamedTemporaryFile"
+                for item in node.items
+            )
+        ]
+        self.assertEqual(
+            len(temp_withs),
+            1,
+            "expected exactly one NamedTemporaryFile with-block in the staging script",
+        )
+        return temp_withs[0]
+
+    def test_no_atomic_replace_runs_while_the_temp_write_handle_is_open(self):
+        with_node = self._temp_with_node()
+        replaces_inside = [
+            node
+            for node in ast.walk(with_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "replace"
+        ]
+        self.assertEqual(
+            replaces_inside,
+            [],
+            "temp .replace() must run AFTER the NamedTemporaryFile block closes the "
+            "write handle — otherwise Windows fails the rename with WinError 32",
+        )
+
+    def test_the_extract_path_still_performs_an_atomic_replace(self):
+        # Guard the seal against passing vacuously (e.g. the rename being removed).
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        replaces = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "replace"
+        ]
+        self.assertTrue(
+            replaces, "extract() must still atomically replace the output via .replace()"
+        )
 
 
 if __name__ == "__main__":

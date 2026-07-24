@@ -60,11 +60,11 @@ test("strict packaged engine stores endpoint only under supervisor-owned root", 
   // 기대값은 리터럴이 아니라 구현과 동일한 node:path.join으로 조립한다 — 구현이
   // join(home, ".cys", "browser")로 루트를 만들어 Windows에서는 역슬래시가 되므로,
   // POSIX 리터럴을 고정하면 Windows 러너에서만 깨진다(3차 CI Windows 레그 실패 원인).
-  const defaultRoot = join("/home/user", ".cys", "browser");
+  const defaultRoot = join("/Users/x", ".cys", "browser");
   // strict + 절대 engineRoot: 구현이 engineRoot를 그대로 반환(join 미경유) → 리터럴 유지 안전.
-  expect(resolveBrowserRoot("/home/user", "/private/engine", "1")).toBe("/private/engine");
-  expect(resolveBrowserRoot("/home/user", "/private/engine", "0")).toBe(defaultRoot);
-  expect(resolveBrowserRoot("/home/user", undefined, "1")).toBe(defaultRoot);
+  expect(resolveBrowserRoot("/Users/x", "/private/engine", "1")).toBe("/private/engine");
+  expect(resolveBrowserRoot("/Users/x", "/private/engine", "0")).toBe(defaultRoot);
+  expect(resolveBrowserRoot("/Users/x", undefined, "1")).toBe(defaultRoot);
 });
 
 test("strict packaged engine binds status and endpoint to signed runtime identity", () => {

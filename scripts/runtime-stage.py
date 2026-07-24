@@ -14,6 +14,7 @@ import shutil
 import stat
 import struct
 import tempfile
+import time
 from urllib.parse import urlsplit
 import zipfile
 
@@ -28,6 +29,32 @@ TARGETS = {
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def retry_on_windows_lock(operation, *, attempts=10, base_delay=0.5, max_delay=4.0, max_total=30.0):
+    """Run *operation*, retrying transient Windows share-lock failures (WinError 32).
+
+    This rides out an *external* holder (antivirus scanner / search indexer briefly
+    holding a just-written file), so an atomic rename/replace over it raises
+    PermissionError with winerror == 32. NOTE: retrying is useless against a lock we
+    hold ourselves — the caller MUST close its own write handle before invoking this
+    (the 5th-run CI failure was exactly a self-held fd, and 56s of backoff could not
+    clear our own handle). Exponential backoff (total budget ~30s) rides out the
+    external window. POSIX never sets winerror, so any PermissionError there is a real
+    error and is re-raised immediately — the wrapper is a no-op on the happy path. On
+    exhaustion the last exception is re-raised (fail-closed — never an unbounded wait)."""
+    delay = base_delay
+    waited = 0.0
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) != 32 or attempt == attempts or waited >= max_total:
+                raise
+            pause = min(delay, max_total - waited)
+            time.sleep(pause)
+            waited += pause
+            delay = min(delay * 2, max_delay)
 
 
 def sha256_file(path: Path) -> str:
@@ -331,7 +358,9 @@ def stage(args: argparse.Namespace) -> None:
         if existing - {".gitkeep"}:
             fail(f"Browser Runtime output is not empty: {final_output}")
         shutil.rmtree(final_output)
-    output.replace(final_output)
+    # Windows AV/indexer may briefly hold the just-written engine/supervisor exes and
+    # freshly-extracted Chromium tree; ride out that share-lock so the atomic swap lands.
+    retry_on_windows_lock(lambda: output.replace(final_output))
     cleanup_pending = False
     shutil.rmtree(temporary_parent, ignore_errors=True)
 

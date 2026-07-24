@@ -55,6 +55,12 @@ jobs:
                                             # setup.exe는 Authenticode+RFC3161 뒤 updater 서명을 다시 생성한다.
     runs-on: ${{ matrix.platform }}
 
+    # Explicit, auditable opt-out for the unsigned Windows distribution model
+    # (unsigned exe + zip + Windows Defender guidance). Only ALLOW_UNSIGNED_WINDOWS=='1'
+    # skips Authenticode; unset/other values keep the fail-closed default unchanged.
+    env:
+      ALLOW_UNSIGNED_WINDOWS: ${{ vars.ALLOW_UNSIGNED_WINDOWS }}
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -205,6 +211,8 @@ jobs:
           #   ⑥runtime/ 만 뒤 '동봉 런타임 준비' 스텝 소관이라, 존재 검사만 충족하도록 빈 디렉터리를
           #   미리 만든다(내용은 그 스텝이 채운다). CYS_TARGET 미설정 = 호스트 트리플(이 레그와 일치).
           mkdir -p src-tauri/runtime
+          # tauri build.rs 리소스 존재 검증 통과용 placeholder — 실 스테이징(후속 스텝)이 원자적으로 대체
+          mkdir -p src-tauri/resources/browser-runtime
           bash scripts/bundle-prep.sh
           CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app
 
@@ -340,16 +348,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # brew는 0.12를 붓는다(로그 실증). Windows는 0.12 고정 — 무암호 키 KDF 호환.
           brew install minisign
           minisign -v
 
+      # choco의 minisign은 구버전이라 무암호(-W) 비밀키의 KDF를 못 읽어 -S 서명이 exit 2
+      # "Unsupported key derivation function"로 실패한다(-V 검증은 통과). 공식 jedisct1 0.12
+      # win64 zip을 다이제스트 고정으로 설치해 macOS(brew 0.12)와 동일한 키 KDF 호환을 보장한다.
       - name: Install Browser Runtime minisign verifier (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install minisign --yes --no-progress
-          if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
-          minisign -v
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip'
+          $expected = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          $zip = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+          if ($actual -ne $expected) { throw "minisign archive digest mismatch: expected $expected got $actual" }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $exe = Join-Path $dest 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path $exe)) { throw "minisign.exe not found at $exe" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $exe -Parent)
+          & $exe -v
           if ($LASTEXITCODE -ne 0) { throw 'minisign verification failed' }
 
       - name: Materialize Browser Runtime release trust inputs (macOS)
@@ -488,7 +511,7 @@ jobs:
         run: python scripts/release-credentials-check.py windows
 
       - name: Import Windows signing certificate
-        if: matrix.platform == 'windows-latest'
+        if: matrix.platform == 'windows-latest' && env.ALLOW_UNSIGNED_WINDOWS != '1'
         id: windows_certificate
         shell: pwsh
         env:
@@ -514,7 +537,11 @@ jobs:
         if: always() && matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
+          # Authenticode cert removal only runs when a cert was imported (signed mode).
+          # Browser Runtime minisign key cleanup always runs — it exists in both modes.
+          if ($env:ALLOW_UNSIGNED_WINDOWS -ne '1') {
+            ./scripts/windows-authenticode.ps1 -Mode Remove -Thumbprint '${{ steps.windows_certificate.outputs.thumbprint }}'
+          }
           foreach ($path in @($env:CYS_BROWSER_RUNTIME_SECRET_KEY, $env:CYS_BROWSER_RUNTIME_PUBLIC_KEY)) {
             if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force }
           }
