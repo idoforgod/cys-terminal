@@ -1,0 +1,99 @@
+{
+  "_doc": "역대 표준 MASTER_DIRECTIVE 해시 대장 — recompose가 base 부분 교체 시 '사용자 정당 수정본'과 구분하는 화이트리스트(DD-1). 이 목록에 있을 때만 최신 표준으로 교체.",
+  "file": "directives/MASTER_DIRECTIVE.md",
+  "hashes": [
+    {
+      "sha256": "c058e9a819cd3c3d400ec658d70cc759da077e94cb61112204c123f92c000a99",
+      "commit": "3152e62978e12dde7ea08c060aba92b595b5d464",
+      "size": 35749,
+      "date": "2026-07-16 19:13:36 +0900",
+      "describe": "v0.12.71-1-g3152e62",
+      "note": "MASTER_DIRECTIVE v1 (v0.12.71-1-g3152e62, 35749B)"
+    },
+    {
+      "sha256": "c26a980da2588818d323b543701698b74ad3ac3dfe496147bf72cc7359b13bd6",
+      "commit": "bc32527b0641c2844689a711c00767ca232af391",
+      "size": 35160,
+      "date": "2026-07-16 11:03:16 +0900",
+      "describe": "v0.12.69-4-gbc32527",
+      "note": "MASTER_DIRECTIVE v2 (v0.12.69-4-gbc32527, 35160B)"
+    },
+    {
+      "sha256": "f4136497ed068def22cd613e364e16b66970210ba793295b8010bfb7dff0616e",
+      "commit": "0eca9feb56bf7ac61185ed8ce33f05a90557b802",
+      "size": 35002,
+      "date": "2026-07-16 10:16:39 +0900",
+      "describe": "v0.12.69-2-g0eca9fe",
+      "note": "MASTER_DIRECTIVE v3 (v0.12.69-2-g0eca9fe, 35002B)"
+    },
+    {
+      "sha256": "5be46486c3072560d18bea99628538c521f3319f331c225fbce2a286cd87d9c3",
+      "commit": "8b48ae7a2b81bb6bfc27f2dedc317b8ea2489760",
+      "size": 34086,
+      "date": "2026-07-04 15:04:24 +0900",
+      "describe": "v0.12.7",
+      "note": "MASTER_DIRECTIVE v4 (v0.12.7, 34086B)"
+    },
+    {
+      "sha256": "48bd26d93c5227cbe8922929a4b907579cdc343497221a25408a9d273c678e57",
+      "commit": "3fac32cfd08561806fbe440dc985885c42c0393b",
+      "size": 32664,
+      "date": "2026-07-03 09:39:19 +0900",
+      "describe": "v0.9.1-1-g3fac32c",
+      "note": "MASTER_DIRECTIVE v5 (v0.9.1-1-g3fac32c, 32664B)"
+    },
+    {
+      "sha256": "342f6e42b12160680fd39c4296399db37b3883256c2dafad176e025b05366542",
+      "commit": "ec0451479f30a1b9a7a411dbb87ae3e93da5c0e9",
+      "size": 32685,
+      "date": "2026-06-18 08:51:39 +0900",
+      "describe": "ec04514",
+      "note": "MASTER_DIRECTIVE v6 (ec04514, 32685B)"
+    },
+    {
+      "sha256": "1c18ee82a77f557c9a34a9a3e395022f80b52ecef34950fa00f8f7437e43321b",
+      "commit": "a1b04b0636524b67112e5941a353afd40b8d92be",
+      "size": 29817,
+      "date": "2026-06-17 23:19:56 +0900",
+      "describe": "a1b04b0",
+      "note": "MASTER_DIRECTIVE v7 (a1b04b0, 29817B)"
+    },
+    {
+      "sha256": "1d6a1920caef472eb12cb297787c88b98c30df6e7041a42d8e47b0365e556356",
+      "commit": "a692643fdb44c3a9d09e7f6e4e6bb64f224bd82c",
+      "size": 30018,
+      "date": "2026-06-14 23:25:40 +0900",
+      "describe": "a692643",
+      "note": "MASTER_DIRECTIVE v8 (a692643, 30018B)"
+    },
+    {
+      "sha256": "1314c045126c09104fab7f8d39c1f5878879331c3644fd745a29cf9c3ba3a359",
+      "commit": "1894df2714ea0cd63883970656961f8ddeea7b94",
+      "size": 29085,
+      "date": "2026-06-14 22:54:21 +0900",
+      "describe": "1894df2",
+      "note": "MASTER_DIRECTIVE v9 (1894df2, 29085B)"
+    },
+    {
+      "sha256": "32bdb14011e2c5e44193deebc051e7a4088ed62e742486484126b87c56be1e8f",
+      "commit": "4d136e32c909a164855c5f7ab135ed2e3aeefd55",
+      "size": 28185,
+      "date": "2026-06-14 19:30:48 +0900",
+      "describe": "4d136e3",
+      "note": "MASTER_DIRECTIVE v10 (4d136e3, 28185B)"
+    },
+    {
+      "sha256": "30cee1f0acffabd978be72b4642cf7b1ccf55f400f547b6d98d9adfecc4fbc18",
+      "commit": "22b8f540488832eeb33b7c0168483c167bfb52a6",
+      "size": 28188,
+      "date": "2026-06-14 08:04:22 +0900",
+      "describe": "22b8f54",
+      "note": "MASTER_DIRECTIVE v11 (22b8f54, 28188B)"
+    }
+  ],
+  "_live_observed": {
+    "sha256": "e5eb70cdf98c6d90727a9289314f76381e9531cf409e009e49e3d1deb948e484",
+    "size": 4530,
+    "equals_ceo_stub": true
+  }
+}

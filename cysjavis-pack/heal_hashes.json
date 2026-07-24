@@ -1,0 +1,30 @@
+{
+  "_doc": "역대 CEO_TEMPLATE(구 스텁) 해시 대장 — MASTER_DIRECTIVE 해시가 이 목록에 들면 반쪽마스터로 판정·치유 발동(W5/DD-5). 정확 일치만·퍼지 금지.",
+  "file": "directives/CEO_TEMPLATE.md",
+  "hashes": [
+    {
+      "sha256": "e5eb70cdf98c6d90727a9289314f76381e9531cf409e009e49e3d1deb948e484",
+      "commit": "3152e62978e12dde7ea08c060aba92b595b5d464",
+      "size": 4530,
+      "date": "2026-07-16 19:13:36 +0900",
+      "describe": "v0.12.71-1-g3152e62",
+      "note": "CEO_TEMPLATE stub v1 (v0.12.71-1-g3152e62, 4530B)"
+    },
+    {
+      "sha256": "cc2512b6137c117298cef7155b1a413e31fa04911f39e6054c076c4e5f033e3d",
+      "commit": "3fac32cfd08561806fbe440dc985885c42c0393b",
+      "size": 3482,
+      "date": "2026-07-03 09:39:19 +0900",
+      "describe": "v0.9.1-1-g3fac32c",
+      "note": "CEO_TEMPLATE stub v2 (v0.9.1-1-g3fac32c, 3482B)"
+    },
+    {
+      "sha256": "925d3f9d1af56c7e96ef7220125a872ba113ba0391b33e998a00b7ab4c31f9fb",
+      "commit": "991d7c97322f0312bf6243b63ed630c58f7524f3",
+      "size": 3488,
+      "date": "2026-06-19 22:43:53 +0900",
+      "describe": "v0.2.3-9-g991d7c9",
+      "note": "CEO_TEMPLATE stub v3 (v0.2.3-9-g991d7c9, 3488B)"
+    }
+  ]
+}
