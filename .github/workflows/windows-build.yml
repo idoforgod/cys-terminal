@@ -27,13 +27,16 @@ jobs:
         run: bash scripts/secret-scan.sh --all
 
       # ── 능력 파리티 게이트(W4·DD-6) — Windows 레그 ──
-      # 파리티 7종 팩 테스트를 Windows 에서 돌려 크로스플랫폼 회귀(fcntl→msvcrt 싱글플라이트 락·
-      # 경로 구분자·CRLF 등)를 잡는다. 러너 프리인스톨 python 사용(동봉 embeddable python 은 설치
-      # 후에만 존재 — 이 게이트는 빌드 이전 fail-fast 라 러너 python 을 쓴다. 파이프라인 로직 검증엔
-      # 동일 CPython on Windows 라 등가). test_parity_paths 의 실 mock-agent 주입 e2e 는 posix 전용
-      # 이라 nt 에서 자기-스킵한다(테스트 내부 _e2e_supported). test_dept_teardown_atomicity 는
-      # 게이트 제외(baseline v0.13.3 선재 실패·우리 회귀 아님).
-      - name: 능력 파리티 팩 테스트 (Windows · pre-build 게이트)
+      # 순수-python 크로스플랫폼 5종을 Windows 에서 돌려 회귀(fcntl→msvcrt 싱글플라이트 락·경로
+      # 구분자·CRLF 등 실제 Windows 코드경로)를 잡는다. 러너 프리인스톨 python 사용(동봉 embeddable
+      # python 은 설치 후에만 존재 — 이 게이트는 빌드 이전 fail-fast 라 러너 python 을 쓴다. 파이프라인
+      # 로직 검증엔 동일 CPython on Windows 라 등가). test_parity_paths 의 실 mock-agent 주입 e2e 는
+      # posix 전용이라 nt 자기-스킵.
+      # ★제외: test_directive_compose·test_heal — `bash cys-dept`(GNU bash 스크립트)를 구동하는데
+      #   Windows 러너의 `bash` 는 System32\bash.exe(WSL 스텁·배포판 없음)로 해석돼 GNU bash 가 아니다.
+      #   스크립트 로직은 플랫폼 동일이라 macOS 잡 전건+`bash -n` 로 이미 게이트(환경 아티팩트·회귀 아님).
+      #   test_dept_teardown_atomicity 도 제외(baseline v0.13.3 선재 실패·우리 회귀 아님).
+      - name: 능력 파리티 팩 테스트 (Windows · 순수-python 5종 · pre-build 게이트)
         shell: bash
         env:
           PYTHONUTF8: '1'          # Windows 콘솔 기본 cp1252 에서 한국어 print UnicodeEncodeError 방지(리포 관례)
@@ -42,8 +45,7 @@ jobs:
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
           "$PY" --version
-          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
-                   test_heal test_budget test_banner_truth; do
+          for t in test_cli_probe test_formation test_parity_paths test_budget test_banner_truth; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== parity(win): $t =="

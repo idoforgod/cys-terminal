@@ -113,8 +113,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # windows-build.yml 의 파리티 게이트와 동일 방식(러너 프리인스톨 python). test_parity_paths 의
-      # 실 mock-agent 주입 e2e 는 posix 전용이라 nt 자기-스킵. teardown_atomicity 는 게이트 제외(선재).
-      - name: 능력 파리티 팩 테스트 (Windows)
+      # 실 mock-agent 주입 e2e 는 posix 전용이라 nt 자기-스킵.
+      # ★Windows 게이트 대상 = 순수-python 크로스플랫폼 5종(fcntl→msvcrt 락·경로·CRLF 등 실제
+      #   Windows 코드경로 검증). test_directive_compose·test_heal 은 **제외** — 둘은 `bash cys-dept`
+      #   (GNU bash 스크립트)를 구동하는데, Windows 러너에서 python 이 spawn 하는 `bash` 는
+      #   System32\bash.exe(WSL 스텁·배포판 없음 → UTF-16 garbage)로 해석돼 GNU bash 가 아니다.
+      #   그 스크립트 로직은 플랫폼 동일 GNU bash 라 macOS 잡(전건)+`bash -n cys-dept` 로 이미 게이트된다
+      #   (환경 아티팩트일 뿐 코드 회귀 아님). test_dept_teardown_atomicity 도 제외(baseline 선재 실패).
+      - name: 능력 파리티 팩 테스트 (Windows · 순수-python 5종)
         shell: bash
         env:
           PYTHONUTF8: '1'          # Windows 콘솔 기본 cp1252 에서 한국어 print UnicodeEncodeError 방지(리포 관례)
@@ -123,8 +129,7 @@ jobs:
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
           "$PY" --version
-          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
-                   test_heal test_budget test_banner_truth; do
+          for t in test_cli_probe test_formation test_parity_paths test_budget test_banner_truth; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== parity(win): $t =="
