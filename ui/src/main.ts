@@ -38,6 +38,7 @@ import {
   isCastUrl,
   castContextOf,
   castFailureReason,
+  castActivationDiagnostics,
   castPaneTitle,
   castDisplayUrl,
   CAST_PROTOCOL_VERSION,
@@ -2385,11 +2386,15 @@ function makeWebPane(node: WebNode): WebPaneView {
       // 실패 원인을 버리지 않는다(무음 금지) — 원인이 소실되면 신선 머신 최빈 실패인 "bun 미설치"가
       // "브라우저 꺼짐"으로 위장돼, 사용자는 클릭마다 수십 초를 날리며 원인을 영영 모른다.
       // 주 전달 경로는 toast(전문), placeholder는 좁으므로 앞부분 요약만 싣는다.
-      const reason = castFailureReason(e);
+      const enriched = castActivationDiagnostics(
+        e,
+        (window as { __CYS_BROWSER_ACTIVATION__?: unknown }).__CYS_BROWSER_ACTIVATION__,
+      );
+      const reason = castFailureReason(enriched);
       castLastFailure = reason; // toast는 8s 후 사라진다 — placeholder가 원인을 계속 인다
       if (reason !== castLastToasted) {
         castLastToasted = reason; // 같은 원인 반복 클릭은 toast 1회만(폭주 상한·placeholder는 매번 갱신)
-        toast("browser", "브라우저 준비 실패", String(e));
+        toast("browser", "브라우저 준비 실패", enriched);
       }
       showPlaceholder(reason ? `브라우저 준비 실패 — ${reason} · 재시도…` : "브라우저 준비 실패 — 재시도…");
       return scheduleRetry(); // 재시도는 ensureAndLoad→passive(자동 재spawn 금지·자원 거버넌스)

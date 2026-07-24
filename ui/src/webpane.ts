@@ -388,6 +388,27 @@ export function castFailureReason(err: unknown, maxLen = 120): string {
   return one.length <= maxLen ? one : `${one.slice(0, maxLen)}…`;
 }
 
+// NATIVE_ACTIVATION_REQUIRED 실패의 진단 보강(순수) — 표식은 게이트가 아니라 문구 재료다.
+// 클릭 차단·권위 부여 금지: 판정자는 항상 백엔드 consume이다. 표식 상태별 진단:
+//   부재       = 활성화 스크립트 미설치(빌드 결함) — 원인 확정이라 진단 선행
+//   arm-failed = arm 거부 — 원인 확정이라 진단 선행(80자 캡: 장문 사유가 백엔드 코드를 placeholder에서 축출 금지)
+//   installed  = 인터셉터 살아있는데 이 클릭 미인터셉트 — 선택자 드리프트 의심, 힌트 후행
+//   armed-ok   = arm 성공 이력인데 소모 실패 — TTL 만료/이중 소모 의심, 힌트 후행
+//   미지 값(위조 포함) = 무보강 — 백엔드 원문 유지(오진 금지)
+export function castActivationDiagnostics(err: unknown, marker: unknown): string {
+  const raw = err === null || err === undefined ? "" : String(err);
+  if (!raw.includes("NATIVE_ACTIVATION_REQUIRED")) return raw;
+  if (marker === undefined || marker === null)
+    return `활성화 스크립트 미설치(빌드 결함 — 재설치 필요) · ${raw}`;
+  const m = String(marker);
+  if (m.startsWith("arm-failed")) return `${m.slice(0, 80)} · ${raw}`;
+  if (m === "installed")
+    return `${raw} · (진단: 인터셉터 설치됨·이 클릭 미인터셉트 — 선택자 불일치 의심)`;
+  if (m === "armed-ok")
+    return `${raw} · (진단: arm 성공 이력 — TTL 만료/이중 소모 의심)`;
+  return raw;
+}
+
 // 레이아웃 트리에서 web 노드 url을 전부 수집(collectWebPaths 동형 순수 walk). openCastPane의 dup
 // 판정(현재 ws 트리에 cast pane 이미 있으면 새 pane 대신 포커스만)에 쓴다.
 export function collectWebUrls(node: any, out: string[] = []): string[] {
