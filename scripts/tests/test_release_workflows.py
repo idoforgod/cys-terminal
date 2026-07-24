@@ -99,7 +99,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # minisign(jedisct1) exposes only the short flag -v (no long --version); asserting
         # the long form pins a command that exits 2 on every runner. Track the working flag.
         self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign -v"))
-        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign -v"))
+        # choco의 minisign은 구버전이라 무암호 비밀키의 KDF를 못 읽어 -S 서명이 exit 2로 실패한다.
+        # Windows는 공식 0.12 win64 zip을 다이제스트 고정 설치한다(무암호 키 KDF 호환·fail-closed).
+        self.assertNotIn("choco install minisign", candidate)
+        self.assertIn(
+            "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip",
+            candidate,
+        )
+        self.assertIn(
+            "37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479", candidate
+        )
+        self.assertRegex(candidate, re.compile(r"Get-FileHash -Algorithm SHA256[\s\S]+\$exe -v"))
 
     def test_browser_runtime_is_built_and_staged_from_pinned_sources_before_signing(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")

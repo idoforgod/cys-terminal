@@ -319,16 +319,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # brew는 0.12를 붓는다(로그 실증). Windows는 0.12 고정 — 무암호 키 KDF 호환.
           brew install minisign
           minisign -v
 
+      # choco의 minisign은 구버전이라 무암호(-W) 비밀키의 KDF를 못 읽어 -S 서명이 exit 2
+      # "Unsupported key derivation function"로 실패한다(-V 검증은 통과). 공식 jedisct1 0.12
+      # win64 zip을 다이제스트 고정으로 설치해 macOS(brew 0.12)와 동일한 키 KDF 호환을 보장한다.
       - name: Install Browser Runtime minisign verifier (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install minisign --yes --no-progress
-          if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
-          minisign -v
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip'
+          $expected = '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+          $zip = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+          if ($actual -ne $expected) { throw "minisign archive digest mismatch: expected $expected got $actual" }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $exe = Join-Path $dest 'minisign-win64\x86_64\minisign.exe'
+          if (-not (Test-Path $exe)) { throw "minisign.exe not found at $exe" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $exe -Parent)
+          & $exe -v
           if ($LASTEXITCODE -ne 0) { throw 'minisign verification failed' }
 
       - name: Materialize Browser Runtime release trust inputs (macOS)
