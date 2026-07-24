@@ -585,11 +585,11 @@ jobs:
       # ★무중단 팩 채널 안전 하한(2026-07-12 오너 확정). seed-once 상태 보호(memory/·SESSION_STATE
       # 불가침)는 0.12.48+ 바이너리 코드다 — 공란이면 ≤0.12.47 구버전 pack-update가 사용자 상태를
       # vendor 골격으로 클로버한다(2026-07 실사고 계열). 새 팩이 더 새로운 바이너리 RPC에 의존할 때만 상향.
-      # ★0.13.5 상향(능력 파리티 T3·T6): 이 릴리스 팩은 boot.formation.* feed 이벤트를 방출하는데
-      #   배너 소멸 수신 핸들러(onDaemonEvent formation 인터셉트·bootbanner.ts)는 0.13.5 앱 빌드에만 있다.
+      # ★0.13.6 상향(능력 파리티 T3·T6): 이 릴리스 팩은 boot.formation.* feed 이벤트를 방출하는데
+      #   배너 소멸 수신 핸들러(onDaemonEvent formation 인터셉트·bootbanner.ts)는 0.13.6 앱 빌드에만 있다.
       #   신팩+구앱(≤0.13.3)이면 배너가 소멸 신호를 못 받아 불멸 잔존(스큐). 게이트가 구앱에 신팩 설치를 막아 차단.
       #   security-floor.txt는 오너 승인 SOT라 무접촉(정책 래칫 변경 아님 — 앱+팩 동시 레인 권위 필드만 상향).
-      PACK_MIN_BINARY: '0.13.5'
+      PACK_MIN_BINARY: '0.13.6'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -869,6 +869,10 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           PUB_DATE="$(git show -s --format=%cI "$GITHUB_REF_NAME")"
+          # 방어적 AppleDouble 제거(belt&suspenders): 상류 handoff tar 가 COPYFILE_DISABLE 로 이미
+          # 차단하지만, 어떤 경로로든 '._*' 사이드카가 유입되면 release-assemble 의 정확-집합 검증이
+          # extra 로 거부한다. 릴리스 자산이 아니므로 assemble 전에 결정론적으로 제거한다.
+          find candidate-plain -type f -name '._*' -delete
           python3 scripts/release-assemble.py \
             --version "$VERSION" \
             --input candidate-plain \

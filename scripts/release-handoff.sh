@@ -39,7 +39,10 @@ case "$MODE" in
     mkdir -p "$(dirname "$OUTPUT")"
     PARTIAL="${OUTPUT}.partial.$$"
     trap 'rm -f "$PARTIAL"' EXIT
-    tar -C "$INPUT_DIR" -czf - . | openssl enc -aes-256-cbc -salt \
+    # COPYFILE_DISABLE=1: macOS(bsdtar)가 xattr 보유 DMG(공증·quarantine·provenance)에 대해
+    # AppleDouble '._*' 사이드카를 tar에 넣는 것을 차단한다. --exclude 는 이미 존재하는 잔재도 배제.
+    # 이게 없으면 assemble 단계 release-assemble.py 의 정확-집합 검증이 '._cys_*.dmg' 를 extra 로 거부한다.
+    COPYFILE_DISABLE=1 tar -C "$INPUT_DIR" --exclude='._*' -czf - . | openssl enc -aes-256-cbc -salt \
       -pbkdf2 -iter 200000 -md sha256 -pass env:RELEASE_HANDOFF_KEY \
       -out "$PARTIAL"
     [ -s "$PARTIAL" ] || { echo "encrypted handoff is empty" >&2; exit 1; }
