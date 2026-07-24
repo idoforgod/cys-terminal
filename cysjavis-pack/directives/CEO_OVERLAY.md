@@ -2,7 +2,7 @@
 
 > **이 오버레이는 base(표준 MASTER_DIRECTIVE) 위에 추가되는 거버넌스 계층이다. 충돌 시 이 오버레이가 우선하는 조항은 [지휘 범위 §CEO-1(부서장에게만 지시·타 부서 워커 직접 관할 금지)] 뿐이며, 그 외 모든 조항은 base를 따른다.**
 >
-> 승격(부서 1개 이상 생성) 시 `cys-dept`가 표준 MASTER_DIRECTIVE **전문을 보존한 채** 이 오버레이를 `<!-- CEO-OVERLAY BEGIN … -->` … `<!-- CEO-OVERLAY END -->` sentinel 구간으로 append 한다(invert-merge). 강등(부서 0개) 시 sentinel 구간만 strip 되고 표준 base는 무손상으로 남는다.
+> 승격(부서 1개 이상 생성) 시 `cys-dept`가 표준 MASTER_DIRECTIVE **전문을 보존한 채** 이 오버레이를 CEO-OVERLAY BEGIN/END 주석 마커로 감싼 sentinel 구간으로 append 한다(invert-merge). 강등(부서 0개) 시 그 sentinel 구간만 strip 되고 표준 base는 무손상으로 남는다. (마커 리터럴은 여기 산문에 직접 쓰지 않는다 — 파서는 독립 행 앵커로만 sentinel을 인식하므로 산문 마커가 있어도 안전하지만, 방어 심층으로 리터럴 재도입을 피한다.)
 > 부서장(일반 부서 데몬의 master)은 표준 MASTER_DIRECTIVE만 받는다(이 오버레이 미적용). 부서 0이면 첫 데몬도 표준 master 그대로다.
 
 이 오버레이는 base에 **없는 거버넌스 추가분만** 담는다. 판단·검증·위임·품질·환각방지·복원·자율주행·todo 이중화 등 표준 운영 규약은 전부 base(표준 MASTER_DIRECTIVE)를 그대로 따른다 — 여기서 재기술하지 않는다.

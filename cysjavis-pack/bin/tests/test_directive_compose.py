@@ -166,8 +166,89 @@ def main():
               "recompose --no-overlay 미구현(RED) exit=%d" % code_d)
 
     shutil.rmtree(tmp, ignore_errors=True)
+
+    # ══ 리뷰어1 BLOCK 회귀 핀(fix#5): 산문 sentinel 리터럴 조기종료·왕복 오염 병리를 실제로 잡는다 ══
+    real_and_selfref_roundtrip()
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
+
+
+BEGIN_LINE = re.compile(r"(?m)^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$")
+
+
+def _demote_via_down(env, home):
+    """부서 0 으로 만들고 `cys-dept down` 을 태워 실제 ceo_demote(_ceo_strip)를 유발(리뷰어2 지적 ④)."""
+    with open(os.path.join(home, ".cys", "depts.json"), "w", encoding="utf-8") as f:
+        json.dump({"depts": {}}, f)
+    return run(env, "down", "d0")
+
+
+def _set_depts(home, n):
+    with open(os.path.join(home, ".cys", "depts.json"), "w", encoding="utf-8") as f:
+        json.dump({"depts": {("d%d" % i): {} for i in range(n)}}, f)
+
+
+def real_and_selfref_roundtrip():
+    # ── R: 실제 CEO_OVERLAY.md 파일로 promote→demote(실 ceo_demote) 왕복 byte-identical(①④) ──
+    real = os.path.join(SELF, "..", "..", "directives", "CEO_OVERLAY.md")
+    check("R0 실제 CEO_OVERLAY.md 존재", os.path.isfile(real), real)
+    if os.path.isfile(real):
+        ov = open(real, encoding="utf-8").read()
+        tmp = tempfile.mkdtemp(prefix="compose-real-")
+        env, home = setup(tmp)
+        pk = os.path.join(home, ".cys", "pack", "directives")
+        for fn in ("CEO_TEMPLATE.md", "CEO_OVERLAY.md"):
+            with open(os.path.join(pk, fn), "w", encoding="utf-8") as f:
+                f.write(ov)
+        base0 = read_md(home)                       # setup 이 쓴 표준 base(BASE_TEXT)
+        run(env, "promote-ceo")
+        comp = read_md(home)
+        check("R1 실오버레이 compose — 독립행 sentinel 정확히 1구간",
+              len(BEGIN_LINE.findall(comp)) == 1, "BEGIN 행 %d" % len(BEGIN_LINE.findall(comp)))
+        check("R2 오버레이 본문(§CEO-1) compose 에 포함", "§CEO-1" in comp)
+        code_d, out_d = _demote_via_down(env, home)
+        stripped = read_md(home)
+        check("R3 ceo_demote(down) 왕복 byte-identical(stripped == base)",
+              stripped == base0, "len=%d/%d out=%r" % (len(stripped), len(base0), out_d[-120:]))
+        check("R4 §CEO 조항 잔존 0(산문 END 조기종료 병리 차단)", "§CEO" not in stripped)
+        check("R5 dangling BEGIN/END 잔존 0", "CEO-OVERLAY" not in stripped)
+
+        # ── ③ 2왕복 누적 오염 0: promote→demote→promote→demote ──
+        _set_depts(home, 1)
+        run(env, "promote-ceo")
+        code_d2, _ = _demote_via_down(env, home)
+        s2 = read_md(home)
+        check("R6 2왕복(promote→demote×2) 후 base byte-identical·이중 append 0",
+              s2 == base0 and "CEO-OVERLAY" not in s2, "s2==base0=%s" % (s2 == base0))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── S: self-referential 픽스처 — 오버레이 본문이 sentinel 리터럴을 담아도 strip 견딤(②) ──
+    selfref = (
+        "# 자기참조 오버레이\n"
+        "§CEO-1 지휘 범위 조항.\n"
+        "이 줄은 마커 리터럴을 담는다: `<!-- CEO-OVERLAY BEGIN v1 sha256:deadbeef -->` "
+        "그리고 뒤에 `<!-- CEO-OVERLAY END -->` 리터럴이 백틱 안에.\n"
+        "또 다른 END 리터럴 <!-- CEO-OVERLAY END --> 이 줄 중간에 들어있다.\n"
+        "부서장에게만 지시.\n"
+    )
+    tmp = tempfile.mkdtemp(prefix="compose-selfref-")
+    env, home = setup(tmp)
+    pk = os.path.join(home, ".cys", "pack", "directives")
+    for fn in ("CEO_TEMPLATE.md", "CEO_OVERLAY.md"):
+        with open(os.path.join(pk, fn), "w", encoding="utf-8") as f:
+            f.write(selfref)
+    base0 = read_md(home)
+    run(env, "promote-ceo")
+    comp = read_md(home)
+    check("S1 self-ref compose — 독립행 sentinel 1구간(산문 리터럴 미오인)",
+          len(BEGIN_LINE.findall(comp)) == 1, "BEGIN 행 %d" % len(BEGIN_LINE.findall(comp)))
+    code_d, out_d = _demote_via_down(env, home)
+    stripped = read_md(home)
+    check("S2 self-ref demote 왕복 byte-identical(산문 END 조기종료 배제)",
+          stripped == base0, "len=%d/%d" % (len(stripped), len(base0)))
+    check("S3 self-ref §CEO/마커 잔존 0", "§CEO" not in stripped and "CEO-OVERLAY" not in stripped)
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -439,10 +439,17 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 #   compose/strip/recompose 3자 모두 (1)크로스플랫폼 python 락(fcntl/msvcrt — reg_upsert 패턴 재사용·
 #   인접결함 FIX-2: macOS엔 flock(1) CLI가 없어 구 `command -v flock` 가드는 무락이었다)
 #   (2)전체 신규 내용 temp+os.replace 원자교체(append-in-place 금지 — 부분 sentinel 오염 차단·Sim S2-1)를 지킨다.
-_compose_promote(){ # $1=md $2=overlay — 멱등(sentinel 존재 시 no-op)·첫 승격에만 .pre-ceo 백업
-  python3 - "$1" "$2" <<'PY'
-import sys,os,re,hashlib
-md,overlay=sys.argv[1:3]
+_compose_promote(){ # $1=md $2=overlay $3=pack — 멱등(sentinel 존재 시 no-op)·첫 승격에만 .pre-ceo 백업.
+                    # exit 0=compose(또는 no-op/인라인치유) / exit 3=거부(base 스텁·치유 소스 부재)
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys,os,re,hashlib,json
+md,overlay,pack=sys.argv[1:4]
+# ★리뷰어1 fix#1: sentinel은 반드시 '독립 행' 전체매칭(re.M·^…$)으로만 판정 — 산문(행 중간·백틱 안)의
+#   리터럴을 구조적으로 배제한다. compose가 쓰는 sentinel은 이미 독립 행이라 정합.
+BEGIN=re.compile(r'(?m)^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$')
+def _load(name):
+    try: return {h['sha256'] for h in json.load(open(os.path.join(pack,name),encoding='utf-8')).get('hashes',[])}
+    except Exception: return set()
 try:
     import fcntl
     def _lk(f): fcntl.flock(f,fcntl.LOCK_EX)
@@ -454,16 +461,32 @@ except ImportError:  # Windows: msvcrt 바이트락(파일 닫힘 시 해제)
 lf=open(md+'.promote.lock','w'); _lk(lf)
 try:
     base=open(md,encoding='utf-8').read()
-    if re.search(r'<!--\s*CEO-OVERLAY BEGIN', base):
-        sys.exit(0)                          # 멱등: 이미 compose됨(이중 append 금지)
+    if BEGIN.search(base):
+        sys.exit(0)                          # 멱등: 이미 compose됨(이중 append 금지·독립행 sentinel만 인정)
+    # ★리뷰어1 fix#4(스텁-base 승격 가드): 스텁 위에 sentinel을 붙이면 heal 전체파일 해시 탐지가 무력화된다.
+    #   base가 반쪽마스터 스텁이면 compose를 거부(exit 3)하거나, .pre-ceo가 표준 base(대장 일치)면 인라인 치유 후 진행.
+    stubs=_load('heal_hashes.json'); ledger=_load('base_hashes.json')
+    if hashlib.sha256(base.encode('utf-8')).hexdigest() in stubs:
+        pre=md+'.pre-ceo'; healed=False
+        if os.path.exists(pre):
+            pc=open(pre,encoding='utf-8').read()
+            if hashlib.sha256(pc.encode('utf-8')).hexdigest() in ledger:
+                base=pc
+                with open(md,'w',encoding='utf-8') as f: f.write(base)   # 인라인 결정론 치유(락 안·직후 재compose)
+                sys.stderr.write("[cys-dept] compose: base 스텁 감지 → .pre-ceo(표준 base·대장 일치) 인라인 치유 후 승격\n")
+                healed=True
+        if not healed:
+            sys.stderr.write("[cys-dept] compose 거부: base가 반쪽마스터 스텁 — 치유(recompose/.pre-ceo 복원) 선행 필요"
+                             "(스텁 위 sentinel append는 heal 전체파일 해시 탐지를 무력화한다).\n")
+            sys.exit(3)
     ov=open(overlay,encoding='utf-8').read()
     h=hashlib.sha256(ov.encode('utf-8')).hexdigest()
     pre=md+'.pre-ceo'                        # 레거시 다운그레이드 호환(구 ceo_demote가 cp .pre-ceo)
     if not os.path.exists(pre):
         with open(pre,'w',encoding='utf-8') as f: f.write(base)
-    sep='' if base.endswith('\n') else '\n'
+    if not base.endswith('\n'): base+='\n'   # base 정규화(왕복 byte-identical 보장 — 디렉티브는 항상 \n 종료)
     ovnl='' if ov.endswith('\n') else '\n'
-    composed=(base+sep+'<!-- CEO-OVERLAY BEGIN v1 sha256:%s -->\n'%h
+    composed=(base+'<!-- CEO-OVERLAY BEGIN v1 sha256:%s -->\n'%h
               +ov+ovnl+'<!-- CEO-OVERLAY END -->\n')
     tmp=md+'.compose.tmp.%d'%os.getpid()
     with open(tmp,'w',encoding='utf-8') as f: f.write(composed); f.flush(); os.fsync(f.fileno())
@@ -488,13 +511,15 @@ def _stubs():
     p=os.path.join(pack,'heal_hashes.json')
     try: return {h['sha256'] for h in json.load(open(p,encoding='utf-8')).get('hashes',[])}
     except Exception: return set()
+# ★리뷰어1 fix#1: sentinel 구간 매칭은 '독립 행' 앵커(re.M·^…$)로만. 비탐욕 `.*?`가 산문의 첫 END
+#   리터럴에서 조기 종료하던 치명 결함 해소 — BEGIN 행부터 실제 END 행까지 정확히 1구간만 제거.
+SENT=re.compile(r'(?ms)^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$\n.*?^<!-- CEO-OVERLAY END -->$\n?')
 lf=open(md+'.promote.lock','w'); _lk(lf)
 try:
     body=open(md,encoding='utf-8').read()
-    m=re.search(r'\n?<!--\s*CEO-OVERLAY BEGIN.*?<!--\s*CEO-OVERLAY END\s*-->[ \t]*\n?', body, re.S)
+    m=SENT.search(body)
     if m:
         base=body[:m.start()]+body[m.end():]
-        if base and not base.endswith('\n'): base+='\n'
         tmp=md+'.strip.tmp.%d'%os.getpid()
         with open(tmp,'w',encoding='utf-8') as f: f.write(base); f.flush(); os.fsync(f.fileno())
         os.replace(tmp,md)
@@ -508,10 +533,15 @@ try:
             print("[cys-dept] CEO 강등(레거시 스텁 감지 → .pre-ceo 복원·백업 보존)")
         else:
             print("[cys-dept] CEO 강등: sentinel·스텁 없음 — base 그대로(no-op)")
-    # ★인접결함 FIX-5(demote 무검증): post-verify — (a)sentinel 제거 확인 (b)반쪽마스터(스텁) 잔존 검사(C03 상당)
+    # ★리뷰어1 fix#2(post-verify 강화·C6 침묵 금지): strip 후 ①행-시작 sentinel(BEGIN/END) 잔존
+    #   ②오버레이 고유 헤딩(§CEO-1) 잔존이면 stderr + 비0 exit(침묵 통과 차단). ③스텁 잔존은 WARN.
     final=open(md,encoding='utf-8').read()
-    if re.search(r'<!--\s*CEO-OVERLAY BEGIN', final):
-        sys.stderr.write("[cys-dept] WARN: demote 후 sentinel 잔존 — strip 미완(수동 점검)\n")
+    bad=[]
+    if re.search(r'(?m)^<!-- CEO-OVERLAY (BEGIN|END)', final): bad.append("sentinel 행 잔존(dangling)")
+    if "§CEO-1" in final: bad.append("오버레이 고유 헤딩(§CEO-1) 잔존")
+    if bad:
+        sys.stderr.write("[cys-dept] ERROR: demote 불완전 — %s (C6 침묵 금지·수동 점검 필요)\n"%", ".join(bad))
+        sys.exit(4)
     if hashlib.sha256(final.encode('utf-8')).hexdigest() in _stubs():
         sys.stderr.write("[cys-dept] WARN: demote 후 base가 반쪽마스터(스텁) — 치유(cys doctor --fix) 필요\n")
 finally: lf.close()
@@ -538,10 +568,12 @@ def _ledger():
     p=os.path.join(pack,'base_hashes.json')
     try: return {h['sha256'] for h in json.load(open(p,encoding='utf-8')).get('hashes',[])}
     except Exception: return set()
+# ★리뷰어1 fix#1: recompose strip도 독립-행 앵커 sentinel만 매칭(산문 리터럴 배제).
+SENT=re.compile(r'(?ms)^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$\n.*?^<!-- CEO-OVERLAY END -->$\n?')
 lf=open(md+'.promote.lock','w'); _lk(lf)
 try:
     body=open(md,encoding='utf-8').read()
-    m=re.search(r'\n?<!--\s*CEO-OVERLAY BEGIN.*?<!--\s*CEO-OVERLAY END\s*-->[ \t]*\n?', body, re.S)
+    m=SENT.search(body)
     base=(body[:m.start()]+body[m.end():]) if m else body
     if base and not base.endswith('\n'): base+='\n'
     # base 교체: base 부분 sha가 표준 대장(base_hashes)에 있을 때만(사용자 수정본 보호). 소스=.pristine 최신 표준.
@@ -575,10 +607,10 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   local ceo="$PACK_DEFAULT/directives/CEO_OVERLAY.md"
   [ -f "$ceo" ] || ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 오버레이 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
-  # ★인접결함 FIX-1(cmp 소급함정): 구 `cmp -s md ceo`는 compose 산출물(base+overlay)이 overlay와
-  #   절대 바이트동일이 아니라 영구 오탐이었다. sentinel(CEO-OVERLAY BEGIN) 존재검사로 대체 —
-  #   존재=이미 compose 승격됨 → 멱등 no-op(PENDING 청소).
-  if grep -q "CEO-OVERLAY BEGIN" "$md" 2>/dev/null; then rm -f "$CEO_PENDING" 2>/dev/null || true; return 0; fi
+  # ★인접결함 FIX-1(cmp 소급함정)+리뷰어1 fix#1: 구 `cmp -s md ceo`는 compose 산출물(base+overlay)이
+  #   overlay와 절대 바이트동일이 아니라 영구 오탐이었다. **독립 행 sentinel** 존재검사로 대체(산문
+  #   리터럴 배제) — 존재=이미 compose 승격됨 → 멱등 no-op(PENDING 청소).
+  if grep -qE '^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$' "$md" 2>/dev/null; then rm -f "$CEO_PENDING" 2>/dev/null || true; return 0; fi
   if [ ! -f "$md.pre-ceo" ] && [ ! -f "$BOOT_MARKER" ]; then
     # PENDING: 부서 생성 자체는 성공 유지(return 0). 침묵 금지 — feed(비대기·보조)+stderr 고지,
     # GUI 상시 배지는 ceo-pending 파일 존재로 렌더(WP-2/T6). 해소=부트 ⑦ one-shot 또는 차기 lifecycle.
@@ -600,7 +632,14 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   #     크로스플랫폼 락 + sentinel 멱등 이중방어로 실효 직렬화.
   #   FIX-3(F1 revert 루프): 통복원(cp)이 아니라 sentinel 구획이라, 이후 demote가 base 개정을 되돌리지
   #     않는다(strip만) — promote/demote 왕복이 base 갱신을 삼키던 루프를 구조적으로 해소.
-  _compose_promote "$md" "$ceo"
+  #   리뷰어1 fix#4: base 스텁이면 _compose_promote가 exit 3(거부) — 부서 lifecycle은 유지(PENDING 유사)하되
+  #     C6 침묵 금지로 feed+stderr 표면화. 치유(recompose/.pre-ceo) 선행 후 재승격.
+  if ! _compose_promote "$md" "$ceo" "$PACK_DEFAULT"; then
+    env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(base 스텁)" \
+      --body "base MASTER_DIRECTIVE가 반쪽마스터 스텁으로 감지되어 CEO 승격을 보류했습니다. 치유(cys doctor --fix 또는 recompose/.pre-ceo 복원) 선행이 필요합니다." >/dev/null 2>&1 || true
+    echo "[cys-dept] CEO 승격 보류 — base 반쪽마스터 스텁(치유 선행 필요·C6 표면화)" >&2
+    return 0
+  fi
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(invert-merge·base 보존·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
@@ -1095,9 +1134,9 @@ EOF
     # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부(md==CEO 템플릿 또는 .pre-ceo 백업 존재)를 post-verify해
     # 미승격이면 exit 5로 truthful 실패를 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
     _md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
-    # ★인접결함 FIX-1(cmp 소급함정·post-verify): compose 산출물은 overlay와 바이트동일이 아니라
-    #   구 `cmp -s md ceo`는 영구 오탐. sentinel 존재(compose 승격) 또는 .pre-ceo 백업 존재로 판정.
-    if grep -q "CEO-OVERLAY BEGIN" "$_md" 2>/dev/null || [ -f "$_md.pre-ceo" ]; then
+    # ★인접결함 FIX-1(cmp 소급함정·post-verify)+리뷰어1 fix#1: 독립 행 sentinel 존재(compose 승격)
+    #   또는 .pre-ceo 백업 존재로 판정(산문 리터럴 배제).
+    if grep -qE '^<!-- CEO-OVERLAY BEGIN v1 sha256:[0-9a-f]{64} -->$' "$_md" 2>/dev/null || [ -f "$_md.pre-ceo" ]; then
       :   # 승격 확정(sentinel 또는 백업 존재)
     else
       echo "[cys-dept] CEO 승격 미완(보류) — base master 미부트(.master-bootstrapped 부재) 등. base 부트 완료 후 재시도." >&2
