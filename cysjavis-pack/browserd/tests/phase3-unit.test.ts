@@ -9,6 +9,8 @@ import {
   navigableUrlError,
   clampViewportSide,
   fitViewport,
+  fitHumanViewport,
+  FIT_MIN_WIDTH,
   jpegQualityFor,
   mapInput,
   msgNav,
@@ -163,6 +165,59 @@ test("4-T-5 fitViewport: 캡 이하는 그대로 · 종횡비 보존 · jpeg 품
   expect(jpegQualityFor(1280, 800)).toBe(75);
   expect(jpegQualityFor(1600, 900)).toBeLessThan(75);
   expect(jpegQualityFor(1920, 1080)).toBeLessThanOrEqual(jpegQualityFor(1600, 900));
+});
+
+// ════════ 4-T-5 확장: 사람 뷰포트 fit-to-width ════════
+test("4-T-5 fitHumanViewport: 좁은 pane 은 데스크톱 폭까지 확대 — ★네이버 실사고 재현(810 폭에서 1080 전폭)", () => {
+  // 오너 실사고: pane CSS 810px 폭에서 네이버(최소 ≈1080px)가 사이트 차원에서 우측 절단.
+  // 이 수정의 정의 = 810 폭 pane 에서 1080 전폭이 보이게 되는 것.
+  const fit = fitHumanViewport(810, 1310);
+  // k=1080/810=1.3333 → h=round(1310×1080/810)=1747 · 면적 1080×1747=1.886MP<2.1MP → 그대로.
+  expect(fit).toEqual({ width: FIT_MIN_WIDTH, height: 1747 });
+});
+
+test("4-T-5 fitHumanViewport: 넓은 pane 은 무확대(fitViewport 그대로 통과)", () => {
+  expect(fitHumanViewport(1400, 900)).toEqual(fitViewport(1400, 900)); // {1400,900} — 면적 1.26MP
+});
+
+test("4-T-5 fitHumanViewport: 경계 — FIT_MIN_WIDTH 이상은 그대로, 1px 미만이면 확대 발동", () => {
+  expect(fitHumanViewport(FIT_MIN_WIDTH, 800)).toEqual({ width: 1080, height: 800 }); // 경계 포함=무확대
+  const narrow = fitHumanViewport(FIT_MIN_WIDTH - 1, 800); // 1079 → 확대 발동
+  expect(narrow.width).toBe(FIT_MIN_WIDTH);
+  // k=1080/1079 → h=round(800×1080/1079)=801 · 면적 865,080<2.1MP → 그대로.
+  expect(narrow.height).toBe(801);
+});
+
+test("4-T-5 fitHumanViewport: 면적 캡 상호작용 — 확대 후 2.1MP 초과분은 fitViewport 가 종횡비 유지로 축소", () => {
+  // (500,1300): k=1080/500=2.16 → h=round(1300×2.16)=2808 → fitViewport(1080,2808).
+  //   면적 1080×2808=3,032,640>2,100,000 → k2=sqrt(2.1M/3.03264M)=0.8321459.
+  //   width=floor(1080×0.8321459)=floor(898.72)=898 · height=floor(2808×0.8321459)=floor(2336.67)=2336.
+  const fit = fitHumanViewport(500, 1300);
+  expect(fit).toEqual({ width: 898, height: 2336 });
+  // 면적 캡 준수.
+  expect(fit.width * fit.height).toBeLessThanOrEqual(VIEWPORT_MAX_AREA);
+  // 종횡비 보존(floor 로 ±1px 오차 이내로 1080/2808 을 유지 — 깨지면 mapInput letterbox 와 어긋난다).
+  expect(Math.abs(fit.width / fit.height - FIT_MIN_WIDTH / 2808)).toBeLessThan(0.001);
+});
+
+test("4-T-5 fitHumanViewport: 퇴화 입력은 fitViewport 폴백(확대 없음)", () => {
+  expect(fitHumanViewport(0, 500)).toEqual(fitViewport(0, 500));   // w<=0 → 폴백
+  expect(fitHumanViewport(800, 0)).toEqual(fitViewport(800, 0));   // h<=0 → 폴백(확대 안 함)
+});
+
+// ════════ 4-T-5 reset 정합 — 에이전트 RPC viewport action=reset 도 사람 경로와 동일 fit 정책 ════════
+// reset 경로는 순수함수로 분리돼 있지 않고 RPC 디스패치에 인라인이다 → 서버 배선을 grep 으로 검증한다.
+test("4-T-5 reset 정합: viewport action=reset 은 fitHumanViewport 로 복원(사람 경로와 동일)·리터럴 계약은 불변", () => {
+  const server = readFileSync(join(import.meta.dir, "..", "server.ts"), "utf8");
+  // reset 블록 추출: `=== "reset"` 부터 그 블록의 return 까지.
+  const start = server.indexOf('=== "reset"');
+  expect(start).toBeGreaterThan(-1);
+  const resetBlock = server.slice(start, server.indexOf("pinned: false", start));
+  // reset=사람 뷰포트 복원 → fit-to-width 를 통과시켜 applyViewport 한다.
+  expect(resetBlock).toContain("fitHumanViewport(");
+  expect(resetBlock).toMatch(/applyViewport\(cid, bv\.width, bv\.height\)/);
+  // 에이전트 리터럴 계약(width/height 지정)은 fit 없이 그대로 적용 — 회귀 0.
+  expect(server).toContain("await applyViewport(cid, w, h)");
 });
 
 // ════════ 4-S-1-4 rebind 직후 입력 무시 ════════

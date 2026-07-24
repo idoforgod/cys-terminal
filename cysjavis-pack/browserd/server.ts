@@ -43,6 +43,7 @@ import {
   navErrorMessage,
   navigableUrlError,
   fitViewport,
+  fitHumanViewport,
   jpegQualityFor,
   msgNav,
   msgTabs,
@@ -2087,7 +2088,10 @@ async function dispatchVerb(verb: string, args: any, cid: string): Promise<any> 
         // 지정 해제 → 사람이 마지막으로 요청한 pane 크기로 복귀(없으면 기본값).
         c.viewportPin = null;
         const back = c.viewportHuman || DEFAULT_VIEWPORT;
-        await applyViewport(cid, back.width, back.height);
+        // reset=사람 뷰포트 복원 — 사람 경로와 동일 정책(fit-to-width) 적용.
+        // 에이전트 리터럴 계약은 width/height 지정 경로(아래)에만 해당한다.
+        const bv = fitHumanViewport(back.width, back.height);
+        await applyViewport(cid, bv.width, bv.height);
         return { context: cid, viewport: c.viewport, pinned: false };
       }
       const w = Number(args.width);
@@ -2645,10 +2649,13 @@ const server = Bun.serve({
             touch();
             // ★4-S-8: 창 크기 변경은 조작 의사가 아니다 — control 을 절대 acquire 하지 않는다.
             const c = contexts.get(cid)!;
+            // viewportHuman 은 pane 실측 **원요청**을 기록한다(reset 복귀 대상). 실제 적용값은
+            // 아래 fit 결과로 별도다 — 좁은 pane 은 데스크톱 폭까지 확대해 렌더한다(fit-to-width).
             c.viewportHuman = { width: m.width, height: m.height };
             if (m.unpin) c.viewportPin = null; // 툴바 "해제" — 에이전트 고정을 사람이 풀 수 있다
             if (c.viewportPin) break; // 고정 중이면 사람 리사이즈는 무시(기록만 해둔다)
-            await applyViewport(cid, m.width, m.height);
+            const hv = fitHumanViewport(m.width, m.height); // 사람 경로 전용 fit-to-width(에이전트 pin 불변)
+            await applyViewport(cid, hv.width, hv.height);
             break;
           }
           case "dialog-reply": {

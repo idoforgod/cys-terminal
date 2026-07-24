@@ -496,6 +496,18 @@ export function fitViewport(w: number, h: number): { width: number; height: numb
   return { width, height };
 }
 
+// 사람(pane) 뷰포트 fit-to-width(4-T-5 확장): pane 폭이 FIT_MIN_WIDTH 미만이면
+// 데스크톱 고정폭 사이트(≈1080px)가 사이트 차원에서 잘린다(headless 는 가로 스크롤바도
+// 안 보인다 — 2026-07-25 오너 실사고). 뷰포트를 FIT_MIN_WIDTH × 비례 높이로 올려 렌더하면
+// child contain-fit 이 pane 에 전폭을 축소 표시한다(좌표는 mapInput letterbox 역변환이 흡수).
+// 에이전트 pin 뷰포트에는 적용하지 않는다 — 에이전트 지정값은 문자 그대로가 계약.
+export const FIT_MIN_WIDTH = 1080;
+export function fitHumanViewport(w: number, h: number): { width: number; height: number } {
+  if (w >= FIT_MIN_WIDTH || !(w > 0 && h > 0)) return fitViewport(w, h);
+  const k = FIT_MIN_WIDTH / w;
+  return fitViewport(FIT_MIN_WIDTH, Math.round(h * k));
+}
+
 // ★DPR(devicePixelRatio) 결정 — 4-S-9 가 "곱할지 말지 명시적으로 결정하고 근거를 남기라"고 한
 //   항목이다. **1차는 DPR 미반영으로 확정한다**(master 판정).
 //   근거: ①Retina(devicePixelRatio=2)에서 캡에 DPR 을 곱하면 면적이 4배가 되어 면적 상한
