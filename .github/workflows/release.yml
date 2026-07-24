@@ -312,7 +312,7 @@ jobs:
         run: |
           set -euo pipefail
           brew install minisign
-          minisign --version
+          minisign -v
 
       - name: Install Browser Runtime minisign verifier (Windows)
         if: matrix.platform == 'windows-latest'
@@ -320,7 +320,7 @@ jobs:
         run: |
           choco install minisign --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'minisign installation failed' }
-          minisign --version
+          minisign -v
           if ($LASTEXITCODE -ne 0) { throw 'minisign verification failed' }
 
       - name: Materialize Browser Runtime release trust inputs (macOS)

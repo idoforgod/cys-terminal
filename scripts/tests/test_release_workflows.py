@@ -96,8 +96,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertGreaterEqual(candidate.count(name), 2, f"missing cross-platform wiring: {name}")
         self.assertIn("CYS_BROWSER_RUNTIME_SECRET_KEY_B64", candidate)
         self.assertIn("CYS_BROWSER_RUNTIME_PUBLIC_KEY_B64", candidate)
-        self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign --version"))
-        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign --version"))
+        # minisign(jedisct1) exposes only the short flag -v (no long --version); asserting
+        # the long form pins a command that exits 2 on every runner. Track the working flag.
+        self.assertRegex(candidate, re.compile(r"brew install minisign[\s\S]+minisign -v"))
+        self.assertRegex(candidate, re.compile(r"choco install minisign[\s\S]+minisign -v"))
 
     def test_browser_runtime_is_built_and_staged_from_pinned_sources_before_signing(self) -> None:
         candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
