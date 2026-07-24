@@ -1091,17 +1091,17 @@ def cmd_self_test():
     try:
         # ── t1: base/dept 판정 매트릭스(unix base·unix dept·win pipe) ──
         assert _socket_is_base("") is True, "unset=base"
-        assert _socket_is_base("/Users/x/.local/state/cys/cys.sock") is True, "unix base"
-        assert _socket_is_base("/Users/x/.local/state/cys-dept-dept-1/cys.sock") is False, \
+        assert _socket_is_base("/tmp/x/.local/state/cys/cys.sock") is True, "unix base"
+        assert _socket_is_base("/tmp/x/.local/state/cys-dept-dept-1/cys.sock") is False, \
             "unix dept 소켓이 base로 오판(원 버그 — basename cys.sock 동일)"
-        assert _socket_is_base("/Users/x/.local/state/cys-dept-ceo/cys.sock") is False, "unix dept(ceo)"
+        assert _socket_is_base("/tmp/x/.local/state/cys-dept-ceo/cys.sock") is False, "unix dept(ceo)"
         assert _socket_is_base("\\\\.\\pipe\\cys") is True, "win base pipe(basename 보존)"
         assert _socket_is_base("\\\\.\\pipe\\cys-dept-foo") is False, "win dept pipe"
         # ★보수성 복원(아키텍트 성찰): 커스텀 소켓은 비-base·비-dept — base 특권(마커·티켓 발급) 없음
         assert _socket_is_base("/tmp/whatever.sock") is False, \
             "커스텀 소켓이 base로 오판(과관용 — 마커 write·티켓 발급 특권 오부여)"
         assert _socket_dept("/tmp/whatever.sock") is None, "커스텀 소켓은 비-dept(구동작 보존)"
-        assert _socket_is_base("/Users/x/.local/state/cys/cys") is True, "basename cys(무확장)도 base"
+        assert _socket_is_base("/tmp/x/.local/state/cys/cys") is True, "basename cys(무확장)도 base"
         # ★불량 레인(R1-LOW-2): 빈 부서명(cys-dept-/)은 비-base·dept None — malformed로 명시 검출
         assert _socket_is_base("/s/cys-dept-/cys.sock") is False, "빈 부서명이 base로 오판"
         assert _socket_dept("/s/cys-dept-/cys.sock") is None, "빈 부서명 dept가 None 아님"
@@ -1112,8 +1112,8 @@ def cmd_self_test():
         assert _socket_malformed_dept("\\\\.\\pipe\\cys-dept-") is True, "win 빈 부서명 pipe 미검출"
 
         # ── t2: 락 키 유일성(부서 basename 동일 → 전체 경로 유일화) ──
-        k1 = _sanitize_sock_key("/Users/x/.local/state/cys-dept-dept-1/cys.sock")
-        k2 = _sanitize_sock_key("/Users/x/.local/state/cys-dept-dept-2/cys.sock")
+        k1 = _sanitize_sock_key("/tmp/x/.local/state/cys-dept-dept-1/cys.sock")
+        k2 = _sanitize_sock_key("/tmp/x/.local/state/cys-dept-dept-2/cys.sock")
         kb = _sanitize_sock_key("")
         assert k1 != k2, "동일 basename 두 부서 소켓이 같은 락 키(원 버그)"
         assert kb == _sanitize_sock_key("base") == "base", "미설정=base 키"
@@ -1128,7 +1128,7 @@ def cmd_self_test():
         # ★락 키 base 정규화(R1-LOW-4): env 미설정과 base 경로 명시가 같은 base 데몬에 다른 락을
         # 주던 선재결함 — 싱글플라이트 키는 base면 단일 'base'로 수렴해야 한다.
         assert _singleflight_key("") == "base", "미설정 락 키≠base"
-        assert _singleflight_key("/Users/x/.local/state/cys/cys.sock") == "base", \
+        assert _singleflight_key("/tmp/x/.local/state/cys/cys.sock") == "base", \
             "base 경로 명시가 'base' 키로 정규화되지 않음(같은 데몬에 다른 락)"
         assert _singleflight_key("/s/cys-dept-dept-1/cys.sock") != "base", "부서 락 키가 base로 수렴"
         assert _singleflight_key("/tmp/whatever.sock") != "base", "커스텀 소켓 락 키가 base로 수렴"
@@ -1216,8 +1216,8 @@ def cmd_self_test():
         assert _sid_norm("") is None, "빈값이 None 아님"
         assert _sid_norm(None) is None, "None이 None 아님"
         assert _sid_norm("master") is None, "비숫자가 None 아님"
-        _LIST_OK = ("surface:6\trole=master\tpid=101\texited=false\tsurface 6\t/Users/x\n"
-                    "surface:7\trole=worker\tpid=102\texited=false\tsurface 7\t/Users/x")
+        _LIST_OK = ("surface:6\trole=master\tpid=101\texited=false\tsurface 6\t/tmp/x\n"
+                    "surface:7\trole=worker\tpid=102\texited=false\tsurface 7\t/tmp/x")
         h, ok = _parse_role_holder(_LIST_OK)
         assert ok and h == "6", "정상 보유자 추출 실패: %r,%r" % (h, ok)
         # 부재(master 행 없음) → (None, True)
