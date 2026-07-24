@@ -58,6 +58,11 @@ PAUSE_HONORED = True
 
 
 def _state_root():
+    """편성 상태·락 저장 루트: <CYS_STATE_DIR or ~/.cys/state>/formation.
+    ★불변식(리뷰어1 권고): 소켓키 싱글플라이트 상호배제는 **모든 트리거(cys-dept·bootstrap·schedule
+    심박)가 동일한 CYS_STATE_DIR을 볼 때만** 성립한다 — 락 파일 경로가 여기서 파생되므로. 따라서 이
+    env를 트리거별로 명시 재설정하지 마라(데몬이 자식 pane에 전파하는 값을 상속만 한다). 테스트는
+    CYS_STATE_DIR을 temp로 고정해 격리하되, 프로덕션 트리거는 env를 건드리지 않는다."""
     return os.path.join(
         os.environ.get("CYS_STATE_DIR") or os.path.join(
             os.path.expanduser("~"), ".cys", "state"),

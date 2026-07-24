@@ -3,6 +3,14 @@
   "file": "directives/MASTER_DIRECTIVE.md",
   "hashes": [
     {
+      "sha256": "4f3d34c3ace6bdc8cbdf8eb02fd243e1c9c00cb6441637b7876ae4ba04c975f4",
+      "commit": "baf70349890da1b7c725f63198495004e35aa8e9",
+      "size": 35797,
+      "date": "2026-07-24",
+      "describe": "v0.13.3-5-gbaf7034 (feat/capability-parity T2)",
+      "note": "MASTER_DIRECTIVE W2 ④-c 티켓 서술 제거판 — 부서 레인 조건화 상비 편성으로 재저작(CEO 티켓 게이트 폐지). recompose 화이트리스트 등재(새 base를 사용자 수정본으로 오인 방지)."
+    },
+    {
       "sha256": "c058e9a819cd3c3d400ec658d70cc759da077e94cb61112204c123f92c000a99",
       "commit": "3152e62978e12dde7ea08c060aba92b595b5d464",
       "size": 35749,

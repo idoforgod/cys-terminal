@@ -38,7 +38,7 @@
    추가 리뷰어로 선택 기동) 지침 주입·프롬프트 대기까지 완료한다(미설치 CLI 자동 건너뜀 ·
    이미 가동 중인 역할 중복 기동 없음). **"필요할 때 띄우겠다"로 미루지 마라** — 이 4종이 떠야
    '프로젝트 실행 준비 완료'다. 주소: `--to cso`/`--to worker`/`--to reviewer-gemini`/
-   `--to reviewer-codex`(+`--to reviewer-grok`). **부서 레인은 ④-c 분기가 우선한다(CEO 티켓 게이트)**.
+   `--to reviewer-codex`(+`--to reviewer-grok`). **부서 레인도 ④-c 조건화 상비 편성으로 수렴한다(W2)**.
    ④-b **리뷰어 감지·무구독 폴백 (멈춤 금지 · 오너 2026-06-14)**: `cys boot`가 미설치
    리뷰어를 건너뛰면 리뷰어 0개로 check가 영영 실패해 부트가 멈춘다. 이를 막기 위해
    `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" boot-reviewers` 를
@@ -47,14 +47,15 @@
    자동 폴백** 기동한다. agy·codex는 *기본 전제*일 뿐 절대 전제가 아니다(다른 임무 부여 가능).
    대체 시 벤더 다양성이 약해지므로 REVIEWER_DIRECTIVE §6(페르소나·렌즈·익명화)으로 보완하고,
    구동 보고(⑥)에 대체 사실을 정직히 라벨링한다.
-   ④-c **부서 레인 분기 (CEO 티켓 게이트 · 오너 2026-07-16 D1 옵션 1')**: 부서 레인(부서 소켓)의
-   팀 기동은 **CEO 발급 티켓 + 결손 기준 자원 게이트 통과 시에만** 자동 수행된다. 티켓 부재/만료면
-   **팀 기동만 생략하고 부서장이 단독 각성해 대기**한다(역할 등록·프리플라이트는 정상·실패 아님).
-   티켓 발급은 본부(base) master에서 `javis_bootstrap.py issue-ticket --dept <name>`(24h·1회성)로 한다.
-   본부(base) 레인 팀 기동은 티켓 불요(기존 동작 — 단, 결손 기준 자원 게이트는 base 포함 전
-   레인에 적용된다). 이 분기는 훅·javis_bootstrap.py가 결정론으로
-   집행하므로 LLM이 재추론하지 않는다. **"부서장은 무조건 단독 대기"라는 규칙은 폐기됐다** — 부서장도
-   티켓만 발급되면 4종 팀을 갖는다(단독 대기는 각성 기본값이 아니라 티켓 부재 시의 강등 상태다).
+   ④-c **부서 레인 조건화 상비 편성 (W2 · 오너 2026-07-24 · 구 CEO 티켓 게이트 폐지)**: 부서 레인
+   (부서 소켓)도 본부(base)와 **동일하게** `javis_formation.py`(ensure)가 **설치된 CLI 기준으로
+   조건화 상비 편성**한다 — master + 4종 의무 노드(cso·worker·reviewer-gemini·reviewer-codex)를
+   설치된 만큼 즉시 최대 편성한다. 미설치 CLI가 있는 역할은 **'편성 대기(pending)'로 기록**되고 해당
+   CLI 설치 시 **자동으로 편성이 완결**된다(빈 셸 master 자리는 유지 — 팀 없이도 master 단독 사용
+   가능). 결손 기준 자원 게이트는 base 포함 전 레인에 적용된다. **구 'CEO 발급 티켓 필수 · 티켓
+   부재=부서장 단독 각성 강등' 교리는 폐기됐다** — `issue-ticket`은 deprecated no-op이며 부서 팀
+   기동에 티켓이 필요하지 않다. 이 분기는 훅·javis_bootstrap.py·javis_formation.py가 결정론으로
+   집행하므로 LLM이 재추론하지 않는다.
    **4종 생존은 결정론으로 확인한다** —
    `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" check`
    가 READY를 낼 때까지 '준비 완료'를 선언하지 마라(눈대중 금지). 부재 노드가 있으면 재기동한다.
