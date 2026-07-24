@@ -178,11 +178,20 @@ fn random_secret_hex() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// invoke 초기화 스크립트에 push_str 연결되므로 **반드시 `;`로 시작**해야 한다 — 선행
+/// ipc-protocol.js가 `})()`(식)로 끝나 ASI가 발동하지 않고, `(`로 시작하면 호출 연쇄로
+/// 삼켜져 인터셉터가 통째로 미설치된다(v0.13.6 실사고). 경계 계약은 동파일 테스트
+/// `activation_script_survives_ipc_protocol_concatenation`이 봉쇄한다.
+/// 표식 `__CYS_BROWSER_ACTIVATION__`은 진단 전용(installed→armed-ok|arm-failed:) —
+/// 권위 없음(판정자는 백엔드 consume). capability는 클로저 격리 유지. arm 실패도 클릭을
+/// 재생한다 — 무반응 버튼 대신 백엔드의 정확한 거부 사유가 UI 배관으로 노출되게.
 fn browser_activation_initialization_script(capability: &str) -> String {
     format!(
-        r##"(() => {{
+        r##";(() => {{
   'use strict';
   const capability = '{capability}';
+  const mark = (s) => {{ try {{ window.__CYS_BROWSER_ACTIVATION__ = s; }} catch (_) {{}} }};
+  mark('installed');
   const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
   const nativeClick = HTMLElement.prototype.click;
   document.addEventListener('click', (event) => {{
@@ -194,8 +203,8 @@ fn browser_activation_initialization_script(capability: &str) -> String {
     event.preventDefault();
     event.stopImmediatePropagation();
     invoke('arm_browser_native_activation', {{ bootstrapCapability: capability }})
-      .then(() => nativeClick.call(target))
-      .catch(() => undefined);
+      .then(() => {{ mark('armed-ok'); nativeClick.call(target); }})
+      .catch((e) => {{ mark('arm-failed: ' + e); nativeClick.call(target); }});
   }}, true);
 }})();"##
     )
@@ -3763,6 +3772,46 @@ mod tests {
         assert_eq!(script.matches(&capability).count(), 1);
         assert!(!script.contains("window.browser"));
         assert!(!script.contains("globalThis.browser"));
+        assert!(script.starts_with(';'), "push_str 연결 경계 — 파스 분리자 필수");
+        assert!(script.contains("__CYS_BROWSER_ACTIVATION__"));
+        assert!(script.contains("arm-failed"));
+    }
+
+    /// tauri Builder::append_invoke_initialization_script는 push_str 문자열 연결이고, 선행
+    /// 기본 스크립트(ipc-protocol.js)는 `})()` + 개행(식)으로 끝난다(2.11.2 실측). 뒤 스크립트가
+    /// 식-연속 토큰으로 시작하면 ASI 미발동으로 `})()\n(...)` 호출 연쇄가 되어 **통째로 삼켜진다**
+    /// (v0.13.6 실사고 — 인터셉터 영구 미설치). 파서 의존성 없이 술어로 경계를 봉쇄한다:
+    /// `)` 뒤에 식을 잇는 시작 토큰이면 위험. 안전 충분조건은 첫 바이트 `;`(빈 문장 분리자).
+    fn concatenation_swallow_hazard(appended: &str) -> bool {
+        matches!(
+            appended.trim_start().chars().next(),
+            Some('(' | '[' | '`' | '.' | '+' | '-' | '*' | '/' | ',' | '?')
+        )
+    }
+
+    #[test]
+    fn activation_script_survives_ipc_protocol_concatenation() {
+        let script = browser_activation_initialization_script(&"c".repeat(64));
+        assert!(
+            !concatenation_swallow_hazard(&script),
+            "활성화 스크립트가 ipc-protocol.js 말미의 식에 흡수된다"
+        );
+        // trim 이전의 실제 첫 바이트가 `;`여야 결정론이 완성된다(공백 시작도 불허)
+        assert_eq!(script.as_bytes().first(), Some(&b';'));
+    }
+
+    #[test]
+    fn concatenation_detector_catches_the_original_swallow_bug() {
+        // 음성 대조군(계측 타당성 게이트) — v0.13.6 실사고 형태(`;` 부재)를 탐지기가 실제로
+        // 잡는지 스스로 증명한다. 이 테스트가 없으면 탐지기 자체의 무력화를 알 수 없다.
+        let current = browser_activation_initialization_script(&"c".repeat(64));
+        let buggy = current
+            .strip_prefix(';')
+            .expect("양성 전제: 현행 스크립트는 ;로 시작");
+        assert!(
+            concatenation_swallow_hazard(buggy),
+            "탐지기가 원본 결함(호출 연쇄 삼킴)을 잡지 못하면 계측 무효"
+        );
     }
 
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
