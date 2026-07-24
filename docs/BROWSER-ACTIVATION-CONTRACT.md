@@ -202,6 +202,19 @@ arm→consume이 2s를 초과해 "trusted native Browser activation expired"를 
 클릭은 통과). **계약**: `NATIVE_ACTIVATION_TTL_MS = 10_000`. 여전히 one-time·window-bound 단일
 소모라 보안 성질(재생 불가)은 불변이다.
 
+**⑥ 등록은 갱신 가능 자원 — 데몬 재시작 시 대장 소실 → 낡은 세션 거부 시 자가 회복 (v0.13.10
+실사고)** — 브로커(cysd) 등록 대장(`gui_peers.sessions`)은 **데몬 메모리**에 있어 데몬 재시작·업데이트
+후 재가동 시 소실된다. 그런데 GUI는 부팅 시 1회 등록한 세션을 계속 제시하므로, 데몬만 재시작되면
+브로커가 `issue_gesture`를 `GUI peer has no broker-owned registration`(코드 `GUI_NOT_REGISTERED`)으로
+거부해 "BROWSER_DISABLED_SAFE"가 **간헐**(GUI 재시작하면 해소 → 됐다안됐다) 발생한다. ④의 지연
+재시도는 세션이 비어 있을 때만 발동하므로 낡은 세션이 남아있는 이 경우엔 발동하지 못한다.
+**계약**: 세션 저장소는 재설정 가능한 `RwLock<Option<String>>`이며(OnceLock 회귀 금지 — 재설정 불가로
+v0.13.10 실사고 재발), `ensure_browserd_cast`는 issue_gesture가 등록 소실성 거부(`main.rs`
+`BROKER_REGISTRATION_LOST_MARKER = "no broker-owned registration"` 부분열 매칭)로 실패하면 세션을
+비우고 `register_browser_gui_peer()`를 **1회 재실행**한 뒤 issue_gesture를 **1회만 재시도**한다. 재시도도
+실패하면 그 에러로 fail-closed(**무한루프 금지** — 재등록·재시도 각 1회 한정). one-time activation은
+함수 초입에서 이미 consume된 뒤이므로 재시도 경로는 rpc만 다시 태우며 **새 클릭이 필요 없다**.
+
 **집행 테스트** (`authority_broker/mod.rs` `#[cfg(all(test, target_os = "macos"))]`):
 1. **양성** `gui_code_requirement_compiles` — `GUI_CODE_REQUIREMENT`(순수 형태)가 `csreq -r -t`로
    컴파일(exit 0)되고 codesign `-R=` 경로에서도 파스 에러가 아님을 확인.
@@ -210,6 +223,10 @@ arm→consume이 2s를 초과해 "trusted native Browser activation expired"를 
    게이트). ※ `csreq`는 두 형태를 모두 받아들여 결함을 숨기므로(실측), 음성 대조군은 반드시
    codesign 기반이어야 한다. TTL은 `native_browser_activation_is_window_bound_ttl_and_single_consume`
    (`main.rs`)가 상수 기준으로 만료 경계를 집행한다.
+3. **판별 문자열 정합**(⑥) `broker_registration_lost_marker_matches_broker_source`(`main.rs`) —
+   `include_str!`로 브로커 소스를 읽어 GUI 판별 부분열 `BROKER_REGISTRATION_LOST_MARKER`가 브로커
+   메시지 원문(`GUI peer has no broker-owned registration`)의 부분열임을 컴파일 시점 임베드로 검증한다.
+   브로커 메시지가 바뀌면 이 테스트가 깨져 자가 회복 미발동을 조기에 잡는다.
 
 ---
 

@@ -82,7 +82,16 @@ async fn connect() -> Result<Stream, String> {
 type ConnCell = std::sync::Arc<tokio::sync::Mutex<Option<tokio::io::BufReader<Stream>>>>;
 static RPC_POOL: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, ConnCell>>> =
     std::sync::OnceLock::new();
-static BROWSER_APP_SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+// GUI가 부팅 시 브로커(cysd)에 등록한 세션. 브로커 등록 대장은 데몬 메모리에 있어 데몬
+// 재시작 시 소실되므로, 낡은 세션 거부를 만나면 비우고 재등록할 수 있어야 한다 → 재설정
+// 불가한 OnceLock 금지(v0.13.10 실사고: 됐다안됐다 간헐 실패), RwLock<Option<_>>로 보관.
+static BROWSER_APP_SESSION: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// 브로커(cysd) 등록 대장 소실 시 GUI가 issue_gesture 거부로 받는 메시지의 판별 부분열.
+/// 원문: src/bin/cysd/authority_broker/mod.rs 의 BrokerFailure "GUI peer has no broker-owned
+/// registration"(코드 GUI_NOT_REGISTERED). rpc()는 error.message만 올리므로 이 부분열로 판별한다.
+/// 문자열 정합은 broker_registration_lost_marker_matches_broker_source 테스트가 보장.
+const BROKER_REGISTRATION_LOST_MARKER: &str = "no broker-owned registration";
 static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
     std::sync::OnceLock::new();
 
@@ -226,13 +235,16 @@ fn browser_activation_initialization_script(capability: &str) -> String {
 }
 
 fn browser_session_params(mut params: Value) -> Result<Value, String> {
+    // read 가드는 즉시 drop하고 String만 clone해 이후(비동기 rpc 포함) 가드를 들고 있지 않는다.
     let session = BROWSER_APP_SESSION
-        .get()
+        .read()
+        .unwrap()
+        .clone()
         .ok_or_else(|| "Browser GUI peer registration is unavailable".to_string())?;
     let object = params
         .as_object_mut()
         .ok_or_else(|| "Browser RPC params must be an object".to_string())?;
-    object.insert("app_session".into(), Value::String(session.clone()));
+    object.insert("app_session".into(), Value::String(session));
     Ok(params)
 }
 
@@ -251,9 +263,10 @@ async fn register_browser_gui_peer() -> Result<(), String> {
         .filter(|value| value.len() == 64)
         .ok_or_else(|| "cysd returned an invalid Browser GUI session".to_string())?
         .to_string();
-    BROWSER_APP_SESSION
-        .set(session)
-        .map_err(|_| "Browser GUI peer was already registered".to_string())
+    // 덮어쓰기: 데몬 재시작으로 대장이 갱신되면 낡은 세션을 새 세션으로 교체한다(OnceLock의
+    // 실패-무시 set 대체). write 가드는 이 대입 문에서 즉시 drop된다(await 경계 안 넘김).
+    *BROWSER_APP_SESSION.write().unwrap() = Some(session);
+    Ok(())
 }
 
 /// 풀에서 소켓의 연결 셀을 얻는다 — 외부 std Mutex는 Arc 클론만 짧게 잡고 즉시 푼다(await 경계 안 넘김).
@@ -966,9 +979,8 @@ async fn ensure_browserd_cast(
         .consume(window.label(), unix_millis_now())
         .map_err(|error| format!("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]: {error}"))?;
     // 지연 재시도(fail-closed는 유지, 무한루프 없음): 부팅 시 1회 등록이 데몬 교체·부팅 경합으로
-    // 실패해 세션이 비어 있으면, 신뢰된 클릭 소모 직후 여기서 1회만 재시도한다. OnceLock이라
-    // 이중 set은 자연 무해(이미 등록됐으면 즉시 통과). 재시도 후에도 실패하면 그 에러로 거부한다.
-    if BROWSER_APP_SESSION.get().is_none() {
+    // 실패해 세션이 비어 있으면, 신뢰된 클릭 소모 직후 여기서 등록한다. 이미 등록됐으면 통과.
+    if BROWSER_APP_SESSION.read().unwrap().is_none() {
         register_browser_gui_peer()
             .await
             .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
@@ -977,9 +989,27 @@ async fn ensure_browserd_cast(
         "window_label":window.label(),
         "pane_nonce":pane_nonce,
     }))?;
-    let issued = rpc("browser.runtime.issue_gesture", issue_params)
-        .await
-        .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+    let issued = match rpc("browser.runtime.issue_gesture", issue_params).await {
+        Ok(value) => value,
+        // 브로커 등록 대장은 데몬 메모리 — 데몬 재시작 시 소실되므로 낡은 세션 거부를 만나면 1회
+        // 재등록·재시도로 자가 회복한다(v0.13.10 실사고: 됐다안됐다 간헐 실패). one-time activation은
+        // 이미 consume된 뒤이므로 재시도에 새 클릭이 필요 없다(consume은 함수 초입 1회 — 재시도는 rpc만).
+        Err(error) if error.contains(BROKER_REGISTRATION_LOST_MARKER) => {
+            *BROWSER_APP_SESSION.write().unwrap() = None;
+            register_browser_gui_peer()
+                .await
+                .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+            let retry_params = browser_session_params(json!({
+                "window_label":window.label(),
+                "pane_nonce":pane_nonce,
+            }))?;
+            // 재시도도 실패하면 그 에러로 fail-closed(무한루프 금지 — 재등록·재시도는 각 1회 한정).
+            rpc("browser.runtime.issue_gesture", retry_params)
+                .await
+                .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?
+        }
+        Err(error) => return Err(format!("BROWSER_DISABLED_SAFE: {error}")),
+    };
     let gesture_receipt = issued["gesture_receipt"].as_str().ok_or_else(|| {
         "BROWSER_DISABLED_SAFE: broker returned no activation receipt".to_string()
     })?;
@@ -4622,6 +4652,24 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(
             seg.contains("--purge-state"),
             "purge 명령 골격 변형 — 트립와이어 재검토 필요"
+        );
+    }
+
+    /// [C6] 데몬 재시작으로 브로커 등록 대장이 소실되면 broker가 GUI에 내려보내는 거부 메시지의
+    /// 판별 부분열(BROKER_REGISTRATION_LOST_MARKER)이 실제 브로커 소스 문자열에 포함되는지 확인한다.
+    /// rpc()는 error.message만 GUI로 올리므로(main.rs rpc_on), 이 부분열 매칭이 어긋나면
+    /// ensure_browserd_cast의 자가 회복(1회 재등록·재시도)이 발동하지 못한다(v0.13.10 실사고 재발).
+    /// include_str!는 컴파일 시점 임베드라 런타임 경로 의존이 없다(purge 트립와이어와 동일 관례).
+    #[test]
+    fn broker_registration_lost_marker_matches_broker_source() {
+        let broker_src = include_str!("../../src/bin/cysd/authority_broker/mod.rs");
+        assert!(
+            broker_src.contains("GUI peer has no broker-owned registration"),
+            "브로커 GUI_NOT_REGISTERED 메시지 원문 변경 — 판별 마커 재배선 필요"
+        );
+        assert!(
+            "GUI peer has no broker-owned registration".contains(BROKER_REGISTRATION_LOST_MARKER),
+            "판별 마커가 브로커 메시지의 부분열이 아님 — 자가 회복 미발동 위험"
         );
     }
 }
