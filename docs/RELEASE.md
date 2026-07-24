@@ -1,5 +1,9 @@
 # 릴리스 절차 (cys 터미널)
 
+> ★실전 확정판: [RELEASE-RUNBOOK-STANDARD.md](RELEASE-RUNBOOK-STANDARD.md)(복사-실행 절차)와
+> [RELEASE-LESSONS.md](RELEASE-LESSONS.md)(v0.13.3 완주에서 확정된 결함 12건·관문·예방 게이트 대장)를
+> 먼저 읽어라 — 어떤 계정·어떤 에이전트가 릴리스를 맡아도 이 두 문서가 시행착오 방지 정본이다 (2026-07-24).
+
 ## 0-0. 현행 릴리스 폐쇄 절차 (2026-07-21 정본)
 
 > 이 절과 `release/assets-policy.json`, `release/credential-contract.json`,
