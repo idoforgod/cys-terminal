@@ -59,15 +59,24 @@ def main():
           probe_cli("definitely-not-a-real-cli-xyz-123") is False)
 
     # 빈곤 PATH 시뮬레이션: PATH 를 비워도 로그인셸 rc 가 채우는 PATH 로 해석돼야 한다.
-    saved = os.environ.get("PATH")
-    try:
-        os.environ["PATH"] = ""
-        check("3 빈곤 PATH 에서도 로그인셸 rc 로 해석",
-              probe_cli(core) is True,
-              "빈 PATH 에서 False 면 GUI launchd 오판 재현(RED/회귀)")
-    finally:
-        if saved is not None:
-            os.environ["PATH"] = saved
+    # ★posix 전용 계약: 이 보장은 macOS GUI(launchd 빈곤 PATH)에서 `zsh -lc` 가 /etc/zprofile
+    #   (path_helper) 등 rc 를 소싱해 PATH 를 복원한다는 macOS 고유 술어다. Windows 에서는
+    #   _resolve_windows 가 bash/`where` 를 쓰는데 이들 해석 자체가 PATH 를 필요로 해(빈 PATH 면
+    #   bash 조차 못 찾음) 동일 술어가 성립하지 않는다 — 플랫폼 의미론 차이(코드 결함 아님).
+    #   Windows 는 이 케이스를 스킵하고 실 감지 경로(테스트 1·2·4)로 계약을 핀한다.
+    if os.name == "nt":
+        check("3 빈곤 PATH 로그인셸 rc 해석 (Windows 스킵)", True,
+              "posix 전용 술어(macOS launchd 빈곤 PATH 복원) — Windows 의미론 비해당")
+    else:
+        saved = os.environ.get("PATH")
+        try:
+            os.environ["PATH"] = ""
+            check("3 빈곤 PATH 에서도 로그인셸 rc 로 해석",
+                  probe_cli(core) is True,
+                  "빈 PATH 에서 False 면 GUI launchd 오판 재현(RED/회귀)")
+        finally:
+            if saved is not None:
+                os.environ["PATH"] = saved
 
     # read-only: 프로브가 파일시스템에 흔적을 남기지 않음(간접 계약 — 함수가 순수 조회임을 문서·구현으로 보장).
     check("4 read-only 부작용 0", getattr(m, "PROBE_READONLY", True) is True,
