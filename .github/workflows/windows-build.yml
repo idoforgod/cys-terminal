@@ -35,6 +35,9 @@ jobs:
       # 게이트 제외(baseline v0.13.3 선재 실패·우리 회귀 아님).
       - name: 능력 파리티 팩 테스트 (Windows · pre-build 게이트)
         shell: bash
+        env:
+          PYTHONUTF8: '1'          # Windows 콘솔 기본 cp1252 에서 한국어 print UnicodeEncodeError 방지(리포 관례)
+          PYTHONIOENCODING: 'utf-8'
         run: |
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3

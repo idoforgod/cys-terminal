@@ -50,6 +50,15 @@ jobs:
           set -euo pipefail
           mkdir -p src-tauri/runtime
           bash scripts/bundle-prep.sh
+          # tauri.conf.json bundle.resources 에 "resources/browser-runtime/" 가 있으나(T0~T4 브라우저
+          # 런타임 기능 추가분) bundle-prep 은 이를 스테이징하지 않는다 — 실제 스테이징은 release.yml 의
+          # 서명·검증 스텝(browser-runtime-metadata.py prepare·runtime-stage.py) 소관이며 릴리스 자격증명이
+          # 필요하다. **컴파일 체크(cargo check)에는 자원 경로 존재만 필요**하므로 placeholder 디렉터리를
+          # 둔다(번들 아님·내용 무관). ★finding: release.yml 의 'src-tauri 단위 테스트' 스텝도 같은 자원을
+          # 스테이징하지 않아(browser-runtime staging 스텝보다 앞) 이 브랜치에서 잠재적으로 깨질 수 있다 —
+          # T6/브라우저런타임 소유자에게 인계(T5 보고).
+          mkdir -p src-tauri/resources/browser-runtime
+          : > src-tauri/resources/browser-runtime/.ci-check-placeholder
 
       # T3 의 Rust 변경(src-tauri/src/main.rs spawn_orchestra_boot 소켓 slug 동봉) 컴파일 확증.
       # check 만(테스트·hwmon 실행 아님). 워크스페이스 전 멤버(root cys-terminal·cys-app·supervisor).
@@ -107,6 +116,9 @@ jobs:
       # 실 mock-agent 주입 e2e 는 posix 전용이라 nt 자기-스킵. teardown_atomicity 는 게이트 제외(선재).
       - name: 능력 파리티 팩 테스트 (Windows)
         shell: bash
+        env:
+          PYTHONUTF8: '1'          # Windows 콘솔 기본 cp1252 에서 한국어 print UnicodeEncodeError 방지(리포 관례)
+          PYTHONIOENCODING: 'utf-8'
         run: |
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
