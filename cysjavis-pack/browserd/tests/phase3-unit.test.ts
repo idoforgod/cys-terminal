@@ -167,6 +167,15 @@ test("4-T-5 fitViewport: 캡 이하는 그대로 · 종횡비 보존 · jpeg 품
   expect(jpegQualityFor(1920, 1080)).toBeLessThanOrEqual(jpegQualityFor(1600, 900));
 });
 
+test("4-T-5 jpegQualityFor: fit-to-width 실사고 면적이 45 로 떨어지지 않고 60 하한 보장(2026-07-25 오너 실사고)", () => {
+  // fit-to-width 실사고 뷰포트 1080×1747=1.886MP — 이전 사다리(>1.6MP→45)에서 흐렸다.
+  expect(jpegQualityFor(1080, 1747)).toBe(60);
+  // 회귀 방지: 기본 뷰포트 1280×800=1.024MP 는 75 불변.
+  expect(jpegQualityFor(1280, 800)).toBe(75);
+  // 안전망: 면적 캡(2.1MP) 초과 합성값은 45(fitViewport 가 실제로는 캡하므로 도달 불가).
+  expect(jpegQualityFor(2000, 1500)).toBe(45); // 3.0MP > 2.1MP
+});
+
 // ════════ 4-T-5 확장: 사람 뷰포트 fit-to-width ════════
 test("4-T-5 fitHumanViewport: 좁은 pane 은 데스크톱 폭까지 확대 — ★네이버 실사고 재현(810 폭에서 1080 전폭)", () => {
   // 오너 실사고: pane CSS 810px 폭에서 네이버(최소 ≈1080px)가 사이트 차원에서 우측 절단.
@@ -270,6 +279,9 @@ test("Phase 2 앱 마커 유지 + Phase 3 UI 마커 존재(회귀 0)", () => {
   // 4-T-5: 클라이언트는 stage CSS 크기만 측정한다(프레임 metadata 파생값이면 무한 루프).
   expect(CAST_APP_HTML).toContain("stage.clientWidth");
   expect(CAST_APP_HTML).not.toContain("deviceWidth");
+  // fitCanvas 는 캔버스 백킹스토어에 DPR 을 반영한다(레티나 흐림 해소·2026-07-25) — 브라우저
+  // 전용 인라인이라 단위테스트 불가, CAST_APP_HTML 문자열에 배선됐는지 grep 으로 검증한다.
+  expect(CAST_APP_HTML).toContain("devicePixelRatio");
 });
 
 // ════════════════════════════════════════════════════════════════════════

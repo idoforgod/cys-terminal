@@ -521,7 +521,10 @@ export function jpegQualityFor(width: number, height: number): number {
   // ★기본 뷰포트 1280×800 = 1.024MP 는 반드시 75 를 유지한다 — 경계를 1.0MP 로 잡으면
   //   Phase 2 와 같은 크기에서 화질이 조용히 떨어진다(회귀).
   if (area <= 1_100_000) return 75;
-  if (area <= 1_600_000) return 60;
+  // fit-to-width 뷰포트(1080×~1750≈1.9MP)가 45 등급에 걸려 글씨 흐림(2026-07-25 오너 실사고)
+  //  — 60 하한 보장. 면적은 fitViewport 가 2.1MP(VIEWPORT_MAX_AREA)로 캡하므로 45 는 안전망.
+  //  1280×800=1.024MP 75 유지 불변.
+  if (area <= VIEWPORT_MAX_AREA) return 60;
   return 45;
 }
 
@@ -798,7 +801,15 @@ export const CAST_APP_HTML = `<!doctype html>
   if (window.ResizeObserver) { try { new ResizeObserver(scheduleViewport).observe(stage); } catch(e){} }
   vunpin.addEventListener('click', function(){ lastVp = ''; sendViewport(true); });
 
-  function fitCanvas(){ canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight; }
+  // 백킹스토어=CSS×DPR — 레티나에서 CSS px 백킹은 2배 확대돼 흐려진다. fit-to-width 가
+  // 공급하는 여분 해상도(예: 1080폭 프레임을 810 CSS pane 에 표시)를 살리는 값싼 선명화(대역 0).
+  // 캡처 DSF 상향(4-S-9 2차)과 별개. 마우스 좌표는 CSS 기준(offsetX·canvas.clientWidth)이라
+  // 백킹 DPR 과 무관하게 mapInput 역변환 비율이 동일하다.
+  function fitCanvas(){
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+  }
 
   function drawFrame(img){
     fitCanvas();
