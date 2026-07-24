@@ -9,7 +9,12 @@ import { shellQuote } from "./shellquote";
 import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
 import { transferTrees } from "./transfer";
 import { updatePlan } from "./updateplan";
-import { bootBannerDecision, isFormationKind } from "./bootbanner";
+import {
+  isFormationKind,
+  formationFeedAction,
+  bootWarningPlan,
+  normalizeBootWarning,
+} from "./bootbanner";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
@@ -5423,6 +5428,10 @@ function toast(category: string, name: string, detail: string) {
 // 8초를 넘기는 진행 이벤트는 완료·실패 때 명시적으로 dismissToast로 내려야 한다.
 const stickyToasts = new Map<string, HTMLElement>();
 
+// ★W3(T3): 소켓 slug → 최신 formation kind. boot-warning 이 formation-complete 뒤에 도착하는 경합
+// (edge trigger)에서 불멸 배너를 막는 레벨 재조정 소스(FIX-2). formation feed 수신 시 갱신.
+const lastFormationKind = new Map<string, string>();
+
 function stickyToast(id: string, category: string, name: string, detail: string) {
   const box = document.getElementById("toasts")!;
   let el = stickyToasts.get(id);
@@ -5567,12 +5576,15 @@ function onDaemonEvent(event: Record<string, unknown>) {
     // ★W3(T3): 편성 상태 표면화(kind=formation-*)는 승인 요청이 아니라 배너 수명 신호다 —
     // 승인 토스트/전환 유예 경로를 타지 않고, boot-warn 배너를 소멸(complete)/갱신(partial)한다.
     if (name === "feed.item.created" && isFormationKind(String(payload.kind ?? ""))) {
-      const decision = bootBannerDecision(String(payload.kind ?? ""));
-      if (decision.action === "dismiss") {
-        dismissToast("boot-warn"); // 편성 완결 → "팀 기동 경고" 배너 제거(멱등)
-      } else if (decision.action === "update" && stickyToasts.has("boot-warn")) {
+      const fkind = String(payload.kind ?? "");
+      const fslug = event.socket_slug ? String(event.socket_slug) : "";
+      if (fslug) lastFormationKind.set(fslug, fkind); // 레벨 추적(백스톱 소스·FIX-2)
+      const act = formationFeedAction(fkind, fslug || null); // 소켓 스코프(교차 오소멸 차단·FIX-1)
+      if (act.op === "dismiss") {
+        dismissToast(act.bannerId); // 편성 완결 → 그 소켓 "팀 기동 경고" 배너만 제거(멱등)
+      } else if (act.op === "update" && stickyToasts.has(act.bannerId)) {
         // 부분 편성: 배너가 떠 있을 때만 문구 갱신(제거 아님 — 아직 미완). 없으면 새로 만들지 않는다.
-        stickyToast("boot-warn", "health", "팀 기동 경고", decision.text);
+        stickyToast(act.bannerId, "health", "팀 기동 경고", act.text);
       }
       refreshFeed();
       refreshSidebarStatus();
@@ -5773,8 +5785,13 @@ async function start() {
   // ★팀 기동 경고(적대검증 D-8): 마스터는 떴으나 cys boot가 팀(CSO·워커·리뷰어)을 못 세운 경우
   // (claude 미설치 등) 침묵하지 않고 안내 — 종전엔 실패를 삼켜 "팀 0개"를 사용자가 몰랐다.
   await listen("boot-warning", (e) => {
-    const msg = typeof e.payload === "string" ? e.payload : "팀 기동에 실패했습니다.";
-    stickyToast("boot-warn", "health", "팀 기동 경고", msg);
+    // ★소켓 스코프 + 엣지 경합 백스톱(FIX-1·FIX-2): payload {slug,message}(구형 string 호환)를
+    // 정규화 → 그 소켓 최신 상태가 이미 complete면 배너 생성 생략(순서 무관 수렴), 아니면 스코프
+    // 배너 생성. 다른 부서 formation-complete 는 자기 스코프 id 만 지우므로 이 배너는 안전.
+    const { slug, message } = normalizeBootWarning(e.payload);
+    const plan = bootWarningPlan(slug, slug ? lastFormationKind.get(slug) : undefined);
+    if (!plan.create) return; // complete 선도착 → 불멸 배너 백스톱
+    stickyToast(plan.bannerId, "health", "팀 기동 경고", message);
   });
 
   // ★T2 안전모드(translocation/비정규 경로): 앱이 임시/비정규 위치에서 실행돼 데몬·launchd·팩 등록을

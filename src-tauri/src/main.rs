@@ -2683,6 +2683,12 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
 /// fire-and-forget(최대 300s라 UI 무블록). socket=Some이면 그 부서 소켓 대상, None이면 본부.
 fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
     let cys = resolve_sidecar("cys");
+    // ★W3(T3 FIX-1): 배너를 소켓 스코프로 발화 — payload 에 소켓 slug 동봉. UI 가 `boot-warn:<slug>`
+    // 스코프 배너를 만들고, formation feed 이벤트의 socket_slug 와 일치할 때만 소멸/갱신한다(다른
+    // 부서 데몬의 formation-complete 가 base 배너를 오소멸하는 C6 위반 차단). slug 파생은 formation
+    // feed 의 socket_slug(spawn_event_forwarder)와 **동일 함수·동일 경로**라 결정론적으로 일치한다
+    // (본부=default_socket / 부서=Some(socket)).
+    let slug = sock_slug(&resolve_socket(&socket));
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
@@ -2705,12 +2711,15 @@ fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
                 if !o.status.success() || (launched_zero && has_missing) {
                     let _ = app.emit(
                         "boot-warning",
-                        "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다.",
+                        json!({"slug": slug.clone(), "message": "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다."}),
                     );
                 }
             }
             Err(e) => {
-                let _ = app.emit("boot-warning", format!("팀 기동(cys boot) 실행 실패: {e}"));
+                let _ = app.emit(
+                    "boot-warning",
+                    json!({"slug": slug.clone(), "message": format!("팀 기동(cys boot) 실행 실패: {e}")}),
+                );
             }
         }
     });

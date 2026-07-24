@@ -90,6 +90,13 @@ if fm:
     fm._surface(None, "partial:agy", "partial:codex")  # 같은 kind(partial) → 무발화
     check("C5.partial 유지 무발화", calls["feed"] == [] and calls["evt"] == [])
 
+    # C6) 소켓 스레딩 — _surface 가 소켓을 EVT fields 로 전달(UI 배너 스코핑의 데이터 원천).
+    # (교차소켓 오소멸·edge-race 수렴 자체는 UI 층 bootbanner.ts 순수함수 몫 — bun 테스트에서 검증.)
+    calls["feed"].clear(); calls["evt"].clear()
+    fm._surface("dept-1.sock", None, "complete")
+    check("C6.소켓이 EVT fields 로 스레딩(스코핑 데이터 원천)",
+          calls["evt"] and calls["evt"][0][1].get("socket") == "dept-1.sock")
+
 # ── D: javis_bootstrap._formation_hint ──
 bs = _load("javis_bootstrap", "javis_bootstrap.py")
 check("D0.bootstrap import", bs is not None)
