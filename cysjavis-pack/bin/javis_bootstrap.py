@@ -78,10 +78,9 @@ BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES", "24")))
 CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S", "5"))  # 총 상한 ≈ 120초
 
-# ── 증분2: 부서 교리 게이트 상태 ──
-# CEO 티켓 저장소(base 레인이 발급·부서 레인이 소비) + 24h TTL + 1회성(소비 시 .used rename).
-TICKET_DIR = os.path.join(STATE_DIR, "dept-boot-tickets")
-TICKET_TTL_SECS = float(os.environ.get("CYS_DEPT_TICKET_TTL_SECS", str(24 * 3600)))
+# ── W2(DD-4): CEO 티켓 게이트 폐지 — 조건화 상비 편성으로 대체(javis_formation.py ensure) ──
+# 구 dept-boot-tickets 저장소·TTL·1회성 소비 로직은 제거됐다(티켓 부재=단독 각성 강등 폐지).
+# `issue-ticket` 서브커맨드는 하위호환 위해 deprecated no-op 으로만 잔존(1개 마이너 릴리스 후 삭제 예고).
 
 def _atomic_write_json(path, obj):
     """CRLF 함정 회피(newline='\\n')·원자 교체 — Windows 재직렬화 원복 교훈."""
@@ -533,53 +532,7 @@ def _acquire_singleflight():
     return True
 
 
-# ── 증분2 ⓐ: CEO 티켓 권한 게이트(P7) ──
-# 이 게이트는 LLM 드리프트 차단용 결정론 가드이지 보안 경계가 아니다(동일 $HOME 신뢰 도메인).
-def _ticket_path(dept):
-    return os.path.join(TICKET_DIR, "%s.ticket" % dept)
-
-
-def _parse_ticket_json(text, dept, now):
-    """순수 판정: 티켓 파일 텍스트 → (유효 bool, 사유). now(epoch) 주입으로 TTL 결정론 검증.
-    계약: JSON 객체 · dept 일치 · issued_at(epoch 숫자) 존재 · 0<=경과<=TTL. 위반=강등(단독 각성)."""
-    try:
-        d = json.loads(text)
-    except (ValueError, TypeError):
-        return False, "티켓 JSON 파싱 실패"
-    if not isinstance(d, dict):
-        return False, "티켓 루트가 객체 아님"
-    if d.get("dept") != dept:
-        return False, "티켓 dept 불일치(%r≠%r)" % (d.get("dept"), dept)
-    ts = d.get("issued_at")
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
-        return False, "issued_at 없음/형식오류"
-    age = now - ts
-    if age < 0:
-        return False, "issued_at 미래(시계 이상 %ds)" % int(-age)
-    if age > TICKET_TTL_SECS:
-        return False, "티켓 만료(%dh 경과 > TTL %dh)" % (age / 3600, TICKET_TTL_SECS / 3600)
-    return True, "유효(발급 %dm 전 · issuer=%s)" % (age / 60, d.get("issuer", "?"))
-
-
-def _peek_dept_ticket(dept):
-    """부서 티켓 유효성 조회(소비하지 않음). → (유효 bool, 사유, path)."""
-    path = _ticket_path(dept)
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        return False, "티켓 파일 부재(%s)" % path, path
-    ok, why = _parse_ticket_json(text, dept, time.time())
-    return ok, why, path
-
-
-def _consume_dept_ticket(path):
-    """티켓을 .used 로 rename(1회성 소비). 실패해도 부트는 계속(best-effort) — 흔적만 반환."""
-    try:
-        os.replace(path, path + ".used")
-        return "소비(.used)"
-    except OSError as e:
-        return "소비 실패(%s — 이미 rename됐거나 권한): 계속" % e
+# ── W2(DD-4): 티켓 파싱/조회/소비 함수 제거 — 티켓 게이트 폐지(조건화 상비 편성으로 대체) ──
 
 
 # ── 증분2 ⓑ: 결손 기준 자원 사전 게이트 ──
@@ -712,31 +665,46 @@ def _run_resource_gate(py, log):
     return None
 
 
+def _run_formation_ensure(py, log):
+    """W2(DD-4) 조건화 상비 편성 — 티켓 게이트 자리 대체. javis_formation.py ensure 를 인라인 발화.
+    boot-last.json 에 `formation` 필드를 추가 기록(ADR-D7 스키마 호환 — 기존 단계 키 유지).
+    모든 실패 graceful — 예외·비0 exit 이 master 각성/부트 체인을 블록하지 않는다(R10)."""
+    formation = os.path.join(PACK, "bin", "javis_formation.py")
+    sock = os.environ.get("CYS_SOCKET", "")
+    if not os.path.isfile(formation):
+        log.step("③″formation", 0, "javis_formation.py 부재 — 편성 생략(계속)")
+        log.data["formation"] = {"state": "skipped", "reason": "javis_formation.py 부재"}
+        return
+    _progress("③″ 조건화 상비 편성(formation ensure)…")
+    argv = [py, formation, "ensure", "--json"]
+    if sock:
+        argv += ["--socket", sock]
+    try:
+        code, out = _run(argv, timeout=300)
+    except Exception as e:
+        log.step("③″formation", 0, "formation ensure 예외(무해 skip): %s" % e)
+        log.data["formation"] = {"state": "failed", "reason": str(e)}
+        return
+    state = None
+    try:
+        state = json.loads(out.strip().splitlines()[-1]) if out.strip() else None
+    except Exception:
+        state = None
+    log.step("③″formation", code,
+             (state or {}).get("state", "") if isinstance(state, dict) else out[:200])
+    log.data["formation"] = state if isinstance(state, dict) else {
+        "state": "unknown", "exit": code, "raw": out[:200]}
+
+
 def cmd_issue_ticket(argv):
-    """CEO 티켓 발급 — base 레인 전용. 사용: issue-ticket --dept <name>.
-    exit: 0=발급(경로 stdout) / 2=base 레인 아님 또는 --dept 형식 위반.
-    이 게이트는 LLM 드리프트 차단용 결정론 가드이지 보안 경계가 아니다(동일 $HOME 신뢰 도메인)."""
-    dept = None
-    for i, a in enumerate(argv):
-        if a == "--dept" and i + 1 < len(argv):
-            dept = argv[i + 1]
-        elif a.startswith("--dept="):
-            dept = a.split("=", 1)[1]
-    if not dept or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", dept):
-        sys.stderr.write("[issue-ticket] --dept <name>(kebab-case a-z0-9-) 필수: %r\n" % dept)
-        return 2
-    if not _is_base_socket():
-        sys.stderr.write("[issue-ticket] base 레인에서만 티켓 발급 허용 — 현재 소켓은 부서 레인(%s). "
-                         "본부(base) master에서 발급하라.\n" % os.environ.get("CYS_SOCKET", ""))
-        return 2
-    now = time.time()
-    ticket = {"dept": dept, "issued_at": now,
-              "issued_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
-              "issuer": os.environ.get("CYS_SURFACE_ID", "") or "base-master"}
-    path = _ticket_path(dept)
-    _atomic_write_json(path, ticket)
-    print(json.dumps({"ok": True, "dept": dept, "ticket": path,
-                      "ttl_hours": round(TICKET_TTL_SECS / 3600, 1)}, ensure_ascii=False))
+    """DEPRECATED no-op — CEO 티켓 게이트는 W2 조건화 상비 편성으로 폐지됐다(DD-4).
+    구 문서·스크립트 하위호환을 위해 경고만 내고 exit 0(파손 방지). 1개 마이너 릴리스 후 삭제 예정."""
+    sys.stderr.write(
+        "[issue-ticket] DEPRECATED no-op — CEO 티켓 게이트는 폐지됐습니다(W2 조건화 상비 편성). "
+        "부서 팀 기동은 이제 설치 CLI 기준 자동 편성(javis_formation.py ensure)됩니다. "
+        "이 서브커맨드는 1개 마이너 릴리스 후 삭제 예정입니다.\n")
+    print(json.dumps({"ok": True, "deprecated": True,
+                      "note": "issue-ticket no-op (티켓 게이트 폐지)"}, ensure_ascii=False))
     return 0
 
 
@@ -951,32 +919,13 @@ def cmd_run():
     except Exception:
         pass  # ③′는 완전 비치명 — 어떤 실패도 부트를 막지 않는다
 
-    # ── 증분2 ⓐ CEO 티켓 권한 게이트(P7) — 부서 레인 팀 기동 전. 티켓 부재/만료=단독 각성 강등(exit 0) ──
-    dept = _socket_dept()
-    ticket_path = None
-    if dept is not None:
-        _progress("③″ CEO 티켓 권한 게이트(부서 레인=%s)…" % dept)
-        ok, why, ticket_path = _peek_dept_ticket(dept)
-        if not ok:
-            note = ("CEO 티켓 부재 — 부서장 단독 각성(팀 기동은 CEO 티켓 발급 후). "
-                    "발급: base master에서 `javis_bootstrap.py issue-ticket --dept %s`. 사유: %s"
-                    % (dept, why))
-            # R1-LOW-3 검증 비대칭 경고: 발급(issue-ticket)은 정규식을 강제하나 소켓 쪽 부서명은
-            # 자유 형식이라, 불일치 부서는 티켓을 영영 못 받는 비대칭이 침묵으로 남는다 — 명시.
-            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", dept):
-                note += (" ★주의: 부서명 %r 은 발급 정규식([a-z0-9][a-z0-9-]*) 불일치 — "
-                         "이 부서명은 티켓 발급 불가 형식이다(부서 재생성 필요)." % dept)
-            _progress(note)
-            log.step("③″ceo-ticket", 0, note)
-            summary = {"ok": True, "marker": "부서장 단독 각성(CEO 티켓 부재)",
-                       "solo_awakening": True, "dept": dept,
-                       "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
-                       "boot_last": BOOT_LAST}
-            log.data["result"] = {"ok": True, "solo_awakening": True, "reason": why}
-            _atomic_write_json(BOOT_LAST, log.data)
-            print(json.dumps(summary, ensure_ascii=False))
-            return 0
-        log.step("③″ceo-ticket", 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
+    # ── W2(DD-4) 조건화 상비 편성 — 티켓 게이트 자리 대체(javis_formation.py ensure) ──
+    # 구 CEO 티켓 권한 게이트(부서 레인 단독 각성 강등)는 폐지됐다. 그 자리에서 formation ensure 를
+    # 인라인 발화한다(bootstrap 문맥은 이미 훅 비동기라 인라인 허용). ensure 는 gate-check(paused
+    # 존중)·소켓키 싱글플라이트·probe_cli(로그인셸 우산)·resource_gate·boot_node 입양 경로를 수렴시켜
+    # 설치 CLI 기준 최대 편성한다. base·부서 레인 동일 경로(레인별 소켓만 다름 — C3 동등성 수렴점).
+    # 실패는 전부 graceful — master 각성을 절대 블록하지 않는다(R10 부트체인 무해성).
+    _run_formation_ensure(py, log)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
     # 결손을 cys list 라이브 노드의 구성 판정(cso≥1∧worker≥1∧reviewer≥2)으로 산출(R1-MED-1):
@@ -993,13 +942,7 @@ def cmd_run():
         code, out = _run(["cys", "boot"], timeout=300)
         log.step("④boot", code, out)
         if code != 0:
-            # 티켓은 아직 미소비 — boot 실패(exit 4)면 보존돼 재시도 가능(R2-LOW-C)
             return log.fail("④boot", code, out, 4)
-
-        # 부서 레인 CEO 티켓 소비 — ④ boot **성공 직후**(실스폰 발생)에만 1회성 소비(R2-LOW-C):
-        # "1회성 티켓 ⟺ 실스폰" 불변식. 착수 전 소각은 boot 실패 시 재시도 티켓까지 태웠다.
-        if ticket_path is not None:
-            log.step("③″ceo-ticket-consume", 0, _consume_dept_ticket(ticket_path))
 
         # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
         # CLI를 건너뛰므로 agy/codex 부재 기계(초보 전원)에서 대체 리뷰어(reviewer-claude-*)를 기동할
@@ -1152,26 +1095,7 @@ def cmd_self_test():
         assert _lane_pack_mismatch("/s/cys-dept-dept-1/cys.sock", "/h/.cys/pack-dept-dept-2") \
             == ("dept-1", "dept-2"), "교차 부서=불일치"
 
-        # ── t4: CEO 티켓 파싱·TTL(증분2 ⓐ 순수 로직) ──
-        now = 1_000_000.0
-        good = json.dumps({"dept": "dept-1", "issued_at": now - 60, "issuer": "base-master"})
-        ok, _ = _parse_ticket_json(good, "dept-1", now)
-        assert ok, "유효 티켓(60s 전)이 거부됨"
-        expired = json.dumps({"dept": "dept-1", "issued_at": now - TICKET_TTL_SECS - 1})
-        ok, why = _parse_ticket_json(expired, "dept-1", now)
-        assert not ok and "만료" in why, "TTL 초과 티켓이 유효로 통과: %s" % why
-        # TTL 경계(정확히 TTL 경과)는 유효(<=)
-        edge = json.dumps({"dept": "dept-1", "issued_at": now - TICKET_TTL_SECS})
-        assert _parse_ticket_json(edge, "dept-1", now)[0], "TTL 경계(정확히 24h)가 만료 처리됨"
-        wrong_dept = json.dumps({"dept": "dept-2", "issued_at": now})
-        assert not _parse_ticket_json(wrong_dept, "dept-1", now)[0], "dept 불일치 티켓이 통과"
-        future = json.dumps({"dept": "dept-1", "issued_at": now + 100})
-        assert not _parse_ticket_json(future, "dept-1", now)[0], "미래 issued_at(시계 이상)이 통과"
-        assert not _parse_ticket_json("{not json", "dept-1", now)[0], "손상 JSON이 유효로 통과"
-        assert not _parse_ticket_json(json.dumps({"dept": "dept-1"}), "dept-1", now)[0], \
-            "issued_at 부재 티켓이 통과"
-        assert not _parse_ticket_json(json.dumps(
-            {"dept": "dept-1", "issued_at": True}), "dept-1", now)[0], "bool issued_at이 숫자로 통과"
+        # ── t4: (제거) CEO 티켓 파싱·TTL — W2(DD-4)로 티켓 게이트 폐지, 관련 순수 로직 삭제됨 ──
 
         # ── t5: 자원 게이트 결정 순수 로직(증분2 ⓑ) ──
         assert _resource_gate_decision(0, None, None)[0] == "allow", "exit 0=allow"
@@ -1286,10 +1210,11 @@ def cmd_self_test():
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
+    print("javis_bootstrap self-test OK (레인 격리 3종 + 자원 게이트 결정 + 결손 구성 판정 + "
           "신원 파싱·정규화·악성 제목/구조 드리프트 내성(U1) + 판정표 v3 S1~S7·거부 사유 tie-break"
-          "(v3-a/e/f)·승계 회귀 봉인(U2·U2-x) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
-          "자원 게이트 결정·구성 결손·_sid_norm·_surface_id_env·_parse_role_holder·_classify_claim_step)")
+          "(v3-a/e/f)·승계 회귀 봉인(U2·U2-x) — base/dept 판정·불량 레인·락 키·레인↔팩·"
+          "자원 게이트 결정·구성 결손·_sid_norm·_surface_id_env·_parse_role_holder·_classify_claim_step "
+          "· W2: CEO 티켓 게이트 폐지)")
     return 0
 
 

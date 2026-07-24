@@ -3,12 +3,14 @@
 
 순수 로직(티켓 TTL·자원 게이트 결정)은 javis_bootstrap `--self-test`가 밀폐 검증한다. 이 파일은
 프로세스 경계가 필요한 부트 흐름을 핀한다(모듈 전역이 import 시 HOME/PACK로 고정):
-  (h) 부서 레인 + 티켓 부재 → 팀 기동(④) 생략·exit 0·단독 각성 메시지(cys boot 미호출).
-  (i) 부서 레인 + 유효 티켓 + 결손>0 → 팀 기동 경로 진입(cys boot 관측)·티켓 .used 소비.
-  (j) 결손 0(구성 충족 재선언) → 자원 게이트·cys boot 미호출(스폰 없음)·티켓 미소비.
+  ★W2(DD-4) 갱신: CEO 티켓 게이트 폐지 → 티켓 부재/발급/소비 핀은 제거하고, 부서 레인이 base와
+    동일하게 formation ensure로 수렴해 상비 편성함을 핀한다(약화 아님·설계 정합 갱신).
+  (h) 부서 레인 → ③″formation 편성 단계·팀 기동 진입(cys boot)·solo_awakening 강등 폐지.
+  (i) 티켓 1회성 소비 개념 폐지 — 팀 기동해도 ceo-ticket-consume 단계 없음.
+  (j) 결손 0(구성 충족 재선언) → 자원 게이트·cys boot 미호출(스폰 없음).
   (j2) 반쪽 팀(reviewer만 4 — 구 총수 비교의 오판 케이스) → 결손 판정·팀 기동 진입(네거티브).
   (k) 자원 게이트 hard(servers) 목 → 팀 기동 0·exit 9·escalation 흔적(cys boot 미호출).
-  (l) issue-ticket base 레인 전용 가드(부서 레인 거부).
+  (l) issue-ticket deprecated no-op(exit 0·DEPRECATED 경고·티켓 파일 미생성).
   (m) javis_dept_migrate 멱등(2회 --fix 동일 결과·백업 생성).
   (n) 자원 게이트 soft → 디바운스 없음: 2연속 부트 모두 경고 경로 진입·레인별 상태파일 0.
   (o) javis_dept_migrate 스테일 교리 백필 — §3 픽스처 dry-run 감지 → --fix 후 §3 부재·
@@ -130,37 +132,31 @@ class DeptTicketGate(unittest.TestCase):
             return False
         return any(line.split()[0:1] == [sub] for line in open(self.cys_log))
 
-    # (h) 부서 레인 + 티켓 부재 → 단독 각성(팀 기동 생략·exit 0)
-    def test_h_dept_no_ticket_solo_awakening(self):
+    # (h) W2(DD-4): 티켓 게이트 폐지 — 부서 레인도 formation ensure로 수렴해 상비 편성(팀 기동 진입).
+    # 계약 갱신 사유: 종전 "티켓 부재→부서장 단독 각성(팀 기동 생략)" 강등 경로가 DD-4로 폐지됐다.
+    def test_h_dept_standing_formation_boots_team(self):
         home, pack, mockbin, sock = self._setup(ticket=None)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
-        self.assertEqual(rc, 0, "티켓 부재 부서 레인인데 exit≠0(단독 각성 강등 실패)")
-        self.assertIn("③″ceo-ticket", _steps(data))
-        self.assertNotIn("④boot", _steps(data), "티켓 부재인데 팀 기동 단계 진입")
-        self.assertTrue((data.get("result") or {}).get("solo_awakening"),
-                        "solo_awakening 미표기")
-        self.assertFalse(self._cys_called("boot"), "티켓 부재인데 cys boot 호출됨")
+        self.assertEqual(rc, 0, "부서 레인 부트 exit≠0")
+        self.assertIn("③″formation", _steps(data), "formation 편성 단계 부재(티켓 게이트 자리 대체)")
+        self.assertNotIn("③″ceo-ticket", _steps(data), "폐지된 CEO 티켓 게이트 단계 잔존")
+        self.assertFalse((data.get("result") or {}).get("solo_awakening"),
+                         "solo_awakening 강등이 폐지되지 않음")
+        # 결손>0(라이브 노드 0) → 상비 편성으로 팀 기동 진입
+        self.assertTrue(self._cys_called("boot"), "부서 레인 상비 편성인데 cys boot 미호출")
 
-    # (i) 부서 레인 + 유효 티켓 + 결손>0 → 팀 기동 진입·티켓 소비
-    def test_i_dept_valid_ticket_boots_and_consumes(self):
-        ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
-        # live_nodes=0 → 결손>0 → 게이트 발동(gate_exit=0 allow) → ④boot → 티켓 소비(성공 직후·
-        # R2-LOW-C "1회성 티켓 ⟺ 실스폰") → ⑤(orch 0) 통과.
-        home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0,
-                                                ticket=ticket, live_nodes=0)
+    # (i) W2: 티켓 1회성 소비 개념 폐지 — 팀 기동해도 ceo-ticket-consume 단계는 없다.
+    def test_i_dept_no_ticket_consume_step(self):
+        home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0, live_nodes=0)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
-        self.assertIn("③″ceo-ticket-consume", _steps(data), "티켓 소비 단계 부재(팀 기동 미진입)")
-        self.assertTrue(self._cys_called("boot"), "유효 티켓인데 cys boot 미호출(팀 기동 미진입)")
-        tdir = os.path.join(home, ".cys", "state", "dept-boot-tickets")
-        self.assertFalse(os.path.exists(os.path.join(tdir, "dept-1.ticket")), "티켓 미소비(잔존)")
-        self.assertTrue(os.path.exists(os.path.join(tdir, "dept-1.ticket.used")), ".used 미생성")
+        self.assertTrue(self._cys_called("boot"), "결손>0인데 cys boot 미호출(팀 기동 미진입)")
+        self.assertNotIn("③″ceo-ticket-consume", _steps(data), "폐지된 티켓 소비 단계 잔존")
 
-    # (j) 결손 0(구성 충족 재선언) → 자원 게이트 미호출·cys boot 미호출(스폰 없음)·티켓 미소비
-    def test_j_no_deficit_skips_gate_and_keeps_ticket(self):
-        ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
+    # (j) 결손 0(구성 충족 재선언) → 자원 게이트 미호출·cys boot 미호출(스폰 없음). (티켓 핀 제거)
+    def test_j_no_deficit_skips_gate_and_boot(self):
         # live_nodes=4 → roles 순환이 cso·worker·reviewer-gemini·reviewer-codex → 구성 충족(결손 0)
-        # → 게이트 생략 + ④ cys boot 호출 생략(R1-MED-1 — "결손 0=스폰 없음" 결정론화)·티켓 미소비.
-        home, pack, mockbin, sock = self._setup(orch_check_exit=0, ticket=ticket, live_nodes=4)
+        # → 게이트 생략 + ④ cys boot 호출 생략(R1-MED-1 — "결손 0=스폰 없음" 결정론화).
+        home, pack, mockbin, sock = self._setup(orch_check_exit=0, live_nodes=4)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
         self.assertEqual(rc, 0, "결손 0 재선언인데 exit≠0")
         self.assertFalse(os.path.isfile(self.gate_log), "결손 0인데 자원 게이트 호출됨(오탐 위험)")
@@ -170,17 +166,11 @@ class DeptTicketGate(unittest.TestCase):
                          "결손 0인데 cys boot 호출됨(스폰 경로 진입 — 구동작 잔재)")
         self.assertIn("④boot-skip", _steps(data), "④ 생략 흔적(④boot-skip 단계) 부재")
         self.assertNotIn("④boot", _steps(data), "결손 0인데 ④boot 단계 기록")
-        tdir = os.path.join(home, ".cys", "state", "dept-boot-tickets")
-        self.assertTrue(os.path.exists(os.path.join(tdir, "dept-1.ticket")),
-                        "결손 0 재선언인데 티켓 소비됨(재사용 불가)")
-        self.assertNotIn("③″ceo-ticket-consume", _steps(data), "결손 0인데 티켓 소비 단계 발생")
 
     # (j2) ★네거티브(R1-MED-1 원 결함): reviewer만 4(총수 4) — 구 총수 비교는 결손 0으로 오판해
-    # cso/worker 사망을 방치했다. 신 구성 판정은 결손으로 보고 팀 기동 경로에 진입해야 한다.
+    # cso/worker 사망을 방치했다. 신 구성 판정은 결손으로 보고 팀 기동 경로에 진입해야 한다. (티켓 핀 제거)
     def test_j2_half_team_reviewers_only_is_deficit(self):
-        ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
-        home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0,
-                                                ticket=ticket, live_nodes=0)
+        home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0, live_nodes=0)
         with open(self.list_file, "w") as f:
             f.write("".join("surface:%d\trole=reviewer-claude-%d\tpid=%d\texited=false\t\t\n"
                             % (i, i, 100 + i) for i in range(4)))
@@ -189,7 +179,6 @@ class DeptTicketGate(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.gate_log),
                         "반쪽 팀(reviewer만 4)인데 자원 게이트 미호출(총수 비교 오판 잔재)")
         self.assertTrue(self._cys_called("boot"), "반쪽 팀인데 cys boot 미호출(결손 미판정)")
-        self.assertIn("③″ceo-ticket-consume", _steps(data), "실스폰인데 티켓 미소비")
 
     # (k) 자원 게이트 hard(servers) → 팀 기동 0·exit 9·escalation
     def test_k_resource_hard_blocks_boot_exit9(self):
@@ -243,25 +232,20 @@ class SoftGateNoDebounce(unittest.TestCase):
 
 
 class IssueTicketGuard(unittest.TestCase):
-    # (l) issue-ticket base 전용 가드
-    def test_l_issue_ticket_base_only(self):
+    # (l) W2(DD-4): issue-ticket 은 deprecated no-op(exit 0·DEPRECATED 경고·티켓 파일 미생성).
+    # 계약 갱신 사유: CEO 티켓 게이트 폐지로 발급 개념 자체가 사라졌다(하위호환 no-op만 잔존).
+    def test_l_issue_ticket_deprecated_noop(self):
         home = tempfile.mkdtemp()
         env = dict(os.environ)
         env["HOME"] = home
-        # base 레인: 발급 성공
         env.pop("CYS_SOCKET", None)
         r = subprocess.run([sys.executable, BOOTSTRAP, "issue-ticket", "--dept", "dept-1"],
                            capture_output=True, text=True, timeout=30, env=env)
-        self.assertEqual(r.returncode, 0, "base 레인 발급 실패:\n%s" % r.stderr)
-        tpath = os.path.join(home, ".cys", "state", "dept-boot-tickets", "dept-1.ticket")
-        self.assertTrue(os.path.isfile(tpath), "티켓 파일 미생성")
-        # 부서 레인: 발급 거부
-        env["CYS_SOCKET"] = "%s/.local/state/cys-dept-dept-2/cys.sock" % home
-        r2 = subprocess.run([sys.executable, BOOTSTRAP, "issue-ticket", "--dept", "dept-2"],
-                            capture_output=True, text=True, timeout=30, env=env)
-        self.assertEqual(r2.returncode, 2, "부서 레인 발급이 거부되지 않음")
+        self.assertEqual(r.returncode, 0, "deprecated no-op 인데 exit≠0:\n%s" % r.stderr)
+        self.assertIn("DEPRECATED", r.stderr, "deprecated 경고 미출력")
         self.assertFalse(os.path.exists(os.path.join(
-            home, ".cys", "state", "dept-boot-tickets", "dept-2.ticket")), "거부인데 티켓 생성됨")
+            home, ".cys", "state", "dept-boot-tickets", "dept-1.ticket")),
+            "no-op 인데 티켓 파일 생성됨")
 
 
 class MigrateIdempotent(unittest.TestCase):

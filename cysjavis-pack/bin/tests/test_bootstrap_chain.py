@@ -90,6 +90,14 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
     # 스텁 cys-dept — 인자 기록
     w(os.path.join(pack, "bin", "cys-dept"),
       "#!/bin/sh\necho \"cys-dept $@\" >> \"%s/calls.log\"\nexit 0\n" % tmp)
+    # 스텁 javis_formation.py — W2(DD-4) 티켓 게이트 대체. 호출 기록 + 상태 JSON 1줄(exit 0).
+    # (bootstrap 의 formation ensure 인라인 발화가 실제 노드 스폰을 시도하지 않도록 밀폐 — orchestra
+    #  스텁과 동형. 실 편성 로직은 test_formation.py 가 밀폐 검증한다.)
+    w(os.path.join(pack, "bin", "javis_formation.py"),
+      "import json,sys\n"
+      "open('%s/formation.log','a').write(' '.join(sys.argv[1:])+'\\n')\n"
+      "print(json.dumps({'ok':True,'state':'complete','kind':'complete'}))\n"
+      "sys.exit(0)\n" % tmp, 0o644)
 
     env = dict(os.environ)
     # ★_surface_id_env 우선순위(AITERM_→JAVIS_→CYS_)에서 CYS_SURFACE_ID=7이 권위를 갖도록 상위 키 제거
@@ -148,45 +156,48 @@ check("1h ★R6 ④-b timeout≥320(2슬롯×130s 순차 — 스텁은 즉시 �
       "timeout=320" in src_boot)
 shutil.rmtree(tmp)
 
-# ── 2. ⓐ 부서 소켓 컨텍스트: 성공해도 base 마커 미생성·⑦ 생략 ──
-# 현행 부서 규약(증분1): 소켓은 디렉토리형 <state>/cys-dept-<name>/cys.sock + 같은 부서 팩
-# (pack-dept-<name>) 페어링 — 구식 평면 소켓/메인 팩 조합은 레인↔팩 가드 exit 8
-# (그 가드 자체는 test_lane_isolation_v1.py t3가 핀). 신교리(증분2): 부서 레인 팀 기동은
-# CEO 티켓 필수 — "부서 부트 성공" 핀을 두 경로로 분해한다.
-# 2-i) 티켓 부재 → 부서장 단독 각성 강등(exit 0·팀 기동 ④⑤ 생략·마커 무접촉·⑦ 생략)
+# ── 2. 부서 소켓 컨텍스트: W2(DD-4) 조건화 상비 편성 — 티켓 게이트 폐지 후 ──
+# 계약 갱신 사유(약화 아님·정당한 갱신): DD-4가 CEO 티켓 권한 게이트를 제거했다. 종전 "티켓 부재→
+# 부서장 단독 각성(팀 기동 생략)" 강등 경로는 폐지됐고, 부서 레인도 base 레인과 동일하게 formation
+# ensure로 수렴해 설치 CLI 기준 상비 편성한다(R2). 따라서 티켓 발급·소비·solo_awakening 핀은
+# 제거하고, 그 자리에 (a) formation ensure 단계 기록 (b) 부서 레인도 팀 기동 진입 (c) 소켓 격리
+# (base 마커 무접촉·⑦ 생략)는 존치 — 를 핀한다. 현행 부서 규약(증분1): 디렉토리형 소켓 + 부서 팩
+# 페어링(레인↔팩 가드 exit 8은 test_lane_isolation_v1.py t3가 핀).
 tmp = tempfile.mkdtemp(prefix="boot-t2-")
 dept_sock = os.path.join(tmp, "state", "cys-dept-dept-3", "cys.sock")
 env, home = make_env(tmp, socket=dept_sock, pack_dept="dept-3")
 code, out, err = run(env)
-check("2a-i 티켓 부재 부서 부트 exit 0(단독 각성 강등)", code == 0,
+check("2a 부서 레인 부트 exit 0(티켓 게이트 폐지)", code == 0,
       "exit=%d err=%s" % (code, err[-200:]))
 try:
     summary2 = json.loads(out.strip().splitlines()[-1])
 except Exception:
     summary2 = {}
-check("2a-ii 단독 각성 명시(solo_awakening·dept)",
-      summary2.get("solo_awakening") is True and summary2.get("dept") == "dept-3")
-check("2a-iii 팀 기동 생략(cys boot 미호출)", "cys boot" not in calls(tmp))
-check("2b ⓐ base 마커 미생성(소켓 격리)", not os.path.exists(marker_path(home)))
-check("2c 부서 컨텍스트 ⑦ 생략", "promote-if-pending" not in calls(tmp))
+check("2a-ii solo_awakening 강등 폐지(티켓 게이트 제거)",
+      summary2.get("solo_awakening") is not True)
+check("2b ③″formation 편성 단계 기록(티켓 게이트 자리 대체)",
+      "③″formation" in [s["step"] for s in
+                         (json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"),
+                          encoding="utf-8")) or {}).get("steps", [])])
+check("2b-ii formation ensure 발화(스텁 호출 기록)",
+      os.path.exists(os.path.join(tmp, "formation.log")) and
+      "ensure" in open(os.path.join(tmp, "formation.log"), encoding="utf-8").read())
+check("2c 부서 레인도 팀 기동 진입(cys boot 호출 — 상비 편성)", "cys boot" in calls(tmp))
+check("2d base 마커 미생성(소켓 격리 — 티켓과 무관·존치)", not os.path.exists(marker_path(home)))
+check("2e 부서 컨텍스트 ⑦ 생략(존치)", "promote-if-pending" not in calls(tmp))
 shutil.rmtree(tmp)
 
-# 2-ii) 티켓 발급(base 레인 issue-ticket) → 부서 팀 기동 경로: ④⑤ 수행·exit 0·마커는 여전히 무접촉
+# 2-ii) issue-ticket 하위호환: deprecated no-op(exit 0·경고·티켓 파일 미생성)
 tmp = tempfile.mkdtemp(prefix="boot-t2t-")
-dept_sock = os.path.join(tmp, "state", "cys-dept-dept-3", "cys.sock")
-env, home = make_env(tmp, socket=dept_sock, pack_dept="dept-3")
+env, home = make_env(tmp)
 env_base = dict(env)
-env_base.pop("CYS_SOCKET", None)  # 발급은 base 레인에서만 허용
+env_base.pop("CYS_SOCKET", None)
 code, out, err = run(env_base, "issue-ticket", "--dept", "dept-3")
-check("2d 티켓 발급 exit 0(base 레인)", code == 0, "exit=%d err=%s" % (code, err[-200:]))
-code, out, err = run(env)
-check("2e 티켓 有 부서 팀 기동 exit 0", code == 0, "exit=%d err=%s" % (code, err[-200:]))
-check("2f 팀 기동 수행(cys boot 호출)", "cys boot" in calls(tmp))
-check("2g 티켓 1회성 소비(.used rename)",
-      os.path.exists(os.path.join(home, ".cys", "state", "dept-boot-tickets",
-                                  "dept-3.ticket.used")))
-check("2h 팀 기동이어도 base 마커 무접촉", not os.path.exists(marker_path(home)))
-check("2i 부서 컨텍스트 ⑦ 생략", "promote-if-pending" not in calls(tmp))
+check("2f issue-ticket deprecated no-op exit 0", code == 0, "exit=%d err=%s" % (code, err[-200:]))
+check("2g issue-ticket deprecated 경고 출력", "DEPRECATED" in err, err[-200:])
+check("2h 티켓 파일 미생성(no-op)",
+      not os.path.exists(os.path.join(home, ".cys", "state", "dept-boot-tickets",
+                                      "dept-3.ticket")))
 shutil.rmtree(tmp)
 
 # ── 2w. windows pipe 이름도 base로 인정 ──

@@ -664,6 +664,31 @@ ceo_demote(){
   ceo_reinject_master "표준 master 복귀"
 }
 
+# ── W2(DD-4·오너 2026-07-24) 조건화 상비 편성 발화 ──
+# allocate/create가 master 자리(빈 셸)를 만든 직후 호출. probe_cli(로그인셸 우산)로 claude 감지 시
+# formation ensure를 백그라운드로 발화(동기 실행 금지 — GUI 버튼 행 걸림 Sim S1-3) → 빈 셸 master
+# 자리에 claude 입양 + 설치 CLI 기준 최대 편성. 미설치면 빈 셸 유지(온보딩 보존 — "팀 없이도 마스터
+# 단독 사용 가능") + ensure가 pending-cli 상태·feed 안내를 기록(설치 시 자동 완결). 실패 전부 무해.
+_bg_detach(){ # 인자 명령을 세션 분리 백그라운드로 — setsid 부재(macOS) 시 nohup 폴백. GUI 무행.
+  if command -v setsid >/dev/null 2>&1; then setsid "$@" >/dev/null 2>&1 &
+  else nohup "$@" >/dev/null 2>&1 & fi
+  disown 2>/dev/null || true
+}
+_fire_formation(){ # $1=name $2=sock
+  local name="$1" sock="$2"
+  local packbin="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin"
+  local formation="$packbin/javis_formation.py" probe="$packbin/javis_cli_probe.py"
+  [ -f "$formation" ] || return 0   # 편성 모듈 부재 = 구동작 보존(무해 skip)
+  if [ -f "$probe" ] && python3 "$probe" claude >/dev/null 2>&1; then
+    _bg_detach python3 "$formation" ensure --socket "$sock"
+    echo "[cys-dept] $name 조건화 상비 편성 발화(백그라운드·claude 감지)" >&2
+  else
+    # claude 미설치: 빈 셸 유지(온보딩 보존). ensure가 pending-cli 상태·feed 안내를 기록(백그라운드).
+    _bg_detach python3 "$formation" ensure --socket "$sock"
+    echo "[cys-dept] $name claude 미설치 — 빈 셸 유지·편성 대기(pending-cli, 팀 없이도 마스터 단독 사용 가능)" >&2
+  fi
+}
+
 cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|recompose [--no-overlay]|list|sock <name> | <name> -- <cmd>}"
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
@@ -787,16 +812,20 @@ PY
       "$0" down "$name" >/dev/null 2>&1 || true; trap - EXIT; exit 6
     fi
     trap - EXIT   # 격리 확정 — 회수 취소
-    # ★오너 지시(2026-06-29): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
-    #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
-    #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
-    #   --role master 필수·--cmd 생략=기본 로그인 셸. CYS_DEPT_NO_MASTER=1=셸도 생략(빈 데몬). 이미 master면 멱등.
+    # ★조건화 상비 편성으로 개정(오너 2026-07-24 · 구 2026-06-29 무조건 빈-셸 정책 대체 — DD-4):
+    #   여전히 role=master '빈 셸'을 먼저 만든다(신규 사용자·claude 미설치 경로에서는 이 빈 셸이 유지돼
+    #   온보딩 보존 — "팀 없이도 마스터 단독 사용 가능"). 그 직후 _fire_formation이 claude 감지 시
+    #   formation ensure를 백그라운드로 발화해 빈 셸에 claude 입양 + 설치 CLI 기준 상비 편성한다.
+    #   UI 자동입양은 role 있는 surface만 받으므로(main.ts:1268 !s.role 가드) --role master 필수.
+    #   CYS_DEPT_NO_MASTER=1=셸도 생략(빈 데몬). 이미 master면 멱등.
     if [ "${CYS_DEPT_NO_MASTER:-0}" = 1 ]; then
       echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 master surface 존재 — 셸 생성 생략(멱등)" >&2
+      _fire_formation "$name" "$sock"
     elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "${CYS_DEPT_CWD:-$HOME}" >/dev/null 2>&1; then
-      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
+      _fire_formation "$name" "$sock"
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
@@ -927,15 +956,18 @@ PY
       exit 6
     fi
     trap - EXIT   # 격리 확정 — 이후 빈 셸 생성
-    # ★WP-11(오너 2026-06-29 결정 일원화): create도 allocate와 동일하게 role=master '빈 셸'만 띄운다.
-    #   자동 각성(부트 노드)+미션 자동주입(send --to master)을 폐지 — 사용자가 그 셸에서 직접 claude 를
-    #   실행해 부서장으로 연결하고, 부서장이 미션 파일($MISS/$key.md)을 스스로 읽는다. 빈 셸(agent=None)엔
-    #   phoenix 각성핑도 미발사(stage_reinject agent-gate) → 빈 zsh 오해석 에러 0. 계정격리·미션파일은 보존.
+    # ★조건화 상비 편성으로 개정(오너 2026-07-24 · 구 WP-11 2026-06-29 무조건 빈-셸 정책 대체 — DD-4):
+    #   create도 allocate와 동일하게 role=master '빈 셸'을 먼저 띄운다(claude 미설치 경로에서는 빈 셸
+    #   유지 — 온보딩·미션파일 보존, 부서장이 미션 파일 $MISS/$key.md를 스스로 읽음). 그 직후
+    #   _fire_formation이 claude 감지 시 formation ensure를 백그라운드로 발화해 상비 편성한다.
+    #   빈 셸(agent=None)엔 phoenix 각성핑 미발사(stage_reinject agent-gate) → 빈 zsh 오해석 0. 계정격리 보존.
     # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
     if dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
+      _fire_formation "$name" "$sock"
     elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$cwd" >/dev/null 2>&1; then
-      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (미션 파일: $MISS/$key.md)" >&2
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 (미션 파일: $MISS/$key.md)" >&2
+      _fire_formation "$name" "$sock"
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
