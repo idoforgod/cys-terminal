@@ -149,6 +149,26 @@ jobs:
             echo "== phoenix test: $(basename "$t") =="
             CYS_PACK_DIR="$(mktemp -d)" python3 "$t"
           done
+          # ── 능력 파리티 게이트(W4·DD-6) — 반쪽마스터·편성 회귀를 출고 전에 차단 ──
+          # 파리티 7종을 명시 실행한다(어느 하나 비0이면 set -e 로 잡 실패=릴리스 차단). glob 이 아니라
+          # 명시 목록인 이유: 이 7종은 '반드시 존재+통과'해야 하는 계약이라 파일 누락도 게이트가 잡아야 한다
+          # (browserd 게이트의 존재-단언 관례와 동형 — untracked 누락 = 초록 거짓말 차단).
+          # ★test_dept_teardown_atomicity 는 게이트 제외 — baseline v0.13.3 부터의 **선재 실패**(down) 블록
+          #   소스-스캔 드리프트·우리 회귀 아님, git stash 로 baseline 동일 확인분). 업스트림(teardown 담당)
+          #   수리 권고. 여기 포함하면 무관한 이유로 릴리스가 영구 차단된다.
+          echo "== 능력 파리티 7종 게이트 =="
+          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
+                   test_heal test_budget test_banner_truth; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== parity test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::능력 파리티 게이트 실패($t) — 반쪽마스터/편성 회귀. 릴리스 차단." >&2
+              echo "핀 관련 실패(C03/directive_compose)면 디렉티브 수정 PR 이 CONTENT_PINS 를 동기화하지 않은 것: " >&2
+              echo "  python3 cysjavis-pack/bin/javis_preflight.py --emit-drift 로 소실/신규 핀을 확인해 함께 고쳐라." >&2
+              exit 1
+            fi
+          done
           # Rust auto-restore 단위(재시도 seam·env 주입·B1·B3) + pack 소유권(B2).
           # ★--skip hwmon:: — hwmon 테스트는 실 GPU 전제(gpu.cores>0 단언)라 가상 러너에서 환경 FAIL
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).

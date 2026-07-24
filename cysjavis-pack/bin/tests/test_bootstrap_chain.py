@@ -32,7 +32,8 @@ def check(name, cond, detail=""):
 
 def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
              check_fail_times=0, check_final=0, socket="", check_needs_reviewers=False,
-             br_exit=0, pack_dept=None, claim_reject_msg=None, list_rows=None):
+             br_exit=0, pack_dept=None, claim_reject_msg=None, list_rows=None,
+             heal_needs=0, heal_exit=0):
     """임시 HOME + 가짜 팩 + 스텁 생성 → 환경 dict 반환.
     pack_dept=<부서명>: 팩을 ~/.cys/pack-dept-<부서명>에 만들고 CYS_PACK_DIR로 지정
     (증분1 레인↔팩 정합 가드 — 부서 소켓 레인은 같은 부서 팩 페어링 필수·불일치=exit 8).
@@ -98,6 +99,19 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
       "open('%s/formation.log','a').write(' '.join(sys.argv[1:])+'\\n')\n"
       "print(json.dumps({'ok':True,'state':'complete','kind':'complete'}))\n"
       "sys.exit(0)\n" % tmp, 0o644)
+    # 스텁 javis_directive_heal.py — W5(DD-5) 배선 ② 프리플라이트 치유 밀폐. `needs`(exit=heal_needs:
+    #  1=치유 필요·0=무결)·`heal`(exit=heal_exit)로 needs-only·비치명 계약을 검증한다(실 치유 로직은
+    #  test_heal.py 밀폐 검증). 호출 순서·인자는 heal.log 에 기록.
+    w(os.path.join(pack, "bin", "javis_directive_heal.py"),
+      "import json,sys\n"
+      "cmd=sys.argv[1] if len(sys.argv)>1 else ''\n"
+      "open('%s/heal.log','a').write(' '.join(sys.argv[1:])+'\\n')\n"
+      "if cmd=='needs':\n"
+      "    print(json.dumps({'needs_heal': bool(%d)})); sys.exit(%d)\n"
+      "if cmd=='heal':\n"
+      "    print(json.dumps({'detail':'stub heal','healed': %s})); sys.exit(%d)\n"
+      "sys.exit(0)\n" % (tmp, heal_needs, heal_needs,
+                         "True" if heal_exit == 0 else "False", heal_exit), 0o644)
 
     env = dict(os.environ)
     # ★_surface_id_env 우선순위(AITERM_→JAVIS_→CYS_)에서 CYS_SURFACE_ID=7이 권위를 갖도록 상위 키 제거
@@ -324,6 +338,58 @@ os.remove(marker_path(home))
 shutil.rmtree(os.path.join(home, ".cys", "state"))
 check("8a 삭제 후 assert-ready=5(게이트=순수 추가 제약)", run(env, "assert-ready")[0] == 5)
 check("8b 재부트로 재생성", run(env)[0] == 0 and os.path.exists(marker_path(home)))
+shutil.rmtree(tmp)
+
+# ── 10. W5(DD-5) 치유 프리플라이트 배선 (T4 연기분 랜딩·T5) ──
+def heal_log(tmp):
+    p = os.path.join(tmp, "heal.log")
+    return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+
+
+def boot_steps(home):
+    p = os.path.join(home, ".cys", "state", "boot-last.json")
+    return [s["step"] for s in (json.load(open(p, encoding="utf-8")) or {}).get("steps", [])] \
+        if os.path.exists(p) else []
+
+
+# 10a: base 소켓 + needs=1 → heal 발화·부트 성공. needs-only 계약(needs 판정 후에만 heal).
+tmp = tempfile.mkdtemp(prefix="boot-t10a-")
+env, home = make_env(tmp, heal_needs=1, heal_exit=0)
+code, out, err = run(env)
+check("10a needs=1 base 부트 성공(치유 비봉쇄)", code == 0, "exit=%d err=%s" % (code, err[-160:]))
+hl = heal_log(tmp)
+check("10b needs 감지 호출", "needs" in hl, hl)
+check("10c needs=1 이면 heal 발화", "heal --json" in hl or "\nheal" in ("\n" + hl), hl)
+check("10d ①′heal 단계 기록", "①′heal" in boot_steps(home))
+shutil.rmtree(tmp)
+
+# 10e: base 소켓 + needs=1 + heal 실패(exit 2) → 부트 여전히 성공(완전 비치명 R10).
+tmp = tempfile.mkdtemp(prefix="boot-t10e-")
+env, home = make_env(tmp, heal_needs=1, heal_exit=2)
+code, out, err = run(env)
+check("10e heal 실패(exit2)여도 부트 성공(비치명)", code == 0, "exit=%d err=%s" % (code, err[-160:]))
+check("10f heal 시도 기록(실패해도 표면화)", "heal" in heal_log(tmp))
+shutil.rmtree(tmp)
+
+# 10g: base 소켓 + needs=0 → heal 미발화(needs-only 가드 — 무결 시 무동작).
+tmp = tempfile.mkdtemp(prefix="boot-t10g-")
+env, home = make_env(tmp, heal_needs=0)
+code, out, err = run(env)
+check("10g needs=0 부트 성공", code == 0, "exit=%d" % code)
+hl = heal_log(tmp)
+check("10h needs=0 이면 heal 미발화(needs-only)",
+      "needs" in hl and not any(ln.strip().startswith("heal") for ln in hl.splitlines()), hl)
+shutil.rmtree(tmp)
+
+# 10i: 부서 소켓 → base 전용 가드로 치유 프리플라이트 자체 생략(needs 조차 미호출 —
+#      부서 팩 recompose 오발화 차단·부서 치유는 heal-all 소관).
+tmp = tempfile.mkdtemp(prefix="boot-t10i-")
+dept_sock = os.path.join(tmp, "state", "cys-dept-dept-9", "cys.sock")
+env, home = make_env(tmp, socket=dept_sock, pack_dept="dept-9", heal_needs=1)
+code, out, err = run(env)
+check("10i 부서 레인 부트 성공", code == 0, "exit=%d err=%s" % (code, err[-160:]))
+check("10j 부서 레인은 치유 프리플라이트 생략(needs 미호출)", heal_log(tmp) == "", heal_log(tmp))
+check("10k 부서 레인도 ①′heal 생략-기록", "①′heal" in boot_steps(home))
 shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")

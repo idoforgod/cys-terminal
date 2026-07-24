@@ -4055,9 +4055,80 @@ class Preflight:
         return buf
 
 
+# ── DD-6 핀-드리프트 리포트 (디렉티브 수정 PR 에서 핀 동기 여부를 사람이 읽는 리포트로) ──
+# 배경: CONTENT_PINS(C03 게이트의 진실)와 실제 디렉티브가 어긋나면 (a) 소실 핀 = 디렉티브가
+# 개정돼 조항이 사라졌는데 핀이 남음(게이트가 유령 조항을 요구) (b) 신규 앵커 = 디렉티브에 새
+# 절대조항이 생겼는데 핀 미등록(게이트가 소실을 못 잡음). 릴리스 게이트(release.yml)의 C03 은
+# strict 이므로, 디렉티브를 고치는 PR 은 이 리포트로 핀 동기 수정을 함께 해야 게이트가 통과한다.
+_DRIFT_ANCHOR_MARKERS = ("🔒", "제거 금지", "절대", "앵커", "ANCHOR", "불가침", "의무", "금지")
+
+
+def emit_drift():
+    """CONTENT_PINS 대비 현 디렉티브의 (소실 핀·신규 앵커 후보)를 사람이 읽는 리포트로 stdout 출력.
+    ★리포트 전용 — 항상 exit 0(비0 아님). 판정·차단은 C03 게이트(strict) 몫이고, 이 모드는 PR 저자가
+    핀을 어디에 맞춰 고쳐야 할지 알려주는 진단이다."""
+    ddir = os.path.join(pack_dir(), "directives")
+    print("═" * 68)
+    print("핀-드리프트 리포트 (DD-6) — CONTENT_PINS ↔ %s" % ddir)
+    print("═" * 68)
+    total_lost = 0
+    total_cand = 0
+    for fn, pins in CONTENT_PINS.items():
+        path = os.path.join(ddir, fn)
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            print("\n■ %s — 읽기 불가(%s) — 스킵" % (fn, path))
+            continue
+        lost = [(pin, label) for pin, label in pins if pin not in text]
+        # 신규 앵커 후보(휴리스틱): 앵커 마커를 가진 줄 중 어떤 기존 핀 substring 도 담지 않은 줄.
+        pin_strs = [pin for pin, _ in pins]
+        cand = []
+        seen = set()
+        for ln in text.splitlines():
+            s = ln.strip()
+            if len(s) < 12:
+                continue
+            if not any(mk in s for mk in _DRIFT_ANCHOR_MARKERS):
+                continue
+            if any(pin in ln for pin in pin_strs):   # 이미 핀이 커버하는 줄 → 후보 아님
+                continue
+            key = s[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            cand.append(s[:100])
+        print("\n■ %s — 핀 %d개 · 소실 %d · 신규앵커후보 %d"
+              % (fn, len(pins), len(lost), len(cand)))
+        if lost:
+            print("  [소실 핀] (디렉티브에서 사라진 조항 — PR 이 조항을 정말 제거했다면 CONTENT_PINS 에서 함께 삭제,")
+            print("            의도치 않은 소실이면 디렉티브 복원):")
+            for pin, label in lost:
+                print("    - %-40r  ← %s" % (pin, label))
+        if cand:
+            print("  [신규 앵커 후보] (핀 미등록 절대조항으로 보이는 줄 — 핀 추가를 검토하라·휴리스틱):")
+            for c in cand[:20]:
+                print("    + %s" % c)
+            if len(cand) > 20:
+                print("    … 외 %d줄" % (len(cand) - 20))
+        if not lost and not cand:
+            print("  드리프트 없음(핀 전부 존재·신규 앵커 후보 0).")
+        total_lost += len(lost)
+        total_cand += len(cand)
+    print("\n" + "─" * 68)
+    print("요약: 소실 핀 %d · 신규 앵커 후보 %d · 검사 디렉티브 %d"
+          % (total_lost, total_cand, len(CONTENT_PINS)))
+    print("갱신 절차: 디렉티브를 고치는 PR 은 이 리포트를 확인해 CONTENT_PINS 를 동기화하라 "
+          "(소실=핀 삭제/복원 판단·신규앵커=핀 추가). 그래야 release.yml C03 strict 게이트가 통과한다.")
+    print("※ 리포트 전용 — 이 모드는 항상 exit 0(차단은 C03 게이트 몫).")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="CYSJavis 결정론 부트 프리플라이트")
     ap.add_argument("--fix", action="store_true", help="수리 가능한 항목 자동 수리")
+    ap.add_argument("--emit-drift", action="store_true",
+                    help="DD-6 핀-드리프트 리포트만 출력(CONTENT_PINS↔디렉티브 소실/신규 — 리포트 전용·exit 0)")
     # OPP-17: --fix 의 시스템 변경을 단일 Mutation 게이트로 수렴.
     ap.add_argument("--dry-run", action="store_true",
                     help="변경 없이 --fix 가 무엇을 할지 미리보기('[dry-run] Would …')")
@@ -4069,6 +4140,10 @@ def main():
     ap.add_argument("--skip", action="append", default=[], metavar="ID",
                     help="해당 검사 건너뜀 (예: --skip C12.daemon)")
     args = ap.parse_args()
+
+    # DD-6: 핀-드리프트 리포트 모드 — 다른 검사 없이 리포트만 내고 exit 0(리포트 전용).
+    if getattr(args, "emit_drift", False):
+        return emit_drift()
 
     if args.safe and (args.dry_run or args.fix):
         ap.error("--safe 는 --dry-run/--fix 와 동시 사용 불가")

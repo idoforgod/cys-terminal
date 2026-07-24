@@ -1,0 +1,120 @@
+name: ci-branch
+
+# 브랜치 푸시 기계검증(W4·능력 파리티). 로컬 맥에 cargo·bun 부재 → 이 워크플로우가 유일한
+# 컴파일·bun·크로스플랫폼 파리티 검증 경로다. 태그·릴리스 트리거 없음(feat/** push 전용).
+# 릴리스 게이트(release.yml)와 별개 — 이건 브랜치 개발 중 회귀를 조기에 잡는 가벼운 CI다.
+
+on:
+  push:
+    branches: ['feat/**']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.95.0'      # release.yml BROWSER_RUST_TOOLCHAIN 과 동일
+  BUN_VERSION: '1.3.8'          # release.yml BROWSER_BUN_VERSION 과 동일
+
+jobs:
+  # 잡1 — macOS: Rust 컴파일 체크(T3 main.rs slug 등) + 파리티 팩 테스트 + cys-dept 문법.
+  macos-rust-pack:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ci-branch-macos
+
+      # cys-app(src-tauri) 컴파일은 generate_context!(tauri-codegen)가 frontendDist(ui/dist)와
+      # bundle 자원(binaries/cys-<triple>·cysd·resources/pack.tar.gz·pack-manifest.json) **실재**를
+      # 요구한다 — 이것이 없으면 `cargo check -p cys-app` 가 컴파일 패닉한다(release.yml 동일 관례).
+      # bundle-prep.sh(= beforeBuildCommand 와 같은 스크립트)가 그 산출물을 표준 경로로 만든다.
+      # runtime/ 만 별도 소관이라 존재 검사용 빈 디렉터리를 미리 만든다.
+      - name: bundle-prep (cys-app 컴파일 전제 자원 생성)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/runtime
+          bash scripts/bundle-prep.sh
+
+      # T3 의 Rust 변경(src-tauri/src/main.rs spawn_orchestra_boot 소켓 slug 동봉) 컴파일 확증.
+      # check 만(테스트·hwmon 실행 아님). 워크스페이스 전 멤버(root cys-terminal·cys-app·supervisor).
+      - name: cargo check --workspace
+        shell: bash
+        run: cargo check --workspace
+
+      # 능력 파리티 7종(반쪽마스터·편성 회귀 조기 차단). 어느 하나 비0이면 set -e 로 잡 실패.
+      - name: 능력 파리티 팩 테스트 (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
+                   test_heal test_budget test_banner_truth; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== parity(mac): $t =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$f"
+          done
+          # bootstrap 체인(heal 프리플라이트 배선 포함) 회귀도 함께.
+          CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_bootstrap_chain.py
+
+      - name: bash -n cys-dept (문법 게이트)
+        shell: bash
+        run: bash -n cysjavis-pack/bin/cys-dept
+
+  # 잡2 — macOS: UI bun 테스트(bootbanner.test.ts 포함 — T3 배너 소켓 스코핑·백스톱 순수함수).
+  macos-ui-bun:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # 리포 관례: `cd ui && bun test`(package.json scripts.test = "bun test"). ui/src/*.test.ts 전건
+      # (bootbanner.test.ts = T3 배너 소켓 스코핑·edge-race 백스톱 순수함수 단위) 실행.
+      - name: bun test ui (bootbanner 포함)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          bun install --frozen-lockfile || bun install
+          bun test
+
+  # 잡3 — Windows: 파리티 팩 테스트(크로스플랫폼 회귀 — fcntl→msvcrt·경로·CRLF).
+  windows-pack:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # windows-build.yml 의 파리티 게이트와 동일 방식(러너 프리인스톨 python). test_parity_paths 의
+      # 실 mock-agent 주입 e2e 는 posix 전용이라 nt 자기-스킵. teardown_atomicity 는 게이트 제외(선재).
+      - name: 능력 파리티 팩 테스트 (Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          "$PY" --version
+          for t in test_directive_compose test_cli_probe test_formation test_parity_paths \
+                   test_heal test_budget test_banner_truth; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== parity(win): $t =="
+            CYS_PACK_DIR="$(mktemp -d)" "$PY" "$f"
+          done

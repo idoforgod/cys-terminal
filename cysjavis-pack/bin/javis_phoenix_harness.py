@@ -98,6 +98,23 @@ def shutil_which(name):
     return shutil.which(name)
 
 
+def _resolve_claude():
+    """DD-2 완성: claude 탐지를 로그인셸 프로브(javis_cli_probe.resolve_cli)로 단일화한다.
+    GUI/launchd 빈곤 PATH에서 record-cli를 돌려도 로그인셸 rc(기능2 우산)로 해석해 오판 0.
+    ★import/probe 실패는 shutil.which 폴백(record 도구가 어떤 환경에서도 죽지 않게 — R10 정신).
+    (record-cli는 부트 경로가 아닌 수동/CI 스텁-시드 도구라 저위험이며, 다른 claude 탐지부와
+     동일 계약으로 수렴시켜 DD-2 '단일 감지 함수' 불변식을 완성한다.)"""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import javis_cli_probe
+        p = javis_cli_probe.resolve_cli("claude")
+        if p:
+            return p
+    except Exception:
+        pass
+    return shutil_which("claude")
+
+
 def _resolve_cys():
     p = shutil_which("cys")
     return p or "cys"
@@ -618,7 +635,7 @@ def cmd_record_cli(args):
     ⚠ LLM 작업 지시 절대 금지 — 메시지 미전송, 기동/ready까지만, 토큰 최소."""
     guard_isolation()
     os.makedirs(RECORD_DIR, exist_ok=True)
-    which_claude = shutil_which("claude")
+    which_claude = _resolve_claude()   # DD-2: 로그인셸 프로브 단일화(shutil.which 폴백)
     result = {"claude_path": which_claude}
     if not which_claude:
         die("claude CLI를 찾을 수 없다")

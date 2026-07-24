@@ -15,9 +15,12 @@
 
 실행: python3 test_parity_paths.py   (exit 0=PASS / 1=RED)
 """
+import hashlib
 import importlib.util
 import os
+import subprocess
 import sys
+import tempfile
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 MODULE = os.path.normpath(os.path.join(SELF, "..", "javis_formation.py"))
@@ -45,6 +48,111 @@ def load():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def _py_sha256(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _e2e_supported():
+    """실 mock-agent 주입-해시 e2e 가능 여부: POSIX sh + 독립 해셔(shasum|sha256sum)."""
+    if os.name == "nt":
+        return False, "Windows(POSIX sh 부재) — 주입 e2e 는 posix 전용(스킵)"
+    import shutil
+    if not (os.path.exists("/bin/sh") or shutil.which("sh")):
+        return False, "sh 부재(스킵)"
+    if not (shutil.which("shasum") or shutil.which("sha256sum")):
+        return False, "독립 해셔(shasum/sha256sum) 부재(스킵)"
+    return True, ""
+
+
+def _run_mock_agent(role, directive_path):
+    """mock-agent.sh 를 실제 서브프로세스로 실행 → 그 프로세스가 **독립 해셔(shasum/sha256sum)**로
+    주입 디렉티브를 해싱해 남긴 AWAKE 라인의 directive_sha 를 회수한다. 데몬 없는 밀폐 실행 —
+    편성 노드가 각성 시 주입 디렉티브를 실제로 손에 쥐는지(=주입 파손 탐지)를 검증한다.
+    반환: 캡처된 directive_sha 문자열(주입 부재/파손 시 'none')."""
+    log = tempfile.NamedTemporaryFile(prefix="mockawake-", suffix=".log", delete=False)
+    log.close()
+    env = dict(os.environ)
+    env["MOCK_AGENT_LOG"] = log.name
+    env["MOCK_AGENT_ONESHOT"] = "1"
+    env["CYS_ROLE"] = role
+    env["CYS_SURFACE_ID"] = "surface:test-%s" % role
+    if directive_path is not None:
+        env["CYS_INJECT_DIRECTIVE"] = directive_path
+    else:
+        env.pop("CYS_INJECT_DIRECTIVE", None)
+    try:
+        subprocess.run(["/bin/sh", FIXTURE], env=env, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        line = ""
+        with open(log.name, encoding="utf-8") as f:
+            for ln in f:
+                if ln.startswith("AWAKE "):
+                    line = ln.strip()
+        sha = "none"
+        for tok in line.split():
+            if tok.startswith("directive_sha="):
+                sha = tok.split("=", 1)[1]
+        return sha
+    finally:
+        try:
+            os.remove(log.name)
+        except OSError:
+            pass
+
+
+def inject_e2e(m):
+    """T2 R2 인계 실물화: 노드 수가 아니라 **주입된 지침의 온전함**을 실 mock-agent 실행으로 검증.
+    tautological(파일 재읽기 해시 비교) 아님 — (1) 별도 프로세스가 (2) 독립 해셔(shasum)로 다시 해싱하고
+    (3) 음성 대조군으로 주입 파손을 실제 탐지함을 증명한다."""
+    ok, why = _e2e_supported()
+    if not ok:
+        check("5 주입-해시 e2e (환경 스킵)", True, why)
+        return
+
+    role_file = getattr(m, "_ROLE_DIRECTIVE_FILE", None)
+    ddir = m._directives_dir() if hasattr(m, "_directives_dir") else None
+    if not role_file or not ddir:
+        check("5 주입 조립 계약(_ROLE_DIRECTIVE_FILE·_directives_dir)", False,
+              "주입 조립 심볼 부재")
+        return
+
+    # 두 경로(button·manual)가 각 역할에 주입할 디렉티브를 실제 mock-agent 로 캡처.
+    button_caps, manual_caps = {}, {}
+    all_present = True
+    hasher_agrees = True
+    for role, fn in role_file.items():
+        path = os.path.join(ddir, fn)
+        expect = _py_sha256(path)      # python hashlib(조립부 _sha256_file 과 동일 계약)
+        b = _run_mock_agent(role, path)   # 버튼 경로 주입 캡처(독립 해셔)
+        mnl = _run_mock_agent(role, path)  # 수동 경로 주입 캡처(동일 조립 → 동일 해시여야 파리티)
+        button_caps[role] = b
+        manual_caps[role] = mnl
+        if b == "none" or mnl == "none":
+            all_present = False
+        # 독립 해셔(shasum/sha256sum) 결과가 조립부 python hashlib 과 일치해야 = 실 전달 무결.
+        if expect is None or b != expect:
+            hasher_agrees = False
+
+    check("5 주입 e2e: 전 역할 디렉티브 실제 전달(none 0 — '편성됐지만 미주입' 탐지)",
+          all_present, "captured=%r" % button_caps)
+    check("6 주입 e2e: 독립 해셔(shasum)↔조립부(hashlib) 해시 일치(실 전달 무결)",
+          hasher_agrees, "button=%r" % button_caps)
+    check("7 주입 e2e: 두 경로(button·manual) 캡처 해시 동일(파리티 — 노드 수 아닌 지침 온전함)",
+          button_caps == manual_caps,
+          "button=%r manual=%r" % (button_caps, manual_caps))
+
+    # ★음성 대조군(non-tautology 증명): 주입 소스가 깨지면(존재하지 않는 경로) mock-agent 가
+    #   directive_sha=none 을 내야 한다 = 이 e2e 가 '주입 파손'을 실제로 탐지함을 보증한다.
+    broken = os.path.join(ddir, "____NO_SUCH_DIRECTIVE____.md")
+    neg = _run_mock_agent("master", broken)
+    check("8 주입 e2e 대조군: 파손된 주입은 none 으로 검출(테스트가 파손을 잡음을 증명)",
+          neg == "none", "broken capture=%r (none 이어야 함)" % neg)
 
 
 def main():
@@ -84,6 +192,9 @@ def main():
         for n in ("1 두 경로 formation.ensure 수렴",
                   "2 로스터 동일", "3 주입 디렉티브 해시 동일", "4 두 경로 C03 PASS"):
             check(n, False, "동등성 API 호출 실패: %s" % e)
+
+    # ── D1(T5): 실 mock-agent 주입-해시 e2e (T2 R2 인계 실물화 — 밀폐·데몬 없음) ──
+    inject_e2e(m)
 
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1

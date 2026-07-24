@@ -737,6 +737,47 @@ def _run_formation_ensure(py, log):
         "state": "unknown", "exit": code, "raw": out[:200]}
 
 
+def _run_heal_preflight(py, log):
+    """W5(DD-5) 배선 ②: 부트 프리플라이트에 가드된 비치명 디렉티브 치유 체크(T4 연기분 랜딩).
+
+    계약(R10 부트체인 무해성 절대 준수):
+      • **needs 감지 시에만** 치유 시도 — read-only `needs`(exit 1=필요)로 먼저 판정, 무결이면 무동작.
+      • **base 소켓 전용** — 부서 레인 팩에 `heal`(do_recompose=True)을 걸면 recompose 가 PACK_DEFAULT
+        ($HOME/.cys/pack)로 잘못 향하므로(T4 FIX-UP 확인분) base 레인에서만 발화한다. 부서 팩 치유는
+        pack-update 사후 `heal-all`(부서 sync 포함) 경로 소관 — 여기서 건드리지 않는다.
+      • **부트 락 존중** — `heal`(=heal_base)은 wait_boot_lock 을 타지 않는 빠른 파일 복원이라 부트와
+        락 순서 경합 0(부서 sync·reinject 를 도는 heal-all 은 여기서 쓰지 않는다). 그래도 idempotent.
+      • **완전 비치명** — needs/heal 의 어떤 비0 exit·예외·타임아웃도 master 각성/부트 체인을 블록하지
+        않는다(로그만 남기고 계속). 반쪽마스터를 만나면 조용히 고치되, 못 고쳐도 부트는 진행한다.
+    """
+    if not _is_base_socket():
+        log.step("①′heal", 0, "부서 소켓 컨텍스트 — base 치유 프리플라이트 생략(부서 팩은 heal-all 소관)")
+        return
+    heal = os.path.join(PACK, "bin", "javis_directive_heal.py")
+    if not os.path.isfile(heal):
+        log.step("①′heal", 0, "javis_directive_heal.py 부재 — 치유 프리플라이트 생략(계속)")
+        return
+    try:
+        # needs: read-only 감지(exit 1=치유 필요 / 0=무결 / 2=내부오류). 필요할 때만 heal 발화.
+        code, out = _run([py, heal, "needs", "--json"], timeout=30)
+        if code != 1:
+            log.step("①′heal", 0, "치유 불요(needs exit=%d) — 무동작" % code)
+            return
+        _progress("①′ 반쪽마스터 디렉티브 감지 — 결정론 치유(비치명·부트 비봉쇄)…")
+        hc, hout = _run([py, heal, "heal", "--json"], timeout=60)
+        # heal exit: 0=성공/불요 · 1=필요하나 복원 실패(비치명) · 2=내부오류(비치명).
+        healed = ""
+        try:
+            healed = (json.loads(hout.strip().splitlines()[-1]) or {}).get("detail", "")[:160]
+        except Exception:
+            healed = (hout or "")[:160]
+        log.step("①′heal", 0, "heal 실행(exit=%d·비치명): %s" % (hc, healed))
+        if hc != 0:
+            _progress("⚠ ①′ 치유 미완(비치명) — 부트 계속(라이브 반쪽마스터는 W5 doctor/heal-all 로 재시도)")
+    except Exception as e:
+        log.step("①′heal", 0, "치유 프리플라이트 예외(무해 skip): %s" % e)
+
+
 def cmd_issue_ticket(argv):
     """DEPRECATED no-op — CEO 티켓 게이트는 W2 조건화 상비 편성으로 폐지됐다(DD-4).
     구 문서·스크립트 하위호환을 위해 경고만 내고 exit 0(파손 방지). 1개 마이너 릴리스 후 삭제 예정."""
@@ -856,6 +897,10 @@ def cmd_run():
             _progress("⚠ preflight 잔여 FAIL(비치명) — 팀 부팅 계속·진짜 게이트는 ⑤ check. 상세 boot-last.json")
     else:
         log.step("①preflight", 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
+
+    # ①′ 디렉티브 치유 프리플라이트(W5·DD-5 배선 ② — T4 연기분) — needs 시에만·base 전용·완전 비치명.
+    # 반쪽마스터(스텁 디렉티브) 설치본을 부트 초입에 결정론 복원하되, 실패해도 부트를 막지 않는다(R10).
+    _run_heal_preflight(py, log)
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)
     _progress("② 데몬 생존 확인…")
