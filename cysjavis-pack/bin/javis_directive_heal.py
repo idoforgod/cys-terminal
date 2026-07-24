@@ -121,27 +121,43 @@ def needs_heal_path(path):
 
 
 # ── 2) base 복원 ─────────────────────────────────────────────────────────
-def _c03_ok(text):
-    """복원 소스 무결성 게이트: 스텁 아님 + (표준 대장 일치 OR 실질 base 크기). javis_preflight 부재 환경
-    (테스트·오프라인)에서도 결정론. 라이브 preflight C03 핀은 부트 ⓪ 에서 별도 재검증(이 게이트는 소스 신뢰선)."""
+# ★리뷰어1 fix#1(정확일치 불변식·감지↔복원 대칭): 복원 소스 신뢰는 **정확일치·배포신뢰 루트만**.
+#   감지가 "스텁 대장 sha256 정확일치(퍼지 금지)"인 것과 대칭으로, 복원도 사용자 수정본을 임의 base 로
+#   덮지 않는다. 종전 `len>=8000` 크기 퍼지 승인은 폐지 — 크기·핀은 **진단 경고로만**(신뢰 판정 불사용).
+def _size_diag(text):
+    """진단 경고 전용(신뢰 판정 불사용): 표준 base≈28~36KB·스텁≈4.5KB. 소재 크기 이상 시 경고 문자열/None."""
+    if text is None:
+        return "소스 없음"
+    return None if len(text) >= 8000 else "소스 크기 이상(<8KB — 스텁/절단 의심)"
+
+
+def _base_trusted(text, source_name):
+    """복원 소스 수용 규칙(퍼지 금지·감지↔복원 대칭):
+      (a) sha256(base) ∈ base_hashes.json 대장 — 정확일치 표준 base(최고 신뢰), 또는
+      (b) source == 'pack-self' — heal 코드와 **동봉 배포**된 팩 자신의 표준 base(identity by
+          distribution: 서명·배포된 팩 루트라 퍼지 아님).
+    스텁은 어느 소스·어느 규칙이든 **절대 거부**(치유 자기부정 차단·불변식 — 스텁 pack-self 도 거부).
+    .pristine·.pre-ceo·pack-target 은 (a) 통과 시에만 수용(크기·핀은 신뢰 판정에 불사용)."""
     if text is None:
         return False
     sha = _sha256_text(text)
-    if sha in _stub_hashes():          # 스텁을 base 로 되쓰면 치유가 자기부정 — 절대 거부
+    if sha in _stub_hashes():          # 스텁을 base 로 되쓰기 금지(감지↔복원 대칭 불변식·최우선)
         return False
-    if sha in _base_hashes():          # 알려진 표준 base — 최고 신뢰
+    if sha in _base_hashes():          # (a) 정확일치 표준 base
         return True
-    return len(text) >= 8000           # 대장 밖이라도 실질 base(스텁 4.5KB≪, 표준 28~36KB) 크기 방어선
+    if source_name == "pack-self":     # (b) 배포 신뢰 루트(동봉 팩 자신 — 스텁 아님이 위에서 보장됨)
+        return True
+    return False                       # .pristine/.pre-ceo/pack-target = (a) 통과 필수(퍼지 승인 없음)
 
 
 def _candidate_bases(pack):
-    """복원 소스 우선순위 생성기: (이름, 경로, 텍스트). .pristine → .pre-ceo → 팩 소스(PACK_SELF)."""
+    """복원 소스 우선순위 생성기: (이름, 경로). .pristine → .pre-ceo → 팩 소스(PACK_SELF) → 대상 자신."""
     md = os.path.join(pack, MD_REL)
-    yield (".pristine", os.path.join(pack, ".pristine", MD_REL), None)
-    yield (".pre-ceo", md + ".pre-ceo", None)
-    # 팩 자기 소스: 대상 팩의 것이 스텁일 수 있으니 PACK_SELF(동봉 권위) 도 후보로.
-    yield ("pack-self", os.path.join(PACK_SELF, MD_REL), None)
-    yield ("pack-target", md, None)
+    yield (".pristine", os.path.join(pack, ".pristine", MD_REL))
+    yield (".pre-ceo", md + ".pre-ceo")
+    # 팩 자기 소스(배포 신뢰 루트): 대상 팩이 스텁이어도 PACK_SELF(동봉 권위) 의 표준 base 로 복원.
+    yield ("pack-self", os.path.join(PACK_SELF, MD_REL))
+    yield ("pack-target", md)
 
 
 def _atomic_write(path, text):
@@ -156,24 +172,29 @@ def _atomic_write(path, text):
 
 
 def restore_base(pack):
-    """우선순위 소스에서 첫 무결(C03 게이트 통과) base 로 MASTER_DIRECTIVE 를 원자 교체.
-    반환: (ok, source, detail)."""
+    """우선순위 소스에서 첫 **신뢰**(정확일치 OR pack-self 배포루트) base 로 MASTER_DIRECTIVE 원자 교체.
+    신뢰 소스 부재 = **자동 변경 0**·merge-pending 회부(사용자 수정본 보호). 반환: (ok, source, detail)."""
     md = os.path.join(pack, MD_REL)
-    for name, src, _ in _candidate_bases(pack):
-        if os.path.abspath(src) == os.path.abspath(md):
-            # 대상 자신: 이미 무결하면 복원 불요(멱등), 스텁이면 스킵.
-            cur = _read(md)
-            if _c03_ok(extract_base(cur) if cur else None):
-                return True, name, "대상 base 이미 무결(no-op)"
+    warns = []
+    for name, src in _candidate_bases(pack):
+        if name == "pack-target":
+            # 대상 자신 = 감지된 스텁(restore 는 needs_heal True 시만 호출) — 신뢰 소스 아님, 스킵.
             continue
         text = _read(src)
         if text is None:
             continue
         base = extract_base(text)      # 소스가 합성물이어도 base 만 취함
-        if _c03_ok(base):
+        diag = _size_diag(base)
+        if _base_trusted(base, name):
             _atomic_write(md, base)
-            return True, name, "%s 에서 표준 base 복원(%s)" % (name, _sha256_text(base)[:16])
-    return False, None, "무결 복원 소스 없음(.pristine/.pre-ceo/팩 소스 전부 부적격) — merge-pending 회부 권장"
+            wd = (" · 진단경고:%s" % diag) if diag else ""
+            return True, name, "%s 에서 표준 base 복원(%s)%s" % (name, _sha256_text(base)[:16], wd)
+        if diag:
+            warns.append("%s:%s" % (name, diag))
+    detail = "신뢰 복원 소스 없음(정확일치/배포루트 부재) — 자동 변경 0·merge-pending 회부(사용자 수정본 보호)"
+    if warns:
+        detail += " [진단:%s]" % "; ".join(warns)
+    return False, None, detail
 
 
 # ── recompose 재사용(cys-dept — 직접 재구현 금지) ──────────────────────────
@@ -268,15 +289,40 @@ def _copy_system_files(dst_pack):
     return copied
 
 
+def _valid_pack_dir(pack_dir):
+    """★리뷰어1 fix#5: 부서 pack_dir 검증 — realpath·is_dir·홈 하위 봉쇄(경로 탈출 차단). 이상 엔트리는
+    경고 후 skip(임의 경로에 System 파일 대량 복사·apply 방지). 반환: (ok, real_or_reason)."""
+    if not pack_dir:
+        return False, "no-pack_dir"
+    try:
+        real = os.path.realpath(pack_dir)
+        home = os.path.realpath(os.path.expanduser("~"))
+    except OSError as e:
+        return False, "realpath 실패: %s" % e
+    if not os.path.isdir(real):
+        return False, "존재하지 않는 디렉토리(is_dir False)"
+    try:
+        contained = os.path.commonpath([real, home]) == home
+    except ValueError:
+        contained = False          # 다른 드라이브/혼합 경로 = 미봉쇄로 간주(보수적 거부)
+    if not contained:
+        return False, "홈 하위 아님(경로 탈출 차단): %s" % real
+    return True, real
+
+
 def _sync_one_dept(name, entry):
-    """부서 1개 sync: init-pack(보존) → 폴백 복사 → 디렉티브 치유 → alive 면 reinject. 반환: dict 결과."""
+    """부서 1개 sync: pack_dir 검증 → init-pack(보존) → 폴백 복사 → 디렉티브 치유 → alive 면 reinject."""
     pack_dir = entry.get("pack_dir")
     socket = entry.get("socket")
     res = {"dept": name, "pack_dir": pack_dir, "alive": False,
            "method": None, "healed": False, "reinject": "skip"}
-    if not pack_dir:
-        res["method"] = "no-pack_dir(skip)"
+    ok, real = _valid_pack_dir(pack_dir)
+    if not ok:
+        res["method"] = "이상 pack_dir skip(%s)" % real
+        log("부서 %s pack_dir 검증 실패 — skip: %s" % (name, real))
         return res
+    pack_dir = real
+    res["pack_dir"] = pack_dir
     alive = _sock_alive(socket)
     res["alive"] = alive
 
@@ -304,9 +350,11 @@ def _sync_one_dept(name, entry):
         n = _copy_system_files(pack_dir)
         res["method"] = "폴백 System 복사(%d파일)" % n
 
-    # ③ 부서 디렉티브 치유(base heal — 사용자 소유 헌법 파일도 스텁이면 결정론 복원)
+    # ③ 부서 디렉티브 치유(base heal — 사용자 소유 헌법 파일도 스텁이면 결정론 복원).
+    #   do_recompose=False: cys-dept recompose 는 PACK_DEFAULT($HOME/.cys/pack)만 대상이라 부서 팩에
+    #   대해 호출하면 엉뚱한 팩을 건드린다. 부서 디렉티브는 base 복원만(CEO 오버레이는 base-master 전용).
     try:
-        hb = heal_base(pack_dir, do_recompose=True)
+        hb = heal_base(pack_dir, do_recompose=False)
         res["healed"] = hb.get("healed", False)
         res["heal_detail"] = hb.get("detail")
     except Exception as e:
@@ -354,6 +402,24 @@ def _state_dir():
         os.path.join("~", ".cys", "state"))
 
 
+# ★리뷰어1 fix#3: DEMOTE_INCOMPLETE 마커 수명 완결. cys-dept ceo_demote 가 strip post-verify 불완전 시
+#   기록하는 마커(경로 규약 동일) — 치유가 성공하면 해소(제거)하고, needs(진단) 출력이 존재를 표면화한다.
+def _demote_marker_path():
+    return os.path.join(_state_dir(), "ceo-demote-incomplete")
+
+
+def _clear_demote_marker():
+    """demote 불완전 마커 제거(치유=해소). 존재해서 지웠으면 True, 없거나 실패면 False."""
+    p = _demote_marker_path()
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _boot_lock_present():
     """부트 진행 중 락 존재 여부(bootstrap-*.lock / cys-boot.lock 양 규약). 존재=부트 중."""
     import glob
@@ -395,8 +461,10 @@ def heal_base(pack=None, do_recompose=True):
     if do_recompose:
         rc, out = recompose(pack)
         rc_detail = " · recompose(rc=%s): %s" % (rc, out)
+    # ★fix#3: 치유 성공 = demote 불완전 마커 해소(존재 시 제거).
+    cleared = _clear_demote_marker()
     return {"pack": pack, "needs": True, "healed": True, "source": source,
-            "detail": detail + rc_detail}
+            "demote_marker_cleared": cleared, "detail": detail + rc_detail}
 
 
 # ── 전체 치유 오케스트레이션 ──────────────────────────────────────────────
@@ -457,8 +525,10 @@ def main(argv=None):
             pack = a.pack or target_pack()
             md = os.path.join(pack, MD_REL)
             need = needs_heal_path(md)
-            _emit({"pack": pack, "needs_heal": need,
-                   "sha": _sha256_file(md)}, a.json)
+            # ★fix#3 소비자: demote 불완전 마커 존재를 진단 출력에 표면화(마커의 단일 소비자 확보).
+            mk = _demote_marker_path()
+            _emit({"pack": pack, "needs_heal": need, "sha": _sha256_file(md),
+                   "demote_incomplete_marker": mk if os.path.exists(mk) else None}, a.json)
             return 1 if need else 0
         if a.cmd == "heal":
             r = heal_base(a.pack or target_pack(), do_recompose=True)

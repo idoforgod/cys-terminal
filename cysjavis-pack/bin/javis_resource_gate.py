@@ -83,16 +83,19 @@ FORMATION_BUDGET_DEFAULT = 20
 
 
 def _formation_budget_value(explicit=None):
-    """예산 해석 우선순위: 명시 인자 > CYS_FORMATION_BUDGET env > 기본 20. 파싱 실패는 기본값(보수)."""
+    """예산 해석 우선순위: 명시 인자 > CYS_FORMATION_BUDGET env > 기본 20.
+    ★리뷰어1 fix#4: env 파싱은 **양의 정수만** 수용 — 비숫자·공백·음수·0 은 기본 20 으로 폴백(오타 env 로
+    조직 기동이 우발 전면 차단되지 않게·부트 플로우 안전). 명시 인자는 호출자 책임이라 그대로 사용."""
     if explicit is not None:
         return explicit
     raw = os.environ.get(FORMATION_BUDGET_ENV)
     if raw is None:
         return FORMATION_BUDGET_DEFAULT
     try:
-        return int(raw)
+        v = int(raw)
     except (TypeError, ValueError):
         return FORMATION_BUDGET_DEFAULT
+    return v if v > 0 else FORMATION_BUDGET_DEFAULT
 
 
 class BudgetVerdict:

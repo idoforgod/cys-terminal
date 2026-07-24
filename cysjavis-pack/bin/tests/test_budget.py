@@ -75,6 +75,42 @@ def main():
           hasattr(m, "FORMATION_BUDGET_ENV") or "CYS_FORMATION_BUDGET" in (open(MODULE, encoding="utf-8").read()),
           "env 배선 미구현(RED)")
 
+    # 6. ★리뷰어1 fix#4: CYS_FORMATION_BUDGET env 음수/0/비숫자/공백 각 거동(오타 env=기본 20 폴백·
+    #    조직 기동 우발 전면차단 방지). 유효 양수만 수용. 각 케이스 실제 재현.
+    val = getattr(m, "_formation_budget_value", None)
+    env_name = getattr(m, "FORMATION_BUDGET_ENV", "CYS_FORMATION_BUDGET")
+    default = getattr(m, "FORMATION_BUDGET_DEFAULT", 20)
+    if callable(val):
+        import os as _os
+        saved = _os.environ.get(env_name)
+
+        def _with(raw):
+            if raw is None:
+                _os.environ.pop(env_name, None)
+            else:
+                _os.environ[env_name] = raw
+            try:
+                return val()   # explicit=None → env 경로
+            finally:
+                if saved is None:
+                    _os.environ.pop(env_name, None)
+                else:
+                    _os.environ[env_name] = saved
+
+        cases = {"음수": ("-5", default), "0": ("0", default),
+                 "비숫자": ("abc", default), "공백": ("   ", default),
+                 "유효양수(공백포함)": (" 30 ", 30)}
+        allok = True
+        detail = []
+        for label, (raw, want) in cases.items():
+            got = _with(raw)
+            ok = (got == want)
+            allok = allok and ok
+            detail.append("%s=%r→%s(want %s)%s" % (label, raw, got, want, "" if ok else "✗"))
+        check("6 budget env 음수/0/비숫자/공백/유효 각 거동(폴백 20)", allok, " ".join(detail))
+    else:
+        check("6 budget env 음수/0/비숫자/공백/유효 각 거동", False, "_formation_budget_value 미노출")
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
 
