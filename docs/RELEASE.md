@@ -360,4 +360,8 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 4곳(+wxs 2곳) 일치
+- [ ] **홈페이지 메인 DL-HERO 버전 동기**(`cys-homepage/_round/dlhero/RELEASE_BUMP_CHECK.md` 5지점:
+      링크 3개·S 슬롯 카피·용량·zip 전환 경로) 후 **원격 메인 페이지 구버전 문자열 0 확인**
+      (`curl -s https://www.cysinsight.com/ | grep -c '<이전버전>'` → 0). /downloads/만 갱신하면
+      메인 밴드가 구버전을 계속 배포한다(무증상 실패 — 2026-07-26 v0.13.17 사고).
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
