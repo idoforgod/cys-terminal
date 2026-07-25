@@ -175,13 +175,16 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
 /// 임시 guard 가 끝나며 락이 풀리고, 그 뒤 대상 큐를 잡는다. 두 leaf 락을 겹쳐 쥐면 반대 방향
 /// 승계와 AB-BA 데드락이 난다(코드 규약 '락 순서: surfaces → roles'의 연장선).
 fn migrate_seat_queue(prev: &Arc<crate::state::Surface>, next: &Arc<crate::state::Surface>) {
-    let drained: Vec<String> = prev.pending_queue.lock().unwrap().drain(..).collect();
+    // ★C1: 항목 메타(seq·origin·enqueued_at·idem_key·important)를 그대로 옮긴다 —
+    // 승계는 주소 이전이지 재발신이 아니다(TTL 시계·출처가 왜곡되면 안 된다).
+    let drained: Vec<crate::state::QueueItem> =
+        prev.pending_queue.lock().unwrap().drain(..).collect();
     if drained.is_empty() {
         return;
     }
     let mut nq = next.pending_queue.lock().unwrap();
-    for text in drained {
-        nq.push_back(text);
+    for item in drained {
+        nq.push_back(item);
     }
 }
 
@@ -1350,6 +1353,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
+                // ★C1: 큐 항목은 메타 보유 QueueItem. origin 판별은 C2(W2)에서 verified_from을
+                // 소비해 승격한다 — 이 단계에서는 정책이 없으므로 System 라벨로 둔다.
+                let item = crate::state::QueueItem::text(
+                    text.clone(),
+                    crate::state::QueueOrigin::system("send_text"),
+                );
                 let depth = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
@@ -1359,7 +1368,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(text.clone());
+                    q.push_back(item);
                     q.len()
                 };
                 daemon.bus.publish(
@@ -1490,6 +1499,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "--queued supports only Return/Enter (other keys cannot ride the text queue)",
                     ));
                 }
+                // ★C1: 빈 문자열 관행 → kind=ReturnKey. 배달 동작은 불변(빈 본문 Inject + CR)이고,
+                // 관찰·정책이 Return 큐잉을 텍스트와 구별할 수 있게 된다.
+                let item =
+                    crate::state::QueueItem::return_key(crate::state::QueueOrigin::system("send_key"));
                 let depth = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
@@ -1499,7 +1512,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(String::new());
+                    q.push_back(item);
                     q.len()
                 };
                 daemon.bus.publish(
@@ -3730,28 +3743,40 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let q = s.pending_queue.lock().unwrap();
-                for (i, text) in q.iter().enumerate() {
+                for (i, item) in q.iter().enumerate() {
+                    // ★C1: 출력 계약 보존 — 기존 키(surface_id·surface_ref·index·bytes·preview)는
+                    // 그대로 두고 메타만 **추가**한다(phoenix harness가 preview substring 매칭).
                     out.push(json!({
                         "surface_id": s.id, "surface_ref": surface_ref(s.id),
-                        "index": i, "bytes": text.len(),
-                        "preview": text.chars().take(80).collect::<String>(),
+                        "index": i, "bytes": item.bytes(),
+                        "preview": item.preview(),
+                        "seq": item.seq, "kind": item.kind.as_str(),
+                        "origin_class": item.origin.class(),
+                        "enqueued_at": item.enqueued_at,
+                        "idem_key": item.idem_key,
+                        "merged_count": item.merged_count,
+                        "important": item.important,
                     }));
                 }
             }
             // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
-            for it in daemon.restored_queue.lock().unwrap().iter() {
-                let sid_v = it.get("surface_id").cloned().unwrap_or(Value::Null);
+            for e in daemon.restored_queue.lock().unwrap().iter() {
                 if let Some(f) = filter_sid {
-                    if sid_v.as_u64() != Some(f) {
+                    if e.surface_id != f {
                         continue;
                     }
                 }
-                let text = it.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 out.push(json!({
-                    "surface_id": sid_v, "restored": true,
-                    "mid": it.get("mid").cloned().unwrap_or(Value::Null),
-                    "bytes": text.len(),
-                    "preview": text.chars().take(80).collect::<String>(),
+                    "surface_id": e.surface_id, "restored": true,
+                    "mid": e.mid,
+                    "bytes": e.item.bytes(),
+                    "preview": e.item.preview(),
+                    "seq": e.item.seq, "kind": e.item.kind.as_str(),
+                    "origin_class": e.item.origin.class(),
+                    "enqueued_at": e.item.enqueued_at,
+                    "idem_key": e.item.idem_key,
+                    "merged_count": e.item.merged_count,
+                    "important": e.item.important,
                 }));
             }
             Reply::Single(ok_response(&id, json!({"entries": out})))
@@ -3794,14 +3819,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            let dropped: Vec<String> = surface.pending_queue.lock().unwrap().drain(..).collect();
+            let dropped: Vec<crate::state::QueueItem> =
+                surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
                     Some(sid),
                     json!({"reason": "cleared", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
+                           "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
                 );
             }
             // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
@@ -6132,6 +6158,14 @@ mod tests {
         assert!(!daemon.surfaces.lock().unwrap().contains_key(&node));
     }
 
+    /// ★C1: 큐 픽스처 — 텍스트 항목(System origin).
+    fn test_queue_item(text: &str) -> crate::state::QueueItem {
+        crate::state::QueueItem::text(
+            text.to_string(),
+            crate::state::QueueOrigin::system("test"),
+        )
+    }
+
     fn queue_clear_rpc(daemon: &Arc<Daemon>, surface_id: u64, caller_pid: Option<u32>) -> Value {
         let req = Request {
             id: json!(1),
@@ -6161,8 +6195,8 @@ mod tests {
         {
             let victim_surface = daemon.surfaces.lock().unwrap()[&victim].clone();
             let mut q = victim_surface.pending_queue.lock().unwrap();
-            q.push_back("진짜 메시지 1".into());
-            q.push_back("진짜 메시지 2".into());
+            q.push_back(test_queue_item("진짜 메시지 1"));
+            q.push_back(test_queue_item("진짜 메시지 2"));
         }
 
         // 공격: attacker pane이 victim의 큐를 인멸 시도.
@@ -6189,7 +6223,7 @@ mod tests {
         bind_caller(&daemon, own_pid, own);
         daemon.surfaces.lock().unwrap()[&own]
             .pending_queue.lock().unwrap()
-            .push_back("내 큐".into());
+            .push_back(test_queue_item("내 큐"));
 
         let resp = queue_clear_rpc(&daemon, own, Some(own_pid));
         assert_eq!(resp["ok"], json!(true), "자기 큐 비우기가 막혔다 (응답: {resp})");
@@ -6208,7 +6242,7 @@ mod tests {
         let node = make_surface(&daemon, Some("worker-3"));
         daemon.surfaces.lock().unwrap()[&node]
             .pending_queue.lock().unwrap()
-            .push_back("큐".into());
+            .push_back(test_queue_item("큐"));
 
         let resp = queue_clear_rpc(&daemon, node, None);
         assert_eq!(

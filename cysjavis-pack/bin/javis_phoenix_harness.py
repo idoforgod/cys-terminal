@@ -362,8 +362,11 @@ def residual_report():
 def _wipe_daemon_state():
     """격리 데몬의 영속 surface 상태만 제거(topology·analytics·큐 등). ★phoenix/ dept-root/ 는 건드리지 않는다
     — 그건 phoenix 의 보호집합 roster 라 재기동을 넘어 보존돼야 한다(부활 단일 진실). HARN_DIR 만."""
+    # ★v0.13.17 C1: 큐 WAL이 v2 신규 파일(queue-state-v2.json)로 분리됐다 — 둘 다 지워야
+    # 드릴이 hermetic 하다(v2만 남으면 이전 드릴 큐가 신 데몬에 그대로 복원된다).
     for name in ("topology.json", "analytics.db", "analytics.db-shm", "analytics.db-wal",
-                 "event.seq", "queue-state.json", "schedule_state.json", "cys.lock",
+                 "event.seq", "queue-state.json", "queue-state-v2.json",
+                 "schedule_state.json", "cys.lock",
                  "autopilot.json", "feed.jsonl"):
         try:
             os.remove(os.path.join(HARN_DIR, name))

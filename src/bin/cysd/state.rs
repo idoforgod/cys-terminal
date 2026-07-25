@@ -17,6 +17,166 @@ const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// C1(v0.13.17) 큐 아이템 구조체화 — `VecDeque<String>` → `VecDeque<QueueItem>`.
+// TTL(C3)·멱등 병합(C4)·origin 정책(C2)은 전부 항목 메타를 전제하므로 타입 승격이 토대다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 데몬 전역 enqueue 시퀀스. 단조 증가·재기동 시 0에서 재시작(WAL 복원 항목은 자기 seq를
+/// 그대로 들고 오므로 재기동 직후 라이브 항목과 seq가 겹칠 수 있다 — seq의 계약은
+/// "동일 큐 안에서 항목을 구별한다"이지 전역 유일성이 아니다. `pop_delivered_head`의
+/// head-match 가드가 필요로 하는 성질은 그 국소 구별로 충족된다).
+static QUEUE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 다음 enqueue 시퀀스를 발급한다(멱등 교체 시 fresh seq 재발급 — C4).
+pub fn next_queue_seq() -> u64 {
+    QUEUE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 큐 항목의 종류. 기존 send_key 큐잉이 쓰던 "빈 문자열 관행"을 타입으로 대체한다 —
+/// 배달 동작은 불변(빈 본문 Inject + CR)이고, 관찰·정책이 Return 큐잉을 구별할 수 있게 된다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueItemKind {
+    Text,
+    ReturnKey,
+}
+
+impl QueueItemKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueueItemKind::Text => "text",
+            QueueItemKind::ReturnKey => "return_key",
+        }
+    }
+}
+
+/// 발신 출처 3분류(D2). 자기신고 `from`이 아니라 **커널 검증된** 발신 surface에서 파생한다.
+/// - `Agent`: verified 발신 surface가 launch-agent 등록(agent_meta 보유) — 정책(softcap·TTL) 대상.
+/// - `Human`: GUI 사람 입력 경로 — 정책 미적용.
+/// - `System`: 데몬 내부·익명(조상추적 미해소) — 정책 미적용.
+///
+/// ※ 설계 D2의 `Agent{surface,role}`에서 role을 `Option<String>`으로 둔다: agent_meta는 있는데
+///    role 미등록인 pane이 실재하므로(claim_role 전) 빈 문자열로 뭉개면 "role 없음"과 구별이 사라진다.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum QueueOrigin {
+    Agent {
+        surface: u64,
+        #[serde(default)]
+        role: Option<String>,
+    },
+    Human,
+    System {
+        #[serde(default)]
+        label: String,
+    },
+}
+
+impl QueueOrigin {
+    pub fn system(label: &str) -> Self {
+        QueueOrigin::System {
+            label: label.to_string(),
+        }
+    }
+    /// 이벤트·통계·정책 판정에 쓰는 분류 문자열.
+    pub fn class(&self) -> &'static str {
+        match self {
+            QueueOrigin::Agent { .. } => "agent",
+            QueueOrigin::Human => "human",
+            QueueOrigin::System { .. } => "system",
+        }
+    }
+    pub fn is_agent(&self) -> bool {
+        matches!(self, QueueOrigin::Agent { .. })
+    }
+    /// 발신 surface id(Agent만 보유) — C2-b 발신 통계 키.
+    pub fn sender_surface(&self) -> Option<u64> {
+        match self {
+            QueueOrigin::Agent { surface, .. } => Some(*surface),
+            _ => None,
+        }
+    }
+    pub fn role(&self) -> Option<&str> {
+        match self {
+            QueueOrigin::Agent { role, .. } => role.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+fn qi_default_kind() -> QueueItemKind {
+    QueueItemKind::Text
+}
+fn qi_default_origin() -> QueueOrigin {
+    QueueOrigin::system("wal-v1")
+}
+
+/// 인플라이트 큐 항목. WAL v2가 이 구조를 그대로 영속한다.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueItem {
+    /// 데몬 전역 enqueue 시퀀스 — `pop_delivered_head` head-match 가드의 대조 키.
+    pub seq: u64,
+    pub text: String,
+    #[serde(default = "qi_default_kind")]
+    pub kind: QueueItemKind,
+    /// epoch secs — TTL(C3) 판정 기준. WAL을 넘어 보존된다.
+    #[serde(default)]
+    pub enqueued_at: f64,
+    #[serde(default = "qi_default_origin")]
+    pub origin: QueueOrigin,
+    #[serde(default)]
+    pub idem_key: Option<String>,
+    #[serde(default)]
+    pub merged_count: u32,
+    /// TTL 면제 선언(C4 `--important`) — authoritative 발신자만 세울 수 있다.
+    #[serde(default)]
+    pub important: bool,
+}
+
+impl QueueItem {
+    /// 일반 텍스트 항목(발급 seq·현재 시각).
+    pub fn text(text: String, origin: QueueOrigin) -> Self {
+        QueueItem {
+            seq: next_queue_seq(),
+            text,
+            kind: QueueItemKind::Text,
+            enqueued_at: now_epoch(),
+            origin,
+            idem_key: None,
+            merged_count: 0,
+            important: false,
+        }
+    }
+    /// queued Return 항목 — 본문은 빈 문자열(기존 배달 동작과 동일한 빈 Inject + CR).
+    pub fn return_key(origin: QueueOrigin) -> Self {
+        QueueItem {
+            seq: next_queue_seq(),
+            text: String::new(),
+            kind: QueueItemKind::ReturnKey,
+            enqueued_at: now_epoch(),
+            origin,
+            idem_key: None,
+            merged_count: 0,
+            important: false,
+        }
+    }
+    /// queue.list 미리보기 — 80자 절단(기존 출력 계약 보존: phoenix harness가 substring 매칭).
+    pub fn preview(&self) -> String {
+        self.text.chars().take(80).collect()
+    }
+    pub fn bytes(&self) -> usize {
+        self.text.len()
+    }
+    /// TTL 만기 후보인가 — Agent origin이고 important 미보유이며 ttl 경과.
+    pub fn is_expired(&self, now: f64, ttl_secs: f64) -> bool {
+        ttl_secs > 0.0
+            && self.origin.is_agent()
+            && !self.important
+            && (now - self.enqueued_at) > ttl_secs
+    }
+}
+
 // ★D3(W5): Windows Job Object — PTY 자식 동반사망(KILL_ON_JOB_CLOSE). unix 는 setsid+killpg/SIGKILL 로 이미
 //   동반사망이 성립하지만 Windows 는 자식이 데몬 사후 생존해 잔존/중복 노드가 됐다(P2-9). 데몬 소유 Job 에
 //   자식을 편입하면 데몬 프로세스 종료 시 OS 가 Job 핸들을 닫아 편입된 전 자식·손자를 강제 종료한다.
@@ -126,8 +286,10 @@ pub struct Surface {
     pub idle_notified: AtomicBool,
     /// recall 영속용 직전 라인 (연속 중복 스킵 — TUI 리드로우 노이즈 억제)
     last_recall_line: Mutex<String>,
-    /// 인플라이트 큐: --queued 전송분 — 대상이 조용해질 때(followup) 순서대로 배달
-    pub pending_queue: Mutex<std::collections::VecDeque<String>>,
+    /// 인플라이트 큐: --queued 전송분 — 대상이 조용해질 때(followup) 순서대로 배달.
+    /// ★C1(v0.13.17): 텍스트 전용(String)에서 메타 보유 QueueItem으로 승격 — TTL·멱등·origin
+    /// 정책은 항목 메타 없이는 성립하지 않는다(governance.rs가 예고하던 enqueue-seq 태깅).
+    pub pending_queue: Mutex<std::collections::VecDeque<QueueItem>>,
     /// T1-1 자기보고 상태 (`status.set` RPC)
     pub agent_status: Mutex<Option<AgentStatus>>,
     /// T2-5 에이전트 메타: launch-agent가 등록한 (agent 이름, 실행 바이너리)
@@ -794,7 +956,7 @@ pub struct Daemon {
     /// 큐 WAL(P7): 미배달 `--queued` 메시지의 데몬 재기동 생존분(queue-state.json replay).
     /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
     /// queue.list가 라이브 큐와 함께 노출한다. mid(안정 해시)로 이중 replay를 dedup한다.
-    pub restored_queue: Mutex<Vec<serde_json::Value>>,
+    pub restored_queue: Mutex<Vec<QueueWalEntry>>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -1167,8 +1329,10 @@ pub fn sibling_cli_path() -> PathBuf {
 }
 
 /// 큐 WAL(P7)의 안정 메시지 id — FNV-1a 64로 (surface_id, text)에서 파생.
-/// 재기동을 넘어 동일 논리 메시지가 같은 mid를 갖게 해, queue-state.json 이중 replay 시
-/// dedup이 성립한다. (동일 surface의 동일 텍스트는 하나로 수렴 — MVP 멱등, Phase 4에서 enqueue-seq 태깅 승격.)
+/// 재기동을 넘어 동일 논리 메시지가 같은 mid를 갖게 해, WAL 이중 replay 시 dedup이 성립한다.
+/// ★C1: mid 단독 dedup은 **동일 (sid,text) 항목을 하나로 붕괴**시켰다(연속 Return 큐잉 ×4가
+/// 복원 시 1건으로 줄던 기존 결함). v2는 dedup 키를 `(mid, seq)`로 확장해 이를 해소한다 —
+/// mid 필드 자체는 관측·구 도구 호환을 위해 유지한다.
 fn queue_mid(sid: u64, text: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in format!("{sid}\u{0}{text}").bytes() {
@@ -1178,20 +1342,88 @@ fn queue_mid(sid: u64, text: &str) -> String {
     format!("q{h:016x}")
 }
 
-/// queue-state.json replay: {mid, surface_id, text} 배열을 mid로 dedup해 복원한다.
+/// 큐 WAL v2 파일명 — **신규 파일**(v1 `queue-state.json`과 분리).
+/// 분리 근거(설계 D1/C1·Sim2): 신구 데몬 공존(ABI Drift 실측) 시 한 파일을 v1/v2로 번갈아
+/// 기록하면 플래핑으로 큐가 소실된다. 신 데몬은 v2만 기록하고, v1은 1회 마이그레이션
+/// 소스로 **불변 보존**한다(다운그레이드 안전판 겸용 — 구 데몬은 동결 스냅샷을 읽는다).
+pub const QUEUE_WAL_V2: &str = "queue-state-v2.json";
+const QUEUE_WAL_V1: &str = "queue-state.json";
+const QUEUE_WAL_SCHEMA_VERSION: u64 = 2;
+
+/// 큐 WAL 한 줄 — 큐 항목 + 재타겟 앵커(surface_id·role).
+/// surface_id는 재기동 시 소멸하므로 role이 실질 앵커다(`rehome_restored_queue`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueWalEntry {
+    pub mid: String,
+    pub surface_id: u64,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(flatten)]
+    pub item: QueueItem,
+}
+
+/// 큐 WAL replay. **v2 우선 → 부재 시 v1에서 1회 마이그레이션**.
 /// 파일 부재/파손이면 빈 벡터(fail-safe — 큐 없음이 기본).
-fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let mut by_mid: HashMap<String, serde_json::Value> = HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(dir.join("queue-state.json")) {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+/// dedup 키는 `(mid, seq)` — 동일 텍스트 다건이 살아남는다(v1 붕괴 결함 해소).
+/// v1에서 마이그레이션된 항목의 신 필드 기본값: kind=Text · origin=System("wal-v1") ·
+/// enqueued_at=로드 시각(원 시각 미보존 — TTL 기준은 복원 시점부터 다시 센다).
+fn load_queue_state(dir: &std::path::Path) -> Vec<QueueWalEntry> {
+    let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut out: Vec<QueueWalEntry> = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(dir.join(QUEUE_WAL_V2)) {
+        if let Ok(env) = serde_json::from_str::<Value>(&content) {
+            if let Some(arr) = env.get("entries").and_then(|v| v.as_array()) {
+                for it in arr {
+                    if let Ok(e) = serde_json::from_value::<QueueWalEntry>(it.clone()) {
+                        if seen.insert((e.mid.clone(), e.item.seq)) {
+                            out.push(e);
+                        }
+                    }
+                }
+            }
+        }
+        return out; // v2 존재 = 정본. v1은 더 이상 보지 않는다(동결 스냅샷).
+    }
+
+    // v1 → v2 1회 마이그레이션. v1 파일은 지우지도 고치지도 않는다(불변 보존).
+    let now = now_epoch();
+    if let Ok(content) = std::fs::read_to_string(dir.join(QUEUE_WAL_V1)) {
+        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&content) {
             for it in arr {
-                if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
-                    by_mid.entry(mid.to_string()).or_insert(it); // 이중 replay dedup
+                let Some(mid) = it.get("mid").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let e = QueueWalEntry {
+                    mid: mid.to_string(),
+                    surface_id: it.get("surface_id").and_then(|v| v.as_u64()).unwrap_or(0),
+                    role: it
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    item: QueueItem {
+                        seq: next_queue_seq(),
+                        text: it
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        kind: QueueItemKind::Text,
+                        enqueued_at: now,
+                        origin: QueueOrigin::system("wal-v1"),
+                        idem_key: None,
+                        merged_count: 0,
+                        important: false,
+                    },
+                };
+                // v1은 이미 mid로 붕괴된 상태라 mid 단독으로도 충분하지만, 키는 v2와 동일하게 쓴다.
+                if seen.insert((e.mid.clone(), e.item.seq)) {
+                    out.push(e);
                 }
             }
         }
     }
-    by_mid.into_values().collect()
+    out
 }
 
 impl Daemon {
@@ -1539,13 +1771,15 @@ impl Daemon {
     }
 
     /// 큐 WAL 스냅샷을 원자적으로 영속(P7·§9.1-1). enqueue/pop/clear 뒤 호출한다.
-    /// 라이브 surface 큐 + 아직 미소비 restored_queue를 합쳐 mid로 dedup해 쓴다 —
+    /// 라이브 surface 큐 + 아직 미소비 restored_queue를 합쳐 `(mid, seq)`로 dedup해 쓴다 —
     /// 미배달 `--queued` 메시지가 데몬 재기동을 생존한다(HARNESS 4-a VOLATILE 수리).
+    /// ★C1: 기록 대상은 **v2 파일 전용**이다. v1(`queue-state.json`)은 절대 다시 쓰지 않는다
+    ///   (신구 데몬 공존 시 플래핑으로 큐가 소실되는 경로 차단 — 설계 D1).
     /// ★락 순서 주의: 호출자는 어떤 pending_queue 락도 쥐지 않은 상태여야 한다(재진입 데드락 방지).
     pub fn persist_queue_state(&self) {
         let dir = state_dir(&self.socket_path);
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut entries: Vec<QueueWalEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
         {
             let surfaces = self.surfaces.lock().unwrap();
             for s in surfaces.values() {
@@ -1554,23 +1788,27 @@ impl Daemon {
                 // 배달하려면 role 앵커가 필요하다.
                 let role = s.role.lock().unwrap().clone();
                 let q = s.pending_queue.lock().unwrap();
-                for text in q.iter() {
-                    let mid = queue_mid(s.id, text);
-                    if seen.insert(mid.clone()) {
-                        entries.push(json!({"mid": mid, "surface_id": s.id, "text": text, "role": role}));
+                for item in q.iter() {
+                    let mid = queue_mid(s.id, &item.text);
+                    if seen.insert((mid.clone(), item.seq)) {
+                        entries.push(QueueWalEntry {
+                            mid,
+                            surface_id: s.id,
+                            role: role.clone(),
+                            item: item.clone(),
+                        });
                     }
                 }
             }
         }
-        for it in self.restored_queue.lock().unwrap().iter() {
-            if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
-                if seen.insert(mid.to_string()) {
-                    entries.push(it.clone());
-                }
+        for e in self.restored_queue.lock().unwrap().iter() {
+            if seen.insert((e.mid.clone(), e.item.seq)) {
+                entries.push(e.clone());
             }
         }
-        if let Ok(content) = serde_json::to_string(&entries) {
-            let _ = crate::governance::write_json_atomic(&dir, "queue-state.json", &content);
+        let envelope = json!({"schema_version": QUEUE_WAL_SCHEMA_VERSION, "entries": entries});
+        if let Ok(content) = serde_json::to_string(&envelope) {
+            let _ = crate::governance::write_json_atomic(&dir, QUEUE_WAL_V2, &content);
         }
     }
 
@@ -1595,12 +1833,13 @@ impl Daemon {
             }
         }
         let mut rehomed = 0usize;
-        restored.retain(|it| {
-            let role = it.get("role").and_then(|v| v.as_str());
-            let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(r) = role {
+        restored.retain(|e| {
+            if let Some(r) = e.role.as_deref() {
                 if let Some(surf) = role_surface.get(r) {
-                    surf.pending_queue.lock().unwrap().push_back(text.to_string());
+                    // ★C1: 메타(seq·origin·enqueued_at·idem_key·important)를 **그대로** 옮긴다.
+                    // 재홈은 이사이지 재발신이 아니다 — 여기서 메타를 새로 만들면 TTL 시계가
+                    // 리셋되고 origin이 왜곡된다.
+                    surf.pending_queue.lock().unwrap().push_back(e.item.clone());
                     rehomed += 1;
                     return false; // restored_queue에서 제거(pending_queue로 이관)
                 }
@@ -2030,14 +2269,14 @@ impl Daemon {
                 }
             }
             // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-            let dropped: Vec<String> = surf.pending_queue.lock().unwrap().drain(..).collect();
+            let dropped: Vec<QueueItem> = surf.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
                     Some(surf.id),
                     json!({"reason": "process_exited", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
+                           "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
                 );
             }
             daemon.bus.publish(
@@ -3935,5 +4174,162 @@ mod tests {
             );
         }
         assert_eq!(line_count.load(Ordering::Relaxed), 3);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T1 (C1) — QueueItem WAL v2: 왕복 · v1 1회 마이그레이션 · v1 불변 보존 · (mid,seq) dedup
+// 파일 I/O만 쓰는 순수 테스트다(데몬·PTY 불요) — load_queue_state/직렬화 계약을 직접 박제한다.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_wal_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cys-qwal-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    fn entry(sid: u64, text: &str, seq: u64, origin: QueueOrigin) -> QueueWalEntry {
+        QueueWalEntry {
+            mid: queue_mid(sid, text),
+            surface_id: sid,
+            role: Some("worker".into()),
+            item: QueueItem {
+                seq,
+                text: text.into(),
+                kind: QueueItemKind::Text,
+                enqueued_at: 1_700_000_000.0,
+                origin,
+                idem_key: None,
+                merged_count: 0,
+                important: false,
+            },
+        }
+    }
+
+    fn write_v2(dir: &std::path::Path, entries: &[QueueWalEntry]) {
+        let env = json!({"schema_version": QUEUE_WAL_SCHEMA_VERSION, "entries": entries});
+        std::fs::write(dir.join(QUEUE_WAL_V2), serde_json::to_string(&env).unwrap()).unwrap();
+    }
+
+    /// 왕복: v2로 쓴 전 메타(seq·kind·enqueued_at·origin·idem_key·merged_count·important)가
+    /// 손실 없이 되읽힌다. 메타 손실은 곧 TTL·정책의 오판이므로 무손실이 계약이다.
+    #[test]
+    fn wal_v2_roundtrip_preserves_all_metadata() {
+        let dir = tmpdir("roundtrip");
+        let mut e = entry(7, "보고 전문", 42, QueueOrigin::Agent { surface: 3, role: Some("cso".into()) });
+        e.item.kind = QueueItemKind::ReturnKey;
+        e.item.idem_key = Some("k1".into());
+        e.item.merged_count = 3;
+        e.item.important = true;
+        write_v2(&dir, &[e.clone()]);
+
+        let loaded = load_queue_state(&dir);
+        assert_eq!(loaded.len(), 1, "v2 항목 1건이 복원돼야 한다");
+        assert_eq!(loaded[0], e, "메타가 하나라도 손실되면 안 된다");
+        assert_eq!(loaded[0].item.origin.class(), "agent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (mid, seq) dedup: **동일 (surface, 텍스트)** 항목이라도 seq가 다르면 둘 다 살아남는다.
+    /// v1의 mid 단독 dedup은 이 경우를 1건으로 붕괴시켰다(연속 Return 큐잉·재시도 wake ×4 소실).
+    #[test]
+    fn wal_v2_dedup_keeps_identical_text_with_distinct_seq() {
+        let dir = tmpdir("dedup");
+        let a = entry(7, "동일 텍스트", 1, QueueOrigin::system("t"));
+        let b = entry(7, "동일 텍스트", 2, QueueOrigin::system("t"));
+        assert_eq!(a.mid, b.mid, "전제: 같은 (sid,text)는 mid가 같다");
+        // 같은 (mid,seq)인 중복 replay 1건을 섞어 dedup도 함께 확인한다.
+        write_v2(&dir, &[a.clone(), b.clone(), a.clone()]);
+
+        let loaded = load_queue_state(&dir);
+        assert_eq!(loaded.len(), 2, "동일 텍스트 2건이 붕괴되면 안 된다 (mid,seq) dedup");
+        let mut seqs: Vec<u64> = loaded.iter().map(|e| e.item.seq).collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![1, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1 → v2 1회 마이그레이션: v2 부재 시 v1을 읽어 기본 메타로 승격한다.
+    /// (kind=Text · origin=System("wal-v1") · enqueued_at=로드 시각 · role 앵커 보존)
+    #[test]
+    fn wal_v1_migrates_once_with_default_metadata() {
+        let dir = tmpdir("migrate");
+        let v1 = json!([
+            {"mid": "qdeadbeef00000001", "surface_id": 11, "text": "구 항목", "role": "master"}
+        ]);
+        std::fs::write(dir.join("queue-state.json"), serde_json::to_string(&v1).unwrap()).unwrap();
+
+        let before = now_epoch();
+        let loaded = load_queue_state(&dir);
+        assert_eq!(loaded.len(), 1);
+        let e = &loaded[0];
+        assert_eq!(e.surface_id, 11);
+        assert_eq!(e.role.as_deref(), Some("master"));
+        assert_eq!(e.item.text, "구 항목");
+        assert_eq!(e.item.kind, QueueItemKind::Text);
+        assert_eq!(e.item.origin, QueueOrigin::system("wal-v1"));
+        assert!(!e.item.important && e.item.idem_key.is_none() && e.item.merged_count == 0);
+        assert!(
+            e.item.enqueued_at >= before,
+            "v1은 원 시각을 보존하지 않으므로 TTL 시계는 로드 시각부터 센다"
+        );
+        assert!(e.item.seq > 0, "마이그레이션 항목도 seq를 발급받아야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1 불변 보존 + v2 우선: v2가 존재하면 v1은 읽지 않고, persist는 v2에만 쓴다.
+    /// (신구 데몬 공존 시 v1/v2 플래핑으로 큐가 소실되는 경로 차단 — 설계 D1)
+    #[test]
+    fn wal_v2_takes_precedence_and_v1_file_is_never_touched() {
+        let dir = tmpdir("precedence");
+        let v1_body = serde_json::to_string(&json!([
+            {"mid": "qold", "surface_id": 1, "text": "v1 전용 항목", "role": "master"}
+        ]))
+        .unwrap();
+        std::fs::write(dir.join("queue-state.json"), &v1_body).unwrap();
+        write_v2(&dir, &[entry(9, "v2 항목", 5, QueueOrigin::system("t"))]);
+
+        let loaded = load_queue_state(&dir);
+        assert_eq!(loaded.len(), 1, "v2 존재 시 v1은 읽지 않는다");
+        assert_eq!(loaded[0].item.text, "v2 항목");
+
+        // v1 파일은 로드 경로에서 절대 수정·삭제되지 않는다(다운그레이드 안전판).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("queue-state.json")).unwrap(),
+            v1_body,
+            "v1 파일이 변경됐다 — 동결 보존 계약 위반"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 파손·부재 fail-safe: 어떤 경우에도 빈 큐로 떨어질 뿐 패닉하지 않는다.
+    #[test]
+    fn wal_load_is_failsafe_on_missing_or_corrupt() {
+        let dir = tmpdir("failsafe");
+        assert!(load_queue_state(&dir).is_empty(), "부재 = 빈 큐");
+        std::fs::write(dir.join(QUEUE_WAL_V2), "{not json").unwrap();
+        assert!(load_queue_state(&dir).is_empty(), "파손 v2 = 빈 큐");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// QueueItem 계약: preview 80자 절단 · ReturnKey 본문은 빈 문자열 · seq 단조 발급.
+    #[test]
+    fn queue_item_contract() {
+        let long: String = "가".repeat(200);
+        let item = QueueItem::text(long, QueueOrigin::system("t"));
+        assert_eq!(item.preview().chars().count(), 80, "preview는 80자 절단");
+
+        let rk = QueueItem::return_key(QueueOrigin::system("t"));
+        assert_eq!(rk.kind, QueueItemKind::ReturnKey);
+        assert_eq!(rk.text, "", "ReturnKey 본문은 빈 문자열(기존 배달 동작 보존)");
+        assert!(rk.seq > item.seq, "seq는 발급마다 단조 증가한다");
     }
 }

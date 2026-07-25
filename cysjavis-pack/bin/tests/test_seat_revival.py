@@ -82,7 +82,8 @@ def _wait_seat(ref, want, timeout=20.0):
 def main():
     h.teardown(verbose=False); h._fresh_harness()
     shutil.rmtree(os.path.join(h.HARN_DIR, "phoenix"), ignore_errors=True)
-    for f in ("topology.json", "desired_roster.json", "queue-state.json"):
+    # ★v0.13.17 C1: 큐 WAL v2 신규 파일도 함께 제거(구 파일만 지우면 큐가 되살아난다).
+    for f in ("topology.json", "desired_roster.json", "queue-state.json", "queue-state-v2.json"):
         try: os.remove(os.path.join(h.HARN_DIR, f))
         except OSError: pass
     h.start_daemon(wait=12.0)
