@@ -43,6 +43,16 @@
       "text_command": "printf '[heartbeat] 주간 fleet digest(G5) — 채택 학습물·사후 효과(ROI)·게이트 지출의 결정론 read-only 집계다. 수치 불변으로 보고하라. 추천 0건 지속=게이트 비용 재조정 검토 트리거.\\n'; CYS_ROUND_DIR=\"${CYS_ROUND_DIR:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_fleet_report.py\" --days 7 2>&1 | tail -40",
       "_builtin": "learn",
       "_builtin_version": 1
+    },
+    {
+      "id": "deadletter-transcribe-6h",
+      "every_minutes": 360,
+      "action": "push",
+      "to": "master",
+      "if_absent": "skip",
+      "text_command": "printf '[heartbeat] dead-letter 원장 전사(6h·C7) — 큐에서 제거된 전 메시지의 무손실 원장을 사람이 읽는 md 로 옮긴다. 신규 0건이면 조용히 끝난다.\\n'; JAVIS_ROOT=\"${JAVIS_ROOT:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_deadletter.py\" 2>&1 | tail -20",
+      "_builtin": "queue",
+      "_builtin_version": 1
     }
   ]
 }

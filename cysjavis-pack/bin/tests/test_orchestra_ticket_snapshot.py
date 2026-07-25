@@ -74,6 +74,43 @@ class TicketSnapshotTest(unittest.TestCase):
                      "[ACTION]", "--queued", "send-key", "ACK에 대한 ACK 금지"):
             self.assertIn(must, t, must)
 
+    # ── ★B6③ 채널별 의미 단언(스냅샷과 독립 신호) ──
+    def test_each_channel_carries_its_own_semantics(self):
+        """스냅샷(test_report_channel_snapshot)은 **문구 표류 탐지**용이라, 문구를 고치면
+        스냅샷도 같이 고쳐지며 통과한다 — 즉 "무엇이 왜 그 채널에 있어야 하는가"는
+        아무도 지키지 않는다. 여기서는 리터럴 복사 대신 **채널별 필수 의미**를 못박아,
+        스냅샷을 갱신하면서 규약 자체를 무너뜨리는 개정을 잡는다.
+        cmd_self_test(내부 assertion)와도 독립이다 — 저쪽은 티켓 조립 무결성을,
+        여기서는 3채널의 의미 분리를 본다."""
+        block = channel_block(self.ticket())
+        self.assertEqual(len(block), 4, "3분류 항목이 3개가 아니다: %s" % block)
+        header, fyi, action, urgent = block
+
+        self.assertIn("3분류", header, "머리글이 3분류 규약임을 밝히지 않는다")
+
+        # ① FYI = 파일 전문 + 포인터 1줄 · master 무회신 · javis_push 경유(직접 send 금지)
+        self.assertIn("[FYI]", fyi)
+        self.assertIn("javis_push.py", fyi, "FYI 가 javis_push 경유가 아니다")
+        self.assertIn("--body-file", fyi, "FYI 에 전문 파일 채널이 없다")
+        self.assertIn("회신하지 않는다", fyi, "FYI 의 무회신 계약이 빠졌다")
+        self.assertNotIn("[ACTION]", fyi, "FYI 항목에 ACTION 이 섞였다")
+
+        # ② ACTION = --queued 직접 push · ACK 1회(ACK에 대한 ACK 금지)
+        self.assertIn("[ACTION]", action)
+        self.assertIn("--queued", action, "ACTION 이 --queued 경로가 아니다")
+        self.assertIn("ACK", action)
+        self.assertIn("ACK에 대한 ACK 금지", action, "ACK 무한왕복 차단 문언이 빠졌다")
+        self.assertNotIn("javis_push.py", action, "ACTION 을 FYI 채널로 흘리고 있다")
+
+        # ③ 긴급 = 직접 send + send-key Return · 남용 금지
+        self.assertIn("send-key", urgent, "긴급 채널에 직접 send 경로가 없다")
+        self.assertIn("Return", urgent)
+        self.assertIn("남용 금지", urgent, "긴급 남용 억제 문언이 빠졌다")
+
+        # 채널 간 배타: 각 항목은 서로 다른 배달 수단을 가리켜야 한다(한 채널로 수렴 금지).
+        self.assertNotEqual(fyi, action)
+        self.assertNotEqual(action, urgent)
+
     # ── 2) 구 규약 회귀 차단 ──
     def test_legacy_single_channel_gone(self):
         t = self.ticket()

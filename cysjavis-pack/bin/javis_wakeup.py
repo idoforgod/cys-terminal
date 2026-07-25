@@ -215,6 +215,18 @@ def is_softcap_rejection(*streams):
     return any(SOFTCAP_ERR in (s or "") for s in streams)
 
 
+def idem_key_unsupported(*streams):
+    """`--idempotency-key` 가 **플래그 자체 때문에** 거부됐는가(구 CLI/구 데몬).
+    참이면 플래그 없이 1회 폴백한다 — 배달이 병합 최적화보다 우선이다.
+    (javis_boot_node.important_unsupported 와 동일 패턴·동일 근거.)"""
+    e = " ".join((s or "") for s in streams).lower()
+    if "idempotency" not in e:
+        return False
+    return any(tok in e for tok in (
+        "unexpected argument", "unrecognized", "unknown", "invalid", "found argument",
+    ))
+
+
 def _load_failcount():
     try:
         with open(FAILCOUNT, encoding="utf-8") as f:
@@ -251,13 +263,23 @@ def cmd_drain(a):
             skipped += 1
             continue
         msg = _build_send_message(rec)
-        cmd = ["cys", "send", "--queued", "--to", rec["target"], msg]
+        # ★B1: 배달에 **데몬 멱등키**를 실는다(키 = task_key). 같은 주제의 wakeup 이 대상 큐에
+        #      이미 대기 중이면 데몬 C4 가 제자리 교체(최신 승리)하므로 큐가 부풀지 않는다.
+        #      부수효과로 keyless 발신 통계 오염도 해소된다(이 경로는 정당한 키 보유 발신이다).
+        cmd = ["cys", "send", "--queued", "--idempotency-key", rec["task_key"],
+               "--to", rec["target"], msg]
+        cmd_nokey = ["cys", "send", "--queued", "--to", rec["target"], msg]
         if a.deliver:
             if alive == "unknown":
                 print(f"warn: {rec['target']} 생존 미확인 상태로 배달 시도", file=sys.stderr)
             err = None
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if r.returncode != 0 and idem_key_unsupported(r.stderr, r.stdout):
+                    # 구 CLI/구 데몬 — 플래그를 내리고 1회 재전송(배달 > 병합 최적화).
+                    print(f"warn: 데몬이 --idempotency-key 미지원 — 플래그 없이 재시도: "
+                          f"{rec['id']}", file=sys.stderr)
+                    r = subprocess.run(cmd_nokey, capture_output=True, text=True, timeout=15)
                 if r.returncode == 0:
                     if _load_failcount().get(rec["target"]):
                         _bump_failcount(rec["target"], reset=True)  # 성공 = 연속실패 해소

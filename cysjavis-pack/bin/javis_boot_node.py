@@ -282,6 +282,20 @@ def important_unsupported(err):
     ))
 
 
+# ★B2(리뷰 수렴): 데몬의 소프트캡 거부는 **실패가 아니라 종결**이다 — 거부와 동시에 데몬이
+#   전문을 dead-letter 원장에 기록했으므로 재전송할 이유가 없다(SOFTCAP_DIRECTIVE 문언).
+#   종전 inject 는 이를 일반 실패로 보고 4연타(attempts=4)로 재전송했고, 그 4건이 전부
+#   거부→원장 기록되어 **혼잡을 키우면서 원장까지 오염**시켰다. 판정 함수는
+#   javis_wakeup.is_softcap_rejection 과 동일 술어를 여기에 자체 정의한다(형제 import 를
+#   부트 경로에 끌어들이지 않는다 — 부트는 의존을 최소로 유지한다).
+SOFTCAP_ERR = "queue_softcap_exceeded"
+
+
+def is_softcap_rejection(*streams):
+    """cys send 출력(stdout/stderr)에 소프트캡 거부 코드가 있으면 True."""
+    return any(SOFTCAP_ERR in (s or "") for s in streams)
+
+
 def inject(role, msg, attempts=4):
     """★`cys send --queued` 단일경로(codex R2 결함4): 큐는 대상이 조용해질 때 메시지+자동 Return 을
     원자적으로 배달한다 → typing_guard 우회(F1)·Return 분리 실패로 인한 중복 입력 위험 제거.
@@ -292,20 +306,33 @@ def inject(role, msg, attempts=4):
     발신은 master pane 이라 authoritative 권한을 충족한다. 구 데몬/구 CLI 는 이 플래그를
     모르므로, 플래그 때문에 거부되면 플래그 없이 1회 폴백한다(하위호환)."""
     errq = ""
+    outq = ""
     use_important = True
     for i in range(attempts):
         cmd = ["cys", "send", "--queued"] + (["--important"] if use_important else []) + \
               ["--to", role, msg]
-        rcq, _, errq = run(cmd, timeout=12)
+        rcq, outq, errq = run(cmd, timeout=12)
         if rcq == 0:
             return True, "주입 큐 등록(자동 Return 배달·시도 %d%s)" % (
                 i + 1, "" if use_important else "·--important 미지원 폴백")
+        # ★B2 터미널 처리: 소프트캡 거부는 종결이다 — 재시도 루프를 **즉시 중단**한다.
+        #   (--important 는 TTL 면제일 뿐 소프트캡 면제가 아니다 — 의도된 설계라 폴백도 무의미.)
+        if is_softcap_rejection(errq, outq):
+            why = "dead-lettered(softcap)"
+            print("warn: %s 각성 주입이 소프트캡 거부됨 — 데몬이 전문을 dead-letter 원장에 "
+                  "기록 완료. 재전송 금지(시도 %d 에서 중단). 대상 큐 적체를 먼저 해소하라."
+                  % (role, i + 1), file=sys.stderr)
+            return False, why
         if use_important and important_unsupported(errq):
             # 구 데몬/권한 미충족 — 플래그를 내리고 같은 시도 안에서 1회 재전송
             use_important = False
-            rcq, _, errq = run(["cys", "send", "--queued", "--to", role, msg], timeout=12)
+            rcq, outq, errq = run(["cys", "send", "--queued", "--to", role, msg], timeout=12)
             if rcq == 0:
                 return True, "주입 큐 등록(자동 Return 배달·시도 %d·--important 미지원 폴백)" % (i + 1)
+            if is_softcap_rejection(errq, outq):
+                print("warn: %s 각성 주입이 소프트캡 거부됨(폴백 경로) — 재전송 금지."
+                      % role, file=sys.stderr)
+                return False, "dead-lettered(softcap)"
         time.sleep(2)
     return False, "주입 실패(%d회·큐 등록 실패: %s)" % (attempts, (errq or "").strip()[:80])
 
@@ -405,13 +432,40 @@ def self_test():
         "무관 실패에 --important 폴백 오발동")
     chk(important_unsupported("") is False, "빈 오류에 폴백 오발동")
 
+    # ★B2: 소프트캡 거부 = 종결 판정(재시도 중단). javis_wakeup 과 동일 술어여야 한다.
+    chk(is_softcap_rejection("error: queue_softcap_exceeded — 재전송하지 마라") is True,
+        "소프트캡 거부 미탐지(stderr)")
+    chk(is_softcap_rejection("", "queue_softcap_exceeded (dead-letter 기록)") is True,
+        "소프트캡 거부 미탐지(다중 스트림)")
+    chk(is_softcap_rejection("send failed: surface not found") is False,
+        "무관 실패를 소프트캡으로 오판(각성 주입이 조기 포기된다)")
+    chk(is_softcap_rejection(None, None) is False, "빈 스트림에 오발동")
+
+    # 4연타 회귀 차단: 소프트캡이 오면 send 는 **1회만** 나가고 상태는 dead-lettered(softcap).
+    calls = []
+
+    def _fake_run(args, timeout=15):
+        calls.append(list(args))
+        return 1, "", "error: %s — 재전송하지 마라" % SOFTCAP_ERR
+
+    _orig_run = globals()["run"]
+    globals()["run"] = _fake_run
+    try:
+        ok, why = inject("worker", "각성", attempts=4)
+    finally:
+        globals()["run"] = _orig_run
+    chk(ok is False, "소프트캡 거부를 성공으로 보고")
+    chk(why == "dead-lettered(softcap)", "소프트캡 종결 상태 문자열 불일치: %r" % why)
+    chk(len(calls) == 1, "소프트캡인데 재전송했다(%d회) — 혼잡 증폭·원장 오염" % len(calls))
+
     if fails:
         print("self-test FAIL:")
         for f in fails:
             print("  ✗ " + f)
         return 1
-    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·무구독폴백슬롯·important폴백)"
-          % (7 + 4 + 4 + 4 + 4 + 5))
+    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·"
+          "무구독폴백슬롯·important폴백·소프트캡종결)"
+          % (7 + 4 + 4 + 4 + 4 + 5 + 7))
     return 0
 
 

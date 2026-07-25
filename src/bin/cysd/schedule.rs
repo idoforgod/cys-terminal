@@ -129,6 +129,22 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "learn",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // ★B4(리뷰 수렴): javis_deadletter 는 **호출자가 0이었다** — 데몬은 dead-letter 원장을
+        // 성실히 쌓는데 그걸 사람이 읽는 곳으로 옮기는 도구가 아무 데서도 불리지 않았다
+        // (무손실의 절반만 구현된 상태: 잃지는 않지만 아무도 못 본다). 6시간 주기로 전사한다.
+        // exit 5=무작업(정상·조용) · 4=전사됐으나 digest 실패(degraded) · 0=신규 전사.
+        // ⚠text_command 는 R-CLI-4 게이트가 이 코드 정의와 **정확 일치**로 신뢰한다 —
+        //   schedule.json 사본과 자구 하나까지 같아야 한다.
+        json!({
+            "id": "deadletter-transcribe-6h",
+            "every_minutes": 360,
+            "action": "push",
+            "to": "master",
+            "if_absent": "skip",
+            "text_command": "printf '[heartbeat] dead-letter 원장 전사(6h·C7) — 큐에서 제거된 전 메시지의 무손실 원장을 사람이 읽는 md 로 옮긴다. 신규 0건이면 조용히 끝난다.\\n'; JAVIS_ROOT=\"${JAVIS_ROOT:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_deadletter.py\" 2>&1 | tail -20",
+            "_builtin": "queue",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
         json!({
             "id": "fleet-digest",
             "every_minutes": 10080,
@@ -144,7 +160,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
-///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn") → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"queue") → 버전 상이 시 교체(갱신)·동버전 무접촉
 ///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
 /// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
 fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
@@ -163,7 +179,7 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
             Some(pos) => {
                 // ★codex W3 major: built-in 마커(_builtin)가 코드 정의(bj)의 마커와 일치하는 항목만
                 //   우리 소유 → 버전 갱신. 마커 없는/다른 동명 항목은 사용자가 그 id 를 선점한 것
-                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프)
+                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프·"queue"=큐 역압 운영)
                 let want_marker = bj.get("_builtin").and_then(|v| v.as_str());
                 let is_ours = want_marker.is_some()
                     && jobs[pos].get("_builtin").and_then(|v| v.as_str()) == want_marker;
@@ -849,7 +865,7 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 4개(phoenix2 + learn2) 생성 → changed=true.
+        // 1차: built-in 5개(phoenix2 + learn2 + queue1) 생성 → changed=true.
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
@@ -859,8 +875,12 @@ mod tests {
             ids.contains(&"learn-ttl-audit") && ids.contains(&"fleet-digest"),
             "learn gaps C12③ 잡 2종 생성"
         );
+        assert!(
+            ids.contains(&"deadletter-transcribe-6h"),
+            "★B4: dead-letter 전사 잡이 없으면 javis_deadletter 는 호출자 0 상태 그대로다"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 5, "사용자1 + built-in4");
+        assert_eq!(jobs.len(), 6, "사용자1 + built-in5");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080).
         let period = |id: &str| {
             jobs.iter()
@@ -871,6 +891,7 @@ mod tests {
         assert_eq!(period("phoenix-drill-weekly"), Some(10080), "drill 7일");
         assert_eq!(period("learn-ttl-audit"), Some(1440), "learn audit 일 1회");
         assert_eq!(period("fleet-digest"), Some(10080), "fleet digest 주 1회");
+        assert_eq!(period("deadletter-transcribe-6h"), Some(360), "dead-letter 전사 6h");
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
         let (c2, _) = apply_builtin_jobs(&mut jobs);
@@ -880,7 +901,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 5, "중복 없이 5개 유지");
+        assert_eq!(jobs.len(), 6, "중복 없이 6개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -964,9 +985,10 @@ mod tests {
             assert_eq!(j, b, "seed '{id}' ↔ builtin_jobs() 정의 드리프트");
             checked += 1;
         }
-        assert!(checked >= 2, "learn 잡 2종(learn-ttl-audit·fleet-digest)이 seed 에 등재돼야 한다");
+        assert!(checked >= 3, "learn 잡 2종 + dead-letter 전사 잡이 seed 에 등재돼야 한다");
         // R-CLI-4: 코드 소유 text_command 는 게이트가 신뢰해야 발화된다.
-        for id in ["learn-ttl-audit", "fleet-digest"] {
+        // ★B4: deadletter-transcribe-6h 는 자구가 1글자만 어긋나도 매 실행 거부된다(조용한 무동작).
+        for id in ["learn-ttl-audit", "fleet-digest", "deadletter-transcribe-6h"] {
             let cmd = builtins
                 .iter()
                 .find(|b| b["id"].as_str() == Some(id))

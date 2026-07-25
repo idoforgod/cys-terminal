@@ -10,11 +10,22 @@ master 큐가 포화됐다. 해법은 "전문은 파일, 채팅에는 포인터 
 - body-file 지정 시 **실존·비어있지 않음**을 검증한다(실패 exit 2 — 없는 파일을 가리키는
   포인터는 보고가 아니라 소음이다).
 - 포인터 문자열에 `· 전문: <절대경로>` 를 자동 첨부한다(수신자가 파일을 열 수 있게).
-- 배달은 **재구현하지 않는다** — 기존 `javis_wakeup.py enqueue`(코얼레싱·멱등키·zombie 가드·
+- 배달은 **재구현하지 않는다** — 기존 `javis_wakeup.py enqueue`(코얼레싱·zombie 가드·
   scrub된 원장)에 위임하고, drain은 기존 `cys send --queued` 경로를 그대로 쓴다.
-  멱등키 = `--key` 값 → 같은 주제의 연속 보고는 병합/억제되어 큐를 채우지 않는다.
 
-exit codes: 0 ok(queued|coalesced) · 2 usage/검증 실패 · 5 suppressed(멱등 억제 — 무작업)
+★B1(리뷰 수렴 BLOCK 수리) 최신 보고 폐기 근절:
+  종전에는 enqueue 에 `--idempotency-key <key>` 를 넘겼다. wakeup 의 멱등키 의미론은
+  "같은 키의 요청은 **중복 삽입하지 않는다**(suppressed)" 이므로, 같은 --key 로 낸
+  **두 번째 보고가 통째로 버려졌다** — 진행 보고는 본질적으로 "최신 상태"인데
+  최신분이 폐기되고 최초분이 남는 정반대 동작이었다(exit 5 를 '정상 무작업'으로
+  포장해 무음이었다). D5 의 키 의미론은 "이 주제의 최신 상태"이고, 그것을 구현하는
+  것은 wakeup 의 **코얼레스 경로**다(reason 최신 갱신·coalesced_count 증가).
+  따라서 enqueue 에서 멱등키를 뗀다 — 같은 (target, task_key) 는 자동 코얼레스된다.
+  대신 배달(drain) 쪽 `cys send --queued` 에 `--idempotency-key <task_key>` 를 붙여
+  데몬 C4 제자리 병합을 태운다(keyless 통계 오염도 함께 해소).
+
+exit codes: 0 ok(enqueued|coalesced) · 2 usage/검증 실패 · 5 suppressed(호환 잔존 —
+  현 경로에서는 발생하지 않는다) · 6 배달 위임 실패(wakeup 호출 자체가 실패)
 """
 import argparse
 import json
@@ -25,7 +36,7 @@ import sys
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
 WAKEUP = os.path.join(BIN_DIR, "javis_wakeup.py")
 
-EXIT_OK, EXIT_USAGE, EXIT_SUPPRESSED = 0, 2, 5
+EXIT_OK, EXIT_USAGE, EXIT_SUPPRESSED, EXIT_DELEGATE = 0, 2, 5, 6
 
 POINTER_BODY_SEP = " · 전문: "
 
@@ -79,13 +90,25 @@ def push(to, key, pointer, body_file=None):
         if why:
             return EXIT_USAGE, None, why
     reason = compose_pointer(pointer, body_abs)
-    rc, out, err = run_wakeup(["enqueue", "--to", to, "--task", key,
-                               "--reason", reason, "--idempotency-key", key])
+    # ★B1: 멱등키를 넘기지 않는다 — 같은 --key 의 후속 보고는 **코얼레스**(최신 reason 승리)
+    #      되어야 한다. 멱등키를 넘기면 최신 보고가 suppressed 로 폐기됐다(D5 정반대).
+    argv = ["enqueue", "--to", to, "--task", key, "--reason", reason]
+    rc, out, err = run_wakeup(argv)
     if rc != 0:
-        return EXIT_USAGE, None, "wakeup enqueue 실패(rc=%s): %s" % (rc, (err or out or "").strip()[:200])
+        # ★B6④: 위임 실패는 usage 오류가 아니다 — 종료코드를 분리하고, 호출자가 손으로
+        #        재현·복구할 수 있게 실행 경로·argv·후속 지시를 함께 준다.
+        return EXIT_DELEGATE, None, (
+            "배달 위임 실패(rc=%s): %s\n"
+            "  wakeup: %s\n"
+            "  argv:   %s\n"
+            "  후속:   위 명령을 직접 실행해 원인을 확인하라. 계속 실패하면 전문 파일은 이미 "
+            "디스크에 있으므로, 포인터 1줄만 `cys send --queued --to %s \"...\"` 로 직접 보내라."
+            % (rc, (err or out or "").strip()[:200], WAKEUP, " ".join(argv), to)
+        )
     result = _wakeup_result(out)
     if result == "suppressed":
-        # 멱등 억제 = 이미 같은 키의 보고가 대기 중. 무작업이지 실패가 아니다.
+        # 멱등키를 넘기지 않으므로 현 경로에서는 나오지 않는다. 구 wakeup·수동 큐 잔재
+        # 대비로 매핑만 유지한다(무작업이지 실패가 아니다).
         return EXIT_SUPPRESSED, "suppressed", None
     if result == "queued":
         return EXIT_OK, "enqueued", None
@@ -99,7 +122,8 @@ def main(argv=None):
         description="이중 채널 보고 — 포인터 1줄 push + 전문 파일 (C7)")
     p.add_argument("--to", required=True, help="수신 역할(master·cso·worker …)")
     p.add_argument("--key", required=True,
-                   help="보고 키(=멱등키·병합 단위). 같은 주제의 연속 보고는 이 키로 병합된다")
+                   help="보고 키(=병합 단위). 같은 주제의 연속 보고는 이 키로 코얼레스되어 "
+                        "**최신 보고가 이긴다**(구 보고가 최신을 막지 않는다)")
     p.add_argument("--pointer", required=True, help="채팅에 실릴 1줄 요약")
     p.add_argument("--body-file", dest="body_file",
                    help="전문 md 경로(권장 절대경로) — 실존·비어있지않음을 검증한다")

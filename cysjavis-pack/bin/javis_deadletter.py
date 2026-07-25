@@ -14,26 +14,39 @@ state dir의 `dead-letters.jsonl`(+10MB 회전본 `dead-letters.<ts>.jsonl`)에 
   3) **증분**: 이미 전사한 바이트 오프셋을 `_round/dead_letters/.offsets.json` 에 기록한다.
      키는 (dev,ino) — 파일이 회전(rename)돼도 같은 아이노드라 재전사되지 않는다. 오프셋에는
      선두 지문(head)도 함께 남겨, 같은 아이노드가 **같은 크기로 교체**된 경우도 탐지해 재판독한다.
-  4) 신규분이 있으면 요약 1줄을 master에게 push(`javis_wakeup.py enqueue`,
-     멱등키 `deadletter-digest` — 미처리 다이제스트가 대기 중이면 억제).
+  4) 신규분이 있으면 요약 1줄을 master에게 push — **javis_push.push() 형제 import**로
+     위임한다(보고 채널 규약 단일화 · suppressed 는 정상 무작업으로 처리).
 
 원장 기록 관례(G2)와 동일하게 **전사 직전 javis_scrub** 로 비밀을 마스킹한다.
 
-exit codes: 0 신규 전사함 · 2 usage/오류 · 5 무작업(원장 파일 부재 또는 신규 행 0)
+★B3(리뷰 수렴) 개정 요지:
+  ①state dir 발견을 자기 글롭이 아니라 **javis_phoenix 의 발견 규약**(glob ∪ ~/.cys/depts.json
+    레지스트리 · realpath)으로 교체 — registry stale·Windows 레이아웃 오차를 한 곳에서만 다룬다.
+    두 곳에 규약을 복제하면 한쪽만 고쳐지는 결함이 재발한다(팩 전반의 '판정 이원화 금지').
+  ②digest push 를 자체 서브프로세스가 아니라 javis_push.push() 호출로 교체.
+  ③digest 실패는 무음이 아니다 — exit 4(degraded) + stderr 경고.
+  ④빈 결과 메시지에 **실제로 검사한 경로 목록**을 찍는다(잘못된 dir 를 보고 있었는지 즉시 판별).
+  ⑤origin 객체를 `agent(surface:7,worker)` 로 렌더(구: dict repr 이 그대로 md 에 박혔다).
+  ⑦오프셋 파일에서 **소멸한 파일 항목을 prune**(회전본 삭제 후 무한 누적 차단).
+
+exit codes: 0 신규 전사함 · 2 usage/오류 · 4 전사는 됐으나 digest push 실패(degraded)
+            · 5 무작업(원장 파일 부재 또는 신규 행 0)
 """
 import argparse
 import glob
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 
-import javis_scrub  # 형제 모듈 — 부재 시 즉시 실패(fail-closed)
+# ★형제 모듈 규약(팩 관례): 같은 bin/ 안의 도구는 서브프로세스가 아니라 import 로 재사용한다.
+#   부재 시 ImportError 로 **즉시 실패**(fail-closed) — 조용히 축소 동작하지 않는다.
+#   scrub_obj 는 collect() 에서, push() 는 push_digest() 에서 쓴다(정적 미사용 아님).
+import javis_scrub   # collect(): 전사 직전 비밀 마스킹(G2)
+import javis_push    # push_digest(): 보고 채널 단일 진입점
 
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
-WAKEUP = os.path.join(BIN_DIR, "javis_wakeup.py")
 
 ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()
 OUT_DIR = os.path.join(ROOT, "_round", "dead_letters")
@@ -42,19 +55,42 @@ OFFSETS = os.path.join(OUT_DIR, ".offsets.json")
 DEAD_LETTER_FILE = "dead-letters.jsonl"
 DIGEST_KEY = "deadletter-digest"
 
-EXIT_OK, EXIT_USAGE, EXIT_EMPTY = 0, 2, 5
+# exit 2(usage)는 argparse 가 직접 낸다 — 코드 경로에서 반환하는 자리가 없어 상수를 두지 않는다
+# (★B3⑧: 미사용 상수는 "이 값을 돌려주는 분기가 있다"는 거짓 신호가 된다).
+EXIT_OK, EXIT_DEGRADED, EXIT_EMPTY = 0, 4, 5
 
 
-# ─────────────────── state dir 발견 ───────────────────
+# ─────────────────── state dir 발견 (javis_phoenix 규약 위임) ───────────────────
 def default_state_dirs():
-    """main + dept 전 state dir. Windows 패리티는 %LOCALAPPDATA%\\cys (javis_phoenix 규약과 정합)."""
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
-        dirs = [os.path.join(base, "cys")] + sorted(glob.glob(os.path.join(base, "cys-dept-*")))
-    else:
+    """main + dept 전 state dir.
+
+    ★B3①: 발견 규약을 **javis_phoenix 에 위임**한다 — 메인 dir 는 `_live_state_dir()`
+    (Windows 는 %LOCALAPPDATA%\\cys), 부서는 `discover_depts()`(glob ∪ depts.json 레지스트리).
+    자기 글롭을 따로 두면 registry stale 면역·realpath 정규화·Windows 분기가 두 벌이 되고,
+    실제로 한쪽만 고쳐진 채 부서 원장이 통째로 누락되는 경로가 생긴다.
+    phoenix import 가 불가능한 격리 환경에서는 최소 폴백만 쓴다(경고 없이 조용히 축소하지 않는다)."""
+    try:
+        import javis_phoenix
+    except ImportError as e:
+        print("[javis_deadletter] javis_phoenix import 실패(%s) — 메인 state dir 만 검사한다"
+              % e, file=sys.stderr)
         base = os.path.join(os.path.expanduser("~"), ".local", "state")
-        dirs = [os.path.join(base, "cys")] + sorted(glob.glob(os.path.join(base, "cys-dept-*")))
-    return [d for d in dirs if os.path.isdir(d)]
+        return [d for d in [os.path.join(base, "cys")] if os.path.isdir(d)]
+
+    dirs = [javis_phoenix._live_state_dir()]
+    for _dept, info in sorted((javis_phoenix.discover_depts() or {}).items()):
+        sd = (info or {}).get("state_dir")
+        if sd:
+            dirs.append(os.path.realpath(sd))
+    # realpath 기준 중복 제거(심링크·레지스트리/글롭 중복) — 순서는 보존.
+    seen, out = set(), []
+    for d in dirs:
+        rp = os.path.realpath(d)
+        if rp in seen or not os.path.isdir(rp):
+            continue
+        seen.add(rp)
+        out.append(rp)
+    return out
 
 
 def ledger_files(state_dir):
@@ -167,6 +203,23 @@ def _fmt_ts(ts):
         return str(ts)
 
 
+def render_origin(origin):
+    """★B3⑤: 데몬이 쓰는 origin 은 **객체**다 — dict repr 이 그대로 md 에 박히면 사람이 못 읽는다.
+    `{"class":"agent","surface":7,"role":"worker"}` → `agent(surface:7,worker)`.
+    구 문자열 origin·미지 형태는 그대로 통과시킨다(전사는 절대 실패하지 않는다)."""
+    if not isinstance(origin, dict):
+        return str(origin)
+    cls = str(origin.get("class") or origin.get("Class") or "?")
+    parts = []
+    if origin.get("surface") is not None:
+        parts.append("surface:%s" % origin["surface"])
+    if origin.get("role"):
+        parts.append(str(origin["role"]))
+    if origin.get("label"):
+        parts.append(str(origin["label"]))
+    return "%s(%s)" % (cls, ",".join(parts)) if parts else cls
+
+
 def render_section(state_dir, per_file):
     """dir 1개 섹션 렌더. per_file = [(path, rows)] — rows는 scrub 완료본."""
     total = sum(len(r) for _, r in per_file)
@@ -187,7 +240,7 @@ def render_section(state_dir, per_file):
         for r in rows:
             lines.append("- `%s` surface=%s role=%s reason=%s origin=%s"
                          % (_fmt_ts(r.get("ts")), r.get("surface_id"), r.get("role"),
-                            r.get("reason"), r.get("origin")))
+                            r.get("reason"), render_origin(r.get("origin"))))
             text = str(r.get("text", ""))
             for tl in text.splitlines() or [""]:
                 lines.append("  > %s" % tl)
@@ -214,28 +267,42 @@ def transcribe(sections, out_path):
 
 
 def push_digest(summary, dry_run=False):
-    """다이제스트 1줄 push. 반환 (rc, 메시지)."""
-    argv = [sys.executable, WAKEUP, "enqueue", "--to", "master", "--task", DIGEST_KEY,
-            "--reason", summary, "--idempotency-key", DIGEST_KEY]
+    """다이제스트 1줄 push. 반환 (rc, 메시지). rc 0 = 성공(코얼레스·억제 포함).
+
+    ★B3②: 자체 서브프로세스로 wakeup 을 부르지 않는다 — 보고 채널의 단일 진입점은
+    javis_push 다. 종전 자체 호출은 ①javis_push 가 B1 에서 멱등키를 뗀 뒤에도 혼자
+    멱등키를 넘겨 **최신 다이제스트를 폐기**했고 ②포인터 조립·검증 규약을 우회했다.
+    suppressed(5)는 실패가 아니라 무작업이므로 성공으로 접는다."""
     if dry_run:
-        return 0, "DRYRUN: " + " ".join(argv[1:])
-    try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-        return r.returncode, (r.stdout or r.stderr or "").strip()
-    except (subprocess.SubprocessError, OSError) as e:
-        return 255, str(e)
+        return 0, ("DRYRUN: javis_push.push(to=master, key=%s, pointer=%r)"
+                   % (DIGEST_KEY, summary))
+    code, result, why = javis_push.push("master", DIGEST_KEY, summary)
+    if code in (javis_push.EXIT_OK, javis_push.EXIT_SUPPRESSED):
+        return 0, result or "ok"
+    return code, why or "push 실패(code=%s)" % code
 
 
 # ─────────────────── 메인 ───────────────────
+def prune_dead_offsets(offsets, live_keys):
+    """★B3⑦: 소멸한 파일(회전본 삭제·state dir 제거)의 오프셋 항목을 제거한다.
+    종전엔 append-only 라 오프셋 파일이 단조 증가했고, (dev,ino) 는 **재사용되므로**
+    죽은 항목이 남아 있으면 새 파일이 옛 오프셋을 물려받아 선두 행을 건너뛸 수 있었다.
+    live_keys 는 이번 실행에서 실제로 본 파일들의 키다."""
+    return {k: v for k, v in offsets.items() if k in live_keys}
+
+
 def collect(state_dirs, offsets):
     """반환 (sections, counts, new_offsets, total). counts = reason별 총계."""
     sections, counts, total = [], {}, 0
     new_offsets = dict(offsets)
+    live_keys = set()
     for d in state_dirs:
         per_file = []
         for path in ledger_files(d):
             rows, off_rec = read_new_rows(path, offsets)
-            new_offsets[file_key(path)] = off_rec
+            key_ = file_key(path)
+            live_keys.add(key_)
+            new_offsets[key_] = off_rec
             if rows:
                 rows = [javis_scrub.scrub_obj(r) for r in rows]   # G2: 전사 직전 마스킹
                 per_file.append((path, rows))
@@ -245,7 +312,7 @@ def collect(state_dirs, offsets):
                 total += len(rows)
         if per_file:
             sections.append(render_section(d, per_file))
-    return sections, counts, new_offsets, total
+    return sections, counts, prune_dead_offsets(new_offsets, live_keys), total
 
 
 def main(argv=None):
@@ -266,13 +333,20 @@ def main(argv=None):
         return EXIT_EMPTY
     have_ledger = any(ledger_files(d) for d in state_dirs)
     if not have_ledger:
-        print("dead-letter 원장 없음(%d개 dir 검사) — 무작업" % len(state_dirs))
+        # ★B3④: 개수만 찍으면 "엉뚱한 dir 를 보고 있었다"를 판별할 수 없다 — 경로를 전부 찍는다.
+        print("dead-letter 원장 없음 — 무작업. 검사한 경로(%d):" % len(state_dirs))
+        for d in state_dirs:
+            print("  - %s" % d)
         return EXIT_EMPTY
 
     offsets = load_offsets(offsets_path)
     sections, counts, new_offsets, total = collect(state_dirs, offsets)
     if total == 0:
-        print(json.dumps({"new_rows": 0, "dirs": len(state_dirs)}, ensure_ascii=False))
+        print(json.dumps({"new_rows": 0, "dirs": len(state_dirs), "checked": state_dirs},
+                         ensure_ascii=False))
+        # 신규 0이어도 오프셋 prune 결과는 반영한다(죽은 항목 무한 누적 차단).
+        if new_offsets != offsets:
+            save_offsets(new_offsets, offsets_path)
         return EXIT_EMPTY
 
     out_path = os.path.join(out_dir, time.strftime("%Y-%m-%d") + ".md")
@@ -293,6 +367,13 @@ def main(argv=None):
     rc, msg = push_digest(summary)
     print(json.dumps({"new_rows": total, "reasons": counts, "out": out_path,
                       "digest_rc": rc, "digest": msg}, ensure_ascii=False))
+    if rc != 0:
+        # ★B3③: 전사는 됐지만 **아무도 모른다** — 무음 성공(exit 0)은 이 도구의 목적
+        # ("읽히는 곳으로 옮긴다")을 절반만 달성한 상태다. degraded 로 드러낸다.
+        print("[javis_deadletter] 경고: 전사는 완료(%s)했으나 master digest push 실패 — %s\n"
+              "  → 전사 파일을 직접 확인하라. 오프셋은 이미 전진했으므로 재실행해도 "
+              "같은 행이 다시 전사되지 않는다." % (out_path, msg), file=sys.stderr)
+        return EXIT_DEGRADED
     return EXIT_OK
 
 

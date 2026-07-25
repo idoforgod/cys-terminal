@@ -114,10 +114,18 @@ class DrainTest(unittest.TestCase):
         self.assertIn("surface not found", err)
 
     def test_generic_failure_fast_fails_at_threshold(self):
+        """★B6②: 종전 단언은 마지막 `pending_count()==0` 하나뿐이라, **enqueue 가 아예 안 됐어도**
+        통과했다(0을 0으로 확인). 1건 선주입을 명시 확인하고, 임계 직전까지 그 1건이
+        **유지**되는지(조기 폐기 없음)까지 못박는다."""
         self.enqueue()
+        self.assertEqual(self.pending_count(), 1, "전제: 1건이 선주입돼야 한다")
         self.fake_send(1, "boom")
-        for _ in range(3):
+        for i in (1, 2):
             self.drain()
+            self.assertEqual(self.pending_count(), 1,
+                             f"{i}회 실패(임계 3 미만)인데 pending 이 조기 폐기됐다")
+            self.assertEqual(self.W._load_failcount().get("master"), i, "연속 실패 계수 오류")
+        self.drain()
         self.assertEqual(self.pending_count(), 0, "3회 연속 실패인데 fast-fail 미발동")
         whys = [e.get("why") for e in self.ledger() if e["event"] == "skipped"]
         self.assertTrue(any("fast-fail" in (w or "") for w in whys), whys)
@@ -136,6 +144,46 @@ class DrainTest(unittest.TestCase):
         self.assertEqual(self.pending_count(), 0)
         self.assertEqual(self.W._load_failcount().get("master"), 0)
         self.assertIn("--queued", self.calls[-1], "배달 명령이 --queued 단일경로가 아니다")
+        # ★B1: 배달에 데몬 멱등키(=task_key)를 실어 C4 제자리 병합을 태운다.
+        #      (부수효과: 이 경로가 keyless 통계를 오염시키던 문제도 해소)
+        cmd = self.calls[-1]
+        self.assertIn("--idempotency-key", cmd, "배달에 데몬 멱등키가 실리지 않았다")
+        self.assertEqual(cmd[cmd.index("--idempotency-key") + 1], "t1",
+                         "멱등키는 task_key 여야 같은 주제 wakeup 이 제자리 병합된다")
+
+
+    # ── B1: 구 데몬 호환 폴백 ──
+    def test_idem_key_unsupported_detector(self):
+        W = self.W
+        self.assertTrue(W.idem_key_unsupported(
+            "error: unexpected argument '--idempotency-key' found"))
+        self.assertTrue(W.idem_key_unsupported("", "unrecognized option --idempotency-key"))
+        self.assertFalse(W.idem_key_unsupported("send failed: surface not found", ""),
+                         "무관 실패에 폴백이 오발동하면 배달이 두 번 나간다")
+        self.assertFalse(W.idem_key_unsupported(None, None))
+
+    def test_old_daemon_falls_back_to_keyless_send_once(self):
+        """구 CLI/구 데몬이 플래그를 모르면 **플래그 없이 1회만** 재전송한다 —
+        배달이 병합 최적화보다 우선이고, 재시도 폭풍은 만들지 않는다."""
+        self.enqueue()
+        seq = []
+
+        def _run(cmd, **kw):
+            self.calls.append(cmd)
+            seq.append(list(cmd))
+            if "--idempotency-key" in cmd:
+                return FakeCompleted(2, "", "error: unexpected argument '--idempotency-key' found")
+            return FakeCompleted(0, "", "")
+
+        self.W.subprocess.run = _run
+        rc, out, err = self.drain()
+        self.assertEqual(json.loads(out.strip().splitlines()[-1]),
+                         {"delivered": 1, "skipped": 0}, "폴백 배달이 성공으로 집계되지 않았다")
+        self.assertEqual(len(seq), 2, "폴백은 정확히 1회여야 한다: %s" % seq)
+        self.assertIn("--idempotency-key", seq[0])
+        self.assertNotIn("--idempotency-key", seq[1])
+        self.assertEqual(self.pending_count(), 0)
+        self.assertEqual(self.W._load_failcount(), {}, "폴백 성공이 실패로 계수됐다")
 
 
 if __name__ == "__main__":

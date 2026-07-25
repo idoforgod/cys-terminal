@@ -773,6 +773,29 @@ def route_event(ev, world, coal, slug="main", now=None):
     elif name == "queue.delivered":
         frames.append({"t": "fx", "kind": "doc", "to": key, "from": None,
                        "bytes": p.get("bytes")})
+    # ★B5: C2~C5 신설 4이벤트 배선. 종전엔 enqueued/delivered 만 알아서, 역압이 실제로
+    #      작동한 순간(거부·만기·병합·OOB 통지)이 HUD 에서 **전부 무연출**이었다 —
+    #      "큐가 쌓이는 것"만 보이고 "큐가 제어되는 것"은 안 보였다. 프레임 관례는 기존
+    #      queue/doc 프레임과 동형(kind 를 새로 만들지 않고 payload 필드로 구분).
+    elif name == "queue.rejected":
+        # log 모드는 admitted=true(관찰만) — 실제 차단과 구분해 연출한다.
+        frames.append({"t": "fx", "kind": "queue", "to": key,
+                       "event": "rejected", "mode": p.get("mode"),
+                       "admitted": bool(p.get("admitted")),
+                       "depth": p.get("agent_depth"), "softcap": p.get("softcap")})
+    elif name == "queue.expired":
+        frames.append({"t": "fx", "kind": "queue", "to": key,
+                       "event": "expired", "count": p.get("count"),
+                       "ttl_secs": p.get("ttl_secs")})
+    elif name == "queue.merged":
+        frames.append({"t": "fx", "kind": "queue", "to": key,
+                       "event": "merged", "depth": p.get("depth"),
+                       "merged_count": p.get("merged_count")})
+    elif name == "queue.oob_notified":
+        # OOB 는 큐를 우회한 직접 주입 — 배달(doc)과 같은 계열로 연출한다.
+        frames.append({"t": "fx", "kind": "doc", "to": key, "from": None,
+                       "event": "oob", "dedup_key": p.get("dedup_key"),
+                       "bytes": p.get("bytes")})
     elif name in ("surface.created", "surface.closed", "surface.exited"):
         poke = True
         # C4: sid 부재 시 payload.surface_ref 에서 번호 재조립 → 구독 slug 정식 키로 생성.

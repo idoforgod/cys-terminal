@@ -20,16 +20,26 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
 sys.path.insert(0, BIN)
 import javis_deadletter as D                                               # noqa: E402
 
 
-def row(text="msg", reason="ttl", surface_id=7, role="worker", origin="agent"):
+def row(text="msg", reason="ttl", surface_id=7, role="worker", origin=None, seq=1):
+    """★B3⑤: **실제 데몬 출력 형식**의 픽스처.
+
+    종전 픽스처는 origin 을 문자열 "agent" 로 넣었는데, 데몬(queue_policy::record_dead_letter)은
+    QueueOrigin 을 그대로 직렬화해 **객체**를 쓴다. 픽스처가 실물과 달라서 렌더러가 dict 를
+    받는 경로가 테스트에서 한 번도 실행되지 않았다(그 결과 md 에 dict repr 이 박혔다).
+    필드 집합도 데몬 계약 그대로 맞춘다(kind·enqueued_at·idem_key·merged_count 포함)."""
+    if origin is None:
+        origin = {"class": "agent", "surface": surface_id, "role": role}
     return {"ts": 1753500000.0, "surface_id": surface_id, "role": role,
-            "text": text, "origin": origin, "reason": reason, "seq": 1}
+            "text": text, "origin": origin, "reason": reason, "seq": seq,
+            "kind": "text", "enqueued_at": 1753499900.0,
+            "idem_key": None, "merged_count": 0}
 
 
 def append_rows(state_dir, rows, name=D.DEAD_LETTER_FILE):
@@ -221,6 +231,151 @@ class DeadLetterTest(unittest.TestCase):
         rc, out = self.run_tool()
         self.assertEqual(json.loads(out)["new_rows"], 1)
         self.assertIn("깨진 json", self.md())
+
+
+    # ── ★B3⑤ origin 렌더 ──
+    def test_origin_object_is_rendered_readably(self):
+        append_rows(self.main_dir, [row("객체 origin")])
+        self.run_tool()
+        body = self.md()
+        self.assertIn("origin=agent(surface:7,worker)", body,
+                      "origin 객체가 사람이 읽을 형태로 렌더되지 않았다")
+        self.assertNotIn("{'class'", body, "dict repr 이 md 에 그대로 박혔다")
+        self.assertNotIn('{"class"', body)
+
+    def test_render_origin_handles_system_and_legacy_forms(self):
+        self.assertEqual(D.render_origin({"class": "system", "label": "boot"}), "system(boot)")
+        self.assertEqual(D.render_origin({"class": "human"}), "human")
+        self.assertEqual(D.render_origin("agent"), "agent", "구 문자열 origin 은 그대로 통과")
+        self.assertEqual(D.render_origin(None), "None")
+
+    # ── ★B3⑥ 동일 크기 교체 → 지문 불일치 → 재전사 ──
+    def test_same_size_replacement_is_detected_and_retranscribed(self):
+        """(dev,ino) 는 같고 **크기까지 같은** 교체는 오프셋만으로는 구분되지 않는다 —
+        head 지문 분기가 그래서 있는데, 종전 테스트는 truncate(크기 감소)만 덮어
+        **이 분기를 한 번도 실행하지 않았다**. 같은 바이트 수로 내용을 갈아끼운다."""
+        path = os.path.join(self.main_dir, D.DEAD_LETTER_FILE)
+        os.makedirs(self.main_dir, exist_ok=True)
+        pad = "P" * (D.HEAD_N + 64)          # 선두 지문 길이를 확실히 넘긴다
+        first = json.dumps(row("A" + pad, surface_id=7), ensure_ascii=False) + "\n"
+        second = json.dumps(row("B" + pad, surface_id=7), ensure_ascii=False) + "\n"
+        self.assertEqual(len(first), len(second), "전제: 두 내용의 바이트 수가 같아야 한다")
+        self.assertGreater(len(first), D.HEAD_N, "전제: 선두 지문 길이보다 길어야 한다")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(first)
+        rc, out = self.run_tool()
+        self.assertEqual(json.loads(out)["new_rows"], 1)
+        st1 = os.stat(path)
+
+        # 제자리 덮어쓰기 — 아이노드·크기 동일, 내용만 교체.
+        with open(path, "r+", encoding="utf-8") as f:
+            f.write(second)
+        st2 = os.stat(path)
+        self.assertEqual((st1.st_dev, st1.st_ino), (st2.st_dev, st2.st_ino),
+                         "전제: 같은 아이노드여야 한다")
+        self.assertEqual(st1.st_size, st2.st_size, "전제: 같은 크기여야 한다")
+
+        rc2, out2 = self.run_tool()
+        self.assertEqual(json.loads(out2)["new_rows"], 1,
+                         "동일 크기 교체를 탐지하지 못했다(head 지문 분기 미실행)")
+        self.assertIn("B" + pad, self.md())
+
+    # ── ★B3⑦ 소멸 파일 오프셋 prune ──
+    def test_offsets_prune_vanished_files(self):
+        path = os.path.join(self.main_dir, D.DEAD_LETTER_FILE)
+        append_rows(self.main_dir, [row("회전 대상")])
+        self.run_tool()
+        rotated = os.path.join(self.main_dir, "dead-letters.1753500001.jsonl")
+        os.rename(path, rotated)
+        append_rows(self.main_dir, [row("현행")])
+        self.run_tool()
+        self.assertEqual(len(D.load_offsets(os.path.join(self.out, ".offsets.json"))), 2)
+
+        # 회전본을 지우면 그 오프셋 항목도 사라져야 한다((dev,ino) 재사용 오염 차단).
+        os.remove(rotated)
+        append_rows(self.main_dir, [row("추가")])
+        self.run_tool()
+        off = D.load_offsets(os.path.join(self.out, ".offsets.json"))
+        self.assertEqual(len(off), 1, "소멸 파일의 오프셋 항목이 남았다: %s" % off)
+        self.assertTrue(list(off.values())[0]["path"].endswith(D.DEAD_LETTER_FILE))
+
+    # ── ★B3④ 빈 결과에 검사 경로 노출 ──
+    def test_empty_result_lists_checked_paths(self):
+        os.makedirs(self.main_dir)
+        rc, out = self.run_tool()
+        self.assertEqual(rc, D.EXIT_EMPTY)
+        self.assertIn(self.main_dir, out, "검사한 경로가 출력되지 않아 오진단을 유발한다")
+
+    def test_no_new_rows_reports_checked_dirs(self):
+        append_rows(self.main_dir, [row()])
+        self.run_tool()
+        rc, out = self.run_tool()
+        self.assertEqual(rc, D.EXIT_EMPTY)
+        self.assertIn(self.main_dir, json.loads(out)["checked"])
+
+    # ── ★B3③ digest 실패 = degraded(exit 4) ──
+    def test_digest_failure_is_degraded_not_silent_success(self):
+        class FailingDigest:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, summary, dry_run=False):
+                self.calls.append((summary, dry_run))
+                return 6, "배달 위임 실패(rc=2): boom"
+
+        D.push_digest = FailingDigest()
+        append_rows(self.main_dir, [row("전사는 된다")])
+        buf, errbuf = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(errbuf):
+            rc = D.main(["--state-dir", self.main_dir, "--out-dir", self.out])
+        self.assertEqual(rc, D.EXIT_DEGRADED, "digest 실패가 무음 성공으로 처리됐다")
+        self.assertIn("전사는 된다", self.md(), "degraded 여도 전사 자체는 완료돼야 한다")
+        self.assertIn("digest push 실패", errbuf.getvalue())
+
+
+class DigestDelegationTest(unittest.TestCase):
+    """★B3②: digest push 는 javis_push.push() 형제 import 로 위임한다 —
+    자체 서브프로세스로 wakeup 을 부르면 보고 채널 규약(B1 코얼레스 의미론)을 우회한다."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig = D.javis_push.push
+
+        def fake_push(to, key, pointer, body_file=None):
+            self.calls.append((to, key, pointer, body_file))
+            return self.result
+
+        self.result = (D.javis_push.EXIT_OK, "enqueued", None)
+        D.javis_push.push = fake_push
+
+    def tearDown(self):
+        D.javis_push.push = self._orig
+
+    def test_push_digest_delegates_to_javis_push(self):
+        rc, msg = D.push_digest("[dead-letter] 신규 3건")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.calls), 1)
+        to, key, pointer, body = self.calls[0]
+        self.assertEqual((to, key), ("master", D.DIGEST_KEY))
+        self.assertIn("신규 3건", pointer)
+        self.assertIsNone(body)
+
+    def test_suppressed_is_success_not_failure(self):
+        self.result = (D.javis_push.EXIT_SUPPRESSED, "suppressed", None)
+        rc, _ = D.push_digest("x")
+        self.assertEqual(rc, 0, "멱등 억제는 무작업이지 실패가 아니다")
+
+    def test_delegate_failure_propagates_nonzero(self):
+        self.result = (D.javis_push.EXIT_DELEGATE, None, "boom")
+        rc, msg = D.push_digest("x")
+        self.assertEqual(rc, D.javis_push.EXIT_DELEGATE)
+        self.assertIn("boom", msg)
+
+    def test_dry_run_does_not_call_push(self):
+        rc, msg = D.push_digest("x", dry_run=True)
+        self.assertEqual((rc, self.calls), (0, []))
+        self.assertIn("DRYRUN", msg)
 
 
 if __name__ == "__main__":
