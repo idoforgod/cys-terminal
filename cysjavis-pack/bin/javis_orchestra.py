@@ -442,8 +442,18 @@ def cmd_review_prompt(args):
     if rnd and rnd > 1:
         lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 평가하고 "
                      "**직전 점수 +10%%** 목표로 본다. 단순 코드수정이 아니라 재귀적 개선 관점으로." % rnd)
-    lines.append("회신: `cys send --queued --to master \"[리뷰] ...\"` (자동 Return 배달 — "
-                 "타이핑 가드 안전·send-key 불필요).")
+    # ★C7/C8 3분류 보고 규약(응답 폭주 재발방지): 전문은 파일로, 채팅에는 포인터 1줄.
+    lines.append("회신 채널(3분류 규약 — 위반 시 큐 폭주):")
+    lines.append("  ① 리뷰 판정·논쟁점(ACTION — master가 조치해야 하는 것): "
+                 "`cys send --queued --to master \"[ACTION] [리뷰] 판정 1줄 …\"` "
+                 "(자동 Return 배달 — 타이핑 가드 안전·send-key 불필요). ACK는 1회, "
+                 "ACK에 대한 ACK 금지.")
+    lines.append("  ② 리뷰 전문·근거 목록(FYI — 회신 금지): 전문을 md 파일로 쓰고 "
+                 "`python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_push.py\" --to master "
+                 "--key <리뷰-slug> --pointer \"[FYI] …\" --body-file <전문 md 절대경로>` — "
+                 "채팅 본문에 리뷰 전문을 통째로 붙여넣지 마라.")
+    lines.append("  ③ 즉시 개입이 필요한 긴급(BLOCK 급): 직접 send 후 "
+                 "`cys send-key --to master Return`(가드 차단 시 --queued로 전환).")
     print("\n".join(lines))
     return 0
 
@@ -634,10 +644,21 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     lines.append("todo 영속: 이 작업을 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/round/%s_TODO.md\"에 "
                  "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천)."
                  % to_role.upper().replace("-", "_"))
-    lines.append("보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master \"[보고] ...\"` "
-                 "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
-                 "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
-                 "Return`(가드 차단 시 --queued로 전환).")
+    # ★C7/C8 3분류 보고 규약(DESIGN §4-C7·§6.1~6.3 · 응답 폭주 재발방지):
+    #   보고를 채팅 본문에 통째로 밀어넣던 관행이 master 큐를 포화시켰다. 전문은 파일,
+    #   채팅에는 포인터 1줄. FYI는 회신을 받지 않고, ACTION만 1회 ACK를 받는다.
+    lines.append("보고 채널(3분류 규약 — 이 분류를 어기면 master 큐가 포화된다):")
+    lines.append("  ① 진행·상태 보고(FYI — master는 회신하지 않는다): 전문을 md 파일로 쓰고 "
+                 "`python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_push.py\" --to master "
+                 "--key <task-slug> --pointer \"[FYI] 1줄 요약\" --body-file <전문 md 절대경로>` "
+                 "— 채팅에는 포인터 1줄만 간다(같은 --key의 연속 보고는 자동 병합). "
+                 "진행률·중간 산출물·조사 결과는 전부 이 채널이다.")
+    lines.append("  ② 게이트 전이·완료·질문·막힘(ACTION — 1회 ACK 대상): "
+                 "`cys send --queued --to master \"[ACTION] ...\"` 로 직접 push하라"
+                 "(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 안전). "
+                 "ACK에 대한 ACK 금지 — 받았다는 답에 다시 답하지 마라.")
+    lines.append("  ③ 즉시 끼어들어야 할 긴급: 직접 send 후 `cys send-key --to master "
+                 "Return`(가드 차단 시 --queued로 전환). 남용 금지 — 위 ①②로 대체 가능하면 긴급이 아니다.")
     # done 증거 게이트(P3 · 설계 §2.2·§4 컴포넌트 C) — E1 산출물 파일 게이트와 나란히 공존하는
     # 별개·보완 채널: E1=검증 산출물 **파일**(--evidence-artifact), 여기=`--evidence` **텍스트**의
     # 증거 범주(negative-case/실데이터)와 probe 영수증 대조. 문구 중복·모순 없이 둘 다 명시한다.
@@ -1424,7 +1445,10 @@ def cmd_self_test(args):
         with contextlib.redirect_stdout(buf):
             cmd_review_prompt(_A())
         out = buf.getvalue()
-        for must in ("엄격 제약", "배회 금지", "문제점", "회신", "+10%"):
+        for must in ("엄격 제약", "배회 금지", "문제점", "회신", "+10%",
+                     # ★C7 3분류 회신 규약 — 리뷰 전문은 파일(javis_push), 판정만 채팅(ACTION)
+                     "회신 채널(3분류 규약", "[ACTION]", "--queued", "[FYI]",
+                     "javis_push.py", "--body-file", "send-key"):
             assert must in out, "review-prompt에 '%s' 누락" % must
         # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
         import tempfile as _tf
@@ -1485,14 +1509,22 @@ def cmd_self_test(args):
         # round-log 표 셀 새니타이즈: 파이프·개행이 제거된다
         assert _cell("a|b\nc") == "a/b c", "_cell 새니타이즈 오류"
         # task-prompt 티켓(밀폐 — rules 명시 주입, 설치본 디렉티브 상태와 무관):
-        # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다
+        # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다.
+        # ★C7(2026-07-26): 보고 채널이 3분류 규약(FYI=javis_push · ACTION=--queued · 긴급=직접 send)
+        #   으로 개정됨 — 필수 리터럴 집합을 신 규약 기준으로 재정의한다. 티켓 문자열과 이 집합은
+        #   **같은 커밋**에서만 함께 바뀐다(한쪽만 바꾸면 전 티켓 발급이 실패한다 — 설계 §6-5).
         ticket = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES)
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
                      "성공 기준", "WORKER_TODO.md", "${CYS_PACK_DIR", "보고 채널",
-                     "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
+                     # 3분류 규약 리터럴(C7) — 세 채널이 전부 명시돼야 티켓이 완전하다
+                     "[FYI]", "javis_push.py", "--body-file", "[ACTION]", "--queued",
+                     "send-key", "ACK에 대한 ACK 금지",
+                     "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
                      "done 증거 게이트(P3)"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
+        # 구 규약 문자열(무분류 '[보고]' 단일 채널)이 되살아나면 3분류가 무력화된다
+        assert "\"[보고] ...\"" not in ticket, "구 단일 보고 채널 문구 잔존(3분류 회귀)"
         # P3 필수 probe 블록: probes 미지정이면 부재(하위호환·E1 블록은 그대로), 지정 시 목록·actprobe 명령
         assert "필수 probe" not in ticket, "probes 미지정인데 필수 probe 블록 존재(하위호환 위반)"
         tp_probe = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
