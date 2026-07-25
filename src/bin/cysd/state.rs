@@ -2286,6 +2286,10 @@ impl Daemon {
                     json!({"reason": "process_exited", "count": dropped.len(),
                            "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
                 );
+                // ★D9②(기존 버그 보수): 자력 종료(셸 EOF)도 close_surface와 동일하게 drain 후
+                // WAL을 갱신해야 한다. 안 하면 폐기된 메시지가 디스크에 남아 다음 재기동에서
+                // 같은 role의 새 surface로 되살아난다(유령 배달).
+                daemon.persist_queue_state();
             }
             daemon.bus.publish(
                 "surface.exited",

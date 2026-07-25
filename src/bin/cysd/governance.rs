@@ -1844,6 +1844,11 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
             json!({"reason": "surface_closed", "count": dropped.len(),
                    "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
         );
+        // ★D9②(기존 버그 보수): drain 후 WAL을 갱신하지 않아 **유령 항목**이 남았다.
+        // 디스크에는 방금 폐기한 메시지가 그대로 있으므로, 다음 재기동에서 restored_queue로
+        // 되살아나 같은 role의 새 surface에 오배달된다(사용자가 본 적 없는 유령 배달).
+        // drain은 큐 상태 변화이므로 enqueue/pop/clear와 동일하게 즉시 영속해야 한다.
+        daemon.persist_queue_state();
     }
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
     let mut sys = System::new();
@@ -3343,6 +3348,97 @@ mod queue_ttl_tests {
             })
             .collect();
         assert_eq!(rotated.len(), 1, "회전본이 정확히 1개 남아야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D9② 회귀 가드 — drain(폐기) 후 WAL 갱신 누락 = 유령 항목
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_drain_persist_tests {
+    use crate::state::{Daemon, QueueItem, QueueOrigin};
+    use std::sync::Arc;
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-qdrain-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    /// WAL v2 파일의 entries 수 — 디스크 사실만 본다(인메모리 상태를 믿지 않는다).
+    fn wal_len(dir: &std::path::Path) -> usize {
+        let p = crate::state::state_dir(&dir.join("cysd.sock")).join(crate::state::QUEUE_WAL_V2);
+        let Ok(s) = std::fs::read_to_string(p) else {
+            return 0;
+        };
+        serde_json::from_str::<serde_json::Value>(&s)
+            .ok()
+            .and_then(|v| v["entries"].as_array().map(|a| a.len()))
+            .unwrap_or(0)
+    }
+
+    /// ★D9②: close_surface의 큐 drain 후 WAL을 갱신하지 않으면 디스크에 폐기 메시지가 남아
+    /// 다음 재기동에서 같은 role의 새 surface로 되살아난다(유령 배달). drain = 큐 상태 변화이므로
+    /// enqueue/pop/clear와 동일하게 즉시 영속돼야 한다.
+    #[test]
+    fn close_surface_drain_updates_wal() {
+        let (d, dir) = daemon("close");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(QueueItem::text(
+            "유령 후보".into(),
+            QueueOrigin::system("t"),
+        ));
+        d.persist_queue_state();
+        assert_eq!(wal_len(&dir), 1, "전제: WAL에 1건이 실려 있다");
+
+        super::close_surface(&d, s.id, super::CloseCause::OwnerClose).expect("close");
+        assert_eq!(
+            wal_len(&dir),
+            0,
+            "drain 후 WAL에 유령 항목이 남으면 재기동 시 되살아나 오배달된다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★D9②(짝): 자력 종료(셸 EOF)는 close_surface를 거치지 않는 별도 경로다 —
+    /// 같은 누락이 그쪽에도 있었다. 짧게 사는 셸이 EOF를 내면 reader 스레드가 drain하고
+    /// WAL을 갱신해야 한다.
+    #[test]
+    fn self_exit_drain_updates_wal() {
+        let (d, dir) = daemon("eof");
+        let s = d
+            .create_surface(None, Some("sleep 1".into()), None, Some("worker-2".into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(QueueItem::text(
+            "유령 후보".into(),
+            QueueOrigin::system("t"),
+        ));
+        d.persist_queue_state();
+        assert_eq!(wal_len(&dir), 1, "전제: WAL에 1건이 실려 있다");
+
+        // EOF는 reader 스레드에서 비동기로 처리된다 — 최대 15초 폴링.
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(15) {
+            if s.exited.load(std::sync::atomic::Ordering::Relaxed) && wal_len(&dir) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            s.exited.load(std::sync::atomic::Ordering::Relaxed),
+            "전제: 셸이 자력 종료해 EOF 경로가 돌아야 한다"
+        );
+        assert_eq!(wal_len(&dir), 0, "자력 종료 drain 후에도 WAL이 갱신돼야 한다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
