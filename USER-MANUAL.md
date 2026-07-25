@@ -227,11 +227,21 @@ cys boot                                        # 표준 노드 세트 일괄 �
 cys send --to worker "상태 보고해줘"    # 대상 PTY stdin에 직접 주입 (타이핑만)
 cys send-key --to worker Return        # 전송 확정 (send 후 필수)
 cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면 자동 배달(Return 불필요)
+cys send --queued --idempotency-key build-status --to master "..."   # 같은 키는 제자리 교체(최신 승리)
+cys send --queued --important --to worker "..."                      # TTL 면제(만기로 사라지지 않음)
 ```
 
 - 기본 send = **steer**(즉시 주입 — 실행 중 조향). `--queued` = **followup**(대상이 3초
   이상 조용할 때 한 틱에 한 건씩 배달).
 - **타이핑 가드**: 사람이 방금 타이핑 중인 pane에는 기계 주입이 거부됩니다(기본 3초).
+- `--idempotency-key <키>`(--queued 전용): 대상 큐에 같은 키의 항목이 있으면 **제자리에서
+  교체**합니다(줄 뒤로 밀리지 않음 — 자주 갱신하는 주제일수록 늦게 배달되는 역전 방지).
+  밀려난 구 텍스트는 dead-letter(`superseded`)에 남습니다. 키가 없으면 어떤 중복 억제도
+  하지 않습니다(동일 문자열 재전송은 정당한 패턴).
+- `--important`(--queued 전용, master·CSO 계열 발신만): **TTL 면제**입니다.
+  소프트캡 면제가 아닙니다 — 혼잡 상한은 지휘 메시지에도 적용됩니다(의도된 설계).
+- 여러 대상(`--to 'reviewer-*'`)에 보낼 때 일부가 실패해도 나머지는 계속 시도하고,
+  마지막에 대상별 실패를 요약한 뒤 **비0으로 종료**합니다.
 
 ### 5.4 관제·이벤트
 
@@ -326,9 +336,25 @@ cys pause        # 큐 배달·스케줄 발화 동결 (직접 send는 통과 �
 cys resume
 cys gate-check   # exit 0=running, 4=paused (자율주행이 매 action 전 확인)
 cys queue list / clear   # 미배달 큐 검사·철회
+cys queue clear --surface <ref> --operator-token <토큰>   # 위임형 clear(남의 큐를 대신 비움)
+cys queue request-clear --surface <ref>                   # ACL 보존형: 대신 비우지 않고 점검을 '요청'
 ```
 
 pause 상태는 재부팅에도 유지됩니다.
+
+**큐에서 사라지는 모든 메시지는 원장에 남습니다.** `clear`·surface 종료·TTL 만기·소프트캡
+거부·멱등 교체 — 어느 경로든 전문이 state dir 의 `dead-letters.jsonl` 에 기록된 뒤에야
+큐에서 제거됩니다. 기록에 실패하면 항목을 **지우지 않고 큐에 남깁니다**(응답의 `retained`
+필드 · `health.dead_letter_write_failed` 이벤트). 사람이 읽는 형태로는 6시간 주기 built-in
+잡(`deadletter-transcribe-6h`)이 `_round/dead_letters/<날짜>.md` 로 전사합니다.
+
+- `--operator-token`: state dir 의 `operator.token`(0600·기동 시 재발급)과 일치하면 타
+  surface 큐도 비울 수 있습니다. 토큰은 "사람 오퍼레이터 세션" 증명이지 새 권한이 아니며,
+  이 경로로 제거된 항목은 `cleared_by_operator` 사유로 원장에 남습니다.
+- `request-clear`: 남의 큐를 직접 비우지 않고 소유 노드에게 점검을 요청합니다(집행·거부
+  판단은 그 노드 몫). 응답의 `delivered`가 false면 `reason`(`gate_blocked`·`human_typing`·
+  `cooldown`·`channel_full`)이 함께 옵니다. **자동 재통지는 없습니다** — 쿨다운(60초)
+  경과 후 직접 재발행하세요.
 
 ---
 
@@ -616,6 +642,9 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보 |
+| `CYS_QUEUE_AGENT_SOFTCAP` | 25 (0=off) | 대상 큐 안의 **Agent 발신 항목 수** 상한. System·Human 발신은 면제 |
+| `CYS_QUEUE_POLICY_MODE` | `log` | 소프트캡 도달 시 동작. `log`=이벤트만(적재 허용) · `enforce`=거부+dead-letter 기록 |
+| `CYS_QUEUE_TTL_SECS` | 3600 (0=off) | 큐 항목 만기. 만기분은 **폐기가 아니라** dead-letters.jsonl 로 이관(전문 보존) |
 | `CYS_FEED_REMIND_SECS` | 300 (0=off) | 승인 적체 재알림 |
 | `CYS_MASTER_DEADMAN_SECS` | 900 (0=off) | 오케스트레이터 무반응 감지 |
 | `CYS_AGENT_AUTORESTART` | 0 | 죽은 에이전트 자동 재기동 (3회 상한) |
@@ -655,7 +684,7 @@ tombstone.set   events.stream   reinject.mark   status.set
 ledger.register / deregister / list / kill
 health.add_rule / list_rules
 feed.push / reply / list
-queue.list / clear
+queue.list / clear / request_clear
 recall.search   attest.pin / verify   approval.check / sign
 learn.propose / status / history
 schedule.status / run_now
@@ -675,6 +704,8 @@ surface.created/exited/crashed/closed/reaped/zombie_reaped/close_denied/quiescin
 agent.exited/recovered/restart_blocked/exit_unrecoverable
 watchdog.load_high/proc_count_high/duplicate_procs/tick_panic   pane.idle
 queue.enqueued/delivered/dropped/depth_high/clear_denied
+queue.rejected/expired/merged/oob_notified   health.dead_letter_write_failed
+health.queue_wal_corrupt
 ledger.registered/killed
 feed.item.created/resolved/aging/timeout   feed.backlog_high
 health.alert/action

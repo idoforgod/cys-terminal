@@ -350,6 +350,13 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 ## 4. 릴리스 전 체크리스트
 
 - [ ] `cargo build --release` 무오류 · `cargo clippy --bins` 0경고 · `cargo test` 통과
+- [ ] **T7 두 기능 핀** — `python3 cysjavis-pack/bin/tests/test_banner_truth.py` ·
+      `test_cli_probe.py` · `test_formation.py` 전부 green. (부트 배너가 사실을 말하는가 ·
+      CLI 감지가 로그인셸 프로브 단일 경로인가 · 편성 상태 enum 이 계약대로인가 —
+      셋 다 릴리스 후 사용자 머신에서만 드러나는 부류라 사전 핀이 유일한 방어다.)
+- [ ] **T9 혼잡 드릴** — `python3 cysjavis-pack/bin/javis_queue_drill.py` **29판정 전부 pass**
+      (exit 0). 격리 데몬을 띄워 소프트캡 거부·TTL 이관·멱등 병합·OOB 통지·하드캡을 실제로
+      돌린다. 라이브 데몬 무접촉(Z1)·격리 데몬 잔여 0(Z2)까지 판정에 포함된다.
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 4곳(+wxs 2곳) 일치
