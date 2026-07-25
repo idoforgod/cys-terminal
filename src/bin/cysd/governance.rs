@@ -1908,6 +1908,10 @@ fn queue_depth_alert_threshold() -> usize {
 
 const QUEUE_ALERT_COOLDOWN_SECS: f64 = 300.0;
 
+/// C5 hard tier·TTL 요약 OOB 통지의 쿨다운(30분). 이벤트 경보(5분)보다 훨씬 길다 —
+/// OOB는 상대 stdin을 점유하는 침습적 채널이라 잦으면 그 자체가 소음이 된다.
+pub(crate) const OOB_HARD_COOLDOWN_SECS: f64 = 1800.0;
+
 /// queued 배달의 '사람 입력 후 정지' 임계(초) — 기본 30초. 사람이 입력하다 3초+ 멈추면
 /// quiet(출력 기준)만으로는 배달이 나가 미완성 입력에 이어붙거나(텍스트) 그대로 제출(Return)
 /// 한다 — send_text 가드가 명명한 '최악 경로'의 재현(적대 검증 R1). 사람 흔적이 식은 뒤에만
@@ -1917,6 +1921,110 @@ fn queue_human_quiet_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C5 — OOB(out-of-band) 제어 레인
+//
+// 혼잡한 큐로 혼잡 경보를 보내면 경보 자체가 큐 뒤에 줄을 선다(순환). 그래서 제어 신호는
+// 큐를 우회해 write_tx로 직접 주입한다 — 스케줄러가 이미 쓰는 경로(schedule.rs inject)의
+// 일반화이며, 스케줄러와 달리 **human 가드를 존중**한다.
+//
+// 도달 의미론(D6): OOB 주입은 도달을 보장하지 않는다(수신 TUI가 스트리밍 중이면 다음 턴
+// 입력으로 버퍼링된다 — 실측상 도달하나 계약은 아니다). 따라서 "1회 발사 후 기도"가 아니라
+// **미해소 상태가 지속되면 쿨다운 경과 후 재통지**하는 자기치유 의미론으로 정의한다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// OOB 통지 대상이 될 수 있는 지휘 role. **dept-master 포함이 필수**다 — 부서 데몬의
+/// roles 맵에는 `master` 키가 없어서, {master,cso}만 조회하면 통지 대상이 공집합이 된다(R3).
+const OOB_PRIVILEGED_ROLES: [&str; 3] = ["master", "cso", "dept-master"];
+
+/// 큐를 우회해 대상 stdin에 제어 신호를 직접 주입한다. 성공 시 true.
+///
+/// 게이트 3중:
+/// ① **agent-present**(안전 필수): `agent_meta` 보유 ∧ 좌석이 Empty가 아닐 때만. 빈 좌석
+///    bare shell에 주입하면 통지 문자열이 **셸 명령으로 실행**된다(Sim3-2 — 스케줄러가
+///    schedule.rs에서 이미 지키는 가드와 동일 근거).
+/// ② **human 가드**: 사람 입력 흔적이 식기 전이면 skip하고 다음 틱에 재시도한다
+///    (미완성 입력에 이어붙이거나 그대로 제출시키는 최악 경로 차단).
+/// ③ **쿨다운**: (surface, dedup_key)별. 쿨다운을 **성공했을 때만** 찍으므로, 주입 실패나
+///    가드 skip은 다음 틱에 그대로 재시도된다.
+pub(crate) fn oob_notify(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    text: &str,
+    dedup_key: &str,
+    cooldown_secs: f64,
+) -> bool {
+    let Some(s) = daemon.get_surface(sid) else {
+        return false;
+    };
+    if s.exited.load(Ordering::Relaxed) {
+        return false;
+    }
+    // ① agent-present
+    if s.agent_meta.lock().unwrap().is_none()
+        || SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
+    {
+        return false;
+    }
+    // ② human 가드
+    let human_recent = s
+        .last_human_input
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
+        .unwrap_or(false);
+    if human_recent {
+        return false;
+    }
+    // ③ 쿨다운
+    let now = now_epoch();
+    let key = (sid, dedup_key.to_string());
+    {
+        let cd = daemon.oob_cooldowns.lock().unwrap();
+        if let Some(last) = cd.get(&key) {
+            if now - last < cooldown_secs {
+                return false;
+            }
+        }
+    }
+    if s.write_tx
+        .try_send(crate::state::WriteReq::Inject {
+            text: text.to_string(),
+            cr_delay_ms: 500,
+            clear_first: false,
+        })
+        .is_err()
+    {
+        return false; // 채널 포화 — 쿨다운을 찍지 않으므로 다음 틱에 재시도된다.
+    }
+    daemon.oob_cooldowns.lock().unwrap().insert(key, now);
+    // 큐 배달과 마찬가지로 원격 주입이므로 에코 제외 창을 갱신한다.
+    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+    daemon.bus.publish(
+        "queue.oob_notified",
+        crate::queue_policy::queue_events::CATEGORY,
+        Some(sid),
+        json!({"dedup_key": dedup_key, "bytes": text.len(),
+               "surface_ref": cys::surface_ref(sid)}),
+    );
+    true
+}
+
+/// 통지 수신 후보: 큐 소유 노드 + roles 맵에 **실재하는** 지휘 role. 중복 sid는 제거한다.
+/// 전 대상이 게이트를 통과하지 못해도 이벤트·dead-letter는 남으므로 사실은 소실되지 않는다.
+fn oob_targets(daemon: &Arc<Daemon>, owner_sid: u64) -> Vec<u64> {
+    let mut out = vec![owner_sid];
+    let roles = daemon.roles.lock().unwrap();
+    for r in OOB_PRIVILEGED_ROLES {
+        if let Some(sid) = roles.get(r).copied() {
+            if !out.contains(&sid) {
+                out.push(sid);
+            }
+        }
+    }
+    out
 }
 
 /// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
@@ -1954,16 +2062,45 @@ fn alert_queue_depth_if_high(
     } else {
         "임계 조정은 CYS_QUEUE_QUIET_SECS"
     };
+    // ★C5 hard tier: depth가 임계의 3배거나 Agent-origin 소프트캡에 닿았다 = 이벤트만으로는
+    // 안 풀린다는 뜻이다(이벤트는 구독자가 봐야 의미가 있고, master는 지금 busy다).
+    // 큐 소유 노드 + 지휘 role에 큐를 **우회해** 직접 통지한다. soft tier는 기존대로 이벤트만.
+    let softcap = crate::queue_policy::agent_softcap();
+    let agent_depth = s
+        .pending_queue
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|i| i.origin.is_agent())
+        .count();
+    let hard = depth >= threshold.saturating_mul(3) || (softcap > 0 && agent_depth >= softcap);
+    let role = s.role.lock().unwrap().clone();
     daemon.bus.publish(
         crate::queue_policy::queue_events::DEPTH_HIGH,
         crate::queue_policy::queue_events::CATEGORY,
         Some(s.id),
         json!({"depth": depth, "threshold": threshold, "blocked_by": blocked_by,
-               "role": s.role.lock().unwrap().clone(),
+               "role": role, "agent_depth": agent_depth, "tier": if hard { "hard" } else { "soft" },
                "surface_ref": cys::surface_ref(s.id),
                "hint": format!("queued 배달이 막힌 채 적체 중 — read-screen으로 상태 점검, \
                                 급한 보고는 직접 send(steer). {knob}")}),
     );
+    if hard {
+        let oldest = crate::queue_policy::oldest_age_secs(s).unwrap_or(0.0) as u64;
+        let text = format!(
+            "[QUEUE-BACKPRESSURE] {} (role={}) 큐 적체 depth={depth} (agent={agent_depth}) \
+             oldest={oldest}s · 사유={blocked_by} — 대상 큐를 점검하고 배달을 막는 원인을 해소하라. \
+             철회가 필요하면 `cys queue list --surface {}` 후 소유 노드가 `cys queue clear` 집행.",
+            cys::surface_ref(s.id),
+            role.as_deref().unwrap_or("-"),
+            cys::surface_ref(s.id),
+        );
+        // dedup 키에 대상 surface를 넣어, 여러 노드가 동시에 적체돼도 각각 통지된다.
+        let key = format!("depth_high_hard:{}", s.id);
+        for target in oob_targets(daemon, s.id) {
+            oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
+        }
+    }
 }
 
 /// ★Phase 5 ①c: WAL로 살아난 restored_queue를 같은 role의 살아있는 surface로 재홈한다.
@@ -2064,6 +2201,22 @@ fn expire_queued(daemon: &Arc<Daemon>) {
                          면제는 System origin과 --important 선언분.",
             }),
         );
+        // ★C5: 만기 요약을 대상 노드·지휘 role에 OOB로 통지한다. 이관은 조용히 일어나면
+        // 안 된다 — 발신자는 배달을 기다리고 있고, 원장을 뒤져보라는 신호가 필요하다.
+        let oldest = moved.iter().map(|i| now - i.enqueued_at).fold(0.0f64, f64::max) as u64;
+        let text = format!(
+            "[QUEUE-TTL] {} (role={}) 대기 메시지 {}건이 TTL({}s) 만기로 dead-letters.jsonl에 \
+             이관됐다(전문 보존·유실 아님). 최고령 {oldest}s. 원장을 확인하고 필요한 건만 \
+             다시 처리하라 — 발신자에게 재전송을 요구하지 마라.",
+            cys::surface_ref(s.id),
+            role.as_deref().unwrap_or("-"),
+            moved.len(),
+            ttl as u64,
+        );
+        let key = format!("ttl_expired:{}", s.id);
+        for target in oob_targets(daemon, s.id) {
+            oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
+        }
     }
     if persist_needed {
         daemon.persist_queue_state();
@@ -3439,6 +3592,133 @@ mod queue_drain_persist_tests {
             "전제: 셸이 자력 종료해 EOF 경로가 돌아야 한다"
         );
         assert_eq!(wal_len(&dir), 0, "자력 종료 drain 후에도 WAL이 갱신돼야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T5 (C5) — oob_notify: agent-present 게이트 · human 가드 · 쿨다운/재통지 · privileged set
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod oob_notify_tests {
+    use super::{oob_notify, oob_targets, SeatState, OOB_HARD_COOLDOWN_SECS};
+    use crate::state::Daemon;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-oob-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    fn surface(d: &Arc<Daemon>, role: Option<&str>) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        if let Some(r) = role {
+            d.roles.lock().unwrap().insert(r.to_string(), s.id);
+        }
+        s
+    }
+
+    /// 에이전트가 앉아 있는 좌석으로 만든다(주입 안전 조건 충족).
+    fn seat_agent(s: &Arc<crate::state::Surface>) {
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        s.seat_cache.store(SeatState::Occupied.as_u8(), Ordering::Relaxed);
+    }
+
+    /// ★Sim3-2(안전 필수): 빈 좌석 bare shell에 주입하면 통지 문자열이 **셸 명령으로 실행**된다.
+    /// agent_meta 부재 또는 seat=Empty면 주입하지 않는다(스케줄러가 이미 지키는 가드와 동일 근거).
+    #[test]
+    fn agent_present_gate_blocks_bare_shell_injection() {
+        let (d, dir) = daemon("agent-gate");
+        let s = surface(&d, Some("worker-1"));
+
+        // ① agent_meta 없음(맨 셸) — seat가 Occupied여도 주입 금지.
+        s.seat_cache.store(SeatState::Occupied.as_u8(), Ordering::Relaxed);
+        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "맨 셸에 주입하면 안 된다");
+
+        // ② agent_meta 있으나 좌석이 비었음(에이전트 죽음) — 주입 금지.
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        s.seat_cache.store(SeatState::Empty.as_u8(), Ordering::Relaxed);
+        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "빈 좌석에 주입하면 안 된다");
+
+        // ③ 에이전트 착석 — 통과.
+        s.seat_cache.store(SeatState::Occupied.as_u8(), Ordering::Relaxed);
+        assert!(oob_notify(&d, s.id, "통지", "k", 1.0), "정상 좌석에는 주입돼야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// human 가드: 사람 입력 흔적이 식기 전에는 주입하지 않는다. 스케줄러 경로와 달리
+    /// OOB는 이 가드를 **존중한다** — 미완성 입력에 이어붙이거나 그대로 제출시키지 않기 위함.
+    #[test]
+    fn human_guard_defers_injection() {
+        let (d, dir) = daemon("human");
+        let s = surface(&d, Some("worker-1"));
+        seat_agent(&s);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "사람 입력 직후엔 보류해야 한다");
+        // 가드로 skip된 시도는 쿨다운을 찍지 않으므로 다음 틱에 그대로 재시도된다.
+        assert!(d.oob_cooldowns.lock().unwrap().is_empty(), "skip이 쿨다운을 소모하면 안 된다");
+        *s.last_human_input.lock().unwrap() = None;
+        assert!(oob_notify(&d, s.id, "통지", "k", 1.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 쿨다운 + **재통지 의미론**(D6): OOB 도달은 보장되지 않으므로 1회 발사 후 기도하지 않는다.
+    /// 쿨다운 안에는 억제하고, 경과하면 (문제가 미해소인 한) 다시 통지한다.
+    #[test]
+    fn cooldown_suppresses_then_renotifies() {
+        let (d, dir) = daemon("cooldown");
+        let s = surface(&d, Some("worker-1"));
+        seat_agent(&s);
+
+        assert!(oob_notify(&d, s.id, "1차", "depth_high", OOB_HARD_COOLDOWN_SECS));
+        assert!(
+            !oob_notify(&d, s.id, "2차", "depth_high", OOB_HARD_COOLDOWN_SECS),
+            "쿨다운 내 재발화는 억제돼야 한다"
+        );
+        // 다른 키는 독립 쿨다운.
+        assert!(oob_notify(&d, s.id, "다른 주제", "ttl_expired", OOB_HARD_COOLDOWN_SECS));
+
+        // 쿨다운 경과를 모사 → 재통지(자기치유).
+        d.oob_cooldowns
+            .lock()
+            .unwrap()
+            .insert((s.id, "depth_high".into()), crate::state::now_epoch() - 3600.0);
+        assert!(
+            oob_notify(&d, s.id, "3차", "depth_high", OOB_HARD_COOLDOWN_SECS),
+            "미해소가 지속되면 쿨다운 후 재통지돼야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★R3: 통지 대상 집합에 **dept-master**가 포함돼야 한다. 부서 데몬의 roles 맵에는
+    /// `master` 키가 없어서 {master,cso}만 조회하면 통지가 공집합이 된다(부서 조직 무통지).
+    #[test]
+    fn privileged_targets_include_dept_master_and_dedupe() {
+        let (d, dir) = daemon("targets");
+        let owner = surface(&d, Some("worker-1"));
+        let cso = surface(&d, Some("cso"));
+        let deptm = surface(&d, Some("dept-master"));
+        let _noise = surface(&d, Some("reviewer-codex"));
+
+        let t = oob_targets(&d, owner.id);
+        assert!(t.contains(&owner.id), "큐 소유 노드는 항상 대상이다");
+        assert!(t.contains(&cso.id));
+        assert!(t.contains(&deptm.id), "부서 데몬에서 통지가 공집합이 되면 안 된다");
+        assert!(!t.contains(&_noise.id), "지휘 role이 아닌 노드는 대상이 아니다");
+
+        // 소유 노드가 지휘 role 자신이면 중복 없이 1건.
+        let t2 = oob_targets(&d, cso.id);
+        assert_eq!(t2.iter().filter(|x| **x == cso.id).count(), 1, "중복 통지 금지");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

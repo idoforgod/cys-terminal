@@ -146,7 +146,7 @@ pub fn hmac_sha256(secret: &[u8], msg: &[u8]) -> [u8; 32] {
 
 /// 상수시간 바이트 비교 — 서명 검증의 조기반환 타이밍 사이드채널 차단.
 /// 길이 다르면 즉시 false(길이는 비밀이 아님), 같으면 전 바이트 XOR 누적 후 0 판정.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

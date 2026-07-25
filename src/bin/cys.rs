@@ -638,7 +638,19 @@ enum QueueAction {
         surface: Option<String>,
     },
     /// Drop all undelivered queued messages for a surface
-    Clear { surface: String },
+    Clear {
+        surface: String,
+        /// 위임 clear: state_dir의 operator.token 값. 일치하면 **타 surface** 큐도 비울 수 있고,
+        /// 제거되는 전 항목이 dead-letters.jsonl에 기록된다(무손실).
+        #[arg(long = "operator-token")]
+        operator_token: Option<String>,
+    },
+    /// 대상 노드에 **자기 큐를 점검·정리하라고 요청**한다(master·cso 전용).
+    /// 남의 큐를 대신 비우지 않는다 — 판단·집행은 대상 노드 몫이라 ACL이 보존된다.
+    RequestClear {
+        #[arg(long)]
+        surface: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1901,15 +1913,57 @@ fn run(command: Command) -> i32 {
                         eprintln!("error: {e}");
                         1
                     }),
-                QueueAction::Clear { surface } => parse_surface_ref(&surface)
+                QueueAction::Clear { surface, operator_token } => parse_surface_ref(&surface)
                     .ok_or_else(|| format!("invalid surface ref: {surface}"))
-                    .and_then(|sid| request("queue.clear", json!({"surface_id": sid})))
+                    .and_then(|sid| {
+                        request(
+                            "queue.clear",
+                            json!({"surface_id": sid, "operator_token": operator_token}),
+                        )
+                    })
                     .map(|r| {
-                        println!("cleared {} queued message(s)", r["cleared"]);
+                        let by_op = if r["by_operator"].as_bool() == Some(true) {
+                            " (operator — 전 항목 dead-letters.jsonl 기록됨)"
+                        } else {
+                            ""
+                        };
+                        println!("cleared {} queued message(s){by_op}", r["cleared"]);
                         0
                     })
                     .unwrap_or_else(|e| {
                         eprintln!("error: {e}");
+                        1
+                    }),
+                QueueAction::RequestClear { surface } => parse_surface_ref(&surface)
+                    .ok_or_else(|| format!("invalid surface ref: {surface}"))
+                    .and_then(|sid| request("queue.request_clear", json!({"surface_id": sid})))
+                    .map(|r| {
+                        if r["notified"].as_bool() == Some(true) {
+                            println!(
+                                "request sent → {} (depth {} · oldest {}s)",
+                                surface, r["depth"], r["oldest_age_secs"]
+                            );
+                        } else {
+                            // 미도달은 실패가 아니다 — 재통지 의미론(쿨다운 후 자동 재시도)이 있다.
+                            println!(
+                                "request not injected (depth {} · oldest {}s): {}",
+                                r["depth"],
+                                r["oldest_age_secs"],
+                                r["hint"].as_str().unwrap_or("게이트 미통과")
+                            );
+                        }
+                        0
+                    })
+                    .unwrap_or_else(|e| {
+                        // 구 데몬은 이 메서드를 모른다 — 결정론 안내로 스큐를 드러낸다.
+                        if e.contains("unknown method") {
+                            eprintln!(
+                                "error: 데몬이 queue request-clear를 지원하지 않는다(구버전 cysd — \
+                                 재기동으로 갱신하라). 임시로는 대상 노드에 직접 점검을 요청하라."
+                            );
+                        } else {
+                            eprintln!("error: {e}");
+                        }
                         1
                     }),
             };

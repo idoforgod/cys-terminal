@@ -3849,9 +3849,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // pane은 커널 peer pid로만 확정한다(client 자기신고 surface_id 불신). 자기 surface(cs == sid)
             // 만 비울 수 있다. 익명 발신(caller_pid None = 데몬 내부 경로)은 통과 — pane은 peer pid가
             // 항상 자기 surface로 해석되므로 익명을 위조할 수 없다.
+            //
+            // ★C6 위임형 clear: state_dir의 `operator.token`(0600·기동 시 재발급)과 **상수시간**
+            // 대조가 일치하면 타 surface 큐도 비울 수 있다. ACL 자체는 불변이다 — 토큰은
+            // "오퍼레이터(사람) 세션" 증명이지 새 role 권한이 아니다. 토큰 미발급(None)·빈 값·
+            // 불일치는 fail-closed(기존 소유 게이트 그대로).
+            let operator_ok = param_str(&params, "operator_token")
+                .zip(daemon.operator_token.as_deref())
+                .map(|(t, d)| {
+                    !d.is_empty() && crate::approval::constant_time_eq(t.as_bytes(), d.as_bytes())
+                })
+                .unwrap_or(false);
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
             if let Some(cs) = caller_sid {
-                if cs != sid {
+                if cs != sid && !operator_ok {
                     daemon.bus.publish(
                         crate::queue_policy::queue_events::CLEAR_DENIED,
                         crate::queue_policy::queue_events::CATEGORY,
@@ -3863,19 +3874,40 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         &id,
                         "clear_denied",
                         &format!(
-                            "queue.clear denied: caller (surface {cs}) may only clear its own surface queue, not surface {sid}"
+                            "queue.clear denied: caller (surface {cs}) may only clear its own surface queue, not surface {sid} (use --operator-token for delegated clear)"
                         ),
                     ));
                 }
             }
+            let by_operator = operator_ok && caller_sid.map(|cs| cs != sid).unwrap_or(false);
             let dropped: Vec<crate::state::QueueItem> =
                 surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
+                // ★C6 무손실 일관성: operator clear로 제거되는 항목도 원장에 남긴다.
+                // 오퍼레이터가 남의 큐를 비우는 경로일수록 "무엇을 지웠는지"가 남아야 한다.
+                let mut recorded = 0usize;
+                if by_operator {
+                    let role = surface.role.lock().unwrap().clone();
+                    for item in &dropped {
+                        if crate::queue_policy::record_dead_letter(
+                            daemon,
+                            sid,
+                            role.as_deref(),
+                            item,
+                            crate::queue_policy::DeadLetterReason::ClearedByOperator,
+                        )
+                        .is_ok()
+                        {
+                            recorded += 1;
+                        }
+                    }
+                }
                 daemon.bus.publish(
                     crate::queue_policy::queue_events::DROPPED,
                     crate::queue_policy::queue_events::CATEGORY,
                     Some(sid),
-                    json!({"reason": "cleared", "count": dropped.len(),
+                    json!({"reason": if by_operator { "cleared_by_operator" } else { "cleared" },
+                           "count": dropped.len(), "dead_lettered": recorded,
                            "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
                 );
             }
@@ -3883,7 +3915,57 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             daemon.persist_queue_state();
             Reply::Single(ok_response(
                 &id,
-                json!({"surface_id": sid, "cleared": dropped.len()}),
+                json!({"surface_id": sid, "cleared": dropped.len(),
+                       "by_operator": by_operator}),
+            ))
+        }
+
+        // ─── C6 위임 요청: 남의 큐를 대신 비우지 않고 **자기 큐를 점검하라고 요청**한다 ───
+        // ACL 보존형이라는 게 핵심이다: 집행 주체는 여전히 큐 소유 노드이고, 이 RPC는
+        // OOB로 요청을 전달할 뿐이다(대상이 판단·집행하거나 거부 사유를 회신한다).
+        "queue.request_clear" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            // 권한: master·cso 계열(직접 주입 권한과 동일 근거 — 남의 stdin을 점유한다).
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if !authoritative_caller_ok(daemon, caller_sid, caller_pid) {
+                return Reply::Single(err_response(
+                    &id,
+                    "acl_denied",
+                    "queue.request_clear requires an authoritative sender (master/cso lineage)",
+                ));
+            }
+            let depth = surface.pending_queue.lock().unwrap().len();
+            let oldest = crate::queue_policy::oldest_age_secs(&surface).unwrap_or(0.0) as u64;
+            let text = format!(
+                "[QUEUE-CLEAR 요청] 네 큐 depth={depth} oldest={oldest}s — 자기 큐를 점검한 뒤 \
+                 `cys queue clear --surface {}` 을 집행하거나, 비우면 안 되는 이유를 회신하라. \
+                 (요청일 뿐 강제가 아니다 — 판단과 집행은 네 몫이다.)",
+                surface_ref(sid),
+            );
+            let delivered = crate::governance::oob_notify(
+                daemon,
+                sid,
+                &text,
+                "request_clear",
+                crate::governance::OOB_HARD_COOLDOWN_SECS,
+            );
+            Reply::Single(ok_response(
+                &id,
+                json!({"surface_id": sid, "depth": depth, "oldest_age_secs": oldest,
+                       "notified": delivered,
+                       "hint": if delivered { Value::Null } else {
+                           json!("주입 게이트 미통과(에이전트 부재·사람 입력 직후·쿨다운) — \
+                                  이벤트는 남았고 다음 시도에서 재통지된다")
+                       }}),
             ))
         }
 
@@ -8106,6 +8188,203 @@ mod queue_merge_tests {
         assert_eq!(q.len(), 3, "Return 3건이 병합돼 줄어들면 제출이 유실된다");
         assert!(q.iter().all(|i| i.idem_key.is_none()), "send_key 항목에 키가 실리면 안 된다");
         drop(q);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T6 (C6) — operator_token 위임 clear(상수시간 대조·dead-letter 기록) · request_clear 권한
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_delegated_clear_tests {
+    use crate::queue_policy;
+    use crate::state::{Daemon, QueueItem, QueueOrigin};
+    use cys::Request;
+    use serde_json::{json, Value};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-qclear-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    fn surface(d: &Arc<Daemon>, role: Option<&str>) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        if let Some(r) = role {
+            d.roles.lock().unwrap().insert(r.to_string(), s.id);
+        }
+        s
+    }
+
+    fn bind(d: &Arc<Daemon>, pid: u32, sid: u64) {
+        d.caller_cache
+            .lock()
+            .unwrap()
+            .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+    }
+
+    fn rpc(d: &Arc<Daemon>, method: &str, params: Value, pid: Option<u32>) -> Value {
+        let req = Request { id: json!(1), method: method.into(), params };
+        let crate::handlers::Reply::Single(r) = crate::handlers::dispatch(d, req, pid) else {
+            panic!("expected single reply");
+        };
+        r
+    }
+
+    fn dead_letters(dir: &std::path::Path) -> Vec<Value> {
+        let p = crate::state::state_dir(&dir.join("cysd.sock")).join(queue_policy::DEAD_LETTER_FILE);
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("유효 JSON"))
+            .collect()
+    }
+
+    fn fill(s: &Arc<crate::state::Surface>, n: usize) {
+        let mut q = s.pending_queue.lock().unwrap();
+        for i in 0..n {
+            q.push_back(QueueItem::text(format!("메시지 {i}"), QueueOrigin::system("t")));
+        }
+    }
+
+    /// 위임 clear: 올바른 operator_token이면 타 surface 큐도 비울 수 있고, 제거된 전 항목이
+    /// dead-letter(cleared_by_operator)에 남는다. **오퍼레이터가 남의 큐를 비우는 경로일수록
+    /// "무엇을 지웠는지"가 남아야 한다**(무손실 일관성).
+    #[test]
+    fn operator_token_allows_foreign_clear_and_records_dead_letters() {
+        let (d, dir) = daemon("op-ok");
+        let victim = surface(&d, Some("worker-1"));
+        let caller = surface(&d, Some("cso"));
+        let pid = 996_101_u32;
+        bind(&d, pid, caller.id);
+        fill(&victim, 3);
+        let token = d.operator_token.clone().expect("기동 시 토큰이 발급돼야 한다");
+
+        let r = rpc(
+            &d,
+            "queue.clear",
+            json!({"surface_id": victim.id, "operator_token": token}),
+            Some(pid),
+        );
+        assert_eq!(r["ok"], json!(true), "응답: {r}");
+        assert_eq!(r["result"]["cleared"], json!(3));
+        assert_eq!(r["result"]["by_operator"], json!(true));
+        assert!(victim.pending_queue.lock().unwrap().is_empty());
+
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 3, "제거된 3건 전부가 원장에 남아야 한다");
+        assert!(dl.iter().all(|e| e["reason"] == json!("cleared_by_operator")));
+        assert_eq!(dl[0]["text"], json!("메시지 0"), "전문 무손실");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 토큰이 틀리면 기존 소유 게이트 그대로 거부한다(fail-closed).
+    /// 상수시간 대조라 길이·내용 어느 쪽으로도 조기반환 타이밍이 새지 않는다.
+    #[test]
+    fn wrong_operator_token_is_denied() {
+        let (d, dir) = daemon("op-bad");
+        let victim = surface(&d, Some("worker-1"));
+        let attacker = surface(&d, Some("worker-2"));
+        let pid = 996_201_u32;
+        bind(&d, pid, attacker.id);
+        fill(&victim, 2);
+
+        for bad in ["", "짧음", "0123456789abcdef0123456789abcdef"] {
+            let r = rpc(
+                &d,
+                "queue.clear",
+                json!({"surface_id": victim.id, "operator_token": bad}),
+                Some(pid),
+            );
+            assert_eq!(r["error"]["code"], json!("clear_denied"), "토큰 {bad:?} 응답: {r}");
+        }
+        // 토큰 미첨부도 동일하게 거부(기존 동작 불변).
+        let r = rpc(&d, "queue.clear", json!({"surface_id": victim.id}), Some(pid));
+        assert_eq!(r["error"]["code"], json!("clear_denied"));
+        assert_eq!(victim.pending_queue.lock().unwrap().len(), 2, "거부됐는데 인멸됐다");
+        assert!(dead_letters(&dir).is_empty(), "거부는 원장을 남기지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 자기 큐 clear는 토큰 없이 통과하고 by_operator=false — operator 경로가 아니므로
+    /// dead-letter도 남기지 않는다(기존 동작 보존: 자기 큐 철회는 발신자 본인의 결정).
+    #[test]
+    fn self_clear_unchanged_without_token() {
+        let (d, dir) = daemon("op-self");
+        let own = surface(&d, Some("worker-1"));
+        let pid = 996_301_u32;
+        bind(&d, pid, own.id);
+        fill(&own, 2);
+
+        let r = rpc(&d, "queue.clear", json!({"surface_id": own.id}), Some(pid));
+        assert_eq!(r["result"]["cleared"], json!(2), "응답: {r}");
+        assert_eq!(r["result"]["by_operator"], json!(false));
+        assert!(dead_letters(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// request_clear 권한: master·cso 계열만. 남의 stdin을 점유하는 동작이라
+    /// 직접 주입(authoritative)과 같은 권한 근거를 쓴다.
+    #[test]
+    fn request_clear_requires_authoritative_sender() {
+        let (d, dir) = daemon("reqclear");
+        let target = surface(&d, Some("worker-1"));
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        target
+            .seat_cache
+            .store(crate::governance::SeatState::Occupied.as_u8(), Ordering::Relaxed);
+        fill(&target, 4);
+
+        let worker = surface(&d, Some("worker-2"));
+        let master = surface(&d, Some("master"));
+        let wpid = 996_401_u32;
+        let mpid = 996_402_u32;
+        bind(&d, wpid, worker.id);
+        bind(&d, mpid, master.id);
+
+        let denied = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(wpid));
+        assert_eq!(denied["error"]["code"], json!("acl_denied"), "응답: {denied}");
+
+        let ok = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
+        assert_eq!(ok["ok"], json!(true), "응답: {ok}");
+        assert_eq!(ok["result"]["depth"], json!(4));
+        assert_eq!(ok["result"]["notified"], json!(true), "에이전트 착석 좌석엔 도달해야 한다");
+
+        // ★ACL 보존: 요청은 큐를 비우지 않는다 — 집행은 대상 노드의 몫이다.
+        assert_eq!(
+            target.pending_queue.lock().unwrap().len(),
+            4,
+            "request_clear가 남의 큐를 직접 비우면 ACL 보존형이 아니다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 빈 좌석·에이전트 부재 대상에는 주입하지 않고 notified=false로 정직하게 보고한다
+    /// (성공을 가장하면 오퍼레이터가 조치됐다고 오인한다).
+    #[test]
+    fn request_clear_reports_undelivered_honestly() {
+        let (d, dir) = daemon("reqclear-bare");
+        let target = surface(&d, Some("worker-1")); // agent_meta 없음 = 맨 셸
+        fill(&target, 1);
+        let master = surface(&d, Some("master"));
+        let mpid = 996_501_u32;
+        bind(&d, mpid, master.id);
+
+        let r = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
+        assert_eq!(r["ok"], json!(true), "게이트 미통과는 오류가 아니라 사실 보고다: {r}");
+        assert_eq!(r["result"]["notified"], json!(false));
+        assert!(r["result"]["hint"].is_string(), "왜 미도달인지 안내가 있어야 한다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

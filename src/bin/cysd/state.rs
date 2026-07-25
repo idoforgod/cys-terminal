@@ -960,6 +960,10 @@ pub struct Daemon {
     /// C3 dead-letter 원장 append 직렬화 락 — O_APPEND 단일 write의 한 줄 원자성을
     /// 핸들러 스레드(거부·superseded)와 watchdog(TTL) 사이에서 보장한다.
     pub dead_letter_lock: Mutex<()>,
+    /// C5 OOB 제어 레인 쿨다운: (surface_id, dedup_key) → 마지막 주입 시각(epoch).
+    /// watchdog 태스크 로컬이 아니라 Daemon에 두는 이유: ①watchdog 재시작으로 리셋되면
+    /// 중복 통지가 난다 ②request_clear 등 RPC 경로도 같은 쿨다운을 공유해야 한다.
+    pub oob_cooldowns: Mutex<HashMap<(u64, String), f64>>,
     /// C2-b 발신 통계: 발신 surface id → (총 큐 발신, 무키 발신, 거부). Agent-origin만 센다.
     /// 재시작 리셋 허용(관찰 창 내 상대 비교 — 영속화는 비목표).
     pub queue_send_stats: Mutex<HashMap<u64, crate::queue_policy::QueueSendStats>>,
@@ -1561,6 +1565,7 @@ impl Daemon {
             // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
             restored_queue: Mutex::new(load_queue_state(&dir)),
             dead_letter_lock: Mutex::new(()),
+            oob_cooldowns: Mutex::new(HashMap::new()),
             queue_send_stats: Mutex::new(HashMap::new()),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
