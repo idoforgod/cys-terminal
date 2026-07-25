@@ -48,6 +48,14 @@ pub fn err_response(id: &Value, code: &str, message: &str) -> Value {
     serde_json::json!({"id": id, "ok": false, "error": {"code": code, "message": message}})
 }
 
+/// 구조화 페이로드를 동봉한 오류 응답. 오류가 "무엇을 하라"까지 결정론으로 전달해야 할 때
+/// 쓴다(C2 큐 소프트캡 거부의 후속 지시·dead-letter 경로 등). `error.data`는 **추가 필드**라
+/// 기존 구독자(code·message만 읽는 구 CLI)와 하위 호환된다.
+pub fn err_response_with(id: &Value, code: &str, message: &str, data: Value) -> Value {
+    serde_json::json!({"id": id, "ok": false,
+                       "error": {"code": code, "message": message, "data": data}})
+}
+
 /// Default socket path: ~/.local/state/cys/cys.sock (unix),
 /// \\.\pipe\cys (windows). Overridable via CYS_SOCKET (legacy JAVIS_/AITERM_ honored).
 pub fn socket_path() -> PathBuf {

@@ -2,7 +2,7 @@
 
 use crate::governance;
 use crate::state::{Daemon, FeedItem, HealthRule, LedgerEntry, DEFAULT_COLS, DEFAULT_ROWS};
-use cys::{err_response, ok_response, parse_surface_ref, surface_ref, Request};
+use cys::{err_response, err_response_with, ok_response, parse_surface_ref, surface_ref, Request};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -1229,6 +1229,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .process(sysinfo::Pid::from_u32(s.pid))
                         .and_then(|p| p.cwd())
                         .map(|p| p.display().to_string());
+                    // C2-b: 발신 통계 스냅샷(부재 = 전부 0). 락은 한 번만 잡는다.
+                    let stats = daemon
+                        .queue_send_stats
+                        .lock()
+                        .unwrap()
+                        .get(&s.id)
+                        .copied()
+                        .unwrap_or_default();
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
                     let (agent, agent_alive) = {
                         let meta = s.agent_meta.lock().unwrap();
@@ -1264,6 +1272,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "agent_alive": agent_alive,
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
+                        // ★C2-b/D10 큐 관측(추가 전용): 이 surface **앞으로 쌓인** 큐의 최고령
+                        // 나이와, 이 surface가 **발신한** 큐 통계 3필드. 후자는 규약 위반의
+                        // 스크리닝 신호이지 판정이 아니다(정당한 [ACTION] 직접 send 포함).
+                        "queue_depth": s.pending_queue.lock().unwrap().len(),
+                        "queue_oldest_age_secs": crate::queue_policy::oldest_age_secs(s),
+                        "queue_sent_total": stats.total,
+                        "queue_sent_keyless": stats.keyless,
+                        "queue_sent_rejected": stats.rejected,
                     })
                 })
                 .collect();
@@ -1353,33 +1369,39 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
-                // ★C1: 큐 항목은 메타 보유 QueueItem. origin 판별은 C2(W2)에서 verified_from을
-                // 소비해 승격한다 — 이 단계에서는 정책이 없으므로 System 라벨로 둔다.
+                // ★C2: 종전 큐 경로는 `verified_from`(커널 검증 발신 surface)을 계산해놓고
+                // 폐기했다 — 정책은 자기신고 `from`이 아니라 이 값에서만 파생해야 한다(D2).
                 let item = crate::state::QueueItem::text(
                     text.clone(),
-                    crate::state::QueueOrigin::system("send_text"),
+                    crate::queue_policy::derive_origin(daemon, verified_from, human),
                 );
-                let depth = {
-                    let mut q = surface.pending_queue.lock().unwrap();
-                    if q.len() >= 100 {
+                let depth = match crate::queue_policy::enqueue_item(daemon, &surface, item) {
+                    Ok(d) => d,
+                    Err(crate::queue_policy::EnqueueError::HardCap) => {
                         return Reply::Single(err_response(
                             &id,
                             "queue_full",
                             "pending queue cap (100) reached",
+                        ))
+                    }
+                    Err(crate::queue_policy::EnqueueError::Softcap {
+                        dead_letter,
+                        agent_depth,
+                        softcap,
+                    }) => {
+                        // 결정론 후속 지시 동봉 — 발신자가 재전송으로 폭주를 키우지 않게.
+                        return Reply::Single(err_response_with(
+                            &id,
+                            crate::queue_policy::ERR_SOFTCAP,
+                            &format!(
+                                "agent-origin queue depth {agent_depth} reached softcap {softcap}"
+                            ),
+                            json!({"directive": crate::queue_policy::SOFTCAP_DIRECTIVE,
+                                   "dead_letter": dead_letter,
+                                   "agent_depth": agent_depth, "softcap": softcap}),
                         ));
                     }
-                    q.push_back(item);
-                    q.len()
                 };
-                daemon.bus.publish(
-                    "queue.enqueued",
-                    "queue",
-                    Some(sid),
-                    json!({"bytes": text.len(), "depth": depth,
-                           "from": params.get("from").cloned().unwrap_or(Value::Null)}),
-                );
-                // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
-                daemon.persist_queue_state();
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "queued": true, "depth": depth}),
@@ -1501,29 +1523,38 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 // ★C1: 빈 문자열 관행 → kind=ReturnKey. 배달 동작은 불변(빈 본문 Inject + CR)이고,
                 // 관찰·정책이 Return 큐잉을 텍스트와 구별할 수 있게 된다.
-                let item =
-                    crate::state::QueueItem::return_key(crate::state::QueueOrigin::system("send_key"));
-                let depth = {
-                    let mut q = surface.pending_queue.lock().unwrap();
-                    if q.len() >= 100 {
+                // ★C2: send_key는 사람 경로가 아니라 전부 프로그램 경로다(human 신고 없음).
+                let item = crate::state::QueueItem::return_key(crate::queue_policy::derive_origin(
+                    daemon,
+                    verified_from,
+                    false,
+                ));
+                let depth = match crate::queue_policy::enqueue_item(daemon, &surface, item) {
+                    Ok(d) => d,
+                    Err(crate::queue_policy::EnqueueError::HardCap) => {
                         return Reply::Single(err_response(
                             &id,
                             "queue_full",
                             "pending queue cap (100) reached",
+                        ))
+                    }
+                    Err(crate::queue_policy::EnqueueError::Softcap {
+                        dead_letter,
+                        agent_depth,
+                        softcap,
+                    }) => {
+                        return Reply::Single(err_response_with(
+                            &id,
+                            crate::queue_policy::ERR_SOFTCAP,
+                            &format!(
+                                "agent-origin queue depth {agent_depth} reached softcap {softcap}"
+                            ),
+                            json!({"directive": crate::queue_policy::SOFTCAP_DIRECTIVE,
+                                   "dead_letter": dead_letter,
+                                   "agent_depth": agent_depth, "softcap": softcap}),
                         ));
                     }
-                    q.push_back(item);
-                    q.len()
                 };
-                daemon.bus.publish(
-                    "queue.enqueued",
-                    "queue",
-                    Some(sid),
-                    json!({"bytes": 0, "depth": depth, "key": "Return",
-                           "from": params.get("from").cloned().unwrap_or(Value::Null)}),
-                );
-                // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
-                daemon.persist_queue_state();
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "key": key, "queued": true, "depth": depth}),
@@ -3804,8 +3835,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(cs) = caller_sid {
                 if cs != sid {
                     daemon.bus.publish(
-                        "queue.clear_denied",
-                        "queue",
+                        crate::queue_policy::queue_events::CLEAR_DENIED,
+                        crate::queue_policy::queue_events::CATEGORY,
                         Some(sid),
                         json!({"requested_surface": sid,
                                "caller_surface": cs, "caller_pid": caller_pid}),
@@ -3823,8 +3854,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
-                    "queue.dropped",
-                    "queue",
+                    crate::queue_policy::queue_events::DROPPED,
+                    crate::queue_policy::queue_events::CATEGORY,
                     Some(sid),
                     json!({"reason": "cleared", "count": dropped.len(),
                            "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
@@ -7542,6 +7573,265 @@ mod tests {
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T2 (C2/C2-b) — origin 3분류 · 소프트캡 log/enforce · System 면제 · 거부 페이로드 ·
+//                dead-letter 기록 · 발신 통계
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_policy_tests {
+    use crate::queue_policy::{self, EnqueueError, QueueSendStats};
+    use crate::state::{Daemon, QueueItem, QueueOrigin};
+    use cys::Request;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    /// 정책 env는 프로세스 전역이라 이 모듈 테스트는 직렬화한다.
+    static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PolicyEnv;
+    impl PolicyEnv {
+        fn set(softcap: &str, mode: &str) -> Self {
+            std::env::set_var("CYS_QUEUE_AGENT_SOFTCAP", softcap);
+            std::env::set_var("CYS_QUEUE_POLICY_MODE", mode);
+            PolicyEnv
+        }
+    }
+    impl Drop for PolicyEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("CYS_QUEUE_AGENT_SOFTCAP");
+            std::env::remove_var("CYS_QUEUE_POLICY_MODE");
+        }
+    }
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-qpol-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    fn surface(d: &Arc<Daemon>, role: Option<&str>) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s
+    }
+
+    fn agent_item(text: &str, sender: u64, role: &str) -> QueueItem {
+        QueueItem::text(
+            text.into(),
+            QueueOrigin::Agent { surface: sender, role: Some(role.into()) },
+        )
+    }
+
+    fn dead_letters(dir: &std::path::Path) -> Vec<Value> {
+        let p = crate::state::state_dir(&dir.join("cysd.sock")).join(queue_policy::DEAD_LETTER_FILE);
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("dead-letter 라인은 유효 JSON이어야 한다"))
+            .collect()
+    }
+
+    fn stats(d: &Arc<Daemon>, sid: u64) -> QueueSendStats {
+        d.queue_send_stats.lock().unwrap().get(&sid).copied().unwrap_or_default()
+    }
+
+    /// origin 3분류(D2): verified & agent_meta → Agent(role 동봉) / verified 맨 셸 → System /
+    /// 익명 → System / human 신고 → Human. **자기신고 from은 어디에도 쓰이지 않는다.**
+    #[test]
+    fn origin_is_derived_from_verified_sender_only() {
+        let (d, dir) = daemon("origin");
+        let agent = surface(&d, Some("worker-1"));
+        *agent.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        let bare = surface(&d, None);
+
+        let o = queue_policy::derive_origin(&d, Some(agent.id), false);
+        assert_eq!(
+            o,
+            QueueOrigin::Agent { surface: agent.id, role: Some("worker-1".into()) },
+            "launch-agent 등록 pane의 발신은 Agent로 분류돼야 정책 대상이 된다"
+        );
+        assert_eq!(
+            queue_policy::derive_origin(&d, Some(bare.id), false),
+            QueueOrigin::system("pane"),
+            "verified 이지만 에이전트 미등록(맨 셸)은 정책 밖이다"
+        );
+        assert_eq!(
+            queue_policy::derive_origin(&d, None, false),
+            QueueOrigin::system("anonymous"),
+            "조상추적 미해소(외부 프로세스)는 System — 혼잡 게이트이지 보안 게이트가 아니다"
+        );
+        assert_eq!(queue_policy::derive_origin(&d, None, true), QueueOrigin::Human);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// log 모드(기본): 소프트캡 도달해도 **적재는 허용**된다 — 차단이 유예됐을 뿐이다.
+    #[test]
+    fn softcap_log_mode_admits_everything() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("2", "log");
+        let (d, dir) = daemon("log-mode");
+        let target = surface(&d, Some("master"));
+
+        for i in 0..5 {
+            let r = queue_policy::enqueue_item(&d, &target, agent_item(&format!("m{i}"), 99, "cso"));
+            assert!(r.is_ok(), "log 모드는 적재를 거부하지 않는다 (i={i})");
+        }
+        assert_eq!(target.pending_queue.lock().unwrap().len(), 5);
+        assert!(dead_letters(&dir).is_empty(), "log 모드는 dead-letter를 만들지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// enforce 모드: 소프트캡 도달분은 거부되고 **전문이 dead-letter에 남는다**.
+    /// 거부는 무음 삭제가 아니다 — 원장이 사실의 SOT다.
+    #[test]
+    fn softcap_enforce_rejects_and_records_dead_letter() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("2", "enforce");
+        let (d, dir) = daemon("enforce-mode");
+        let target = surface(&d, Some("master"));
+
+        assert!(queue_policy::enqueue_item(&d, &target, agent_item("a", 99, "cso")).is_ok());
+        assert!(queue_policy::enqueue_item(&d, &target, agent_item("b", 99, "cso")).is_ok());
+        let rejected = queue_policy::enqueue_item(&d, &target, agent_item("거부될 전문", 99, "cso"));
+        match rejected {
+            Err(EnqueueError::Softcap { dead_letter, agent_depth, softcap }) => {
+                assert_eq!((agent_depth, softcap), (2, 2));
+                assert!(dead_letter.is_some(), "거부와 동시에 원장 경로가 반환돼야 한다");
+            }
+            other => panic!("소프트캡 거부가 아니다: {other:?}"),
+        }
+        assert_eq!(target.pending_queue.lock().unwrap().len(), 2, "거부분은 적재되지 않는다");
+
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "거부 1건 = 원장 1줄");
+        assert_eq!(dl[0]["text"], json!("거부될 전문"), "전문이 무손실로 남아야 한다");
+        assert_eq!(dl[0]["reason"], json!("softcap_rejected"));
+        assert_eq!(dl[0]["origin"]["class"], json!("agent"));
+        assert_eq!(dl[0]["role"], json!("master"), "role은 대상 surface의 역할이다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// System/Human origin은 enforce 모드에서도 소프트캡 밖이다 —
+    /// 부트 wake·시스템 통지가 혼잡 정책에 오차단되면 안 된다(D3 기각 대안의 근거).
+    #[test]
+    fn softcap_exempts_system_and_human_origin() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("1", "enforce");
+        let (d, dir) = daemon("exempt");
+        let target = surface(&d, Some("master"));
+
+        for i in 0..4 {
+            let sys = QueueItem::text(format!("s{i}"), QueueOrigin::system("boot"));
+            assert!(queue_policy::enqueue_item(&d, &target, sys).is_ok(), "System 면제 (i={i})");
+            let hum = QueueItem::text(format!("h{i}"), QueueOrigin::Human);
+            assert!(queue_policy::enqueue_item(&d, &target, hum).is_ok(), "Human 면제 (i={i})");
+        }
+        assert_eq!(target.pending_queue.lock().unwrap().len(), 8);
+        assert!(dead_letters(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 하드캡 100은 불변 — origin 무관하게 적용된다(소프트캡을 껐어도).
+    #[test]
+    fn hard_cap_still_applies_to_every_origin() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("0", "enforce"); // 소프트캡 비활성
+        let (d, dir) = daemon("hardcap");
+        let target = surface(&d, None);
+        {
+            let mut q = target.pending_queue.lock().unwrap();
+            for i in 0..queue_policy::QUEUE_HARD_CAP {
+                q.push_back(QueueItem::text(format!("x{i}"), QueueOrigin::system("t")));
+            }
+        }
+        let r = queue_policy::enqueue_item(&d, &target, QueueItem::text("넘침".into(), QueueOrigin::Human));
+        assert!(matches!(r, Err(EnqueueError::HardCap)), "하드캡 100은 불변이다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2-b 발신 통계: Agent-origin 발신만 센다. 무키(keyless)·거부는 별도 카운터.
+    /// **판정이 아니라 스크리닝 신호**라는 해석 한계는 문서 계약이고, 여기선 계수 정확성만 박제한다.
+    #[test]
+    fn send_stats_count_agent_origin_only() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("2", "enforce");
+        let (d, dir) = daemon("stats");
+        let target = surface(&d, Some("master"));
+        let sender = 4242_u64;
+
+        // 무키 2건(허용) + 키 있는 1건(허용 — 소프트캡 미도달 시점 확인용은 아래 순서로 보장)
+        let mut keyed = agent_item("keyed", sender, "worker");
+        keyed.idem_key = Some("k".into());
+        assert!(queue_policy::enqueue_item(&d, &target, keyed).is_ok());
+        assert!(queue_policy::enqueue_item(&d, &target, agent_item("n1", sender, "worker")).is_ok());
+        // 소프트캡(2) 도달 — 이후 무키 1건은 거부.
+        assert!(queue_policy::enqueue_item(&d, &target, agent_item("n2", sender, "worker")).is_err());
+        // System 발신은 통계에 잡히지 않는다(발신 surface가 없다).
+        assert!(queue_policy::enqueue_item(
+            &d, &target, QueueItem::text("sys".into(), QueueOrigin::system("t"))
+        ).is_ok());
+
+        let st = stats(&d, sender);
+        assert_eq!(st.total, 3, "Agent-origin 발신 3건");
+        assert_eq!(st.keyless, 2, "무키 발신 2건(keyed 1건 제외)");
+        assert_eq!(st.rejected, 1, "거부 1건");
+        assert_eq!(stats(&d, 999).total, 0, "다른 발신자에 오염되면 안 된다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RPC 왕복: `--queued` send_text가 커널 검증 발신자에서 Agent origin을 파생하고,
+    /// queue.list가 그 분류를 노출한다(자기신고 from이 아니라 verified 기반임을 박제).
+    #[test]
+    fn queued_send_text_derives_agent_origin_end_to_end() {
+        let _g = POLICY_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("25", "log");
+        let (d, dir) = daemon("rpc-origin");
+        let sender = surface(&d, Some("worker-1"));
+        *sender.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        let target = surface(&d, Some("master"));
+        let pid = 993_777_u32;
+        d.caller_cache
+            .lock()
+            .unwrap()
+            .insert(pid, (Some(sender.id), crate::state::now_epoch(), None));
+
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            // 자기신고 from은 거짓말이다 — 정책은 이 값을 보지 않아야 한다.
+            params: json!({"surface_id": target.id, "text": "보고", "queued": true, "from": 1}),
+        };
+        let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(&d, req, Some(pid))
+        else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["result"]["queued"], json!(true), "응답: {resp}");
+
+        let list = Request {
+            id: json!(2),
+            method: "queue.list".into(),
+            params: json!({"surface_id": target.id}),
+        };
+        let crate::handlers::Reply::Single(lr) = crate::handlers::dispatch(&d, list, None) else {
+            panic!("expected single reply");
+        };
+        let entries = lr["result"]["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["origin_class"], json!("agent"));
+        assert_eq!(entries[0]["kind"], json!("text"));
+        assert_eq!(entries[0]["preview"], json!("보고"), "preview 출력 계약 보존");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

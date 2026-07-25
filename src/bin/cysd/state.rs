@@ -957,6 +957,12 @@ pub struct Daemon {
     /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
     /// queue.list가 라이브 큐와 함께 노출한다. mid(안정 해시)로 이중 replay를 dedup한다.
     pub restored_queue: Mutex<Vec<QueueWalEntry>>,
+    /// C3 dead-letter 원장 append 직렬화 락 — O_APPEND 단일 write의 한 줄 원자성을
+    /// 핸들러 스레드(거부·superseded)와 watchdog(TTL) 사이에서 보장한다.
+    pub dead_letter_lock: Mutex<()>,
+    /// C2-b 발신 통계: 발신 surface id → (총 큐 발신, 무키 발신, 거부). Agent-origin만 센다.
+    /// 재시작 리셋 허용(관찰 창 내 상대 비교 — 영속화는 비목표).
+    pub queue_send_stats: Mutex<HashMap<u64, crate::queue_policy::QueueSendStats>>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -1554,6 +1560,8 @@ impl Daemon {
             feed_persist_lock: Mutex::new(()),
             // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
             restored_queue: Mutex::new(load_queue_state(&dir)),
+            dead_letter_lock: Mutex::new(()),
+            queue_send_stats: Mutex::new(HashMap::new()),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -2272,8 +2280,8 @@ impl Daemon {
             let dropped: Vec<QueueItem> = surf.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
-                    "queue.dropped",
-                    "queue",
+                    crate::queue_policy::queue_events::DROPPED,
+                    crate::queue_policy::queue_events::CATEGORY,
                     Some(surf.id),
                     json!({"reason": "process_exited", "count": dropped.len(),
                            "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),

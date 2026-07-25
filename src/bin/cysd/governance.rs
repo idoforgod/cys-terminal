@@ -836,26 +836,26 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
         return;
     }
     // ★C1: 데몬 내부 발신 — System origin으로 정식 편입(종전 `from:"governance-approval"`
-    // 문자열 관행을 타입으로 대체). 캡 도달 시의 무음 drop 승격은 D9③(W2)에서 처리한다.
+    // 문자열 관행을 타입으로 대체). System은 소프트캡·TTL 밖이고 하드캡만 받는다.
     let item = crate::state::QueueItem::text(
         text.to_string(),
         crate::state::QueueOrigin::system("governance-approval"),
     );
-    let depth = {
-        let mut q = s.pending_queue.lock().unwrap();
-        if q.len() >= 100 {
-            return;
-        }
-        q.push_back(item);
-        q.len()
-    };
-    daemon.bus.publish(
-        "queue.enqueued",
-        "queue",
-        Some(master_sid),
-        json!({"bytes": text.len(), "depth": depth, "from": "governance-approval"}),
-    );
-    daemon.persist_queue_state();
+    // ★D9③: 캡 도달 시 종전엔 **무음 drop**이었다 — 승인 대기 알림이 흔적 없이 사라졌다.
+    // 이제 dead-letter에 남긴다(어떤 경로로도 무음 삭제 금지). 원장 기록마저 실패하면
+    // health 경고가 발행되므로 침묵은 어느 층에서도 성립하지 않는다.
+    if let Err(crate::queue_policy::EnqueueError::HardCap) =
+        crate::queue_policy::enqueue_item(daemon, &s, item.clone())
+    {
+        let role = s.role.lock().unwrap().clone();
+        let _ = crate::queue_policy::record_dead_letter(
+            daemon,
+            master_sid,
+            role.as_deref(),
+            &item,
+            crate::queue_policy::DeadLetterReason::WakeupCap,
+        );
+    }
 }
 
 /// L2 escalation(2026-07-07 재발방지): 데몬 감지(approval) 항목이 stall 임계
@@ -1832,8 +1832,8 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         surface.pending_queue.lock().unwrap().drain(..).collect();
     if !dropped.is_empty() {
         daemon.bus.publish(
-            "queue.dropped",
-            "queue",
+            crate::queue_policy::queue_events::DROPPED,
+            crate::queue_policy::queue_events::CATEGORY,
             Some(id),
             json!({"reason": "surface_closed", "count": dropped.len(),
                    "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
@@ -1944,8 +1944,8 @@ fn alert_queue_depth_if_high(
         "임계 조정은 CYS_QUEUE_QUIET_SECS"
     };
     daemon.bus.publish(
-        "queue.depth_high",
-        "queue",
+        crate::queue_policy::queue_events::DEPTH_HIGH,
+        crate::queue_policy::queue_events::CATEGORY,
         Some(s.id),
         json!({"depth": depth, "threshold": threshold, "blocked_by": blocked_by,
                "role": s.role.lock().unwrap().clone(),
@@ -2054,8 +2054,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
             *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             daemon.bus.publish(
-                "queue.delivered",
-                "queue",
+                crate::queue_policy::queue_events::DELIVERED,
+                crate::queue_policy::queue_events::CATEGORY,
                 Some(s.id),
                 serde_json::json!({"bytes": item.bytes(), "remaining": remaining,
                                    "seq": item.seq, "kind": item.kind.as_str(),

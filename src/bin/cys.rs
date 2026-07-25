@@ -1435,11 +1435,22 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {
-        Err(format!(
+        // ★C2: 오류에 구조화 후속 지시(error.data.directive)가 실려 오면 사람·에이전트가
+        // 읽는 문자열에 그대로 이어붙인다. 지시가 stderr에 안 보이면 에이전트는 기본 행동
+        // (재전송)으로 돌아가 폭주를 키운다 — 지시 전달이 거부의 절반이다.
+        let mut msg = format!(
             "{}: {}",
             resp["error"]["code"].as_str().unwrap_or("error"),
             resp["error"]["message"].as_str().unwrap_or("unknown error")
-        ))
+        );
+        if let Some(d) = resp["error"]["data"]["directive"].as_str() {
+            msg.push_str(" — ");
+            msg.push_str(d);
+        }
+        if let Some(p) = resp["error"]["data"]["dead_letter"].as_str() {
+            msg.push_str(&format!(" (dead-letter: {p})"));
+        }
+        Err(msg)
     }
 }
 

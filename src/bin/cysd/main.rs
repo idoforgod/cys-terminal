@@ -21,6 +21,7 @@ mod events;
 mod governance;
 mod handlers;
 mod hwmon;
+mod queue_policy;
 mod recall;
 mod schedule;
 mod severity;
