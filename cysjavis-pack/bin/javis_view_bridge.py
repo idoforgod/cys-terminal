@@ -74,10 +74,17 @@ CTYPES = {
 def _allowed_roots():
     """허용 루트 목록(realpath 정규화). 존재하지 않아도 정규화만 하고 유지 —
     나중에 생성될 수 있고, 실검사는 요청 경로 realpath 와의 prefix 비교로 한다.
-    CYS_VIEWER_ROOTS(콜론 구분)로 확장."""
+    CYS_VIEWER_ROOTS(콜론 구분)로 확장.
+
+    ★2026-07-25 오너 승인: 코드 파일 단독 뷰어(확장자별 하이라이팅) 대상에 프로젝트
+    소스(src/·ui/·cysjavis-pack/…)를 포함하려면 산출물 루트만으론 부족해 CYSjavis
+    프로젝트 루트(_worktrees·cys-homepage 포함)를 허용 루트로 넓힌다. 보안 성질 불변:
+    ①127.0.0.1 전용+URL 토큰 ②읽기 전용(POST/PUT/DELETE 405) ③realpath+os.sep 경계로
+    traversal·심볼릭 이탈 차단 ④full-trust 역할(cys pane)만 브리지 스폰. 자격증명은
+    ~/.cys/*.env(루트 밖·600)에 격리돼 이 루트로 노출되지 않는다. 더 넓히거나 좁히려면
+    CYS_VIEWER_ROOTS로 조정(재빌드 불요)."""
     raw = [
-        "~/Desktop/CYSjavis/_round",
-        "~/Desktop/CYSjavis/_research",
+        "~/Desktop/CYSjavis",          # 프로젝트 루트(소스·산출물·worktree·홈페이지 전부 하위)
         "~/.cys/_round",
         "~/.cys/browser/evidence",
     ]
