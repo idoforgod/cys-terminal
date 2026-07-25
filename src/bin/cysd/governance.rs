@@ -1833,17 +1833,33 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         &mut daemon.health_hits.lock().unwrap(),
         id,
     );
-    // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-    let dropped: Vec<crate::state::QueueItem> =
-        surface.pending_queue.lock().unwrap().drain(..).collect();
-    if !dropped.is_empty() {
+    // 미배달 큐 폐기 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단.
+    //
+    // ★R1 무손실(record-before-remove): 종전엔 drain 으로 먼저 비우고 **이벤트만** 냈다.
+    // 이벤트 버스는 유실 가능한 링이고 원장(dead-letters.jsonl)이 사실의 SOT라는 게 이 설계의
+    // 전제이므로, 이 경로는 사실상 무음 인멸이었다 — 오퍼레이터가 탭을 닫는 순간 인플라이트
+    // 메시지가 어디에도 남지 않고 사라졌다. 이제 항목별로 원장을 먼저 쓰고 성공분만 제거한다.
+    let outcome = crate::queue_policy::record_then_drain(
+        daemon,
+        &surface,
+        crate::queue_policy::DeadLetterReason::SurfaceClosed,
+    );
+    if outcome.total() > 0 {
         daemon.bus.publish(
             crate::queue_policy::queue_events::DROPPED,
             crate::queue_policy::queue_events::CATEGORY,
             Some(id),
-            json!({"reason": "surface_closed", "count": dropped.len(),
-                   "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
+            json!({"reason": "surface_closed", "count": outcome.cleared.len(),
+                   "dead_lettered": outcome.cleared.len(),
+                   "retained": outcome.retained.len(),
+                   "bytes": outcome.cleared_bytes()}),
         );
+        // 원장 기록에 실패한 항목은 버리지 않는다. 이 surface 는 이미 surfaces 맵에서 빠졌으므로
+        // pending_queue 에 남겨두면 persist_queue_state 가 보지 못한다 — restored_queue 로 옮겨
+        // WAL 에 실리게 하고, rehome_restored_queue 가 같은 role 의 새 좌석으로 재배달한다.
+        if !outcome.retained.is_empty() {
+            daemon.adopt_orphan_queue_items(id, outcome.role.clone(), &outcome.retained);
+        }
         // ★D9②(기존 버그 보수): drain 후 WAL을 갱신하지 않아 **유령 항목**이 남았다.
         // 디스크에는 방금 폐기한 메시지가 그대로 있으므로, 다음 재기동에서 restored_queue로
         // 되살아나 같은 role의 새 surface에 오배달된다(사용자가 본 적 없는 유령 배달).
@@ -1910,7 +1926,43 @@ const QUEUE_ALERT_COOLDOWN_SECS: f64 = 300.0;
 
 /// C5 hard tier·TTL 요약 OOB 통지의 쿨다운(30분). 이벤트 경보(5분)보다 훨씬 길다 —
 /// OOB는 상대 stdin을 점유하는 침습적 채널이라 잦으면 그 자체가 소음이 된다.
+/// **자동 통지 전용**이다 — 사람이 명시적으로 발행하는 요청에 쓰면 안 된다(아래 참조).
 pub(crate) const OOB_HARD_COOLDOWN_SECS: f64 = 1800.0;
+
+/// `queue.request_clear` 전용 쿨다운(60초).
+///
+/// ★R1 의미론 정직화: 종전에는 사람이 친 `cys queue request-clear` 에 자동 통지용 1800초를
+/// 그대로 물렸다. 그 결과 ①오퍼레이터가 재발행해도 30분간 조용히 무시됐고 ②`hint` 는
+/// "다음 시도에서 재통지된다"고 안내했지만 **재통지를 돌리는 주기 잡이 없다**(자동 재시도
+/// 루프를 도는 depth_high·TTL 통지와 달리 이 경로는 1회성 RPC다) — 문언과 동작이 어긋났다.
+/// 60초는 "연타 방지"라는 이 경로의 실제 목적에만 맞춘 값이다.
+pub(crate) const OOB_REQUEST_CLEAR_COOLDOWN_SECS: f64 = 60.0;
+
+/// OOB 주입이 배달되지 않은 **사유**. 종전 `bool` 은 "안 됐다"만 말할 수 있어서, 호출자가
+/// 응답에 실을 안내를 추측으로 지어냈다(요청 경로의 잘못된 hint 의 근원). 사유를 값으로
+/// 돌려 응답·이벤트가 사실만 말하게 한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OobSkip {
+    /// 대상 부재·종료·에이전트 미등록·빈 좌석 — 주입하면 셸 명령으로 실행될 수 있는 상태.
+    GateBlocked,
+    /// 사람 입력 흔적이 아직 식지 않음.
+    HumanTyping,
+    /// 같은 (surface, dedup_key) 의 쿨다운 창 안.
+    Cooldown,
+    /// writer 채널 포화 — 쿨다운을 찍지 않으므로 즉시 재발행 가능.
+    ChannelFull,
+}
+
+impl OobSkip {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OobSkip::GateBlocked => "gate_blocked",
+            OobSkip::HumanTyping => "human_typing",
+            OobSkip::Cooldown => "cooldown",
+            OobSkip::ChannelFull => "channel_full",
+        }
+    }
+}
 
 /// queued 배달의 '사람 입력 후 정지' 임계(초) — 기본 30초. 사람이 입력하다 3초+ 멈추면
 /// quiet(출력 기준)만으로는 배달이 나가 미완성 입력에 이어붙거나(텍스트) 그대로 제출(Return)
@@ -1939,7 +1991,8 @@ fn queue_human_quiet_secs() -> u64 {
 /// roles 맵에는 `master` 키가 없어서, {master,cso}만 조회하면 통지 대상이 공집합이 된다(R3).
 const OOB_PRIVILEGED_ROLES: [&str; 3] = ["master", "cso", "dept-master"];
 
-/// 큐를 우회해 대상 stdin에 제어 신호를 직접 주입한다. 성공 시 true.
+/// 큐를 우회해 대상 stdin에 제어 신호를 직접 주입한다. 배달 시 `Ok(())`,
+/// 미배달 시 `Err(OobSkip)` — **사유가 값으로 나온다**(호출자가 안내를 지어내지 않게).
 ///
 /// 게이트 3중:
 /// ① **agent-present**(안전 필수): `agent_meta` 보유 ∧ 좌석이 Empty가 아닐 때만. 빈 좌석
@@ -1955,18 +2008,18 @@ pub(crate) fn oob_notify(
     text: &str,
     dedup_key: &str,
     cooldown_secs: f64,
-) -> bool {
+) -> Result<(), OobSkip> {
     let Some(s) = daemon.get_surface(sid) else {
-        return false;
+        return Err(OobSkip::GateBlocked);
     };
     if s.exited.load(Ordering::Relaxed) {
-        return false;
+        return Err(OobSkip::GateBlocked);
     }
     // ① agent-present
     if s.agent_meta.lock().unwrap().is_none()
         || SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
     {
-        return false;
+        return Err(OobSkip::GateBlocked);
     }
     // ② human 가드
     let human_recent = s
@@ -1976,7 +2029,7 @@ pub(crate) fn oob_notify(
         .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
         .unwrap_or(false);
     if human_recent {
-        return false;
+        return Err(OobSkip::HumanTyping);
     }
     // ③ 쿨다운
     let now = now_epoch();
@@ -1985,7 +2038,7 @@ pub(crate) fn oob_notify(
         let cd = daemon.oob_cooldowns.lock().unwrap();
         if let Some(last) = cd.get(&key) {
             if now - last < cooldown_secs {
-                return false;
+                return Err(OobSkip::Cooldown);
             }
         }
     }
@@ -1997,19 +2050,20 @@ pub(crate) fn oob_notify(
         })
         .is_err()
     {
-        return false; // 채널 포화 — 쿨다운을 찍지 않으므로 다음 틱에 재시도된다.
+        // 채널 포화 — 쿨다운을 찍지 않으므로 즉시/다음 틱에 재시도된다.
+        return Err(OobSkip::ChannelFull);
     }
     daemon.oob_cooldowns.lock().unwrap().insert(key, now);
     // 큐 배달과 마찬가지로 원격 주입이므로 에코 제외 창을 갱신한다.
     *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
     daemon.bus.publish(
-        "queue.oob_notified",
+        crate::queue_policy::queue_events::OOB_NOTIFIED,
         crate::queue_policy::queue_events::CATEGORY,
         Some(sid),
         json!({"dedup_key": dedup_key, "bytes": text.len(),
                "surface_ref": cys::surface_ref(sid)}),
     );
-    true
+    Ok(())
 }
 
 /// 통지 수신 후보: 큐 소유 노드 + roles 맵에 **실재하는** 지휘 role. 중복 sid는 제거한다.
@@ -2098,7 +2152,7 @@ fn alert_queue_depth_if_high(
         // dedup 키에 대상 surface를 넣어, 여러 노드가 동시에 적체돼도 각각 통지된다.
         let key = format!("depth_high_hard:{}", s.id);
         for target in oob_targets(daemon, s.id) {
-            oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
+            let _ = oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
         }
     }
 }
@@ -2215,7 +2269,7 @@ fn expire_queued(daemon: &Arc<Daemon>) {
         );
         let key = format!("ttl_expired:{}", s.id);
         for target in oob_targets(daemon, s.id) {
-            oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
+            let _ = oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
         }
     }
     if persist_needed {
@@ -2268,10 +2322,16 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
         // 배달을 보류한다. 종전엔 quiet 이기만 하면 배달해, 빈 셸이 role 을 쥔 동안 리뷰어 verdict·
         // 워커 보고가 zsh 프롬프트에 문자로 타이핑돼 **보고가 증발**했다(surface:112 실측).
         //
-        // 판정 기준을 'role 유무'로 둔 이유: pending_queue 는 텍스트만 담아(anchor 미보존) 항목별
-        // role-앵커 여부를 구분할 수 없다. 그런데 role 좌석은 정의상 에이전트 자리이므로 'role 있는
+        // 판정 기준을 'role 유무'로 둔 이유: role 좌석은 정의상 에이전트 자리이므로 'role 있는
         // surface'가 role-앵커 메시지의 실질 대상이다. role 없는 맨 셸의 `--queued` 자동화는
         // 종전 그대로 통과한다(무회귀).
+        //
+        // ★주석 정정(A7): C1 이후 `QueueItem` 은 origin(발신 분류·발신 surface·role)을 **보유한다** —
+        // "pending_queue 는 텍스트만 담아 항목별 앵커를 구분할 수 없다"는 종전 설명은 더 이상
+        // 사실이 아니다. 그럼에도 판정을 surface 단위 role 로 유지하는 것은 의도적 선택이다:
+        // 좌석이 비었으면 그 좌석 앞 큐는 **항목 출처와 무관하게** 배달할 곳이 없다(주입하면
+        // 셸 명령이 된다). origin 은 혼잡 정책(누가 보냈나)의 축이고, 이 게이트는 배달 안전
+        // (어디로 가나)의 축이다 — 두 축을 섞지 않는다.
         //
         // Unknown(프로브 미도달)은 **배달**한다 — 현행 동작 유지(판정 실패가 전 큐를 멈추는
         // 새 장애를 만들지 않는다). 보류는 유실이 아니라 지연이며, 좌석에 에이전트가 앉으면
@@ -3290,8 +3350,9 @@ mod queue_ttl_tests {
     use serde_json::Value;
     use std::sync::Arc;
 
-    /// TTL env는 프로세스 전역이라 이 모듈은 직렬화한다.
-    static TTL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// ★A7: TTL env 도 `CYS_QUEUE_*` 가족이다 — 모듈 사설 락이 아니라 **공유 락**을 잡는다.
+    /// (queue_policy·handlers 테스트와 같은 락이어야 동시 set_var 경합이 실제로 막힌다.)
+    use crate::queue_policy::QUEUE_ENV_LOCK as TTL_ENV_LOCK;
 
     struct TtlEnv;
     impl TtlEnv {
@@ -3594,6 +3655,110 @@ mod queue_drain_persist_tests {
         assert_eq!(wal_len(&dir), 0, "자력 종료 drain 후에도 WAL이 갱신돼야 한다");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn dead_letters(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let p = crate::state::state_dir(&dir.join("cysd.sock"))
+            .join(crate::queue_policy::DEAD_LETTER_FILE);
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("원장 라인은 유효 JSON"))
+            .collect()
+    }
+
+    /// ★A2(REVISE 수리): surface 종료는 **무음 인멸 경로**였다. drain 후 이벤트만 냈는데
+    /// 이벤트 버스는 유실 가능한 링이고 원장이 SOT라는 게 이 설계의 전제다 —
+    /// 오퍼레이터가 탭을 닫는 순간 인플라이트 메시지가 어디에도 남지 않고 사라졌다.
+    #[test]
+    fn close_surface_records_dead_letter_before_drain() {
+        let (d, dir) = daemon("close-dl");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(QueueItem::text(
+            "닫힘과 함께 사라지던 전문".into(),
+            QueueOrigin::system("t"),
+        ));
+
+        super::close_surface(&d, s.id, super::CloseCause::OwnerClose).expect("close");
+
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "surface 종료가 무음 인멸됐다");
+        assert_eq!(dl[0]["reason"], serde_json::json!("surface_closed"));
+        assert_eq!(dl[0]["text"], serde_json::json!("닫힘과 함께 사라지던 전문"));
+        assert_eq!(dl[0]["role"], serde_json::json!("worker-1"), "role 앵커도 남아야 한다");
+        assert_eq!(wal_len(&dir), 0, "기록 성공분은 WAL 에서도 빠져야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A2 무손실: 원장을 못 남기면 항목을 버리지 않는다. close_surface 는 surface 를 맵에서
+    /// 이미 뺐으므로 pending_queue 잔류만으로는 persist 가 보지 못한다 — restored_queue 로
+    /// 입양해 WAL 에 싣고 rehome 대상으로 만들어야 한다(그게 '보존'의 실제 조건).
+    #[cfg(unix)]
+    #[test]
+    fn close_surface_retains_items_when_ledger_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, dir) = daemon("close-retain");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-9".into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(QueueItem::text(
+            "버려지면 안 되는 전문".into(),
+            QueueOrigin::system("t"),
+        ));
+
+        let sdir = crate::state::state_dir(&dir.join("cysd.sock"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let _ = std::fs::remove_file(sdir.join(crate::queue_policy::DEAD_LETTER_FILE));
+        let orig = std::fs::metadata(&sdir).unwrap().permissions();
+        std::fs::set_permissions(&sdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let closed = super::close_surface(&d, s.id, super::CloseCause::OwnerClose);
+        std::fs::set_permissions(&sdir, orig).unwrap();
+        closed.expect("close");
+
+        assert!(dead_letters(&dir).is_empty(), "전제: 원장 기록이 실패해야 한다");
+        assert_eq!(
+            d.restored_queue.lock().unwrap().len(),
+            1,
+            "★원장 없는 삭제가 발생했다 — 잔류 항목이 WAL(rehome) 로 보존되지 않았다"
+        );
+        // 권한 복구 후 다시 영속하면 잔류분이 실제로 WAL 에 실린다.
+        d.persist_queue_state();
+        assert_eq!(wal_len(&dir), 1, "잔류 항목이 디스크에 보존되지 않았다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A2(짝): 자력 종료(reader EOF)도 같은 규율 — 원장 기록 후 drain.
+    #[test]
+    fn self_exit_records_dead_letter_before_drain() {
+        let (d, dir) = daemon("eof-dl");
+        let s = d
+            .create_surface(None, Some("sleep 1".into()), None, Some("worker-2".into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(QueueItem::text(
+            "자력 종료와 함께 사라지던 전문".into(),
+            QueueOrigin::system("t"),
+        ));
+
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(15) {
+            if s.exited.load(std::sync::atomic::Ordering::Relaxed) && !dead_letters(&dir).is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "자력 종료가 무음 인멸됐다");
+        assert_eq!(dl[0]["reason"], serde_json::json!("process_exited"));
+        assert_eq!(dl[0]["text"], serde_json::json!("자력 종료와 함께 사라지던 전문"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3601,7 +3766,7 @@ mod queue_drain_persist_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod oob_notify_tests {
-    use super::{oob_notify, oob_targets, SeatState, OOB_HARD_COOLDOWN_SECS};
+    use super::{oob_notify, oob_targets, OobSkip, SeatState, OOB_HARD_COOLDOWN_SECS};
     use crate::state::Daemon;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -3643,16 +3808,28 @@ mod oob_notify_tests {
 
         // ① agent_meta 없음(맨 셸) — seat가 Occupied여도 주입 금지.
         s.seat_cache.store(SeatState::Occupied.as_u8(), Ordering::Relaxed);
-        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "맨 셸에 주입하면 안 된다");
+        assert_eq!(
+            oob_notify(&d, s.id, "통지", "k", 1.0),
+            Err(OobSkip::GateBlocked),
+            "맨 셸에 주입하면 안 된다"
+        );
 
         // ② agent_meta 있으나 좌석이 비었음(에이전트 죽음) — 주입 금지.
         *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
         s.seat_cache.store(SeatState::Empty.as_u8(), Ordering::Relaxed);
-        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "빈 좌석에 주입하면 안 된다");
+        assert_eq!(
+            oob_notify(&d, s.id, "통지", "k", 1.0),
+            Err(OobSkip::GateBlocked),
+            "빈 좌석에 주입하면 안 된다"
+        );
 
         // ③ 에이전트 착석 — 통과.
         s.seat_cache.store(SeatState::Occupied.as_u8(), Ordering::Relaxed);
-        assert!(oob_notify(&d, s.id, "통지", "k", 1.0), "정상 좌석에는 주입돼야 한다");
+        assert_eq!(
+            oob_notify(&d, s.id, "통지", "k", 1.0),
+            Ok(()),
+            "정상 좌석에는 주입돼야 한다"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3664,11 +3841,15 @@ mod oob_notify_tests {
         let s = surface(&d, Some("worker-1"));
         seat_agent(&s);
         *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
-        assert!(!oob_notify(&d, s.id, "통지", "k", 1.0), "사람 입력 직후엔 보류해야 한다");
+        assert_eq!(
+            oob_notify(&d, s.id, "통지", "k", 1.0),
+            Err(OobSkip::HumanTyping),
+            "사람 입력 직후엔 보류해야 한다 — 사유도 정확해야 한다"
+        );
         // 가드로 skip된 시도는 쿨다운을 찍지 않으므로 다음 틱에 그대로 재시도된다.
         assert!(d.oob_cooldowns.lock().unwrap().is_empty(), "skip이 쿨다운을 소모하면 안 된다");
         *s.last_human_input.lock().unwrap() = None;
-        assert!(oob_notify(&d, s.id, "통지", "k", 1.0));
+        assert_eq!(oob_notify(&d, s.id, "통지", "k", 1.0), Ok(()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3680,21 +3861,26 @@ mod oob_notify_tests {
         let s = surface(&d, Some("worker-1"));
         seat_agent(&s);
 
-        assert!(oob_notify(&d, s.id, "1차", "depth_high", OOB_HARD_COOLDOWN_SECS));
-        assert!(
-            !oob_notify(&d, s.id, "2차", "depth_high", OOB_HARD_COOLDOWN_SECS),
+        assert_eq!(oob_notify(&d, s.id, "1차", "depth_high", OOB_HARD_COOLDOWN_SECS), Ok(()));
+        assert_eq!(
+            oob_notify(&d, s.id, "2차", "depth_high", OOB_HARD_COOLDOWN_SECS),
+            Err(OobSkip::Cooldown),
             "쿨다운 내 재발화는 억제돼야 한다"
         );
         // 다른 키는 독립 쿨다운.
-        assert!(oob_notify(&d, s.id, "다른 주제", "ttl_expired", OOB_HARD_COOLDOWN_SECS));
+        assert_eq!(
+            oob_notify(&d, s.id, "다른 주제", "ttl_expired", OOB_HARD_COOLDOWN_SECS),
+            Ok(())
+        );
 
         // 쿨다운 경과를 모사 → 재통지(자기치유).
         d.oob_cooldowns
             .lock()
             .unwrap()
             .insert((s.id, "depth_high".into()), crate::state::now_epoch() - 3600.0);
-        assert!(
+        assert_eq!(
             oob_notify(&d, s.id, "3차", "depth_high", OOB_HARD_COOLDOWN_SECS),
+            Ok(()),
             "미해소가 지속되면 쿨다운 후 재통지돼야 한다"
         );
         let _ = std::fs::remove_dir_all(&dir);

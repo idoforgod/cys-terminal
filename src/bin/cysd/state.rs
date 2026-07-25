@@ -1377,23 +1377,44 @@ pub struct QueueWalEntry {
 /// dedup 키는 `(mid, seq)` — 동일 텍스트 다건이 살아남는다(v1 붕괴 결함 해소).
 /// v1에서 마이그레이션된 항목의 신 필드 기본값: kind=Text · origin=System("wal-v1") ·
 /// enqueued_at=로드 시각(원 시각 미보존 — TTL 기준은 복원 시점부터 다시 센다).
-fn load_queue_state(dir: &std::path::Path) -> Vec<QueueWalEntry> {
+fn load_queue_state(dir: &std::path::Path) -> (Vec<QueueWalEntry>, Option<QueueWalCorruption>) {
     let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
     let mut out: Vec<QueueWalEntry> = Vec::new();
+    let mut corrupt: Option<QueueWalCorruption> = None;
 
     if let Ok(content) = std::fs::read_to_string(dir.join(QUEUE_WAL_V2)) {
-        if let Ok(env) = serde_json::from_str::<Value>(&content) {
-            if let Some(arr) = env.get("entries").and_then(|v| v.as_array()) {
-                for it in arr {
+        // ★R1: 종전에는 v2 파싱 실패 시 **조용히 빈 벡터**를 돌려주고 그대로 return 했다.
+        // ①손상 파일이 제자리에 남아 다음 persist 가 덮어써 증거가 소실되고 ②v1 이 있어도
+        // 폴백하지 않아 살릴 수 있는 큐를 버렸으며 ③아무 신호도 없었다(무음 유실).
+        // 이제 손상본을 격리 rename 해 보존하고, v1 마이그레이션으로 흘려보내며, health 로 알린다.
+        let parsed = serde_json::from_str::<Value>(&content)
+            .ok()
+            .filter(|env| env.get("entries").map(|v| v.is_array()).unwrap_or(false));
+        match parsed {
+            Some(env) => {
+                for it in env["entries"].as_array().into_iter().flatten() {
                     if let Ok(e) = serde_json::from_value::<QueueWalEntry>(it.clone()) {
                         if seen.insert((e.mid.clone(), e.item.seq)) {
                             out.push(e);
                         }
                     }
                 }
+                return (out, None); // v2 정상 = 정본. v1은 더 이상 보지 않는다(동결 스냅샷).
+            }
+            None => {
+                let src = dir.join(QUEUE_WAL_V2);
+                let quarantined = dir.join(format!(
+                    "queue-state-v2.corrupt-{}.json",
+                    now_epoch() as u64
+                ));
+                let moved = std::fs::rename(&src, &quarantined).is_ok();
+                corrupt = Some(QueueWalCorruption {
+                    quarantined: moved.then(|| quarantined.display().to_string()),
+                    bytes: content.len(),
+                });
+                // 이어서 v1 폴백 마이그레이션으로 흘러간다(아래) — 살릴 수 있는 건 살린다.
             }
         }
-        return out; // v2 존재 = 정본. v1은 더 이상 보지 않는다(동결 스냅샷).
     }
 
     // v1 → v2 1회 마이그레이션. v1 파일은 지우지도 고치지도 않는다(불변 보존).
@@ -1433,7 +1454,15 @@ fn load_queue_state(dir: &std::path::Path) -> Vec<QueueWalEntry> {
             }
         }
     }
-    out
+    (out, corrupt)
+}
+
+/// v2 WAL 손상 격리 결과 — 데몬 구성 직후 health 이벤트로 가시화한다(구성 시점엔 bus 가 없다).
+#[derive(Debug)]
+struct QueueWalCorruption {
+    /// 격리 rename 성공 시 보존 경로. `None` = rename 실패(원본이 제자리에 남았다).
+    quarantined: Option<String>,
+    bytes: usize,
 }
 
 impl Daemon {
@@ -1520,6 +1549,8 @@ impl Daemon {
                 None
             }
         };
+        // 큐 WAL 복원 — 손상 격리 사실은 bus 생성 후에 발행해야 하므로 여기서 미리 받는다.
+        let (queue_wal_entries, queue_wal_corrupt) = load_queue_state(&dir);
         // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
@@ -1563,7 +1594,7 @@ impl Daemon {
             operator_token,
             feed_persist_lock: Mutex::new(()),
             // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
-            restored_queue: Mutex::new(load_queue_state(&dir)),
+            restored_queue: Mutex::new(queue_wal_entries),
             dead_letter_lock: Mutex::new(()),
             oob_cooldowns: Mutex::new(HashMap::new()),
             queue_send_stats: Mutex::new(HashMap::new()),
@@ -1582,6 +1613,25 @@ impl Daemon {
             approval_stats: Mutex::new(HashMap::new()),
             auto_route_seen: Mutex::new(HashMap::new()),
         });
+        // ★R1: v2 WAL 손상은 무음이면 안 된다 — 격리 사실·폴백 결과를 health 로 발행한다.
+        if let Some(c) = queue_wal_corrupt {
+            let restored_n = daemon.restored_queue.lock().unwrap().len();
+            daemon.bus.publish(
+                "health.queue_wal_corrupt",
+                "health",
+                None,
+                json!({"file": QUEUE_WAL_V2, "bytes": c.bytes,
+                       "quarantined": c.quarantined,
+                       "fallback": "v1",
+                       "restored_from_v1": restored_n,
+                       "hint": "v2 큐 WAL이 파손돼 격리했다. v1 스냅샷으로 폴백했으며 \
+                                격리본은 수동 판독용으로 보존된다(자동 삭제 없음)"}),
+            );
+            eprintln!(
+                "[cysd] queue WAL v2 파손 — 격리={:?} · v1 폴백 복원 {restored_n}건",
+                c.quarantined
+            );
+        }
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
         daemon
@@ -1822,6 +1872,38 @@ impl Daemon {
         let envelope = json!({"schema_version": QUEUE_WAL_SCHEMA_VERSION, "entries": entries});
         if let Ok(content) = serde_json::to_string(&envelope) {
             let _ = crate::governance::write_json_atomic(&dir, QUEUE_WAL_V2, &content);
+        }
+    }
+
+    /// ★R1(무손실): 사라지는 surface 의 큐에서 **원장 기록에 실패해 버릴 수 없는** 항목을
+    /// restored_queue 로 입양한다. surfaces 맵에서 이미 빠진 surface 의 pending_queue 는
+    /// `persist_queue_state` 가 보지 못하므로, 여기로 옮겨야 WAL 에 실리고
+    /// `rehome_restored_queue` 가 같은 role 의 새 좌석으로 재배달할 수 있다.
+    /// `(mid, seq)` 로 dedup 해 중복 입양을 막는다.
+    pub fn adopt_orphan_queue_items(
+        &self,
+        surface_id: u64,
+        role: Option<String>,
+        items: &[QueueItem],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut restored = self.restored_queue.lock().unwrap();
+        for item in items {
+            let mid = queue_mid(surface_id, &item.text);
+            if restored
+                .iter()
+                .any(|e| e.mid == mid && e.item.seq == item.seq)
+            {
+                continue;
+            }
+            restored.push(QueueWalEntry {
+                mid,
+                surface_id,
+                role: role.clone(),
+                item: item.clone(),
+            });
         }
     }
 
@@ -2281,15 +2363,24 @@ impl Daemon {
                     let _ = child.try_wait();
                 }
             }
-            // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-            let dropped: Vec<QueueItem> = surf.pending_queue.lock().unwrap().drain(..).collect();
-            if !dropped.is_empty() {
+            // 미배달 큐 폐기 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단.
+            // ★R1 record-before-remove: close_surface 와 동일 규율. 원장에 남기지 못한 항목은
+            // 제거하지 않는다 — 이 surface 는 (reap 전까지) 맵에 남아 있으므로 pending_queue 에
+            // 잔류시키면 persist_queue_state 가 그대로 WAL 에 싣는다.
+            let outcome = crate::queue_policy::record_then_drain(
+                &daemon,
+                &surf,
+                crate::queue_policy::DeadLetterReason::ProcessExited,
+            );
+            if outcome.total() > 0 {
                 daemon.bus.publish(
                     crate::queue_policy::queue_events::DROPPED,
                     crate::queue_policy::queue_events::CATEGORY,
                     Some(surf.id),
-                    json!({"reason": "process_exited", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
+                    json!({"reason": "process_exited", "count": outcome.cleared.len(),
+                           "dead_lettered": outcome.cleared.len(),
+                           "retained": outcome.retained.len(),
+                           "bytes": outcome.cleared_bytes()}),
                 );
                 // ★D9②(기존 버그 보수): 자력 종료(셸 EOF)도 close_surface와 동일하게 drain 후
                 // WAL을 갱신해야 한다. 안 하면 폐기된 메시지가 디스크에 남아 다음 재기동에서
@@ -4236,6 +4327,11 @@ mod queue_wal_tests {
         std::fs::write(dir.join(QUEUE_WAL_V2), serde_json::to_string(&env).unwrap()).unwrap();
     }
 
+    /// 항목만 보는 테스트용 축약 — 손상 신호는 전용 테스트에서 따로 검사한다.
+    fn load_entries(dir: &std::path::Path) -> Vec<QueueWalEntry> {
+        load_queue_state(dir).0
+    }
+
     /// 왕복: v2로 쓴 전 메타(seq·kind·enqueued_at·origin·idem_key·merged_count·important)가
     /// 손실 없이 되읽힌다. 메타 손실은 곧 TTL·정책의 오판이므로 무손실이 계약이다.
     #[test]
@@ -4248,7 +4344,7 @@ mod queue_wal_tests {
         e.item.important = true;
         write_v2(&dir, &[e.clone()]);
 
-        let loaded = load_queue_state(&dir);
+        let loaded = load_entries(&dir);
         assert_eq!(loaded.len(), 1, "v2 항목 1건이 복원돼야 한다");
         assert_eq!(loaded[0], e, "메타가 하나라도 손실되면 안 된다");
         assert_eq!(loaded[0].item.origin.class(), "agent");
@@ -4266,7 +4362,7 @@ mod queue_wal_tests {
         // 같은 (mid,seq)인 중복 replay 1건을 섞어 dedup도 함께 확인한다.
         write_v2(&dir, &[a.clone(), b.clone(), a.clone()]);
 
-        let loaded = load_queue_state(&dir);
+        let loaded = load_entries(&dir);
         assert_eq!(loaded.len(), 2, "동일 텍스트 2건이 붕괴되면 안 된다 (mid,seq) dedup");
         let mut seqs: Vec<u64> = loaded.iter().map(|e| e.item.seq).collect();
         seqs.sort();
@@ -4285,7 +4381,7 @@ mod queue_wal_tests {
         std::fs::write(dir.join("queue-state.json"), serde_json::to_string(&v1).unwrap()).unwrap();
 
         let before = now_epoch();
-        let loaded = load_queue_state(&dir);
+        let loaded = load_entries(&dir);
         assert_eq!(loaded.len(), 1);
         let e = &loaded[0];
         assert_eq!(e.surface_id, 11);
@@ -4314,7 +4410,7 @@ mod queue_wal_tests {
         std::fs::write(dir.join("queue-state.json"), &v1_body).unwrap();
         write_v2(&dir, &[entry(9, "v2 항목", 5, QueueOrigin::system("t"))]);
 
-        let loaded = load_queue_state(&dir);
+        let loaded = load_entries(&dir);
         assert_eq!(loaded.len(), 1, "v2 존재 시 v1은 읽지 않는다");
         assert_eq!(loaded[0].item.text, "v2 항목");
 
@@ -4331,9 +4427,64 @@ mod queue_wal_tests {
     #[test]
     fn wal_load_is_failsafe_on_missing_or_corrupt() {
         let dir = tmpdir("failsafe");
-        assert!(load_queue_state(&dir).is_empty(), "부재 = 빈 큐");
+        let (entries, corrupt) = load_queue_state(&dir);
+        assert!(entries.is_empty(), "부재 = 빈 큐");
+        assert!(corrupt.is_none(), "파일 부재는 손상이 아니다(첫 가동)");
+
         std::fs::write(dir.join(QUEUE_WAL_V2), "{not json").unwrap();
-        assert!(load_queue_state(&dir).is_empty(), "파손 v2 = 빈 큐");
+        let (entries, corrupt) = load_queue_state(&dir);
+        assert!(entries.is_empty(), "파손 v2 + v1 부재 = 빈 큐");
+        assert!(corrupt.is_some(), "파손을 감지하지 못했다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A7⑤: v2 파손은 **무음 유실**이면 안 된다.
+    /// ①손상본을 `queue-state-v2.corrupt-<ts>.json` 으로 격리 보존(제자리에 남기면 다음
+    /// persist 가 덮어써 증거가 사라진다) ②v1 이 있으면 폴백 마이그레이션으로 살릴 건 살린다
+    /// ③손상 사실을 호출자에게 값으로 돌려준다(Daemon::new 가 health 이벤트로 발행).
+    #[test]
+    fn corrupt_v2_is_quarantined_and_falls_back_to_v1() {
+        let dir = tmpdir("corrupt-fallback");
+        let v1_body = serde_json::to_string(&json!([
+            {"mid": "qold", "surface_id": 1, "text": "v1 생존 항목", "role": "master"}
+        ]))
+        .unwrap();
+        std::fs::write(dir.join("queue-state.json"), &v1_body).unwrap();
+        std::fs::write(dir.join(QUEUE_WAL_V2), "{\"entries\": [반쪽").unwrap();
+
+        let (entries, corrupt) = load_queue_state(&dir);
+        let c = corrupt.expect("파손 신호가 없다");
+
+        // ① 격리 — 원본 자리는 비고, corrupt- 파일이 생긴다.
+        assert!(
+            !dir.join(QUEUE_WAL_V2).exists(),
+            "파손본이 제자리에 남았다 — 다음 persist 가 덮어써 증거가 소실된다"
+        );
+        let q = c.quarantined.expect("격리 경로가 없다");
+        assert!(q.contains("queue-state-v2.corrupt-"), "격리 파일명 규약 위반: {q}");
+        assert!(std::path::Path::new(&q).exists(), "격리본이 실제로 없다");
+
+        // ② v1 폴백 — 파손을 이유로 살릴 수 있는 큐를 버리지 않는다.
+        assert_eq!(entries.len(), 1, "v1 폴백이 동작하지 않았다");
+        assert_eq!(entries[0].item.text, "v1 생존 항목");
+
+        // v1 은 여전히 불변 보존(다운그레이드 안전판).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("queue-state.json")).unwrap(),
+            v1_body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// entries 키가 아예 없는(스키마 어긋난) v2 도 파손으로 취급한다 —
+    /// "파싱은 됐지만 읽을 게 없다"를 정상 빈 큐로 오인하면 조용한 전량 유실이 된다.
+    #[test]
+    fn v2_without_entries_array_is_treated_as_corrupt() {
+        let dir = tmpdir("corrupt-schema");
+        std::fs::write(dir.join(QUEUE_WAL_V2), r#"{"schema_version": 2}"#).unwrap();
+        let (entries, corrupt) = load_queue_state(&dir);
+        assert!(entries.is_empty());
+        assert!(corrupt.is_some(), "entries 부재를 정상 빈 큐로 오인했다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

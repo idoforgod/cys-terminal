@@ -1371,10 +1371,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             {
                 // ★C2: 종전 큐 경로는 `verified_from`(커널 검증 발신 surface)을 계산해놓고
                 // 폐기했다 — 정책은 자기신고 `from`이 아니라 이 값에서만 파생해야 한다(D2).
-                let mut item = crate::state::QueueItem::text(
-                    text.clone(),
-                    crate::queue_policy::derive_origin(daemon, verified_from, human),
-                );
+                // ★R1: 자기신고 `human` 도 판별에서 뺐다. 종전엔 `human:true` 한 줄로 Agent 분류를
+                // 덮어써 소프트캡을 통과할 수 있었다(D2 "self-report 불신"과 정면 충돌).
+                // GUI 발신은 **분류를 바꾸지 않고** System 라벨만 `"gui"` 로 세분화한다 —
+                // 관측 해상도는 유지하되 정책 등급은 origin 판별이 단독으로 정한다.
+                let mut origin = crate::queue_policy::derive_origin(daemon, verified_from);
+                if human {
+                    if let crate::state::QueueOrigin::System { .. } = origin {
+                        origin = crate::state::QueueOrigin::system("gui");
+                    }
+                }
+                let mut item = crate::state::QueueItem::text(text.clone(), origin);
                 // ★C4 멱등 키: 있을 때만 병합한다. 없으면 어떤 중복 억제도 하지 않는다
                 // (동일 문자열 재전송은 정당한 패턴 — boot wake ×4·PATH 수복 재시도).
                 item.idem_key = param_str(&params, "idempotency_key").filter(|k| !k.is_empty());
@@ -1396,7 +1403,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         return Reply::Single(err_response(
                             &id,
                             "queue_full",
-                            "pending queue cap (100) reached",
+                            &format!(
+                                "pending queue cap ({}) reached",
+                                crate::queue_policy::QUEUE_HARD_CAP
+                            ),
                         ))
                     }
                     Err(crate::queue_policy::EnqueueError::Softcap {
@@ -1545,7 +1555,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let item = crate::state::QueueItem::return_key(crate::queue_policy::derive_origin(
                     daemon,
                     verified_from,
-                    false,
                 ));
                 let depth = match crate::queue_policy::enqueue_item(daemon, &surface, item) {
                     Ok(d) => d,
@@ -1553,7 +1562,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         return Reply::Single(err_response(
                             &id,
                             "queue_full",
-                            "pending queue cap (100) reached",
+                            &format!(
+                                "pending queue cap ({}) reached",
+                                crate::queue_policy::QUEUE_HARD_CAP
+                            ),
                         ))
                     }
                     Err(crate::queue_policy::EnqueueError::Softcap {
@@ -3248,6 +3260,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap()
                         .map(|t| t > std::time::Instant::now())
                         .unwrap_or(false);
+                    // C2-b/D10 큐 관측 — surface.list 와 **파리티**. org.status 는 master·CSO 의
+                    // 조직 보드라, 혼잡 판단에 필요한 수치가 여기 없으면 두 번 조회해야 했다.
+                    let stats = daemon
+                        .queue_send_stats
+                        .lock()
+                        .unwrap()
+                        .get(&s.id)
+                        .copied()
+                        .unwrap_or_default();
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
                     let (agent, agent_alive) = {
                         let meta = s.agent_meta.lock().unwrap();
@@ -3269,6 +3290,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "exited": s.exited.load(Ordering::Relaxed),
                         "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
+                        "queue_oldest_age_secs": crate::queue_policy::oldest_age_secs(s),
+                        "queue_sent_total": stats.total,
+                        "queue_sent_keyless": stats.keyless,
+                        "queue_sent_rejected": stats.rejected,
                         "queue_paused": queue_paused,
                         "agent": agent,
                         "agent_alive": agent_alive,
@@ -3854,6 +3879,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 대조가 일치하면 타 surface 큐도 비울 수 있다. ACL 자체는 불변이다 — 토큰은
             // "오퍼레이터(사람) 세션" 증명이지 새 role 권한이 아니다. 토큰 미발급(None)·빈 값·
             // 불일치는 fail-closed(기존 소유 게이트 그대로).
+            //
+            // ★R1: 토큰 일치 = 오퍼레이터다. 발신 위치(pane 안/밖)는 등급을 바꾸지 않는다 —
+            // 종전엔 `caller_sid != sid` 까지 요구해서 pane 밖(caller_pid 미해소=익명) 오퍼레이터가
+            // self clear 로 강등되고 원장 사유가 뒤바뀌었다.
             let operator_ok = param_str(&params, "operator_token")
                 .zip(daemon.operator_token.as_deref())
                 .map(|(t, d)| {
@@ -3879,44 +3908,45 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            let by_operator = operator_ok && caller_sid.map(|cs| cs != sid).unwrap_or(false);
-            let dropped: Vec<crate::state::QueueItem> =
-                surface.pending_queue.lock().unwrap().drain(..).collect();
-            if !dropped.is_empty() {
-                // ★C6 무손실 일관성: operator clear로 제거되는 항목도 원장에 남긴다.
-                // 오퍼레이터가 남의 큐를 비우는 경로일수록 "무엇을 지웠는지"가 남아야 한다.
-                let mut recorded = 0usize;
-                if by_operator {
-                    let role = surface.role.lock().unwrap().clone();
-                    for item in &dropped {
-                        if crate::queue_policy::record_dead_letter(
-                            daemon,
-                            sid,
-                            role.as_deref(),
-                            item,
-                            crate::queue_policy::DeadLetterReason::ClearedByOperator,
-                        )
-                        .is_ok()
-                        {
-                            recorded += 1;
-                        }
-                    }
-                }
+            // ★R1: `by_operator` 는 **토큰 제시 사실 그 자체**다. 종전에는 `caller_sid != sid`
+            // 까지 요구해서, pane 밖 오퍼레이터(caller_pid 미해소 = 익명)가 토큰을 정당하게
+            // 제시해도 self clear 로 강등돼 원장에 `cleared_by_operator` 가 남지 않았다.
+            // 토큰을 쥔 사람이 곧 오퍼레이터다 — 어디서 호출했는지는 등급을 바꾸지 않는다.
+            let by_operator = operator_ok;
+            // ★R1 무손실(record-before-remove): 종전에는 drain 으로 **먼저 비우고** operator
+            // 경로에서만 원장을 남겼다. 그래서 ①self/익명 clear 는 무음 삭제였고 ②원장 기록에
+            // 실패한 항목도 이미 사라진 뒤였다. queue_policy 계약(기록 실패 시 제거 금지)이
+            // 문서에만 있고 코드에 없던 자리다. 이제 두 경로 모두 항목별로 기록을 먼저 시도하고
+            // **성공분만** 제거한다 — 실패분은 큐에 잔류해 다음 시도·WAL 로 보존된다.
+            let reason = if by_operator {
+                crate::queue_policy::DeadLetterReason::ClearedByOperator
+            } else {
+                crate::queue_policy::DeadLetterReason::Cleared
+            };
+            let outcome = crate::queue_policy::record_then_drain(daemon, &surface, reason);
+            if outcome.total() > 0 {
                 daemon.bus.publish(
                     crate::queue_policy::queue_events::DROPPED,
                     crate::queue_policy::queue_events::CATEGORY,
                     Some(sid),
-                    json!({"reason": if by_operator { "cleared_by_operator" } else { "cleared" },
-                           "count": dropped.len(), "dead_lettered": recorded,
-                           "bytes": dropped.iter().map(|t| t.bytes()).sum::<usize>()}),
+                    json!({"reason": reason.as_str(),
+                           "count": outcome.cleared.len(),
+                           "dead_lettered": outcome.cleared.len(),
+                           "retained": outcome.retained.len(),
+                           "bytes": outcome.cleared_bytes()}),
                 );
             }
-            // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
+            // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화 — 잔류분도 함께 보존).
             daemon.persist_queue_state();
             Reply::Single(ok_response(
                 &id,
-                json!({"surface_id": sid, "cleared": dropped.len(),
-                       "by_operator": by_operator}),
+                json!({"surface_id": sid, "cleared": outcome.cleared.len(),
+                       "retained": outcome.retained.len(),
+                       "by_operator": by_operator,
+                       "hint": if outcome.retained.is_empty() { Value::Null } else {
+                           json!("일부 항목은 dead-letter 기록에 실패해 **큐에 남겼다**(무손실 우선) — \
+                                  health.dead_letter_write_failed 를 확인하고 state dir 쓰기 권한을 복구한 뒤 재시도하라")
+                       }}),
             ))
         }
 
@@ -3951,20 +3981,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                  (요청일 뿐 강제가 아니다 — 판단과 집행은 네 몫이다.)",
                 surface_ref(sid),
             );
-            let delivered = crate::governance::oob_notify(
+            // ★R1: 자동 통지용 1800초가 아니라 **이 경로 전용 60초**를 쓴다. 이 RPC 는 사람이
+            // 명시적으로 발행하는 1회성 요청이고, 재통지를 돌려주는 주기 잡이 없다 —
+            // 30분 쿨다운은 "재발행이 조용히 삼켜지는" 동작이었지 재통지가 아니었다.
+            let outcome = crate::governance::oob_notify(
                 daemon,
                 sid,
                 &text,
                 "request_clear",
-                crate::governance::OOB_HARD_COOLDOWN_SECS,
+                crate::governance::OOB_REQUEST_CLEAR_COOLDOWN_SECS,
             );
+            let delivered = outcome.is_ok();
+            let reason = outcome.err().map(|e| e.as_str());
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "depth": depth, "oldest_age_secs": oldest,
-                       "notified": delivered,
-                       "hint": if delivered { Value::Null } else {
-                           json!("주입 게이트 미통과(에이전트 부재·사람 입력 직후·쿨다운) — \
-                                  이벤트는 남았고 다음 시도에서 재통지된다")
+                       // `delivered` 가 정본. `notified` 는 구 CLI 호환용 동의어다.
+                       "delivered": delivered, "notified": delivered,
+                       "reason": reason,
+                       "cooldown_secs": crate::governance::OOB_REQUEST_CLEAR_COOLDOWN_SECS as u64,
+                       "hint": match reason {
+                           None => Value::Null,
+                           // ★자동 재통지는 없다 — 문언을 실동작에 맞춘다.
+                           Some("cooldown") => json!(format!(
+                               "직전 요청의 쿨다운({}초) 안이라 주입하지 않았다 — 자동 재통지는 없으니 \
+                                쿨다운 경과 후 직접 재발행하라",
+                               crate::governance::OOB_REQUEST_CLEAR_COOLDOWN_SECS as u64)),
+                           Some("human_typing") => json!(
+                               "대상 pane 에 사람 입력 흔적이 남아 주입을 보류했다 — 자동 재통지는 없다. \
+                                입력이 식은 뒤 직접 재발행하라"),
+                           Some("channel_full") => json!(
+                               "대상 writer 채널이 포화라 주입하지 못했다 — 쿨다운을 소모하지 않았으니 \
+                                즉시 재발행 가능하다"),
+                           _ => json!(
+                               "대상이 에이전트 pane 이 아니거나 좌석이 비어 주입을 막았다(맨 셸 주입 금지) — \
+                                자동 재통지는 없다. 좌석을 복구한 뒤 직접 재발행하라"),
                        }}),
             ))
         }
@@ -6367,6 +6418,7 @@ mod tests {
 
     /// 대조군 ②: 익명 발신(caller_pid None = 데몬 내부 경로)은 통과해야 한다.
     /// (pane은 커널 peer pid가 항상 자기 surface로 해석되므로 익명을 위조할 수 없다 = 안전.)
+    /// **행동 유지 박제** — A1 수정 후에도 이 통과는 그대로다(원장만 추가로 남는다).
     #[test]
     fn queue_clear_allows_anonymous() {
         let daemon = claim_daemon();
@@ -6379,6 +6431,122 @@ mod tests {
         assert_eq!(
             resp["ok"], json!(true),
             "익명(데몬 내부) 큐 비우기가 막혔다 (응답: {resp})"
+        );
+    }
+
+    /// 원장 읽기 헬퍼 — 이 데몬의 state dir dead-letters.jsonl 전 행.
+    fn clear_dead_letters(daemon: &Arc<Daemon>) -> Vec<Value> {
+        let p = crate::state::state_dir(&daemon.socket_path)
+            .join(crate::queue_policy::DEAD_LETTER_FILE);
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("원장 라인은 유효 JSON"))
+            .collect()
+    }
+
+    fn queue_clear_rpc_with(
+        daemon: &Arc<Daemon>,
+        surface_id: u64,
+        caller_pid: Option<u32>,
+        token: Option<&str>,
+    ) -> Value {
+        let mut params = json!({ "surface_id": surface_id });
+        if let Some(t) = token {
+            params["operator_token"] = json!(t);
+        }
+        let req = Request { id: json!(1), method: "queue.clear".into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// ★A1(BLOCK 수리) 무음 삭제 근절: **어떤 경로로도** clear 된 항목은 원장에 남는다.
+    /// 종전엔 operator 경로만 기록했고 self/익명 clear 는 흔적 없이 사라졌다 —
+    /// queue_policy 의 "큐에서 사라지는 모든 항목은 여기 남는다" 불변식이 코드에 없었다.
+    #[test]
+    fn queue_clear_records_dead_letter_on_every_path() {
+        // ① self clear — 새 사유 `cleared` 로 남는다.
+        // ★원장 파일을 읽는 테스트는 반드시 isolated_daemon: claim_daemon 은 dir 키가
+        //   {pid}-{epoch초}라 같은 초에 도는 테스트끼리 state dir(=원장)를 공유한다.
+        let daemon = isolated_daemon();
+        let own = make_surface(&daemon, Some("worker-1"));
+        let own_pid = 994_301_u32;
+        bind_caller(&daemon, own_pid, own);
+        daemon.surfaces.lock().unwrap()[&own]
+            .pending_queue.lock().unwrap()
+            .push_back(test_queue_item("self clear 대상 전문"));
+
+        let resp = queue_clear_rpc(&daemon, own, Some(own_pid));
+        assert_eq!(resp["result"]["cleared"].as_u64(), Some(1), "{resp}");
+        assert_eq!(resp["result"]["retained"].as_u64(), Some(0));
+        assert_eq!(resp["result"]["by_operator"], json!(false));
+        let dl = clear_dead_letters(&daemon);
+        assert_eq!(dl.len(), 1, "self clear 가 무음 삭제됐다");
+        assert_eq!(dl[0]["reason"], json!("cleared"));
+        assert_eq!(dl[0]["text"], json!("self clear 대상 전문"), "전문이 무손실로 남아야 한다");
+
+        // ② 익명 + 토큰(caller_pid=None) — pane 밖 오퍼레이터도 정당 사용자다.
+        //    `by_operator` 는 토큰 제시 사실이지 발신 위치가 아니다.
+        let daemon2 = isolated_daemon();
+        let node = make_surface(&daemon2, Some("worker-3"));
+        let tok = daemon2.operator_token.clone().expect("기동 시 토큰 발급");
+        daemon2.surfaces.lock().unwrap()[&node]
+            .pending_queue.lock().unwrap()
+            .push_back(test_queue_item("오퍼레이터 clear 대상"));
+
+        let resp2 = queue_clear_rpc_with(&daemon2, node, None, Some(&tok));
+        assert_eq!(resp2["ok"], json!(true), "{resp2}");
+        assert_eq!(
+            resp2["result"]["by_operator"], json!(true),
+            "pane 밖(익명) 오퍼레이터가 self 로 강등됐다: {resp2}"
+        );
+        let dl2 = clear_dead_letters(&daemon2);
+        assert_eq!(dl2.len(), 1, "익명+토큰 경로가 원장을 남기지 않았다");
+        assert_eq!(dl2[0]["reason"], json!("cleared_by_operator"));
+    }
+
+    /// ★A1 무손실(record-before-remove): 원장 기록에 **실패**하면 항목을 지우지 않는다.
+    /// state dir 를 read-only 로 만들어 기록을 강제 실패시키고, 큐 잔류를 확인한다.
+    /// (queue_policy.rs 계약: "호출자는 이때 항목을 제거하거나 거부를 강행해선 안 된다")
+    #[cfg(unix)]
+    #[test]
+    fn queue_clear_retains_items_when_ledger_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        // ★isolated 필수: 이 테스트는 state dir 를 read-only 로 잠근다 — 공유 dir 이면
+        //   같은 초에 도는 다른 테스트의 원장 기록까지 실패시킨다(교차 오염).
+        let daemon = isolated_daemon();
+        let own = make_surface(&daemon, Some("worker-1"));
+        let own_pid = 994_401_u32;
+        bind_caller(&daemon, own_pid, own);
+        daemon.surfaces.lock().unwrap()[&own]
+            .pending_queue.lock().unwrap()
+            .push_back(test_queue_item("지워지면 안 되는 전문"));
+
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 기존 원장이 있으면 append 가 성공해버린다 — 없는 상태에서 read-only 로 잠근다.
+        let _ = std::fs::remove_file(dir.join(crate::queue_policy::DEAD_LETTER_FILE));
+        let orig = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let resp = queue_clear_rpc(&daemon, own, Some(own_pid));
+        // 권한 복구는 단언보다 먼저 — 실패해도 임시 디렉터리가 남지 않게.
+        std::fs::set_permissions(&dir, orig).unwrap();
+
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        assert_eq!(
+            resp["result"]["cleared"].as_u64(), Some(0),
+            "원장을 못 남겼는데 삭제됐다고 보고했다: {resp}"
+        );
+        assert_eq!(resp["result"]["retained"].as_u64(), Some(1), "{resp}");
+        assert!(resp["result"]["hint"].is_string(), "잔류 사유 안내가 없다: {resp}");
+        assert_eq!(
+            daemon.surfaces.lock().unwrap()[&own].pending_queue.lock().unwrap().len(),
+            1,
+            "★원장 없는 삭제가 발생했다 — 무손실 원칙 위반"
         );
     }
 
@@ -6431,6 +6599,24 @@ mod tests {
                 live_e["agent_alive"], json!(true),
                 "{method}: seen=true·notified=false인데 alive가 true가 아니다: {live_e}"
             );
+
+            // ★A6 큐 텔레메트리 파리티: surface.list 에만 있던 4필드를 org.status 에도 실는다.
+            // org.status 는 master·CSO 의 조직 보드다 — 혼잡 판단 수치가 없으면 두 번 조회해야 했고,
+            // 실제로 그 이중조회가 빠진 채 depth 만 보고 판단하는 경로가 있었다.
+            for f in [
+                "queue_depth",
+                "queue_oldest_age_secs",
+                "queue_sent_total",
+                "queue_sent_keyless",
+                "queue_sent_rejected",
+            ] {
+                assert!(
+                    live_e.get(f).is_some(),
+                    "{method}: 큐 텔레메트리 필드 {f} 가 없다(파리티 위반): {live_e}"
+                );
+            }
+            assert_eq!(live_e["queue_depth"], json!(0));
+            assert_eq!(live_e["queue_sent_total"], json!(0));
 
             // 메타 없는 surface: 두 필드 모두 null이어야 한다 (presence 일관).
             let bare_e = surface_entry(&resp, key, bare);
@@ -7689,8 +7875,10 @@ mod queue_policy_tests {
     use serde_json::{json, Value};
     use std::sync::Arc;
 
-    /// 정책 env는 프로세스 전역이라 이 모듈 테스트는 직렬화한다.
-    static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// ★A7: 정책 env 는 프로세스 전역이다 — 모듈별 사설 락 대신 **공유 락 하나**를 잡는다
+    /// (queue_policy::QUEUE_ENV_LOCK). 모듈마다 락이 다르면 handlers·governance·queue_policy 가
+    /// 서로를 모른 채 동시에 set_var 해서 간헐 실패가 난다.
+    use crate::queue_policy::QUEUE_ENV_LOCK as POLICY_ENV_LOCK;
 
     struct PolicyEnv;
     impl PolicyEnv {
@@ -7748,7 +7936,7 @@ mod queue_policy_tests {
     }
 
     /// origin 3분류(D2): verified & agent_meta → Agent(role 동봉) / verified 맨 셸 → System /
-    /// 익명 → System / human 신고 → Human. **자기신고 from은 어디에도 쓰이지 않는다.**
+    /// 익명 → System. **자기신고 from·human 은 어디에도 쓰이지 않는다.**
     #[test]
     fn origin_is_derived_from_verified_sender_only() {
         let (d, dir) = daemon("origin");
@@ -7756,24 +7944,100 @@ mod queue_policy_tests {
         *agent.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
         let bare = surface(&d, None);
 
-        let o = queue_policy::derive_origin(&d, Some(agent.id), false);
+        let o = queue_policy::derive_origin(&d, Some(agent.id));
         assert_eq!(
             o,
             QueueOrigin::Agent { surface: agent.id, role: Some("worker-1".into()) },
             "launch-agent 등록 pane의 발신은 Agent로 분류돼야 정책 대상이 된다"
         );
         assert_eq!(
-            queue_policy::derive_origin(&d, Some(bare.id), false),
+            queue_policy::derive_origin(&d, Some(bare.id)),
             QueueOrigin::system("pane"),
-            "verified 이지만 에이전트 미등록(맨 셸)은 정책 밖이다"
+            "verified 이지만 에이전트 미등록·좌석 비점유(맨 셸)는 정책 밖이다"
         );
         assert_eq!(
-            queue_policy::derive_origin(&d, None, false),
+            queue_policy::derive_origin(&d, None),
             QueueOrigin::system("anonymous"),
             "조상추적 미해소(외부 프로세스)는 System — 혼잡 게이트이지 보안 게이트가 아니다"
         );
-        assert_eq!(queue_policy::derive_origin(&d, None, true), QueueOrigin::Human);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★R1: `cys new-surface` + 수동 `agy`/`codex` 기동(CLAUDE.md §6 정식 절차)으로 편입된
+    /// pane 은 `agent_meta` 가 없다. 좌석 점유 사실만으로도 Agent 로 분류하지 않으면,
+    /// 정확히 그 리뷰어 노드들이 소프트캡 정책 밖으로 새어나간다.
+    #[test]
+    fn seat_occupied_pane_without_meta_is_agent_origin() {
+        let (d, dir) = daemon("origin-seat");
+        let manual = surface(&d, Some("reviewer-codex"));
+        assert!(manual.agent_meta.lock().unwrap().is_none(), "전제: meta 미등록");
+
+        manual.seat_cache.store(
+            crate::governance::SeatState::Occupied.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(
+            queue_policy::derive_origin(&d, Some(manual.id)),
+            QueueOrigin::Agent { surface: manual.id, role: Some("reviewer-codex".into()) },
+            "수동 기동 에이전트(seat=Occupied·meta None)가 정책 밖으로 새면 안 된다"
+        );
+
+        // Unknown(프로브 미도달)은 확장 대상이 아니다 — 판정 실패를 근거로 삼으면 맨 셸 오차단.
+        manual.seat_cache.store(
+            crate::governance::SeatState::Unknown.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert_eq!(
+            queue_policy::derive_origin(&d, Some(manual.id)),
+            QueueOrigin::system("pane"),
+            "좌석 판정 미도달을 Agent 로 승격하면 맨 셸 자동화가 오차단된다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★R1: 자기신고 `human:true` 는 **분류를 바꾸지 못한다**. Agent pane 이 human 을 달아도
+    /// Agent 로 남아 소프트캡을 받고, System 경로에서만 라벨이 `gui` 로 세분화된다.
+    #[test]
+    fn self_reported_human_cannot_escape_agent_classification() {
+        let _g = crate::queue_policy::QUEUE_ENV_LOCK.lock().unwrap();
+        let _e = PolicyEnv::set("1", "enforce");
+        let (d, dir) = daemon("human-escape");
+        let target = surface(&d, Some("master"));
+        let sender = surface(&d, Some("worker-1"));
+        *sender.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        bind_caller_pid(&d, 981_301, sender.id);
+
+        // 소프트캡 1 — 첫 건으로 즉시 도달시킨다.
+        let first = send_queued(&d, target.id, "1건", 981_301, false);
+        assert_eq!(first["ok"], json!(true), "첫 적재는 통과해야 한다: {first}");
+
+        let escaped = send_queued(&d, target.id, "human 위장", 981_301, true);
+        assert_eq!(
+            escaped["error"]["code"],
+            json!(queue_policy::ERR_SOFTCAP),
+            "human:true 자기신고가 Agent 소프트캡을 우회했다: {escaped}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn bind_caller_pid(d: &Arc<Daemon>, pid: u32, sid: u64) {
+        d.caller_cache
+            .lock()
+            .unwrap()
+            .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+    }
+
+    fn send_queued(d: &Arc<Daemon>, sid: u64, text: &str, pid: u32, human: bool) -> Value {
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({"surface_id": sid, "text": text, "queued": true, "human": human}),
+        };
+        let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(d, req, Some(pid))
+        else {
+            panic!("expected single reply");
+        };
+        resp
     }
 
     /// log 모드(기본): 소프트캡 도달해도 **적재는 허용**된다 — 차단이 유예됐을 뿐이다.
@@ -8317,10 +8581,13 @@ mod queue_delegated_clear_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 자기 큐 clear는 토큰 없이 통과하고 by_operator=false — operator 경로가 아니므로
-    /// dead-letter도 남기지 않는다(기존 동작 보존: 자기 큐 철회는 발신자 본인의 결정).
+    /// 자기 큐 clear는 토큰 없이 통과하고 by_operator=false.
+    /// ★A1 개정: 종전에는 "operator 경로가 아니므로 원장을 남기지 않는다"가 계약이었는데,
+    /// 그건 곧 **자기 큐 철회는 무음 삭제**라는 뜻이었다. 철회 주체가 본인이라는 사실이
+    /// 기록 면제 사유가 될 수는 없다(제3자가 보낸 인플라이트 메시지가 사라지는 건 동일하다).
+    /// 이제 사유 `cleared` 로 남는다 — 통과/거부 동작 자체는 불변이다.
     #[test]
-    fn self_clear_unchanged_without_token() {
+    fn self_clear_unchanged_without_token_but_now_recorded() {
         let (d, dir) = daemon("op-self");
         let own = surface(&d, Some("worker-1"));
         let pid = 996_301_u32;
@@ -8330,7 +8597,9 @@ mod queue_delegated_clear_tests {
         let r = rpc(&d, "queue.clear", json!({"surface_id": own.id}), Some(pid));
         assert_eq!(r["result"]["cleared"], json!(2), "응답: {r}");
         assert_eq!(r["result"]["by_operator"], json!(false));
-        assert!(dead_letters(&dir).is_empty());
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 2, "self clear 무음 삭제 재발");
+        assert!(dl.iter().all(|e| e["reason"] == json!("cleared")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8370,8 +8639,10 @@ mod queue_delegated_clear_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 빈 좌석·에이전트 부재 대상에는 주입하지 않고 notified=false로 정직하게 보고한다
+    /// 빈 좌석·에이전트 부재 대상에는 주입하지 않고 delivered=false로 정직하게 보고한다
     /// (성공을 가장하면 오퍼레이터가 조치됐다고 오인한다).
+    /// ★A4: 사유도 값으로 나와야 한다 — 종전엔 사유 없이 "다음 시도에서 재통지된다"는
+    /// **존재하지 않는 재시도**를 안내했다.
     #[test]
     fn request_clear_reports_undelivered_honestly() {
         let (d, dir) = daemon("reqclear-bare");
@@ -8383,8 +8654,65 @@ mod queue_delegated_clear_tests {
 
         let r = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
         assert_eq!(r["ok"], json!(true), "게이트 미통과는 오류가 아니라 사실 보고다: {r}");
-        assert_eq!(r["result"]["notified"], json!(false));
-        assert!(r["result"]["hint"].is_string(), "왜 미도달인지 안내가 있어야 한다");
+        assert_eq!(r["result"]["delivered"], json!(false));
+        assert_eq!(r["result"]["notified"], json!(false), "구 CLI 호환 동의어 유지");
+        assert_eq!(r["result"]["reason"], json!("gate_blocked"), "사유가 정확해야 한다: {r}");
+        let hint = r["result"]["hint"].as_str().expect("왜 미도달인지 안내가 있어야 한다");
+        assert!(
+            hint.contains("자동 재통지는 없다"),
+            "hint 가 실동작(자동 재통지 없음)을 말하지 않는다: {hint}"
+        );
+        assert!(
+            !hint.contains("다음 시도에서 재통지"),
+            "존재하지 않는 자동 재통지를 약속하고 있다: {hint}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A4: request_clear 쿨다운은 **전용 60초**다. 1800초(자동 통지용)를 쓰면 사람이 친
+    /// 재발행이 30분간 조용히 삼켜지는데, 이 경로에는 재통지를 돌리는 주기 잡이 없다.
+    #[test]
+    fn request_clear_uses_dedicated_short_cooldown() {
+        assert_eq!(
+            crate::governance::OOB_REQUEST_CLEAR_COOLDOWN_SECS, 60.0,
+            "요청 경로 쿨다운 상수가 바뀌었다 — 문서·hint 와 동기화하라"
+        );
+        assert!(
+            crate::governance::OOB_REQUEST_CLEAR_COOLDOWN_SECS
+                < crate::governance::OOB_HARD_COOLDOWN_SECS,
+            "요청 경로가 자동 통지보다 긴 쿨다운을 쓰면 안 된다"
+        );
+
+        let (d, dir) = daemon("reqclear-cd");
+        let target = surface(&d, Some("worker-1"));
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        target
+            .seat_cache
+            .store(crate::governance::SeatState::Occupied.as_u8(), Ordering::Relaxed);
+        fill(&target, 2);
+        let master = surface(&d, Some("master"));
+        let mpid = 996_601_u32;
+        bind(&d, mpid, master.id);
+
+        let first = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
+        assert_eq!(first["result"]["delivered"], json!(true), "{first}");
+        assert_eq!(first["result"]["cooldown_secs"], json!(60));
+
+        // 연타는 억제하되, 사유를 정확히 말한다(연타 방지가 이 쿨다운의 유일한 목적).
+        let second = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
+        assert_eq!(second["result"]["delivered"], json!(false), "{second}");
+        assert_eq!(second["result"]["reason"], json!("cooldown"));
+
+        // 60초 경과를 모사 → 재발행이 실제로 통과한다(1800초였다면 여전히 막혔다).
+        d.oob_cooldowns
+            .lock()
+            .unwrap()
+            .insert((target.id, "request_clear".into()), crate::state::now_epoch() - 61.0);
+        let third = rpc(&d, "queue.request_clear", json!({"surface_id": target.id}), Some(mpid));
+        assert_eq!(
+            third["result"]["delivered"], json!(true),
+            "60초 경과 후 재발행이 막혔다 — 자동 통지용 1800초가 그대로 물려 있다: {third}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

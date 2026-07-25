@@ -26,11 +26,19 @@ pub mod queue_events {
     pub const DEPTH_HIGH: &str = "queue.depth_high";
     pub const CLEAR_DENIED: &str = "queue.clear_denied";
 
-    // 신설 3종 (C2·C3·C4)
+    // 신설 4종 (C2·C3·C4·C5)
     pub const REJECTED: &str = "queue.rejected";
     pub const EXPIRED: &str = "queue.expired";
     pub const MERGED: &str = "queue.merged";
+    /// C5 OOB 제어 레인 통지 — governance::oob_notify 가 유일 발행자.
+    pub const OOB_NOTIFIED: &str = "queue.oob_notified";
 }
+
+/// 정책 env(`CYS_QUEUE_*`)는 프로세스 전역이라, 이를 만지는 **모든 모듈의 테스트**가 이
+/// 하나의 락을 잡아 직렬화한다. 모듈별 사설 락을 두면 queue_policy·handlers·governance 가
+/// 서로를 모른 채 동시에 set_var 해서 간헐 실패(flake)가 난다 — 락은 env 만큼 전역이어야 한다.
+#[cfg(test)]
+pub(crate) static QUEUE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 기존 하드캡 — **불변**. origin 무관하게 큐 전체 길이에 적용된다.
 pub const QUEUE_HARD_CAP: usize = 100;
@@ -103,6 +111,10 @@ pub const ERR_SOFTCAP: &str = "queue_softcap_exceeded";
 pub const DEAD_LETTER_FILE: &str = "dead-letters.jsonl";
 /// 회전 임계 10MB — 무한 성장 차단. 회전본은 `dead-letters.<ts>.jsonl`.
 pub const DEAD_LETTER_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// 회전본 보존 기간(일). 회전은 파일 하나의 무한 성장만 막았고 **회전본 개수**는 무한이었다 —
+/// 24/365 데몬에서 state dir 이 단조 증가한다. 회전이 일어나는 순간(=드문 사건)에만 정리해
+/// 상시 비용 0으로 유지한다. 현행 파일(`dead-letters.jsonl`)은 절대 prune 대상이 아니다.
+pub const DEAD_LETTER_RETAIN_DAYS: u64 = 30;
 
 /// 원장 사유. **어떤 경로로도 무음 삭제는 없다** — 큐에서 사라지는 모든 항목은 여기에 남는다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +123,15 @@ pub enum DeadLetterReason {
     SoftcapRejected,
     Superseded,
     WakeupCap,
+    /// 오퍼레이터 토큰으로 남의 큐를 비운 경우(위임형 clear).
     ClearedByOperator,
+    /// 소유자 자신(또는 데몬 내부 익명 경로)이 자기 큐를 비운 경우.
+    /// ★이 사유가 없던 동안 self/익명 clear 는 **무음 삭제**였다 — 불변식의 구멍이었다.
+    Cleared,
+    /// surface 가 오너 의도로 닫힘(close_surface).
+    SurfaceClosed,
+    /// pane 프로세스가 자력 종료(reader EOF).
+    ProcessExited,
 }
 
 impl DeadLetterReason {
@@ -122,6 +142,9 @@ impl DeadLetterReason {
             DeadLetterReason::Superseded => "superseded",
             DeadLetterReason::WakeupCap => "wakeup_cap",
             DeadLetterReason::ClearedByOperator => "cleared_by_operator",
+            DeadLetterReason::Cleared => "cleared",
+            DeadLetterReason::SurfaceClosed => "surface_closed",
+            DeadLetterReason::ProcessExited => "process_exited",
         }
     }
 }
@@ -174,6 +197,8 @@ pub fn record_dead_letter(
                     crate::state::now_epoch() as u64
                 ));
                 let _ = std::fs::rename(&path, rotated);
+                // 회전 직후에만 보존기간 정리 — 상시 비용 0, 무한 누적 차단.
+                prune_rotated_dead_letters(&dir, DEAD_LETTER_RETAIN_DAYS);
             }
         }
         let mut f = std::fs::OpenOptions::new()
@@ -203,6 +228,103 @@ pub fn record_dead_letter(
             Err(msg)
         }
     }
+}
+
+/// 회전본(`dead-letters.<ts>.jsonl`) 중 mtime 이 `retain_days` 를 넘긴 것을 지운다.
+/// **현행 파일은 이름이 다르므로 절대 걸리지 않는다**(패턴에 중간 세그먼트가 필수).
+/// 순수 파일 연산이라 테스트가 mtime 조작으로 직접 핀할 수 있다.
+pub fn prune_rotated_dead_letters(dir: &std::path::Path, retain_days: u64) -> usize {
+    if retain_days == 0 {
+        return 0;
+    }
+    let cutoff = match std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(retain_days * 86_400))
+    {
+        Some(t) => t,
+        None => return 0,
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut pruned = 0usize;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `dead-letters.<무언가>.jsonl` 만 — 현행 `dead-letters.jsonl` 은 중간 세그먼트가 없다.
+        let Some(mid) = name
+            .strip_prefix("dead-letters.")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if mid.is_empty() {
+            continue;
+        }
+        let old = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if old && std::fs::remove_file(ent.path()).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// 종료·clear 경로 공용 **record-before-remove**.
+///
+/// 종전 세 경로(queue.clear self·close_surface·reader EOF)는 `drain(..)` 으로 먼저 비우고
+/// 나서 이벤트만 냈다 — 이벤트 버스는 유실 가능한 링이므로 사실상 **무음 삭제**였다.
+/// 여기서는 순서를 뒤집는다: 항목별로 원장 기록을 먼저 시도하고, **기록에 성공한 것만**
+/// 큐에서 제거한다. 실패분은 큐에 남아 다음 기회(재시도·WAL)로 보존된다.
+///
+/// 제거는 스냅샷 인덱스가 아니라 `seq` 집합으로 한다 — 기록 중 새 항목이 들어와도
+/// 우리가 기록하지 않은 항목은 절대 지워지지 않는다(TOCTOU 안전).
+pub struct DrainOutcome {
+    /// 원장 기록 성공 = 실제로 큐에서 제거된 항목.
+    pub cleared: Vec<QueueItem>,
+    /// 원장 기록 실패 = 큐에 잔류시킨 항목(무손실 우선).
+    pub retained: Vec<QueueItem>,
+    pub role: Option<String>,
+}
+
+impl DrainOutcome {
+    pub fn total(&self) -> usize {
+        self.cleared.len() + self.retained.len()
+    }
+    pub fn cleared_bytes(&self) -> usize {
+        self.cleared.iter().map(|i| i.bytes()).sum()
+    }
+}
+
+pub fn record_then_drain(
+    daemon: &Daemon,
+    surface: &Surface,
+    reason: DeadLetterReason,
+) -> DrainOutcome {
+    let items: Vec<QueueItem> = surface.pending_queue.lock().unwrap().iter().cloned().collect();
+    let role = surface.role.lock().unwrap().clone();
+    if items.is_empty() {
+        return DrainOutcome { cleared: Vec::new(), retained: Vec::new(), role };
+    }
+    let mut cleared = Vec::new();
+    let mut retained = Vec::new();
+    for item in items {
+        match record_dead_letter(daemon, surface.id, role.as_deref(), &item, reason) {
+            Ok(_) => cleared.push(item),
+            Err(_) => retained.push(item),
+        }
+    }
+    if !cleared.is_empty() {
+        let seqs: std::collections::HashSet<u64> = cleared.iter().map(|i| i.seq).collect();
+        surface
+            .pending_queue
+            .lock()
+            .unwrap()
+            .retain(|i| !seqs.contains(&i.seq));
+    }
+    DrainOutcome { cleared, retained, role }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -490,32 +612,40 @@ pub fn oldest_age_secs(surface: &Surface) -> Option<f64> {
         })
 }
 
-/// 발신 origin 판별(D2). **자기신고 `from`은 쓰지 않는다** — 커널 peer pid로 해석된
-/// `verified_from`만이 근거다.
-/// 우선순위: verified & agent_meta 보유 → Agent · human 신고 → Human · 그 외 → System.
-pub fn derive_origin(daemon: &Daemon, verified_from: Option<u64>, human: bool) -> QueueOrigin {
-    if let Some(sid) = verified_from {
-        if let Some(s) = daemon.get_surface(sid) {
-            if s.agent_meta.lock().unwrap().is_some() {
-                return QueueOrigin::Agent {
-                    surface: sid,
-                    role: s.role.lock().unwrap().clone(),
-                };
-            }
-        }
-        // verified 이지만 에이전트 미등록(맨 셸 pane) — 정책 대상 아님.
-        return if human {
-            QueueOrigin::Human
-        } else {
-            QueueOrigin::system("pane")
-        };
-    }
-    if human {
-        QueueOrigin::Human
-    } else {
+/// 발신 origin 판별(D2). **근거는 커널 peer pid로 해석된 `verified_from` 뿐이다** —
+/// 자기신고 `from`도, 자기신고 `human`도 판별에 쓰지 않는다.
+///
+/// ★자기신고 `human` 제거(D2 문언 준수): 종전에는 `human:true` 한 줄이면 어떤 발신자든
+/// Human = 정책 면제로 분류됐다. 신원 위조가 곧 정책 우회인 구조는 "self-report 불신"이라는
+/// D2의 전제를 스스로 무너뜨린다. `QueueOrigin::Human` variant 는 **WAL v1/v2 역호환**을 위해
+/// 타입으로만 남고, 신규 분류는 더 이상 이 variant 를 만들지 않는다(GUI 큐잉 발신은 호출부가
+/// System 라벨 `"gui"`로 세분화 — 라벨은 관측용이고 정책 등급은 System 그대로다).
+///
+/// ★Agent 판정 확장: `agent_meta` 는 `cys launch-agent` 로 기동한 노드만 갖는다. 그런데
+/// CLAUDE.md §6 정식 절차(`cys new-surface` → 그 pane 에서 직접 `agy`/`codex` 실행)로 편입된
+/// 리뷰어 pane 은 meta 가 없어 **정책 밖**으로 새어나갔다 — 정확히 그 노드들이 폭주 리스크의
+/// 주체인데도. 좌석 사실(`seat_cache == Occupied`, 자손 프로세스 존재)을 두 번째 근거로 받아
+/// 수동 기동 에이전트도 정책 안으로 들인다. Unknown(프로브 미도달)은 확장하지 않는다 —
+/// 판정 실패를 근거로 삼으면 맨 셸 자동화를 오차단한다.
+pub fn derive_origin(daemon: &Daemon, verified_from: Option<u64>) -> QueueOrigin {
+    let Some(sid) = verified_from else {
         // 조상추적 미해소(외부 프로세스·데몬 내부) — 위협 모델상 정책 밖.
-        QueueOrigin::system("anonymous")
+        return QueueOrigin::system("anonymous");
+    };
+    if let Some(s) = daemon.get_surface(sid) {
+        let registered = s.agent_meta.lock().unwrap().is_some();
+        let seated = crate::governance::SeatState::from_u8(
+            s.seat_cache.load(std::sync::atomic::Ordering::Relaxed),
+        ) == crate::governance::SeatState::Occupied;
+        if registered || seated {
+            return QueueOrigin::Agent {
+                surface: sid,
+                role: s.role.lock().unwrap().clone(),
+            };
+        }
     }
+    // verified 이지만 에이전트도 좌석 점유도 아님(맨 셸 pane) — 정책 대상 아님.
+    QueueOrigin::system("pane")
 }
 
 #[cfg(test)]
@@ -543,6 +673,7 @@ mod tests {
     /// T2-b: 모드 파싱 — 미설정·오타·대소문자. 기본은 관찰(log)이며 오타로 enforce가 되면 안 된다.
     #[test]
     fn policy_mode_defaults_to_log() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap();
         let cases = [("", PolicyMode::Log), ("log", PolicyMode::Log),
                      ("garbage", PolicyMode::Log), ("ENFORCE", PolicyMode::Enforce),
                      (" enforce ", PolicyMode::Enforce)];
@@ -561,5 +692,62 @@ mod tests {
         assert_eq!(DeadLetterReason::Superseded.as_str(), "superseded");
         assert_eq!(DeadLetterReason::WakeupCap.as_str(), "wakeup_cap");
         assert_eq!(DeadLetterReason::ClearedByOperator.as_str(), "cleared_by_operator");
+        // 신설 3종 — self clear·surface 종료 2경로의 무음 삭제를 없앤 사유들.
+        assert_eq!(DeadLetterReason::Cleared.as_str(), "cleared");
+        assert_eq!(DeadLetterReason::SurfaceClosed.as_str(), "surface_closed");
+        assert_eq!(DeadLetterReason::ProcessExited.as_str(), "process_exited");
+    }
+
+    /// A5: 회전본 보존기간 prune — 오래된 회전본만 지우고 **현행 파일은 절대 건드리지 않는다**.
+    /// mtime 조작이 필요해 unix 한정(prune 로직 자체는 OS 무관).
+    #[cfg(unix)]
+    #[test]
+    fn rotated_dead_letters_are_pruned_after_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-dlprune-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cur = dir.join(DEAD_LETTER_FILE);
+        let old = dir.join("dead-letters.1000000000.jsonl");
+        let fresh = dir.join("dead-letters.2000000000.jsonl");
+        let other = dir.join("schedule_state.json");
+        for p in [&cur, &old, &fresh, &other] {
+            std::fs::write(p, "{}\n").unwrap();
+        }
+        // 현행 파일도 함께 '오래된' 것으로 만든다 — 그래도 살아남아야 계약이다.
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        for p in [&cur, &old, &other] {
+            filetime_set(p, ancient);
+        }
+
+        let n = prune_rotated_dead_letters(&dir, DEAD_LETTER_RETAIN_DAYS);
+        assert_eq!(n, 1, "보존기간 초과 회전본 1건만 지워야 한다");
+        assert!(!old.exists(), "40일 지난 회전본이 남았다");
+        assert!(fresh.exists(), "보존기간 내 회전본을 지웠다");
+        assert!(cur.exists(), "★현행 원장을 지웠다 — 무손실 위반");
+        assert!(other.exists(), "무관 파일을 지웠다");
+
+        // retain_days=0 = 비활성(안전판).
+        assert_eq!(prune_rotated_dead_letters(&dir, 0), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mtime 을 과거로 미는 최소 헬퍼(외부 크레이트 무의존 — utimes(2) 직접 호출).
+    #[cfg(unix)]
+    fn filetime_set(path: &std::path::Path, t: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let tv = [
+            libc::timeval { tv_sec: secs, tv_usec: 0 },
+            libc::timeval { tv_sec: secs, tv_usec: 0 },
+        ];
+        unsafe {
+            libc::utimes(c.as_ptr(), tv.as_ptr());
+        }
     }
 }

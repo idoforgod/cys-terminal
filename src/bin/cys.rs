@@ -1586,17 +1586,34 @@ fn run(command: Command) -> i32 {
             } else {
             resolve_targets(&surface, &to).and_then(|sids| {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
-                let multi = sids.len() > 1;
+                let total = sids.len();
+                let multi = total > 1;
+                // ★A7⑦ 다중 대상 부분 실패: 종전엔 `?`로 **첫 실패에서 루프를 이탈**했다.
+                // `--to 'reviewer-*'` 처럼 여러 노드에 뿌리는 호출에서 앞선 대상 하나가 죽어 있으면
+                // 뒤의 멀쩡한 대상은 아예 시도조차 되지 않았고, 이미 성공한 발신은 보고되지 않았다
+                // (부분 성공이 전량 실패처럼 보이는 오표시). 이제 전 대상을 시도하고, 대상별 오류를
+                // 모아 말미에 요약한다. 단 하나라도 실패하면 종료코드는 비0이다(스크립트 게이트 보존).
+                let mut failures: Vec<String> = Vec::new();
+                let mut ok_n = 0usize;
                 for sid in sids {
                     // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
                     // 집행한다. 클라측 C-u·150ms sleep·게이트는 제거 — 비원자 split·race를 없앤다.
                     // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
-                    let r = request(
+                    let r = match request(
                         "surface.send_text",
                         json!({"surface_id": sid, "text": text.join(" "), "from": from,
                                "queued": queued, "clear_first": clear_first,
                                "idempotency_key": idempotency_key, "important": important}),
-                    )?;
+                    ) {
+                        Ok(r) => r,
+                        // 단일 대상은 종전 오류 문자열을 그대로 전달한다(계약 무변경).
+                        Err(e) if !multi => return Err(e),
+                        Err(e) => {
+                            eprintln!("[send] surface:{sid} 실패: {e}");
+                            failures.push(format!("surface:{sid}: {e}"));
+                            continue;
+                        }
+                    };
                     let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     if queued {
                         // ★C4 스큐 감지: 키를 보냈는데 응답에 merged가 없으면 구 데몬이다 —
@@ -1612,8 +1629,17 @@ fn run(command: Command) -> i32 {
                     } else {
                         println!("OK{tag}");
                     }
+                    ok_n += 1;
                 }
-                Ok(())
+                if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{total} 대상 중 {ok_n} 성공 · {} 실패 — {}",
+                        failures.len(),
+                        failures.join(" | ")
+                    ))
+                }
             })
             }
         }
@@ -1938,18 +1964,22 @@ fn run(command: Command) -> i32 {
                     .ok_or_else(|| format!("invalid surface ref: {surface}"))
                     .and_then(|sid| request("queue.request_clear", json!({"surface_id": sid})))
                     .map(|r| {
-                        if r["notified"].as_bool() == Some(true) {
+                        // `delivered` 가 정본, `notified` 는 구 데몬 호환 동의어.
+                        let ok = r["delivered"].as_bool().or_else(|| r["notified"].as_bool());
+                        if ok == Some(true) {
                             println!(
                                 "request sent → {} (depth {} · oldest {}s)",
                                 surface, r["depth"], r["oldest_age_secs"]
                             );
                         } else {
-                            // 미도달은 실패가 아니다 — 재통지 의미론(쿨다운 후 자동 재시도)이 있다.
+                            // ★A4: 미도달은 실패가 아니지만 **자동 재통지도 없다** — 사유와
+                            // 재발행 가능 시점을 그대로 보여준다(종전 문언은 없는 재시도를 약속했다).
                             println!(
-                                "request not injected (depth {} · oldest {}s): {}",
+                                "request not injected (depth {} · oldest {}s · 사유={}): {}",
                                 r["depth"],
                                 r["oldest_age_secs"],
-                                r["hint"].as_str().unwrap_or("게이트 미통과")
+                                r["reason"].as_str().unwrap_or("unknown"),
+                                r["hint"].as_str().unwrap_or("게이트 미통과 — 직접 재발행하라")
                             );
                         }
                         0
