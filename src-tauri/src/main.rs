@@ -2755,13 +2755,165 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// `cys boot` 기계판독 요약 줄의 파싱 결과(결함 A 수리 · 2026-07-25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootMachineSummary {
+    /// 판정에는 쓰지 않는다(신규 기동 0 = 전원 가동 중인 정상 no-op boot일 수 있다 — 이 값을
+    /// 판정에 넣은 것이 원 오탐이었다). 계약 완결성·디버깅·회귀 핀용으로만 파싱한다.
+    #[allow(dead_code)]
+    launched: u32,
+    failed: u32,
+    /// 의무 4종(cso·worker·reviewer-gemini·reviewer-codex)이 CLI 미발견으로 skip된 수.
+    /// 선택 노드 grok의 미설치는 여기에 **포함되지 않는다** — 이것이 오탐 제거의 핵심.
+    mandatory_missing: u32,
+}
+
+/// `boot-machine: launched=N failed=N mandatory_missing=N` 줄 파싱(순수 함수).
+/// ★계약(단일 진실): 이 형식의 **생성자**는 `src/bin/cys.rs::boot_machine_line()` — 형식 변경은
+/// 반드시 양쪽 동시 수정. 줄이 없으면(=구 cys 사이드카와의 버전 스큐) None → 호출자가 구
+/// 휴리스틱으로 폴백한다. 알 수 없는 키는 무시(전방 호환), 세 키가 다 모여야 Some.
+/// 마지막 매칭 줄을 채택 — 재실행 로그가 앞에 섞여도 최신 요약이 이긴다.
+fn parse_boot_machine_line(stdout: &str) -> Option<BootMachineSummary> {
+    let body = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("boot-machine:"))?;
+    let (mut launched, mut failed, mut mandatory_missing) = (None, None, None);
+    for tok in body.split_whitespace() {
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
+        let Ok(n) = v.parse::<u32>() else { continue };
+        match k {
+            "launched" => launched = Some(n),
+            "failed" => failed = Some(n),
+            "mandatory_missing" => mandatory_missing = Some(n),
+            _ => {}
+        }
+    }
+    Some(BootMachineSummary {
+        launched: launched?,
+        failed: failed?,
+        mandatory_missing: mandatory_missing?,
+    })
+}
+
+/// 의무 노드 CLI 부재 안내(자가 진단 가능한 구체 원인).
+const BOOT_WARN_MISSING_CLI: &str = "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다.";
+/// 원인 중립 안내 — 기동 실패·비정상 종료는 CLI 미설치라 단정할 수 없다(오진 문구 금지).
+const BOOT_WARN_PARTIAL: &str = "팀 일부 노드 기동에 실패했습니다 — `cys list`로 현황을 확인하세요. 팀 없이도 마스터 단독 사용은 가능합니다.";
+
+/// `cys boot` 결과 → 경고 배너 문구(Some) 또는 무경고(None). 순수 함수 — 회귀 핀.
+///
+/// ★결함 A 수리(2026-07-25): 종전 판정은 사람용 요약 줄의 문자열 힌트("신규 기동 0" ∧ "미설치")
+/// 였는데, 팀 5노드가 전부 살아 있어도 **선택 노드 grok의 "미설치" 한 줄** 때문에 조건이 참이 돼
+/// 오탐 배너가 떴다(게다가 문구는 "claude CLI 확인"으로 오진). 이제 cys가 찍는 기계 줄의
+/// `mandatory_missing`(의무 4종만 셈)으로 판정한다.
+/// 기계 줄이 없으면(구 사이드카) 구 휴리스틱을 그대로 폴백 — 배너 자체가 사라지지는 않게.
+fn boot_warning_message(stdout: &str, exit_ok: bool) -> Option<&'static str> {
+    match parse_boot_machine_line(stdout) {
+        Some(m) => {
+            if m.mandatory_missing > 0 {
+                Some(BOOT_WARN_MISSING_CLI)
+            } else if !exit_ok || m.failed > 0 {
+                Some(BOOT_WARN_PARTIAL)
+            } else {
+                None
+            }
+        }
+        None => {
+            let launched_zero = stdout.contains("신규 기동 0");
+            let has_missing = stdout.contains("미설치");
+            if !exit_ok || (launched_zero && has_missing) {
+                Some(BOOT_WARN_MISSING_CLI)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// ★결함 B 수리(2026-07-25): 배너 **소멸 신호**의 canonical 발행자를 버튼 레인에도 배선한다.
+/// 배경: boot-warning 배너의 유일한 소멸 신호는 feed `formation-complete`(ui/src/bootbanner.ts
+/// W3/T3)인데, 그 발행자 `javis_formation.py ensure`는 훅 레인(javis_bootstrap.py)과 부서 생성
+/// 레인(cys-dept `_fire_formation`)에만 배선돼 있었다. 버튼 경로(spawn_orchestra_boot)에는
+/// formation 호출이 0줄이라 한 번 뜬 배너가 팀이 정상화돼도 영영 사라지지 않았다
+/// (라이브 증거 2026-07-25: ~/.cys/state/formation/ 빈 디렉토리 · feed.jsonl formation-* 0건).
+///
+/// 소켓 규약 — **javis_bootstrap.py `_run_formation_ensure` 와 바이트 동일 규약**:
+///   본부(None) = `--socket` 인자 없음 + CYS_SOCKET 제거 / 부서(Some) = `--socket <소켓경로>` + env.
+/// ⚠`resolve_socket()`이 만드는 기본 소켓 **경로**를 본부에서 넘기면 안 된다 —
+/// javis_formation.py `_sanitize_key()`가 None→"base", 경로→"_Users_..._cys.sock"로 다른 키를
+/// 만들어 상태 파일과 **싱글플라이트 락 키가 레인마다 갈라진다**(훅 레인과 동시 실행 시 상호배제
+/// 소멸 = 중복 스폰). 인자 형식은 소켓 **경로**가 맞다(usage `ensure --socket <S>`, cys-dept가
+/// 부서 소켓 경로를 그대로 전달) — 본부만 "인자 생략"이 규약이다.
+/// 배너 스코프(sock_slug)는 formation feed를 중계하는 데몬이 결정하므로 이 인자와 무관하다.
+///
+/// 전부 best-effort — 팩 부재·실행 실패·타임아웃 어느 것도 배너 로직이나 부트 결과를 바꾸지 않는다.
+fn fire_formation_ensure(socket: &Option<String>) {
+    let script = cys::pack::pack_dir()
+        .join("bin")
+        .join("javis_formation.py");
+    if !script.exists() {
+        return; // 팩 미설치/미시드 = 구동작 보존(무해 skip · cys-dept _fire_formation 과 동일)
+    }
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(python3.exe) PATH 주입
+    match socket {
+        Some(s) => {
+            cmd.env("CYS_SOCKET", s);
+            cmd.arg(&script).arg("ensure").arg("--socket").arg(s);
+        }
+        None => {
+            cmd.env_remove("CYS_SOCKET");
+            cmd.arg(&script).arg("ensure");
+        }
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    // 상한 감시(cys.rs 헤드리스 호출과 동일한 try_wait 폴링 패턴) — ensure 내부 _boot_node 는
+    // 노드당 200s 를 쓸 수 있어 무한 대기가 가능하다. 이 스레드는 boot 이후의 꼬리라 UI 를 막지
+    // 않지만, 좀비 python 이 남지 않도록 60s 에서 kill 한다(다음 boot 가 멱등하게 재시도한다).
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[formation] ensure 기동 실패(무해 skip): {e}");
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // zombie 수거
+                    eprintln!("[formation] ensure 60초 타임아웃 — 종료(다음 boot 가 멱등 재시도)");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!("[formation] ensure 대기 실패(무해 skip): {e}");
+                break;
+            }
+        }
+    }
+}
+
 /// ★절대규칙(오너 2026-07-15): 모든 마스터(본부·부서장)는 CSO·워커·리뷰어2 팀을 반드시 갖는다.
 /// 종전에는 이 팀 스폰이 마스터 LLM의 `cys boot`(디렉티브 §0 ④) 실행에 의존했는데, dept-master가
 /// "부서장 스코프=단독 대기"를 **환각**해 boot를 건너뛰는 치명 실사고가 발생했다(2026-07-15). 산문
 /// 의존을 제거하고 버튼 경로에서 `cys boot`를 코드 결정론으로 강제한다 — cys boot는 이미 가동 중인
 /// 역할을 건너뛰고(멱등·boot 락으로 동시 boot 직렬화) 마스터가 나중에 스스로 boot해도 중복 없음.
 /// ★관측성(적대검증 D-8): 종전 `let _ = status()`는 실패를 삼켜 claude 미설치 등으로 팀이 0개여도
-/// 사용자가 몰랐다(원 증상 재현·더 나쁨). exit≠0이거나 신규 기동 0이면 boot-warning 이벤트로 승격.
+/// 사용자가 몰랐다(원 증상 재현·더 나쁨). 진짜 결손이면 boot-warning 이벤트로 승격한다 — 승격
+/// 판정은 `boot_warning_message()`(기계 줄 기반)이며, 종전의 "신규 기동 0" 휴리스틱은 구 사이드카
+/// 폴백으로만 남았다(결함 A 2026-07-25). 배너의 **소멸** 신호는 이어지는 `fire_formation_ensure()`
+/// 가 만든다(결함 B — 버튼 레인에 formation 발행자가 없어 배너가 영구 잔류했다).
 /// fire-and-forget(최대 300s라 UI 무블록). socket=Some이면 그 부서 소켓 대상, None이면 본부.
 fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
     let cys = resolve_sidecar("cys");
@@ -2787,13 +2939,12 @@ fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
         match cmd.output() {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                // "boot 완료: 신규 기동 0" + "미설치" 힌트 = 팀이 안 떴다(claude 미설치 등) → 경고.
-                let launched_zero = stdout.contains("신규 기동 0");
-                let has_missing = stdout.contains("미설치");
-                if !o.status.success() || (launched_zero && has_missing) {
+                // 판정은 기계 줄(boot-machine:) 기반 — 사람용 문구 휴리스틱은 폴백으로만 남는다.
+                // (구 판정은 선택 노드 grok 의 "미설치" 한 줄에 오탐했다 — boot_warning_message 주석.)
+                if let Some(message) = boot_warning_message(&stdout, o.status.success()) {
                     let _ = app.emit(
                         "boot-warning",
-                        json!({"slug": slug.clone(), "message": "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다."}),
+                        json!({"slug": slug.clone(), "message": message}),
                     );
                 }
             }
@@ -2804,6 +2955,10 @@ fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
                 );
             }
         }
+        // ★결함 B 수리: 경고 여부·boot 성패와 **무관하게** 편성 상태 발행자를 돌린다 — 이 호출이
+        // 배너의 유일한 소멸 신호(feed formation-complete)를 만든다. boot 가 no-op(전원 가동)이어도
+        // 반드시 필요하다: 이전에 뜬 배너를 걷어내는 건 boot 결과가 아니라 formation 상태다.
+        fire_formation_ensure(&socket);
     });
 }
 
@@ -3808,6 +3963,67 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★불변식 박제(결함 A 수리 2026-07-25) ①: 기계 줄 정상 파싱 — 생성자는
+    /// src/bin/cys.rs::boot_machine_line(). 이 리터럴이 그쪽 테스트와 **글자 그대로** 같아야 한다.
+    #[test]
+    fn boot_machine_line_parses_cys_contract_format() {
+        let out = "cys boot — LLM orchestrating 편성 점검\n\
+                   boot-machine: launched=3 failed=1 mandatory_missing=2\n\
+                   boot 완료: 신규 기동 3 · 실패 1 · 현황은 `cys list`로 확인 (role 열)\n";
+        assert_eq!(
+            parse_boot_machine_line(out),
+            Some(BootMachineSummary {
+                launched: 3,
+                failed: 1,
+                mandatory_missing: 2
+            })
+        );
+    }
+
+    /// ②오탐 케이스 박제 — 원 결함의 실측 stdout(2026-07-25): 팀 5노드 전원 가동이라 신규 기동 0,
+    /// 선택 노드 grok 만 "미설치". 구 휴리스틱은 여기서 경고를 띄웠다(오탐). 이제 무경고여야 한다.
+    #[test]
+    fn boot_warning_silent_when_only_optional_grok_missing() {
+        let out = "· claude: 역할 'cso' 이미 가동 중 — 건너뜀\n\
+                   · claude: 역할 'worker' 이미 가동 중 — 건너뜀\n\
+                   · gemini: 역할 'reviewer-gemini' 이미 가동 중 — 건너뜀\n\
+                   · codex: 역할 'reviewer-codex' 이미 가동 중 — 건너뜀\n\
+                   · grok: CLI 'grok' 미설치 — 건너뜀 (선택 노드 — 미설치면 건너뜀이 정상)\n\
+                   boot-machine: launched=0 failed=0 mandatory_missing=0\n\
+                   boot 완료: 신규 기동 0 · 실패 0 · 현황은 `cys list`로 확인 (role 열)\n";
+        assert_eq!(boot_warning_message(out, true), None);
+        // 구 휴리스틱이 참이 되는 입력임을 함께 박제(회귀 시 이 줄이 먼저 깨진다).
+        assert!(out.contains("신규 기동 0") && out.contains("미설치"));
+    }
+
+    /// ③진성 결손 — 의무 4종이 claude 미설치로 빠지면 경고 + CLI 설치 안내(원인 구체).
+    /// 반대로 failed>0·exit≠0 은 원인 중립 문구여야 한다(claude 미설치라 단정하면 오진).
+    #[test]
+    fn boot_warning_distinguishes_missing_cli_from_launch_failure() {
+        let missing = "boot-machine: launched=0 failed=0 mandatory_missing=2\n";
+        assert_eq!(boot_warning_message(missing, true), Some(BOOT_WARN_MISSING_CLI));
+        let failed = "boot-machine: launched=1 failed=2 mandatory_missing=0\n";
+        assert_eq!(boot_warning_message(failed, true), Some(BOOT_WARN_PARTIAL));
+        // exit≠0 인데 기계 줄은 깨끗한 경우(락 경합 후 비정상 종료 등)도 중립 경고.
+        let clean = "boot-machine: launched=0 failed=0 mandatory_missing=0\n";
+        assert_eq!(boot_warning_message(clean, false), Some(BOOT_WARN_PARTIAL));
+    }
+
+    /// ④기계 줄 부재(구 cys 사이드카 버전 스큐) → None → 구 휴리스틱 폴백이 살아 있어야 한다.
+    /// 스큐 상태에서 배너가 통째로 사라지면 C6(침묵 금지) 위반이라 폴백은 의도적으로 남긴다.
+    #[test]
+    fn boot_machine_line_absent_falls_back_to_legacy_heuristic() {
+        let legacy = "· claude: CLI 'claude' 미설치 — 건너뜀 (설치: …)\n\
+                      boot 완료: 신규 기동 0 · 실패 0 · 현황은 `cys list`로 확인 (role 열)\n";
+        assert_eq!(parse_boot_machine_line(legacy), None);
+        assert_eq!(boot_warning_message(legacy, true), Some(BOOT_WARN_MISSING_CLI));
+        // 정상 구버전 출력(미설치 없음)은 폴백에서도 무경고.
+        let legacy_ok = "boot 완료: 신규 기동 4 · 실패 0 · 현황은 `cys list`로 확인 (role 열)\n";
+        assert_eq!(boot_warning_message(legacy_ok, true), None);
+        // 손상된 기계 줄(키 결손)도 None → 폴백(전방호환: 모르는 키만 있으면 무시).
+        assert_eq!(parse_boot_machine_line("boot-machine: launched=1\n"), None);
+    }
 
     #[test]
     fn tauri_browser_deadline_outlives_cysd_worker_deadline() {

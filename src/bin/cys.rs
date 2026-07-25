@@ -4087,6 +4087,26 @@ fn acquire_boot_lock() -> BootLock {
     }
 }
 
+/// boot 기계판독 요약 줄의 접두 — GUI 파서와 공유하는 상수(오타 방어).
+const BOOT_MACHINE_PREFIX: &str = "boot-machine:";
+
+/// ★boot 판정 계약(결함 A 수리 2026-07-25): 사람용 요약 줄("boot 완료: 신규 기동 …")은 팀 상태를
+/// 판정할 수 없다 — 선택 노드 grok이 미설치면 팀 5노드가 전부 살아 있어도 "신규 기동 0"+"미설치"가
+/// 동시에 찍혀 GUI 휴리스틱이 오탐 배너를 띄웠다. 판정용 기계 줄을 별도로 1줄 찍는다.
+/// **형식 단일 진실** — 소비자는 `src-tauri/src/main.rs::parse_boot_machine_line()`.
+/// 형식 변경 시 양쪽을 같은 커밋에서 고쳐야 한다(키 추가는 소비자가 무시하므로 하위호환).
+/// 순수 함수 — 회귀 핀.
+fn boot_machine_line(launched: u32, failed: u32, mandatory_missing: u32) -> String {
+    format!("{BOOT_MACHINE_PREFIX} launched={launched} failed={failed} mandatory_missing={mandatory_missing}")
+}
+
+/// 의무 편성 역할 = PLAN 5종 중 grok(reviewer-grok)을 뺀 4종. grok은 **선택 노드**라 미설치가
+/// 정상이며 팀 결손이 아니다 — `mandatory_missing` 카운트에서 제외하는 유일한 기준.
+/// 순수 함수 — 회귀 핀(PLAN과의 정합은 boot_plan_mandatory_matches_roster 테스트가 박제).
+fn is_mandatory_boot_role(role: &str) -> bool {
+    matches!(role, "cso" | "worker" | "reviewer-gemini" | "reviewer-codex")
+}
+
 fn run_boot(cwd: Option<String>) -> i32 {
     // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
     // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
@@ -4122,10 +4142,20 @@ fn run_boot(cwd: Option<String>) -> i32 {
         .filter(|s| !s["exited"].as_bool().unwrap_or(true))
         .filter_map(|s| s["role"].as_str().map(|x| x.to_string()))
         .collect();
-    let mut launched = 0;
-    let mut failed = 0;
+    let mut launched: u32 = 0;
+    let mut failed: u32 = 0;
+    // 의무 4종이 CLI 미발견으로 skip된 횟수 — 진짜 팀 결손 신호(선택 노드 grok은 세지 않는다).
+    let mut mandatory_missing: u32 = 0;
     println!("cys boot — LLM orchestrating 편성 점검 (CSO·worker·agy·codex 4종 의무 + grok 선택)");
     for (role, agent) in PLAN {
+        // ★검사 순서(결함 A 수리 2026-07-25): '이미 가동 중'을 CLI 존재 검사보다 **먼저** 본다.
+        // 이미 살아 있는 역할은 그 CLI 바이너리가 지워졌거나 PATH에서 사라져도 팀 결손이 아니다
+        // (프로세스는 이미 떠 있다) — 종전 순서는 이를 '미설치'로 세어 mandatory_missing을 부풀렸다.
+        // 부수 효과로 which/where 프로브도 생략돼 no-op boot가 빨라진다.
+        if live_roles.contains(*role) {
+            println!("· {agent}: 역할 '{role}' 이미 가동 중 — 건너뜀");
+            continue;
+        }
         let bin = agents
             .get(*agent)
             .and_then(|a| a["cmd"].as_str())
@@ -4168,11 +4198,10 @@ fn run_boot(cwd: Option<String>) -> i32 {
                 "gemini" => " (Antigravity CLI `agy` — 선택 리뷰어)",
                 _ => " (선택 노드 — 미설치면 건너뜀이 정상)",
             };
+            if is_mandatory_boot_role(*role) {
+                mandatory_missing += 1;
+            }
             println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀{hint}");
-            continue;
-        }
-        if live_roles.contains(*role) {
-            println!("· {agent}: 역할 '{role}' 이미 가동 중 — 건너뜀");
             continue;
         }
         println!("· {agent}: 기동 시작 (role={role})…");
@@ -4183,6 +4212,8 @@ fn run_boot(cwd: Option<String>) -> i32 {
             println!("· {agent}: 기동 실패 — 나머지 노드는 계속 진행");
         }
     }
+    // 기계 줄 먼저(GUI 판정용·형식 고정) → 사람용 요약 줄(문구 보존 — 기존 독자·문서 무회귀).
+    println!("{}", boot_machine_line(launched, failed, mandatory_missing));
     println!(
         "boot 완료: 신규 기동 {launched} · 실패 {failed} · 현황은 `cys list`로 확인 (role 열)"
     );
@@ -9854,6 +9885,38 @@ mod tests {
         assert!(worker2.contains("RSI-BODY-MARKER"), "worker-2(변형)에 RSI 미주입");
         assert!(!cso.contains("RSI-BODY-MARKER"), "cso에 RSI 오주입(대상 아님)");
         assert!(!reviewer.contains("RSI-BODY-MARKER"), "reviewer에 RSI 오주입(대상 아님)");
+    }
+
+    /// ★불변식 박제(결함 A 수리 2026-07-25): 기계판독 요약 줄의 **형식 계약**.
+    /// 소비자는 src-tauri/src/main.rs::parse_boot_machine_line() — 이 문자열이 바뀌면 GUI 배너
+    /// 판정이 조용히 구 휴리스틱으로 폴백(오탐 재발)하므로 형식을 테스트로 못 박는다.
+    #[test]
+    fn boot_machine_line_format_is_the_gui_contract() {
+        assert_eq!(
+            boot_machine_line(0, 0, 0),
+            "boot-machine: launched=0 failed=0 mandatory_missing=0"
+        );
+        assert_eq!(
+            boot_machine_line(3, 1, 2),
+            "boot-machine: launched=3 failed=1 mandatory_missing=2"
+        );
+        // 접두는 상수와 일치(파서가 접두로 줄을 찾는다).
+        assert!(boot_machine_line(0, 0, 0).starts_with(BOOT_MACHINE_PREFIX));
+    }
+
+    /// ★불변식 박제(결함 A 수리 2026-07-25): 의무 4종 ↔ 선택 grok 판정.
+    /// grok(reviewer-grok)이 의무로 잘못 분류되면 grok 미설치만으로 팀 정상인데도 경고가 뜬다
+    /// (원 오탐의 근본 원인). PLAN 로스터와 동기화 여부도 함께 박제한다.
+    #[test]
+    fn boot_plan_mandatory_matches_roster() {
+        for role in ["cso", "worker", "reviewer-gemini", "reviewer-codex"] {
+            assert!(is_mandatory_boot_role(role), "{role}은 의무 4종이어야 한다");
+        }
+        assert!(
+            !is_mandatory_boot_role("reviewer-grok"),
+            "grok은 선택 노드 — 미설치가 정상이므로 결손으로 세면 안 된다"
+        );
+        assert!(!is_mandatory_boot_role("master"), "master는 boot PLAN 대상이 아니다");
     }
 
     /// ★불변식 박제 (절대지침 앵커1-b): 탭 타이틀 = "{role}-{agent} · {워크플로우 폴더명}".
