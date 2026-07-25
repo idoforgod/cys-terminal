@@ -184,6 +184,23 @@ jobs:
               exit 1
             fi
           done
+          # ── v0.13.17 큐 역압 L2 팩 배선 게이트(C7) ──
+          # javis_push 이중 채널 보고 · dead-letter 전사 · wakeup drain 의 소프트캡 종결(fast-fail
+          # 비오염) · orchestra 티켓 보고채널 스냅샷. 전부 밀폐 unittest(데몬·cys 미호출)라 러너에서
+          # 결정론이며, 파리티 게이트와 동형으로 파일 존재도 단언한다(untracked 누락 = 초록 거짓말 차단).
+          # ★T9 혼잡 드릴(javis_queue_drill.py)은 여기 비편입 — 격리 cysd 기동이 필요해 러너에서 불안정할
+          #   수 있다. 로컬·릴리스 런북 체크리스트(수동 게이트)에서 돌린다.
+          echo "== 큐 역압 팩 4종 게이트 =="
+          for t in test_javis_push test_deadletter test_wakeup_drain test_orchestra_ticket_snapshot; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "큐 역압 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== queue-backpressure test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::큐 역압 팩 게이트 실패($t) — 응답 폭주 방어 배선 회귀. 릴리스 차단." >&2
+              echo "  보고채널 스냅샷 실패면 티켓 문안과 javis_orchestra 무결성 assertion 을 원자 동기하라." >&2
+              exit 1
+            fi
+          done
           # Rust auto-restore 단위(재시도 seam·env 주입·B1·B3) + pack 소유권(B2).
           # ★--skip hwmon:: — hwmon 테스트는 실 GPU 전제(gpu.cores>0 단언)라 가상 러너에서 환경 FAIL
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).

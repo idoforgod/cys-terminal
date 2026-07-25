@@ -136,6 +136,20 @@ jobs:
               exit 1
             fi
           done
+          # (3) v0.13.17 큐 역압 L2 팩 배선 4종(C7 — javis_push 이중 채널·dead-letter 전사·
+          #     wakeup drain 소프트캡 종결·orchestra 티켓 보고채널 스냅샷). 이 레인이 실제로 배포하는
+          #     것이 바로 이 팩 스크립트들이라, 여기서 막지 못하면 폭주 방어가 빠진 팩이 승격된다.
+          #     전부 밀폐 unittest(데몬·cys 미호출)이며 존재-단언도 파리티와 동형.
+          #     ★T9 혼잡 드릴(javis_queue_drill.py)은 비편입 — 격리 cysd 기동 필요(로컬·릴리스 런북 전용).
+          for t in test_javis_push test_deadletter test_wakeup_drain test_orchestra_ticket_snapshot; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "큐 역압 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== pack-queue-backpressure: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::큐 역압 팩 게이트 실패($t) — 응답 폭주 방어 배선 회귀. 팩 승격 차단." >&2
+              exit 1
+            fi
+          done
 
       # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
       # 오염시키는 회귀 차단(release.yml과 동일).

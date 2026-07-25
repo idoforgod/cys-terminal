@@ -83,6 +83,16 @@ jobs:
           done
           # bootstrap 체인(heal 프리플라이트 배선 포함) 회귀도 함께.
           CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_bootstrap_chain.py
+          # v0.13.17 큐 역압 L2 팩 배선 4종(C7 — javis_push 이중 채널·dead-letter 전사·wakeup drain
+          # 소프트캡 종결·orchestra 티켓 보고채널 스냅샷). 전부 밀폐 unittest(데몬·cys 미호출)라
+          # CI 러너에서 결정론이다. 파리티 목록과 동형으로 파일 존재도 게이트한다(초록 거짓말 차단).
+          # ★혼잡 드릴(javis_queue_drill.py)은 CI 비편입 — 격리 cysd 기동이 필요해 로컬·릴리스 게이트 전용.
+          for t in test_javis_push test_deadletter test_wakeup_drain test_orchestra_ticket_snapshot; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "큐 역압 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== queue-backpressure(mac): $t =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$f"
+          done
 
       - name: bash -n cys-dept (문법 게이트)
         shell: bash
@@ -136,6 +146,10 @@ jobs:
           CYS_PACK_DIR="$GITHUB_WORKSPACE/cysjavis-pack" \
             "$PY" cysjavis-pack/bin/javis_preflight.py --gate-c03
           # test_formation 8a~8c 가 Windows 에서 **msvcrt.locking** 락 경로를 실행(REVISE2 커버).
+          # ★v0.13.17 큐 역압 4종(test_javis_push·test_deadletter·test_wakeup_drain·
+          #   test_orchestra_ticket_snapshot)은 이 레인 **제외** — 밀폐 unittest 이긴 하나
+          #   javis_deadletter 의 회전 판별이 (st_dev, st_ino) 동일성에 의존해 Windows 파일시스템에서
+          #   미검증이다. macOS·ubuntu 레인이 이미 전건을 게이트하므로 커버리지 공백은 없다.
           for t in test_cli_probe test_formation test_parity_paths test_budget test_banner_truth; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "파리티 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
