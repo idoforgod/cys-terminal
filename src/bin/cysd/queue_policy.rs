@@ -252,6 +252,114 @@ pub enum EnqueueError {
     },
 }
 
+/// 적재 결과 — 신규 적재인지 기존 항목 교체(멱등 병합)인지.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Added(usize),
+    /// 동일 idem_key 항목을 제자리 교체했다(큐 길이 불변).
+    Merged(usize),
+}
+
+impl EnqueueOutcome {
+    pub fn depth(&self) -> usize {
+        match self {
+            EnqueueOutcome::Added(d) | EnqueueOutcome::Merged(d) => *d,
+        }
+    }
+    pub fn merged(&self) -> bool {
+        matches!(self, EnqueueOutcome::Merged(_))
+    }
+}
+
+/// C4 멱등 병합 + 적재. `idem_key`가 있고 대상 큐에 같은 키 항목이 있으면 **제자리 교체**한다.
+///
+/// 제자리 교체인 이유(D5): 키의 의미는 "이 주제의 최신 상태"다. 갱신할 때마다 뒤로 밀면
+/// 자주 갱신하는 주제일수록 배달이 늦어지는 역전이 생긴다.
+///
+/// 교체 항목은 **fresh seq**를 갖는다(Sim3-1): 배달 임계구역이 head를 복제한 직후 교체가
+/// 일어나도 `pop_delivered_head`의 seq 대조가 구/신 항목을 정확히 구분한다 — 구 항목은
+/// 배달 완료되고 신 항목은 pop되지 않아 다음 틱에 배달된다(소실·중복 pop 없음).
+///
+/// 밀려나는 구 텍스트는 dead-letter(`superseded`)에 남는다 — **병합조차 정보를 버리지 않는다**.
+/// 원장 기록에 실패하면 병합을 되돌려 구·신 항목을 **둘 다** 보존한다(무손실 우선).
+///
+/// 키가 없으면 어떤 병합·중복 억제도 하지 않는다: 동일 문자열 재전송은 정당한 패턴이다
+/// (PATH 수복 재시도·boot wake ×4). 억제는 발신자의 명시 선언이 있을 때만.
+pub fn enqueue_or_merge(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<Surface>,
+    item: QueueItem,
+) -> Result<EnqueueOutcome, EnqueueError> {
+    let Some(key) = item.idem_key.clone() else {
+        return enqueue_item(daemon, surface, item).map(EnqueueOutcome::Added);
+    };
+
+    // ── 임계영역: 같은 키 탐색 → 제자리 교체 ──
+    let replaced = {
+        let mut q = surface.pending_queue.lock().unwrap();
+        match q.iter().position(|i| i.idem_key.as_deref() == Some(key.as_str())) {
+            Some(idx) => {
+                let old = q[idx].clone();
+                let mut fresh = item.clone();
+                fresh.merged_count = old.merged_count + 1;
+                q[idx] = fresh;
+                Some((idx, old, q.len()))
+            }
+            None => None,
+        }
+    };
+
+    let Some((idx, old, depth)) = replaced else {
+        return enqueue_item(daemon, surface, item).map(EnqueueOutcome::Added);
+    };
+
+    let role = surface.role.lock().unwrap().clone();
+    match record_dead_letter(
+        daemon,
+        surface.id,
+        role.as_deref(),
+        &old,
+        DeadLetterReason::Superseded,
+    ) {
+        Ok(p) => {
+            if let Some(sid) = item.origin.sender_surface() {
+                bump_stats(daemon, sid, false, false);
+            }
+            daemon.bus.publish(
+                queue_events::MERGED,
+                queue_events::CATEGORY,
+                Some(surface.id),
+                json!({"idem_key": key, "depth": depth,
+                       "merged_count": old.merged_count + 1,
+                       "seq": item.seq, "superseded_seq": old.seq,
+                       "origin_class": item.origin.class(),
+                       "bytes": item.bytes(),
+                       "dead_letter": p.display().to_string()}),
+            );
+            daemon.persist_queue_state();
+            Ok(EnqueueOutcome::Merged(depth))
+        }
+        Err(_) => {
+            // 원장을 못 남겼다 = 구 텍스트를 버릴 수 없다. 병합을 되돌리고 구 항목을
+            // 제자리에 복원한 뒤, 신 항목은 별건으로 적재한다(둘 다 보존 — 무손실 우선).
+            {
+                let mut q = surface.pending_queue.lock().unwrap();
+                let pos = q
+                    .iter()
+                    .position(|i| i.seq == item.seq)
+                    .unwrap_or(idx.min(q.len()));
+                if q.get(pos).map(|i| i.seq) == Some(item.seq) {
+                    q[pos] = old;
+                } else {
+                    let at = pos.min(q.len());
+                    q.insert(at, old);
+                }
+            }
+            enqueue_item(daemon, surface, item).map(EnqueueOutcome::Added)
+        }
+    }
+}
+
 /// 항목 하나를 대상 큐에 적재한다. 정책 판정·통계·이벤트·WAL 영속을 한 곳에서 수행해
 /// 세 enqueue 경로가 서로 다른 규율을 갖는 일(오늘의 결함 원형)을 구조적으로 막는다.
 ///

@@ -1371,12 +1371,27 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             {
                 // ★C2: 종전 큐 경로는 `verified_from`(커널 검증 발신 surface)을 계산해놓고
                 // 폐기했다 — 정책은 자기신고 `from`이 아니라 이 값에서만 파생해야 한다(D2).
-                let item = crate::state::QueueItem::text(
+                let mut item = crate::state::QueueItem::text(
                     text.clone(),
                     crate::queue_policy::derive_origin(daemon, verified_from, human),
                 );
-                let depth = match crate::queue_policy::enqueue_item(daemon, &surface, item) {
-                    Ok(d) => d,
+                // ★C4 멱등 키: 있을 때만 병합한다. 없으면 어떤 중복 억제도 하지 않는다
+                // (동일 문자열 재전송은 정당한 패턴 — boot wake ×4·PATH 수복 재시도).
+                item.idem_key = param_str(&params, "idempotency_key").filter(|k| !k.is_empty());
+                // ★C4 --important(TTL 면제): authoritative 발신자 한정. role 일괄 면제를
+                // 철회한 자리를 메우는 **메시지 단위 의도 선언**이므로 권한을 좁게 건다.
+                if params.get("important").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if !authoritative_caller_ok(daemon, verified_from, caller_pid) {
+                        return Reply::Single(err_response(
+                            &id,
+                            "invalid_params",
+                            "important requires an authoritative sender (master/cso lineage)",
+                        ));
+                    }
+                    item.important = true;
+                }
+                let outcome = match crate::queue_policy::enqueue_or_merge(daemon, &surface, item) {
+                    Ok(o) => o,
                     Err(crate::queue_policy::EnqueueError::HardCap) => {
                         return Reply::Single(err_response(
                             &id,
@@ -1402,9 +1417,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 };
+                // `merged` 필드는 **항상** 싣는다(키 무관) — 신 CLI가 이 필드의 부재로
+                // 구 데몬 스큐를 결정론 판정한다(cys.rs 선례와 동일 방식).
                 return Reply::Single(ok_response(
                     &id,
-                    json!({"surface_id": sid, "queued": true, "depth": depth}),
+                    json!({"surface_id": sid, "queued": true, "depth": outcome.depth(),
+                           "merged": outcome.merged()}),
                 ));
             }
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
@@ -7832,6 +7850,262 @@ mod queue_policy_tests {
         assert_eq!(entries[0]["origin_class"], json!("agent"));
         assert_eq!(entries[0]["kind"], json!("text"));
         assert_eq!(entries[0]["preview"], json!("보고"), "preview 출력 계약 보존");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T4 (C4) — 멱등 병합: 제자리 교체 · fresh seq · superseded 원장 · merged_count ·
+//           무키=무병합 · send-key 키 미제공 · --important 권한
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_merge_tests {
+    use crate::queue_policy::{self, EnqueueOutcome};
+    use crate::state::{Daemon, QueueItem, QueueOrigin};
+    use cys::Request;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-qmerge-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    fn surface(d: &Arc<Daemon>, role: Option<&str>) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s
+    }
+
+    fn item(text: &str, key: Option<&str>) -> QueueItem {
+        let mut i = QueueItem::text(text.into(), QueueOrigin::system("t"));
+        i.idem_key = key.map(|k| k.to_string());
+        i
+    }
+
+    fn snapshot(s: &Arc<crate::state::Surface>) -> Vec<(String, u64, u32)> {
+        s.pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|i| (i.text.clone(), i.seq, i.merged_count))
+            .collect()
+    }
+
+    fn dead_letters(dir: &std::path::Path) -> Vec<Value> {
+        let p = crate::state::state_dir(&dir.join("cysd.sock")).join(queue_policy::DEAD_LETTER_FILE);
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("유효 JSON"))
+            .collect()
+    }
+
+    /// 제자리 교체(D5): 키의 의미는 "이 주제의 최신 상태"다 — 갱신할 때마다 뒤로 밀면
+    /// 자주 갱신하는 주제일수록 배달이 늦어지는 역전이 생긴다. 위치는 유지되고
+    /// **seq는 새로 발급**되며(Sim3-1 배달 경쟁 정합) merged_count가 누적된다.
+    #[test]
+    fn merge_replaces_in_place_with_fresh_seq() {
+        let (d, dir) = daemon("in-place");
+        let s = surface(&d, Some("master"));
+        assert!(queue_policy::enqueue_or_merge(&d, &s, item("첫째", None)).is_ok());
+        assert!(queue_policy::enqueue_or_merge(&d, &s, item("상태 v1", Some("k"))).is_ok());
+        assert!(queue_policy::enqueue_or_merge(&d, &s, item("셋째", None)).is_ok());
+        let before = snapshot(&s);
+        let old_seq = before[1].1;
+
+        let out = queue_policy::enqueue_or_merge(&d, &s, item("상태 v2", Some("k"))).unwrap();
+        assert_eq!(out, EnqueueOutcome::Merged(3), "큐 길이가 늘면 병합이 아니다");
+
+        let after = snapshot(&s);
+        assert_eq!(
+            after.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(),
+            vec!["첫째".to_string(), "상태 v2".to_string(), "셋째".to_string()],
+            "교체는 제자리에서 — 순번이 뒤로 밀리면 안 된다"
+        );
+        assert_ne!(after[1].1, old_seq, "교체 항목은 fresh seq를 받아야 한다");
+        assert_eq!(after[1].2, 1, "merged_count 누적");
+
+        // 한 번 더 병합 → merged_count 2.
+        queue_policy::enqueue_or_merge(&d, &s, item("상태 v3", Some("k"))).unwrap();
+        assert_eq!(snapshot(&s)[1].2, 2);
+
+        // 밀려난 구 텍스트는 전부 원장에 남는다 — 병합조차 정보를 버리지 않는다.
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 2);
+        assert_eq!(dl[0]["text"], json!("상태 v1"));
+        assert_eq!(dl[0]["reason"], json!("superseded"));
+        assert_eq!(dl[1]["text"], json!("상태 v2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 무키 = 무병합. 동일 문자열 재전송은 정당한 패턴이다(boot wake ×4·PATH 수복 재시도) —
+    /// 억제는 발신자의 명시 선언(키)이 있을 때만 한다.
+    #[test]
+    fn keyless_sends_never_merge_even_when_identical() {
+        let (d, dir) = daemon("keyless");
+        let s = surface(&d, Some("master"));
+        for _ in 0..4 {
+            queue_policy::enqueue_or_merge(&d, &s, item("동일한 각성 명령", None)).unwrap();
+        }
+        assert_eq!(snapshot(&s).len(), 4, "무키 동일 문자열 4건은 4건으로 남아야 한다");
+        assert!(dead_letters(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 다른 키끼리는 서로 병합하지 않는다(키 공간 격리).
+    #[test]
+    fn distinct_keys_do_not_merge() {
+        let (d, dir) = daemon("distinct");
+        let s = surface(&d, Some("master"));
+        queue_policy::enqueue_or_merge(&d, &s, item("a1", Some("ka"))).unwrap();
+        queue_policy::enqueue_or_merge(&d, &s, item("b1", Some("kb"))).unwrap();
+        let out = queue_policy::enqueue_or_merge(&d, &s, item("a2", Some("ka"))).unwrap();
+        assert!(out.merged());
+        assert_eq!(
+            snapshot(&s).iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(),
+            vec!["a2".to_string(), "b1".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 원장 기록 실패 시에는 병합을 되돌려 **구·신 항목을 둘 다** 보존한다.
+    /// 병합이 무음 삭제가 되는 경로를 차단한다(무손실 우선 fail-open).
+    #[test]
+    fn merge_falls_back_to_append_when_dead_letter_fails() {
+        let (d, dir) = daemon("dl-fail");
+        let s = surface(&d, Some("master"));
+        queue_policy::enqueue_or_merge(&d, &s, item("구 텍스트", Some("k"))).unwrap();
+
+        // 원장 경로에 디렉터리를 만들어 append open을 실패시킨다.
+        let sdir = crate::state::state_dir(&dir.join("cysd.sock"));
+        std::fs::create_dir_all(sdir.join(queue_policy::DEAD_LETTER_FILE)).unwrap();
+
+        let out = queue_policy::enqueue_or_merge(&d, &s, item("신 텍스트", Some("k"))).unwrap();
+        assert!(!out.merged(), "원장을 못 남겼으면 병합했다고 보고하면 안 된다");
+        assert_eq!(
+            snapshot(&s).iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>(),
+            vec!["구 텍스트".to_string(), "신 텍스트".to_string()],
+            "구 텍스트가 사라지면 병합이 무음 삭제가 된다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── RPC 층: --important 권한 · merged 응답 필드 · send-key 미제공 ──
+
+    fn send(d: &Arc<Daemon>, sid: u64, params: Value, pid: Option<u32>) -> Value {
+        let req = Request { id: json!(1), method: "surface.send_text".into(), params };
+        let crate::handlers::Reply::Single(r) = crate::handlers::dispatch(d, req, pid) else {
+            panic!("expected single reply");
+        };
+        let _ = sid;
+        r
+    }
+
+    /// `--important`(TTL 면제)는 authoritative 발신자(master/cso 계열) 한정이다.
+    /// role 일괄 면제를 철회한 자리를 메우는 **의도 선언**이므로 권한을 좁게 건다 —
+    /// 아무나 선언할 수 있으면 사고 주범 트래픽이 그대로 무기한화된다(Sim1-1).
+    #[test]
+    fn important_flag_requires_authoritative_sender() {
+        let (d, dir) = daemon("important");
+        let target = surface(&d, Some("worker-1"));
+        let worker = surface(&d, Some("worker-2"));
+        let master = surface(&d, Some("master"));
+        let wpid = 995_101_u32;
+        let mpid = 995_102_u32;
+        for (pid, s) in [(wpid, &worker), (mpid, &master)] {
+            d.caller_cache
+                .lock()
+                .unwrap()
+                .insert(pid, (Some(s.id), crate::state::now_epoch(), None));
+        }
+
+        let denied = send(
+            &d,
+            target.id,
+            json!({"surface_id": target.id, "text": "x", "queued": true, "important": true}),
+            Some(wpid),
+        );
+        assert_eq!(denied["error"]["code"], json!("invalid_params"), "응답: {denied}");
+        assert!(target.pending_queue.lock().unwrap().is_empty(), "거부됐는데 적재됐다");
+
+        let ok = send(
+            &d,
+            target.id,
+            json!({"surface_id": target.id, "text": "지휘 ACTION", "queued": true, "important": true}),
+            Some(mpid),
+        );
+        assert_eq!(ok["result"]["queued"], json!(true), "응답: {ok}");
+        assert!(
+            target.pending_queue.lock().unwrap()[0].important,
+            "master 발신의 important 선언은 항목에 실려야 TTL 면제가 성립한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 응답의 `merged` 필드는 키 유무와 무관하게 **항상** 실린다 — 신 CLI가 이 필드의
+    /// 부재로 구 데몬 스큐를 결정론 판정하기 때문이다(병합을 오표시하지 않기 위함).
+    #[test]
+    fn queued_response_always_carries_merged_field() {
+        let (d, dir) = daemon("merged-field");
+        let target = surface(&d, Some("master"));
+
+        let first = send(
+            &d, target.id,
+            json!({"surface_id": target.id, "text": "v1", "queued": true, "idempotency_key": "k"}),
+            None,
+        );
+        assert_eq!(first["result"]["merged"], json!(false), "첫 적재는 병합이 아니다");
+        let second = send(
+            &d, target.id,
+            json!({"surface_id": target.id, "text": "v2", "queued": true, "idempotency_key": "k"}),
+            None,
+        );
+        assert_eq!(second["result"]["merged"], json!(true));
+        assert_eq!(second["result"]["depth"], json!(1), "병합은 depth를 늘리지 않는다");
+
+        let nokey = send(
+            &d, target.id,
+            json!({"surface_id": target.id, "text": "v3", "queued": true}),
+            None,
+        );
+        assert_eq!(nokey["result"]["merged"], json!(false));
+        assert_eq!(nokey["result"]["depth"], json!(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// send_key 큐잉에는 멱등 키를 주지 않는다 — Return은 "주제의 최신 상태"가 아니라
+    /// 제출 동작이고, 연속 Return을 병합하면 제출 횟수가 조용히 줄어든다.
+    /// 데몬은 idempotency_key 파라미터를 받아도 무시해야 한다(CLI에는 플래그 자체가 없다).
+    #[test]
+    fn send_key_queue_ignores_idempotency_key() {
+        let (d, dir) = daemon("sendkey");
+        let target = surface(&d, Some("master"));
+        for _ in 0..3 {
+            let req = Request {
+                id: json!(1),
+                method: "surface.send_key".into(),
+                params: json!({"surface_id": target.id, "key": "Return", "queued": true,
+                               "idempotency_key": "k"}),
+            };
+            let crate::handlers::Reply::Single(r) = crate::handlers::dispatch(&d, req, None) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(r["result"]["queued"], json!(true), "응답: {r}");
+        }
+        let q = target.pending_queue.lock().unwrap();
+        assert_eq!(q.len(), 3, "Return 3건이 병합돼 줄어들면 제출이 유실된다");
+        assert!(q.iter().all(|i| i.idem_key.is_none()), "send_key 항목에 키가 실리면 안 된다");
+        drop(q);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

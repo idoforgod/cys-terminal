@@ -67,6 +67,15 @@ enum Command {
         /// 입력 버퍼 선정리(Ctrl-U) — launch-agent 등록 에이전트 pane 한정 (TUI별 의미 상이)
         #[arg(long)]
         clear_first: bool,
+        /// 멱등 키(--queued 전용): 같은 (대상, 키) 대기 메시지를 제자리 교체한다.
+        /// "이 주제의 최신 상태"를 보낼 때만 쓴다 — 키가 없으면 어떤 중복 억제도 하지 않는다
+        /// (동일 문자열 재전송은 정당한 패턴이다). 밀려난 구 텍스트는 dead-letter에 남는다.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+        /// TTL 면제 선언(--queued 전용) — master/cso 계열 발신자만 허용.
+        /// 지휘 ACTION처럼 시간으로 사라지면 안 되는 메시지에만 쓴다(남용 = 무한 적체).
+        #[arg(long)]
+        important: bool,
         /// Text to inject (multiple args are joined with spaces)
         #[arg(required = true)]
         text: Vec<String>,
@@ -1454,6 +1463,13 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     }
 }
 
+/// 버전 스큐 경고는 실행당 1회만 낸다 — 다중 대상(--to 글롭) 루프에서 같은 경고가
+/// 대상 수만큼 반복되면 정작 읽어야 할 결과가 스크롤로 밀려난다.
+fn warn_skew_once(msg: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("{msg}"));
+}
+
 // ---------- commands ----------
 
 fn run(command: Command) -> i32 {
@@ -1550,7 +1566,12 @@ fn run(command: Command) -> i32 {
             }
         }),
 
-        Command::Send { surface, to, queued, clear_first, text } => {
+        Command::Send { surface, to, queued, clear_first, idempotency_key, important, text } => {
+            // 큐 전용 플래그를 직접 전송에 붙이면 조용히 무시된다 — 의도 오해를 즉시 끊는다.
+            if !queued && (idempotency_key.is_some() || important) {
+                Err("--idempotency-key/--important는 --queued 전용이다 (직접 전송은 대기열이 없다)"
+                    .to_string())
+            } else {
             resolve_targets(&surface, &to).and_then(|sids| {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 let multi = sids.len() > 1;
@@ -1560,17 +1581,29 @@ fn run(command: Command) -> i32 {
                     // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
                     let r = request(
                         "surface.send_text",
-                        json!({"surface_id": sid, "text": text.join(" "), "from": from, "queued": queued, "clear_first": clear_first}),
+                        json!({"surface_id": sid, "text": text.join(" "), "from": from,
+                               "queued": queued, "clear_first": clear_first,
+                               "idempotency_key": idempotency_key, "important": important}),
                     )?;
                     let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     if queued {
-                        println!("QUEUED (depth {}){tag}", r["depth"]);
+                        // ★C4 스큐 감지: 키를 보냈는데 응답에 merged가 없으면 구 데몬이다 —
+                        // 병합이 일어난 것처럼 오표시하지 않고 결정론 경고를 낸다(send-key 선례).
+                        if idempotency_key.is_some() && r["merged"].as_bool().is_none() {
+                            warn_skew_once(
+                                "[send] 경고: 데몬이 --idempotency-key를 지원하지 않아 \
+                                 병합 없이 적재됐다(구버전 cysd — 재기동으로 갱신하라)",
+                            );
+                        }
+                        let merged = if r["merged"].as_bool() == Some(true) { " MERGED" } else { "" };
+                        println!("QUEUED (depth {}){merged}{tag}", r["depth"]);
                     } else {
                         println!("OK{tag}");
                     }
                 }
                 Ok(())
             })
+            }
         }
 
         Command::SendKey { surface, to, queued, keys } => {
