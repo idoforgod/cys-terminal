@@ -269,14 +269,43 @@ def awaken_message(role):
     )
 
 
+def important_unsupported(err):
+    """`--important` 가 **플래그 자체 때문에** 거부됐는가(구 CLI/구 데몬·권한 미충족).
+    참이면 플래그 없이 1회 재시도한다(각성 주입은 TTL 면제가 '있으면 좋은' 것이지 전제가 아니다).
+    거부 사유가 --important 와 무관하면 False → 기존 재시도 루프가 그대로 처리."""
+    e = (err or "").lower()
+    if "important" not in e:
+        return False
+    return any(tok in e for tok in (
+        "unexpected argument", "unrecognized", "unknown", "invalid",
+        "found argument", "requires an authoritative sender", "authoritative",
+    ))
+
+
 def inject(role, msg, attempts=4):
     """★`cys send --queued` 단일경로(codex R2 결함4): 큐는 대상이 조용해질 때 메시지+자동 Return 을
     원자적으로 배달한다 → typing_guard 우회(F1)·Return 분리 실패로 인한 중복 입력 위험 제거.
-    (idle-then-inject 로 이미 안착했으므로 큐는 즉시 배달된다.)"""
+    (idle-then-inject 로 이미 안착했으므로 큐는 즉시 배달된다.)
+
+    ★C7/W6(DESIGN §2.3): 각성 디렉티브는 **TTL 로 사라지면 안 되는 지휘 메시지**다 →
+    `--important`(TTL 면제)로 승격한다. 채널은 그대로 `--queued` 단일경로다(플래그만 승격).
+    발신은 master pane 이라 authoritative 권한을 충족한다. 구 데몬/구 CLI 는 이 플래그를
+    모르므로, 플래그 때문에 거부되면 플래그 없이 1회 폴백한다(하위호환)."""
+    errq = ""
+    use_important = True
     for i in range(attempts):
-        rcq, _, errq = run(["cys", "send", "--queued", "--to", role, msg], timeout=12)
+        cmd = ["cys", "send", "--queued"] + (["--important"] if use_important else []) + \
+              ["--to", role, msg]
+        rcq, _, errq = run(cmd, timeout=12)
         if rcq == 0:
-            return True, "주입 큐 등록(자동 Return 배달·시도 %d)" % (i + 1)
+            return True, "주입 큐 등록(자동 Return 배달·시도 %d%s)" % (
+                i + 1, "" if use_important else "·--important 미지원 폴백")
+        if use_important and important_unsupported(errq):
+            # 구 데몬/권한 미충족 — 플래그를 내리고 같은 시도 안에서 1회 재전송
+            use_important = False
+            rcq, _, errq = run(["cys", "send", "--queued", "--to", role, msg], timeout=12)
+            if rcq == 0:
+                return True, "주입 큐 등록(자동 Return 배달·시도 %d·--important 미지원 폴백)" % (i + 1)
         time.sleep(2)
     return False, "주입 실패(%d회·큐 등록 실패: %s)" % (attempts, (errq or "").strip()[:80])
 
@@ -365,12 +394,24 @@ def self_test():
     chk(post_inject_ack(edge, "cso", elapsed=0) is False, "age=1,elapsed=0 경계를 ack 오인정(+마진 잔존)")
     chk(post_inject_ack(edge, "cso", elapsed=1) is False, "age=1,elapsed=1(동일) ack 오인정(엄격 < 위반)")
 
+    # ★W6: --important 폴백 판정(구 CLI/구 데몬·권한) — 무관한 실패에는 폴백하지 않는다
+    chk(important_unsupported("error: unexpected argument '--important' found") is True,
+        "구 CLI unexpected argument 미탐지")
+    chk(important_unsupported("unrecognized option --important") is True,
+        "구 CLI unrecognized 미탐지")
+    chk(important_unsupported("important requires an authoritative sender (master/cso lineage)") is True,
+        "권한 미충족 폴백 미탐지")
+    chk(important_unsupported("send failed: surface not found") is False,
+        "무관 실패에 --important 폴백 오발동")
+    chk(important_unsupported("") is False, "빈 오류에 폴백 오발동")
+
     if fails:
         print("self-test FAIL:")
         for f in fails:
             print("  ✗ " + f)
         return 1
-    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·무구독폴백슬롯)" % (7 + 4 + 4 + 4 + 4))
+    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·무구독폴백슬롯·important폴백)"
+          % (7 + 4 + 4 + 4 + 4 + 5))
     return 0
 
 

@@ -203,6 +203,17 @@ def _build_send_message(rec):
 #   카운터 리셋(이후 재큐잉은 깨끗한 재시도 — 자가 회복·수동 리셋 불요).
 FAILCOUNT = os.path.join(WK_DIR, "failcount.json")
 
+# ★C7(DESIGN §4-C7 · Sim1 S1-2): 데몬의 소프트캡 거부 오류는 **실패가 아니라 종결**이다.
+#   `queue_softcap_exceeded`가 오면 데몬이 이미 dead-letter 원장에 전문을 기록했다 = 배달 종결.
+#   이를 일반 실패로 분류하면 ①fast-fail 카운터가 오염되고 ②pending이 남아 재시도 폭풍이 된다.
+#   따라서 skipped(why=dead-lettered(softcap))로 원장 기록 + pending 제거 + 카운터 미증가.
+SOFTCAP_ERR = "queue_softcap_exceeded"
+
+
+def is_softcap_rejection(*streams):
+    """cys send 출력(stdout/stderr)에 소프트캡 거부 코드가 있으면 True."""
+    return any(SOFTCAP_ERR in (s or "") for s in streams)
+
 
 def _load_failcount():
     try:
@@ -244,11 +255,27 @@ def cmd_drain(a):
         if a.deliver:
             if alive == "unknown":
                 print(f"warn: {rec['target']} 생존 미확인 상태로 배달 시도", file=sys.stderr)
+            err = None
             try:
-                subprocess.run(cmd, check=True, timeout=15)
-                if _load_failcount().get(rec["target"]):
-                    _bump_failcount(rec["target"], reset=True)  # 성공 = 연속실패 해소
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    if _load_failcount().get(rec["target"]):
+                        _bump_failcount(rec["target"], reset=True)  # 성공 = 연속실패 해소
+                elif is_softcap_rejection(r.stderr, r.stdout):
+                    # ★C7 터미널 처리: 데몬이 dead-letter에 기록 완료 = 배달 종결.
+                    #   실패 아님 → fast-fail 카운터 미증가·pending 제거·suppressed 성격의 skipped.
+                    os.remove(path)
+                    _ledger_append({"event": "skipped", "target": rec["target"],
+                                    "wakeup_id": rec["id"], "why": "dead-lettered(softcap)"})
+                    print("skipped (소프트캡 거부 — 데몬 dead-letter 기록 완료·재전송 금지): "
+                          f"{rec['id']} → {rec['target']}", file=sys.stderr)
+                    skipped += 1
+                    continue
+                else:
+                    err = (r.stderr or r.stdout or "").strip()[:200] or f"rc={r.returncode}"
             except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
+                err = str(e)
+            if err is not None:
                 streak = _bump_failcount(rec["target"])
                 if streak >= fastfail_max:
                     # ★G13 fast-fail: 임계 도달 — pending 종결(무한 재시도 차단)·카운터 리셋
@@ -262,8 +289,8 @@ def cmd_drain(a):
                     skipped += 1
                     continue
                 _ledger_append({"event": "deliver_failed", "target": rec["target"],
-                                "wakeup_id": rec["id"], "why": str(e), "fail_streak": streak})
-                print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {e}",
+                                "wakeup_id": rec["id"], "why": err, "fail_streak": streak})
+                print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {err}",
                       file=sys.stderr)
                 continue
         else:
