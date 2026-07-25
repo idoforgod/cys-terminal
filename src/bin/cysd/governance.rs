@@ -48,6 +48,12 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
+                // ★C3 틱 내 순서 고정: rehome → expire → deliver.
+                // rehome이 먼저여야 WAL 복원분이 **정식 surface에 안착한 뒤** 만기 판정을 받는다
+                // (restored_queue에 머무는 동안 만기시키면 주인 없는 항목을 이관하는 오귀속).
+                // expire가 deliver보다 먼저여야 이미 만기인 항목을 굳이 배달하지 않는다.
+                rehome_restored(&daemon);
+                expire_queued(&daemon);
                 deliver_queued(&daemon, &mut queue_depth_alerted);
                 reap_orphan_ledger(&daemon, &sys);
                 reap_exited_surfaces(&daemon);
@@ -1955,6 +1961,110 @@ fn alert_queue_depth_if_high(
     );
 }
 
+/// ★Phase 5 ①c: WAL로 살아난 restored_queue를 같은 role의 살아있는 surface로 재홈한다.
+/// (Phase 3에서 restored_queue가 배달 경로에 미배선이라, 재기동 생존 메시지가 idle에도 미배달로
+/// 잔존하던 갭을 닫는다 — role 앵커 재타겟.)
+/// ★C3에서 deliver_queued 내부에서 **추출**됐다: 틱 순서를 rehome → expire → deliver로 고정해,
+/// 복원분이 정식 surface에 안착한 뒤에만 만기 판정을 받게 하기 위함이다(Sim2-3).
+fn rehome_restored(daemon: &Arc<Daemon>) {
+    if daemon.rehome_restored_queue() > 0 {
+        daemon.persist_queue_state();
+    }
+}
+
+/// 큐 항목 TTL(초) — 기본 3600 · 0=비활성(`CYS_QUEUE_TTL_SECS`).
+/// TTL은 **폐기가 아니라 이관** 기한이다: 만기 항목은 dead-letter에 전문이 남는다.
+fn queue_ttl_secs() -> f64 {
+    std::env::var("CYS_QUEUE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600.0)
+}
+
+/// C3 TTL sweep — 만기 항목을 큐에서 빼 dead-letter로 이관한다.
+///
+/// 만기 조건(D4): `now - enqueued_at > ttl` ∧ origin=Agent ∧ `important` 미보유.
+/// System/Human은 면제(부트 wake·시스템 통지·사람 입력이 시간으로 사라지면 안 된다).
+/// `--important`는 메시지 단위 의도 선언이다 — role 일괄 면제는 사고 최다 발신자(CSO)를
+/// 통째로 무기한화하므로 채택하지 않았다(Sim1-1).
+///
+/// 락 규율: surface별 pending_queue 락 안에서 **수집·제거만** 하고, dead-letter 기록·이벤트·
+/// `persist_queue_state`는 락 해제 후에 한다(persist는 pending_queue 락 비보유가 전제조건).
+///
+/// ★기록 실패 시 되돌린다: 원장을 못 남긴 항목은 큐 **앞머리로 복원**한다 — 원장 없는 삭제 금지
+/// (무손실 우선 fail-open). 실패 자체는 record_dead_letter가 health 경고로 발행한다.
+fn expire_queued(daemon: &Arc<Daemon>) {
+    let ttl = queue_ttl_secs();
+    if ttl <= 0.0 {
+        return;
+    }
+    let now = now_epoch();
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    let mut persist_needed = false;
+
+    for s in surfaces {
+        // ── 임계영역: 만기 후보 수집·제거 ──
+        let expired: Vec<crate::state::QueueItem> = {
+            let mut q = s.pending_queue.lock().unwrap();
+            if q.iter().all(|i| !i.is_expired(now, ttl)) {
+                continue;
+            }
+            let (out, keep): (Vec<_>, Vec<_>) =
+                q.drain(..).partition(|i| i.is_expired(now, ttl));
+            *q = keep.into();
+            out
+        };
+        if expired.is_empty() {
+            continue;
+        }
+
+        let role = s.role.lock().unwrap().clone();
+        let mut moved: Vec<crate::state::QueueItem> = Vec::new();
+        let mut restore: Vec<crate::state::QueueItem> = Vec::new();
+        for item in expired {
+            match crate::queue_policy::record_dead_letter(
+                daemon,
+                s.id,
+                role.as_deref(),
+                &item,
+                crate::queue_policy::DeadLetterReason::Ttl,
+            ) {
+                Ok(_) => moved.push(item),
+                Err(_) => restore.push(item), // 원장 없는 삭제 금지 — 큐에 되돌린다.
+            }
+        }
+        if !restore.is_empty() {
+            let mut q = s.pending_queue.lock().unwrap();
+            for item in restore.into_iter().rev() {
+                q.push_front(item);
+            }
+        }
+        if moved.is_empty() {
+            continue;
+        }
+        persist_needed = true;
+        let remaining = s.pending_queue.lock().unwrap().len();
+        daemon.bus.publish(
+            crate::queue_policy::queue_events::EXPIRED,
+            crate::queue_policy::queue_events::CATEGORY,
+            Some(s.id),
+            serde_json::json!({
+                "count": moved.len(), "ttl_secs": ttl, "remaining": remaining,
+                "role": role, "surface_ref": cys::surface_ref(s.id),
+                "oldest_age_secs": moved.iter().map(|i| now - i.enqueued_at)
+                    .fold(0.0f64, f64::max),
+                "bytes": moved.iter().map(|i| i.bytes()).sum::<usize>(),
+                "hint": "만기 항목은 폐기가 아니라 dead-letters.jsonl로 이관됐다(전문 무손실). \
+                         면제는 System origin과 --important 선언분.",
+            }),
+        );
+    }
+    if persist_needed {
+        daemon.persist_queue_state();
+    }
+}
+
 /// 인플라이트 큐 배달자: 대상 surface가 quiet 임계(기본 3초) 이상 조용하면 큐에서 한 건 주입.
 /// 연속 배달은 다음 틱 — 메시지 사이 자연 간격이 생겨 에이전트가 한 건씩 소화한다.
 /// 배달이 막힌 채 적체되면(depth ≥ 임계) `queue.depth_high`를 쿨다운(5분)으로 발행한다.
@@ -1962,12 +2072,6 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
     // T4-15 kill-switch: pause 중에는 큐 배달 동결 (메시지는 보존 — resume 시 재개)
     if daemon.paused.load(Ordering::Relaxed) {
         return;
-    }
-    // ★Phase 5 ①c: WAL로 살아난 restored_queue를 같은 role의 살아있는 surface로 재홈한 뒤 배달.
-    // (Phase 3에서 restored_queue가 배달 경로에 미배선이라, 재기동 생존 메시지가 idle에도 미배달로
-    // 잔존하던 갭을 닫는다 — role 앵커 재타겟.)
-    if daemon.rehome_restored_queue() > 0 {
-        daemon.persist_queue_state();
     }
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
@@ -3013,5 +3117,232 @@ mod tests {
             load_tombstones_from_disk(&daemon.socket_path).is_empty(),
             "topology.json에 reap 묘비가 영속돼 재부팅 후 4역할 부활이 막힌다"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T3 (C3) — TTL 이관 · origin/important 면제 · rehome→expire 순서 · dead-letter 기록 ·
+//           기록 실패 시 수용(보류) · 로테이션
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod queue_ttl_tests {
+    use super::{expire_queued, rehome_restored};
+    use crate::queue_policy;
+    use crate::state::{Daemon, QueueItem, QueueOrigin, QueueWalEntry};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    /// TTL env는 프로세스 전역이라 이 모듈은 직렬화한다.
+    static TTL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TtlEnv;
+    impl TtlEnv {
+        fn set(secs: &str) -> Self {
+            std::env::set_var("CYS_QUEUE_TTL_SECS", secs);
+            TtlEnv
+        }
+    }
+    impl Drop for TtlEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("CYS_QUEUE_TTL_SECS");
+        }
+    }
+
+    fn daemon(tag: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-qttl-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        (Daemon::new(dir.join("cysd.sock")), dir)
+    }
+
+    fn surface(d: &Arc<Daemon>, role: Option<&str>) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s
+    }
+
+    /// `age_secs` 만큼 과거에 적재된 항목.
+    fn aged(text: &str, origin: QueueOrigin, age_secs: f64) -> QueueItem {
+        let mut i = QueueItem::text(text.into(), origin);
+        i.enqueued_at = crate::state::now_epoch() - age_secs;
+        i
+    }
+
+    fn agent_origin() -> QueueOrigin {
+        QueueOrigin::Agent { surface: 42, role: Some("worker-1".into()) }
+    }
+
+    fn dl_path(dir: &std::path::Path) -> std::path::PathBuf {
+        crate::state::state_dir(&dir.join("cysd.sock")).join(queue_policy::DEAD_LETTER_FILE)
+    }
+
+    fn dead_letters(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dl_path(dir))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("유효 JSON"))
+            .collect()
+    }
+
+    fn texts(s: &Arc<crate::state::Surface>) -> Vec<String> {
+        s.pending_queue.lock().unwrap().iter().map(|i| i.text.clone()).collect()
+    }
+
+    /// 만기 조건(D4): Agent origin ∧ !important ∧ ttl 경과. 나머지는 전부 보존한다.
+    /// System/Human 면제는 부트 wake·시스템 통지가 시간으로 증발하지 않게 하는 장치다.
+    #[test]
+    fn ttl_expires_only_aged_agent_items_without_important() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60");
+        let (d, dir) = daemon("selectivity");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(aged("만기 agent", agent_origin(), 120.0));
+            q.push_back(aged("신선 agent", agent_origin(), 10.0));
+            q.push_back(aged("만기 system", QueueOrigin::system("boot"), 120.0));
+            q.push_back(aged("만기 human", QueueOrigin::Human, 120.0));
+            let mut imp = aged("만기 important", agent_origin(), 120.0);
+            imp.important = true;
+            q.push_back(imp);
+        }
+        expire_queued(&d);
+
+        assert_eq!(
+            texts(&s),
+            vec![
+                "신선 agent".to_string(),
+                "만기 system".to_string(),
+                "만기 human".to_string(),
+                "만기 important".to_string(),
+            ],
+            "만기 Agent 1건만 이관되고 순서는 보존돼야 한다"
+        );
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "이관 1건 = 원장 1줄");
+        assert_eq!(dl[0]["text"], serde_json::json!("만기 agent"), "전문 무손실");
+        assert_eq!(dl[0]["reason"], serde_json::json!("ttl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TTL=0은 비활성 — 아무리 묵어도 손대지 않는다(런타임 롤백 스위치·§10).
+    #[test]
+    fn ttl_zero_disables_sweep() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("0");
+        let (d, dir) = daemon("disabled");
+        let s = surface(&d, Some("master"));
+        s.pending_queue
+            .lock()
+            .unwrap()
+            .push_back(aged("아주 묵은 항목", agent_origin(), 999_999.0));
+        expire_queued(&d);
+        assert_eq!(texts(&s).len(), 1, "TTL=0이면 sweep이 돌면 안 된다");
+        assert!(!dl_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★Sim2-3 순서 불변식: WAL 복원분은 **rehome 후에만** 만기 판정을 받는다.
+    /// expire를 먼저 돌리면 restored_queue에 있는 항목은 손대지 않는다(주인 없는 오귀속 차단).
+    #[test]
+    fn expire_does_not_touch_restored_queue_before_rehome() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60");
+        let (d, dir) = daemon("order");
+        let s = surface(&d, Some("worker-1"));
+        let item = aged("복원 후 만기", agent_origin(), 120.0);
+        d.restored_queue.lock().unwrap().push(QueueWalEntry {
+            mid: "qtest".into(),
+            surface_id: 9999, // 재기동으로 소멸한 구 id — role이 실질 앵커다.
+            role: Some("worker-1".into()),
+            item,
+        });
+
+        // ① rehome 없이 expire만: restored_queue는 만기 대상이 아니다.
+        expire_queued(&d);
+        assert_eq!(d.restored_queue.lock().unwrap().len(), 1, "복원 대기분을 만기시키면 안 된다");
+        assert!(dead_letters(&dir).is_empty());
+
+        // ② 정식 순서(rehome → expire): 안착 후 만기 판정 → 이관.
+        rehome_restored(&d);
+        assert!(d.restored_queue.lock().unwrap().is_empty(), "role 앵커로 재홈돼야 한다");
+        assert_eq!(texts(&s), vec!["복원 후 만기".to_string()]);
+        expire_queued(&d);
+        assert!(texts(&s).is_empty(), "안착 후에는 만기 이관 대상이다");
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1);
+        assert_eq!(dl[0]["reason"], serde_json::json!("ttl"));
+        // WAL이 enqueued_at을 보존하므로 복원분은 나이를 유지한다(재홈이 시계를 리셋하지 않는다).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★Sim3-4 (무손실 우선 fail-open): dead-letter 기록이 실패하면 항목을 **제거하지 않는다**.
+    /// 원장 없는 삭제는 금지 — 실패는 health 경고로 가시화하고 항목은 큐에 남는다.
+    /// 주입 방법: 원장 경로에 **디렉터리**를 만들어 append open을 실패시킨다.
+    #[test]
+    fn dead_letter_write_failure_keeps_item_in_queue() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60");
+        let (d, dir) = daemon("failopen");
+        let s = surface(&d, Some("master"));
+        let sdir = crate::state::state_dir(&dir.join("cysd.sock"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::create_dir_all(sdir.join(queue_policy::DEAD_LETTER_FILE)).unwrap();
+
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(aged("원장 실패분", agent_origin(), 120.0));
+            q.push_back(aged("신선분", agent_origin(), 1.0));
+        }
+        expire_queued(&d);
+        assert_eq!(
+            texts(&s),
+            vec!["원장 실패분".to_string(), "신선분".to_string()],
+            "원장을 못 남긴 항목은 큐 앞머리로 복원돼 순서까지 보존돼야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 로테이션: 원장이 10MB 임계에 닿으면 `dead-letters.<ts>.jsonl`로 회전하고
+    /// 새 파일에 이어 쓴다(무한 성장 차단). 크기는 sparse set_len으로 만든다.
+    #[test]
+    fn dead_letter_rotates_at_threshold() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60");
+        let (d, dir) = daemon("rotate");
+        let s = surface(&d, Some("master"));
+        let sdir = crate::state::state_dir(&dir.join("cysd.sock"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        let f = std::fs::File::create(dl_path(&dir)).unwrap();
+        f.set_len(queue_policy::DEAD_LETTER_MAX_BYTES).unwrap();
+        drop(f);
+
+        s.pending_queue
+            .lock()
+            .unwrap()
+            .push_back(aged("회전 후 첫 줄", agent_origin(), 120.0));
+        expire_queued(&d);
+
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "회전 후 새 파일에는 이번 줄만 있어야 한다");
+        assert_eq!(dl[0]["text"], serde_json::json!("회전 후 첫 줄"));
+        let rotated: Vec<_> = std::fs::read_dir(&sdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("dead-letters.") && n.ends_with(".jsonl")
+                    && n != queue_policy::DEAD_LETTER_FILE
+            })
+            .collect();
+        assert_eq!(rotated.len(), 1, "회전본이 정확히 1개 남아야 한다");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
