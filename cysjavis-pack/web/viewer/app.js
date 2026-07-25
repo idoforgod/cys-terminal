@@ -29,6 +29,19 @@
     });
   }
 
+  // marked v12.0.2 — 신뢰 md 뷰어는 산문의 raw HTML(꺾쇠 제네릭 `<Option>`·`<T>`·
+  // `<Stream>` 등 태그 유사 텍스트)을 해석하지 말고 문자 그대로 표시해야 한다. 미해석 시
+  // marked 가 `<Option>` 을 인라인 raw HTML 로 통과 → `<option>` 요소로 파싱돼 UA 기본
+  // 스타일상 안 보이고 이후 텍스트가 요소로 흡수돼 사라진다(실측: `RwLock<Option>…` 잘림).
+  // 수정: renderer.html 오버라이드로 raw HTML 토큰을 이스케이프. 이 marked 버전은 블록·인라인
+  // raw HTML 을 모두 renderer.html 로 보낸다(파서: 블록 `renderer.html(e.text,e.block)` ·
+  // 인라인 `t.html(e.text)`). 코드펜스(```)·인라인코드(`)는 renderer.code/codespan 경유라
+  // 이 오버라이드의 영향을 전혀 받지 않아 원문(이미 marked 가 엔티티 이스케이프)이 보존된다.
+  // sanitize()의 보안 제거 목록·스킴 필터는 심층방어로 그대로 유지(약화 금지).
+  if (window.marked && typeof window.marked.use === "function") {
+    window.marked.use({ renderer: { html: function (h) { return esc(h); } } });
+  }
+
   function apiURL(ep, params) {
     var u = API + ep + "?";
     var kv = [];
@@ -176,6 +189,64 @@
     content.appendChild(wrap);
   }
 
+  // ---------------------------------------------------------------- 코드 렌더
+  // 확장자 → hljs 언어. 미매핑·미지 확장자는 plaintext(hljs auto 금지 — 예측가능).
+  // 매핑 대상은 vendored highlight.min.js(v11.9.0) 에 등록된 문법으로 한정하고,
+  // 없으면 renderCode 진입 시 getLanguage 로 plaintext 폴백한다(심층 안전).
+  var LANG_MAP = {
+    py: "python", rs: "rust", ts: "typescript", tsx: "typescript",
+    js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
+    json: "json", toml: "ini", ini: "ini",
+    yaml: "yaml", yml: "yaml",
+    sh: "bash", bash: "bash", zsh: "bash",
+    html: "xml", htm: "xml", xml: "xml",
+    css: "css", scss: "scss", less: "less",
+    sql: "sql", go: "go",
+    c: "c", h: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp",
+    java: "java", rb: "ruby", php: "php", swift: "swift",
+    kt: "kotlin", kts: "kotlin", lua: "lua", pl: "perl", r: "r",
+    txt: "plaintext", log: "plaintext", env: "plaintext", conf: "plaintext"
+  };
+
+  function fileExt(name) {
+    var i = name.lastIndexOf(".");
+    return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
+  }
+
+  // 확장자로 렌더 종류 분기: md/markdown → 마크다운, diff/patch → diff, 그 외 → 코드.
+  function fileKind(name) {
+    var e = fileExt(name);
+    if (e === "md" || e === "markdown") return "md";
+    if (e === "diff" || e === "patch") return "diff";
+    return "code";
+  }
+
+  // 코드 파일 단독 뷰어: 원문을 textContent 로만 주입(innerHTML 금지)한 뒤 hljs 로 색칠.
+  // marked·sanitize 를 경유하지 않는다 — hljs 는 DOM 텍스트 노드만 하이라이트하므로
+  // raw HTML 이 실행 컨텍스트로 들어갈 표면이 없다(★XSS 없음).
+  function renderCode(text, name) {
+    var lang = LANG_MAP[fileExt(name)] || "plaintext";
+    // vendored hljs 에 해당 문법이 없으면 plaintext 폴백(등록 언어만 신뢰).
+    if (lang !== "plaintext" && window.hljs &&
+        typeof window.hljs.getLanguage === "function" &&
+        !window.hljs.getLanguage(lang)) {
+      lang = "plaintext";
+    }
+    var wrap = document.createElement("div");
+    wrap.className = "code-view";
+    var pre = document.createElement("pre");
+    var code = document.createElement("code");
+    code.className = "language-" + lang;
+    code.textContent = text;          // ★원문 안전 삽입(innerHTML 아님)
+    pre.appendChild(code);
+    wrap.appendChild(pre);
+    content.innerHTML = "";
+    content.appendChild(wrap);
+    if (window.hljs) {
+      try { window.hljs.highlightElement(code); } catch (e) {}
+    }
+  }
+
   // ---------------------------------------------------------------- 데이터 로드
   function loadFile(path) {
     setStatus("불러오는 중…");
@@ -183,9 +254,19 @@
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (!j.ok) { showError("파일 오류: " + (j.error || "")); setStatus(""); return; }
-        docTitle.textContent = path.split("/").pop();
-        renderMarkdown(j.content + (j.truncated ?
-          "\n\n> **[2MB 초과 — 이후 절단됨]**" : ""));
+        var name = path.split("/").pop();
+        docTitle.textContent = name;
+        var kind = fileKind(name);
+        if (kind === "md") {
+          renderMarkdown(j.content + (j.truncated ?
+            "\n\n> **[2MB 초과 — 이후 절단됨]**" : ""));
+        } else if (kind === "diff") {
+          renderDiff(j.content + (j.truncated ?
+            "\n[2MB 초과 — 이후 절단됨]" : ""));
+        } else {
+          renderCode(j.content + (j.truncated ?
+            "\n[2MB 초과 — 이후 절단됨]" : ""), name);
+        }
         setStatus(j.truncated ? "절단됨 · " + j.size + "B" : j.size + "B");
         subscribeWatch(path);
       })
@@ -268,7 +349,7 @@
   }
 
   function openPath(path) {
-    // md 는 렌더, 그 외도 텍스트로 렌더(marked 가 코드로 감쌈). URL 갱신.
+    // 확장자로 분기 렌더(md·diff·코드). loadFile 이 fileKind 로 판별. URL 갱신.
     var u = new URL(location.href);
     u.searchParams.delete("diff");
     u.searchParams.delete("base");

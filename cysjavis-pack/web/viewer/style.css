@@ -134,6 +134,17 @@ body {
 .diff tr.del td.code { color: var(--del-fg); }
 .diff tr.hunk td { background: var(--hunk); color: var(--accent); }
 
+/* 코드 파일 단독 뷰어 (확장자별 하이라이팅) */
+.code-view { max-width: 1100px; margin: 0 auto; }
+.code-view pre {
+  background: var(--code-bg); padding: 14px 16px; border-radius: 8px;
+  overflow-x: auto; border: 1px solid var(--border); margin: 0;
+}
+.code-view code {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12.5px;
+  line-height: 1.5; background: none; padding: 0; white-space: pre;
+}
+
 .errbox {
   max-width: 900px; margin: 2em auto; padding: 14px 18px;
   border: 1px solid var(--del-fg); border-radius: 8px;
