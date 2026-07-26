@@ -71,6 +71,12 @@ def _active_dept_count():
     return len(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB)))
 
 
+def _nodes_hard_effective(dept_count):
+    """노드 hard 상한(동적) — STEP A 정적 floor 와 STEP B 부서 가산의 큰 쪽. measure() STEP B 와
+    **동일 산식의 단일 소스**(편성 예산이 이 산식을 재사용해 두 임계가 갈라지지 않게 한다)."""
+    return max(NODES_HARD_DEFAULT, NODES_HARD_BASE + max(0, int(dept_count or 0)) * NODES_HARD_PER_DEPT)
+
+
 # ── ★W6 곱셈 자원 예산(설계 DD-3/W6·오너 2026-07-24) ──
 # 부서 수 × 편성 크기 곱셈으로 조직 전체의 투영 에이전트 수를 예산과 대조한다. ★단, 곱셈분에서 **이미
 # 편성돼 살아있는 노드**(live 측정에 이미 포함)를 뺀다 — 안 빼면 기존 편성을 두 번 센다(_formed_agent_count).
@@ -78,26 +84,40 @@ def _active_dept_count():
 # base 동일 물리법칙) · **hard-fail 아님** — 초과 시 편성은 pending-resource 로 '대기·자동 재시도'
 # (기존 hard/soft 의미론 보존: 게이트는 master/편성 부트 플로우가 호출하므로 조직 기동을 영영 막지 않는다).
 FORMATION_BUDGET_ENV = "CYS_FORMATION_BUDGET"
-# 기본 20 근거: complete 편성 1레인 = master+4종 의무 노드(CSO·worker·agy·codex) = 5노드.
+# 기본(floor) 20 근거: complete 편성 1레인 = master+4종 의무 노드(CSO·worker·agy·codex) = 5노드.
 #   20 = base + 3부서까지 동시 full 편성(4레인×5) 여유 — 기존 nodes_hard 계열(정적 floor 18·부서당 +5)과
 #   같은 자릿수로 정렬(자원 거버넌스 실사고 상한). env CYS_FORMATION_BUDGET 로 하드웨어별 오버라이드.
-FORMATION_BUDGET_DEFAULT = 20
+FORMATION_BUDGET_DEFAULT = 20   # = 동적 산식의 정적 floor(부서 0~1 구간에서 지배)
 
 
-def _formation_budget_value(explicit=None):
-    """예산 해석 우선순위: 명시 인자 > CYS_FORMATION_BUDGET env > 기본 20.
-    ★리뷰어1 fix#4: env 파싱은 **양의 정수만** 수용 — 비숫자·공백·음수·0 은 기본 20 으로 폴백(오타 env 로
+def _formation_budget_dynamic(dept_count=None):
+    """★두 임계 정합(2026-07-26): 편성 예산을 노드 상한과 **동형으로 동적화**한다.
+
+    근거(자기모순 제거): 같은 파일의 노드 상한은 이미 동적이다 — nodes_hard_effective =
+    max(18, 12 + 부서수×5). 그런데 편성 예산만 정적 20 이면 부서 2개 머신(nodes_hard=22)에서
+    **노드 상한은 허용하는데 편성 예산은 금지**하는 모순이 생긴다(라이브 실측 2026-07-26:
+    정상 노드 21 · nodes_hard 22 → allow, formation_budget 20 → pending-resource = 편성 영구 대기).
+    임의 상향이 아니라 두 임계를 같은 부서수 기반 산식으로 맞추는 것이 수리다 — 따라서 예산은
+    노드 상한 산식(_nodes_hard_effective)을 그대로 재사용하고, 기존 floor 20 을 하한으로 남긴다
+    (부서 0~1 구간은 종전 20 그대로 = 무회귀). 결과: 예산 ≥ 노드 상한이 모든 부서수에서 성립.
+    dept_count=None(미상)은 부서 0 취급 = floor 20 (파일시스템 탐침 없음 — 순수·밀폐)."""
+    return max(FORMATION_BUDGET_DEFAULT, _nodes_hard_effective(dept_count))
+
+
+def _formation_budget_value(explicit=None, dept_count=None):
+    """예산 해석 우선순위: 명시 인자 > CYS_FORMATION_BUDGET env > 동적 기본(floor 20·부서 가산).
+    ★리뷰어1 fix#4: env 파싱은 **양의 정수만** 수용 — 비숫자·공백·음수·0 은 기본값으로 폴백(오타 env 로
     조직 기동이 우발 전면 차단되지 않게·부트 플로우 안전). 명시 인자는 호출자 책임이라 그대로 사용."""
     if explicit is not None:
         return explicit
     raw = os.environ.get(FORMATION_BUDGET_ENV)
     if raw is None:
-        return FORMATION_BUDGET_DEFAULT
+        return _formation_budget_dynamic(dept_count)
     try:
         v = int(raw)
     except (TypeError, ValueError):
-        return FORMATION_BUDGET_DEFAULT
-    return v if v > 0 else FORMATION_BUDGET_DEFAULT
+        return _formation_budget_dynamic(dept_count)
+    return v if v > 0 else _formation_budget_dynamic(dept_count)
 
 
 def _formation_state_dir():
@@ -173,9 +193,11 @@ def formation_budget_check(live_agents, formation_size, dept_count=1, budget=Non
       신규 투영분 = max(0, max(1,dept_count)×formation_size − formed_agents)
     formed_agents = 이미 편성돼 살아있는(=live_agents 에 이미 계수된) 노드 수 → 이중계상 제거
     (기본 0 = 구 동작 그대로. 라이브 경로는 cmd_check 가 _formed_agent_count 로 채운다).
+    budget=None 이면 env > 동적 기본(max(20, 12+dept_count×5) — 노드 상한과 동형) 순으로 해석.
     역할 중립 · hard-fail 아님(초과=pending-resource 대기). 반환: BudgetVerdict(.blocked·.state)."""
-    budget = _formation_budget_value(budget)
     dept_count = max(1, int(dept_count or 1))
+    # 예산 기본값은 **이 호출이 보는 부서 수**에서 파생(노드 상한과 동형 — _formation_budget_dynamic).
+    budget = _formation_budget_value(budget, dept_count=dept_count)
     size = int(formation_size or 0)
     incoming = max(0, dept_count * size - int(formed_agents or 0))
     projected = int(live_agents or 0) + incoming
@@ -247,8 +269,8 @@ def measure(a):
     if a.nodes_hard != NODES_HARD_DEFAULT:
         nodes_hard_effective = a.nodes_hard
     else:
-        nodes_hard_effective = max(NODES_HARD_DEFAULT,
-                                    NODES_HARD_BASE + active_depts * NODES_HARD_PER_DEPT)
+        # 단일 소스(_nodes_hard_effective) — 편성 예산이 같은 산식을 재사용한다(임계 정합).
+        nodes_hard_effective = _nodes_hard_effective(active_depts)
 
     return {"servers": servers, "nodes": nodes,
             "load1": round(load1, 2) if load1 is not None else None,
@@ -578,7 +600,8 @@ def main(argv=None):
     c.add_argument("--dept-count", dest="dept_count", type=int, default=None,
                    help="부서 수(미지정 시 활성 소켓 수 측정값 사용)")
     c.add_argument("--formation-budget", dest="formation_budget", type=int, default=None,
-                   help="편성 예산 한도(미지정 시 CYS_FORMATION_BUDGET env 또는 기본 20)")
+                   help="편성 예산 한도(미지정 시 CYS_FORMATION_BUDGET env 또는 동적 기본="
+                        "max(20, 12+부서수×5) — 노드 상한과 동형)")
     c.add_argument("--formed-agents", dest="formed_agents", type=int, default=None,
                    help="이미 편성돼 살아있는 노드 수(테스트 주입 — 미지정 시 편성 상태 파일 측정)")
     c.set_defaults(fn=cmd_check)

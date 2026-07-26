@@ -2869,6 +2869,12 @@ fn fire_formation_ensure(socket: &Option<String>) {
             cmd.arg(&script).arg("ensure");
         }
     }
+    // ★부트 레인 강제 표면화(2026-07-26): 표면화가 '전이 시에만'으로 좁혀지면서(주기 10분 잡의 토스트
+    // 스팸 차단) **앱 재시작**이라는 구멍이 생겼다 — UI 의 배너 중복 억제 상태(bootbanner.ts
+    // lastFormationKind)는 인메모리라 새 앱 세션에서 초기화되는데, 상태 파일이 이미 complete 인 레인은
+    // 전이가 없어 formation-complete 를 다시 발행하지 않는다 → 새 세션에서 뜬 boot-warning 배너에
+    // 소멸 신호가 영영 오지 않는다. 부트는 세션당 1회뿐이라 스팸이 아니다(주기 잡에는 절대 금지).
+    cmd.arg("--force-surface");
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

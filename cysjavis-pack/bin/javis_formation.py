@@ -26,7 +26,8 @@ ensure(socket): ①cys gate-check(paused→pending 유지 종료) ②소켓키 �
 저장: <state>/formation/<socket-key>.json  (state = CYS_STATE_DIR or ~/.cys/state — 기존 관례).
 
 CLI:
-  python3 javis_formation.py ensure --socket <S> [--cwd D] [--json]
+  python3 javis_formation.py ensure --socket <S> [--cwd D] [--json] [--force-surface]
+    --force-surface = 전이 없어도 현재 상태 1회 표면화(앱 부트 레인 전용 · 주기 잡 금지)
   python3 javis_formation.py classify --installed claude,agy --live master,cso [--no-resource]
   python3 javis_formation.py self-test
 """
@@ -407,10 +408,17 @@ def _emit_evt(evt_type, fields):
     _run(argv, timeout=10)
 
 
-def _surface(socket, prev_state, state):
+def _surface(socket, prev_state, state, force=False):
     """상태 표면화 — (1) UI 배너 수명 신호(feed --kind) (2) 음성/HUD EVT. kind 전이 또는 최초
-    관측 시에만 발화(심박 스팸 억제·'전이 시' 계약). 전부 best-effort·부트 무해(R10)."""
-    if prev_state is not None and state_kind(prev_state) == state_kind(state):
+    관측 시에만 발화(심박 스팸 억제·'전이 시' 계약). 전부 best-effort·부트 무해(R10).
+
+    ★force=True(앱 부트 레인 전용·2026-07-26): 전이 여부와 무관하게 현재 상태를 1회 표면화한다.
+    UI 의 배너 중복 억제(bootbanner.ts lastFormationKind)는 **인메모리**라 앱 재시작 시 소실되는데,
+    상태 파일이 이미 complete 인 레인은 전이가 없어 formation-complete 를 다시 발행하지 않는다 →
+    새 앱 세션에서 boot-warning 배너가 뜨면 소멸 신호가 영영 오지 않았다. 부트 1회만 강제 재발행해
+    그 갭을 닫는다. ⚠주기 스케줄 잡(10분)에는 절대 붙이지 마라 — 매 틱 토스트 스팸이 되살아난다.
+    INV-1 불변: 강제 표면화는 상태를 계산·변경하지 않는다(발행 kind 는 호출자가 준 state 그대로)."""
+    if not force and prev_state is not None and state_kind(prev_state) == state_kind(state):
         return  # 상태 kind 무변화 → 재표면화 생략(배너 dismiss 는 멱등이나 스팸 억제)
     _feed_for_state(state)
     evt = evt_type_for_state(state)
@@ -419,8 +427,12 @@ def _surface(socket, prev_state, state):
 
 
 # ── ensure: 상태 기계 전이 주체 ──
-def ensure(socket=None, cwd=None):
-    """편성 전이(멱등·싱글플라이트). 반환: (state, detail). 모든 실패 graceful."""
+def ensure(socket=None, cwd=None, force_surface=False):
+    """편성 전이(멱등·싱글플라이트). 반환: (state, detail). 모든 실패 graceful.
+
+    force_surface=True 면 kind 전이가 없어도 현재 상태를 1회 표면화한다(_surface 주석 참조 —
+    앱 부트 레인 전용. 주기 잡은 기본값 False 로 스팸 억제 계약을 유지한다). 상태 판정·기록에는
+    아무 영향이 없다(INV-1: complete 는 여전히 classify()==complete 일 때만)."""
     prev = _read_state(socket)   # 전이 감지용(배너 수명 신호는 전이 시에만 표면화)
     # ① kill-switch
     if not gate_check():
@@ -456,7 +468,7 @@ def ensure(socket=None, cwd=None):
             state = "complete"
             detail = "라이브 로스터 이미 완결(5역할 생존) — 신규 기동 0 · 자원 게이트 무관"
             _write_state(socket, state, detail, live_now)
-            _surface(socket, prev, state)
+            _surface(socket, prev, state, force=force_surface)
             return state, detail
 
         # ④ 자원 게이트(complete 가 **아닐 때만** — 실제로 노드를 스폰하는 경로에서만 예산을 본다)
@@ -465,7 +477,7 @@ def ensure(socket=None, cwd=None):
             state = "pending-resource"
             detail = "곱셈 자원 예산 hard — 편성 대기"
             _write_state(socket, state, detail, live)
-            _surface(socket, prev, state)
+            _surface(socket, prev, state, force=force_surface)
             return state, detail
 
         # CLI 전무 → pending-cli(빈 셸 유지·온보딩 보존)
@@ -474,7 +486,7 @@ def ensure(socket=None, cwd=None):
             state = classify(installed=installed, live=live, resource_ok=True)
             detail = "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)"
             _write_state(socket, state, detail, live)
-            _surface(socket, prev, state)
+            _surface(socket, prev, state, force=force_surface)
             return state, detail
 
         # ⑤⑥ 설치된 CLI 기준 최대 편성. master 먼저(입양 경로) → CSO → 나머지.
@@ -502,7 +514,7 @@ def ensure(socket=None, cwd=None):
         # ★주기 실행 스팸 차단(2026-07-26): 무조건 _feed_for_state 였던 자리를 _surface(전이 시에만
         # 표면화) 로 교체한다. 편성 ensure 가 스케줄 주기(10분)로 붙으면 매 틱마다 사용자에게 토스트가
         # 갔다. prev 는 ensure 진입부에서 읽은 직전 상태 — 동일 kind 면 _surface 계약대로 생략된다.
-        _surface(socket, prev, state)
+        _surface(socket, prev, state, force=force_surface)
         return state, detail
 
 
@@ -603,7 +615,7 @@ def self_test():
 
 
 def _cmd_ensure(argv):
-    socket, cwd, as_json = None, None, False
+    socket, cwd, as_json, force_surface = None, None, False, False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -613,9 +625,13 @@ def _cmd_ensure(argv):
             cwd = argv[i + 1]; i += 2; continue
         if a == "--json":
             as_json = True; i += 1; continue
+        # ★앱 부트 레인 전용(2026-07-26): UI 배너 억제 상태(lastFormationKind)가 앱 재시작으로
+        #   소실돼도 소멸 신호가 도달하도록 현재 상태를 1회 강제 표면화. 주기 잡은 붙이지 않는다.
+        if a == "--force-surface":
+            force_surface = True; i += 1; continue
         i += 1
     try:
-        state, detail = ensure(socket=socket, cwd=cwd)
+        state, detail = ensure(socket=socket, cwd=cwd, force_surface=force_surface)
     except Exception as e:  # 최후 graceful — 예외 스택 대신 명시 메시지
         state, detail = "failed:%s" % type(e).__name__, str(e)
     summary = {"ok": state_kind(state) in ("complete", "partial"),
@@ -650,7 +666,8 @@ def main(argv):
         return _cmd_classify(argv[2:])
     if cmd == "ensure":
         return _cmd_ensure(argv[2:])
-    sys.stderr.write("usage: javis_formation.py ensure --socket <S> [--cwd D] [--json] | "
+    sys.stderr.write("usage: javis_formation.py ensure --socket <S> [--cwd D] [--json] "
+                     "[--force-surface] | "
                      "classify --installed a,b --live x,y [--no-resource] | self-test\n")
     return 2
 

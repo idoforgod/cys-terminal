@@ -49,6 +49,27 @@ def main():
           and "self-test" in rs)
     check("② built-in 버전 마커(idempotent ensure 기준)", "_builtin_version" in rs and "BUILTIN_JOBS_VERSION" in rs)
 
+    # ②′ ★편성 재시도 잡 배송 경로(2026-07-26). 팩 schedule.json 은 user-owned 라 팩 업데이트가
+    #    절대 덮지 않는다 → 팩 파일에만 두면 **기존 사용자에게 도달하지 않는다**. 코드 소유 built-in
+    #    이어야 데몬 부트 upsert 로 배달된다. seed 사본은 코드 정의와 동일 마커/버전이어야 한다
+    #    (Rust pack_seed_marked_jobs_match_builtin_defs 가 값 동일까지 검사).
+    check("②′ schedule.rs builtin 에 formation-ensure-10min 정의(10분·ensure)",
+          bool(re.search(r'"id":\s*"formation-ensure-10min"', rs))
+          and bool(re.search(r'"every_minutes":\s*10\b', rs))
+          and "javis_formation.py" in rs)
+    check("②′ 편성 built-in 마커(_builtin: formation) 부여",
+          bool(re.search(r'"_builtin":\s*"formation"', rs)))
+    fjob = next((j for j in d.get("jobs", []) if j["id"] == "formation-ensure-10min"), None)
+    check("②′ 팩 seed 편성 잡도 동일 마커(신규 설치 ↔ 코드 정의 무드리프트)",
+          bool(fjob) and fjob.get("_builtin") == "formation"
+          and isinstance(fjob.get("_builtin_version"), int), str(fjob))
+    # 코드 정의의 command **값**만 본다(주석의 '붙이지 마라' 경고문에 오탐하지 않게).
+    rs_cmds = re.findall(r'"command":\s*"((?:[^"\\]|\\.)*)"', rs)
+    check("②′ 주기 잡에 --force-surface 미부착(전이-시-표면화 스팸 게이트 보존)",
+          "--force-surface" not in (fjob or {}).get("command", "")
+          and not [c for c in rs_cmds if "--force-surface" in c],
+          "주기 잡 강제 표면화는 매 틱 토스트 스팸 · rs_cmds=%r" % (rs_cmds,))
+
     # ③ 데몬 부트가 ensure_builtin_jobs 를 스케줄러 기동 전에 호출.
     mn = open(MAIN_RS, encoding="utf-8").read()
     check("③ main.rs 부트가 ensure_builtin_jobs 호출", "schedule::ensure_builtin_jobs()" in mn)

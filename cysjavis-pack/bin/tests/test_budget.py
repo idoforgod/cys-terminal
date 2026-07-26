@@ -172,6 +172,50 @@ def main():
     else:
         check("8 _formed_agent_count 존재", False, "이중계상 차감 원천 미구현")
 
+    # 9. ★두 임계 정합(2026-07-26) — 편성 예산이 노드 상한과 **동형으로 동적**인가.
+    #    배경(자기모순): 같은 파일의 노드 상한은 동적(max(18, 12+부서수×5))인데 편성 예산만 정적 20 이면
+    #    부서 2개 머신(nodes_hard=22, 정상 노드 21)에서 **노드 상한은 허용하는데 편성 예산은 금지**한다
+    #    → 편성이 pending-resource 로 영구 대기(배너 소멸 신호 미발행). 예산 ≥ 노드 상한이 성립해야 한다.
+    bud = getattr(m, "_formation_budget_value", None)
+    nhe = getattr(m, "_nodes_hard_effective", None)
+    if callable(bud) and callable(nhe):
+        import os as _os
+        saved = _os.environ.pop(getattr(m, "FORMATION_BUDGET_ENV", "CYS_FORMATION_BUDGET"), None)
+        try:
+            rows = []
+            allok = True
+            for d in (0, 1, 2, 3, 8):
+                b, h = bud(None, dept_count=d), nhe(d)
+                ok = b >= h
+                allok = allok and ok
+                rows.append("depts=%d budget=%d nodes_hard=%d%s" % (d, b, h, "" if ok else "✗"))
+            check("9a 예산 ≥ 노드 상한(부서 0/1/2/3/8 전 구간 정합)", allok, " ".join(rows))
+            check("9b 부서 0~1 은 종전 floor 20 유지(무회귀)",
+                  bud(None, dept_count=0) == 20 and bud(None, dept_count=1) == 20,
+                  "d0=%r d1=%r" % (bud(None, dept_count=0), bud(None, dept_count=1)))
+            check("9c 부서 2 에서 동적 상향(20→22 = nodes_hard 와 동일 산식)",
+                  bud(None, dept_count=2) == 22 and nhe(2) == 22,
+                  "budget=%r nodes_hard=%r" % (bud(None, dept_count=2), nhe(2)))
+            # 라이브 실측 재현: nodes=21 · depts=2 · size=5 · 기편성=10 → projected 21 ≤ budget 22 → 통과.
+            #   (구 정적 20 이면 21 > 20 으로 차단 = 자기모순. 노드 축은 21 ≤ 22 로 allow 였다.)
+            lv = fbc(live_agents=21, formation_size=5, dept_count=2, formed_agents=10)
+            check("9d 라이브 실측(노드21·부서2) — 노드 축 allow 인데 예산 축만 차단하던 모순 해소",
+                  lv.blocked is False and lv.budget == 22, "got=%r" % (lv,))
+            # 우선순위 보존: env > 동적 기본, 명시 인자 > env.
+            _os.environ["CYS_FORMATION_BUDGET"] = "30"
+            check("9e env 오버라이드 우선순위 보존(동적 기본보다 env 우선)",
+                  bud(None, dept_count=2) == 30 and bud(99, dept_count=2) == 99,
+                  "env=%r explicit=%r" % (bud(None, dept_count=2), bud(99, dept_count=2)))
+            _os.environ.pop("CYS_FORMATION_BUDGET", None)
+        finally:
+            if saved is not None:
+                _os.environ["CYS_FORMATION_BUDGET"] = saved
+            else:
+                _os.environ.pop("CYS_FORMATION_BUDGET", None)
+    else:
+        check("9 편성 예산 동적화(노드 상한 정합)", False,
+              "_formation_budget_value(dept_count=)·_nodes_hard_effective 미노출")
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
 

@@ -88,7 +88,8 @@ pub fn schedule_path() -> PathBuf {
 }
 
 /// ★B2-1(W3): built-in 잡 정의 버전. 잡 내용이 바뀌면 올린다 — 부트 ensure 가 구버전 항목을 갱신하는 기준.
-const BUILTIN_JOBS_VERSION: u64 = 1;
+/// v2(2026-07-26): formation-ensure-10min 추가 — 버전을 올려야 **기존 사용자 파일**에 upsert 된다.
+const BUILTIN_JOBS_VERSION: u64 = 2;
 
 /// built-in 잡 정의(phoenix 인프라 + learn 학습 루프) — 팩 schedule.json 배달이 아니라 코드가 소유한다
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
@@ -155,12 +156,29 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "learn",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // ★편성 재시도 잡(2026-07-26 · 배너 불멸 2단계) — **배송 경로 수리**.
+        // 팩 schedule.json 은 user-owned(`cys pack-ownership schedule.json` = user)라 팩 업데이트가
+        // 절대 덮지 않는다 → 이 잡을 팩 파일에만 두면 **기존 사용자에게 영영 도달하지 못한다**(신규
+        // 설치 전용 반쪽 수리). 코드 소유 built-in 으로 옮겨 데몬 부트 ensure 가 id upsert 로 배달한다.
+        // 역할: 편성이 pending(자원·CLI 미설치)으로 멈춘 레인을 10분마다 재시도해 완결로 승급시키고,
+        // 그 전이에서 배너 소멸 신호(feed formation-complete)를 발행한다.
+        // ⚠`--force-surface` 를 붙이지 마라 — 주기 잡의 강제 표면화는 매 틱 토스트 스팸이다
+        //   (강제 표면화는 앱 부트 레인 전용 · src-tauri fire_formation_ensure).
+        json!({
+            "id": "formation-ensure-10min",
+            "every_minutes": 10,
+            "action": "command",
+            "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_formation.py\" ensure ${CYS_SOCKET:+--socket \"$CYS_SOCKET\"} --json",
+            "if_absent": "skip",
+            "_builtin": "formation",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
     ]
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
-///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"queue") → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"queue"·"formation") → 버전 상이 시 교체(갱신)·동버전 무접촉
 ///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
 /// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
 fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
@@ -179,7 +197,8 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
             Some(pos) => {
                 // ★codex W3 major: built-in 마커(_builtin)가 코드 정의(bj)의 마커와 일치하는 항목만
                 //   우리 소유 → 버전 갱신. 마커 없는/다른 동명 항목은 사용자가 그 id 를 선점한 것
-                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프·"queue"=큐 역압 운영)
+                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프·
+                //   "queue"=큐 역압 운영·"formation"=편성 재시도)
                 let want_marker = bj.get("_builtin").and_then(|v| v.as_str());
                 let is_ours = want_marker.is_some()
                     && jobs[pos].get("_builtin").and_then(|v| v.as_str()) == want_marker;
@@ -879,8 +898,12 @@ mod tests {
             ids.contains(&"deadletter-transcribe-6h"),
             "★B4: dead-letter 전사 잡이 없으면 javis_deadletter 는 호출자 0 상태 그대로다"
         );
+        assert!(
+            ids.contains(&"formation-ensure-10min"),
+            "★배송 수리: 편성 재시도 잡이 built-in 이 아니면 user-owned schedule.json 탓에 기존 사용자에게 영영 도달하지 않는다"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 6, "사용자1 + built-in5");
+        assert_eq!(jobs.len(), 7, "사용자1 + built-in6");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080).
         let period = |id: &str| {
             jobs.iter()
@@ -892,16 +915,35 @@ mod tests {
         assert_eq!(period("learn-ttl-audit"), Some(1440), "learn audit 일 1회");
         assert_eq!(period("fleet-digest"), Some(10080), "fleet digest 주 1회");
         assert_eq!(period("deadletter-transcribe-6h"), Some(360), "dead-letter 전사 6h");
+        assert_eq!(period("formation-ensure-10min"), Some(10), "편성 재시도 10분");
+        // 편성 잡은 command 액션(형 정합) + 주기 잡이므로 강제 표면화 금지(붙으면 매 틱 토스트 스팸).
+        let formation = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("formation-ensure-10min"))
+            .unwrap();
+        assert_eq!(formation["action"].as_str(), Some("command"), "편성 잡=command 액션");
+        let fcmd = formation["command"].as_str().expect("command 필드");
+        assert!(fcmd.contains("javis_formation.py") && fcmd.contains("ensure"), "편성 ensure 호출: {fcmd}");
+        assert!(
+            !fcmd.contains("--force-surface"),
+            "주기 잡에 강제 표면화가 붙으면 스팸 억제(전이 시에만)가 무력화된다: {fcmd}"
+        );
+        assert_eq!(formation["if_absent"].as_str(), Some("skip"), "대상 부재 시 skip");
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
         let (c2, _) = apply_builtin_jobs(&mut jobs);
         assert!(!c2, "동버전 재실행은 무접촉(변경 없음)이어야 한다");
+        assert_eq!(
+            jobs.iter().filter(|j| j["id"].as_str() == Some("formation-ensure-10min")).count(),
+            1,
+            "편성 잡 재실행 중복 생성 0(멱등)"
+        );
         let snap_count = jobs
             .iter()
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 6, "중복 없이 6개 유지");
+        assert_eq!(jobs.len(), 7, "중복 없이 7개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -933,6 +975,79 @@ mod tests {
             1,
             "갱신 후에도 중복 0"
         );
+    }
+
+    /// ★배송 경로 핀(2026-07-26): 편성 재시도 잡이 **기존 사용자 파일**에 도달하는가.
+    /// 팩 schedule.json 은 user-owned(`cys pack-ownership schedule.json` = user)라 팩 업데이트가
+    /// 절대 덮지 않는다 — 즉 팩 파일에만 추가하면 기존 사용자에게 영영 배달되지 않는다. 유일한
+    /// 배송 경로는 데몬 부트의 built-in upsert(main.rs `schedule::ensure_builtin_jobs()`)다.
+    /// 여기서는 "9잡·커스터마이즈된 구버전 사용자 파일" 을 시뮬해 ①편성 잡 신규 주입 ②사용자
+    /// 커스터마이즈 무손실 ③id 유일·중복 0 ④버전 대조로 구버전 built-in 갱신을 함께 못박는다.
+    #[test]
+    fn formation_job_reaches_existing_user_file_via_builtin_upsert() {
+        // built-in id 는 코드 정의 안에서 유일해야 upsert 가 결정론적이다(중복이면 마지막이 이긴다).
+        let defs = builtin_jobs();
+        let mut seen: Vec<&str> = defs.iter().filter_map(|j| j["id"].as_str()).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "built-in 잡 id 중복 — upsert 비결정론");
+
+        // 기존 사용자 파일 시뮬: 사용자 잡 3개(그중 1개는 사용자가 주기를 고친 커스터마이즈) +
+        // 구버전(v1) built-in 마커 잡 5개 = 8잡. 편성 잡은 **없다**(팩 배달이 닿지 않았으므로).
+        let mut jobs: Vec<serde_json::Value> = vec![
+            json!({"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": "echo user"}),
+            json!({"id": "my-custom-report", "every_minutes": 77, "action": "push", "to": "master",
+                   "text": "USER TEXT"}),
+            json!({"id": "content-channel-health-watch", "every_minutes": 720, "action": "push",
+                   "to": "master"}),
+        ];
+        for b in builtin_jobs() {
+            if b["id"].as_str() == Some("formation-ensure-10min") {
+                continue; // 기존 사용자에겐 아직 없는 잡
+            }
+            let mut old = b.clone();
+            old["_builtin_version"] = json!(1); // 구버전 마커(v1 시절 배달분)
+            jobs.push(old);
+        }
+        assert_eq!(jobs.len(), 8, "시뮬 전제: 사용자3 + 구버전 built-in5");
+
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        assert!(changed, "구버전 갱신 + 편성 잡 주입으로 changed 여야 한다");
+        assert!(conflicts.is_empty(), "마커 일치 항목은 conflict 아님: {conflicts:?}");
+        assert_eq!(jobs.len(), 9, "사용자3 + built-in6 = 9(편성 잡 1개만 신규 추가)");
+        let formation = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("formation-ensure-10min"))
+            .expect("편성 잡이 기존 사용자 파일에 주입돼야 한다(배송 경로 = built-in upsert)");
+        assert_eq!(formation["_builtin"].as_str(), Some("formation"));
+        assert_eq!(formation["_builtin_version"].as_u64(), Some(BUILTIN_JOBS_VERSION));
+        // 사용자 커스터마이즈 무손실(예약 id 아닌 잡은 무접촉).
+        let custom = jobs.iter().find(|j| j["id"].as_str() == Some("my-custom-report")).unwrap();
+        assert_eq!(custom["every_minutes"].as_u64(), Some(77), "사용자 잡 보존");
+        assert_eq!(
+            jobs.iter()
+                .find(|j| j["id"].as_str() == Some("content-channel-health-watch"))
+                .unwrap()["every_minutes"]
+                .as_u64(),
+            Some(720),
+            "마커 없는 사용자 커스터마이즈 잡 보존(built-in 아님)"
+        );
+        // 구버전 built-in 은 현재 버전으로 갱신됐고, 재실행은 무접촉(중복 0).
+        for j in jobs.iter() {
+            if j.get("_builtin").is_some() {
+                assert_eq!(
+                    j["_builtin_version"].as_u64(),
+                    Some(BUILTIN_JOBS_VERSION),
+                    "built-in 잡은 현재 버전으로 갱신: {}",
+                    j["id"]
+                );
+            }
+        }
+        let (again, _) = apply_builtin_jobs(&mut jobs);
+        assert!(!again, "2차 ensure 는 무접촉(멱등)");
+        assert_eq!(jobs.len(), 9, "재실행에도 중복 0");
     }
 
     // ★codex W3 major: 사용자가 예약 id(phoenix-snapshot-6h)를 마커 없이 선점하면 built-in ensure 가

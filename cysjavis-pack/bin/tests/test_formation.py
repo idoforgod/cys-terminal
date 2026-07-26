@@ -240,6 +240,59 @@ def ensure_order_gate(m):
         m.ensure(socket="/tmp/c.sock")
         check("11 kind 전이(complete→partial) → 표면화 재발화",
               len(feeds) == 2 and feeds[1][0] == "formation-partial", "feeds=%r" % (feeds,))
+
+        # ── 12. ★force_surface 양방향 핀(2026-07-26 · 앱 부트 배너 소멸 갭 수리) ──
+        #   배경: 표면화를 '전이 시에만'으로 좁히자 **앱 재시작** 구멍이 생겼다 — UI 의 중복 억제
+        #   상태(bootbanner.ts lastFormationKind)는 인메모리라 새 앱 세션에서 초기화되는데, 상태
+        #   파일이 이미 complete 인 레인은 전이가 없어 formation-complete 를 다시 발행하지 않는다
+        #   → 새 세션에서 뜬 boot-warning 배너에 소멸 신호가 영영 오지 않는다.
+        #   양방향 핀: (a) force=True 면 동일 kind 라도 매 호출 1회 표면화 (b) 기본(False)은 종전대로
+        #   전이 시에만 — (b) 가 없으면 수리가 주기 잡 스팸으로 퇴화한다.
+        feeds = _ensure_harness(m, live=REQUIRED, installed=all_clis, resource_ok=False)
+        m.ensure(socket="/tmp/d.sock")                       # 최초 관측 → 1회
+        m.ensure(socket="/tmp/d.sock")                       # 동일 kind·기본 → 생략
+        check("12a 기본(force_surface=False)은 동일 kind 재표면화 생략(스팸 게이트 보존)",
+              len(feeds) == 1, "feeds=%r" % (feeds,))
+        m.ensure(socket="/tmp/d.sock", force_surface=True)   # 전이 없어도 강제 1회
+        check("12b force_surface=True → 동일 kind 라도 표면화 1회 발생(부트 소멸 신호 도달)",
+              len(feeds) == 2 and feeds[1][0] == "formation-complete", "feeds=%r" % (feeds,))
+        m.ensure(socket="/tmp/d.sock", force_surface=True)   # 호출마다 정확히 1회(누적 아님)
+        check("12c force 표면화는 호출당 정확히 1회(중복 발행 0)",
+              len(feeds) == 3, "feeds=%r" % (feeds,))
+        m.ensure(socket="/tmp/d.sock")                       # 다시 기본 → 생략(계약 복귀)
+        check("12d force 해제 시 종전 계약 복귀(전이 없으면 무발행)",
+              len(feeds) == 3, "feeds=%r" % (feeds,))
+
+        # (e) ★INV-1 유지: 강제 표면화는 **상태를 바꾸지 않는다** — complete 가 아닌 로스터에서
+        #     force 를 켜도 formation-complete 는 절대 발행되지 않는다(배너를 그냥 지우는 구현 차단).
+        feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
+        state, _d = m.ensure(socket="/tmp/e.sock", force_surface=True)
+        check("12e force 여도 complete 아니면 formation-complete 무발행(INV-1)",
+              m.state_kind(state) == "partial"
+              and not [f for f in feeds if f[0] == "formation-complete"]
+              and [f for f in feeds if f[0] == "formation-partial"],
+              "state=%r feeds=%r" % (state, feeds))
+        # CLI 전무(pending) 경로도 동일 — force 가 상태 승격 수단이 되지 않는다.
+        feeds = _ensure_harness(m, live=set(), installed=set(), resource_ok=True)
+        state, _d = m.ensure(socket="/tmp/e2.sock", force_surface=True)
+        check("12f force + CLI 전무 → pending 유지·complete 무발행(INV-1)",
+              m.state_kind(state) == "pending-cli"
+              and not [f for f in feeds if f[0] == "formation-complete"],
+              "state=%r feeds=%r" % (state, feeds))
+
+        # (f) CLI 배선 핀: `--force-surface` 플래그가 ensure(force_surface=True) 로 연결되는가.
+        #     (앱 부트 경로 src-tauri fire_formation_ensure 가 이 플래그로만 켠다.)
+        seen = []
+        saved_ensure = m.ensure
+        m.ensure = lambda socket=None, cwd=None, force_surface=False: (
+            seen.append(force_surface) or ("complete", "stub"))
+        try:
+            m._cmd_ensure(["--socket", "/tmp/f.sock", "--force-surface", "--json"])
+            m._cmd_ensure(["--socket", "/tmp/f.sock", "--json"])
+        finally:
+            m.ensure = saved_ensure
+        check("12g CLI --force-surface → ensure(force_surface=True) 배선(미지정=False)",
+              seen == [True, False], "seen=%r" % (seen,))
     finally:
         for k, v in saved.items():
             setattr(m, k, v)
