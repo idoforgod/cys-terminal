@@ -254,7 +254,13 @@ SELFCORR_HOOKS = [
     ("role-bootstrap.sh", [("UserPromptSubmit", None)]),
     # ★W-C1(커스텀 생존 2026-07-17): vendor(system·임베드) 팩 파일 수정 감지 → 치유 예고 +
     # 영속 경로 안내(additionalContext WARN — BLOCK 아님·자기발화 봉쇄 금지 경계 준수).
-    ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
+    # ★CU-2A(scope 1급화 2026-07-26): 같은 스크립트를 PreToolUse 에도 등록해 **교차-scope 팩 쓰기**
+    # (남의 scope 팩 = 경계 침범 · vendor 게이트와 별개 게이트 ADR-2)를 사전 판정한다. 차단은
+    # PreToolUse JSON permissionDecision 채널로만 가능하므로 이벤트 2종 등록이 필수다(PostToolUse
+    # 유지 — vendor 사후 경고는 종전 그대로). 이 표가 등록기(C28 --fix)와 검사기(C28 report)의
+    # 단일 기대집합이라, 여기에 추가하면 "등록됐는데 preflight WARN" 인 어정쩡 상태가 생기지 않는다.
+    ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit"),
+                       ("PreToolUse", "Write|Edit|MultiEdit")]),
 ]
 
 # work management 앵커(절대지침 5차) 4규칙 b·c의 전담 sub-skill — C22가 존재·본문을 검증한다.
