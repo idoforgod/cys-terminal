@@ -717,7 +717,16 @@ def _run_formation_ensure(py, log):
         log.data["formation"] = {"state": "skipped", "reason": "javis_formation.py 부재"}
         return
     _progress("③″ 조건화 상비 편성(formation ensure)…")
-    argv = [py, formation, "ensure", "--json"]
+    # ★부트스트랩 레인 강제 표면화(2026-07-26 · 앱 부트 레인과 동등성). 표면화가 '전이 시에만'으로
+    # 좁혀지면서(주기 10분 잡의 토스트 스팸 차단) **세션 시작**이라는 구멍이 생겼다 — UI 의 배너 중복
+    # 억제 상태(bootbanner.ts lastFormationKind)는 인메모리라 새 앱/세션에서 초기화되는데, 상태 파일이
+    # 이미 complete 인 레인은 전이가 없어 formation-complete 를 다시 발행하지 않는다 → 새 세션에서 뜬
+    # boot-warning 배너에 소멸 신호가 영영 오지 않는다.
+    # 이 함수는 master 각성 부트 체인(_run_formation_ensure 호출부 1곳)에서만 도는 **1회성** 경로라
+    # 스팸이 아니다 — 그리고 "너는 마스터다" 수동 경로는 앱 부트 레인(src-tauri fire_formation_ensure)
+    # 과 **동등**해야 한다(두 경로 동등성). ⚠주기 잡(schedule 의 formation-ensure-10min)에는 절대
+    # 붙이지 마라 — 매 틱 토스트 스팸이 된다. 주기 경로는 이 함수를 타지 않는다.
+    argv = [py, formation, "ensure", "--json", "--force-surface"]
     if sock:
         argv += ["--socket", sock]
     try:

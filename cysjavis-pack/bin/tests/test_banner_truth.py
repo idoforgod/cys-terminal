@@ -184,5 +184,30 @@ if fm:
           "_feed_for_state(" not in _tail,
           "무조건 표면화가 남아 있으면 주기 잡이 매 틱 토스트를 낸다")
 
+# ── H: 부트 레인 강제 표면화 **두 레인 동등성** (2026-07-26 · 배너 소멸 갭 3단계) ──
+# 배경: 표면화를 '전이 시에만'으로 좁힌 결과, 상태 파일이 이미 complete 인 레인은 세션이 새로
+# 시작돼도(=UI 의 인메모리 lastFormationKind 초기화) formation-complete 를 재발행하지 않아 배너
+# 소멸 신호가 유실된다. 해법은 **세션 1회성 부트 경로에서만** 강제 표면화(--force-surface)다.
+# 부트 레인은 두 개이며 둘 다 붙어야 한다 — 한쪽만 붙으면 그 경로 사용자에게만 배너가 불멸한다:
+#   ① 앱 부트 레인   : src-tauri/src/main.rs fire_formation_ensure
+#   ② 부트스트랩 레인 : javis_bootstrap.py _run_formation_ensure ("너는 마스터다" 수동 각성 주경로)
+# 짝 조건은 주기 잡 **미부착**이며, 그쪽은 test_phoenix_e2_schedule.py ②′ 가 못박는다(중복 배제).
+_bs_src = open(os.path.join(BIN, "javis_bootstrap.py"), encoding="utf-8").read()
+_bs_fn = _bs_src[_bs_src.index("def _run_formation_ensure("):_bs_src.index("def _run_heal_preflight(")]
+check("H1.부트스트랩 레인이 ensure 를 --force-surface 로 호출(세션 1회성 · 배너 소멸 신호 도달)",
+      "--force-surface" in _bs_fn,
+      "수동 각성 경로에 없으면 앱 재시작/새 세션에서 boot-warning 배너가 불멸한다")
+# 앱 부트 레인(Rust)은 팩 밖 파일이라 리포에서만 검사 가능 — 팩 단독 설치 환경에서는 SKIP.
+_MAIN_RS = os.path.normpath(os.path.join(SELF, "..", "..", "..", "src-tauri", "src", "main.rs"))
+if os.path.exists(_MAIN_RS):
+    _rs = open(_MAIN_RS, encoding="utf-8").read()
+    _rs_fn = _rs[_rs.index("fn fire_formation_ensure"):]
+    _rs_fn = _rs_fn[:_rs_fn.index("\nfn ") if "\nfn " in _rs_fn else len(_rs_fn)]
+    check("H2.앱 부트 레인도 --force-surface(두 레인 동등성 — 한쪽만 고치면 반쪽 수리)",
+          '.arg("--force-surface")' in _rs_fn,
+          "src-tauri fire_formation_ensure 에서 강제 표면화가 빠졌다")
+else:
+    print("SKIP H2.앱 부트 레인 소스 부재(팩 단독 설치) — %s" % _MAIN_RS)
+
 print("\n%s: %d fail(s) %s" % ("FAIL" if fails else "PASS", len(fails), fails or ""))
 sys.exit(1 if fails else 0)
