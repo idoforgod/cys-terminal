@@ -111,6 +111,17 @@ p = sys.argv[1]
 rec = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'session': sys.argv[2], 'event': sys.argv[3],
        'path': sys.argv[4], 'own_scope': sys.argv[5], 'target_scope': sys.argv[6], 'mode': sys.argv[7]}
 try:
+  # ★크기 상한(reviewer2): 게이트 A는 코얼레싱이 없어 매 편집 적재라 무한 증가한다.
+  # 1MB 초과 시 최근 절반만 남기고 회전(원자 교체) — 오탐 실측 자료는 최근분이 가치.
+  try:
+    if os.path.getsize(p) > 1_048_576:
+      with open(p, encoding='utf-8') as rf: lines = rf.readlines()
+      keep = lines[len(lines)//2:]
+      tmp = p + '.tmp.%d' % os.getpid()
+      with open(tmp, 'w', encoding='utf-8') as wf: wf.writelines(keep)
+      os.replace(tmp, p)
+  except OSError:
+    pass
   with open(p, 'a', encoding='utf-8') as f:
     f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 except Exception:
