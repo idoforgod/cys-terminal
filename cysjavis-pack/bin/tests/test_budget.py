@@ -111,6 +111,67 @@ def main():
     else:
         check("6 budget env 음수/0/비숫자/공백/유효 각 거동", False, "_formation_budget_value 미노출")
 
+    # 7. ★이중계상 제거(2026-07-26) — 라이브 실측 재현.
+    #    live_agents(=ps 측정 nodes)는 소켓 스코프가 없어 **이미 기동된 부서의 노드를 전부 포함**한다.
+    #    구 산식은 거기에 dept_count×formation_size 를 통째로 더해 같은 노드를 두 번 셌다
+    #    (실측 2026-07-26: nodes=21 · depts=2 · size=5 → projected 31 인데 실존 노드는 21).
+    #    투영은 "앞으로 **새로** 뜰 노드"만 더해야 한다 → 기편성분(formed_agents)을 차감.
+    try:
+        before = fbc(live_agents=21, formation_size=5, dept_count=2, budget=20)  # formed=0 = 구 산식
+        after = fbc(live_agents=21, formation_size=5, dept_count=2, budget=20, formed_agents=10)
+        check("7a 구 산식 재현(기편성 미차감) = 21 + 2×5 = 31",
+              getattr(before, "projected", None) == 31, "got=%r" % (before,))
+        check("7b 이중계상 제거 후 = 21 + max(0, 10−10) = 21(실존 노드와 일치)",
+              getattr(after, "projected", None) == 21, "got=%r" % (after,))
+        check("7c 투영은 실측 노드 미만으로 내려가지 않는다(과다차감 하한)",
+              fbc(live_agents=21, formation_size=5, dept_count=2, budget=99,
+                  formed_agents=999).projected == 21, "하한 붕괴")
+        check("7d 미편성 부서는 여전히 곱셈 투영(예산 축 무력화 아님)",
+              fbc(live_agents=5, formation_size=5, dept_count=8, budget=20,
+                  formed_agents=5).projected == 40 and
+              fbc(live_agents=5, formation_size=5, dept_count=8, budget=20,
+                  formed_agents=5).blocked is True, "미편성 투영 소실")
+    except Exception as e:
+        check("7 이중계상 제거 전후 비교", False, "호출 실패: %s" % e)
+
+    # 8. _formed_agent_count — 편성 상태 파일(roles_booted) 합산·유령/base 레인 제외.
+    fac = getattr(m, "_formed_agent_count", None)
+    if callable(fac):
+        import json as _json
+        import os as _os
+        import shutil as _shutil
+        import tempfile as _tempfile
+        td = _tempfile.mkdtemp(prefix="fmbud-")
+        saved = _os.environ.get("CYS_STATE_DIR")
+        _os.environ["CYS_STATE_DIR"] = td
+        try:
+            fdir = _os.path.join(td, "formation")
+            _os.makedirs(fdir)
+            live_sock = _os.path.join(td, "dept-1.sock")
+            open(live_sock, "w").close()                      # 살아있는 부서 소켓
+            dead_sock = _os.path.join(td, "dept-gone.sock")    # 철거된 부서(파일 없음)
+
+            def w(name, obj):
+                with open(_os.path.join(fdir, name), "w", encoding="utf-8") as f:
+                    _json.dump(obj, f)
+
+            w("live.json", {"socket": live_sock, "roles_booted": ["master", "cso", "worker"]})
+            w("dead.json", {"socket": dead_sock, "roles_booted": ["master", "cso"]})
+            w("base.json", {"socket": "", "roles_booted": ["master", "cso"]})
+            w("broken.json", {"socket": live_sock, "roles_booted": "not-a-list"})
+            check("8a 살아있는 부서만 계수(철거·base 레인 제외)", fac(5) == 3, "got=%r" % (fac(5),))
+            check("8b 레인당 formation_size 상한(과다차감 방지)", fac(2) == 2, "got=%r" % (fac(2),))
+        except Exception as e:
+            check("8 _formed_agent_count 상태파일 계수", False, "실패: %s" % e)
+        finally:
+            if saved is None:
+                _os.environ.pop("CYS_STATE_DIR", None)
+            else:
+                _os.environ["CYS_STATE_DIR"] = saved
+            _shutil.rmtree(td, ignore_errors=True)
+    else:
+        check("8 _formed_agent_count 존재", False, "이중계상 차감 원천 미구현")
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
 

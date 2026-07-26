@@ -140,8 +140,114 @@ def main():
     else:
         check("8a 싱글플라이트 락 실행 스모크", False, "_singleflight 미구현")
 
+    # 9~11. ★ensure 판정 순서·표면화 계약(2026-07-26 배너 불멸 수리 회귀 핀).
+    ensure_order_gate(m)
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
+
+
+# ── 9~11. ensure 판정 순서 + 표면화 스팸 억제 (밀폐 — 라이브 데몬 무접촉) ──
+#   배경(라이브 실측 2026-07-26): ensure 가 자원 게이트를 로스터 판정보다 **먼저** 봐서, 5역할이
+#   전원 생존(classify=complete)인데도 _resource_ok=False 한 번에 pending-resource 로 조기 반환했다.
+#   UI 배너(bootbanner.ts)의 유일한 소멸 신호는 feed kind `formation-complete` 하나뿐이라 그 신호가
+#   영영 발행되지 않아 "팀 기동 경고" 배너가 불멸했다.
+#   ★쌍 게이트(reward-hack 차단): (a)만 통과하는 구현은 "배너를 그냥 지우는 것"과 구별 불가하므로
+#   (b) 로스터가 complete 가 **아닐 때는 formation-complete 를 절대 발행하지 않는다(INV-1)" 를
+#   함께 못박는다 — pending-cli 의 설치 안내(기능1 온보딩) 경로 보존까지 실증한다.
+def _ensure_harness(m, live, installed, resource_ok):
+    """ensure 의 외부 접촉(cys list·자원 게이트·boot_node·feed·EVT)을 전부 스텁으로 대체.
+    반환: feed 호출 기록 리스트(kind, title, body) — 라이브 `cys feed push` 는 절대 실행되지 않는다."""
+    feeds = []
+    m.gate_check = lambda: True
+    m._installed_clis = lambda: set(installed)
+    m._live_roles = lambda socket=None: (set(live) if live is not None else None)
+    m._resource_ok = lambda socket=None: resource_ok
+    m._boot_node = lambda role, socket, cwd=None, timeout=200: (True, "stub")
+    m._ensure_master_seat = lambda socket, cwd: (True, "stub")
+    m._feed = lambda title, body, kind="formation": feeds.append((kind, title, body))
+    m._emit_evt = lambda evt, fields: None
+    return feeds
+
+
+def ensure_order_gate(m):
+    import shutil
+    import tempfile
+    if not callable(getattr(m, "ensure", None)):
+        check("9a 로스터 complete + 자원 hard → complete", False, "ensure 미구현")
+        return
+    saved = {k: getattr(m, k) for k in
+             ("gate_check", "_installed_clis", "_live_roles", "_resource_ok",
+              "_boot_node", "_ensure_master_seat", "_feed", "_emit_evt")}
+    saved_state = os.environ.get("CYS_STATE_DIR")
+    td = tempfile.mkdtemp(prefix="fmens-")
+    os.environ["CYS_STATE_DIR"] = td
+    all_clis = {"claude", "agy", "codex"}
+    try:
+        # (a) 로스터 complete + 자원 hard(_resource_ok=False) → complete + formation-complete 표면화.
+        feeds = _ensure_harness(m, live=REQUIRED, installed=all_clis, resource_ok=False)
+        state, detail = m.ensure(socket="/tmp/a.sock")
+        check("9a 로스터 complete + 자원 hard → complete(자원 게이트보다 로스터 우선)",
+              state == "complete", "state=%r detail=%r" % (state, detail))
+        check("9a2 formation-complete 표면화(배너 소멸 신호 발행)",
+              [f for f in feeds if f[0] == "formation-complete"], "feeds=%r" % (feeds,))
+
+        # (b1) 로스터 partial(2/5) → complete 발행 금지(배너 유지).
+        feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
+        state, _d = m.ensure(socket="/tmp/b1.sock")
+        check("9b1 로스터 partial → complete 아님(배너 유지)",
+              m.state_kind(state) == "partial", "state=%r" % (state,))
+        check("9b2 partial 경로는 formation-complete 무발행(INV-1)",
+              not [f for f in feeds if f[0] == "formation-complete"]
+              and [f for f in feeds if f[0] == "formation-partial"], "feeds=%r" % (feeds,))
+
+        # (b2) CLI 전무 → pending-cli 유지 + 설치 안내(기능1 온보딩) 경로 보존 + complete 무발행.
+        feeds = _ensure_harness(m, live=set(), installed=set(), resource_ok=True)
+        state, _d = m.ensure(socket="/tmp/b2.sock")
+        check("9b3 CLI 전무 → pending-cli 유지", m.state_kind(state) == "pending-cli",
+              "state=%r" % (state,))
+        pend = [f for f in feeds if f[0] == "formation-pending"]
+        check("9b4 pending-cli 경로 complete 무발행 + 설치 안내 보존(기능1)",
+              not [f for f in feeds if f[0] == "formation-complete"]
+              and pend and "claude.ai/install.sh" in pend[0][2], "feeds=%r" % (feeds,))
+
+        # (b3) 로스터 complete 인데 CLI 부분 설치 → complete 로 승격 금지(부분 설치 오판 차단).
+        feeds = _ensure_harness(m, live=REQUIRED, installed={"claude"}, resource_ok=False)
+        state, _d = m.ensure(socket="/tmp/b3.sock")
+        check("9b5 부분 CLI 는 로스터 전원이어도 complete 아님(INV-1)",
+              state != "complete" and not [f for f in feeds if f[0] == "formation-complete"],
+              "state=%r feeds=%r" % (state, feeds))
+
+        # (c) 동일 kind 연속 10회 ensure → 표면화(feed) 는 1회만(주기 심박 토스트 스팸 차단).
+        feeds = _ensure_harness(m, live=REQUIRED, installed=all_clis, resource_ok=False)
+        for _ in range(10):
+            m.ensure(socket="/tmp/c.sock")
+        check("10 동일 kind 10회 ensure → 표면화 1회(주기 실행 토스트 스팸 0)",
+              len(feeds) == 1 and feeds[0][0] == "formation-complete",
+              "feeds=%r" % (feeds,))
+
+        # (c2) ★편성 실행(final) 경로도 동일 — 여기가 구 코드에서 _feed_for_state 를 **무조건** 부르던
+        #      자리다(주기 10분 잡이 붙으면 매 틱 토스트). partial 로스터로 10회 반복 → 표면화 1회.
+        feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
+        for _ in range(10):
+            m.ensure(socket="/tmp/c2.sock")
+        check("10b 편성 실행 경로 10회 → 표면화 1회(final 경로 스팸 게이트 = _surface 교체)",
+              len(feeds) == 1 and feeds[0][0] == "formation-partial", "feeds=%r" % (feeds,))
+
+        # (d) kind 전이 → 표면화 재발화(침묵 금지 C6 보존 — 스팸 억제가 침묵으로 퇴화하지 않음).
+        m._live_roles = lambda socket=None: {"master", "cso"}
+        m._resource_ok = lambda socket=None: True
+        m.ensure(socket="/tmp/c.sock")
+        check("11 kind 전이(complete→partial) → 표면화 재발화",
+              len(feeds) == 2 and feeds[1][0] == "formation-partial", "feeds=%r" % (feeds,))
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+        if saved_state is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = saved_state
+        shutil.rmtree(td, ignore_errors=True)
 
 
 if __name__ == "__main__":

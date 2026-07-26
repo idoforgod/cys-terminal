@@ -72,7 +72,9 @@ def _active_dept_count():
 
 
 # ── ★W6 곱셈 자원 예산(설계 DD-3/W6·오너 2026-07-24) ──
-# 부서 수 × 편성 크기 곱셈으로 조직 전체의 투영 에이전트 수를 예산과 대조한다. 역할 중립(CEO·부서장·
+# 부서 수 × 편성 크기 곱셈으로 조직 전체의 투영 에이전트 수를 예산과 대조한다. ★단, 곱셈분에서 **이미
+# 편성돼 살아있는 노드**(live 측정에 이미 포함)를 뺀다 — 안 빼면 기존 편성을 두 번 센다(_formed_agent_count).
+# 역할 중립(CEO·부서장·
 # base 동일 물리법칙) · **hard-fail 아님** — 초과 시 편성은 pending-resource 로 '대기·자동 재시도'
 # (기존 hard/soft 의미론 보존: 게이트는 master/편성 부트 플로우가 호출하므로 조직 기동을 영영 막지 않는다).
 FORMATION_BUDGET_ENV = "CYS_FORMATION_BUDGET"
@@ -98,35 +100,88 @@ def _formation_budget_value(explicit=None):
     return v if v > 0 else FORMATION_BUDGET_DEFAULT
 
 
+def _formation_state_dir():
+    """javis_formation 편성 상태 저장 루트(<CYS_STATE_DIR or ~/.cys/state>/formation) — 동일 규약."""
+    return os.path.join(
+        os.environ.get("CYS_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cys", "state"),
+        "formation")
+
+
+def _formed_agent_count(formation_size=0):
+    """★이중계상 차단(2026-07-26): **이미 편성돼 살아있는** 부서 레인의 노드 수.
+
+    live_agents(ps 측정 nodes)는 소켓 스코프가 전혀 없다(_count_matching 은 머신 전역 ps 를 센다) —
+    즉 이미 기동된 부서의 claude/agy/codex 프로세스가 **전부 이미 포함**돼 있다. 그런데 구 투영식은
+    거기에 dept_count×formation_size 를 통째로 더해 같은 노드를 두 번 셌다(라이브 실측 2026-07-26:
+    nodes=21 · depts=2 · size=5 → projected 31, 실제 존재 노드는 21).
+    투영은 "앞으로 **새로** 뜰 노드"만 더해야 하므로, 각 부서 레인의 이미 생존한 역할 수를 빼준다.
+
+    원천: javis_formation 이 레인별로 기록하는 상태 파일의 roles_booted(=관측된 live 로스터).
+    · socket 이 빈 레인(base)은 제외 — dept_count 가 부서 소켓만 세므로 대칭을 맞춘다.
+    · 소켓 파일이 사라진(철거된) 부서는 제외 — 유령 차감으로 예산이 과대해지지 않게(안전측).
+    · 레인당 formation_size 로 상한(과다 차감 방지). 읽기 실패는 0(보수적 = 구 동작 쪽).
+    """
+    import glob as _glob
+    cap = int(formation_size or 0)
+    total = 0
+    for p in _glob.glob(os.path.join(_formation_state_dir(), "*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                obj = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        sock = obj.get("socket") or ""
+        if not sock or not os.path.exists(sock):
+            continue
+        rb = obj.get("roles_booted")
+        n = len(rb) if isinstance(rb, list) else 0   # 손상 필드는 0(보수적 = 구 동작 쪽)
+        total += min(n, cap) if cap > 0 else n
+    return total
+
+
 class BudgetVerdict:
     """곱셈 편성 예산 판정 결과. blocked=True → pending-resource(대기·자동 재시도·hard-fail 아님)."""
 
-    def __init__(self, blocked, projected, budget, live_agents, formation_size, dept_count):
+    def __init__(self, blocked, projected, budget, live_agents, formation_size, dept_count,
+                 formed_agents=0, incoming=0):
         self.blocked = blocked
         self.projected = projected
         self.budget = budget
         self.live_agents = live_agents
         self.formation_size = formation_size
         self.dept_count = dept_count
+        self.formed_agents = formed_agents   # 이미 편성돼 live 에 포함된 노드(투영에서 제외된 수)
+        self.incoming = incoming             # 앞으로 새로 뜰 노드(투영 가산분)
         self.state = "pending-resource" if blocked else "ok"
 
     def __repr__(self):
         rel = ">" if self.blocked else "<="
-        return "%s(projected=%d%sbudget=%d · live=%d + depts=%d×size=%d)" % (
-            self.state, self.projected, rel, self.budget,
-            self.live_agents, self.dept_count, self.formation_size)
+        return ("%s(projected=%d%sbudget=%d · live=%d + incoming=%d "
+                "[depts=%d×size=%d − 기편성=%d])" % (
+                    self.state, self.projected, rel, self.budget, self.live_agents,
+                    self.incoming, self.dept_count, self.formation_size, self.formed_agents))
 
     __str__ = __repr__
 
 
-def formation_budget_check(live_agents, formation_size, dept_count=1, budget=None):
-    """곱셈 편성 예산: projected = live_agents + max(1,dept_count)×formation_size 가 budget 초과면 차단.
+def formation_budget_check(live_agents, formation_size, dept_count=1, budget=None,
+                           formed_agents=0):
+    """곱셈 편성 예산: projected = live_agents + **신규 투영분** 이 budget 초과면 차단.
+      신규 투영분 = max(0, max(1,dept_count)×formation_size − formed_agents)
+    formed_agents = 이미 편성돼 살아있는(=live_agents 에 이미 계수된) 노드 수 → 이중계상 제거
+    (기본 0 = 구 동작 그대로. 라이브 경로는 cmd_check 가 _formed_agent_count 로 채운다).
     역할 중립 · hard-fail 아님(초과=pending-resource 대기). 반환: BudgetVerdict(.blocked·.state)."""
     budget = _formation_budget_value(budget)
     dept_count = max(1, int(dept_count or 1))
-    projected = int(live_agents or 0) + dept_count * int(formation_size or 0)
+    size = int(formation_size or 0)
+    incoming = max(0, dept_count * size - int(formed_agents or 0))
+    projected = int(live_agents or 0) + incoming
     return BudgetVerdict(projected > budget, projected, budget,
-                         int(live_agents or 0), int(formation_size or 0), dept_count)
+                         int(live_agents or 0), size, dept_count,
+                         int(formed_agents or 0), incoming)
 
 
 def _ps_lines():
@@ -296,11 +351,16 @@ def cmd_check(a):
     if getattr(a, "formation_size", 0):
         live = m["nodes"] if m["nodes"] is not None else 0
         depts = a.dept_count if getattr(a, "dept_count", None) else max(1, m["active_depts"])
+        # ★이중계상 차단: 이미 편성돼 live(ps 측정)에 포함된 노드는 투영 가산에서 뺀다.
+        formed = (a.formed_agents if getattr(a, "formed_agents", None) is not None
+                  else _formed_agent_count(a.formation_size))
         bv = formation_budget_check(live_agents=live, formation_size=a.formation_size,
-                                    dept_count=depts, budget=a.formation_budget)
+                                    dept_count=depts, budget=a.formation_budget,
+                                    formed_agents=formed)
         checks.append({"metric": "formation_budget", "value": bv.projected,
                        "soft": bv.budget, "hard": bv.budget + 1,
-                       "level": "hard" if bv.blocked else "ok"})
+                       "level": "hard" if bv.blocked else "ok",
+                       "formed_agents": bv.formed_agents, "incoming": bv.incoming})
         if bv.blocked:
             worst = "hard"
     verdict = {"ok": "allow", "soft": "soft_warn", "hard": "hard_block"}[worst]
@@ -519,6 +579,8 @@ def main(argv=None):
                    help="부서 수(미지정 시 활성 소켓 수 측정값 사용)")
     c.add_argument("--formation-budget", dest="formation_budget", type=int, default=None,
                    help="편성 예산 한도(미지정 시 CYS_FORMATION_BUDGET env 또는 기본 20)")
+    c.add_argument("--formed-agents", dest="formed_agents", type=int, default=None,
+                   help="이미 편성돼 살아있는 노드 수(테스트 주입 — 미지정 시 편성 상태 파일 측정)")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")

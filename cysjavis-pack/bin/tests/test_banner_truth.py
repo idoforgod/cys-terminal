@@ -149,5 +149,40 @@ if ev:
     check("F1.emit 왕복 exit 0", r.returncode == 0, r.stderr.strip())
     check("F1b.emit wire 라인", "[EVT v2] boot.formation.complete" in r.stdout)
 
+# ── G: pending-resource 배너 문구의 **진실성** — "자동 재시도" 약속에 재시도 주체가 실존하는가 ──
+# 배경(2026-07-26): pending-resource 배너는 "자원 정리 후 자동 재시도됩니다"라고 말하는데, 정작
+# 편성 ensure 를 주기 실행하는 잡이 schedule.json 에 **0건**이었다(거짓 약속 = 배너 진실 위반).
+# 재시도 주체(주기 잡)와 스팸 억제(_surface 전이 게이트)는 **반드시 함께** 있어야 한다 — 잡만 있고
+# 억제가 없으면 매 틱 토스트 폭주, 억제만 있고 잡이 없으면 약속이 거짓이다. 둘 다 못박는다.
+import json as _json
+
+SCHED = os.path.normpath(os.path.join(SELF, "..", "..", "schedule.json"))
+try:
+    _jobs = (_json.load(open(SCHED, encoding="utf-8")) or {}).get("jobs", [])
+except (OSError, ValueError) as e:
+    _jobs = []
+    check("G0.schedule.json 파싱", False, str(e))
+_fj = [j for j in _jobs if "javis_formation.py" in (j.get("command") or "")
+       or "javis_formation.py" in (j.get("text_command") or "")]
+check("G1.편성 재시도 주체 실존(schedule.json 에 formation ensure 주기 잡)",
+      bool(_fj), "formation 잡 %d건 — 배너의 '자동 재시도' 약속이 거짓이 된다" % len(_fj))
+if _fj:
+    j = _fj[0]
+    check("G2.주기 잡이다(every_minutes 설정·과빈도 아님)",
+          isinstance(j.get("every_minutes"), int) and 1 <= j["every_minutes"] <= 60,
+          "every_minutes=%r" % j.get("every_minutes"))
+    check("G3.ensure 를 호출한다", " ensure" in (j.get("command") or ""), j.get("command", ""))
+    check("G4.레인 소켓 규약 준수(부서=--socket · 본부=인자 생략)",
+          "${CYS_SOCKET:+--socket" in (j.get("command") or ""),
+          "레인별 상태키·락키가 갈라지면 중복 스폰")
+if fm:
+    # G5) 짝 조건: 주기 잡이 붙어도 표면화는 kind 전이 시에만(위 C2/C5 가 억제를 실증) —
+    #     ensure 최종 경로가 무조건 feed 하지 않는지 소스 계약으로 재확인(스팸 폭주 회귀 핀).
+    _src = open(os.path.join(BIN, "javis_formation.py"), encoding="utf-8").read()
+    _tail = _src[_src.index("def ensure("):_src.index("# ── 두 경로 동등성")]
+    check("G5.ensure 어느 경로도 _feed_for_state 를 직접 호출하지 않는다(전부 _surface 경유)",
+          "_feed_for_state(" not in _tail,
+          "무조건 표면화가 남아 있으면 주기 잡이 매 틱 토스트를 낸다")
+
 print("\n%s: %d fail(s) %s" % ("FAIL" if fails else "PASS", len(fails), fails or ""))
 sys.exit(1 if fails else 0)

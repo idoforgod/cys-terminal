@@ -14,7 +14,10 @@
   pending-resource = 곱셈 자원 예산 초과(hard) — 대기·자동 재시도.
 
 ensure(socket): ①cys gate-check(paused→pending 유지 종료) ②소켓키 싱글플라이트 락
-  ③probe_cli(로그인셸 우산) 역할별 CLI 판정 ④javis_resource_gate.py check(hard→pending-resource)
+  ③probe_cli(로그인셸 우산) 역할별 CLI 판정 ③′라이브 로스터 관측·분류 — **이미 complete 면 자원
+    게이트를 보지 않고 즉시 complete 기록·표면화**(신규 스폰 0 = 자원 소비 0. 구 순서는 complete 레인을
+    pending-resource 로 조기 반환해 배너 소멸 신호를 영구 차단했다)
+  ④complete 가 아닐 때만 javis_resource_gate.py check(hard→pending-resource)
   ⑤master 자리: 죽었으면 new-surface --role master 재생성 / 빈 셸이면 javis_boot_node 입양경로로
     claude 부착 / 이미 각성이면 no-op ⑥나머지 역할 javis_boot_node 재사용(CSO 먼저) ⑦상태 파일
     갱신 + feed 표면화(침묵 금지) ⑧멱등(이미 기동된 역할 재기동 금지 — boot_node already_up).
@@ -436,12 +439,29 @@ def ensure(socket=None, cwd=None):
         if not lock.acquired:
             return "partial:inflight", "다른 편성 진행 중(싱글플라이트) — no-op"
 
-        # ③ CLI 가용성
+        # ③ CLI 가용성(로그인셸 우산 프로브 — 이 ensure 에서 1회만 수행하고 이하 전 경로가 재사용)
         installed = _installed_clis()
 
-        # ④ 자원 게이트
+        # ③′ ★로스터 우선 판정(자원 게이트보다 먼저 — 2026-07-26 배너 불멸 수리).
+        #    이미 complete(5역할 전원 생존)면 **새로 뜰 노드가 0** 이므로 자원 게이트를 볼 이유가 없다.
+        #    구 순서(자원 먼저)는 complete 인 레인을 pending-resource 로 조기 반환시켜 배너 소멸 신호
+        #    (formation-complete)를 영원히 발행하지 못하게 했다(라이브 실측: classify=complete ∧
+        #    _resource_ok=False → pending-resource 기록).
+        #    ★불변식 INV-1: complete 는 **오직 classify()==complete** 일 때만 — 아래 어떤 경로도
+        #    formation-complete 를 발행하지 않는다(pending-cli·partial 은 기존 kind 유지 = 기능1
+        #    인앱 CLI 설치 온보딩 안내 보존).
+        live_now = _live_roles(socket)
+        if live_now is not None and classify(installed=installed, live=live_now,
+                                             resource_ok=True) == "complete":
+            state = "complete"
+            detail = "라이브 로스터 이미 완결(5역할 생존) — 신규 기동 0 · 자원 게이트 무관"
+            _write_state(socket, state, detail, live_now)
+            _surface(socket, prev, state)
+            return state, detail
+
+        # ④ 자원 게이트(complete 가 **아닐 때만** — 실제로 노드를 스폰하는 경로에서만 예산을 본다)
         if not _resource_ok(socket):
-            live = _live_roles(socket) or set()
+            live = live_now or set()   # ③′ 관측 재사용(cys list 중복 호출 0)
             state = "pending-resource"
             detail = "곱셈 자원 예산 hard — 편성 대기"
             _write_state(socket, state, detail, live)
@@ -450,7 +470,7 @@ def ensure(socket=None, cwd=None):
 
         # CLI 전무 → pending-cli(빈 셸 유지·온보딩 보존)
         if not installed:
-            live = _live_roles(socket) or set()
+            live = live_now or set()   # ③′ 관측 재사용(cys list 중복 호출 0)
             state = classify(installed=installed, live=live, resource_ok=True)
             detail = "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)"
             _write_state(socket, state, detail, live)
@@ -479,7 +499,10 @@ def ensure(socket=None, cwd=None):
         detail = "편성 실행 — 기동=%s · 설치CLI=%s" % (
             ",".join(sorted(booted)) or "없음", ",".join(sorted(installed)))
         _write_state(socket, state, detail, live)
-        _feed_for_state(state)
+        # ★주기 실행 스팸 차단(2026-07-26): 무조건 _feed_for_state 였던 자리를 _surface(전이 시에만
+        # 표면화) 로 교체한다. 편성 ensure 가 스케줄 주기(10분)로 붙으면 매 틱마다 사용자에게 토스트가
+        # 갔다. prev 는 ensure 진입부에서 읽은 직전 상태 — 동일 kind 면 _surface 계약대로 생략된다.
+        _surface(socket, prev, state)
         return state, detail
 
 
