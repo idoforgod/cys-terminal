@@ -227,6 +227,8 @@ RBAC PII 가림(`CYS_CONTROL_REDACT=1`). 상세 설계: docs/CONTROL_CENTER_DESI
 | T2-7 | **디렉티브 드리프트 감지·재주입** | `cys reinject --role X [--check]` |
 | T2-8 | **오케스트레이터 dead-man**: 단일 장애점 봉합 | `master.deadman` 이벤트 |
 | T3-9 | **todo 워치**: 역할별 TODO 파일 mtime 감시→진행률 집계 | `todo.updated` · `cys todo-path` |
+| T3-9b | **팩 경로 데몬 권위**: 경로 산출이 클라이언트 env가 아니라 데몬 봉투(`pack_dir`·`scope`)를 따른다 — env 유실 pane이 남의 팩에 쓰는 것을 차단 | `cys todo-path [--role R] [--kind session-state\|recovery]` |
+| T3-9c | **교차-scope 판정기**: 쓰기 대상이 남의 scope 팩인지 판정(훅 SOT · JSON 5키 · exit 0 고정) | `cys pack-scope-check --path <p>` |
 | T3-10 | **원샷 타이머** (+fresh TTL `--close-after`) | `cys schedule add --id x --in 20m --text ... --to role` |
 | T3-11 | **역할 글롭 브로드캐스트** | `cys send --to 'reviewer-*' "..."` |
 | T3-12 | **feed aging 재알림**: pending 승인 무음 적체 차단 | `feed.item.aging` |

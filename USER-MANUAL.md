@@ -277,11 +277,36 @@ cys reinject --role worker [--check]   # 디렉티브 재주입 (--check: 드리
 에이전트 사망은 즉시 감지되어 `agent.exited/recovered` 이벤트가 흐르고, 옵션으로 자동
 재기동(`CYS_AGENT_AUTORESTART=1`, 3회 상한·인증 오류 시 차단)이 가능합니다.
 
-### 5.7 역할별 TODO 경로
+### 5.7 역할별 TODO 경로 · 팩 경로 판정
 
 ```bash
-cys todo-path        # 이 surface 역할 전용 TODO 파일 경로를 결정론으로 산출(없으면 생성)
+cys todo-path                          # 이 surface 역할 전용 TODO 파일 경로를 결정론으로 산출(없으면 생성)
+cys todo-path --role worker-2          # 다른 역할의 경로만 산출 (파일 생성·기록 없음)
+cys todo-path --kind session-state     # 팩 정본 SESSION_STATE.md 경로만 산출 (생성 없음)
+cys todo-path --kind recovery          # 팩 정본 RECOVERY.md 경로만 산출 (생성 없음)
 ```
+
+팩 경로는 **데몬이 권위**입니다. `todo-path`는 역할을 물을 때 쓰는 같은 `surface.list` 응답의
+봉투에서 `pack_dir`을 함께 읽어(추가 왕복 없음), 로컬 `CYS_PACK_DIR`과 다르면 경고 한 줄을 낸 뒤
+**데몬 값을 채택**합니다. 부서 pane이 `CYS_PACK_DIR`을 잃으면 로컬 산출은 조용히 본사 팩
+(`~/.cys/pack`)으로 폴백하는데, 그러면 부서 노드의 TODO가 본사 팩에 쓰입니다 — 데몬 권위가
+이것을 막습니다. 봉투에 키가 없는 구버전 데몬이면 조용히 로컬로 폴백하고, 데몬에 묻지 못하면
+그 사실을 stderr로 알립니다.
+
+`--kind`가 산출하는 SESSION_STATE·RECOVERY는 역할과 무관한 팩 단위 파일이라 **역할이 등록되지
+않은 surface에서도 동작**합니다(복원 초입에 읽히는 파일이기 때문입니다). 세 경로 모두 같은 팩
+권위 산출을 공유합니다.
+
+```bash
+cys pack-scope-check --path <경로>     # 이 경로가 '남의 scope 팩'인지 판정 (stdout JSON · exit 0 고정)
+```
+
+`pack-guard` 훅이 쓰는 판정 SOT입니다. 출력은 5키
+`{verdict, own_scope, target_scope, suggest, authority}`이고, `verdict`는 `ok` 또는 `cross-scope`,
+`authority`는 자기 scope의 출처(`daemon`=surface.list 봉투 / `local`=로컬 env 산출)입니다.
+**어떤 오류에서도 exit 0**이며 판정 불가는 `verdict: "ok"`로 표현합니다 — 훅 내부 사정이 도구
+실행을 막지 않게 하려는 계약입니다. `authority`가 `daemon`이 아니면 소비자는 차단을 기록으로
+강등해야 합니다(권위가 불확실할 때는 막지 않습니다).
 
 ---
 
@@ -612,7 +637,8 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | 기본 | `ping` `identify` `actions` `doctor` | 데몬 확인·자기 주소·명령 카탈로그·자기진단(`--fix`) |
 | surface | `new-surface` `list` `attach` `read-screen` `resize` `close-surface` `quiesce` `tombstone` | 세션 생성·목록·미러링·화면 읽기·크기·닫기(자식 트리 전멸)·주입 보류·묘비 |
 | 통신 | `send` `send-key` `events` `watch` | stdin 주입·키 주입·이벤트 구독·regex 완료 대기 |
-| 역할·함대 | `launch-agent` `boot` `claim-role` `surface-role` `status` `fleet` `set-status` `todo-path` | 역할 노드 기동·일괄 부트·역할 등록/조회·관제 보드·자기보고·역할별 TODO 경로 |
+| 역할·함대 | `launch-agent` `boot` `claim-role` `surface-role` `status` `fleet` `set-status` `todo-path` | 역할 노드 기동·일괄 부트·역할 등록/조회·관제 보드·자기보고·역할별 TODO 경로(`--role` 타역할 산출 · `--kind session-state\|recovery` 팩 정본 파일 경로 · 팩은 데몬 권위 우선) |
+| 팩 경계 | `pack-scope-check` | 쓰기 대상이 남의 scope 팩인지 판정(훅 SOT · JSON 5키 `verdict`/`own_scope`/`target_scope`/`suggest`/`authority` · exit 0 고정) |
 | 사이클·복구 | `cycle-agent` `node-recover` `restore` `reinject` `drain` | 컨텍스트 사이클·재기동·조직 복원·지침 재주입·업데이트 전 저장 신호(`drain --verify`=노드별 체크포인트 저장을 nonce 마커로 결정론 검증 후 JSON+exit code) |
 | 거버넌스 | `run` `ps` `kill` `add-health-rule` `health-rules` `pause` `resume` `gate-check` `queue` | scoped 실행·원장·강제 종료·헬스룰·kill-switch·큐 관리 |
 | 승인 | `feed` `approval` | 승인 요청함(push/list/reply)·HMAC signed-prefix 서명(check/sign) |
@@ -730,6 +756,19 @@ editor.action_catalog / action_info
 channel.start / stop / register / inbound / outbound / receipt / ack / allow /
         allow-remote-approve / revoke / lockdown / unlock / status
 ```
+
+`surface.list` · `system.identify` · `org.status`의 응답에는 **봉투 레벨**(surface 엔트리 안이
+아니라 `result` 최상위)로 데몬 정체성 두 키가 실립니다.
+
+| 키 | 뜻 |
+|---|---|
+| `pack_dir` | 이 데몬이 소속된 팩 디렉터리 절대경로 |
+| `scope` | 그 팩의 이름(본사 `pack` · 부서 `pack-dept-<n>`) |
+
+값은 데몬 기동 시 1회 캡처한 상수라 요청마다 흔들리지 않습니다. 클라이언트(`cys todo-path`·
+`cys pack-scope-check`·pack-guard 훅)는 이 값을 자기 `CYS_PACK_DIR`보다 **우선하는 권위**로
+씁니다. 추가된 키이므로 구버전 클라이언트는 무시하고, 구버전 데몬(키 없음)에 붙은 신버전
+클라이언트는 로컬 env로 조용히 폴백합니다.
 
 ### 이벤트 (계열별)
 

@@ -601,6 +601,11 @@ enum Command {
         /// 경로 대신 **선언 한 줄**을 출력한다(손기재 오작성을 줄이는 기계 생성기 · 설계 §4-4 P1).
         #[arg(long)]
         emit_decl: bool,
+        /// todo 대신 **팩 단위 파일**의 경로를 산출한다(생성·기록 없음 · 설계 CU-2C).
+        /// `session-state`=`<팩>/round/SESSION_STATE.md` · `recovery`=`<팩>/round/RECOVERY.md`.
+        /// 역할과 무관한 파일이므로 역할 미등록에서도 동작한다 — 팩 산출 권위는 todo 경로와 공유.
+        #[arg(long, value_enum)]
+        kind: Option<TodoKind>,
     },
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
@@ -625,6 +630,38 @@ enum Command {
         #[command(subcommand)]
         action: ChannelAction,
     },
+}
+
+/// ★CU-2C — `todo-path --kind`가 산출하는 **팩 단위 파일**의 종류.
+///
+/// 왜 todo-path에 얹는가: 디렉티브가 없애려는 병은 "`~/.cys/pack/round/...`를 손으로 적는 것"
+/// 하나다. todo만 기계 산출로 바꾸고 SESSION_STATE·RECOVERY는 리터럴로 남기면, 부서 노드는
+/// 여전히 본사 팩에 복원 파일을 쓴다 — 같은 병이 이름만 바꿔 남는다. 산출 권위(데몬 우선)를
+/// 재구현하지 않고 **같은 경로를 공유**하는 것이 이 옵션의 요점이다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TodoKind {
+    /// 복원의 단일 진실 — 현재 위치·지시 대장·노드 상태·미해결 게이트·다음 액션.
+    SessionState,
+    /// 재부팅 프로토콜 — SESSION_STATE보다 먼저 읽히는 복원 순서서.
+    Recovery,
+}
+
+impl TodoKind {
+    /// 파일명 정본. 이 대응을 두 곳에 적으면 언젠가 갈리고, 그러면 **쓰는 곳과 읽는 곳이
+    /// 다른 파일을 가리킨다** — 유령 todo 사고와 같은 형태의 실패다.
+    fn file_name(self) -> &'static str {
+        match self {
+            TodoKind::SessionState => "SESSION_STATE.md",
+            TodoKind::Recovery => "RECOVERY.md",
+        }
+    }
+}
+
+/// `--kind` 경로 조립 — 팩 round 디렉터리 + 종류별 파일명. **순수 함수인 것 자체가 계약**이다:
+/// 여기엔 `create_dir_all`도 `write`도 없으므로 "산출만 하고 만들지 않는다"가 코드 형태로 자명하다
+/// (todo 경로는 생성기라서 이 성질이 없다 — 그래서 분기 자체를 분리했다).
+fn kind_path(pack_round: &std::path::Path, kind: TodoKind) -> std::path::PathBuf {
+    pack_round.join(kind.file_name())
 }
 
 #[derive(Subcommand)]
@@ -2289,7 +2326,7 @@ fn run(command: Command) -> i32 {
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd } => return run_boot(cwd),
-        Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
+        Command::TodoPath { role, emit_decl, kind } => return run_todo_path(role, emit_decl, kind),
 
         Command::SurfaceRole => return run_surface_role(),
         Command::PackScopeCheck { path } => return run_pack_scope_check(&path),
@@ -4961,7 +4998,7 @@ fn pack_authority_local_notice(local: &std::path::Path) -> String {
     )
 }
 
-fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
+fn run_todo_path(role_opt: Option<String>, emit_decl: bool, kind: Option<TodoKind>) -> i32 {
     // `--role` 지정 = 남의 역할 산출 = **파일 기록 금지**(설계 R7 신원 게이트 우회 방지).
     let foreign = role_opt.is_some();
     // ★CU-3B: 역할 조회와 **같은 응답의 봉투**에서 팩 권위를 함께 회수한다(추가 왕복 0).
@@ -4978,43 +5015,49 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
     };
     // `--role`은 **남의 역할 경로 산출 전용**이다(파일 생성·기록 없음 · 설계 R7). 자기 역할은
     // 데몬이 정본이므로 surface.list로 조회한다 — 손으로 지어 부르는 것을 막는 것이 이 명령의 존재 이유다.
-    let role = match role_opt {
-        Some(r) => {
+    //
+    // ★CU-2C: 역할 해석 **실패를 즉시 치명으로 다루지 않는다**. `--kind`가 산출하는
+    // SESSION_STATE·RECOVERY는 역할과 무관한 팩 단위 파일이라, 역할이 없다고 거부하면 정확히
+    // 필요한 순간에 막힌다 — RECOVERY 경로는 데몬 roles 맵이 아직 비어 있는 **복원 초입**에
+    // 읽히는 파일이다. 그래서 실패 사유를 들고만 있다가, 역할이 실제로 필요한 지점에서 낸다.
+    let mut own_role: Option<String> = None;
+    let mut role_error: Option<String> = None;
+    match &role_opt {
+        Some(_) => {
+            // 봉투(팩 권위)만 받으러 1회 묻는다 — 남의 역할 경로도 같은 권위를 써야 한다.
             if let Ok(resp) = request("surface.list", json!({})) {
                 absorb_envelope(&resp);
             }
-            r
         }
-        None => {
-            let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
-                eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다(다른 역할은 --role)");
-                return 1;
-            };
-            let Some(my_sid) = parse_surface_ref(&sref) else {
-                eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
-                return 1;
-            };
-            let role = match request("surface.list", json!({})) {
-                Ok(r) => {
-                    absorb_envelope(&r);
-                    r["surfaces"].as_array().and_then(|arr| {
-                        arr.iter()
-                            .find(|s| s["surface_id"].as_u64() == Some(my_sid))
-                            .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
-                    })
-                }
-                Err(e) => {
-                    eprintln!("surface.list 실패: {e}");
-                    return 1;
-                }
-            };
-            let Some(role) = role else {
-                eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
-                return 1;
-            };
-            role
-        }
-    };
+        None => match cys::env_compat(ENV_SURFACE_ID) {
+            None => {
+                role_error = Some(
+                    "CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다(다른 역할은 --role)"
+                        .into(),
+                )
+            }
+            Some(sref) => match parse_surface_ref(&sref) {
+                None => role_error = Some(format!("CYS_SURFACE_ID 파싱 실패: {sref}")),
+                Some(my_sid) => match request("surface.list", json!({})) {
+                    Ok(r) => {
+                        absorb_envelope(&r);
+                        own_role = r["surfaces"].as_array().and_then(|arr| {
+                            arr.iter()
+                                .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                                .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+                        });
+                        if own_role.is_none() {
+                            role_error = Some(
+                                "이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용"
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(e) => role_error = Some(format!("surface.list 실패: {e}")),
+                },
+            },
+        },
+    }
 
     // ★S19 — 팩 경로는 `cys::pack::pack_dir()` 단일 구현을 경유한다. 종전에는
     // `env_compat("CYS_PACK_DIR")`(= CYS_/JAVIS_/AITERM_**PACK**_DIR)만 봐서 레거시 키
@@ -5035,6 +5078,32 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
     let scope = daemon_scope
         .filter(|s| !s.is_empty())
         .unwrap_or_else(cys::pack::scope_id);
+    let round = pack.join("round");
+
+    // ★CU-2C `--kind` — 팩 단위 파일 경로 **산출 전용**(생성·기록 없음). 위에서 산출한 `pack`을
+    // 그대로 쓴다(별도 산출 금지 — 두 벌이면 갈린다). 역할은 이 경로에 관여하지 않으므로
+    // `role_error`가 있어도 성공한다: 복원 초입(역할 미등록)이 이 옵션의 주 사용처다.
+    if let Some(k) = kind {
+        if emit_decl {
+            // 선언은 todo 파일의 귀속 표식이다 — 팩 단위 파일에는 의미가 없다. 조용히 무시하면
+            // 호출자는 선언을 받은 줄 알고 파이프에 흘린다. 무시했다는 사실을 말한다.
+            eprintln!("ℹ --emit-decl 무시 — 선언은 todo 파일 전용이다(--kind는 팩 단위 파일 경로 산출).");
+        }
+        println!("{}", kind_path(&round, k).display());
+        return 0;
+    }
+
+    // 여기부터는 역할이 필수다(todo는 역할별 파일) — 미룬 실패를 지금 낸다.
+    let role = match role_opt {
+        Some(r) => r,
+        None => match own_role {
+            Some(r) => r,
+            None => {
+                eprintln!("{}", role_error.unwrap_or_else(|| "역할 해석 실패".into()));
+                return 1;
+            }
+        },
+    };
 
     // 선언은 **경로보다 먼저** 만든다 — 만들 수 없으면 파일도 만들지 않는다(부분 성공 금지).
     let decl_line = match build_todo_decl_line(&role, &scope) {
@@ -5054,7 +5123,6 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
         return 0;
     }
 
-    let round = pack.join("round");
     let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
     let path = round.join(&fname);
 
@@ -12467,6 +12535,93 @@ mod tests {
         let s = pack_scope_suggest("pack-dept-dept-2", "pack");
         assert!(s.contains("cys todo-path"), "교정 경로 안내가 없다: {s}");
         assert!(s.contains("pack-dept-dept-2") && s.contains("pack"));
+    }
+
+    // ── CU-2C: todo-path --kind (팩 단위 파일 경로 산출) ─────────────────────
+    //
+    // 이 옵션이 없으면 디렉티브(MASTER 34·225행)가 **존재하지 않는 옵션을 지시**한다 —
+    // 지시를 따르려는 노드는 `unexpected argument '--kind'`를 받고 리터럴 경로로 되돌아간다.
+    // 그게 정확히 이 작업이 없애려는 병(손으로 적은 `~/.cys/pack/round/...`)이다.
+
+    /// kind 2종의 경로 산출 + **파일을 만들지 않는다**는 성질을 함께 못박는다.
+    /// 산출만 하는 명령이 조용히 디렉터리를 만들면, 부서 노드가 본사 팩에 빈 round를 남긴다.
+    #[test]
+    fn kind_path_derives_pack_scoped_files_without_creating_anything() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-kind-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("round");
+        assert_eq!(
+            kind_path(&round, TodoKind::SessionState),
+            round.join("SESSION_STATE.md")
+        );
+        assert_eq!(kind_path(&round, TodoKind::Recovery), round.join("RECOVERY.md"));
+        assert!(!td.exists(), "경로 산출이 디렉터리를 만들었다 — 산출 전용 계약 위반");
+        assert!(!round.exists());
+    }
+
+    /// **데몬 권위 공유**: kind 경로는 todo 경로와 같은 `resolve_pack_authority` 결과에서 파생된다.
+    /// 별도 산출을 두면 env 유실 pane에서 todo는 부서 팩, SESSION_STATE는 본사 팩으로 갈린다 —
+    /// 한 노드의 복원 파일과 작업 파일이 다른 팩에 사는 상태가 된다.
+    #[test]
+    fn kind_path_shares_daemon_pack_authority_with_todo_path() {
+        let local = std::path::Path::new("/home/x/.cys/pack"); // env 유실 → 홈 폴백(본사)
+        let (pack, warn) = resolve_pack_authority(Some("/home/x/.cys/pack-dept-dept-2"), local);
+        assert!(warn.is_some(), "불일치는 경고와 함께 데몬 값을 채택한다");
+        let round = pack.join("round");
+        assert_eq!(
+            kind_path(&round, TodoKind::SessionState),
+            std::path::PathBuf::from("/home/x/.cys/pack-dept-dept-2/round/SESSION_STATE.md"),
+            "kind 경로가 데몬 권위를 따르지 않으면 복원 파일이 남의 팩에 산다"
+        );
+        // 구데몬(봉투 키 없음)에서는 todo와 **같은** 로컬 폴백을 쓴다 — 둘이 갈리지 않는다.
+        let (pack2, _) = resolve_pack_authority(None, local);
+        assert_eq!(
+            kind_path(&pack2.join("round"), TodoKind::Recovery),
+            std::path::PathBuf::from("/home/x/.cys/pack/round/RECOVERY.md")
+        );
+    }
+
+    /// clap 계약: 값 enum 검증(오타는 파싱 단계에서 거부)·kebab 값·`--role`과 독립 조합.
+    /// 디렉티브가 적는 문자열이 그대로 계약이므로 형태를 박제한다.
+    #[test]
+    fn todo_path_kind_cli_shape() {
+        use clap::Parser;
+        match Cli::parse_from(["cys", "todo-path", "--kind", "session-state"]).command {
+            Command::TodoPath { kind, role, emit_decl } => {
+                assert_eq!(kind, Some(TodoKind::SessionState));
+                assert!(role.is_none() && !emit_decl);
+            }
+            _ => panic!("todo-path가 TodoPath로 파싱되지 않음"),
+        }
+        match Cli::parse_from(["cys", "todo-path", "--kind", "recovery"]).command {
+            Command::TodoPath { kind, .. } => assert_eq!(kind, Some(TodoKind::Recovery)),
+            _ => panic!(),
+        }
+        // 무인자 = 종전 todo 경로(회귀 0 — 기존 호출자 전부가 이 형태다)
+        match Cli::parse_from(["cys", "todo-path"]).command {
+            Command::TodoPath { kind, .. } => assert!(kind.is_none()),
+            _ => panic!(),
+        }
+        // --role과 독립 조합 가능(배타 아님)
+        match Cli::parse_from(["cys", "todo-path", "--role", "worker", "--kind", "recovery"]).command
+        {
+            Command::TodoPath { kind, role, .. } => {
+                assert_eq!(kind, Some(TodoKind::Recovery));
+                assert_eq!(role.as_deref(), Some("worker"));
+            }
+            _ => panic!(),
+        }
+        // 오타·미지 값은 **파싱에서** 거부한다 — 런타임에 조용히 폴백하면 엉뚱한 파일을 가리킨다.
+        for bad in ["session_state", "sessionstate", "SESSION-STATE", "todo", ""] {
+            assert!(
+                Cli::try_parse_from(["cys", "todo-path", "--kind", bad]).is_err(),
+                "미지 kind 값 {bad:?}가 통과했다"
+            );
+        }
     }
 
     // ── CU-6A: status 표의 CTX 열 ───────────────────────────────────────────
