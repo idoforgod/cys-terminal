@@ -1,7 +1,7 @@
 {
   "name": "aiterm-ui",
   "private": true,
-  "version": "0.13.19",
+  "version": "0.13.20",
   "scripts": {
     "build": "sh build.sh",
     "test": "bun test"
