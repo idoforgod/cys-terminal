@@ -902,6 +902,20 @@ pub struct Daemon {
     /// 산출 규칙은 `cys::pack::scope_id()` 단일 정본을 쓴다(Python `javis_report.py`의 `my_scope`와
     /// 같은 규칙 — 여기서 basename을 재구현하면 2언어 판정이 즉시 drift한다).
     pub scope: String,
+    /// ★CU-6A(ADR-4) 세션 파일 **선점 레지스트리**: `session_file → (surface_id, source_rank)`.
+    ///
+    /// 무엇을 막는가: 같은 프로젝트 디렉터리에서 여러 pane이 도는 흔한 배치에서, 트랜스크립트
+    /// 휴리스틱(= mtime 최신 파일 집기)은 **남의 세션 파일**을 자기 것으로 집는다. 그 오귀속이
+    /// 조용히 60% 컨텍스트 임계를 발화시키면 master가 엉뚱한 노드에 cycle-agent를 집행한다.
+    ///
+    /// 왜 rank인가: 매핑 신뢰도는 소스마다 다르다(statusline 서버진실 3 > 결정론 매핑 2 >
+    /// mtime 휴리스틱 1). 낮은 rank는 높은 rank가 선점한 파일을 **집지 못하고**, 높은 rank는
+    /// 나중에 와도 **즉시 탈환**한다. 탈환이 상→하 단방향이라 두 pane이 파일을 주고받는 플랩이
+    /// 구조적으로 불가능하다(SIM-2 (a)(b)(b2) 실증).
+    ///
+    /// 왜 데몬 상태인가: 수집기 태스크 로컬(`tails`)에 두면 파일 소유권이 수집 루프 수명에
+    /// 묶여 재시작·surface 교체에서 소실된다. 소유권은 데몬 사실이다.
+    pub session_claims: Mutex<HashMap<PathBuf, (u64, u8)>>,
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
     pub bus: EventBus,
@@ -1590,6 +1604,7 @@ impl Daemon {
         let daemon = Arc::new(Daemon {
             pack_dir,
             scope,
+            session_claims: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단

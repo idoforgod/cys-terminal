@@ -68,6 +68,13 @@ pub struct ObservedUsage {
     pub source: String,
     pub session_file: String,
     pub updated_at: f64,
+    /// ★CU-6A 귀속 신뢰도(additive · `"confident"|"ambiguous"|"evicted"`, 비클로드/구경로는 `None`).
+    ///
+    /// 왜 값을 지우지 않고 표식을 다는가: 오귀속이 확정돼도 스냅샷을 지우면 소비자는 "관측 없음"
+    /// 으로 보고 **조용히** 자기보고로 되돌아간다. 틀렸다는 사실 자체가 소비자에게 필요한 신호다
+    /// (표는 관측 대신 자기보고를 그리고, 60% 임계 게이트는 이 값을 보고 미투입한다).
+    /// `None`은 "판정 안 함"이며 **종전 동작**을 뜻한다 — 게이트는 `None`을 통과시킨다(회귀 0).
+    pub attribution: Option<String>,
 }
 
 /// surface별 tail 진행 상태 (수집기 태스크 로컬 — 데몬 상태 오염 없음)
@@ -83,12 +90,17 @@ struct TailState {
     server_ctx_window: Option<u64>,
     /// codex rollout의 turn_context가 준 모델명 — token_count 소비 귀속용(전수조사 A-2)
     codex_model: Option<String>,
+    /// ★CU-6A 이 매핑의 **신뢰 등급**(선점 서열의 근거). `heuristic`과 별개인 이유: `heuristic`은
+    /// "주기적으로 재발견할 것인가"라는 수명 정책이고, rank는 "이 매핑을 얼마나 믿는가"다.
+    /// codex lsof 매핑은 결정론(rank 2)이면서도 /clear 후 새 rollout 추적을 위해 재발견 대상
+    /// (heuristic=true)이라, 둘을 한 불리언으로 겸하면 반드시 한쪽이 틀린다.
+    rank: u8,
 }
 
 impl TailState {
     /// 새 tail — 영속 오프셋(analytics tail_offsets)이 있으면 거기서 정확 재개해
     /// 재시작 시 마지막 256KB 재파싱→DB 중복 INSERT(전수조사 A-4)를 근절한다.
-    fn attach(daemon: &Arc<Daemon>, path: PathBuf, heuristic: bool, now: f64) -> Self {
+    fn attach(daemon: &Arc<Daemon>, path: PathBuf, heuristic: bool, rank: u8, now: f64) -> Self {
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let stored = daemon
             .analytics
@@ -100,7 +112,7 @@ impl TailState {
             Some(o) if o <= len => o,
             _ => len.saturating_sub(FIRST_ATTACH_TAIL),
         };
-        TailState { path, offset, carry: String::new(), heuristic, last_discovery: now, server_ctx_window: None, codex_model: None }
+        TailState { path, offset, carry: String::new(), heuristic, last_discovery: now, server_ctx_window: None, codex_model: None, rank }
     }
 }
 
@@ -148,6 +160,37 @@ fn collect_tick(
         .collect();
     tails.retain(|sid, _| live_ids.contains(sid));
     attempts.retain(|sid, _| live_ids.contains(sid));
+    // ★CU-6A 선점 유지보수 ① 죽은 pane의 선점 해제 — 안 하면 종료된 pane이 세션 파일을 영영
+    // 쥐고 있어 같은 디렉터리의 후속 pane이 자기 세션을 관측하지 못한다.
+    {
+        let mut claims = daemon.session_claims.lock().unwrap();
+        retain_live_claims(&mut claims, &live_ids);
+    }
+    // ★CU-6A 선점 유지보수 ② statusline(rank3) 선점 등록. statusline은 **에이전트 자신이 보고한**
+    // 세션 파일이라 최상위 권위다. 이 선점이 폴백 발견보다 **먼저** 서야 폴백이 그 파일을 집지
+    // 못한다(SIM-2 (a)). 폴백이 먼저 쥐고 있었다면 여기서 탈환한다(SIM-2 (b) — 무효화 1회).
+    let now = now_epoch();
+    for s in &surfaces {
+        if s.exited.load(Ordering::Relaxed) {
+            continue;
+        }
+        let reported = s.observed_usage.lock().unwrap().as_ref().and_then(|u| {
+            (u.source == "statusline"
+                && now - u.updated_at < STATUSLINE_FRESH_SECS
+                && !u.session_file.is_empty())
+            .then(|| PathBuf::from(&u.session_file))
+        });
+        let Some(path) = reported else {
+            continue;
+        };
+        let outcome = {
+            let mut claims = daemon.session_claims.lock().unwrap();
+            claim_session(&mut claims, &path, s.id, RANK_STATUSLINE)
+        };
+        if let ClaimOutcome::Evicted { evicted } = outcome {
+            apply_eviction(daemon, tails, attempts, evicted, s.id, &path);
+        }
+    }
     for s in &surfaces {
         if s.exited.load(Ordering::Relaxed) {
             continue;
@@ -187,8 +230,11 @@ fn collect_for(
         });
 
     // ── 세션 파일 결정 (등록 > lsof > 휴리스틱) ──
-    let desired: Option<(PathBuf, bool)> = if let Some(reg) = registered {
-        Some((PathBuf::from(reg), false))
+    // ★CU-6A: 결과에 **rank**(매핑 신뢰도)를 함께 싣는다. 선점 서열과 귀속 표식이 전부 이 값에서
+    // 파생되므로, 발견 지점(어떻게 찾았는지 아는 유일한 곳)에서 붙이는 것이 정직하다.
+    let desired: Option<(PathBuf, bool, u8)> = if let Some(reg) = registered {
+        // 등록 매핑(usage.register — SessionStart hook)은 결정론 1:1이다.
+        Some((PathBuf::from(reg), false, RANK_DETERMINISTIC))
     } else {
         let need_discovery = match tails.get(&s.id) {
             None => true,
@@ -200,7 +246,7 @@ fn collect_for(
             tails
                 .get(&s.id)
                 .filter(|t| t.path.exists())
-                .map(|t| (t.path.clone(), t.heuristic))
+                .map(|t| (t.path.clone(), t.heuristic, t.rank))
         };
         if need_discovery {
             // 발견 백오프: 실패가 반복돼도 전수 프로세스 refresh·lsof는 주기당 1회만
@@ -216,15 +262,23 @@ fn collect_for(
                 existing()
             } else {
                 attempts.insert(s.id, now);
-                discover_session_file(s, agent, bin)
-                    .map(|p| (p, true))
+                // ★CU-6A: 상위·동급 rank가 선점한 후보는 건너뛰고 다음 후보를 본다. 여기서
+                // 읽기만 하는 이유는 아래 스냅샷 직전의 선점 전이 한 곳에 상태 변경을 모으기
+                // 위해서다(두 곳에서 맵을 바꾸면 탈환의 출처를 추적할 수 없다).
+                let candidates = discover_session_candidates(s, agent, bin);
+                let picked = {
+                    let claims = daemon.session_claims.lock().unwrap();
+                    first_unblocked(&claims, s.id, candidates)
+                };
+                picked
+                    .map(|(p, rank)| (p, true, rank))
                     .or_else(existing)
             }
         } else {
             existing()
         }
     };
-    let Some((path, heuristic)) = desired else {
+    let Some((path, heuristic, rank)) = desired else {
         // 미발견 — 다음 재발견 시도까지 빈 상태 유지 (배지 없음이 정직한 표현)
         return;
     };
@@ -240,12 +294,14 @@ fn collect_for(
     // tail 상태 초기화/전환: 경로가 바뀌었으면 영속 오프셋(없으면 파일 끝 창)에서 새로 시작
     let need_reset = tails.get(&s.id).map(|t| t.path != path).unwrap_or(true);
     if need_reset {
-        tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, now));
+        tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, rank, now));
         // 새 세션 파일 = 새 세션 — 에지 게이트 재무장. 직전 세션이 임계 위에서 끝났어도
         // 새 세션이 곧장 임계 이상으로 시작하면(거대 지침 재주입) 발화해야 한다.
         s.ctx_threshold_armed.store(true, Ordering::Relaxed);
     } else if let Some(t) = tails.get_mut(&s.id) {
         t.heuristic = heuristic;
+        // rank도 함께 최신화한다 — 같은 파일이 lsof로 재확인되면 결정론으로 승격될 수 있다.
+        t.rank = rank;
         if heuristic {
             t.last_discovery = now;
         }
@@ -289,6 +345,8 @@ fn collect_for(
                         source: source_label("transcript", state.heuristic),
                         session_file: state.path.to_string_lossy().into_owned(),
                         updated_at: now,
+                        // 귀속 판정은 선점 전이 이후에 확정된다(아래) — 여기선 미판정.
+                        attribution: None,
                     });
                 }
             }
@@ -316,6 +374,7 @@ fn collect_for(
                         source: source_label("rollout", state.heuristic),
                         session_file: state.path.to_string_lossy().into_owned(),
                         updated_at: now,
+                        attribution: None,
                     });
                 }
             }
@@ -390,14 +449,52 @@ fn collect_for(
         return;
     }
 
-    let Some(new) = next else {
+    let Some(mut new) = next else {
         return;
     };
 
+    // ── ★CU-6A 선점 전이 (스냅샷 직전 · 상태 변경은 이 한 곳에서만) ──
+    let outcome = {
+        let mut claims = daemon.session_claims.lock().unwrap();
+        claim_session(&mut claims, &path, s.id, rank)
+    };
+    match outcome {
+        ClaimOutcome::Blocked { .. } => {
+            // 상위(또는 동급 선착) rank가 이 파일을 쥐고 있다 — 관측을 **포기**한다.
+            // 배지가 없는 것이 남의 컨텍스트를 내 것으로 그리는 것보다 낫다. tail을 놓아
+            // 다음 발견 창에서 다른 후보를 찾게 한다(굳어 버리는 것을 막는다).
+            tails.remove(&s.id);
+            return;
+        }
+        ClaimOutcome::Evicted { evicted } => {
+            apply_eviction(daemon, tails, attempts, evicted, s.id, &path)
+        }
+        ClaimOutcome::Granted => {}
+    }
+
+    // ★SIM-2 (c): 선점만으로는 부족하다 — 밀려난 pane은 "다음 후보"로 옮겨가 **또 다른 남의
+    // 파일**을 집는다. 같은 프로젝트 디렉터리에 폴백 pane이 둘 이상이면 전원 모호로 내린다.
+    let ambiguous = {
+        let claims = daemon.session_claims.lock().unwrap();
+        ambiguous_surfaces(&claims).contains(&s.id)
+    };
+    new.attribution = Some(
+        if ambiguous {
+            ATTR_AMBIGUOUS
+        } else {
+            ATTR_CONFIDENT
+        }
+        .into(),
+    );
+
     // ── 스냅샷 갱신 + 이벤트 (정수 % 변화시에만 — 이벤트 폭주 차단) ──
+    // ★SIM-2 (e): 귀속이 바뀌면 값이 그대로여도 소비자에게 알려야 한다. `changed` 조건에
+    // attribution을 넣지 않으면 confident→ambiguous 전이가 HUD에 영영 도달하지 않는다.
     let changed = prev
         .as_ref()
-        .map(|p| p.ctx_pct != new.ctx_pct || p.rate != new.rate)
+        .map(|p| {
+            p.ctx_pct != new.ctx_pct || p.rate != new.rate || p.attribution != new.attribution
+        })
         .unwrap_or(true);
     *s.observed_usage.lock().unwrap() = Some(new.clone());
     if changed {
@@ -410,14 +507,41 @@ fn collect_for(
                 "role": s.role.lock().unwrap().clone(),
                 "agent": new.agent, "ctx_pct": new.ctx_pct, "ctx_tokens": new.ctx_tokens,
                 "ctx_window": new.ctx_window, "rate": new.rate, "source": new.source,
+                // ★SIM-2 (e): 이 payload는 명시적 `json!`이라 struct 필드 추가만으로는 실리지
+                // 않는다 — 여기 키를 더하지 않으면 모호 신호가 소비자에게 **불가시**다.
+                "attribution": new.attribution,
             }),
         );
     }
     // 결정론 컨텍스트 임계 — 자기보고(status.set)와 **공유 에지 게이트**(ctx_threshold_armed)
     // 로 발화한다. 분리된 에지 상태를 쓰면 같은 교차에 두 경로가 각각 발화해 master/CSO가
     // cycle-agent를 이중 집행한다. payload source:"observed"로 자기보고 발화와 구분.
-    if let Some(p) = new.ctx_pct {
-        crate::handlers::maybe_fire_context_threshold(daemon, s, p, "observed", Some(&new.agent));
+    //
+    // ★CU-6A 게이트: 귀속이 모호·무효인 관측은 임계에 **투입하지 않는다**. 틀린 pane을
+    // 순환(/clear)시키는 것은 아무것도 안 하는 것보다 나쁘다 — 그 pane의 작업이 날아간다.
+    // 게이트가 닫혀도 자기보고(status.set) 경로는 그대로 살아 있어 완전 실명은 아니다.
+    // `None`(비클로드·구경로)은 종전대로 통과 — 이 게이트는 판정이 있을 때만 개입한다.
+    if matches!(new.attribution.as_deref(), None | Some(ATTR_CONFIDENT)) {
+        if let Some(p) = new.ctx_pct {
+            crate::handlers::maybe_fire_context_threshold(
+                daemon, s, p, "observed", Some(&new.agent),
+            );
+        }
+    } else if prev.as_ref().and_then(|p| p.attribution.as_deref()) != new.attribution.as_deref() {
+        // **에지 1회만**. 매 틱(2초) 반복 발화는 소음이고, 소음은 곧 무시다.
+        daemon.bus.publish(
+            "usage.attribution_ambiguous",
+            "usage",
+            Some(s.id),
+            json!({
+                "surface_ref": cys::surface_ref(s.id),
+                "role": s.role.lock().unwrap().clone(),
+                "attribution": new.attribution,
+                "session_file": new.session_file,
+                "ctx_pct": new.ctx_pct,
+                "note": "귀속 모호 — 컨텍스트 임계 게이트 미투입(자기보고 경로는 유지)",
+            }),
+        );
     }
 }
 
@@ -519,7 +643,10 @@ fn collect_external(
                     if !external_eligible(now, mt, &comp, &guards) {
                         continue;
                     }
-                    ext.tails.insert(p.clone(), TailState::attach(daemon, p, false, now));
+                    // 외부(비-pane) 세션은 surface 귀속 자체가 없다(소비 적재 전용) — 선점
+                    // 레지스트리에 들어가지 않으므로 rank는 형식상 결정론 값을 쓴다.
+                    ext.tails
+                        .insert(p.clone(), TailState::attach(daemon, p, false, RANK_DETERMINISTIC, now));
                 }
             }
         }
@@ -593,19 +720,191 @@ fn source_label(base: &str, heuristic: bool) -> String {
     }
 }
 
+// ───────────────────── CU-6A 귀속 선점 레지스트리(ADR-4) ─────────────────────
+//
+// 무엇을 고치는가: 같은 프로젝트 디렉터리에서 pane 둘이 돌면 `discover_claude_transcript`는
+// **둘 다에게 같은 최신 파일**을 준다(mtime 최신 1개를 고르므로 구조적으로 그렇다). 그 오귀속이
+// 조용히 60% 컨텍스트 임계를 발화시키면 master는 엉뚱한 노드에 cycle-agent를 집행한다 —
+// 관측이 없는 것보다 나쁜 상태다.
+//
+// 해법 3층: ①파일 단위 선점 ②소스 신뢰도(rank) 서열 ③그래도 유일하지 않으면 모호로 강등하고
+// 게이트에 넣지 않는다. ③이 필요한 이유는 ①만으로는 선점당한 pane이 "다음 후보"로 옮겨가
+// **또 다른 남의 파일**을 집기 때문이다(이차 오귀속).
+
+/// statusline(`usage.report`) — 에이전트가 자기 세션을 직접 보고한 **서버 진실**. 최상위.
+pub const RANK_STATUSLINE: u8 = 3;
+/// 결정론 매핑 — `usage.register`(SessionStart hook이 transcript_path 등록)와 codex lsof fd 직독.
+/// "이 pane의 프로세스가 그 파일을 실제로 열고 있다"까지 확인된 매핑이다.
+pub const RANK_DETERMINISTIC: u8 = 2;
+/// 휴리스틱 폴백 — 디렉터리에서 mtime 최신 파일 집기. **틀릴 수 있는 유일한 등급**이고,
+/// 모호 강등·게이트 차단이 겨냥하는 대상이다.
+pub const RANK_HEURISTIC: u8 = 1;
+
+/// 유일 매핑으로 확인된 귀속 — 표시·게이트 전부 정상 경로.
+pub const ATTR_CONFIDENT: &str = "confident";
+/// 같은 프로젝트 디렉터리를 공유하는 폴백 pane이 둘 이상 — 누구 것인지 말할 수 없다.
+pub const ATTR_AMBIGUOUS: &str = "ambiguous";
+/// 상위 rank가 이 파일을 가져갔다 — 이 귀속은 **틀린 것으로 확정**됐다.
+pub const ATTR_EVICTED: &str = "evicted";
+
+/// 선점 시도 결과 — 순수 상태기계의 출력.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// 빈 자리·자기 자리 = 성공.
+    Granted,
+    /// 더 높은(또는 같은) rank가 쥐고 있다 — 이 파일을 관측에 쓰면 안 된다.
+    Blocked { holder: u64 },
+    /// 탈환 — 저rank 보유자를 축출했다. 호출자는 그 surface의 귀속을 무효화해야 한다.
+    Evicted { evicted: u64 },
+}
+
+/// 선점 상태기계(순수). 규칙 셋:
+/// ①빈 자리·자기 자리 = 성공(rank는 최신 값으로 갱신).
+/// ②남이 **더 높거나 같은** rank로 쥐고 있으면 차단. 같은 rank도 차단하는 것이 요점이다 —
+///   동급끼리 서로 뺏게 두면 매 틱 소유자가 뒤집히는 플랩이 된다. 선착순 고정이 안정적이다.
+/// ③남이 **더 낮은** rank면 탈환. 탈환이 상→하 단방향이므로 되돌아가는 경로가 없고,
+///   그래서 플랩이 구조적으로 불가능하다(SIM-2 (b2) 실증).
+pub fn claim_session(
+    claims: &mut HashMap<PathBuf, (u64, u8)>,
+    path: &Path,
+    sid: u64,
+    rank: u8,
+) -> ClaimOutcome {
+    match claims.get(path).copied() {
+        None => {
+            claims.insert(path.to_path_buf(), (sid, rank));
+            ClaimOutcome::Granted
+        }
+        Some((holder, _)) if holder == sid => {
+            claims.insert(path.to_path_buf(), (sid, rank));
+            ClaimOutcome::Granted
+        }
+        Some((holder, holder_rank)) if holder_rank >= rank => ClaimOutcome::Blocked { holder },
+        Some((holder, _)) => {
+            claims.insert(path.to_path_buf(), (sid, rank));
+            ClaimOutcome::Evicted { evicted: holder }
+        }
+    }
+}
+
+/// 죽은 surface의 선점을 놓아준다 — 안 하면 종료된 pane이 파일을 영영 쥐고 있어 후속 pane이
+/// 자기 세션을 관측하지 못한다(수집 틱 머리에서 1회).
+pub fn retain_live_claims(claims: &mut HashMap<PathBuf, (u64, u8)>, live: &HashSet<u64>) {
+    claims.retain(|_, (sid, _)| live.contains(sid));
+}
+
+/// 후보 목록에서 **상위·동급 rank에 막히지 않은 첫 후보**를 고른다(SIM-2 (a): 폴백은 statusline이
+/// 쥔 파일을 못 집는다). 여기서는 **읽기만** 한다 — 실제 선점 전이는 스냅샷 직전 한 곳에서만
+/// 수행한다. 두 곳에서 맵을 바꾸면 탈환이 어디서 났는지 추적할 수 없다.
+pub fn first_unblocked(
+    claims: &HashMap<PathBuf, (u64, u8)>,
+    sid: u64,
+    candidates: Vec<(PathBuf, u8)>,
+) -> Option<(PathBuf, u8)> {
+    candidates
+        .into_iter()
+        .find(|(p, rank)| match claims.get(p) {
+            Some((holder, holder_rank)) => *holder == sid || *holder_rank < *rank,
+            None => true,
+        })
+}
+
+/// ★SIM-2 (c) 공유-cwd 모호 강등: **같은 프로젝트 디렉터리에 휴리스틱(rank1) pane이 둘 이상**이면
+/// 그 전원을 모호로 내린다. confident는 유일 매핑일 때만이라는 뜻이다.
+///
+/// 그룹 키가 부모 디렉터리 **이름**인 이유: claude 트랜스크립트는 `~/.claude*/projects/<munged-cwd>/`
+/// 에 있고 발견기는 **전 프로필을 가로질러** 최신 파일을 고른다 — 프로필(`.claude` vs `.claude-2`)이
+/// 달라도 munged cwd가 같으면 서로의 파일을 집을 수 있으므로, 전체 경로가 아니라 프로젝트
+/// 컴포넌트로 묶어야 실제 경합 집합과 일치한다.
+pub fn ambiguous_surfaces(claims: &HashMap<PathBuf, (u64, u8)>) -> HashSet<u64> {
+    let mut by_project: HashMap<String, HashSet<u64>> = HashMap::new();
+    for (path, (sid, rank)) in claims {
+        if *rank != RANK_HEURISTIC {
+            continue;
+        }
+        let key = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        by_project.entry(key).or_default().insert(*sid);
+    }
+    by_project
+        .into_values()
+        .filter(|g| g.len() >= 2)
+        .flatten()
+        .collect()
+}
+
+/// 탈환 뒷정리 — 축출된 surface의 귀속에 `evicted` 표식을 달고 재발견을 트리거한다.
+/// 값을 지우지 않는 이유는 `ObservedUsage::attribution` 주석 참조(조용한 소멸 금지).
+fn apply_eviction(
+    daemon: &Arc<Daemon>,
+    tails: &mut HashMap<u64, TailState>,
+    attempts: &mut HashMap<u64, f64>,
+    evicted: u64,
+    winner: u64,
+    path: &Path,
+) {
+    // surfaces 락을 먼저 놓고 observed_usage를 잡는다 — 핸들러(org.status)의 잠금 순서와 동형.
+    let victim = daemon.surfaces.lock().unwrap().get(&evicted).cloned();
+    if let Some(v) = victim {
+        if let Some(prev) = v.observed_usage.lock().unwrap().as_mut() {
+            prev.attribution = Some(ATTR_EVICTED.into());
+        }
+    }
+    // 재발견 트리거: tail을 놓아야 다음 틱에 **다른** 세션 파일을 찾는다. 백오프도 함께 지운다
+    // (여긴 지금 막 소유권이 바뀐 순간이라 즉시 재탐색이 옳다).
+    tails.remove(&evicted);
+    attempts.remove(&evicted);
+    daemon.bus.publish(
+        "usage.attribution_evicted",
+        "usage",
+        Some(evicted),
+        json!({
+            "surface_ref": cys::surface_ref(evicted),
+            "session_file": path.to_string_lossy(),
+            "taken_by": cys::surface_ref(winner),
+            "note": "상위 rank 소스가 이 세션 파일을 가져갔다 — 기존 귀속 무효(재발견 대기)",
+        }),
+    );
+}
+
 // ───────────────────────── 세션 파일 발견 ─────────────────────────
 
 /// 에이전트별 세션 파일 발견 (등록 부재 시) — claude: 프로필 스캔 / codex: lsof → 휴리스틱
 fn discover_session_file(s: &Arc<Surface>, agent: &str, bin: &str) -> Option<PathBuf> {
+    discover_session_candidates(s, agent, bin)
+        .into_iter()
+        .next()
+        .map(|(p, _)| p)
+}
+
+/// ★CU-6A: 발견 결과는 **우선순위 목록**이다(단건이 아니다). 상위 rank가 선점한 후보를 건너뛰고
+/// 다음 후보로 갈 수 있어야, 폴백 pane이 남의 파일을 붙잡은 채 굳는 일이 없다.
+/// 각 후보에 rank를 함께 붙인다 — lsof 매핑(프로세스가 실제로 연 fd)은 결정론, mtime 스캔은 휴리스틱.
+fn discover_session_candidates(s: &Arc<Surface>, agent: &str, bin: &str) -> Vec<(PathBuf, u8)> {
     let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
     let (agent_pid, agent_cwd) = find_agent_descendant(s.pid, bin_base);
     let cwd = agent_cwd.unwrap_or_else(|| s.cwd.clone());
     match agent {
-        "claude" => discover_claude_transcript(&cwd, s.created_at),
-        "codex" => agent_pid
-            .and_then(discover_codex_rollout_lsof)
-            .or_else(|| discover_codex_rollout(&cwd, s.created_at)),
-        _ => None,
+        "claude" => discover_claude_transcripts(&cwd, s.created_at)
+            .into_iter()
+            .map(|p| (p, RANK_HEURISTIC))
+            .collect(),
+        "codex" => {
+            let mut v: Vec<(PathBuf, u8)> = Vec::new();
+            if let Some(p) = agent_pid.and_then(discover_codex_rollout_lsof) {
+                v.push((p, RANK_DETERMINISTIC));
+            }
+            for p in discover_codex_rollouts(&cwd, s.created_at) {
+                if !v.iter().any(|(q, _)| *q == p) {
+                    v.push((p, RANK_HEURISTIC));
+                }
+            }
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -626,14 +925,21 @@ fn find_agent_descendant(surface_pid: u32, bin_base: &str) -> (Option<u32>, Opti
     (pid, cwd)
 }
 
-/// claude 휴리스틱: `~/.claude*` 전 프로필의 projects/<munged>/ 에서 pane 생성 이후
-/// mtime 최신 .jsonl (심링크 프로필은 canonicalize로 중복 제거)
-fn discover_claude_transcript(cwd: &str, created_at: f64) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+/// claude 휴리스틱: `~/.claude*` 전 프로필의 projects/<munged>/ 에서 pane 생성 이후 .jsonl 후보를
+/// **mtime 내림차순 전부** 돌려준다(심링크 프로필은 canonicalize로 중복 제거).
+/// ★CU-6A로 단건→목록이 됐다: 1위가 이미 상위 rank에 선점됐으면 2위를 봐야 하기 때문이다.
+/// 목록 자체는 종전과 같은 후보 집합이고 1위도 같으므로, 선점이 없으면 거동은 바이트 동일하다.
+fn discover_claude_transcripts(cwd: &str, created_at: f64) -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
     let comp = claude_project_component(cwd);
-    let mut best: Option<(f64, PathBuf)> = None;
+    let mut found: Vec<(f64, PathBuf)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for e in std::fs::read_dir(&home).ok()?.flatten() {
+    let Ok(entries) = std::fs::read_dir(&home) else {
+        return Vec::new();
+    };
+    for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name != ".claude" && !name.starts_with(".claude-") {
             continue;
@@ -656,12 +962,12 @@ fn discover_claude_transcript(cwd: &str, created_at: f64) -> Option<PathBuf> {
             if mt + 5.0 < created_at {
                 continue;
             }
-            if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
-                best = Some((mt, p));
-            }
+            found.push((mt, p));
         }
     }
-    best.map(|(_, p)| p)
+    // 최신 우선. 동률은 경로로 안정 정렬 — 순서가 흔들리면 후보 선택이 틱마다 뒤집힌다.
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, p)| p).collect()
 }
 
 /// codex 결정론: 에이전트 프로세스가 열어둔 rollout 파일 fd를 lsof로 직독 (unix 전용 —
@@ -681,10 +987,12 @@ fn discover_codex_rollout_lsof(pid: u32) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// codex 휴리스틱: 최근 3개 날짜 디렉터리에서 session_meta.cwd 일치 + pane 생성 이후
-/// mtime 최신 rollout
-fn discover_codex_rollout(cwd: &str, created_at: f64) -> Option<PathBuf> {
-    let base = dirs::home_dir()?.join(".codex").join("sessions");
+/// codex 휴리스틱: 최근 3개 날짜 디렉터리에서 session_meta.cwd 일치 + pane 생성 이후 rollout 후보를
+/// **mtime 내림차순 전부**(CU-6A — claude 쪽과 같은 이유로 단건→목록).
+fn discover_codex_rollouts(cwd: &str, created_at: f64) -> Vec<PathBuf> {
+    let Some(base) = dirs::home_dir().map(|h| h.join(".codex").join("sessions")) else {
+        return Vec::new();
+    };
     let mut day_dirs: Vec<PathBuf> = Vec::new();
     'outer: for y in read_subdirs_desc(&base) {
         for m in read_subdirs_desc(&y) {
@@ -696,7 +1004,7 @@ fn discover_codex_rollout(cwd: &str, created_at: f64) -> Option<PathBuf> {
             }
         }
     }
-    let mut best: Option<(f64, PathBuf)> = None;
+    let mut found: Vec<(f64, PathBuf)> = Vec::new();
     for dir in day_dirs {
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
@@ -714,12 +1022,11 @@ fn discover_codex_rollout(cwd: &str, created_at: f64) -> Option<PathBuf> {
             if rollout_first_line_cwd(&p).as_deref() != Some(cwd) {
                 continue;
             }
-            if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
-                best = Some((mt, p));
-            }
+            found.push((mt, p));
         }
     }
-    best.map(|(_, p)| p)
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, p)| p).collect()
 }
 
 fn read_subdirs_desc(p: &Path) -> Vec<PathBuf> {
@@ -1176,6 +1483,9 @@ fn update_agy_usage(daemon: &Arc<Daemon>, s: &Arc<Surface>, rate: Vec<RateWindow
         source: "agy-rpc".into(),
         session_file: String::new(),
         updated_at: now_epoch(),
+        // agy는 세션 파일 매핑 자체가 없다(쿼터 RPC 직독) — 귀속 경합의 대상이 아니므로 미판정.
+        // ctx_pct도 None이라 60% 게이트 대상도 아니다.
+        attribution: None,
     };
     let changed = s
         .observed_usage
@@ -1476,6 +1786,7 @@ mod tests {
             last_discovery: 0.0,
             server_ctx_window: None,
             codex_model: None,
+            rank: RANK_DETERMINISTIC,
         };
         let lines = read_new_lines(&mut st);
         assert_eq!(lines, vec!["line1".to_string(), "line2".to_string()]);
@@ -1579,5 +1890,140 @@ mod tests {
         assert_eq!(c.sessions.len(), 1, "세션도 리셋");
         assert!((c.today_cost_usd - 0.2).abs() < 1e-9, "비용도 리셋");
         assert_eq!(c.model_tokens.len(), 1, "모델믹스도 리셋");
+    }
+
+    // ─────────────── CU-6A 귀속 선점 상태기계 (SIM-2 (a)(b)(b2)(c)(d)) ───────────────
+    //
+    // 이 다섯은 "같은 프로젝트 디렉터리에서 pane 둘이 돌 때 남의 컨텍스트를 내 것으로 그리고
+    // 엉뚱한 노드를 순환시킨다"는 실사고 경로를 각각 한 마디씩 끊는다. 데몬·파일시스템 없이
+    // 순수 상태기계로 재현하는 이유는, 이 경합이 실기에서는 재현 자체가 어렵기 때문이다.
+
+    fn claims_of(items: &[(&str, u64, u8)]) -> HashMap<PathBuf, (u64, u8)> {
+        items.iter().map(|(p, sid, r)| (PathBuf::from(*p), (*sid, *r))).collect()
+    }
+
+    /// (a) statusline(rank3)이 쥔 파일을 폴백(rank1)이 **못 집는다**.
+    /// 이게 뚫리면 statusline 보고를 가진 정상 pane의 세션이 옆 pane에게 도둑맞는다.
+    #[test]
+    fn sim2a_fallback_cannot_take_a_statusline_claimed_file() {
+        let f = "/h/.claude/projects/proj/a.jsonl";
+        let mut claims = claims_of(&[(f, 7, RANK_STATUSLINE)]);
+        assert_eq!(
+            claim_session(&mut claims, Path::new(f), 9, RANK_HEURISTIC),
+            ClaimOutcome::Blocked { holder: 7 }
+        );
+        assert_eq!(claims[&PathBuf::from(f)], (7, RANK_STATUSLINE), "차단인데 소유자가 바뀌었다");
+        // 후보 선택 단계에서도 같은 판정이어야 한다 — 애초에 고르지 않는 것이 1차 방어다.
+        let picked = first_unblocked(
+            &claims,
+            9,
+            vec![(PathBuf::from(f), RANK_HEURISTIC), (PathBuf::from("/h/.claude/projects/proj/b.jsonl"), RANK_HEURISTIC)],
+        );
+        assert_eq!(picked.map(|(p, _)| p), Some(PathBuf::from("/h/.claude/projects/proj/b.jsonl")),
+                   "선점된 1위를 건너뛰고 2위를 골라야 한다");
+    }
+
+    /// (b) 폴백이 먼저 쥐고 있어도 statusline이 **후착 탈환**한다(무효화는 그 순간 1회).
+    /// 서열이 시간순이면 먼저 틀린 매핑이 영원히 이긴다 — 그래서 rank가 시간보다 세다.
+    #[test]
+    fn sim2b_higher_rank_evicts_a_prior_fallback_holder() {
+        let f = "/h/.claude/projects/proj/a.jsonl";
+        let mut claims = claims_of(&[(f, 9, RANK_HEURISTIC)]);
+        assert_eq!(
+            claim_session(&mut claims, Path::new(f), 7, RANK_STATUSLINE),
+            ClaimOutcome::Evicted { evicted: 9 }
+        );
+        assert_eq!(claims[&PathBuf::from(f)], (7, RANK_STATUSLINE));
+    }
+
+    /// (b2) 탈환 후 폴백이 다시 청구해도 막힌다 = **플랩 구조적 0**.
+    /// 탈환이 상→하 단방향이라 되돌아가는 경로 자체가 없다(동급도 선착순 고정).
+    #[test]
+    fn sim2b2_no_flap_after_eviction() {
+        let f = "/h/.claude/projects/proj/a.jsonl";
+        let mut claims = claims_of(&[(f, 7, RANK_STATUSLINE)]);
+        for _ in 0..5 {
+            assert_eq!(
+                claim_session(&mut claims, Path::new(f), 9, RANK_HEURISTIC),
+                ClaimOutcome::Blocked { holder: 7 },
+                "재청구가 통과하면 매 틱 소유자가 뒤집힌다"
+            );
+        }
+        // 동급끼리도 선착순 고정 — 서로 뺏으면 그 자체가 플랩이다.
+        let mut same = claims_of(&[(f, 9, RANK_HEURISTIC)]);
+        assert_eq!(
+            claim_session(&mut same, Path::new(f), 11, RANK_HEURISTIC),
+            ClaimOutcome::Blocked { holder: 9 }
+        );
+        // 자기 재청구는 언제나 통과(갱신) — 이게 막히면 정상 pane이 매 틱 관측을 잃는다.
+        assert_eq!(
+            claim_session(&mut same, Path::new(f), 9, RANK_HEURISTIC),
+            ClaimOutcome::Granted
+        );
+    }
+
+    /// (c) 같은 프로젝트 디렉터리에 폴백 pane이 둘 이상 = **전원 모호**.
+    /// 선점만으로는 부족하다 — 밀려난 pane은 다음 후보(= 또 다른 남의 파일)를 집기 때문이다.
+    /// 프로필이 달라도(`.claude` vs `.claude-2`) munged cwd가 같으면 한 경합 집합이다.
+    #[test]
+    fn sim2c_shared_project_dir_downgrades_all_fallbacks_to_ambiguous() {
+        let claims = claims_of(&[
+            ("/h/.claude/projects/-w-proj/a.jsonl", 7, RANK_HEURISTIC),
+            ("/h/.claude-2/projects/-w-proj/b.jsonl", 9, RANK_HEURISTIC),
+            // 다른 프로젝트의 단독 폴백 — 유일 매핑이므로 confident로 남아야 한다.
+            ("/h/.claude/projects/-w-other/c.jsonl", 11, RANK_HEURISTIC),
+            // 같은 디렉터리라도 결정론(rank2) 매핑은 경합 대상이 아니다.
+            ("/h/.claude/projects/-w-proj/d.jsonl", 13, RANK_DETERMINISTIC),
+        ]);
+        let amb = ambiguous_surfaces(&claims);
+        assert!(amb.contains(&7) && amb.contains(&9), "공유 디렉터리 폴백 전원이 모호여야 한다: {amb:?}");
+        assert!(!amb.contains(&11), "단독 폴백까지 모호로 내리면 정상 관측이 통째로 죽는다");
+        assert!(!amb.contains(&13), "결정론 매핑은 모호 강등 대상이 아니다");
+        // 단독 폴백 하나뿐이면 모호는 없다(회귀: 기본 상태에서 게이트가 닫히면 안 된다).
+        let solo = claims_of(&[("/h/.claude/projects/-w-proj/a.jsonl", 7, RANK_HEURISTIC)]);
+        assert!(ambiguous_surfaces(&solo).is_empty());
+    }
+
+    /// (d) 게이트 판정: 모호 89%는 임계에 **미투입**, confident 61%는 발화. `None`(구경로)은 통과.
+    /// 이 표가 CU-6A의 존재 이유다 — 틀린 pane을 /clear 시키면 그 노드의 작업이 날아간다.
+    #[test]
+    fn sim2d_threshold_gate_admits_only_confident_or_unjudged() {
+        // collect_for의 게이트 조건과 **같은 식**을 단정한다(식이 갈리면 이 테스트는 무의미해진다).
+        let admits = |a: Option<&str>| matches!(a, None | Some(ATTR_CONFIDENT));
+        assert!(admits(Some(ATTR_CONFIDENT)), "confident 61%는 발화해야 한다");
+        assert!(admits(None), "비클로드·구경로(미판정)는 종전대로 통과 — 회귀 0");
+        assert!(!admits(Some(ATTR_AMBIGUOUS)), "모호 89%가 임계를 발화하면 엉뚱한 노드가 순환된다");
+        assert!(!admits(Some(ATTR_EVICTED)), "무효화된 귀속도 발화 금지");
+    }
+
+    /// 죽은 pane의 선점 해제 — 안 하면 종료된 pane이 파일을 영영 쥐고 있어 후속 pane이 자기
+    /// 세션을 관측하지 못한다(부팅 후 첫 pane이 조용히 실명하는 형태로 나타난다).
+    #[test]
+    fn dead_surfaces_release_their_claims() {
+        let mut claims = claims_of(&[
+            ("/h/.claude/projects/p/a.jsonl", 7, RANK_HEURISTIC),
+            ("/h/.claude/projects/p/b.jsonl", 9, RANK_STATUSLINE),
+        ]);
+        let live: HashSet<u64> = [9u64].into_iter().collect();
+        retain_live_claims(&mut claims, &live);
+        assert_eq!(claims.len(), 1);
+        assert!(claims.contains_key(&PathBuf::from("/h/.claude/projects/p/b.jsonl")));
+    }
+
+    /// ★SIM-2 (e): 이벤트 페이로드는 명시적 `json!`이라 struct 필드 추가만으로는 실리지 않는다.
+    /// 소비자(HUD)가 모호 신호를 볼 수 있는 유일한 통로이므로 키 존재를 박제한다.
+    #[test]
+    fn usage_updated_payload_carries_attribution_key() {
+        let src = include_str!("usage.rs");
+        let publish = src
+            .split("\"usage.updated\",")
+            .nth(1)
+            .expect("usage.updated publish 지점이 사라졌다");
+        // json! 블록 본문만 잘라 본다(바이트 슬라이스는 한글 주석에서 문자 경계를 깬다).
+        let payload = publish.split("}),").next().expect("json! 블록");
+        assert!(
+            payload.contains("\"attribution\""),
+            "usage.updated 페이로드에 attribution 키가 없다 — 모호 신호가 소비자에게 불가시가 된다:\n{payload}"
+        );
     }
 }

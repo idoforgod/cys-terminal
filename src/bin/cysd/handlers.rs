@@ -3127,6 +3127,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 source: "statusline".into(),
                 session_file: param_str(&params, "session_file").unwrap_or_default(),
                 updated_at: crate::state::now_epoch(),
+                // ★CU-6A: statusline은 **에이전트 자신이 보고한** 세션이라 귀속 경합의 대상이
+                // 아니다(선점 rank 최상위 — usage.rs collect_tick이 이 session_file로 rank3
+                // 선점을 등록해 폴백이 이 파일을 못 집게 한다). 여기서 판정을 남기지 않는
+                // 것이 곧 "종전 동작 유지"다 — 아래 임계 발화는 게이트 없이 그대로 돈다.
+                attribution: None,
             });
             // CC v2 WS-A: statusline은 claude rate의 유일한 생산자 — 계정 귀속(신선 생산분).
             // session_file(=statusline stdin의 transcript_path)로 프로필 dir→accountUuid 해석.
@@ -3419,6 +3424,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
                     "surfaces": list,
+                    // ★CU-5(=CU-3A 확장): org.status 봉투도 surface.list와 **동형**으로 데몬
+                    // 정체성을 싣는다. 두 RPC가 같은 사실을 서로 다르게 말하면(한쪽만 싣는다면)
+                    // 소비자는 어느 것을 물었느냐에 따라 다른 팩을 믿게 된다 — 권위의 갈라짐이
+                    // 이 작업 전체가 없애려는 결함이다. 값은 부팅 캡처 상수를 **읽기만** 하고
+                    // surface 엔트리는 건드리지 않는다(봉투/엔트리 경계 계약).
+                    "pack_dir": daemon.pack_dir.to_string_lossy(),
+                    "scope": daemon.scope,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
                     "health_recent": health_recent,
@@ -6694,7 +6706,9 @@ mod tests {
         assert_eq!(daemon.scope, "pack-dept-cu3a", "데몬이 캡처한 scope 가 팩 basename 이 아니다");
         assert_eq!(daemon.pack_dir, pack, "데몬이 캡처한 pack_dir 가 샌드박스와 다르다");
 
-        for method in ["surface.list", "system.identify"] {
+        // org.status도 **같은 봉투 계약**이다(CU-5). 셋 중 하나만 정체성을 실으면 소비자는
+        // 어느 RPC를 물었느냐에 따라 다른 팩을 믿게 된다 — 그 갈라짐이 이 작업이 없애려는 결함이다.
+        for method in ["surface.list", "system.identify", "org.status"] {
             let req = Request { id: json!(1), method: method.into(), params: json!({}) };
             let Reply::Single(resp) = dispatch(&daemon, req, None) else {
                 panic!("expected single reply for {method}");

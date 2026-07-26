@@ -605,6 +605,16 @@ enum Command {
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
     SurfaceRole,
+    /// Judge whether a write target belongs to another scope's pack — pack-guard 훅의 판정 SOT.
+    /// stdout JSON `{verdict: "ok"|"cross-scope", own_scope, target_scope, suggest, authority}` ·
+    /// **exit 0 고정**(어떤 오류도 도구 실행을 막지 않는다 — 판정 불가는 verdict "ok"로 표현).
+    /// `authority`는 자기 scope의 출처다: "daemon"(surface.list 봉투 = 권위) | "local"(로컬 env 산출).
+    /// 소비자 계약 — authority가 "daemon"이 아니면 차단(deny)을 기록(log)으로 강등하라.
+    PackScopeCheck {
+        /// 검사할 경로. 아직 존재하지 않아도 된다(부모 기준 정규화 — 훅은 파일 생성 **전**에 불린다).
+        #[arg(long)]
+        path: String,
+    },
     /// HMAC signed-prefix 승인 — 위험명령 prefix를 1회 서명하면 이후 자동 통과(guard.sh 연동)
     Approval {
         #[command(subcommand)]
@@ -2282,6 +2292,7 @@ fn run(command: Command) -> i32 {
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
+        Command::PackScopeCheck { path } => return run_pack_scope_check(&path),
 
         Command::Resize { surface, rows, cols } => target_surface(&surface, &None).and_then(|sid| {
             request("surface.resize", json!({"surface_id": sid, "rows": rows, "cols": cols}))
@@ -4907,13 +4918,73 @@ fn new_todo_body(role: &str, decl_line: &str) -> String {
     format!("{decl_line}\n\n# {role} TODO — 영속 todo (절대지침 7)\n\n")
 }
 
+/// ★CU-3B(ADR-1) — **팩 경로의 권위는 데몬이고 클라이언트 env는 폴백이다.**
+///
+/// 왜 이 판정이 필요한가: `todo-path`는 역할(role)은 이미 데몬에 물어보면서 **경로만** 자기
+/// env로 산출하는 비대칭이었다. 부서 pane이 `CYS_PACK_DIR`를 잃으면(rotate·상속 누락)
+/// `pack_dir()`은 panic하지 않고 **조용히 홈 기본 `~/.cys/pack`으로 폴백**한다 — 부서 노드가
+/// 본사 팩 round에 todo를 쓰는 교차-scope 사고의 발원지다. 조용한 오답보다 데몬 권위가 낫다.
+///
+/// 왜 순수 함수인가: 4분기(일치/불일치/봉투 키 부재/데몬 미조회)가 각각 다른 사고를 막는
+/// 별개 결정이라, 통합 경로 테스트로는 분기를 고정할 수 없다. 경고 문구는 **반환만 하고
+/// 출력하지 않는다** — 출력까지 여기서 하면 테스트가 화면을 읽어야 한다.
+///
+/// 반환 = (채택할 팩 경로, 호출자가 stderr로 낼 경고).
+fn resolve_pack_authority(
+    daemon_pack: Option<&str>,
+    local: &std::path::Path,
+) -> (std::path::PathBuf, Option<String>) {
+    match daemon_pack.filter(|s| !s.is_empty()) {
+        // 불일치 = env 유실(또는 오염) 의심. **데몬 값을 채택**하고 시끄럽게 알린다 —
+        // 조용히 고치면 env가 깨진 채로 영영 산다.
+        Some(d) if std::path::Path::new(d) != local => (
+            std::path::PathBuf::from(d),
+            Some(format!(
+                "⚠ pack 불일치: 데몬={d} 로컬env={} — 데몬 값 채택(env 유실 의심, 점검: echo $CYS_PACK_DIR)",
+                local.display()
+            )),
+        ),
+        Some(d) => (std::path::PathBuf::from(d), None),
+        // 봉투에 키가 없다 = 구데몬(CU-3A 이전). **조용한** 로컬 폴백이 옳다 — 버전 스큐는
+        // 사용자 잘못이 아니고, 여기서 경고하면 업그레이드 전 전 노드가 매 호출 소음을 낸다.
+        None => (local.to_path_buf(), None),
+    }
+}
+
+/// 데몬에 **묻지 못한** 경로(비-pane·데몬 미기동·소켓 오류)의 고지 문구. 위 `None` 분기(구데몬)와
+/// 달리 여기는 조용하면 안 된다 — 권위 없이 로컬 env를 믿고 있다는 사실 자체가 사용자가 알아야
+/// 할 상태다(같은 로컬 폴백이라도 이유가 다르면 알림도 달라야 한다).
+fn pack_authority_local_notice(local: &std::path::Path) -> String {
+    format!(
+        "ℹ 데몬 미조회 — 로컬 env 팩({})으로 산출한다(데몬 권위 없음)",
+        local.display()
+    )
+}
+
 fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
     // `--role` 지정 = 남의 역할 산출 = **파일 기록 금지**(설계 R7 신원 게이트 우회 방지).
     let foreign = role_opt.is_some();
+    // ★CU-3B: 역할 조회와 **같은 응답의 봉투**에서 팩 권위를 함께 회수한다(추가 왕복 0).
+    // `--role`(남의 역할) 경로도 같은 권위를 공유해야 한다 — 남의 경로를 내 깨진 env로
+    // 산출하면 "누구 팩인지"가 호출자마다 갈린다. 그 경로엔 조회할 surface가 없으므로
+    // 봉투만 받으러 1회 묻고, 실패하면 로컬 폴백 + 고지한다(데몬 없이도 계속 동작).
+    let mut daemon_pack: Option<String> = None;
+    let mut daemon_scope: Option<String> = None;
+    let mut daemon_queried = false;
+    let mut absorb_envelope = |r: &Value| {
+        daemon_queried = true;
+        daemon_pack = r["pack_dir"].as_str().map(|s| s.to_string());
+        daemon_scope = r["scope"].as_str().map(|s| s.to_string());
+    };
     // `--role`은 **남의 역할 경로 산출 전용**이다(파일 생성·기록 없음 · 설계 R7). 자기 역할은
     // 데몬이 정본이므로 surface.list로 조회한다 — 손으로 지어 부르는 것을 막는 것이 이 명령의 존재 이유다.
     let role = match role_opt {
-        Some(r) => r,
+        Some(r) => {
+            if let Ok(resp) = request("surface.list", json!({})) {
+                absorb_envelope(&resp);
+            }
+            r
+        }
         None => {
             let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
                 eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다(다른 역할은 --role)");
@@ -4924,11 +4995,14 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
                 return 1;
             };
             let role = match request("surface.list", json!({})) {
-                Ok(r) => r["surfaces"].as_array().and_then(|arr| {
-                    arr.iter()
-                        .find(|s| s["surface_id"].as_u64() == Some(my_sid))
-                        .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
-                }),
+                Ok(r) => {
+                    absorb_envelope(&r);
+                    r["surfaces"].as_array().and_then(|arr| {
+                        arr.iter()
+                            .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                            .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+                    })
+                }
                 Err(e) => {
                     eprintln!("surface.list 실패: {e}");
                     return 1;
@@ -4946,8 +5020,21 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
     // `env_compat("CYS_PACK_DIR")`(= CYS_/JAVIS_/AITERM_**PACK**_DIR)만 봐서 레거시 키
     // `AITERM_JARVIS_DIR`를 인식하지 못했다 — 그 환경에서는 **생성 위치와 스캔 위치가 갈려
     // 파일이 보고기에 영영 보이지 않는다**(env 목록이 두 벌이면 언젠가 갈린다는 실증).
-    let pack = cys::pack::pack_dir();
-    let scope = cys::pack::scope_id();
+    // ★CU-3B: 그 값은 이제 **폴백**이다 — 권위는 위에서 회수한 데몬 봉투다.
+    let local_pack = cys::pack::pack_dir();
+    let (pack, warn) = resolve_pack_authority(daemon_pack.as_deref(), &local_pack);
+    if let Some(w) = warn {
+        eprintln!("{w}");
+    } else if !daemon_queried {
+        eprintln!("{}", pack_authority_local_notice(&local_pack));
+    }
+    // scope도 같은 우선순위다. 데몬 봉투에 `scope`가 있으면(= `pack_dir`도 함께 온다) 그 값을
+    // 쓰고, 없으면 로컬 `scope_id()`(= basename(local_pack))를 쓴다 — 두 키는 CU-3A에서 함께
+    // 추가됐으므로 "pack만 있고 scope는 없는" 봉투는 존재하지 않는다. 여기서 basename을
+    // 재구현하지 않는 것이 요점이다(pack.rs `scope_id_of` 단일 정본과의 drift 차단).
+    let scope = daemon_scope
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(cys::pack::scope_id);
 
     // 선언은 **경로보다 먼저** 만든다 — 만들 수 없으면 파일도 만들지 않는다(부분 성공 금지).
     let decl_line = match build_todo_decl_line(&role, &scope) {
@@ -5006,6 +5093,113 @@ fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
         );
     }
     println!("{}", path.display());
+    0
+}
+
+// ───────────────── CU-2A 판정 SOT — `cys pack-scope-check` ─────────────────
+//
+// pack-guard 훅(sh)이 "이 쓰기가 남의 팩인가"를 **재구현하지 않게** 하는 것이 이 명령의 존재
+// 이유다. sh에서 realpath·basename·scope 비교를 다시 짜면 판정식이 2벌이 되고, 그중 하나는
+// 반드시 뒤처져 훅과 CLI가 다른 답을 낸다(팩 env 목록이 두 벌이라 갈렸던 S19와 같은 병).
+
+/// 대상 경로가 **어느 팩 scope에 속하는가**. 판정 범위를 `$HOME/.cys/` 직하의 `pack*` 디렉터리로
+/// 좁히는 것이 계약의 핵심이다 — 레포 워크트리 소스·문서·임시 파일은 애초에 팩이 아니므로 훅이
+/// 개입하면 안 된다(개발 무간섭. 이 경계가 없으면 전 노드의 Write/Edit 핫패스가 오탐으로 막힌다).
+/// `pack`(본사)·`pack-dept-<n>`(부서)·`pack.prev`(교체 잔재)를 한 규칙으로 덮는다.
+fn target_pack_scope(canon: &std::path::Path, home: &std::path::Path) -> Option<String> {
+    let rel = canon.strip_prefix(home.join(".cys")).ok()?;
+    match rel.components().next()? {
+        std::path::Component::Normal(n) => {
+            let name = n.to_string_lossy().into_owned();
+            name.starts_with("pack").then_some(name)
+        }
+        // `..` 등 비정상 컴포넌트는 팩 지목으로 보지 않는다(정규화 후엔 나올 수 없지만,
+        // 판정 불가를 cross-scope로 오인하지 않는다는 안전 방향을 코드로 남긴다).
+        _ => None,
+    }
+}
+
+/// 교차-scope 판정. **자기 scope를 모르면 언제나 `ok`다** — 권위 없이 차단하지 않는 것이 이
+/// 명령의 안전 계약이다(SIM-3: 로컬 env 산출로 자기 scope를 base로 오인해 **자기 부서 팩 쓰기를
+/// 오차단**하는 자해가 실증됐다. 2호 방어가 3호 피해자를 공격하면 안 된다).
+fn pack_scope_verdict(own_scope: &str, target_scope: Option<&str>) -> &'static str {
+    match target_scope {
+        Some(t) if !own_scope.is_empty() && t != own_scope => "cross-scope",
+        _ => "ok",
+    }
+}
+
+/// 심링크 우회 차단 — 실경로로 정규화한다. 아직 없는 파일(신규 Write)은 `canonicalize`가 실패하므로
+/// **부모를 정규화하고 파일명을 다시 붙인다**: 훅은 파일 생성 **전**에 호출되므로 이 폴백이 없으면
+/// 신규 파일 쓰기는 전부 판정 불가가 된다(= 교차-scope 신규 생성이 무조건 통과).
+fn canonicalize_for_check(p: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|c| c.join(name))
+            .unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// 교차-scope일 때의 교정 안내 — 훅이 사용자에게 그대로 보여 준다. "쓰지 마라"로 끝내면
+/// 사용자는 우회로를 찾는다. 올바른 경로를 **산출하는 명령**을 함께 준다.
+fn pack_scope_suggest(own_scope: &str, target_scope: &str) -> String {
+    format!(
+        "이 경로는 다른 scope의 팩({target_scope})이다 — 내 scope는 {own_scope}. \
+         팩 경로는 손으로 적지 말고 `cys todo-path`(필요하면 `--role <역할>`)가 산출한 경로를 쓰라."
+    )
+}
+
+/// `cys pack-scope-check --path <p>` — pack-guard 훅 전용 판정기. **exit는 항상 0**이다(ADR-3:
+/// "비정상 종료 = 차단"류의 우연 의존을 원천 제거. 차단은 훅의 JSON 결정 채널이 하고, 이 명령은
+/// 사실만 낸다).
+fn run_pack_scope_check(path: &str) -> i32 {
+    // own_scope는 **데몬 권위 우선**(SIM-3 교정). 로컬 env 산출만 믿으면 env 유실 pane이 자기
+    // 부서 팩을 base로 오인한다. 그래서 출처(`authority`)를 함께 실어 보내, 권위가 로컬일 때는
+    // 소비자가 차단을 기록으로 강등할 수 있게 한다 — 불확실한 권위로 막지 않는다.
+    //
+    // ★`request`(autostart 경유)를 **쓰지 않는다**: 이 명령은 pack-guard 훅에서 모든 Write/Edit
+    // 마다 불린다. 데몬이 죽어 있을 때 매 편집이 launchd kickstart + 4초 대기 + sibling spawn을
+    // 유발하면, 방어 장치가 곧 개발 정지 장치가 된다. 여기선 **한 번 시도하고 빠르게 포기**하고
+    // (authority=local), 소비자가 차단을 기록으로 강등한다 — 그게 이 필드의 존재 이유다.
+    let daemon_scope = cys::env_compat(ENV_SURFACE_ID)
+        .and_then(|_| {
+            request_on_timeout(
+                &cys::socket_path(),
+                "surface.list",
+                json!({}),
+                std::time::Duration::from_secs(2),
+            )
+            .ok()
+        })
+        .and_then(|r| r["scope"].as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+    let (own_scope, authority) = match daemon_scope {
+        Some(s) => (s, "daemon"),
+        None => (cys::pack::scope_id(), "local"),
+    };
+
+    let canon = canonicalize_for_check(std::path::Path::new(path));
+    let target_scope = target_pack_scope(&canon, &cys::home_dir());
+    let verdict = pack_scope_verdict(&own_scope, target_scope.as_deref());
+    let suggest = target_scope
+        .as_deref()
+        .filter(|_| verdict == "cross-scope")
+        .map(|t| pack_scope_suggest(&own_scope, t));
+
+    println!(
+        "{}",
+        json!({
+            "verdict": verdict,
+            "own_scope": own_scope,
+            "target_scope": target_scope,
+            "suggest": suggest,
+            "authority": authority,
+        })
+    );
     0
 }
 
@@ -6262,17 +6456,15 @@ fn run_fleet(as_json: bool) -> i32 {
             } else {
                 s["status"]["state"].as_str().unwrap_or("·파생")
             };
-            let ctx = s["status"]["context_pct"]
-                .as_u64()
-                .map(|v| format!("{v}%"))
-                .unwrap_or_else(|| "-".into());
+            // 같은 규칙을 쓴다 — 표 둘이 같은 값을 다르게 그리면 그게 곧 드리프트다.
+            let ctx = ctx_cell(&s);
             let task = s["status"]["task"]
                 .as_str()
                 .filter(|t| !t.is_empty())
                 .or_else(|| s["title"].as_str())
                 .unwrap_or("(업무 미보고)");
             println!(
-                "   {:<14} {:<9} {:>4}  {}",
+                "   {:<14} {:<9} {:>5}  {}",
                 role,
                 state,
                 ctx,
@@ -6281,6 +6473,33 @@ fn run_fleet(as_json: bool) -> i32 {
         }
     }
     0
+}
+
+/// ★CU-6A — status 표의 CTX 열: **관측 우선 + 출처 표식**.
+///
+/// 왜 표식을 붙이나: 관측(데몬이 트랜스크립트를 읽어 산출)과 자기보고(에이전트가 말한 값)는
+/// 신뢰도가 다른데 종전 표는 둘을 구분 없이 `NN%`로 그려, 보는 사람이 "이 값이 어디서 왔는지"를
+/// 알 수 없었다. `ᵒ`=observed · `ˢ`=self-reported · `-`=값 없음.
+///
+/// 왜 모호·무효 관측을 버리나: 귀속이 확정되지 않은 관측은 **남의 컨텍스트**일 수 있다. 그 값을
+/// 이 노드의 것으로 그리면 사람이 엉뚱한 노드를 순환시킨다 — 관측이 없는 것보다 나쁘다.
+/// 그때는 자기보고로 물러선다(완전 실명이 아니라 신뢰도 강등이다).
+///
+/// `--json`은 건드리지 않는다(필드만 추가됨) — 표시 규칙과 기계 소비는 다른 계약이다.
+fn ctx_cell(s: &Value) -> String {
+    let trusted = !matches!(
+        s["usage"]["attribution"].as_str(),
+        Some("ambiguous") | Some("evicted")
+    );
+    if trusted {
+        if let Some(p) = s["usage"]["ctx_pct"].as_u64() {
+            return format!("{p}%ᵒ");
+        }
+    }
+    match s["status"]["context_pct"].as_u64() {
+        Some(p) => format!("{p}%ˢ"),
+        None => "-".into(),
+    }
 }
 
 fn run_status(as_json: bool) -> i32 {
@@ -6302,7 +6521,7 @@ fn run_status(as_json: bool) -> i32 {
         );
     }
     let header = format!(
-        "{:<14} {:<12} {:<8} {:<9} {:>4} {:>7} {:>5}  {}",
+        "{:<14} {:<12} {:<8} {:<9} {:>5} {:>7} {:>5}  {}",
         "ROLE", "SURFACE", "AGENT", "STATE", "CTX", "IDLE", "QUEUE", "TASK/TITLE"
     );
     println!("{header}");
@@ -6315,10 +6534,7 @@ fn run_status(as_json: bool) -> i32 {
         } else {
             s["status"]["state"].as_str().unwrap_or("-").to_string()
         };
-        let ctx = s["status"]["context_pct"]
-            .as_u64()
-            .map(|v| format!("{v}%"))
-            .unwrap_or_else(|| "-".into());
+        let ctx = ctx_cell(&s);
         let task = s["status"]["task"]
             .as_str()
             .filter(|t| !t.is_empty())
@@ -6330,7 +6546,7 @@ fn run_status(as_json: bool) -> i32 {
             s["queue_depth"].as_u64().unwrap_or(0).to_string()
         };
         println!(
-            "{:<14} {:<12} {:<8} {:<9} {:>4} {:>7} {:>5}  {}",
+            "{:<14} {:<12} {:<8} {:<9} {:>5} {:>7} {:>5}  {}",
             s["role"].as_str().unwrap_or("-"),
             s["surface_ref"].as_str().unwrap_or("?"),
             s["agent"].as_str().unwrap_or("-"),
@@ -6437,6 +6653,24 @@ fn todo_decl_excluded(
     )
 }
 
+/// ★CU-2B — cycle 저장 지시문. 종전 리터럴 `~/.cys/pack/round/<역할>_TODO.md`가 무엇을 깨뜨렸나:
+/// 부서 노드(팩=`~/.cys/pack-dept-N`)가 이 지시를 그대로 따르면 **본사 팩에 저장**한다. 그건
+/// ①교차-scope 쓰기(2호 방어 대상)이면서 ②저장 게이트가 검사하는 파일(`pack_round/<역할>_TODO.md`,
+/// 이 노드의 팩)과 다른 파일이라 **저장해도 게이트가 통과하지 않는** 이중 실패다.
+/// 지시와 검사는 같은 값에서 나와야 한다 — 그래서 게이트가 쓰는 그 값을 그대로 포맷에 넣는다.
+///
+/// 순수 함수인 이유: 이 문자열의 유일한 계약은 "본사/부서 각각에서 자기 팩 경로를 말한다"이고,
+/// 그건 인젝션 없이 값만으로 단정할 수 있다.
+fn build_cycle_save_instruction(pack_round: &std::path::Path, role_todo: &str) -> String {
+    format!(
+        "[CYCLE] 컨텍스트 순환 절차 개시. 지금 즉시: ① 자기 TODO 파일({})과 \
+         SESSION_STATE({} 또는 <cwd>/_round/SESSION_STATE.md)에 현재 작업 상태·미해결 게이트·\
+         다음 액션을 저장하라. ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.",
+        pack_round.join(role_todo).display(),
+        pack_round.join("SESSION_STATE.md").display()
+    )
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -6483,6 +6717,12 @@ fn run_cycle_agent(
             .or(entry["cwd"].as_str())
             .unwrap_or(".")
             .to_string();
+        // ★CU-2B: 팩 round와 대상 역할의 todo 파일명은 **저장 지시문과 저장 게이트가 함께 쓰는
+        // 한 값**이다. 종전에는 게이트만 이 값을 계산하고 지시문은 `~/.cys/pack/round/...`를
+        // 리터럴로 박아, `--save-file` 지정 시에는 아예 계산되지도 않았다. 지시와 검사가 다른
+        // 파일을 가리키면 저장 검증은 구조적으로 통과할 수 없다 — 그래서 분기 밖으로 올린다.
+        let pack_round = cys::pack::pack_dir().join("round");
+        let role_todo = format!("{}_TODO.md", role_name.to_uppercase().replace('-', "_"));
         let files: Vec<String> = if !save_files.is_empty() {
             save_files
         } else {
@@ -6513,11 +6753,6 @@ fn run_cycle_agent(
                     }
                 }
             }
-            let pack_round = cys::pack::pack_dir().join("round");
-            let role_todo = format!(
-                "{}_TODO.md",
-                role_name.to_uppercase().replace('-', "_")
-            );
             let pt = pack_round.join(&role_todo);
             if pt.exists() {
                 v.push(pt.to_string_lossy().into_owned());
@@ -6544,7 +6779,7 @@ fn run_cycle_agent(
 
         // 1) 저장 지시
         eprintln!("[cycle 1/5] 저장 지시 주입 → surface:{sid} ({role_name})");
-        inject_text(sid, "[CYCLE] 컨텍스트 순환 절차 개시. 지금 즉시: ① 자기 TODO 파일(~/.cys/pack/round/<역할>_TODO.md)과 SESSION_STATE(_round/ 또는 pack round/ 정본)에 현재 작업 상태·미해결 게이트·다음 액션을 저장하라. ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.")?;
+        inject_text(sid, &build_cycle_save_instruction(&pack_round, &role_todo))?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         if !baseline.is_empty() {
@@ -12075,5 +12310,206 @@ mod tests {
         std::fs::write(&bad, "# worker TODO — 영속 todo (절대지침 7)\n\n").unwrap();
         assert!(verify_todo_counted(&bad, "pack").is_err());
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── CU-3B: 팩 경로 권위 4분기 ────────────────────────────────────────────
+    // 막는 사고: 부서 pane이 `CYS_PACK_DIR`를 잃으면 `pack_dir()`은 panic이 아니라 **조용히**
+    // 홈 기본(`~/.cys/pack`)으로 폴백한다 — 부서 노드가 본사 팩 round에 todo를 쓴다.
+    // 네 분기는 각각 다른 실패를 막으므로 하나씩 못박는다.
+
+    /// ①불일치 = env 유실 의심. **데몬 값을 채택**하고 경고한다(조용히 고치면 env가 깨진 채로 산다).
+    #[test]
+    fn pack_authority_prefers_daemon_and_warns_on_mismatch() {
+        let local = std::path::Path::new("/home/x/.cys/pack");
+        let (pack, warn) =
+            resolve_pack_authority(Some("/home/x/.cys/pack-dept-dept-2"), local);
+        assert_eq!(pack, std::path::PathBuf::from("/home/x/.cys/pack-dept-dept-2"));
+        let w = warn.expect("불일치는 반드시 시끄러워야 한다 — 조용한 교정은 env 파손을 영속시킨다");
+        assert!(w.contains("pack-dept-dept-2") && w.contains("/home/x/.cys/pack"),
+                "경고가 두 값을 모두 보여야 사용자가 어디가 깨졌는지 안다: {w}");
+    }
+
+    /// ②일치 = 정상. 경고 없음(정상 경로에서 소음을 내면 진짜 경고가 묻힌다).
+    #[test]
+    fn pack_authority_silent_when_daemon_agrees_with_env() {
+        let local = std::path::Path::new("/home/x/.cys/pack-dept-dept-2");
+        let (pack, warn) =
+            resolve_pack_authority(Some("/home/x/.cys/pack-dept-dept-2"), local);
+        assert_eq!(pack, local);
+        assert!(warn.is_none(), "일치인데 경고가 났다: {warn:?}");
+    }
+
+    /// ③봉투에 키 없음 = 구데몬(CU-3A 이전). **조용한** 로컬 폴백 — 버전 스큐로 전 노드가
+    /// 매 호출 소음을 내면 안 된다. 빈 문자열도 '값 없음'과 같게 다룬다(직렬화 사고 방어).
+    #[test]
+    fn pack_authority_falls_back_silently_on_old_daemon() {
+        let local = std::path::Path::new("/home/x/.cys/pack");
+        for daemon in [None, Some("")] {
+            let (pack, warn) = resolve_pack_authority(daemon, local);
+            assert_eq!(pack, local, "구데몬 봉투({daemon:?})는 로컬 폴백이어야 한다");
+            assert!(warn.is_none(), "스큐 폴백은 조용해야 한다: {warn:?}");
+        }
+    }
+
+    /// ④비-pane(데몬 미조회) = 같은 로컬 폴백이지만 **이유가 다르므로 알린다**.
+    /// 권위 없이 로컬 env를 믿고 있다는 사실 자체가 사용자가 알아야 할 상태다.
+    #[test]
+    fn pack_authority_notice_names_the_local_pack_when_daemon_unreachable() {
+        let n = pack_authority_local_notice(std::path::Path::new("/home/x/.cys/pack"));
+        assert!(n.contains("/home/x/.cys/pack") && n.contains("데몬"),
+                "고지가 팩 경로와 사유를 모두 말해야 한다: {n}");
+    }
+
+    // ── CU-2B: cycle 저장 지시문이 자기 팩을 말하는가 ────────────────────────
+
+    /// 리터럴 `~/.cys/pack/round/...`가 깨뜨린 것: 부서 노드가 그대로 따르면 **본사 팩에 저장**한다
+    /// (교차-scope 쓰기) — 게다가 저장 게이트가 검사하는 파일은 자기 팩이라 **저장해도 통과 불가**인
+    /// 이중 실패였다. 지시와 검사가 같은 값에서 나오는지 본사·부서 2케이스로 못박는다.
+    #[test]
+    fn cycle_instruction_points_at_this_nodes_own_pack() {
+        for (pack, role_todo, foreign) in [
+            ("/home/x/.cys/pack/round", "WORKER_TODO.md", "pack-dept-dept-2"),
+            ("/home/x/.cys/pack-dept-dept-2/round", "WORKER_2_TODO.md", "/.cys/pack/round"),
+        ] {
+            let s = build_cycle_save_instruction(std::path::Path::new(pack), role_todo);
+            assert!(s.contains(&format!("{pack}/{role_todo}")),
+                    "지시문이 게이트가 검사하는 todo 경로를 말하지 않는다: {s}");
+            assert!(s.contains(&format!("{pack}/SESSION_STATE.md")),
+                    "지시문이 자기 팩의 SESSION_STATE를 말하지 않는다: {s}");
+            assert!(!s.contains(foreign),
+                    "지시문에 남의 scope 경로가 남아 있다({foreign}): {s}");
+            // 게이트 마커 계약(CYCLE-SAVED)은 지시문의 기능적 핵심 — 문구를 다듬다 잃으면
+            // 2단계 검증이 영원히 타임아웃한다.
+            assert!(s.contains("CYCLE-SAVED"));
+        }
+    }
+
+    // ── pack-scope-check: 훅 판정 SOT ───────────────────────────────────────
+
+    /// 판정 범위는 `$HOME/.cys/pack*`뿐이다 — 레포 워크트리·문서·임시 파일까지 팩으로 보면
+    /// 전 노드 Write/Edit 핫패스가 오탐으로 막힌다(개발 무간섭 계약 · SIM-3 실증 항목).
+    #[test]
+    fn target_pack_scope_only_matches_pack_family_under_dot_cys() {
+        let home = std::path::Path::new("/home/x");
+        for (p, want) in [
+            ("/home/x/.cys/pack/round/MASTER_TODO.md", Some("pack")),
+            ("/home/x/.cys/pack-dept-dept-2/round/W.md", Some("pack-dept-dept-2")),
+            ("/home/x/.cys/pack.prev/soul.md", Some("pack.prev")),
+            ("/home/x/.cys/pack", Some("pack")),
+            // 팩이 아닌 .cys 하위(상태·소켓)는 비대상
+            ("/home/x/.cys/claude-default/settings.json", None),
+            // 레포 워크트리 소스 — 절대 건드리지 않는다
+            ("/home/x/Desktop/CYSjavis/src/bin/cys.rs", None),
+            // 이름이 비슷한 홈 하위 디렉터리도 .cys 밖이면 비대상
+            ("/home/x/pack/round/A.md", None),
+        ] {
+            assert_eq!(
+                target_pack_scope(std::path::Path::new(p), home).as_deref(),
+                want,
+                "경로 {p}"
+            );
+        }
+    }
+
+    /// **권위 없이 차단하지 않는다**(SIM-3 자해 재현 방지): own_scope가 비면 언제나 ok.
+    /// 자기 팩 쓰기도 ok. 남의 팩일 때만 cross-scope.
+    #[test]
+    fn pack_scope_verdict_blocks_only_a_known_foreign_pack() {
+        assert_eq!(pack_scope_verdict("pack-dept-dept-2", Some("pack")), "cross-scope");
+        assert_eq!(pack_scope_verdict("pack", Some("pack")), "ok");
+        assert_eq!(pack_scope_verdict("pack", None), "ok");
+        // own_scope 미상(데몬 무응답 + 로컬 산출 실패) — 모르면 막지 않는다.
+        assert_eq!(pack_scope_verdict("", Some("pack")), "ok");
+    }
+
+    /// 심링크 우회 차단 + **미존재 파일**(훅은 생성 전에 불린다) 부모 정규화 폴백.
+    /// 이 폴백이 없으면 "교차-scope 신규 파일 생성"은 전부 무판정 통과다.
+    #[test]
+    fn canonicalize_for_check_resolves_symlinks_and_uncreated_files() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-scopechk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let real = td.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let f = real.join("t.md");
+        std::fs::write(&f, "x").unwrap();
+        let real_canon = std::fs::canonicalize(&real).unwrap();
+
+        // ① 실재 파일: 실경로로 정규화된다
+        assert_eq!(canonicalize_for_check(&f), real_canon.join("t.md"));
+
+        // ② 심링크 경유: 링크가 아니라 **대상**으로 판정된다(우회 차단)
+        #[cfg(unix)]
+        {
+            let link = td.join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(canonicalize_for_check(&link.join("t.md")), real_canon.join("t.md"));
+            // ②' 아직 없는 파일 + 심링크 부모 = 부모만 정규화하고 이름을 다시 붙인다
+            assert_eq!(
+                canonicalize_for_check(&link.join("new.md")),
+                real_canon.join("new.md")
+            );
+        }
+
+        // ③ 부모도 없는 경로: 판정 불가 — 입력을 그대로 돌려주고(= 팩 밖) 조용히 ok가 된다
+        let ghost = td.join("nope").join("deep").join("x.md");
+        assert_eq!(canonicalize_for_check(&ghost), ghost);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 훅 계약: 교차-scope 안내는 "쓰지 마라"로 끝내지 않고 **올바른 산출 명령**을 준다
+    /// (막기만 하면 사용자는 우회로를 찾는다).
+    #[test]
+    fn pack_scope_suggest_names_the_generator_command() {
+        let s = pack_scope_suggest("pack-dept-dept-2", "pack");
+        assert!(s.contains("cys todo-path"), "교정 경로 안내가 없다: {s}");
+        assert!(s.contains("pack-dept-dept-2") && s.contains("pack"));
+    }
+
+    // ── CU-6A: status 표의 CTX 열 ───────────────────────────────────────────
+
+    /// 관측 우선·출처 표식·모호 강등. **모호한 관측을 그대로 그리면** 사람이 남의 컨텍스트를
+    /// 보고 엉뚱한 노드를 순환시킨다 — 그때는 자기보고로 물러서는 것이 옳다.
+    #[test]
+    fn ctx_cell_prefers_trustworthy_observation_and_marks_its_source() {
+        // ① 신뢰 가능한 관측 = 관측값 + ᵒ (자기보고가 있어도 관측이 이긴다)
+        let s = json!({"usage": {"ctx_pct": 61, "attribution": "confident"},
+                       "status": {"context_pct": 40}});
+        assert_eq!(ctx_cell(&s), "61%ᵒ");
+        // ①' 판정이 없는 구경로(비클로드 등)도 관측을 쓴다 — 회귀 0
+        let s = json!({"usage": {"ctx_pct": 61}, "status": {"context_pct": 40}});
+        assert_eq!(ctx_cell(&s), "61%ᵒ");
+        // ② 모호·무효 관측 = 버리고 자기보고 + ˢ
+        for attr in ["ambiguous", "evicted"] {
+            let s = json!({"usage": {"ctx_pct": 89, "attribution": attr},
+                           "status": {"context_pct": 40}});
+            assert_eq!(ctx_cell(&s), "40%ˢ", "attribution={attr}");
+        }
+        // ③ 둘 다 없으면 `-` (모호 관측만 있고 자기보고가 없는 경우 포함 — 지어내지 않는다)
+        assert_eq!(ctx_cell(&json!({})), "-");
+        assert_eq!(
+            ctx_cell(&json!({"usage": {"ctx_pct": 89, "attribution": "ambiguous"}})),
+            "-"
+        );
+        // ④ 관측 없음 + 자기보고 있음 = 자기보고
+        assert_eq!(ctx_cell(&json!({"status": {"context_pct": 7}})), "7%ˢ");
+    }
+
+    /// clap 계약: `--path`는 필수이고 서브커맨드 이름은 kebab(`pack-scope-check`)이다.
+    /// 훅(sh)이 이 문자열을 호출하므로 이름·인자 형태가 계약이다.
+    #[test]
+    fn pack_scope_check_cli_shape() {
+        use clap::Parser;
+        match Cli::parse_from(["cys", "pack-scope-check", "--path", "/a/b"]).command {
+            Command::PackScopeCheck { path } => assert_eq!(path, "/a/b"),
+            _ => panic!("pack-scope-check가 PackScopeCheck로 파싱되지 않음"),
+        }
+        assert!(
+            Cli::try_parse_from(["cys", "pack-scope-check"]).is_err(),
+            "--path 없이 통과하면 훅이 빈 판정을 받는다"
+        );
     }
 }
