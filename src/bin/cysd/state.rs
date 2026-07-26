@@ -889,6 +889,19 @@ mod panic_isolation_tests {
 }
 
 pub struct Daemon {
+    /// ★CU-3A 데몬 정체성(부팅 시점 상수): 이 데몬이 소속된 팩 디렉터리. `Daemon::new`에서
+    /// **1회만** 캡처한다 — 핸들러가 매 요청 `cys::pack::pack_dir()`을 직호출하지 않는 이유는 두 가지다.
+    /// ①런타임 env 변조(pane 상속·rotate)가 데몬 정체성을 흔들면 `surface.list` 봉투가 요청마다
+    /// 다른 팩을 주장해 소비자(`cys todo-path`·pack-guard)의 권위 판정이 갈린다 — 정체성은
+    /// 프로세스 수명 동안 불변이어야 한다. ②lib 크레이트 `cys`의 W0-a 봉인(pack.rs `pack_dir()`)은
+    /// 테스트 빌드에서 env 미설정 시 panic이므로, 해석 지점을 **프로덕션 부팅 경로 한 곳**으로
+    /// 모아 두면 테스트 격리 규약(CYS_PACK_DIR 샌드박스)의 검사 대상도 그 한 곳으로 줄어든다.
+    /// 부서 데몬은 spawn 시 env가 확정되므로 "기동 시점 캡처"가 의미상으로도 정확하다.
+    pub pack_dir: PathBuf,
+    /// ★CU-3A 데몬 정체성: `pack_dir`의 basename(= scope id · 본사=`pack`, 부서=`pack-dept-<n>`).
+    /// 산출 규칙은 `cys::pack::scope_id()` 단일 정본을 쓴다(Python `javis_report.py`의 `my_scope`와
+    /// 같은 규칙 — 여기서 basename을 재구현하면 2언어 판정이 즉시 drift한다).
+    pub scope: String,
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
     pub bus: EventBus,
@@ -1568,7 +1581,15 @@ impl Daemon {
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
         let channels_conn = crate::channels::open(&socket_path);
+        // ★CU-3A: 데몬 정체성(팩·scope) 1회 캡처. 이후 어떤 핸들러도 pack_dir()을 재해석하지
+        // 않는다(요청마다 다른 팩을 주장하는 것을 원천 차단 — 필드 주석 참조). scope는 basename
+        // 재구현 대신 `scope_id()` 정본을 호출한다; 두 호출 사이 env 변동 창은 부팅 단일 스레드
+        // 구간이라 존재하지 않는다.
+        let pack_dir = cys::pack::pack_dir();
+        let scope = cys::pack::scope_id();
         let daemon = Arc::new(Daemon {
+            pack_dir,
+            scope,
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단

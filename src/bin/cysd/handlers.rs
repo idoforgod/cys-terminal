@@ -1004,6 +1004,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "started_at": daemon.started_at,
                     "latest_seq": daemon.bus.latest_seq(),
                     "surface_count": daemon.surfaces.lock().unwrap().len(),
+                    // ★CU-3A(additive·INV-5): 데몬 정체성 — 부팅 시 캡처된 상수를 **읽기만** 한다
+                    // (여기서 pack_dir()을 직호출하면 요청마다 env를 재해석해 정체성이 흔들린다).
+                    // 소비자는 이 두 키를 자기 env보다 우선하는 권위로 쓴다(env 유실 pane 교정).
+                    // 구 CLI는 미지 키를 무시하므로 버전 스큐 안전.
+                    "pack_dir": daemon.pack_dir.to_string_lossy(),
+                    "scope": daemon.scope,
                     "caller": caller,
                 }),
             ))
@@ -1284,7 +1290,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 })
                 .collect();
             list.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
-            Reply::Single(ok_response(&id, json!({"surfaces": list})))
+            // ★CU-3A(additive·INV-5): 데몬 정체성은 **봉투 레벨**이다 — surface 엔트리 안이 아니다.
+            // 엔트리는 pane 단위 사실이고 팩·scope는 데몬 단위 사실이라, 엔트리에 넣으면 N번 중복된
+            // 같은 값이 되고 엔트리 필드 단정 테스트의 계약도 흔든다. 값은 부팅 시 캡처된 상수
+            // (state.rs Daemon::pack_dir/scope)를 읽기만 한다.
+            Reply::Single(ok_response(
+                &id,
+                json!({"surfaces": list,
+                       "pack_dir": daemon.pack_dir.to_string_lossy(),
+                       "scope": daemon.scope}),
+            ))
         }
 
         // ★양방향 소켓의 핵심: 다른 pane의 PTY stdin에 텍스트를 직접 주입한다.
@@ -6650,6 +6665,66 @@ mod tests {
                 "{method}: 메타 없는 surface인데 agent/agent_alive가 null이 아니다: {bare_e}"
             );
         }
+    }
+
+    /// ★CU-3A: `surface.list`·`system.identify` 응답 **봉투**에 데몬 정체성(`pack_dir`·`scope`)이
+    /// 실린다. 이게 필요한 이유 — 소비자(`cys todo-path`·pack-guard)가 자기 env로 팩을 산출하면
+    /// env 유실 pane 에서 자기 부서 팩을 base 로 오인해 **자기 쓰기를 오차단**한다(SIM-3 실증).
+    /// 권위는 데몬 한 곳이어야 하므로 응답이 그 권위를 실어 나른다.
+    ///
+    /// 함께 박제하는 것: ①값은 부팅 시 캡처된 상수(=CYS_PACK_DIR 샌드박스와 일치) ②scope=팩 basename
+    /// ③**엔트리 안이 아니라 봉투** — 엔트리에 새면 pane 단위 사실과 데몬 단위 사실이 섞인다.
+    #[test]
+    fn list_and_identify_envelopes_expose_daemon_identity() {
+        // CYS_PACK_DIR 는 프로세스 전역 env — Daemon::new 가 그 값을 캡처하는 창을 직렬화한다.
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // scope = basename 이므로 디렉터리 이름 자체가 기대값이다(부서 팩 명명 규약 형태로).
+        let base = std::env::temp_dir().join(format!(
+            "cys-scope-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let pack = base.join("pack-dept-cu3a");
+        let _ = std::fs::create_dir_all(&pack);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack);
+        // 캡처는 Daemon::new 1회 — env 설정 후에 만들어야 한다.
+        let daemon = Daemon::new(pack.join("cysd.sock"));
+        let sid = make_surface(&daemon, Some("worker-1"));
+
+        assert_eq!(daemon.scope, "pack-dept-cu3a", "데몬이 캡처한 scope 가 팩 basename 이 아니다");
+        assert_eq!(daemon.pack_dir, pack, "데몬이 캡처한 pack_dir 가 샌드박스와 다르다");
+
+        for method in ["surface.list", "system.identify"] {
+            let req = Request { id: json!(1), method: method.into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply for {method}");
+            };
+            assert_eq!(resp["ok"], json!(true), "{method} 실패: {resp}");
+            let env = &resp["result"];
+            assert_eq!(
+                env["pack_dir"].as_str(),
+                Some(pack.to_string_lossy().as_ref()),
+                "{method}: 봉투 pack_dir 가 데몬 정체성과 다르다: {env}"
+            );
+            assert_eq!(
+                env["scope"], json!("pack-dept-cu3a"),
+                "{method}: 봉투 scope 가 팩 basename 이 아니다: {env}"
+            );
+        }
+
+        // ③ 봉투 전용 계약: surface 엔트리에는 새지 않는다(엔트리 필드 단정 테스트와의 경계).
+        let req = Request { id: json!(2), method: "surface.list".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        let entry = surface_entry(&resp, "surfaces", sid);
+        assert!(
+            entry.get("pack_dir").is_none() && entry.get("scope").is_none(),
+            "데몬 정체성이 surface 엔트리로 샜다(봉투 레벨 계약 위반): {entry}"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 발견(AB-BA 데드락 — 락 순서 역전): surface.create의 master/cso 특권역할 게이트가

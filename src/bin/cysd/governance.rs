@@ -1116,7 +1116,7 @@ fn check_launch_flags(
 
 /// T2-6 토폴로지 영속: role→agent→cwd 매핑을 디스크에 상시 기록 (cys restore의 진실).
 pub fn persist_topology(daemon: &Arc<Daemon>) {
-    let entries: Vec<serde_json::Value> = daemon
+    let mut entries: Vec<serde_json::Value> = daemon
         .surfaces
         .lock()
         .unwrap()
@@ -1128,6 +1128,11 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                 json!({"role": role, "agent": meta.as_ref().map(|(n, _)| n.clone()),
                        "agent_bin": meta.map(|(_, b)| b),
                        "cwd": s.cwd, "title": s.title.lock().unwrap().clone(),
+                       // ★CU-7A(additive): surface 셸의 pid. 교차-데몬 발신자 attest(CU-7B)가
+                       // "이 pid가 정말 저 데몬의 이 역할인가"를 대조할 유일한 물증이다. 여기서
+                       // 굳이 영속하는 이유: attest는 **남의 데몬**을 소켓으로 물어볼 수 없고
+                       // (그 자체가 신뢰 문제) 파일이 유일한 교차 데몬 관측면이기 때문이다.
+                       "pid": s.pid,
                        "session_id": s.agent_session_id.lock().unwrap().clone(),
                        // (W1) 원 계정 config_dir 영속 — restore가 이 값을 launch 문자열에 인라인해
                        // 데몬 env 변동에도 원 대화(.jsonl)로 정확히 재개한다. 구 topology(필드 없음)는
@@ -1137,6 +1142,18 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
             })
         })
         .collect();
+    // ★CU-7A: pid_start_time 보강은 **surfaces 락을 놓은 뒤**에 한다. peer_start_time은 sysinfo
+    // 블로킹 syscall이라 락 안에서 돌리면 그동안 surface 생성·종료·send가 전부 정지한다
+    // (surface.list 핸들러가 같은 이유로 pid 수집과 refresh를 분리해 둔 관용구를 따른다).
+    // pid만으로는 부족한 이유: pid는 재사용된다 — start_time과 쌍이어야 "같은 프로세스"가
+    // 결정론으로 증명된다. 죽은 프로세스·조회 실패는 None(=null)으로 남기고, 소비자는 None을
+    // "대조 불가 → 미검증"으로 다루면 된다(fail-closed는 소비자 쪽 책임).
+    for e in entries.iter_mut() {
+        let st = e["pid"]
+            .as_u64()
+            .and_then(|p| crate::state::peer_start_time(p as u32));
+        e["pid_start_time"] = json!(st);
+    }
     // ★W2a 묘비 영속: 의도적으로 닫힌 역할을 topology.json에 함께 써 콜드부트를 넘겨 생존시킨다.
     // auto-restore·phoenix가 이 집합을 desired_roster로 병합해 좀비 부활을 원천 차단한다.
     let tombstones: Vec<String> = {
@@ -1159,7 +1176,14 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
     let rev = daemon.tombstones_rev.load(std::sync::atomic::Ordering::SeqCst);
     let dir = crate::state::state_dir(&daemon.socket_path);
     let content = serde_json::to_string_pretty(&json!({
-        "schema_version": 1,          // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행)
+        // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행).
+        // ★CU-7A 버전 정책(명문화): **키 추가=버전 유지 · 키 의미 변경(또는 제거)=버전 범프**.
+        // 근거 — 이 파일의 소비자는 전부 "아는 키만 읽는" 관용 파서다: phoenix restore(python·
+        // role/agent/cwd/session_id 등만 읽고 pid는 **읽지 않는다**), 묘비 리더(tombstones 키만),
+        // state-generations 스냅샷(파일 통복사). 키 추가는 이들 중 누구도 깨지 않으므로 범프하면
+        // 오히려 구 바이너리에 legacy 경고를 유발한다(무해한 변경에 비용만 발생). 반대로 기존 키의
+        // 의미가 바뀌면 관용 파서는 조용히 오해석하므로 반드시 범프해야 한다.
+        "schema_version": 1,
         "tombstones_rev": rev,        // ★A-S1 단조 카운터
         "updated_at": now_epoch(),
         "entries": entries,
@@ -3215,9 +3239,10 @@ mod tests {
     // ─────────── ★묘비 게이트: reap≠묘비, owner-close=묘비 (부활 불변식) ───────────
 
     use super::{
-        close_surface, load_tombstones_from_disk, load_tombstones_rev_from_disk, now_epoch,
-        persist_topology, reap_exited_surfaces, CloseCause, Daemon,
+        close_surface, load_tombstones_from_disk, load_tombstones_rev_from_disk, load_topology,
+        now_epoch, persist_topology, reap_exited_surfaces, CloseCause, Daemon,
     };
+    use serde_json::json;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     /// reap 계열 테스트는 CYS_REAP_EXITED* env를 만지므로 직렬화(다른 env-터치 테스트와 충돌 방지).
@@ -3339,6 +3364,90 @@ mod tests {
         assert_eq!(v["tombstones_rev"].as_u64(), Some(rev1));
         // disk 시드 라운드트립
         assert_eq!(load_tombstones_rev_from_disk(&daemon.socket_path), rev1);
+    }
+
+    /// ★CU-7A 라운드트립: persist_topology 가 쓴 entries 에 `pid`·`pid_start_time` 이 실리고,
+    /// 기존 키는 하나도 잃지 않는다(additive·INV-5). `schema_version` 은 **불변**이어야 한다 —
+    /// 키 추가는 관용 파서 소비자(phoenix·묘비 리더·세대 스냅샷)를 깨지 않으므로 범프 대상이 아니다.
+    #[test]
+    fn topology_entries_carry_pid_additively() {
+        let daemon = drill_daemon("cu7a-roundtrip");
+        let id = spawn_role_surface(&daemon, "worker");
+        let live_pid = daemon.surfaces.lock().unwrap().get(&id).cloned().unwrap().pid;
+        persist_topology(&daemon);
+
+        // ① 디스크 원본(직접 파싱)
+        let content = std::fs::read_to_string(
+            crate::state::state_dir(&daemon.socket_path).join("topology.json"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["schema_version"], 1, "키 추가는 schema_version 을 범프하지 않는다");
+        let e = v["entries"]
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["role"] == "worker"))
+            .cloned()
+            .expect("worker 엔트리가 topology 에 없다");
+        assert_eq!(e["pid"].as_u64(), Some(live_pid as u64), "엔트리 pid 가 실제 셸 pid 와 다르다");
+        assert!(
+            e.get("pid_start_time").is_some(),
+            "pid_start_time 키 자체가 없다(attest 대조 불가): {e}"
+        );
+        // 살아있으면 Some·죽었으면 None — 둘 다 같은 시점 재조회와 일치해야 한다(비플래키 등가 단정).
+        assert_eq!(
+            e["pid_start_time"].as_u64(),
+            crate::state::peer_start_time(live_pid),
+            "pid_start_time 이 실제 프로세스 start_time 과 불일치: {e}"
+        );
+        // 기존 키 무손실(additive 계약) — 하나라도 빠지면 restore 가 조용히 열화된다.
+        for k in [
+            "role",
+            "agent",
+            "agent_bin",
+            "cwd",
+            "title",
+            "session_id",
+            "claude_config_dir",
+            "pack_reinject",
+        ] {
+            assert!(e.get(k).is_some(), "기존 키 {k} 가 사라졌다(additive 위반): {e}");
+        }
+
+        // ② 기존 읽기 경로(load_topology) 라운드트립 — 소비자가 실제로 쓰는 경로에서도 무손실.
+        let loaded = load_topology(&daemon);
+        let le = loaded
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["role"] == "worker"))
+            .cloned()
+            .expect("load_topology 가 worker 엔트리를 잃었다");
+        assert_eq!(le["pid"].as_u64(), Some(live_pid as u64));
+        assert_eq!(le["cwd"], e["cwd"], "load_topology 라운드트립에서 cwd 가 변형됐다");
+    }
+
+    /// ★CU-7A 하위호환: 구 topology.json(=pid·pid_start_time 키 없음)을 **기존 읽기 경로**로 읽어도
+    /// 깨지지 않는다 — 부재는 null 로 보이고 소비자는 현행 동작으로 폴백한다(버전 스큐 안전·INV-5).
+    #[test]
+    fn legacy_topology_without_pid_loads_as_null() {
+        let daemon = drill_daemon("cu7a-legacy");
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let legacy = json!({
+            "schema_version": 1,
+            "updated_at": 0,
+            "entries": [{"role": "worker", "agent": "claude", "agent_bin": "claude",
+                         "cwd": "/tmp", "title": "worker", "session_id": null,
+                         "claude_config_dir": null, "pack_reinject": null}],
+            "tombstones": [],
+        });
+        std::fs::write(dir.join("topology.json"), legacy.to_string()).unwrap();
+        let loaded = load_topology(&daemon);
+        let e = loaded
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["role"] == "worker"))
+            .cloned()
+            .expect("구 topology 의 worker 엔트리를 읽지 못했다");
+        assert!(e["pid"].is_null(), "구 topology 의 pid 부재가 null 이 아니다: {e}");
+        assert!(e["pid_start_time"].is_null(), "구 topology 의 pid_start_time 부재가 null 이 아니다: {e}");
+        assert_eq!(e["cwd"], json!("/tmp"), "구 엔트리의 기존 키가 손상됐다");
     }
 
     /// ★W2/C3(데몬측 원자화): close 의 엔트리 제거 + 묘비 삽입이 **단일 persist_topology** 로 원자화된다
