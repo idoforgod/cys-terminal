@@ -118,12 +118,75 @@ check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
 check("W6 데몬 묘비 set 병행", '"$CYS" tombstone "$1" --dept' in src)
 check("W7 데몬 묘비 remove 병행", '"$CYS" tombstone "$1" --dept --remove' in src)
 # ★R7(적대검증 W1): down/down-sock 모두 묘비가 reg_remove보다 선행(set -e abort 시 등재+미묘비 창 봉쇄)
-_down = src.split("  down)", 1)[1].split(";;", 1)[0]
+# ★W8 앵커 수리(CU-5A 라운드): 종전 `split(";;")`은 down 아암을 **첫 `;;`까지**로 잘랐다. down에
+# 인자 파싱 하드닝(`for _a; case "$_a" in --purge-state) … ;;`)이 들어오며 그 내부 `;;`가 먼저
+# 걸려 슬라이스가 묘비 줄에 닿지 못했고 `.index()`가 ValueError로 스크립트를 통째로 중단시켰다
+# (기준선 42/43 FAIL의 정체). 검사 의도(묘비 선기록 순서)는 그대로 두고, 아암 경계를 **다음 아암
+# 라벨**(`\n  down-sock)`)로 잡아 내부 case의 `;;`에 면역시킨다. 아래 W9도 같은 위험(현재는
+# 내부 case 부재로 통과 중)이라 동일 규약으로 정박한다.
+_down = src.split("\n  down)", 1)[1].split("\n  down-sock)", 1)[0]
 check("W8 down: 묘비 선기록", _down.index('dept_tombstone "$name"') < _down.index('reg_remove "$name"'))
-_ds = src.split("  down-sock)", 1)[1].split(";;", 1)[0]
+_ds = src.split("\n  down-sock)", 1)[1].split("\n  rotate)", 1)[0]
 check("W9 down-sock: 묘비 선기록(실행문 정박 — 주석 오매치 방지)",
       _ds.index('dept_tombstone "$name"') < _ds.index('reg_remove "$name"'))
 check("W10 ★R11 해소 실패 WARN 가시화", "데몬 묘비 해소 미확정" in src)
+
+# ── CU-5A 정적 트립와이어(설계 DESIGN_scope-first-class.md §4 CU-5A "테스트") ──
+# ★번호 주의: 설계는 이 3핀을 W10·W11·W12로 부르나 W10은 위 R11 핀이 **선점**(LOCKED 기준선의
+#   이름을 바꾸면 기존 증거·CI 로그와 어긋난다) → stdout 오염 핀만 `W10a`로 두고 나머지는 설계 번호
+#   그대로 쓴다. AC-9 "보호 핀 4종"의 W10 = 아래 W10a(stdout 계약)를 가리킨다.
+def _arm(start, end):
+    """case 아암 슬라이스 — 아암 라벨 경계로 정박(내부 case의 `;;` 면역 · W8 수리와 같은 규약)."""
+    return src.split(start, 1)[1].split(end, 1)[0]
+
+
+def _strip_comment(line):
+    """따옴표 밖 `#`부터 잘라낸다 — 주석 안의 `>&2` 문구가 리다이렉션으로 오인되지 않게."""
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+_launch = _arm("\n  launch)", "\n  allocate)")
+_alloc = _arm("\n  allocate)", "\n  create)")
+# ★W10a(E15 계약 · AC-9 보호 핀): allocate stdout 마지막 줄은 확정 name(Tauri 파싱·871행 주석),
+#   launch stdout은 사람용 상태줄뿐이다. 두 아암에 **새 stdout echo가 하나라도 늘면 FAIL** —
+#   진단·경고는 전부 >&2 여야 한다(GUI 부서장 버튼 파손 회귀 봉쇄). 허용 목록=CU-5A 이전 원본 3종.
+_ALLOWED_STDOUT = ("이미 가동 중 — 재사용", "가동 완료 (sock=", "ERROR: $name 데몬 기동 실패",
+                   'echo "$name"')
+_leaks = []
+for _blk, _tag in ((_launch, "launch"), (_alloc, "allocate")):
+    for _ln in _blk.splitlines():
+        _s = _strip_comment(_ln).strip()
+        if "echo " not in _s or _s.startswith("#"):
+            continue
+        if ">&2" in _s:
+            continue
+        if not any(a in _s for a in _ALLOWED_STDOUT):
+            _leaks.append("%s: %s" % (_tag, _s[:90]))
+check("W10a allocate/launch 신규 echo 전부 >&2 (stdout 오염 0)", not _leaks, "; ".join(_leaks))
+check("W10a-2 allocate stdout 마지막 줄 = 확정 name",
+      _strip_comment([l for l in _alloc.splitlines()
+                      if "echo " in _strip_comment(l) and ">&2" not in _strip_comment(l)][-1]).strip()
+      == 'echo "$name"')
+# ★W11: launch spawn에 CYS_ACCOUNT_DIR 주입 — rotate(재기동)가 launch를 재사용하므로 이 배선이
+#   빠지면 세대교체마다 부서 데몬이 계정 격리를 잃는다(AC-3 env 3종 생존).
+check("W11 launch 블록 CYS_ACCOUNT_DIR 주입",
+      'CYS_ACCOUNT_DIR="$acctdir"' in _launch and 'dept_account_dir "$name"' in _launch)
+# ★W12: 값이 있는데 실물이 없으면 조용한 무주입이 아니라 fail-loud(exit 5) — 원사고(비격리 spawn) 형태 봉쇄.
+check("W12 dept_account_dir fail-loud 분기", "return 5" in src.split("dept_account_dir(){", 1)[1]
+      .split("\n}", 1)[0] and '[ "$acctdir_rc" = 5 ] && exit 5' in _launch)
+# ★W12b: allocate의 account_dir 기록(create 예약 python `e['account_dir']=acctdir`과 대칭) —
+#   미기록이면 allocate-born 부서가 계정 미상으로 남아 이후 launch/rotate가 복구에만 의존한다.
+check("W12b allocate account_dir 레지스트리 기록(create 대칭)",
+      'reg_set_account_dir "$name" "$acctdir"' in _alloc and "e['account_dir']=acctdir" in src)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

@@ -10,6 +10,9 @@
 #   cys-dept <name> -- <cmd>  부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
 #
 # 격리 불변식: 부서마다 socket의 *부모 디렉토리*와 pack_dir이 서로 달라야 한다(state_dir·ACL 격리).
+# ★계정 격리(CU-5A): 부서 데몬 env 3종은 CYS_SOCKET·CYS_PACK_DIR·**CYS_ACCOUNT_DIR**이다. 계정 dir의
+#   권위는 depts.json `account_dir`이고, 부재 시 부서 팩 agents.json 리터럴로 복구(dept_account_dir) —
+#   allocate/create가 기록하고 launch(=rotate 재사용 경로)가 주입한다. 등재값이 실재하지 않으면 fail-loud(exit 5).
 # 단일 진입점: Tauri/UI·CLI 모두 이 도구를 거쳐 부서를 운용한다(직접 cysd spawn 금지 — 레지스트리/ACL 미시드 방지).
 set -euo pipefail
 
@@ -254,6 +257,38 @@ try:
 finally: _ulk(lf)
 PY
 }
+# ★CU-5A: depts.json `account_dir` 기록 — allocate 대칭화(create는 예약 python이 이미 기록:934행)와
+# dept_account_dir 복구 성공 시 역기입(자기치유)의 단일 창구. reg_set_meta의 flock RMW+원자교체 관용구 재사용.
+# ★reg_set_meta와의 의도 차이: 엔트리 부재는 fail-closed가 아니라 **WARN 후 no-op**(exit 0) — 이 함수는
+#   치유·대칭기록이라 lifecycle(launch/rotate)을 절대 깨면 안 된다. 진단은 전부 stderr(stdout 오염 0).
+reg_set_account_dir(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY'
+import json,sys,os
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
+p,n,acct=sys.argv[1:4]
+lf=open(p+'.lock','w'); _lk(lf)
+try:
+    try: d=json.load(open(p))
+    except Exception: d={'depts':{}}
+    e=d.setdefault('depts',{}).get(n)
+    if e is None:
+        sys.stderr.write("[cys-dept] WARN: account_dir 기록 skip — 레지스트리 엔트리 부재(%s)\n"%n); sys.exit(0)
+    if e.get('account_dir')==acct: sys.exit(0)          # 멱등(무의미한 재기록·mtime churn 0)
+    e['account_dir']=acct
+    tmp=p+'.tmp.%d'%os.getpid()
+    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,p)
+finally: _ulk(lf)
+PY
+}
 
 # 부서 데몬 ACL 시드 — external(CEO·오너셸)→worker 차단. fail-closed: 없으면 격리 붕괴이므로 항상 시드.
 seed_acl(){
@@ -332,6 +367,69 @@ PY
   fi
   [ -n "${HOME:-}" ] || return 1            # 규약 fallback도 불가 → fail-closed 신호
   echo "$HOME/.cys/claude-$acct"
+}
+
+# ★CU-5A 보조: 부서 팩 agents.json 에 seed_agents_account 가 **박아둔** CLAUDE_CONFIG_DIR 리터럴 산출(read-only).
+# 신구조 env 맵 우선·레거시 cmd 인라인 리터럴 폴백(seed_agents_account:291-295와 같은 두 자리를 읽는다 —
+# 생산자와 소비자가 갈리지 않도록 동일 규칙). stdout=리터럴 1줄(그 외 무출력).
+# exit 0=산출 / 1=파일·값 부재 / 3=값에 `$` 포함(base 템플릿 `${CYS_ACCOUNT_DIR:-…}` 오채택 방어 — SIM-1).
+dept_agents_account_literal(){
+  local aj; aj="$(dept_pack "$1")/agents.json"
+  [ -f "$aj" ] || return 1
+  python3 - "$aj" <<'PY'
+import json,re,sys
+try: d=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception: sys.exit(1)
+c=d.get("claude") or {}
+env=c.get("env")
+v=env.get("CLAUDE_CONFIG_DIR") if isinstance(env,dict) else None
+if not v:
+    m=re.search(r'CLAUDE_CONFIG_DIR="([^"]*)"', c.get("cmd","") or "")
+    v=m.group(1) if m else None
+if not v: sys.exit(1)
+if "$" in v: sys.exit(3)     # 미전개 템플릿 = 부서 고유 계정이 아님(base 팩 원본) → 채택 금지
+print(v)
+PY
+}
+
+# ★CU-5A: 부서 계정 dir(CYS_ACCOUNT_DIR) 결정론 산출. 우선순위(SIM-1 실측으로 확정):
+#   ① depts.json `account_dir`(레지스트리 = 권위)
+#   ② 부서 팩 agents.json 의 CLAUDE_CONFIG_DIR 리터럴(seed 가 박은 결정론 진실 · `$` 템플릿 제외·
+#      디렉터리 실재 시에만 채택) → 성공 시 ①에 역기입해 다음부터 레지스트리 경로로 수렴(자기치유)
+#   ~~resolve_default_base 재산출~~ = **기각**(SIM-1: base `~/.cys/claude-default` 미실재 기계에서
+#   조용한 무주입으로 버그 잔존 · create-born 카탈로그 계정은 파생 자체가 재현 불가).
+# stdout=계정 dir 1줄(성공 시에만)·진단은 전부 >&2.
+# exit 0=산출 / 1=출처 없음(정상 경로 — 신규·온보딩) / 5=레지스트리 등재값이 실재하지 않음(fail-loud).
+dept_account_dir(){
+  local name="$1" v lit
+  v="$(python3 - "$REG" "$name" <<'PY'
+import json,sys
+p,n=sys.argv[1:3]
+try: d=json.load(open(p,encoding="utf-8"))
+except Exception: sys.exit(1)
+v=(d.get('depts',{}).get(n) or {}).get('account_dir')
+if not v: sys.exit(1)
+print(v)
+PY
+)" || v=""
+  if [ -n "$v" ]; then
+    if [ -d "$v" ]; then echo "$v"; return 0; fi
+    # ★fail-loud(설계 CU-5A.2): 레지스트리가 계정을 **선언했는데** 실물이 없다 = 격리 전제 붕괴.
+    # 조용히 무주입으로 넘어가면 부서 데몬이 base 계정을 물고 기동한다(본 건의 원사고 형태).
+    echo "[cys-dept] ERROR: $name account_dir 등재값이 실재하지 않음($v) — fail-loud: 계정 비격리 spawn 금지." >&2
+    echo "[cys-dept]        복구=해당 dir 복원 또는 depts.json account_dir 교정 후 재시도." >&2
+    return 5
+  fi
+  lit="$(dept_agents_account_literal "$name")" || lit=""
+  if [ -n "$lit" ] && [ -d "$lit" ]; then
+    reg_set_account_dir "$name" "$lit" || true   # 역기입 실패가 기동을 막지 않는다(치유는 best-effort)
+    echo "[cys-dept] $name account_dir 복구: agents.json 리터럴 채택($lit) → depts.json 역기입(자기치유)" >&2
+    echo "$lit"; return 0
+  fi
+  if [ -n "$lit" ]; then
+    echo "[cys-dept] WARN: $name agents.json 리터럴($lit) 디렉터리 미실재 — 채택 보류(무주입)" >&2
+  fi
+  return 1
 }
 
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).
@@ -755,7 +853,23 @@ case "$cmd" in
     if ready "$sock"; then
       echo "[cys-dept] $name 이미 가동 중 — 재사용"
     else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      # ★CU-5A 계정 격리 배선: rotate(1124)가 이 launch를 재사용하므로, 여기서 CYS_ACCOUNT_DIR이
+      # 빠지면 **세대교체마다** 부서 데몬이 계정 격리를 잃는다(AC-3: rotate 후 env 3종 생존).
+      # 출처 없음(신규·온보딩)=종전 spawn 그대로 + 고지 1줄 → 첫 기동 경로 무변경.
+      acctdir=""; acctdir_rc=0
+      acctdir="$(dept_account_dir "$name")" || acctdir_rc=$?
+      [ "$acctdir_rc" = 5 ] && exit 5 || true   # 등재값 미실재 = fail-loud(사유는 헬퍼가 stderr 출력)
+      if [ -n "$acctdir" ]; then
+        # agents.json 리터럴 ↔ 주입 env 이중 진실원 대조: **집행 없음**(경고만·부채 등재).
+        lit="$(dept_agents_account_literal "$name")" || lit=""
+        if [ -n "$lit" ] && [ "$lit" != "$acctdir" ]; then
+          echo "[cys-dept] WARN: $name agents.json 리터럴($lit) ≠ 주입 CYS_ACCOUNT_DIR($acctdir) — 이중 진실원 불일치(집행 없음)" >&2
+        fi
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      else
+        echo "[cys-dept] $name account_dir 미상(레지스트리·agents.json 모두 부재) — CYS_ACCOUNT_DIR 없이 기동(신규·온보딩 경로 무변경)" >&2
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
@@ -830,6 +944,10 @@ PY
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
     [ -d "$acctdir" ] || { echo "[cys-dept] allocate: account fork dir 생성 실패: $acctdir — fail-closed" >&2; exit 5; }
+    # ★CU-5A: 산출한 계정 dir을 레지스트리에 기록 — create(예약 python 934행 `e['account_dir']=acctdir`)와
+    # **대칭화**. 이게 없으면 allocate-born 부서는 account_dir 미기록 상태로 남아 이후 launch/rotate가
+    # 계정을 알 수 없다(본 건 결손의 절반). 실패해도 allocate는 계속(치유 계층 — 진단은 stderr).
+    reg_set_account_dir "$name" "$acctdir" || echo "[cys-dept] WARN: $name account_dir 레지스트리 기록 실패(비치명·rotate 시 agents.json 복구 경로)" >&2
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2
