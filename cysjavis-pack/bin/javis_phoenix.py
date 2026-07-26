@@ -1582,6 +1582,177 @@ def c6_detect_stale_surfaces(socket):
     return stale
 
 
+# ------------- CU-6B: 죽은-에이전트 페인 **관찰자**(표식·보고 전용) + agent_seen 원장 -------------
+#
+# ADR-5(설계 정본 §3): **회수기는 순수 관찰자이고, 스폰 권위는 phoenix 복구 경로 단독이다.** 이 절의
+# 코드는 어떤 surface 도 닫지 않고(close-surface 호출 0) 띄우지 않는다(node-recover·restore 호출 0).
+# 외부로 나가는 호출은 `cys status --json` 읽기 하나뿐이다. 사다리(기획서 §5-5)는 1단=표식 ·
+# 2단=GUI 접힘(ui/src) · 3단=오너 close 이며, **3단(자동 close)은 본 CU 비범위**(오너 결재 사항).
+#
+# 왜 원장이 필요한가: `agent_alive=false` 하나만으로는 "죽었다"를 말할 수 없다. 데몬은 launch-agent 로
+# 등록된 노드의 presence 만 답하므로, 아직 한 번도 뜬 적 없는 부팅 중 pane 도 false 로 보인다. 그래서
+# **살아 있는 것을 본 이력**(agent_seen)을 파일 원장에 남기고, 이력이 있는 pane 만 '죽었다'고 판정한다.
+# (null=미상은 어떤 경우에도 비대상 — 수동 셸·구데몬·claim-role 만 한 pane 이 여기 걸리면 오살이다.)
+
+DEADAGENT_GRACE_DEFAULT = 300      # 부팅 창 보호(초). env CYS_DEADAGENT_GRACE_SECS 로 상향·하향.
+REAP_LEDGER_NAME = "reap_ledger.json"
+
+
+def reap_ledger_path(socket):
+    """agent_seen 원장 경로 — phoenix_home(socket) 하위(라이브 상태 파일 무접촉 계약과 동일 규약)."""
+    return os.path.join(phoenix_home(socket), REAP_LEDGER_NAME)
+
+
+def deadagent_grace_secs():
+    """부팅 창 보호 초. env CYS_DEADAGENT_GRACE_SECS 우선(정수·음수 아님), 부재·부적격이면 기본 300s.
+    부적격 값을 조용히 삼키지 않는다(오설정이 탐지 술어를 몰래 바꾸는 것을 막는다)."""
+    raw = os.environ.get("CYS_DEADAGENT_GRACE_SECS")
+    if raw is None or str(raw).strip() == "":
+        return DEADAGENT_GRACE_DEFAULT
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log("★CU-6B: CYS_DEADAGENT_GRACE_SECS=%r 는 정수가 아니다 — 기본 %ds 사용(무시 아님·고지)."
+            % (raw, DEADAGENT_GRACE_DEFAULT))
+        return DEADAGENT_GRACE_DEFAULT
+    if v < 0:
+        log("★CU-6B: CYS_DEADAGENT_GRACE_SECS=%s 는 음수 — 기본 %ds 사용(보호창 무력화 금지)."
+            % (v, DEADAGENT_GRACE_DEFAULT))
+        return DEADAGENT_GRACE_DEFAULT
+    return v
+
+
+def load_reap_ledger(path):
+    """원장 로드 → {surface_ref: {first_seen, last_seen}}. 부재=빈 dict(fresh 정상·경고 없음).
+    손상=기존 `_isolate_corrupt` 로 격리 후 빈 dict — **침묵 리셋 금지**(log+EVT 로 이력 소실을 고지한다).
+    이력 소실의 방향은 안전하다: 이력이 없으면 판정이 '비대상'으로 보수화된다(오살 아님·탐지 지연)."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError("최상위가 object 가 아님")
+        seen = obj.get("surfaces", {})
+        if seen is None:
+            seen = {}
+        if not isinstance(seen, dict):
+            raise ValueError("surfaces 가 object 가 아님")
+    except Exception as _e:
+        isolated = _isolate_corrupt(path)
+        log("★CU-6B 원장 손상(%s: %s) — 격리(%s) 후 빈 원장으로 재시작. 침묵 아님: agent_seen 이력이 "
+            "소실돼 당분간 탐지가 보수화(비대상)된다." % (type(_e).__name__, _e, isolated))
+        _emit_evt("agent.error", agent="phoenix",
+                  summary="reap_ledger 손상 — 격리 후 빈 원장 재시작(agent_seen 이력 소실·탐지 보수화)")
+        return {}
+    out = {}
+    for ref, rec in seen.items():
+        if isinstance(ref, str) and ref and isinstance(rec, dict):
+            out[ref] = {"first_seen": rec.get("first_seen"), "last_seen": rec.get("last_seen")}
+    return out
+
+
+def save_reap_ledger(path, ledger):
+    """원장 영속(원자쓰기 관용구 재사용). 봉투(surfaces/updated_at)는 additive 확장을 위한 것."""
+    _atomic_write_json(path, {"surfaces": ledger, "updated_at": _now()})
+
+
+def ledger_observe_alive(ledger, entries, now=None):
+    """**순수 함수**(I/O 0·입력 불변 — 테스트 주입 지점): `status --json`.surfaces 중 `agent_alive is True`
+    인 항목을 원장에 upsert 한 **새 dict** 를 반환한다. first_seen 은 최초 관측 시각 고정, last_seen 은 매
+    관측 갱신. 살아있지 않은(false/null) 항목은 원장을 건드리지 않는다 — 그래야 '죽은 것'이 자기 이력을
+    스스로 만들어내는 자기오염이 원천적으로 불가능하다."""
+    now = _now() if now is None else int(now)
+    out = {k: dict(v) for k, v in (ledger or {}).items() if isinstance(v, dict)}
+    for s in entries or []:
+        if not isinstance(s, dict):
+            continue
+        ref = s.get("surface_ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        if s.get("agent_alive") is not True:       # 엄격 — truthy 가 아니라 True 동일성
+            continue
+        rec = out.get(ref)
+        if rec is None:
+            out[ref] = {"first_seen": now, "last_seen": now}
+        else:
+            rec["last_seen"] = now
+            if rec.get("first_seen") is None:
+                rec["first_seen"] = now
+    return out
+
+
+def detect_dead_agent_entries(entries, ledger, now=None, grace=None):
+    """**순수 판정 함수**(I/O 0): 술어 5종을 **전부** 충족한 surface 만 반환한다(하나라도 불충족=비대상).
+      ① `agent_alive is False` — 엄격. None(미상)은 절대 비대상: 수동 셸·구데몬·claim-role 전용 pane.
+      ② `exited is False` — 엄격. 종료 잔재는 C6 stale 회수기 소관이라 이중 취급하지 않는다.
+      ③ agent 등록됨(비어있지 않은 문자열) — launch-agent 로 띄운 노드만. 빈 셸·온보딩 pane 비대상.
+      ④ `created_at + grace < now` — 부팅 창 보호(기본 300s). created_at 부재·비수치면 비대상(모르면 안 센다).
+      ⑤ 원장에 agent_seen 이력 존재 — 한 번도 살아있는 걸 본 적 없으면 '죽은' 게 아니라 '아직'이다.
+    반환 항목은 표식·보고 전용 관측 레코드다(행동 지시 아님)."""
+    now = _now() if now is None else int(now)
+    grace = deadagent_grace_secs() if grace is None else int(grace)
+    ledger = ledger or {}
+    out = []
+    for s in entries or []:
+        if not isinstance(s, dict):
+            continue
+        ref = s.get("surface_ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        if s.get("agent_alive") is not False:                       # ①
+            continue
+        if s.get("exited") is not False:                            # ②
+            continue
+        agent = s.get("agent")
+        if not isinstance(agent, str) or not agent.strip():         # ③
+            continue
+        created = s.get("created_at")
+        if not isinstance(created, (int, float)) or isinstance(created, bool):  # ④(모르면 비대상)
+            continue
+        age = now - float(created)
+        if age <= grace:
+            continue
+        seen = ledger.get(ref)                                      # ⑤
+        if not isinstance(seen, dict) or seen.get("first_seen") is None:
+            continue
+        out.append({
+            "surface": ref,
+            "role": s.get("role"),
+            "agent": agent,
+            "created_at": created,
+            "age_secs": int(age),
+            "agent_seen_first": seen.get("first_seen"),
+            "agent_seen_last": seen.get("last_seen"),
+        })
+    return out
+
+
+def c6_detect_dead_agent_surfaces(socket, now=None):
+    """★CU-6B 관찰자 진입점 — `cys status --json` 1콜로 ⓐ살아있는 노드의 agent_seen 원장 upsert,
+    ⓑ죽은-에이전트 페인 탐지를 함께 수행하고 **탐지 결과만** 반환한다. 어떤 행동도 하지 않는다
+    (close·reap·스폰·복구 호출 0 — ADR-5). status 불신(rc≠0·파싱 실패)=빈 목록(fail-safe: 소스를
+    못 믿을 때 '전원 사망 추정'을 하지 않는다는 C5 원칙과 동일 방향)."""
+    st = _status_json(socket)
+    if not isinstance(st, dict):
+        return []
+    entries = st.get("surfaces")
+    if not isinstance(entries, list):
+        return []
+    now = _now() if now is None else int(now)
+    path = reap_ledger_path(socket)
+    ledger = load_reap_ledger(path)
+    updated = ledger_observe_alive(ledger, entries, now)
+    if updated != ledger:
+        try:
+            save_reap_ledger(path, updated)
+        except Exception as _e:
+            # 원장 쓰기 실패가 탐지를 죽이지 않는다(다음 틱 재시도) — 단 침묵하지 않는다.
+            log("★CU-6B: reap_ledger 쓰기 실패(%s: %s) — 이번 틱 이력은 휘발, 탐지는 진행."
+                % (type(_e).__name__, _e))
+    return detect_dead_agent_entries(entries, updated, now, deadagent_grace_secs())
+
+
 def c6_reap_stale_surfaces(socket):
     """★C6 S0 실 회수(W2 — P0-6 cause 활용): exited=true 잔재를 **Reap 사유로만** 회수한다
     (`cys close-surface <ref> --reap` → CloseCause::Reap → 묘비 미생성·부활 대상 유지). 고정 OwnerClose 경로
@@ -1667,6 +1838,17 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         log("★C6 S0: 죽은 surface 잔재 %d개 탐지 → %d개 Reap 회수(묘비 0·라이브 무접촉)."
             % (len(c6_stale), len(c6.get("reaped", []))))
         save_journal(socket, ticket, j)
+    # ★CU-6B 관찰자(표식 전용): agent 가 죽은 라이브 페인을 **탐지만** 한다 — 회수·close·스폰 0(ADR-5).
+    #   관찰이 부활을 죽이면 안 되므로 어떤 예외도 여기서 흡수한다(탐지 실패=빈 목록·보고에 그대로 노출).
+    try:
+        c6_dead = c6_detect_dead_agent_surfaces(socket)
+    except Exception as _e:
+        log("★CU-6B: 죽은-에이전트 탐지 중 예외(%s: %s) — 관찰 skip(부활 경로 무영향)."
+            % (type(_e).__name__, _e))
+        c6_dead = []
+    if c6_dead:
+        log("★CU-6B: agent 사망 페인 %d개 탐지(표식만 — 자동 close·회수 없음): %s"
+            % (len(c6_dead), [d.get("surface") for d in c6_dead]))
     # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
     # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
     entries, _tombstones = observe_and_persist_roster(socket)
@@ -2025,6 +2207,9 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
         "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재
+        # ★CU-6B(additive): agent 가 죽었지만 셸은 살아있는 페인의 **탐지 결과만**. 이 키를 보고
+        #   어떤 자동 행동도 하지 않는다(사다리 1단=표식 / 2단=GUI 접힘 / 3단=오너 close).
+        "dead_agent_surfaces": c6_dead,
         "c6_reaped": c6.get("reaped", []), # ★C6 S0(W2): Reap 사유로 실제 회수한 잔재(묘비 미생성·라이브 무접촉)
         "c6_reap_failed": c6.get("reap_failed", []),
         "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)

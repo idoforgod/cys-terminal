@@ -19,6 +19,7 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel } from "./deptlabel";
+import { isDeadAgentPane, deadAgentHeaderText } from "./deadagent";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
@@ -1762,6 +1763,61 @@ function setRoleDot(el: HTMLElement, role: string | null) {
   }
 }
 
+// ---------- CU-6B2: agent가 죽은 pane 접기(사다리 2단 · 표시 전용·완전 가역) ----------
+// agent는 죽었는데 셸만 남은 pane이 화면을 차지한 채 조용히 서 있으면, 사용자는 그게 일하는
+// 노드인지 시체인지 구별할 수 없다. 그래서 **헤더 한 줄만 남기고 본문을 접는다**.
+//
+// 경계(설계 정본 ADR-5·CU-6B2):
+//   · close·회수·재스폰을 절대 하지 않는다 — 사다리 3단(오너 close)은 비범위이고, 기존 ×버튼은 그대로다.
+//   · PTY·스크롤백 무접촉: term-host를 display:none으로 감출 뿐 xterm 버퍼도 데몬 세션도 건드리지 않는다.
+//     (fitPane은 크기 60x40 미만이면 반환하므로 숨은 동안 PTY 리사이즈가 나가지 않는다.)
+//   · 완전 가역: 배지 클릭으로 펼치고, agent가 살아나면 다음 폴링 틱에 인라인 스타일이 제거돼 원상 복귀.
+//   · 최초 탐지에만 자동으로 접는다 — 사용자가 손으로 펼친 pane을 3초 폴링이 다시 접으면 안 된다.
+const DEAD_BADGE_CLASS = "pane-dead-agent";
+
+function setDeadCollapsed(rt: PaneRuntime, collapsed: boolean) {
+  rt.el.dataset.deadCollapsed = collapsed ? "1" : "";
+  // 인라인 스타일만 쓴다(스타일시트 무접촉) — 해제 시 ""로 되돌리면 원래 CSS 규칙이 그대로 복귀한다.
+  rt.termHost.style.display = collapsed ? "none" : "";
+  // 접힌 pane이 split에서 계속 자리를 차지하면 '접었다'는 말이 무색해진다 — 헤더 높이만 남기고
+  // 남는 공간은 형제 pane에 넘긴다. 펼치면 ""로 비워 render()/디바이더 드래그가 다시 주인이 된다.
+  rt.el.style.flex = collapsed ? "0 0 auto" : "";
+}
+
+function applyDeadAgentState(rt: PaneRuntime, role: string | null, dead: boolean) {
+  const header = rt.titleEl.parentElement;
+  const badge = header?.querySelector<HTMLElement>("." + DEAD_BADGE_CLASS) ?? null;
+  if (!dead) {
+    // 살아있는(또는 미상인) pane은 아무 흔적도 남기지 않는다 — 되돌림이 곧 정상 상태.
+    if (badge) badge.remove();
+    if (rt.el.classList.contains("agent-dead")) {
+      rt.el.classList.remove("agent-dead");
+      setDeadCollapsed(rt, false);
+    }
+    return;
+  }
+  const firstDetect = !rt.el.classList.contains("agent-dead");
+  rt.el.classList.add("agent-dead");
+  rt.el.dataset.deadRole = role ?? "";
+  let b = badge;
+  if (!b && header) {
+    b = document.createElement("span");
+    b.className = DEAD_BADGE_CLASS;
+    b.style.cursor = "pointer";
+    b.style.opacity = "0.75";
+    b.style.marginLeft = "6px";
+    b.addEventListener("mousedown", (e) => e.stopPropagation()); // 헤더 드래그 오발 방지(usageEl과 동일 관용구)
+    b.addEventListener("click", () => {
+      setDeadCollapsed(rt, rt.el.dataset.deadCollapsed !== "1");
+      b!.textContent = deadAgentHeaderText(rt.el.dataset.deadRole || null,
+                                           rt.el.dataset.deadCollapsed === "1");
+    });
+    header.insertBefore(b, rt.usageEl);
+  }
+  if (firstDetect) setDeadCollapsed(rt, true);
+  if (b) b.textContent = deadAgentHeaderText(role, rt.el.dataset.deadCollapsed === "1");
+}
+
 // 주기적으로 데몬에 물어 자동 제목 pane의 현재 디렉토리(cd 추적)를 갱신.
 // + 외부(CLI launch-agent·cys boot)에서 생성된 역할 노드 surface를 pane으로 자동 입양 —
 //   이게 없으면 노드가 데몬 안에서 헤드리스로만 돌고 화면에 보이지 않는다.
@@ -1783,6 +1839,8 @@ async function refreshPaneTitles() {
           live_cwd: string | null;
           exited: boolean;
           usage?: ObservedUsage | null;
+          // CU-6B2: agent presence(등록 노드만 답한다 — 수동 셸·구데몬은 null).
+          agent_alive?: boolean | null;
         }[];
       };
       for (const s of r.surfaces) {
@@ -1790,6 +1848,7 @@ async function refreshPaneTitles() {
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
         setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
+        applyDeadAgentState(rt, s.role, isDeadAgentPane(s)); // CU-6B2: agent 사망 pane 접기(표시 전용)
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
       }

@@ -719,6 +719,7 @@ def build_report(status, extra_dirs, now=None):
     # 노드 현황·idle·feed (status 있을 때만)
     live_nodes = []
     idle_nodes = []
+    dead_agent_nodes = []
     feed_pending = None
     paused = None
     if status:
@@ -743,6 +744,24 @@ def build_report(status, extra_dirs, now=None):
             if isinstance(idle_secs, int) and idle_secs >= IDLE_ALERT_SECS and s.get("agent_alive"):
                 idle_nodes.append(entry)
 
+        # ── ★CU-6B 사다리 1단(표식) — agent는 죽었는데 셸(pane)은 살아있는 노드 ─────────────
+        # 위 루프와 **분리**한 이유: 저 루프는 role 없는 surface를 건너뛰는데(집계 대상이 아니므로),
+        # agent가 죽은 pane은 role 유무와 무관하게 사람에게 보여야 한다. 기존 집계·판정은 무접촉.
+        #
+        # ⚠(경고)가 아니라 ℹ(정보)로 렌더한다 — ⚠는 javis_gate_check의 WARNING_KEYWORDS라
+        # 쓰는 순간 게이트가 WARN으로 승격된다(이 파일 아래 '미선언 todo' 절의 같은 계약).
+        # 이 절은 **표식일 뿐 어떤 자동 정리도 하지 않는다**(close·회수 0 — 3단은 오너 결재).
+        # 유예창(grace)·agent_seen 이력 같은 정밀 술어의 권위는 phoenix 원장이고(reap_ledger.json),
+        # 여기 표시는 status 한 장면의 관측이다 — 두 곳의 숫자가 다를 수 있음이 정상이다.
+        for s in status.get("surfaces", []):
+            if s.get("agent_alive") is not False or s.get("exited") is not False:
+                continue  # null(미상)·종료 pane은 비대상(엄격 — 수동 셸·부팅 창 오탐 차단)
+            agent = s.get("agent")
+            if not isinstance(agent, str) or not agent.strip():
+                continue  # agent 미등록 pane(빈 셸)은 비대상
+            dead_agent_nodes.append({"role": s.get("role"), "surface": s.get("surface_ref"),
+                                     "agent": agent})
+
     return {
         # ⚠ 모수는 `nodes[]`다(유령 재유입 금지). "전부 끝났다"는 주장은 아래 두 필드가 한다.
         "overall_pct": pct(agg_done, agg_total),
@@ -756,6 +775,8 @@ def build_report(status, extra_dirs, now=None):
         "nodes": nodes,
         "live_nodes": live_nodes,
         "idle_nodes": idle_nodes,
+        # ★CU-6B(additive·표식 전용): agent 사망 + 셸 생존 pane. 소비자는 표시만 한다(자동 정리 금지).
+        "dead_agent_nodes": dead_agent_nodes,
         "feed_pending": feed_pending,
         "paused": paused,
         "status_available": status is not None,
@@ -893,6 +914,15 @@ def render_text(rep):
             lines.append("  • ⚠ 큐/스케줄 일시정지(kill-switch) 상태")
         alive = sum(1 for n in rep["live_nodes"] if n.get("agent_alive"))
         lines.append("  • 활성 노드: %d개" % alive)
+        # ★CU-6B 표식 1줄(있을 때만) — 사람이 "저 pane은 왜 조용한가"를 즉시 읽게 한다.
+        # 정보(ℹ)다: 게이트 승격 금지·자동 정리 없음(펼침/닫기는 사람의 판단).
+        dead_agents = rep.get("dead_agent_nodes") or []
+        if dead_agents:
+            who = ", ".join("%s(%s · %s)" % (d.get("role") or "역할없음",
+                                             d.get("surface") or "surface?", d.get("agent") or "?")
+                            for d in dead_agents)
+            lines.append("  • ℹ agent 종료 pane %d개 (셸은 생존 — 표식만, 자동 정리 안 함): %s"
+                         % (len(dead_agents), who))
         if rep["feed_pending"]:
             lines.append("  • ⚠ 미처리 승인(feed): %d건 — 즉결 필요" % rep["feed_pending"])
         if rep["idle_nodes"]:
