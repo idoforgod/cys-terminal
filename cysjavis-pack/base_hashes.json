@@ -3,6 +3,22 @@
   "file": "directives/MASTER_DIRECTIVE.md",
   "hashes": [
     {
+      "sha256": "6316768ee56d9b075e1fe6b0fa7e63a1a4f761b83da9409444bd254093d21f36",
+      "commit": "100a034f45689452f05aafa64d90736aae9406d2",
+      "size": 36470,
+      "date": "2026-07-26",
+      "describe": "v0.13.19-4-g100a034 (feat/dept-scope-integrity CU-2C)",
+      "note": "MASTER_DIRECTIVE scope 권위 개정판 — pack/round 리터럴을 cys todo-path 권위 산출 지시로 교체(ADR-1). recompose 화이트리스트 등재."
+    },
+    {
+      "sha256": "ea62107a9171d8dd36bc1437222a4cf0d0b3ec81cd429e6b405163b1c419c65e",
+      "commit": "ff48432dd0213d58f5904713a7f560e37bb6c857",
+      "size": 36372,
+      "date": "2026-07-26",
+      "describe": "v0.13.18 base",
+      "note": "소급 등재 — ff48432(v0.13.18)가 등재 없이 base 변경(W-E 발견 선재 결손). 이 판을 쓰는 사용자 설치본이 recompose에서 정당 수정본으로 오인되지 않게 화이트리스트 복원."
+    },
+    {
       "sha256": "4f3d34c3ace6bdc8cbdf8eb02fd243e1c9c00cb6441637b7876ae4ba04c975f4",
       "commit": "baf70349890da1b7c725f63198495004e35aa8e9",
       "size": 35797,
