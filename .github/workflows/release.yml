@@ -23,6 +23,75 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # ★S27 교정(2026-07-26) — `src/` 모듈 선언 ↔ git 추적 파일 정합 사전 게이트.
+      # **왜 첫 잡의 첫 스텝인가**: `src/lib.rs` 가 `pub mod X;` 를 선언했는데 `src/X.rs` 가 미추적이면
+      # 태그 체크아웃에는 그 파일이 없고 **전 레그(macOS×2·Windows)가 컴파일 즉사**한다. 종전에는
+      # 그 사실이 `cargo build` 까지 20분 걸려서야 드러났고, 실패 로그는 원인(=git add 누락)을
+      # 가리키지 않았다. 실측 사례: v0.13.17 작업 브랜치에서 `src/lib.rs:16 pub mod todo_scan;` 이
+      # 이미 있는데 `src/todo_scan.rs` 는 untracked 였다.
+      # 팩 테스트에는 존재-단언 관례(`[ -f "$f" ] || exit 1`)가 있는데 `src/` 에만 없던 공백을 닫는다.
+      # SOT 는 **git 인덱스**(`git ls-files`)다 — 작업 트리 존재는 일부러 근거로 쓰지 않는다.
+      #   정확히 그 괴리(디스크엔 있고 인덱스엔 없음)가 이 게이트의 표적이기 때문이다.
+      # ⚠정직한 한계 — 이건 컴파일러가 아니다. 다음은 못 잡거나 보지 않는다:
+      #   ①인라인 `mod x { … }`(중괄호)는 파일을 요구하지 않으므로 대상 아님
+      #   ②`#[path = "…"]` 로 경로를 덮어쓴 선언은 **해석하지 않고 skip** 하며 그 사실을 로그에 남긴다
+      #   ③`cfg` 조건부 모듈도 무조건 파일을 요구한다(추적돼 있으면 통과하므로 위양성은 없다)
+      #   ④src 밖(src-tauri/·browser-runtime/)은 이 게이트 범위가 아니다
+      - name: src 모듈 선언 ↔ 추적 파일 정합 (미추적 즉사 사전 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          out = subprocess.run(["git", "ls-files", "src"],
+                               capture_output=True, text=True, check=True).stdout
+          tracked = set(l.strip() for l in out.splitlines() if l.strip())
+          rs = sorted(p for p in tracked if p.endswith(".rs"))
+          if not rs:
+              print("::error::git ls-files src 에 .rs 가 없다 — 인덱스 부재?", file=sys.stderr)
+              sys.exit(1)
+
+          # 열 0에서 시작하고 `;`로 끝나는 선언만 본다(인라인 `mod x { … }`는 파일 불요).
+          DECL = re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;')
+          missing, skipped = [], []
+          for p in rs:
+              with open(p, encoding="utf-8", errors="replace") as f:
+                  lines = f.read().splitlines()
+              base = os.path.basename(p)
+              # lib.rs·main.rs·mod.rs 는 디렉터리 자신을 대표한다 → 형제 경로.
+              # 그 외 `foo.rs` 의 자식 모듈은 `foo/` 아래에 산다(Rust 2018 경로 규칙).
+              d = os.path.dirname(p) if base in ("lib.rs", "main.rs", "mod.rs") else p[:-3]
+              for i, line in enumerate(lines):
+                  m = DECL.match(line)
+                  if not m:
+                      continue
+                  if i > 0 and lines[i - 1].lstrip().startswith("#[path"):
+                      skipped.append("%s:%d %s (#[path] 재지정 — 미해석)" % (p, i + 1, m.group(1)))
+                      continue
+                  name = m.group(1)
+                  cands = [os.path.join(d, name + ".rs"), os.path.join(d, name, "mod.rs")]
+                  if any(c in tracked for c in cands):
+                      continue
+                  on_disk = [c for c in cands if os.path.exists(c)]
+                  missing.append((p, i + 1, name, cands, on_disk))
+
+          for s in skipped:
+              print("  (skip) %s" % s)
+          sys.stdout.flush()
+          if missing:
+              print("::error::선언된 모듈의 소스가 git 인덱스에 없다 — 이 상태로 태그하면 전 레그 컴파일 즉사:",
+                    file=sys.stderr)
+              for p, ln, name, cands, on_disk in missing:
+                  why = ("작업 트리엔 있으나 **미추적**: %s → `git add %s`" % (on_disk[0], on_disk[0])
+                         if on_disk else "작업 트리에도 없음(오타·삭제 잔재 의심)")
+                  print("::error::  %s:%d `mod %s;` — %s" % (p, ln, name, why), file=sys.stderr)
+                  print("::error::    기대 경로: %s" % " 또는 ".join(cands), file=sys.stderr)
+              sys.exit(1)
+          print("✅ src 모듈 선언 ↔ 추적 파일 정합: %d개 .rs 스캔, 미해결 0" % len(rs))
+          PY
+
       - name: Release closure unit and static tests
         shell: bash
         run: |
@@ -184,6 +253,62 @@ jobs:
               exit 1
             fi
           done
+          # ── ★todo 선언·유령집계 게이트(C-1 교정 · 2026-07-26) ──
+          # **왜 여기 있어야 하는가**: 이 게이트 3종은 `ci-branch.yml` 에만 있었고 그 워크플로는
+          # `push: branches: ['feat/**']` 로만 기동한다 — **태그 push 로는 한 번도 돌지 않는다.**
+          # 즉 결함이 사용자에게 도달하는 유일한 경로(태그)에는 보증이 0이었다. Rust 파서는
+          # 아래 `cargo test --lib` 가 expected.json 대조로 묶는데 **실제 배송되는 Python 파서는
+          # 파리티 검증 0회로 서명·봉인**되던 비대칭을 여기서 닫는다.
+          # 존재-단언은 위 파리티 7종 관례와 동형이다(untracked 누락 = 초록 거짓말 차단).
+          echo "== todo 선언 파서 2언어 파리티(골든 + 조합 1024건) =="
+          d="cysjavis-pack/bin/tests/fixtures/todo-decl"
+          h="cysjavis-pack/bin/tests/parity_todo_decl.py"
+          [ -d "$d" ] || { echo "골든 픽스처 디렉터리 누락: $d (계약 SOT 부재 = 실패)" >&2; exit 1; }
+          [ -f "$d/expected.json" ] || { echo "계약 대장 누락: $d/expected.json (git add 누락 의심)" >&2; exit 1; }
+          # `ls "$d"/*.md` 는 0건일 때 pipefail 로 메시지 없이 죽는다 — find 는 0건에서도 정상 종료.
+          n="$(find "$d" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          [ "$n" -ge 15 ] || { echo "픽스처 케이스 부족(${n}종 · 설계 P3-1 최소 15종)" >&2; exit 1; }
+          [ -f "$h" ] || { echo "파리티 하네스 누락: $h (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_decl_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_decl_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_decl.rs" ] || { echo "Rust 파서 누락: src/todo_decl.rs (git add 누락 의심)" >&2; exit 1; }
+          # 하네스가 rustc 를 단독 호출한다(크레이트 의존 0 불변식의 기계 증명). 이 레그는 앞의
+          # `Setup Rust` 스텝이 툴체인을 깔았으므로 PATH 에 rustc 가 있다 — 없으면 하네스가 hard fail 한다.
+          if ! python3 "$h" --fuzz 1024 --list-mismatch 20; then
+            echo "::error::선언 파서 2언어 파리티 실패 — Python 정본과 Rust 구현이 갈렸다. 릴리스 차단." >&2
+            exit 1
+          fi
+          # 선언·스탬프·유령집계 소비자 회귀 6종. 여기서만 핀되는 행동:
+          #   · orphan-scope·미선언이 nodes[] 에 남는다(빼면 false QUIET → 세션 주차)
+          #   · 완료 파일이 미완 파일을 shadow 하지 않는다 · 집계 밖 미완 존재 시 QUIET/park 금지
+          #   · 라벨은 선언 owner(role 라벨공간 하이픈 조인 파탄 차단)
+          #   · 데몬 payload verdict 선택 필드에 대한 HUD 브리지 구/신 스큐 내성(ADR-2)
+          #   · 게이트 대장 회귀 65종(javis_report_gate + javis_gate_check)
+          # CYS_PACK_DIR 을 빈 임시 디렉터리로 고정하는 이유는 위 게이트들과 같다 — 러너의 실제
+          # 팩·홈 디렉터리에 판정이 의존하면 초록이 근거가 되지 못한다.
+          echo "== todo 선언·유령집계 소비자 회귀 6종 =="
+          for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
+                   test_report_gate test_todo_shared_constants; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== declared-state test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::선언·유령집계 게이트 실패($t) — 진행률 집계 회귀. 릴리스 차단." >&2
+              exit 1
+            fi
+          done
+          # ★todo **스캔 집합** 파리티(S18) — 위 파서 파리티와 **다른 표면**이다. 그쪽은 "같은 파일을
+          # 같게 판정하는가", 여기는 "**애초에 같은 파일을 보는가**"를 묻는다. 실측 결함: 배제 정책은
+          # 이미 같았는데 데몬이 정본 위치 `${CYS_PACK_DIR}/round`를 스캔 루트에 갖고 있지 않아, 데몬에
+          # 배선한 선언 판정·유령 배제·verdict/owner payload 가 정본 todo 에는 한 번도 적용되지 않았다.
+          echo "== todo 스캔 집합 2언어 파리티(C1·C2 동일 파일 집합) =="
+          hs="cysjavis-pack/bin/tests/parity_todo_scan.py"
+          [ -f "$hs" ] || { echo "스캔 파리티 하네스 누락: $hs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_scan_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_scan_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_scan.rs" ] || { echo "스캔 단일 구현 누락: src/todo_scan.rs (git add 누락 의심)" >&2; exit 1; }
+          if ! python3 "$hs"; then
+            echo "::error::todo 스캔 집합 파리티 실패 — C1(보고기)과 C2(데몬)가 다른 파일을 본다. 릴리스 차단." >&2
+            exit 1
+          fi
           # ── v0.13.17 큐 역압 L2 팩 배선 게이트(C7) ──
           # javis_push 이중 채널 보고 · dead-letter 전사 · wakeup drain 의 소프트캡 종결(fast-fail
           # 비오염) · orchestra 티켓 보고채널 스냅샷. 전부 밀폐 unittest(데몬·cys 미호출)라 러너에서
@@ -606,7 +731,16 @@ jobs:
       #   배너 소멸 수신 핸들러(onDaemonEvent formation 인터셉트·bootbanner.ts)는 0.13.6 앱 빌드에만 있다.
       #   신팩+구앱(≤0.13.3)이면 배너가 소멸 신호를 못 받아 불멸 잔존(스큐). 게이트가 구앱에 신팩 설치를 막아 차단.
       #   security-floor.txt는 오너 승인 SOT라 무접촉(정책 래칫 변경 아님 — 앱+팩 동시 레인 권위 필드만 상향).
-      PACK_MIN_BINARY: '0.13.6'
+      # ★0.13.18 상향(S26 · 2026-07-26 실측 근거). 이 릴리스 팩의 `javis_orchestra.py`가 선언 생성 실패
+      #   경로에서 **`cys todo-path --emit-decl` 실행을 지시**한다. 그 플래그는 이 릴리스에서 새로 생긴다:
+      #     · `git show v0.13.17:src/bin/cys.rs | grep -c emit_decl` → 0
+      #     · `git show v0.13.17:cysjavis-pack/bin/javis_orchestra.py | grep -c emit-decl` → 0
+      #     · 작업 트리 `src/bin/cys.rs` → 4 (clap `#[arg(long)] emit_decl: bool`)
+      #   즉 ≤0.13.17 바이너리 사용자가 이 팩을 받으면 지시대로 실행했을 때 unknown-flag 로 죽고,
+      #   선언 없는 todo 가 남아 집계가 `unclaimed` 로 떨어진다. docs/RELEASE.md:154 불변 규칙
+      #   ("새 팩이 더 새로운 바이너리 기능에 의존하면 그 버전으로 상향")의 직접 적용이다.
+      #   ⚠이 값은 **이 태그의 버전과 같아야** 의미가 있다 — 범프가 0.13.18 이 아니면 여기도 함께 고쳐라.
+      PACK_MIN_BINARY: '0.13.18'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -638,6 +772,58 @@ jobs:
       # 이메일·키토큰)을 바이너리 link 전에 fail-closed로 차단한다. 비0이면 잡 실패(발행 차단).
       - name: Scan pack content (pre-build hard-gate)
         run: bash scripts/scan-pack-secrets.sh
+
+      # ★★배송 팩 계약 게이트(C-1 교정 · 2026-07-26) — **이 잡이 pack.tar.gz 를 실제로 만든다.**
+      # 위 build 잡(macOS aarch64)에도 같은 게이트를 걸었지만, 그건 앱 바이너리 레그다. 사용자에게
+      # 배달되는 **Python 파서 본체**는 이 잡이 tar 로 묶어 minisign 서명한다. 서명 **전에** 검증하지
+      # 않으면 "파리티 0회로 봉인된 파서"가 그대로 나간다 — 설계 대장이 ✅ 라고 적은 보증이 배송
+      # 시점에 부재한 상태다. 그 이음매를 여기서 닫는다.
+      # 위치: 시크릿 스캔 직후 · `cargo clean`/`Build cys`/tar 생성/서명 **전부보다 앞**(fail-fast).
+      # 러너: ubuntu-latest. 앞의 `Setup Rust`(stable)가 rustc 를 PATH 에 올려두므로 2언어 파리티를
+      #   **여기서도 온전히** 돌린다(파이썬 단독 축소본 아님). 하네스는 rustc 부재 시 hard fail 하므로
+      #   조용한 축소는 발생하지 않는다.
+      # 존재-단언은 이 리포 관례(`[ -f "$f" ] || exit 1`)를 그대로 따른다 — untracked 누락으로 게이트가
+      #   조용히 skip 되면 초록이 거짓말이 된다.
+      - name: 배송 팩 계약 게이트 (선언 파서 2언어 파리티 + 유령집계 회귀)
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="cysjavis-pack/bin/tests/fixtures/todo-decl"
+          h="cysjavis-pack/bin/tests/parity_todo_decl.py"
+          [ -d "$d" ] || { echo "골든 픽스처 디렉터리 누락: $d (계약 SOT 부재 = 실패)" >&2; exit 1; }
+          [ -f "$d/expected.json" ] || { echo "계약 대장 누락: $d/expected.json (git add 누락 의심)" >&2; exit 1; }
+          n="$(find "$d" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          [ "$n" -ge 15 ] || { echo "픽스처 케이스 부족(${n}종 · 설계 P3-1 최소 15종)" >&2; exit 1; }
+          [ -f "$h" ] || { echo "파리티 하네스 누락: $h (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_decl_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_decl_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_decl.rs" ] || { echo "Rust 파서 누락: src/todo_decl.rs (git add 누락 의심)" >&2; exit 1; }
+          command -v rustc >/dev/null || { echo "rustc 부재 — 2언어 파리티 불가(축소 실행 금지)" >&2; exit 1; }
+          echo "== [pack] todo 선언 파서 2언어 파리티(골든 ${n}종 + 조합 1024건) =="
+          if ! python3 "$h" --fuzz 1024 --list-mismatch 20; then
+            echo "::error::[pack] 선언 파서 2언어 파리티 실패 — 배송될 Python 파서가 Rust 와 갈렸다. 서명 전 차단." >&2
+            exit 1
+          fi
+          echo "== [pack] todo 선언·유령집계 소비자 회귀 6종 =="
+          for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
+                   test_report_gate test_todo_shared_constants; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== [pack] declared-state test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::[pack] 선언·유령집계 게이트 실패($t) — 배송 팩 회귀. 서명 전 차단." >&2
+              exit 1
+            fi
+          done
+          # ★todo 스캔 집합 파리티(S18) — 파서 파리티와 다른 표면("같은 파일을 보는가").
+          echo "== [pack] todo 스캔 집합 2언어 파리티(C1·C2 동일 파일 집합) =="
+          hs="cysjavis-pack/bin/tests/parity_todo_scan.py"
+          [ -f "$hs" ] || { echo "스캔 파리티 하네스 누락: $hs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_scan_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_scan_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_scan.rs" ] || { echo "스캔 단일 구현 누락: src/todo_scan.rs (git add 누락 의심)" >&2; exit 1; }
+          if ! python3 "$hs"; then
+            echo "::error::[pack] todo 스캔 집합 파리티 실패 — C1(보고기)과 C2(데몬)가 다른 파일을 본다. 서명 전 차단." >&2
+            exit 1
+          fi
 
       # ★cargo clean 선행 — rust-cache가 복원한 스테일 OUT_DIR/pack_all.rs(이전 cysjavis-pack 트리로
       # 생성된 임베드 테이블)가 재사용돼 manifest SOT를 오염시키는 회귀를 차단한다. 캐시 복원 직후에

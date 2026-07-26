@@ -48,6 +48,14 @@ cys read-screen --surface <ref>                 # 보조 확인 수단 (상시 �
 cys set-status --state working --context <pct>  # 컨텍스트 자기보고 — 60% 도달 시 데몬이 결정론 통보
 ```
 
+## todo 선언 (진행% 집계 귀속)
+
+todo 파일(`<역할>_TODO.md`)은 **첫 체크박스보다 위**, 머리말 첫 줄에 선언 한 줄을 둔다 —
+`<!-- javis:todo v1 owner=<역할> scope=<팩 폴더명> lane=<작업슬러그> status=active since=<YYYY-MM-DD> -->`.
+집계기는 파일명·경로·수정시각이 아니라 이 선언으로 귀속을 판정한다(공유 폴더의 남의 시대 파일 유입
+차단). 레인이 끝나면 `status=retired`로 갱신한다. 값은 `[A-Za-z0-9._:-]`만 — 따옴표·공백은 미선언
+판정. 선언 없는 파일도 그대로 동작한다(하위호환).
+
 ## 4대 행동 지침
 
 ### 1. 실행 전 사고

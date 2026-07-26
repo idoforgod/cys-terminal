@@ -591,8 +591,17 @@ enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
-    /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출
-    TodoPath,
+    /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출.
+    /// 새로 만드는 파일에는 선언 블록 v1 한 줄이 **자동 동봉**된다(집계기는 파일명이 아니라 이 선언으로 귀속을 판정한다).
+    TodoPath {
+        /// 다른 역할의 todo 경로/선언을 산출한다 — **경로 산출 전용**(파일 생성·기록 없음).
+        /// 신원 게이트 우회 통로가 되지 않도록 남의 역할 파일은 절대 만들지 않는다(설계 R7).
+        #[arg(long)]
+        role: Option<String>,
+        /// 경로 대신 **선언 한 줄**을 출력한다(손기재 오작성을 줄이는 기계 생성기 · 설계 §4-4 P1).
+        #[arg(long)]
+        emit_decl: bool,
+    },
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
     SurfaceRole,
@@ -2270,7 +2279,7 @@ fn run(command: Command) -> i32 {
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd } => return run_boot(cwd),
-        Command::TodoPath => return run_todo_path(),
+        Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
 
@@ -4873,46 +4882,145 @@ fn run_surface_role() -> i32 {
     0
 }
 
-fn run_todo_path() -> i32 {
-    let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
-        eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다");
-        return 1;
+/// 선언 블록 v1 한 줄을 만들고 **파서 왕복 검증**까지 한다(설계 §4-1 · S17).
+///
+/// ★생성물을 파서에 먹여 `counted`가 나오는지 보는 것이 유일한 계약 준수 증명이다 —
+/// 문자 클래스(G4)·필수 키(G5)를 여기서 다시 검사하면 검사식이 두 벌이 되고, 그중 하나는
+/// 반드시 뒤처져 소비자와 갈린다(Python 스탬프 도구 `build_decl_line`과 **같은 패턴**).
+///
+/// ★실패는 **시끄럽다**. 접거나 그럴듯한 기본값으로 대체하지 않는다 — `scope`를 정규화로
+/// 접고 `"pack"`으로 폴백하던 생산자가 있었고, 그 "그럴듯하지만 틀린 정체성"이 살아있는
+/// 파일을 남의 레인(foreign-scope)으로 조용히 배제시켰다(S14와 같은 병).
+fn build_todo_decl_line(owner: &str, scope: &str) -> Result<String, String> {
+    let line = format!("<!-- javis:todo v1 owner={owner} scope={scope} status=active -->");
+    let decl = cys::todo_decl::parse(&format!("{line}\n"))
+        .map_err(|e| format!("선언 생성 실패({}: {e})", e.code))?;
+    let verdict = cys::todo_decl::classify(Some(&decl), scope, &|_| true);
+    if verdict != cys::todo_decl::Verdict::Counted {
+        return Err(format!("선언 생성 실패(판정={verdict})"));
+    }
+    Ok(line)
+}
+
+/// 새 todo 파일의 초기 본문 — **선언이 첫 줄**이다(G1' 위치 계약에 여유롭게 들어간다).
+fn new_todo_body(role: &str, decl_line: &str) -> String {
+    format!("{decl_line}\n\n# {role} TODO — 영속 todo (절대지침 7)\n\n")
+}
+
+fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
+    // `--role` 지정 = 남의 역할 산출 = **파일 기록 금지**(설계 R7 신원 게이트 우회 방지).
+    let foreign = role_opt.is_some();
+    // `--role`은 **남의 역할 경로 산출 전용**이다(파일 생성·기록 없음 · 설계 R7). 자기 역할은
+    // 데몬이 정본이므로 surface.list로 조회한다 — 손으로 지어 부르는 것을 막는 것이 이 명령의 존재 이유다.
+    let role = match role_opt {
+        Some(r) => r,
+        None => {
+            let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
+                eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다(다른 역할은 --role)");
+                return 1;
+            };
+            let Some(my_sid) = parse_surface_ref(&sref) else {
+                eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
+                return 1;
+            };
+            let role = match request("surface.list", json!({})) {
+                Ok(r) => r["surfaces"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                        .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+                }),
+                Err(e) => {
+                    eprintln!("surface.list 실패: {e}");
+                    return 1;
+                }
+            };
+            let Some(role) = role else {
+                eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
+                return 1;
+            };
+            role
+        }
     };
-    let Some(my_sid) = parse_surface_ref(&sref) else {
-        eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
-        return 1;
-    };
-    let role = match request("surface.list", json!({})) {
-        Ok(r) => r["surfaces"].as_array().and_then(|arr| {
-            arr.iter()
-                .find(|s| s["surface_id"].as_u64() == Some(my_sid))
-                .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
-        }),
+
+    // ★S19 — 팩 경로는 `cys::pack::pack_dir()` 단일 구현을 경유한다. 종전에는
+    // `env_compat("CYS_PACK_DIR")`(= CYS_/JAVIS_/AITERM_**PACK**_DIR)만 봐서 레거시 키
+    // `AITERM_JARVIS_DIR`를 인식하지 못했다 — 그 환경에서는 **생성 위치와 스캔 위치가 갈려
+    // 파일이 보고기에 영영 보이지 않는다**(env 목록이 두 벌이면 언젠가 갈린다는 실증).
+    let pack = cys::pack::pack_dir();
+    let scope = cys::pack::scope_id();
+
+    // 선언은 **경로보다 먼저** 만든다 — 만들 수 없으면 파일도 만들지 않는다(부분 성공 금지).
+    let decl_line = match build_todo_decl_line(&role, &scope) {
+        Ok(l) => l,
         Err(e) => {
-            eprintln!("surface.list 실패: {e}");
+            eprintln!(
+                "{e}\n  role={role} scope={scope}\n  \
+                 값 문자 클래스(G4 `[A-Za-z0-9._:-]+`)를 벗어난 이름은 선언이 될 수 없다. \
+                 접어서 그럴듯한 값을 만들지 않는 것이 계약이다 — 틀린 정체성은 살아있는 \
+                 파일을 남의 레인으로 조용히 배제시킨다."
+            );
             return 1;
         }
     };
-    let Some(role) = role else {
-        eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
-        return 1;
-    };
-    let pack = cys::env_compat("CYS_PACK_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cys/pack")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".cys/pack"));
+    if emit_decl {
+        println!("{decl_line}");
+        return 0;
+    }
+
     let round = pack.join("round");
+    let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
+    let path = round.join(&fname);
+
+    // `--role`(남의 역할)은 산출만 한다 — 디렉터리도 만들지 않는다.
+    if foreign {
+        println!("{}", path.display());
+        return 0;
+    }
+
     if let Err(e) = std::fs::create_dir_all(&round) {
         eprintln!("round 디렉터리 생성 실패: {e}");
         return 1;
     }
-    let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
-    let path = round.join(&fname);
     if !path.exists() {
-        let _ = std::fs::write(&path, format!("# {role} TODO — 영속 todo (절대지침 7)\n\n"));
+        if let Err(e) = std::fs::write(&path, new_todo_body(&role, &decl_line)) {
+            eprintln!("todo 파일 생성 실패: {e}");
+            return 1;
+        }
+        // ★자기 산출물 파서 왕복 검증(스탬프 도구 `verify_counted`와 같은 패턴). 의무화된
+        // 생성기가 의무화된 규칙을 위반하면 `unclaimed_ratio`가 구조적으로 M3 목표(<10%) 아래로
+        // 수렴하지 못한다 — 실제로 종전 생성기는 선언 없는 파일만 찍었다.
+        match verify_todo_counted(&path, &scope) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("생성한 todo가 파서 검증을 통과하지 못했다: {e}\n  경로={}", path.display());
+                return 1;
+            }
+        }
+    } else if let Err(e) = verify_todo_counted(&path, &scope) {
+        // 기존 파일은 **건드리지 않는다**(증거 보존 · 스탬프 도구 소관). 다만 조용히 넘기지도
+        // 않는다 — 이 파일이 왜 집계에 안 잡히는지를 지금 말해 주는 편이 낫다(G9의 정신).
+        eprintln!(
+            "ℹ 기존 todo가 선언 판정을 통과하지 못한다: {e}\n  경로={}\n  \
+             일괄 스탬프: python3 \"${{CYS_PACK_DIR:-$HOME/.cys/pack}}/bin/javis_todo_stamp.py\" --apply",
+            path.display()
+        );
     }
     println!("{}", path.display());
     0
+}
+
+/// 파일을 다시 읽어 선언이 `counted`인지 확인한다 — 읽기 경로는 계약 정본을 경유한다.
+fn verify_todo_counted(path: &std::path::Path, scope: &str) -> Result<(), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("재검증 읽기 실패: {e}"))?;
+    let head = cys::todo_decl::head_from_bytes(&raw);
+    let decl = cys::todo_decl::parse(&head).map_err(|e| format!("{}: {e}", e.code))?;
+    // scope 실재는 여기서 묻는 것이 아니다(디스크 상태는 소비자 관심사) — 내 선언이 유효하고
+    // 내 scope로 집계되는가만 본다. 스탬프 도구 `verify_counted`와 같은 판단이다.
+    let verdict = cys::todo_decl::classify(Some(&decl), scope, &|_| true);
+    if verdict != cys::todo_decl::Verdict::Counted {
+        return Err(format!("판정={verdict}"));
+    }
+    Ok(())
 }
 
 /// 루트 cwd("/"·"\\"·"C:\\" 류)를 home으로 교정 — 순수 함수(진리표 테스트 가능).
@@ -6292,6 +6400,43 @@ fn set_surface_quiescing(sid: u64, on: bool) -> Result<(), String> {
     request("surface.quiesce", json!({"surface_id": sid, "on": on})).map(|_| ())
 }
 
+/// C3 저장검증 대상 제외 판정 — 선언이 `retired`(은퇴) 또는 `foreign-scope`(실재하는 남의 팩)면 true.
+///
+/// **fail-open이 계약이다**(ADR-3): 미선언(`unclaimed`)·고아(`orphan-scope`)는 제외하지 **않는다**.
+/// 판정 못 한다고 살아있을 수 있는 파일을 게이트에서 빼면 저장 누락을 조용히 통과시킨다 —
+/// 놓치는 것보다 시끄러운 편이 안전하다. 파일을 못 열어도 같은 이유로 제외하지 않는다.
+///
+/// 읽기는 선두 `HEAD_BYTES`(1 KiB)뿐이다(G3) — cycle마다 _round의 파일 수만큼 도는 경로다.
+/// `scope_exists`를 주입받는 이유는 파서와 같다: 판정에서 파일시스템을 분리해 테스트가 실재
+/// 팩 배치에 의존하지 않게 한다(프로덕션 호출자는 `cys::pack::scope_exists`를 넘긴다).
+fn todo_decl_excluded(
+    path: &std::path::Path,
+    my_scope: &str,
+    scope_exists: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if f.take(cys::todo_decl::HEAD_BYTES as u64)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    // 예산(G3) 적용과 lossy 디코드는 계약 정본 `head_from_bytes`가 유일하게 수행한다.
+    // ★W14 S15 — 여기서 `String::from_utf8_lossy`를 직접 부르면 그것이 곧 두 번째 읽기 규칙이
+    // 되고, 언젠가 정본과 갈린다(실제로 C2 데몬이 그렇게 갈렸다). 경계가 멀티바이트 중간이어도
+    // 대체문자를 남길 뿐 패닉하지 않는 성질은 그 함수가 보장한다.
+    let head = cys::todo_decl::head_from_bytes(&buf);
+    let decl = cys::todo_decl::parse(&head).ok();
+    let verdict = cys::todo_decl::classify(decl.as_ref(), my_scope, scope_exists);
+    matches!(
+        verdict,
+        cys::todo_decl::Verdict::Retired | cys::todo_decl::Verdict::ForeignScope
+    )
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -6351,10 +6496,19 @@ fn run_cycle_agent(
             if ss.exists() {
                 v.push(ss.to_string_lossy().into_owned());
             }
+            // ★C3(설계 §4-5): cwd/_round도 전 노드가 함께 쓰는 디렉터리다. 바로 위 pack/round
+            // 분기는 그 사실을 알고 대상 역할 파일로 한정하는데 **이 분기만 무방비**였던 비대칭이
+            // 유령 todo 사고의 코드 수준 원인이다. 종결된 레인의 유산 파일(status=retired)과 남의
+            // 팩 파일(foreign-scope)을 목록에서 빼 handshake 본문을 정화한다.
+            // 판정 의미는 바꾸지 않는다 — 게이트는 여전히 ANY-match(하나라도 갱신되면 통과)다.
+            let my_scope = cys::pack::scope_id();
+            let scope_exists = |s: &str| cys::pack::scope_exists(s);
             if let Ok(entries) = std::fs::read_dir(&cwd_round) {
                 for e in entries.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if name.ends_with("_TODO.md") {
+                    if name.ends_with("_TODO.md")
+                        && !todo_decl_excluded(&e.path(), &my_scope, &scope_exists)
+                    {
                         v.push(e.path().to_string_lossy().into_owned());
                     }
                 }
@@ -11740,5 +11894,186 @@ mod tests {
         assert_eq!(report["all_saved"], json!(false));
         assert_eq!(report["pending_loss_warning"].as_array().unwrap().len(), 1);
         assert_eq!(report["pending_loss_warning"][0]["pending_undelivered"], json!(2));
+    }
+
+    // ── C3(Declared State) 저장검증 대상 정화 ────────────────────────────────
+    // cwd/_round는 전 노드 공유 디렉터리다. 바로 옆 pack/round 분기는 그 사실을 알고 대상 역할
+    // 파일로 한정하는데 이 분기만 무방비였던 비대칭이 유령 todo 사고의 코드 수준 원인이다.
+
+    /// 은퇴·타 스코프만 제외한다. 판정 불능(미선언·고아)은 **제외하지 않는다** — 판정 못 한다고
+    /// 살아있을 수 있는 파일을 게이트에서 빼면 저장 누락을 조용히 통과시킨다(ADR-3 fail-open).
+    #[test]
+    fn todo_decl_excluded_only_drops_retired_and_foreign_scope() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-c3-decl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let packs = |s: &str| matches!(s, "pack" | "pack-dept-dept-1");
+        let write = |name: &str, body: &str| {
+            let p = td.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let decl = |scope: &str, status: &str| {
+            format!(
+                "<!-- javis:todo v1 owner=worker scope={scope} status={status} -->\n# T\n- [ ] a\n"
+            )
+        };
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("retired", decl("pack", "retired"), true),
+            ("legacy-retired", "<!-- ★ STALE 무효화 -->\n# T\n- [ ] a\n".into(), true),
+            ("foreign", decl("pack-dept-dept-1", "active"), true),
+            ("mine", decl("pack", "active"), false),
+            ("orphan", decl("pack-dept-dept-9", "active"), false),
+            ("undeclared", "# 손으로 쓴 todo\n- [ ] a\n".into(), false),
+        ];
+        for (name, body, want) in cases {
+            let p = write(&format!("{name}_TODO.md"), &body);
+            assert_eq!(
+                todo_decl_excluded(&p, "pack", &packs),
+                want,
+                "[{name}] 저장검증 대상 제외 판정"
+            );
+        }
+        // 열 수 없는 경로도 제외하지 않는다(fail-open — 게이트를 조용히 헐겁게 만들지 않는다).
+        assert!(!todo_decl_excluded(&td.join("없는파일_TODO.md"), "pack", &packs));
+        // 예산(G3) 밖 은퇴 선언은 보이지 않는다 = 제외되지 않는다.
+        let far = write(
+            "budget_TODO.md",
+            &format!("{}\n{}", "x".repeat(cys::todo_decl::HEAD_BYTES), decl("pack", "retired")),
+        );
+        assert!(!todo_decl_excluded(&far, "pack", &packs));
+        // ★W14 S15 — 비UTF-8 팽창이 예산을 줄이지 않는다. 원시 400 B의 0xFF는 디코드하면
+        // 1200 B지만 원시 기준으로는 예산 안이므로 은퇴 선언이 보여야 한다. 종전에는
+        // `parse`의 재절단이 이걸 잘라 **은퇴 파일이 저장검증 대상으로 되살아났다**.
+        let p = td.join("nonutf8_TODO.md");
+        let mut raw: Vec<u8> = vec![0xff; 400];
+        raw.push(b'\n');
+        raw.extend_from_slice(decl("pack", "retired").as_bytes());
+        std::fs::write(&p, &raw).unwrap();
+        assert!(todo_decl_excluded(&p, "pack", &packs));
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★**W14 — C3 소비자 테스트의 자기 반사 차단(reviewer3 자기 신고 2번).**
+    ///
+    /// 위 케이스는 기대값을 사람이 파서 지식으로 적은 것이다. 파서와 소비자가 **함께 틀리면
+    /// 초록**인 구조였다 — Python 쪽에는 `expected.json` 외부 SOT가 있는데 Rust 소비자에는
+    /// 대응물이 없었다. 여기서는 골든 픽스처를 그대로 넣고 기대값을 **오직 대장에서** 읽는다.
+    #[test]
+    fn golden_fixtures_drive_c3_exclusion_from_external_sot() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cysjavis-pack/bin/tests/fixtures/todo-decl");
+        let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap_or_else(|e| {
+            panic!("골든 대장을 읽을 수 없다({}): {e} — SOT 부재는 skip이 아니라 실패다",
+                   dir.display())
+        });
+        let spec: serde_json::Value = serde_json::from_str(&raw).expect("expected.json 파싱");
+        let my_scope = spec["my_scope"].as_str().expect("my_scope").to_string();
+        let existing: Vec<String> = spec["existing_scopes"]
+            .as_array()
+            .expect("existing_scopes")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let scope_exists = |s: &str| existing.iter().any(|e| e == s);
+
+        let td = std::env::temp_dir().join(format!(
+            "cys-c3-golden-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let cases = spec["cases"].as_object().expect("cases");
+        assert!(cases.len() >= 15, "픽스처 케이스가 15종 미만이다: {}", cases.len());
+        for (name, exp) in cases {
+            // 내용은 한 바이트도 바꾸지 않는다(바이너리 케이스가 있어 텍스트 경유 금지).
+            let bytes = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("픽스처 {name} 읽기 실패: {e}"));
+            let p = td.join(format!("{}_TODO.md", name.trim_end_matches(".md")));
+            std::fs::write(&p, &bytes).unwrap();
+            let verdict = exp["classify"].as_str().expect("classify");
+            // 저장검증 제외 = "주인이 처분을 명시한 것"뿐(ADR-3 fail-open). 기대값을 파서가
+            // 아니라 **대장 문자열**에서 유도한다.
+            let want = matches!(verdict, "retired" | "foreign-scope");
+            assert_eq!(
+                todo_decl_excluded(&p, &my_scope, &scope_exists),
+                want,
+                "[{name}] 대장 판정={verdict} 인데 C3 제외 판정이 갈렸다"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── S17: 의무화된 생성기가 의무화된 규칙을 지키는가 ──────────────────────
+    // 디렉티브는 같은 문단에서 "경로는 반드시 `cys todo-path`" + "머리말에 선언 1줄"을 명하는데,
+    // 종전 `run_todo_path`는 선언 없는 파일만 찍었다. 유일한 기계 생성기가 규칙 위반자였고,
+    // 그래서 `unclaimed_ratio`가 구조적으로 M3 목표(<10%) 아래로 수렴할 수 없었다.
+
+    /// ★생성기의 산출물은 **자기가 만든 파서**에 먹여 `counted`가 나와야 한다.
+    /// (Python 스탬프 도구 `build_decl_line`과 같은 왕복 검증 패턴 — 검사식을 두 벌 두지 않는다.)
+    #[test]
+    fn generated_todo_body_parses_as_counted() {
+        for (role, scope) in [
+            ("worker", "pack"),
+            ("worker-2", "pack-dept-dept-1"),
+            ("reviewer-gemini", "pack"),
+            ("cso", "pack.dept_1:a-b"),
+        ] {
+            let line = build_todo_decl_line(role, scope).expect("선언 생성");
+            let body = new_todo_body(role, &line);
+            let head = cys::todo_decl::head_from_bytes(body.as_bytes());
+            let decl = cys::todo_decl::parse(&head).expect("생성물이 파서를 통과해야 한다");
+            assert_eq!(decl.owner, role);
+            assert_eq!(decl.scope, scope);
+            assert_eq!(
+                cys::todo_decl::classify(Some(&decl), scope, &|_| true),
+                cys::todo_decl::Verdict::Counted,
+                "role={role} scope={scope}"
+            );
+        }
+    }
+
+    /// ★실패는 **시끄럽다** — 접거나 그럴듯한 기본값으로 대체하지 않는다.
+    /// 정규화 폴백(`자비스` → `pack`)은 "그럴듯하지만 틀린 정체성"을 만들고, 그 정체성은
+    /// 살아있는 파일을 남의 레인으로 조용히 배제시킨다(S14와 같은 병).
+    #[test]
+    fn declaration_generator_fails_loudly_on_illegal_identity() {
+        for (role, scope) in [
+            ("worker", "자비스"),     // G4 밖 팩 이름
+            ("워커", "pack"),          // G4 밖 role
+            ("worker", "pack round"),  // 값 내 공백
+            ("worker", ""),            // 빈 값
+        ] {
+            assert!(
+                build_todo_decl_line(role, scope).is_err(),
+                "role={role} scope={scope} — 조용히 그럴듯한 값을 만들면 안 된다"
+            );
+        }
+    }
+
+    /// 생성 직후 재검증(`verify_todo_counted`)이 실제로 파일을 읽어 판정한다.
+    #[test]
+    fn verify_todo_counted_reads_the_written_file() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-s17-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let line = build_todo_decl_line("worker", "pack").unwrap();
+        let good = td.join("WORKER_TODO.md");
+        std::fs::write(&good, new_todo_body("worker", &line)).unwrap();
+        assert!(verify_todo_counted(&good, "pack").is_ok());
+        // 선언 없는 파일(종전 생성기의 산출물 형태)은 통과하지 못한다 = S17의 재현.
+        let bad = td.join("LEGACY_TODO.md");
+        std::fs::write(&bad, "# worker TODO — 영속 todo (절대지침 7)\n\n").unwrap();
+        assert!(verify_todo_counted(&bad, "pack").is_err());
+        let _ = std::fs::remove_dir_all(&td);
     }
 }

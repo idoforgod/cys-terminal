@@ -3941,6 +3941,12 @@ class Preflight:
             env = dict(os.environ)
             env.pop("CYS_SOCKET", None)
             env.pop("CYS_REPORT_GATE_DIR", None)
+            # ★유령 데몬 차단(flake 근본 원인): 가드가 없는(회귀) 게이트는 collect까지 진행하고,
+            #   그 안의 cys 호출이 "소켓 없음"을 보면 sibling cysd를 autostart 한다. 그러면 우리가
+            #   준 가짜 소켓 경로에 실제 데몬이 붙어 DB·WAL을 계속 쓰고, 검사 종료 후에도 살아남는다
+            #   (실측: analytics.db-wal 이 게이트 종료 후에도 증가). 진단 체크는 유령 데몬을 낳으면
+            #   안 되고, 이 잔존 쓰기가 아래 임시 트리 정리를 ENOTEMPTY로 터뜨린 flake의 뿌리다.
+            env["CYS_NO_AUTOSTART"] = "1"
             env.update(env_over)
             try:
                 subprocess.run([sys.executable, script, "run", "--shadow", "--state-dir", state_dir],
@@ -3961,17 +3967,39 @@ class Preflight:
         #   basename 판별로 dept면 정합 소켓 토큰을, 본사·그 외면 소켓 unset을 준다.
         base = os.path.basename(os.path.normpath(pack_dir()))
         mdept = re.match(r"pack-dept-(.+)$", base)
+        # ★계측기 신뢰(flake 근절): 구현은 임시 디렉터리 하나를 '소켓 토큰의 부모'와 '게이트
+        #   state_dir(대장이 사는 곳)'로 겸용했다. 그 결과 소켓 쪽에 붙은 프로세스의 잔존 쓰기가
+        #   대장 트리를 오염시켰고, TemporaryDirectory 정리가
+        #   `[Errno 66] Directory not empty: 'cys-dept-simfake'` 로 터지며 그게 WARN 강등이 되어
+        #   **판정 자체를 뒤집었다**(실측 6회 중 3회 위양성 — 멀쩡한 수정을 되돌릴 뻔했다).
+        #   세 겹으로 끊는다: ①위 CYS_NO_AUTOSTART=1(원인 제거) ②소켓 토큰 트리와 state_dir 분리
+        #   — 소켓 쪽에 무엇이 쓰이든 대장 트리와 무관 ③mkdtemp + finally rmtree(ignore_errors)
+        #   — 정리 실패는 삼킨다. 판정은 오직 대장 verdict로 내린다(환경 정리는 판정 입력이 아니다).
+        made = []
         try:
-            with tempfile.TemporaryDirectory() as tf, tempfile.TemporaryDirectory() as tl:
-                vf, ef = _run({"CYS_PACK_DIR": hq,           # 케이스 F: 본사 팩 + dept 소켓 토큰
-                               "CYS_SOCKET": os.path.join(tf, "cys-dept-simfake", "cys.sock")}, tf)
-                l_over = {"CYS_PACK_DIR": pack_dir()}        # 케이스 L: 팩 자기 컨텍스트(정합)
-                if mdept:                                    # dept 팩 → 정합 소켓 토큰 부여(존재 불요)
-                    l_over["CYS_SOCKET"] = os.path.join(tl, "cys-dept-%s" % mdept.group(1), "cys.sock")
-                vl, el = _run(l_over, tl)
+            sock_root = tempfile.mkdtemp(prefix="c71-sock-")   # 소켓 토큰 전용(state_dir와 분리)
+            made.append(sock_root)
+            tf = tempfile.mkdtemp(prefix="c71-f-")             # 케이스 F state_dir(대장)
+            made.append(tf)
+            tl = tempfile.mkdtemp(prefix="c71-l-")             # 케이스 L state_dir(대장)
+            made.append(tl)
         except OSError as e:
-            self.add(cid, WARN, "가드 행동 검사 환경 준비 실패(%s) — 비차단 강등" % e)
+            for _d in made:                                    # 부분 생성분 회수(누수 금지)
+                shutil.rmtree(_d, ignore_errors=True)
+            # 여기 WARN은 '생성' 실패(검사 수행 자체가 불가)다 — '정리' 실패는 아래 finally가 삼킨다.
+            self.add(cid, WARN, "가드 행동 검사 임시 디렉터리 생성 실패(%s) — 비차단 강등" % e)
             return
+        try:
+            vf, ef = _run({"CYS_PACK_DIR": hq,               # 케이스 F: 본사 팩 + dept 소켓 토큰
+                           "CYS_SOCKET": os.path.join(sock_root, "cys-dept-simfake", "cys.sock")}, tf)
+            l_over = {"CYS_PACK_DIR": pack_dir()}            # 케이스 L: 팩 자기 컨텍스트(정합)
+            if mdept:                                        # dept 팩 → 정합 소켓 토큰 부여(존재 불요)
+                l_over["CYS_SOCKET"] = os.path.join(sock_root, "cys-dept-%s" % mdept.group(1),
+                                                    "cys.sock")
+            vl, el = _run(l_over, tl)
+        finally:
+            for _d in (tf, tl, sock_root):                   # 정리 실패는 무시 — 판정 오염 금지
+                shutil.rmtree(_d, ignore_errors=True)
 
         if vf is None:
             self.add(cid, WARN, "케이스 F 실행/대장 회수 실패(%s) — 가드 검사 보류(비차단)" % ef)

@@ -3337,14 +3337,39 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .cloned()
                 .collect();
             let todo: Value = {
-                let tp = daemon.todo_progress.lock().unwrap();
+                // ★락 순서 규약(SOT 주석: governance.rs `todo_verdict_map` 위) — 이 블록이
+                // **TP→TV 중첩을 실제로 수행하는 유일한 지점**이며, 그래서 전역 순서를 정한다.
+                // 어디서든 TV를 잡은 채 TP를 잡으면 이 스레드와 즉시 데드락이다. 역순 금지.
+                let tp = daemon
+                    .todo_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // C2 선언 판정을 항목에 실어 보낸다(신설 선택 필드 `verdict`). 집계에 남아 있는
+                // 비-counted 판정은 `unclaimed`(미선언)·`orphan-scope`(실재하지 않는 팩을 가리킴)
+                // 둘뿐이며, 소비자(HUD 브리지)가 이 둘을 **구분 표시**하기 위해 필요하다.
+                // 불리언 하나로는 두 상태를 못 나르므로 판정 문자열 그대로 싣는다.
+                let tv = daemon
+                    .todo_verdict
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 tp.iter()
                     .map(|(path, (done, total, mtime))| {
-                        (
-                            path.clone(),
-                            json!({"done": done, "total": total,
-                                   "age_secs": (now - mtime).max(0.0) as u64}),
-                        )
+                        let mut item = json!({"done": done, "total": total,
+                                              "age_secs": (now - mtime).max(0.0) as u64});
+                        if let Some((_, verdict, owner)) = tv.get(path) {
+                            item["verdict"] = json!(verdict);
+                            // ★W14 S16 — 선언 `owner`를 스냅샷에도 싣는다(선택 필드).
+                            // `todo.updated` 이벤트에는 이미 실려 있었는데 여기에는 없어서, HUD
+                            // 브리지가 스냅샷 경로에서는 계속 **파일명 정규식**으로 라벨을
+                            // 추론했다 — 선언이 소거하려던 D3(파일명→역할 추론)가 C4에 그대로
+                            // 살아 있었다. 이벤트와 스냅샷이 다른 진실을 말하면 HUD 라벨은
+                            // 새로고침 한 번에 뒤집힌다. 센티널 `"?"`는 데몬이 애초에 저장하지
+                            // 않으므로 여기 도달하지 않는다(주인 미상 = 필드 부재).
+                            if let Some(o) = owner {
+                                item["owner"] = json!(o);
+                            }
+                        }
+                        (path.clone(), item)
                     })
                     .collect::<serde_json::Map<String, Value>>()
                     .into()
