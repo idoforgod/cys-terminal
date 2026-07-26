@@ -31,7 +31,7 @@
    (⓪의 --fix가 이미 기동했을 수 있다 — ping으로 확정만 한다).
 ② **역할 등록**: `cys claim-role master` (launch-agent로 기동됐다면 이미 등록 — `cys list`의
    role 열로 확인하고 중복 등록하지 않는다).
-③ **복원 점검**: `~/.cys/pack/round/SESSION_STATE.md` 를 읽는다. 미완 작업·미해결 게이트가
+③ **복원 점검**: `cys todo-path --kind session-state` 가 산출한 경로(SESSION_STATE.md)를 읽는다. 미완 작업·미해결 게이트가
    있으면 RECOVERY.md 프로토콜로 **복원 모드**에 진입한다(완료된 단계 반복 금지).
 ④ **노드 자동 기동 (생략 금지·앵커4-1 의무)**: `cys boot` 를 실행한다 — 설치된 CLI를 자동
    감지해 **CSO·워커(claude)·리뷰어 agy(Antigravity CLI)·리뷰어 codex 4종을 의무 기동**하고(grok은 설치 시
@@ -222,12 +222,12 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   (`javis_orchestra.py check`로 결정론 확인).
 
 ## 9. 복원 체크포인트 + todo 영속 (전 노드 의무)
-- 주요 이벤트(위임·게이트 통과·커밋·오너 지시)마다 `~/.cys/pack/round/SESSION_STATE.md`를
-  갱신한다(현재 위치·지시 대장·노드 상태표·미해결 게이트·다음 액션). 재시작 시
-  `~/.cys/pack/round/RECOVERY.md` 프로토콜대로 SESSION_STATE → todo → 노드 재기동·재각성 →
+- 주요 이벤트(위임·게이트 통과·커밋·오너 지시)마다 `cys todo-path --kind session-state`가 산출한
+  경로(SESSION_STATE.md)를 갱신한다(현재 위치·지시 대장·노드 상태표·미해결 게이트·다음 액션).
+  재시작 시 같은 디렉터리의 `RECOVERY.md` 프로토콜대로 SESSION_STATE → todo → 노드 재기동·재각성 →
   미해결 게이트부터 재개한다.
 - **todo 영속은 전 노드(master·CSO·워커·리뷰어) 공통 의무다**: master 자신도
-  `~/.cys/pack/round/MASTER_TODO.md`를 유지하고 **세부 완료마다 갱신**한다(다른 노드는 각자
+  `cys todo-path`가 산출한 경로(MASTER_TODO.md)를 유지하고 **세부 완료마다 갱신**한다(다른 노드는 각자
   같은 디렉터리의 `<역할>_TODO.md` — 각 디렉티브에 명시. pack의 round가 진행% 집계기의 기본
   스캔 경로다). 데몬이 `*_TODO.md` 변경을 감시해 `todo.updated` 이벤트로 전 노드에 공유한다
   — 양방향 소켓 공유의 토대.
