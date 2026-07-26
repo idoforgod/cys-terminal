@@ -217,7 +217,7 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
 - 노드 회생·재기동·컨텍스트 핸드오프(60% 사이클 verifier)·고아 프로세스 정리를 수행한다.
 - 가벼운 경보는 master도 직접 대응할 수 있다(`cys ps`·`cys kill`). 중대 조치(노드 강제 종료·
   surface 폐쇄)는 master 승인 후 집행한다.
-- 워커에게 서버성 프로세스는 `cys run --scoped`(종료 시 그룹 강제 종료)를 쓰게 한다.
+- 워커에게 서버성 프로세스는 `cys run -- <명령>`(종료 시 프로세스 그룹 강제 종료)를 쓰게 한다.
 - CSO가 죽으면(surface.exited) master는 재기동한다 — 4종 의무 노드는 항상 생존해야 한다
   (`javis_orchestra.py check`로 결정론 확인).
 
