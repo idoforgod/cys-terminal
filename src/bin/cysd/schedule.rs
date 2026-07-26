@@ -87,9 +87,14 @@ pub fn schedule_path() -> PathBuf {
     cys::pack::pack_dir().join("schedule.json")
 }
 
-/// ★B2-1(W3): built-in 잡 정의 버전. 잡 내용이 바뀌면 올린다 — 부트 ensure 가 구버전 항목을 갱신하는 기준.
-/// v2(2026-07-26): formation-ensure-10min 추가 — 버전을 올려야 **기존 사용자 파일**에 upsert 된다.
-const BUILTIN_JOBS_VERSION: u64 = 2;
+/// ★B2-1(W3): built-in 잡 정의 버전. **기존 잡의 내용이 바뀔 때만** 올린다 — 부트 ensure 가 구버전
+/// 항목을 통째로 교체하는 기준이기 때문이다.
+/// ⚠**잡 추가에는 올리지 마라**(2026-07-26 적대적 성찰): 신규 id 는 apply_builtin_jobs 의 `None →
+/// append` 경로(부재=생성)를 타는데 그 경로는 버전을 보지 않는다. 반면 버전을 올리면 **기존 built-in
+/// 잡 전체**가 `cur_ver != want_ver` 로 판정돼 사용자 파일에서 통째로 교체된다 — 사용자가 주기 등을
+/// 손봤다면 조용히 소실된다(우리가 근절하려는 '사용자 의도 무언 파괴' 결함 그 자체).
+/// 회귀 핀: `new_builtin_job_does_not_replace_existing_builtin_jobs`.
+const BUILTIN_JOBS_VERSION: u64 = 1;
 
 /// built-in 잡 정의(phoenix 인프라 + learn 학습 루프) — 팩 schedule.json 배달이 아니라 코드가 소유한다
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
@@ -160,6 +165,9 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
         // 팩 schedule.json 은 user-owned(`cys pack-ownership schedule.json` = user)라 팩 업데이트가
         // 절대 덮지 않는다 → 이 잡을 팩 파일에만 두면 **기존 사용자에게 영영 도달하지 못한다**(신규
         // 설치 전용 반쪽 수리). 코드 소유 built-in 으로 옮겨 데몬 부트 ensure 가 id upsert 로 배달한다.
+        // 배송 경로는 `None → append`(부재=생성)이며 **버전 대조를 타지 않는다** — 그래서 이 잡을
+        // 추가하면서 BUILTIN_JOBS_VERSION 을 올리지 않는다(올리면 기존 built-in 잡이 전부 교체돼
+        // 사용자 커스터마이즈가 조용히 소실된다 · 상수 주석 참조).
         // 역할: 편성이 pending(자원·CLI 미설치)으로 멈춘 레인을 10분마다 재시도해 완결로 승급시키고,
         // 그 전이에서 배너 소멸 신호(feed formation-complete)를 발행한다.
         // ⚠`--force-surface` 를 붙이지 마라 — 주기 잡의 강제 표면화는 매 틱 토스트 스팸이다
@@ -981,8 +989,8 @@ mod tests {
     /// 팩 schedule.json 은 user-owned(`cys pack-ownership schedule.json` = user)라 팩 업데이트가
     /// 절대 덮지 않는다 — 즉 팩 파일에만 추가하면 기존 사용자에게 영영 배달되지 않는다. 유일한
     /// 배송 경로는 데몬 부트의 built-in upsert(main.rs `schedule::ensure_builtin_jobs()`)다.
-    /// 여기서는 "9잡·커스터마이즈된 구버전 사용자 파일" 을 시뮬해 ①편성 잡 신규 주입 ②사용자
-    /// 커스터마이즈 무손실 ③id 유일·중복 0 ④버전 대조로 구버전 built-in 갱신을 함께 못박는다.
+    /// 여기서는 "커스터마이즈된 기존 사용자 파일(8잡)" 을 시뮬해 ①편성 잡 신규 주입(append 경로 —
+    /// **버전 대조 없이** 부재만으로 생성) ②사용자 잡 무손실 ③id 유일·중복 0 ④2차 무접촉을 못박는다.
     #[test]
     fn formation_job_reaches_existing_user_file_via_builtin_upsert() {
         // built-in id 는 코드 정의 안에서 유일해야 upsert 가 결정론적이다(중복이면 마지막이 이긴다).
@@ -994,7 +1002,7 @@ mod tests {
         assert_eq!(seen.len(), n, "built-in 잡 id 중복 — upsert 비결정론");
 
         // 기존 사용자 파일 시뮬: 사용자 잡 3개(그중 1개는 사용자가 주기를 고친 커스터마이즈) +
-        // 구버전(v1) built-in 마커 잡 5개 = 8잡. 편성 잡은 **없다**(팩 배달이 닿지 않았으므로).
+        // 현행 버전 built-in 마커 잡 5개 = 8잡. 편성 잡은 **없다**(팩 배달이 user-owned 벽에 막혔으므로).
         let mut jobs: Vec<serde_json::Value> = vec![
             json!({"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
                    "command": "echo user"}),
@@ -1007,14 +1015,12 @@ mod tests {
             if b["id"].as_str() == Some("formation-ensure-10min") {
                 continue; // 기존 사용자에겐 아직 없는 잡
             }
-            let mut old = b.clone();
-            old["_builtin_version"] = json!(1); // 구버전 마커(v1 시절 배달분)
-            jobs.push(old);
+            jobs.push(b.clone()); // 이미 배달된 built-in(현행 버전 그대로)
         }
-        assert_eq!(jobs.len(), 8, "시뮬 전제: 사용자3 + 구버전 built-in5");
+        assert_eq!(jobs.len(), 8, "시뮬 전제: 사용자3 + 기배달 built-in5");
 
         let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
-        assert!(changed, "구버전 갱신 + 편성 잡 주입으로 changed 여야 한다");
+        assert!(changed, "편성 잡 신규 주입(append)으로 changed 여야 한다");
         assert!(conflicts.is_empty(), "마커 일치 항목은 conflict 아님: {conflicts:?}");
         assert_eq!(jobs.len(), 9, "사용자3 + built-in6 = 9(편성 잡 1개만 신규 추가)");
         let formation = jobs
@@ -1034,13 +1040,13 @@ mod tests {
             Some(720),
             "마커 없는 사용자 커스터마이즈 잡 보존(built-in 아님)"
         );
-        // 구버전 built-in 은 현재 버전으로 갱신됐고, 재실행은 무접촉(중복 0).
+        // built-in 잡은 전부 현행 버전 마커를 유지한다.
         for j in jobs.iter() {
             if j.get("_builtin").is_some() {
                 assert_eq!(
                     j["_builtin_version"].as_u64(),
                     Some(BUILTIN_JOBS_VERSION),
-                    "built-in 잡은 현재 버전으로 갱신: {}",
+                    "built-in 잡 버전 마커: {}",
                     j["id"]
                 );
             }
@@ -1048,6 +1054,66 @@ mod tests {
         let (again, _) = apply_builtin_jobs(&mut jobs);
         assert!(!again, "2차 ensure 는 무접촉(멱등)");
         assert_eq!(jobs.len(), 9, "재실행에도 중복 0");
+    }
+
+    /// ★부수피해 회귀 핀(2026-07-26 적대적 성찰): **신규 built-in 잡 도입이 기존 built-in 잡을
+    /// 교체하지 않는다.**
+    /// 배경(실제로 저지른 결함): 편성 잡을 추가하며 BUILTIN_JOBS_VERSION 을 1→2 로 올렸는데,
+    /// 배송(append)은 버전을 보지 않으므로 그 상향은 **불필요**했고 대가만 있었다 — 기존 built-in
+    /// 5종이 전부 `cur_ver != want_ver` 로 판정돼 사용자 파일에서 통째로 교체되고, 사용자가 손댄
+    /// 주기·필드가 조용히 소실된다(이 프로젝트가 근절 중인 '사용자 의도 무언 파괴' 결함 유형).
+    /// ⚠fixture 는 **현장에 이미 배달된 버전(DEPLOYED_VERSION 리터럴)** 으로 고정한다 —
+    ///   BUILTIN_JOBS_VERSION 상수로 fixture 를 만들면 상수를 올려도 양변이 함께 움직여 결함을
+    ///   못 잡는 tautology 가 된다(실제로 1차 작성본이 그랬고, 주입 실험에서 통과해 버렸다).
+    /// ※ 진짜 정의 변경으로 버전을 올릴 때는 이 테스트가 의도적으로 걸린다 — 그때는 "기존 잡 교체가
+    ///   의도된 변경인가"를 사람이 판단하고 리터럴을 갱신하라는 신호다(무의식적 상향 차단이 목적).
+    #[test]
+    fn new_builtin_job_does_not_replace_existing_builtin_jobs() {
+        /// 사용자 파일에 이미 배달돼 있는 built-in 잡의 버전(현장 값 — 코드 상수와 독립된 리터럴).
+        const DEPLOYED_VERSION: u64 = 1;
+        // 사용자가 기존 built-in 잡의 주기를 손댄 파일(마커·버전은 그대로 = 우리 소유로 인식됨).
+        // 신규 잡(formation)은 아직 없다 — "잡 추가" 상황의 정확한 재현.
+        const TWEAKED: u64 = 720; // 사용자가 6h → 12h 로 늘림
+        let mut jobs: Vec<serde_json::Value> = Vec::new();
+        for b in builtin_jobs() {
+            if b["id"].as_str() == Some("formation-ensure-10min") {
+                continue;
+            }
+            let mut j = b.clone();
+            j["_builtin_version"] = json!(DEPLOYED_VERSION); // 현장 파일의 버전(코드 상수와 무관)
+            if j["id"].as_str() == Some("phoenix-snapshot-6h") {
+                j["every_minutes"] = json!(TWEAKED);
+            }
+            jobs.push(j);
+        }
+        let before: Vec<serde_json::Value> = jobs.clone();
+
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        assert!(changed, "신규 built-in 잡은 append 돼야 한다");
+        assert!(conflicts.is_empty(), "마커 일치 항목은 conflict 아님: {conflicts:?}");
+
+        // ① 신규 잡은 도달한다(배송은 버전과 무관한 append 경로).
+        assert!(
+            jobs.iter().any(|j| j["id"].as_str() == Some("formation-ensure-10min")),
+            "신규 built-in 잡이 append 되지 않았다"
+        );
+        // ② 기존 built-in 잡은 **한 글자도** 바뀌지 않는다 — 사용자가 손댄 값 포함.
+        let snap = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+            .unwrap();
+        assert_eq!(
+            snap["every_minutes"].as_u64(),
+            Some(TWEAKED),
+            "사용자가 손댄 기존 built-in 잡의 주기가 코드 정의로 되돌려졌다 — \
+             불필요한 BUILTIN_JOBS_VERSION 상향이 사용자 의도를 무언 파괴한다"
+        );
+        for old in &before {
+            let id = old["id"].as_str().unwrap();
+            let now = jobs.iter().find(|j| j["id"].as_str() == Some(id)).unwrap();
+            assert_eq!(old, now, "기존 built-in 잡 '{id}' 이 신규 잡 도입으로 교체됐다");
+        }
+        assert_eq!(jobs.len(), before.len() + 1, "추가는 정확히 신규 1건(그 외 무접촉)");
     }
 
     // ★codex W3 major: 사용자가 예약 id(phoenix-snapshot-6h)를 마커 없이 선점하면 built-in ensure 가
