@@ -1292,13 +1292,29 @@ static AUTOSTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 static AUTOSTART_TRIED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn sibling_daemon_path() -> Option<std::path::PathBuf> {
-    let name = if cfg!(windows) { "cysd.exe" } else { "cysd" };
-    std::env::current_exe()
-        .ok()?
+/// 형제 cysd 경로 해석의 **순수부**(테스트 가능 — `current_exe()`는 주입할 수 없다).
+///
+/// ★F7 CLI측 절반(WS-5 · 설계 §7-1): `current_exe()`는 심링크를 **해석하지 않은 채** 돌려줄 수 있다
+/// (`/usr/local/bin/cys → /opt/cysjavis/bin/cys` 같은 심링크 설치, 개발자의 `ln -s` 배치). 그 부모에서
+/// 형제 cysd를 찾으면 실제 설치 트리가 아니라 **심링크 디렉토리**를 데몬 트리로 오해석한다: 형제가
+/// 없으면 autostart가 "no sibling cysd"로 죽고, 하필 다른 버전의 cysd가 있으면 스큐 데몬을 띄운다
+/// (아래 autostart 경로의 crashloop 사고 이력과 결합되는 지점 — cys.rs autostart 주석 참조).
+/// → `canonicalize()`로 실경로를 먼저 확정한 뒤 형제를 찾는다.
+///
+/// **폴백 필수**: 브로커 신원 검증(mod.rs)은 fail-closed지만 여기는 **기능 경로**다. 권한·레이스로
+/// canonicalize가 실패했다고 `None`을 돌려주면 autostart·`daemon install`이 통째로 죽는다.
+/// 실패 시 원경로로 폴백해 종전 동작(dev 빌드 `target/debug` 포함)을 그대로 보존한다.
+fn sibling_daemon_from_exe(exe: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    resolved
         .parent()
         .map(|d| d.join(name))
         .filter(|p| p.exists())
+}
+
+fn sibling_daemon_path() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) { "cysd.exe" } else { "cysd" };
+    sibling_daemon_from_exe(&std::env::current_exe().ok()?, name)
 }
 
 // ── Windows 진짜 KeepAlive 패리티(작업 스케줄러 RestartOnFailure) 헬퍼 (mac launchd KeepAlive 대응) ──
@@ -3903,13 +3919,20 @@ fn doctor_pid_is_cysd(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// 고아 소켓 제거 판정(순수 함수 — 진리표 테스트 가능). 삭제는 "살아있는 cysd 홀더가 없다"의
-/// **3중 부정**이 전부 성립할 때만: ①flock 홀더 부재(=락 획득 성공 또는 락파일 ENOENT)
-/// ②기록된 홀더 pid가 사망 ③(pid 재사용 방어) 그 pid가 cysd가 아님. 하나라도 어긋나면 보류한다.
+/// 고아 소켓 제거 판정(순수 함수 — 진리표 테스트 가능). 삭제는 **①flock 홀더 부재**(=락 획득 성공
+/// 또는 락파일 ENOENT) **②기록된 홀더 pid가 사망**, 두 부정이 함께 성립할 때만이다.
+///
+/// ★정직성 정정(WS-8): 종전 주석·사용자 문구는 "3중 부정"을 표방했으나 **`pid_is_cysd`가 verdict에
+/// 전혀 반영되지 않았다**(두 match arm이 같은 값을 반환). 진단 계약을 내세운 코드가 자기 사인을
+/// 과장한 셈이다. 지금은 세 번째 신호를 **실제로 분기시킨다**: 살아있는 pid가 cysd가 아니면
+/// `ForeignPid`(= pid 재사용 의심)로 갈라 사용자에게 다른 문구·다른 조치를 준다. 판정 자체는 종전과
+/// 동일하게 보수적이다(둘 다 삭제 금지) — 바뀐 것은 **삭제/보류 경계가 아니라 진단의 해상도**다.
+/// pid 사망이 확인된 경로에서는 `pid_is_cysd`를 애초에 조회하지 않는다(호출부에서 lazy — 락 스팬 안
+/// sysinfo 스냅샷의 순수 비용 제거).
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum OrphanVerdict {
-    /// 삭제 가능 — 살아있는 홀더 없음이 3중으로 확인됨.
+    /// 삭제 가능 — 락 미보유 + 기록된 홀더 pid 사망이 함께 확인됨.
     Removable,
     /// flock 획득 실패 = 데몬이 **부팅 중이거나 보유 중** — 판정 보류·삭제 금지(fail-closed).
     /// 이 분기를 미정의로 두면 산 소켓을 지우는 영구 장애 경로가 재현된다.
@@ -3918,6 +3941,10 @@ enum OrphanVerdict {
     UnknownHolder,
     /// 기록된 홀더 pid가 살아있는 cysd — 삭제 금지.
     LiveHolder(u32),
+    /// 기록된 홀더 pid가 살아있으나 **cysd가 아니다**(pid 재사용 의심) — 삭제 금지(보수적).
+    /// LiveHolder와 판정 결과는 같지만 원인이 다르다: 전자는 "데몬이 산다", 후자는 "락파일이 낡았고
+    /// 그 번호를 남이 쓰고 있다". 사용자 조치가 다르므로(전자=대기, 후자=수동 확인) 문구를 가른다.
+    ForeignPid(u32),
 }
 
 #[cfg(unix)]
@@ -3938,7 +3965,7 @@ fn judge_orphan_socket(
     match holder_pid {
         None => OrphanVerdict::UnknownHolder,
         Some(pid) if pid_alive && pid_is_cysd => OrphanVerdict::LiveHolder(pid),
-        Some(pid) if pid_alive => OrphanVerdict::LiveHolder(pid), // 정체 불명 생존 pid = 보수적 보류
+        Some(pid) if pid_alive => OrphanVerdict::ForeignPid(pid), // 생존하나 cysd 아님 = pid 재사용 의심
         Some(_) => OrphanVerdict::Removable,
     }
 }
@@ -3994,10 +4021,11 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     } else {
         None
     };
-    let (alive, is_cysd) = match holder_pid {
-        Some(p) => (doctor_pid_alive(p), doctor_pid_is_cysd(p)),
-        None => (false, false),
-    };
+    // ★lazy: sysinfo 스냅샷은 **pid가 살아있을 때만** 뜬다. 사망 pid에 대한 조회는 verdict에
+    // 영향을 줄 수 없는데(진리표상 `Some(_) => Removable`) 락 스팬 안에서 비용만 지불했다 — WS-7이
+    // 줄이려는 바로 그 보유 구간이다.
+    let alive = holder_pid.map(doctor_pid_alive).unwrap_or(false);
+    let is_cysd = alive && holder_pid.map(doctor_pid_is_cysd).unwrap_or(false);
     let verdict = judge_orphan_socket(lock_exists, flock_acquired, holder_pid, alive, is_cysd);
     std::thread::sleep(doctor_lock_hold()); // 테스트 노브(기본 0) — 부팅측 재시도 흡수 검증용.
 
@@ -4017,14 +4045,22 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         OrphanVerdict::LiveHolder(pid) => DiagItem {
             name: "socket",
             status: DiagStatus::Warn,
-            detail: format!("고아 후보 소켓 — 홀더 pid {pid} 생존 → 보류"),
+            detail: format!("고아 후보 소켓 — 홀더 pid {pid}가 살아있는 cysd → 보류"),
+            action: "삭제 금지(잠시 후 재실행)".into(),
+        },
+        OrphanVerdict::ForeignPid(pid) => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: format!("고아 후보 소켓 — 홀더 pid {pid} 생존하나 cysd 아님(pid 재사용 의심) → 보류"),
             action: "삭제 금지(수동 확인)".into(),
         },
         OrphanVerdict::Removable if fix => match std::fs::remove_file(sp) {
             Ok(()) => DiagItem {
                 name: "socket",
                 status: DiagStatus::Ok,
-                detail: "고아 소켓 제거(홀더 부재 3중 확인)".into(),
+                // ★정직한 사인(WS-8): 실제로 확인한 것만 적는다 — 시작 락을 아무도 안 쥐었고,
+                // 락파일에 적힌 홀더 pid가 죽었다. 종전 "3중 확인"은 검사하지 않은 신호를 셌다.
+                detail: "고아 소켓 제거(시작 락 미보유 + 홀더 pid 사망 확인)".into(),
                 action: "삭제함".into(),
             },
             Err(e) => DiagItem {
@@ -11510,8 +11546,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn sibling_daemon_resolves_through_symlinked_launcher() {
+        // ★F7 CLI측(WS-5): 심링크로 설치된 cys에서 형제 cysd를 찾을 때, 심링크 **디렉토리**가 아니라
+        // 실제 설치 트리를 봐야 한다. 이 픽스처가 없으면 canonicalize 삭제가 무증상으로 통과한다.
+        let base = std::env::temp_dir().join(format!(
+            "cys-sibling-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("real/bin"); // 실제 설치 트리: cys + cysd 동봉
+        let linkdir = base.join("shim"); // 심링크만 있는 디렉토리(cysd 없음)
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&linkdir).unwrap();
+        std::fs::write(real.join("cys"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(real.join("cysd"), b"#!/bin/sh\n").unwrap();
+        let link = linkdir.join("cys");
+        std::os::unix::fs::symlink(real.join("cys"), &link).unwrap();
+
+        // ① 심링크 런처: 링크 디렉토리에는 cysd가 없다 → canonicalize 없이는 None(=autostart 사망).
+        assert!(
+            !linkdir.join("cysd").exists(),
+            "픽스처 전제: 심링크 디렉토리에는 형제 cysd가 없다"
+        );
+        let got = sibling_daemon_from_exe(&link, "cysd").expect("심링크를 해석해 실트리를 찾아야 한다");
+        assert_eq!(
+            got,
+            real.canonicalize().unwrap().join("cysd"),
+            "심링크 디렉토리가 아니라 실제 설치 트리의 cysd여야 한다"
+        );
+
+        // ② 비심링크(직접 실행) 경로는 종전과 동일하게 동작한다(회귀 방지).
+        assert_eq!(
+            sibling_daemon_from_exe(&real.join("cys"), "cysd").unwrap(),
+            real.canonicalize().unwrap().join("cysd")
+        );
+
+        // ③ 형제가 없으면 None — 폴백이 존재하지 않는 경로를 반환하지 않는다.
+        let lone = base.join("lone");
+        std::fs::create_dir_all(&lone).unwrap();
+        std::fs::write(lone.join("cys"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(sibling_daemon_from_exe(&lone.join("cys"), "cysd"), None);
+
+        // ④ canonicalize 실패(비존재 경로)여도 패닉·None-즉사 없이 원경로 폴백으로 진행한다.
+        assert_eq!(
+            sibling_daemon_from_exe(&base.join("ghost/cys"), "cysd"),
+            None,
+            "폴백해도 형제 부재는 None(존재 필터는 유지)"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn orphan_socket_verdict_truth_table() {
-        // 삭제는 "살아있는 cysd 홀더 없음"의 3중 부정이 전부 성립할 때만.
+        // 삭제는 [락 미보유 + 홀더 pid 사망] 두 부정이 함께 성립할 때만. `pid_is_cysd`는 삭제 경계를
+        // 바꾸지 않지만 **생존 pid의 성격을 갈라** 사용자 문구·조치를 바꾼다(WS-8 정직성 정정).
         // ①락파일 ENOENT = 홀더 없음으로 진행(미정의면 --fix가 영구 무력)
         assert_eq!(
             judge_orphan_socket(false, true, None, false, false),
@@ -11532,19 +11625,33 @@ mod tests {
             judge_orphan_socket(true, true, None, false, false),
             OrphanVerdict::UnknownHolder
         );
-        // ④홀더 pid 생존 → 보류(cysd 여부 무관하게 보수적)
+        // ④홀더 pid 생존 → 보류. **pid_is_cysd가 verdict를 실제로 가른다**(종전에는 두 arm이 같은
+        //   값을 반환해 인자가 죽어 있었다 — 그러면서 사용자에겐 "3중 확인"이라 출력했다).
         assert_eq!(
             judge_orphan_socket(true, true, Some(7), true, true),
-            OrphanVerdict::LiveHolder(7)
+            OrphanVerdict::LiveHolder(7),
+            "살아있는 cysd = 데몬 보유"
         );
         assert_eq!(
             judge_orphan_socket(true, true, Some(7), true, false),
-            OrphanVerdict::LiveHolder(7)
+            OrphanVerdict::ForeignPid(7),
+            "살아있으나 cysd 아님 = pid 재사용 의심(문구·조치가 다르다)"
         );
-        // ⑤3중 부정 충족(락 미보유 + pid 사망 + 비cysd) → 삭제 허용
+        assert_ne!(
+            judge_orphan_socket(true, true, Some(7), true, true),
+            judge_orphan_socket(true, true, Some(7), true, false),
+            "pid_is_cysd는 verdict에 반드시 반영된다 — 인자를 무시하는 회귀를 여기서 죽인다"
+        );
+        // ⑤삭제 조건 충족(락 미보유 + pid 사망) → 삭제 허용. 사망 pid에서는 is_cysd를 조회조차
+        //   하지 않으므로(호출부 lazy) 두 입력 모두 같은 결론이어야 한다.
         assert_eq!(
             judge_orphan_socket(true, true, Some(7), false, false),
             OrphanVerdict::Removable
+        );
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), false, true),
+            OrphanVerdict::Removable,
+            "사망 pid는 is_cysd 값과 무관하게 삭제 가능"
         );
     }
 
