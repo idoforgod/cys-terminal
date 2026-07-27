@@ -33,9 +33,11 @@ type ManagedSessionKey = zeroize::Zeroizing<[u8; 32]>;
 /// flock을 점유하는데 세션 키는 메모리 전용이라 재인수가 불가능해 고아가 확정된다.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ValidationSeverity {
-    /// 살아있는 정상 런타임에서도 부하·타이밍으로 발생 가능(TCP connect/read 타임아웃·비200).
+    /// 살아있는 정상 런타임에서도 부하·타이밍으로 발생 가능(TCP connect/read 타임아웃·비200
+    /// **+ endpoint 파일의 일시적 read I/O 오류** — fd 고갈·EIO·NFS 지연은 내용 손상이 아니다).
     Transient,
-    /// 런타임 신원 자체가 깨졌다(프로세스 부재·start_time 불일치·MAC 불일치·identity 불일치).
+    /// 런타임 신원 자체가 깨졌다(프로세스 부재·start_time 불일치·MAC 불일치·identity 불일치
+    /// **+ endpoint 파일 부재(NotFound)·JSON 파싱 실패** — 둘 다 재시도로 회복되지 않는다).
     Fatal,
 }
 
@@ -103,7 +105,9 @@ impl RealSupervisorLauncher {
     }
 
     /// 엔트리를 잊는 유일한 경로. 잊은 런타임을 살려두면 전역 flock을 영구 독점하므로
-    /// 제거와 종료는 하나의 계약이다(§2-A evict 종료 계약).
+    /// 제거와 종료 **요청**은 하나의 계약이다(§2-A evict 종료 계약). 단 종료는
+    /// best-effort이며 EOF 무시 supervisor는 잔존한다 — `terminate_evicted_runtime` 주석의
+    /// 잔존물 계약을 볼 것.
     fn evict_managed_runtime(&self, runtime: &ManagedRuntime, reason: &str) {
         let removed = self.remove_managed_incarnation(
             &runtime.state.instance_id,
@@ -161,6 +165,20 @@ fn remove_managed_incarnation(
 /// X2(reap 금지) 비위반: 이것은 타 데몬이 쥔 홀더가 아니라 **우리가 세션 키를 발급하고
 /// control 파이프를 소유한 자기 자식**이다. 소유권 토큰 부재 문제가 성립하지 않으므로
 /// X2의 적용 대상이 아니다.
+///
+/// ★**evict 종료는 best-effort다 — EOF를 무시하는 supervisor는 잔존한다**(적대 검증 4-2).
+/// 이 함수는 control 파이프만 닫고 끝나며 `try_wait` 폴링도 SIGKILL 격상도 하지 않는다.
+/// `terminate_supervisor`가 하는 격상을 여기서 못 하는 이유는 구조적이다: 성공 커밋 후
+/// `Child` 핸들은 워처 스레드(`launch()`의 `child.wait()` 루프)가 단독 소유하며,
+/// `ManagedRuntime`은 `control`만 공유 보유한다. 따라서 evict는 "종료 요청"이지
+/// "종료 보장"이 아니다.
+///
+/// **잔존물 계약**(§4-3의 pre-readiness 잔존물 계약과 같은 등급의 인정된 한계):
+/// EOF를 무시하거나 wedge된 supervisor는 flock을 쥔 채 장부에서만 사라진다 = 잔여 고아.
+/// 회수는 ①supervisor 자신의 liveness 스레드(EOF ≤100ms 감지) ②엔진 런처 자기 타임아웃
+/// ③프로세스 사망 시 flock 자동 해제 + 다음 ensure의 stale 수렴에 의존한다. 이 창은
+/// 리스(WS-11) 도입 전까지 완전 봉합 불가다. 계약을 회귀로 고정한 테스트:
+/// `evicting_an_eof_ignoring_supervisor_leaves_it_alive_by_contract`.
 ///
 /// 무음 종료 금지 계약: 종료 시 반드시 1줄을 남긴다.
 fn terminate_evicted_runtime(runtime: &ManagedRuntime, reason: &str) {
@@ -519,8 +537,9 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             _ => {
                 terminate_supervisor(&mut child, &mut control, PRE_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
-                    "SUPERVISOR_READINESS_OVERFLOW",
-                    "supervisor readiness frame exceeded 64 KiB",
+                    // §5-0-A-1 코드 길이 상한 26자 — `SUPERVISOR_READINESS_OVERFLOW`(29자)에서 개명.
+                    "SUPERVISOR_READY_OVERFLOW",
+                    "readiness frame exceeded 64 KiB",
                 ));
             }
         };
@@ -640,10 +659,20 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         }
         let validated = (|| -> Result<AuthenticatedEndpointSnapshot, ValidationError> {
             let input = std::fs::read(&runtime.endpoint_path).map_err(|error| {
-                fatal(BrokerFailure::new(
-                    "ENGINE_ENDPOINT_UNAVAILABLE",
+                let failure = BrokerFailure::new(
+                    "ENGINE_ENDPOINT_FAILED",
                     format!("private engine endpoint unavailable: {error}"),
-                ))
+                );
+                // ★적대 검증 4-3: 파일 I/O 실패를 일괄 치명으로 두면 fd 고갈·순간 EIO·
+                // NFS 지연 **1회**가 살아있는 브라우저의 소유권을 파괴한다 — WS-0이 막으려던
+                // 결함(health 타임아웃 1회 = 고아 확정)과 정확히 동형이다. 회복 불가가
+                // 확정된 `NotFound`(엔진이 endpoint를 지웠거나 쓰지 못했다)만 치명이고,
+                // 나머지 io 오류는 일시로 분류해 연속 3회 한계에 맡긴다.
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    fatal(failure)
+                } else {
+                    transient(failure)
+                }
             })?;
             let endpoint: AuthenticatedEngineEndpoint =
                 serde_json::from_slice(&input).map_err(|error| {
@@ -750,6 +779,53 @@ fn terminate_supervisor(
     child.wait().ok()
 }
 
+/// §5-0-A-1 계약: 에러 코드는 **26자 이내**여야 배너
+/// `BROWSER_DISABLED_SAFE [<CODE>]: <message>`가 120자 절단(`ui/src/webpane.ts:386`) 안에서
+/// 사유를 보존한다. 소스 텍스트를 직접 스캔하는 트립와이어로, 두 모듈의 테스트가 공유한다.
+///
+/// 판정 규칙: `"` 바로 뒤부터 `[A-Z0-9_]`가 이어지고 곧바로 `"`로 닫히는 리터럴만 후보다
+/// (따옴표 parity에 의존하지 않아 `\"` 이스케이프가 섞여도 어긋나지 않는다). Rust 상수 이름
+/// 같은 비-리터럴 식별자는 애초에 후보가 아니며, 에러 코드가 아닌 것으로 확인된 리터럴은
+/// 아래 명시 제외 목록에 둔다.
+#[cfg(test)]
+pub(super) fn over_long_screaming_case_literals(source: &str) -> Vec<&str> {
+    const MAX_ERROR_CODE_LEN: usize = 26;
+    /// 에러 코드가 아님이 확인된 SCREAMING_SNAKE 리터럴(컴파일 타임 env 이름).
+    const NOT_ERROR_CODES: [&str; 1] = ["CYS_BROWSER_V2_RELEASE_QUALIFIED"];
+    let bytes = source.as_bytes();
+    let mut offenders: Vec<&str> = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_uppercase()
+                || bytes[end] == b'_'
+                || bytes[end].is_ascii_digit())
+        {
+            end += 1;
+        }
+        if end > start && end < bytes.len() && bytes[end] == b'"' {
+            let token = &source[start..end];
+            if token.contains('_')
+                && token.len() > MAX_ERROR_CODE_LEN
+                && !NOT_ERROR_CODES.contains(&token)
+                && !offenders.contains(&token)
+            {
+                offenders.push(token);
+            }
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    offenders
+}
+
 fn ensure_launch_not_cancelled(cancelled: &Arc<AtomicBool>) -> Result<(), BrokerFailure> {
     if cancelled.load(Ordering::SeqCst) {
         return Err(BrokerFailure::new(
@@ -807,8 +883,9 @@ fn wait_for_supervisor_readiness(
         if std::time::Instant::now() >= deadline {
             terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
-                "SUPERVISOR_READINESS_TIMEOUT",
-                "supervisor readiness timed out",
+                // §5-0-A-1 코드 길이 상한 26자 — `SUPERVISOR_READINESS_TIMEOUT`(28자)에서 개명.
+                "SUPERVISOR_READY_TIMEOUT",
+                "readiness timed out",
             ));
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
@@ -1545,6 +1622,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// endpoint 파일 **부재**(`NotFound`)는 회복 불가이므로 첫 실패에 축출한다.
+    /// ★적대 검증 4-3 이후 이 테스트의 의미는 "모든 파일 I/O 오류가 치명"이 아니라
+    /// "**NotFound만** 치명"으로 좁혀졌다 — 짝이 되는 음성 테스트는
+    /// `endpoint_read_io_error_is_transient_and_keeps_a_live_runtime`이다.
     #[test]
     fn fatal_validation_failure_evicts_on_the_first_occurrence() {
         let launcher = RealSupervisorLauncher::default();
@@ -1561,8 +1642,81 @@ mod tests {
 
         let error = launcher.validate_live(&state).unwrap_err();
 
-        assert_eq!(error.code, "ENGINE_ENDPOINT_UNAVAILABLE");
+        assert_eq!(error.code, "ENGINE_ENDPOINT_FAILED");
         assert!(launcher.managed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ★적대 검증 4-3: endpoint read의 **일시적** I/O 오류(fd 고갈·순간 EIO·NFS 지연) 1회로
+    /// 살아있는 브라우저의 소유권이 파괴되면 안 된다 — WS-0이 막으려던 결함과 동형이다.
+    /// 픽스처는 endpoint_path를 디렉터리로 만들어 `NotFound`가 아닌 io 오류를 결정론적으로 낸다.
+    #[test]
+    fn endpoint_read_io_error_is_transient_and_keeps_a_live_runtime() {
+        let launcher = RealSupervisorLauncher::default();
+        let pid = std::process::id();
+        let started_at = process_start_time(pid).expect("self process start time");
+        let mut state = state_for(13);
+        state.supervisor_pid = pid;
+        state.engine_pid = pid;
+        let dir = scratch_dir("endpoint-io");
+        // 디렉터리를 읽으면 NotFound가 아닌 io 오류(EISDIR)가 난다 — "내용 손상"이 아니다.
+        let endpoint_path = dir.join("endpoint-as-a-directory");
+        std::fs::create_dir_all(&endpoint_path).unwrap();
+        assert_ne!(
+            std::fs::read(&endpoint_path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "픽스처 전제: 이 오류는 NotFound가 아니어야 한다"
+        );
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, endpoint_path, [13_u8; 32], started_at, None),
+        );
+
+        for attempt in 1..=(MAX_CONSECUTIVE_TRANSIENT_VALIDATION_FAILURES - 1) {
+            let error = launcher.validate_live(&state).unwrap_err();
+            assert_eq!(error.code, "ENGINE_ENDPOINT_FAILED");
+            assert_eq!(
+                launcher.managed.lock().unwrap().len(),
+                1,
+                "endpoint read I/O 오류 {attempt}회로는 살아있는 런타임을 축출하지 않는다"
+            );
+            assert_eq!(
+                transient_failure_count(&launcher, &state.instance_id),
+                attempt,
+                "일시 실패로 계수되어야 한다(치명이면 카운터가 남지 않는다)"
+            );
+        }
+
+        // 한계까지 연속되면 비로소 축출된다 — 일시 분류가 "무한 관용"은 아니다.
+        launcher.validate_live(&state).unwrap_err();
+        assert!(launcher.managed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// JSON 파싱 실패는 내용 손상이라 재시도로 회복되지 않는다 — 치명 유지(4-3 경계의 반대편).
+    #[test]
+    fn corrupt_endpoint_json_stays_fatal_on_the_first_occurrence() {
+        let launcher = RealSupervisorLauncher::default();
+        let pid = std::process::id();
+        let started_at = process_start_time(pid).expect("self process start time");
+        let mut state = state_for(14);
+        state.supervisor_pid = pid;
+        state.engine_pid = pid;
+        let dir = scratch_dir("endpoint-corrupt");
+        let endpoint_path = dir.join("state.json");
+        std::fs::write(&endpoint_path, b"{not json").unwrap();
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, endpoint_path, [14_u8; 32], started_at, None),
+        );
+
+        let error = launcher.validate_live(&state).unwrap_err();
+
+        assert_eq!(error.code, "RUNTIME_INTEGRITY_FAILED");
+        assert!(
+            launcher.managed.lock().unwrap().is_empty(),
+            "손상된 내용은 재시도로 회복되지 않는다"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1841,19 +1995,44 @@ mod tests {
         assert!(POST_READINESS_TERMINATION_GRACE >= std::time::Duration::from_secs(3));
     }
 
+    /// stale 화신을 evict해도 **교체 화신의 control 파이프는 건드리지 않는다**.
+    ///
+    /// ★적대 검증 BLOCK-2: 종전 판본은 픽스처가 양쪽 control을 `None`으로 만들어 놓고
+    /// `!replacement.control...is_some()`을 단언했다 — "None이 None임"을 확인할 뿐이라
+    /// 명제를 검증할 수 없는 자기충족 테스트였다. 이제 교체 화신에 **실제 자식 프로세스의
+    /// stdin 파이프**를 물리고, evict 후에도 그 파이프가 살아있으며(`is_some()`) 자식이
+    /// 계속 실행 중임을 단언한다.
+    #[cfg(unix)]
     #[test]
     fn eviction_never_terminates_a_replacement_incarnation() {
         let launcher = RealSupervisorLauncher::default();
         let instance_id = "d".repeat(32);
+
+        // 교체 화신 = 살아있는 자식. stdin EOF를 감지하면 즉시 종료하는 진짜 supervisor 모사.
+        let mut replacement_child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("replacement supervisor");
+        let replacement_control = replacement_child.stdin.take().expect("control pipe");
+
         let mut stale_state = state_for(11);
         stale_state.instance_id = instance_id.clone();
         stale_state.engine_generation = 11;
         let stale = test_runtime(&stale_state, "stale".into(), [11_u8; 32], 1, None);
-        *stale.control.lock().unwrap() = None;
         let mut replacement_state = state_for(12);
         replacement_state.instance_id = instance_id.clone();
         replacement_state.engine_generation = 12;
-        let replacement = test_runtime(&replacement_state, "new".into(), [12_u8; 32], 1, None);
+        let replacement = test_runtime(
+            &replacement_state,
+            "new".into(),
+            [12_u8; 32],
+            1,
+            Some(replacement_control),
+        );
         launcher
             .managed
             .lock()
@@ -1864,8 +2043,8 @@ mod tests {
 
         assert_eq!(launcher.managed.lock().unwrap().len(), 1);
         assert!(
-            !replacement.control.lock().unwrap().is_some(),
-            "control was None to begin with"
+            replacement.control.lock().unwrap().is_some(),
+            "stale evict가 교체 화신의 control 파이프를 빼앗으면 살아있는 런타임을 무음 종료시킨다"
         );
         assert_eq!(
             launcher
@@ -1877,6 +2056,85 @@ mod tests {
                 .state
                 .engine_generation,
             12
+        );
+        // 파이프가 살아있다는 사실을 프로세스 관측으로 이중 확인한다(구조체 필드만이 아니라).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            replacement_child.try_wait().unwrap().is_none(),
+            "교체 화신은 stale evict 후에도 계속 살아 있어야 한다"
+        );
+
+        // 대조군: 교체 화신을 실제로 evict하면 그때는 파이프가 닫히고 자식이 회수된다.
+        launcher.evict_managed_runtime(&replacement, "replacement");
+        assert!(replacement.control.lock().unwrap().is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while replacement_child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "EOF를 존중하는 자식은 evict로 회수돼야 한다"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// ★적대 검증 4-2 ②: **evict 종료의 한계를 계약으로 박제**한다(고치는 게 아니라 정직한 기록).
+    ///
+    /// `terminate_evicted_runtime`은 control 파이프만 닫고 끝난다 — `try_wait` 폴링도 SIGKILL
+    /// 격상도 없다(성공 커밋 후 `Child` 핸들은 워처 스레드가 단독 소유하므로 구조적으로 불가).
+    /// 따라서 EOF를 무시하거나 wedge된 supervisor는 **장부에서만 사라지고 프로세스는 잔존**한다.
+    /// 이 테스트가 깨진다면 격상 핸들이 도입돼 한계가 해소된 것이므로 계약 문서와 함께 갱신하라.
+    #[cfg(unix)]
+    #[test]
+    fn evicting_an_eof_ignoring_supervisor_leaves_it_alive_by_contract() {
+        // stdin을 아예 읽지 않는 자식 = EOF 무시(wedge된 supervisor 모사).
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap \"\" TERM; sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("eof-ignoring supervisor");
+        let control = child.stdin.take().expect("control pipe");
+        let launcher = RealSupervisorLauncher::default();
+        let state = state_for(15);
+        let runtime = test_runtime(&state, "unused".into(), [15_u8; 32], 1, Some(control));
+        launcher
+            .managed
+            .lock()
+            .unwrap()
+            .insert(state.instance_id.clone(), runtime.clone());
+
+        launcher.evict_managed_runtime(&runtime, "eof-ignoring");
+
+        assert!(
+            launcher.managed.lock().unwrap().is_empty(),
+            "장부에서는 사라진다"
+        );
+        assert!(
+            runtime.control.lock().unwrap().is_none(),
+            "종료 요청(파이프 닫기)은 반드시 수행된다"
+        );
+        // 잔존물 계약: 유예를 충분히 주어도 이 프로세스는 죽지 않는다.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "evict 종료는 best-effort — EOF 무시 supervisor는 잔존한다(§4-3 잔존물 계약 등급의 인정된 한계)"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// §5-0-A-1 계약: 신설·개명 에러 코드는 **26자 이내**여야 배너
+    /// `BROWSER_DISABLED_SAFE [<CODE>]: <message>`가 120자 절단(`ui/src/webpane.ts:386`) 안에
+    /// 사유를 보존한다. 소스 자체를 스캔하는 트립와이어라 이 파일에 긴 코드를 새로 넣으면 깨진다.
+    #[test]
+    fn every_error_code_literal_in_this_module_fits_the_26_char_cap() {
+        let offenders = super::over_long_screaming_case_literals(include_str!("runtime_launcher.rs"));
+        assert!(
+            offenders.is_empty(),
+            "에러 코드는 26자 이내여야 한다(배너 120자 절단): {offenders:?}"
         );
     }
 }

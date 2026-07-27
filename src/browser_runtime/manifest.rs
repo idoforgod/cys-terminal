@@ -194,6 +194,87 @@ fn safe_relative_path(value: &str) -> bool {
             .all(|part| !matches!(part, "" | "." | ".."))
 }
 
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    /// 빌드 산출물 `browser-runtime.lock.json`의 위치. 스테이징 스크립트가
+    /// `src-tauri/resources/browser-runtime/`에 쓴다(`scripts/runtime-stage.py:352`,
+    /// `scripts/build-macos-signed.sh:89`, `scripts/build-windows-signed.ps1:42`).
+    fn staged_lock_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src-tauri/resources/browser-runtime/browser-runtime.lock.json")
+    }
+
+    /// `Value`를 재귀 순회하며 f64로 역직렬화되는 수를 모두 모은다(경로와 함께).
+    fn collect_floats(value: &Value, path: &str, found: &mut Vec<String>) {
+        match value {
+            Value::Number(number) => {
+                if number.is_f64() {
+                    found.push(format!("{path} = {number}"));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_floats(item, &format!("{path}[{index}]"), found);
+                }
+            }
+            Value::Object(entries) => {
+                for (key, item) in entries {
+                    collect_floats(item, &format!("{path}.{key}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// ★WS-6 요구4 · 설계 §8-3 — **lock.json float 금지 pin**.
+    ///
+    /// 매니페스트의 모든 수는 정수여야 한다. float이 섞이면 `float_roundtrip` 유무에 따라
+    /// 정준화(`write_canonical`)의 `Number::to_string()`이 달라져 `runtime_id`가 바뀌고,
+    /// 그 결과 브로커·supervisor의 runtime_id 대조가 무너진다(F9/F10).
+    ///
+    /// **파일 부재 시의 계약(명시)**: 이 파일은 릴리스 스테이징이 만드는 **빌드 산출물**이라
+    /// 개발 체크아웃에는 없는 것이 정상이다(`.placeholder`만 존재). 따라서 부재는 **통과**로
+    /// 계약한다 — skip이 아니라 "검사 대상이 없으므로 위반도 없다"는 판정이다. 파일이 존재하면
+    /// **반드시** 검사하며, 이때 파싱 실패나 float 발견은 전부 실패다(조건부 무해화 금지).
+    #[test]
+    fn staged_lock_json_carries_no_floating_point_numbers() {
+        let path = staged_lock_path();
+        let input = match std::fs::read_to_string(&path) {
+            Ok(input) => input,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // 계약: 빌드 산출물 부재 = 통과. 존재할 때만 검사 대상이 된다.
+                return;
+            }
+            Err(error) => panic!("스테이징된 lock.json을 읽을 수 없다 ({}): {error}", path.display()),
+        };
+        let value: Value = serde_json::from_str(&input)
+            .unwrap_or_else(|error| panic!("lock.json은 유효 JSON이어야 한다: {error}"));
+
+        let mut floats = Vec::new();
+        collect_floats(&value, "$", &mut floats);
+
+        assert!(
+            floats.is_empty(),
+            "lock.json의 모든 수는 정수여야 한다(float은 정준화 표기를 흔들어 runtime_id를 깨뜨린다): {floats:?}"
+        );
+    }
+
+    /// 위 pin이 실제로 float을 잡아내는지 확인하는 양성 대조군 — 순회기가 조용히
+    /// 망가져도 본 테스트가 통과해버리는 사태(vacuous pass)를 막는다.
+    #[test]
+    fn the_float_scanner_actually_detects_nested_floats() {
+        let value: Value = serde_json::from_str(
+            r#"{"a":1,"b":{"c":[0,1,2.5]},"d":[{"e":3}],"f":"2.5","g":true}"#,
+        )
+        .unwrap();
+        let mut floats = Vec::new();
+        collect_floats(&value, "$", &mut floats);
+        assert_eq!(floats, vec!["$.b.c[2] = 2.5".to_string()]);
+    }
+}
+
 fn write_canonical(value: &Value, output: &mut String) -> Result<(), BrowserError> {
     match value {
         Value::Null => output.push_str("null"),
