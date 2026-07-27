@@ -1653,10 +1653,15 @@ async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
 
 const MAX_REQUEST_LINE: usize = 10 * 1024 * 1024; // 지침 주입(수백 KB)에 충분한 10MB
 
+/// `cancellation`은 **호출자(handle_connection)가 소유**한다 — 요청 주체의 연결이 죽으면 호출자가
+/// 이 플래그를 set 해 진행 중인 ensure 워커를 취소한다(WS-0-③). 등록되는 요청은 이 동일한 Arc를
+/// 레지스트리에 넣으므로 `browser.runtime.cancel`의 명시 취소와 **같은 플래그**를 공유한다
+/// (취소 경로 이원화 금지 — 새 경로를 만들지 않고 기존 배선을 그대로 쓴다).
 async fn dispatch_request_isolated(
     daemon: Arc<Daemon>,
     req: Request,
     caller_pid: Option<u32>,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
 ) -> Reply {
     if !req.method.starts_with("browser.runtime.") {
         return handlers::dispatch(&daemon, req, caller_pid);
@@ -1748,6 +1753,7 @@ async fn dispatch_request_isolated(
             caller_pid,
             pane_nonce.to_string(),
             request_id.to_string(),
+            cancellation.clone(),
         ) {
             Ok(guard) => Some(guard),
             Err(error) => {
@@ -1762,10 +1768,8 @@ async fn dispatch_request_isolated(
     } else {
         cys::browser_runtime::ENSURE_WORKER_DEADLINE
     };
-    let cancellation = request_guard
-        .as_ref()
-        .map(|guard| guard.cancellation.clone())
-        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // 등록 요청이든 아니든 **호출자가 준 동일 플래그**를 쓴다 — 연결 소멸(WS-0-③)은 등록되지 않는
+    // 브라우저 verb(operation 등)에도 똑같이 취소로 작용해야 한다.
     match run_browser_job_bounded_with_cancellation(
         browser_job_gate(),
         timeout,
@@ -1826,11 +1830,14 @@ struct BrowserRequestGuard {
 }
 
 impl BrowserRequestRegistry {
+    /// `cancellation`은 호출자 소유 플래그다(WS-0-③ — 연결 소멸 감지가 같은 Arc를 set 한다).
+    /// 레지스트리에 이 Arc를 그대로 넣어 `cancel()`의 명시 취소와 단일 플래그를 공유한다.
     fn register(
         self: &Arc<Self>,
         caller_pid: u32,
         pane_nonce: String,
         request_id: String,
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<BrowserRequestGuard, String> {
         if caller_pid == 0
             || !valid_browser_request_credential(&pane_nonce)
@@ -1843,7 +1850,6 @@ impl BrowserRequestRegistry {
             pane_nonce,
             request_id,
         };
-        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut requests = self.requests.lock().unwrap();
         if requests.contains_key(&key) {
             return Err("duplicate Browser request identity".into());
@@ -2277,13 +2283,76 @@ mod browser_rpc_isolation_tests {
         first.await.unwrap().unwrap();
     }
 
+    /// ★WS-0-③: 요청 주체(GUI 프로세스·연결)가 ensure 진행 중 사라지면 커밋 전에 취소되어야 한다.
+    /// 취소가 없으면 워커는 25초를 마저 돌아 supervisor+engine을 커밋하고, 그 런타임은 주인 없는
+    /// **고아**가 된다(원사고의 또 다른 생성 경로). 커밋 0건이 수용 기준이다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_disconnect_cancels_in_flight_ensure_before_it_commits() {
+        use super::await_watching_peer;
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let (client, server) = tokio::io::duplex(64);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let mut reader = BufReader::new(server_read);
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let committed = Arc::new(AtomicUsize::new(0));
+
+        // ensure 워커 모사: 취소 신호를 보면 커밋 없이 조기 종료, 아니면 커밋한다.
+        let worker_flag = cancellation.clone();
+        let worker_committed = committed.clone();
+        let job = async move {
+            for _ in 0..2_000 {
+                if worker_flag.load(Ordering::SeqCst) {
+                    return "cancelled";
+                }
+                tokio::task::yield_now().await;
+            }
+            worker_committed.fetch_add(1, Ordering::SeqCst);
+            "committed"
+        };
+
+        // 요청 주체가 응답을 받기 전에 연결을 끊는다.
+        drop(client);
+
+        let outcome = await_watching_peer(job, &mut reader, &cancellation).await;
+        assert!(
+            cancellation.load(Ordering::SeqCst),
+            "①연결 EOF가 취소 플래그를 set 해야 한다"
+        );
+        assert_eq!(outcome, "cancelled", "②워커가 조기 종료해야 한다");
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            0,
+            "③커밋 0건 — 주인 없는 런타임을 만들지 않는다"
+        );
+
+        // 살아있는 연결에서는 오취소가 없어야 한다(정상 흐름 무해).
+        let (mut client, server) = tokio::io::duplex(64);
+        let (server_read, _sw) = tokio::io::split(server);
+        let mut reader = BufReader::new(server_read);
+        let alive_flag = Arc::new(AtomicBool::new(false));
+        client.write_all(b"{\"id\":2}\n").await.unwrap(); // 파이프라인된 다음 요청
+        let outcome = await_watching_peer(async { "done" }, &mut reader, &alive_flag).await;
+        assert_eq!(outcome, "done");
+        assert!(
+            !alive_flag.load(Ordering::SeqCst),
+            "살아있는 연결·파이프라인 바이트는 취소하지 않는다(오취소 금지)"
+        );
+    }
+
     #[test]
     fn pane_cancel_uses_peer_and_request_identity_and_leaves_no_late_commit() {
         let registry = Arc::new(BrowserRequestRegistry::default());
         let pane_nonce = "b".repeat(64);
         let request_id = "a".repeat(64);
         let guard = registry
-            .register(77, pane_nonce.clone(), request_id.clone())
+            .register(
+                77,
+                pane_nonce.clone(),
+                request_id.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
             .unwrap();
         let committed = Arc::new(AtomicUsize::new(0));
         let committed_by_job = committed.clone();
@@ -2301,6 +2370,47 @@ mod browser_rpc_isolation_tests {
         worker.join().unwrap();
         assert_eq!(committed.load(Ordering::SeqCst), 0);
         assert_eq!(registry.len(), 0);
+    }
+}
+
+/// ★WS-0-③: 응답을 기다리는 동안 **요청 주체의 연결 소멸**을 함께 감시한다.
+///
+/// `job`이 먼저 끝나면 그 결과를 그대로 돌려준다. 그 전에 read half가 EOF(또는 오류)를 내면
+/// `cancellation`을 set 하고 — 새 취소 경로를 만들지 않고 `browser.runtime.cancel`이 쓰는 그
+/// 플래그를 그대로 쓴다 — 이후에도 `job`이 스스로 정리를 마칠 때까지 기다린다(가드 drop·워커 회수).
+///
+/// 감시는 **한 번만** 한다: `fill_buf`는 EOF에서 즉시 반환하므로 계속 폴링하면 바쁜 루프가 된다.
+/// 비어있지 않은 바이트(파이프라인된 다음 요청)는 연결이 살아있다는 뜻이므로 **취소하지 않는다**
+/// (오취소가 정상 흐름을 깨는 것이 미탐지보다 나쁘다).
+async fn await_watching_peer<T, F, R>(
+    job: F,
+    reader: &mut BufReader<R>,
+    cancellation: &Arc<std::sync::atomic::AtomicBool>,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+    R: AsyncRead + Unpin,
+{
+    tokio::pin!(job);
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            done = &mut job => return done,
+            read = reader.fill_buf(), if watching => {
+                watching = false;
+                match read {
+                    Ok(buf) if buf.is_empty() => {
+                        cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+                        eprintln!("[cysd] browser rpc peer disconnected mid-flight — cancelling in-flight work (orphan guard)");
+                    }
+                    Err(_) => {
+                        cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+                        eprintln!("[cysd] browser rpc peer connection failed mid-flight — cancelling in-flight work (orphan guard)");
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
     }
 }
 
@@ -2325,7 +2435,27 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
             }
         };
 
-        match dispatch_request_isolated(daemon.clone(), req, caller_pid).await {
+        // ★WS-0-③ 요청 주체 소멸 감지: ensure가 도는 25초 동안 GUI 프로세스·연결이 죽어도 데몬은
+        // 그걸 모른 채 supervisor+engine을 끝까지 커밋했다 — 그 런타임은 **주인 없는 고아**가 되고
+        // (원사고의 또 다른 생성 경로), 죽은 GUI의 peer 엔트리도 대장에 남아 상한 소진을 가속한다.
+        // 브라우저 verb에 한해 응답 대기 구간에서 read half의 EOF를 함께 감시하고, 끊기면
+        // **기존 취소 플래그**(browser.runtime.cancel과 동일한 Arc)를 set 한다 — 새 취소 경로를
+        // 만들지 않는다. 워커는 그 플래그를 보고 조기 종료하고, 레인 A의 terminate_supervisor
+        // pre-readiness grace(100ms)가 이때 실효를 낸다.
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch_peer = req.method.starts_with("browser.runtime.");
+        let dispatched = dispatch_request_isolated(
+            daemon.clone(),
+            req,
+            caller_pid,
+            Arc::clone(&cancellation),
+        );
+        let reply = if watch_peer {
+            await_watching_peer(dispatched, &mut reader, &cancellation).await
+        } else {
+            dispatched.await
+        };
+        match reply {
             Reply::Single(resp) => {
                 if write_line(&mut write_half, &resp).await.is_err() {
                     return;
