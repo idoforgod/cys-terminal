@@ -201,7 +201,7 @@ pane 안의 AI는 `cys identify` 한 번으로 자기 주소를 알고, 그 순�
 
 | 모듈 (`src/bin/cysd/`) | 역할 |
 |---|---|
-| `main.rs` | 진입점·accept loop·연결 핸들러·프레이밍·startup lock·자동 복원 |
+| `main.rs` | 진입점·accept loop·연결 핸들러·프레이밍·startup lock(지수 백오프 재시도)·자동 복원·**데몬 로그 회전** |
 | `handlers.rs` | RPC 디스패치(60+ 메서드)·발신자 신원 해소·ACL·능력 게이트 |
 | `state.rs` | Surface(PTY) 수명주기·scrollback·역할 레지스트리·토폴로지·묘비·큐·헬스룰 |
 | `governance.rs` | watchdog(5초)·고아 회수·중복 프로세스·에이전트 사망 감지·큐 배달 |
@@ -212,13 +212,44 @@ pane 안의 AI는 `cys identify` 한 번으로 자기 주소를 알고, 그 순�
 | `channels.rs` | Slack·Discord 브리지(원격 승인·수신·발신·lockdown) |
 | `schedule.rs` | 30초 tick 스케줄러(원샷·반복·missed-fire) |
 | `approval.rs` | HMAC signed-prefix 승인 |
-| `deadman.rs` | hung 데몬 홀더 감지·안전 회수 |
+| `deadman.rs` | hung 데몬 홀더 감지·안전 회수(홀더 판별은 sysinfo 스냅샷 — `ps` fork 없음) |
 | `hwmon.rs` | CPU 코어별·GPU·NPU·MEM 실시간 스냅샷 |
 
 굵직한 견고성 장치: vt100 파서 패닉은 `catch_unwind`로 격리되어 그 청크만 버리고 리더는
 불사(`state.rs`), watchdog tick·백그라운드 writer도 각각 패닉 격리, 응답은 8MB 상한 +
 round-trip 자기검증 프레이밍(와이어 무결성 이중 가드), 데몬 중복 기동은 소켓 연결 확인 +
 flock으로 거부.
+
+**startup lock의 불변식 (v0.13.21 — 수정자 필독)**
+
+- **락파일은 unlink하지 않는다.** flock은 프로세스가 죽으면 커널이 자동 해제하므로 "잔여 락"이라는
+  개념 자체가 성립하지 않는다. 락파일을 지우면 부팅 데몬은 unlink된 inode에 락을 잡고 다음 데몬은
+  **새 inode에 별개 락**을 잡아 상호배제가 무효화되며, 가시 락파일에 holder pid가 없어 데드맨이
+  **영구 무장해제**된다. `cys doctor --fix`(`diag_stale_lock`, `src/bin/cys.rs`)는 이제 stale pid
+  문자열을 `set_len(0)`으로 비우기만 하고 파일은 남긴다 — `remove_file`을 되살리지 마라.
+- **doctor는 flock을 쥔 채로 판정한다**(check→조치 전 구간 단일 스팬). 락을 못 잡으면
+  "데몬 부팅/보유 중"으로 보고 **판정 보류·삭제 금지**(fail-closed). 블로킹 `connect`는 스팬
+  **밖**으로 빼서 보유 시간을 최소화한다.
+- **부팅측은 지수 백오프+지터로 흡수한다**(`lock_retry_schedule`, 총 ≥1s). doctor의 순간 보유가
+  부팅 데몬을 `dead-holder-reclaim-failed`라는 **오사유로 exit(1)** 시키면, 30회당 1줄 로그 억제와
+  launchd 10초 재시도가 겹쳐 **무로그 crashloop**이 된다.
+
+**데몬 로그 회전 (v0.13.21 신설)**
+
+`cysd.log`는 소켓 스코프별 파일이며(본부·부서는 다른 파일) 종전에는 회전 없이 무한 append됐다.
+이제 부팅 시 **크기 게이트 통과 시에만** 회전한다.
+
+- 순서 불변식: ①boot-id 마커를 **락 시도 이전**에 1줄(승자·패자 모두 구간 귀속) ②락 획득 성공 후
+  (승자만) `len(cysd.log) >= 10MB`면 회전 ③회전 직후 마커 1줄(승자의 라이브 구간 헤더).
+  마커는 80자 이내, boot-id는 16 hex(신규 의존성 없음).
+- 방식은 **copy-truncate**: 세대 이동 `.2→.3`·`.1→.2`는 rename, `cysd.log → .1`만 복사 후
+  `truncate(0)`. 라이브 기록자(launchd fd·앱 스폰·부서 셸 리다이렉트)가 쥔 **inode를 보존**하기
+  위해서다. 복사~truncate 사이에 도착한 소량 라인 유실은 이 방식의 고유 한계로 수용한다.
+- **O_APPEND 실측 게이트**: 부서 데몬의 로그 fd는 O_APPEND가 아니다(실측). 비-O_APPEND 기록자에게
+  truncate를 하면 오프셋이 유지돼 **10MB NUL 홀**이 생긴다. 그래서 회전 직전
+  `fcntl(F_GETFL) & O_APPEND`를 실측하고, 미충족이면 **회전을 건너뛰고 1줄 경고**만 남긴다.
+- 0바이트 세대 파일은 승격하지 않고, 로그 부재는 no-op이다. 장수 데몬은 24시간 주기로 크기를
+  재점검한다. Windows는 best-effort(공유 모드 때문에 실패할 수 있으므로 실패 시 회전 스킵).
 
 ### 5.3 프로토콜 — NDJSON, 한 줄 = JSON 하나
 

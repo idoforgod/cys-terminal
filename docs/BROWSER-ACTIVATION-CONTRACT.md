@@ -5,6 +5,10 @@
 > 봉쇄한다. 코드 인용은 모두 현재 워크트리(`feat/browser-activation-v0.13.7`) 실물에서 직접 읽어
 > 파일:라인을 병기한다.
 
+> **상호 참조**: 활성화가 거부됐을 때 **그 이유를 어떻게 말하는가**는
+> [`docs/DIAGNOSTIC-CONTRACT.md`](DIAGNOSTIC-CONTRACT.md)가 정본이다 — `error.code` 필수·배너
+> 선두 120자 예산·`include_str!` 트립와이어 쌍·코드 26자 상한·진단 code 레지스트리 전수.
+
 관련 파일:
 - `src-tauri/src/main.rs` — 활성화 스크립트 생성·주입·회귀 테스트(코드 SOT)
 - `ui/src/webpane.ts` — 표식 기반 진단 보강 순수함수(`castActivationDiagnostics`)

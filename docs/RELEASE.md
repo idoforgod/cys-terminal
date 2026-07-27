@@ -418,10 +418,14 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             for f in "cys_${V}_aarch64.dmg" "cys_${V}_x64.dmg" \
                      "cys_${V}_x64-setup.exe" "cys_${V}_x64-setup.zip"; do
               L=$(curl -sI "$B/$f" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r')
-              printf '%-32s %s bytes  = %s MB\n' "$f" "$L" "$((L/1000/1000))"
+              printf '%-32s %s bytes = %s MiB (%s MB)\n' \
+                "$f" "$L" "$((L/1024/1024))" "$((L/1000/1000))"
             done
             ```
-            4줄 전부 값이 나와야 하고(빈 값 = 자산 부재), MB 표기가 메인 페이지 4토큰과
+            ★**메인 페이지 표기 관례는 MiB(÷2²⁰)다** — 종전 이 문서는 MB(÷10⁶)만 계산해
+            그대로 따르면 4토큰이 **전부 틀린다**(실측 확인 2026-07-27). 위 스니펫은 둘 다
+            찍으니 **MiB 열을 페이지 4토큰과 대조**하라.
+            4줄 전부 값이 나와야 하고(빈 값 = 자산 부재), MiB 표기가 메인 페이지 4토큰과
             일치해야 한다. 불일치 1건이라도 있으면 **미완**이다.
       - [ ] ④ **버튼 href 4종 HEAD 200** — 페이지에 박힌 다운로드 링크를 눈이 아니라 HTTP 로 확인:
 
@@ -440,3 +444,16 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       스크립트가 그 SOT(밴드 구조·용량 표기 규약)를 알지 못한다. 자동화하려면 홈페이지 리포에
       게이트를 두는 것이 옳다 — 여기서는 문서 게이트로 고정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
+
+### 롤백 — 되돌릴 수 있는 마지막 지점
+
+> **되돌릴 수 있는 마지막 지점 = `release-publish.yml` PUBLISH dispatch 직전이다.**
+> 그 이후(환경 승인 → `--draft=false --latest` → SFTP 업로드 → 사용자 설치)는 되돌리기가 아니라
+> **손상 관리**다. dispatch 전에 draft 자산 검증·`BUNDLE_SHA` 대조·오너 승인을 끝내라.
+>
+> 발행 후 치명 결함을 발견했다면 절차 정본은 **`_round/RUNBOOK_ROLLBACK.md`**다(리포 밖 운영 문서).
+> 요지: ①**구버전을 `latest`로 먼저 승격**한 뒤 신버전을 draft로 강등한다 — 순서를 뒤집으면
+> `releases/latest/download/latest.json`이 404가 돼 **전 사용자 updater 채널이 파손**된다
+> ②홈페이지는 SUMS → pack 3종 → 메인 페이지 순으로 되돌린다 ③**이미 설치한 사용자는 롤백으로
+> 보호되지 않는다**(updater는 강등하지 않는다) → 전진 핫픽스가 기본 대응이다.
+> `release-publish.yml`은 승격 전용이며 역방향 워크플로가 없다 — GitHub API 직접 PATCH가 유일 경로다.
