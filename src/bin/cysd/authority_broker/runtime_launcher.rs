@@ -25,8 +25,26 @@ const POST_READINESS_TERMINATION_GRACE: std::time::Duration = std::time::Duratio
 /// pre-readiness 경로: supervisor의 liveness 스레드는 readiness 이후에야 스폰되므로
 /// (`supervisor/main.rs:44` 블로킹 → `:60` spawn) EOF가 무효다. 긴 유예는 회수 이득이
 /// 0인 채로 취소 응답성만 해치고 자식의 늦은 부작용 창을 넓힌다.
+///
+/// ⚠이 상수는 **사용자 취소가 아닌** pre-readiness 실패(readiness 타임아웃·read 실패·
+/// 채널 disconnect·프레임 오버플로·프레임 없는 즉사)에만 쓴다. 취소 경로는
+/// `CANCELLATION_TERMINATION_GRACE`다 — 아래 상수의 계약을 보라.
 const PRE_READINESS_TERMINATION_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
+/// pre-readiness **취소** 경로: 유예 0(즉시 SIGKILL). 셋을 동시에 만족하는 유일한 값이다.
+///
+/// ① **회수 이득 0**: 이 구간은 위 `PRE_READINESS_TERMINATION_GRACE` 주석대로 EOF가
+///    무효다(liveness 스레드 부재). 기다려도 supervisor는 Drop을 시작조차 하지 않는다.
+/// ② **부작용 창 최소화**: 취소는 "자식의 늦은 부수효과를 막을 만큼 빨라야 한다"가 계약이다
+///    (`cancellation_reaps_supervisor_during_readiness_without_late_side_effect`). 유예는
+///    회수 없이 그 창만 넓힌다 — 고아 조건을 스스로 제조하는 순수 손실이다.
+/// ③ **취소 응답성**: 사용자가 취소한 launch가 permit을 더 붙들고 있을 이유가 없다.
+///
+/// ※ readiness **이후**의 취소(`launch()` 말미)는 EOF가 실효하고 회수할 엔진이 실재하므로
+///   `POST_READINESS_TERMINATION_GRACE`를 그대로 쓴다 — 여기와 혼동하지 말 것.
+const CANCELLATION_TERMINATION_GRACE: std::time::Duration = std::time::Duration::ZERO;
+/// `terminate_supervisor`의 유예 폴링 간격. grace가 실제 상한이 되도록 충분히 잘게 썬다.
+const TERMINATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 type ManagedSessionKey = zeroize::Zeroizing<[u8; 32]>;
 
 /// `validate_live` 실패의 성격. 일시 실패로 소유권을 파괴하면 supervisor는 계속 살아
@@ -789,7 +807,12 @@ impl SupervisorLauncher for RealSupervisorLauncher {
 
 /// 실패·취소 경로 전용 종료기. `drop(control)`로 EOF를 유도해 supervisor가 스스로
 /// Drop을 완주하게 하고(엔진 그룹·state.json 회수·flock 해제), grace 만료 시에만
-/// SIGKILL로 격상한다. grace는 경로별로 다르다(위 3개 상수).
+/// SIGKILL로 격상한다. grace는 경로별로 다르다(위 4개 상수).
+///
+/// 폴링 granularity는 **5ms**다. grace가 곧 상한이어야 하기 때문이다 — 50ms였을 때
+/// 100ms 유예의 실제 kill 시점은 최악 150ms(=grace + 폴링 1주기)로 **1.5배** 초과했고,
+/// 저속 CI 러너에서 그 초과분이 타이밍 계약을 잠식했다. 5ms면 초과분은 ≤5%이고,
+/// 비용은 유예 만료까지의 sleep 횟수뿐이다(3s 경로 최악 600회 — 무시 가능).
 ///
 /// X2(reap 금지) 비위반: 대상은 우리가 방금 스폰하고 control 파이프를 소유한 자기
 /// 자식이며, 타 데몬이 쥔 홀더가 아니다.
@@ -804,7 +827,7 @@ fn terminate_supervisor(
         if let Ok(Some(status)) = child.try_wait() {
             return Some(status);
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(TERMINATION_POLL_INTERVAL);
     }
     let _ = child.kill();
     child.wait().ok()
@@ -882,8 +905,10 @@ fn spawn_supervisor_cancellable(
     // after the pre-spawn check, but it must never leave a detached child.
     if cancelled.load(Ordering::SeqCst) {
         // 아직 아무도 stdin을 가져가지 않았다 — 여기서 꺼내 닫아야 EOF가 전달된다.
+        // 유예는 0이다: 이 시점 supervisor는 아직 엔진을 스폰하지 않아 회수할 대상이
+        // 없고(핸드셰이크 경로와 동형), 기다림은 취소 지연일 뿐이다.
         let mut control = child.stdin.take();
-        terminate_supervisor(&mut child, &mut control, PRE_READINESS_TERMINATION_GRACE);
+        terminate_supervisor(&mut child, &mut control, CANCELLATION_TERMINATION_GRACE);
         return Err(BrokerFailure::new(
             "BROWSER_CANCELLED",
             "Browser launch was cancelled during process creation",
@@ -893,8 +918,9 @@ fn spawn_supervisor_cancellable(
 }
 
 /// pre-readiness 구간 전용 대기 루프. 모든 실패 경로는 `terminate_supervisor`로
-/// 통일하며, 이 구간의 grace는 `PRE_READINESS_TERMINATION_GRACE`다(EOF 무효 구간이라
-/// 긴 유예는 취소 응답성만 해친다 — 취소 회귀 테스트의 계약이기도 하다).
+/// 통일한다. 유예는 두 갈래다 — **취소**는 `CANCELLATION_TERMINATION_GRACE`(0, 늦은
+/// 부수효과 차단이 계약), 나머지 실패는 `PRE_READINESS_TERMINATION_GRACE`(100ms,
+/// 사용자 대기 경로도 계약도 아니다). 둘 다 EOF 무효 구간이라 회수 이득은 없다.
 fn wait_for_supervisor_readiness(
     child: &mut std::process::Child,
     control: &mut Option<ChildStdin>,
@@ -905,7 +931,7 @@ fn wait_for_supervisor_readiness(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if cancelled.load(Ordering::SeqCst) {
-            terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
+            terminate_supervisor(child, control, CANCELLATION_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
                 "BROWSER_CANCELLED",
                 "Browser launch was cancelled while waiting for readiness",
@@ -1541,6 +1567,15 @@ mod tests {
         assert_eq!(launcher.managed.lock().unwrap().len(), 0);
     }
 
+    /// 취소는 자식의 늦은 부수효과를 막을 만큼 빨라야 한다.
+    ///
+    /// **실시간 예산**(마커 기록 = 스폰 후 250ms): 취소 신호 40ms + 대기 루프의 취소 감지
+    /// ≤20ms(`recv_timeout` 주기) + 종료 유예 0 + kill/wait ⇒ 정상 시 ~60ms에 SIGKILL.
+    /// 여유 ≈190ms이므로 러너가 3배 느려도(스폰 지연·스케줄링 지연 포함) 견딘다.
+    /// 유예 100ms + 폴링 50ms였던 판본은 상한이 ~210ms까지 밀려 여유가 ≈40ms뿐이었고,
+    /// GitHub aarch64 러너에서 실제로 초과해 실패했다 — 그 격차가 이 값들의 존재 이유다.
+    /// 예산의 결정론 핀은 `cancellation_termination_is_immediate`와
+    /// `pre_readiness_cancellation_paths_are_wired_to_the_zero_grace`가 함께 든다.
     #[cfg(unix)]
     #[test]
     fn cancellation_reaps_supervisor_during_readiness_without_late_side_effect() {
@@ -2157,6 +2192,75 @@ mod tests {
         assert_eq!(HANDSHAKE_TERMINATION_GRACE, std::time::Duration::ZERO);
         assert!(PRE_READINESS_TERMINATION_GRACE < std::time::Duration::from_millis(250));
         assert!(POST_READINESS_TERMINATION_GRACE >= std::time::Duration::from_secs(3));
+    }
+
+    /// ★취소 유예 상한 = 0. 이 값이 완화되면 자식의 늦은 부수효과 창이 그만큼 열린다.
+    ///
+    /// 왜 상수 단언인가: 유일한 다른 핀인
+    /// `cancellation_reaps_supervisor_during_readiness_without_late_side_effect`는 실시간
+    /// 예산 위에 서 있어 저속 러너에서 먼저 무너진다(실제로 GitHub aarch64 러너에서 유예
+    /// 100ms 판본이 그렇게 죽었다). 상수 단언은 부하와 무관하게 결정론으로 재발을 막는다.
+    ///
+    /// 폴링 간격까지 함께 고정하는 이유: 실제 kill 시점의 상한은 `grace + poll`이므로
+    /// 폴링만 커져도 유예를 키운 것과 같은 결과가 된다(50ms 시절 100ms 유예의 실측 상한
+    /// = 150ms).
+    #[test]
+    fn cancellation_termination_is_immediate() {
+        assert_eq!(CANCELLATION_TERMINATION_GRACE, std::time::Duration::ZERO);
+        assert!(
+            TERMINATION_POLL_INTERVAL <= std::time::Duration::from_millis(5),
+            "grace가 실제 상한이 되려면 폴링 granularity가 유예보다 훨씬 잘아야 한다"
+        );
+    }
+
+    /// 상수만 0이고 취소 경로가 다른 상수를 쓰면 계약은 그대로 깨진다 — **배선**을 고정한다.
+    ///
+    /// 규칙: pre-readiness 구간(`spawn_supervisor_cancellable`~`wait_for_supervisor_readiness`)
+    /// 안에서 `BROWSER_CANCELLED`를 반환하는 `terminate_supervisor` 호출은 반드시
+    /// `CANCELLATION_TERMINATION_GRACE`를 넘겨야 한다. readiness **이후**의 취소는 이 구간
+    /// 밖이라 스캔 대상이 아니다(엔진 회수를 위해 3s 유예를 유지한다).
+    #[test]
+    fn pre_readiness_cancellation_paths_are_wired_to_the_zero_grace() {
+        let source = include_str!("runtime_launcher.rs");
+        let start = source
+            .find("fn spawn_supervisor_cancellable(")
+            .expect("pre-readiness 구간 시작점");
+        let end = source
+            .find("fn verify_engine_endpoint(")
+            .expect("pre-readiness 구간 끝점");
+        let region = &source[start..end];
+
+        // `stringify!`로 needle을 만든다 — 상수 이름을 문자열 **리터럴**로 적으면
+        // 26자 에러 코드 트립와이어(`every_error_code_literal_in_this_module_fits_the_26_char_cap`)가
+        // 그것을 과장된 에러 코드로 오인해 그 계약을 망가뜨린다.
+        let zero_grace = stringify!(CANCELLATION_TERMINATION_GRACE);
+        let mut cancellation_sites = 0_usize;
+        let mut offenders: Vec<&str> = Vec::new();
+        for (index, _) in region.match_indices("terminate_supervisor(") {
+            let after = &region[index..];
+            let call = &after[..after.find(");").expect("호출은 반드시 닫힌다")];
+            let failure = after
+                .find("BrokerFailure::new(")
+                .expect("모든 종료는 실패 반환이 뒤따른다");
+            let code_window = &after[failure..(failure + 80).min(after.len())];
+            if !code_window.contains("\"BROWSER_CANCELLED\"") {
+                continue;
+            }
+            cancellation_sites += 1;
+            if !call.contains(zero_grace) {
+                offenders.push(call);
+            }
+        }
+
+        assert_eq!(
+            cancellation_sites, 2,
+            "pre-readiness 취소 종료 지점은 스폰 경합·readiness 대기 2곳이다 — \
+             수가 달라졌다면 스캔이 대상을 놓쳤거나 경로가 늘었다"
+        );
+        assert!(
+            offenders.is_empty(),
+            "취소 경로는 즉시 종료여야 한다: {offenders:?}"
+        );
     }
 
     /// stale 화신을 evict해도 **교체 화신의 control 파이프는 건드리지 않는다**.
