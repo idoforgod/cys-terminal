@@ -582,13 +582,14 @@ fn boot_marker_line(boot_id: &str, phase: &str, socket_path: &std::path::Path) -
 /// 하나라도 아니면 copy-truncate가 NUL 홀을 만드므로 회전을 포기한다(fail-closed).
 /// tty·파이프(개발 실행·phoenix 하네스 캡처)도 O_APPEND가 아니므로 자연히 스킵된다 — 의도된 보수성이다.
 #[cfg(unix)]
+fn fd_is_append(fd: std::os::unix::io::RawFd) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_APPEND) != 0
+}
+
+#[cfg(unix)]
 fn log_fds_are_append() -> bool {
-    use std::os::unix::io::RawFd;
-    let is_append = |fd: RawFd| {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        flags >= 0 && (flags & libc::O_APPEND) != 0
-    };
-    is_append(1) && is_append(2)
+    fd_is_append(1) && fd_is_append(2)
 }
 
 /// windows: fcntl이 없다 — best-effort로 회전을 시도하고 실패는 무시한다(다른 기록자의 공유 모드에
@@ -637,8 +638,14 @@ fn rotate_log_generations(log: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 크기 게이트 + O_APPEND 실측 게이트를 통과할 때만 회전한다. 어떤 실패도 데몬 부팅을 막지 않는다.
-fn maybe_rotate_daemon_log(log: &std::path::Path) {
+/// 크기 게이트 + O_APPEND 게이트를 통과할 때만 회전한다. 어떤 실패도 데몬 부팅을 막지 않는다.
+///
+/// ★append 여부를 **주입**받는다(테스트 가능성). 종전에는 내부에서 `log_fds_are_append()`를 직접
+/// 불러 판정이 **테스트 하니스의 stdout/stderr 종류에 종속**됐다: `cargo test`를 파이프로 받으면
+/// 게이트가 닫히고 `cargo test >> out.log`로 돌리면 열려, 같은 테스트가 환경에 따라 다른 결론을
+/// 냈다. 더 나쁜 것은 **성공 경로(크기 게이트+append 게이트+실제 회전의 합성)가 어떤 테스트에서도
+/// 실행되지 않았다**는 점이다 — 회전 자체는 `rotate_log_generations` 직접 호출로만 덮여 있었다.
+fn maybe_rotate_daemon_log_with(log: &std::path::Path, fds_are_append: bool) {
     let len = match std::fs::metadata(log) {
         Ok(m) => m.len(),
         Err(_) => return, // 로그 파일 없음(포그라운드 실행 등) — 무해 스킵.
@@ -646,7 +653,7 @@ fn maybe_rotate_daemon_log(log: &std::path::Path) {
     if len < LOG_ROTATE_THRESHOLD {
         return;
     }
-    if !log_fds_are_append() {
+    if !fds_are_append {
         eprintln!(
             "[cysd] log rotation skipped: log fd is not O_APPEND — copy-truncate would punch a NUL hole ({} bytes)",
             len
@@ -657,6 +664,11 @@ fn maybe_rotate_daemon_log(log: &std::path::Path) {
         Ok(()) => eprintln!("[cysd] log rotated: {len} bytes → cysd.log.1 (copy-truncate)"),
         Err(e) => eprintln!("[cysd] log rotation failed (skipped): {e}"),
     }
+}
+
+/// 프로덕션 진입점 — 자기 로그 fd를 **실측**해 위 판정에 주입한다.
+fn maybe_rotate_daemon_log(log: &std::path::Path) {
+    maybe_rotate_daemon_log_with(log, log_fds_are_append());
 }
 
 /// ★W2 콜드부트 자동 복원 판정(순수 함수 — 부수효과 없음, 단위 테스트 가능).
@@ -1918,23 +1930,10 @@ fn browser_job_gate() -> &'static BrowserJobGate {
     GATE.get_or_init(|| BrowserJobGate::new(1))
 }
 
-async fn run_browser_job_bounded<T, F>(
-    gate: &BrowserJobGate,
-    timeout: std::time::Duration,
-    job: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(Arc<std::sync::atomic::AtomicBool>) -> T + Send + 'static,
-{
-    run_browser_job_bounded_with_cancellation(
-        gate,
-        timeout,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        job,
-    )
-    .await
-}
+// ※ 취소 플래그 없는 편의 래퍼 `run_browser_job_bounded`는 삭제했다. WS-0-3이 프로덕션 호출부를
+//   `run_browser_job_bounded_with_cancellation`(연결 소멸 감시 포함)로 옮기면서 래퍼는 **테스트만
+//   부르는 죽은 코드**가 됐고, 그 상태로 두면 "프로덕션이 쓰지 않는 함수를 4종 테스트가 검증"하는
+//   가짜 커버리지가 된다. 테스트는 이제 아래 프로덕션 함수를 직접 호출한다.
 
 async fn run_browser_job_bounded_with_cancellation<T, F>(
     gate: &BrowserJobGate,
@@ -2010,12 +2009,142 @@ mod startup_lock_retry_tests {
         assert_eq!(jittered(Duration::from_millis(1)).as_millis(), 1, "미세값 무변");
     }
 
+    // ───────────── WS-7 수용 기준: 데몬 부팅 ↔ doctor 동시 실행 통합 테스트 ─────────────
+    //
+    // 기획서 §4 WS-7 / 설계 §9-1이 명령한 상호작용 검증이다. 검증 대상은 **프로덕션
+    // `acquire_startup_lock` 그 자체**이며, 테스트가 재시도 루프를 재구현하지 않는다
+    // (종전 `retry_loop_wins_the_lock_a_doctor_briefly_held`는 `try_flock`+백오프를 테스트 안에서
+    //  다시 짜, `acquire_startup_lock`에서 재시도를 통째로 지워도 초록이었다 = 커버리지 0).
+    //
+    // 구조와 그 근거:
+    //   · 부팅 데몬 = **자식 프로세스**(이 테스트 바이너리 재실행 → `boot_lock_child_entrypoint`).
+    //     실패 경로가 `std::process::exit(1)`이라 in-process로는 "오사유 exit이 나지 않았다"를
+    //     단언할 수 없다(하니스째 죽어 단언 지점에 도달조차 못 한다). 자식이라야 exit code와
+    //     stderr를 **증거로** 검사할 수 있다.
+    //   · doctor = 가능하면 **진짜 `cys` 바이너리**(`cys doctor` + `CYS_DOCTOR_LOCK_HOLD_MS`).
+    //     게이트 명령이 `cargo build --bin cysd --bin cys`를 선행하므로 평시 이 경로를 탄다.
+    //     바이너리가 없으면 같은 보유 구간을 내는 스레드 픽스처로 낙하한다 — **검증의 핵심
+    //     단언(프로덕션 락 획득 성공/실패)은 두 모드에서 동일하며, 어떤 경우에도 skip하지 않는다.**
+    //   · 결정론화는 벽시계 경합이 아니라 **노브 주입**이다(설계 §10-1-A-5): 보유 1500ms ≪ 재시도
+    //     예산 5000ms로 고정하면 성패가 스케줄러 운에 좌우되지 않는다.
+    //   · 음성 대조(`CYS_LOCK_RETRY_MS=0`)를 함께 돌려 **재시도가 없으면 정확히 그 사고
+    //     (`dead-holder-reclaim-failed` 오사유 exit(1))가 재현됨**을 증명한다. 이 대조가 없으면
+    //     "재시도가 실제로 일하는가"를 아무도 확인하지 않은 채 초록만 본다.
+
+    /// 부팅 데몬 역할의 자식 프로세스 진입점 — 부모가 재실행으로만 구동한다(단독 실행은 no-op).
     #[test]
-    fn retry_loop_wins_the_lock_a_doctor_briefly_held() {
-        // ★결정론: 벽시계 경합이 아니라 "doctor 보유 구간 < 재시도 예산"을 노브로 고정해 재현한다.
-        // 재시도가 없으면 이 시나리오에서 부팅 데몬은 dead-holder-reclaim-failed로 오사유 exit(1)한다.
+    #[ignore = "부모 통합 테스트가 재실행으로 구동한다"]
+    fn boot_lock_child_entrypoint() {
+        let Ok(dir) = std::env::var("CYS_TEST_BOOT_LOCK_DIR") else {
+            return; // 환경변수 없이 우연히 실행돼도 아무 일도 하지 않는다(재귀·오염 방지).
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let t0 = std::time::Instant::now();
+        // ★프로덕션 함수를 그대로 호출한다. 여기서 실패하면 이 프로세스가 exit(1)로 죽고,
+        //   부모가 그 exit code와 stderr를 증거로 읽는다.
+        match acquire_startup_lock(&dir.join("cys.lock"), &dir.join("cys.sock"), &dir) {
+            Some(_held) => println!("BOOT-LOCK-ACQUIRED elapsed_ms={}", t0.elapsed().as_millis()),
+            None => println!("BOOT-LOCK-NONE"),
+        }
+    }
+
+    /// 같은 target 디렉토리의 `cys` 바이너리(진짜 doctor). 없으면 None → 스레드 픽스처로 낙하.
+    fn sibling_cys_binary() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("CYS_TEST_CYS_BIN") {
+            let p = std::path::PathBuf::from(p);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        // 테스트 바이너리는 target/<profile>/deps/cysd-<hash> — 두 단계 위가 target/<profile>.
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let p = profile_dir.join(if cfg!(windows) { "cys.exe" } else { "cys" });
+        p.exists().then_some(p)
+    }
+
+    /// doctor 역할로 startup 락을 `hold_ms` 동안 붙잡는다. 반환값을 drop할 때까지 유효.
+    enum LockHolder {
+        RealDoctor(std::process::Child),
+        Fixture(Option<std::thread::JoinHandle<()>>),
+    }
+
+    impl LockHolder {
+        fn start(dir: &std::path::Path, lock: &std::path::Path, hold_ms: u64) -> (Self, bool) {
+            if let Some(cys) = sibling_cys_binary() {
+                // 진짜 `cys doctor`: 소켓 파일이 없으므로 socket 진단은 즉시 통과하고,
+                // startup-lock 진단이 flock을 쥔 채 CYS_DOCTOR_LOCK_HOLD_MS 만큼 머문다.
+                let child = std::process::Command::new(cys)
+                    .arg("doctor")
+                    .env("CYS_SOCKET", dir.join("cys.sock"))
+                    .env("CYS_PACK_DIR", dir.join("pack"))
+                    .env("CYS_NO_AUTOSTART", "1")
+                    .env("CYS_DOCTOR_LOCK_HOLD_MS", hold_ms.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                if let Ok(child) = child {
+                    return (LockHolder::RealDoctor(child), true);
+                }
+            }
+            let lock = lock.to_path_buf();
+            let handle = std::thread::spawn(move || {
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&lock)
+                    .expect("픽스처 홀더가 락 파일을 열지 못했다");
+                assert_eq!(
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0,
+                    "픽스처 홀더가 락을 잡지 못했다"
+                );
+                std::thread::sleep(Duration::from_millis(hold_ms));
+                drop(f);
+            });
+            (LockHolder::Fixture(Some(handle)), false)
+        }
+
+        fn finish(self) {
+            match self {
+                LockHolder::RealDoctor(mut c) => {
+                    let _ = c.wait();
+                }
+                LockHolder::Fixture(h) => {
+                    if let Some(h) = h {
+                        let _ = h.join();
+                    }
+                }
+            }
+        }
+    }
+
+    /// 락이 실제로 누군가에게 잡힐 때까지 유계 대기(최대 5s). 잡히면 true.
+    fn wait_until_locked(lock: &std::path::Path) -> bool {
+        for _ in 0..250 {
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(lock)
+            {
+                let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+                if got {
+                    // 프로브가 잡아버렸다 — 즉시 놓아 본 시나리오를 방해하지 않는다.
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+                } else {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    fn boot_lock_scenario_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "cysd-lockretry-{}-{}",
+            "cysd-bootlock-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2023,44 +2152,109 @@ mod startup_lock_retry_tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
-        let lock = d.join("cys.lock");
-        let doctor = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock)
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(doctor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "doctor가 락을 쥔 상태 모사"
-        );
-        let hold_ms = 300u64; // doctor 진단 2건 연속 실행의 상한을 넉넉히 상회하는 보유 구간.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(hold_ms));
-            drop(doctor);
-        });
+        // 홀더 pid = 1(init/launchd): **살아있지만 cysd가 아니다**. 재시도가 없으면 데드맨이
+        // Dead로 오판(무응답 소켓 + heartbeat 부재=stale) → 회수 시도 → pid_is_cysd(1)=false로
+        // 거부 → `dead-holder-reclaim-failed` 오사유 exit(1). 즉 원사고를 정확히 재현하는 값이다.
+        // (거부 경로라 pid 1에는 어떤 시그널도 전송되지 않는다 — reclaim_from_dead_holder 참조.)
+        std::fs::write(d.join("cys.lock"), b"1").unwrap();
+        d
+    }
 
-        let booting = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock)
-            .unwrap();
-        let try_flock = |f: &std::fs::File| unsafe {
-            libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
-        };
-        assert!(!try_flock(&booting), "첫 시도는 실패(경합 재현)");
-        let mut won = false;
-        for backoff in schedule_for_budget(1550) {
-            std::thread::sleep(jittered(backoff));
-            if try_flock(&booting) {
-                won = true;
-                break;
-            }
-        }
-        assert!(won, "재시도 예산(1550ms) 안에서 {hold_ms}ms 보유를 흡수해 승리해야 한다");
-        std::fs::remove_dir_all(&d).ok();
+    fn run_boot_child(dir: &std::path::Path, retry_ms: u64) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "startup_lock_retry_tests::boot_lock_child_entrypoint",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CYS_TEST_BOOT_LOCK_DIR", dir)
+            .env("CYS_LOCK_RETRY_MS", retry_ms.to_string())
+            .env_remove("CYS_TEST_CYS_BIN")
+            .output()
+            .expect("부팅 자식 프로세스 실행")
+    }
+
+    #[test]
+    fn boot_daemon_wins_the_lock_while_doctor_holds_it() {
+        const HOLD_MS: u64 = 1500; // doctor 보유 구간(노브 주입)
+        const RETRY_MS: u64 = 5000; // 부팅 데몬 재시도 예산(노브 주입) — 보유 구간을 크게 상회
+
+        // ── ① 본 시나리오: doctor가 락을 쥔 채로 데몬이 부팅한다 → 재시도로 획득해 성공해야 한다.
+        let dir = boot_lock_scenario_dir("win");
+        let lock = dir.join("cys.lock");
+        let (holder, real_doctor) = LockHolder::start(&dir, &lock, HOLD_MS);
+        assert!(
+            wait_until_locked(&lock),
+            "홀더가 락을 잡지 못했다 — 시나리오 전제 붕괴(real_doctor={real_doctor})"
+        );
+        let out = run_boot_child(&dir, RETRY_MS);
+        holder.finish();
+
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "doctor가 락을 쥔 순간 부팅한 데몬이 죽었다(real_doctor={real_doctor})\n\
+             status={:?}\nstdout={stdout}\nstderr={stderr}",
+            out.status.code()
+        );
+        assert!(
+            stdout.contains("BOOT-LOCK-ACQUIRED"),
+            "부팅 데몬이 락을 획득하지 못했다\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("dead-holder-reclaim-failed"),
+            "오사유(dead-holder-reclaim-failed)로 판정했다 — WS-7이 없애려던 바로 그 경로\nstderr={stderr}"
+        );
+        // 재시도가 실제로 돌았다는 증거: 즉시 획득이었다면 경과가 0에 수렴한다.
+        let elapsed_ms: u64 = stdout
+            .split("elapsed_ms=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or_else(|| panic!("자식이 경과를 보고하지 않았다: {stdout}"));
+        assert!(
+            elapsed_ms >= 100,
+            "백오프 재시도를 거치지 않고 즉시 획득했다({elapsed_ms}ms) — 경합이 재현되지 않았다"
+        );
+        // 획득 뒤에는 `claim_lock`이 자기 pid를 기록하고 heartbeat를 touch한다 — 데드맨이 다음
+        // 경합에서 홀더를 식별할 수 있어야 인수 계약이 성립한다(획득만 하고 대장을 안 남기면
+        // 다음 부팅이 FailClosed로 굳는다).
+        let recorded = std::fs::read_to_string(&lock).unwrap();
+        let recorded: u32 = recorded.trim().parse().expect("락파일에 홀더 pid가 기록돼야 한다");
+        assert_ne!(recorded, 1, "홀더 pid가 자식 프로세스 pid로 갱신돼야 한다");
+        assert!(
+            deadman::heartbeat_path(&dir).exists(),
+            "획득 직후 heartbeat가 touch돼야 한다"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn boot_daemon_without_retry_reproduces_the_false_reclaim_exit() {
+        // ── ② 음성 대조: 재시도 예산 0(= WS-7 이전 동작)이면 **정확히 그 사고**가 재현된다.
+        //     이 대조가 초록이어야 ①의 초록이 "재시도 덕분"임이 증명된다(mutation 저항).
+        const HOLD_MS: u64 = 1500;
+        let dir = boot_lock_scenario_dir("noretry");
+        let lock = dir.join("cys.lock");
+        let (holder, real_doctor) = LockHolder::start(&dir, &lock, HOLD_MS);
+        assert!(wait_until_locked(&lock), "홀더가 락을 잡지 못했다");
+        let out = run_boot_child(&dir, 0);
+        holder.finish();
+
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "재시도 없이는 부팅 데몬이 exit(1)해야 한다(real_doctor={real_doctor})\nstderr={stderr}"
+        );
+        assert!(
+            stderr.contains("dead-holder-reclaim-failed"),
+            "사고 사유가 재현되지 않았다 — 시나리오가 다른 경로를 탔다\nstderr={stderr}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2190,17 +2384,20 @@ mod log_rotation_tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_append_fd_gate_skips_rotation() {
-        // ★실측 확증: 부서 데몬 로그 fd는 O_APPEND가 아니다 → copy-truncate 시 NUL 홀 발생.
-        // 테스트 프로세스의 stdout/stderr는 파이프·tty(비 O_APPEND)이므로 게이트가 닫혀야 한다.
-        assert!(
-            !log_fds_are_append(),
-            "테스트 하니스의 stdout/stderr는 O_APPEND가 아니다"
-        );
+    fn append_gate_decides_rotation_on_both_branches() {
+        // ★종전 결함 둘: ①`assert!(!log_fds_are_append())`가 **테스트 하니스 환경에 종속**됐다
+        //   (`cargo test >> out.log`면 stdout이 O_APPEND라 그 자리에서 실패). ②그 게이트 때문에
+        //   `maybe_rotate_daemon_log`의 **성공 경로가 어떤 테스트에서도 실행되지 않았다** —
+        //   크기 게이트+append 게이트+실제 회전의 합성 커버리지가 0이었다.
+        //   이제 append 여부를 주입해 **양쪽 분기를 모두** 덮는다.
+        use std::os::unix::fs::MetadataExt;
+        let big = vec![b'x'; (LOG_ROTATE_THRESHOLD + 1) as usize];
+
+        // (a) non-append 기록자 → 회전 스킵(copy-truncate가 NUL 홀을 뚫는 것을 막는다).
         let d = tmp_dir("noappend");
         let log = daemon_log_path(&d);
-        std::fs::write(&log, vec![b'x'; (LOG_ROTATE_THRESHOLD + 1) as usize]).unwrap();
-        maybe_rotate_daemon_log(&log);
+        std::fs::write(&log, &big).unwrap();
+        maybe_rotate_daemon_log_with(&log, false);
         assert!(
             !log_generation_path(&log, 1).exists(),
             "non-append 기록자면 회전 스킵(NUL 홀 방지)"
@@ -2211,22 +2408,92 @@ mod log_rotation_tests {
             "스킵 시 원본 무손상"
         );
         std::fs::remove_dir_all(&d).ok();
+
+        // (b) append 기록자 → 임계 초과이므로 **실제로 회전**한다: .1 생성 + 원본 truncate +
+        //     inode 보존(라이브 기록자 fd가 유령 inode로 새지 않는다).
+        let d = tmp_dir("append");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, &big).unwrap();
+        let live_ino = std::fs::metadata(&log).unwrap().ino();
+        maybe_rotate_daemon_log_with(&log, true);
+        assert_eq!(
+            std::fs::metadata(log_generation_path(&log, 1)).unwrap().len(),
+            LOG_ROTATE_THRESHOLD + 1,
+            "append 기록자면 실제 회전 — 전량이 .1로 보존된다"
+        );
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0, "원본은 truncate");
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().ino(),
+            live_ino,
+            "cysd.log inode 보존(rename 금지)"
+        );
+        std::fs::remove_dir_all(&d).ok();
+
+        // (c) 크기 게이트가 append 게이트보다 우선한다 — append여도 임계 미만이면 회전 금지
+        //     (crashloop 3회에 보관 세대가 전부 밀려나는 경로 차단).
+        let d = tmp_dir("appendsmall");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, b"small").unwrap();
+        maybe_rotate_daemon_log_with(&log, true);
+        assert!(!log_generation_path(&log, 1).exists(), "임계 미만은 회전 금지");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_append_probe_reads_the_real_open_flag() {
+        // 주입 게이트의 **실측부**(프로덕션이 fd 1·2에 적용하는 그 술어)를 환경 무관하게 검증한다.
+        // 이 술어가 뒤집히면 부서 데몬(비 O_APPEND)에서 copy-truncate가 NUL 홀을 뚫는다.
+        use std::os::unix::io::AsRawFd;
+        let d = tmp_dir("fdflag");
+        let p = d.join("probe.log");
+        let appending = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .unwrap();
+        assert!(fd_is_append(appending.as_raw_fd()), "O_APPEND fd=true");
+        let writing = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&p)
+            .unwrap();
+        assert!(
+            !fd_is_append(writing.as_raw_fd()),
+            "W,0x10000 계열(부서 데몬 로그 fd)=false"
+        );
+        assert!(!fd_is_append(-1), "잘못된 fd는 fail-closed");
+        drop(appending);
+        drop(writing);
+        std::fs::remove_dir_all(&d).ok();
     }
 }
 
 #[cfg(test)]
 mod browser_rpc_isolation_tests {
-    use super::{run_browser_job_bounded, BrowserJobGate, BrowserRequestRegistry};
+    use super::{run_browser_job_bounded_with_cancellation, BrowserJobGate, BrowserRequestRegistry};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 취소 플래그를 만들어 **프로덕션 진입점을 그대로** 호출한다(로직 없음 — 인자 조립만).
+    /// 종전에는 테스트 전용 래퍼(`run_browser_job_bounded`)를 통했고, 그 래퍼는 WS-0-3 이후
+    /// 프로덕션이 부르지 않는 죽은 코드였다 — 즉 4종 테스트가 프로덕션 경로를 덮지 못했다.
+    fn fresh_cancellation() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_browser_start_does_not_starve_other_async_rpc_work() {
         let gate = BrowserJobGate::new(1);
-        let slow = run_browser_job_bounded(&gate, std::time::Duration::from_secs(1), |_| {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            "browser-ready"
-        });
+        let slow = run_browser_job_bounded_with_cancellation(
+            &gate,
+            std::time::Duration::from_secs(1),
+            fresh_cancellation(),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                "browser-ready"
+            },
+        );
         let other_rpc = async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             "pty-ping"
@@ -2241,9 +2508,10 @@ mod browser_rpc_isolation_tests {
         let gate = BrowserJobGate::new(1);
         let launched = Arc::new(AtomicUsize::new(0));
         let launched_in_job = launched.clone();
-        let result = run_browser_job_bounded(
+        let result = run_browser_job_bounded_with_cancellation(
             &gate,
             std::time::Duration::from_millis(10),
+            fresh_cancellation(),
             move |cancelled| {
                 std::thread::sleep(std::time::Duration::from_millis(60));
                 if !cancelled.load(Ordering::SeqCst) {
@@ -2268,16 +2536,26 @@ mod browser_rpc_isolation_tests {
         let first_gate = gate.clone();
         let first_release = release.clone();
         let first = tokio::spawn(async move {
-            run_browser_job_bounded(&first_gate, std::time::Duration::from_secs(1), move |_| {
-                while !first_release.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-            })
+            run_browser_job_bounded_with_cancellation(
+                &first_gate,
+                std::time::Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+                move |_| {
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                },
+            )
             .await
         });
         tokio::task::yield_now().await;
-        let second =
-            run_browser_job_bounded(&gate, std::time::Duration::from_millis(20), |_| ()).await;
+        let second = run_browser_job_bounded_with_cancellation(
+            &gate,
+            std::time::Duration::from_millis(20),
+            Arc::new(AtomicBool::new(false)),
+            |_| (),
+        )
+        .await;
         assert_eq!(second.unwrap_err(), "backpressure");
         release.store(true, Ordering::SeqCst);
         first.await.unwrap().unwrap();

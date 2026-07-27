@@ -319,6 +319,56 @@ mod tests {
     }
 
     #[test]
+    fn pid_is_cysd_accepts_a_real_cysd_basename() {
+        // ★긍정 단언(누락분): 구현이 `ps` 파싱 → sysinfo `Process::name()`으로 교체됐는데 단언이
+        // **부정 3건뿐**이었다. 즉 sysinfo가 실제 cysd를 인식하지 못하도록 깨져도(플랫폼 차이·
+        // 크레이트 업그레이드·권한) 테스트는 초록이다. 그 실패 모드는 조용하지 않다:
+        // `reclaim_from_dead_holder`의 verify 게이트가 **영구히 닫혀** SIGTERM/SIGKILL이 한 번도
+        // 발사되지 않고, 부팅 데몬은 매번 `dead-holder-reclaim-failed`로 exit(1) → 30회당 1줄
+        // 로그 억제와 launchd 10s 재기동이 겹쳐 **무로그 crashloop**이 된다(W3가 없애려던 그 상태).
+        // basename이 정확히 `cysd`인 실행 스텁을 띄워 인식 자체를 검증한다.
+        let d = tmp_dir();
+        let stub = d.join("cysd");
+        std::fs::copy("/bin/sleep", &stub).expect("스텁 복사(/bin/sleep → basename cysd)");
+        let mut child = std::process::Command::new(&stub)
+            .arg("30")
+            .spawn()
+            .expect("스텁 스폰");
+        let pid = child.id();
+        // 스폰 직후 프로세스 테이블 반영 지연을 흡수하는 유계 폴링(최대 2s — 벽시계 의존 최소화).
+        let mut recognized = false;
+        for _ in 0..40 {
+            if pid_is_cysd(pid) {
+                recognized = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 대조: 같은 스텁을 `cysd`가 아닌 이름으로 띄우면 반드시 false여야 한다(부분일치·항상참 차단).
+        let other = d.join("cysd-lookalike");
+        std::fs::copy("/bin/sleep", &other).unwrap();
+        let mut decoy = std::process::Command::new(&other).arg("30").spawn().unwrap();
+        let decoy_pid = decoy.id();
+        std::thread::sleep(Duration::from_millis(150));
+        let decoy_verdict = pid_is_cysd(decoy_pid);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = decoy.kill();
+        let _ = decoy.wait();
+        std::fs::remove_dir_all(&d).ok();
+
+        assert!(
+            recognized,
+            "basename cysd 프로세스를 인식하지 못한다 — 데드맨 kill 게이트가 영구 무장해제된다"
+        );
+        assert!(
+            !decoy_verdict,
+            "`cysd-…` 유사명은 여전히 false여야 한다(부분일치 오살상 차단)"
+        );
+    }
+
+    #[test]
     fn pid_is_cysd_refuses_non_cysd() {
         // 안전 게이트: 테스트 바이너리·init(pid 1)은 cysd가 아니므로 false → kill 거부.
         assert!(!pid_is_cysd(std::process::id()), "테스트 프로세스≠cysd");
