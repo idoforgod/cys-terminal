@@ -11372,7 +11372,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn doctor_stale_lock_detect_and_fix() {
+    fn doctor_stale_lock_reports_but_never_unlinks() {
+        // ★K4 회귀 핀: --fix가 락 파일을 unlink 하면 startup lock 상호배제가 영구 무효화되고
+        // (다음 데몬은 unlink된 inode에, 그 다음은 새 inode에 별개 락) 데드맨이 영구 무장해제된다.
+        // 계약: 파일·inode는 언제나 보존, --fix는 stale pid 표기 truncate까지만.
         let base = std::env::temp_dir().join(format!("cys-doc-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -11380,13 +11383,132 @@ mod tests {
         let lock = ctx.socket_path.with_extension("lock");
         // 없음 → OK
         assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Ok);
-        // 잔여 락(아무도 미보유) → WARN
+        // 빈 락파일(홀더 없음·pid 미기재) → 정리할 것 없음 → OK, 파일 보존
         std::fs::write(&lock, b"").unwrap();
+        assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Ok);
+        assert!(lock.exists(), "읽기 전용 보고는 파일을 건드리지 않는다");
+
+        // stale pid 기록 잔존 → WARN(보고만)
+        std::fs::write(&lock, b"999999").unwrap();
         assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Warn);
-        // --fix → 제거
+        assert!(lock.exists(), "보고 경로는 unlink 금지");
+
+        // --fix → pid 표기만 truncate, 파일·inode 보존
+        use std::os::unix::fs::MetadataExt;
+        let ino_before = std::fs::metadata(&lock).unwrap().ino();
         assert_eq!(diag_stale_lock(&ctx, true).status, DiagStatus::Ok);
-        assert!(!lock.exists(), "잔여 락 제거됨");
+        assert!(lock.exists(), "★--fix도 락 파일을 절대 삭제하지 않는다");
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().ino(),
+            ino_before,
+            "inode 보존 — 새 inode가 생기면 상호배제가 갈라진다"
+        );
+        assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0, "pid 표기만 비움");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_socket_verdict_truth_table() {
+        // 삭제는 "살아있는 cysd 홀더 없음"의 3중 부정이 전부 성립할 때만.
+        // ①락파일 ENOENT = 홀더 없음으로 진행(미정의면 --fix가 영구 무력)
+        assert_eq!(
+            judge_orphan_socket(false, true, None, false, false),
+            OrphanVerdict::Removable
+        );
+        // ②flock 획득 실패 = 데몬 부팅/보유 중 → fail-closed 보류(산 소켓 삭제 차단)
+        assert_eq!(
+            judge_orphan_socket(true, false, Some(42), true, true),
+            OrphanVerdict::HeldByDaemon
+        );
+        assert_eq!(
+            judge_orphan_socket(true, false, None, false, false),
+            OrphanVerdict::HeldByDaemon,
+            "flock 실패는 pid 정보보다 우선한다"
+        );
+        // ③구형 락파일(pid 미기재) = 데드맨 FailClosed와 동일한 보수 해석 → 삭제 금지
+        assert_eq!(
+            judge_orphan_socket(true, true, None, false, false),
+            OrphanVerdict::UnknownHolder
+        );
+        // ④홀더 pid 생존 → 보류(cysd 여부 무관하게 보수적)
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), true, true),
+            OrphanVerdict::LiveHolder(7)
+        );
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), true, false),
+            OrphanVerdict::LiveHolder(7)
+        );
+        // ⑤3중 부정 충족(락 미보유 + pid 사망 + 비cysd) → 삭제 허용
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), false, false),
+            OrphanVerdict::Removable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_holds_flock_across_check_and_unlink_and_is_fail_closed() {
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("cys-doc-span-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        let lock = ctx.socket_path.with_extension("lock");
+        // 고아 후보: 연결 불가 파일 + 부팅 중인 데몬이 락을 쥔 상태를 모사.
+        std::fs::write(&ctx.socket_path, b"not-a-socket").unwrap();
+        std::fs::write(&lock, format!("{}", std::process::id())).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // ★fail-closed: 락을 잡을 수 없으면 --fix여도 산 소켓을 지우지 않는다.
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Warn);
+        assert!(ctx.socket_path.exists(), "★부팅 중 데몬의 소켓 삭제 금지");
+        drop(holder);
+
+        // 홀더 사라짐 + 기록 pid 사망 → 3중 부정 충족 → 제거.
+        std::fs::write(&lock, b"999999").unwrap();
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Ok);
+        assert!(!ctx.socket_path.exists(), "홀더 부재 확정 시에만 제거");
+        assert!(lock.exists(), "소켓 진단도 락 파일은 절대 unlink 하지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_refuses_when_lockfile_has_no_holder_pid() {
+        // 구형 락파일(빈 파일)은 데드맨 FailClosed와 동일 해석 — --fix여도 소켓 삭제 금지.
+        let base = std::env::temp_dir().join(format!("cys-doc-nopid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::write(&ctx.socket_path, b"not-a-socket").unwrap();
+        std::fs::write(ctx.socket_path.with_extension("lock"), b"").unwrap();
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Warn);
+        assert!(ctx.socket_path.exists(), "pid 미상 = 보수적 보류");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_pid_is_cysd_is_fail_closed_for_non_cysd() {
+        // sysinfo 교체 후에도 의미론 유지: 정확 basename 일치만 true(부분일치·부재·pid 0 = false).
+        assert!(!doctor_pid_is_cysd(0));
+        assert!(!doctor_pid_is_cysd(1), "init/launchd ≠ cysd");
+        assert!(
+            !doctor_pid_is_cysd(std::process::id()),
+            "테스트 바이너리(cys-<hash>) ≠ cysd"
+        );
     }
 
     #[test]
@@ -11488,7 +11610,10 @@ mod tests {
         std::fs::create_dir_all(&ctx.pack_dir).unwrap();
         std::fs::write(ctx.pack_dir.join(".pack-version"), env!("CARGO_PKG_VERSION")).unwrap();
         std::fs::write(&ctx.socket_path, b"x").unwrap(); // 고아 소켓
-        std::fs::write(ctx.socket_path.with_extension("lock"), b"").unwrap(); // 잔여 락
+        // ★WS-7 계약 반영: 락파일에 **사망한 홀더 pid**가 기록돼 있어야 고아 소켓 제거가 허용된다
+        // (홀더 부재 3중 확인). 빈 락파일(구형)은 데드맨 FailClosed와 동일 해석으로 제거를 보류하며,
+        // 그 경로는 doctor_refuses_when_lockfile_has_no_holder_pid가 따로 핀한다.
+        std::fs::write(ctx.socket_path.with_extension("lock"), b"999999").unwrap();
         std::fs::create_dir_all(base.join(".pack-staging-init-1")).unwrap(); // 잔재
         std::fs::write(&ctx.settings_paths[0], "{}").unwrap();
 

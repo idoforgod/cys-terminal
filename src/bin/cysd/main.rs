@@ -1960,6 +1960,104 @@ where
     }
 }
 
+#[cfg(all(test, unix))]
+mod startup_lock_retry_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Duration;
+
+    #[test]
+    fn default_schedule_exceeds_one_second_and_backs_off() {
+        let s = schedule_for_budget(1550);
+        let ms: Vec<u64> = s.iter().map(|d| d.as_millis() as u64).collect();
+        assert_eq!(ms, vec![50, 100, 200, 400, 800], "지수 백오프");
+        let total: u64 = ms.iter().sum();
+        assert!(
+            total >= 1000,
+            "총 예산 ≥1s여야 doctor의 순간 락 보유를 흡수한다(실제 {total}ms)"
+        );
+    }
+
+    #[test]
+    fn budget_knob_is_injectable_for_deterministic_tests() {
+        assert!(
+            schedule_for_budget(0).is_empty(),
+            "예산 0 = 재시도 없음(구 동작 재현용)"
+        );
+        let s = schedule_for_budget(120);
+        assert_eq!(
+            s.iter().map(|d| d.as_millis() as u64).sum::<u64>(),
+            120,
+            "예산을 넘지 않는다"
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        for _ in 0..200 {
+            let d = jittered(Duration::from_millis(100));
+            assert!(
+                (80..=120).contains(&(d.as_millis() as u64)),
+                "±20% 밖: {d:?}"
+            );
+        }
+        assert_eq!(jittered(Duration::from_millis(1)).as_millis(), 1, "미세값 무변");
+    }
+
+    #[test]
+    fn retry_loop_wins_the_lock_a_doctor_briefly_held() {
+        // ★결정론: 벽시계 경합이 아니라 "doctor 보유 구간 < 재시도 예산"을 노브로 고정해 재현한다.
+        // 재시도가 없으면 이 시나리오에서 부팅 데몬은 dead-holder-reclaim-failed로 오사유 exit(1)한다.
+        let d = std::env::temp_dir().join(format!(
+            "cysd-lockretry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let lock = d.join("cys.lock");
+        let doctor = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(doctor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "doctor가 락을 쥔 상태 모사"
+        );
+        let hold_ms = 300u64; // doctor 진단 2건 연속 실행의 상한을 넉넉히 상회하는 보유 구간.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+            drop(doctor);
+        });
+
+        let booting = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let try_flock = |f: &std::fs::File| unsafe {
+            libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+        };
+        assert!(!try_flock(&booting), "첫 시도는 실패(경합 재현)");
+        let mut won = false;
+        for backoff in schedule_for_budget(1550) {
+            std::thread::sleep(jittered(backoff));
+            if try_flock(&booting) {
+                won = true;
+                break;
+            }
+        }
+        assert!(won, "재시도 예산(1550ms) 안에서 {hold_ms}ms 보유를 흡수해 승리해야 한다");
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
 #[cfg(test)]
 mod log_rotation_tests {
     use super::*;
