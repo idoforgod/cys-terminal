@@ -2286,8 +2286,11 @@ mod log_rotation_tests {
         assert!(line.contains("boot=0123456789abcdef"));
         assert!(line.contains("pre-lock"));
 
+        // ★username은 `scripts/secret-scan.sh:33`의 더미 화이트리스트(user|x|youruser|USERNAME|
+        // runner|home)에서만 고른다 — 그 밖의 이름은 개인경로로 판정돼 `secret-scan.sh --all`
+        // (release.yml:151 fail-closed 게이트)에서 릴리스가 막힌다. 길이는 dept 세그먼트로 낸다.
         let long = std::path::Path::new(
-            "/Users/some-very-long-user-name/Library/Application Support/cysjavis/dept-alpha/cysd.sock",
+            "/Users/user/Library/Application Support/cysjavis/dept-alpha-very-long-department/cysd.sock",
         );
         let line = boot_marker_line("0123456789abcdef", "live", long);
         assert!(line.len() <= 80, "긴 경로 마커 {}자: {line}", line.len());
