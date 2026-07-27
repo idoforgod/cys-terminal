@@ -1539,7 +1539,8 @@ mod tests {
             now_epoch().to_bits()
         ));
         std::fs::create_dir_all(&exe_dir).unwrap();
-        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/me"), None);
+        // 더미 HOME은 개인경로 패턴(/Users/*)을 피한다 — release 시크릿 스캔 하드게이트 대상.
+        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/tmp/dummy-home"), None);
         let path = pairs
             .iter()
             .find(|(k, _)| k == "PATH")
