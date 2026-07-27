@@ -313,13 +313,15 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             })
             .and_then(|_| control.flush());
         if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
+            let mut control = Some(control);
+            terminate_supervisor(&mut child, &mut control, HANDSHAKE_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
                 "RUNTIME_START_FAILED",
                 format!("private broker handshake failed: {error}"),
             ));
         }
+        // 핸드셰이크가 끝난 시점부터 control은 종료기·워처가 공유하는 자원이다.
+        let mut control = Some(control);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut line = String::new();
@@ -331,6 +333,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         });
         let state = match wait_for_supervisor_readiness(
             &mut child,
+            &mut control,
             ready_rx,
             &request.cancellation,
             std::time::Duration::from_secs(25),
@@ -339,23 +342,20 @@ impl SupervisorLauncher for RealSupervisorLauncher {
                 match cys::browser_runtime::parse_runtime_state(&line) {
                     Ok(ParsedRuntimeState::V2(state)) => state,
                     Ok(ParsedRuntimeState::LegacyIncompatible(_)) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
                         return Err(BrokerFailure::new(
                             "PROTOCOL_MISMATCH",
                             "supervisor returned legacy state",
                         ));
                     }
                     Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
                         return Err(runtime_failure(error));
                     }
                 }
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
                     "RUNTIME_START_FAILED",
                     "supervisor readiness timed out or returned an invalid frame",
@@ -366,8 +366,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         let supervisor_started_at = match process_start_time(state.supervisor_pid) {
             Some(started_at) => started_at,
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
                     "RUNTIME_START_FAILED",
                     "supervisor process identity unavailable",
@@ -377,8 +376,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         let engine_started_at = match process_start_time(state.engine_pid) {
             Some(started_at) => started_at,
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
                     "RUNTIME_START_FAILED",
                     "engine process identity unavailable",
@@ -386,8 +384,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             }
         };
         if request.cancellation.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
                 "BROWSER_CANCELLED",
                 "Browser launch was cancelled after readiness",
@@ -396,7 +393,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         let alive = Arc::new(AtomicBool::new(true));
         // control 파이프는 이제 워처 스레드와 managed 엔트리가 **함께** 보유한다.
         // 평시에는 워처가 붙들어 supervisor를 살려두고, evict 시에만 take()로 닫는다.
-        let control = Arc::new(Mutex::new(Some(control)));
+        let control = Arc::new(Mutex::new(control));
         let managed_runtime = ManagedRuntime {
             state: state.clone(),
             session_key: ManagedSessionKey::new(session_key),
@@ -412,8 +409,8 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             control: control.clone(),
         };
         if let Err(error) = self.commit_managed_runtime(managed_runtime, &request.cancellation) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let mut owned = control.lock().unwrap().take();
+            terminate_supervisor(&mut child, &mut owned, POST_READINESS_TERMINATION_GRACE);
             return Err(error);
         }
         let managed = self.managed.clone();
@@ -604,8 +601,9 @@ fn spawn_supervisor_cancellable(
     // Close the narrow check→spawn race: cancellation may win immediately
     // after the pre-spawn check, but it must never leave a detached child.
     if cancelled.load(Ordering::SeqCst) {
-        let _ = child.kill();
-        let _ = child.wait();
+        // 아직 아무도 stdin을 가져가지 않았다 — 여기서 꺼내 닫아야 EOF가 전달된다.
+        let mut control = child.stdin.take();
+        terminate_supervisor(&mut child, &mut control, PRE_READINESS_TERMINATION_GRACE);
         return Err(BrokerFailure::new(
             "BROWSER_CANCELLED",
             "Browser launch was cancelled during process creation",
@@ -614,8 +612,12 @@ fn spawn_supervisor_cancellable(
     Ok(child)
 }
 
+/// pre-readiness 구간 전용 대기 루프. 모든 실패 경로는 `terminate_supervisor`로
+/// 통일하며, 이 구간의 grace는 `PRE_READINESS_TERMINATION_GRACE`다(EOF 무효 구간이라
+/// 긴 유예는 취소 응답성만 해친다 — 취소 회귀 테스트의 계약이기도 하다).
 fn wait_for_supervisor_readiness(
     child: &mut std::process::Child,
+    control: &mut Option<ChildStdin>,
     receiver: std::sync::mpsc::Receiver<std::io::Result<(usize, String)>>,
     cancelled: &Arc<AtomicBool>,
     timeout: std::time::Duration,
@@ -623,16 +625,14 @@ fn wait_for_supervisor_readiness(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if cancelled.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
                 "BROWSER_CANCELLED",
                 "Browser launch was cancelled while waiting for readiness",
             ));
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
                 "RUNTIME_START_FAILED",
                 "supervisor readiness timed out",
@@ -641,8 +641,7 @@ fn wait_for_supervisor_readiness(
         match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
             Ok(Ok(frame)) => return Ok(frame),
             Ok(Err(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
                     "RUNTIME_START_FAILED",
                     format!("supervisor readiness read failed: {error}"),
@@ -657,8 +656,7 @@ fn wait_for_supervisor_readiness(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
                     "RUNTIME_START_FAILED",
                     "supervisor readiness channel disconnected",
@@ -1288,6 +1286,7 @@ mod tests {
 
         let error = wait_for_supervisor_readiness(
             &mut child,
+            &mut None,
             ready_rx,
             &cancelled,
             std::time::Duration::from_secs(2),
@@ -1451,6 +1450,75 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_supervisor_reclaims_an_eof_honoring_child_within_grace() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("eof-honoring child");
+        let mut control = child.stdin.take();
+
+        let started = std::time::Instant::now();
+        let status = terminate_supervisor(
+            &mut child,
+            &mut control,
+            std::time::Duration::from_millis(1500),
+        )
+        .expect("terminated child must be reaped");
+
+        assert!(
+            status.success(),
+            "an EOF-honoring child exits on its own — SIGKILL must not be needed"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "EOF must reclaim the child before the grace expires"
+        );
+        assert!(control.is_none(), "the control pipe must be taken and closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_supervisor_escalates_to_sigkill_for_an_eof_ignoring_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap \"\" TERM; sleep 30 </dev/null")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("eof-ignoring child");
+        let mut control = child.stdin.take();
+
+        let status = terminate_supervisor(
+            &mut child,
+            &mut control,
+            std::time::Duration::from_millis(100),
+        )
+        .expect("escalated child must be reaped");
+
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "a child that ignores EOF must be escalated to SIGKILL"
+        );
+    }
+
+    #[test]
+    fn termination_grace_is_split_by_readiness_phase() {
+        // pre-readiness에서 supervisor는 liveness 스레드가 없어 EOF가 무효다 —
+        // 긴 유예는 회수 이득 0에 취소 응답성만 해친다(취소 회귀 테스트의 계약).
+        assert_eq!(HANDSHAKE_TERMINATION_GRACE, std::time::Duration::ZERO);
+        assert!(PRE_READINESS_TERMINATION_GRACE < std::time::Duration::from_millis(250));
+        assert!(POST_READINESS_TERMINATION_GRACE >= std::time::Duration::from_secs(3));
     }
 
     #[test]

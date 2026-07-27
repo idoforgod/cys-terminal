@@ -3814,8 +3814,106 @@ fn doctor_socket_connectable(p: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(p).is_ok()
 }
 
+// ─────────────────────── WS-7: doctor 소켓·락 진단 (flock 스팬 · fail-closed) ───────────────────────
+//
+// 두 진단(diag_orphan_socket → diag_stale_lock)은 run_doctor_diagnostics에서 **연속 실행**되고 둘 다
+// startup flock을 만진다. 부팅 중인 데몬의 acquire_startup_lock이 그 순간 실패하면 데드맨이
+// `dead-holder-reclaim-failed`라는 **오사유로 exit(1)** 시키므로, 여기서는 보유 구간을 최소화하고
+// (블로킹 connect는 스팬 밖) 데몬 쪽은 지수 백오프 재시도로 흡수한다(cysd/main.rs acquire_startup_lock).
+
+/// doctor가 flock을 쥔 채 머무는 인위적 시간 — **테스트 전용 노브**(기본 0). 통합 테스트가 벽시계
+/// 경합에 기대지 않고 "doctor가 락을 쥔 순간 부팅 데몬이 재시도로 이긴다"를 결정론으로 재현한다.
+fn doctor_lock_hold() -> std::time::Duration {
+    std::env::var("CYS_DOCTOR_LOCK_HOLD_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_default()
+}
+
+/// 락 파일의 홀더 pid — cysd `deadman::read_holder_pid`와 **동일 규약**(빈 파일·0·파싱 실패 = None).
+/// None은 구형 락파일을 뜻하며 데드맨의 `FailClosed`와 같은 보수 해석(어떤 제거도 금지)을 받는다.
+#[cfg(unix)]
+fn doctor_read_holder_pid(lock: &std::path::Path) -> Option<u32> {
+    let s = std::fs::read_to_string(lock).ok()?;
+    match s.trim().parse::<u32>().ok()? {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+#[cfg(unix)]
+fn doctor_pid_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// pid의 프로세스명이 정확히 `cysd`인가 — **sysinfo 1회 스냅샷**(단일 pid 대상).
+/// `ps` fork는 고부하에서 50~150ms가 걸려 락 보유 상한을 깬다(cysd/deadman.rs와 동일 교체).
+#[cfg(unix)]
+fn doctor_pid_is_cysd(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+    sys.process(sysinfo::Pid::from_u32(pid))
+        .map(|p| {
+            p.name()
+                .to_string_lossy()
+                .rsplit('/')
+                .next()
+                .map(|b| b == "cysd")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 고아 소켓 제거 판정(순수 함수 — 진리표 테스트 가능). 삭제는 "살아있는 cysd 홀더가 없다"의
+/// **3중 부정**이 전부 성립할 때만: ①flock 홀더 부재(=락 획득 성공 또는 락파일 ENOENT)
+/// ②기록된 홀더 pid가 사망 ③(pid 재사용 방어) 그 pid가 cysd가 아님. 하나라도 어긋나면 보류한다.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum OrphanVerdict {
+    /// 삭제 가능 — 살아있는 홀더 없음이 3중으로 확인됨.
+    Removable,
+    /// flock 획득 실패 = 데몬이 **부팅 중이거나 보유 중** — 판정 보류·삭제 금지(fail-closed).
+    /// 이 분기를 미정의로 두면 산 소켓을 지우는 영구 장애 경로가 재현된다.
+    HeldByDaemon,
+    /// 구형 락파일(holder pid 미기재) — 데드맨 `FailClosed`와 동일한 보수 해석으로 삭제 금지.
+    UnknownHolder,
+    /// 기록된 홀더 pid가 살아있는 cysd — 삭제 금지.
+    LiveHolder(u32),
+}
+
+#[cfg(unix)]
+fn judge_orphan_socket(
+    lock_exists: bool,
+    flock_acquired: bool,
+    holder_pid: Option<u32>,
+    pid_alive: bool,
+    pid_is_cysd: bool,
+) -> OrphanVerdict {
+    if !lock_exists {
+        // 락 파일 ENOENT = 홀더 없음으로 진행. (미정의로 두면 --fix가 영구 무력해진다.)
+        return OrphanVerdict::Removable;
+    }
+    if !flock_acquired {
+        return OrphanVerdict::HeldByDaemon;
+    }
+    match holder_pid {
+        None => OrphanVerdict::UnknownHolder,
+        Some(pid) if pid_alive && pid_is_cysd => OrphanVerdict::LiveHolder(pid),
+        Some(pid) if pid_alive => OrphanVerdict::LiveHolder(pid), // 정체 불명 생존 pid = 보수적 보류
+        Some(_) => OrphanVerdict::Removable,
+    }
+}
+
 #[cfg(unix)]
 fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    use std::os::unix::io::AsRawFd;
     let sp = &ctx.socket_path;
     if !sp.exists() {
         return DiagItem {
@@ -3825,6 +3923,7 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
+    // ★블로킹 connect(타임아웃 없음)는 반드시 **락 스팬 밖**에서 — 안에서 하면 보유 상한을 깬다.
     if doctor_socket_connectable(sp) {
         return DiagItem {
             name: "socket",
@@ -3833,13 +3932,67 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
-    // 존재하나 연결 불가 = 고아 소켓.
-    if fix {
-        match std::fs::remove_file(sp) {
+    // 존재하나 연결 불가 = 고아 **후보**. 여기부터 flock 스팬 — check→unlink 전 구간을 보유해
+    // "판정 후 데몬이 부팅해 bind" TOCTOU를 봉합한다(락 핸들 drop = flock 해제이므로 조기 drop 금지).
+    let lock = sp.with_extension("lock");
+    let lock_exists = lock.exists();
+    let mut _guard: Option<std::fs::File> = None;
+    let mut flock_acquired = true;
+    if lock_exists {
+        match std::fs::OpenOptions::new().read(true).open(&lock) {
+            Ok(f) => {
+                flock_acquired =
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+                if flock_acquired {
+                    _guard = Some(f);
+                }
+            }
+            Err(e) => {
+                return DiagItem {
+                    name: "socket",
+                    status: DiagStatus::Warn,
+                    detail: format!("고아 후보 소켓 — 시작 락 열기 실패로 판정 보류: {e}"),
+                    action: "수동 확인(삭제 금지)".into(),
+                }
+            }
+        }
+    }
+    let holder_pid = if lock_exists {
+        doctor_read_holder_pid(&lock)
+    } else {
+        None
+    };
+    let (alive, is_cysd) = match holder_pid {
+        Some(p) => (doctor_pid_alive(p), doctor_pid_is_cysd(p)),
+        None => (false, false),
+    };
+    let verdict = judge_orphan_socket(lock_exists, flock_acquired, holder_pid, alive, is_cysd);
+    std::thread::sleep(doctor_lock_hold()); // 테스트 노브(기본 0) — 부팅측 재시도 흡수 검증용.
+
+    let item = match verdict {
+        OrphanVerdict::HeldByDaemon => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: "고아 후보 소켓 — 시작 락을 누군가 보유 중(데몬 부팅/보유) → 판정 보류".into(),
+            action: "삭제 금지(잠시 후 재실행)".into(),
+        },
+        OrphanVerdict::UnknownHolder => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: "고아 후보 소켓 — 락파일에 홀더 pid 미기재(구형) → 보수적 보류".into(),
+            action: "삭제 금지(수동 확인)".into(),
+        },
+        OrphanVerdict::LiveHolder(pid) => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: format!("고아 후보 소켓 — 홀더 pid {pid} 생존 → 보류"),
+            action: "삭제 금지(수동 확인)".into(),
+        },
+        OrphanVerdict::Removable if fix => match std::fs::remove_file(sp) {
             Ok(()) => DiagItem {
                 name: "socket",
                 status: DiagStatus::Ok,
-                detail: "고아 소켓 제거".into(),
+                detail: "고아 소켓 제거(홀더 부재 3중 확인)".into(),
                 action: "삭제함".into(),
             },
             Err(e) => DiagItem {
@@ -3848,15 +4001,16 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                 detail: format!("고아 소켓 제거 실패: {e}"),
                 action: "수동 삭제 필요".into(),
             },
-        }
-    } else {
-        DiagItem {
+        },
+        OrphanVerdict::Removable => DiagItem {
             name: "socket",
             status: DiagStatus::Warn,
-            detail: "고아 소켓(리스너 없음)".into(),
+            detail: "고아 소켓(리스너 없음·홀더 부재)".into(),
             action: "cys doctor --fix 로 제거".into(),
-        }
-    }
+        },
+    };
+    drop(_guard); // 여기서 flock 해제 — 판정~삭제 전 구간을 보유했다.
+    item
 }
 
 #[cfg(not(unix))]
@@ -3869,6 +4023,14 @@ fn diag_orphan_socket(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
     }
 }
 
+/// ★K4(CRITICAL): 이 진단은 **락 파일을 절대 unlink 하지 않는다**.
+///
+/// flock은 프로세스가 죽으면 커널이 자동 해제하므로 "잔여 락"이라는 개념 자체가 성립하지 않는다.
+/// 반대로 락파일을 unlink 하면 상호배제가 **영구 무효화**된다: 부팅 데몬은 unlink된 inode에 락을
+/// 잡고, 그 다음 데몬은 새로 생성된 별개 inode에 락을 잡아 둘 다 승자가 된다. 게다가 가시 락파일에
+/// holder pid가 없어져 데드맨(cysd/deadman.rs)이 영구 무장해제된다.
+/// → 기본은 **읽기 전용 보고**, `--fix`는 stale pid 문자열 truncate까지만(락 보유 중이므로 홀더
+///   부재가 확정된 상태 — 파일 자체와 inode는 보존한다).
 #[cfg(unix)]
 fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     use std::os::unix::io::AsRawFd;
@@ -3893,8 +4055,8 @@ fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             }
         }
     };
-    // 비차단 획득 시도: 획득되면 아무도 안 쥔 잔여(stale), 실패면 데몬 보유(정상). fd를 쥔 채
-    // 제거해 진단↔제거 사이 데몬 재기동 레이스를 차단한다.
+    // 비차단 획득 시도: 획득되면 아무도 안 쥔 상태, 실패면 데몬 보유(정상). fd를 쥔 채 판정·기록해
+    // 진단↔기록 사이 데몬 재기동 레이스를 차단한다.
     let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !got {
         return DiagItem {
@@ -3904,28 +4066,35 @@ fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
-    let item = if fix {
-        match std::fs::remove_file(&lock) {
+    std::thread::sleep(doctor_lock_hold()); // 테스트 노브(기본 0).
+    let stale_pid = doctor_read_holder_pid(&lock);
+    let item = match (stale_pid, fix) {
+        (None, _) => DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Ok,
+            detail: "시작 락 유휴(홀더 없음·기록된 pid 없음)".into(),
+            action: String::new(),
+        },
+        (Some(pid), false) => DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Warn,
+            detail: format!("시작 락 유휴이나 stale holder pid {pid} 기록 잔존"),
+            action: "cys doctor --fix 로 pid 표기만 정리(락 파일은 보존)".into(),
+        },
+        (Some(pid), true) => match f.set_len(0) {
             Ok(()) => DiagItem {
                 name: "startup-lock",
                 status: DiagStatus::Ok,
-                detail: "잔여 시작 락 제거".into(),
-                action: "삭제함".into(),
+                detail: format!("stale holder pid {pid} 표기 정리(락 파일·inode 보존)"),
+                action: "pid 표기 truncate".into(),
             },
             Err(e) => DiagItem {
                 name: "startup-lock",
                 status: DiagStatus::Warn,
-                detail: format!("잔여 락 제거 실패: {e}"),
-                action: "수동 삭제".into(),
+                detail: format!("stale pid 표기 정리 실패: {e}"),
+                action: "수동 확인(락 파일 삭제 금지)".into(),
             },
-        }
-    } else {
-        DiagItem {
-            name: "startup-lock",
-            status: DiagStatus::Warn,
-            detail: "잔여 시작 락(아무도 미보유)".into(),
-            action: "cys doctor --fix 로 제거".into(),
-        }
+        },
     };
     unsafe {
         libc::flock(f.as_raw_fd(), libc::LOCK_UN);

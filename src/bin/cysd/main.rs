@@ -411,6 +411,21 @@ fn acquire_startup_lock(
         return Some(file);
     }
 
+    // ★WS-7: try_flock 실패는 곧바로 데드맨 판정으로 넘기지 않고 **지수 백오프+지터로 재시도**한다.
+    // 근거: `cys doctor`가 진단 스팬 동안 같은 락을 순간 보유한다(cys.rs diag_orphan_socket·
+    // diag_stale_lock). 재시도가 없으면 그 순간 부팅한 데몬이 홀더를 dead로 오판→회수 실패→
+    // `dead-holder-reclaim-failed` **오사유로 exit(1)** 하고, 30회당 1줄 로그 억제(deadman.rs:197)와
+    // launchd 10s 재기동이 겹쳐 **무로그 crashloop**이 된다.
+    // ★적용 범위 엄수: 재시도는 **try_flock에만** 붙인다. judge_holder의 입력(holder_pid·responded·
+    // hb_stale)과 진리표는 무접촉이다 — 데드맨 계약(X5·X6)을 침범하지 않는다.
+    for backoff in lock_retry_schedule() {
+        std::thread::sleep(jittered(backoff));
+        if try_flock(&file) {
+            deadman::claim_lock(&mut file, state_dir);
+            return Some(file);
+        }
+    }
+
     // 경합: 현재 홀더 상태 진단(pid·소켓 응답·heartbeat 신선도) → 판정.
     let holder_pid = deadman::read_holder_pid(lock_path);
     let responded = deadman::probe_holder(socket_path, deadman::PROBE_TIMEOUT);
@@ -442,6 +457,45 @@ fn acquire_startup_lock(
             std::process::exit(1);
         }
     }
+}
+
+/// startup flock 재시도 백오프 스케줄(순수 — 테스트 가능). 기본 50→100→200→400→800ms(총 1550ms).
+/// 총 예산이 1초를 넘어야 doctor의 순간 보유(진단 2건 연속 + 테스트 노브)를 흡수한다.
+/// `CYS_LOCK_RETRY_MS`로 총 예산을 주입할 수 있다(테스트 결정론용 — 0이면 재시도 없음).
+fn lock_retry_schedule() -> Vec<std::time::Duration> {
+    schedule_for_budget(
+        std::env::var("CYS_LOCK_RETRY_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1550),
+    )
+}
+
+fn schedule_for_budget(budget_ms: u64) -> Vec<std::time::Duration> {
+    let mut out = Vec::new();
+    let (mut used, mut step) = (0u64, 50u64);
+    while used < budget_ms {
+        let d = step.min(budget_ms - used);
+        out.push(std::time::Duration::from_millis(d));
+        used += d;
+        step = (step * 2).min(800);
+    }
+    out
+}
+
+/// 백오프에 ±20% 지터 — 여러 데몬이 동시에 재시도해 같은 순간에 몰리는 thundering herd를 흩는다.
+/// 신규 크레이트 금지 계약을 지키려 시스템 시각 나노초를 엔트로피로 쓴다(공정성 요구 없음).
+fn jittered(d: std::time::Duration) -> std::time::Duration {
+    let ms = d.as_millis() as u64;
+    if ms < 5 {
+        return d;
+    }
+    let span = ms / 5;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|x| x.subsec_nanos() as u64)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(ms + (nanos % (2 * span + 1)) - span)
 }
 
 /// ★W3 crashloop 로그 dedupe — 동일 사유 연속 패배는 N회당 1줄만(누적 카운트 병기).
