@@ -4,9 +4,9 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -70,6 +70,8 @@ struct ManagedRuntime {
     /// evict 시 종료 계약용 control 파이프. 워처 스레드와 공유 보유하며,
     /// `take()` → drop(EOF)로 supervisor를 정상 종료 경로에 태운다.
     control: Arc<Mutex<Option<ChildStdin>>>,
+    /// post-readiness 사망 사인 채집기(워처 스레드와 공유).
+    stderr: Arc<StderrTap>,
 }
 
 impl RealSupervisorLauncher {
@@ -167,6 +169,153 @@ fn terminate_evicted_runtime(runtime: &ManagedRuntime, reason: &str) {
         "cys-browserd: evicted managed runtime instance={} generation={} reason={reason} control_closed={closed}",
         runtime.state.instance_id, runtime.state.engine_generation
     );
+}
+
+/// supervisor stderr 링버퍼 상한. 다중 라인을 보존해 "필터를 통과하는 마지막 완결 라인"을
+/// 뽑을 수 있어야 한다(자기유발 라인 하나에 진짜 사인이 밀려나면 안 된다).
+const STDERR_TAP_CAPACITY: usize = 8 * 1024;
+/// tap 스레드가 EOF에 도달했음을 기다리는 **유계** 상한. 무한 join은 금지다
+/// (ensure 경로의 broker Mutex 안에서 데드락을 만든다).
+const STDERR_TAP_EOF_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+/// 우리가 control 파이프를 닫아서 supervisor가 내는 소리는 사인이 아니다.
+/// (`supervisor/main.rs:64-66`, `SupervisorError` Display = `{code}: {message}`)
+const SELF_INFLICTED_SIGNS: [&str; 4] = [
+    "broker liveness pipe closed",
+    "broker liveness pipe failed",
+    "unexpected command on startup-only broker channel",
+    "AUTHORITY_REJECTED: broker liveness",
+];
+
+/// supervisor stderr를 논블로킹으로 채집하는 링버퍼. 스레드는 detach이며
+/// supervisor stderr의 EOF(= supervisor 사망)로 스스로 끝난다.
+struct StderrTap {
+    ring: Mutex<VecDeque<u8>>,
+    rolled: AtomicBool,
+    eof: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl StderrTap {
+    fn spawn(stderr: Option<ChildStderr>) -> Arc<Self> {
+        let (eof_tx, eof_rx) = std::sync::mpsc::sync_channel(1);
+        let tap = Arc::new(Self {
+            ring: Mutex::new(VecDeque::new()),
+            rolled: AtomicBool::new(false),
+            eof: Mutex::new(stderr.as_ref().map(|_| eof_rx)),
+        });
+        let Some(mut stderr) = stderr else {
+            return tap;
+        };
+        let sink = tap.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => sink.push(&buffer[..count]),
+                }
+            }
+            let _ = eof_tx.send(());
+        });
+        tap
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut ring = self.ring.lock().unwrap();
+        ring.extend(bytes.iter().copied());
+        while ring.len() > STDERR_TAP_CAPACITY {
+            ring.pop_front();
+            self.rolled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// EOF 신호를 **유계**로 기다린다. 데이터가 커널 파이프에 있으나 tap 스레드가 아직
+    /// 스케줄되지 않은 창 때문에, 이 대기 없이는 가장 흔한 즉사 실패에서 사인이 확률적으로 빈다.
+    fn await_eof(&self, timeout: std::time::Duration) -> bool {
+        let mut slot = self.eof.lock().unwrap();
+        match slot.as_ref() {
+            None => true,
+            Some(receiver) => {
+                let reached = receiver.recv_timeout(timeout).is_ok();
+                if reached {
+                    *slot = None;
+                }
+                reached
+            }
+        }
+    }
+
+    /// "필터를 통과하는 마지막 완결 라인"(filter-then-last). 순서를 뒤집으면
+    /// 자기유발 라인이 마지막일 때 진짜 사인까지 함께 소실된다.
+    fn last_sign(&self) -> Option<String> {
+        let bytes: Vec<u8> = self.ring.lock().unwrap().iter().copied().collect();
+        let text = String::from_utf8_lossy(&bytes);
+        // 완결 라인만 본다: 마지막 개행 이후의 조각은 아직 끝나지 않은 라인이다.
+        let complete = match text.rfind('\n') {
+            Some(index) => &text[..index],
+            None => return None,
+        };
+        let mut lines: Vec<&str> = complete.lines().collect();
+        if self.rolled.load(Ordering::SeqCst) && !lines.is_empty() {
+            // 링이 굴렀다면 첫 라인은 앞이 잘렸을 수 있다.
+            lines.remove(0);
+        }
+        lines
+            .into_iter()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !is_self_inflicted_sign(line))
+            .map(normalize_sign)
+            .next_back()
+    }
+
+    /// 사망 사인 채집: EOF 유계 대기 후 추출.
+    fn death_sign(&self) -> Option<String> {
+        self.await_eof(STDERR_TAP_EOF_WAIT);
+        self.last_sign()
+    }
+}
+
+fn is_self_inflicted_sign(line: &str) -> bool {
+    SELF_INFLICTED_SIGNS
+        .iter()
+        .any(|marker| line.contains(marker))
+}
+
+/// `cys-browserd: ` 접두는 **로그 전용**이다 — 배너 message에서는 제거한다(120자 절단 대응).
+fn normalize_sign(line: &str) -> String {
+    line.strip_prefix("cys-browserd: ")
+        .unwrap_or(line)
+        .trim()
+        .to_string()
+}
+
+/// 자기유발 SIGKILL(우리 격상)은 사인이 아니므로 표시하지 않는다.
+fn exit_annotation(status: Option<ExitStatus>) -> Option<String> {
+    let status = status?;
+    if let Some(code) = status.code() {
+        return Some(format!("exit {code}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        return match status.signal() {
+            Some(9) | None => None,
+            Some(signal) => Some(format!("signal {signal}")),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// 배너는 120자에서 절단되므로 **사인을 선두**에 둔다. 산문 해설은 넣지 않는다.
+fn supervisor_death_message(sign: Option<String>, status: Option<ExitStatus>) -> String {
+    match (sign, exit_annotation(status)) {
+        (Some(sign), Some(exit)) => format!("{sign} ({exit})"),
+        (Some(sign), None) => sign,
+        (None, Some(exit)) => format!("supervisor left no stderr sign ({exit})"),
+        (None, None) => "supervisor left no stderr sign".to_string(),
+    }
 }
 
 /// 일시/치명 분리 판정. 일시 실패는 연속 카운터를 올리고 한계 도달 시에만 evict를 지시한다.
@@ -289,8 +438,11 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             .env_remove("PATH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // 사인 채집: stderr를 버리면 실패 원인이 침묵 속에 소멸한다(진단 블랙홀).
+            // `.env_remove("PATH")`는 보안 봉인이므로 불가침이다.
+            .stderr(Stdio::piped());
         let mut child = spawn_supervisor_cancellable(&mut command, &request.cancellation)?;
+        let stderr_tap = StderrTap::spawn(child.stderr.take());
         let mut control = child.stdin.take().ok_or_else(|| {
             BrokerFailure::new(
                 "RUNTIME_START_FAILED",
@@ -314,11 +466,12 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             .and_then(|_| control.flush());
         if let Err(error) = write_result {
             let mut control = Some(control);
-            terminate_supervisor(&mut child, &mut control, HANDSHAKE_TERMINATION_GRACE);
-            return Err(BrokerFailure::new(
-                "RUNTIME_START_FAILED",
-                format!("private broker handshake failed: {error}"),
-            ));
+            let status = terminate_supervisor(&mut child, &mut control, HANDSHAKE_TERMINATION_GRACE);
+            let message = match stderr_tap.death_sign() {
+                Some(sign) => supervisor_death_message(Some(sign), status),
+                None => format!("private broker handshake failed: {error}"),
+            };
+            return Err(BrokerFailure::new("RUNTIME_START_FAILED", message));
         }
         // 핸드셰이크가 끝난 시점부터 control은 종료기·워처가 공유하는 자원이다.
         let mut control = Some(control);
@@ -354,11 +507,20 @@ impl SupervisorLauncher for RealSupervisorLauncher {
                     }
                 }
             }
-            _ => {
-                terminate_supervisor(&mut child, &mut control, POST_READINESS_TERMINATION_GRACE);
+            (0, _) => {
+                // supervisor가 readiness 프레임 없이 죽었다 — 가장 흔한 즉사 실패다.
+                let status =
+                    terminate_supervisor(&mut child, &mut control, PRE_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
-                    "RUNTIME_START_FAILED",
-                    "supervisor readiness timed out or returned an invalid frame",
+                    "SUPERVISOR_EXIT_PRE_READY",
+                    supervisor_death_message(stderr_tap.death_sign(), status),
+                ));
+            }
+            _ => {
+                terminate_supervisor(&mut child, &mut control, PRE_READINESS_TERMINATION_GRACE);
+                return Err(BrokerFailure::new(
+                    "SUPERVISOR_READINESS_OVERFLOW",
+                    "supervisor readiness frame exceeded 64 KiB",
                 ));
             }
         };
@@ -407,6 +569,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             alive: alive.clone(),
             transient_failures: Arc::new(AtomicU32::new(0)),
             control: control.clone(),
+            stderr: stderr_tap.clone(),
         };
         if let Err(error) = self.commit_managed_runtime(managed_runtime, &request.cancellation) {
             let mut owned = control.lock().unwrap().take();
@@ -420,8 +583,14 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         std::thread::spawn(move || {
             // 워처가 Arc를 함께 보유해 성공 커밋 후 control 파이프 수명을 유지한다.
             let _control_liveness = control;
-            let _ = child.wait();
+            let status = child.wait().ok();
             watcher_alive.store(false, Ordering::SeqCst);
+            // post-readiness 사망의 사인 소비처 — 이게 없으면 정상 운영에서 더 흔한
+            // 엔진 크래시류의 원인이 여전히 0이다.
+            eprintln!(
+                "cys-browserd: managed runtime exited instance={instance_id} generation={engine_generation} {}",
+                supervisor_death_message(stderr_tap.death_sign(), status)
+            );
             remove_managed_incarnation(&managed, &instance_id, engine_generation, &watcher_alive);
         });
         Ok(state)
@@ -451,9 +620,13 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         }
         if !runtime.alive.load(Ordering::SeqCst) {
             self.evict_managed_runtime(&runtime, "managed runtime exited");
+            // 죽은 런타임의 사인을 호출자에게도 전달한다(사인 우선 형식).
             return Err(BrokerFailure::new(
                 "ENGINE_EXITED",
-                "managed runtime exited",
+                match runtime.stderr.last_sign() {
+                    Some(sign) => sign,
+                    None => "managed runtime exited".to_string(),
+                },
             ));
         }
         if process_start_time(state.supervisor_pid) != Some(runtime.supervisor_started_at)
@@ -634,7 +807,7 @@ fn wait_for_supervisor_readiness(
         if std::time::Instant::now() >= deadline {
             terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
             return Err(BrokerFailure::new(
-                "RUNTIME_START_FAILED",
+                "SUPERVISOR_READINESS_TIMEOUT",
                 "supervisor readiness timed out",
             ));
         }
@@ -647,14 +820,9 @@ fn wait_for_supervisor_readiness(
                     format!("supervisor readiness read failed: {error}"),
                 ));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if child.try_wait().ok().flatten().is_some() {
-                    return Err(BrokerFailure::new(
-                        "RUNTIME_START_FAILED",
-                        "supervisor exited before readiness",
-                    ));
-                }
-            }
+            // try_wait 기반 "exited before readiness" 분기는 삭제했다(부활 금지):
+            // 자식이 죽으면 stdout EOF로 read_line이 0을 반환해 (0, _) 분기가 받는다.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 terminate_supervisor(child, control, PRE_READINESS_TERMINATION_GRACE);
                 return Err(BrokerFailure::new(
@@ -985,6 +1153,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(true)),
             transient_failures: Arc::new(AtomicU32::new(0)),
             control: Arc::new(Mutex::new(control)),
+            stderr: StderrTap::spawn(None),
         }
     }
 
@@ -1125,6 +1294,7 @@ mod tests {
                     alive: Arc::new(AtomicBool::new(false)),
                     transient_failures: Arc::new(AtomicU32::new(0)),
                     control: Arc::new(Mutex::new(None)),
+                    stderr: StderrTap::spawn(None),
                 },
             );
             launcher.prune_dead_managed();
@@ -1155,6 +1325,7 @@ mod tests {
                 alive: old_alive.clone(),
                 transient_failures: Arc::new(AtomicU32::new(0)),
                 control: Arc::new(Mutex::new(None)),
+                stderr: StderrTap::spawn(None),
             },
         );
         let replacement_alive = Arc::new(AtomicBool::new(true));
@@ -1172,6 +1343,7 @@ mod tests {
                 alive: replacement_alive.clone(),
                 transient_failures: Arc::new(AtomicU32::new(0)),
                 control: Arc::new(Mutex::new(None)),
+                stderr: StderrTap::spawn(None),
             },
         );
 
@@ -1200,6 +1372,7 @@ mod tests {
             alive: old_alive,
             transient_failures: Arc::new(AtomicU32::new(0)),
             control: Arc::new(Mutex::new(None)),
+            stderr: StderrTap::spawn(None),
         };
         let replacement_alive = Arc::new(AtomicBool::new(true));
         let mut replacement_state = state_for(4);
@@ -1216,6 +1389,7 @@ mod tests {
                 alive: replacement_alive.clone(),
                 transient_failures: Arc::new(AtomicU32::new(0)),
                 control: Arc::new(Mutex::new(None)),
+                stderr: StderrTap::spawn(None),
             },
         );
 
@@ -1240,6 +1414,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(true)),
             transient_failures: Arc::new(AtomicU32::new(0)),
             control: Arc::new(Mutex::new(None)),
+            stderr: StderrTap::spawn(None),
         };
 
         let error = launcher
@@ -1509,6 +1684,151 @@ mod tests {
             status.signal(),
             Some(9),
             "a child that ignores EOF must be escalated to SIGKILL"
+        );
+    }
+
+    /// 가짜 supervisor 픽스처: stderr를 tap으로 채집하고 종료까지 회수한 뒤
+    /// (사인, 종료 상태)를 돌려준다 — 생산 경로와 동일한 순서다.
+    #[cfg(unix)]
+    fn tapped_fixture(script: &str) -> (Option<String>, Option<ExitStatus>) {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fixture supervisor");
+        let tap = StderrTap::spawn(child.stderr.take());
+        let mut control = child.stdin.take();
+        let status = terminate_supervisor(
+            &mut child,
+            &mut control,
+            std::time::Duration::from_millis(1500),
+        );
+        (tap.death_sign(), status)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_immediate_death_is_classified_with_its_exit_status() {
+        let (sign, status) = tapped_fixture("exit 70");
+
+        assert_eq!(sign, None);
+        assert_eq!(status.and_then(|status| status.code()), Some(70));
+        assert_eq!(
+            supervisor_death_message(sign, status),
+            "supervisor left no stderr sign (exit 70)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_sign_leads_the_message_and_fits_the_banner() {
+        let (sign, status) = tapped_fixture(
+            "echo 'cys-browserd: RUNTIME_ALREADY_RUNNING: another supervisor owns this EngineKey lock' >&2; exit 70",
+        );
+
+        let message = supervisor_death_message(sign, status);
+        assert_eq!(
+            message,
+            "RUNTIME_ALREADY_RUNNING: another supervisor owns this EngineKey lock (exit 70)"
+        );
+        assert!(
+            message.len() <= 120,
+            "the sign must survive the 120-char banner truncation"
+        );
+        assert!(
+            !message.contains("cys-browserd: "),
+            "the log-only prefix must not enter the banner message"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_living_supervisor_never_blocks_the_sign_snapshot() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 </dev/null")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("slow supervisor");
+        let tap = StderrTap::spawn(child.stderr.take());
+
+        let started = std::time::Instant::now();
+        let sign = tap.death_sign();
+        let elapsed = started.elapsed();
+
+        assert_eq!(sign, None);
+        assert!(
+            elapsed < std::time::Duration::from_millis(600),
+            "the EOF wait must be bounded, not an unbounded join (took {elapsed:?})"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_stderr_keeps_the_last_complete_line() {
+        let (sign, _) = tapped_fixture(
+            "i=0; while [ $i -lt 400 ]; do printf 'noise %s aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i >&2; i=$((i+1)); done; echo 'ENGINE_EXITED: engine exited: signal 11' >&2; exit 70",
+        );
+
+        assert_eq!(
+            sign.as_deref(),
+            Some("ENGINE_EXITED: engine exited: signal 11")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_inflicted_liveness_lines_are_not_mistaken_for_a_sign() {
+        let (sign, _) = tapped_fixture(
+            "echo 'cys-browserd: ENGINE_EXITED: engine exited: signal 11' >&2; \
+             echo 'cys-browserd: AUTHORITY_REJECTED: broker liveness pipe closed' >&2; exit 77",
+        );
+
+        assert_eq!(
+            sign.as_deref(),
+            Some("ENGINE_EXITED: engine exited: signal 11"),
+            "filter-then-last: our own pipe close must not bury the real sign"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_trailing_line_is_not_reported_as_a_sign() {
+        let (sign, _) = tapped_fixture("printf 'partial line without newline' >&2; exit 1");
+
+        assert_eq!(sign, None, "only complete lines are signs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_eof_synchronisation_collects_the_sign_every_time() {
+        for iteration in 0..100 {
+            let (sign, status) = tapped_fixture("echo 'RUNTIME_START_FAILED: boom' >&2; exit 3");
+            assert_eq!(
+                sign.as_deref(),
+                Some("RUNTIME_START_FAILED: boom"),
+                "sign collection must be deterministic (iteration {iteration})"
+            );
+            assert_eq!(status.and_then(|status| status.code()), Some(3));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_inflicted_sigkill_is_suppressed_from_the_message() {
+        use std::os::unix::process::ExitStatusExt;
+        let killed = ExitStatus::from_raw(9);
+        assert_eq!(exit_annotation(Some(killed)), None);
+        assert_eq!(
+            supervisor_death_message(Some("SOME_SIGN: detail".into()), Some(killed)),
+            "SOME_SIGN: detail"
         );
     }
 
