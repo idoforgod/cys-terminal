@@ -97,6 +97,22 @@ const BROKER_REGISTRATION_LOST_MARKER: &str = "no broker-owned registration";
 /// `gui_branch_codes_exist_in_broker_source` 트립와이어가 컴파일 시점 임베드로 보장한다.
 const GUI_NOT_REGISTERED_CODE: &str = "GUI_NOT_REGISTERED";
 const GUI_IDENTITY_MISMATCH_CODE: &str = "GUI_IDENTITY_MISMATCH";
+/// 브로커가 만료·미발급·기소비를 한 code로 묶어 보내는 등록 challenge 거부 사인.
+const GUI_REGISTRATION_REPLAY_CODE: &str = "GUI_REGISTRATION_REPLAY";
+/// **만료 전용 code(정공법)** — 아직 브로커에 없다. 브로커 담당 워커가 만료 분기를 이 code로
+/// 분리하면 GUI는 아래 문자열 폴백을 지우고 곧바로 이 상수만 보면 된다(이관 지점을 미리 고정).
+const GUI_CHALLENGE_EXPIRED_CODE: &str = "GUI_CHALLENGE_EXPIRED";
+/// ★임시 조치(한계 명시): 브로커는 만료를 `GUI_REGISTRATION_REPLAY` 하나로 뭉쳐 보내고 사유만
+/// message 괄호에 부기한다(authority_broker/mod.rs `(사유: 만료)`). 만료는 "틀렸다"가 아니라
+/// "느렸다"이므로 **재발급→재등록이 정답인 회복 가능 조건**인데, code만 보면 미발급·기소비와
+/// 구별할 수 없어 자가회복 분기를 못 탄다. 그래서 당분간 message 부분열로 만료를 식별한다.
+///
+/// 한계(정직한 기록): ①message는 계약이 아니다 — 브로커가 문구를 손보면 이 분기는 **무증상으로
+/// 죽는다**(`expiry_marker_exists_in_broker_source` 트립와이어가 컴파일 시점 임베드로 그것만 막는다).
+/// ②한국어 리터럴 의존이라 로케일·번역 도입 시 즉시 파손. ③미발급·기소비는 여전히 회복 대상이
+/// 아니다(재시도해도 같은 실패 — 의도된 보수성).
+/// → 근본 수리는 브로커측 `GUI_CHALLENGE_EXPIRED` 신설이다(**브로커 담당 워커 조치 필요**).
+const BROKER_CHALLENGE_EXPIRED_MARKER: &str = "(사유: 만료)";
 /// 데몬 응답이 아예 없는 전송 계층 실패(연결 끊김·직렬화) — 데몬 code가 존재하지 않는 경우.
 const RPC_TRANSPORT_FAILED_CODE: &str = "RPC_TRANSPORT_FAILED";
 /// 데몬이 error.code 없이 message만 준 경우(구 데몬 스큐) — 배너 형식을 깨지 않기 위한 자리표.
@@ -267,9 +283,52 @@ fn browser_session_params(mut params: Value) -> Result<Value, String> {
     Ok(params)
 }
 
+/// GUI peer 등록의 **단일 비행(single-flight) 게이트**. 부트 재시도 태스크와 클릭 경로가 동시에
+/// 등록을 시도할 수 있는데, `GUI_ALREADY_REGISTERED` 폐기(WS-4)로 두 번째 등록이 이제 **교체**로
+/// 성공한다 — 즉 늦게 도착한 등록이 살아있는 세션 S1을 S2로 갈아치우고, 그 사이 날아간 RPC가
+/// `GUI_IDENTITY_MISMATCH`를 맞는다(종전 c232a1e에서는 두 번째가 거부돼 S1이 보존됐다).
+/// 이 뮤텍스가 등록을 직렬화하고, 아래 `ensure_browser_gui_peer`가 "이미 세션이 있으면 손대지
+/// 않는다"를 강제해 그 창을 닫는다.
+static GUI_REGISTRATION_FLIGHT: std::sync::OnceLock<tauri::async_runtime::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn gui_registration_flight() -> &'static tauri::async_runtime::Mutex<()> {
+    GUI_REGISTRATION_FLIGHT.get_or_init(|| tauri::async_runtime::Mutex::new(()))
+}
+
+/// **살아있는 세션은 절대 교체하지 않는** 등록 진입점. 세션이 없을 때만 실제 등록을 수행한다.
+/// 부트 재시도·클릭 지연등록·세션 소실 회복 — 모든 경로가 이걸 쓴다. 강제 재등록이 필요한 곳은
+/// 먼저 `BROWSER_APP_SESSION`을 None으로 비운 뒤 호출한다(= 자기 세션을 스스로 무효화한 경우만).
+async fn ensure_browser_gui_peer() -> Result<(), RpcFailure> {
+    let _flight = gui_registration_flight().lock().await;
+    // 비행 대기 중 다른 경로가 등록을 마쳤을 수 있다 — 락 **획득 후** 재확인이 핵심이다
+    // (획득 전 확인만 하면 두 태스크가 나란히 통과해 교체 경합이 그대로 남는다).
+    if BROWSER_APP_SESSION.read().unwrap().is_some() {
+        return Ok(());
+    }
+    register_browser_gui_peer().await
+}
+
 /// 등록 체인도 code 보존형(`rpc_on_full`) — `GUI_REGISTRATION_LIMIT`·`GUI_IDENTITY_REJECTED`·
 /// `GUI_REGISTRATION_REPLAY`가 message만 남고 소멸하면 등록 실패 진단이 반쪽이 된다(WS-1).
+///
+/// 만료(`is_challenge_expired`)는 **1회만** 재발급→재등록한다: challenge 발급과 소비 사이에 부팅
+/// 부하가 끼면 TTL을 넘길 수 있는데, 그건 "느렸다"이지 "틀렸다"가 아니라 재시도가 정답이다.
+/// 두 번째 만료는 그대로 실패시킨다(무한루프 금지 — 재시도 예산은 정확히 1회).
 async fn register_browser_gui_peer() -> Result<(), RpcFailure> {
+    match register_browser_gui_peer_once().await {
+        Err(failure) if failure.is_challenge_expired() => {
+            eprintln!(
+                "[cys-app] Browser GUI registration challenge expired ([{}] {}) — 재발급 후 1회 재시도",
+                failure.code, failure.message
+            );
+            register_browser_gui_peer_once().await
+        }
+        other => other,
+    }
+}
+
+async fn register_browser_gui_peer_once() -> Result<(), RpcFailure> {
     let challenge = rpc_coded("browser.runtime.gui_challenge", json!({})).await?;
     let registration_secret = challenge["registration_challenge"]
         .as_str()
@@ -443,7 +502,17 @@ impl RpcFailure {
     fn is_gui_registration_lost(&self) -> bool {
         self.code == GUI_NOT_REGISTERED_CODE
             || self.code == GUI_IDENTITY_MISMATCH_CODE
+            || self.is_challenge_expired()
             || self.message.contains(BROKER_REGISTRATION_LOST_MARKER)
+    }
+
+    /// 등록 challenge가 **만료**되어 거부됐는가 — 재발급→재등록으로 회복 가능한 유일한 replay 사유.
+    /// code 우선(브로커가 전용 code를 내면 그것만 보고), 그 전까지는 message 부분열 폴백이다
+    /// (한계는 `BROKER_CHALLENGE_EXPIRED_MARKER` 주석 참조).
+    fn is_challenge_expired(&self) -> bool {
+        self.code == GUI_CHALLENGE_EXPIRED_CODE
+            || (self.code == GUI_REGISTRATION_REPLAY_CODE
+                && self.message.contains(BROKER_CHALLENGE_EXPIRED_MARKER))
     }
 }
 
@@ -1118,11 +1187,10 @@ async fn ensure_browserd_cast(
         })?;
     // 지연 재시도(fail-closed는 유지, 무한루프 없음): 부팅 시 1회 등록이 데몬 교체·부팅 경합으로
     // 실패해 세션이 비어 있으면, 신뢰된 클릭 소모 직후 여기서 등록한다. 이미 등록됐으면 통과.
-    if BROWSER_APP_SESSION.read().unwrap().is_none() {
-        register_browser_gui_peer()
-            .await
-            .map_err(|failure| failure.banner())?;
-    }
+    // ★ensure로 위임 — 부트 재시도 태스크와 이 클릭이 겹칠 때 살아있는 세션을 교체하지 않는다.
+    ensure_browser_gui_peer()
+        .await
+        .map_err(|failure| failure.banner())?;
     let issue_params = browser_session_params(json!({
         "window_label":window.label(),
         "pane_nonce":pane_nonce,
@@ -1136,8 +1204,11 @@ async fn ensure_browserd_cast(
         // (is_gui_registration_lost). identity mismatch는 종전 marker 매칭에 걸리지 않아 클릭 1회를
         // 통째로 잃었다(브로커가 대장에서 세션을 제거한 직후라 재등록이 정확한 처방이다).
         Err(failure) if failure.is_gui_registration_lost() => {
+            // 자기 세션이 브로커에서 무효해졌음을 확인한 경로다 — 여기서만 세션을 비우고(강제
+            // 재등록의 전제) ensure를 부른다. 같은 순간 다른 경로가 이미 새 세션을 만들었다면
+            // ensure가 그것을 재사용한다(교체 금지).
             *BROWSER_APP_SESSION.write().unwrap() = None;
-            register_browser_gui_peer()
+            ensure_browser_gui_peer()
                 .await
                 .map_err(|failure| failure.banner())?;
             let retry_params = browser_session_params(json!({
@@ -4076,7 +4147,7 @@ fn main() {
                 // 세션 없이 부팅했다(첫 클릭이 통째로 지연 재등록에 소모 — 실패하면 그대로 죽음).
                 // 재시도는 **부트 임계 경로 밖**에서만 한다 — spawn으로 떼어내 daemon-ready·
                 // event-forwarder·온보딩을 45초간 막지 않는다.
-                if let Err(failure) = register_browser_gui_peer().await {
+                if let Err(failure) = ensure_browser_gui_peer().await {
                     eprintln!(
                         "[cys-app] Browser GUI registration failed closed: [{}] {} — 15s 간격 3회 재시도",
                         failure.code, failure.message
@@ -4086,7 +4157,19 @@ fn main() {
                         let mut last = failure;
                         for attempt in 1..=3u32 {
                             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                            match register_browser_gui_peer().await {
+                            // ★조기 종료(이 브랜치가 신설한 경합의 봉합): 15s 잠든 사이 클릭 경로가
+                            // 이미 등록을 마쳤을 수 있다. `GUI_ALREADY_REGISTERED` 폐기(WS-4) 이후
+                            // 두 번째 등록은 거부가 아니라 **교체**라, 그대로 재시도하면 살아있는
+                            // 세션 S1을 S2로 갈아치워 in-flight RPC가 GUI_IDENTITY_MISMATCH를 맞는다.
+                            // (ensure 안에도 같은 확인이 있지만 여기서 먼저 끊어 남은 재시도 예산과
+                            //  최종 실패 배너까지 함께 소멸시킨다 — 성공했는데 배너가 뜨는 모순 방지.)
+                            if BROWSER_APP_SESSION.read().unwrap().is_some() {
+                                eprintln!(
+                                    "[cys-app] Browser GUI registration already recovered elsewhere — 부트 재시도 {attempt}/3 종료"
+                                );
+                                return;
+                            }
+                            match ensure_browser_gui_peer().await {
                                 Ok(()) => {
                                     eprintln!(
                                         "[cys-app] Browser GUI registration recovered on retry {attempt}/3"
@@ -5194,6 +5277,73 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             message: "supervisor exited before ready".into(),
         };
         assert!(!unrelated.is_gui_registration_lost());
+    }
+
+    /// 만료 challenge 자가회복 구멍의 회귀 핀. 브로커가 만료를 `GUI_IDENTITY_MISMATCH`에서
+    /// `GUI_REGISTRATION_REPLAY`로 재분류하면서 GUI 회복 분기가 끊겼다 — 만료는 "느렸다"이지
+    /// "틀렸다"가 아니라 재발급·재등록이 정답인데 그 경로를 못 탔다.
+    #[test]
+    fn expired_challenge_is_recoverable_but_replay_is_not() {
+        let expired = RpcFailure {
+            code: GUI_REGISTRATION_REPLAY_CODE.to_string(),
+            message:
+                "GUI registration challenge is unknown or already consumed (사유: 만료)".into(),
+        };
+        assert!(expired.is_challenge_expired(), "만료 식별");
+        assert!(
+            expired.is_gui_registration_lost(),
+            "만료는 재시도로 회복 가능 — 회복 대상에 포함돼야 한다"
+        );
+
+        // 미발급·기소비는 같은 code지만 회복 불가(재시도해도 같은 실패) — 오발동 금지.
+        let consumed = RpcFailure {
+            code: GUI_REGISTRATION_REPLAY_CODE.to_string(),
+            message: "GUI registration challenge is unknown or already consumed (사유: 미발급 또는 기소비)"
+                .into(),
+        };
+        assert!(!consumed.is_challenge_expired());
+        assert!(!consumed.is_gui_registration_lost());
+
+        // 브로커가 전용 code를 신설하면(정공법) 문자열 없이도 곧바로 잡혀야 한다.
+        let coded = RpcFailure {
+            code: GUI_CHALLENGE_EXPIRED_CODE.to_string(),
+            message: "whatever the broker writes".into(),
+        };
+        assert!(coded.is_challenge_expired());
+        assert!(coded.is_gui_registration_lost());
+    }
+
+    /// 임시 조치(message 부분열 식별)의 유일한 안전장치 — 브로커가 만료 문구를 손대면 이 분기는
+    /// 무증상으로 죽는다. 컴파일 시점 임베드로 그 순간을 red로 만든다.
+    /// (브로커가 `GUI_CHALLENGE_EXPIRED` 전용 code를 신설하면 이 테스트와 마커를 함께 폐기한다.)
+    #[test]
+    fn expiry_marker_exists_in_broker_source() {
+        let broker_src = include_str!("../../src/bin/cysd/authority_broker/mod.rs");
+        assert!(
+            broker_src.contains(BROKER_CHALLENGE_EXPIRED_MARKER),
+            "브로커 소스에 만료 마커 {BROKER_CHALLENGE_EXPIRED_MARKER} 가 없다 — \
+             GUI 만료 자가회복 분기가 죽었다(브로커측 전용 code 신설로 이관했다면 이 테스트도 폐기)"
+        );
+        assert!(
+            broker_src.contains(&format!("\"{GUI_REGISTRATION_REPLAY_CODE}\"")),
+            "브로커 소스에 {GUI_REGISTRATION_REPLAY_CODE} 가 없다 — code 개명·삭제 의심"
+        );
+    }
+
+    /// ★4-1 회귀 핀: **재등록이 살아있는 세션을 무효화하지 않는다**.
+    /// `GUI_ALREADY_REGISTERED` 폐기(WS-4)로 두 번째 등록이 거부가 아니라 교체가 됐다 — 부트
+    /// 재시도와 클릭 경로가 겹치면 S1이 S2로 갈아치워져 in-flight RPC가 GUI_IDENTITY_MISMATCH를
+    /// 맞는다. `ensure_browser_gui_peer`는 살아있는 세션을 보면 **RPC 자체를 하지 않는다**.
+    /// (가드를 지우면: 데몬 부재 시 Err로, 데몬 존재 시 세션 교체로 — 어느 쪽이든 red가 된다.)
+    #[test]
+    fn ensure_does_not_replace_a_live_session() {
+        let live = "a".repeat(64);
+        *BROWSER_APP_SESSION.write().unwrap() = Some(live.clone());
+        let result = tauri::async_runtime::block_on(ensure_browser_gui_peer());
+        let after = BROWSER_APP_SESSION.read().unwrap().clone();
+        *BROWSER_APP_SESSION.write().unwrap() = None; // 전역 상태 원복(다른 테스트 오염 금지)
+        assert!(result.is_ok(), "살아있는 세션이면 등록을 시도조차 하지 않는다: {result:?}");
+        assert_eq!(after.as_deref(), Some(live.as_str()), "세션이 교체되면 안 된다");
     }
 
     /// [WS-1] 배너 선두 사인은 UI 절단(castFailureReason maxLen=200) 안에 반드시 남아야 한다.
