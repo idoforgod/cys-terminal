@@ -2453,7 +2453,9 @@ function makeWebPane(node: WebNode): WebPaneView {
         e,
         (window as { __CYS_BROWSER_ACTIVATION__?: unknown }).__CYS_BROWSER_ACTIVATION__,
       );
-      const reason = castFailureReason(enriched);
+      // maxLen 200 명시(WS-1 §5-0-A 1): 배너가 `BROWSER_DISABLED_SAFE [<CODE>]: <message>`로
+      // 사인을 선두에 실으면서 기본 120으로는 message(진짜 원인·exit status)가 절단으로 삭제된다.
+      const reason = castFailureReason(enriched, 200);
       castLastFailure = reason; // toast는 8s 후 사라진다 — placeholder가 원인을 계속 인다
       if (reason !== castLastToasted) {
         castLastToasted = reason; // 같은 원인 반복 클릭은 toast 1회만(폭주 상한·placeholder는 매번 갱신)
@@ -5710,6 +5712,18 @@ async function start() {
       );
     });
     listen("daemon-ready", () => dismissToast("daemon-hint"));
+    // ★WS-1: 백엔드가 부트 GUI 등록 최종 실패(15s×3 재시도 소진) 때 발화하는 배너 —
+    // 종전에는 리스너가 0건이라 emit이 무효였고, 브라우저가 왜 안 되는지 사용자가 영영 몰랐다.
+    // 8초 토스트로는 부트 직후 흘러가므로 sticky(id 고정·중복 갱신)로 남긴다.
+    listen("browser-disabled-safe", (e) => {
+      const reason = typeof e.payload === "string" && e.payload ? e.payload : "원인 미상";
+      stickyToast(
+        "browser-disabled-safe",
+        "health",
+        "브라우저 사용 불가",
+        `${reason} · 앱을 다시 열면 재등록을 시도합니다.`,
+      );
+    });
     const probe = setInterval(async () => {
       try {
         await invoke("daemon_status");

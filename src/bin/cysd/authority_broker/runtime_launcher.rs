@@ -18,6 +18,15 @@ const MAX_MANAGED_RUNTIMES: usize = 4;
 /// 살아있는 런타임을 부하 스파이크 1회로 고아로 만들지 않기 위한 연속 실패 한계.
 /// 일시 실패는 이 횟수만큼 연속되어야 비로소 엔트리를 제거한다(성공 시 리셋).
 const MAX_CONSECUTIVE_TRANSIENT_VALIDATION_FAILURES: u32 = 3;
+/// 핸드셰이크 실패 경로: 엔진이 아직 없어 회수 대상이 없다 → 유예 0(즉시).
+const HANDSHAKE_TERMINATION_GRACE: std::time::Duration = std::time::Duration::ZERO;
+/// post-readiness 경로: EOF 실효 ≤100ms + supervisor Drop 내부 엔진 유예 2s + 여유.
+const POST_READINESS_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// pre-readiness 경로: supervisor의 liveness 스레드는 readiness 이후에야 스폰되므로
+/// (`supervisor/main.rs:44` 블로킹 → `:60` spawn) EOF가 무효다. 긴 유예는 회수 이득이
+/// 0인 채로 취소 응답성만 해치고 자식의 늦은 부작용 창을 넓힌다.
+const PRE_READINESS_TERMINATION_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(100);
 type ManagedSessionKey = zeroize::Zeroizing<[u8; 32]>;
 
 /// `validate_live` 실패의 성격. 일시 실패로 소유권을 파괴하면 supervisor는 계속 살아
@@ -546,6 +555,29 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             .map(|byte| format!("{byte:02x}"))
             .collect())
     }
+}
+
+/// 실패·취소 경로 전용 종료기. `drop(control)`로 EOF를 유도해 supervisor가 스스로
+/// Drop을 완주하게 하고(엔진 그룹·state.json 회수·flock 해제), grace 만료 시에만
+/// SIGKILL로 격상한다. grace는 경로별로 다르다(위 3개 상수).
+///
+/// X2(reap 금지) 비위반: 대상은 우리가 방금 스폰하고 control 파이프를 소유한 자기
+/// 자식이며, 타 데몬이 쥔 홀더가 아니다.
+fn terminate_supervisor(
+    child: &mut std::process::Child,
+    control: &mut Option<ChildStdin>,
+    grace: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    drop(control.take());
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    child.wait().ok()
 }
 
 fn ensure_launch_not_cancelled(cancelled: &Arc<AtomicBool>) -> Result<(), BrokerFailure> {

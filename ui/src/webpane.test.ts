@@ -435,6 +435,24 @@ describe("cast web pane — URL 조립·판정(browserd screencast)", () => {
     expect(castFailureReason(undefined)).toBe("");
   });
 
+  it("castFailureReason — cast 실패 경로의 maxLen 200: 대괄호 사인 + inner code가 함께 살아남는다", () => {
+    // WS-1 배너 규약: `BROWSER_DISABLED_SAFE [<CODE>]: <message>` — message는 다시
+    // `<INNER_CODE>: <inner message> (exit <n>)` 이라 기본 120으로는 inner code가 절단으로 삭제된다.
+    const banner =
+      "BROWSER_DISABLED_SAFE [RUNTIME_START_FAILED]: SUPERVISOR_EXIT_PRE_READY: " +
+      "cys-browserd supervisor exited before readiness while pinning the bundled engine (exit 101)";
+    expect(banner.length).toBeGreaterThan(120); // 전제: 기본 절단에 걸리는 길이
+    expect(banner.length).toBeLessThanOrEqual(200);
+    // 기본(120)이면 inner code 뒤의 사유가 잘려 나간다 — 상향의 근거
+    expect(castFailureReason(banner)).toContain("[RUNTIME_START_FAILED]");
+    expect(castFailureReason(banner)).not.toContain("(exit 101)");
+    // 200 명시(cast 실패 경로) → 배너 전문 무절단
+    expect(castFailureReason(banner, 200)).toBe(banner);
+    // 200 경계도 기본값과 동일 규칙(경계 무절단·초과분만 "…")
+    expect(castFailureReason("y".repeat(200), 200)).toBe("y".repeat(200));
+    expect(castFailureReason("y".repeat(201), 200)).toBe(`${"y".repeat(200)}…`);
+  });
+
   it("castPaneTitle — 3자 페이지 제목의 헤더 반영(정규화·상한·빈값은 기본 제목에 양보)", () => {
     expect(castPaneTitle("예시 문서 — example.com")).toBe("예시 문서 — example.com");
     expect(castPaneTitle("줄바꿈\n섞인   제목\t")).toBe("줄바꿈 섞인 제목"); // 헤더 파괴 방지

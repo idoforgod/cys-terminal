@@ -54,4 +54,21 @@ describe("castActivationDiagnostics — 표식 기반 진단 보강", () => {
     const marker = "skip-nomatch:btn-close";
     expect(castActivationDiagnostics(NATIVE, marker)).toBe(`${marker} · ${NATIVE}`);
   });
+
+  // ★WS-1 매핑 갱신: 백엔드가 데몬 error.code를 대괄호 규약으로 실어 올린 뒤에도, 활성화 진단은
+  // NATIVE_ACTIVATION_REQUIRED **한 code에만** 반응해야 한다. 다른 사인에 활성화 힌트를 덧대면
+  // "한 번 더 클릭하면 연결됩니다" 같은 오진이 진짜 원인(등록·런타임 실패)을 덮는다.
+  it("9) 다른 code의 대괄호 배너는 무보강 원문 — 활성화 진단이 사인을 가로채지 않는다", () => {
+    const coded = [
+      "BROWSER_DISABLED_SAFE [GUI_NOT_REGISTERED]: GUI peer has no broker-owned registration",
+      "BROWSER_DISABLED_SAFE [GUI_IDENTITY_MISMATCH]: GUI PID incarnation, canonical executable, code signature, or digest changed",
+      "BROWSER_DISABLED_SAFE [GUI_REGISTRATION_LIMIT]: too many GUI peers are registered",
+      "BROWSER_DISABLED_SAFE [RUNTIME_START_TIMEOUT]: broker did not answer in 40s",
+    ];
+    for (const err of coded) {
+      expect(err.startsWith("BROWSER_DISABLED_SAFE [")).toBe(true); // 규약 자체의 회귀 핀
+      expect(castActivationDiagnostics(err, "armed-ok")).toBe(err);
+      expect(castActivationDiagnostics(err, undefined)).toBe(err);
+    }
+  });
 });
