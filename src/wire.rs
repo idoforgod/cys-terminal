@@ -23,6 +23,12 @@ use serde_json::Value;
 /// pv=2 (WS-6): `serde_json`의 `float_roundtrip` 피처를 켠 릴리스부터다. 같은 pv를 유지하면
 /// float 프레임에서 길이 불일치가 `LenMismatch`(Critical=하드 실패)로 잘못 분류되므로,
 /// 피처 활성과 pv 증가는 **반드시 같은 릴리스에 동반**한다(디코더가 스큐를 graceful로 판정).
+///
+/// ★완화 비대칭(F-1, 정직한 한계 기재): `VersionSkew`의 graceful downgrade는 **신규 디코더에만**
+/// 존재한다(`cys.rs`의 `decode_response_frame` — 이 릴리스에서 신설). 배포된 구 `cys`(v0.13.20)는
+/// 모든 `AbiError`를 하드 실패시키므로 **신 cysd × 구 cys** 조합에서 float 페이로드의 길이 불일치가
+/// 그대로 실패로 올라온다. 노출은 업데이트 창 + PATH 상 구 `cys` 사본을 쓰는 경우에 한정된다
+/// (cys/cysd는 함께 배포된다). 완화는 신규 CLI 확산으로만 이뤄지며 데몬측 수리는 없다.
 pub const PROTO_PV: u16 = 2;
 
 /// 응답 객체에 additive하게 부착되는 메타 키.

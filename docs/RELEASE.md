@@ -444,6 +444,12 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       스크립트가 그 SOT(밴드 구조·용량 표기 규약)를 알지 못한다. 자동화하려면 홈페이지 리포에
       게이트를 두는 것이 옳다 — 여기서는 문서 게이트로 고정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
+- [ ] **릴리스 노트에 pv 스큐 비대칭 1줄 기재(F-1)** — 와이어 `_pv` 스큐의 graceful downgrade는
+      **신규 `cys`에만** 있다(`src/bin/cys.rs` `decode_response_frame`). 배포된 구 `cys`
+      (v0.13.20)는 모든 ABI 오류를 하드 실패시키므로 **신 cysd × 구 cys** 조합에서 float 응답의
+      길이 불일치가 실패로 보일 수 있다. 노출 대상은 업데이트 창 + **PATH 상 구 `cys` 사본**을
+      쓰는 사용자다(cys/cysd는 함께 배포되므로 정상 설치 경로는 무영향). 조치: 앱과 CLI 심링크를
+      함께 갱신(`cys` 재설치)하면 사라진다 — 데몬측 수리는 없다(완화는 신규 CLI 확산뿐).
 
 ### 롤백 — 되돌릴 수 있는 마지막 지점
 
