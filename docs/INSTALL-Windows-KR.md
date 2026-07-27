@@ -38,6 +38,15 @@ cys.exe daemon install   (로그온 자동기동 재등록)
 cys.exe daemon status    (등록 상태 확인)
 ```
 
+## 문제 해결
+
+- **실행 시 "VCRUNTIME140.dll이(가) 없어 코드 실행을 진행할 수 없습니다" (cysd.exe 시스템
+  오류)**: v0.13.22 이하 구버전에서만 발생하는 결함으로, Microsoft Visual C++ 재배포
+  패키지가 없는 깨끗한 Windows에서 나타납니다. **v0.13.23 이상은 CRT를 정적 링크해 이
+  오류가 원천적으로 발생하지 않으므로 최신 설치본으로 재설치**하는 것이 정식 해법입니다.
+  당장의 응급 조치로는 Microsoft 공식 재배포 패키지 설치도 유효합니다:
+  https://aka.ms/vs/17/release/vc_redist.x64.exe
+
 ## 참고
 - 이전 안내에 있던 **MSI(cys-0.2.x)** 는 구버전 방식입니다. 현재 소비자 배포본은 위 **NSIS
   setup.exe(runtime 동봉)** 이며, 로컬 개발 폴더 `dist-win\`의 옛 파일은 배포본이 아닙니다.

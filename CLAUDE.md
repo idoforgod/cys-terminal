@@ -67,4 +67,7 @@ cys set-status --state working --context <pct>  # 컨텍스트 자기보고 — 
 
 ## 프로젝트 고유 규칙
 
-(프로젝트마다 여기에 추가)
+- **Windows CRT 정책(SOT)**: Windows MSVC 바이너리는 CRT 정적 링크(crt-static)가 정책이다.
+  선언은 루트 `.cargo/config.toml` 한 곳, 검증은 `scripts/verify_win_crt.py`(릴리스·feasibility
+  양 레인 게이트). 개별 빌드 스텝에 RUSTFLAGS 를 심는 방식은 금지 — config rustflags 를 통째
+  대체해 정책이 무음 증발한다.

@@ -51,6 +51,15 @@ gh api repos/idoforgod/cys-terminal/environments/release-production \
 DMG 공증 제출·staple·Gatekeeper 검증을 통과해야 한다. Windows sidecar와 NSIS 설치 파일은
 SHA-256 Authenticode 서명, HTTPS RFC3161 타임스탬프, 게시자 일치 검증을 통과해야 한다.
 
+Windows 레인은 추가로 **CRT 게이트**(`scripts/verify_win_crt.py` — 이 스크립트가 정본이고 이
+문단은 참조일 뿐이다)를 통과해야 한다: 서명 완료된 setup.exe 를 추출해 ①모든 exe 의 PE 임포트
+테이블에서 VCRUNTIME 동적 의존을 스윕(우리 3바이너리 cys/cysd/cys-browserd 는 예외 불허,
+서드파티는 같은 폴더 vcruntime140.dll 동봉 시만 허용)하고 ②cysd.exe 의 3카테고리 수리
+마커(v0.13.22 · 5fd38d6) 존재를 확인해 구베이스 빌드 출하를 차단한다. CRT 정책의 선언
+위치(SOT)는 루트 `.cargo/config.toml` 의 crt-static 이다. CI 러너에는 VC 재배포 패키지가
+프리인스톨돼 있어 이 결함군은 러너 런타임으로 재현되지 않는다 — 클린 머신 실기는 릴리스
+검토 단계에서 redist 없는 VM(System32 에 vcruntime140.dll 부재 확인 후)으로 수행한다.
+
 ### Browser Runtime 소스·스테이징·서명 계약
 
 `release/browser-runtime-sources.json`이 Rust 1.95.0, Bun 1.3.8, Playwright 1.49.1과
