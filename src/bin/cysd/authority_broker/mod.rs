@@ -24,6 +24,10 @@ pub struct BrokerConfig {
     runtime_root: PathBuf,
     state_path: PathBuf,
     target: TargetTriple,
+    /// 테스트 전용: `expected_supervisor_path()`가 돌려줄 경로. 실제 런타임 트리(engine·chromium
+    /// 실체 파일)를 깔지 않고도 소유권 판정을 검증하기 위한 주입점이며 프로덕션 빌드에 없다.
+    #[cfg(test)]
+    supervisor_override: Option<PathBuf>,
 }
 
 impl BrokerConfig {
@@ -32,6 +36,21 @@ impl BrokerConfig {
             BrokerFailure::new(
                 "RUNTIME_NOT_FOUND",
                 format!("cysd path unavailable: {error}"),
+            )
+        })?;
+        // ★WS-5(F7): macOS `current_exe()`는 심링크를 해석하지 않는다. `/usr/local/bin/cysd`가
+        // 번들 안 실체를 가리키는 심링크일 때, 해석하지 않은 경로의 부모(`/usr/local/bin`)에서
+        // `../Resources/browser-runtime`을 짜면 `/usr/local/Resources/...`라는 존재하지 않는
+        // 리소스 루트가 나온다. **fail-closed**로 정규화한다 — `unwrap_or` 폴백을 두면 잘못된
+        // 루트로 조용히 진행해 RUNTIME_NOT_FOUND를 엉뚱한 지점에서 만나게 된다.
+        // 배너에 "데몬 재시작 필요"를 싣는 이유: `shared_broker()`가 OnceLock으로 이 실패를
+        // 프로세스 수명 내내 캐시하므로, 원인을 고쳐도 같은 데몬에서는 재시도가 통하지 않는다.
+        let executable = executable.canonicalize().map_err(|error| {
+            BrokerFailure::new(
+                "RUNTIME_NOT_FOUND",
+                format!(
+                    "cysd path cannot be canonicalized ({error}) — 심링크 해석 실패로 번들 리소스 루트를 확정할 수 없다. 원인 해소 후 **데몬 재시작 필요**(브로커 초기화 실패는 프로세스 수명 동안 캐시된다)"
+                ),
             )
         })?;
         let executable_dir = executable.parent().ok_or_else(|| {
@@ -50,6 +69,8 @@ impl BrokerConfig {
             state_path: state_root.join("state.json"),
             target: TargetTriple::current()
                 .map_err(|error| BrokerFailure::new(error.code().as_str(), error.to_string()))?,
+            #[cfg(test)]
+            supervisor_override: None,
         })
     }
 
@@ -60,6 +81,7 @@ impl BrokerConfig {
             runtime_root,
             state_path,
             target: TargetTriple::current().unwrap_or(TargetTriple::Aarch64AppleDarwin),
+            supervisor_override: None,
         }
     }
 }
@@ -187,6 +209,28 @@ pub enum BrokerStatus {
     Incompatible { reason: String },
     LegacyActive,
     DisabledSafe { code: String, message: String },
+    /// 이 데몬은 브라우저 런타임을 **구조적으로 소유하지 않는다**(부서 데몬). 고장이 아니라
+    /// 정책이므로 오류가 아닌 정상 result로 사실 보고한다 → `{"status":"UNSUPPORTED","reason":…}`.
+    /// 태그 열거형 계약(`#[serde(tag="status")]`) 준수 — `{unsupported:true}` 같은 평면 키 금지.
+    Unsupported { reason: String },
+}
+
+/// 부서(dept) 데몬에서 **차단**되는 browser.runtime 런치 verb (WS-5 §7-0-A 정정).
+/// `operation`이 포함되는 이유: 내부에서 `ensure_shared`를 호출하므로 빠뜨리면 부서 pane의
+/// 워커 호출 한 번이 supervisor 스폰 처닝을 그대로 일으킨다(수용 기준 "spawn 0" 위반).
+/// `probe`·`cancel`·`gui_challenge`·`register_gui`·`issue_gesture`는 **통과**시킨다 —
+/// 등록 핸드셰이크와 진단을 죽이면 WS-10(관측)과 자기모순이다.
+pub const DEPT_BLOCKED_RUNTIME_OPERATIONS: [&str; 3] = ["ensure", "prepare_embed", "operation"];
+
+/// 부서 데몬의 런치 거부 사유 단일진실(err message 겸 probe reason).
+pub const DEPT_RUNTIME_UNSUPPORTED_REASON: &str =
+    "부서(dept) 데몬은 공용 Browser Runtime을 소유하지 않는다 — 런타임 기동은 메인 cysd에서만 수행된다";
+
+/// 부서 데몬의 `probe` 응답 — 오류가 아니라 사실 보고(UNSUPPORTED).
+pub fn dept_unsupported_status() -> BrokerStatus {
+    BrokerStatus::Unsupported {
+        reason: DEPT_RUNTIME_UNSUPPORTED_REASON.into(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -627,6 +671,10 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
         // This lock spans compatibility re-check and launch. Concurrent callers
         // wait for the first result and can never create a second supervisor.
         let mut inner = self.inner.lock().unwrap();
+        // WS-5 선검사 재료: 이 브로커가 **지금 또는 직전에** 소유한 instance_id.
+        // 아래 UNAUTHENTICATED_STATE 분기에서 "남의 런타임"과 "재검증 실패한 내 런타임"을
+        // 가르는 데 쓴다(K5 — 자기 런타임을 FOREIGN으로 오판하지 않기 위한 이중 방어선).
+        let recently_owned = inner.live.as_ref().map(|state| state.instance_id.clone());
         if let Some(state) = inner.live.clone() {
             if self.launcher.validate_live(&state).is_ok() {
                 let status = self.status_for_v2(state);
@@ -651,9 +699,34 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
                     format!("active Browser runtime is incompatible: {reason}"),
                 ));
             }
-            BrokerStatus::DisabledSafe { code, .. } if code == "UNAUTHENTICATED_STATE" => {}
+            BrokerStatus::DisabledSafe { code, .. } if code == "UNAUTHENTICATED_STATE" => {
+                // ★WS-5(F8) fall-through 협착 — 디스크 state가 "인증되지 않았다"는 사실은
+                // "아무도 안 쓴다"와 다르다. 살아있는 정품 supervisor가 소유 중인데도 무조건
+                // launch로 떨어지면 두 번째 supervisor를 얹어 처닝·고아를 만든다.
+                // **kill은 절대 하지 않는다(X2)** — 판정만 하고 launch를 보류할 뿐이다.
+                if let Some(state) = self.read_disk_state_v2() {
+                    match self.classify_disk_state_owner(&state, recently_owned.as_deref()) {
+                        OwnershipVerdict::SelfOwnedUnvalidated => {
+                            return Err(BrokerFailure::new(
+                                "RUNTIME_SELF_OWNED_UNVALIDATED",
+                                "이 데몬이 방금까지 소유하던 런타임이 살아 있으나 재검증에 실패했다 — 새 supervisor를 얹지 않는다(재시도 시 재판정)",
+                            ));
+                        }
+                        OwnershipVerdict::Foreign => {
+                            return Err(BrokerFailure::new(
+                                "RUNTIME_FOREIGN_OWNER",
+                                "다른 데몬 세션이 이 Browser 런타임을 소유 중으로 판정됐다 — 일시 상태이며 재시도 시 재판정한다",
+                            ));
+                        }
+                        OwnershipVerdict::Launchable => {}
+                    }
+                }
+            }
             BrokerStatus::DisabledSafe { code, message } => {
                 return Err(BrokerFailure::new(code, message));
+            }
+            BrokerStatus::Unsupported { reason } => {
+                return Err(BrokerFailure::new("RUNTIME_UNSUPPORTED", reason));
             }
         }
         let manifest = self.load_manifest()?;
@@ -938,6 +1011,62 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
             ));
         }
         Ok(endpoint)
+    }
+
+    /// 디스크 state를 v2로 다시 읽는다. `probe_disk()`는 상태만 돌려주고 state를 넘기지 않아
+    /// 소유권 판정에 필요한 `supervisor_pid`·`started_at`을 얻으려면 한 번 더 읽어야 한다.
+    fn read_disk_state_v2(&self) -> Option<RuntimeStateV2> {
+        let input = std::fs::read_to_string(&self.config.state_path).ok()?;
+        match cys::browser_runtime::parse_runtime_state(&input).ok()? {
+            ParsedRuntimeState::V2(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// 번들 매니페스트가 지정하는 supervisor 실행파일의 **정규화 절대경로**.
+    /// basename(`cys-browserd`) 비교는 동일 UID 공격자가 아무 데나 같은 이름의 프로세스를 띄워
+    /// 영구 FOREIGN_OWNER를 유지하는 DoS 표면을 연다 — GUI 신원 검증과 같은 원칙으로 완전일치만 쓴다.
+    fn expected_supervisor_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = self.config.supervisor_override.clone() {
+            return Some(path);
+        }
+        let manifest = self.load_manifest().ok()?;
+        let assets = manifest.target(&self.config.target).ok()?;
+        let paths = cys::browser_runtime::RuntimePaths::resolve_existing(
+            &self.config.runtime_root,
+            &self.config.target,
+            assets,
+        )
+        .ok()?;
+        Some(paths.supervisor)
+    }
+
+    /// 디스크 state의 소유권 판정(WS-5 §7-3 + §7-0-A K5).
+    ///
+    /// 순서: **① supervisor 생존(단일 sysinfo 스냅샷) → ② 자기 소유 선검사 → ③ 3중 신호**.
+    /// 설계 원안은 선검사를 맨 앞에 두지만, 그러면 supervisor가 **죽은** 크래시 상황에서도
+    /// `SELF_OWNED_UNVALIDATED`가 나와 crash-recovery 재기동(`dead_managed_runtime_is_replaced…`
+    /// 계약)이 영구히 막힌다. 생존 신호를 선행 조건으로 둬야 "자기 오판 차단"이라는 K5의 의도를
+    /// 지키면서 재기동 경로를 보존한다 — 이 순서 자체가 계약이다.
+    fn classify_disk_state_owner(
+        &self,
+        state: &RuntimeStateV2,
+        recently_owned: Option<&str>,
+    ) -> OwnershipVerdict {
+        // 신호는 **단일 스냅샷**에서 읽는다(신호 간 시점 분열 = 판정 불능의 원인).
+        let Some(fact) = supervisor_process_fact(state.supervisor_pid) else {
+            return OwnershipVerdict::Launchable; // 죽은 pid = 잔재 state → 현행대로 launch.
+        };
+        if recently_owned == Some(state.instance_id.as_str()) {
+            return OwnershipVerdict::SelfOwnedUnvalidated;
+        }
+        let expected = self.expected_supervisor_path();
+        if classify_live_owner(state, expected.as_deref(), &fact) {
+            OwnershipVerdict::Foreign
+        } else {
+            OwnershipVerdict::Launchable
+        }
     }
 
     fn load_manifest(&self) -> Result<RuntimeManifest, BrokerFailure> {
@@ -1320,6 +1449,70 @@ impl GuiPeerVerifier for PlatformGuiPeerVerifier {
     fn verify(&self, pid: u32) -> Result<GuiExecutableIdentity, BrokerFailure> {
         inspect_gui_executable_identity(pid)
     }
+}
+
+/// 디스크 state 소유권 판정 결과(WS-5). **어느 경우에도 kill은 하지 않는다(X2)** — 이 판정은
+/// launch 여부만 가른다. FOREIGN_OWNER는 리스(WS-11) 도입 전의 **잠정 설계**이며 TOCTOU 잔여가
+/// 있다(판정 직후 supervisor가 죽으면 다음 호출에서 다시 launch 가능으로 뒤집힌다 — 의도된 일시성).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnershipVerdict {
+    /// 살아있는 정품 supervisor가 소유 중 — launch 금지(일시 상태, 재시도 시 재판정).
+    Foreign,
+    /// 우리가 방금까지 소유하던 instance가 살아 있다 — FOREIGN이 아니라 **재검증 대상**이다.
+    SelfOwnedUnvalidated,
+    /// 신호 미충족(사망·위조·경로 불일치·시각 불일치) — 현행대로 launch 진행.
+    Launchable,
+}
+
+/// 단일 sysinfo 스냅샷에서 읽은 후보 supervisor 프로세스 사실.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupervisorProcessFact {
+    /// 정규화된 절대 실행 경로. 얻지 못하면 `None`(판정 불가 → launch 진행).
+    executable: Option<PathBuf>,
+    /// epoch 초. `state.started_at`과 ±2s 대조해 pid 재사용을 배제한다.
+    start_time: u64,
+}
+
+/// state.started_at ↔ 프로세스 start_time 허용 오차(초). supervisor는 기동 직후 state를 쓰지만
+/// 그 사이 파일 I/O·서명 검증이 끼므로 0 대조는 정품도 탈락시킨다.
+const OWNER_START_TIME_TOLERANCE_SECS: i64 = 2;
+
+/// 3중 신호 판정(순수 함수 — 테스트가 프로세스 없이 픽스처만으로 위조 시나리오를 재현한다).
+/// ①state가 유효 v2(호출자가 이미 파싱 성공으로 보장) ②supervisor_pid 생존(`fact` 존재로 보장)
+/// ③exe 절대경로가 매니페스트 supervisor와 **완전일치** + `started_at` ↔ `start_time` ±2s.
+fn classify_live_owner(
+    state: &RuntimeStateV2,
+    expected_supervisor: Option<&std::path::Path>,
+    fact: &SupervisorProcessFact,
+) -> bool {
+    let (Some(expected), Some(actual)) = (expected_supervisor, fact.executable.as_deref()) else {
+        // 기대 경로를 확정할 수 없으면 소유를 단정하지 않는다(fail-open toward launch —
+        // 여기서 fail-closed로 굳히면 매니페스트 해석 실패 하나가 브라우저를 영구 불능화한다).
+        return false;
+    };
+    if expected != actual {
+        return false;
+    }
+    let Some(declared) = chrono::DateTime::parse_from_rfc3339(&state.started_at).ok() else {
+        return false;
+    };
+    let drift = declared.timestamp() - fact.start_time as i64;
+    drift.abs() <= OWNER_START_TIME_TOLERANCE_SECS
+}
+
+/// 후보 supervisor pid의 사실을 **단일 스냅샷**으로 회수한다(신호 간 시점 분열 방지).
+fn supervisor_process_fact(pid: u32) -> Option<SupervisorProcessFact> {
+    if pid == 0 {
+        return None;
+    }
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    let process = system.process(Pid::from_u32(pid))?;
+    Some(SupervisorProcessFact {
+        executable: process.exe().and_then(|path| path.canonicalize().ok()),
+        start_time: process.start_time(),
+    })
 }
 
 /// 주어진 pid들의 생존 여부와 `start_time`을 **단일 sysinfo 스냅샷**으로 회수한다(WS-4).
@@ -2173,6 +2366,191 @@ mod tests {
                 .code,
             "GUI_REGISTRATION_REPLAY"
         );
+    }
+
+    // ───────────────────────── WS-5: 소유권 판정(FOREIGN_OWNER) ─────────────────────────
+
+    /// 매니페스트를 읽어 CountingLauncher로 v2 state 씨앗을 만든다(디스크 픽스처용).
+    fn seed_state(config: &BrokerConfig) -> RuntimeStateV2 {
+        let manifest =
+            RuntimeManifest::parse(&std::fs::read_to_string(&config.manifest_path).unwrap())
+                .unwrap();
+        CountingLauncher::default()
+            .launch(&LaunchRequest {
+                manifest,
+                manifest_path: config.manifest_path.clone(),
+                target: config.target.clone(),
+                runtime_root: config.runtime_root.clone(),
+                state_path: config.state_path.clone(),
+                authority: VerifiedAuthority::trusted_test(),
+                cancellation: Arc::new(AtomicBool::new(false)),
+            })
+            .unwrap()
+    }
+
+    fn rfc3339_from_epoch(seconds: u64) -> String {
+        chrono::DateTime::from_timestamp(seconds as i64, 0)
+            .expect("epoch 초는 유효 범위")
+            .to_rfc3339()
+    }
+
+    /// ★위조 state DoS 방어(설계 §7-0-A K5 "테스트 방향 정정"): **이름만** `cys-browserd`인
+    /// 프로세스는 절대 차단 근거가 되지 못한다. 동일 UID 공격자가 아무 데서나 그 이름으로
+    /// 프로세스를 띄우고 state를 위조하면 영구 FOREIGN_OWNER로 브라우저를 봉인할 수 있기 때문이다.
+    /// 절대경로 완전일치만이 소유를 증명한다.
+    #[test]
+    fn basename_only_cys_browserd_impostor_cannot_block_a_launch() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-broker-impostor-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = BrokerConfig::for_test(
+            root.join("manifest.json"),
+            root.join("runtime"),
+            root.join("state.json"),
+        );
+        write_manifest(&config);
+        let mut state = seed_state(&config);
+        state.started_at = rfc3339_from_epoch(1_000_000);
+
+        let expected =
+            std::path::Path::new("/Applications/cys.app/Contents/Resources/browser-runtime/runtime/aarch64-apple-darwin/supervisor/cys-browserd");
+        // basename은 같지만 절대경로가 다른 사칭 프로세스 + 시각까지 완벽히 맞춘 최악 조건.
+        let impostor = SupervisorProcessFact {
+            executable: Some(PathBuf::from("/tmp/attacker/cys-browserd")),
+            start_time: 1_000_000,
+        };
+        assert!(
+            !classify_live_owner(&state, Some(expected), &impostor),
+            "이름만 같은 사칭 프로세스가 launch를 차단해서는 안 된다(영구 봉인 DoS)"
+        );
+
+        // 대조군 ①: 절대경로가 완전일치하고 시각도 맞으면 소유로 판정한다(탐지 타당성).
+        let genuine = SupervisorProcessFact {
+            executable: Some(expected.to_path_buf()),
+            start_time: 1_000_000,
+        };
+        assert!(classify_live_owner(&state, Some(expected), &genuine));
+
+        // 대조군 ②: 경로가 같아도 start_time이 허용 오차를 넘으면 pid 재사용으로 보고 차단하지 않는다.
+        let recycled = SupervisorProcessFact {
+            executable: Some(expected.to_path_buf()),
+            start_time: 1_000_000 + OWNER_START_TIME_TOLERANCE_SECS as u64 + 1,
+        };
+        assert!(
+            !classify_live_owner(&state, Some(expected), &recycled),
+            "start_time 불일치 = pid 재사용 — 소유로 단정하지 않는다"
+        );
+
+        // 대조군 ③: 기대 경로를 확정할 수 없으면 소유를 단정하지 않는다(브라우저 영구 불능 방지).
+        assert!(!classify_live_owner(&state, None, &genuine));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 죽은 supervisor_pid를 가리키는 잔재 state는 launch를 막지 못한다(현행 동작 보존).
+    #[test]
+    fn stale_state_with_a_dead_supervisor_still_launches() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-broker-dead-owner-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = BrokerConfig::for_test(
+            root.join("manifest.json"),
+            root.join("runtime"),
+            root.join("state.json"),
+        );
+        write_manifest(&config);
+        let mut state = seed_state(&config);
+        // 존재할 수 없는 pid(사망 모사).
+        state.supervisor_pid = u32::MAX - 7;
+        std::fs::write(&config.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let launcher = Arc::new(CountingLauncher::default());
+        let broker = AuthorityBroker::new(config, launcher.clone());
+        assert!(matches!(
+            broker
+                .ensure_shared(&VerifiedAuthority::trusted_test())
+                .unwrap(),
+            BrokerStatus::Compatible { .. }
+        ));
+        assert_eq!(launcher.0.load(Ordering::SeqCst), 1, "죽은 소유자는 launch를 막지 않는다");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 살아있는 정품(절대경로 완전일치 + start_time 일치)이 소유 중이면 launch를 보류한다.
+    /// **kill은 하지 않는다(X2)** — 판정만 하고 spawn을 0으로 유지한다.
+    #[test]
+    fn live_genuine_owner_blocks_launch_without_spawning() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-broker-foreign-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = BrokerConfig::for_test(
+            root.join("manifest.json"),
+            root.join("runtime"),
+            root.join("state.json"),
+        );
+        write_manifest(&config);
+        // 이 테스트 프로세스 자신을 "정품 supervisor"로 세운다 — 확실히 살아 있고 exe가 정규 경로다.
+        let self_pid = std::process::id();
+        let fact = supervisor_process_fact(self_pid).expect("자기 프로세스는 스냅샷에 존재한다");
+        config.supervisor_override = fact.executable.clone();
+        let mut state = seed_state(&config);
+        state.supervisor_pid = self_pid;
+        state.started_at = rfc3339_from_epoch(fact.start_time);
+        std::fs::write(&config.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let launcher = Arc::new(CountingLauncher::default());
+        let broker = AuthorityBroker::new(config, launcher.clone());
+        let failure = broker
+            .ensure_shared(&VerifiedAuthority::trusted_test())
+            .unwrap_err();
+        assert_eq!(failure.code, "RUNTIME_FOREIGN_OWNER");
+        assert!(failure.message.contains("재판정"), "일시 상태임을 문구로 알린다");
+        assert_eq!(launcher.0.load(Ordering::SeqCst), 0, "spawn 0");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 같은 instance를 **우리가 방금까지 소유**했다면 FOREIGN이 아니라 재검증 유도로 분기한다.
+    #[test]
+    fn our_own_unvalidated_runtime_is_not_reported_as_a_foreign_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-broker-self-owned-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = BrokerConfig::for_test(
+            root.join("manifest.json"),
+            root.join("runtime"),
+            root.join("state.json"),
+        );
+        write_manifest(&config);
+        let self_pid = std::process::id();
+        let fact = supervisor_process_fact(self_pid).expect("자기 프로세스 스냅샷");
+        config.supervisor_override = fact.executable.clone();
+        let mut state = seed_state(&config);
+        state.supervisor_pid = self_pid;
+        state.started_at = rfc3339_from_epoch(fact.start_time);
+        std::fs::write(&config.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let launcher = Arc::new(CrashableLauncher::default());
+        launcher.live.store(false, Ordering::SeqCst); // 재검증 실패 모사
+        let broker = AuthorityBroker::new(config, launcher.clone());
+        broker.inner.lock().unwrap().live = Some(state.clone());
+
+        let failure = broker
+            .ensure_shared(&VerifiedAuthority::trusted_test())
+            .unwrap_err();
+        assert_eq!(failure.code, "RUNTIME_SELF_OWNED_UNVALIDATED");
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            0,
+            "자기 런타임 위에 두 번째 supervisor를 얹지 않는다"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

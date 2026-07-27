@@ -980,6 +980,33 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         return crate::channels::handle(daemon, sub, &params, &id, caller_pid);
     }
     if let Some(operation) = req.method.strip_prefix("browser.runtime.") {
+        // ★WS-5 부서 게이트: 부서 데몬은 공용 Browser Runtime을 소유하지 않는다.
+        // 런치 verb만 fail-closed로 막아 **spawn 0**을 보장하고, 진단·등록 핸드셰이크
+        // (probe·cancel·gui_challenge·register_gui·issue_gesture)는 그대로 통과시킨다.
+        // 브로커 진입 **직전**에 두는 이유: authority_broker::handle은 shared_broker()를
+        // 초기화하며 번들 리소스를 뒤지므로, 부서 데몬에서는 그 비용조차 낭비다.
+        if cys::is_dept_socket(&daemon.socket_path) {
+            if crate::authority_broker::DEPT_BLOCKED_RUNTIME_OPERATIONS.contains(&operation) {
+                return Reply::Single(err_response(
+                    &id,
+                    "RUNTIME_UNSUPPORTED",
+                    crate::authority_broker::DEPT_RUNTIME_UNSUPPORTED_REASON,
+                ));
+            }
+            if operation == "probe" {
+                // 오류가 아니라 **사실 보고** — {"status":"UNSUPPORTED","reason":…}.
+                return Reply::Single(
+                    match serde_json::to_value(crate::authority_broker::dept_unsupported_status()) {
+                        Ok(status) => ok_response(&id, status),
+                        Err(error) => err_response(
+                            &id,
+                            "BROWSER_UNAVAILABLE",
+                            &format!("status encode failed: {error}"),
+                        ),
+                    },
+                );
+            }
+        }
         return Reply::Single(match crate::authority_broker::handle(
             daemon,
             operation,
@@ -7481,6 +7508,83 @@ mod tests {
             "float가 재파싱에서 비트 단위로 보존되지 않았다"
         );
         assert_eq!(parsed["result"]["item"], float_resp["result"]["item"]);
+    }
+
+    /// ★WS-5 부서 게이트: 부서(dept) 데몬에서 **런치 verb만** RUNTIME_UNSUPPORTED로 fail-closed
+    /// (supervisor spawn 0 보장), `probe`는 UNSUPPORTED를 **정상 result**로 사실 보고,
+    /// 등록 핸드셰이크 verb는 게이트를 통과해 브로커로 간다(WS-10 관측·GUI 등록 보존).
+    /// (`browser.runtime.cancel`은 main.rs 라우팅에서 dispatch 이전에 가로채므로 이 게이트를
+    ///  구조적으로 만나지 않는다 — 통과 보장은 코드 배치로 이미 성립한다.)
+    #[test]
+    fn dept_daemon_blocks_browser_launch_verbs_but_keeps_probe_and_handshake() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-dept-browser-gate-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cys.sock"));
+        assert!(
+            cys::is_dept_socket(&daemon.socket_path),
+            "픽스처가 부서 소켓 규약(cys-dept-*)을 만족해야 한다"
+        );
+
+        for operation in ["ensure", "prepare_embed", "operation"] {
+            let request = Request {
+                id: json!(1),
+                method: format!("browser.runtime.{operation}"),
+                params: json!({"realm": "shared-default", "mode": "headless"}),
+            };
+            let Reply::Single(reply) = dispatch(&daemon, request, None) else {
+                panic!("단일 응답")
+            };
+            assert_eq!(
+                reply["error"]["code"],
+                json!("RUNTIME_UNSUPPORTED"),
+                "부서 데몬에서 {operation}은 fail-closed여야 한다"
+            );
+        }
+
+        // probe = 오류가 아니라 사실 보고. 태그 열거형 계약({"status":…})을 지킨다.
+        let Reply::Single(reply) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "browser.runtime.probe".into(),
+                params: json!({}),
+            },
+            None,
+        ) else {
+            panic!("단일 응답")
+        };
+        assert_eq!(reply["ok"], json!(true), "probe는 정상 result다");
+        assert_eq!(reply["result"]["status"], json!("UNSUPPORTED"));
+        assert!(
+            reply["result"]["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "사유를 실어 보고한다"
+        );
+        assert!(
+            reply["result"].get("unsupported").is_none(),
+            "평면 키가 아니라 태그 열거형이어야 한다"
+        );
+
+        // 등록 핸드셰이크·제스처 verb는 게이트를 통과한다(브로커가 자기 사유로 거절할 뿐).
+        for operation in ["gui_challenge", "register_gui", "issue_gesture"] {
+            let request = Request {
+                id: json!(3),
+                method: format!("browser.runtime.{operation}"),
+                params: json!({}),
+            };
+            let Reply::Single(reply) = dispatch(&daemon, request, None) else {
+                panic!("단일 응답")
+            };
+            assert_ne!(
+                reply["error"]["code"],
+                json!("RUNTIME_UNSUPPORTED"),
+                "{operation}은 부서 게이트에 막히면 안 된다(등록 핸드셰이크 보존)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// W3.6 back-pressure: 임계 초과 시 approval.backpressure 이벤트 + org.status 노출 + deny 카운터.
