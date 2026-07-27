@@ -26,7 +26,9 @@
      3종이 자연 통과. 경로 하드코딩 없음 — 레이아웃 변화 내성).
 
 종료 코드: 0=통과 / 1=검사A 위반 / 2=검사B 마커 결손 / 3=PE 파싱 실패(fail-closed) /
-          4=입력·추출 오류. 모든 판정 내역을 stdout 에 남긴다(릴리스 로그 증거).
+          4=입력·추출·인자 오류. 복수 실패 동시 발생 시 우선순위 1>2>3(가장 행동 가능한
+          원인 우선 — 어느 쪽이든 비0=차단은 동일). 모든 판정 내역을 stdout 에
+          남긴다(릴리스 로그 증거).
 
 사용:
   python3 scripts/verify_win_crt.py --setup release-candidate/cys_X.Y.Z_x64-setup.exe
@@ -35,6 +37,7 @@
 
 import argparse
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -59,7 +62,23 @@ NEEDLE = "vcruntime140"  # vcruntime140.dll·vcruntime140_1.dll 모두 접두 �
 
 
 def imports_of(path):
-    """PE 파일이 임포트하는 DLL 이름 목록. PE 아니면 None(호출측 fail-closed)."""
+    """PE 파일이 임포트하는 DLL 이름 목록. 파싱 불가·구조 이상이면 None(호출측 fail-closed).
+
+    ★fail-closed 계약(리뷰어1 REVISE 반영): 임포트 테이블이 존재한다고 선언됐는데(RVA≠0)
+    그 RVA 나 descriptor 의 name_rva 가 어느 섹션에도 매핑되지 않으면 — "임포트 없음"이
+    아니라 **파싱 실패(None)** 다. 종전엔 이 경로가 []/스킵으로 새어 클린 판정되는
+    fail-open 이었다. 잘린 헤더·NUL 부재 등 모든 구조 이상도 예외 대신 None 으로 수렴한다.
+    delay-load 디렉토리(DataDirectory[13])는 스윕하지 않는다 — 이 게이트의 결함 클래스는
+    "로더 단계 기동 불능"이고 delay-load 는 기동을 막지 않으며 MSVC 는 vcruntime 을
+    delay-load 하지 않는다(정보성 한계 명시).
+    """
+    try:
+        return _imports_of_inner(path)
+    except (struct.error, ValueError, IndexError, OverflowError):
+        return None  # 구조 이상 = 파싱 실패(fail-closed) — docstring 계약 유지
+
+
+def _imports_of_inner(path):
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 0x40 or data[:2] != b"MZ":
@@ -103,15 +122,16 @@ def imports_of(path):
     dlls = []
     off = rva2off(imp_rva)
     if off is None:
-        return []
+        return None  # 임포트 테이블 선언(RVA≠0)인데 섹션 미매핑 — fail-open 봉쇄, 파싱 실패
     while off + 20 <= len(data):
         ilt, _, _, name_rva, iat = struct.unpack_from("<IIIII", data, off)
         if ilt == 0 and name_rva == 0 and iat == 0:
             break
         noff = rva2off(name_rva)
-        if noff is not None:
-            end = data.index(b"\0", noff)
-            dlls.append(data[noff:end].decode("ascii", "replace"))
+        if noff is None:
+            return None  # descriptor 의 name_rva 미매핑 — 동일하게 파싱 실패(fail-closed)
+        end = data.index(b"\0", noff)  # NUL 부재 시 ValueError → 래퍼가 None 으로 수렴
+        dlls.append(data[noff:end].decode("ascii", "replace"))
         off += 20
     return dlls
 
@@ -174,19 +194,29 @@ def extract_setup(setup, sevenzip):
     return tmp
 
 
+class _GateArgumentParser(argparse.ArgumentParser):
+    """argparse 기본 사용법-오류 exit(2)가 '검사B 마커 결손(2)'과 충돌하지 않게
+    입력 오류는 전부 4로 수렴시킨다(리뷰어1 MINOR 반영)."""
+
+    def error(self, message):
+        print(f"인자 오류: {message}", file=sys.stderr)
+        sys.exit(4)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Windows CRT 발행 차단 게이트")
+    ap = _GateArgumentParser(description="Windows CRT 발행 차단 게이트")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--setup", help="NSIS setup.exe (내부에서 7z 추출)")
     src.add_argument("--tree", help="이미 추출된 설치 트리")
     ap.add_argument("--sevenzip", default="7z", help="7-Zip 실행 파일 (기본 7z, macOS 는 7zz)")
     args = ap.parse_args()
 
+    tmp = None
     if args.setup:
         if not os.path.isfile(args.setup):
             print(f"setup 파일 없음: {args.setup}", file=sys.stderr)
             sys.exit(4)
-        tree = extract_setup(args.setup, args.sevenzip)
+        tmp = tree = extract_setup(args.setup, args.sevenzip)
         print(f"== 입력: {args.setup} (추출: {tree})")
     else:
         tree = args.tree
@@ -195,8 +225,12 @@ def main():
             sys.exit(4)
         print(f"== 입력 트리: {tree}")
 
-    violations, unparsed, allowed, total = check_imports(tree)
-    missing, cysd = check_markers(tree)
+    try:
+        violations, unparsed, allowed, total = check_imports(tree)
+        missing, cysd = check_markers(tree)
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)  # 추출 임시 디렉토리 정리(로컬 반복 실행 누적 방지)
 
     print(f"== 검사 A(임포트 스윕): exe {total}개 검사")
     for rel in allowed:

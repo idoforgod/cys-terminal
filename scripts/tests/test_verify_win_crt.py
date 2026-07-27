@@ -94,6 +94,46 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(gate.imports_of(p), [])
 
 
+class FailClosedRegressionTests(unittest.TestCase):
+    """리뷰어1 REVISE(fail-open) 회귀 핀 — 임포트 테이블이 선언됐는데 섹션 미매핑이면
+    '클린'이 아니라 파싱 실패(None→UNPARSED)여야 한다. make_pe 는 e_lfanew=0x40 고정이라
+    PE32+ 기준 DataDirectory[1].RVA 파일 오프셋 = 0x40+4+20+112+8 = 212 로 결정적이다."""
+
+    IMPORT_RVA_OFF = 0x40 + 4 + 20 + 112 + 8
+
+    def test_import_table_rva_unmapped_is_parse_failure(self):
+        blob = bytearray(make_pe(["VCRUNTIME140.dll"]))
+        struct.pack_into("<I", blob, self.IMPORT_RVA_OFF, 0x9000)  # 어느 섹션에도 없음
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cysd.exe")
+            with open(p, "wb") as f:
+                f.write(blob)
+            self.assertIsNone(gate.imports_of(p))
+            _, unparsed, _, _ = gate.check_imports(d)
+            self.assertEqual(len(unparsed), 1)  # fail-closed — 무음 통과 금지
+
+    def test_descriptor_name_rva_unmapped_is_parse_failure(self):
+        blob = bytearray(make_pe(["VCRUNTIME140.dll"]))
+        # 섹션 raw 시작(512 정렬) = descriptor 배열 시작. name_rva 필드는 +12.
+        raw_off = (0x40 + 4 + 20 + 240 + 40 + 0x1FF) & ~0x1FF
+        struct.pack_into("<I", blob, raw_off + 12, 0x9000)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cys.exe")
+            with open(p, "wb") as f:
+                f.write(blob)
+            self.assertIsNone(gate.imports_of(p))
+            _, unparsed, _, _ = gate.check_imports(d)
+            self.assertEqual(len(unparsed), 1)
+
+    def test_missing_nul_terminator_is_parse_failure_not_crash(self):
+        blob = make_pe(["VCRUNTIME140.dll"])[:-1]  # 이름 종결 NUL 제거 — 종전 ValueError 크래시
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cysd.exe")
+            with open(p, "wb") as f:
+                f.write(blob)
+            self.assertIsNone(gate.imports_of(p))  # 예외가 아니라 None(계약 유지)
+
+
 class GateLogicTests(unittest.TestCase):
     def test_strict_binary_rejected_even_with_dll_beside(self):
         # 정책 바이너리는 DLL 드롭으로도 통과 불가(무음 정책 회귀 봉쇄).
