@@ -10,3 +10,16 @@
 # pack_dir() 은 종전대로 CYS_PACK_DIR 미설정 시 ~/.cys/pack 으로 폴백한다.
 [env]
 CYS_PACK_DIR = { value = "target/test-pack-sandbox", relative = true, force = false }
+
+# CRT 정책 SOT — Windows MSVC 바이너리는 CRT 정적 링크(자기완결).
+# 근거: VCRUNTIME140.dll 부재 머신(VC++ 재배포 패키지 미설치)에서 cys/cysd/cys-browserd 가
+# 기동 불능이던 현장 결함(2026-07-28 제보·v0.13.22 설치본 PE 임포트 실측 — 370개 exe 중
+# 우리 3바이너리만 vcruntime140 동적 임포트). 이 선언 하나가 리포 루트 이하 모든 Windows MSVC
+# cargo 빌드(사이드카·src-tauri·테스트·feasibility·미래 바이너리)에 상속된다 — CRT 정책이
+# 빌드 사이트마다 창발하던 무선언 상태(cys-browserd 무성 감염의 원인)를 종결한다.
+# 검증 게이트: scripts/verify_win_crt.py (release.yml·windows-build.yml Windows 잡 —
+# PE 임포트 스윕 + 3카테고리 수리 마커. 문자열 grep 은 오검출로 부적합 판명, PE 파싱 고정).
+# UCRT(api-ms-win-crt-*)는 Windows 10+ OS 동봉이라 정적화 대상이 아니어도 안전하지만,
+# crt-static 은 vcruntime·UCRT 를 함께 정적화한다(tier-1 지원 경로).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Windows CRT 발행 차단 게이트 — VCRUNTIME 임포트 스윕 + 3카테고리 수리 마커.
+
+무엇을 막는가:
+  A) CRT 정책 회귀 — 우리 Rust 바이너리(cys/cysd/cys-browserd)가 VCRUNTIME140.dll 을
+     동적 임포트하면 VC++ 재배포 패키지 없는 Windows 에서 기동 불능(2026-07-28 현장 결함).
+     정책 SOT 는 .cargo/config.toml 의 crt-static — 이 게이트가 산출물에서 그 실효를 증명한다.
+  B) 베이스 오염 회귀 — v0.13.22 의 3카테고리 근본 수리(5fd38d6: 윈도우 회복층·큐 폭주 억제·
+     컨텍스트 사이클 사슬)가 빠진 구베이스 빌드의 출하(반쪽마스터류 사고의 재발 벡터).
+
+판정 방법(혼용 금지):
+  A 는 PE 임포트 디렉토리 파싱만 사용한다 — 원시 바이트 grep 은 v0.13.22 실측에서 370개 중
+    300+개 오검출(데이터 섹션 문자열 잔존)로 부적합 판명. GitHub CI 러너에는 VC 재배포가
+    프리인스톨돼 있어 이 결함은 런타임 재현이 불가능하므로, 임포트 테이블 정적 검사가
+    CI 에서 가능한 유일한 결정론 검증이다.
+  B 는 cysd.exe 원시 바이트의 UTF-8 마커 존재 검사(≥1) — 존재 검사에는 바이트 서치가 적법.
+    전제: pack 이 비압축 임베드(현행 build.rs). 임베드가 압축되면 이 검사는 시끄럽게 실패하며
+    그때 방식을 갱신한다. 마커 목록은 아래 상수 한 곳에만 둔다.
+
+임포트 판정 2단(적대 검증 반영):
+  1단(엄격): cys.exe·cysd.exe·cys-browserd.exe 는 vcruntime 임포트 자체가 무조건 실패.
+     같은 폴더 DLL 동봉으로도 통과 불가 — DLL 드롭은 런타임엔 유효해도 crt-static 정책
+     회귀의 무음 통과 경로가 되므로 봉쇄한다.
+  2단(규칙): 그 외 exe 는 같은 디렉토리에 vcruntime140.dll 동봉 시만 허용(app-local =
+     실제 런타임 안전 불변식. v0.13.22 실측: runtime/python/{python,python3,pythonw}.exe
+     3종이 자연 통과. 경로 하드코딩 없음 — 레이아웃 변화 내성).
+
+종료 코드: 0=통과 / 1=검사A 위반 / 2=검사B 마커 결손 / 3=PE 파싱 실패(fail-closed) /
+          4=입력·추출 오류. 모든 판정 내역을 stdout 에 남긴다(릴리스 로그 증거).
+
+사용:
+  python3 scripts/verify_win_crt.py --setup release-candidate/cys_X.Y.Z_x64-setup.exe
+  python3 scripts/verify_win_crt.py --tree <추출된 설치 트리>  [--sevenzip 7zz]
+"""
+
+import argparse
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+# 정책 회귀를 무조건 차단하는 우리 바이너리(경로 말단 이름, 소문자).
+STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
+
+# 3카테고리 수리 마커(5fd38d6) — cysd.exe 임베드 pack/코드의 UTF-8 바이트 서열.
+# v0.13.22 실측 검출 수: merge_demoted=1, observed-uncertain=8, force-no-verify=6,
+# cys node-recover=12, 죽은 agent 좌석=24, schedule.error=13. 판정은 각 ≥1(리팩토링 내성).
+FIX_MARKERS = [
+    b"merge_demoted",        # 카테고리3: 큐 멱등 병합 TTL 강등(불멸 항목 차단)
+    b"observed-uncertain",   # 카테고리2: usage 귀속 모호 임계 발화
+    b"force-no-verify",      # 카테고리2: cycle 검증 대기 비상 탈출구 의미 복원
+    b"cys node-recover",     # 카테고리1: 죽은 agent 좌석 복구 경로
+    "죽은 agent 좌석".encode("utf-8"),  # 카테고리1: 무효 입양 금지
+    b"schedule.error",       # 카테고리1: fire_command 실패 표면화
+]
+
+NEEDLE = "vcruntime140"  # vcruntime140.dll·vcruntime140_1.dll 모두 접두 매치
+
+
+def imports_of(path):
+    """PE 파일이 임포트하는 DLL 이름 목록. PE 아니면 None(호출측 fail-closed)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        return None
+    coff = e_lfanew + 4
+    nsec = struct.unpack_from("<H", data, coff + 2)[0]
+    opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic == 0x20B:      # PE32+ (x64)
+        dd_off = opt + 112
+    elif magic == 0x10B:    # PE32 (32bit — pip 벤더 스텁 등)
+        dd_off = opt + 96
+    else:
+        return None
+    ndd = struct.unpack_from("<I", data, dd_off - 4)[0]
+    if ndd < 2:
+        return []
+    imp_rva, _ = struct.unpack_from("<II", data, dd_off + 8)  # DataDirectory[1] = Import Table
+    if imp_rva == 0:
+        return []
+    secs = []
+    sec0 = opt + opt_size
+    for i in range(nsec):
+        s = sec0 + 40 * i
+        va = struct.unpack_from("<I", data, s + 12)[0]
+        vsz = struct.unpack_from("<I", data, s + 8)[0]
+        off = struct.unpack_from("<I", data, s + 20)[0]
+        rsz = struct.unpack_from("<I", data, s + 16)[0]
+        secs.append((va, max(vsz, rsz), off))
+
+    def rva2off(rva):
+        for va, sz, off in secs:
+            if va <= rva < va + sz:
+                return off + (rva - va)
+        return None
+
+    dlls = []
+    off = rva2off(imp_rva)
+    if off is None:
+        return []
+    while off + 20 <= len(data):
+        ilt, _, _, name_rva, iat = struct.unpack_from("<IIIII", data, off)
+        if ilt == 0 and name_rva == 0 and iat == 0:
+            break
+        noff = rva2off(name_rva)
+        if noff is not None:
+            end = data.index(b"\0", noff)
+            dlls.append(data[noff:end].decode("ascii", "replace"))
+        off += 20
+    return dlls
+
+
+def check_imports(tree):
+    """검사 A. 반환: (위반 목록, 파싱실패 목록, 허용 내역, 검사한 exe 수)."""
+    violations, unparsed, allowed = [], [], []
+    total = 0
+    for dirpath, _, files in os.walk(tree):
+        for fn in files:
+            if not fn.lower().endswith(".exe"):
+                continue
+            total += 1
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, tree)
+            try:
+                dlls = imports_of(p)
+            except Exception as e:  # 손상 PE 등 — fail-closed
+                dlls = None
+                print(f"  parse-error: {rel}: {e}")
+            if dlls is None:
+                unparsed.append(rel)
+                continue
+            if not any(NEEDLE in d.lower() for d in dlls):
+                continue
+            if fn.lower() in STRICT_BINARIES:
+                violations.append((rel, "정책 바이너리 — 예외 불허(crt-static 회귀)"))
+            elif os.path.isfile(os.path.join(dirpath, "vcruntime140.dll")):
+                allowed.append(rel)
+            else:
+                violations.append((rel, "동봉 vcruntime140.dll 없음 — 클린 머신에서 기동 불능"))
+    return violations, unparsed, allowed, total
+
+
+def check_markers(tree):
+    """검사 B. 반환: (결손 마커 목록, cysd 경로 or None)."""
+    cysd = None
+    for dirpath, _, files in os.walk(tree):
+        for fn in files:
+            if fn.lower() == "cysd.exe":
+                cysd = os.path.join(dirpath, fn)
+                break
+        if cysd:
+            break
+    if cysd is None:
+        return [m.decode("utf-8", "replace") for m in FIX_MARKERS], None
+    with open(cysd, "rb") as f:
+        blob = f.read()
+    missing = [m.decode("utf-8", "replace") for m in FIX_MARKERS if m not in blob]
+    return missing, cysd
+
+
+def extract_setup(setup, sevenzip):
+    tmp = tempfile.mkdtemp(prefix="cys-crt-gate-")
+    cmd = [sevenzip, "x", setup, f"-o{tmp}", "-y"]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"NSIS 추출 실패({sevenzip} exit {r.returncode}): {r.stderr.strip()[:500]}", file=sys.stderr)
+        sys.exit(4)
+    return tmp
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Windows CRT 발행 차단 게이트")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--setup", help="NSIS setup.exe (내부에서 7z 추출)")
+    src.add_argument("--tree", help="이미 추출된 설치 트리")
+    ap.add_argument("--sevenzip", default="7z", help="7-Zip 실행 파일 (기본 7z, macOS 는 7zz)")
+    args = ap.parse_args()
+
+    if args.setup:
+        if not os.path.isfile(args.setup):
+            print(f"setup 파일 없음: {args.setup}", file=sys.stderr)
+            sys.exit(4)
+        tree = extract_setup(args.setup, args.sevenzip)
+        print(f"== 입력: {args.setup} (추출: {tree})")
+    else:
+        tree = args.tree
+        if not os.path.isdir(tree):
+            print(f"트리 없음: {tree}", file=sys.stderr)
+            sys.exit(4)
+        print(f"== 입력 트리: {tree}")
+
+    violations, unparsed, allowed, total = check_imports(tree)
+    missing, cysd = check_markers(tree)
+
+    print(f"== 검사 A(임포트 스윕): exe {total}개 검사")
+    for rel in allowed:
+        print(f"  allow(app-local DLL 동봉): {rel}")
+    for rel, why in violations:
+        print(f"  VIOLATION: {rel} — {why}")
+    for rel in unparsed:
+        print(f"  UNPARSED(fail-closed): {rel}")
+    print(f"== 검사 B(3카테고리 수리 마커): cysd={cysd or '미발견'}")
+    for m in missing:
+        print(f"  MISSING-MARKER: {m}")
+    ok_markers = len(FIX_MARKERS) - len(missing)
+    print(f"  markers: {ok_markers}/{len(FIX_MARKERS)} 존재")
+
+    if violations:
+        print("결과: FAIL(1) — CRT 정책 위반. 릴리스 차단.")
+        sys.exit(1)
+    if missing:
+        print("결과: FAIL(2) — 수리 마커 결손. 구베이스 빌드 의심 — 브랜치 베이스(BASE-OK) 재검.")
+        sys.exit(2)
+    if unparsed:
+        print("결과: FAIL(3) — PE 파싱 실패 존재(fail-closed).")
+        sys.exit(3)
+    print("결과: PASS — VCRUNTIME 자기완결 + 3카테고리 수리 실재.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
