@@ -695,6 +695,9 @@ jobs:
       - name: Windows CRT gate (VCRUNTIME import sweep + 3-category fix markers)
         if: matrix.platform == 'windows-latest'
         shell: bash
+        env:
+          PYTHONUTF8: '1'          # Windows 콘솔 cp1252 에서 한국어 판정 출력 UnicodeEncodeError 방지(리포 관례)
+          PYTHONIOENCODING: 'utf-8'
         run: |
           set -euo pipefail
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
