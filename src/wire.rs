@@ -19,7 +19,11 @@
 use serde_json::Value;
 
 /// 와이어 마이너 버전 단일진실.
-pub const PROTO_PV: u16 = 1;
+///
+/// pv=2 (WS-6): `serde_json`의 `float_roundtrip` 피처를 켠 릴리스부터다. 같은 pv를 유지하면
+/// float 프레임에서 길이 불일치가 `LenMismatch`(Critical=하드 실패)로 잘못 분류되므로,
+/// 피처 활성과 pv 증가는 **반드시 같은 릴리스에 동반**한다(디코더가 스큐를 graceful로 판정).
+pub const PROTO_PV: u16 = 2;
 
 /// 응답 객체에 additive하게 부착되는 메타 키.
 const KEY_FLEN: &str = "_flen";
@@ -37,6 +41,11 @@ pub enum AbiError {
 }
 
 /// 인코드 자기검증 기본 ON. `CYS_ABI_VERIFY=0`로만 좁게 opt-out(debug-only 아님).
+///
+/// ★WS-6 정정: 이 스위치는 자기검증**과 메타 부착을 함께** 끈다. 예전처럼 검증만 끄고
+/// `_flen`/`_pv`를 계속 붙이면, 검증되지 않은 선언 길이가 와이어에 흘러 상대 디코더가
+/// `LenMismatch`(Critical)를 오발화한다 — 탈출구가 혼재 버전 위험을 오히려 키운다.
+/// off일 때는 메타 없는 legacy 프레임 형태로 나가고, 디코더는 이를 무검증 수용한다.
 fn verify_on() -> bool {
     std::env::var("CYS_ABI_VERIFY").as_deref() != Ok("0")
 }
@@ -57,8 +66,14 @@ fn payload_len(resp: &Value) -> usize {
 ///     `Err(Drift)`. `assert_eq!`/`debug_assert!`가 아니라 **명시 분기** — release에서도 발화.
 /// (b) additive: 같은 top-level 객체에 `_flen`·`_pv`만 형제로 추가(중첩·래핑 없음).
 pub fn frame_response(resp: &Value) -> Result<String, AbiError> {
+    // 탈출구(`CYS_ABI_VERIFY=0`): 검증도 메타 부착도 하지 않는다 — 미검증 `_flen`을 내보내
+    // 상대 디코더의 LenMismatch를 오발화시키느니, legacy 프레임 형태로 나가는 편이 안전하다.
+    if !verify_on() {
+        let line = serde_json::to_string(resp).map_err(|_| AbiError::Drift)?;
+        return Ok(format!("{line}\n"));
+    }
     // (a) round-trip 자기검증 — 선언 == 실제 직렬화 결과.
-    if verify_on() {
+    {
         let body = serde_json::to_string(resp).map_err(|_| AbiError::Drift)?;
         let reparsed: Value = serde_json::from_str(&body).map_err(|_| AbiError::Drift)?;
         if reparsed != *resp {
@@ -232,6 +247,89 @@ mod tests {
         let legacy = r#"{"id":1,"ok":true,"result":{"x":1}}"#;
         let v = parse_frame(legacy).expect("legacy frame accepted");
         assert_eq!(v["ok"].as_bool(), Some(true));
+    }
+
+    /// WS-6 골든 벡터 — **하드코딩**(랜덤 생성 금지: flaky·재현 불가).
+    ///
+    /// 앞 3종은 f32 유래 값의 f64 표현이다(hwmon이 `f32 as f64`로 싣는 CPU·메모리 실측치 형태).
+    /// 뒤 3종은 소수부를 가진 epoch f64다. 두 계열 모두 `float_roundtrip`이 꺼져 있으면
+    /// 재파싱에서 최종 1 ulp가 어긋나 `frame_response`가 Drift로 발화하던 값들이다.
+    const GOLDEN_F32_DERIVED: [f64; 3] = [
+        97.15709686279297,
+        18.764999389648438,
+        56.920005798339844,
+    ];
+    const GOLDEN_EPOCH_F64: [f64; 3] = [
+        1_753_660_800.123_456_7,
+        1_690_000_000.987_654_3,
+        1_800_000_000.000_000_2,
+    ];
+
+    /// 골든 벡터가 (a) Drift 없이 프레이밍되고 (b) `_flen` 왕복이 성립함을 단언한다.
+    /// 값 비교는 `to_bits()`로 — 비트 동일성이 곧 정확 왕복이다(근사 비교는 결함을 숨긴다).
+    #[test]
+    fn wire_golden_float_vectors_survive_roundtrip() {
+        for value in GOLDEN_F32_DERIVED.iter().chain(GOLDEN_EPOCH_F64.iter()) {
+            let reply = json!({"id": 9, "ok": true, "result": {"value": value}});
+            let line = frame_response(&reply)
+                .unwrap_or_else(|error| panic!("float {value} 프레이밍 실패: {error:?}"));
+            let parsed = parse_frame(&line)
+                .unwrap_or_else(|error| panic!("float {value} _flen 왕복 실패: {error:?}"));
+            let decoded = parsed["result"]["value"].as_f64().expect("f64 필드");
+            assert_eq!(
+                decoded.to_bits(),
+                value.to_bits(),
+                "float {value}가 재파싱에서 비트 단위로 보존되지 않았다"
+            );
+        }
+    }
+
+    /// 6종을 **한 응답에 동시에** 실어도(실전 hwmon 스냅샷 형태) Drift 없이 통과하고
+    /// declared `_flen`이 실제 payload 길이와 일치함을 단언한다.
+    #[test]
+    fn wire_golden_float_payload_declares_exact_length() {
+        let reply = json!({
+            "id": 11, "ok": true,
+            "result": {
+                "cpu_percent": GOLDEN_F32_DERIVED[0],
+                "mem_percent": GOLDEN_F32_DERIVED[1],
+                "load_percent": GOLDEN_F32_DERIVED[2],
+                "sampled_at": GOLDEN_EPOCH_F64[0],
+                "started_at": GOLDEN_EPOCH_F64[1],
+                "expires_at": GOLDEN_EPOCH_F64[2],
+            }
+        });
+        let line = frame_response(&reply).expect("혼합 float 응답은 Drift 없이 프레이밍된다");
+        let decoded: Value = serde_json::from_str(line.trim_end()).unwrap();
+        let declared = decoded["_flen"].as_u64().expect("_flen 선언");
+        let actual = serde_json::to_string(&reply["result"]).unwrap().len() as u64;
+        assert_eq!(declared, actual, "declared _flen == 실제 payload 바이트 길이");
+        assert_eq!(decoded["_pv"].as_u64(), Some(PROTO_PV as u64));
+        // 왕복 검증까지 통과(LenMismatch/VersionSkew 없음).
+        let parsed = parse_frame(&line).expect("float 프레임 왕복");
+        assert_eq!(parsed["result"], reply["result"]);
+    }
+
+    /// WS-6 릴리스 계약 핀: `float_roundtrip` 활성과 `PROTO_PV=2`는 한 릴리스에 동반한다.
+    /// pv를 되돌리면 float 프레임 스큐가 graceful이 아니라 Critical로 오분류된다.
+    #[test]
+    fn wire_proto_pv_is_pinned_to_the_float_roundtrip_release() {
+        assert_eq!(PROTO_PV, 2, "float_roundtrip 릴리스의 와이어 마이너는 2다");
+    }
+
+    /// `CYS_ABI_VERIFY=0` 탈출구는 자기검증과 **메타 부착을 함께** 끈다 — 미검증 `_flen`이
+    /// 와이어에 흘러 상대 디코더의 LenMismatch를 오발화시키는 혼재 위험을 제거한다.
+    #[test]
+    fn wire_verify_optout_also_drops_meta() {
+        std::env::set_var("CYS_ABI_VERIFY", "0");
+        let line = frame_response(&sample_reply()).expect("탈출구에서도 한 줄은 나간다");
+        let decoded: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert!(decoded.get("_flen").is_none(), "검증 off면 _flen도 붙지 않는다");
+        assert!(decoded.get("_pv").is_none(), "검증 off면 _pv도 붙지 않는다");
+        assert_eq!(decoded["ok"].as_bool(), Some(true), "top-level은 그대로");
+        // 메타 없는 프레임 = legacy → 디코더가 무검증 수용.
+        assert!(parse_frame(&line).is_ok());
+        std::env::remove_var("CYS_ABI_VERIFY");
     }
 
     /// T4-5A: cap 이내 응답은 통과(None), cap 초과 응답은 fail-loud sentinel로 트렁케이트.

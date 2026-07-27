@@ -88,6 +88,16 @@ async fn main() {
     // 데몬 메모리 토큰과 불일치 → GUI 승인 Feed 우회가 무력화되어 Allow 전멸.
     let socket_path = cys::socket_path();
 
+    // ★WS-9 ①: boot-id 구간 마커는 **락 시도 이전**에 1줄 발행한다 — 락 경합의 패자도 exit(1) 전에
+    // 자기 구간 헤더를 남겨야 lock-loss 줄이 어느 부팅에 속하는지 사후 판별된다(패자 귀속).
+    // 승자용 라이브 구간 헤더는 회전 완료 직후 한 번 더 발행한다(아래 ②).
+    let boot_id = new_boot_id();
+    let daemon_state_dir = socket_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    eprintln!("{}", boot_marker_line(&boot_id, "pre-lock", &socket_path));
+
     // unix: flock 기반 startup 락 — 경합 시 hung 홀더는 데드맨이 회수·인수, 건강한 홀더/구 락파일은
     // fail-closed exit. 락 파일 핸들은 이 main 스코프에서 데몬 수명 동안 보유한다(핸들 drop = flock 해제 =
     // 게이트 소멸이므로 절대 조기 drop 금지 — accept_loop 는 반환하지 않아 main 종료까지 살아있다).
@@ -140,6 +150,26 @@ async fn main() {
             }
         }
     };
+
+    // ★WS-9 ②: 로그 회전은 싱글턴 게이트를 통과한 **승자만** 수행한다(패자가 회전하면 crashloop이
+    // 자기 증거를 지운다). 크기 게이트(10MB)·O_APPEND 실측 게이트는 maybe_rotate_daemon_log 안에 있다.
+    // 회전 완료 직후 라이브 구간 헤더를 1줄 더 발행 — 회전으로 비워진 cysd.log의 첫 줄이 이번 부팅
+    // 마커여야 "지금 보고 있는 로그가 어느 부팅인지"가 승자에 대해서도 성립한다.
+    maybe_rotate_daemon_log(&daemon_log_path(&daemon_state_dir));
+    eprintln!("{}", boot_marker_line(&boot_id, "live", &socket_path));
+    // 장수 데몬(수개월 무재부팅) 대비 주기 점검 — 부팅 시 1회 회전만으로는 10MB를 넘긴 채 무한 성장한다.
+    // heartbeat(W3)와 무관한 독립 interval 태스크다(데드맨 판정 입력 무접촉).
+    {
+        let log = daemon_log_path(&daemon_state_dir);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(LOG_ROTATE_CHECK_INTERVAL);
+            tick.tick().await; // 첫 tick 은 즉시 발화 — 위 부팅 회전과 중복이므로 소비한다.
+            loop {
+                tick.tick().await;
+                maybe_rotate_daemon_log(&log);
+            }
+        });
+    }
 
     // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
@@ -428,6 +458,150 @@ fn log_lock_loss(state_dir: &std::path::Path, lock_path: &std::path::Path, reaso
             "error: another cysd holds the startup lock ({}) — reason={reason}, occurrence #{count}",
             lock_path.display()
         );
+    }
+}
+
+// ─────────────────────────── WS-9: boot-id 구간 마커 + 로그 회전 ───────────────────────────
+//
+// F12(로그 무한 성장·구간 미상)의 수리. 두 축이다:
+//   ① **boot-id 구간 마커**: 부팅마다 16자리 hex 구간 ID를 로그에 심어 "이 줄이 어느 부팅의 것인가"를
+//      결정론으로 판별한다. 락 시도 **이전**(패자 귀속) + 회전 직후(승자 라이브 헤더) 총 2회 발행.
+//   ② **copy-truncate 회전**: 라이브 기록자(launchd fd·앱스폰·부서 셸 리다이렉트)가 쥔 inode를 보존해야
+//      하므로 `cysd.log` 자체는 rename 하지 않고 **복사 후 truncate(0)** 한다. 세대 이동(.2→.3, .1→.2)은
+//      라이브 기록자가 없으므로 rename(원자적·무복사)을 쓴다.
+//
+// ★치명 전제(실측 확증): copy-truncate는 기록자 fd가 **O_APPEND일 때만** 안전하다. non-append 기록자는
+//   자기 파일 오프셋을 그대로 유지하므로 truncate 후 첫 write가 10MB 지점에 착지해 **거대한 NUL 홀**을
+//   만든다(로그가 NUL 늪이 되어 F12보다 나쁜 상태). HQ 데몬 로그 fd는 O_APPEND(`AP`)지만 **부서 데몬
+//   로그 fd는 O_APPEND가 아니다**(`W,0x10000;SH`). 따라서 회전 직전 fcntl(F_GETFL)로 실측하고 미충족이면
+//   **회전을 스킵**한다(경고 1줄). 근본 수리(부팅 시 자기 로그 fd를 O_APPEND로 재개설해 dup2)는 후속 티켓.
+
+/// 회전 임계 — cysd.log가 이 크기 이상일 때만 회전한다. **크기 게이트는 필수**: 조건 없이 매 부팅
+/// 회전하면 crashloop 3회에 보관 세대(.1/.2/.3)가 전부 밀려나 crashloop의 증거를 crashloop이 지운다.
+const LOG_ROTATE_THRESHOLD: u64 = 10 * 1024 * 1024;
+/// 장수 데몬 대비 주기 점검 간격(24h).
+const LOG_ROTATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// 보관 세대 수 — cysd.log.1 ~ .3.
+const LOG_ROTATE_GENERATIONS: u32 = 3;
+
+/// 데몬 로그 경로 — 소켓 스코프별(`state_dir/cysd.log`). 본부·부서는 소켓이 다르므로 **다른 파일**이며,
+/// 공유는 동일 스코프 내 기록자들(launchd + 앱스폰 + 중첩 기동) 사이에서만 발생한다.
+fn daemon_log_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("cysd.log")
+}
+
+/// 부팅 구간 ID(16 hex). **신규 크레이트 도입 금지** — 기존 CSPRNG(channels::random_token_hex)를
+/// 앞 16자만 쓰고, 그마저 실패하면 pid+나노초 조합으로 폴백한다. boot-id는 인가 토큰이 아니라
+/// 구간 라벨이므로 예측 가능해도 무해하다(폴백 허용 근거 — random_token_hex의 hard-fail 정책과 별개).
+fn new_boot_id() -> String {
+    if let Ok(t) = channels::random_token_hex() {
+        if t.len() >= 16 {
+            return t[..16].to_string();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:08x}{:08x}", std::process::id(), nanos as u32)
+}
+
+/// 구간 마커 1줄을 만든다(순수 — 테스트 가능). **80자 이내** 계약: phoenix 하네스가 두 번째 cysd의
+/// 결합 출력을 400자로 절단해 `holds the startup lock` 리터럴을 찾으므로(javis_phoenix_harness.py:788-798),
+/// 마커가 길면 그 리터럴을 400자 밖으로 밀어내 락 경합 드릴이 거짓 NOT-REPRODUCED가 된다.
+/// 소켓 전체 경로를 넣으면 80자를 넘길 수 있으므로 넘칠 때만 파일명으로 축약한다.
+fn boot_marker_line(boot_id: &str, phase: &str, socket_path: &std::path::Path) -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    let full = socket_path.display().to_string();
+    let line = format!("[cysd] ==== boot={boot_id} v={v} {phase} sock={full} ====");
+    if line.len() <= 80 {
+        return line;
+    }
+    let short = socket_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "?".into());
+    format!("[cysd] ==== boot={boot_id} v={v} {phase} sock={short} ====")
+}
+
+/// 회전 기록자 안전성 실측 — 우리 로그 fd(stdout·stderr)가 **둘 다** O_APPEND인가.
+/// 하나라도 아니면 copy-truncate가 NUL 홀을 만드므로 회전을 포기한다(fail-closed).
+/// tty·파이프(개발 실행·phoenix 하네스 캡처)도 O_APPEND가 아니므로 자연히 스킵된다 — 의도된 보수성이다.
+#[cfg(unix)]
+fn log_fds_are_append() -> bool {
+    use std::os::unix::io::RawFd;
+    let is_append = |fd: RawFd| {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags & libc::O_APPEND) != 0
+    };
+    is_append(1) && is_append(2)
+}
+
+/// windows: fcntl이 없다 — best-effort로 회전을 시도하고 실패는 무시한다(다른 기록자의 공유 모드에
+/// 따라 복사·truncate가 실패할 수 있다).
+#[cfg(windows)]
+fn log_fds_are_append() -> bool {
+    true
+}
+
+/// `cysd.log` → `cysd.log.<n>` 세대 경로.
+fn log_generation_path(log: &std::path::Path, n: u32) -> std::path::PathBuf {
+    let mut name = log
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("cysd.log"));
+    name.push(format!(".{n}"));
+    log.with_file_name(name)
+}
+
+/// 0바이트가 아닌 파일만 대상으로 하는 존재 판정(부서 셸 `>` 리다이렉트가 만든 빈 파일이 무한히
+/// `.N`으로 승격되는 것을 막는다).
+fn nonempty(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// 세대 이동 + copy-truncate 실행부(게이트 통과 후에만 호출 — 단위 테스트가 직접 부른다).
+///
+/// 순서 불변식: `.2→.3`, `.1→.2`는 **rename**(원자적·무복사 — 라이브 기록자가 없는 파일이다),
+/// `cysd.log → .1`만 **복사 후 truncate(0)**(라이브 기록자가 쥔 inode 보존).
+///
+/// 알려진 고유 한계: 복사 시작~truncate 사이에 도착한 소량 라인은 유실될 수 있다(logrotate copytruncate와
+/// 동일). 10MB 시점의 수 라인 손실은 수용한다.
+fn rotate_log_generations(log: &std::path::Path) -> std::io::Result<()> {
+    for n in (1..LOG_ROTATE_GENERATIONS).rev() {
+        let from = log_generation_path(log, n);
+        let to = log_generation_path(log, n + 1);
+        if nonempty(&from) {
+            let _ = std::fs::rename(&from, &to); // best-effort — 실패해도 아래 단계는 진행한다.
+        }
+    }
+    std::fs::copy(log, log_generation_path(log, 1))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(log)?
+        .set_len(0)?;
+    Ok(())
+}
+
+/// 크기 게이트 + O_APPEND 실측 게이트를 통과할 때만 회전한다. 어떤 실패도 데몬 부팅을 막지 않는다.
+fn maybe_rotate_daemon_log(log: &std::path::Path) {
+    let len = match std::fs::metadata(log) {
+        Ok(m) => m.len(),
+        Err(_) => return, // 로그 파일 없음(포그라운드 실행 등) — 무해 스킵.
+    };
+    if len < LOG_ROTATE_THRESHOLD {
+        return;
+    }
+    if !log_fds_are_append() {
+        eprintln!(
+            "[cysd] log rotation skipped: log fd is not O_APPEND — copy-truncate would punch a NUL hole ({} bytes)",
+            len
+        );
+        return;
+    }
+    match rotate_log_generations(log) {
+        Ok(()) => eprintln!("[cysd] log rotated: {len} bytes → cysd.log.1 (copy-truncate)"),
+        Err(e) => eprintln!("[cysd] log rotation failed (skipped): {e}"),
     }
 }
 
@@ -1729,6 +1903,156 @@ where
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
             Err("timeout".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cysd-logrot-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn boot_marker_is_within_80_chars_even_for_long_socket_paths() {
+        // 계약: phoenix 하네스가 두 번째 cysd 출력을 400자로 절단해 `holds the startup lock`을 찾는다
+        // (javis_phoenix_harness.py:788-798). 마커가 길면 그 리터럴이 절단면 밖으로 밀린다.
+        let short = std::path::Path::new("/tmp/c.sock");
+        let line = boot_marker_line("0123456789abcdef", "pre-lock", short);
+        assert!(line.len() <= 80, "짧은 경로 마커 {}자: {line}", line.len());
+        assert!(line.contains("boot=0123456789abcdef"));
+        assert!(line.contains("pre-lock"));
+
+        let long = std::path::Path::new(
+            "/Users/some-very-long-user-name/Library/Application Support/cysjavis/dept-alpha/cysd.sock",
+        );
+        let line = boot_marker_line("0123456789abcdef", "live", long);
+        assert!(line.len() <= 80, "긴 경로 마커 {}자: {line}", line.len());
+        assert!(line.contains("cysd.sock"), "축약해도 스코프 식별자는 남는다: {line}");
+    }
+
+    #[test]
+    fn boot_id_is_16_hex_chars_and_varies() {
+        let a = new_boot_id();
+        assert_eq!(a.len(), 16, "boot-id는 16자: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "hex만: {a}");
+        let b = new_boot_id();
+        assert_ne!(a, b, "부팅마다 달라야 구간 판별이 성립한다");
+    }
+
+    #[test]
+    fn size_gate_blocks_rotation_below_threshold() {
+        // ★크기 게이트가 없으면 crashloop 3회에 전 이력이 소멸한다(회귀 핀).
+        let d = tmp_dir("gate");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, b"small").unwrap();
+        maybe_rotate_daemon_log(&log);
+        assert!(
+            !log_generation_path(&log, 1).exists(),
+            "임계 미만은 회전 금지"
+        );
+        assert_eq!(std::fs::read(&log).unwrap(), b"small", "원본 무손상");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn rotation_moves_generations_and_truncates_live_inode() {
+        let d = tmp_dir("rot");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, b"current").unwrap();
+        std::fs::write(log_generation_path(&log, 1), b"gen1").unwrap();
+        std::fs::write(log_generation_path(&log, 2), b"gen2").unwrap();
+
+        // 라이브 기록자를 모사 — 회전 후에도 **같은 fd**로 계속 쓸 수 있어야 한다(inode 보존).
+        #[cfg(unix)]
+        let live_ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&log).unwrap().ino()
+        };
+
+        rotate_log_generations(&log).unwrap();
+
+        assert_eq!(std::fs::read(log_generation_path(&log, 3)).unwrap(), b"gen2");
+        assert_eq!(std::fs::read(log_generation_path(&log, 2)).unwrap(), b"gen1");
+        assert_eq!(
+            std::fs::read(log_generation_path(&log, 1)).unwrap(),
+            b"current"
+        );
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0, "원본은 truncate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().ino(),
+                live_ino,
+                "cysd.log inode 보존(rename 금지) — 라이브 기록자 fd가 유령 inode로 새지 않는다"
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn empty_generation_files_are_not_promoted() {
+        // 부서 셸 `>` 리다이렉트가 만든 0바이트 파일이 무한히 `.N`으로 승격되는 것을 막는다.
+        let d = tmp_dir("empty");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, b"current").unwrap();
+        std::fs::write(log_generation_path(&log, 1), b"").unwrap();
+        rotate_log_generations(&log).unwrap();
+        assert!(
+            !log_generation_path(&log, 2).exists(),
+            "0바이트 세대는 승격 금지"
+        );
+        assert_eq!(
+            std::fs::read(log_generation_path(&log, 1)).unwrap(),
+            b"current",
+            "빈 .1은 그대로 덮어쓴다"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn missing_log_is_a_no_op() {
+        let d = tmp_dir("absent");
+        maybe_rotate_daemon_log(&daemon_log_path(&d));
+        assert!(!daemon_log_path(&d).exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_append_fd_gate_skips_rotation() {
+        // ★실측 확증: 부서 데몬 로그 fd는 O_APPEND가 아니다 → copy-truncate 시 NUL 홀 발생.
+        // 테스트 프로세스의 stdout/stderr는 파이프·tty(비 O_APPEND)이므로 게이트가 닫혀야 한다.
+        assert!(
+            !log_fds_are_append(),
+            "테스트 하니스의 stdout/stderr는 O_APPEND가 아니다"
+        );
+        let d = tmp_dir("noappend");
+        let log = daemon_log_path(&d);
+        std::fs::write(&log, vec![b'x'; (LOG_ROTATE_THRESHOLD + 1) as usize]).unwrap();
+        maybe_rotate_daemon_log(&log);
+        assert!(
+            !log_generation_path(&log, 1).exists(),
+            "non-append 기록자면 회전 스킵(NUL 홀 방지)"
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            LOG_ROTATE_THRESHOLD + 1,
+            "스킵 시 원본 무손상"
+        );
+        std::fs::remove_dir_all(&d).ok();
     }
 }
 

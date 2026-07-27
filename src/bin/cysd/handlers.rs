@@ -7458,6 +7458,29 @@ mod tests {
         let resp = json!({"id": 1, "ok": true, "result": {"item": item}});
         let framed = cys::wire::frame_response(&resp);
         assert!(framed.is_ok(), "새 serde 필드가 ABI Drift 유발: {framed:?}");
+
+        // ★WS-6: float 필드 케이스 — f32 유래 실측치(hwmon CPU·메모리 %)와 소수부 epoch를
+        // 같은 응답에 실어도 producer 자기검증이 Drift 없이 통과하고 _flen 왕복이 성립해야 한다.
+        // (serde_json `float_roundtrip` 미활성 시 재파싱이 1 ulp 어긋나 Critical로 발화하던 지점.)
+        let float_resp = json!({
+            "id": 2, "ok": true,
+            "result": {
+                "item": item,
+                "cpu_percent": 97.15709686279297_f64,
+                "mem_percent": 18.764999389648438_f64,
+                "load_percent": 56.920005798339844_f64,
+                "sampled_at": 1_753_660_800.123_456_7_f64,
+            }
+        });
+        let float_framed =
+            cys::wire::frame_response(&float_resp).expect("float 필드가 ABI Drift 유발");
+        let parsed = cys::wire::parse_frame(&float_framed).expect("float 프레임 _flen 왕복 실패");
+        assert_eq!(
+            parsed["result"]["cpu_percent"].as_f64().unwrap().to_bits(),
+            97.15709686279297_f64.to_bits(),
+            "float가 재파싱에서 비트 단위로 보존되지 않았다"
+        );
+        assert_eq!(parsed["result"]["item"], float_resp["result"]["item"]);
     }
 
     /// W3.6 back-pressure: 임계 초과 시 approval.backpressure 이벤트 + org.status 노출 + deny 카운터.

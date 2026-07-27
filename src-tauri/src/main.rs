@@ -92,6 +92,18 @@ static BROWSER_APP_SESSION: std::sync::RwLock<Option<String>> = std::sync::RwLoc
 /// registration"(코드 GUI_NOT_REGISTERED). rpc()는 error.message만 올리므로 이 부분열로 판별한다.
 /// 문자열 정합은 broker_registration_lost_marker_matches_broker_source 테스트가 보장.
 const BROKER_REGISTRATION_LOST_MARKER: &str = "no broker-owned registration";
+
+/// GUI가 **분기**하는 브로커 실패 코드(자가 회복 판정). 문자열 정합은
+/// `gui_branch_codes_exist_in_broker_source` 트립와이어가 컴파일 시점 임베드로 보장한다.
+const GUI_NOT_REGISTERED_CODE: &str = "GUI_NOT_REGISTERED";
+const GUI_IDENTITY_MISMATCH_CODE: &str = "GUI_IDENTITY_MISMATCH";
+/// 데몬 응답이 아예 없는 전송 계층 실패(연결 끊김·직렬화) — 데몬 code가 존재하지 않는 경우.
+const RPC_TRANSPORT_FAILED_CODE: &str = "RPC_TRANSPORT_FAILED";
+/// 데몬이 error.code 없이 message만 준 경우(구 데몬 스큐) — 배너 형식을 깨지 않기 위한 자리표.
+const RPC_UNCODED_ERROR_CODE: &str = "RPC_UNCODED_ERROR";
+/// ok 응답인데 GUI가 요구하는 필드가 없거나 형식이 어긋난 경우(데몬 스큐·계약 위반).
+const RPC_MALFORMED_RESPONSE_CODE: &str = "RPC_MALFORMED_RESPONSE";
+
 static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
     std::sync::OnceLock::new();
 
@@ -255,12 +267,16 @@ fn browser_session_params(mut params: Value) -> Result<Value, String> {
     Ok(params)
 }
 
-async fn register_browser_gui_peer() -> Result<(), String> {
-    let challenge = rpc("browser.runtime.gui_challenge", json!({})).await?;
+/// 등록 체인도 code 보존형(`rpc_on_full`) — `GUI_REGISTRATION_LIMIT`·`GUI_IDENTITY_REJECTED`·
+/// `GUI_REGISTRATION_REPLAY`가 message만 남고 소멸하면 등록 실패 진단이 반쪽이 된다(WS-1).
+async fn register_browser_gui_peer() -> Result<(), RpcFailure> {
+    let challenge = rpc_coded("browser.runtime.gui_challenge", json!({})).await?;
     let registration_secret = challenge["registration_challenge"]
         .as_str()
-        .ok_or_else(|| "cysd returned no Browser GUI registration challenge".to_string())?;
-    let registration = rpc(
+        .ok_or_else(|| {
+            RpcFailure::malformed("cysd returned no Browser GUI registration challenge")
+        })?;
+    let registration = rpc_coded(
         "browser.runtime.register_gui",
         json!({"registration_secret":registration_secret}),
     )
@@ -268,7 +284,7 @@ async fn register_browser_gui_peer() -> Result<(), String> {
     let session = registration["app_session"]
         .as_str()
         .filter(|value| value.len() == 64)
-        .ok_or_else(|| "cysd returned an invalid Browser GUI session".to_string())?
+        .ok_or_else(|| RpcFailure::malformed("cysd returned an invalid Browser GUI session"))?
         .to_string();
     // 덮어쓰기: 데몬 재시작으로 대장이 갱신되면 낡은 세션을 새 세션으로 교체한다(OnceLock의
     // 실패-무시 set 대체). write 가드는 이 대입 문에서 즉시 drop된다(await 경계 안 넘김).
@@ -373,6 +389,93 @@ async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Resu
     serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())
 }
 
+/// 데몬 실패의 **사인(code)을 보존**하는 실패 값 — `rpc_on`/`rpc_oneshot`이 message만 올려
+/// 배너에서 사인이 소멸하던 진단 블랙홀(WS-1 F1·F2)의 수리 단위다. 배너 문구는 기존 대괄호
+/// 규약 `BROWSER_DISABLED_SAFE [<CODE>]: <message>`(`[NATIVE_ACTIVATION_REQUIRED]` 선례,
+/// `ui/src/castdiag.test.ts` 픽스처)의 확장이며 **신설 형식이 아니다**.
+#[derive(Debug, Clone, PartialEq)]
+struct RpcFailure {
+    code: String,
+    message: String,
+}
+
+impl RpcFailure {
+    /// 전송 계층 실패(연결 끊김·직렬화) — 데몬 응답 자체가 없어 code가 존재하지 않는다.
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            code: RPC_TRANSPORT_FAILED_CODE.to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// ok 응답인데 GUI가 요구하는 필드가 없는 경우 — 데몬 실패가 아니라 계약 어긋남이다.
+    fn malformed(message: impl Into<String>) -> Self {
+        Self {
+            code: RPC_MALFORMED_RESPONSE_CODE.to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// `{"ok":false,"error":{...}}` 응답에서 code/message를 뽑는다. code 부재(구 데몬 스큐)는
+    /// 자리표 코드로 채워 배너 형식을 유지한다 — message는 기존 계약(`unknown error`)과 동일.
+    fn from_error_response(resp: &Value) -> Self {
+        Self {
+            code: resp["error"]["code"]
+                .as_str()
+                .filter(|code| !code.is_empty())
+                .unwrap_or(RPC_UNCODED_ERROR_CODE)
+                .to_string(),
+            message: resp["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string(),
+        }
+    }
+
+    /// GUI 배너 1줄. 사인을 선두에 실어 절단(`castFailureReason`)에도 code가 살아남게 한다.
+    fn banner(&self) -> String {
+        format!("BROWSER_DISABLED_SAFE [{}]: {}", self.code, self.message)
+    }
+
+    /// 데몬 재시작으로 브로커 등록 대장이 소실된 상황인가 — **code 우선**, 구 데몬(코드 미탑재·
+    /// 스큐) 대비 marker 문자열 폴백 유지. `GUI_IDENTITY_MISMATCH`도 재등록으로 회복 가능한
+    /// 동일 부류다(대장에서 자기 세션이 제거된 뒤이므로 재등록이 정확한 처방).
+    fn is_gui_registration_lost(&self) -> bool {
+        self.code == GUI_NOT_REGISTERED_CODE
+            || self.code == GUI_IDENTITY_MISMATCH_CODE
+            || self.message.contains(BROKER_REGISTRATION_LOST_MARKER)
+    }
+}
+
+/// 데몬 전체 응답 → `result` 또는 `{code,message}`. `rpc_on`/`rpc_oneshot`의 unwrap과 동일한
+/// 판정(ok==true)이며 실패 측만 code를 보존한다.
+fn unwrap_rpc_result(resp: Value) -> Result<Value, RpcFailure> {
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(RpcFailure::from_error_response(&resp))
+    }
+}
+
+/// `rpc_on`의 code 보존형 — **연결 모델은 그대로 풀(rpc_full) 경유**다. 브라우저 체인 중
+/// 풀을 쓰던 호출(issue_gesture·prepare_embed)과 등록 체인(gui_challenge·register_gui)만
+/// 이 함수로 승격한다. 기존 `rpc`/`rpc_on` 소비자는 무영향.
+async fn rpc_on_full(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcFailure> {
+    let resp = rpc_full(socket, method, params)
+        .await
+        .map_err(RpcFailure::transport)?;
+    unwrap_rpc_result(resp)
+}
+
+/// 기본 소켓 code 보존형 RPC (`rpc`의 대응물).
+async fn rpc_coded(method: &str, params: Value) -> Result<Value, RpcFailure> {
+    rpc_on_full(&default_socket(), method, params).await
+}
+
 #[tauri::command]
 async fn daemon_status(socket: Option<String>) -> Result<Value, String> {
     rpc_on(
@@ -405,7 +508,18 @@ async fn org_status(socket: Option<String>) -> Result<Value, String> {
 /// 공유 풀(conn_cell)을 desync로 오염시키지 않는다(같은 부서로 가는 send_key/org_status 응답 귀속 보호).
 /// 적대검증 R-1 교정: rpc_on을 timeout으로 감싸면 취소 시 풀 연결이 미수신 응답을 남겨 후속 RPC가
 /// stale 응답을 잘못 읽는다 — 일회성 연결은 드롭이 곧 연결 종료라 공유 상태를 건드리지 않는다.
-async fn rpc_oneshot(
+async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    // 기존 9개 호출부의 문자열 계약(message만)을 그대로 보존하는 얇은 래퍼.
+    rpc_oneshot_checked(socket, method, params)
+        .await
+        .map_err(|failure| failure.message)
+}
+
+/// `rpc_oneshot`의 전송·파싱 본체 — 데몬 응답 **전체**(ok/result/error.code)를 반환한다.
+/// ★`rpc_full` 직사용 금지(설계 §3-1): `rpc_full`은 소켓별 풀 셀을 응답까지 점유하므로 ensure
+/// 40s 동안 기본 소켓의 전 GUI RPC가 직렬 대기하는 동결을 만든다. 일회성 연결은 드롭이 곧 연결
+/// 종료라 공유 상태를 건드리지 않는다.
+async fn rpc_oneshot_full(
     socket: &std::path::Path,
     method: &str,
     params: Value,
@@ -425,15 +539,19 @@ async fn rpc_oneshot(
     if n == 0 {
         return Err("connection closed".into());
     }
-    let resp: Value = serde_json::from_str(resp.trim()).map_err(|e| e.to_string())?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err(resp["error"]["message"]
-            .as_str()
-            .unwrap_or("unknown error")
-            .to_string())
-    }
+    serde_json::from_str(resp.trim()).map_err(|e| e.to_string())
+}
+
+/// 일회성 연결 + code 보존 — 브라우저 체인(ensure·cancel) 전용.
+async fn rpc_oneshot_checked(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcFailure> {
+    let resp = rpc_oneshot_full(socket, method, params)
+        .await
+        .map_err(RpcFailure::transport)?;
+    unwrap_rpc_result(resp)
 }
 
 /// Tasks Control Center — 모든 부서의 모든 노드를 한 콜로 집계한다("부서 다중소켓 보드").
@@ -1003,32 +1121,35 @@ async fn ensure_browserd_cast(
     if BROWSER_APP_SESSION.read().unwrap().is_none() {
         register_browser_gui_peer()
             .await
-            .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+            .map_err(|failure| failure.banner())?;
     }
     let issue_params = browser_session_params(json!({
         "window_label":window.label(),
         "pane_nonce":pane_nonce,
     }))?;
-    let issued = match rpc("browser.runtime.issue_gesture", issue_params).await {
+    let issued = match rpc_coded("browser.runtime.issue_gesture", issue_params).await {
         Ok(value) => value,
         // 브로커 등록 대장은 데몬 메모리 — 데몬 재시작 시 소실되므로 낡은 세션 거부를 만나면 1회
         // 재등록·재시도로 자가 회복한다(v0.13.10 실사고: 됐다안됐다 간헐 실패). one-time activation은
         // 이미 consume된 뒤이므로 재시도에 새 클릭이 필요 없다(consume은 함수 초입 1회 — 재시도는 rpc만).
-        Err(error) if error.contains(BROKER_REGISTRATION_LOST_MARKER) => {
+        // ★판정은 code 우선(GUI_NOT_REGISTERED·GUI_IDENTITY_MISMATCH) + marker 문자열 폴백
+        // (is_gui_registration_lost). identity mismatch는 종전 marker 매칭에 걸리지 않아 클릭 1회를
+        // 통째로 잃었다(브로커가 대장에서 세션을 제거한 직후라 재등록이 정확한 처방이다).
+        Err(failure) if failure.is_gui_registration_lost() => {
             *BROWSER_APP_SESSION.write().unwrap() = None;
             register_browser_gui_peer()
                 .await
-                .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?;
+                .map_err(|failure| failure.banner())?;
             let retry_params = browser_session_params(json!({
                 "window_label":window.label(),
                 "pane_nonce":pane_nonce,
             }))?;
             // 재시도도 실패하면 그 에러로 fail-closed(무한루프 금지 — 재등록·재시도는 각 1회 한정).
-            rpc("browser.runtime.issue_gesture", retry_params)
+            rpc_coded("browser.runtime.issue_gesture", retry_params)
                 .await
-                .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))?
+                .map_err(|failure| failure.banner())?
         }
-        Err(error) => return Err(format!("BROWSER_DISABLED_SAFE: {error}")),
+        Err(failure) => return Err(failure.banner()),
     };
     let gesture_receipt = issued["gesture_receipt"].as_str().ok_or_else(|| {
         "BROWSER_DISABLED_SAFE: broker returned no activation receipt".to_string()
@@ -1040,7 +1161,7 @@ async fn ensure_browserd_cast(
         .insert("request_id".into(), Value::String(request_id.clone()));
     let ensure = tokio::time::timeout(
         std::time::Duration::from_secs(TAURI_BROWSER_ENSURE_DEADLINE_SECS),
-        rpc_oneshot(
+        rpc_oneshot_checked(
             &default_socket(),
             "browser.runtime.ensure",
             browser_session_params(intent)?,
@@ -1049,9 +1170,15 @@ async fn ensure_browserd_cast(
     .await;
     match ensure {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => return Err(format!("BROWSER_DISABLED_SAFE: {error}")),
+        Ok(Err(failure)) => return Err(failure.banner()),
         Err(_) => {
-            let _ = cancel_browser_request(&pane_nonce, &request_id).await;
+            if let Err(failure) = cancel_browser_request(&pane_nonce, &request_id).await {
+                // 취소 실패는 배너를 덮지 않는다(원인은 timeout) — 사인만 로그로 남긴다.
+                eprintln!(
+                    "[cys-app] browser cancel after ensure timeout failed: [{}] {}",
+                    failure.code, failure.message
+                );
+            }
             return Err(format!(
                 "BROWSER_DISABLED_SAFE [RUNTIME_START_TIMEOUT]: broker did not answer in {}s",
                 TAURI_BROWSER_ENSURE_DEADLINE_SECS
@@ -1059,22 +1186,26 @@ async fn ensure_browserd_cast(
         }
     }
     let embed = browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)?;
-    rpc(
+    rpc_coded(
         "browser.runtime.prepare_embed",
         browser_session_params(embed)?,
     )
     .await
-    .map_err(|error| format!("BROWSER_DISABLED_SAFE: {error}"))
+    .map_err(|failure| failure.banner())
 }
 
-async fn cancel_browser_request(pane_nonce: &str, request_id: &str) -> Result<Value, String> {
-    rpc_oneshot(
+async fn cancel_browser_request(
+    pane_nonce: &str,
+    request_id: &str,
+) -> Result<Value, RpcFailure> {
+    rpc_oneshot_checked(
         &default_socket(),
         "browser.runtime.cancel",
         browser_session_params(json!({
             "pane_nonce":pane_nonce,
             "request_id":request_id,
-        }))?,
+        }))
+        .map_err(RpcFailure::malformed)?,
     )
     .await
 }
@@ -1090,7 +1221,11 @@ async fn cancel_browserd_cast(pane_nonce: String, request_id: String) -> Result<
     if !valid_credential(&pane_nonce) || !valid_credential(&request_id) {
         return Err("invalid Browser cancellation identity".into());
     }
-    cancel_browser_request(&pane_nonce, &request_id).await
+    // 취소 실패는 브라우저 비활성화 사건이 아니므로 BROWSER_DISABLED_SAFE 배너를 쓰지 않는다 —
+    // 대괄호 사인 규약만 공유한다.
+    cancel_browser_request(&pane_nonce, &request_id)
+        .await
+        .map_err(|failure| format!("[{}]: {}", failure.code, failure.message))
 }
 
 /// 복원용 passive descriptor 조회. `prepare_embed`은 cysd의 이미 호환 판정된 live runtime에만
@@ -1111,9 +1246,17 @@ async fn browserd_state(
     let Ok(embed) = browser_session_params(embed) else {
         return json!({"alive":false});
     };
-    match rpc("browser.runtime.prepare_embed", embed).await {
+    // ★WS-1 code 전파의 논리적 연장(설계 §7-0-A 3): 종전에는 모든 Err를 `{alive:false}`로 뭉개
+    // passive 경로(pane 복원·5s 재시도)에서 실패 사유가 통째로 소실됐다 — UNSUPPORTED·
+    // GUI_IDENTITY_MISMATCH 같은 사인이 사용자에게 영영 도달하지 못한다. code/message를 함께 싣되
+    // alive 계약은 불변이라 기존 소비자(`state.alive` 판정)는 무영향이다.
+    match rpc_on_full(&default_socket(), "browser.runtime.prepare_embed", embed).await {
         Ok(descriptor) => json!({"alive":true,"descriptor":descriptor}),
-        Err(_) => json!({"alive":false}),
+        Err(failure) => json!({
+            "alive":false,
+            "code":failure.code,
+            "message":failure.message,
+        }),
     }
 }
 
@@ -3929,9 +4072,39 @@ fn main() {
                     );
                     return;
                 }
-                if let Err(error) = register_browser_gui_peer().await {
-                    eprintln!("[cys-app] Browser GUI registration failed closed: {error}");
-                    let _ = handle.emit("browser-disabled-safe", error);
+                // ★부트 등록 재시도(설계 §6-3): 종전에는 1회 실패를 로그만 찍고 흘려보내 GUI가
+                // 세션 없이 부팅했다(첫 클릭이 통째로 지연 재등록에 소모 — 실패하면 그대로 죽음).
+                // 재시도는 **부트 임계 경로 밖**에서만 한다 — spawn으로 떼어내 daemon-ready·
+                // event-forwarder·온보딩을 45초간 막지 않는다.
+                if let Err(failure) = register_browser_gui_peer().await {
+                    eprintln!(
+                        "[cys-app] Browser GUI registration failed closed: [{}] {} — 15s 간격 3회 재시도",
+                        failure.code, failure.message
+                    );
+                    let retry_handle = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut last = failure;
+                        for attempt in 1..=3u32 {
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                            match register_browser_gui_peer().await {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "[cys-app] Browser GUI registration recovered on retry {attempt}/3"
+                                    );
+                                    return;
+                                }
+                                Err(failure) => {
+                                    eprintln!(
+                                        "[cys-app] Browser GUI registration retry {attempt}/3 failed: [{}] {}",
+                                        failure.code, failure.message
+                                    );
+                                    last = failure;
+                                }
+                            }
+                        }
+                        // 최종 실패만 배너로 소재화한다 — 사인이 선두에 실린 대괄호 규약.
+                        let _ = retry_handle.emit("browser-disabled-safe", last.banner());
+                    });
                 }
                 let _ = handle.emit("daemon-ready", ());
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
@@ -4920,5 +5093,122 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             "GUI peer has no broker-owned registration".contains(BROKER_REGISTRATION_LOST_MARKER),
             "판별 마커가 브로커 메시지의 부분열이 아님 — 자가 회복 미발동 위험"
         );
+    }
+
+    /// [WS-1] GUI가 **분기**하는 브로커 code 상수가 실제 브로커 소스에 실재하는지 확인한다.
+    /// 브로커가 code를 개명·삭제하면 자가 회복(재등록·재시도)이 조용히 죽는다 — marker 폴백이
+    /// 남아 있어 무증상으로 넘어가므로 컴파일 시점에 잡아야 한다.
+    /// 음성 대조군(존재하지 않는 code)을 함께 둬 이 단언이 공허 참이 아님을 증명한다.
+    #[test]
+    fn gui_branch_codes_exist_in_broker_source() {
+        let broker_src = include_str!("../../src/bin/cysd/authority_broker/mod.rs");
+        for code in [GUI_NOT_REGISTERED_CODE, GUI_IDENTITY_MISMATCH_CODE] {
+            assert!(
+                broker_src.contains(&format!("\"{code}\"")),
+                "브로커 소스에 {code} 가 없음 — GUI 자가 회복 분기가 죽는다(코드 개명·삭제 의심)"
+            );
+        }
+        // 음성 대조군: 실재하지 않는 code는 잡히면 안 된다(부분열 오탐 방지 포함).
+        for absent in ["\"GUI_NOT_REGISTERED_V2\"", "\"GUI_IDENTITY_MISMATCHED\""] {
+            assert!(
+                !broker_src.contains(absent),
+                "음성 대조군 {absent} 이 브로커 소스에 존재 — 트립와이어 판정이 무의미해짐"
+            );
+        }
+    }
+
+    /// [WS-1] 배너 대괄호 규약(`BROWSER_DISABLED_SAFE [<CODE>]: <message>`)이 UI 픽스처와
+    /// 동일한 형식인지 컴파일 시점에 대조한다. UI가 새 형식을 만들거나 Rust가 규약을 바꾸면
+    /// castdiag/webpane의 진단 보강이 원문 통과로 무력화된다.
+    #[test]
+    fn banner_bracket_convention_matches_ui_fixture() {
+        let castdiag_src = include_str!("../../ui/src/castdiag.test.ts");
+        assert!(
+            castdiag_src.contains("BROWSER_DISABLED_SAFE [NATIVE_ACTIVATION_REQUIRED]"),
+            "UI 픽스처의 대괄호 배너 규약 소실 — Rust 배너 형식과 어긋남"
+        );
+        let failure = RpcFailure {
+            code: GUI_IDENTITY_MISMATCH_CODE.to_string(),
+            message: "GUI PID incarnation changed".to_string(),
+        };
+        assert_eq!(
+            failure.banner(),
+            "BROWSER_DISABLED_SAFE [GUI_IDENTITY_MISMATCH]: GUI PID incarnation changed"
+        );
+        // 음성 대조군: 종전의 code 없는 형식(`BROWSER_DISABLED_SAFE: `)으로 회귀하지 않는다.
+        assert!(!failure.banner().starts_with("BROWSER_DISABLED_SAFE: "));
+    }
+
+    /// [WS-1] 데몬 응답 → {code,message} 분해. code 부재(구 데몬 스큐)에도 배너 형식이 깨지지
+    /// 않아야 하고, ok 응답의 result 계약은 기존 rpc_on/rpc_oneshot과 동일해야 한다.
+    #[test]
+    fn unwrap_rpc_result_preserves_code_and_message() {
+        let ok = unwrap_rpc_result(json!({"ok":true,"result":{"port":9222}}));
+        assert_eq!(ok.unwrap()["port"], json!(9222));
+
+        let coded = unwrap_rpc_result(
+            json!({"ok":false,"error":{"code":"GUI_REGISTRATION_LIMIT","message":"too many GUI peers"}}),
+        )
+        .unwrap_err();
+        assert_eq!(coded.code, "GUI_REGISTRATION_LIMIT");
+        assert_eq!(coded.message, "too many GUI peers");
+
+        // code 부재·빈 문자열은 자리표로 채운다(배너 형식 유지). message 폴백은 기존 계약 유지.
+        let uncoded = unwrap_rpc_result(json!({"ok":false,"error":{"message":"boom"}})).unwrap_err();
+        assert_eq!(uncoded.code, RPC_UNCODED_ERROR_CODE);
+        assert_eq!(uncoded.message, "boom");
+        let empty = unwrap_rpc_result(json!({"ok":false,"error":{"code":""}})).unwrap_err();
+        assert_eq!(empty.code, RPC_UNCODED_ERROR_CODE);
+        assert_eq!(empty.message, "unknown error");
+    }
+
+    /// [WS-1] 자가 회복 판정 — code 우선 + marker 문자열 폴백. `GUI_IDENTITY_MISMATCH`가
+    /// 종전 marker 매칭에 걸리지 않아 클릭 1회를 잃던 결함의 회귀 핀이다.
+    #[test]
+    fn gui_registration_lost_matches_code_first_then_marker() {
+        let not_registered = RpcFailure {
+            code: GUI_NOT_REGISTERED_CODE.to_string(),
+            message: "GUI peer has no broker-owned registration".into(),
+        };
+        assert!(not_registered.is_gui_registration_lost());
+
+        // 종전 결함: identity mismatch 는 message 에 marker 가 없어 회복 분기를 못 탔다.
+        let mismatch = RpcFailure {
+            code: GUI_IDENTITY_MISMATCH_CODE.to_string(),
+            message: "GUI PID incarnation, canonical executable, code signature, or digest changed"
+                .into(),
+        };
+        assert!(!mismatch.message.contains(BROKER_REGISTRATION_LOST_MARKER));
+        assert!(mismatch.is_gui_registration_lost());
+
+        // 구 데몬 스큐(code 미탑재) — marker 폴백이 살아 있어야 한다.
+        let legacy = RpcFailure {
+            code: RPC_UNCODED_ERROR_CODE.to_string(),
+            message: "GUI peer has no broker-owned registration".into(),
+        };
+        assert!(legacy.is_gui_registration_lost());
+
+        // 무관 실패는 재등록 루프를 돌리지 않는다(오발동 금지).
+        let unrelated = RpcFailure {
+            code: "RUNTIME_START_FAILED".into(),
+            message: "supervisor exited before ready".into(),
+        };
+        assert!(!unrelated.is_gui_registration_lost());
+    }
+
+    /// [WS-1] 배너 선두 사인은 UI 절단(castFailureReason maxLen=200) 안에 반드시 남아야 한다.
+    /// 브로커 최장 code + 전형적 message 로 상한을 잰다.
+    #[test]
+    fn banner_code_survives_ui_truncation_budget() {
+        let failure = RpcFailure {
+            code: "GUI_IDENTITY_MISMATCH".into(),
+            message: "GUI PID incarnation, canonical executable, code signature, or digest changed"
+                .into(),
+        };
+        let banner = failure.banner();
+        // 사인은 앞에서 46자 안에 끝난다("BROWSER_DISABLED_SAFE [" 23 + code 21 + "]" 1 + ":" 1).
+        let sign_end = banner.find(']').expect("대괄호 규약 이탈");
+        assert!(sign_end < 120, "사인이 기본 절단(120) 밖으로 밀림: {sign_end}");
+        assert!(banner.len() <= 200, "배너 전문이 cast 절단(200)을 초과: {}", banner.len());
     }
 }

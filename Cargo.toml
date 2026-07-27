@@ -25,7 +25,10 @@ path = "src/bin/cys.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# ★WS-6(F9/F10): `float_roundtrip` — 파서가 f64를 **정확 왕복**으로 복원한다. 없으면 f32 유래
+# 값(hwmon CPU·메모리 %)이 재파싱에서 1 ulp 어긋나 wire::frame_response의 producer 자기검증이
+# Drift(Critical)로 발화한다. 인코더(ryu)는 이미 최단 왕복이라 문제는 오직 디코더 쪽이었다.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # ★벤더링 + 패치: ConPTY 자식 생성에 CREATE_NO_WINDOW 추가(Win11 검은 창 flash 차단). vendor/portable-pty/ 참조.
 portable-pty = { path = "vendor/portable-pty" }
 vt100 = "0.15"

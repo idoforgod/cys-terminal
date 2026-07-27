@@ -383,6 +383,10 @@ export function sanitizeLayoutForPersist(data: any): any {
 // 위장돼 사용자가 클릭만 반복하며 원인을 영영 모른다. 개행·연속 공백을 접고 maxLen 초과분은 "…"로
 // 절단한다(placeholder가 좁아 앞부분만 싣는다 — 전문은 toast가 나른다). 빈 에러·null은 ""(호출측이
 // 원인 없는 기본 문구로 낙하).
+// ★maxLen 계약(WS-1 §5-0-A 1): 기본값 120은 **불변**이고(기존 호출부·경계 단언 보존), 배너
+// `BROWSER_DISABLED_SAFE [<CODE>]: <message>`를 나르는 **cast 실패 경로만 200을 명시 인자로**
+// 넘긴다. 120이면 대괄호 사인(23+code)에 message가 밀려 진짜 원인(inner code + exit status)이
+// 절단으로 삭제된다 — 사인을 살리려 message를 버리는 자기모순을 상향으로 푼다.
 export function castFailureReason(err: unknown, maxLen = 120): string {
   const one = (err === null || err === undefined ? "" : String(err)).replace(/\s+/g, " ").trim();
   return one.length <= maxLen ? one : `${one.slice(0, maxLen)}…`;

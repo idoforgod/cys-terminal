@@ -6,8 +6,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(super) struct RealSupervisorLauncher {
@@ -15,7 +15,30 @@ pub(super) struct RealSupervisorLauncher {
 }
 
 const MAX_MANAGED_RUNTIMES: usize = 4;
+/// 살아있는 런타임을 부하 스파이크 1회로 고아로 만들지 않기 위한 연속 실패 한계.
+/// 일시 실패는 이 횟수만큼 연속되어야 비로소 엔트리를 제거한다(성공 시 리셋).
+const MAX_CONSECUTIVE_TRANSIENT_VALIDATION_FAILURES: u32 = 3;
 type ManagedSessionKey = zeroize::Zeroizing<[u8; 32]>;
+
+/// `validate_live` 실패의 성격. 일시 실패로 소유권을 파괴하면 supervisor는 계속 살아
+/// flock을 점유하는데 세션 키는 메모리 전용이라 재인수가 불가능해 고아가 확정된다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ValidationSeverity {
+    /// 살아있는 정상 런타임에서도 부하·타이밍으로 발생 가능(TCP connect/read 타임아웃·비200).
+    Transient,
+    /// 런타임 신원 자체가 깨졌다(프로세스 부재·start_time 불일치·MAC 불일치·identity 불일치).
+    Fatal,
+}
+
+type ValidationError = (BrokerFailure, ValidationSeverity);
+
+fn transient(failure: BrokerFailure) -> ValidationError {
+    (failure, ValidationSeverity::Transient)
+}
+
+fn fatal(failure: BrokerFailure) -> ValidationError {
+    (failure, ValidationSeverity::Fatal)
+}
 
 impl Default for RealSupervisorLauncher {
     fn default() -> Self {
@@ -33,6 +56,11 @@ struct ManagedRuntime {
     supervisor_started_at: u64,
     engine_started_at: u64,
     alive: Arc<AtomicBool>,
+    /// 연속 일시 실패 카운터(성공 시 0으로 리셋).
+    transient_failures: Arc<AtomicU32>,
+    /// evict 시 종료 계약용 control 파이프. 워처 스레드와 공유 보유하며,
+    /// `take()` → drop(EOF)로 supervisor를 정상 종료 경로에 태운다.
+    control: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 impl RealSupervisorLauncher {
@@ -59,16 +87,21 @@ impl RealSupervisorLauncher {
         instance_id: &str,
         engine_generation: u64,
         alive: &Arc<AtomicBool>,
-    ) {
-        remove_managed_incarnation(&self.managed, instance_id, engine_generation, alive);
+    ) -> bool {
+        remove_managed_incarnation(&self.managed, instance_id, engine_generation, alive)
     }
 
-    fn cleanup_failed_validation(&self, runtime: &ManagedRuntime) {
-        self.remove_managed_incarnation(
+    /// 엔트리를 잊는 유일한 경로. 잊은 런타임을 살려두면 전역 flock을 영구 독점하므로
+    /// 제거와 종료는 하나의 계약이다(§2-A evict 종료 계약).
+    fn evict_managed_runtime(&self, runtime: &ManagedRuntime, reason: &str) {
+        let removed = self.remove_managed_incarnation(
             &runtime.state.instance_id,
             runtime.state.engine_generation,
             &runtime.alive,
         );
+        if removed {
+            terminate_evicted_runtime(runtime, reason);
+        }
     }
 
     fn commit_managed_runtime(
@@ -99,13 +132,45 @@ fn remove_managed_incarnation(
     instance_id: &str,
     engine_generation: u64,
     alive: &Arc<AtomicBool>,
-) {
+) -> bool {
     let mut managed = managed.lock().unwrap();
     let remove = managed.get(instance_id).is_some_and(|runtime| {
         runtime.state.engine_generation == engine_generation && Arc::ptr_eq(&runtime.alive, alive)
     });
     if remove {
         managed.remove(instance_id);
+    }
+    remove
+}
+
+/// evict된 런타임을 종료 경로에 태운다: control 파이프를 닫으면(EOF) supervisor의
+/// liveness 스레드(`supervisor/main.rs:60-70`)가 ≤100ms에 감지해 Drop을 완주시킨다
+/// (엔진 그룹 회수·state.json 제거·flock 해제).
+///
+/// X2(reap 금지) 비위반: 이것은 타 데몬이 쥔 홀더가 아니라 **우리가 세션 키를 발급하고
+/// control 파이프를 소유한 자기 자식**이다. 소유권 토큰 부재 문제가 성립하지 않으므로
+/// X2의 적용 대상이 아니다.
+///
+/// 무음 종료 금지 계약: 종료 시 반드시 1줄을 남긴다.
+fn terminate_evicted_runtime(runtime: &ManagedRuntime, reason: &str) {
+    let closed = runtime.control.lock().unwrap().take().is_some();
+    eprintln!(
+        "cys-browserd: evicted managed runtime instance={} generation={} reason={reason} control_closed={closed}",
+        runtime.state.instance_id, runtime.state.engine_generation
+    );
+}
+
+/// 일시/치명 분리 판정. 일시 실패는 연속 카운터를 올리고 한계 도달 시에만 evict를 지시한다.
+fn should_evict_after_validation_failure(
+    runtime: &ManagedRuntime,
+    severity: ValidationSeverity,
+) -> bool {
+    match severity {
+        ValidationSeverity::Fatal => true,
+        ValidationSeverity::Transient => {
+            let consecutive = runtime.transient_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            consecutive >= MAX_CONSECUTIVE_TRANSIENT_VALIDATION_FAILURES
+        }
     }
 }
 
@@ -288,18 +353,29 @@ impl SupervisorLauncher for RealSupervisorLauncher {
                 ));
             }
         };
-        let supervisor_started_at = process_start_time(state.supervisor_pid).ok_or_else(|| {
-            BrokerFailure::new(
-                "RUNTIME_START_FAILED",
-                "supervisor process identity unavailable",
-            )
-        })?;
-        let engine_started_at = process_start_time(state.engine_pid).ok_or_else(|| {
-            BrokerFailure::new(
-                "RUNTIME_START_FAILED",
-                "engine process identity unavailable",
-            )
-        })?;
+        // identity 실패 경로도 반드시 자식을 회수한다(회수 누락 시 defunct 잔존).
+        let supervisor_started_at = match process_start_time(state.supervisor_pid) {
+            Some(started_at) => started_at,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BrokerFailure::new(
+                    "RUNTIME_START_FAILED",
+                    "supervisor process identity unavailable",
+                ));
+            }
+        };
+        let engine_started_at = match process_start_time(state.engine_pid) {
+            Some(started_at) => started_at,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BrokerFailure::new(
+                    "RUNTIME_START_FAILED",
+                    "engine process identity unavailable",
+                ));
+            }
+        };
         if request.cancellation.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
@@ -309,6 +385,9 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             ));
         }
         let alive = Arc::new(AtomicBool::new(true));
+        // control 파이프는 이제 워처 스레드와 managed 엔트리가 **함께** 보유한다.
+        // 평시에는 워처가 붙들어 supervisor를 살려두고, evict 시에만 take()로 닫는다.
+        let control = Arc::new(Mutex::new(Some(control)));
         let managed_runtime = ManagedRuntime {
             state: state.clone(),
             session_key: ManagedSessionKey::new(session_key),
@@ -320,6 +399,8 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             supervisor_started_at,
             engine_started_at,
             alive: alive.clone(),
+            transient_failures: Arc::new(AtomicU32::new(0)),
+            control: control.clone(),
         };
         if let Err(error) = self.commit_managed_runtime(managed_runtime, &request.cancellation) {
             let _ = child.kill();
@@ -331,6 +412,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         let engine_generation = state.engine_generation;
         let watcher_alive = alive.clone();
         std::thread::spawn(move || {
+            // 워처가 Arc를 함께 보유해 성공 커밋 후 control 파이프 수명을 유지한다.
             let _control_liveness = control;
             let _ = child.wait();
             watcher_alive.store(false, Ordering::SeqCst);
@@ -362,7 +444,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             ));
         }
         if !runtime.alive.load(Ordering::SeqCst) {
-            self.cleanup_failed_validation(&runtime);
+            self.evict_managed_runtime(&runtime, "managed runtime exited");
             return Err(BrokerFailure::new(
                 "ENGINE_EXITED",
                 "managed runtime exited",
@@ -371,27 +453,27 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         if process_start_time(state.supervisor_pid) != Some(runtime.supervisor_started_at)
             || process_start_time(state.engine_pid) != Some(runtime.engine_started_at)
         {
-            self.cleanup_failed_validation(&runtime);
+            self.evict_managed_runtime(&runtime, "pid incarnation changed");
             return Err(BrokerFailure::new(
                 "PROCESS_IDENTITY_MISMATCH",
                 "managed runtime PID incarnation changed",
             ));
         }
-        let validated = (|| {
+        let validated = (|| -> Result<AuthenticatedEndpointSnapshot, ValidationError> {
             let input = std::fs::read(&runtime.endpoint_path).map_err(|error| {
-                BrokerFailure::new(
+                fatal(BrokerFailure::new(
                     "ENGINE_ENDPOINT_UNAVAILABLE",
                     format!("private engine endpoint unavailable: {error}"),
-                )
+                ))
             })?;
             let endpoint: AuthenticatedEngineEndpoint =
                 serde_json::from_slice(&input).map_err(|error| {
-                    BrokerFailure::new(
+                    fatal(BrokerFailure::new(
                         "RUNTIME_INTEGRITY_FAILED",
                         format!("invalid authenticated engine endpoint: {error}"),
-                    )
+                    ))
                 })?;
-            verify_engine_endpoint(state, &runtime, &endpoint)?;
+            verify_engine_endpoint(state, &runtime, &endpoint).map_err(fatal)?;
             authenticated_health(&endpoint)?;
             Ok(AuthenticatedEndpointSnapshot {
                 schema_version: endpoint.schema_version,
@@ -407,10 +489,18 @@ impl SupervisorLauncher for RealSupervisorLauncher {
                 state_mac: endpoint.state_mac,
             })
         })();
-        if validated.is_err() {
-            self.cleanup_failed_validation(&runtime);
+        match validated {
+            Ok(snapshot) => {
+                runtime.transient_failures.store(0, Ordering::SeqCst);
+                Ok(snapshot)
+            }
+            Err((failure, severity)) => {
+                if should_evict_after_validation_failure(&runtime, severity) {
+                    self.evict_managed_runtime(&runtime, failure.code.as_str());
+                }
+                Err(failure)
+            }
         }
-        validated
     }
 
     fn sign_private_request(
@@ -437,7 +527,7 @@ impl SupervisorLauncher for RealSupervisorLauncher {
             ));
         }
         if !runtime.alive.load(Ordering::SeqCst) {
-            self.cleanup_failed_validation(&runtime);
+            self.evict_managed_runtime(&runtime, "stale runtime on private request");
             return Err(BrokerFailure::new(
                 "ENGINE_EXITED",
                 "private engine request targeted a stale runtime",
@@ -591,13 +681,18 @@ fn verify_engine_endpoint(
         .map_err(|_| BrokerFailure::new("RUNTIME_INTEGRITY_FAILED", "engine endpoint MAC mismatch"))
 }
 
-fn authenticated_health(endpoint: &AuthenticatedEngineEndpoint) -> Result<(), BrokerFailure> {
+/// 반환하는 실패의 성격 구분(§2-A): TCP connect/write/read·응답 형식·비200은 **일시**
+/// (부하 스파이크로 살아있는 런타임에서도 발생), 신원 불일치만 **치명**이다.
+fn authenticated_health(endpoint: &AuthenticatedEngineEndpoint) -> Result<(), ValidationError> {
     use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
     use std::time::Duration;
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port);
     let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_millis(500))
         .map_err(|error| {
-            BrokerFailure::new("ENGINE_EXITED", format!("engine health connect: {error}"))
+            transient(BrokerFailure::new(
+                "ENGINE_EXITED",
+                format!("engine health connect: {error}"),
+            ))
         })?;
     stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok();
@@ -610,32 +705,43 @@ fn authenticated_health(endpoint: &AuthenticatedEngineEndpoint) -> Result<(), Br
         body.len()
     )
     .and_then(|_| stream.write_all(body))
-    .map_err(|error| BrokerFailure::new("ENGINE_EXITED", format!("engine health write: {error}")))?;
+    .map_err(|error| {
+        transient(BrokerFailure::new(
+            "ENGINE_EXITED",
+            format!("engine health write: {error}"),
+        ))
+    })?;
     let mut response = Vec::new();
     stream
         .take(1024 * 1024)
         .read_to_end(&mut response)
         .map_err(|error| {
-            BrokerFailure::new("ENGINE_EXITED", format!("engine health read: {error}"))
+            transient(BrokerFailure::new(
+                "ENGINE_EXITED",
+                format!("engine health read: {error}"),
+            ))
         })?;
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| {
-            BrokerFailure::new(
+            transient(BrokerFailure::new(
                 "ENGINE_EXITED",
                 "engine health returned an invalid HTTP response",
-            )
+            ))
         })?;
     if !response.starts_with(b"HTTP/1.1 200 ") && !response.starts_with(b"HTTP/1.0 200 ") {
-        return Err(BrokerFailure::new(
+        return Err(transient(BrokerFailure::new(
             "ENGINE_EXITED",
             "engine health returned non-200",
-        ));
+        )));
     }
     let value: serde_json::Value =
         serde_json::from_slice(&response[split + 4..]).map_err(|error| {
-            BrokerFailure::new("ENGINE_EXITED", format!("engine health JSON: {error}"))
+            transient(BrokerFailure::new(
+                "ENGINE_EXITED",
+                format!("engine health JSON: {error}"),
+            ))
         })?;
     if value
         .pointer("/result/pid")
@@ -650,10 +756,10 @@ fn authenticated_health(endpoint: &AuthenticatedEngineEndpoint) -> Result<(), Br
             .and_then(serde_json::Value::as_u64)
             != Some(endpoint.process_start_time)
     {
-        return Err(BrokerFailure::new(
+        return Err(fatal(BrokerFailure::new(
             "PROCESS_IDENTITY_MISMATCH",
             "engine health identity mismatch",
-        ));
+        )));
     }
     Ok(())
 }
@@ -833,6 +939,140 @@ mod tests {
         }
     }
 
+    fn test_runtime(
+        state: &RuntimeStateV2,
+        endpoint_path: std::path::PathBuf,
+        session_key: [u8; 32],
+        started_at: u64,
+        control: Option<ChildStdin>,
+    ) -> ManagedRuntime {
+        ManagedRuntime {
+            state: state.clone(),
+            session_key: ManagedSessionKey::new(session_key),
+            endpoint_path,
+            supervisor_started_at: started_at,
+            engine_started_at: started_at,
+            alive: Arc::new(AtomicBool::new(true)),
+            transient_failures: Arc::new(AtomicU32::new(0)),
+            control: Arc::new(Mutex::new(control)),
+        }
+    }
+
+    /// 실제 엔진처럼 대답하는 스크립트 서버. `script`의 각 원소가 한 요청의 성패다.
+    fn spawn_scripted_health_server(
+        script: Vec<bool>,
+        pid: u32,
+        runtime_id: String,
+        started_at: u64,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::net::{Ipv4Addr, TcpListener};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("health listener");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for healthy in script {
+                let (mut stream, _) = listener.accept().expect("health accept");
+                // 요청을 끝까지 소비해야 close 시 RST가 나지 않는다(미소비 수신버퍼 → reset).
+                let mut request = Vec::new();
+                let mut scratch = [0_u8; 2048];
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => request.extend_from_slice(&scratch[..count]),
+                    }
+                    if let Some(split) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..split]).to_lowercase();
+                        let length = head
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\r\n").next())
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let response = if healthy {
+                    let body = format!(
+                        "{{\"result\":{{\"pid\":{pid},\"runtime_id\":\"{runtime_id}\",\"process_start_time\":{started_at}}}}}"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, handle)
+    }
+
+    fn signed_endpoint_json(
+        session_key: &[u8; 32],
+        state: &RuntimeStateV2,
+        started_at: u64,
+    ) -> String {
+        let token = "a".repeat(32);
+        let cast_token = "b".repeat(32);
+        let payload = serde_json::to_vec(&json!([
+            2,
+            state.engine_pid,
+            state.port,
+            token,
+            cast_token,
+            state.runtime_id,
+            started_at,
+            true,
+            state.instance_id,
+            state.engine_generation,
+        ]))
+        .unwrap();
+        let mut signer = Hmac::<Sha256>::new_from_slice(session_key).unwrap();
+        signer.update(b"cys.browser.engine-state.v1\0");
+        signer.update(&payload);
+        let state_mac: String = signer
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        serde_json::to_string(&json!({
+            "schema_version": 2,
+            "pid": state.engine_pid,
+            "port": state.port,
+            "token": token,
+            "cast_token": cast_token,
+            "runtime_id": state.runtime_id,
+            "process_start_time": started_at,
+            "headless": true,
+            "instance_id": state.instance_id,
+            "engine_generation": state.engine_generation,
+            "state_mac": state_mac,
+        }))
+        .unwrap()
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cys-ws0-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn transient_failure_count(launcher: &RealSupervisorLauncher, instance_id: &str) -> u32 {
+        launcher
+            .managed
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .expect("runtime retained")
+            .transient_failures
+            .load(Ordering::SeqCst)
+    }
+
     #[test]
     fn managed_session_key_has_compiler_guaranteed_zeroize_contract() {
         fn assert_zeroize<T: zeroize::Zeroize>() {}
@@ -853,6 +1093,8 @@ mod tests {
                     supervisor_started_at: 1,
                     engine_started_at: 1,
                     alive: Arc::new(AtomicBool::new(false)),
+                    transient_failures: Arc::new(AtomicU32::new(0)),
+                    control: Arc::new(Mutex::new(None)),
                 },
             );
             launcher.prune_dead_managed();
@@ -881,6 +1123,8 @@ mod tests {
                 supervisor_started_at: 1,
                 engine_started_at: 1,
                 alive: old_alive.clone(),
+                transient_failures: Arc::new(AtomicU32::new(0)),
+                control: Arc::new(Mutex::new(None)),
             },
         );
         let replacement_alive = Arc::new(AtomicBool::new(true));
@@ -896,6 +1140,8 @@ mod tests {
                 supervisor_started_at: 2,
                 engine_started_at: 2,
                 alive: replacement_alive.clone(),
+                transient_failures: Arc::new(AtomicU32::new(0)),
+                control: Arc::new(Mutex::new(None)),
             },
         );
 
@@ -922,6 +1168,8 @@ mod tests {
             supervisor_started_at: 3,
             engine_started_at: 3,
             alive: old_alive,
+            transient_failures: Arc::new(AtomicU32::new(0)),
+            control: Arc::new(Mutex::new(None)),
         };
         let replacement_alive = Arc::new(AtomicBool::new(true));
         let mut replacement_state = state_for(4);
@@ -936,10 +1184,12 @@ mod tests {
                 supervisor_started_at: 4,
                 engine_started_at: 4,
                 alive: replacement_alive.clone(),
+                transient_failures: Arc::new(AtomicU32::new(0)),
+                control: Arc::new(Mutex::new(None)),
             },
         );
 
-        launcher.cleanup_failed_validation(&stale_runtime);
+        launcher.evict_managed_runtime(&stale_runtime, "test");
 
         let managed = launcher.managed.lock().unwrap();
         let retained = managed.get(&instance_id).expect("replacement retained");
@@ -958,6 +1208,8 @@ mod tests {
             supervisor_started_at: 5,
             engine_started_at: 5,
             alive: Arc::new(AtomicBool::new(true)),
+            transient_failures: Arc::new(AtomicU32::new(0)),
+            control: Arc::new(Mutex::new(None)),
         };
 
         let error = launcher
@@ -1020,5 +1272,191 @@ mod tests {
             "cancelled readiness must prevent late child side effects"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transient_health_failure_does_not_orphan_a_live_runtime() {
+        let launcher = RealSupervisorLauncher::default();
+        let pid = std::process::id();
+        let started_at = process_start_time(pid).expect("self process start time");
+        let mut state = state_for(7);
+        state.supervisor_pid = pid;
+        state.engine_pid = pid;
+        let (port, server) = spawn_scripted_health_server(
+            vec![false, false, true, false, false, false],
+            pid,
+            state.runtime_id.clone(),
+            started_at,
+        );
+        state.port = port;
+        let session_key = [7_u8; 32];
+        let dir = scratch_dir("transient");
+        let endpoint_path = dir.join("state.json");
+        std::fs::write(
+            &endpoint_path,
+            signed_endpoint_json(&session_key, &state, started_at),
+        )
+        .unwrap();
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, endpoint_path, session_key, started_at, None),
+        );
+
+        for attempt in 1..=2 {
+            let error = launcher.validate_live(&state).unwrap_err();
+            assert_eq!(error.code, "ENGINE_EXITED");
+            assert_eq!(
+                launcher.managed.lock().unwrap().len(),
+                1,
+                "transient failure {attempt} must not destroy ownership of a live runtime"
+            );
+            assert_eq!(transient_failure_count(&launcher, &state.instance_id), attempt);
+        }
+
+        launcher.validate_live(&state).expect("healthy validation");
+        assert_eq!(
+            transient_failure_count(&launcher, &state.instance_id),
+            0,
+            "a successful validation must reset the consecutive counter"
+        );
+
+        for attempt in 1..=2 {
+            launcher.validate_live(&state).unwrap_err();
+            assert_eq!(
+                launcher.managed.lock().unwrap().len(),
+                1,
+                "post-reset transient failure {attempt} must not evict"
+            );
+        }
+        let error = launcher.validate_live(&state).unwrap_err();
+        assert_eq!(error.code, "ENGINE_EXITED");
+        assert!(
+            launcher.managed.lock().unwrap().is_empty(),
+            "the third consecutive transient failure evicts"
+        );
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fatal_validation_failure_evicts_on_the_first_occurrence() {
+        let launcher = RealSupervisorLauncher::default();
+        let pid = std::process::id();
+        let started_at = process_start_time(pid).expect("self process start time");
+        let mut state = state_for(8);
+        state.supervisor_pid = pid;
+        state.engine_pid = pid;
+        let dir = scratch_dir("fatal");
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, dir.join("absent.json"), [8_u8; 32], started_at, None),
+        );
+
+        let error = launcher.validate_live(&state).unwrap_err();
+
+        assert_eq!(error.code, "ENGINE_ENDPOINT_UNAVAILABLE");
+        assert!(launcher.managed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn identity_mismatch_evicts_without_counting_transient_failures() {
+        let launcher = RealSupervisorLauncher::default();
+        let mut state = state_for(10);
+        state.supervisor_pid = std::process::id();
+        state.engine_pid = std::process::id();
+        let dir = scratch_dir("identity");
+        // 기록된 start_time과 실제 프로세스의 start_time이 다르면 치명이다.
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, dir.join("state.json"), [10_u8; 32], 1, None),
+        );
+
+        let error = launcher.validate_live(&state).unwrap_err();
+
+        assert_eq!(error.code, "PROCESS_IDENTITY_MISMATCH");
+        assert!(launcher.managed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_closes_the_control_pipe_so_the_supervisor_can_exit() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("fake supervisor");
+        let control = child.stdin.take().expect("control pipe");
+        let launcher = RealSupervisorLauncher::default();
+        let state = state_for(9);
+        let runtime = test_runtime(&state, "unused".into(), [9_u8; 32], 1, Some(control));
+        launcher
+            .managed
+            .lock()
+            .unwrap()
+            .insert(state.instance_id.clone(), runtime.clone());
+
+        launcher.evict_managed_runtime(&runtime, "test eviction");
+
+        assert!(launcher.managed.lock().unwrap().is_empty());
+        assert!(
+            runtime.control.lock().unwrap().is_none(),
+            "evict must take the control pipe"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an evicted runtime must be terminated, not orphaned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn eviction_never_terminates_a_replacement_incarnation() {
+        let launcher = RealSupervisorLauncher::default();
+        let instance_id = "d".repeat(32);
+        let mut stale_state = state_for(11);
+        stale_state.instance_id = instance_id.clone();
+        stale_state.engine_generation = 11;
+        let stale = test_runtime(&stale_state, "stale".into(), [11_u8; 32], 1, None);
+        *stale.control.lock().unwrap() = None;
+        let mut replacement_state = state_for(12);
+        replacement_state.instance_id = instance_id.clone();
+        replacement_state.engine_generation = 12;
+        let replacement = test_runtime(&replacement_state, "new".into(), [12_u8; 32], 1, None);
+        launcher
+            .managed
+            .lock()
+            .unwrap()
+            .insert(instance_id.clone(), replacement.clone());
+
+        launcher.evict_managed_runtime(&stale, "stale");
+
+        assert_eq!(launcher.managed.lock().unwrap().len(), 1);
+        assert!(
+            !replacement.control.lock().unwrap().is_some(),
+            "control was None to begin with"
+        );
+        assert_eq!(
+            launcher
+                .managed
+                .lock()
+                .unwrap()
+                .get(&instance_id)
+                .unwrap()
+                .state
+                .engine_generation,
+            12
+        );
     }
 }
