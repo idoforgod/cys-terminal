@@ -255,6 +255,27 @@ cys watch --surface surface:3 --until "DONE"   # scrollback이 regex에 맞을 �
 
 `read-screen --since N`은 단조 라인 커서로 델타만 읽습니다.
 
+#### 관측 명령과 autostart
+
+`cys`는 데몬에 연결하지 못하면 **형제 `cysd`를 자동 기동**한 뒤 다시 시도합니다(신규 머신 zero-setup).
+편리하지만 관측 명령에서는 부작용이 됩니다 — "데몬이 떠 있는가"를 물었는데 그 질문 자체가 데몬을
+띄워버리면 답이 바뀝니다. 그래서 명령마다 성질이 다릅니다.
+
+| 명령 | 자동 기동 | 이유 |
+|---|---|---|
+| `cys ping`, `cys daemon status` | **안 함** | 순수 생존 프로브 — 관측이 대상을 바꾸면 안 됩니다. |
+| `cys list` | 함 (기본) | 복원 절차가 이 자동 기동에 의존합니다. 끄려면 `--no-autostart`. |
+| `cys status`, `cys doctor` | 함 / 접촉 없음 | `status`는 관제 보드라 데몬이 필요하고, `doctor`는 애초에 자동 기동 경로를 타지 않습니다. |
+
+```bash
+cys list --no-autostart      # 죽은 데몬을 깨우지 않고 현재 상태만 본다
+CYS_NO_AUTOSTART=1 cys list  # 동일 (env 옵트아웃 — 세션 전체에 적용)
+```
+
+데몬이 안 떠 있으면 `--no-autostart`는 연결 실패로 끝납니다. 이것이 정상이며, "죽어 있음"이 곧
+답입니다. 장애를 조사할 때(특히 crashloop·락 경합을 볼 때)는 조사 행위가 증거를 바꾸지 않도록
+이 플래그를 쓰세요.
+
 ### 5.5 자기보고 (권장 규약)
 
 에이전트는 화면 파싱 대신 스스로 신고합니다:

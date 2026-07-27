@@ -53,7 +53,12 @@ enum Command {
         cols: u16,
     },
     /// List surfaces
-    List,
+    List {
+        /// 관측만 하고 데몬을 깨우지 않는다(env `CYS_NO_AUTOSTART=1`과 동일 경로).
+        /// ★기본 동작은 변경하지 않는다 — phoenix 복원 폴백이 `cys list`의 자동 기동에 의존한다.
+        #[arg(long)]
+        no_autostart: bool,
+    },
     /// Inject text into a surface's stdin (no trailing newline; follow with send-key Return)
     Send {
         #[arg(long)]
@@ -1044,12 +1049,19 @@ fn main() {
     if let Some(s) = &cli.socket {
         std::env::set_var(cys::ENV_SOCKET, s);
     }
-    // 순수 프로브 명령은 자동 기동 금지 — "데몬이 떠 있는가"라는 질문의 답을 바꾸면 안 된다
+    // 순수 프로브 명령은 자동 기동 금지 — "데몬이 떠 있는가"라는 질문의 답을 바꾸면 안 된다.
+    // ★WS-10: `list --no-autostart`는 사용자가 명시적으로 같은 성질을 요구한 경우다(옵트인).
+    // `status`·`doctor`는 여기 편입하지 않는다 — status는 관제 보드(INSTALL Step1·릴리스 스모크·
+    // phoenix _daemon_identity exit 6 계약이 자동 기동을 전제), doctor는 raw connect만 써서
+    // 이미 autostart 무접촉이다. 전환하면 순수 회귀가 된다.
     if matches!(
         cli.command,
         Command::Ping
             | Command::Daemon {
                 action: DaemonAction::Status
+            }
+            | Command::List {
+                no_autostart: true
             }
     ) {
         AUTOSTART.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1491,6 +1503,26 @@ type ConnStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type ConnStream = std::fs::File;
 
+/// ★WS-6: 응답 프레임 디코딩 — `_pv` 마이너 스큐(구/신 데몬 혼재, 업데이트 직후 창)는 hard fail이
+/// 아니라 **graceful downgrade**다. 길이 대칭검증만 건너뛰고 본문 JSON을 그대로 수용하며, 경고는
+/// 실행당 1회만 낸다(다중 대상 루프에서 결과가 스크롤로 밀리는 것 방지).
+///
+/// `LenMismatch`는 **동일버전 트렁케이션**이므로 하드 실패를 유지한다 — 잘린 프레임을 수용하면
+/// 부분 응답을 성공으로 오독한다. `parse_frame` 시그니처는 무접촉이다(wire.rs 계약 보존).
+fn decode_response_frame(raw: &str) -> Result<Value, String> {
+    match cys::wire::parse_frame(raw) {
+        Ok(v) => Ok(v),
+        Err(cys::wire::AbiError::VersionSkew { peer_pv, local_pv }) => {
+            warn_skew_once(&format!(
+                "[cys] warning: daemon ABI _pv={peer_pv} != cli _pv={local_pv} — 프레임 길이 검증을 건너뛰고 진행(graceful downgrade). 데몬·CLI 버전을 맞추면 사라진다."
+            ));
+            serde_json::from_str(raw)
+                .map_err(|e| format!("abi: version-skew frame is not valid json: {e}"))
+        }
+        Err(e) => Err(format!("abi: {e:?}")),
+    }
+}
+
 fn request(method: &str, params: Value) -> Result<Value, String> {
     let mut stream = connect()?;
     let req = json!({"id": 1, "method": method, "params": params});
@@ -1508,7 +1540,7 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     // T1-6: 디코더 대칭검증 — declared `_flen`/`_pv` 형제 메타가 있으면 트렁케이션/버전스큐를
     // 검출한다. additive 계약이라 반환은 top-level 응답 객체 그대로(아래 resp["ok"] 호환 유지).
     // 메타 없는 legacy peer 프레임은 graceful 수용. LenMismatch는 트렁케이션이므로 거부.
-    let resp: Value = cys::wire::parse_frame(resp_line.trim()).map_err(|e| format!("abi: {e:?}"))?;
+    let resp: Value = decode_response_frame(resp_line.trim())?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {
@@ -1620,7 +1652,7 @@ fn run(command: Command) -> i32 {
             .map(|r| println!("{}", r["surface_ref"].as_str().unwrap_or("?")))
         }
 
-        Command::List => request("surface.list", json!({})).map(|r| {
+        Command::List { .. } => request("surface.list", json!({})).map(|r| {
             for s in r["surfaces"].as_array().cloned().unwrap_or_default() {
                 println!(
                     "{}\trole={}\tpid={}\texited={}\t{}\t{}",
@@ -11405,6 +11437,75 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0, "pid 표기만 비움");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn list_no_autostart_is_opt_in_and_default_stays_autostarting() {
+        // ★WS-10: 기본 동작 무변경이 계약이다 — phoenix 복원 폴백이 `cys list`의 자동 기동에 의존한다.
+        use clap::Parser;
+        let plain = Cli::try_parse_from(["cys", "list"]).expect("cys list");
+        assert!(
+            matches!(
+                plain.command,
+                Command::List {
+                    no_autostart: false
+                }
+            ),
+            "기본은 autostart 유지"
+        );
+        let opted = Cli::try_parse_from(["cys", "list", "--no-autostart"]).expect("플래그 파싱");
+        assert!(matches!(
+            opted.command,
+            Command::List {
+                no_autostart: true
+            }
+        ));
+        // `status`·`doctor`는 전환 대상이 아니다(INSTALL Step1·릴리스 스모크·phoenix _daemon_identity
+        // exit 6 계약이 자동 기동을 전제) — 플래그가 붙지 않았음을 핀으로 고정한다.
+        assert!(
+            Cli::try_parse_from(["cys", "status", "--no-autostart"]).is_err(),
+            "status에는 --no-autostart를 붙이지 않는다(계약 파손 방지)"
+        );
+    }
+
+    #[test]
+    fn version_skew_frame_is_accepted_but_truncation_is_not() {
+        // ★WS-6: 마이너 스큐 = graceful downgrade(본문 수용) / 동일버전 길이 불일치 = 하드 실패.
+        let sound = cys::wire::frame_response(&json!({"ok": true, "result": {"a": 1}})).unwrap();
+        assert_eq!(
+            decode_response_frame(sound.trim()).unwrap()["result"]["a"],
+            json!(1),
+            "정상 프레임은 그대로 통과"
+        );
+
+        // 구 데몬 모사: _pv가 다르고 _flen도 어긋난다 → VersionSkew → 본문 수용.
+        let skewed = json!({
+            "ok": true,
+            "result": {"surfaces": []},
+            "_flen": 999_999,
+            "_pv": cys::wire::PROTO_PV as u64 + 1,
+        })
+        .to_string();
+        let decoded = decode_response_frame(&skewed).expect("스큐는 graceful 수용");
+        assert_eq!(decoded["ok"], json!(true));
+        assert!(decoded["result"]["surfaces"].is_array(), "본문 보존");
+
+        // 동일버전 + 길이 불일치 = 트렁케이션 → 하드 실패 유지(부분 응답을 성공으로 오독 금지).
+        let truncated = json!({
+            "ok": true,
+            "result": {"surfaces": []},
+            "_flen": 999_999,
+            "_pv": cys::wire::PROTO_PV as u64,
+        })
+        .to_string();
+        let err = decode_response_frame(&truncated).expect_err("트렁케이션은 거부");
+        assert!(err.contains("LenMismatch"), "사유가 드러나야 한다: {err}");
+
+        // 메타 없는 legacy peer 프레임은 무검증 수용(기존 계약).
+        assert_eq!(
+            decode_response_frame(r#"{"ok":true,"result":"pong"}"#).unwrap()["result"],
+            json!("pong")
+        );
     }
 
     #[cfg(unix)]
