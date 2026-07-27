@@ -117,6 +117,18 @@ jobs:
           # updater 서명 산출을 끈다(릴리스 경로 release.yml은 windows conf 기본값 true+서명키 사용).
           bunx @tauri-apps/cli@2 build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
+      # ★Windows CRT 발행 차단 게이트(release.yml 과 동일 게이트의 feasibility 레인) —
+      # NSIS 산출 직후·느린 silent-install 검증 이전에 fail-fast 로 실행한다.
+      # 이 레인은 미서명·정규화 없음이라 경로가 release.yml(release-candidate/)과 다르다.
+      - name: Windows CRT gate (VCRUNTIME import sweep + 3-category fix markers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          SETUP=(target/release/bundle/nsis/*-setup.exe)
+          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
+
       - name: Upload NSIS installer artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

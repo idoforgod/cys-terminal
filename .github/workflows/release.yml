@@ -125,7 +125,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
     # hang 상한 — 미지정 시 GitHub 기본은 360분(6시간)이다. 서명·공증 대기나 러너 stall이
     # 한 번 걸리면 릴리스 레인 전체가 6시간 묶이고 동시성 슬롯도 함께 잠긴다.
-    timeout-minutes: 90
+    # ★150 상향(v0.13.23): crt-static 도입이 rust-cache 를 전량 무효화해 첫 콜드 빌드가
+    # 90분을 위협하고, 타임아웃 시 rust-cache 는 저장되지 않아 재실행도 동일 콜드가 되는
+    # 실패 루프가 가능하다. 첫 green 후 캐시 재적재 상태를 보고 재평가할 것.
+    timeout-minutes: 150
 
     # Explicit, auditable opt-out for the unsigned Windows distribution model
     # (unsigned exe + zip + Windows Defender guidance). Only ALLOW_UNSIGNED_WINDOWS=='1'
@@ -682,6 +685,22 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           PYTHONUTF8: '1'
         run: ./scripts/build-windows-signed.ps1
+
+      # ★Windows CRT 발행 차단 게이트 — 서명 완료된 최종 출하 바이트(release-candidate)에서
+      # ①VCRUNTIME 임포트 스윕(PE 파싱 — 정책 3바이너리 엄격 + app-local 규칙)과
+      # ②3카테고리 수리 마커 6종(구베이스 빌드 차단)을 fail-closed 검증한다.
+      # CI 러너에는 VC 재배포가 프리인스톨돼 있어 이 결함은 런타임 재현이 불가능하므로
+      # 임포트 테이블 정적 검사가 유일한 결정론 게이트다. 서명/미서명(ALLOW_UNSIGNED_WINDOWS)
+      # 양 모드 모두 실행한다(임포트 테이블은 서명과 무관).
+      - name: Windows CRT gate (VCRUNTIME import sweep + 3-category fix markers)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          SETUP=(release-candidate/cys_*_x64-setup.exe)
+          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
 
       - name: Remove ephemeral signing material
         if: always() && matrix.platform == 'windows-latest'

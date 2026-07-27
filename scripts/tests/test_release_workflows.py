@@ -70,6 +70,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         pack = PACK_WORKFLOW.read_text(encoding="utf-8")
         self.assertRegex(pack, re.compile(r"if ! gh release upload[\s\S]+gh release delete"))
 
+    def test_windows_crt_gate_is_wired_in_both_windows_lanes(self) -> None:
+        # CRT 게이트(VCRUNTIME 임포트 스윕 + 3카테고리 수리 마커)가 릴리스·feasibility 양 레인에서
+        # 조용히 소실되는 회귀를 차단한다. 게이트 자체의 판정 로직은 test_verify_win_crt.py 소관.
+        candidate = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        feasibility = (ROOT / ".github" / "workflows" / "windows-build.yml").read_text(encoding="utf-8")
+        for body, lane in ((candidate, "release.yml"), (feasibility, "windows-build.yml")):
+            self.assertIn("scripts/verify_win_crt.py", body, f"CRT gate missing in {lane}")
+        # 릴리스 레인은 서명 완료된 정규화 산출물(출하 바이트)을 검사해야 한다.
+        self.assertIn("release-candidate/cys_", candidate)
+        # 미서명 탈출구(ALLOW_UNSIGNED_WINDOWS)가 게이트를 우회하지 못하게 — 게이트 스텝은
+        # platform 조건만 가져야 한다.
+        gate_idx = candidate.index("Windows CRT gate")
+        gate_block = candidate[gate_idx:gate_idx + 400]
+        self.assertNotIn("ALLOW_UNSIGNED_WINDOWS", gate_block)
+
     def test_platform_signing_and_notarization_are_fail_closed(self) -> None:
         macos = MACOS_BUILD.read_text(encoding="utf-8")
         windows = WINDOWS_SIGN.read_text(encoding="utf-8")
