@@ -2257,6 +2257,17 @@ interface WebPaneView extends PaneView {
 
 const VIEW_BRIDGE_RETRY_MS = 5000;
 
+/// passive 조회(`browserd_state`)가 실려 보낸 실패 사인을 placeholder 문구 조각으로 정규화한다(순수).
+/// 사인이 전혀 없으면 빈 문자열 — 그때만 종전 문구("브라우저 꺼짐")와 동일해진다.
+/// code는 `renderCastState`와 같은 대괄호 선두 규약, message는 개행·연속공백을 1칸으로 접고 120자 캡
+/// (placeholder는 1줄 표시 — 데몬이 붙여 보낸 장문 진단이 pane 레이아웃을 밀어내지 않게 한다).
+function castStateReason(code?: unknown, message?: unknown): string {
+  const c = typeof code === "string" && code.trim() ? ` [${code.trim()}]` : "";
+  const raw = typeof message === "string" ? message.replace(/\s+/g, " ").trim() : "";
+  const m = raw ? ` ${raw.length > 120 ? `${raw.slice(0, 117)}…` : raw}` : "";
+  return `${c}${m}`;
+}
+
 function makeWebPane(node: WebNode): WebPaneView {
   const el = document.createElement("div");
   el.className = "pane web-pane";
@@ -2534,7 +2545,7 @@ function makeWebPane(node: WebNode): WebPaneView {
     const gen = ++castLoadGen;
     const parentOrigin = castParentOrigin(window.location);
     if (!parentOrigin) return showPlaceholder("지원하지 않는 앱 origin — 브라우저 로드 거부");
-    let state: { alive: boolean; descriptor?: CastEmbedDescriptor };
+    let state: { alive: boolean; descriptor?: CastEmbedDescriptor; code?: string; message?: string };
     try {
       state = (await invoke("browserd_state", {
         paneNonce: castPaneId,
@@ -2542,7 +2553,7 @@ function makeWebPane(node: WebNode): WebPaneView {
         parentOrigin,
         embedTicket: newCastEmbedTicket(),
       })) as {
-        alive: boolean; descriptor?: CastEmbedDescriptor;
+        alive: boolean; descriptor?: CastEmbedDescriptor; code?: string; message?: string;
       };
     } catch {
       if (disposed || gen !== castLoadGen) return;
@@ -2550,7 +2561,14 @@ function makeWebPane(node: WebNode): WebPaneView {
     }
     if (disposed || gen !== castLoadGen) return;
     if (!state.alive || !state.descriptor) {
-      return showCastReconnectPlaceholder("브라우저 꺼짐 — 클릭해 재연결");
+      // ★T2-4(설계 §7-0-A-3): 백엔드는 alive:false와 함께 실패 사인 {code,message}를 싣는다
+      // (src-tauri browserd_state). 여기서 그걸 버리면 UNSUPPORTED·GUI_IDENTITY_MISMATCH 같은
+      // 진짜 고장이 "브라우저 꺼짐"으로 위장돼 관측 델타가 0이 된다 — 사인을 문구에 실어야
+      // 백엔드 code 전파(WS-1)가 사용자까지 종단 도달한다.
+      // 형식: code는 renderCastState와 같은 대괄호 선두 규약, message는 1줄 정규화 + 120자 캡.
+      return showCastReconnectPlaceholder(
+        `브라우저 꺼짐${castStateReason(state.code, state.message)} — 클릭해 재연결`,
+      );
     }
     loadCastFrame(state.descriptor);
   };
