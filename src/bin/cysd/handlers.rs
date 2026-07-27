@@ -532,13 +532,18 @@ fn threshold_from(raw: Option<String>) -> u8 {
 /// **3 경로가 공유**하는 단일 발화 로직. ctx_threshold_armed 에지로 '미만→이상' 교차 시 1회만
 /// 발행하고, 임계 위 체류 중엔 재발행하지 않으며, 임계 아래로 내려가면 재무장된다. 경로마다
 /// 인라인 복제하면 같은 교차에 두 경로가 각각 발화해 master/CSO가 cycle-agent를 이중 집행한다.
-/// `source`=발화 출처("self-report"|"observed"|"statusline"), `agent`=관측·statusline 경로에서만 Some.
+/// `source`=발화 출처("self-report"|"observed"|"observed-uncertain"|"statusline"),
+/// `agent`=관측·statusline 경로에서만 Some.
+/// `attribution`=관측 경로의 세션 귀속 판정(confident|ambiguous|evicted). C1 폴백 발화
+/// (`observed-uncertain`)는 귀속이 확실하지 않은 채로 오는 신호라, 수신측(master/CSO)이
+/// 대상 pane을 재확인할지 판단하려면 **그 근거 값 자체**가 payload에 있어야 한다.
 pub(crate) fn maybe_fire_context_threshold(
     daemon: &Arc<Daemon>,
     surface: &Arc<crate::state::Surface>,
     pct: u8,
     source: &str,
     agent: Option<&str>,
+    attribution: Option<&str>,
 ) {
     let role = surface.role.lock().unwrap().clone();
     let threshold = pick_context_threshold(
@@ -552,16 +557,28 @@ pub(crate) fn maybe_fire_context_threshold(
     if !surface.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
         return;
     }
+    // ★E9(적대 리뷰 R-6 잔여): `observed-uncertain` 은 귀속이 확실하지 않은 채 온 신호다
+    // (C1 고위험 폴백). 그런데 `action` 문구가 확실한 신호와 똑같이 "집행 대상"이라고 말하면,
+    // payload 의 `attribution` 을 읽지 않는 수신자는 오귀속 pane 을 그대로 /clear 시킨다 —
+    // source 를 나눈 의미가 소비 지점에서 사라진다. 지시 자체를 차등한다(실측 확인 선행).
+    let action = if source == "observed-uncertain" {
+        "귀속 불확실 — 대상 pane 실측 확인(read-screen) 후 cycle-agent 집행"
+    } else {
+        "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클"
+    };
     let mut payload = json!({
         "role": role.clone(),
         "context_pct": pct,
         "threshold": threshold,
         "surface_ref": cys::surface_ref(surface.id),
         "source": source,
-        "action": "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클",
+        "action": action,
     });
     if let Some(a) = agent {
         payload["agent"] = json!(a);
+    }
+    if let Some(at) = attribution {
+        payload["attribution"] = json!(at);
     }
     daemon
         .bus
@@ -1416,11 +1433,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // ★R1: 자기신고 `human` 도 판별에서 뺐다. 종전엔 `human:true` 한 줄로 Agent 분류를
                 // 덮어써 소프트캡을 통과할 수 있었다(D2 "self-report 불신"과 정면 충돌).
                 // GUI 발신은 **분류를 바꾸지 않고** System 라벨만 `"gui"` 로 세분화한다 —
-                // 관측 해상도는 유지하되 정책 등급은 origin 판별이 단독으로 정한다.
+                // 관측 해상도는 유지하되 정책 등급(소프트캡)은 origin 판별이 단독으로 정한다.
+                // ★E4: 이 라벨은 **GUI 전용 TTL 등급**의 근거이기도 하다
+                // (`QueueItem::effective_ttl`) — 사람이 친 입력은 장주기(기본 24h ·
+                // `CYS_QUEUE_GUI_TTL_SECS`)를 받고 그 밖의 데몬 자동 발신은 4h 상한을 받는다.
+                // 그래서 문자열 리터럴이 아니라 공유 상수를 쓴다(양쪽이 갈리면 사람 입력이
+                // 조용히 짧은 등급으로 떨어진다).
+                // ★E4 재수정: 이 라벨이 주는 것은 **무기한 면제가 아니다**. 라벨의 근거가
+                // 클라이언트 자기신고(`human`)인 이상, 무기한을 주면 detach 프로세스가 한 줄로
+                // 그것을 위조 획득한다 — 유계 등급이라 위조해도 얻는 게 24h 뿐이다.
                 let mut origin = crate::queue_policy::derive_origin(daemon, verified_from);
                 if human {
                     if let crate::state::QueueOrigin::System { .. } = origin {
-                        origin = crate::state::QueueOrigin::system("gui");
+                        origin = crate::state::QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI);
                     }
                 }
                 let mut item = crate::state::QueueItem::text(text.clone(), origin);
@@ -2921,7 +2946,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // (cycle-agent 이중 집행)를 차단한다. master/CSO는 이 이벤트(watchdog)를 받아
             // cycle-agent를 집행한다.
             if let Some(pct) = context_pct {
-                maybe_fire_context_threshold(daemon, &surface, pct, "self-report", None);
+                maybe_fire_context_threshold(daemon, &surface, pct, "self-report", None, None);
             }
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "state": state})))
         }
@@ -3185,7 +3210,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             );
             // 공유 에지 게이트로 context.threshold 발화 — Phase 1과 동일 함수(이중발화 차단)
             if let Some(pct) = ctx_pct {
-                maybe_fire_context_threshold(daemon, &surface, pct, "statusline", Some(&agent));
+                maybe_fire_context_threshold(
+                    daemon,
+                    &surface,
+                    pct,
+                    "statusline",
+                    Some(&agent),
+                    None,
+                );
             }
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
@@ -6320,6 +6352,86 @@ mod tests {
             threshold_events(&daemon, node).len(),
             1,
             "첫 보고 60%(경계값 포함)에서 발화돼야 한다"
+        );
+    }
+
+    /// ★C1: 귀속 미확실 관측(`observed-uncertain`)도 **공유 에지 게이트를 그대로 지난다**.
+    /// 폴백이 게이트를 우회하면 수집 틱(2초)마다 발화해 master/CSO가 같은 pane에 cycle-agent를
+    /// 반복 집행한다. 교차 1회성 + payload의 attribution 동봉(수신측이 신뢰도를 판단할 근거)을
+    /// 함께 못박는다. 자기보고 경로는 근거가 없으므로 그 키를 달지 않아야 한다.
+    #[test]
+    fn c1_uncertain_observed_fires_once_per_edge_with_attribution() {
+        let daemon = claim_daemon();
+        let sid = make_surface(&daemon, Some("worker-c1"));
+        let surface = daemon.get_surface(sid).expect("surface");
+
+        // 임계 미만: 발화 없음(게이트 재무장 유지)
+        maybe_fire_context_threshold(
+            &daemon, &surface, 40, "observed-uncertain", Some("claude"), Some("ambiguous"),
+        );
+        assert_eq!(threshold_events(&daemon, sid).len(), 0, "40%에서 발화됐다");
+
+        // 미만→이상 교차: 1회 발화 + 근거 동봉
+        maybe_fire_context_threshold(
+            &daemon, &surface, 90, "observed-uncertain", Some("claude"), Some("ambiguous"),
+        );
+        let evs = threshold_events(&daemon, sid);
+        assert_eq!(evs.len(), 1, "폴백 교차에서 정확히 1회 발화돼야 한다");
+        assert_eq!(evs[0]["payload"]["source"].as_str(), Some("observed-uncertain"));
+        assert_eq!(
+            evs[0]["payload"]["attribution"].as_str(),
+            Some("ambiguous"),
+            "귀속 근거가 빠지면 수신측이 오귀속 가능성을 알 방법이 없다"
+        );
+
+        // 임계 위 체류(다음 틱): 재발화 없음
+        maybe_fire_context_threshold(
+            &daemon, &surface, 100, "observed-uncertain", Some("claude"), Some("evicted"),
+        );
+        assert_eq!(
+            threshold_events(&daemon, sid).len(),
+            1,
+            "체류 중 재발화 = cycle-agent 반복 집행"
+        );
+
+        // 자기보고 경로는 귀속 판정이 없다 — 없는 근거를 만들어 붙이면 안 된다.
+        status_set(&daemon, sid, "working", 10, "t", None);
+        status_set(&daemon, sid, "working", 70, "t", None);
+        let evs = threshold_events(&daemon, sid);
+        assert_eq!(evs.len(), 2, "재교차에서 재발화돼야 한다");
+        assert!(evs[1]["payload"].get("attribution").is_none());
+        assert_eq!(evs[1]["payload"]["source"].as_str(), Some("self-report"));
+    }
+
+    /// ★E9(적대 리뷰 R-6 잔여): payload 의 `action` 은 신뢰도에 따라 **다른 지시**를 담는다.
+    /// source 를 `observed-uncertain` 으로 나눠놓고 지시 문구가 확실한 신호와 동일하면,
+    /// `attribution` 을 읽지 않는 수신자는 오귀속 pane 을 그대로 /clear 시킨다 — 분리의 의미가
+    /// 소비 지점에서 증발한다. 불확실 신호는 실측 확인(read-screen)을 선행 조건으로 지시한다.
+    #[test]
+    fn e9_uncertain_source_gets_verification_first_action() {
+        let daemon = claim_daemon();
+
+        let uncertain_sid = make_surface(&daemon, Some("worker-e9a"));
+        let uncertain = daemon.get_surface(uncertain_sid).expect("surface");
+        maybe_fire_context_threshold(
+            &daemon, &uncertain, 90, "observed-uncertain", Some("claude"), Some("ambiguous"),
+        );
+        let a = threshold_events(&daemon, uncertain_sid);
+        let uncertain_action = a[0]["payload"]["action"].as_str().unwrap_or_default();
+        assert!(
+            uncertain_action.contains("read-screen") && uncertain_action.contains("귀속 불확실"),
+            "불확실 신호가 실측 확인 없이 집행을 지시하면 오귀속 pane 이 순환된다: {uncertain_action}"
+        );
+
+        // 대조군: 확실한 경로(자기보고·confident 관측)의 지시는 종전 그대로다(무회귀).
+        let sure_sid = make_surface(&daemon, Some("worker-e9b"));
+        let sure = daemon.get_surface(sure_sid).expect("surface");
+        maybe_fire_context_threshold(&daemon, &sure, 90, "self-report", None, None);
+        let b = threshold_events(&daemon, sure_sid);
+        let sure_action = b[0]["payload"]["action"].as_str().unwrap_or_default();
+        assert!(
+            sure_action.contains("cycle-agent") && !sure_action.contains("귀속 불확실"),
+            "확실한 신호의 지시가 격하되면 자율 순환이 사람 확인 대기로 퇴행한다: {sure_action}"
         );
     }
 

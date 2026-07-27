@@ -517,17 +517,22 @@ fn collect_for(
     // 로 발화한다. 분리된 에지 상태를 쓰면 같은 교차에 두 경로가 각각 발화해 master/CSO가
     // cycle-agent를 이중 집행한다. payload source:"observed"로 자기보고 발화와 구분.
     //
-    // ★CU-6A 게이트: 귀속이 모호·무효인 관측은 임계에 **투입하지 않는다**. 틀린 pane을
-    // 순환(/clear)시키는 것은 아무것도 안 하는 것보다 나쁘다 — 그 pane의 작업이 날아간다.
-    // 게이트가 닫혀도 자기보고(status.set) 경로는 그대로 살아 있어 완전 실명은 아니다.
-    // `None`(비클로드·구경로)은 종전대로 통과 — 이 게이트는 판정이 있을 때만 개입한다.
-    if matches!(new.attribution.as_deref(), None | Some(ATTR_CONFIDENT)) {
-        if let Some(p) = new.ctx_pct {
+    // ★CU-6A 게이트 + C1 고위험 폴백 — 판정은 `observed_fire_source`(순수)가 유일하게 한다.
+    if let Some(p) = new.ctx_pct {
+        if let Some(src) = observed_fire_source(new.attribution.as_deref(), p) {
             crate::handlers::maybe_fire_context_threshold(
-                daemon, s, p, "observed", Some(&new.agent),
+                daemon,
+                s,
+                p,
+                src,
+                Some(&new.agent),
+                new.attribution.as_deref(),
             );
         }
-    } else if prev.as_ref().and_then(|p| p.attribution.as_deref()) != new.attribution.as_deref() {
+    }
+    if !matches!(new.attribution.as_deref(), None | Some(ATTR_CONFIDENT))
+        && prev.as_ref().and_then(|p| p.attribution.as_deref()) != new.attribution.as_deref()
+    {
         // **에지 1회만**. 매 틱(2초) 반복 발화는 소음이고, 소음은 곧 무시다.
         daemon.bus.publish(
             "usage.attribution_ambiguous",
@@ -539,9 +544,47 @@ fn collect_for(
                 "attribution": new.attribution,
                 "session_file": new.session_file,
                 "ctx_pct": new.ctx_pct,
-                "note": "귀속 모호 — 컨텍스트 임계 게이트 미투입(자기보고 경로는 유지)",
+                "note": format!(
+                    "귀속 모호 — 컨텍스트 임계 게이트 미투입({UNCERTAIN_FIRE_PCT}% 이상은 폴백 발화 · 자기보고 경로는 유지)"
+                ),
             }),
         );
+    }
+}
+
+/// 귀속이 모호·무효여도 관측 발화를 허용하는 **고위험 폴백 임계**.
+pub const UNCERTAIN_FIRE_PCT: u8 = 85;
+
+/// 관측 경로의 임계 투입 판정(순수) — `Some(source)`면 그 source로 발화한다.
+///
+/// ★CU-6A: 귀속이 모호(공유 cwd 폴백 pane 2+)·무효(evicted)인 관측은 원칙적으로 임계에
+/// **투입하지 않는다**. 틀린 pane을 순환(/clear)시키면 그 pane의 작업이 날아가기 때문이다.
+///
+/// ★C1 폴백: 그러나 훅과 statusline이 **동시에** 죽은 환경(윈도우: codex lsof 부재로 귀속이
+/// 영구 휴리스틱)에서는 이 게이트가 곧 실명이다 — 100%에 도달해도 아무도 순환시키지 못한다.
+/// 그래서 `UNCERTAIN_FIRE_PCT` 이상에서는 모호·무효라도 발화한다. 근거: **오귀속 cycle의
+/// 대가(잘못된 pane 순환)보다 100% 방치의 대가(그 pane 작업 전소)가 크며, cycle-agent에는
+/// 저장 검증 게이트가 있어 오발화의 실피해가 제한된다**(저장이 안 되면 clear가 실행되지 않는다).
+/// source를 `observed-uncertain`으로 나눠 수신측(master/CSO)이 신뢰도를 구분하게 한다.
+///
+/// ★E2(적대 리뷰 REVISE-2): 폴백 대상은 `ambiguous` **뿐**이다. `evicted` 는 성격이 다르다 —
+/// 모호는 "누구 것인지 모른다"(맞을 수도 있다)지만, 축출은 **더 높은 rank 의 다른 pane 이 그
+/// 세션을 가져갔다는 확정 사실**이다. 즉 이 관측치는 이 surface 의 것이 아님이 판명된 값이라,
+/// 그걸로 임계를 발화하면 **엉뚱한 pane 을 확정적으로 순환**시킨다(폴백의 논거였던 "틀릴 수도
+/// 있지만 방치보다 낫다"의 전제 자체가 성립하지 않는다). 게다가 축출된 surface 는 재발견이
+/// 트리거되므로(`apply_eviction`), 그 pane 의 진짜 소비는 새 귀속으로 다시 들어온다.
+///
+/// "max(해당 surface 임계, 85)"의 **surface 임계 쪽 절반은 하류가 이미 강제한다** —
+/// `maybe_fire_context_threshold`가 role 오버라이드·env 임계 미만이면 그대로 반환하므로,
+/// 여기서 임계를 다시 계산하면 두 곳에서 갈릴 뿐 판정은 같다.
+pub fn observed_fire_source(attribution: Option<&str>, pct: u8) -> Option<&'static str> {
+    match attribution {
+        // `None`(비클로드·구경로)은 판정 자체가 없으므로 종전대로 통과.
+        None | Some(ATTR_CONFIDENT) => Some("observed"),
+        // 오귀속이 **확정**된 관측 — 어떤 pct 에서도 발화하지 않는다.
+        Some(ATTR_EVICTED) => None,
+        _ if pct >= UNCERTAIN_FIRE_PCT => Some("observed-uncertain"),
+        _ => None,
     }
 }
 
@@ -1984,16 +2027,81 @@ mod tests {
         assert!(ambiguous_surfaces(&solo).is_empty());
     }
 
-    /// (d) 게이트 판정: 모호 89%는 임계에 **미투입**, confident 61%는 발화. `None`(구경로)은 통과.
-    /// 이 표가 CU-6A의 존재 이유다 — 틀린 pane을 /clear 시키면 그 노드의 작업이 날아간다.
+    /// (d) 게이트 판정 — **폴백 임계 미만 구간**: 모호·무효 71%는 임계에 미투입, confident 61%는
+    /// 발화, `None`(구경로)은 통과. 이 표가 CU-6A의 존재 이유다 — 틀린 pane을 /clear 시키면
+    /// 그 노드의 작업이 날아간다. 85% 이상 구간은 C1 폴백이 담당한다(아래 별도 테스트).
     #[test]
     fn sim2d_threshold_gate_admits_only_confident_or_unjudged() {
-        // collect_for의 게이트 조건과 **같은 식**을 단정한다(식이 갈리면 이 테스트는 무의미해진다).
-        let admits = |a: Option<&str>| matches!(a, None | Some(ATTR_CONFIDENT));
-        assert!(admits(Some(ATTR_CONFIDENT)), "confident 61%는 발화해야 한다");
-        assert!(admits(None), "비클로드·구경로(미판정)는 종전대로 통과 — 회귀 0");
-        assert!(!admits(Some(ATTR_AMBIGUOUS)), "모호 89%가 임계를 발화하면 엉뚱한 노드가 순환된다");
-        assert!(!admits(Some(ATTR_EVICTED)), "무효화된 귀속도 발화 금지");
+        // collect_for가 **실제로 부르는 함수**를 단정한다 — 식을 복제하면 언젠가 갈린다.
+        assert_eq!(observed_fire_source(Some(ATTR_CONFIDENT), 61), Some("observed"));
+        assert_eq!(observed_fire_source(None, 61), Some("observed"), "비클로드·구경로(미판정)는 종전대로 통과 — 회귀 0");
+        assert_eq!(observed_fire_source(Some(ATTR_AMBIGUOUS), 71), None, "모호 71%가 임계를 발화하면 엉뚱한 노드가 순환된다");
+        assert_eq!(observed_fire_source(Some(ATTR_EVICTED), 71), None, "무효화된 귀속은 발화 금지(E2: 폴백 구간 포함 전면)");
+        // 폴백 경계 바로 아래는 여전히 차단 — off-by-one이 게이트를 통째로 여는 것을 막는다.
+        assert_eq!(observed_fire_source(Some(ATTR_AMBIGUOUS), UNCERTAIN_FIRE_PCT - 1), None);
+    }
+
+    /// ★C1 고위험 폴백: 훅+statusline이 동시에 죽은 환경(윈도우: codex lsof 부재 → 영구 휴리스틱)
+    /// 에서 CU-6A 게이트는 곧 실명이다 — 100%에 도달해도 아무도 순환시키지 못하고 그 pane의
+    /// 작업이 통째로 날아간다. 85% 이상은 모호·무효라도 발화하되 source를 나눠 신뢰도를 알린다.
+    #[test]
+    fn c1_uncertain_attribution_still_fires_at_high_pct() {
+        assert_eq!(
+            observed_fire_source(Some(ATTR_AMBIGUOUS), UNCERTAIN_FIRE_PCT),
+            Some("observed-uncertain"),
+            "ambiguous {UNCERTAIN_FIRE_PCT}%가 막히면 그 pane은 100%까지 방치된다"
+        );
+        assert_eq!(
+            observed_fire_source(Some(ATTR_AMBIGUOUS), 100),
+            Some("observed-uncertain")
+        );
+        // 확실한 귀속은 폴백 구간에서도 source가 격하되지 않는다(수신측 신뢰도 판단 재료).
+        assert_eq!(observed_fire_source(Some(ATTR_CONFIDENT), 100), Some("observed"));
+    }
+
+    /// ★E2 회귀 핀: `evicted` 는 **폴백 구간에서도** 발화하지 않는다.
+    /// ambiguous("누구 것인지 모른다")와 달리 evicted 는 "이 surface 것이 아님이 확정됐다"는
+    /// 사실이라, 발화하면 엉뚱한 pane 을 확정적으로 /clear 시킨다 — 폴백의 논거("틀릴 수도
+    /// 있지만 방치보다 낫다")가 성립하지 않는 유일한 값이다.
+    #[test]
+    fn c1_fallback_excludes_evicted_attribution() {
+        for pct in [0u8, 60, UNCERTAIN_FIRE_PCT - 1, UNCERTAIN_FIRE_PCT, 99, 100] {
+            assert_eq!(
+                observed_fire_source(Some(ATTR_EVICTED), pct),
+                None,
+                "evicted {pct}% 발화 = 오귀속 확정 pane 순환(작업 전소)"
+            );
+        }
+        // 대조군: 같은 pct 에서 ambiguous 는 폴백을 그대로 받는다(폴백 자체는 살아 있다).
+        assert_eq!(
+            observed_fire_source(Some(ATTR_AMBIGUOUS), 100),
+            Some("observed-uncertain")
+        );
+    }
+
+    /// 폴백은 **에지 게이트를 우회하지 않는다** — 판정 함수는 순수하고, 발화는 여전히 공유
+    /// `ctx_threshold_armed` 게이트 한 곳(`maybe_fire_context_threshold`)만 지난다. 폴백을
+    /// 급히 넣다가 게이트를 우회하는 인라인 발화를 심으면 같은 교차에 cycle-agent가 이중
+    /// 집행된다(에지 1회성의 실제 동작 핀은 handlers.rs의 `c1_*_fires_once_per_edge`).
+    #[test]
+    fn c1_fallback_does_not_bypass_the_shared_edge_gate() {
+        let src = include_str!("usage.rs");
+        // 테스트 모듈은 판정 대상이 아니다 — 자기 자신의 문자열 리터럴까지 세면 안 된다.
+        let prod = src.split("#[cfg(test)]").next().expect("소스 본문");
+        let head = prod
+            .split("pub fn observed_fire_source")
+            .nth(1)
+            .expect("observed_fire_source 함수가 사라졌다");
+        let body = &head[..head.find("\n}").expect("함수 본문 끝을 찾지 못했다")];
+        assert!(
+            !body.contains("ctx_threshold_armed") && !body.contains("publish"),
+            "판정 함수가 에지 상태·버스를 직접 만지면 이중 집행 차단이 무너진다: {body}"
+        );
+        // 관측 경로의 발화 진입점은 하나뿐이어야 한다(경로 복제 = 이중 발화).
+        assert_eq!(
+            prod.matches("crate::handlers::maybe_fire_context_threshold").count(),
+            1
+        );
     }
 
     /// 죽은 pane의 선점 해제 — 안 하면 종료된 pane이 파일을 영영 쥐고 있어 후속 pane이 자기

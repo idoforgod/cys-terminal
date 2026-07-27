@@ -63,6 +63,9 @@ cysjavis-pack/memory/*
 
 # 설치 매니페스트 (생성 아티팩트 — 배포본 해시라 repo 제네릭 파일과 불일치)
 cysjavis-pack/.install-manifest.json
+
+# 팩 런타임 상태 (토큰 등 시크릿 — 커밋 금지 · git add -A 사고 방지)
+cysjavis-pack/state/
 src-tauri/runtime
 
 # 로컬 배포·팩 산출물 (발행 금지 — git add -A 사고 방지 2026-07-06)

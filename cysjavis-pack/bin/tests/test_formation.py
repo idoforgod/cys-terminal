@@ -161,7 +161,11 @@ def _ensure_harness(m, live, installed, resource_ok):
     feeds = []
     m.gate_check = lambda: True
     m._installed_clis = lambda: set(installed)
-    m._live_roles = lambda socket=None: (set(live) if live is not None else None)
+    # ★N-7: 스텁 시그니처는 실함수(`_live_roles(socket, require_live_agent=True)`)와 일치시킨다.
+    #   종전 `lambda socket=None` 은 좌석 관측 호출(`_live_roles(socket, require_live_agent=False)`)이
+    #   추가되는 순간 TypeError 로 조용히 깨진다 — 미래 파손의 씨앗이라 실시그니처를 그대로 받는다.
+    m._live_roles = lambda socket=None, require_live_agent=True: (
+        set(live) if live is not None else None)
     m._resource_ok = lambda socket=None: resource_ok
     m._boot_node = lambda role, socket, cwd=None, timeout=200: (True, "stub")
     m._ensure_master_seat = lambda socket, cwd: (True, "stub")
@@ -235,7 +239,7 @@ def ensure_order_gate(m):
               len(feeds) == 1 and feeds[0][0] == "formation-partial", "feeds=%r" % (feeds,))
 
         # (d) kind 전이 → 표면화 재발화(침묵 금지 C6 보존 — 스팸 억제가 침묵으로 퇴화하지 않음).
-        m._live_roles = lambda socket=None: {"master", "cso"}
+        m._live_roles = lambda socket=None, require_live_agent=True: {"master", "cso"}
         m._resource_ok = lambda socket=None: True
         m.ensure(socket="/tmp/c.sock")
         check("11 kind 전이(complete→partial) → 표면화 재발화",

@@ -5,8 +5,25 @@
 설계 근거: `_round/queue-backpressure/DESIGN-response-storm-fix-v1.md` §7 T9
 목적: enforce/log 두 정책 모드에서 "수신자 busy 고정 + 다발 발신" 실사고형 혼잡을 격리
       데몬에 재현해, ①소프트캡 결정론 거부 ②멱등 병합 ③depth 수렴 ④무키 무병합
-      ⑤log 모드 관측 정확성 ⑥TTL 적체 상한 ⑦System-origin 면제를 **결정론(exit code)** 으로
-      판정한다. 자기채점 산문이 아니라 exit code 와 stdout JSON 이 사실이다.
+      ⑤log 모드 관측 정확성 ⑥TTL 적체 상한 ⑦System-origin **등급 분리**를 **결정론(exit code)**
+      으로 판정한다. 자기채점 산문이 아니라 exit code 와 stdout JSON 이 사실이다.
+
+★⑦ 재작성(2026-07-27 적대리뷰 N-6): 종전 7c "System-origin TTL 면제"는 **오라벨·공허 통과**였다.
+  드릴이 `CYS_QUEUE_SYSTEM_TTL_SECS` 를 설정하지 않아 라이브 기본 14400s(4h)가 걸린 채로
+  "TTL 창 경과 후에도 잔존"을 물었으니, 어떤 대기시간에도 참인 명제였다(무엇도 검증 못 함).
+  게다가 B5 이후 System 은 **면제가 아니라 별도의 긴 등급**이다. 그래서 지금은 System TTL 을
+  드릴 창(TTL_SYSTEM)에 맞춰 명시하고 **3등급 분리**를 각각 실검증한다:
+    7c Agent TTL 창을 지난 나이인데도 System 은 잔존(= 더 긴 별도 등급)
+    7d System TTL 창까지 가면 만기 이관(= 무한 면제 아님 · 무한 누적 재발 차단)
+    7e 사람의 GUI 큐잉(System 라벨 `gui`)은 그 창을 지나도 잔존(= **더 긴 전용 등급**)
+    7f 그 GUI 도 자기 등급(TTL_GUI) 창까지 가면 만기 이관(= **면제가 아니다**)
+
+★⑦e/f 재작성(2026-07-27 최종 재검증 E4): 종전 7e 는 "GUI = TTL 면제"를 시연했는데, 그 면제는
+  클라이언트 자기신고(`human:true`)에 걸려 있어 pane 밖 detach 프로세스가 한 줄로 **무기한 TTL 을
+  위조 획득**하는 구멍이었다. 면제를 철회하고 GUI 전용 장주기 등급(라이브 기본 24h ·
+  `CYS_QUEUE_GUI_TTL_SECS`)으로 바꿨으므로, 드릴도 "면제 시연"이 아니라 **등급 시연**을 한다 —
+  GUI TTL 을 드릴 창(TTL_GUI)에 명시해 ①System 보다 길고 ②그래도 상한이 있음을 함께 못박는다
+  (명시하지 않으면 라이브 기본 86400s 가 걸려 7f 가 영원히 공허 통과한다 — N-6 과 같은 형태).
 
 격리 계약(javis_phoenix_harness 와 동일 — 라이브 무접촉):
   · 데몬은 ~/.cys/state-harness/cys.sock 에만 bind 하고 상태·dead-letter 도 그 디렉터리로 격리된다.
@@ -26,9 +43,13 @@ Agent-origin 재현(위장이 아니라 실 경로):
   (조상 추적이 어떤 surface 에도 닿지 않음 → QueueOrigin::System).
 
 시간 압축: 격리 데몬 env 로 TTL·소프트캡·depth 경보를 짧게 잡는다(라이브 기본값 불변).
-  · enforce 위상: SOFTCAP=5 · TTL=600(TTL 이 소프트캡/병합 판정을 교란하지 않게 길게)
-  · log     위상: SOFTCAP=5 · TTL=6(적체 상한 실증이 주제)
+  · enforce 위상: SOFTCAP=5 · AGENT_TTL=600 · SYSTEM_TTL=600 · GUI_TTL=600
+                  (TTL 이 소프트캡/병합 판정을 교란하지 않게 길게)
+  · log     위상: SOFTCAP=5 · AGENT_TTL=6 · SYSTEM_TTL=45 · GUI_TTL=120
+                  (적체 상한 + **3등급 분리** 실증이 주제)
   watchdog 틱은 5초 고정이라 TTL 실측 상한은 TTL+틱 ≈ 11초다.
+  등급 비(6:45:120)는 라이브 비(3600:14400:86400 = 1:4:24)보다 짧은 쪽을 크게 벌렸다 —
+  틱 해상도(5초)가 인접 등급의 sweep 창을 섞지 않게 하려면 짧은 쪽 TTL 대비 충분한 간격이 필요하다.
 
 사용:
   python3 cysjavis-pack/bin/javis_queue_drill.py            # 전 판정 실행
@@ -54,7 +75,15 @@ DBG = os.path.join(REPO, "target", "debug")
 # ── 정책 파라미터(격리 데몬 env 로 주입) ──────────────────────────────────────
 SOFTCAP = 5
 TTL_LONG = 600      # enforce 위상 — TTL 이 소프트캡/병합 판정을 교란하지 않게
-TTL_SHORT = 6       # log 위상 — 적체 상한 실증
+TTL_SHORT = 6       # log 위상 — 적체 상한 실증(Agent 등급)
+# ★N-6: System 등급 TTL 을 **드릴 창에 맞춰 명시**한다. 미설정 시 라이브 기본 14400s 가 걸려
+#   "System 은 잔존한다"가 무조건 참이 되는 공허 판정이 된다(종전 7c 결함).
+TTL_SYSTEM = 45     # log 위상 — Agent(6s)보다 길고 드릴 안에서 반드시 도달하는 별도 등급
+# ★E4 재수정: GUI 등급도 같은 이유로 **드릴 창에 명시**한다. 미설정이면 라이브 기본 86400s(24h)가
+#   걸려 "GUI 는 잔존한다"가 무조건 참이 되는 공허 판정으로 되돌아간다(종전 7e 결함과 같은 형태).
+#   System(45s)의 약 2.7배 — 7e(System 창 통과 시점) 관측과 7f(GUI 창 도달) 사이에 앞단계 지연을
+#   흡수할 여유를 두려면 두 창 사이가 넉넉해야 한다.
+TTL_GUI = 120       # log 위상 — System(45s)보다 길고 드릴 안에서 반드시 도달하는 GUI 전용 등급
 DEPTH_ALERT = 2
 TICK = 5.0          # governance.rs WATCHDOG_INTERVAL_SECS (상수)
 HARD_CAP = 100      # queue_policy.rs QUEUE_HARD_CAP (상수)
@@ -132,6 +161,20 @@ def depth(sid):
     return len(queue_entries(sid))
 
 
+def oldest_age(sid):
+    """대상 큐 최고령 항목의 나이(초). 비었으면 None.
+    ★TTL 등급 판정은 '얼마나 기다렸나'(벽시계)가 아니라 '항목이 몇 초 묵었나'(enqueued_at)로
+    해야 한다 — 드릴 앞단계가 느려져도 판정이 흔들리지 않는다."""
+    now = time.time()
+    ages = [now - e["enqueued_at"] for e in queue_entries(sid) if "enqueued_at" in e]
+    return max(ages) if ages else None
+
+
+def entries_matching(sid, tag):
+    """preview(80자 절단)에 태그가 든 큐 항목만. 같은 surface 안의 레인 분리 확인용."""
+    return [e for e in queue_entries(sid) if tag in (e.get("preview") or "")]
+
+
 def dead_letters(reason=None, tag=None):
     """dead-letter 원장 조회. 원장이 SOT 이며 이벤트(링·유실 가능)에 의존하지 않는다."""
     rows = []
@@ -182,8 +225,12 @@ def events(name=None, sid=None):
 
 
 # ── 격리 환경 조립 ────────────────────────────────────────────────────────────
-def boot(mode, ttl):
-    """정책 env 를 건 격리 데몬을 hermetic 하게 재기동한다(이전 위상 상태 전소거)."""
+def boot(mode, ttl, system_ttl, gui_ttl):
+    """정책 env 를 건 격리 데몬을 hermetic 하게 재기동한다(이전 위상 상태 전소거).
+
+    ★system_ttl·gui_ttl 은 **필수 인자**다(N-6 · E4 재수정): 미설정이면 라이브 기본
+    (14400s·86400s)이 걸려 해당 등급 판정이 공허 통과한다. 위상마다 명시하게 강제해
+    그 회귀를 타입 수준에서 막는다."""
     global _events_proc
     stop_events()
     h.teardown()
@@ -197,10 +244,13 @@ def boot(mode, ttl):
     os.environ["CYS_QUEUE_POLICY_MODE"] = mode
     os.environ["CYS_QUEUE_AGENT_SOFTCAP"] = str(SOFTCAP)
     os.environ["CYS_QUEUE_TTL_SECS"] = str(ttl)
+    os.environ["CYS_QUEUE_SYSTEM_TTL_SECS"] = str(system_ttl)
+    os.environ["CYS_QUEUE_GUI_TTL_SECS"] = str(gui_ttl)
     os.environ["CYS_QUEUE_DEPTH_ALERT"] = str(DEPTH_ALERT)
     if not h.start_daemon() or not h.harness_ping():
         raise SystemExit("격리 데몬 기동 실패 (%s)" % h.DAEMON_LOG)
-    log("격리 데몬 기동 — mode=%s softcap=%d ttl=%ss depth_alert=%d" % (mode, SOFTCAP, ttl, DEPTH_ALERT))
+    log("격리 데몬 기동 — mode=%s softcap=%d agent_ttl=%ss system_ttl=%ss gui_ttl=%ss depth_alert=%d"
+        % (mode, SOFTCAP, ttl, system_ttl, gui_ttl, DEPTH_ALERT))
     start_events()
 
 
@@ -304,6 +354,24 @@ def system_burst(target_ref, n, tag):
     return rcs
 
 
+def gui_burst(target_sid, n, tag):
+    """사람의 **GUI 큐잉** 재현 — 앱(Tauri)이 쓰는 RPC 그대로 `surface.send_text{queued,human}`.
+
+    위장이 아니다: 이 스크립트는 pane 밖 프로세스라 조상추적이 어떤 surface 에도 닿지 않아
+    origin 은 그대로 System 이고(derive_origin), `human` 플래그는 **분류를 바꾸지 않고**
+    System 라벨만 `gui` 로 세분한다(handlers.rs "GUI 발신은 분류를 바꾸지 않고 System 라벨만
+    gui 로 세분화"). 정책 등급이 아니라 라벨만 다른 두 레인을 만들어 **TTL 등급 분기**를 실검증한다
+    (E4 재수정 이후 이 라벨이 주는 것은 면제가 아니라 GUI 전용 장주기 등급이다 — 7e/7f 참조).
+    CLI 에는 이 플래그가 없어(cys send 에 --human 없음) RPC 로 직접 부른다.
+    반환: 발신별 성공 여부(0=성공)."""
+    rcs = []
+    for i in range(1, n + 1):
+        r = rpc("surface.send_text", {"surface_id": target_sid, "text": "%s-%d" % (tag, i),
+                                      "queued": True, "human": True})
+        rcs.append(0 if r.get("result") is not None and not r.get("error") else 1)
+    return rcs
+
+
 def wait_until(pred, timeout, period=0.5):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -315,7 +383,8 @@ def wait_until(pred, timeout, period=0.5):
 
 # ── 위상 1: enforce ───────────────────────────────────────────────────────────
 def phase_enforce():
-    boot("enforce", TTL_LONG)
+    # enforce 위상은 TTL 이 소프트캡·병합 판정을 교란하지 않게 두 등급 모두 길게 잡는다.
+    boot("enforce", TTL_LONG, TTL_LONG, TTL_LONG)
     r1_ref, r1 = mk_surface()
     r2_ref, r2 = mk_surface()
     a_ref, a = mk_surface()
@@ -408,17 +477,18 @@ def phase_enforce():
 
 # ── 위상 2: log ───────────────────────────────────────────────────────────────
 def phase_log():
-    boot("log", TTL_SHORT)
+    boot("log", TTL_SHORT, TTL_SYSTEM, TTL_GUI)
     r3_ref, r3 = mk_surface()   # ⑤⑥a keyless 적재 → TTL 만료
     r4_ref, r4 = mk_surface()   # ⑥b 지속 유입 적체 상한
-    r5_ref, r5 = mk_surface()   # ⑦ System-origin 면제
+    r5_ref, r5 = mk_surface()   # ⑦a~d System-origin(익명) 등급
+    r6_ref, r6 = mk_surface()   # ⑦e/f 사람 GUI 큐잉(System 라벨 gui) — 전용 장주기 등급 레인
     b_ref, b = mk_surface()
-    for ref in (r3_ref, r4_ref, r5_ref):
+    for ref in (r3_ref, r4_ref, r5_ref, r6_ref):
         make_busy(ref)
     time.sleep(1.2)
     judge("L0", "수신자 busy 고정(log 위상)",
-          all(busy_confirmed(x) for x in (r3_ref, r4_ref, r5_ref)),
-          {"receivers": [r3_ref, r4_ref, r5_ref]})
+          all(busy_confirmed(x) for x in (r3_ref, r4_ref, r5_ref, r6_ref)),
+          {"receivers": [r3_ref, r4_ref, r5_ref, r6_ref]})
     judge("L0b", "발신 surface Agent 등록(set_meta)", register_agent(b), {"sender": b_ref})
 
     # ── ⑤ log 모드: 거부 없음 + rejected{mode:log} 관측 정확 ──
@@ -441,11 +511,14 @@ def phase_log():
           {"sent": n5, "remaining": len(ents5),
            "dead_letter": len(dead_letters(tag=tag5))})
 
-    # ── ⑦ System-origin 발신(면제 관측 대상 — TTL 창 대기 전에 적재) ──
+    # ── ⑦ System 등급 2레인 적재(익명 System · 사람 GUI 큐잉) — TTL 창 대기 전에 적재 ──
     n7, tag7 = 8, "DRILLSYS"
     rcs7 = system_burst(r5_ref, n7, tag7)
     ents7 = queue_entries(r5)
     ev_rej7 = events("queue.rejected", r5)
+    n7g, tag7g = 4, "DRILLGUI"
+    rcs7g = gui_burst(r6, n7g, tag7g)
+    ents7g = queue_entries(r6)
     judge("7a", "System-origin(익명 발신) 소프트캡 미적용 — 전량 적재",
           all(c == 0 for c in rcs7) and len(ents7) == n7 and len(ev_rej7) == 0,
           {"rc_series": rcs7, "depth": len(ents7), "sent": n7,
@@ -453,6 +526,13 @@ def phase_log():
     judge("7b", "System-origin 판별 정확(origin_class=system)",
           all(e.get("origin_class") == "system" for e in ents7),
           {"origins": [e.get("origin_class") for e in ents7]})
+    # GUI 큐잉도 **분류는 System 그대로**여야 한다(라벨만 gui) — 분류가 바뀌면 소프트캡 정책이
+    # 통째로 우회되므로(자기신고 human 으로 Agent 를 탈출하던 R1 결함) 그 자리를 못박는다.
+    judge("7b2", "사람 GUI 큐잉 적재 — 분류는 System 유지(라벨만 gui · 정책 등급 불변)",
+          all(c == 0 for c in rcs7g) and len(ents7g) == n7g
+          and all(e.get("origin_class") == "system" for e in ents7g),
+          {"rc_series": rcs7g, "depth": len(ents7g), "sent": n7g,
+           "origins": [e.get("origin_class") for e in ents7g]})
 
     # ── ⑥a TTL 만료 → dead-letter(ttl) 이관 ──
     ttl_budget = TTL_SHORT + 3 * TICK + 4
@@ -467,11 +547,18 @@ def phase_log():
           n5 == len(dl_ttl5) + depth(r3) + len(events("queue.delivered", r3)),
           {"sent": n5, "ttl_rows": len(dl_ttl5), "remaining": depth(r3)})
 
-    # ── ⑦c System-origin TTL 면제(같은 TTL 창을 지났는데 잔존) ──
-    ents7b = queue_entries(r5)
-    judge("7c", "System-origin TTL 면제 — TTL 창 경과 후에도 잔존(만기 0)",
-          len(ents7b) == n7 and len(dead_letters("ttl", tag7)) == 0,
-          {"depth_after_ttl_window": len(ents7b), "sent": n7,
+    # ── ⑦c System 등급 분리: Agent TTL 창을 지난 나이인데도 System 은 잔존 ──
+    #   판정 기준을 벽시계가 아니라 **항목의 나이**로 잡는다(oldest_age) — 앞단계가 느려져도
+    #   "Agent 등급이었으면 이미 만기됐을 나이"라는 명제 자체는 흔들리지 않는다.
+    aged_past_agent = wait_until(lambda: (oldest_age(r5) or 0) > TTL_SHORT + TICK,
+                                 TTL_SHORT + 3 * TICK + 6)
+    age7c = oldest_age(r5) or 0
+    ents7c = queue_entries(r5)
+    judge("7c", "System 등급 분리 — Agent TTL(%ss)+sweep 창을 넘긴 나이인데도 System 전량 잔존"
+          % TTL_SHORT,
+          aged_past_agent and len(ents7c) == n7 and len(dead_letters("ttl", tag7)) == 0,
+          {"oldest_age_secs": round(age7c, 1), "agent_ttl": TTL_SHORT, "system_ttl": TTL_SYSTEM,
+           "sweep_window": TTL_SHORT + TICK, "depth": len(ents7c), "sent": n7,
            "ttl_rows": len(dead_letters("ttl", tag7))})
 
     # ── ⑥b 적체 상한 = TTL 창 (지속 유입에도 depth 가 총 발신량으로 자라지 않음) ──
@@ -493,7 +580,73 @@ def phase_log():
     judge("6c", "유입 정지 후 TTL 창 내 전량 배수(적체 영구화 불가)",
           final_drained and len(dead_letters("ttl")) >= total6,
           {"depth_final": depth(r4), "ttl_rows_total": len(dead_letters("ttl"))})
-    return {"log_sent": n5 + n7 + total6}
+
+    # ── ⑦d System 은 **무한 면제가 아니다** — 자기 등급 TTL 창에 닿으면 만기 이관 ──
+    #   종전(B5 이전)에는 System 이 소프트캡·TTL 양쪽에서 면제라, 배달이 봉쇄된 pane 앞에서
+    #   무한 누적됐다(라이브 원장 1h+ 실증). 그 회귀를 여기서 못박는다.
+    sys_drained = wait_until(lambda: depth(r5) == 0, TTL_SYSTEM + 3 * TICK + 6)
+    dl_ttl7 = dead_letters("ttl", tag7)
+    ev_exp7 = events("queue.expired", r5)
+    judge("7d", "System 별도 장주기 TTL(%ss) 도달 → 만기 이관(무한 면제·무한 누적 아님)"
+          % TTL_SYSTEM,
+          sys_drained and len(dl_ttl7) == n7 and len(ev_exp7) > 0,
+          {"depth_after": depth(r5), "ttl_rows": len(dl_ttl7), "sent": n7,
+           "expired_events": len(ev_exp7), "system_ttl": TTL_SYSTEM,
+           "budget_secs": TTL_SYSTEM + 3 * TICK + 6})
+    judge("7d2", "System 만기에서도 소실 0 (발신 총량 = dead-letter(ttl) + 잔량 + 배달)",
+          n7 == len(dl_ttl7) + depth(r5) + len(events("queue.delivered", r5)),
+          {"sent": n7, "ttl_rows": len(dl_ttl7), "remaining": depth(r5)})
+
+    # ── ⑦e 사람의 GUI 큐잉은 **System 보다 긴 전용 등급**이다(System 라벨 gui) ──
+    #   같은 System 분류인데도 익명 레인(r5)은 만기됐고 이 레인은 잔존해야 한다 = 라벨 분기 실증.
+    #
+    #   ★sweep 창을 반드시 넘겨서 본다(N-6 재발 방지): 만기는 5초 틱의 sweep 이 집행하므로
+    #   `age > TTL` 만으로는 "아직 안 쓸린 것"과 "등급이 다른 것"을 구별할 수 없다 — 실제로 초안은
+    #   age=47.1s(TTL 45s)에서 통과했는데 그건 등급 분기가 아니라 **틱 사이에 본 것**이었다.
+    #   sweep 을 최소 2회 확실히 지난 나이(System TTL + 2틱 + 여유)까지 기다린 뒤에만 판정한다.
+    #
+    #   ★E4 재수정: 여기서 묻는 것은 "면제"가 **아니다**. 면제라면 어떤 나이에서도 참이라
+    #   상한 철회를 못 잡는다(그게 종전 7e 의 결함이자, 자기신고 위조로 무기한을 얻던 구멍이다).
+    #   지금은 "GUI 창(TTL_GUI) **안에서만** 잔존"을 묻고, 그 창을 넘긴 뒤는 7f 가 만기를 묻는다.
+    gui_hold = TTL_SYSTEM + 2 * TICK + 4
+    wait_until(lambda: (oldest_age(r6) or 0) > gui_hold, gui_hold + 3 * TICK)
+    ents7e = entries_matching(r6, tag7g)
+    age7e = oldest_age(r6) or 0
+    judge("7e", "GUI 전용 장주기 등급 — System TTL(%ss)+sweep 2틱을 넘겨도 GUI 창(%ss) 안이면 전량 잔존"
+          % (TTL_SYSTEM, TTL_GUI),
+          len(ents7e) == n7g and len(dead_letters("ttl", tag7g)) == 0
+          and gui_hold < age7e < TTL_GUI,
+          {"depth": len(ents7e), "sent": n7g, "oldest_age_secs": round(age7e, 1),
+           "system_ttl": TTL_SYSTEM, "gui_ttl": TTL_GUI, "required_age": gui_hold, "tick": TICK,
+           "ttl_rows": len(dead_letters("ttl", tag7g)),
+           "note": "잔존 실패 = state.rs effective_ttl 이 System 라벨 gui 를 분기하지 않는다는 뜻. "
+                   "age >= gui_ttl 로 실패했다면 앞단계 지연으로 관측 창을 놓친 것이니 "
+                   "TTL_GUI 를 늘려 재실행하라(판정 의미 자체는 유효)."})
+
+    # ── ⑦f 그 GUI 도 **면제가 아니다** — 자기 등급 창(TTL_GUI)에 닿으면 만기 이관 ──
+    #   ★이 판정이 E4 재수정의 본핀이다. GUI 라벨은 클라이언트 자기신고(human:true)로 붙으므로,
+    #   등급이 무기한이면 pane 밖 detach 프로세스가 한 줄로 무기한 TTL 을 위조 획득한다.
+    #   유계 등급이면 위조해도 얻는 게 TTL_GUI(라이브 24h) 뿐이라 위조할 값어치가 없다.
+    #   만기는 폐기가 아니라 이관이므로 전문은 원장에 남는다(무손실) — 그 둘을 함께 못박는다.
+    gui_drained = wait_until(lambda: len(entries_matching(r6, tag7g)) == 0,
+                             TTL_GUI + 3 * TICK + 6)
+    dl_ttl7g = dead_letters("ttl", tag7g)
+    ev_exp7g = events("queue.expired", r6)
+    judge("7f", "GUI 등급도 상한이 있다 — GUI TTL(%ss) 도달 → 만기 이관(무기한 면제 아님)"
+          % TTL_GUI,
+          gui_drained and len(dl_ttl7g) == n7g and len(ev_exp7g) > 0,
+          {"depth_after": len(entries_matching(r6, tag7g)), "ttl_rows": len(dl_ttl7g),
+           "sent": n7g, "expired_events": len(ev_exp7g), "gui_ttl": TTL_GUI,
+           "budget_secs": TTL_GUI + 3 * TICK + 6,
+           "note": "FAIL 이면 GUI 가 다시 무기한 면제라는 뜻 — 자기신고 human:true 로 "
+                   "무기한 TTL 을 위조 획득하는 경로가 열려 있다"})
+    judge("7f2", "GUI 만기에서도 소실 0 (발신 총량 = dead-letter(ttl) + 잔량 + 배달)",
+          n7g == len(dl_ttl7g) + len(entries_matching(r6, tag7g))
+          + len(events("queue.delivered", r6)),
+          {"sent": n7g, "ttl_rows": len(dl_ttl7g),
+           "remaining": len(entries_matching(r6, tag7g)),
+           "delivered": len(events("queue.delivered", r6))})
+    return {"log_sent": n5 + n7 + n7g + total6}
 
 
 def main():
@@ -525,6 +678,7 @@ def main():
         "drill": "queue-backpressure T9",
         "elapsed_secs": elapsed,
         "params": {"softcap": SOFTCAP, "ttl_enforce": TTL_LONG, "ttl_log": TTL_SHORT,
+                   "ttl_system_log": TTL_SYSTEM,
                    "depth_alert": DEPTH_ALERT, "watchdog_tick": TICK, "hard_cap": HARD_CAP},
         "socket": h.HARN_SOCK,
         "dead_letters": DEAD_LETTERS,

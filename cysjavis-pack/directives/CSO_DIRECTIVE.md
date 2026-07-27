@@ -29,8 +29,10 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 | `watchdog.proc_count_high` | 한 surface의 자식 폭증 | 해당 노드 점검·경고, 필요 시 `close-surface`(자식 트리 전멸) 건의 |
 | `health.alert` (not_logged_in·token_expired 등) | 노드 인증·로그인 이상 | 해당 노드 작업 중단 안내 → master에 재로그인 필요 보고 |
 | `pane.idle` | 노드 장기 무출력 | read-screen으로 상태 확인 → hang이면 회생 조치(키 입력/재기동 건의) |
-| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
+| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). **★`payload.source`를 먼저 본다**: `self-report`·`observed`·`statusline`은 그대로 집행. **`observed-uncertain`(귀속 불확실 — 데몬이 85%+ 고위험에서 어쩔 수 없이 발화한 관측)이면 집행 전 `cys read-screen --surface <payload.surface_ref>`로 그 pane이 정말 고컨텍스트 주체인지 실측 확인**한 뒤에만 cycle-agent를 건다. 오귀속이 의심되면 순환하지 말고 대상 노드에 "지금 컨텍스트 몇 %인지 `cys set-status --context`로 자기보고하라" push로 대체한다(엉뚱한 pane을 `/clear`하면 그 pane의 작업이 날아간다). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
 | `queue.depth_high` | 한 노드행 queued 배달이 막힌 채 적체(기본 depth 5+ · blocked_by에 사유) | read-screen으로 대상 노드 점검 → 막힘 원인(연속 출력·사람 입력·queue pause) 해소 또는 master 보고 |
+| `queue.rejected` | 대상 큐의 **Agent 발신 소프트캡 초과분 거부**(기본 25건·`CYS_QUEUE_AGENT_SOFTCAP`). 정책 기본값이 `enforce`라 **실제로 거부되고** 전문은 dead-letter 원장에 남는다(`mode:log`면 관찰만·적재 허용) | ①`payload`의 발신 노드 정체 확인(누가 폭주 중인가) ②`cys queue list --surface <대상>`·dead-letter 원장 열람으로 거부된 전문 회수 ③배달 막힘이 원인이면 대상 pane 점검·해소, 발신 폭주가 원인이면 그 노드에 **재전송 금지** 경고 push ④풀리지 않으면 `request-clear`로 대상에 정리 요청 후 master 보고. **거부는 실패가 아니라 종결이다 — 원장에 남았으니 같은 메시지를 대신 재전송해 주지 마라**(혼잡 증폭·원장 오염) |
+| `queue.expired` | 큐 항목 TTL 만기 — **폐기가 아니라 dead-letter 원장으로 이관**(Agent 기본 1h·System 기본 4h·`--important`는 면제) | ①원장에서 만기 전문을 확인하고 ②그중 **지금도 유효한 건만** 골라 재처리한다(만기 다발은 그 노드가 오래 막혀 있었다는 신호이므로 배달 막힘 원인을 함께 점검) ③발신자에게 "다시 보내라"고 요구하지 마라 — 전문이 원장에 보존돼 있어 재전송은 중복이다 |
 
 ## 2. 노드 생애 관리
 - 죽은 노드(`surface.exited`)는 master와 협의해 재기동한다: `cys launch-agent --role <역할> --agent <cli>`.

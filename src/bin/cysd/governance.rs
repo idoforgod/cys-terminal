@@ -953,7 +953,10 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
         return;
     }
     // ★C1: 데몬 내부 발신 — System origin으로 정식 편입(종전 `from:"governance-approval"`
-    // 문자열 관행을 타입으로 대체). System은 소프트캡·TTL 밖이고 하드캡만 받는다.
+    // 문자열 관행을 타입으로 대체). System은 소프트캡 밖이고 하드캡을 받는다.
+    // ★E4 주석 정정: "TTL 밖"은 더 이상 사실이 아니다 — B5 이후 System 은 자기 등급 TTL
+    // (기본 4h)을 받는다. 승인 대기 알림이 4h 안에 처리되지 않으면 dead-letter 로 이관되며,
+    // 그게 의도다(전문 보존 · master 가 죽은 채 무한 누적되는 편이 더 해롭다).
     let item = crate::state::QueueItem::text(
         text.to_string(),
         crate::state::QueueOrigin::system("governance-approval"),
@@ -2073,6 +2076,128 @@ pub(crate) const OOB_HARD_COOLDOWN_SECS: f64 = 1800.0;
 /// 60초는 "연타 방지"라는 이 경로의 실제 목적에만 맞춘 값이다.
 pub(crate) const OOB_REQUEST_CLEAR_COOLDOWN_SECS: f64 = 60.0;
 
+/// ★E1(0.13.21) 적체 **다이제스트** 쿨다운 기본(초) — 대상 1명이 적체 통지를 받는 최소 간격.
+///
+/// 종전(B3)에는 같은 값이 키 무관 **전역 레이트캡**(`__global__` 예약 키)이었다. 그 구조는
+/// 적체 노드별로 `depth_high_hard:{sid}` 를 따로 주입하는 설계를 전제로, 총량만 사후에 깎았다 —
+/// 그래서 적체 노드가 2개 이상이면 전역캡(300s)과 소스 쿨다운(300s)이 동주기로 맞물려 위상이
+/// 고정되고, 억제된 통지는 그대로 폐기되므로 **1개 외 전원이 영구 침묵**했다(적대 리뷰 BLOCK-1).
+///
+/// 지금은 틱마다 hard tier 노드를 먼저 **수집**해 대상별 **1통의 다이제스트**로 주입한다. 통지가
+/// 노드 수와 무관하게 대상당 1건이므로 총량 상한이 곧 이 쿨다운이고, 창 안에 새로 적체된 노드는
+/// 다음 다이제스트 본문에 실려 나간다 — 영구 침묵이 구조적으로 불가능하다.
+///
+/// `CYS_OOB_GLOBAL_MIN_SECS` 로 조정한다(이름은 B3 호환 유지). **0 = 쿨다운 없음**이다 —
+/// 종전의 "0=전역캡 비활성"과 달리 이제는 틱마다 주입된다는 뜻이므로 진단 목적에만 쓴다.
+pub(crate) const OOB_GLOBAL_MIN_SECS_DEFAULT: f64 = 300.0;
+
+fn oob_global_min_secs() -> f64 {
+    std::env::var("CYS_OOB_GLOBAL_MIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(OOB_GLOBAL_MIN_SECS_DEFAULT)
+}
+
+/// 적체 다이제스트의 dedup 키. **surface id 를 넣지 않는다** — 키에 sid 를 박는 순간 통지가
+/// 노드별로 쪼개지고, 대상 1명이 맞는 총량을 다시 별도 캡으로 깎아야 하는 B3 구조로 되돌아간다.
+/// 계열 추출이 `:` 앞을 자르므로 이 값 자체가 계열이며 B4 사이드카에 (role, 계열)로 영속된다.
+pub(crate) const OOB_DEPTH_DIGEST_KEY: &str = "depth_high_digest";
+
+/// dedup_key → 계열(`ttl_expired:12` → `ttl_expired`). 키에 박힌 surface id 는
+/// 재기동 시 소멸하므로, 재기동을 넘겨 보존하는 원장(B4)은 계열 단위로만 의미가 있다.
+/// sid 를 안 박는 키(적체 다이제스트)는 값 자체가 계열이 된다.
+pub(crate) fn oob_key_class(dedup_key: &str) -> &str {
+    dedup_key.split(':').next().unwrap_or(dedup_key)
+}
+
+/// B4 쿨다운 사이드카. 큐 WAL(v2)에 편승시키지 않은 이유: 큐 WAL 은 enqueue·pop 마다
+/// 전량 재직렬화되는 뜨거운 경로라 쿨다운(드문 갱신)을 얹으면 서로의 실패가 전이된다.
+pub const OOB_COOLDOWN_FILE: &str = "oob-cooldowns.json";
+
+/// 원장 보존 상한(초). 현행 최장 쿨다운(1800s)의 2배 — 이보다 오래된 스탬프는 어떤 쿨다운도
+/// 억제하지 못하므로 보관 자체가 무의미하다(파일·메모리 단조 증가 차단).
+const OOB_COOLDOWN_MAX_AGE_SECS: f64 = 3600.0;
+
+/// 사이드카를 읽어 (role, 계열) → 마지막 주입 시각 맵을 만든다. 부재·손상·만료는 조용히
+/// 버린다 — 통지를 **막는** 원장이므로 못 읽었을 때의 안전한 방향은 "억제하지 않음"이다.
+pub fn load_oob_cooldowns(dir: &std::path::Path) -> HashMap<(String, String), f64> {
+    let mut out = HashMap::new();
+    let Ok(content) = std::fs::read_to_string(dir.join(OOB_COOLDOWN_FILE)) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return out;
+    };
+    let now = now_epoch();
+    for e in v["entries"].as_array().into_iter().flatten() {
+        let (Some(role), Some(class), Some(ts)) = (
+            e["role"].as_str(),
+            e["class"].as_str(),
+            e["ts"].as_f64(),
+        ) else {
+            continue;
+        };
+        // 미래 시각(시계 역행·수기 편집)은 무한 억제가 되므로 버린다.
+        if ts > now || now - ts > OOB_COOLDOWN_MAX_AGE_SECS {
+            continue;
+        }
+        out.insert((role.to_string(), class.to_string()), ts);
+    }
+    out
+}
+
+/// 라이브 맵(surface 키)을 role 앵커로 환산해 사이드카에 원자적으로 쓴다.
+/// 호출은 **스탬프가 갱신될 때만** — 주입 성공은 쿨다운 간격만큼 드문 사건이라 상시 IO 가 없다.
+/// role 없는 surface 의 스탬프는 저장하지 않는다(재기동 후 매칭할 앵커가 없어 무의미하고,
+/// role 없는 것끼리 한 바구니에 뭉쳐 과억제를 만든다).
+///
+/// ★메모리 상의 복원 원장은 **읽기 전용 gap-filler** 다: 라이브 스탬프가 생긴 (role,계열)은
+/// 여기서 지운다. 라이브를 정본으로 두지 않으면 "라이브 쿨다운을 되돌렸는데도 복원분이 계속
+/// 억제하는" 이중 진실이 생긴다(request_clear 재발행이 조용히 삼켜지던 A4 결함의 재발 경로).
+fn persist_oob_cooldowns(daemon: &Arc<Daemon>) {
+    let now = now_epoch();
+    // ① 라이브 스탬프 스냅샷(락은 짧게) → ② role 해석 → ③ 파일용 병합 뷰 구성.
+    let live: Vec<(u64, String, f64)> = {
+        let mut cd = daemon.oob_cooldowns.lock().unwrap();
+        cd.retain(|_, ts| now - *ts <= OOB_COOLDOWN_MAX_AGE_SECS);
+        cd.iter().map(|((sid, k), ts)| (*sid, k.clone(), *ts)).collect()
+    };
+    let mut superseded: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut file_ledger = {
+        let mut r = daemon.restored_oob_cooldowns.lock().unwrap();
+        r.retain(|_, ts| now - *ts <= OOB_COOLDOWN_MAX_AGE_SECS);
+        r.clone()
+    };
+    for (sid, key, ts) in live {
+        let Some(role) = daemon.get_surface(sid).and_then(|s| s.role.lock().unwrap().clone()) else {
+            continue;
+        };
+        let k = (role, oob_key_class(&key).to_string());
+        superseded.insert(k.clone());
+        // 같은 (role, 계열)에 여러 surface 가 걸리면 **가장 최근** 스탬프가 정본이다.
+        let e = file_ledger.entry(k).or_insert(ts);
+        if ts > *e {
+            *e = ts;
+        }
+    }
+    daemon
+        .restored_oob_cooldowns
+        .lock()
+        .unwrap()
+        .retain(|k, _| !superseded.contains(k));
+    let entries: Vec<serde_json::Value> = file_ledger
+        .iter()
+        .map(|((role, class), ts)| json!({"role": role, "class": class, "ts": ts}))
+        .collect();
+    let content = json!({"schema_version": 1, "entries": entries});
+    if let Ok(s) = serde_json::to_string(&content) {
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = write_json_atomic(&dir, OOB_COOLDOWN_FILE, &s);
+    }
+}
+
 /// OOB 주입이 배달되지 않은 **사유**. 종전 `bool` 은 "안 됐다"만 말할 수 있어서, 호출자가
 /// 응답에 실을 안내를 추측으로 지어냈다(요청 경로의 잘못된 hint 의 근원). 사유를 값으로
 /// 돌려 응답·이벤트가 사실만 말하게 한다.
@@ -2137,6 +2262,12 @@ const OOB_PRIVILEGED_ROLES: [&str; 3] = ["master", "cso", "dept-master"];
 ///    (미완성 입력에 이어붙이거나 그대로 제출시키는 최악 경로 차단).
 /// ③ **쿨다운**: (surface, dedup_key)별. 쿨다운을 **성공했을 때만** 찍으므로, 주입 실패나
 ///    가드 skip은 다음 틱에 그대로 재시도된다.
+/// ④ **재기동 생존 쿨다운(B4)**: ③의 맵은 surface_id 키라 재기동을 넘지 못한다 — role 앵커
+///    원장(사이드카)을 같은 창으로 함께 본다.
+///
+/// ★E1: 종전의 키 무관 **전역 레이트캡**(`__global__`)은 제거됐다. 총량 상한은 이제 통지를
+/// 합쳐서 내보내는 쪽(적체 다이제스트)이 구조적으로 갖는다 — 사후에 깎는 캡은 소스 쿨다운과
+/// 동주기로 맞물려 위상을 고정시키고, 억제분이 폐기되면 그대로 영구 침묵이 됐다(BLOCK-1).
 pub(crate) fn oob_notify(
     daemon: &Arc<Daemon>,
     sid: u64,
@@ -2169,9 +2300,20 @@ pub(crate) fn oob_notify(
     // ③ 쿨다운
     let now = now_epoch();
     let key = (sid, dedup_key.to_string());
+    let class = oob_key_class(dedup_key).to_string();
+    let role = s.role.lock().unwrap().clone();
     {
         let cd = daemon.oob_cooldowns.lock().unwrap();
         if let Some(last) = cd.get(&key) {
+            if now - last < cooldown_secs {
+                return Err(OobSkip::Cooldown);
+            }
+        }
+    }
+    // ④ 재기동 생존분(role 앵커) — 라이브 스탬프가 없는 재기동 직후 창에서만 실효한다.
+    if let Some(role) = role.as_deref() {
+        let led = daemon.restored_oob_cooldowns.lock().unwrap();
+        if let Some(last) = led.get(&(role.to_string(), class.clone())) {
             if now - last < cooldown_secs {
                 return Err(OobSkip::Cooldown);
             }
@@ -2189,6 +2331,8 @@ pub(crate) fn oob_notify(
         return Err(OobSkip::ChannelFull);
     }
     daemon.oob_cooldowns.lock().unwrap().insert(key, now);
+    // ★B4: 스탬프가 갱신됐을 때만 사이드카를 갱신한다(상시 IO 금지 — 주입 자체가 드문 사건).
+    persist_oob_cooldowns(daemon);
     // 큐 배달과 마찬가지로 원격 주입이므로 에코 제외 창을 갱신한다.
     *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
     daemon.bus.publish(
@@ -2216,13 +2360,84 @@ fn oob_targets(daemon: &Arc<Daemon>, owner_sid: u64) -> Vec<u64> {
     out
 }
 
-/// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
-/// 모든 '막힘' 분기에서 공통 호출한다(한 분기라도 빠지면 그 사유의 적체가 침묵한다).
+/// 한 틱에 hard tier 로 판정된 적체 노드 1건 — 다이제스트(E1)의 원소.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HardBacklog {
+    pub sid: u64,
+    pub role: Option<String>,
+    pub depth: usize,
+    pub agent_depth: usize,
+    pub oldest_secs: u64,
+    pub blocked_by: String,
+}
+
+/// 다이제스트 본문(순수) — 적체 노드 **전 목록**을 손실 없이 싣는다.
+///
+/// 한 줄로 만든다: 주입 텍스트의 개행은 수신 TUI에서 그대로 제출(Return)로 해석될 수 있어,
+/// 여러 줄 본문은 첫 줄만 전달되고 나머지가 프롬프트에 흩뿌려진다(기존 통지 문구도 전부 단행).
+pub(crate) fn depth_digest_text(hard: &[HardBacklog]) -> String {
+    let list: Vec<String> = hard
+        .iter()
+        .map(|h| {
+            format!(
+                "{}(role={} depth={} agent={} oldest={}s 사유={})",
+                cys::surface_ref(h.sid),
+                h.role.as_deref().unwrap_or("-"),
+                h.depth,
+                h.agent_depth,
+                h.oldest_secs,
+                h.blocked_by,
+            )
+        })
+        .collect();
+    format!(
+        "[QUEUE-BACKPRESSURE] 큐 적체 {}건 — {} · 각 노드의 큐를 점검하고 배달을 막는 원인을 \
+         해소하라. 철회가 필요하면 `cys queue list --surface <ref>` 후 소유 노드가 \
+         `cys queue clear` 집행.",
+        hard.len(),
+        list.join(" ; "),
+    )
+}
+
+/// 수집된 hard tier 적체를 **대상별 1통**으로 주입한다(E1).
+///
+/// 대상 = 적체 노드들의 `oob_targets` 합집합(소유 노드 + master/cso/dept-master). 키가
+/// `OOB_DEPTH_DIGEST_KEY` 하나뿐이라 (target,key) 쿨다운이 곧 대상당 총량 상한이고,
+/// 창 안에 새로 적체된 노드는 다음 다이제스트 본문에 실린다 — 노드별 통지를 사후 캡으로
+/// 깎던 B3 구조의 위상 고정(1개 외 전원 영구 침묵)이 구조적으로 성립하지 않는다.
+fn notify_depth_digest(daemon: &Arc<Daemon>, hard: &[HardBacklog]) {
+    if hard.is_empty() {
+        return;
+    }
+    let text = depth_digest_text(hard);
+    let cooldown = oob_global_min_secs();
+    let mut targets: Vec<u64> = Vec::new();
+    for h in hard {
+        for t in oob_targets(daemon, h.sid) {
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+    }
+    for t in targets {
+        let _ = oob_notify(daemon, t, &text, OOB_DEPTH_DIGEST_KEY, cooldown);
+    }
+}
+
+/// 배달이 막힌 surface의 적체 경보 — quiet 미충족·human 흔적·pause 등 모든 '막힘' 분기에서
+/// 공통 호출한다(한 분기라도 빠지면 그 사유의 적체가 침묵한다).
+///
+/// 두 레인이 **분리**돼 있다(E1):
+/// - 이벤트 레인(`queue.depth_high`): 소스별 5분 쿨다운(`depth_alerted`).
+/// - OOB 레인: 여기서는 **수집만** 하고 주입은 틱 말미 `notify_depth_digest` 가 한다.
+///   수집을 이벤트 쿨다운 뒤에 두면 소스별 위상차가 그대로 다이제스트 누락으로 번역돼
+///   BLOCK-1(위상 고정 침묵)이 재발하므로, 수집은 쿨다운 **앞**에 둔다.
 fn alert_queue_depth_if_high(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     depth_alerted: &mut HashMap<u64, f64>,
     blocked_by: &str,
+    hard_backlog: &mut Vec<HardBacklog>,
 ) {
     let threshold = queue_depth_alert_threshold();
     if threshold == 0 {
@@ -2231,6 +2446,28 @@ fn alert_queue_depth_if_high(
     let depth = s.pending_queue.lock().unwrap().len();
     if depth < threshold {
         return;
+    }
+    // ★C5 hard tier: depth가 임계의 3배거나 Agent-origin 소프트캡에 닿았다 = 이벤트만으로는
+    // 안 풀린다는 뜻이다(이벤트는 구독자가 봐야 의미가 있고, master는 지금 busy다).
+    let softcap = crate::queue_policy::agent_softcap();
+    let agent_depth = s
+        .pending_queue
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|i| i.origin.is_agent())
+        .count();
+    let hard = depth >= threshold.saturating_mul(3) || (softcap > 0 && agent_depth >= softcap);
+    let role = s.role.lock().unwrap().clone();
+    if hard && !hard_backlog.iter().any(|h| h.sid == s.id) {
+        hard_backlog.push(HardBacklog {
+            sid: s.id,
+            role: role.clone(),
+            depth,
+            agent_depth,
+            oldest_secs: crate::queue_policy::oldest_age_secs(s).unwrap_or(0.0) as u64,
+            blocked_by: blocked_by.to_string(),
+        });
     }
     let now = now_epoch();
     let last = depth_alerted.get(&s.id).copied().unwrap_or(0.0);
@@ -2251,19 +2488,6 @@ fn alert_queue_depth_if_high(
     } else {
         "임계 조정은 CYS_QUEUE_QUIET_SECS"
     };
-    // ★C5 hard tier: depth가 임계의 3배거나 Agent-origin 소프트캡에 닿았다 = 이벤트만으로는
-    // 안 풀린다는 뜻이다(이벤트는 구독자가 봐야 의미가 있고, master는 지금 busy다).
-    // 큐 소유 노드 + 지휘 role에 큐를 **우회해** 직접 통지한다. soft tier는 기존대로 이벤트만.
-    let softcap = crate::queue_policy::agent_softcap();
-    let agent_depth = s
-        .pending_queue
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|i| i.origin.is_agent())
-        .count();
-    let hard = depth >= threshold.saturating_mul(3) || (softcap > 0 && agent_depth >= softcap);
-    let role = s.role.lock().unwrap().clone();
     daemon.bus.publish(
         crate::queue_policy::queue_events::DEPTH_HIGH,
         crate::queue_policy::queue_events::CATEGORY,
@@ -2274,22 +2498,6 @@ fn alert_queue_depth_if_high(
                "hint": format!("queued 배달이 막힌 채 적체 중 — read-screen으로 상태 점검, \
                                 급한 보고는 직접 send(steer). {knob}")}),
     );
-    if hard {
-        let oldest = crate::queue_policy::oldest_age_secs(s).unwrap_or(0.0) as u64;
-        let text = format!(
-            "[QUEUE-BACKPRESSURE] {} (role={}) 큐 적체 depth={depth} (agent={agent_depth}) \
-             oldest={oldest}s · 사유={blocked_by} — 대상 큐를 점검하고 배달을 막는 원인을 해소하라. \
-             철회가 필요하면 `cys queue list --surface {}` 후 소유 노드가 `cys queue clear` 집행.",
-            cys::surface_ref(s.id),
-            role.as_deref().unwrap_or("-"),
-            cys::surface_ref(s.id),
-        );
-        // dedup 키에 대상 surface를 넣어, 여러 노드가 동시에 적체돼도 각각 통지된다.
-        let key = format!("depth_high_hard:{}", s.id);
-        for target in oob_targets(daemon, s.id) {
-            let _ = oob_notify(daemon, target, &text, &key, OOB_HARD_COOLDOWN_SECS);
-        }
-    }
 }
 
 /// ★Phase 5 ①c: WAL로 살아난 restored_queue를 같은 role의 살아있는 surface로 재홈한다.
@@ -2305,17 +2513,75 @@ fn rehome_restored(daemon: &Arc<Daemon>) {
 
 /// 큐 항목 TTL(초) — 기본 3600 · 0=비활성(`CYS_QUEUE_TTL_SECS`).
 /// TTL은 **폐기가 아니라 이관** 기한이다: 만기 항목은 dead-letter에 전문이 남는다.
-fn queue_ttl_secs() -> f64 {
+pub(crate) fn queue_ttl_secs() -> f64 {
     std::env::var("CYS_QUEUE_TTL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600.0)
 }
 
+/// ★B5(0.13.21) System-origin 큐 항목 TTL(초) — 기본 14400(4h) · 0=비활성
+/// (`CYS_QUEUE_SYSTEM_TTL_SECS`). Agent(기본 1h)보다 **의도적으로 길다**: System 발신은
+/// 스케줄러·거버넌스의 제어 메시지라 성급한 이관이 더 해롭다. 그럼에도 상한을 두는 이유는
+/// 종전에 System 이 소프트캡·TTL 양쪽에서 면제라, 배달이 봉쇄된 pane(출력 중·사람 입력 창)
+/// 앞에서 **무한 누적**됐기 때문이다(라이브 원장 1h+ 실증).
+///
+/// `CYS_QUEUE_TTL_SECS=0`(전면 롤백 스위치)이면 이 값과 무관하게 sweep 자체가 돌지 않는다 —
+/// "TTL 0 = 아무것도 만기시키지 않는다"는 기존 계약을 System 확장이 깨뜨리면 안 된다.
+pub(crate) fn queue_system_ttl_secs() -> f64 {
+    std::env::var("CYS_QUEUE_SYSTEM_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(14400.0)
+}
+
+/// ★E4 재수정(0.13.21 최종 재검증) 사람의 GUI 큐잉(`System{label:"gui"}`) 전용 TTL(초) —
+/// 기본 86400(24h) · **0=무기한 면제**(`CYS_QUEUE_GUI_TTL_SECS`).
+///
+/// 종전 이 등급은 무기한 면제였다. 그런데 `gui` 라벨은 클라이언트 자기신고(`human:true`)로
+/// 붙으므로, 면제였을 때는 pane 밖 detach 프로세스가 한 줄로 **무기한 TTL 을 위조 획득**했다 —
+/// 소프트캡 등급에서 막아둔 자기신고 우회가 TTL 등급에서 다시 열려 있었던 셈이다.
+/// 유계 장주기 등급으로 바꾸면 위조의 이득 자체가 사라진다(얻는 것이 24h 뿐이라 위조할
+/// 값어치가 없다). 사람 입력 보호는 유지된다: 24h 는 사람이 하루 안에 돌아오는 창을 덮고,
+/// 만기는 폐기가 아니라 dead-letter 이관 + OOB 통지다(전문 무손실·소실 아님).
+/// 진짜 무기한이 필요하면 `--important`(메시지 단위 의도 선언)나 이 env `0`(운영자 선언)이라는
+/// **명시 경로**를 쓴다.
+pub(crate) fn queue_gui_ttl_secs() -> f64 {
+    std::env::var("CYS_QUEUE_GUI_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86400.0)
+}
+
+/// 3등급 TTL 을 한 묶음으로 — 판정자(`QueueItem::effective_ttl`)가 등급표를 통째로 받는다.
+///
+/// 전면 롤백 스위치(`CYS_QUEUE_TTL_SECS=0`)를 **여기서 한 번에** 적용한다: Agent 가 0 이면
+/// 세 등급 모두 0 이다. "TTL 을 끄면 아무것도 만기되지 않는다"는 약속을 등급 확장이 깨뜨리면
+/// 안 되고, 그 판정이 호출자마다 흩어지면 한 호출자만 빠뜨렸을 때 조용히 뚫린다.
+pub(crate) fn queue_ttls() -> crate::state::QueueTtls {
+    let agent = queue_ttl_secs();
+    if agent <= 0.0 {
+        return crate::state::QueueTtls { agent: 0.0, system: 0.0, gui: 0.0 };
+    }
+    crate::state::QueueTtls {
+        agent,
+        system: queue_system_ttl_secs(),
+        gui: queue_gui_ttl_secs(),
+    }
+}
+
 /// C3 TTL sweep — 만기 항목을 큐에서 빼 dead-letter로 이관한다.
 ///
-/// 만기 조건(D4): `now - enqueued_at > ttl` ∧ origin=Agent ∧ `important` 미보유.
-/// System/Human은 면제(부트 wake·시스템 통지·사람 입력이 시간으로 사라지면 안 된다).
+/// 만기 조건(현행 계약 · 판정 정본은 `QueueItem::is_expired`): `now - enqueued_at > 등급별 ttl`
+/// ∧ `important` 미보유. 등급은 세 갈래다 —
+/// - Agent: `CYS_QUEUE_TTL_SECS`(기본 1h).
+/// - System(GUI 제외): `CYS_QUEUE_SYSTEM_TTL_SECS`(기본 4h). 종전 "System 면제"는
+///   B5(0.13.21)에서 폐기됐다 — 배달이 봉쇄된 pane 앞에서 제어 메시지가 무한 누적됐기 때문이다.
+/// - GUI(`System{label:"gui"}` = 사람의 GUI 큐잉): `CYS_QUEUE_GUI_TTL_SECS`(기본 **24h** ·
+///   0=면제). E4 재수정 — 이 등급은 종전 **무기한 면제**였으나, 라벨이 클라이언트
+///   자기신고(`human:true`)로 붙는 탓에 detach 프로세스가 무기한 TTL 을 위조 획득했다.
+///   유계 장주기 등급으로 바꿔 위조 이득을 없애되, 사람 입력은 24h + 원장 + OOB 통지로 보호한다.
+/// - **면제**: `--important` 선언분과 `Human`(WAL 유산 variant · 신규 생성 경로 없음).
 /// `--important`는 메시지 단위 의도 선언이다 — role 일괄 면제는 사고 최다 발신자(CSO)를
 /// 통째로 무기한화하므로 채택하지 않았다(Sim1-1).
 ///
@@ -2325,10 +2591,13 @@ fn queue_ttl_secs() -> f64 {
 /// ★기록 실패 시 되돌린다: 원장을 못 남긴 항목은 큐 **앞머리로 복원**한다 — 원장 없는 삭제 금지
 /// (무손실 우선 fail-open). 실패 자체는 record_dead_letter가 health 경고로 발행한다.
 fn expire_queued(daemon: &Arc<Daemon>) {
-    let ttl = queue_ttl_secs();
+    let ttls = queue_ttls();
+    let ttl = ttls.agent;
     if ttl <= 0.0 {
-        return;
+        return; // 전면 롤백 스위치 — System(B5)·GUI(E4) 등급도 함께 잠긴다.
     }
+    let system_ttl = ttls.system;
+    let gui_ttl = ttls.gui;
     let now = now_epoch();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
@@ -2338,11 +2607,10 @@ fn expire_queued(daemon: &Arc<Daemon>) {
         // ── 임계영역: 만기 후보 수집·제거 ──
         let expired: Vec<crate::state::QueueItem> = {
             let mut q = s.pending_queue.lock().unwrap();
-            if q.iter().all(|i| !i.is_expired(now, ttl)) {
+            if q.iter().all(|i| !i.is_expired(now, ttls)) {
                 continue;
             }
-            let (out, keep): (Vec<_>, Vec<_>) =
-                q.drain(..).partition(|i| i.is_expired(now, ttl));
+            let (out, keep): (Vec<_>, Vec<_>) = q.drain(..).partition(|i| i.is_expired(now, ttls));
             *q = keep.into();
             out
         };
@@ -2382,25 +2650,42 @@ fn expire_queued(daemon: &Arc<Daemon>) {
             Some(s.id),
             serde_json::json!({
                 "count": moved.len(), "ttl_secs": ttl, "remaining": remaining,
+                // ★B5: System 등급 TTL 과 등급별 건수 — 어느 상한이 걸렸는지 이벤트만 보고 안다.
+                "system_ttl_secs": system_ttl,
+                // ★E4 재수정: GUI 는 이제 면제가 아니라 자기 등급(기본 24h)이라, 이 상한이
+                // 걸렸는지도 이벤트에서 읽혀야 한다(면제 시절엔 셀 것 자체가 없었다).
+                "gui_ttl_secs": gui_ttl,
+                "agent_count": moved.iter().filter(|i| i.origin.is_agent()).count(),
+                "system_count": moved.iter().filter(|i| !i.origin.is_agent()).count(),
+                "gui_count": moved.iter()
+                    .filter(|i| matches!(&i.origin,
+                        crate::state::QueueOrigin::System { label }
+                            if label == crate::state::SYSTEM_LABEL_GUI))
+                    .count(),
                 "role": role, "surface_ref": cys::surface_ref(s.id),
                 "oldest_age_secs": moved.iter().map(|i| now - i.enqueued_at)
                     .fold(0.0f64, f64::max),
                 "bytes": moved.iter().map(|i| i.bytes()).sum::<usize>(),
                 "hint": "만기 항목은 폐기가 아니라 dead-letters.jsonl로 이관됐다(전문 무손실). \
-                         면제는 System origin과 --important 선언분.",
+                         등급은 3종 — Agent=CYS_QUEUE_TTL_SECS, System=더 긴 \
+                         CYS_QUEUE_SYSTEM_TTL_SECS, 사람의 GUI 큐잉(system 라벨 gui)=장주기 \
+                         CYS_QUEUE_GUI_TTL_SECS(기본 24h·0=면제). 무기한 면제는 --important \
+                         선언분뿐이다.",
             }),
         );
         // ★C5: 만기 요약을 대상 노드·지휘 role에 OOB로 통지한다. 이관은 조용히 일어나면
         // 안 된다 — 발신자는 배달을 기다리고 있고, 원장을 뒤져보라는 신호가 필요하다.
         let oldest = moved.iter().map(|i| now - i.enqueued_at).fold(0.0f64, f64::max) as u64;
         let text = format!(
-            "[QUEUE-TTL] {} (role={}) 대기 메시지 {}건이 TTL({}s) 만기로 dead-letters.jsonl에 \
-             이관됐다(전문 보존·유실 아님). 최고령 {oldest}s. 원장을 확인하고 필요한 건만 \
-             다시 처리하라 — 발신자에게 재전송을 요구하지 마라.",
+            "[QUEUE-TTL] {} (role={}) 대기 메시지 {}건이 TTL(agent {}s·system {}s·gui {}s) 만기로 \
+             dead-letters.jsonl에 이관됐다(전문 보존·유실 아님). 최고령 {oldest}s. 원장을 확인하고 \
+             필요한 건만 다시 처리하라 — 발신자에게 재전송을 요구하지 마라.",
             cys::surface_ref(s.id),
             role.as_deref().unwrap_or("-"),
             moved.len(),
             ttl as u64,
+            system_ttl as u64,
+            gui_ttl as u64,
         );
         let key = format!("ttl_expired:{}", s.id);
         for target in oob_targets(daemon, s.id) {
@@ -2422,6 +2707,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
     }
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
+    // ★E1: 이 틱의 hard tier 적체를 모아 **말미에 대상별 1통**으로 통지한다(다이제스트).
+    let mut hard_backlog: Vec<HardBacklog> = Vec::new();
     for s in surfaces {
         if s.exited.load(Ordering::Relaxed) {
             continue;
@@ -2433,13 +2720,19 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             .map(|t| t > std::time::Instant::now())
             .unwrap_or(false)
         {
-            alert_queue_depth_if_high(daemon, &s, depth_alerted, "queue_paused(헬스 조치)");
+            alert_queue_depth_if_high(
+                daemon,
+                &s,
+                depth_alerted,
+                "queue_paused(헬스 조치)",
+                &mut hard_backlog,
+            );
             continue;
         }
         // 아직 바쁨(출력 중) — steer는 즉시 전송이 담당, 큐는 기다린다.
         let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
         if quiet_for < queue_quiet_secs() {
-            alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
+            alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)", &mut hard_backlog);
             continue;
         }
         // 사람 입력 흔적이 식기 전 배달 금지 — 미완성 입력에 이어붙기/제출 차단(R1 MED-2).
@@ -2450,7 +2743,13 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
             .unwrap_or(false);
         if human_recent {
-            alert_queue_depth_if_high(daemon, &s, depth_alerted, "human_typing(사람 입력 직후)");
+            alert_queue_depth_if_high(
+                daemon,
+                &s,
+                depth_alerted,
+                "human_typing(사람 입력 직후)",
+                &mut hard_backlog,
+            );
             continue;
         }
         // ★SEAT 게이트(2026-07-17 실사고 수리): **role 좌석**인데 좌석이 비었으면(에이전트 없음)
@@ -2479,6 +2778,7 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
                 &s,
                 depth_alerted,
                 "empty_seat(좌석에 에이전트 미연결)",
+                &mut hard_backlog,
             );
             continue;
         }
@@ -2522,6 +2822,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             daemon.persist_queue_state();
         }
     }
+    // ★E1: 틱 말미 1회 — 적체 노드가 몇 개든 대상 1명에게 가는 통지는 1통이다.
+    notify_depth_digest(daemon, &hard_backlog);
 }
 
 #[cfg(test)]
@@ -3560,7 +3862,7 @@ mod tests {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod queue_ttl_tests {
-    use super::{expire_queued, rehome_restored};
+    use super::{expire_queued, queue_gui_ttl_secs, queue_ttls, rehome_restored};
     use crate::queue_policy;
     use crate::state::{Daemon, QueueItem, QueueOrigin, QueueWalEntry};
     use serde_json::Value;
@@ -3580,6 +3882,10 @@ mod queue_ttl_tests {
     impl Drop for TtlEnv {
         fn drop(&mut self) {
             std::env::remove_var("CYS_QUEUE_TTL_SECS");
+            // ★B5: System 등급 TTL 도 같은 가족이다 — 패닉으로 빠져나가도 반드시 원복한다.
+            std::env::remove_var("CYS_QUEUE_SYSTEM_TTL_SECS");
+            // ★E4 재수정: GUI 등급도 같은 가족(면제 철회 후 신설).
+            std::env::remove_var("CYS_QUEUE_GUI_TTL_SECS");
         }
     }
 
@@ -3630,19 +3936,27 @@ mod queue_ttl_tests {
         s.pending_queue.lock().unwrap().iter().map(|i| i.text.clone()).collect()
     }
 
-    /// 만기 조건(D4): Agent origin ∧ !important ∧ ttl 경과. 나머지는 전부 보존한다.
-    /// System/Human 면제는 부트 wake·시스템 통지가 시간으로 증발하지 않게 하는 장치다.
+    /// 만기 조건: 등급별 TTL 경과 ∧ !important ∧ 면제 origin 아님.
+    ///
+    /// ★R-3(적대 리뷰) 재작성: 종전 이 테스트는 Agent TTL 만 60s 로 걸고 System 등급은
+    /// **기본값 14400** 에 맡겼다 — 120s 항목이 보존된 건 "등급이 분리돼서"가 아니라 "System
+    /// 등급 상한이 4시간이라 아직 안 됐을 뿐"이라, 등급 분리가 통째로 사라져도 초록으로 남는
+    /// 공허한 통과였다. 두 등급을 **모두 명시**하고 각 등급의 경계 양쪽을 함께 핀한다.
     #[test]
-    fn ttl_expires_only_aged_agent_items_without_important() {
+    fn ttl_expires_by_origin_tier_with_both_grades_pinned() {
         let _g = TTL_ENV_LOCK.lock().unwrap();
-        let _e = TtlEnv::set("60");
+        let _e = TtlEnv::set("60"); // Agent 등급
+        std::env::set_var("CYS_QUEUE_SYSTEM_TTL_SECS", "600"); // System 등급(명시)
         let (d, dir) = daemon("selectivity");
         let s = surface(&d, Some("master"));
         {
             let mut q = s.pending_queue.lock().unwrap();
             q.push_back(aged("만기 agent", agent_origin(), 120.0));
             q.push_back(aged("신선 agent", agent_origin(), 10.0));
-            q.push_back(aged("만기 system", QueueOrigin::system("boot"), 120.0));
+            // 120s = Agent 등급(60)은 넘었고 System 등급(600)은 안 넘었다 — 등급이 실제로
+            // 분리돼 있어야만 보존된다(등급 통합 회귀 시 이 줄이 먼저 깨진다).
+            q.push_back(aged("등급차 보존 system", QueueOrigin::system("boot"), 120.0));
+            q.push_back(aged("만기 system", QueueOrigin::system("boot"), 900.0));
             q.push_back(aged("만기 human", QueueOrigin::Human, 120.0));
             let mut imp = aged("만기 important", agent_origin(), 120.0);
             imp.important = true;
@@ -3654,16 +3968,217 @@ mod queue_ttl_tests {
             texts(&s),
             vec![
                 "신선 agent".to_string(),
-                "만기 system".to_string(),
+                "등급차 보존 system".to_string(),
                 "만기 human".to_string(),
                 "만기 important".to_string(),
             ],
-            "만기 Agent 1건만 이관되고 순서는 보존돼야 한다"
+            "각 등급의 만기분만 이관되고 순서는 보존돼야 한다"
         );
         let dl = dead_letters(&dir);
-        assert_eq!(dl.len(), 1, "이관 1건 = 원장 1줄");
+        assert_eq!(dl.len(), 2, "이관 2건 = 원장 2줄");
         assert_eq!(dl[0]["text"], serde_json::json!("만기 agent"), "전문 무손실");
+        assert_eq!(dl[1]["text"], serde_json::json!("만기 system"));
+        assert!(dl.iter().all(|e| e["reason"] == serde_json::json!("ttl")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★E4(적대 리뷰 REVISE-5/6) + **재수정(최종 재검증)**: 사람의 GUI 큐잉
+    /// (`System{label:"gui"}`)은 **자기 전용 장주기 등급**이다 — 무기한 면제가 **아니다**.
+    ///
+    /// D2 이후 실사람 입력은 `Human` variant 가 아니라 이 라벨로 들어온다. B5 가 System 전체에
+    /// 4h 상한을 걸면서 정작 보호 대상이던 사람 입력이 제어 메시지와 같은 등급을 받았으므로
+    /// 라벨로 갈라 자기 등급을 준다(여기까지가 E4).
+    ///
+    /// 재수정의 이유: 그 라벨은 **클라이언트 자기신고(`human:true`)** 로 붙는다. 등급이
+    /// 무기한 면제였을 때는 pane 밖 detach 프로세스가 한 줄로 무기한 TTL 을 위조 획득할 수
+    /// 있었다. 유계 장주기(기본 24h · `CYS_QUEUE_GUI_TTL_SECS`)로 바꾸면 위조 이득이 사라진다.
+    ///
+    /// 이 테스트가 핀하는 3사실: ①GUI 는 System 등급과 **분리**돼 더 길다 ②그래도 **상한이
+    /// 있다**(자기 등급 경과 시 이관) ③`anonymous`(데몬 자식 자동 발신)는 GUI 등급을 못 받는다.
+    #[test]
+    fn gui_labeled_system_items_get_their_own_long_bounded_tier() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60"); // Agent 등급
+        std::env::set_var("CYS_QUEUE_SYSTEM_TTL_SECS", "600"); // System 등급
+        std::env::set_var("CYS_QUEUE_GUI_TTL_SECS", "6000"); // GUI 등급(명시 — 셋 다 다르게)
+        let (d, dir) = daemon("gui-tier");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            // System 등급(600)은 넘겼지만 GUI 등급(6000) 안 — 등급이 분리돼야만 보존된다.
+            q.push_back(aged(
+                "사람이 친 GUI 입력(등급차 보존)",
+                QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI),
+                900.0,
+            ));
+            // GUI 등급도 넘기면 이관된다 — 면제가 아니라 상한이다(위조 이득 제거의 핵심).
+            q.push_back(aged(
+                "묵은 GUI 입력(등급 초과)",
+                QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI),
+                9_000.0,
+            ));
+            q.push_back(aged("익명 자동 발신", QueueOrigin::system("anonymous"), 900.0));
+        }
+        expire_queued(&d);
+
+        assert_eq!(
+            texts(&s),
+            vec!["사람이 친 GUI 입력(등급차 보존)".to_string()],
+            "GUI 는 System 보다 긴 자기 등급을 받되(보존), 그 등급을 넘으면 이관된다(면제 아님)"
+        );
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 2, "이관 2건 = 원장 2줄(전문 무손실)");
+        assert_eq!(dl[0]["text"], serde_json::json!("묵은 GUI 입력(등급 초과)"));
+        assert_eq!(dl[0]["origin"]["label"], serde_json::json!("gui"));
+        assert_eq!(dl[1]["text"], serde_json::json!("익명 자동 발신"));
+        assert!(dl.iter().all(|e| e["reason"] == serde_json::json!("ttl")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★E4 재수정 — GUI 등급의 **기본값은 24h** 이고, `0` 은 운영자의 **명시 면제 선언**이다.
+    ///
+    /// 기본값 핀이 없으면 "유계로 바꿨다"는 계약이 env 를 거는 테스트에서만 참이 되어,
+    /// 라이브 기본이 조용히 면제로 돌아가도 초록으로 남는다(E4 원 결함과 같은 형태의 공허 통과).
+    #[test]
+    fn gui_tier_defaults_to_24h_and_zero_means_exempt() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60");
+        // GUI env 미설정 = 라이브 기본(86400).
+        std::env::remove_var("CYS_QUEUE_GUI_TTL_SECS");
+        assert_eq!(queue_gui_ttl_secs(), 86_400.0, "GUI 기본 등급은 24h 다");
+        assert_eq!(queue_ttls().gui, 86_400.0);
+
+        let (d, dir) = daemon("gui-default");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(aged("23h GUI", QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI), 82_800.0));
+            q.push_back(aged("25h GUI", QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI), 90_000.0));
+        }
+        expire_queued(&d);
+        assert_eq!(texts(&s), vec!["23h GUI".to_string()], "기본 24h 안은 보존 · 넘으면 이관");
+        assert_eq!(dead_letters(&dir).len(), 1);
+
+        // 운영자가 0 을 명시하면 종전 무기한 면제로 되돌아간다(롤백 경로 보존).
+        std::env::set_var("CYS_QUEUE_GUI_TTL_SECS", "0");
+        let (d2, dir2) = daemon("gui-exempt-optin");
+        let s2 = surface(&d2, Some("master"));
+        s2.pending_queue.lock().unwrap().push_back(aged(
+            "아주 묵은 GUI",
+            QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI),
+            999_999.0,
+        ));
+        expire_queued(&d2);
+        assert_eq!(texts(&s2).len(), 1, "CYS_QUEUE_GUI_TTL_SECS=0 은 명시 면제 선언이다");
+        assert!(dead_letters(&dir2).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// ★E4: 승인 대기 wakeup(`governance-approval`)은 **만기가 의도**다.
+    /// 종전 주석은 이 항목을 "TTL 밖"이라 서술했지만 B5 이후 사실이 아니고, 그래야 master 가
+    /// 죽은 채로 승인 알림이 무한 누적되는 것을 막는다. 만기는 폐기가 아니라 이관이므로
+    /// 전문은 dead-letter 에 남는다(무손실) — 그 두 사실을 함께 핀한다.
+    #[test]
+    fn governance_approval_wakeup_expires_into_dead_letter() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("3600");
+        std::env::set_var("CYS_QUEUE_SYSTEM_TTL_SECS", "14400"); // 기본 4h 명시
+        let (d, dir) = daemon("approval-ttl");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            // 4h 직전 = 보존, 4h 경과 = 이관.
+            q.push_back(aged(
+                "승인 대기(3h)",
+                QueueOrigin::system("governance-approval"),
+                10_800.0,
+            ));
+            q.push_back(aged(
+                "승인 대기(5h)",
+                QueueOrigin::system("governance-approval"),
+                18_000.0,
+            ));
+        }
+        expire_queued(&d);
+
+        assert_eq!(texts(&s), vec!["승인 대기(3h)".to_string()], "4h 안은 보존");
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "만기분은 무음 삭제가 아니라 원장 이관이다");
+        assert_eq!(dl[0]["text"], serde_json::json!("승인 대기(5h)"), "전문 무손실");
+        assert_eq!(dl[0]["origin"]["label"], serde_json::json!("governance-approval"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B5: System origin 도 상한을 받는다 — 단 **Agent 보다 긴 별도 등급**이다.
+    /// 종전엔 System 이 TTL 면제라, 배달이 봉쇄된 pane 앞에서 제어 메시지가 무한 누적됐다.
+    /// 이관 방식은 Agent 와 동일하다(폐기 아님·dead-letter 전문 보존).
+    #[test]
+    fn system_origin_expires_on_its_own_longer_ttl() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("60"); // Agent 등급
+        std::env::set_var("CYS_QUEUE_SYSTEM_TTL_SECS", "600"); // System 등급(더 길다)
+        let (d, dir) = daemon("system-ttl");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            // Agent TTL(60)은 넘겼지만 System 등급(600) 안 — 등급이 다르므로 보존돼야 한다.
+            q.push_back(aged("system 신선", QueueOrigin::system("schedule"), 300.0));
+            q.push_back(aged("system 만기", QueueOrigin::system("schedule"), 900.0));
+            let mut imp = aged("system important", QueueOrigin::system("schedule"), 900.0);
+            imp.important = true;
+            q.push_back(imp);
+            q.push_back(aged("human 무기한", QueueOrigin::Human, 999_999.0));
+        }
+        expire_queued(&d);
+
+        assert_eq!(
+            texts(&s),
+            vec![
+                "system 신선".to_string(),
+                "system important".to_string(),
+                "human 무기한".to_string(),
+            ],
+            "System 은 자기 등급 TTL 로만 만기되고 important·Human 은 면제여야 한다"
+        );
+        let dl = dead_letters(&dir);
+        assert_eq!(dl.len(), 1, "이관 1건 = 원장 1줄(무손실)");
+        assert_eq!(dl[0]["text"], serde_json::json!("system 만기"), "전문 무손실");
         assert_eq!(dl[0]["reason"], serde_json::json!("ttl"));
+        assert_eq!(dl[0]["origin"]["class"], serde_json::json!("system"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B5 롤백 계약: `CYS_QUEUE_TTL_SECS=0` 은 **전면** 비활성이다 — System·GUI 등급이 살아
+    /// 있어도 sweep 자체가 돌지 않는다(운영자가 TTL 을 끄면 아무것도 만기되지 않는다는 약속).
+    /// ★E4 재수정: 등급이 셋으로 늘었으므로 GUI 도 함께 잠기는지 핀한다 — 등급을 추가할 때마다
+    /// 이 스위치를 빠뜨리면 "껐는데 뭔가 만기된다"는 가장 나쁜 배신이 생긴다.
+    #[test]
+    fn ttl_zero_also_disables_system_and_gui_tiers() {
+        let _g = TTL_ENV_LOCK.lock().unwrap();
+        let _e = TtlEnv::set("0");
+        std::env::set_var("CYS_QUEUE_SYSTEM_TTL_SECS", "600");
+        std::env::set_var("CYS_QUEUE_GUI_TTL_SECS", "600");
+        let t = queue_ttls();
+        assert_eq!(
+            (t.agent, t.system, t.gui),
+            (0.0, 0.0, 0.0),
+            "전면 롤백 스위치는 등급표 전체를 0 으로 만든다(호출자별 재판정 금지)"
+        );
+        let (d, dir) = daemon("system-ttl-off");
+        let s = surface(&d, Some("master"));
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(aged("아주 묵은 system", QueueOrigin::system("schedule"), 99_999.0));
+            q.push_back(aged(
+                "아주 묵은 gui",
+                QueueOrigin::system(crate::state::SYSTEM_LABEL_GUI),
+                99_999.0,
+            ));
+        }
+        expire_queued(&d);
+        assert_eq!(texts(&s).len(), 2, "전면 롤백 스위치가 등급 확장으로 뚫리면 안 된다");
+        assert!(dead_letters(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4614,8 +5129,13 @@ mod queue_drain_persist_tests {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod oob_notify_tests {
-    use super::{oob_notify, oob_targets, OobSkip, SeatState, OOB_HARD_COOLDOWN_SECS};
+    use super::{
+        alert_queue_depth_if_high, depth_digest_text, notify_depth_digest, oob_notify, oob_targets,
+        HardBacklog, OobSkip, SeatState, OOB_COOLDOWN_FILE, OOB_DEPTH_DIGEST_KEY,
+        OOB_HARD_COOLDOWN_SECS, OOB_REQUEST_CLEAR_COOLDOWN_SECS,
+    };
     use crate::state::Daemon;
+    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -4715,7 +5235,7 @@ mod oob_notify_tests {
             Err(OobSkip::Cooldown),
             "쿨다운 내 재발화는 억제돼야 한다"
         );
-        // 다른 키는 독립 쿨다운.
+        // 다른 키는 독립 쿨다운(★E1 이후 전역캡이 사라져 별도 seam 없이 그대로 성립한다).
         assert_eq!(
             oob_notify(&d, s.id, "다른 주제", "ttl_expired", OOB_HARD_COOLDOWN_SECS),
             Ok(())
@@ -4730,6 +5250,274 @@ mod oob_notify_tests {
             oob_notify(&d, s.id, "3차", "depth_high", OOB_HARD_COOLDOWN_SECS),
             Ok(()),
             "미해소가 지속되면 쿨다운 후 재통지돼야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 실제로 **주입된** OOB 를 이벤트 원장으로 관측한다 — 주입 텍스트는 writer 스레드가
+    /// 소비해 사후 확인이 불가하므로, 유일한 발행자(`oob_notify`)의 이벤트가 사실의 대리자다.
+    /// `bytes` 가 본문 길이라 "어떤 다이제스트가 갔는지"까지 바이트 단위로 대조할 수 있다.
+    fn oob_events(d: &Arc<Daemon>, sid: u64, key: &str) -> Vec<serde_json::Value> {
+        d.bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| {
+                e["name"] == crate::queue_policy::queue_events::OOB_NOTIFIED
+                    && e["surface_id"].as_u64() == Some(sid)
+                    && e["payload"]["dedup_key"] == key
+            })
+            .collect()
+    }
+
+    fn digest_bytes(d: &Arc<Daemon>, sid: u64) -> Vec<usize> {
+        oob_events(d, sid, OOB_DEPTH_DIGEST_KEY)
+            .iter()
+            .map(|e| e["payload"]["bytes"].as_u64().unwrap_or(0) as usize)
+            .collect()
+    }
+
+    /// 쿨다운 스탬프를 창 밖으로 밀어 "창 경과"를 모사한다(테스트 전용 seam).
+    fn rewind_cooldown(d: &Arc<Daemon>, sid: u64, key: &str, secs: f64) {
+        let mut cd = d.oob_cooldowns.lock().unwrap();
+        let k = (sid, key.to_string());
+        if let Some(ts) = cd.get(&k).copied() {
+            cd.insert(k, ts - secs);
+        }
+    }
+
+    fn hard(sid: u64, role: &str) -> HardBacklog {
+        HardBacklog {
+            sid,
+            role: Some(role.to_string()),
+            depth: 15,
+            agent_depth: 15,
+            oldest_secs: 120,
+            blocked_by: "busy(출력 중)".into(),
+        }
+    }
+
+    /// ★E1 (BLOCK-1 회귀 핀 · 핵심): **적체 노드 2개가 서로 다른 시각에 발생해도 둘 다 도달**한다.
+    ///
+    /// 종전 구조(노드별 `depth_high_hard:{sid}` + 300s 전역캡)에서는 소스 쿨다운(300s)과
+    /// 전역캡(300s)이 동주기라 위상이 고정됐고, 억제된 통지는 폐기(`let _ =`)돼 **먼저 적체된
+    /// 1개 외 전원이 영구 침묵**했다. 다이제스트는 통지를 노드 수와 무관하게 1통으로 합치므로
+    /// 나중에 적체된 노드도 다음 창의 본문에 실린다.
+    #[test]
+    fn depth_digest_reaches_every_backlogged_node_and_caps_at_one_per_window() {
+        let (d, dir) = daemon("digest");
+        let master = surface(&d, Some("master"));
+        seat_agent(&master);
+
+        let solo = hard(11, "worker-1");
+        let both = [hard(11, "worker-1"), hard(22, "cso")];
+
+        // ── t0: 노드 11만 적체 → 다이제스트 1통 ──
+        notify_depth_digest(&d, std::slice::from_ref(&solo));
+        assert_eq!(
+            digest_bytes(&d, master.id),
+            vec![depth_digest_text(std::slice::from_ref(&solo)).len()],
+            "다이제스트는 대상당 1통이다"
+        );
+
+        // ── 창 안: 노드 22가 뒤늦게 적체(위상차) → 총량 상한 1 이므로 지금은 억제 ──
+        notify_depth_digest(&d, &both);
+        assert_eq!(
+            digest_bytes(&d, master.id).len(),
+            1,
+            "창 안에서 추가 주입이 나가면 총량 상한이 없는 것과 같다"
+        );
+
+        // ── 창 경과: 억제됐던 22가 **다음 다이제스트 본문에 실려** 도달한다 ──
+        rewind_cooldown(&d, master.id, OOB_DEPTH_DIGEST_KEY, 86_400.0);
+        notify_depth_digest(&d, &both);
+        let sent = digest_bytes(&d, master.id);
+        assert_eq!(sent.len(), 2, "창이 지나면 재통지된다(자기치유)");
+        assert_eq!(
+            sent[1],
+            depth_digest_text(&both).len(),
+            "2차 통지 본문이 2노드 다이제스트가 아니면 뒤늦은 노드는 영구 침묵한다"
+        );
+        assert_ne!(sent[0], sent[1], "전제: 1노드·2노드 본문은 서로 다르다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★E1: 다이제스트 대상 = 적체 노드들의 소유 노드 **합집합** + 지휘 role. 노드가 몇 개든
+    /// 대상 1명이 받는 통지는 1건이다(침습 채널 총량 상한이 곧 이 구조).
+    #[test]
+    fn depth_digest_targets_every_owner_union_once() {
+        let (d, dir) = daemon("digest-targets");
+        let master = surface(&d, Some("master"));
+        let w1 = surface(&d, Some("worker-1"));
+        let w2 = surface(&d, Some("worker-2"));
+        for s in [&master, &w1, &w2] {
+            seat_agent(s);
+        }
+        let backlog = [hard(w1.id, "worker-1"), hard(w2.id, "worker-2")];
+        let want = depth_digest_text(&backlog);
+        notify_depth_digest(&d, &backlog);
+        for s in [&master, &w1, &w2] {
+            assert_eq!(
+                digest_bytes(&d, s.id),
+                vec![want.len()],
+                "대상 {}: 노드 2개여도 통지는 1통이고 본문은 전 목록이다",
+                s.id
+            );
+        }
+        // 무손실: 본문에 적체 노드가 모두 들어 있다(위 bytes 대조의 대상 문자열).
+        assert!(want.contains(&cys::surface_ref(w1.id)) && want.contains(&cys::surface_ref(w2.id)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★E1: 다이제스트 본문은 **단행**이어야 한다 — 주입 텍스트의 개행은 수신 TUI 에서 제출
+    /// (Return)로 해석돼 두 번째 줄부터 프롬프트에 흩뿌려진다.
+    #[test]
+    fn depth_digest_text_is_single_line_and_lossless() {
+        let t = depth_digest_text(&[hard(11, "worker-1"), hard(22, "cso")]);
+        assert!(!t.contains('\n'), "다이제스트 본문에 개행이 있으면 안 된다: {t}");
+        assert!(t.contains("2건") && t.contains("surface:11") && t.contains("surface:22"));
+        assert!(t.contains("oldest=120s"), "진단 수치가 빠지면 수신측이 판단할 재료가 없다");
+        assert!(depth_digest_text(&[]).contains("0건"), "빈 목록도 패닉 없이 다뤄야 한다");
+    }
+
+    /// ★E1: 수집 레인은 **이벤트 쿨다운과 독립**이다. 종전 구조에서는 hard 판정 자체가 소스별
+    /// 5분 쿨다운 뒤에 있어서, 이벤트가 억제된 틱에는 OOB 도 통째로 사라졌다 — 소스별 위상차가
+    /// 그대로 통지 누락으로 번역되는 경로(BLOCK-1의 절반)다.
+    #[test]
+    fn hard_backlog_collection_is_not_gated_by_event_cooldown() {
+        let (d, dir) = daemon("collect");
+        let s = surface(&d, Some("worker-1"));
+        {
+            // 기본 임계 5 → hard 는 depth ≥ 15(env 무의존).
+            let mut q = s.pending_queue.lock().unwrap();
+            for i in 0..15 {
+                q.push_back(crate::state::QueueItem::text(
+                    format!("m{i}"),
+                    crate::state::QueueOrigin::Agent { surface: 7, role: None },
+                ));
+            }
+        }
+        let mut alerted: HashMap<u64, f64> = HashMap::new();
+        let mut h1 = Vec::new();
+        alert_queue_depth_if_high(&d, &s, &mut alerted, "busy(출력 중)", &mut h1);
+        assert_eq!(h1.len(), 1, "hard tier 적체가 수집돼야 한다");
+        assert_eq!(h1[0].sid, s.id);
+        assert_eq!(h1[0].depth, 15);
+
+        // 같은 틱 직후(이벤트는 5분 쿨다운으로 억제되는 구간) — 수집은 계속돼야 한다.
+        let mut h2 = Vec::new();
+        alert_queue_depth_if_high(&d, &s, &mut alerted, "busy(출력 중)", &mut h2);
+        assert_eq!(
+            h2.len(),
+            1,
+            "이벤트 쿨다운이 다이제스트 수집까지 막으면 위상 고정 침묵이 재발한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A4 보존(전역캡 제거 후): `request_clear` 는 사람이 명시 발행하는 요청 레인이라
+    /// 자동 통지와 **예산을 공유하지 않는다**. 종전에는 전역캡이 이 결합을 만들어 면제 상수로
+    /// 도려내야 했는데, 캡 자체가 사라져 (surface,key) 쿨다운만으로 독립이 성립한다.
+    /// 새 전역 상한을 다시 들이면 이 테스트가 먼저 깨진다.
+    #[test]
+    fn request_clear_lane_keeps_independent_budget() {
+        let (d, dir) = daemon("req-clear-lane");
+        let s = surface(&d, Some("master"));
+        seat_agent(&s);
+
+        // ① 자동 통지(다이제스트) 직후에도 사람의 요청은 즉시 배달된다.
+        notify_depth_digest(&d, &[hard(11, "worker-1")]);
+        assert_eq!(
+            oob_notify(&d, s.id, "clear 요청", "request_clear", OOB_REQUEST_CLEAR_COOLDOWN_SECS),
+            Ok(()),
+            "자동 통지가 사람 요청을 삼키면 전용 60초 쿨다운(A4)의 의미가 죽는다"
+        );
+        // ② 반대 방향: 사람 요청이 자동 통지 예산을 소모하지 않는다.
+        let (d2, dir2) = daemon("req-clear-lane-rev");
+        let s2 = surface(&d2, Some("cso"));
+        seat_agent(&s2);
+        assert_eq!(
+            oob_notify(&d2, s2.id, "clear 요청", "request_clear", OOB_REQUEST_CLEAR_COOLDOWN_SECS),
+            Ok(())
+        );
+        notify_depth_digest(&d2, &[hard(7, "worker-1")]);
+        assert_eq!(
+            digest_bytes(&d2, s2.id).len(),
+            1,
+            "사람 요청 직후에도 자동 경보는 나가야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// ★B4: 쿨다운이 **데몬 재기동을 생존**한다. 큐는 WAL 로 즉시 복원돼 depth 가 그대로
+    /// 살아나는데 쿨다운만 빈 맵이라, 재기동마다 미해소 조건 전체가 재통지 버스트로 터졌다(R4).
+    /// 앵커는 큐 WAL 과 같은 **role** 이다 — surface_id 는 재기동 시 소멸한다(재사용 없음).
+    #[test]
+    fn cooldowns_survive_daemon_restart_via_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-oob-persist-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("cysd.sock");
+        let sidecar = crate::state::state_dir(&sock).join(OOB_COOLDOWN_FILE);
+
+        // ── 1세대 데몬: 통지 1회로 스탬프를 찍는다 ──
+        let d1 = Daemon::new(sock.clone());
+        let s1 = surface(&d1, Some("master"));
+        seat_agent(&s1);
+        assert_eq!(
+            oob_notify(
+                &d1,
+                s1.id,
+                "적체",
+                &format!("depth_high_hard:{}", s1.id),
+                OOB_HARD_COOLDOWN_SECS
+            ),
+            Ok(())
+        );
+        assert!(sidecar.exists(), "스탬프 갱신 시 사이드카가 기록돼야 한다");
+
+        // ── 2세대 데몬(재기동 모사): 라이브 맵은 비었지만 원장이 억제한다 ──
+        let d2 = Daemon::new(sock.clone());
+        assert!(
+            d2.oob_cooldowns.lock().unwrap().is_empty(),
+            "전제: surface 키 라이브 맵은 재기동을 넘지 못한다"
+        );
+        let mut restored_keys: Vec<(String, String)> =
+            d2.restored_oob_cooldowns.lock().unwrap().keys().cloned().collect();
+        restored_keys.sort();
+        assert_eq!(
+            restored_keys,
+            // ★E1: 전역캡(`__global__`) 예산 항목은 사라졌다 — 총량 상한이 다이제스트 구조로
+            // 옮겨갔으므로 영속 대상은 실제 dedup 키 계열뿐이다.
+            vec![("master".to_string(), "depth_high_hard".to_string())],
+            "role 앵커 + dedup 키 계열로 복원돼야 한다"
+        );
+        let _filler = surface(&d2, None); // surface id 를 어긋나게 해 sid 무관성을 드러낸다
+        let s2 = surface(&d2, Some("master"));
+        seat_agent(&s2);
+        assert_ne!(s1.id, s2.id, "전제: 재기동 후 같은 role 이 다른 surface id 를 갖는다");
+        assert_eq!(
+            oob_notify(
+                &d2,
+                s2.id,
+                "적체",
+                &format!("depth_high_hard:{}", s2.id),
+                OOB_HARD_COOLDOWN_SECS
+            ),
+            Err(OobSkip::Cooldown),
+            "재기동 직후 미해소 조건이 그대로 재통지되면 R4 버스트가 재발한다"
+        );
+
+        // ── 손상 폴백: 못 읽으면 빈 맵(fail-open) — 통지를 **막는** 원장이라 억제하지 않는다 ──
+        std::fs::write(&sidecar, "{ 손상된 json").unwrap();
+        let d3 = Daemon::new(sock);
+        assert!(
+            d3.restored_oob_cooldowns.lock().unwrap().is_empty(),
+            "손상본은 빈 맵 폴백이어야 한다(버스트 1회 감수 · 통지 봉쇄 금지)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -75,6 +75,8 @@ enum Command {
         /// 멱등 키(--queued 전용): 같은 (대상, 키) 대기 메시지를 제자리 교체한다.
         /// "이 주제의 최신 상태"를 보낼 때만 쓴다 — 키가 없으면 어떤 중복 억제도 하지 않는다
         /// (동일 문자열 재전송은 정당한 패턴이다). 밀려난 구 텍스트는 dead-letter에 남는다.
+        /// 교체는 구 항목의 나이를 승계하며, TTL 잔여가 5분 미만이면 교체하지 않고
+        /// **신규 발신으로 강등**된다(소프트캡 재적용 — 거부될 수 있다).
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
         /// TTL 면제 선언(--queued 전용) — master/cso 계열 발신자만 허용.
@@ -6993,6 +6995,91 @@ fn build_cycle_save_instruction(pack_round: &std::path::Path, role_todo: &str) -
     )
 }
 
+/// ★C2 — cycle 저장 게이트 목록 확정(순수). `detected`=스윕으로 찾은 **실존** 후보,
+/// `expected`=지시문이 생성을 명령하는 **기대 경로**(실존 여부 무관).
+///
+/// 협로가 무엇이었나: 신설 노드의 첫 cycle은 후보가 하나도 없다(`_round`도 팩 todo도 아직
+/// 없다). 종전 코드는 그 상태를 "저장 검증 파일 없음" 에러로 끝내 **clear를 영영 실행하지
+/// 못했다** — 정작 컨텍스트가 가장 급한 노드가 순환에서 배제되는 방향의 실패다. 기대 경로를
+/// 감시 대상으로 삼으면 에이전트가 지시대로 파일을 만드는 순간 게이트가 통과한다(생성도
+/// 갱신이다). 게이트 의미는 그대로 ANY-match이고, 감시 대상이 늘어도 **다른 노드가 건드릴 수
+/// 없는 자기 역할 파일**뿐이라 거짓 통과 위험은 늘지 않는다.
+///
+/// 순서 보존 dedup: baseline·handshake 본문이 이 순서로 만들어지므로 안정적이어야 한다.
+fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) -> Vec<String> {
+    let mut out = detected;
+    for p in expected {
+        let s = p.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// 저장 게이트 1틱 판정(ANY-match) — 하나라도 `start_time` 이후 갱신됐고 해시가 baseline과
+/// 다르면 통과. 화면 마커(CYCLE-SAVED)는 참고 신호일 뿐이고 **파일 변화가 사실**이다
+/// (reward-hack·stale 마커 차단).
+///
+/// ★C2: **비존재 파일의 baseline은 `None`**이므로, 지시대로 새로 생성된 파일은
+/// mtime>start && `Some(해시)` != `None` 이 성립해 이 판정이 그대로 '변화'로 인정한다 —
+/// 기대 경로를 게이트에 넣기 위해 판정 로직을 바꿀 필요가 없다는 것이 이 함수의 계약이다.
+/// 루프에서 분리한 이유도 그 계약을 테스트가 직접 단정할 수 있게 하기 위함이다.
+fn cycle_save_verified(
+    baseline: &[(String, Option<String>)],
+    start_time: std::time::SystemTime,
+) -> bool {
+    baseline.iter().any(|(f, base_hash)| {
+        let mtime_ok = std::fs::metadata(f)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| t > start_time)
+            .unwrap_or(false);
+        mtime_ok && sha256_file(f) != *base_hash
+    })
+}
+
+/// cycle 2단계(저장 검증)의 진로 — `--force-no-verify` 의 실효 의미를 타입으로 고정한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleVerifyPlan {
+    /// 파일 갱신을 기다린다(기본).
+    Wait,
+    /// 운영자가 명시적으로 검증을 건너뛴다(비상 탈출구).
+    SkipForced,
+    /// 감시할 파일 자체가 없다.
+    SkipNoFiles,
+}
+
+/// ★E3(적대 리뷰 REVISE-4): C2 이후 `files` 가 절대 비지 않게 되면서 `--force-no-verify` 는
+/// **死플래그**가 됐다 — 유일한 소비처였던 "빈 목록 거부" 분기에 도달할 수 없기 때문이다.
+/// 그 결과 저장이 불가능한 상태(에이전트 무응답·hang)에서 clear 를 강행할 비상 탈출구가
+/// 사라졌고, 운영자는 30분 timeout 을 기다린 뒤 실패를 받는 것 외에 방법이 없었다.
+/// 플래그의 원래 의미(검증 없이 진행)를 **검증 대기 자체를 건너뛰는 것**으로 복원한다.
+/// 저장 지시 주입은 그대로 한다 — 지시조차 안 하면 저장할 기회 자체가 사라진다.
+fn cycle_verify_plan(force_no_verify: bool, baseline_len: usize) -> CycleVerifyPlan {
+    if force_no_verify {
+        CycleVerifyPlan::SkipForced
+    } else if baseline_len > 0 {
+        CycleVerifyPlan::Wait
+    } else {
+        CycleVerifyPlan::SkipNoFiles
+    }
+}
+
+/// 2-phase handshake 본문의 파일 1줄(순수).
+///
+/// ★E8(N-5): 종전에는 `unwrap_or_default()` 로 **미존재 파일에 빈 해시**를 실었다. 검증자는
+/// `"경로 (sha256: )"` 를 보고 "해시가 비었다 = 뭔가 잘못됐다"로 읽거나, 더 나쁘게는 다른
+/// 미존재 파일과 **같은 빈 값**이라 구분하지 못했다. C2 이후 기대 경로(아직 없는 파일)가
+/// 본문에 정상적으로 들어오므로, 그 상태를 사실대로 표기한다 — 이 파일은 **생성 자체가
+/// 저장의 증거**이고, 검증자가 확인해야 할 것은 해시가 아니라 존재 전이다.
+fn handshake_file_line(path: &str, hash: Option<String>) -> String {
+    match hash {
+        Some(h) => format!("{path} (sha256: {h})"),
+        None => format!("{path} (미생성 — 생성 자체가 증거)"),
+    }
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -7075,19 +7162,22 @@ fn run_cycle_agent(
                     }
                 }
             }
-            let pt = pack_round.join(&role_todo);
-            if pt.exists() {
-                v.push(pt.to_string_lossy().into_owned());
-            }
-            // SESSION_STATE(pack 정본)는 master 소관 — master cycle일 때만 게이트에 포함
+            // ★C2: 기대 경로(지시문이 **생성을 명령하는** 파일)는 실존 여부와 무관하게 넣는다.
+            // 종전 `pt.exists()` 가드가 만든 협로: 신설 노드는 아직 이 파일이 없어 게이트에서
+            // 빠지고, 지시문은 바로 그 파일을 만들라고 시킨다 — 순응해 저장해도 아무도 안 보므로
+            // 검증 실패로 clear가 막힌다. 비존재 파일의 baseline은 `None`이고, 생성되면
+            // mtime>start && 해시(Some) != None 이 성립해 현행 ANY-match 루프가 그대로 인정한다.
+            // SESSION_STATE(pack 정본)는 master 소관이므로 master cycle에서만 기대 경로다.
+            let mut expected = vec![pack_round.join(&role_todo)];
             if role_name == "master" {
-                let pss = pack_round.join("SESSION_STATE.md");
-                if pss.exists() {
-                    v.push(pss.to_string_lossy().into_owned());
-                }
+                expected.push(pack_round.join("SESSION_STATE.md"));
             }
-            v
+            cycle_gate_files(v, expected)
         };
+        // ★E3 주석 정정: C2 폴백(`cycle_gate_files`)이 기대 경로를 무조건 넣으므로 `files` 는
+        // 실질적으로 비지 않는다 — 이 분기는 폴백이 되돌려지는 미래를 대비한 **방어적 잔존**이지
+        // "진짜 예외가 여기 남았다"는 종전 서술은 사실이 아니었다. 그래서 `--force-no-verify` 의
+        // 실질 의미도 이 분기가 아니라 **아래 검증 대기 생략**에 있다(비상 탈출구).
         if files.is_empty() && !force_no_verify {
             return Err(
                 "저장 검증 파일 없음 — --save-file로 지정하거나 --force-no-verify(위험)".into(),
@@ -7104,35 +7194,34 @@ fn run_cycle_agent(
         inject_text(sid, &build_cycle_save_instruction(&pack_round, &role_todo))?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
-        if !baseline.is_empty() {
-            eprintln!("[cycle 2/5] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-            let mut verified = false;
-            while std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                for (f, base_hash) in &baseline {
-                    let mtime_ok = std::fs::metadata(f)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| t > start_time)
-                        .unwrap_or(false);
-                    if mtime_ok && sha256_file(f) != *base_hash {
+        match cycle_verify_plan(force_no_verify, baseline.len()) {
+            CycleVerifyPlan::Wait => {
+                eprintln!("[cycle 2/5] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+                let mut verified = false;
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if cycle_save_verified(&baseline, start_time) {
                         verified = true;
                         break;
                     }
                 }
-                if verified {
-                    break;
+                if !verified {
+                    return Err(format!(
+                        "저장 검증 실패 — {timeout}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
+                    ));
                 }
+                eprintln!("[cycle] 저장 검증 통과");
             }
-            if !verified {
-                return Err(format!(
-                    "저장 검증 실패 — {timeout}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
-                ));
+            CycleVerifyPlan::SkipForced => {
+                eprintln!(
+                    "[cycle 2/5] ⚠ 저장 검증 **생략** (--force-no-verify) — 저장 지시는 주입했지만 \
+                     파일 갱신을 기다리지 않는다. 대상이 저장하지 못한 상태로 clear 될 수 있다."
+                );
             }
-            eprintln!("[cycle] 저장 검증 통과");
-        } else {
-            eprintln!("[cycle 2/5] ⚠ 파일 검증 생략 (--force-no-verify)");
+            CycleVerifyPlan::SkipNoFiles => {
+                eprintln!("[cycle 2/5] ⚠ 감시 대상 파일 없음 — 검증 생략");
+            }
         }
 
         // 3) 2-phase handshake — 검증자 부재 시 clear 금지 (soul 규칙)
@@ -7143,7 +7232,7 @@ fn run_cycle_agent(
             let vsid = vr["surface_id"].as_u64().ok_or("bad verifier resolve")?;
             let body: String = baseline
                 .iter()
-                .map(|(f, _)| format!("{f} (sha256: {})", sha256_file(f).unwrap_or_default()))
+                .map(|(f, _)| handshake_file_line(f, sha256_file(f)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let push = request(
@@ -12994,6 +13083,73 @@ mod tests {
         }
     }
 
+    // ── C2: cycle 저장 게이트 협로 봉합 ─────────────────────────────────────
+
+    /// ★C2 ②: 후보가 **하나도 없어도** 게이트는 성립해야 한다. 신설 노드의 첫 cycle이 정확히
+    /// 그 상태이고, 종전에는 여기서 "저장 검증 파일 없음" 에러로 끝나 clear가 영영 실행되지
+    /// 않았다 — 컨텍스트가 가장 급한 노드가 순환에서 배제되는 방향의 실패다.
+    #[test]
+    fn cycle_gate_falls_back_to_expected_paths_when_nothing_detected() {
+        let pack_round = std::path::Path::new("/home/x/.cys/pack/round");
+        // 워커: 자기 역할 TODO 하나가 기대 경로.
+        let g = cycle_gate_files(vec![], vec![pack_round.join("WORKER_TODO.md")]);
+        assert_eq!(g, vec!["/home/x/.cys/pack/round/WORKER_TODO.md".to_string()],
+                   "후보 전무에서 게이트가 비면 clear가 실행되지 않는다");
+        // master: pack SESSION_STATE도 자기 소관이라 함께 감시한다.
+        let g = cycle_gate_files(
+            vec![],
+            vec![pack_round.join("MASTER_TODO.md"), pack_round.join("SESSION_STATE.md")],
+        );
+        assert_eq!(g.len(), 2);
+        assert!(g[1].ends_with("SESSION_STATE.md"));
+    }
+
+    /// ★C2 ①: 기대 경로는 **실존 여부와 무관하게** 목록에 들어가되, 이미 탐지된 후보와
+    /// 중복되면 한 번만 실린다(baseline·handshake 본문이 이 목록으로 만들어진다). 탐지 순서는
+    /// 보존한다 — 목록 순서가 흔들리면 handshake 본문이 매 cycle 달라져 비교가 어려워진다.
+    #[test]
+    fn cycle_gate_merges_expected_without_duplicates_and_keeps_order() {
+        let pt = "/home/x/.cys/pack/round/WORKER_TODO.md".to_string();
+        let g = cycle_gate_files(
+            vec!["/w/_round/SESSION_STATE.md".into(), pt.clone()],
+            vec![std::path::PathBuf::from(&pt)],
+        );
+        assert_eq!(g, vec!["/w/_round/SESSION_STATE.md".to_string(), pt],
+                   "이미 실존해 탐지된 기대 경로가 두 번 실렸다");
+    }
+
+    /// ★C2 실측: **비존재 파일을 게이트에 넣어도 판정 로직을 바꿀 필요가 없다**는 계약.
+    /// baseline이 `None`이므로 지시대로 새로 생성되면 mtime>start && Some != None 이 성립한다.
+    /// 이게 깨지면 신설 노드는 지시에 순응해 저장하고도 검증 실패로 clear를 못 받는다.
+    #[test]
+    fn cycle_save_verified_accepts_a_newly_created_gate_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-c2-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("WORKER_TODO.md").to_string_lossy().into_owned();
+
+        // 아직 없는 파일의 baseline = None (게이트 등록 시점의 실제 값).
+        let baseline = vec![(missing.clone(), sha256_file(&missing))];
+        assert_eq!(baseline[0].1, None, "비존재 파일의 baseline은 None이어야 한다");
+
+        let start_time = std::time::SystemTime::now();
+        assert!(!cycle_save_verified(&baseline, start_time), "저장 전에 통과하면 게이트가 아니다");
+
+        // mtime 해상도(초 단위 파일시스템) 때문에 생성 시각이 start_time과 같아질 수 있다 —
+        // 실제 cycle에는 지시 주입·에이전트 응답 시간이 끼어 있어 발생하지 않는 조건이다.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&missing, "# 저장\n").unwrap();
+        assert!(
+            cycle_save_verified(&baseline, start_time),
+            "새로 생성된 게이트 파일이 '갱신'으로 인정되지 않는다 — C2 전제가 깨졌다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── pack-scope-check: 훅 판정 SOT ───────────────────────────────────────
 
     /// 판정 범위는 `$HOME/.cys/pack*`뿐이다 — 레포 워크트리·문서·임시 파일까지 팩으로 보면
@@ -13207,6 +13363,45 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cys", "pack-scope-check"]).is_err(),
             "--path 없이 통과하면 훅이 빈 판정을 받는다"
+        );
+    }
+
+    // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
+
+    /// ★E3 회귀 핀: `--force-no-verify` 는 死플래그가 아니다.
+    ///
+    /// C2 폴백 이후 `files` 가 절대 비지 않게 되면서, 이 플래그의 유일한 소비처였던
+    /// "빈 목록 거부" 분기는 도달 불능이 됐다 — 즉 플래그를 줘도 동작이 **하나도** 달라지지
+    /// 않았다(저장이 불가능한 hang 상태에서 clear 를 강행할 비상 탈출구 소실). 지금은 검증
+    /// 대기 자체를 건너뛴다.
+    #[test]
+    fn force_no_verify_skips_the_wait_even_when_files_exist() {
+        // C2 이후의 실제 상태: 감시 파일이 있다.
+        assert_eq!(cycle_verify_plan(false, 3), CycleVerifyPlan::Wait);
+        assert_eq!(
+            cycle_verify_plan(true, 3),
+            CycleVerifyPlan::SkipForced,
+            "파일이 있어도 플래그가 대기를 건너뛰지 못하면 死플래그가 재발한다"
+        );
+        // 파일이 없는 경우의 두 갈래도 구분된다(경고 문구가 사실과 어긋나지 않게).
+        assert_eq!(cycle_verify_plan(false, 0), CycleVerifyPlan::SkipNoFiles);
+        assert_eq!(cycle_verify_plan(true, 0), CycleVerifyPlan::SkipForced);
+    }
+
+    /// ★E8(N-5): 검증자에게 제시하는 본문에서 **미존재 기대 경로**는 빈 해시가 아니라 사실을
+    /// 표기한다. `unwrap_or_default()` 는 미존재 파일 여럿을 전부 같은 빈 문자열로 만들어,
+    /// 검증자가 "무엇을 확인해야 하는지"(존재 전이)를 알 수 없게 했다.
+    #[test]
+    fn handshake_body_states_missing_files_instead_of_empty_hash() {
+        let line = handshake_file_line("/r/WORKER_TODO.md", None);
+        assert!(
+            line.contains("미생성") && !line.contains("sha256: )"),
+            "미존재 경로를 빈 해시로 제시하면 검증자가 오판한다: {line}"
+        );
+        assert_eq!(
+            handshake_file_line("/r/SESSION_STATE.md", Some("abc123".into())),
+            "/r/SESSION_STATE.md (sha256: abc123)",
+            "존재 파일의 표기는 종전 계약 그대로여야 한다"
         );
     }
 }

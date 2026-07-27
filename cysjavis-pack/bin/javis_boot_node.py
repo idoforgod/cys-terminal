@@ -27,7 +27,16 @@ javis_boot_node.py — 결정론 단일 노드 부트 헬퍼 (부트스트랩 �
 
 프로토콜(idle-then-inject):
   1) PRE-CHECK  awake_ready 면 already_up. 점유만 됐고 미각성이면 입양→주입.
-  2) LAUNCH     없을 때만 launch-agent 1회. 실패 텍스트 무시·cys list 재조회(F2).
+                단 **agent 가 죽은 좌석**(status.agent_alive is False)은 입양 금지 —
+                맨 셸에 각성 산문을 보내면 command not found 로 끝나 복구율 0이다(F1).
+                already_up 도 불인정한다(죽기 직전 set-status 잔향을 생존으로 쓰지 않는다).
+  2) LAUNCH/RECOVER/ADOPT  3분기(precheck_action):
+                launch  = role surface 부재 → launch-agent 1회(허위 실패 텍스트 무시·재조회 F2)
+                recover = 죽은 agent 좌석 → `cys node-recover`(같은 surface CLI 재기동+디렉티브
+                          재주입). 승계(takeover_empty_seat)로는 못 고친다 — 데몬 seat_claimable 이
+                          agent_meta 보유 좌석을 배제해 **조용한 무승계**로 끝난다(격리 실측).
+                          살아나지 않으면 주입하지 않고 중단한다(맨 셸 산문 금지).
+                adopt   = role 보유 + agent 생존/미상 → 종전대로 입양해 주입(재기동 안 함).
   3) POLL-IDLE  idle_secs>=IDLE 안착까지 폴링(F1). 폴링 중 awake_ready 잡히면 즉시 종료.
   4) INJECT     주입 직전 t_inject 기록. 자연어(확장자 없음·F4) 각성 지침을 `cys send --queued`
                 단일경로로 주입(메시지+자동 Return 원자적·typing_guard 우회·중복 위험 제거 — codex R2 결함4).
@@ -148,10 +157,69 @@ def role_surface_row(role):
 
 
 def status_surface(status, role):
-    for s in status.get("surfaces", []):
+    for s in (status or {}).get("surfaces", []):
         if s.get("role") == role and not s.get("exited"):
             return s
     return None
+
+
+# ★F1(2026-07-27 적대리뷰 REVISE-1) — 죽은 agent pane 복구 경로 실배선.
+#   종전 PRE-CHECK 은 `role_surface_row(role)`(cys list) 만 봤다. cys list 는 agent 생존을
+#   말하지 않으므로, **agent 가 죽고 셸만 남은 pane**(라이브 실측: 부서 8노드 전원
+#   agent_alive=false)이 role 을 점유 중이면 launch 를 건너뛰고 '입양'(각성 산문 주입)으로 갔다.
+#   맨 셸에 한국어 산문이 떨어지면 `command not found` 로 끝나 복구율이 0이었다.
+#   편성 ensure(javis_formation._roster_from_status)는 이미 agent_alive is False 를 '역할 부재'로
+#   보고 _boot_node 를 부르는데, 정작 boot_node 가 여기서 no-op 이 되어 복구 사슬이 끊겼다.
+#
+# ★복구 경로 정정(격리 데몬 실측 2026-07-27): 이 결함의 처방은 `cys launch-agent`(빈 좌석 승계)가
+#   **아니다**. 데몬의 승계 게이트 `governance::seat_claimable` 은 `agent_meta.is_none()` 을 요구한다
+#   ("죽은 에이전트의 좌석은 node-recover 영역이지 탈취 대상이 아니다" — governance.rs 문언).
+#   그런데 죽은 agent 좌석은 **정의상 agent_meta 를 보유**한다(그래서 agent_alive 가 None 이 아니라
+#   False 다) → takeover 는 구조적으로 성립 불가다. 격리 데몬 프로브 실측: dead seat 에
+#   `surface.create{role, takeover_empty_seat:true}` 를 걸면 **오류 없이** 새 surface 만 생기고 role 은
+#   죽은 좌석에 그대로 남는다(조용한 무승계). 그 위에 각성 산문을 얹으면 결함이 그대로 재발한다.
+#   데몬이 지정한 경로는 `cys node-recover` 다 — 같은 surface 에서 CLI 를 재기동하고 디렉티브를
+#   재주입하며, 전제조건이 정확히 'agent 메타 보유 + agent_alive != true'(= 우리의 dead seat)다.
+def seat_agent_dead(status, role):
+    """role 을 점유한 비종료 surface 가 **빈 좌석**(agent 사망·셸만 생존)인가.
+
+    True  = `agent_alive is False` — 입양(각성 산문 주입) 금지. `cys launch-agent` 가
+            `takeover_empty_seat` 로 좌석을 승계해 CLI 를 실제로 다시 띄워야 한다.
+    False = ①산 agent(True) ②필드 부재(구 데몬 — agent_alive 를 아예 노출하지 않음)
+            ③None(등록 agent 없는 수동 셸·부팅 중) ④해당 role surface 없음.
+            ②③은 종전 입양 동작을 그대로 유지한다(스큐 안전 — 판정 실패를 근거로
+            멀쩡한 pane 을 재기동해 오살하지 않는다. javis_formation 의 None 처리와 동일 규약)."""
+    s = status_surface(status, role)
+    if s is None:
+        return False
+    return s.get("agent_alive") is False
+
+
+def precheck_already_up(status, role):
+    """PRE-CHECK 의 already_up 판정 — awake_ready 이되 **빈 좌석이면 불인정**.
+
+    ★왜 필요한가: awake_ready 의 2번째 근거는 'fresh set-status(age<=600s)'다. agent 가 방금
+    죽은 좌석은 죽기 직전에 남긴 set-status 잔향이 아직 신선해서 already_up 으로 통과한다 →
+    launch 분기(F1)에 닿지도 못하고 no-op 으로 끝난다. `agent_alive is False` 는 '그 agent 는
+    죽었다'는 데몬의 결정론 사실이므로, 그 잔향을 생존 근거로 쓰지 않는다.
+    (agent_alive is True 면 awake_ready 가 그 자체로 참이라 이 게이트는 무해하다.)"""
+    if seat_agent_dead(status, role):
+        return False, "agent_alive=false(빈 좌석) — set-status 잔향을 생존으로 불인정"
+    return awake_ready(status, role)
+
+
+def precheck_action(row_present, dead_seat):
+    """PRE-CHECK 3분기(순수) — 무엇을 할 것인가.
+
+      "launch"  role 보유 surface 자체가 없다 → `cys launch-agent`(신규 기동).
+      "recover" role 은 있는데 그 좌석의 agent 가 죽었다 → `cys node-recover`(같은 surface 재기동
+                +디렉티브 재주입). **입양 금지** — 맨 셸에 각성 산문을 보내면 command not found 다.
+      "adopt"   role 보유 + agent 생존/미상 → 종전대로 입양해 각성 지침을 주입.
+
+    ★재기동 중복 방지 보존: agent 가 살아있으면(dead_seat=False) 절대 재스폰·재기동하지 않는다."""
+    if not row_present:
+        return "launch"
+    return "recover" if dead_seat else "adopt"
 
 
 def _pid_for_surface_ref(surface_ref):
@@ -337,6 +405,33 @@ def inject(role, msg, attempts=4):
     return False, "주입 실패(%d회·큐 등록 실패: %s)" % (attempts, (errq or "").strip()[:80])
 
 
+# ─────────────────── 죽은 agent 좌석 복구(F1) ───────────────────
+def node_recover(role, emit, budget=60.0):
+    """죽은 agent 좌석을 `cys node-recover`로 되살린다. 성공 = agent_alive 가 False 를 벗어남.
+
+    node-recover 는 셸을 죽이지 않는다 — 같은 surface 에서 C-u 로 입력을 비우고 CLI 를 재기동한
+    뒤 디렉티브를 재주입한다(cys.rs run_node_recover). 그래서 pane·스크롤백이 보존되고,
+    `--reclaim`(kill) 같은 비가역 조치가 필요 없다.
+    실패하면 **False 를 돌려 주입을 막는다** — 살아나지 않은 셸에 산문을 보내지 않는 것이 F1 의 핵심.
+
+    ★budget 은 **전체 상한**이다(하위 subprocess timeout 포함). 호출측의 --timeout 예산 안에서
+    돌아야 POLL/INJECT/VERIFY 가 굶지 않고, 상위 formation(_boot_node timeout=200)도 안 터진다."""
+    t0 = time.time()
+    rc, out, err = run(["cys", "node-recover", "--role", role], timeout=max(20.0, budget * 0.7))
+    emit("recover", "node-recover rc=%d %s" % (rc, (err or out or "").strip().replace("\n", " ")[:160]))
+    if rc != 0:
+        return False
+    while time.time() - t0 < budget:
+        st = cys_status()
+        if st is not None and not seat_agent_dead(st, role):
+            emit("recover", "%s agent 재기동 확인(agent_alive 가 false 를 벗어남)" % role)
+            return True
+        time.sleep(2)
+    emit("recover", "node-recover 후에도 agent_alive=false 지속 — 맨 셸 주입 금지(중단). "
+                    "`javis_boot_node.py --reclaim --role %s` 로 좌석을 회수한 뒤 재기동하라" % role)
+    return False
+
+
 # ─────────────────── 회수(F5) ───────────────────
 def reclaim(role, emit):
     """막힌(죽은) 미각성 surface 결정론 회수. ★node_alive(orchestra 와 동일 술어)가 True 면 절대 종료
@@ -402,6 +497,37 @@ def self_test():
                            "status": {"age_secs": 9999, "state": "working"}}]}
     chk(awake_ready(stale, "cso")[0] is False, "stale set-status awake 오인정")
 
+    # ★F1: 죽은 agent 좌석 판정 + PRE-CHECK 분기(입양 vs launch-agent 승계)
+    dead = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": False,
+                          "status": {"age_secs": 5, "state": "working"}}]}
+    alive = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": True}]}
+    shell = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": None}]}
+    legacy = {"surfaces": [{"role": "cso", "exited": False}]}          # 구 데몬(필드 부재)
+    exited_row = {"surfaces": [{"role": "cso", "exited": True, "agent_alive": False}]}
+    chk(seat_agent_dead(dead, "cso") is True, "agent 사망 좌석 미탐지(입양으로 새어나가 복구 0)")
+    chk(seat_agent_dead(alive, "cso") is False, "산 agent 를 빈 좌석으로 오판(재스폰 위험)")
+    chk(seat_agent_dead(shell, "cso") is False, "agent_alive=None(빈 셸)을 사망으로 오판")
+    chk(seat_agent_dead(legacy, "cso") is False, "agent_alive 필드 부재(구 데몬)를 사망으로 오판(스큐 안전 위반)")
+    chk(seat_agent_dead(exited_row, "cso") is False, "종료 surface 를 현행 좌석으로 오인")
+    chk(seat_agent_dead({}, "cso") is False, "빈 status 에 오발동")
+    chk(seat_agent_dead(None, "cso") is False, "None status 에 오발동")
+    chk(precheck_action(False, False) == "launch", "surface 부재인데 launch 안 함")
+    chk(precheck_action(False, True) == "launch", "surface 부재+dead 신호에 launch 안 함")
+    chk(precheck_action(True, True) == "recover", "죽은 agent 좌석인데 입양으로 감(F1 회귀)")
+    chk(precheck_action(True, False) == "adopt", "산 agent 보유 role 을 재기동(중복 기동 회귀)")
+    # ★승계(takeover)로 가면 안 된다: 데몬 seat_claimable 이 agent_meta 보유 좌석을 배제하므로
+    #   launch-agent 는 dead seat 에서 조용히 무승계로 끝난다(격리 데몬 실측).
+    chk(precheck_action(True, True) != "launch",
+        "dead seat 을 launch-agent 승계로 처리(데몬이 배제하는 경로 — 조용한 무승계)")
+    # already_up 게이트가 빈 좌석을 삼키면 launch 분기에 닿지도 못한다(F1 우회 경로 차단).
+    chk(precheck_already_up(dead, "cso")[0] is False,
+        "죽은 좌석의 set-status 잔향을 already_up 으로 인정(F1 이 no-op 으로 무력화)")
+    chk(precheck_already_up(alive, "cso")[0] is True, "산 agent 를 already_up 미인정(불필요 재기동)")
+    chk(precheck_already_up(fresh, "cso")[0] is True,
+        "agent_alive 미상 + fresh set-status 를 already_up 미인정(종전 계약 파손)")
+    chk(precheck_already_up(stale, "cso")[0] is False, "stale set-status 를 already_up 오인정")
+    chk(precheck_already_up(legacy, "cso")[0] is False, "구 데몬 무신호를 already_up 오인정")
+
     # reviewer claim-role 풀네임(R1 결함3)·각성 메시지 .md 미포함(F4)
     chk("cys claim-role reviewer-codex" in awaken_message("reviewer-codex"), "reviewer-codex claim 풀네임 누락")
     chk("cys claim-role reviewer-gemini" in awaken_message("reviewer-gemini"), "reviewer-gemini claim 풀네임 누락")
@@ -464,8 +590,8 @@ def self_test():
             print("  ✗ " + f)
         return 1
     print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·"
-          "무구독폴백슬롯·important폴백·소프트캡종결)"
-          % (7 + 4 + 4 + 4 + 4 + 5 + 7))
+          "무구독폴백슬롯·important폴백·소프트캡종결·죽은agent좌석복구분기)"
+          % (7 + 4 + 17 + 4 + 4 + 4 + 5 + 7))
     return 0
 
 
@@ -516,16 +642,19 @@ def main():
     def remaining():
         return a.timeout - (time.time() - t0)
 
-    # 1) PRE-CHECK — 이미 각성?(awake_ready=프로세스 제외)
-    ready, why = awake_ready(status, a.role)
+    # 1) PRE-CHECK — 이미 각성?(awake_ready=프로세스 제외 · 빈 좌석이면 잔향 불인정 — F1)
+    ready, why = precheck_already_up(status, a.role)
     if ready:
         row = role_surface_row(a.role)
         emit("precheck", "이미 각성 — %s (%s). 재기동 생략." % (row["surface_ref"] if row else "?", why))
         return done("already_up", why, row["surface_ref"] if row else None)
 
-    # 2) LAUNCH — role 보유 surface 가 없을 때만(F2: 허위 실패보고 무시·재조회)
+    # 2) LAUNCH / RECOVER / ADOPT — 3분기(F2 허위 실패보고 무시·재조회 · F1 죽은 좌석 복구)
     row = role_surface_row(a.role)
-    if row is None:
+    dead_seat = seat_agent_dead(status, a.role)
+    action = precheck_action(row is not None, dead_seat)
+
+    if action == "launch":
         cmd = ["cys", "launch-agent", "--role", a.role, "--agent", a.agent]
         if a.cwd:
             cmd += ["--cwd", a.cwd]
@@ -539,8 +668,24 @@ def main():
         if row is None:
             emit("fail", "launch 후에도 %s surface 생성 안 됨" % a.role)
             return done("no_surface", "launch_failed", code=1)
+
+    elif action == "recover":
+        # ★F1: agent 만 죽고 셸은 살아있는 좌석. 입양(각성 산문 주입) 금지 — 맨 셸은 그 산문을
+        #   command not found 로 흘린다(복구율 0). 데몬이 지정한 경로는 node-recover 다
+        #   (승계 게이트는 agent_meta 보유 좌석을 구조적으로 배제한다 — 상단 주석 참조).
+        emit("precheck", "%s 가 role 을 점유했으나 agent 사망(agent_alive=false) — 입양 금지, "
+                         "node-recover 로 같은 surface 에서 CLI 재기동" % row["surface_ref"])
+        # POLL-IDLE·INJECT·VERIFY 에 최소 15초는 남겨둔다(전체 --timeout 예산 준수).
+        if not node_recover(a.role, emit, budget=max(20.0, remaining() - 15)):
+            return done("recover_failed", "dead_agent_not_revived", row["surface_ref"], code=1)
+        row = role_surface_row(a.role)
+        if row is None:
+            emit("fail", "node-recover 후 %s role surface 소실" % a.role)
+            return done("no_surface", "recover_lost_surface", code=1)
+
     else:
-        emit("precheck", "%s 가 이미 role 보유(미각성) — 입양해 주입(재기동 안 함)" % row["surface_ref"])
+        emit("precheck", "%s 가 이미 role 보유(미각성·agent 생존/미상) — 입양해 주입(재기동 안 함)"
+             % row["surface_ref"])
     surface = row["surface_ref"]
 
     # 3) POLL-IDLE — 시작 애니메이션이 가라앉을 때까지(F1 핵심). 폴링 중 각성되면 즉시 종료.

@@ -225,21 +225,48 @@ def evt_type_for_state(state):
     return _STATE_EVT.get(state_kind(state))
 
 
-# ── 라이브 로스터 관측(cys list) ──
-def _live_roles(socket):
-    """cys list(소켓 문맥) → 라이브(미exited) 역할 집합. 파싱 불가/데몬 부재 → None."""
-    env = dict(os.environ)
-    if socket:
-        env["CYS_SOCKET"] = socket
-    try:
-        r = subprocess.run(["cys", "list"], capture_output=True, text=True,
-                           timeout=15, env=env)
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
+# ── 라이브 로스터 관측(cys status --json · agent 생존 인지) ──
+def _canonical_role(role):
+    """변형 역할(cso-1·worker-2·reviewer-gemini-x)을 의무 역할 기준으로 귀속(순수·self-test 핀)."""
+    if role == "master":
+        return "master"
+    if role == "cso" or role.startswith("cso-"):
+        return "cso"
+    if role == "worker" or role.startswith("worker-"):
+        return "worker"
+    if role.startswith("reviewer-gemini"):
+        return "reviewer-gemini"
+    if role.startswith("reviewer-codex"):
+        return "reviewer-codex"
+    return role
+
+
+def _roster_from_status(obj, require_live_agent=True):
+    """`cys status --json`(org.status) surfaces → 역할 집합(순수·self-test 핀).
+
+    ★agent 사망 인지(2026-07-27 hotfix): 종전 판정은 'pane 에 role 이 있으면 생존'이라, agent 가
+      전부 죽고 셸만 남은 부서(라이브 실측: 8노드 agent_alive=false)를 **complete 로 오판**해
+      편성 복구가 영영 발화하지 않았다. agent_alive is False = 그 좌석의 agent 사망 → 역할 부재로
+      본다(재기동 대상). agent_alive is None 은 '등록된 agent 없음'(수동 new-surface 빈 셸)이라
+      종전 의미(좌석 점유=생존)를 그대로 둔다 — 온보딩·입양 경로(boot_node)가 그 위에 서 있다.
+    require_live_agent=False 는 좌석 존재만 묻는 관측(=구 동작) — master 좌석 재생성 판단 전용."""
     roles = set()
-    for line in (r.stdout or "").splitlines():
+    for s in (obj or {}).get("surfaces") or []:
+        if s.get("exited"):
+            continue
+        role = s.get("role") or ""
+        if not role:
+            continue
+        if require_live_agent and s.get("agent_alive") is False:
+            continue
+        roles.add(_canonical_role(role))
+    return roles
+
+
+def _roster_from_list_tsv(text):
+    """`cys list` TSV → 역할 집합(순수·구 폴백 경로). agent 생존은 이 출력에 없다(=agent 맹목)."""
+    roles = set()
+    for line in (text or "").splitlines():
         f = line.rstrip("\n").split("\t")
         if len(f) < 4:
             continue
@@ -248,20 +275,33 @@ def _live_roles(socket):
             continue
         if not role:
             continue
-        # 변형 역할(cso-1·worker-2·reviewer-*)은 의무 역할 기준으로 귀속.
-        if role == "master":
-            roles.add("master")
-        elif role == "cso" or role.startswith("cso-"):
-            roles.add("cso")
-        elif role == "worker" or role.startswith("worker-"):
-            roles.add("worker")
-        elif role.startswith("reviewer-gemini"):
-            roles.add("reviewer-gemini")
-        elif role.startswith("reviewer-codex"):
-            roles.add("reviewer-codex")
-        else:
-            roles.add(role)
+        roles.add(_canonical_role(role))
     return roles
+
+
+def _live_roles(socket, require_live_agent=True):
+    """라이브 역할 집합. 파싱 불가/데몬 부재 → None.
+
+    1차 `cys status --json`(agent_alive 노출 = agent 사망 인지) · 실패 시 `cys list` TSV 폴백
+    (구 동작 = agent 맹목). 폴백은 새 결함을 만들지 않는다 — 종전과 같은 판정으로 되돌아갈 뿐이다."""
+    env = dict(os.environ)
+    if socket:
+        env["CYS_SOCKET"] = socket
+    try:
+        r = subprocess.run(["cys", "status", "--json"], capture_output=True, text=True,
+                           timeout=15, env=env)
+        if r.returncode == 0:
+            return _roster_from_status(json.loads(r.stdout or "{}"), require_live_agent)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["cys", "list"], capture_output=True, text=True,
+                           timeout=15, env=env)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return _roster_from_list_tsv(r.stdout or "")
 
 
 def _installed_clis():
@@ -316,7 +356,10 @@ def _boot_node(role, socket, cwd=None, timeout=200):
 def _ensure_master_seat(socket, cwd):
     """master 자리 확보: seat 닫힘 → new-surface --role master 재생성(node-recover·Sim S2-7).
     빈 셸/미각성 → boot_node 입양 경로가 claude 부착. 이미 각성 → no-op(already_up)."""
-    roles = _live_roles(socket)
+    # ★좌석 존재만 묻는다(require_live_agent=False): agent 가 죽은 master 좌석은 **재생성 대상이
+    # 아니라 입양 대상**이다 — 살아있는 좌석에 new-surface --role master 를 또 쏘면 role 점유 충돌·
+    # litter surface 가 된다. 죽은 agent 의 복구는 아래 _boot_node(입양 경로)가 담당한다.
+    roles = _live_roles(socket, require_live_agent=False)
     env = dict(os.environ)
     if socket:
         env["CYS_SOCKET"] = socket
@@ -602,6 +645,29 @@ def self_test():
     ck(_sanitize_key("/s/cys-dept-dept-1/cys.sock") !=
        _sanitize_key("/s/cys-dept-dept-2/cys.sock"), "동일 basename 두 부서 키 충돌")
     ck(_sanitize_key("") == _sanitize_key(None) == "base", "미설정=base 키")
+    # ★agent 사망 인지(2026-07-27 hotfix): 죽은 agent 좌석은 역할 부재 → 재기동 대상.
+    dead = {"surfaces": [
+        {"role": "master", "exited": False, "agent_alive": False},
+        {"role": "cso", "exited": False, "agent_alive": True},
+        {"role": "worker-2", "exited": False, "agent_alive": True},
+        {"role": "reviewer-gemini", "exited": False, "agent_alive": None},   # 빈 셸(등록 agent 없음)
+        {"role": "reviewer-codex", "exited": True, "agent_alive": True},     # 종료 surface
+    ]}
+    live = _roster_from_status(dead)
+    ck("master" not in live, "agent 사망(agent_alive=false) 좌석을 생존으로 오판")
+    ck("cso" in live and "worker" in live, "생존 agent 역할 누락(변형 role 귀속 포함)")
+    ck("reviewer-gemini" in live, "빈 셸(agent_alive=None)은 종전대로 좌석 생존")
+    ck("reviewer-codex" not in live, "exited surface 를 생존으로 오판")
+    # 좌석 관측(require_live_agent=False)은 구 동작 그대로 — master 좌석 재생성 오폭 차단.
+    seats = _roster_from_status(dead, require_live_agent=False)
+    ck("master" in seats, "좌석 관측이 죽은 agent 좌석을 놓치면 master 를 중복 생성한다")
+    ck(classify(installed={"claude", "agy", "codex"}, live=live,
+                resource_ok=True) != "complete", "agent 전멸 부서를 complete 로 오판")
+    # TSV 폴백 파서(구 경로)는 동일 역할 귀속을 유지한다.
+    ck(_roster_from_list_tsv(
+        "surface:1\trole=cso-1\tpid=1\texited=false\tt\t/\n"
+        "surface:2\trole=worker\tpid=2\texited=true\tt\t/\n") == {"cso"},
+       "TSV 폴백 파서 회귀(exited 무시·변형 role 귀속)")
     # 두 경로 동등성(plan_roster)
     b, mn = plan_roster("button"), plan_roster("manual")
     ck(b.ensure_fn is mn.ensure_fn, "두 경로 ensure 수렴 실패")

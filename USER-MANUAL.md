@@ -238,8 +238,36 @@ cys send --queued --important --to worker "..."                      # TTL 면�
   교체**합니다(줄 뒤로 밀리지 않음 — 자주 갱신하는 주제일수록 늦게 배달되는 역전 방지).
   밀려난 구 텍스트는 dead-letter(`superseded`)에 남습니다. 키가 없으면 어떤 중복 억제도
   하지 않습니다(동일 문자열 재전송은 정당한 패턴).
+  교체할 때 **기다린 시간은 원래 것을 그대로 물려받습니다** — 그러지 않으면 자주 갱신하는
+  메시지가 만기 시계를 매번 되감아 큐에서 영원히 사라지지 않습니다. 그래서 만기까지 남은
+  시간이 5분 미만인 항목에는 교체를 걸지 않고, 원래 항목을 원장으로 보낸 뒤 갱신본을
+  **새 메시지로 처리**합니다(혼잡 상한을 다시 통과합니다 — 수명이 다한 주제의 갱신은
+  사실상 새 발신이기 때문입니다). 이때 혼잡 상한에 걸리면 평소처럼 거부되며, 원래 항목과
+  갱신본 **둘 다** 원장에 남아 있으므로 잃는 내용은 없습니다.
 - `--important`(--queued 전용, master·CSO 계열 발신만): **TTL 면제**입니다.
   소프트캡 면제가 아닙니다 — 혼잡 상한은 지휘 메시지에도 적용됩니다(의도된 설계).
+
+**큐 혼잡 상한(소프트캡) — 기본이 `enforce`입니다.** 한 대상 큐에 쌓인 **에이전트 발신**
+항목이 소프트캡(기본 25건 · `CYS_QUEUE_AGENT_SOFTCAP`)에 닿으면, 그 뒤 발신은 관찰만 하는 게
+아니라 **실제로 거부**됩니다(`queue_softcap_exceeded`로 비0 종료 · `queue.rejected` 이벤트).
+거부된 메시지는 사라지지 않습니다 — 데몬이 전문을 `dead-letters.jsonl` 원장에 적은 뒤에 거부하며,
+그래서 **거부는 실패가 아니라 종결입니다**(같은 메시지를 다시 보내면 혼잡만 커지고 원장이
+오염됩니다). 적재만 허용하고 이벤트만 남기는 관찰 모드는 `CYS_QUEUE_POLICY_MODE=log`로
+**명시해야** 켜지는 롤백 스위치입니다. 사람(GUI)·시스템 발신은 이 상한에서 면제됩니다.
+
+**큐 항목 만기(TTL) — 발신 등급마다 다릅니다.** 아무도 받아가지 않는 메시지가 큐에 영원히
+남지 않도록, 오래된 항목은 큐에서 빠져 원장으로 **이관**됩니다(폐기가 아닙니다).
+
+| 발신 등급 | 기본 만기 | 이유 |
+|---|---|---|
+| 에이전트(노드 pane에서 보낸 것) | 1시간 (`CYS_QUEUE_TTL_SECS`) | 가장 흔한 폭주 주체입니다. |
+| 시스템(스케줄러·거버넌스 등 pane 밖 발신) | **4시간** (`CYS_QUEUE_SYSTEM_TTL_SECS`) | 제어 메시지라 성급히 치우면 더 해롭습니다. 그래도 상한을 둡니다 — 종전에는 시스템 발신이 만기 자체가 없어, 배달이 막힌 pane 앞에서 **한없이 쌓였습니다**. |
+| 사람이 GUI에서 큐잉한 것 | **24시간** (`CYS_QUEUE_GUI_TTL_SECS` · 0=면제) | 사실상 무기한에 준하는 장주기입니다 — 사람이 하루 안에 돌아오는 창을 덮고, 만기돼도 폐기가 아니라 **원장 보존 + 통지**입니다. 종전에는 완전 면제였는데, 이 등급을 가르는 `gui` 표시는 보내는 쪽이 스스로 붙이는 값이라 사람이 아닌 프로그램도 한 줄로 **무기한을 받아낼 수 있었습니다**. 상한을 두면 그렇게 얻을 게 24시간뿐이라 흉내 낼 이유가 사라집니다. |
+| `--important` 선언분 | 면제 | 등급과 무관한 메시지 단위 의도 선언입니다. **진짜 무기한이 필요할 때 쓰는 명시 경로**입니다. |
+
+만기가 일어나면 `queue.expired` 이벤트가 흐르고, 전문은 원장에 남습니다. **원장을 확인해
+지금도 유효한 건만 다시 처리하면 됩니다 — 발신자에게 재전송을 요구할 필요가 없습니다.**
+`CYS_QUEUE_TTL_SECS=0`은 등급과 무관하게 만기 기능을 통째로 끄는 전면 롤백 스위치입니다.
 - 여러 대상(`--to 'reviewer-*'`)에 보낼 때 일부가 실패해도 나머지는 계속 시도하고,
   마지막에 대상별 실패를 요약한 뒤 **비0으로 종료**합니다.
 
@@ -286,6 +314,16 @@ cys set-status --state working --context 57 --task "리팩터링 중"
 
 컨텍스트%가 임계(기본 60%)에 닿으면 데몬이 `context.threshold` 이벤트로 통보합니다.
 
+**`source`가 `observed-uncertain`이면 그 통보는 "확실하지 않다"는 뜻입니다.** 에이전트가
+스스로 신고하지 않을 때 데몬은 세션 기록을 읽어 소비량을 관측하는데, 한 폴더에서 여러 pane이
+돌면 그 값이 **어느 pane 것인지 특정되지 않을 때**가 있습니다. 원칙적으로 그런 관측치는
+임계 발화에 쓰지 않지만(엉뚱한 pane을 `/clear` 시키면 그 pane 작업이 날아갑니다), 85% 이상은
+예외로 발화합니다 — 방치해서 100%에 닿아 전부 잃는 쪽이 더 나쁘기 때문입니다. 이 폴백으로
+나온 통보는 `source: "observed-uncertain"`과 `attribution` 값을 함께 싣고, `action` 문구도
+"바로 집행"이 아니라 **`cys read-screen`으로 대상 pane을 직접 확인한 뒤 집행**하라고
+바뀝니다. 반대로 소유가 **다른 pane 것으로 판명된**(`evicted`) 관측치는 몇 %든 발화하지
+않습니다.
+
 ### 5.6 컨텍스트 사이클·복구
 
 ```bash
@@ -297,6 +335,14 @@ cys reinject --role worker [--check]   # 디렉티브 재주입 (--check: 드리
 
 에이전트 사망은 즉시 감지되어 `agent.exited/recovered` 이벤트가 흐르고, 옵션으로 자동
 재기동(`CYS_AGENT_AUTORESTART=1`, 3회 상한·인증 오류 시 차단)이 가능합니다.
+
+**`cycle-agent --force-no-verify`의 의미가 바뀌었습니다.** 예전에는 "검증할 파일 목록이
+비었을 때 그래도 진행"이라는 뜻이었는데, 목록이 비는 경우가 없어지면서 아무 일도 하지 않는
+죽은 플래그가 돼 있었습니다. 지금은 **저장 검증 대기 자체를 건너뜁니다** — 저장 지시는
+그대로 주입하되(지시조차 안 하면 저장할 기회가 사라집니다) 파일이 갱신되기를 기다리지 않고
+다음 단계로 넘어갑니다. 대상이 멈춰(hang) 저장을 못 하는 상황에서 30분 타임아웃을 기다리지
+않고 빠져나오는 **비상 탈출구**이며, 대신 **저장되지 않은 채로 clear될 수 있습니다**.
+평시 사용은 금지이고, 검증자 handshake 단계는 이 플래그와 무관하게 그대로 적용됩니다.
 
 ### 5.7 역할별 TODO 경로 · 팩 경로 판정
 
@@ -401,6 +447,24 @@ pause 상태는 재부팅에도 유지됩니다.
   판단은 그 노드 몫). 응답의 `delivered`가 false면 `reason`(`gate_blocked`·`human_typing`·
   `cooldown`·`channel_full`)이 함께 옵니다. **자동 재통지는 없습니다** — 쿨다운(60초)
   경과 후 직접 재발행하세요.
+
+**큐 우회 적체 통지(OOB)는 '대상 1명당 한 통'의 다이제스트로 나갑니다.** 적체가 심하면
+(depth가 경보 임계의 3배 또는 에이전트 소프트캡 도달) 데몬은 이벤트만 흘리는 데 그치지 않고
+큐를 **우회해** 대상 노드와 지휘 역할(`master`·`cso`·`dept-master`)의 화면에 직접 통지를
+꽂습니다. `dept-master`가 목록에 있는 이유는 부서 데몬에는 `master` 역할 자체가 없어서,
+두 역할만 찾으면 부서 안에서는 통지 대상이 **아무도 없게** 되기 때문입니다. 종전에는 이
+통지가 **적체된 노드마다 따로** 나갔습니다 — 통지 중복 억제 키에 적체 노드 번호가 들어 있어서,
+막힌 노드가 N개면 한 사람이 같은 시간대에 최대 N회를 맞았습니다.
+
+지금은 그 틱에 적체 판정된 **모든 노드를 한 통에 담은 다이제스트**가 대상 1명당
+**최소 간격**(기본 300초 · `CYS_OOB_GLOBAL_MIN_SECS`)으로 들어갑니다. 즉 어느 노드가
+원인이든 한 창에 **통지 1건**이고, 그 1건 안에 적체 노드 전 목록이 들어 있어 **정보가
+사라지지 않습니다**. `queue.depth_high`·`queue.expired` 이벤트는 그대로 흐르고, 만기 전문은
+`dead-letters.jsonl` 원장에, 현재 적체는 `cys queue list`에 그대로 있습니다(이쪽이
+진실원입니다). TTL 만기 요약은 종전대로 노드별 키(30분 쿨다운)로 나가고, 사람이 직접 친
+`request-clear`는 별도 레인(60초 쿨다운)이라 다이제스트 주기에 삼켜지지 않습니다.
+`CYS_OOB_GLOBAL_MIN_SECS=0`은 쿨다운 해제입니다 — 적체가 지속되면 틱(5초)마다 다이제스트가
+들어가므로 평시에는 권하지 않습니다.
 
 ---
 
@@ -690,8 +754,11 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보 |
 | `CYS_QUEUE_AGENT_SOFTCAP` | 25 (0=off) | 대상 큐 안의 **Agent 발신 항목 수** 상한. System·Human 발신은 면제 |
-| `CYS_QUEUE_POLICY_MODE` | `log` | 소프트캡 도달 시 동작. `log`=이벤트만(적재 허용) · `enforce`=거부+dead-letter 기록 |
-| `CYS_QUEUE_TTL_SECS` | 3600 (0=off) | 큐 항목 만기. 만기분은 **폐기가 아니라** dead-letters.jsonl 로 이관(전문 보존) |
+| `CYS_QUEUE_POLICY_MODE` | `enforce` | 소프트캡 도달 시 동작. 기본은 **거부+dead-letter 기록**이며, `log`(=이벤트만·적재 허용)는 명시해야 켜지는 관찰·롤백 모드입니다 |
+| `CYS_QUEUE_TTL_SECS` | 3600 (0=off) | 큐 항목 만기(Agent 발신 기준). 만기분은 **폐기가 아니라** dead-letters.jsonl 로 이관(전문 보존). 0이면 등급 무관 전면 비활성 |
+| `CYS_QUEUE_SYSTEM_TTL_SECS` | 14400=4h (0=off) | System 발신(스케줄러·거버넌스 제어 메시지) 만기 — 제어 메시지라 Agent(1h)보다 길게 잡되 무한 누적은 막습니다. 사람이 GUI에서 큐잉한 항목(`gui` 라벨)은 아래 전용 등급을 받고, `--important`는 면제. `CYS_QUEUE_TTL_SECS=0`이면 이 값과 무관하게 전면 비활성 |
+| `CYS_QUEUE_GUI_TTL_SECS` | 86400=24h (0=면제) | 사람이 GUI에서 큐잉한 항목(`gui` 라벨) 전용 만기 — System(4h)보다 훨씬 길지만 **무기한은 아닙니다**. `gui` 표시는 보내는 쪽 자기신고라, 무기한이면 사람이 아닌 프로그램이 그것을 흉내 내 만기를 영구 회피할 수 있었습니다. `CYS_QUEUE_TTL_SECS=0`이면 이 값과 무관하게 전면 비활성 |
+| `CYS_OOB_GLOBAL_MIN_SECS` | 300 (0=쿨다운 해제) | 큐 우회 적체 통지(OOB) **다이제스트**의 대상 1명당 최소 간격 — 적체 노드가 여럿이어도 한 통에 전 목록을 담아 1건만 들어갑니다(무손실). 0이면 적체 지속 시 틱(5초)마다 주입되므로 평시 비권장. TTL 만기 요약(노드별 30분)·`request-clear`(60초)는 별도 레인 |
 | `CYS_FEED_REMIND_SECS` | 300 (0=off) | 승인 적체 재알림 |
 | `CYS_MASTER_DEADMAN_SECS` | 900 (0=off) | 오케스트레이터 무반응 감지 |
 | `CYS_AGENT_AUTORESTART` | 0 | 죽은 에이전트 자동 재기동 (3회 상한) |
@@ -798,7 +865,7 @@ surface.created/exited/crashed/closed/reaped/zombie_reaped/close_denied/quiescin
 agent.exited/recovered/restart_blocked/exit_unrecoverable
 watchdog.load_high/proc_count_high/duplicate_procs/tick_panic   pane.idle
 queue.enqueued/delivered/dropped/depth_high/clear_denied
-queue.rejected/expired/merged/oob_notified   health.dead_letter_write_failed
+queue.rejected/expired/merged/merge_demoted/oob_notified   health.dead_letter_write_failed
 health.queue_wal_corrupt
 ledger.registered/killed
 feed.item.created/resolved/aging/timeout   feed.backlog_high

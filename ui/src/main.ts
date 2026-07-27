@@ -20,6 +20,12 @@ import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { isDeadAgentPane, deadAgentHeaderText } from "./deadagent";
+import {
+  contextThresholdTitle,
+  contextThresholdBody,
+  shouldOsBanner as ctxShouldOsBanner,
+  type ContextThresholdPayload,
+} from "./ctxthreshold";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
@@ -5580,9 +5586,14 @@ function onDaemonEvent(event: Record<string, unknown>) {
     return;
   }
   if (name === "context.threshold") {
-    toast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
-    if (Number(payload.context_pct ?? 0) >= 80)
-      osBanner(`🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
+    // R-6: payload.source 가 `observed-uncertain`(귀속 불확실 · usage.rs C1 고위험 폴백)이면
+    // 문구에 "(귀속 불확실 — pane 확인 필요)"를 병기해 확신 어조와 구별한다. 판정·문구 조립은
+    // ctxthreshold.ts 순수 함수(회귀 테스트 ctxthreshold.test.ts) — 알림 자체는 종전대로 올린다.
+    const ctxPayload = payload as ContextThresholdPayload;
+    const ctxTitle = contextThresholdTitle(ctxPayload);
+    const ctxBody = contextThresholdBody(ctxPayload);
+    toast("threshold", ctxTitle, ctxBody);
+    if (ctxShouldOsBanner(ctxPayload)) osBanner(ctxTitle, ctxBody); // B4 OS 배너(≥80만)
     refreshSidebarStatus();
     return;
   }

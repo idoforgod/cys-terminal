@@ -7,7 +7,7 @@ use chrono::{Datelike, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -640,13 +640,12 @@ async fn run_text_command(cmd: &str) -> Result<String, String> {
     // R-CLI-4: 무게이트 셸 실행 차단 — built-in 신뢰 또는 서명 승인만 통과.
     text_command_allowed(cmd)?;
     // RC-11: OS별 셸 — Windows는 sh 부재라 heartbeat/report text_command job이 전부 실패했다.
-    // fire_command와 동일하게 command_shell()((cmd,/C) on windows) 사용으로 통일.
+    // fire_command와 동일하게 command_shell()(win=동봉 bash·미탐지 시 cmd) 사용으로 통일.
     let (sh, flag) = command_shell();
-    let fut = tokio::process::Command::new(sh)
-        .arg(flag)
-        .arg(cmd)
-        .hide_console()
-        .output();
+    let mut c = tokio::process::Command::new(sh);
+    c.arg(flag).arg(cmd).hide_console();
+    apply_spawn_env(&mut c); // 동봉 runtime PATH·HOME — 데몬 PATH 로는 python3/printf 미발견
+    let fut = c.output();
     let out = match tokio::time::timeout(Duration::from_secs(30), fut).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(format!("text_command spawn 실패: {e}")),
@@ -813,17 +812,90 @@ fn aiterm_parse(s: &str) -> Option<u64> {
     cys::parse_surface_ref(s)
 }
 
-/// 플랫폼별 셸 호출자 (program, flag). Windows에는 `sh`가 PATH에 없어
-/// 발화가 ErrorKind::NotFound로 즉시 실패하므로 cmd.exe로 분기한다.
-/// 데몬의 default_shell/create_surface와 동일한 cfg(windows) 비대칭 해소.
-fn command_shell() -> (&'static str, &'static str) {
+/// 후보 디렉토리에서 동봉 `bash.exe` 절대경로를 찾는다(순수 — 회귀 핀·OS 무관 컴파일).
+/// 첫 실재 파일이 승자(후보 순서 = 우선순위). 없으면 None.
+#[cfg(any(windows, test))]
+fn resolve_bash_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.into_iter()
+        .map(|d| d.join("bash.exe"))
+        .find(|c| c.is_file())
+}
+
+/// Windows 동봉 bash 후보 디렉토리(우선순위 순). runtime_bin_dirs(실재 디렉토리만)가 SOT이고,
+/// PortableGit 의 `bash.exe` 정규 위치(`runtime/git/bin`)를 보수적으로 덧댄다 — runtime_bin_dirs 는
+/// PATH 주입용이라 git/bin 을 싣지 않는데(그 자리엔 sh·bash 뿐), 셸 탐지는 그 디렉토리가 본진이다.
+#[cfg(windows)]
+fn windows_bash_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = cys::runtime_bin_dirs(exe_dir);
+    dirs.push(exe_dir.join("runtime").join("git").join("bin"));
+    dirs
+}
+
+/// 플랫폼별 셸 호출자 (program, flag).
+/// Windows: **동봉 Git Bash 우선**(2026-07-27 hotfix). 데몬 built-in 잡 페이로드는 전부 POSIX
+///   문법(`${VAR:-...}` 전개·`;` 연쇄·printf/tail 파이프)이라 cmd.exe 로는 파싱조차 되지 않아
+///   윈도우 전원에서 주기 잡 6종이 통째로 불능이었다. 동봉 PortableGit 의 bash.exe 를 찾으면
+///   (절대경로, "-c")로 승격하고, 미탐지(비동봉 설치)일 때만 종전 cmd 폴백을 유지한다.
+///   탐지는 프로세스 1회만(OnceLock) — 매 발화 파일시스템 조회를 피한다.
+/// unix: 종전 그대로 ("sh","-c") — 무변경.
+fn command_shell() -> (String, &'static str) {
     #[cfg(windows)]
     {
-        ("cmd", "/C")
+        static BASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let found = BASH.get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .and_then(|d| resolve_bash_in(windows_bash_candidates(&d)))
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        match found {
+            Some(bash) => (bash.clone(), "-c"),
+            None => ("cmd".to_string(), "/C"),
+        }
     }
     #[cfg(not(windows))]
     {
-        ("sh", "-c")
+        ("sh".to_string(), "-c")
+    }
+}
+
+/// 스케줄 발화 자식에 얹을 env 주입 쌍(순수 — 회귀 핀·OS 무관 컴파일).
+/// ① PATH: 동봉 runtime 선두 주입. 데몬은 GUI(Explorer/Finder) 기동이라 PATH 가 빈곤해
+///    python3·printf·tail 을 못 찾는다 — office-bridge/auto-restore 와 **동일 SOT**
+///    (`cys::runtime_prefixed_path`)를 재사용한다(중복 구현 금지). 무변경이면 쌍 없음.
+/// ② HOME: Windows 의 `bash -c` 는 비로그인 셸이라 HOME 이 없으면 잡 페이로드의
+///    `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로 붕괴한다 → 미설정일 때만
+///    USERPROFILE 로 채운다. HOME 이 이미 있으면 무접촉(unix 는 항상 이 경로 → 무변경).
+fn spawn_env_pairs(
+    exe_dir: &Path,
+    current_path: &str,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
+        env.push(("PATH".to_string(), newp));
+    }
+    if home.map(|h| h.is_empty()).unwrap_or(true) {
+        if let Some(up) = userprofile.filter(|u| !u.is_empty()) {
+            env.push(("HOME".to_string(), up.to_string()));
+        }
+    }
+    env
+}
+
+/// spawn_env_pairs 를 현재 프로세스 env 로 계산해 명령에 적용한다(run_text_command·fire_command 공용).
+fn apply_spawn_env(cmd: &mut tokio::process::Command) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("HOME").ok();
+    let userprofile = std::env::var("USERPROFILE").ok();
+    for (k, v) in spawn_env_pairs(&exe_dir, &path, home.as_deref(), userprofile.as_deref()) {
+        cmd.env(k, v);
     }
 }
 
@@ -833,17 +905,13 @@ async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String>
         .as_deref()
         .ok_or("command job missing 'command'")?;
     let (shell, flag) = command_shell();
-    let out = tokio::time::timeout(
-        Duration::from_secs(600),
-        tokio::process::Command::new(shell)
-            .arg(flag)
-            .arg(command)
-            .hide_console()
-            .output(),
-    )
-    .await
-    .map_err(|_| "command timed out (600s)".to_string())?
-    .map_err(|e| e.to_string())?;
+    let mut c = tokio::process::Command::new(shell);
+    c.arg(flag).arg(command).hide_console();
+    apply_spawn_env(&mut c); // run_text_command 와 동일 — 동봉 runtime PATH·HOME 주입
+    let out = tokio::time::timeout(Duration::from_secs(600), c.output())
+        .await
+        .map_err(|_| "command timed out (600s)".to_string())?
+        .map_err(|e| e.to_string())?;
     daemon.bus.publish(
         "schedule.command_done",
         "schedule",
@@ -851,6 +919,24 @@ async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String>
         json!({"job_id": job.id, "exit": out.status.code(),
                "stdout_tail": String::from_utf8_lossy(&out.stdout).chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()}),
     );
+    // 실패 표면화: 종전엔 exit≠0 도 Ok 로 삼켜 schedule.fired 가 나갔다 — 편성 ensure 같은 잡이
+    // 매 10분 실패해도 이벤트만 보면 '발화 성공'으로 읽혔다(무음 고장). run_text_command 와 같은
+    // 형태로 Err 를 돌려 fire()가 schedule.error(job_id·exit·stderr 꼬리)를 발행하게 한다.
+    // command_done 은 그대로 유지(exit·stdout 관측자 무회귀). 성공(exit 0) 경로는 무변경.
+    if !out.status.success() {
+        return Err(format!(
+            "command 비정상 종료({:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .rev()
+                .take(200)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        ));
+    }
     Ok(format!("command exit={:?}", out.status.code()))
 }
 
@@ -1391,14 +1477,139 @@ mod tests {
         let (shell, flag) = command_shell();
         #[cfg(windows)]
         {
-            assert_eq!(shell, "cmd");
-            assert_eq!(flag, "/C");
+            // 동봉 bash 탐지 시 (절대경로,-c) · 미탐지 시에만 (cmd,/C) 폴백.
+            if flag == "-c" {
+                assert!(
+                    shell.to_ascii_lowercase().ends_with("bash.exe"),
+                    "-c 플래그는 bash 승격 경로에서만 나온다 — got: {shell}"
+                );
+            } else {
+                assert_eq!(shell, "cmd");
+                assert_eq!(flag, "/C");
+            }
         }
         #[cfg(not(windows))]
         {
             assert_eq!(shell, "sh");
             assert_eq!(flag, "-c");
         }
+    }
+
+    /// ★A1 핀(2026-07-27 hotfix): Windows 셸 선택의 순수 코어 — 동봉 bash.exe 가 있으면 그 절대경로를
+    /// 고르고(후보 순서 우선), 없으면 None(→ command_shell 이 cmd 폴백). 파일시스템만 보는 순수
+    /// 함수라 어느 OS 에서도 결정론으로 검증된다(윈도우 실기 없이 결함 재발을 잡는 유일한 핀).
+    #[test]
+    fn resolve_bash_picks_bundled_and_falls_back_when_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-sched-bash-{}-{}",
+            std::process::id(),
+            now_epoch().to_bits()
+        ));
+        let miss = root.join("git").join("cmd"); // bash.exe 없는 후보
+        let hit = root.join("git").join("bin"); // PortableGit 본진
+        let hit2 = root.join("git").join("usr").join("bin");
+        for d in [&miss, &hit, &hit2] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // 부재: 후보가 전부 비면 폴백(None)이어야 한다 — 없는 bash 를 강제 선택하면 전 잡이 spawn 실패.
+        assert_eq!(
+            resolve_bash_in(vec![miss.clone(), hit.clone()]),
+            None,
+            "bash.exe 부재 후보만 있으면 None(cmd 폴백)"
+        );
+        std::fs::write(hit.join("bash.exe"), b"stub").unwrap();
+        std::fs::write(hit2.join("bash.exe"), b"stub").unwrap();
+        assert_eq!(
+            resolve_bash_in(vec![miss.clone(), hit.clone(), hit2.clone()]),
+            Some(hit.join("bash.exe")),
+            "실재하는 첫 후보를 절대경로로 선택(후보 순서 = 우선순위)"
+        );
+        // 빈 후보 목록(runtime 비동봉 설치)도 안전하게 None.
+        assert_eq!(resolve_bash_in(Vec::new()), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★A2 핀: 스케줄 발화 자식 env — 동봉 runtime PATH 선두 주입 + (Windows bash 비로그인 셸용)
+    /// HOME 보정. 종전엔 둘 다 없어 데몬 PATH 로는 python3/printf 를 못 찾고 `${HOME}` 도 붕괴했다.
+    #[test]
+    fn spawn_env_injects_runtime_path_and_backfills_home() {
+        let exe_dir = std::env::temp_dir().join(format!(
+            "cys-sched-env-{}-{}",
+            std::process::id(),
+            now_epoch().to_bits()
+        ));
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/me"), None);
+        let path = pairs
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("PATH 주입 쌍이 있어야 한다(office-bridge·auto-restore 동일 SOT)");
+        assert!(
+            path.starts_with(&exe_dir.to_string_lossy().to_string()),
+            "동봉 바이너리 폴더가 PATH 선두여야 한다 — got: {path}"
+        );
+        assert!(path.contains("/usr/bin"), "기존 PATH 는 보존돼야 한다 — got: {path}");
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "HOME"),
+            "HOME 이 이미 있으면 무접촉(unix 무변경 보장)"
+        );
+        // HOME 부재(Windows bash -c 비로그인 셸) → USERPROFILE 로 보정.
+        let win = spawn_env_pairs(&exe_dir, "/usr/bin", None, Some("C:\\Users\\me"));
+        assert_eq!(
+            win.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str()),
+            Some("C:\\Users\\me"),
+            "HOME 미설정이면 ${{HOME}} 전개가 붕괴한다 — USERPROFILE 로 채워야 한다"
+        );
+        // 빈 문자열 USERPROFILE 은 보정 근거가 못 된다(빈 HOME 을 심으면 경로가 더 나빠진다).
+        let neither = spawn_env_pairs(&exe_dir, "/usr/bin", None, Some(""));
+        assert!(!neither.iter().any(|(k, _)| k == "HOME"));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// ★A3 핀: command 잡이 exit≠0 로 끝나면 command_done **에 더해** schedule.error 가 발행돼야 한다.
+    /// 종전엔 Ok 로 삼켜 schedule.fired 만 나갔다 — 편성 ensure 가 매 10분 실패해도 이벤트상 '성공'
+    /// 이라 무음 고장이었다(윈도우 잡 6종 전멸을 이벤트로는 볼 수 없던 이유).
+    #[tokio::test(flavor = "current_thread")]
+    async fn failing_command_job_publishes_schedule_error() {
+        let daemon = test_daemon();
+        let mut j = job(None, &[]);
+        j.id = "failing-cmd".into();
+        j.action = "command".into();
+        j.command = Some("exit 3".into());
+        fire(Arc::clone(&daemon), j).await;
+        let events = daemon.bus.replay_after(0);
+        let named = |n: &str| {
+            events
+                .iter()
+                .find(|e| e["name"].as_str() == Some(n))
+                .cloned()
+        };
+        let done = named("schedule.command_done").expect("command_done 은 종전대로 발행(무회귀)");
+        assert_eq!(done["payload"]["exit"].as_i64(), Some(3));
+        let err = named("schedule.error").expect("exit≠0 은 schedule.error 로 표면화돼야 한다");
+        assert_eq!(err["payload"]["job_id"].as_str(), Some("failing-cmd"));
+        let msg = err["payload"]["error"].as_str().unwrap_or("");
+        assert!(msg.contains('3'), "에러에 exit code 가 실려야 한다 — got: {msg}");
+        assert!(
+            named("schedule.fired").is_none(),
+            "실패 발화가 fired 로도 보고되면 모니터링이 모순된다"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_command_job_still_reports_fired() {
+        // 대칭 확인(성공 경로 무변경): exit 0 은 command_done + fired, error 없음.
+        let daemon = test_daemon();
+        let mut j = job(None, &[]);
+        j.id = "ok-cmd".into();
+        j.action = "command".into();
+        j.command = Some("exit 0".into());
+        fire(Arc::clone(&daemon), j).await;
+        let events = daemon.bus.replay_after(0);
+        let has = |n: &str| events.iter().any(|e| e["name"].as_str() == Some(n));
+        assert!(has("schedule.command_done") && has("schedule.fired"));
+        assert!(!has("schedule.error"), "성공 경로에 error 가 새로 생기면 회귀다");
     }
 
     #[test]

@@ -53,8 +53,11 @@ impl QueueItemKind {
 
 /// 발신 출처 3분류(D2). 자기신고 `from`이 아니라 **커널 검증된** 발신 surface에서 파생한다.
 /// - `Agent`: verified 발신 surface가 launch-agent 등록(agent_meta 보유) — 정책(softcap·TTL) 대상.
-/// - `Human`: GUI 사람 입력 경로 — 정책 미적용.
-/// - `System`: 데몬 내부·익명(조상추적 미해소) — 정책 미적용.
+/// - `Human`: **WAL v1/v2 역호환 전용** variant — 신규 생성 경로가 없다(D2 "self-report 불신"
+///   이후 자기신고 `human` 은 분류를 바꾸지 못한다). 실사람 GUI 큐잉은 `System` 라벨 `"gui"` 로
+///   들어오고 **GUI 전용 TTL 등급(기본 24h)**을 받는다(`effective_ttl` 참조) — 이 variant 의
+///   무기한 면제는 유산 항목용이며, 신규 경로가 없으므로 누적 위험이 없다.
+/// - `System`: 데몬 내부·익명(조상추적 미해소)·GUI. 소프트캡은 면제, TTL 은 등급 분리 적용.
 ///
 /// ※ 설계 D2의 `Agent{surface,role}`에서 role을 `Option<String>`으로 둔다: agent_meta는 있는데
 ///    role 미등록인 pane이 실재하므로(claim_role 전) 빈 문자열로 뭉개면 "role 없음"과 구별이 사라진다.
@@ -71,6 +74,35 @@ pub enum QueueOrigin {
         #[serde(default)]
         label: String,
     },
+}
+
+/// GUI(사람) 큐잉을 세분화하는 System 라벨. **GUI 전용 TTL 등급의 유일한 근거 값**이므로
+/// 라벨을 붙이는 쪽(handlers)과 등급을 판정하는 쪽(`is_expired`)이 같은 상수를 본다 —
+/// 문자열을 양쪽에 따로 박으면 한쪽 오타가 사람 입력을 System(4h) 등급으로 떨어뜨린다.
+pub const SYSTEM_LABEL_GUI: &str = "gui";
+
+/// 등급별 큐 TTL(초) 묶음 — Agent·System·GUI 3등급. 각 값 `0` = **그 등급은 만기 대상 아님**.
+///
+/// ★E4 재수정(0.13.21 최종 재검증): 종전 GUI 는 **무기한 면제**였다. 그런데 그 면제의 근거인
+/// `gui` 라벨은 클라이언트 자기신고(`human:true`)에 걸려 있어, pane 밖 detach 프로세스가
+/// `human:true` 한 줄로 **무기한 TTL 을 위조 획득**할 수 있었다(D2 "self-report 불신"이 정책
+/// 등급에서는 지켜졌는데 TTL 등급에서 다시 뚫린 형태다). 면제를 철회하고 **유계 장주기
+/// 등급(기본 24h)**으로 바꾸면 위조의 이득이 사라진다 — 얻는 것이 "무기한"이 아니라
+/// "24h"뿐이면 위조할 값어치가 없다. 사람 입력의 보호는 여전히 성립한다: 24h 는 사람이 하루
+/// 안에 돌아오는 실사용 창을 덮고, 만기는 폐기가 아니라 원장 이관 + OOB 통지다(소실 아님).
+///
+/// 세 값을 **한 묶음으로 넘기는** 이유: 등급 분기가 `QueueItem::effective_ttl` 한 곳에만
+/// 존재하도록 강제하기 위함이다. 종전에는 sweep(governance)과 병합 유예 계산(queue_policy)이
+/// 각자 `match origin` 을 들고 있어, 한쪽만 고치면 "만기 판정"과 "만기까지 남은 시간"이 서로
+/// 다른 등급표를 보는 결함이 열려 있었다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueueTtls {
+    /// Agent 발신(`CYS_QUEUE_TTL_SECS` · 기본 1h).
+    pub agent: f64,
+    /// System 발신 — GUI 제외(`CYS_QUEUE_SYSTEM_TTL_SECS` · 기본 4h).
+    pub system: f64,
+    /// 사람의 GUI 큐잉(`CYS_QUEUE_GUI_TTL_SECS` · 기본 24h · 0=면제).
+    pub gui: f64,
 }
 
 impl QueueOrigin {
@@ -168,12 +200,52 @@ impl QueueItem {
     pub fn bytes(&self) -> usize {
         self.text.len()
     }
-    /// TTL 만기 후보인가 — Agent origin이고 important 미보유이며 ttl 경과.
-    pub fn is_expired(&self, now: f64, ttl_secs: f64) -> bool {
-        ttl_secs > 0.0
-            && self.origin.is_agent()
-            && !self.important
-            && (now - self.enqueued_at) > ttl_secs
+    /// 이 항목에 **실제로 걸리는 TTL(초)**. `0` = 만기 대상 아님(면제·해당 등급 비활성).
+    ///
+    /// 등급 분기의 **유일한 정본**이다 — 만기 판정(`is_expired`)도, "만기까지 얼마 남았나"를
+    /// 묻는 병합 유예 계산(`queue_policy`)도 이 함수 하나만 본다. 두 곳에 `match origin` 을
+    /// 두면 한쪽만 고쳤을 때 만기 시점과 잔여 수명이 서로 다른 등급표를 보게 된다.
+    ///
+    /// ★B5(0.13.21): System origin 에 **별도의 긴 TTL** 이 생겼다. 종전에는 Agent 만 만기
+    /// 대상이라 System 발신(스케줄러·거버넌스 제어 메시지)은 배달이 봉쇄된 pane 앞에서
+    /// **무한 누적**됐다(라이브 원장 1h+ 실증). 제어 메시지는 성급한 이관이 더 해로우므로
+    /// Agent 보다 길게 잡되, 상한 자체가 없는 상태는 유지하지 않는다.
+    ///
+    /// ★E4(적대 리뷰 REVISE-5/6): 실사람의 GUI 큐잉은 `Human` 이 아니라
+    /// `System{label:"gui"}` 로 들어온다(D2 이후 자기신고 `human` 은 분류를 못 바꾼다).
+    /// B5 가 System 전체에 4h 를 걸면서 정작 보호 대상인 사람 입력이 제어 메시지와 같은
+    /// 등급을 받았으므로, 라벨로 갈라 **자기 등급**을 준다.
+    ///
+    /// ★E4 재수정(최종 재검증): 그 GUI 등급을 **무기한 면제로 두지는 않는다**. 라벨은
+    /// 클라이언트 자기신고(`human:true`)로 붙으므로, 면제였을 때는 detach 프로세스가
+    /// 한 줄로 무기한 TTL 을 위조 획득했다. 기본 24h(`CYS_QUEUE_GUI_TTL_SECS`)의 **유계
+    /// 장주기 등급**으로 바꾸면 위조 이득이 사라지고(얻는 게 24h 뿐), 사람 입력 보호는
+    /// 그대로다 — 24h 는 사람이 하루 안에 돌아오는 창을 덮고, 만기는 폐기가 아니라 원장
+    /// 이관 + OOB 통지다. 진짜 무기한이 필요하면 `--important`(발신자 의도 선언) 또는
+    /// `CYS_QUEUE_GUI_TTL_SECS=0`(운영자 선언)이라는 **명시 경로**가 있다.
+    ///
+    /// `Human` 은 여전히 무기한 면제다 — WAL v1/v2 역호환 전용 variant 라 신규 생성 경로가
+    /// 없고(누적 위험 없음), 위조로 얻을 수 있는 분류도 아니다.
+    pub fn effective_ttl(&self, ttls: QueueTtls) -> f64 {
+        if self.important {
+            return 0.0;
+        }
+        let ttl = match &self.origin {
+            QueueOrigin::Agent { .. } => ttls.agent,
+            QueueOrigin::System { label } if label == SYSTEM_LABEL_GUI => ttls.gui,
+            QueueOrigin::System { .. } => ttls.system,
+            QueueOrigin::Human => 0.0,
+        };
+        ttl.max(0.0)
+    }
+
+    /// TTL 만기 후보인가 — origin 등급별 TTL(`effective_ttl`)을 적용한다.
+    ///
+    /// 판정을 여기(항목 자신)에 둔 이유: sweep 쪽에 label 분기를 두면 이 함수를 부르는
+    /// 다른 호출자(테스트·미래 경로)가 같은 등급표를 못 보고 계약이 두 곳으로 갈린다.
+    pub fn is_expired(&self, now: f64, ttls: QueueTtls) -> bool {
+        let ttl = self.effective_ttl(ttls);
+        ttl > 0.0 && (now - self.enqueued_at) > ttl
     }
 }
 
@@ -1004,6 +1076,14 @@ pub struct Daemon {
     /// watchdog 태스크 로컬이 아니라 Daemon에 두는 이유: ①watchdog 재시작으로 리셋되면
     /// 중복 통지가 난다 ②request_clear 등 RPC 경로도 같은 쿨다운을 공유해야 한다.
     pub oob_cooldowns: Mutex<HashMap<(u64, String), f64>>,
+    /// ★B4(0.13.21) 재기동 생존 쿨다운: (role, dedup_key 계열) → 마지막 주입 시각(epoch).
+    /// 위 `oob_cooldowns` 는 surface_id 키라 **데몬 재기동을 넘지 못한다** — 큐는 WAL 로 살아나
+    /// depth 가 즉시 복원되는데 쿨다운만 빈 맵이라, 재기동마다 미해소 조건 전체가 재통지
+    /// 버스트로 터졌다. surface_id 는 재기동 시 소멸하므로(재사용 없음) 큐 WAL 과 **같은 앵커**
+    /// 인 role 로 영속한다. 계열 = dedup_key 의 `:` 앞부분(`ttl_expired:12` → `ttl_expired`;
+    /// 적체 다이제스트처럼 sid 를 안 박는 키는 그 자체가 계열이다).
+    /// 손상·부재는 빈 맵 폴백(fail-open — 버스트 1회를 감수하고 통지를 막지 않는다).
+    pub restored_oob_cooldowns: Mutex<HashMap<(String, String), f64>>,
     /// C2-b 발신 통계: 발신 surface id → (총 큐 발신, 무키 발신, 거부). Agent-origin만 센다.
     /// 재시작 리셋 허용(관찰 창 내 상대 비교 — 영속화는 비목표).
     pub queue_send_stats: Mutex<HashMap<u64, crate::queue_policy::QueueSendStats>>,
@@ -1647,6 +1727,8 @@ impl Daemon {
             restored_queue: Mutex::new(queue_wal_entries),
             dead_letter_lock: Mutex::new(()),
             oob_cooldowns: Mutex::new(HashMap::new()),
+            // ★B4: 재기동 직후 통지 버스트 억제 — 디스크 원장에서 role 앵커 쿨다운을 되살린다.
+            restored_oob_cooldowns: Mutex::new(crate::governance::load_oob_cooldowns(&dir)),
             queue_send_stats: Mutex::new(HashMap::new()),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),

@@ -105,6 +105,11 @@
   Return만 가드에 막혔으면 `cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다.
   대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시 해당
   노드를 read-screen으로 점검하라.
+  **큐 정책 기본값은 `enforce`다**: 한 대상 큐의 Agent 발신이 소프트캡(기본 25건)에 닿으면
+  이후 발신은 **결정론으로 거부**되고(`queue_softcap_exceeded`) 전문은 dead-letter 원장에
+  기록된다. 거부는 **종결이지 실패가 아니다** — 재전송하면 혼잡만 키우고 원장을 오염시킨다.
+  관찰만 하는 `log` 모드(적재 허용·이벤트만)는 `CYS_QUEUE_POLICY_MODE=log`로 **명시해야**
+  켜지는 롤백 스위치다.
 - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
   워커에게 task를 위임하는 프롬프트는 반드시
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
@@ -144,13 +149,29 @@
 push는 **보조 신호**다. push만 기다리며 능동 점검을 게을리하면 시스템 전체에
 치명적 에러가 쌓인다 — push 수신과 능동 점검을 **반드시 병행**한다.
 - 기본 수신: `cys events` 구독으로 `feed.*`·`health.alert`·`watchdog.*`·`pane.idle`·
-  `context.threshold`·`queue.depth_high`를 받는다(depth_high 수신 시 §2 배달 규칙의 대응 —
-  해당 노드 read-screen 점검).
+  `context.threshold`·`queue.depth_high`·`queue.rejected`·`queue.expired`를 받는다
+  (depth_high 수신 시 §2 배달 규칙의 대응 — 해당 노드 read-screen 점검).
+  - `queue.rejected` = 대상 큐의 **Agent 발신 소프트캡 초과분 거부**(기본 25건). 큐 정책
+    기본값이 `enforce`라 관찰이 아니라 **실제 거부**이며, 거부된 전문은 데몬이 dead-letter
+    원장에 즉시 기록한다. 대응: ①발신 노드의 정체 확인(누가 폭주 중인가) ②dead-letter 원장
+    열람으로 거부 전문 회수 ③배달 막힘이면 대상 pane 점검·해소, 발신 폭주면 그 노드에 경고
+    ④안 풀리면 대상에 `request-clear` 요청. **거부는 실패가 아니라 종결이다 — 같은 메시지를
+    대신 재전송하지 마라**(혼잡 증폭·원장 오염).
+  - `queue.expired` = 큐 항목 TTL 만기 — **폐기가 아니라 dead-letter 원장으로 이관**이다
+    (Agent 기본 1h·System 기본 4h·`--important`는 면제). 대응: 원장을 확인해 **지금도 유효한
+    건만** 골라 재처리하고, 발신자에게 재전송을 요구하지 않는다(전문이 보존돼 있어 중복이다).
+    만기 다발은 그 노드가 오래 막혀 있었다는 신호이므로 배달 막힘 원인을 함께 점검한다.
 - **주기적 능동 점검(강제)**: 라운드마다·주기적으로 `cys status`(전 노드 1콜 스냅샷) +
   필요 시 `read-screen`으로 **전 노드를 일괄 점검**한다. push가 없다고 점검을 건너뛰지 않는다.
 - **idle/멈춤 즉시 조치**: `pane.idle`(기본 5분·`CYS_IDLE_SECONDS`)이 오거나 점검에서
   멈춘 노드를 발견하면 `read-screen`으로 확인→회수→재지시한다. 방치 금지.
 - `context.threshold`(노드 컨텍스트 60% 도달 — 데몬이 결정론으로 발화)가 오면 §11 사이클을 집행한다.
+  **★집행 전 `payload.source`를 본다**: `self-report`·`observed`·`statusline`은 귀속이 확실하니
+  그대로 집행한다. **`observed-uncertain`(귀속 불확실 — 훅·statusline이 함께 죽어 데몬이 85%+
+  고위험에서 어쩔 수 없이 발화한 관측)이면 cycle-agent 집행 전에 `cys read-screen --surface
+  <payload.surface_ref>`로 그 pane이 정말 고컨텍스트 주체인지 실측 확인**한다. 오귀속이 의심되면
+  순환시키지 말고, 대상 노드에 "지금 컨텍스트 몇 %인지 `cys set-status --context`로 자기보고하라"는
+  push로 대체한다 — 엉뚱한 pane을 `/clear`하면 그 pane의 작업이 전소된다.
 - **'보고 보류' ≠ '모니터링 중단'**: 오너에게 보고할 것이 없어도 점검은 계속한다.
 - **라운드 사이클 의무 단계**: 모든 작업 라운드에 'master 주기 점검'(전 노드 status + idle +
   feed + context 확인)을 1단계로 포함한다.

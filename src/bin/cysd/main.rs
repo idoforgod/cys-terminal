@@ -3712,14 +3712,42 @@ mod auto_restore_tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
+    /// ★E7(적대 리뷰 REVISE-9): `CYS_PHOENIX_EXTRACT_FAIL` 은 **프로세스 전역 env** 인
+    /// fault-주입 seam 이다. 이 seam 을 쓰는 테스트와 정상 추출을 기대하는 테스트가 병렬로
+    /// 돌면, 한쪽의 set_var 창에 다른 쪽 추출이 걸려 간헐 실패(flaky)가 난다 — 락은 env 만큼
+    /// 전역이어야 한다(queue_policy::QUEUE_ENV_LOCK 선례와 동일 패턴).
+    static EMBED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// poison 무시 관용구 — 한 테스트의 패닉이 나머지를 연쇄 실패시키면 원인 진단이 가려진다.
+    fn embed_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        EMBED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// seam env RAII — 패닉으로 빠져나가도 반드시 원복한다(설정된 채 남으면 락을 잡아도
+    /// 이후 모든 추출이 실패한다).
+    struct ExtractFailSeam;
+    impl ExtractFailSeam {
+        fn arm() -> Self {
+            std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
+            ExtractFailSeam
+        }
+    }
+    impl Drop for ExtractFailSeam {
+        fn drop(&mut self) {
+            std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        }
+    }
+
     /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
     #[test]
     fn b1_extract_mid_failure_leaves_no_partial_root() {
+        let _g = embed_env_guard(); // ★E7: seam 공유 테스트 직렬화
         let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
-        std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
-        let res = extract_phoenix_embed(&sd);
-        std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        let res = {
+            let _seam = ExtractFailSeam::arm();
+            extract_phoenix_embed(&sd)
+        };
         assert!(res.is_err(), "주입된 중간 실패가 Err 여야 한다");
         // phoenix-embed 하위 child dir 0(즉시 정리 — 다음 부팅 prune 의존 금지).
         let root = sd.join("phoenix-embed");
@@ -3767,6 +3795,7 @@ mod auto_restore_tests {
     /// 임베드 내용 그대로 쓴다. temp 누수 0: 정리 후 디렉터리 소멸.
     #[test]
     fn b1_extract_writes_phoenix_and_deps() {
+        let _g = embed_env_guard(); // ★E7: seam 공유 테스트 직렬화
         let sd = std::env::temp_dir().join(format!("cys-b1x-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
         let (root, script) = extract_phoenix_embed(&sd).expect("추출 성공");
@@ -3792,6 +3821,7 @@ mod auto_restore_tests {
     /// ★B1③: 추출된 실 phoenix 가 --selftest 를 통과한다(python3 가용 시). self-test 게이트 실증.
     #[test]
     fn b1_self_test_passes_on_real_embed() {
+        let _g = embed_env_guard(); // ★E7: seam 공유 테스트 직렬화
         let py = match std::process::Command::new("python3")
             .arg("--version")
             .output()
