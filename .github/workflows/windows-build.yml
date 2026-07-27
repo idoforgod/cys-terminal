@@ -113,6 +113,12 @@ jobs:
         env:
           PYTHONUTF8: '1'   # Windows Python 기본 cp1252 stdout에서 한국어 print 크래시 방지
         run: |
+          # tauri build.rs 리소스 존재 검증 통과용 placeholder(release.yml L368과 동형) —
+          # browser-runtime 도입 이후 이 feasibility 레인이 실행된 적 없어 누락돼 있던 선재
+          # 부식(2026-07-28 run 30307662547 실측: "resource path 'resources\browser-runtime'
+          # doesn't exist"로 즉사). 이 레인은 브라우저 런타임 실스테이징 없이 빌드한다 —
+          # cys-browserd 포함 완전 검증은 release.yml 소관.
+          mkdir -p src-tauri/resources/browser-runtime
           # createUpdaterArtifacts=false 인라인 override — 이 잡은 서명키 없는 가능성 빌드라
           # updater 서명 산출을 끈다(릴리스 경로 release.yml은 windows conf 기본값 true+서명키 사용).
           bunx @tauri-apps/cli@2 build --config '{"bundle":{"createUpdaterArtifacts":false}}'
