@@ -3871,10 +3871,27 @@ fn doctor_socket_connectable(p: &std::path::Path) -> bool {
 
 /// doctor가 flock을 쥔 채 머무는 인위적 시간 — **테스트 전용 노브**(기본 0). 통합 테스트가 벽시계
 /// 경합에 기대지 않고 "doctor가 락을 쥔 순간 부팅 데몬이 재시도로 이긴다"를 결정론으로 재현한다.
+///
+/// ★ADV-3: 이 노브는 종전에 **릴리스 바이너리에도** 그대로 실렸고 상한이 없었다 —
+/// `CYS_DOCTOR_LOCK_HOLD_MS=600000 cys doctor` 한 줄이면 10분간 startup 락을 점유해 데몬 부팅을
+/// 봉쇄할 수 있었다(WS-7 "보유 구간 최소화" 정면 위반, 환경변수 하나짜리 DoS). 릴리스에서는 노브
+/// 자체를 무효화하고(디버그 빌드에서만 해석) 사용자 입력이 락 보유 시간을 늘릴 경로를 없앤다.
 fn doctor_lock_hold() -> std::time::Duration {
-    std::env::var("CYS_DOCTOR_LOCK_HOLD_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
+    resolve_doctor_lock_hold(
+        std::env::var("CYS_DOCTOR_LOCK_HOLD_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok()),
+        cfg!(debug_assertions),
+    )
+}
+
+/// 노브 값 → 실제 보유 시간(순수). 릴리스 빌드(`debug_build == false`)에서는 값과 무관하게 0이며,
+/// 디버그 빌드에서만 통합 테스트가 요구하는 보유 구간을 그대로 존중한다.
+fn resolve_doctor_lock_hold(requested_ms: Option<u64>, debug_build: bool) -> std::time::Duration {
+    if !debug_build {
+        return std::time::Duration::ZERO;
+    }
+    requested_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or_default()
 }
@@ -11689,6 +11706,29 @@ mod tests {
         assert!(!ctx.socket_path.exists(), "홀더 부재 확정 시에만 제거");
         assert!(lock.exists(), "소켓 진단도 락 파일은 절대 unlink 하지 않는다");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★ADV-3 회귀 핀: 락 보유 노브는 **릴리스 빌드에서 무효**여야 한다. 종전에는 상한도 게이트도
+    /// 없어 `CYS_DOCTOR_LOCK_HOLD_MS=600000 cys doctor` 한 줄이 startup 락을 10분 점유해 데몬
+    /// 부팅을 봉쇄했다(WS-7의 "보유 구간 최소화" 위반). 디버그 빌드에서는 통합 테스트
+    /// (`cysd::boot_daemon_wins_the_lock_while_doctor_holds_it`)가 요구하는 보유 구간을 유지한다.
+    #[test]
+    fn doctor_lock_hold_knob_is_inert_in_release_builds() {
+        use std::time::Duration;
+        assert_eq!(
+            resolve_doctor_lock_hold(Some(600_000), false),
+            Duration::ZERO,
+            "릴리스 빌드에서는 어떤 값을 넣어도 락을 붙잡지 않는다"
+        );
+        assert_eq!(resolve_doctor_lock_hold(None, false), Duration::ZERO);
+        // 디버그 빌드는 종전 계약 유지(테스트 결정론 보존).
+        assert_eq!(
+            resolve_doctor_lock_hold(Some(1_500), true),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(resolve_doctor_lock_hold(None, true), Duration::ZERO);
+        // 미설정·파싱 실패는 어느 빌드에서나 0(노브 부재 = 즉시 해제).
+        assert_eq!(doctor_lock_hold(), Duration::ZERO);
     }
 
     #[cfg(unix)]

@@ -157,6 +157,20 @@ pub trait SupervisorLauncher: Send + Sync + 'static {
         state: &RuntimeStateV2,
         body: &[u8],
     ) -> Result<String, BrokerFailure>;
+
+    /// `validate_live` 실패 **직후** 런처가 아직 그 런타임을 소유(관리)하고 있는가.
+    ///
+    /// ★ADV-1: WS-0의 "일시 실패 연속 3회에서만 evict"는 세션(`inner.live`)이 살아 있어야만
+    /// 2·3회째 호출이 발생한다 — 호출자가 첫 `Err`에 세션을 버리면 `validate_live`에 넘길 state의
+    /// 유일한 출처가 사라져 **두 번째 호출 자체가 일어나지 않고**, 카운터는 1에서 멈춰 evict가
+    /// 영원히 발화하지 않는다(그 뒤 모든 클릭은 `RUNTIME_FOREIGN_OWNER` 영구 반환). evict가
+    /// 실제로 일어났는지를 이 신호로 받아 세션 폐기를 결정하면 3스트라이크가 주 경로에서 산다.
+    ///
+    /// 기본 구현은 "소유하지 않음"(= 종전 동작: 실패 시 세션 즉시 폐기)이라, 소유 개념이 없는
+    /// 테스트 런처는 계약이 바뀌지 않는다.
+    fn retains_runtime(&self, _state: &RuntimeStateV2) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -620,7 +634,12 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
             if self.launcher.validate_live(&state).is_ok() {
                 return self.status_for_v2(state);
             }
-            inner.live = None;
+            // ★ADV-1: 런처가 아직 그 런타임을 소유 중이면(= evict되지 않은 일시 실패 1·2회째)
+            // 세션을 유지한다. 무조건 비우면 다음 호출에 넘길 state가 사라져 3스트라이크가
+            // 주 경로에서 영원히 발화하지 않는다.
+            if !self.launcher.retains_runtime(&state) {
+                inner.live = None;
+            }
         }
         drop(inner);
         self.probe_disk()
@@ -676,13 +695,24 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
         // 가르는 데 쓴다(K5 — 자기 런타임을 FOREIGN으로 오판하지 않기 위한 이중 방어선).
         let recently_owned = inner.live.as_ref().map(|state| state.instance_id.clone());
         if let Some(state) = inner.live.clone() {
-            if self.launcher.validate_live(&state).is_ok() {
-                let status = self.status_for_v2(state);
-                if matches!(status, BrokerStatus::Compatible { .. }) {
-                    return Ok(status);
+            match self.launcher.validate_live(&state) {
+                Ok(_) => {
+                    let status = self.status_for_v2(state);
+                    if matches!(status, BrokerStatus::Compatible { .. }) {
+                        return Ok(status);
+                    }
+                    // 재검증은 통과했는데 비호환(매니페스트 교체 등) — 종전대로 세션을 버린다.
+                    inner.live = None;
+                }
+                // ★ADV-1: 재검증 실패는 evict 여부로만 세션을 버린다(probe와 동일 규약).
+                // 첫 Err에 버리면 3스트라이크가 발화하지 못해 WS-0이 약속한 "일시 실패 1회가
+                // 살아있는 런타임을 잃게 하지 않는다"가 주 경로에서 거짓이 된다.
+                Err(_) => {
+                    if !self.launcher.retains_runtime(&state) {
+                        inner.live = None;
+                    }
                 }
             }
-            inner.live = None;
         }
         match self.probe_disk() {
             status @ BrokerStatus::Compatible { .. } => return Ok(status),
@@ -1930,6 +1960,73 @@ mod tests {
         }
     }
 
+    /// ★ADV-1 전용: 실제 런처의 3스트라이크 규약을 **브로커 관점에서** 모사한다.
+    /// 일시 실패를 낼 때마다 카운터를 올리고, `strikes`회 연속에서만 소유를 놓는다(= evict).
+    /// `retains_runtime`이 그 소유 상태를 그대로 보고하므로, 브로커가 첫 실패에 세션을 버리면
+    /// 두 번째 `validate_live`가 아예 호출되지 않아 테스트가 red가 된다(회귀 검출 지점).
+    struct FlakyLauncher {
+        inner: CountingLauncher,
+        owned: Mutex<Option<String>>,
+        consecutive: AtomicUsize,
+        validations: AtomicUsize,
+        strikes: usize,
+    }
+
+    impl FlakyLauncher {
+        fn new(strikes: usize) -> Self {
+            Self {
+                inner: CountingLauncher::default(),
+                owned: Mutex::new(None),
+                consecutive: AtomicUsize::new(0),
+                validations: AtomicUsize::new(0),
+                strikes,
+            }
+        }
+
+        fn launches(&self) -> usize {
+            self.inner.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SupervisorLauncher for FlakyLauncher {
+        fn launch(&self, request: &LaunchRequest) -> Result<RuntimeStateV2, BrokerFailure> {
+            let state = self.inner.launch(request)?;
+            *self.owned.lock().unwrap() = Some(state.instance_id.clone());
+            self.consecutive.store(0, Ordering::SeqCst);
+            Ok(state)
+        }
+
+        fn validate_live(
+            &self,
+            state: &RuntimeStateV2,
+        ) -> Result<AuthenticatedEndpointSnapshot, BrokerFailure> {
+            self.validations.fetch_add(1, Ordering::SeqCst);
+            if self.owned.lock().unwrap().as_deref() != Some(state.instance_id.as_str()) {
+                return Err(BrokerFailure::new(
+                    "UNAUTHENTICATED_STATE",
+                    "runtime is not owned by this broker session",
+                ));
+            }
+            let consecutive = self.consecutive.fetch_add(1, Ordering::SeqCst) + 1;
+            if consecutive >= self.strikes {
+                *self.owned.lock().unwrap() = None; // evict
+            }
+            Err(BrokerFailure::new("ENGINE_EXITED", "engine health connect"))
+        }
+
+        fn sign_private_request(
+            &self,
+            _state: &RuntimeStateV2,
+            _body: &[u8],
+        ) -> Result<String, BrokerFailure> {
+            Ok("0".repeat(64))
+        }
+
+        fn retains_runtime(&self, state: &RuntimeStateV2) -> bool {
+            self.owned.lock().unwrap().as_deref() == Some(state.instance_id.as_str())
+        }
+    }
+
     struct CrashableLauncher {
         launches: AtomicUsize,
         live: std::sync::atomic::AtomicBool,
@@ -2121,6 +2218,69 @@ mod tests {
             broker.probe(),
             BrokerStatus::DisabledSafe { code, .. } if code == "UNAUTHENTICATED_STATE"
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// ★ADV-1 회귀 핀: WS-0의 3스트라이크는 **프로덕션 경로**(probe·ensure_shared)에서 살아야
+    /// 한다. 종전 구현은 첫 `Err`에 `inner.live`를 비웠고, 그 세션이 `validate_live`에 넘길
+    /// state의 유일한 출처였으므로 두 번째 호출 자체가 발생하지 않았다 — 카운터는 1에서 멈추고
+    /// evict는 영원히 발화하지 않으며, 이후 클릭은 `RUNTIME_FOREIGN_OWNER`로 영구 고착된다
+    /// (X2로 kill 금지·데몬 재시작으로도 못 푼다). 이 테스트는 런처를 직접 3회 부르지 않고
+    /// **브로커 공개 API만** 두드린다.
+    #[test]
+    fn three_strike_eviction_is_reachable_through_the_production_probe_path() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-browser-broker-three-strike-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = BrokerConfig::for_test(
+            root.join("manifest.json"),
+            root.join("runtime"),
+            root.join("missing-state.json"),
+        );
+        write_manifest(&config);
+        let launcher = Arc::new(FlakyLauncher::new(3));
+        let broker = AuthorityBroker::new(config, launcher.clone());
+        assert!(matches!(
+            broker
+                .ensure_shared(&VerifiedAuthority::trusted_test())
+                .unwrap(),
+            BrokerStatus::Compatible { .. }
+        ));
+        assert_eq!(launcher.launches(), 1);
+
+        // ① 1·2회째 일시 실패: 세션도 런타임 소유도 유지돼야 다음 스트라이크가 셈해진다.
+        for attempt in 1..=2 {
+            assert!(matches!(broker.probe(), BrokerStatus::NotRunning));
+            assert!(
+                broker.inner.lock().unwrap().live.is_some(),
+                "일시 실패 {attempt}회로 살아있는 런타임 세션을 잃으면 안 된다"
+            );
+            assert_eq!(
+                launcher.validations.load(Ordering::SeqCst),
+                attempt,
+                "세션이 유지돼야 {}회째 재검증이 실제로 일어난다",
+                attempt + 1
+            );
+        }
+
+        // ② 3회째에 evict — 그때서야 세션이 비워진다.
+        assert!(matches!(broker.probe(), BrokerStatus::NotRunning));
+        assert_eq!(launcher.validations.load(Ordering::SeqCst), 3);
+        assert!(
+            broker.inner.lock().unwrap().live.is_none(),
+            "연속 3회에서는 evict가 발화하고 세션도 함께 비워져야 한다"
+        );
+
+        // ③ evict 후에는 재기동이 진행된다(FOREIGN_OWNER 영구 고착 없음).
+        assert!(matches!(
+            broker
+                .ensure_shared(&VerifiedAuthority::trusted_test())
+                .unwrap(),
+            BrokerStatus::Compatible { .. }
+        ));
+        assert_eq!(launcher.launches(), 2, "evict 후 launch가 진행돼야 한다");
         std::fs::remove_dir_all(root).unwrap();
     }
 

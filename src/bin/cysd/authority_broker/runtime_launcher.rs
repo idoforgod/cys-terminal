@@ -37,8 +37,23 @@ enum ValidationSeverity {
     /// **+ endpoint 파일의 일시적 read I/O 오류** — fd 고갈·EIO·NFS 지연은 내용 손상이 아니다).
     Transient,
     /// 런타임 신원 자체가 깨졌다(프로세스 부재·start_time 불일치·MAC 불일치·identity 불일치
-    /// **+ endpoint 파일 부재(NotFound)·JSON 파싱 실패** — 둘 다 재시도로 회복되지 않는다).
+    /// **+ endpoint 파일 부재(NotFound)·JSON 파싱 실패 + health connect의 ConnectionRefused**
+    /// — 모두 재시도로 회복되지 않는다).
     Fatal,
+}
+
+/// health TCP connect 실패의 성격 판정(F-2).
+///
+/// `ConnectionRefused` = "그 포트에 리스너가 없다" → 파일 I/O의 `NotFound`와 동형인 **회복 불가**
+/// 신호다(부하가 아무리 심해도 살아있는 엔진이 자기 포트를 refuse하지 않는다). 나머지
+/// (timeout·reset·unreachable·interrupted 등)는 살아있는 런타임에서도 부하 스파이크로 발생하므로
+/// 종전대로 일시다 — `endpoint_read_io_error_is_transient_except_not_found`와 정확히 대칭이다.
+fn health_connect_severity(kind: std::io::ErrorKind) -> ValidationSeverity {
+    if kind == std::io::ErrorKind::ConnectionRefused {
+        ValidationSeverity::Fatal
+    } else {
+        ValidationSeverity::Transient
+    }
 }
 
 type ValidationError = (BrokerFailure, ValidationSeverity);
@@ -168,10 +183,14 @@ fn remove_managed_incarnation(
 ///
 /// ★**evict 종료는 best-effort다 — EOF를 무시하는 supervisor는 잔존한다**(적대 검증 4-2).
 /// 이 함수는 control 파이프만 닫고 끝나며 `try_wait` 폴링도 SIGKILL 격상도 하지 않는다.
-/// `terminate_supervisor`가 하는 격상을 여기서 못 하는 이유는 구조적이다: 성공 커밋 후
-/// `Child` 핸들은 워처 스레드(`launch()`의 `child.wait()` 루프)가 단독 소유하며,
-/// `ManagedRuntime`은 `control`만 공유 보유한다. 따라서 evict는 "종료 요청"이지
-/// "종료 보장"이 아니다.
+/// `terminate_supervisor`가 하는 격상을 여기서 하지 않는 이유는 **구조적 불가가 아니라
+/// 비용·복잡도 때문의 보류**다(ADV-1 정정 — 종전 주석은 "구조적으로 불가"라고 단정했으나
+/// 틀렸다): 성공 커밋 후 `Child` 핸들은 워처 스레드(`launch()`의 `child.wait()` 루프)가 단독
+/// 소유하지만, SIGTERM/SIGKILL은 `Child`가 아니라 **pid만** 있으면 보낼 수 있고(`libc::kill`),
+/// pid 재사용 오살을 막을 재료(`state.supervisor_pid` ↔ `supervisor_started_at`)는 같은 파일의
+/// `validate_live`가 이미 쓰고 있다. 하려면 워처와의 종료 경합·grace 타이머·플랫폼 분기를
+/// 감당해야 해서 리스(WS-11)와 함께 다루기로 미룬 것이다. 현재 evict는 여전히 "종료 요청"이지
+/// "종료 보장"이 아니다 — 아래 잔존물 계약이 그 대가다.
 ///
 /// **잔존물 계약**(§4-3의 pre-readiness 잔존물 계약과 같은 등급의 인정된 한계):
 /// EOF를 무시하거나 wedge된 supervisor는 flock을 쥔 채 장부에서만 사라진다 = 잔여 고아.
@@ -711,6 +730,18 @@ impl SupervisorLauncher for RealSupervisorLauncher {
         }
     }
 
+    /// ★ADV-1: 소유 장부(`managed`)에 **같은 세대의 그 인스턴스**가 아직 있는가.
+    /// evict(치명 1회·일시 연속 3회)가 일어났으면 엔트리가 사라져 false가 되고, 브로커는
+    /// 그때만 `inner.live`를 버린다 — 1·2회째 일시 실패에서는 세션이 살아남아야 다음 호출이
+    /// 발생하고 3스트라이크가 실제로 셈해진다(세대 대조로 교체된 신규 런타임 오인식 차단).
+    fn retains_runtime(&self, state: &RuntimeStateV2) -> bool {
+        self.managed
+            .lock()
+            .unwrap()
+            .get(&state.instance_id)
+            .is_some_and(|runtime| runtime.state.engine_generation == state.engine_generation)
+    }
+
     fn sign_private_request(
         &self,
         state: &RuntimeStateV2,
@@ -956,18 +987,26 @@ fn verify_engine_endpoint(
         .map_err(|_| BrokerFailure::new("RUNTIME_INTEGRITY_FAILED", "engine endpoint MAC mismatch"))
 }
 
-/// 반환하는 실패의 성격 구분(§2-A): TCP connect/write/read·응답 형식·비200은 **일시**
-/// (부하 스파이크로 살아있는 런타임에서도 발생), 신원 불일치만 **치명**이다.
+/// 반환하는 실패의 성격 구분(§2-A): TCP write/read·응답 형식·비200과 timeout·reset·unreachable
+/// 계열 connect 실패는 **일시**(부하 스파이크로 살아있는 런타임에서도 발생), 신원 불일치와
+/// `ConnectionRefused`만 **치명**이다.
+///
+/// ★F-2: `ConnectionRefused`는 "그 포트에 리스너가 없다"는 **회복 불가 신호**로, 파일 I/O의
+/// `NotFound`(위 endpoint 읽기에서 유일하게 치명으로 좁힌 그것)와 정확히 동형이다 — 부하가
+/// 아무리 심해도 살아있는 엔진이 자기 포트 연결을 refuse하지는 않는다. 이걸 일시로 두면
+/// supervisor 생존 + engine 단독 사망 시 evict에 `validate_live` 3회가 필요한데, 이 함수는
+/// **사용자 행동(probe·ensure)으로만 구동**되므로 회복이 2클릭에서 4클릭으로 늘어난다.
+/// 대칭 근거: `endpoint_read_io_error_is_transient_except_not_found`(파일 I/O 쪽 같은 논리).
 fn authenticated_health(endpoint: &AuthenticatedEngineEndpoint) -> Result<(), ValidationError> {
     use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
     use std::time::Duration;
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port);
     let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_millis(500))
         .map_err(|error| {
-            transient(BrokerFailure::new(
-                "ENGINE_EXITED",
-                format!("engine health connect: {error}"),
-            ))
+            (
+                BrokerFailure::new("ENGINE_EXITED", format!("engine health connect: {error}")),
+                health_connect_severity(error.kind()),
+            )
         })?;
     stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok();
@@ -1557,6 +1596,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// ⚠범위 고지(ADV-1): 이 테스트는 `validate_live`를 **직접** 연속 호출한다 — 3스트라이크
+    /// 산술만 검증하며, 프로덕션 호출자가 그 연속 호출을 실제로 만들어내는지는 증명하지 않는다
+    /// (종전에는 첫 실패에 `inner.live`가 비워져 두 번째 호출 자체가 없었고, 이 테스트가 그
+    /// 사실을 은폐했다). 프로덕션 규약은
+    /// `authority_broker::tests::three_strike_eviction_is_reachable_through_the_production_probe_path`
+    /// 가 브로커 공개 API로 고정한다 — 둘은 한 쌍이며 따로 지우지 말 것.
     #[test]
     fn transient_health_failure_does_not_orphan_a_live_runtime() {
         let launcher = RealSupervisorLauncher::default();
@@ -1650,6 +1695,8 @@ mod tests {
     /// ★적대 검증 4-3: endpoint read의 **일시적** I/O 오류(fd 고갈·순간 EIO·NFS 지연) 1회로
     /// 살아있는 브라우저의 소유권이 파괴되면 안 된다 — WS-0이 막으려던 결함과 동형이다.
     /// 픽스처는 endpoint_path를 디렉터리로 만들어 `NotFound`가 아닌 io 오류를 결정론적으로 낸다.
+    /// ⚠위 `transient_health_failure_does_not_orphan_a_live_runtime`과 같은 범위 고지(ADV-1):
+    /// 직접 3회 호출은 산술 검증이고, 프로덕션 경로 성립은 브로커측 3스트라이크 테스트가 맡는다.
     #[test]
     fn endpoint_read_io_error_is_transient_and_keeps_a_live_runtime() {
         let launcher = RealSupervisorLauncher::default();
@@ -1690,6 +1737,123 @@ mod tests {
         // 한계까지 연속되면 비로소 축출된다 — 일시 분류가 "무한 관용"은 아니다.
         launcher.validate_live(&state).unwrap_err();
         assert!(launcher.managed.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ★F-2 회귀 핀: engine health의 `ConnectionRefused`("그 포트에 리스너가 없다")는 **치명**이다.
+    /// supervisor 생존 + engine 단독 사망일 때 종전에는 evict에 `validate_live` 3회가 필요했는데,
+    /// 이 함수는 사용자 행동(probe·ensure)으로만 구동되므로 회복이 2클릭에서 4클릭으로 늘어났다.
+    /// 픽스처는 bind 직후 닫은 포트로 ECONNREFUSED를 결정론적으로 낸다.
+    #[test]
+    fn engine_connection_refused_is_fatal_on_the_first_occurrence() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let launcher = RealSupervisorLauncher::default();
+        let pid = std::process::id();
+        let started_at = process_start_time(pid).expect("self process start time");
+        let mut state = state_for(21);
+        state.supervisor_pid = pid;
+        state.engine_pid = pid;
+        // 닫힌 포트 = 리스너 부재. 연결 시도는 즉시 ECONNREFUSED로 떨어진다.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port reservation");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        state.port = port;
+        let session_key = [21_u8; 32];
+        let dir = scratch_dir("health-refused");
+        let endpoint_path = dir.join("state.json");
+        std::fs::write(
+            &endpoint_path,
+            signed_endpoint_json(&session_key, &state, started_at),
+        )
+        .unwrap();
+        launcher.managed.lock().unwrap().insert(
+            state.instance_id.clone(),
+            test_runtime(&state, endpoint_path, session_key, started_at, None),
+        );
+
+        let error = launcher.validate_live(&state).unwrap_err();
+        assert_eq!(error.code, "ENGINE_EXITED");
+        assert!(
+            error.message.contains("health connect"),
+            "connect 단계 실패여야 한다(픽스처 전제): {}",
+            error.message
+        );
+        assert!(
+            launcher.managed.lock().unwrap().is_empty(),
+            "ECONNREFUSED 1회로 즉시 축출돼야 한다 — 3회를 요구하면 회복이 2클릭에서 4클릭이 된다"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// F-2의 **대조군**: refused만 치명이고 나머지 TCP 오류(timeout·reset·unreachable)는 일시로
+    /// 남아 연속 3회 한계에 맡겨진다. timeout을 치명으로 넓히면 부하 스파이크 1회가 살아있는
+    /// 런타임을 파괴한다(WS-0이 막으려던 바로 그 결함).
+    #[test]
+    fn only_connection_refused_is_a_fatal_health_connect_error() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            health_connect_severity(ErrorKind::ConnectionRefused),
+            ValidationSeverity::Fatal
+        );
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert_eq!(
+                health_connect_severity(kind),
+                ValidationSeverity::Transient,
+                "{kind:?}는 살아있는 런타임에서도 발생 가능 — 일시로 남아야 한다"
+            );
+        }
+
+        // 판정이 실제 축출 규약에 어떻게 꽂히는지까지 못 박는다: timeout은 3회, refused는 1회.
+        let started_at = process_start_time(std::process::id()).expect("self start time");
+        let dir = scratch_dir("health-severity");
+        let timeout_state = state_for(22);
+        let timeout_runtime = test_runtime(
+            &timeout_state,
+            dir.join("timeout.json"),
+            [22_u8; 32],
+            started_at,
+            None,
+        );
+        for attempt in 1..MAX_CONSECUTIVE_TRANSIENT_VALIDATION_FAILURES {
+            assert!(
+                !should_evict_after_validation_failure(
+                    &timeout_runtime,
+                    health_connect_severity(ErrorKind::TimedOut)
+                ),
+                "timeout {attempt}회로는 축출되지 않는다"
+            );
+        }
+        assert!(
+            should_evict_after_validation_failure(
+                &timeout_runtime,
+                health_connect_severity(ErrorKind::TimedOut)
+            ),
+            "timeout은 연속 3회에서 비로소 축출된다"
+        );
+
+        let refused_state = state_for(23);
+        let refused_runtime = test_runtime(
+            &refused_state,
+            dir.join("refused.json"),
+            [23_u8; 32],
+            started_at,
+            None,
+        );
+        assert!(
+            should_evict_after_validation_failure(
+                &refused_runtime,
+                health_connect_severity(ErrorKind::ConnectionRefused)
+            ),
+            "refused는 첫 회에 축출된다"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
