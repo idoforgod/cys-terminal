@@ -119,6 +119,9 @@ const RPC_TRANSPORT_FAILED_CODE: &str = "RPC_TRANSPORT_FAILED";
 const RPC_UNCODED_ERROR_CODE: &str = "RPC_UNCODED_ERROR";
 /// ok 응답인데 GUI가 요구하는 필드가 없거나 형식이 어긋난 경우(데몬 스큐·계약 위반).
 const RPC_MALFORMED_RESPONSE_CODE: &str = "RPC_MALFORMED_RESPONSE";
+/// GUI 자체가 embed 요청을 만들지 못한 경우(pane_nonce·ticket·generation·origin 검증 실패) —
+/// RPC를 보내기도 전의 **로컬** 거부라 데몬 code가 존재하지 않는다(ADV-2).
+const EMBED_INTENT_INVALID_CODE: &str = "EMBED_INTENT_INVALID";
 
 static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationRegistry>> =
     std::sync::OnceLock::new();
@@ -129,6 +132,16 @@ static NATIVE_BROWSER_ACTIVATIONS: std::sync::OnceLock<Mutex<NativeActivationReg
 const NATIVE_ACTIVATION_TTL_MS: u64 = 10_000;
 const TAURI_BROWSER_ENSURE_DEADLINE_SECS: u64 =
     cys::browser_runtime::ENSURE_WORKER_DEADLINE.as_secs() + 5;
+
+/// GUI peer 등록 체인(`gui_challenge`·`register_gui`) RPC 1콜의 **읽기 상한**.
+/// ★F-3(성찰3): 등록은 `GUI_REGISTRATION_FLIGHT` 뮤텍스로 직렬화되는데 체인 전체
+/// (`register_browser_gui_peer`→`rpc_on_full`→`rpc_full`→`rpc_once`)에 read 상한이 없었다 —
+/// 연결은 됐지만 응답하지 않는 cysd 하나가 뮤텍스를 **영구 점유**하면 부트 재시도뿐 아니라
+/// 신뢰 클릭 경로(`ensure_browserd_cast`)까지 통째로 막힌다(single-flight 도입이 만든 결합).
+/// 상한은 `ensure`의 소켓 RPC 상한과 같은 계열의 보수적 10s다(등록은 브로커 메모리 조작이라
+/// runtime cold start 같은 긴 작업이 아니다). 상한 초과는 `AfterSend`로 처리돼 풀 연결이
+/// 폐기되므로(`rpc_full`의 `*conn = None`) 취소가 공유 풀을 stale 응답으로 오염시키지 않는다.
+const GUI_REGISTRATION_RPC_DEADLINE_SECS: u64 = 10;
 
 #[derive(Default)]
 struct NativeActivationRegistry {
@@ -300,44 +313,76 @@ fn gui_registration_flight() -> &'static tauri::async_runtime::Mutex<()> {
 /// 부트 재시도·클릭 지연등록·세션 소실 회복 — 모든 경로가 이걸 쓴다. 강제 재등록이 필요한 곳은
 /// 먼저 `BROWSER_APP_SESSION`을 None으로 비운 뒤 호출한다(= 자기 세션을 스스로 무효화한 경우만).
 async fn ensure_browser_gui_peer() -> Result<(), RpcFailure> {
+    ensure_browser_gui_peer_on(
+        &default_socket(),
+        std::time::Duration::from_secs(GUI_REGISTRATION_RPC_DEADLINE_SECS),
+    )
+    .await
+}
+
+/// `ensure_browser_gui_peer`의 소켓·상한 주입형 — 프로덕션 경로는 항상 기본 소켓 +
+/// `GUI_REGISTRATION_RPC_DEADLINE_SECS`를 쓰고, 테스트만 무응답 소켓 + 짧은 상한을 꽂아
+/// "상한 내 실패 + 뮤텍스 해제"를 실측한다(10s를 그대로 기다리면 스위트가 느려진다).
+async fn ensure_browser_gui_peer_on(
+    socket: &std::path::Path,
+    deadline: std::time::Duration,
+) -> Result<(), RpcFailure> {
     let _flight = gui_registration_flight().lock().await;
     // 비행 대기 중 다른 경로가 등록을 마쳤을 수 있다 — 락 **획득 후** 재확인이 핵심이다
     // (획득 전 확인만 하면 두 태스크가 나란히 통과해 교체 경합이 그대로 남는다).
     if BROWSER_APP_SESSION.read().unwrap().is_some() {
         return Ok(());
     }
-    register_browser_gui_peer().await
+    register_browser_gui_peer_on(socket, deadline).await
 }
 
-/// 등록 체인도 code 보존형(`rpc_on_full`) — `GUI_REGISTRATION_LIMIT`·`GUI_IDENTITY_REJECTED`·
+/// 등록 체인도 code 보존형(`rpc_on_full_deadline`) — `GUI_REGISTRATION_LIMIT`·`GUI_IDENTITY_REJECTED`·
 /// `GUI_REGISTRATION_REPLAY`가 message만 남고 소멸하면 등록 실패 진단이 반쪽이 된다(WS-1).
 ///
 /// 만료(`is_challenge_expired`)는 **1회만** 재발급→재등록한다: challenge 발급과 소비 사이에 부팅
 /// 부하가 끼면 TTL을 넘길 수 있는데, 그건 "느렸다"이지 "틀렸다"가 아니라 재시도가 정답이다.
 /// 두 번째 만료는 그대로 실패시킨다(무한루프 금지 — 재시도 예산은 정확히 1회).
-async fn register_browser_gui_peer() -> Result<(), RpcFailure> {
-    match register_browser_gui_peer_once().await {
+///
+/// ★F-3: 체인의 두 RPC는 각각 `GUI_REGISTRATION_RPC_DEADLINE_SECS` 읽기 상한을 갖는다 —
+/// 무응답 cysd가 뮤텍스를 영구 점유하는 hang 경로를 끊는다(만료 재시도는 브로커가 **응답한**
+/// 뒤에만 일어나므로 상한이 곱해지지 않는다: 최악도 challenge 10s + register 10s).
+async fn register_browser_gui_peer_on(
+    socket: &std::path::Path,
+    deadline: std::time::Duration,
+) -> Result<(), RpcFailure> {
+    match register_browser_gui_peer_once_on(socket, deadline).await {
         Err(failure) if failure.is_challenge_expired() => {
             eprintln!(
                 "[cys-app] Browser GUI registration challenge expired ([{}] {}) — 재발급 후 1회 재시도",
                 failure.code, failure.message
             );
-            register_browser_gui_peer_once().await
+            register_browser_gui_peer_once_on(socket, deadline).await
         }
         other => other,
     }
 }
 
-async fn register_browser_gui_peer_once() -> Result<(), RpcFailure> {
-    let challenge = rpc_coded("browser.runtime.gui_challenge", json!({})).await?;
+async fn register_browser_gui_peer_once_on(
+    socket: &std::path::Path,
+    deadline: std::time::Duration,
+) -> Result<(), RpcFailure> {
+    let challenge = rpc_on_full_deadline(
+        socket,
+        "browser.runtime.gui_challenge",
+        json!({}),
+        Some(deadline),
+    )
+    .await?;
     let registration_secret = challenge["registration_challenge"]
         .as_str()
         .ok_or_else(|| {
             RpcFailure::malformed("cysd returned no Browser GUI registration challenge")
         })?;
-    let registration = rpc_coded(
+    let registration = rpc_on_full_deadline(
+        socket,
         "browser.runtime.register_gui",
         json!({"registration_secret":registration_secret}),
+        Some(deadline),
     )
     .await?;
     let session = registration["app_session"]
@@ -367,10 +412,15 @@ enum RpcErr {
     AfterSend(String),
 }
 
+///
+/// `read_deadline`(Some)은 **응답 대기 상한**이다. 초과는 `AfterSend`로 분류해 호출자
+/// (`rpc_full`)가 풀 연결을 폐기하게 만든다 — 미수신 응답이 남은 연결을 재사용하면 다음 RPC가
+/// stale 프레임을 읽는다(적대검증 R-1). None은 종전 무한 대기(기존 호출부 전부).
 async fn rpc_once(
     socket: &std::path::Path,
     conn: &mut Option<tokio::io::BufReader<Stream>>,
     line: &[u8],
+    read_deadline: Option<std::time::Duration>,
 ) -> Result<String, RpcErr> {
     if conn.is_none() {
         *conn = Some(BufReader::new(
@@ -387,10 +437,19 @@ async fn rpc_once(
         .await
         .map_err(|e| RpcErr::AfterSend(e.to_string()))?;
     let mut resp_line = String::new();
-    let n = c
-        .read_line(&mut resp_line)
-        .await
-        .map_err(|e| RpcErr::AfterSend(e.to_string()))?;
+    let read = c.read_line(&mut resp_line);
+    let n = match read_deadline {
+        Some(limit) => match tokio::time::timeout(limit, read).await {
+            Ok(result) => result.map_err(|e| RpcErr::AfterSend(e.to_string()))?,
+            Err(_) => {
+                return Err(RpcErr::AfterSend(format!(
+                    "cysd did not answer in {}s",
+                    limit.as_secs()
+                )))
+            }
+        },
+        None => read.await.map_err(|e| RpcErr::AfterSend(e.to_string()))?,
+    };
     if n == 0 {
         return Err(RpcErr::AfterSend("connection closed".into()));
     }
@@ -420,17 +479,29 @@ async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result
 /// 재시도·UI 분류를 해야 하는데 rpc_on은 message만 올려 코드가 유실됐다 — 기존 호출부의 문자열
 /// 계약(message만)은 rpc_on 래퍼로 그대로 보존하고, 코드가 필요한 곳만 이 함수를 직접 쓴다.
 async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    rpc_full_deadline(socket, method, params, None).await
+}
+
+/// `rpc_full`의 읽기 상한 주입형. 상한 초과는 `AfterSend`로 처리되어 이 함수가 풀 연결을
+/// 폐기(`*conn = None`)하므로, 바깥에서 `tokio::time::timeout`으로 감쌌을 때와 달리 취소된
+/// 연결이 미수신 응답을 남기지 않는다(적대검증 R-1이 금지한 패턴을 피하는 이유).
+async fn rpc_full_deadline(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    read_deadline: Option<std::time::Duration>,
+) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
     let cell = conn_cell(socket);
     let mut conn = cell.lock().await;
-    let resp_line = match rpc_once(socket, &mut conn, &line).await {
+    let resp_line = match rpc_once(socket, &mut conn, &line, read_deadline).await {
         Ok(r) => r,
         Err(RpcErr::BeforeSend(_)) => {
             // 풀링된 연결이 끊겨 전송 자체가 실패 — 데몬이 요청을 못 봤으니 재시도 안전
             *conn = None;
-            match rpc_once(socket, &mut conn, &line).await {
+            match rpc_once(socket, &mut conn, &line, read_deadline).await {
                 Ok(r) => r,
                 Err(RpcErr::BeforeSend(e)) | Err(RpcErr::AfterSend(e)) => {
                     *conn = None;
@@ -534,7 +605,17 @@ async fn rpc_on_full(
     method: &str,
     params: Value,
 ) -> Result<Value, RpcFailure> {
-    let resp = rpc_full(socket, method, params)
+    rpc_on_full_deadline(socket, method, params, None).await
+}
+
+/// `rpc_on_full`의 읽기 상한 주입형 — 등록 체인(single-flight 뮤텍스 아래) 전용.
+async fn rpc_on_full_deadline(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    read_deadline: Option<std::time::Duration>,
+) -> Result<Value, RpcFailure> {
+    let resp = rpc_full_deadline(socket, method, params, read_deadline)
         .await
         .map_err(RpcFailure::transport)?;
     unwrap_rpc_result(resp)
@@ -1309,13 +1390,36 @@ async fn browserd_state(
     parent_origin: String,
     embed_ticket: String,
 ) -> Value {
-    let Ok(embed) =
-        browser_embed_intent(&pane_nonce, &embed_ticket, embed_generation, &parent_origin)
-    else {
-        return json!({"alive":false});
+    // ★ADV-2: 조기 return 2곳도 사인을 싣는다 — 특히 아래 `browser_session_params` 실패는
+    // `BROWSER_APP_SESSION`이 비어 있다는 뜻(= GUI peer 미등록)이고, 부팅 등록 실패·데몬 교체
+    // 직후의 **가장 흔한 실제 고장**이다. 여기서 침묵하면 사용자는 종전과 글자 하나 다르지 않은
+    // "브라우저 꺼짐 — 클릭해 재연결"만 보고, `castStateReason` 배선이 최빈 경로에서 죽는다.
+    let embed = match browser_embed_intent(
+        &pane_nonce,
+        &embed_ticket,
+        embed_generation,
+        &parent_origin,
+    ) {
+        Ok(embed) => embed,
+        Err(message) => {
+            return json!({
+                "alive":false,
+                "code":EMBED_INTENT_INVALID_CODE,
+                "message":message,
+            })
+        }
     };
-    let Ok(embed) = browser_session_params(embed) else {
-        return json!({"alive":false});
+    let embed = match browser_session_params(embed) {
+        Ok(embed) => embed,
+        // 데몬이 준 code가 아니라 GUI가 판정한 등록 부재다 — 브로커의 동명 사인과 같은 처방
+        // (클릭 → ensure_browser_gui_peer 재등록)으로 수렴하므로 같은 code를 쓴다.
+        Err(message) => {
+            return json!({
+                "alive":false,
+                "code":GUI_NOT_REGISTERED_CODE,
+                "message":message,
+            })
+        }
     };
     // ★WS-1 code 전파의 논리적 연장(설계 §7-0-A 3): 종전에는 모든 Err를 `{alive:false}`로 뭉개
     // passive 경로(pane 복원·5s 재시도)에서 실패 사유가 통째로 소실됐다 — UNSUPPORTED·
@@ -5335,8 +5439,13 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     /// 재시도와 클릭 경로가 겹치면 S1이 S2로 갈아치워져 in-flight RPC가 GUI_IDENTITY_MISMATCH를
     /// 맞는다. `ensure_browser_gui_peer`는 살아있는 세션을 보면 **RPC 자체를 하지 않는다**.
     /// (가드를 지우면: 데몬 부재 시 Err로, 데몬 존재 시 세션 교체로 — 어느 쪽이든 red가 된다.)
+    /// 전역 `BROWSER_APP_SESSION`을 건드리는 테스트끼리의 직렬화 가드 — 병렬 실행에서 서로의
+    /// 세션 상태를 덮어써 무증상 flake가 되는 것을 막는다(테스트 전용·프로덕션 무관).
+    static SESSION_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn ensure_does_not_replace_a_live_session() {
+        let _guard = SESSION_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let live = "a".repeat(64);
         *BROWSER_APP_SESSION.write().unwrap() = Some(live.clone());
         let result = tauri::async_runtime::block_on(ensure_browser_gui_peer());
@@ -5344,6 +5453,107 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         *BROWSER_APP_SESSION.write().unwrap() = None; // 전역 상태 원복(다른 테스트 오염 금지)
         assert!(result.is_ok(), "살아있는 세션이면 등록을 시도조차 하지 않는다: {result:?}");
         assert_eq!(after.as_deref(), Some(live.as_str()), "세션이 교체되면 안 된다");
+    }
+
+    /// ★ADV-2 회귀 핀: passive 조회의 **조기 return 2곳**도 사인을 싣는다. 특히 세션 부재
+    /// (= GUI peer 미등록)는 부팅 등록 실패·데몬 교체 직후의 최빈 고장인데, 종전에는 bare
+    /// `{alive:false}`라 `castStateReason`이 최빈 경로에서 아무 것도 표시하지 못했다.
+    #[test]
+    fn browserd_state_early_returns_carry_a_diagnostic_sign() {
+        let _guard = SESSION_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let nonce = "a".repeat(64);
+        let ticket = "b".repeat(64);
+        let origin = if cfg!(windows) {
+            "http://tauri.localhost"
+        } else {
+            "tauri://localhost"
+        };
+
+        // ① embed intent 자체가 불성립(부모 origin 불일치) — 로컬 거부 사인.
+        let bad = tauri::async_runtime::block_on(browserd_state(
+            nonce.clone(),
+            1,
+            "https://evil.example".into(),
+            ticket.clone(),
+        ));
+        assert_eq!(bad["alive"], json!(false), "alive 계약은 불변이어야 한다");
+        assert_eq!(bad["code"], json!(EMBED_INTENT_INVALID_CODE));
+        assert!(
+            bad["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "사유 문구가 실려야 한다: {bad}"
+        );
+
+        // ② 세션 부재(=GUI peer 미등록) — 최빈 실제 고장. RPC를 보내기 전에 끊긴다.
+        *BROWSER_APP_SESSION.write().unwrap() = None;
+        let unregistered =
+            tauri::async_runtime::block_on(browserd_state(nonce, 1, origin.into(), ticket));
+        assert_eq!(unregistered["alive"], json!(false));
+        assert_eq!(
+            unregistered["code"],
+            json!(GUI_NOT_REGISTERED_CODE),
+            "미등록은 브로커 동명 사인으로 올라와야 클릭 재등록 처방과 수렴한다: {unregistered}"
+        );
+        assert!(unregistered["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("registration")));
+    }
+
+    /// ★F-3 회귀 핀: 등록 RPC는 **연결은 됐지만 응답하지 않는** cysd 앞에서 상한 내에 실패하고,
+    /// `GUI_REGISTRATION_FLIGHT` 뮤텍스를 즉시 놓아줘 다음 시도(=신뢰 클릭 경로)가 진행된다.
+    /// 상한이 없으면 `rpc_once`의 `read_line`이 영원히 블록해 뮤텍스가 영구 점유되고, 이 브랜치가
+    /// 도입한 single-flight 직렬화 때문에 클릭 경로까지 통째로 봉쇄된다(회귀 조건).
+    #[cfg(unix)]
+    #[test]
+    fn gui_registration_times_out_on_hung_socket_and_releases_the_flight() {
+        use tokio::net::UnixListener;
+        let _guard = SESSION_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cys-gui-reg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let hang_sock = dir.join("hang.sock");
+        let _ = std::fs::remove_file(&hang_sock);
+        *BROWSER_APP_SESSION.write().unwrap() = None; // 세션 없음 = 실제 등록을 시도하는 상태
+
+        let deadline = std::time::Duration::from_millis(300);
+        tauri::async_runtime::block_on(async {
+            // 무응답 소켓: accept만 하고 응답을 주지 않는다(= hang한 cysd).
+            let hang = UnixListener::bind(&hang_sock).unwrap();
+            tauri::async_runtime::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = hang.accept().await {
+                    held.push(s); // 연결 유지 — EOF를 주면 timeout이 아니라 즉시 실패가 된다
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // bind 안정화
+
+            for attempt in 1..=2 {
+                let started = std::time::Instant::now();
+                let result = ensure_browser_gui_peer_on(&hang_sock, deadline).await;
+                let elapsed = started.elapsed();
+                let failure = result.expect_err("무응답 데몬에서 등록이 성공할 수 없다");
+                assert_eq!(
+                    failure.code, RPC_TRANSPORT_FAILED_CODE,
+                    "상한 초과는 전송 계층 실패로 올라온다 (attempt {attempt}): {failure:?}"
+                );
+                assert!(
+                    failure.message.contains("did not answer"),
+                    "상한 초과 사유가 message에 남아야 한다 (attempt {attempt}): {failure:?}"
+                );
+                assert!(
+                    elapsed < deadline * 10,
+                    "등록은 상한 안에서 끝나야 한다 (attempt {attempt}): {elapsed:?}"
+                );
+                // 뮤텍스 해제 확인 — 잠긴 채로 남으면 다음 시도(클릭 경로)가 영영 못 들어온다.
+                assert!(
+                    gui_registration_flight().try_lock().is_ok(),
+                    "실패 후 single-flight 뮤텍스가 해제돼야 한다 (attempt {attempt})"
+                );
+            }
+        });
+        assert!(
+            BROWSER_APP_SESSION.read().unwrap().is_none(),
+            "실패한 등록이 세션을 남기면 안 된다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// [WS-1] 배너 선두 사인은 UI 절단(castFailureReason maxLen=200) 안에 반드시 남아야 한다.
