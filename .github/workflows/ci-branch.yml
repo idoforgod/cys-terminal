@@ -20,6 +20,10 @@ jobs:
   # 잡1 — macOS: Rust 컴파일 체크(T3 main.rs slug 등) + 파리티 팩 테스트 + cys-dept 문법.
   macos-rust-pack:
     runs-on: macos-latest
+    # hang 상한 — 미지정 시 GitHub 기본은 360분(6시간)이다(release.yml build 잡과 동일 근거).
+    # 브랜치 레인은 릴리스보다 가볍지만(로컬 실측 cargo check + 팩 테스트 ~15분), 러너 stall이
+    # 한 번 걸리면 feat/** 푸시마다 동시성 슬롯이 6시간 묶여 릴리스 레인까지 굶는다.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -394,6 +398,8 @@ jobs:
   # 잡2 — macOS: UI bun 테스트(bootbanner.test.ts 포함 — T3 배너 소켓 스코핑·백스톱 순수함수).
   macos-ui-bun:
     runs-on: macos-latest
+    # bun install + bun test 는 수 분이면 끝난다 — 그 이상은 네트워크·러너 stall이다.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -415,6 +421,8 @@ jobs:
   # 잡3 — Windows: 파리티 팩 테스트(크로스플랫폼 회귀 — fcntl→msvcrt·경로·CRLF).
   windows-pack:
     runs-on: windows-latest
+    # 순수-python 5종뿐이라 분 단위다. Windows 러너는 부팅이 느려 20분으로 둔다.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
