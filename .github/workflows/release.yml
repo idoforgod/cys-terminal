@@ -123,6 +123,9 @@ jobs:
                                             # createUpdaterArtifacts=true(tauri.windows.conf.json) + 서명키로
                                             # setup.exe는 Authenticode+RFC3161 뒤 updater 서명을 다시 생성한다.
     runs-on: ${{ matrix.platform }}
+    # hang 상한 — 미지정 시 GitHub 기본은 360분(6시간)이다. 서명·공증 대기나 러너 stall이
+    # 한 번 걸리면 릴리스 레인 전체가 6시간 묶이고 동시성 슬롯도 함께 잠긴다.
+    timeout-minutes: 90
 
     # Explicit, auditable opt-out for the unsigned Windows distribution model
     # (unsigned exe + zip + Windows Defender guidance). Only ALLOW_UNSIGNED_WINDOWS=='1'
@@ -331,6 +334,11 @@ jobs:
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
+          # ★WS-7: `--bin cys` 레인 — doctor 진단(고아 소켓·시작 락 fail-closed)·버전 게이트·resume
+          #   게이트 테스트가 CI에서 **한 번도 실행된 적이 없다**(위 두 줄은 cysd 바이너리와 lib만 돈다).
+          #   doctor --fix는 라이브 소켓·락 파일을 만지는 파괴적 경로라 회귀 무방비가 특히 위험하다.
+          #   --test-threads=1: doctor 테스트가 프로세스 전역 env(CYS_DOCTOR_*)를 교대한다.
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
 
       # src-tauri(cys-app) 단위 게이트 — 위 phoenix 스텝의 `cargo test --bin cysd|--lib`는 둘 다 루트
       # crate(cys-terminal)라 src-tauri crate 테스트(browserd state 파싱 등 Tauri command 단위)가 CI에서
