@@ -7,7 +7,7 @@ use cys::browser_runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -242,7 +242,6 @@ struct GuiExecutableIdentity {
 #[derive(Default)]
 struct GuiPeerRegistry {
     sessions: HashMap<u32, RegisteredGuiPeer>,
-    used_registration_secrets: HashSet<String>,
     pending_challenges: HashMap<String, PendingGuiChallenge>,
 }
 
@@ -286,48 +285,64 @@ impl GuiPeerRegistry {
         Ok(challenge)
     }
 
+    /// GUI peer 등록 (WS-4). 순서는 **명문화된 계약**이다: prune → 멱등 재등록 → 신규 등록.
+    ///
+    /// `alive`는 주입형 판정자다(`deadman.rs`의 `verify_cysd: impl Fn(u32)->bool` 선례). 레지스트리를
+    /// 순수하게 유지해 단위 테스트가 프로세스 없이 픽스처만으로 죽은 peer를 모사할 수 있게 한다.
+    /// 계약: 호출자는 **락 밖에서 만든 단일 스냅샷**을 닫아 넘긴다(`register_gui_peer` 참조).
+    /// 좀비(defunct)는 `start_time`이 유지되므로 "존재"로 취급한다 — 대장 항목을 지우는 쪽이
+    /// 더 위험하기 때문이다. codesign·해시 재검증은 여기서 절대 하지 않는다(등록 시 1회로 족하다).
     fn register(
         &mut self,
         one_time_secret: &str,
         identity: GuiExecutableIdentity,
         now_ms: u64,
+        alive: &dyn Fn(u32, u64) -> bool,
     ) -> Result<String, BrokerFailure> {
         validate_hex_secret(one_time_secret, "GUI registration secret")?;
         validate_gui_identity_shape(&identity)?;
+        // ① prune — 죽은 GUI 화신이 MAX_GUI_PEERS 슬롯을 영구 점유해 재시작한 GUI가
+        //    GUI_REGISTRATION_LIMIT으로 영영 등록 못 하던 경로를 닫는다(F6).
+        self.sessions
+            .retain(|pid, peer| alive(*pid, peer.identity.start_time));
         let secret_hash = sha256_id(one_time_secret.as_bytes());
-        if self.used_registration_secrets.contains(&secret_hash) {
+        // 거부 사유 분해(WS-8 정합): code 문자열은 계약이라 불변, 사유는 message 뒤 괄호 부기.
+        // `used_registration_secrets` 집합은 pending 소비와 완전 중복이라 제거했다(무한 증가 누수도
+        // 함께 사라진다). 대신 미발급/기소비는 tombstone이 없어 **구별 불가**이므로 정직하게 묶어
+        // 적고, 만료만 별도 분기로 분해한다.
+        let Some(challenge) = self.pending_challenges.get(&secret_hash) else {
             return Err(BrokerFailure::new(
                 "GUI_REGISTRATION_REPLAY",
-                "GUI one-time registration secret was already consumed",
-            ));
-        }
-        let Some(challenge) = self.pending_challenges.remove(&secret_hash) else {
-            return Err(BrokerFailure::new(
-                "GUI_REGISTRATION_REPLAY",
-                "GUI registration challenge is unknown or already consumed",
+                "GUI registration challenge is unknown or already consumed (사유: 미발급 또는 기소비)",
             ));
         };
-        if challenge.expires_at_ms <= now_ms || challenge.identity != identity {
+        if challenge.expires_at_ms <= now_ms {
+            self.pending_challenges.remove(&secret_hash);
+            return Err(BrokerFailure::new(
+                "GUI_REGISTRATION_REPLAY",
+                "GUI registration challenge is unknown or already consumed (사유: 만료)",
+            ));
+        }
+        if challenge.identity != identity {
             return Err(BrokerFailure::new(
                 "GUI_IDENTITY_MISMATCH",
-                "GUI registration challenge is expired or bound to another process identity",
+                "GUI registration challenge is bound to another process identity",
             ));
         }
-        if self.sessions.contains_key(&identity.pid) {
-            return Err(BrokerFailure::new(
-                "GUI_ALREADY_REGISTERED",
-                "GUI process incarnation is already registered",
-            ));
-        }
-        if self.sessions.len() >= MAX_GUI_PEERS {
+        // 신원까지 일치한 뒤에야 one-time challenge를 소비한다(실패 경로가 challenge를 태우지 않게).
+        self.pending_challenges.remove(&secret_hash);
+        let session = crate::channels::random_token_hex()
+            .map_err(|error| BrokerFailure::new("AUTHORITY_UNAVAILABLE", error))?;
+        // ② 멱등 재등록 — 같은 pid 화신의 재등록은 **교체**다. MAX 검사는 생략한다(슬롯 증가 0).
+        //    새 challenge를 이미 통과했으므로 신원은 재확인된 상태다. 종전 GUI_ALREADY_REGISTERED는
+        //    폐기(소비자 0 확인) — 데몬이 살아있는 채 GUI만 재시도하면 영구 거부되던 경로였다.
+        // ③ 신규 등록만 MAX 검사를 받는다.
+        if !self.sessions.contains_key(&identity.pid) && self.sessions.len() >= MAX_GUI_PEERS {
             return Err(BrokerFailure::new(
                 "GUI_REGISTRATION_LIMIT",
                 "GUI registration registry is at its hard limit",
             ));
         }
-        let session = crate::channels::random_token_hex()
-            .map_err(|error| BrokerFailure::new("AUTHORITY_UNAVAILABLE", error))?;
-        self.used_registration_secrets.insert(secret_hash);
         self.sessions.insert(
             identity.pid,
             RegisteredGuiPeer {
@@ -415,11 +430,22 @@ impl<L: SupervisorLauncher> AuthorityBroker<L> {
         one_time_secret: &str,
         identity: GuiExecutableIdentity,
     ) -> Result<String, BrokerFailure> {
-        self.inner
-            .lock()
-            .unwrap()
-            .gui_peers
-            .register(one_time_secret, identity, unix_millis())
+        // ★비용 규약(WS-4): 생존 판정은 **락 밖에서 단 한 번** 스냅샷으로 만든다.
+        // sysinfo는 macOS에서 타깃 pid 조회조차 내부적으로 전 프로세스를 열거하므로,
+        // peer 4개를 각각 `System::new()`로 물으면 `inner` 뮤텍스를 쥔 채 수십 ms를 태운다
+        // (handlers.rs의 동일 함정 경고 주석과 같은 계열). 추적 pid 목록만 짧게 읽고 락을 놓는다.
+        let tracked: Vec<u32> = {
+            let inner = self.inner.lock().unwrap();
+            inner.gui_peers.sessions.keys().copied().collect()
+        };
+        let snapshot = live_process_start_times(&tracked);
+        let alive = |pid: u32, start_time: u64| snapshot.get(&pid) == Some(&start_time);
+        self.inner.lock().unwrap().gui_peers.register(
+            one_time_secret,
+            identity,
+            unix_millis(),
+            &alive,
+        )
     }
 
     fn issue_gui_challenge(
@@ -1296,6 +1322,26 @@ impl GuiPeerVerifier for PlatformGuiPeerVerifier {
     }
 }
 
+/// 주어진 pid들의 생존 여부와 `start_time`을 **단일 sysinfo 스냅샷**으로 회수한다(WS-4).
+/// 반환 map에 없는 pid = 사망. 있는 pid의 `start_time` 불일치 = pid 재사용(다른 화신).
+/// 좀비(defunct)는 여전히 열거되므로 "생존"으로 나온다 — 대장 유지가 안전 측이다.
+fn live_process_start_times(pids: &[u32]) -> HashMap<u32, u64> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let targets: Vec<Pid> = pids.iter().map(|pid| Pid::from_u32(*pid)).collect();
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&targets), true);
+    pids.iter()
+        .filter_map(|pid| {
+            system
+                .process(Pid::from_u32(*pid))
+                .map(|process| (*pid, process.start_time()))
+        })
+        .collect()
+}
+
 fn inspect_gui_executable_identity(pid: u32) -> Result<GuiExecutableIdentity, BrokerFailure> {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let mut system = System::new();
@@ -1934,8 +1980,150 @@ mod tests {
         }
     }
 
+    /// WS-4 테스트 픽스처: 진짜 GUI와 형태가 같은 신원(pid·화신만 다름).
+    fn gui_identity(pid: u32, start_time: u64) -> GuiExecutableIdentity {
+        GuiExecutableIdentity {
+            pid,
+            start_time,
+            canonical_executable: "/Applications/cys.app/Contents/MacOS/cys-app".into(),
+            code_sign_identity: "macos:com.cysjavis.terminal:Q43YA2NMF9".into(),
+            executable_sha256: format!("sha256:{}", "a".repeat(64)),
+        }
+    }
+
+    /// challenge 발급 → 등록의 정상 2단 핸드셰이크(테스트 편의 래퍼).
+    fn handshake(
+        registry: &mut GuiPeerRegistry,
+        identity: &GuiExecutableIdentity,
+        now_ms: u64,
+        alive: &dyn Fn(u32, u64) -> bool,
+    ) -> Result<String, BrokerFailure> {
+        let secret = registry.issue_challenge(identity.clone(), now_ms)?;
+        registry.register(&secret, identity.clone(), now_ms + 1, alive)
+    }
+
+    /// ① 죽은 peer가 **정확히 MAX(4)개** 슬롯을 채운 상태에서 5번째 등록이 성공한다.
+    /// 픽스처가 3개면 prune이 없어도 통과하므로(빈 슬롯 잔존) 반드시 4개여야 탐지력이 있다.
+    #[test]
+    fn gui_registry_prunes_exactly_max_dead_peers_before_admitting_a_new_one() {
+        let alive_all = |_: u32, _: u64| true;
+        let mut registry = GuiPeerRegistry::default();
+        let dead: Vec<GuiExecutableIdentity> = (901..905)
+            .map(|pid| gui_identity(pid, 1_000 + u64::from(pid)))
+            .collect();
+        for (index, identity) in dead.iter().enumerate() {
+            handshake(&mut registry, identity, 1_000 + index as u64 * 10, &alive_all).unwrap();
+        }
+        assert_eq!(registry.sessions.len(), MAX_GUI_PEERS, "슬롯이 가득 찬 전제");
+
+        // 죽은 4개는 스냅샷에 없고, 새 GUI만 살아 있다.
+        let fresh = gui_identity(910, 777);
+        let only_fresh_alive = |pid: u32, _: u64| pid == 910;
+        handshake(&mut registry, &fresh, 5_000, &only_fresh_alive)
+            .expect("죽은 peer 4개가 prune되어 5번째 등록이 성공해야 한다");
+        assert_eq!(
+            registry.sessions.len(),
+            1,
+            "prune 후 살아있는 신규 peer만 남는다"
+        );
+    }
+
+    /// ② 살아있는 peer는 prune되지 않는다 — 한계 초과는 여전히 LIMIT으로 fail-closed.
+    #[test]
+    fn gui_registry_never_prunes_a_live_peer() {
+        let alive_all = |_: u32, _: u64| true;
+        let mut registry = GuiPeerRegistry::default();
+        let live: Vec<GuiExecutableIdentity> = (901..905)
+            .map(|pid| gui_identity(pid, 1_000 + u64::from(pid)))
+            .collect();
+        let mut sessions = Vec::new();
+        for (index, identity) in live.iter().enumerate() {
+            sessions.push(
+                handshake(&mut registry, identity, 1_000 + index as u64 * 10, &alive_all).unwrap(),
+            );
+        }
+        let intruder = gui_identity(910, 777);
+        assert_eq!(
+            handshake(&mut registry, &intruder, 5_000, &alive_all)
+                .unwrap_err()
+                .code,
+            "GUI_REGISTRATION_LIMIT"
+        );
+        assert_eq!(registry.sessions.len(), MAX_GUI_PEERS);
+        // 살아있는 peer의 세션은 prune 시도에도 그대로 유효하다.
+        registry.validate(901, &sessions[0], &live[0]).unwrap();
+    }
+
+    /// ③ 만료된 challenge와 이미 소비된 secret은 둘 다 REPLAY로 fail-closed(code 불변),
+    /// 사유만 message 뒤 괄호로 분해된다.
+    #[test]
+    fn gui_registry_rejects_expired_and_reused_secrets_as_replay() {
+        let alive_all = |_: u32, _: u64| true;
+        let mut registry = GuiPeerRegistry::default();
+        let identity = gui_identity(77, 101);
+
+        let expired = registry.issue_challenge(identity.clone(), 1_000).unwrap();
+        let failure = registry
+            .register(
+                &expired,
+                identity.clone(),
+                1_000 + GUI_CHALLENGE_TTL_MS + 1,
+                &alive_all,
+            )
+            .unwrap_err();
+        assert_eq!(failure.code, "GUI_REGISTRATION_REPLAY");
+        assert!(failure.message.contains("만료"), "사유 분해: {failure:?}");
+
+        let secret = registry.issue_challenge(identity.clone(), 2_000).unwrap();
+        registry
+            .register(&secret, identity.clone(), 2_001, &alive_all)
+            .unwrap();
+        let failure = registry
+            .register(&secret, identity.clone(), 2_002, &alive_all)
+            .unwrap_err();
+        assert_eq!(failure.code, "GUI_REGISTRATION_REPLAY");
+        assert!(
+            failure.message.contains("기소비"),
+            "사유 분해: {failure:?}"
+        );
+    }
+
+    /// ④ 같은 pid 화신의 재등록은 **교체**다 — 슬롯이 늘지 않으므로 MAX 검사를 받지 않는다.
+    /// (종전 GUI_ALREADY_REGISTERED 폐기: 데몬 생존 중 GUI만 재시도하면 영구 거부되던 경로.)
+    #[test]
+    fn gui_registry_replaces_same_pid_without_applying_the_max_limit() {
+        let alive_all = |_: u32, _: u64| true;
+        let mut registry = GuiPeerRegistry::default();
+        let live: Vec<GuiExecutableIdentity> = (901..905)
+            .map(|pid| gui_identity(pid, 1_000 + u64::from(pid)))
+            .collect();
+        let mut first_session = String::new();
+        for (index, identity) in live.iter().enumerate() {
+            let session =
+                handshake(&mut registry, identity, 1_000 + index as u64 * 10, &alive_all).unwrap();
+            if index == 0 {
+                first_session = session;
+            }
+        }
+        assert_eq!(registry.sessions.len(), MAX_GUI_PEERS, "한계까지 채운 전제");
+
+        let replaced = handshake(&mut registry, &live[0], 5_000, &alive_all)
+            .expect("MAX에 도달했어도 같은 pid 재등록은 교체라 허용된다");
+        assert_ne!(replaced, first_session, "재등록은 새 세션을 발급한다");
+        assert_eq!(registry.sessions.len(), MAX_GUI_PEERS, "슬롯 수는 불변");
+        // 낡은 세션은 더 이상 통하지 않는다(교체의 의미).
+        assert_eq!(
+            registry
+                .validate(901, &first_session, &live[0])
+                .unwrap_err()
+                .code,
+            "GUI_IDENTITY_MISMATCH"
+        );
+    }
+
     #[test]
     fn gui_registration_binds_pid_incarnation_canonical_binary_and_code_identity() {
+        let alive_all = |_: u32, _: u64| true;
         let mut registry = GuiPeerRegistry::default();
         let genuine = GuiExecutableIdentity {
             pid: 77,
@@ -1946,7 +2134,7 @@ mod tests {
         };
         let one_time = registry.issue_challenge(genuine.clone(), 1_000).unwrap();
         let session = registry
-            .register(&one_time, genuine.clone(), 1_001)
+            .register(&one_time, genuine.clone(), 1_001, &alive_all)
             .unwrap();
         registry.validate(77, &session, &genuine).unwrap();
 
@@ -1964,7 +2152,9 @@ mod tests {
             "GUI_IDENTITY_MISMATCH"
         );
         let second = registry.issue_challenge(genuine.clone(), 2_000).unwrap();
-        let session = registry.register(&second, genuine.clone(), 2_001).unwrap();
+        let session = registry
+            .register(&second, genuine.clone(), 2_001, &alive_all)
+            .unwrap();
         let pid_reuse = GuiExecutableIdentity {
             start_time: 102,
             ..genuine.clone()
@@ -1978,7 +2168,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .register(&one_time, genuine, 2_002)
+                .register(&one_time, genuine, 2_002, &alive_all)
                 .unwrap_err()
                 .code,
             "GUI_REGISTRATION_REPLAY"
