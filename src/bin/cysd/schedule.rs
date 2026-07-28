@@ -1384,7 +1384,7 @@ mod tests {
             now_epoch().to_bits()
         ));
         std::fs::create_dir_all(&exe_dir).unwrap();
-        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/me"), None);
+        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None);
         let path = pairs
             .iter()
             .find(|(k, _)| k == "PATH")
