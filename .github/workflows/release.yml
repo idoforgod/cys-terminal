@@ -190,10 +190,12 @@ jobs:
             x86_64-apple-darwin)  ARCH=x64 ;;
             *) echo "unexpected target: $TRIPLE"; exit 1 ;;
           esac
-          # ★스테일 사이드카 차단(run 30362160225 실증 — rust-cache 복원 후 cargo 가 x64 cysd
-          #   재빌드를 스킵해 구세대 바이너리가 출하 직전까지 감). 자사 크레이트만 강제 재빌드 —
-          #   의존성 캐시는 유지되므로 비용은 수분.
-          cargo clean -p cys-terminal -p cys-app 2>/dev/null || cargo clean
+          # ★스테일 사이드카 차단 v2(run 30364472849 실증 — `cargo clean -p` 는 --target 없이
+          #   호스트 타깃 디렉토리만 청소해 크로스(target/<triple>/) 산출물이 생존한다).
+          #   자사 크레이트의 지문·산출물을 네이티브/크로스 양 경로에서 외과 제거 — 의존성 캐시 유지.
+          for TD in "target/release" "target/$TRIPLE/release"; do
+            rm -rf "$TD/.fingerprint"/cys-* "$TD"/cys "$TD"/cysd "$TD"/cys-app* "$TD"/deps/cys* 2>/dev/null || true
+          done
           bash scripts/build-macos-signed.sh "$TRIPLE"
           # ★경로 정규화 — 스크립트는 네이티브(호스트=타깃) 빌드에서 target/release/bundle 을 쓰지만,
           #   아래 tauri-action(tauriScript=true·args --target)은 target/<triple>/release/bundle 에서 수집한다.
@@ -240,8 +242,10 @@ jobs:
           PYTHONIOENCODING: 'utf-8'
         run: |
           set -euo pipefail
-          # ★스테일 사이드카 차단(macOS 스텝과 대칭 — run 30362160225 x64 레그 실증)
-          cargo clean -p cys-terminal -p cys-app 2>/dev/null || cargo clean
+          # ★스테일 사이드카 차단 v2(macOS 스텝과 대칭 — cargo clean -p 는 크로스 경로 미청소)
+          for TD in "target/release" "target/${{ matrix.target }}/release"; do
+            rm -rf "$TD/.fingerprint"/cys-* "$TD"/cys.exe "$TD"/cysd.exe "$TD"/cys-app* "$TD"/deps/cys* 2>/dev/null || true
+          done
           # ① NSIS 빌드(beforeBuildCommand=bundle-prep 포함) — 종전 tauri-action 기본 러너와 동일 CLI 경로
           bun x @tauri-apps/cli@2 build --target "${{ matrix.target }}"
           # ② CRT 게이트 — 업로드 전 최종 바이트 검증
