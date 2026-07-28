@@ -64,6 +64,15 @@ fn scrub_claude_session_env() {
 
 #[tokio::main]
 async fn main() {
+    // ★수리 세대 부팅 로그 — 릴리스 게이트 마커의 확정 임베드 지점(v4).
+    // main() 첫 실행 경로라 어떤 타깃·최적화에서도 데드코드 제거가 불가능하다
+    // (v3 status() 참조는 x86_64 코드젠에서 함수째 소거됨 — run 30367192331 실증).
+    // 부수 효용: 데몬 stderr 로그 첫 줄에서 설치본 수리 세대를 즉시 판별.
+    eprintln!(
+        "[cysd] v{} {}",
+        env!("CARGO_PKG_VERSION"),
+        crate::schedule::FIX_GENERATION
+    );
     scrub_claude_session_env();
 
     // ★W1(조기 단일 인스턴스 게이트): 소켓 경로 확정 직후·pack 설치보다 먼저 단일 인스턴스 게이트를
