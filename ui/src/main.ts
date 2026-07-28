@@ -17,6 +17,7 @@ import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purge
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
+import { classifyMouseReport } from "./mousefilter";
 
 declare global {
   interface Window {
@@ -31,6 +32,9 @@ declare global {
     };
   }
 }
+// 플랫폼 판별은 세션·페인마다 다시 할 이유가 없다 — 모듈 로드 시 1회만 읽는다(마우스 보고 필터가 소비).
+const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
+
 const invoke = (cmd: string, args?: Record<string, unknown>) => window.__TAURI__.core.invoke(cmd, args);
 const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
   window.__TAURI__.event.listen(name, handler);
@@ -1990,6 +1994,23 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   let insertLeak: string | null = null;
 
   term.onData((data) => {
+    // ★Windows 마우스 보고 유출 차단 (현장 결함 1호 · Parallels Windows 실기 제보).
+    // Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면 xterm.js가 마우스 보고를 PTY로 보내는데,
+    // Windows는 ConPTY 입력 계층이 시퀀스를 깨뜨려 선두 ESC가 소실된 `[555;98;34M...`가 Claude Code
+    // 입력창에 리터럴로 무한 타이핑된다. macOS는 앱이 정상 소비하므로 **Windows에서만** 배선한다
+    // (계약: IS_WINDOWS 가드 밖으로 꺼내지 말 것 — macOS 회귀 0이 이 가드에 걸려 있다).
+    //   휠 → PTY 전송 대신 로컬 스크롤로 번역. 방향키 시퀀스 주입은 금지다(의도된 결정) —
+    //        Claude Code의 입력 히스토리를 오염시킨다. 노치당 3줄은 통상 터미널 관용.
+    //   그 외 마우스 보고 → 무음 폐기.
+    //   마우스 보고가 아니면 바이트 하나 건드리지 않고 아래 IME 경로로 그대로 내려보낸다.
+    if (IS_WINDOWS) {
+      const mouse = classifyMouseReport(data);
+      if (mouse.kind === "wheel") {
+        term.scrollLines(mouse.dir * 3 * mouse.count);
+        return;
+      }
+      if (mouse.kind === "drop") return;
+    }
     // 완성 음절은 그대로 PTY로 — 잔여 pending이 있으면 리듀서가 순서 보존 후 함께 전송(안전장치).
     // Windows 등 비-WKWebView에선 input 핸들러·insertLeak 감지 미배선이라 insertLeak이 항상 null →
     // duplicate=false → 순수 send(data)와 동일(회귀 0). WKWebView에서 insertText 자모 유출만 폐기.
