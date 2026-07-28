@@ -11,6 +11,8 @@ pub mod license;
 pub mod pack;
 pub mod packsig;
 pub mod overrides;
+pub mod todo_decl;
+pub mod todo_scan;
 pub mod wire;
 #[cfg(target_os = "macos")]
 pub mod launchd;

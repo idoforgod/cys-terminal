@@ -1,0 +1,322 @@
+name: ci-branch
+
+# 브랜치 푸시 기계검증. 태그·릴리스 트리거 없음(feat/** push 전용).
+# 릴리스 게이트(release.yml)와 별개 — 이건 브랜치 개발 중 회귀를 조기에 잡는 가벼운 CI다.
+#
+# ⚠백포트 유래(0.14.2 레인 · 2026-07-29). 이 파일은 v0.13.18 레인의 `ci-branch.yml` 에서
+#   **선언 기반 상태 아키텍처 관련 두 덩어리만** 옮겨 온 것이다:
+#     ①팩 스위트 레인 대조(3레인 목록 드리프트 차단)  ②게이트 대장·파리티·유령집계 회귀 잡
+#   원 레인의 나머지 스텝(bundle-prep·cargo check --workspace·능력 파리티 7종·C03 전핀·
+#   bun UI 잡·Windows 잡)은 이 브랜치의 범위가 아니어서 **의도적으로 가져오지 않았다**.
+#   그것들을 나중에 편입할 때는 아래 레인 대조 게이트의 ALLOWED 도 함께 갱신해야 한다.
+
+on:
+  push:
+    branches: ['feat/**']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # 잡1 — macOS: 레인 목록 대조 + 선언/유령집계 팩 스위트 회귀.
+  macos-rust-pack:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ★팩 스위트 레인 대조(S31 · 2026-07-26 / **3레인 확장 W19 · 같은 날**). **이 스텝이 왜
+      #   존재하는가**: 브랜치 레인(ci-branch.yml)·태그 레인(release.yml)·팩-only 레인
+      #   (pack-release.yml)의 팩 테스트 목록이 갈리는 것을 **사람이 눈으로 대조하는 방식은 이미
+      #   세 번 실패했다** —
+      #     · C-1: 브랜치에만 있고 릴리스에 없음 → 태그에서 검증 공백
+      #     · R4: 릴리스에만 있고 브랜치에 없음(test_todo_stamp) → 브랜치 초록이 거짓 신호,
+      #           회귀가 20분짜리 태그 런에서야 발견
+      #     · C-1 세 번째 문: 위 둘을 맞추고 "닫혔다"고 적었으나 **pack-release.yml 은 애초에 대조
+      #           대상이 아니었다**. 그 레인이 pack.tar.gz 를 만들고 pack-manifest.json 을 minisign
+      #           서명하는 실제 배송 경로인데, 배송되는 Python 파서가 파리티 0회로 봉인되고 있었다.
+      #           (S26 = min_binary 하한을 release.yml 에만 고치고 pack-release.yml 을 방치한 사고와
+      #            **같은 계급**. 이 리포가 반복해 당하는 형태는 언제나 '레인 하나를 빼먹음'이다.)
+      #   세 방향 모두 "목록이 여러 파일에 손으로 복제돼 있다"는 같은 원인이다. 리뷰·주석으로는 못
+      #   막고, **모든 레인 파일에서 이름 집합을 뽑아 전 쌍을 대조하는 기계**만이 막는다. 그 기계가
+      #   이 스텝이다. 2레인 대조는 이 결함을 구조적으로 볼 수 없었다 — 세 번째 파일이 입력에
+      #   없었기 때문이다.
+      # 위치 근거: checkout 직후 = Rust/Bun 셋업(수 분) 앞. 비대칭은 1초 안에 알 수 있어야 한다.
+      #
+      # ⚠**정직한 한계 — 이 게이트가 못 보는 것**(과신 금지):
+      #   1) 추출은 **주석을 제거한 뒤의 정규식 `test_[a-z0-9_]+`** 이다. 즉 **텍스트 존재**를 볼 뿐
+      #      "그 스위트가 실제로 실행되는가"는 모른다. 이름이 실행되지 않는 자리(변수 기본값, 죽은
+      #      분기, `[ -f ]` 존재검사만)에 적혀 있어도 '있음'으로 센다.
+      #   2) **파일 단위 합집합** 비교다. 잡·OS 단위가 아니다 — 예컨대 ci-branch 의 Windows 잡에만
+      #      있고 macOS 잡에 없는 스위트도 '있음'으로 통과한다(Windows 제외 목록은 의도된 설계라
+      #      이 입도를 택했다). 잡별 대조가 필요해지면 이 스크립트를 확장해야 한다.
+      #   3) **동적 생성·글롭은 못 편다**. `test_phoenix_*.py` 는 토큰 `test_phoenix_` 하나로 잡히고,
+      #      셸 변수로 조립되는 이름은 아예 안 보인다.
+      #   4) 주석 제거는 `#` 이후를 자르는 단순 방식이라, 문자열 안의 `#` 이 있으면 과다 절단된다
+      #      (현재 세 파일에는 해당 사례 없음 — 생기면 이 게이트가 이름을 놓칠 수 있다).
+      #   5) **이 스텝 자신은 스캔에서 제외된다**(SELF-BEGIN/END 표식). 아래 ALLOWED 의 이름들이
+      #      ci-branch.yml 의 '코드'이기도 해서, 제외하지 않으면 게이트가 **자기 allowlist 를 읽고**
+      #      그 이름을 "ci-branch 에 있음"으로 오판한다(실측 — 초안이 이 함정에 그대로 빠졌다).
+      #      대가: 이 스텝 안에서만 언급되는 스위트는 어느 집합에도 안 잡힌다(의도된 맞교환).
+      #   6) **레인 목록은 아래 LANES 에 하드코딩된 3종이 전부다**(W19 추가). 팩 테스트를 돌리는
+      #      네 번째 워크플로우가 생겨도 LANES 에 등재하기 전까지 그 레인은 대조 밖에 있다 —
+      #      이번 결함(pack-release.yml 미편입)의 재발 경로가 정확히 이것이다. 새 워크플로우가
+      #      `cysjavis-pack/bin/tests/` 를 실행하기 시작하면 **여기 먼저 등재하라**.
+      #   요약: 이건 **복제된 목록의 드리프트 조기 경보**이지 커버리지 증명이 아니다.
+      # LANE-GATE-SELF-BEGIN
+      - name: 팩 스위트 레인 대조 (ci-branch ⇔ release ⇔ pack-release 목록 드리프트 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys
+
+          # 팩 테스트를 실행하는 **모든** 레인. 여기 없는 워크플로우는 대조 밖이다(한계 6).
+          LANES = {
+              "ci-branch":    ".github/workflows/ci-branch.yml",
+              "release":      ".github/workflows/release.yml",
+              "pack-release": ".github/workflows/pack-release.yml",
+          }
+
+          # 레인별 "빠지면 무엇이 거짓말이 되는가" — 에러 메시지에 붙여 편입 방향을 지시한다.
+          HINT = {
+              "ci-branch":    "브랜치 초록이 거짓 신호가 된다(R4 계급)",
+              "release":      "태그 레인에 검증 공백이 생긴다(C-1 계급)",
+              "pack-release": "배송 팩이 검증 0회로 tar·서명·봉인된다(C-1 세 번째 문 계급)",
+          }
+
+          # 의도된 비대칭만 여기 등재한다. 값 = (**있어야 하는 레인 집합**, 이유).
+          # **이유 없는 등재 금지** — 등재는 "왜 일부 레인에만 있어도 되는가"를 다음 사람에게 설명하는
+          # 자리다. 새 비대칭을 만들려면 여기에 근거를 적어야 하고, 그 마찰이 이 게이트의 목적이다
+          # (조용한 드리프트 → 명시적 결정으로 전환). ★"팩 레인이라 생략"은 이유가 아니다 —
+          # 그 스위트가 팩 배송과 **왜** 무관한지, 무관하지 않다면 무엇이 막고 있는지를 적어라.
+          ALLOWED = {
+              "test_phoenix_": (
+                  {"release"},
+                  "release 전용(`test_phoenix_*.py` 글롭 · 실측 13종 · 2026-07-29). "
+                  "**팩 배송과 무관해서가 아니다** — 대상 javis_phoenix.py 는 팩에 실려 나간다. "
+                  "실제 이유는 하네스 의존이다: release.yml build 잡은 `cargo build --bin cys "
+                  "--bin cysd` 로 실 데몬을 만들고 PHOENIX_HARNESS_CYSD 로 kill→재기동 host-level "
+                  "e2e 를 돌린다. 팩-only 레인은 manifest emit 용 `cys` 만 빌드해 cysd 가 없고, "
+                  "ci-branch 는 그 예산(수 분)을 안 쓴다. 13종 중 cysd 를 실제로 요구하는 것은 3종"
+                  "(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 나머지는 원리상 이식 "
+                  "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
+                  "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다.",
+              ),
+              "test_bootstrap_chain": (
+                  set(),
+                  "★백포트 상태(0.14.2 레인): 스위트 파일은 트리에 **실재**하지만 이 레인의 어느 "
+                  "워크플로우에도 아직 배선돼 있지 않다(원 레인은 ci-branch 의 '능력 파리티' 스텝에서 "
+                  "돌렸는데, 그 스텝은 이 백포트 범위 밖이라 가져오지 않았다). 부트 체인(heal "
+                  "프리플라이트 배선) 회귀는 밀폐(실 데몬·실 Claude 불요)라 세 레인 어디서든 돌릴 수 "
+                  "있으므로 이것은 **잔여 격차**다 — 능력 파리티 스텝을 편입할 때 ALLOWED 에서 지우고 "
+                  "레인에 배선하는 편이 정답이다(오너 판단 대기).",
+              ),
+          }
+
+          # 이 게이트 스텝 자신을 스캔에서 도려내는 표식(한계 5). 없으면 위 ALLOWED 의 이름들이
+          # ci-branch.yml 의 코드로 읽혀 자기 자신을 근거로 "있음" 판정하는 자기참조 오판이 난다.
+          SELF_BEGIN, SELF_END = "LANE-GATE-SELF-BEGIN", "LANE-GATE-SELF-END"
+
+          def names(path):
+              try:
+                  raw = open(path, encoding="utf-8").read().splitlines()
+              except OSError as e:
+                  print(f"::error::레인 파일을 읽지 못함: {path} ({e})", file=sys.stderr)
+                  sys.exit(1)
+              found, skipping = set(), False
+              for line in raw:
+                  # 표식 판정은 **주석 제거 전에** 한다(표식 자체가 주석이라 지우면 안 보인다).
+                  if SELF_BEGIN in line:
+                      skipping = True
+                      continue
+                  if SELF_END in line:
+                      skipping = False
+                      continue
+                  if skipping:
+                      continue
+                  line = re.sub(r"#.*$", "", line)      # 주석 제거(한계 4 참조)
+                  found |= set(re.findall(r"\btest_[a-z0-9_]+", line))
+              # 표식이 열린 채 끝났다면 파일 뒷부분이 통째로 스캔에서 빠진 것이다 — 그 상태의
+              # "차이 없음"은 근거가 아니다(END 를 지우면 게이트가 조용히 눈을 감는 실패 경로).
+              if skipping:
+                  print(f"::error::{path}: {SELF_BEGIN} 이후 {SELF_END} 가 없다 — 파일 뒷부분이 "
+                        f"스캔에서 누락된다. 표식을 복구하라(fail-closed).", file=sys.stderr)
+                  sys.exit(1)
+              # 측정 실패는 조용한 통과가 아니라 중단이다 — 0건이면 정규식·파일 구조가 바뀐 것이고,
+              # 그 상태의 "차이 없음"은 게이트가 아니라 껍데기다.
+              if not found:
+                  print(f"::error::{path} 에서 팩 테스트 이름을 0건 추출 — 추출기 파손 의심. "
+                        f"비교 불가로 중단한다(fail-closed).", file=sys.stderr)
+                  sys.exit(1)
+              return found
+
+          ALL = set(LANES)
+          sets = {lane: names(path) for lane, path in LANES.items()}
+          union = set().union(*sets.values())
+          # 각 이름이 실제로 존재하는 레인 집합. 이 집합이 ALL 이 아니면 **어느 한 쌍 이상이 비대칭**
+          # 이라는 뜻이다(3레인 전 쌍 대조를 집합 하나로 환원 — 쌍을 빠뜨릴 여지를 없앤다).
+          where = {n: frozenset(l for l in ALL if n in sets[l]) for n in union}
+
+          print("[레인 대조] " + " · ".join(f"{l}={len(sets[l])}종" for l in sorted(ALL))
+                + f" · 3레인 공통={len(set.intersection(*sets.values()))}종"
+                + f" · 허용 비대칭={len(ALLOWED)}종")
+
+          # 불필요해진 허용 항목은 실패가 아니라 경고 — 전 레인에 편입해 해소된 정상 상태이므로 막을
+          # 이유가 없다. 다만 방치하면 allowlist 가 근거 없는 목록으로 썩으므로 눈에 띄게 남긴다.
+          for n, (exp, why) in ALLOWED.items():
+              here = where.get(n, frozenset())
+              if here == ALL:
+                  print(f"::warning::허용 비대칭 '{n}' 이 이제 전 레인에 있다 — "
+                        f"ALLOWED 에서 제거하라(사유였던 것: {why})")
+              elif not here and exp:
+                  print(f"::warning::허용 비대칭 '{n}' 이 어느 레인에도 없다 — "
+                        f"스위트가 삭제됐다면 ALLOWED 에서도 제거하라")
+
+          drift, stale = [], []
+          for n in sorted(union):
+              here = where[n]
+              if here == ALL:
+                  continue                      # 전 레인 보유 = 대칭
+              if n in ALLOWED:
+                  exp, _why = ALLOWED[n]
+                  if here == frozenset(exp):
+                      continue                  # 등재된 형태와 실제가 일치 = 의도된 비대칭
+                  stale.append((n, here, frozenset(exp)))   # 등재는 됐으나 형태가 달라짐
+                  continue
+              drift.append((n, here))
+
+          if drift or stale:
+              print("::error::팩 테스트 스위트가 레인 사이에서 갈렸다 — 어느 한 레인의 초록이 "
+                    "거짓 신호가 된다.", file=sys.stderr)
+              for n, here in drift:
+                  for miss in sorted(ALL - here):
+                      print(f"::error::  {n}: {LANES[miss]} 에 없음(있는 레인: "
+                            f"{', '.join(sorted(here))}) → 그 파일에 편입하라 · {HINT[miss]}",
+                            file=sys.stderr)
+              for n, here, exp in stale:
+                  print(f"::error::  {n}: ALLOWED 등재 형태({', '.join(sorted(exp)) or '없음'})와 실제"
+                        f"({', '.join(sorted(here)) or '없음'})가 다르다 — 비대칭의 모양이 바뀌었다. "
+                        f"편입하거나 ALLOWED 의 레인 집합·이유를 갱신하라.", file=sys.stderr)
+              print("::error::의도된 비대칭이라면 이 스텝의 ALLOWED 에 **레인 집합과 이유를 함께** "
+                    "등재하라('팩 레인이라 생략'은 이유가 아니다).", file=sys.stderr)
+              sys.exit(1)
+
+          print("[레인 대조] 비대칭 0 — 3레인의 팩 스위트 목록 일치(허용 항목 제외)")
+          PY
+      # LANE-GATE-SELF-END
+
+      # 2언어 파리티 하네스가 rustc 를 단독 호출한다(크레이트 의존 0 불변식의 기계 증명).
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 게이트 대장 회귀 65종(javis_report_gate + javis_gate_check). v0.13.17 까지 이 스위트는
+      # CI 에도 릴리스 게이트 문서에도 편입돼 있지 않았다(실측) — 게이트 코어를 고치면서 자동
+      # 검증이 전무했다는 뜻이라 여기서 편입한다. 파리티 목록과 동형으로 파일 존재도 게이트한다.
+      #
+      # ★flake 게이트(N=5): 같은 입력에 판정이 흔들리는 스위트는 초록도 빨강도 근거가 못 된다.
+      #   실측 사고 — C71GateGuardBehavior 가 **수정 전 baseline 에서 6회 중 3회 실패**했고, 그
+      #   위양성 때문에 멀쩡한 수정을 "테스트를 깼다"고 되돌릴 뻔했다. 5회 돌려 exit code 가
+      #   하나라도 다르면 잡을 실패시킨다.
+      # ⚠정직한 한계 — 이건 값싼 조기 경보이지 보증이 아니다. 1회 실패확률 p 인 flake 를 N 회
+      #   반복이 잡을 확률은 1-(p^N+(1-p)^N) 이고, N=5 에서:
+      #     p=0.50 → 94% | p=0.30 → 83% | p=0.10 → 41% | p=0.05 → 23% | p=0.01 → 5%
+      #   즉 저확률 flake 는 그냥 통과한다. "N=5 통과 = 결정론"으로 읽지 말 것.
+      # ⚠커버리지 공백 — C71GateGuardBehavior 3종은 `~/.cys/pack` 부재 시 self-skip 이라 CI
+      #   러너(팩 미설치)에서는 **실행되지 않는다**. 즉 위 실측 flake 자체는 이 레인이 못 잡는다.
+      #   여기서 지키는 건 나머지 62종의 재현성이고, C71 은 로컬 팩 환경 검증 소관이다.
+      # 예산: 1회 약 2.6s → 5회 약 13s (측정치).
+      - name: 게이트 대장 회귀(test_report_gate) + flake 게이트 N=5 (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="cysjavis-pack/bin/tests/test_report_gate.py"
+          [ -f "$f" ] || { echo "게이트 대장 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          log="$(mktemp)"; first=""
+          for i in 1 2 3 4 5; do
+            rc=0
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$f" >"$log" 2>&1 || rc=$?
+            echo "== report-gate(mac) run $i/5: exit=$rc · $(grep -E '^(Ran |OK|FAILED)' "$log" | tr '\n' ' ')"
+            [ -n "$first" ] || first="$rc"
+            if [ "$rc" != "$first" ]; then
+              echo "FLAKE: 반복 실행 판정 불일치(run1 exit=$first, run$i exit=$rc) — 계측기 불안정" >&2
+              cat "$log" >&2; exit 1
+            fi
+          done
+          [ "$first" = "0" ] || { echo "test_report_gate 실패(exit=$first · 5회 일관)" >&2; cat "$log" >&2; exit 1; }
+
+      # ★선언 파서 2언어 파리티(설계 P3-4 · 리스크 K1/R1). **이 잡이 왜 존재하는가**:
+      #   설계 §5-4 가 "2언어 파서 drift 는 문서로 맞추면 반드시 어긋난다"고 못 박았고, 실제로
+      #   구현 첫날 Python·Rust 가 3곳에서 갈렸다(ADR-4 C-1 레거시 마커 판정 / C-2 진단 표현 /
+      #   C-3 레거시 선언 표현). 리뷰·문서·주석은 이 결합을 못 막는다 — **같은 입력을 양쪽에
+      #   먹여 결과를 대조하는 기계**만이 막는다. 그 기계가 이 스텝이다.
+      # 대조 표면 = verdict + 언어중립 diag_code + 선언 필드(owner·scope·status·legacy).
+      #   ⚠한국어 진단 **문구는 계약이 아니다**(ADR-4 C-2). 문구를 계약에 넣으면 문구를 다듬는
+      #   커밋마다 이 잡이 결함을 오보한다 — 픽스처 expected.json 에도 문구를 싣지 않는다.
+      # 픽스처 부재·빈 디렉터리는 **hard fail**(조용한 skip 은 파리티 CI 를 껍데기로 만든다 —
+      #   위 스텝들의 `[ -f "$f" ] || exit 1` 관례와 동형). 하네스 내부에서도 재차 검사한다.
+      # Rust 측은 `scripts/todo_decl_dump.rs` 를 rustc 단독 컴파일해 돌린다(파서가 크레이트
+      #   의존 0 이라는 불변식의 기계 증명 — 상세는 그 파일 헤더). 러너 PATH 에 rustc 가 있다.
+      # 예산: 컴파일 포함 약 1s(로컬 측정 · 조합 1024건 기준).
+      - name: 선언 파서 2언어 파리티 (골든 픽스처 + 조합 1024건 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="cysjavis-pack/bin/tests/fixtures/todo-decl"
+          h="cysjavis-pack/bin/tests/parity_todo_decl.py"
+          [ -d "$d" ] || { echo "골든 픽스처 디렉터리 누락: $d (계약 SOT 부재 = 실패)" >&2; exit 1; }
+          [ -f "$d/expected.json" ] || { echo "계약 대장 누락: $d/expected.json" >&2; exit 1; }
+          # `ls "$d"/*.md`는 0건일 때 pipefail 로 **메시지 없이** 죽는다(실측) — 이유를 못 남기는
+          # 실패는 다음 사람이 원인을 다시 파야 한다. find 는 0건에서도 정상 종료한다.
+          n="$(find "$d" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          [ "$n" -ge 15 ] || { echo "픽스처 케이스 부족(${n}종 · 설계 P3-1 최소 15종)" >&2; exit 1; }
+          [ -f "$h" ] || { echo "파리티 하네스 누락: $h (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_decl_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_decl_dump.rs" >&2; exit 1; }
+          echo "== todo-decl parity(mac): 픽스처 ${n}종 + 조합 1024건 =="
+          python3 "$h" --fuzz 1024 --list-mismatch 20
+          # Python 측 골든 회귀(계약 대장 해석·A2 자해 회귀 핀)도 같은 레인에서 건다.
+          CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_todo_decl.py
+
+      # ★유령 todo·선언 소비자 회귀(test_report_ghost) + HUD 브리지 스큐(test_hud_bridge_skew).
+      #   **이 스텝이 왜 존재하는가**: 07-26 유령 집계 사고의 수정과 그 위에 얹은 선언 모델(C1)의
+      #   핵심 행동이 전부 이 두 스위트에만 있는데 CI 에는 0회 등장이었다 — 게이트 대장·파리티는
+      #   각각 다른 표면을 보므로 이 둘의 회귀를 대신 잡아주지 못한다. 구체적으로 여기서만 핀되는 것:
+      #     · `orphan-scope`·미선언은 `nodes[]`에 **남는다**(빼면 게이트가 false QUIET→세션 주차)
+      #     · 완료 파일이 미완 파일을 shadow 하지 않는다(정본 선출 정렬키의 미완 우선)
+      #     · 집계 밖 미완이 하나라도 있으면 QUIET/park 금지(구조적 불변식)
+      #     · 라벨은 선언 `owner` — role 라벨공간(하이픈) 조인 키가 어긋나지 않는다
+      #     · 데몬 payload 의 `verdict` 선택 필드에 대한 HUD 브리지의 구/신 스큐 내성(ADR-2)
+      #   `CYS_PACK_DIR` 을 빈 임시 디렉터리로 고정하는 이유는 위 게이트 대장 스텝과 같다 —
+      #   러너의 실제 팩(부재)·홈 디렉터리에 판정이 의존하면 초록이 근거가 되지 못한다.
+      #     · 스탬프 도구(test_todo_stamp 30종)의 선언 스탬프 왕복 — **R4 교정(2026-07-26)으로 편입**.
+      #       이 스위트는 release.yml 에만 있어서 스탬프 회귀가 브랜치에서 초록이고 태그에서 20분 뒤에야
+      #       터졌다(C-1 의 역방향 비대칭). 위 '팩 스위트 레인 대조' 스텝이 이 계급을 기계로 막는다.
+      # 예산: 네 스위트 합쳐 약 1s(로컬 측정 · 61+11+30종 + 공유상수).
+      - name: 유령 todo·선언 소비자 회귀 + HUD 브리지 스큐 + 스탬프 (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t (mac) =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$f"
+          done
+
+      # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
+      #   그쪽은 "같은 파일을 같게 판정하는가", 여기는 "**애초에 같은 파일을 보는가**"를 묻는다.
+      #   실측 결함 — 소비자 C1(Python 보고기)·C2(Rust 데몬)의 배제 정책은 이미 같았는데 데몬이
+      #   **정본 위치 `${CYS_PACK_DIR}/round`를 스캔 루트에 갖고 있지 않아**, 데몬에 배선한 선언
+      #   판정·유령 배제·verdict/owner payload 가 정본 todo 에는 한 번도 적용되지 않았다.
+      #   정책 리뷰로는 절대 안 잡힌다 — 같은 임시 트리를 양쪽에 먹여 집합을 대조해야 잡힌다.
+      # Rust 측은 `scripts/todo_scan_dump.rs` 를 rustc 단독 컴파일해 돌린다(크레이트 의존 0 증명).
+      # 예산: 컴파일 포함 약 1s(로컬 측정).
+      - name: todo 스캔 집합 2언어 파리티 (C1·C2 동일 파일 집합 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          h="cysjavis-pack/bin/tests/parity_todo_scan.py"
+          [ -f "$h" ] || { echo "스캔 파리티 하네스 누락: $h (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_scan_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_scan_dump.rs" >&2; exit 1; }
+          [ -f "src/todo_scan.rs" ] || { echo "스캔 단일 구현 누락: src/todo_scan.rs" >&2; exit 1; }
+          python3 "$h"

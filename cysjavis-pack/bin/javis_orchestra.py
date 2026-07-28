@@ -59,6 +59,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 # 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
 # ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
@@ -132,8 +133,15 @@ def effective_required_roles(detect=None, agents=None):
     return ["cso", "worker"] + [e["role"] for e in reviewer_roster(detect, agents)]
 
 
+# ★팩 경로 env 키의 우선순위 목록(W14 S19). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+# **같은 목록·같은 순서**여야 한다 — `tests/test_todo_shared_constants.py`가 기계 대조한다.
+# 종전에는 이 목록이 3종으로 갈려 있었고, `cys todo-path`가 `AITERM_JARVIS_DIR`를 인식하지
+# 못해 레거시 env 환경에서 **생성 위치와 스캔 위치가 갈려 파일이 보고기에 영영 보이지 않았다**.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
 def pack_dir():
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """팩 경로. 키 목록·순서는 `PACK_DIR_ENV_KEYS`(Rust `src/pack.rs`와 기계 대조)."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return v
@@ -603,6 +611,111 @@ def resolve_manifest_phase(manifest, phase_id):
         return None, []
 
 
+# ── todo 선언 블록 v1 (설계 DESIGN_declared-state.md §4-1 · 생산자 P3) ──────────────
+# 유령 todo 사고의 근저원인은 소비자가 파일명·경로·mtime으로 소유권을 **추론**한 것이다.
+# 추론을 없애려면 파일 자신이 소유를 **선언**해야 한다. 그런데 선언을 워커 손기재에 맡기면
+# 실측상 오작성 6종 중 5종(따옴표·값 공백·키 누락·대문자 키·후행 주석)이 미선언으로 떨어진다
+# — 그래서 티켓 발부 시점에 **완성된 한 줄**을 기계 생성해 동봉한다(손기동 자체를 줄인다).
+DECL_VALUE_BAD_RE = re.compile(r"[^A-Za-z0-9._:-]+")
+DECL_VALUE_OK_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+# 파서는 단일 구현이다(재구현 금지 — ADR-2 2언어 파리티 계약의 Python 측). 생성한 선언을
+# 파서에 되먹여 `counted`가 나오는지 확인하는 것이 유일한 계약 준수 증명이다.
+# ⚠팩 부분갱신 스큐(ADR-2)로 파서가 없을 수도 있다 — 그때는 왕복 검증만 생략하고 문법 검사는
+#   그대로 유지한다(여기서 예외를 던지면 팩 스큐 한 번에 위임 전체가 죽는다).
+try:
+    import javis_todo_decl as _decl                                       # noqa: E402
+except Exception:                                                         # pragma: no cover
+    _decl = None
+
+
+def _pack_identity():
+    """팩 **경로**와 **정체성(scope)** 을 한 번의 조회로 **함께** 확정한다.
+
+    ★W14 S14 — 이것이 이 함수의 존재 이유다. 종전에는 티켓의 todo 경로가
+    `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게** 전개되고,
+    같은 티켓의 선언 `scope=`는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는
+    보증이 아무 데도 없었다. 실측 재현 — master가 `scope=pack`으로 발부한 티켓을 워커가
+    `pack-dept-dept-1` 팩에서 기록하면 소비자는 `excluded=[('worker','foreign-scope',0,2)]`,
+    `pending_outside=[]`(주인이 명시한 처분이라 면제) → **false QUIET → 세션 주차**다.
+    경로와 정체성은 **같은 시점·같은 값**에서 나와야 한다.
+    """
+    root = os.path.abspath(os.path.normpath(pack_dir()))
+    return root, os.path.basename(root)
+
+
+def decl_value_strict(raw):
+    """**정체성 값**(owner·scope) 검증 — 접지 않고, 폴백도 없다. 위반이면 `None`.
+
+    ★W14 S14 — 종전 `decl_value`는 허용 밖 문자를 `-`로 접고 남는 게 없으면 `"pack"`으로
+    폴백했다. 팩 basename이 G4 문자집합 밖(예: `자비스`)이면 scope가 통째로 `pack`이 되어
+    **그럴듯하지만 틀린 정체성**을 배포했다 — 그 선언을 받은 파일은 진짜 팩에서 `foreign-scope`
+    로 **조용히 배제**된다. 유령을 막으려던 장치가 살아있는 작업을 지우는 정확한 형태다.
+
+    같은 상황에서 스탬프 도구(`javis_todo_stamp.build_decl_line`)는 **정반대로** 시끄럽게
+    실패했다(`선언 생성 실패(bad-token: …)`). 두 생산자가 반대로 행동하는데 어느 쪽이 정본인지
+    계약이 없었고, master 심판은 **시끄러운 쪽**이다 — 추측한 정체성보다 없는 선언이 안전하다
+    (선언이 없으면 소비자가 `unclaimed`로 fail-open 보고한다 · ADR-3).
+    """
+    s = (raw or "").strip()
+    return s if DECL_VALUE_OK_RE.match(s) else None
+
+
+def decl_slug(raw):
+    """**진단 값**(lane) 전용 슬러그 — 여기서만 접는다. 정체성(owner·scope)에는 쓰지 마라.
+
+    lane은 판정에 쓰이지 않는 사람용 표식이라(설계 §4-1 필드 표) 접어도 오배제를 낳지 않는다.
+    남는 게 없으면 빈 문자열이고, 호출자는 그때 **키를 통째로 생략**한다(빈 값은 선언 전체를
+    무효화한다 — G4 값은 1글자 이상).
+    """
+    return DECL_VALUE_BAD_RE.sub("-", (raw or "").strip()).strip("-.:_")
+
+
+def todo_decl_line(to_role, task=None, today=None, scope=None):
+    """티켓에 동봉할 선언 한 줄(v1). 반환 = `(line, None)` 또는 **`(None, 사유)`**.
+
+    키 순서·필수 3종(owner·scope·status)은 설계 §4-1 고정. `scope`는 role 생존이 아니라
+    **팩 정체성**이다 — owner 노드가 죽어도 선언은 파일에 남아 미완 작업이 노드 수명과
+    분리된다. 값은 호출자가 `_pack_identity()`로 확정해 넘기며(경로와 **같은 바인딩**),
+    생략 시 여기서 같은 함수로 조회한다.
+
+    `lane`·`since`는 판정에 쓰지 않는 진단용이라, lane 슬러그가 비면 키를 통째로 생략한다.
+
+    ★실패는 시끄럽다(W14 S14). 정체성 값이 G4를 어기면 접거나 폴백하지 않고 사유를 돌려준다.
+    ★생성물은 **파서에 되먹여** 검증한다(스탬프 도구 `build_decl_line`과 같은 왕복 패턴) —
+      문법 검사식을 여기 다시 적으면 그중 하나는 반드시 뒤처지고, 뒤처진 쪽이 소비자와 갈린다.
+    """
+    if scope is None:
+        _, scope = _pack_identity()
+    owner_v = decl_value_strict(to_role)
+    scope_v = decl_value_strict(scope)
+    if owner_v is None or scope_v is None:
+        bad = "owner=%r" % to_role if owner_v is None else "scope=%r" % scope
+        return None, ("선언 값이 G4 문자집합(`[A-Za-z0-9._:-]+`)을 벗어난다: %s" % bad)
+
+    parts = ["owner=%s" % owner_v, "scope=%s" % scope_v]
+    lane = decl_slug(task)[:48].strip("-.:_")
+    if lane:
+        parts.append("lane=%s" % lane)
+    parts.append("status=active")
+    parts.append("since=%s" % (today or time.strftime("%Y-%m-%d")))
+    line = "<!-- javis:todo v1 %s -->" % " ".join(parts)
+
+    if _decl is not None:                       # 파서 왕복 검증(계약 준수의 유일한 증명)
+        d, diag = _decl.parse(line + "\n")
+        if d is None:
+            return None, "선언 생성 실패(%s: %s)" % (getattr(diag, "code", "?"), diag)
+        if _decl.classify(d, scope_v, lambda s: True) != "counted":
+            return None, "선언 생성 실패(counted 미달)"
+    return line, None
+
+
+def todo_file_name(role):
+    """역할 → todo 파일명. 생산자 3곳(P1 `cys todo-path` · P2 cycle 저장검증 · P3 여기)이
+    **같은 규칙**을 쓴다: 대문자화 + 하이픈→언더스코어."""
+    return "%s_TODO.md" % role.upper().replace("-", "_")
+
+
 def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
@@ -629,11 +742,42 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
     lines.extend("  " + b for b in bullets)
     lines.append("")
-    # 경로는 pack 앵커 절대경로 — javis_report의 todo 스캔 루트(pack/round)와 일치해야
-    # 진행% 집계에 잡힌다(상대경로 'round/'는 워커 cwd에 따라 집계 누락 — 적대 검증 R1).
-    lines.append("todo 영속: 이 작업을 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/round/%s_TODO.md\"에 "
-                 "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천)."
-                 % to_role.upper().replace("-", "_"))
+    # ★W14 S14 — 경로와 선언 `scope`를 **같은 시점·같은 조회**에서 확정한다.
+    #
+    # 종전에는 경로가 `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게**
+    # 전개되고 선언 scope는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는 보증이
+    # 없었고, 갈리면 워커가 만든 파일이 자기 팩에서 `foreign-scope`로 **조용히 배제**된다
+    # (실측: excluded=[('worker','foreign-scope',0,2)] · pending_outside=[] → false QUIET → park).
+    # 지금은 master가 확정한 **절대경로**를 티켓에 박는다 — 발부자와 수행자가 같은 팩을 가리킨다.
+    pack_root, scope_id = _pack_identity()
+    todo_path = os.path.join(pack_root, "round", todo_file_name(to_role))
+    lines.append("todo 영속: 이 작업을 \"%s\"에 "
+                 "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천). "
+                 "경로는 발부 시점에 확정된 절대경로다 — 다른 팩에 만들면 집계에서 배제된다."
+                 % todo_path)
+    # ★todo 선언(설계 §4-1) — 집계기는 파일명·경로·mtime이 아니라 이 선언으로 귀속을 판정한다.
+    # 위치 계약(첫 체크박스 이전)은 협상 대상이 아니다: 체크박스 뒤의 선언을 인정하면 본문에
+    # 적힌 문구가 스스로를 무효화하는 자해 경로가 열린다(A2 회귀).
+    decl, why = todo_decl_line(to_role, task, scope=scope_id)
+    if decl is not None:
+        lines.append("todo 선언(위 파일을 새로 만들 때 **첫 체크박스보다 위**, 머리말 첫 줄에 아래 한 줄을 "
+                     "그대로 복사하라 — 집계기는 파일명이 아니라 이 선언으로 소유·귀속을 판정한다. "
+                     "따옴표 추가·값에 공백·키 대문자화는 전부 '미선언'으로 떨어지니 한 글자도 고치지 마라. "
+                     "이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 미선언 처리된다. "
+                     "레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 선언하라):")
+        lines.append("  %s" % decl)
+    else:
+        # ★실패는 시끄럽다(S14). 접어서 그럴듯한 정체성(`scope=pack`)을 배포하지 않는다 —
+        # 틀린 정체성은 살아있는 파일을 남의 레인으로 **조용히** 배제시키고, 그 배제는 QUIET
+        # 불변식의 면제 대상이라 마지막 방어선조차 통과한다. 선언이 아예 없으면 소비자는
+        # `unclaimed`로 fail-open 보고한다(ADR-3) = 시끄럽지만 안전한 쪽이다.
+        sys.stderr.write("javis_orchestra: todo 선언을 생성하지 못했다 — %s "
+                         "(role=%s scope=%s)\n" % (why, to_role, scope_id))
+        lines.append("todo 선언: **생성 실패** — %s. 선언 없이 파일을 만들어라(집계기가 "
+                     "`unclaimed`(미선언)로 시끄럽게 보고한다). 임의로 값을 고쳐 넣지 마라 — "
+                     "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
+                     "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
+                     "`cys todo-path --emit-decl`로 다시 받아라." % why)
     lines.append("보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master \"[보고] ...\"` "
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
@@ -1486,10 +1630,15 @@ def cmd_self_test(args):
         assert _cell("a|b\nc") == "a/b c", "_cell 새니타이즈 오류"
         # task-prompt 티켓(밀폐 — rules 명시 주입, 설치본 디렉티브 상태와 무관):
         # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다
+        # ★W14 S14 — 종전 필수 토큰 `"${CYS_PACK_DIR"`는 **뺐다**. todo 경로를 워커 셸에서 늦게
+        #   전개되는 문자열로 두는 것이 바로 이번에 없앤 이원 바인딩이다(경로=워커 시점 /
+        #   선언 scope=master 시점 → foreign-scope 오배제 → false QUIET). pack 앵커 보장은
+        #   아래 S14 블록이 **발부 시점 절대경로**(`_pack_identity()` + WORKER_TODO.md)로
+        #   더 강하게 핀한다 — 토큰 존재 검사는 그 불변식과 정면으로 모순된다.
         ticket = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES)
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
-                     "성공 기준", "WORKER_TODO.md", "${CYS_PACK_DIR", "보고 채널",
+                     "성공 기준", "WORKER_TODO.md", "보고 채널",
                      "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
                      "done 증거 게이트(P3)"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
@@ -1516,6 +1665,40 @@ def cmd_self_test(args):
         # todo 파일명은 역할명 대문자 변환(reviewer-gemini → REVIEWER_GEMINI_TODO.md)
         assert "REVIEWER_GEMINI_TODO.md" in build_task_ticket(
             "T", "S", None, "reviewer-gemini", rules=FALLBACK_RULES), "todo 파일명 역할 변환 오류"
+        # ★todo 선언 v1(설계 §4-1) — 티켓이 문법 위반 선언을 배포하면 파서가 전건 미선언으로
+        # 버려 배선 자체가 무의미해진다. 문법을 여기서 기계로 못박는다(손기재 오류 원천 차단).
+        decl, why = todo_decl_line("reviewer-gemini", "유령 todo 결함 수정 (ghost fix)")
+        assert decl is not None, "선언 생성 실패: %s" % why
+        m_decl = re.fullmatch(r"<!-- javis:todo (v\d+) (.+) -->", decl)
+        assert m_decl and m_decl.group(1) == "v1", "선언 접두·버전 토큰 형식 오류: %r" % decl
+        toks = dict(t.split("=", 1) for t in m_decl.group(2).split())
+        for k in ("owner", "scope", "status"):                      # G5 필수 키 3종
+            assert k in toks, "선언 필수 키 '%s' 누락: %r" % (k, decl)
+        for k, v in toks.items():                                   # G4 키·값 문법
+            assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", k), "선언 키 문법 위반: %r" % k
+            assert re.fullmatch(r"[A-Za-z0-9._:-]+", v), "선언 값 문법 위반: %s=%r" % (k, v)
+        assert toks["owner"] == "reviewer-gemini" and toks["status"] == "active", decl
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", toks.get("since", "")), "since 날짜 형식 오류: %r" % decl
+        # lane은 한글·공백을 지운 슬러그(G4 위반 방지) — 남는 게 없으면 키 자체를 생략한다
+        assert toks.get("lane") == "todo-ghost-fix", "lane 슬러그 정규화 오류: %r" % decl
+        assert "lane=" not in todo_decl_line("worker", "유령 결함")[0], \
+            "슬러그가 빈 lane을 빈 값으로 배출(선언 전체 무효화 위험)"
+        # ★W14 S14 — 정체성 값은 **접지 않는다**. 팩 이름이 G4 밖이면 그럴듯한 폴백을
+        # 만들지 말고 시끄럽게 실패해야 한다(스탬프 도구와 같은 정책으로 수렴).
+        bad_line, bad_why = todo_decl_line("worker", "t", scope="자비스")
+        assert bad_line is None and bad_why, "G4 밖 scope를 조용히 접어 배포했다"
+        assert todo_decl_line("워커", "t", scope="pack")[0] is None, "G4 밖 owner를 접어 배포했다"
+        # 경로와 scope는 **같은 바인딩**에서 나온다 — 티켓의 todo 경로는 발부 시점 절대경로다.
+        _pk_root, _pk_scope = _pack_identity()
+        _tk = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES)
+        assert os.path.join(_pk_root, "round", "WORKER_TODO.md") in _tk, \
+            "티켓 todo 경로가 발부 시점 절대경로가 아니다(늦은 전개 = scope 이원 바인딩)"
+        assert "scope=%s" % _pk_scope in _tk, "티켓 선언 scope가 발부 시점 팩과 다르다"
+        assert "${CYS_PACK_DIR" not in _tk.split("todo 영속:")[1].split("\n")[0], \
+            "todo 경로가 여전히 워커 셸에서 늦게 전개된다(S14 재발)"
+        # 티켓 동봉 확인은 날짜 리터럴을 비교하지 않는다(자정 경계에서 since가 갈리는 위조 flake 방지)
+        assert "<!-- javis:todo v1 owner=worker scope=" in build_task_ticket(
+            "T", "S", None, "worker", rules=FALLBACK_RULES), "티켓에 todo 선언 한 줄 누락"
         # 추출기(순수 함수) 배터리 — 합성 디렉티브 텍스트로 밀폐 검증:
         synth = ("# W\n\n## 7. ★절대 강조 4규칙 — x\n머리말.\n"
                  + "\n".join(FALLBACK_RULES) + "\n\n## 8. 다음\n- 무관\n")

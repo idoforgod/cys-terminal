@@ -561,8 +561,17 @@ enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
-    /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출
-    TodoPath,
+    /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출.
+    /// 새로 만드는 파일에는 선언 블록 v1 한 줄이 **자동 동봉**된다(집계기는 파일명이 아니라 이 선언으로 귀속을 판정한다).
+    TodoPath {
+        /// 다른 역할의 todo 경로/선언을 산출한다 — **경로 산출 전용**(파일 생성·기록 없음).
+        /// 신원 게이트 우회 통로가 되지 않도록 남의 역할 파일은 절대 만들지 않는다(설계 R7).
+        #[arg(long)]
+        role: Option<String>,
+        /// 경로 대신 **선언 한 줄**을 출력한다(손기재 오작성을 줄이는 기계 생성기 · 설계 §4-4 P1).
+        #[arg(long)]
+        emit_decl: bool,
+    },
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
     SurfaceRole,
@@ -2006,7 +2015,7 @@ fn run(command: Command) -> i32 {
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd } => return run_boot(cwd),
-        Command::TodoPath => return run_todo_path(),
+        Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
 
@@ -3493,8 +3502,106 @@ fn doctor_socket_connectable(p: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(p).is_ok()
 }
 
+// ─────────────────────── WS-7: doctor 소켓·락 진단 (flock 스팬 · fail-closed) ───────────────────────
+//
+// 두 진단(diag_orphan_socket → diag_stale_lock)은 run_doctor_diagnostics에서 **연속 실행**되고 둘 다
+// startup flock을 만진다. 부팅 중인 데몬의 acquire_startup_lock이 그 순간 실패하면 데드맨이
+// `dead-holder-reclaim-failed`라는 **오사유로 exit(1)** 시키므로, 여기서는 보유 구간을 최소화하고
+// (블로킹 connect는 스팬 밖) 데몬 쪽은 지수 백오프 재시도로 흡수한다(cysd/main.rs acquire_startup_lock).
+
+/// doctor가 flock을 쥔 채 머무는 인위적 시간 — **테스트 전용 노브**(기본 0). 통합 테스트가 벽시계
+/// 경합에 기대지 않고 "doctor가 락을 쥔 순간 부팅 데몬이 재시도로 이긴다"를 결정론으로 재현한다.
+fn doctor_lock_hold() -> std::time::Duration {
+    std::env::var("CYS_DOCTOR_LOCK_HOLD_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_default()
+}
+
+/// 락 파일의 홀더 pid — cysd `deadman::read_holder_pid`와 **동일 규약**(빈 파일·0·파싱 실패 = None).
+/// None은 구형 락파일을 뜻하며 데드맨의 `FailClosed`와 같은 보수 해석(어떤 제거도 금지)을 받는다.
+#[cfg(unix)]
+fn doctor_read_holder_pid(lock: &std::path::Path) -> Option<u32> {
+    let s = std::fs::read_to_string(lock).ok()?;
+    match s.trim().parse::<u32>().ok()? {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+#[cfg(unix)]
+fn doctor_pid_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// pid의 프로세스명이 정확히 `cysd`인가 — **sysinfo 1회 스냅샷**(단일 pid 대상).
+/// `ps` fork는 고부하에서 50~150ms가 걸려 락 보유 상한을 깬다(cysd/deadman.rs와 동일 교체).
+#[cfg(unix)]
+fn doctor_pid_is_cysd(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+    sys.process(sysinfo::Pid::from_u32(pid))
+        .map(|p| {
+            p.name()
+                .to_string_lossy()
+                .rsplit('/')
+                .next()
+                .map(|b| b == "cysd")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 고아 소켓 제거 판정(순수 함수 — 진리표 테스트 가능). 삭제는 "살아있는 cysd 홀더가 없다"의
+/// **3중 부정**이 전부 성립할 때만: ①flock 홀더 부재(=락 획득 성공 또는 락파일 ENOENT)
+/// ②기록된 홀더 pid가 사망 ③(pid 재사용 방어) 그 pid가 cysd가 아님. 하나라도 어긋나면 보류한다.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum OrphanVerdict {
+    /// 삭제 가능 — 살아있는 홀더 없음이 3중으로 확인됨.
+    Removable,
+    /// flock 획득 실패 = 데몬이 **부팅 중이거나 보유 중** — 판정 보류·삭제 금지(fail-closed).
+    /// 이 분기를 미정의로 두면 산 소켓을 지우는 영구 장애 경로가 재현된다.
+    HeldByDaemon,
+    /// 구형 락파일(holder pid 미기재) — 데드맨 `FailClosed`와 동일한 보수 해석으로 삭제 금지.
+    UnknownHolder,
+    /// 기록된 홀더 pid가 살아있는 cysd — 삭제 금지.
+    LiveHolder(u32),
+}
+
+#[cfg(unix)]
+fn judge_orphan_socket(
+    lock_exists: bool,
+    flock_acquired: bool,
+    holder_pid: Option<u32>,
+    pid_alive: bool,
+    pid_is_cysd: bool,
+) -> OrphanVerdict {
+    if !lock_exists {
+        // 락 파일 ENOENT = 홀더 없음으로 진행. (미정의로 두면 --fix가 영구 무력해진다.)
+        return OrphanVerdict::Removable;
+    }
+    if !flock_acquired {
+        return OrphanVerdict::HeldByDaemon;
+    }
+    match holder_pid {
+        None => OrphanVerdict::UnknownHolder,
+        Some(pid) if pid_alive && pid_is_cysd => OrphanVerdict::LiveHolder(pid),
+        Some(pid) if pid_alive => OrphanVerdict::LiveHolder(pid), // 정체 불명 생존 pid = 보수적 보류
+        Some(_) => OrphanVerdict::Removable,
+    }
+}
+
 #[cfg(unix)]
 fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    use std::os::unix::io::AsRawFd;
     let sp = &ctx.socket_path;
     if !sp.exists() {
         return DiagItem {
@@ -3504,6 +3611,7 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
+    // ★블로킹 connect(타임아웃 없음)는 반드시 **락 스팬 밖**에서 — 안에서 하면 보유 상한을 깬다.
     if doctor_socket_connectable(sp) {
         return DiagItem {
             name: "socket",
@@ -3512,13 +3620,67 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
-    // 존재하나 연결 불가 = 고아 소켓.
-    if fix {
-        match std::fs::remove_file(sp) {
+    // 존재하나 연결 불가 = 고아 **후보**. 여기부터 flock 스팬 — check→unlink 전 구간을 보유해
+    // "판정 후 데몬이 부팅해 bind" TOCTOU를 봉합한다(락 핸들 drop = flock 해제이므로 조기 drop 금지).
+    let lock = sp.with_extension("lock");
+    let lock_exists = lock.exists();
+    let mut _guard: Option<std::fs::File> = None;
+    let mut flock_acquired = true;
+    if lock_exists {
+        match std::fs::OpenOptions::new().read(true).open(&lock) {
+            Ok(f) => {
+                flock_acquired =
+                    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+                if flock_acquired {
+                    _guard = Some(f);
+                }
+            }
+            Err(e) => {
+                return DiagItem {
+                    name: "socket",
+                    status: DiagStatus::Warn,
+                    detail: format!("고아 후보 소켓 — 시작 락 열기 실패로 판정 보류: {e}"),
+                    action: "수동 확인(삭제 금지)".into(),
+                }
+            }
+        }
+    }
+    let holder_pid = if lock_exists {
+        doctor_read_holder_pid(&lock)
+    } else {
+        None
+    };
+    let (alive, is_cysd) = match holder_pid {
+        Some(p) => (doctor_pid_alive(p), doctor_pid_is_cysd(p)),
+        None => (false, false),
+    };
+    let verdict = judge_orphan_socket(lock_exists, flock_acquired, holder_pid, alive, is_cysd);
+    std::thread::sleep(doctor_lock_hold()); // 테스트 노브(기본 0) — 부팅측 재시도 흡수 검증용.
+
+    let item = match verdict {
+        OrphanVerdict::HeldByDaemon => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: "고아 후보 소켓 — 시작 락을 누군가 보유 중(데몬 부팅/보유) → 판정 보류".into(),
+            action: "삭제 금지(잠시 후 재실행)".into(),
+        },
+        OrphanVerdict::UnknownHolder => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: "고아 후보 소켓 — 락파일에 홀더 pid 미기재(구형) → 보수적 보류".into(),
+            action: "삭제 금지(수동 확인)".into(),
+        },
+        OrphanVerdict::LiveHolder(pid) => DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: format!("고아 후보 소켓 — 홀더 pid {pid} 생존 → 보류"),
+            action: "삭제 금지(수동 확인)".into(),
+        },
+        OrphanVerdict::Removable if fix => match std::fs::remove_file(sp) {
             Ok(()) => DiagItem {
                 name: "socket",
                 status: DiagStatus::Ok,
-                detail: "고아 소켓 제거".into(),
+                detail: "고아 소켓 제거(홀더 부재 3중 확인)".into(),
                 action: "삭제함".into(),
             },
             Err(e) => DiagItem {
@@ -3527,15 +3689,16 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                 detail: format!("고아 소켓 제거 실패: {e}"),
                 action: "수동 삭제 필요".into(),
             },
-        }
-    } else {
-        DiagItem {
+        },
+        OrphanVerdict::Removable => DiagItem {
             name: "socket",
             status: DiagStatus::Warn,
-            detail: "고아 소켓(리스너 없음)".into(),
+            detail: "고아 소켓(리스너 없음·홀더 부재)".into(),
             action: "cys doctor --fix 로 제거".into(),
-        }
-    }
+        },
+    };
+    drop(_guard); // 여기서 flock 해제 — 판정~삭제 전 구간을 보유했다.
+    item
 }
 
 #[cfg(not(unix))]
@@ -3548,6 +3711,14 @@ fn diag_orphan_socket(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
     }
 }
 
+/// ★K4(CRITICAL): 이 진단은 **락 파일을 절대 unlink 하지 않는다**.
+///
+/// flock은 프로세스가 죽으면 커널이 자동 해제하므로 "잔여 락"이라는 개념 자체가 성립하지 않는다.
+/// 반대로 락파일을 unlink 하면 상호배제가 **영구 무효화**된다: 부팅 데몬은 unlink된 inode에 락을
+/// 잡고, 그 다음 데몬은 새로 생성된 별개 inode에 락을 잡아 둘 다 승자가 된다. 게다가 가시 락파일에
+/// holder pid가 없어져 데드맨(cysd/deadman.rs)이 영구 무장해제된다.
+/// → 기본은 **읽기 전용 보고**, `--fix`는 stale pid 문자열 truncate까지만(락 보유 중이므로 홀더
+///   부재가 확정된 상태 — 파일 자체와 inode는 보존한다).
 #[cfg(unix)]
 fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     use std::os::unix::io::AsRawFd;
@@ -3572,8 +3743,8 @@ fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             }
         }
     };
-    // 비차단 획득 시도: 획득되면 아무도 안 쥔 잔여(stale), 실패면 데몬 보유(정상). fd를 쥔 채
-    // 제거해 진단↔제거 사이 데몬 재기동 레이스를 차단한다.
+    // 비차단 획득 시도: 획득되면 아무도 안 쥔 상태, 실패면 데몬 보유(정상). fd를 쥔 채 판정·기록해
+    // 진단↔기록 사이 데몬 재기동 레이스를 차단한다.
     let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !got {
         return DiagItem {
@@ -3583,28 +3754,35 @@ fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             action: String::new(),
         };
     }
-    let item = if fix {
-        match std::fs::remove_file(&lock) {
+    std::thread::sleep(doctor_lock_hold()); // 테스트 노브(기본 0).
+    let stale_pid = doctor_read_holder_pid(&lock);
+    let item = match (stale_pid, fix) {
+        (None, _) => DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Ok,
+            detail: "시작 락 유휴(홀더 없음·기록된 pid 없음)".into(),
+            action: String::new(),
+        },
+        (Some(pid), false) => DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Warn,
+            detail: format!("시작 락 유휴이나 stale holder pid {pid} 기록 잔존"),
+            action: "cys doctor --fix 로 pid 표기만 정리(락 파일은 보존)".into(),
+        },
+        (Some(pid), true) => match f.set_len(0) {
             Ok(()) => DiagItem {
                 name: "startup-lock",
                 status: DiagStatus::Ok,
-                detail: "잔여 시작 락 제거".into(),
-                action: "삭제함".into(),
+                detail: format!("stale holder pid {pid} 표기 정리(락 파일·inode 보존)"),
+                action: "pid 표기 truncate".into(),
             },
             Err(e) => DiagItem {
                 name: "startup-lock",
                 status: DiagStatus::Warn,
-                detail: format!("잔여 락 제거 실패: {e}"),
-                action: "수동 삭제".into(),
+                detail: format!("stale pid 표기 정리 실패: {e}"),
+                action: "수동 확인(락 파일 삭제 금지)".into(),
             },
-        }
-    } else {
-        DiagItem {
-            name: "startup-lock",
-            status: DiagStatus::Warn,
-            detail: "잔여 시작 락(아무도 미보유)".into(),
-            action: "cys doctor --fix 로 제거".into(),
-        }
+        },
     };
     unsafe {
         libc::flock(f.as_raw_fd(), libc::LOCK_UN);
@@ -4578,46 +4756,145 @@ fn run_surface_role() -> i32 {
     0
 }
 
-fn run_todo_path() -> i32 {
-    let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
-        eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다");
-        return 1;
+/// 선언 블록 v1 한 줄을 만들고 **파서 왕복 검증**까지 한다(설계 §4-1 · S17).
+///
+/// ★생성물을 파서에 먹여 `counted`가 나오는지 보는 것이 유일한 계약 준수 증명이다 —
+/// 문자 클래스(G4)·필수 키(G5)를 여기서 다시 검사하면 검사식이 두 벌이 되고, 그중 하나는
+/// 반드시 뒤처져 소비자와 갈린다(Python 스탬프 도구 `build_decl_line`과 **같은 패턴**).
+///
+/// ★실패는 **시끄럽다**. 접거나 그럴듯한 기본값으로 대체하지 않는다 — `scope`를 정규화로
+/// 접고 `"pack"`으로 폴백하던 생산자가 있었고, 그 "그럴듯하지만 틀린 정체성"이 살아있는
+/// 파일을 남의 레인(foreign-scope)으로 조용히 배제시켰다(S14와 같은 병).
+fn build_todo_decl_line(owner: &str, scope: &str) -> Result<String, String> {
+    let line = format!("<!-- javis:todo v1 owner={owner} scope={scope} status=active -->");
+    let decl = cys::todo_decl::parse(&format!("{line}\n"))
+        .map_err(|e| format!("선언 생성 실패({}: {e})", e.code))?;
+    let verdict = cys::todo_decl::classify(Some(&decl), scope, &|_| true);
+    if verdict != cys::todo_decl::Verdict::Counted {
+        return Err(format!("선언 생성 실패(판정={verdict})"));
+    }
+    Ok(line)
+}
+
+/// 새 todo 파일의 초기 본문 — **선언이 첫 줄**이다(G1' 위치 계약에 여유롭게 들어간다).
+fn new_todo_body(role: &str, decl_line: &str) -> String {
+    format!("{decl_line}\n\n# {role} TODO — 영속 todo (절대지침 7)\n\n")
+}
+
+fn run_todo_path(role_opt: Option<String>, emit_decl: bool) -> i32 {
+    // `--role` 지정 = 남의 역할 산출 = **파일 기록 금지**(설계 R7 신원 게이트 우회 방지).
+    let foreign = role_opt.is_some();
+    // `--role`은 **남의 역할 경로 산출 전용**이다(파일 생성·기록 없음 · 설계 R7). 자기 역할은
+    // 데몬이 정본이므로 surface.list로 조회한다 — 손으로 지어 부르는 것을 막는 것이 이 명령의 존재 이유다.
+    let role = match role_opt {
+        Some(r) => r,
+        None => {
+            let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
+                eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다(다른 역할은 --role)");
+                return 1;
+            };
+            let Some(my_sid) = parse_surface_ref(&sref) else {
+                eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
+                return 1;
+            };
+            let role = match request("surface.list", json!({})) {
+                Ok(r) => r["surfaces"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                        .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+                }),
+                Err(e) => {
+                    eprintln!("surface.list 실패: {e}");
+                    return 1;
+                }
+            };
+            let Some(role) = role else {
+                eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
+                return 1;
+            };
+            role
+        }
     };
-    let Some(my_sid) = parse_surface_ref(&sref) else {
-        eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
-        return 1;
-    };
-    let role = match request("surface.list", json!({})) {
-        Ok(r) => r["surfaces"].as_array().and_then(|arr| {
-            arr.iter()
-                .find(|s| s["surface_id"].as_u64() == Some(my_sid))
-                .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
-        }),
+
+    // ★S19 — 팩 경로는 `cys::pack::pack_dir()` 단일 구현을 경유한다. 종전에는
+    // `env_compat("CYS_PACK_DIR")`(= CYS_/JAVIS_/AITERM_**PACK**_DIR)만 봐서 레거시 키
+    // `AITERM_JARVIS_DIR`를 인식하지 못했다 — 그 환경에서는 **생성 위치와 스캔 위치가 갈려
+    // 파일이 보고기에 영영 보이지 않는다**(env 목록이 두 벌이면 언젠가 갈린다는 실증).
+    let pack = cys::pack::pack_dir();
+    let scope = cys::pack::scope_id();
+
+    // 선언은 **경로보다 먼저** 만든다 — 만들 수 없으면 파일도 만들지 않는다(부분 성공 금지).
+    let decl_line = match build_todo_decl_line(&role, &scope) {
+        Ok(l) => l,
         Err(e) => {
-            eprintln!("surface.list 실패: {e}");
+            eprintln!(
+                "{e}\n  role={role} scope={scope}\n  \
+                 값 문자 클래스(G4 `[A-Za-z0-9._:-]+`)를 벗어난 이름은 선언이 될 수 없다. \
+                 접어서 그럴듯한 값을 만들지 않는 것이 계약이다 — 틀린 정체성은 살아있는 \
+                 파일을 남의 레인으로 조용히 배제시킨다."
+            );
             return 1;
         }
     };
-    let Some(role) = role else {
-        eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
-        return 1;
-    };
-    let pack = cys::env_compat("CYS_PACK_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cys/pack")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".cys/pack"));
+    if emit_decl {
+        println!("{decl_line}");
+        return 0;
+    }
+
     let round = pack.join("round");
+    let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
+    let path = round.join(&fname);
+
+    // `--role`(남의 역할)은 산출만 한다 — 디렉터리도 만들지 않는다.
+    if foreign {
+        println!("{}", path.display());
+        return 0;
+    }
+
     if let Err(e) = std::fs::create_dir_all(&round) {
         eprintln!("round 디렉터리 생성 실패: {e}");
         return 1;
     }
-    let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
-    let path = round.join(&fname);
     if !path.exists() {
-        let _ = std::fs::write(&path, format!("# {role} TODO — 영속 todo (절대지침 7)\n\n"));
+        if let Err(e) = std::fs::write(&path, new_todo_body(&role, &decl_line)) {
+            eprintln!("todo 파일 생성 실패: {e}");
+            return 1;
+        }
+        // ★자기 산출물 파서 왕복 검증(스탬프 도구 `verify_counted`와 같은 패턴). 의무화된
+        // 생성기가 의무화된 규칙을 위반하면 `unclaimed_ratio`가 구조적으로 M3 목표(<10%) 아래로
+        // 수렴하지 못한다 — 실제로 종전 생성기는 선언 없는 파일만 찍었다.
+        match verify_todo_counted(&path, &scope) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("생성한 todo가 파서 검증을 통과하지 못했다: {e}\n  경로={}", path.display());
+                return 1;
+            }
+        }
+    } else if let Err(e) = verify_todo_counted(&path, &scope) {
+        // 기존 파일은 **건드리지 않는다**(증거 보존 · 스탬프 도구 소관). 다만 조용히 넘기지도
+        // 않는다 — 이 파일이 왜 집계에 안 잡히는지를 지금 말해 주는 편이 낫다(G9의 정신).
+        eprintln!(
+            "ℹ 기존 todo가 선언 판정을 통과하지 못한다: {e}\n  경로={}\n  \
+             일괄 스탬프: python3 \"${{CYS_PACK_DIR:-$HOME/.cys/pack}}/bin/javis_todo_stamp.py\" --apply",
+            path.display()
+        );
     }
     println!("{}", path.display());
     0
+}
+
+/// 파일을 다시 읽어 선언이 `counted`인지 확인한다 — 읽기 경로는 계약 정본을 경유한다.
+fn verify_todo_counted(path: &std::path::Path, scope: &str) -> Result<(), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("재검증 읽기 실패: {e}"))?;
+    let head = cys::todo_decl::head_from_bytes(&raw);
+    let decl = cys::todo_decl::parse(&head).map_err(|e| format!("{}: {e}", e.code))?;
+    // scope 실재는 여기서 묻는 것이 아니다(디스크 상태는 소비자 관심사) — 내 선언이 유효하고
+    // 내 scope로 집계되는가만 본다. 스탬프 도구 `verify_counted`와 같은 판단이다.
+    let verdict = cys::todo_decl::classify(Some(&decl), scope, &|_| true);
+    if verdict != cys::todo_decl::Verdict::Counted {
+        return Err(format!("판정={verdict}"));
+    }
+    Ok(())
 }
 
 /// 루트 cwd("/"·"\\"·"C:\\" 류)를 home으로 교정 — 순수 함수(진리표 테스트 가능).
@@ -5997,6 +6274,128 @@ fn set_surface_quiescing(sid: u64, on: bool) -> Result<(), String> {
     request("surface.quiesce", json!({"surface_id": sid, "on": on})).map(|_| ())
 }
 
+/// C3 저장검증 대상 제외 판정 — 선언이 `retired`(은퇴) 또는 `foreign-scope`(실재하는 남의 팩)면 true.
+///
+/// **fail-open이 계약이다**(ADR-3): 미선언(`unclaimed`)·고아(`orphan-scope`)는 제외하지 **않는다**.
+/// 판정 못 한다고 살아있을 수 있는 파일을 게이트에서 빼면 저장 누락을 조용히 통과시킨다 —
+/// 놓치는 것보다 시끄러운 편이 안전하다. 파일을 못 열어도 같은 이유로 제외하지 않는다.
+///
+/// 읽기는 선두 `HEAD_BYTES`(1 KiB)뿐이다(G3) — cycle마다 _round의 파일 수만큼 도는 경로다.
+/// `scope_exists`를 주입받는 이유는 파서와 같다: 판정에서 파일시스템을 분리해 테스트가 실재
+/// 팩 배치에 의존하지 않게 한다(프로덕션 호출자는 `cys::pack::scope_exists`를 넘긴다).
+fn todo_decl_excluded(
+    path: &std::path::Path,
+    my_scope: &str,
+    scope_exists: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if f.take(cys::todo_decl::HEAD_BYTES as u64)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    // 예산(G3) 적용과 lossy 디코드는 계약 정본 `head_from_bytes`가 유일하게 수행한다.
+    // ★W14 S15 — 여기서 `String::from_utf8_lossy`를 직접 부르면 그것이 곧 두 번째 읽기 규칙이
+    // 되고, 언젠가 정본과 갈린다(실제로 C2 데몬이 그렇게 갈렸다). 경계가 멀티바이트 중간이어도
+    // 대체문자를 남길 뿐 패닉하지 않는 성질은 그 함수가 보장한다.
+    let head = cys::todo_decl::head_from_bytes(&buf);
+    let decl = cys::todo_decl::parse(&head).ok();
+    let verdict = cys::todo_decl::classify(decl.as_ref(), my_scope, scope_exists);
+    matches!(
+        verdict,
+        cys::todo_decl::Verdict::Retired | cys::todo_decl::Verdict::ForeignScope
+    )
+}
+
+/// ★C2 — cycle 저장 게이트 목록 확정(순수). `detected`=스윕으로 찾은 **실존** 후보,
+/// `expected`=지시문이 생성을 명령하는 **기대 경로**(실존 여부 무관).
+///
+/// 협로가 무엇이었나: 신설 노드의 첫 cycle은 후보가 하나도 없다(`_round`도 팩 todo도 아직
+/// 없다). 종전 코드는 그 상태를 "저장 검증 파일 없음" 에러로 끝내 **clear를 영영 실행하지
+/// 못했다** — 정작 컨텍스트가 가장 급한 노드가 순환에서 배제되는 방향의 실패다. 기대 경로를
+/// 감시 대상으로 삼으면 에이전트가 지시대로 파일을 만드는 순간 게이트가 통과한다(생성도
+/// 갱신이다). 게이트 의미는 그대로 ANY-match이고, 감시 대상이 늘어도 **다른 노드가 건드릴 수
+/// 없는 자기 역할 파일**뿐이라 거짓 통과 위험은 늘지 않는다.
+///
+/// 순서 보존 dedup: baseline·handshake 본문이 이 순서로 만들어지므로 안정적이어야 한다.
+fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) -> Vec<String> {
+    let mut out = detected;
+    for p in expected {
+        let s = p.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// 저장 게이트 1틱 판정(ANY-match) — 하나라도 `start_time` 이후 갱신됐고 해시가 baseline과
+/// 다르면 통과. 화면 마커(CYCLE-SAVED)는 참고 신호일 뿐이고 **파일 변화가 사실**이다
+/// (reward-hack·stale 마커 차단).
+///
+/// ★C2: **비존재 파일의 baseline은 `None`**이므로, 지시대로 새로 생성된 파일은
+/// mtime>start && `Some(해시)` != `None` 이 성립해 이 판정이 그대로 '변화'로 인정한다 —
+/// 기대 경로를 게이트에 넣기 위해 판정 로직을 바꿀 필요가 없다는 것이 이 함수의 계약이다.
+/// 루프에서 분리한 이유도 그 계약을 테스트가 직접 단정할 수 있게 하기 위함이다.
+fn cycle_save_verified(
+    baseline: &[(String, Option<String>)],
+    start_time: std::time::SystemTime,
+) -> bool {
+    baseline.iter().any(|(f, base_hash)| {
+        let mtime_ok = std::fs::metadata(f)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| t > start_time)
+            .unwrap_or(false);
+        mtime_ok && sha256_file(f) != *base_hash
+    })
+}
+
+/// cycle 2단계(저장 검증)의 진로 — `--force-no-verify` 의 실효 의미를 타입으로 고정한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleVerifyPlan {
+    /// 파일 갱신을 기다린다(기본).
+    Wait,
+    /// 운영자가 명시적으로 검증을 건너뛴다(비상 탈출구).
+    SkipForced,
+    /// 감시할 파일 자체가 없다.
+    SkipNoFiles,
+}
+
+/// ★E3(적대 리뷰 REVISE-4): C2 이후 `files` 가 절대 비지 않게 되면서 `--force-no-verify` 는
+/// **死플래그**가 됐다 — 유일한 소비처였던 "빈 목록 거부" 분기에 도달할 수 없기 때문이다.
+/// 그 결과 저장이 불가능한 상태(에이전트 무응답·hang)에서 clear 를 강행할 비상 탈출구가
+/// 사라졌고, 운영자는 30분 timeout 을 기다린 뒤 실패를 받는 것 외에 방법이 없었다.
+/// 플래그의 원래 의미(검증 없이 진행)를 **검증 대기 자체를 건너뛰는 것**으로 복원한다.
+/// 저장 지시 주입은 그대로 한다 — 지시조차 안 하면 저장할 기회 자체가 사라진다.
+fn cycle_verify_plan(force_no_verify: bool, baseline_len: usize) -> CycleVerifyPlan {
+    if force_no_verify {
+        CycleVerifyPlan::SkipForced
+    } else if baseline_len > 0 {
+        CycleVerifyPlan::Wait
+    } else {
+        CycleVerifyPlan::SkipNoFiles
+    }
+}
+
+/// 2-phase handshake 본문의 파일 1줄(순수).
+///
+/// ★E8(N-5): 종전에는 `unwrap_or_default()` 로 **미존재 파일에 빈 해시**를 실었다. 검증자는
+/// `"경로 (sha256: )"` 를 보고 "해시가 비었다 = 뭔가 잘못됐다"로 읽거나, 더 나쁘게는 다른
+/// 미존재 파일과 **같은 빈 값**이라 구분하지 못했다. C2 이후 기대 경로(아직 없는 파일)가
+/// 본문에 정상적으로 들어오므로, 그 상태를 사실대로 표기한다 — 이 파일은 **생성 자체가
+/// 저장의 증거**이고, 검증자가 확인해야 할 것은 해시가 아니라 존재 전이다.
+fn handshake_file_line(path: &str, hash: Option<String>) -> String {
+    match hash {
+        Some(h) => format!("{path} (sha256: {h})"),
+        None => format!("{path} (미생성 — 생성 자체가 증거)"),
+    }
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -6056,10 +6455,19 @@ fn run_cycle_agent(
             if ss.exists() {
                 v.push(ss.to_string_lossy().into_owned());
             }
+            // ★C3(설계 §4-5): cwd/_round도 전 노드가 함께 쓰는 디렉터리다. 바로 위 pack/round
+            // 분기는 그 사실을 알고 대상 역할 파일로 한정하는데 **이 분기만 무방비**였던 비대칭이
+            // 유령 todo 사고의 코드 수준 원인이다. 종결된 레인의 유산 파일(status=retired)과 남의
+            // 팩 파일(foreign-scope)을 목록에서 빼 handshake 본문을 정화한다.
+            // 판정 의미는 바꾸지 않는다 — 게이트는 여전히 ANY-match(하나라도 갱신되면 통과)다.
+            let my_scope = cys::pack::scope_id();
+            let scope_exists = |s: &str| cys::pack::scope_exists(s);
             if let Ok(entries) = std::fs::read_dir(&cwd_round) {
                 for e in entries.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if name.ends_with("_TODO.md") {
+                    if name.ends_with("_TODO.md")
+                        && !todo_decl_excluded(&e.path(), &my_scope, &scope_exists)
+                    {
                         v.push(e.path().to_string_lossy().into_owned());
                     }
                 }
@@ -6069,19 +6477,22 @@ fn run_cycle_agent(
                 "{}_TODO.md",
                 role_name.to_uppercase().replace('-', "_")
             );
-            let pt = pack_round.join(&role_todo);
-            if pt.exists() {
-                v.push(pt.to_string_lossy().into_owned());
-            }
-            // SESSION_STATE(pack 정본)는 master 소관 — master cycle일 때만 게이트에 포함
+            // ★C2: 기대 경로(지시문이 **생성을 명령하는** 파일)는 실존 여부와 무관하게 넣는다.
+            // 종전 `pt.exists()` 가드가 만든 협로: 신설 노드는 아직 이 파일이 없어 게이트에서
+            // 빠지고, 지시문은 바로 그 파일을 만들라고 시킨다 — 순응해 저장해도 아무도 안 보므로
+            // 검증 실패로 clear가 막힌다. 비존재 파일의 baseline은 `None`이고, 생성되면
+            // mtime>start && 해시(Some) != None 이 성립해 현행 ANY-match 루프가 그대로 인정한다.
+            // SESSION_STATE(pack 정본)는 master 소관이므로 master cycle에서만 기대 경로다.
+            let mut expected = vec![pack_round.join(&role_todo)];
             if role_name == "master" {
-                let pss = pack_round.join("SESSION_STATE.md");
-                if pss.exists() {
-                    v.push(pss.to_string_lossy().into_owned());
-                }
+                expected.push(pack_round.join("SESSION_STATE.md"));
             }
-            v
+            cycle_gate_files(v, expected)
         };
+        // ★E3 주석 정정: C2 폴백(`cycle_gate_files`)이 기대 경로를 무조건 넣으므로 `files` 는
+        // 실질적으로 비지 않는다 — 이 분기는 폴백이 되돌려지는 미래를 대비한 **방어적 잔존**이지
+        // "진짜 예외가 여기 남았다"는 종전 서술은 사실이 아니었다. 그래서 `--force-no-verify` 의
+        // 실질 의미도 이 분기가 아니라 **아래 검증 대기 생략**에 있다(비상 탈출구).
         if files.is_empty() && !force_no_verify {
             return Err(
                 "저장 검증 파일 없음 — --save-file로 지정하거나 --force-no-verify(위험)".into(),
@@ -6098,35 +6509,34 @@ fn run_cycle_agent(
         inject_text(sid, "[CYCLE] 컨텍스트 순환 절차 개시. 지금 즉시: ① 자기 TODO 파일(~/.cys/pack/round/<역할>_TODO.md)과 SESSION_STATE(_round/ 또는 pack round/ 정본)에 현재 작업 상태·미해결 게이트·다음 액션을 저장하라. ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.")?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
-        if !baseline.is_empty() {
-            eprintln!("[cycle 2/5] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-            let mut verified = false;
-            while std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                for (f, base_hash) in &baseline {
-                    let mtime_ok = std::fs::metadata(f)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| t > start_time)
-                        .unwrap_or(false);
-                    if mtime_ok && sha256_file(f) != *base_hash {
+        match cycle_verify_plan(force_no_verify, baseline.len()) {
+            CycleVerifyPlan::Wait => {
+                eprintln!("[cycle 2/5] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+                let mut verified = false;
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if cycle_save_verified(&baseline, start_time) {
                         verified = true;
                         break;
                     }
                 }
-                if verified {
-                    break;
+                if !verified {
+                    return Err(format!(
+                        "저장 검증 실패 — {timeout}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
+                    ));
                 }
+                eprintln!("[cycle] 저장 검증 통과");
             }
-            if !verified {
-                return Err(format!(
-                    "저장 검증 실패 — {timeout}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
-                ));
+            CycleVerifyPlan::SkipForced => {
+                eprintln!(
+                    "[cycle 2/5] ⚠ 저장 검증 **생략** (--force-no-verify) — 저장 지시는 주입했지만 \
+                     파일 갱신을 기다리지 않는다. 대상이 저장하지 못한 상태로 clear 될 수 있다."
+                );
             }
-            eprintln!("[cycle] 저장 검증 통과");
-        } else {
-            eprintln!("[cycle 2/5] ⚠ 파일 검증 생략 (--force-no-verify)");
+            CycleVerifyPlan::SkipNoFiles => {
+                eprintln!("[cycle 2/5] ⚠ 감시 대상 파일 없음 — 검증 생략");
+            }
         }
 
         // 3) 2-phase handshake — 검증자 부재 시 clear 금지 (soul 규칙)
@@ -6137,7 +6547,7 @@ fn run_cycle_agent(
             let vsid = vr["surface_id"].as_u64().ok_or("bad verifier resolve")?;
             let body: String = baseline
                 .iter()
-                .map(|(f, _)| format!("{f} (sha256: {})", sha256_file(f).unwrap_or_default()))
+                .map(|(f, _)| handshake_file_line(f, sha256_file(f)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let push = request(
@@ -10419,7 +10829,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn doctor_stale_lock_detect_and_fix() {
+    fn doctor_stale_lock_reports_but_never_unlinks() {
+        // ★K4 회귀 핀: --fix가 락 파일을 unlink 하면 startup lock 상호배제가 영구 무효화되고
+        // (다음 데몬은 unlink된 inode에, 그 다음은 새 inode에 별개 락) 데드맨이 영구 무장해제된다.
+        // 계약: 파일·inode는 언제나 보존, --fix는 stale pid 표기 truncate까지만.
         let base = std::env::temp_dir().join(format!("cys-doc-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -10427,13 +10840,132 @@ mod tests {
         let lock = ctx.socket_path.with_extension("lock");
         // 없음 → OK
         assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Ok);
-        // 잔여 락(아무도 미보유) → WARN
+        // 빈 락파일(홀더 없음·pid 미기재) → 정리할 것 없음 → OK, 파일 보존
         std::fs::write(&lock, b"").unwrap();
+        assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Ok);
+        assert!(lock.exists(), "읽기 전용 보고는 파일을 건드리지 않는다");
+
+        // stale pid 기록 잔존 → WARN(보고만)
+        std::fs::write(&lock, b"999999").unwrap();
         assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Warn);
-        // --fix → 제거
+        assert!(lock.exists(), "보고 경로는 unlink 금지");
+
+        // --fix → pid 표기만 truncate, 파일·inode 보존
+        use std::os::unix::fs::MetadataExt;
+        let ino_before = std::fs::metadata(&lock).unwrap().ino();
         assert_eq!(diag_stale_lock(&ctx, true).status, DiagStatus::Ok);
-        assert!(!lock.exists(), "잔여 락 제거됨");
+        assert!(lock.exists(), "★--fix도 락 파일을 절대 삭제하지 않는다");
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().ino(),
+            ino_before,
+            "inode 보존 — 새 inode가 생기면 상호배제가 갈라진다"
+        );
+        assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0, "pid 표기만 비움");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_socket_verdict_truth_table() {
+        // 삭제는 "살아있는 cysd 홀더 없음"의 3중 부정이 전부 성립할 때만.
+        // ①락파일 ENOENT = 홀더 없음으로 진행(미정의면 --fix가 영구 무력)
+        assert_eq!(
+            judge_orphan_socket(false, true, None, false, false),
+            OrphanVerdict::Removable
+        );
+        // ②flock 획득 실패 = 데몬 부팅/보유 중 → fail-closed 보류(산 소켓 삭제 차단)
+        assert_eq!(
+            judge_orphan_socket(true, false, Some(42), true, true),
+            OrphanVerdict::HeldByDaemon
+        );
+        assert_eq!(
+            judge_orphan_socket(true, false, None, false, false),
+            OrphanVerdict::HeldByDaemon,
+            "flock 실패는 pid 정보보다 우선한다"
+        );
+        // ③구형 락파일(pid 미기재) = 데드맨 FailClosed와 동일한 보수 해석 → 삭제 금지
+        assert_eq!(
+            judge_orphan_socket(true, true, None, false, false),
+            OrphanVerdict::UnknownHolder
+        );
+        // ④홀더 pid 생존 → 보류(cysd 여부 무관하게 보수적)
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), true, true),
+            OrphanVerdict::LiveHolder(7)
+        );
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), true, false),
+            OrphanVerdict::LiveHolder(7)
+        );
+        // ⑤3중 부정 충족(락 미보유 + pid 사망 + 비cysd) → 삭제 허용
+        assert_eq!(
+            judge_orphan_socket(true, true, Some(7), false, false),
+            OrphanVerdict::Removable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_holds_flock_across_check_and_unlink_and_is_fail_closed() {
+        use std::os::unix::io::AsRawFd;
+        let base = std::env::temp_dir().join(format!("cys-doc-span-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        let lock = ctx.socket_path.with_extension("lock");
+        // 고아 후보: 연결 불가 파일 + 부팅 중인 데몬이 락을 쥔 상태를 모사.
+        std::fs::write(&ctx.socket_path, b"not-a-socket").unwrap();
+        std::fs::write(&lock, format!("{}", std::process::id())).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // ★fail-closed: 락을 잡을 수 없으면 --fix여도 산 소켓을 지우지 않는다.
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Warn);
+        assert!(ctx.socket_path.exists(), "★부팅 중 데몬의 소켓 삭제 금지");
+        drop(holder);
+
+        // 홀더 사라짐 + 기록 pid 사망 → 3중 부정 충족 → 제거.
+        std::fs::write(&lock, b"999999").unwrap();
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Ok);
+        assert!(!ctx.socket_path.exists(), "홀더 부재 확정 시에만 제거");
+        assert!(lock.exists(), "소켓 진단도 락 파일은 절대 unlink 하지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_refuses_when_lockfile_has_no_holder_pid() {
+        // 구형 락파일(빈 파일)은 데드맨 FailClosed와 동일 해석 — --fix여도 소켓 삭제 금지.
+        let base = std::env::temp_dir().join(format!("cys-doc-nopid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::write(&ctx.socket_path, b"not-a-socket").unwrap();
+        std::fs::write(ctx.socket_path.with_extension("lock"), b"").unwrap();
+        let item = diag_orphan_socket(&ctx, true);
+        assert_eq!(item.status, DiagStatus::Warn);
+        assert!(ctx.socket_path.exists(), "pid 미상 = 보수적 보류");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_pid_is_cysd_is_fail_closed_for_non_cysd() {
+        // sysinfo 교체 후에도 의미론 유지: 정확 basename 일치만 true(부분일치·부재·pid 0 = false).
+        assert!(!doctor_pid_is_cysd(0));
+        assert!(!doctor_pid_is_cysd(1), "init/launchd ≠ cysd");
+        assert!(
+            !doctor_pid_is_cysd(std::process::id()),
+            "테스트 바이너리(cys-<hash>) ≠ cysd"
+        );
     }
 
     #[test]
@@ -10535,7 +11067,10 @@ mod tests {
         std::fs::create_dir_all(&ctx.pack_dir).unwrap();
         std::fs::write(ctx.pack_dir.join(".pack-version"), env!("CARGO_PKG_VERSION")).unwrap();
         std::fs::write(&ctx.socket_path, b"x").unwrap(); // 고아 소켓
-        std::fs::write(ctx.socket_path.with_extension("lock"), b"").unwrap(); // 잔여 락
+        // ★WS-7 계약 반영: 락파일에 **사망한 홀더 pid**가 기록돼 있어야 고아 소켓 제거가 허용된다
+        // (홀더 부재 3중 확인). 빈 락파일(구형)은 데드맨 FailClosed와 동일 해석으로 제거를 보류하며,
+        // 그 경로는 doctor_refuses_when_lockfile_has_no_holder_pid가 따로 핀한다.
+        std::fs::write(ctx.socket_path.with_extension("lock"), b"999999").unwrap();
         std::fs::create_dir_all(base.join(".pack-staging-init-1")).unwrap(); // 잔재
         std::fs::write(&ctx.settings_paths[0], "{}").unwrap();
 
@@ -11413,5 +11948,292 @@ mod tests {
         assert_eq!(report["all_saved"], json!(false));
         assert_eq!(report["pending_loss_warning"].as_array().unwrap().len(), 1);
         assert_eq!(report["pending_loss_warning"][0]["pending_undelivered"], json!(2));
+    }
+
+    // ── C3(Declared State) 저장검증 대상 정화 ────────────────────────────────
+    // cwd/_round는 전 노드 공유 디렉터리다. 바로 옆 pack/round 분기는 그 사실을 알고 대상 역할
+    // 파일로 한정하는데 이 분기만 무방비였던 비대칭이 유령 todo 사고의 코드 수준 원인이다.
+
+    /// 은퇴·타 스코프만 제외한다. 판정 불능(미선언·고아)은 **제외하지 않는다** — 판정 못 한다고
+    /// 살아있을 수 있는 파일을 게이트에서 빼면 저장 누락을 조용히 통과시킨다(ADR-3 fail-open).
+    #[test]
+    fn todo_decl_excluded_only_drops_retired_and_foreign_scope() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-c3-decl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let packs = |s: &str| matches!(s, "pack" | "pack-dept-dept-1");
+        let write = |name: &str, body: &str| {
+            let p = td.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let decl = |scope: &str, status: &str| {
+            format!(
+                "<!-- javis:todo v1 owner=worker scope={scope} status={status} -->\n# T\n- [ ] a\n"
+            )
+        };
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("retired", decl("pack", "retired"), true),
+            ("legacy-retired", "<!-- ★ STALE 무효화 -->\n# T\n- [ ] a\n".into(), true),
+            ("foreign", decl("pack-dept-dept-1", "active"), true),
+            ("mine", decl("pack", "active"), false),
+            ("orphan", decl("pack-dept-dept-9", "active"), false),
+            ("undeclared", "# 손으로 쓴 todo\n- [ ] a\n".into(), false),
+        ];
+        for (name, body, want) in cases {
+            let p = write(&format!("{name}_TODO.md"), &body);
+            assert_eq!(
+                todo_decl_excluded(&p, "pack", &packs),
+                want,
+                "[{name}] 저장검증 대상 제외 판정"
+            );
+        }
+        // 열 수 없는 경로도 제외하지 않는다(fail-open — 게이트를 조용히 헐겁게 만들지 않는다).
+        assert!(!todo_decl_excluded(&td.join("없는파일_TODO.md"), "pack", &packs));
+        // 예산(G3) 밖 은퇴 선언은 보이지 않는다 = 제외되지 않는다.
+        let far = write(
+            "budget_TODO.md",
+            &format!("{}\n{}", "x".repeat(cys::todo_decl::HEAD_BYTES), decl("pack", "retired")),
+        );
+        assert!(!todo_decl_excluded(&far, "pack", &packs));
+        // ★W14 S15 — 비UTF-8 팽창이 예산을 줄이지 않는다. 원시 400 B의 0xFF는 디코드하면
+        // 1200 B지만 원시 기준으로는 예산 안이므로 은퇴 선언이 보여야 한다. 종전에는
+        // `parse`의 재절단이 이걸 잘라 **은퇴 파일이 저장검증 대상으로 되살아났다**.
+        let p = td.join("nonutf8_TODO.md");
+        let mut raw: Vec<u8> = vec![0xff; 400];
+        raw.push(b'\n');
+        raw.extend_from_slice(decl("pack", "retired").as_bytes());
+        std::fs::write(&p, &raw).unwrap();
+        assert!(todo_decl_excluded(&p, "pack", &packs));
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★**W14 — C3 소비자 테스트의 자기 반사 차단(reviewer3 자기 신고 2번).**
+    ///
+    /// 위 케이스는 기대값을 사람이 파서 지식으로 적은 것이다. 파서와 소비자가 **함께 틀리면
+    /// 초록**인 구조였다 — Python 쪽에는 `expected.json` 외부 SOT가 있는데 Rust 소비자에는
+    /// 대응물이 없었다. 여기서는 골든 픽스처를 그대로 넣고 기대값을 **오직 대장에서** 읽는다.
+    #[test]
+    fn golden_fixtures_drive_c3_exclusion_from_external_sot() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cysjavis-pack/bin/tests/fixtures/todo-decl");
+        let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap_or_else(|e| {
+            panic!("골든 대장을 읽을 수 없다({}): {e} — SOT 부재는 skip이 아니라 실패다",
+                   dir.display())
+        });
+        let spec: serde_json::Value = serde_json::from_str(&raw).expect("expected.json 파싱");
+        let my_scope = spec["my_scope"].as_str().expect("my_scope").to_string();
+        let existing: Vec<String> = spec["existing_scopes"]
+            .as_array()
+            .expect("existing_scopes")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let scope_exists = |s: &str| existing.iter().any(|e| e == s);
+
+        let td = std::env::temp_dir().join(format!(
+            "cys-c3-golden-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let cases = spec["cases"].as_object().expect("cases");
+        assert!(cases.len() >= 15, "픽스처 케이스가 15종 미만이다: {}", cases.len());
+        for (name, exp) in cases {
+            // 내용은 한 바이트도 바꾸지 않는다(바이너리 케이스가 있어 텍스트 경유 금지).
+            let bytes = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("픽스처 {name} 읽기 실패: {e}"));
+            let p = td.join(format!("{}_TODO.md", name.trim_end_matches(".md")));
+            std::fs::write(&p, &bytes).unwrap();
+            let verdict = exp["classify"].as_str().expect("classify");
+            // 저장검증 제외 = "주인이 처분을 명시한 것"뿐(ADR-3 fail-open). 기대값을 파서가
+            // 아니라 **대장 문자열**에서 유도한다.
+            let want = matches!(verdict, "retired" | "foreign-scope");
+            assert_eq!(
+                todo_decl_excluded(&p, &my_scope, &scope_exists),
+                want,
+                "[{name}] 대장 판정={verdict} 인데 C3 제외 판정이 갈렸다"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── S17: 의무화된 생성기가 의무화된 규칙을 지키는가 ──────────────────────
+    // 디렉티브는 같은 문단에서 "경로는 반드시 `cys todo-path`" + "머리말에 선언 1줄"을 명하는데,
+    // 종전 `run_todo_path`는 선언 없는 파일만 찍었다. 유일한 기계 생성기가 규칙 위반자였고,
+    // 그래서 `unclaimed_ratio`가 구조적으로 M3 목표(<10%) 아래로 수렴할 수 없었다.
+
+    /// ★생성기의 산출물은 **자기가 만든 파서**에 먹여 `counted`가 나와야 한다.
+    /// (Python 스탬프 도구 `build_decl_line`과 같은 왕복 검증 패턴 — 검사식을 두 벌 두지 않는다.)
+    #[test]
+    fn generated_todo_body_parses_as_counted() {
+        for (role, scope) in [
+            ("worker", "pack"),
+            ("worker-2", "pack-dept-dept-1"),
+            ("reviewer-gemini", "pack"),
+            ("cso", "pack.dept_1:a-b"),
+        ] {
+            let line = build_todo_decl_line(role, scope).expect("선언 생성");
+            let body = new_todo_body(role, &line);
+            let head = cys::todo_decl::head_from_bytes(body.as_bytes());
+            let decl = cys::todo_decl::parse(&head).expect("생성물이 파서를 통과해야 한다");
+            assert_eq!(decl.owner, role);
+            assert_eq!(decl.scope, scope);
+            assert_eq!(
+                cys::todo_decl::classify(Some(&decl), scope, &|_| true),
+                cys::todo_decl::Verdict::Counted,
+                "role={role} scope={scope}"
+            );
+        }
+    }
+
+    /// ★실패는 **시끄럽다** — 접거나 그럴듯한 기본값으로 대체하지 않는다.
+    /// 정규화 폴백(`자비스` → `pack`)은 "그럴듯하지만 틀린 정체성"을 만들고, 그 정체성은
+    /// 살아있는 파일을 남의 레인으로 조용히 배제시킨다(S14와 같은 병).
+    #[test]
+    fn declaration_generator_fails_loudly_on_illegal_identity() {
+        for (role, scope) in [
+            ("worker", "자비스"),     // G4 밖 팩 이름
+            ("워커", "pack"),          // G4 밖 role
+            ("worker", "pack round"),  // 값 내 공백
+            ("worker", ""),            // 빈 값
+        ] {
+            assert!(
+                build_todo_decl_line(role, scope).is_err(),
+                "role={role} scope={scope} — 조용히 그럴듯한 값을 만들면 안 된다"
+            );
+        }
+    }
+
+    /// 생성 직후 재검증(`verify_todo_counted`)이 실제로 파일을 읽어 판정한다.
+    #[test]
+    fn verify_todo_counted_reads_the_written_file() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-s17-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let line = build_todo_decl_line("worker", "pack").unwrap();
+        let good = td.join("WORKER_TODO.md");
+        std::fs::write(&good, new_todo_body("worker", &line)).unwrap();
+        assert!(verify_todo_counted(&good, "pack").is_ok());
+        // 선언 없는 파일(종전 생성기의 산출물 형태)은 통과하지 못한다 = S17의 재현.
+        let bad = td.join("LEGACY_TODO.md");
+        std::fs::write(&bad, "# worker TODO — 영속 todo (절대지침 7)\n\n").unwrap();
+        assert!(verify_todo_counted(&bad, "pack").is_err());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── C2: cycle 저장 게이트 협로 봉합 ─────────────────────────────────────
+
+    /// ★C2 ②: 후보가 **하나도 없어도** 게이트는 성립해야 한다. 신설 노드의 첫 cycle이 정확히
+    /// 그 상태이고, 종전에는 여기서 "저장 검증 파일 없음" 에러로 끝나 clear가 영영 실행되지
+    /// 않았다 — 컨텍스트가 가장 급한 노드가 순환에서 배제되는 방향의 실패다.
+    #[test]
+    fn cycle_gate_falls_back_to_expected_paths_when_nothing_detected() {
+        let pack_round = std::path::Path::new("/home/x/.cys/pack/round");
+        // 워커: 자기 역할 TODO 하나가 기대 경로.
+        let g = cycle_gate_files(vec![], vec![pack_round.join("WORKER_TODO.md")]);
+        assert_eq!(g, vec!["/home/x/.cys/pack/round/WORKER_TODO.md".to_string()],
+                   "후보 전무에서 게이트가 비면 clear가 실행되지 않는다");
+        // master: pack SESSION_STATE도 자기 소관이라 함께 감시한다.
+        let g = cycle_gate_files(
+            vec![],
+            vec![pack_round.join("MASTER_TODO.md"), pack_round.join("SESSION_STATE.md")],
+        );
+        assert_eq!(g.len(), 2);
+        assert!(g[1].ends_with("SESSION_STATE.md"));
+    }
+
+    /// ★C2 ①: 기대 경로는 **실존 여부와 무관하게** 목록에 들어가되, 이미 탐지된 후보와
+    /// 중복되면 한 번만 실린다(baseline·handshake 본문이 이 목록으로 만들어진다). 탐지 순서는
+    /// 보존한다 — 목록 순서가 흔들리면 handshake 본문이 매 cycle 달라져 비교가 어려워진다.
+    #[test]
+    fn cycle_gate_merges_expected_without_duplicates_and_keeps_order() {
+        let pt = "/home/x/.cys/pack/round/WORKER_TODO.md".to_string();
+        let g = cycle_gate_files(
+            vec!["/w/_round/SESSION_STATE.md".into(), pt.clone()],
+            vec![std::path::PathBuf::from(&pt)],
+        );
+        assert_eq!(g, vec!["/w/_round/SESSION_STATE.md".to_string(), pt],
+                   "이미 실존해 탐지된 기대 경로가 두 번 실렸다");
+    }
+
+    /// ★C2 실측: **비존재 파일을 게이트에 넣어도 판정 로직을 바꿀 필요가 없다**는 계약.
+    /// baseline이 `None`이므로 지시대로 새로 생성되면 mtime>start && Some != None 이 성립한다.
+    /// 이게 깨지면 신설 노드는 지시에 순응해 저장하고도 검증 실패로 clear를 못 받는다.
+    #[test]
+    fn cycle_save_verified_accepts_a_newly_created_gate_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-c2-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("WORKER_TODO.md").to_string_lossy().into_owned();
+
+        // 아직 없는 파일의 baseline = None (게이트 등록 시점의 실제 값).
+        let baseline = vec![(missing.clone(), sha256_file(&missing))];
+        assert_eq!(baseline[0].1, None, "비존재 파일의 baseline은 None이어야 한다");
+
+        let start_time = std::time::SystemTime::now();
+        assert!(!cycle_save_verified(&baseline, start_time), "저장 전에 통과하면 게이트가 아니다");
+
+        // mtime 해상도(초 단위 파일시스템) 때문에 생성 시각이 start_time과 같아질 수 있다 —
+        // 실제 cycle에는 지시 주입·에이전트 응답 시간이 끼어 있어 발생하지 않는 조건이다.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&missing, "# 저장\n").unwrap();
+        assert!(
+            cycle_save_verified(&baseline, start_time),
+            "새로 생성된 게이트 파일이 '갱신'으로 인정되지 않는다 — C2 전제가 깨졌다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
+
+    /// ★E3 회귀 핀: `--force-no-verify` 는 死플래그가 아니다.
+    ///
+    /// C2 폴백 이후 `files` 가 절대 비지 않게 되면서, 이 플래그의 유일한 소비처였던
+    /// "빈 목록 거부" 분기는 도달 불능이 됐다 — 즉 플래그를 줘도 동작이 **하나도** 달라지지
+    /// 않았다(저장이 불가능한 hang 상태에서 clear 를 강행할 비상 탈출구 소실). 지금은 검증
+    /// 대기 자체를 건너뛴다.
+    #[test]
+    fn force_no_verify_skips_the_wait_even_when_files_exist() {
+        // C2 이후의 실제 상태: 감시 파일이 있다.
+        assert_eq!(cycle_verify_plan(false, 3), CycleVerifyPlan::Wait);
+        assert_eq!(
+            cycle_verify_plan(true, 3),
+            CycleVerifyPlan::SkipForced,
+            "파일이 있어도 플래그가 대기를 건너뛰지 못하면 死플래그가 재발한다"
+        );
+        // 파일이 없는 경우의 두 갈래도 구분된다(경고 문구가 사실과 어긋나지 않게).
+        assert_eq!(cycle_verify_plan(false, 0), CycleVerifyPlan::SkipNoFiles);
+        assert_eq!(cycle_verify_plan(true, 0), CycleVerifyPlan::SkipForced);
+    }
+
+    /// ★E8(N-5): 검증자에게 제시하는 본문에서 **미존재 기대 경로**는 빈 해시가 아니라 사실을
+    /// 표기한다. `unwrap_or_default()` 는 미존재 파일 여럿을 전부 같은 빈 문자열로 만들어,
+    /// 검증자가 "무엇을 확인해야 하는지"(존재 전이)를 알 수 없게 했다.
+    #[test]
+    fn handshake_body_states_missing_files_instead_of_empty_hash() {
+        let line = handshake_file_line("/r/WORKER_TODO.md", None);
+        assert!(
+            line.contains("미생성") && !line.contains("sha256: )"),
+            "미존재 경로를 빈 해시로 제시하면 검증자가 오판한다: {line}"
+        );
+        assert_eq!(
+            handshake_file_line("/r/SESSION_STATE.md", Some("abc123".into())),
+            "/r/SESSION_STATE.md (sha256: abc123)",
+            "존재 파일의 표기는 종전 계약 그대로여야 한다"
+        );
     }
 }

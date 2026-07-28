@@ -47,6 +47,20 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
   0.12.48+ **바이너리 쪽 코드**다 — 공란이면 ≤0.12.47 사용자의 pack-update가 사용자 상태를 vendor
   골격으로 클로버한다(2026-07 팩 치유 원복 실사고 계열). 새 팩이 더 새로운 바이너리 기능에 의존하면
   그 버전으로 상향한다. (release.yml `PACK_MIN_BINARY` env가 CI 기본값.)
+- **★기능 의존 하한은 사람이 올려야 한다 — 두 레인 모두 (2026-07-26 S26 레인 비대칭 교정)**.
+  `scripts/min-binary-policy.sh` 는 **보안 하한·지원창만** 계산하며 **기능 의존을 모른다**
+  (실측: `bash scripts/min-binary-policy.sh` → `0.12.48`). 따라서 **바이너리 릴리스가 새 CLI 표면
+  (플래그·서브커맨드)을 추가하고 팩이 그것을 지시하면, 다음 pack 태그 전에 하한을 그 버전으로
+  올려라.** 손대야 할 곳은 **두 곳(레인마다 하나)** 이다:
+  - 본체 레인 — `.github/workflows/release.yml` 의 `PACK_MIN_BINARY`
+  - 팩-온리 레인 — `.github/workflows/pack-release.yml` 의 `PACK_MIN_BINARY_OVERRIDE`
+    (비면 정책 스크립트 값 `0.12.48` 이 쓰인다)
+
+  한쪽만 고치면 다른 문으로 같은 실패가 들어온다 — 실제로 `--emit-decl` 의존(이 레인에서는
+  v0.14.2 에서 처음 생긴다)을 release.yml 에만 반영했다가, 다음 `pack-v` 태그가
+  `min_binary=0.12.48` 로 서명될 뻔했다. 두 값은 **같아야** 한다(다르면 어느 쪽이 옳은지
+  아무도 모른다). 오버라이드 사용 시 `::warning::min_binary 정책 오버라이드 사용` 이
+  워크플로 로그에 남는 것이 **정상**이다.
 - **직전 latest.json 동봉 필수**. 누락 시 `releases/latest/download/latest.json`이 404가 되어 전체
   사용자의 바이너리 확인 채널이 파손된다.
 - 팩-온리 적용 후 "디스크 팩 > 바이너리 임베드 팩" 상태가 일상화된다 — 이때 부트 스윕은
@@ -54,15 +68,37 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
   (2026-07-12 도입 — 종전의 "스윕 실행 → 다운그레이드 가드 no-op" 소음 제거). 수동 `cys init-pack`은
   게이트를 타지 않고 여전히 다운그레이드 가드에 막힌다(동일 최종 상태·이중 방어).
 
-## 0. 버전 위치 (범프 시 모두 갱신 — 실측 4곳)
+## 0. 버전 위치 (범프 시 모두 갱신 — **게이트 강제 8곳**)
+
+> ★표기 이력(종전 "실측 4곳" → **2026-07-26 재정정**): 이전 표기들(4 → 6)은 모두 **과소 집계**라
+> **게이트와 어긋났다**. `scripts/version-check.sh`와 `release.yml`이 하드 게이트로 강제하는 위치는
+> **8곳**이다 — 아래 **수동 편집 6개 + `Cargo.lock` 2패키지(자동 재생성)**. 8곳 중 하나라도
+> 어긋나면 **태그 CI가 즉사한다**. 아래 취소선(legacy 표기)은 배포 자산 기준의 역사 맥락일 뿐
+> **범프 면제가 아니다**.
+
+**(A) 수동 편집 6개**
 
 - `Cargo.toml` / `src-tauri/Cargo.toml` — `version`
 - `src-tauri/tauri.conf.json` — `version`
 - `ui/package.json` — `version`
 - ~~`dist-win/cys.wxs` / `dist-win/cys-x64.wxs`~~ (legacy MSI — NSIS 전환으로 폐기)
 
-> ⚠ **문서-게이트 드리프트(2026-07-12 기록)**: `scripts/version-check.sh`는 아직 wxs 2곳을 포함한
-> **6곳**을 강제한다. 스크립트가 정리되기 전까지는 wxs 2곳도 함께 범프해야 게이트를 통과한다.
+> ⚠ **문서-게이트 드리프트(2026-07-12 기록 · 여전히 유효)**: 위 wxs 2개는 배포 자산으로는 폐기
+> 표기지만 `scripts/version-check.sh`는 **여전히 강제한다**. 스크립트가 정리되기 전까지는 wxs 2개도
+> 함께 범프해야 게이트를 통과한다 — **취소선을 보고 건너뛰면 태그 CI가 즉사한다**(실제 함정).
+
+**(B) 자동 재생성 2개 — `Cargo.lock`**
+
+> ★**+Cargo.lock 2패키지 (S23 · 2026-07-26 추가)**: `Cargo.lock` 의 `[[package]] cys-terminal` ·
+> `cys-app` version 도 `version-check.sh` 가 강제한다(A 6개 + B 2개 = **합계 8곳**). Cargo.lock 은
+> 손편집 대상이 **아니다** — 위 (A) 수동 편집 6개를 고친 뒤
+> `cargo update -w -p cys-terminal -p cys-app`(또는 `cargo build`)로
+> 재생성해 **범프 커밋에 함께 담는다**. 이 검사를 붙인 이유: 종전 유일한 lock 포획자는
+> `release.yml` 의 `cargo build --locked -p cys-browserd` 하나였는데, aarch64 레그는 그 앞의
+> unlocked 빌드가 lock 을 재생성해 드리프트를 **자가치유·은폐**하고, x64·Windows 레그만 **20분 뒤**
+> 죽으면서 로그가 "브라우저 런타임 스테이징 실패"로 읽혀 원인을 감췄다.
+> ⚠한계: 이건 lock 의 **버전 필드 2개**만 본다. 의존 그래프 전체의 최신성은 `--locked` 빌드만이
+> 증명한다.
 
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 
@@ -242,5 +278,55 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] `cargo build --release` 무오류 · `cargo clippy --bins` 0경고 · `cargo test` 통과
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
-- [ ] 버전 문자열 4곳(+wxs 2곳) 일치
+- [ ] 버전 문자열 4곳(+wxs 2곳) 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
+      (**Cargo.lock 2패키지 포함 8곳**. 범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
+      범프 커밋에 함께 담아라. 손편집 금지 · S23)
+- [ ] **★메인 페이지(`/`) 원격 검증 — 4항목 전부 (S28 · 자동화 밖의 수동 게이트)**
+
+      원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기
+      (`release-assemble.py`)가 `/downloads/` 만 보고 메인 페이지는 아예 보지 않는다"였다.
+      **이 레인(0.14.2)에는 그 두 스크립트가 존재하지도 않는다**(실측: `scripts/` 에 없음) —
+      즉 메인 페이지 검증은 **부분 자동화조차 없는 100% 수동 게이트**다. 그래서 메인 밴드 누락은
+      404 가 아니라 **무증상 구버전 배포**로 나타난다(구자산이 보존돼 링크는 200). v0.13.17 에서
+      실제로 발생했다. 아래 4항목은 아무 스크립트도 대신해 주지 않으므로 **사람이 손으로 돌리고
+      결과를 릴리스 노트에 붙인다.**
+
+      선행: `cys-homepage/_round/dlhero/RELEASE_BUMP_CHECK.md` 5지점(링크 3개·S 슬롯 카피·
+      용량·zip 전환 경로) 반영 → 업로드 → 그 다음 아래를 원격에 대고 실행한다.
+
+      - [ ] ① **구버전 문자열 0** — `curl -s https://www.cysinsight.com/ | grep -c '<이전버전>'` → **0**
+      - [ ] ② **신버전 문자열 9** — `curl -s https://www.cysinsight.com/ | grep -c '<신버전>'` → **9**
+            (0 이면 미반영, 9 미만이면 부분 반영 = 밴드 일부가 구버전을 계속 배포한다)
+      - [ ] ③ **용량 4토큰 개별 재계산** — ★버전 grep 이 **못 잡는 별개 축**이다.
+            `sed 's/0.14.1/0.14.2/g'` 류 일괄 치환은 버전 9토큰만 바꾸고 페이지에 적힌 용량
+            4토큰(예: 340MB·358MB·226MB·226MB)은 **그대로 남긴다** — 버전은 전부 새 값이라
+            ①②는 통과하는데 표시 용량만 조용히 거짓이 된다. 자산 4종의 실제 바이트를
+            `curl -sI` 의 `content-length` 로 **하나씩** 받아 페이지 표기와 대조하라:
+
+            ```sh
+            V=X.Y.Z; B=https://www.cysinsight.com/downloads
+            for f in "cys_${V}_aarch64.dmg" "cys_${V}_x64.dmg" \
+                     "cys_${V}_x64-setup.exe" "cys_${V}_x64-setup.zip"; do
+              L=$(curl -sI "$B/$f" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r')
+              printf '%-32s %s bytes  = %s MB\n' "$f" "$L" "$((L/1000/1000))"
+            done
+            ```
+            4줄 전부 값이 나와야 하고(빈 값 = 자산 부재), MB 표기가 메인 페이지 4토큰과
+            일치해야 한다. 불일치 1건이라도 있으면 **미완**이다.
+      - [ ] ④ **버튼 href 4종 HEAD 200** — 페이지에 박힌 다운로드 링크를 눈이 아니라 HTTP 로 확인:
+
+            ```sh
+            curl -s https://www.cysinsight.com/ \
+              | grep -oE 'href="[^"]*(dmg|setup\.exe|setup\.zip)"' | sed 's/href="//;s/"$//' \
+              | sort -u | while read -r u; do
+                  case "$u" in http*) U="$u";; *) U="https://www.cysinsight.com${u#.}";; esac
+                  printf '%-70s %s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' -I "$U")"
+                done
+            ```
+            **4개 URL 이 나와야 하고 전부 200** 이어야 한다. 개수가 4 미만이면 밴드에 링크가
+            빠진 것이고, 200 이 아니면 자산 경로가 어긋난 것이다.
+
+      ⚠이 4항목을 `verify-release-remote.sh` 에 넣지 않는 이유: 홈페이지는 **이 리포 밖**이라
+      스크립트가 그 SOT(밴드 구조·용량 표기 규약)를 알지 못한다. 자동화하려면 홈페이지 리포에
+      게이트를 두는 것이 옳다 — 여기서는 문서 게이트로 고정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성

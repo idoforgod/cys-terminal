@@ -51,21 +51,36 @@ pub fn embedded_pack_hash() -> String {
     format!("{:x}", h.finalize())
 }
 
-/// pack_dir 해석의 순수 env 층(W0-a): CYS_PACK_DIR(구 JAVIS_/AITERM_ 폴백) → 명시 경로,
+/// ★팩 경로 env 키의 **우선순위 목록 정본**(W14 S19 · 2026-07-26).
+///
+/// 이 순서가 계약이다 — 먼저 발견되는 비어있지 않은 값이 이긴다. Python 팩의 세 구현
+/// (`javis_report.pack_dir` · `javis_orchestra.pack_dir` · `javis_todo_stamp.pack_dir`)이
+/// **같은 목록을 같은 순서로** 갖고, `cysjavis-pack/bin/tests/test_todo_shared_constants.py`가
+/// 이 상수를 읽어 4자 기계 대조한다.
+///
+/// **왜 상수로 뽑았나**: 같은 개념이 5곳에 적혀 있었고(2언어 5구현) env 목록이 **3종**으로
+/// 갈려 있었다. 실제 피해 — `cys todo-path`가 `AITERM_JARVIS_DIR`를 인식하지 못해, 레거시 env
+/// 환경에서 **생성 위치(`~/.cys/pack/round`)와 스캔 위치(`$AITERM_JARVIS_DIR/round`)가 갈려
+/// 파일이 보고기에 영영 보이지 않았다.** 설계 §14-4 4번: 한 개념이 두 곳에 적히면 그 자체가
+/// 결함이다 — 재사용하거나, 못 하면 기계 대조를 박아라.
+///
+/// `AITERM_PACK_DIR`는 종전 `env_compat` 기계적 개명 규칙이 실제로 인정하던 키라 목록에
+/// 명시적으로 남긴다(암묵을 명시로 바꾼 것이지 동작 변경이 아니다).
+pub const PACK_DIR_ENV_KEYS: [&str; 4] = [
+    ENV_PACK_DIR,        // "CYS_PACK_DIR"
+    "JAVIS_PACK_DIR",
+    "AITERM_PACK_DIR",
+    "AITERM_JARVIS_DIR",
+];
+
+/// pack_dir 해석의 순수 env 층(W0-a): `PACK_DIR_ENV_KEYS` 순서대로 → 명시 경로,
 /// 아무 override도 없으면 `None`(= 홈 기본 폴백 대상). panic·부수효과 없음 — 폴백-불변식
 /// 회귀 테스트(pack_dir_env_precedence_and_legacy_fallbacks)가 이 순수함수를 직접 호출한다.
 fn pack_dir_from_env() -> Option<PathBuf> {
-    if let Some(d) = crate::env_compat(ENV_PACK_DIR) {
-        return Some(PathBuf::from(d));
-    }
-    for legacy in ["JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"] {
-        if let Ok(d) = std::env::var(legacy) {
-            if !d.is_empty() {
-                return Some(PathBuf::from(d));
-            }
-        }
-    }
-    None
+    PACK_DIR_ENV_KEYS
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// 홈 기반 라이브 기본 pack 경로(~/.cys/pack) — env override를 **의도적으로 무시**하는 원천 경로.
@@ -97,6 +112,73 @@ pub fn pack_dir() -> PathBuf {
     #[cfg(not(test))]
     {
         home_default_pack_dir()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 선언 기반 todo 판정(Declared State)의 팩 정체성 — `todo_decl::classify`가 요구하는
+// `my_scope`와 `scope_exists`를 여기 한 곳에서 산출한다.
+//
+// **여기 두는 이유**: 소비자가 데몬(`cysd/governance.rs check_todo`)과 CLI(`cys.rs` cycle
+// 저장검증) **둘**이라, 각자 구현하면 즉시 drift가 난다(파서를 lib 계층에 둔 것과 같은 이유).
+// 그리고 이 판정의 정본은 팩 디렉터리 이름 자체다 — 파서에 파일시스템을 넣지 않는 설계(픽스처가
+// 계약·ADR-2)라 디스크 조회는 소비자 쪽인 여기서 콜러블로 주입한다.
+//
+// Python 정본(`cysjavis-pack/bin/javis_report.py`의 `my_scope`·`scope_exists`)과 **같은 규칙**
+// 이어야 2언어 판정이 갈리지 않는다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 내 팩 식별자 = `pack_dir()`의 basename. **하드코딩 금지** — 본사는 `pack`, 부서는
+/// `pack-dept-dept-2` 등으로 팩 이름 자체가 정체성이다(설계 §4-1 `scope` 필드).
+pub fn scope_id() -> String {
+    scope_id_of(&pack_dir())
+}
+
+/// 선언된 scope가 **디스크에 실재하는 팩**인가 — 팩의 형제 디렉터리 존재로만 판정한다.
+///
+/// 이 판정이 필요한 이유(§4-2 R2 교정): scope가 남의 팩이라고 **무조건 조용히 배제**하면 부서
+/// teardown·재생성·팩 개명 시 살아있는 파일이 통째로 사라져 07-11 유령 사고를 거울상으로
+/// 재현한다. 실재하면 정상(조용한 배제 = foreign-scope), 실재하지 않으면 orphan-scope로
+/// 시끄럽게 알린다. 입력이 "디렉터리 존재"라 시간 의존이 없고 결정론이다.
+pub fn scope_exists(scope: &str) -> bool {
+    scope_exists_in(&pack_dir(), scope)
+}
+
+/// `scope_id`의 순수 부분 — pack_dir() 봉인(W0-a)에 걸리지 않고 테스트가 직접 검증한다.
+/// 상대 경로는 cwd 기준으로 절대화한 뒤 basename을 뽑는다(Python `basename(normpath(abspath(…)))` 등가).
+fn scope_id_of(dir: &Path) -> String {
+    absolutize(dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `scope_exists`의 순수 부분(팩 경로 주입형).
+fn scope_exists_in(pack: &Path, scope: &str) -> bool {
+    // 경로 탈출 방어 — G4 값 문법(`[A-Za-z0-9._:-]+`)상 정상 선언엔 나올 수 없는 형태지만,
+    // 깨진 선언이 파서를 통과하는 미래 변경에 대비해 소비자 쪽에서도 막는다.
+    if scope.is_empty()
+        || scope == "."
+        || scope == ".."
+        || scope.contains('/')
+        || scope.contains('\\')
+    {
+        return false;
+    }
+    match absolutize(pack).parent() {
+        Some(parent) => parent.join(scope).is_dir(),
+        None => false,
+    }
+}
+
+/// 상대 경로를 cwd 기준으로 절대화한다(cwd 조회 실패는 원본 그대로 — 패닉 0).
+fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
     }
 }
 
@@ -2301,6 +2383,53 @@ mod tests {
         std::env::set_var("CYS_PACK_DIR", "");
         assert_eq!(pack_dir_from_env(), Some(PathBuf::from("/legacy/javis")));
         // guards drop → 각 키 원값 복원(중간 set_var는 덮어써짐)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 선언 기반 todo 판정의 팩 정체성(scope_id·scope_exists)
+    // ★W0-a: pack_dir()은 테스트 빌드에서 env 미설정 시 panic(격리 봉인)하므로, 여기서도
+    // 순수함수(scope_id_of·scope_exists_in)를 직접 호출한다(pack_dir_env_precedence와 동일 예외).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// scope는 **팩 이름 자체**다. 본사 `pack`·부서 `pack-dept-dept-2` 어느 쪽도 하드코딩하지
+    /// 않고 basename으로 산출해야, 부서 팩이 늘어나도 판정이 자동으로 따라온다.
+    #[test]
+    fn scope_id_is_pack_dir_basename() {
+        assert_eq!(scope_id_of(Path::new("/home/u/.cys/pack")), "pack");
+        assert_eq!(
+            scope_id_of(Path::new("/home/u/.cys/pack-dept-dept-2")),
+            "pack-dept-dept-2"
+        );
+        // 후행 슬래시·`.` 요소는 basename 판정에 영향을 주지 않는다(Python normpath 등가).
+        assert_eq!(scope_id_of(Path::new("/home/u/.cys/pack/")), "pack");
+        assert_eq!(scope_id_of(Path::new("/home/u/.cys/pack/.")), "pack");
+    }
+
+    /// 실재 판정은 **팩의 형제 디렉터리 존재**로만 한다 — 시간 의존 0·결정론.
+    /// 부재(orphan-scope)와 실재(foreign-scope)를 가르는 이 한 번의 stat이, 부서 teardown·개명
+    /// 시 살아있는 파일이 통째로 조용히 사라지는 것(07-11 사고의 거울상)을 막는다.
+    #[test]
+    fn scope_exists_checks_sibling_pack_dirs_only() {
+        let root = std::env::temp_dir().join(format!(
+            "cys-scope-exists-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let me = root.join("pack-dept-dept-2");
+        std::fs::create_dir_all(&me).unwrap();
+        std::fs::create_dir_all(root.join("pack-dept-dept-1")).unwrap();
+        std::fs::write(root.join("pack-dept-dept-7"), b"file, not dir").unwrap();
+
+        assert!(scope_exists_in(&me, "pack-dept-dept-1"), "형제 팩 실재");
+        assert!(scope_exists_in(&me, "pack-dept-dept-2"), "자기 자신도 실재");
+        assert!(!scope_exists_in(&me, "pack-dept-dept-9"), "부재 = orphan-scope 근거");
+        assert!(!scope_exists_in(&me, "pack-dept-dept-7"), "파일은 팩이 아니다");
+        // 경로 탈출 방어 — G4 값 문법상 정상 선언엔 나올 수 없지만 소비자 쪽에서도 막는다.
+        for bad in ["", ".", "..", "../pack-dept-dept-1", "a/b", "a\\b"] {
+            assert!(!scope_exists_in(&me, bad), "경로 탈출 후보가 통과했다: {bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

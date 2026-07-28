@@ -741,6 +741,19 @@ pub struct Daemon {
     pub pause_info: Mutex<Option<(f64, String)>>, // (since, reason)
     /// T3-9 todo 워치: path → (done, total, mtime)
     pub todo_progress: Mutex<HashMap<String, (u64, u64, f64)>>,
+    /// C2 선언 판정 캐시(Declared State): path → (mtime, verdict 케밥 문자열, 선언 owner).
+    ///
+    /// **세 가지 일을 겸한다.** ①`org.status`/`todo.updated`가 실을 구분 플래그의 원천
+    /// (`todo_progress` 값 튜플은 건드리지 않는다 — 설계 §5-2가 구조체 변경을 파급 확대로 기각).
+    /// ②mtime 기반 재파싱 skip 캐시. ②가 없으면 **배제 판정(retired·foreign-scope) 파일은
+    /// `todo_progress`에 등재되지 않으므로 매 워치독 틱마다 다시 읽히고 다시 파싱된다** =
+    /// 전 파일 I/O 순증. 그래서 skip 판정의 기준을 진행률 맵이 아니라 이 캐시로 옮겼다.
+    /// ③★W14 S16 — **선언 `owner`의 보관처**. `todo.updated` 이벤트에는 이미 실렸는데
+    /// `org.status`에는 없어서, HUD 브리지가 스냅샷 경로에서는 여전히 **파일명 정규식**으로
+    /// 라벨을 추론했다(D3가 C4에 그대로 생존). 이벤트와 스냅샷이 다른 진실을 말하면 HUD 라벨은
+    /// 새로고침 한 번에 뒤집힌다. 센티널 `"?"`(ADR-4 C-3 · 주인 미상)는 `None`으로 저장한다 —
+    /// 없는 정보를 있는 것처럼 흘리면 소비자가 `"?"`라는 이름의 노드를 그린다.
+    pub todo_verdict: Mutex<HashMap<String, (f64, &'static str, Option<String>)>>,
     /// T1-3 발신자 해석 캐시: caller pid → 항목 — 60초 TTL (항목 정의는 CallerCacheEntry).
     pub caller_cache: Mutex<HashMap<u32, CallerCacheEntry>>,
     /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface
@@ -1295,6 +1308,7 @@ impl Daemon {
             paused: AtomicBool::new(pause_restored.is_some()),
             pause_info: Mutex::new(pause_restored),
             todo_progress: Mutex::new(HashMap::new()),
+            todo_verdict: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
             create_idem: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),

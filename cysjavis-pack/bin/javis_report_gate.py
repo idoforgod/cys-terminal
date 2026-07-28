@@ -38,6 +38,7 @@ STALL_CYCLES_DEFAULT = 6       # 6주기=30분 무진행 → stall 승격(DESIGN
 QUIET_CYCLES_DEFAULT = 12      # 12주기=60분 QUIET → 세션 주차 후보(P2·CSO 집행)
 GAP_CYCLES = 3                 # 직전 대장과 간격 >3주기 = GAP(슬립·재부팅 복귀 위양성 강등)
 SCHEMA_VERSION = 1
+STALL_COOLDOWN_SECS = 3600     # stall 재발화 쿨다운(1h·12주기) — 2026-07-26 무한 발화 결함 수정
 LEDGER_MAX_BYTES = 5 * 1024 * 1024   # 대장 5MB 도달 시 ledger.jsonl.1로 1세대 로테이션
 
 # 정규화 블랙리스트 — 타임스탬프·수집시각·순서 비결정 항목만 제거한다. 화이트리스트 금지
@@ -249,6 +250,88 @@ def in_progress_tasks(report):
             if n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)]
 
 
+def pending_outside_nodes(report):
+    """`nodes[]` **밖**에 남은 미완 작업 **전건**(javis_report의 동명 필드 · 교정 2-b).
+
+    구버전 보고기(이 필드를 싣지 않는 팩)에서는 빈 목록 → 종전 동작과 동일하다(ADR-2 스큐 안전:
+    양측은 서로를 전제하지 않는다). 새 필드가 도착하면 그때부터 불변식이 발효한다.
+
+    ⚠park 판정에 쓰는 것은 이 전건이 아니라 `unresolved_pending_nodes`다(W15 교정 3).
+    이 함수는 보고·진단용 전건 접근자로 남는다.
+    """
+    return list(report.get("pending_outside_nodes") or [])
+
+
+# ★W15 교정 3 — park 차단에서 **면제되는** 갈래(javis_report.PENDING_KIND_STALE_GHOST와 같은 값).
+# 값이 갈리면 게이트가 유령을 unresolved로 보아 종전 결함(park 영구 차단)이 그대로 남거나,
+# 반대로 unresolved를 유령으로 보아 false QUIET이 난다 — 후자가 훨씬 위험하므로 **모르는
+# kind는 전부 unresolved로 취급**한다(아래 비교가 `!=` 인 이유).
+PENDING_KIND_STALE_GHOST = "stale_ghost"
+
+
+def unresolved_pending_nodes(report):
+    """집계 밖 미완 중 **주인 불명**인 것만(= park를 막는 것만 · W15 교정 3).
+
+    종전에는 `pending_outside_nodes` 전체가 park를 막았고, 그래서 07-26 형태의 유령이
+    존재하는 동안 `quiet_branch_holds`가 **영원히** False였다 — 유령을 성공적으로 배제한
+    바로 그 사실이 세션 주차를 영구 차단한 것이다. 유령은 정의상 오래된 파일이라 시간이
+    풀어주지도 않는다.
+
+    분리 기준은 **누가 그렇게 말했는가**다(판정은 산출기 `javis_report.pending_kind`가 내리고
+    여기서는 그 라벨만 읽는다 — 두 번째 기준을 만들지 않는다).
+      · `unresolved`  주인 불명(`unclaimed`·`orphan-scope`·`shadowed`·휴리스틱 `retired`)
+                      **+ 휴리스틱 `stale`**(담당 role이 살아 있다 · W18 교정 1)
+                      → 우리가 마지막 관측자다. **park 차단 유지.**
+      · `stale_ghost` 우리 추론이고 담당 role도 없다(휴리스틱 `orphan`) → park를 막지 않는다.
+                      이미 집계에서 배제할 만큼 확신한 판정을 park만 영원히 막게 두는 것은
+                      일관성이 없다(`foreign-scope` 면제와 같은 논리다).
+
+    ★W18 교정 1 — 종전에는 휴리스틱 `stale`도 면제였다. `orphan`과 `stale`을 가르는 것은
+    **담당 role의 생사**뿐인데(`javis_report.classify_files`), `stale`은 담당 role이 **살아
+    있는** 파일이다. 살아있는 담당자의 미완을 우리 추론(mtime)만으로 침묵시키면 ADR-3·A3
+    교훈에 어긋난다. 07-26 유령 4파일은 전부 종결 레인(role 부재)=`orphan`이라 W15가 풀려던
+    livelock 해소는 그대로 유지된다.
+
+    ★스큐(ADR-2): 구버전 보고기는 `kind`를 싣지 않는다 → 그 항목은 `unresolved`가 되어
+    **종전과 똑같이** park를 막는다. 새 필드가 도착해야 면제가 발효한다 = 보수적 방향이다.
+    """
+    return [r for r in pending_outside_nodes(report)
+            if r.get("kind") != PENDING_KIND_STALE_GHOST]
+
+
+def quiet_branch_holds(report):
+    """★구조적 불변식 — QUIET(=세션 주차 후보) 분기의 **전체** 성립 조건.
+
+    조건 3개의 AND다:
+      ① `nodes[]`에 미완 작업이 없다
+      ② **`nodes[]` 밖에도** 주인 불명(`unresolved`) 미완 작업이 없다   ← 신설(W15에서 축소)
+         (면제 = **주인이 처분을 명시한 것**(`retired`·`foreign-scope` · 산출기가 목록에서
+          아예 뺀다) + **담당 role이 사라진 종결 레인 유령**(`stale_ghost` = 휴리스틱 `orphan`
+          · W15 교정 3에서 park 차단만 면제 · W18 교정 1에서 `stale` 제외). 주인 불명인
+          `orphan-scope`·`unclaimed`·`shadowed`·휴리스틱 `retired`와, 담당 role이 살아 있는
+          휴리스틱 `stale`은 면제가 아니다.
+          판정은 산출기 `javis_report.pending_kind`가 내리고 여기서는 라벨만 읽는다.)
+      ③ 전 활성 노드가 idle이다
+
+    ★W15 교정 3 — ②를 전건에서 `unresolved`로 좁힌 이유. 종전 ②는 유령이 존재하는 동안
+    park를 **영구히** 막았다. 유령을 배제한 바로 그 사실이 세션 주차를 영영 못 하게 만드는
+    것은 일관성이 없고, 운영자가 유령을 처분할 경로도 없었다(그 경로는
+    `javis_todo_stamp.py --promote-retire`로 함께 열었다 — 정책을 지키려면 도구가 그 정책을
+    집행할 수 있어야 한다). 유령은 **보고에는 계속 노출된다**: park 조건에서만 뺐다.
+
+    ②가 없던 시절, 버킷 분류가 한 번만 틀려도(orphan-scope 조용한 배제·완료 파일이 미완
+    파일을 shadow) 미완 작업이 `nodes[]`에서 사라지고 ①이 공집합으로 성립해 게이트가
+    **false QUIET → 세션 주차**로 갔다. 두 결함은 분류 단계가 달랐을 뿐 같은 사슬을 탔다.
+    ②는 그 사슬의 마지막 고리를 끊는다 — 앞으로 분류가 또 틀려도 park 오발동으로 번지지 않는다.
+
+    판정을 술어 하나로 뽑아 둔 이유: 분기가 인라인 AND로 흩어져 있으면 다음 소비자가
+    ②를 빠뜨린 채 ①만 복제한다. 이 함수가 QUIET 판정의 단일 진입점이다.
+    """
+    return (not in_progress_tasks(report)) \
+        and (not unresolved_pending_nodes(report)) \
+        and all_nodes_idle(report)
+
+
 def all_nodes_idle(report):
     """전 활성 노드가 idle인가. 정보 없음(활성 노드 0·status 미수집)이면 False(QUIET 단정 불가=보수적)."""
     alive = [n for n in (report.get("live_nodes") or []) if n.get("agent_alive")]
@@ -269,8 +352,15 @@ def all_nodes_idle(report):
 #   collect → EVT 매핑 없음 → wake 전용
 #   DELTA   → task_progress {task, stage, [pct]}
 #   날짜변경 → briefing {counts:{running,inbox,approvals,alerts}}
-def extract_warnings(report):
-    """원문 report에서 WARN 트리거 목록 추출. 각 항목: trigger/reason/wake_body/(evt_type,evt_fields)/idem."""
+def extract_warnings(report, counters=None, now=0, edge_cooldown=0):
+    """원문 report에서 WARN 트리거 목록 추출. 각 항목: trigger/reason/wake_body/(evt_type,evt_fields)/idem.
+
+    ⚠`counters`·`now`·`edge_cooldown`은 **이 브랜치에서 무시된다**(호출 규약 호환용 선택 인자).
+    상류(v0.13.x)에는 무배정 idle을 '엣지 1회 + 쿨다운'으로 강등하는 `idle_edge` 갈래가 있어
+    이 세 인자를 소비하지만, 그 갈래는 이 브랜치에 아직 없다 — 여기서는 모든 idle이 매 주기
+    WARN(`idle_5min:<role>`)으로 나가므로 강등 자체가 존재하지 않는다(= 침묵 위험 없음·보수적).
+    idle_edge 갈래를 나중에 이식하면 이 인자들을 그때 실제로 소비하면 된다.
+    """
     warns = []
     proc = ("read-screen 확인·재지시.")
     tail = " 기상절차: cys status --json 1콜 점검 병행."
@@ -332,12 +422,18 @@ def extract_warnings(report):
     return warns
 
 
-def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso):
+def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso, now_epoch=0):
     """태스크(노드) 단위 stall 카운터 갱신 + 승격 대상 WARN 생성.
 
     전역 diff 카운터 금지 — 다른 태스크의 변화가 특정 태스크의 정체를 은폐한다(적대 검증 A6).
     승격 조건: 진행 시그니처 무변화 ≥stall_cycles **AND 담당 노드 idle**(데몬 실측). 노드 busy면
     정상 장기 라운드(리뷰 40분+ 등)이므로 카운터만 증가·승격 보류(오탐 억제 S1-2).
+
+    ★2026-07-26 수정(유령 stall 무한 발화): 승격 후 재발화에 쿨다운을 건다. 종전에는 승격 조건이
+    한 번 성립하면 **매 주기 영구 발화**했다(idle 엣지에는 쿨다운이 있는데 stall에는 없던 설계 공백).
+    실측: 유산 todo 2건이 6·7·8·9주기로 5분마다 무한 승격(state/report_gate-dept-2/ledger.jsonl
+    09:02~09:17). 유령 자체는 javis_report 배제로 사라지지만, 진짜 stall도 해소 전까지 5분마다
+    같은 wake를 반복하므로 상한이 필요하다 — 발화는 유지하되 STALL_COOLDOWN_SECS 간격으로 억제.
     """
     prev = counters.get("nodes", {}) or {}
     new_nodes = {}
@@ -350,17 +446,23 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso)
         if pc and pc.get("sig") == sig:
             count = pc.get("count", 0) + 1
             last_change = pc.get("last_change_ts", now_iso)
+            last_stall = pc.get("last_stall_fired", 0)
         else:
             count = 0                 # 진행 변화 시에만 리셋(해당 태스크 기준)
             last_change = now_iso
-        new_nodes[label] = {"sig": sig, "count": count, "last_change_ts": last_change}
+            last_stall = 0            # 진행 재개 = 쿨다운도 리셋(다음 정체는 즉시 알린다)
+        new_nodes[label] = {"sig": sig, "count": count, "last_change_ts": last_change,
+                            "last_stall_fired": last_stall}
 
         in_progress = n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)
         if in_progress and count >= stall_cycles:
+            if now_epoch and (now_epoch - last_stall) < STALL_COOLDOWN_SECS:
+                continue              # 쿨다운 창 — 카운터는 계속 증가(다음 발화에 실제 경과 반영)
             idle = node_is_idle(report, label)
             if idle is False:
                 continue              # 노드 busy → 승격 보류(카운터는 이미 증가)
             # idle True 또는 None(미지=보수적 시끄러운 쪽으로 승격) → stall WARN
+            new_nodes[label]["last_stall_fired"] = now_epoch or last_stall
             mins = count * cycle_minutes
             stalls.append({
                 "trigger": "stall",
@@ -639,14 +741,16 @@ class Gate:
         # ── 분류 ──
         warns = extract_warnings(report)
         warns += build_stall_warnings(counters, report, self.cycle_minutes,
-                                      self.stall_cycles, now_iso)
+                                      self.stall_cycles, now_iso, now_epoch)
         delta_fields = diff_top_fields(old_snap, new_snap)
 
         if warns:
             verdict = VERDICT_WARN
         elif delta_fields:
             verdict = VERDICT_DELTA
-        elif (not in_progress_tasks(report)) and all_nodes_idle(report):
+        elif quiet_branch_holds(report):
+            # ★구조적 불변식(교정 2-b · 2026-07-26): `nodes[]` **밖**의 미완 작업도 0이어야
+            #   QUIET이다 — 버킷 분류 실수가 park 오발동으로 번지지 않게 하는 마지막 고리.
             # ★master 승인 2026-07-18: DESIGN QUIET 조건의 "미해결 게이트 0"은 report 스키마에
             #   소스 필드가 없어 생략한다 — 보수적 방향(주차 덜 발동)이라 안전하다(승인됨). 필요 시
             #   report에 미해결 게이트 카운트를 추가하고 여기 AND 조건으로 편입한다.

@@ -252,10 +252,80 @@ def node_key(s):
 
 
 # ------------------------------------------------------------------ 월드
-TODO_ROLE = re.compile(r"(?:^|/)(?P<r>[A-Z_]+)_TODO\.md$")
+# ★W14 S16 — 파일명 정규식이 **숫자·하이픈을 통째로 탈락**시켰다. 종전 `[A-Z_]+`는
+# `WORKER_2_TODO.md`·`REVIEWER-GEMINI_TODO.md`를 아예 매치하지 못해 HUD에서 **표시 자체가
+# 사라졌다**. 둘 다 실재 형태다 — `cys todo-path`가 role `worker-2`에 대해 실제로 만드는
+# 이름이고, 하이픈판은 손기동 산출물로 실측된다. 문자집합을 role 라벨공간에 맞춘다.
+TODO_ROLE = re.compile(r"(?:^|/)(?P<r>[A-Za-z0-9_-]+)_TODO\.md$")
+# 파일명 → role 라벨 정규화는 **소문자화 + 언더스코어→하이픈** 한 규칙이다
+# (`javis_report.node_label`·`javis_todo_stamp.owner_from_filename`과 **같은 규칙**).
+# 종전의 하드코딩 dict는 이 규칙과 결과가 동일하면서 새 역할이 생길 때마다 조용히
+# 누락되는 표면만 늘렸다 — 규칙 하나로 수렴시킨다.
 TODO_ROLE_MAP = {"MASTER": "master", "WORKER": "worker", "CSO": "cso",
                  "REVIEWER_GEMINI": "reviewer-gemini", "REVIEWER_AGY": "reviewer-agy",
                  "REVIEWER_CODEX": "reviewer-codex"}
+
+
+def normalize_role_label(raw):
+    """role 라벨공간(소문자·하이픈)으로 수렴시킨다. 빈 값이면 None.
+
+    ⚠라벨은 게이트·HUD의 **조인 키**다. 한 글자만 어긋나도 조인이 조용히 전패한다
+    (`javis_report.decl_label`이 같은 이유로 같은 정규화를 한다).
+    """
+    s = (raw or "").strip().lower().replace("_", "-")
+    return s or None
+
+
+def todo_label(path, entry):
+    """이 todo 항목의 라벨 — **선언 `owner`가 1순위**, 없으면 파일명 폴백(D3 해소).
+
+    ★W14 S16 — 데몬은 `todo.updated`에 owner를 실으면서 `org.status`에는 싣지 않았고,
+    브리지는 **어느 쪽도 읽지 않았다**. 그래서 선언이 소거하려던 파일명→역할 추론(D3)이
+    HUD(C4)에 그대로 생존했다 — 실측: 선언 `owner=cso`인데 HUD 라벨은 `worker`.
+    선언이 유일한 진실이라는 ADR-1이 마지막 소비자에서 지켜지지 않았다.
+
+    ⚠스큐 안전(ADR-2): 구버전 데몬은 `owner`를 싣지 않는다 → 파일명 폴백 = 종전 동작 그대로.
+    """
+    owner = normalize_role_label((entry or {}).get("owner"))
+    if owner:
+        return owner
+    m = TODO_ROLE.search(path or "")
+    if not m:
+        return None
+    raw = m.group("r")
+    return normalize_role_label(TODO_ROLE_MAP.get(raw, raw))
+
+# C4: 데몬(C2)이 실은 선언 판정 → HUD 구분 표시 라벨.
+# 집계에 남아 있는 비-counted 판정은 이 둘뿐이다 — retired·foreign-scope 는 데몬이 애초에
+# 등재하지 않는다(설계 §4-5). `counted` 와 미지 판정은 라벨을 달지 않는다.
+TODO_FLAG_BY_VERDICT = {
+    "unclaimed": "미선언",      # 선언 없음·깨짐 — 주인을 기계가 확정하지 못한 파일
+    "orphan-scope": "고아",     # 실재하지 않는 팩을 가리킴(부서 teardown·개명 흔적)
+}
+
+
+def todo_flag(entry):
+    """todo 항목(또는 todo.updated payload)의 판정 라벨. 표시할 것이 없으면 None.
+
+    ⚠**스큐 안전(ADR-2)**: 팩은 pack 채널로, 데몬은 앱 릴리스로 배송돼 **스큐가 정상 상태**다.
+    구버전 데몬은 `verdict` 를 싣지 않으므로 `.get()` 기본값으로 None → 표시·프레임이 종전과
+    완전히 동일하다. 양측은 서로를 전제하지 않는다.
+
+    ⚠**온보딩 방어(설계 §6)**: 미선언은 **경고가 아니라 정보**다. 신규 사용자가 손으로 쓴 todo 에
+    경고가 쏟아지면 첫 경험이 훼손된다 — 라벨만 달고 진행률(done/total)은 그대로 보여준다.
+    """
+    return TODO_FLAG_BY_VERDICT.get((entry or {}).get("verdict"))
+
+
+def with_todo_flag(entry):
+    """항목에 표시 라벨(`flag`)을 얹은 사본. 달 라벨이 없으면 **원본 그대로** 돌려준다
+    (구버전 데몬·정상 파일에서 프레임이 한 바이트도 달라지지 않게 하는 스큐 안전 경로)."""
+    flag = todo_flag(entry)
+    if flag is None:
+        return entry
+    out = dict(entry)
+    out["flag"] = flag
+    return out
 
 
 class World:
@@ -362,10 +432,36 @@ class World:
                     out[slug] = d.get("socket")
             return out
 
-    def apply_todo(self, path, done, total):
+    @staticmethod
+    def _todo_rank(path, entry):
+        """정본 선출 정렬 키(작을수록 우선). 상세 근거는 `snapshot`의 주석."""
+        e = entry or {}
+        done, total = e.get("done") or 0, e.get("total") or 0
+        pending = total > 0 and done < total
+        return (0 if e.get("owner") else 1,      # ① 선언 owner 보유
+                0 if pending else 1,             # ② 미완 우선(완료가 미완을 덮지 않는다)
+                e.get("age_secs") or 0,          # ③ 최신
+                path or "")                      # ④ 결정론 tie-break
+
+    def apply_todo(self, path, done, total, verdict=None, owner=None):
         with self.lock:
             ent = self.todo.setdefault(path, {})
             ent["done"], ent["total"], ent["age_secs"] = done, total, 0
+            # owner 는 신버전 데몬만 싣는 선택 필드다(ADR-2 스큐 안전 — verdict 와 같은 규칙).
+            # 부재면 기존 값을 **지우지 않는다**: 구버전 이벤트 한 건이 스냅샷의 라벨 진실을
+            # 파일명 추론으로 되돌리면 안 된다.
+            if owner:
+                ent["owner"] = owner
+            # verdict 는 신버전 데몬만 싣는 선택 필드다(ADR-2 스큐 안전). 부재면 기존 항목의
+            # 판정을 지우지 않고 그대로 둔다 — 구버전 이벤트가 스냅샷의 라벨을 지워버리면
+            # 미선언·고아가 무음으로 되돌아간다.
+            if verdict is not None:
+                ent["verdict"] = verdict
+                flag = todo_flag(ent)
+                if flag is None:
+                    ent.pop("flag", None)   # counted 로 전이 = 라벨 해제
+                else:
+                    ent["flag"] = flag
 
     def apply_ledger(self, name, payload):
         if name == "ledger.registered":
@@ -431,7 +527,9 @@ class World:
                 self.daemon = status.get("daemon") or self.daemon
                 self.daemon["paused"] = status.get("paused", False)
                 for p, t in (status.get("todo") or {}).items():
-                    self.todo[p] = t
+                    # C4: 데몬이 실은 선언 판정을 표시 라벨로 승격(미선언/고아 구분).
+                    # 플래그 부재(구버전 데몬)면 t를 그대로 둔다 — 종전과 동일 동작.
+                    self.todo[p] = with_todo_flag(t)
                 self.seq = self.daemon.get("latest_seq", self.seq)
             structural = False
             if fleet:
@@ -625,11 +723,22 @@ class World:
                     "floor": len(self.departments) - i,   # 첫 부서(본부)가 최상층
                     "nodes": nodes,
                 })
+            # ★W14 S16 — 라벨당 **정본 1개 선출**. 종전에는 dict 대입이라 나중에 순회된
+            # 항목이 앞의 것을 조용히 덮었고, **완료 5/5가 미완 0/2를 덮는** 것이 실측으로
+            # 재현됐다. 그 상태는 사람이 보는 화면에서 살아있는 작업을 지운다.
+            # 정렬은 `javis_report`의 정본 선출 키에서 **미완 우선**을 이식한 것이다
+            # (거기서는 `shadowed` 선출, 여기서는 표시 선출 — 같은 원리를 같은 순서로).
+            #   ① 선언 owner 보유(= 기계가 주인을 확정한 파일)
+            #   ② **미완 우선** — 살아있는 작업이 완료된 파일에 밀리지 않는다
+            #   ③ 최신(age_secs 작은 쪽) ④ 경로순(결정론 tie-break)
+            # ※ `javis_report`의 '정본위치(pack/round)' 키는 여기 대응물이 없다 — 브리지는
+            #   팩 경로를 모른다. 경로 패턴으로 추측하는 것은 ADR-1이 없애려던 그 추론이므로
+            #   넣지 않는다(누락이 아니라 의도적 부재다).
             todo_named = {}
-            for p, t in self.todo.items():
-                m = TODO_ROLE.search(p or "")
-                if m:
-                    todo_named[TODO_ROLE_MAP.get(m.group("r"), m.group("r"))] = t
+            for p, t in sorted(self.todo.items(), key=lambda kv: self._todo_rank(*kv)):
+                label = todo_label(p, t)
+                if label and label not in todo_named:
+                    todo_named[label] = t
             return {
                 "v": 2, "ts": now, "seq": self.seq,   # v2: 정식 노드 키(<slug>@surface:N)·dept_label
                 "daemon": {"version": self.daemon.get("version"),
@@ -759,9 +868,15 @@ def route_event(ev, world, coal, slug="main", now=None):
         if k:
             frames.append({"t": "fx", "kind": "usage", "key": k, "pct": p.get("ctx_pct")})
     elif name == "todo.updated":
-        world.apply_todo(p.get("path"), p.get("done"), p.get("total"))
-        frames.append({"t": "fx", "kind": "todo", "path": p.get("path"),
-                       "done": p.get("done"), "total": p.get("total")})
+        # C4: verdict·owner 는 신버전 데몬만 싣는다(부재=구버전 → 종전 동작 · ADR-2 스큐 안전).
+        world.apply_todo(p.get("path"), p.get("done"), p.get("total"),
+                         p.get("verdict"), p.get("owner"))
+        fx = {"t": "fx", "kind": "todo", "path": p.get("path"),
+              "done": p.get("done"), "total": p.get("total")}
+        flag = todo_flag(p)
+        if flag is not None:
+            fx["flag"] = flag   # 달 라벨이 없으면 키 자체를 만들지 않는다(구버전 프레임과 동형)
+        frames.append(fx)
     elif name == "surface.input_injected":
         # from 은 동일 데몬 내 소스 surface → 같은 slug 로 정식화.
         frames.append({"t": "fx", "kind": "doc", "to": key,

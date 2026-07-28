@@ -32,8 +32,24 @@ jobs:
       EXPIRES_DAYS: '90'            # 서명 신선도 유효창(release.yml과 동일)
       # ★min_binary는 정책 파생(해법③⑤ · 2026-07-14): scripts/min-binary-policy.sh가
       # max(security-floor.txt, 지원창 하한)을 계산 — 손설정 하한의 '잊음' 실패 계급 제거.
-      # 비상시에만 오버라이드(값 지정 시 정책 무시·근거를 커밋에 남길 것).
-      PACK_MIN_BINARY_OVERRIDE: ''
+      #
+      # ⚠**정책 스크립트가 모르는 것 = 기능 의존**(2026-07-26 S26 레인 비대칭 교정).
+      #   min-binary-policy.sh 는 **보안 하한·지원창만** 계산한다. "이 팩이 새 바이너리 기능을
+      #   요구하는가"는 그 입력에 아예 없다. 실측: `bash scripts/min-binary-policy.sh` → 0.12.48.
+      #   그래서 **규칙**: 바이너리 릴리스가 새 CLI 표면(플래그·서브커맨드)을 추가하고 팩이 그것을
+      #   **지시**하면, 다음 pack-v 태그 **전에** 아래 OVERRIDE 를 그 버전으로 올려라. 안 올리면
+      #   구버전 바이너리 사용자가 팩을 받아 지시대로 실행했을 때 unknown-flag 로 죽는다.
+      #   (같은 규칙의 본체 레인 대응물 = release.yml 의 `PACK_MIN_BINARY`. 두 레인은 **따로**
+      #    고쳐야 한다 — 한쪽만 고치면 다른 문으로 같은 실패가 들어온다. 이게 S26 의 실제 사고다.)
+      #
+      # 현재 값 0.14.2 의 근거: v0.14.2 팩의 javis_orchestra.py 가 `cys todo-path --emit-decl`
+      #   실행을 지시하는데 그 플래그는 이 레인에서 v0.14.2 에 처음 생긴다(≤0.14.1 에는 부재 —
+      #   `git show v0.14.1:src/bin/cys.rs | grep -c emit_decl` → 0 으로 실측).
+      #   상향 시 release.yml 의 PACK_MIN_BINARY 와 **같은 값인지** 확인할 것.
+      #
+      # 값 지정 시 정책이 무시되고 "min_binary 정책 오버라이드 사용" ::warning 이 로그에 남는다
+      #   (아래 Compute min_binary 스텝) — 의도된 흔적이다. 근거를 커밋에 남길 것.
+      PACK_MIN_BINARY_OVERRIDE: '0.14.2'
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +92,63 @@ jobs:
 
       - name: Scan pack content (pre-build hard-gate)
         run: bash scripts/scan-pack-secrets.sh
+
+      # ★★배송 팩 계약 게이트(C-1 세 번째 레인 교정 · 2026-07-26) — **이 레인도 pack.tar.gz 를 만들고
+      #   pack-manifest.json 을 minisign 서명한다**(아래 `Identity gate + build pack.tar.gz` ·
+      #   `Sign pack-manifest.json (minisign)`). 즉 사용자에게 배달되는 Python 선언 파서 본체가
+      #   **파리티 검증 0회로 봉인되는 문**이 여기 열려 있었다.
+      #   경위: C-1 을 release.yml 의 `pack-artifacts` 잡에만 걸고 닫았다고 판단했으나, 팩-only
+      #   레인(pack-v* 태그)은 그 잡을 전혀 타지 않는다. S26(min_binary 하한을 release.yml 에만
+      #   고치고 이 파일은 방치)과 **정확히 같은 형태의 레인 비대칭**이다 — 한 문을 닫고 "닫혔다"고
+      #   적는 동안 다른 문이 열려 있었다. 그래서 이 게이트는 release.yml `pack-artifacts` 의
+      #   동일 블록을 **축소 없이** 옮긴 것이다.
+      # 위치: manifest emit(`Emit authoritative pack-manifest.json`)·tar 생성·minisign 서명
+      #   **전부보다 앞**. 서명 뒤 검증은 이미 봉인된 것을 보는 일이라 의미가 없다.
+      # 러너: ubuntu-latest. 위 `Setup Rust`(dtolnay stable)가 rustc 를 PATH 에 올려두므로 2언어
+      #   파리티를 **여기서도 온전히** 돌린다(파이썬 단독 축소본 아님). 하네스는 rustc 부재 시
+      #   hard fail 하고, 아래 `command -v rustc` 존재-단언이 그 앞에서 한 번 더 차단한다.
+      # 존재-단언은 이 리포 관례(`[ -f "$f" ] || exit 1`)를 그대로 따른다 — untracked 누락으로
+      #   게이트가 조용히 skip 되면 초록이 거짓말이 된다.
+      - name: 배송 팩 계약 게이트 (선언 파서 2언어 파리티 + 유령집계 회귀)
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="cysjavis-pack/bin/tests/fixtures/todo-decl"
+          h="cysjavis-pack/bin/tests/parity_todo_decl.py"
+          [ -d "$d" ] || { echo "골든 픽스처 디렉터리 누락: $d (계약 SOT 부재 = 실패)" >&2; exit 1; }
+          [ -f "$d/expected.json" ] || { echo "계약 대장 누락: $d/expected.json (git add 누락 의심)" >&2; exit 1; }
+          n="$(find "$d" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+          [ "$n" -ge 15 ] || { echo "픽스처 케이스 부족(${n}종 · 설계 P3-1 최소 15종)" >&2; exit 1; }
+          [ -f "$h" ] || { echo "파리티 하네스 누락: $h (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_decl_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_decl_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_decl.rs" ] || { echo "Rust 파서 누락: src/todo_decl.rs (git add 누락 의심)" >&2; exit 1; }
+          command -v rustc >/dev/null || { echo "rustc 부재 — 2언어 파리티 불가(축소 실행 금지)" >&2; exit 1; }
+          echo "== [pack-only] todo 선언 파서 2언어 파리티(골든 ${n}종 + 조합 1024건) =="
+          if ! python3 "$h" --fuzz 1024 --list-mismatch 20; then
+            echo "::error::[pack-only] 선언 파서 2언어 파리티 실패 — 배송될 Python 파서가 Rust 와 갈렸다. 서명 전 차단." >&2
+            exit 1
+          fi
+          echo "== [pack-only] todo 선언·유령집계 소비자 회귀 6종 =="
+          for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
+                   test_report_gate test_todo_shared_constants; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== [pack-only] declared-state test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::[pack-only] 선언·유령집계 게이트 실패($t) — 배송 팩 회귀. 서명 전 차단." >&2
+              exit 1
+            fi
+          done
+          # ★todo 스캔 집합 파리티(S18) — 파서 파리티와 다른 표면("같은 파일을 보는가").
+          echo "== [pack-only] todo 스캔 집합 2언어 파리티(C1·C2 동일 파일 집합) =="
+          hs="cysjavis-pack/bin/tests/parity_todo_scan.py"
+          [ -f "$hs" ] || { echo "스캔 파리티 하네스 누락: $hs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "scripts/todo_scan_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_scan_dump.rs (git add 누락 의심)" >&2; exit 1; }
+          [ -f "src/todo_scan.rs" ] || { echo "스캔 단일 구현 누락: src/todo_scan.rs (git add 누락 의심)" >&2; exit 1; }
+          if ! python3 "$hs"; then
+            echo "::error::[pack-only] todo 스캔 집합 파리티 실패 — C1(보고기)과 C2(데몬)가 다른 파일을 본다. 서명 전 차단." >&2
+            exit 1
+          fi
 
       # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
       # 오염시키는 회귀 차단(release.yml과 동일).

@@ -597,42 +597,116 @@ fn check_alerts(daemon: &Arc<Daemon>, fired: &mut HashMap<String, f64>) {
     fired.retain(|k, _| active_keys.contains(k));
 }
 
-/// CYS_TODO_DIRS(PATH류 목록)를 플랫폼 규약대로 분해한다.
-/// `std::env::split_paths`는 Unix에서 ':' · Windows에서 ';'로 가르며,
-/// Windows 드라이브 문자 콜론(`C:\…`)을 구분자로 오인하지 않는다 — ':' 하드코딩이
-/// Windows 절대경로를 `C`와 `\…`로 쪼개 워치를 무력화하던 버그를 차단한다.
-/// 빈 항목은 기존 동작과 동일하게 버린다.
-fn parse_todo_dirs(raw: &str) -> Vec<std::path::PathBuf> {
-    std::env::split_paths(raw)
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect()
+// CYS_TODO_DIRS 분해·스캔 루트 조립·파일 발견은 전부 **lib 계층 단일 구현**이다
+// (`cys::todo_scan`). 여기 재구현을 두면 파리티 하네스가 검증하는 규칙과 데몬이 실제로 쓰는
+// 규칙이 갈린다 — 그 갈림이 정확히 S18이었다(정책은 같은데 보는 파일 집합이 달랐다).
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★락 순서 규약 (todo 계열 · 2026-07-26 명문화)
+//
+//   **`todo_progress` → `todo_verdict`.** 역순 획득 금지.
+//
+// 근거는 실측이다: `handlers.rs`의 `org.status` 조립이 `todo_progress` 가드를 **잡은 채**
+// `todo_verdict`를 획득한다(TP→TV 중첩). 여기 워치독이 TV를 잡은 채 TP를 잡으면 두 스레드가
+// 서로의 가드를 기다려 **즉시 데드락**이고, 데드락은 워치독을 죽여 자원 거버넌스를 데몬
+// 수명 내내 침묵시킨다 — 아래 poison 내성이 막으려는 것과 정확히 같은 종류의 사고다.
+//
+// 현행 `check_todo`는 두 맵을 **중첩 없이** 각각 임시 가드로만 잡으므로 규약을 만족한다
+// (모든 획득이 한 문장 안에서 끝나 가드가 즉시 소멸한다). 이 파일에 TV 가드를 변수로 묶는
+// 코드를 넣게 되면 그 스코프 안에서 TP를 만지지 마라 — 필요하면 TP를 **먼저** 잡아라.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 판정 캐시 잠금 — 워치독 틱 경로라 poisoning에도 살아남아야 한다(패닉으로 워치독을 죽이면
+/// 자원 거버넌스가 데몬 수명 내내 조용히 사라진다 · 틱 패닉 격리와 같은 정신).
+fn todo_verdict_map(
+    daemon: &Arc<Daemon>,
+) -> std::sync::MutexGuard<'_, HashMap<String, (f64, &'static str, Option<String>)>> {
+    daemon
+        .todo_verdict
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 진행률 맵 잠금 — `todo_verdict_map`과 **대칭**으로 poison 내성이어야 한다.
+///
+/// 종전에는 같은 함수 안에서 판정 캐시만 poison 내성이고 진행률 맵은 `.unwrap()`이었다.
+/// 주석이 "패닉으로 워치독을 죽이면 자원 거버넌스가 데몬 수명 내내 사라진다"고 적어 놓고
+/// 절반만 이행된 상태다 — 다른 스레드가 진행률 맵을 잡은 채 패닉하면 그 순간부터 워치독
+/// 틱 전체가 매번 죽는다. 방어의 비대칭은 방어가 아니다.
+fn todo_progress_map(
+    daemon: &Arc<Daemon>,
+) -> std::sync::MutexGuard<'_, HashMap<String, (u64, u64, f64)>> {
+    daemon
+        .todo_progress
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 진행률 맵(`todo_progress`)에 등재할 판정인가.
+///
+/// - `retired`/`foreign-scope` = **등재도 이벤트 발행도 하지 않는다.** 종결된 레인의 유산
+///   파일과 남의 팩 파일이 이 경로로 `org.status`·HUD·Control Center까지 흘러들어간 것이
+///   07-26 유령 집계 사고(dept-2 306항목 중 301항목이 유령)의 데몬 측 통로였다.
+/// - `unclaimed`/`orphan-scope` = **등재한다.** 판정 불능을 '없음'으로 처리하면 죽은 워커의
+///   미완 작업이 은폐되고 게이트가 false QUIET에 빠진다(ADR-3 fail-open) — 숨기지 말고
+///   구분 플래그를 달아 시끄럽게 보고한다.
+fn todo_is_countable(verdict: cys::todo_decl::Verdict) -> bool {
+    !matches!(
+        verdict,
+        cys::todo_decl::Verdict::Retired | cys::todo_decl::Verdict::ForeignScope
+    )
 }
 
 /// T3-9 todo 파일 워치: 각 surface cwd의 `_round/*_TODO.md` + CYS_TODO_DIRS 추가 루트.
 /// 변경 감지 시 todo.updated 이벤트 + org.status 집계 갱신 (push 규약을 기계 보증으로).
+///
+/// ★C2 선언 기반 판정(Declared State · 설계 §4-5): 어떤 파일을 집계할지는 파일명·경로·mtime이
+/// 아니라 **파일 안의 선언 한 줄**이 정한다(ADR-1). 여기 방어가 없어 종결 레인의 유산 todo가
+/// `daemon.todo_progress` → `org.status` → HUD까지 유입됐다 — Python 보고기만 고치는 것은
+/// 절반만 덮는 것이었다.
 fn check_todo(daemon: &Arc<Daemon>) {
-    let mut dirs: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    for s in daemon.surfaces.lock().unwrap().values() {
-        if !s.exited.load(Ordering::Relaxed) {
-            dirs.insert(std::path::PathBuf::from(&s.cwd).join("_round"));
-        }
-    }
-    if let Ok(extra) = std::env::var("CYS_TODO_DIRS") {
-        dirs.extend(parse_todo_dirs(&extra));
-    }
+    // 팩 정체성 조회는 **틱당 1회**. 파일마다 부르면 워치독 틱에 stat이 순증한다.
+    // 판정 입력을 인자로 뽑아 두면 테스트가 라이브 팩(CYS_PACK_DIR)을 건드리지 않고
+    // 5분기 전부를 결정론으로 재현할 수 있다.
+    //
+    // ★S18 교정 — **정본 위치 `pack/round`를 스캔 루트에 넣는다**(같은 이유로 팩 경로도 틱당
+    // 1회만 조회한다). 이것이 없어서 데몬은 정본 todo를 한 번도 보지 않았고, 이번 브랜치가
+    // 데몬에 배선한 선언 판정·verdict/owner payload·유령 배제가 **정본 파일에는 전혀 적용되지
+    // 않았다**. 팩 경로를 인자로 뽑는 이유도 판정 입력과 같다 — 테스트가 라이브 팩을 만지지
+    // 않으면서 루트 구성 규칙을 결정론으로 재현할 수 있어야 한다.
+    let pack = cys::pack::pack_dir();
+    check_todo_with(daemon, &cys::pack::scope_id(), &|s| {
+        cys::pack::scope_exists(s)
+    }, Some(pack.as_path()))
+}
+
+fn check_todo_with(
+    daemon: &Arc<Daemon>,
+    my_scope: &str,
+    scope_exists: &dyn Fn(&str) -> bool,
+    pack_dir: Option<&std::path::Path>,
+) {
+    // 스캔 루트·파일 발견 규칙은 **lib 계층 단일 구현**이다(`cys::todo_scan`) — Python 소비자
+    // C1과 같은 집합을 보는지 `parity_todo_scan.py`가 같은 임시 트리로 기계 대조한다.
+    let cwds: Vec<String> = daemon
+        .surfaces
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| !s.exited.load(Ordering::Relaxed))
+        .map(|s| s.cwd.clone())
+        .collect();
+    let roots = cys::todo_scan::scan_roots(
+        pack_dir,
+        &cwds,
+        std::env::var("CYS_TODO_DIRS").ok().as_deref(),
+    );
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with("_TODO.md") {
+    {
+        for path in cys::todo_scan::discover(&roots) {
+            let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
+            };
             let mtime = meta
                 .modified()
                 .ok()
@@ -641,45 +715,82 @@ fn check_todo(daemon: &Arc<Daemon>) {
                 .unwrap_or(0.0);
             let key = path.to_string_lossy().into_owned();
             seen.insert(key.clone());
-            let prev_mtime = daemon
-                .todo_progress
-                .lock()
-                .unwrap()
-                .get(&key)
-                .map(|(_, _, m)| *m);
-            if prev_mtime == Some(mtime) {
+            // ★성능 계약(§4-5): skip 기준은 진행률 맵이 아니라 **판정 캐시**다. 배제 판정 파일은
+            // 진행률 맵에 없으므로, 옛 기준을 그대로 두면 유산 파일이 매 틱 재파싱된다.
+            // 캐시 히트(= mtime 무변화)면 파일을 열지 않는다 — 읽기 I/O 순증 0.
+            let prev = todo_verdict_map(daemon).get(&key).map(|(m, v, _)| (*m, *v));
+            if prev.map(|(m, _)| m) == Some(mtime) {
                 continue;
             }
             // 변경됨 — 체크박스 집계 (64KB 상한: 거대 파일이 watchdog 틱을 잡아먹지 않게)
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            //
+            // ★비UTF-8 정합(2026-07-26): 종전 `read_to_string`은 비UTF-8 바이트 하나에
+            // `continue`로 빠져 **등재도 캐시 갱신도 0**이었다 — 그 파일은 매 틱 재파싱되면서
+            // 영원히 집계에서 사라진다. 반면 Python 소비자(`javis_report.read_head`·
+            // `count_checkboxes`)는 `errors="replace"`로 lossy 디코드해 **집계한다**.
+            // 같은 파일에 대해 데몬은 "없음", 팩은 "있음"이라고 말하는 조용한 갈림이었고,
+            // 조용한 차이가 가장 나쁘다(2언어 파리티 K1). 여기를 lossy로 맞춘다 —
+            // `from_utf8_lossy`의 U+FFFD 치환은 Python의 `errors="replace"`와 동형이며,
+            // 체크박스·선언 토큰은 ASCII라 치환이 판정에 영향을 주지 않는다.
+            let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let content: String = content.chars().take(65536).collect();
+            let content: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(65536)
+                .collect();
+            // G3: 선언 파싱 예산은 **원시 바이트** 선두 1 KiB뿐이고, 그 절단은
+            // `head_from_bytes`가 유일하게 수행한다(계약 정본).
+            //
+            // ★W14 S15 교정 — 종전에는 여기서 `content.get(..HEAD_BYTES)`로 **디코드된 문자열**을
+            // 잘라 자체 재구현했다. 그 결과 프로덕션 데몬은 계약 정본을 한 번도 통과하지 않았고
+            // (`head_from_bytes`의 유일한 호출자가 파리티 테스트 덤퍼였다) **하네스가 검증하는
+            // 읽기 경로 ≠ 프로덕션 읽기 경로**였다. 비UTF-8 파일에서 lossy 디코드가 1바이트를
+            // 3바이트로 팽창시키므로 두 경로의 절단 지점이 갈리고, 은퇴 선언이 팽창 뒤에 있으면
+            // **은퇴한 파일을 데몬만 계속 집계**한다(유령 재발). 재구현하지 말고 여기를 지나라.
+            let head = cys::todo_decl::head_from_bytes(&bytes);
+            let decl = cys::todo_decl::parse(&head).ok();
+            let verdict = cys::todo_decl::classify(decl.as_ref(), my_scope, scope_exists);
+            // ★S16 — 선언 owner를 판정 캐시에 함께 보관한다(그래야 `org.status` 조립이 파일명
+            // 추론 없이 라벨을 낼 수 있다). 센티널 `"?"`·빈 값은 "모른다"이므로 싣지 않는다.
+            let owner = decl
+                .as_ref()
+                .map(|d| d.owner.as_str())
+                .filter(|o| !o.is_empty() && *o != "?")
+                .map(|o| o.to_string());
+            todo_verdict_map(daemon).insert(key.clone(), (mtime, verdict.as_str(), owner.clone()));
+            if !todo_is_countable(verdict) {
+                // 은퇴·타 스코프 — 조용히 배제. 직전까지 집계 중이던 파일이 은퇴 선언을 얻은
+                // 경우를 위해 기존 등재분도 걷어낸다(유령 잔류 차단).
+                todo_progress_map(daemon).remove(&key);
+                continue;
+            }
             let done = content.matches("- [x]").count() as u64
                 + content.matches("- [X]").count() as u64;
             let total = done + content.matches("- [ ]").count() as u64;
-            daemon
-                .todo_progress
-                .lock()
-                .unwrap()
-                .insert(key.clone(), (done, total, mtime));
-            if prev_mtime.is_some() {
+            todo_progress_map(daemon).insert(key.clone(), (done, total, mtime));
+            if prev.is_some() {
                 // 최초 발견은 무음 등록 — 데몬 재시작마다 전 파일 이벤트 폭주 방지
-                daemon.bus.publish(
-                    "todo.updated",
-                    "todo",
-                    None,
-                    json!({"path": key, "done": done, "total": total}),
-                );
+                let mut payload = json!({"path": key, "done": done, "total": total,
+                                         "verdict": verdict.as_str()});
+                // ★`owner` 동봉(교정 3 · Python 소비자와 정합). 데몬의 집계 **키는 경로 그대로**
+                // 유지한다(설계 §5-2가 키 스키마 변경을 파급 확대로 기각). 다만 소비자가 라벨을
+                // 파일명에서 추론하지 않아도 되도록 선언의 owner를 실어 보낸다 — Python
+                // `javis_report`는 이미 owner를 라벨로 쓰며, 데몬 payload만 파일명 추론에 남으면
+                // HUD와 보고기의 라벨이 갈린다. ADR-4 C-3 센티널 `"?"`(주인 미상)는 싣지 않는다.
+                // ★S16 — 같은 값이 `org.status`에도 실린다(위 판정 캐시). 이벤트에만 있고
+                // 스냅샷에 없으면 HUD 라벨이 새로고침 한 번에 뒤집힌다.
+                if let Some(owner) = owner.as_deref() {
+                    payload["owner"] = json!(owner);
+                }
+                daemon.bus.publish("todo.updated", "todo", None, payload);
             }
         }
     }
-    // 사라진 파일 정리
-    daemon
-        .todo_progress
-        .lock()
-        .unwrap()
-        .retain(|k, _| seen.contains(k));
+    // 사라진 파일 정리 — 진행률과 판정 캐시를 **같은 seen 집합**으로 함께 솎는다(캐시 누수 차단).
+    // 락 순서 규약(TP→TV) 준수: 두 획득 모두 한 문장 안에서 끝나 가드가 중첩되지 않는다.
+    todo_progress_map(daemon).retain(|k, _| seen.contains(k));
+    todo_verdict_map(daemon).retain(|k, _| seen.contains(k));
 }
 
 /// ★W-B 보완(승인 미감지=워커 hang 방지 · 2026-07-17): agents.json 이 user 소유로 승격되면
@@ -2280,11 +2391,12 @@ mod tests {
     }
 
     use super::{
-        collect_scoped_for_shutdown, parse_todo_dirs, pop_delivered_head,
+        collect_scoped_for_shutdown, pop_delivered_head,
         prune_surface_health_keys, prune_watchdog_debounce_maps, LOAD_DEBOUNCE_SECS,
     };
     use crate::state::LedgerEntry;
     use std::collections::{HashMap, HashSet, VecDeque};
+    #[cfg(windows)]
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -2590,14 +2702,9 @@ mod tests {
     }
 
     // ── CYS_TODO_DIRS 파싱 회귀 가드 ──
-    // 빈 항목은 버린다(기존 동작 보존). split_paths가 Unix에서 ':'로 가른다.
-    #[test]
-    fn parse_todo_dirs_drops_empty_entries() {
-        // 구버전 split(':').filter(!is_empty)와 동치임을 확인.
-        let dirs = parse_todo_dirs("/a/b::/c/d");
-        assert_eq!(dirs, vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")]);
-        assert!(parse_todo_dirs("").is_empty());
-    }
+    // ★W14 S18: 구현이 `cys::todo_scan::parse_todo_dirs`(lib 단일 구현)로 이관됐다.
+    // 빈 항목 처리 회귀는 그 모듈의 단위 테스트가 갖고, 여기서는 **데몬이 그 구현을 쓰는지**만
+    // 확인한다(재구현이 부활하면 이 두 테스트가 lib 구현을 검증하지 않게 되므로 함께 옮겼다).
 
     // Windows 드라이브 문자 콜론(`C:\…`)을 구분자로 오인하지 않아야 한다.
     // 구버전 `extra.split(':')`는 `C:\Users\x\_round`를 `C` + `\Users\x\_round`로
@@ -2606,7 +2713,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn parse_todo_dirs_keeps_windows_drive_paths_intact() {
-        let dirs = parse_todo_dirs(r"C:\Users\x\_round;D:\proj\_round");
+        let dirs = cys::todo_scan::parse_todo_dirs(r"C:\Users\x\_round;D:\proj\_round");
         assert_eq!(
             dirs,
             vec![
@@ -2962,5 +3069,637 @@ mod tests {
             load_tombstones_from_disk(&daemon.socket_path).is_empty(),
             "topology.json에 reap 묘비가 영속돼 재부팅 후 4역할 부활이 막힌다"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C2 (Declared State) — 유령 todo 배제 · fail-open 등재 · mtime 판정 캐시
+//
+// 이 스위트가 지키는 것: 07-11~07-20에 종결된 레인의 유산 todo 4파일이 07-26 편대의 집계에
+// 유입돼 dept-2 306항목 중 301항목(98%)이 유령이 된 사고의 **데몬 측 통로**를 다시 열지 않는 것.
+// Python 보고기(C1)만 고치면 절반만 덮는다 — 데몬은 같은 파일들을 같은 방식으로 스캔해
+// `daemon.todo_progress` → `org.status` → HUD·Control Center까지 오염시키고 있었다.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod todo_decl_tests {
+    use super::check_todo_with;
+    use crate::state::Daemon;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    /// CYS_TODO_DIRS는 프로세스 전역 env라 스캔 대상 지정 창을 직렬화한다(같은 테스트 바이너리의
+    /// 다른 todo 테스트와 충돌 방지). ★`my_scope`·`scope_exists`는 env가 아니라 **인자**로
+    /// 주입하므로 라이브 팩(CYS_PACK_DIR)은 이 스위트에서 아예 건드리지 않는다.
+    static TODO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const MY: &str = "pack-dept-dept-2";
+
+    /// 이 스위트의 팩 실재 판정 — dept-1은 실재, dept-9는 부재(개명·teardown 흔적).
+    fn packs(scope: &str) -> bool {
+        matches!(scope, "pack" | "pack-dept-dept-1" | "pack-dept-dept-2")
+    }
+
+    fn decl(scope: &str, status: &str) -> String {
+        format!("<!-- javis:todo v1 owner=worker-2 scope={scope} status={status} -->\n")
+    }
+
+    /// (done 1, total 2)짜리 본문 — 판정과 무관하게 항상 "집계할 거리가 있는" 파일을 만든다.
+    /// 유령이 배제되지 않으면 반드시 수치로 드러나게 하는 장치다.
+    fn body() -> &'static str {
+        "\n# TODO\n- [x] 완료\n- [ ] 미완\n"
+    }
+
+    struct Fixture {
+        daemon: Arc<Daemon>,
+        round: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Fixture {
+            let dir = std::env::temp_dir().join(format!(
+                "cys-todo-decl-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let round = dir.join("_round");
+            std::fs::create_dir_all(&round).expect("픽스처 디렉터리");
+            std::env::set_var("CYS_TODO_DIRS", &round);
+            Fixture {
+                daemon: Daemon::new(dir.join("cysd.sock")),
+                round,
+                dir,
+            }
+        }
+
+        fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
+            let p = self.round.join(name);
+            std::fs::write(&p, content).expect("픽스처 파일");
+            p
+        }
+
+        fn tick(&self) {
+            // ★S18 이후 `check_todo_with`는 팩 경로를 인자로 받는다. 이 스위트는 라이브 팩을
+            // 만지지 않으므로 `None`을 넘긴다(정본 루트 추가 규칙 자체는
+            // `cys::todo_scan::scan_roots` 단위 테스트와 `parity_todo_scan.py`가 지킨다).
+            check_todo_with(&self.daemon, MY, &packs, None);
+        }
+
+        /// 정본 위치(`pack/round`)를 스캔 루트로 넣은 틱 — S18 회귀용.
+        fn tick_with_pack(&self, pack: &std::path::Path) {
+            check_todo_with(&self.daemon, MY, &packs, Some(pack));
+        }
+
+        /// 등재 키는 **정규경로**다(Python 소비자 `os.path.realpath`와 같은 규칙).
+        fn key(&self, name: &str) -> String {
+            let p = self.round.join(name);
+            std::fs::canonicalize(&p)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        /// 등재된 경로의 파일명 집합 — 절대경로 비교는 임시디렉터리 이름에 묶여 읽기 어렵다.
+        fn registered(&self) -> std::collections::BTreeSet<String> {
+            self.daemon
+                .todo_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .filter_map(|k| {
+                    std::path::Path::new(k)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+                .collect()
+        }
+
+        fn progress(&self, name: &str) -> Option<(u64, u64)> {
+            let key = self.key(name);
+            self.daemon
+                .todo_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map(|(d, t, _)| (*d, *t))
+        }
+
+        fn verdict(&self, name: &str) -> Option<&'static str> {
+            let key = self.key(name);
+            self.daemon
+                .todo_verdict
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map(|(_, v, _)| *v)
+        }
+
+        /// 판정 캐시에 보관된 선언 owner(= `org.status`가 싣는 값).
+        fn owner(&self, name: &str) -> Option<String> {
+            let key = self.key(name);
+            self.daemon
+                .todo_verdict
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .and_then(|(_, _, o)| o.clone())
+        }
+
+        /// `after_seq` 이후 발행된 todo.updated 이벤트의 (파일명, verdict) 목록.
+        fn todo_events(&self, after_seq: u64) -> Vec<(String, String)> {
+            self.daemon
+                .bus
+                .replay_after(after_seq)
+                .into_iter()
+                .filter(|e| e["name"] == Value::from("todo.updated"))
+                .map(|e| {
+                    let p = e["payload"]["path"].as_str().unwrap_or_default().to_string();
+                    let name = std::path::Path::new(&p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let v = e["payload"]["verdict"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    (name, v)
+                })
+                .collect()
+        }
+
+        fn seq(&self) -> u64 {
+            self.daemon.bus.latest_seq()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::env::remove_var("CYS_TODO_DIRS");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// ★핵심 회귀 핀 — 유령(은퇴·타 스코프)은 `todo_progress`에 **등재되지 않는다**.
+    /// 그리고 판정 불능(미선언·고아)은 fail-open으로 **등재하되 구분 플래그를 단다**(ADR-3):
+    /// 판정 못 한다고 숨기면 죽은 워커의 미완 작업이 은폐돼 게이트가 false QUIET에 빠진다.
+    #[test]
+    fn ghost_todos_are_excluded_and_unclaimed_is_flagged() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("exclude");
+        // 유령 3종 — 전부 체크박스를 갖고 있어, 배제 실패 시 집계 수치로 즉시 드러난다.
+        f.write("MASTER_TODO.md", &format!("{}{}", decl(MY, "retired"), body()));
+        f.write("CSO_TODO.md", &format!("{}{}", decl("pack-dept-dept-1", "active"), body()));
+        f.write("LEGACY_TODO.md", &format!("<!-- ★ STALE 무효화 -->\n{}", body()));
+        // 살아있는 내 파일 + 판정 불능 2종.
+        f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        f.write("PLAIN_TODO.md", &format!("# 손으로 쓴 todo{}", body()));
+        f.write("ORPHAN_TODO.md", &format!("{}{}", decl("pack-dept-dept-9", "active"), body()));
+
+        let before = f.seq();
+        f.tick();
+
+        assert_eq!(
+            f.registered(),
+            ["ORPHAN_TODO.md", "PLAIN_TODO.md", "WORKER_TODO.md"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "은퇴·타 스코프 파일이 진행률 집계에 남아 있다 — 유령 유입 경로가 다시 열렸다"
+        );
+        // 판정 캐시는 배제분까지 **전부** 보유해야 한다(다음 틱 재파싱 방지의 전제).
+        assert_eq!(f.verdict("MASTER_TODO.md"), Some("retired"));
+        assert_eq!(f.verdict("CSO_TODO.md"), Some("foreign-scope"));
+        assert_eq!(f.verdict("LEGACY_TODO.md"), Some("retired"));
+        assert_eq!(f.verdict("WORKER_TODO.md"), Some("counted"));
+        assert_eq!(f.verdict("PLAIN_TODO.md"), Some("unclaimed"));
+        assert_eq!(f.verdict("ORPHAN_TODO.md"), Some("orphan-scope"));
+        // 온보딩 방어(§6-2): 미선언 파일의 진행률을 사용자에게서 빼앗지 않는다.
+        assert_eq!(f.progress("PLAIN_TODO.md"), Some((1, 2)));
+        assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 2)));
+        // 최초 발견은 무음 등록 — 데몬 재시작마다 전 파일 이벤트가 폭주하지 않는다(기존 계약).
+        assert!(
+            f.todo_events(before).is_empty(),
+            "최초 스캔은 무음이어야 한다: {:?}",
+            f.todo_events(before)
+        );
+    }
+
+    /// 은퇴·타 스코프는 **이벤트도 발행하지 않는다**. 등재 배제만 하고 이벤트를 흘리면
+    /// HUD·구독자가 유령의 갱신을 계속 그린다.
+    #[test]
+    fn excluded_todos_publish_no_events_on_change() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("events");
+        let retired = f.write("MASTER_TODO.md", &format!("{}{}", decl(MY, "retired"), body()));
+        let alive = f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        f.tick(); // 최초 무음 등록
+
+        let before = f.seq();
+        std::fs::write(&retired, format!("{}{}- [ ] 추가\n", decl(MY, "retired"), body())).unwrap();
+        std::fs::write(&alive, format!("{}{}- [ ] 추가\n", decl(MY, "active"), body())).unwrap();
+        f.tick();
+
+        assert_eq!(
+            f.todo_events(before),
+            vec![("WORKER_TODO.md".to_string(), "counted".to_string())],
+            "은퇴 파일의 갱신이 이벤트로 새어나갔다"
+        );
+        assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 3)));
+    }
+
+    /// 이벤트 payload의 `verdict`는 신설 **선택 필드**다 — 미선언·고아를 HUD가 구분 표시하는
+    /// 유일한 근거이며, 불리언 하나로는 두 상태를 나를 수 없어 판정 문자열을 그대로 싣는다.
+    #[test]
+    fn update_event_carries_verdict_for_unclaimed_and_orphan() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("verdict-payload");
+        let plain = f.write("PLAIN_TODO.md", body());
+        let orphan = f.write(
+            "ORPHAN_TODO.md",
+            &format!("{}{}", decl("pack-dept-dept-9", "active"), body()),
+        );
+        f.tick();
+
+        let before = f.seq();
+        std::fs::write(&plain, format!("{}- [ ] 추가\n", body())).unwrap();
+        std::fs::write(
+            &orphan,
+            format!("{}{}- [ ] 추가\n", decl("pack-dept-dept-9", "active"), body()),
+        )
+        .unwrap();
+        f.tick();
+
+        let mut got = f.todo_events(before);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("ORPHAN_TODO.md".to_string(), "orphan-scope".to_string()),
+                ("PLAIN_TODO.md".to_string(), "unclaimed".to_string()),
+            ]
+        );
+    }
+
+    /// 레인 종결(= 살아있던 파일에 `status=retired`를 기록)이 **이미 등재된 유령을 걷어낸다**.
+    /// 배제를 신규 파일에만 적용하면 종결 시점에 집계돼 있던 항목이 영구 잔류한다.
+    #[test]
+    fn retiring_a_counted_todo_removes_it_from_progress() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("retire-transition");
+        let p = f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        f.tick();
+        assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 2)));
+
+        let before = f.seq();
+        std::fs::write(&p, format!("{}{}", decl(MY, "retired"), body())).unwrap();
+        f.tick();
+
+        assert!(
+            f.progress("WORKER_TODO.md").is_none(),
+            "은퇴 선언을 얻은 파일이 집계에 잔류했다"
+        );
+        assert_eq!(f.verdict("WORKER_TODO.md"), Some("retired"));
+        assert!(f.todo_events(before).is_empty(), "은퇴 전이는 조용해야 한다");
+    }
+
+    /// ★성능 계약(설계 §4-5 · R2 발견) — mtime이 그대로면 **파일을 다시 읽지 않는다**.
+    ///
+    /// 검증 방법: 내용을 바꾸되 mtime을 원래 값으로 되돌린 뒤 틱을 돌린다. 재파싱했다면 새 내용
+    /// (counted)이 반영돼 집계에 등재됐을 것이다. 등재되지 않았다는 것이 곧 "읽지 않았다"는 증거다.
+    /// 이 계약이 없으면 배제 판정 파일은 진행률 맵에 없다는 이유로 **매 워치독 틱마다** 다시
+    /// 읽히고 다시 파싱된다 = 전 파일 I/O 순증.
+    #[test]
+    fn unchanged_mtime_skips_reparse_even_for_excluded_files() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("mtime-cache");
+        let p = f.write("MASTER_TODO.md", &format!("{}{}", decl(MY, "retired"), body()));
+        f.tick();
+        assert_eq!(f.verdict("MASTER_TODO.md"), Some("retired"));
+
+        let times = std::fs::metadata(&p).unwrap();
+        let stamp = std::fs::FileTimes::new()
+            .set_accessed(times.accessed().unwrap())
+            .set_modified(times.modified().unwrap());
+        std::fs::write(&p, format!("{}{}", decl(MY, "active"), body())).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_times(stamp)
+            .unwrap();
+        f.tick();
+
+        assert_eq!(
+            f.verdict("MASTER_TODO.md"),
+            Some("retired"),
+            "mtime 무변화인데 재파싱했다 — 워치독 틱에 전 파일 I/O가 순증한다"
+        );
+        assert!(f.progress("MASTER_TODO.md").is_none());
+
+        // 반대 방향: mtime이 실제로 바뀌면 즉시 반영된다(캐시가 갱신을 막지 않는다).
+        std::fs::write(&p, format!("{}{}", decl(MY, "active"), body())).unwrap();
+        f.tick();
+        assert_eq!(f.verdict("MASTER_TODO.md"), Some("counted"));
+        assert_eq!(f.progress("MASTER_TODO.md"), Some((1, 2)));
+    }
+
+    /// 사라진 파일은 진행률과 **판정 캐시 양쪽에서** 함께 정리된다(24/365 데몬의 맵 누수 차단).
+    #[test]
+    fn vanished_files_are_pruned_from_both_maps() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("prune");
+        let alive = f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        let ghost = f.write("MASTER_TODO.md", &format!("{}{}", decl(MY, "retired"), body()));
+        f.tick();
+        assert_eq!(f.daemon.todo_verdict.lock().unwrap().len(), 2);
+
+        std::fs::remove_file(&alive).unwrap();
+        std::fs::remove_file(&ghost).unwrap();
+        f.tick();
+
+        assert!(f.daemon.todo_progress.lock().unwrap().is_empty());
+        assert!(
+            f.daemon.todo_verdict.lock().unwrap().is_empty(),
+            "판정 캐시가 사라진 파일을 붙들고 있다(단조 누적 누수)"
+        );
+    }
+
+    /// 선언 파싱 예산(G3)은 선두 1 KiB다. 체크박스 집계용 64KB 읽기를 재사용하되 **선두만**
+    /// 넘긴다 — 1 KiB 밖의 은퇴 선언은 보이지 않아야 예산이 계약으로 성립한다.
+    /// (예산이 없으면 거대 파일이 워치독 틱을 잡아먹는다.)
+    #[test]
+    fn declaration_beyond_head_budget_is_not_honored() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("budget");
+        let pad = "x".repeat(cys::todo_decl::HEAD_BYTES);
+        f.write(
+            "WORKER_TODO.md",
+            &format!("{pad}\n{}{}", decl(MY, "retired"), body()),
+        );
+        f.tick();
+        assert_eq!(
+            f.verdict("WORKER_TODO.md"),
+            Some("unclaimed"),
+            "예산 밖 선언이 인정되면 임의 파일 말미의 문구가 집계를 조작할 수 있다"
+        );
+        assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 2)), "fail-open 등재는 유지");
+    }
+
+    /// ★비UTF-8 정합(2026-07-26 교정 6) — 데몬과 Python 소비자가 갈리지 않는다.
+    ///
+    /// 종전 `read_to_string`은 비UTF-8 바이트 하나에 `continue`로 빠져 **등재 0·캐시 갱신 0**
+    /// 이었다(캐시가 비니 매 틱 재파싱까지 겹친다). Python `javis_report`는 같은 파일을
+    /// `errors="replace"`로 lossy 디코드해 **집계한다** — 같은 파일에 대해 데몬은 "없음",
+    /// 팩은 "있음"이라고 말하는 조용한 갈림이었다. 조용한 차이가 최악이므로 여기로 수렴시킨다.
+    #[test]
+    fn non_utf8_todo_is_lossy_decoded_like_python() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("non-utf8");
+        let mut bytes = decl(MY, "active").into_bytes();
+        bytes.extend_from_slice(b"\n# \xff\xfe\x80 (\xeb\x81\xa8\xec\xa7\x84 UTF-8)\n");
+        bytes.extend_from_slice(b"- [x] \xff\xfe\n- [ ] \x80\n");
+        std::fs::write(f.round.join("WORKER_TODO.md"), &bytes).expect("픽스처 파일");
+        f.tick();
+
+        assert_eq!(
+            f.verdict("WORKER_TODO.md"),
+            Some("counted"),
+            "비UTF-8 바이트 하나로 판정 캐시가 통째로 비면 매 틱 재파싱된다"
+        );
+        assert_eq!(
+            f.progress("WORKER_TODO.md"),
+            Some((1, 2)),
+            "데몬이 집계하지 않는 파일을 Python 소비자는 집계한다 = 2언어 조용한 갈림"
+        );
+    }
+
+    /// ★`owner` 동봉(교정 3) — 소비자가 라벨을 파일명에서 추론하지 않아도 되게 한다.
+    /// 집계 **키는 경로 그대로**다(설계 §5-2: 키 스키마 변경은 파급 확대로 기각).
+    /// 센티널 `"?"`(ADR-4 C-3 · 레거시 은퇴 = 주인 미상)는 싣지 않는다 — 없는 정보를
+    /// 있는 것처럼 흘리면 소비자가 `"?"`라는 라벨의 노드를 그린다.
+    #[test]
+    fn update_event_carries_owner_but_not_sentinel() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("owner-payload");
+        // 파일명(WORKER)과 owner(worker-2)가 다른 상태 — 파일명 추론이 틀리는 정확한 조건.
+        let named = f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        let plain = f.write("PLAIN_TODO.md", body());
+        f.tick();
+
+        let before = f.seq();
+        std::fs::write(&named, format!("{}{}- [ ] 추가\n", decl(MY, "active"), body())).unwrap();
+        std::fs::write(&plain, format!("{}- [ ] 추가\n", body())).unwrap();
+        f.tick();
+
+        let owners: std::collections::BTreeMap<String, Option<String>> = f
+            .daemon
+            .bus
+            .replay_after(before)
+            .into_iter()
+            .filter(|e| e["name"] == Value::from("todo.updated"))
+            .map(|e| {
+                let p = e["payload"]["path"].as_str().unwrap_or_default().to_string();
+                let name = std::path::Path::new(&p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (
+                    name,
+                    e["payload"]["owner"].as_str().map(|s| s.to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(owners.get("WORKER_TODO.md"), Some(&Some("worker-2".into())));
+        // 미선언 파일은 owner를 알 수 없다 — 필드 자체가 없어야 한다(빈 문자열도 아니다).
+        assert_eq!(owners.get("PLAIN_TODO.md"), Some(&None));
+    }
+
+    /// ★락 순서 규약(TP→TV) 회귀 — poison된 맵에서도 워치독 틱은 살아남는다(교정 5).
+    ///
+    /// 종전에는 같은 함수 안에서 판정 캐시만 poison 내성이고 진행률 맵은 `.unwrap()`이라
+    /// 다른 스레드의 패닉 한 번이 워치독 틱을 데몬 수명 내내 죽였다 — 주석은 그 위험을
+    /// 정확히 적어 놓고 절반만 이행돼 있었다. 방어의 비대칭은 방어가 아니다.
+    #[test]
+    fn watchdog_tick_survives_both_poisoned_todo_locks() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("poison");
+        f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+
+        // 두 맵을 각각 poison 시킨다(패닉 스레드는 join으로 회수 — 테스트 러너는 죽지 않는다).
+        for which in 0..2 {
+            let d = Arc::clone(&f.daemon);
+            let h = std::thread::spawn(move || {
+                if which == 0 {
+                    let _g = d.todo_progress.lock().unwrap();
+                    panic!("의도된 패닉 — todo_progress poison");
+                } else {
+                    let _g = d.todo_verdict.lock().unwrap();
+                    panic!("의도된 패닉 — todo_verdict poison");
+                }
+            });
+            assert!(h.join().is_err(), "패닉 스레드가 패닉하지 않았다");
+        }
+        assert!(f.daemon.todo_progress.is_poisoned());
+        assert!(f.daemon.todo_verdict.is_poisoned());
+
+        f.tick(); // 패닉하면 여기서 테스트가 죽는다 = 회귀
+
+        assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 2)));
+        assert_eq!(f.verdict("WORKER_TODO.md"), Some("counted"));
+    }
+
+    /// ★**W14 S18 회귀 핀 — 데몬이 정본 위치(`pack/round`)를 본다.**
+    ///
+    /// 종전 스캔 루트는 surface `cwd/_round` + `CYS_TODO_DIRS`뿐이었고, `CYS_TODO_DIRS`를
+    /// 자동 주입하는 지점은 저장소 전수 grep 0건이었다. 그런데 이 조직의 **정본 todo 위치는
+    /// `${CYS_PACK_DIR}/round/`** 다(위임 티켓·`cys todo-path`·Python 보고기가 전부 그곳을 쓴다).
+    /// 즉 이번 브랜치가 데몬에 배선한 선언 판정·유령 배제·verdict/owner payload가 **정본
+    /// todo에는 한 번도 적용되지 않았다** = 데몬 작업 대부분이 실질 무효였다.
+    #[test]
+    fn canonical_pack_round_is_scanned() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("pack-round");
+        // 팩은 픽스처 디렉터리 안에 만든다 — 라이브 `~/.cys/pack` 무접촉.
+        let pack = f.dir.join("pack");
+        let pack_round = pack.join("round");
+        std::fs::create_dir_all(&pack_round).expect("팩 round");
+        let canonical = pack_round.join("WORKER_TODO.md");
+        std::fs::write(&canonical, format!("{}{}", decl(MY, "active"), body())).unwrap();
+        // 정본 위치의 유령도 같은 정책으로 배제돼야 한다(정책은 이미 같았고 시야만 없었다).
+        std::fs::write(
+            pack_round.join("MASTER_TODO.md"),
+            format!("{}{}", decl(MY, "retired"), body()),
+        )
+        .unwrap();
+
+        // ① 팩 경로를 안 주면 정본 파일은 **보이지 않는다**(종전 동작 = 결함 재현).
+        f.tick();
+        assert!(
+            f.registered().is_empty(),
+            "팩 루트 없이 정본 파일이 보였다 — 이 테스트의 전제가 무너졌다: {:?}",
+            f.registered()
+        );
+
+        // ② 팩 경로를 주면 보인다. 키는 정규경로다(Python 소비자와 같은 규칙).
+        f.tick_with_pack(&pack);
+        assert_eq!(
+            f.registered(),
+            ["WORKER_TODO.md".to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "정본 위치의 살아있는 todo가 집계에 없다(S18 재발) / 유령이 섞였다"
+        );
+        let key = std::fs::canonicalize(&canonical)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            f.daemon
+                .todo_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map(|(d, t, _)| (*d, *t)),
+            Some((1, 2))
+        );
+    }
+
+    /// ★**W14 — 소비자 테스트의 자기 반사 차단(reviewer3 자기 신고 2번).**
+    ///
+    /// 이 스위트의 나머지 케이스는 기대값을 `cys::todo_decl`(파서)에서 **유도**한다. 즉
+    /// 파서와 소비자가 **함께 틀리면 초록**이다 — Python 쪽에는 `expected.json`이라는 외부
+    /// SOT가 있는데 Rust 소비자에는 대응물이 없었다(그래서 "가장 의심스러운 남은 자리"였다).
+    ///
+    /// 여기서는 골든 픽스처 파일을 **그대로** 스캔 디렉터리에 넣고, 기대값을 오직
+    /// `expected.json`에서 읽어 대조한다. 파서를 호출해 기대값을 만들지 않는다 —
+    /// 그것이 자기 반사를 끊는다는 말의 실제 내용이다.
+    ///
+    /// 대조 2축: ①판정 캐시의 verdict = 대장의 `classify` ②등재 여부 = "조용히 빼도 되는
+    /// 것은 `retired`·`foreign-scope` 둘뿐"이라는 정책(ADR-3)이 대장 값으로부터 재현되는가.
+    #[test]
+    fn golden_fixtures_drive_daemon_verdicts_from_external_sot() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cysjavis-pack/bin/tests/fixtures/todo-decl");
+        let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap_or_else(|e| {
+            panic!("골든 대장을 읽을 수 없다({}): {e} — SOT 부재는 skip이 아니라 실패다",
+                   dir.display())
+        });
+        let spec: Value = serde_json::from_str(&raw).expect("expected.json 파싱");
+        let my_scope = spec["my_scope"].as_str().expect("my_scope").to_string();
+        let existing: Vec<String> = spec["existing_scopes"]
+            .as_array()
+            .expect("existing_scopes")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let scope_exists = move |s: &str| existing.iter().any(|e| e == s);
+
+        let f = Fixture::new("golden-sot");
+        let cases = spec["cases"].as_object().expect("cases");
+        assert!(cases.len() >= 15, "픽스처 케이스가 15종 미만이다: {}", cases.len());
+        // 픽스처 이름을 todo 파일명 규칙(`*_TODO.md`)에 맞춰 복사한다 — 내용은 한 바이트도
+        // 바꾸지 않는다(바이너리 케이스가 있으므로 텍스트 경유 금지).
+        let mut want: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (name, exp) in cases {
+            let bytes = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("픽스처 {name} 읽기 실패: {e}"));
+            let stem = name.trim_end_matches(".md").replace('.', "_");
+            let todo_name = format!("{stem}_TODO.md");
+            std::fs::write(f.round.join(&todo_name), &bytes).expect("픽스처 복사");
+            want.insert(
+                todo_name,
+                exp["classify"].as_str().expect("classify").to_string(),
+            );
+        }
+
+        check_todo_with(&f.daemon, &my_scope, &scope_exists, None);
+
+        let got_verdicts = f
+            .daemon
+            .todo_verdict
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(k, (_, v, _))| {
+                std::path::Path::new(k)
+                    .file_name()
+                    .map(|n| (n.to_string_lossy().into_owned(), v.to_string()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(got_verdicts, want, "데몬 판정이 골든 대장(외부 SOT)과 갈렸다");
+
+        // 등재 정책도 대장 값에서 유도한다(파서에 묻지 않는다).
+        let want_registered: std::collections::BTreeSet<String> = want
+            .iter()
+            .filter(|(_, v)| v.as_str() != "retired" && v.as_str() != "foreign-scope")
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(
+            f.registered(),
+            want_registered,
+            "등재 집합이 대장에서 유도한 정책과 갈렸다(조용한 배제는 retired·foreign-scope 둘뿐)"
+        );
+    }
+
+    /// ★W14 S16 — 판정 캐시가 선언 `owner`를 보관한다(= `org.status`가 싣는 값의 원천).
+    /// 이벤트에만 owner가 있고 스냅샷에 없으면 HUD 라벨이 새로고침 한 번에 뒤집힌다.
+    #[test]
+    fn verdict_cache_keeps_declared_owner_for_status_snapshot() {
+        let _g = TODO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new("owner-cache");
+        // 파일명(WORKER)과 owner(worker-2)가 다른 상태 — 파일명 추론이 틀리는 정확한 조건.
+        f.write("WORKER_TODO.md", &format!("{}{}", decl(MY, "active"), body()));
+        f.write("PLAIN_TODO.md", body());
+        f.write("LEGACY_TODO.md", &format!("<!-- ★ STALE 무효화 -->\n{}", body()));
+        f.tick();
+
+        assert_eq!(f.owner("WORKER_TODO.md").as_deref(), Some("worker-2"));
+        assert_eq!(f.owner("PLAIN_TODO.md"), None, "미선언은 주인을 모른다");
+        // ADR-4 C-3 센티널 `"?"`는 저장하지 않는다 — 소비자가 `"?"` 노드를 그리면 안 된다.
+        assert_eq!(f.owner("LEGACY_TODO.md"), None, "센티널이 owner로 새어나갔다");
     }
 }
