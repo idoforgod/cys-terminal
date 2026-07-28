@@ -232,7 +232,8 @@ jobs:
           # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
           releaseName: 'cys ${{ github.ref_name }}'
           releaseBody: 'cys 터미널 ${{ github.ref_name }}. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.'
-          releaseDraft: false     # 실태그 자동 발행 — updater가 releases/latest를 즉시 인식
+          releaseDraft: true      # ★v0.14.0(2026-07-28): draft 생성까지만 — 공개 발행·latest 마킹은 오너 승인 후
+                                  #   별도 집행(발행=외부 공개 denylist). 구 'false 자동발행'은 승인 게이트와 충돌.
           prerelease: false
           args: --target ${{ matrix.target }}
 
@@ -478,9 +479,9 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             pack.tar.gz pack-manifest.json pack-manifest.json.minisig \
             -R "$SRC_REPO" --clobber
-          # Phase 2: 소스 repo 릴리스가 updater 엔드포인트(releases/latest) — latest 마킹을 결정론 강제
-          gh release edit "${{ github.ref_name }}" -R "$SRC_REPO" --latest --draft=false
-          echo "✅ 팩 아티팩트 업로드 + latest 마킹 완료"
+          # ★v0.14.0(2026-07-28): 종전 '--latest --draft=false' 강제 공개를 제거 — draft 유지.
+          #   공개 발행+latest 마킹은 오너 승인 후 별도 집행(발행=외부 공개 denylist·승인 게이트).
+          echo "✅ 팩 아티팩트 업로드 완료 (draft 유지 — 공개는 오너 승인 후)"
 
   # (Phase 2-4 완결·2026-07-03) 전환기 미러(relocate) 잡 제거 — 구 repo(cys-terminal-releases)는
   # Archive됨. 마지막 미러(v0.10.0·자산 URL=소스 repo)가 읽기 전용으로 영구 생존하므로,
