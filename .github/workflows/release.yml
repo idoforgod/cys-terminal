@@ -3,7 +3,8 @@ name: release
 # 릴리스 통합(Phase 2 완결·2026-07-03) — 공개 소스 repo의 릴리스가 곧 공개 배포다.
 #   build         : tag(vX.Y.Z) push → 앱 빌드·서명 → 이 repo에 public 릴리스 발행(updater 대상)
 #   pack-artifacts: 팩 서명 자산 업로드 + latest 마킹 결정론 강제
-#   (P0 이력: --draft 는 수동 Publish 누락 시 채널 영구 정지 → 자동 발행 유지.
+#   (P0 이력: 과거 '--draft=수동 Publish 누락 위험'으로 자동 발행을 썼으나, v0.14.0(2026-07-28)부터
+#    draft 생성까지만 CI — 공개 발행·latest 마킹은 오너 승인 후 별도 집행이 정책이다. 되돌리지 마라.
 #    구 배포 repo cys-terminal-releases는 Archive — 마지막 미러가 구 설치본 이주 경로로 영구 생존.)
 # 사용: 버전 6곳 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
 #       (수동 실행도 가능 — Actions 탭 Run workflow)
@@ -207,12 +208,48 @@ jobs:
           test -f "$DST/macos/cys.app.tar.gz.sig"       || { echo "::error::업데이터 서명 미생성"; exit 1; }
           echo "✓ macOS 서명·공증 산출물 준비: $DST/dmg/cys_${VERSION}_${ARCH}.dmg + $DST/macos/cys.app.tar.gz(.sig)"
 
+      # ★Windows 직접 빌드 + CRT 발행 차단 게이트 — 업로드 **전** (R2 agy 구조 권고 수용 · 2026-07-28).
+      #   종전(R1)엔 tauri-action(빌드+업로드 일체)이 먼저라 게이트가 업로드 뒤였다 — draft 정책이
+      #   유지되는 한 안전하지만, 정책 회귀(releaseDraft 반전) 시 공개된 산출물을 사후 실패시키는
+      #   구조 의존이었다. macOS 패턴과 동형으로 직접 빌드→게이트→(tauri-action은 수집만)로 전환해
+      #   게이트가 어떤 정책에서도 업로드 자체를 선행 차단하게 한다.
+      - name: Windows 직접 빌드 + CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers · 업로드 전)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          CYS_TARGET: ${{ matrix.target }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          PYTHONUTF8: '1'          # Windows 콘솔 cp1252 에서 한국어 판정 출력 UnicodeEncodeError 방지(0623a0f 백포트)
+          PYTHONIOENCODING: 'utf-8'
+        run: |
+          set -euo pipefail
+          # ① NSIS 빌드(beforeBuildCommand=bundle-prep 포함) — 종전 tauri-action 기본 러너와 동일 CLI 경로
+          bun x @tauri-apps/cli@2 build --target "${{ matrix.target }}"
+          # ② CRT 게이트 — 업로드 전 최종 바이트 검증
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
+          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
+          # ③ 음성 대조(R1 codex medium 수용): 공개 v0.14.0(구베이스·VCRUNTIME 감염 실물)에 같은
+          #   게이트를 돌려 ①임포트 스윕 true-positive(exit 1)와 ②마커 3종 전부 부재(0/3)를
+          #   결정론으로 증명한다 — "신버전 존재·구버전 부재" 양방향 판별력의 CI 증거.
+          curl -fsSL -o /tmp/cys-neg-base.exe \
+            https://github.com/idoforgod/cys-terminal/releases/download/v0.14.0/cys_0.14.0_x64-setup.exe
+          set +e
+          NEG_OUT="$("$PY" scripts/verify_win_crt.py --setup /tmp/cys-neg-base.exe 2>&1)"; NEG_RC=$?
+          set -e
+          echo "$NEG_OUT" | tail -5
+          [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
+          echo "$NEG_OUT" | grep -q "markers: 0/3" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/3 이어야 한다" >&2; exit 1; }
+          echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
+
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
       # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
-      # ★macOS는 위 스텝이 slim 산출물을 이미 만들었으므로 tauriScript=true 로 빌드를 no-op 시킨다(재빌드=fat 재역참조
-      #   방지). tauri-action은 표준 경로의 그 산출물을 수집·업로드·latest.json 병합만 수행한다. Windows는 tauriScript=''
-      #   → getRunner가 falsy로 무시하고 기본 러너로 정상 빌드(동작 불변 — tauri-action src/runner.ts 실측 확인).
+      # ★양 플랫폼 모두 위 직접 빌드 스텝이 산출물을 이미 만들었으므로 tauriScript=true 로 빌드를 no-op
+      #   시킨다(macOS=재빌드 fat 재역참조 방지·Windows=게이트 미통과 바이트 업로드 방지). tauri-action은
+      #   표준 경로의 그 산출물을 수집·업로드·latest.json 병합만 수행한다.
       - name: Build, sign, and release (private)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -226,8 +263,8 @@ jobs:
           # 이 tauri-action은 macOS에서 빌드 no-op(수집 전용)이므로 APPLE_* 를 여기 전달하지 않는다
           # (빈 APPLE_* env는 tauri 번들러의 security import 실패를 유발 — 종전 함정 그대로 유효).
         with:
-          # macOS='true'(빌드 no-op → 위 스텝의 slim 산출물 수집) · Windows=''(falsy → 기본 러너 정상 빌드, 불변).
-          tauriScript: ${{ matrix.platform == 'macos-latest' && 'true' || '' }}
+          # 양 플랫폼 'true'(빌드 no-op → 위 직접 빌드 스텝의 산출물 수집만) — 게이트 선행 구조(R2).
+          tauriScript: 'true'
           tagName: ${{ github.ref_name }}
           # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
           releaseName: 'cys ${{ github.ref_name }}'
@@ -236,37 +273,6 @@ jobs:
                                   #   별도 집행(발행=외부 공개 denylist). 구 'false 자동발행'은 승인 게이트와 충돌.
           prerelease: false
           args: --target ${{ matrix.target }}
-
-      # ★Windows CRT 발행 차단 게이트(v0.13.23 백포트·0.14.1) — 최종 NSIS 산출물에서
-      #   ①VCRUNTIME 임포트 스윕(PE 파싱 — cys/cysd 엄격 + 서드파티 app-local 규칙)과
-      #   ②0.14.1 축A 수리 마커 3종(구베이스 0.14.0 빌드 출하 차단)을 fail-closed 검증한다.
-      #   CI 러너에는 VC 재배포가 프리인스톨돼 있어 이 결함은 런타임 재현이 불가능하므로
-      #   임포트 테이블 정적 검사가 유일한 결정론 게이트다. tauri-action 업로드 뒤에 돌지만
-      #   릴리스는 draft 라 공개 전 차단이 성립한다(공개 발행은 게이트 green + 오너 승인 후).
-      - name: Windows CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers)
-        if: matrix.platform == 'windows-latest'
-        shell: bash
-        env:
-          PYTHONUTF8: '1'          # Windows 콘솔 cp1252 에서 한국어 판정 출력 UnicodeEncodeError 방지(0623a0f 백포트)
-          PYTHONIOENCODING: 'utf-8'
-        run: |
-          set -euo pipefail
-          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
-          SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
-          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
-          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
-          # ★음성 대조(R1 codex medium 수용): 공개 v0.14.0(구베이스·VCRUNTIME 감염 실물)에 같은
-          #   게이트를 돌려 ①임포트 스윕 true-positive(exit 1)와 ②마커 3종 전부 부재(0/3)를
-          #   결정론으로 증명한다 — "신버전 존재·구버전 부재" 양방향 판별력의 CI 증거.
-          curl -fsSL -o /tmp/cys-neg-base.exe \
-            https://github.com/idoforgod/cys-terminal/releases/download/v0.14.0/cys_0.14.0_x64-setup.exe
-          set +e
-          NEG_OUT="$("$PY" scripts/verify_win_crt.py --setup /tmp/cys-neg-base.exe 2>&1)"; NEG_RC=$?
-          set -e
-          echo "$NEG_OUT" | tail -5
-          [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
-          echo "$NEG_OUT" | grep -q "markers: 0/3" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/3 이어야 한다" >&2; exit 1; }
-          echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
 
       # 러너 키체인 잔류 방지 — 실패 경로 포함 항상 정리 (v0.13.23 구조 준용·브라우저 키 정리는 해당 없음)
       - name: Remove ephemeral macOS keychain
