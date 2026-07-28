@@ -777,13 +777,13 @@ fn aiterm_parse(s: &str) -> Option<u64> {
 }
 
 /// ★0.14.1 수리 세대 마커 — 릴리스 게이트(scripts/verify_win_crt.py)가 출하 cysd 바이너리에서
-/// 이 바이트열의 실재를 단언해 구베이스(0.14.1 이하) 빌드 출하를 차단한다.
+/// 이 바이트열의 실재를 단언해 구베이스(0.14.2 이하) 빌드 출하를 차단한다.
 /// **live RPC 가 참조하는 상수**라 어떤 플랫폼 링커도 제거할 수 없다 — `#[used]` static 은
 /// MSVC link.exe 의 미참조 제거(/OPT:REF)에 소거됨을 CI run 30359522750 에서 실증(0/1),
 /// 코드 경로 문자열 휴리스틱은 run 30357918475 에서 붕괴(부분열·컴파일러 재량). 3세대 메커니즘.
 /// 부수 효용: `cys schedule list`(status RPC)에 fix_generation 으로 노출 — 현장 진단에서
 /// 설치본의 수리 세대를 즉시 판별할 수 있다.
-pub const FIX_GENERATION: &str = "cys-fix-b1b2-gen-0.14.2";
+pub const FIX_GENERATION: &str = "cys-fix-w1-gen-0.14.3";
 
 /// 후보 디렉토리에서 동봉 `bash.exe` 절대경로를 찾는다(순수 — 회귀 핀·OS 무관 컴파일).
 /// 첫 실재 파일이 승자(후보 순서 = 우선순위). 없으면 None.

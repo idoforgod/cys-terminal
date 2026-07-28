@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="cys (CYSJavis Terminal)" Language="1033" Version="0.14.2"
+  <Product Id="*" Name="cys (CYSJavis Terminal)" Language="1033" Version="0.14.3"
            Manufacturer="CYS" UpgradeCode="8B7BA455-D8E8-4997-BB27-766B928C66F5">
     <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
     <Media Id="1" Cabinet="aiterm.cab" EmbedCab="yes"/>

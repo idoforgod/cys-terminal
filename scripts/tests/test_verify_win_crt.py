@@ -226,7 +226,7 @@ class MarkerTests(unittest.TestCase):
             with open(os.path.join(d, "cysd.exe"), "wb") as f:
                 f.write(b"pad-without-generation-marker")
             missing, _ = gate.check_markers(d)
-            self.assertEqual(missing, ["cys-fix-b1b2-gen-0.14.2"])
+            self.assertEqual(missing, ["cys-fix-w1-gen-0.14.3"])
 
     def test_cysd_absent_reports_all_missing(self):
         with tempfile.TemporaryDirectory() as d:
