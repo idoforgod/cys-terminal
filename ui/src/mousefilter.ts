@@ -54,9 +54,17 @@ function matchReport(data: string, from: number): Hit | null {
 
   RE_X10.lastIndex = from;
   if (RE_X10.exec(data)) {
-    // ESC[M 뒤 3바이트 중 첫 바이트가 버튼(+32). ESC[M 접두가 유일해 오탐 위험이 없다.
-    const button = data.charCodeAt(from + 3) - OFFSET;
-    return { end: RE_X10.lastIndex, wheel: wheelDelta(button) };
+    // ESC[M 뒤 3바이트는 순서대로 버튼·x·y이고, 규약상 **셋 다** 원시값이 OFFSET(0x20) 이상이다
+    // (제어문자 회피를 위해 32를 더해 싣기 때문). 정규식은 자릿수만 세므로 여기서 값 하한을 검증한다 —
+    // 무검증으로 3 코드유닛을 삼키면 `ESC[M` 뒤에 우연히 붙은 사용자 입력·제어문자까지 마우스 보고로
+    // 오인해 폐기하게 된다(입력 소실). 하나라도 미달이면 non-match → 청크는 기존 정책대로 pass.
+    const b = data.charCodeAt(from + 3);
+    const x = data.charCodeAt(from + 4);
+    const y = data.charCodeAt(from + 5);
+    if (b >= OFFSET && x >= OFFSET && y >= OFFSET) {
+      return { end: RE_X10.lastIndex, wheel: wheelDelta(b - OFFSET) };
+    }
+    return null;
   }
 
   RE_URXVT.lastIndex = from;
@@ -97,4 +105,34 @@ export function classifyMouseReport(data: string): MouseVerdict {
   if (reports === 0) return { kind: "pass" }; // 도달 불가(빈 문자열은 위에서 컷) — 방어
   if (net === 0) return { kind: "drop" }; // 휠 아님, 또는 위/아래가 상쇄돼 스크롤할 것이 없음
   return { kind: "wheel", dir: net > 0 ? 1 : -1, count: Math.abs(net) };
+}
+
+// 휠 노치 하나가 굴리는 줄 수 — 통상 터미널 관용치.
+const WHEEL_LINES = 3;
+
+// onData 청크를 어디로 보낼지에 대한 '결정'. 실행(스크롤·전송)은 호출측 main.ts가 한다.
+//   forward = 기존 IME 경로로 원문 그대로(data는 입력과 동일 참조 — 바이트 하나 건드리지 않는다는 계약)
+//   scroll  = PTY로 보내지 말고 term.scrollLines(lines)로 로컬 스크롤
+//   discard = 무음 폐기
+export type OnDataRoute =
+  | { action: "forward"; data: string }
+  | { action: "scroll"; lines: number }
+  | { action: "discard" };
+
+// 플랫폼 분기까지 포함한 배선 결정을 순수 함수로 뽑아낸다 — main.ts에는 실행만 남기고
+// '어떤 조건에서 무엇을 하는가'는 전부 여기서 테스트로 고정한다(배선 회귀를 테스트가 지키게).
+//
+// ★macOS 계약: isWindows=false면 분류 함수를 호출조차 하지 않고 무조건 forward다.
+// macOS는 앱이 마우스 보고를 정상 소비하므로 필터가 개입할 이유가 없고, 개입하지 않음이
+// '회귀 0'의 근거다. 이 조기 반환을 없애면 macOS가 필터 오탐에 노출된다.
+export function routeOnData(data: string, isWindows: boolean): OnDataRoute {
+  if (!isWindows) return { action: "forward", data };
+
+  const verdict = classifyMouseReport(data);
+  if (verdict.kind === "wheel") {
+    // 방향키 시퀀스 주입은 금지다(의도된 결정) — Claude Code의 입력 히스토리를 오염시킨다.
+    return { action: "scroll", lines: verdict.dir * WHEEL_LINES * verdict.count };
+  }
+  if (verdict.kind === "drop") return { action: "discard" };
+  return { action: "forward", data };
 }

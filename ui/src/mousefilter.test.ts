@@ -7,7 +7,7 @@
 //  (1) 마우스 보고는 전부 잡아낸다 — 놓치면 Windows에서 `[555;98;34M` 리터럴 유출이 재발한다.
 //  (2) 마우스 아닌 것은 절대 안 잡는다 — 오탐하면 사용자 입력(특히 한글 IME 경로)이 소실된다.
 import { describe, it, expect } from "bun:test";
-import { classifyMouseReport } from "./mousefilter";
+import { classifyMouseReport, routeOnData } from "./mousefilter";
 
 const ESC = "\x1b";
 // SGR(1006/1016) 보고 조립기. press=M(눌림)/m(뗌).
@@ -131,5 +131,83 @@ describe("통과 보장 — 오탐하면 사용자 입력이 소실된다", () =
   it("마우스 보고 + 일반 텍스트 혼합 청크는 pass — 텍스트 소실보다 유출 1회가 낫다", () => {
     expect(classifyMouseReport(sgr(35, 10, 20) + "a")).toEqual({ kind: "pass" });
     expect(classifyMouseReport("a" + sgr(64, 10, 20))).toEqual({ kind: "pass" });
+  });
+});
+
+describe("X10 필드 하한 — 길이만 맞는 3바이트를 마우스로 오인하면 입력이 소실된다", () => {
+  // X10은 버튼·x·y 셋 다 원시값 ≥ 0x20(32)이다. 정규식은 자릿수만 세므로 값 검증이 없으면
+  // `ESC[M` 뒤에 우연히 붙은 제어문자·저位 바이트까지 삼켜 폐기하게 된다.
+  const shortFields: [string, string][] = [
+    ["버튼 필드가 0x1f(하한 미달)", `${ESC}[M\x1f!!`],
+    ["x 필드가 NUL", `${ESC}[M!\x00!`],
+    ["y 필드가 개행(0x0a)", `${ESC}[Mab\n`],
+    ["세 필드 전부 제어문자", `${ESC}[M\x01\x02\x03`],
+    ["y 필드가 정확히 0x1f — 경계 바로 아래", `${ESC}[M!!\x1f`],
+  ];
+  for (const [name, input] of shortFields) {
+    it(`${name} → pass`, () => {
+      expect(classifyMouseReport(input)).toEqual({ kind: "pass" });
+    });
+  }
+  it("세 필드가 정확히 0x20(경계값)이면 유효한 X10 보고 → drop", () => {
+    expect(classifyMouseReport(`${ESC}[M\x20\x20\x20`)).toEqual({ kind: "drop" });
+  });
+  it("하한 미달 X10이 유효 보고 뒤에 붙어도 청크 전체가 pass(부분 폐기 금지)", () => {
+    expect(classifyMouseReport(x10(0, 10, 20) + `${ESC}[M\x00!!`)).toEqual({ kind: "pass" });
+  });
+});
+
+describe("routeOnData — 배선 결정(플랫폼 분기 포함)을 순수 함수로 고정", () => {
+  it("★macOS 계약: isWindows=false면 마우스 보고여도 원문 그대로 forward", () => {
+    const report = sgr(35, 10, 20);
+    const r = routeOnData(report, false);
+    expect(r).toEqual({ action: "forward", data: report });
+    // 참조 동일성 — 바이트 하나 건드리지 않는다는 계약을 값이 아니라 동일성으로 못박는다.
+    if (r.action === "forward") expect(r.data).toBe(report);
+  });
+  it("macOS에선 휠 보고도 forward(로컬 스크롤 번역 없음 — 앱이 정상 소비)", () => {
+    const wheel = sgr(64, 10, 20);
+    expect(routeOnData(wheel, false)).toEqual({ action: "forward", data: wheel });
+  });
+
+  it("Windows 휠업 1노치 → scroll lines -3", () => {
+    expect(routeOnData(sgr(64, 10, 20), true)).toEqual({ action: "scroll", lines: -3 });
+  });
+  it("Windows 휠다운 1노치 → scroll lines +3", () => {
+    expect(routeOnData(sgr(65, 10, 20), true)).toEqual({ action: "scroll", lines: 3 });
+  });
+  it("Windows 휠다운 5연속 배칭 → scroll lines +15 (방향×3×count)", () => {
+    expect(routeOnData(sgr(65, 1, 1).repeat(5), true)).toEqual({ action: "scroll", lines: 15 });
+  });
+  it("Windows 휠업 4연속 배칭 → scroll lines -12", () => {
+    expect(routeOnData(sgr(64, 1, 1).repeat(4), true)).toEqual({ action: "scroll", lines: -12 });
+  });
+
+  it("Windows 비-휠 마우스 보고 → discard", () => {
+    expect(routeOnData(sgr(35, 10, 20), true)).toEqual({ action: "discard" });
+    expect(routeOnData(x10(0, 10, 20), true)).toEqual({ action: "discard" });
+    expect(routeOnData(urxvt(0, 10, 20), true)).toEqual({ action: "discard" });
+  });
+
+  it("Windows 일반 텍스트 → forward 원문 참조 동일", () => {
+    const text = "hello";
+    const r = routeOnData(text, true);
+    expect(r).toEqual({ action: "forward", data: text });
+    if (r.action === "forward") expect(r.data).toBe(text);
+  });
+  it("Windows 한글 완성 음절 → forward 원문 참조 동일 (IME 경로 무손상)", () => {
+    const ko = "너";
+    const r = routeOnData(ko, true);
+    expect(r).toEqual({ action: "forward", data: ko });
+    if (r.action === "forward") expect(r.data).toBe(ko);
+  });
+  it("Windows 빈 청크 → forward(빈 문자열 그대로)", () => {
+    expect(routeOnData("", true)).toEqual({ action: "forward", data: "" });
+  });
+  it("Windows bracketed paste → forward 원문 참조 동일", () => {
+    const paste = `${ESC}[200~붙여넣은 텍스트${ESC}[201~`;
+    const r = routeOnData(paste, true);
+    if (r.action === "forward") expect(r.data).toBe(paste);
+    else throw new Error("bracketed paste가 forward가 아니면 붙여넣기가 통째로 사라진다");
   });
 });
