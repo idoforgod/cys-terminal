@@ -631,6 +631,13 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     // text 결정: text_command가 있으면 데몬이 실행해 stdout을 push 텍스트로 쓴다(결정론 환원).
     // 없으면 정적 text. 둘 다 없으면 에러.
     let text: String = if let Some(cmd) = job.text_command.as_deref() {
+        // R2 codex medium: text_command 경로도 같은 셸을 쓰므로 폴백 경고를 동일 배선
+        // (command_shell 은 OnceLock 캐시라 재호출 비용 없음).
+        #[cfg(windows)]
+        {
+            let (_s, flag) = command_shell();
+            warn_shell_fallback(daemon, flag);
+        }
         run_text_command(cmd).await?
     } else {
         job.text
@@ -817,15 +824,35 @@ fn command_shell() -> (String, &'static str) {
     }
 }
 
+/// 폴백 경고 재발행 판정(순수 — 회귀 핀·OS 무관 컴파일). cmd 폴백(flag=="/C")일 때
+/// 미발행(last=0)이거나 마지막 발행에서 1시간 이상 지났으면 true.
+/// ★R2 codex medium 수용: 종전 프로세스당 1회(AtomicBool)는 첫 발행이 구독자 부재 시점에
+/// 떨어지면 프로세스 생존 내내 재발행이 없어 사실상 무음으로 회귀했다 — 유계 재발행으로 교체.
+#[cfg(any(windows, test))]
+fn should_warn_fallback(flag: &str, last_emit_epoch: u64, now_epoch: u64) -> bool {
+    const THROTTLE_SECS: u64 = 3600;
+    if flag != "/C" {
+        return false;
+    }
+    last_emit_epoch == 0 || now_epoch.saturating_sub(last_emit_epoch) >= THROTTLE_SECS
+}
+
 /// ★폴백 가시화(0.14.1 강화 — 상류에 없음): Windows에서 동봉 bash 미탐지로 cmd /C 폴백이 선택되면
-/// 프로세스당 1회 schedule.warning 을 발행한다. 폴백은 POSIX 페이로드 잡의 확정 실패 경로인데,
-/// 종전엔 그 사실 자체가 어디에도 표면화되지 않았다(무음 금지 원칙). 실패 개별 건은 A1(schedule.error)이
-/// 잡고, 이 경고는 "왜 전부 실패하는가"의 근본 원인을 한 번에 알린다.
+/// schedule.warning 을 발행한다(시간당 최대 1회 — should_warn_fallback). 폴백은 POSIX 페이로드 잡의
+/// 확정 실패 경로인데, 종전엔 그 사실 자체가 어디에도 표면화되지 않았다(무음 금지 원칙). 실패 개별
+/// 건은 A1(schedule.error)이 잡고, 이 경고는 "왜 전부 실패하는가"의 근본 원인을 알린다.
+/// command·text_command **양 경로 공통**으로 호출한다(fire_command·fire_push).
 #[cfg(windows)]
-fn warn_shell_fallback_once(daemon: &Arc<Daemon>, flag: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if flag == "/C" && !WARNED.swap(true, Ordering::Relaxed) {
+fn warn_shell_fallback(daemon: &Arc<Daemon>, flag: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_EMIT: AtomicU64 = AtomicU64::new(0);
+    let now = now_epoch() as u64;
+    let last = LAST_EMIT.load(Ordering::Relaxed);
+    if should_warn_fallback(flag, last, now)
+        && LAST_EMIT
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
         daemon.bus.publish(
             "schedule.warning",
             "schedule",
@@ -882,7 +909,7 @@ async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String>
         .ok_or("command job missing 'command'")?;
     let (shell, flag) = command_shell();
     #[cfg(windows)]
-    warn_shell_fallback_once(daemon, flag);
+    warn_shell_fallback(daemon, flag);
     let mut c = tokio::process::Command::new(shell);
     c.arg(flag).arg(command).hide_console();
     apply_spawn_env(&mut c); // run_text_command 와 동일 — 동봉 runtime PATH·HOME 주입
@@ -1413,6 +1440,21 @@ mod tests {
             named("schedule.fired").is_none(),
             "실패 발화가 fired 로도 보고되면 모니터링이 모순된다"
         );
+    }
+
+    /// ★R2 codex medium 핀: 폴백 경고 재발행 판정 — bash 승격(-c)이면 절대 발행하지 않고,
+    /// cmd 폴백(/C)은 미발행 또는 1시간 경과 시에만 재발행(스팸 없이 무음도 없는 유계 재발행).
+    #[test]
+    fn fallback_warning_is_throttled_not_once() {
+        // bash 승격 경로 — 어떤 시각에도 경고 없음
+        assert!(!should_warn_fallback("-c", 0, 10_000));
+        assert!(!should_warn_fallback("-c", 5_000, 10_000));
+        // cmd 폴백 — 최초(미발행)는 발행
+        assert!(should_warn_fallback("/C", 0, 10_000));
+        // 직전 발행 후 1시간 미만 — 억제 (스팸 차단)
+        assert!(!should_warn_fallback("/C", 10_000, 10_000 + 3_599));
+        // 1시간 경과 — 재발행 (종전 AtomicBool 1회 방식은 여기서 영구 무음으로 회귀했다)
+        assert!(should_warn_fallback("/C", 10_000, 10_000 + 3_600));
     }
 
     #[tokio::test(flavor = "current_thread")]

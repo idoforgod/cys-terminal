@@ -57,12 +57,15 @@ for _stream in (sys.stdout, sys.stderr):
 STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
 
 # 0.14.1 축A 수리 마커 — cysd.exe 코드의 UTF-8 바이트 서열. 판정은 각 ≥1(리팩토링 내성).
-# 판별력 근거: 세 마커 전부 0.14.1 에서 처음 들어간 문자열이다 — 0.14.0(v0.12.94 베이스)
-# cysd 에는 없다(schedule.error 는 v0.12.94 에도 있어 판별력이 없으므로 쓰지 않는다).
+# 판별력 근거: 세 마커 전부 0.14.1 에서 처음 들어간 **고유** 문자열이다 — 0.14.0(v0.12.94 베이스)
+# cysd 에는 없다(schedule.error 는 v0.12.94 에도 있고, bash.exe 는 흔한 리터럴이라 임베드
+# 자산·타 코드와의 우연 일치 위험이 있어 쓰지 않는다 — R2 codex medium 수용).
+# 이 마커들은 "0.14.1 수리 빌드"를 핀한다 — bash 승격 경로 자체의 동작 실증은 CI 음성 대조
+# (release.yml — 0.14.0 실물 0/3 단언)와 Parallels 실기(V-A2-1)가 담당한다.
 FIX_MARKERS = [
-    "command 비정상 종료".encode("utf-8"),  # A1: fire_command exit≠0 표면화(에러 포맷 문자열)
-    b"shell-fallback",       # A2 강화: bash 미탐지 cmd 폴백 1회 경고 이벤트 kind
-    b"bash.exe",             # A2: 동봉 Git Bash 승격 경로(resolve_bash_in 탐지 파일명)
+    "command 비정상 종료".encode("utf-8"),      # A1: fire_command exit≠0 표면화(에러 포맷 문자열)
+    b"shell-fallback",                          # A2 폴백 경고 이벤트 kind
+    "동봉 bash.exe 미탐지".encode("utf-8"),     # A2 폴백 경고 상세(고유 한국어 리터럴)
 ]
 
 NEEDLE = "vcruntime140"  # vcruntime140.dll·vcruntime140_1.dll 모두 접두 매치
