@@ -86,6 +86,36 @@ class ParserTests(unittest.TestCase):
                 f.write(b"#!/bin/sh\necho not a pe\n")
             self.assertIsNone(gate.imports_of(p))
 
+    def test_unmapped_import_dir_rva_is_parse_failure(self):
+        # ★R1 codex high 핀: Import Directory 를 선언했는데 그 RVA 가 어느 섹션에도 매핑되지
+        # 않는 조작·손상 PE — 종전엔 [](빈 임포트=통과)로 fail-open 이었다. None(파싱 실패
+        # → exit 3)이어야 한다.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "d.exe")
+            blob = bytearray(make_pe(["VCRUNTIME140.dll"]))
+            # DataDirectory[1] RVA 를 섹션 밖(0x9000)으로 조작
+            e_lfanew = struct.unpack_from("<I", blob, 0x3C)[0]
+            opt = e_lfanew + 4 + 20
+            dd_off = opt + 112  # PE32+
+            struct.pack_into("<I", blob, dd_off + 8, 0x9000)
+            with open(p, "wb") as f:
+                f.write(bytes(blob))
+            self.assertIsNone(gate.imports_of(p))
+
+    def test_unmapped_descriptor_name_rva_is_parse_failure(self):
+        # ★R1 codex high 핀: nonzero descriptor 의 name_rva 미매핑 — 종전엔 그 항목만 조용히
+        # 건너뛰어 DLL 이름(잠재적 vcruntime)이 검사에서 증발했다. None 이어야 한다.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "e.exe")
+            blob = bytearray(make_pe(["VCRUNTIME140.dll", "KERNEL32.dll"]))
+            # 섹션 원시 데이터에서 첫 descriptor 의 NameRVA(오프셋 +12)를 섹션 밖으로 조작
+            headers_len = 0x40 + 4 + 20 + 240 + 40
+            raw_off = (headers_len + 0x1FF) & ~0x1FF
+            struct.pack_into("<I", blob, raw_off + 12, 0x9000)
+            with open(p, "wb") as f:
+                f.write(bytes(blob))
+            self.assertIsNone(gate.imports_of(p))
+
     def test_no_import_table(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "d.exe")

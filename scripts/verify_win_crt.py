@@ -113,15 +113,22 @@ def imports_of(path):
     dlls = []
     off = rva2off(imp_rva)
     if off is None:
-        return []
+        # ★fail-closed 승격(R1 codex high 수용 · 2026-07-28): Import Directory 를 선언했는데
+        # 그 RVA 가 어느 섹션에도 매핑되지 않으면 손상·비정상 PE 다. 종전 [](빈 임포트=통과)는
+        # 조작·손상 PE 가 VCRUNTIME 임포트를 숨긴 채 PASS 하는 fail-open 구멍이었다 → 파싱
+        # 실패(None)로 승격해 exit 3 경로에 태운다.
+        return None
     while off + 20 <= len(data):
         ilt, _, _, name_rva, iat = struct.unpack_from("<IIIII", data, off)
         if ilt == 0 and name_rva == 0 and iat == 0:
             break
         noff = rva2off(name_rva)
-        if noff is not None:
-            end = data.index(b"\0", noff)
-            dlls.append(data[noff:end].decode("ascii", "replace"))
+        if noff is None:
+            # nonzero descriptor 의 name_rva 미매핑도 동일 근거로 fail-closed — 조용히
+            # 건너뛰면 그 항목의 DLL 이름(잠재적 vcruntime)이 검사에서 증발한다.
+            return None
+        end = data.index(b"\0", noff)
+        dlls.append(data[noff:end].decode("ascii", "replace"))
         off += 20
     return dlls
 

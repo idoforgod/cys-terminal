@@ -255,6 +255,18 @@ jobs:
           SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
           [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
           "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
+          # ★음성 대조(R1 codex medium 수용): 공개 v0.14.0(구베이스·VCRUNTIME 감염 실물)에 같은
+          #   게이트를 돌려 ①임포트 스윕 true-positive(exit 1)와 ②마커 3종 전부 부재(0/3)를
+          #   결정론으로 증명한다 — "신버전 존재·구버전 부재" 양방향 판별력의 CI 증거.
+          curl -fsSL -o /tmp/cys-neg-base.exe \
+            https://github.com/idoforgod/cys-terminal/releases/download/v0.14.0/cys_0.14.0_x64-setup.exe
+          set +e
+          NEG_OUT="$("$PY" scripts/verify_win_crt.py --setup /tmp/cys-neg-base.exe 2>&1)"; NEG_RC=$?
+          set -e
+          echo "$NEG_OUT" | tail -5
+          [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
+          echo "$NEG_OUT" | grep -q "markers: 0/3" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/3 이어야 한다" >&2; exit 1; }
+          echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
 
       # 러너 키체인 잔류 방지 — 실패 경로 포함 항상 정리 (v0.13.23 구조 준용·브라우저 키 정리는 해당 없음)
       - name: Remove ephemeral macOS keychain
