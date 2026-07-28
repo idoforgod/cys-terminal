@@ -91,6 +91,10 @@ def imports_of(path):
         dd_off = opt + 96
     else:
         return None
+    # ★경계 선검증(R3 codex high 수용): 선언된 optional header 가 DataDirectory[1](+8..+16)을
+    # 담을 만큼 크고 파일 안에 실재해야 한다 — opt_size 를 속인 절단·조작 PE 는 파싱 실패(exit 3).
+    if dd_off + 16 > opt + opt_size or opt + opt_size > len(data):
+        return None
     ndd = struct.unpack_from("<I", data, dd_off - 4)[0]
     if ndd < 2:
         return []
@@ -99,6 +103,9 @@ def imports_of(path):
         return []
     secs = []
     sec0 = opt + opt_size
+    # 섹션 테이블 전체가 파일 경계 안에 있어야 한다 — 밖이면 쓰레기 헤더로 오판정할 수 있다.
+    if sec0 + 40 * nsec > len(data):
+        return None
     for i in range(nsec):
         s = sec0 + 40 * i
         va = struct.unpack_from("<I", data, s + 12)[0]
@@ -121,9 +128,11 @@ def imports_of(path):
         # 조작·손상 PE 가 VCRUNTIME 임포트를 숨긴 채 PASS 하는 fail-open 구멍이었다 → 파싱
         # 실패(None)로 승격해 exit 3 경로에 태운다.
         return None
+    terminated = False
     while off + 20 <= len(data):
         ilt, _, _, name_rva, iat = struct.unpack_from("<IIIII", data, off)
         if ilt == 0 and name_rva == 0 and iat == 0:
+            terminated = True
             break
         noff = rva2off(name_rva)
         if noff is None:
@@ -133,6 +142,10 @@ def imports_of(path):
         end = data.index(b"\0", noff)
         dlls.append(data[noff:end].decode("ascii", "replace"))
         off += 20
+    if not terminated:
+        # ★R3 codex high 수용: zero terminator 없이 EOF 에 닿아 루프가 끝난 경우 — 절단·조작 PE 가
+        # 뒷부분 descriptor(잠재적 vcruntime)를 자르고 '수집분만 정상'으로 통과하던 fail-open. None.
+        return None
     return dlls
 
 

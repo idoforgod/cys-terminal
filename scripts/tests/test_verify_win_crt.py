@@ -102,6 +102,40 @@ class ParserTests(unittest.TestCase):
                 f.write(bytes(blob))
             self.assertIsNone(gate.imports_of(p))
 
+    def test_lying_opt_size_is_parse_failure(self):
+        # ★R3 codex high 핀: COFF 의 opt_size 를 DataDirectory[1] 이 담기지 않는 크기로 속인
+        # 절단·조작 PE — 종전엔 어긋난 오프셋에서 쓰레기 섹션 헤더를 읽어 오판정 여지가 있었다.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "f.exe")
+            blob = bytearray(make_pe(["VCRUNTIME140.dll"]))
+            e_lfanew = struct.unpack_from("<I", blob, 0x3C)[0]
+            coff = e_lfanew + 4
+            struct.pack_into("<H", blob, coff + 16, 100)  # PE32+ dd_off+16=128 > 100
+            with open(p, "wb") as f:
+                f.write(bytes(blob))
+            self.assertIsNone(gate.imports_of(p))
+
+    def test_unterminated_descriptor_array_is_parse_failure(self):
+        # ★R3 codex high 핀: zero terminator 없이 descriptor 배열이 EOF 에 닿는 절단 PE —
+        # 종전엔 수집분을 '정상 임포트'로 반환해 잘려나간 vcruntime descriptor 가 증발했다.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "g.exe")
+            blob = bytearray(make_pe(["KERNEL32.dll"]))
+            # 섹션 원시영역을 '종결자 없는 descriptor 1개(20B)'로 재구성: name_rva 는 섹션 내
+            # 자기 자신(+16, IAT=1 의 상위 0 바이트)을 가리켜 매핑은 성공하되 배열은 미종결.
+            headers_len = 0x40 + 4 + 20 + 240 + 40
+            raw_off = (headers_len + 0x1FF) & ~0x1FF
+            va = 0x1000
+            desc = struct.pack("<IIIII", 1, 0, 0, va + 16, 1)
+            blob = blob[:raw_off] + desc  # 파일이 descriptor 끝에서 정확히 절단
+            # 섹션 헤더의 크기 필드를 20 으로 축소(경계 정합)
+            sec_hdr = 0x40 + 4 + 20 + 240
+            struct.pack_into("<I", blob, sec_hdr + 8, 20)   # VirtualSize
+            struct.pack_into("<I", blob, sec_hdr + 16, 20)  # SizeOfRawData
+            with open(p, "wb") as f:
+                f.write(bytes(blob))
+            self.assertIsNone(gate.imports_of(p))
+
     def test_unmapped_descriptor_name_rva_is_parse_failure(self):
         # ★R1 codex high 핀: nonzero descriptor 의 name_rva 미매핑 — 종전엔 그 항목만 조용히
         # 건너뛰어 DLL 이름(잠재적 vcruntime)이 검사에서 증발했다. None 이어야 한다.
