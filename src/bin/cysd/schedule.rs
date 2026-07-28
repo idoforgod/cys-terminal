@@ -776,13 +776,14 @@ fn aiterm_parse(s: &str) -> Option<u64> {
     cys::parse_surface_ref(s)
 }
 
-/// ★0.14.1 수리 세대 마커 — 릴리스 게이트(scripts/verify_win_crt.py)가 출하 바이너리에서
+/// ★0.14.1 수리 세대 마커 — 릴리스 게이트(scripts/verify_win_crt.py)가 출하 cysd 바이너리에서
 /// 이 바이트열의 실재를 단언해 구베이스(0.14.0 이하) 빌드 출하를 차단한다.
-/// `#[used]` 로 참조 여부와 무관하게 링커가 보존한다 — cfg·최적화 재량에 좌우되던
-/// 코드 경로 문자열 휴리스틱(CI run 30357918475 에서 shell-fallback 미검출 실증)을 대체하는
-/// 결정론 메커니즘. 전 플랫폼 컴파일이라 맥 로컬 빌드에서도 사전 검증된다.
-#[used]
-static CYS_FIX_GENERATION_A1A2: [u8; 24] = *b"cys-fix-a1a2-gen-0.14.1\0";
+/// **live RPC 가 참조하는 상수**라 어떤 플랫폼 링커도 제거할 수 없다 — `#[used]` static 은
+/// MSVC link.exe 의 미참조 제거(/OPT:REF)에 소거됨을 CI run 30359522750 에서 실증(0/1),
+/// 코드 경로 문자열 휴리스틱은 run 30357918475 에서 붕괴(부분열·컴파일러 재량). 3세대 메커니즘.
+/// 부수 효용: `cys schedule list`(status RPC)에 fix_generation 으로 노출 — 현장 진단에서
+/// 설치본의 수리 세대를 즉시 판별할 수 있다.
+pub const FIX_GENERATION: &str = "cys-fix-a1a2-gen-0.14.1";
 
 /// 후보 디렉토리에서 동봉 `bash.exe` 절대경로를 찾는다(순수 — 회귀 핀·OS 무관 컴파일).
 /// 첫 실재 파일이 승자(후보 순서 = 우선순위). 없으면 None.
@@ -961,6 +962,8 @@ pub fn status(daemon: &Daemon) -> serde_json::Value {
         "schedule_path": schedule_path().to_string_lossy(),
         "jobs": jobs,
         "last_fired": state.last_fired,
+        // 수리 세대 노출(가산 필드) — 릴리스 게이트 마커의 live 참조 지점(링커 제거 불가 보장)
+        "fix_generation": FIX_GENERATION,
     })
 }
 
