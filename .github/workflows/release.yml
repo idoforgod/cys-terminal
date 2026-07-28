@@ -190,6 +190,10 @@ jobs:
             x86_64-apple-darwin)  ARCH=x64 ;;
             *) echo "unexpected target: $TRIPLE"; exit 1 ;;
           esac
+          # ★스테일 사이드카 차단(run 30362160225 실증 — rust-cache 복원 후 cargo 가 x64 cysd
+          #   재빌드를 스킵해 구세대 바이너리가 출하 직전까지 감). 자사 크레이트만 강제 재빌드 —
+          #   의존성 캐시는 유지되므로 비용은 수분.
+          cargo clean -p cys-terminal -p cys-app 2>/dev/null || cargo clean
           bash scripts/build-macos-signed.sh "$TRIPLE"
           # ★경로 정규화 — 스크립트는 네이티브(호스트=타깃) 빌드에서 target/release/bundle 을 쓰지만,
           #   아래 tauri-action(tauriScript=true·args --target)은 target/<triple>/release/bundle 에서 수집한다.
@@ -206,6 +210,18 @@ jobs:
           test -f "$DST/dmg/cys_${VERSION}_${ARCH}.dmg" || { echo "::error::DMG 미생성: $DST/dmg/cys_${VERSION}_${ARCH}.dmg"; exit 1; }
           test -f "$DST/macos/cys.app.tar.gz"           || { echo "::error::업데이터 tar 미생성"; exit 1; }
           test -f "$DST/macos/cys.app.tar.gz.sig"       || { echo "::error::업데이터 서명 미생성"; exit 1; }
+          # ★수리 세대 마커 단언(macOS 레그 — Windows CRT 게이트와 대칭): 스테일 사이드카가
+          #   서명·공증을 통과해 출하되는 경로를 바이트 검사로 차단한다.
+          CYSD_BIN="$SRC/macos/cys.app/Contents/MacOS/cysd"
+          python3 - "$CYSD_BIN" <<'PYEOF'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          marker = b"cys-fix-a1a2-gen-0.14.1"
+          if marker not in data:
+              print(f"::error::수리 세대 마커 부재({sys.argv[1]}) — 스테일 사이드카 의심. cargo clean 후 재빌드 필요")
+              sys.exit(1)
+          print(f"marker OK: {data.count(marker)}회")
+          PYEOF
           echo "✓ macOS 서명·공증 산출물 준비: $DST/dmg/cys_${VERSION}_${ARCH}.dmg + $DST/macos/cys.app.tar.gz(.sig)"
 
       # ★Windows 직접 빌드 + CRT 발행 차단 게이트 — 업로드 **전** (R2 agy 구조 권고 수용 · 2026-07-28).
@@ -224,6 +240,8 @@ jobs:
           PYTHONIOENCODING: 'utf-8'
         run: |
           set -euo pipefail
+          # ★스테일 사이드카 차단(macOS 스텝과 대칭 — run 30362160225 x64 레그 실증)
+          cargo clean -p cys-terminal -p cys-app 2>/dev/null || cargo clean
           # ① NSIS 빌드(beforeBuildCommand=bundle-prep 포함) — 종전 tauri-action 기본 러너와 동일 CLI 경로
           bun x @tauri-apps/cli@2 build --target "${{ matrix.target }}"
           # ② CRT 게이트 — 업로드 전 최종 바이트 검증
