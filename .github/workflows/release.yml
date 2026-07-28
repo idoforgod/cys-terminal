@@ -152,46 +152,60 @@ jobs:
       - name: 동봉 런타임 준비 (Python·git·uv·node — macOS 전용, per-arch)
         if: matrix.platform == 'macos-latest'
         shell: bash
-        run: bash scripts/prep-mac-runtime.sh "${{ matrix.target }}"
+        run: |
+          bash scripts/prep-mac-runtime.sh "${{ matrix.target }}"
+          # .prep-target 마커 — build-macos-signed.sh가 같은 타깃 재준비를 건너뛰게 한다(중복 방지)
+          printf '%s' "${{ matrix.target }}" > src-tauri/runtime/.prep-target
 
-      # ★RC-23 git-core dedup (macOS 전용) — Tauri 번들러가 bundle.resources 심볼릭링크를 역참조(upstream
-      #   #13219, 미해결)해 runtime/git 을 141MB→608MB(중복 464MB)·DMG 434MB로 부풀린다. tauri-action에 그대로
-      #   맡기면 fat DMG가 나오므로, 여기서 '앱만 빌드 → dedup → hdiutil UDZO DMG → 업데이터 재생성'까지 하고,
-      #   아래 tauri-action은 mac 레그에서 tauriScript=true(빌드 no-op)로 이 slim 산출물을 그대로 수집·업로드·
-      #   latest.json 병합만 하게 한다. tauri-action은 표준 번들 경로(bundle/dmg/<name>_<ver>_<arch>.dmg,
-      #   bundle/macos/<name>.app.tar.gz[.sig])를 existsSync로 수집하므로 아래 파일명이 정확히 일치해야 한다.
-      #   CI는 인증서 미보유 → 미서명(현행과 동일 · Gatekeeper 경고 감수). 서명·공증은 로컬 build-macos-signed.sh 경로.
-      - name: git-core dedup + UDZO DMG + 업데이터 재생성 (macOS 전용)
+      # ★v0.14.0 (2026-07-28): 인증서(Q43YA2NMF9) 취득 후 첫 서명 릴리스 — 종전 '미서명 slim 빌드' 스텝을
+      #   build-macos-signed.sh(서명+공증+staple+dedup+DMG+업데이터 재서명 완결형) 호출로 교체한다.
+      #   스크립트가 dedup·UDZO DMG·app.tar.gz 재서명을 전부 품으므로 종전 스텝의 ①~④와 기능 동일 + 서명·공증.
+      - name: Import Developer ID into ephemeral keychain (macOS 전용)
         if: matrix.platform == 'macos-latest'
         shell: bash
         env:
-          CYS_TARGET: ${{ matrix.target }}                         # bundle-prep.sh 크로스빌드 타깃
+          APPLE_CERTIFICATE_B64: ${{ secrets.APPLE_CERTIFICATE_B64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: bash scripts/import-macos-signing-certificate.sh
+
+      - name: Build, notarize, staple + 산출물 정규화 (macOS 전용)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         run: |
           set -euo pipefail
           TRIPLE="${{ matrix.target }}"
-          BUNDLE="target/$TRIPLE/release/bundle"
-          APP="$BUNDLE/macos/cys.app"
           VERSION="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')"
           case "$TRIPLE" in
             aarch64-apple-darwin) ARCH=aarch64 ;;
             x86_64-apple-darwin)  ARCH=x64 ;;
             *) echo "unexpected target: $TRIPLE"; exit 1 ;;
           esac
-          # ① 앱 번들만 빌드(--bundles app) — beforeBuildCommand(bundle-prep)가 UI·cys/cysd·pack 빌드. fat DMG는 생략.
-          bun x @tauri-apps/cli@2 build --bundles app --target "$TRIPLE"
-          # ② git-core dedup (역참조 되돌리기 · build-macos-signed.sh와 동일 공유 스크립트) → runtime/git 608→~144MB
-          bash scripts/dedup-git-core.sh "$APP"
-          # ③ 업데이터 tar.gz 재생성(dedup 반영·심볼릭링크 보존) + 재서명 → tauri-action이 이 .sig로 latest.json 작성
-          ( cd "$BUNDLE/macos" && tar czf cys.app.tar.gz cys.app )
-          bun x @tauri-apps/cli@2 signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$BUNDLE/macos/cys.app.tar.gz"
-          # ④ dedup된 .app으로 UDZO DMG(hdiutil · Tauri 기본 포맷 동일). 파일명 cys_<ver>_<arch>.dmg = tauri-action 표준 수집명.
-          STAGE="$(mktemp -d)"; ditto "$APP" "$STAGE/cys.app"; ln -s /Applications "$STAGE/Applications"
-          mkdir -p "$BUNDLE/dmg"
-          hdiutil create -volname "cys" -srcfolder "$STAGE" -ov -format UDZO "$BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg"
-          rm -rf "$STAGE"
-          echo "✓ macOS slim 산출물 준비: $BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg + $BUNDLE/macos/cys.app.tar.gz(.sig)"
+          bash scripts/build-macos-signed.sh "$TRIPLE"
+          # ★경로 정규화 — 스크립트는 네이티브(호스트=타깃) 빌드에서 target/release/bundle 을 쓰지만,
+          #   아래 tauri-action(tauriScript=true·args --target)은 target/<triple>/release/bundle 에서 수집한다.
+          #   러너=arm64 → aarch64 레그가 네이티브라 이 불일치가 실재한다(비대칭 실패 방지 — 기획 §8-3).
+          HOST_TRIPLE="$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
+          if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
+          DST="target/$TRIPLE/release/bundle"
+          if [ "$SRC" != "$DST" ]; then
+            mkdir -p "$DST/dmg" "$DST/macos"
+            cp -a "$SRC/dmg/cys_${VERSION}_${ARCH}.dmg" "$DST/dmg/"
+            cp -a "$SRC/macos/cys.app.tar.gz" "$SRC/macos/cys.app.tar.gz.sig" "$DST/macos/"
+          fi
+          # 수집 대상 실재 단언 (무음 금지 — 없으면 tauri-action이 빈손으로 '성공'한다)
+          test -f "$DST/dmg/cys_${VERSION}_${ARCH}.dmg" || { echo "::error::DMG 미생성: $DST/dmg/cys_${VERSION}_${ARCH}.dmg"; exit 1; }
+          test -f "$DST/macos/cys.app.tar.gz"           || { echo "::error::업데이터 tar 미생성"; exit 1; }
+          test -f "$DST/macos/cys.app.tar.gz.sig"       || { echo "::error::업데이터 서명 미생성"; exit 1; }
+          echo "✓ macOS 서명·공증 산출물 준비: $DST/dmg/cys_${VERSION}_${ARCH}.dmg + $DST/macos/cys.app.tar.gz(.sig)"
 
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
@@ -208,9 +222,9 @@ jobs:
           # ── 업데이트 무결성 서명 (필수 — 없으면 .sig·latest.json 미생성) ──
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''    # 이 키는 무암호로 생성됨(실측 확인) → 빈 문자열. 별도 시크릿 불필요.
-          # ── macOS 코드사이닝 + 공증은 Developer ID 인증서 취득 후 추가. ──
-          # ★빈 APPLE_* env 를 넘기면 tauri 번들러가 빈 인증서를 security import 하려다 실패하므로,
-          #   인증서가 없는 동안에는 APPLE_* 를 아예 전달하지 않는다(=미서명 빌드 → Gatekeeper 경고 감수).
+          # ── macOS 코드사이닝 + 공증(v0.14.0~): 위 build-macos-signed.sh 스텝이 수행 완료 ──
+          # 이 tauri-action은 macOS에서 빌드 no-op(수집 전용)이므로 APPLE_* 를 여기 전달하지 않는다
+          # (빈 APPLE_* env는 tauri 번들러의 security import 실패를 유발 — 종전 함정 그대로 유효).
         with:
           # macOS='true'(빌드 no-op → 위 스텝의 slim 산출물 수집) · Windows=''(falsy → 기본 러너 정상 빌드, 불변).
           tauriScript: ${{ matrix.platform == 'macos-latest' && 'true' || '' }}
@@ -221,6 +235,12 @@ jobs:
           releaseDraft: false     # 실태그 자동 발행 — updater가 releases/latest를 즉시 인식
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      # 러너 키체인 잔류 방지 — 실패 경로 포함 항상 정리 (v0.13.23 구조 준용·브라우저 키 정리는 해당 없음)
+      - name: Remove ephemeral macOS keychain
+        if: always() && matrix.platform == 'macos-latest'
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/cys-release-signing.keychain-db" 2>/dev/null || true
 
   # ── 무중단 팩 채널 아티팩트 (DESIGN-noshutdown-pack-update §2-①/§5/§7) ──
   # 기존 build/서명/updater 잡과 독립·가산. cys 바이너리를 네이티브로 빌드(팩 콘텐츠는 플랫폼 무관)해

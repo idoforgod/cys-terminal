@@ -195,8 +195,20 @@ if spctl -a -vv "$APP" 2>&1 | grep -qi "accepted"; then
 else
   echo "  ✗ spctl 거부 — 공증 실패. 위 notarytool 결과를 확인하라"; exit 1
 fi
-xcrun stapler validate "$APP" >/dev/null 2>&1 && echo "  ✓ app 공증 티켓 stapled" || echo "  ⚠ app staple 미확인"
-xcrun stapler validate "$DMG" >/dev/null 2>&1 && echo "  ✓ DMG 공증 티켓 stapled" || echo "  ⚠ DMG staple 미확인(앱 공증되면 설치는 정상)"
+# ★staple 검증 hard-fail 승격 (v0.13.23 백포트 · 2026-07-28) — 종전 '⚠ 경고 후 exit 0'은
+#   staple 안 된 산출물이 "빌드 성공"으로 나가는 무음 통과 경로였다(품질 원칙 위배).
+if xcrun stapler validate "$APP" >/dev/null 2>&1; then
+  echo "  ✓ app 공증 티켓 stapled"
+else
+  echo "  ✗ app staple 검증 실패" >&2
+  exit 1
+fi
+if xcrun stapler validate "$DMG" >/dev/null 2>&1; then
+  echo "  ✓ DMG 공증 티켓 stapled"
+else
+  echo "  ✗ DMG staple 검증 실패" >&2
+  exit 1
+fi
 # DMG 자체 Gatekeeper 게이트 — .app spctl만으론 DMG 서명 누락을 못 잡는다(2026-07-04 실측 갭).
 if spctl -a -t open --context context:primary-signature -vv "$DMG" 2>&1 | grep -qi "accepted"; then
   echo "  ✓ DMG spctl: accepted (primary-signature)"
@@ -207,6 +219,10 @@ fi
 echo "== 배포본 정리 + 자동업데이트 매니페스트 =="
 mkdir -p dist-mac
 cp "$DMG" "dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
-sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal >/dev/null 2>&1 || true
+# 실패 가시화(2026-07-28): 종전 '>/dev/null || true'는 실패를 완전 무음 처리했다.
+# CI에서는 tauri-action이 latest.json을 생성하므로 이 매니페스트는 미사용(비치명) —
+# 따라서 hard-fail 대신 '보이는 경고'로 표면화한다. 로컬 수동 배포 경로에서만 확인 필요.
+sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal \
+  || echo "  ⚠ make-update-manifest 실패(비치명 — CI는 tauri-action이 latest.json 생성. 로컬 수동 배포 시에만 조치)" >&2
 echo "✓ 공증 빌드 완료: dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
 echo "  → ad-hoc 재서명·xattr 우회 불필요. gh release 발행은 오너 승인 후."
