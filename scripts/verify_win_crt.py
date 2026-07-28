@@ -43,6 +43,16 @@ import subprocess
 import sys
 import tempfile
 
+# Windows 콘솔 기본 cp1252 에서 한국어 판정 출력이 UnicodeEncodeError 로 죽으면 게이트가
+# 판정 이전에 crash 한다(상류 run 30311769077 실측 · 0623a0f 백포트). 워크플로우 env(PYTHONUTF8)와
+# 별개로 스크립트 자체에서도 방어한다 — 출력 인코딩 문제로 게이트가 죽는 일은 없어야 한다.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 # 정책 회귀를 무조건 차단하는 우리 바이너리(경로 말단 이름, 소문자).
 STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
 
