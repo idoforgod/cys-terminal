@@ -237,6 +237,22 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
+      # ★Windows CRT 발행 차단 게이트(v0.13.23 백포트·0.14.1) — 최종 NSIS 산출물에서
+      #   ①VCRUNTIME 임포트 스윕(PE 파싱 — cys/cysd 엄격 + 서드파티 app-local 규칙)과
+      #   ②0.14.1 축A 수리 마커 3종(구베이스 0.14.0 빌드 출하 차단)을 fail-closed 검증한다.
+      #   CI 러너에는 VC 재배포가 프리인스톨돼 있어 이 결함은 런타임 재현이 불가능하므로
+      #   임포트 테이블 정적 검사가 유일한 결정론 게이트다. tauri-action 업로드 뒤에 돌지만
+      #   릴리스는 draft 라 공개 전 차단이 성립한다(공개 발행은 게이트 green + 오너 승인 후).
+      - name: Windows CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
+          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"
+
       # 러너 키체인 잔류 방지 — 실패 경로 포함 항상 정리 (v0.13.23 구조 준용·브라우저 키 정리는 해당 없음)
       - name: Remove ephemeral macOS keychain
         if: always() && matrix.platform == 'macos-latest'
