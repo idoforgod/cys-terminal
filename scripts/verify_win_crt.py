@@ -56,16 +56,15 @@ for _stream in (sys.stdout, sys.stderr):
 # 정책 회귀를 무조건 차단하는 우리 바이너리(경로 말단 이름, 소문자).
 STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
 
-# 0.14.1 축A 수리 마커 — cysd.exe 코드의 UTF-8 바이트 서열. 판정은 각 ≥1(리팩토링 내성).
-# 판별력 근거: 세 마커 전부 0.14.1 에서 처음 들어간 **고유** 문자열이다 — 0.14.0(v0.12.94 베이스)
-# cysd 에는 없다(schedule.error 는 v0.12.94 에도 있고, bash.exe 는 흔한 리터럴이라 임베드
-# 자산·타 코드와의 우연 일치 위험이 있어 쓰지 않는다 — R2 codex medium 수용).
-# 이 마커들은 "0.14.1 수리 빌드"를 핀한다 — bash 승격 경로 자체의 동작 실증은 CI 음성 대조
-# (release.yml — 0.14.0 실물 0/3 단언)와 Parallels 실기(V-A2-1)가 담당한다.
+# 0.14.1 수리 세대 마커 — cysd 소스의 `#[used]` static(CYS_FIX_GENERATION_A1A2) 바이트열.
+# ★코드 경로 문자열 휴리스틱 폐기(CI run 30357918475 실증 · 2026-07-28):
+#   ①'command 비정상 종료'는 구베이스의 'text_command 비정상 종료'의 부분열이라 판별력 0
+#   ②cfg(windows) 경로 리터럴('shell-fallback')은 컴파일러 재량으로 실빌드에서 미검출됨.
+# `#[used]` static 은 참조 여부·최적화와 무관하게 링커가 보존하는 결정론 임베드이고
+# 전 플랫폼 컴파일이라 맥 로컬 릴리스 빌드에서도 사전 검증된다. 0.14.0 이하엔 존재하지
+# 않는 신조어 바이트열 — 판별력은 CI 음성 대조(0.14.0 실물 0/1 단언)가 계속 증명한다.
 FIX_MARKERS = [
-    "command 비정상 종료".encode("utf-8"),      # A1: fire_command exit≠0 표면화(에러 포맷 문자열)
-    b"shell-fallback",                          # A2 폴백 경고 이벤트 kind
-    "동봉 bash.exe 미탐지".encode("utf-8"),     # A2 폴백 경고 상세(고유 한국어 리터럴)
+    b"cys-fix-a1a2-gen-0.14.1",
 ]
 
 NEEDLE = "vcruntime140"  # vcruntime140.dll·vcruntime140_1.dll 모두 접두 매치

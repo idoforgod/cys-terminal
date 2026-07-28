@@ -223,11 +223,10 @@ class MarkerTests(unittest.TestCase):
 
     def test_missing_marker_detected(self):
         with tempfile.TemporaryDirectory() as d:
-            partial = [m for m in gate.FIX_MARKERS if m != b"shell-fallback"]
             with open(os.path.join(d, "cysd.exe"), "wb") as f:
-                f.write(b"".join(partial))
+                f.write(b"pad-without-generation-marker")
             missing, _ = gate.check_markers(d)
-            self.assertEqual(missing, ["shell-fallback"])
+            self.assertEqual(missing, ["cys-fix-a1a2-gen-0.14.1"])
 
     def test_cysd_absent_reports_all_missing(self):
         with tempfile.TemporaryDirectory() as d:

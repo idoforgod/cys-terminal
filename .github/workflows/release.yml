@@ -241,7 +241,7 @@ jobs:
           set -e
           echo "$NEG_OUT" | tail -5
           [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
-          echo "$NEG_OUT" | grep -q "markers: 0/3" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/3 이어야 한다" >&2; exit 1; }
+          echo "$NEG_OUT" | grep -q "markers: 0/" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/N 이어야 한다" >&2; exit 1; }
           echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
 
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
