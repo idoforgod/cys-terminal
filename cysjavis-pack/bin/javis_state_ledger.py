@@ -41,6 +41,13 @@ try:  # unix 전용. 부재(Windows)면 flock 없이 O_APPEND 단독(문서화�
 except ImportError:  # pragma: no cover - 이 프로젝트는 darwin
     fcntl = None
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 스크립트 폴더를 sys.path 에 넣지 않는다(D1 계약·test_import_guard).
+#   unix/mac 은 폴더가 이미 sys.path[0] 이라 무동작(멱등). append 이유는 선례(javis_event.py:19-29)와 동일.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
 # ── 비밀 마스킹: 팩 형제 모듈이 import 가능하면 사용, 아니면 내장 폴백(impl 디렉터리 단독 실행 대비) ──
 try:
     import javis_scrub  # type: ignore
