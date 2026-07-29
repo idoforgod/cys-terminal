@@ -1462,23 +1462,24 @@ pub fn seat_claimable_now(s: &crate::state::Surface) -> bool {
 /// 생존으로 오판돼 죽음 은폐(node-recover 거부)로 번진다.
 const WIN_EXEC_EXTS: [&str; 5] = ["cmd", "bat", "exe", "ps1", "com"];
 
-/// basename에서 Windows 실행 확장자 **1개만** 제거한다(없으면 원문 그대로).
-/// 확장자 판정은 대소문자 무시(Windows 파일시스템 규약: `CLAUDE-2.CMD` == `claude-2.cmd`)이나
-/// **이름 본체는 대소문자를 보존**해 비교한다 — 본체까지 lower로 접으면 유닉스에서
-/// 서로 다른 바이너리(`Claude` vs `claude`)가 동일시돼 오살 판정 재료가 된다.
+/// basename에서 Windows 실행 확장자 **1개만** 제거한다. 반환 `(본체, strip 발생 여부)`.
+/// 확장자 판정 자체는 대소문자 무시(Windows 파일시스템 규약: `.CMD` == `.cmd`).
+/// ★두 번째 반환값이 곧 "이 토큰은 Windows 실행 표기다"라는 증거다 — 호출부는 이때만
+/// 본체 비교를 대소문자 무시로 완화한다. 확장자 없는 bare 토큰은 대소문자를 보존해
+/// 유닉스 의미(`Claude` ≠ `claude`, 서로 다른 파일)를 지킨다.
 /// `.js`는 여기 없다 — 번들 특례는 호출부의 기존 `.js` 규칙이 그대로 담당한다(의미 불변).
-fn strip_win_exec_ext(base: &str) -> &str {
+fn strip_win_exec_ext(base: &str) -> (&str, bool) {
     match base.rfind('.') {
         // idx>0: `.cmd` 같은 도트파일(본체가 빈 문자열)은 strip 대상이 아니다.
         Some(idx) if idx > 0 => {
             let ext = &base[idx + 1..];
             if WIN_EXEC_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
-                &base[..idx]
+                (&base[..idx], true)
             } else {
-                base
+                (base, false)
             }
         }
-        _ => base,
+        _ => (base, false),
     }
 }
 
@@ -1494,15 +1495,24 @@ fn strip_win_exec_ext(base: &str) -> &str {
 /// ★확장자 정규화(2026-07-29 현장 결함 2호 실측): Windows에서 개명 래퍼로 기동하면 트리가
 /// `powershell → cmd.exe(…\claude-2.cmd) → claude.exe`가 되는데, 등록 bin_base는 확장자 없는
 /// `claude-2`라 어느 토큰과도 일치하지 않았다 → agent_alive 영구 false → boot_node reclaim()이
-/// `taskkill /T`로 멀쩡한 pane을 오살. 비교 직전 **양측**(토큰 base·bin_base)에서 등록 실행
+/// `taskkill /T`로 멀쩡한 pane을 오살. 비교 직전 **토큰 basename과 bin_base**에서 등록 실행
 /// 확장자 1개를 벗겨 같은 지평에 세운다. 확장자가 이미 양측에 있거나 둘 다 없는 기존 경로는
 /// 정규화 결과가 동일하므로 판정이 바뀌지 않는다(무회귀).
+///
+/// ★정규화 반경은 **basename 한정**이다 — 경로 세그먼트에는 적용하지 않는다(codex R1 major①).
+/// 세그먼트까지 벗기면 `node C:\work\claude.cmd\helper.js` 같은 *무관 디렉터리*가 생존 증거로
+/// 승격돼 죽음 은폐(node-recover 거부)를 낳는다. 디렉터리명은 실행 파일명이 아니다.
+///
+/// ★지원 계약(codex R1 missing④): 매칭 대상은 **관측된 프로세스 cmdline**이지 기동 표기
+/// (alias·`.lnk` 바로가기·셸 함수)가 아니다. alias나 `.lnk`로 기동해도 실행 후에는 해석된
+/// 실물 실행 파일이 cmdline에 나타나므로 토큰 매칭으로 충분하다. cmdline에 실물이 끝내
+/// 나타나지 않는 기동 형태는 이 함수의 지원 밖이며, 그 경우 생존 판정은 다른 근거를 써야 한다.
 pub fn cmdline_matches_agent(cmdline: &str, bin_base: &str) -> bool {
     if bin_base.is_empty() {
         return false;
     }
     // 기대 이름도 같은 정규화를 거쳐야 대칭이 된다(`claude.exe` 등록 vs `claude` 토큰).
-    let want = strip_win_exec_ext(bin_base);
+    let (want, want_win) = strip_win_exec_ext(bin_base);
     if want.is_empty() {
         return false;
     }
@@ -1510,20 +1520,34 @@ pub fn cmdline_matches_agent(cmdline: &str, bin_base: &str) -> bool {
     // @google/gemini-cli·@anthropic-ai/claude-code) — `<bin>-` 접두 전체를 열면
     // claude-code-router·grok-1-weights 같은 무관 경로가 생존으로 오판된다(적대 검증 R1:
     // 죽음 은폐 → node-recover 거부의 역결함).
-    let pkg_cli = format!("{want}-cli");
-    let pkg_code = format!("{want}-code");
+    // ★패키지명은 **원형 bin_base**에서 파생한다(정규화 前) — 세그먼트 규칙 전체를 수정 전
+    // 원형으로 유지하기 위함이다. 차분 실측(2026-07-29): 여기서 정규화값 want 를 쓰면
+    // bin_base=`claude.exe`·세그먼트 `claude.exe` 조합이 True→False 로 뒤집혀(216건)
+    // 생존 인지를 잃는다 = 오살 방향 회귀. 세그먼트는 손대지 않는 것이 정답이다.
+    let pkg_cli = format!("{bin_base}-cli");
+    let pkg_code = format!("{bin_base}-code");
     cmdline.split_whitespace().any(|tok| {
         let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-        if strip_win_exec_ext(base) == want || base.strip_suffix(".js").is_some_and(|b| b == want) {
+        let (tok_base, tok_win) = strip_win_exec_ext(base);
+        // ★본체 대소문자 무시는 **Windows형 토큰에 한정**(codex R1 major②): 어느 한쪽이라도
+        // 등록 실행 확장자를 실제로 벗은 경우에만 완화한다. 대소문자 무구분은 Windows
+        // 파일시스템의 성질이지 유닉스의 성질이 아니므로, bare 토큰끼리는 정확 비교를 유지해
+        // 유닉스에서 `Claude`와 `claude`가 뭉개지지 않게 한다.
+        let name_hit = if tok_win || want_win {
+            tok_base.eq_ignore_ascii_case(want)
+        } else {
+            tok_base == want
+        };
+        if name_hit || base.strip_suffix(".js").is_some_and(|b| b == want) {
             return true;
         }
         // 경로 세그먼트 매칭은 실제 경로 토큰에서만 (단어 인자 오탐 방지).
-        // 세그먼트에도 같은 정규화 — `…\claude-2.cmd\…` 형태의 실존 경로 세그먼트를 위해.
+        // ★세그먼트는 **무정규화 원형** — strip도, 대소문자 완화도, bin_base 정규화도 없다.
+        // 비교 대상이 want 가 아니라 bin_base 인 것에 유의(위 pkg_cli 주석의 216건 근거).
         tok.contains(['/', '\\'])
-            && tok.split(['/', '\\']).any(|seg| {
-                let s = strip_win_exec_ext(seg);
-                s == want || s == pkg_cli || s == pkg_code
-            })
+            && tok
+                .split(['/', '\\'])
+                .any(|seg| seg == bin_base || seg == pkg_cli || seg == pkg_code)
     })
 }
 
@@ -2488,15 +2512,20 @@ mod tests {
             "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude-2.cmd --dangerously-skip-permissions",
             "claude-2"
         ));
-        // ② 확장자 대소문자 무시(Windows 파일시스템 규약) — 확장자만, 이름 본체는 그대로 비교
+        // ② 확장자 대소문자 무시(Windows 파일시스템 규약)
         assert!(m("cmd.exe /c C:\\bin\\claude-2.CMD --dangerously-skip-permissions", "claude-2"));
         assert!(m("cmd.exe /c C:\\bin\\claude-2.Cmd --dangerously-skip-permissions", "claude-2"));
-        // ★설계 경계 박제: 본체까지 대문자인 `CLAUDE-2.CMD`는 **false**다. 브리프 예시는
-        // true를 적었으나, 같은 브리프의 규칙("이름 본체 비교는 기존대로 대소문자 유지")과
-        // 충돌한다 → 규칙을 따랐다. 본체를 대소문자 무시로 접으면 유닉스에서 서로 다른
-        // 바이너리가 동일시돼 '생존 오판'의 재료가 되므로, 정규화는 확장자에만 국한한다.
-        // (Windows 실기에서 래퍼 basename이 통째로 대문자로 관측되면 이 핀부터 재검토할 것.)
-        assert!(!m("cmd.exe /c C:\\bin\\CLAUDE-2.CMD --x", "claude-2"));
+        // ★본체 대소문자 규칙 계약(codex R1 major② 확정): 등록 확장자가 **실제로 벗겨진**
+        // Windows형 토큰에 한해 본체도 대소문자 무시로 비교한다 — 대소문자 무구분은 Windows
+        // 파일시스템의 성질이기 때문이다. Windows 실기에서 래퍼 basename이 통째 대문자로
+        // 관측되는 형태(`CLAUDE-2.CMD`)가 실재하므로 이를 생존으로 인정해야 오살을 막는다.
+        assert!(m("cmd.exe /c C:\\bin\\CLAUDE-2.CMD --x", "claude-2"));
+        assert!(m("cmd.exe /c C:\\bin\\Claude-2.cmd --x", "claude-2"));
+        assert!(m("cmd.exe /c C:\\bin\\claude-2.cmd --x", "CLAUDE-2.CMD")); // bin_base 측 대칭
+        // ★그러나 확장자 없는 bare 토큰은 **정확 비교 유지** — 유닉스에서 `CLAUDE-2`와
+        // `claude-2`는 서로 다른 파일이고, 뭉개면 '생존 오판'의 재료가 된다(반경 봉인).
+        assert!(!m("/usr/local/bin/CLAUDE-2 --x", "claude-2"));
+        assert!(!m("/usr/local/bin/Claude --x", "claude"));
         // ③ 기본형 무회귀: 확장자가 양측에 다 있어도, 한쪽에만 있어도 성립
         assert!(m("C:\\Program Files\\claude\\claude.exe --x", "claude.exe"));
         assert!(m("C:\\Program Files\\claude\\claude.exe --x", "claude"));
@@ -2517,9 +2546,14 @@ mod tests {
         // ⑦ 도트파일·정규화 후 빈 이름은 매칭 대상이 아니다(공백 매처 방어)
         assert!(!m("/usr/local/bin/.cmd", "claude"));
         assert!(!m("C:\\bin\\claude.exe --x", ".exe"));
-        // ⑧ 경로 세그먼트에도 같은 정규화(실존 경로 형태) — 단, 패키지 규칙 의미는 불변
+        // ⑧ 경로 세그먼트는 **무정규화 원형** — 패키지 규칙(`<bin>-cli`·`<bin>-code`) 의미 불변
         assert!(m("node C:\\n\\m\\@anthropic-ai\\claude-code\\cli.js", "claude"));
         assert!(!m("node C:\\opt\\claude-code-router\\index.js", "claude"));
+        // ★세그먼트 strip 철회 박제(codex R1 major①): 디렉터리명은 실행 파일명이 아니다.
+        // 세그먼트까지 확장자를 벗기면 무관 디렉터리가 생존 증거로 승격돼 죽음을 은폐한다.
+        assert!(!m("node C:\\work\\claude.cmd\\helper.js", "claude"));
+        assert!(!m("node C:\\work\\claude.exe\\helper.js", "claude"));
+        assert!(!m("node /work/gemini.cmd/helper.js", "gemini"));
     }
 
     use super::{

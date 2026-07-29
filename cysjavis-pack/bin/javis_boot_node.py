@@ -305,6 +305,22 @@ def inject(role, msg, attempts=4):
 
 
 # ─────────────────── 회수(F5) ───────────────────
+def _reclaim_verdict(fresh_st, role, pid, cur_pid):
+    """kill 직전 최종 허용 판정 — **순수함수**(cys 호출·부작용 0·self_test 결정론 대상).
+    입력의 fresh_st·cur_pid 는 호출부가 *신선하게* 조회해 넘긴다(조회는 부작용이라 밖에 둔다).
+    반환: "kill" | "hold-alive" | "hold-pid" | "hold-status".
+    ★보류 우선 원칙: 조금이라도 불확실하면 살려둔다 — 죽은 노드를 못 죽이는 손해(재시도 가능)
+    보다 산 노드를 죽이는 손해(작업 소실·비가역)가 훨씬 크다."""
+    if fresh_st is None:
+        return "hold-status"          # 상태 불명 → 판단 불가 → 보존
+    if node_alive(fresh_st, role):
+        return "hold-alive"           # 되살아났다 → 오살 직전 회피
+    if not pid or cur_pid != pid:
+        return "hold-pid"             # pid 가 갈렸다 → 엉뚱한 프로세스 종료 방지
+    return "kill"
+
+
+
 def reclaim(role, emit):
     """막힌(죽은) 미각성 surface 결정론 회수. ★node_alive(orchestra 와 동일 술어)가 True 면 절대 종료
     금지 — 건강한 quiet 노드 오살 차단(codex R2 결함2·4). 기대 agent 는 ROLE_AGENT 로 강제(인자 불신·R2 #5).
@@ -327,18 +343,21 @@ def reclaim(role, emit):
     if _pid_for_surface_ref(ref) != pid or not pid:
         emit("reclaim", "%s pid 불일치/부재 — 회수 보류(잘못된 종료 방지)" % ref)
         return 1
-    # ★TOCTOU 방어(2026-07-29 현장 결함 2호): 위 node_alive 판정과 실제 kill 사이에는 창이 있고,
-    # 그 사이 노드가 되살아나면 멀쩡한 pane 을 `taskkill /T` 로 오살한다. 결함 2호는 생존 매처가
-    # 확장자를 벗기지 않아 agent_alive 를 *영구* false 로 만들어 '오판→오살' 사슬을 실제로
-    # 성립시켰다. 매처 수리(governance.rs 확장자 정규화)로 agent_alive 가 신뢰 가능해진 지금,
-    # kill 직전 신선 재조회가 비로소 실질 방어가 된다.
-    # ★새 판정 규칙 도입 없음 — 위와 동일한 node_alive 술어를 신선한 status 로 한 번 더 물을 뿐.
-    st_fresh = cys_status()
-    if st_fresh is None:
-        emit("reclaim", "%s kill 직전 status 재조회 실패 — 회수 보류(불확실할 땐 보존)" % ref)
-        return 1
-    if node_alive(st_fresh, role):
-        emit("reclaim", "%s 가 kill 직전 재조회에서 생존 — 회수 중단(TOCTOU 오살 방지)" % role)
+    # ★오살 창 축소(2026-07-29 현장 결함 2호) — **완전 차단이 아니다**(codex R1 minor).
+    # 재조회와 _kill 사이에도 창은 남는다(TOCTOU 는 원리상 소거 불가·OS 원자 연산 부재).
+    # 여기서 하는 일은 그 창을 status 1회 왕복 길이로 *좁히는* 것뿐이다.
+    # 결함 2호는 생존 매처가 확장자를 벗기지 않아 agent_alive 를 *영구* false 로 만들어
+    # '오판→오살' 사슬을 성립시켰다 — 창이 좁든 넓든 판정이 상시 거짓이면 무의미했다.
+    # 매처 수리(governance.rs 확장자 정규화)로 agent_alive 가 신뢰 가능해진 지금에야
+    # 이 재조회가 실질 효과를 갖는다(수리 1이 선행 조건).
+    # ★새 판정 규칙 도입 없음 — 동일한 node_alive 술어를 신선한 status 로 한 번 더 물을 뿐.
+    verdict = _reclaim_verdict(cys_status(), role, pid, _pid_for_surface_ref(ref))
+    if verdict != "kill":
+        emit("reclaim", {
+            "hold-status": "%s kill 직전 status 재조회 실패 — 회수 보류(불확실할 땐 보존)" % ref,
+            "hold-alive": "%s 가 kill 직전 재조회에서 생존 — 회수 중단(오살 창 축소)" % role,
+            "hold-pid": "%s kill 직전 pid 재확인 불일치 — 회수 보류(엉뚱한 pid 종료 방지)" % ref,
+        }[verdict])
         return 1
     rc, _, _ = _kill(pid)
     time.sleep(1.5)
@@ -386,6 +405,19 @@ def self_test():
     chk(_comm_matches("/usr/local/bin/.cmd", "claude") is False, "도트파일 strip 후 빈이름 오탐")
     chk(_comm_matches("my-claude-helper.exe", "claude") is False, "substring 오매칭(확장자 경유)")
 
+    # ★_reclaim_verdict 4분기(codex R1 minor·missing3): kill 직전 최종 게이트를 순수함수로
+    #   떼어내 cys 스텁 없이 결정론 검증한다. 픽스처는 _pid_for_surface_ref 호출 전에
+    #   단락되도록 구성(agent_alive=True 는 awake_ready 즉시 True / status=None 은 상태 부재 즉시 False).
+    v_alive = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": True}]}
+    v_dead = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": False, "status": None}]}
+    chk(_reclaim_verdict(None, "cso", 100, 100) == "hold-status", "status 실패인데 kill 허용")
+    chk(_reclaim_verdict(v_alive, "cso", 100, 100) == "hold-alive", "생존 노드에 kill 허용(오살)")
+    chk(_reclaim_verdict(v_dead, "cso", 100, 999) == "hold-pid", "pid 불일치인데 kill 허용")
+    chk(_reclaim_verdict(v_dead, "cso", 0, 0) == "hold-pid", "pid 부재인데 kill 허용")
+    chk(_reclaim_verdict(v_dead, "cso", 100, 100) == "kill", "죽은 노드 회수 불가(회수 마비)")
+    # 우선순위: 생존 판정이 pid 불일치보다 앞선다(어느 쪽이든 보류라 결과 동일 — 계약 고정)
+    chk(_reclaim_verdict(v_alive, "cso", 100, 999) == "hold-alive", "보류 사유 우선순위 계약 이탈")
+
     # awake_ready: 프로세스 제외·fresh/stale 구분(R1 결함1)
     only_proc = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": None, "status": None}]}
     chk(awake_ready(only_proc, "cso")[0] is False, "프로세스만으로 awake 오판(주입 skip 위험)")
@@ -422,8 +454,8 @@ def self_test():
         for f in fails:
             print("  ✗ " + f)
         return 1
-    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·확장자정규화·claim-role·엄격ack·F4·무구독폴백슬롯)"
-          % (7 + 10 + 4 + 4 + 4 + 4))
+    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·확장자정규화·회수판정4분기·claim-role·엄격ack·F4·무구독폴백슬롯)"
+          % (7 + 10 + 6 + 4 + 4 + 4 + 4))
     return 0
 
 
