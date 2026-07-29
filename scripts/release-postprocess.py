@@ -84,7 +84,24 @@ def main(argv):
     version = tag.lstrip("v")
     tok = token()
 
-    rel = api("/repos/%s/releases/tags/%s" % (REPO, tag), tok)
+    # ★draft 릴리스는 `/releases/tags/<tag>` 로 조회되지 않는다(404 — 실측).
+    #   목록 조회로 폴백해야 CI 직후(draft 상태)에도 후처리가 돈다.
+    try:
+        rel = api("/repos/%s/releases/tags/%s" % (REPO, tag), tok)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        rel = None
+        for page in (1, 2):
+            for r in api("/repos/%s/releases?per_page=50&page=%d" % (REPO, page), tok):
+                if r.get("tag_name") == tag:
+                    rel = r
+                    break
+            if rel:
+                break
+        if rel is None:
+            raise SystemExit("::error::릴리스 %s 를 찾지 못했다(draft 포함 조회 실패)" % tag)
+        print("  (draft — 목록 조회로 찾음)")
     print("릴리스 %s — draft=%s · 자산 %d종" % (tag, rel.get("draft"), len(rel.get("assets", []))))
 
     outdir = os.path.join(BACKUP_ROOT, tag + "-assets")
