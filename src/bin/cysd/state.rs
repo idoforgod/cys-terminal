@@ -759,6 +759,21 @@ pub struct Daemon {
     /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface
     /// 재반환(추가 spawn 0). TTL(CREATE_IDEM_TTL_SECS) 만료 엔트리는 조회 시 lazy 제거.
     pub create_idem: Mutex<HashMap<String, (u64, f64)>>,
+    /// ★T-0147-4: 생성자 원장 — 새 surface_id → (생성을 요청한 발신 surface_id, epoch초).
+    /// `surface.create`가 pane 안에서 호출됐을 때(발신이 surface로 해석될 때)만 기록한다.
+    ///
+    /// **왜 필요한가**: `surface.close`의 소유 게이트는 "발신 pane은 자기 surface만 닫는다"인데,
+    /// `cys launch-agent`는 **자기가 방금 만든** surface의 기동이 실패하면 그것을 되돌려야 한다
+    /// (`cys.rs` 롤백 = `surface.close{cause:"reap"}`). pane 안에서 실행되는 모든 경로
+    /// (`cys boot`·▶CEO·부트스트랩·master의 노드 재기동)는 발신이 항상 자기 surface로 해석되므로
+    /// 롤백이 **구조적으로 close_denied** 였다 → 실패한 surface가 role을 쥔 채 잔존(고아 좌석).
+    /// 이 원장이 "생성자 자신의 롤백"만 정확히 열어준다(권한 모델 확장 아님 —
+    /// `handlers::rollback_allowed`가 cause=Reap·생성자 일치·TTL 3조건을 모두 요구).
+    ///
+    /// **영속하지 않는다**: 데몬이 재시작되면 롤백 주체(pane 프로세스)도 함께 죽으므로 원장을
+    /// 되살릴 의미가 없고, topology 스키마를 넓히면 조작 표면만 늘어난다. TTL은 create 재시도
+    /// 창과 동일한 CREATE_IDEM_TTL_SECS를 재사용하고 만료분은 insert 시 lazy GC 한다.
+    pub create_owner: Mutex<HashMap<u64, (u64, f64)>>,
     pub ledger: Mutex<HashMap<u32, LedgerEntry>>,
     /// 역할 레지스트리: role → surface_id (launch-agent가 등록, --to <role> 주소 해석에 사용)
     pub roles: Mutex<HashMap<String, u64>>,
@@ -1311,6 +1326,7 @@ impl Daemon {
             todo_verdict: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
             create_idem: Mutex::new(HashMap::new()),
+            create_owner: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
             // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).

@@ -150,6 +150,53 @@ fn close_cause_from_params(params: &Value) -> governance::CloseCause {
     }
 }
 
+/// ★T-0147-4: surface.close 소유 게이트의 **생성자 롤백 예외** — 순수 판정부(테스트 가능).
+///
+/// 허용은 세 조건을 **모두** 요구한다(하나라도 빠지면 거부):
+/// ① `cause == Reap` — 롤백 의미의 닫기만. `OwnerClose`는 묘비를 심으므로 남의 역할을 영구
+///    폐역시킬 수 있다 → 타 surface에 대해선 절대 열지 않는다.
+/// ② `entry.creator == caller_sid` — 발신 pane이 **바로 그 surface를 만든 당사자**여야 한다.
+///    남이 만든 surface는 `cause="reap"`을 붙여도 통과하지 못한다(기존 위협모델 불변).
+/// ③ `now - entry.ts < CREATE_IDEM_TTL_SECS` — 창을 생성 직후 롤백 구간으로 좁힌다. 오래 전
+///    자기가 만든 pane을 나중에 임의로 죽이는 권한으로 자라지 않게 하는 시한이다.
+///
+/// `entry`가 없으면(=데몬 재시작 후·pane 밖 생성) 거부 — 부재는 무증명이다(deny-by-default).
+fn rollback_allowed(
+    entry: Option<(u64, f64)>,
+    caller_sid: u64,
+    cause: governance::CloseCause,
+    now: f64,
+) -> bool {
+    if cause != governance::CloseCause::Reap {
+        return false;
+    }
+    entry.is_some_and(|(creator, ts)| {
+        creator == caller_sid && now - ts < crate::state::CREATE_IDEM_TTL_SECS
+    })
+}
+
+/// 데몬 상태(create_owner 원장)를 읽어 `rollback_allowed`에 위임한다.
+/// 락 규약: `create_owner`는 **리프 락** — surfaces/roles를 쥔 채 잡지 않는다(AB-BA 차단).
+/// 이 함수는 close 게이트에서 다른 락 없이 호출된다.
+fn creator_rollback_ok(
+    daemon: &Daemon,
+    sid: u64,
+    caller_sid: u64,
+    cause: governance::CloseCause,
+) -> bool {
+    let entry = daemon.create_owner.lock().unwrap().get(&sid).copied();
+    rollback_allowed(entry, caller_sid, cause, crate::state::now_epoch())
+}
+
+/// 생성자 원장 기록 + 만료분 lazy GC (surface.create 성공 아크 전용).
+/// GC를 insert 시점에 함께 도는 이유는 create_idem과 동일 — 별도 타이머 없이 유계 유지.
+fn record_create_owner(daemon: &Daemon, new_sid: u64, creator_sid: u64) {
+    let now = crate::state::now_epoch();
+    let mut owners = daemon.create_owner.lock().unwrap();
+    owners.retain(|_, (_, ts)| now - *ts < crate::state::CREATE_IDEM_TTL_SECS);
+    owners.insert(new_sid, (creator_sid, now));
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -1054,6 +1101,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         })
                     };
                     if let Some(pid) = reuse {
+                        // ★T-0147-4 이음매 주의: 이 조기 반환은 성공 아크를 타지 않으므로 create_owner
+                        // 원장을 **갱신하지 않는다**(의도). 같은 pane 재시도는 원 기록이 그대로 유효하고
+                        // (create_idem·create_owner가 TTL을 공유해 캐시 히트면 원장도 신선), 다른 pane이
+                        // 남의 surface를 재수령한 경우엔 롤백이 거부된다 = 만든 적 없는 pane을 죽이지 않는다.
+                        // 여기서 ts를 갱신하면 create 반복으로 롤백 창을 무한 연장할 수 있어 갱신하지 않는다.
                         return Reply::Single(ok_response(
                             &id,
                             json!({"surface_id": sid, "surface_ref": surface_ref(sid),
@@ -1134,6 +1186,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             daemon.persist_queue_state(); // 이관 결과를 WAL 에 확정(재기동 생존)
                             crate::governance::persist_topology(daemon);
                         }
+                    }
+                    // ★T-0147-4 생성자 기록 — 발신이 pane(surface)으로 해석될 때만. 이 한 줄이
+                    // launch-agent 롤백(surface.close{cause:"reap"})의 유일한 증명이다(§state::create_owner).
+                    // 익명 발신(데몬 내부·pane 밖 CLI)은 기록하지 않는다 — 이미 close 게이트를 통과하므로
+                    // 원장이 필요 없고, 없는 소유권을 만들어 두면 안 된다. resolve_caller_surface는 캐시
+                    // 미스 시 프로세스 표를 훑으므로 성공 아크(락 미보유)에서만 호출한다.
+                    if let Some(cs) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) {
+                        record_create_owner(daemon, s.id, cs);
                     }
                     // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.
                     if let Some(key) = idem_key {
@@ -1643,9 +1703,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 확정한다(client 자기신고 surface_id 불신). 발신이 surface로 해석되면 자기 surface
             // (cs == sid)만 닫을 수 있다. 익명 발신(caller_pid None = 데몬 내부 node-recover·오케스트
             // 레이터 경로)은 통과 — pane은 peer pid가 항상 자기 surface로 해석되므로 익명을 위조할 수 없다.
+            //
+            // ★W2/P0-6: cause 파라미터 — 기본 OwnerClose(묘비 생성·좀비 부활 차단)이나, launch-agent 롤백처럼
+            // "생성 실패로 되돌리는" 발신처는 cause="reap"을 보내 묘비를 남기지 않는다(실패한 launch 는 부활
+            // 대상이지 의도적 폐역이 아니다 — 롤백이 역할을 오묘비화하던 P0-6 우회로 차단). 미지 값은 안전측
+            // OwnerClose(묘비)로 폴백(오타로 부활 폭주하지 않게).
+            // ★T-0147-4: cause를 소유 게이트 **앞으로** 옮겼다 — 게이트의 생성자 롤백 예외가 cause를
+            // 판정 입력으로 쓴다(Reap만 예외 대상). 파싱은 순수 함수라 순서 이동에 부작용이 없다.
+            let cause = close_cause_from_params(&params);
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
             if let Some(cs) = caller_sid {
-                if cs != sid {
+                // ★T-0147-4: 예외 하나 — "발신이 방금 만든 surface를, 롤백(reap)으로, TTL 안에" 닫는 것.
+                // pane 안에서 도는 launch-agent(cys boot·▶CEO·부트스트랩·노드 재기동)의 기동 실패 롤백이
+                // 여기서 close_denied 되면 실패한 surface가 role을 쥔 채 남아 고아 좌석이 된다(사망 감지
+                // 스킵·부활 명단 제외 → 사용자는 백지 창을 "죽은 master"로 오인). 판정 3조건은
+                // rollback_allowed 참조 — 남의 surface·OwnerClose·만료는 여전히 전부 거부다.
+                if cs != sid && !creator_rollback_ok(daemon, sid, cs, cause) {
                     daemon.bus.publish(
                         "surface.close_denied",
                         "surface",
@@ -1661,12 +1734,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ),
                     ));
                 }
+                // 감사 흔적: 예외로 통과한 롤백은 조용히 지나가지 않는다(권한 게이트 우회처럼 보이는
+                // 정상 동작이므로, 사후 조사에서 "누가 무엇을 되돌렸는지"가 이벤트로 남아야 한다).
+                // 거부 이벤트(surface.close_denied)는 현행 그대로 — 소비자 계약 무변경.
+                if cs != sid {
+                    daemon.bus.publish(
+                        "surface.close_rollback",
+                        "surface",
+                        Some(sid),
+                        json!({"requested_surface": sid, "creator_surface": cs,
+                               "caller_pid": caller_pid, "cause": "reap"}),
+                    );
+                }
             }
-            // ★W2/P0-6: cause 파라미터 — 기본 OwnerClose(묘비 생성·좀비 부활 차단)이나, launch-agent 롤백처럼
-            // "생성 실패로 되돌리는" 발신처는 cause="reap"을 보내 묘비를 남기지 않는다(실패한 launch 는 부활
-            // 대상이지 의도적 폐역이 아니다 — 롤백이 역할을 오묘비화하던 P0-6 우회로 차단). 미지 값은 안전측
-            // OwnerClose(묘비)로 폴백(오타로 부활 폭주하지 않게).
-            let cause = close_cause_from_params(&params);
             match governance::close_surface(daemon, sid, cause) {
                 Ok(()) => Reply::Single(ok_response(
                     &id,
@@ -5920,11 +6000,22 @@ mod tests {
         assert_eq!(pick_context_threshold(Some(200), 60), 60, "범위 밖(>100) → env 폴백");
     }
 
-    fn close_surface_rpc(daemon: &Arc<Daemon>, surface_id: u64, caller_pid: Option<u32>) -> Value {
+    /// `cause`=None 이면 파라미터를 아예 싣지 않는다(=현행 기본 OwnerClose 경로 그대로).
+    /// Some("reap") 이면 launch-agent 롤백과 동형의 요청이 된다(T-0147-4).
+    fn close_surface_rpc(
+        daemon: &Arc<Daemon>,
+        surface_id: u64,
+        caller_pid: Option<u32>,
+        cause: Option<&str>,
+    ) -> Value {
+        let params = match cause {
+            Some(c) => json!({ "surface_id": surface_id, "cause": c }),
+            None => json!({ "surface_id": surface_id }),
+        };
         let req = Request {
             id: json!(1),
             method: "surface.close".into(),
-            params: json!({ "surface_id": surface_id }),
+            params,
         };
         let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
@@ -5946,7 +6037,7 @@ mod tests {
         bind_caller(&daemon, attacker_pid, attacker);
 
         // 공격: attacker pane이 자기 소유가 아닌 victim(master) surface를 강제 종료 시도.
-        let resp = close_surface_rpc(&daemon, victim, Some(attacker_pid));
+        let resp = close_surface_rpc(&daemon, victim, Some(attacker_pid), None);
         assert_eq!(
             resp["ok"], json!(false),
             "타 surface에 대한 close가 통과했다 (응답: {resp})"
@@ -5973,7 +6064,7 @@ mod tests {
         let own_pid = 993_201_u32;
         bind_caller(&daemon, own_pid, own);
 
-        let resp = close_surface_rpc(&daemon, own, Some(own_pid));
+        let resp = close_surface_rpc(&daemon, own, Some(own_pid), None);
         assert_eq!(resp["ok"], json!(true), "자기 surface close가 막혔다 (응답: {resp})");
         assert!(
             !daemon.surfaces.lock().unwrap().contains_key(&own),
@@ -5988,12 +6079,163 @@ mod tests {
         let daemon = claim_daemon();
         let node = make_surface(&daemon, Some("worker-3"));
 
-        let resp = close_surface_rpc(&daemon, node, None);
+        let resp = close_surface_rpc(&daemon, node, None, None);
         assert_eq!(
             resp["ok"], json!(true),
             "익명(데몬 내부) close가 막혔다 (응답: {resp})"
         );
         assert!(!daemon.surfaces.lock().unwrap().contains_key(&node));
+    }
+
+    /// pane 안에서 surface.create 를 호출해 생성자 원장이 기록된 새 surface 를 만든다.
+    /// (launch-agent 가 pane 에서 도는 실제 배선과 동형 — 원장 기록 아크까지 함께 검증한다.)
+    fn create_from_pane(daemon: &Arc<Daemon>, creator_pid: u32, role: Option<&str>) -> u64 {
+        let resp = create_surface_rpc(daemon, role, Some(creator_pid));
+        assert_eq!(resp["ok"], json!(true), "pane 발신 surface.create 실패 (응답: {resp})");
+        resp["result"]["surface_id"].as_u64().expect("surface_id")
+    }
+
+    /// ⓐ 발견(T-0147-4 · Windows 실측): `cys launch-agent` 는 surface 를 만들고 기동이 실패하면
+    /// `surface.close{cause:"reap"}` 로 되돌린다. 그런데 소유 게이트가 "자기 surface만"이라, pane
+    /// 안에서 도는 모든 경로(cys boot·▶CEO·부트스트랩·master 의 노드 재기동)에서 롤백이 **구조적으로**
+    /// close_denied 였다 → 실패한 surface 가 role 을 쥔 채 에이전트 없이 잔존(고아 좌석) → 사망 감지
+    /// 스킵·부활 명단 제외 → 사용자는 백지 창을 "죽은 master"로 오인. 생성자 자신의 reap 롤백만
+    /// 열린다는 예외를 박제한다. **Reap 은 묘비를 만들지 않는 것이 정상**(governance.rs close_surface)
+    /// — 실패한 launch 는 부활 대상이지 의도적 폐역이 아니다.
+    #[test]
+    fn close_allows_creator_rollback_reap() {
+        let daemon = claim_daemon();
+        let creator = make_surface(&daemon, Some("master"));
+        let creator_pid = 993_301_u32;
+        bind_caller(&daemon, creator_pid, creator);
+
+        let child = create_from_pane(&daemon, creator_pid, Some("worker"));
+        assert_ne!(child, creator, "자기 surface 경로로 새는 테스트는 무의미");
+        // 원장 기록 아크 확인 — 이 기록이 롤백의 유일한 증명이다.
+        assert_eq!(
+            daemon.create_owner.lock().unwrap().get(&child).map(|e| e.0),
+            Some(creator),
+            "pane 발신 create 인데 생성자 원장이 기록되지 않았다"
+        );
+        // 이 create 가 실제로 등록한 역할명(worker → dedup 으로 worker-N).
+        let child_role = daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .get(&child)
+            .and_then(|s| s.role.lock().unwrap().clone())
+            .expect("child role");
+
+        let resp = close_surface_rpc(&daemon, child, Some(creator_pid), Some("reap"));
+        assert_eq!(
+            resp["ok"], json!(true),
+            "생성자의 reap 롤백이 막혔다 = 고아 좌석 회귀 (응답: {resp})"
+        );
+        assert!(
+            !daemon.surfaces.lock().unwrap().contains_key(&child),
+            "롤백이 통과했는데 surface 가 맵에 남아 있다"
+        );
+        // 핵심 결과: role 점유가 풀려야 재기동이 claim_denied 로 막히지 않는다.
+        assert!(
+            !daemon.roles.lock().unwrap().contains_key(&child_role),
+            "롤백 후에도 role '{child_role}' 점유가 잔존한다 (고아 좌석의 정체)"
+        );
+        // Reap 은 묘비를 남기지 않는다 — 남기면 그 역할이 부활 명단에서 영구 제외된다.
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains(&child_role),
+            "reap 롤백이 role '{child_role}' 을 묘비화했다 (P0-6 오묘비화 회귀)"
+        );
+    }
+
+    /// ⓑ 예외는 **cause=reap 한정**. 생성자라도 cause 미지정(=OwnerClose)이면 여전히 거부다 —
+    /// OwnerClose 는 묘비를 심어 그 역할을 영구 폐역시키므로, 타 surface 에 대해선 절대 열지 않는다.
+    #[test]
+    fn close_denies_creator_owner_close() {
+        let daemon = claim_daemon();
+        let creator = make_surface(&daemon, Some("master"));
+        let creator_pid = 993_302_u32;
+        bind_caller(&daemon, creator_pid, creator);
+
+        let child = create_from_pane(&daemon, creator_pid, Some("worker"));
+        let resp = close_surface_rpc(&daemon, child, Some(creator_pid), None);
+        assert_eq!(
+            resp["ok"], json!(false),
+            "생성자의 OwnerClose 가 통과했다 = 예외가 cause 를 무시한다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("close_denied"));
+        assert!(
+            daemon.surfaces.lock().unwrap().contains_key(&child),
+            "거부됐는데 surface 가 닫혔다"
+        );
+    }
+
+    /// ⓒ 기존 위협모델 불변식 박제: **남이 만든** surface 는 cause="reap" 을 붙여도 거부다.
+    /// (close_rejects_foreign_surface 시나리오를 reap 으로 우회할 수 없음을 못박는다.)
+    #[test]
+    fn close_denies_foreign_surface_even_with_reap() {
+        let daemon = claim_daemon();
+        let attacker = make_surface(&daemon, Some("worker-1"));
+        let victim = make_surface(&daemon, Some("master"));
+        let attacker_pid = 993_303_u32;
+        bind_caller(&daemon, attacker_pid, attacker);
+
+        let resp = close_surface_rpc(&daemon, victim, Some(attacker_pid), Some("reap"));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "reap 을 붙이면 타 surface close 가 통과한다 = 권한 게이트 우회 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("close_denied"));
+        assert!(
+            daemon.surfaces.lock().unwrap().contains_key(&victim),
+            "거부됐는데 victim 이 닫혔다"
+        );
+        assert_eq!(
+            daemon.roles.lock().unwrap().get("master").copied(),
+            Some(victim),
+            "거부됐는데 victim 의 role 매핑이 정리됐다"
+        );
+    }
+
+    /// ⓓ 예외는 생성 직후 롤백 창(CREATE_IDEM_TTL_SECS)에만 열린다. 만료 후에는 거부 —
+    /// "오래 전 내가 만든 pane 을 언제든 죽일 수 있는 권한"으로 자라지 않게 하는 시한이다.
+    #[test]
+    fn close_denies_creator_rollback_after_ttl() {
+        let daemon = claim_daemon();
+        let creator = make_surface(&daemon, Some("master"));
+        let creator_pid = 993_304_u32;
+        bind_caller(&daemon, creator_pid, creator);
+
+        let child = create_from_pane(&daemon, creator_pid, Some("worker"));
+        // 원장 기록 시각을 TTL 밖으로 밀어 만료를 재현한다(시계 대기 없이 결정론).
+        {
+            let mut owners = daemon.create_owner.lock().unwrap();
+            let entry = owners.get_mut(&child).expect("create_owner entry");
+            entry.1 = crate::state::now_epoch() - crate::state::CREATE_IDEM_TTL_SECS - 1.0;
+        }
+
+        let resp = close_surface_rpc(&daemon, child, Some(creator_pid), Some("reap"));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "TTL 만료 후에도 생성자 롤백이 통과했다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("close_denied"));
+        assert!(daemon.surfaces.lock().unwrap().contains_key(&child));
+    }
+
+    /// 순수 판정부 단위 박제 — 3조건 AND 및 부재=거부(deny-by-default).
+    #[test]
+    fn rollback_allowed_requires_all_three_conditions() {
+        use governance::CloseCause::{OwnerClose, Reap};
+        let now = 1_000_000.0_f64;
+        let fresh = Some((41_u64, now - 1.0));
+        assert!(rollback_allowed(fresh, 41, Reap, now), "생성자+reap+신선 → 허용");
+        assert!(!rollback_allowed(fresh, 41, OwnerClose, now), "OwnerClose → 거부");
+        assert!(!rollback_allowed(fresh, 42, Reap, now), "생성자 불일치 → 거부");
+        assert!(
+            !rollback_allowed(Some((41, now - crate::state::CREATE_IDEM_TTL_SECS - 1.0)), 41, Reap, now),
+            "TTL 만료 → 거부"
+        );
+        assert!(!rollback_allowed(None, 41, Reap, now), "원장 부재 → 거부(무증명)");
     }
 
     fn queue_clear_rpc(daemon: &Arc<Daemon>, surface_id: u64, caller_pid: Option<u32>) -> Value {
