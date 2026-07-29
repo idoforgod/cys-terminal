@@ -1457,26 +1457,73 @@ pub fn seat_claimable_now(s: &crate::state::Surface) -> bool {
 /// orchestra check 상시 FAIL → 멀쩡한 노드 수선·오살(quit·close) 연쇄를 낳았다
 /// (2026-06-12 실측). false-negative(오살)가 false-positive보다 훨씬 위험하므로 매칭을
 /// 넓힌다 — 검사 범위는 어차피 해당 surface의 자손 프로세스로 한정된다.
+/// Windows 실행 확장자 화이트리스트 — PATHEXT의 실행 가능 형태 중 에이전트 기동에 실제로
+/// 쓰이는 것만. ★임의 확장자 strip 금지: 목록을 열면 `claude.backup` 같은 무관 파일이
+/// 생존으로 오판돼 죽음 은폐(node-recover 거부)로 번진다.
+const WIN_EXEC_EXTS: [&str; 5] = ["cmd", "bat", "exe", "ps1", "com"];
+
+/// basename에서 Windows 실행 확장자 **1개만** 제거한다(없으면 원문 그대로).
+/// 확장자 판정은 대소문자 무시(Windows 파일시스템 규약: `CLAUDE-2.CMD` == `claude-2.cmd`)이나
+/// **이름 본체는 대소문자를 보존**해 비교한다 — 본체까지 lower로 접으면 유닉스에서
+/// 서로 다른 바이너리(`Claude` vs `claude`)가 동일시돼 오살 판정 재료가 된다.
+/// `.js`는 여기 없다 — 번들 특례는 호출부의 기존 `.js` 규칙이 그대로 담당한다(의미 불변).
+fn strip_win_exec_ext(base: &str) -> &str {
+    match base.rfind('.') {
+        // idx>0: `.cmd` 같은 도트파일(본체가 빈 문자열)은 strip 대상이 아니다.
+        Some(idx) if idx > 0 => {
+            let ext = &base[idx + 1..];
+            if WIN_EXEC_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+                &base[..idx]
+            } else {
+                base
+            }
+        }
+        _ => base,
+    }
+}
+
+/// Walk the process table and collect all descendants of `root`.
+/// 에이전트 생존 매칭 — cmdline의 어느 토큰이든 ①basename 정확 일치 ②`.js` 번들 일치
+/// (`…/gemini.js`) ③경로 세그먼트 일치(`…/gemini/…` 또는 `…/gemini-cli/…` 패키지 경로)면
+/// 생존으로 본다. 구(舊) 규칙(앞 3토큰 제한 + basename 단일 일치)은 npm 래퍼 에이전트
+/// (`node --옵션 …/@google/gemini-cli/bundle/gemini.js`)를 놓쳐 agent_alive=false 오판 →
+/// orchestra check 상시 FAIL → 멀쩡한 노드 수선·오살(quit·close) 연쇄를 낳았다
+/// (2026-06-12 실측). false-negative(오살)가 false-positive보다 훨씬 위험하므로 매칭을
+/// 넓힌다 — 검사 범위는 어차피 해당 surface의 자손 프로세스로 한정된다.
+///
+/// ★확장자 정규화(2026-07-29 현장 결함 2호 실측): Windows에서 개명 래퍼로 기동하면 트리가
+/// `powershell → cmd.exe(…\claude-2.cmd) → claude.exe`가 되는데, 등록 bin_base는 확장자 없는
+/// `claude-2`라 어느 토큰과도 일치하지 않았다 → agent_alive 영구 false → boot_node reclaim()이
+/// `taskkill /T`로 멀쩡한 pane을 오살. 비교 직전 **양측**(토큰 base·bin_base)에서 등록 실행
+/// 확장자 1개를 벗겨 같은 지평에 세운다. 확장자가 이미 양측에 있거나 둘 다 없는 기존 경로는
+/// 정규화 결과가 동일하므로 판정이 바뀌지 않는다(무회귀).
 pub fn cmdline_matches_agent(cmdline: &str, bin_base: &str) -> bool {
     if bin_base.is_empty() {
+        return false;
+    }
+    // 기대 이름도 같은 정규화를 거쳐야 대칭이 된다(`claude.exe` 등록 vs `claude` 토큰).
+    let want = strip_win_exec_ext(bin_base);
+    if want.is_empty() {
         return false;
     }
     // 패키지 세그먼트는 `<bin>-cli`·`<bin>-code` 정확 일치만(실존 npm 패키지명:
     // @google/gemini-cli·@anthropic-ai/claude-code) — `<bin>-` 접두 전체를 열면
     // claude-code-router·grok-1-weights 같은 무관 경로가 생존으로 오판된다(적대 검증 R1:
     // 죽음 은폐 → node-recover 거부의 역결함).
-    let pkg_cli = format!("{bin_base}-cli");
-    let pkg_code = format!("{bin_base}-code");
+    let pkg_cli = format!("{want}-cli");
+    let pkg_code = format!("{want}-code");
     cmdline.split_whitespace().any(|tok| {
         let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-        if base == bin_base || base.strip_suffix(".js").is_some_and(|b| b == bin_base) {
+        if strip_win_exec_ext(base) == want || base.strip_suffix(".js").is_some_and(|b| b == want) {
             return true;
         }
-        // 경로 세그먼트 매칭은 실제 경로 토큰에서만 (단어 인자 오탐 방지)
+        // 경로 세그먼트 매칭은 실제 경로 토큰에서만 (단어 인자 오탐 방지).
+        // 세그먼트에도 같은 정규화 — `…\claude-2.cmd\…` 형태의 실존 경로 세그먼트를 위해.
         tok.contains(['/', '\\'])
-            && tok
-                .split(['/', '\\'])
-                .any(|seg| seg == bin_base || seg == pkg_cli || seg == pkg_code)
+            && tok.split(['/', '\\']).any(|seg| {
+                let s = strip_win_exec_ext(seg);
+                s == want || s == pkg_cli || s == pkg_code
+            })
     })
 }
 
@@ -2388,6 +2435,91 @@ mod tests {
             "node --max-old-space-size=4096 --enable-source-maps --no-deprecation /n/m/@google/gemini-cli/bundle/gemini.js",
             "gemini"
         ));
+    }
+
+    /// ★특성화 기준선(2026-07-29 · 확장자 정규화 수술 前 박제): 현행 부트스트랩이 실제로
+    /// 의존하는 그린 경로 — 이 판정들은 수술 후에도 **한 건도 바뀌면 안 된다**.
+    /// (수술 반경 검증용 — 확장자 정규화가 등록 확장자 계열 밖으로 새면 여기서 깨진다.)
+    #[test]
+    fn cmdline_matches_agent_bootstrap_characterization() {
+        use super::cmdline_matches_agent as m;
+        // ── macOS 실사용 형태 (cys launch-agent 가 실제로 띄우는 꼴) ──
+        // 개명 래퍼 = 쉘 스크립트(확장자 없음) → basename 직접 일치
+        assert!(m(
+            "/bin/bash /Users/x/bin/claude-cysinsight --dangerously-skip-permissions",
+            "claude-cysinsight"
+        ));
+        assert!(m("/usr/local/bin/claude --dangerously-skip-permissions", "claude"));
+        assert!(m("/opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox", "codex"));
+        assert!(m("codex --dangerously-bypass-approvals-and-sandbox", "codex"));
+        // npm 래퍼(2026-06-12 결함 픽스처)는 위 covers_npm_wrapper_forms 가 정본 —
+        // 여기서는 기준선 대표 1건만 재확인한다.
+        assert!(m(
+            "node --no-warnings /Users/user/.npm-global/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+            "gemini"
+        ));
+        // ── Windows 기본형(확장자가 양측에 모두 있는 꼴 — 수술 前에도 green) ──
+        assert!(m(
+            "C:\\Users\\x\\AppData\\Local\\Programs\\claude\\claude.exe --dangerously-skip-permissions",
+            "claude.exe"
+        ));
+        // ── 오탐 없던 비매칭 경로(죽음 은폐 방지 규칙) ──
+        assert!(!m("node /opt/claude-code-router/index.js", "claude"));
+        assert!(!m("tail -f logs/claude-archive/x.log", "claude"));
+        assert!(!m("my-claude-helper --x", "claude"));
+        assert!(!m("/a/grok-1-weights/loader.js", "grok"));
+        assert!(!m("python3 train.py gemini-style-arg", "gemini"));
+        // 등록 외 확장자는 이름 본체로 취급(strip 금지) — unix 파일명 무영향
+        assert!(!m("/usr/local/bin/claude.something", "claude"));
+        assert!(!m("", "claude"));
+        assert!(!m("node /x/y.js", ""));
+    }
+
+    /// ★불변식 박제(2026-07-29 현장 결함 2호 · Windows 실기 확정): 개명 래퍼(`claude-2.cmd`)
+    /// 기동 시 트리는 `powershell → cmd.exe(…\claude-2.cmd) → claude.exe`인데 등록 bin_base는
+    /// 확장자 없는 `claude-2`다. 확장자를 벗기지 않으면 일치 토큰이 영원히 없어 agent_alive
+    /// 영구 false → boot_node reclaim()의 `taskkill /T`가 멀쩡한 pane을 오살한다.
+    #[test]
+    fn cmdline_matches_agent_normalizes_windows_exec_extensions() {
+        use super::cmdline_matches_agent as m;
+        // ① 결함 재현 픽스처 — sysinfo(Windows)는 CommandLineToArgvW로 argv를 얻으므로
+        //    따옴표는 이미 제거된 상태로 join된다(따옴표 트리밍은 불필요·미도입).
+        assert!(m(
+            "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude-2.cmd --dangerously-skip-permissions",
+            "claude-2"
+        ));
+        // ② 확장자 대소문자 무시(Windows 파일시스템 규약) — 확장자만, 이름 본체는 그대로 비교
+        assert!(m("cmd.exe /c C:\\bin\\claude-2.CMD --dangerously-skip-permissions", "claude-2"));
+        assert!(m("cmd.exe /c C:\\bin\\claude-2.Cmd --dangerously-skip-permissions", "claude-2"));
+        // ★설계 경계 박제: 본체까지 대문자인 `CLAUDE-2.CMD`는 **false**다. 브리프 예시는
+        // true를 적었으나, 같은 브리프의 규칙("이름 본체 비교는 기존대로 대소문자 유지")과
+        // 충돌한다 → 규칙을 따랐다. 본체를 대소문자 무시로 접으면 유닉스에서 서로 다른
+        // 바이너리가 동일시돼 '생존 오판'의 재료가 되므로, 정규화는 확장자에만 국한한다.
+        // (Windows 실기에서 래퍼 basename이 통째로 대문자로 관측되면 이 핀부터 재검토할 것.)
+        assert!(!m("cmd.exe /c C:\\bin\\CLAUDE-2.CMD --x", "claude-2"));
+        // ③ 기본형 무회귀: 확장자가 양측에 다 있어도, 한쪽에만 있어도 성립
+        assert!(m("C:\\Program Files\\claude\\claude.exe --x", "claude.exe"));
+        assert!(m("C:\\Program Files\\claude\\claude.exe --x", "claude"));
+        assert!(m("C:\\bin\\claude-2.exe --x", "claude-2.cmd"));
+        // ④ 오탐 차단 — 유사 이름은 확장자를 벗겨도 본체가 다르다(오살 위험 방향 사수)
+        assert!(!m("C:\\bin\\claude-2.cmdx --x", "claude-2"));
+        assert!(!m("C:\\bin\\xclaude-2.cmd --x", "claude-2"));
+        assert!(!m("C:\\bin\\claude-27.cmd --x", "claude-2"));
+        // ⑤ 나머지 등록 확장자 각 1건
+        assert!(m("powershell -File C:\\bin\\claude-2.ps1", "claude-2"));
+        assert!(m("cmd.exe /c C:\\bin\\agy.bat --yolo", "agy"));
+        assert!(m("C:\\bin\\codex.com", "codex"));
+        // ⑥ unix 무영향 — 등록 외 확장자는 이름 본체이므로 strip 금지
+        assert!(m("/usr/local/bin/claude --dangerously-skip-permissions", "claude"));
+        assert!(!m("/usr/local/bin/claude.something", "claude"));
+        assert!(!m("/usr/local/bin/claude.backup", "claude"));
+        assert!(m("node /n/m/@google/gemini-cli/bundle/gemini.js", "gemini")); // .js 특례 불변
+        // ⑦ 도트파일·정규화 후 빈 이름은 매칭 대상이 아니다(공백 매처 방어)
+        assert!(!m("/usr/local/bin/.cmd", "claude"));
+        assert!(!m("C:\\bin\\claude.exe --x", ".exe"));
+        // ⑧ 경로 세그먼트에도 같은 정규화(실존 경로 형태) — 단, 패키지 규칙 의미는 불변
+        assert!(m("node C:\\n\\m\\@anthropic-ai\\claude-code\\cli.js", "claude"));
+        assert!(!m("node C:\\opt\\claude-code-router\\index.js", "claude"));
     }
 
     use super::{

@@ -163,14 +163,37 @@ def _pid_for_surface_ref(surface_ref):
 
 
 # ─────────────────── 상태 계약 3분리 ───────────────────
+# Windows 실행 확장자 화이트리스트(Rust governance.rs WIN_EXEC_EXTS 와 동일 목록·파리티).
+# ★임의 확장자 strip 금지 — 목록을 열면 무관 파일이 에이전트로 오판된다.
+WIN_EXEC_EXTS = ("cmd", "bat", "exe", "ps1", "com")
+
+
+def _norm_comm(comm):
+    """comm → 비교용 정규명. ①경로 구분자 `/`·`\\` 양쪽으로 basename 추출(Windows 경로는
+    posix os.path.basename 이 쪼개지 못한다) ②lower ③등록 실행 확장자 **1개만** 제거.
+    ★AGENT_COMM 값 확장이 아니라 입력 정규화로 해결한다 — 원천 명단(정본 바이너리명) 유지."""
+    s = (comm or "").strip()
+    for sep in ("\\", "/"):
+        s = s.rsplit(sep, 1)[-1]
+    s = s.lower()
+    i = s.rfind(".")
+    # i>0: `.cmd` 같은 도트파일(본체가 빈 문자열)은 strip 대상이 아니다.
+    if i > 0 and s[i + 1:] in WIN_EXEC_EXTS:
+        s = s[:i]
+    return s
+
+
 def _comm_matches(comm, agent):
     """comm(ps -o comm= 결과·macOS 는 전체경로)의 basename 이 agent 고유 바이너리와 동등하면 True.
-    ★미지/빈 agent 는 후보 없음→False(wildcard 차단·R1 결함2)·basename 동등(substring 오매칭 차단·R2 논쟁점)."""
+    ★미지/빈 agent 는 후보 없음→False(wildcard 차단·R1 결함2)·basename 동등(substring 오매칭 차단·R2 논쟁점).
+    ★확장자 정규화(2026-07-29 현장 결함 2호 파리티): Windows comm 은 `claude.exe` 로 관측돼
+    기본 설정에서도 `("claude",)` 와 불일치→False 였다(잠복 결함). 확장자를 벗겨 성립시킨다.
+    단, 개명 래퍼명(`claude-2.cmd`→`claude-2`)은 여기서 여전히 False 다 — 이 함수는 *정본
+    바이너리명* 동등 비교이고, 래퍼명 매칭은 cysd 쪽 cmdline_matches_agent 의 책임이다."""
     names = AGENT_COMM.get(agent or "", ())
     if not names:
         return False
-    base = os.path.basename((comm or "").strip()).lower()
-    return base in names
+    return _norm_comm(comm) in names
 
 
 def process_present(pid, agent):
@@ -304,6 +327,19 @@ def reclaim(role, emit):
     if _pid_for_surface_ref(ref) != pid or not pid:
         emit("reclaim", "%s pid 불일치/부재 — 회수 보류(잘못된 종료 방지)" % ref)
         return 1
+    # ★TOCTOU 방어(2026-07-29 현장 결함 2호): 위 node_alive 판정과 실제 kill 사이에는 창이 있고,
+    # 그 사이 노드가 되살아나면 멀쩡한 pane 을 `taskkill /T` 로 오살한다. 결함 2호는 생존 매처가
+    # 확장자를 벗기지 않아 agent_alive 를 *영구* false 로 만들어 '오판→오살' 사슬을 실제로
+    # 성립시켰다. 매처 수리(governance.rs 확장자 정규화)로 agent_alive 가 신뢰 가능해진 지금,
+    # kill 직전 신선 재조회가 비로소 실질 방어가 된다.
+    # ★새 판정 규칙 도입 없음 — 위와 동일한 node_alive 술어를 신선한 status 로 한 번 더 물을 뿐.
+    st_fresh = cys_status()
+    if st_fresh is None:
+        emit("reclaim", "%s kill 직전 status 재조회 실패 — 회수 보류(불확실할 땐 보존)" % ref)
+        return 1
+    if node_alive(st_fresh, role):
+        emit("reclaim", "%s 가 kill 직전 재조회에서 생존 — 회수 중단(TOCTOU 오살 방지)" % role)
+        return 1
     rc, _, _ = _kill(pid)
     time.sleep(1.5)
     if role_surface_row(role) is not None and _pid_for_surface_ref(ref) == pid:
@@ -333,6 +369,22 @@ def self_test():
     chk(_comm_matches("anything", "") is False, "빈 agent wildcard 오탐")
     chk(_comm_matches("claude", None) is False, "None agent wildcard 오탐")
     chk(process_present(123, "") is False, "빈 agent process_present 오탐")
+
+    # ★확장자 정규화 파리티(2026-07-29 현장 결함 2호): Windows comm 은 `claude.exe` 로 관측된다.
+    chk(_comm_matches("claude.exe", "claude") is True, "claude.exe 정규화 실패(기본설정 잠복결함)")
+    chk(_comm_matches("C:\\Users\\x\\.local\\bin\\claude.exe", "claude") is True,
+        "Windows 전체경로 basename 분해 실패")
+    chk(_comm_matches("CLAUDE.EXE", "claude") is True, "comm 대소문자 무시 회귀")
+    chk(_comm_matches("agy.exe", "gemini") is True, "agy.exe(gemini) 정규화 실패")
+    chk(_comm_matches("codex.cmd", "codex") is True, "codex.cmd 정규화 실패")
+    # ★개명 래퍼명은 여기서 여전히 False — 이 함수는 *정본 바이너리명* 동등 비교이고,
+    #   래퍼명(`claude-2`) 매칭은 cysd 의 cmdline_matches_agent 책임이다(역할 경계 박제).
+    chk(_comm_matches("claude-2.cmd", "claude") is False, "래퍼명이 정본명 비교를 통과(경계 붕괴)")
+    # 등록 외 확장자는 이름 본체 — strip 금지(무관 파일 오판 차단)
+    chk(_comm_matches("claude.something", "claude") is False, "미등록 확장자 strip 오탐")
+    chk(_comm_matches("claude.backup", "claude") is False, "미등록 확장자 strip 오탐(.backup)")
+    chk(_comm_matches("/usr/local/bin/.cmd", "claude") is False, "도트파일 strip 후 빈이름 오탐")
+    chk(_comm_matches("my-claude-helper.exe", "claude") is False, "substring 오매칭(확장자 경유)")
 
     # awake_ready: 프로세스 제외·fresh/stale 구분(R1 결함1)
     only_proc = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": None, "status": None}]}
@@ -370,7 +422,8 @@ def self_test():
         for f in fails:
             print("  ✗ " + f)
         return 1
-    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·claim-role·엄격ack·F4·무구독폴백슬롯)" % (7 + 4 + 4 + 4 + 4))
+    print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·확장자정규화·claim-role·엄격ack·F4·무구독폴백슬롯)"
+          % (7 + 10 + 4 + 4 + 4 + 4))
     return 0
 
 
