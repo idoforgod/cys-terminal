@@ -962,11 +962,18 @@ def cmd_self_test(args):
     t.check("자체 재계산 해시가 기록됨", r["files"][0]["sha256"] == after["sha256"])
 
     # 4) allow 직전 재확인 술어
-    print("[4] allow 직전 대상 유휴 재확인")
+    # [R2-C] 라벨을 S1 실측 튜닝 상수(RECHECK_IDLE_MIN=5s · ALLOW_RECHECK_MAX=108s)로 정정.
+    #   종전 라벨은 "idle 3(<10)" 이라 상수 변경 후에도 옛 계약을 설명하고 있었다.
+    print("[4] allow 직전 대상 유휴 재확인 (하한 %.0fs · 대기 상한 %.0fs)"
+          % (RECHECK_IDLE_MIN, ALLOW_RECHECK_MAX))
     ok, why = recheck_ready({"idle_secs": 30, "queue_depth": 0, "status": None})
     t.check("idle 30 queue 0 → ready", ok, why)
+    ok, why = recheck_ready({"idle_secs": 6, "queue_depth": 0})
+    t.check("idle 6(>=%.0f) → ready (S1 성공 사이클 실측치)" % RECHECK_IDLE_MIN, ok, why)
     ok, why = recheck_ready({"idle_secs": 3, "queue_depth": 0})
-    t.check("idle 3(<10) → 대기", not ok, why)
+    t.check("idle 3(<%.0f) → 대기" % RECHECK_IDLE_MIN, not ok, why)
+    t.check("상수 계약 핀 — RECHECK_IDLE_MIN=5 · ALLOW_RECHECK_MAX=108",
+            RECHECK_IDLE_MIN == 5.0 and ALLOW_RECHECK_MAX == 108.0)
     ok, why = recheck_ready({"idle_secs": 30, "queue_depth": 2})
     t.check("queue_depth>0 → 대기", not ok, why)
     ok, why = recheck_ready({"idle_secs": 30, "queue_depth": 0,

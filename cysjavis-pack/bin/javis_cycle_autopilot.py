@@ -418,38 +418,127 @@ def idle_min(role):
     return IDLE_MIN.get(role, IDLE_MIN_DEFAULT)
 
 
-# ── 저장/복구 파일 세트 (순수) ────────────────────────────────────────
-def save_files(role, packdir=None):
-    """--save-file 명시 세트 = 그 노드의 **복구 읽기 파일**(설계 §2 저장경로≠복구경로 봉합).
-
-    master: PROJECT/_round/SESSION_STATE.md + $PACK/round/MASTER_TODO.md (2건)
-    그 외 : $PACK/round/<ROLE>_TODO.md 단독 소유 파일
-    """
+# ── 저장/복구 파일 세트 — [R2-A] **대상 surface 기준** 파생 ───────────
+#
+# ★codex R2 BLOCK 의 정확한 처방: role 문자열 + 실행 프로세스의 전역 PROJECT 로 정하면
+#   master 가 실제로 쓰는 정본과 갈린다. 실측(2026-07-29): master surface:198 의 cwd 는
+#   홈($HOME)이라 정본이 $HOME/_round/SESSION_STATE.md 인데,
+#   스케줄 잡은 CYS_PROJECT_ROOT=<프로젝트 절대경로> 를 주입한다.
+#   그대로면 stage2 가 영영 통과하지 못한다(fail-closed 이라 손실은 없지만 S2 불능).
+def role_todo_file(role, packdir=None):
+    """$PACK/round/<ROLE>_TODO.md — 그 역할 **단독 소유** 파일."""
     pd = packdir or pack_dir()
-    if role == "master":
-        return [os.path.join(PROJECT, "_round", "SESSION_STATE.md"),
-                os.path.join(pd, "round", "MASTER_TODO.md")]
-    todo = "%s_TODO.md" % role.upper().replace("-", "_")
-    return [os.path.join(pd, "round", todo)]
+    return os.path.join(pd, "round", "%s_TODO.md" % role.upper().replace("-", "_"))
+
+
+def node_round_dir(cwd, home=None, cys_root=None):
+    """대상 노드의 `_round` 정본 디렉터리(순수) — `hooks/save-state.sh:24-32` **동형**.
+
+    ① cwd 상향탐색: `_round` 를 가진 첫 디렉터리 (`/` 는 검사하지 않는다 — 원본과 동일)
+    ② 폴백: `$CYS_ROOT`(미설정 시 `$HOME`)`/_round/ACTIVE_PROJECT` 첫 줄이 가리키는 프로젝트
+    ③ 없으면 None
+    반환 (round_dir|None, how) — how ∈ {"cwd-ascend","active-project","none"}
+    """
+    if cwd and os.path.isabs(cwd):
+        d, prev = cwd, None
+        while d and d != "/" and d != prev:
+            if os.path.isdir(os.path.join(d, "_round")):
+                return os.path.join(d, "_round"), "cwd-ascend"
+            prev, d = d, os.path.dirname(d)
+    root = cys_root or os.environ.get("CYS_ROOT", "").strip() or (
+        home or os.path.expanduser("~"))
+    try:
+        with open(os.path.join(root, "_round", "ACTIVE_PROJECT"), "r", encoding="utf-8") as f:
+            ap = f.readline().strip()
+        if ap and os.path.isdir(os.path.join(ap, "_round")):
+            return os.path.join(ap, "_round"), "active-project"
+    except OSError:
+        pass
+    return None, "none"
+
+
+def parse_cys_list(text):
+    """`cys list` 텍스트 파싱(순수) — status --json 에 cwd 가 없을 때의 폴백.
+
+    실측 형식(탭 구분): `surface:198\\trole=master\\tpid=92636\\texited=false\\t<title>\\t<cwd>`
+    """
+    out = {}
+    for line in (text or "").splitlines():
+        parts = [p for p in line.rstrip("\n").split("\t")]
+        if len(parts) < 6 or not parts[0].startswith("surface:"):
+            continue
+        try:
+            sid = int(parts[0].split(":", 1)[1])
+        except ValueError:
+            continue
+        cwd = parts[-1].strip()
+        role = parts[1][5:].strip() if parts[1].startswith("role=") else None
+        out[sid] = {"role": role, "cwd": cwd}
+    return out
+
+
+def surface_cwd(row, runner=run):
+    """대상 surface 의 실제 작업 디렉터리 — (cwd|None, source).
+
+    우선순위: status --json 의 `live_cwd`(프로세스 실시간) → `cwd`(생성 시점) →
+    `cys list` 마지막 필드 파싱(스키마 부재 대비 폴백).
+    """
+    for key in ("live_cwd", "cwd"):
+        v = (row or {}).get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip(), "status.%s" % key
+    sid = (row or {}).get("surface_id")
+    if sid is None:
+        return None, "none"
+    rc, out, _e = runner([CYS, "list"])
+    if rc == 0:
+        got = parse_cys_list(out).get(sid)
+        if got and got.get("cwd"):
+            return got["cwd"], "cys-list"
+    return None, "none"
+
+
+def resolve_save_files(role, row, packdir=None, runner=run):
+    """[R2-A] 대상 surface 기준 save-file **절대 목록** 파생 — 단일 출처.
+
+    이 함수 결과를 lease 에 **1회** 저장하고, baseline·cycle-agent argv·검증자 매핑·
+    사후검증 ⓓ 가 전부 그 lease 목록만 소비한다(재계산 금지 = 갈림 원천 제거).
+    반환: {files[], round_dir, how, cwd, cwd_source, fallback(bool)}
+    """
+    todo = role_todo_file(role, packdir)
+    cwd, cwd_src = surface_cwd(row, runner)
+    rd, how = node_round_dir(cwd)
+    fallback = rd is None
+    if fallback:
+        rd = os.path.join(PROJECT, "_round")   # 해석 실패 시에만 — 원장에 fallback 기록
+        how = "project-fallback"
+    files = ([os.path.join(rd, "SESSION_STATE.md"), todo] if role == "master" else [todo])
+    return {"files": files, "round_dir": rd, "how": how, "cwd": cwd,
+            "cwd_source": cwd_src, "fallback": fallback}
 
 
 def resume_text(cycle_id):
     return "%s (nonce=%s)" % (RESUME_BASE, nonce_for(cycle_id))
 
 
-def build_cycle_agent_argv(role, cycle_id, packdir=None):
+def build_cycle_agent_argv(role, cycle_id, files):
     """cys cycle-agent argv(순수) — self-test 가 이 함수 결과를 박제한다.
+
+    [R2-A] `files` 는 **반드시 lease 에 저장된 목록**을 그대로 넘긴다. 여기서 다시 파생하면
+      baseline·argv·검증자·사후검증이 각자 계산해 갈릴 수 있다(단일 출처 원칙).
 
     ★`--force-no-verify` 는 **절대 금지**다. 저장 검증 없이 clear 하는 유일한 탈출구이고,
       전자동 개시자가 그것을 쥐는 순간 '미저장 clear'가 상시 경로가 된다. 어떤 인자·환경변수·
       실패 경로로도 이 리스트에 추가하지 말 것(self-test: force_no_verify_never_in_argv).
     """
+    if not files:
+        raise ValueError("save-file 목록이 비었다 — lease 저장 목록을 넘겨라(단일 출처)")
     return [CYS, "cycle-agent",
             "--role", role,
             "--verifier", VERIFIER_ROLE,
             "--timeout", str(CYCLE_AGENT_TIMEOUT),
             "--resume-text", resume_text(cycle_id)] + \
-        [x for f in save_files(role, packdir) for x in ("--save-file", f)]
+        [x for f in files for x in ("--save-file", f)]
 
 
 # ── 측정(신선도 = 무효화 이벤트 부재) ─────────────────────────────────
@@ -825,16 +914,31 @@ def cmd_tick(args):
         cid = new_cycle_id()
         surface = (ctx.get("row") or {}).get("surface_ref")
         m = ctx["measure"]
+        # [R2-A] save-file 목록은 여기서 **대상 surface 기준으로 1회** 파생한다.
+        #   이후 baseline·argv·검증자 매핑·사후검증 ⓓ 는 전부 lease 의 이 목록만 소비한다.
+        sfr = resolve_save_files(role, ctx.get("row"))
         detail = {"mode": mode(), "ctx_pct": m.get("ctx_pct"), "ctx_tokens": m.get("ctx_tokens"),
                   "threshold": m.get("threshold"), "session_file": m.get("session_file"),
                   "updated_at": m.get("updated_at"), "idle_secs": (ctx["row"] or {}).get("idle_secs"),
                   "queue_depth": (ctx["row"] or {}).get("queue_depth"),
+                  "save_files": sfr["files"], "save_files_origin": {
+                      "cwd": sfr["cwd"], "cwd_source": sfr["cwd_source"],
+                      "round_dir": sfr["round_dir"], "how": sfr["how"],
+                      "fallback": sfr["fallback"]},
                   "gates": [{"n": x["id"], "ok": x["ok"]} for x in verdict["gates"]]}
+        if sfr["fallback"]:
+            # 해석 실패 = 전역 PROJECT 폴백. 조용히 넘어가면 R2 BLOCK 이 재발하므로 원장에 못 박는다.
+            log_append({"ts": now_ts, "cycle_id": cid, "phase": "skip", "role": role,
+                        "surface": surface,
+                        "detail": {"warn": "save-file 경로 해석 실패 — PROJECT 폴백 사용",
+                                   "save_files_origin": detail["save_files_origin"]}})
         if mode() == MODE_SHADOW:
+            # [R2-A] shadow 증거: 실제로 넘어갈 argv 를 그대로 원장에 남긴다(음성대조용).
+            detail["cycle_agent_argv"] = build_cycle_agent_argv(role, cid, sfr["files"])
             log_append({"ts": now_ts, "cycle_id": cid, "phase": "would_fire", "role": role,
                         "surface": surface, "detail": detail})
             print(json.dumps({"result": "would_fire(shadow)", "role": role, "cycle_id": cid,
-                              "sweep": sweep}, ensure_ascii=False))
+                              "save_files": sfr["files"], "sweep": sweep}, ensure_ascii=False))
             return EXIT_OK
 
         # live — lease 획득 후 집행자 detach 스폰
@@ -852,7 +956,8 @@ def cmd_tick(args):
                                    "ctx_tokens": m.get("ctx_tokens"),
                                    "ctx_pct": m.get("ctx_pct"),
                                    "updated_at": m.get("updated_at")},
-                           "save_files": save_files(role)}
+                           "save_files": sfr["files"],
+                           "save_files_origin": detail["save_files_origin"]}
             save_state(st)
         log_append({"ts": now_ts, "cycle_id": cid, "phase": "armed", "role": role,
                     "surface": surface, "detail": detail})
@@ -1068,7 +1173,13 @@ def cmd_execute(args):
     _set_phase(cid, role, surface, "prenotified", {"prenotice": PRENOTICE_TEXT})
 
     # 2) [v2.1 ①] baseline 원장 기록 — **cycle-agent 실행 직전**. 검증자의 유일한 진실 기준.
-    files = (lease.get("save_files") or save_files(role))
+    # [R2-A] 파일 목록은 lease 에 저장된 것만 쓴다. 여기서 재파생하면 tick 이 본 대상과
+    #        execute 가 보는 대상이 갈릴 수 있다(단일 출처). 부재면 fail-closed.
+    files = lease.get("save_files")
+    if not files:
+        _finalize(cid, role, surface, "failed",
+                  {"reason": "lease 에 save_files 목록 없음 — 단일 출처 위반, 집행 중단"})
+        return EXIT_ERR
     start_ts = time.time()
     bl = write_baseline(cid, role, surface, files, start_ts)
     with _StateLock():
@@ -1079,9 +1190,10 @@ def cmd_execute(args):
             save_state(st)
 
     # 3) cycle-agent 를 자식으로 — 1s 간격 kill-switch 폴링, 감지 즉시 SIGTERM
-    argv = build_cycle_agent_argv(role, cid)
+    argv = build_cycle_agent_argv(role, cid, files)
     _set_phase(cid, role, surface, "fired",
                {"argv": argv, "baseline": bl["path"], "file_set": bl["file_set"],
+                "save_files_origin": lease.get("save_files_origin"),
                 "started_at": start_ts, "poll_secs": KILL_POLL_SECS,
                 "residual_window": RESIDUAL_WINDOW_NOTE})
     ledger_append("cycle", "cycle-autopilot",
@@ -1191,7 +1303,9 @@ def postverify_decide(pre, row, nonce_hits, save_mtimes, start_ts):
       세지 않는다. 자식 exit code 를 성공 신호로 쓰던 종전 오류의 정확한 처방이다.)
     실효 확인(cleared_verified) = ⓐ 신규 session_file + ctx_tokens **상대 급락**
       (절대 하한 금지 — 복원 재주입 baseline 이 노드마다 다르다)
-      AND ⓑ 신규 세션 jsonl 에 nonce 도착 AND ⓓ 복구 읽기 파일 **전건** 재기록.
+      AND ⓑ **신규** 세션 jsonl 에 nonce 도착 AND ⓓ 복구 읽기 파일 **전건** 재기록.
+    [R2-B] ⓑ 는 session_file 이 교체됐을 때만 참이 될 수 있다. 세션이 그대로면 nonce_hits 가
+      몇이든 False 다 — 구 세션에 남은 문양은 도착 증거가 아니다(실측 오염 cycle 1785338591).
     clear 미실행 확인(failed_preclear) = 측정은 유효한데 session_file 이 **그대로**.
     ⓓ 는 [v2.1 ①] baseline ALL-match 계약과 정합하도록 ALL 이다 — 검증자가 전 파일 재기록을
       이미 강제하므로 ALL 이 lockout 을 만들지 않는다(v2 의 ANY 편차는 철회).
@@ -1209,11 +1323,16 @@ def postverify_decide(pre, row, nonce_hits, save_mtimes, start_ts):
     res["measurement_valid"] = bool(
         u.get("source") == "statusline" and isinstance(new_upd, (int, float))
         and new_upd > start_ts)
+    session_changed = bool(new_sf and old_sf and new_sf != old_sf)
+    res["session_changed"] = session_changed
     res["a_effective"] = bool(
-        res["measurement_valid"] and new_sf and new_sf != old_sf
+        res["measurement_valid"] and session_changed
         and isinstance(new_tok, (int, float)) and isinstance(old_tok, (int, float))
         and new_tok < old_tok)
-    res["b_nonce"] = bool(nonce_hits and nonce_hits > 0)
+    # [R2-B] 세션 파일이 그대로면 그 파일의 nonce 문양은 stage5 **도착** 증거가 아니다
+    #   (구 세션의 argv·로그 열람 흔적). 신규 세션에서만 유효 — 오염 차단을 여기서도 강제한다
+    #   (post_verify 가 이미 0 을 넘기지만, 순수 함수 단독 호출자도 같은 계약을 받도록 이중 방어).
+    res["b_nonce"] = bool(session_changed and nonce_hits and nonce_hits > 0)
     stale = [f for f, mt in (save_mtimes or {}).items()
              if mt is None or mt <= start_ts]
     res["stale_recovery"] = sorted(stale)
@@ -1253,15 +1372,25 @@ def _count_nonce(session_file, cycle_id):
 def post_verify(role, cycle_id, lease, takeover=False):
     start_ts = (lease or {}).get("fired_at") or (lease or {}).get("started_at") or 0.0
     pre = (lease or {}).get("pre") or {}
-    files = (lease or {}).get("save_files") or save_files(role)
+    files = (lease or {}).get("save_files") or []   # [R2-A] 단일 출처 — 재파생 금지
     status = fetch_status()
     row = surface_row(status, role)
     new_sf = ((row or {}).get("usage") or {}).get("session_file")
-    hits = _count_nonce(new_sf, cycle_id)
+    old_sf = pre.get("session_file")
+    # [R2-B] nonce 는 **신규 세션 파일에서만** 센다. 세션이 그대로면 그 파일에 찍힌 문양은
+    #   stage5 도착 증거가 아니라 구 세션의 로그 열람 흔적(argv·도구 출력)일 뿐이다
+    #   — 실패 cycle 1785338591 에서 session_file 불변인데 hits=3 이 나온 실측 오염.
+    hits_raw = _count_nonce(new_sf, cycle_id)
+    session_changed = bool(new_sf and old_sf and new_sf != old_sf)
+    hits = hits_raw if session_changed else 0
     mtimes = {f: mtime_of(f) for f in files}
     v = postverify_decide(pre, row, hits, mtimes, start_ts)
     v["takeover"] = takeover
     v["nonce_hits"] = hits
+    v["nonce_hits_raw"] = hits_raw            # 오염 관측용(판정 미투입)
+    v["nonce_counted_from"] = new_sf if session_changed else None
+    if not files:
+        v["save_files_missing"] = True
     v["save_mtimes"] = {os.path.basename(f): mtimes[f] for f in mtimes}
 
     # ⓒ /clear 큐 걸림 — 재집행 금지, 복원 포인터만 멱등 선적재
@@ -1388,11 +1517,15 @@ def cmd_status(args):
         ctx = collect_ctx(role, now_ts, status or {}, killed, kreason, records, bad,
                           lease is None or lstatus in ("none", "terminal"))
         v = evaluate_gates(role, ctx, now_ts)
+        sfr = resolve_save_files(role, ctx.get("row"))   # [R2-A] 대상 surface 기준 dry 파생
         out["gates"][role] = {"pass": v["pass"], "exit": v["exit"], "reason": v["reason"],
                               "detail": v["gates"],
                               "measure": ctx["measure"],
-                              "save_files": save_files(role),
-                              "cycle_agent_argv": build_cycle_agent_argv(role, 0)}
+                              "save_files": sfr["files"],
+                              "save_files_origin": {k: sfr[k] for k in
+                                                    ("cwd", "cwd_source", "round_dir",
+                                                     "how", "fallback")},
+                              "cycle_agent_argv": build_cycle_agent_argv(role, 0, sfr["files"])}
     print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
     return EXIT_OK
 
@@ -1454,6 +1587,15 @@ def extract_contract_block(path):
         if on:
             buf.append(ln)
     return None
+
+
+def _raises(fn):
+    """호출이 예외를 올리면 True (계약 위반이 조용히 통과하지 않는지 확인용)."""
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        return True
+    return False
 
 
 class _T(object):
@@ -1630,6 +1772,39 @@ def cmd_self_test(args):
                                                     "last_terminal_ts": now_ts - 9999,
                                                     "incomplete": False, "corrupt": False}), now_ts)
         t.check("직전 %s → 발화 금지(짝짓기)" % bad_phase, not v["pass"])
+
+    # 5-b) [R2-C] reset 해제 분기 직접 회귀 4검체
+    print("[5-b] reset 짝짓기 해제 분기 (RESET_COOLDOWN_SECS=%.0f)" % RESET_COOLDOWN_SECS)
+    FAIL_TS = now_ts - 9999
+
+    def led_reset(reset_ts, last_ts=FAIL_TS, phase="failed_preclear"):
+        d = {"cycles": 2, "last_terminal_phase": phase, "last_terminal_ts": last_ts,
+             "incomplete": False, "corrupt": False}
+        if reset_ts is not None:
+            d["last_reset_ts"] = reset_ts
+        return d
+    v = evaluate_gates("worker", ctx_of(ledger=led_reset(None)), now_ts)
+    t.check("① reset 전(실패 종결만) → 발화 금지", not v["pass"], v["reason"])
+    v = evaluate_gates("worker", ctx_of(ledger=led_reset(now_ts - 179)), now_ts)
+    t.check("② reset + 179s → 아직 금지(쿨다운 미충족)", not v["pass"], v["reason"])
+    v = evaluate_gates("worker", ctx_of(ledger=led_reset(now_ts - 180)), now_ts)
+    t.check("③ reset + 180s → 통과", v["pass"], v["reason"])
+    v = evaluate_gates("worker",
+                       ctx_of(ledger=led_reset(now_ts - 600, last_ts=now_ts - 300)), now_ts)
+    t.check("④ reset 후 다음 실패 terminal 기록 → 재잠금(자동 재시도 루프 없음)",
+            not v["pass"], v["reason"])
+    v = evaluate_gates("worker",
+                       ctx_of(ledger=led_reset(FAIL_TS - 1, last_ts=FAIL_TS)), now_ts)
+    t.check("  reset 이 종결보다 **과거**면 해제 아님", not v["pass"], v["reason"])
+    v = evaluate_gates("worker",
+                       ctx_of(ledger=led_reset(now_ts - 10, last_ts=now_ts - 1500,
+                                               phase=SUCCESS_PHASE)), now_ts)
+    t.check("  성공 종결에는 reset 분기가 개입하지 않음(정상 쿨다운 경로)", v["pass"], v["reason"])
+    lvr = ledger_view([{"ts": 100, "cycle_id": 1, "phase": "failed_preclear", "role": "worker"},
+                       {"ts": 300, "cycle_id": None, "phase": "reset", "role": "worker"}],
+                      "worker", 0)
+    t.check("  원장의 reset 레코드가 last_reset_ts 로 집계(사이클로는 미계상)",
+            lvr["last_reset_ts"] == 300 and lvr["cycles"] == 1 and not lvr["incomplete"])
     v = evaluate_gates("worker", ctx_of(ledger={"cycles": 1, "incomplete": True,
                                                 "incomplete_cycle": 7, "corrupt": False}), now_ts)
     t.check("원장 미완결 → exit 5", (not v["pass"]) and v["exit"] == EXIT_LEDGER)
@@ -1665,27 +1840,108 @@ def cmd_self_test(args):
     lv5 = ledger_view([], "worker", 3)
     t.check("bad_lines>0 → corrupt", lv5["corrupt"])
 
-    # 7) argv·저장세트 계약
-    print("[7] cycle-agent argv 계약")
-    argv_w = build_cycle_agent_argv("worker", 1234567, packdir="/PK")
-    argv_m = build_cycle_agent_argv("master", 1234567, packdir="/PK")
+    # 7) argv·저장세트 계약 — [R2-A] 대상 surface 기준 파생
+    print("[7] save-file 대상 surface 파생 + argv 계약")
+
+    def norow(role, cwd, sid=9):
+        return {"role": role, "surface_id": sid, "live_cwd": cwd, "cwd": cwd,
+                "surface_ref": "surface:%d" % sid}
+
+    # 7-a) node_round_dir — save-state.sh 동형 상향탐색 (실디렉터리 대조)
+    HOME = os.path.expanduser("~")
+    rd, how = node_round_dir(HOME)
+    t.check("cwd=$HOME → 홈 _round 정본 (save-state.sh 동형)",
+            rd == os.path.join(HOME, "_round") and how == "cwd-ascend", "%s/%s" % (rd, how))
+    rd2, how2 = node_round_dir(os.path.join(HOME, "Desktop", "CYSjavis"))
+    t.check("cwd=프로젝트 → 프로젝트 _round",
+            rd2 == os.path.join(HOME, "Desktop", "CYSjavis", "_round") and how2 == "cwd-ascend",
+            str(rd2))
+    deep = os.path.join(tmpd, "a", "b", "c")
+    os.makedirs(os.path.join(tmpd, "a", "_round"))
+    os.makedirs(deep)
+    rd3, _h3 = node_round_dir(deep)
+    t.check("깊은 하위에서 상향탐색으로 조상 _round 발견",
+            rd3 == os.path.join(tmpd, "a", "_round"), str(rd3))
+    rd4, how4 = node_round_dir("relative/not/abs")
+    t.check("상대경로는 상향탐색 안 함(무한루프 방지)", how4 != "cwd-ascend")
+    rd5, how5 = node_round_dir("/nonexistent-xyz", cys_root=tmpd)
+    t.check("_round 도 ACTIVE_PROJECT 도 없으면 None", rd5 is None and how5 == "none")
+    ap_root = os.path.join(tmpd, "aproot")
+    os.makedirs(os.path.join(ap_root, "_round"))
+    open(os.path.join(ap_root, "_round", "ACTIVE_PROJECT"), "w").write(
+        os.path.join(tmpd, "a") + "\n")
+    rd6, how6 = node_round_dir("/nonexistent-xyz", cys_root=ap_root)
+    t.check("ACTIVE_PROJECT 폴백 동작",
+            rd6 == os.path.join(tmpd, "a", "_round") and how6 == "active-project", str(rd6))
+
+    # 7-b) ★R2 BLOCK 회귀 핀 — master cwd=$HOME 이면 홈 정본이 나와야 한다
+    sfr_m = resolve_save_files("master", norow("master", HOME, 198), packdir="/PK")
+    t.check("★[R2-A] master(cwd=$HOME) save-file = 홈 _round 정본",
+            sfr_m["files"] == [os.path.join(HOME, "_round", "SESSION_STATE.md"),
+                               "/PK/round/MASTER_TODO.md"], str(sfr_m["files"]))
+    t.check("★[R2-A] 전역 PROJECT 에 결박되지 않음",
+            os.path.join(PROJECT, "_round", "SESSION_STATE.md") not in sfr_m["files"]
+            or PROJECT == HOME, str(sfr_m["files"]))
+    t.check("파생 출처가 기록됨(cwd·round_dir·how·fallback)",
+            sfr_m["cwd"] == HOME and sfr_m["how"] == "cwd-ascend"
+            and sfr_m["fallback"] is False and sfr_m["cwd_source"] == "status.live_cwd")
+    sfr_mp = resolve_save_files("master", norow("master", os.path.join(HOME, "Desktop", "CYSjavis"),
+                                                198), packdir="/PK")
+    t.check("master(cwd=프로젝트) 는 프로젝트 정본",
+            sfr_mp["files"][0] == os.path.join(HOME, "Desktop", "CYSjavis", "_round",
+                                               "SESSION_STATE.md"), str(sfr_mp["files"]))
+    sfr_w = resolve_save_files("worker", norow("worker", os.path.join(HOME, "Desktop", "CYSjavis")),
+                               packdir="/PK")
+    t.check("worker save-file 단독 WORKER_TODO.md(round_dir 무관)",
+            sfr_w["files"] == ["/PK/round/WORKER_TODO.md"], str(sfr_w["files"]))
+    t.check("reviewer-codex → REVIEWER_CODEX_TODO.md",
+            resolve_save_files("reviewer-codex", norow("reviewer-codex", HOME),
+                               packdir="/PK")["files"] == ["/PK/round/REVIEWER_CODEX_TODO.md"])
+
+    # 7-c) cwd 해석 실패 → PROJECT 폴백 + fallback 플래그
+    sfr_fb = resolve_save_files("master", {"role": "master", "surface_id": None},
+                                packdir="/PK", runner=lambda *a, **k: (1, "", "no daemon"))
+    t.check("cwd 해석 실패 → PROJECT 폴백 + fallback=True",
+            sfr_fb["fallback"] is True
+            and sfr_fb["files"][0] == os.path.join(PROJECT, "_round", "SESSION_STATE.md"),
+            str(sfr_fb))
+
+    # 7-d) cys list 폴백 파싱
+    listing = ("surface:198\trole=master\tpid=92636\texited=false\tmaster-claude · testhost\t"
+               "/Users/x/h\n"
+               "surface:200\trole=worker\tpid=6352\texited=false\tworker · CYSjavis\t"
+               "/Users/x/proj\n"
+               "쓰레기 줄\n")
+    parsed = parse_cys_list(listing)
+    t.check("cys list 파싱 — surface_id·role·cwd",
+            parsed[198]["cwd"] == "/Users/x/h" and parsed[198]["role"] == "master"
+            and parsed[200]["cwd"] == "/Users/x/proj", str(parsed))
+    t.check("cys list 형식 위반 줄 무시", len(parsed) == 2)
+    cwd_fb, src_fb = surface_cwd({"surface_id": 198},
+                                 runner=lambda *a, **k: (0, listing, ""))
+    t.check("status 에 cwd 없으면 cys list 폴백",
+            cwd_fb == "/Users/x/h" and src_fb == "cys-list")
+
+    # 7-e) argv 는 넘겨받은 목록만 소비 (단일 출처)
+    argv_w = build_cycle_agent_argv("worker", 1234567, sfr_w["files"])
+    argv_m = build_cycle_agent_argv("master", 1234567, sfr_m["files"])
     t.check("force_no_verify_never_in_argv(worker)", "--force-no-verify" not in argv_w)
     t.check("force_no_verify_never_in_argv(master)", "--force-no-verify" not in argv_m)
     t.check("--verifier cycle-verifier 고정",
             argv_w[argv_w.index("--verifier") + 1] == VERIFIER_ROLE)
     t.check("resume-text 에 nonce 포함",
             ("nonce=%s" % nonce_for(1234567)) in argv_w[argv_w.index("--resume-text") + 1])
-    sf_w = save_files("worker", packdir="/PK")
-    sf_m = save_files("master", packdir="/PK")
-    t.check("worker save-file 단독 WORKER_TODO.md",
-            sf_w == ["/PK/round/WORKER_TODO.md"], str(sf_w))
-    t.check("master save-file 2건(SESSION_STATE + MASTER_TODO)",
-            sf_m == [os.path.join(PROJECT, "_round", "SESSION_STATE.md"),
-                     "/PK/round/MASTER_TODO.md"], str(sf_m))
-    t.check("reviewer-codex → REVIEWER_CODEX_TODO.md",
-            save_files("reviewer-codex", packdir="/PK") == ["/PK/round/REVIEWER_CODEX_TODO.md"])
-    t.check("argv 에 save-file 전량 동봉",
-            all(f in argv_m for f in sf_m))
+    t.check("argv 에 lease 목록 전량 동봉", all(f in argv_m for f in sfr_m["files"]))
+    t.check("★argv 가 자체 파생하지 않음(빈 목록이면 거부)",
+            _raises(lambda: build_cycle_agent_argv("master", 1, [])))
+    import inspect as _insp
+    t.check("build_cycle_agent_argv 안에서 재파생 호출 없음",
+            "resolve_save_files" not in _insp.getsource(build_cycle_agent_argv))
+    t.check("execute 가 lease 목록만 소비(재파생 금지)",
+            'lease.get("save_files")' in _insp.getsource(cmd_execute)
+            and "resolve_save_files" not in _insp.getsource(cmd_execute))
+    t.check("post_verify 가 lease 목록만 소비",
+            "resolve_save_files" not in _insp.getsource(post_verify))
 
     # 8) 사후검증 3분기 [v2.1 ④]
     print("[8] 사후검증 판정표 (cleared_verified / failed_preclear / indeterminate)")
@@ -1733,6 +1989,33 @@ def cmd_self_test(args):
             r["verdict"] == "failed_preclear" and r["queue_depth"] == 2)
     t.check("어떤 분기도 자식 exit code 를 입력으로 쓰지 않는다",
             "child_rc" not in json.dumps(r, default=str))
+
+    # 8-a2) [R2-B] nonce 오라클 오염 차단 — 실패 cycle 1785338591 재현형
+    print("[8-a2] nonce 오라클 (신규 세션에서만 유효)")
+    r = postverify_decide(pre, prow("/a/old.jsonl", 431710, 1200.0), 3,
+                          {"/f/a": 1100.0}, st0)
+    t.check("★[R2-B] 구세션 hits=3 인데 session_file 동일 → b_nonce False",
+            r["b_nonce"] is False and r["session_changed"] is False, str(r))
+    t.check("  그 경우 판정은 failed_preclear(성공으로 새지 않음)",
+            r["verdict"] == "failed_preclear")
+    r = postverify_decide(pre, prow("/a/new.jsonl", 20000, 1200.0), 3,
+                          {"/f/a": 1100.0}, st0)
+    t.check("신규 세션 + hits>0 → b_nonce True", r["b_nonce"] is True and r["session_changed"])
+    r = postverify_decide({"session_file": None, "ctx_tokens": 700000},
+                          prow("/a/new.jsonl", 20000, 1200.0), 3, {"/f/a": 1100.0}, st0)
+    t.check("pre.session_file 부재 → 교체 판정 불가 → b_nonce False(보수)",
+            r["b_nonce"] is False)
+    src_pv = _insp.getsource(post_verify)
+    t.check("post_verify 도 신규 세션에서만 카운트(원시값은 관측용 보존)",
+            "session_changed" in src_pv and "nonce_hits_raw" in src_pv)
+    # 정확 문양 계약(구 cycle-<id> 부분일치 오염 차단)
+    nf = os.path.join(tmpd, "sess_nonce.jsonl")
+    open(nf, "w", encoding="utf-8").write(
+        "라인1 baseline path /baselines/cycle-777.json\n"
+        "라인2 [RESUME] ... (nonce=cycle-777)\n")
+    t.check("정확 문양 '(nonce=cycle-N)' 만 카운트", _count_nonce(nf, 777) == 1,
+            str(_count_nonce(nf, 777)))
+    t.check("세션 파일 부재 → 0", _count_nonce(None, 777) == 0)
 
     # 8-b) baseline 기록 계약 [v2.1 ①]
     print("[8-b] baseline 레코드 계약")
