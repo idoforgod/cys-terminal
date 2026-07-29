@@ -285,8 +285,10 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기
       (`release-assemble.py`)가 `/downloads/` 만 보고 메인 페이지는 아예 보지 않는다"였다.
-      **이 레인(0.14.2)에는 그 두 스크립트가 존재하지도 않는다**(실측: `scripts/` 에 없음) —
-      즉 메인 페이지 검증은 **부분 자동화조차 없는 100% 수동 게이트**다. 그래서 메인 밴드 누락은
+      **이 레인에는 그 두 스크립트가 존재하지 않았다**(실측) — 그래서 메인 페이지 검증은
+      100% 수동 게이트였다. ★**2026-07-29 해소**: `scripts/verify-release-remote.py` 신설로
+      6항목 전부를 기계로 돌린다(라이브 0.14.4 로 교정 — 6/6 PASS). 아래 수동 명령은
+      그 스크립트가 못 돌 때의 폴백이자 판정 기준의 서술로 남긴다. 그래서 메인 밴드 누락은
       404 가 아니라 **무증상 구버전 배포**로 나타난다(구자산이 보존돼 링크는 200). v0.13.17 에서
       실제로 발생했다. 아래 4항목은 아무 스크립트도 대신해 주지 않으므로 **사람이 손으로 돌리고
       결과를 릴리스 노트에 붙인다.**
@@ -308,12 +310,18 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             for f in "cys_${V}_aarch64.dmg" "cys_${V}_x64.dmg" \
                      "cys_${V}_x64-setup.exe" "cys_${V}_x64-setup.zip"; do
               L=$(curl -sI "$B/$f" | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r')
-              printf '%-32s %s bytes  = %s MB\n' "$f" "$L" "$((L/1000/1000))"
+              printf '%-32s %s bytes  = %s MB\n' "$f" "$L" "$((L/1024/1024))"
             done
             ```
             4줄 전부 값이 나와야 하고(빈 값 = 자산 부재), MB 표기가 메인 페이지 4토큰과
             일치해야 한다. 불일치 1건이라도 있으면 **미완**이다.
-      - [ ] ④ **버튼 href 4종 HEAD 200** — 페이지에 박힌 다운로드 링크를 눈이 아니라 HTTP 로 확인:
+            ★**단위는 MiB(1024) 버림**이다 — 십진 MB(1000)로 계산하면 정상 배포에서도 어긋난다
+            (실측: 231,644,695B → 라이브 표기 **220MB** · 1000 기준이면 231 · 반올림이면 221).
+      - [ ] ④ **버튼 href 4종 HEAD 200** — 페이지에 박힌 다운로드 링크를 눈이 아니라 HTTP 로 확인.
+            ★**정적 `href="…"` 만 grep 하면 3개만 잡힌다** — zip 링크는 JS 가
+            `setAttribute('href', '/downloads/…zip')` 로 붙이기 때문이다(실측). 양쪽을 봐야 4개다.
+            아래 명령은 정적만 본다 → **`python3 scripts/verify-release-remote.py <V> <구버전>` 을 쓰라**
+            (6항목 전부를 기계로 돌리고 JS 주입 링크까지 센다):
 
             ```sh
             curl -s https://www.cysinsight.com/ \
@@ -337,22 +345,26 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             **1 이상**이어야 한다. 0 이면 안내가 사라진 것 — 밴드 카피를 복원할 때까지 **미완**이다.
 
       - [ ] ⑥ **SHA256SUMS 신버전 전체 갱신 · 누락 0** (2026-07-29 오너 지시 ⓑ)
-            `SHA256SUMS` 는 릴리스 CI 의 `pack-artifacts` 잡이 **4종이 모두 올라온 뒤** 생성해
-            릴리스에 올린다(누락 1건이라도 있으면 잡이 fail-closed 로 중단된다). 홈페이지 쪽에도
-            같은 파일이 올라가야 하고, **구버전 줄이 섞여 있으면 안 된다**:
+            ★파일명은 **`SHA256SUMS.txt`** 다(`SHA256SUMS` 는 404 — 실측). CI 가 아니라
+            **`scripts/release-postprocess.py`** 가 CI 완주 후 로컬에서 만든다(자기 자신을 뺀
+            **전 자산** — 배포 4종만이 아니다. v0.14.4 기준 13줄). 홈페이지에도 같은 파일이
+            올라가야 하고, **구버전 줄이 섞여 있으면 안 된다**:
             ```sh
             V=X.Y.Z; B=https://www.cysinsight.com/downloads
-            curl -s "$B/SHA256SUMS" | tee /tmp/sums.txt
-            test "$(grep -c "cys_${V}_" /tmp/sums.txt)" -eq 4   # 신버전 4줄
-            test "$(grep -vc "cys_${V}_" /tmp/sums.txt)" -eq 0  # 구버전 줄 0
+            curl -s "$B/SHA256SUMS.txt" | tee /tmp/sums.txt
+            test "$(grep -c "cys_${V}_" /tmp/sums.txt)" -ge 4   # 신버전 4줄 이상(전 자산 등재)
+            # 구버전 자산 줄 0 (버전 없는 공용 자산 cys_aarch64.app.tar.gz 등은 정상)
+            test "$(grep -cE "cys_[0-9]+\\.[0-9]+\\.[0-9]+_" /tmp/sums.txt)" \
+               -eq "$(grep -c "cys_${V}_" /tmp/sums.txt)"
             # 실자산과 대조(다운로드 후 검증) — 표기만 갱신되고 바이트가 구버전인 사고 차단
             cd "$(mktemp -d)" && for f in "cys_${V}_aarch64.dmg" "cys_${V}_x64.dmg" \
                  "cys_${V}_x64-setup.exe" "cys_${V}_x64-setup.zip"; do curl -sO "$B/$f"; done
-            curl -sO "$B/SHA256SUMS" && shasum -a 256 -c SHA256SUMS
+            curl -sO "$B/SHA256SUMS.txt" && shasum -a 256 -c SHA256SUMS.txt
             ```
             **4줄 전건 OK** 여야 한다. 1건이라도 FAILED 면 미완이다.
 
-      ⚠이 6항목을 `verify-release-remote.sh` 에 넣지 않는 이유: 홈페이지는 **이 리포 밖**이라
-      스크립트가 그 SOT(밴드 구조·용량 표기 규약)를 알지 못한다. 자동화하려면 홈페이지 리포에
-      게이트를 두는 것이 옳다 — 여기서는 문서 게이트로 고정한다.
+      ⚠**남은 한계**: 이 검증은 홈페이지의 SOT(밴드 구조·카피 규약)를 알지 못하고 **결과만** 본다.
+      "링크가 200이고 버전이 맞다"는 "밴드가 의도대로 구성됐다"를 뜻하지 않는다.
+      구조 자체의 게이트는 홈페이지 리포(`cys-homepage/_round/dlhero/RELEASE_BUMP_CHECK.md`)에
+      두는 것이 옳다 — 여기서는 배포 결과 게이트로 고정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
