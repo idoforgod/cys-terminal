@@ -56,15 +56,15 @@ for _stream in (sys.stdout, sys.stderr):
 # 정책 회귀를 무조건 차단하는 우리 바이너리(경로 말단 이름, 소문자).
 STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
 
-# 0.14.3 수리 세대 마커 — cysd 소스의 FIX_GENERATION const 바이트열(live RPC 참조+main() 부팅로그 임베드 · v4).
+# 0.14.4 수리 세대 마커 — cysd 소스의 FIX_GENERATION const 바이트열(live RPC 참조+main() 부팅로그 임베드 · v4).
 # ★코드 경로 문자열 휴리스틱 폐기(CI run 30357918475 실증 · 2026-07-28):
 #   ①'command 비정상 종료'는 구베이스의 'text_command 비정상 종료'의 부분열이라 판별력 0
 #   ②cfg(windows) 경로 리터럴('shell-fallback')은 컴파일러 재량으로 실빌드에서 미검출됨.
 # `#[used]` static 은 참조 여부·최적화와 무관하게 링커가 보존하는 결정론 임베드이고
-# 전 플랫폼 컴파일이라 맥 로컬 릴리스 빌드에서도 사전 검증된다. 0.14.2 이하엔 존재하지
-# 않는 신조어 바이트열(0.14.3 세대는 w1) — 판별력은 CI 음성 대조(0.14.0 실물 0/1 단언)가 계속 증명한다.
+# 전 플랫폼 컴파일이라 맥 로컬 릴리스 빌드에서도 사전 검증된다. 0.14.3 이하엔 존재하지
+# 않는 신조어 바이트열(0.14.4 세대는 w2) — 판별력은 CI 음성 대조(0.14.0 실물 0/1 단언)가 계속 증명한다.
 FIX_MARKERS = [
-    b"cys-fix-w1-gen-0.14.3",
+    b"cys-fix-w2-gen-0.14.4",
 ]
 
 NEEDLE = "vcruntime140"  # vcruntime140.dll·vcruntime140_1.dll 모두 접두 매치

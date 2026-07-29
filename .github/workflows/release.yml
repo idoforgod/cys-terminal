@@ -359,7 +359,7 @@ jobs:
           python3 - "$CYSD_BIN" <<'PYEOF'
           import sys
           data = open(sys.argv[1], "rb").read()
-          marker = b"cys-fix-w1-gen-0.14.3"
+          marker = b"cys-fix-w2-gen-0.14.4"
           if marker not in data:
               print(f"::error::수리 세대 마커 부재({sys.argv[1]}) — 스테일 사이드카 의심. cargo clean 후 재빌드 필요")
               sys.exit(1)
