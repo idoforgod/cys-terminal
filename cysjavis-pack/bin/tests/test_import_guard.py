@@ -61,6 +61,9 @@
     BLOCK-4 ★③ 프로브가 형제 `ModuleNotFoundError` 만 FAIL 로 보고 **그 밖의 비정상 종료·timeout 을
             통과**시켰다 → 가드 평가 도중 죽어 import 에 **도달조차 못 한 실행**이 "형제 import 통과"
             의 증거로 계상됐다. **rc=0 만 PASS**로 바꾸고 실패 사유를 구분해 보고한다.
+            ※2026-07-30 R2 후속: 이 수리에 **회귀 검체가 0건**이었다(리뷰어2 미핀 지적 · 실측
+              `ZeroDivisionError` grep 0건). 수리가 되돌려져도 잡을 것이 없다는 뜻이라
+              `_selftest_probe_failclosed()` 로 세 계열(크래시·sys.exit·마커 부재)을 박제했다.
     REVISE-1 `sys.path.pop(0)` 은 우리가 끝에 붙인 항목을 지우지 않으므로 실제로는 정상인데 FAIL —
             **의도적으로 고치지 않는다**. 아래 '계약' 참조.
 
@@ -867,9 +870,59 @@ def _selftest_marker_parsing():
         check("④ 마커 파싱 %s" % label, got == want, "got=%s want=%s" % (got, want))
 
 
+def _selftest_probe_failclosed():
+    """③ 프로브가 **비정상 종료 계열을 전부 FAIL 로** 판정하는지 잠근다(BLOCK-4 회귀 핀).
+
+    ★왜 여기 있는가: `runtime_probe` 는 이미 fail-closed 다(rc≠0 → FAIL · rc=0 도 `sys.modules`
+      실측). 그런데 **그 성질을 고정하는 검체가 0건**이었다 — 미래에 "형제 MNF 가 아닌 실패는
+      무관하니 통과시키자"로 되돌려져도 스위트는 그대로 초록이다. BLOCK-4 가 정확히 그 형태의
+      결함이었고, 수리만 있고 핀이 없으면 같은 자리에서 두 번째로 당한다. 여기서 박제한다.
+
+    ★검체가 재현하는 것 — 모두 "가드 평가 도중 죽어 형제 import 에 **도달조차 못 한** 실행":
+      (a) 모듈 레벨 크래시(`ZeroDivisionError`) → rc=1
+      (b) 모듈 레벨 `sys.exit(3)`               → rc=3   (비정상 종료 계열 2종 커버)
+      (c) 적재 보고 마커 출력 **전에** `os._exit(0)` → rc=0 인데 마커 부재
+          — rc=0 을 곧이곧대로 믿으면 통과하는 유일한 경로라 따로 핀한다.
+
+    ※timeout 계열 검체는 **의도적으로 두지 않는다**. 프로브의 `timeout=120` 이 고정값이라
+      검체 하나가 스위트를 2분 늘린다(현재 전체 실행이 수 초). 비용 대비 부적절하다.
+      코드 경로는 `except subprocess.TimeoutExpired` 한 줄이고 반환 형태는 위 세 계열과 동형
+      (`(False, 사유)`)이라, 여기서 잠그는 불변식("rc=0 + 마커 확인 외에는 전부 FAIL")이
+      그 줄까지 함께 지킨다. timeout 을 짧게 바꿔 검체를 넣고 싶어지면, 그 값이 실물 팩
+      스캔(③ 본 실행)에서도 짧아진다는 점을 먼저 따져라.
+    """
+    src_dir = tempfile.mkdtemp(prefix="import_guard_probe_selftest_")
+    # cwd 는 검체 폴더와 **다른** 중립 폴더여야 한다 — 같으면 `-c` 의 sys.path[0](=cwd)로
+    # 형제가 그냥 잡혀 가드 유무와 무관해진다. main() 의 ③ 호출과 같은 조건으로 맞춘다.
+    neutral = tempfile.mkdtemp(prefix="import_guard_probe_selftest_cwd_")
+    try:
+        with open(os.path.join(src_dir, "javis_sib.py"), "w") as fh:
+            fh.write("VALUE = 1\n")
+        sib = {"javis_sib"}
+        cases = [
+            ("p_zero_div.py", _G + "1 / 0\nimport javis_sib\n",
+             "rc=1", "모듈 레벨 크래시(ZeroDivisionError) → rc=1"),
+            ("p_sys_exit3.py", _G + "sys.exit(3)\nimport javis_sib\n",
+             "rc=3", "모듈 레벨 sys.exit(3) → rc=3"),
+            ("p_os_exit0.py", _G + "import javis_sib\nos._exit(0)\n",
+             "적재 보고 마커 부재", "마커 전 os._exit(0) → rc=0 이지만 마커 부재"),
+        ]
+        for fn, src, want, desc in cases:
+            path = os.path.join(src_dir, fn)
+            with open(path, "w") as fh:
+                fh.write(src)
+            ok, detail = runtime_probe(path, sib, neutral, sib)
+            check("④ ③프로브 fail-closed: %s" % desc,
+                  (not ok) and (want in detail), "want=%r got=%r" % (want, detail))
+    finally:
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(neutral, ignore_errors=True)
+
+
 def selftest():
     """검체를 임시 폴더에 심고 스캐너가 기대대로 판정하는지 확인한다."""
     _selftest_marker_parsing()
+    _selftest_probe_failclosed()
     tmp = tempfile.mkdtemp(prefix="import_guard_selftest_")
     try:
         with open(os.path.join(tmp, "javis_sib.py"), "w") as fh:

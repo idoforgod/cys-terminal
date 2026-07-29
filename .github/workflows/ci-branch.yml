@@ -215,15 +215,72 @@ jobs:
           #   `name` 은 GitHub Actions 에서 **필수가 아니고** 키 순서도 자유다 — 초안은 `- name:` 을
           #   스텝 머리로 가정해 `- shell: pwsh` 로 시작하는 스텝과 `- if: false` 가 첫 줄인 스텝을
           #   놓쳤다(리뷰어2 2차 실증: 두 경우 모두 게이트가 exit 0 으로 오탐).
-          def _step_ranges(lines):
-              """[(시작줄, 끝줄, 스텝머리 들여쓰기, 키 들여쓰기)] — `steps:` 아래 리스트 항목만."""
+          # ★2026-07-30 R2 보강 — **파서가 모르는 구조를 조용히 통과시키지 않는다**. 위 수리 뒤에도
+          #   4케이스 단위 실행(신구 대조)에서 두 구멍이 실측됐다:
+          #     G1 **잡 수준 `if:`** — 스텝이 무조건이어도 **잡 전체**가 꺼지면 스위트는 0회 실행된다.
+          #        스텝만 보던 판정은 이걸 조건 0건(초록)으로 통과시켰다. 이 게이트가 증명하려는
+          #        명제는 "그 스텝에 if 가 없다"가 아니라 "**그 스위트가 무조건 돈다**"이므로,
+          #        잡 수준 조건은 같은 명제를 무너뜨리는 동급 사건이다.
+          #     G2 **`-` 단독 머리**(키가 다음 줄 · 합법 YAML)와 첫 머리와 **들여쓰기가 다른** 리스트
+          #        항목 — 머리 정규식 `-(\s+)\S` 가 못 잡아 그 스텝이 **앞 스텝 범위로 병합**된다.
+          #        병합은 지금 우연히 과탐 쪽으로 틀렸을 뿐, 조건의 **귀속이 틀린** 것은 그대로다.
+          #        배치가 한 칸만 달라지면 반대 방향(미탐)으로 뒤집힌다.
+          #   처방은 이 파일의 다른 게이트들과 같은 교리다 — **판정 불가는 통과가 아니라 중단**
+          #   (`names()` 의 0건 추출 fail-closed 와 동형). 드리프트·계약 위반(exit 1)과 구분되게
+          #   **전용 종료코드 3**을 쓴다: 전자는 "워크플로를 고쳐라", 후자는 "**이 파서를 고쳐라**"라
+          #   수신자와 조치가 다르고, 섞이면 파서 파손이 워크플로 결함으로 오진된다.
+          EXIT_STRUCT = 3       # 워크플로 구조 판별 실패 (≠1 계약 위반 · ≠0 통과)
+
+          def _struct_fail(path, lineno, why):
+              print(f"::error::{path}:{lineno}: 스텝 구조를 판별할 수 없다 — {why}. 이 게이트는 "
+                    f"'필수 스위트가 무조건 실행되는가'를 텍스트로 증명하는데, 구조를 못 읽으면 그 "
+                    f"증명이 성립하지 않는다. 조용한 통과 대신 중단한다"
+                    f"(fail-closed · exit {EXIT_STRUCT} = 워크플로가 아니라 이 파서를 고치라는 신호).",
+                    file=sys.stderr)
+              sys.exit(EXIT_STRUCT)
+
+          def _job_conditions(lines, steps_line, base):
+              """`steps:` 를 품은 **잡 자체**의 `if:` 목록 (G1).
+
+              잡 머리 = `steps:` 보다 얕은 첫 윗줄. 잡 수준 키 = 그 아래에서 들여쓰기가 정확히
+              `base` 인 **비-리스트** 줄(더 깊은 건 중첩 키, `-` 로 시작하면 스텝 머리다).
+              """
+              head = head_ind = None
+              for k in range(steps_line - 1, -1, -1):
+                  s = lines[k]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  ind = len(s) - len(s.lstrip())
+                  if ind < base:
+                      head, head_ind = k, ind
+                      break
+              if head is None:
+                  return []
+              out = []
+              for k in range(head + 1, len(lines)):
+                  s = lines[k]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  ind = len(s) - len(s.lstrip())
+                  if ind <= head_ind:
+                      break                                  # 잡 종료
+                  if ind != base or s.lstrip().startswith("-"):
+                      continue
+                  m = re.match(r"^\s{%d}if:\s*(.+)$" % base, s)
+                  if m:
+                      out.append("잡 수준 " + m.group(1).strip())
+              return out
+
+          def _step_ranges(lines, path):
+              """[(시작줄, 끝줄, 스텝머리 들여쓰기, 키 들여쓰기, 잡수준조건)] — `steps:` 아래 리스트 항목만."""
               out, i, n = [], 0, len(lines)
               while i < n:
-                  m = re.match(r"^(\s*)steps:\s*$", lines[i])
+                  m = re.match(r"^(\s*)steps:\s*(#.*)?$", lines[i])
                   if not m:
                       i += 1
                       continue
                   base, j, step_indent, heads = len(m.group(1)), i + 1, None, []
+                  job_conds = _job_conditions(lines, i, base)
                   while j < n:
                       line = lines[j]
                       if line.strip() and not line.lstrip().startswith("#"):
@@ -237,23 +294,33 @@ jobs:
                                   step_indent = ind2
                               if ind2 == step_indent:
                                   heads.append((j, ind2 + 1 + len(hm.group(2))))
+                              elif ind2 < step_indent:
+                                  _struct_fail(path, j + 1, "리스트 항목의 들여쓰기가 첫 스텝 머리"
+                                               f"({step_indent}칸)보다 얕다({ind2}칸) — 어느 것이 "
+                                               "스텝 경계인지 정할 수 없다")
+                          elif re.match(r"^\s*-\s*$", line) and (step_indent is None
+                                                                 or ind <= step_indent):
+                              _struct_fail(path, j + 1, "`-` 단독 리스트 항목(키가 다음 줄) — "
+                                           "스텝 머리를 못 잡아 이 스텝이 앞 스텝 범위로 병합되고 "
+                                           "조건의 귀속이 틀어진다. 키를 `- ` 뒤 같은 줄에 두어라")
                       j += 1
                   for k, (h, key_indent) in enumerate(heads):
                       end = heads[k + 1][0] if k + 1 < len(heads) else j
-                      out.append((h, end, step_indent, key_indent))
+                      out.append((h, end, step_indent, key_indent, job_conds))
                   i = j
               return out
 
           def step_conditions(path, token):
               lines = open(path, encoding="utf-8").read().splitlines()
-              ranges = _step_ranges(lines)
+              ranges = _step_ranges(lines, path)
               found = []
               for i, raw in enumerate(lines):
                   if token not in re.sub(r"#.*$", "", raw):
                       continue
-                  for start, end, step_indent, key_indent in ranges:
+                  for start, end, step_indent, key_indent, job_conds in ranges:
                       if not (start <= i < end):
                           continue
+                      found.extend(job_conds)      # 잡이 꺼지면 스텝 조건이 무엇이든 안 돈다(G1)
                       for j in range(start, end):
                           # 머리 첫 줄의 `- if:` 와 본문의 `if:` 를 모두 본다(키 순서 자유)
                           m = re.match(r"^\s{%d}-\s+if:\s*(.+)$" % step_indent, lines[j]) or \
@@ -263,7 +330,8 @@ jobs:
                       break
                   else:
                       # 스텝 경계를 못 잡았다 = 파서가 이 파일 구조를 모른다 → 조용한 통과 금지
-                      found.append("<스텝 경계 판별 실패 — 파서가 이 워크플로 구조를 읽지 못한다>")
+                      _struct_fail(path, i + 1, f"'{token}' 이 등장하는 줄이 어느 스텝 범위에도 "
+                                   "속하지 않는다(`steps:` 블록 미인식 · 플로우 스타일 등)")
               return found
 
           # ── 부분 레인 계약 검사 (⊆ · ⊇ · 무조건 실행) ──
