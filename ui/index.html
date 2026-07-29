@@ -55,6 +55,7 @@
         <button class="cc-tab" data-view="board">스킬 보드</button>
         <button class="cc-tab" data-view="tasks">작업</button>
         <button class="cc-tab" data-view="feed">승인 Feed <span id="cc-feed-tabbadge" class="badge" hidden>0</span></button>
+        <button class="cc-tab" data-view="alarms">🔔 알람</button>
         <button class="cc-tab active" data-view="office">🏢 오피스</button>
       </div>
       <div id="cc-body">
@@ -145,6 +146,10 @@
         <div id="cc-view-feed" hidden>
           <div class="cc-board-note">노드·CSO·워커가 올린 승인 요청을 검토하고 Allow/Deny 합니다. 대기 건수는 상단 Control Center 버튼과 이 탭에 표시됩니다.</div>
           <div class="cc-section"><div class="cc-h">승인 Feed</div><div id="cc-feed-items"></div></div>
+        </div>
+        <div id="cc-view-alarms" hidden>
+          <div class="cc-board-note">화면에 떴던 알람 이력(최신순 · 이 세션에서 최대 200건). 모든 알람은 종류 불문 일정 시간이 지나면 화면에서 자동으로 사라지고, 내용은 여기에 남습니다.</div>
+          <div class="cc-section"><div class="cc-h">알람 이력</div><div id="cc-alarm-list"></div></div>
         </div>
         <div id="cc-view-office" hidden>
           <div id="cc-office-hint" class="cc-board-note" hidden>메타버스 오피스 브리지가 꺼져 있습니다 —

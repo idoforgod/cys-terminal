@@ -18,6 +18,15 @@ import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
+import {
+  toastTtl,
+  toastTimerPlan,
+  needsExpiryBanner,
+  expiryBannerText,
+  pushAlarm,
+  formatAlarmTime,
+  type AlarmRecord,
+} from "./toastttl";
 
 declare global {
   interface Window {
@@ -157,7 +166,10 @@ let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "office";
+type CcTab =
+  | "live" | "eff" | "skills" | "sessions" | "weekly" | "learn"
+  | "board" | "tasks" | "feed" | "alarms" | "office";
+let ccTab: CcTab = "office";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -446,7 +458,7 @@ async function refreshWeekly() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office") {
+function setCcTab(view: CcTab) {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
@@ -457,6 +469,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.getElementById("cc-view-board")!.hidden = view !== "board";
   document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
   document.getElementById("cc-view-feed")!.hidden = view !== "feed";
+  document.getElementById("cc-view-alarms")!.hidden = view !== "alarms";
   document.getElementById("cc-view-office")!.hidden = view !== "office";
   // 오피스 탭 전면 모드 — cc-body의 대시보드 폭 상한(780px)을 해제해 3D를 창 크기에 연동(cc-glance 패턴).
   document.body.classList.toggle("cc-office", view === "office");
@@ -475,6 +488,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   if (view === "board") refreshBoard();
   if (view === "tasks") refreshTasks();
   if (view === "feed") refreshFeed();
+  if (view === "alarms") renderAlarmHistory();
   if (view === "office") openOfficeView();
 }
 
@@ -4911,40 +4925,111 @@ async function purgeDept(ws: Workspace) {
 
 // ---------- toasts (daemon push events) ----------
 
+// ★T-0147-3(2026-07-30): 모든 토스트는 종류 불문 유한 수명을 갖는다(정책=toastttl.ts).
+// 소멸해도 내용은 알람 이력(alarmHistory → Control Center '알람' 탭)에 남으므로
+// main.ts:4878 주석의 실사고("실패를 인지 못함")는 이력 + 수동 × + 만료 배너로 대체 방어한다.
+let alarmHistory: AlarmRecord[] = [];
+
+function recordAlarm(category: string, name: string, detail: string, id?: string) {
+  alarmHistory = pushAlarm(alarmHistory, { ts: Date.now(), category, name, detail, id });
+  if (ccOpen && ccTab === "alarms") renderAlarmHistory();
+}
+
+// 우상단 × — 자동 소멸을 기다리지 않고 즉시 치울 수 있는 수동 경로(sticky는 id로 정리).
+function addToastCloseButton(el: HTMLElement, id?: string) {
+  const x = document.createElement("button");
+  x.className = "toast-x";
+  x.type = "button";
+  x.title = "닫기";
+  x.textContent = "×";
+  x.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (id) dismissToast(id);
+    else el.remove();
+  });
+  el.appendChild(x);
+}
+
 function toast(category: string, name: string, detail: string) {
+  recordAlarm(category, name, detail);
   const box = document.getElementById("toasts")!;
   const el = document.createElement("div");
   el.className = `toast ${category}`;
   el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
+  addToastCloseButton(el);
   box.appendChild(el);
-  setTimeout(() => el.remove(), 8000);
+  setTimeout(() => el.remove(), toastTtl("volatile").ttlMs);
 }
 
-// 지속형(sticky) 토스트 — 8초 auto-dismiss 없이 id로 갱신/제거한다. 다운로드처럼
-// 8초를 넘기는 진행 이벤트는 완료·실패 때 명시적으로 dismissToast로 내려야 한다.
-const stickyToasts = new Map<string, HTMLElement>();
+// 지속형(sticky) 토스트 — id로 갱신/제거하고, 갱신마다 TTL 타이머가 리셋된다(debounce).
+// 완료·실패 때 dismissToast로 내리는 기존 계약은 그대로 유지되고, 페어가 유실돼도
+// TTL이 최후 방어선으로 화면을 정리한다(구 구현은 타이머가 없어 영구 잔존했다).
+const stickyToasts = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
 
 function stickyToast(id: string, category: string, name: string, detail: string) {
+  recordAlarm(category, name, detail, id);
   const box = document.getElementById("toasts")!;
-  let el = stickyToasts.get(id);
+  const prev = stickyToasts.get(id);
+  const plan = toastTimerPlan("sticky", id, !!prev);
+  if (prev && plan.clearPrevious) clearTimeout(prev.timer);
+  let el = prev?.el;
   if (!el) {
     el = document.createElement("div");
     el.className = `toast ${category}`;
     el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
+    addToastCloseButton(el, id);
     box.appendChild(el);
-    stickyToasts.set(id, el);
   }
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
+  const timer = setTimeout(() => {
+    dismissToast(id);
+    // 고위험 실패(purge-fail-* 등)는 조용히 사라지지 않는다 — OS 배너로 1회 보강(D2b 계승).
+    if (needsExpiryBanner(id)) {
+      const b = expiryBannerText(name, detail);
+      osBanner(b.title, b.body);
+    }
+  }, plan.ttlMs);
+  stickyToasts.set(id, { el, timer });
 }
 
 function dismissToast(id: string) {
-  const el = stickyToasts.get(id);
-  if (el) {
-    el.remove();
+  const t = stickyToasts.get(id);
+  if (t) {
+    clearTimeout(t.timer); // 타이머 짝 해제 — 없으면 재사용 id에서 유령 만료가 남는다
+    t.el.remove();
     stickyToasts.delete(id);
+  }
+}
+
+// 알람 이력 탭 — 소멸한 토스트를 세션 내에서 다시 볼 수 있는 수용처(최신순).
+function renderAlarmHistory() {
+  const box = document.getElementById("cc-alarm-list");
+  if (!box) return;
+  box.textContent = "";
+  if (alarmHistory.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "cc-board-note";
+    empty.textContent = "표시된 알람이 없습니다.";
+    box.appendChild(empty);
+    return;
+  }
+  for (const a of alarmHistory) {
+    const row = document.createElement("div");
+    row.className = `alarm-item ${a.category}`;
+    const meta = document.createElement("div");
+    meta.className = "al-meta";
+    meta.textContent = `${formatAlarmTime(a.ts)} · ${a.category}${a.id ? ` · ${a.id}` : ""}`;
+    const title = document.createElement("div");
+    title.className = "al-title";
+    title.textContent = a.name;
+    const body = document.createElement("div");
+    body.className = "al-body";
+    body.textContent = a.detail;
+    row.append(meta, title, body);
+    box.appendChild(row);
   }
 }
 
