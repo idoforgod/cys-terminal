@@ -53,7 +53,12 @@ jobs:
           curl -fL -o py.zip "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
           7z x py.zip -o"$RT/python" -y >/dev/null
           cp "$RT/python/python.exe" "$RT/python/python3.exe"
-          # embeddable ._pth: 스크립트 dir(.) + site 활성화(형제 import·표준 경로 계산 존중).
+          # embeddable ._pth: 아래 3줄이 sys.path 를 확정한다(표준 경로 계산 우회).
+          # ⚠`.` 은 **이 ._pth 파일이 있는 디렉터리(= 번들 python 루트)** 를 뜻한다 — 스크립트 폴더가 아니다.
+          #   따라서 팩 bin/ 형제 모듈 import 는 이 줄로 해결되지 않는다(2026-07-29 Windows 실측:
+          #   `ModuleNotFoundError: No module named 'javis_scrub'`). 해결 주체는 각 스크립트의 sys.path
+          #   가드다(cysjavis-pack/bin/*.py · 회귀 잠금 tests/test_import_guard.py).
+          # ★내용 3줄 동결 — `import site` 를 빼면 pip·site-packages 가 죽어 앱 내 CLI 설치가 붕괴한다.
           printf 'python312.zip\n.\nimport site\n' > "$RT/python/python312._pth"
           # ── pip 부트스트랩 (embeddable은 pip 미포함 → 'No module named pip' 방지) ──
           echo "== get-pip (embeddable python pip 부트스트랩) =="
@@ -402,4 +407,75 @@ jobs:
           Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan·★KeepAlive respawn·★⑧실경로 auto-restore[주입 없이 cysd 자체 decide_auto_restore]·★⑨Job Object 자식트리 동반사망[D3 P2-9])"
           # ★Actions pwsh 래퍼는 스크립트 말미에 exit $LASTEXITCODE 를 붙인다 — 위 방어적 uninstall(스모크 finally 가
           #   이미 제거해 rc=1)이 그 값을 오염시켜 '스모크 성공인데 스텝 exit 1'(run 28738140283 실증). 판정은 $code 로 끝 — 명시 exit 0.
+          exit 0
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T6 형제 import 가드 회귀 (D1) — ★**이 레인에서만 진짜 조건으로 돈다**.
+      # 배경: 2026-07-29 Windows 0.14.4 에서 `javis_event.py: No module named 'javis_scrub'` 실측.
+      #   원인은 동봉 embeddable 파이썬(`python312._pth`)이 표준 경로 계산을 우회해 **스크립트 폴더를
+      #   sys.path 에 넣지 않는** 것이고, 훅은 fail-open(exit 0)이라 이 실패가 증상 없이 산다.
+      # 왜 여기여야 하나(리뷰어1 R2): 이 회귀 스위트는 ci-branch/release/pack-release 3레인에 등재돼
+      #   있지만 전부 macOS/ubuntu 잡이라 **문제의 런타임에서는 0회 실행**된다. 그 레인의 ③ 은
+      #   runpy 로 조건을 *모사*할 뿐이다. 여기서는 실제로 배송되는 그 인터프리터가 그 파일들을 돈다.
+      # 판정 계약: 스위트 자신이 exit 0/1 을 낸다(0=전건 PASS). 실패 시 throw = 게이트.
+      # ─────────────────────────────────────────────────────────────────────────
+      # ⚠스텝 제목·주석에 스위트 파일명을 적지 마라 — 레인 대조 게이트는 주석을 지우고 이름을 긁으므로,
+      #   제목에 남은 이름이 **실행 줄이 사라져도 초록을 유지시키는 유령 근거**가 된다(실측으로 확인).
+      #   이 레인이 그 스위트를 돈다는 증거는 아래 `$suite` 경로 한 곳뿐이어야 한다.
+      - name: T6 형제 import 가드 회귀 (동봉 embeddable python 실런타임)
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T6: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $py  = Join-Path $dir 'runtime\python\python3.exe'
+          $pth = Join-Path $dir 'runtime\python\python312._pth'
+          if (-not (Test-Path $py))  { throw "T6: 동봉 python3.exe 미발견: $py" }
+          # ★전제 확인: `._pth` 가 없으면 이 런타임은 embeddable 이 아니고, 그러면 이 스텝의 초록은
+          #   '문제 조건에서 통과했다'는 증거가 되지 못한다(fail-closed).
+          if (-not (Test-Path $pth)) { throw "T6: python312._pth 미발견 — embeddable 전제 붕괴: $pth" }
+          Write-Host "py=$py"; Write-Host "pth=$pth"; Get-Content $pth
+
+          # ── 음성 대조: 이 런타임이 정말 '스크립트 폴더를 sys.path 에 넣지 않는다'를 먼저 증명한다.
+          #    ★판정은 **전용 종료코드**로 한다(리뷰어2 REVISE/MAJOR). 단순히 "exit≠0 이면 정상"으로
+          #      보면 경로 오타·DLL 부재·인자 오류처럼 **형제 모듈과 무관한 실패까지 정상**으로 읽혀
+          #      음성 대조가 무력화된다. 실패의 **이유**까지 프로브 안에서 확정한다:
+          #        0  = 형제 import 성공 → 결함 전제 붕괴(throw)
+          #        42 = probe_sib 를 못 찾음 → 기대한 그 조건(정상)
+          #        그 외 = 프로브 자체가 깨짐(throw) — 조용한 통과 금지
+          #    ⚠stderr 를 변수로 캡처하지 마라($ErrorActionPreference='Stop' + 2>&1 은 네이티브
+          #      명령에서 NativeCommandError 를 던진다). 종료코드만 본다 — 그래서 파싱도 불필요하다.
+          $probe = Join-Path $env:RUNNER_TEMP 'guard_probe'
+          Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $probe | Out-Null
+          Set-Content -Path (Join-Path $probe 'probe_sib.py') -Encoding utf8 -Value 'VALUE = 1'
+          Set-Content -Path (Join-Path $probe 'probe_main.py') -Encoding utf8 -Value @(
+            "import sys",
+            "try:",
+            "    import probe_sib",
+            "except ModuleNotFoundError as e:",
+            "    sys.exit(42 if getattr(e, 'name', '') == 'probe_sib' else 43)",
+            "sys.exit(0)"
+          )
+          & $py (Join-Path $probe 'probe_main.py')
+          $probeCode = $LASTEXITCODE
+          Write-Host "음성 대조 exit=$probeCode (42 여야 정상 — probe_sib 를 못 찾아야 한다)"
+          if ($probeCode -eq 0) {
+            throw "T6 전제 붕괴: 동봉 런타임이 스크립트 폴더를 sys.path 에 넣었다 — 가드의 근거였던 조건이 사라졌다. ._pth 변경 여부를 확인하고 기획서(docs/plans/2026-07-29-win-two-defects-plan.md)를 갱신하라."
+          }
+          if ($probeCode -ne 42) {
+            throw "T6 음성 대조 자체가 깨졌다 (exit=$probeCode) — 형제 모듈 부재가 아닌 다른 이유로 실패했다. 이 상태의 초록은 증거가 아니므로 중단한다(fail-closed)."
+          }
+
+          # ── 본 검증: 회귀 스위트를 그 인터프리터로 그대로 실행 ──
+          $suite = Join-Path (Get-Location) 'cysjavis-pack\bin\tests\test_import_guard.py'
+          if (-not (Test-Path $suite)) { throw "T6: 스위트 미발견(checkout 경로): $suite" }
+          & $py $suite
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "T6: 형제 import 가드 회귀 실패 (exit=$code) — 배송 런타임에서 팩 스크립트의 형제 import 가 깨진다" }
+          Write-Host "OK: T6 형제 import 가드 회귀 통과 (동봉 embeddable python312._pth 실런타임 · 음성 대조 확인)"
           exit 0

@@ -58,13 +58,19 @@ jobs:
       #      ci-branch.yml 의 '코드'이기도 해서, 제외하지 않으면 게이트가 **자기 allowlist 를 읽고**
       #      그 이름을 "ci-branch 에 있음"으로 오판한다(실측 — 초안이 이 함정에 그대로 빠졌다).
       #      대가: 이 스텝 안에서만 언급되는 스위트는 어느 집합에도 안 잡힌다(의도된 맞교환).
-      #   6) **레인 목록은 아래 LANES 에 하드코딩된 3종이 전부다**(W19 추가). 팩 테스트를 돌리는
-      #      네 번째 워크플로우가 생겨도 LANES 에 등재하기 전까지 그 레인은 대조 밖에 있다 —
+      #   6) **완전 레인 목록은 아래 LANES 에 하드코딩된 3종이 전부다**(W19 추가). 팩 테스트를 돌리는
+      #      네 번째 워크플로우가 생겨도 등재하기 전까지 그 레인은 대조 밖에 있다 —
       #      이번 결함(pack-release.yml 미편입)의 재발 경로가 정확히 이것이다. 새 워크플로우가
       #      `cysjavis-pack/bin/tests/` 를 실행하기 시작하면 **여기 먼저 등재하라**.
+      #      ★2026-07-29 리뷰어1 R2 반영: windows-build.yml 이 정확히 그 사각이었다(팩 스위트를
+      #      돌리는데 LANES 밖). 다만 그 레인은 **전 스위트를 돌리는 레인이 아니라** 동봉
+      #      embeddable 런타임 전용 부분 레인이라, 동급 LANES 에 넣으면 나머지 스위트가 전부
+      #      비대칭으로 잡혀 ALLOWED 가 근거 없는 목록으로 썩는다. 그래서 아래 SUBSET_LANES 라는
+      #      **방향성 있는 약한 계약**으로 편입한다(⊆ 검사 + 필수 보유 검사). 완전 레인이 아닌
+      #      워크플로우는 앞으로도 이쪽에 등재하라.
       #   요약: 이건 **복제된 목록의 드리프트 조기 경보**이지 커버리지 증명이 아니다.
       # LANE-GATE-SELF-BEGIN
-      - name: 팩 스위트 레인 대조 (ci-branch ⇔ release ⇔ pack-release 목록 드리프트 차단)
+      - name: 팩 스위트 레인 대조 (ci-branch ⇔ release ⇔ pack-release 드리프트 차단 + windows-build 부분 레인 계약)
         shell: bash
         run: |
           set -euo pipefail
@@ -76,6 +82,21 @@ jobs:
               "ci-branch":    ".github/workflows/ci-branch.yml",
               "release":      ".github/workflows/release.yml",
               "pack-release": ".github/workflows/pack-release.yml",
+          }
+
+          # 부분 레인 — 팩 스위트를 **일부만** 돌리는 워크플로우. 완전 레인과 목록을 맞출 의무는
+          # 없지만 대조 밖에 두지도 않는다. 계약 두 줄:
+          #   ⊆ : 여기서 돌리는 스위트는 완전 레인에도 있어야 한다(여기서만 도는 고아 스위트 차단).
+          #   ⊇ : REQUIRED 는 반드시 보유해야 한다(그 레인에서만 성립하는 검증의 조용한 제거 차단).
+          # 값 = (경로, 반드시 보유해야 할 스위트 집합, 그 레인이 유일하게 증명하는 것).
+          SUBSET_LANES = {
+              "windows-build": (
+                  ".github/workflows/windows-build.yml",
+                  {"test_import_guard"},
+                  "동봉 embeddable 파이썬(python312._pth)에서의 실행. 3완전 레인은 전부 "
+                  "macOS/ubuntu 잡이라 D1(형제 import 실패)의 **실제 런타임에서는 0회 실행**된다 — "
+                  "그 레인의 재현은 runpy 모사다. 여기서 빠지면 D1 회귀는 다시 무증상으로 산다.",
+              ),
           }
 
           # 레인별 "빠지면 무엇이 거짓말이 되는가" — 에러 메시지에 붙여 편입 방향을 지시한다.
@@ -186,6 +207,89 @@ jobs:
                   continue
               drift.append((n, here))
 
+          # 이름이 등장하는 **스텝 자체가 조건부인지** 본다. 이 게이트는 텍스트만 읽으므로
+          # `if: false` 로 스텝을 죽여도 이름은 그대로 남아 초록을 유지한다(리뷰어2 실증).
+          # 필수 스위트는 무조건 실행돼야 하므로, 그 스텝에 step-level `if:` 가 있으면 실패시킨다.
+          #
+          # ★스텝 경계는 `- name:` 이 아니라 **`steps:` 블록의 리스트 항목**으로 잡는다.
+          #   `name` 은 GitHub Actions 에서 **필수가 아니고** 키 순서도 자유다 — 초안은 `- name:` 을
+          #   스텝 머리로 가정해 `- shell: pwsh` 로 시작하는 스텝과 `- if: false` 가 첫 줄인 스텝을
+          #   놓쳤다(리뷰어2 2차 실증: 두 경우 모두 게이트가 exit 0 으로 오탐).
+          def _step_ranges(lines):
+              """[(시작줄, 끝줄, 스텝머리 들여쓰기, 키 들여쓰기)] — `steps:` 아래 리스트 항목만."""
+              out, i, n = [], 0, len(lines)
+              while i < n:
+                  m = re.match(r"^(\s*)steps:\s*$", lines[i])
+                  if not m:
+                      i += 1
+                      continue
+                  base, j, step_indent, heads = len(m.group(1)), i + 1, None, []
+                  while j < n:
+                      line = lines[j]
+                      if line.strip() and not line.lstrip().startswith("#"):
+                          ind = len(line) - len(line.lstrip())
+                          if ind <= base and not line.lstrip().startswith("-"):
+                              break                      # steps: 블록 종료
+                          hm = re.match(r"^(\s*)-(\s+)\S", line)
+                          if hm:
+                              ind2 = len(hm.group(1))
+                              if step_indent is None:
+                                  step_indent = ind2
+                              if ind2 == step_indent:
+                                  heads.append((j, ind2 + 1 + len(hm.group(2))))
+                      j += 1
+                  for k, (h, key_indent) in enumerate(heads):
+                      end = heads[k + 1][0] if k + 1 < len(heads) else j
+                      out.append((h, end, step_indent, key_indent))
+                  i = j
+              return out
+
+          def step_conditions(path, token):
+              lines = open(path, encoding="utf-8").read().splitlines()
+              ranges = _step_ranges(lines)
+              found = []
+              for i, raw in enumerate(lines):
+                  if token not in re.sub(r"#.*$", "", raw):
+                      continue
+                  for start, end, step_indent, key_indent in ranges:
+                      if not (start <= i < end):
+                          continue
+                      for j in range(start, end):
+                          # 머리 첫 줄의 `- if:` 와 본문의 `if:` 를 모두 본다(키 순서 자유)
+                          m = re.match(r"^\s{%d}-\s+if:\s*(.+)$" % step_indent, lines[j]) or \
+                              re.match(r"^\s{%d}if:\s*(.+)$" % key_indent, lines[j])
+                          if m:
+                              found.append(m.group(1).strip())
+                      break
+                  else:
+                      # 스텝 경계를 못 잡았다 = 파서가 이 파일 구조를 모른다 → 조용한 통과 금지
+                      found.append("<스텝 경계 판별 실패 — 파서가 이 워크플로 구조를 읽지 못한다>")
+              return found
+
+          # ── 부분 레인 계약 검사 (⊆ · ⊇ · 무조건 실행) ──
+          sub_err = []
+          for lane, (path, required, why) in SUBSET_LANES.items():
+              have = names(path)          # names() 는 0건 추출 시 자체적으로 fail-closed 한다
+              for n in sorted(required - have):
+                  sub_err.append(f"{lane}: 필수 스위트 '{n}' 이 {path} 에서 사라졌다 — {why}")
+              for n in sorted(required & have):
+                  for cond in step_conditions(path, n):
+                      sub_err.append(f"{lane}: 필수 스위트 '{n}' 의 스텝이 조건부다(`if: {cond}`) — "
+                                     f"이 게이트는 텍스트만 읽어 스텝이 실제로 도는지 모른다. "
+                                     f"조건을 걷어내 무조건 실행되게 하거나, SUBSET_LANES 의 계약을 "
+                                     f"바꿔라(그 경우 {why} 가 더 이상 보장되지 않는다는 뜻이다)")
+              for n in sorted(have - union):
+                  sub_err.append(f"{lane}: '{n}' 이 이 부분 레인에만 있다 — 완전 레인 "
+                                 f"({', '.join(sorted(ALL))}) 에도 편입하거나, 여기서 빼라. "
+                                 f"한 레인에서만 도는 스위트는 나머지 레인의 초록을 거짓으로 만든다")
+              print(f"[부분 레인] {lane}={len(have)}종 · 필수 보유 {len(required & have)}/{len(required)}")
+
+          if sub_err:
+              print("::error::부분 레인 계약 위반 — 레인 대조 밖으로 새는 스위트가 있다.", file=sys.stderr)
+              for m in sub_err:
+                  print(f"::error::  {m}", file=sys.stderr)
+              sys.exit(1)
+
           if drift or stale:
               print("::error::팩 테스트 스위트가 레인 사이에서 갈렸다 — 어느 한 레인의 초록이 "
                     "거짓 신호가 된다.", file=sys.stderr)
@@ -202,7 +306,7 @@ jobs:
                     "등재하라('팩 레인이라 생략'은 이유가 아니다).", file=sys.stderr)
               sys.exit(1)
 
-          print("[레인 대조] 비대칭 0 — 3레인의 팩 스위트 목록 일치(허용 항목 제외)")
+          print("[레인 대조] 비대칭 0 — 3완전 레인 목록 일치(허용 항목 제외) · 부분 레인 계약 충족")
           PY
       # LANE-GATE-SELF-END
 
@@ -296,7 +400,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp; do
+          for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
+                   test_import_guard; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="

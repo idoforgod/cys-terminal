@@ -281,7 +281,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 버전 문자열 4곳(+wxs 2곳) 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
       (**Cargo.lock 2패키지 포함 8곳**. 범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
-- [ ] **★메인 페이지(`/`) 원격 검증 — 4항목 전부 (S28 · 자동화 밖의 수동 게이트)**
+- [ ] **★메인 페이지(`/`) 원격 검증 — 6항목 전부 (S28 + 2026-07-29 오너 지시 ⓐⓑⓒ · 자동화 밖의 수동 게이트)**
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기
       (`release-assemble.py`)가 `/downloads/` 만 보고 메인 페이지는 아예 보지 않는다"였다.
@@ -326,7 +326,33 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             **4개 URL 이 나와야 하고 전부 200** 이어야 한다. 개수가 4 미만이면 밴드에 링크가
             빠진 것이고, 200 이 아니면 자산 경로가 어긋난 것이다.
 
-      ⚠이 4항목을 `verify-release-remote.sh` 에 넣지 않는 이유: 홈페이지는 **이 리포 밖**이라
+      - [ ] ⑤ **Windows Defender/SmartScreen 안내 섹션 잔존** (2026-07-29 오너 지시 ⓐ·ⓒ)
+            버전 범프 일괄 치환이 밴드 카피를 통째로 갈아끼우면 이 안내가 **조용히 사라진다**.
+            사라지면 Windows 사용자가 SmartScreen 경고에서 그냥 이탈한다(설치 실패로 나타나지 않고
+            **다운로드 후 침묵**으로 나타나므로 아무도 신고하지 않는다 — §2.6 관측 침묵과 같은 구조).
+            ```sh
+            curl -s https://www.cysinsight.com/ \
+              | grep -ciE 'smartscreen|defender|추가 정보|알 수 없는 게시자'
+            ```
+            **1 이상**이어야 한다. 0 이면 안내가 사라진 것 — 밴드 카피를 복원할 때까지 **미완**이다.
+
+      - [ ] ⑥ **SHA256SUMS 신버전 전체 갱신 · 누락 0** (2026-07-29 오너 지시 ⓑ)
+            `SHA256SUMS` 는 릴리스 CI 의 `pack-artifacts` 잡이 **4종이 모두 올라온 뒤** 생성해
+            릴리스에 올린다(누락 1건이라도 있으면 잡이 fail-closed 로 중단된다). 홈페이지 쪽에도
+            같은 파일이 올라가야 하고, **구버전 줄이 섞여 있으면 안 된다**:
+            ```sh
+            V=X.Y.Z; B=https://www.cysinsight.com/downloads
+            curl -s "$B/SHA256SUMS" | tee /tmp/sums.txt
+            test "$(grep -c "cys_${V}_" /tmp/sums.txt)" -eq 4   # 신버전 4줄
+            test "$(grep -vc "cys_${V}_" /tmp/sums.txt)" -eq 0  # 구버전 줄 0
+            # 실자산과 대조(다운로드 후 검증) — 표기만 갱신되고 바이트가 구버전인 사고 차단
+            cd "$(mktemp -d)" && for f in "cys_${V}_aarch64.dmg" "cys_${V}_x64.dmg" \
+                 "cys_${V}_x64-setup.exe" "cys_${V}_x64-setup.zip"; do curl -sO "$B/$f"; done
+            curl -sO "$B/SHA256SUMS" && shasum -a 256 -c SHA256SUMS
+            ```
+            **4줄 전건 OK** 여야 한다. 1건이라도 FAILED 면 미완이다.
+
+      ⚠이 6항목을 `verify-release-remote.sh` 에 넣지 않는 이유: 홈페이지는 **이 리포 밖**이라
       스크립트가 그 SOT(밴드 구조·용량 표기 규약)를 알지 못한다. 자동화하려면 홈페이지 리포에
       게이트를 두는 것이 옳다 — 여기서는 문서 게이트로 고정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
