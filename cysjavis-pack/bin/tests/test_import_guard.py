@@ -608,7 +608,13 @@ _PROBE_CODE = (
     "sys.stdout.write('\\nGUARDPROBE_LOADED=' + ','.join(w for w in want if w in sys.modules) + '\\n')\n"
 )
 _MNF = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
-_LOADED = re.compile(r"^GUARDPROBE_LOADED=(.*)$", re.M)
+# ★`(.*)$` 는 re.M 에서 `\n` 앞까지만 먹으므로 Windows 의 `\r` 가 **캡처에 남는다**.
+#   그래서 `'javis_scrub\r' != 'javis_scrub'` 로 어긋나 T6 가 8/8 거짓 실패했다(2026-07-29 실측).
+#   패턴에서 `\r` 를 명시적으로 배제하고, 파싱 후에도 각 항목을 strip 한다(이중 방어).
+# ★줄 앵커(`^`+re.M)를 쓰지 않는다. `^` 는 `\n` 뒤에서만 성립해 CR 계열을 놓치고,
+#   `(.*)$` 는 Windows 의 `\r` 를 **캡처에 남긴다**(2026-07-29 실측: T6 가 8/8 거짓 실패).
+#   줄바꿈 관례에 무관하게 마커 뒤 비-줄바꿈 문자만 먹는다.
+_LOADED = re.compile(r"GUARDPROBE_LOADED=([^\r\n]*)")
 
 
 def runtime_probe(path, siblings, neutral_cwd, expect=()):
@@ -648,10 +654,11 @@ def runtime_probe(path, siblings, neutral_cwd, expect=()):
     # rc=0 이어도 **실제 적재**를 확인한다
     if expect:
         out = r.stdout.decode("utf-8", "replace")
-        m = _LOADED.search(out)
-        if not m:
+        hits = _LOADED.findall(out)      # 대상 스크립트 출력에 섞여도 **마지막**이 우리 것
+        m = hits[-1] if hits else None
+        if m is None:
             return False, "적재 보고 마커 부재 — 프로브가 끝까지 실행되지 않았다(판정 불가·fail-closed)"
-        loaded = {x for x in m.group(1).split(",") if x}
+        loaded = {x.strip() for x in m.split(",") if x.strip()}
         missing = [e for e in expect if e not in loaded]
         if missing:
             return False, ("rc=0 이지만 형제 %s 가 실제로 적재되지 않았다 — 예외를 삼켰을 뿐 "
@@ -844,8 +851,25 @@ _SPECIMENS = [
 ]
 
 
+def _selftest_marker_parsing():
+    """③ 프로브의 적재 보고 마커 파싱이 **줄바꿈 관례에 무관**한지 잠근다.
+
+    ★2026-07-29 실측 회귀: `(.*)$` 가 Windows 의 `\r` 를 캡처에 남겨 T6 가 8/8 **거짓 실패**했다.
+      mac 에서는 절대 재현되지 않는다(LF 뿐) — 그래서 여기서 문자열로 박제한다.
+    """
+    for label, blob in (("LF", "x\nGUARDPROBE_LOADED=a,b\n"),
+                        ("CRLF", "x\r\nGUARDPROBE_LOADED=a,b\r\n"),
+                        ("CR 단독", "x\rGUARDPROBE_LOADED=a,b\r"),
+                        ("빈 목록", "GUARDPROBE_LOADED=\r\n")):
+        hits = _LOADED.findall(blob)
+        got = {x.strip() for x in hits[-1].split(",") if x.strip()} if hits else None
+        want = set() if "=" in blob and blob.split("=", 1)[1].strip() == "" else {"a", "b"}
+        check("④ 마커 파싱 %s" % label, got == want, "got=%s want=%s" % (got, want))
+
+
 def selftest():
     """검체를 임시 폴더에 심고 스캐너가 기대대로 판정하는지 확인한다."""
+    _selftest_marker_parsing()
     tmp = tempfile.mkdtemp(prefix="import_guard_selftest_")
     try:
         with open(os.path.join(tmp, "javis_sib.py"), "w") as fh:
