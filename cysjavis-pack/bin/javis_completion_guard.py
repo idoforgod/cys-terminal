@@ -37,8 +37,14 @@ D2·D3·D5·D20·D27. 래퍼 = hooks/completion-guard.sh(14줄·무수정) — s
         `['context_unmeasured']` **단독**일 때만 NO_BLOCK_PASS 모드로 verify 진행,
         `measure_error:*` 포함(ps/load 실측 실패) 등 그 외 전부 skip_soft(SKIPPED_RESOURCE)
         — trips 공집합 판별은 자원 측정 실패를 조용히 통과시키는 오판 경로라 폐기.
-      5 verifier tax: `_round/verify-budget/` 부재 = 무제한 통과(B2 배포 전 호환). 존재 시
-        per-surface 샤드 합산·고정창 1h·소진 → SKIPPED_BUDGET(deferred 마킹·카운터 동결).
+      5 verifier tax(B2 §3 실구현): `_round/verify-budget/` 부재 = 무제한 통과(배포 전 호환).
+        존재 시 per-surface 샤드(자기 샤드만 기록) 합산 = 총량 검사·고정창 1h(창 키=샤드
+        window_start)·소진 → SKIPPED_BUDGET(deferred 마킹·카운터 동결) + **resource.hard
+        플릿 단일 발행**(조건 04② — 워커별 발화 금지: 멱등 마커 `.hard-emitted-<창키>`
+        O_EXCL 원자 생성 승자만 emit·창당 at-most-once(G7c — 승자 사망 시 그 창 무발화
+        수용)·블로킹 대기 없음(조건 25①)).
+        예산 한도 = 기본(60회/300초) < policy.json(플릿 배포값) < env
+        JAVIS_VERIFY_BUDGET_RUNS/SECS(pane 실험 오버라이드 — 최우선).
       6 verify_spec 부재 → SKIPPED_NO_SPEC(워커 측 fail-closed 금지 · 조건 18②).
   · verify 실행 = setsid 프로세스 그룹 + 종료 시 killpg(손자 잔존 차단 · 조건 07③) ·
     잔존 감지 시 tamper-adjacent 이벤트 1회. 타임아웃(spec timeout_s·상한 30s)=INFRA_ERROR
@@ -94,6 +100,8 @@ env 노브(테스트 주입 포함):
   CYS_GUARD_LIVENESS=alive|dead claim pid 생존 결정론 주입(javis_task LIVENESS 관례)
   CYS_GUARD_RESOURCE_ARGS       resource_gate 추가 인자(테스트 override 주입용 공백 구분)
   CYS_BIN                       cys 바이너리(기본 cys — 테스트는 PATH shim)
+  JAVIS_VERIFY_BUDGET_RUNS      B2: verifier tax 창당 실행 상한(기본 60 — policy.json 보다 우선)
+  JAVIS_VERIFY_BUDGET_SECS      B2: verifier tax 창당 벽시계 상한 초(기본 300 — 동일 우선순위)
 """
 import contextlib
 import hashlib
@@ -470,28 +478,58 @@ def _resource_gate(ctx_pct):
     return "infra", "resource_gate 미지 exit %d" % rc, None
 
 
-# ── verifier tax 샤드(§2-2 5단 — B2 §3 선정합·부재=무제한) ───────────────────
+# ── verifier tax 샤드(§2-2 5단 — B2 §3 실구현·부재=무제한) ───────────────────
 def _budget_window():
     return int(time.time() // BUDGET_WINDOW_SEC) * BUDGET_WINDOW_SEC
 
 
-def _budget_check():
-    """(exhausted:bool, detail). 디렉터리 부재 = (False, 'absent') — B2 배포 전 호환."""
-    if not os.path.isdir(BUDGET_DIR):
-        return False, "absent"
+def _budget_limits():
+    """유효 예산 한도 (max_runs, max_secs) — 우선순위: 기본(60회/300초) < policy.json(플릿
+    배포값) < env JAVIS_VERIFY_BUDGET_RUNS/SECS(pane 실험 오버라이드 — 최우선·카나리아용).
+    ★조정 명문(B2 §3 — 근거 자인): 초기값 총 60회/300초·고정창 1h 는 **카나리아 실측 전
+    보수 추정**이다(실측 근거 없음). OT-2 카나리아에서 창당 실 verify 소비를 실측한 뒤
+    policy.json(플릿)·env(개별 pane) 로 조정하라 — 코드 상수 재조정은 측정 근거 병기 없이
+    금지. 비수치 값은 해당 층만 무시(폴백 유지)."""
+    # G7b: 한도 ≤0 은 해당 층 무시 폴백 — '비수치 무시'와 동형(0/음수 한도는 상시 소진 =
+    # 전 함대 verify 정지 footgun — 오타·오배포 방어).
     max_runs, max_secs = BUDGET_MAX_RUNS_DEFAULT, BUDGET_MAX_SECS_DEFAULT
     pol, _e = _read_json(os.path.join(BUDGET_DIR, "policy.json"))
     if pol:
         with contextlib.suppress(TypeError, ValueError):
-            max_runs = int(pol.get("max_runs", max_runs))
+            v = int(pol.get("max_runs", max_runs))
+            if v > 0:
+                max_runs = v
         with contextlib.suppress(TypeError, ValueError):
-            max_secs = float(pol.get("max_secs", max_secs))
+            v = float(pol.get("max_secs", max_secs))
+            if v > 0:
+                max_secs = v
+    raw = os.environ.get("JAVIS_VERIFY_BUDGET_RUNS", "").strip()
+    if raw:
+        with contextlib.suppress(ValueError):
+            v = int(raw)
+            if v > 0:
+                max_runs = v
+    raw = os.environ.get("JAVIS_VERIFY_BUDGET_SECS", "").strip()
+    if raw:
+        with contextlib.suppress(ValueError):
+            v = float(raw)
+            if v > 0:
+                max_secs = v
+    return max_runs, max_secs
+
+
+def _budget_check():
+    """(exhausted:bool, detail, stats:dict|None). 디렉터리 부재 = (False,'absent',None) —
+    배포 전 호환. 판독 = 전 샤드 합산(자기 샤드만 기록·판독은 전체 — 총량 검사·R1)."""
+    if not os.path.isdir(BUDGET_DIR):
+        return False, "absent", None
+    max_runs, max_secs = _budget_limits()
     win = _budget_window()
     runs, secs = 0, 0.0
     try:
         names = os.listdir(BUDGET_DIR)
     except OSError:
-        return False, "unreadable"
+        return False, "unreadable", None
     for name in names:
         if not name.endswith(".json") or name == "policy.json":
             continue
@@ -501,9 +539,49 @@ def _budget_check():
                 runs += int(shard.get("runs", 0))
             with contextlib.suppress(TypeError, ValueError):
                 secs += float(shard.get("secs", 0.0))
+    stats = {"runs": runs, "secs": secs, "max_runs": max_runs, "max_secs": max_secs,
+             "window": win}
     if runs >= max_runs or secs >= max_secs:
-        return True, "runs=%d/%d secs=%.1f/%.1f(1h 고정창)" % (runs, max_runs, secs, max_secs)
-    return False, "runs=%d/%d secs=%.1f/%.1f" % (runs, max_runs, secs, max_secs)
+        return True, "runs=%d/%d secs=%.1f/%.1f(1h 고정창)" % (runs, max_runs, secs,
+                                                               max_secs), stats
+    return False, "runs=%d/%d secs=%.1f/%.1f" % (runs, max_runs, secs, max_secs), stats
+
+
+def _budget_hard_emit_once(stats):
+    """B2(조건 04②): 소진 = `resource.hard`(metric=verify_budget) **플릿 단일 발행** —
+    워커별 발화 금지. 멱등 마커 `.hard-emitted-<창키>` 를 O_EXCL 원자 생성(락·대기 없음 ·
+    조건 25①)한 마커 선점 승자만 emit — 반복 소진·타 워커 동시 도달은 마커 존재로 무발화,
+    창이 바뀌면 새 마커. ★G7c 보증 수위 정정: 이 계약은 창당 **at-most-once** 다 — 마커
+    생성 '후' emit '전' 승자 사망 시 그 창은 무발화(수용: 이벤트는 best-effort 부수 채널 ·
+    조건 19① — 판정(SKIPPED_BUDGET·deferred)은 마커와 무관하게 각 워커에서 성립).
+    value/threshold 는 소진 축(runs 우선) 기준. 지난 창 마커(24h+)는 best-effort 청소
+    (비블로킹·실패 무해)."""
+    if not stats:
+        return False
+    win = stats.get("window")
+    marker = os.path.join(BUDGET_DIR, ".hard-emitted-%s" % win)
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False  # 이미 발행됨(창당 1회) 또는 디렉터리 소실 — 무발화
+    with contextlib.suppress(OSError):
+        os.write(fd, (_now() + "\n").encode("utf-8"))
+    with contextlib.suppress(OSError):
+        os.close(fd)
+    if stats.get("runs", 0) >= stats.get("max_runs", 0):
+        value, threshold = stats.get("runs", 0), stats.get("max_runs", 0)
+    else:
+        value, threshold = int(stats.get("secs", 0)), int(stats.get("max_secs", 0))
+    _emit("resource.hard", {"metric": "verify_budget", "value": str(value),
+                            "threshold": str(threshold)})
+    with contextlib.suppress(OSError):
+        for name in os.listdir(BUDGET_DIR):
+            if name.startswith(".hard-emitted-") and name != os.path.basename(marker):
+                p = os.path.join(BUDGET_DIR, name)
+                with contextlib.suppress(OSError):
+                    if time.time() - os.stat(p).st_mtime > 24 * 3600:
+                        os.remove(p)
+    return True
 
 
 def _budget_record(sid, secs):
@@ -520,6 +598,64 @@ def _budget_record(sid, secs):
         shard["secs"] = float(shard.get("secs", 0.0)) + float(secs)
     with contextlib.suppress(OSError):
         _write_json_atomic(path, shard)
+
+
+def _maybe_demote_calibrated(task_id, state, spec):
+    """B2(조건 07②): timeout_violations ≥2 → verify_spec.calibrated=false 자동 강등 전이.
+    집행은 javis_task `set-verify-spec <id> --demote-calibrated` 위임 — 레코드 갱신이
+    wlock(5번째 mutator) 직렬화를 그대로 타고 멱등이다(guard 의 직접 갱신 금지 — 락 계약
+    단일화). calibrated 가 이미 false/부재면 스폰 자체를 생략(반복 Stop 무의미 스폰 차단).
+    best-effort: 실패는 판정 불개입(조건 19① OBSERVABILITY 상속).
+    ★G5: 호출처는 **정상 Stop(_hook_main) 한정** — 데드라인 경로(_on_deadline)는 스폰을
+    생략하고 카운트만 적재한다(다음 정상 Stop 이 여기서 소비 — 3중 상한 여유 보존)."""
+    if int(state.get("timeout_violations", 0)) < 2:
+        return
+    if spec is None:
+        task, _e = _read_json(os.path.join(TASKS_DIR, "%s.json" % task_id))
+        spec = (task or {}).get("verify_spec") if isinstance(task, dict) else None
+    if not isinstance(spec, dict) or spec.get("calibrated") is not True:
+        return
+    jt = os.path.join(_SELF_DIR, "javis_task.py")
+    if not os.path.isfile(jt):
+        return
+    env = dict(os.environ)
+    env["CYS_NO_AUTOSTART"] = "1"
+    with contextlib.suppress(Exception):
+        subprocess.run([sys.executable, jt, "set-verify-spec", task_id,
+                        "--demote-calibrated"],
+                       capture_output=True, text=True, timeout=10, env=env)
+
+
+def _grill_active():
+    """G6(성찰 2): grill 마커 활성(collecting·비만료) 판정 — grill_gate 형제 모듈 재사용
+    (C75 import 전례·복제 금지). 실패 전부 비활성 취급(best-effort — 판정 불개입)."""
+    try:
+        import grill_gate as _gg
+        m = _gg._load_marker()
+        return bool(m and m.get("status") == "collecting" and not _gg._expired(m))
+    except Exception:  # noqa: BLE001 — 마커/모듈 어떤 이상도 경보 억제측(무해)
+        return False
+
+
+def _warn_armed_combo(sid):
+    """G6(성찰 2 MEDIUM): 무장 조합 위험 경보 — 무장 첫 발동 시 1회(_alert_once 코얼레싱).
+    조합: CLAUDE_CODE_STOP_HOOK_BLOCK_CAP 미설정(하네스 Stop 지갑=기본 cap 8+1=9) ∧ grill
+    마커 활성 ∧ GRILL_STOP_SELF_CAP=0(self-cap off) — grill 블록 K 가 지갑을 선점하면
+    9−K < N(escalation 임계 3) 이 되어 guard 가 escalation 도달 전 지갑 소진(무검증
+    오버라이드 창 — T0 §2 실험 4 산술). 처방 = cap 상향+self-cap 활성 **원자 조합**(OT-2)."""
+    if os.environ.get("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP", "").strip():
+        return
+    if os.environ.get("GRILL_STOP_SELF_CAP", "0").strip() not in ("", "0"):
+        return
+    if not _grill_active():
+        return
+    _alert_once(sid, "armed-combo-risk", "agent.error",
+                {"agent": _role(),
+                 "summary": "[completion-guard] 무장 조합 위험 — 선점 산술 위험(9−K<N): "
+                            "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP 미설정 ∧ grill 마커 활성 ∧ "
+                            "GRILL_STOP_SELF_CAP=0 — grill 블록이 하네스 Stop 지갑(9)을 "
+                            "선점하면 guard escalation(N=3) 도달 전 소진. cap 상향+self-cap "
+                            "활성 원자 조합 적용 요망(OT-2)"})
 
 
 # ── verify 실행(setsid 그룹 + killpg — §2-2·조건 07③·23) ────────────────────
@@ -966,6 +1102,9 @@ def _hook_main():
     # 3) 회로차단기 disarm — 이후 무발동(재무장=master 가 마커 삭제).
     if os.path.isfile(_disarm_path(task_id)):
         return EXIT_PASS
+    # 3b) G6: 무장 조합 위험 경보 — 무장 guard 가 실제 발동(claim 유효)한 시점에 1회
+    #     (에피소드 코얼레싱 — _alert_once). best-effort·판정 불개입.
+    _warn_armed_combo(sid)
     # 4) 태스크 레코드 — 부재/파싱 실패 = INFRA_ERROR 경로(§2-1).
     task, terr = _read_json(os.path.join(TASKS_DIR, "%s.json" % task_id))
     state, corrupted = _load_guard_state(task_id)
@@ -1067,14 +1206,14 @@ def _hook_main():
         if gkind == "skip_hard":
             state["deferred"] = True  # 조건 04① — verify-deferred 통과 마킹
         return _finish_skip(state, "SKIPPED_RESOURCE")
-    # 5단 verifier tax(부재=무제한 — B2 배포 전 호환).
-    exhausted, bdetail = _budget_check()
+    # 5단 verifier tax(부재=무제한 — 배포 전 호환). B2(조건 04②): 소진 이벤트는 워커별
+    # 발화가 아니라 resource.hard 플릿 단일 발행(멱등 마커 — 창당 정확 1회).
+    exhausted, bdetail, bstats = _budget_check()
     if exhausted:
         state["deferred"] = True
-        _alert_once(sid, "budget-exhausted", "agent.error",
-                    {"agent": _role(),
-                     "summary": "[completion-guard] verifier tax 소진(%s) — SKIPPED_BUDGET(deferred)"
-                                % bdetail})
+        _budget_hard_emit_once(bstats)
+        print("[completion-guard] verifier tax 소진(%s) — SKIPPED_BUDGET(verify-deferred 통과)"
+              % bdetail, file=sys.stderr)
         return _finish_skip(state, "SKIPPED_BUDGET")  # 카운터 동결 — block/infra 무변경
     # 6단 verify_spec 부재.
     spec = task.get("verify_spec")
@@ -1084,6 +1223,10 @@ def _hook_main():
     res = _run_verify(spec, task_id, sid)
     if res.get("timed_out_any"):
         state["timeout_violations"] = int(state.get("timeout_violations", 0)) + 1
+    # B2(조건 07②) + G5 짝: 강등 소비는 **무조건 호출** — 데드라인 경로(_on_deadline 은 스폰
+    # 생략)가 적재한 위반분도 다음 정상 Stop 이 여기서 소비한다(이번 run 의 타임아웃 여부와
+    # 무관). 함수 자체가 <2 또는 calibrated≠true 면 즉시 반환이라 평시 비용 0(스폰 없음).
+    _maybe_demote_calibrated(task_id, state, spec)
     if res.get("survivors_any"):
         _emit("agent.error",
               {"agent": _role(),
@@ -1181,6 +1324,10 @@ def _on_deadline(detail):
         return EXIT_PASS  # state 로드 전(무장·claim 판정 구간) — 적재할 대상 없음
     state["timeout_violations"] = int(state.get("timeout_violations", 0)) + 1
     task_id = state.get("task_id") or ""
+    # ★G5(b2-bugs·성찰 2): 데드라인 경로에서는 _maybe_demote_calibrated 스폰을 **생략**한다 —
+    #   이 핸들러는 자체 데드라인 소진 직후의 잔여 시간 창에서 도는 정리 경로라, 최대 10s
+    #   subprocess 스폰이 3중 상한(SIGALRM·훅 타임아웃·하네스) 여유를 잠식한다. 위반 카운트는
+    #   위에서 적재됐으므로 다음 정상 Stop 의 무조건 소비 지점(_hook_main — G5 짝)이 처리한다.
     if state.get("escalated_at") and not os.path.isfile(_bundle_path(task_id)):
         sig = state.get("last_sig") or "nosig"
         bundle = {"schema_version": 1, "task": task_id, "sig": sig,
@@ -1308,9 +1455,13 @@ def self_test():
             for k in ("CYS_COMPLETION_GUARD", "CYS_SURFACE_ID", "AITERM_SURFACE_ID",
                       "CYS_GUARD_ESC_N", "CYS_GUARD_RESOURCE_ARGS", "CYS_SHIM_SEND_RC",
                       "CYS_GUARD_SELF_DEADLINE_SEC", "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP",
-                      "CYS_SHIM_STATUS_HANG"):
+                      "CYS_SHIM_STATUS_HANG", "JAVIS_VERIFY_BUDGET_RUNS",
+                      "JAVIS_VERIFY_BUDGET_SECS", "GRILL_STOP_SELF_CAP"):
                 env.pop(k, None)
             env.update({
+                # G6 밀폐: grill 마커 기본 경로(~/Desktop/CYSjavis — 라이브)를 읽지 않게
+                # root 내 부재 경로로 핀. G6 케이스만 env_extra 로 실마커 주입.
+                "GRILL_MARKER": os.path.join(root, ".grill-absent.json"),
                 "JAVIS_ROOT": root,
                 "HUD_STATE_DIR": os.path.join(root, "hud"),
                 "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
@@ -1482,6 +1633,12 @@ def self_test():
         st = gstate(root, "T1")
         chk(rc == 0 and st["last_verdict"] == "SKIPPED_BUDGET" and st["deferred"] is True,
             "budget 소진이 SKIPPED_BUDGET+deferred 아님: %s" % st)
+        # ── B2(조건 04②): 소진 = resource.hard 플릿 단일 발행(멱등 마커) — 워커별 발화 금지 ──
+        hard_evs = [x for x in spool_lines(root) if x["type"] == "resource.hard"
+                    and x["payload"].get("metric") == "verify_budget"]
+        chk(len(hard_evs) == 1, "B2 budget 소진 resource.hard 정확 1회 아님: %d" % len(hard_evs))
+        b2_markers = [n for n in os.listdir(bdir) if n.startswith(".hard-emitted-")]
+        chk(len(b2_markers) == 1, "B2 멱등 마커(.hard-emitted-<창키>) 부재/중복: %s" % b2_markers)
         # 샤드 기록: budget 있는 상태에서 verify 실행되면 자기 샤드 적재
         with open(os.path.join(bdir, "999.json"), "w") as f:
             json.dump({"schema_version": 1, "window_start": _budget_window(),
@@ -1492,6 +1649,133 @@ def self_test():
         shard, _err = _read_json(os.path.join(bdir, "7.json"))
         chk(shard is not None and shard.get("runs", 0) >= 1,
             "verify 실행이 자기 샤드에 미적재: %s" % shard)
+        # ── B2 기준 ①: 샤드 병행(999·888·자기 7) 합산 경계 실측 + 반복 소진 창당 1회 ──
+        with open(os.path.join(bdir, "policy.json"), "w") as f:
+            json.dump({"max_runs": 4, "max_secs": 300}, f)
+        for name, n_runs in (("999.json", 1), ("888.json", 1)):
+            with open(os.path.join(bdir, name), "w") as f:
+                json.dump({"schema_version": 1, "window_start": _budget_window(),
+                           "runs": n_runs, "secs": 0.5}, f)
+        rc, _o, _e = run_guard(root)  # 합산 3(999=1+888=1+자기=1) < 4 → 통과·자기 샤드 → 2
+        chk(rc == 0 and gstate(root, "T1")["last_verdict"] == "PASS",
+            "B2 합산 3/4 미만인데 통과 아님: %s" % gstate(root, "T1"))
+        rc, _o, _e = run_guard(root)  # 합산 4 ≥ 4 → 반복 소진(같은 창)
+        chk(rc == 0 and gstate(root, "T1")["last_verdict"] == "SKIPPED_BUDGET",
+            "B2 합산 4/4 경계 소진 실패: %s" % gstate(root, "T1"))
+        hard_evs = [x for x in spool_lines(root) if x["type"] == "resource.hard"
+                    and x["payload"].get("metric") == "verify_budget"]
+        chk(len(hard_evs) == 1,
+            "B2 반복 소진에 resource.hard 재발화(창당 1회 위반): %d" % len(hard_evs))
+
+        # ── B2: 예산 env 노브 — JAVIS_VERIFY_BUDGET_RUNS 가 policy.json 보다 우선 ──
+        root, tasks = new_root("r-budget-env")
+        mk_task(tasks, "T1", ok_spec)
+        mk_claim(tasks, "7", "T1")
+        bdir2 = os.path.join(root, "_round", "verify-budget")
+        os.makedirs(bdir2)
+        with open(os.path.join(bdir2, "policy.json"), "w") as f:
+            json.dump({"max_runs": 99, "max_secs": 300}, f)
+        rc, _o, _e = run_guard(root)  # policy 99 여유 → 통과(자기 샤드 1 적재)
+        chk(rc == 0 and gstate(root, "T1")["last_verdict"] == "PASS",
+            "B2 env 노브 사전 통과 실패: %s" % gstate(root, "T1"))
+        rc, _o, _e = run_guard(root, env_extra={"JAVIS_VERIFY_BUDGET_RUNS": "1"})
+        st = gstate(root, "T1")
+        chk(rc == 0 and st["last_verdict"] == "SKIPPED_BUDGET",
+            "B2 env JAVIS_VERIFY_BUDGET_RUNS=1 이 policy(99) 를 우선하지 않음: %s" % st)
+        env_hard = [x for x in spool_lines(root) if x["type"] == "resource.hard"
+                    and x["payload"].get("metric") == "verify_budget"]
+        chk(len(env_hard) == 1 and str(env_hard[0]["payload"].get("threshold")) == "1",
+            "B2 env 한도 resource.hard threshold 오기록(emit 파서가 수치 문자열을 int 로 "
+            "정규화 — str 대조): %s" % [x["payload"] for x in env_hard])
+
+        # ── B2 기준 ⑦(조건 07②): timeout 위반 2회 → calibrated=false 강등 전이 +
+        #    이후 strict checkout 거동(spec 존재 통과 + 강등 경고 표면화) ──
+        root, tasks = new_root("r-demote")
+        mk_task(tasks, "T1", {"mode": "command", "cmd": "sleep 30",
+                              "pass_rule": {"kind": "exit_map", "pass_exits": [0]},
+                              "timeout_s": 0.5, "calibrated": True})
+        mk_claim(tasks, "7", "T1")
+        rc, _o, _e = run_guard(root)
+        chk(rc == 0 and gstate(root, "T1")["timeout_violations"] == 1,
+            "B2 demote 1회차 위반 적재 실패: %s" % gstate(root, "T1"))
+        rec1, _err = _read_json(os.path.join(tasks, "T1.json"))
+        chk(rec1["verify_spec"]["calibrated"] is True,
+            "B2 위반 1회에 조기 강등: %s" % rec1["verify_spec"])
+        rc, _o, _e = run_guard(root)
+        chk(rc == 0 and gstate(root, "T1")["timeout_violations"] == 2,
+            "B2 demote 2회차 위반 적재 실패: %s" % gstate(root, "T1"))
+        rec2, _err = _read_json(os.path.join(tasks, "T1.json"))
+        chk(rec2["verify_spec"]["calibrated"] is False,
+            "B2 위반 2회 후 calibrated=false 전이 실패: %s" % rec2.get("verify_spec"))
+        env_dc = dict(os.environ)
+        for k in ("CYS_SURFACE_ID", "AITERM_SURFACE_ID"):
+            env_dc.pop(k, None)
+        env_dc.update({"JAVIS_ROOT": root, "CYS_NO_AUTOSTART": "1",
+                       "JAVIS_VERIFY_GATE": "strict", "JAVIS_TASK_LIVENESS": "alive",
+                       "PATH": shim_dir + os.pathsep + os.environ.get("PATH", "")})
+        r_dc = subprocess.run([sys.executable, os.path.join(_SELF_DIR, "javis_task.py"),
+                               "checkout", "T1", "--owner", "w-b2"],
+                              capture_output=True, text=True, env=env_dc, timeout=60)
+        chk(r_dc.returncode == 0 and "calibrated 강등" in r_dc.stderr,
+            "B2 강등 후 strict checkout 거동(통과+경고) 실패: rc=%s err=%s"
+            % (r_dc.returncode, r_dc.stderr[:300]))
+
+        # ── G5(수리): 데드라인 경로 demote 스폰 생략 — 카운트만 적재·다음 정상 Stop 소비 ──
+        root, tasks = new_root("r-g5-deadline")
+        mk_task(tasks, "T1", {"mode": "command", "cmd": "exit 0",
+                              "pass_rule": {"kind": "exit_map", "pass_exits": [0]},
+                              "timeout_s": 5, "calibrated": True})
+        mk_claim(tasks, "7", "T1")
+        with open(os.path.join(tasks, "T1.guard.json"), "w", encoding="utf-8") as f:
+            json.dump(dict(_fresh_state("T1"), timeout_violations=1), f)
+        t0 = time.time()
+        rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_SELF_DEADLINE_SEC": "2",
+                                                "CYS_SHIM_STATUS_HANG": "1"})
+        g5_dt = time.time() - t0
+        st = gstate(root, "T1")
+        chk(rc == 0 and st["last_verdict"] == "INFRA_ERROR"
+            and st["timeout_violations"] == 2,
+            "G5 데드라인 INFRA 적재(violations 1→2) 실패: rc=%s st=%s" % (rc, st))
+        rec_g5, _err = _read_json(os.path.join(tasks, "T1.json"))
+        chk(rec_g5["verify_spec"]["calibrated"] is True,
+            "G5 데드라인 경로가 demote 스폰(생략 위반): %s" % rec_g5.get("verify_spec"))
+        chk(g5_dt < 8, "G5 데드라인 경로 소요 시간 마진 붕괴(스폰 잠식 의심): %.1fs" % g5_dt)
+        rc, _o, _e = run_guard(root)  # 다음 정상 Stop — 무조건 소비 지점이 잔여분 처리
+        rec_g5, _err = _read_json(os.path.join(tasks, "T1.json"))
+        chk(rc == 0 and rec_g5["verify_spec"]["calibrated"] is False
+            and rec_g5["verify_spec"].get("demoted_at"),
+            "G5 다음 정상 Stop 의 강등 소비 실패: %s" % rec_g5.get("verify_spec"))
+
+        # ── G6(수리): 무장 조합 위험 경보 — cap 미설정 ∧ grill 활성 ∧ self-cap 0 = 1회 ──
+        root, tasks = new_root("r-g6-combo")
+        mk_task(tasks, "T1", ok_spec)
+        mk_claim(tasks, "7", "T1")
+        g6_marker = os.path.join(root, "grill_session.json")
+        with open(g6_marker, "w", encoding="utf-8") as f:
+            json.dump({"session_id": "g6", "floor": 20, "status": "collecting",
+                       "started_at": time.time(), "ttl_secs": 3600, "evidence": []}, f)
+        rc, _o, _e = run_guard(root, env_extra={"GRILL_MARKER": g6_marker})
+        rc, _o, _e = run_guard(root, env_extra={"GRILL_MARKER": g6_marker})
+        g6_evs = [x for x in spool_lines(root) if x["type"] == "agent.error"
+                  and "선점 산술 위험" in x["payload"].get("summary", "")]
+        chk(len(g6_evs) == 1,
+            "G6 무장 조합 위험 경보 1회(반복 무재발화) 아님: %d" % len(g6_evs))
+        # self-cap 활성(≥1)·cap 상향은 각각 조합 해제 → 무경보
+        root, tasks = new_root("r-g6-off")
+        mk_task(tasks, "T1", ok_spec)
+        mk_claim(tasks, "7", "T1")
+        g6_marker2 = os.path.join(root, "grill_session.json")
+        with open(g6_marker2, "w", encoding="utf-8") as f:
+            json.dump({"session_id": "g6b", "floor": 20, "status": "collecting",
+                       "started_at": time.time(), "ttl_secs": 3600, "evidence": []}, f)
+        rc, _o, _e = run_guard(root, env_extra={"GRILL_MARKER": g6_marker2,
+                                                "GRILL_STOP_SELF_CAP": "2"})
+        rc, _o, _e = run_guard(root, env_extra={"GRILL_MARKER": g6_marker2,
+                                                "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "12"})
+        g6_evs = [x for x in spool_lines(root) if x["type"] == "agent.error"
+                  and "선점 산술 위험" in x["payload"].get("summary", "")]
+        chk(len(g6_evs) == 0,
+            "G6 조합 해제(self-cap on/cap 상향)인데 경보 발화: %d" % len(g6_evs))
 
         # ── 사다리 6단: spec 부재 → SKIPPED_NO_SPEC(fail-open) ──
         root, tasks = new_root("r-nospec")
@@ -1986,7 +2270,12 @@ def self_test():
         return 1
     print("javis_completion_guard self-test OK — 무장OFF/claim부재·stale claim 경보1회·"
           "CYCLE 마커+TTL·부트 grace·ctx60 yield(emit 1회)·ctx 측정실패 NO_BLOCK_PASS·"
-          "resource soft/hard/64→INFRA·budget 부재/소진/샤드 적재·no-spec·"
+          "resource soft/hard/64→INFRA·budget 부재/소진/샤드 적재·"
+          "B2 tax(resource.hard 단일발행+멱등 마커·반복 소진 창당 at-most-once·샤드 3벌 합산 "
+          "경계 3/4→4/4·env 노브 policy 우선·threshold 기록)·"
+          "B2 demote(timeout 2회→calibrated=false 전이·strict checkout 통과+강등 경고)·"
+          "G5(데드라인 demote 스폰 생략·카운트 적재·다음 정상 Stop 소비·시간 마진)·"
+          "G6(무장 조합 위험 경보 1회·조합 해제 무경보)·no-spec·"
           "동일실패 100회(pending 1·queued 1·bundle 1·emit 1·override 코얼레싱 1)·"
           "PASS 리셋 재블록·F2 오버라이드(카운터 기반 — 새 Stop 5회 tamper 1·pending 무증식·"
           "CYCLE 마커 감지 0)·인프라 3종(블록0·경보3·corrupt 격리)·breaker disarm·"

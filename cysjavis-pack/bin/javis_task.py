@@ -54,6 +54,29 @@ B1(Phase 1 Wave B1 · DESIGN-DECISIONS §2-1): completion-guard 태스크 바인
 - 사이드카 네임스페이스 격리(F5): guard 산출 사이드카(`<id>.guard.json`·
   `<id>.esc-bundle.json`)는 태스크 레코드가 아니다 — list 등 판독 진입점은 예약 접미
   파일을 제외하고, G10 id 검증은 예약 접미(`.guard`·`.esc-bundle`) id 를 거부한다.
+
+B2(Phase 1 Wave B2 · DESIGN-DECISIONS §3): 고위험 서명·done-deferred·calibrated 강등.
+- set-verify-spec 위험 어휘 4종 검사(조건 07①·30③ — T1 이 예약한 훅 지점 실구현):
+  cmd 가 서버기동(javis_resource_gate SERVER_PATTERNS/classify **import 재사용** — 복제 금지·
+  조건 04③)·push생산(cys send|feed push|wakeup enqueue|approval) 이면 **서명 불문 고정
+  거부(exit 2)** — verify 는 멱등·읽기전용이어야 한다. 삭제(rm|rmdir|unlink|shutil.rmtree|
+  git clean|find -delete)·네트워크(curl|wget|nc|netcat|ssh|scp|rsync) 는 risk.class=high
+  승격 — `--signed-by <approver>` 인간 서명 없으면 exit 2. 서명 전 리뷰어 ACCEPT 의무는
+  계약 문서 조항(조건 30③ — 자기신고 한계 자인·도구는 서명 문자열만 집행 가능).
+- set-verify-spec <id> --demote-calibrated: guard timeout_violations≥2 소비 경로(조건 07②)
+  — wlock 안에서 verify_spec.calibrated=false 전이(멱등·calibrated=true 일 때만 변이) +
+  spec.demoted_at 병기(G7d — 강등 근거의 영속화). checkout 은 강등 상태(calibrated=false ∧
+  demoted_at 존재)를 stderr 경고로 표면화한다(비차단 — 재캘리브레이션 권고 · guard.json
+  사이드카 소실과 무관. spec 존재=게이트 충족 계약은 불변).
+- set-status done deferred 검사(조건 04①·20② 우선순위 통일 — 20② 채택): <id>.guard.json
+  미해소 판정은 **내구 신호 합성**(G1 — deferred=true ∨ last_verdict=VERIFY_FAIL ∨
+  block_count>0 ∨ last_sig≠None · 전부 guard PASS 로만 리셋되는 필드)이다 — last_verdict
+  단독 판정은 SKIPPED_*/NO_BLOCK_PASS 1회로 잔존이 마스킹된다(b2-bugs HIGH). 미해소 시
+  risk.class=high 면 exit 4 차단 / 일반이면 통과 + evidence 에 'verify-deferred' 라벨 자동
+  병기 + stderr 고지(미검증 목록 다이제스트 보고 대상). guard.json 부재·손상 = 무간섭(회귀 0).
+- set-verify-spec 재등록 게이트(G2): 미해소 guard 상태(G1 동일 기준) 또는 기존 spec
+  risk.class=high 교체는 --force-respec 명시 없이 exit 2 거부 — 무해 cmd 재등록으로
+  done-deferred 차단·서명 의무를 세탁하는 우회 봉쇄. 강제 시 task-audit 원장 1줄 기록.
 """
 import argparse
 import contextlib
@@ -101,7 +124,7 @@ _VS_INLINE = {
     "MODE_ENUM": ["command", "procedural", "probe", "waiver"],
     "TOP_KEYS": ["schema_version", "mode", "cmd", "cwd", "pass_rule", "probe", "procedural",
                  "waiver_ref", "timeout_s", "n_of_m", "harness_ref", "calibrated", "risk",
-                 "template", "template_origin"],
+                 "template", "template_origin", "demoted_at"],
     "REQUIRED_TOP": ["mode"],
     "MODE_REQUIRED": {"command": ["cmd", "pass_rule"], "procedural": ["procedural"],
                       "probe": ["probe"], "waiver": ["waiver_ref"]},
@@ -962,6 +985,16 @@ def cmd_checkout(a):
         return EXIT_VERIFY
     if gate in ("warn", "grandfather"):
         print("verify-gate WARN: %s" % gwhy, file=sys.stderr)
+    # ── B2(조건 07②): calibrated 강등 상태 표면화 — spec 존재 통과 계약은 불변(비차단).
+    #    G7d: 판정 근거 = spec.demoted_at(--demote-calibrated 가 강등 시 병기하는 영속 필드) —
+    #    guard.json(휘발 사이드카) 판독에 의존하지 않아 사이드카 소실과 무관하게 발화한다.
+    #    수동 calibrated:false 등록(강등 전이 아님)은 demoted_at 부재 → 경고 없음(의도). ──
+    _spec_b2 = task.get("verify_spec")
+    if (isinstance(_spec_b2, dict) and _spec_b2 and _spec_b2.get("calibrated") is False
+            and _spec_b2.get("demoted_at")):
+        print("verify-gate WARN: calibrated 강등 상태(demoted_at=%s — 조건 07② quick 상한 "
+              "위반 반복) — 재캘리브레이션 전 신뢰 강등(비차단·재게이트 권고)"
+              % _spec_b2.get("demoted_at"), file=sys.stderr)
     verdict, holder = _acquire_lock(a.id, a.owner, pid=a.pid)
     if verdict == "conflict":
         who = (holder or {}).get("owner_id", "unknown")
@@ -1267,7 +1300,28 @@ def cmd_set_status(a):
     art_paths = list(getattr(a, "evidence_artifact", None) or [])
     artifact_records = None  # done 게이트 통과 시 채워져 wlock 안에서 task.evidence.artifacts로 저장
     skip_audit_pending = False  # skip 감사는 실제 done 진행(전이·settle 게이트 통과) 후에만 기록
+    guard_deferred = False  # B2: guard 미검증 잔존 → evidence 'verify-deferred' 라벨 병기 예약
     if a.status == "done":
+        # ── B2 guard deferred 검사(조건 04①·20② 우선순위 통일 — 20② 채택 · cheap-first):
+        #    <id>.guard.json 미해소 판정 = **내구 신호 합성**(G1 — _guard_unresolved:
+        #    deferred ∨ last_verdict=VERIFY_FAIL ∨ block_count>0 ∨ last_sig≠None · 전부
+        #    PASS 로만 리셋) — last_verdict 단독 판정의 SKIPPED_*/NO_BLOCK_PASS 마스킹 창 차단.
+        #    risk.class=high 는 done 보류(exit 4) / 일반은 통과+라벨 병기(다이제스트 보고 대상).
+        #    guard.json 부재·손상 = 무간섭(회귀 0 — B1 이전 레코드·비무장 pane 동일 동작). ──
+        _gobj = _load_guard_obj(a.id)
+        if _guard_unresolved(_gobj):
+            _vs = task.get("verify_spec")
+            _rk = _vs.get("risk") if isinstance(_vs, dict) else None
+            _risk_cls = _rk.get("class") if isinstance(_rk, dict) else None
+            if _risk_cls == "high":
+                print("done blocked(4): verify 미검증 잔존(%s) + risk.class=high — 고위험 "
+                      "태스크는 verify 통과(guard PASS) 후 done(조건 20② 고위험 보류 · "
+                      "G1 내구 신호 합성)" % _guard_signals(_gobj), file=sys.stderr)
+                return EXIT_BLOCKED
+            guard_deferred = True
+            print("verify-deferred: guard 미검증 잔존(%s) — evidence 에 'verify-deferred' "
+                  "라벨 자동 병기(미검증 목록 다이제스트 보고 대상 · 조건 04①·20②)"
+                  % _guard_signals(_gobj), file=sys.stderr)
         # ── E1 evidence-artifact 게이트(증거의 기계화 · 설계 §E1) — cheap-first(settle sleep 전) ──
         #   신선도 앵커 = owner.json acquired_at을 release(:하단) '전'에 판독한다(R2).
         #   기계 검사 실패(실존·비어있지않음·신선도)는 우회 불가 — strict 거부/warn 경고.
@@ -1352,6 +1406,17 @@ def cmd_set_status(a):
                                 "text": ev_text or skip_text, "at": _now()}
         if artifact_records:  # E1: 비파괴 확장 — 기존 evidence(text/skip)와 공존
             task.setdefault("evidence", {})["artifacts"] = artifact_records
+        if a.status == "done" and guard_deferred:
+            # B2(조건 20②): 'verify-deferred' 라벨 자동 병기 — 미검증 done 의 원장 가시화.
+            ev = task.setdefault("evidence", {})
+            ev["verify_deferred"] = True
+            if isinstance(ev.get("text"), str) and ev["text"]:
+                if "[verify-deferred]" not in ev["text"]:
+                    ev["text"] += " [verify-deferred]"
+            else:
+                ev["text"] = "[verify-deferred]"
+                ev.setdefault("type", "evidence")
+                ev.setdefault("at", _now())
         if settle_override_note is not None:
             task.setdefault("settle_overrides", []).append(
                 {"at": _now(), "reason": settle_override_note})
@@ -1385,15 +1450,128 @@ def cmd_set_status(a):
     return EXIT_OK
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# B2(§3 · 조건 07①·30③): verify cmd 위험 어휘 4종 — 등록 직전 게이트의 어휘 정의.
+#   삭제·네트워크 = risk.class=high 승격 + 인간 서명(--signed-by) 의무.
+#   서버기동·push생산 = 서명으로도 불허(고정 거부) — verify 의 멱등·읽기전용 계약 위반.
+#   서버기동 판정은 javis_resource_gate SERVER_PATTERNS/_count_matching import 재사용
+#   (복제 금지 — 조건 04③·07①의 "SERVER_PATTERNS 재사용" 문언 그대로).
+#   ※\bapproval\b 는 브리프 어휘 문언 그대로 — 읽기전용 승인 '조회' cmd 오탐 가능성은
+#   고정 거부의 보수측 비용으로 수용(등록 시점 게이트라 master 가 cmd 재작성으로 해소).
+#   ★G4(b2-bugs MEDIUM): 대소문자 무시(re.IGNORECASE) — `RM -rf`·`CURL …` 류 케이스 변조
+#   우회 차단(서버기동 판정은 javis_resource_gate SERVER_PATTERNS 소관 유지 — 여기서 불변).
+#   ★미검출 잔여 경계 명문(G4 자인 — 이 게이트는 어휘 표면 검사일 뿐 의미 분석이 아니다):
+#     `python -c "os.remove(...)"`·`python -c "shutil.move(...)"` 등 인터프리터 경유 삭제,
+#     `git reset --hard`·`git checkout -- .` 등 워킹트리 파괴, `truncate`·`dd of=`·`> file`
+#     리다이렉션 덮어쓰기, `find -exec rm` 변형, base64/eval 난독은 검출하지 않는다 —
+#     잔여 위험은 인간 서명+리뷰어 ACCEPT(조건 30③)와 guard 실행격리(setsid·killpg)가 흡수.
+# ─────────────────────────────────────────────────────────────────────────────
+_RISK_DELETE_RE = re.compile(
+    r"\brm\b|\brmdir\b|\bunlink\b|shutil\.rmtree|\bgit\s+clean\b|\bfind\b[^|;&]*\s-delete\b",
+    re.IGNORECASE)
+_RISK_NET_RE = re.compile(
+    r"\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\brsync\b",
+    re.IGNORECASE)
+_RISK_PUSH_RE = re.compile(
+    r"\bcys\s+send\b|\bfeed\s+push\b|\bwakeup\b[^|;&]*\benqueue\b"
+    r"|javis_wakeup(?:\.py)?\b[^|;&]*\benqueue\b|javis_approval\w*|\bcys\s+approve\b"
+    r"|\bapproval\b",
+    re.IGNORECASE)
+
+
+def _load_guard_obj(task_id):
+    """<id>.guard.json 판독 — 부재·손상·비객체 = None(무간섭 — 회귀 0)."""
+    with contextlib.suppress(OSError, ValueError):
+        with open(os.path.join(TASKS_DIR, "%s.guard.json" % task_id),
+                  encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _guard_unresolved(gobj):
+    """B2 G1(b2-bugs HIGH): 미해소 guard 판정 — **내구 신호 합성**.
+    last_verdict 단독 판정은 VERIFY_FAIL 후 SKIPPED_*·NO_BLOCK_PASS 1회(clear 사이클마다
+    발생하는 창)로 잔존이 마스킹돼 고위험 done 차단이 우회된다. deferred·block_count·
+    last_sig 는 guard §2-4 계약상 **PASS 로만 리셋**되는 내구 필드 — 넷 중 하나라도 잔존이면
+    미해소다."""
+    if not isinstance(gobj, dict):
+        return False
+    bc = gobj.get("block_count")
+    bc_pos = isinstance(bc, (int, float)) and not isinstance(bc, bool) and bc > 0
+    return (gobj.get("deferred") is True
+            or gobj.get("last_verdict") == "VERIFY_FAIL"
+            or bc_pos
+            or gobj.get("last_sig") is not None)
+
+
+def _guard_signals(gobj):
+    """미해소 판정 근거 문면(stderr 고지·차단 사유 공용)."""
+    return ("deferred=%s·last_verdict=%s·block_count=%s·last_sig=%s"
+            % (gobj.get("deferred"), gobj.get("last_verdict"),
+               gobj.get("block_count"), gobj.get("last_sig")))
+
+
+def _risk_scan_cmd(cmd_text):
+    """(categories:set, err|None) — cmd 문자열의 위험 어휘 4종 분류.
+    서버기동은 _count_matching 이 ps 형식('pid command') 줄을 기대하므로 합성 pid 를 접두해
+    분류기(제외 패턴 포함)를 그대로 태운다. import 실패(버전 찢김)는 (None, 사유) —
+    master-facing 등록 경로라 fail-closed(등록 거부)가 계약(조건 18② 비대칭 원칙의 반대편:
+    fail-closed 는 master-facing 에만)."""
+    cats = set()
+    if _RISK_DELETE_RE.search(cmd_text):
+        cats.add("삭제")
+    if _RISK_NET_RE.search(cmd_text):
+        cats.add("네트워크")
+    if _RISK_PUSH_RE.search(cmd_text):
+        cats.add("push생산")
+    try:
+        import javis_resource_gate as _rg  # 형제 모듈 — 경로 가드(sys.path append) 뒤 지역 import
+        if _rg._count_matching(["99999 " + cmd_text.replace("\n", " ")],
+                               _rg.SERVER_PATTERNS, _rg.SERVER_EXCLUDE_PATTERNS) > 0:
+            cats.add("서버기동")
+    except Exception as e:  # noqa: BLE001 — import·분류 실패 = 검사 불가(fail-closed 소비)
+        return None, "javis_resource_gate import/분류 실패(버전 찢김 의심): %s" % e
+    return cats, None
+
+
 def cmd_set_verify_spec(a):
     """T1(§1-2): verify_spec 등록 — 스키마 검증 + `with _wlock(id)` **필수**(R1-contract:
     set-status·checkout·release·create 에 이은 5번째 mutator — lost-update 차단).
-    risk 는 T1 에서 class="auto" 기록만: 위험 어휘 4종(삭제·네트워크·서버기동·push생산) 검사·
-    서명 전이는 Wave B2 가 이 지점(등록 직전)에 끼운다 — ★B2 훅 지점 예약(조건 07①·30③)."""
+    B2(§3): T1 이 예약한 훅 지점 실구현 — 위험 어휘 4종 검사(서버기동·push생산=고정 거부 /
+    삭제·네트워크=high 승격+--signed-by 서명 의무) + --demote-calibrated 내부 경로(조건 07②)."""
     task = _read_task(a.id)
     if not task:
         print(f"not found: {a.id}", file=sys.stderr)
         return EXIT_NOTFOUND
+    # ── B2(조건 07②): --demote-calibrated — guard timeout_violations≥2 소비 경로.
+    #    wlock 직렬화(6번째 mutator 진입점이 아니라 set-verify-spec 의 내부 경로) · 멱등:
+    #    calibrated=true 일 때만 변이·이미 false/부재는 무변이 보고. ──
+    if getattr(a, "demote_calibrated", False):
+        with _wlock(a.id):
+            task = _read_task(a.id)          # 락 안 재독 — 대기 중 갱신 반영
+            if not task:
+                print(f"not found: {a.id}", file=sys.stderr)
+                return EXIT_NOTFOUND
+            spec = task.get("verify_spec")
+            if not isinstance(spec, dict) or not spec:
+                print("error: verify_spec 부재 — calibrated 강등 대상 없음", file=sys.stderr)
+                return EXIT_USAGE
+            was_true = spec.get("calibrated") is True
+            if was_true:
+                spec["calibrated"] = False
+                # G7d: 강등 사실을 spec 자체에 병기 — checkout 경고가 guard.json(휘발 사이드카)
+                # 소실과 무관하게 이 필드로 발화한다(강등 근거의 영속화).
+                spec["demoted_at"] = _now()
+                task["updated_at"] = _now()
+                _write_json_atomic(_task_path(a.id), task)
+                print("calibrated 강등(조건 07②): quick wall-clock 상한 위반 반복(guard "
+                      "timeout_violations≥2) — 재캘리브레이션(하네스 워커 calibrate + master "
+                      "봉인) 전까지 신뢰 강등", file=sys.stderr)
+        print(json.dumps({"id": a.id, "calibrated": False, "demoted": was_true},
+                         ensure_ascii=False))
+        return EXIT_OK
     if a.file:
         try:
             with open(a.file, encoding="utf-8") as f:
@@ -1425,6 +1603,59 @@ def cmd_set_verify_spec(a):
         risk.setdefault("class", "auto")
         risk.setdefault("signed_by", None)
         risk.setdefault("signed_at", None)
+    # ── B2(조건 07①·30③): 위험 어휘 4종 검사 — 등록 직전 게이트(T1 예약 지점 실구현) ──
+    cmd_text = spec.get("cmd") if isinstance(spec.get("cmd"), str) else ""
+    if cmd_text.strip():
+        cats, scan_err = _risk_scan_cmd(cmd_text)
+        if scan_err:
+            print("error: 위험 어휘 검사 불가 — %s: 등록 거부(master-facing fail-closed — "
+                  "팩 설치 정합 복구 후 재시도)" % scan_err, file=sys.stderr)
+            return EXIT_USAGE
+        hard = cats & {"서버기동", "push생산"}
+        if hard:
+            print("verify-cmd rejected(2): %s 어휘 감지 — 서명 불문 고정 거부(조건 07①): "
+                  "verify 는 멱등·읽기전용이어야 한다(서버기동=자원 거버넌스 침식·push생산="
+                  "큐 남발 점화원). cmd 를 읽기전용 검증으로 재작성하라."
+                  % "·".join(sorted(hard)), file=sys.stderr)
+            return EXIT_USAGE
+        soft = cats & {"삭제", "네트워크"}
+        if soft:
+            if not getattr(a, "signed_by", None):
+                print("verify-cmd high-risk(2): %s 어휘 감지 — risk.class=high 승격 대상: "
+                      "인간 서명+리뷰어 ACCEPT 필요. `--signed-by <approver>` 로 서명 재등록"
+                      "하라(서명 전 리뷰어 ACCEPT 의무는 계약 문서 조항 · 조건 30③ — 도구는 "
+                      "서명 문자열만 집행하며 자기신고 한계를 자인한다)."
+                      % "·".join(sorted(soft)), file=sys.stderr)
+                return EXIT_USAGE
+            spec["risk"]["class"] = "high"
+    if getattr(a, "signed_by", None):
+        spec["risk"]["signed_by"] = a.signed_by
+        spec["risk"]["signed_at"] = _now()
+    # ── B2 G2(성찰 2 MEDIUM): 무서명 재등록 우회 차단 — 기존 상태 참조 게이트.
+    #    세탁 시나리오: VERIFY_FAIL 잔존/high 서명 spec 을 무해 cmd 로 갈아끼워 done-deferred
+    #    차단(G1)·서명 의무를 우회하는 경로. 트리거 = ①미해소 guard 상태(G1 내구 신호 합성
+    #    동일 기준) ②기존 spec risk.class=high 교체. --force-respec 명시 없으면 exit 2 거부 /
+    #    있으면 통과하되 task-audit 원장 1줄(probe_runs task-audit 확장 전례 — _append_audit
+    #    재사용)로 감사 가시화. 어휘 게이트(위) '이후' 배치 — 새 spec 자체의 위험 판정이
+    #    항상 선행한다(고정 거부·서명 의무는 force 로도 우회 불가). ──
+    respec_forced = False
+    _g2_reasons = []
+    _gobj_pre = _load_guard_obj(a.id)
+    if _guard_unresolved(_gobj_pre):
+        _g2_reasons.append("미해소 guard 상태(%s)" % _guard_signals(_gobj_pre))
+    _old_spec = task.get("verify_spec")
+    if isinstance(_old_spec, dict):
+        _old_risk = _old_spec.get("risk")
+        if isinstance(_old_risk, dict) and _old_risk.get("class") == "high":
+            _g2_reasons.append("기존 spec risk.class=high 교체")
+    if _g2_reasons:
+        if not getattr(a, "force_respec", False):
+            print("respec blocked(2): %s — 재등록이 검증 잔존·서명 의무를 세탁하는 우회 경로일 "
+                  "수 있다(G2): 해소(guard PASS) 후 재등록하거나, 의도된 교체면 "
+                  "`--force-respec` 명시(task-audit 원장 기록 동반)로만 허용."
+                  % " ∧ ".join(_g2_reasons), file=sys.stderr)
+            return EXIT_USAGE
+        respec_forced = True
     errs = validate_verify_spec(spec)
     if errs:
         for e in errs:
@@ -1448,6 +1679,8 @@ def cmd_set_verify_spec(a):
         task["verify_spec"] = spec
         task["updated_at"] = _now()
         _write_json_atomic(_task_path(a.id), task)
+    if respec_forced:
+        _append_audit(a.id, "force-respec")  # G2: 강제 재등록 원장 1줄(우회 가시화 — §3 mine 소비)
     with contextlib.suppress(OSError):
         os.remove(_verify_notified_marker(a.id))  # A4: 재위임 사이클 재개 — 통지 마커 해제
     print(json.dumps({"id": a.id, "verify_spec_mode": spec.get("mode"),
@@ -2026,6 +2259,185 @@ def cmd_self_test(args):
                                                          "args": ["--path", "/tmp/x"]}})])
             assert rc == EXIT_OK and "플래그형 아님" not in e, \
                 "F6 플래그형 probe.args 에 오경고: %s" % e
+
+        # ══ B2 배터리(§3 — 서명·고정 거부·done-deferred·demote·checkout 강등 경고) ══
+        with tempfile.TemporaryDirectory(prefix="javis-task-b2-") as broot:
+            b_tasks = os.path.join(broot, "_round", "tasks")
+            exit_map_ok = {"kind": "exit_map", "pass_exits": [0]}
+            del_spec = json.dumps({"mode": "command", "cmd": "rm -rf /tmp/b2-junk",
+                                   "pass_rule": exit_map_ok})
+
+            # ── B2① 삭제 어휘: 무서명 = exit 2 / --signed-by = 등록 성공 + high 승격 ──
+            rc, _, e = run(broot, ["create", "Tb2", "--id", "Tb2"])
+            assert rc == 0, "B2 create 실패: %s" % e
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json", del_spec])
+            assert rc == EXIT_USAGE and "high-risk" in e and "--signed-by" in e, \
+                "B2 삭제 어휘 무서명 등록 미거부: rc=%s err=%s" % (rc, e)
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json", del_spec,
+                                   "--signed-by", "master"])
+            assert rc == EXIT_OK, "B2 서명 등록 실패: %s" % e
+            b2risk = read_task(broot, "Tb2")["verify_spec"]["risk"]
+            assert b2risk["class"] == "high" and b2risk["signed_by"] == "master" \
+                and b2risk["signed_at"], "B2 서명 승격 오기록: %s" % b2risk
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json",
+                                   json.dumps({"mode": "command",
+                                               "cmd": "curl https://x.test/health",
+                                               "pass_rule": exit_map_ok})])
+            assert rc == EXIT_USAGE and "네트워크" in e, \
+                "B2 네트워크 어휘 무서명 미거부: rc=%s err=%s" % (rc, e)
+            # ── B2② push생산·서버기동 = 서명 불문 고정 거부 ──
+            for bad_cmd in ("cys send --to master done", "bun run server.ts"):
+                rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json",
+                                       json.dumps({"mode": "command", "cmd": bad_cmd,
+                                                   "pass_rule": exit_map_ok}),
+                                       "--signed-by", "master"])
+                assert rc == EXIT_USAGE and "고정 거부" in e, \
+                    "B2 고정 거부 어휘(%r)가 서명으로 통과: rc=%s err=%s" % (bad_cmd, rc, e)
+            # ── B2③(G2 수리 반영) 일반 cmd: 기존 high spec 교체는 G2 게이트 — 무 force 거부 →
+            #    --force-respec 통과+auto 강등(세탁 경로가 원장 기록 없이는 닫힘을 실증) ──
+            benign_spec = json.dumps({"mode": "command", "cmd": "echo ok",
+                                      "pass_rule": exit_map_ok})
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json", benign_spec])
+            assert rc == EXIT_USAGE and "respec blocked" in e, \
+                "G2 기존 high spec 의 무 force 교체 미거부: rc=%s err=%s" % (rc, e)
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2", "--json", benign_spec,
+                                   "--force-respec"])
+            assert rc == EXIT_OK, "G2 --force-respec 일반 cmd 등록 실패: %s" % e
+            assert read_task(broot, "Tb2")["verify_spec"]["risk"]["class"] == "auto", \
+                "B2 일반 cmd 가 auto 아님: %s" % read_task(broot, "Tb2")["verify_spec"]["risk"]
+            # 신규 태스크 첫 등록(기존 상태 없음) = G2 무발동·일반 cmd 무서명 통과(회귀 0)
+            rc, _, e = run(broot, ["create", "Tb2f", "--id", "Tb2f"])
+            assert rc == 0
+            rc, _, e = run(broot, ["set-verify-spec", "Tb2f", "--json", benign_spec])
+            assert rc == EXIT_OK, "B2 첫 등록 일반 cmd 실패(G2 오발동 의심): %s" % e
+            # ── G4: 위험 어휘 대소문자 무시 — RM/CURL 케이스 변조 우회 차단 ──
+            for g4_cmd, g4_word in (("RM -rf /tmp/b2-x", "삭제"),
+                                    ("CURL https://x.test", "네트워크")):
+                rc, _, e = run(broot, ["set-verify-spec", "Tb2f", "--json",
+                                       json.dumps({"mode": "command", "cmd": g4_cmd,
+                                                   "pass_rule": exit_map_ok})])
+                assert rc == EXIT_USAGE and g4_word in e, \
+                    "G4 대문자 어휘(%r) 미검출: rc=%s err=%s" % (g4_cmd, rc, e)
+
+            # ── B2④ done-deferred: 일반 spec = 통과+라벨 병기 ──
+            setup_checked_out(broot, "Tb3")
+            with open(os.path.join(b_tasks, "Tb3.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tb3", "deferred": True,
+                           "last_verdict": "SKIPPED_BUDGET"}, f)
+            art3 = mkfile(broot, "b2-ev3.txt", "budget deferred evidence\n")
+            rc, _, e = run(broot, ["set-status", "Tb3", "done", "--evidence",
+                                   "budget 소진 관측 완료", "--evidence-artifact", art3] + OV)
+            assert rc == EXIT_OK and "verify-deferred" in e, \
+                "B2 일반 deferred done 통과+고지 실패: rc=%s err=%s" % (rc, e)
+            ev3 = read_task(broot, "Tb3")["evidence"]
+            assert ev3.get("verify_deferred") is True \
+                and "[verify-deferred]" in ev3.get("text", ""), \
+                "B2 verify-deferred 라벨 병기 누락: %s" % ev3
+            # high spec + 미해소 VERIFY_FAIL = exit 4 차단
+            setup_checked_out(broot, "Tb4")
+            rc, _, e = run(broot, ["set-verify-spec", "Tb4", "--json", del_spec,
+                                   "--signed-by", "master"])
+            assert rc == EXIT_OK, "B2 Tb4 서명 등록 실패: %s" % e
+            with open(os.path.join(b_tasks, "Tb4.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tb4", "deferred": False,
+                           "last_verdict": "VERIFY_FAIL"}, f)
+            art4 = mkfile(broot, "b2-ev4.txt", "high-risk attempt evidence\n")
+            rc, _, e = run(broot, ["set-status", "Tb4", "done", "--evidence",
+                                   "고위험 미검증 시도", "--evidence-artifact", art4] + OV)
+            assert rc == EXIT_BLOCKED and "done blocked(4)" in e, \
+                "B2 high deferred done 이 exit 4 아님: rc=%s err=%s" % (rc, e)
+            assert read_task(broot, "Tb4")["status"] != "done", "B2 차단인데 done 전이됨"
+            # guard.json 부재 = 무간섭(회귀 0)
+            setup_checked_out(broot, "Tb5")
+            art5 = mkfile(broot, "b2-ev5.txt", "clean done evidence\n")
+            rc, _, e = run(broot, ["set-status", "Tb5", "done", "--evidence",
+                                   "정상 완료 검증됨", "--evidence-artifact", art5] + OV)
+            assert rc == EXIT_OK and "verify-deferred" not in e, \
+                "B2 guard.json 부재 done 회귀: rc=%s err=%s" % (rc, e)
+
+            # ── G1(수리): done-deferred 내구 신호 합성 — SKIPPED_* 마스킹 창 차단 ──
+            #    VERIFY_FAIL(block_count 적재) 후 SKIPPED_CYCLE 1회가 last_verdict 를 덮어도
+            #    block_count·last_sig(PASS 로만 리셋)가 잔존을 증언 → high done 차단 유지.
+            setup_checked_out(broot, "Tb8")
+            rc, _, e = run(broot, ["set-verify-spec", "Tb8", "--json", del_spec,
+                                   "--signed-by", "master"])
+            assert rc == EXIT_OK, "G1 Tb8 서명 등록 실패: %s" % e
+            with open(os.path.join(b_tasks, "Tb8.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tb8", "deferred": False,
+                           "last_verdict": "SKIPPED_CYCLE", "block_count": 3,
+                           "last_sig": "sigG1"}, f)
+            art8 = mkfile(broot, "b2-ev8.txt", "masked residue evidence\n")
+            rc, _, e = run(broot, ["set-status", "Tb8", "done", "--evidence",
+                                   "마스킹 잔존 시도", "--evidence-artifact", art8] + OV)
+            assert rc == EXIT_BLOCKED and "block_count=3" in e, \
+                "G1 마스킹 잔존(SKIPPED_CYCLE·block_count 3) done 미차단: rc=%s err=%s" % (rc, e)
+            # PASS 상태(내구 신호 전부 리셋: block_count 0·sig None) → 통과·라벨 없음
+            with open(os.path.join(b_tasks, "Tb8.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tb8", "deferred": False,
+                           "last_verdict": "PASS", "block_count": 0, "last_sig": None}, f)
+            rc, _, e = run(broot, ["set-status", "Tb8", "done", "--evidence",
+                                   "PASS 후 완료", "--evidence-artifact", art8] + OV)
+            assert rc == EXIT_OK and "verify-deferred" not in e, \
+                "G1 PASS 리셋 후 done 미통과: rc=%s err=%s" % (rc, e)
+            # 일반(비-high) spec 의 NO_BLOCK_PASS 잔존(last_sig) → 통과+라벨 병기
+            setup_checked_out(broot, "Tb9")
+            with open(os.path.join(b_tasks, "Tb9.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tb9", "deferred": False,
+                           "last_verdict": "NO_BLOCK_PASS", "block_count": 0,
+                           "last_sig": "sigNB"}, f)
+            art9 = mkfile(broot, "b2-ev9.txt", "nbp residue evidence\n")
+            rc, _, e = run(broot, ["set-status", "Tb9", "done", "--evidence",
+                                   "NO_BLOCK_PASS 잔존", "--evidence-artifact", art9] + OV)
+            assert rc == EXIT_OK and "verify-deferred" in e, \
+                "G1 일반 spec NBP 잔존(last_sig) 라벨 미병기: rc=%s err=%s" % (rc, e)
+
+            # ── G2(수리): 미해소 guard 상태(VERIFY_FAIL)의 무서명 재등록 거부 + force 원장 ──
+            b2_runs = os.path.join(broot, "probe_runs.jsonl")
+            rc, _, e = run(broot, ["set-verify-spec", "Tb4", "--json", benign_spec])
+            assert rc == EXIT_USAGE and "respec blocked" in e and "미해소 guard" in e, \
+                "G2 high+VERIFY_FAIL 무서명 재등록 미거부: rc=%s err=%s" % (rc, e)
+            rc, _, e = run(broot, ["set-verify-spec", "Tb4", "--json", benign_spec,
+                                   "--force-respec"],
+                           {"CYS_PROBE_RUNS": b2_runs})
+            assert rc == EXIT_OK, "G2 --force-respec 통과 실패: %s" % e
+            with open(b2_runs, encoding="utf-8") as f:
+                fr = [json.loads(ln) for ln in f if ln.strip()]
+            fr = [r for r in fr if r.get("probe") == "task-audit"
+                  and r.get("audit") == "force-respec" and r.get("target") == "Tb4"]
+            assert len(fr) == 1, "G2 force-respec 원장 1줄 아님: %s" % fr
+
+            # ── B2⑤ --demote-calibrated: true→false 전이·멱등·spec 부재 거부 ──
+            rc, _, e = run(broot, ["create", "Tb6", "--id", "Tb6"])
+            assert rc == 0
+            rc, _, e = run(broot, ["set-verify-spec", "Tb6", "--json",
+                                   json.dumps({"mode": "command", "cmd": "echo ok",
+                                               "pass_rule": exit_map_ok,
+                                               "calibrated": True})])
+            assert rc == EXIT_OK, "B2 calibrated spec 등록 실패: %s" % e
+            rc, out, e = run(broot, ["set-verify-spec", "Tb6", "--demote-calibrated"])
+            assert rc == EXIT_OK and json.loads(out)["demoted"] is True, \
+                "B2 demote 전이 실패: rc=%s out=%s" % (rc, out)
+            _tb6_spec = read_task(broot, "Tb6")["verify_spec"]
+            assert _tb6_spec["calibrated"] is False, "B2 demote 후 calibrated 가 false 아님"
+            assert _tb6_spec.get("demoted_at"), \
+                "G7d demoted_at 병기 누락: %s" % _tb6_spec
+            rc, out, e = run(broot, ["set-verify-spec", "Tb6", "--demote-calibrated"])
+            assert rc == EXIT_OK and json.loads(out)["demoted"] is False, \
+                "B2 demote 멱등 위반: %s" % out
+            rc, _, e = run(broot, ["create", "Tb7", "--id", "Tb7"])
+            assert rc == 0
+            rc, _, e = run(broot, ["set-verify-spec", "Tb7", "--demote-calibrated"])
+            assert rc == EXIT_USAGE and "강등 대상 없음" in e, \
+                "B2 spec 부재 demote 미거부: rc=%s err=%s" % (rc, e)
+            # checkout 강등 경고(G7d 수리): 근거 = spec.demoted_at — guard.json **부재**인 채로
+            # strict 통과+경고 표면화(사이드카 소실과 무관함을 실증)
+            assert not os.path.isfile(os.path.join(b_tasks, "Tb6.guard.json")), \
+                "G7d 전제 위반: Tb6.guard.json 이 존재(사이드카 무관성 검증 불가)"
+            rc, _, e = run(broot, ["checkout", "Tb6", "--owner", "w1"],
+                           {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_OK and "calibrated 강등" in e and "demoted_at" in e, \
+                "G7d 강등 상태 strict checkout 경고(demoted_at 기준) 부재/차단: rc=%s err=%s" \
+                % (rc, e)
     except AssertionError as ex:
         print("javis_task self-test FAIL: %s" % ex, file=sys.stderr)
         return 1
@@ -2037,7 +2449,14 @@ def cmd_self_test(args):
           "A3 스키마 parity / B1 guard-claim — checkout 기록·release/터미널 소거(교차 surface)·"
           "무sid 무동작·거부 경로 무claim / F3 --claim-surface 기록·env 대비 우선 / "
           "F5 사이드카 list 오염 0·예약 접미 id 거부(create·show) / "
-          "F6 probe args 형식 경고 fail-open)")
+          "F6 probe args 형식 경고 fail-open / "
+          "B2 — 삭제·네트워크 무서명 거부·--signed-by high 승격·push생산/서버기동 고정 거부·"
+          "일반 cmd auto(첫 등록)·done-deferred(일반 라벨 병기·high exit4·부재 회귀 0)·"
+          "--demote-calibrated 전이/멱등/부재 거부·strict checkout 강등 경고(demoted_at 기준·"
+          "guard.json 무관 — G7d) / "
+          "B2 수리 — G1 내구 신호 합성(SKIPPED_CYCLE+block_count 마스킹 차단·PASS 리셋 통과·"
+          "NBP last_sig 라벨)·G2 재등록 게이트(high 교체/미해소 guard 거부·--force-respec "
+          "통과+task-audit 원장 1줄)·G4 대소문자 어휘(RM·CURL 검출))")
     return EXIT_OK
 
 
@@ -2102,6 +2521,15 @@ def main(argv=None):
     g = c.add_mutually_exclusive_group(required=True)
     g.add_argument("--file", default=None, help="verify_spec JSON 파일 경로")
     g.add_argument("--json", default=None, help="verify_spec JSON 문자열")
+    g.add_argument("--demote-calibrated", dest="demote_calibrated", action="store_true",
+                   help="B2(조건 07②): calibrated=false 강등 전이(guard timeout_violations≥2 "
+                        "소비 경로 · wlock 직렬화 · 멱등)")
+    c.add_argument("--signed-by", dest="signed_by", default=None,
+                   help="B2(조건 30③): 삭제·네트워크 어휘 cmd 의 인간 서명(approver) — "
+                        "서명 전 리뷰어 ACCEPT 의무는 계약 문서 조항")
+    c.add_argument("--force-respec", dest="force_respec", action="store_true",
+                   help="B2 G2: 미해소 guard 상태/기존 high spec 교체의 명시 강제 재등록 — "
+                        "task-audit 원장 1줄(force-respec) 기록 동반")
     c.set_defaults(fn=cmd_set_verify_spec)
 
     c = sub.add_parser("ready")

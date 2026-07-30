@@ -8,7 +8,7 @@
 
   "MODE_ENUM": ["command", "procedural", "probe", "waiver"],
 
-  "TOP_KEYS": ["schema_version", "mode", "cmd", "cwd", "pass_rule", "probe", "procedural", "waiver_ref", "timeout_s", "n_of_m", "harness_ref", "calibrated", "risk", "template", "template_origin"],
+  "TOP_KEYS": ["schema_version", "mode", "cmd", "cwd", "pass_rule", "probe", "procedural", "waiver_ref", "timeout_s", "n_of_m", "harness_ref", "calibrated", "risk", "template", "template_origin", "demoted_at"],
 
   "REQUIRED_TOP": ["mode"],
 

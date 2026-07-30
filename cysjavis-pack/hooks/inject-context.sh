@@ -193,5 +193,15 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
   fi
 fi
 
+# ---------- ★계측(조건 12 · Phase1 B2): 주입 총 바이트 .state_log 1줄 — baseline 실측 확보 ----------
+# graceful: STATE(_round) 미확정이면 스킵 · 기록 실패도 주입 자체에 무영향.
+# G7f: 그룹화 { ...; } 2>/dev/null — `cmd >> f 2>/dev/null` 은 `>> f` 리다이렉션 자체가
+# 실패(권한·부재 디렉터리)하면 그 오류가 아직 미전환된 stderr 로 새어 주석 주장("무영향")과
+# 어긋난다. 그룹의 stderr 를 먼저 /dev/null 로 돌려 리다이렉션 실패까지 무음 흡수한다.
+if [ -n "$STATE" ]; then
+  INJ_BYTES=$(printf '%b' "$OUT" | wc -c | tr -d ' ')
+  { echo "$(date -Iseconds 2>/dev/null || date)	SessionStart-inject	source=$SOURCE bytes=${INJ_BYTES:-0}" >> "$(dirname "$STATE")/.state_log"; } 2>/dev/null
+fi
+
 printf '%b' "$OUT"
 exit 0

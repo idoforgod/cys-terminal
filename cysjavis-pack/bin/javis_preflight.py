@@ -14,6 +14,7 @@
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -4121,6 +4122,331 @@ class Preflight:
                 detail += " · 선택 키 결손(정상 가능): " + "; ".join(notes)
             self.add(cid, PASS, detail)
 
+    # ═══ Phase 1 Wave B2 신규 4종 (C72~C75 · DESIGN-DECISIONS §3 · 조건 18①·D4·05④·02④) ═══
+    # 전부 read-only·부작용 0·self.results/planned 미참조 — report 스레드풀 안전(§5-4 규율).
+    # cid 는 C72부터(C63·C64 결번 재사용 금지 — T0 §5-4).
+
+    # C72 상호 정합 핀 — Phase1 게이트 3점 세트의 '세대 문자열'(C03 content-pin 문법 답습).
+    # 핀이 있는 구성요소는 현 세대, 없는 것은 구세대다 — 어느 쪽이 구세대인지 명시(조건 18①).
+    C72_TASK_PINS = (
+        ("verify-spec missing(6)", "checkout exit6 게이트 stderr 고정 문면(T1)"),
+        (".verify-gate-activated", "grandfather 활성 마커 상수(T1)"),
+        ("EXIT_VERIFY = 6", "exit 6 배정(D9)"),
+        ("--demote-calibrated", "calibrated 강등 내부 경로(B2 · 조건 07②)"),
+    )
+    C72_GUARD_PINS = (
+        ("SKIPPED_NO_SPEC", "판정 enum 10종 세대(B1)"),
+        (".guard-claim.", "태스크 바인딩 파일 계약(B1 §2-1)"),
+        ("verify-budget", "verifier tax 샤드 소비부(B1/B2 §3)"),
+    )
+    C72_SCHEMA_MODE_ENUM = ["command", "procedural", "probe", "waiver"]
+    _C72_RESERVED_RE = re.compile(r"RESERVED_ID_SUFFIXES\s*=\s*\(([^)]*)\)")
+
+    def c72_phase1_gate_set(self):
+        cid = "C72.phase1-gate-set"
+        if self.skipped(cid):
+            return
+        bin_dir = os.path.join(pack_dir(), "bin")
+        task_p = os.path.join(bin_dir, "javis_task.py")
+        guard_p = os.path.join(bin_dir, "javis_completion_guard.py")
+        schema_p = os.path.join(pack_dir(), "schemas", "verify_spec_schema.json")
+        probs = []
+
+        def _read(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return f.read()
+            except OSError:
+                return None
+
+        task_txt = _read(task_p)
+        if task_txt is None:
+            probs.append("javis_task.py 판독 불가(%s) — 게이트 본체 소실" % task_p)
+        else:
+            for pin, why in self.C72_TASK_PINS:
+                if pin not in task_txt:
+                    probs.append("javis_task.py 구세대 — 마커 %r 부재(%s)" % (pin, why))
+        guard_txt = _read(guard_p)
+        if guard_txt is None:
+            probs.append("javis_completion_guard.py 부재/판독 불가(%s) — guard 구성요소 "
+                         "구세대/미배포(3중 부재 회귀 · 조건 18①)" % guard_p)
+        else:
+            for pin, why in self.C72_GUARD_PINS:
+                if pin not in guard_txt:
+                    probs.append("javis_completion_guard.py 구세대 — 마커 %r 부재(%s)"
+                                 % (pin, why))
+        try:
+            with open(schema_p, encoding="utf-8") as f:
+                schema_doc = json.load(f)
+            if not isinstance(schema_doc, dict):
+                probs.append("verify_spec_schema.json 구조 손상(최상위 비객체)")
+            elif schema_doc.get("MODE_ENUM") != self.C72_SCHEMA_MODE_ENUM:
+                probs.append("verify_spec_schema.json 구세대 — MODE_ENUM %r ≠ 기대 %r"
+                             % (schema_doc.get("MODE_ENUM"), self.C72_SCHEMA_MODE_ENUM))
+        except (OSError, ValueError) as e:
+            probs.append("verify_spec_schema.json 부재/손상(%s) — %s" % (schema_p, e))
+        # 상호 해시급 정합: 예약 접미 튜플이 두 파일에서 동일해야 한다(F5 네임스페이스 계약).
+        if task_txt is not None and guard_txt is not None:
+            mt = self._C72_RESERVED_RE.search(task_txt)
+            mg = self._C72_RESERVED_RE.search(guard_txt)
+            norm = lambda m: re.sub(r"\s+", "", m.group(1)) if m else None  # noqa: E731
+            if norm(mt) is None or norm(mg) is None or norm(mt) != norm(mg):
+                probs.append("javis_task↔guard RESERVED_ID_SUFFIXES 불일치(%r vs %r) — "
+                             "두 구성요소가 서로 다른 세대(찢김)"
+                             % (norm(mt), norm(mg)))
+        if probs:
+            self.add(cid, FAIL, " | ".join(probs) + " — 팩 원자쌍 재배포로 세대 일치 필요")
+            return
+        # 찢김 없음 — 운영 마커 표면화(WARN 층): guard-disarmed·stale CYCLE(TTL 초과).
+        warns = []
+        root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+        tasks_dir = os.path.join(root, "_round", "tasks")
+        try:
+            names = os.listdir(tasks_dir)
+        except OSError:
+            names = []
+        disarmed = sorted(n[:-len(".guard-disarmed")] for n in names
+                          if n.endswith(".guard-disarmed"))
+        if disarmed:
+            warns.append("guard-disarmed %d건(회로차단기 개방 — 재무장=master 마커 삭제): %s"
+                         % (len(disarmed), ", ".join(disarmed[:8])))
+        # G7e: TTL 은 guard 모듈 상수를 흡수(C75 형제 import 전례) — 수기 복제(30*60)는
+        # guard 측 TTL 변경 시 조용히 어긋나는 드리프트 창이라 제거. import 불가 = 1800 폴백.
+        try:
+            import javis_completion_guard as _jcg
+            cycle_ttl = getattr(_jcg, "CYCLE_TTL_SEC", 1800)
+        except Exception:  # noqa: BLE001 — 부재/찢김은 위 guard 핀 층이 이미 FAIL 로 표면화
+            cycle_ttl = 1800
+        stale_cyc = []
+        for n in names:
+            if not n.startswith("CYCLE_IN_PROGRESS."):
+                continue
+            with contextlib.suppress(OSError):
+                age = time.time() - os.stat(os.path.join(tasks_dir, n)).st_mtime
+                if age > cycle_ttl:
+                    stale_cyc.append("%s(%.0f분)" % (n, age / 60))
+        if stale_cyc:
+            warns.append("stale CYCLE 마커(TTL %d분 초과 — 고아 clear 흔적·guard 는 무시 진행): %s"
+                         % (cycle_ttl // 60, ", ".join(sorted(stale_cyc)[:8])))
+        # G6(성찰 2): 무장 env 조합 점검 — 이 프로세스가 무장 pane 에서 돌 때만 의미(평시
+        # master 프리플라이트는 비무장 → 무발화). 조합 = cap 미설정 ∧ self-cap 0: grill 블록
+        # K 가 하네스 Stop 지갑(기본 8+1=9)을 선점하면 guard escalation(N=3) 도달 전 소진
+        # (9−K<N 선점 산술 — guard _warn_armed_combo 런타임 경보의 프리플라이트 짝).
+        if (os.environ.get("CYS_COMPLETION_GUARD") == "1"
+                and not os.environ.get("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP", "").strip()
+                and os.environ.get("GRILL_STOP_SELF_CAP", "0").strip() in ("", "0")):
+            warns.append("무장 env 조합 위험(G6 — 선점 산술 9−K<N): CYS_COMPLETION_GUARD=1 ∧ "
+                         "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP 미설정 ∧ GRILL_STOP_SELF_CAP=0 — "
+                         "cap 상향+self-cap 활성 원자 조합 적용 요망(OT-2)")
+        if warns:
+            self.add(cid, WARN, "게이트 3점 세대 정합 OK · " + " | ".join(warns))
+        else:
+            self.add(cid, PASS, "Phase1 게이트 3점 세트 세대 정합(javis_task 마커 %d·guard 마커 "
+                                "%d·schema MODE_ENUM·예약 접미 상호 일치) · disarmed 0 · "
+                                "stale CYCLE 0" % (len(self.C72_TASK_PINS),
+                                                   len(self.C72_GUARD_PINS)))
+
+    # C73 — 워커 프로필 settings 훅 무결성(D4: 블록 압박 하 모델의 훅 자가제거 실측 대응).
+    # 기대 집합 마커 = $PACK/state/guard-hook-expected.json (없으면 SKIP — OT-2 등록 전 상태).
+    # 스키마: {"schema_version":1, "profiles":[{"settings":"<abs settings.json>",
+    #          "sha256":"<hex·선택>", "must_contain":["<부분문자열>", ...]}]}
+    def c73_guard_hook_integrity(self):
+        cid = "C73.guard-hook-integrity"
+        if self.skipped(cid):
+            return
+        exp_p = os.path.join(pack_dir(), "state", "guard-hook-expected.json")
+        if not os.path.isfile(exp_p):
+            self.add(cid, SKIP, "기대 집합 마커 부재(%s) — guard 훅 라이브 등록 전(OT-2) 정상"
+                     % exp_p)
+            return
+        try:
+            with open(exp_p, encoding="utf-8") as f:
+                exp = json.load(f)
+            profiles = exp["profiles"]
+            assert isinstance(profiles, list)
+        except Exception as e:  # noqa: BLE001 — 마커 손상은 WARN(감시 불능 표면화·부트 비차단)
+            self.add(cid, WARN, "기대 집합 마커 손상(%s) — 훅 무결성 감시 불능: %s" % (exp_p, e))
+            return
+        # G7g 판정 서열: must_contain(등록 실존)이 1급 신호 — 통과 시 sha 불일치는 WARN 강등.
+        # settings 는 정당 사유(권한 추가·모델 변경 등)로도 바뀌는 파일이라 sha 단독 FAIL 은
+        # 오경보 양산 경로다. ★갱신 책임 명문: settings 를 정당 변경한 주체가 같은 변경에서
+        # guard-hook-expected.json 의 sha256 을 재계산·갱신할 책임을 진다(방치 = WARN 잔존).
+        probs, warns, oks = [], [], 0
+        import hashlib
+        for ent in profiles:
+            if not isinstance(ent, dict) or not ent.get("settings"):
+                probs.append("마커 항목 형식 오류: %r" % (ent,))
+                continue
+            sp = os.path.expanduser(str(ent["settings"]))
+            try:
+                raw = open(sp, "rb").read()
+            except OSError:
+                probs.append("%s: settings 부재/판독 불가 — 등록 소실 의심(D4)" % sp)
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            missing = [m for m in (ent.get("must_contain") or []) if str(m) not in text]
+            if missing:
+                probs.append("%s: 등록 부재 %s — 훅 자가제거 의심(D4 실측: 블록 압박 하 "
+                             "update-config 자발 시도)" % (sp, ", ".join(map(repr, missing))))
+                continue
+            want_sha = str(ent.get("sha256") or "").lower()
+            if want_sha:
+                got = hashlib.sha256(raw).hexdigest()
+                if got != want_sha:
+                    warns.append("%s: 체크섬 불일치(기대 %s… ≠ 실측 %s…) — must_contain 은 "
+                                 "전부 존재: 정당 설정 변경 가능성 → WARN 강등(G7g · 변경 "
+                                 "주체가 기대 마커 sha256 갱신 책임)" % (sp, want_sha[:12],
+                                                                        got[:12]))
+                    continue
+            oks += 1
+        if probs:
+            self.add(cid, FAIL, " | ".join(probs + warns))
+        elif warns:
+            self.add(cid, WARN, " | ".join(warns))
+        else:
+            self.add(cid, PASS, "워커 프로필 settings 훅 무결성 OK(%d/%d 프로필 — 등록 존재·"
+                                "체크섬 일치)" % (oks, len(profiles)))
+
+    # C74 — brief 게이트 2경로 배선(조건 05④·21③·28): ①checkout --brief hard 경로 코드
+    # ②인세션 경고 훅(brief-lint-warn.sh) 등록. 등록 대상표 = env CYS_BRIEF_WARN_PROFILES
+    # (콤마) 또는 $PACK/state/brief-warn-expected.txt(프로필 dotdir basename 목록) — 표 부재
+    # 시 전 프로필 스캔으로 존재 여부만 본다. 미등록 = WARN(라이브 등록은 OT-2 — FAIL 아님).
+    def c74_brief_gate_paths(self):
+        cid = "C74.brief-gate-paths"
+        if self.skipped(cid):
+            return
+        probs, warns = [], []
+        task_p = os.path.join(pack_dir(), "bin", "javis_task.py")
+        lint_p = os.path.join(pack_dir(), "bin", "javis_brief_lint.py")
+        hook_p = os.path.join(pack_dir(), "hooks", "brief-lint-warn.sh")
+        try:
+            task_txt = open(task_p, encoding="utf-8").read()
+        except OSError:
+            task_txt = ""
+        if not ("--brief" in task_txt and "javis_brief_lint" in task_txt):
+            probs.append("checkout --brief hard 경로 코드 부재(javis_task.py grep — T1 회귀)")
+        if not os.path.isfile(lint_p):
+            probs.append("javis_brief_lint.py 부재 — 두 경로 모두 엔진 소실")
+        if not os.path.isfile(hook_p):
+            probs.append("hooks/brief-lint-warn.sh 부재 — 인세션 경고 경로 실체 소실")
+        # 등록 대상표(분리 독립 — guard 대상표와 별개 · §1-3 R1-contract)
+        env_names = os.environ.get("CYS_BRIEF_WARN_PROFILES", "")
+        names = tuple(x.strip() for x in env_names.split(",") if x.strip())
+        if not names:
+            with contextlib.suppress(OSError):
+                with open(os.path.join(pack_dir(), "state", "brief-warn-expected.txt"),
+                          encoding="utf-8") as f:
+                    names = tuple(ln.strip() for ln in f
+                                  if ln.strip() and not ln.startswith("#"))
+        settings = discover_claude_settings()
+
+        def _registered(sp):
+            try:
+                return "brief-lint-warn.sh" in open(sp, encoding="utf-8").read()
+            except OSError:
+                return False
+
+        if names:
+            targets = [s for s in settings
+                       if os.path.basename(os.path.dirname(s)) in names]
+            miss = [os.path.basename(os.path.dirname(s)) for s in targets
+                    if not _registered(s)]
+            absent = [n for n in names if n not in
+                      {os.path.basename(os.path.dirname(s)) for s in settings}]
+            if miss or absent:
+                warns.append("경고 훅 미등록(대상표 기준): %s — 라이브 등록은 OT-2 승인 라인"
+                             % ", ".join(sorted(set(miss) | set(absent))))
+        else:
+            reg = [s for s in settings if _registered(s)]
+            if not reg:
+                warns.append("경고 훅 등록 0 프로필(대상표 미공급·전 프로필 스캔) — "
+                             "인세션 경고 경로 무음 비활성(라이브 등록=OT-2)")
+        if probs:
+            self.add(cid, FAIL, " | ".join(probs + warns))
+        elif warns:
+            self.add(cid, WARN, "hard 경로 코드·엔진·훅 실체 OK · " + " | ".join(warns))
+        else:
+            self.add(cid, PASS, "brief 게이트 2경로 OK(checkout --brief 코드 + 경고 훅 등록)")
+
+    # C75 — 배포 직전 열린+무spec 태스크 재스캔(조건 02④ — U22 스냅샷 재사용 금지·매 실행
+    # 재실측). 라이브 _round/tasks **읽기 전용**. 5건 초과 = strict 승격 부적격 FAIL.
+    # T1 descope 이연 2건 수용처: grandfathered 목록(02② HUD 목록 대체 표면화) +
+    # 유예-중 waiver 목록(16③ 매일 경보 대체 표면화).
+    def c75_verify_spec_rescan(self):
+        cid = "C75.verify-spec-rescan"
+        if self.skipped(cid):
+            return
+        root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+        tasks_dir = os.path.join(root, "_round", "tasks")
+        if not os.path.isdir(tasks_dir):
+            self.add(cid, SKIP, "%s 부재 — 태스크 보드 없는 환경" % tasks_dir)
+            return
+        try:
+            import javis_task as _jt  # 형제 모듈 — OPEN_STATUSES·waiver 판정 재사용(읽기 전용)
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, WARN, "javis_task import 실패(%s) — 재스캔 불능(버전 찢김 의심)" % e)
+            return
+        open_statuses = set(getattr(_jt, "OPEN_STATUSES", ["backlog", "todo", "in_progress",
+                                                           "in_review", "blocked"]))
+        reserved = tuple(getattr(_jt, "RESERVED_FILE_SUFFIXES",
+                                 (".guard.json", ".esc-bundle.json")))
+        no_spec, grandfathered, waiver_grace, parse_fail = [], [], [], 0
+        gf_closed = 0
+        try:
+            names = sorted(os.listdir(tasks_dir))
+        except OSError as e:
+            self.add(cid, WARN, "태스크 디렉터리 판독 불가(%s)" % e)
+            return
+        for n in names:
+            if not n.endswith(".json") or n.startswith(".") or n.endswith(reserved):
+                continue
+            try:
+                with open(os.path.join(tasks_dir, n), encoding="utf-8") as f:
+                    t = json.load(f)
+            except (OSError, ValueError):
+                parse_fail += 1
+                continue
+            if not isinstance(t, dict) or "status" not in t:
+                continue
+            tid = t.get("id") or n[:-5]
+            is_open = t.get("status") in open_statuses
+            gf = t.get("grandfathered") is True
+            if gf:
+                # G3: grandfathered 목록은 **열린 태스크 한정** — closed(done·cancelled)는
+                # 승격 리스크 표면이 아니므로 '(closed N건)' 분리 집계만(목록 소음 제거).
+                if is_open:
+                    grandfathered.append(tid)
+                else:
+                    gf_closed += 1
+            spec = t.get("verify_spec")
+            if is_open and (not isinstance(spec, dict) or not spec):
+                # G3(과계상 수리): grandfathered=true 는 초과 계수에서 **제외** — 게이트
+                # 설계(§1-2)가 이미 WARN 통과로 면제한 구세대분이라 strict 승격 부적격
+                # 산술(>5 FAIL)에 재계상하면 이중 계상이다. 별도 목록 표면화는 유지(위).
+                if not gf:
+                    no_spec.append(tid)
+            elif is_open and isinstance(spec, dict) and spec.get("mode") == "waiver":
+                with contextlib.suppress(Exception):
+                    rec = _jt._load_waiver(spec.get("waiver_ref") or "")
+                    if rec is not None and _jt._waiver_state(rec)[0] == "grace":
+                        waiver_grace.append(tid)
+        detail = ("열린+무spec(비-grandfathered) %d건%s · grandfathered(열린) %d건%s%s · "
+                  "waiver 유예-중 %d건%s%s"
+                  % (len(no_spec),
+                     "(%s)" % ", ".join(no_spec[:10]) if no_spec else "",
+                     len(grandfathered),
+                     "(%s)" % ", ".join(grandfathered[:10]) if grandfathered else "",
+                     "(closed %d건 분리 집계)" % gf_closed if gf_closed else "",
+                     len(waiver_grace),
+                     "(%s)" % ", ".join(waiver_grace[:10]) if waiver_grace else "",
+                     " · 파싱 실패 %d건" % parse_fail if parse_fail else ""))
+        if len(no_spec) > 5:
+            self.add(cid, FAIL, "strict 승격 부적격(조건 02④ — 열린+무spec %d건 > 5): "
+                                "grandfather 완료 전 배포 금지 · %s"
+                     % (len(no_spec), detail))
+        else:
+            self.add(cid, PASS, "strict 승격 재스캔 OK(≤5) — " + detail)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -4153,6 +4479,9 @@ class Preflight:
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             self.c66_board_catalog, self.c67_learn_wiring, self.c69_gate_ledger,
             self.c70_launchd_job, self.c71_agents_schema,
+            # Phase 1 Wave B2(C72~C75) — 마지막 고정 슬롯(C62·C68) 앞(§5-4 배선 규율).
+            self.c72_phase1_gate_set, self.c73_guard_hook_integrity,
+            self.c74_brief_gate_paths, self.c75_verify_spec_rescan,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
