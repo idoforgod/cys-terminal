@@ -580,7 +580,13 @@ def awaken_message(role):
 def inject(role, msg, attempts=4):
     """★`cys send --queued` 단일경로(codex R2 결함4): 큐는 대상이 조용해질 때 메시지+자동 Return 을
     원자적으로 배달한다 → typing_guard 우회(F1)·Return 분리 실패로 인한 중복 입력 위험 제거.
-    (idle-then-inject 로 이미 안착했으므로 큐는 즉시 배달된다.)"""
+    (idle-then-inject 로 이미 안착했으므로 큐는 즉시 배달된다.)
+
+    ★T-0147-2 층1 **I7 — 인벤토리 예외(명시)**: 이 경로(부트·restore·디렉티브 주입)는 master
+    stdin 주입자 인벤토리의 I7 이고 **W5 범위 밖**이다. 근거는 정의다 — W5 가 재는 것은
+    "정상 대기 상태의 반복 wake"이고, 부트 시점 각성 주입은 **정상 대기가 시작되기 전**에
+    끝난다(주기적이지도, 조건 지속형도 아니다). 강등 대상이 아니라 계수 밖이라는 뜻이며,
+    은닉이 아니라 등재된 예외다(설계 층1 표 I7)."""
     for i in range(attempts):
         rcq, _, errq = run(["cys", "send", "--queued", "--to", role, msg], timeout=12)
         if rcq == 0:

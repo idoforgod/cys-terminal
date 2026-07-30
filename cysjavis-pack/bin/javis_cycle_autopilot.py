@@ -349,6 +349,106 @@ def escalate(text, runner=run):
 # ═══════════════════════ CONTRACT BLOCK v1 END ═══════════════════════
 
 
+# ── ★T-0147-2 층1 I3 — escalation 발행 경로를 javis_wakeup 큐로 수렴 ─────────────────
+#
+# 설계 정본: `_round/T-0147-2-DESIGN-wakeup-demotion.md` §2 층1(I3) · §8(R2-C2 수용).
+# 종전 `escalate` 는 `cys send` + `send-key Return` 으로 master stdin 을 **직접** 두드리는
+# 두 번째 발행자였다. 그 경로는 큐의 코얼레싱·멱등·zombie 가드·digest 를 전부 우회하므로
+# 게이트 push 와 무관하게 홍수를 재생산한다. 설계의 불변식은 "trigger-namespace별 단일
+# 발행자" — pack 측 wakeup 은 **레인당 javis_wakeup 큐 하나**로만 나간다. 여기서 수렴시킨다.
+#
+# ⚠이 재정의가 CONTRACT BLOCK v1 **밖**에 있는 것은 의도다(회피가 아니라 범위 준수):
+#   그 블록은 `javis_cycle_verifier.py` 와 **바이트 동일**해야 하고 양쪽 self-test 의
+#   contract-parity 검사가 그것을 박제한다. 설계 층1 표가 지목한 주입자는 autopilot 의 I3
+#   하나뿐이라, 블록 안을 고치면 범위 밖 파일(verifier)까지 같은 변경에 끌려들어간다.
+#   그래서 블록은 원형 그대로 두고 **모듈 수준에서 심볼만 덮어쓴다** — autopilot 안의 모든
+#   escalate 호출부(:879·:1244·:1413)는 아래 정의를 본다. verifier 도 같은 수렴을 받게 될
+#   때는 블록 자체를 옮기는 것이 옳고, 그때 두 파일을 함께 갱신하면 parity 가 유지된다.
+#   (`push_line` 은 건드리지 않는다 — 선통보 주입 :1169 가 그대로 쓴다.)
+
+WAKEUP_SCRIPT_BASENAME = "javis_wakeup.py"
+ESCALATION_TASK_DEFAULT = "autopilot-escalation"
+
+
+def wakeup_script():
+    """javis_wakeup.py 경로 — 형제 파일 우선(레포·배포 팩 양쪽에서 성립), 없으면 팩 bin."""
+    sib = os.path.join(os.path.dirname(os.path.abspath(__file__)), WAKEUP_SCRIPT_BASENAME)
+    return sib if os.path.exists(sib) else os.path.join(pack_dir(), "bin", WAKEUP_SCRIPT_BASENAME)
+
+
+def wakeup_env():
+    """큐 루트를 **명시 고정**해서 javis_wakeup 을 스폰한다(cwd 의존 제거).
+
+    javis_wakeup 의 큐 루트는 `JAVIS_ROOT or os.getcwd()` 다. autopilot 은 schedule/launchd 가
+    스폰하므로 cwd 가 `/` 인 채로 도는 일이 실제로 있었고(cwd=/ 오염 사고 계열), 그러면 큐가
+    엉뚱한 곳에 생겨 escalation 이 **조용히** 사라진다. env 를 넘기는 기법 자체는
+    `javis_report_gate.Runner.wk_env` 와 같은 관례다.
+
+    값의 우선순위: 이미 배선된 `JAVIS_ROOT`(레인 배선이 이긴다) → `PROJECT`(이 스크립트가
+    cycle 원장을 쓰는 그 루트 · 상단 `CYCLE_LOG` 와 동일 관례).
+    ⚠레인 정합 주의: 게이트는 자기 레인 state dir(`CYS_REPORT_GATE_DIR`)를 큐 루트로 쓴다.
+      루트가 갈리면 master 는 '게이트 digest 1건 + autopilot digest 1건'을 받는다(종전 N건
+      대비 급감이지만 완전한 1건은 아니다). 설계 불변식은 **trigger-namespace 비중첩**
+      (`gate-*` vs `autopilot-*`)이라 정합성 자체는 성립한다. 한 큐로 완전히 합치려면 레인
+      배선에서 `JAVIS_ROOT` 를 게이트 state dir 로 맞춰 주면 이 함수가 그대로 따른다.
+    """
+    return dict(os.environ, JAVIS_ROOT=(os.environ.get("JAVIS_ROOT") or PROJECT))
+
+
+def run_wakeup(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
+    """`run` 과 동형이되 큐 루트(JAVIS_ROOT)를 고정해 스폰하는 러너.
+
+    `run` 의 시그니처에는 env 자리가 없고(계약 블록 = 변경 금지), 프로세스 env 를 일시
+    변조하면 kill-switch 폴링 스레드의 스폰과 경쟁한다. 그래서 **전용 러너**를 따로 둔다 —
+    주입 가능성(runner=…)은 그대로다.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, input=stdin_text, env=wakeup_env())
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
+        return 127, "", "runner error: %s" % e
+
+
+def escalate(text, runner=run_wakeup, task_key=None):
+    """master 로 1줄 escalation — **javis_wakeup 큐 경유**(설계 층1 I3).
+
+    반환 계약 `(ok, why)` 와 "실패해도 예외를 올리지 않는다"는 종전 그대로다(원장 = 진실원,
+    escalation 은 그 원장의 부수 통지다).
+
+    `task_key` = escalation 의 **종류** 식별자. 큐의 병합 단위가 (target, task_key) 라 이 값이
+    없으면 성격이 다른 사건들이 한 덩어리로 접힌다. 호출부가 자기 사건을 명시한다(미지정 시
+    `autopilot-escalation`).
+
+    멱등키 = `task_key` + 본문 sha1 접미. task_key 만 쓰면 **다른 사건**(다른 cycle_id·다른
+    사유)까지 통째로 억제되고, 본문 전체를 키로 쓰면 같은 사건의 반복도 매번 새 키가 되어
+    억제가 무동작한다. 본문 해시가 그 사이의 유일한 안정점이다(같은 문구=같은 사건).
+
+    ok 판정:
+      enqueue 실패              → (False, "enqueue rc=..")   큐에 들어가지도 못했다
+      enqueue 성공 · drain 실패 → (True,  "queued(배달 보류)") 큐에 남아 다음 drain 이 배달한다
+                                  (수신자 파킹은 escalation **자체**의 실패가 아니다)
+    """
+    if no_send():
+        return False, "no_send"
+    key = task_key or ESCALATION_TASK_DEFAULT
+    idem = "%s-%s" % (key, hashlib.sha1(text.encode("utf-8")).hexdigest()[:12])
+    script = wakeup_script()
+    rc, _o, err = runner([sys.executable, script, "enqueue", "--to", "master",
+                          "--task", key, "--reason", text,
+                          "--severity", "critical", "--idempotency-key", idem])
+    if rc != 0:
+        return False, "enqueue rc=%d %s" % (rc, (err or "").strip()[:120])
+    rc2, _o2, err2 = runner([sys.executable, script, "drain", "--deliver", "--target", "master"])
+    if rc2 == 5:
+        # javis_wakeup EXIT_EMPTY — 그 사이 다른 drain(게이트 주기)이 가져갔거나 멱등 억제로
+        # 새 pending 이 없었다. 둘 다 "이미 전달됐다"는 뜻이라 성공이다.
+        return True, ""
+    if rc2 != 0:
+        return True, "queued(배달 보류) drain rc=%d %s" % (rc2, (err2 or "").strip()[:120])
+    return True, ""
+
+
 # ── 모드·역할 노브 ────────────────────────────────────────────────────
 MODE_SHADOW, MODE_LIVE = "shadow", "live"
 IDLE_MIN = {"master": 180.0}      # 그 외 역할 = 60s
@@ -877,7 +977,8 @@ def cmd_tick(args):
         _finalize(cid, role, lease.get("surface"), "failed",
                   {"takeover": True, "dead_phase": ph, "lease_status": lstatus})
         escalate("[CYCLE-AUTOPILOT] cycle-%s %s 집행자 사망(phase=%s) — failed 종결. "
-                 "재개는 reset --role %s 후." % (cid, role, ph, role))
+                 "재개는 reset --role %s 후." % (cid, role, ph, role),
+                 task_key="autopilot-executor-death")   # ★I3: 사건 종류별 병합 단위
         print(json.dumps({"result": "takeover-failed", "cycle_id": cid, "phase": ph},
                          ensure_ascii=False))
         return EXIT_OK
@@ -1242,7 +1343,8 @@ def cmd_execute(args):
                   {"reason": "in-flight kill-switch: %s" % aborted, "child_rc": rc,
                    "tail": tail[-400:], "residual_window": RESIDUAL_WINDOW_NOTE})
         escalate("[CYCLE-AUTOPILOT] cycle-%d %s in-flight kill-switch 로 중단(%s)."
-                 % (cid, role, aborted))
+                 % (cid, role, aborted),
+                 task_key="autopilot-killswitch")       # ★I3: 사건 종류별 병합 단위
         return EXIT_KILL
 
     # 4) [v2.1 ④] 자식 종료 = executor_exited (clear 성공을 뜻하지 않는다). exit code 는 기록만.
@@ -1412,7 +1514,8 @@ def post_verify(role, cycle_id, lease, takeover=False):
             reasons.append("stale=%s" % ",".join(os.path.basename(x) for x in v["stale_recovery"]))
         escalate("[CYCLE-AUTOPILOT] cycle-%d %s 사후검증 %s(%s). 해제: "
                  "javis_cycle_autopilot.py reset --role %s --reason '<사유>'"
-                 % (cycle_id, role, v["verdict"], " ".join(reasons), role))
+                 % (cycle_id, role, v["verdict"], " ".join(reasons), role),
+                 task_key="autopilot-postverify")       # ★I3: 사건 종류별 병합 단위
     return v
 
 

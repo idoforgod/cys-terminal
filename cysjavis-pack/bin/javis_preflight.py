@@ -373,6 +373,39 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+# ── B7 레인 분리(T-0147-2 §2 층3 · idle-standby-v5 D2/D3) ────────────────────
+# 델타게이트 상태(대장·카운터·seen-store·배지)는 **데몬(레인)별로 분리**돼야 한다. 공유하면
+# 여러 데몬이 같은 counters 를 밀어 stall 카운터가 배속 증가하고, 한 레인의 배지가 다른 레인의
+# 판정처럼 보인다(설계 §0-7 실측: dept-3 데몬이 base 와 report_gate 공유).
+#
+# ★진짜 계약은 env 이름이 아니라 **파생 규칙**이다: 팩 디렉터리 basename → state_dir.
+#   `pack-dept-<id>` → `$HOME/.cys/state/report_gate-<id>` / 그 밖 → `$HOME/.cys/state/report_gate`.
+#   파생이 필요한 전 site 가 이 헬퍼 하나만 쓴다(샷건 서저리 봉인). 현재 파생 site:
+#     ⓐ C16 배선 bake(신규 append + 마이그레이션 삽입)   ⓑ C69 대장 데드맨 검사
+#   신규 site 는 반드시 이 함수를 경유한다.
+GATE_STATE_ENV = "CYS_REPORT_GATE_DIR"
+
+
+def gate_state_dir_for_pack(pack=None):
+    """팩 정체 → 델타게이트 레인 state_dir(리터럴 경로). javis_report_gate.default_state_dir 과 동형."""
+    base = os.path.basename(os.path.normpath(pack or pack_dir()))
+    m = re.match(r"pack-dept-(.+)$", base)
+    root = os.path.join(os.path.expanduser("~"), ".cys", "state")
+    return os.path.join(root, "report_gate-%s" % m.group(1)) if m \
+        else os.path.join(root, "report_gate")
+
+
+def gate_command_with_lane(command, state_dir):
+    """게이트 잡 command 에 인라인 env 프리픽스를 **삽입만** 한다(재생성 금지).
+
+    ★기존 토큰을 절대 잃지 않는 것이 계약이다: 실측상 일부 레인의 잡은 `run --shadow` 를 보유하고
+      있고, 템플릿 재생성 방식은 그것을 조용히 소실시킨다(idle-standby-v5 D2 3항). 그래서
+      "앞에 붙이기"만 하고 나머지 문자열은 바이트 그대로 둔다. 멱등(이미 있으면 무동작)."""
+    if GATE_STATE_ENV in (command or ""):
+        return command
+    return '%s="%s" %s' % (GATE_STATE_ENV, state_dir, command)
+
+
 def _cys_hook_cmd(script_name):
     """Claude settings.json hook 명령 문자열(단일 진실 — 모든 등록부 공용).
     Windows: git-bash `bash`로 명시 호출 + **정슬래시 + 따옴표**. 미따옴표 역슬래시 경로는 bash가
@@ -1613,6 +1646,27 @@ class Preflight:
                 mode = "text_command(결정론 직접산출)"
             else:
                 mode = "text(master 산출)"
+            # ★B7 레인 분리 마이그레이션(T-0147-2 §2 층3): 게이트 잡이 있어도 레인 env 가
+            #   배선되지 않았으면 여러 데몬이 같은 state 를 밟는다. --fix 는 **토큰 보존 삽입**만
+            #   한다(재생성 금지 — `run --shadow` 같은 기존 인자 소실 차단).
+            unwired = [x for x in jobs if is_gate_report(x)
+                       and GATE_STATE_ENV not in (x.get("command") or "")]
+            if unwired:
+                lane = gate_state_dir_for_pack()
+                if self.fix:
+                    for x in unwired:
+                        x["command"] = gate_command_with_lane(x["command"], lane)
+                    data["jobs"] = jobs
+                    open(p, "w", encoding="utf-8").write(
+                        json.dumps(data, ensure_ascii=False, indent=2))
+                    self.add(cid, FIXED,
+                             "게이트 잡 %d건에 레인 배선 삽입(%s=%s) — 데몬별 state 분리"
+                             % (len(unwired), GATE_STATE_ENV, lane))
+                else:
+                    self.add(cid, FAIL,
+                             "게이트 잡에 레인 배선(%s) 부재 — 다중 데몬 state 공유 위험. "
+                             "--fix로 삽입 가능(기존 인자 보존)" % GATE_STATE_ENV)
+                return
             self.add(cid, PASS, "5분 보고 job 존재: %s (every_minutes=%s ≤5, %s)"
                      % (j.get("id"), j.get("every_minutes"), mode))
             return
@@ -1628,7 +1682,10 @@ class Preflight:
                 "id": "owner-progress-gate-5min",
                 "every_minutes": 5,
                 "action": "command",
-                "command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run',
+                # ★B7: 레인 state_dir 을 **리터럴로 bake** 한다(런타임 env 오염에 비의존).
+                "command": gate_command_with_lane(
+                    'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run',
+                    gate_state_dir_for_pack()),
                 "if_absent": "skip",
             })
             data["jobs"] = jobs
@@ -3927,9 +3984,11 @@ class Preflight:
                     return
             except Exception:
                 pass  # gate-check 실패는 무시하고 대장 검사 계속(비차단)
-        ledger = os.path.join(os.path.expanduser("~"), ".cys", "state", "report_gate", "ledger.jsonl")
-        if os.environ.get("CYS_REPORT_GATE_DIR"):
-            ledger = os.path.join(os.environ["CYS_REPORT_GATE_DIR"], "ledger.jsonl")
+        # ★B7 파생 site ⓑ — 레인별 대장을 본다. 종전에는 env/기본값만 해석해, 격리 이후 부서
+        #   레인이 **본사 대장**을 감시하는 split-brain 이 됐다(idle-standby-v5 D2 ⓑ 실측).
+        ledger = os.path.join(gate_state_dir_for_pack(), "ledger.jsonl")
+        if os.environ.get(GATE_STATE_ENV):
+            ledger = os.path.join(os.environ[GATE_STATE_ENV], "ledger.jsonl")
         if not os.path.isfile(ledger):
             self.add(cid, WARN, "게이트 대장 부재(%s) — 델타게이트 미배선/미가동일 수 있음(비차단)" % ledger)
             return

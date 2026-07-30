@@ -4,7 +4,15 @@
 
 DESIGN §C1 필수 케이스 10종을 Gate 코어에 대역 Runner를 주입해 핀한다(서버·데몬 기동 0).
 외부 명령(javis_report/event/wakeup·cys)은 전부 FakeRunner로 대체 — 호출 여부·인자를 기록해
-"배달 체인 완결(enqueue+drain)"·"emit 거부 폴백"·"fail-open 직송" 등 부작용을 검증한다.
+"배달 체인 완결(enqueue+drain)"·"emit 거부 폴백" 등 부작용을 검증한다.
+
+★W5(T-0147-2 wakeup 홍수 해소) 계약 전환 — 아래 단언들은 **의도적으로** 갱신됐다:
+  · idle·feed·collect·내부오류는 **더 이상 master push 를 내지 않는다**(층2 채널 정책표).
+    정보는 ledger·badge(·EVT)로 남고 stdin 주입만 사라진다 — 채널 이동이지 침묵이 아니다.
+  · fail-open 직송 2경로(I2)는 제거됐다. state 기록 불능은 stdout `gate_signal=state_unwritable`
+    토큰(=state **외부** oracle)으로만 나간다.
+  · push 는 stall 확증(§2-C)·시스템 데드락(P3)·노드 사망(deadman 소비)에서만 승격된다.
+검체 전량(§1-B N1~C3)은 `tests/run_bootstrap_health.py` W5 그룹이 소유한다. 여기는 코어 회귀다.
 
 실행: python3 test_report_gate.py   (unittest·표준 러너 — CI가 파일 직접 실행하는 관례 준거)
 """
@@ -35,11 +43,16 @@ def report(nodes=None, live_nodes=None, idle_nodes=None, feed=None,
 
 class FakeRunner:
     def __init__(self, report_ok=True, rep=None, err=None, emit_rc=0,
-                 drain_delivered=1, collect_raises=False):
+                 drain_delivered=1, collect_raises=False, events=None,
+                 ack_ok=True, tasks=None, enqueue_rc=0):
         self.report_ok, self.rep, self.err = report_ok, rep, err
         self.emit_rc, self.drain_delivered = emit_rc, drain_delivered
         self.collect_raises = collect_raises
+        self.events, self.ack_ok, self.tasks = events or [], ack_ok, tasks
+        self.enqueue_rc = enqueue_rc
         self.emits, self.enqueues, self.drains, self.sends = [], [], [], []
+        self.polls = []
+        self._wid = 0
 
     def collect_report(self):
         if self.collect_raises:
@@ -50,13 +63,28 @@ class FakeRunner:
         self.emits.append((evt_type, fields))
         return self.emit_rc, "", ""
 
-    def enqueue(self, to, task, reason, idem, payload=None):
-        self.enqueues.append((to, task, reason, idem))
-        return 0
+    def enqueue(self, to, task, reason, idem, payload=None, severity=None):
+        self.enqueues.append((to, task, reason, idem, severity))
+        self._wid += 1
+        return self.enqueue_rc, ("W-%010x" % self._wid)
 
     def drain(self, target):
         self.drains.append(target)
         return 0, self.drain_delivered
+
+    # ── W5: 데몬 이벤트 1회 폴링(queue.delivered 영수증 · master.deadman 사망 확증) ──
+    def poll_events(self, after_seq, names, timeout=0):
+        self.polls.append((after_seq, tuple(names)))
+        if not self.ack_ok:
+            return False, [], after_seq
+        evs = [e for e in self.events if e.get("name") in names]
+        return True, evs, after_seq + len(evs)
+
+    # ── W5: P3 데드락 술어의 티켓 원장 증거 ──
+    def task_snapshot(self):
+        if self.tasks is None:
+            return False, None, "no tasks"
+        return True, self.tasks, None
 
     def send_queued(self, to, body):
         self.sends.append((to, body))
@@ -86,6 +114,12 @@ def ledger_entries(state_dir):
     path = os.path.join(state_dir, "ledger.jsonl")
     with open(path, encoding="utf-8") as f:
         return [json.loads(l) for l in f if l.strip()]
+
+
+def badges(state_dir):
+    """A8 배지 파일(데몬 alerts.rs `node_liveness` 소비 계약) — {key: badge}."""
+    with open(os.path.join(state_dir, "badges.json"), encoding="utf-8") as f:
+        return {b["key"]: b for b in json.load(f)["badges"]}
 
 
 class GateCore(unittest.TestCase):
@@ -127,8 +161,8 @@ class GateCore(unittest.TestCase):
             self.assertEqual(e["verdict"], "QUIET")
             self.assertEqual(r.enqueues, [])
 
-    # ── ③ 경고 주입 → WARN + 배달(enqueue+drain) 호출 ──
-    def test_warning_triggers_wake_and_drain(self):
+    # ── ③ 경고 주입 → WARN + **push 강등**(W5 층2: idle 은 ledger+evt+badge) ──
+    def test_idle_warning_records_but_never_pushes(self):
         with tempfile.TemporaryDirectory() as t:
             rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
                          idle_nodes=[{"role": "worker", "idle_secs": 600}])
@@ -137,27 +171,67 @@ class GateCore(unittest.TestCase):
             gate(t, r).run()
             e = ledger_entries(t)[-1]
             self.assertEqual(e["verdict"], "WARN")
-            self.assertEqual(len(r.enqueues), 1)
-            self.assertEqual(r.enqueues[0][0], "master")
-            self.assertEqual(r.drains, ["master"])            # 배달 체인 완결(drain 필수)
-            self.assertEqual(e["delivered"], "wake")
+            self.assertEqual(r.enqueues, [], "idle 이 master stdin 을 다시 잠식한다(W5 층2 위반)")
+            self.assertEqual(r.drains, [])
+            self.assertEqual(e["delivered"], "none")
+            self.assertTrue(any("idle_5min:worker" in x for x in e["reasons"]))
+            self.assertIn("agent.silent", [t for t, _ in r.emits])   # EVT 채널은 유지
+            self.assertIn("gate-idle-worker", badges(t))             # badge 채널도 유지
 
-    def test_multi_idle_nodes_separate_per_node_wake_keys(self):
-        # master 승인 2026-07-18: idle 노드별로 task/idem 분리 → 큐 병합 최대화.
+    def test_multi_idle_nodes_separate_per_node_keys(self):
+        # master 승인 2026-07-18: idle 노드별로 task/idem 분리(키 분리는 유지 — 채널만 강등).
+        # ★BASELINE 은 현재 idle 인 role 을 **disarmed** 로 시드한다(idle-standby-v5 D7 — 업그레이드
+        #   순간의 재발화 파도 방지). 그래서 엣지는 baseline **이후의 idle 진입**에서만 뜬다.
+        busy = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                      live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 5},
+                                  {"role": "reviewer-gemini", "agent_alive": True, "idle_secs": 5}])
+        idle = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                      live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 600},
+                                  {"role": "reviewer-gemini", "agent_alive": True, "idle_secs": 700}],
+                      idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600},
+                                  {"role": "reviewer-gemini", "idle_secs": 700}])
         with tempfile.TemporaryDirectory() as t:
-            rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
-                         idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600},
-                                     {"role": "reviewer-gemini", "idle_secs": 700}])
-            r = FakeRunner(rep=rep)
-            gate(t, r).run()                                  # baseline
-            gate(t, r).run()
-            tasks = sorted(task for _to, task, _reason, _idem in r.enqueues)
-            idems = sorted(idem for _to, _task, _reason, idem in r.enqueues)
-            self.assertEqual(tasks, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
-            self.assertEqual(idems, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
-            self.assertEqual(r.drains, ["master"])            # 여러 enqueue·drain 1회
+            gate(t, FakeRunner(rep=busy)).run()               # baseline (idle 아님)
+            r = FakeRunner(rep=idle)
+            gate(t, r).run()                                  # idle 진입 → 엣지 2건
+            keys = badges(t)
+            self.assertIn("gate-idle-reviewer-codex", keys)
+            self.assertIn("gate-idle-reviewer-gemini", keys)
+            self.assertEqual(r.enqueues, [])                  # push 0
+            # 라벨 `worker` 는 live role 로 조인되지 않는다 → 스키마 결함으로 **노출**(은닉 금지)
+            self.assertIn("gate-label-worker", keys)
 
-    def test_feed_pending_warns_with_approval_evt(self):
+    def test_idle_edge_fires_once_then_suppressed(self):
+        """A3′ — 무배정 idle 은 엣지 1회. 종전 레벨 트리거가 매 주기 재발화하던 갈래."""
+        busy = report(live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 5}])
+        idle = report(live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 600}],
+                      idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600}])
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=busy)).run()               # baseline (idle 아님)
+            r = FakeRunner(rep=idle)
+            gate(t, r).run()                                  # 엣지 1회
+            first = ledger_entries(t)[-1]
+            gate(t, r).run()                                  # 같은 조건 지속 → 재발화 금지
+            second = ledger_entries(t)[-1]
+            self.assertTrue(any("idle_edge:reviewer-codex" in x for x in first["reasons"]),
+                            first["reasons"])
+            self.assertFalse(any("idle_edge:reviewer-codex" in x for x in second["reasons"]),
+                             "엣지가 레벨로 퇴화했다(매 주기 재발화)")
+
+    def test_baseline_seeds_current_idle_as_disarmed(self):
+        """D7 — 재설치·업그레이드 직후 전 노드가 동시 엣지 발화하는 '파도'를 막는다."""
+        idle = report(live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 600}],
+                      idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600}])
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=idle)
+            gate(t, r).run()                                  # baseline: idle 상태로 시작
+            gate(t, r).run()
+            e = ledger_entries(t)[-1]
+            self.assertFalse(any("idle_edge" in x for x in e["reasons"]),
+                             "BASELINE 직후 엣지 파도 발생: %r" % e["reasons"])
+
+    def test_feed_pending_is_ledger_and_badge_only(self):
+        # 설계 층2 표: gate-feed = ledger+badge(EVT·push 없음 — GUI Feed 탭이 이미 소비자다).
         with tempfile.TemporaryDirectory() as t:
             rep = report(feed=2)
             r = FakeRunner(rep=rep)
@@ -165,7 +239,8 @@ class GateCore(unittest.TestCase):
             gate(t, r).run()
             e = ledger_entries(t)[-1]
             self.assertEqual(e["verdict"], "WARN")
-            self.assertIn("approval.needed", [t for t, _ in r.emits])
+            self.assertEqual(r.enqueues, [])
+            self.assertIn("gate-feed", badges(t))
 
     # ── ④ 태스크별 stall(6주기·노드 idle) + busy 시 보류 ──
     def test_per_task_stall_promotes_when_idle(self):
@@ -209,40 +284,45 @@ class GateCore(unittest.TestCase):
             self.assertEqual(r2.enqueues, [])                 # wake 금지
             self.assertEqual(r2.drains, [])
 
-    # ── ⑥ fail-open(내부 예외 주입 → 직송 호출) ──
-    def test_fail_open_direct_sends_and_records(self):
+    # ── ⑥ fail-open(내부 예외 주입) — ★W5 I2: 직송 제거·대장+배지로 수렴 ──
+    def test_fail_open_records_without_direct_send(self):
         with tempfile.TemporaryDirectory() as t:
             r = FakeRunner(collect_raises=True)
             rc = gate(t, r).run()
             self.assertEqual(rc, 0)                            # 죽지 않는다
-            self.assertEqual(len(r.sends), 1)
-            self.assertEqual(r.sends[0][0], "master")
+            self.assertEqual(r.sends, [], "fail-open 직송(I2)이 살아있다 — 라우터 우회 발행자")
+            self.assertEqual(r.enqueues, [])
             e = ledger_entries(t)[-1]
             self.assertEqual(e["verdict"], "FAILOPEN")
+            self.assertIn("gate-internal-error", badges(t))     # 침묵 금지: 배지로 노출
 
     def test_fail_open_streak_note_after_three(self):
         with tempfile.TemporaryDirectory() as t:
             r = FakeRunner(collect_raises=True)
             for _ in range(3):
                 gate(t, r).run()
-            self.assertIn("게이트 자체 수리 필요", r.sends[-1][1])
+            self.assertIn("게이트 자체 수리 필요",
+                          badges(t)["gate-internal-error"]["message"])
 
-    # ── P1-1: state_dir 접근 불가(권한/락 OSError)도 최상위 fail-open으로 exit 0 + 직송 ──
+    # ── N6b: state 기록 불능 → **state 외부 oracle**(stdout gate_signal 토큰)만 나간다 ──
     @unittest.skipIf(os.geteuid() == 0, "root는 파일권한 무시 — chmod 555 재현 불가")
-    def test_fail_open_when_state_dir_unwritable(self):
+    def test_state_unwritable_emits_gate_signal_not_direct_send(self):
+        import contextlib
+        import io
         with tempfile.TemporaryDirectory() as t:
             sd = os.path.join(t, "state")
             os.makedirs(sd)
             r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
             os.chmod(sd, 0o555)                               # 읽기·실행만 — 락 mkdir 불가
+            out = io.StringIO()
             try:
-                rc = gate(sd, r).run()
+                with contextlib.redirect_stdout(out):
+                    rc = gate(sd, r).run()
             finally:
                 os.chmod(sd, 0o755)                           # 정리 위해 복구
             self.assertEqual(rc, 0)                            # 죽지 않는다(exit 1 금지)
-            self.assertEqual(len(r.sends), 1)                  # master 직송 시도
-            self.assertEqual(r.sends[0][0], "master")
-            self.assertIn("state 기록 불가", r.sends[0][1])
+            self.assertEqual(r.sends, [], "state 불능 직송(I2)이 살아있다")
+            self.assertIn("gate_signal=state_unwritable", out.getvalue())
 
     # ── ⑦ 블랙리스트 정규화(타임스탬프만 다른 입력 = 무변화) ──
     def test_blacklist_normalization_timestamp_only_no_change(self):
@@ -465,9 +545,12 @@ class C16ReportScheduleGate(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
+    RAW_CMD = "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run"
     GATE_JOB = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
-                "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run",
+                "command": "CYS_REPORT_GATE_DIR=\"/tmp/lane\" " + RAW_CMD,
                 "if_absent": "skip"}
+    UNWIRED_JOB = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": RAW_CMD + " --shadow", "if_absent": "skip"}
     PUSH_JOB = {"id": "owner-progress-report-5min", "every_minutes": 5, "action": "push",
                 "to": "master", "text_command": "python3 x", "if_absent": "skip"}
 
@@ -480,6 +563,22 @@ class C16ReportScheduleGate(unittest.TestCase):
             self.assertEqual(res2["status"], "PASS")
             ids = [j["id"] for j in after["jobs"]]
             self.assertEqual(ids, ["owner-progress-gate-5min"])   # 구 push 잡 재생성 안 됨
+
+    # ── W5 B7: 레인 배선 마이그레이션(토큰 보존 삽입만) ──
+    def test_unwired_gate_job_fails_and_fix_inserts_lane_env_preserving_args(self):
+        with tempfile.TemporaryDirectory() as t:
+            res, _ = self._c16(t, [dict(self.UNWIRED_JOB)])
+            self.assertEqual(res["status"], "FAIL", res)          # 다중 데몬 state 공유 위험
+            res2, after = self._c16(t, [dict(self.UNWIRED_JOB)], fix=True)
+            self.assertEqual(res2["status"], "FIXED", res2)
+            cmd = after["jobs"][0]["command"]
+            self.assertTrue(cmd.startswith("CYS_REPORT_GATE_DIR="), cmd)
+            self.assertIn("--shadow", cmd, "기존 인자가 재생성으로 소실됐다(토큰 보존 위반)")
+            self.assertIn("javis_report_gate.py", cmd)
+            # 멱등: 재실행은 무동작(PASS)
+            res3, after3 = self._c16(t, after["jobs"], fix=True)
+            self.assertEqual(res3["status"], "PASS", res3)
+            self.assertEqual(after3["jobs"][0]["command"], cmd)
 
     def test_no_report_job_fails_and_fix_adds_gate_job(self):
         # reviewer1 P1: --fix는 구 push 잡이 아니라 게이트 잡을 추가해야 한다.

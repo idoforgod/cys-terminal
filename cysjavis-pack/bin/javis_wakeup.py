@@ -7,7 +7,14 @@
 - idempotency_key가 같은 요청은 중복 삽입하지 않는다(suppressed로 기록).
 - zombie 가드: 배달(drain) 시 대상 생존을 확인하고, 죽은 대상에는 배달하지 않고 skipped 처리
   ("죽은 런에 병합하면 불멸화" 함정의 배달 측 방어).
-- 원장은 append-only: 모든 사건(queued/coalesced/suppressed/delivered/skipped)을 queue.jsonl에 기록.
+- 원장은 append-only: 모든 사건(queued/coalesced/suppressed/delivered/skipped/digest)을
+  queue.jsonl에 기록.
+
+★T-0147-2 층1 I6 (설계 `_round/T-0147-2-DESIGN-wakeup-demotion.md` §2 층1) 가산:
+- `enqueue --severity {info,warn,critical}`(기본 warn). 코얼레싱 시 severity 는 **상승만** 한다.
+- `drain` digest: 같은 target 의 살아남은 pending 을 **1건으로 접어 cys send 를 1회만** 호출한다
+  (종전: pending 1건당 1회 → master stdin 잠식의 직접 원인). 단건이면 종전 포맷 그대로(무회귀).
+  digest 본문에는 각 항목의 W-id·severity·task_key·근거를 **줄 단위로 보존**한다(뭉개기 금지).
 
 상태 저장: $JAVIS_ROOT/_round/wakeups/pending/<safe(target)>__<safe(task_key)>.json
 원장:      $JAVIS_ROOT/_round/wakeups/queue.jsonl (append-only)
@@ -52,6 +59,13 @@ PENDING_DIR = os.path.join(WK_DIR, "pending")
 LEDGER = os.path.join(WK_DIR, "queue.jsonl")
 
 EXIT_OK, EXIT_USAGE, EXIT_EMPTY = 0, 2, 5
+
+# ★T-0147-2 층1 I6 — severity 등급. 순서가 곧 계약이다(코얼레싱은 **상승만**).
+_SEV_DEFAULT = "warn"
+_SEV_RANK = {"info": 0, "warn": 1, "critical": 2}
+# digest 항목 근거의 표시 상한. 요약(뭉개기)이 아니라 **절단 + 절단 표시**다 — 설계 I6 는
+# "task·key·근거 1줄씩 병기"를 계약으로 못 박았으므로 근거를 없애는 축약은 금지다.
+_DIGEST_REASON_MAX = 300
 
 
 def _now():
@@ -193,6 +207,27 @@ def _load_pending(path):
         return None
 
 
+def _severity_of(rec):
+    """pending 레코드의 severity — **구버전 레코드(키 부재)는 warn** 으로 읽는다.
+
+    ADR-2 스큐 안전: 팩이 부분 갱신돼 구버전 enqueue 가 만든 pending 이 신버전 drain 을
+    만나도 종전과 같은 등급으로 처리돼야 한다(모르는 값도 warn 으로 접어 KeyError 를 만들지
+    않는다 — 배달 경로에서 예외를 올리면 그 wakeup 은 영영 배달되지 않는다).
+    """
+    sev = (rec or {}).get("severity")
+    return sev if sev in _SEV_RANK else _SEV_DEFAULT
+
+
+def _max_severity(a, b):
+    """★T-0147-2 I6 — severity 는 **상승만** 한다(절대 하강 금지).
+
+    코얼레싱은 "같은 (target, task_key) 를 1건으로 접는" 연산인데, 나중 도착한 warn 이 앞선
+    critical 을 덮으면 **치명 신호가 병합에 먹혀 영영 안 보인다**. 병합은 정보를 줄여도 되지만
+    등급을 낮춰서는 안 된다.
+    """
+    return a if _SEV_RANK[a] >= _SEV_RANK[b] else b
+
+
 def cmd_enqueue(a):
     payload = json.loads(a.payload) if a.payload else {}
     path = _pending_path(a.to, a.task)
@@ -210,14 +245,18 @@ def cmd_enqueue(a):
             cur["coalesced_count"] = cur.get("coalesced_count", 0) + 1
             cur["reason"] = a.reason
             cur["payload"] = {**cur.get("payload", {}), **payload}
+            # ★T-0147-2 I6 — severity 는 최대치로 **상승만**(`_max_severity` 주석 참조).
+            cur["severity"] = _max_severity(_severity_of(cur), a.severity)
             if a.idempotency_key:
                 cur.setdefault("idempotency_keys", []).append(a.idempotency_key)
             cur["updated_at"] = _now()
             _write_json_atomic(path, cur)
             _ledger_append({"event": "coalesced", "target": a.to, "task_key": a.task,
-                            "wakeup_id": cur["id"], "coalesced_count": cur["coalesced_count"]})
+                            "wakeup_id": cur["id"], "coalesced_count": cur["coalesced_count"],
+                            "severity": cur["severity"]})
             print(json.dumps({"result": "coalesced", "id": cur["id"],
-                              "coalesced_count": cur["coalesced_count"]}, ensure_ascii=False))
+                              "coalesced_count": cur["coalesced_count"],
+                              "severity": cur["severity"]}, ensure_ascii=False))
             return EXIT_OK
         rec = {
             "id": f"W-{uuid.uuid4().hex[:10]}",
@@ -225,6 +264,7 @@ def cmd_enqueue(a):
             "task_key": a.task,
             "reason": a.reason,
             "payload": payload,
+            "severity": a.severity,   # ★T-0147-2 I6 (기본 warn — 구 호출부는 무변경으로 종전 등급)
             "idempotency_keys": [a.idempotency_key] if a.idempotency_key else [],
             "coalesced_count": 0,
             "queued_at": _now(),
@@ -232,8 +272,9 @@ def cmd_enqueue(a):
         }
         _write_json_atomic(path, rec)
         _ledger_append({"event": "queued", "target": a.to, "task_key": a.task,
-                        "wakeup_id": rec["id"], "reason": a.reason})
-        print(json.dumps({"result": "queued", "id": rec["id"]}, ensure_ascii=False))
+                        "wakeup_id": rec["id"], "reason": a.reason, "severity": rec["severity"]})
+        print(json.dumps({"result": "queued", "id": rec["id"],
+                          "severity": rec["severity"]}, ensure_ascii=False))
         return EXIT_OK
 
 
@@ -262,6 +303,53 @@ def _build_send_message(rec):
             f"payload={json.dumps(rec.get('payload', {}), ensure_ascii=False)}")
 
 
+def _fold_reason(reason):
+    """digest 항목의 근거 **1줄** — 개행을 공백으로 접고 상한 초과분만 절단한다.
+
+    요약하지 않는다(설계 I6 "뭉개기 금지"). 자를 때는 잘랐다는 사실을 `…` 로 남긴다 —
+    조용한 절삭은 수신자가 "이게 전부"라고 오해하게 만든다.
+    """
+    s = " ".join(str(reason or "").split())
+    return s if len(s) <= _DIGEST_REASON_MAX else s[:_DIGEST_REASON_MAX] + "…"
+
+
+def _digest_sort_key(rec):
+    """digest 항목 정렬 — severity 내림차순(critical 먼저) → task_key 오름차순.
+
+    결정론이 목적이다: 같은 pending 집합은 언제 접어도 같은 본문을 내야 데몬 에코·원장 대조·
+    회귀 테스트가 성립한다. 심각한 것을 먼저 읽히게 두는 것은 수신자(사람·LLM) 배려다.
+    """
+    return (-_SEV_RANK[_severity_of(rec)], rec.get("task_key") or "")
+
+
+def _build_digest_message(target, recs):
+    """★T-0147-2 층1 I6 — 같은 target 의 N건을 **1 push** 로 접는다.
+
+    · 단건이면 `_build_send_message` 포맷 **그대로**다(무회귀 — 기존 테스트·운영 습관 보존).
+    · 2건 이상이면 첫 줄 `[wakeup digest <N>건] target=<target>` + 항목 1줄씩.
+
+    ★데몬 계약(설계 §2 층3 A3′ 상태머신): 데몬은 배달된 텍스트에서 `W-<hex>` 토큰을 **전부**
+      뽑아 `queue.delivered` 이벤트로 에코한다. 그 이벤트가 critical 티어의 유일한 Inject-ack
+      (= disarm 근거)이므로, **병합된 전 항목의 W-id 가 본문에 리터럴로 남아야 한다**.
+      id 를 요약·생략하면 ack 가 영영 오지 않아 critical edge 가 disarm 되지 않는다.
+    ★critical 필드 보존(설계 I6): 항목마다 task_key·severity·근거 1줄을 병기한다. payload 는
+      비어있지 않을 때만 줄 끝에 붙여 단건 포맷과 정보량을 맞춘다.
+
+    `recs` 는 호출부가 `_digest_sort_key` 로 정렬해 넘긴다(정렬 책임을 한 곳에 둔다).
+    """
+    if len(recs) == 1:
+        return _build_send_message(recs[0])
+    lines = [f"[wakeup digest {len(recs)}건] target={target}"]
+    for rec in recs:
+        line = (f"- [{rec['id']}] sev={_severity_of(rec)} task={rec.get('task_key')} "
+                f"reason={_fold_reason(rec.get('reason'))}")
+        payload = rec.get("payload") or {}
+        if payload:
+            line += " payload=%s" % json.dumps(payload, ensure_ascii=False)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 # ★G13(cokacdir 성찰 2026-07-04): 연속 배달실패 카운터 + fast-fail — hang/유령 대상 무한
 #   재시도('idle 5분' 산문 규칙뿐이던 갭)를 결정론으로 차단. 임계 도달 시 pending 종결 +
 #   카운터 리셋(이후 재큐잉은 깨끗한 재시도 — 자가 회복·수동 리셋 불요).
@@ -285,6 +373,18 @@ def _bump_failcount(target, reset=False):
 
 
 def cmd_drain(a):
+    """★T-0147-2 층1 I6 — **target 별 digest 배달**(종전: pending 1건당 cys send 1회).
+
+    종전 루프는 pending N건이면 master stdin 에 N개의 메시지를 꽂았다. 그 자체가 wakeup
+    홍수의 마지막 증폭단이었다(설계 §0-2: queued 1030 / coalesced 0). 여기서 N→1 로 접는다.
+
+    무회귀 계약:
+      · 단건이면 메시지 포맷·원장·stdout 이 종전과 동일하다(digest 원장 레코드도 남기지 않는다).
+      · stdout JSON 의 `delivered` 는 **병합된 항목 수**다(digest 1건이 3항목이면 3).
+        게이트(`javis_report_gate.Runner.drain`)가 이 숫자로 배달 성공을 판정하므로 의미를
+        바꾸면 배달 성공이 실패로 뒤집힌다.
+      · zombie 가드(G27)·fast-fail 임계(G13)·원장 마스킹(G2)·exit code 전부 유지.
+    """
     fastfail_max = int(os.environ.get("JAVIS_FASTFAIL_MAX", "3"))
     pending = _iter_pending()
     if a.target:
@@ -292,50 +392,69 @@ def cmd_drain(a):
     if not pending:
         print("nothing pending")
         return EXIT_EMPTY
-    delivered = skipped = 0
+    # target 별 그룹. 삽입 순서 = `_iter_pending` 의 파일명 정렬 순서라 그룹 순회도 결정론이다.
+    groups = {}
     for path, rec in pending:
-        alive = _target_alive(rec["target"])
+        groups.setdefault(rec["target"], []).append((path, rec))
+    delivered = skipped = 0
+    for target, items in groups.items():
+        # 생존 판정은 **target 당 1회**(종전 pending 당 1회) — 판정 기준·강등 규칙은 그대로이고
+        # 같은 target 을 같은 순간에 두 번 묻지 않을 뿐이다(`cys list` 호출도 N→1).
+        alive = _target_alive(target)
         if alive == "dead":
             # zombie 가드: 죽은 대상에 배달/병합 유지 금지 → skipped로 종결(pending 제거)
-            os.remove(path)
-            _ledger_append({"event": "skipped", "target": rec["target"], "wakeup_id": rec["id"],
-                            "why": "target_dead(zombie guard)"})
-            print(f"skipped (대상 사망): {rec['id']} → {rec['target']}")
-            skipped += 1
+            for path, rec in items:
+                os.remove(path)
+                _ledger_append({"event": "skipped", "target": target, "wakeup_id": rec["id"],
+                                "why": "target_dead(zombie guard)"})
+                print(f"skipped (대상 사망): {rec['id']} → {target}")
+                skipped += 1
             continue
-        msg = _build_send_message(rec)
-        cmd = ["cys", "send", "--queued", "--to", rec["target"], msg]
+        items.sort(key=lambda pr: _digest_sort_key(pr[1]))
+        msg = _build_digest_message(target, [rec for _p, rec in items])
+        cmd = ["cys", "send", "--queued", "--to", target, msg]
         if a.deliver:
             if alive == "unknown":
-                print(f"warn: {rec['target']} 생존 미확인 상태로 배달 시도", file=sys.stderr)
+                print(f"warn: {target} 생존 미확인 상태로 배달 시도", file=sys.stderr)
             try:
                 subprocess.run(cmd, check=True, timeout=15)
-                if _load_failcount().get(rec["target"]):
-                    _bump_failcount(rec["target"], reset=True)  # 성공 = 연속실패 해소
+                if _load_failcount().get(target):
+                    _bump_failcount(target, reset=True)  # 성공 = 연속실패 해소
             except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
-                streak = _bump_failcount(rec["target"])
+                # ★digest 는 배달 **1회**다 — 실패도 1회로 센다(항목 수만큼 세면 pending 이 많은
+                #   target 이 첫 실패에서 곧장 임계를 넘어 전 항목을 잃는다).
+                streak = _bump_failcount(target)
                 if streak >= fastfail_max:
                     # ★G13 fast-fail: 임계 도달 — pending 종결(무한 재시도 차단)·카운터 리셋
-                    os.remove(path)
-                    _ledger_append({"event": "skipped", "target": rec["target"],
-                                    "wakeup_id": rec["id"],
-                                    "why": f"fast-fail(연속 {streak}회 배달실패)"})
-                    _bump_failcount(rec["target"], reset=True)
-                    print(f"skipped (fast-fail {streak}회): {rec['id']} → {rec['target']}",
-                          file=sys.stderr)
-                    skipped += 1
+                    for path, rec in items:
+                        os.remove(path)
+                        _ledger_append({"event": "skipped", "target": target,
+                                        "wakeup_id": rec["id"],
+                                        "why": f"fast-fail(연속 {streak}회 배달실패)"})
+                        print(f"skipped (fast-fail {streak}회): {rec['id']} → {target}",
+                              file=sys.stderr)
+                        skipped += 1
+                    _bump_failcount(target, reset=True)
                     continue
-                _ledger_append({"event": "deliver_failed", "target": rec["target"],
-                                "wakeup_id": rec["id"], "why": str(e), "fail_streak": streak})
-                print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {e}",
-                      file=sys.stderr)
+                for _path, rec in items:
+                    _ledger_append({"event": "deliver_failed", "target": target,
+                                    "wakeup_id": rec["id"], "why": str(e), "fail_streak": streak})
+                    print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {e}",
+                          file=sys.stderr)
                 continue
         else:
-            print("DRYRUN:", " ".join(cmd))
-        os.remove(path)
-        _ledger_append({"event": "delivered" if a.deliver else "delivered_dryrun",
-                        "target": rec["target"], "wakeup_id": rec["id"]})
-        delivered += 1
+            # digest 본문은 여러 줄이라 그대로 찍으면 DRYRUN 이 N 줄이 된다 — **표시만** 1줄로
+            # 접는다(실제 배달 인자는 원문 그대로). W-id 는 전부 리터럴로 남는다.
+            print("DRYRUN:", " ".join(cmd[:-1] + [cmd[-1].replace("\n", "\\n")]))
+        for path, rec in items:
+            os.remove(path)
+            _ledger_append({"event": "delivered" if a.deliver else "delivered_dryrun",
+                            "target": target, "wakeup_id": rec["id"]})
+            delivered += 1
+        if len(items) > 1:
+            # 접힘 사실 자체를 원장에 남긴다(M1 계수의 근거 — "N건을 1 push 로 접었다").
+            _ledger_append({"event": "digest", "target": target, "count": len(items),
+                            "wakeup_ids": [rec["id"] for _p, rec in items]})
     print(json.dumps({"delivered": delivered, "skipped": skipped}, ensure_ascii=False))
     return EXIT_OK
 
@@ -350,6 +469,9 @@ def main(argv=None):
     c.add_argument("--reason", required=True)
     c.add_argument("--payload", help="JSON 문자열")
     c.add_argument("--idempotency-key", dest="idempotency_key")
+    # ★T-0147-2 I6 — 기본 warn(구 호출부는 무변경으로 종전 등급 유지). 코얼레싱 시 상승만.
+    c.add_argument("--severity", choices=tuple(_SEV_RANK), default=_SEV_DEFAULT,
+                   help="심각도(기본 warn) — 병합 시 최대치로 상승만 한다")
     c.set_defaults(fn=cmd_enqueue)
 
     c = sub.add_parser("list")

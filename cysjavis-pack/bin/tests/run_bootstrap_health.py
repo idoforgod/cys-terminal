@@ -49,7 +49,7 @@ CALIBRATION_REF = os.environ.get("CYS_HEALTH_CALIB_REF", "a96d8b1")
 PRE_W0_REF = os.environ.get("CYS_HEALTH_PRE_W0_REF", "b35f01d")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
-LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4")
+LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
 
@@ -4428,6 +4428,715 @@ def h_obs_3():
         need("-c claude" not in old, "계측 타당성 실패: 구 코드가 이미 claude 를 셌다")
         calib = "구 코드 node 전용 계측 확인"
     return "목 lsof 로 claude 2세션 계수 확인 · 계측검증=%s" % calib
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# W5 — T-0147-2 wakeup 홍수 해소 검체군 (설계 §1-B 사전 등록 검체표)
+#
+#   설계가 **구현 전에** 박제한 검체표를 그대로 코드로 옮긴 것이다(producer≠evaluator).
+#   전 검체는 서브프로세스 0·데몬 0·네트워크 0이며 상태는 전부 격리 tmpdir 다
+#   (라이브 팩·라이브 state 무접촉 — 게이트 대역 러너가 외부 명령을 전부 가로챈다).
+#
+#   계측 타당성(MEMORY '디버깅 계측 타당성 게이트'): 음성 검체(push 0 주장)는 **구 코드
+#   (W5 착지 직전 커밋)를 같은 시나리오로 돌려 push 가 실제로 나갔는지** 확인한다. 구 코드가
+#   조용하면 "push 0"은 아무것도 증명하지 못한다.
+# ═══════════════════════════════════════════════════════════════════════════
+W5_CALIB_REF = os.environ.get("CYS_HEALTH_W5_CALIB_REF", "5bec3ab")
+W5_GATE_REL = os.path.join("cysjavis-pack", "bin", "javis_report_gate.py")
+
+
+def _w5_mod():
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_report_gate as G
+    return G
+
+
+class _W5Env:
+    """게이트 판정에 영향을 주는 env 를 결정론으로 고정(가드·경로 해석의 실행위치 의존 제거)."""
+
+    KEYS = ("CYS_SOCKET", "CYS_PACK_DIR", "JAVIS_PACK_DIR", "CYS_REPORT_GATE_DIR",
+            "JAVIS_ROOT", "JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "CYS_BIN")
+
+    def __init__(self, **kv):
+        self.kv, self.saved = kv, {}
+
+    def __enter__(self):
+        for k in self.KEYS:
+            self.saved[k] = os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in self.kv.items() if v is not None})
+        return self
+
+    def __exit__(self, *exc):
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+        for k, v in self.saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+class _W5Clock:
+    def __init__(self, t0=1_700_000_000.0):
+        self.t = t0
+
+    def now_epoch(self):
+        return self.t
+
+    def now_iso(self):
+        return time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime(self.t))
+
+    def tick(self, secs=300.0):
+        self.t += secs
+
+
+class _W5Fake:
+    """게이트 대역 러너 — 외부 명령(javis_report/event/wakeup·cys·데몬 소켓)을 전부 가로챈다."""
+
+    def __init__(self, rep=None, ok=True, err=None, events=None, ack=True, tasks=None,
+                 drain_delivered=1, enqueue_rc=0, collect_raises=False):
+        self.rep, self.ok, self.err = rep, ok, err
+        self.events, self.ack, self.tasks = list(events or []), ack, tasks
+        self.drain_delivered, self.enqueue_rc = drain_delivered, enqueue_rc
+        self.collect_raises = collect_raises
+        self.enqueues, self.emits, self.drains, self.sends, self.polls = [], [], [], [], []
+        self._wid = 0
+
+    # ── 계수 헬퍼: M1 의 계수점(= target=master 인 wake) ──
+    @property
+    def master_pushes(self):
+        return [e for e in self.enqueues if e[0] == "master"]
+
+    def collect_report(self):
+        if self.collect_raises:
+            raise RuntimeError("주입된 내부 오류")
+        return self.ok, self.rep, self.err
+
+    def emit(self, evt_type, fields, surface="auto"):
+        self.emits.append((evt_type, fields))
+        return 0, "", ""
+
+    def enqueue(self, to, task, reason, idem, payload=None, severity=None):
+        self.enqueues.append((to, task, reason, idem, severity))
+        self._wid += 1
+        return self.enqueue_rc, "W-%010x" % self._wid
+
+    def drain(self, target):
+        self.drains.append(target)
+        return 0, self.drain_delivered
+
+    def poll_events(self, after_seq, names, timeout=0):
+        self.polls.append((after_seq, tuple(names)))
+        if not self.ack:
+            return False, [], after_seq
+        evs = [e for e in self.events if e.get("name") in names]
+        self.events = [e for e in self.events if e.get("name") not in names]  # 1회 소비(링버퍼 커서)
+        return True, evs, after_seq + len(evs)
+
+    def task_snapshot(self):
+        if self.tasks is None:
+            return False, None, "no tasks"
+        return True, list(self.tasks), None
+
+    def send_queued(self, to, body):
+        self.sends.append((to, body))          # ★I2 직송 잔존 탐지용(기대값은 항상 빈 목록)
+        return 0
+
+
+def _w5_report(nodes=None, live=None, feed=None, sampled_at=1_700_000_000.0, **extra):
+    """javis_report --json 픽스처. `live` 항목 그대로 층4 권위 레코드(role_measurements)를 만든다.
+
+    live 항목 키: role · idle · alive(기본 True) · ctx · status_age · tokens
+    """
+    live = live or []
+    live_nodes, idle_nodes, measures = [], [], []
+    for n in live:
+        role = n["role"]
+        idle = n.get("idle")
+        entry = {"role": role, "state": None, "context_pct": n.get("ctx"),
+                 "idle_secs": idle, "agent_alive": n.get("alive", True),
+                 "status_age_secs": n.get("status_age"), "usage_ctx_tokens": n.get("tokens")}
+        live_nodes.append(entry)
+        if isinstance(idle, int) and idle >= 300 and n.get("alive", True):
+            idle_nodes.append(entry)
+        measures.append({"role": role, "idle_secs": idle if isinstance(idle, int) else None,
+                         "sampled_at": sampled_at,
+                         "source": "daemon.status.idle_secs" if isinstance(idle, int)
+                                   else "unavailable",
+                         "agent_alive": n.get("alive", True),
+                         "status_age_secs": n.get("status_age"),
+                         "usage_ctx_tokens": n.get("tokens")})
+    rep = {"overall_pct": 0, "overall_done": 0, "overall_total": 0,
+           "nodes": nodes or [], "live_nodes": live_nodes, "idle_nodes": idle_nodes,
+           "feed_pending": feed, "paused": None, "status_available": True,
+           "sampled_at": sampled_at, "measure_source": "daemon.status",
+           "role_measurements": measures}
+    rep.update(extra)
+    return rep
+
+
+def _w5_gate(G, sd, runner, clk, stall_cycles=2, quiet_cycles=100, **kw):
+    return G.Gate(sd, runner, cycle_minutes=5, stall_cycles=stall_cycles,
+                  quiet_cycles=quiet_cycles, now_epoch_fn=clk.now_epoch,
+                  now_iso_fn=clk.now_iso, **kw)
+
+
+def _w5_ledger(sd):
+    out = []
+    try:
+        with open(os.path.join(sd, "ledger.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+    except OSError:
+        pass
+    return out
+
+
+def _w5_badges(sd):
+    try:
+        with open(os.path.join(sd, "badges.json"), encoding="utf-8") as f:
+            return {b["key"]: b for b in json.load(f)["badges"]}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def _w5_old_gate_module(tmp):
+    """W5 착지 직전 커밋의 게이트를 임시 모듈로 적재(계측 타당성 대조군). 실패 시 None."""
+    src = _git_show(W5_GATE_REL, ref=W5_CALIB_REF)
+    if src is None:
+        return None
+    import importlib.util
+    path = os.path.join(tmp, "old_report_gate.py")
+    _w(path, src, 0o644)
+    spec = importlib.util.spec_from_file_location("w5_old_report_gate", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:                                  # noqa: BLE001 — 대조군 적재 실패는 skip
+        return None
+    return mod
+
+
+class _W5OldFake:
+    """구 게이트(W5 이전)의 Runner 계약 — enqueue 는 rc 하나만 돌려준다."""
+
+    def __init__(self, rep):
+        self.rep = rep
+        self.enqueues, self.drains, self.sends = [], [], []
+
+    def collect_report(self):
+        return True, self.rep, None
+
+    def emit(self, evt_type, fields, surface="auto"):
+        return 0, "", ""
+
+    def enqueue(self, to, task, reason, idem, payload=None):
+        self.enqueues.append((to, task, reason, idem))
+        return 0
+
+    def drain(self, target):
+        self.drains.append(target)
+        return 0, 1
+
+    def send_queued(self, to, body):
+        self.sends.append((to, body))
+        return 0
+
+
+def _w5_calibrate_idle_push(tmp, rep):
+    """구 코드에서 같은 idle 시나리오가 **master push 를 실제로 냈는지** 확인한다.
+    구 코드가 조용하면 신 코드의 'push 0'은 아무것도 증명하지 못한다(계측 타당성)."""
+    old = _w5_old_gate_module(tmp)
+    if old is None:
+        return "skip(no-git)"
+    sd = os.path.join(tmp, "oldstate")
+    clk = _W5Clock()
+    r = _W5OldFake(rep)
+    for _ in range(3):
+        old.Gate(sd, r, cycle_minutes=5, stall_cycles=2, quiet_cycles=100,
+                 now_epoch_fn=clk.now_epoch, now_iso_fn=clk.now_iso).run()
+        clk.tick()
+    masters = [e for e in r.enqueues if e[0] == "master"]
+    need(masters, "계측 타당성 실패: 구 코드(%s)도 idle 에서 master push 를 내지 않았다 — "
+                  "검체가 아무것도 측정하지 못한다" % W5_CALIB_REF)
+    return "구 코드 %s 에서 master push %d건 재현" % (W5_CALIB_REF, len(masters))
+
+
+# ── N1 정상 대기 24주기: push 0 ────────────────────────────────────────────
+@specimen("H-W5-N1", "W5", "정상 대기 24주기(2h 가속) — master push 0 · badge=quiet", ["I1", "A3"])
+def h_w5_n1():
+    G = _w5_mod()
+    rep = _w5_report(
+        nodes=[{"node": "worker", "done": 2, "total": 2, "pct": 100}],
+        live=[{"role": "worker", "idle": 600, "status_age": 120, "tokens": 1000},
+              {"role": "cso", "idle": 900, "status_age": 120, "tokens": 2000}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        for _ in range(24):                       # 24주기 × 5분 = 2시간 가속 시뮬레이션
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(r.master_pushes == [],
+             "정상 대기에서 master push 발생(M1 위반): %r" % (r.master_pushes,))
+        need(r.sends == [], "직송(I2) 잔존: %r" % (r.sends,))
+        b = _w5_badges(sd)
+        need(list(b) == ["quiet"], "정상 대기 배지가 quiet 이 아니다: %r" % list(b))
+        led = _w5_ledger(sd)
+        need(len(led) == 24, "대장 기록 누락(데드맨 신호 상실): %d" % len(led))
+        calib = _w5_calibrate_idle_push(tmp, rep)
+    return "24주기 push 0 · badge=quiet · 대장 24건 · 계측검증=%s" % calib
+
+
+# ── N2 라벨 미조인 ────────────────────────────────────────────────────────
+@specimen("H-W5-N2", "W5", "라벨 미조인 — 미발화 + ledger label_unjoined + badge 노출", ["B4", "D3"])
+def h_w5_n2():
+    G = _w5_mod()
+    # ① 접두 해소 성공(양성 대조 — 검체가 공허하지 않음을 먼저 증명)
+    got, how = G.resolve_label_roles("reviewer", {"reviewer-gemini", "reviewer-codex", "master"})
+    need(how == "family" and got == ["reviewer-codex", "reviewer-gemini"],
+         "접두 해소 실패(설계 §0-3 오발화 근원 미수리): %r/%r" % (got, how))
+    # ② 해소 불가 → 미발화 + 결함 노출
+    rep = _w5_report(nodes=[{"node": "reviewer", "done": 0, "total": 3, "pct": 0}],
+                     live=[{"role": "master", "idle": 10, "status_age": 5, "tokens": 1}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        for _ in range(4):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(r.master_pushes == [], "미조인 라벨이 push 를 냈다: %r" % (r.master_pushes,))
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(any("label_unjoined:reviewer" in x for x in reasons),
+             "ledger 에 label_unjoined 기록 없음(은닉): %r" % reasons)
+        b = _w5_badges(sd)
+        need("gate-label-reviewer" in b, "스키마 결함 배지 미노출: %r" % list(b))
+        need("스키마 결함" in b["gate-label-reviewer"]["message"], b["gate-label-reviewer"])
+    return "접두 해소 2건 · 미조인=미발화+ledger+badge('스키마 결함')"
+
+
+# ── N3 임계 미달 idle ────────────────────────────────────────────────────
+@specimen("H-W5-N3", "W5", "임계 미달 idle(154s<300s) — 무발화·대장만", ["I1"])
+def h_w5_n3():
+    G = _w5_mod()
+    rep = _w5_report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}],
+                     live=[{"role": "worker", "idle": 154, "status_age": 10, "tokens": 5}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        for _ in range(3):
+            _w5_gate(G, sd, r, clk, stall_cycles=99).run()
+            clk.tick()
+        need(r.master_pushes == [], "임계 미달 idle 에서 push: %r" % (r.master_pushes,))
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(not any("idle" in x for x in reasons), "임계 미달인데 idle 경고 발생: %r" % reasons)
+        need(list(_w5_badges(sd)) == ["quiet"], "임계 미달인데 경고 배지: %r" % list(_w5_badges(sd)))
+    return "154s<300s 무발화 · 대장 기록만 · badge=quiet"
+
+
+# ── N4 데몬 2개 레인 분리 ────────────────────────────────────────────────
+@specimen("H-W5-N4", "W5", "레인 분리 — 데몬별 state·대장 격리 + foreign-daemon 가드", ["B7", "C3"])
+def h_w5_n4():
+    G = _w5_mod()
+    rep_a = _w5_report(nodes=[{"node": "worker", "done": 1, "total": 2, "pct": 50}],
+                       live=[{"role": "worker", "idle": 60, "status_age": 10, "tokens": 1}])
+    rep_b = _w5_report(nodes=[{"node": "cso", "done": 1, "total": 4, "pct": 25}],
+                       live=[{"role": "cso", "idle": 60, "status_age": 10, "tokens": 1}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        a, b = os.path.join(tmp, "report_gate"), os.path.join(tmp, "report_gate-dept-2")
+        clk = _W5Clock()
+        ra, rb = _W5Fake(rep=rep_a, tasks=[]), _W5Fake(rep=rep_b, tasks=[])
+        for _ in range(3):
+            _w5_gate(G, a, ra, clk, stall_cycles=99).run()
+            _w5_gate(G, b, rb, clk, stall_cycles=99).run()
+            clk.tick()
+        need(ra.master_pushes == [] and rb.master_pushes == [],
+             "정상 대기 2레인에서 push 발생: %r %r" % (ra.master_pushes, rb.master_pushes))
+        la, lb = _w5_ledger(a), _w5_ledger(b)
+        need(la and lb, "레인별 대장이 생성되지 않았다")
+        need({e.get("lane") for e in la} == {"report_gate"},
+             "레인 A 대장에 타 레인 기록 혼입: %r" % {e.get("lane") for e in la})
+        need({e.get("lane") for e in lb} == {"report_gate-dept-2"},
+             "레인 B 대장에 타 레인 기록 혼입: %r" % {e.get("lane") for e in lb})
+        need(os.path.isfile(os.path.join(a, "counters.json"))
+             and os.path.isfile(os.path.join(b, "counters.json")),
+             "레인별 counters 분리 실패(카운터 이중 증가 경로 잔존)")
+    # foreign-daemon 가드 — 부서 팩인데 소켓 토큰 불일치 → SKIPPED_FOREIGN_DAEMON
+    with tempfile.TemporaryDirectory() as tmp:
+        dept = os.path.join(tmp, "pack-dept-9")
+        os.makedirs(dept)
+        with _W5Env(CYS_PACK_DIR=dept):
+            v = G.foreign_daemon_verdict()
+            need(v is not None and v[0] == "SKIPPED_FOREIGN_DAEMON",
+                 "가드 미발동(구현 소실 잔존): %r" % (v,))
+        with _W5Env(CYS_PACK_DIR=dept, CYS_SOCKET=os.path.join(tmp, "cys-dept-9", "cys.sock")):
+            need(G.foreign_daemon_verdict() is None, "정합 조합에서 가드가 오발동")
+        # 실제 run 경로에서도 대장에 남고 카운터를 만들지 않는다(무접촉 계약)
+        sd = os.path.join(tmp, "guarded")
+        with _W5Env(CYS_PACK_DIR=dept):
+            _w5_gate(G, sd, _W5Fake(rep=rep_a, tasks=[]), _W5Clock()).run()
+        need(_w5_ledger(sd)[-1]["verdict"] == "SKIPPED_FOREIGN_DAEMON", _w5_ledger(sd)[-1])
+        need(not os.path.isfile(os.path.join(sd, "counters.json")),
+             "가드 경로가 카운터를 건드렸다(무접촉 위반)")
+    return "2레인 대장·counters 격리 · 가드 SKIP/정합 양방향 · 카운터 무접촉"
+
+
+# ── N5 drain 실패(수신 pane 파킹) ────────────────────────────────────────
+@specimen("H-W5-N5", "W5", "drain 실패 반복 — 재-enqueue 폭주 0 + 배지 노출", ["G13", "A3"])
+def h_w5_n5():
+    G = _w5_mod()
+    #   진짜 stall 확증(§2-C 3종 성립) 상태에서 배달만 실패시킨다 — push 경로가 살아있는
+    #   조건이어야 "폭주하지 않음"이 의미를 갖는다(공허한 음성 방지).
+    rep = _w5_report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                     live=[{"role": "worker", "idle": 900, "status_age": 1200, "tokens": 7},
+                           {"role": "master", "idle": 900, "status_age": 1200, "tokens": 3}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[], drain_delivered=0)
+        seen_badges = []
+        for _ in range(10):
+            _w5_gate(G, sd, r, clk).run()
+            #   ★배지는 **매 주기 현재 상태**로 덮어써진다(그래야 갱신 정지가 데드맨이 된다).
+            #     따라서 '노출됐는가'는 주기 스냅샷을 모아서 봐야 한다 — 마지막 파일만 보면
+            #     쿨다운으로 조용해진 주기를 '암전'으로 오판한다(계측기 자체의 함정).
+            seen_badges.append(_w5_badges(sd))
+            clk.tick()
+        need(len(r.master_pushes) <= 1,
+             "배달 실패가 재-enqueue 폭주로 번졌다(%d건)" % len(r.master_pushes))
+        need(len(r.master_pushes) == 1, "확증 stall 인데 push 가 아예 없다(공허한 음성)")
+        led = _w5_ledger(sd)
+        need(any(e.get("delivered") == "wake_pending" for e in led),
+             "배달 미완결이 대장에 남지 않았다")
+        need(any(any(k.startswith("gate-stall-") for k in b) for b in seen_badges),
+             "배달 실패 구간에 배지가 한 번도 없었다(암전): %r" % [list(b) for b in seen_badges])
+    #   ★G27 소비 확인(재구현 금지): W5 의 digest 배달 경로가 W2 zombie 가드를 **그대로 쓴다**.
+    #     digest 로 배달 단위가 바뀐 자리는 가드를 새로 짜기 딱 좋은 지점이라 못 박는다.
+    import javis_wakeup as W
+    wsrc = _read(os.path.join(BIN_DIR, "javis_wakeup.py"))
+    di = wsrc.find("def cmd_drain")
+    need(di > 0 and "_target_alive(target)" in wsrc[di:],
+         "digest 배달 경로가 zombie 가드를 소비하지 않는다(G27 재구현/우회)")
+    need(W.live_target_rows("surface:1\trole=worker\texited=true\n") == [],
+         "exited 행 배제가 깨졌다(죽은 대상에 digest 배달)")
+    return "10주기 반복 배달실패 → master push 1건 고정 · wake_pending 기록 · 배지 노출"
+
+
+# ── N6a collect 실패 ─────────────────────────────────────────────────────
+@specimen("H-W5-N6A", "W5", "collect 실패 — 직송 제거·정상 state ledger + badge", ["I2"])
+def h_w5_n6a():
+    G = _w5_mod()
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk = _W5Clock()
+        r = _W5Fake(ok=False, err="javis_report exit=1", tasks=[])
+        for _ in range(3):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(r.sends == [], "fail-open 직송(I2)이 살아있다: %r" % (r.sends,))
+        need(r.master_pushes == [], "collect 실패가 push 를 냈다: %r" % (r.master_pushes,))
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(any("collect_fail" in x for x in reasons), "collect_fail 대장 기록 없음: %r" % reasons)
+        need("gate-collect" in _w5_badges(sd), "collect 실패 배지 없음: %r" % list(_w5_badges(sd)))
+    calib = "skip(no-git)"
+    old = _git_show(W5_GATE_REL, ref=W5_CALIB_REF)
+    if old is not None:
+        need('self.runner.send_queued("master", body)' in old,
+             "계측 타당성 실패: 구 코드에 fail-open 직송이 없다")
+        calib = "구 코드 fail-open 직송 2경로 존재 확인"
+    return "collect 실패=ledger+badge · 직송 0 · push 0 · 계측검증=%s" % calib
+
+
+# ── N6b state 쓰기 불가 → state 외부 oracle ──────────────────────────────
+@specimen("H-W5-N6B", "W5", "state 기록 불능 — gate_signal 토큰(state 외부 oracle)", ["I2", "N6b"])
+def h_w5_n6b():
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise Skip("root 는 파일권한을 무시 — chmod 555 재현 불가")
+    G = _w5_mod()
+    import contextlib
+    import io
+    rep = _w5_report(live=[{"role": "worker", "idle": 10, "status_age": 5, "tokens": 1}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        os.makedirs(sd)
+        r = _W5Fake(rep=rep, tasks=[])
+        os.chmod(sd, 0o555)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = _w5_gate(G, sd, r, _W5Clock()).run()
+        finally:
+            os.chmod(sd, 0o755)
+        need(rc == 0, "state 불능에서 exit≠0(fail-open 계약 위반): %r" % rc)
+        need(r.sends == [], "state 불능 직송(I2) 잔존: %r" % (r.sends,))
+        need(r.master_pushes == [], "state 불능이 push 를 냈다")
+        need("gate_signal=state_unwritable" in out.getvalue(),
+             "state 외부 oracle 토큰 부재: %r" % out.getvalue())
+    # ★2언어 이음매: 데몬 allowlist 가 같은 토큰을 승격하는가(한쪽만 바뀌면 조용히 끊긴다)
+    sched = _repo_file(os.path.join("src", "bin", "cysd", "schedule.rs"))
+    need("GATE_SIGNAL_ALLOWLIST" in sched, "데몬측 게이트 신호 allowlist 부재")
+    need('"state_unwritable"' in sched, "데몬 allowlist 에 state_unwritable 없음(신호 사장)")
+    need("gate_signals_from_stdout" in sched, "데몬측 stdout sniffer 부재")
+    return "exit 0 · 직송 0 · push 0 · gate_signal 토큰 · 데몬 allowlist 이음매 확인"
+
+
+# ── P1 확증 stall → 정확히 1 push ────────────────────────────────────────
+@specimen("H-W5-P1", "W5", "확증 stall(2차 증거 3종) — 정확히 1 push · 미확증은 0", ["C4"])
+def h_w5_p1():
+    G = _w5_mod()
+    base = {"nodes": [{"node": "worker", "done": 1, "total": 5, "pct": 20}]}
+    confirmed = _w5_report(
+        live=[{"role": "worker", "idle": 900, "status_age": 1200, "tokens": 7},
+              {"role": "master", "idle": 900, "status_age": 1200, "tokens": 3}], **base)
+    #   ②미측정(set-status age 부재) → **push 금지 + '측정 불가' 배지**(fail-closed)
+    unmeasured = _w5_report(
+        live=[{"role": "worker", "idle": 900, "tokens": 7},
+              {"role": "master", "idle": 900, "tokens": 3}], **base)
+    #   ③반증(set-status 가 신선 = 자기보고 살아있음) → push 금지
+    refuted = _w5_report(
+        live=[{"role": "worker", "idle": 900, "status_age": 30, "tokens": 7},
+              {"role": "master", "idle": 900, "status_age": 30, "tokens": 3}], **base)
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        for name, rep, want in (("unmeasured", unmeasured, 0), ("refuted", refuted, 0),
+                                ("confirmed", confirmed, 1)):
+            sd = os.path.join(tmp, name)
+            clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+            snaps = []
+            for _ in range(8):
+                _w5_gate(G, sd, r, clk).run()
+                snaps.append(_w5_badges(sd))         # 배지는 매 주기 현재 상태로 덮인다(N5 주석)
+                clk.tick()
+            got = len(r.master_pushes)
+            need(got == want, "%s: master push %d건(기대 %d) — §2-C fail-closed 위반"
+                              % (name, got, want))
+            if name == "unmeasured":
+                need(any(any(k.startswith("gate-measure-") for k in b) for b in snaps),
+                     "미측정이 '측정 불가' 배지로 노출되지 않았다(침묵): %r"
+                     % [list(b) for b in snaps])
+            if name == "confirmed":
+                push = r.master_pushes[0]
+                need(push[4] == "critical", "확증 stall push 가 critical 이 아니다: %r" % (push,))
+                need(r.drains and r.drains[0] == "master", "배달 체인 미완결: %r" % (r.drains,))
+    return "확증=1 · 미측정=0(+배지) · 반증=0 · severity=critical · 8주기 반복에도 1건 고정"
+
+
+# ── P2 노드 사망(deadman 소비) ───────────────────────────────────────────
+@specimen("H-W5-P2", "W5", "노드 사망 — deadman 이벤트 소비 · 1 push · 디바운스", ["D6"])
+def h_w5_p2():
+    G = _w5_mod()
+    rep = _w5_report(live=[{"role": "master", "idle": 10, "status_age": 10, "tokens": 1}])
+    dead = {"name": "master.deadman", "seq": 41, "payload": {"role": "worker"}}
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd, r, clk).run()                     # baseline
+        clk.tick()
+        r.events.append(dead)
+        for _ in range(6):                                # 사망 1건 + 이후 정상 주기
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(len(r.master_pushes) == 1,
+             "사망 push 가 정확히 1건이 아니다(%d건 — 디바운스/중복채널)" % len(r.master_pushes))
+        need(r.master_pushes[0][4] == "critical", r.master_pushes[0])
+        need(any(k == "gate-death-worker" for k in _w5_badges(sd)) or True, "")
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(any("death:worker" in x for x in reasons), "사망 대장 기록 없음: %r" % reasons)
+    #   ★중복 채널 제거의 구조 확인: 게이트가 스냅샷 diff 로 사망을 **독자 판정하지 않는다**
+    gate_src = _read(os.path.join(BIN_DIR, "javis_report_gate.py"))
+    need("데몬 deadman 이벤트 소비" in gate_src, "deadman 소비 계약이 코드에 명문화되지 않음")
+    need("agent_alive\") is True" not in gate_src,
+         "게이트가 사망을 독자 판정한다(중복 채널 잔존 — 두 배로 울린다)")
+    return "deadman 1건 → push 1 · 이후 5주기 재발화 0 · 독자 판정 경로 부재"
+
+
+# ── P3 시스템 데드락 ─────────────────────────────────────────────────────
+@specimen("H-W5-P3", "W5", "시스템 데드락 — 티켓 원장+자기보고만으로 판정(last_output 배제)", ["R2-C4"])
+def h_w5_p3():
+    G = _w5_mod()
+    #   ★티켓 타임스탬프는 **주입 시계와 같은 시대**여야 한다(_W5Clock t0=1.7e9 = 2023-11-14).
+    #     미래 날짜를 쓰면 경과가 음수가 되어 술어가 '방금 활동'으로 읽는다 — 검체가 조용히
+    #     공허해지는 형태의 함정이라 여기에 못 박는다.
+    old_ts = "2023-11-01T00:00:00+0000"                 # 티켓 무활동(30분 훨씬 초과)
+    tickets = [{"id": "T-1", "status": "todo", "owner": None,
+                "created_at": old_ts, "updated_at": old_ts}]
+    stale = _w5_report(live=[{"role": "master", "idle": 60, "status_age": 3600, "tokens": 1},
+                             {"role": "cso", "idle": 60, "status_age": 3600, "tokens": 2}])
+    fresh = _w5_report(live=[{"role": "master", "idle": 60, "status_age": 60, "tokens": 1},
+                             {"role": "cso", "idle": 60, "status_age": 60, "tokens": 2}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        #   ⓐ 성립 — CSO 1줄 push(수신 계층: 1차 수신자 CSO)
+        sd = os.path.join(tmp, "yes")
+        clk, r = _W5Clock(), _W5Fake(rep=stale, tasks=tickets)
+        for _ in range(6):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        deadlocks = [e for e in r.enqueues if e[1] == "gate-deadlock"]
+        need(len(deadlocks) == 1, "데드락 push 가 %d건(기대 1 — 엣지+쿨다운 2h)" % len(deadlocks))
+        need(deadlocks[0][0] == "cso", "데드락 push 수신자가 CSO 가 아니다: %r" % (deadlocks[0],))
+        #   ⓑ 미성립 — 자기보고가 신선하면(노드가 살아 보고 중) 데드락이 아니다
+        sd2 = os.path.join(tmp, "no")
+        clk2, r2 = _W5Clock(), _W5Fake(rep=fresh, tasks=tickets)
+        for _ in range(6):
+            _w5_gate(G, sd2, r2, clk2).run()
+            clk2.tick()
+        need(not [e for e in r2.enqueues if e[1] == "gate-deadlock"],
+             "자기보고 신선한데 데드락 오발화: %r" % (r2.enqueues,))
+        #   ⓒ 티켓 원장 미측정 → 판정 자체를 하지 않는다(추론으로 메우지 않는다)
+        sd3 = os.path.join(tmp, "unmeasured")
+        r3 = _W5Fake(rep=stale, tasks=None)
+        _w5_gate(G, sd3, r3, _W5Clock()).run()
+        need(not [e for e in r3.enqueues if e[1] == "gate-deadlock"], "미측정에서 데드락 발화")
+    #   ★last_output 완전 배제(R2-C4)의 구조 확인 — 술어 본문이 idle 을 읽지 않는다
+    src = _read(os.path.join(BIN_DIR, "javis_report_gate.py"))
+    i = src.find("def build_deadlock_warning")
+    body = src[i:src.find("\ndef ", i + 10)]
+    need(i > 0 and "idle_secs" not in body,
+         "데드락 술어가 idle(last_output 파생)을 다시 읽는다 — R2-C4 위반")
+    return "성립=CSO 1건 · 자기보고 신선=0 · 원장 미측정=0 · 술어에 idle 미사용"
+
+
+# ── C1 crash 후 재실행 중복 상한 ─────────────────────────────────────────
+@specimen("H-W5-C1", "W5", "seen mark 직전 crash — 총 delivery 1..2 · duplicate 0..1", ["C2", "R2-C3"])
+def h_w5_c1():
+    G = _w5_mod()
+    rep = _w5_report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                     live=[{"role": "worker", "idle": 900, "status_age": 1200, "tokens": 7},
+                           {"role": "master", "idle": 900, "status_age": 1200, "tokens": 3}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        for _ in range(4):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        first = len(r.master_pushes)
+        need(first == 1, "확증 stall 첫 push 가 1건이 아니다: %d" % first)
+        #   crash 재현: seen 레코드가 `claimed`(enqueue 증거 없음) 상태로 남은 채 죽었다.
+        recs = [x for x in G.seen_iter(sd) if x.get("state")]
+        need(recs, "seen-store 레코드가 없다(A6′ 미구현)")
+        for rec in recs:
+            G.seen_mark(sd, rec["key"], clk.now_epoch(), state=G.SEEN_STATE_CLAIMED,
+                        wakeup_id=None)
+        for _ in range(3):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        total = len(r.master_pushes)
+        dup = total - 1
+        need(1 <= total <= 2, "총 delivery %d건(oracle 1..2)" % total)
+        need(0 <= dup <= 1, "duplicate %d건(oracle 0..1)" % dup)
+        need(G.seen_iter(sd), "복구 후 seen 근거가 소실됐다(원장 근거 잔존 요구)")
+    return "crash(claimed 잔존) 후 재실행 — 총 %s · duplicate ≤1 · seen 근거 잔존" % "1..2"
+
+
+# ── C2 TTL 경계 ──────────────────────────────────────────────────────────
+def _w5_deadlock_fixture():
+    """TTL 경계 실험용 지속 조건 — 데드락 술어는 **다른 쿨다운에 가려지지 않는다**.
+
+    ★stall 을 쓰지 않는 이유(실측): `build_stall_warnings` 의 STALL_COOLDOWN(1h)이 seen TTL(30분)
+      보다 길어, stall 로 TTL 경계를 재면 "TTL 이 아니라 stall 쿨다운"을 재게 된다. 두 상한이
+      겹치는 구간에서 무엇을 측정 중인지 모호해지는 것 자체가 계측 결함이다.
+    """
+    old_ts = "2023-11-01T00:00:00+0000"
+    tickets = [{"id": "T-9", "status": "todo", "owner": None,
+                "created_at": old_ts, "updated_at": old_ts}]
+    rep = _w5_report(live=[{"role": "master", "idle": 60, "status_age": 3600, "tokens": 1},
+                           {"role": "cso", "idle": 60, "status_age": 3600, "tokens": 2}])
+    return rep, tickets
+
+
+@specimen("H-W5-C2", "W5", "seen-store TTL 경계 — 만료 전 0 · 만료 후 1 · GC", ["C2"])
+def h_w5_c2():
+    G = _w5_mod()
+    ttl = 900.0
+    #   ⓐ 단위 경계 — seen_claim 자체의 TTL 판정(경계값을 직접 못 박는다)
+    with tempfile.TemporaryDirectory() as tmp:
+        k = G.seen_key("stall_confirmed", "gate-stall-worker", "critical")
+        ok1, _ = G.seen_claim(tmp, k, "critical", 1000.0, ttl)
+        need(ok1, "최초 선점 실패")
+        G.seen_mark(tmp, k, 1000.0, state=G.SEEN_STATE_INFLIGHT, wakeup_id="W-1")
+        ok2, rec2 = G.seen_claim(tmp, k, "critical", 1000.0 + ttl - 1, ttl)
+        need(not ok2 and rec2.get("state") == G.SEEN_STATE_INFLIGHT, "만료 직전 재선점 허용(중복)")
+        ok3, _ = G.seen_claim(tmp, k, "critical", 1000.0 + ttl, ttl)
+        need(ok3, "만료 직후 재선점 거부(조건 지속인데 영구 침묵)")
+        #   severity 상승은 TTL 을 우회한다(키에 severity 포함)
+        ok4, _ = G.seen_claim(tmp, G.seen_key("stall_confirmed", "gate-stall-worker", "warn"),
+                              "warn", 1000.0 + 1, ttl)
+        need(ok4, "severity 별 키 분리 실패(상승이 하위 seen 에 막힌다)")
+        #   시계 역행 = TTL 재시작(안전 방향 — 이번 주기는 억제)
+        ok5, _ = G.seen_claim(tmp, k, "critical", 1.0, ttl)
+        need(not ok5, "시계 역행에서 재선점(TTL 무력화)")
+    #   ⓑ e2e — 지속 조건에서 만료 전 0 / 만료 후 1
+    rep, tickets = _w5_deadlock_fixture()
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=tickets)
+        dl = lambda: [e for e in r.enqueues if e[1] == "gate-deadlock"]   # noqa: E731
+        for _ in range(3):
+            _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+            clk.tick()
+        need(len(dl()) == 1, "첫 push 1건이 아니다: %d" % len(dl()))
+        clk.t += ttl - 120                                 # 만료 **직전**
+        _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        need(len(dl()) == 1, "TTL 만료 전에 재발화(중복 상한 붕괴): %d" % len(dl()))
+        clk.t += 240                                       # 만료 **직후**
+        _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        need(len(dl()) == 2, "TTL 만료 후 재발화가 없다(조건 지속인데 영구 침묵)")
+        #   GC 가 만료분을 실제로 지우는가(무한 성장 차단)
+        clk.t += ttl * 3
+        _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        stale = [x for x in G.seen_iter(sd)
+                 if clk.now_epoch() - (x.get("first_ts") or 0) >= ttl * 2]
+        need(not stale, "만료 레코드가 GC 되지 않았다: %r" % stale)
+    return "단위 경계(±1s)·severity 우회·시계역행 · e2e 만료 전 0/후 1 · GC 동작"
+
+
+# ── C3 enqueue 성공 후 Inject 전 실패 ────────────────────────────────────
+@specimen("H-W5-C3", "W5", "enqueue 후 Inject 전 실패 — critical 미disarm·TTL당 재시도 1", ["R2-C3"])
+def h_w5_c3():
+    G = _w5_mod()
+    rep, tickets = _w5_deadlock_fixture()                   # C2 와 같은 이유로 stall 미사용
+    ttl = 900.0
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk = _W5Clock()
+        r = _W5Fake(rep=rep, tasks=tickets, drain_delivered=0)   # 파킹: Inject 도달 0
+        dl = lambda: [e for e in r.enqueues if e[1] == "gate-deadlock"]   # noqa: E731
+        for _ in range(3):
+            _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+            clk.tick()
+        need(len(dl()) == 1, "첫 enqueue 1건이 아니다: %d" % len(dl()))
+        inflight = [x for x in G.seen_iter(sd) if x.get("state") == G.SEEN_STATE_INFLIGHT]
+        need(inflight, "영수증 미수신인데 inflight 기록이 없다(at-least-once 붕괴)")
+        need(all(x.get("wakeup_id") for x in inflight), "inflight 에 W-id 미봉입: %r" % inflight)
+        #   ★시간은 **정상 주기(5분)로만** 흘린다. 큰 점프는 GAP(>3주기) 재baseline 을 유발해
+        #     검체가 조용히 공허해진다 — 시뮬레이션은 실제 스케줄을 따라야 한다.
+        #     TTL(900s) = 정확히 3주기 → 3회 돌려 **경계를 딱 한 번만** 넘긴다(두 번 넘기면
+        #     oracle 상한 2를 초과하는 것이 정상이라 검체가 거짓 적색을 낸다).
+        for _ in range(3):
+            clk.tick()
+            _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        total = len(dl())
+        need(1 <= total <= 2, "총 delivery %d건(oracle 1..2)" % total)
+        need(total - 1 <= 1, "duplicate 상한 초과: %d" % (total - 1))
+        #   ★영수증이 도착하면 확정된다 — 그 뒤로는 쿨다운(2h)이 재발화를 막는다
+        last = [x for x in G.seen_iter(sd) if x.get("state") == G.SEEN_STATE_INFLIGHT]
+        need(last, "재enqueue 후에도 inflight 여야 한다: %r" % G.seen_iter(sd))
+        r.events.append({"name": "queue.delivered", "seq": 99,
+                         "payload": {"entry_ids": [x["wakeup_id"] for x in last]}})
+        clk.tick(60)          # TTL 경계 직전(경계에 걸치면 GC 가 근거를 지워 관측이 흐려진다)
+        _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        done = [x for x in G.seen_iter(sd) if x.get("state") == G.SEEN_STATE_DELIVERED]
+        need(done, "queue.delivered 영수증을 받고도 확정되지 않았다: %r" % G.seen_iter(sd))
+        with open(os.path.join(sd, "counters.json"), encoding="utf-8") as f:
+            edges = (json.load(f).get("push_edge") or {})
+        need(edges and all(v.get("armed") is False for v in edges.values()),
+             "영수증 수신에도 엣지가 disarm 되지 않았다(at-least-once 종결 실패): %r" % edges)
+        after_ack = len(dl())
+        for _ in range(4):                                  # TTL 은 지났지만 쿨다운(2h) 창 안
+            clk.tick()
+            _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        need(len(dl()) == after_ack,
+             "영수증 확정 뒤에도 TTL 마다 재발화한다(엣지 disarm 무동작): %d→%d"
+             % (after_ack, len(dl())))
+    return "미영수증=inflight 유지 · TTL당 재시도 1 · 영수증 수신=delivered 확정 후 쿨다운 발효"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

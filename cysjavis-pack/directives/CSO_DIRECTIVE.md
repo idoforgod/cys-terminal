@@ -31,6 +31,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 | `pane.idle` | 노드 장기 무출력 | read-screen으로 상태 확인 → hang이면 회생 조치(키 입력/재기동 건의) |
 | `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
 | `queue.depth_high` | 한 노드행 queued 배달이 막힌 채 적체(기본 depth 5+ · blocked_by에 사유) | read-screen으로 대상 노드 점검 → 막힘 원인(연속 출력·사람 입력·queue pause) 해소 또는 master 보고 |
+| `[gate] …` wakeup (델타게이트 push) | **네가 게이트 push의 1차 수신자다**(T-0147-2 층2 수신 계층) | **처리 계약**: ①먼저 `cys control alerts`의 `node_liveness` 배지와 게이트 대장(`javis_report_gate.py status`)으로 근거를 확인한다 ②네 권한으로 해소되면 해소하고 **master에 보고하지 않는다**(master stdin 보존이 이 설계의 목적이다) ③해소 불가·판단 필요일 때만 master에 1줄 보고한다. 게이트는 idle·context·feed를 **더 이상 push하지 않는다** — 그것들은 배지·대장·EVT로만 오므로 네가 주기 점검으로 잡는다. |
 
 ## 2. 노드 생애 관리
 - 죽은 노드(`surface.exited`)는 master와 협의해 재기동한다: `cys launch-agent --role <역할> --agent <cli>`.

@@ -5,7 +5,7 @@
       "id": "owner-progress-gate-5min",
       "every_minutes": 5,
       "action": "command",
-      "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run",
+      "command": "CYS_REPORT_GATE_DIR=\"$HOME/.cys/state/report_gate\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run",
       "if_absent": "skip"
     },
     {

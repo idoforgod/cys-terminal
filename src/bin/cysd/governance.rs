@@ -928,6 +928,51 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
     }
 }
 
+/// ★T-0147-2 층1 I4: 승인 wakeup 중복 억제 상태 — 문구 해시 → 마지막 적재 시각.
+///
+/// Daemon(state.rs)에 필드를 늘리지 않고 모듈 static 으로 두는 이유: 이 억제는 governance 의
+/// approval 네임스페이스 안에서만 의미가 있고(설계 층3 '발행자 불변식' ② — pack 큐와 trigger 가
+/// 겹치지 않으므로 전역 dedupe 가 아니라 자체 문구 dedupe 가 계약이다), 데몬 전역 상태로 승격하면
+/// 재시작 영속·RPC 노출 같은 계약이 딸려온다. 여기 필요한 건 프로세스 수명의 5분 창뿐이다.
+static APPROVAL_WAKEUP_RECENT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, f64>>> =
+    std::sync::OnceLock::new();
+
+fn approval_wakeup_recent() -> &'static std::sync::Mutex<HashMap<u64, f64>> {
+    APPROVAL_WAKEUP_RECENT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 문구 지문. 전문 비교 대신 해시를 쓰는 이유는 창 맵이 감지 문구(수백 바이트 excerpt 포함)를
+/// 그대로 붙들지 않게 하기 위함이다 — 충돌 시 결과는 '한 번 덜 깨움'이라 안전 방향이다.
+fn approval_wakeup_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// ★T-0147-2 층1 I4 술어(순수 — 부작용0·테스트 핀). 승인 감지 에피소드마다 master stdin 을
+/// 두드리던 경로에 창(기본 5분) dedupe 를 건다. 판정 근거 2종:
+///   ① 직전 큐에 **동일 문구**가 아직 배달 대기 중 = 같은 사실을 두 번 읽힐 이유가 없다.
+///   ② 창 안에 같은 문구를 이미 적재했다 = 배달돼 사라졌더라도 master 는 방금 그것을 봤다.
+/// `window_secs <= 0.0` 이면 항상 false — 노브 비활성 시 **종전 무억제 동작**으로 정확히 되돌린다.
+fn approval_wakeup_suppressed(
+    queue: &std::collections::VecDeque<String>,
+    recent: &HashMap<u64, f64>,
+    text: &str,
+    now: f64,
+    window_secs: f64,
+) -> bool {
+    if window_secs <= 0.0 {
+        return false;
+    }
+    if queue.iter().any(|q| q == text) {
+        return true;
+    }
+    recent
+        .get(&approval_wakeup_hash(text))
+        .is_some_and(|t| now - t < window_secs)
+}
+
 /// L2 방치 차단(2026-07-07 feed 폭주 재발방지): master role surface의 pending_queue에
 /// 텍스트 1건을 직접 적재한다 — 승인 감지가 이벤트 bus에만 실려 master stdin에 닿지 않던
 /// 갭의 봉인. cap(100)·배달 규약(deliver_queued 조용시점·typing-guard)은 큐 기존 계약을
@@ -946,13 +991,47 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
     if s.exited.load(Ordering::Relaxed) {
         return;
     }
+    // ★T-0147-2 층1 I4: pending_queue 삽입 **전** 문구 dedupe(기본 창 5분, 0=비활성).
+    let window = env_u64("CYS_APPROVAL_WAKEUP_DEDUPE_SECS", 300) as f64;
+    let now = now_epoch();
+    let mut suppressed = false;
     let depth = {
         let mut q = s.pending_queue.lock().unwrap();
-        if q.len() >= 100 {
-            return;
+        // 락 순서: pending_queue → APPROVAL_WAKEUP_RECENT. 이 static 은 여기서만 잡히므로
+        // 역순 획득자가 존재할 수 없다(데드락 무관).
+        let mut recent = approval_wakeup_recent()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 무한 성장 차단: 창의 2배를 넘긴 항목은 어떤 판정에도 쓰이지 않는다(24/365 데몬 누수).
+        if window > 0.0 {
+            recent.retain(|_, t| now - *t <= 2.0 * window);
         }
-        q.push_back(text.to_string());
-        q.len()
+        if approval_wakeup_suppressed(&q, &recent, text, now, window) {
+            suppressed = true;
+            None
+        } else if q.len() >= 100 {
+            None // 큐 포화 — 종전대로 조용히 무시
+        } else {
+            q.push_back(text.to_string());
+            recent.insert(approval_wakeup_hash(text), now);
+            Some(q.len())
+        }
+    };
+    if suppressed {
+        // 침묵 금지: 억제도 관측 가능한 사실로 남긴다 — '깨우지 않았다'가 '사건이 없었다'로
+        // 읽히면 wakeup 홍수를 고치다 무음 고장을 새로 만든 셈이 된다.
+        daemon.bus.publish(
+            "queue.suppressed",
+            "queue",
+            Some(master_sid),
+            json!({"from": "governance-approval", "reason": "dup_within_window",
+                   "window_secs": window}),
+        );
+        return;
+    }
+    // 적재 성공 시에만 queue.enqueued — 기존 발행 경로 무회귀(수락 증거의 의미 불변).
+    let Some(depth) = depth else {
+        return;
     };
     daemon.bus.publish(
         "queue.enqueued",
@@ -2196,6 +2275,54 @@ fn alert_queue_depth_if_high(
     );
 }
 
+/// ★T-0147-2 §2 층3 A3′(= §8 R2-C3 수용): 배달 텍스트에 봉입된 wakeup entry id(`W-<hex>`) 추출.
+///
+/// `queue.enqueued`는 **수락 증거**이지 배달 영수증이 아니다. javis_wakeup 의 상태머신
+/// (`armed → seen-claim → enqueue(W-id 봉입) → Inject-ack → disarm`)에서 critical-tier 는
+/// 실제 `WriteReq::Inject` 가 일어났다는 영수증(`queue.delivered`)을 보고서만 disarm 한다 —
+/// 그래서 데몬이 배달한 텍스트에서 W-id 를 되읽어 에코해야 python 게이트가 조인할 수 있다.
+///
+/// 정규식 대신 바이트 스캔인 이유: 문법이 고정(`W-` + `[0-9a-f]{1,32}`)이고 이 함수는 배달
+/// 틱마다 도는 경로다 — Regex 컴파일/의존을 새로 끌 이유가 없다(크레이트에 regex 가 이미 있어도
+/// 이 문법에는 과잉이다).
+///
+/// 경계 규약: `W-` 뒤 hex 0자는 무시(`W-`·`W-ZZZZ`), hex 뒤 첫 비-hex 문자가 종료 경계
+/// (`[wakeup W-a1b2c3d4e5]` → `W-a1b2c3d4e5`), 등장 순서 보존 + 중복 제거, 최대 32개.
+fn wakeup_entry_ids(text: &str) -> Vec<String> {
+    /// 한 배달 텍스트에서 뽑는 id 상한 — digest 병합이라도 이 이상은 페이로드 비대만 낳는다.
+    const MAX_IDS: usize = 32;
+    /// id 본문 hex 상한(계약: 1~32자).
+    const MAX_HEX: usize = 32;
+    let is_hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+    let b = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] != b'W' || b[i + 1] != b'-' {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let mut end = start;
+        while end < b.len() && end - start < MAX_HEX && is_hex(b[end]) {
+            end += 1;
+        }
+        // hex 0자 = 오형 → `W-` 다음 문자부터 재스캔(겹친 `W-W-a1` 도 놓치지 않는다).
+        i = if end > start { end } else { start };
+        if end == start {
+            continue;
+        }
+        let id = format!("W-{}", &text[start..end]);
+        if !out.iter().any(|x| x == &id) {
+            out.push(id);
+            if out.len() >= MAX_IDS {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// 인플라이트 큐 배달자: 대상 surface가 quiet 임계(기본 3초) 이상 조용하면 큐에서 한 건 주입.
 /// 연속 배달은 다음 틱 — 메시지 사이 자연 간격이 생겨 에이전트가 한 건씩 소화한다.
 /// 배달이 막힌 채 적체되면(depth ≥ 임계) `queue.depth_high`를 쿨다운(5분)으로 발행한다.
@@ -2293,11 +2420,20 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
         if let Some((text, remaining)) = delivered {
             // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
             *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+            // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
+            // 배열인 이유 — javis_wakeup 의 digest 모드(층1 I6)가 같은 target 의 N건을 1회
+            // Inject 로 병합하므로, 병합된 **전** W-id 가 ack 돼야 critical-tier 가 disarm 된다.
+            // 하나라도 빠지면 그 사건은 seen-store 에 inflight 로 남아 TTL 마다 영구 재enqueue 된다
+            // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
+            // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
+            let entry_ids = wakeup_entry_ids(&text);
             daemon.bus.publish(
                 "queue.delivered",
                 "queue",
                 Some(s.id),
-                serde_json::json!({"bytes": text.len(), "remaining": remaining}),
+                serde_json::json!({"bytes": text.len(), "remaining": remaining,
+                                   "entry_ids": entry_ids,
+                                   "surface_ref": cys::surface_ref(s.id)}),
             );
             // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
             daemon.persist_queue_state();
@@ -2307,7 +2443,120 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{learn_stuck_candidates, merged_approval_patterns, plan_duplicate_kills};
+    use super::{
+        approval_wakeup_suppressed, learn_stuck_candidates, merged_approval_patterns,
+        plan_duplicate_kills, wakeup_entry_ids,
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★T-0147-2 §2 층3 A3′(R2-C3) — queue.delivered 의 W-id 에코
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 단건: 대괄호·공백에 둘러싸여도 hex 종료 경계에서 정확히 끊긴다.
+    #[test]
+    fn wakeup_entry_ids_extracts_single_id_with_boundary() {
+        assert_eq!(
+            wakeup_entry_ids("[wakeup W-a1b2c3d4e5] master 확인 요망"),
+            vec!["W-a1b2c3d4e5".to_string()]
+        );
+        // 줄바꿈·구두점도 종료 경계
+        assert_eq!(wakeup_entry_ids("id=W-0f9\n다음 줄"), vec!["W-0f9".to_string()]);
+    }
+
+    /// digest 3건: 병합 배달의 **전** id 가 순서대로 나와야 critical-tier 가 disarm 된다
+    /// (하나라도 누락되면 그 사건은 inflight 로 남아 TTL 마다 영구 재enqueue = 홍수 재발).
+    #[test]
+    fn wakeup_entry_ids_extracts_all_digest_ids_in_order_dedup() {
+        let text = "[digest 3건]\n- W-aaa1 노드 사망\n- W-bbb2 stall\n- W-ccc3 데드락\n(재게시 W-aaa1)";
+        assert_eq!(
+            wakeup_entry_ids(text),
+            vec!["W-aaa1".to_string(), "W-bbb2".to_string(), "W-ccc3".to_string()],
+            "등장 순서 보존 + 중복 제거"
+        );
+    }
+
+    /// 0건: 봉입 id 없는 일반 큐 배달은 빈 배열(에코 계약상 키는 항상 존재).
+    #[test]
+    fn wakeup_entry_ids_empty_when_no_token() {
+        assert!(wakeup_entry_ids("평범한 큐 메시지 — id 없음").is_empty());
+        assert!(wakeup_entry_ids("").is_empty());
+    }
+
+    /// 오형: `W-` 뒤 hex 0자(`W-`, `W-ZZZZ`, 대문자 hex)는 전부 무시. 겹친 `W-W-a1` 도 회수.
+    #[test]
+    fn wakeup_entry_ids_rejects_malformed_tokens() {
+        assert!(wakeup_entry_ids("W-").is_empty());
+        assert!(wakeup_entry_ids("W- a1b2").is_empty(), "공백은 hex 아님");
+        assert!(wakeup_entry_ids("W-ZZZZ").is_empty());
+        assert!(wakeup_entry_ids("W-A1B2").is_empty(), "hex 는 소문자 [0-9a-f] 만");
+        assert_eq!(wakeup_entry_ids("W-W-a1"), vec!["W-a1".to_string()]);
+    }
+
+    /// 상한: id 32개에서 절단(페이로드 비대 차단) · hex 본문도 32자에서 절단.
+    #[test]
+    fn wakeup_entry_ids_caps_count_and_hex_length() {
+        let many: String = (0..40).map(|i| format!("W-{i:04x} ")).collect();
+        assert_eq!(wakeup_entry_ids(&many).len(), 32);
+        let long = format!("W-{}", "a".repeat(40));
+        assert_eq!(wakeup_entry_ids(&long), vec![format!("W-{}", "a".repeat(32))]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★T-0147-2 층1 I4 — 승인 wakeup 중복 억제(창 5분)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 직전 큐에 동일 문구가 배달 대기 중이면 억제 — 같은 사실로 master 를 두 번 깨우지 않는다.
+    #[test]
+    fn approval_wakeup_suppressed_when_same_text_still_queued() {
+        let mut q = std::collections::VecDeque::new();
+        q.push_back("[승인감지] claude surface:7 …".to_string());
+        let recent = std::collections::HashMap::new();
+        assert!(approval_wakeup_suppressed(
+            &q,
+            &recent,
+            "[승인감지] claude surface:7 …",
+            1000.0,
+            300.0
+        ));
+        // 다른 문구는 통과(다른 사실은 깨울 가치가 있다)
+        assert!(!approval_wakeup_suppressed(
+            &q,
+            &recent,
+            "[승인감지] codex surface:9 …",
+            1000.0,
+            300.0
+        ));
+    }
+
+    /// 창 안/밖 경계 — 배달돼 큐에서 사라진 뒤에도 창 동안은 억제, 창을 넘기면 재발화.
+    #[test]
+    fn approval_wakeup_window_boundary_in_and_out() {
+        let q = std::collections::VecDeque::new();
+        let text = "[승인감지] claude surface:7 …";
+        let mut recent = std::collections::HashMap::new();
+        recent.insert(super::approval_wakeup_hash(text), 1000.0);
+        assert!(
+            approval_wakeup_suppressed(&q, &recent, text, 1299.0, 300.0),
+            "창 안(299s<300s) 억제"
+        );
+        assert!(
+            !approval_wakeup_suppressed(&q, &recent, text, 1300.0, 300.0),
+            "창 경계(=300s) 부터 재발화 — 방치 차단 원목적 보존"
+        );
+        assert!(!approval_wakeup_suppressed(&q, &recent, text, 9999.0, 300.0));
+    }
+
+    /// window 0 = 노브 비활성 → 종전 무억제 동작으로 정확히 복귀(회귀 탈출구).
+    #[test]
+    fn approval_wakeup_dedupe_disabled_when_window_zero() {
+        let mut q = std::collections::VecDeque::new();
+        let text = "[승인감지] claude surface:7 …";
+        q.push_back(text.to_string());
+        let mut recent = std::collections::HashMap::new();
+        recent.insert(super::approval_wakeup_hash(text), 1000.0);
+        assert!(!approval_wakeup_suppressed(&q, &recent, text, 1000.0, 0.0));
+        assert!(!approval_wakeup_suppressed(&q, &recent, text, 1000.0, -1.0));
+    }
 
     /// ★W-B 보완 핀: agents.json user 동결이 vendor 신규 approval_patterns 를 못 받아 승인
     /// 미감지→워커 hang 으로 가는 경로를 차단한다. 규칙 = 합집합(디스크 ∪ 임베드), 동명은 디스크 승.

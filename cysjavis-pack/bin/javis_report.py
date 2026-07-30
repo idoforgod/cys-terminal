@@ -336,6 +336,42 @@ def _retire_scan_lines(head):
     return out
 
 
+# ── ★T-0147-2 층4 — 판정 근거 단일화(설계 `_round/T-0147-2-DESIGN-wakeup-demotion.md` §2 층4) ──
+#
+# 게이트(`javis_report_gate`)는 idle 판정을 `live_nodes[].idle_secs` 와 `idle_nodes[]` **두 갈래**
+# 에서 문자열 라벨로 조인해 왔다. 같은 사실을 두 곳에서 읽으면 어느 쪽이 진실인지·언제 잰
+# 값인지가 사라지고, 그 공백이 오발화(설계 §0-3 라벨공간 교차조인 실패)의 서식지였다.
+# 그래서 **출처와 샘플 시각이 박힌 단일 권위 레코드**를 방출한다: `role_measurements[]`.
+#
+# ⚠두 번째 판정 기준을 만들지 않는 것이 이 조항의 핵심이다 — 모집단·값은 전부 `live_nodes`
+#   항목에서 파생하고(아래 `_measurement_from_node`), 여기서 새로 status 를 훑지 않는다.
+MEASURE_SOURCE_STATUS = "daemon.status"
+MEASURE_SOURCE_NONE = "unavailable"
+MEASURE_SOURCE_IDLE = "daemon.status.idle_secs"
+
+
+def _measurement_from_node(entry, sampled_at):
+    """`live_nodes[]` 항목 1건 → 권위 측정 레코드 1건(설계 층4).
+
+    `idle_secs` 가 없거나 int 가 아니면 값은 `null`, source 는 `unavailable` 이다 —
+    **0 으로 접지 않는다**. 0 은 "쟀고 방금 움직였다"는 뜻이라, 미측정을 0 으로 접는 순간
+    fail-closed 여야 할 게이트가 fail-open 으로 뒤집힌다.
+    """
+    idle = entry.get("idle_secs")
+    measured = isinstance(idle, int)      # 술어는 `idle_nodes` 선별과 동일(두 기준 금지)
+    return {
+        "role": entry.get("role"),
+        "idle_secs": idle if measured else None,
+        "sampled_at": sampled_at,
+        "source": MEASURE_SOURCE_IDLE if measured else MEASURE_SOURCE_NONE,
+        "agent_alive": entry.get("agent_alive"),
+        # ★§2-C fail-closed 확증의 2차 증거 — **idle 판정에는 절대 쓰지 않는다**(아래
+        #   live_nodes 산출부의 계약 주석 참조). ②자기보고 증거 / ③usage 토큰 델타.
+        "status_age_secs": entry.get("status_age_secs"),
+        "usage_ctx_tokens": entry.get("usage_ctx_tokens"),
+    }
+
+
 def live_roles(status):
     """status의 role 집합(소문자). status 미수집이면 None(=귀속 판정 불가 → 배제 안 함)."""
     if not status:
@@ -670,7 +706,12 @@ def classify_files(files, status, now):
     return active, excluded, unclaimed, pending_outside, stats
 
 
-def build_report(status, extra_dirs, now=None):
+def build_report(status, extra_dirs, now=None, sampled_at=None):
+    """`sampled_at` = status 를 실제로 수집한 시각(epoch float · 설계 층4).
+
+    호출부가 주지 않으면 `now` 로 폴백한다(테스트 결정론 유지). status 미수집이면 무조건
+    `None` 이다 — 수집하지 않은 것에 시각을 붙이면 그 값이 곧 거짓 근거가 된다.
+    """
     files = discover_todo_files(status, extra_dirs)
     now = time.time() if now is None else now
     nodes, excluded, unclaimed, pending_outside, decl_stats = classify_files(files, status, now)
@@ -721,6 +762,9 @@ def build_report(status, extra_dirs, now=None):
     idle_nodes = []
     feed_pending = None
     paused = None
+    # ★T-0147-2 층4 — 수집 시각·출처는 **레코드에 박아** 내보낸다(소비자가 추정하지 않게).
+    sampled_at_val = None if status is None else (now if sampled_at is None else sampled_at)
+    measure_source = MEASURE_SOURCE_NONE if status is None else MEASURE_SOURCE_STATUS
     if status:
         feed_pending = status.get("feed", {}).get("pending")
         paused = status.get("paused")
@@ -729,19 +773,37 @@ def build_report(status, extra_dirs, now=None):
             if not role:
                 continue
             ag = s.get("status") or {}  # org.status는 자기보고를 "status" 필드로 노출
+            us = s.get("usage") or {}   # org.status는 데몬 관측 사용량을 "usage" 필드로 노출
             # idle = PTY 무출력 경과(surface 상위 "idle_secs"). 자기보고 갱신 경과(status.age_secs)는
             # 활동 중에도 갱신되므로 idle 판정에 쓰면 안 된다(절대지침 B3: 출력 멎은 지 5분+).
             idle_secs = s.get("idle_secs")
+            # ★T-0147-2 §2-C — stall critical push 의 **fail-closed 확증 2차 증거**(가산).
+            #   last_output 유래 idle 은 "픽셀이 안 바뀐 시간"이라 신뢰할 수 없어(설계 §0-4)
+            #   critical 승격 입력에서 제외됐다. 그 자리를 아래 두 값이 메운다:
+            #     ② status_age_secs — `cys set-status` 자기보고 경과(에이전트가 스스로 말한 것)
+            #     ③ usage_ctx_tokens — 데몬 관측 토큰(게이트가 주기 간 **델타**를 낸다)
+            #   ⚠idle 판정에는 절대 쓰지 않는다(위 계약 그대로). 용도는 확증 전용이다.
+            #   ⚠미측정은 반드시 None 이다 — 0 으로 접으면 "델타 0"(=멎었다)과 구별되지 않아
+            #     fail-closed 가 fail-open 으로 뒤집힌다(이 조항의 유일한 치명 함정).
+            age_secs = ag.get("age_secs")
+            ctx_tokens = us.get("ctx_tokens")
             entry = {
                 "role": role,
                 "state": ag.get("state"),
                 "context_pct": ag.get("context_pct"),
                 "idle_secs": idle_secs,
                 "agent_alive": s.get("agent_alive"),
+                "status_age_secs": age_secs if isinstance(age_secs, int) else None,
+                "usage_ctx_tokens": ctx_tokens if isinstance(ctx_tokens, int) else None,
             }
             live_nodes.append(entry)
             if isinstance(idle_secs, int) and idle_secs >= IDLE_ALERT_SECS and s.get("agent_alive"):
                 idle_nodes.append(entry)
+    # 권위 측정 레코드 — 모집단·값은 `live_nodes` 에서만 파생한다(두 번째 판정 기준 금지).
+    # 정렬은 role 오름차순(안정 정렬이라 동명 role 은 status 순서를 그대로 보존한다 — 결정론).
+    role_measurements = sorted(
+        (_measurement_from_node(n, sampled_at_val) for n in live_nodes),
+        key=lambda m: m["role"])
 
     return {
         # ⚠ 모수는 `nodes[]`다(유령 재유입 금지). "전부 끝났다"는 주장은 아래 두 필드가 한다.
@@ -759,6 +821,13 @@ def build_report(status, extra_dirs, now=None):
         "feed_pending": feed_pending,
         "paused": paused,
         "status_available": status is not None,
+        # ★T-0147-2 층4 — 판정 근거 단일화(가산 · 구버전 게이트는 이 키를 몰라 종전대로 동작).
+        #   `sampled_at`/`measure_source` 는 "언제·어디서 잰 값인가"를 레코드에 박는다.
+        #   `role_measurements` 는 게이트가 idle 판정에 쓸 **유일한 권위 레코드**다
+        #   (live_nodes·idle_nodes 두 갈래를 라벨로 조인하던 종전 방식의 대체재).
+        "sampled_at": sampled_at_val,
+        "measure_source": measure_source,
+        "role_measurements": role_measurements,
         # 배제된 todo 전건(사유 포함) — 소비자는 집계에 쓰지 않되 사람에게는 반드시 보인다.
         # 항목의 "source"는 판정 출처("decl"=선언 / "heuristic"=폴백 4규칙) — 마이그레이션 관측용.
         "excluded": excluded,
@@ -913,7 +982,10 @@ def main():
                     help="추가 스캔 폴더(그 안의 _round/*_TODO.md 및 직접 *_TODO.md)")
     args = ap.parse_args()
 
-    rep = build_report(cys_status(), args.extra_dir)
+    # ★T-0147-2 층4 — 수집 **직후**의 시각을 권위 레코드에 싣는다(추정 금지).
+    status = cys_status()
+    rep = build_report(status, args.extra_dir,
+                       sampled_at=(time.time() if status is not None else None))
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
     else:

@@ -626,6 +626,13 @@ async fn run_text_command(cmd: &str) -> Result<String, String> {
     Ok(s)
 }
 
+/// ★T-0147-2 층1 **I5 — 인벤토리 예외(명시)**.
+///
+/// 이 경로(schedule heartbeat inject)는 master stdin 주입자 전수 인벤토리의 I5 항목이고,
+/// **W5 범위 밖**이다. 이유: 여기 실리는 잡은 오너가 직접 심은 전자동 사이클 메커니즘이라
+/// 라우팅을 자율로 바꾸는 것은 '오너 결정 사항'(설계 §4 유지 리스크·자율 변경 경계)이다.
+/// 그래서 **강등하지 않고 계수에서만 명시 제외**한다(M1 예외 예산 — 원장에는 그대로 남는다).
+/// 침묵이 아니라 등재된 예외다: 인벤토리에 이름이 있고, 여기 주석이 그 사실을 코드에 못 박는다.
 async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     let to = job.to.as_deref().ok_or("push job missing 'to'")?;
     // text 결정: text_command가 있으면 데몬이 실행해 stdout을 push 텍스트로 쓴다(결정론 환원).
@@ -889,6 +896,55 @@ fn apply_spawn_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// ★T-0147-2 §1-B N6b / 층1 I2 — 게이트 신호 allowlist(deny-by-default).
+///
+/// 여기 없는 name 은 버린다. stdout 은 **신뢰 경계 밖**(잡이 임의 문자열을 찍는다)이라
+/// 열어두면 미지 토큰이 `gate.*` 이벤트 이름 공간과 CC 배지판을 오염시킨다.
+/// ★확장 시 python 게이트(`javis_report_gate.py`)와 **동시 갱신**할 것 — 한쪽만 늘리면
+/// 게이트는 신호를 보내는데 데몬이 조용히 버리는 무음 고장이 된다.
+const GATE_SIGNAL_ALLOWLIST: &[&str] = &["state_unwritable"];
+
+/// 게이트 stdout 요약에서 기계 토큰 `gate_signal=<name>` 을 뽑는다(순수 — 부작용0·테스트 핀).
+///
+/// 왜 stdout 인가: 게이트가 state_dir 에 쓸 수 없으면 원장에도 badges.json 에도 아무 흔적을
+/// 남길 수 없다 — 같은 state 를 oracle 로 기대하는 것이 자기모순(설계 R3-GATE)이다. stdout
+/// 요약 1줄은 이미 `schedule.command_done` 텔레메트리에 실려 나가는 **확립된 채널**이라,
+/// 새 채널을 만들지 않고 state 외부 oracle 을 얻는다.
+///
+/// 문법: `[a-z_]{1,40}`, 중복 제거, 상한 4(한 잡이 이벤트를 폭주시키지 못하게).
+pub fn gate_signals_from_stdout(stdout: &str) -> Vec<String> {
+    const TOKEN: &str = "gate_signal=";
+    const MAX_SIGNALS: usize = 4;
+    const MAX_NAME: usize = 40;
+    let mut out: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let mut rest = line;
+        while let Some(pos) = rest.find(TOKEN) {
+            let tail = &rest[pos + TOKEN.len()..];
+            rest = tail; // 같은 줄의 다음 토큰까지 훑는다
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                .take(MAX_NAME + 1) // +1 로 받아 길이 초과를 '절단'이 아니라 '거부'로 판정
+                .collect();
+            if name.is_empty() || name.len() > MAX_NAME {
+                continue;
+            }
+            if !GATE_SIGNAL_ALLOWLIST.contains(&name.as_str()) {
+                continue;
+            }
+            if out.iter().any(|n| n == &name) {
+                continue;
+            }
+            out.push(name);
+            if out.len() >= MAX_SIGNALS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     let command = job
         .command
@@ -911,6 +967,19 @@ async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String>
         json!({"job_id": job.id, "exit": out.status.code(),
                "stdout_tail": String::from_utf8_lossy(&out.stdout).chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()}),
     );
+    // ★T-0147-2 §1-B N6b: stdout 기계 토큰 → 데몬 사실로 승격(state 외부 oracle).
+    // 아래 exit≠0 Err 반환 **앞**에 두는 이유: 게이트는 항상 exit 0 이지만 계약은 종료코드와
+    // 무관하다 — 실패 경로에서 신호가 증발하면 "쓰기 불능"을 알릴 유일한 채널이 닫힌다.
+    for name in gate_signals_from_stdout(&String::from_utf8_lossy(&out.stdout)) {
+        daemon.bus.publish(
+            &format!("gate.{name}"),
+            "alert",
+            None,
+            json!({"job_id": job.id, "signal": name}),
+        );
+        // CC 배지 축(alerts.rs) — 이벤트는 흘러가지만 배지는 TTL 동안 남아 사람이 본다.
+        crate::alerts::note_gate_signal(&format!("gate.{name}"), json!({"job_id": job.id}));
+    }
     // 실패 표면화: 종전엔 exit≠0 도 Ok 로 삼켜 schedule.fired 가 나갔다 — 잡이 매 주기 실패해도
     // 이벤트만 보면 '발화 성공'으로 읽혔다(무음 고장). run_text_command 와 같은 형태로 Err 를
     // 돌려 fire()가 schedule.error(job_id·exit·stderr 꼬리)를 발행하게 한다.
@@ -1444,6 +1513,85 @@ mod tests {
         assert!(!should_warn_fallback("/C", 10_000, 10_000 + 3_599));
         // 1시간 경과 — 재발행 (종전 AtomicBool 1회 방식은 여기서 영구 무음으로 회귀했다)
         assert!(should_warn_fallback("/C", 10_000, 10_000 + 3_600));
+    }
+
+    /// ★T-0147-2 §1-B N6b 핀(순수부): stdout 토큰 파싱 — 정상·중복·미지 거부·상한·문법.
+    #[test]
+    fn gate_signals_from_stdout_allowlists_and_dedupes() {
+        // 정상 1건 — 요약 줄 안에 섞여 있어도 토큰만 뽑는다.
+        assert_eq!(
+            gate_signals_from_stdout("gate ok nodes=4 gate_signal=state_unwritable lane=base"),
+            vec!["state_unwritable".to_string()]
+        );
+        // 여러 줄·중복 → 1건
+        assert_eq!(
+            gate_signals_from_stdout(
+                "gate_signal=state_unwritable\n다른 줄\ngate_signal=state_unwritable\n"
+            ),
+            vec!["state_unwritable".to_string()]
+        );
+        // 미지 토큰 거부(deny-by-default) — stdout 은 신뢰 경계 밖이다.
+        assert!(gate_signals_from_stdout("gate_signal=rm_rf_root").is_empty());
+        assert!(gate_signals_from_stdout("gate_signal=state_unwritable_extra").is_empty());
+        assert!(gate_signals_from_stdout("gate_signal=STATE_UNWRITABLE").is_empty(), "소문자만");
+        assert!(gate_signals_from_stdout("gate_signal=").is_empty(), "빈 name 거부");
+        assert!(gate_signals_from_stdout("gate_signal= state_unwritable").is_empty());
+        // 길이 초과(>40)는 절단이 아니라 거부
+        assert!(gate_signals_from_stdout(&format!("gate_signal={}", "a".repeat(41))).is_empty());
+        // 토큰 없는 평범한 stdout
+        assert!(gate_signals_from_stdout("게이트 정상 종료\n").is_empty());
+        // 상한 4 — 현재 allowlist 가 1종이라 dedupe 로 이미 1건이지만, 상한 상수가 살아있음을
+        // 계약으로 남긴다(allowlist 확장 시 여기가 폭주 방지선).
+        let flood = "gate_signal=state_unwritable ".repeat(50);
+        assert!(gate_signals_from_stdout(&flood).len() <= 4);
+    }
+
+    /// ★T-0147-2 §1-B N6b 핀(배선): stdout 토큰을 내는 command 잡 → `gate.state_unwritable`
+    /// 이벤트 발행. 데몬이 state 를 못 쓰는 게이트의 유일한 목격자가 된다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_job_stdout_token_publishes_gate_signal_event() {
+        let daemon = test_daemon();
+        let mut j = job(None, &[]);
+        j.id = "gate-signal-cmd".into();
+        j.action = "command".into();
+        // echo 는 sh/cmd 양쪽에서 동일하게 동작한다(플랫폼 무관 핀).
+        j.command = Some("echo gate_signal=state_unwritable".into());
+        fire(Arc::clone(&daemon), j).await;
+        let events = daemon.bus.replay_after(0);
+        let sig = events
+            .iter()
+            .find(|e| e["name"].as_str() == Some("gate.state_unwritable"))
+            .expect("stdout 토큰은 gate.* 이벤트로 승격돼야 한다");
+        assert_eq!(sig["payload"]["job_id"].as_str(), Some("gate-signal-cmd"));
+        assert_eq!(sig["payload"]["signal"].as_str(), Some("state_unwritable"));
+        // 무회귀: 기존 command_done·fired 는 그대로.
+        let has = |n: &str| events.iter().any(|e| e["name"].as_str() == Some(n));
+        assert!(has("schedule.command_done") && has("schedule.fired"));
+        // CC 배지 축에도 흡수됐는지(state 외부 oracle 의 사람이 보는 표면).
+        let badges = crate::alerts::gate_signal_badges(now_epoch());
+        assert!(
+            badges.iter().any(|b| b.key == "signal/gate.state_unwritable"
+                && b.severity == "critical"),
+            "게이트 신호는 critical 배지로 노출돼야 한다"
+        );
+    }
+
+    /// 대칭 핀: 토큰 없는 평범한 command 잡은 gate.* 를 만들지 않는다(오염 0).
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_job_without_token_publishes_no_gate_signal() {
+        let daemon = test_daemon();
+        let mut j = job(None, &[]);
+        j.id = "plain-cmd".into();
+        j.action = "command".into();
+        j.command = Some("echo hello".into());
+        fire(Arc::clone(&daemon), j).await;
+        let events = daemon.bus.replay_after(0);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["name"].as_str().is_some_and(|n| n.starts_with("gate."))),
+            "토큰 없는 stdout 이 gate.* 를 만들면 이벤트 공간이 오염된다"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
