@@ -162,6 +162,21 @@ def _kill(pid, force=False):
     return run(args, timeout=5)
 
 
+# ★G24(H-WIN-10): 1차 '그레이스풀' 단계가 이 플랫폼에서 **실제로 효과가 있나**.
+#   Windows 의 `taskkill /PID <pid> /T`(무 `/F`)는 WM_CLOSE 를 보내는 것이고, 콘솔 프로세스
+#   (claude·codex·agy 같은 CLI TUI)는 메시지 루프가 없어 **종료되지 않는다** — "This process
+#   can only be terminated forcefully" 를 내며 구조적 no-op 이다. 그럼에도 회수 경로는 1차를
+#   보내고 1.5s 를 기다리고 나서 강제 단계로 갔다 — 매 회수마다 무의미한 지연 + '그레이스풀을
+#   시도했다'는 **거짓 기록**이 남았다.
+#   처방(W2 handoff '인터프리터·후보 확대 금지 — loud no-op 이 정답'과 동형): 대체 시그널
+#   (CTRL_BREAK 등)을 새로 **발명하지 않는다**. 무효를 **명시 로그**하고 강제 단계로 직행한다.
+GRACEFUL_KILL_SUPPORTED = os.name != "nt"
+GRACEFUL_KILL_NOOP_REASON = (
+    "Windows: 1차 그레이스풀 단계 무효(taskkill /T 무 /F 는 WM_CLOSE — 콘솔 프로세스 미종료) "
+    "→ 생략하고 강제 단계로 직행"
+)
+
+
 def cys_status():
     rc, out, _ = run(["cys", "status", "--json"], timeout=12)
     if rc != 0:
@@ -629,9 +644,16 @@ def reclaim(role, emit):
             "hold-pid": "%s kill 직전 pid 재확인 불일치 — 회수 보류(엉뚱한 pid 종료 방지)" % ref,
         }[verdict])
         return 1
-    rc, _, _ = _kill(pid)
-    time.sleep(1.5)
-    if role_surface_row(role) is not None and _pid_for_surface_ref(ref) == pid:
+    # ★G24: 1차 그레이스풀은 **효과가 있는 플랫폼에서만** 시도한다. 무효 플랫폼에서는 시도했다고
+    #   기록하지 않고(보고=실측), 사유를 남긴 뒤 강제 단계로 직행한다(무의미한 1.5s 지연 제거).
+    if GRACEFUL_KILL_SUPPORTED:
+        _kill(pid)
+        time.sleep(1.5)
+        need_force = role_surface_row(role) is not None and _pid_for_surface_ref(ref) == pid
+    else:
+        emit("reclaim", GRACEFUL_KILL_NOOP_REASON)
+        need_force = True
+    if need_force:
         _kill(pid, force=True)
         time.sleep(1.5)
     if role_surface_row(role) is None:
@@ -819,6 +841,17 @@ def self_test():
     chk(post_inject_ack(lt, "cso", elapsed=5, t_inject=1100.0) is False, "주입전 래치를 ack 오인정")
     chk(post_inject_ack(lt, "cso", elapsed=5) is False, "t_inject 미전달인데 래치로 ack 오인정")
 
+    # ─────────── W4 · G24: 1차 그레이스풀 단계 유효성(H-WIN-10) ───────────
+    # 플랫폼 술어가 kill 인자 형상과 **일치**하는지 — Windows 에서 무 /F 는 콘솔 프로세스에
+    # 무동작이므로 '지원 안 함'으로 선언돼야 하고(그러면 회수는 강제 단계로 직행한다),
+    # unix 에서는 SIGTERM 이 실효라 '지원'으로 선언돼야 한다(구 동작 보존).
+    chk(GRACEFUL_KILL_SUPPORTED == (os.name != "nt"), "그레이스풀 지원 술어가 플랫폼과 불일치")
+    chk(bool(GRACEFUL_KILL_NOOP_REASON) and "강제" in GRACEFUL_KILL_NOOP_REASON,
+        "무효 사유 문구가 강제 단계 직행을 명시하지 않는다(조용한 생략 금지)")
+    _src_bn = open(os.path.abspath(__file__), encoding="utf-8").read()
+    chk("if GRACEFUL_KILL_SUPPORTED:" in _src_bn,
+        "회수 경로가 그레이스풀 지원 술어로 분기하지 않는다(G24 미수리)")
+
     if fails:
         print("self-test FAIL:")
         for f in fails:
@@ -826,7 +859,7 @@ def self_test():
         return 1
     print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·확장자정규화·회수판정4분기·"
           "claim-role·엄격ack·F4·무구독폴백슬롯 + W2: 래치 단방향·liveness 3등급+판정불가·"
-          "Unknown 이원·role_family·배달 3분기)" % (7 + 10 + 6 + 4 + 4 + 4 + 4 + 41))
+          "Unknown 이원·role_family·배달 3분기 + W4: G24 그레이스풀 유효성 3)" % (7 + 10 + 6 + 4 + 4 + 4 + 4 + 41 + 3))
     return 0
 
 

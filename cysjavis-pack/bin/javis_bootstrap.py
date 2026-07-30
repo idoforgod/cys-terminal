@@ -192,6 +192,13 @@ EXIT_SESSION_CONTEXT = 10    # claim 왕복이 '정당거부가 아닌' 사유�
 EXIT_SKIPPED_INFLIGHT = 11   # 싱글플라이트 패자 — 실패 아님(A7)
 EXIT_USAGE = 64              # EX_USAGE(sysexits.h) — 미지 서브커맨드·사용오류(A14)
 
+# ★(W4) `cys boot` 의 **busy 전용 종료코드**(EX_TEMPFAIL) — Rust 정본 `cys.rs::EXIT_BOOT_BUSY`.
+#   구계약에서 busy 는 0(성공)이었고, 그래서 ④가 **무스폰인데 CEO 티켓을 소각**했다(G11).
+#   신계약: 0=Fatal 없음 / 1=Fatal / 75=busy(무스폰 skip). 이 값은 소비 분기의 근거이고,
+#   `H-EXIT-2` 가 Rust 상수와 기계 대조한다. 구 바이너리는 75 를 내지 않으므로(0/1/2만)
+#   이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
+CYS_BOOT_EXIT_BUSY = 75
+
 # claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — session-start.sh:101 과 동일 어휘).
 # 이 마커가 없는 rc≠0 은 거부가 아니라 세션 컨텍스트 오류다(A20: 판정·escalation 층위 뭉개기 해소).
 _CLAIM_DENIED_MARKERS = ("claim_denied", "privileged role held")
@@ -230,6 +237,38 @@ def _read_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _tcc_probe_targets():
+    """macOS TCC(파일·폴더 권한) 탐침 대상 — **이미 진입한 실자원**에서 파생한다.
+
+    ★P3-A-TCC(재감사 · RC3 "계측기가 대상을 못 잰다"): 구 탐침은 `~/Desktop` **하드코딩**이었다.
+      부트가 실제로 읽고 쓰는 자원은 (a) 이 세션의 작업 디렉터리(pane cwd — claude 가 파일을
+      읽는 곳) 와 (b) 팩 디렉터리(디렉티브·상태·헬퍼) 인데, 탐침은 그 둘 중 아무것도 찌르지
+      않았다. 그래서 ①Desktop 을 안 쓰는 기계에선 **거짓 경고**가 되고 ②Documents·프로젝트
+      폴더만 막힌 실제 사고에서는 **침묵**했다(GUI perm-warning 은 Desktop+Documents 를 보므로
+      부트 탐침이 GUI 보다도 좁았다). 탐침 대상을 실자원 파생으로 바꾼다 — 계측기는 자기가
+      실제로 쓰는 자원을 재야 한다.
+    ★HOME 은 탐침하지 않는다: 홈 루트는 TCC 대상이 아니고(하위 특수 폴더가 대상), 여기서
+      필요한 사실은 '내가 지금 쓰는 폴더를 읽을 수 있나' 뿐이다.
+    반환: [(경로, 라벨)] — darwin 아니면 빈 목록(무동작). 중복·부재 경로는 제거한다.
+    """
+    if sys.platform != "darwin":
+        return []
+    try:
+        cwd = os.getcwd()
+    except OSError:                      # cwd 가 삭제된 세션 — 탐침 대상에서 제외(크래시 금지)
+        cwd = None
+    out, seen = [], set()
+    for path, label in ((cwd, "작업 디렉터리"), (PACK, "팩")):
+        if not path:
+            continue
+        real = os.path.realpath(path)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        out.append((real, label))
+    return out
 
 
 def _progress(msg):
@@ -426,6 +465,7 @@ _STEP_DEFS = (
     # ★W2: 팩↔바이너리 스큐 폴백은 ④boot **판정 기록 이전**에 남는다(선언 순서=실행 순서 계약).
     ("BOOT_SKEW", "④boot-skew"),
     ("BOOT", "④boot"),
+    ("BOOT_BUSY", "④boot-busy"),
     ("BOOT_DEGRADE", "④boot-degrade"),
     ("BOOT_TICKET_CONSUME", "④boot-ticket-consume"),
     ("BOOT_REVIEWERS", "④b-boot-reviewers"),
@@ -1069,9 +1109,14 @@ def _boot_fatal_verdict(code, out):
       busy(다른 boot 진행 중)·already_alive·launched 는 실패가 아니다(G11 — busy 를 성공으로
       오인하지도, 실패로 오인하지도 않는다).
     ★--json 소비 불가(구 바이너리·파싱 실패)면 **종전 계약으로 보수 폴백**: 비0 = Fatal.
-      새 계약을 못 읽는 상태에서 Degrade 로 접으면 진짜 실패를 은닉한다(fail-open 금지)."""
+      새 계약을 못 읽는 상태에서 Degrade 로 접으면 진짜 실패를 은닉한다(fail-open 금지).
+    ★(W4) 단 **exit 75(busy)** 는 그 보수 폴백에서 제외한다 — busy 는 실패가 아니라 '무스폰'이고,
+      75 는 신 계약 전용 값이라(구 바이너리는 0/1/2만) 오해석 위험이 없다. 이걸 Fatal 로 접으면
+      훅↔GUI 중첩 부트마다 exit 4 위경보가 난다(P3-B16 부류의 반복성 오경보)."""
     v = _parse_boot_json(out)
     if v is None or not isinstance(v.get("roles"), list):
+        if code == CYS_BOOT_EXIT_BUSY:
+            return None
         return (None if code == 0
                 else "cys boot 실패(exit %s) — --json 계약 소비 불가로 종전 계약(비0=Fatal) 적용:\n%s"
                      % (code, out))
@@ -1079,6 +1124,25 @@ def _boot_fatal_verdict(code, out):
            if r.get("mandatory") and r.get("outcome") in ("failed", "missing")]
     if not bad:
         return None
+    return _fatal_detail(bad, out)
+
+
+def _boot_was_busy(code, out):
+    """④ `cys boot` 가 **무스폰 skip**(다른 boot 가 락 보유)이었나 — 티켓 소각 차단의 근거(G11).
+
+    판정은 두 축의 **OR** 이다: ⓐ exit == 75(신 계약 전용 값) ⓑ --json summary.lock == "busy".
+    둘 중 하나만 봐도 되게 만들지 않는 이유: exit 만 보면 --json 파싱이 성공했는데 종료코드가
+    스큐된 조합(팩 신 / 바이너리 구)을 못 걸고, JSON 만 보면 파싱 실패 시 busy 를 놓친다.
+    ★'busy' 는 실패가 아니다 — 다른 런이 팀을 세우는 중이고, 최종 게이트는 ⑤check 다."""
+    if code == CYS_BOOT_EXIT_BUSY:
+        return True
+    v = _parse_boot_json(out) or {}
+    summary = v.get("summary") if isinstance(v.get("summary"), dict) else {}
+    return summary.get("lock") == "busy"
+
+
+def _fatal_detail(bad, out):
+    """Fatal 사유 1줄 조립 — install_hint 는 **그대로** 인용한다(플랫폼 분기는 생산자 몫·B15)."""
     detail = ", ".join("%s=%s%s" % (r.get("role"), r.get("outcome"),
                                     (" [" + r["install_hint"] + "]") if r.get("install_hint") else "")
                        for r in bad)
@@ -1225,12 +1289,14 @@ def _cmd_run_chain(log):
 
     # ★TCC 보조 경고(오너 2026-07-15): macOS 폴더 권한 리셋(서명 변경 업그레이드) 시 pane 자식이
     # EPERM으로 죽는 실사고 — 부트가 살아있는 세션에서라도 조기 경고(주 안내는 GUI perm-warning).
-    if sys.platform == "darwin":
+    for _probe, _label in _tcc_probe_targets():
         try:
-            os.listdir(os.path.join(HOME, "Desktop"))
+            os.listdir(_probe)
         except PermissionError:
-            _progress("⚠ macOS 데스크탑 폴더 접근 거부 — 시스템 설정→개인정보 보호 및 보안→"
-                      "파일 및 폴더에서 cys 허용 후 앱 재시작(미허용 시 pane의 claude가 EPERM으로 꺼짐)")
+            _progress("⚠ macOS 폴더 접근 거부(%s: %s) — 시스템 설정→개인정보 보호 및 보안→"
+                      "파일 및 폴더에서 cys 허용 후 앱 재시작(미허용 시 pane의 claude가 EPERM으로 꺼짐)"
+                      % (_label, _probe))
+            break
         except OSError:
             pass
 
@@ -1376,14 +1442,24 @@ def _cmd_run_chain(log):
         if fatal_why is not None:
             # 티켓은 아직 미소비 — boot 실패(exit 4)면 보존돼 재시도 가능(R2-LOW-C)
             return log.fail(STEP.BOOT, code, fatal_why, EXIT_BOOT)
-        if code != 0:
+        # ★(W4 · G11) busy = **무스폰**. 성공(0)도 실패도 아니므로 ⓐ티켓을 태우지 않고
+        #   ⓑDegrade 경고도 내지 않는다(정상적인 훅↔GUI 중첩 부트에서 매번 뜨는 위경보 차단).
+        #   팀은 락을 쥔 그 런이 세우고, 이 런의 최종 게이트는 ⑤check 다(재시도 창 내장).
+        boot_busy = _boot_was_busy(code, out)
+        if boot_busy:
+            log.step(STEP.BOOT_BUSY, code,
+                     "다른 boot 가 락 보유 — 이 런은 무스폰 skip(exit %s). 티켓 미소비·Degrade 아님. "
+                     "팀 기동 확인은 ⑤check 가 담당한다." % code)
+            _progress("④ 다른 boot 진행 중(무스폰 skip) — 티켓 보존·⑤ 생존 확인으로 진행")
+        elif code != 0:
             log.step(STEP.BOOT_DEGRADE, code,
                      "비0 이지만 Fatal 역할은 전원 확보 — 경고 강등 후 ④-b·⑤ 계속(B1 정책 열)")
             _progress("⚠ ④ 일부 선택/리뷰어 노드 미기동(Degrade) — 팀 기동 계속")
 
         # 부서 레인 CEO 티켓 소비 — ④ boot **성공 직후**(실스폰 발생)에만 1회성 소비(R2-LOW-C):
         # "1회성 티켓 ⟺ 실스폰" 불변식. 착수 전 소각은 boot 실패 시 재시도 티켓까지 태웠다.
-        if ticket_path is not None:
+        # ★busy(무스폰)에서는 소비하지 않는다 — 티켓 1장은 스폰 1회에 대응한다(G11).
+        if ticket_path is not None and not boot_busy:
             log.step(STEP.BOOT_TICKET_CONSUME, 0, _consume_dept_ticket(ticket_path))
 
         # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
@@ -1666,12 +1742,26 @@ def cmd_self_test():
         assert _boot_fatal_verdict(1, _fatal) is not None, "Fatal 역할 실패가 exit 4 로 승격되지 않음"
         assert "claude 설치" in _boot_fatal_verdict(1, _fatal), "Fatal 사유에 install_hint 미동봉"
         _busy = json.dumps({"roles": [
-            {"role": "cso", "agent": "claude", "outcome": "busy", "mandatory": True}]})
+            {"role": "cso", "agent": "claude", "outcome": "busy", "mandatory": True}],
+            "summary": {"lock": "busy"}})
         assert _boot_fatal_verdict(0, _busy) is None, "busy 가 Fatal 실패로 오분류(G11)"
         # --json 미소비(구 바이너리) → 종전 계약으로 보수 폴백(비0=Fatal · fail-open 금지)
         assert _boot_fatal_verdict(1, "구 바이너리 산문 출력") is not None, \
             "--json 소비 불가에서 비0 이 Degrade 로 접힘(진짜 실패 은닉)"
         assert _boot_fatal_verdict(0, "구 바이너리 산문 출력") is None, "exit 0 이 Fatal 로 오판"
+        # ★(W4) bare exit 의미 전환 소비 — busy(75)·Fatal(1)·Degrade-only(0) 3분기
+        assert CYS_BOOT_EXIT_BUSY == 75, "busy exit 상수 변경(Rust EXIT_BOOT_BUSY 와 파리티 깨짐)"
+        assert _boot_was_busy(CYS_BOOT_EXIT_BUSY, _busy) is True, "exit 75 를 busy 로 못 읽음"
+        assert _boot_was_busy(0, _busy) is True, "summary.lock=busy 를 busy 로 못 읽음(스큐 축)"
+        assert _boot_was_busy(CYS_BOOT_EXIT_BUSY, "파싱 불가 산문") is True, \
+            "JSON 파싱 실패 + exit 75 를 busy 로 못 읽음"
+        assert _boot_was_busy(0, _degraded) is False, "Degrade-only 를 busy 로 오판(티켓 미소비 회귀)"
+        assert _boot_was_busy(1, _fatal) is False, "Fatal 을 busy 로 오판(실패 은닉)"
+        # busy 는 Fatal 이 아니다 — 파싱 실패 폴백에서도 exit 75 만은 예외로 통과한다
+        assert _boot_fatal_verdict(CYS_BOOT_EXIT_BUSY, "파싱 불가 산문") is None, \
+            "exit 75(busy)가 보수 폴백에서 Fatal 로 접힘(중첩 부트 위경보)"
+        assert _boot_fatal_verdict(2, "파싱 불가 산문") is not None, \
+            "busy 예외가 다른 비0 까지 열어줌(fail-open)"
         # ★결손 판정 ↔ check verdict 공유(H-PRED-1): 같은 status fixture 에서 판정이 갈리지 않는다.
         _healthy = {"surfaces": [
             {"role": "cso", "exited": False, "awakened_at": 1.0},
@@ -1829,10 +1919,26 @@ def cmd_self_test():
                        (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_SKIP),
                        (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_ABSENT)):
             assert _a != _b, "동명이의 잔존: %r" % (_a,)
+
+        # ── t10: TCC 탐침 대상이 실자원 파생인가(P3-A-TCC · H-PRED-10) ──
+        _t = _tcc_probe_targets()
+        if sys.platform == "darwin":
+            _paths = [p for p, _ in _t]
+            assert _paths, "darwin 에서 TCC 탐침 대상이 비었다(탐침 소멸)"
+            assert os.path.realpath(PACK) in _paths, "팩(실자원)이 탐침 대상에 없다"
+            assert all(os.path.isdir(p) for p in _paths), "부재 경로가 탐침 대상에 남았다"
+            # 하드코딩된 Desktop 이 아니다 — Desktop 이 cwd·PACK 일 때만 우연히 포함될 수 있다
+            _desk = os.path.realpath(os.path.join(HOME, "Desktop"))
+            assert _desk not in _paths or _desk in (os.path.realpath(os.getcwd()),
+                                                   os.path.realpath(PACK)), \
+                "Desktop 하드코딩 잔존(P3-A-TCC 미수리)"
+            assert all(isinstance(l, str) and l for _p, l in _t), "탐침 라벨 결손"
+        else:
+            assert _t == [], "비-darwin 에서 TCC 탐침이 동작한다(무동작 계약 위반)"
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
+    print("javis_bootstrap self-test OK (W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
           "레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
           "로스터 결손 신구 차분 9종 + W2(A13 타입드 게이트 exit·_run_split 채널분리·B1 PLAN 정책 "
           "소비 6종·공유 판정 결손 2종) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"

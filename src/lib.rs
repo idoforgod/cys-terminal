@@ -85,6 +85,30 @@ pub const PIPE_BUSY_ERROR: i32 = 231;
 pub const PIPE_BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 pub const PIPE_BUSY_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 타이핑 가드 거부의 **에러 코드·메시지 단일 소스**(T-0147-6).
+///
+/// 생산자 = `cysd` handlers(`surface.send_text`·`surface.send_key`), 소비자 = `cys` 클라이언트의
+/// 주입 경로. 클라이언트는 와이어에서 `error.message` 만 받으므로(rpc_over) 이 문구가 곧 판정
+/// 근거다 — **양쪽이 리터럴을 따로 들고 있으면** 문구를 다듬는 순간 소비자의 `--queued` 폴백이
+/// 조용히 죽는다(RC1 문자열 계약 드리프트). 그래서 상수로 못박고 양쪽이 이것만 쓴다.
+pub const ERR_TYPING_GUARD: &str = "typing_guard";
+pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or use --queued";
+
+/// `cys boot` 가 **무스폰 skip**(다른 boot 가 락 보유)을 낼 때의 종료코드 — EX_TEMPFAIL(75).
+///
+/// ★(T-0147-7 W4 · G11·하드 제약 6-⑧) bare exit 계약: **0 = Fatal 없음(Degrade-only 포함) ·
+/// 1 = Fatal 실패(mandatory 역할의 failed·missing) · 75 = busy(무스폰)**.
+/// 구계약에서 busy 는 0(성공)이었고, 그래서 소비부가 '팀을 세웠다'로 읽어 1회성 CEO 티켓을
+/// **무스폰 상태로 소각**했다(G11). 반대로 1(Fatal)로 접으면 정상적인 훅↔GUI 중첩 부트마다
+/// '팀 기동 실패' 위경보가 난다(P3-B16 부류) — 그래서 **별도 값**이다.
+/// 75 는 sysexits.h EX_TEMPFAIL 로, clap 사용오류(2)·EX_USAGE(64)·부트 게이트 exit 공간(3~11)과
+/// 겹치지 않는다.
+///
+/// **왜 lib 상수인가**: 생산자(`cys.rs::run_boot`)와 소비자(GUI `cys-app`)가 다른 크레이트이고,
+/// 파이썬 소비자(`javis_bootstrap.CYS_BOOT_EXIT_BUSY`)까지 셋이다. 값을 세 곳에 적으면 그것이
+/// RC1(다중 구현) 의 새 인스턴스다 — 검체 `H-EXIT-2` 가 3자 파리티를 기계 대조한다.
+pub const EXIT_BOOT_BUSY: i32 = 75;
+
 /// 동봉 runtime PATH 선두 주입(RC-5 · 공용 — cysd PTY 자식·GUI 직스폰이 공유, 중복 구현 금지).
 /// `exe_dir`(바이너리 폴더) + Windows 자기완결 설치의 `<install>\runtime\{python, git\cmd, git\usr\bin}`
 /// 중 **실재하는** 디렉토리를 `current_path` 앞에 (중복 제거) 얹은 새 PATH를 반환. 얹을 게 없으면

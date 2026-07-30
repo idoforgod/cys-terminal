@@ -5314,6 +5314,22 @@ async function start() {
     stickyToast("boot-warn", "health", "팀 기동 경고", msg);
   });
 
+  // ★T-0147-7 W4(B5·B16): 팀 부트 신호가 3등급으로 타입화됐다 — 경고(위) / 정보 / 경로 강등.
+  // 종전엔 정상 상황(다른 boot 진행 중·부서 티켓 부재)도 '기동 실패' 경고로 나갔고(P3-B16 위경보),
+  // 1차 경로 강등(python 부재 → cys boot 직접)은 **아무 신호도 없었다**(조용한 강등). 둘을 분리한다.
+  // 두 토스트 모두 sticky 기본 TTL(60s)로 자동 소멸하고 알람 이력에 남는다(T-0147-3 계약 준수).
+  await listen("boot-info", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "팀 기동 상태 안내입니다.";
+    stickyToast("boot-info", "health", "팀 기동 안내", msg);
+  });
+  await listen("boot-degraded", (e) => {
+    const msg =
+      typeof e.payload === "string"
+        ? e.payload
+        : "팀 부트 1차 경로를 쓸 수 없어 직접 호출로 강등했습니다.";
+    stickyToast("boot-degrade", "health", "팀 부트 경로 강등", msg);
+  });
+
   // ★T2 안전모드(translocation/비정규 경로): 앱이 임시/비정규 위치에서 실행돼 데몬·launchd·팩 등록을
   // 전부 skip 한 경우(백엔드 조기 반환) 침묵하지 않고 설치 복구 절차를 sticky 로 안내한다. 이 경로에선
   // daemon-ready 가 오지 않아 상단바가 대기 상태로 남으므로, sticky 안내가 유일한 사용자 신호다.

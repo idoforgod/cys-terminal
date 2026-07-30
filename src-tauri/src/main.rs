@@ -2135,54 +2135,303 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
-        spawn_orchestra_boot(app, None); // ★절대규칙: 마스터=4노드 팀 결정론 스폰(LLM 환각 무관)
+        // ★(W4 · B5) launch-agent 는 생성한 surface ref 를 stdout 으로 낸다 — 팀 부트 1차 경로
+        //   (javis_bootstrap.py)가 ③claim-role 을 **이 pane 에 귀속**시키려면 그 값이 필요하다.
+        //   없으면 GUI 는 surface 밖 프로세스라 claim 왕복이 exit 10(세션 컨텍스트 오류)로 죽는다.
+        let sref = launched_surface_ref(&out.stdout);
+        spawn_orchestra_boot(app, None, sref); // ★절대규칙: 마스터=팀 결정론 스폰(LLM 환각 무관)
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
+/// `cys launch-agent` stdout → 생성된 surface ref("surface:N"). 진단 산문은 stderr 로 가므로
+/// stdout 마지막 비어있지 않은 줄이 계약이다(cys.rs run_launch_agent_opts 의 `println!`).
+fn launched_surface_ref(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with("surface:"))
+        .map(|l| l.to_string())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 팀 부트 **단일 계약**(T-0147-7 W4 · B5·B15·B16 · H-DOC-8)
+//
+// ## 무엇이 틀렸었나
+// 팀 부트 진입점이 셋(훅 → javis_bootstrap.py 체인 / GUI 버튼 → `cys boot` 직접 / 산문 §0)이었고,
+// GUI 만 **체인을 건너뛰어** 자기만의 판정을 갖고 있었다:
+//   · 판정 재료가 stdout **산문 문자열**("신규 기동 0"·"미설치")이었다 — 문구가 바뀌면 조용히
+//     오작동하고(RC1 사본 드리프트), 정상 상황도 오경보로 읽혔다.
+//   · `건강한 팀 + grok 미설치`(사실상 모든 기계)에서 재부트 한 번에 '팀 기동 실패' 토스트가
+//     떴다(P3-B16 — 반복성 위경보). 반대로 `claude 만 설치 → 리뷰어 0` 은 **무경고**였다(R5).
+//   · 플랫폼별 설치 힌트가 GUI 사본에만 없어서(P3-B15) macOS 명령을 Windows 사용자에게 안내했다.
+//
+// ## 계약(경로 2 · 계약 1 — 비평2 D-4)
+//   1차: `javis_bootstrap.py run` — **훅과 같은 체인**이다(preflight→claim→④boot --json→⑤check).
+//        판정은 그 체인의 **타입드 exit 공간**(0/3/4/6/7/8/9/10/11/64)을 소비한다.
+//   폴백: python 해소 실패·스크립트 부재 시 `cys boot --json` **직접** 호출 — 이때도 판정은
+//        **typed role 표**(outcome·mandatory·install_hint)로 하고, 강등 자체를 `boot-degraded`
+//        이벤트로 **기록**한다(조용한 강등 금지). 두 경로가 같은 계약을 소비하므로 '진입점 통일'
+//        없이도 판정 이원화가 소멸한다.
+//
+// ## 경고 규율(B16)
+//   경고는 **mandatory(Fatal) 역할이 없을 때만** 낸다. 리뷰어·grok(Degrade)은 대체 폴백·
+//   익명 peer-review 로 보완되므로 경고 대상이 아니다. busy(exit 75/11)는 '다른 런이 세우는 중'
+//   이라 경고가 아니라 정보다. install_hint 는 **생산자 문구 그대로** 표출한다(사본 금지).
+//   ★T-0147-3 정합: 새 신호도 sticky 기본 TTL(60s)로 자동 소멸한다 — '절대 안 사라지는 종류'를
+//   만들지 않는다. 단 auto-dismiss 는 이 수리의 대체재가 아니다(오진 이력은 그대로 쌓이므로).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 팀 부트 결과의 사용자 신호 등급 — 조용한 실패·조용한 강등을 **타입으로** 불가능하게 만든다.
+#[derive(Debug, Clone, PartialEq)]
+enum BootSignal {
+    /// 신호 없음(정상 완주 · Degrade-only 포함).
+    Silent,
+    /// 정보: 실패가 아니지만 사용자가 알아야 하는 상태(busy skip·부서 단독 각성).
+    Info(String),
+    /// 경고: 팀의 최소 실행 단위가 없다(Fatal) 또는 체인이 깨졌다.
+    Warn(String),
+}
+
+/// GUI 가 팀 부트 1차 경로에 쓸 python 인터프리터 후보(우선순위).
+/// ★후보를 2개로 둔 이유: 동봉 runtime 은 `python3` 를 제공하지만 순정 Windows CPython 은
+/// `python` 만 있는 경우가 있다. 이 경로는 **비파괴**(부트 체인)이고 boot 락·싱글플라이트가
+/// 중복을 막으므로 후보 확대가 안전하다 — 파괴 경로(reclaim)에서 후보를 넓히지 않는 보수
+/// 판정(cys.rs escalate_reclaim)과는 위험 방향이 반대다.
+const BOOT_PY_CANDIDATES: [&str; 2] = ["python3", "python"];
+
+/// stdout 에서 **마지막 JSON 오브젝트**를 뽑는다 — 진행 산문과 기계 계약의 공존 규약
+/// (python `javis_bootstrap._parse_boot_json` 과 동일 규칙: 마지막 `\n{`…부터 끝까지).
+fn parse_last_json_object(s: &str) -> Option<Value> {
+    let t = s.trim();
+    let cand = match t.rfind("\n{") {
+        Some(i) => &t[i + 1..],
+        None if t.starts_with('{') => t,
+        None => return None,
+    };
+    serde_json::from_str::<Value>(cand).ok().filter(|v| v.is_object())
+}
+
+/// `cys boot --json` role 표 → **Fatal 경고 문구**(없으면 None).
+/// 규칙: `mandatory == true` 이고 `outcome ∈ {failed, missing}` 인 역할만 경고 대상이고,
+/// `install_hint` 는 **그대로** 인용한다(플랫폼 분기는 생산자 = cys.rs `install_hint()` 소유).
+fn boot_json_fatal_message(stdout: &str) -> Option<String> {
+    let v = parse_last_json_object(stdout)?;
+    let roles = v.get("roles")?.as_array()?;
+    let bad: Vec<String> = roles
+        .iter()
+        .filter(|r| {
+            r.get("mandatory").and_then(Value::as_bool).unwrap_or(false)
+                && matches!(
+                    r.get("outcome").and_then(Value::as_str),
+                    Some("failed") | Some("missing")
+                )
+        })
+        .map(|r| {
+            let role = r.get("role").and_then(Value::as_str).unwrap_or("?");
+            let outcome = r.get("outcome").and_then(Value::as_str).unwrap_or("?");
+            match r.get("install_hint").and_then(Value::as_str) {
+                Some(h) => format!("{role}={outcome} → {h}"),
+                None => format!("{role}={outcome}"),
+            }
+        })
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "마스터는 시작됐으나 **의무 노드**가 빠졌습니다: {}. 팀 없이도 마스터 단독 사용은 가능합니다.",
+        bad.join(" · ")
+    ))
+}
+
+/// 폴백 경로(`cys boot --json` 직접)의 판정 — bare exit 신계약(0/1/75)과 typed role 표를 함께 읽는다.
+fn cys_boot_signal(code: Option<i32>, stdout: &str) -> BootSignal {
+    // busy(75) = 무스폰 skip. 다른 boot(훅 경로 등)가 팀을 세우는 중이므로 경고가 아니다.
+    if code == Some(cys::EXIT_BOOT_BUSY) {
+        return BootSignal::Info(
+            "다른 팀 기동이 이미 진행 중이어서 이번 요청은 건너뜁니다(중복 스폰 방지) — 곧 팀이 올라옵니다."
+                .into(),
+        );
+    }
+    if let Some(msg) = boot_json_fatal_message(stdout) {
+        return BootSignal::Warn(msg);
+    }
+    match code {
+        Some(0) => BootSignal::Silent,
+        // exit 1 = Fatal 이지만 role 표를 못 읽은 경우(스큐·파싱 실패) — fail-closed 로 경고한다.
+        Some(c) => BootSignal::Warn(format!(
+            "팀 기동이 실패했습니다(cys boot exit {c}) — `cys list` 로 노드 상태를 확인하세요."
+        )),
+        None => BootSignal::Warn("팀 기동 프로세스가 비정상 종료했습니다(시그널) — `cys list` 확인.".into()),
+    }
+}
+
+/// 1차 경로(`javis_bootstrap.py run`)의 판정 — 체인의 **타입드 exit 공간**을 그대로 소비한다.
+/// 근거 문서: `javis_bootstrap.py` 헤더 exit 표(0/3/4/5/6/7/8/9/10/11/64).
+/// stderr 는 실패 상세(`[bootstrap] 단계 실패: <단계> (exit N)\n<detail>`)를 담으며, detail 에는
+/// 생산자가 만든 install_hint 가 **그대로** 들어 있다(B15) — GUI 는 그 꼬리를 인용만 한다.
+fn bootstrap_chain_signal(code: Option<i32>, stdout: &str, stderr: &str) -> BootSignal {
+    let detail = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    match code {
+        Some(0) => {
+            // 완주(completed) 또는 부서 단독 각성(solo_awakening — CEO 티켓 부재). 둘 다 성공
+            // 경로이므로 stdout 최종 JSON 을 읽어 구분한다(산문 매칭 금지).
+            let solo = parse_last_json_object(stdout)
+                .and_then(|v| v.get("solo_awakening").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if solo {
+                BootSignal::Info(
+                    "부서장이 단독 각성했습니다 — 부서 팀 기동에는 CEO 티켓이 필요합니다\
+                     (본부 master 에서 `javis_bootstrap.py issue-ticket --dept <부서>` 발급 후 재시도)."
+                        .into(),
+                )
+            } else {
+                BootSignal::Silent
+            }
+        }
+        // 11 = 싱글플라이트 패자(정상 skip · 실패 아님) — 훅이 먼저 발화한 정상 상황이다.
+        Some(11) => BootSignal::Info(
+            "팀 기동이 이미 진행 중이어서 이번 요청은 건너뜁니다(중복 방지) — 곧 팀이 올라옵니다.".into(),
+        ),
+        // 7 = claim 정당거부: 살아있는 master 가 이미 있다(이 pane 은 master 가 아니다).
+        Some(7) => BootSignal::Warn(
+            "이미 다른 master 노드가 있어 이 탭은 master 로 등록되지 않았습니다 — 기존 master 탭을 사용하세요(조직당 master 1명)."
+                .into(),
+        ),
+        Some(c) => BootSignal::Warn(format!(
+            "팀 기동 체인이 {} 단계에서 멈췄습니다(javis_bootstrap exit {c}).\n{detail}",
+            match c {
+                3 => "데몬 확인(②ping)",
+                4 => "팀 기동(④cys boot)",
+                6 => "노드 생존 확인(⑤check)",
+                8 => "레인↔팩 정합(⓪lane-pack)",
+                9 => "자원 게이트(④′resource-gate)",
+                10 => "세션 컨텍스트(③claim-role)",
+                64 => "명령 사용오류(EX_USAGE — 배선 점검)",
+                _ => "알 수 없는",
+            }
+        )),
+        None => BootSignal::Warn(format!(
+            "팀 기동 체인이 비정상 종료했습니다(시그널).\n{detail}"
+        )),
+    }
+}
+
 /// ★절대규칙(오너 2026-07-15): 모든 마스터(본부·부서장)는 CSO·워커·리뷰어2 팀을 반드시 갖는다.
 /// 종전에는 이 팀 스폰이 마스터 LLM의 `cys boot`(디렉티브 §0 ④) 실행에 의존했는데, dept-master가
 /// "부서장 스코프=단독 대기"를 **환각**해 boot를 건너뛰는 치명 실사고가 발생했다(2026-07-15). 산문
-/// 의존을 제거하고 버튼 경로에서 `cys boot`를 코드 결정론으로 강제한다 — cys boot는 이미 가동 중인
-/// 역할을 건너뛰고(멱등·boot 락으로 동시 boot 직렬화) 마스터가 나중에 스스로 boot해도 중복 없음.
-/// ★관측성(적대검증 D-8): 종전 `let _ = status()`는 실패를 삼켜 claude 미설치 등으로 팀이 0개여도
-/// 사용자가 몰랐다(원 증상 재현·더 나쁨). exit≠0이거나 신규 기동 0이면 boot-warning 이벤트로 승격.
-/// fire-and-forget(최대 300s라 UI 무블록). socket=Some이면 그 부서 소켓 대상, None이면 본부.
-fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
+/// 의존을 제거하고 버튼 경로에서 팀 기동을 코드 결정론으로 강제한다 — 체인은 이미 가동 중인 역할을
+/// 건너뛰고(멱등·boot 락·싱글플라이트로 직렬화) 마스터가 나중에 스스로 선언해도 중복이 없다.
+/// ★(W4 · B5) 1차 경로가 `cys boot` 직접 호출에서 **`javis_bootstrap.py run` 체인**으로 바뀌었다 —
+/// 위 [팀 부트 단일 계약] 주석 참조. fire-and-forget(체인 최악 예산이 길어 UI 무블록).
+/// socket=Some 이면 그 부서 소켓 대상(+레인 팩 동반 주입 — G34), None 이면 본부.
+/// surface_ref=Some 이면 체인의 ③claim-role 이 그 pane 에 귀속된다(없으면 exit 10 을 맞는다).
+fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>, surface_ref: Option<String>) {
     let cys = resolve_sidecar("cys");
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&cys);
-        inject_runtime_path(&mut cmd);
-        match &socket {
-            Some(s) => {
-                cmd.env("CYS_SOCKET", s);
-            }
-            None => {
-                cmd.env_remove("CYS_SOCKET");
-            }
-        }
-        cmd.arg("boot");
-        no_console(&mut cmd);
-        match cmd.output() {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                // "boot 완료: 신규 기동 0" + "미설치" 힌트 = 팀이 안 떴다(claude 미설치 등) → 경고.
-                let launched_zero = stdout.contains("신규 기동 0");
-                let has_missing = stdout.contains("미설치");
-                if !o.status.success() || (launched_zero && has_missing) {
-                    let _ = app.emit(
-                        "boot-warning",
-                        "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다.",
-                    );
+        // 레인 팩 유도(G34) — 부서 소켓이면 그 부서 팩이어야 한다. 본부는 기본 팩.
+        let lane_pack: Option<std::path::PathBuf> = socket
+            .as_deref()
+            .and_then(|s| cys::pack::lane_pack_for_socket(std::path::Path::new(s)));
+        let pack = lane_pack.clone().unwrap_or_else(cys::pack::pack_dir);
+        let script = pack.join("bin").join("javis_bootstrap.py");
+
+        // 공통 env 배선(두 경로가 **같은 레인**을 보게 한다).
+        let apply_env = |cmd: &mut std::process::Command| {
+            inject_runtime_path(cmd);
+            match &socket {
+                Some(s) => {
+                    cmd.env("CYS_SOCKET", s);
+                    if let Some(p) = &lane_pack {
+                        cmd.env("CYS_PACK_DIR", p);
+                    }
+                }
+                None => {
+                    cmd.env_remove("CYS_SOCKET");
                 }
             }
-            Err(e) => {
-                let _ = app.emit("boot-warning", format!("팀 기동(cys boot) 실행 실패: {e}"));
+            if let Some(sref) = &surface_ref {
+                cmd.env("CYS_SURFACE_ID", sref);
             }
+            no_console(cmd);
+        };
+
+        // ── 1차: javis_bootstrap.py run(훅과 동일 체인) ──
+        let why = if script.is_file() {
+            let mut last_err = String::new();
+            for py in BOOT_PY_CANDIDATES {
+                let mut cmd = std::process::Command::new(py);
+                apply_env(&mut cmd);
+                cmd.arg(&script).arg("run");
+                match cmd.output() {
+                    Ok(o) => {
+                        let signal = bootstrap_chain_signal(
+                            o.status.code(),
+                            &String::from_utf8_lossy(&o.stdout),
+                            &String::from_utf8_lossy(&o.stderr),
+                        );
+                        emit_boot_signal(&app, signal);
+                        return;
+                    }
+                    Err(e) => last_err = format!("{py}: {e}"),
+                }
+            }
+            format!("python 인터프리터 해소 실패({last_err})")
+        } else {
+            format!("부트 체인 스크립트 부재({})", script.display())
+        };
+
+        // ── 폴백: cys boot --json 직접(경로 2·계약 1) + **typed 강등 신호**(조용한 강등 금지) ──
+        let _ = app.emit(
+            "boot-degraded",
+            format!(
+                "팀 부트 1차 경로(javis_bootstrap.py 체인)를 쓸 수 없어 `cys boot --json` 직접 호출로 \
+                 강등했습니다 — 사유: {why}. 팀은 기동되지만 preflight·역할 등록·생존 확인 단계는 \
+                 생략됩니다(팩·python 배선을 점검하세요)."
+            ),
+        );
+        let mut cmd = std::process::Command::new(&cys);
+        apply_env(&mut cmd);
+        cmd.arg("boot").arg("--json");
+        match cmd.output() {
+            Ok(o) => emit_boot_signal(
+                &app,
+                cys_boot_signal(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
+            ),
+            Err(e) => emit_boot_signal(
+                &app,
+                BootSignal::Warn(format!("팀 기동(cys boot) 실행 실패: {e}")),
+            ),
         }
     });
+}
+
+/// 판정 → 이벤트. Silent 는 아무것도 내지 않는다(위경보 0). Info/Warn 은 각자 채널로 —
+/// UI 는 둘 다 sticky 토스트로 받고 T-0147-3 의 TTL(60s)로 자동 소멸한다.
+fn emit_boot_signal(app: &AppHandle, signal: BootSignal) {
+    match signal {
+        BootSignal::Silent => {}
+        BootSignal::Info(m) => {
+            let _ = app.emit("boot-info", m);
+        }
+        BootSignal::Warn(m) => {
+            let _ = app.emit("boot-warning", m);
+        }
+    }
 }
 
 /// ★R8(WP-2·적대검증 W2): CEO 승격 대기(PENDING) 여부 — cys-dept가 기록한 상태 파일 존재 검사.
@@ -2258,14 +2507,32 @@ async fn approve_ceo_promotion() -> Result<String, String> {
 /// start_master(base=CEO 자리)와 대칭·동일 메커니즘(launch-agent). CYS_SOCKET=부서 소켓으로
 /// 그 부서 데몬이 pane을 spawn하므로 부서 팩 디렉티브(MASTER_DIRECTIVE)가 자동 주입되고,
 /// claim도 그 부서 레지스트리 대상(데몬당 살아있는 마스터 1명 규칙은 부서별 독립 적용).
+/// ★(W4 · G34 의 GUI 지점) **CYS_SOCKET 단독 주입 금지** — 부서 소켓만 주면 데몬·자식이 **본부 팩**을
+/// 물려받아 ①그 부서 마스터 선언이 레인↔팩 가드에 `exit 8` 로 **영구 차단**되고 ②본부 팩을 교차
+/// 서빙해 계정 격리가 붕괴하고 schedule 이 중복 발화한다(재현: 부서 데몬 사망 후 ▶부서장 클릭).
+/// 그래서 (소켓, 팩) **쌍**을 함께 주입한다. 유도는 `cys::pack::lane_pack_for_socket` **단일 소스**를
+/// 쓴다(CLI autostart 가 쓰는 그 함수 — 중복 구현 금지). 유도 불가·팩 미실재는 **Err**(토스트)로
+/// 거부한다: 새 부서 팩을 자동 창설하지 않는다(부서 실체 없이 데몬만 뜨는 유령 레인 방지).
 #[tauri::command]
 async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String> {
     let cys = resolve_sidecar("cys");
-    let socket_boot = socket.clone(); // 아래 orchestra boot용(첫 클로저가 socket을 move)
+    let lane_pack = cys::pack::lane_pack_for_socket(std::path::Path::new(&socket)).ok_or_else(|| {
+        format!("부서 팩 경로를 유도할 수 없습니다(비표준 소켓: {socket}) — 부서를 정규 이름으로 재생성하세요.")
+    })?;
+    if !lane_pack.is_dir() {
+        return Err(format!(
+            "부서 팩이 없습니다({}) — 이 부서는 실체가 없습니다. 부서를 다시 생성한 뒤 부서장을 기동하세요\
+             (본부 팩으로 부서 데몬을 띄우면 부서 부트가 영구 차단됩니다).",
+            lane_pack.display()
+        ));
+    }
+    let socket_boot = socket.clone(); // 아래 팀 부트용(첫 클로저가 socket을 move)
+    let pack_env = lane_pack.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
         cmd.env("CYS_SOCKET", &socket);
+        cmd.env("CYS_PACK_DIR", &pack_env); // ★G34: 소켓과 팩은 항상 쌍으로 간다
         cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
         no_console(&mut cmd);
         cmd.output()
@@ -2274,7 +2541,11 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
-        spawn_orchestra_boot(app, Some(socket_boot)); // ★절대규칙: 부서장도 4노드 팀 결정론 스폰(환각 무관)
+        // ★절대규칙: 부서장도 팀 결정론 스폰(환각 무관). 부서 레인은 ④-c CEO 티켓 게이트를 타므로
+        //   티켓이 없으면 체인이 '단독 각성'(exit 0·solo_awakening)으로 강등되고, GUI 는 그 사실을
+        //   boot-info 로 **명시**한다(조용한 무동작 금지 — 종전 GUI 는 티켓 게이트를 우회했다).
+        let sref = launched_surface_ref(&out.stdout);
+        spawn_orchestra_boot(app, Some(socket_boot), sref);
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
@@ -3681,5 +3952,126 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             "GUI purge 가 --purge-workdir 를 다시 요청함 — 홈 파괴 경로 재개방(실사고 2026-07-16 재발)"
         );
         assert!(seg.contains("--purge-state"), "purge 명령 골격 변형 — 트립와이어 재검토 필요");
+    }
+
+    // ══════════════ 팀 부트 단일 계약(W4 · B5·B15·B16 · G34 GUI) ══════════════
+
+    /// B16: 경고는 **의무(Fatal) 역할이 빠졌을 때만** 난다. 리뷰어·grok(Degrade)은 대체 폴백으로
+    /// 보완되므로 경고 대상이 아니다 — 이 규율이 깨지면 "건강한 팀 + grok 미설치"(사실상 전 기계)
+    /// 에서 재부트마다 '팀 기동 실패' 위경보가 뜬다(P3-B16 실증).
+    #[test]
+    fn boot_warning_only_for_mandatory_failures() {
+        let degrade_only = r#"cys boot — 편성 점검
+· grok: CLI 'grok' 미설치 — 건너뜀
+{"roles":[{"role":"cso","outcome":"launched","mandatory":true},
+          {"role":"worker","outcome":"already_alive","mandatory":true},
+          {"role":"reviewer-grok","outcome":"missing","mandatory":false,"install_hint":"npm i -g grok"},
+          {"role":"reviewer-gemini","outcome":"failed","mandatory":false}],
+ "summary":{"launched":1,"failed":1,"missing":1,"fatal_failed":0,"lock":"acquired"}}"#;
+        assert_eq!(boot_json_fatal_message(degrade_only), None, "Degrade 실패가 경고를 만들었다");
+        assert_eq!(cys_boot_signal(Some(0), degrade_only), BootSignal::Silent);
+
+        let fatal = r#"{"roles":[{"role":"cso","outcome":"missing","mandatory":true,
+                                  "install_hint":"winget install Anthropic.Claude"}],
+                        "summary":{"fatal_failed":1}}"#;
+        let msg = boot_json_fatal_message(fatal).expect("Fatal 인데 경고가 없다");
+        // B15: install_hint 는 **생산자 문구 그대로** — GUI 가 플랫폼 사본을 만들지 않는다
+        assert!(msg.contains("winget install Anthropic.Claude"), "install_hint 미표출: {msg}");
+        assert!(msg.contains("cso=missing"), "역할·판정 미표출: {msg}");
+        assert!(matches!(cys_boot_signal(Some(1), fatal), BootSignal::Warn(_)));
+    }
+
+    /// busy(exit 75)는 실패가 아니라 정보다 — 훅↔GUI 중첩 부트는 정상 시나리오다(G11·하드 제약 6-⑧).
+    #[test]
+    fn boot_busy_is_info_not_warning() {
+        let busy = r#"{"roles":[{"role":"cso","outcome":"busy","mandatory":true}],
+                       "summary":{"busy":5,"lock":"busy"}}"#;
+        match cys_boot_signal(Some(cys::EXIT_BOOT_BUSY), busy) {
+            BootSignal::Info(m) => assert!(m.contains("건너뜁니다"), "busy 안내 문구: {m}"),
+            other => panic!("busy 가 정보 신호가 아니다: {other:?}"),
+        }
+        // 파싱 실패 + 미지 비0 은 fail-closed 로 경고한다(조용한 성공 금지)
+        assert!(matches!(cys_boot_signal(Some(4), "산문만"), BootSignal::Warn(_)));
+        assert!(matches!(cys_boot_signal(None, ""), BootSignal::Warn(_)));
+        assert_eq!(cys_boot_signal(Some(0), "산문만"), BootSignal::Silent);
+    }
+
+    /// 1차 경로(체인)의 타입드 exit 소비 — 정상 완주는 무신호, 정상 skip·단독 각성은 정보,
+    /// 단계 실패는 경고(단계명 + 생산자 detail 인용).
+    #[test]
+    fn bootstrap_chain_signal_consumes_typed_exit_space() {
+        let done = r#"{"ok":true,"marker":"base 마커 기록","lane":"base"}"#;
+        assert_eq!(bootstrap_chain_signal(Some(0), done, ""), BootSignal::Silent);
+        let solo = r#"{"ok":true,"marker":"부서장 단독 각성(CEO 티켓 부재)","solo_awakening":true,"dept":"dept-2"}"#;
+        match bootstrap_chain_signal(Some(0), solo, "") {
+            BootSignal::Info(m) => assert!(m.contains("CEO 티켓"), "티켓 안내 누락: {m}"),
+            other => panic!("단독 각성이 정보 신호가 아니다: {other:?}"),
+        }
+        assert!(matches!(bootstrap_chain_signal(Some(11), "", ""), BootSignal::Info(_)));
+        match bootstrap_chain_signal(Some(7), "", "") {
+            BootSignal::Warn(m) => assert!(m.contains("master"), "정당거부 처방 누락: {m}"),
+            other => panic!("claim 정당거부가 경고가 아니다: {other:?}"),
+        }
+        // exit 4(④boot Fatal) — 단계명과 생산자 detail(install_hint 포함)을 인용한다
+        let se = "[bootstrap] 단계 실패: ④boot (exit 1)\n의무(Fatal) 역할 기동 실패: cso=missing [claude 설치: curl -fsSL https://claude.ai/install.sh | bash]";
+        match bootstrap_chain_signal(Some(4), "", se) {
+            BootSignal::Warn(m) => {
+                assert!(m.contains("팀 기동(④cys boot)"), "단계 라벨 누락: {m}");
+                assert!(m.contains("claude.ai/install.sh"), "생산자 힌트 미인용: {m}");
+            }
+            other => panic!("체인 실패가 경고가 아니다: {other:?}"),
+        }
+        assert!(matches!(bootstrap_chain_signal(None, "", ""), BootSignal::Warn(_)));
+    }
+
+    /// ★B5 트립와이어: GUI 는 팀 부트 판정에 **stdout 산문 문자열**을 다시 쓰지 않는다.
+    /// (구 판정 재료였던 "신규 기동 0"·"미설치" 매칭이 되살아나면 RC1 사본 드리프트가 재발한다.)
+    #[test]
+    fn gui_boot_diagnosis_has_no_prose_matching() {
+        let src = include_str!("main.rs");
+        let start = src.find("fn spawn_orchestra_boot").expect("팀 부트 함수 소실");
+        let end = start + src[start..].find("\nfn emit_boot_signal").expect("배선 변형");
+        let seg = &src[start..end];
+        for banned in ["신규 기동 0", "\"미설치\"", "contains(\"미설치\")"] {
+            assert!(!seg.contains(banned), "산문 문자열 매칭 재도입: {banned}");
+        }
+        assert!(seg.contains("javis_bootstrap.py"), "1차 경로가 체인이 아니다(B5 미착지)");
+        assert!(seg.contains("boot-degraded"), "폴백 강등이 조용하다(typed 신호 부재)");
+        assert!(seg.contains("--json"), "폴백이 typed 계약을 소비하지 않는다");
+    }
+
+    /// ★G34 GUI 지점: 부서 소켓 주입은 **레인 팩과 쌍**이어야 하고, 유도는 lib 단일 소스를 쓴다.
+    #[test]
+    fn dept_master_injects_lane_pack_pair() {
+        let src = include_str!("main.rs");
+        let start = src.find("async fn start_dept_master").expect("start_dept_master 소실");
+        let end = start + src[start..].find("\n/// 부서 데몬 teardown").unwrap_or(600);
+        let seg = &src[start..end];
+        assert!(seg.contains("lane_pack_for_socket"), "레인 팩 유도 부재(중복 구현·미주입)");
+        assert!(seg.contains("CYS_PACK_DIR"), "CYS_PACK_DIR 동반 주입 부재(G34 GUI 지점 미수리)");
+        assert!(seg.contains("CYS_SOCKET"), "소켓 주입 소실");
+        // 유도 함수가 lib 정본이다(GUI 사본 금지)
+        let home = cys::home_dir();
+        assert_eq!(
+            cys::pack::lane_pack_for_socket(std::path::Path::new("/x/cys-dept-sales/cys.sock")),
+            Some(home.join(".cys").join("pack-dept-sales"))
+        );
+        assert!(cys::pack::lane_pack_for_socket(std::path::Path::new("/x/cys/cys.sock")).is_none());
+    }
+
+    /// launch-agent stdout → surface ref 회수(1차 경로의 ③claim-role 귀속 전제).
+    #[test]
+    fn launched_surface_ref_reads_stdout_contract() {
+        assert_eq!(
+            launched_surface_ref(b"surface:42\n"),
+            Some("surface:42".to_string())
+        );
+        // 진단 산문이 섞여도 stdout 의 surface 줄만 취한다(마지막 우선)
+        assert_eq!(
+            launched_surface_ref(b"noise\nsurface:7\ntrailing\n"),
+            Some("surface:7".to_string())
+        );
+        assert_eq!(launched_surface_ref(b""), None);
+        assert_eq!(launched_surface_ref(b"error: nope\n"), None);
     }
 }

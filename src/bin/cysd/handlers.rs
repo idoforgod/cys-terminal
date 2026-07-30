@@ -1445,10 +1445,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .map(|t| t.elapsed().as_secs() < guard)
                         .unwrap_or(false);
                     if typing {
+                        // ★T-0147-6: 코드·문구는 lib 단일 소스다 — 소비자(cys 주입 경로)가 이
+                        //   메시지로 `--queued` 1회 전환을 판정한다(문구 사본 금지).
                         return Reply::Single(err_response(
                             &id,
-                            "typing_guard",
-                            "human is typing in this pane; retry later or use --queued",
+                            cys::ERR_TYPING_GUARD,
+                            cys::MSG_TYPING_GUARD,
                         ));
                     }
                 }
@@ -1587,10 +1589,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .map(|t| t.elapsed().as_secs() < guard)
                         .unwrap_or(false);
                     if typing {
+                        // ★T-0147-6: 코드·문구는 lib 단일 소스다 — 소비자(cys 주입 경로)가 이
+                        //   메시지로 `--queued` 1회 전환을 판정한다(문구 사본 금지).
                         return Reply::Single(err_response(
                             &id,
-                            "typing_guard",
-                            "human is typing in this pane; retry later or use --queued",
+                            cys::ERR_TYPING_GUARD,
+                            cys::MSG_TYPING_GUARD,
                         ));
                     }
                 }

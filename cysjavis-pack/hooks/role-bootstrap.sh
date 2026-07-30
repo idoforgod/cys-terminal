@@ -2,8 +2,9 @@
 # javis 결정론 부트스트랩 발화 — UserPromptSubmit hook
 #
 # 절대요구(오너 2026-07-15): "너는 마스터다" 류 마스터 선언이 입력되면, LLM의 재량·환각·누락과
-# 무관하게 하네스가 부트스트랩을 100% 예외없이 발화한다. 부트 완료 = master·CSO·워커·리뷰어2
-# (5노드)가 화면에 뜨는 것. 종전엔 "각성한 마스터가 cys boot 실행"이 산문 계약이라 LLM이 건너뛰면
+# 무관하게 하네스가 부트스트랩을 100% 예외없이 발화한다. 부트 완료 = **필수 역할 전원+master**가
+# 화면에 뜨는 것(구성·개수는 javis_orchestra.team_roster_note 파생 — B18: 리터럴 금지).
+# 종전엔 "각성한 마스터가 cys boot 실행"이 산문 계약이라 LLM이 건너뛰면
 # (부서장 단독 대기 환각) 팀이 안 떴다 — 그 호출 자체를 코드 결정론(이 훅)으로 격상한다.
 #
 # 메커니즘: UserPromptSubmit은 프롬프트 제출 시 하네스가 강제 실행하는 훅이다(모델 우회 불가).
@@ -298,11 +299,17 @@ fi
 #   문서만 거짓이 됐다(P3-A-120S 의 문서면). 예산 모듈 소비 불가 시에만 파생 실패를 명시한다.
 CHECK_WINDOW_S="$("$CYS_PY" "$PACK/bin/javis_budget.py" --note-check-window 2>/dev/null)"
 [ -n "$CHECK_WINDOW_S" ] || CHECK_WINDOW_S="예산 모듈 미소비(javis_budget 확인)"
+# ★B18/H-DOC-2(W4): 팀 구성·노드 수도 **하드코딩하지 않는다** — 종전 "(5노드)" 리터럴은
+#   REQUIRED_ROLES 와 무관하게 늙어 문서만 거짓이 됐다(편성이 바뀌어도 훅 note 는 그대로).
+#   `javis_orchestra --note-team-roster`(=REQUIRED_ROLES+master 파생)를 인용한다. required 집합에
+#   master 를 추가해 숫자를 맞추는 것은 금지 방향 ②(레거시 master 부트 사망).
+TEAM_ROSTER="$("$CYS_PY" "$PACK/bin/javis_orchestra.py" --note-team-roster 2>/dev/null)"
+[ -n "$TEAM_ROSTER" ] || TEAM_ROSTER="필수 역할 전원+master(로스터 모듈 미소비 — javis_orchestra 확인)"
 "$CYS_PY" -c 'import json,sys
 note=("[결정론 부트스트랩 발화됨 — 하네스 강제] \"너는 마스터다\" 선언을 UserPromptSubmit 훅이 감지해 "
       "javis_bootstrap.py를 백그라운드로 실행 중이다(발화 후 프로세스 생존 확인됨): preflight(비치명) → "
-      "master 역할 등록 → cys boot(CSO·워커·리뷰어2 팀 기동) → 생존확인(최대 %ss). "
-      "완료 = master·cso·worker·reviewer×2 (5노드)가 "
+      "master 역할 등록 → cys boot(팀 기동) → 생존확인(최대 %ss). "
+      "완료 = %s가 "
       "화면에 뜨는 것. 지침: 너(LLM)는 이 부트스트랩을 재실행하지 마라(훅이 이미 결정론 집행 중) — "
       "MASTER_DIRECTIVE §0의 개별 명령(preflight·claim-role·cys boot·check)을 손으로 재현하는 것도 "
       "재실행이다. 너의 잔여 의무는 §0의 ③복원 점검·⑤승인 채널 확보·⑥구동 보고뿐이다. "
@@ -314,7 +321,7 @@ note=("[결정론 부트스트랩 발화됨 — 하네스 강제] \"너는 마�
       "다음 액션 큐를 결정론 확인해 미완 작업이 있으면 자율 착수하라(\"오너 지시 대기\"는 폐기). "
       "만약 팀이 안 뜨면 원인이 "
       "이번 런 로그 %s (최근 런 포인터: %s)·이 레인 boot-last에 있고 실패 시 승인 Feed에 알림이 뜬다."
-      ) % (sys.argv[3], sys.argv[4], sys.argv[1], sys.argv[2])
+      ) % (sys.argv[3], sys.argv[5], sys.argv[4], sys.argv[1], sys.argv[2])
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
-  "$LOG" "$LATEST" "$CHECK_WINDOW_S" "$LANE_BOOT_LAST"
+  "$LOG" "$LATEST" "$CHECK_WINDOW_S" "$LANE_BOOT_LAST" "$TEAM_ROSTER"
 exit 0

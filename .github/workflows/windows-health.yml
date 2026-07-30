@@ -1,0 +1,94 @@
+name: windows-health (H-WIN 실기)
+
+# ★목적(T-0147-7 W4 · 부채 V4 해소 · 검체 H-WIN-11): 부트스트랩 건강성 러너의 **Windows 검체군을
+#   실제 Windows 에서 돌린다.** 지금까지 G18–G25(백슬래시·드라이브 경로·named pipe·taskkill·CYS_PY
+#   폴백·pack-guard 접두·cygpath 안내)의 판정은 전부 **macOS 러너의 스텁 목**이었다 — 재감사가
+#   RC4 로 분류한 "Windows 무검증 베이스라인"의 실체가 이것이다. 스텁은 회귀를 조기에 잡는 값싼
+#   장치이지 플랫폼 증명이 아니다: 스텁이 초록인데 실기가 깨지는 조합(경로 구분자·PATH 해소·
+#   락 프리미티브)이 이 리포에서 이미 두 번 실사고를 냈다(0.14.4 D1 형제 import · ConPTY 마우스).
+#
+# ★범위(최소 구성 — 의도된 한계)
+#   · H-WIN-1~10 + A8 락(H-CONC-1·3) + A6 발화경로(H-DETECT-10) + H-WIN-11(잡 계약 자기검증)만 돈다.
+#   · **전 검체를 돌리지 않는다**: 다수 검체가 macOS 전용 픽스처(launchd·lsof·flock)나 레포 전 트리
+#     스캔을 전제해 Windows 에서 skip 이 되고, skip 무더기는 초록의 의미를 흐린다. 러너는 그래서
+#     `--only` 로 대상을 명시한다(플랫폼 목록의 단일 출처는 아래 WIN_SPECIMENS 한 줄).
+#   · 이 잡은 어떤 릴리스도 만들지 않고 아티팩트도 올리지 않는다(release.yml 과 완전 독립).
+#
+# ★레인 대조 게이트(ci-branch.yml '팩 스위트 레인 대조')와의 관계 — **의도적으로 등재하지 않았다**:
+#   그 게이트는 `test_[a-z0-9_]+` 토큰(= `test_*.py` 스위트 이름)의 레인 간 드리프트를 본다. 이 잡은
+#   개별 스위트를 직접 부르지 않고 **건강성 러너**만 부르므로 추출 토큰이 0건이고, 그 상태로
+#   LANES/SUBSET_LANES 에 넣으면 게이트의 fail-closed(0건 추출=추출기 파손)가 발동해 CI 를
+#   상시 적색으로 만든다. 러너의 검체 목록은 파일 안(`_REG`)에 있고 `--list`/`--json` 으로 기계
+#   판독되므로 레인 간 사본이 애초에 없다. **이 잡이 나중에 `test_*.py` 를 직접 부르기 시작하면
+#   그때 SUBSET_LANES 에 등재하라**(그 시점부터는 드리프트 표면이 생긴다).
+
+on:
+  push:
+    branches: ['feat/**']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # ⚠이 잡에는 `if:` 조건을 달지 마라. 조건부 Windows 검증은 "돌지 않는 초록"이 되고, 그것이
+  #   부채 V4(무검증 베이스라인)의 재생산이다. 예산이 문제면 트리거(on:)를 좁혀라.
+  win-health:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 러너는 stdlib 전용(네트워크 0)이라 별도 의존성 설치가 없다. 3.12 = 동봉 embeddable
+      # 런타임(python-3.12.10-embed-amd64)과 같은 마이너로 맞춘다(실기 환경 근접).
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 실기 환경 사실을 먼저 기록한다 — 초록/빨강의 해석 근거다(bash=Git Bash 존재가 전제:
+      # 훅 검체는 `bash <hook>` 으로 훅을 실행한다).
+      - name: 실기 환경 확인 (python · bash · 경로 규약)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "import sys,os;print('python',sys.version.split()[0],'os.name',os.name)"
+          bash --version | head -1
+          echo "OSTYPE=${OSTYPE:-?} · which bash=$(command -v bash)"
+
+      # ★H-WIN 검체 실기. `--json` 으로 기계 판독 결과를 남기고(회귀 시 원 결함 ID 역추적),
+      #   러너 exit 를 그대로 잡 판정으로 쓴다(발효 검체의 fail 은 hard fail).
+      - name: 부트스트랩 건강성 — H-WIN 검체 실기 (windows-latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "건강성 러너 누락: $R (git add 누락 의심)" >&2; exit 1; }
+          # 플랫폼 검체 목록의 단일 출처(이 한 줄). H-WIN-11 은 잡 계약 자기검증 + 실기 재실행.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-CONC-1,H-CONC-3,H-DETECT-10"
+          echo "== H-WIN 실기: $WIN_SPECIMENS =="
+          python "$R" --only "$WIN_SPECIMENS"
+          python "$R" --only "$WIN_SPECIMENS" --json > win-health.json
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("win-health.json", encoding="utf-8"))
+          s = d["summary"]
+          print("[win-health] verdict=%s pass=%s fail=%s skip=%s pending=%s"
+                % (s["verdict"], s["pass"], s["fail"], s["skip"], s["pending"]))
+          for r in d["specimens"]:
+              print("  %-6s %-12s %s" % (r["status"].upper(), r["id"], r.get("reason", r.get("detail", ""))[:160]))
+          # 측정 실패는 조용한 통과가 아니다 — 실기 목적이 skip 무더기로 무력화되면 잡을 세운다.
+          if s["fail"]:
+              sys.exit(1)
+          if s["pass"] == 0:
+              print("::error::Windows 실기에서 PASS 0건 — 검체가 전부 skip/pending 이면 이 잡은 "
+                    "무검증 베이스라인을 재생산한다(fail-closed).", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: 결과 업로드 (기계 판독 JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-health-json
+          path: win-health.json
+          if-no-files-found: warn

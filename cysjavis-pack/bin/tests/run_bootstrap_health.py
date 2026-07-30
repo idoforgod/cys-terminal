@@ -44,9 +44,12 @@ PY = sys.executable or "python3"
 # 기준 커밋 핀(재감사 헤더) — 계측기 자기검증(구 코드 FIRE 확인)의 대조 트리.
 # W0 착지 커밋을 쓴다: W1a 이전 상태이면서 W0 지혈이 반영된 트리.
 CALIBRATION_REF = os.environ.get("CYS_HEALTH_CALIB_REF", "a96d8b1")
+# W0 **이전** 트리 — W0 자신이 고친 문구 결함(G30·G31·G32·FILLER)의 계측 대조는 이쪽이어야 한다
+# (W0 착지 트리에서는 이미 수리돼 탐지기가 FIRE 하지 않는다 = 기준 선택 오류로 인한 오보 차단).
+PRE_W0_REF = os.environ.get("CYS_HEALTH_PRE_W0_REF", "b35f01d")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
-LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3")
+LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
 
@@ -118,11 +121,17 @@ def _shell_hooks():
     return sorted(out)
 
 
-def _git_show(relpath):
-    """기준 커밋의 파일 내용(계측기 자기검증용). 레포가 아니거나 실패면 None."""
+def _git_show(relpath, ref=None):
+    """기준 커밋의 파일 내용(계측기 자기검증용). 레포가 아니거나 실패면 None.
+
+    ★ref 인자(W4): 기본 기준은 W0 착지 커밋(`CALIBRATION_REF`)이지만, **W0 자신이 고친 결함**
+      (G30·G31·G32·P3-A-FILLER 의 문구면)은 그 트리에서 이미 수리돼 있어 탐지기가 FIRE 하지
+      않는다 — 그 경우 계측 대조는 **W0 이전 트리**(`PRE_W0_REF`)로 해야 유효하다. 잘못된 기준에서
+      "구 코드가 안 잡힌다"는 결과는 탐지기 파손이 아니라 기준 선택 오류다(오보 방지)."""
     if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
         return None
-    r = _run(["git", "-C", REPO_DIR, "show", "%s:%s" % (CALIBRATION_REF, relpath)], timeout=30)
+    r = _run(["git", "-C", REPO_DIR, "show", "%s:%s" % (ref or CALIBRATION_REF, relpath)],
+             timeout=30)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -940,11 +949,15 @@ def _cys_bin():
     return None
 
 
-@specimen("H-EXIT-2", "W2", "boot Busy → busy 판정 구분 + CEO 티켓 보존", ["G11"])
+@specimen("H-EXIT-2", "W2", "boot Busy → busy 판정 구분(--json + bare exit 75) + CEO 티켓 보존",
+          ["G11"])
 def h_exit_2():
     """G11: boot 락 Busy-skip(exit 0)을 ④가 '스폰 성공'으로 오인해 CEO 티켓을 **무스폰 소각**했다.
     busy 는 --json 의 outcome 으로 타입 구분되고, 티켓 소비는 실스폰 확인 후에만 일어난다.
-    ★bare exit 의미는 구계약 유지(busy=0) — 전환은 W4 GUI --json 소비와 원자(금지 방향 ⑧)."""
+    ★**W4 갱신(하드 제약 6-⑧ 이행)**: bare exit 의미 전환이 GUI `--json` 소비와 **같은 커밋**으로
+      착지했으므로, 이 검체가 박제하는 계약도 함께 전진한다 — busy = `EXIT_BOOT_BUSY`(75).
+      W2 시점의 '구계약 유지(busy=0)' 단언은 폐기가 아니라 **전환 완료로 승계**된 것이다
+      (그 단언의 목적은 'GUI 가 모르는 채 exit 의미가 바뀌는 것' 차단이었고, 이제 GUI 가 안다)."""
     src = _repo_file(os.path.join("src", "bin", "cys.rs"))
     notes = []
     # ⓐ busy 경로가 --json 에서 outcome:"busy" 를 낸다. (run_boot **본문의** Busy 분기 — 락 헬퍼의
@@ -956,9 +969,21 @@ def h_exit_2():
     busy_arm = src[i:i + 2000]
     need('"outcome": "busy"' in busy_arm,
          "Busy 분기가 --json 에 outcome:busy 를 내지 않는다(성공과 구분 불가 — G11 재발)")
-    need("return 0;" in busy_arm,
-         "Busy 의 bare exit 가 0 이 아니다(구계약 위반 — 전환은 W4 원자·금지 방향 ⑧)")
-    notes.append("busy=outcome 구분 + bare exit 0 구계약 유지")
+    need("boot_exit_code(0, true)" in busy_arm,
+         "Busy 의 bare exit 가 단일 판정 함수를 통과하지 않는다(의미가 코드 두 곳으로 흩어짐)")
+    need("return 0;" not in busy_arm,
+         "Busy 가 여전히 exit 0(성공)을 낸다 — 무스폰을 성공으로 보고(G11 재발)")
+    # 3자 파리티: Rust lib 정본 ↔ python 소비부 ↔ GUI 소비부가 같은 값을 쓴다.
+    lib = os.path.join(REPO_DIR, "src", "lib.rs")
+    if os.path.isfile(lib):
+        need("pub const EXIT_BOOT_BUSY: i32 = 75;" in _read(lib), "lib 정본 busy exit 상수 이탈")
+    need("CYS_BOOT_EXIT_BUSY = 75" in _read(os.path.join(BIN_DIR, "javis_bootstrap.py")),
+         "python 소비부 busy exit 상수 이탈(파리티 붕괴)")
+    gui = os.path.join(REPO_DIR, "src-tauri", "src", "main.rs")
+    if os.path.isfile(gui):
+        need("cys::EXIT_BOOT_BUSY" in _read(gui),
+             "GUI 가 busy exit 를 별도 분기하지 않는다(중첩 부트 위경보 — 전환의 전제 조건)")
+    notes.append("busy=outcome 구분 + bare exit 75(3자 파리티)")
     # ⓑ 티켓 소비는 ④ boot **성공 직후**에만(무스폰 소각 0). bootstrap 소비부 구조 단언.
     boot_src = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
     # 라벨은 W3 의 STEP 레지스트리로 승격됐다(리터럴 금지) — **소비 호출 지점**을 앵커로 쓴다.
@@ -969,7 +994,10 @@ def h_exit_2():
          "티켓 소비가 boot 결과 판정보다 앞선다(무스폰 소각 경로 잔존 — G11)")
     # busy 는 실스폰이 아니다: 소비 지점이 --json 판정 뒤에 있어야 busy 에서 티켓이 타지 않는다.
     need("_parse_boot_json(" in before, "티켓 소비가 --json 소비보다 앞선다(busy 구분 없이 소각)")
-    notes.append("티켓 소비는 boot --json 판정 후(실스폰 확인)")
+    need("_boot_was_busy(" in before, "티켓 소비가 busy 판정보다 앞선다(무스폰 소각 경로 잔존)")
+    need(re.search(r"if ticket_path is not None and not boot_busy:", boot_src),
+         "티켓 소비 조건에 busy 배제가 없다 — 1회성 티켓 ⟺ 실스폰 불변식 파괴(G11)")
+    notes.append("티켓 소비는 boot --json 판정 후 + busy 배제(실스폰 확인)")
     # ⓒ 소비부가 busy 를 Fatal 실패로 오분류하지 않는다(순수 판정 실측).
     sys.path.insert(0, BIN_DIR)
     try:
@@ -977,6 +1005,10 @@ def h_exit_2():
         busy = json.dumps({"roles": [{"role": "cso", "agent": "claude",
                                       "outcome": "busy", "mandatory": True}]})
         need(B._boot_fatal_verdict(0, busy) is None, "busy 가 Fatal 실패로 오분류(G11 재발)")
+        need(B._boot_was_busy(B.CYS_BOOT_EXIT_BUSY, busy) is True,
+             "소비부가 exit 75 를 busy(무스폰)로 읽지 않는다 — 티켓 소각 위험")
+        need(B._boot_fatal_verdict(B.CYS_BOOT_EXIT_BUSY, "파싱 불가 산문") is None,
+             "exit 75 가 보수 폴백에서 Fatal 로 접힌다(중첩 부트마다 exit 4 위경보)")
         fatal = json.dumps({"roles": [{"role": "cso", "agent": "claude",
                                        "outcome": "failed", "mandatory": True}]})
         need(B._boot_fatal_verdict(1, fatal) is not None, "의무 역할 failed 가 Fatal 로 승격되지 않음")
@@ -1737,7 +1769,7 @@ def h_safe_1():
 
 
 @specimen("H-SAFE-2", "W2",
-          "치명위험 ④ 차단 — readiness 안전 밸브(영구 오부정 불가능성) + bare exit 구계약",
+          "치명위험 ④ 차단 — readiness 안전 밸브(영구 오부정 불가능성) + bare exit 계약(W4 전환)",
           ["W2-자체감사", "B4(안전 경계)", "금지 방향 ⑧"])
 def h_safe_2():
     """★두 개의 자체감사 산출 안전장치를 박제한다.
@@ -1747,9 +1779,10 @@ def h_safe_2():
        T-0147-4 이후 롤백 close 가 실제로 성공하므로 **건강한 pane 이 전부 닫힌다**(글자 0).
        그래서 화면과 무관한 양성 증거(`agent_alive` = 데몬이 커널 프로세스 표에서 관측한 사실)를
        둔다. 기동 **실패** 노드는 자손이 없어 이 밸브가 켜지지 않으므로 B4 오탐 방향은 불변이다.
-    ② **bare exit 구계약**(금지 방향 ⑧): `cys boot` 의 bare exit 에 mandatory/busy 같은 새 의미를
-       실으면 아직 --json 을 소비하지 않는 GUI 판정이 조용히 바뀐다. exit 는 구계약(launch 실패>0)
-       그대로 두고, B1·G29 는 typed --json 으로만 전달한다.
+    ② **bare exit 계약**(하드 제약 6-⑧): W2 에서는 "GUI 가 --json 을 소비하기 전까지 exit 의미를
+       바꾸지 말라"였다(구계약 launch 실패>0). **W4 에서 GUI 소비가 같은 커밋으로 착지**했으므로
+       계약이 전진한다 — 0=Fatal 없음 / 1=Fatal / 75=busy. 단언의 방향은 그대로다: exit 의 의미는
+       한 곳(`boot_exit_code`)이 소유하고, 소비부가 그 세 값을 **분기해서** 읽어야 한다.
     """
     src = _repo_file(os.path.join("src", "bin", "cys.rs"))
     notes = []
@@ -1780,13 +1813,18 @@ def h_safe_2():
     # ② bare exit 구계약
     ri = src.find("fn run_boot(")
     rbody = src[ri:src.find("\n/// 죽음 확정 좌석의 reclaim", ri)]
-    tail = rbody[rbody.rfind("if failed > 0"):]
-    need(tail.startswith("if failed > 0"),
-         "bare exit 이 구계약(launch 실패>0)이 아니다 — 금지 방향 ⑧ 위반(GUI 판정 무단 변경)")
-    need("fatal_failed" not in tail, "bare exit 이 mandatory 의미를 싣는다(W4 원자 계약 위반)")
+    need("boot_exit_code(fatal_failed, false)" in rbody,
+         "run_boot 종료가 단일 판정 함수를 통과하지 않는다(의미가 흩어져 두 채널이 갈린다)")
+    need("if failed > 0" not in rbody,
+         "구계약(launch 실패>0)이 잔존한다 — 리뷰어 1종 실패가 팀 실패로 번지는 B1 데드엔드 재발")
     need('"fatal_failed": fatal_failed' in rbody,
          "fatal_failed 가 --json 요약에 없다(typed 채널로 전달되지 않음)")
-    notes.append("bare exit=구계약(failed>0) · mandatory 는 --json 전용")
+    # exit 와 --json 이 **같은 사실**을 내는지: Fatal 계상 지점이 mandatory 분기 전건에 있어야 한다.
+    need(rbody.count("fatal_failed += 1;") >= 3,
+         "mandatory 실패 계상 지점이 부족하다(%d) — 어떤 Fatal 경로가 exit 0 으로 접힌다"
+         % rbody.count("fatal_failed += 1;"))
+    need("fn boot_exit_code(" in src, "bare exit 판정 순수 함수 부재(테스트 가능성·단일 소유 상실)")
+    notes.append("bare exit=신계약(0/1/75 · boot_exit_code 단일 소유)")
     # ③ 팩↔바이너리 스큐 폴백(온보딩 전멸 차단)
     bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
     need("_is_unknown_arg_error(" in bsrc, "`--json` 미지원 구 바이너리 폴백이 없다(온보딩 전멸)")
@@ -2418,11 +2456,141 @@ def h_win_8():
     return "lib 단일 정의·사본 0·pane/schedule 소비 · 계측검증=%s" % calib
 
 
-pending("H-WIN-9", "W4", "어댑터 OS 후보 해소(agy/codex Windows 경로) — 커버 결함 B8 = W4 소속",
-        ["B8"])
-pending("H-WIN-10", "W4", "Windows 1차 종료 단계 유효성(CTRL_BREAK 대체·명시 로그) — 커버 결함 G24 = W4 소속",
-        ["G24"])
-pending("H-WIN-11", "W4", "Windows CI 실기 재실행(부채 V4 해소)", ["A6", "A8", "B13"])
+@specimen("H-WIN-9", "W4", "어댑터 OS 후보 해소(agy/codex Windows 경로) — 단일 오라클 안에서", ["B8"])
+def h_win_9():
+    """B8: Windows 에서 `where agy` 는 실패하지만 실제 설치물은 `agy.cmd`(npm shim)다. 감지가
+    확장자·npm prefix 후보를 순회하지 않으면 **설치돼 있는데 미설치로 판정**해 리뷰어가 영영
+    안 뜬다. 그리고 그 후보 순회는 감지 **단일 오라클 안**에 있어야 한다(부트·agent-detect·
+    python detect_reviewer 가 같은 판정을 받으려면)."""
+    src = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
+    if not os.path.isfile(src):
+        raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+    body = _read(src)
+    # ① 후보 순회가 존재하고 단일 오라클(detect_agent_binary)이 그것을 통과한다
+    need("fn windows_agent_candidates(" in body, "Windows 후보 순회 함수 부재(B8 미수리)")
+    need("apply_windows_agent_fallback(AgentDetection {" in body,
+         "detect_agent_binary 가 Windows 폴백을 통과하지 않는다(오라클 밖 판정)")
+    need(body.count("fn apply_windows_agent_fallback(") == 2,
+         "cfg 분기 2벌(windows/not) 형태가 아니다 — 다른 OS 에서 항등 보장 불가")
+    # ② 후보 집합: 확장자 4종 + npm prefix 2종(%APPDATA%·%LOCALAPPDATA%)
+    seg = body[body.index("fn windows_agent_candidates("):]
+    seg = seg[:seg.index("\n}\n") + 2]
+    for ext in ("cmd", "exe", "bat", "ps1"):
+        need('"%s"' % ext in seg, "확장자 후보 누락: %s" % ext)
+    for var in ("APPDATA", "LOCALAPPDATA"):
+        need('"%s"' % var in seg, "npm prefix 후보 누락: %%%s%%" % var)
+    need("npm" in seg, "npm 전역 prefix 경로 후보 부재(PATH 미갱신 셸 대응 불가)")
+    need("is_executable_file(" in seg, "후보 판정이 실행권을 안 본다(실재만 보면 오탐)")
+    # ③ 후보 전부 미발견이면 **힌트가 경로수정 안내로 교체**된다(설치 안내 반복이 아니라 배선 교정)
+    need("WINDOWS_AGENT_PATH_HINT" in body, "전탐색 실패 힌트 상수 부재")
+    need("d.hint = WINDOWS_AGENT_PATH_HINT" in body, "후보 전탐색 실패 시 힌트 교체 배선 부재")
+    # ④ 소비층 단일화: python 은 자체 판정을 1차로 쓰지 않는다(cys agent-detect 소비)
+    orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
+    need("cys_agent_detect(" in orch and "agent-detect" in orch,
+         "python detect_reviewer 가 단일 오라클을 소비하지 않는다(B12)")
+    calib = "skip(no-git)"
+    old = _git_show("src/bin/cys.rs")
+    if old is not None:
+        need("windows_agent_candidates" not in old,
+             "계측 타당성 실패: 구 코드에 이미 후보 순회가 있다면 B8 은 결함이 아니다")
+        calib = "구 코드 후보 순회 부재 확인"
+    return "후보 확장자 4·npm prefix 2·실행권 판정 · 힌트 교체 · python 소비 · 계측검증=%s" % calib
+
+
+@specimen("H-WIN-10", "W4", "Windows 1차 종료 단계 유효성(무효 명시 로그 후 강제 직행)", ["G24"])
+def h_win_10():
+    """G24: `taskkill /PID <pid> /T`(무 `/F`)는 WM_CLOSE 라 콘솔 프로세스(claude·codex·agy)를
+    **종료하지 않는다** — 1차 '그레이스풀' 단계가 구조적 no-op 이었다. 그럼에도 회수 경로는
+    그것을 보내고 1.5s 기다렸고, '그레이스풀을 시도했다'는 거짓 기록을 남겼다.
+    처방(W2 handoff '후보 확대 금지 — loud no-op 이 정답'과 동형): 대체 시그널을 발명하지 않고
+    **무효를 명시 로그**한 뒤 강제 단계로 직행한다.
+    ★계측: 플랫폼 술어를 **import 전에 위장**해 실제 모듈 판정을 측정한다(주석 스캔 아님)."""
+    probe = r'''
+import json, os, sys
+os.name = sys.argv[1]          # ★import 전 위장 — 술어는 import 시점에 확정된다
+sys.path.insert(0, sys.argv[2])
+import javis_boot_node as m
+calls = []
+m.run = lambda args, timeout=5: (calls.append(list(args)), (0, "", ""))[1]
+m._kill(4321)
+m._kill(4321, force=True)
+print(json.dumps({"supported": m.GRACEFUL_KILL_SUPPORTED,
+                  "reason": m.GRACEFUL_KILL_NOOP_REASON, "calls": calls}))
+'''
+    out = {}
+    for osname in ("nt", "posix"):
+        r = _run([PY, "-c", probe, osname, BIN_DIR])
+        need(r.returncode == 0, "탐침 실패(os.name=%s): %s" % (osname, r.stderr[-400:]))
+        out[osname] = json.loads(r.stdout.strip().splitlines()[-1])
+    # ① Windows: 그레이스풀 미지원 선언 + 1차 인자가 실제로 `/F` 없는 무효 형태임을 실측
+    need(out["nt"]["supported"] is False, "Windows 에서 그레이스풀이 여전히 '지원'으로 선언됨")
+    g, f = out["nt"]["calls"]
+    need(g[:1] == ["taskkill"] and "/F" not in g,
+         "Windows 1차 인자가 taskkill 무-/F 형태가 아니다(계측 전제 붕괴): %s" % g)
+    need("/F" in f, "Windows 강제 단계에 /F 가 없다: %s" % f)
+    # ② unix: 종전 동작 보존(SIGTERM → SIGKILL 2단)
+    need(out["posix"]["supported"] is True, "unix 에서 그레이스풀이 꺼졌다(무회귀 위반)")
+    gp, fp = out["posix"]["calls"]
+    need(gp[0] == "kill" and "-9" not in gp, "unix 1차가 SIGTERM 이 아니다: %s" % gp)
+    need("-9" in fp, "unix 강제 단계가 SIGKILL 이 아니다: %s" % fp)
+    # ③ 무효 사유가 '강제 단계 직행'을 명시한다(조용한 생략 금지)
+    need("강제" in out["nt"]["reason"], "무효 사유가 강제 직행을 명시하지 않는다")
+    # ④ 회수 경로가 술어로 분기한다(1.5s 무의미 대기 제거)
+    bn = _read(os.path.join(BIN_DIR, "javis_boot_node.py"))
+    need("if GRACEFUL_KILL_SUPPORTED:" in bn, "회수 경로가 술어 분기를 쓰지 않는다")
+    need("emit(\"reclaim\", GRACEFUL_KILL_NOOP_REASON)" in bn, "무효 명시 로그 배선 부재")
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_boot_node.py")
+    if old is not None:
+        need("GRACEFUL_KILL_SUPPORTED" not in old,
+             "계측 타당성 실패: 구 코드에 이미 술어가 있다면 G24 는 결함이 아니다")
+        need("rc, _, _ = _kill(pid)" in old,
+             "계측 타당성 실패: 구 코드가 1차 그레이스풀을 무조건 보내지 않았다면 전제가 다르다")
+        calib = "구 코드 무조건 1차 그레이스풀 확인"
+    return "nt=무효선언+/F직행 · posix=TERM→KILL 보존 · 사유 명시 · 분기 배선 · 계측검증=%s" % calib
+
+
+@specimen("H-WIN-11", "W4", "Windows CI 실기 재실행(부채 V4 해소) — 로컬은 잡 계약 검증", ["A6", "A8", "B13"])
+def h_win_11():
+    """부채 V4: G18–G25 판정이 전부 macOS 스텁 목이라 **런타임 확증이 0회**였다. 스텁은 값싼
+    조기경보이지 플랫폼 증명이 아니다(0.14.4 D1 형제 import·ConPTY 마우스가 그 계급의 실사고).
+    이 검체는 두 층으로 동작한다:
+      · 전 플랫폼: Windows CI 잡의 **계약**을 검증한다(존재·windows-latest·python 셋업·러너 실기·
+        조건부 아님). 계약이 깨지면 '돌지 않는 초록'이 되고 그게 V4 의 재생산이다.
+      · Windows: H-WIN 검체군 + A8 락(H-CONC-1·3) + A6 발화경로(H-DETECT-10)를 **실기 재실행**한다.
+    ★macOS 에서는 실측을 하지 않았으므로 **PASS 를 주장하지 않는다** — Skip(사유 동봉)이다.
+      측정하지 않은 것을 초록으로 세는 것이 이 문서 전체가 경계하는 reward-hack 이다."""
+    rel = os.path.join(".github", "workflows", "windows-health.yml")
+    wf = os.path.join(REPO_DIR, rel)
+    if not os.path.isfile(wf):
+        raise Fail("Windows CI 잡 부재: %s — 부채 V4 미해소(실기 경로 없음)" % rel)
+    text = _read(wf)
+    need("runs-on: windows-latest" in text, "windows-latest 러너가 아니다(실기 아님)")
+    need("actions/setup-python" in text, "python 셋업 스텝 부재 — 러너 실행 불가")
+    need("run_bootstrap_health.py" in text, "건강성 러너를 호출하지 않는다")
+    need("H-WIN-1" in text and "H-WIN-10" in text, "H-WIN 검체 실기 목록이 없다")
+    need("H-CONC-1" in text and "H-DETECT-10" in text,
+         "A8 락·A6 경로 실측 검체가 목록에 없다(§5 H-WIN-11 커버 결함)")
+    # 잡이 조건부면 '돌지 않는 초록'이다 — 잡 수준 if 금지(ci-branch 레인 게이트와 동형 교리)
+    job = text[text.index("jobs:"):]
+    need(not re.search(r"^\s{4}if:", job, re.M), "잡 수준 `if:` 존재 — 조건부 Windows 검증 금지")
+    need("--json" in text, "기계 판독 결과 미수집(회귀 시 결함 ID 역추적 불가)")
+    if os.name != "nt":
+        raise Skip("Windows 실기는 CI 잡(%s)에서 수행한다 — 이 기계(%s)에서는 잡 계약만 검증했다"
+                   "(windows-latest·python 셋업·러너 H-WIN+H-CONC-1/3+H-DETECT-10 실기·무조건 실행)"
+                   % (rel, sys.platform))
+    # ── 실기(Windows 러너) ──
+    ids = ["H-WIN-%d" % i for i in range(1, 11)] + ["H-CONC-1", "H-CONC-3", "H-DETECT-10"]
+    r = _run([PY, os.path.abspath(__file__), "--json", "--only", ",".join(ids)], timeout=900)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        raise Fail("실기 재실행 결과 파싱 실패: %s" % (r.stdout[-400:] + r.stderr[-400:]))
+    s = d["summary"]
+    bad = [x["id"] for x in d["specimens"] if x["status"] == "fail"]
+    need(not bad, "Windows 실기 실패 검체: %s" % bad)
+    need(s["pass"] > 0, "Windows 실기 PASS 0건 — 전부 skip 이면 실기 목적이 무력화된다")
+    return "실기 %d PASS / %d SKIP (Windows 러너) · 잡 계약 충족" % (s["pass"], s["skip"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2914,8 +3082,123 @@ def h_pred_8():
              "계측 타당성 실패: 구 코드가 이미 델타를 쓴다")
         calib = "구 코드=화면 전체 매칭 + 카운트 회계 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
-pending("H-PRED-9", "W4", "trust 패턴·마커 SOT=코드/vendor + user override 계층", ["P3-B19"])
-pending("H-PRED-10", "W4", "TCC 탐침 대상이 실자원(cwd+PACK)에서 파생", ["P3-A-TCC"])
+@specimen("H-PRED-9", "W4", "trust 패턴·마커 SOT=코드/vendor + user override 계층(★W-B 동결 정합)",
+          ["P3-B19"])
+def h_pred_9():
+    """P3-B19: 폴더신뢰 프롬프트 패턴이 **코드 하드코딩**이었다(`trustthisfolder`) — claude 문면이
+    바뀌거나 다른 CLI 를 쓰면 코드를 고쳐야 했다. 그런데 `agents.json` 은 ★W-B 로 **user 소유
+    동결**이라 단순히 그 파일로 옮기면 예전에 커스터마이즈한 사용자는 vendor 신규 값을 **영영
+    못 받는다**(동결 = 폴더신뢰 자동확인 불발·readiness 시간폴백 퇴화).
+    그래서 계약이 '파일로 이동'이 아니라 **'코드/vendor 기본값 + user override 필드 계층'** 이다.
+    이 검체는 그 계층이 실재하고, **trust-prompt 항목만** 자동응답에 소비되는지 못박는다
+    (사람 판단이 필요한 tool-permission 류 자동응답은 절대 금지 — 그게 열리면 승인 게이트 소멸)."""
+    src = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
+    if not os.path.isfile(src):
+        raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+    body = _read(src)
+    # ① 필드 계층: 결손 키만 vendor 임베드로 보강, 디스크 파일 무접촉(★W-B)
+    need("fn fill_missing_fields(" in body, "필드 계층 함수 부재(agents.json 동결 미해소)")
+    need('LAYERED_KEYS' in body, "계층 대상 키 목록 상수 부재")
+    seg = body[body.index("fn fill_missing_fields("):]
+    seg = seg[:seg.index("\n}\n") + 2]
+    for k in ("ready_marker", "approval_patterns"):
+        need('"%s"' % k in seg, "계층 대상에 %s 누락" % k)
+    need("resolved.get(k).is_some()" in seg,
+         "디스크 선언(명시 null 포함) 존중 규칙 부재 — 사용자 주권 침해")
+    need("embedded_agents_json(" in body, "vendor 임베드 소스 부재(코드 기본값 계층 없음)")
+    # ② trust 패턴은 선언에서 읽고 **trust-prompt 항목만** 소비한다
+    need("fn trust_prompt_regex(" in body, "trust 패턴 선언 소비 함수 부재(하드코딩 잔존)")
+    tseg = body[body.index("fn trust_prompt_regex("):]
+    tseg = tseg[:tseg.index("\n}\n") + 2]
+    need('Some("trust-prompt")' in tseg, "trust-prompt 항목 한정 필터 부재(전 패턴 자동응답 위험)")
+    need("approval_patterns" in tseg, "패턴 소스가 approval_patterns 가 아니다")
+    # ③ agents.json 스키마 버전 + trust-prompt 선언 실재 + 자동응답 금지 계약 문구
+    aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
+    need(aj.get("_schema") == 2, "agents.json _schema 가 2 가 아니다(계층 계약 미표기): %r"
+         % aj.get("_schema"))
+    doc = aj.get("_doc", "")
+    need("trust-prompt" in doc and "자동응답" in doc,
+         "_doc 에 'trust-prompt 만 자동확인 · 그 외 자동응답 금지' 계약이 없다")
+    claude = aj.get("claude", {})
+    names = [p.get("name") for p in (claude.get("approval_patterns") or [])]
+    need("trust-prompt" in names, "claude 어댑터에 trust-prompt 선언이 없다(자동확인 불발)")
+    need(len([n for n in names if n != "trust-prompt"]) > 0,
+         "trust-prompt 외 패턴이 0건 — 'trust-prompt 만 소비' 계약의 대조군이 사라졌다")
+    # ④ 하드코딩 needle 은 **폴백으로만** 남는다 — 선언 패턴이 **먼저** 판정한다.
+    #    (needle 제거가 아니라 병존이 정답이다: 패턴 부재·컴파일 실패 시의 유일한 경로이고,
+    #     구 문면에 더 강건하다. 그래서 검체는 '제거'가 아니라 **순서**를 못박는다.)
+    need("fn trust_prompt_hit(" in body, "trust 판정 합성 함수 부재(순서 계약을 확인할 자리 없음)")
+    hseg = body[body.index("fn trust_prompt_hit("):]
+    hseg = hseg[:hseg.index("\n}\n") + 2]
+    need("re.is_match(" in hseg, "선언 패턴이 판정에 쓰이지 않는다(하드코딩 1차 잔존)")
+    need(hseg.index("re.is_match(") < hseg.index("trustthisfolder"),
+         "하드코딩 needle 이 선언 패턴보다 먼저 판정한다(선언 무력화)")
+    need("split_whitespace()" in hseg,
+         "정규식을 flat 텍스트에 돌린다 — 선언 패턴의 공백 의미가 깨져 자동확인이 불발한다")
+    calib = "skip(no-git)"
+    old = _git_show("src/bin/cys.rs")
+    if old is not None:
+        need("fn trust_prompt_regex(" not in old,
+             "계측 타당성 실패: 구 코드에 이미 선언 소비가 있다면 B19 는 결함이 아니다")
+        need("fn fill_missing_fields(" not in old,
+             "계측 타당성 실패: 구 코드에 이미 필드 계층이 있다면 C-1 은 결함이 아니다")
+        calib = "구 코드 하드코딩·whole-object 폴백 확인"
+    return "필드 계층 2키·디스크 존중 · trust-prompt 한정 소비 · _schema=2 · 계약 문구 · 계측검증=%s" % calib
+
+
+@specimen("H-PRED-10", "W4", "TCC 탐침 대상이 실자원(cwd+PACK)에서 파생", ["P3-A-TCC"])
+def h_pred_10():
+    """P3-A-TCC(RC3 — 계측기가 대상을 못 잰다): 부트의 macOS 폴더권한 탐침이 `~/Desktop`
+    **하드코딩**이었다. 부트가 실제로 읽는 자원은 (a) 이 세션의 작업 디렉터리 (b) 팩 디렉터리인데
+    탐침은 그 둘 중 아무것도 찌르지 않았다 → Desktop 을 안 쓰는 기계에선 거짓 경고, Documents·
+    프로젝트 폴더만 막힌 실제 사고에선 침묵(GUI perm-warning 보다도 좁았다).
+    ★계측: 격리 cwd·PACK 에서 함수를 **실제로 호출**해 반환 대상이 그 실자원에서 파생됨을 본다."""
+    probe = r'''
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+os.chdir(sys.argv[2])
+os.environ["CYS_PACK_DIR"] = sys.argv[3]
+import javis_bootstrap as b
+print(json.dumps({"targets": b._tcc_probe_targets(), "pack": b.PACK, "platform": sys.platform}))
+'''
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.path.join(tmp, "work dir")     # 공백 포함 — 경로 조립 취약성 동시 확인
+        pack = os.path.join(tmp, "pack-dept-x")
+        os.makedirs(cwd)
+        os.makedirs(pack)
+        r = _run([PY, "-c", probe, BIN_DIR, cwd, pack])
+        need(r.returncode == 0, "탐침 호출 실패: %s" % r.stderr[-400:])
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    paths = [p for p, _label in d["targets"]]
+    if d["platform"] == "darwin":
+        need(os.path.realpath(cwd) in paths, "작업 디렉터리(실자원)가 탐침 대상에 없다: %s" % paths)
+        need(os.path.realpath(pack) in paths, "팩(실자원)이 탐침 대상에 없다: %s" % paths)
+        need(all(isinstance(l, str) and l for _p, l in d["targets"]), "탐침 라벨 결손")
+        home_desk = os.path.realpath(os.path.expanduser("~/Desktop"))
+        need(home_desk not in paths, "Desktop 하드코딩 잔존: %s" % paths)
+    else:
+        need(d["targets"] == [], "비-darwin 에서 탐침이 동작한다(무동작 계약 위반)")
+    # 소스 규약: **탐침 함수 본문**에 Desktop 리터럴이 없다(주석 설명·self-test 대조군은 허용 —
+    # 결함을 설명한 문장과 '하드코딩이 아님'을 단언하는 self-test 까지 잡으면 문서화가 회귀가 된다).
+    src_bs = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need("_tcc_probe_targets(" in src_bs, "탐침 대상 파생 함수 부재")
+    fn_body = src_bs[src_bs.index("def _tcc_probe_targets("):]
+    fn_body = fn_body[:fn_body.index("\ndef ")]
+    # docstring(결함 설명)과 주석은 스캔에서 제외 — 결함을 설명한 문장을 회귀로 오보하지 않는다.
+    fn_body = _code_lines(fn_body[fn_body.index('"""', fn_body.index('"""') + 3) + 3:])
+    need("Desktop" not in fn_body, "탐침 함수 실행부에 Desktop 하드코딩 잔존")
+    need("os.getcwd()" in fn_body and "PACK" in fn_body,
+         "탐침 대상이 cwd·PACK 실자원에서 파생되지 않는다")
+    # 호출부도 파생 목록을 순회한다(단일 대상 하드코딩 재발 차단)
+    need("for _probe, _label in _tcc_probe_targets():" in src_bs,
+         "호출부가 파생 목록을 순회하지 않는다")
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_bootstrap.py")
+    if old is not None:
+        need('os.path.join(HOME, "Desktop")' in old,
+             "계측 타당성 실패: 구 코드에 Desktop 하드코딩이 없다면 이 검체는 무의미")
+        calib = "구 코드 Desktop 하드코딩 확인"
+    return "cwd+PACK 실측 파생(%d대상) · Desktop 리터럴 0 · 계측검증=%s" % (len(paths), calib)
 @specimen("H-TIME-1", "W2", "예산 parity Σ(하위 최악치)≤상위 + 냉시작 하한 fixture", ["B9"])
 def h_time_1():
     """B9: 예산 역전이 3중이었다(외부 상한 < 내부 최악치) — 상위 timeout 이 정상 진행 중인 하위를
@@ -3159,12 +3442,285 @@ def h_doc_6():
         need(oldbad, "계측 타당성 실패: 구 문서에 base 하드코딩이 없다면 이 검체는 무의미")
         calib = "구 문서 하드코딩 %d줄 확인" % len(oldbad)
     return "하드코딩 0줄 · §9 SESSION_STATE·RECOVERY·TODO 레인 파생 · 계측검증=%s" % calib
-pending("H-DOC-2", "W4", "'5노드'=REQUIRED_ROLES+1 파생", ["B18"])
-pending("H-DOC-3", "W4", "CEO_TEMPLATE 동사↔cys-dept 가드 허용 집합 대조", ["G6"])
-pending("H-DOC-4", "W4", "헤더 exit 표↔코드 상수 기계 대조 (결함 G31·G32 문구는 W0에서 수정 — 기계 대조 assert 는 CS-6 문서 정합 테스트=W4 산출)", ["G31", "G32"])
-pending("H-DOC-5", "W4", "generic reviewer 안내 문구 금지 (결함 G30 문구는 W0에서 수정 — assert 는 W4)", ["G30"])
-pending("H-DOC-7", "W4", "agents 스키마 완결성(vendor/user 계층)", ["B20"])
-pending("H-DOC-8", "W4", "팀 부트 진입점 전수 단일 계약", ["B5"])
+@specimen("H-DOC-2", "W4", "'노드 수' 표기가 REQUIRED_ROLES+1 파생(required 에 master 부재 유지)",
+          ["B18"])
+def h_doc_2():
+    """B18(RC6): 훅 note 가 `master·cso·worker·reviewer×2 (5노드)` 를 **리터럴**로 박아 두고,
+    판정 술어(REQUIRED_ROLES)는 그와 무관하게 진화했다 — 편성이 바뀌면 문서만 거짓이 된다.
+    ★금지 방향 ②: 숫자를 맞추려고 `REQUIRED_ROLES` 에 master 를 넣으면 check 의 required 가 master 를
+      요구하게 되고, 레거시 master 조합에서 **부트 전체가 사망**한다. master 는 안내에서만 +1 이다."""
+    orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
+    hook = _read(_hook("role-bootstrap.sh"))
+    # ① 파생 소스가 존재하고 master 는 required 밖이다
+    need("def team_roster_note(" in orch, "팀 구성 안내 파생 함수 부재(리터럴 잔존 위험)")
+    r = _run([PY, os.path.join(BIN_DIR, "javis_orchestra.py"), "--note-team-roster"])
+    need(r.returncode == 0 and r.stdout.strip(), "--note-team-roster 산출 실패: %s" % r.stderr[-300:])
+    note = r.stdout.strip()
+    # ② 실제 REQUIRED_ROLES 를 읽어 +1 파생인지 대조(숫자·역할명 전건)
+    probe = "import sys;sys.path.insert(0, sys.argv[1]);import javis_orchestra as o;" \
+            "print(repr(o.REQUIRED_ROLES))"
+    rr = _run([PY, "-c", probe, BIN_DIR])
+    need(rr.returncode == 0, "REQUIRED_ROLES 조회 실패: %s" % rr.stderr[-300:])
+    required = eval(rr.stdout.strip())          # 리스트 리터럴(신뢰 경계: 우리 코드 산출)
+    need("master" not in required,
+         "REQUIRED_ROLES 에 master 가 들어갔다 — 금지 방향 ②(레거시 master 부트 사망)")
+    need("총 %d노드" % (len(required) + 1) in note, "노드 수가 REQUIRED_ROLES+1 파생이 아니다: %s" % note)
+    for role in required:
+        need(role in note, "필수 역할 %s 가 안내에 없다: %s" % (role, note))
+    need(note.startswith("master·"), "안내가 master 로 시작하지 않는다: %s" % note)
+    # ③ 훅은 그 산출을 **인용**한다(자기 리터럴 금지)
+    code = _code_lines(hook)
+    need("--note-team-roster" in code, "훅이 파생 산출을 인용하지 않는다")
+    need("TEAM_ROSTER" in code, "훅에 로스터 변수 배선 부재")
+    need(not re.search(r"\d\s*노드", code), "훅 코드에 노드 수 리터럴 잔존: %s"
+         % re.findall(r".{0,30}\d\s*노드.{0,20}", code)[:3])
+    need(not re.search(r"reviewer×\d", code), "훅 코드에 리뷰어 개수 리터럴 잔존")
+    # ④ 파생 실패 시 조용히 빈 문구가 되지 않는다(loud 폴백)
+    need("로스터 모듈 미소비" in hook, "파생 실패 폴백 문구 부재(빈 안내로 조용히 퇴화)")
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+    if old is not None:
+        need(re.search(r"\(5노드\)", old),
+             "계측 타당성 실패: 구 훅에 '(5노드)' 리터럴이 없다면 B18 은 결함이 아니다")
+        calib = "구 훅 '(5노드)' 리터럴 확인"
+    return "파생=%s · required 에 master 부재 · 훅 리터럴 0 · 계측검증=%s" % (note[:48], calib)
+
+
+@specimen("H-DOC-3", "W4", "CEO_TEMPLATE 동사 ⊆ cys-dept 가드 허용 집합(지시-집행 통일)", ["G6"])
+def h_doc_3():
+    """G6(RC6): CEO_TEMPLATE 가 CEO 에게 `cys-dept launch/down` **직접 호출**을 지시했는데,
+    cys-dept 의 단일소유 가드는 `CYS_ROLE` 이 설정된 비-CSO 노드의 lifecycle 동사를 exit 7 로
+    거부한다. CEO 는 role=master 이므로 **지시대로 하면 항상 실패**한다(지시와 집행의 정면 모순).
+    이 검체는 문서가 지시하는 동사 집합이 가드가 허용하는 집합의 부분집합인지 기계 대조한다 —
+    문서·가드 어느 쪽이 바뀌어도 즉시 적색이 된다."""
+    tmpl_rel = os.path.join("cysjavis-pack", "directives", "CEO_TEMPLATE.md")
+    tmpl = _repo_file(tmpl_rel)
+    dept = _read(os.path.join(BIN_DIR, "cys-dept"))
+    # ① 가드가 막는 동사 집합을 **코드에서** 뽑는다(문서에 적힌 목록을 신뢰하지 않는다)
+    m = re.search(r"^\s*(launch\|[a-z|\-]+)\)\s*$", dept, re.M)
+    need(m is not None, "cys-dept 단일소유 가드의 동사 case 를 찾지 못했다(가드 형태 변경?)")
+    blocked = set(m.group(1).split("|"))
+    need({"launch", "down", "create", "rotate"} <= blocked,
+         "가드가 막는 집합이 예상보다 좁다(%s) — 검체 전제 재확인 필요" % sorted(blocked))
+    need("CYS_ROLE" in dept and "exit 7" in dept, "가드 판정 재료(CYS_ROLE·exit 7) 부재")
+    # ② 문서가 **호출 형태로** 지시하는 동사(`cys-dept <verb>`)를 뽑는다
+    used = set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", tmpl))
+    illegal = sorted(used & blocked)
+    need(not illegal,
+         "CEO_TEMPLATE 가 가드가 거부하는 동사를 직접 호출하도록 지시한다: %s "
+         "(GUI 부서 버튼 또는 CSO 위임 경유로 개정하라)" % illegal)
+    need(used, "문서에 cys-dept 사용 예가 0건 — 추출기 파손 의심(fail-closed)")
+    # ③ 대안 경로가 명시돼 있다(금지만 하고 대안이 없으면 문서가 막다른 길이 된다)
+    need("CSO" in tmpl and ("위임" in tmpl or "요청" in tmpl), "CSO 위임 경로 안내 부재")
+    need("GUI" in tmpl, "GUI 부서 버튼 경로 안내 부재")
+    need("exit 7" in tmpl, "가드 거부가 '계약'임을 문서가 알리지 않는다(버그로 오인)")
+    calib = "skip(no-git)"
+    old = _git_show(tmpl_rel)
+    if old is not None:
+        old_used = set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", old))
+        need(old_used & blocked,
+             "계측 타당성 실패: 구 문서가 이미 허용 동사만 썼다면 G6 은 결함이 아니다")
+        calib = "구 문서 위반 동사 %s 확인" % sorted(old_used & blocked)
+    return "문서 동사 %s ⊆ 허용(가드 차단 %d종) · 대안 2경로 명시 · 계측검증=%s" % (
+        sorted(used), len(blocked), calib)
+
+
+@specimen("H-DOC-4", "W4", "헤더 exit 표 ↔ 코드 상수 기계 대조", ["G31", "G32"])
+def h_doc_4():
+    """G31·G32(RC6): 헤더 산문의 exit 표가 코드 상수와 갈렸다(구 헤더 '2=preflight' 는 이미 없는
+    계약이었고, check 의 exit 2=판정 불가는 표에 없었다). 문구는 소비자의 **처방**을 결정하므로
+    틀린 표는 잘못된 조치를 유도한다. W0 이 문구를 고쳤고, 이 검체가 **기계 대조**를 상주시킨다."""
+    bs_path = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    body = _read(bs_path)
+    head = body[:body.index('"""', body.index('"""') + 3)]
+    # ① 코드 상수 EXIT_* → 값
+    consts = {int(v): k for k, v in re.findall(r"^(EXIT_[A-Z_]+)\s*=\s*(\d+)", body, re.M)}
+    need(len(consts) >= 10, "EXIT_* 상수 추출 %d건 — 추출기 파손 의심(fail-closed)" % len(consts))
+    # 상수 외에 **리터럴 return** 으로 나가는 exit 도 실재 계약이다(예: `issue-ticket` 사용오류 2).
+    # 유령 판정은 '코드에 그 값으로 나가는 경로가 아예 없는가' 여야 한다 — 상수만 보면 정상 문서를
+    # 오보한다(초안이 실제로 2 를 유령으로 잡았다).
+    literal_returns = {int(n) for n in re.findall(r"^\s+return (\d{1,2})\s*$", body, re.M)}
+    reachable = set(consts) | literal_returns
+    # ② 헤더 표에 적힌 값 → 코드에 그 값이 실재해야 한다(유령 exit 금지)
+    documented = {int(n) for n in re.findall(r"(?<![\w.])(\d{1,2})=", head)}
+    need(documented, "헤더 exit 표를 0건 추출 — 표 형식 변경(fail-closed)")
+    ghost = sorted(documented - reachable)
+    need(not ghost, "헤더가 코드에 없는 exit 를 문서화한다(유령 계약): %s" % ghost)
+    # ③ 반대로 게이트 exit 공간(2~11) 상수가 표에 있어야 한다(문서 결손 금지)
+    undocumented = sorted(v for v in consts if 2 <= v <= 11 and v not in documented)
+    need(not undocumented, "코드 exit 가 헤더 표에 없다(문서 결손): %s"
+         % [(v, consts[v]) for v in undocumented])
+    # ④ G31 회귀 핀: '2=preflight' 는 폐기된 계약이다(preflight 는 비치명).
+    #    ★규칙을 '문자열 부재'로 두면 **폐기 선언 자체를 쓸 수 없다**(문서가 결함을 설명 못 한다) →
+    #      H-DOC-1 의 `_no_wait_for_owner` 와 동형으로, 출현마다 근처에 부정 마커가 있어야 한다는
+    #      형태 규칙으로 판정한다(살아있는 계약 vs 폐기 인용의 구분).
+    for m in re.finditer(r"2\s*=\s*preflight", head):
+        win = head[max(0, m.start() - 60):m.end() + 60]
+        need(any(k in win for k in ("낡은", "폐기", "아니다", "금지")),
+             "구 계약 '2=preflight' 가 살아있는 계약으로 적혀 있다(G31 회귀): …%s…"
+             % win.replace("\n", " "))
+    need("preflight" in head and ("비치명" in head or "경고 강등" in head),
+         "preflight 비치명 계약이 헤더에 없다")
+    # ⑤ G32 회귀 핀: check exit 2(판정 불가)가 1(미기동)과 **분리**돼 문서화됐다
+    orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
+    ohead = orch[:orch.index('"""', orch.index('"""') + 3)]
+    need("판정 불가" in ohead, "orchestra 헤더에 check exit 2=판정 불가 서술 부재(G32)")
+    need("cys boot" in ohead and "cys ping" in ohead,
+         "처방 분기(2→ping / 1→boot)가 헤더에 없다 — 뭉개면 처방이 뒤집힌다")
+    need("EXIT_CHECK" in body and consts.get(6) == "EXIT_CHECK", "⑤check exit 상수 대응 이탈")
+    # ⑥ (W4) 소비 계약: `cys boot` 의 busy exit 가 3자 파리티다(python·Rust·lib)
+    need("CYS_BOOT_EXIT_BUSY = 75" in body, "python 소비부 busy exit 상수 이탈")
+    lib = os.path.join(REPO_DIR, "src", "lib.rs")
+    if os.path.isfile(lib):
+        need("pub const EXIT_BOOT_BUSY: i32 = 75;" in _read(lib),
+             "Rust lib 정본 busy exit 상수 이탈(파리티 붕괴)")
+    # ★계측 기준 = **W0 이전**(G31/G32 문구는 W0 이 고쳤다). 구 헤더에 '2=preflight' 유령 계약이
+    #   실재했음을 확인해 탐지기가 진짜 결함을 잡는 형태임을 증명한다.
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_bootstrap.py", ref=PRE_W0_REF)
+    if old is not None:
+        oldhead = old[:old.index('"""', old.index('"""') + 3)]
+        need(re.search(r"2\s*=\s*preflight", oldhead),
+             "계측 타당성 실패: W0 이전 헤더에 '2=preflight' 유령 계약이 없다면 G31 은 결함이 아니다")
+        calib = "W0 이전 헤더 '2=preflight' 유령 계약 확인"
+    return "exit 상수 %d종 ↔ 헤더 표 %d종 대조 · 유령 0·결손 0 · busy 파리티 · 계측검증=%s" % (
+        len(consts), len(documented), calib)
+
+
+@specimen("H-DOC-5", "W4", "generic reviewer 안내 문구 금지(로스터 역할명만)", ["G30"])
+def h_doc_5():
+    """G30(RC6): 안내문이 `cys claim-role <worker|cso|reviewer>` 라고 적어, 리뷰어가 generic
+    `reviewer` 로 등록하도록 유도했다. 그런데 orchestra check 는 **에이전트별 역할명**
+    (reviewer-gemini·reviewer-codex·대체 reviewer-claude-N)만 의무 좌석으로 인정한다 →
+    지시를 따른 노드가 '부재'로 판정돼 부트가 영구 실패한다(문서가 결함을 생산한 사례)."""
+    targets = [("hooks/session-start.sh", _read(_hook("session-start.sh"))),
+               ("directives/MASTER_DIRECTIVE.md",
+                _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md")))]
+    for rel, body in targets:
+        code = _code_lines(body)
+        bad = re.findall(r"claim-role\s+<?[a-z|]*\breviewer\b(?![-\w])", code)
+        need(not bad, "%s 에 generic reviewer 등록 안내 잔존: %s" % (rel, bad[:3]))
+        need("reviewer-gemini" in code and "reviewer-codex" in code,
+             "%s 에 에이전트별 리뷰어 역할명이 없다" % rel)
+    # 대체 슬롯·선택 슬롯까지 안내에 실재해야 한다(무구독 폴백 기계가 이름을 못 찾는 사고 차단)
+    ss = _read(_hook("session-start.sh"))
+    for name in ("reviewer-claude-1", "reviewer-claude-2", "reviewer-grok"):
+        need(name in ss, "session-start 안내에 %s 누락(폴백 로스터 이름 결손)" % name)
+    need("generic" in ss and ("실패" in ss or "못 보고" in ss),
+         "generic 등록이 왜 위험한지(판정 실패) 안내가 없다 — 금지만 하면 다시 쓴다")
+    # 로스터 이름의 정본은 코드다 — 안내에 적힌 이름이 REVIEWER_SLOTS 와 일치해야 한다
+    probe = "import sys;sys.path.insert(0, sys.argv[1]);import javis_orchestra as o;" \
+            "print(repr([r for s in o.REVIEWER_SLOTS for r in (s[0], s[2])]))"
+    rr = _run([PY, "-c", probe, BIN_DIR])
+    need(rr.returncode == 0, "REVIEWER_SLOTS 조회 실패: %s" % rr.stderr[-300:])
+    for role in eval(rr.stdout.strip()):
+        need(role in ss, "코드 로스터 역할 %s 가 안내에 없다(사본 드리프트)" % role)
+    calib = "skip(no-git)"
+    # ★계측 기준 = **W0 이전**(G30 문구는 W0 이 고쳤으므로 W0 착지 트리에서는 이미 정상이다)
+    old = _git_show("cysjavis-pack/hooks/session-start.sh", ref=PRE_W0_REF)
+    if old is not None:
+        need(re.search(r"claim-role\s+<?[a-z|]*\breviewer\b(?![-\w])", _code_lines(old)),
+             "계측 타당성 실패: W0 이전 안내에 generic reviewer 가 없다면 G30 은 결함이 아니다")
+        calib = "W0 이전 안내 generic reviewer 확인"
+    return "안내 2곳 generic 0 · 로스터 4종 정합 · 위험 고지 · 계측검증=%s" % calib
+
+
+@specimen("H-DOC-7", "W4", "agents 스키마 완결성(preflight C71 — 결손 의미 고지·vendor/user 계층)",
+          ["B20"])
+def h_doc_7():
+    """B20(RC6): 어댑터의 **선택 키 결손이 조용히 기능을 퇴화**시켰다(ready_marker 없음→readiness
+    시간폴백, resume_arg 없음→restore 가 대화기억 없이 fresh 기동 = 맥락 소실). 어느 것도 그
+    자체로 오류가 아니라서(grok 처럼 원래 없는 게 정상인 어댑터가 있다) 판정은 'FAIL' 이 아니라
+    **결손의 의미를 말하는 것**이어야 한다 — 그리고 가장 비싼 손실(resume_arg)만 WARN 으로 올린다.
+    ★W4a 착지분을 **검증**한다(재구현 아님)."""
+    pf = _read(os.path.join(BIN_DIR, "javis_preflight.py"))
+    need("C71" in pf, "preflight 에 C71 어댑터 스키마 체크 부재(B20 미착지)")
+    need("def c71_agents_schema(" in pf, "C71 구현 함수 부재")
+    need("OPTIONAL_KEY_MEANING" in pf, "결손 키 의미 표 부재(무음 퇴화 고지 불가)")
+    seg = pf[pf.index("OPTIONAL_KEY_MEANING"):]
+    seg = seg[:seg.index("KNOWN_AGENTS_SCHEMA")]
+    for key in ("ready_marker", "clear_cmd", "resume_arg", "approval_patterns"):
+        need('"%s"' % key in seg, "결손 의미 표에 %s 누락" % key)
+    # resume_arg **만** WARN 티어(WARN 남발은 신호를 죽인다)
+    rows = re.findall(r'\("([a-z_]+)",\s*"[^"]*",\s*(True|False)\)', seg)
+    need(rows, "의미 표 행 추출 0건 — 추출기 파손(fail-closed)")
+    warn_keys = sorted(k for k, w in rows if w == "True")
+    need(warn_keys == ["resume_arg"], "WARN 티어가 resume_arg 단독이 아니다: %s" % warn_keys)
+    # 스키마 버전 계층 인지: 알려진 버전 목록 + 미지 버전은 WARN(하위호환 유지)
+    need("KNOWN_AGENTS_SCHEMA" in pf, "알려진 스키마 버전 목록 부재")
+    need(re.search(r"KNOWN_AGENTS_SCHEMA\s*=\s*\(1,\s*2\)", pf),
+         "스키마 버전 목록이 (1, 2) 가 아니다 — agents.json _schema 와 파리티 확인 필요")
+    aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
+    need(aj.get("_schema") in (1, 2), "agents.json _schema 가 알려진 버전이 아니다")
+    need("cmd" in pf and "기동 불가" in pf, "필수 키(cmd) 결손이 FAIL 로 분리되지 않는다")
+    # vendor/user 계층 구분이 문서에 있다(★W-B 동결 정합 — 사용자 파일을 코드가 고치지 않는다)
+    need("_schema" in aj.get("_doc", "") and "vendor" in aj.get("_doc", ""),
+         "_doc 에 vendor/user 필드 계층 설명 부재")
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_preflight.py")
+    if old is not None:
+        need("C71" not in old,
+             "계측 타당성 실패: 구 preflight 에 이미 C71 이 있다면 B20 은 결함이 아니다")
+        calib = "구 preflight C71 부재 확인"
+    return "C71 실재·의미표 4키·WARN=resume_arg 단독·스키마(1,2) 파리티 · 계측검증=%s" % calib
+
+
+@specimen("H-DOC-8", "W4", "팀 부트 진입점 전수가 단일 계약(폴백 포함 typed 소비 + 강등 신호)", ["B5"])
+def h_doc_8():
+    """B5(RC1·RC3): 팀 부트 진입점이 셋(훅 체인 / GUI 버튼 / 산문 §0)이었고 GUI 만 **체인을
+    건너뛰어** 자기 판정을 가졌다 — 판정 재료가 stdout **산문 문자열**("신규 기동 0"·"미설치")이라
+    ①문구가 바뀌면 조용히 오작동하고 ②건강한 팀+grok 미설치에서 위경보가 났고(P3-B16)
+    ③claude 만 설치→리뷰어 0 은 무경고였다(R5) ④플랫폼 힌트 사본이 없어 macOS 명령을 Windows
+    사용자에게 안내했다(P3-B15).
+    ★목표는 '단일 진입점'이 아니라 **'단일 계약 + 명시 강등'**(비평2 D-4): 경로는 둘이어도
+      (1차=체인 / 폴백=`cys boot --json` 직접) 판정 계약은 하나이고, 강등은 typed 신호로 기록된다."""
+    gui_rel = os.path.join("src-tauri", "src", "main.rs")
+    gui_path = os.path.join(REPO_DIR, gui_rel)
+    if not os.path.isfile(gui_path):
+        raise Skip("레포 체크아웃 아님(배포 팩) — GUI 소스 부재")
+    gui = _read(gui_path)
+    seg = gui[gui.index("fn spawn_orchestra_boot"):]
+    seg = seg[:seg.index("\nfn emit_boot_signal")]
+    # ① 1차 = 훅과 **같은 체인**
+    need("javis_bootstrap.py" in seg, "GUI 1차 경로가 부트 체인이 아니다(B5 미착지)")
+    need('.arg("run")' in seg, "체인 서브커맨드(run) 호출 부재")
+    need("inject_runtime_path" in seg, "동봉 runtime PATH 주입 부재(Windows 에서 python 해소 실패)")
+    # ② 폴백 = cys boot --json 직접 + typed 강등 신호(조용한 강등 금지)
+    need('.arg("boot")' in seg and '.arg("--json")' in seg, "폴백이 typed 계약을 소비하지 않는다")
+    need('"boot-degraded"' in seg, "강등이 조용하다(typed 신호 부재)")
+    # ③ 산문 매칭 전폐(구 판정 재료 재도입 차단)
+    for banned in ("신규 기동 0", 'contains("미설치")'):
+        need(banned not in seg, "산문 문자열 매칭 재도입: %s" % banned)
+    # ④ 경고 규율: mandatory 실패만 경고 · install_hint 그대로 · busy 는 정보
+    need("fn boot_json_fatal_message(" in gui, "typed role 표 판정 함수 부재")
+    fseg = gui[gui.index("fn boot_json_fatal_message("):]
+    fseg = fseg[:fseg.index("\n}\n") + 2]
+    need('"mandatory"' in fseg, "mandatory 필드를 보지 않는다(Degrade 위경보 재발)")
+    need('Some("failed") | Some("missing")' in fseg, "outcome 타입 판정이 아니다")
+    need('"install_hint"' in fseg, "install_hint 를 표출하지 않는다(플랫폼 사본 부활 위험)")
+    need("EXIT_BOOT_BUSY" in gui, "busy exit 를 별도 분기하지 않는다(중첩 부트 위경보)")
+    need("enum BootSignal" in gui, "신호 등급 타입 부재 — 조용한 실패를 타입으로 막지 못한다")
+    # ⑤ 진입점 전수: 훅·산문도 같은 체인을 가리킨다(산문이 개별 명령 재현을 지시하지 않는다)
+    hook = _read(_hook("role-bootstrap.sh"))
+    need("javis_bootstrap.py" in hook, "훅이 체인을 발화하지 않는다")
+    md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
+    need("javis_bootstrap.py" in md and ("수동 재현 금지" in md or "산문 체인" in md),
+         "§0 이 체인 단일 계약을 가리키지 않는다")
+    # ⑥ 소비부(python)도 같은 typed 계약(outcome·mandatory)을 읽는다
+    bs = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need('"failed", "missing"' in bs and '"mandatory"' in bs,
+         "python 소비부 판정이 typed 계약이 아니다")
+    need("_boot_was_busy(" in bs, "python 소비부가 busy(무스폰)를 분기하지 않는다(티켓 소각 위험)")
+    calib = "skip(no-git)"
+    old = _git_show(gui_rel)
+    if old is not None:
+        need("신규 기동 0" in old,
+             "계측 타당성 실패: 구 GUI 에 산문 매칭이 없다면 B5 는 결함이 아니다")
+        need("javis_bootstrap.py" not in old.split("fn spawn_orchestra_boot")[1][:3000]
+             if "fn spawn_orchestra_boot" in old else True,
+             "계측 타당성 실패: 구 GUI 가 이미 체인을 썼다면 통일이 결함이 아니다")
+        calib = "구 GUI 산문 매칭·체인 미사용 확인"
+    return "1차=체인·폴백=--json·강등 typed · mandatory 한정 경고 · 진입점 4곳 정합 · 계측검증=%s" % calib
 # ═══════════════════════════════════════════════════════════════════════════
 # W3 발효: 시드·등록·수명주기·레인 (H-SEED-1~5 · H-LIFE-1~2)
 # ═══════════════════════════════════════════════════════════════════════════

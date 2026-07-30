@@ -115,6 +115,32 @@ pub fn pack_dir() -> PathBuf {
     }
 }
 
+/// 소켓 경로 → 그 레인의 팩 경로(결정론 유도 · G34).
+///
+/// 규약: 부서 소켓은 경로 성분(unix 부모 디렉터리 / windows 파이프명)에 `cys-dept-<name>` 을 갖고,
+/// 그 부서의 팩은 `~/.cys/pack-dept-<name>` 이다 — `cys-dept` 의 `dept_sock`/`dept_pack`
+/// 명명 규약과 **동일 소스 규칙**(cysjavis-pack/bin/cys-dept:40-44). 부서명이 비면(`cys-dept-`)
+/// 불량 레인이므로 None(javis_bootstrap `_socket_malformed_dept` 와 동일 판정).
+///
+/// ★W4 에서 `cys.rs` 로컬 함수에서 **lib 로 승격**했다(중복 구현 금지). 소비자가 둘이 됐기
+/// 때문이다: ⓐCLI autostart 의 (소켓,팩) 쌍 보증(`cys.rs::ensure_daemon_lane_pack`) ⓑGUI 의
+/// 부서장 기동(`src-tauri/main.rs::start_dept_master` — CYS_SOCKET 만 주입하면 데몬이 **본부 팩**을
+/// 물려받아 그 부서 부트가 레인↔팩 가드에 exit 8 로 영구 차단된다: G34 의 GUI 지점).
+/// 같은 규칙을 두 크레이트에 두 번 쓰면 그것이 RC1(사본 드리프트)의 새 인스턴스가 된다.
+pub fn lane_pack_for_socket(socket: &Path) -> Option<PathBuf> {
+    let name = socket
+        .to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .find_map(|c| c.strip_prefix("cys-dept-").map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())?;
+    Some(
+        dirs::home_dir()?
+            .join(".cys")
+            .join(format!("pack-dept-{name}")),
+    )
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 선언 기반 todo 판정(Declared State)의 팩 정체성 — `todo_decl::classify`가 요구하는
 // `my_scope`와 `scope_exists`를 여기 한 곳에서 산출한다.

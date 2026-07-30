@@ -40,14 +40,22 @@ cys-dept list | while read d; do
 done
 ```
 
-## [새 부서 기동 시 — 기존 부서 비간섭 (절대)]
+## [부서 수명주기 — CEO는 직접 집행하지 않는다 (단일소유 강제)]
 
-- 새 부서 데몬을 띄울 때 **기존 부서의 데몬·surface·작업을 절대 건드리지 않는다.** `cys-dept launch <name>`이 새 (socket 디렉토리, pack_dir) 쌍을 신규 생성할 뿐이다.
+- **부서 생성·종료·회전·승격은 CEO가 직접 실행하지 않는다.** `cys-dept`의 lifecycle 동사(`launch`·`allocate`·`create`·`down`·`down-sock`·`rotate`·`reap`·`promote-ceo`)는 **CSO(`CYS_ROLE=cso`)와 GUI(오너 직접·role 없음) 전용**이며, CEO는 role=master 노드이므로 호출하면 단일소유 가드가 `exit 7`로 거부한다(다중주체 churn·빈 부서·중복·레이스 방지). 거부는 버그가 아니라 계약이다 — 우회(`CYS_ROLE` unset 등)는 금지.
+- 따라서 CEO의 정당한 경로는 둘뿐이다: ⓐ **GUI 부서 버튼**(오너가 직접 누르는 부서 생성·종료·정리) ⓑ **CSO 위임** — 필요를 판단해 CSO에게 요청한다.
+  ```bash
+  # ⓑ CSO 위임 (CEO가 직접 cys-dept 를 실행하는 대신)
+  cys send --to cso "[부서요청] 새 부서 '<name>' 생성 요청 — 목적: <미션>. 자원 게이트 확인 후 집행하고 결과 보고."
+  cys send-key --to cso Return
+  ```
+- **CEO가 직접 쓰는 `cys-dept`는 읽기 전용 동사뿐이다**: `cys-dept list`·`cys-dept sock <name>`(그리고 무변조인 `promote-if-pending --request-only`). 이 셋은 가드 면제이며 인벤토리·주소 해석에 쓴다.
+- 새 부서가 뜰 때 **기존 부서의 데몬·surface·작업은 절대 건드리지 않는다** — 새 (socket 디렉토리, pack_dir) 쌍이 신규 생성될 뿐이다(집행 주체가 CSO·GUI여도 이 불변식은 동일).
 - 파괴적·비가역 행동(부서 데몬 kill·close-surface·디렉토리 삭제) 전에는 오너 의도를 명시 확인. 추측 비가역 실행 금지.
 
 ## [자원 거버넌스]
 
-- 부서 데몬마다 watchdog·scheduler가 독립 가동되므로, 부서 수를 무한정 늘리지 않는다(자원 누적 주의). 유휴 부서는 `cys-dept down <name>`으로 정리.
+- 부서 데몬마다 watchdog·scheduler가 독립 가동되므로, 부서 수를 무한정 늘리지 않는다(자원 누적 주의). 유휴 부서는 **GUI 부서 버튼 또는 CSO 위임**으로 정리를 요청한다(CEO 직접 `down` 호출은 단일소유 가드가 거부 — 위 [부서 수명주기] 절).
 - 부서 간 자원 충돌(서버·load) 시 부서장들에게 조정 지시.
 
 ## [RSI 학습 루프 — 부서 작업용, CEO는 총괄]

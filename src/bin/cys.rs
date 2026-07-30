@@ -2,7 +2,8 @@
 //! 예: cys send --surface surface:31 "..." ; cys send-key --surface surface:31 Return
 
 use clap::{Parser, Subcommand};
-use cys::{key_to_bytes, parse_surface_ref, socket_path, surface_ref, ENV_SURFACE_ID};
+// ★EXIT_BOOT_BUSY 정본은 lib 상수다(GUI cys-app·python javis_bootstrap 과 3자 공유 — 사본 금지).
+use cys::{key_to_bytes, parse_surface_ref, socket_path, surface_ref, ENV_SURFACE_ID, EXIT_BOOT_BUSY};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -562,9 +563,11 @@ enum Command {
         cwd: Option<String>,
         /// 기계 판독 결과를 stdout 마지막 줄에 JSON 으로 낸다(B1·G11·G29·B8):
         /// `{"roles":[{"role","agent","outcome","mandatory","install_hint"}],"summary":{…}}`.
-        /// outcome ∈ launched | already_alive | busy | missing | failed | recovered.
-        /// ★bare exit 의미는 **구계약 유지**(0=Fatal 실패 없음 / 1=Fatal 실패) — busy 등의 타입
-        /// 구분은 이 필드로만 표현한다. exit 의미 전환은 GUI --json 소비 착지와 원자다(금지 방향 ⑧).
+        /// outcome ∈ launched | already_alive | busy | missing | failed | recovered |
+        /// skipped_unconfirmed.
+        /// ★(W4) bare exit 계약: **0 = Fatal 없음(Degrade-only 포함) · 1 = Fatal 실패(mandatory 역할의
+        /// failed·missing) · 75 = busy(다른 boot 가 락 보유 — 무스폰 skip)**. 세 의미가 분리돼 있으므로
+        /// 소비부는 `!success()` 하나로 판정하지 말고 75 를 별도 분기해야 한다(위경보 방지).
         #[arg(long)]
         json: bool,
     },
@@ -1081,22 +1084,79 @@ fn extract_bin<'a>(cmd: &'a str, fallback: &'a str) -> &'a str {
         .unwrap_or(fallback)
 }
 
+/// 데몬이 낸 오류가 **타이핑 가드 거부**인가 — 판정 근거는 lib 단일 소스 문구다.
+/// (와이어는 `error.message` 만 전달하므로 코드 문자열은 클라이언트에 도달하지 않는다 —
+///  그래도 둘 다 보는 이유는 미래에 코드가 전달되도록 바뀌어도 이 분기가 살아있게 하려는 것.)
+fn is_typing_guard_err(e: &str) -> bool {
+    e.contains(cys::MSG_TYPING_GUARD) || e.contains(cys::ERR_TYPING_GUARD)
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
+///
+/// ★T-0147-6(사람 입력 경합 · W4): `authoritative:true` 는 타이핑 가드를 면제하지만 **무조건이
+/// 아니다** — 데몬은 호출자 신원(`authoritative_caller_ok`)까지 확인하고, 그 확인이 안 되면
+/// (비-restore-root 자손·신원 미검증 경로) 가드가 그대로 집행돼 `typing_guard` 로 거부한다.
+/// 종전엔 그 거부가 그대로 Err 로 올라가 **주입 자체가 유실**됐다(오너가 그 순간 pane 에 타이핑
+/// 중이었다는 이유만으로 디렉티브가 안 들어갔다). 이제 **`--queued` 로 1회 전환**한다:
+///   · 큐 배달(`deliver_queued`)은 출력 조용 + 사람 입력 냉각 후 `Inject{cr_delay}` 로 넣는다 —
+///     즉 사람의 미완성 입력에 이어붙이거나 제출하는 최악 경로가 **구조적으로** 불가능하다.
+///   · 그래서 별도 Return 을 보내지 않는다(큐 배달이 CR 을 포함한다 — 이중 제출 금지).
+///   · 재시도는 **정확히 1회**다. 실패해도 여기서 더 밀지 않는다 — 멱등 재주입은 상위
+///     (`javis_boot_node` VERIFY 3분기)의 책임이고, 여기서 반복하면 중복 주입이 된다.
+/// ★W2 ack 검증과의 결합: 큐 전환은 '배달 예약'이므로 ack(awakened_at 래치)가 늦어질 수 있다.
+///   호출부(launch-agent)는 미확인을 **치명으로 올리지 않고** `directive_verified=false` 로
+///   상태화하므로(B14), 이 전환이 새 실패를 만들지 않는다. 중복 주입 0 은 위 '1회' 규칙이 보장.
 fn inject_text(sid: u64, text: &str) -> Result<(), String> {
     let wrapped = format!("\x1b[200~{text}\x1b[201~");
     // authoritative: 디렉티브·과업 주입은 타이핑 가드를 면제한다 — 막 기동한 에이전트
     // pane에 사람 미완성 입력이 없고, GUI 활성 pane의 사람-입력 잔향이 주입을 영구
     // 차단하던 경로(human is typing 무한)를 끊는다. ACL은 데몬에서 그대로 집행된다.
-    request(
+    match request(
         "surface.send_text",
         json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
-    )?;
+    ) {
+        Ok(_) => {}
+        Err(e) if is_typing_guard_err(&e) => {
+            eprintln!(
+                "[inject] 사람 입력 감지 — 입력을 멈추면 큐가 배달합니다(--queued 1회 전환, \
+                 {}) surface={}",
+                surface_ref(sid),
+                surface_ref(sid)
+            );
+            // ★래핑 주의: 큐 배달은 `WriteReq::Inject` 라 데몬이 **bracketed paste 를 스스로**
+            //   씌운다(state.rs writer arm). 여기서 `wrapped` 를 넣으면 이중 래핑이 되어 제어열이
+            //   본문에 섞인다 — 직접 경로(`Data`, 클라이언트가 래핑)와 규약이 다르므로 **원문**을
+            //   보낸다(`cys send --queued` 가 원문을 보내는 것과 동일).
+            request(
+                "surface.send_text",
+                json!({"surface_id": sid, "text": text, "queued": true,
+                       "from": "inject(typing_guard fallback)"}),
+            )?;
+            return Ok(()); // 큐 배달이 CR 을 포함한다 — 별도 Return 금지(이중 제출 방지)
+        }
+        Err(e) => return Err(e),
+    }
     std::thread::sleep(std::time::Duration::from_millis(800));
-    request(
+    match request(
         "surface.send_key",
         json!({"surface_id": sid, "key": "Return", "authoritative": true}),
-    )?;
-    Ok(())
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) if is_typing_guard_err(&e) => {
+            // 본문은 이미 직접 들어갔고 **제출만** 막혔다 — Return 만 큐로 1회 전환한다
+            // (send_key --queued 는 Return/Enter 전용이라 계약상 안전).
+            eprintln!(
+                "[inject] 사람 입력 감지 — 입력을 멈추면 큐가 배달합니다(제출 Return --queued 1회 전환) surface={}",
+                surface_ref(sid)
+            );
+            request(
+                "surface.send_key",
+                json!({"surface_id": sid, "key": "Return", "queued": true}),
+            )?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// "90s" / "20m" / "2h" / "1h30m" → 초
@@ -1312,22 +1372,11 @@ fn task_has_restart_on_failure(task: &str) -> bool {
 }
 
 /// 소켓 경로 → 그 레인의 팩 경로(결정론 유도 · G34).
-/// 규약: 부서 소켓은 경로 성분(unix 부모 디렉터리 / windows 파이프명)에 `cys-dept-<name>` 을 갖고,
-/// 그 부서의 팩은 `~/.cys/pack-dept-<name>` 이다 — `cys-dept` 의 `dept_sock`/`dept_pack`
-/// 명명 규약과 **동일 소스 규칙**(cysjavis-pack/bin/cys-dept:40-44). 부서명이 비면(`cys-dept-`)
-/// 불량 레인이므로 None(javis_bootstrap `_socket_malformed_dept` 와 동일 판정).
+/// ★W4: 구현은 **lib 단일 소스**(`cys::pack::lane_pack_for_socket`)로 승격됐다 — GUI(cys-app)도
+/// 같은 유도를 소비해야 하기 때문이다(main.rs `start_dept_master` = G34 의 GUI 지점).
+/// 여기 남은 얇은 별칭은 이 파일의 기존 호출부·회귀 테스트를 그대로 유지하기 위한 것이다.
 fn lane_pack_for_socket(socket: &std::path::Path) -> Option<std::path::PathBuf> {
-    let name = socket
-        .to_string_lossy()
-        .replace('\\', "/")
-        .split('/')
-        .find_map(|c| c.strip_prefix("cys-dept-").map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())?;
-    Some(
-        dirs::home_dir()?
-            .join(".cys")
-            .join(format!("pack-dept-{name}")),
-    )
+    cys::pack::lane_pack_for_socket(socket)
 }
 
 /// ★G34(W3): (소켓, 팩) **쌍 보증** — 부서 소켓으로 데몬을 띄우면서 본부 팩을 물려주는 것을 막는다.
@@ -4914,7 +4963,10 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             g
         }
         BootLock::Busy => {
-            println!("cys boot — 다른 boot 진행 중(락 보유) — 중복 스폰 방지로 skip (그 boot가 팀을 세움)");
+            println!(
+                "cys boot — 다른 boot 진행 중(락 보유) — 중복 스폰 방지로 skip (그 boot가 팀을 세움) \
+                 · exit {EXIT_BOOT_BUSY}(busy=무스폰)"
+            );
             if as_json {
                 let roles: Vec<Value> = BOOT_PLAN
                     .iter()
@@ -4931,7 +4983,8 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                        "fatal_failed": 0, "lock": "busy"}})
                 );
             }
-            return 0;
+            // ★(W4) busy 는 0 이 아니다 — 무스폰이므로 소비부가 '팀을 세웠다'로 읽으면 안 된다.
+            return boot_exit_code(0, true);
         }
     };
     let agents: Value = std::fs::read_to_string(cys::pack::pack_dir().join("agents.json"))
@@ -5064,6 +5117,14 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                         // reclaim 이 좌석을 못 비웠다(hold 판정 포함) — 새 스폰은 claim_denied/litter 뿐이다.
                         println!("· {agent}: reclaim 후에도 좌석 잔존 — 스폰 보류(수동 점검 필요)");
                         failed += 1;
+                        // ★(W4) 의무 역할이면 **Fatal 계상**한다. 종전엔 이 분기만 fatal_failed 를
+                        //   빼먹어, `failed` 를 보던 구 exit 계약에서는 1 이 나갔지만 새 계약
+                        //   (fatal_failed → exit 1)에서는 **exit 0(성공)**으로 접히는 fail-open 이
+                        //   된다. `--json` outcome=failed+mandatory 는 이미 Fatal 로 소비되므로
+                        //   (javis_bootstrap._boot_fatal_verdict) exit 과 JSON 이 갈리는 것도 막는다.
+                        if *mandatory {
+                            fatal_failed += 1;
+                        }
                         outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
                                              "mandatory": mandatory,
                                              "reason": "죽음 확정 좌석을 node-recover·reclaim 으로도 해소 못 함",
@@ -5103,20 +5164,35 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                "fatal_failed": fatal_failed, "lock": "acquired"}})
         );
     }
-    // ★★bare exit 은 **구계약을 그대로 유지**한다: `launch 실패 > 0 → 1, 그 밖 0`
-    //   (미설치는 종전처럼 exit 에 반영하지 않는다). 금지 방향 ⑧ — busy·mandatory 같은 새 의미를
-    //   bare exit 에 실으면 **아직 --json 을 소비하지 않는 GUI**(main.rs 가 stdout 문자열 +
-    //   `!status.success()` 로 경보를 판정)의 판정이 조용히 바뀐다. exit 의미 전환은 W4 의 GUI
-    //   --json 소비 착지와 **원자**여야 한다.
-    //   B1(리뷰어 실패가 팀 전체 부트 실패로 번지는 데드엔드)과 G29(의무 CLI 미설치≠성공)는
-    //   exit 가 아니라 **typed --json(outcome·mandatory)** 로 전달되고, 그 승격 판정은 소비부
-    //   `javis_bootstrap._boot_fatal_verdict` 가 한다 — 생산자/소비자 계약이 한 웨이브에 함께 있다.
-    if failed > 0 {
+    // ★★(W4) bare exit **의미 전환** — GUI `--json` 소비와 **동일 커밋**(하드 제약 6-⑧).
+    //   구계약: `launch 실패>0 → 1 / 그 밖 0`. busy 도 0, 리뷰어 1종 실패도 1 이었다 —
+    //   즉 "재시도하면 되는 상황"과 "팀이 없는 상황"과 "선택 노드만 빠진 상황"이 한 값에 뭉개져
+    //   있었다(RC2 의미 융합). 이제 세 의미를 분리한다:
+    //     · busy(다른 boot 가 락 보유)   → EXIT_BOOT_BUSY(75 = EX_TEMPFAIL) — **무스폰**이다.
+    //       0 을 주면 소비부가 '팀을 세웠다'로 읽어 CEO 티켓을 소각한다(G11 의 그 사고).
+    //     · Fatal 실패(mandatory 역할의 failed·missing) → 1 — 팀의 최소 실행 단위가 없다.
+    //     · Degrade-only(선택·리뷰어만 실패/미설치)  → 0 — 대체 폴백·익명 peer-review 로 보완
+    //       가능하며, ⑤check 가 최종 게이트다(B1 데드엔드 재발 금지).
+    //   exit 은 `--json` 의 typed 판정과 **같은 사실**을 낸다: exit 1 ⟺ mandatory 중 failed|missing
+    //   존재(= `javis_bootstrap._boot_fatal_verdict` 의 판정). 두 채널이 갈리면 fail-open 이 생긴다
+    //   (Rust 테스트 `boot_exit_matches_json_fatal_verdict` 가 이 동등성을 박제).
+    boot_exit_code(fatal_failed, false)
+}
+
+/// `cys boot` bare exit 판정의 **순수 함수**(W4) — 0/1/75 세 의미의 단일 소유자.
+/// run_boot 의 두 종료 지점(busy skip · 정상 종료)이 모두 이것을 통과하므로, 의미가 코드 두 곳에
+/// 흩어지지 않는다. 회귀 테스트(`boot_exit_matches_json_fatal_verdict`)가 --json 의 Fatal 판정
+/// (mandatory && outcome ∈ {failed, missing})과 **같은 사실**을 내는지 박제한다.
+fn boot_exit_code(fatal_failed: usize, busy: bool) -> i32 {
+    if busy {
+        EXIT_BOOT_BUSY
+    } else if fatal_failed > 0 {
         1
     } else {
         0
     }
 }
+
 
 /// 죽음 확정 좌석의 reclaim 에스컬레이션 — 팩 헬퍼(`javis_boot_node.py --reclaim`)에 위임한다.
 /// ★왜 위임인가: reclaim 은 kill 을 포함한 **파괴 행위**이고, 그 안전 판정(`_reclaim_verdict` 의
@@ -12040,6 +12116,77 @@ mod tests {
         assert!(cys::is_dept_socket(std::path::Path::new(
             "/Users/x/.local/state/cys-dept-dept-2/cys.sock"
         )));
+        // ★W4: 구현은 lib 단일 소스다 — GUI(cys-app)가 같은 함수를 쓴다(사본 드리프트 봉인)
+        assert_eq!(
+            lane_pack_for_socket(std::path::Path::new("/x/cys-dept-ceo/cys.sock")),
+            cys::pack::lane_pack_for_socket(std::path::Path::new("/x/cys-dept-ceo/cys.sock")),
+            "cys.rs 별칭과 lib 정본의 판정이 갈렸다(중복 구현 재발)"
+        );
+    }
+
+    /// ★W4(하드 제약 6-⑧) `cys boot` bare exit **의미 전환** 계약 박제.
+    /// exit 은 `--json` 의 Fatal 판정과 **같은 사실**을 내야 한다: 1 ⟺ mandatory 중 failed|missing.
+    /// busy 는 그 어느 쪽도 아니므로 별도 값(75)이고, Degrade-only 는 0 이다(B1 데드엔드 금지).
+    #[test]
+    fn boot_exit_matches_json_fatal_verdict() {
+        // ① 세 의미가 서로 다른 값이다(뭉개짐 금지)
+        assert_eq!(boot_exit_code(0, false), 0, "Fatal 0건 = 성공(Degrade-only 포함)");
+        assert_eq!(boot_exit_code(1, false), 1, "Fatal 1건 = 1");
+        assert_eq!(boot_exit_code(3, false), 1, "Fatal 다건도 1(개수 아님·의미)");
+        assert_eq!(boot_exit_code(0, true), EXIT_BOOT_BUSY, "busy = 별도 비0");
+        // ② busy 는 성공(0)·Fatal(1) 과 겹치지 않고, clap 사용오류(2)·EX_USAGE(64)와도 다르다
+        assert_eq!(EXIT_BOOT_BUSY, 75, "EX_TEMPFAIL(75) 고정 — python·GUI 소비부와 파리티");
+        for reserved in [0, 1, 2, 64] {
+            assert_ne!(EXIT_BOOT_BUSY, reserved, "busy 값이 예약 exit 과 충돌: {reserved}");
+        }
+        // ③ busy 는 fatal 계수와 무관하게 busy 다(락을 못 잡았으면 아무 역할도 시도하지 않았다)
+        assert_eq!(boot_exit_code(9, true), EXIT_BOOT_BUSY);
+        // ④ --json Fatal 판정 규칙과의 동등성 — 같은 fixture 를 양쪽 규칙으로 판정한다.
+        //    (python 소비부 `_boot_fatal_verdict` 와 문자 그대로 같은 술어: mandatory ∧ failed|missing)
+        let fatal_rule = |roles: &[Value]| -> usize {
+            roles
+                .iter()
+                .filter(|r| {
+                    r["mandatory"].as_bool().unwrap_or(false)
+                        && matches!(r["outcome"].as_str(), Some("failed") | Some("missing"))
+                })
+                .count()
+        };
+        let degrade_only = vec![
+            json!({"role":"cso","outcome":"launched","mandatory":true}),
+            json!({"role":"reviewer-grok","outcome":"missing","mandatory":false}),
+            json!({"role":"reviewer-gemini","outcome":"failed","mandatory":false}),
+        ];
+        assert_eq!(boot_exit_code(fatal_rule(&degrade_only), false), 0);
+        let fatal = vec![
+            json!({"role":"cso","outcome":"missing","mandatory":true}),
+            json!({"role":"worker","outcome":"launched","mandatory":true}),
+        ];
+        assert_eq!(boot_exit_code(fatal_rule(&fatal), false), 1);
+        // skipped_unconfirmed(죽음 미확정 보류)는 Fatal 이 아니다 — 파괴·스폰 둘 다 안 한 상태
+        let unconfirmed = vec![json!({"role":"cso","outcome":"skipped_unconfirmed","mandatory":true})];
+        assert_eq!(boot_exit_code(fatal_rule(&unconfirmed), false), 0);
+    }
+
+    /// ★T-0147-6: 타이핑 가드 거부 판정이 **lib 단일 소스 문구**로 이뤄지는지.
+    /// 와이어는 `error.message` 만 전달하므로 이 매처가 깨지면 `--queued` 폴백이 조용히 죽는다.
+    #[test]
+    fn typing_guard_matcher_binds_to_shared_message() {
+        assert!(is_typing_guard_err(cys::MSG_TYPING_GUARD), "정본 메시지 미매칭");
+        assert!(is_typing_guard_err(cys::ERR_TYPING_GUARD), "정본 코드 미매칭");
+        // 실제 클라이언트가 받는 형태(데몬 message 그대로)
+        assert!(is_typing_guard_err(
+            "human is typing in this pane; retry later or use --queued"
+        ));
+        // 다른 거부는 절대 큐 전환을 트리거하지 않는다(오폴백 금지)
+        for other in [
+            "acl_denied: external→worker deny",
+            "surface process has exited",
+            "queue_full: pending queue cap (100) reached",
+            "clear_first_unsupported",
+        ] {
+            assert!(!is_typing_guard_err(other), "무관 오류가 큐 전환을 유발: {other}");
+        }
     }
 
     #[test]

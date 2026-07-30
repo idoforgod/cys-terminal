@@ -286,6 +286,27 @@ def effective_required_roles(detect=None, agents=None):
     return ["cso", "worker"] + [e["role"] for e in reviewer_roster(detect, agents)]
 
 
+# ─────────────────── B18: 팀 구성 안내 문구의 단일 파생 소스 (H-DOC-2) ───────────────────
+def team_roster_note(required=None):
+    """훅 note·문서가 인용할 '완료 = 무엇이 떠야 하나' 한 줄. **하드코딩 금지**.
+
+    ★B18(재감사 P3 · RC6): 훅 note 가 `master·cso·worker·reviewer×2 (5노드)` 를 **리터럴**로
+      박아 놓고, 판정 술어(`REQUIRED_ROLES` / `effective_required_roles`)는 그와 무관하게
+      진화했다 — 편성이 바뀌면 문서만 거짓이 되는 사본 드리프트(P3-A-120S 의 문서면과 동형).
+      숫자·역할명을 **여기서 파생**해 소비처는 인용만 한다.
+    ★금지 방향 ②(하드 제약 6): `REQUIRED_ROLES` 에 master 를 넣어 이 숫자를 맞추는 것은
+      **금지**다 — check 의 required 집합이 master 를 요구하면 레거시 master(자기 좌석을
+      스스로 세지 못하는 구 데몬 조합)에서 부트 전체가 사망한다. master 는 '선언한 자기 자신'
+      이므로 required 밖에 있는 것이 정상이고, 안내 문구에서만 `+1` 로 합산한다.
+    ★감지 미호출: `REQUIRED_ROLES`(표준 상수)만 읽는다 — 훅 발화 경로의 안내 1줄을 위해
+      `cys agent-detect` 서브프로세스를 띄우지 않는다(발화 지연 0). 대체 슬롯 치환 가능성은
+      문구로 고지한다(로스터 실체는 ⑤check 가 판정).
+    """
+    roles = ["master"] + list(REQUIRED_ROLES if required is None else required)
+    return ("%s (필수 역할 전원+master — 총 %d노드 · 리뷰어는 미감지 시 Claude 대체 슬롯으로 치환)"
+            % ("·".join(roles), len(roles)))
+
+
 # ★팩 경로 env 키의 우선순위 목록(W14 S19). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
 # **같은 목록·같은 순서**여야 한다 — `tests/test_todo_shared_constants.py`가 기계 대조한다.
 # 종전에는 이 목록이 3종으로 갈려 있었고, `cys todo-path`가 `AITERM_JARVIS_DIR`를 인식하지
@@ -2101,6 +2122,19 @@ def cmd_self_test(args):
         assert effective_required_roles(detect=yes, agents=synth_ag) == REQUIRED_ROLES, \
             "감지 시 유효 의무역할이 표준과 불일치"
 
+        # ── B18: 팀 구성 안내 파생(H-DOC-2) — 리터럴 금지·master 는 required 밖 ──
+        assert "master" not in REQUIRED_ROLES, \
+            "REQUIRED_ROLES 에 master 가 들어갔다(금지 방향 ② — 레거시 master 부트 사망)"
+        _note = team_roster_note()
+        assert _note.startswith("master·"), "팀 구성 안내가 master 로 시작하지 않는다"
+        assert "총 %d노드" % (len(REQUIRED_ROLES) + 1) in _note, \
+            "노드 수가 REQUIRED_ROLES+1 파생이 아니다: %s" % _note
+        for _r in REQUIRED_ROLES:
+            assert _r in _note, "필수 역할 %s 가 안내에서 누락" % _r
+        # 편성이 바뀌면 숫자·역할명이 **따라 움직인다**(사본 드리프트 불가능성 증명)
+        _n3 = team_roster_note(required=["cso", "worker"])
+        assert "총 3노드" in _n3 and "reviewer" not in _n3, "안내가 편성 변화를 따르지 않는다: %s" % _n3
+
         # ── 무음실패 카탈로그 배터리 (OpenMontage D5 2부 — render·무점수·드리프트) ──
         sf_ids = [s["id"] for s in SILENT_FAILURES]
         for must in ("SF-GATE-SCORE-FIELD", "SF-DENY-CHARTER-EDIT",
@@ -2309,6 +2343,11 @@ def main():
     # preflight 호환: `--self-test`는 subcommand 없이도 동작해야 한다(가로채기).
     if "--self-test" in sys.argv:
         return cmd_self_test(None)
+    # ★B18(H-DOC-2): 훅 note·문서가 인용할 팀 구성 1줄. subcommand 공간을 늘리지 않고
+    #   `--self-test` 와 동일한 가로채기 관례를 쓴다(javis_budget --note-check-window 대칭).
+    if "--note-team-roster" in sys.argv:
+        print(team_roster_note())
+        return 0
     ap = argparse.ArgumentParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
