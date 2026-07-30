@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cys:schemas/verify_spec_schema.json",
+  "title": "cys task verify_spec — single machine SOT (Phase 1 T1 · DESIGN-DECISIONS §1-1)",
+  "description": "태스크 verify_spec 필드의 기계강제 리터럴 단일진실. javis_task.py set-verify-spec/checkout 게이트가 런타임에 MODE_ENUM·TOP_KEYS·PASS_RULE 계약을 여기서 로드한다(부재 시 인라인 폴백 — verdict_schema.json 관례). 판정 어휘는 신설하지 않는다: 판정 3치 = actprobe PASS/FAIL/INDET 수렴(G6 — 제3 어휘 금지), 도구별 exit 는 pass_rule.exit_map 필드로 흡수한다(D11 — 단일 exit 어휘 신설 금지). probe.name 은 닫힌 enum 이 아니라 개방 집합이다(D11 — probe_runs.jsonl 이 이미 이중 생산자: actprobe 5종 + javis_task task-audit). 점수·비용 키(score/grade/rating/usd/cost/price)는 어느 깊이든 금지(reward-hack 차단 — javis_manifest 관례). 작성 3분할(조건 27): 선언=master · 하네스/calibrate=워커 · 봉인·승인=master(운영 규약+approver 병기 — 자기신고 한계는 BRIEF_CONTRACT 에 자인). verify_spec 게이트 통과는 필요조건(FLOOR)일 뿐 리뷰어 라운드·gate-status 4자 수렴을 대체하지 않는다(조건 30①).",
+
+  "SCHEMA_VERSION": 1,
+
+  "MODE_ENUM": ["command", "procedural", "probe", "waiver"],
+
+  "TOP_KEYS": ["schema_version", "mode", "cmd", "cwd", "pass_rule", "probe", "procedural", "waiver_ref", "timeout_s", "n_of_m", "harness_ref", "calibrated", "risk", "template", "template_origin"],
+
+  "REQUIRED_TOP": ["mode"],
+
+  "MODE_REQUIRED": {
+    "command": ["cmd", "pass_rule"],
+    "procedural": ["procedural"],
+    "probe": ["probe"],
+    "waiver": ["waiver_ref"]
+  },
+
+  "PASS_RULE_KEYS": ["kind", "pass_exits", "fail_exits", "indet_exits", "needle", "expr"],
+  "PASS_RULE_KIND_ENUM": ["exit_map", "output_contains", "json_check"],
+
+  "PROBE_KEYS": ["name", "args"],
+  "probe_open_set_note": "probe.name 은 개방 집합(D11) — actprobe DISPATCH 5종(submit/kill-preflight/artifact/verdict-match/ctx-compare)과 task-audit 등 확장 생산자를 닫힌 enum 으로 핀하지 않는다. 실행 판정은 actprobe exit(0=PASS/2=FAIL/3=INDET) 흡수.",
+
+  "PROCEDURAL_KEYS": ["tool", "artifact_path", "phase", "criteria", "report_path"],
+  "PROCEDURAL_TOOL_ENUM": ["check-criteria", "factcheck"],
+  "PROCEDURAL_TOOL_REQUIRED": {
+    "check-criteria": ["artifact_path", "phase", "criteria"],
+    "factcheck": ["report_path"]
+  },
+  "procedural_note": "실도구 입력 정합(R1-contract): check-criteria 는 manifest(criteria[] 인라인)+--phase+--artifact 3요소, factcheck 는 report 경로만(javis_factcheck_gate.evaluate(text) import 재사용).",
+
+  "CRITERIA_KIND_ENUM": ["citation_present", "contradiction_flagged", "min_sources", "section_present", "no_unsupported_claims", "json_valid", "field_present", "min_items"],
+  "CRITERIA_KEYS": ["kind", "value", "statement"],
+  "criteria_note": "javis_manifest CHECK_KINDS 8종 닫힌 enum 핀(file_exists 없음 — 콘텐츠 강제). 이 목록이 javis_manifest.CHECK_KINDS 와 갈리면 계약 드리프트다.",
+
+  "N_OF_M_KEYS": ["n", "m"],
+
+  "RISK_KEYS": ["class", "signed_by", "signed_at"],
+  "risk_note": "T1 은 risk.class='auto' 기록만(필드·훅 지점 예약) — 위험 어휘 4종(삭제·네트워크·서버기동·push생산) 검사와 서명 전이는 Wave B2 소관(조건 07①·30③).",
+
+  "VERDICT_ENUM": ["PASS", "FAIL", "INDET"],
+
+  "TIMEOUT_S_DEFAULT": 10,
+
+  "SCORE_BAN": "score|grade|rating|usd|cost|price (어느 깊이든 금지 — reward-hack·비용 채널 차단, javis_manifest BANNED_KEY_RE 관례)",
+
+  "waiver_note": "mode=waiver 는 javis_waiver 레코드 재사용(만료일 필수·silent 연장 불가). 소비측(checkout 게이트)은 waivers.jsonl 직접 판독 + javis_waiver 만료 판정(날짜 산술) import 재사용. 만료 48h 유예 = 만료일+2일 날짜 산술(조건 16③) — 유예 중 WARN 통과, 경과 시 차단."
+}

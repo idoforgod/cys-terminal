@@ -14,11 +14,31 @@
 상태 저장: $JAVIS_ROOT/_round/tasks/<id>.json (쓰기는 temp+os.replace 원자적)
 락:        $JAVIS_ROOT/_round/tasks/<id>.lock/ (디렉터리 = mkdir 원자성) + owner.json
 
-exit codes: 0 ok · 2 usage · 3 not found · 4 blocked · 5 no evidence(W0-3·E1 artifact) · 8 duplicate origin · 9 conflict(409)
+exit codes: 0 ok · 1 self-test 실패 · 2 usage · 3 not found · 4 blocked ·
+            5 no evidence(W0-3·E1 artifact) · 6 verify-spec missing(T1 게이트) ·
+            8 duplicate origin · 9 conflict(409)
 
 T0a(2026-07-13 · attention-p0 승인): W0-3 evidence 게이트·W2-1 전이표·W1-2 handoff 리마인더를
 omc-w2 라인에서 이식 복원 — 문서화된 운영 계약(CLAUDE.md)과 라이브 코드의 분기 봉합.
 버전CAS·lease renew·서킷 등 W2 심층 기능 재통합은 T0b(후속 티켓) 범위.
+
+T1(Phase 1 Wave A · DESIGN-DECISIONS §1): verify_spec checkout 게이트.
+- exit 6 계약(조건 02①·16④): 'exit 6 = verify_spec 부재: **재시도 금지**, 워커는 push 금지,
+  javis_wakeup enqueue --to master --task verify-spec-missing-<id> --idempotency-key <task_id>
+  로만 통지(태스크당 1회 병합)' — 거부 통지는 이 코드가 same-run drain --deliver 짝과 함께
+  자동 수행한다(실패 무해 통과 · pending 잔류 시 후속 drain 편승 배달). 병합=pending 창+
+  <id>.verify-notified 마커 창(TTL 24h) 2중 — 배달 후 재거부는 마커 만료(또는 set-verify-spec
+  성공 시 삭제) 후 재통지(A4). waiver 계열 거부는 stderr·task_key '-waiver' 분기(B1).
+- 게이트 모드 env JAVIS_VERIFY_GATE=off|warn(기본)|strict (조건 32 — 2단 롤아웃: warn 기본 출하,
+  strict 승격은 오탐 0 실측+오너 승인). strict 최초 집행 시 grandfather 마커
+  _round/tasks/.verify-gate-activated 생성 — created_at < 마커 시각 태스크는 WARN 통과 +
+  grandfathered:true 표식(조건 16① — fail-closed 는 활성 이후 신규 태스크에만).
+- set-verify-spec <id> (--file|--json): 스키마 검증(schemas/verify_spec_schema.json SOT ·
+  인라인 폴백) + _wlock 직렬화. risk 는 T1 에서 class="auto" 기록만(어휘 4종 검사·서명은 B2).
+- 시스템 태스크 클래스 origin_kind=recovery|healing|watchdog → create 시 표준 읽기전용
+  verify_spec 템플릿 자동 부여(조건 16② · prereg 선서명은 [OT]).
+- checkout --brief <파일>: javis_brief_lint hard 경로(verify[] 형식 위반 = exit 6 거부).
+  인세션 Agent/Task 경고 경로는 hooks/brief-lint-warn.sh(fail-open — 조건 05·21·28 비대칭).
 """
 import argparse
 import contextlib
@@ -55,6 +75,427 @@ TERMINAL_FROM = ("in_progress", "in_review")  # W2-1 전이표: 터미널 전이
 
 EXIT_OK, EXIT_USAGE, EXIT_NOTFOUND, EXIT_BLOCKED, EXIT_DUP, EXIT_CONFLICT = 0, 2, 3, 4, 8, 9
 EXIT_NO_EVIDENCE = 5  # W0-3: done 전이에 증거 부재(T0a 이식 · 기존 exit 체계와 무충돌)
+EXIT_VERIFY = 6  # T1: verify_spec 게이트 거부(D9 — 6·7 빈 슬롯 실측 후 배정 · 조건 28)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T1(Phase 1 · DESIGN-DECISIONS §1-1): verify_spec 스키마 — schemas/verify_spec_schema.json
+#   단일 머신 SOT 런타임 로드 + 인라인 폴백(javis_verdict._load_consts 관례). 판정 어휘는
+#   신설하지 않는다(G6): 3치 = actprobe PASS/FAIL/INDET, 도구별 exit 는 pass_rule 로 흡수(D11).
+# ─────────────────────────────────────────────────────────────────────────────
+_VS_INLINE = {
+    "MODE_ENUM": ["command", "procedural", "probe", "waiver"],
+    "TOP_KEYS": ["schema_version", "mode", "cmd", "cwd", "pass_rule", "probe", "procedural",
+                 "waiver_ref", "timeout_s", "n_of_m", "harness_ref", "calibrated", "risk",
+                 "template", "template_origin"],
+    "REQUIRED_TOP": ["mode"],
+    "MODE_REQUIRED": {"command": ["cmd", "pass_rule"], "procedural": ["procedural"],
+                      "probe": ["probe"], "waiver": ["waiver_ref"]},
+    "PASS_RULE_KEYS": ["kind", "pass_exits", "fail_exits", "indet_exits", "needle", "expr"],
+    "PASS_RULE_KIND_ENUM": ["exit_map", "output_contains", "json_check"],
+    "PROBE_KEYS": ["name", "args"],
+    "PROCEDURAL_KEYS": ["tool", "artifact_path", "phase", "criteria", "report_path"],
+    "PROCEDURAL_TOOL_ENUM": ["check-criteria", "factcheck"],
+    "PROCEDURAL_TOOL_REQUIRED": {"check-criteria": ["artifact_path", "phase", "criteria"],
+                                 "factcheck": ["report_path"]},
+    "CRITERIA_KIND_ENUM": ["citation_present", "contradiction_flagged", "min_sources",
+                           "section_present", "no_unsupported_claims", "json_valid",
+                           "field_present", "min_items"],
+    "CRITERIA_KEYS": ["kind", "value", "statement"],
+    "N_OF_M_KEYS": ["n", "m"],
+    "RISK_KEYS": ["class", "signed_by", "signed_at"],
+}
+
+
+def _vs_schema_path():
+    """schemas/verify_spec_schema.json 위치 — bin/ 의 형제 schemas/, 폴백 CYS_PACK_DIR(verdict 관례)."""
+    cand = os.path.join(os.path.dirname(_SELF_DIR), "schemas", "verify_spec_schema.json")
+    if os.path.isfile(cand):
+        return cand
+    pd = os.environ.get("CYS_PACK_DIR") or os.environ.get("JAVIS_PACK_DIR")
+    if pd:
+        p = os.path.join(pd, "schemas", "verify_spec_schema.json")
+        if os.path.isfile(p):
+            return p
+    return cand
+
+
+def _vs_load_consts():
+    """스키마 로드, 실패·키 누락 시 인라인 폴백(graceful degrade — 외부의존 0·항상 동작).
+    B4: 키 타입(list/dict) 대조 — 불일치=손상 스키마 → 인라인 폴백 강등 + stderr 경고 1줄."""
+    try:
+        with open(_vs_schema_path(), encoding="utf-8") as f:
+            s = json.load(f)
+        out = {k: s[k] for k in _VS_INLINE}  # 모든 키 존재 필수 — 누락 시 KeyError→폴백
+        for k, v in out.items():
+            if type(v) is not type(_VS_INLINE[k]):  # B4: list/dict 타입 대조
+                print("verify-spec 스키마 키 %r 타입 불일치(%s≠%s) — 인라인 폴백 강등"
+                      % (k, type(v).__name__, type(_VS_INLINE[k]).__name__), file=sys.stderr)
+                return dict(_VS_INLINE)
+        return out
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(_VS_INLINE)
+
+
+_VS = _vs_load_consts()
+# 점수·비용 키 금지(javis_manifest BANNED_KEY_RE 관례 — reward-hack·비용 채널 차단)
+_VS_BANNED_KEY_RE = re.compile(r"(?<![a-z])(score|grade|rating|usd|cost|price)(?![a-z])", re.I)
+
+SYSTEM_ORIGIN_KINDS = ("recovery", "healing", "watchdog")  # D13 — 신설값·기존 레코드 충돌 0
+GATE_MARKER = ".verify-gate-activated"  # §1-2 — strict 승격 집행 시 생성(warn 기간엔 미생성)
+VERIFY_NOTIFY_TTL_SEC = 24 * 3600  # A4 — 거부 통지 태스크당 1회 창(<id>.verify-notified mtime)
+
+
+def _vs_banned_keys(obj, path="$"):
+    errs = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if _VS_BANNED_KEY_RE.search(str(k)):
+                errs.append("금지된 점수·비용 키 %r (%s.%s)" % (k, path, k))
+            errs += _vs_banned_keys(v, "%s.%s" % (path, k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            errs += _vs_banned_keys(v, "%s[%d]" % (path, i))
+    return errs
+
+
+def _is_pos_int(x):
+    return isinstance(x, int) and not isinstance(x, bool) and x >= 1
+
+
+def _nonempty_str(x):
+    return isinstance(x, str) and bool(x.strip())
+
+
+def validate_verify_spec(spec):
+    """순수 CHECK — verify_spec 객체 → 오류 리스트(javis_manifest.validate_manifest house style).
+
+    닫힌 키 집합 + mode 별 필수 + pass_rule/procedural/probe/waiver 세부. probe.name 은
+    개방 집합(D11 — enum 핀 금지), procedural.criteria[].kind 는 manifest 8종 닫힌 enum 핀.
+    """
+    errs = []
+    if not isinstance(spec, dict):
+        return ["verify_spec 이 객체(dict)가 아님"]
+    errs += _vs_banned_keys(spec)
+    for k in spec:
+        if k not in _VS["TOP_KEYS"]:
+            errs.append("미지 최상위 키 %r — 계약 키는 %s" % (k, "|".join(_VS["TOP_KEYS"])))
+    for k in _VS["REQUIRED_TOP"]:
+        if k not in spec:
+            errs.append("필수 키 누락: %s" % k)
+    sv = spec.get("schema_version")
+    if sv is not None and sv != 1:
+        errs.append("schema_version 무효(%r) — 1 만 유효" % (sv,))
+    mode = spec.get("mode")
+    if mode is not None and mode not in _VS["MODE_ENUM"]:
+        errs.append("mode 무효(%r) — %s" % (mode, "|".join(_VS["MODE_ENUM"])))
+    if mode in _VS["MODE_REQUIRED"]:
+        for k in _VS["MODE_REQUIRED"][mode]:
+            if k not in spec:
+                errs.append("mode=%s 는 %s 필수" % (mode, k))
+    if "cmd" in spec and not _nonempty_str(spec.get("cmd")):
+        errs.append("cmd 비어있지 않은 문자열 필요")
+    if "cwd" in spec and not _nonempty_str(spec.get("cwd")):
+        errs.append("cwd 비어있지 않은 문자열 필요")
+    pr = spec.get("pass_rule")
+    if pr is not None:
+        if not isinstance(pr, dict):
+            errs.append("pass_rule 객체 아님")
+        else:
+            for k in pr:
+                if k not in _VS["PASS_RULE_KEYS"]:
+                    errs.append("pass_rule 미지 키 %r — %s" % (k, "|".join(_VS["PASS_RULE_KEYS"])))
+            kind = pr.get("kind")
+            if kind not in _VS["PASS_RULE_KIND_ENUM"]:
+                errs.append("pass_rule.kind 무효(%r) — %s"
+                            % (kind, "|".join(_VS["PASS_RULE_KIND_ENUM"])))
+            if kind == "exit_map":
+                pe = pr.get("pass_exits")
+                if not (isinstance(pe, list) and pe
+                        and all(isinstance(x, int) and not isinstance(x, bool) for x in pe)):
+                    errs.append("pass_rule.exit_map 은 pass_exits 정수 배열(≥1) 필수")
+                for lk in ("fail_exits", "indet_exits"):
+                    lv = pr.get(lk)
+                    if lv is not None and not (isinstance(lv, list)
+                                               and all(isinstance(x, int) and not isinstance(x, bool)
+                                                       for x in lv)):
+                        errs.append("pass_rule.%s 정수 배열 필요" % lk)
+            if kind == "output_contains" and not _nonempty_str(pr.get("needle")):
+                errs.append("pass_rule.output_contains 는 needle 필수")
+            if kind == "json_check" and not _nonempty_str(pr.get("expr")):
+                errs.append("pass_rule.json_check 는 expr 필수")
+    pb = spec.get("probe")
+    if pb is not None:
+        if not isinstance(pb, dict):
+            errs.append("probe 객체 아님")
+        else:
+            for k in pb:
+                if k not in _VS["PROBE_KEYS"]:
+                    errs.append("probe 미지 키 %r — %s" % (k, "|".join(_VS["PROBE_KEYS"])))
+            if not _nonempty_str(pb.get("name")):
+                errs.append("probe.name 비어있지 않은 문자열 필요(개방 집합 — enum 핀 없음·D11)")
+            ar = pb.get("args")
+            if ar is not None and not (isinstance(ar, list) and all(isinstance(x, str) for x in ar)):
+                errs.append("probe.args 문자열 배열 필요")
+    pc = spec.get("procedural")
+    if pc is not None:
+        if not isinstance(pc, dict):
+            errs.append("procedural 객체 아님")
+        else:
+            for k in pc:
+                if k not in _VS["PROCEDURAL_KEYS"]:
+                    errs.append("procedural 미지 키 %r — %s" % (k, "|".join(_VS["PROCEDURAL_KEYS"])))
+            tool = pc.get("tool")
+            if tool not in _VS["PROCEDURAL_TOOL_ENUM"]:
+                errs.append("procedural.tool 무효(%r) — %s"
+                            % (tool, "|".join(_VS["PROCEDURAL_TOOL_ENUM"])))
+            for k in _VS["PROCEDURAL_TOOL_REQUIRED"].get(tool, []):
+                if not pc.get(k):
+                    errs.append("procedural.tool=%s 는 %s 필수(실도구 입력 정합 — R1-contract)"
+                                % (tool, k))
+            cr = pc.get("criteria")
+            if cr is not None:
+                if not isinstance(cr, list) or not cr:
+                    errs.append("procedural.criteria 비어있지 않은 배열 필요")
+                else:
+                    for i, c in enumerate(cr):
+                        w = "procedural.criteria[%d]" % i
+                        if not isinstance(c, dict):
+                            errs.append("%s 객체 아님" % w)
+                            continue
+                        for k in c:
+                            if k not in _VS["CRITERIA_KEYS"]:
+                                errs.append("%s 미지 키 %r — %s"
+                                            % (w, k, "|".join(_VS["CRITERIA_KEYS"])))
+                        if c.get("kind") not in _VS["CRITERIA_KIND_ENUM"]:
+                            errs.append("%s kind 무효(%r) — 기존 8종 닫힌 enum 핀(file_exists 없음)"
+                                        % (w, c.get("kind")))
+    if "waiver_ref" in spec and not _nonempty_str(spec.get("waiver_ref")):
+        errs.append("waiver_ref 비어있지 않은 문자열 필요(javis_waiver 레코드 id)")
+    ts = spec.get("timeout_s")
+    if ts is not None and not ((isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                                and ts > 0)):
+        errs.append("timeout_s 양수 필요(%r)" % (ts,))
+    nm = spec.get("n_of_m")
+    if nm is not None:
+        if not isinstance(nm, dict):
+            errs.append("n_of_m 객체 필요({n, m})")
+        else:
+            for k in nm:
+                if k not in _VS["N_OF_M_KEYS"]:
+                    errs.append("n_of_m 미지 키 %r — n|m" % k)
+            if not _is_pos_int(nm.get("n")) or not _is_pos_int(nm.get("m")):
+                errs.append("n_of_m.n/m 양의 정수 필요(%r)" % (nm,))
+            elif nm["n"] > nm["m"]:
+                errs.append("n_of_m.n(%s) > m(%s) — n ≤ m" % (nm["n"], nm["m"]))
+    if "calibrated" in spec and not isinstance(spec.get("calibrated"), bool):
+        errs.append("calibrated 는 bool")
+    rk = spec.get("risk")
+    if rk is not None:
+        if not isinstance(rk, dict):
+            errs.append("risk 객체 아님")
+        else:
+            for k in rk:
+                if k not in _VS["RISK_KEYS"]:
+                    errs.append("risk 미지 키 %r — %s" % (k, "|".join(_VS["RISK_KEYS"])))
+    return errs
+
+
+def _system_verify_spec_template(origin_kind):
+    """시스템 태스크 클래스(D13·조건 16②) 표준 읽기전용 verify_spec 템플릿.
+    치유·복원 티켓이 게이트에 걸리는 경로를 원천 제거. prereg 체인 선서명은 [OT](오너 1회)."""
+    return {
+        "schema_version": 1,
+        "mode": "command",
+        "cmd": "cys status --json",  # 읽기전용 한정(조건 16②·20① — cys status·preflight 계열)
+        "pass_rule": {"kind": "exit_map", "pass_exits": [0]},
+        "timeout_s": 10,
+        "n_of_m": {"n": 1, "m": 1},
+        "harness_ref": None,
+        "calibrated": False,
+        "risk": {"class": "auto", "signed_by": None, "signed_at": None},
+        "template": "system-readonly-v1",
+        "template_origin": origin_kind,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T1(§1-2): checkout verify 게이트 — 모드·grandfather 마커·waiver 소비·거부 통지.
+# ─────────────────────────────────────────────────────────────────────────────
+def _gate_mode():
+    """JAVIS_VERIFY_GATE=off|warn(기본)|strict — 미지 값은 warn(기본값)으로 접는다(보수측)."""
+    m = (os.environ.get("JAVIS_VERIFY_GATE") or "warn").strip().lower()
+    return m if m in ("off", "warn", "strict") else "warn"
+
+
+def _gate_marker_path():
+    return os.path.join(TASKS_DIR, GATE_MARKER)
+
+
+def _ensure_gate_marker():
+    """grandfather 활성 마커 — **strict 승격 집행 시 생성**(R1-contract). 최초 strict 게이트
+    평가가 승격 집행 시점이다: 마커 내용 = 그 시각 ISO. warn 기간엔 생성하지 않는다(이행기 —
+    신규 태스크는 spec 을 채운다·명문). 이미 있으면 기존 시각 유지(멱등).
+    B3: 쓰기 실패(IsADirectoryError 등 OSError)는 suppress + 마커 없음 취급(보수측 reject)
+    + stderr 경고 1줄 — traceback 으로 게이트가 깨지지 않는다."""
+    p = _gate_marker_path()
+    if os.path.isfile(p):
+        return
+    tmp = None
+    try:
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        tmp = "%s.tmp.%s.%s" % (p, os.getpid(), uuid.uuid4().hex[:8])
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(_now() + "\n")
+        os.replace(tmp, p)
+    except OSError as e:
+        print("verify-gate: 활성 마커 기록 실패(%s) — 마커 없음 취급(보수측 거부·B3)" % e,
+              file=sys.stderr)
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+
+def _gate_marker_epoch():
+    """마커 시각(epoch) — 내용 ISO 우선, 파싱 불가 시 mtime 폴백, 부재 시 None."""
+    p = _gate_marker_path()
+    try:
+        with open(p, encoding="utf-8") as f:
+            ep = _iso_to_epoch(f.read().strip())
+        if ep is not None:
+            return ep
+        return os.stat(p).st_mtime
+    except OSError:
+        return None
+
+
+def _waivers_path():
+    return os.path.join(ROOT, ".vibecoding", "waivers.jsonl")  # javis_waiver 저장 계약과 동일
+
+
+def _load_waiver(waiver_ref):
+    """waivers.jsonl 직접 판독(§1-1 R1-contract) — waiver_id 일치 레코드(최신=마지막 줄).
+    append-only 원장이라 같은 id 재기록은 없지만 방어적으로 마지막 일치를 취한다."""
+    found = None
+    try:
+        with open(_waivers_path(), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue  # 손상 줄은 유효 waiver 로 취급하지 않음(javis_waiver fail-closed 관례)
+                if isinstance(rec, dict) and rec.get("waiver_id") == waiver_ref:
+                    found = rec
+    except OSError:
+        return None
+    return found
+
+
+def _waiver_state(rec):
+    """만료 판정 — javis_waiver 의 날짜 산술 import 재사용(중복 정의 금지 · §1-1).
+    반환 (state, detail) · state ∈ valid|grace|expired|invalid|infra.
+    48h 유예 = **만료일+2일 날짜 산술**(조건 16③ 조작화): today ≤ expiry+2일 이면 grace.
+    A1: 모듈 부재(버전 찢김 의심)는 INFRA 취급 — traceback 대신 상태 보고
+    (_notify_verify_missing 의 wakeup isfile 가드와 대칭)."""
+    try:
+        import javis_waiver as _wv  # 형제 모듈 — 경로 가드(sys.path append) 뒤 지역 import
+    except ImportError:
+        return "infra", "javis_waiver 모듈 부재(버전 찢김 의심)"
+    ed = _wv._parse_date(rec.get("expiry", ""))
+    if ed is None:
+        return "invalid", "expiry 파싱 불가(%r)" % rec.get("expiry")
+    today = _wv._today()
+    if ed >= today:
+        return "valid", "expiry=%s" % ed.isoformat()
+    if today.toordinal() - ed.toordinal() <= 2:
+        return "grace", "expiry=%s(+2일 유예 중)" % ed.isoformat()
+    return "expired", "expiry=%s(유예 경과)" % ed.isoformat()
+
+
+def _verify_gate_check(task):
+    """checkout verify_spec 게이트(§1-2) → (verdict, why).
+    verdict ∈ 'pass' | 'warn'(경고 후 통과) | 'grandfather'(WARN 통과+표식) | 'reject'
+    | 'reject-waiver'(B1 — waiver 계열 거부 stderr·task_key 분기용·exit 6 동일)."""
+    mode = _gate_mode()
+    if mode == "off":
+        return "pass", None
+    spec = task.get("verify_spec")
+    if isinstance(spec, dict) and spec:
+        if spec.get("mode") == "waiver":
+            ref = spec.get("waiver_ref") or ""
+            rec = _load_waiver(ref)
+            if rec is None:
+                why = "waiver_ref %r 미해소(waivers.jsonl 레코드 없음)" % ref
+                return ("reject-waiver" if mode == "strict" else "warn"), why
+            state, detail = _waiver_state(rec)
+            if state == "infra":
+                return "warn", ("waiver %s 판정 불가(INFRA) — %s: strict 에서도 warn 강등"
+                                "(traceback 금지·A1)" % (ref, detail))
+            if state == "valid":
+                return "pass", None
+            if state == "grace":
+                return "warn", ("waiver %s 만료 — 48h 유예 중(%s) · 재승인(신규 issue) 필요"
+                                % (ref, detail))
+            why = "waiver %s %s(%s) — 만료일+2일 유예 경과" % (ref, state, detail)
+            return ("reject-waiver" if mode == "strict" else "warn"), why
+        return "pass", None  # spec 존재 = 게이트 충족(실행·판정은 completion-guard(B1) 소관)
+    # spec 부재
+    if mode == "warn":
+        return "warn", "verify_spec 부재 — 이행기(warn): master 가 set-verify-spec 으로 채울 것(strict 승격 대비)"
+    _ensure_gate_marker()  # strict 승격 집행 = 최초 strict 평가 — 마커 시각 박제
+    marker_ep = _gate_marker_epoch()
+    created_ep = _iso_to_epoch(task.get("created_at"))
+    if marker_ep is not None and created_ep is not None and created_ep < marker_ep:
+        return "grandfather", ("created_at < 게이트 활성 시각(%s) — WARN 통과+grandfathered 표식"
+                               % GATE_MARKER)
+    return "reject", "verify_spec 부재(게이트 활성 이후 신규 태스크)"
+
+
+def _verify_notified_marker(task_id):
+    return os.path.join(TASKS_DIR, "%s.verify-notified" % task_id)  # A4 — 재발화 억제 마커
+
+
+def _notify_verify_missing(task_id, why, waiver=False):
+    """거부 통지(§1-2): wakeup enqueue(멱등키=task_id) + **same-run drain --deliver 짝**.
+    autopilot :442 전례 — CYS_NO_AUTOSTART=1 + timeout(2~5s) + 실패 무해 통과(블로킹 대기 금지).
+    drain 실패 시 pending 잔류 → 후속 drain 편승 배달(계약 자인 — BRIEF_CONTRACT). best-effort:
+    어떤 실패도 exit 코드·게이트 판정에 불개입.
+    A4: 병합=pending 창+마커 창 2중 — <id>.verify-notified(TTL 24h·mtime) 존재+미만료면
+    enqueue 생략(배달 성공 후 재거부 재발화 억제 = 진짜 '태스크당 1회'). 마커는 enqueue 성공
+    시 생성·set-verify-spec 성공 시 삭제(재위임 사이클 재개)·만료 후 재통지.
+    B1: waiver 계열 거부는 task_key 에 '-waiver' 접미(분리 병합)."""
+    import subprocess  # 지역 import — 모듈 상단 결합 회피(E1 관례)
+    wk = os.path.join(_SELF_DIR, "javis_wakeup.py")
+    if not os.path.isfile(wk):
+        return
+    mark = _verify_notified_marker(task_id)
+    try:
+        if time.time() - os.stat(mark).st_mtime < VERIFY_NOTIFY_TTL_SEC:
+            return  # A4: 마커 창 내 재거부 — enqueue 생략(재발화 억제)
+    except OSError:
+        pass
+    env = dict(os.environ)
+    env["CYS_NO_AUTOSTART"] = "1"
+    base = [sys.executable, wk]
+    task_key = "verify-spec-missing-%s%s" % (task_id, "-waiver" if waiver else "")
+    reason = ("checkout 거부(exit 6) — %s: %s"
+              % ("verify-waiver 만료·미해소" if waiver else "verify_spec 부재", why or task_id))
+    enq_ok = False
+    with contextlib.suppress(Exception):
+        r = subprocess.run(base + ["enqueue", "--to", "master", "--task", task_key,
+                                   "--reason", reason,
+                                   "--idempotency-key", task_id, "--severity", "warn"],
+                           capture_output=True, text=True, timeout=5, env=env)
+        enq_ok = (r.returncode == 0)
+    if enq_ok:
+        with contextlib.suppress(OSError):
+            with open(mark, "w", encoding="utf-8") as f:
+                f.write(_now() + "\n")
+    with contextlib.suppress(Exception):
+        subprocess.run(base + ["drain", "--deliver", "--target", "master"],
+                       capture_output=True, text=True, timeout=5, env=env)
 
 
 def _now():
@@ -388,6 +829,10 @@ def cmd_create(a):
             "created_at": _now(),
             "updated_at": _now(),
         }
+        # T1(D13·조건 16②): 시스템 태스크 클래스는 표준 읽기전용 verify_spec 템플릿 자동 부여 —
+        # 치유·복원 티켓이 checkout 게이트에 걸리는 경로 원천 제거(prereg 선서명은 [OT]).
+        if a.origin_kind in SYSTEM_ORIGIN_KINDS:
+            task["verify_spec"] = _system_verify_spec_template(a.origin_kind)
         _write_json_atomic(_task_path(task_id), task)
     print(task_id)
     return EXIT_OK
@@ -405,6 +850,47 @@ def cmd_checkout(a):
     if unresolved:
         print(f"blocked: 미해소 blocker {unresolved} — 체크아웃 거부", file=sys.stderr)
         return EXIT_BLOCKED
+    # ── B6: 게이트 평가 '전' 생존 소유자 선확인 — 산 소유자 충돌은 exit 9 우선(무통지).
+    #    자기 재진입(owner 동일)은 _acquire_lock 멱등 경로에 위임. TOCTOU 는 아래 CAS 가 최종심.
+    holder = _read_owner(a.id)
+    if holder and holder.get("owner_id") != a.owner and _pid_alive(holder.get("pid")):
+        print(f"conflict(409): 살아있는 소유자 {holder.get('owner_id')} — 재시도 금지, "
+              "다른 태스크로 이동", file=sys.stderr)
+        return EXIT_CONFLICT
+    # ── T1 brief 게이트(--brief · hard 경로 — 조건 05①·21①·28): javis_brief_lint 의
+    #    hard(2)=verify[] 형식 위반만 exit 6 거부. 경고(1)는 stderr 로 흘리고 통과(fail-open).
+    #    인세션 Agent/Task 경고 경로는 hooks/brief-lint-warn.sh 별도(여긴 티켓 연동 위임 전용).
+    if getattr(a, "brief", None):
+        try:
+            import javis_brief_lint as _bl  # 형제 모듈 — 경로 가드(sys.path append) 뒤 지역 import
+        except ImportError:
+            print("error: javis_brief_lint 모듈 부재(버전 찢김 의심) — --brief 게이트 평가 불가: "
+                  "팩 설치 정합 복구 후 재시도(A1 — wakeup isfile 가드와 대칭)", file=sys.stderr)
+            return EXIT_USAGE
+        bcode, bfind = _bl.lint_file(a.brief)
+        for ln in bfind:
+            print("brief-lint: %s" % ln, file=sys.stderr)
+        if bcode == 2:
+            print("brief verify[] missing(6): checkout --brief hard 거부 — "
+                  "BRIEF_CONTRACT 5필드+실행형 verify[] 동봉 후 재위임(재시도 금지)",
+                  file=sys.stderr)
+            return EXIT_VERIFY
+    # ── T1 verify_spec 게이트(§1-2): 락 획득 '전' 평가 — 거부가 소유권·레코드를 변이하지 않는다.
+    gate, gwhy = _verify_gate_check(task)
+    if gate in ("reject", "reject-waiver"):
+        # wakeup enqueue+same-run drain(무해 통과·A4 마커 억제) — 통지 선행
+        _notify_verify_missing(a.id, gwhy, waiver=(gate == "reject-waiver"))
+        if gate == "reject-waiver":  # B1: waiver 계열 거부 stderr 분기(exit 6 유지)
+            print("verify-waiver expired(6): 재승인(신규 issue) 후 재위임. "
+                  "통지 큐 등재됨(태스크당 1회 병합·미배달 시 후속 drain 편승).", file=sys.stderr)
+        else:
+            print("verify-spec missing(6): 재시도 금지 — master가 verify_spec 작성 후 재위임. "
+                  "통지 큐 등재됨(태스크당 1회 병합·미배달 시 후속 drain 편승).", file=sys.stderr)
+        if gwhy:
+            print("verify-gate: %s" % gwhy, file=sys.stderr)
+        return EXIT_VERIFY
+    if gate in ("warn", "grandfather"):
+        print("verify-gate WARN: %s" % gwhy, file=sys.stderr)
     verdict, holder = _acquire_lock(a.id, a.owner, pid=a.pid)
     if verdict == "conflict":
         who = (holder or {}).get("owner_id", "unknown")
@@ -417,6 +903,8 @@ def cmd_checkout(a):
             return EXIT_NOTFOUND
         task["status"] = "in_progress"
         task["owner"] = a.owner
+        if gate == "grandfather":
+            task["grandfathered"] = True  # §1-2: WARN 통과 표식(strict 활성 이전 생성분)
         task["updated_at"] = _now()
         _write_json_atomic(_task_path(a.id), task)
     print(json.dumps({"checkout": verdict, "id": a.id, "owner": a.owner}, ensure_ascii=False))
@@ -821,6 +1309,68 @@ def cmd_set_status(a):
     return EXIT_OK
 
 
+def cmd_set_verify_spec(a):
+    """T1(§1-2): verify_spec 등록 — 스키마 검증 + `with _wlock(id)` **필수**(R1-contract:
+    set-status·checkout·release·create 에 이은 5번째 mutator — lost-update 차단).
+    risk 는 T1 에서 class="auto" 기록만: 위험 어휘 4종(삭제·네트워크·서버기동·push생산) 검사·
+    서명 전이는 Wave B2 가 이 지점(등록 직전)에 끼운다 — ★B2 훅 지점 예약(조건 07①·30③)."""
+    task = _read_task(a.id)
+    if not task:
+        print(f"not found: {a.id}", file=sys.stderr)
+        return EXIT_NOTFOUND
+    if a.file:
+        try:
+            with open(a.file, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            print("error: --file 읽기 실패: %s (%s)" % (a.file, e), file=sys.stderr)
+            return EXIT_USAGE
+    else:
+        text = a.json
+    try:
+        spec = json.loads(text)
+    except ValueError as e:
+        print("error: verify_spec JSON 파싱 실패: %s" % e, file=sys.stderr)
+        return EXIT_USAGE
+    if not isinstance(spec, dict):
+        print("error: verify_spec 은 JSON 객체여야 함", file=sys.stderr)
+        return EXIT_USAGE
+    spec.setdefault("schema_version", 1)
+    # ── risk 필드 예약(T1): class="auto" 는 '부재 시에만' 주입 — B5: 비-dict 입력은 무언 치환
+    #    없이 exit 2 거부(어휘 검사·signed_by 전이는 Wave B2 몫) ──
+    risk = spec.get("risk")
+    if risk is None:
+        spec["risk"] = {"class": "auto", "signed_by": None, "signed_at": None}
+    elif not isinstance(risk, dict):
+        print("error: risk 는 객체({class, signed_by, signed_at})여야 함 — 비-dict 입력 거부"
+              "(무언 치환 금지 · B5)", file=sys.stderr)
+        return EXIT_USAGE
+    else:
+        risk.setdefault("class", "auto")
+        risk.setdefault("signed_by", None)
+        risk.setdefault("signed_at", None)
+    errs = validate_verify_spec(spec)
+    if errs:
+        for e in errs:
+            print("[SCHEMA] %s" % e, file=sys.stderr)
+        print("error: verify_spec 스키마 위반 %d건 — 등록 거부(schemas/verify_spec_schema.json)"
+              % len(errs), file=sys.stderr)
+        return EXIT_USAGE
+    with _wlock(a.id):  # ★R1-contract: 5번째 mutator 직렬화 — 동시 set-status lost-update 차단
+        task = _read_task(a.id)          # 락 안 재독 — 대기 중 갱신 반영
+        if not task:
+            print(f"not found: {a.id}", file=sys.stderr)
+            return EXIT_NOTFOUND
+        task["verify_spec"] = spec
+        task["updated_at"] = _now()
+        _write_json_atomic(_task_path(a.id), task)
+    with contextlib.suppress(OSError):
+        os.remove(_verify_notified_marker(a.id))  # A4: 재위임 사이클 재개 — 통지 마커 해제
+    print(json.dumps({"id": a.id, "verify_spec_mode": spec.get("mode"),
+                      "risk_class": spec["risk"]["class"]}, ensure_ascii=False))
+    return EXIT_OK
+
+
 def cmd_ready(a):
     task = _read_task(a.id)
     if not task:
@@ -867,6 +1417,12 @@ def cmd_self_test(args):
         #   영수증 경로·caller 를 tmpdir 로 고정(라이브 미접촉 · cys identify 서브프로세스 회피).
         env.setdefault("CYS_PROBE_RUNS", os.path.join(root, "probe_runs.jsonl"))
         env.setdefault("CYS_ACTPROBE_CALLER", "self-test")
+        # T1 밀폐: 게이트 모드는 기본 warn 으로 '핀'(ambient JAVIS_VERIFY_GATE=strict 누출 차단),
+        #   거부 통지의 drain 이 라이브 cys 를 부르지 않도록 LIVENESS=dead 핀(dead=zombie 가드가
+        #   cys 호출 없이 pending 종결). 게이트 케이스는 env_extra 로 명시 오버라이드한다.
+        env["JAVIS_VERIFY_GATE"] = "warn"
+        env["JAVIS_WAKEUP_LIVENESS"] = "dead"
+        env["CYS_NO_AUTOSTART"] = "1"
         if env_extra:
             env.update(env_extra)
         r = subprocess.run([sys.executable, self_path] + argv,
@@ -892,6 +1448,18 @@ def cmd_self_test(args):
 
     OV = ["--settled-override", "self-test"]  # 체크아웃된 태스크의 완료 하한선(settle) 우회
     try:
+        # ── A3 parity: 스키마 파일 SOT ↔ _VS_INLINE 드리프트 0 + manifest CHECK_KINDS 핀 ──
+        with open(_vs_schema_path(), encoding="utf-8") as f:
+            _schema_doc = json.load(f)
+        for k in _VS_INLINE:
+            assert _schema_doc.get(k) == _VS_INLINE[k], \
+                "스키마 파일↔_VS_INLINE 드리프트(%s): %r != %r" % (k, _schema_doc.get(k),
+                                                                  _VS_INLINE[k])
+        import javis_manifest as _mf
+        assert tuple(_VS_INLINE["CRITERIA_KIND_ENUM"]) == tuple(_mf.CHECK_KINDS), \
+            "CRITERIA_KIND_ENUM ≠ javis_manifest.CHECK_KINDS: %r vs %r" % (
+                _VS_INLINE["CRITERIA_KIND_ENUM"], _mf.CHECK_KINDS)
+
         with tempfile.TemporaryDirectory(prefix="javis-task-e1-") as root:
             # ── 부정 1: 부재 경로 → exit 5 ──
             setup_checked_out(root, "Tneg-missing")
@@ -1011,11 +1579,268 @@ def cmd_self_test(args):
             ev2 = read_task(root, "Tbc2")["evidence"]
             assert ev2.get("text") == "pytest 12/12 PASS" and len(ev2.get("artifacts", [])) == 1, \
                 "텍스트+artifact 비파괴 공존 실패: %s" % ev2
+
+        # ══ T1 verify_spec 게이트 배터리(§1-2 — 별도 밀폐 root) ══
+        with tempfile.TemporaryDirectory(prefix="javis-task-t1-") as groot:
+            tasks_dir = os.path.join(groot, "_round", "tasks")
+            marker = os.path.join(tasks_dir, GATE_MARKER)
+
+            def write_marker(epoch):
+                os.makedirs(tasks_dir, exist_ok=True)
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch)) + "\n")
+
+            def backdate_created(tid, epoch):
+                p = os.path.join(tasks_dir, tid + ".json")
+                with open(p, encoding="utf-8") as f:
+                    t = json.load(f)
+                t["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(epoch))
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(t, f, ensure_ascii=False)
+
+            # ── 게이트 warn(기본): 무spec checkout → exit 0 + WARN 경고 ──
+            rc, _, e = run(groot, ["create", "Tg-warn", "--id", "Tg-warn"])
+            assert rc == 0, "게이트 create 실패: %s" % e
+            rc, _, err = run(groot, ["checkout", "Tg-warn", "--owner", "w1"])
+            assert rc == EXIT_OK, "warn 모드 checkout 이 0 을 안 냄: %s (%s)" % (rc, err)
+            assert "verify-gate WARN" in err, "warn 모드 경고 누락: %s" % err
+
+            # ── 게이트 off: 무간섭(경고도 없음) ──
+            rc, _, e = run(groot, ["create", "Tg-off", "--id", "Tg-off"])
+            assert rc == 0
+            rc, _, err = run(groot, ["checkout", "Tg-off", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "off"})
+            assert rc == EXIT_OK and "verify-gate" not in err, \
+                "off 모드 무간섭 위반: rc=%s err=%s" % (rc, err)
+
+            # ── 게이트 strict: 마커(과거)보다 늦게 생성된 무spec 태스크 → exit 6 + 문면 ──
+            write_marker(time.time() - 3600)  # strict 승격이 1시간 전에 집행된 상태를 조성
+            rc, _, e = run(groot, ["create", "Tg-strict", "--id", "Tg-strict"])
+            assert rc == 0
+            rc, _, err = run(groot, ["checkout", "Tg-strict", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_VERIFY, "strict 무spec 이 6 을 안 냄: %s (%s)" % (rc, err)
+            assert "verify-spec missing(6): 재시도 금지 — master가 verify_spec 작성 후 재위임" in err, \
+                "strict 거부 문면 불일치: %s" % err
+
+            # ── 거부 통지(A4): 1회차만 enqueue+마커 생성 — 반복 거부는 마커 창 억제(진짜
+            #    '태스크당 1회'). pending 정확 1건(D17 — drain 전 스냅샷) + same-run drain
+            #    배달 시도 흔적(cys 셔임 로그 · exit 1 → 배달실패 → pending 잔류). 이후
+            #    set-verify-spec 성공이 마커를 삭제(재위임 사이클 재개).
+            shim_dir = os.path.join(groot, "shim")
+            os.makedirs(shim_dir, exist_ok=True)
+            shim = os.path.join(shim_dir, "cys")
+            with open(shim, "w", encoding="utf-8") as f:
+                f.write('#!/bin/sh\necho "$@" >> "$0.log"\nexit 1\n')
+            os.chmod(shim, 0o755)
+            gate_env = {"JAVIS_VERIFY_GATE": "strict", "JAVIS_WAKEUP_LIVENESS": "alive",
+                        "JAVIS_FASTFAIL_MAX": "99",
+                        "PATH": shim_dir + os.pathsep + os.environ.get("PATH", "")}
+            good_spec = {"mode": "command", "cmd": "python3 -c 0",
+                         "pass_rule": {"kind": "exit_map", "pass_exits": [0]}}
+            rc, _, e = run(groot, ["create", "Tg-notif", "--id", "Tg-notif"])
+            assert rc == 0
+            for _i in range(3):
+                rc, _, _e = run(groot, ["checkout", "Tg-notif", "--owner", "w1"], gate_env)
+                assert rc == EXIT_VERIFY
+            pend_dir = os.path.join(groot, "_round", "wakeups", "pending")
+            pend = [n for n in os.listdir(pend_dir)] if os.path.isdir(pend_dir) else []
+            pend = [n for n in pend if n.endswith(".json")]
+            assert len(pend) == 1, "동일 거부 반복 후 pending ≠ 1건: %s" % pend
+            assert os.path.isfile(shim + ".log"), "same-run drain 배달 시도 흔적(셔임 로그) 없음"
+            with open(shim + ".log", encoding="utf-8") as f:
+                shim_lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            assert any("send" in ln for ln in shim_lines), "cys send 시도 미기록: %s" % shim_lines
+            notif_mark = os.path.join(tasks_dir, "Tg-notif.verify-notified")
+            assert os.path.isfile(notif_mark), "A4 통지 마커 미생성"
+            with open(os.path.join(groot, "_round", "wakeups", "queue.jsonl"),
+                      encoding="utf-8") as f:
+                _ledger = f.read()
+            _queued = [ln for ln in _ledger.splitlines()
+                       if '"queued"' in ln and "verify-spec-missing-Tg-notif" in ln]
+            assert len(_queued) == 1, "A4 마커 억제 실패 — enqueue %d회: %s" % (len(_queued), _queued)
+            rc, _, e = run(groot, ["set-verify-spec", "Tg-notif", "--json",
+                                   json.dumps(good_spec)])
+            assert rc == EXIT_OK, "Tg-notif spec 등록 실패: %s" % e
+            assert not os.path.isfile(notif_mark), "A4 set-verify-spec 성공 후 통지 마커 미삭제"
+
+            # ── grandfather: created_at < 마커 시각 → WARN 통과 + grandfathered:true ──
+            rc, _, e = run(groot, ["create", "Tg-gf", "--id", "Tg-gf"])
+            assert rc == 0
+            backdate_created("Tg-gf", time.time() - 7200)  # 마커(1h 전)보다 이른 2h 전
+            rc, _, err = run(groot, ["checkout", "Tg-gf", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_OK, "grandfather 가 통과하지 않음: %s (%s)" % (rc, err)
+            # B8: 괄호 교정 — WARN 문구는 무조건 필수 + grandfather 표기 or 연산은 괄호로 묶음
+            assert "verify-gate WARN" in err and \
+                ("grandfather" in err.lower() or "grandfathered" in err), \
+                "grandfather WARN 문구 누락: %s" % err
+            assert read_task(groot, "Tg-gf").get("grandfathered") is True, \
+                "grandfathered:true 표식 누락"
+
+            # ── set-verify-spec: 유효 spec 등록 → strict checkout 통과(무경고) ──
+            rc, _, e = run(groot, ["create", "Tg-spec", "--id", "Tg-spec"])
+            assert rc == 0
+            rc, out, e = run(groot, ["set-verify-spec", "Tg-spec", "--json",
+                                     json.dumps(good_spec)])
+            assert rc == EXIT_OK, "set-verify-spec 유효 등록 실패: %s (%s)" % (rc, e)
+            rec = read_task(groot, "Tg-spec")["verify_spec"]
+            assert rec["mode"] == "command" and rec["risk"]["class"] == "auto", \
+                "risk.class=auto 예약 기록 누락: %s" % rec
+            rc, _, err = run(groot, ["checkout", "Tg-spec", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_OK and "verify-gate" not in err, \
+                "spec 보유 strict checkout 실패: rc=%s err=%s" % (rc, err)
+
+            # ── set-verify-spec 스키마 거부: mode 무효·미지 키 → exit 2 ──
+            rc, _, err = run(groot, ["set-verify-spec", "Tg-spec", "--json",
+                                     json.dumps({"mode": "vibes"})])
+            assert rc == EXIT_USAGE and "mode 무효" in err, "무효 mode 미거부: %s (%s)" % (rc, err)
+            rc, _, err = run(groot, ["set-verify-spec", "Tg-spec", "--json",
+                                     json.dumps({"mode": "command", "cmd": "true",
+                                                 "pass_rule": {"kind": "exit_map",
+                                                               "pass_exits": [0]},
+                                                 "score": 99})])
+            assert rc == EXIT_USAGE, "금지 키(score) 미거부: %s (%s)" % (rc, err)
+            # ── B5: risk 비-dict 입력 → exit 2 거부(무언 치환 제거·부재 시에만 auto 주입) ──
+            rc, _, err = run(groot, ["set-verify-spec", "Tg-spec", "--json",
+                                     json.dumps({"mode": "command", "cmd": "true",
+                                                 "pass_rule": {"kind": "exit_map",
+                                                               "pass_exits": [0]},
+                                                 "risk": "high"})])
+            assert rc == EXIT_USAGE and "risk" in err, \
+                "B5 비-dict risk 미거부: %s (%s)" % (rc, err)
+
+            # ── waiver 소비: 유효/유예(만료+2일)/유예 경과 3상 ──
+            vibe = os.path.join(groot, ".vibecoding")
+            os.makedirs(vibe, exist_ok=True)
+            import datetime as _dt
+            today = _dt.date.today()
+            wrecs = [
+                {"waiver_id": "WVR-ok", "target_rule": "r", "approver": "master", "risk": "low",
+                 "expiry": (today + _dt.timedelta(days=3)).isoformat()},
+                {"waiver_id": "WVR-grace", "target_rule": "r", "approver": "master", "risk": "low",
+                 "expiry": (today - _dt.timedelta(days=1)).isoformat()},
+                {"waiver_id": "WVR-dead", "target_rule": "r", "approver": "master", "risk": "low",
+                 "expiry": (today - _dt.timedelta(days=5)).isoformat()},
+            ]
+            with open(os.path.join(vibe, "waivers.jsonl"), "w", encoding="utf-8") as f:
+                for r in wrecs:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            for tid, ref, want_rc, want_sub in (
+                    ("Tg-wv-ok", "WVR-ok", EXIT_OK, None),
+                    ("Tg-wv-grace", "WVR-grace", EXIT_OK, "유예"),
+                    ("Tg-wv-dead", "WVR-dead", EXIT_VERIFY, "유예 경과")):
+                rc, _, e = run(groot, ["create", tid, "--id", tid])
+                assert rc == 0
+                rc, _, e = run(groot, ["set-verify-spec", tid, "--json",
+                                       json.dumps({"mode": "waiver", "waiver_ref": ref})])
+                assert rc == EXIT_OK, "waiver spec 등록 실패(%s): %s" % (tid, e)
+                rc, _, err = run(groot, ["checkout", tid, "--owner", "w1"],
+                                 {"JAVIS_VERIFY_GATE": "strict"})
+                assert rc == want_rc, "waiver %s: rc=%s 기대=%s (%s)" % (ref, rc, want_rc, err)
+                if want_sub:
+                    assert want_sub in err, "waiver %s 문구 %r 누락: %s" % (ref, want_sub, err)
+                if want_rc == EXIT_VERIFY:  # B1: waiver 계열 거부 stderr 분기(문면 고정)
+                    assert "verify-waiver expired(6): 재승인(신규 issue) 후 재위임" in err, \
+                        "B1 waiver 거부 문면 누락: %s" % err
+                    assert "verify-spec missing(6)" not in err, \
+                        "B1 분기 실패 — missing 문면 혼입: %s" % err
+
+            # ── 시스템 클래스 create → 읽기전용 템플릿 자동 부여 + 스키마 유효 + strict 통과 ──
+            rc, _, e = run(groot, ["create", "Tg-heal", "--id", "Tg-heal",
+                                   "--origin-kind", "healing"])
+            assert rc == 0, "healing create 실패: %s" % e
+            tspec = read_task(groot, "Tg-heal").get("verify_spec")
+            assert tspec and tspec.get("template") == "system-readonly-v1" \
+                and tspec.get("template_origin") == "healing", "시스템 템플릿 미부여: %s" % tspec
+            assert validate_verify_spec(tspec) == [], \
+                "시스템 템플릿이 자체 스키마 위반: %s" % validate_verify_spec(tspec)
+            rc, _, err = run(groot, ["checkout", "Tg-heal", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_OK, "시스템 클래스 strict checkout 실패: %s (%s)" % (rc, err)
+
+            # ── checkout --brief: verify[] 있는 브리프 통과 / 없는 브리프 exit 6(hard) ──
+            bok = mkfile(groot, "brief-ok.md",
+                         "# task\n구현\n# verify\n- python3 x.py self-test → exit 0\n")
+            bbad = mkfile(groot, "brief-bad.md", "# task\n구현만 서술·verify 없음\n")
+            rc, _, e = run(groot, ["create", "Tg-brief", "--id", "Tg-brief"])
+            assert rc == 0
+            rc, _, err = run(groot, ["checkout", "Tg-brief", "--owner", "w1", "--brief", bok])
+            assert rc == EXIT_OK, "유효 브리프 checkout 실패: %s (%s)" % (rc, err)
+            rc, _, e = run(groot, ["release", "Tg-brief", "--owner", "w1"])
+            assert rc == 0
+            rc, _, err = run(groot, ["checkout", "Tg-brief", "--owner", "w1", "--brief", bbad])
+            assert rc == EXIT_VERIFY and "verify[]" in err, \
+                "무verify 브리프가 6 을 안 냄: rc=%s err=%s" % (rc, err)
+
+            # ── B6: 게이트 평가 전 생존 소유자 선확인 — 산 소유자 충돌 = exit 9 우선(무통지) ──
+            rc, _, e = run(groot, ["create", "Tg-own", "--id", "Tg-own"])
+            assert rc == 0
+            rc, _, e = run(groot, ["checkout", "Tg-own", "--owner", "w1"])  # warn 모드 선점
+            assert rc == EXIT_OK, "Tg-own 선점 실패: %s" % e
+            rc, _, err = run(groot, ["checkout", "Tg-own", "--owner", "w2"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_CONFLICT, "B6 산 소유자 충돌이 9 를 안 냄: %s (%s)" % (rc, err)
+            assert "verify-spec missing" not in err, "B6 exit 9 우선 위반 — 게이트 문면 출력: %s" % err
+            assert not os.path.isfile(os.path.join(tasks_dir, "Tg-own.verify-notified")), \
+                "B6 무통지 위반 — exit 9 경로에서 통지 마커 생성"
+
+            # ── 동시성(R1-contract): set-verify-spec ∥ set-status — lost-update 0 ──
+            import threading
+            for it in range(3):
+                tid = "Tg-conc%d" % it
+                rc, _, e = run(groot, ["create", tid, "--id", tid])
+                assert rc == 0
+                rc, _, e = run(groot, ["checkout", tid, "--owner", "w1"])
+                assert rc == 0, "conc checkout 실패: %s" % e
+                results = {}
+
+                def _sv(tid=tid):
+                    results["sv"] = run(groot, ["set-verify-spec", tid, "--json",
+                                                json.dumps(good_spec)])
+
+                def _ss(tid=tid):
+                    results["ss"] = run(groot, [
+                        "set-status", tid, "in_review"])
+                th1, th2 = threading.Thread(target=_sv), threading.Thread(target=_ss)
+                th1.start(); th2.start(); th1.join(30); th2.join(30)
+                assert results["sv"][0] == 0 and results["ss"][0] == 0, \
+                    "동시 mutator exit 비0: %s" % (results,)
+                final = read_task(groot, tid)
+                assert final.get("status") == "in_review" and \
+                    (final.get("verify_spec") or {}).get("mode") == "command", \
+                    "lost-update 발생(iter %d): status=%s spec=%s" \
+                    % (it, final.get("status"), final.get("verify_spec"))
+
+        # ── B7: 마커 자동생성 경로 — 마커 부재 strict 최초 checkout = 승격 집행(grandfather
+        #    WARN 통과+마커 생성) → 직후 신규 create checkout → exit 6 (별도 밀폐 root) ──
+        with tempfile.TemporaryDirectory(prefix="javis-task-t1b7-") as b7root:
+            b7_tasks = os.path.join(b7root, "_round", "tasks")
+            rc, _, e = run(b7root, ["create", "Tb7-old", "--id", "Tb7-old"])
+            assert rc == 0, "B7 create 실패: %s" % e
+            time.sleep(1.1)  # created_at(초 해상도) < 마커 생성 시각 엄밀 보장
+            rc, _, err = run(b7root, ["checkout", "Tb7-old", "--owner", "w1"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_OK and "grandfathered" in err, \
+                "B7 최초 strict 가 grandfather 통과 안 함: rc=%s err=%s" % (rc, err)
+            assert os.path.isfile(os.path.join(b7_tasks, GATE_MARKER)), \
+                "B7 마커 자동생성 안 됨"
+            rc, _, e = run(b7root, ["create", "Tb7-new", "--id", "Tb7-new"])
+            assert rc == 0
+            rc, _, err = run(b7root, ["checkout", "Tb7-new", "--owner", "w2"],
+                             {"JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_VERIFY, \
+                "B7 마커 생성 직후 신규 태스크가 6 을 안 냄: rc=%s err=%s" % (rc, err)
     except AssertionError as ex:
         print("javis_task self-test FAIL: %s" % ex, file=sys.stderr)
         return 1
     print("javis_task self-test OK (E1 evidence-artifact 게이트 — 부정4·긍정·폴백·skip감사·"
-          "재진입·warn/off 경계·off밸브 skip감사·하위호환 A/B · 밀폐 tmpdir+JAVIS_ROOT)")
+          "재진입·warn/off 경계·off밸브 skip감사·하위호환 A/B · 밀폐 tmpdir+JAVIS_ROOT / "
+          "T1 verify 게이트 — warn·off·strict 문면·wakeup 1건+drain 흔적+A4 마커 억제/해제·"
+          "grandfather·set-verify-spec 유효/거부·B5 risk 비-dict 거부·waiver 3상+B1 분기·"
+          "시스템 템플릿·--brief hard·B6 산소유자 9 우선·동시성 lost-update 0·B7 마커 자동생성·"
+          "A3 스키마 parity)")
     return EXIT_OK
 
 
@@ -1041,6 +1866,9 @@ def main(argv=None):
     c.add_argument("id")
     c.add_argument("--owner", required=True, help="워커/세션 식별자")
     c.add_argument("--pid", type=int, help="락 생존 판정에 쓸 장수 프로세스 pid(기본: 호출자)")
+    c.add_argument("--brief", default=None,
+                   help="T1: 위임 브리프 파일 — javis_brief_lint hard 경로(verify[] 형식 위반 = "
+                        "exit 6 거부). 인세션 경고 경로는 hooks/brief-lint-warn.sh(fail-open)")
     c.set_defaults(fn=cmd_checkout)
 
     c = sub.add_parser("release")
@@ -1066,6 +1894,15 @@ def main(argv=None):
     c.add_argument("--skip-reason", dest="skip_reason", default=None,
                    help="W0-3·E1: 검증 불가 사유 — evidence/artifact 대체(사용 시 skip_audit.jsonl 감사 기록)")
     c.set_defaults(fn=cmd_set_status)
+
+    c = sub.add_parser("set-verify-spec",
+                       help="T1: verify_spec 등록(스키마 검증+wlock 직렬화) — 작성 3분할: "
+                            "선언=master·하네스/calibrate=워커·봉인=master(조건 27)")
+    c.add_argument("id")
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("--file", default=None, help="verify_spec JSON 파일 경로")
+    g.add_argument("--json", default=None, help="verify_spec JSON 문자열")
+    c.set_defaults(fn=cmd_set_verify_spec)
 
     c = sub.add_parser("ready")
     c.add_argument("id")
