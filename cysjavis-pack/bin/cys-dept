@@ -298,6 +298,88 @@ os.replace(tmp,dst)
 PY
 }
 
+# ── G3(W3): launch(=rotate 공용)의 **계정격리 복원** ────────────────────────────
+# ★결함(G3): `allocate`·`create` 는 데몬을 `CYS_ACCOUNT_DIR=<fork dir>` 로 띄우고 부서 팩
+#   agents.json 의 CLAUDE_CONFIG_DIR 을 그 dir 로 시드했는데, **launch 는 둘 다 하지 않았다**.
+#   그런데 `rotate`(버전 스큐 세대교체)는 launch 를 재귀 호출한다 — 즉 **rotate 한 번으로 계정격리가
+#   조용히 풀렸다**(데몬 env 소실 + agents.json 이 base 를 가리키면 오너 config 공유 = F1 붕괴).
+# ★복원 규약(3순위): ①명시 env(CYS_ACCOUNT_DIR) ②레지스트리 `account_dir`(create·allocate 기록)
+#   ③부서 팩 agents.json 의 현재 CLAUDE_CONFIG_DIR. 유도값이 없으면 계정격리를 쓰지 않는 부서
+#   (구 launch 산출)이므로 **무동작**(회귀 0).
+reg_get_field(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY'
+import json,sys
+p,n,f=sys.argv[1:4]
+try: d=json.load(open(p))
+except Exception: sys.exit(0)
+e=(d.get('depts') or {}).get(n) or {}
+print(e.get(f) or '')
+PY
+}
+
+# 레지스트리 필드 1개 기록(flock RMW·원자 교체 — reg_set_meta 와 동일 규약, 임의 필드용).
+reg_set_field(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+import json,sys,os
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
+p,n,k,v=sys.argv[1:5]
+lf=open(p+'.lock','w'); _lk(lf)
+try:
+    try: d=json.load(open(p))
+    except Exception: d={'depts':{}}
+    e=d.setdefault('depts',{}).setdefault(n,{})
+    e[k]=v
+    tmp=p+'.tmp.%d'%os.getpid()
+    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,p)
+finally: _ulk(lf)
+PY
+}
+
+# 부서 팩 agents.json 이 실제로 가리키는 계정 dir(=시드된 값) 출력. 없으면 빈 출력.
+pack_seeded_acct(){ python3 - "$1/agents.json" <<'PY'
+import json,sys,re
+try: d=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception: sys.exit(0)
+c=d.get("claude") or {}
+env=c.get("env")
+if isinstance(env,dict) and env.get("CLAUDE_CONFIG_DIR"):
+    print(env["CLAUDE_CONFIG_DIR"]); sys.exit(0)
+m=re.search(r'CLAUDE_CONFIG_DIR="([^"]*)"', c.get("cmd",""))
+if m: print(m.group(1))
+PY
+}
+
+# 이 부서의 계정 dir 유도(위 3순위). 빈 출력 = 계정격리 미사용 부서.
+resolve_lane_acctdir(){
+  local name="$1" pack="$2" v
+  if [ -n "${CYS_ACCOUNT_DIR:-}" ]; then echo "$CYS_ACCOUNT_DIR"; return 0; fi
+  v="$(reg_get_field "$name" account_dir 2>/dev/null | tail -1)"
+  [ -n "$v" ] && { echo "$v"; return 0; }
+  v="$(pack_seeded_acct "$pack" 2>/dev/null | tail -1)"
+  [ -n "$v" ] && { echo "$v"; return 0; }
+  return 0
+}
+
+# 계정격리 시드 검증(+자기치유). 0=격리 확정 또는 해당없음 · 1=격리 실패(호출부 fail-closed).
+verify_lane_account_seed(){
+  local pack="$1" acctdir="$2" cur
+  [ -n "$acctdir" ] || return 0                 # 계정격리 미사용 부서 — 검증 대상 아님
+  cur="$(pack_seeded_acct "$pack" 2>/dev/null | tail -1)"
+  [ "$cur" = "$acctdir" ] && return 0           # 이미 정합(멱등)
+  echo "[cys-dept] 계정격리 시드 재확립: agents.json CLAUDE_CONFIG_DIR '${cur:-none}' → '$acctdir'" >&2
+  seed_agents_account "$pack" "$acctdir" || return 1
+  cur="$(pack_seeded_acct "$pack" 2>/dev/null | tail -1)"
+  [ "$cur" = "$acctdir" ]
+}
+
 # 부서 schedule 시드 — owner-progress-report(5/15분 보고)는 최상위(owner/CEO) 데몬만 돌려야 한다.
 # pack install이 임베드 schedule.json(owner-보고 job)을 모든 pack에 깔므로, 부서 pack은 데몬 기동
 # 후 빈 jobs로 덮어쓴다(데몬 30초 내 핫리로드 + install은 user-modified 보존으로 영속). 부서마다
@@ -503,18 +585,37 @@ case "$cmd" in
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     reg_upsert "$name" "$sock" "$pack"
+    # ★G3(W3): 계정격리 복원 — rotate 가 이 경로를 재귀 호출하므로, 여기서 계정 dir 을 유도하지
+    #   않으면 **재기동 한 번으로 격리가 조용히 풀린다**(데몬 env 소실 → 자식 claude 가 오너 base
+    #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
+    acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)"
+    if [ -n "$acctdir" ]; then
+      mkdir -p "$acctdir" 2>/dev/null || true
+      [ -d "$acctdir" ] || { echo "[cys-dept] ERROR: $name account dir 사용 불가($acctdir) — fail-closed(비격리 기동 금지)" >&2; exit 5; }
+    fi
     if ready "$sock"; then
       echo "[cys-dept] $name 이미 가동 중 — 재사용"
     else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      if [ -n "$acctdir" ]; then
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
+          nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      else
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
+    # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).
+    #   실패는 '비격리 확정'이므로 fail-closed 로 멈춘다(create/allocate 의 exit 6 규약과 동형).
+    if ! verify_lane_account_seed "$pack" "$acctdir"; then
+      echo "[cys-dept] ERROR: $name 계정격리 시드 실패(agents.json CLAUDE_CONFIG_DIR≠$acctdir) — fail-closed" >&2
+      exit 6
+    fi
     ceo_promote
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
-    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack). 부서 수=$(reg_count)"
+    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none}). 부서 수=$(reg_count)"
     ;;
   allocate)
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
@@ -581,6 +682,10 @@ PY
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
     [ -d "$acctdir" ] || { echo "[cys-dept] allocate: account fork dir 생성 실패: $acctdir — fail-closed" >&2; exit 5; }
+    # ★G3(W3): account_dir 을 레지스트리에 **기록**한다 — rotate/launch 가 계정격리를 복원할 때
+    #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
+    #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
+    reg_set_field "$name" account_dir "$acctdir" || true
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2

@@ -31,7 +31,9 @@ BIN = os.path.dirname(SELF)                                              # cysja
 REPO = os.path.dirname(os.path.dirname(BIN))                             # 저장소 루트
 sys.path.insert(0, BIN)
 
+import javis_bootstrap as BOOT                                           # noqa: E402
 import javis_orchestra as ORC                                            # noqa: E402
+import javis_preflight as PFL                                            # noqa: E402
 import javis_report as RP                                                # noqa: E402
 import javis_todo_decl as TD                                             # noqa: E402
 import javis_todo_stamp as ST                                            # noqa: E402
@@ -80,6 +82,42 @@ class PackDirEnvKeys(unittest.TestCase):
     def test_python_implementations_agree(self):
         self.assertEqual(RP.PACK_DIR_ENV_KEYS, ORC.PACK_DIR_ENV_KEYS)
         self.assertEqual(RP.PACK_DIR_ENV_KEYS, ST.PACK_DIR_ENV_KEYS)
+        # ★A11(T-0147-7 W3): 부트 체인 2구현도 같은 목록을 갖는다. 실측 분열은 4/3/2/1 이었고,
+        #   그 '1' 이 **javis_bootstrap**(CYS_PACK_DIR 단독)·'3' 이 **javis_preflight**
+        #   (AITERM_PACK_DIR 누락)였다 — 레거시 env 기계에서 부트가 검사·기동하는 팩이 갈렸다.
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, PFL.PACK_DIR_ENV_KEYS,
+                         "preflight 팩 env 목록이 갈렸다 — 검사 대상 팩 ≠ 실사용 팩(A11)")
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, BOOT.PACK_DIR_ENV_KEYS,
+                         "bootstrap 팩 env 목록이 갈렸다 — 부트가 다른 팩을 기동(A11)")
+
+    def test_preflight_and_bootstrap_resolve_legacy_key(self):
+        """★A11 행동 축 — `AITERM_PACK_DIR`만 설정된 환경에서 부트 체인 전원이 같은 팩을 본다."""
+        saved = {k: os.environ.get(k) for k in RP.PACK_DIR_ENV_KEYS}
+        try:
+            for k in RP.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            os.environ["AITERM_PACK_DIR"] = "/tmp/legacy-pack-w3"
+            self.assertEqual(PFL.pack_dir(), "/tmp/legacy-pack-w3")
+            self.assertEqual(BOOT._pack_from_env(), "/tmp/legacy-pack-w3")
+            self.assertEqual(ORC.pack_dir(), "/tmp/legacy-pack-w3")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_hook_prelude_documents_the_same_key_list(self):
+        """훅 프리루드(`hooks/_lib.sh`)는 팩 경로를 `CYS_PACK_DIR`(데몬 주입·레인 스코프)만으로
+        해소한다 — 그 **의도적 축소**와 정본 목록을 주석에 못박고, 목록이 갈리면 여기서 멈춘다.
+        (문서와 코드가 갈리는 자리는 그 자체가 결함이다 — 설계 §14-4 4번.)"""
+        lib = os.path.join(os.path.dirname(BIN), "hooks", "_lib.sh")
+        self.assertTrue(os.path.isfile(lib), "프리루드 부재: %s" % lib)
+        with open(lib, encoding="utf-8") as f:
+            body = f.read()
+        canon = " ".join(RP.PACK_DIR_ENV_KEYS)
+        self.assertIn(canon, body,
+                      "프리루드 주석의 팩 env 정본 목록이 코드와 갈렸다(기대: %s)" % canon)
 
     def test_python_matches_rust(self):
         self.assertEqual(list(RP.PACK_DIR_ENV_KEYS), self.rust_keys(),

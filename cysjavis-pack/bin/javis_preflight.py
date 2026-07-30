@@ -26,6 +26,21 @@ import tempfile
 import threading
 import time
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 스크립트 폴더를 sys.path 에 넣지 않는다(javis_bootstrap.py:94
+#   선례·test_import_guard 계약). append 인 이유: 발견이 목적이고 stdlib precedence 를 강등하지 않는다.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# ★공용 크로스플랫폼 락·원자쓰기(W1a 신설 javis_lock → W3 소비 이관 · G16).
+#   import 실패(팩 스큐·부분 배포)는 preflight 를 죽이지 않는다 — None 이면 `_settings_rmw` 가
+#   mkstemp 인라인 폴백으로 강등한다(직렬화만 상실·등록은 계속).
+try:
+    import javis_lock as _lock
+except Exception:
+    _lock = None
+
 PASS, FAIL, WARN, FIXED, SKIP = "PASS", "FAIL", "WARN", "FIXED", "SKIP"
 # OPP-17 Mutation 게이트 status — dry/safe 미리보기·무변경진단·비가역 차단(WARN-first).
 DRYRUN, SAFE_GAP, BLOCKED = "DRYRUN", "SAFE-GAP", "BLOCKED"
@@ -257,6 +272,19 @@ SELFCORR_HOOKS = [
     ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
 ]
 
+# ★소망상태 매니페스트의 파이썬 측 — **각성 티어**(awakening tier · A9 · W3).
+#   "없으면 부트 발화 자체가 사라지는" 훅 집합이다: SessionStart(=/clear 후 지침 재주입) +
+#   UserPromptSubmit(=마스터 선언 부트 발화). Rust 측 정본은 `src/pack.rs AWAKENING_HOOKS` 이고
+#   **집합 대조는 bin/tests/run_bootstrap_health.py H-SEED-1** 이 한다(언어 경계=기계 대조·A11 규율).
+#   등록 주체: session-start.sh=C08(FAIL) · role-bootstrap.sh=C28(★A21로 FAIL 티어 격상).
+#   ※ 이 목록은 '소망상태'이고 SELFCORR_HOOKS 는 'C28 이 등록하는 집합'이다 — 교집합이
+#     role-bootstrap 이며, H-SEED-1 이 그 포함관계까지 단언한다(집행자 누락 방지).
+AWAKENING_HOOKS = [
+    ("session-start.sh", [("SessionStart", None)]),
+    ("role-bootstrap.sh", [("UserPromptSubmit", None)]),
+]
+AWAKENING_SCRIPTS = {script for script, _ in AWAKENING_HOOKS}
+
 # work management 앵커(절대지침 5차) 4규칙 b·c의 전담 sub-skill — C22가 존재·본문을 검증한다.
 WORK_SKILLS = ["hallucination-guard", "grill-me"]
 
@@ -325,9 +353,20 @@ AUTOPILOT_MEMORY_INDEX_LINE = (
 )
 
 
+# ★팩 경로 env 키 목록·순서의 단일 상수(A11 · W3). 이 목록이 계약이다 — 먼저 발견되는
+#   비어있지 않은 값이 이긴다. 같은 목록·같은 순서를 갖는 구현: src/pack.rs `PACK_DIR_ENV_KEYS`(Rust) ·
+#   javis_report · javis_orchestra · javis_todo_stamp · javis_bootstrap · 이 파일(Python).
+#   기계 대조: bin/tests/test_todo_shared_constants.py(2언어 전 구현) — 한 곳만 고치면 테스트가 멈춘다.
+# ★A11 실측 교정: 종전 이 함수의 목록은 3키(AITERM_PACK_DIR 누락)였는데 docstring 은 "pack.rs 의
+#   4단 폴백을 그대로 미러링한다"고 **거짓 주장**했다(재감사 A11: 주장 자체가 자기 증거). 레거시
+#   env(AITERM_PACK_DIR)만 설정된 기계에서 preflight 는 홈 기본 팩을, Rust·orchestra 는 레거시 팩을
+#   봐서 **검사 대상과 실사용 팩이 갈렸다**. 목록을 4키로 맞추고 주장을 참으로 만든다.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def pack_dir():
-    """pack 위치 결정 — src/pack.rs pack_dir()의 4단 폴백을 그대로 미러링한다."""
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """pack 위치 결정 — src/pack.rs pack_dir()의 4단 폴백(PACK_DIR_ENV_KEYS)을 그대로 미러링한다."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return v
@@ -346,17 +385,54 @@ def _cys_hook_cmd(script_name):
     return "sh " + script
 
 
+# ★G10(W3): '우리 훅인가' 판정의 소유 술어. 종전 술어는 `script_name in c and "hooks" in c` 라는
+#   **부분문자열 2개**였다 — 사용자가 자기 훅을 `~/myhooks/inject-context.sh`(또는 어떤 경로든
+#   'hooks' 문자열을 포함하는 곳)에 두면 우리 등록기가 그것을 '우리 파손 엔트리'로 보고 **무음 삭제**
+#   했다(사용자 설정 파괴 · 되돌릴 근거도 안 남는다). 판정은 두 조건의 **동시 충족**으로 좁힌다:
+#     ⓐ 경로 꼬리가 정확히 `/hooks/<script_name>` (구성요소 경계 — `/myhooks/…` 는 탈락)
+#     ⓑ 그 경로가 **cys 관리 루트** 아래(현재 팩 접두 또는 알려진 cys 레거시 루트)
+#   ⓑ 없이 ⓐ만 쓰면 `~/mytools/hooks/inject-context.sh` 같은 제3자 훅이 여전히 삭제 대상이 되고,
+#   ⓐ 없이 ⓑ만 쓰면 원 결함(부분문자열)이 남는다. 구 cys 경로(.config/cysjavis 등)의 죽은 엔트리는
+#   ⓑ의 레거시 루트 목록으로 계속 회수한다(회귀 0 — 그 청소가 중복 append 방지의 본래 목적).
+_CYS_LEGACY_HOOK_ROOTS = ("/.cys/", "/.config/cysjavis/", "/.aiterm/", "/cysjavis-pack/")
+
+
+def _hook_cmd_paths(cmd):
+    """hook command 문자열에서 경로 후보를 뽑는다(정슬래시 정규화). `sh <abs>` / `bash "<abs>"` /
+    env 접두(VAR=x sh …) 등 배포된 형태를 모두 커버 — 토큰 단위로 훑고 따옴표만 벗긴다."""
+    norm = (cmd or "").replace("\\", "/")
+    out = []
+    for tok in norm.replace('"', " ").replace("'", " ").split():
+        if "/" in tok:
+            out.append(tok)
+    return out
+
+
+def _hook_entry_is_ours(cmd, script_name, pack_hooks_prefix):
+    """순수 판정: 이 hook command 가 **우리 팩의 script_name 훅**을 가리키나(G10 소유 술어)."""
+    tail = "/hooks/" + script_name
+    for path in _hook_cmd_paths(cmd):
+        if not path.endswith(tail):
+            continue                     # ⓐ 경로 꼬리 정확 매치(구성요소 경계)
+        if path.startswith(pack_hooks_prefix):
+            return True                  # ⓑ-1 현재 팩(레인 팩 포함) 접두
+        if any(root in path for root in _CYS_LEGACY_HOOK_ROOTS):
+            return True                  # ⓑ-2 알려진 cys 레거시 루트(죽은 엔트리 회수)
+    return False
+
+
 def _prune_stale_hook_entries(arr, script_name, desired):
-    """event hook 배열에서 script_name(우리 팩 hook basename)을 참조하되 desired와 다른(구·파손)
-    엔트리를 제거한다. return (정리된 리스트, desired 존재 여부). 비-cys 엔트리·타 스크립트·정상
-    엔트리는 보존 → in-place 업그레이드 시 파손 항목만 교체(중복 append·잔존 파손 동시 차단)."""
+    """event hook 배열에서 **우리 팩의** script_name 훅을 참조하되 desired와 다른(구·파손)
+    엔트리를 제거한다. return (정리된 리스트, desired 존재 여부). 비-cys 엔트리·사용자 동명 훅·
+    타 스크립트·정상 엔트리는 보존 → in-place 업그레이드 시 파손 항목만 교체."""
+    prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
     kept, have = [], False
     for entry in arr:
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
         cmds = [h.get("command", "") for h in entry.get("hooks", []) if isinstance(h, dict)]
-        ours = any(script_name in c and "hooks" in c for c in cmds)
+        ours = any(_hook_entry_is_ours(c, script_name, prefix) for c in cmds)
         if not ours:
             kept.append(entry)
         elif desired in cmds:
@@ -421,61 +497,190 @@ def _path_under_tempdir(p):
     return False
 
 
-def discover_claude_settings():
-    """$HOME 직하 .claude*/settings.json 전부(존재 파일만·사전순) + cys 계정 config dir.
+def _discover_isolation_block():
+    """등록 금지(격리) 컨텍스트인가 — (사유|None, 좁힌 대상|None).
 
-    home-glob 부분은 cys.rs와 동일 규칙(unchanged·isfile 게이트·사전순). 추가로 master 및
-    ~/.cys/claude 를 공유하는 claude-adapter 리뷰어가 기동하는 cys 전용 config dir
-    (${CYS_ACCOUNT_DIR:-dirname(pack_dir())/claude})의 settings.json을 마지막에 append한다 —
-    agents.json claude.cmd 의 CLAUDE_CONFIG_DIR 해석(C31 L2022)과 byte-identical.
-    init-pack(여전히 ~/.claude* 만 glob)과 **의도적 분기**: event-hook 배포는 init-pack이 아니라
-    preflight 소관(C08/C27/C28/C32/C33가 이 함수를 소비). agy/codex는 Claude-config 노드가
-    아니므로 미대상. 함수는 절대 raise 안 함(부재/이상 dir은 부분 커버리지로 graceful 강등)."""
-    home = os.path.expanduser("~")
-    found = []
+    ★G1(W3) sentinel 의 근거: 종전 이 판정은 `[]` 를 반환했고, 호출부가 `discover() or [~/.claude]`
+      로 폴백해 **금지가 통째로 무효화**됐다(부서·임시 팩이 실 글로벌 settings 에 자기 훅을 등록).
+      `[]`(순수 미발견 — 신규 머신) 와 `금지`(격리 팩)는 **정반대 처방**이므로 융합하면 안 된다:
+      전자는 폴백 생성이 정답, 후자는 등록 0 이 정답이다. 그래서 판정을 여기서 분리해 낸다.
+    """
+    _acct = os.environ.get("CYS_ACCOUNT_DIR")
     # 축A 근본복원(2026-06-30): 부서 데몬 컨텍스트(CYS_ACCOUNT_DIR이 부서 전용 dir·basename에
     # 'dept-')에서는 home-glob을 생략하고 자기 account_dir settings.json에만 hook을 등록한다.
     # home-glob을 그대로 두면 부서 preflight가 CEO(CEO 프로필 config)·타부서 config에까지
     # hook을 append해 dept-3·dept-4처럼 무한 재발한다(부서장 config 공유와 무관한 절차 버그).
-    _acct = os.environ.get("CYS_ACCOUNT_DIR")
     _acct_is_dept = bool(_acct and "dept-" in os.path.basename(os.path.normpath(_acct)))
     # R2 강화(2026-06-30): CYS_ACCOUNT_DIR 누락 엣지에서도 pack_dir이 pack-dept-* 면 부서로 판별 →
     # home-glob 진입을 차단해 CEO·타부서 settings 재누수를 env 비의존으로 원천 봉쇄.
     _pack_is_dept = "pack-dept-" in os.path.basename(os.path.normpath(pack_dir()))
     if _acct_is_dept or _pack_is_dept:
         if _acct and os.path.isdir(_acct):
-            return [os.path.join(_acct, "settings.json")]
-        return []  # account_dir 미상 시: 글로벌 등록 절대 금지(누수방지 우선·부서 settings는 cys-dept가 생성)
+            # 좁힌 대상(자기 account dir)만 허용 — 글로벌은 금지 상태 그대로다.
+            return ("부서 팩/계정 컨텍스트 — 자기 account dir 한정 등록",
+                    [os.path.join(_acct, "settings.json")])
+        return ("부서 팩 컨텍스트인데 account_dir 미상 — 글로벌 등록 절대 금지"
+                "(부서 settings 는 cys-dept 가 생성)", [])
     # 2026-07-02 근본복원(temp-pack 누수): grill embed/스냅샷 하네스가 CYS_PACK_DIR=/tmp/snap_grill_* 로
     # preflight --fix 를 돌리면 home-glob을 타고 실 글로벌 settings에 /tmp 세션훅을 등록 → temp가 비거나
-    # 사라지며 "No such file" 무한재발. dept 가드(_pack_is_dept)의 짝: 임시 pack은 실 config에 절대
-    # 등록 금지(스냅샷/테스트 부작용 0). 이미 등록된 잔해 청소는 C57.
+    # 사라지며 "No such file" 무한재발. dept 가드의 짝: 임시 pack은 실 config에 절대 등록 금지
+    # (스냅샷/테스트 부작용 0). 이미 등록된 잔해 청소는 C57.
     if _path_under_tempdir(pack_dir()):
-        return []
+        return ("임시 팩 컨텍스트(%s) — 실 config 등록 절대 금지" % pack_dir(), [])
+    return (None, None)
+
+
+def discover_claude_settings():
+    """$HOME 직하 .claude* **프로필 디렉터리**의 settings.json 전부(사전순) + 실사용 config dir.
+
+    반환은 **항상 리스트**다(읽기 전용 소비자 계약 — raise 없음·None 없음). 등록(쓰기) 소비자는
+    `resolve_registration_targets()` 를 써야 한다 — 그쪽만 '금지'와 '미발견'을 구분한다(G1).
+
+    · ★R4(W3): `CLAUDE_CONFIG_DIR`(현재 세션의 **실사용** config dir)이 있으면 **최우선**으로 넣는다.
+      종전엔 이 env 를 아예 보지 않아, 실제로 훅이 필요한 그 디렉터리가 등록 대상에서 빠질 수 있었다
+      (등록≠가동 갭의 절반 — A21 재검증 R4).
+    · ★G7(W3): 후보 기준은 **디렉터리 존재**다. 종전 `isfile(settings.json)` 게이트는 파일이 아직
+      없는 프로필을 영구 미배선으로 굳혔다(등록기는 makedirs+create 를 이미 한다 — cys.rs
+      `discover_claude_settings` 와 동일 규칙).
+    · cys 계정 config dir(${CYS_ACCOUNT_DIR:-dirname(pack_dir())/claude})을 append 한다 —
+      agents.json claude.env 의 CLAUDE_CONFIG_DIR 해석(C31)과 같은 규약이다.
+    · agy/codex 는 Claude-config 노드가 아니므로 미대상.
+    """
+    reason, narrow = _discover_isolation_block()
+    if reason is not None:
+        return list(narrow or [])
+    home = os.path.expanduser("~")
+    found = []
+    seen = set()
+
+    def _add(path):
+        try:
+            key = os.path.realpath(path)
+        except OSError:
+            key = path
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(path)
+
+    # ★R4: 실사용 config dir 최우선(디렉터리 존재 시에만 — 없는 경로를 만들지 않는다).
+    ccd = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if ccd and os.path.isdir(ccd):
+        _add(os.path.join(ccd, "settings.json"))
     try:
         names = os.listdir(home)
     except OSError:
         names = []
     for n in sorted(names):
         if n == ".claude" or n.startswith(".claude-"):
-            p = os.path.join(home, n, "settings.json")
-            if os.path.isfile(p):
-                found.append(p)
+            d = os.path.join(home, n)
+            if os.path.isdir(d):                     # ★G7: 디렉터리 존재 기준
+                _add(os.path.join(d, "settings.json"))
     # cys 계정 config dir(master + ~/.cys/claude 공유 claude-adapter 리뷰어) 포함.
     # env-first: dept 데몬은 CYS_ACCOUNT_DIR=~/.cys/claude-<key>로 기동되므로 자기 dir이 정답
-    # (하드코딩 ~/.cys/claude는 dept 오타깃). 디렉터리 존재 시에만 포함(미기동 노드 config dir
-    # 생성 방지). 파일 부재여도 포함 — _register_event_hook이 makedirs+create.
+    # (하드코딩 ~/.cys/claude는 dept 오타깃). 디렉터리 존재 시에만 포함(미기동 노드 config dir 생성 방지).
     try:
         account_dir = os.environ.get("CYS_ACCOUNT_DIR") or os.path.join(
             os.path.dirname(os.path.normpath(pack_dir())), "claude")
         if account_dir and os.path.isdir(account_dir):
-            cand = os.path.join(account_dir, "settings.json")
-            seen = {os.path.realpath(p) for p in found}
-            if os.path.realpath(cand) not in seen:
-                found.append(cand)
+            _add(os.path.join(account_dir, "settings.json"))
     except Exception:
         pass  # 부재/이상 dir → home-glob만 반환(preflight 부트 게이트라 crash 금지)
     return found
+
+
+def resolve_registration_targets():
+    """훅 **등록(쓰기)** 대상 해소 — `(targets, forbidden_reason)`.
+
+    · `forbidden_reason` 이 not-None 이면 **글로벌 폴백 금지**다(targets 는 좁힌 목록 또는 빈 목록).
+    · None 이면 targets 는 발견 목록이며, 순수 미발견(신규 머신)일 때만 기본 프로필
+      `~/.claude/settings.json` **한 건**으로 폴백한다(등록기가 생성한다).
+    ★G1: 이 반환 계약이 '금지'와 '미발견'의 융합을 절단한다 — 종전 `discover() or [기본]` 관용구는
+      금지 컨텍스트에서도 기본 프로필로 폴백해 격리를 무효화했다(H-EXIT-8).
+    """
+    reason, narrow = _discover_isolation_block()
+    if reason is not None:
+        return (list(narrow or []), reason)
+    targets = discover_claude_settings()
+    if targets:
+        return (targets, None)
+    return ([os.path.join(os.path.expanduser("~"), ".claude", "settings.json")], None)
+
+
+# ── settings.json read-modify-write 의 단일 소유자 (G16 · W3) ────────────────────
+# ★결함(G16): settings.json 은 **3-writer 대상**이다 — python preflight(C08/C27/C28/C32/C33/C41) ·
+#   Rust 시드/init-pack · 부서 마이그레이션. 그런데 preflight 의 네 등록기가 각자
+#   `open(path + ".tmp")` → `os.replace` 를 재구현했고 tmp 이름이 **고정**이었다: 동시 writer 가
+#   서로의 임시 파일에 써서 **교차 파손**(반쪽 JSON)을 만들고, 그러면 그 뒤 모든 등록기가
+#   "파싱 실패 — 덮어쓰기 거부"로 수리를 영구 포기한다(A8 재검증이 지목한 지배 실패 모드).
+#   Rust 측 원자화는 W2(A8rs)에서 착지했고, python 측 락·mkstemp 유틸은 W1a(javis_lock)에서
+#   신설됐다 — W3 은 그 유틸의 **소비 이관**이다(신설 1회 + 소비 이관 = 원자 단위·비평1 #19).
+# 계약: ①레인 무관 **파일별 락**(`<settings>.cys-lock`)으로 3-writer 직렬화 ②symlink 거부
+#   ③파싱 실패 = 거부(빈 dict 로 대체 금지) ④최초 1회 백업 보존 ⑤mkstemp+replace 원자 교체.
+#   락 사용 불가(백엔드 부재)여도 **쓰기는 진행**한다 — 직렬화 상실은 열화이고, 등록 자체를
+#   포기하면 훅이 사라진다(가용성 우선·조용하지 않게 사유를 반환값에 싣지 않고 stderr 로 남긴다).
+def _settings_rmw(settings_path, mutate, indent=2):
+    """settings.json 을 락 아래에서 읽고-바꾸고-원자적으로 쓴다.
+
+    `mutate(data) -> None|str` : data(dict)를 제자리 수정. 문자열을 반환하면 그 사유로 중단(무쓰기).
+    반환: None=성공 / 문자열=실패 사유(호출자가 FAIL·WARN 으로 보고).
+    """
+    if os.path.islink(settings_path):
+        return "symlink 거부(실파일만 허용): %s" % settings_path
+    d = os.path.dirname(settings_path)
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            return "설정 디렉터리 생성 실패: %s (%s)" % (d, e)
+    lock = None
+    if _lock is not None:
+        try:
+            lock = _lock.FileLock(settings_path + ".cys-lock", owner="preflight-settings",
+                                  blocking=True, timeout=10.0, soft=True)
+            lock.acquire()
+            if lock.status != _lock.ACQUIRED:
+                sys.stderr.write("[preflight] settings 락 미획득(%s: %s) — 직렬화 없이 진행: %s\n"
+                                 % (lock.status, lock.detail, settings_path))
+        except Exception as e:      # 락 인프라 고장이 등록을 죽이지 않는다
+            sys.stderr.write("[preflight] settings 락 사용 불가(%s) — 직렬화 없이 진행\n" % e)
+            lock = None
+    try:
+        data = {}
+        if os.path.isfile(settings_path):
+            try:
+                with open(settings_path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                return ("기존 settings.json 파싱 실패 — 덮어쓰기 거부(수동 복구 필요): %s (%s)"
+                        % (settings_path, e))
+            if not isinstance(data, dict):
+                return "settings.json 루트가 객체가 아님 — 거부: %s" % settings_path
+            # 최초 백업만 보존 — 재실행이 정상 백업을 손상 상태로 덮어쓰는 것을 차단.
+            backup = settings_path + ".bak-preflight"
+            if not os.path.exists(backup):
+                try:
+                    shutil.copy2(settings_path, backup)
+                except OSError as e:
+                    return "백업 생성 실패(쓰기 중단): %s (%s)" % (backup, e)
+        err = mutate(data)
+        if err:
+            return err
+        body = json.dumps(data, ensure_ascii=False, indent=indent)
+        if _lock is not None:
+            _lock.atomic_write_text(settings_path, body)
+        else:                       # 팩 스큐(javis_lock 부재) — mkstemp 인라인 폴백
+            fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=".tmp-settings-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(tmp, settings_path)
+        return None
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 class Preflight:
@@ -802,59 +1007,30 @@ class Preflight:
     def _register_hook(self, settings_path):
         """hook 등록. 성공=None, 실패=사유 문자열 (호출자가 FAIL로 보고).
 
-        안전장치: ①symlink 거부(링크 너머 실파일 훼손 차단) ②기존 파일이 JSON으로
-        파싱 안 되면 {}로 대체하지 않고 거부 — 침묵 데이터 소실 차단(rust 구현과 동일 규약).
+        안전장치는 `_settings_rmw`(G16 단일 소유자) 계약에 위임한다 — symlink 거부·파싱 실패
+        거부(빈 dict 대체 금지)·최초 1회 백업·**파일별 락 + mkstemp 원자 교체**.
         """
-        if os.path.islink(settings_path):
-            return "symlink 거부(실파일만 허용): %s" % settings_path
         cmd = _cys_hook_cmd("session-start.sh")
-        if os.path.isfile(settings_path):
-            try:
-                data = json.load(open(settings_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return ("기존 settings.json 파싱 실패 — 덮어쓰기 거부(수동 복구 필요): %s (%s)"
-                        % (settings_path, e))
-            if not isinstance(data, dict):
-                return "settings.json 루트가 객체가 아님 — 거부: %s" % settings_path
-            # 최초 백업만 보존 — 재실행이 정상 백업을 손상 상태로 덮어쓰는 것을 차단.
-            backup = settings_path + ".bak-preflight"
-            if not os.path.exists(backup):
-                shutil.copy2(settings_path, backup)
-        else:
-            data = {}
-            d = os.path.dirname(settings_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-        arr = data.setdefault("hooks", {}).setdefault("SessionStart", [])
-        # reconcile: 구·파손 엔트리 제거 후 desired 하나만 보장(중복·잔존 파손 차단).
-        kept, have = _prune_stale_hook_entries(arr, "session-start.sh", cmd)
-        if not have:
-            kept.append({"hooks": [{"type": "command", "command": cmd}]})
-        arr[:] = kept
-        # 원자적 쓰기(tmp+replace) — truncate-write 중 크래시가 settings.json을
-        # 파손시키면 다음 실행이 파싱 거부로 수리 불능에 빠진다(전수조사 발견).
-        tmp = settings_path + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(
-            json.dumps(data, ensure_ascii=False, indent=2)
-        )
-        os.replace(tmp, settings_path)
-        return None
+
+        def _mutate(data):
+            arr = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+            # reconcile: 구·파손 엔트리 제거 후 desired 하나만 보장(중복·잔존 파손 차단).
+            kept, have = _prune_stale_hook_entries(arr, "session-start.sh", cmd)
+            if not have:
+                kept.append({"hooks": [{"type": "command", "command": cmd}]})
+            arr[:] = kept
+
+        return _settings_rmw(settings_path, _mutate)
 
     def c08_hook_registered(self):
         cid = "C08.hook-registered"
         if self.skipped(cid):
             return
-        targets = discover_claude_settings()
-        if not targets:
-            default = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-            if self.fix:
-                err = self._register_hook(default)
-                if err:
-                    self.add(cid, FAIL, err)
-                else:
-                    self.add(cid, FIXED, "Claude 설정 미발견 → %s 생성·등록" % default)
-            else:
-                self.add(cid, FAIL, "~/.claude*/settings.json 미발견 — --fix로 생성 가능")
+        # ★G1: 등록 대상은 sentinel 계약으로 받는다 — '금지'(격리 팩)와 '미발견'(신규 머신)은
+        #   처방이 정반대다(등록 0 vs 기본 프로필 생성). 폴백은 resolve 가 소유한다.
+        targets, forbidden = resolve_registration_targets()
+        if forbidden and not targets:
+            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
             return
         unregistered = [t for t in targets if not self._hook_registered(t)]
         if not unregistered:
@@ -895,39 +1071,19 @@ class Preflight:
         """statusLine 등록. 성공=None, 실패=사유 문자열. 기존 statusLine은 CYS_PREV_STATUSLINE로
         래핑해 체인 보존(덮어쓰기 금지) — _register_hook과 동일한 symlink 거부·파싱 거부·최초
         백업·원자적 쓰기 철학."""
-        if os.path.islink(settings_path):
-            return "symlink 거부(실파일만 허용): %s" % settings_path
         base = _cys_hook_cmd("cys-statusline.sh")   # 정슬래시+따옴표(Windows) / sh <abs>(unix)
-        if os.path.isfile(settings_path):
-            try:
-                data = json.load(open(settings_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return ("기존 settings.json 파싱 실패 — 덮어쓰기 거부(수동 복구 필요): %s (%s)"
-                        % (settings_path, e))
-            if not isinstance(data, dict):
-                return "settings.json 루트가 객체가 아님 — 거부: %s" % settings_path
-            backup = settings_path + ".bak-preflight"
-            if not os.path.exists(backup):
-                shutil.copy2(settings_path, backup)
-        else:
-            data = {}
-            d = os.path.dirname(settings_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-        # 기존 statusLine(우리 것이 아니면) → CYS_PREV_STATUSLINE로 보존 체인(사람용 줄 위임).
-        prev = data.get("statusLine")
-        prev_cmd = prev.get("command", "") if isinstance(prev, dict) else ""
-        if prev_cmd and "cys-statusline.sh" not in prev_cmd:
-            cmd = "CYS_PREV_STATUSLINE=%s %s" % (shlex.quote(prev_cmd), base)
-        else:
-            cmd = base
-        data["statusLine"] = {"type": "command", "command": cmd}
-        tmp = settings_path + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(
-            json.dumps(data, ensure_ascii=False, indent=2)
-        )
-        os.replace(tmp, settings_path)
-        return None
+
+        def _mutate(data):
+            # 기존 statusLine(우리 것이 아니면) → CYS_PREV_STATUSLINE로 보존 체인(사람용 줄 위임).
+            prev = data.get("statusLine")
+            prev_cmd = prev.get("command", "") if isinstance(prev, dict) else ""
+            if prev_cmd and "cys-statusline.sh" not in prev_cmd:
+                cmd = "CYS_PREV_STATUSLINE=%s %s" % (shlex.quote(prev_cmd), base)
+            else:
+                cmd = base
+            data["statusLine"] = {"type": "command", "command": cmd}
+
+        return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
 
     def c32_statusline(self):
         cid = "C32.statusline"
@@ -938,9 +1094,9 @@ class Preflight:
             if not (self.fix and self.repair_via_init_pack() and os.path.isfile(script)):
                 self.add(cid, FAIL, "hooks/cys-statusline.sh 없음 — `cys init-pack` 또는 --fix")
                 return
-        targets = discover_claude_settings()
-        if not targets:
-            self.add(cid, WARN, "~/.claude*/settings.json 미발견 — claude 노드 기동 후 재실행")
+        targets, forbidden = resolve_registration_targets()   # ★G1 sentinel
+        if forbidden and not targets:
+            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
             return
         unregistered = [t for t in targets if not self._statusline_registered(t)]
         if not unregistered:
@@ -978,9 +1134,9 @@ class Preflight:
             if not (self.fix and self.repair_via_init_pack() and os.path.isfile(script)):
                 self.add(cid, WARN, "hooks/%s 없음 — `cys init-pack` 또는 --fix" % self.EVENT_HOOK)
                 return
-        targets = discover_claude_settings()
-        if not targets:
-            self.add(cid, WARN, "~/.claude*/settings.json 미발견 — claude 노드 기동 후 재실행")
+        targets, forbidden = resolve_registration_targets()   # ★G1 sentinel
+        if forbidden and not targets:
+            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
             return
         # 프로필×이벤트 단위로 미등록 항목 수집
         pending = [(t, ev) for t in targets for ev in self.EVENT_HOOK_EVENTS
@@ -2714,35 +2870,17 @@ class Preflight:
 
     def _register_appbuild_hook(self, settings_path):
         """PreToolUse(Edit|Write|NotebookEdit)로 게이트 hook 등록. 성공=None, 실패=사유."""
-        if os.path.islink(settings_path):
-            return "symlink 거부: %s" % settings_path
         cmd = _cys_hook_cmd(APPBUILD_HOOK)
-        data = {}
-        if os.path.isfile(settings_path):
-            try:
-                data = json.load(open(settings_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return "기존 settings.json 파싱 실패 — 거부: %s" % e
-            if not isinstance(data, dict):
-                return "settings.json 루트가 객체가 아님 — 거부"
-            backup = settings_path + ".bak-preflight"
-            if not os.path.exists(backup):
-                shutil.copy2(settings_path, backup)
-        else:
-            d = os.path.dirname(settings_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-        arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-        kept, have = _prune_stale_hook_entries(arr, APPBUILD_HOOK, cmd)
-        if not have:
-            kept.append({"matcher": "Edit|Write|NotebookEdit",
-                         "hooks": [{"type": "command", "command": cmd}]})
-        arr[:] = kept
-        tmp = settings_path + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(
-            json.dumps(data, ensure_ascii=False, indent=2))
-        os.replace(tmp, settings_path)
-        return None
+
+        def _mutate(data):
+            arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+            kept, have = _prune_stale_hook_entries(arr, APPBUILD_HOOK, cmd)
+            if not have:
+                kept.append({"matcher": "Edit|Write|NotebookEdit",
+                             "hooks": [{"type": "command", "command": cmd}]})
+            arr[:] = kept
+
+        return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
 
     # ── C28 자기교정·영속성 hook 등록 헬퍼 (event 일반화) ──
     @staticmethod
@@ -2764,37 +2902,19 @@ class Preflight:
     def _register_event_hook(self, settings_path, event, script_name, matcher=None):
         """event 에 pack/hooks/script_name 등록. 성공=None, 실패=사유. 멱등은 호출부.
         _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적)."""
-        if os.path.islink(settings_path):
-            return "symlink 거부: %s" % settings_path
         cmd = _cys_hook_cmd(script_name)
-        data = {}
-        if os.path.isfile(settings_path):
-            try:
-                data = json.load(open(settings_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return "기존 settings.json 파싱 실패 — 거부: %s" % e
-            if not isinstance(data, dict):
-                return "settings.json 루트가 객체가 아님 — 거부"
-            backup = settings_path + ".bak-preflight"
-            if not os.path.exists(backup):
-                shutil.copy2(settings_path, backup)
-        else:
-            d = os.path.dirname(settings_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-        arr = data.setdefault("hooks", {}).setdefault(event, [])
-        kept, have = _prune_stale_hook_entries(arr, script_name, cmd)
-        if not have:
-            entry = {"hooks": [{"type": "command", "command": cmd}]}
-            if matcher is not None:
-                entry["matcher"] = matcher
-            kept.append(entry)
-        arr[:] = kept
-        tmp = settings_path + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(
-            json.dumps(data, ensure_ascii=False, indent=2))
-        os.replace(tmp, settings_path)
-        return None
+
+        def _mutate(data):
+            arr = data.setdefault("hooks", {}).setdefault(event, [])
+            kept, have = _prune_stale_hook_entries(arr, script_name, cmd)
+            if not have:
+                entry = {"hooks": [{"type": "command", "command": cmd}]}
+                if matcher is not None:
+                    entry["matcher"] = matcher
+                kept.append(entry)
+            arr[:] = kept
+
+        return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
 
     def c27_appbuild(self):
         cid = "C27.appbuild"
@@ -2848,8 +2968,10 @@ class Preflight:
                 fixed.append("게이트 hook 실행권한")
         # (d) PreToolUse 게이트 hook 등록 (결정론 — .appbuild 밖 fail-open이라 안전)
         if os.path.isfile(hook_path):
-            targets = discover_claude_settings() or [
-                os.path.join(os.path.expanduser("~"), ".claude", "settings.json")]
+            targets, forbidden = resolve_registration_targets()   # ★G1 sentinel(폴백 소유자)
+            if forbidden and not targets:
+                warns.append("등록 대상 없음 — %s" % forbidden)
+                targets = []
             reg = 0
             for t in targets:
                 if self._appbuild_hook_registered(t):
@@ -2896,31 +3018,46 @@ class Preflight:
                     os.chmod(p, mode | 0o755)
                     fixed.append("%s 실행권한" % os.path.basename(p))
         # (b) 이벤트별 등록 (멱등 — 구 .config 경로는 미인정이라 패키지 경로로 신규 등록)
-        targets = discover_claude_settings() or [
-            os.path.join(os.path.expanduser("~"), ".claude", "settings.json")]
+        # ★G1 sentinel: 격리(부서/임시) 팩은 글로벌 폴백 없이 등록 0 — 폴백은 resolve 가 소유한다.
+        targets, forbidden = resolve_registration_targets()
+        if forbidden and not targets:
+            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
+            return
+        # ★A21(W3) 훅별 중요도 티어: **각성 훅**(role-bootstrap→UserPromptSubmit) 미등록은
+        #   C08(session-start)과 **대칭으로 FAIL** 이다. 종전엔 C28 전체가 WARN 이라, 부트 발화의
+        #   유일한 트리거가 빠져 있어도 preflight 가 초록에 가까웠다(C08=FAIL vs C28=WARN 비대칭 —
+        #   재감사 A21 확증). 나머지 자기교정 훅(inject·save·reflect·nudge·pack-guard)은 종전대로 WARN.
+        fails = []
         for t in targets:
             for script_name, events in SELFCORR_HOOKS:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
                     continue
+                tier_fatal = script_name in AWAKENING_SCRIPTS
                 for event, matcher in events:
                     if self._event_hook_registered(t, event, script_name):
                         continue
                     if self.fix:
                         err = self._register_event_hook(t, event, script_name, matcher)
                         if err:
-                            warns.append("%s/%s 등록 실패: %s"
-                                         % (os.path.basename(t), event, err))
+                            (fails if tier_fatal else warns).append(
+                                "%s/%s 등록 실패: %s" % (os.path.basename(t), event, err))
                         else:
                             fixed.append("%s←%s(%s)"
                                          % (os.path.basename(t), script_name, event))
                     else:
-                        warns.append("%s %s 미등록(--fix)"
-                                     % (os.path.basename(t), script_name))
+                        (fails if tier_fatal else warns).append(
+                            "%s %s(%s) 미등록%s" % (os.path.basename(t), script_name, event,
+                                                   "(--fix로 등록)" if tier_fatal else "(--fix)"))
         detail = "자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) 6종 + reflect 엔진"
         if fixed:
             shown = "; ".join(fixed[:6]) + (" …+%d" % (len(fixed) - 6) if len(fixed) > 6 else "")
             detail += " · " + shown
-        if warns:
+        if fails:
+            self.add(cid, FAIL,
+                     detail + " · ★각성 훅 미등록(부트 발화 불가 — C08 대칭 FAIL): "
+                     + " | ".join(fails[:6])
+                     + (" · 기타: " + " | ".join(warns[:3]) if warns else ""))
+        elif warns:
             self.add(cid, WARN, detail + " · " + " | ".join(warns[:6]))
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
@@ -3099,8 +3236,10 @@ class Preflight:
         # (b)(c) 두 hook(check=PreToolUse·count=PostToolUse) 존재·실행권·등록.
         # ★count(evaluator) 미배선이면 distinct가 영원히 0 → fail-CLOSED 마비라 FAIL로 강제.
         #   check(gatekeeper)는 마커 밖 fail-open이라 미등록 시 WARN(강제 약화일 뿐 마비 아님).
-        targets = discover_claude_settings() or [
-            os.path.join(os.path.expanduser("~"), ".claude", "settings.json")]
+        targets, forbidden = resolve_registration_targets()   # ★G1 sentinel(폴백 소유자)
+        if forbidden and not targets:
+            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
+            return
         for hname, hevent, hmatcher in GRILL_HOOKS:
             hook = os.path.join(pd, "hooks", hname)
             if not os.path.isfile(hook):

@@ -114,9 +114,30 @@ for _s in (sys.stdout, sys.stderr):
 
 HOME = os.path.expanduser("~")
 CYS_DIR = os.path.join(HOME, ".cys")
-PACK = os.environ.get("CYS_PACK_DIR") or os.path.join(CYS_DIR, "pack")
+# ★A11(W3): 팩 경로 env 키 목록·순서의 단일 상수 — src/pack.rs `PACK_DIR_ENV_KEYS`·javis_preflight·
+#   javis_report·javis_orchestra·javis_todo_stamp 와 **같은 목록·같은 순서**(기계 대조:
+#   bin/tests/test_todo_shared_constants.py). 종전 이 파일은 `CYS_PACK_DIR` **1키**만 봤다 —
+#   레거시 env(JAVIS_PACK_DIR·AITERM_*)만 설정된 기계에서 부트가 홈 기본 팩을, orchestra·preflight 는
+#   레거시 팩을 봐서 **부트가 검사·기동하는 팩이 갈렸다**(A11 실분열 4/3/2/1 의 '1').
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
+def _pack_from_env():
+    for _k in PACK_DIR_ENV_KEYS:
+        _v = os.environ.get(_k, "")
+        if _v:
+            return _v
+    return os.path.join(CYS_DIR, "pack")
+
+
+PACK = _pack_from_env()
+# ★base 마커(CEO 승격 게이트의 SOT) — 경로 불변. writer 는 base 레인 성공 경로 유일이며,
+#   cys-dept 의 `ceo_promote` 가 이 파일의 **존재**로 승격 게이트를 연다. 레인별 마커를 여기에
+#   쓰면 부서장 부트가 CEO 게이트를 오개방한다(P3-A-DEPT-LANE 금지 방향 ① — 절대 금지).
 MARKER = os.path.join(CYS_DIR, ".master-bootstrapped")
 STATE_DIR = os.path.join(CYS_DIR, "state")
+# ★base 레인 boot-last(§0 산문·GUI·테스트가 읽는 역사적 경로) — 비-base 레인은 `lane_state_path`
+#   가 `boot-last-<lane>.json` 으로 분리한다(G15).
 BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 # ⑤ bounded retry — 무한 대기 금지(자원 거버넌스). env 오버라이드는 테스트 하네스 전용.
 # ★예산 확대(오너 2026-07-15 적대검증 adv#4): 냉시작 claude는 모델 로드+MCP init로 30초 내
@@ -375,8 +396,63 @@ def _my_surface_id():
             or os.environ.get("AITERM_SURFACE_ID", "") or "")
 
 
+# ── 단계 정체성 레지스트리 (P3-A-STEP-NAME · W3) ─────────────────────────────
+# ★결함 2건(재검증이 성립 확정한 절반):
+#   ⓐ **동명이의 재사용** — `③′lane-pack` 이 '불량 레인(빈 부서명)'과 '레인↔팩 불일치' **두 개의
+#      다른 단계**에 쓰였고, `④′resource-gate` 가 '게이트 실행'과 '게이트 생략'에 쓰였다. 진단에서
+#      같은 이름이 다른 사건을 뜻하면 원인 추적이 갈린다.
+#   ⓑ **서수 ↔ 실행순서 불일치** — 레인 가드는 ①preflight 보다 **먼저** 도는데 이름은 `③′` 였고,
+#      티켓 소비는 ④boot **뒤**인데 이름은 `③″` 였다. 서수는 계약처럼 읽히므로(로그·산문·티켓)
+#      순서를 거짓말하는 이름은 그 자체가 오정보다.
+# ★해법: 라벨을 **선언 순서 = 실행 순서**인 단일 레지스트리로 승격하고(아래 튜플), 호출부는
+#   문자열 리터럴 대신 `STEP.*` 상수만 쓴다. `_Log.step` 이 미등록 라벨과 순서 역행을 런타임에
+#   기록하고(측정 실패를 침묵시키지 않는다), `--self-test` 가 ①유일성 ②리터럴 0(전 호출부가
+#   레지스트리 경유) ③기록 순서 단조를 단언한다(H-LIFE-2).
+_STEP_DEFS = (
+    # (상수명, 기록 라벨) — 이 순서가 실행 순서 계약이다.
+    ("LANE_MALFORMED", "⓪lane-malformed"),
+    ("LANE_MALFORMED_NOTIFY", "⓪lane-malformed-notify"),
+    ("LANE_PACK", "⓪lane-pack"),
+    ("LANE_PACK_NOTIFY", "⓪lane-pack-notify"),
+    ("PREFLIGHT", "①preflight"),
+    ("PING", "②ping"),
+    ("CLAIM_ROLE", "③claim-role"),
+    ("CLAIM_ROLE_CONTEXT", "③claim-role-context"),
+    ("CEO_TICKET", "③″ceo-ticket"),
+    ("RESOURCE_GATE_ABSENT", "④′resource-gate-absent"),
+    ("RESOURCE_GATE", "④′resource-gate"),
+    ("RESOURCE_GATE_NOTIFY", "④′resource-gate-notify"),
+    ("RESOURCE_GATE_SKIP", "④′resource-gate-skip"),
+    # ★W2: 팩↔바이너리 스큐 폴백은 ④boot **판정 기록 이전**에 남는다(선언 순서=실행 순서 계약).
+    ("BOOT_SKEW", "④boot-skew"),
+    ("BOOT", "④boot"),
+    ("BOOT_DEGRADE", "④boot-degrade"),
+    ("BOOT_TICKET_CONSUME", "④boot-ticket-consume"),
+    ("BOOT_REVIEWERS", "④b-boot-reviewers"),
+    ("BOOT_REVIEWERS_PERMANENT", "④b-permanent"),
+    ("BOOT_SKIP", "④boot-skip"),
+    ("CHECK", "⑤check"),
+    ("CHECK_UNJUDGEABLE", "⑤check-unjudgeable"),
+    ("MARKER", "⑥marker"),
+    ("PROMOTE_REQUEST", "⑦promote-request"),
+)
+
+
+class _StepIds:
+    """단계 라벨 상수 네임스페이스(enum 승격) — `STEP.BOOT` 형태로만 참조한다."""
+
+    def __init__(self, defs):
+        for name, label in defs:
+            setattr(self, name, label)
+
+
+STEP = _StepIds(_STEP_DEFS)
+STEP_ORDER = tuple(label for _, label in _STEP_DEFS)
+STEP_INDEX = {label: i for i, label in enumerate(STEP_ORDER)}
+
+
 class _Log:
-    """단계 결과를 boot-last.json에 누적(진단 가시성 — 각 retry 시도 포함).
+    """단계 결과를 (레인) boot-last 에 누적(진단 가시성 — 각 retry 시도 포함).
 
     ★A19 런 정체성: 레코드는 이제 **누가/언제/어디서** 돈 런인지 스스로 말한다.
       run_id(started+pid)·pid·surface·role 이 없던 종전에는 (ⓐ)한 레인의 두 pane 중 누구의 런인지,
@@ -393,14 +469,20 @@ class _Log:
         self.pid = os.getpid()
         self.run_id = "%s-%d" % (started, self.pid)
         self.surface = _my_surface_id()
+        # ★G15: 기록 대상은 **레인 boot-last** 다(base 레인은 역사적 경로 그대로).
+        #   전 레인 공유 단일 파일이던 종전에는 base·부서 동시 부트가 서로의 진단을 덮었다.
+        self.path = lane_state_path("boot_last")
+        self.lane = lane_key()
         self.data = {"started": started, "run_id": self.run_id, "pid": self.pid,
                      "surface": self.surface, "role": os.environ.get("CYS_ROLE", ""),
+                     "lane": self.lane, "boot_last_path": self.path,
                      "steps": [],
                      "socket": os.environ.get("CYS_SOCKET", ""), "base_socket": _is_base_socket(),
                      # ★선기록 — 이 시점 이후 어떤 경로로 죽어도 '진행 중'이 남는다.
                      "result": {"ok": None, "state": "running", "run_id": self.run_id,
                                 "surface": self.surface}}
-        _atomic_write_json(BOOT_LAST, self.data)
+        self._last_step_order = -1
+        _atomic_write_json(self.path, self.data)
 
     def _attributed(self, res):
         """result 딕트에 런 귀속을 못박는다 — §0 소비 술어('자기 surface의 최신 완주 런')의 전제."""
@@ -409,15 +491,34 @@ class _Log:
         res.setdefault("pid", self.pid)
         return res
 
-    def step(self, name, code, detail=""):
-        self.data["steps"].append({"step": name, "exit": code,
-                                   "detail": detail.strip()[-2000:]})
-        _atomic_write_json(BOOT_LAST, self.data)
+    def step(self, name, code, detail="", suffix=""):
+        """단계 기록. `name` 은 **STEP.* 상수**여야 한다(P3-A-STEP-NAME).
+
+        `suffix` 는 같은 단계의 반복 시도 표기(⑤check 의 `#3`) — 정체성은 base 라벨이 갖고
+        순서·유일성 판정도 base 라벨로 한다(구 `"⑤check#%d" % attempt` 문자열 조립이 단계 정체성을
+        매 시도마다 새로 만들던 것을 없앤다).
+        ★측정 실패를 침묵시키지 않는다: 미등록 라벨·순서 역행을 레코드에 상태로 남기고 stderr 로도
+          알린다(부트는 계속 — 진단 계측이 부트를 죽이면 안 된다).
+        """
+        rec = {"step": name + suffix, "exit": code, "detail": detail.strip()[-2000:]}
+        idx = STEP_INDEX.get(name)
+        if idx is None:
+            rec["step_unregistered"] = True
+            sys.stderr.write("[bootstrap] ⚠ 미등록 단계 라벨: %r(레지스트리 갱신 필요)\n" % name)
+        else:
+            rec["order"] = idx
+            if idx < self._last_step_order:
+                rec["order_violation"] = self._last_step_order
+                sys.stderr.write("[bootstrap] ⚠ 단계 순서 역행: %s(order %d < %d)\n"
+                                 % (name, idx, self._last_step_order))
+            self._last_step_order = max(self._last_step_order, idx)
+        self.data["steps"].append(rec)
+        _atomic_write_json(self.path, self.data)
 
     def result(self, **kw):
         """단계 성공/강등 경로의 result 기록(귀속 자동 첨부)."""
         self.data["result"] = self._attributed(dict(kw))
-        _atomic_write_json(BOOT_LAST, self.data)
+        _atomic_write_json(self.path, self.data)
 
     def finish(self, exit_code, exc=None):
         """★A19 종결 기록 — cmd_run 의 finally 가 유일 호출자. 어떤 경로로 끝나도 도달한다.
@@ -438,7 +539,7 @@ class _Log:
         else:
             res.setdefault("exit", exit_code)
             self._attributed(res)
-        _atomic_write_json(BOOT_LAST, self.data)
+        _atomic_write_json(self.path, self.data)
 
     def fail(self, name, code, detail, exit_code, ok=False, state="failed"):
         """실패·거부 경로의 공통 종결(단계 기록 → result → stderr → loud 알림).
@@ -466,17 +567,18 @@ class _Log:
         #      데몬 부재에서도 행 걸지 않는다).
         #   ③ 알림 결과 채널명을 boot-last에 남긴다 — '알렸다'는 주장이 아니라 실측 파생 기록
         #      (CS-3 보고=실측). 'none(...)' 이면 비제로 exit·boot-last가 최종 증거다.
-        hint = {"③claim-role": "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
-                "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
-                "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
-                "②ping": "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",
-                "③claim-role-context": "역할 등록 왕복이 세션 컨텍스트 오류로 실패했습니다 — "
+        # ★키는 STEP 상수다(리터럴 금지) — 라벨이 바뀌면 힌트가 조용히 안 붙는 드리프트를 차단한다.
+        hint = {STEP.CLAIM_ROLE: "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
+                STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
+                STEP.CHECK: "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
+                STEP.PING: "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",
+                STEP.CLAIM_ROLE_CONTEXT: "역할 등록 왕복이 세션 컨텍스트 오류로 실패했습니다 — "
                                        "이 세션이 cys pane 안인지(CYS_SURFACE_ID)와 데몬 응답을 확인하세요"
                                        "(‘남이 master’라는 뜻이 아닙니다).",
                 }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
         channel = _notify_loud("부트스트랩 미완(%s)" % name, hint)
         self.data["result"]["notify"] = {"attempted": True, "channel": channel}
-        _atomic_write_json(BOOT_LAST, self.data)
+        _atomic_write_json(self.path, self.data)
         return exit_code
 
 
@@ -501,9 +603,8 @@ def _observe_surface_role():
 
 
 def _skip_record_path():
-    """싱글플라이트 skip 기록 경로(레인별) — boot-last.json 본체를 덮지 않는다(단일-writer 보존)."""
-    return os.path.join(STATE_DIR, "boot-skip-%s.json"
-                        % _singleflight_key(os.environ.get("CYS_SOCKET", "")))
+    """싱글플라이트 skip 기록 경로(레인별) — boot-last 본체를 덮지 않는다(단일-writer 보존)."""
+    return lane_state_path("skip")
 
 
 def _emit_skip_verdict():
@@ -550,10 +651,53 @@ def _singleflight_key(sock):
     return "base" if _socket_is_base(sock) else _sanitize_sock_key(sock)
 
 
+def lane_key(sock=None):
+    """이 부트가 속한 **레인 키** — 'base' 또는 소켓 경로 새니타이즈 값(레인마다 유일).
+    락 키와 동일 규약을 쓴다(`_singleflight_key`) — 락은 레인별인데 상태 파일은 공유였던
+    비대칭(G15·R3)을 없애려면 두 네임스페이스가 **같은 키 함수**를 써야 한다."""
+    return _singleflight_key(os.environ.get("CYS_SOCKET", "") if sock is None else sock)
+
+
+# 레인 스코프 상태의 **경로 규약 단일 소유자**(G15 · P3-A-DEPT-LANE · CS-7②).
+#
+# ★결함: 락은 레인별(bootstrap-<lane>.lock)인데 상태는 **전 레인 공유 단일 파일**이었다 —
+#   base 와 부서가 동시에 부트하면 서로의 boot-last.json 을 덮어 진단 SOT 가 소실됐고(G15),
+#   부서 레인은 마커가 아예 없어 재선언마다 300s preflight 를 통째로 다시 돌았다
+#   (P3-A-DEPT-LANE: fast path 부재).
+# ★불변식 2개(금지 방향 ①):
+#   ⓐ **base 마커 경로는 절대 레인화하지 않는다** — cys-dept 의 CEO 승격 게이트가 그 파일의
+#      존재를 읽는다. 부서 마커를 base 경로에 쓰면 게이트가 오개방된다.
+#   ⓑ base 레인의 경로는 **역사적 경로 그대로**다(§0 산문·GUI·테스트 호환·회귀 0). 접미는
+#      비-base 레인에만 붙는다.
+# ★같은 레인의 다중 pane 오염은 이 분리로 해결되지 않는다 — 그쪽은 run 귀속(CS-2⑩·W1b)이 담당한다.
+_LANE_STATE_KINDS = {
+    "marker": (CYS_DIR, ".master-bootstrapped", ""),
+    "boot_last": (STATE_DIR, "boot-last", ".json"),
+    "skip": (STATE_DIR, "boot-skip", ".json"),
+    "lock": (STATE_DIR, "bootstrap", ".lock"),
+}
+
+
+def lane_state_path(kind, sock=None):
+    """레인 스코프 상태 파일 경로. kind ∈ marker|boot_last|skip|lock.
+    base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
+    비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
+    ※ skip·lock 은 종전부터 레인별이었다 — 규약을 이 함수 하나로 모은다(사본 3벌 제거)."""
+    try:
+        base_dir, stem, ext = _LANE_STATE_KINDS[kind]
+    except KeyError:
+        raise ValueError("미지 레인 상태 종류: %r" % kind)
+    key = lane_key(sock)
+    if kind in ("skip", "lock"):
+        return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))   # 항상 레인별(구 동작 보존)
+    if key == "base":
+        return os.path.join(base_dir, stem + ext)
+    return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))
+
+
 def _singleflight_path():
-    """싱글플라이트 락 파일 경로(레인별)."""
-    key = _singleflight_key(os.environ.get("CYS_SOCKET", ""))  # ★base 정규화 + 비-base 전체 경로 유일화
-    return os.path.join(STATE_DIR, "bootstrap-%s.lock" % key)
+    """싱글플라이트 락 파일 경로(레인별) — 경로 규약은 lane_state_path 단일 소유."""
+    return lane_state_path("lock")
 
 
 def _acquire_singleflight():
@@ -887,6 +1031,18 @@ def _resource_gate_decision(gate_exit, gate_json, live_node_count):
         % gate_exit)
 
 
+def _is_unknown_arg_error(out):
+    """순수 판정: 출력이 **'미지 인자' 사용오류**인가(구 바이너리 스큐 신호).
+
+    clap(rust CLI)·getopt 계열의 관용 문구를 본다. ★보수적으로 좁게 본다 — 넓히면 진짜 부트 실패를
+    '스큐'로 오독해 재시도 루프를 만든다(폭주 방향). 여기서 찾는 것은 **인자 파싱 실패**뿐이다."""
+    low = (out or "").lower()
+    return any(m in low for m in (
+        "unexpected argument", "unrecognized option", "unknown option",
+        "found argument", "invalid option", "unexpected value",
+    ))
+
+
 def _parse_boot_json(out):
     """`cys boot --json` 출력에서 JSON 오브젝트를 뽑는다(진행 산문과 섞여 나올 수 있다).
     ★stdout 마지막 '{'…'}' 블록만 취한다 — 산문 로그와 기계 계약의 공존 규약(A7 채널 분리 정신).
@@ -934,7 +1090,7 @@ def _run_resource_gate(py, log):
     반환: None=진행 / 9=hard-block(팀 기동 0·CEO escalation)."""
     gate = os.path.join(PACK, "bin", "javis_resource_gate.py")
     if not os.path.isfile(gate):
-        log.step("④′resource-gate", 0, "결손>0이나 resource_gate 부재 — 게이트 생략(계속)")
+        log.step(STEP.RESOURCE_GATE_ABSENT, 0, "결손>0이나 resource_gate 부재 — 게이트 생략(계속)")
         return None
     # ★A13 잠복 경로 차단(착수 전 재검증 산물): 종전 호출은 `_run`(stdout+stderr **병합**)의
     #   병합 텍스트를 json.loads 에 넣었다. 게이트가 stderr 를 한 줄이라도 흘리는 날(파이썬 경고·
@@ -951,7 +1107,7 @@ def _run_resource_gate(py, log):
     live = _live_node_count() if code == 2 else None
     verdict, why = _resource_gate_decision(code, gate_json, live)
     out = (gout or "") + (("\n[stderr] " + gerr.strip()) if (gerr or "").strip() else "")
-    log.step("④′resource-gate", code, "결손>0 · verdict=%s · %s\n%s" % (verdict, why, out))
+    log.step(STEP.RESOURCE_GATE, code, "결손>0 · verdict=%s · %s\n%s" % (verdict, why, out))
     if verdict in ("usage-error", "unknown-exit"):
         # ★조용한 allow 금지 — 측정 실패는 시끄럽게(loud) 남기고 진행한다(fail-open 제거).
         _progress("⚠ 자원 게이트 측정 실패(%s) — 자원 판정 없이 진행: %s" % (verdict, why))
@@ -961,7 +1117,7 @@ def _run_resource_gate(py, log):
         _progress("✗ 자원 hard_block — 팀 기동 0·CEO escalation: " + why)
         notified = _notify_loud("자원 hard_block(부트 중단)",
                                 "%s. 자원 정리(서버 kill·/clear·노드 회수) 후 재선언하라." % why)
-        log.step("④′resource-gate-notify", 0, "알림 채널: %s" % notified)
+        log.step(STEP.RESOURCE_GATE_NOTIFY, 0, "알림 채널: %s" % notified)
         log.result(ok=False, state="failed", failed_step="resource-gate",
                    exit=EXIT_RESOURCE_HARD)
         return EXIT_RESOURCE_HARD
@@ -1044,10 +1200,10 @@ def _cmd_run_chain(log):
         detail = ("불량 레인(빈 부서명): CYS_SOCKET=%s 의 'cys-dept-' 성분에 부서명이 없다 — "
                   "base도 부서도 아닌 소켓으로는 부트 불가. 부서를 정규 이름(cys-dept-<name>)으로 "
                   "재생성한 뒤 재선언하라." % os.environ.get("CYS_SOCKET", ""))
-        log.step("③′lane-pack", 1, detail)
+        log.step(STEP.LANE_MALFORMED, 1, detail)
         _progress("⚠ " + detail)
         notified = _notify_loud("불량 레인(빈 부서명 — 부트 중단)", detail)
-        log.step("③′lane-pack-notify", 0, "알림 채널: %s" % notified)
+        log.step(STEP.LANE_MALFORMED_NOTIFY, 0, "알림 채널: %s" % notified)
         log.result(ok=False, state="failed", failed_step="lane-pack", exit=EXIT_LANE_PACK)
         return EXIT_LANE_PACK
 
@@ -1060,10 +1216,10 @@ def _cmd_run_chain(log):
         detail = ("레인↔팩 불일치(교차 오염·UT-14): 소켓 부서=%s · 팩 부서=%s. CYS_SOCKET과 "
                   "CYS_PACK_DIR이 같은 부서를 가리켜야 한다(base↔메인팩 / dept-X↔pack-dept-X). "
                   "팀 기동 중단." % (sd or "base", pd or "메인"))
-        log.step("③′lane-pack", 1, detail)
+        log.step(STEP.LANE_PACK, 1, detail)
         _progress("⚠ " + detail)
         notified = _notify_loud("레인↔팩 불일치(부트 중단)", detail)
-        log.step("③′lane-pack-notify", 0, "알림 채널: %s" % notified)
+        log.step(STEP.LANE_PACK_NOTIFY, 0, "알림 채널: %s" % notified)
         log.result(ok=False, state="failed", failed_step="lane-pack", exit=EXIT_LANE_PACK)
         return EXIT_LANE_PACK
 
@@ -1086,26 +1242,32 @@ def _cmd_run_chain(log):
     # 각자 검증하므로 preflight와 분리해도 안전. 마커가 현재 pack_version이면 300s preflight 자체를
     # 생략(재선언 fast path — pile-up·재실행 비용 제거).
     preflight = os.path.join(PACK, "bin", "javis_preflight.py")
-    _marker = _read_json(MARKER) or {}
-    _marker_fresh = (_is_base_socket() and _marker.get("pack_version") == _pack_version()
+    # ★P3-A-DEPT-LANE(W3): fast path 는 **레인 마커**를 읽는다. 종전엔 `_is_base_socket()` 조건이
+    #   붙어 부서 레인엔 fast path 가 아예 없었고, 부서장 재선언마다 300s preflight 를 통째로 다시
+    #   돌았다(레인별 마커가 없었으니 판정 근거 자체가 없었다). base 레인 경로·의미는 불변이고,
+    #   CEO 승격 게이트가 읽는 base 마커는 여전히 base 레인만 쓴다(금지 방향 ①).
+    _marker = _read_json(lane_state_path("marker")) or {}
+    _marker_fresh = (_marker.get("pack_version") == _pack_version()
                      and _marker.get("pack_version") not in (None, "unknown"))
     if _marker_fresh:
-        log.step("①preflight", 0, "base 마커가 현재 pack_version — preflight 생략(fast path)")
+        log.step(STEP.PREFLIGHT, 0,
+                 "레인 마커(%s)가 현재 pack_version — preflight 생략(fast path)"
+                 % lane_state_path("marker"))
     elif os.path.isfile(preflight):
         _progress("① preflight --fix 실행 중(최대 300s · 비치명 — FAIL이어도 팀 부팅 계속)…")
         code, out = _run([py, preflight, "--fix"], timeout=300)
-        log.step("①preflight", code, out)
+        log.step(STEP.PREFLIGHT, code, out)
         if code != 0:
             _progress("⚠ preflight 잔여 FAIL(비치명) — 팀 부팅 계속·진짜 게이트는 ⑤ check. 상세 boot-last.json")
     else:
-        log.step("①preflight", 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
+        log.step(STEP.PREFLIGHT, 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)
     _progress("② 데몬 생존 확인…")
     code, out = _run(["cys", "ping"], timeout=15)
-    log.step("②ping", code, out)
+    log.step(STEP.PING, code, out)
     if code != 0:
-        return log.fail("②ping", code, out, EXIT_PING)
+        return log.fail(STEP.PING, code, out, EXIT_PING)
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
     # ★SEAT(2026-07-17 실사고): 보유자가 '빈 좌석'(role 만 쥔 agent 없는 셸 — cys-dept 가 부서 생성 시
@@ -1123,7 +1285,7 @@ def _cmd_run_chain(log):
     _progress("③ master 역할 등록…")
     code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"],
                      timeout=_budget_leaf("CYS_CLAIM_TIMEOUT_S", 15))
-    log.step("③claim-role", code, out)
+    log.step(STEP.CLAIM_ROLE, code, out)
     if code != 0:
         low = (out or "").lower()
         # ★A20 타입드 exit 소비(W2 · H-EXIT-3): CLI 가 이제 판정 타입을 **exit 로** 낸다 —
@@ -1135,7 +1297,7 @@ def _cmd_run_chain(log):
                    "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
             # ★ok=None(CS-2⑩): 정당거부는 '이 레인의 부트가 깨졌다'가 아니다 — 공유 boot-last 의
             #   ok:true(건강한 master 의 완주 기록)를 ok:false 로 덮으면 §0 이 churn 한다.
-            return log.fail("③claim-role", code, msg, EXIT_CLAIM_DENIED,
+            return log.fail(STEP.CLAIM_ROLE, code, msg, EXIT_CLAIM_DENIED,
                             ok=None, state="declined")
         # ★A20 타입드 exit 의 정확한 처방 분기(3=미도달 / 2=식별불가 / 그 밖=구 계약 산문 판정).
         kind = {3: ("미도달 — 요청이 데몬에 닿지 못했다(소켓 부재·데몬 다운·왕복 실패). "
@@ -1145,7 +1307,7 @@ def _cmd_run_chain(log):
             code, "구 계약(exit %s) — 거부 마커가 출력에 없다" % code)
         msg = ("역할 등록 왕복이 **거부가 아닌** 사유로 실패했다(세션 컨텍스트 오류): %s "
                "'다른 pane이 master' 라는 뜻이 **아니다** — 세션 배선을 확인하라.\n%s" % (kind, out))
-        return log.fail("③claim-role-context", code, msg, EXIT_SESSION_CONTEXT,
+        return log.fail(STEP.CLAIM_ROLE_CONTEXT, code, msg, EXIT_SESSION_CONTEXT,
                         ok=None, state="session_error")
     log.data["role_claimed"] = "master"   # 관측 파생 귀속(보고=실측)
 
@@ -1165,18 +1327,18 @@ def _cmd_run_chain(log):
                 note += (" ★주의: 부서명 %r 은 발급 정규식([a-z0-9][a-z0-9-]*) 불일치 — "
                          "이 부서명은 티켓 발급 불가 형식이다(부서 재생성 필요)." % dept)
             _progress(note)
-            log.step("③″ceo-ticket", 0, note)
+            log.step(STEP.CEO_TICKET, 0, note)
             summary = {"ok": True, "marker": "부서장 단독 각성(CEO 티켓 부재)",
                        "solo_awakening": True, "dept": dept,
                        "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
-                       "boot_last": BOOT_LAST}
+                       "lane": log.lane, "boot_last": log.path}
             # ★A7 채널 보존: solo_awakening 은 **성공** 경로이므로 stdout 최종 JSON 을 유지한다
             #   (session-start 산문 계약 "완료 선언은 최종 JSON 인용 시에만"의 소비 대상).
             log.result(ok=True, state="solo_awakening", solo_awakening=True, reason=why,
                        exit=EXIT_OK)
             print(json.dumps(summary, ensure_ascii=False))
             return EXIT_OK
-        log.step("③″ceo-ticket", 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
+        log.step(STEP.CEO_TICKET, 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
     # 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 — 의무 역할 목록은 ⑤check와 동일 소스
@@ -1194,7 +1356,18 @@ def _cmd_run_chain(log):
         boot_budget = _budget_derived("cys_boot_outer_s", 300)
         _progress("④ 4종 의무 노드 기동 중(최대 %ds — 예산 파생)…" % boot_budget)
         code, out = _run(["cys", "boot", "--json"], timeout=boot_budget)
-        log.step("④boot", code, out)
+        # ★★팩↔바이너리 스큐 방어(온보딩 치명 위험 차단): 구 `cys` 바이너리는 `--json` 을 모르므로
+        #   clap 이 **사용오류(exit 2)** 로 즉사한다 — 그대로 두면 아래 `_boot_fatal_verdict` 가
+        #   '비0=Fatal' 보수 폴백을 적용해 **모든 부트가 exit 4 로 실패**한다(팩만 먼저 갱신된
+        #   기계 = 온보딩 전멸·팀 0). 미지 인자 신호를 확인하면 bare `cys boot`(구계약)로 1회
+        #   재시도한다. 사용오류는 **인자 파싱 단계**라 스폰이 아직 없었으므로 이중 스폰 위험 0이다.
+        if code != 0 and _is_unknown_arg_error(out):
+            log.step(STEP.BOOT_SKEW, code,
+                     "`cys boot --json` 미지원(구 바이너리) — bare `cys boot` 로 1회 폴백. "
+                     "팩↔바이너리 버전 스큐를 해소하라(`cys --version` 확인).")
+            _progress("⚠ ④ `--json` 미지원 바이너리 — 구계약(bare cys boot)으로 폴백")
+            code, out = _run(["cys", "boot"], timeout=boot_budget)
+        log.step(STEP.BOOT, code, out)
         # ★B1 PLAN 정책 열 소비 — exit 4(부트 실패)는 **Fatal 실패에서만** 낸다.
         #   종전엔 `cys boot` 의 어떤 비0 도 exit 4 로 승격돼, 리뷰어 1종 고장(Degrade)이 팀 전체
         #   기동 실패로 번지는 영구 데드엔드였다(B1). 판정은 --json 의 role 별 outcome·mandatory 를
@@ -1202,16 +1375,16 @@ def _cmd_run_chain(log):
         fatal_why = _boot_fatal_verdict(code, out)
         if fatal_why is not None:
             # 티켓은 아직 미소비 — boot 실패(exit 4)면 보존돼 재시도 가능(R2-LOW-C)
-            return log.fail("④boot", code, fatal_why, EXIT_BOOT)
+            return log.fail(STEP.BOOT, code, fatal_why, EXIT_BOOT)
         if code != 0:
-            log.step("④boot-degrade", code,
+            log.step(STEP.BOOT_DEGRADE, code,
                      "비0 이지만 Fatal 역할은 전원 확보 — 경고 강등 후 ④-b·⑤ 계속(B1 정책 열)")
             _progress("⚠ ④ 일부 선택/리뷰어 노드 미기동(Degrade) — 팀 기동 계속")
 
         # 부서 레인 CEO 티켓 소비 — ④ boot **성공 직후**(실스폰 발생)에만 1회성 소비(R2-LOW-C):
         # "1회성 티켓 ⟺ 실스폰" 불변식. 착수 전 소각은 boot 실패 시 재시도 티켓까지 태웠다.
         if ticket_path is not None:
-            log.step("③″ceo-ticket-consume", 0, _consume_dept_ticket(ticket_path))
+            log.step(STEP.BOOT_TICKET_CONSUME, 0, _consume_dept_ticket(ticket_path))
 
         # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
         # CLI를 건너뛰므로 agy/codex 부재 기계(초보 전원)에서 대체 리뷰어(reviewer-claude-*)를 기동할
@@ -1221,20 +1394,20 @@ def _cmd_run_chain(log):
                   % (rev_budget, _budget_leaf("REVIEWER_SLOT_COUNT", 2),
                      _budget_leaf("REVIEWER_FALLBACK_ATTEMPTS", 2)))
         code, out = _run([py, orchestra, "boot-reviewers"], timeout=rev_budget)
-        log.step("④b-boot-reviewers", code, out)
+        log.step(STEP.BOOT_REVIEWERS, code, out)
         # ★B1: 리뷰어는 Degrade — 비0 이어도 ⑤ 로 계속한다(최종 게이트는 ⑤ check). 단 A12 분류로
         #   '영구 실패(2/127)'만은 처방을 정확히 남긴다(재시도 안내 금지 — 재시도해도 같은 결과).
         if code in (2, 127):
-            log.step("④b-permanent", code,
+            log.step(STEP.BOOT_REVIEWERS_PERMANENT, code,
                      "boot-reviewers 영구 실패(exit %s — 데몬 다운 또는 스크립트/인터프리터 부재): "
                      "재시도는 무의미하다. `cys ping`·CYS_PACK_DIR·python 해소를 점검하라." % code)
             _progress("⚠ ④-b 영구 실패(exit %s) — 리뷰어는 Degrade 정책이라 ⑤ 로 계속(처방은 로그)" % code)
     else:
-        log.step("④′resource-gate", 0,
+        log.step(STEP.RESOURCE_GATE_SKIP, 0,
                  "결손 0(%s) — 자원 게이트 생략(재선언 오탐 hard-block 방지)" % deficit_why)
         # 결손 0 재선언은 스폰이 없으므로 ④ cys boot·④-b 폴백을 호출하지 않고 티켓도 태우지
         # 않는다(향후 실 기동에 재사용). ⑤ check는 유지(생존 재확인).
-        log.step("④boot-skip", 0, "결손 0(구성 충족) — cys boot·④-b 생략(스폰 없음·티켓 미소비)")
+        log.step(STEP.BOOT_SKIP, 0, "결손 0(구성 충족) — cys boot·④-b 생략(스폰 없음·티켓 미소비)")
         _progress("④ 결손 0(전 구성 생존) — 팀 기동 생략, ⑤ 생존 재확인으로 진행")
 
     # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
@@ -1246,7 +1419,7 @@ def _cmd_run_chain(log):
     daemon_gone = False
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=check_timeout)
-        log.step("⑤check#%d" % attempt, code, out)
+        log.step(STEP.CHECK, code, out, suffix="#%d" % attempt)
         if code == 0:
             break
         # ★G32/H-EXIT-7 — check exit 2 는 '노드 미기동'이 **아니다**: 데몬 소실·cys 부재·status 파손
@@ -1267,43 +1440,52 @@ def _cmd_run_chain(log):
             time.sleep(CHECK_INTERVAL_S)
     if code != 0:
         if daemon_gone:
-            return log.fail("⑤check-unjudgeable", code,
+            return log.fail(STEP.CHECK_UNJUDGEABLE, code,
                             "check 가 **판정 불가**를 반환했다(exit %s) — '노드 미기동'이 아니다. "
                             "exit 2=cysd 데몬 소실·cys 미설치·status 파손 / exit 127=orchestra "
                             "스크립트·인터프리터 부재. 처방: `cys ping` 으로 데몬을, CYS_PACK_DIR·"
                             "python 해소로 팩 배선을 확인하라(`cys boot` 는 이 상황의 처방이 아니다).\n%s"
                             % (code, out), EXIT_CHECK)
-        return log.fail("⑤check", code,
+        return log.fail(STEP.CHECK, code,
                         "%d회 재시도 후에도 의무 노드 미기동:\n%s" % (CHECK_RETRIES, out), EXIT_CHECK)
 
-    # ⑥ 완료 마커 — ⑤ exit 0에서만 도달. base 소켓 가드(부서 부트는 base 마커 무접촉).
+    # ⑥ 완료 마커 — ⑤ exit 0에서만 도달.
+    # ★G15/P3-A-DEPT-LANE: **레인 마커**를 쓴다(base 레인은 역사적 경로 = base 마커 그 자체).
+    #   부서 레인은 `.master-bootstrapped-<lane>` 에 쓰고 **base 마커는 절대 건드리지 않는다** —
+    #   base 마커의 존재가 cys-dept CEO 승격 게이트를 여는 SOT 이므로, 부서장 부트가 그것을 쓰면
+    #   게이트가 오개방된다(금지 방향 ① · 이 불변식은 레인화의 전제 조건이다).
+    _marker_payload = {
+        "pack_version": _pack_version(), "binary_version": _binary_version(),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "surface_ref": os.environ.get("CYS_SURFACE_ID", ""),
+        "lane": lane_key(),
+        "socket": os.environ.get("CYS_SOCKET", ""), "orchestra_check": "exit 0"}
+    _marker_path = lane_state_path("marker")
+    _atomic_write_json(_marker_path, _marker_payload)
     if _is_base_socket():
-        _atomic_write_json(MARKER, {
-            "pack_version": _pack_version(), "binary_version": _binary_version(),
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "surface_ref": os.environ.get("CYS_SURFACE_ID", ""),
-            "socket": os.environ.get("CYS_SOCKET", ""), "orchestra_check": "exit 0"})
-        log.step("⑥marker", 0, MARKER)
+        log.step(STEP.MARKER, 0, _marker_path)
         marker_note = "base 마커 기록"
     else:
-        log.step("⑥marker", 0, "부서 소켓 컨텍스트 — base 마커 무접촉(부서장 부트 완료)")
-        marker_note = "부서장 부트 — base 마커 무접촉"
+        log.step(STEP.MARKER, 0,
+                 "레인 마커 기록: %s (base 마커 %s 무접촉 — CEO 게이트 불가침)"
+                 % (_marker_path, MARKER))
+        marker_note = "부서 레인 마커 기록 — base 마커 무접촉"
 
     # ⑦ 승격 pending 해소 요청(비대기) — 동의·실제 승격은 부트 밖(배지/feed·차기 lifecycle)
     if _is_base_socket():
         dept = os.path.join(PACK, "bin", "cys-dept")
         if os.path.isfile(dept):
             code, out = _run(["bash", dept, "promote-if-pending", "--request-only"], timeout=30)
-            log.step("⑦promote-request", code, out)  # best-effort — 실패해도 부트는 성공
+            log.step(STEP.PROMOTE_REQUEST, code, out)  # best-effort — 실패해도 부트는 성공
         else:
-            log.step("⑦promote-request", 0, "cys-dept 부재 — 생략")
+            log.step(STEP.PROMOTE_REQUEST, 0, "cys-dept 부재 — 생략")
     else:
-        log.step("⑦promote-request", 0, "부서 컨텍스트 — 생략")
+        log.step(STEP.PROMOTE_REQUEST, 0, "부서 컨텍스트 — 생략")
 
     # ⑧ 기계 요약 — master는 이 JSON을 인용해 '기동 완료'를 보고한다(다른 근거 인용 금지)
     summary = {"ok": True, "marker": marker_note,
                "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
-               "boot_last": BOOT_LAST}
+               "lane": log.lane, "boot_last": log.path}
     # ★A7 채널 보존: 완주는 stdout 최종 JSON(구 산문 계약의 유일한 인용 근거)이다.
     log.result(ok=True, state="completed", exit=EXIT_OK)
     print(json.dumps(summary, ensure_ascii=False))
@@ -1311,7 +1493,16 @@ def _cmd_run_chain(log):
 
 
 def cmd_status():
-    print(json.dumps({"marker": _read_json(MARKER), "boot_last": _read_json(BOOT_LAST),
+    """레인 스코프 진단 덤프(G15) — **이 레인의** 마커·boot-last 와 경로를 함께 낸다.
+    base 마커(CEO 게이트 SOT)는 항상 별도 필드로 보여 부서 레인에서도 게이트 상태를 판독한다."""
+    lane = lane_key()
+    marker_path = lane_state_path("marker")
+    bl_path = lane_state_path("boot_last")
+    print(json.dumps({"lane": lane,
+                      "marker": _read_json(marker_path), "marker_path": marker_path,
+                      "base_marker": _read_json(MARKER), "base_marker_path": MARKER,
+                      "boot_last": _read_json(bl_path), "boot_last_path": bl_path,
+                      "skip_record": _read_json(lane_state_path("skip")),
                       "base_socket": _is_base_socket()}, ensure_ascii=False, indent=1))
     return 0
 
@@ -1322,7 +1513,9 @@ def cmd_assert_ready():
     gate = os.environ.get("CYS_BOOT_GATE", "").strip().lower()
     if gate == "off":
         return 0
-    m = _read_json(MARKER)
+    # ★G15: 게이트가 읽는 마커는 **이 레인의** 마커다(base 레인은 역사적 경로 그대로) —
+    #   부서 레인이 base 마커를 읽으면 "본부가 떴으니 나도 준비됨"이라는 거짓 통과가 된다.
+    m = _read_json(lane_state_path("marker"))
     ok = bool(m) and m.get("pack_version") == _pack_version()
     if ok:
         return 0
@@ -1582,17 +1775,93 @@ def cmd_self_test():
         assert _role_satisfied("reviewer-codex", {"reviewer-codex-2"}) is False, \
             "리뷰어 접두 관용 잔재(check 규약 이탈)"
         assert _role_satisfied("reviewer-gemini", {"reviewer-gemini"}) is True, "정확일치 실패"
+
+        # ── t8: 레인 스코프 상태 경로(G15 · P3-A-DEPT-LANE) ──
+        _base_sock = "/Users/x/.local/state/cys/cys.sock"
+        _dept_sock = "/Users/x/.local/state/cys-dept-dept-1/cys.sock"
+        assert lane_key(_base_sock) == "base", "base 레인 키 이탈"
+        assert lane_key("") == "base", "env 미설정=base 레인"
+        assert lane_key(_dept_sock) != "base", "부서 레인 키가 base로 수렴"
+        assert lane_key("/Users/x/.local/state/cys-dept-dept-2/cys.sock") != lane_key(_dept_sock), \
+            "부서 간 레인 키 충돌(상태 파일 공유 재발)"
+        # ⓐ base 레인은 **역사적 경로**를 그대로 쓴다(§0 산문·GUI·테스트 호환)
+        assert lane_state_path("marker", _base_sock) == MARKER, "base 마커 경로가 변경됨(회귀)"
+        assert lane_state_path("boot_last", _base_sock) == BOOT_LAST, "base boot-last 경로 변경(회귀)"
+        # ⓑ 부서 레인은 분리된다 — 그리고 **base 마커를 절대 가리키지 않는다**(CEO 게이트 불가침)
+        _dm = lane_state_path("marker", _dept_sock)
+        _dbl = lane_state_path("boot_last", _dept_sock)
+        assert _dm != MARKER, "부서 레인이 base 마커를 가리킨다(CEO 승격 게이트 오개방 — 금지 방향 ①)"
+        assert _dbl != BOOT_LAST, "부서 레인이 base boot-last 를 공유한다(G15 미수리)"
+        assert os.path.basename(_dm).startswith(".master-bootstrapped-"), "부서 마커 명명 규약 이탈"
+        assert os.path.basename(_dbl).startswith("boot-last-"), "부서 boot-last 명명 규약 이탈"
+        assert lane_state_path("marker", "/Users/x/.local/state/cys-dept-dept-2/cys.sock") != _dm, \
+            "부서 간 마커 충돌(레인 오염)"
+        # ⓒ skip·lock 은 base 에서도 레인 접미(구 동작 보존)
+        assert lane_state_path("lock", _base_sock).endswith("bootstrap-base.lock"), "base 락 경로 변경"
+        assert lane_state_path("skip", _base_sock).endswith("boot-skip-base.json"), "base skip 경로 변경"
+        try:
+            lane_state_path("nope")
+            raise AssertionError("미지 상태 종류가 조용히 통과(오타가 새 파일을 만든다)")
+        except ValueError:
+            pass
+
+        # ── t9: 단계 정체성 레지스트리(P3-A-STEP-NAME · H-LIFE-2) ──
+        assert len(set(STEP_ORDER)) == len(STEP_ORDER), \
+            "단계 라벨 중복(동명이의 재사용 재발): %r" % (
+                [l for l in STEP_ORDER if STEP_ORDER.count(l) > 1],)
+        _names = [n for n, _ in _STEP_DEFS]
+        assert len(set(_names)) == len(_names), "단계 상수명 중복"
+        # ⓐ **호출부 리터럴 0** — 전 기록 지점이 레지스트리를 경유한다(드리프트 원천 차단)
+        _src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        _lit = re.findall(r'log\.(?:step|fail)\(\s*"', _src)
+        assert not _lit, "단계 기록에 문자열 리터럴 잔존 %d건(레지스트리 미경유)" % len(_lit)
+        # ⓑ 서수 ↔ 실행순서: 레인 가드는 ①preflight **앞**, 티켓 소비는 ④boot **뒤**
+        assert STEP_INDEX[STEP.LANE_MALFORMED] < STEP_INDEX[STEP.PREFLIGHT], \
+            "레인 가드가 preflight 뒤로 선언됨(서수-실행순서 불일치 재발)"
+        assert STEP_INDEX[STEP.LANE_PACK] < STEP_INDEX[STEP.PREFLIGHT], "레인↔팩 가드 순서 이탈"
+        assert STEP_INDEX[STEP.BOOT] < STEP_INDEX[STEP.BOOT_TICKET_CONSUME] \
+            < STEP_INDEX[STEP.BOOT_REVIEWERS], "티켓 소비가 ④boot~④-b 사이가 아니다"
+        assert STEP_INDEX[STEP.RESOURCE_GATE] < STEP_INDEX[STEP.BOOT], "자원 게이트가 ④boot 뒤"
+        assert STEP_INDEX[STEP.CHECK] < STEP_INDEX[STEP.MARKER] < STEP_INDEX[STEP.PROMOTE_REQUEST], \
+            "⑤check→⑥marker→⑦promote 순서 이탈"
+        # ⓒ 동명이의였던 3쌍이 이제 서로 다른 라벨이다
+        for _a, _b in ((STEP.LANE_MALFORMED, STEP.LANE_PACK),
+                       (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_SKIP),
+                       (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_ABSENT)):
+            assert _a != _b, "동명이의 잔존: %r" % (_a,)
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
+    print("javis_bootstrap self-test OK (W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
+          "레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
           "로스터 결손 신구 차분 9종 + W2(A13 타입드 게이트 exit·_run_split 채널분리·B1 PLAN 정책 "
           "소비 6종·공유 판정 결손 2종) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
           "자원 게이트 결정·구성 결손·grok 좌석·cso-1 좌석·정상 5노드·결손 1·worker-N·대체 로스터)")
     return 0
 
 
-_USAGE = """usage: javis_bootstrap.py [run|status|assert-ready|issue-ticket --dept <name>] [--self-test]
+def cmd_lane_path(argv):
+    """`lane-path [kind]` — 이 레인의 상태 파일 경로를 stdout 한 줄로(훅·산문 안내의 단일 출처).
+
+    ★왜 서브커맨드인가(G15 소비처 통일): 훅 note·§0 산문이 `~/.cys/state/boot-last.json` 을
+      **하드코딩**하면 부서 레인에서 거짓 경로를 안내한다(그 레인의 진단은 다른 파일에 있다).
+      경로 규약의 소유자는 `lane_state_path` 하나이고, 소비자는 이 명령으로 물어본다.
+    인자 없음 = boot_last. 미지 종류는 EX_USAGE(64) 거부(오타가 새 파일을 만들지 않는다)."""
+    kind = (argv[0] if argv else "boot_last").replace("-", "_")
+    if kind == "all":
+        out = {k: lane_state_path(k) for k in sorted(_LANE_STATE_KINDS)}
+        out.update({"lane": lane_key(), "base_marker": MARKER})   # dict | 는 3.9+ 전용 — 회피
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    try:
+        print(lane_state_path(kind))
+    except ValueError:
+        sys.stderr.write("[bootstrap] 미지 레인 상태 종류: %r (marker|boot_last|skip|lock|all)\n" % kind)
+        return EXIT_USAGE
+    return 0
+
+
+_USAGE = """usage: javis_bootstrap.py [run|status|assert-ready|lane-path <kind>|issue-ticket --dept <name>] [--self-test]
   (인자 없음 = run)
 exit: 0=완료/단독각성 · 3=ping · 4=boot · 5=assert-ready 게이트 · 6=check ·
       7=claim 정당거부 · 8=레인↔팩 · 9=자원 hard_block · 10=세션 컨텍스트 오류 ·
@@ -1657,6 +1926,8 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd == "issue-ticket":
         return cmd_issue_ticket(argv[2:])
+    if cmd == "lane-path":
+        return cmd_lane_path(argv[2:])
     table = {"run": cmd_run, "status": cmd_status, "assert-ready": cmd_assert_ready}
     fn = table.get(cmd)
     if fn is None:

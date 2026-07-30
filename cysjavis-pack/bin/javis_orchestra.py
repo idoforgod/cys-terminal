@@ -155,9 +155,16 @@ def slot_satisfied(required, live_roles):
     bn = _boot_node()
     match = (bn.role_matches_requirement if bn is not None
              else (lambda req, cand: req == cand or (req == "worker" and cand.startswith("worker"))))
-    for cand in live_roles:
-        if match(required, cand):
-            return True, cand, True, "네이티브 좌석 %s" % cand
+    # ★결정론(자가치유 보호): live_roles 는 **집합**이라 순회 순서가 비결정적이다. worker 처럼
+    #   복수 좌석이 가능한 요건에서 임의의 후보를 집으면, 죽은 worker-3 를 골라 '미기동' 오판을
+    #   내고 그 오판이 결손>0 → 불필요한 스폰·재선언 churn 으로 번진다. 정렬로 못박고, 정확일치
+    #   후보를 접두 후보보다 앞세운다(요건 이름 그대로의 좌석이 1순위 대표).
+    #   ★등급 기반 최선 선택은 호출부(check_verdicts)가 한다 — 이 함수는 순수 이름공간 판정이다.
+    natives = sorted(c for c in live_roles if match(required, c))
+    if natives:
+        cand = required if required in natives else natives[0]
+        return True, cand, True, "네이티브 좌석 %s%s" % (
+            cand, "" if len(natives) == 1 else " (동족 %d좌석 중 대표)" % len(natives))
     slot = _slot_for(required)
     if slot is None:
         return False, None, None, "부재(슬롯 없는 역할 — 정확일치 요건)"
@@ -329,12 +336,29 @@ def check_verdicts(status):
     roster = reviewer_roster()
     required = ["cso", "worker"] + [e["role"] for e in roster]
     live = live_role_names(status)
+    # 등급 우선순위(높을수록 건강) — 동족 좌석이 여러 개일 때 **가장 건강한 좌석**이 요건을 대표한다.
+    # ★왜: worker 가 3개 있고 그중 하나만 죽었을 때 죽은 좌석을 대표로 뽑으면 '미기동' 오판이 나고,
+    #   그 오판이 결손>0 → 불필요한 스폰·재선언 churn(자가치유가 아니라 자가교란)으로 번진다.
+    _RANK = {"awake_confirmed": 3, "alive_presumed": 2, "unknown": 1, "absent": 0}
     verdicts = {}
     for r in required:
         sat, filler, native, why = slot_satisfied(r, live)
-        grade, greason = (bn.node_liveness(status, filler or r) if bn is not None
-                          else (("alive_presumed", "공유 술어 소비 불가 — 좌석 존재로 추정")
-                                if sat else ("absent", "공유 술어 소비 불가")))
+        if bn is None:
+            grade, greason = (("alive_presumed", "공유 술어 소비 불가 — 좌석 존재로 추정")
+                              if sat else ("absent", "공유 술어 소비 불가"))
+        elif not sat:
+            grade, greason = bn.node_liveness(status, filler or r)
+        else:
+            # 요건을 충족하는 **전 동족 좌석**을 평가해 최선 등급을 취한다(대표 선택의 결정론화).
+            cands = sorted(c for c in live if bn.role_matches_requirement(r, c))
+            if filler and filler not in cands:
+                cands.append(filler)          # 대체 좌석(슬롯 폴백)도 후보에 포함
+            best = max(((bn.node_liveness(status, c), c) for c in cands),
+                       key=lambda t: _RANK.get(t[0][0], 0))
+            (grade, greason), filler = best[0], best[1]
+            # native = 요건 이름공간(정확일치·worker 접두)으로 충족됐는가. 대체 슬롯 좌석
+            # (reviewer-claude-N)이 대표가 되면 False → 실충전자 라벨링이 켜진다(B2 정직 강등).
+            native = bn.role_matches_requirement(r, filler)
         # 좌석은 있는데 각성/생존 신호가 전부 없으면(absent) 충족이 아니다 — 이름공간과 생존을
         # 함께 본다. 단 unknown(판정불가)은 좌석 존재 시 충족측으로 접는다(fail-open은 여기가
         # 정당하다: check 는 파괴 행위를 하지 않고, unknown 에서 적색을 내면 콜드스타트마다 위경보).

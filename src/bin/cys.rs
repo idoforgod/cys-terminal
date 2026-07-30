@@ -1302,9 +1302,105 @@ fn task_has_restart_on_failure(task: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 소켓 경로 → 그 레인의 팩 경로(결정론 유도 · G34).
+/// 규약: 부서 소켓은 경로 성분(unix 부모 디렉터리 / windows 파이프명)에 `cys-dept-<name>` 을 갖고,
+/// 그 부서의 팩은 `~/.cys/pack-dept-<name>` 이다 — `cys-dept` 의 `dept_sock`/`dept_pack`
+/// 명명 규약과 **동일 소스 규칙**(cysjavis-pack/bin/cys-dept:40-44). 부서명이 비면(`cys-dept-`)
+/// 불량 레인이므로 None(javis_bootstrap `_socket_malformed_dept` 와 동일 판정).
+fn lane_pack_for_socket(socket: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = socket
+        .to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .find_map(|c| c.strip_prefix("cys-dept-").map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())?;
+    Some(
+        dirs::home_dir()?
+            .join(".cys")
+            .join(format!("pack-dept-{name}")),
+    )
+}
+
+/// ★G34(W3): (소켓, 팩) **쌍 보증** — 부서 소켓으로 데몬을 띄우면서 본부 팩을 물려주는 것을 막는다.
+///
+/// 결함(재감사 §1.2 G34 · P1): 부서 소켓+**본부 팩** 조합의 데몬이 생기면 ①부서 마스터 선언이
+/// `javis_bootstrap` 의 레인↔팩 가드에 걸려 **exit 8 로 영구 차단**되고 ②본부 팩을 교차 서빙해
+/// F1 계정·레인 격리가 붕괴하며 schedule 이 중복 발화한다. 쌍 보증이 `cys-dept` 3지점에만 있었고
+/// CLI autostart 는 env 를 무스크럽 상속해 그 조합을 만들 수 있었다(부서 데몬 사망 후 임의 cys 명령).
+///
+/// 판정(base 소켓은 무동작 — 기존 동작 100% 보존):
+///  · 팩 env 미설정 → 소켓에서 레인 팩을 유도해 **주입**(선택지 ①). 유도한 팩 디렉터리가 없으면
+///    그 부서는 실재하지 않는 것이므로 거부(선택지 ② — 새 부서 팩을 자동 창설하지 않는다).
+///  · 팩 env 설정 + 유도값과 불일치 → **거부**(선택지 ②): 명시 오설정이며, 그대로 띄우면 위 ①②가 확정된다.
+/// 거부는 조용하지 않다 — 호출부가 에러를 삼키므로 사유를 여기서 stderr 로 낸다.
+fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    let socket = cys::socket_path();
+    if !cys::is_dept_socket(&socket) {
+        return Ok(());
+    }
+    let derived = match lane_pack_for_socket(&socket) {
+        Some(p) => p,
+        None => {
+            let msg = format!(
+                "부서 소켓({})에서 부서명을 유도할 수 없다(불량 레인) — autostart 거부. \
+                 부서 데몬은 `cys-dept launch <name>` 으로 기동하세요.",
+                socket.display()
+            );
+            eprintln!("[cys] {msg}");
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+        }
+    };
+    let env_pack = cys::pack::PACK_DIR_ENV_KEYS
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+    match env_pack {
+        None => {
+            if !derived.is_dir() {
+                let msg = format!(
+                    "부서 소켓({})의 팩({})이 없어 autostart 를 거부한다(본부 팩으로 부서 데몬을 \
+                     띄우면 레인↔팩 불일치로 부서 부트가 영구 차단되고 격리가 붕괴한다) — \
+                     부서 데몬은 `cys-dept launch <name>` 으로 기동하세요.",
+                    socket.display(),
+                    derived.display()
+                );
+                eprintln!("[cys] {msg}");
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+            }
+            eprintln!(
+                "[cys] 부서 소켓 감지 — 레인 팩 주입(CYS_PACK_DIR={})",
+                derived.display()
+            );
+            cmd.env(cys::pack::ENV_PACK_DIR, &derived);
+            Ok(())
+        }
+        Some(p) => {
+            let same = std::fs::canonicalize(&p)
+                .ok()
+                .zip(std::fs::canonicalize(&derived).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or_else(|| std::path::Path::new(&p) == derived.as_path());
+            if same {
+                return Ok(());
+            }
+            let msg = format!(
+                "레인↔팩 불일치로 autostart 거부: 소켓={} 팩={}(기대 {}). 이 조합의 데몬은 \
+                 부서 부트를 영구 차단하고 본부 팩을 교차 서빙한다 — 부서 데몬은 \
+                 `cys-dept launch <name>` 으로 기동하세요.",
+                socket.display(),
+                p,
+                derived.display()
+            );
+            eprintln!("[cys] {msg}");
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+        }
+    }
+}
+
 /// 데몬을 분리 세션으로 기동 — CLI가 Ctrl-C로 죽어도 데몬은 살아남는다.
 fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(path);
+    // ★G34: 스폰 전 (소켓,팩) 쌍 보증 — 거부 시 스폰 자체를 하지 않는다.
+    ensure_daemon_lane_pack(&mut cmd)?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -3177,100 +3273,91 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     rc
 }
 
-/// Claude Code 설정 파일 자동 탐색: $HOME 직하의 `.claude*` 디렉터리에 있는 settings.json 전부.
+/// Claude Code 설정 파일 자동 탐색: $HOME 직하의 `.claude*` **디렉터리**의 settings.json 전부.
 /// (멀티 프로필 환경 — 예: .claude / .claude-* — 을 한 번에 커버.)
-/// 결정론: 존재하는 파일만, 사전순 정렬로 반환한다.
-fn discover_claude_settings() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else {
-        return vec![];
-    };
-    let Ok(entries) = std::fs::read_dir(&home) else {
-        return vec![];
-    };
-    let mut found: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n == ".claude" || n.starts_with(".claude-"))
-                .unwrap_or(false)
-        })
-        .map(|e| e.path().join("settings.json"))
-        .filter(|p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    found.sort();
-    found
-}
-
-/// SessionStart hook으로 등록할 명령 문자열을 OS별로 조립한다 (순수 함수 — 회귀 핀).
+/// 결정론: 사전순 정렬.
 ///
-/// Unix: 기존과 동일하게 `sh <path>/session-start.sh`.
-/// Windows: 바닐라 Windows 셸(cmd/PowerShell)은 `.sh`를 인터프리터 없이 실행하지 못하고
-///   "open with" 대화상자를 띄운다(anthropics/claude-code #21847·#24097). Claude Code가
-///   Windows에서 찾는 인터프리터는 Git Bash의 `bash`이므로, 바 셸이 해석할 수 있도록
-///   `bash` 명령으로 명시 호출한다(맨 이름 `sh`는 Git Bash가 `bash.exe`만 보장하므로 회피).
-///   `/clear` 후 SessionStart 자동 재주입(autopilot 축2)이 Windows에서도 발동하게 하는 핵심.
-fn hook_command(pack_dir: &std::path::Path) -> String {
-    // RC-2: 공용 함수로 위임 — 격리 config dir(pack.rs setup_isolated_config_dir)과 init-pack이
-    // 동일 OS 분기를 쓰게 단일화(중복 제거·불일치 차단).
-    cys::pack::session_start_hook_command(pack_dir)
+/// ★W3 G7: 종전엔 `settings.json` 이 **파일로 존재할 때만** 후보였다 — 프로필 디렉터리는 있는데
+/// settings.json 이 아직 없는 상태(신규 프로필·사용자가 파일을 지운 상태)가 **영구 미배선**으로
+/// 굳었다(그 프로필의 claude 세션은 훅 없이 돌고, 등록기는 그 프로필을 보지도 않는다). 이제
+/// 디렉터리 존재를 기준으로 후보화하고 등록기가 파일을 생성한다(python `discover_claude_settings`
+/// 와 동일 규칙 — 두 언어의 home-glob 규칙은 하나여야 한다).
+fn discover_claude_settings() -> Vec<String> {
+    cys::pack::personal_profile_settings_paths()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
-/// Claude Code settings.json에 SessionStart hook을 등록한다 (백업 생성, 중복 등록 방지).
-fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Result<String, String> {
-    // symlink 거부 — 링크 너머 실파일을 덮어쓰는 TOCTOU 부류 차단(preflight와 동일 규약).
-    if std::fs::symlink_metadata(settings_path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(format!("{settings_path} is a symlink — refusing to write"));
+/// Claude Code settings.json에 **소망 훅 집합**(SessionStart + UserPromptSubmit)을 등록한다.
+///
+/// ★W3 A9: 종전엔 SessionStart **하나만** 등록했다 — init-pack 을 거친 기계도 각성 훅
+/// (role-bootstrap → UserPromptSubmit)은 preflight C28 이 처음 도는 순간까지 미등록이었고,
+/// 그 C28 의 유일한 자동 트리거가 바로 그 미등록 훅이었다(닭·달걀). 이제 Rust 시드
+/// (`setup_isolated_config_dir`)·init-pack·개인 프로필 병합이 **같은 매니페스트**
+/// (`cys::pack::AWAKENING_HOOKS`)를 소비한다 — 소망상태는 한 곳에만 적힌다.
+///
+/// 멱등·백업·symlink·파싱 거부 규약은 `cys::pack::merge_desired_hooks` 계약에 위임한다
+/// (백업은 **실제 write 시에만** — 멱등 재실행이 정상 `.bak-cys` 를 클로버하지 않는다·RC-1 D2).
+/// ★T-0147-5(W3): launch-agent 가 기록한 config dir 의 settings.json 에 **각성 훅**이 없으면
+/// 기동 로그 경고 + 승인 Feed push 로 1분 내 원인을 가시화한다.
+///
+/// 왜: 노드는 정상 기동하지만 그 config 계급에 훅이 없으면 ①`/clear` 후 지침 재주입(SessionStart)과
+/// ②마스터 선언 부트 발화(UserPromptSubmit)가 **둘 다 사라진다**. 종전엔 어떤 채널에도 신호가 없어
+/// "떠 있는데 각성만 안 되는" 침묵 고장이었다(등록≠가동 갭 — A21 재검증).
+/// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다 —
+/// 같은 표면·같은 술어여야 두 채널의 보고가 갈리지 않는다.
+/// 비치명: 경고만 하고 부트는 계속한다(위경고 모드·부트 봉쇄 회귀 금지 — 금지 방향 ③ 정신).
+fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: &str) {
+    // claude 계열만 대상(agy·codex 는 Claude-config 노드가 아니다 — preflight discover 와 동일 규약).
+    if !agent.starts_with("claude") {
+        return;
     }
-    let hook_cmd = hook_command(pack_dir);
-    let mut root: Value = match std::fs::read_to_string(settings_path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
-        // 파일 없음일 때만 빈 설정으로 시작 — 권한 등 다른 읽기 에러를 무시하면
-        // 기존 settings.json이 hooks만 남은 JSON으로 대체될 수 있다
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(format!("settings read error: {e}")),
-    };
-    let hooks = root
-        .as_object_mut()
-        .ok_or("settings root is not an object")?
-        .entry("hooks")
-        .or_insert(json!({}));
-    let session_start = hooks
-        .as_object_mut()
-        .ok_or("hooks is not an object")?
-        .entry("SessionStart")
-        .or_insert(json!([]));
-    let arr = session_start
-        .as_array_mut()
-        .ok_or("SessionStart is not an array")?;
-    let already = arr.iter().any(|m| {
-        m["hooks"]
-            .as_array()
-            .map(|hs| {
-                hs.iter()
-                    .any(|h| h["command"].as_str() == Some(hook_cmd.as_str()))
-            })
-            .unwrap_or(false)
-    });
-    if already {
+    let Some(cfg) = config_dir else { return };
+    let settings = std::path::Path::new(cfg).join("settings.json");
+    let root = std::fs::read_to_string(&settings)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let pack = cys::pack::pack_dir();
+    let missing: Vec<&str> = cys::pack::AWAKENING_HOOKS
+        .iter()
+        .filter(|h| {
+            !cys::pack::hook_registered_in(&root, h.event, &cys::pack::hook_command_for(&pack, h.script))
+        })
+        .map(|h| h.script)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let body = format!(
+        "role={role} agent={agent} 의 config dir({})에 각성 훅이 없습니다: {}. \
+         이 노드는 떠도 /clear 후 지침 재주입(SessionStart)·마스터 선언 부트 발화(UserPromptSubmit)가 \
+         발동하지 않습니다. 조치: `python3 {}/bin/javis_preflight.py --fix`(C28) 또는 `cys init-pack`.",
+        settings.display(),
+        missing.join(", "),
+        pack.display()
+    );
+    eprintln!("[launch-agent] ⚠ 각성 훅 미등록 — {body}");
+    // best-effort: 데몬 부재·거부여도 기동은 계속한다(경고 채널 실패가 부트를 죽이지 않는다).
+    let _ = request(
+        "feed.push",
+        json!({"kind": "hook-missing", "title": "각성 훅 미등록(노드 기동)", "body": body}),
+    );
+}
+
+fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Result<String, String> {
+    let added = cys::pack::merge_desired_hooks(
+        std::path::Path::new(settings_path),
+        pack_dir,
+        &cys::pack::AWAKENING_HOOKS,
+    )?;
+    if added.is_empty() {
         return Ok("hook already installed (skipped)".into());
     }
-    // backup — RC-1(D2 master 조건): 실제 write가 발생할 때만 백업한다. `already` 체크 앞에서
-    // 백업하면 온보딩이 매 기동 init-pack을 호출할 때(멱등) 정상 상태 .bak-cys가 매번 클로버돼
-    // "정상 백업"이 소실된다(적대검증 serious). already→skip 경로는 백업을 건드리지 않는다.
-    if std::path::Path::new(settings_path).exists() {
-        let backup = format!("{settings_path}.bak-cys");
-        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
-    }
-    arr.push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
-    std::fs::write(settings_path, serde_json::to_string_pretty(&root).unwrap())
-        .map_err(|e| e.to_string())?;
     Ok(format!(
-        "SessionStart hook registered in {settings_path} (backup: .bak-cys)"
+        "hook registered in {settings_path}: {} (backup: .bak-cys)",
+        added.join(", ")
     ))
 }
 
@@ -3318,6 +3405,9 @@ struct DoctorCtx {
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
+/// ★W3(A9): 각성 집합 전체 판정은 `cys::pack::hook_registered_in`(매니페스트 소비)이 담당한다 —
+/// 이 함수는 SessionStart 단일 판정의 기존 형태를 보존하는 얇은 사본이므로 신규 소비처를 만들지 마라.
+#[allow(dead_code)]
 fn doctor_hook_present(root: &Value, hook_cmd: &str) -> bool {
     root.get("hooks")
         .and_then(|h| h.get("SessionStart"))
@@ -3442,22 +3532,38 @@ fn diag_install_manifest(ctx: &DoctorCtx) -> DiagItem {
 }
 
 fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
-    let hook_cmd = cys::pack::session_start_hook_command(&ctx.pack_dir);
-    let is_registered = |path: &str| -> bool {
-        std::fs::read_to_string(path)
+    // ★W3(A9): 진단 대상 = **소망 훅 집합 전체**(SessionStart + UserPromptSubmit). 종전엔 SessionStart
+    //   하나만 봐서, 각성 훅(role-bootstrap)이 빠진 기계를 doctor 가 "OK"로 보고했다(보고≠실측).
+    let missing_in = |path: &str| -> Vec<&'static str> {
+        let root = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .map(|root| doctor_hook_present(&root, &hook_cmd))
-            .unwrap_or(false)
+            .unwrap_or_else(|| json!({}));
+        cys::pack::AWAKENING_HOOKS
+            .iter()
+            .filter(|h| {
+                !cys::pack::hook_registered_in(
+                    &root,
+                    h.event,
+                    &cys::pack::hook_command_for(&ctx.pack_dir, h.script),
+                )
+            })
+            .map(|h| h.script)
+            .collect()
     };
-    if ctx.settings_paths.iter().any(|p| is_registered(p)) {
+    if ctx.settings_paths.iter().any(|p| missing_in(p).is_empty()) {
         return DiagItem {
             name: "hook",
             status: DiagStatus::Ok,
-            detail: "SessionStart hook 등록됨".into(),
+            detail: "각성 hook 집합 등록됨(SessionStart+UserPromptSubmit)".into(),
             action: String::new(),
         };
     }
+    let missing: Vec<String> = ctx
+        .settings_paths
+        .iter()
+        .map(|p| format!("{p}: {}", missing_in(p).join("+")))
+        .collect();
     if fix {
         let mut done = 0usize;
         let mut errs: Vec<String> = Vec::new();
@@ -3480,7 +3586,7 @@ fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         return DiagItem {
             name: "hook",
             status,
-            detail: "SessionStart hook 미등록 — 재등록 시도".into(),
+            detail: format!("각성 hook 미등록({}) — 재등록 시도", missing.join(" | ")),
             action: format!(
                 "등록 {done}건{}",
                 if errs.is_empty() {
@@ -3495,8 +3601,9 @@ fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         name: "hook",
         status: DiagStatus::Warn,
         detail: format!(
-            "SessionStart hook 미등록({}개 settings 확인)",
-            ctx.settings_paths.len()
+            "각성 hook 미등록({}개 settings 확인) — {}",
+            ctx.settings_paths.len(),
+            missing.join(" | ")
         ),
         action: "cys doctor --fix 또는 cys init-pack 로 등록".into(),
     }
@@ -4099,10 +4206,11 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
 
 /// 절대지침 앵커4-1: 프로젝트 시작 시 CSO·worker·agy·codex 4개 노드를 의무 기동한다
 /// (LLM orchestrating 상주 편성). grok은 설치돼 있으면 추가 리뷰어로 띄운다(미설치 skip).
-/// 소켓별 boot 락 가드 — Acquired는 fd를 쥔 채 Drop에서 flock 자동 해제. 파일 열기 실패나
-/// windows는 Acquired(None)로 락 없이 진행(직렬화만 포기·중복은 데몬 특권 가드가 대부분 흡수).
+/// 소켓별 boot 락 가드 — `Acquired`는 보유 토큰(`LockHold`)을 쥔 채 Drop에서 해제한다
+/// (unix=flock fd 자동 해제 / non-unix=pidfile 삭제). 판정 불가·파일 열기 실패는
+/// `LockHold::unserialized()`로 락 없이 진행(직렬화만 포기 — 중복은 데몬 특권 가드·live-slot이 흡수).
 enum BootLock {
-    Acquired(#[allow(dead_code)] Option<std::fs::File>),
+    Acquired(LockHold),
     Busy,
 }
 
@@ -4123,6 +4231,12 @@ const BUDGET_POST_MARKER_SETTLE_SECS: u64 = 2;
 const BUDGET_ACK_WAIT_SECS: u64 = 8;
 const BUDGET_TRUST_SETTLE_SECS: u64 = 2;
 const BUDGET_HEARTBEAT_INTERVAL_SECS: u64 = 20;
+/// non-unix pidfile 락의 스테일 회수 임계(초). 정상 부트 최악치보다 **넉넉히 크게** 잡아
+/// 진행 중인 부트를 뺏지 않으면서, 크래시 잔재가 영구히 부트를 막는 것을 구조적으로 막는다.
+/// (`allow(dead_code)`: 소비처가 `cfg(not(unix))` 라 unix 빌드에선 미사용 — 상수는 BUDGET
+///  파리티 블록의 일원으로 **항상 소스에 존재**해야 한다(H-PRED-6 이 텍스트로 대조).)
+#[allow(dead_code)]
+const BUDGET_LOCK_STALE_SECS: u64 = 900;
 /// G35: 폴더신뢰 자동확인 재전송 상한(멱등 래치 + 이 상한으로 매 tick 재전송을 절단).
 const BUDGET_TRUST_MAX_SENDS: u32 = 2;
 
@@ -4168,7 +4282,7 @@ fn boot_lock_already_held() -> bool {
 /// 멈춘다. 그래서 짧게 기다렸다가(선행 boot 가 이 role 을 세울 시간) 여전히 Busy 면 **경고 후 진행**
 /// 한다 — 중복 스폰 창을 '무제한'에서 '대기 상한 이후의 꼬리'로 줄이는 것이 이 게이트의 목적이고,
 /// 최종 중복 방어는 데몬의 특권 가드·live-slot 계약이다(가용성 우선).
-fn acquire_launch_lock() -> Option<std::fs::File> {
+fn acquire_launch_lock() -> Option<LockHold> {
     if boot_lock_already_held() {
         return None; // 이미 상위(run_boot)가 쥐고 있다 — 재획득은 자기 교착이다.
     }
@@ -4176,10 +4290,12 @@ fn acquire_launch_lock() -> Option<std::fs::File> {
         + std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
     loop {
         match acquire_boot_lock() {
-            BootLock::Acquired(g) => {
-                BOOT_LOCK_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
-                return g;
-            }
+            // ★플래그를 여기서 세우지 않는다(의도): 세우면 이 함수가 반환한 guard 가 drop 된 뒤에도
+            //   플래그가 참으로 남아, 같은 프로세스의 **다음** launch-agent 가 '이미 보유'로 오판해
+            //   락을 아예 건너뛴다(`cys restore` 처럼 한 프로세스가 여러 role 을 순차 기동하는 경로에서
+            //   2번째부터 커버리지가 조용히 사라진다). 플래그의 유일한 writer 는 run_boot 다 —
+            //   그쪽은 함수 전체 수명 동안 guard 를 쥐고 있어 참/거짓이 실제 보유 상태와 일치한다.
+            BootLock::Acquired(g) => return Some(g),
             BootLock::Busy => {
                 if std::time::Instant::now() >= deadline {
                     eprintln!(
@@ -4194,20 +4310,53 @@ fn acquire_launch_lock() -> Option<std::fs::File> {
     }
 }
 
+/// boot 락 보유 토큰. **unix**=flock 된 fd(닫히면 커널이 자동 해제) / **non-unix**=pidfile 경로
+/// (Drop 에서 **파일을 삭제**해야 해제된다 — 파일시스템 락은 자동 해제가 없다).
+///
+/// ★왜 구조체인가(Windows 전용 치명 결함의 수리): 초안은 `Option<File>` 만 들고 있었다. Windows
+/// 경로에서 그 File 은 pidfile 핸들이라, Drop 은 **핸들만 닫고 파일은 디스크에 남긴다**. 남은
+/// pidfile 은 다음 부트에서 `create_new` 를 AlreadyExists 로 만들고, 그때 생존 판정이 실패하면
+/// (tasklist 부재·제한 환경·pid 재사용) **모든 Windows 부트가 영구히 'Busy'** 가 된다 —
+/// 조용하고 영구적인 온보딩 전멸(팀이 영영 안 뜸)이다. 해제를 RAII 로 못박는다.
+struct LockHold {
+    #[allow(dead_code)]
+    file: Option<std::fs::File>,
+    /// non-unix 전용: Drop 에서 삭제할 pidfile 경로(unix 는 항상 None).
+    pidfile: Option<std::path::PathBuf>,
+}
+
+impl Drop for LockHold {
+    fn drop(&mut self) {
+        if let Some(p) = self.pidfile.take() {
+            // 핸들을 먼저 닫는다(Windows 는 열린 파일 삭제가 실패할 수 있다).
+            self.file = None;
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+impl LockHold {
+    fn unserialized() -> Self {
+        LockHold { file: None, pidfile: None }
+    }
+}
+
 fn acquire_boot_lock() -> BootLock {
     let lock_path = boot_lock_path();
     if let Some(parent) = lock_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    #[cfg(unix)]
     let f = match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
         Ok(f) => f,
-        Err(_) => return BootLock::Acquired(None), // 락 못 열면 직렬화 없이 진행(보수적 허용)
+        // 락 못 열면 직렬화 없이 진행(보수적 허용 — 종전 동작)
+        Err(_) => return BootLock::Acquired(LockHold::unserialized()),
     };
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            BootLock::Acquired(Some(f))
+            BootLock::Acquired(LockHold { file: Some(f), pidfile: None })
         } else {
             BootLock::Busy
         }
@@ -4222,23 +4371,38 @@ fn acquire_boot_lock() -> BootLock {
     //     · 파일시스템이 EXCL 을 못 주는 예외 상황에서만 `Acquired(None)`(종전 동작)로 강등한다.
     #[cfg(not(unix))]
     {
-        drop(f);
         match win_pidfile_lock(&lock_path) {
-            WinLock::Won(g) => BootLock::Acquired(Some(g)),
+            WinLock::Won(pidfile, handle) => BootLock::Acquired(LockHold {
+                file: Some(handle),
+                pidfile: Some(pidfile),
+            }),
             WinLock::Busy => BootLock::Busy,
-            WinLock::Unavailable => BootLock::Acquired(None),
+            // ★fail-OPEN: 판정할 수 없으면 **직렬화를 포기하고 진행**한다(= W2 이전 동작).
+            //   Windows 에서 'Busy 로 굳는' 실패가 훨씬 위험하다 — 중복 스폰은 데몬 특권 가드·
+            //   live-slot 계약이 뒤에서 막지만, 영구 Busy 는 **아무도 막지 못한다**(팀 0).
+            WinLock::Unavailable => BootLock::Acquired(LockHold::unserialized()),
         }
     }
 }
 
 #[cfg(not(unix))]
 enum WinLock {
-    Won(std::fs::File),
+    /// (삭제할 pidfile 경로, 열린 핸들)
+    Won(std::path::PathBuf, std::fs::File),
     Busy,
     Unavailable,
 }
 
 /// A8rs: pidfile 기반 크로스플랫폼 락(non-unix 경로 전용). javis_lock.py 의 pidfile 백엔드와 동형.
+///
+/// ★★Windows 전용 안전 설계(오너 지시: "윈도우는 뜻하지 않은 에러가 자주 난다"):
+///   파일시스템 락은 **자동 해제가 없다** — 크래시·강제종료·핸들 누수는 pidfile 을 남기고, 남은
+///   pidfile 은 이후 전 부트를 막을 수 있다. 그래서 회수 근거를 **2중**으로 둔다:
+///     ⓐ 보유자 pid 사망(tasklist)  — 1차, 정확
+///     ⓑ **pidfile 나이 > 스테일 임계** — 2차 backstop. tasklist 가 없거나(제한 환경·PATH 문제)
+///        실패하거나, pid 가 **재사용**돼 남의 살아있는 프로세스로 오인돼도 시간이 지나면 반드시
+///        회수된다. 이 backstop 이 '영구 Busy' 를 **구조적으로 불가능**하게 만든다.
+///   그리고 어느 쪽도 판정 못 하면 `Unavailable`(직렬화 포기·진행)로 강등한다 — 가용성 우선.
 #[cfg(not(unix))]
 fn win_pidfile_lock(lock_path: &std::path::Path) -> WinLock {
     use std::io::Write;
@@ -4252,31 +4416,65 @@ fn win_pidfile_lock(lock_path: &std::path::Path) -> WinLock {
             Ok(mut f) => {
                 let _ = write!(f, "{}", std::process::id());
                 let _ = f.flush();
-                return WinLock::Won(f);
+                return WinLock::Won(pidfile, f);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if attempt == 0 && pidfile_holder_dead(&pidfile) {
-                    // 스테일 회수 — 보유자가 죽었으면 무한 거부 창을 남기지 않는다.
-                    let _ = std::fs::remove_file(&pidfile);
+                if attempt == 0 && pidfile_reclaimable(&pidfile) {
+                    // 스테일 회수 — 보유자 사망 또는 나이 초과. 무한 거부 창을 남기지 않는다.
+                    if std::fs::remove_file(&pidfile).is_err() {
+                        // 삭제 자체가 막히면(권한·핸들 점유) 판정 불가 → 직렬화 포기(가용성 우선).
+                        return WinLock::Unavailable;
+                    }
                     continue;
                 }
+                // 회수 불가 = 살아있는 동시 부트로 본다(정상 Busy — 그 boot 가 팀을 세운다).
                 return WinLock::Busy;
             }
+            // create_new 자체가 다른 이유로 실패(경로·권한) → 직렬화 포기(종전 동작으로 강등).
             Err(_) => return WinLock::Unavailable,
         }
     }
     WinLock::Busy
 }
 
+/// pidfile 을 회수해도 되는가 — ⓐ보유자 사망 ∨ ⓑ나이 초과(backstop).
 #[cfg(not(unix))]
-fn pidfile_holder_dead(pidfile: &std::path::Path) -> bool {
+fn pidfile_reclaimable(pidfile: &std::path::Path) -> bool {
+    // ⓑ 나이 backstop 을 **먼저** 본다: 외부 프로세스 조회에 의존하지 않는 유일한 근거다.
+    // (판정 순서가 계약이다 — 조회 도구 실패가 회수 판정을 지배하면 영구 Busy 가 된다.)
+    if let Ok(md) = std::fs::metadata(pidfile) {
+        if let Ok(age) = md.modified().and_then(|t| {
+            std::time::SystemTime::now()
+                .duration_since(t)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }) {
+            if age.as_secs() > BUDGET_LOCK_STALE_SECS {
+                eprintln!(
+                    "[boot-lock] pidfile 나이 {}s > 스테일 임계 {}s — 회수(영구 Busy 방지)",
+                    age.as_secs(),
+                    BUDGET_LOCK_STALE_SECS
+                );
+                return true;
+            }
+        }
+    }
     let Ok(txt) = std::fs::read_to_string(pidfile) else {
         return true; // 읽을 수 없는 락 파일 = 신뢰 불가 → 스테일 취급
     };
     let Ok(pid) = txt.trim().parse::<u32>() else {
-        return true;
+        return true; // 내용이 pid 가 아니다(파손) → 스테일 취급
     };
-    // tasklist 로 생존 확인(Windows 표준 도구). 조회 실패는 '살아있음'으로 보수 판정(오회수 금지).
+    if pid == std::process::id() {
+        return true; // 우리가 남긴 잔재(핸들 누수) → 회수
+    }
+    pidfile_holder_dead(pid)
+}
+
+/// 보유 pid 의 사망 확인(외부 프로세스 조회 — Windows tasklist). 조회 실패는
+/// '살아있음'(보수 방향) — 영구 Busy 는 pidfile_reclaimable 의 나이 backstop 이 상한을 보장한다.
+/// javis_lock.py 의 pid 사망 검사와 동형 규약(H-CONC-2 스테일 회수 계약의 Rust 측 절반).
+#[cfg(not(unix))]
+fn pidfile_holder_dead(pid: u32) -> bool {
     match std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
@@ -4334,6 +4532,58 @@ fn seat_liveness(s: &Value) -> (SeatLiveness, &'static str) {
         Some("unknown") => (SeatLiveness::Unknown, "좌석 판정 불가(프로브 실패)"),
         _ => (SeatLiveness::Absent, "좌석 비었음/무신호"),
     }
+}
+
+/// ★★(W2 안전 게이트 · 치명위험 ④ 차단) 이 좌석의 **죽음이 확정**됐는가 —
+/// 파괴적/침습적 복구(node-recover 의 pane 주입, reclaim 의 kill)를 허용할 유일한 조건.
+///
+/// **왜 별도 술어인가(내가 만든 결함의 수리)**: `seat_liveness` 의 `Absent` 는 세 가지 다른 사실이
+/// 모여 있다 — ⓐ좌석이 명시적으로 비었다(`seat=="empty"`) ⓑ좌석 판정이 불가해 시한부로 결손 취급
+/// 했다(Unknown 해소) ⓒ구 데몬이라 좌석 차원 자체가 없다. ⓑ·ⓒ에 침습적 복구를 걸면
+/// **살아있는 팀을 파괴**한다:
+///   · 냉시작 데몬은 watchdog 첫 틱(5s) 전까지 전 좌석이 Unknown 이고, GUI 는 앱 시작 즉시
+///     `spawn_orchestra_boot` 를 쏜다 → 건강한 전 pane 이 '결손'으로 보인다.
+///   · `run_node_recover` 는 `agent_alive == Some(true)` 만 거부한다 — watchdog 이 아직 자손을
+///     관측하지 못한 **정상 기동 중** 노드는 `Some(false)` 라 통과해, 돌고 있는 claude 입력창에
+///     `C-u` + 기동 커맨드를 밀어 넣는다(화면 파괴·중복 기동).
+///   · 그 뒤 reclaim 은 kill 이다. 세 좌석에 연쇄하면 '모든 pane 사망(글자 0)'이다.
+///
+/// 그래서 **3중 AND** 로만 확정한다(보류 우선 원칙 — 산 노드를 죽이는 손해가 비가역):
+///   1. `seat == "empty"`  : 데몬 커널 사실이 **명시적으로** 빈 좌석이라고 말한다(Unknown·부재 아님).
+///   2. `agent_alive == Some(false)`: launch-agent 로 등록된 노드인데(meta 존재) 그 에이전트가 죽었다.
+///      `null`(meta 없음 = 수동 셸·역할만 쥔 pane)은 **대상 아님** — 사용자 셸을 죽이지 않는다.
+///      (그 케이스의 정답은 파괴가 아니라 `takeover_empty_seat` 비파괴 승계다.)
+///   3. 좌석 나이 > readiness 최대 예산: 방금 만들어진 pane 은 **기동 중일 수 있다**(create → send →
+///      set_meta → watchdog 관측 사이의 창). 동시 `cys restore`/다른 boot 와의 레이스를 결정론으로 끊는다.
+fn seat_death_confirmed(s: &Value) -> Result<(), String> {
+    match s["seat"].as_str() {
+        Some("empty") => {}
+        other => {
+            return Err(format!(
+                "좌석 사실이 'empty' 가 아니다(seat={other:?}) — 판정불가·구데몬 무신호에 침습적 복구 금지"
+            ))
+        }
+    }
+    if s["agent_alive"].as_bool() != Some(false) {
+        return Err(format!(
+            "agent_alive={} — meta 없는 pane(수동 셸)이거나 생존 신호가 있다. 파괴 대상 아님",
+            s["agent_alive"]
+        ));
+    }
+    // epoch: now_epoch()은 cysd 전용이라 cys.rs 는 chrono 를 쓴다(cys.rs:2882 선례).
+    let now = chrono::Local::now().timestamp() as f64;
+    let created = s["created_at"].as_f64().unwrap_or(0.0);
+    if created <= 0.0 {
+        return Err("created_at 미상 — 좌석 나이를 못 재므로 파괴 금지(보류 우선)".into());
+    }
+    let age = now - created;
+    let floor = budget_readiness_max(0, false).as_secs() as f64;
+    if !(age > floor) {
+        return Err(format!(
+            "좌석 나이 {age:.0}s ≤ readiness 예산 {floor:.0}s — 기동 중일 수 있다(레이스 방지)"
+        ));
+    }
+    Ok(())
 }
 
 /// role → 그 role 을 쥔 비종료 surface 행(없으면 None). worker 는 접두 수용(데몬 dedup: worker-N).
@@ -4465,6 +4715,9 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             let hint = install_hint(agent);
             println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀 (설치: {hint})");
             missing += 1;
+            // ★fatal_failed 는 **--json 전용 요약 필드**다 — bare exit 을 움직이지 않는다(금지 방향 ⑧).
+            //   의무 CLI 미설치가 '성공'이 아니라는 사실(G29)은 typed outcome=missing+mandatory 로
+            //   전달되고, 그것을 exit 4 로 승격하는 판정은 **소비부(javis_bootstrap)** 가 한다.
             if *mandatory {
                 fatal_failed += 1;
             }
@@ -4513,36 +4766,57 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                  "mandatory": mandatory, "liveness": label, "reason": why}));
             continue;
         }
-        // ── ★죽음 확정 좌석: node-recover(비파괴) 우선 → reclaim 에스컬레이션 자동 체인 ──
+        // ── ★죽음 **확정** 좌석: node-recover(비파괴) 우선 → reclaim 에스컬레이션 자동 체인 ──
         //   좌석이 남아 있는데 에이전트만 죽은 경우(B3 의 그 상태), 새 surface 를 만들면 특권 역할은
         //   claim_denied 로 막히고 리뷰어는 litter 를 남긴다. 기존 pane 위에서 되살리는 것이
         //   **비파괴적이고 정확한** 처방이다. 실패하면 reclaim(파괴)으로 한 단계 올린다.
+        //
+        // ★★안전 게이트(치명위험 ④ 차단 · `seat_death_confirmed` 주석 전문 참조): 이 체인은
+        //   **죽음이 확정된 좌석에만** 닿는다. Absent 는 '명시적 빈 좌석'·'판정불가 시한부 해소'·
+        //   '구 데몬 무신호'가 섞인 등급이고, 뒤 두 경우에 침습적 복구를 걸면 냉시작 데몬의 건강한
+        //   전 팀을 파괴한다(watchdog 첫 틱 전 = 전 좌석 Unknown, GUI 는 그 순간 boot 를 쏜다).
+        //   확정 실패 시엔 **좌석을 건드리지도, 새로 스폰하지도 않는다** — 살아있을 수 있는 좌석
+        //   위에 중복 스폰하면 claim_denied·litter·이중 에이전트가 된다. 보류 우선(비가역 회피).
         if let Some(row) = seat.as_ref() {
             let sref = row["surface_ref"].as_str().unwrap_or("").to_string();
-            if !sref.is_empty() {
-                println!("· {agent}: 역할 '{role}' 좌석은 있으나 죽음 확정({why}) — node-recover 시도(비파괴)");
-                if run_node_recover(Some(sref.clone()), Some((*role).to_string())) == 0 {
-                    recovered += 1;
-                    outcomes.push(json!({"role": role, "agent": agent, "outcome": "recovered",
-                                         "mandatory": mandatory, "surface_ref": sref,
-                                         "reason": format!("node-recover(비파괴): {why}")}));
+            match seat_death_confirmed(row) {
+                Err(hold) => {
+                    println!(
+                        "· {agent}: 역할 '{role}' 좌석 존재·생존 신호 없음({why})이나 **죽음 미확정** \
+                         — 침습적 복구·스폰 모두 보류(보류 우선): {hold}"
+                    );
+                    eprintln!(
+                        "[boot] role={role} 보류 — 수동 확인: `cys read-screen --surface {sref}` / \
+                         회수가 필요하면 `javis_boot_node.py --reclaim --role {role}`(hold-first 판정 내장)"
+                    );
+                    outcomes.push(json!({"role": role, "agent": agent,
+                                         "outcome": "skipped_unconfirmed", "mandatory": mandatory,
+                                         "surface_ref": sref, "reason": hold,
+                                         "hint": "죽음 미확정 좌석 — 파괴·중복 스폰 금지(수동 확인)"}));
                     continue;
                 }
-                println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·보류 우선 판정 내장)");
-                escalate_reclaim(role);
-                let after = fetch_surfaces();
-                if find_seat_row(&after, role).is_some() {
-                    // reclaim 이 좌석을 못 비웠다 — 새 스폰은 claim_denied/litter 를 만들 뿐이다.
-                    println!("· {agent}: reclaim 후에도 좌석 잔존 — 스폰 보류(수동 점검 필요)");
-                    failed += 1;
-                    if *mandatory {
-                        fatal_failed += 1;
+                Ok(()) => {
+                    println!("· {agent}: 역할 '{role}' 좌석 죽음 **확정**({why}) — node-recover 시도(비파괴)");
+                    if run_node_recover(Some(sref.clone()), Some((*role).to_string())) == 0 {
+                        recovered += 1;
+                        outcomes.push(json!({"role": role, "agent": agent, "outcome": "recovered",
+                                             "mandatory": mandatory, "surface_ref": sref,
+                                             "reason": format!("node-recover(비파괴): {why}")}));
+                        continue;
                     }
-                    outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
-                                         "mandatory": mandatory,
-                                         "reason": "죽음 확정 좌석을 node-recover·reclaim 으로도 해소 못 함",
-                                         "install_hint": "javis_boot_node.py --reclaim --role 로 수동 회수 후 재부트"}));
-                    continue;
+                    println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·hold-first 판정 내장)");
+                    escalate_reclaim(role);
+                    let after = fetch_surfaces();
+                    if find_seat_row(&after, role).is_some() {
+                        // reclaim 이 좌석을 못 비웠다(hold 판정 포함) — 새 스폰은 claim_denied/litter 뿐이다.
+                        println!("· {agent}: reclaim 후에도 좌석 잔존 — 스폰 보류(수동 점검 필요)");
+                        failed += 1;
+                        outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
+                                             "mandatory": mandatory,
+                                             "reason": "죽음 확정 좌석을 node-recover·reclaim 으로도 해소 못 함",
+                                             "install_hint": "javis_boot_node.py --reclaim --role 로 수동 회수 후 재부트"}));
+                        continue;
+                    }
                 }
             }
         }
@@ -4561,6 +4835,7 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                  "mandatory": mandatory,
                                  "install_hint": install_hint(agent)}));
         }
+        // (fatal_failed 는 --json 요약 전용 — exit 은 아래에서 구계약 `failed` 만 본다)
     }
     println!(
         "boot 완료: 신규 기동 {launched} · 회수복구 {recovered} · 이미가동 {already} · \
@@ -4575,10 +4850,15 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                "fatal_failed": fatal_failed, "lock": "acquired"}})
         );
     }
-    // ★bare exit 의미는 구계약 유지(비0=실패) — 단 '실패'의 정의를 **의무(Fatal) 실패**로 정확화한다.
-    //   선택 리뷰어 미설치·기동실패로 exit 1 을 내면 소비부가 exit 4(부트 실패)로 승격시켜 영구
-    //   데드엔드가 된다(B1). 타입 구분은 --json 이 담당하고, exit 는 Fatal 만 말한다.
-    if fatal_failed > 0 {
+    // ★★bare exit 은 **구계약을 그대로 유지**한다: `launch 실패 > 0 → 1, 그 밖 0`
+    //   (미설치는 종전처럼 exit 에 반영하지 않는다). 금지 방향 ⑧ — busy·mandatory 같은 새 의미를
+    //   bare exit 에 실으면 **아직 --json 을 소비하지 않는 GUI**(main.rs 가 stdout 문자열 +
+    //   `!status.success()` 로 경보를 판정)의 판정이 조용히 바뀐다. exit 의미 전환은 W4 의 GUI
+    //   --json 소비 착지와 **원자**여야 한다.
+    //   B1(리뷰어 실패가 팀 전체 부트 실패로 번지는 데드엔드)과 G29(의무 CLI 미설치≠성공)는
+    //   exit 가 아니라 **typed --json(outcome·mandatory)** 로 전달되고, 그 승격 판정은 소비부
+    //   `javis_bootstrap._boot_fatal_verdict` 가 한다 — 생산자/소비자 계약이 한 웨이브에 함께 있다.
+    if failed > 0 {
         1
     } else {
         0
@@ -4609,7 +4889,17 @@ fn escalate_reclaim(role: &str) {
                 out.trim()
             );
         }
-        Err(e) => eprintln!("[boot] reclaim 실행 실패(python3 부재?): {e}"),
+        // ★의도적으로 인터프리터 후보를 넓히지 않는다(Windows 보수 판정):
+        //   Windows 는 `python3` 가 보통 없고(팩이 embeddable python 을 동봉 · 훅은 CYS_PY 로 해소),
+        //   여기서 후보를 넓히면 **파괴 경로(kill)가 Windows 에서 더 쉽게 발화**한다. 오너 지시대로
+        //   Windows 는 예기치 않은 실패가 잦은 플랫폼이므로, 파괴는 '실행되지 않는 쪽'이 안전하다.
+        //   대신 무엇이 일어나지 않았고 무엇을 실행해야 하는지 **시끄럽게** 남긴다(무음 no-op 금지).
+        Err(e) => eprintln!(
+            "[boot] reclaim **미실행**(python3 해소 실패: {e}) — 좌석은 그대로 보존된다(안전측). \
+             회수가 필요하면 팩 인터프리터로 직접: \
+             \"$CYS_PY\" \"{}\" --reclaim --role {role}  (Windows 는 CYS_PY=동봉 python)",
+            helper.display()
+        ),
     }
 }
 
@@ -5076,6 +5366,32 @@ fn boot_agent_on_surface(
                 std::thread::sleep(std::time::Duration::from_secs(BUDGET_TRUST_SETTLE_SECS));
             }
             // 상한 소진 후에는 더 보내지 않는다 — 반복 Return 이 신뢰창을 종료시키는 실측 경로 차단.
+        }
+        // ★★안전 밸브(치명위험 ④ 차단 — 영구 오부정 불가능성 보장):
+        //   `agent_alive` 는 **데몬이 커널 프로세스 표에서 관측한 사실**이다(이 surface 의 자손에
+        //   agent 바이너리가 살아있음). 화면 텍스트와 달리 잔존 화면으로 위조될 수 없고, 렌더 방식
+        //   (개행 없는 in-place 그리기)에도 영향받지 않는다.
+        //   ★왜 필수인가: 델타 매칭은 claude 의 `❯` 가 **scrollback(개행 완성 라인)에 실린다**는
+        //   가정에 서 있다. 그 가정이 어떤 버전·터미널 폭에서 깨지면 readiness 가 **영구 오부정**이
+        //   되고, T-0147-4 이후 롤백 close 가 실제로 성공하므로 **건강한 pane 이 전부 닫힌다**
+        //   (= '모든 pane 사망·글자 0'). 그래서 화면과 무관한 양성 증거를 하나 둔다.
+        //   ★B4 를 되돌리지 않는다: 기동에 **실패한** 에이전트는 자손 프로세스가 없어 agent_alive 가
+        //   참이 되지 않는다 → 잔존 ❯ 만으로는 절대 ready 가 되지 않는다(오탐 방향 무변).
+        //   agent_meta 는 기동 send 직후 등록되므로(①a) watchdog 첫 틱(≤5s) 뒤부터 참이 될 수 있다.
+        if !ready {
+            let alive = fetch_surfaces()
+                .into_iter()
+                .find(|s| s["surface_id"].as_u64() == Some(sid))
+                .map(|s| s["agent_alive"].as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            if alive {
+                eprintln!(
+                    "[launch-agent] ready(안전 밸브): 데몬이 agent 프로세스 생존을 관측 — \
+                     화면 텍스트와 무관한 커널 사실이므로 주입 안전"
+                );
+                ready = true;
+                break;
+            }
         }
         // ③ ready 판정 — **마커 분기도 델타 우선 + screen_tail_is_shell_prompt 가드**를 받는다.
         match &ready_marker {
@@ -5615,6 +5931,10 @@ fn run_launch_agent_opts(
         eprintln!("[launch-agent] {} created (role={role})", surface_ref(sid));
         // (W1) 데몬이 기록·반환한 권위 config_dir을 resume 게이트·restore 인라인의 결정론 소스로 쓴다.
         let recorded_cfg = r["claude_config_dir"].as_str().map(String::from);
+        // ★T-0147-5(W3): 그 config dir 의 settings.json 에 각성 훅이 없으면 **1분 내 원인 가시화**.
+        //   이 노드는 뜨지만 `/clear` 후 지침 재주입도, 마스터 선언 부트도 발화하지 않는다 —
+        //   종전엔 그 사실이 어디에도 나타나지 않아 "노드는 살아있는데 각성만 안 되는" 침묵 고장이 됐다.
+        warn_if_awakening_hooks_missing(recorded_cfg.as_deref(), role, agent);
         boot_agent_on_surface(
             sid,
             role,
@@ -11055,7 +11375,7 @@ mod tests {
         // 회귀 가드: 바닐라 Windows 셸은 `.sh`를 인터프리터 없이 실행 못 하고 "open with"
         // 대화상자를 띄운다(claude-code #21847·#24097) → /clear 후 자동 재주입(autopilot 축2)
         // 무력화. Unix는 기존 `sh` 동작을 그대로 보존(제로 회귀).
-        let cmd = hook_command(std::path::Path::new("/pack"));
+        let cmd = cys::pack::session_start_hook_command(std::path::Path::new("/pack"));
         // 어느 OS든 항상 동봉된 session-start.sh를 가리킨다
         assert!(
             cmd.contains("hooks/session-start.sh") || cmd.contains("hooks\\session-start.sh"),
@@ -11138,6 +11458,43 @@ mod tests {
         assert_eq!(pairs, vec![("A".into(), "b".into()), ("CLAUDE_CONFIG_DIR".into(), "x".into())]); // 정렬
         let no_env = serde_json::json!({"cmd": "agy"});
         assert!(agent_env_pairs(&no_env).is_empty());
+    }
+
+    /// ★G34(W3) — 소켓에서 **레인 팩을 결정론 유도**한다(cys-dept 명명 규약 미러).
+    /// 부서 소켓+본부 팩 데몬이 생기면 부서 부트가 exit 8 로 영구 차단되고 팩이 교차 서빙된다.
+    #[test]
+    fn lane_pack_derivation_mirrors_dept_naming_convention() {
+        let home = dirs::home_dir().unwrap();
+        // unix 부서 소켓(디렉터리 성분) → ~/.cys/pack-dept-<name>
+        let p = lane_pack_for_socket(std::path::Path::new(
+            "/Users/x/.local/state/cys-dept-dept-2/cys.sock",
+        ))
+        .expect("부서 소켓에서 레인 팩 유도 실패");
+        assert_eq!(p, home.join(".cys").join("pack-dept-dept-2"));
+        // windows named pipe 형태(역슬래시)도 같은 규약
+        let w = lane_pack_for_socket(std::path::Path::new(r"\\.\pipe\cys-dept-sales"))
+            .expect("named pipe 에서 유도 실패");
+        assert_eq!(w, home.join(".cys").join("pack-dept-sales"));
+        // 명명 부서(dept-N 아님)도 커버 — cys-dept 는 임의 이름을 허용한다
+        assert_eq!(
+            lane_pack_for_socket(std::path::Path::new("/x/cys-dept-ceo/cys.sock")).unwrap(),
+            home.join(".cys").join("pack-dept-ceo")
+        );
+        // base 소켓·커스텀 소켓·빈 부서명(불량 레인)은 유도 불가 → None(호출부가 거부/무동작)
+        for bad in [
+            "/Users/x/.local/state/cys/cys.sock",
+            "/tmp/whatever.sock",
+            "/x/cys-dept-/cys.sock",
+        ] {
+            assert!(
+                lane_pack_for_socket(std::path::Path::new(bad)).is_none(),
+                "유도 불가여야 한다: {bad}"
+            );
+        }
+        // is_dept_socket 판정과 정합 — 부서로 판정되면 유도 가능해야 한다(빈 부서명 제외)
+        assert!(cys::is_dept_socket(std::path::Path::new(
+            "/Users/x/.local/state/cys-dept-dept-2/cys.sock"
+        )));
     }
 
     #[test]

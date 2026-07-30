@@ -116,8 +116,15 @@ def _run_bootstrap(home, pack, mockbin, socket=None):
     env["CYS_BOOT_CHECK_INTERVAL_S"] = "0"
     r = subprocess.run([sys.executable, BOOTSTRAP, "run"],
                        capture_output=True, text=True, timeout=60, env=env)
-    bl = os.path.join(home, ".cys", "state", "boot-last.json")
-    data = json.load(open(bl, encoding="utf-8")) if os.path.isfile(bl) else None
+    # ★W3(G15): boot-last 는 **레인별** 파일이다(base=boot-last.json / 부서=boot-last-<lane>.json).
+    #   전 레인 공유 단일 파일이던 종전엔 base·부서 동시 부트가 서로의 진단 SOT 를 덮었다.
+    #   테스트는 규약 사본을 갖지 않고 state 디렉터리에서 이 런의 파일을 집는다.
+    state = os.path.join(home, ".cys", "state")
+    data = None
+    for cand in sorted(os.listdir(state) if os.path.isdir(state) else []):
+        if cand.startswith("boot-last") and cand.endswith(".json"):
+            data = json.load(open(os.path.join(state, cand), encoding="utf-8"))
+            break
     return r.returncode, data, r.stderr
 
 
@@ -172,7 +179,7 @@ class DeptTicketGate(unittest.TestCase):
         home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0,
                                                 ticket=ticket, live_nodes=0)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
-        self.assertIn("③″ceo-ticket-consume", _steps(data), "티켓 소비 단계 부재(팀 기동 미진입)")
+        self.assertIn("④boot-ticket-consume", _steps(data), "티켓 소비 단계 부재(팀 기동 미진입)")
         self.assertTrue(self._cys_called("boot"), "유효 티켓인데 cys boot 미호출(팀 기동 미진입)")
         tdir = os.path.join(home, ".cys", "state", "dept-boot-tickets")
         self.assertFalse(os.path.exists(os.path.join(tdir, "dept-1.ticket")), "티켓 미소비(잔존)")
@@ -187,7 +194,9 @@ class DeptTicketGate(unittest.TestCase):
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
         self.assertEqual(rc, 0, "결손 0 재선언인데 exit≠0")
         self.assertFalse(os.path.isfile(self.gate_log), "결손 0인데 자원 게이트 호출됨(오탐 위험)")
-        gate_step = [s for s in (data or {}).get("steps", []) if s["step"] == "④′resource-gate"]
+        # ★W3(P3-A-STEP-NAME): '게이트 실행'과 '게이트 생략'이 같은 라벨을 쓰던 동명이의를 해소했다
+        gate_step = [s for s in (data or {}).get("steps", [])
+                     if s["step"] == "④′resource-gate-skip"]
         self.assertTrue(gate_step and "결손 0" in gate_step[0]["detail"], "게이트 생략 흔적 부재")
         self.assertFalse(self._cys_called("boot"),
                          "결손 0인데 cys boot 호출됨(스폰 경로 진입 — 구동작 잔재)")
@@ -196,7 +205,7 @@ class DeptTicketGate(unittest.TestCase):
         tdir = os.path.join(home, ".cys", "state", "dept-boot-tickets")
         self.assertTrue(os.path.exists(os.path.join(tdir, "dept-1.ticket")),
                         "결손 0 재선언인데 티켓 소비됨(재사용 불가)")
-        self.assertNotIn("③″ceo-ticket-consume", _steps(data), "결손 0인데 티켓 소비 단계 발생")
+        self.assertNotIn("④boot-ticket-consume", _steps(data), "결손 0인데 티켓 소비 단계 발생")
 
     # (j2) ★네거티브(R1-MED-1 원 결함): reviewer만 4(총수 4) — 구 총수 비교는 결손 0으로 오판해
     # cso/worker 사망을 방치했다. 신 구성 판정은 결손으로 보고 팀 기동 경로에 진입해야 한다.
@@ -212,7 +221,7 @@ class DeptTicketGate(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.gate_log),
                         "반쪽 팀(reviewer만 4)인데 자원 게이트 미호출(총수 비교 오판 잔재)")
         self.assertTrue(self._cys_called("boot"), "반쪽 팀인데 cys boot 미호출(결손 미판정)")
-        self.assertIn("③″ceo-ticket-consume", _steps(data), "실스폰인데 티켓 미소비")
+        self.assertIn("④boot-ticket-consume", _steps(data), "실스폰인데 티켓 미소비")
 
     # (k) 자원 게이트 hard(servers) → 팀 기동 0·exit 9·escalation
     def test_k_resource_hard_blocks_boot_exit9(self):

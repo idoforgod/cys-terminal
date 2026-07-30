@@ -26,6 +26,12 @@
 #      다른 디렉터리에 두고 돌린다. 1단만 두면 그 전부가 조용히(정확히는 stderr 1줄 남기고)
 #      전면 강등된다(test_pre_dispatch.sh 하네스에서 56/56 → 10/56 로 실측 재현).
 #      팩 경로는 레인을 존중한다(CYS_PACK_DIR) — 부서 레인이 base 프리루드를 집지 않는다.
+#      ★팩 경로 env 정본 목록(A11 · T-0147-7 W3): CYS_PACK_DIR JAVIS_PACK_DIR AITERM_PACK_DIR AITERM_JARVIS_DIR
+#      (src/pack.rs `PACK_DIR_ENV_KEYS` = javis_preflight·javis_bootstrap·javis_report·
+#       javis_orchestra·javis_todo_stamp 의 `PACK_DIR_ENV_KEYS` 와 동일 목록·동일 순서).
+#      훅은 그중 **CYS_PACK_DIR 하나만** 해소한다 — 의도적 축소다: 훅 env 는 데몬이 pane 에
+#      주입하고(레인 스코프) 레거시 키는 사람이 셸에 export 하는 이주 경로라 훅 계약이 아니다.
+#      이 목록이 코드와 갈리면 tests/test_todo_shared_constants.py 가 멈춘다(문서-코드 결박).
 #   ⓕ 설치 건강성(프리루드 실재)은 preflight 핀 체크가 담당한다 — 런타임 loud-skip과 이중 방어.
 #
 # ★이 파일은 훅이 아니다 — settings.json에 등록하지 않는다(SELFCORR_HOOKS 명시 목록 방식이라

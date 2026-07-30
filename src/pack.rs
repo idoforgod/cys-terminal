@@ -274,6 +274,249 @@ fn authorize_pack_write(dir: &Path, auth: Option<PackWriteAuth>) -> Result<(), S
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 소망상태 훅 매니페스트 (T-0147-7 W3 · A9 · 재감사 §3 CS-7③)
+// ─────────────────────────────────────────────────────────────────────────────
+/// "이 config 계급에는 어떤 훅이 등록돼 있어야 하는가"의 **단일 데이터 소스**.
+///
+/// ★왜 필요한가(A9): 종전엔 소망상태가 **집행자마다 흩어져** 있었다 —
+///   ① Rust 시드(`setup_isolated_config_dir`)는 `settings.json` **파일이 없을 때만** 2훅을 썼고,
+///   ② init-pack(`cys.rs::install_claude_hook`)은 SessionStart **하나만** 등록했고,
+///   ③ 파이썬 preflight C28(`SELFCORR_HOOKS`)만 UserPromptSubmit(role-bootstrap)을 등록했는데
+///      그 C28의 유일한 트리거가 **결손된 그 훅 자신**이었다(결정론 층 닭·달걀).
+///   결과: `settings.json`이 이미 있는 기계(=거의 전부)는 각성 훅이 영구 미등록일 수 있었다.
+///
+/// 그래서 소망 집합은 데이터로 한 곳에 적고(1 데이터 × N 집행자), 집행은 **파일 단위가 아니라
+/// 이벤트 단위 멱등 병합**(`merge_desired_hooks`)으로 한다. 파이썬 측 사본(`javis_preflight.
+/// SELFCORR_HOOKS` + C08 session-start)은 `bin/tests/run_bootstrap_health.py` H-SEED-1이 이
+/// 상수를 파싱해 **집합 대조**한다(test_todo_shared_constants 선례 — 언어 경계는 기계 대조로 결박).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesiredHook {
+    /// pack `hooks/` 아래 스크립트 basename.
+    pub script: &'static str,
+    /// Claude Code hook 이벤트명.
+    pub event: &'static str,
+    /// matcher(툴 필터). None = matcher 키 미기록(전체).
+    pub matcher: Option<&'static str>,
+}
+
+/// **각성 티어**(awakening) — 없으면 마스터 선언이 부트를 발화하지 못하는(=팀이 영구히 안 뜨는)
+/// 훅 집합. Rust 격리 config 시드·init-pack·개인 프로필 병합(T-0147-1)·preflight C28의 FAIL 티어가
+/// **모두 이 집합**을 소비한다. 순서는 계약이 아니지만(집합 대조) 결정론 출력을 위해 고정한다.
+pub const AWAKENING_HOOKS: [DesiredHook; 2] = [
+    DesiredHook {
+        script: "session-start.sh",
+        event: "SessionStart",
+        matcher: None,
+    },
+    DesiredHook {
+        script: "role-bootstrap.sh",
+        event: "UserPromptSubmit",
+        matcher: None,
+    },
+];
+
+/// hook 등록 명령 문자열(단일 OS 규약) — `session_start_hook_command`·
+/// `role_bootstrap_hook_command`의 일반화. `javis_preflight._cys_hook_cmd(script)`와
+/// **byte-identical**이어야 한다(두 writer가 같은 문자열을 내야 중복 append 0·matcher 일치).
+pub fn hook_command_for(pack_dir: &Path, script: &str) -> String {
+    let path = pack_dir.join("hooks").join(script);
+    if cfg!(windows) {
+        format!("bash \"{}\"", path.display().to_string().replace('\\', "/"))
+    } else {
+        format!("sh {}", path.display())
+    }
+}
+
+/// settings.json 의 특정 이벤트에 desired 명령이 등록돼 있는가(순수 판정 · 읽기 전용).
+pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) -> bool {
+    root.get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|m| {
+                m.get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|hs| {
+                        hs.iter()
+                            .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(desired))
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 소망 훅을 settings.json 에 **이벤트 단위로 멱등 병합**한다(A9).
+///
+/// 계약(사용자 불가침 — ★W-B seed-once 교리 정합):
+///  · **추가만 한다**. 사용자 항목·타 도구 훅·기존 배열 순서를 지우거나 재배치하지 않는다.
+///  · 이미 같은 명령이 그 이벤트에 있으면 **무동작**(byte-identical 문자열이라 중복 0).
+///  · 추가할 것이 없으면 파일을 **쓰지 않는다**(백업도 건드리지 않는다 — 정상 백업 클로버 차단).
+///  · symlink 거부 / 파싱 실패 시 **거부**(빈 객체로 덮어쓰기 금지 — 침묵 데이터 소실 차단).
+///  · 쓰기는 `write_atomic`(tmp+rename+fsync) — 반쪽 파일이 굳으면 훅 등록부 전체가 사라진다.
+///
+/// 반환: 실제로 추가한 항목의 사람용 라벨(`"SessionStart←session-start.sh"`). 빈 벡터 = 이미 충족.
+pub fn merge_desired_hooks(
+    settings_path: &Path,
+    pack_dir: &Path,
+    hooks: &[DesiredHook],
+) -> Result<Vec<String>, String> {
+    if std::fs::symlink_metadata(settings_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} is a symlink — refusing to write",
+            settings_path.display()
+        ));
+    }
+    let existed = settings_path.exists();
+    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
+        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
+        // 파일 없음일 때만 빈 설정으로 시작 — 권한 등 다른 읽기 에러를 무시하면
+        // 기존 settings.json이 hooks만 남은 JSON으로 대체될 수 있다.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("settings read error: {e}")),
+    };
+    if !root.is_object() {
+        return Err("settings root is not an object".into());
+    }
+    let mut added: Vec<String> = Vec::new();
+    for h in hooks {
+        let desired = hook_command_for(pack_dir, h.script);
+        if hook_registered_in(&root, h.event, &desired) {
+            continue;
+        }
+        let mut entry = serde_json::json!({"hooks": [{"type": "command", "command": desired}]});
+        if let Some(m) = h.matcher {
+            entry["matcher"] = serde_json::Value::String(m.to_string());
+        }
+        let arr = root
+            .as_object_mut()
+            .ok_or("settings root is not an object")?
+            .entry("hooks")
+            .or_insert(serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("hooks is not an object")?
+            .entry(h.event.to_string())
+            .or_insert(serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{} is not an array", h.event))?;
+        arr.push(entry);
+        added.push(format!("{}←{}", h.event, h.script));
+    }
+    if added.is_empty() {
+        return Ok(added);
+    }
+    // backup — 실제 write가 발생할 때만(멱등 재실행이 정상 백업을 클로버하지 않게).
+    if existed {
+        let backup = format!("{}.bak-cys", settings_path.display());
+        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(added)
+}
+
+/// 설치 직후 **'등록 집합 ⊇ 소망 집합'** 검증(W3 게이트) — 미충족 항목을 반환한다(빈 벡터=충족).
+///
+/// 왜 병합 뒤에 다시 읽는가: 병합기는 '내가 쓴 것'을 알지만 **디스크가 실제로 그 상태인지**는
+/// 다른 사실이다(권한·경합·부분 쓰기·심링크 거부). 보고를 실측에서 파생시키는 것이 CS-3 계약이고,
+/// 이 검증이 없으면 "시드했다"는 주장만 남는다(A9 가 정확히 그 자리에서 났다).
+pub fn verify_desired_hooks_registered(
+    settings_path: &Path,
+    pack_dir: &Path,
+    hooks: &[DesiredHook],
+) -> Vec<String> {
+    let root: serde_json::Value = std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    hooks
+        .iter()
+        .filter(|h| !hook_registered_in(&root, h.event, &hook_command_for(pack_dir, h.script)))
+        .map(|h| format!("{}←{}", h.event, h.script))
+        .collect()
+}
+
+/// 홈 직하 개인 Claude 프로필 디렉터리(`.claude` / `.claude-*`)의 settings.json 경로들.
+/// ★G7: **디렉터리 존재** 기준이다(settings.json 부재 프로필도 후보 — 병합기가 생성한다).
+/// 결정론: 사전순. 홈 미해소·읽기 실패는 빈 목록(부트 게이트라 crash 금지).
+pub fn personal_profile_settings_paths() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return vec![];
+    };
+    let Ok(entries) = std::fs::read_dir(&home) else {
+        return vec![];
+    };
+    let mut dirs_found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n == ".claude" || n.starts_with(".claude-"))
+                .unwrap_or(false)
+                && e.path().is_dir()
+        })
+        .map(|e| e.path().join("settings.json"))
+        .collect();
+    dirs_found.sort();
+    dirs_found
+}
+
+/// ★T-0147-1 레거시 각성 경로 — 개인 프로필(`~/.claude*`)에 **각성 훅만** 멱등 병합한다.
+///
+/// 왜(오너 명시 요구 · P0): preflight C28의 home-glob 등록은 이미 있었지만 **닭·달걀**이었다 —
+/// 첫 훅이 없으면 preflight가 실행되지 않고, preflight가 실행되지 않으면 훅이 등록되지 않는다.
+/// 데몬 pack install(=기동마다 도는 유일한 결정론 집행자)이 이 병합을 하면 그 고리가 끊긴다.
+///
+/// 격리 교리와의 관계: `~/.claude` 불가침은 **오너가 훅 병합에 한해 의식적으로 완화**한 결정이다
+/// (memory `awakening-dual-path-requirement`). 병합은 추가만 하며 사용자 항목을 절대 건드리지
+/// 않는다(`merge_desired_hooks` 계약).
+/// 안전 전제(W1a A2): 훅 최선두에 surface 이중 게이트(CYS_SURFACE_ID∥AITERM_SURFACE_ID)가 있는
+/// 바이너리와 **같은 릴리스**다 — 비-cys 세션에서 이 훅이 등록돼 있어도 부트를 발화하지 않는다
+/// (하드 제약 2 충족). 그 게이트가 없다면 이 병합은 오발화 표면을 넓히는 결함이 된다.
+///
+/// 범위 게이트: **base 팩 전용**. 부서 팩(`pack-dept-*`)·임시 팩(테스트·스냅샷)에서 도는 install은
+/// 개인 프로필을 건드리지 않는다(F1 레인 격리·테스트 부작용 0). 옵트아웃: `CYS_NO_PERSONAL_HOOK_MERGE=1`.
+/// best-effort — 실패해도 팩 설치 자체는 유효(로그만 남긴다).
+pub fn merge_awakening_hooks_into_personal_profiles() -> Vec<(String, Vec<String>)> {
+    if cfg!(test) {
+        return vec![]; // 테스트 빌드는 실 HOME 을 절대 만지지 않는다
+    }
+    if std::env::var("CYS_NO_PERSONAL_HOOK_MERGE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return vec![];
+    }
+    let pack = pack_dir();
+    if pack != home_default_pack_dir() {
+        return vec![]; // 부서/임시/테스트 팩 — 개인 프로필 무접촉
+    }
+    let mut out = vec![];
+    for settings in personal_profile_settings_paths() {
+        match merge_desired_hooks(&settings, &pack, &AWAKENING_HOOKS) {
+            Ok(added) if added.is_empty() => {}
+            Ok(added) => {
+                eprintln!(
+                    "[pack] 개인 프로필 각성 훅 병합: {} ({})",
+                    settings.display(),
+                    added.join(", ")
+                );
+                out.push((settings.display().to_string(), added));
+            }
+            Err(e) => eprintln!(
+                "[pack] ⚠ 개인 프로필 훅 병합 건너뜀: {} — {e}",
+                settings.display()
+            ),
+        }
+    }
+    out
+}
+
 /// SessionStart hook 등록 명령을 OS별로 조립하는 **공용 함수**(RC-2 · 순수 함수·회귀 핀).
 /// Windows: 바닐라 셸(cmd/PowerShell)은 `.sh`를 인터프리터 없이 못 실행하고 "open with" 대화상자를
 ///   띄운다(anthropics/claude-code #21847·#24097). Claude Code가 Windows에서 찾는 인터프리터는
@@ -281,19 +524,13 @@ fn authorize_pack_write(dir: &Path, auth: Option<PackWriteAuth>) -> Result<(), S
 /// Unix: 기존과 동일 `sh <path>`(제로 회귀).
 /// cys.rs::hook_command(init-pack 경로)와 setup_isolated_config_dir(격리 config dir 경로)가 **둘 다**
 /// 이 함수를 써서 두 경로의 인터프리터가 일치한다(구: 격리 경로만 `sh` 하드코딩 → Windows 불일치).
+/// ★W3(A9): 구현은 `hook_command_for` 단일 규약에 위임한다 — 종전엔 이 함수와
+/// `role_bootstrap_hook_command` 가 같은 OS 분기를 **두 벌** 갖고 있었다(RC1 사본).
 pub fn session_start_hook_command(pack_dir: &Path) -> String {
-    let script = pack_dir.join("hooks/session-start.sh");
-    if cfg!(windows) {
-        // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\John Doe\.cys\pack\...) 대응 — Windows만
-        // quote로 감싼다. unix는 **무변경**(기존 install에 등록된 미quote 문자열과 install_claude_hook의
-        // already-매칭이 유지돼야 중복 등록이 안 생긴다 — quote 추가 시 불일치→매 기동 중복 append 회귀).
-        // ★역슬래시→정슬래시 정규화(RC-3): git-bash가 C:\ 역슬래시를 escape/미해석해 경로를 파괴하는
-        // 것(C:\Users\...→C:Users...→No such file) 방지. javis_preflight._cys_hook_cmd 의 Windows 형태와
-        // **동일 문자열**을 방출 → 두 writer 간 중복 등록 0(matcher 일치).
-        format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
-    } else {
-        format!("sh {}", script.display())
-    }
+    // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\John Doe\.cys\pack\...) 대응 — Windows만
+    // quote로 감싼다. unix는 **무변경**(기존 install에 등록된 미quote 문자열과 already-매칭 유지 —
+    // quote 추가 시 불일치→매 기동 중복 append 회귀). 역슬래시→정슬래시 정규화(RC-3)도 그 함수 소관.
+    hook_command_for(pack_dir, "session-start.sh")
 }
 
 /// UserPromptSubmit hook(role-bootstrap.sh) 등록 명령 — session_start_hook_command 와 동일 OS 규약
@@ -301,12 +538,7 @@ pub fn session_start_hook_command(pack_dir: &Path) -> String {
 /// 와 **byte-identical** 이어야 한다 — 격리 config 초기 시드(이 함수)와 preflight C28 재등록이 같은
 /// 문자열을 방출해야 중복 append 0(_prune_stale_hook_entries·_event_hook_registered matcher 일치·RC1).
 pub fn role_bootstrap_hook_command(pack_dir: &Path) -> String {
-    let script = pack_dir.join("hooks/role-bootstrap.sh");
-    if cfg!(windows) {
-        format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
-    } else {
-        format!("sh {}", script.display())
-    }
+    hook_command_for(pack_dir, "role-bootstrap.sh")
 }
 
 /// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
@@ -342,33 +574,36 @@ fn setup_isolated_config_dir() {
             let _ = write_atomic(&claude_md, tmpl.as_bytes());
         }
     }
-    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh + UserPromptSubmit →
-    // role-bootstrap.sh (없을 때만)
+    // hook: <cfg>/settings.json 에 **소망 훅 집합(AWAKENING_HOOKS)** 을 이벤트 단위 멱등 병합.
+    //
+    // ★W3 A9: 종전엔 `if !settings.exists()` — **파일 단위 시드**였다. settings.json 이 이미 있는
+    //   기계(사용자가 한 번이라도 Claude 설정을 만졌거나 구버전이 SessionStart 만 등록한 기계)에서는
+    //   UserPromptSubmit(role-bootstrap) 이 **영구히 등록되지 않았다**. 그 훅이 preflight C28 의
+    //   유일한 자동 트리거라 닭·달걀이 완성됐다(A9 재검증: v0.12.70 이전 설치 기계 전체가 모집단).
+    //   이제 파일이 있어도 **없는 이벤트만 추가**한다 — 문자열이 byte-identical 이라 중복 0이고,
+    //   사용자 항목은 병합기 계약상 불가침이다.
     let settings = cfg.join("settings.json");
-    if !settings.exists() {
-        // RC-2: OS-aware 공용 함수 사용 — Windows는 bash(Git Bash가 bash.exe만 보장·cmd/PowerShell은
-        // .sh를 인터프리터 없이 못 실행). 구 `sh` 하드코딩 제거(격리 config dir·init-pack 경로 일치).
-        let ss_hook = session_start_hook_command(&pack_dir());
-        // ★RC1(증분2): "너는 마스터다" 선언 시 결정론 부트스트랩을 발화하는 UserPromptSubmit 훅을
-        // 초기 시드에 함께 등록한다. 종전엔 preflight C28(SELFCORR_HOOKS)이 첫 --fix 때 비로소 등록해,
-        // 초기 세션(preflight 실행 전) 마스터 선언은 훅 미등록으로 발화되지 않는 창이 있었다.
-        // 부서 config의 결정론 등록 SOT는 preflight C28(role-bootstrap.sh→UserPromptSubmit, 이미 배선)
-        // 이며, 이 시드는 base 격리 config의 초기 창을 닫는 belt-and-suspenders다(양자 동일 문자열).
-        let ups_hook = role_bootstrap_hook_command(&pack_dir());
-        let json = serde_json::json!({
-            "hooks": {
-                "SessionStart": [ { "hooks": [ { "type": "command", "command": ss_hook } ] } ],
-                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ups_hook } ] } ]
-            }
-        });
-        if let Ok(s) = serde_json::to_string_pretty(&json) {
-            // ★(W2 · A8rs/G16) 비원자 `fs::write` → `write_atomic`. settings.json 은 python
-            // preflight(C28)·Rust 시드·부서 마이그레이션의 **3-writer 대상**이고, 이 파일이 반쪽으로
-            // 굳으면 훅 등록부가 파싱 불가가 되어 **부트 발화 자체가 사라진다**(A8 재검증이 지배 실패
-            // 모드로 지목한 '등록부 수리 거부' 경로). tmp 이름은 pid 접미라 교차 파손도 없다.
-            let _ = write_atomic(&settings, s.as_bytes());
-        }
+    match merge_desired_hooks(&settings, &pack_dir(), &AWAKENING_HOOKS) {
+        Ok(added) if !added.is_empty() => eprintln!(
+            "[pack] 격리 config 각성 훅 병합: {} ({})",
+            settings.display(),
+            added.join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("[pack] ⚠ 격리 config 훅 병합 건너뜀: {} — {e}", settings.display()),
     }
+    // ★W3 게이트: 설치 직후 '등록 집합 ⊇ 소망 집합' 실측 검증(주장 아닌 파생 보고).
+    let missing = verify_desired_hooks_registered(&settings, &pack_dir(), &AWAKENING_HOOKS);
+    if !missing.is_empty() {
+        eprintln!(
+            "[pack] ⚠ 각성 훅 등록 미충족(등록 집합 ⊅ 소망 집합): {} — {} \
+             (조치: `cys doctor --fix` 또는 preflight C28)",
+            settings.display(),
+            missing.join(", ")
+        );
+    }
+    // ★T-0147-1: 개인 프로필(~/.claude*)의 레거시 각성 경로 — base 팩에서만·추가만(위 함수 계약).
+    let _ = merge_awakening_hooks_into_personal_profiles();
 }
 
 /// 설치 매니페스트: rel → 설치 당시 내용의 sha256. "지금 디스크에 있는 파일이 우리가
@@ -1746,6 +1981,114 @@ mod tests {
     fn dir_file(role: &str) -> Option<String> {
         role_directive_path(role)
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    }
+
+    /// ★T-0147-1 실증 검체(W3) — **목 개인 프로필**에 각성 훅을 병합해 3단 단언한다:
+    ///   ①사용자 기존 항목 **보존** ②우리 훅 **존재** ③재실행 **멱등**(중복 0·백업 무접촉).
+    ///
+    /// 왜 이 검체가 필수인가: 오너는 `~/.claude` 불가침을 **훅 병합에 한해** 의식적으로 완화했다.
+    /// 그 완화가 안전한 이유는 병합기가 '추가만' 한다는 계약 하나뿐이므로, 그 계약이 깨지면
+    /// 사용자 설정 파괴로 직결된다 — 계약을 코드가 아니라 **테스트가** 지킨다.
+    #[test]
+    fn awakening_hook_merge_preserves_user_entries_and_is_idempotent() {
+        let td = std::env::temp_dir().join(format!("cys-t01471-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let pack = td.join("pack");
+        let settings = td.join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        // 사용자 기존 설정: 우리와 무관한 훅 + 우리와 같은 이벤트의 남의 훅 + 비-훅 키
+        let user = serde_json::json!({
+            "theme": "dark",
+            "permissions": {"allow": ["Bash(ls)"]},
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "sh /home/u/myhooks/session-start.sh"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "sh /home/u/mytool/stop.sh"}]}]
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&user).unwrap()).unwrap();
+
+        // ── 1차 병합 ──
+        let added = merge_desired_hooks(&settings, &pack, &AWAKENING_HOOKS).unwrap();
+        assert_eq!(added.len(), 2, "각성 2훅이 추가되지 않았다: {added:?}");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        // ① 사용자 항목 보존(비-훅 키·남의 훅·다른 이벤트 전부)
+        assert_eq!(after["theme"], "dark", "사용자 비-훅 키 소실");
+        assert_eq!(after["permissions"]["allow"][0], "Bash(ls)", "사용자 권한 설정 소실");
+        let ss = after["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(
+            ss.iter().any(|e| e["hooks"][0]["command"] == "sh /home/u/myhooks/session-start.sh"),
+            "같은 이벤트의 사용자 훅이 삭제됐다(추가만 계약 위반)"
+        );
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "sh /home/u/mytool/stop.sh",
+            "다른 이벤트의 사용자 훅 소실"
+        );
+        // ② 우리 훅 존재(등록 집합 ⊇ 소망 집합)
+        assert!(
+            verify_desired_hooks_registered(&settings, &pack, &AWAKENING_HOOKS).is_empty(),
+            "병합 후에도 소망 집합이 충족되지 않았다"
+        );
+        // ③ 재실행 멱등 — 추가 0 · 중복 0 · 백업 무접촉(정상 백업 클로버 금지)
+        let backup = format!("{}.bak-cys", settings.display());
+        std::fs::write(&backup, "{\"_sentinel\":\"keep\"}").unwrap();
+        let again = merge_desired_hooks(&settings, &pack, &AWAKENING_HOOKS).unwrap();
+        assert!(again.is_empty(), "멱등 위반 — 재실행이 또 추가했다: {again:?}");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{\"_sentinel\":\"keep\"}",
+            "무변경 재실행이 정상 백업을 클로버했다"
+        );
+        let after2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        for h in AWAKENING_HOOKS.iter() {
+            let want = hook_command_for(&pack, h.script);
+            let n = after2["hooks"][h.event]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|e| {
+                            e["hooks"]
+                                .as_array()
+                                .map(|hs| hs.iter().any(|x| x["command"] == want.as_str()))
+                                .unwrap_or(false)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(n, 1, "{} 훅이 {n}회 등록됐다(중복 append)", h.script);
+        }
+        // ④ 파싱 불가 파일은 **거부**(빈 객체로 덮어쓰지 않는다 — 침묵 데이터 소실 차단)
+        let broken = td.join(".claude-broken").join("settings.json");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, "{ not json").unwrap();
+        assert!(
+            merge_desired_hooks(&broken, &pack, &AWAKENING_HOOKS).is_err(),
+            "파싱 실패 파일을 덮어썼다(사용자 설정 소실 경로)"
+        );
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ not json", "거부인데 파일이 변경됐다");
+        // ⑤ 부재 파일은 생성한다(G7 빈 프로필 배선의 전제)
+        let fresh = td.join(".claude-fresh").join("settings.json");
+        std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        assert_eq!(
+            merge_desired_hooks(&fresh, &pack, &AWAKENING_HOOKS).unwrap().len(),
+            2,
+            "부재 파일에 각성 2훅이 생성되지 않았다"
+        );
+        assert!(verify_desired_hooks_registered(&fresh, &pack, &AWAKENING_HOOKS).is_empty());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 개인 프로필 병합의 **범위 게이트** — 부서/임시 팩에서는 개인 프로필을 건드리지 않는다.
+    /// (테스트 빌드는 항상 no-op 이라 실 HOME 무접촉이 구조적으로 보장된다.)
+    #[test]
+    fn personal_profile_merge_is_scoped_and_test_safe() {
+        assert!(
+            merge_awakening_hooks_into_personal_profiles().is_empty(),
+            "테스트 빌드에서 개인 프로필 병합이 동작했다(실 HOME 오염 위험)"
+        );
     }
 
     #[test]

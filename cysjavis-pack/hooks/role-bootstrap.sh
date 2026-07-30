@@ -214,6 +214,12 @@ done
 # 변환이 필요하다 — cys_native_path가 양쪽을 한 규약으로 처리한다(unix는 무변환).
 BOOT_N="$(cys_native_path "$BOOT")"
 
+# ★G15(W3): boot-last 는 **레인별** 파일이다 — 안내 경로를 하드코딩하면 부서 레인에서 거짓 경로를
+#   가리킨다(그 레인의 진단은 boot-last-<lane>.json 에 있다). 경로 규약의 소유자는
+#   javis_bootstrap.lane_state_path 하나이고, 훅은 `lane-path` 로 물어본다(사본 0).
+LANE_BOOT_LAST="$("$CYS_PY" "$BOOT_N" lane-path boot_last 2>/dev/null | tail -1)"
+[ -n "$LANE_BOOT_LAST" ] || LANE_BOOT_LAST="$HOME/.cys/state/boot-last.json(레인 경로 판독 실패 — base 추정)"
+
 # ── 발화 전 실행 가능성 검증(A6 — 상태 파생 보고의 전제) ──
 FIRE_FAIL=""
 command -v "$CYS_PY" >/dev/null 2>&1 || [ -x "$CYS_PY" ] || FIRE_FAIL="인터프리터 미해소($CYS_PY)"
@@ -275,11 +281,12 @@ if [ -n "$FIRE_FAIL" ]; then
 note=("[결정론 부트스트랩 발화 실패 — 상태 파생 보고] \"너는 마스터다\" 선언은 감지했으나 "
       "javis_bootstrap.py 발화가 실패했다(사유: %s). 팀은 뜨지 않았다 — 부트가 시작됐다고 "
       "보고하지 마라(성공 문구 인용 금지). "
-      "원인은 발화 로그 %s (최근 런 포인터: %s)와 ~/.cys/state/boot-last.json 에 있다. "
+      "원인은 발화 로그 %s (최근 런 포인터: %s)와 이 레인의 boot-last(%s)에 있다. "
       "조치: ①python 인터프리터 해소 여부 ②팩 경로(CYS_PACK_DIR) 정합 ③위 로그의 "
-      "첫 오류 줄을 그대로 오너에게 보고. 승인 Feed에도 알림을 시도했다.") % (sys.argv[1], sys.argv[2], sys.argv[3])
+      "첫 오류 줄을 그대로 오너에게 보고. 승인 Feed에도 알림을 시도했다."
+      ) % (sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
-    "$FIRE_FAIL" "$LOG" "$LATEST"
+    "$FIRE_FAIL" "$LOG" "$LATEST" "$LANE_BOOT_LAST"
   exit 0
 fi
 
@@ -301,12 +308,13 @@ note=("[결정론 부트스트랩 발화됨 — 하네스 강제] \"너는 마�
       "재실행이다. 너의 잔여 의무는 §0의 ③복원 점검·⑤승인 채널 확보·⑥구동 보고뿐이다. "
       "\"부서장은 단독 대기\" 같은 규칙은 존재하지 않는다(환각 금지) — 모든 마스터는 팀을 갖는다"
       "(단, ④-c 분기: 부서 레인은 CEO 티켓 부재 시 단독 각성으로 강등되는 것이 정상이다 — 팀 미기동은 "
-      "실패가 아니며 boot-last.json의 solo_awakening으로 확인한다. \"팀을 갖는다\"는 티켓 발급이 전제다). "
+      "실패가 아니며 이 레인 boot-last(%s)의 solo_awakening으로 확인한다. "
+      "\"팀을 갖는다\"는 티켓 발급이 전제다). "
       "cys list로 팀 기동을 확인하고, 완료되면 §0 ⑥대로 구동 보고 후 orchestra next-action으로 "
       "다음 액션 큐를 결정론 확인해 미완 작업이 있으면 자율 착수하라(\"오너 지시 대기\"는 폐기). "
       "만약 팀이 안 뜨면 원인이 "
-      "이번 런 로그 %s (최근 런 포인터: %s)·boot-last.json에 있고 실패 시 승인 Feed에 알림이 뜬다."
-      ) % (sys.argv[3], sys.argv[1], sys.argv[2])
+      "이번 런 로그 %s (최근 런 포인터: %s)·이 레인 boot-last에 있고 실패 시 승인 Feed에 알림이 뜬다."
+      ) % (sys.argv[3], sys.argv[4], sys.argv[1], sys.argv[2])
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
-  "$LOG" "$LATEST" "$CHECK_WINDOW_S"
+  "$LOG" "$LATEST" "$CHECK_WINDOW_S" "$LANE_BOOT_LAST"
 exit 0

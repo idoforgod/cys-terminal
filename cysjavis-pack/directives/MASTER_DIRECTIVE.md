@@ -31,12 +31,16 @@
 | 신호 | 판정 | 네가 할 일 |
 |---|---|---|
 | 컨텍스트에 `[결정론 부트스트랩 발화됨 — 하네스 강제]` 블록이 있다 | 훅이 이미 집행 중 | **재실행 금지.** 잔여 의무만: ③복원 점검 · ⑤승인 채널 확보 · ⑥구동 보고+next-action 자율 착수 |
-| 그 블록이 없다 **또는** `~/.cys/state/boot-last.json`의 **자기 surface 최신 완주 런**이 `ok:false`다 | 훅 미발화(훅 없는 기계·비-cys 세션) 또는 부트 실패 | `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를 **1회** 실행하고 그 **최종 JSON만** 인용해 보고 |
+| 그 블록이 없다 **또는** 이 레인 boot-last의 **자기 surface 최신 완주 런**이 `ok:false`다 | 훅 미발화(훅 없는 기계·비-cys 세션) 또는 부트 실패 | `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를 **1회** 실행하고 그 **최종 JSON만** 인용해 보고 |
 
 - **개별 명령 수동 재현 금지**: 훅 컨텍스트가 있든 없든, ⓪preflight·②claim-role·④cys boot·
   ⑤check를 하나씩 손으로 치는 것은 **부트 재실행**이다(중복 preflight·좌석 탈취·CEO 티켓 소각).
   폴백은 언제나 "스크립트 **1회**"이고, 산문 체인이 아니다.
-- **boot-last.json 판독 규약**: 그 파일은 레인 공유다. 읽을 것은 `result` 중 **자기 surface**
+- **boot-last 경로 규약(레인 스코프)**: 파일 경로는 **레인마다 다르다** — base 레인은
+  `~/.cys/state/boot-last.json`, 부서 레인은 `boot-last-<lane>.json`이다. 경로를 손으로 짐작하지 말고
+  `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py" lane-path boot_last` 로 물어라
+  (`lane-path all`은 마커·락·skip 경로까지 낸다 · `status`는 이 레인 마커+base 마커를 함께 덤프한다).
+- **boot-last 판독 규약**: 그 파일은 **같은 레인의** 여러 pane이 공유한다. 읽을 것은 `result` 중 **자기 surface**
   (`surface` 필드 = 이 pane의 `CYS_SURFACE_ID`)의 **완주 런**(`state`가 `completed`·`solo_awakening`·
   `failed` 중 하나 — `running`은 진행 중, `skipped_inflight`는 다른 런 소유)이다. 남의 pane이 남긴
   `state:declined`(exit 7 정당거부)·`session_error`(exit 10)는 `ok:null`이라 **재실행 근거가 아니다**.

@@ -46,7 +46,7 @@ PY = sys.executable or "python3"
 CALIBRATION_REF = os.environ.get("CYS_HEALTH_CALIB_REF", "a96d8b1")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
-LANDED_WAVES = ("W0", "W1a", "W1b", "W2")
+LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
 
@@ -961,12 +961,15 @@ def h_exit_2():
     notes.append("busy=outcome 구분 + bare exit 0 구계약 유지")
     # ⓑ 티켓 소비는 ④ boot **성공 직후**에만(무스폰 소각 0). bootstrap 소비부 구조 단언.
     boot_src = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
-    ci = boot_src.find("③″ceo-ticket-consume")
-    need(ci > 0, "CEO 티켓 소비 지점을 못 찾았다")
+    # 라벨은 W3 의 STEP 레지스트리로 승격됐다(리터럴 금지) — **소비 호출 지점**을 앵커로 쓴다.
+    ci = boot_src.find("_consume_dept_ticket(ticket_path)")
+    need(ci > 0, "CEO 티켓 소비 호출 지점을 못 찾았다")
     before = boot_src[:ci]
     need("_boot_fatal_verdict(" in before,
-         "티켓 소비가 boot 결과 판정보다 앞선다(무스폰 소각 경로 잔존)")
-    notes.append("티켓 소비는 boot 판정 후(실스폰 확인)")
+         "티켓 소비가 boot 결과 판정보다 앞선다(무스폰 소각 경로 잔존 — G11)")
+    # busy 는 실스폰이 아니다: 소비 지점이 --json 판정 뒤에 있어야 busy 에서 티켓이 타지 않는다.
+    need("_parse_boot_json(" in before, "티켓 소비가 --json 소비보다 앞선다(busy 구분 없이 소각)")
+    notes.append("티켓 소비는 boot --json 판정 후(실스폰 확인)")
     # ⓒ 소비부가 busy 를 Fatal 실패로 오분류하지 않는다(순수 판정 실측).
     sys.path.insert(0, BIN_DIR)
     try:
@@ -1255,7 +1258,62 @@ def h_exit_7():
 
 # ★H-EXIT-8(G1 discover sentinel)은 **W3 소속**이다(재감사 §4: G1 → W3 시드·등록 웨이브).
 #   구판 러너가 'H-EXIT 잔여'를 일괄 W2 로 태깅했으나 §4 웨이브 소속이 정본이다(W1a/W1b 재태깅 선례).
-pending("H-EXIT-8", "W3", "discover sentinel(격리 팩 vs 미발견 분리) — 재태깅 W2→W3(§4 소속 정본: G1=W3)", ["G1"])
+@specimen("H-EXIT-8", "W3", "discover sentinel — 격리 팩=글로벌 등록 0 / 순수 미발견=폴백 허용", ["G1"])
+def h_exit_8():
+    """G1: 격리 가드가 `[]` 를 반환하고 호출부가 `discover() or [~/.claude]` 로 폴백해 **금지가
+    통째로 무효화**됐다(부서·임시 팩이 실 글로벌 settings 에 자기 훅을 등록). `[]`(순수 미발견 —
+    신규 머신)과 '금지'는 처방이 정반대이므로 반환 타입으로 분리한다."""
+    PF = _preflight_mod()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp, _temp_guard_double(PF, "SNAPMARK"):
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        # ⓐ 순수 미발견(신규 머신·base 팩) → 폴백 1건 허용·금지 사유 없음
+        with _env_patch(HOME=home, CYS_PACK_DIR=os.path.join(home, ".cys", "pack"),
+                        CYS_ACCOUNT_DIR=None, CLAUDE_CONFIG_DIR=None):
+            targets, forbidden = PF.resolve_registration_targets()
+            need(forbidden is None, "순수 미발견인데 금지로 판정: %r" % forbidden)
+            need(len(targets) == 1 and targets[0].endswith(os.path.join(".claude", "settings.json")),
+                 "신규 머신 폴백(기본 프로필 1건)이 사라졌다: %r" % targets)
+            notes.append("미발견=폴백 1건")
+        # ⓑ 부서 팩(account dir 미상) → **글로벌 등록 0** + 금지 사유
+        with _env_patch(HOME=home, CYS_PACK_DIR=os.path.join(home, ".cys", "pack-dept-d1"),
+                        CYS_ACCOUNT_DIR=None, CLAUDE_CONFIG_DIR=None):
+            targets, forbidden = PF.resolve_registration_targets()
+            need(forbidden, "부서 팩인데 금지 사유가 없다(격리 무효화)")
+            need(targets == [], "부서 팩인데 등록 대상이 있다: %r" % targets)
+            notes.append("부서 팩=등록 0")
+        # ⓒ 부서 팩 + account dir → 그 dir **한 건만**(글로벌은 여전히 금지)
+        acct = os.path.join(home, ".cys", "claude-d1")
+        os.makedirs(acct, exist_ok=True)
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with _env_patch(HOME=home, CYS_PACK_DIR=os.path.join(home, ".cys", "pack-dept-d1"),
+                        CYS_ACCOUNT_DIR=acct, CLAUDE_CONFIG_DIR=None):
+            targets, forbidden = PF.resolve_registration_targets()
+            need(forbidden, "좁힌 등록에도 금지(격리) 사유가 붙어야 한다")
+            need(targets == [os.path.join(acct, "settings.json")],
+                 "부서 account dir 한 건이 아니다: %r" % targets)
+            notes.append("부서+account=좁힌 1건")
+        # ⓓ 임시 팩 → 실 config 등록 0(스냅샷 하네스 부작용 0). 판정 입력은 마커 경로다(위 double).
+        with _env_patch(HOME=home, CYS_PACK_DIR=os.path.join(tmp, "SNAPMARK", "snap_grill_1"),
+                        CYS_ACCOUNT_DIR=None, CLAUDE_CONFIG_DIR=None):
+            targets, forbidden = PF.resolve_registration_targets()
+            need(forbidden and targets == [], "임시 팩이 실 config 등록 대상을 가졌다: %r" % targets)
+            notes.append("임시 팩=등록 0")
+    # ⓔ 구 관용구(`discover() or [기본]`) 잔존 0 — 폴백 소유자는 resolve 하나다
+    src = _read(os.path.join(BIN_DIR, "javis_preflight.py"))
+    need("discover_claude_settings() or [" not in _code_lines(src),
+         "금지를 무효화하는 `or [기본]` 폴백 관용구가 남아 있다(G1 재발)")
+    notes.append("`or [기본]` 관용구 0")
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need(_code_lines(old).count("discover_claude_settings() or [") >= 3,
+             "계측 타당성 실패: 구 코드의 폴백 관용구를 못 찾았다")
+        need("resolve_registration_targets" not in old,
+             "계측 타당성 실패: 구 코드에 이미 sentinel 계약이 있다")
+        calib = "구 코드 폴백 관용구 3+·sentinel 부재 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 @specimen("H-EXIT-9", "W1b", "싱글플라이트 패자 → 비-master skip verdict(즉시 반환)", ["G17", "A7"])
 def h_exit_9():
     """G17: 패자 pane 이 **신원 확인 없이** 조용히 exit 0 하면 그 pane 의 LLM 이 '부트 완료된
@@ -1430,7 +1488,10 @@ def h_conc_2():
     need("fn win_pidfile_lock(" in src, "non-unix 락 구현이 없다(무락 Acquired 잔존 — A8rs)")
     need("create_new(true)" in src, "pidfile 락이 O_EXCL(create_new) 원자성을 쓰지 않는다")
     need("fn pidfile_holder_dead(" in src, "스테일 락 회수가 없다(무한 거부 창 — R1 동형)")
-    ai = src.find("#[cfg(not(unix))]\n    {\n        drop(f);")
+    # (의도 보존 갱신) 최종 구현은 f 를 cfg(unix) 한정으로 열어 non-unix 분기에 drop(f) 가
+    # 존재하지 않는다 — 의도(무락 Acquired 의 pidfile 락 교체)는 분기가 win_pidfile_lock 을
+    # 직접 호출하는지로 판정한다.
+    ai = src.find("#[cfg(not(unix))]\n    {\n        match win_pidfile_lock(")
     need(ai > 0, "non-unix 분기가 pidfile 락으로 교체되지 않았다")
     notes.append("A8rs: pidfile 락(O_EXCL)+스테일 회수")
     # ⓑ' LAUNCH 경로 락 참여(G12 핵심) — 별도 프로세스 `cys launch-agent`(boot_node 경유)가
@@ -1472,7 +1533,420 @@ def h_conc_2():
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
-pending("H-CONC-3", "W3", "settings.json 3-writer 경합 무파손(mkstemp+공용 락)", ["G16", "A8"])
+_CONC3_CHILD = r"""
+import json, os, sys
+sys.path.insert(0, os.environ["CYS_BIN_DIR"])
+import javis_preflight as PF
+tag, iters = sys.argv[1], int(sys.argv[2])
+target = os.environ["CYS_SETTINGS"]
+script, event = os.environ["CYS_PAIR"].split("|")
+pf = PF.Preflight(True, [])
+for i in range(iters):
+    # ⓐ 훅 등록(멱등) — 실 등록기 경로를 그대로 태운다
+    err = pf._register_event_hook(target, event, script, None)
+    if err:
+        sys.stderr.write("register-fail:%s\n" % err); sys.exit(3)
+    # ⓑ 순수 RMW 카운터 — lost update 를 **정확히** 잰다(락이 없으면 총합이 줄어든다)
+    def mut(data, tag=tag, i=i):
+        data.setdefault("marks", []).append("%s-%d" % (tag, i))
+    err = PF._settings_rmw(target, mut)
+    if err:
+        sys.stderr.write("rmw-fail:%s\n" % err); sys.exit(4)
+sys.exit(0)
+"""
+
+
+@specimen("H-CONC-3", "W3", "settings.json 3-writer 경합 — 무파손·무 lost-update(공용 락+mkstemp)",
+          ["G16", "A8"])
+def h_conc_3():
+    """G16: settings.json 은 python preflight·Rust 시드/init-pack·부서 마이그레이션의 **3-writer**
+    대상인데, preflight 의 네 등록기가 각자 `open(path + ".tmp")` → `os.replace` 를 재구현했고
+    tmp 이름이 **고정**이었다 — 동시 writer 가 서로의 임시 파일에 써서 교차 파손(반쪽 JSON)을 만들고,
+    그 뒤 모든 등록기가 "파싱 실패 — 덮어쓰기 거부"로 수리를 영구 포기한다(A8 지배 실패 모드).
+    W1a 가 신설한 `javis_lock`(락+mkstemp)의 **소비 이관**이 W3 몫이다."""
+    PF = _preflight_mod()
+    notes = []
+    # ⓐ 구조: 고정 `.tmp` 재구현 0 · 등록기 전원이 단일 RMW 소유자를 경유
+    src = _read(os.path.join(BIN_DIR, "javis_preflight.py"))
+    code = _code_lines(src)
+    need('settings_path + ".tmp"' not in code, "고정 .tmp 재구현이 남아 있다(교차 파손 경로)")
+    need("def _settings_rmw(" in code, "settings RMW 단일 소유자가 없다")
+    for fn in ("_register_hook", "_register_statusline", "_register_event_hook",
+               "_register_appbuild_hook"):
+        i = code.find("def %s(" % fn)
+        need(i > 0, "%s 를 못 찾았다" % fn)
+        body = code[i:code.find("\n    def ", i + 10)]
+        need("_settings_rmw(" in body, "%s 가 단일 RMW 소유자를 경유하지 않는다" % fn)
+    need("javis_lock" in code and "FileLock(" in code, "preflight 가 공용 락을 소비하지 않는다")
+    notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0")
+    # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 3-writer 의 나머지 두 축
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+    mi = pk.find("pub fn merge_desired_hooks(")
+    need(mi > 0, "Rust 병합기를 못 찾았다")
+    mbody = pk[mi:pk.find("\n}\n", mi)]
+    need("write_atomic(settings_path" in mbody,
+         "Rust 병합기가 원자 쓰기를 쓰지 않는다(반쪽 등록부 = 부트 발화 소실)")
+    need("std::fs::write(settings" not in _code_lines(pk), "Rust 비원자 settings write 잔존")
+    cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    need("std::fs::write(settings_path" not in _code_lines(cy),
+         "init-pack 이 비원자 write 로 되돌아갔다(3-writer 파손 축 복귀)")
+    notes.append("Rust 시드 원자 쓰기")
+    # ⓒ 실측 경합: 6 writer × 12 iter 동시 실행 → 파손 0 · lost update 0 · 훅 6종 전원 등록
+    pairs = [("session-start.sh", "SessionStart"), ("role-bootstrap.sh", "UserPromptSubmit"),
+             ("save-state.sh", "Stop"), ("save-state.sh", "PreCompact"),
+             ("reflect-scan.sh", "SessionEnd"), ("pack-guard.sh", "PostToolUse")]
+    iters = 12
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        pack = _fake_pack_with_hooks(os.path.join(home, ".cys", "pack"))
+        target = os.path.join(home, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # 사용자 기존 설정 — 경합 후에도 살아 있어야 한다
+        _w(target, json.dumps({"theme": "dark", "hooks": {}}), 0o644)
+        child = os.path.join(tmp, "child.py")
+        _w(child, _CONC3_CHILD, 0o644)
+        procs = []
+        for n, (script, event) in enumerate(pairs):
+            env = _base_env({"HOME": home, "CYS_PACK_DIR": pack, "CYS_BIN_DIR": BIN_DIR,
+                             "CYS_SETTINGS": target, "CYS_PAIR": "%s|%s" % (script, event)})
+            procs.append(subprocess.Popen([PY, child, "w%d" % n, str(iters)], env=env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          text=True))
+        fails = []
+        for pr in procs:
+            out, err = pr.communicate(timeout=180)
+            if pr.returncode != 0:
+                fails.append("rc=%d %s" % (pr.returncode, (err or "")[-200:]))
+        need(not fails, "경합 writer 실패: %r" % fails)
+        # 파손 0: 파싱 성공 + 사용자 키 보존
+        raw = _read(target)
+        data = json.loads(raw)          # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        need(data.get("theme") == "dark", "경합이 사용자 키를 지웠다")
+        # lost update 0: 모든 writer 의 모든 mark 가 남는다
+        marks = data.get("marks") or []
+        need(len(marks) == len(pairs) * iters,
+             "lost update 발생 — marks %d ≠ 기대 %d(직렬화 실패)" % (len(marks), len(pairs) * iters))
+        need(len(set(marks)) == len(marks), "mark 중복(재진입 이상)")
+        # 훅 6종 전원 등록 + 이벤트별 중복 0
+        #   ★기대 문자열은 **자식과 같은 팩 env** 에서 만들어야 한다(부모 env 로 만들면 경로가 달라
+        #     '0회 등록'으로 오판한다 — 계측기 자기검증).
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack):
+            wants = {(script, event): PF._cys_hook_cmd(script) for script, event in pairs}
+        for script, event in pairs:
+            want = wants[(script, event)]
+            arr = (data.get("hooks") or {}).get(event) or []
+            cnt = sum(1 for e in arr for h in e.get("hooks", []) if h.get("command") == want)
+            need(cnt == 1, "%s/%s 등록 %d회(0=유실·2+=중복 append)" % (event, script, cnt))
+        # 잔재 0: 고정 .tmp 파일이 남지 않는다(mkstemp 정리)
+        leftovers = [f for f in os.listdir(os.path.dirname(target))
+                     if f.endswith(".tmp") or f.startswith(".tmp-")]
+        need(not leftovers, "임시 파일 잔재: %r" % leftovers)
+        notes.append("6 writer × %d iter: 파손 0·lost update 0·중복 0" % iters)
+        # ⓓ ★계측 타당성(음성 대조군): 같은 mark 오라클을 **직렬화 없는** RMW 에 걸면 lost update 가
+        #    실제로 검출돼야 한다 — 검출력이 없는 오라클로 얻은 위 GREEN 은 아무것도 증명하지 않는다
+        #    (MEMORY '디버깅 계측 타당성 게이트': 계측기 자체를 먼저 검증한다).
+        naive = os.path.join(tmp, "naive.json")
+        _w(naive, json.dumps({"marks": []}), 0o644)
+        nchild = os.path.join(tmp, "naive.py")
+        _w(nchild, "import json, os, sys, time\n"
+                   "t, n = sys.argv[1], int(sys.argv[2])\n"
+                   "p = os.environ['CYS_SETTINGS']\n"
+                   "for i in range(n):\n"
+                   "    d = json.load(open(p))\n"
+                   "    time.sleep(0.02)\n"
+                   "    d.setdefault('marks', []).append('%s-%d' % (t, i))\n"
+                   "    json.dump(d, open(p, 'w'))\n", 0o644)
+        nprocs = [subprocess.Popen([PY, nchild, "n%d" % k, "6"],
+                                   env=_base_env({"CYS_SETTINGS": naive}),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  for k in range(4)]
+        for pr in nprocs:
+            pr.communicate(timeout=120)
+        nmarks = (json.loads(_read(naive) or "{}") or {}).get("marks") or []
+        need(len(nmarks) < 4 * 6,
+             "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
+             "(marks=%d) — 위 GREEN 은 검출력 미확인" % len(nmarks))
+        notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출"
+                     % (4 * 6 - len(nmarks), 4 * 6))
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        oldc = _code_lines(old)
+        need(oldc.count('settings_path + ".tmp"') >= 3,
+             "계측 타당성 실패: 구 코드의 고정 .tmp 재구현을 못 찾았다")
+        need("_settings_rmw" not in oldc, "계측 타당성 실패: 구 코드에 이미 단일 RMW 소유자가 있다")
+        need("javis_lock" not in oldc, "계측 타당성 실패: 구 preflight 가 이미 공용 락을 쓴다")
+        calib = "구 코드=고정 .tmp 3+·락 미소비 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SAFE-1", "W2",
+          "치명위험 ④ 차단 — 파괴적 복구는 '죽음 확정' 좌석에만(냉시작·기동중 좌석 불가침)",
+          ["W2-자체감사", "B3(안전 경계)", "④ 전 pane 사망"])
+def h_safe_1():
+    """★내가 W2 에서 신설한 파괴 경로(node-recover pane 주입 → reclaim kill)의 발동 조건을 못박는다.
+
+    발견 경위(자체 적대감사): `seat_liveness` 의 `Absent` 는 세 사실의 합집합이다 —
+    ⓐ명시적 빈 좌석 ⓑ좌석 판정불가의 시한부 해소 ⓒ구 데몬 무신호. 초안은 ⓑ·ⓒ에도 복구 체인을
+    걸었고, 그 경로는 **냉시작 데몬**(watchdog 첫 틱 전 = 전 좌석 Unknown)에서 GUI 의
+    `spawn_orchestra_boot` 와 만나 **건강한 전 pane** 을 파괴한다:
+      · `run_node_recover` 는 `agent_alive == Some(true)` 만 거부한다 → watchdog 이 아직 자손을
+        관측 못 한 **정상 기동 중** 노드는 통과해, 돌고 있는 claude 입력창에 `C-u` + 기동 커맨드가 박힌다.
+      · 이어지는 reclaim 은 kill 이다. 세 좌석에 연쇄하면 '터미널에 글자 0'이다.
+    수리 = `seat_death_confirmed` 3중 AND(명시 empty ∧ agent_alive==false ∧ 좌석 나이>readiness 예산).
+    """
+    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    notes = []
+    need("fn seat_death_confirmed(" in src, "죽음 확정 게이트가 없다 — 파괴 경로가 Absent 전체에 열림")
+    gi = src.find("fn seat_death_confirmed(")
+    body = src[gi:src.find("\n}\n", gi)]
+    # 3중 AND 전수
+    need('Some("empty") => {}' in body,
+         "좌석 사실이 **명시적** empty 일 때만 통과하지 않는다(Unknown·필드부재 혼입)")
+    need('s["agent_alive"].as_bool() != Some(false)' in body,
+         "agent_alive==Some(false) 요건이 없다 — meta 없는 사용자 셸까지 파괴 대상이 된다")
+    need("created_at" in body and "budget_readiness_max" in body,
+         "좌석 나이 가드가 없다 — 기동 중 pane 과의 레이스가 열린다")
+    need("created <= 0.0" in body, "created_at 미상에서 파괴를 허용한다(보류 우선 위반)")
+    notes.append("3중 AND(명시 empty·agent_alive=false·나이>예산)+미상 보류")
+    # 호출부: 확정 실패 시 **파괴도 스폰도 안 한다**(중복 스폰이 곧 이중 에이전트다)
+    ci = src.find("match seat_death_confirmed(row)")
+    need(ci > 0, "run_boot 이 죽음 확정 게이트를 소비하지 않는다")
+    arm = src[ci:ci + 2200]
+    need("skipped_unconfirmed" in arm, "미확정 좌석의 typed outcome 이 없다")
+    need("continue;" in arm, "미확정에서 스폰으로 흘러간다(중복 스폰·claim_denied·litter)")
+    ok_at = arm.find("Ok(()) =>")
+    err_at = arm.find("Err(hold) =>")
+    need(0 <= err_at < ok_at, "미확정(Err) 분기가 확정(Ok) 분기보다 뒤에 있다(구조 취약)")
+    need("run_node_recover" in arm[ok_at:], "확정 분기에 node-recover 가 없다")
+    need("run_node_recover" not in arm[err_at:ok_at],
+         "미확정 분기에서 node-recover 를 호출한다(살아있는 pane 주입 — ④ 재발)")
+    need("escalate_reclaim" not in arm[err_at:ok_at],
+         "미확정 분기에서 reclaim(kill)을 호출한다(오살 — ④ 재발)")
+    notes.append("미확정=파괴 0·스폰 0(typed skipped_unconfirmed)")
+    # reclaim 은 여전히 hold-first 판정을 통과해야 kill 한다(2선 방어)
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_boot_node as BN
+    unk = {"surfaces": [{"role": "cso", "exited": False, "agent_alive": False,
+                         "status": None, "seat": "unknown"}]}
+    need(BN._reclaim_verdict(unk, "cso", 100, 100) == "hold-alive",
+         "2선 방어(reclaim hold-first)가 Unknown 좌석에 kill 을 허용")
+    notes.append("2선 방어: reclaim Unknown=hold")
+    return " · ".join(notes)
+
+
+@specimen("H-SAFE-2", "W2",
+          "치명위험 ④ 차단 — readiness 안전 밸브(영구 오부정 불가능성) + bare exit 구계약",
+          ["W2-자체감사", "B4(안전 경계)", "금지 방향 ⑧"])
+def h_safe_2():
+    """★두 개의 자체감사 산출 안전장치를 박제한다.
+
+    ① **readiness 안전 밸브**: 델타 매칭은 claude 의 `❯` 가 scrollback(개행 완성 라인)에 실린다는
+       가정에 서 있다. 그 가정이 어떤 버전·터미널에서 깨지면 readiness 가 **영구 오부정**이 되고,
+       T-0147-4 이후 롤백 close 가 실제로 성공하므로 **건강한 pane 이 전부 닫힌다**(글자 0).
+       그래서 화면과 무관한 양성 증거(`agent_alive` = 데몬이 커널 프로세스 표에서 관측한 사실)를
+       둔다. 기동 **실패** 노드는 자손이 없어 이 밸브가 켜지지 않으므로 B4 오탐 방향은 불변이다.
+    ② **bare exit 구계약**(금지 방향 ⑧): `cys boot` 의 bare exit 에 mandatory/busy 같은 새 의미를
+       실으면 아직 --json 을 소비하지 않는 GUI 판정이 조용히 바뀐다. exit 는 구계약(launch 실패>0)
+       그대로 두고, B1·G29 는 typed --json 으로만 전달한다.
+    """
+    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    notes = []
+    bi = src.find("fn boot_agent_on_surface(")
+    body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
+    # ① 안전 밸브 — agent_alive 커널 사실 기반, 델타 실패와 독립
+    need("안전 밸브" in body and 's["agent_alive"].as_bool()' in body,
+         "readiness 안전 밸브가 없다 — 델타 가정이 깨지면 건강 pane 전부 close(④)")
+    vi = body.find("★★안전 밸브")
+    need(vi > 0, "안전 밸브 블록 앵커를 못 찾았다")
+    # 밸브 코드 구간 = 앵커부터 마커 분기 직전까지(주석 길이에 의존하지 않는 경계).
+    mi_tmp = body.find("match &ready_marker {", vi)
+    need(mi_tmp > vi, "안전 밸브 뒤에 마커 분기가 없다")
+    valve = body[vi:mi_tmp]
+    need("ready = true" in valve, "안전 밸브가 ready 를 세우지 않는다")
+    need("if alive {" in valve, "안전 밸브가 agent_alive 조건 분기를 갖지 않는다")
+    need("break;" in valve, "안전 밸브가 폴링 루프를 벗어나지 않는다")
+    # 밸브는 마커 판정보다 **앞**에 있어야 실효가 있다(마커 실패로 루프가 끝나기 전에 발화)
+    mi = body.find("match &ready_marker {")
+    need(0 < vi < mi, "안전 밸브가 마커 분기 뒤에 있다(델타 실패 시 도달 못 함)")
+    notes.append("안전 밸브: agent_alive 커널 사실·마커 분기 선행")
+    # B4 오탐 방향 불변: 밸브의 **판정 근거**(주석 제외 실코드)에 화면/델타 텍스트가 없다.
+    valve_code = "\n".join(ln for ln in valve.splitlines() if not ln.strip().startswith("//"))
+    for banned in ("delta_text", "delta_flat", "text.contains"):
+        need(banned not in valve_code,
+             "안전 밸브가 화면/델타 텍스트를 근거로 쓴다(%s) — 커널 사실 독립성 상실" % banned)
+    notes.append("밸브 근거=화면 무의존(B4 오탐 방향 불변)")
+    # ② bare exit 구계약
+    ri = src.find("fn run_boot(")
+    rbody = src[ri:src.find("\n/// 죽음 확정 좌석의 reclaim", ri)]
+    tail = rbody[rbody.rfind("if failed > 0"):]
+    need(tail.startswith("if failed > 0"),
+         "bare exit 이 구계약(launch 실패>0)이 아니다 — 금지 방향 ⑧ 위반(GUI 판정 무단 변경)")
+    need("fatal_failed" not in tail, "bare exit 이 mandatory 의미를 싣는다(W4 원자 계약 위반)")
+    need('"fatal_failed": fatal_failed' in rbody,
+         "fatal_failed 가 --json 요약에 없다(typed 채널로 전달되지 않음)")
+    notes.append("bare exit=구계약(failed>0) · mandatory 는 --json 전용")
+    # ③ 팩↔바이너리 스큐 폴백(온보딩 전멸 차단)
+    bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need("_is_unknown_arg_error(" in bsrc, "`--json` 미지원 구 바이너리 폴백이 없다(온보딩 전멸)")
+    need("④boot-skew" in bsrc, "스큐 폴백이 진단 단계로 기록되지 않는다")
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_bootstrap as B
+    need(B._is_unknown_arg_error("error: unexpected argument '--json' found") is True,
+         "clap 미지원 인자 신호를 감지하지 못한다")
+    need(B._is_unknown_arg_error("boot 완료: 신규 기동 0 · 실패 1") is False,
+         "진짜 부트 실패를 스큐로 오독한다(재시도 루프 위험)")
+    notes.append("스큐 폴백: 미지 인자만 좁게 감지")
+    return " · ".join(notes)
+
+
+@specimen("H-SAFE-W", "W2",
+          "Windows 전용 락 안전성 — 영구 Busy 불가능성(나이 backstop)·RAII 해제·fail-open + 타깃 타입검사",
+          ["W2-자체감사", "A8rs", "④ Windows 온보딩 전멸"])
+def h_safe_w():
+    """★오너 지시("맥은 문제없어도 윈도우 설치파일에서 에러·코드 깨짐이 잦다")에 대한 구조적 응답.
+
+    W2 가 신설한 `cfg(not(unix))` 락 코드는 **macOS 컴파일러가 한 번도 검사하지 않는 영역**이다.
+    두 종류의 위험을 각각 못박는다:
+      ① **컴파일 위험**: 검사되지 않은 cfg 분기의 타입 오류는 Windows 빌드에서만 터진다.
+         → 이 검체는 해당 함수들이 존재하고 계약 형상을 유지하는지 **텍스트로** 확인하고,
+           실제 타깃 타입검사는 릴리스 게이트(Windows CI · H-WIN-11)와 워커의 스크래치 크레이트
+           `cargo check --target x86_64-pc-windows-msvc` 로 수행한다(음성 대조: 같은 크레이트를
+           macOS 타깃으로 검사하면 unix 분기의 `libc` 미해소로 **반드시 실패**해야 한다).
+      ② **런타임 위험(치명)**: 파일시스템 락은 자동 해제가 없다. 초안은 pidfile 을 삭제하지 않아
+         `tasklist` 가 실패하거나 pid 가 재사용되면 **모든 Windows 부트가 영구 Busy** 가 됐다
+         (조용하고 영구적인 팀 0 = 온보딩 전멸). 나이 backstop + RAII 삭제 + fail-open 으로
+         '영구 Busy' 를 구조적으로 불가능하게 만든다.
+    """
+    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    notes = []
+    # ⓐ RAII 해제 — Drop 에서 pidfile 을 삭제한다(핸들만 닫고 파일을 남기면 안 된다)
+    need("impl Drop for LockHold" in src, "락 보유 토큰에 RAII 해제(Drop)가 없다")
+    di = src.find("impl Drop for LockHold")
+    dbody = src[di:src.find("\n}\n", di)]
+    need("remove_file" in dbody, "Drop 이 pidfile 을 삭제하지 않는다(잔존 → 다음 부트 Busy)")
+    need("self.file = None" in dbody,
+         "삭제 전 핸들을 닫지 않는다(Windows 는 열린 파일 삭제가 실패할 수 있다)")
+    notes.append("RAII: 핸들 닫고 pidfile 삭제")
+    # ⓑ 나이 backstop — 외부 도구 무의존 회수 근거(영구 Busy 불가능성의 핵심)
+    need("fn pidfile_reclaimable(" in src, "스테일 회수 판정 함수가 없다")
+    ri = src.find("fn pidfile_reclaimable(")
+    rbody = src[ri:src.find("\n}\n", ri)]
+    need("BUDGET_LOCK_STALE_SECS" in rbody, "나이 기반 backstop 이 없다(tasklist 실패 시 영구 Busy)")
+    # (의도 보존 갱신) 외부 프로세스 조회는 pidfile_holder_dead 로 분리됐다(H-CONC-2 계약 심볼).
+    # 의도: 회수 판정에서 나이 backstop 이 보유자 사망 조회보다 **먼저** — 조회 도구 실패가
+    # 판정을 지배하면 영구 Busy. holder_dead 호출이 상수 뒤에 있고, 조회 자체(tasklist)는
+    # holder_dead 안에 있음을 각각 단언한다.
+    ai = rbody.find("BUDGET_LOCK_STALE_SECS")
+    ti = rbody.find("pidfile_holder_dead")
+    need(0 < ai < ti, "나이 backstop 이 보유자 사망 조회 뒤에 있다 — 외부 도구 실패가 먼저 판정을 지배한다")
+    hi = src.find("fn pidfile_holder_dead(")
+    need(hi > 0 and "tasklist" in src[hi:src.find("\n}\n", hi)],
+         "보유자 사망 조회(tasklist)가 holder_dead 에 없다")
+    need("pid == std::process::id()" in rbody, "자기 잔재(핸들 누수) 회수 경로가 없다")
+    notes.append("나이 backstop 선행 + 자기 잔재 회수")
+    # ⓒ fail-open — 판정 불가는 Busy 가 아니라 '직렬화 포기·진행'
+    need("WinLock::Unavailable => BootLock::Acquired(LockHold::unserialized())" in src,
+         "판정 불가가 fail-open(직렬화 포기·진행)으로 강등되지 않는다")
+    wi = src.find("fn win_pidfile_lock(")
+    wbody = src[wi:src.find("\n}\n", wi)]
+    need("return WinLock::Unavailable" in wbody, "락 생성 실패가 Unavailable 로 강등되지 않는다")
+    need("remove_file(&pidfile).is_err()" in wbody,
+         "스테일 삭제 실패가 fail-open 으로 흐르지 않는다(권한 문제에서 영구 Busy)")
+    notes.append("fail-open: 판정불가·삭제실패 → 직렬화 포기(진행)")
+    # ⓓ BUDGET 파리티에 편입 — 상수가 python SOT 와 기계 대조된다
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_budget as BU
+    need("BUDGET_LOCK_STALE_SECS" in BU.RUST_PARITY_CONSTS,
+         "스테일 임계가 BUDGET 파리티 표에 없다(rust/python 드리프트 가능)")
+    m = re.search(r"const BUDGET_LOCK_STALE_SECS: u64 = (\d+);", src)
+    need(m and int(m.group(1)) == int(BU.leaf("LOCK_STALE_S")),
+         "스테일 임계 파리티 불일치: rust=%s python=%s"
+         % (m.group(1) if m else None, BU.leaf("LOCK_STALE_S")))
+    # 임계는 정상 부트 최악치보다 커야 한다(진행 중 부트를 뺏지 않는다)
+    need(BU.leaf("LOCK_STALE_S") > BU.cys_boot_outer_s(),
+         "스테일 임계(%s) ≤ cys boot 외부 상한(%s) — 진행 중 부트의 락을 뺏는다"
+         % (BU.leaf("LOCK_STALE_S"), BU.cys_boot_outer_s()))
+    notes.append("임계 파리티 + 정상 부트 최악치 초과 단언")
+    # ⓔ 파괴 경로는 Windows 에서 넓히지 않는다(python 후보 확장 금지 — 보수 판정)
+    ei = src.find("fn escalate_reclaim(")
+    ebody = src[ei:src.find("\n}\n", ei)]
+    need('Command::new("python3")' in ebody, "reclaim 헬퍼 호출을 못 찾았다")
+    need("reclaim **미실행**" in ebody,
+         "인터프리터 해소 실패가 무음 no-op 이다(무엇이 안 일어났는지 고지 필요)")
+    need(ebody.count("Command::new(") == 1,
+         "인터프리터 후보를 넓혔다 — Windows 에서 파괴 경로가 더 쉽게 발화한다(보수 판정 이탈)")
+    notes.append("파괴 경로 Windows 확장 금지 + loud no-op")
+    return " · ".join(notes)
+
+
+@specimen("H-SAFE-3", "W2",
+          "치명위험 ①②③ 차단 — 큐 폭주 상한·clear 트리거 비선점·자가치유 fail-safe",
+          ["W2-자체감사", "B11(상한)", "② clear 게이트", "③ 자가치유"])
+def h_safe_3():
+    """① 폭주: 재주입은 delivered_no_ack 한정·멱등 1회·큐 비었을 때만 → 누적 0.
+    ② clear: status.set 의 래치 영속(fsync 2회·unwrap panic 경로)이 컨텍스트 임계 발화를 **선점하지
+       못한다**(순서 역전 금지).
+    ③ 자가치유: `cys list` 파서 드리프트가 **전 wakeup 을 dead 로 만들어** 주기 자가치유를 조용히
+       전멸시키던 경로를 unknown 강등으로 막는다. 동족 좌석 대표 선택도 결정론화(죽은 좌석 오대표 금지).
+    """
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_boot_node as BN
+    import javis_orchestra as O
+    import javis_wakeup as W
+    notes = []
+    # ① 큐 폭주 상한 — 재주입은 큐가 **빈** 상태에서만(pending 이면 재전송 금지)
+    alive = {"surface_ref": "surface:7", "role": "cso", "pid": 9, "exited": False}
+    need(BN.classify_delivery(["너는 이 cys"], alive, "너는 이 cys")[0] == BN.DELIVERY_PENDING,
+         "큐 잔존이 pending 이 아니다 — 맹목 재전송(wakeup 홍수) 위험")
+    bnsrc = _read(os.path.join(BIN_DIR, "javis_boot_node.py"))
+    vi = bnsrc.find("배달 3분기로 처방을 가른다")
+    seg = bnsrc[vi:vi + 2600]
+    need(seg.count("inject(a.role, msg") == 1, "재주입 지점이 1개가 아니다(멱등 상한 붕괴)")
+    need("attempts=1" in seg, "재주입이 멱등 1회가 아니다")
+    notes.append("재주입: pending 금지·멱등 1회·지점 1개")
+    # ② clear 트리거 비선점 — 래치 영속이 임계 발화보다 **뒤**
+    hnd = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    si = hnd.find('"status.set" =>')
+    sbody = hnd[si:hnd.find('"reinject.mark" =>', si)]
+    fire = sbody.find("maybe_fire_context_threshold(daemon, &surface, pct")
+    persist = sbody.find("crate::governance::persist_topology(daemon);")
+    need(fire > 0 and persist > 0, "status.set 의 임계 발화·래치 영속 지점을 못 찾았다")
+    need(fire < persist,
+         "래치 영속(fsync 2회·unwrap panic 경로)이 컨텍스트 임계 발화를 **선점**한다 — "
+         "60%% clear 사이클이 부수 기능에 막힐 수 있다(치명위험 ②)")
+    need("let latched_now = {" in sbody[:fire],
+         "래치 자체(인메모리)는 발화 전에 세워져야 한다(값 손실 0)")
+    notes.append("clear 트리거 비선점(래치 영속은 발화 뒤)")
+    # ③ wakeup 파서 드리프트 fail-safe
+    need(W._target_alive.__doc__ is not None, "zombie 가드 문서 소실")
+    wsrc = _read(os.path.join(BIN_DIR, "javis_wakeup.py"))
+    need("liveness=unknown 으로" in wsrc or "unknown 으로 강등" in wsrc,
+         "파서 0행에서 unknown 강등이 없다 — 전 wakeup 이 dead 로 접혀 자가치유 전멸")
+    need(W.live_target_rows("완전히 다른 포맷의 출력\n또 한 줄\n") == [],
+         "드리프트 입력에서 행이 나온다(테스트 전제 붕괴)")
+    notes.append("wakeup: 파서 드리프트=unknown(배달 계속)")
+    # ③' 동족 좌석 대표 결정론 — 죽은 worker 가 건강한 worker 를 가리지 않는다
+    st = {"surfaces": [
+        {"role": "cso", "exited": False, "awakened_at": 1.0},
+        {"role": "worker", "exited": False, "agent_alive": False, "seat": "empty"},
+        {"role": "worker-2", "exited": False, "awakened_at": 2.0},
+        {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
+        {"role": "reviewer-codex", "exited": False, "awakened_at": 1.0}]}
+    v, _ = O.check_verdicts(st)
+    need(v["worker"]["satisfied"] is True,
+         "죽은 worker 좌석이 건강한 worker-2 를 가려 '미기동' 오판(결손 churn): %r" % v["worker"])
+    need(v["worker"]["grade"] == "awake_confirmed" and v["worker"]["filler"] == "worker-2",
+         "동족 대표가 최선 등급 좌석이 아니다: %r" % v["worker"])
+    # 결정론: 반복 호출에서 동일 결과(집합 순회 비결정성 제거)
+    reps = {json.dumps(O.check_verdicts(st)[0], sort_keys=True) for _ in range(8)}
+    need(len(reps) == 1, "check_verdicts 가 비결정적이다(집합 순회 의존 잔존)")
+    notes.append("동족 대표=최선 등급·8회 반복 결정론")
+    return " · ".join(notes)
 
 
 @specimen("H-CONC-4", "W2", "좌석 승계 임계영역 재검증(프로브 후 점유 → 승계 취소)", ["G13", "G14"])
@@ -2691,15 +3165,573 @@ pending("H-DOC-4", "W4", "헤더 exit 표↔코드 상수 기계 대조 (결함 
 pending("H-DOC-5", "W4", "generic reviewer 안내 문구 금지 (결함 G30 문구는 W0에서 수정 — assert 는 W4)", ["G30"])
 pending("H-DOC-7", "W4", "agents 스키마 완결성(vendor/user 계층)", ["B20"])
 pending("H-DOC-8", "W4", "팀 부트 진입점 전수 단일 계약", ["B5"])
-pending("H-SEED-1", "W3", "소망 훅 집합 동등성(Rust 시드/init-pack == SELFCORR_HOOKS)", ["A9"])
-pending("H-SEED-2", "W3", "실사용 config dir 등록 hard 검증(CLAUDE_CONFIG_DIR 최우선)", ["A21", "R4"])
-pending("H-SEED-3", "W3", "settings.json 없는 프로필 디렉토리 후보화", ["G7"])
-pending("H-SEED-4", "W3", "cys-dept launch/rotate → CYS_ACCOUNT_DIR 복원 주입", ["G3"])
-pending("H-SEED-5", "W3", "외부 동명 훅 보존(_prune 소유 술어)", ["G10"])
-pending("H-LIFE-1", "W3", "레인별 marker/boot-last 분리 + run 귀속 교차 단언", ["G15", "P3-A-DEPT-LANE"])
-pending("H-LIFE-2", "W3", "step id enum 유일성·기록 순서=실행 순서 "
-        "(재태깅 W1b→W3: §4 웨이브 소속이 정본 — P3-A-STEP-NAME 은 W3 대상)",
-        ["P3-A-STEP-NAME"])
+# ═══════════════════════════════════════════════════════════════════════════
+# W3 발효: 시드·등록·수명주기·레인 (H-SEED-1~5 · H-LIFE-1~2)
+# ═══════════════════════════════════════════════════════════════════════════
+class _env_patch:
+    """env 를 임시 치환한다(None = 삭제). 검체는 실 HOME·실 팩을 절대 만지지 않는다."""
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.saved = {}
+
+    def __enter__(self):
+        for k, v in self.kw.items():
+            self.saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return self
+
+    def __exit__(self, *a):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
+class _temp_guard_double:
+    """preflight 의 **임시 팩 가드**를 검체 동안 마커 기반으로 치환한다.
+
+    ★왜 필요한가(계측 타당성): 이 러너의 격리 샌드박스는 그 자체가 `/var/folders/...`(임시 dir)
+      아래에 산다 — 그래서 실 가드가 **모든** 샌드박스 팩을 '임시 팩'으로 판정해 등록을 금지한다.
+      그러면 base 팩 시나리오(폴백 허용·프로필 발견)를 아예 잴 수 없다.
+    ★그래서 가드의 *논리*는 버리지 않고 **판정 입력만 마커로 바꾼다**: 마커 경로를 준 케이스는
+      여전히 '임시 팩=금지'로 판정되므로 가드 경로도 같은 검체 안에서 실측된다. 실 함수 자체의
+      타당성(진짜 tmp 경로를 True 로 본다)은 진입 시 1회 단언한다."""
+
+    def __init__(self, PF, mark):
+        self.PF = PF
+        self.mark = mark
+        self.orig = None
+
+    def __enter__(self):
+        self.orig = self.PF._path_under_tempdir
+        need(self.orig(tempfile.gettempdir()) is True,
+             "계측 타당성 실패: 실 임시 팩 가드가 tmp 경로를 임시로 보지 않는다")
+        self.PF._path_under_tempdir = lambda path, m=self.mark: m in (path or "")
+        return self
+
+    def __exit__(self, *a):
+        self.PF._path_under_tempdir = self.orig
+        return False
+
+
+def _preflight_mod():
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_preflight
+    return javis_preflight
+
+
+def _bootstrap_mod():
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_bootstrap
+    return javis_bootstrap
+
+
+def _rust_awakening_hooks():
+    """src/pack.rs `AWAKENING_HOOKS` 리터럴 → {(script, event, matcher)}. 파싱 실패=hard fail."""
+    src = _repo_file(os.path.join("src", "pack.rs"))
+    m = re.search(r"pub const AWAKENING_HOOKS: \[DesiredHook; (\d+)\] = \[(.*?)\n\];", src, re.S)
+    need(m, "src/pack.rs 에서 AWAKENING_HOOKS 를 찾지 못했다(표현이 바뀌면 이 대조를 함께 갱신하라)")
+    body = _code_lines(m.group(2).replace("//", "#"))
+    out = set()
+    for blk in re.finditer(
+            r'script:\s*"([^"]+)"\s*,\s*event:\s*"([^"]+)"\s*,\s*matcher:\s*(None|Some\("([^"]*)"\))',
+            body):
+        out.add((blk.group(1), blk.group(2), blk.group(4)))
+    need(len(out) == int(m.group(1)),
+         "Rust 매니페스트 파싱 수 불일치(선언 %s ≠ 파싱 %d)" % (m.group(1), len(out)))
+    return out
+
+
+def _make_profile(home, name, hooks):
+    """격리 HOME 에 프로필 디렉터리+settings.json 생성. hooks = {event: [command…]}."""
+    d = os.path.join(home, name)
+    os.makedirs(d, exist_ok=True)
+    if hooks is None:
+        return d
+    data = {"hooks": {ev: [{"hooks": [{"type": "command", "command": c}]} for c in cmds]
+                      for ev, cmds in hooks.items()}}
+    _w(os.path.join(d, "settings.json"), json.dumps(data, ensure_ascii=False, indent=2), 0o644)
+    return d
+
+
+def _fake_pack_with_hooks(pack):
+    """C28 이 요구하는 훅 스크립트·reflect 엔진을 갖춘 가짜 팩(등록 판정만 재려면 존재만 충분)."""
+    for _, script in (("", "session-start.sh"), ("", "role-bootstrap.sh"),
+                      ("", "inject-context.sh"), ("", "save-state.sh"),
+                      ("", "reflect-scan.sh"), ("", "commit-memory-nudge.sh"),
+                      ("", "pack-guard.sh")):
+        _w(os.path.join(pack, "hooks", script), "#!/bin/sh\nexit 0\n")
+    _w(os.path.join(pack, "bin", "javis_reflect.py"), "import sys;sys.exit(0)\n", 0o644)
+    return pack
+
+
+@specimen("H-SEED-1", "W3", "소망 훅 집합 동등성 — Rust 시드/init-pack == 파이썬 매니페스트", ["A9"])
+def h_seed_1():
+    """A9: 소망상태가 **집행자마다 흩어져** 있었다 — Rust 시드는 `!settings.exists()` 파일 단위,
+    init-pack 은 SessionStart 하나만, role-bootstrap(UserPromptSubmit)은 preflight C28 만 등록했고
+    그 C28 의 유일한 자동 트리거가 **결손된 그 훅 자신**이었다(닭·달걀). 소망 집합을 데이터 한 곳에
+    적고(1 데이터 × N 집행자) 집행을 **이벤트 단위 멱등 병합**으로 바꾼다."""
+    PF = _preflight_mod()
+    rust = _rust_awakening_hooks()
+    py = {(script, ev, matcher) for script, evs in PF.AWAKENING_HOOKS for ev, matcher in evs}
+    need(rust == py, "소망 집합이 2언어에서 갈렸다 — rust=%r / python=%r" % (sorted(rust), sorted(py)))
+    notes = ["집합 %d항 2언어 일치" % len(rust)]
+    # ⓐ 각성 집합은 SessionStart + UserPromptSubmit 을 **둘 다** 갖는다(둘 중 하나만이 원 결함)
+    need({e for _, e, _ in py} == {"SessionStart", "UserPromptSubmit"},
+         "각성 집합이 두 이벤트를 덮지 않는다: %r" % sorted({e for _, e, _ in py}))
+    # ⓑ C28 등록 집합(SELFCORR_HOOKS)이 role-bootstrap 을 포함한다(집행자 누락 방지)
+    selfcorr = {(sc, ev) for sc, evs in PF.SELFCORR_HOOKS for ev, _ in evs}
+    need(("role-bootstrap.sh", "UserPromptSubmit") in selfcorr,
+         "C28 등록 집합에 각성 훅이 없다(등록 주체 부재)")
+    need(PF.AWAKENING_SCRIPTS == {sc for sc, _, _ in py}, "AWAKENING_SCRIPTS 파생 불일치")
+    notes.append("C28 등록 주체 확인")
+    # ⓒ Rust 두 집행자가 **매니페스트를 소비**한다(사본 재발명 0)
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+    need("merge_desired_hooks(&settings, &pack_dir(), &AWAKENING_HOOKS)" in pk,
+         "격리 config 시드가 매니페스트를 소비하지 않는다")
+    need("fn merge_desired_hooks(" in pk, "이벤트 단위 병합기가 없다")
+    need("if !settings.exists() {" not in _code_lines(pk),
+         "파일 단위 시드 가드(`!settings.exists()`)가 남아 있다(A9 재발)")
+    cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    need("cys::pack::AWAKENING_HOOKS" in cy, "init-pack 이 매니페스트를 소비하지 않는다")
+    ii = cy.find("fn install_claude_hook(")
+    need(ii > 0, "install_claude_hook 을 못 찾았다")
+    body = cy[ii:cy.find("\n}\n", ii)]
+    need('"SessionStart"' not in body, "init-pack 이 여전히 SessionStart 만 직접 등록한다")
+    notes.append("Rust 집행자 2 소비")
+    # ⓓ 개인 프로필 병합(T-0147-1)도 같은 집합을 쓴다
+    need("fn merge_awakening_hooks_into_personal_profiles(" in pk, "개인 프로필 병합기가 없다")
+    mi = pk.find("pub fn merge_awakening_hooks_into_personal_profiles(")
+    pbody = pk[mi:pk.find("\n}\n", mi)]
+    need("&AWAKENING_HOOKS" in pbody, "개인 프로필 병합이 매니페스트를 소비하지 않는다")
+    notes.append("개인 프로필 병합 동일 집합")
+    # ⓔ ★W3 게이트: 설치 직후 '등록 집합 ⊇ 소망 집합' **실측 검증**이 배선돼 있다(주장 금지)
+    need("pub fn verify_desired_hooks_registered(" in pk, "설치 후 ⊇ 검증 함수가 없다")
+    si = pk.find("fn setup_isolated_config_dir()")
+    sbody = pk[si:pk.find("\n}\n", si)]
+    need("verify_desired_hooks_registered(&settings" in sbody,
+         "설치 경로가 '등록 집합 ⊇ 소망 집합' 을 검증하지 않는다(시드했다는 주장만 남는다)")
+    need("등록 집합 ⊅ 소망 집합" in sbody, "미충족 시 loud 보고가 없다(조용한 실패)")
+    notes.append("설치 후 ⊇ 검증 배선")
+    old = _git_show(os.path.join("src", "pack.rs"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need("AWAKENING_HOOKS" not in old, "계측 타당성 실패: 구 코드에 이미 매니페스트가 있다")
+        need("if !settings.exists() {" in old, "계측 타당성 실패: 구 파일 단위 시드 가드를 못 찾았다")
+        oldc = _git_show(os.path.join("src", "bin", "cys.rs"))
+        if oldc is not None:
+            oi = oldc.find("fn install_claude_hook(")
+            need('"SessionStart"' in oldc[oi:oi + 3000],
+                 "계측 타당성 실패: 구 init-pack 의 SessionStart 단독 등록을 못 찾았다")
+        calib = "구 코드=파일 단위 시드 + init-pack SessionStart 단독 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SEED-2", "W3",
+          "실사용 config dir 등록 hard 검증(CLAUDE_CONFIG_DIR 최우선 · role-bootstrap 미등록=FAIL)",
+          ["A21", "R4"])
+def h_seed_2():
+    """A21: C08(session-start)=FAIL 인데 C28(role-bootstrap)=WARN 이라 **부트 발화의 유일한
+    트리거가 빠져도 preflight 가 초록에 가까웠다**(비대칭). R4: discover 가 `CLAUDE_CONFIG_DIR`
+    (=이 세션의 실사용 config dir)을 아예 보지 않아, 정작 훅이 필요한 그 디렉터리가 등록 대상에서
+    빠질 수 있었다(등록≠가동 갭)."""
+    PF = _preflight_mod()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp, _temp_guard_double(PF, "SNAPMARK"):
+        home = os.path.join(tmp, "home")
+        pack = _fake_pack_with_hooks(os.path.join(home, ".cys", "pack"))
+        ccd = os.path.join(tmp, "live-config")           # 실사용 config dir(홈 밖)
+        os.makedirs(ccd, exist_ok=True)
+        _make_profile(home, ".claude", {"SessionStart": []})
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                        CLAUDE_CONFIG_DIR=ccd):
+            # ⓐ R4: 실사용 config dir 이 **최우선** 후보다
+            found = PF.discover_claude_settings()
+            need(found and found[0] == os.path.join(ccd, "settings.json"),
+                 "CLAUDE_CONFIG_DIR 이 최우선 후보가 아니다: %r" % found)
+            notes.append("CLAUDE_CONFIG_DIR 최우선")
+            # ⓑ A21 티어: 각성 훅(role-bootstrap) 미등록 → C28 **FAIL**
+            want_ss = PF._cys_hook_cmd("session-start.sh")
+            _w(os.path.join(ccd, "settings.json"),
+               json.dumps({"hooks": {"SessionStart": [
+                   {"hooks": [{"type": "command", "command": want_ss}]}]}}), 0o644)
+            pf = PF.Preflight(False, [])
+            pf.c28_self_correction()
+            row = [r for r in pf.results if r["id"].startswith("C28")][0]
+            need(row["status"] == PF.FAIL,
+                 "각성 훅 미등록인데 C28 이 FAIL 이 아니다(C08 대칭 위반): %r" % row)
+            need("각성" in row["detail"], "FAIL 사유가 각성 훅을 지목하지 않는다: %r" % row["detail"])
+            notes.append("role-bootstrap 미등록=FAIL")
+            # ⓒ 등록되면 FAIL 이 사라진다(위경고 모드 금지 — 판정이 실측 파생임을 확인).
+            #   ★전 프로필에 등록해야 한다 — C28 은 발견된 **모든** 등록 대상을 검사한다(한 프로필만
+            #   고치고 FAIL 해소를 기대하면 검체가 계약을 오해한 것이다).
+            reg = PF.Preflight(True, [])
+            for t in PF.discover_claude_settings():
+                need(reg._register_event_hook(t, "UserPromptSubmit", "role-bootstrap.sh", None) is None,
+                     "각성 훅 등록 실패: %s" % t)
+            pf2 = PF.Preflight(False, [])
+            pf2.c28_self_correction()
+            row2 = [r for r in pf2.results if r["id"].startswith("C28")][0]
+            need(row2["status"] != PF.FAIL,
+                 "각성 훅이 등록됐는데도 FAIL(위경고 모드): %r" % row2)
+            notes.append("등록 시 FAIL 해소")
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        oi = old.find("def c28_self_correction(")
+        need("self.add(cid, FAIL" not in old[oi:oi + 3000],
+             "계측 타당성 실패: 구 C28 에 이미 FAIL 티어가 있다")
+        di = old.find("def discover_claude_settings(")
+        # ★docstring 언급(agents.json 해석 서술)은 코드가 아니다 — **env 를 읽는 코드**의 부재를 잰다.
+        need('os.environ.get("CLAUDE_CONFIG_DIR"' not in old[di:di + 3000],
+             "계측 타당성 실패: 구 discover 가 이미 CLAUDE_CONFIG_DIR env 를 읽는다")
+        calib = "구 C28 FAIL 부재 + 구 discover CLAUDE_CONFIG_DIR 미참조 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SEED-3", "W3", "settings.json 없는 프로필 디렉터리 → 후보화·생성 등록", ["G7"])
+def h_seed_3():
+    """G7: 후보 기준이 `isfile(settings.json)` 이라 **파일이 아직 없는 프로필**은 영구 미배선으로
+    굳었다(그 프로필의 claude 는 훅 없이 돌고, 등록기는 그 프로필을 보지도 않는다). 등록기는 이미
+    makedirs+create 를 하므로 기준은 **디렉터리 존재**여야 한다."""
+    PF = _preflight_mod()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp, _temp_guard_double(PF, "SNAPMARK"):
+        home = os.path.join(tmp, "home")
+        pack = _fake_pack_with_hooks(os.path.join(home, ".cys", "pack"))
+        _make_profile(home, ".claude-empty", None)        # 디렉터리만(settings.json 없음)
+        _make_profile(home, ".claude", {"SessionStart": []})
+        _w(os.path.join(home, ".claude-notadir"), "file\n", 0o644)   # 파일은 프로필 아님
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                        CLAUDE_CONFIG_DIR=None):
+            found = PF.discover_claude_settings()
+            need(os.path.join(home, ".claude-empty", "settings.json") in found,
+                 "settings.json 없는 프로필이 후보에서 빠졌다: %r" % found)
+            need(not any("notadir" in f for f in found), "파일을 프로필로 오인: %r" % found)
+            notes.append("빈 프로필 후보화")
+            # 등록기가 파일을 **생성**한다(후보화만으로는 배선이 아니다)
+            pf = PF.Preflight(True, [])
+            err = pf._register_hook(os.path.join(home, ".claude-empty", "settings.json"))
+            need(err is None, "빈 프로필 등록 실패: %s" % err)
+            data = json.loads(_read(os.path.join(home, ".claude-empty", "settings.json")))
+            cmds = [h["command"] for e in data["hooks"]["SessionStart"] for h in e["hooks"]]
+            need(PF._cys_hook_cmd("session-start.sh") in cmds, "생성된 파일에 훅이 없다: %r" % cmds)
+            notes.append("등록기 생성 확인")
+    # Rust 파리티 — cys.rs 는 공용 함수(디렉터리 기준)를 경유한다
+    cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    need("cys::pack::personal_profile_settings_paths()" in cy,
+         "cys.rs discover 가 공용(디렉터리 기준) 구현을 경유하지 않는다")
+    need(".filter(|p| p.is_file())" not in cy, "cys.rs 에 isfile 게이트 잔존(G7 재발)")
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+    need("&& e.path().is_dir()" in pk, "pack.rs 프로필 열거가 디렉터리 기준이 아니다")
+    notes.append("Rust 파리티(디렉터리 기준)")
+    old = _git_show(os.path.join("src", "bin", "cys.rs"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need(".filter(|p| p.is_file())" in old, "계측 타당성 실패: 구 isfile 게이트를 못 찾았다")
+        calib = "구 코드 isfile 게이트 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SEED-4", "W3", "cys-dept launch/rotate → CYS_ACCOUNT_DIR 복원 주입 + 시드 검증", ["G3"])
+def h_seed_4():
+    """G3: `allocate`·`create` 는 계정격리(CYS_ACCOUNT_DIR + agents.json 시드)를 세우는데
+    **launch 는 둘 다 안 했다**. 그런데 `rotate` 는 launch 를 재귀 호출한다 — **재기동 한 번으로
+    격리가 조용히 풀렸다**(자식 claude 가 오너 base config 공유 = F1 붕괴)."""
+    dept = os.path.join(BIN_DIR, "cys-dept")
+    need(os.path.isfile(dept), "cys-dept 부재")
+    src = _read(dept)
+    notes = []
+    # ⓐ launch 스폰에 CYS_ACCOUNT_DIR 주입 + 시드 검증 fail-closed
+    li = src.find("\n  launch)")
+    need(li > 0, "launch 분기를 못 찾았다")
+    lbody = src[li:src.find("\n  allocate)", li)]
+    need('CYS_ACCOUNT_DIR="$acctdir"' in lbody, "launch 스폰에 CYS_ACCOUNT_DIR 주입이 없다(G3 재발)")
+    need("resolve_lane_acctdir" in lbody, "launch 가 계정 dir 을 유도하지 않는다")
+    need("verify_lane_account_seed" in lbody, "launch 가 계정격리 시드를 검증하지 않는다")
+    need("exit 6" in lbody, "시드 실패가 fail-closed 가 아니다(비격리 기동 허용)")
+    notes.append("launch 주입+검증+fail-closed")
+    # ⓑ rotate 는 launch 를 재귀 호출한다(= 이 수리가 rotate 에도 적용된다는 결박)
+    ri = src.find("\n  rotate)")
+    need(ri > 0 and 'bash "$0" launch "$name"' in src[ri:ri + 4000],
+         "rotate 가 launch 를 경유하지 않는다(복원 경로 결박 실패)")
+    notes.append("rotate=launch 재귀(복원 상속)")
+    # ⓒ allocate 가 account_dir 을 레지스트리에 기록한다(복원 SOT)
+    ai = src.find("\n  allocate)")
+    need("reg_set_field \"$name\" account_dir" in src[ai:src.find("\n  create)", ai)],
+         "allocate 가 account_dir 을 레지스트리에 기록하지 않는다(rotate 복원 근거 부재)")
+    notes.append("allocate=account_dir 기록")
+    # ⓓ 유도 3순위·시드 자기치유 실측(함수 블록만 로드 — 데몬·부서 무접촉)
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        pack = os.path.join(home, ".cys", "pack")
+        dpack = os.path.join(home, ".cys", "pack-dept-t1")
+        acct = os.path.join(home, ".cys", "claude-t1")
+        os.makedirs(dpack, exist_ok=True)
+        os.makedirs(acct, exist_ok=True)
+        _w(os.path.join(pack, "agents.json"),
+           json.dumps({"claude": {"cmd": "claude",
+                                  "env": {"CLAUDE_CONFIG_DIR": os.path.join(home, ".cys", "claude")}}}),
+           0o644)
+        reg = os.path.join(home, ".cys", "depts.json")
+        _w(reg, json.dumps({"depts": {"t1": {"socket": "s", "pack_dir": dpack,
+                                             "account_dir": acct}}}), 0o644)
+        fns = os.path.join(tmp, "fns.sh")
+        head = src.split("\ncmd=")[0]
+        _w(fns, head)
+        script = (
+            '. "%s"\n'
+            'echo "REG=$(reg_get_field t1 account_dir)"\n'
+            'echo "RESOLVE=$(resolve_lane_acctdir t1 "%s")"\n'
+            'verify_lane_account_seed "%s" "%s" && echo VERIFY=OK || echo VERIFY=FAIL\n'
+            'echo "SEEDED=$(pack_seeded_acct "%s")"\n'
+            'verify_lane_account_seed "%s" "" && echo NOACCT=OK || echo NOACCT=FAIL\n'
+        ) % (fns, dpack, dpack, acct, dpack, dpack)
+        env = _base_env({"HOME": home, "CYS_PACK_DIR": pack, "CYS_DEPTS_JSON": reg})
+        r = _run(["bash", "-c", script], env=env, timeout=90)
+        out = r.stdout
+        need("REG=" + acct in out, "레지스트리 account_dir 유도 실패: %r" % out)
+        need("RESOLVE=" + acct in out, "유도 3순위가 레지스트리 값을 못 집었다: %r" % out)
+        need("VERIFY=OK" in out, "시드 자기치유·검증 실패: %r\n%s" % (out, r.stderr[-400:]))
+        need("SEEDED=" + acct in out, "agents.json 이 계정 dir 로 시드되지 않았다: %r" % out)
+        need("NOACCT=OK" in out, "계정격리 미사용 부서에서 검증이 실패로 접혔다(회귀): %r" % out)
+        notes.append("유도 3순위·자기치유 실측")
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "cys-dept"))
+    calib = "skip(no-git)"
+    if old is not None:
+        oi = old.find("\n  launch)")
+        oldl = old[oi:old.find("\n  allocate)", oi)]
+        need("CYS_ACCOUNT_DIR" not in oldl,
+             "계측 타당성 실패: 구 launch 가 이미 CYS_ACCOUNT_DIR 을 주입한다")
+        need('CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup' in oldl,
+             "계측 타당성 실패: 구 launch 의 무격리 스폰 라인을 못 찾았다")
+        calib = "구 launch=CYS_ACCOUNT_DIR 미주입 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SEED-5", "W3", "외부 동명 훅 보존(_prune 소유 술어 — pack 접두 + /hooks/<name> 꼬리)",
+          ["G10"])
+def h_seed_5():
+    """G10: 소유 판정이 `script_name in c and "hooks" in c` 라는 **부분문자열 2개**였다 —
+    사용자가 자기 훅을 `~/myhooks/inject-context.sh` 에 두면(경로에 'hooks' 문자열 포함) 우리
+    등록기가 그것을 '우리 파손 엔트리'로 보고 **무음 삭제**했다(사용자 설정 파괴)."""
+    PF = _preflight_mod()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        pack = os.path.join(home, ".cys", "pack")
+        os.makedirs(pack, exist_ok=True)
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                        CLAUDE_CONFIG_DIR=None):
+            desired = PF._cys_hook_cmd("inject-context.sh")
+            user_a = "sh %s/myhooks/inject-context.sh" % home            # 'hooks' 부분문자열 함정
+            user_b = "sh %s/mytools/hooks/inject-context.sh" % home      # 꼬리 정확 매치 함정
+            stale = "sh %s/.config/cysjavis/hooks/inject-context.sh" % home   # 구 cys 경로(회수 대상)
+            broken = 'bash "%s\\hooks\\inject-context.sh"' % pack.replace("/", "\\")
+            arr = [{"hooks": [{"type": "command", "command": c}]}
+                   for c in (user_a, user_b, stale, broken, desired)]
+            kept, have = PF._prune_stale_hook_entries(arr, "inject-context.sh", desired)
+            kept_cmds = [h["command"] for e in kept for h in e["hooks"]]
+            need(user_a in kept_cmds, "사용자 동명 훅(~/myhooks/…)이 무음 삭제됐다(G10 재발)")
+            need(user_b in kept_cmds, "제3자 hooks/ 디렉터리 훅이 삭제됐다")
+            need(desired in kept_cmds and have is True, "정상 엔트리·have 판정 소실")
+            need(stale not in kept_cmds, "구 cys 경로 죽은 엔트리가 회수되지 않았다(중복 append 재발)")
+            need(broken not in kept_cmds, "파손(역슬래시) 엔트리가 회수되지 않았다")
+            notes.append("사용자 2보존 / 구·파손 2회수 / 정상 1보존")
+            # 순수 술어 직접 핀
+            need(PF._hook_entry_is_ours(user_a, "inject-context.sh",
+                                        (os.path.join(pack, "hooks") + os.sep)) is False,
+                 "소유 술어가 사용자 훅을 우리 것으로 판정")
+            need(PF._hook_entry_is_ours(desired, "inject-context.sh",
+                                        (os.path.join(pack, "hooks") + os.sep)) is True,
+                 "소유 술어가 우리 훅을 인식하지 못함")
+            # ★계측 타당성: **구 술어**는 사용자 훅을 삭제 대상으로 봤다
+            old_pred = ("inject-context.sh" in user_a) and ("hooks" in user_a)
+            need(old_pred is True,
+                 "계측 타당성 실패: 구 부분문자열 술어가 이 검체를 잡지 못한다(검체 무의미)")
+            notes.append("구 술어 FIRE 확인(부분문자열)")
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need('ours = any(script_name in c and "hooks" in c for c in cmds)' in old,
+             "계측 타당성 실패: 구 부분문자열 술어 원문을 못 찾았다")
+        calib = "구 술어 원문(부분문자열 2개) 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+def _dept_boot_sandbox(tmp, name="d1"):
+    """부서 레인 부트 격리 환경 — (env, home, pack, sock). base 팩·부서 팩을 모두 세운다."""
+    home = os.path.join(tmp, "home")
+    bindir = os.path.join(tmp, "stubbin")
+    dpack = os.path.join(home, ".cys", "pack-dept-%s" % name)
+    sock = os.path.join(home, ".local", "state", "cys-dept-%s" % name, "cys.sock")
+    os.makedirs(os.path.join(dpack, "bin"), exist_ok=True)
+    os.makedirs(bindir, exist_ok=True)
+    _mock_cys(bindir, tmp)
+    _w(os.path.join(dpack, "bin", "javis_preflight.py"), "import sys; sys.exit(0)\n", 0o644)
+    _w(os.path.join(dpack, "bin", "javis_orchestra.py"), "import sys; sys.exit(0)\n", 0o644)
+    # fast path 전제: 마커에 실팩 버전이 박혀야 재선언이 preflight 를 생략할 수 있다
+    # (`unknown` 은 판정 불가로 취급 — 그 계약을 검체가 우회하지 않도록 실제 버전 파일을 둔다).
+    _w(os.path.join(dpack, ".pack-version"), "9.9.9\n", 0o644)
+    env = _base_env({"HOME": home, "PATH": bindir + os.pathsep + os.environ.get("PATH", ""),
+                     "CYS_SURFACE_ID": "8", "CYS_BOOT_CHECK_RETRIES": "1",
+                     "CYS_BOOT_CHECK_INTERVAL_S": "0.05",
+                     "CYS_PACK_DIR": dpack, "CYS_SOCKET": sock})
+    return env, home, dpack, sock
+
+
+@specimen("H-LIFE-1", "W3",
+          "레인별 marker/boot-last 분리(base·부서 병행 무오염) + base 마커=CEO 게이트 유지",
+          ["G15", "P3-A-DEPT-LANE"])
+def h_life_1():
+    """G15: 락은 레인별인데 상태는 **전 레인 공유 단일 파일**이었다 — base·부서 동시 부트가 서로의
+    진단 SOT 를 덮었다. P3-A-DEPT-LANE: 부서 레인엔 마커가 아예 없어 재선언마다 300s preflight 를
+    통째로 다시 돌았다.
+    ★금지 방향 ①: 부서 마커를 base 마커로 쓰면 CEO 승격 게이트가 오개방된다 — base 마커 경로는
+      불변이고 **부서 레인은 절대 그 파일을 쓰지 않는다**.
+    ★교차 단언: 같은 레인의 다중 pane 오염은 레인 분리로 해결되지 않는다 — run 귀속(CS-2⑩)이 담당."""
+    B = _bootstrap_mod()
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    notes = []
+    # ⓐ 경로 규약(순수) — base 는 역사적 경로, 부서는 분리, 그리고 base 마커 불침범
+    base_sock = "/x/.local/state/cys/cys.sock"
+    dept_sock = "/x/.local/state/cys-dept-d1/cys.sock"
+    need(B.lane_state_path("marker", base_sock) == B.MARKER, "base 마커 경로 변경(회귀)")
+    need(B.lane_state_path("boot_last", base_sock) == B.BOOT_LAST, "base boot-last 경로 변경(회귀)")
+    need(B.lane_state_path("marker", dept_sock) != B.MARKER,
+         "부서 레인이 base 마커를 가리킨다(CEO 승격 게이트 오개방 — 금지 방향 ①)")
+    need(B.lane_state_path("boot_last", dept_sock) != B.BOOT_LAST, "부서 boot-last 미분리")
+    notes.append("경로 규약(base 불변·부서 분리)")
+    with tempfile.TemporaryDirectory() as tmp:
+        # ⓑ base 레인 완주 → base 마커·base boot-last
+        env, home = _boot_sandbox(os.path.join(tmp, "base"))
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 0, "base 부트 실패: %d\n%s" % (r.returncode, r.stderr[-400:]))
+        base_marker = os.path.join(home, ".cys", ".master-bootstrapped")
+        base_bl = os.path.join(home, ".cys", "state", "boot-last.json")
+        need(os.path.isfile(base_marker), "base 마커 미생성")
+        base_bl_before = _read(base_bl)
+        need(base_bl_before, "base boot-last 미기록")
+        notes.append("base 완주 기록")
+        # ⓒ **같은 HOME**에서 부서 레인 부트(티켓 발급 후) → 부서 파일만 새로 생기고 base 는 무오염
+        denv, dhome, dpack, dsock = _dept_boot_sandbox(os.path.join(tmp, "base"), "d1")
+        need(os.path.realpath(dhome) == os.path.realpath(home), "검체 전제: 같은 HOME 이어야 한다")
+        ienv = dict(denv)
+        ienv.pop("CYS_SOCKET", None)            # 발급은 base 레인에서만
+        ienv["CYS_PACK_DIR"] = os.path.join(home, ".cys", "pack")
+        ri = _run([PY, boot, "issue-ticket", "--dept", "d1"], env=ienv, timeout=90)
+        need(ri.returncode == 0, "CEO 티켓 발급 실패: %d\n%s" % (ri.returncode, ri.stderr[-300:]))
+        rd = _run([PY, boot], env=denv, timeout=180)
+        need(rd.returncode == 0, "부서 레인 부트 실패: %d\n%s" % (rd.returncode, rd.stderr[-500:]))
+        # base 진단이 덮이지 않았다(구 코드에서는 여기서 덮였다)
+        need(_read(base_bl) == base_bl_before,
+             "부서 부트가 base boot-last 를 덮었다(G15 재발 — 진단 SOT 상호 덮어씀)")
+        # 부서 전용 파일이 생겼다
+        state = os.path.join(home, ".cys", "state")
+        dept_bls = [f for f in os.listdir(state)
+                    if f.startswith("boot-last-") and f.endswith(".json")]
+        need(dept_bls, "부서 레인 boot-last 파일이 없다(레인 분리 미적용): %r" % os.listdir(state))
+        dept_markers = [f for f in os.listdir(os.path.join(home, ".cys"))
+                        if f.startswith(".master-bootstrapped-")]
+        need(dept_markers, "부서 레인 마커가 없다(P3-A-DEPT-LANE fast path 부재 잔존)")
+        notes.append("부서 파일 신설·base 무오염")
+        # ⓓ base 마커 = CEO 게이트 SOT 유지: 내용이 부서 런으로 바뀌지 않았다
+        bm = json.loads(_read(base_marker) or "{}")
+        need(bm.get("lane") in (None, "base"),
+             "base 마커가 부서 런으로 덮였다(CEO 승격 게이트 오개방): %r" % bm)
+        dm = json.loads(_read(os.path.join(home, ".cys", dept_markers[0])) or "{}")
+        need(dm.get("lane") and dm["lane"] != "base", "부서 마커에 레인 귀속이 없다: %r" % dm)
+        notes.append("base 마커=CEO 게이트 유지")
+        # ⓔ 부서 fast path 실증 — 마커가 생겼으므로 재선언 시 preflight 를 생략한다
+        rd2 = _run([PY, boot], env=denv, timeout=180)
+        need(rd2.returncode == 0, "부서 재선언 실패: %d" % rd2.returncode)
+        dbl = json.loads(_read(os.path.join(state, dept_bls[0])) or "{}")
+        pf_steps = [s for s in dbl.get("steps", []) if s["step"] == "①preflight"]
+        need(pf_steps and "fast path" in pf_steps[0]["detail"],
+             "부서 레인 fast path 미발동(재선언마다 preflight 전량 재실행): %r" % pf_steps)
+        notes.append("부서 fast path 발동")
+        # ⓕ 교차 단언(CS-2⑩): 같은 레인 다중 pane 은 run 귀속이 담당한다
+        need(dbl.get("surface") == "8" and (dbl.get("result") or {}).get("surface") == "8",
+             "레인 파일에 run 귀속(surface)이 없다 — 같은 레인 다중 pane 오염 방어 부재")
+        need(dbl.get("lane") and dbl.get("boot_last_path"), "레인 귀속 필드 누락: %r" % sorted(dbl))
+        notes.append("run 귀속 교차 단언")
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need("lane_state_path" not in old, "계측 타당성 실패: 구 코드에 이미 레인 경로 규약이 있다")
+        need('BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")' in old
+             and "_atomic_write_json(BOOT_LAST, self.data)" in old,
+             "계측 타당성 실패: 구 코드의 공유 단일 boot-last write 를 못 찾았다")
+        need("if _is_base_socket() and _marker.get" in old or "_is_base_socket() and _marker" in old,
+             "계측 타당성 실패: 구 fast path 의 base 전용 가드를 못 찾았다")
+        calib = "구 코드=공유 boot-last + base 전용 fast path 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-LIFE-2", "W3", "step id enum 유일성·리터럴 0·기록 순서=실행 순서",
+          ["P3-A-STEP-NAME"])
+def h_life_2():
+    """P3-A-STEP-NAME(치환된 절반이 성립): **동명이의 재사용**(`③′lane-pack` 이 불량 레인/레인↔팩
+    두 단계 공유, `④′resource-gate` 가 실행/생략 공유)과 **서수↔실행순서 불일치**(레인 가드는
+    ①preflight 앞인데 `③′`, 티켓 소비는 ④boot 뒤인데 `③″`). 라벨을 레지스트리로 승격한다."""
+    B = _bootstrap_mod()
+    notes = []
+    need(len(set(B.STEP_ORDER)) == len(B.STEP_ORDER),
+         "단계 라벨 중복(동명이의): %r" % [l for l in B.STEP_ORDER if B.STEP_ORDER.count(l) > 1])
+    notes.append("라벨 %d개 유일" % len(B.STEP_ORDER))
+    src = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    lits = re.findall(r'log\.(?:step|fail)\(\s*"', _code_lines(src))
+    need(not lits, "단계 기록에 문자열 리터럴 잔존 %d건(레지스트리 미경유)" % len(lits))
+    notes.append("호출부 리터럴 0")
+    # 선언 순서 = 실행 순서(핵심 3쌍)
+    idx = B.STEP_INDEX
+    need(idx[B.STEP.LANE_PACK] < idx[B.STEP.PREFLIGHT], "레인 가드가 preflight 뒤로 선언됨")
+    need(idx[B.STEP.BOOT] < idx[B.STEP.BOOT_TICKET_CONSUME] < idx[B.STEP.BOOT_REVIEWERS],
+         "티켓 소비 서수가 실행 위치(④boot~④-b)와 불일치")
+    need(idx[B.STEP.RESOURCE_GATE] < idx[B.STEP.BOOT] < idx[B.STEP.CHECK] < idx[B.STEP.MARKER],
+         "체인 서수 역행")
+    notes.append("서수=실행순서")
+    # 실측: 실제 런의 기록 순서가 선언 순서에 단조하고 위반 표식이 없다
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        env, home = _boot_sandbox(tmp)
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 0, "부트 실패: %d\n%s" % (r.returncode, r.stderr[-400:]))
+        bl = _boot_last(home)
+        steps = bl.get("steps") or []
+        need(steps, "단계 기록이 없다")
+        orders = []
+        for st in steps:
+            need("step_unregistered" not in st, "미등록 라벨 기록: %r" % st["step"])
+            need("order_violation" not in st, "순서 역행 기록: %r" % st)
+            need("order" in st, "기록에 선언 순서(order)가 없다: %r" % st)
+            orders.append(st["order"])
+        need(orders == sorted(orders), "기록 순서가 선언 순서에 단조하지 않다: %r" % orders)
+        notes.append("실측 %d단계 단조" % len(steps))
+        # ⑤check 반복은 base 라벨 + suffix 로 남는다(정체성이 시도마다 새로 생기지 않는다)
+        chk = [st for st in steps if st["step"].startswith(B.STEP.CHECK)]
+        need(chk and all(st["order"] == idx[B.STEP.CHECK] for st in chk),
+             "⑤check 반복 시도의 단계 정체성이 흔들린다: %r" % chk)
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need(_code_lines(old).count('log.step("③′lane-pack", 1, detail)') == 2,
+             "계측 타당성 실패: 구 코드의 동명이의(③′lane-pack 2회)를 못 찾았다")
+        need('log.step("⑤check#%d" % attempt' in old,
+             "계측 타당성 실패: 구 코드의 시도별 라벨 조립을 못 찾았다")
+        need("STEP_ORDER" not in old, "계측 타당성 실패: 구 코드에 이미 레지스트리가 있다")
+        calib = "구 코드=동명이의 2회 + 시도별 라벨 조립 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
 @specimen("H-OBS-1", "W2", "배달 3분기 VERIFY(pending/dropped/delivered-무ack)", ["B11"])
 def h_obs_1():
     """B11: 실체는 '유실'보다 **'무기한 지연 + 미배달/배달-무ack 구분 불가'** 다. 구분이 없으면

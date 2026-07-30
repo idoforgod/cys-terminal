@@ -93,6 +93,9 @@ LEAF_FLOORS = {
     "MARGIN_RATIO": 0.2,               # 하위 최악치 합의 20%
     "MARGIN_MIN_S": 20,                # 최소 절대 마진
     "HEARTBEAT_INTERVAL_S": 20,        # 침묵 창 상쇄용 stderr 진행 하트비트 주기
+    # non-unix(Windows) pidfile 락의 스테일 회수 임계. 파일시스템 락은 자동 해제가 없어
+    # 크래시 잔재가 영구히 부트를 막을 수 있다 — 나이 기반 회수가 그 상한이다(영구 Busy 불가).
+    "LOCK_STALE_S": 900,
 }
 
 _ENV_PREFIX = "CYS_BUDGET_"
@@ -269,6 +272,7 @@ RUST_PARITY_CONSTS = {
     "BUDGET_ACK_WAIT_SECS": "LAUNCH_ACK_WAIT_S",
     "BUDGET_TRUST_SETTLE_SECS": "LAUNCH_TRUST_SETTLE_S",
     "BUDGET_HEARTBEAT_INTERVAL_SECS": "HEARTBEAT_INTERVAL_S",
+    "BUDGET_LOCK_STALE_SECS": "LOCK_STALE_S",
 }
 
 

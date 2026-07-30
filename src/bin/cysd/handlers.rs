@@ -2977,6 +2977,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // `is_none()` 가드가 래치의 1회성을 보장한다 — 재보고가 시각을 갱신하면 '첫 각성 시각'
             // 이라는 의미가 사라지고 부패하는 신호(age)로 퇴화한다.
             // 새로 세워졌을 때만 topology 영속을 트리거한다(쓰기 폭증 방지 · 이후 보고는 no-op).
+            let role_for_latch = role.clone();
             let latched_now = {
                 let mut latch = surface.awakened_at.lock().unwrap();
                 if latch.is_none() {
@@ -2986,18 +2987,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     false
                 }
             };
-            if latched_now {
-                // 영속 필수(비평2 B-1): 인메모리 단독이면 데몬 재시작마다 건강한 전 팀이 래치를
-                // 잃고 legacy-presumed 로 강등된다(부트 체인이 '각성 확정'을 영영 못 본다).
-                crate::governance::persist_topology(daemon);
-                daemon.bus.publish(
-                    "role.awakened",
-                    "status",
-                    Some(sid),
-                    json!({"role": role, "awakened_at": *surface.awakened_at.lock().unwrap(),
-                           "state": state}),
-                );
-            }
+            // ★★영속·이벤트는 **컨텍스트 임계 발화 뒤로 미룬다**(치명위험 ② 차단).
+            //   이 핸들러의 최우선 산출은 60% clear 사이클 트리거다 — 그것이 죽으면 노드들이
+            //   컨텍스트 100%를 넘겨 끌고 가는 사고가 된다. 래치 영속은 fsync 2회(file+dir)를
+            //   포함하고 `persist_topology` 는 락 poison 시 panic 하는 `unwrap` 경로다. 즉
+            //   **부수 기능이 주 트리거를 선점할 수 있는 순서**였다. 래치 자체는 위에서 이미
+            //   인메모리로 세워졌으니(값 손실 0), 영속만 뒤로 옮겨 선점 가능성을 구조적으로 없앤다.
             let status_evt =
                 json!({"role": role, "state": state, "context_pct": context_pct, "task": task});
             if changed {
@@ -3020,6 +3015,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // cycle-agent를 집행한다.
             if let Some(pct) = context_pct {
                 maybe_fire_context_threshold(daemon, &surface, pct, "self-report", None);
+            }
+            // ★(W2 · B6) 래치 영속 — 임계 발화 **뒤**(위 주석 참조). 데몬 재시작 생존이 필수라
+            // 생략할 수는 없고(비평2 B-1), 순서만 뒤로 물려 clear 사이클을 선점하지 못하게 한다.
+            if latched_now {
+                crate::governance::persist_topology(daemon);
+                daemon.bus.publish(
+                    "role.awakened",
+                    "status",
+                    Some(sid),
+                    json!({"role": role_for_latch, "awakened_at": *surface.awakened_at.lock().unwrap(),
+                           "state": state}),
+                );
             }
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "state": state})))
         }

@@ -170,7 +170,17 @@ def _target_alive(target):
         out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10).stdout
         # ★G27: exited 행 배제 + 공유 술어(정확일치·worker 접두)로 해소. 종전의 전문 정규식
         #   경계 매칭은 '부분일치'는 막았지만 '죽은 행'은 못 막았다 — 두 결함은 다른 축이다.
-        return "alive" if _target_matches(target, live_target_rows(out)) else "dead"
+        rows = live_target_rows(out)
+        # ★★파서 드리프트 fail-safe(자가치유 전멸 차단): `cys list` 포맷이 바뀌어 파싱이 0행을
+        #   내면 **전 대상이 'dead'** 가 되어 wakeup 배달이 전부 skip 된다 — 주기 자가치유·자율
+        #   착수 wake 가 조용히 전멸한다(가장 발견하기 어려운 종류의 사고다). 출력은 있는데 행을
+        #   못 뽑았다면 그것은 '대상이 죽었다'가 아니라 **'우리가 못 읽었다'** = unknown 이고,
+        #   unknown 은 배달 보류가 아니라 경고 배달이다(계약: 모듈 docstring).
+        if not rows and (out or "").strip():
+            sys.stderr.write("[wakeup] cys list 파싱 0행(포맷 드리프트?) — liveness=unknown 으로 "
+                             "강등해 배달은 계속한다(자가치유 전멸 방지)\n")
+            return "unknown"
+        return "alive" if _target_matches(target, rows) else "dead"
     except (subprocess.SubprocessError, OSError):
         return "unknown"
 

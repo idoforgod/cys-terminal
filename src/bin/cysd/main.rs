@@ -171,6 +171,34 @@ async fn main() {
             sweep_prev(dir, 12);
         }
     }
+    // ★G34(W3) 데몬측 (소켓,팩) 정합 검사 — 이 데몬이 어떤 레인을 어떤 팩으로 서빙하는지 **기동
+    // 로그에 못박는다**. 부서 소켓+본부 팩 조합은 부서 부트를 exit 8 로 영구 차단하고 본부 팩을
+    // 교차 서빙한다(F1 격리 붕괴·schedule 중복 발화). CLI 측은 스폰 전에 거부하지만(ensure_daemon_
+    // lane_pack), GUI·launchd·수동 기동 등 다른 진입점이 남으므로 데몬 자신도 판정해 기록한다.
+    // ※비치명(로그): 이미 뜬 데몬을 죽이는 것은 이 웨이브의 범위가 아니다 — 진단 가시성이 목적이다.
+    {
+        let is_dept = cys::is_dept_socket(&socket_path);
+        let pack = cys::pack::pack_dir();
+        let pack_is_dept = pack
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("pack-dept-"))
+            .unwrap_or(false);
+        if is_dept != pack_is_dept {
+            eprintln!(
+                "[cysd] ⚠ 레인↔팩 불일치: socket={} (dept={is_dept}) pack={} (dept={pack_is_dept}) \
+                 — 부서 데몬은 `cys-dept launch <name>`(CYS_SOCKET+CYS_PACK_DIR 쌍)으로 기동해야 한다. \
+                 이 조합은 부서 부트 차단·팩 교차 서빙을 유발한다.",
+                socket_path.display(),
+                pack.display()
+            );
+        } else {
+            eprintln!(
+                "[cysd] lane: socket={} pack={} (dept={is_dept})",
+                socket_path.display(),
+                pack.display()
+            );
+        }
+    }
     // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
     // **이전에** 자가치유한다(미커밋=rollback / 커밋완료=정리). 순서가 중요 — install(false)가
     // 부분반영 트리 위에서 돌면 안 되므로 반드시 선행한다.
