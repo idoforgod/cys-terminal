@@ -11,4 +11,11 @@ PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 [ -f "$PACK/bin/javis_completion_guard.py" ] || exit 0
 # G22: 인터프리터 해소(python3→python→py) + cygpath 네이티브 경로. 미해소면 통과(기존 계약).
 [ -n "$CYS_PY" ] || exit 0
+# F9: 외곽 타임아웃 — 3중 상한 산술: 외곽 60 > guard 자체 데드라인(SELF_DEADLINE) 50 >
+#     verify 개별 상한 30 (조건 23①의 '30'은 verify 개별 상한으로 supersede — 바깥으로
+#     갈수록 느슨해 안쪽이 먼저 끊는다). `timeout` 부재 환경(coreutils 없는 macOS 등)은
+#     기존 계약 그대로 — guard 자체 SIGALRM 데드라인이 방어한다.
+if command -v timeout >/dev/null 2>&1; then
+  exec timeout 60 "$CYS_PY" "$(cys_native_path "$PACK/bin/javis_completion_guard.py")"
+fi
 exec "$CYS_PY" "$(cys_native_path "$PACK/bin/javis_completion_guard.py")"

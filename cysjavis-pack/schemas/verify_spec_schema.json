@@ -23,7 +23,7 @@
   "PASS_RULE_KIND_ENUM": ["exit_map", "output_contains", "json_check"],
 
   "PROBE_KEYS": ["name", "args"],
-  "probe_open_set_note": "probe.name 은 개방 집합(D11) — actprobe DISPATCH 5종(submit/kill-preflight/artifact/verdict-match/ctx-compare)과 task-audit 등 확장 생산자를 닫힌 enum 으로 핀하지 않는다. 실행 판정은 actprobe exit(0=PASS/2=FAIL/3=INDET) 흡수.",
+  "probe_open_set_note": "probe.name 은 개방 집합(D11) — actprobe DISPATCH 5종(submit/kill-preflight/artifact/verdict-match/ctx-compare)과 task-audit 등 확장 생산자를 닫힌 enum 으로 핀하지 않는다. 실행 판정은 actprobe exit(0=PASS/2=FAIL/3=INDET) 흡수. ★args 계약(F6): probe.args 는 actprobe 서브커맨드 플래그 그대로다(예: [\"--path\",\"<p>\"] — 위치 인자가 아니라 플래그형). set-verify-spec 은 플래그형 아님 감지 시 stderr 경고만 낸다(fail-open).",
 
   "PROCEDURAL_KEYS": ["tool", "artifact_path", "phase", "criteria", "report_path"],
   "PROCEDURAL_TOOL_ENUM": ["check-criteria", "factcheck"],

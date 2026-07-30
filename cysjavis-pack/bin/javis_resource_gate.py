@@ -244,6 +244,13 @@ def evaluate(m, a):
 def cmd_check(a):
     m = measure(a)
     worst, checks = evaluate(m, a)
+    # ★T1/B1(Phase 1 · DESIGN-DECISIONS §2-5 · 조건 10): --require-context 지정 시 context
+    #   미제공(자기보고 부재)을 soft(exit 1)로 격상 — '미측정=조용한 allow' 상속을 소비부
+    #   (javis_completion_guard 등 verify 실행 경로)가 결정론으로 감지하게 한다.
+    #   기본 동작 불변(플래그 없으면 종전과 동일 — 기존 부트 플로우 회귀 0). 실제 자원
+    #   soft/hard 트립이 있으면 그것이 그대로 우선한다(여기서는 ok→soft 승격만).
+    if getattr(a, "require_context", False) and m["context_pct"] is None and worst == "ok":
+        worst = "soft"
     verdict = {"ok": "allow", "soft": "soft_warn", "hard": "hard_block"}[worst]
     trips = [c for c in checks if c["level"] != "ok"]
     warnings = []
@@ -477,6 +484,9 @@ def main(argv=None):
     c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
     c.add_argument("--rate-override", default=None,
                    help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
+    c.add_argument("--require-context", dest="require_context", action="store_true",
+                   help="Phase 1 §2-5: context 미제공 시 context_unmeasured 를 soft(exit 1)로 "
+                        "격상 — verify 실행 경로(completion-guard) 전용. 기본 동작 불변")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")
@@ -564,6 +574,33 @@ def self_test():
         json.loads(buf.getvalue().strip())
     except ValueError as e:
         fails.append("--json stdout 이 순수 JSON 아님: %s" % e)
+    # ⑦ ★B1(§2-5): --require-context + context 미제공 → soft(exit 1)·trips 는 비어 있음
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["check", "--json", "--require-context", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_SOFT, "--require-context 미제공이 soft(1) 아님: rc=%r" % rc)
+    try:
+        doc = json.loads(buf.getvalue().strip())
+        chk(doc.get("trips") == [], "--require-context 승격이 trips 를 오염: %r" % doc.get("trips"))
+        chk("context_unmeasured" in (doc.get("warnings") or []),
+            "--require-context 미제공에 context_unmeasured 경고 부재")
+    except ValueError as e:
+        fails.append("--require-context --json 파싱 실패: %s" % e)
+    # ⑧ --require-context + context 제공 → 종전 판정 그대로(42=allow · 61=hard)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--require-context", "--context", "42", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "--require-context+context 42 가 allow 아님: rc=%r" % rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--require-context", "--context", "61", "--servers-override", "0",
+                   "--nodes-override", "0", "--load-override", "0.0"])
+    chk(rc == EXIT_HARD, "--require-context+context 61 이 hard(2) 아님: rc=%r" % rc)
+    # ⑨ 플래그 없는 기존 호출 = 기본 동작 불변(context 미제공 = allow · 회귀 0)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "플래그 없는 context 미제공이 allow 아님(기본 동작 회귀): rc=%r" % rc)
 
     if fails:
         print("javis_resource_gate self-test FAIL:")
@@ -571,7 +608,9 @@ def self_test():
             print("  ✗ " + f)
         return 1
     print("javis_resource_gate self-test OK — A13 타입드 exit 9종"
-          "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)")
+          "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)"
+          " + B1 --require-context 5종(미제공 soft·trips 비오염·context 제공 allow/hard·"
+          "무플래그 기본 동작 불변)")
     return 0
 
 

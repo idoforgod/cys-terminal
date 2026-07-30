@@ -39,6 +39,21 @@ T1(Phase 1 Wave A · DESIGN-DECISIONS §1): verify_spec checkout 게이트.
   verify_spec 템플릿 자동 부여(조건 16② · prereg 선서명은 [OT]).
 - checkout --brief <파일>: javis_brief_lint hard 경로(verify[] 형식 위반 = exit 6 거부).
   인세션 Agent/Task 경고 경로는 hooks/brief-lint-warn.sh(fail-open — 조건 05·21·28 비대칭).
+
+B1(Phase 1 Wave B1 · DESIGN-DECISIONS §2-1): completion-guard 태스크 바인딩 파일 계약.
+- checkout 성공 시 `--claim-surface <sid>`(명시 인자 우선 · F3) 또는 `CYS_SURFACE_ID`
+  (cysd 주입 — 둘 다 부재 시 무동작)로 `_round/tasks/.guard-claim.<surface>` 를 기록
+  (task_id·pid·ts) — guard 는 이 파일 stat 1개로 자기 바인딩을 판정한다(조건 23④ —
+  전수 스캔 금지).
+- ★이음매 자인(F3): 표준 플로우에서 checkout 은 master pane 에서 실행되므로 env 만으로는
+  claim 이 master surface 에 기록돼 **워커 pane 의 guard 가 무발동**한다 — master 는
+  `--claim-surface <워커 sid>` 로 위임 대상 워커 surface 를 지정하거나, 워커가 자기
+  pane 에서 동일-owner 재checkout(멱등 재진입 지원)해야 한다.
+- release·set-status 터미널 전이(done|cancelled) 성공 시 해당 task 를 가리키는
+  guard-claim 을 삭제한다(교차 surface 호출 대비 — task_id 일치 항목 소거).
+- 사이드카 네임스페이스 격리(F5): guard 산출 사이드카(`<id>.guard.json`·
+  `<id>.esc-bundle.json`)는 태스크 레코드가 아니다 — list 등 판독 진입점은 예약 접미
+  파일을 제외하고, G10 id 검증은 예약 접미(`.guard`·`.esc-bundle`) id 를 거부한다.
 """
 import argparse
 import contextlib
@@ -502,10 +517,65 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# B1(§2-1): completion-guard 태스크 바인딩 — .guard-claim.<surface> 파일 계약.
+#   writer = checkout(여기) · 소거 = release/터미널 전이(여기) · reader = guard(stat 1개).
+#   전부 best-effort(suppress) — claim 실패가 checkout 성공을 되돌리지 않는다.
+# ─────────────────────────────────────────────────────────────────────────────
+def _guard_surface_id():
+    """cysd 주입 CYS_SURFACE_ID(구 AITERM_SURFACE_ID 수용 — _lib.sh A2 게이트 동일 규약)."""
+    raw = (os.environ.get("CYS_SURFACE_ID", "")
+           or os.environ.get("AITERM_SURFACE_ID", "")).strip()
+    return re.sub(r"[^0-9A-Za-z_-]", "", raw)
+
+
+def _write_guard_claim(task_id, pid_arg, surface=None):
+    """F3: 명시 `--claim-surface` 인자 우선 — master 가 위임 대상 워커 surface 로 claim 을
+    기록할 수 있게 한다(guard-claim 이음매 해소). 기본은 현행 env(CYS_SURFACE_ID)."""
+    if surface is not None:
+        sid = re.sub(r"[^0-9A-Za-z_-]", "", str(surface).strip())
+        if not sid:
+            print("warn: --claim-surface 값이 정화 후 공백 — claim 미기록(fail-open)",
+                  file=sys.stderr)
+            return
+    else:
+        sid = _guard_surface_id()
+    if not sid:
+        return
+    rec = {"task_id": task_id,
+           "pid": pid_arg if pid_arg is not None else os.getppid(),  # _acquire_lock 관례 동일
+           "ts": _now()}
+    with contextlib.suppress(OSError):
+        _write_json_atomic(os.path.join(TASKS_DIR, ".guard-claim.%s" % sid), rec)
+
+
+def _remove_guard_claims(task_id):
+    """이 task 를 가리키는 guard-claim 전부 소거 — release/set-status 가 타 surface 에서
+    호출될 수 있어 자기 surface 파일만 지우면 고아 claim 이 남는다(stale 24h 규정의 보완)."""
+    try:
+        names = os.listdir(TASKS_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".guard-claim."):
+            continue
+        p = os.path.join(TASKS_DIR, name)
+        with contextlib.suppress(OSError, ValueError):
+            with open(p, encoding="utf-8") as f:
+                rec = json.load(f)
+            if isinstance(rec, dict) and rec.get("task_id") == task_id:
+                os.remove(p)
+
+
 # ★G10(cokacdir 성찰 2026-07-04): task id allowlist — 경로 조합 전 traversal 차단.
 #   wakeup._safe(:45)와 동일 문자집합이나 조용한 치환 대신 '거부'(fail-loud) —
 #   기존 유효 id의 경로 매핑을 바꾸지 않고, `--id ../../tmp/x` 류 임의 쓰기를 닫는다.
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+# ★F5(B1): guard 사이드카 예약 접미 — `<id>.guard.json`·`<id>.esc-bundle.json` 이 태스크
+#   레코드(`<id>.json`)와 같은 `.json` 종결이라 판독 진입점에서 유령 태스크로 오파싱되고,
+#   역으로 이 접미로 끝나는 id 는 사이드카와 파일명이 충돌한다 — 양방향 격리.
+RESERVED_ID_SUFFIXES = (".guard", ".esc-bundle")
+RESERVED_FILE_SUFFIXES = tuple(s + ".json" for s in RESERVED_ID_SUFFIXES)
 
 
 def _task_path(task_id):
@@ -583,7 +653,8 @@ def _list_tasks():
         return []
     out = []
     for name in sorted(os.listdir(TASKS_DIR)):
-        if name.endswith(".json") and not name.startswith("."):
+        if (name.endswith(".json") and not name.startswith(".")
+                and not name.endswith(RESERVED_FILE_SUFFIXES)):  # F5: 사이드카 제외
             t = _read_task(name[:-5])
             if t:
                 out.append(t)
@@ -907,6 +978,8 @@ def cmd_checkout(a):
             task["grandfathered"] = True  # §1-2: WARN 통과 표식(strict 활성 이전 생성분)
         task["updated_at"] = _now()
         _write_json_atomic(_task_path(a.id), task)
+    # B1(§2-1)·F3: completion-guard 바인딩 — 성공 경로에서만·명시 --claim-surface 우선
+    _write_guard_claim(a.id, a.pid, surface=getattr(a, "claim_surface", None))
     print(json.dumps({"checkout": verdict, "id": a.id, "owner": a.owner}, ensure_ascii=False))
     return EXIT_OK
 
@@ -941,6 +1014,7 @@ def cmd_release(a):
                 task["status"] = "todo"
             task["updated_at"] = _now()
             _write_json_atomic(_task_path(a.id), task)
+    _remove_guard_claims(a.id)  # B1(§2-1): 바인딩 해제 — guard 무발동 복귀
     print(f"released: {a.id}")
     return EXIT_OK
 
@@ -1298,6 +1372,8 @@ def cmd_set_status(a):
                   file=sys.stderr)
             print("evidence에 전사 통계 첨부 권장: javis_transcript_stats.py --latest --oneline "
                   "(도구 부재 시 생략 — 비차단)", file=sys.stderr)
+    if a.status in TERMINAL_STATUSES:
+        _remove_guard_claims(a.id)  # B1(§2-1): 터미널 전이 = 바인딩 소거(wlock 밖·best-effort)
     # P1b 우회 가시화(§2.2-2): done 확정 후에만 probe 원장에 감사 행(skip-reason·gate-off) append.
     #   E1 skip_audit.jsonl(위)과 상보적 — 비차단·wlock 밖. mode 는 done 분기에서 정의된다.
     if a.status == "done":
@@ -1356,6 +1432,14 @@ def cmd_set_verify_spec(a):
         print("error: verify_spec 스키마 위반 %d건 — 등록 거부(schemas/verify_spec_schema.json)"
               % len(errs), file=sys.stderr)
         return EXIT_USAGE
+    # F6(fail-open 경고): probe.args 는 actprobe 서브커맨드 **플래그 그대로** 전달된다
+    #   (예: ["--path","<p>"] — 위치 인자 아님). 플래그형 아님 감지 시 stderr 경고만·등록 진행.
+    if spec.get("mode") == "probe":
+        _pargs = (spec.get("probe") or {}).get("args") or []
+        if _pargs and not str(_pargs[0]).startswith("-"):
+            print("warn: probe.args 형식 — args 는 actprobe 서브커맨드 플래그 그대로여야 함"
+                  '(예: ["--path","<p>"]) · args[0]=%r 이 플래그형 아님(fail-open — 등록 진행)'
+                  % str(_pargs[0]), file=sys.stderr)
     with _wlock(a.id):  # ★R1-contract: 5번째 mutator 직렬화 — 동시 set-status lost-update 차단
         task = _read_task(a.id)          # 락 안 재독 — 대기 중 갱신 반영
         if not task:
@@ -1412,6 +1496,10 @@ def cmd_self_test(args):
     def run(root, argv, env_extra=None):
         env = dict(os.environ)
         env["JAVIS_ROOT"] = root
+        # B1 밀폐: ambient surface id(cys pane 안에서 self-test 실행 시)가 guard-claim 을
+        # 만들어 케이스 간 상태를 오염시키지 않게 기본 제거 — claim 케이스만 env_extra 로 주입.
+        env.pop("CYS_SURFACE_ID", None)
+        env.pop("AITERM_SURFACE_ID", None)
         env.setdefault("JAVIS_TASK_LIVENESS", "alive")  # 체크아웃 락 생존 결정론
         # P1b 밀폐: probe 원장 감사 행(skip-reason·gate-off)이 라이브 pack/state 로 새지 않도록
         #   영수증 경로·caller 를 tmpdir 로 고정(라이브 미접촉 · cys identify 서브프로세스 회피).
@@ -1832,6 +1920,112 @@ def cmd_self_test(args):
                              {"JAVIS_VERIFY_GATE": "strict"})
             assert rc == EXIT_VERIFY, \
                 "B7 마커 생성 직후 신규 태스크가 6 을 안 냄: rc=%s err=%s" % (rc, err)
+
+        # ══ B1 guard-claim 파일 계약 배터리(§2-1 — 별도 밀폐 root) ══
+        with tempfile.TemporaryDirectory(prefix="javis-task-b1-") as croot:
+            c_tasks = os.path.join(croot, "_round", "tasks")
+
+            def claim_path(sid):
+                return os.path.join(c_tasks, ".guard-claim.%s" % sid)
+
+            def read_claim(sid):
+                with open(claim_path(sid), encoding="utf-8") as f:
+                    return json.load(f)
+
+            # checkout(CYS_SURFACE_ID 있음) → claim 기록(task_id·pid·ts)
+            rc, _, e = run(croot, ["create", "Tc1", "--id", "Tc1"])
+            assert rc == 0, "B1 create 실패: %s" % e
+            rc, _, e = run(croot, ["checkout", "Tc1", "--owner", "w1", "--pid", "12345"],
+                           {"CYS_SURFACE_ID": "42"})
+            assert rc == EXIT_OK, "B1 checkout 실패: %s" % e
+            cl = read_claim("42")
+            assert cl["task_id"] == "Tc1" and cl["pid"] == 12345 and cl.get("ts"), \
+                "B1 claim 내용 오기록: %s" % cl
+            # release → claim 소거
+            rc, _, e = run(croot, ["release", "Tc1", "--owner", "w1"])
+            assert rc == EXIT_OK, "B1 release 실패: %s" % e
+            assert not os.path.isfile(claim_path("42")), "B1 release 후 claim 잔존"
+            # 재checkout + set-status done(타 surface 호출 시뮬 — env 무 sid) → claim 소거
+            rc, _, e = run(croot, ["checkout", "Tc1", "--owner", "w1"],
+                           {"CYS_SURFACE_ID": "42"})
+            assert rc == EXIT_OK, "B1 재checkout 실패: %s" % e
+            assert os.path.isfile(claim_path("42")), "B1 재checkout claim 미기록"
+            rc, _, e = run(croot, ["set-status", "Tc1", "done",
+                                   "--skip-reason", "B1 claim 소거 검증"] + OV)
+            assert rc == EXIT_OK, "B1 done 실패: %s" % e
+            assert not os.path.isfile(claim_path("42")), \
+                "B1 터미널 전이(타 surface) 후 claim 잔존(교차 소거 실패)"
+            # CYS_SURFACE_ID 부재 → claim 미생성(무동작)
+            rc, _, e = run(croot, ["create", "Tc2", "--id", "Tc2"])
+            assert rc == 0
+            rc, _, e = run(croot, ["checkout", "Tc2", "--owner", "w1"])
+            assert rc == EXIT_OK, "B1 무sid checkout 실패: %s" % e
+            claims = [n for n in os.listdir(c_tasks) if n.startswith(".guard-claim.")]
+            assert claims == [], "B1 무sid 인데 claim 생성: %s" % claims
+            # 거부 경로(exit 6)는 claim 을 만들지 않는다 — 마커를 과거로 선치(grandfather 배제)
+            with open(os.path.join(c_tasks, GATE_MARKER), "w", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                      time.localtime(time.time() - 3600)) + "\n")
+            rc, _, e = run(croot, ["create", "Tc3", "--id", "Tc3"])
+            assert rc == 0
+            rc, _, e = run(croot, ["checkout", "Tc3", "--owner", "w1"],
+                           {"CYS_SURFACE_ID": "43", "JAVIS_VERIFY_GATE": "strict"})
+            assert rc == EXIT_VERIFY, "B1 strict 거부 기대: %s" % rc
+            assert not os.path.isfile(claim_path("43")), "B1 거부 경로가 claim 생성"
+
+            # ══ F3 --claim-surface: 명시 인자 claim 기록 + env 대비 우선 ══
+            rc, _, e = run(croot, ["create", "Tc4", "--id", "Tc4"])
+            assert rc == 0, "F3 create 실패: %s" % e
+            rc, _, e = run(croot, ["checkout", "Tc4", "--owner", "master",
+                                   "--claim-surface", "55", "--pid", "777"],
+                           {"JAVIS_VERIFY_GATE": "warn"})
+            assert rc == EXIT_OK, "F3 checkout --claim-surface 실패: %s" % e
+            cl = read_claim("55")
+            assert cl["task_id"] == "Tc4" and cl["pid"] == 777, "F3 claim 오기록: %s" % cl
+            rc, _, e = run(croot, ["release", "Tc4", "--owner", "master"])
+            assert rc == EXIT_OK and not os.path.isfile(claim_path("55")), \
+                "F3 release 후 claim 잔존"
+            rc, _, e = run(croot, ["checkout", "Tc4", "--owner", "master",
+                                   "--claim-surface", "56"],
+                           {"CYS_SURFACE_ID": "42", "JAVIS_VERIFY_GATE": "warn"})
+            assert rc == EXIT_OK, "F3 우선순위 checkout 실패: %s" % e
+            assert os.path.isfile(claim_path("56")) and not os.path.isfile(claim_path("42")), \
+                "F3 명시 인자 우선 실패(56 기대·42 금지): %s" \
+                % [n for n in os.listdir(c_tasks) if n.startswith(".guard-claim.")]
+
+            # ══ F5 사이드카 네임스페이스 격리: list 오염 0 + 예약 접미 id 거부 ══
+            with open(os.path.join(c_tasks, "Tc4.guard.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task_id": "Tc4", "block_count": 0}, f)
+            with open(os.path.join(c_tasks, "Tc4.esc-bundle.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"schema_version": 1, "task": "Tc4"}, f)
+            rc, out, e = run(croot, ["list"])
+            assert rc == EXIT_OK, "F5 list 실패: %s" % e
+            ids = [t.get("id") for t in json.loads(out)]
+            assert "Tc4.guard" not in ids and "Tc4.esc-bundle" not in ids, \
+                "F5 사이드카가 list 에 유령 태스크로 오염: %s" % ids
+            assert "Tc4" in ids, "F5 필터가 실태스크를 삼킴: %s" % ids
+            rc, _, e = run(croot, ["create", "X", "--id", "X.guard"])
+            assert rc == EXIT_USAGE and "reserved" in e, \
+                "F5 예약 접미(.guard) id 미거부: rc=%s err=%s" % (rc, e)
+            rc, _, e = run(croot, ["create", "X", "--id", "X.esc-bundle"])
+            assert rc == EXIT_USAGE, "F5 예약 접미(.esc-bundle) id 미거부: %s" % rc
+            rc, _, e = run(croot, ["show", "Tc4.guard"])
+            assert rc == EXIT_USAGE, "F5 show 예약 접미 id 미거부: %s" % rc
+
+            # ══ F6 set-verify-spec probe args 형식 경고(fail-open) ══
+            rc, _, e = run(croot, ["set-verify-spec", "Tc4", "--json",
+                                   json.dumps({"mode": "probe",
+                                               "probe": {"name": "artifact",
+                                                         "args": ["path-positional"]}})])
+            assert rc == EXIT_OK and "플래그형 아님" in e, \
+                "F6 위치 인자형 probe.args 경고 부재/차단: rc=%s err=%s" % (rc, e)
+            rc, _, e = run(croot, ["set-verify-spec", "Tc4", "--json",
+                                   json.dumps({"mode": "probe",
+                                               "probe": {"name": "artifact",
+                                                         "args": ["--path", "/tmp/x"]}})])
+            assert rc == EXIT_OK and "플래그형 아님" not in e, \
+                "F6 플래그형 probe.args 에 오경고: %s" % e
     except AssertionError as ex:
         print("javis_task self-test FAIL: %s" % ex, file=sys.stderr)
         return 1
@@ -1840,7 +2034,10 @@ def cmd_self_test(args):
           "T1 verify 게이트 — warn·off·strict 문면·wakeup 1건+drain 흔적+A4 마커 억제/해제·"
           "grandfather·set-verify-spec 유효/거부·B5 risk 비-dict 거부·waiver 3상+B1 분기·"
           "시스템 템플릿·--brief hard·B6 산소유자 9 우선·동시성 lost-update 0·B7 마커 자동생성·"
-          "A3 스키마 parity)")
+          "A3 스키마 parity / B1 guard-claim — checkout 기록·release/터미널 소거(교차 surface)·"
+          "무sid 무동작·거부 경로 무claim / F3 --claim-surface 기록·env 대비 우선 / "
+          "F5 사이드카 list 오염 0·예약 접미 id 거부(create·show) / "
+          "F6 probe args 형식 경고 fail-open)")
     return EXIT_OK
 
 
@@ -1866,6 +2063,9 @@ def main(argv=None):
     c.add_argument("id")
     c.add_argument("--owner", required=True, help="워커/세션 식별자")
     c.add_argument("--pid", type=int, help="락 생존 판정에 쓸 장수 프로세스 pid(기본: 호출자)")
+    c.add_argument("--claim-surface", dest="claim_surface", default=None,
+                   help="B1 F3: guard-claim 을 기록할 surface id — master 가 위임 대상 워커"
+                        " pane 을 지정(명시 인자 우선·기본은 env CYS_SURFACE_ID)")
     c.add_argument("--brief", default=None,
                    help="T1: 위임 브리프 파일 — javis_brief_lint hard 경로(verify[] 형식 위반 = "
                         "exit 6 거부). 인세션 경고 경로는 hooks/brief-lint-warn.sh(fail-open)")
@@ -1925,6 +2125,12 @@ def main(argv=None):
         if tid is not None and not _ID_RE.match(tid):
             print("error: invalid task id %r — 허용 [A-Za-z0-9._-]{1,80} (G10 traversal 차단)"
                   % tid, file=sys.stderr)
+            return EXIT_USAGE
+        # F5(G10 확장): 예약 사이드카 접미 id 거부 — <id>.guard.json 등과 파일명 충돌 차단
+        if tid is not None and tid.endswith(RESERVED_ID_SUFFIXES):
+            print("error: reserved task id %r — guard 사이드카 예약 접미(%s) 는 태스크 id 로"
+                  " 쓸 수 없음 (F5 네임스페이스 격리)"
+                  % (tid, "·".join(RESERVED_ID_SUFFIXES)), file=sys.stderr)
             return EXIT_USAGE
     return a.fn(a)
 
