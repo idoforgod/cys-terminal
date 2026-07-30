@@ -22,6 +22,29 @@
 | `capture-pane`/화면 폴링 | `cys events --reconnect` 구독(push) · 보조 `cys read-screen` |
 
 ## 0. 부트 시퀀스 (각성 직후 1회 — 구동체제 셋팅)
+
+### 0-A. 실행 주체 단일 계약 (이 절의 **최우선** 규칙 · 아래 ⓪~⑥보다 앞선다)
+부트의 실행 주체는 **하나**다: `javis_bootstrap.py`. 아래 ⓪~⑥은 그 스크립트가 집행하는 단계
+**명세(참조용)** 이며, 네가 손으로 재현할 절차 목록이 **아니다**. 무엇을 할지는 두 기계 신호로만
+갈린다 — 재량·기억·추측으로 판단하지 마라.
+
+| 신호 | 판정 | 네가 할 일 |
+|---|---|---|
+| 컨텍스트에 `[결정론 부트스트랩 발화됨 — 하네스 강제]` 블록이 있다 | 훅이 이미 집행 중 | **재실행 금지.** 잔여 의무만: ③복원 점검 · ⑤승인 채널 확보 · ⑥구동 보고+next-action 자율 착수 |
+| 그 블록이 없다 **또는** `~/.cys/state/boot-last.json`의 **자기 surface 최신 완주 런**이 `ok:false`다 | 훅 미발화(훅 없는 기계·비-cys 세션) 또는 부트 실패 | `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를 **1회** 실행하고 그 **최종 JSON만** 인용해 보고 |
+
+- **개별 명령 수동 재현 금지**: 훅 컨텍스트가 있든 없든, ⓪preflight·②claim-role·④cys boot·
+  ⑤check를 하나씩 손으로 치는 것은 **부트 재실행**이다(중복 preflight·좌석 탈취·CEO 티켓 소각).
+  폴백은 언제나 "스크립트 **1회**"이고, 산문 체인이 아니다.
+- **boot-last.json 판독 규약**: 그 파일은 레인 공유다. 읽을 것은 `result` 중 **자기 surface**
+  (`surface` 필드 = 이 pane의 `CYS_SURFACE_ID`)의 **완주 런**(`state`가 `completed`·`solo_awakening`·
+  `failed` 중 하나 — `running`은 진행 중, `skipped_inflight`는 다른 런 소유)이다. 남의 pane이 남긴
+  `state:declined`(exit 7 정당거부)·`session_error`(exit 10)는 `ok:null`이라 **재실행 근거가 아니다**.
+- **exit 판독**: 0=완료(또는 부서 단독 각성) · 7=이 surface는 master 아님(인계) ·
+  10=세션 컨텍스트 오류(‘남이 master’ 아님 — 세션 배선 확인) · 11=다른 런이 부트 중(정상 skip·
+  실패 아님) · 그 외 비0=단계 실패(출력의 단계·원인을 그대로 보고, 자연어 재추론 금지).
+
+### 0-B. 단계 명세 (javis_bootstrap.py가 집행 — 손으로 재현하지 마라)
 ⓪ **결정론 프리플라이트 (생략 금지·최우선)**:
    `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_preflight.py" --fix` 를 실행한다. 이 스크립트가 pack·디렉티브·soul·hook 등록·round/todo·데몬을 **결정론으로**
    검증·수리한다. 이 점검 항목들(존재 검증·역할 매핑·hook 등록·범위 검사)을 **LLM 자연어로
@@ -222,12 +245,15 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   (`javis_orchestra.py check`로 결정론 확인).
 
 ## 9. 복원 체크포인트 + todo 영속 (전 노드 의무)
-- 주요 이벤트(위임·게이트 통과·커밋·오너 지시)마다 `~/.cys/pack/round/SESSION_STATE.md`를
+> ★경로 규약(G5 동류 · 레인 격리): 아래 상태·복원 파일은 모두 **자기 레인의 팩**
+> `${CYS_PACK_DIR:-$HOME/.cys/pack}` 아래에 있다. base 팩 경로를 하드코딩하면 부서 레인이
+> 본부 상태를 읽고 쓰는 교차 오염이 난다(§0 ③과 동일 규약).
+- 주요 이벤트(위임·게이트 통과·커밋·오너 지시)마다 `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/SESSION_STATE.md`를
   갱신한다(현재 위치·지시 대장·노드 상태표·미해결 게이트·다음 액션). 재시작 시
-  `~/.cys/pack/round/RECOVERY.md` 프로토콜대로 SESSION_STATE → todo → 노드 재기동·재각성 →
+  `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/RECOVERY.md` 프로토콜대로 SESSION_STATE → todo → 노드 재기동·재각성 →
   미해결 게이트부터 재개한다.
 - **todo 영속은 전 노드(master·CSO·워커·리뷰어) 공통 의무다**: master 자신도
-  `~/.cys/pack/round/MASTER_TODO.md`를 유지하고 **세부 완료마다 갱신**한다(다른 노드는 각자
+  `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/MASTER_TODO.md`를 유지하고 **세부 완료마다 갱신**한다(다른 노드는 각자
   같은 디렉터리의 `<역할>_TODO.md` — 각 디렉티브에 명시. pack의 round가 진행% 집계기의 기본
   스캔 경로다). 데몬이 `*_TODO.md` 변경을 감시해 `todo.updated` 이벤트로 전 노드에 공유한다
   — 양방향 소켓 공유의 토대.

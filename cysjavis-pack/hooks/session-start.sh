@@ -53,6 +53,8 @@ list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' �
    (preflight→claim-role→boot→orchestra check→완료 마커를 exit-code 체인으로 수행.
     "기동 완료"는 이 스크립트의 최종 JSON을 인용할 때만 선언할 수 있다 — 다른 근거 인용 금지.)
    · exit 7 = 이 surface는 master가 아니다(살아있는 master 존재) — 선언을 중단하고 기존 master에 인계하라.
+   · exit 10 = 세션 컨텍스트 오류(거부가 아님 — CYS_SURFACE_ID 부재·데몬 미응답). '남이 master'로 보고하지 마라.
+   · exit 11 = 다른 런이 이미 부트 중(정상 skip·실패 아님) — 재실행하지 말고 cys list로 진행을 확인하라.
    · 그 외 비0 exit = 부트 실패 — 출력의 단계·원인을 그대로 보고하라(자연어 재추론 금지).
 3) 마스터 외 역할은 \`cys claim-role <worker|cso|reviewer-gemini|reviewer-codex>\` 로 자기 surface를
    역할 주소로 등록한다. ⚠리뷰어는 **에이전트별 역할명**(reviewer-gemini·reviewer-codex, 대체
@@ -117,13 +119,16 @@ cat "$D"
 # PENDING(promote-if-pending은 마커 필수)이 된다. 디렉티브 §0의 정식 개정은 T2b(재핀 의례).
 if [ "$CYS_ROLE" = "master" ] && [ -f "$BOOT_PY" ]; then
   echo
-  echo "■ 부트 브리지: 부트 시퀀스(§0)는 산문 수행 대신 다음 명령 실행+최종 JSON 인용으로 수행하라 —"
+  echo "■ 부트 브리지(§0-A 실행 주체 단일 계약): 훅 컨텍스트([결정론 부트스트랩 발화됨])가 이미 있으면"
+  echo "  재실행 금지 — 잔여 의무(③복원·⑤승인채널·⑥보고+next-action)만 수행하라. 없으면(훅 미발화 기계)"
+  echo "  다음 명령을 **1회** 실행하고 최종 JSON만 인용하라(개별 명령 산문 재현 금지) —"
   # ★G8: 경로 줄은 `echo` 금지·`printf '%s\n'` 필수.
   #   macOS 의 /bin/sh(bash --posix)는 xpg_echo 로 **echo 가 백슬래시 이스케이프를 해석**한다 →
   #   Windows 네이티브 경로 `X:\Prog Files\...` 의 인용 이스케이프가 무음 붕괴해 안내가 다시
   #   '복사해서 실행 불가' 상태로 되돌아간다(실측: cygpath 목 검체 H-WIN-7 에서 재현).
   printf '  %s\n' "$BOOT_CMD"
-  echo "  (exit 7=이 surface는 master 아님·인계 / 그 외 비0=단계·원인 그대로 보고 / 완료 선언은 JSON 인용 시에만)"
+  echo "  (exit 7=이 surface는 master 아님·인계 / 10=세션 컨텍스트 오류 / 11=다른 런이 부트 중(정상 skip)"
+  echo "   / 그 외 비0=단계·원인 그대로 보고 / 완료 선언은 최종 JSON 인용 시에만)"
 fi
 # ── 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) ──
 # 업데이트·치유 불가침 사용자 확장점(팩 파일 직접 수정 대체 채널). 안전핵 키워드 줄은 주입에서

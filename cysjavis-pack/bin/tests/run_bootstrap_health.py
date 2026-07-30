@@ -46,7 +46,7 @@ PY = sys.executable or "python3"
 CALIBRATION_REF = os.environ.get("CYS_HEALTH_CALIB_REF", "a96d8b1")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
-LANDED_WAVES = ("W0", "W1a")
+LANDED_WAVES = ("W0", "W1a", "W1b")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
 
@@ -176,6 +176,50 @@ def _run_rb(env, prompt="너는 마스터다"):
     return _run(["bash", _hook("role-bootstrap.sh")], input=json.dumps({"prompt": prompt}), env=env)
 
 
+def _code_lines(body):
+    """셸/파이썬 소스에서 **주석 전용 줄을 제거**한 코드만 남긴다.
+    ★계측기 오탐 방지: 제거한 결함을 주석으로 **설명한** 줄(`cut -c1-200 은 제거됐다`)까지
+      정적 스캔이 잡으면, 문서화가 곧 회귀로 보고된다(W1a G-PRELUDE 선례와 동일 규약)."""
+    return "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+
+
+def _detect_mod():
+    """감지기 단일 소유 모듈(bin/javis_detect.py) 적재 — W1b corpus 검체의 피검체."""
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_detect
+    return javis_detect
+
+
+def _old_hook_fires(prompt, tmp, env_extra=None):
+    """★계측 타당성: 기준 커밋의 **구 훅**을 같은 프롬프트로 돌려 발화 여부를 관측한다.
+    구 코드가 결함을 재현하지 못하면 신 코드의 PASS 는 아무것도 증명하지 않는다(MEMORY 3칙).
+    반환: True/False/None(레포 아님 — 계측 대조 생략)."""
+    old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+    if old is None:
+        return None
+    oldhook = os.path.join(tmp, "oldhooks", "role-bootstrap.sh")
+    _w(oldhook, old)
+    # 구 훅(a96d8b1)은 프리루드를 source 하지 않지만, 상위 웨이브 계보에서 온 사본이 섞이면
+    # loud-skip 으로 전멸할 수 있어 형제 위치에 프리루드를 병치해 둔다(무해·멱등).
+    _w(os.path.join(tmp, "oldhooks", "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+    env, _h, _p, _b, _st = _rb_sandbox(os.path.join(tmp, "oldsb"))
+    if env_extra:
+        env.update(env_extra)
+    r = _run(["bash", oldhook], input=json.dumps({"prompt": prompt}), env=env)
+    return "발화됨" in r.stdout
+
+
+def _calib_note(fired, expect, what):
+    """구 코드 관측치가 기대(결함 재현)와 일치하는지 확인하고 계측검증 문구를 만든다."""
+    if fired is None:
+        return "skip(no-git)"
+    need(fired == expect,
+         "계측 타당성 실패: 구 코드가 %s 에서 fired=%s (기대 %s) — 검체가 결함을 재현하지 못한다"
+         % (what, fired, expect))
+    return "구 코드 fired=%s 재현" % fired
+
+
 def _run_ledgers(state, timeout=8.0):
     """런별 발화 로그 목록(백그라운드 기록 완료까지 bounded 대기)."""
     end = time.time() + timeout
@@ -240,6 +284,23 @@ def b7():
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. 러너 게이트 검체 (G-* — §5 ID 공간이 아닌 러너 로컬 게이트)
 # ═══════════════════════════════════════════════════════════════════════════
+@specimen("B-8", "W1b", "베이스라인 test_lane_isolation_v1 (훅 BOOT 부재·레인↔팩)",
+          ["레인 격리", "A7 종료 경로"])
+def b_8():
+    """★W1b 편입 이유: 이 테스트가 훅의 **BOOT 부재 분기**와 bootstrap 의 exit 8 경로를 핀한다 —
+    W1b 가 훅 전단(감지기 이관·게이트 재배치)과 cmd_run 종료 구조를 동시에 만졌으므로 1커맨드
+    게이트 안에 들어와야 한다(종전엔 러너 밖 수동 실행이었다)."""
+    return _baseline([PY, os.path.join(TESTS_DIR, "test_lane_isolation_v1.py")],
+                     "test_lane_isolation_v1")
+
+
+@specimen("B-9", "W1b", "베이스라인 javis_detect --self-test (감지기 밀폐 corpus)",
+          ["A4", "P3-A-NEGA", "P3-A-FILLER", "G9", "G25"])
+def b_9():
+    return _baseline([PY, os.path.join(BIN_DIR, "javis_detect.py"), "--self-test"],
+                     "javis_detect --self-test")
+
+
 @specimen("G-SYNTAX", "W1a", "전 훅 + 프리루드 `sh -n`·`bash -n` 무오류", ["CS-4① ⓐ POSIX sh"])
 def g_syntax():
     targets = ["_lib.sh"] + _shell_hooks()
@@ -260,7 +321,7 @@ def g_prelude():
     need(os.path.isfile(lib), "_lib.sh 부재 — 프리루드 미착지")
     fns = ["cys_require_surface", "cys_have_surface", "cys_norm_path", "cys_is_abs",
            "cys_norm_cwd", "cys_path_has_prefix", "cys_native_path", "cys_shquote",
-           "cys_resolve_py", "cys_fix_locale"]
+           "cys_resolve_py", "cys_fix_locale", "cys_timeout_run"]
     body = _read(lib)
     missing = [f for f in fns if ("%s()" % f) not in body]
     need(not missing, "프리루드 함수 누락: %s" % missing)
@@ -389,11 +450,132 @@ def g_smoke():
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. H-DETECT (훅 발화 계층)
 # ═══════════════════════════════════════════════════════════════════════════
-pending("H-DETECT-1", "W1b", "혼합의도 FIRE corpus(절 경계 스코프)", ["A4"])
-pending("H-DETECT-2", "W1b", "'네가/니가/당신이 마스터다' FIRE + 인접 의문 SKIP", ["P3-A-NEGA"])
-pending("H-DETECT-3", "W1b", "filler 경계 15자=발화/16자=미발화", ["P3-A-FILLER"])
-pending("H-DETECT-4", "W1b", "LC_ALL=C 파리티(UTF-8과 동일 판정)", ["G9"])
-pending("H-DETECT-5", "W1b", "200자 창 python측 문자 단위 슬라이스", ["G25"])
+@specimen("H-DETECT-1", "W1b", "혼합의도 FIRE corpus(절 경계 스코프)", ["A4"])
+def h_detect_1():
+    """A4: 억제를 감지보다 먼저 돌리던 순서를 역전 — 선언이 **속한 절** 안의 마커만 억제한다."""
+    D = _detect_mod()
+    fire = ["너는 마스터다. 오늘 뭐부터 할까?",
+            "너는 이제 마스터다! 무슨 일부터 시작할까?",
+            "너는 마스터다.\n오늘 작업 목록은 뭐로 잡을까?",
+            "너는 마스터다; 첫 작업은 뭐로 할까?",
+            "'설계 문서'를 예시로 보여줘. 그리고 너는 마스터다."]
+    skip = ["'너는 마스터다'가 무슨 뜻이야?", "너는 마스터다라고 말하지 마",
+            "너는 마스터가 아니다", "너는 마스터다 처럼 들리는 문장을 만들어줘"]
+    for p in fire:
+        v = D.detect(p)
+        need(v["fire"], "혼합의도 미발화(A4 회귀) %r → %s" % (p, v["reason"]))
+    for p in skip:
+        v = D.detect(p)
+        need(not v["fire"], "억제 케이스 오발화(과교정) %r → %s" % (p, v["reason"]))
+    # 훅 배선 교차 확인 — 함수는 맞는데 배선이 틀린 구멍 차단
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _h, _p, _b, _s = _rb_sandbox(tmp)
+        r = _run_rb(env, prompt=fire[0])
+        need("발화됨" in r.stdout, "훅 배선에서 혼합의도 미발화: %r" % r.stdout[:300])
+        calib = _calib_note(_old_hook_fires(fire[0], tmp), False, "혼합의도 프롬프트")
+    return "혼합의도 %d FIRE / 억제 %d SKIP + 훅 교차 · 계측검증=%s" % (len(fire), len(skip), calib)
+
+
+@specimen("H-DETECT-2", "W1b", "'네가/니가/당신이 마스터다' FIRE + 인접 의문 SKIP", ["P3-A-NEGA"])
+def h_detect_2():
+    """P3-A-NEGA: 표준 정서법 주어가 어휘에 없어 전부 미발화했다. '네'·'당신' 단독 과확장은 금지."""
+    D = _detect_mod()
+    for p in ("네가 마스터다", "니가 마스터다", "당신이 마스터다", "네가 이제 마스터야",
+              "지금부터 네가 마스터가 된다"):
+        v = D.detect(p)
+        need(v["fire"], "표준 정서법 주어 미발화(P3-A-NEGA 회귀) %r → %s" % (p, v["reason"]))
+    for p in ("'네가 마스터다'가 무슨 뜻?", "'니가 마스터다'가 무슨 의미인지 설명해줘",
+              "\"당신이 마스터다\"라고 입력하면 어떻게 되나요?"):
+        need(not D.detect(p)["fire"], "인접 의문인데 발화 %r" % p)
+    for p in ("네 마스터 브랜치를 봐줘", "당신 마스터키 어디 뒀어"):
+        need(not D.detect(p)["fire"], "'네'·'당신' 단독 과확장 발화 %r" % p)
+    need("네가" in D.SUBJECT and "니가" in D.SUBJECT and "당신이" in D.SUBJECT,
+         "주어 어휘에 네가/니가/당신이가 없다: %s" % D.SUBJECT)
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _h, _p, _b, _s = _rb_sandbox(tmp)
+        need("발화됨" in _run_rb(env, prompt="네가 마스터다").stdout, "훅 배선에서 '네가 마스터다' 미발화")
+        calib = _calib_note(_old_hook_fires("네가 마스터다", tmp), False, "'네가 마스터다'")
+    return "주어 5 FIRE / 인접의문 3 SKIP / 단독 과확장 2 SKIP · 계측검증=%s" % calib
+
+
+@specimen("H-DETECT-3", "W1b", "filler 경계 15자=발화/16자=미발화", ["P3-A-FILLER"])
+def h_detect_3():
+    """P3-A-FILLER: 주석(12) ≠ 코드(15) 불일치를 상수 FILLER_MAX 로 못박고 경계를 박제한다.
+    ★수치는 **이관 시 보존**돼야 한다 — 구 grep 과 신 함수의 경계가 같음을 구 훅 실측으로 대조한다."""
+    D = _detect_mod()
+    need(D.FILLER_MAX == 15, "FILLER_MAX 스펙 이탈: %r≠15" % D.FILLER_MAX)
+    ok15 = "너는" + "가" * 15 + "마스터다"
+    no16 = "너는" + "가" * 16 + "마스터다"
+    need(D.detect(ok15)["fire"], "filler 15자 경계 미발화")
+    need(not D.detect(no16)["fire"], "filler 16자 오발화(경계 누수)")
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _h, _p, _b, _s = _rb_sandbox(tmp)
+        need("발화됨" in _run_rb(env, prompt=ok15).stdout, "훅에서 filler 15 미발화")
+        need("발화됨" not in _run_rb(env, prompt=no16).stdout, "훅에서 filler 16 오발화")
+        # 경계 파리티: 구 grep 도 15=발화 / 16=미발화 였다(이관이 수치를 바꾸지 않았다는 증명)
+        c15 = _calib_note(_old_hook_fires(ok15, tmp), True, "filler 15자")
+        c16 = _calib_note(_old_hook_fires(no16, os.path.join(tmp, "b")), False, "filler 16자")
+    return "15=FIRE·16=SKIP(함수·훅) · 구 grep 파리티: %s / %s" % (c15, c16)
+
+
+@specimen("H-DETECT-4", "W1b", "LC_ALL=C 파리티(UTF-8과 동일 판정)", ["G9"])
+def h_detect_4():
+    """G9: `grep -E '.{0,15}'` 는 C 로케일에서 **바이트**를 세어 한글 filler 창이 1/3로 줄었다.
+    python `re` 는 코드포인트 기반이고, 감지기는 stdin 을 바이트로 읽어 UTF-8 명시 디코드한다."""
+    D = _detect_mod()
+    probes = ["너는 이제 마스터다", "너는" + "가" * 15 + "마스터다", "네가 마스터다"]
+    cenv = {"LC_ALL": "C", "LANG": "C", "LC_CTYPE": "C"}
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _h, _p, _b, _s = _rb_sandbox(tmp)
+        cenv_full = dict(env, **cenv)
+        for p in probes:
+            need("발화됨" in _run_rb(cenv_full, prompt=p).stdout,
+                 "LC_ALL=C 에서 미발화(G9 회귀): %r" % p)
+        need("발화됨" not in _run_rb(cenv_full, prompt="'너는 마스터다'가 무슨 뜻이야?").stdout,
+             "LC_ALL=C 에서 억제 케이스가 오발화(로케일 의존 잔존)")
+        # 감지기 CLI 단독 파리티(훅 밖에서도 로케일 비의존인지)
+        r = _run([PY, os.path.join(BIN_DIR, "javis_detect.py"), "hook-gate"],
+                 input=json.dumps({"prompt": probes[1]}, ensure_ascii=False),
+                 env=_base_env(cenv))
+        need(r.returncode == 0, "LC_ALL=C 에서 감지기 CLI 가 발화하지 않았다(rc=%d): %s"
+             % (r.returncode, r.stderr[-300:]))
+        # 계측 타당성: 구 훅은 같은 환경에서 **미발화**해야 한다(바이트 계수 결함 재현)
+        calib = _calib_note(_old_hook_fires(probes[1], tmp, env_extra=cenv), False,
+                            "LC_ALL=C + 한글 filler 15자")
+    need(D.detect(probes[1])["fire"], "UTF-8 판정과 불일치")
+    return "LC_ALL=C 에서 %d FIRE / 억제 1 SKIP / CLI 파리티 · 계측검증=%s" % (len(probes), calib)
+
+
+@specimen("H-DETECT-5", "W1b", "200자 창 python측 문자 단위 슬라이스", ["G25"])
+def h_detect_5():
+    """G25: `cut -c1-200` 은 GNU 에서 **항상 바이트**(BSD 도 C 로케일이면 바이트)라 한글 감지창이
+    약 66자로 축소됐다. 해법은 셸 슬라이스 **제거** — python 이 원문을 문자 단위로 자른다."""
+    D = _detect_mod()
+    need(D.WINDOW_CHARS == 200, "WINDOW_CHARS 스펙 이탈: %r≠200" % D.WINDOW_CHARS)
+    decl = "너는 마스터다"
+    inside = "가" * (D.WINDOW_CHARS - len(decl)) + decl
+    outside = "가" * D.WINDOW_CHARS + decl
+    need(len(inside.encode("utf-8")) > D.WINDOW_CHARS,
+         "검체가 바이트 기준으로도 창 안이라 회귀를 못 잡는다(검체 무효)")
+    need(D.detect(inside)["fire"], "문자 200 경계 미발화(바이트 슬라이스 회귀)")
+    need(not D.detect(outside)["fire"], "감지창 밖 선언이 발화(창 미적용)")
+    # 셸 슬라이스 제거 확인(정적) — 훅에 cut -c·bashism 슬라이스가 남아 있으면 회귀다
+    hook = _code_lines(_read(_hook("role-bootstrap.sh")))
+    need("cut -c" not in hook, "훅에 `cut -c` 바이트 슬라이스가 남았다(G25 미수리)")
+    need(not re.search(r"\$\{[A-Za-z_][A-Za-z0-9_]*:\d+:", hook), "훅에 bashism 슬라이스가 남았다")
+    need("tr '\\n' ' '" not in hook, "훅에 개행 평탄화가 남았다(창 판정이 두 곳에 존재)")
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _h, _p, _b, _s = _rb_sandbox(tmp)
+        need("발화됨" in _run_rb(env, prompt=inside).stdout, "훅에서 문자 200 경계 미발화")
+        need("발화됨" not in _run_rb(env, prompt=outside).stdout, "훅에서 창 밖 선언 발화")
+        # 계측 타당성: 구 훅은 바이트 절단 조건(C 로케일)에서 **미발화**해야 한다
+        calib = _calib_note(_old_hook_fires(inside, tmp,
+                                            env_extra={"LC_ALL": "C", "LANG": "C", "LC_CTYPE": "C"}),
+                            False, "한글 194자 프리픽스 + 선언(바이트 절단 조건)")
+        old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+        if old is not None:
+            need("cut -c1-200" in old, "계측 타당성 실패: 구 코드에 cut -c 슬라이스가 없다")
+    return "문자 200 경계 FIRE/창밖 SKIP(함수·훅) · 셸 슬라이스 제거 확인 · 계측검증=%s" % calib
 
 
 @specimen("H-DETECT-6", "W1a", "무-surface env → 무발화·무부작용", ["A2"])
@@ -422,20 +604,156 @@ def h_detect_6():
     return "무발화·cys왕복0·상태무접촉 + 대조군 발화 · 계측검증=%s" % calib
 
 
-pending("H-DETECT-7", "W1b", "role 게이트 allowlist 행렬(worker-2·cso-1·미지 role)", ["A3=B7"])
-pending("H-DETECT-8", "W1b", "surface-role 판정불가 → fail-closed+loud", ["A5"])
-pending("H-DETECT-9", "W1b", "python 부재 → 정적 loud(cannot-judge 분리)", ["A22"])
+@specimen("H-DETECT-7", "W1b", "role 게이트 allowlist 행렬(worker-2·cso-1·미지 role)", ["A3=B7"])
+def h_detect_7():
+    """A3=B7: 구 denylist(`worker|cso|reviewer-*|reviewer`)는 **열거 밖 전부 통과**였다 —
+    데몬이 실제 발권하는 worker-2(dedup)·cso-1·reviewer-claude-1·미지 role 이 마스터 부트를
+    오발화했다. 수정은 열거 확장이 아니라 **allowlist 반전**(master 또는 빈 좌석만 발화)이다."""
+    blocked = ["worker", "worker-2", "cso", "cso-1", "reviewer-gemini", "reviewer-codex",
+               "reviewer-claude-1", "reviewer-grok", "verifier", "unknown-role", "ceo"]
+    allowed = ["master", ""]
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, role in enumerate(blocked):
+            sb = os.path.join(tmp, "b%d" % i)
+            env, _h, _p, _b, _s = _rb_sandbox(sb)
+            _mock_cys(os.path.join(sb, "bin"), sb,
+                      'case "$1" in surface-role) echo "%s"; exit 0;; esac' % role)
+            r = _run_rb(env)
+            need("발화됨" not in r.stdout,
+                 "A3 회귀: role=%s 에서 마스터 부트 오발화(denylist 잔존): %r" % (role, r.stdout[:200]))
+            need("allowlist" in r.stderr or "비-master" in r.stderr,
+                 "role=%s 차단이 침묵이다(로그 없음): %r" % (role, r.stderr[:200]))
+        for i, role in enumerate(allowed):
+            sb = os.path.join(tmp, "a%d" % i)
+            env, _h, _p, _b, _s = _rb_sandbox(sb)
+            _mock_cys(os.path.join(sb, "bin"), sb,
+                      'case "$1" in surface-role) echo "%s"; exit 0;; esac' % role)
+            need("발화됨" in _run_rb(env).stdout,
+                 "정상 좌석(role=%r)에서 발화하지 않았다(과차단)" % role)
+        # 계측 타당성: 구 훅은 worker-2 에서 **발화**했어야 한다(결함 재현)
+        sb = os.path.join(tmp, "calib")
+        os.makedirs(sb, exist_ok=True)
+        old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+        calib = "skip(no-git)"
+        if old is not None:
+            oldhook = os.path.join(sb, "oldhooks", "role-bootstrap.sh")
+            _w(oldhook, old)
+            _w(os.path.join(sb, "oldhooks", "_lib.sh"),
+               _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            env, _h, _p, _b, _s = _rb_sandbox(os.path.join(sb, "sb"))
+            _mock_cys(os.path.join(sb, "sb", "bin"), os.path.join(sb, "sb"),
+                      'case "$1" in surface-role) echo "worker-2"; exit 0;; esac')
+            r = _run(["bash", oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env)
+            need("발화됨" in r.stdout,
+                 "계측 타당성 실패: 구 코드가 worker-2 에서 오발화하지 않는다 — 검체가 결함을 재현 못함")
+            calib = "구 코드 worker-2 오발화 재현"
+    return "차단 %d role(미지 role 포함)·허용 2 · 계측검증=%s" % (len(blocked), calib)
+
+
+@specimen("H-DETECT-8", "W1b", "surface-role 판정불가 → fail-closed+loud", ["A5"])
+def h_detect_8():
+    """A5: `cys surface-role` 이 판정 불가(rc≠0·hang)일 때 구 코드는 MYROLE 을 **빈값**으로 얻어
+    '미claim' 으로 오통과시켰다(빈값 오통과). 3상화: rc≠0=무발화+로그 / 빈값=미claim 통과.
+    ★timeout 단독 적용은 hang 을 오발화로 바꾸는 악화이므로 데드라인과 3상화를 함께 검증한다."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # ⓐ rc≠0(판정 불가) → 무발화 + 로그
+        sb = os.path.join(tmp, "rc")
+        env, _h, _p, _b, _s = _rb_sandbox(sb)
+        _mock_cys(os.path.join(sb, "bin"), sb,
+                  'case "$1" in surface-role) echo ""; exit 3;; esac')
+        r = _run_rb(env)
+        need("발화됨" not in r.stdout, "판정 불가(rc=3)인데 발화(fail-open 잔존)")
+        need("판정 불가" in r.stderr, "판정 불가가 침묵으로 접혔다: %r" % r.stderr[:200])
+        notes.append("rc≠0 무발화+로그")
+        # ⓑ hang → 데드라인으로 유한 종료 + 무발화(훅이 프롬프트를 무한정 붙잡지 않는다)
+        sb = os.path.join(tmp, "hang")
+        env, _h, _p, _b, _s = _rb_sandbox(sb)
+        _mock_cys(os.path.join(sb, "bin"), sb,
+                  'case "$1" in surface-role) sleep 30; echo ""; exit 0;; esac')
+        t0 = time.time()
+        r = _run_rb(env)
+        dt = time.time() - t0
+        need(dt < 20, "hang 이 데드라인으로 끊기지 않았다(%.1fs) — 훅이 프롬프트를 붙잡는다" % dt)
+        need("발화됨" not in r.stdout, "hang(판정 불가)인데 발화 — timeout 단독 적용 악화 형태")
+        notes.append("hang %.1fs 내 종료·무발화" % dt)
+        # ⓒ 빈값(정상 미claim)은 통과해야 한다 — 3상 분리의 반대편(과차단 금지)
+        sb = os.path.join(tmp, "empty")
+        env, _h, _p, _b, _s = _rb_sandbox(sb)
+        need("발화됨" in _run_rb(env).stdout, "빈값(미claim)이 차단됐다 — rc≠0 과 융합(과차단)")
+        notes.append("빈값 미claim 통과")
+    # 계측 타당성: 프리루드에 데드라인 실행기가 존재하고 훅이 그것으로 감싼다
+    need("cys_timeout_run()" in _read(os.path.join(HOOKS_DIR, "_lib.sh")),
+         "프리루드에 데드라인 실행기(cys_timeout_run)가 없다")
+    need("cys_timeout_run" in _read(_hook("role-bootstrap.sh")),
+         "훅이 surface-role 을 데드라인으로 감싸지 않는다")
+    old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+    calib = "skip(no-git)"
+    if old is not None:
+        need("cys_timeout_run" not in old and 'MYROLE="$(cys surface-role' in old,
+             "계측 타당성 실패: 구 코드가 이미 데드라인·3상화를 갖고 있다면 이 검체는 무의미")
+        calib = "구 코드 무-데드라인·빈값 오통과 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-DETECT-9", "W1b", "python 부재 → 정적 loud(cannot-judge 분리)", ["A22"])
+def h_detect_9():
+    """A22: 인터프리터 미해소는 '선언 아님'이 아니라 **판정 불가**다. 구 코드는 `|| CYS_PY=python3`
+    으로 채워 존재하지 않는 인터프리터를 향해 파싱을 시도하고 조용히 exit 0 했다(cannot-judge 침묵).
+    ★judged-no 와의 분리: 프롬프트에 마스터 토큰이 아예 없으면 침묵이 정당하다(스팸 금지)."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # PATH 에서 python 전부 제거 + CYS_PY 빈값 강제 → cannot-judge
+        sb = os.path.join(tmp, "nopy")
+        env, _h, _p, _b, _s = _rb_sandbox(sb)
+        binp = os.path.join(sb, "onlybin")
+        os.makedirs(binp, exist_ok=True)
+        for tool in ("bash", "sh", "cat", "grep", "printf", "tr", "head", "date", "mkdir",
+                     "rm", "ls", "ln", "sleep", "dirname", "sed", "command", "kill", "wait"):
+            src = shutil.which(tool)
+            if src and not os.path.exists(os.path.join(binp, tool)):
+                os.symlink(src, os.path.join(binp, tool))
+        # 목 cys 를 python 없는 PATH 에 복사(feed/send 시도 흔적 회수용)
+        _mock_cys(binp, sb, 'case "$1" in surface-role) echo ""; exit 0;; esac')
+        env["PATH"] = binp
+        env["CYS_PY"] = ""
+        r = _run_rb(env)
+        need(r.returncode == 0, "python 부재에서 훅이 비0 종료(exit=%d)" % r.returncode)
+        need("발화됨" not in r.stdout, "python 부재인데 '발화됨' 보고")
+        need("판정 불가" in r.stdout and "python" in r.stdout,
+             "cannot-judge 가 정적 loud 로 나오지 않았다(침묵 접힘): %r" % r.stdout[:300])
+        need("hookSpecificOutput" in r.stdout, "정적 additionalContext 미출력(python 없이 발행 실패)")
+        json.loads(r.stdout.strip().splitlines()[-1])   # 정적 JSON 이 유효 JSON 인가
+        need("feed push" in _calls(sb) or "send --queued" in _calls(sb),
+             "판정 불가인데 승인 채널 알림 시도가 없다: %r" % _calls(sb)[-300:])
+        notes.append("cannot-judge 정적 loud+알림")
+        # judged-no: 마스터 토큰 없는 프롬프트는 침묵(스팸 금지)
+        r2 = _run_rb(env, prompt="오늘 작업 지시해줘")
+        need(r2.stdout.strip() == "", "선언 토큰 없는 프롬프트에 컨텍스트를 주입했다(스팸): %r" % r2.stdout[:200])
+        notes.append("judged-no 침묵")
+    old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+    calib = "skip(no-git)"
+    if old is not None:
+        need('CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"' in old
+             or "|| CYS_PY=python3" in old or '|| CYS_PY="python3"' in old,
+             "계측 타당성 실패: 구 코드에 '존재하지 않는 인터프리터로 채우기'가 없다")
+        calib = "구 코드 인터프리터 기본값 채움 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 @specimen("H-DETECT-10", "W1a", "pre-exec 사망 목 → '발화 실패' 상태파생 보고(허위 '발화됨' 금지)", ["A6"])
 def h_detect_10():
     real = shutil.which("python3") or PY
-    # 목 인터프리터: `-c`(프롬프트 파싱·NOTE 생성)는 정상 위임, **스크립트 실행은 exec 실패(127)**.
+    # 목 인터프리터: `-c`(NOTE 생성)와 **감지기 스크립트**(W1b: 선언 판정이 python 단일 함수로
+    # 이관됐다)는 정상 위임하고, **부트 스크립트 실행만 exec 실패(127)** 로 만든다.
+    # ★목을 좁힌 이유: 이 검체가 재는 것은 '부트 발화의 pre-exec 사망'이지 '감지 불가'가 아니다.
+    #   감지기까지 죽이면 훅이 A22 cannot-judge 분기로 빠져 A6 표면을 아예 통과하지 않는다.
     mock = ("#!/bin/sh\n"
             'case "$1" in\n'
             '  -c) exec "%s" "$@" ;;\n'
+            "  *javis_detect.py) exec \"%s\" \"$@\" ;;\n"
             "esac\n"
-            "exit 127\n" % real)
+            "exit 127\n" % (real, real))
     with tempfile.TemporaryDirectory() as tmp:
         env, _home, _pack, _bind, state = _rb_sandbox(tmp, mock_py=mock)
         r = _run_rb(env)
@@ -495,7 +813,120 @@ def h_detect_11():
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. H-EXIT (종료·판정 계약) — W1a 발효분은 A15/R2 하나
 # ═══════════════════════════════════════════════════════════════════════════
-pending("H-EXIT-1", "W1b", "cmd_run 종료 불변식(stdout JSON / stderr verdict·run_id)", ["A7", "A19"])
+def _boot_sandbox(tmp, *, cys_extra="", check_exit=0):
+    """javis_bootstrap.py 격리 실행 환경(HOME+가짜 팩+스텁 cys). 반환 (env, home, tmp)."""
+    home = os.path.join(tmp, "home")
+    pack = os.path.join(home, ".cys", "pack")
+    bindir = os.path.join(tmp, "stubbin")
+    os.makedirs(os.path.join(pack, "bin"), exist_ok=True)
+    os.makedirs(bindir, exist_ok=True)
+    _mock_cys(bindir, tmp, cys_extra)
+    _w(os.path.join(pack, "bin", "javis_preflight.py"), "import sys; sys.exit(0)\n", 0o644)
+    _w(os.path.join(pack, "bin", "javis_orchestra.py"),
+       "import sys; sys.exit(%d)\n" % check_exit, 0o644)
+    env = _base_env({"HOME": home, "PATH": bindir + os.pathsep + os.environ.get("PATH", ""),
+                     "CYS_SURFACE_ID": "7", "CYS_BOOT_CHECK_RETRIES": "1",
+                     "CYS_BOOT_CHECK_INTERVAL_S": "0.05"})
+    return env, home
+
+
+def _boot_last(home):
+    return json.loads(_read(os.path.join(home, ".cys", "state", "boot-last.json")) or "{}")
+
+
+@specimen("H-EXIT-1", "W1b",
+          "cmd_run 종료 불변식(stdout JSON / stderr verdict·run_id·귀속) + A20 소비 분기",
+          ["A7", "A19", "A20(소비층)", "CS-2⑩"])
+def h_exit_1():
+    """A7·A19·CS-2⑩: 종료 채널 분리 · 런 정체성 · 정당거부의 boot-last 오염 0.
+
+    ※A20 은 두 층이다 — CLI 타입드 exit 표(cys.rs)는 **W2**, bootstrap 의 **소비 분기**
+      (거부 마커 유무로 exit 7 / 10 분리)는 W1b 다. 여기서 재는 것은 후자다(H-EXIT-3=W2 유지).
+    """
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    notes = []
+    src = _read(boot)
+    need("def _cmd_run_chain(" in src and "log.finish(" in src,
+         "cmd_run 이 try/finally 종결 기록 구조로 분리되지 않았다(A19)")
+    with tempfile.TemporaryDirectory() as tmp:
+        # ⓐ 완주 → stdout 최종 JSON(구 산문 계약 보존) + 귀속·종결 기록
+        env, home = _boot_sandbox(os.path.join(tmp, "ok"))
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 0, "완주 경로 exit≠0: %d\n%s" % (r.returncode, r.stderr[-500:]))
+        summary = json.loads(r.stdout.strip().splitlines()[-1])
+        need(summary.get("ok") is True, "stdout 최종 JSON 이 성공 계약을 잃었다: %r" % summary)
+        bl = _boot_last(home)
+        for k in ("run_id", "pid", "surface", "ended", "exit"):
+            need(k in bl, "boot-last 에 런 귀속·종결 필드 누락: %s (%r)" % (k, sorted(bl)))
+        need(bl["surface"] == "7", "surface 귀속이 틀렸다: %r" % bl.get("surface"))
+        need(bl["exit"] == 0 and (bl.get("result") or {}).get("state") == "completed",
+             "완주 상태 기록 이상: %r" % bl.get("result"))
+        need((bl["result"].get("run_id") or "") == bl["run_id"],
+             "result 에 run 귀속이 없다(§0 '자기 surface 최신 완주 런' 판독 불가)")
+        notes.append("완주=stdout JSON+귀속+종결")
+
+        # ⓑ 정당거부(claim_denied) → exit 7 · **ok:false 오염 0**(state=declined)
+        env, home = _boot_sandbox(
+            os.path.join(tmp, "deny"),
+            cys_extra=('case "$1" in claim-role) echo "claim_denied: privileged role held by '
+                       'live surface" >&2; exit 1;; esac'))
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 7, "정당거부 exit≠7: %d" % r.returncode)
+        res = _boot_last(home).get("result") or {}
+        need(res.get("ok") is None and res.get("state") == "declined",
+             "정당거부가 공유 boot-last 에 ok:false 를 덮었다(CS-2⑩ 회귀): %r" % res)
+        need(res.get("surface") == "7", "거부 기록에 surface 귀속이 없다: %r" % res)
+        notes.append("거부=exit 7·ok:null(오염 0)")
+
+        # ⓒ 거부 마커 없는 claim 실패 → **exit 10 세션 컨텍스트 오류**(A20 소비 분기)
+        env, home = _boot_sandbox(
+            os.path.join(tmp, "ctx"),
+            cys_extra='case "$1" in claim-role) echo "error: no surface" >&2; exit 4;; esac')
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 10, "거부 마커 없는 실패가 exit 10 으로 분리되지 않았다: %d" % r.returncode)
+        need("세션 컨텍스트 오류" in r.stderr, "exit 10 문구가 없다: %r" % r.stderr[-300:])
+        res = _boot_last(home).get("result") or {}
+        need(res.get("ok") is None and res.get("state") == "session_error",
+             "세션 컨텍스트 오류가 ok:false 를 덮었다: %r" % res)
+        notes.append("마커 없는 실패=exit 10·ok:null")
+
+        # ⓓ 인프라 실패(ping)는 여전히 ok:false — 과교정 금지(이건 실제로 깨진 부트다)
+        env, home = _boot_sandbox(os.path.join(tmp, "ping"),
+                                  cys_extra='case "$1" in ping) exit 1;; esac')
+        r = _run([PY, boot], env=env, timeout=180)
+        need(r.returncode == 3, "ping 실패 exit≠3: %d" % r.returncode)
+        res = _boot_last(home).get("result") or {}
+        need(res.get("ok") is False and res.get("state") == "failed",
+             "인프라 실패가 ok:false 를 잃었다(과교정): %r" % res)
+        notes.append("인프라 실패=ok:false 유지")
+
+        # ⓔ 진행 중 선기록(A19) — 러닝 상태에서 강제 종료해도 'running' 이 남는다
+        env, home = _boot_sandbox(os.path.join(tmp, "run"),
+                                  cys_extra='case "$1" in ping) sleep 20;; esac')
+        pr = subprocess.Popen([PY, boot], env=env, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        deadline = time.time() + 15
+        bl = {}
+        while time.time() < deadline:
+            bl = _boot_last(home)
+            if bl.get("run_id"):
+                break
+            time.sleep(0.1)
+        pr.kill(); pr.wait(timeout=15)
+        need(bl.get("run_id"), "시작 시점 선기록이 없다(진행 중 상태 판별 불가)")
+        need((bl.get("result") or {}).get("state") == "running",
+             "선기록 상태가 running 이 아니다: %r" % bl.get("result"))
+        notes.append("running 선기록(SIGKILL 생존)")
+    # 계측 타당성: 구 코드는 종결·귀속 필드가 없었다
+    old = _git_show("cysjavis-pack/bin/javis_bootstrap.py")
+    calib = "skip(no-git)"
+    if old is not None:
+        need('"result"] = {"ok": True}' in old or '{"ok": True}' in old,
+             "계측 타당성 실패: 구 코드 성공 기록 형태를 못 찾았다")
+        need("run_id" not in old, "계측 타당성 실패: 구 코드에 이미 run_id 가 있다")
+        need("log.finish(" not in old, "계측 타당성 실패: 구 코드에 이미 종결 기록이 있다")
+        calib = "구 코드 run_id·종결 기록 부재 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 pending("H-EXIT-2", "W2", "boot Busy → busy 판정 구분 + CEO 티켓 보존", ["G11"])
 pending("H-EXIT-3", "W2", "claim-role 타입드 exit 표(0/7/3/2)", ["A20"])
 pending("H-EXIT-4", "W2", "boot --json 스키마(mandatory·outcome·install_hint)", ["G29", "B15", "B16", "R5"])
@@ -503,7 +934,52 @@ pending("H-EXIT-5", "W2", "미지 subcommand EX_USAGE + 게이트 exit 2 충돌 
 pending("H-EXIT-6", "W2", "orchestra 2/127=영구실패 · 124=재시도 분류", ["A12"])
 pending("H-EXIT-7", "W2", "check exit 2(데몬 소실) 별도 분기", ["G32"])
 pending("H-EXIT-8", "W2", "discover sentinel(격리 팩 vs 미발견 분리)", ["G1"])
-pending("H-EXIT-9", "W1b", "싱글플라이트 패자 → 비-master skip verdict(즉시 반환)", ["G17"])
+@specimen("H-EXIT-9", "W1b", "싱글플라이트 패자 → 비-master skip verdict(즉시 반환)", ["G17", "A7"])
+def h_exit_9():
+    """G17: 패자 pane 이 **신원 확인 없이** 조용히 exit 0 하면 그 pane 의 LLM 이 '부트 완료된
+    master'를 자칭한다. verdict 에 자기 surface-role 확인 결과를 동봉하고 '비-master'를 명시한다.
+    ★즉시 반환(waited=false) — 수렴 대기 금지(금지 방향 ⑨)."""
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        env, home = _boot_sandbox(
+            tmp, cys_extra=('case "$1" in ping) sleep 8;; surface-role) echo "worker"; exit 0;; esac'))
+        winner = subprocess.Popen([PY, boot], env=env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        try:
+            # 승자가 락을 잡을 시간을 준다(선기록 등장으로 확인)
+            deadline = time.time() + 15
+            while time.time() < deadline and not _boot_last(home).get("run_id"):
+                time.sleep(0.1)
+            winner_run = _boot_last(home).get("run_id")
+            t0 = time.time()
+            r = _run([PY, boot], env=env, timeout=60)
+            dt = time.time() - t0
+        finally:
+            winner.kill(); winner.wait(timeout=15)
+        need(r.returncode == 11, "패자 exit≠11(구분 exit 부재): %d" % r.returncode)
+        need(r.stdout.strip() == "",
+             "패자가 stdout(계약 채널)을 오염시켰다 — master 가 '완료'로 인용할 위험: %r" % r.stdout[:300])
+        line = [l for l in r.stderr.splitlines() if l.strip().startswith("{")]
+        need(line, "stderr 1줄 verdict JSON 이 없다: %r" % r.stderr[-400:])
+        v = json.loads(line[-1])
+        need(v.get("verdict") == "skipped_inflight", "verdict 타입 이상: %r" % v)
+        need(v.get("surface_role") == "worker" and v.get("is_master") is False,
+             "패자가 자기 신원을 확인하지 않았다(G17 회귀): %r" % v)
+        need("비-master" in (v.get("self_check") or ""),
+             "'비-master' 명시가 없다(자칭 master 차단 실패): %r" % v.get("self_check"))
+        need(v.get("waited") is False and dt < 6,
+             "패자가 수렴 대기를 했다(%.1fs · 금지 방향 ⑨): %r" % (dt, v))
+        need(v.get("boot_last_untouched") is True, "skip 이 단일-writer 보존을 주장하지 않는다")
+        need(_boot_last(home).get("run_id") == winner_run,
+             "패자가 승자의 boot-last 를 덮었다(단일-writer 파괴)")
+        need(os.path.isfile(os.path.join(home, ".cys", "state", "boot-skip-base.json")),
+             "skip 별도 기록 파일이 없다")
+    old = _git_show("cysjavis-pack/bin/javis_bootstrap.py")
+    calib = "skip(no-git)"
+    if old is not None:
+        need("_emit_skip_verdict" not in old, "계측 타당성 실패: 구 코드에 이미 skip verdict 가 있다")
+        calib = "구 코드 침묵 skip(exit 0) 확인"
+    return "exit 11 · stdout 무접촉 · 비-master 명시 · waited=false · 별도 기록 · 계측검증=%s" % calib
 
 
 @specimen("H-EXIT-10", "W1a", "②ping 실패에도 알림 시도 발생(카브아웃 제거·notifier 단일화)", ["A15", "R2"])
@@ -615,7 +1091,32 @@ def h_conc_1():
 pending("H-CONC-2", "W2", "훅+GUI boot 중첩 → 중복 스폰 0(락 확장)", ["G12"])
 pending("H-CONC-3", "W3", "settings.json 3-writer 경합 무파손(mkstemp+공용 락)", ["G16", "A8"])
 pending("H-CONC-4", "W2", "좌석 승계 임계영역 재검증(프로브 후 점유 → 승계 취소)", ["G13", "G14"])
-pending("H-CONC-5", "W1b", "하네스 pgid 실측(결정 실험 — 처방 아닌 측정)", ["A18"])
+@specimen("H-CONC-5", "W1b", "하네스 pgid 실측(결정 실험 — 처방 아닌 측정)", ["A18"])
+def h_conc_5():
+    """A18 은 **측정**이 게이트다(처방 아님 — os.setsid 선제 내재화는 철회됐다).
+
+    이 검체는 두 가지만 강제한다:
+      ① 결정 실험 스크립트가 실재하고 결정론적으로 돈다(측정 실패=hard fail).
+      ② **계측 타당성**: 세션 분리 스폰(대조군)이 같은 group-kill 에서 생존한다 — 그래야
+         '훅 분기가 사망'이라는 관측치가 의미를 갖는다(항상-사망 프로브 배제).
+    판정(group-kill 노출 여부) 자체는 결함 심각도 결정(P3 유지 vs P2 복귀)이며 master 소관이다 —
+    여기서 fail 로 만들지 않고 **detail 에 실측치를 실어** 게이트 출력에 남긴다.
+    """
+    probe = os.path.join(TESTS_DIR, "probe_pgid.py")
+    need(os.path.isfile(probe), "A18 결정 실험 스크립트 부재: %s" % probe)
+    if os.name != "posix":
+        raise Skip("posix 전용 측정(Windows 프로세스 그룹은 H-WIN-11 소속)")
+    r = _run([PY, probe, "--json"], timeout=180)
+    need(r.returncode == 0, "측정 실패(exit=%d): %s" % (r.returncode, r.stderr[-400:]))
+    m = json.loads(r.stdout)
+    need("error" not in m, "측정 오류: %s" % m.get("error"))
+    ca = m.get("control_arm") or {}
+    need(ca.get("ok") is True,
+         "계측기 고장 — 대조군(세션 분리 스폰)이 group-kill 에서 생존하지 못했다: %r" % ca)
+    need(isinstance(m.get("child_survived_group_kill"), bool), "관측치 누락: %r" % m)
+    return ("훅 분기=%s(setsid=%s) · pgid 분리=%s · group-kill 생존=%s → %s · 대조군 생존 확인"
+            % (m.get("hook_branch"), m.get("setsid_available"), m.get("pgid_separated"),
+               m.get("child_survived_group_kill"), m.get("verdict")))
 
 
 @specimen("H-CONC-6", "W1a", "스테일 락(보유 pid 사망) 회수 — 유한 거부 창 상한", ["R1", "A2"])
@@ -1010,12 +1511,110 @@ pending("H-PRED-10", "W4", "TCC 탐침 대상이 실자원(cwd+PACK)에서 파�
 pending("H-TIME-1", "W2", "예산 parity Σ(하위 최악치)≤상위 + 냉시작 하한 fixture", ["B9"])
 pending("H-TIME-2", "W2", "문서·훅 안내 숫자=BUDGET 상수 파생(하드코딩 grep 0)", ["P3-A-120S"])
 pending("H-TIME-3", "W2", "카운트 회계 금지(Instant 데드라인 단언)", ["B17"])
-pending("H-DOC-1", "W1b", "§0↔훅 note↔template 문안 정합", ["A10", "P3-A-TEMPLATE"])
+_CLAUDE_MD_COPIES = ("CLAUDE.md", os.path.join("cysjavis-pack", "CLAUDE.md.template"))
+_HOOK_FIRED_MARK = "[결정론 부트스트랩 발화됨 — 하네스 강제]"
+
+
+def _repo_file(rel):
+    p = os.path.join(REPO_DIR, rel)
+    if not os.path.isfile(p):
+        raise Skip("레포 파일 부재(배포 팩 실행): %s" % rel)
+    return _read(p)
+
+
+def _no_wait_for_owner(text, where):
+    """'오너 지시 대기' 문구 금지(H-DOC-1) — 단, **폐기 선언**으로 인용한 것은 허용한다.
+    ★규칙을 '문자열 부재'로 두면 폐기 선언 자체를 쓸 수 없다(문서가 결함을 설명 못 한다) →
+      출현마다 근처(±40자)에 부정 마커(폐기/아니라/금지)가 있어야 한다는 형태 규칙으로 판정한다."""
+    for m in re.finditer(r"오너 지시 대기|오너의? 지시를 기다|오너 지시를 받아", text):
+        window = text[max(0, m.start() - 40):m.end() + 40]
+        need(any(k in window for k in ("폐기", "아니라", "금지")),
+             "%s 에 '오너 지시 대기' 계열 문구가 살아 있다(§0 ⑥·앵커6 축1 위반): …%s…"
+             % (where, window.replace("\n", " ")))
+
+
+@specimen("H-DOC-1", "W1b", "§0↔훅 note↔template(사본 2벌) 문안 정합", ["A10", "P3-A-TEMPLATE"])
+def h_doc_1():
+    """A10: 부트 실행 주체 계약이 §0(디렉티브)·훅 note·template 3곳에 사본으로 살면서 서로
+    달랐다. 계약을 §0-A 단일 표로 모으고 나머지는 **포인터**로 만든 뒤, 그 정합을 기계로 못박는다.
+    P3-A-TEMPLATE: 훅 없는 기계의 폴백 절차("스크립트 1회")가 보존돼야 한다 — 산문 체인 금지."""
+    md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
+    hook = _read(_hook("role-bootstrap.sh"))
+    notes = []
+    # ① §0-A 조건부 단일 계약이 존재하고 두 분기를 명시하는가
+    need("0-A" in md and "실행 주체 단일 계약" in md, "§0-A 단일 계약 절이 없다(A10 미착지)")
+    need(_HOOK_FIRED_MARK in md, "§0-A 가 훅 컨텍스트 신호 문구를 인용하지 않는다(정합 불가)")
+    need("재실행 금지" in md, "§0-A 에 재실행 금지 분기가 없다")
+    need("1회" in md and "javis_bootstrap.py" in md, "§0-A 에 '스크립트 1회' 폴백이 없다")
+    need("수동 재현 금지" in md or "산문 체인" in md or "손으로 치는" in md,
+         "§0-A 가 개별 명령 수동 재현 금지를 명문하지 않는다")
+    notes.append("§0-A 조건부 계약")
+    # ② 훅 note 가 같은 신호 문구를 쓰고 잔여 의무를 가리키는가(문안 정합의 핵심 축)
+    need(_HOOK_FIRED_MARK in hook, "훅 note 와 §0-A 의 신호 문구가 다르다(정합 파괴)")
+    need("재실행하지 마라" in hook, "훅 note 에 재실행 금지가 없다")
+    need("next-action" in hook, "훅 note 가 next-action 자율 착수를 가리키지 않는다")
+    _no_wait_for_owner(_code_lines(hook), "훅 note")   # 주석(수정 이력 설명)은 스캔 제외
+    notes.append("훅 note 신호·잔여의무 정합")
+    # ③ template 2벌 사본이 §0 포인터 + 폴백 보존 문구를 갖고, **서로 동일**한가
+    bodies = []
+    for rel in _CLAUDE_MD_COPIES:
+        t = _repo_file(rel)
+        need("0-A" in t, "%s 가 §0-A 포인터를 갖지 않는다" % rel)
+        need("javis_bootstrap.py" in t and "1회" in t,
+             "%s 에 훅 미발화 폴백(스크립트 1회)이 없다(P3-A-TEMPLATE)" % rel)
+        need("산문 체인" in t, "%s 에 '산문 체인 금지' 보존 문구가 없다(P3-A-TEMPLATE)" % rel)
+        need("javis_preflight.py" not in t.split("## 터미널")[0],
+             "%s 부트절이 아직 preflight 산문 지시를 담고 있다(A10 미수리)" % rel)
+        _no_wait_for_owner(t, rel)
+        bodies.append(t.split("## 터미널")[0])
+    need(bodies[0] == bodies[1],
+         "template 2벌 사본의 부트절이 갈렸다(사본 드리프트) — 길이 %d vs %d"
+         % (len(bodies[0]), len(bodies[1])))
+    notes.append("template 2벌 동일·폴백 보존")
+    # 계측 타당성: 구 문서는 산문 부트 지시를 담고 있었다
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/CLAUDE.md.template")
+    if old is not None:
+        head = old.split("## 터미널")[0]
+        need("javis_preflight.py" in head,
+             "계측 타당성 실패: 구 template 부트절에 산문 preflight 지시가 없다")
+        calib = "구 template 산문 부트 지시 확인"
+    oldmd = _git_show("cysjavis-pack/directives/MASTER_DIRECTIVE.md")
+    if oldmd is not None:
+        need("실행 주체 단일 계약" not in oldmd,
+             "계측 타당성 실패: 구 §0 에 이미 단일 계약이 있다")
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-DOC-6", "W1b",
+          "§0 ③ 및 §9 상태 경로가 CYS_PACK_DIR 파생(base 하드코딩 0) "
+          "— 재태깅 W4→W1b: W1b master 지시로 :225 동류 교정이 착지",
+          ["G5"])
+def h_doc_6():
+    """G5(및 그 동류): 디렉티브가 base 팩 경로를 하드코딩하면 부서장 레인이 **본부 상태**를
+    읽고 쓴다(교차 오염). 레인 파생(`${CYS_PACK_DIR:-$HOME/.cys/pack}`)만 허용한다."""
+    rel = os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md")
+    md = _repo_file(rel)
+    bad = [l.strip()[:120] for l in md.splitlines() if "~/.cys/pack" in l]
+    need(not bad, "base 팩 경로 하드코딩 잔존(%d줄): %s" % (len(bad), bad[:5]))
+    # $HOME/.cys/pack 은 **반드시** CYS_PACK_DIR 폴백 형태로만 등장해야 한다
+    loose = [l.strip()[:120] for l in md.splitlines()
+             if "$HOME/.cys/pack" in l and "CYS_PACK_DIR:-$HOME/.cys/pack" not in l]
+    need(not loose, "CYS_PACK_DIR 폴백 없는 $HOME 경로 잔존: %s" % loose[:5])
+    need("${CYS_PACK_DIR:-$HOME/.cys/pack}/round/SESSION_STATE.md" in md,
+         "§9 SESSION_STATE 경로가 레인 파생이 아니다(:225 동류 미교정)")
+    # 계측 타당성: 기준 커밋에는 하드코딩이 있었다
+    calib = "skip(no-git)"
+    old = _git_show(rel)
+    if old is not None:
+        oldbad = [l for l in old.splitlines() if "~/.cys/pack" in l]
+        need(oldbad, "계측 타당성 실패: 구 문서에 base 하드코딩이 없다면 이 검체는 무의미")
+        calib = "구 문서 하드코딩 %d줄 확인" % len(oldbad)
+    return "하드코딩 0줄 · §9 SESSION_STATE·RECOVERY·TODO 레인 파생 · 계측검증=%s" % calib
 pending("H-DOC-2", "W4", "'5노드'=REQUIRED_ROLES+1 파생", ["B18"])
 pending("H-DOC-3", "W4", "CEO_TEMPLATE 동사↔cys-dept 가드 허용 집합 대조", ["G6"])
 pending("H-DOC-4", "W4", "헤더 exit 표↔코드 상수 기계 대조 (결함 G31·G32 문구는 W0에서 수정 — 기계 대조 assert 는 CS-6 문서 정합 테스트=W4 산출)", ["G31", "G32"])
 pending("H-DOC-5", "W4", "generic reviewer 안내 문구 금지 (결함 G30 문구는 W0에서 수정 — assert 는 W4)", ["G30"])
-pending("H-DOC-6", "W4", "§0 ③ 경로가 CYS_PACK_DIR 파생 (결함 G5 는 W0에서 수정 — assert 는 W4)", ["G5"])
 pending("H-DOC-7", "W4", "agents 스키마 완결성(vendor/user 계층)", ["B20"])
 pending("H-DOC-8", "W4", "팀 부트 진입점 전수 단일 계약", ["B5"])
 pending("H-SEED-1", "W3", "소망 훅 집합 동등성(Rust 시드/init-pack == SELFCORR_HOOKS)", ["A9"])
@@ -1024,7 +1623,9 @@ pending("H-SEED-3", "W3", "settings.json 없는 프로필 디렉토리 후보화
 pending("H-SEED-4", "W3", "cys-dept launch/rotate → CYS_ACCOUNT_DIR 복원 주입", ["G3"])
 pending("H-SEED-5", "W3", "외부 동명 훅 보존(_prune 소유 술어)", ["G10"])
 pending("H-LIFE-1", "W3", "레인별 marker/boot-last 분리 + run 귀속 교차 단언", ["G15", "P3-A-DEPT-LANE"])
-pending("H-LIFE-2", "W1b", "step id enum 유일성·기록 순서=실행 순서", ["P3-A-STEP-NAME"])
+pending("H-LIFE-2", "W3", "step id enum 유일성·기록 순서=실행 순서 "
+        "(재태깅 W1b→W3: §4 웨이브 소속이 정본 — P3-A-STEP-NAME 은 W3 대상)",
+        ["P3-A-STEP-NAME"])
 pending("H-OBS-1", "W2", "배달 3분기 VERIFY(pending/dropped/delivered-무ack)", ["B11"])
 pending("H-OBS-2", "W2", "주입 검증 실패 → directive_verified:false 상태화", ["B14"])
 

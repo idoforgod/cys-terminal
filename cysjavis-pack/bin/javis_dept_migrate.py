@@ -38,7 +38,14 @@ EVENT = "UserPromptSubmit"
 SCRIPT_NAME = "role-bootstrap.sh"
 HOOK_REL = os.path.join("hooks", "role-bootstrap.sh")
 BOOTSTRAP_REL = os.path.join("bin", "javis_bootstrap.py")
-REQUIRED_PACK_FILES = [HOOK_REL, BOOTSTRAP_REL]
+# ★훅의 **의존 실체**를 전부 나열한다(T-0147-7 W1b · 이음매 결함 차단):
+#   role-bootstrap.sh 는 혼자 못 돈다 — 프리루드 `hooks/_lib.sh`(W1a: 미소실 시 loud-skip 강등)와
+#   선언 감지기 `bin/javis_detect.py`(W1b: 감지 판정의 단일 소유자)가 같은 레인에 있어야 한다.
+#   둘 중 하나라도 없으면 부서 레인에서 훅이 **매 선언마다 '판정 불가'로 강등**된다(팀 미기동).
+#   구 목록(훅+부트스트랩 2개)은 그 의존을 몰랐다 — 레거시 부서 팩이 정확히 그 상태로 남는다.
+PRELUDE_REL = os.path.join("hooks", "_lib.sh")
+DETECT_REL = os.path.join("bin", "javis_detect.py")
+REQUIRED_PACK_FILES = [HOOK_REL, PRELUDE_REL, BOOTSTRAP_REL, DETECT_REL]
 DIRECTIVE_REL = os.path.join("directives", "MASTER_DIRECTIVE.md")
 STALE_DOCTRINE_MARK = "[부서장 스코프 절대규칙]"   # 폐기 교리 heading(2026-07-11 구본)
 CURRENT_DOCTRINE_MARK = "④-c"                      # 현행 교리 분기(D1 옵션 1')

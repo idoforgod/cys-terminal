@@ -30,6 +30,21 @@ BOOTSTRAP = os.path.join(BIN, "javis_bootstrap.py")
 MIGRATE = os.path.join(BIN, "javis_dept_migrate.py")
 
 
+def _seed_main_pack_hook_deps(main_pack):
+    """메인 팩에 **훅 의존 실체 전부**를 심는다(migrate 의 REQUIRED_PACK_FILES 대응).
+
+    ★T-0147-7 W1b: role-bootstrap.sh 는 혼자 못 돈다 — 프리루드 `hooks/_lib.sh`(W1a)와
+      선언 감지기 `bin/javis_detect.py`(W1b)가 같은 레인에 있어야 훅이 강등되지 않는다.
+      픽스처가 그 의존을 빠뜨리면 '실물 메인 팩'을 모사하지 못한다(migrate 는 정당하게 error).
+    """
+    os.makedirs(os.path.join(main_pack, "hooks"), exist_ok=True)
+    os.makedirs(os.path.join(main_pack, "bin"), exist_ok=True)
+    _write_exec(os.path.join(main_pack, "hooks", "role-bootstrap.sh"), "#!/bin/bash\nexit 0\n")
+    _write_exec(os.path.join(main_pack, "hooks", "_lib.sh"), "#!/bin/sh\n:\n")
+    _write_exec(os.path.join(main_pack, "bin", "javis_bootstrap.py"), "#!/usr/bin/env python3\n")
+    _write_exec(os.path.join(main_pack, "bin", "javis_detect.py"), "#!/usr/bin/env python3\n")
+
+
 def _write_exec(path, content):
     with open(path, "w") as f:
         f.write(content)
@@ -280,8 +295,7 @@ class MigrateIdempotent(unittest.TestCase):
         main_pack = os.path.join(home, ".cys", "pack")
         os.makedirs(os.path.join(main_pack, "hooks"), exist_ok=True)
         os.makedirs(os.path.join(main_pack, "bin"), exist_ok=True)
-        _write_exec(os.path.join(main_pack, "hooks", "role-bootstrap.sh"), "#!/bin/bash\nexit 0\n")
-        _write_exec(os.path.join(main_pack, "bin", "javis_bootstrap.py"), "#!/usr/bin/env python3\n")
+        _seed_main_pack_hook_deps(main_pack)
         # 기존 부서 config(UserPromptSubmit 부재 — 풀 세트 중 SessionStart만 있는 상태 재현)
         acctdir = os.path.join(home, ".cys", "claude-default-dept-1")
         os.makedirs(acctdir, exist_ok=True)
@@ -309,6 +323,9 @@ class MigrateIdempotent(unittest.TestCase):
         self.assertTrue(os.path.isfile(settings + ".bak-migrate"), "백업 미생성")
         self.assertTrue(os.path.isfile(os.path.join(dept_pack, "hooks", "role-bootstrap.sh")),
                         "부서 팩에 훅 미복사")
+        for _rel in (("hooks", "_lib.sh"), ("bin", "javis_detect.py")):
+            self.assertTrue(os.path.isfile(os.path.join(dept_pack, *_rel)),
+                            "부서 팩에 훅 의존(%s) 미복사 — 부서 레인 훅이 강등된다" % "/".join(_rel))
         self.assertTrue(os.path.isfile(os.path.join(dept_pack, "bin", "javis_bootstrap.py")),
                         "부서 팩에 부트스트랩 미복사")
 
@@ -352,8 +369,7 @@ class MigrateDirectiveBackfill(unittest.TestCase):
         os.makedirs(os.path.join(main_pack, "hooks"), exist_ok=True)
         os.makedirs(os.path.join(main_pack, "bin"), exist_ok=True)
         os.makedirs(os.path.join(main_pack, "directives"), exist_ok=True)
-        _write_exec(os.path.join(main_pack, "hooks", "role-bootstrap.sh"), "#!/bin/bash\nexit 0\n")
-        _write_exec(os.path.join(main_pack, "bin", "javis_bootstrap.py"), "#!/usr/bin/env python3\n")
+        _seed_main_pack_hook_deps(main_pack)
         with open(os.path.join(main_pack, "directives", "MASTER_DIRECTIVE.md"), "w",
                   encoding="utf-8") as f:
             f.write(CURRENT_DIRECTIVE)

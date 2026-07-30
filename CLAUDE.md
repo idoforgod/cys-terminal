@@ -11,10 +11,15 @@
    역할 주소로 등록한다. ⚠리뷰어는 **에이전트별 역할명**(reviewer-gemini·reviewer-codex)을
    쓴다 — generic `reviewer`로 등록하면 orchestra check의 4종 생존 판정이 실패한다.
    launch-agent/boot로 기동됐다면 이미 등록돼 있다(`cys list` role 열 확인 — 재등록 금지).
-3. 마스터 선언이면 MASTER_DIRECTIVE의 **부트 시퀀스**를 수행해 구동체제를 셋팅하고 결과를 보고한다.
-   부트 시퀀스 ⓪은 결정론 프리플라이트다:
-   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_preflight.py" --fix` —
-   존재·매핑·hook 등록 검증은 이 스크립트 출력만이 사실이다(LLM 자연어 재추론 금지).
+3. 마스터 선언이면 부트는 **산문으로 수행하지 않는다** — 계약의 정본은 MASTER_DIRECTIVE
+   **§0-A(실행 주체 단일 계약)** 이고, 이 파일은 그 포인터일 뿐이다. 두 갈래만 있다:
+   · 컨텍스트에 `[결정론 부트스트랩 발화됨 — 하네스 강제]` 블록이 있으면 **재실행 금지** —
+     잔여 의무(§0 ③복원 점검·⑤승인 채널·⑥구동 보고+next-action 자율 착수)만 수행한다.
+   · 그 블록이 없거나(훅 미발화 기계) 자기 surface의 최신 완주 런이 실패면 **훅 미발화 시
+     폴백**으로 `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를
+     **1회** 실행하고 그 **최종 JSON만** 인용해 보고한다.
+   ⚠ preflight·claim-role·`cys boot`·check를 하나씩 손으로 치는 **산문 체인은 금지**다(그것도
+   부트 재실행이다 — 중복 preflight·좌석 탈취·CEO 티켓 소각). 폴백은 언제나 스크립트 1회다.
 
 ## 터미널: cys 터미널 전용 (⚠ 외부 터미널 체계 아님 — 치환 실행)
 

@@ -20,16 +20,38 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
   - ★소켓 격리: CYS_SOCKET이 base가 아니면(부서 pane 부트) write하지 않는다 — 부서장 부트가
     base 마커를 오염시키면 CEO 승격 게이트(cys-dept)가 오개방된다.
 
-exit(`run` 체인 — 코드 상수와 대조 유지): 0=부트 완료(또는 부서장 단독 각성=CEO 티켓 부재,
-      또는 단일 실행 락 skip — 이미 다른 pane이 부트 중) / 3=ping / 4=boot
-      6=check 최종 실패(CHECK_RETRIES 소진) / 7=claim 거부(이 surface는 master 아님 — 지휘 중단·인계)
+exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 상수):
+      0=부트 완료(또는 부서장 단독 각성=CEO 티켓 부재) / 3=ping / 4=boot
+      6=check 최종 실패(CHECK_RETRIES 소진) / 7=claim 정당거부(이 surface는 master 아님 — 지휘 중단·인계)
       8=레인↔팩 정합 실패 또는 불량 레인(빈 부서명) — 교차 오염 차단·팀 기동 전 중단
       9=자원 hard_block(결손 기준 자원 사전 게이트 — 팀 기동 전 착수 거부·CEO escalation)
+      10=세션 컨텍스트 오류(claim 왕복이 정당거부가 **아닌** 사유로 실패 — CYS_SURFACE_ID 부재·
+         데몬 미응답·바이너리 부재 등. 7과 분리해야 '남의 master' 오보를 안 만든다 — A20)
+      11=skipped_inflight(단일 실행 락 패자 — 이미 다른 런이 부트 중. **실패 아님**)
   다른 서브커맨드: 5=assert-ready 게이트 실패(하위 게이트 전용) / 2=`issue-ticket` 사용오류
-      (--dept 형식 위반 또는 base 레인 아님).
+      (--dept 형식 위반 또는 base 레인 아님) / 64=EX_USAGE(미지 서브커맨드 — A14).
   ★2는 preflight가 아니다 — ①preflight는 비치명(FAIL이어도 경고 강등·계속)이라 전용 exit가
     없다. 구 헤더의 '2=preflight'는 낡은 계약이었다(G31).
 안전밸브: CYS_BOOT_GATE=warn(assert-ready 실패를 경고로 강등)|off(게이트 무력).
+
+★종료 채널 계약(T-0147-7 W1b · A7 · 재감사 §3 CS-2① — 비평2 C-2 반영):
+  · completed / solo_awakening → **stdout 최종 JSON**(배포된 산문 계약 "완료 선언은 이 스크립트의
+    최종 JSON을 인용할 때만" — session-start.sh — 을 그대로 보존한다. 이 채널은 성공 전용이다).
+  · skipped_inflight / failed → **stderr 1줄 verdict JSON + 구분 exit**. stdout(계약 채널)은
+    건드리지 않는다 — 디렉티브 미개정 기계의 master가 skip JSON을 '완료'로 인용하는 회귀 차단.
+  · skip은 **즉시 반환**한다(수렴 대기 금지 — 금지 방향 ⑨: 정상 시나리오가 이미 동시 2호출이라
+    대기는 LLM Bash 호출을 냉부팅 예산만큼 블록해 도구 타임아웃·재시도 홍수를 만든다).
+  · skip 기록은 boot-last.json 본체를 **덮지 않는다**(단일-writer 불변식 보존) — 레인별
+    `boot-skip-<lane>.json` 별도 파일에 남긴다.
+
+★런 정체성(A19 · CS-7①): boot-last.json 은 run_id(started+pid)·pid·surface·role 을 귀속하고,
+  cmd_run 전체가 try/finally로 `ended`·`exit`(예외 시 `exc`)를 **항상** 기록한다. 시작 시점에
+  `result:{"ok":null,"state":"running"}` 을 선기록하므로 '진행 중 / 중단 / 크래시 / 완주'가
+  기계 구분된다(종전엔 진행 중과 크래시가 똑같이 'result 없음'이었다).
+★boot-last 오염 차단(CS-2⑩ · 비평2 C-3): 정당거부(exit 7)·세션 컨텍스트 오류(exit 10)는 공유
+  boot-last 에 `ok:false` 를 쓰지 않는다(`ok:null` + state=declined|session_error). 같은 레인
+  두 번째 pane의 정당한 거부가 건강한 master의 ok:true 를 덮어 §0 소비 술어를 churn 시키는 것을
+  막는다. §0 이 읽어야 하는 신호는 '**자기 surface**의 최신 완주 런'이다 — 그래서 귀속이 필수다.
 
 부서 교리 게이트 (증분2 — D1 옵션 1'):
   ⓐ CEO 티켓 권한 게이트(P7): 부서 레인(CYS_SOCKET=부서 소켓)의 팀 기동은 CEO 발급 티켓 필수.
@@ -102,6 +124,25 @@ BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 # 넉넉히 기다린다 — 24×5s ≈ 120초 상한(무한 아님·자원 거버넌스 유지).
 CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES", "24")))
 CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S", "5"))  # 총 상한 ≈ 120초
+
+# ── exit 코드 단일 소스(A7·A14·A20 — 헤더 exit 표의 진실원천) ──
+# ★타입드 종료: '성공'·'정당거부'·'세션 컨텍스트 오류'·'정상 skip'·'사용오류'가 각자 코드를 갖는다.
+#   구 계약은 정당거부와 인프라 실패를 7 하나로, 정상 skip과 완주를 0 하나로 뭉갰다(RC2).
+EXIT_OK = 0
+EXIT_PING = 3
+EXIT_BOOT = 4
+EXIT_ASSERT_READY = 5
+EXIT_CHECK = 6
+EXIT_CLAIM_DENIED = 7        # 정당거부 — 살아있는 master 가 이미 있다(이 surface 는 master 아님)
+EXIT_LANE_PACK = 8
+EXIT_RESOURCE_HARD = 9
+EXIT_SESSION_CONTEXT = 10    # claim 왕복이 '정당거부가 아닌' 사유로 실패(A20)
+EXIT_SKIPPED_INFLIGHT = 11   # 싱글플라이트 패자 — 실패 아님(A7)
+EXIT_USAGE = 64              # EX_USAGE(sysexits.h) — 미지 서브커맨드·사용오류(A14)
+
+# claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — session-start.sh:101 과 동일 어휘).
+# 이 마커가 없는 rc≠0 은 거부가 아니라 세션 컨텍스트 오류다(A20: 판정·escalation 층위 뭉개기 해소).
+_CLAIM_DENIED_MARKERS = ("claim_denied", "privileged role held")
 
 # ── 증분2: 부서 교리 게이트 상태 ──
 # CEO 티켓 저장소(base 레인이 발급·부서 레인이 소비) + 24h TTL + 1회성(소비 시 .used rename).
@@ -281,22 +322,88 @@ def _binary_version():
     return out.strip().splitlines()[0] if code == 0 and out.strip() else "unknown"
 
 
+def _my_surface_id():
+    """이 런이 속한 surface 참조(귀속 키). 구 env 이름도 수용(프리루드 A2 게이트와 동일 규약)."""
+    return (os.environ.get("CYS_SURFACE_ID", "")
+            or os.environ.get("AITERM_SURFACE_ID", "") or "")
+
+
 class _Log:
-    """단계 결과를 boot-last.json에 누적(진단 가시성 — 각 retry 시도 포함)."""
+    """단계 결과를 boot-last.json에 누적(진단 가시성 — 각 retry 시도 포함).
+
+    ★A19 런 정체성: 레코드는 이제 **누가/언제/어디서** 돈 런인지 스스로 말한다.
+      run_id(started+pid)·pid·surface·role 이 없던 종전에는 (ⓐ)한 레인의 두 pane 중 누구의 런인지,
+      (ⓑ)진행 중인지 크래시했는지 구분이 불가능했다(둘 다 'result 키 없음'으로 보였다).
+      `result:{"ok":null,"state":"running"}` 선기록 + finish() 의 try/finally 종결 기록이 그 둘을
+      기계로 분리한다.
+    ★role 은 **env 파생**(CYS_ROLE — 데몬이 pane에 주입)이다: 여기서 `cys surface-role` 왕복을
+      추가하면 부트 시작 전에 데몬 왕복이 하나 더 늘고, ③ 이전에는 아직 claim 도 안 된 상태라
+      권위값도 아니다. ③ 성공 후 `role_claimed` 를 별도로 남긴다(관측 파생 — 보고=실측).
+    """
 
     def __init__(self):
-        self.data = {"started": time.strftime("%Y-%m-%dT%H:%M:%S"), "steps": [],
-                     "socket": os.environ.get("CYS_SOCKET", ""), "base_socket": _is_base_socket()}
+        started = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.pid = os.getpid()
+        self.run_id = "%s-%d" % (started, self.pid)
+        self.surface = _my_surface_id()
+        self.data = {"started": started, "run_id": self.run_id, "pid": self.pid,
+                     "surface": self.surface, "role": os.environ.get("CYS_ROLE", ""),
+                     "steps": [],
+                     "socket": os.environ.get("CYS_SOCKET", ""), "base_socket": _is_base_socket(),
+                     # ★선기록 — 이 시점 이후 어떤 경로로 죽어도 '진행 중'이 남는다.
+                     "result": {"ok": None, "state": "running", "run_id": self.run_id,
+                                "surface": self.surface}}
+        _atomic_write_json(BOOT_LAST, self.data)
+
+    def _attributed(self, res):
+        """result 딕트에 런 귀속을 못박는다 — §0 소비 술어('자기 surface의 최신 완주 런')의 전제."""
+        res.setdefault("run_id", self.run_id)
+        res.setdefault("surface", self.surface)
+        res.setdefault("pid", self.pid)
+        return res
 
     def step(self, name, code, detail=""):
         self.data["steps"].append({"step": name, "exit": code,
                                    "detail": detail.strip()[-2000:]})
         _atomic_write_json(BOOT_LAST, self.data)
 
-    def fail(self, name, code, detail, exit_code):
-        self.step(name, code, detail)
-        self.data["result"] = {"ok": False, "failed_step": name, "exit": exit_code}
+    def result(self, **kw):
+        """단계 성공/강등 경로의 result 기록(귀속 자동 첨부)."""
+        self.data["result"] = self._attributed(dict(kw))
         _atomic_write_json(BOOT_LAST, self.data)
+
+    def finish(self, exit_code, exc=None):
+        """★A19 종결 기록 — cmd_run 의 finally 가 유일 호출자. 어떤 경로로 끝나도 도달한다.
+
+        체인이 result 를 남기지 못한 채 끝났다면(=크래시·중단) 그 사실을 상태로 박는다.
+        종전에는 SIGKILL·예외·중간 return 이 전부 '기록 없음'으로 수렴해 '진행 중'과 구분되지
+        않았다(A19 재검증: "필드 추가만으론 '중단 vs 크래시' 융합 잔존 — try/finally 필수").
+        """
+        self.data["ended"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.data["exit"] = exit_code
+        if exc:
+            self.data["exc"] = str(exc)[:500]
+        res = self.data.get("result")
+        if not isinstance(res, dict) or res.get("state") == "running":
+            self.data["result"] = self._attributed(
+                {"ok": None, "state": "crashed" if exc else "aborted",
+                 "exit": exit_code, "exc": (str(exc)[:500] if exc else None)})
+        else:
+            res.setdefault("exit", exit_code)
+            self._attributed(res)
+        _atomic_write_json(BOOT_LAST, self.data)
+
+    def fail(self, name, code, detail, exit_code, ok=False, state="failed"):
+        """실패·거부 경로의 공통 종결(단계 기록 → result → stderr → loud 알림).
+
+        ★ok/state 파라미터(CS-2⑩ · 비평2 C-3): 정당거부(exit 7)·세션 컨텍스트 오류(exit 10)는
+          `ok=None, state='declined'|'session_error'` 로 남긴다 — 공유 boot-last 에 `ok:false` 를
+          덮으면 같은 레인의 건강한 master 가 남긴 ok:true 를 남의 pane 이 지워, §0 의 '직접 실행'
+          분기를 무한 churn 시킨다(부트 폭풍). 인프라 실패(ping·boot·check·lane-pack)는 그대로
+          ok=False 다 — 그건 실제로 이 레인의 부트가 깨진 사실이다.
+        """
+        self.step(name, code, detail)
+        self.result(ok=ok, state=state, failed_step=name, exit=exit_code)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
         # ★실패 가시화(오너 2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
         # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — 알림으로 승격.
@@ -316,11 +423,77 @@ class _Log:
                 "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
                 "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
                 "②ping": "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",
+                "③claim-role-context": "역할 등록 왕복이 세션 컨텍스트 오류로 실패했습니다 — "
+                                       "이 세션이 cys pane 안인지(CYS_SURFACE_ID)와 데몬 응답을 확인하세요"
+                                       "(‘남이 master’라는 뜻이 아닙니다).",
                 }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
         channel = _notify_loud("부트스트랩 미완(%s)" % name, hint)
         self.data["result"]["notify"] = {"attempted": True, "channel": channel}
         _atomic_write_json(BOOT_LAST, self.data)
         return exit_code
+
+
+def _observe_surface_role():
+    """이 surface 의 데몬 권위 역할 관측 → (role|None, 사유). None = 판정 불가.
+
+    ★G17 전용(싱글플라이트 패자 경로에서만 호출): 부트를 건너뛴 pane 이 **자기 신원을 확인하지
+      않고** 조용히 exit 0 하면, 그 pane 의 LLM 은 "부트 완료된 master"를 자칭하며 지휘를
+      계속한다(자칭 master 잔존 — javis_bootstrap.py:516 재검증). 그래서 skip verdict 에는
+      '나는 master 가 아니다'를 명시할 근거를 실측으로 붙인다.
+    ★rc0+빈출력 삼킴(A5)은 여기서 완전 해소되지 않는다(cys.rs 3상화는 W2) — 다만 CYS_SURFACE_ID
+      가 있는데 빈값이면 '미claim(비-master)'로 읽는 것이 보수적이고 이 목적에 정확하다.
+    """
+    if not _my_surface_id():
+        return None, "CYS_SURFACE_ID 부재 — surface 귀속 불가"
+    code, out = _run(["cys", "surface-role"], timeout=5)
+    if code != 0:
+        return None, "surface-role 판정 불가(rc=%s)" % code
+    role = (out or "").strip().splitlines()
+    role = role[0].strip() if role else ""
+    return role, ("role=%s" % role if role else "미claim(빈 좌석)")
+
+
+def _skip_record_path():
+    """싱글플라이트 skip 기록 경로(레인별) — boot-last.json 본체를 덮지 않는다(단일-writer 보존)."""
+    return os.path.join(STATE_DIR, "boot-skip-%s.json"
+                        % _singleflight_key(os.environ.get("CYS_SOCKET", "")))
+
+
+def _emit_skip_verdict():
+    """A7·G17: 싱글플라이트 패자의 타입드 종료 — stderr 1줄 verdict JSON + exit 11.
+
+    ★즉시 반환한다(수렴 대기 금지 — 금지 방향 ⑨). 정상 시나리오가 이미 동시 2호출
+      (role-bootstrap 백그라운드 + session-start 산문 지시)이므로, 여기서 승자의 완주를 기다리면
+      LLM 의 Bash 호출이 냉부팅 최악 예산(≈1555s)만큼 블록되고 도구 타임아웃→재시도 홍수가 된다.
+    ★stdout 무접촉: '완료 선언은 최종 JSON 인용 시에만'이라는 배포된 산문 계약을 지키려면 skip 은
+      절대 stdout 에 JSON 을 내면 안 된다(구 코드는 그냥 침묵했고, 침묵은 자칭 master 를 낳았다).
+    """
+    role, why = _observe_surface_role()
+    is_master = (role == "master") if role is not None else None
+    if is_master is True:
+        self_check = ("이 surface 는 master 좌석이다 — 그러나 부트는 **다른 런**이 진행 중이므로 "
+                      "재실행하지 말고 cys list·boot-last.json 으로 그 런의 결과를 확인하라.")
+    elif is_master is False:
+        self_check = ("이 surface 는 **비-master**(%s) 다 — 마스터를 자칭하거나 팀을 지휘하지 마라. "
+                      "부트는 다른 pane 이 소유한다." % why)
+    else:
+        self_check = ("이 surface 의 역할을 판정할 수 없다(%s) — master 를 자칭하지 마라"
+                      "(판정 불가는 '나는 master' 가 아니다)." % why)
+    verdict = {"verdict": "skipped_inflight", "ok": None, "exit": EXIT_SKIPPED_INFLIGHT,
+               "reason": "다른 부트스트랩 런이 진행 중(단일 실행 락 비획득) — 즉시 반환",
+               "run_id": "%s-%d" % (time.strftime("%Y-%m-%dT%H:%M:%S"), os.getpid()),
+               "pid": os.getpid(), "surface": _my_surface_id(),
+               "surface_role": role, "is_master": is_master, "self_check": self_check,
+               "lock": _singleflight_path(), "waited": False,
+               "boot_last_untouched": True, "record": _skip_record_path()}
+    _progress("부트스트랩 이미 진행 중(단일 실행 락) — 중복 실행 skip(exit %d). 진행은 cys list로 확인."
+              % EXIT_SKIPPED_INFLIGHT)
+    sys.stderr.write(json.dumps(verdict, ensure_ascii=False) + "\n")
+    try:
+        _atomic_write_json(_skip_record_path(), verdict)
+    except OSError:
+        pass          # 기록 실패가 skip 을 실패로 바꾸면 안 된다(verdict 는 이미 stderr 에 있다)
+    return EXIT_SKIPPED_INFLIGHT
 
 
 def _singleflight_key(sock):
@@ -618,9 +791,9 @@ def _run_resource_gate(py, log):
         notified = _notify_loud("자원 hard_block(부트 중단)",
                                 "%s. 자원 정리(서버 kill·/clear·노드 회수) 후 재선언하라." % why)
         log.step("④′resource-gate-notify", 0, "알림 채널: %s" % notified)
-        log.data["result"] = {"ok": False, "failed_step": "resource-gate", "exit": 9}
-        _atomic_write_json(BOOT_LAST, log.data)
-        return 9
+        log.result(ok=False, state="failed", failed_step="resource-gate",
+                   exit=EXIT_RESOURCE_HARD)
+        return EXIT_RESOURCE_HARD
     if verdict == "hard-overcount":
         _progress("⚠ 자원 nodes hard(과계수 결함으로 판단) — cys list 교차확인 후 1회 경고·진행: " + why)
         _notify_loud("자원 게이트 nodes 과계수 경고", why)
@@ -661,11 +834,36 @@ def cmd_issue_ticket(argv):
 
 
 def cmd_run():
-    # ★단일 실행 게이트 — 진행 중이면 즉시 성공 반환(중복 preflight/boot 방지·pile-up 차단).
+    """★A7 단일 종료 불변식의 소유자 — 여기 밖으로 나가는 종료 경로는 없다.
+
+    ① 싱글플라이트 패자 → `_emit_skip_verdict()`(stderr verdict + exit 11 · boot-last 무접촉)
+    ② 그 밖 전부 → `_Log()` 생성 후 `_cmd_run_chain()`, **try/finally 로 종결 기록**(A19).
+       finally 는 정상 return·중간 return·예외·SystemExit 전부에서 돈다 — '진행 중'으로 영원히
+       남는 레코드가 사라진다.
+    ★예외는 삼키지 않는다(re-raise): 트레이스백은 진단의 최종 증거다. 다만 기록되는 exit 는
+      파이썬이 실제로 낼 값(uncaught=1)이어야 하므로 그렇게 남긴다 — 기록≠실측 금지.
+    """
     if _acquire_singleflight() is None:
-        _progress("부트스트랩 이미 진행 중(단일 실행 락) — 중복 실행 skip. 진행은 cys list로 확인.")
-        return 0
+        return _emit_skip_verdict()
     log = _Log()
+    exit_code = None
+    try:
+        exit_code = _cmd_run_chain(log)
+        return exit_code
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+        raise
+    except BaseException as e:
+        exit_code = 1                        # uncaught → 파이썬 프로세스 실제 exit
+        log.finish(exit_code, exc="%s: %s" % (type(e).__name__, e))
+        raise
+    finally:
+        if "ended" not in log.data:          # 예외 경로에서 이미 기록했으면 중복 기록 금지
+            log.finish(exit_code if exit_code is not None else 1)
+
+
+def _cmd_run_chain(log):
+    """부트 단계 체인(①~⑧) — 종료 기록은 호출자(cmd_run)의 try/finally 가 소유한다."""
     py = sys.executable or "python3"
 
     # ★불량 레인 가드(R1-LOW-2): 빈 부서명(cys-dept-/ — suffix 없음) 소켓은 base도 부서도 아닌
@@ -679,9 +877,8 @@ def cmd_run():
         _progress("⚠ " + detail)
         notified = _notify_loud("불량 레인(빈 부서명 — 부트 중단)", detail)
         log.step("③′lane-pack-notify", 0, "알림 채널: %s" % notified)
-        log.data["result"] = {"ok": False, "failed_step": "lane-pack", "exit": 8}
-        _atomic_write_json(BOOT_LAST, log.data)
-        return 8
+        log.result(ok=False, state="failed", failed_step="lane-pack", exit=EXIT_LANE_PACK)
+        return EXIT_LANE_PACK
 
     # ★레인↔팩 정합 가드(증분1 · UT-14 교차 오염 차단): 부서 소켓 레인은 그 부서 팩(pack-dept-X)을,
     # base 레인은 메인 팩을 써야 한다. 불일치면 잘못된 데몬/팩 조합이 마커·승격·디렉티브를 오염시키므로
@@ -696,9 +893,8 @@ def cmd_run():
         _progress("⚠ " + detail)
         notified = _notify_loud("레인↔팩 불일치(부트 중단)", detail)
         log.step("③′lane-pack-notify", 0, "알림 채널: %s" % notified)
-        log.data["result"] = {"ok": False, "failed_step": "lane-pack", "exit": 8}
-        _atomic_write_json(BOOT_LAST, log.data)
-        return 8
+        log.result(ok=False, state="failed", failed_step="lane-pack", exit=EXIT_LANE_PACK)
+        return EXIT_LANE_PACK
 
     # ★TCC 보조 경고(오너 2026-07-15): macOS 폴더 권한 리셋(서명 변경 업그레이드) 시 pane 자식이
     # EPERM으로 죽는 실사고 — 부트가 살아있는 세션에서라도 조기 경고(주 안내는 GUI perm-warning).
@@ -738,7 +934,7 @@ def cmd_run():
     code, out = _run(["cys", "ping"], timeout=15)
     log.step("②ping", code, out)
     if code != 0:
-        return log.fail("②ping", code, out, 3)
+        return log.fail("②ping", code, out, EXIT_PING)
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
     # ★SEAT(2026-07-17 실사고): 보유자가 '빈 좌석'(role 만 쥔 agent 없는 셸 — cys-dept 가 부서 생성 시
@@ -746,13 +942,32 @@ def cmd_run():
     #   --takeover-empty-seat 는 **요청**일 뿐이다: 데몬이 커널 사실(자손 프로세스 0·agent 메타 없음·
     #   최근 입력 없음)로 재판정해 정말 빈 좌석일 때만 승계를 허용하고, agent 가 붙은 정당한 master 는
     #   종전대로 거부한다(유령 master 차단 규칙 불변 — 살아있는 master 가 있으면 여전히 exit 7).
+    # ★A20 타입드 판정(W1b 소비층): rc≠0 을 전부 '정당거부(exit 7)'로 접던 것을 둘로 쪼갠다.
+    #   ⓐ 출력에 데몬의 거부 마커(claim_denied / privileged role held)가 있으면 **정당거부=exit 7**
+    #     — "살아있는 master 가 있다"는 판정이 성립한 경우다(지휘 중단·인계가 정답).
+    #   ⓑ 마커가 없는 rc≠0 은 **세션 컨텍스트 오류=exit 10**: CYS_SURFACE_ID 부재(cys.rs 가 대상
+    #     surface 를 못 정함)·데몬 미응답·바이너리 부재·사용오류 등. 이걸 7로 보고하면 사용자에게
+    #     "다른 pane 이 이미 master 다"라는 **거짓 판정**을 주고, 그 처방(기존 master 탭으로 가라)은
+    #     실제 원인(세션 배선)을 영영 못 찾게 만든다(A20: 판정·escalation 층위의 뭉개기).
     _progress("③ master 역할 등록…")
     code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"], timeout=15)
     log.step("③claim-role", code, out)
     if code != 0:
-        msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
-               "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
-        return log.fail("③claim-role", code, msg, 7)
+        low = (out or "").lower()
+        if any(m in low for m in _CLAIM_DENIED_MARKERS):
+            msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
+                   "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
+            # ★ok=None(CS-2⑩): 정당거부는 '이 레인의 부트가 깨졌다'가 아니다 — 공유 boot-last 의
+            #   ok:true(건강한 master 의 완주 기록)를 ok:false 로 덮으면 §0 이 churn 한다.
+            return log.fail("③claim-role", code, msg, EXIT_CLAIM_DENIED,
+                            ok=None, state="declined")
+        msg = ("역할 등록 왕복이 **거부가 아닌** 사유로 실패했다(세션 컨텍스트 오류) — 데몬의 거부 "
+               "마커(claim_denied/privileged role held)가 출력에 없다. 흔한 원인: 이 세션이 cys "
+               "pane 밖(CYS_SURFACE_ID 부재)·데몬 미응답·cys 바이너리 부재. '다른 pane이 master' "
+               "라는 뜻이 **아니다** — 세션 배선을 확인하라.\n%s" % out)
+        return log.fail("③claim-role-context", code, msg, EXIT_SESSION_CONTEXT,
+                        ok=None, state="session_error")
+    log.data["role_claimed"] = "master"   # 관측 파생 귀속(보고=실측)
 
     # ── 증분2 ⓐ CEO 티켓 권한 게이트(P7) — 부서 레인 팀 기동 전. 티켓 부재/만료=단독 각성 강등(exit 0) ──
     dept = _socket_dept()
@@ -775,10 +990,12 @@ def cmd_run():
                        "solo_awakening": True, "dept": dept,
                        "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
                        "boot_last": BOOT_LAST}
-            log.data["result"] = {"ok": True, "solo_awakening": True, "reason": why}
-            _atomic_write_json(BOOT_LAST, log.data)
+            # ★A7 채널 보존: solo_awakening 은 **성공** 경로이므로 stdout 최종 JSON 을 유지한다
+            #   (session-start 산문 계약 "완료 선언은 최종 JSON 인용 시에만"의 소비 대상).
+            log.result(ok=True, state="solo_awakening", solo_awakening=True, reason=why,
+                       exit=EXIT_OK)
             print(json.dumps(summary, ensure_ascii=False))
-            return 0
+            return EXIT_OK
         log.step("③″ceo-ticket", 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
@@ -791,7 +1008,7 @@ def cmd_run():
     if has_deficit:
         gate_rc = _run_resource_gate(py, log)
         if gate_rc is not None:
-            return gate_rc  # 9 = 자원 hard_block(팀 기동 0·escalation)
+            return gate_rc  # EXIT_RESOURCE_HARD(9) = 자원 hard_block(팀 기동 0·escalation)
 
         # ④ 4종 의무 노드 기동 — 결손>0에서만 호출(결손 0=스폰 경로 미진입)
         _progress("④ 4종 의무 노드 기동 중(최대 300s)…")
@@ -799,7 +1016,7 @@ def cmd_run():
         log.step("④boot", code, out)
         if code != 0:
             # 티켓은 아직 미소비 — boot 실패(exit 4)면 보존돼 재시도 가능(R2-LOW-C)
-            return log.fail("④boot", code, out, 4)
+            return log.fail("④boot", code, out, EXIT_BOOT)
 
         # 부서 레인 CEO 티켓 소비 — ④ boot **성공 직후**(실스폰 발생)에만 1회성 소비(R2-LOW-C):
         # "1회성 티켓 ⟺ 실스폰" 불변식. 착수 전 소각은 boot 실패 시 재시도 티켓까지 태웠다.
@@ -832,7 +1049,7 @@ def cmd_run():
             time.sleep(CHECK_INTERVAL_S)
     if code != 0:
         return log.fail("⑤check", code,
-                        "%d회 재시도 후에도 의무 노드 미기동:\n%s" % (CHECK_RETRIES, out), 6)
+                        "%d회 재시도 후에도 의무 노드 미기동:\n%s" % (CHECK_RETRIES, out), EXIT_CHECK)
 
     # ⑥ 완료 마커 — ⑤ exit 0에서만 도달. base 소켓 가드(부서 부트는 base 마커 무접촉).
     if _is_base_socket():
@@ -862,10 +1079,10 @@ def cmd_run():
     summary = {"ok": True, "marker": marker_note,
                "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
                "boot_last": BOOT_LAST}
-    log.data["result"] = {"ok": True}
-    _atomic_write_json(BOOT_LAST, log.data)
+    # ★A7 채널 보존: 완주는 stdout 최종 JSON(구 산문 계약의 유일한 인용 근거)이다.
+    log.result(ok=True, state="completed", exit=EXIT_OK)
     print(json.dumps(summary, ensure_ascii=False))
-    return 0
+    return EXIT_OK
 
 
 def cmd_status():
@@ -1102,6 +1319,14 @@ def cmd_self_test():
     return 0
 
 
+_USAGE = """usage: javis_bootstrap.py [run|status|assert-ready|issue-ticket --dept <name>] [--self-test]
+  (인자 없음 = run)
+exit: 0=완료/단독각성 · 3=ping · 4=boot · 5=assert-ready 게이트 · 6=check ·
+      7=claim 정당거부 · 8=레인↔팩 · 9=자원 hard_block · 10=세션 컨텍스트 오류 ·
+      11=skipped_inflight(정상 skip) · 64=EX_USAGE(사용오류)
+"""
+
+
 def main(argv):
     # preflight/CI 호환: `--self-test`는 subcommand 없이도 동작(가로채기).
     if "--self-test" in argv:
@@ -1109,8 +1334,17 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd == "issue-ticket":
         return cmd_issue_ticket(argv[2:])
-    return {"run": cmd_run, "status": cmd_status,
-            "assert-ready": cmd_assert_ready}.get(cmd, cmd_run)()
+    table = {"run": cmd_run, "status": cmd_status, "assert-ready": cmd_assert_ready}
+    fn = table.get(cmd)
+    if fn is None:
+        # ★A14: 구 `.get(cmd, cmd_run)` 는 **미지 입력의 기본값을 최대 부작용**(전면 부트)으로 뒀다 —
+        #   오타 한 글자('runn'·'--status')가 좌석 탈취·CEO 티켓 소비 같은 비가역 부작용을 일으켰다.
+        #   미지 서브커맨드는 거부한다(fail-closed) — EX_USAGE(64)는 게이트 exit 공간(2·3·…·11)과
+        #   겹치지 않아 소비처가 '사용오류'를 판정 결과로 오독하지 않는다(RC2 타입드 종료).
+        sys.stderr.write("[bootstrap] 미지 서브커맨드: %r — 실행하지 않았다(부작용 0).\n%s"
+                         % (cmd, _USAGE))
+        return EXIT_USAGE
+    return fn()
 
 
 if __name__ == "__main__":

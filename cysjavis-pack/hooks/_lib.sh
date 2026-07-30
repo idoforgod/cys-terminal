@@ -175,6 +175,53 @@ cys_fix_locale() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5-b. 데드라인 실행기 (A5 훅면 — 판정 호출의 hang 차단)
+# ─────────────────────────────────────────────────────────────────────────────
+# `cys surface-role` 같은 **판정 조회**가 데몬 미응답으로 행 걸면 훅이 사용자 프롬프트를
+# 무한정 붙잡는다. GNU `timeout(1)`은 **macOS 기본 설치에 없다**(coreutils 미설치 기계) —
+# session-start.sh:96-100 은 그래서 `command -v timeout` 분기를 쓰지만, 부재 시 그냥
+# 타임아웃 없이 실행해 hang 표면을 그대로 남겼다. 여기서는 3단으로 해소한다:
+#   ① timeout(1) → ② gtimeout(1)(coreutils) → ③ CYS_PY 기반 실행기(가장 흔한 macOS 경로)
+#   ④ 셋 다 없으면 무-데드라인 직접 실행(정직한 강등 — 조용한 실패보다 낫다)
+# 반환 코드는 실행 대상의 것을 그대로 전달하고, **타임아웃은 124**(GNU 관례)다.
+# ★stdout 은 건드리지 않는다(호출측 `$(...)` 회수 계약 유지 · 프리루드 계약 ⓑ).
+cys_timeout_run() {
+  _cys_to="${1:-2}"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_cys_to" "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_cys_to" "$@"
+    return $?
+  fi
+  if [ -n "${CYS_PY:-}" ]; then
+    # ★프로세스 **그룹** 종료: 대상만 죽이면 손자(대상이 띄운 자식)가 stdout 파이프를 계속 붙잡아
+    #   호출측 `$(...)` 가 EOF 를 못 받고 그대로 행 걸린다(데드라인이 사실상 무효 — 실측 확인).
+    #   그래서 새 세션으로 스폰하고 타임아웃 시 그룹 전체에 SIGKILL 을 보낸다.
+    "$CYS_PY" -c 'import os,signal,subprocess,sys
+try:
+    p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+except FileNotFoundError:
+    sys.exit(127)
+except Exception:
+    sys.exit(126)
+try:
+    sys.exit(p.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception:
+        p.kill()
+    sys.exit(124)' "$_cys_to" "$@"
+    return $?
+  fi
+  "$@"
+  return $?
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 6. 상태 경로 (A17 훅면 — HOME 부재 backfill)
 # ─────────────────────────────────────────────────────────────────────────────
 # Windows 비로그인 셸(`bash -c`)은 HOME이 없어 `$HOME/.cys/state` 가 `/.cys/state` 로
