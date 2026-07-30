@@ -7,7 +7,7 @@ use chrono::{Datelike, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -872,41 +872,19 @@ fn warn_shell_fallback(daemon: &Arc<Daemon>, flag: &str) {
     }
 }
 
-/// 스케줄 발화 자식에 얹을 env 주입 쌍(순수 — 회귀 핀·OS 무관 컴파일).
-/// ① PATH: 동봉 runtime 선두 주입. 데몬은 GUI(Explorer/Finder) 기동이라 PATH 가 빈곤해
-///    python3·printf·tail 을 못 찾는다 — office-bridge/auto-restore 와 **동일 SOT**
-///    (`cys::runtime_prefixed_path`)를 재사용한다(중복 구현 금지). 무변경이면 쌍 없음.
-/// ② HOME: Windows 의 `bash -c` 는 비로그인 셸이라 HOME 이 없으면 잡 페이로드의
-///    `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로 붕괴한다 → 미설정일 때만
-///    USERPROFILE 로 채운다. HOME 이 이미 있으면 무접촉(unix 는 항상 이 경로 → 무변경).
-fn spawn_env_pairs(
-    exe_dir: &Path,
-    current_path: &str,
-    home: Option<&str>,
-    userprofile: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
-        env.push(("PATH".to_string(), newp));
-    }
-    if home.map(|h| h.is_empty()).unwrap_or(true) {
-        if let Some(up) = userprofile.filter(|u| !u.is_empty()) {
-            env.push(("HOME".to_string(), up.to_string()));
-        }
-    }
-    env
-}
-
+/// 스케줄 발화 자식에 얹을 env 주입 쌍 — ★T-0147-7 W1a(A17)에서 **`cys::spawn_env_pairs` 로 승격**했다.
+/// 같은 규약(PATH 선두주입 + HOME←USERPROFILE backfill)이 pane 스폰(state.rs)에도 필요한데 사본이
+/// 없어 Windows pane 이 `$HOME` 붕괴로 훅 발화를 잃었다 — 사본 증식 대신 lib 단일 소유로 옮겼다.
+/// 회귀 핀(아래 `spawn_env_injects_runtime_path_and_backfills_home`)은 이제 `cys::spawn_env_pairs`
+/// 를 직접 호출해 **lib 구현 자체**를 결박한다 — 사본이 아니라 SOT 를 검증한다(RC1).
+///
 /// spawn_env_pairs 를 현재 프로세스 env 로 계산해 명령에 적용한다(run_text_command·fire_command 공용).
 fn apply_spawn_env(cmd: &mut tokio::process::Command) {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let path = std::env::var("PATH").unwrap_or_default();
-    let home = std::env::var("HOME").ok();
-    let userprofile = std::env::var("USERPROFILE").ok();
-    for (k, v) in spawn_env_pairs(&exe_dir, &path, home.as_deref(), userprofile.as_deref()) {
+    for (k, v) in cys::spawn_env_pairs_from_process(&exe_dir) {
         cmd.env(k, v);
     }
 }
@@ -1395,7 +1373,7 @@ mod tests {
             now_epoch().to_bits()
         ));
         std::fs::create_dir_all(&exe_dir).unwrap();
-        let pairs = spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None);
+        let pairs = cys::spawn_env_pairs(&exe_dir, "/usr/bin:/bin", Some("/Users/user"), None);
         let path = pairs
             .iter()
             .find(|(k, _)| k == "PATH")
@@ -1411,14 +1389,14 @@ mod tests {
             "HOME 이 이미 있으면 무접촉(unix 무변경 보장)"
         );
         // HOME 부재(Windows bash -c 비로그인 셸) → USERPROFILE 로 보정.
-        let win = spawn_env_pairs(&exe_dir, "/usr/bin", None, Some("C:\\Users\\me"));
+        let win = cys::spawn_env_pairs(&exe_dir, "/usr/bin", None, Some("C:\\Users\\me"));
         assert_eq!(
             win.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str()),
             Some("C:\\Users\\me"),
             "HOME 미설정이면 ${{HOME}} 전개가 붕괴한다 — USERPROFILE 로 채워야 한다"
         );
         // 빈 문자열 USERPROFILE 은 보정 근거가 못 된다(빈 HOME 을 심으면 경로가 더 나빠진다).
-        let neither = spawn_env_pairs(&exe_dir, "/usr/bin", None, Some(""));
+        let neither = cys::spawn_env_pairs(&exe_dir, "/usr/bin", None, Some(""));
         assert!(!neither.iter().any(|(k, _)| k == "HOME"));
         let _ = std::fs::remove_dir_all(&exe_dir);
     }

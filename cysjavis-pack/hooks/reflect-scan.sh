@@ -6,17 +6,28 @@
 # 안전: graceful, 반드시 exit 0 (hook 실패가 세션을 깨지 않게). 자동적용·자동수정 0(shadow).
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(reflect-scan)" >&2; exit 0; }
+
 INPUT=$(cat 2>/dev/null)
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 ROOT="${CYS_ROOT:-$HOME}"
 
-TRANSCRIPT=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+# G22: 인터프리터 경성 참조(python3) 제거 — 프리루드가 python3→python→py로 해소.
+# 미해소(빈 값)면 이 훅은 판정 재료를 얻을 수 없으므로 조용히 통과한다(기존 graceful 계약 유지).
+[ -n "$CYS_PY" ] || exit 0
+
+TRANSCRIPT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('transcript_path',''))
 except Exception: print('')" 2>/dev/null)
-CWD=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
 except Exception: print('')" 2>/dev/null)
-case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (무한루프 방지)
+# G19: 드라이브/UNC 경로 정규화 후 절대경로 판정(Windows `C:\` cwd 공란화 해소·POSIX 무변경)
+CWD="$(cys_norm_cwd "$CWD")"
+cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (무한루프 방지)
 
 # _round 상향탐색 (save-state.sh와 동일 규약) → fallback ACTIVE_PROJECT
 DIR="$CWD"; RD=""; PREV=""
@@ -35,13 +46,13 @@ NOW=$(date -Iseconds 2>/dev/null || date)
 
 # ① 반복신호 light scan → RSI_LEDGER.md SHADOW 후보 (임계3·멱등·자동적용0)
 if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] && [ -f "$PACK/bin/javis_reflect.py" ]; then
-  python3 "$PACK/bin/javis_reflect.py" scan --transcript "$TRANSCRIPT" \
+  "$CYS_PY" "$(cys_native_path "$PACK/bin/javis_reflect.py")" scan --transcript "$TRANSCRIPT" \
     --ledger "$RD/RSI_LEDGER.md" >/dev/null 2>&1
 fi
 
 # ③ 종료 시 장기기억 정합 verify — 깨졌으면 .state_log에 경고만(자동수정 0)
 if [ -f "$PACK/bin/javis_memory.py" ]; then
-  if ! python3 "$PACK/bin/javis_memory.py" verify >/dev/null 2>&1; then
+  if ! "$CYS_PY" "$(cys_native_path "$PACK/bin/javis_memory.py")" verify >/dev/null 2>&1; then
     echo "$NOW	WARN:memory	장기기억 색인↔파일 정합 깨짐 — javis_memory.py verify 확인 필요" \
       >> "$RD/.state_log" 2>/dev/null
   fi

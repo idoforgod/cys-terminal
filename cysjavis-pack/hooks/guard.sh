@@ -21,6 +21,13 @@
 # ★fail-closed: 파싱불가·미해석·allowlist밖 → deny.
 set -u
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+# ★이 훅은 GATE 클래스지만 프리루드 소실은 '가드 판정 불가'가 아니라 '가드 미설치'다 —
+#   exit 0(강등)이 계약이다. 프리루드 실재는 preflight 핀 체크가 별도로 감시한다(이중 방어).
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(guard)" >&2; exit 0; }
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
@@ -41,8 +48,13 @@ fi
 
 INPUT="$(cat)"
 
+# G22: 인터프리터 후보에 python·py 추가 — Windows에는 `python3` 명령이 없고 python/py만 있는
+# 경우가 흔하다. 후보 **순서 = 우선순위**이고 절대경로 후보(homebrew·/usr/bin)는 PATH 빈곤 환경
+# (GUI 기동)의 belt-and-braces다. 프리루드가 해소한 CYS_PY를 최우선 후보로 둔다(단일 SOT).
 PYBIN=""
-for c in python3 /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
+for c in "${CYS_PY:-python3}" python3 python py \
+         /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
+  [ -n "$c" ] || continue
   if command -v "$c" >/dev/null 2>&1; then PYBIN="$(command -v "$c")"; break; fi
   [ -x "$c" ] && PYBIN="$c" && break
 done
@@ -113,19 +125,28 @@ def norm_base(s):
     s = _strip_hidden(s)
     return s
 
+# ★G18(T-0147-7 W1a): 경로 판정을 **정규화 경로** 기반으로 — 백슬래시 무음 우회 차단.
+# 종전 `t.rsplit("/",1)[-1]` 은 Windows 경로 `C:\Users\me\.claude\soul.md` 에 '/' 가 없어
+# **전체 문자열을 basename 으로 돌려주었다** → protected()·guard_infra() 가 전부 미스 →
+# 헌법파일 쓰기·guard 자기보호가 Windows에서 무음 통과였다(실측 정적 판독 · 검체 H-WIN-1).
+def norm_path(t):
+    return (t or "").replace("\\", "/")
+
 def basename(t):
     # .strip(): file_path 의 trailing 개행/공백(예: jq -Rs 산물·은닉)이 매칭 회피하는 것 차단(fail-closed)
-    return t.rsplit("/", 1)[-1].strip()
+    return norm_path(t).rsplit("/", 1)[-1].strip()
+
+PROTECTED_NAMES = ("soul.md", "claude.md", "vibecoding_constitution.md",
+                   "vibecoding_enforcement.md", "route_contract.md")
 
 def protected(name):
     n = basename(name).lower()
-    return n in ("soul.md", "claude.md", "vibecoding_constitution.md",
-                 "vibecoding_enforcement.md", "route_contract.md") or n.endswith("_directive.md")
+    return n in PROTECTED_NAMES or n.endswith("_directive.md")
 
 # 잔여3(R3): STRICT Write/Edit 가 건드리면 안 되는 guard 인프라(디렉터리 전체)
 def guard_infra(fp):
     b = basename(fp).lower()
-    if "_round/autopilot/" in fp:
+    if "_round/autopilot/" in norm_path(fp):   # G18: 백슬래시 경로도 같은 판정
         return True
     if b == "constitution_edit_authorized":   # ★인가 토큰 — STRICT 중 생성 차단(자율주행 자기인가 방지)
         return True
@@ -173,7 +194,8 @@ def redirect_safe(target):
         return False
     if target == "/dev/null":
         return True
-    return ("_round/autopilot/" in target) and (".." not in target)
+    t = norm_path(target)                       # G18: 백슬래시 경로도 같은 판정
+    return ("_round/autopilot/" in t) and (".." not in t)
 
 def extract_commands(toks):
     cmds = []
@@ -352,6 +374,16 @@ def norm_loose(s):
     s = re.sub(r"([<>])", r" \1 ", s)
     return " ".join(s.split())
 
+def norm_loose_slash(s):
+    """G18 보조 변형 — 백슬래시를 '삭제'가 아니라 '/'로 바꾼다. 보호파일 basename 스캔에만 쓴다.
+    norm_loose 의 백슬래시 **삭제**는 `s\\oul.md` 류 이스케이프 회피를 무력화하는 장치인데, 같은
+    삭제가 Windows 경로 `C:\\Users\\me\\soul.md` 의 basename 경계도 지워 보호 판정을 미스한다.
+    두 변형을 **모두** 스캔하면 양쪽이 다 막힌다 — 추가 deny만 발생하고 기존 통과 경로는 불변."""
+    s = norm_base(s)
+    s = s.replace('"', "").replace("'", "").replace("\\", "/")
+    s = re.sub(r"([<>])", r" \1 ", s)
+    return " ".join(s.split())
+
 def l_words(seg): return seg.split()
 def l_strip_env(ws):
     i = 0
@@ -377,7 +409,10 @@ def l_git_sub(args):
     return None, []
 WHITELIST_DIR = "_round/autopilot/"
 def l_fileop_allowed(args):
-    nonflag = [a for a in args if not a.startswith("-") and a not in ("+x", "-x") and not re.match(r"^[0-7]{3,4}$", a)]
+    # G18: 경로 판정 전 정규화 — 백슬래시 경로가 '경로가 아닌 것'으로 오분류되면
+    # 화이트리스트 밖 파괴 연산이 통과한다(fail-open 방향 오류).
+    nonflag = [norm_path(a) for a in args
+               if not a.startswith("-") and a not in ("+x", "-x") and not re.match(r"^[0-7]{3,4}$", a)]
     paths = [a for a in nonflag if "/" in a]
     if not paths and not nonflag:
         return False
@@ -387,7 +422,7 @@ def l_fileop_allowed(args):
             return False
     return True
 
-def loose_deny(n):
+def loose_deny(n, n_slash=""):
     for seg in l_segments(n):
         prog, args = l_cmd_word(seg)
         if prog is None: continue
@@ -426,7 +461,8 @@ def loose_deny(n):
                 up = any(a.startswith("--post-data") or a.startswith("--post-file") or a.startswith("--method=post") for a in (x.lower() for x in args))
             if up:
                 return "%s 업로드/POST (외부전송). 박사님 승인 필요" % prog
-    alltoks = n.split()
+    # G18: 두 정규화 변형(백슬래시 삭제형 + 슬래시 변환형)의 토큰을 합쳐 보호파일을 스캔한다.
+    alltoks = n.split() + (n_slash.split() if n_slash else [])
     if any(protected(t) for t in alltoks):
         writers = {"tee", "cp", "dd", "mv", "install", "ln", "truncate", "patch", "vim", "vi", "nano", "emacs", "ex"}
         sed_inplace = False; seg_progs = set()
@@ -459,7 +495,7 @@ if tool == "Bash" and command:
         r = strict_deny(command)
         if r: out_deny("[STRICT] " + r)
     else:
-        r = loose_deny(norm_loose(command))
+        r = loose_deny(norm_loose(command), norm_loose_slash(command))
         if r:
             # P1-2 HMAC 서명 우회: master가 서명한 명령 접두는 LOOSE deny를 우회한다.
             # cys approval check exit 0 = 서명됨 → 허용 / 미서명·cysd미가용 = fail-closed(deny 유지).

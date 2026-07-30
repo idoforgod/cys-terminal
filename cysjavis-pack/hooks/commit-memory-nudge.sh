@@ -6,8 +6,15 @@
 # 안전: graceful, 반드시 exit 0. 넛지(리마인더)만 — 강제 아님.
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(commit-memory-nudge)" >&2; exit 0; }
+# G22: 인터프리터 경성 참조 제거. 미해소면 넛지 재료를 못 얻으므로 조용히 통과(기존 계약).
+[ -n "$CYS_PY" ] || exit 0
+
 INPUT=$(cat 2>/dev/null)
-CMD=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+CMD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('tool_input',{}).get('command',''))
 except Exception: print('')" 2>/dev/null)
 
@@ -22,9 +29,9 @@ case "$CMD" in
   *"--dry-run"*) exit 0 ;;
 esac
 
-MSG='방금 git commit 했다. 이 커밋이 아키텍처 결정·중요 피드백·비자명 접근법이면 장기기억 증류를 고려하라(작성은 master 판단 — 자동작성 0): python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_memory.py" add --type feedback|project --name <slug> --desc "<한 줄>" --outcome success|failure|neutral --body "<사실>". 단순 수정·리팩터·문서오타면 무시. (shadow 넛지 — 강제 아님)'
+MSG='방금 git commit 했다. 이 커밋이 아키텍처 결정·중요 피드백·비자명 접근법이면 장기기억 증류를 고려하라(작성은 master 판단 — 자동작성 0): '"${CYS_PY:-python3}"' "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_memory.py" add --type feedback|project --name <slug> --desc "<한 줄>" --outcome success|failure|neutral --body "<사실>". 단순 수정·리팩터·문서오타면 무시. (shadow 넛지 — 강제 아님)'
 
 # PostToolUse additionalContext 로 master 컨텍스트에 주입 (python으로 JSON 안전 생성)
-printf '%s' "$MSG" | python3 -c "import json,sys
+printf '%s' "$MSG" | "$CYS_PY" -c "import json,sys
 print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse','additionalContext':sys.stdin.read()}}, ensure_ascii=False))" 2>/dev/null
 exit 0

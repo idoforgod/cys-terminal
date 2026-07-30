@@ -14,13 +14,18 @@
 #   실패해도 사이클이 더 자주 도는 게 아니라 오너 보호가 약해지는 쪽임을 문서화한다.
 #
 # 안전: **무출력**(UserPromptSubmit 의 stdout 은 모델 컨텍스트로 주입된다 — 오염 금지)·항상 exit 0.
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/../_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(owner-active)" >&2; exit 0; }
 set +e
 [ -n "$CYS_STATE_LEDGER_DISABLE" ] && exit 0
 
 IN=$(cat 2>/dev/null)
 [ -n "$IN" ] || exit 0
 
-PY="$(command -v python3 || command -v python || command -v py)"
+# G22: 인터프리터 해소는 프리루드 단일 소유(python3→python→py). 사본 재구현 금지(RC4).
+PY="${CYS_PY:-}"
 [ -n "$PY" ] || exit 0
 
 # 선두 공백을 제거한 뒤 첫 글자를 본다(설계의 '첫 문자' 를 공백 내성으로 확장 — IMPL_NOTES 기재).

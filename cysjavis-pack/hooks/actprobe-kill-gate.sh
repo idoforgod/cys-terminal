@@ -13,14 +13,22 @@
 
 set -u
 
-# ── python3 해석 (없으면 hook JSON 파싱 불가 = 인프라 fail-open) ───────────
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(actprobe-kill-gate)" >&2; exit 0; }
+
+# ── 인터프리터 해석 (없으면 hook JSON 파싱 불가 = 인프라 fail-open) ───────────
+# G22: 후보에 python·py 추가(Windows는 python3 명령이 없다). 프리루드 해소값을 최우선 후보로.
 PYBIN=""
-for c in python3 /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
+for c in "${CYS_PY:-python3}" python3 python py \
+         /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
+  [ -n "$c" ] || continue
   if command -v "$c" >/dev/null 2>&1; then PYBIN="$(command -v "$c")"; break; fi
   [ -x "$c" ] && { PYBIN="$c"; break; }
 done
 if [ -z "$PYBIN" ]; then
-  echo "kill-gate: WARN python3 부재 — hook JSON 파싱 불가 · fail-open" >&2
+  echo "kill-gate: WARN python(3) 부재 — hook JSON 파싱 불가 · fail-open" >&2
   exit 0
 fi
 
@@ -47,7 +55,12 @@ ti = d.get("tool_input") or {}
 cmd = ti.get("command") if isinstance(ti, dict) else None
 cmd = cmd if isinstance(cmd, str) else ("" if cmd is None else str(cmd))
 
-KILL = {"kill", "pkill", "killall"}
+# ★G21(T-0147-7 W1a): KILL 동사 집합에 Windows 종료 동사 `taskkill` 추가.
+#   종전 집합은 POSIX 3동사만이라 Windows의 실제 종료 경로가 가드를 **완전히 우회**했다
+#   (파괴 경로는 이식됐는데 보호 술어는 미이식 — B13과 같은 비대칭 클래스).
+#   `taskkill /F /PID 1234` → pid 추출 성공 → probe / `taskkill /IM claude.exe` → NOPID →
+#   이름 기반이라 fail-closed 차단(정책 그대로).
+KILL = {"kill", "pkill", "killall", "taskkill"}
 # 투명 래퍼(뒤 토큰이 실제 명령) — sudo kill 등이 under-block 되지 않게 스킵
 WRAP = {"sudo", "nohup", "exec", "command", "time", "doas", "builtin", "env", "then", "do"}
 
@@ -178,10 +191,27 @@ run_probe() {
     _out="$("$PYBIN" "$ACTPROBE" kill-preflight --pid "$_pid" 2>&1)"; _rc=$?
   fi
   _reason="${_out#*: }"            # actprobe 접두 "[VERDICT] probe pid: " 제거
+  # ── ★G21: rc=2/3 을 **출력 형상**으로 '판정' vs '인프라 실패' 로 분리 ──
+  # exit 2/3 은 actprobe의 판정 코드(FAIL/INDET)인데 **동시에** 사용오류의 코드이기도 하다:
+  # argparse 서브파서 오류·미지 인자·python SystemExit(2) 가 같은 숫자로 나온다. 종전 코드는
+  # 그 전부를 '판정'으로 읽어 **인프라 실패를 차단으로 승격**했다 — 헤더 §2.3이 명문화한
+  # fail-OPEN 정책의 역전이다(부트·온보딩 무해 보장 파괴).
+  # 판정 출력은 `[FAIL] …` / `[INDET] …` verdict 토큰을 반드시 포함한다(javis_actprobe.py:584).
+  # 토큰이 없으면 인프라 실패로 보고 정책대로 fail-open + WARN.
   case "$_rc" in
     0)   return 0 ;;                                       # PASS → 이 pid 허용
-    2)   emit_deny "kill-preflight FAIL: $_reason" ;;      # FAIL → 차단
-    3)   emit_deny "kill-preflight INDET: $_reason" ;;     # 판정불가 → 안전측 차단
+    2)
+      case "$_out" in
+        *"[FAIL]"*) emit_deny "kill-preflight FAIL: $_reason" ;;   # 판정 → 차단
+        *) echo "kill-gate: WARN actprobe rc=2 인데 verdict 형상 아님(사용오류·인프라): $_out — fail-open" >&2
+           exit 0 ;;
+      esac ;;
+    3)
+      case "$_out" in
+        *"[INDET]"*) emit_deny "kill-preflight INDET: $_reason" ;; # 판정불가 → 안전측 차단
+        *) echo "kill-gate: WARN actprobe rc=3 인데 verdict 형상 아님(인자 오류 등): $_out — fail-open" >&2
+           exit 0 ;;
+      esac ;;
     124) echo "kill-gate: WARN actprobe 타임아웃 (pid $_pid) — fail-open" >&2; exit 0 ;;
     *)   echo "kill-gate: WARN actprobe 예상밖 rc=$_rc (pid $_pid): $_out — fail-open" >&2; exit 0 ;;
   esac

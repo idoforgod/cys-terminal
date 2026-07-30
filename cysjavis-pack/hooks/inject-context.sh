@@ -6,10 +6,16 @@
 # 경로: SOUL·ROOT는 환경변수(CYS_SOUL·CYS_ROOT)로 오버라이드 가능. 미설정 시 portable 기본값(아래).
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
+
 INPUT=$(cat 2>/dev/null)
 [ -z "$INPUT" ] && exit 0
-# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
-CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
+# 인터프리터 해소는 프리루드(python3→python→py). 이 훅의 기존 계약(비어 있으면 안 됨)은
+# 자기 자리에서 명시 폴백한다 — 계약 무변경(미해소 시 graceful degrade).
+[ -n "$CYS_PY" ] || CYS_PY="python3"
 
 # JSON stdin 을 python 1회 스폰으로 source·cwd 동시 파싱(콜드스타트 절감 — 기존 2회 스폰 병합).
 # __CYS_END__ sentinel 로 cwd 공백 시에도 필드 경계를 결정론 보존($()가 후행 개행을 삭제해도
@@ -23,7 +29,12 @@ except Exception:
 print('__CYS_END__')" 2>/dev/null)
 { IFS= read -r SOURCE; IFS= read -r CWD; } <<< "$_PARSED"
 [ -z "$SOURCE" ] && SOURCE="startup"
-case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
+# ── G19: 절대경로 게이트를 드라이브 경로까지 (Windows `C:\proj` cwd 공란화 해소) ──
+# 종전의 `/*` 전용 glob 게이트는 `C:\Users\x` 를 상대경로로 보고 CWD를 공란화해 SESSION_STATE
+# 상향탐색을 전면 불능화했다(Windows 전 설치). 드라이브/UNC 경로만 슬래시 정규화한 뒤
+# 프리루드 술어로 판정한다 — POSIX 경로는 바이트 무변경(회귀 0).
+CWD="$(cys_norm_cwd "$CWD")"
+cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
 SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
 [ -f "$SOUL" ] || SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자)
@@ -63,12 +74,23 @@ fi
 
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
 DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""
-case "$CYS_PACK_DIR" in */pack-dept-dept-*) DEPT_CTX=1 ;; esac
-case "$CYS_SOCKET"   in */cys-dept-dept-*)  DEPT_CTX=1 ;; esac
+# ── G4+G20: 부서 레인 감지 글롭 수리 (명명 부서 + Windows 파이프·백슬래시) ──
+# 종전 글롭 `*/pack-dept-dept-*` · `*/cys-dept-dept-*` 는 부서명이 문자 그대로 `dept-N` 인
+# 경우만 매칭했다 → **명명 부서**(pack-dept-sales)는 부서 컨텍스트로 인식되지 않아 메인 레인
+# SESSION_STATE가 오주입되고(G4·격리 파괴), Windows named pipe(`\\.\pipe\cys-dept-sales`)·
+# 백슬래시 경로는 슬래시 글롭에 아예 걸리지 않았다(G20).
+# ★판정 SOT는 python `javis_bootstrap._pack_dept`(팩 **basename**이 `pack-dept-` 로 시작) ·
+#   `_socket_dept`(경로 **성분**이 `cys-dept-` 로 시작)다 — 두 술어를 정규화 후 그대로 미러한다
+#   (셸↔python 판정 일치 = parity 검체 H-WIN-3/H-PRED-6의 대상).
+_PACK_N="$(cys_norm_path "${CYS_PACK_DIR:-}")"
+_PACK_BASE="${_PACK_N%/}"; _PACK_BASE="${_PACK_BASE##*/}"
+_SOCK_N="$(cys_norm_path "${CYS_SOCKET:-}")"
+case "$_PACK_BASE" in pack-dept-?*) DEPT_CTX=1 ;; esac
+case "/$_SOCK_N" in */cys-dept-?*) DEPT_CTX=1 ;; esac
 if [ -n "$DEPT_CTX" ]; then
-  case "$CYS_PACK_DIR" in
-    */pack-dept-dept-*) DEPT_ROUND="$CYS_PACK_DIR/round" ;;
-    *)                  DEPT_NO_STATE=1 ;;
+  case "$_PACK_BASE" in
+    pack-dept-?*) DEPT_ROUND="$CYS_PACK_DIR/round" ;;
+    *)            DEPT_NO_STATE=1 ;;
   esac
   if [ -n "$DEPT_ROUND" ] && [ -f "$DEPT_ROUND/SESSION_STATE.md" ]; then
     STATE="$DEPT_ROUND/SESSION_STATE.md"; STATE_DIR="$DEPT_ROUND"
@@ -120,8 +142,12 @@ fi
 
 # ---------- ★동일 cwd 다중 세션 감지 (위험 #3: SESSION_STATE 편집 race 방어) ----------
 # 같은 작업폴더(CWD)에서 도는 살아있는 claude 세션을 lsof로 실시간 카운트. 2개+면 경고.
+# ── G33: 계측기 자체가 대상을 못 재던 결함 수리 ──
+# 종전 `lsof -c node` 는 **node로 실행되는 claude**만 셌다. claude Code는 네이티브 바이너리
+# (comm=claude)로 설치되는 경로가 주류라 이 경고는 상시 불발이었다(계측기 타당성 실패 — MEMORY
+# '디버깅 계측 타당성 게이트'와 동일 클래스). `-c` 는 반복 지정이 OR이라 스폰 1회로 둘 다 센다.
 if command -v lsof >/dev/null 2>&1 && [ -n "$CWD" ]; then
-  SHARE=$(lsof -c node -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
+  SHARE=$(lsof -c node -c claude -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
   if [ "${SHARE:-0}" -ge 2 ]; then
     OUT="${OUT}⚠ 같은 작업폴더($(_esc "$CWD"))에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
   fi

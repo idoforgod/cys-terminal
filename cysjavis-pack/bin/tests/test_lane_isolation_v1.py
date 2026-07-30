@@ -112,6 +112,11 @@ class HookBootAbsent(unittest.TestCase):
         env["CYS_PACK_DIR"] = pack
         env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
         env.pop("CYS_SOCKET", None)
+        # ★A2 surface 이중 게이트(T-0147-7 W1a): 훅은 cys pane 안에서만 발화한다. 이 케이스는
+        # 'cys pane 안의 빈 팩'을 재현하므로 CYS_SURFACE_ID를 **명시** 주입한다 — os.environ
+        # 상속에 의존하면 결과가 실행 위치(cys pane 안/밖)에 따라 흔들린다(결정론 파괴).
+        env["CYS_SURFACE_ID"] = "9"
+        env.pop("AITERM_SURFACE_ID", None)
         # timeout=20: 행 걸리면 TimeoutExpired로 테스트 실패(무행 요구 검증)
         r = subprocess.run(["bash", HOOK], input=json.dumps({"prompt": "너는 마스터다"}),
                            capture_output=True, text=True, timeout=20, env=env)

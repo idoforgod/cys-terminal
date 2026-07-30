@@ -1735,14 +1735,18 @@ impl Daemon {
         builder.env("PYTHONUTF8", "1");
         // 온보딩①: 데몬 옆 동봉 cys CLI + (Windows)동봉 runtime을 pane PATH 선두 주입 —
         // 신규 머신(심링크 없음)에서도 pane 속 AI가 `cys identify`·python3·bash를 즉시 쓴다.
-        // RC-5: GUI 직스폰과 공유하는 공용 fn(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.
+        // RC-5: GUI 직스폰과 공유하는 공용 fn 사용 — 중복 구현 금지.
+        // ★T-0147-7 W1a(A17): PATH 단독 주입 → `cys::spawn_env_pairs` 소비로 교체. 종전엔
+        //   **HOME backfill 이 schedule.rs 에만 있고 pane 스폰에는 없어서**, HOME 없는 Windows
+        //   데몬 env 를 상속한 pane 에서 `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로
+        //   붕괴했다 — 훅(role-bootstrap·session-start)이 팩을 못 찾아 발화가 무산되는 경로다.
+        //   unix 는 HOME 이 항상 있어 PATH 쌍만 나오므로 **제로 회귀**(검체 H-WIN-8).
         if let Some(bin_dir) = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
-            let cur = std::env::var("PATH").unwrap_or_default();
-            if let Some(newp) = cys::runtime_prefixed_path(&bin_dir, &cur) {
-                builder.env("PATH", newp);
+            for (k, v) in cys::spawn_env_pairs_from_process(&bin_dir) {
+                builder.env(k, v);
             }
         }
         builder.env(cys::ENV_SOCKET, self.socket_path.to_string_lossy().as_ref());

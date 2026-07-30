@@ -10,13 +10,18 @@
 #   렌더는 javis_state_ledger.py 가 2048B 로 캡하고, 여기서 head -c 2048 로 한 번 더 조인다.
 #
 # 안전: 실패 시 **무출력 exit 0**(복원 생명선을 깨지 않는다). 항상 exit 0.
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/../_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(state-ledger-inject)" >&2; exit 0; }
 set +e
 [ -n "$CYS_STATE_LEDGER_DISABLE" ] && exit 0
 
 # 훅 JSON stdin 은 사용하지 않지만 소비한다(쓰기측 EPIPE 회피).
 cat >/dev/null 2>&1
 
-PY="$(command -v python3 || command -v python || command -v py)"
+# G22: 인터프리터 해소는 프리루드 단일 소유(python3→python→py). 사본 재구현 금지(RC4).
+PY="${CYS_PY:-}"
 [ -n "$PY" ] || exit 0
 # 스크립트 해소(팩 갱신 면역): 명시 env > 팩 bin > 사용자 로컬 bin. 셋 다 없으면 무동작.
 BIN="${CYS_STATE_LEDGER_BIN:-}"

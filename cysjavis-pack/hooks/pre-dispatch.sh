@@ -32,6 +32,10 @@
 
 set -u
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(pre-dispatch)" >&2; exit 0; }
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR="."
 
 # 계약 ②: stdin 1회 버퍼링
@@ -42,8 +46,9 @@ TOOL=""
 if command -v jq >/dev/null 2>&1; then
   TOOL=$(printf '%s' "$IN" | jq -r '.tool_name // empty' 2>/dev/null)
 fi
-if [ -z "$TOOL" ] && command -v python3 >/dev/null 2>&1; then
-  TOOL=$(printf '%s' "$IN" | python3 -c 'import sys,json
+# G22: 경성 python3 → 프리루드 해소값(python3→python→py). 미해소면 아래 UNKNOWN superset 경로.
+if [ -z "$TOOL" ] && [ -n "${CYS_PY:-}" ]; then
+  TOOL=$(printf '%s' "$IN" | "$CYS_PY" -c 'import sys,json
 try:
     d=json.load(sys.stdin); print(d.get("tool_name") or "")
 except Exception:

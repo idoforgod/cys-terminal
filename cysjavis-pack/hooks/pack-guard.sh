@@ -7,8 +7,15 @@
 # 코얼레싱: 세션·파일당 1회만 경고(경고 피로 → 무시 학습 방지).
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(pack-guard)" >&2; exit 0; }
+# G22: 인터프리터 경성 참조 제거. 미해소면 판정 재료를 못 얻으므로 조용히 통과(기존 계약).
+[ -n "$CYS_PY" ] || exit 0
+
 INPUT=$(cat 2>/dev/null)
-FP=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+FP=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
   ti = json.load(sys.stdin).get('tool_input', {})
   print(ti.get('file_path', '') or ti.get('path', ''))
@@ -17,14 +24,17 @@ except Exception:
 [ -z "$FP" ] && exit 0
 
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
-case "$FP" in
-  "$PACK"/*) ;;
-  *) exit 0 ;;
-esac
-REL="${FP#"$PACK"/}"
+# ── G23: 팩 접두 판정 정규화 (Windows 백슬래시 미매칭 → vendor 수정 경고 무음) ──
+# 종전 `case "$FP" in "$PACK"/*)` 는 tool_input.file_path 가 `C:\Users\me\.cys\pack\hooks\x.sh`
+# 인데 PACK 이 `C:/Users/me/.cys/pack` (또는 반대)면 문자열이 안 맞아 **경고 자체가 안 났다**.
+# 정규화 후 접두 비교(프리루드 cys_path_has_prefix)로 양쪽 표기를 흡수한다.
+cys_path_has_prefix "$FP" "$PACK" || exit 0
+_FP_N="$(cys_norm_path "$FP")"; _PACK_N="$(cys_norm_path "$PACK")"
+_PACK_N="${_PACK_N%/}"
+REL="${_FP_N#"$_PACK_N"/}"
 
 # 세션·파일당 1회 코얼레싱 스탬프.
-SID=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+SID=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('session_id', 'nosession'))
 except Exception: print('nosession')" 2>/dev/null)
 STAMP_DIR="${TMPDIR:-/tmp}/cys-pack-guard"
@@ -40,6 +50,6 @@ OWN=$(cys pack-ownership --quiet "$REL" 2>/dev/null)
 
 MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 다음 부트 설치 스윕에 vendor 본으로 치유됩니다(수정본은 $REL.user 로 보존·병합 원장 기록). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ vendor 개선 제안은 cys pack-merge --file $REL --propose. (WARN — 차단 아님·개발 기계의 upstream 승격 작업이면 무시)"
 
-printf '%s' "$MSG" | python3 -c "import json,sys
+printf '%s' "$MSG" | "$CYS_PY" -c "import json,sys
 print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse','additionalContext':sys.stdin.read()}}, ensure_ascii=False))" 2>/dev/null
 exit 0

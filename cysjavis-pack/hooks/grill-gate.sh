@@ -20,20 +20,26 @@
 #       덮어쓰기)로도 게이트를 끌 수 있다 — 비악의 오작동 방지 threat model의 명시적 한계
 #       (적대 봉쇄가 필요하면 begin이 HMAC 서명·check가 검증하는 무결성 핀이 별도로 필요).
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(grill-gate)" >&2; exit 0; }
 # self-test는 엔진에 위임(preflight가 엔진 self-test를 직접 검증)
 if [ "${1:-}" = "--self-test" ]; then
   HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
-  exec python3 "$HOOK_DIR/../bin/grill_gate.py" --self-test
+  [ -n "${CYS_PY:-}" ] || exit 0
+  exec "$CYS_PY" "$(cys_native_path "$HOOK_DIR/../bin/grill_gate.py")" --self-test
 fi
 
-command -v python3 >/dev/null 2>&1 || exit 0       # fail-open: python 없음
+[ -n "${CYS_PY:-}" ] || exit 0                     # G22 fail-open: python(3) 해소 불가
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || exit 0
 GATE_PY="$HOOK_DIR/../bin/grill_gate.py"
 [ -f "$GATE_PY" ] || exit 0                          # fail-open: 엔진 없음
+GATE_PY_N="$(cys_native_path "$GATE_PY")"
 
 cat >/dev/null 2>&1   # PreToolUse stdin(hook JSON)은 check가 쓰지 않음 — 소비만
 
-python3 "$GATE_PY" check
+"$CYS_PY" "$GATE_PY_N" check
 rc=$?
 # 오직 명시적 floor 미충족(2)만 차단. 0·1·크래시 등 그 외 전부 통과(fail-open).
 [ "$rc" = "2" ] && exit 2

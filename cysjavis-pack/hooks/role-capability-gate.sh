@@ -41,9 +41,12 @@
 # - reviewer의 tmp/로그 write는 과도차단 방지를 위해 허용(검증 대상 경로 한정 — propmap T6-P3 §5).
 # - 검증: 내장 배터리 --self-test.
 
-# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(부트 실패 방지).
-CYS_PY="$(command -v python3 || command -v python || command -v py)"
-if [ -z "$CYS_PY" ]; then
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)" >&2; exit 0; }
+# 인터프리터 해소 — 프리루드 단일 소유(python3→python→py · G22). 사본 재구현 금지(RC4).
+if [ -z "${CYS_PY:-}" ]; then
   # python(3) 전무 — role을 알 수 없으니 안전측: reviewer 환경이면 막아야 하나 role 판별 불가.
   # 환경변수로 role 힌트가 있으면 그것으로 fail-closed, 없으면 통과(무역할 가정).
   case "${CYS_SURFACE_ROLE:-}" in

@@ -12,7 +12,14 @@
 # 설치(human-hold/denylist): 노드 settings.json PreToolUse 에 RTK cys-rewrite tuple **뒤** 등록.
 #   {"matcher":"","hooks":[{"type":"command","command":"$HOME/.cys/pack/hooks/serena-nudge.sh"}]}
 #   worker-only 권장(RTK U0 master-glob gap 회피 · stanza master skip 과 정합).
-exec python3 -c '
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(serena-nudge)" >&2; exit 0; }
+# G22: 인터프리터 경성 참조 제거. 미해소 = 넛지 불가 → 무해 통과(never-block 불변 유지).
+[ -n "${CYS_PY:-}" ] || exit 0
+
+exec "$CYS_PY" -c '
 import sys, json, os
 
 def out_empty():

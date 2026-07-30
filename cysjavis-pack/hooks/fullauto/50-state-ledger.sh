@@ -15,14 +15,18 @@
 #   ③ Write · _round/handoffs/*.md             → type=handoff  {name, path}
 #
 # 비활성 스위치: CYS_STATE_LEDGER_DISABLE=1 (설치 롤백 전 즉시 무력화용)
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/../_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(50-state-ledger)" >&2; exit 0; }
 set +e
 [ -n "$CYS_STATE_LEDGER_DISABLE" ] && exit 0
 
 IN=$(cat 2>/dev/null)
 [ -n "$IN" ] || exit 0
 
-# 인터프리터 해소(팩 관례 — Windows 는 python3 가 없고 python/py 만 있는 경우가 흔하다).
-PY="$(command -v python3 || command -v python || command -v py)"
+# G22: 인터프리터 해소는 프리루드 단일 소유(python3→python→py). 사본 재구현 금지(RC4).
+PY="${CYS_PY:-}"
 [ -n "$PY" ] || exit 0
 # 스크립트 해소(팩 갱신 면역): 명시 env > 팩 bin > 사용자 로컬 bin. 셋 다 없으면 무동작.
 BIN="${CYS_STATE_LEDGER_BIN:-}"

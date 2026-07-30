@@ -10,9 +10,15 @@
 #   3) 의존 도구(git)·경로 부재 시 조용히 skip(에러 출력 없이 exit 0).
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/../_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(vibe-doc-sync)" >&2; exit 0; }
+# G22: 인터프리터 경성 참조 제거. 미해소면 판정 재료를 못 얻으므로 조용히 통과(기존 계약).
+[ -n "$CYS_PY" ] || exit 0
 INPUT=$(cat 2>/dev/null)
 
-FP=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+FP=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))
 except Exception: print('')" 2>/dev/null)
 [ -n "$FP" ] || exit 0

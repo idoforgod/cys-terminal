@@ -9,13 +9,18 @@
 # - python3 부재·JSON 파싱 실패·판단 불가 → 허용(작업 차단보다 통과가 안전측).
 # 막는 경우는 오직: .appbuild 존재 + 05-gate.md 부재 + 대상이 소스 확장자일 때(exit 2).
 
-if ! command -v python3 >/dev/null 2>&1; then exit 0; fi   # fail-open
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(appbuild-gate)" >&2; exit 0; }
+# G22: 인터프리터 경성 참조 제거(python3→python→py). 미해소 = 판정 불가 → fail-open(기존 계약).
+[ -n "${CYS_PY:-}" ] || exit 0
 INPUT="$(cat)" || exit 0
 export APPBUILD_HOOK_INPUT="$INPUT"
 
 if [ "${1:-}" = "--self-test" ]; then export APPBUILD_SELF_TEST=1; fi
 
-exec python3 - <<'PYEOF'
+exec "$CYS_PY" - <<'PYEOF'
 import json, os, sys
 
 SRC_EXT = {

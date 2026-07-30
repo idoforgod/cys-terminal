@@ -7,13 +7,20 @@
 # 안전: graceful, 반드시 exit 0
 set +e
 
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(save-state)" >&2; exit 0; }
+
 INPUT=$(cat 2>/dev/null)
-# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
-CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
+# 인터프리터 해소는 프리루드(python3→python→py) — 기존 계약(비어 있으면 안 됨)은 명시 폴백.
+[ -n "$CYS_PY" ] || CYS_PY="python3"
 CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
 except Exception: print('')" 2>/dev/null)
-case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (무한루프 방지)
+# G19: 드라이브/UNC 경로 정규화 후 절대경로 판정(Windows `C:\` cwd 공란화 해소·POSIX 무변경)
+CWD="$(cys_norm_cwd "$CWD")"
+cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (무한루프 방지)
 EVENT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
  d=json.load(sys.stdin); print(d.get('hook_event_name', d.get('trigger','event')))

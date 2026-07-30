@@ -9,12 +9,17 @@
 #   중복 억제는 javis_state_ledger.py 가 세션 마커로 처리한다(Stop 은 턴마다 발화한다).
 #
 # 안전: 무출력(Stop 훅 stdout 오염 금지)·모든 실패 무해 흘림·항상 exit 0.
+# ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
+. "$(dirname "$0")/../_lib.sh" 2>/dev/null \
+  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(state-staleness)" >&2; exit 0; }
 set +e
 [ -n "$CYS_STATE_LEDGER_DISABLE" ] && exit 0
 
 IN=$(cat 2>/dev/null)
 
-PY="$(command -v python3 || command -v python || command -v py)"
+# G22: 인터프리터 해소는 프리루드 단일 소유(python3→python→py). 사본 재구현 금지(RC4).
+PY="${CYS_PY:-}"
 [ -n "$PY" ] || exit 0
 # 스크립트 해소(팩 갱신 면역): 명시 env > 팩 bin > 사용자 로컬 bin. 셋 다 없으면 무동작.
 BIN="${CYS_STATE_LEDGER_BIN:-}"

@@ -184,6 +184,47 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
     }
 }
 
+/// 자식 프로세스(pane 스폰·스케줄 발화·GUI 직스폰)에 얹을 env 주입 쌍(순수 — 회귀 핀·OS 무관 컴파일).
+///
+/// ① PATH: 동봉 runtime 선두 주입. 데몬은 GUI(Explorer/Finder) 기동이라 PATH 가 빈곤해
+///    python3·printf·tail 을 못 찾는다 — office-bridge/auto-restore 와 **동일 SOT**
+///    (`runtime_prefixed_path`)를 재사용한다(중복 구현 금지). 무변경이면 쌍 없음.
+/// ② HOME: Windows 의 비로그인 셸(`bash -c`)·순수 cmd 스폰은 HOME 이 없어 페이로드의
+///    `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로 붕괴한다 → **미설정일 때만**
+///    USERPROFILE 로 채운다. HOME 이 이미 있으면 무접촉(unix 는 항상 이 경로 → 무변경).
+///
+/// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
+///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
+///   발화 무산됐다(감사 A17: "state.rs pane 스폰에 backfill 부재 — schedule.rs:882 에는 있음").
+///   사본을 늘리는 대신 lib 공용 함수로 승격해 **두 스폰 경로가 같은 규약을 소비**하게 한다
+///   (RC4 '규약 산재' 소멸 · 검체 H-WIN-8). GUI 직스폰(src-tauri)의 편입은 W4 소속이다.
+pub fn spawn_env_pairs(
+    exe_dir: &Path,
+    current_path: &str,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(newp) = runtime_prefixed_path(exe_dir, current_path) {
+        env.push(("PATH".to_string(), newp));
+    }
+    if home.map(|h| h.is_empty()).unwrap_or(true) {
+        if let Some(up) = userprofile.filter(|u| !u.is_empty()) {
+            env.push(("HOME".to_string(), up.to_string()));
+        }
+    }
+    env
+}
+
+/// `spawn_env_pairs` 를 **현재 프로세스 env** 로 계산한다(호출부 3중 복붙 제거).
+/// 반환 쌍을 각 스폰 빌더(`tokio::process::Command`·portable-pty `CommandBuilder`)에 얹는다.
+pub fn spawn_env_pairs_from_process(exe_dir: &Path) -> Vec<(String, String)> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("HOME").ok();
+    let userprofile = std::env::var("USERPROFILE").ok();
+    spawn_env_pairs(exe_dir, &path, home.as_deref(), userprofile.as_deref())
+}
+
 /// unix pane PATH 합성(순수·테스트 가능 · **unix 전용 의미론** · OS 무관 컴파일). 순서:
 /// `[prefixes: exe_dir + 번들 runtime bins] 중 신규분 선두` ; `current_path 전체(순서 그대로 보존)` ;
 /// `~/.local/bin(claude native 설치 위치) 신규분 말미 append`. claude 설치기가 ~/.zshrc 를 수정하지

@@ -73,6 +73,15 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
+# ★공용 크로스플랫폼 락(T-0147-7 W1a · A8py): 싱글플라이트를 javis_lock 단일 소유로 옮긴다.
+#   종전 인라인 구현은 fcntl 단독이라 Windows에서 직렬화가 전무했고(항상 '획득'으로 접힘),
+#   락 파일에 보유자 신원이 없어 스테일 회수도 불가능했다(R1). import 실패는 부트를 죽이지
+#   않는다 — None 이면 아래 폴백이 구 동작(직렬화 없이 진행)으로 강등한다.
+try:
+    import javis_lock as _lock
+except Exception:  # 팩 스큐·부서 팩 결손 — 지혈이 새 크래시 지점이 되면 안 된다
+    _lock = None
+
 # ★R3(D-IMPL-3): Windows 파이프 환경(cp949/cp1252)에서 한글 출력 UnicodeEncodeError 크래시 방어 —
 # PYTHONUTF8 export는 cys-dept 경로에만 있어 이 스크립트의 직접 실행을 보호하지 못한다.
 for _s in (sys.stdout, sys.stderr):
@@ -100,7 +109,13 @@ TICKET_DIR = os.path.join(STATE_DIR, "dept-boot-tickets")
 TICKET_TTL_SECS = float(os.environ.get("CYS_DEPT_TICKET_TTL_SECS", str(24 * 3600)))
 
 def _atomic_write_json(path, obj):
-    """CRLF 함정 회피(newline='\\n')·원자 교체 — Windows 재직렬화 원복 교훈."""
+    """CRLF 함정 회피(newline='\\n')·원자 교체 — Windows 재직렬화 원복 교훈.
+    ★W1a: 구현을 javis_lock.atomic_write_json 으로 단일화한다(mkstemp 헬퍼 공용화·CS-5②).
+      바이트 계약(indent=1·ensure_ascii=False·말미 개행)은 동일하다. import 실패 시에만
+      아래 인라인 사본으로 강등한다(팩 스큐 내성)."""
+    if _lock is not None:
+        return _lock.atomic_write_json(path, obj, indent=1, ensure_ascii=False,
+                                       trailing_newline=True)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-boot-")
     try:
@@ -284,19 +299,27 @@ class _Log:
         _atomic_write_json(BOOT_LAST, self.data)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
         # ★실패 가시화(오너 2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
-        # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — feed 알림으로
-        # 승격(best-effort·데몬 다운 등 실패 무해). ②ping 실패(데몬 자체 부재)는 feed도 불가라 skip.
-        if name != "②ping":
-            hint = {"③claim-role": "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
-                    "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
-                    "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요."
-                    }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
-            try:
-                subprocess.run(["cys", "feed", "push", "--kind", "bootstrap-fail",
-                                "--title", "부트스트랩 미완(%s)" % name, "--body", hint],
-                               capture_output=True, timeout=10)
-            except Exception:
-                pass
+        # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — 알림으로 승격.
+        #
+        # ★W1a A15+R2 — notifier 단일화 + ②ping 카브아웃 제거:
+        #   ① 종전엔 여기서 `cys feed push` 를 직접 호출해 `_notify_loud`(feed→send 폴백)와 **이중
+        #      구현**이었다(R2). 채널 정책이 두 곳에 흩어지면 한쪽만 고쳐지는 드리프트가 난다 →
+        #      알림 채널의 단일 소유자는 `_notify_loud` 하나다.
+        #   ② 종전 `if name != "②ping"` 카브아웃은 **채널 가용성(런타임)을 단계 정체성(정적)으로
+        #      대체**한 오류였다(A15). ②ping 실패가 곧 '알림 불가'는 아니다 — ping은 짧은 타임아웃·
+        #      경합·부분 장애로도 실패하고, 데몬이 정말 죽었어도 send --queued 폴백이 큐에 남길 수
+        #      있다. 가용성은 **시도해 보고** 판정한다(_notify_loud는 best-effort·짧은 timeout이라
+        #      데몬 부재에서도 행 걸지 않는다).
+        #   ③ 알림 결과 채널명을 boot-last에 남긴다 — '알렸다'는 주장이 아니라 실측 파생 기록
+        #      (CS-3 보고=실측). 'none(...)' 이면 비제로 exit·boot-last가 최종 증거다.
+        hint = {"③claim-role": "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
+                "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
+                "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
+                "②ping": "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",
+                }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
+        channel = _notify_loud("부트스트랩 미완(%s)" % name, hint)
+        self.data["result"]["notify"] = {"attempted": True, "channel": channel}
+        _atomic_write_json(BOOT_LAST, self.data)
         return exit_code
 
 
@@ -307,26 +330,41 @@ def _singleflight_key(sock):
     return "base" if _socket_is_base(sock) else _sanitize_sock_key(sock)
 
 
+def _singleflight_path():
+    """싱글플라이트 락 파일 경로(레인별)."""
+    key = _singleflight_key(os.environ.get("CYS_SOCKET", ""))  # ★base 정규화 + 비-base 전체 경로 유일화
+    return os.path.join(STATE_DIR, "bootstrap-%s.lock" % key)
+
+
 def _acquire_singleflight():
     """부트스트랩 전체 단일 실행 락(오너 2026-07-15 적대검증·아키텍트: preflight 300s는 boot 락으로
     직렬화되지 않아 중복 fire가 settings.json read-modify-write를 경쟁하고 300s 프리플라이트를 중복
-    실행했다). 소켓별 flock 비차단 — 이미 진행 중이면 None 반환(호출부가 no-op 종료). unix 전용
-    실효(windows는 항상 락 획득=직렬화 없음, boot 락이 최종 방어). 반환 fd를 프로세스 수명동안 보유."""
-    key = _singleflight_key(os.environ.get("CYS_SOCKET", ""))  # ★base 정규화 + 비-base 전체 경로 유일화
-    lock_path = os.path.join(STATE_DIR, "bootstrap-%s.lock" % key)
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    except OSError:
-        return True  # 락 못 열면 직렬화 없이 진행(보수적 허용)
-    if os.name == "posix":
-        import fcntl
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return None  # 다른 부트스트랩 진행 중 — no-op
-    _acquire_singleflight._fd = fd  # GC로 fd 닫혀 락 풀리지 않게 프로세스 수명동안 보유
+    실행했다). 소켓별 비차단 — 이미 진행 중이면 None 반환(호출부가 no-op 종료).
+
+    ★W1a A8py: 구현을 `javis_lock.FileLock` 로 교체했다. 종전 인라인은 `if os.name == "posix"`
+      가드로 fcntl만 걸어 **Windows에서 직렬화가 전무**했다(락을 못 잡는 게 아니라 '항상 획득'으로
+      접혀 중복 부트가 결정론적으로 무장 — A6와 같은 웨이브가 필수인 이유). 이제 백엔드가
+      posix=flock / windows=msvcrt.locking / 폴백=pidfile(+스테일 pid 회수 — R1의 최대 ~330s
+      부트 거부 창 해소)로 가용성 기반 분기한다.
+    ★타입드 3상 소비: acquired→진행 / busy→None(no-op) / unavailable→진행(보수적 허용).
+      'busy'와 'unavailable'을 융합하면 락 인프라 고장이 조용한 부트 거부가 된다(구 코드는
+      `except OSError: return True` 로 unavailable만 분리했고 windows busy는 아예 없었다).
+    ★fd 보유: FileLock 인스턴스를 모듈 전역에 붙여 GC로 fd가 닫혀 락이 조용히 풀리는 것을 막는다."""
+    lock_path = _singleflight_path()
+    if _lock is None:
+        # 팩 스큐(javis_lock 부재) — 구 동작으로 강등: 직렬화 없이 진행. 조용히 접지 않게 흔적 1줄.
+        _progress("경고: javis_lock 미적재 — 싱글플라이트 직렬화 없이 진행(팩 배포 확인 필요)")
+        return True
+    lk = _lock.FileLock(lock_path, owner="javis_bootstrap", blocking=False)
+    st = lk.acquire()
+    if st == _lock.BUSY:
+        return None  # 다른 부트스트랩 진행 중 — no-op
+    if st == _lock.UNAVAILABLE:
+        _progress("경고: 단일 실행 락 사용 불가(%s) — 직렬화 없이 진행" % lk.detail)
+        return True
+    _acquire_singleflight._lk = lk  # 프로세스 수명동안 보유(GC 해제 차단)
+    if lk.reclaimed_stale:
+        _progress("스테일 부트 락 회수(사망 보유자) — 신규 부트 진행")
     return True
 
 

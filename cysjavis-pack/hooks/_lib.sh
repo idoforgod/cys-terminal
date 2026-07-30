@@ -1,0 +1,192 @@
+#!/bin/sh
+# _lib.sh — cysjavis 훅 공용 프리루드 (T-0147-7 W1a · 재감사 §3 CS-4① · RC4 소멸)
+#
+# 문제(RC4): 크로스컷 규약(surface 게이트·CYS_PY 해소·백슬래시 정규화·드라이브 절대경로 판정·
+#   cygpath 변환·로케일·상태 경로)이 훅마다 재복붙되어 드리프트했다. 실측 결과 python3 참조 훅
+#   28개 중 CYS_PY 해소는 5개뿐(G22), cwd 절대경로 게이트는 `/*` 전용이라 Windows `C:\` cwd를
+#   공란화(G19), 경로 판정은 '/' 전용이라 백슬래시 무음 우회(G18·G20·G23)였다.
+#   → 규약은 파일마다 살지 않고 **여기 한 곳**에 산다.
+#
+# 계약(재감사 CS-4① 비평2 D-1 '프리루드 견고성 판정' 명문):
+#   ⓐ **POSIX sh 호환** — 훅 shebang이 sh/bash 혼재라 bashism 금지(배열·`${x:0:n}`·`[[`·
+#      `local`·`+=` 금지). 문자열 슬라이스는 CS-8 python 창 판정으로 이관(G25).
+#   ⓑ **stdout 무출력** — 여러 훅(SessionStart·UserPromptSubmit)의 stdout은 모델 컨텍스트로
+#      주입된다. 프리루드가 한 글자라도 stdout에 쓰면 전 훅의 출력 계약이 깨진다.
+#   ⓒ **`set -u` 안전** — guard.sh·pre-dispatch.sh·actprobe-kill-gate.sh는 set -u다.
+#      모든 변수 읽기는 `${X:-}` 형태만 쓴다.
+#   ⓓ **멱등·항상 0으로 종료** — source 결과가 비0이면 호출측 loud-skip이 오발동한다.
+#   ⓔ source 실패는 호출측이 **loud-skip**(stderr 1줄 + exit 0)으로 처리한다. 조용한 꺼짐도,
+#      훅 전멸도 아닌 제3의 길. 규약 문장(전 훅 동일 · **2단 해소 후 loud-skip**):
+#        . "$(dirname "$0")/_lib.sh" 2>/dev/null \
+#          || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
+#          || { echo "[cys-hook] _lib.sh 소실 — 훅 강등" >&2; exit 0; }
+#      (하위 디렉터리 훅은 1단이 `$(dirname "$0")/../_lib.sh`.)
+#      ★2단(팩 경로) 폴백이 필수인 이유(실측 회귀): 훅은 **팩 밖으로 복사돼 실행되는 경로가
+#      실재한다** — 배선 하네스·테스트 스텁·`~/.cys/local/hooks/<이벤트>.d/` 오버레이가 훅 파일만
+#      다른 디렉터리에 두고 돌린다. 1단만 두면 그 전부가 조용히(정확히는 stderr 1줄 남기고)
+#      전면 강등된다(test_pre_dispatch.sh 하네스에서 56/56 → 10/56 로 실측 재현).
+#      팩 경로는 레인을 존중한다(CYS_PACK_DIR) — 부서 레인이 base 프리루드를 집지 않는다.
+#   ⓕ 설치 건강성(프리루드 실재)은 preflight 핀 체크가 담당한다 — 런타임 loud-skip과 이중 방어.
+#
+# ★이 파일은 훅이 아니다 — settings.json에 등록하지 않는다(SELFCORR_HOOKS 명시 목록 방식이라
+#   글롭 오등록 위험 없음). 파일명 접두 `_`는 '훅 아님'의 시각 신호다.
+
+# 멱등 가드 — 중첩 source(pre-dispatch → 서브훅)에서 재정의 비용을 없앤다.
+[ -n "${CYS_LIB_SH_LOADED:-}" ] && return 0
+CYS_LIB_SH_LOADED=1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. surface 이중 게이트 (A2 — 오발화 차단)
+# ─────────────────────────────────────────────────────────────────────────────
+# cysd가 pane에 주입하는 CYS_SURFACE_ID(구 AITERM_SURFACE_ID) 둘 다 없으면 = cys 밖의 임의
+# claude 세션(VS Code·일반 터미널)이다. 그런 곳에서 cys 부트를 발화하면 preflight 변형·데몬
+# autostart·boot-last 오염이라는 부작용을 남긴다(A2 재검증: 추가 피해 3건).
+# ※경계: cys pane 안에서 사람이 직접 타이핑하는 경우는 CYS_SURFACE_ID가 **있으므로 통과**한다
+#   (T-0147-1 레거시 직접타이핑 경로와 정합) — 차단 대상은 비-cys 터미널뿐이다.
+cys_require_surface() {
+  [ -n "${CYS_SURFACE_ID:-}" ] && return 0
+  [ -n "${AITERM_SURFACE_ID:-}" ] && return 0
+  exit 0
+}
+
+# 판정만 필요한 곳(조건 분기)용 — exit 하지 않는 술어형.
+cys_have_surface() {
+  [ -n "${CYS_SURFACE_ID:-}" ] && return 0
+  [ -n "${AITERM_SURFACE_ID:-}" ] && return 0
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. 경로 정규화 (G18·G19·G20·G23)
+# ─────────────────────────────────────────────────────────────────────────────
+# 백슬래시 → 슬래시. python측 술어(javis_bootstrap._socket_dept/_pack_dept·
+# javis_scrub 등)가 전부 `.replace("\\","/")` 후 판정하므로 셸도 같은 정규화를 쓴다
+# (셸↔python 판정 일치 = H-PRED-6/H-WIN-3 parity 검체의 대상).
+cys_norm_path() {
+  printf '%s' "${1:-}" | tr '\\' '/'
+}
+
+# 절대경로 판정 — POSIX `/…`·UNC `//…`(정규화 후) + Windows 드라이브 `C:…`.
+# 종전 `case "$CWD" in /*)` 는 `C:\Users\x` 를 상대경로로 보고 CWD를 공란화해 SESSION_STATE
+# 상향탐색·write-ahead·reflect를 Windows에서 전면 불능화했다(G19).
+cys_is_abs() {
+  case "${1:-}" in
+    /*) return 0 ;;
+    [A-Za-z]:*) return 0 ;;
+    '\'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 훅 stdin의 cwd 필드 정규화 — 드라이브/UNC 경로만 슬래시화한다.
+# ★POSIX 경로는 **무접촉**: 디렉터리 이름에 백슬래시가 든 정당한 unix 경로를 깨지 않는다
+#   (Windows 전용 이득 vs POSIX 회귀 0의 보수적 경계).
+cys_norm_cwd() {
+  case "${1:-}" in
+    [A-Za-z]:*|'\'*) cys_norm_path "${1:-}" ;;
+    *) printf '%s' "${1:-}" ;;
+  esac
+}
+
+# 경로 접두 판정(정규화 후) — `pack-guard` 팩 소속·guard 자기보호 등에 쓴다(G23).
+# 사용: cys_path_has_prefix "$FP" "$PACK"  → 0=접두 일치
+cys_path_has_prefix() {
+  _cys_p="$(cys_norm_path "${1:-}")"
+  _cys_q="$(cys_norm_path "${2:-}")"
+  case "$_cys_q" in */) _cys_q="${_cys_q%/}" ;; esac
+  [ -n "$_cys_q" ] || return 1
+  case "$_cys_p" in "$_cys_q"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. cygpath 가드 (A6·G8)
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows(PortableGit sh)에서 네이티브 python은 POSIX 경로(/c/…)를 열지 못한다. cygpath가
+# 있으면 네이티브(윈도) 경로로 변환하고, 없으면(unix) 원본을 그대로 낸다 — 무변환이 정답.
+# 종전 role-bootstrap.sh는 이 규약(inject-context.sh:38 선례)을 위반해 CYS_PACK_DIR 부재
+# 폴백 경로에서 발화가 즉사하는데도 "발화됨"을 보고했다(A6).
+cys_native_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "${1:-}" 2>/dev/null || printf '%s' "${1:-}"
+  else
+    printf '%s' "${1:-}"
+  fi
+}
+
+# 안내 문자열용 셸 인용 — Windows 네이티브 경로(공백·백슬래시)를 그대로 붙이면 사용자가
+# 복사해 실행할 수 없다(G8). 큰따옴표로 감싸고 내부 `"`·`\`·`$`·백틱만 이스케이프한다.
+cys_shquote() {
+  printf '"%s"' "$(printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\\$/g' -e 's/`/\\`/g')"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CYS_PY 해소 (G22 — python3 경성 참조 소멸)
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows에는 `python3` 명령이 없고 `python`/`py`만 있는 경우가 흔하다. 해소 실패 시
+# **빈 문자열**을 남긴다 — 호출측이 'cannot-judge' 로 loud 분기할 수 있게(판정불가와
+# 판정-아님의 융합 금지 · CS-2⑨). 종전처럼 `|| echo python3` 로 채우면 '존재하지 않는
+# 인터프리터'가 마치 해소된 것처럼 보여 실패 원인이 소실된다.
+# ※기존 계약 보존: 비어 있으면 안 되는 호출부는 `[ -n "$CYS_PY" ] || CYS_PY=python3` 로
+#   자기 자리에서 명시 폴백한다(계약 무변경 · 인터프리터 해소만 추가).
+cys_resolve_py() {
+  if [ -n "${CYS_PY:-}" ]; then
+    if [ -x "${CYS_PY}" ] || command -v "${CYS_PY}" >/dev/null 2>&1; then
+      export CYS_PY
+      return 0
+    fi
+  fi
+  CYS_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || printf '%s' '')"
+  export CYS_PY
+  [ -n "${CYS_PY:-}" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. 로케일 고정 (G9 완화)
+# ─────────────────────────────────────────────────────────────────────────────
+# `grep -E '.{0,15}'` 은 로케일이 C면 **바이트**를 세므로 한글 filler 창이 약 1/3로 줄어
+# 선언 감지가 미발화한다(role-bootstrap.sh:53 실측). 완전 해소는 감지기 python 이관(W1b·
+# CS-8)이고, 여기서는 **LC_ALL 미설정 시에만** UTF-8 계열로 고정해 표면을 좁힌다.
+# ※LC_ALL이 명시적으로 C인 환경은 사용자 의도로 존중한다(덮지 않는다 — 여기서 덮으면
+#   사용자의 명시 설정을 훅이 무음 변경하는 더 나쁜 결함이 된다).
+_cys_locale_exists() {
+  command -v locale >/dev/null 2>&1 || return 1
+  # 표기 차이 흡수(glibc `C.utf8` ↔ 요청 `C.UTF-8`): 소문자화 + `_`·`-` 제거 후 정확 비교.
+  locale -a 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '_-' \
+    | grep -qxF "$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -d '_-')"
+}
+
+cys_fix_locale() {
+  [ -n "${LC_ALL:-}" ] && return 0
+  case "${LANG:-}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) LC_ALL="${LANG}"; export LC_ALL; return 0 ;;
+  esac
+  case "${LC_CTYPE:-}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) LC_ALL="${LC_CTYPE}"; export LC_ALL; return 0 ;;
+  esac
+  # LANG·LC_CTYPE 둘 다 UTF-8이 아닌 드문 환경만 실재 확인 후 고정(존재하지 않는 로케일을
+  # 심으면 libc가 "C"로 되돌려 오히려 나빠진다 — 그래서 무조건 대입은 금지).
+  for _cys_c in C.UTF-8 en_US.UTF-8; do
+    if _cys_locale_exists "$_cys_c"; then
+      LC_ALL="$_cys_c"; export LC_ALL
+      return 0
+    fi
+  done
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. 상태 경로 (A17 훅면 — HOME 부재 backfill)
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows 비로그인 셸(`bash -c`)은 HOME이 없어 `$HOME/.cys/state` 가 `/.cys/state` 로
+# 붕괴한다. Rust측 spawn_env_pairs(HOME←USERPROFILE backfill)의 셸 대응물이다.
+CYS_STATE_DIR="${CYS_STATE_DIR:-${HOME:-${USERPROFILE:-.}}/.cys/state}"
+export CYS_STATE_DIR
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 로드 시 자동 적용 (부작용 없음·stdout 무출력)
+# ─────────────────────────────────────────────────────────────────────────────
+cys_resolve_py >/dev/null 2>&1 || :
+cys_fix_locale >/dev/null 2>&1 || :
+
+# ★반드시 0으로 끝난다(계약 ⓓ) — 비0이면 호출측 loud-skip이 오발동한다.
+:
