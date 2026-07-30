@@ -2132,10 +2132,10 @@ def h_win_1():
     g = _hook("guard.sh")
     env = _base_env()
     cases = [
-        ("C:\\Users\\me\\.claude\\soul.md", 2, "드라이브 백슬래시 soul.md"),
+        ("C:\\Users\\x\\.claude\\soul.md", 2, "드라이브 백슬래시 soul.md"),
         ("C:\\x\\CLAUDE.md", 2, "백슬래시 CLAUDE.md"),
         ("C:\\x\\WORKER_DIRECTIVE.md", 2, "백슬래시 *_DIRECTIVE.md"),
-        ("/Users/me/.claude/soul.md", 2, "POSIX soul.md(회귀 대조)"),
+        ("/Users/x/.claude/soul.md", 2, "POSIX soul.md(회귀 대조)"),
         ("C:\\x\\notes.md", 0, "무해 파일(과차단 대조)"),
     ]
     for fp, want, label in cases:
@@ -2144,7 +2144,7 @@ def h_win_1():
         need(r.returncode == want, "%s: exit=%d(기대 %d)" % (label, r.returncode, want))
     # Bash 경로(LOOSE)도 같은 정규화가 걸리는가
     r = _run(["bash", g], env=env, input=json.dumps(
-        {"tool_name": "Bash", "tool_input": {"command": "echo x | tee C:\\Users\\me\\soul.md"}}))
+        {"tool_name": "Bash", "tool_input": {"command": "echo x | tee C:\\Users\\x\\soul.md"}}))
     need(r.returncode == 2, "LOOSE bash 백슬래시 경로 우회(exit=%d)" % r.returncode)
     calib = "skip(no-git)"
     old = _git_show("cysjavis-pack/hooks/guard.sh")
@@ -2154,7 +2154,7 @@ def h_win_1():
             _w(og, old)
             _w(os.path.join(tmp, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
             r2 = _run(["bash", og], env=env, input=json.dumps(
-                {"tool_name": "Write", "tool_input": {"file_path": "C:\\Users\\me\\.claude\\soul.md"}}))
+                {"tool_name": "Write", "tool_input": {"file_path": "C:\\Users\\x\\.claude\\soul.md"}}))
             need(r2.returncode == 0,
                  "계측 타당성 실패: 구 guard 가 백슬래시 경로를 이미 차단한다면 이 검체는 무의미")
             calib = "구 코드 무음 우회 재현 확인"
@@ -2363,10 +2363,10 @@ def h_win_6():
         _mock_cys(binp, tmp, 'case "$1" in pack-ownership) echo system; exit 0;; esac')
         env = _base_env({"HOME": os.path.join(tmp, "home"),
                          "PATH": binp + os.pathsep + os.environ.get("PATH", ""),
-                         "CYS_PACK_DIR": "C:/Users/me/.cys/pack",
+                         "CYS_PACK_DIR": "C:/Users/x/.cys/pack",
                          "TMPDIR": os.path.join(tmp, "stamps")})
         r = _run(["bash", _hook("pack-guard.sh")], env=env, input=json.dumps(
-            {"tool_input": {"file_path": "C:\\Users\\me\\.cys\\pack\\hooks\\guard.sh"},
+            {"tool_input": {"file_path": "C:\\Users\\x\\.cys\\pack\\hooks\\guard.sh"},
              "session_id": "s1"}))
         need(r.returncode == 0, "pack-guard 비0 종료(%d)" % r.returncode)
         need("pack-ownership" in _calls(tmp),
