@@ -805,7 +805,7 @@ fn resolve_bash_in(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
 /// PortableGit 의 `bash.exe` 정규 위치(`runtime/git/bin`)를 보수적으로 덧댄다 — runtime_bin_dirs 는
 /// PATH 주입용이라 git/bin 을 싣지 않는데(그 자리엔 sh·bash 뿐), 셸 탐지는 그 디렉토리가 본진이다.
 #[cfg(windows)]
-fn windows_bash_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+fn windows_bash_candidates(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut dirs = cys::runtime_bin_dirs(exe_dir);
     dirs.push(exe_dir.join("runtime").join("git").join("bin"));
     dirs
