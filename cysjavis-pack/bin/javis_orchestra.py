@@ -203,11 +203,57 @@ def reviewer_launch_binary(agent, agents=None):
     return os.path.expanduser(cmd.split()[0])
 
 
+# 단일 오라클 캐시 — 프로세스 생애 1회 spawn (asked=질문했는가 / agents=결과 or None).
+_CYS_AGENT_DETECT = {"asked": False, "agents": None}
+
+
+def cys_agent_detect(timeout=10):
+    """★(W4 · 재감사 §3 CS-1③ · B12) `cys agent-detect --json` = 어댑터 설치 감지의 **단일 오라클**.
+    Rust 쪽이 한 곳에서 extract_bin(env-prefix 건너뛰기) + 틸드확장 + 실행권 + (Windows 후보
+    순회)를 판정하므로, python 이 같은 규칙을 재발명하다 어긋나던 경로(구: Rust=exists() /
+    python=os.access X_OK)를 없앤다.
+    반환: {agent: {"installed": bool, ...}} · None = 판정 불가(cys 부재·구버전 cys 로 서브커맨드
+    미지원·실행/파싱 실패) → **호출부가 자체 감지로 폴백**한다(감지가 죽어서 부트가 멈추면 안 된다).
+    프로세스당 1회만 spawn 하고 결과를 캐시한다(로스터가 agent 마다 물어도 subprocess 1회)."""
+    if _CYS_AGENT_DETECT["asked"]:
+        return _CYS_AGENT_DETECT["agents"]
+    _CYS_AGENT_DETECT["asked"] = True
+    got = None
+    cys = shutil.which("cys")
+    if cys:
+        try:
+            r = subprocess.run([cys, "agent-detect", "--json"],
+                               capture_output=True, timeout=timeout)
+            if r.returncode == 0:
+                d = json.loads((r.stdout or b"").decode("utf-8", "replace"))
+                a = d.get("agents")
+                if isinstance(a, dict):
+                    got = a
+        except Exception:
+            got = None
+    _CYS_AGENT_DETECT["agents"] = got
+    return got
+
+
 def detect_reviewer(agent, agents=None):
     """★결정론 1차 감지(오너 '가장 중요한 전제') — 그 리뷰어 CLI 가 *호출 가능*한가.
-    바이너리가 절대경로로 실재·실행가능하거나 PATH 에서 해석되면 available.
+    ★1순위 = cys_agent_detect() (Rust 단일 오라클 · W4 CS-1③). 그 판정이 SOT 다.
+    ★폴백(오라클 부재·실패·해당 agent 미수록) = 아래 자체 감지: 바이너리가 절대경로로 실재·
+    실행가능(os.access X_OK)하거나 PATH(shutil.which)에서 해석되면 available. 폴백은 제거하지
+    않는다 — 구버전 cys·cys 미설치 머신에서도 감지가 답을 내야 한다(하드 삭제 금지).
+    ★오라클은 **실디스크 어댑터 정의에 대한 판정**이다. 그래서 주입된 `agents` 가 디스크 본과
+    다르면(=합성 fixture 를 넣은 밀폐 self-test) 쓰지 않는다 — 주입을 무시하고 실환경을 보면
+    테스트 밀폐가 깨진다. reviewer_roster 처럼 디스크에서 해소한 dict 는 같으므로 소비된다
+    (로스터가 오라클을 못 쓰면 이 단일화가 무의미해진다).
     인증·구독 유무는 여기서 판정하지 않는다(미인증은 부트 시 set-status ack 부재로
     boot-reviewers 가 2차 폴백한다). claude 는 시스템 전제. 반환: (available, reason)."""
+    if agents is None or agents == _agents_json():
+        oracle = cys_agent_detect()
+        if isinstance(oracle, dict):
+            ent = oracle.get(agent)
+            if isinstance(ent, dict) and isinstance(ent.get("installed"), bool):
+                return ent["installed"], "cys agent-detect: %s" % (
+                    ent.get("reason") or ("installed" if ent["installed"] else "missing"))
     binp = reviewer_launch_binary(agent, agents)
     if not binp:
         return False, "agents.json 에 %s.cmd 없음" % agent

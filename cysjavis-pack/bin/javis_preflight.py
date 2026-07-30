@@ -4001,6 +4001,67 @@ class Preflight:
             self.add(cid, PASS,
                      "launchd 잡 정상(penalty box·EX_CONFIG·inferred stale 징후 없음)")
 
+    # ── C71 어댑터 스키마 완결성 (B20) — 결손 키의 **의미**를 말한다(무음 퇴화 차단) ──
+    # C05 는 "cmd 존재 + 역할 매핑"만 본다. 그런데 어댑터의 선택 키 결손은 조용히 기능을
+    # 퇴화시킨다: ready_marker 없음→readiness 를 시간 폴백으로 때움(느리고 부정확),
+    # clear_cmd 없음→cycle-agent 가 컨텍스트를 못 비움, resume_arg 없음→restore 가 대화기억
+    # 없이 fresh 기동(=세션 만료 시 맥락 소실), approval_patterns 없음→승인 프롬프트 무감지.
+    # 어느 것도 그 자체로 오류가 아니다(grok 처럼 원래 없는 게 정상인 어댑터가 있다) → 기본
+    # PASS + detail 에 결손 의미를 명시하고, **resume_arg 결손만 WARN** 으로 올린다(복원 계층의
+    # 맥락 소실이 가장 비싸고 사용자가 모르는 채 겪는 손실이라서). WARN 남발은 신호를 죽인다.
+    OPTIONAL_KEY_MEANING = (
+        ("ready_marker", "ready_marker 없음→시간 폴백 사용", False),
+        ("clear_cmd", "clear_cmd 없음→cycle-agent 미지원(clear 불가)", False),
+        ("resume_arg", "resume_arg 없음→session resume 미지원(restore는 fresh 기동)", True),
+        ("approval_patterns", "approval_patterns 없음→승인 프롬프트 자동감지 없음", False),
+    )
+    KNOWN_AGENTS_SCHEMA = (1, 2)
+
+    def c71_agents_schema(self):
+        cid = "C71.agents-schema"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "agents.json")
+        try:
+            data = json.load(open(p, encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            # 부재·손상 수리는 C05 의 책임(백업·복원 경로 보유) — 여기서 중복 수리하지 않는다.
+            self.add(cid, SKIP, "agents.json 로드 불가(%s) — C05 먼저 해결" % e)
+            return
+        if not isinstance(data, dict):
+            self.add(cid, FAIL, "agents.json 최상위가 객체가 아니다(%s)" % type(data).__name__)
+            return
+        fails, warns, notes = [], [], []
+        # _schema: 없으면 구 파일 → 무시(하위호환). 있으면 알려진 값인지만 본다.
+        schema = data.get("_schema")
+        if schema is not None and schema not in self.KNOWN_AGENTS_SCHEMA:
+            warns.append("미지 agents.json 스키마 버전 %s — 팩 갱신 확인 권장" % schema)
+        agents = [(k, v) for k, v in sorted(data.items()) if not k.startswith("_")]
+        if not agents:
+            self.add(cid, FAIL, "어댑터 항목 0개 — agents.json 이 메타 키만 갖고 있다")
+            return
+        for name, spec in agents:
+            if not isinstance(spec, dict):
+                fails.append("%s: 어댑터 정의가 객체가 아니다(%s)" % (name, type(spec).__name__))
+                continue
+            cmd = spec.get("cmd")
+            if not (isinstance(cmd, str) and cmd.strip()):
+                fails.append("%s: 필수 키 cmd 누락/빈 값 — 기동 불가" % name)
+            missing = [(key, why, warn) for key, why, warn in self.OPTIONAL_KEY_MEANING
+                       if key not in spec]
+            for key, why, warn in missing:
+                (warns if warn else notes).append("%s: %s" % (name, why))
+        if fails:
+            self.add(cid, FAIL, "; ".join(fails + warns + notes))
+        elif warns:
+            self.add(cid, WARN, "; ".join(warns + notes))
+        else:
+            detail = "어댑터 %d종 스키마 정합(cmd 전건 존재%s)" % (
+                len(agents), ", _schema=%s" % schema if schema is not None else "")
+            if notes:
+                detail += " · 선택 키 결손(정상 가능): " + "; ".join(notes)
+            self.add(cid, PASS, detail)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -4032,7 +4093,7 @@ class Preflight:
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             self.c66_board_catalog, self.c67_learn_wiring, self.c69_gate_ledger,
-            self.c70_launchd_job,
+            self.c70_launchd_job, self.c71_agents_schema,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

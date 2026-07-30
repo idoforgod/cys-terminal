@@ -1,5 +1,6 @@
 {
-  "_doc": "에이전트 어댑터 정의. launch-agent가 사용: 기동 명령 → inject_delay_secs 대기 → 역할 디렉티브를 stdin push. clear_cmd=cycle-agent의 컨텍스트 초기화 명령, resume_arg=restore/node-recover의 대화 기억 복원 플래그, approval_patterns=데몬 승인 격상 스캔(자동 응답 절대 없음 — 감지·feed 격상만). 사용자 환경에 맞게 수정 가능(~/.cys/pack/agents.json).",
+  "_schema": 2,
+  "_doc": "에이전트 어댑터 정의. launch-agent가 사용: 기동 명령 → inject_delay_secs 대기 → 역할 디렉티브를 stdin push. clear_cmd=cycle-agent의 컨텍스트 초기화 명령, resume_arg=restore/node-recover의 대화 기억 복원 플래그, approval_patterns=데몬 승인 격상 스캔(자동 응답 절대 없음 — 감지·feed 격상만). ★예외 1건: approval_patterns 의 name=\"trust-prompt\" 항목만 launch-agent 의 폴더신뢰 자동확인이 소비한다(Return 1발·멱등 래치·전송 상한 — 사람 판단이 필요한 tool-permission 류는 절대 자동응답하지 않는다). _schema=agents.json 구조 버전(현재 2 — ready_marker·approval_patterns 는 코드 기본값(내장 vendor)+user override 필드 계층 적용). 사용자 환경에 맞게 수정 가능(~/.cys/pack/agents.json).",
   "claude": {
     "cmd": "claude --dangerously-skip-permissions",
     "env": { "CLAUDE_CONFIG_DIR": "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}" },

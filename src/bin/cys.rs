@@ -568,6 +568,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 어댑터 CLI 설치 감지 — agents.json 의 각 어댑터가 **지금 기동 가능한가**(바이너리 실재+실행권).
+    /// 부트·python(detect_reviewer)·GUI 가 공유하는 단일 오라클(CS-1③). 데몬 무의존.
+    #[command(name = "agent-detect")]
+    AgentDetect {
+        /// 기계 판독 JSON:
+        /// `{"agents":{"<agent>":{"installed","bin","resolved","reason","hint"}}}`
+        #[arg(long)]
+        json: bool,
+    },
     /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출.
     /// 새로 만드는 파일에는 선언 블록 v1 한 줄이 **자동 동봉**된다(집계기는 파일명이 아니라 이 선언으로 귀속을 판정한다).
     TodoPath {
@@ -2116,6 +2125,7 @@ fn run(command: Command) -> i32 {
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd, json } => return run_boot(cwd, json),
+        Command::AgentDetect { json } => return run_agent_detect(json),
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
@@ -4619,6 +4629,270 @@ fn install_hint(agent: &str) -> &'static str {
     }
 }
 
+/// B8: agents.json 의 cmd 가 Windows 실설치 경로와 어긋날 때의 안내 — 후보 전탐색까지 빈손일 때만.
+#[cfg(windows)]
+const WINDOWS_AGENT_PATH_HINT: &str = "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 \
+(agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex)";
+
+/// 어댑터 설치 감지 결과 — `cys agent-detect`·`run_boot` 이 공유하는 **단일 오라클**의 산출물(CS-1③).
+struct AgentDetection {
+    /// 지금 이 어댑터를 기동할 수 있는가 = 바이너리 실재 **+ 실행권**.
+    installed: bool,
+    /// agents.json cmd 에서 env-prefix 를 건너뛴 바이너리 토큰(extract_bin 단일 진실).
+    bin: String,
+    /// 해소된 실경로(경로형=틸드 확장 후 / PATH형=which·where 첫 줄). 미해소 시 None.
+    resolved: Option<std::path::PathBuf>,
+    /// 사람용 판정 근거 한 줄 (python detect_reviewer 의 reason 과 동형 문면).
+    reason: String,
+    /// 미설치 안내 — 기본은 install_hint, Windows 후보 전탐색 실패 시 경로수정 힌트로 대체.
+    hint: String,
+}
+
+/// 파일이 실재하고 **실행 가능**한가. 종전 `exists()` 판정의 강화 — python 쪽
+/// `detect_reviewer`(`os.access(binp, os.X_OK)`)와 오라클 문면을 일치시킨다(재감사 §3 CS-1③).
+/// unix 는 실유효 권한(access(2) X_OK)으로 판정하고, Windows 는 실행권 개념이 없어 실재로만 본다.
+/// ★무회귀: 실행권 없는 파일은 셸 경유 기동도 EACCES 로 실패하므로, 종전 exists()=true 판정은
+///   '기동 가능'의 오탐이었다 — 판정이 좁아지는 방향뿐이고 기동 가능한 대상을 잃지 않는다.
+/// ★cfg 를 **함수 두 벌**로 가른다(블록 `#[cfg]` 를 tail expression 으로 쓰면 속성 붙은 블록이
+///   statement 로 파싱돼 `if` 가 tail 이 되고 E0317 로 **Windows 빌드만** 깨진다 — 실측 확인).
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !p.is_file() {
+        return false;
+    }
+    match std::ffi::CString::new(p.as_os_str().as_bytes()) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 },
+        Err(_) => false,
+    }
+}
+
+/// Windows 는 실행권(X_OK) 개념이 없다 — 실재로만 판정한다(대칭 구현).
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
+/// PATH 해석 → (발견?, 해소경로). **발견 판정의 권위는 종전과 동일하게 exit status** 이고
+/// 경로는 best-effort 다(stdout 파싱 실패가 '미설치' 로 뒤집히지 않게 — 무회귀).
+fn which_in_path(bin: &str) -> (bool, Option<std::path::PathBuf>) {
+    #[cfg(windows)]
+    let prog = "where";
+    #[cfg(not(windows))]
+    let prog = "which";
+    match std::process::Command::new(prog).arg(bin).output() {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let first = s
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .map(std::path::PathBuf::from);
+            (true, first)
+        }
+        _ => (false, None),
+    }
+}
+
+/// B8: Windows 후보 순회 — 선언 경로·PATH 가 빈손일 때 확장자 변형(.cmd/.exe/.bat/.ps1)과
+/// npm 전역 설치 표준 위치(`%APPDATA%\npm`·`%LOCALAPPDATA%\npm`)를 훑는다.
+/// (npm -g 는 Windows 에서 `<prefix>\<name>.cmd` 셸 래퍼를 깔고, prefix 기본값이 `%APPDATA%\npm`
+///  이다. 일부 설정·설치기는 `%LOCALAPPDATA%` 하위를 prefix 로 쓰므로 함께 본다.)
+/// 선언이 unix 경로형(`~/.local/bin/agy`)이어도 Windows 에선 그 경로가 없으므로 **바이너리 이름만**
+/// 취해 순회한다 — "OS 별 후보 목록" 미해소로 Windows 부트가 전멸하던 구멍을 메운다.
+#[cfg(windows)]
+fn windows_agent_candidates(bin: &str) -> Option<std::path::PathBuf> {
+    let raw = std::path::Path::new(bin)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bin.to_string());
+    let stem = raw
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .trim_end_matches(".ps1")
+        .to_string();
+    if stem.is_empty() {
+        return None;
+    }
+    // ① 확장자 변형을 PATH 로 재해석(`where agy` 는 실패해도 `where agy.cmd` 는 잡히는 경로).
+    for ext in ["cmd", "exe", "bat", "ps1"] {
+        let cand = format!("{stem}.{ext}");
+        let (found, path) = which_in_path(&cand);
+        if found {
+            return Some(path.unwrap_or_else(|| std::path::PathBuf::from(cand)));
+        }
+    }
+    // ② npm 전역 prefix 후보 직접 탐색(PATH 미갱신 셸 — Windows 설치 직후 흔한 상태).
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        let Some(base) = std::env::var_os(var) else {
+            continue;
+        };
+        let npm = std::path::PathBuf::from(base).join("npm");
+        for name in [
+            format!("{stem}.cmd"),
+            format!("{stem}.exe"),
+            format!("{stem}.bat"),
+            format!("{stem}.ps1"),
+            stem.clone(),
+        ] {
+            let cand = npm.join(&name);
+            if is_executable_file(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// B8 후보 순회는 **Windows 한정** — 다른 OS 빌드에서는 항등(cfg 분기를 함수 두 벌로 갈라
+/// `mut` 미사용 경고 없이 컴파일된다).
+#[cfg(not(windows))]
+fn apply_windows_agent_fallback(d: AgentDetection) -> AgentDetection {
+    d
+}
+
+#[cfg(windows)]
+fn apply_windows_agent_fallback(mut d: AgentDetection) -> AgentDetection {
+    if d.installed {
+        return d;
+    }
+    match windows_agent_candidates(&d.bin) {
+        Some(p) => {
+            d.reason = format!("{} → Windows 후보 발견 {}", d.reason, p.display());
+            d.resolved = Some(p);
+            d.installed = true;
+        }
+        None => {
+            d.reason = format!(
+                "{} → Windows 후보(.cmd/.exe/.bat/.ps1 · %APPDATA%\\npm · %LOCALAPPDATA%\\npm) 전부 미발견",
+                d.reason
+            );
+            d.hint = WINDOWS_AGENT_PATH_HINT.to_string();
+        }
+    }
+    d
+}
+
+/// 어댑터 설치 감지의 **단일 오라클**(재감사 §3 CS-1③ · B12) — run_boot·`cys agent-detect`,
+/// 그리고 그 JSON 을 소비하는 python `detect_reviewer` 가 **같은 판정**을 쓴다(종전엔 Rust 인라인
+/// 판정과 python 자체 판정이 별개라 실행권 체크 유무가 어긋났다 = 두 오라클 불일치).
+/// ①extract_bin 으로 env-prefix 건너뛴 바이너리 토큰 ②경로형(`~`·경로구분자 포함)은 틸드 확장 후
+/// 실재+실행권 ③그 외는 which/where(exit status 권위) ④Windows 는 실패 시 B8 후보 순회.
+fn detect_agent_binary(agent: &str, agents: &Value) -> AgentDetection {
+    let bin = agents
+        .get(agent)
+        .and_then(|a| a["cmd"].as_str())
+        // env-prefix를 건너뛰고 실제 바이너리 토큰을 찾는다 (extract_bin 단일 진실) — claude
+        // cmd가 `CLAUDE_CONFIG_DIR="..." claude ...`처럼 env 대입으로 시작해 첫 토큰을 바이너리로
+        // 오판('미설치')하던 회귀를 차단한다 (gemini/codex는 바이너리로 시작해 영향 없음).
+        .map(|c| extract_bin(c, agent).to_string())
+        .unwrap_or_else(|| agent.to_string());
+    // 경로형 cmd('~/'·'/' 포함 — 예: agy 절대경로)는 which/where가 틸드를 확장하지
+    // 않아 '미설치'로 오판한다 → 파일 실재+실행권으로 판정 (실행은 셸 -lc 경유라 틸드 확장됨).
+    // '\\' 도 경로형으로 본다(Windows 선언 경로 — unix 어댑터엔 등장하지 않아 영향 0).
+    let path_form = bin.starts_with('~') || bin.contains('/') || bin.contains('\\');
+    let (installed, resolved, reason) = if path_form {
+        let p = expand_tilde(&bin);
+        if is_executable_file(&p) {
+            let r = format!("실행가능 {}", p.display());
+            (true, Some(p), r)
+        } else {
+            (false, None, format!("바이너리 부재/실행불가 {}", p.display()))
+        }
+    } else {
+        let (found, path) = which_in_path(&bin);
+        if found {
+            let shown = path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| bin.clone());
+            (true, path, format!("PATH 발견 {shown}"))
+        } else {
+            (false, None, format!("PATH 미발견 {bin}"))
+        }
+    };
+    apply_windows_agent_fallback(AgentDetection {
+        installed,
+        bin,
+        resolved,
+        reason,
+        hint: install_hint(agent).to_string(),
+    })
+}
+
+/// `cys agent-detect [--json]` — 어댑터별 설치 감지를 **한 곳에서** 판정해 내보낸다.
+/// 데몬 무의존(순수 파일시스템·PATH 조회)이라 부트 전에도 호출할 수 있다.
+/// exit: 0=판정 산출 / **3=판정 불가**(어댑터 정의를 못 읽음). 3 과 '전부 미설치'(0 +
+/// installed:false)는 **다른 사실**이다 — 소비부(python detect_reviewer)가 3 을 보고 자체 감지로
+/// 폴백해야 하고, 0 을 보면 그 판정을 신뢰해야 한다(cys_status 의 exit 2 vs 1 구분과 동형 규약).
+/// ★임베드 폴백을 **의도적으로 하지 않는다**: load_agent_spec 은 agents.json **파일 자체**가 없으면
+///   `init-pack` 을 요구하며 실패한다(키 단위 폴백만 있다). 여기서 내장본으로 "설치됨"을 답하면
+///   기동이 불가능한 상태를 '가용'으로 보고하는 오라클 거짓말이 된다.
+fn run_agent_detect(as_json: bool) -> i32 {
+    let p = cys::pack::pack_dir().join("agents.json");
+    let agents: Value = match std::fs::read_to_string(&p)
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[agent-detect] 판정 불가 — {} 읽기/파싱 실패({e}). 복구: `cys init-pack`",
+                p.display()
+            );
+            if as_json {
+                println!(
+                    "{}",
+                    json!({"agents": {}, "error": format!("agents.json unreadable: {e}")})
+                );
+            }
+            return 3;
+        }
+    };
+    let keys: Vec<String> = agents
+        .as_object()
+        .map(|o| {
+            o.keys()
+                .filter(|k| !k.starts_with('_')) // '_doc'·'_roles'·'_schema' 등 메타 키 제외
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for k in &keys {
+        let d = detect_agent_binary(k, &agents);
+        out.insert(
+            k.clone(),
+            json!({
+                "installed": d.installed,
+                "bin": d.bin,
+                "resolved": d.resolved.map(|p| p.display().to_string()),
+                "reason": d.reason,
+                "hint": d.hint,
+            }),
+        );
+    }
+    if as_json {
+        println!("{}", json!({"agents": out}));
+    } else {
+        for k in &keys {
+            let e = &out[k];
+            println!(
+                "{:<8} {} {}",
+                k,
+                if e["installed"].as_bool() == Some(true) {
+                    "installed"
+                } else {
+                    "missing  "
+                },
+                e["reason"].as_str().unwrap_or("")
+            );
+        }
+    }
+    0
+}
+
 fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
     // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
     // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
@@ -4682,38 +4956,17 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             );
             last_hb = std::time::Instant::now();
         }
-        let bin = agents
-            .get(*agent)
-            .and_then(|a| a["cmd"].as_str())
-            // env-prefix를 건너뛰고 실제 바이너리 토큰을 찾는다 (extract_bin 단일 진실) — claude
-            // cmd가 `CLAUDE_CONFIG_DIR="..." claude ...`처럼 env 대입으로 시작해 첫 토큰을 바이너리로
-            // 오판('미설치')하던 회귀를 차단한다 (gemini/codex는 바이너리로 시작해 영향 없음).
-            .map(|c| extract_bin(c, agent).to_string())
-            .unwrap_or_else(|| agent.to_string());
-        // 경로형 cmd('~/'·'/' 포함 — 예: agy 절대경로)는 which/where가 틸드를 확장하지
-        // 않아 '미설치'로 오판한다 → 파일 존재로 판정 (실행은 셸 -lc 경유라 틸드 확장됨)
-        let found = if bin.starts_with('~') || bin.contains('/') {
-            expand_tilde(&bin).exists()
-        } else {
-            #[cfg(windows)]
-            let ok = std::process::Command::new("where")
-                .arg(&bin)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            #[cfg(not(windows))]
-            let ok = std::process::Command::new("which")
-                .arg(&bin)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            ok
-        };
-        if !found {
+        // ★(W4 · CS-1③) 인라인 감지 폐기 → **공유 오라클**(detect_agent_binary) 소비.
+        //   같은 판정을 `cys agent-detect --json` 이 내보내고 python detect_reviewer 가 그걸 쓴다
+        //   (종전엔 Rust=exists() / python=X_OK 로 두 오라클이 어긋났다). Windows 후보 순회(B8)도
+        //   오라클 안에 있으므로 부트가 자동으로 함께 받는다.
+        let det = detect_agent_binary(agent, &agents);
+        let bin = det.bin;
+        if !det.installed {
             // ★(W2 · G29·B8) 미설치는 **typed `missing`** 이다 — 종전엔 산문 skip + exit 0 이라
             // 소비부(bootstrap exit 4 계약)와 불일치했고, 의무 CLI 미설치가 '성공'으로 보고됐다.
-            let hint = install_hint(agent);
-            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀 (설치: {hint})");
+            let hint = det.hint;
+            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀 ({}) (설치: {hint})", det.reason);
             missing += 1;
             // ★fatal_failed 는 **--json 전용 요약 필드**다 — bare exit 을 움직이지 않는다(금지 방향 ⑧).
             //   의무 CLI 미설치가 '성공'이 아니라는 사실(G29)은 typed outcome=missing+mandatory 로
@@ -4903,6 +5156,95 @@ fn escalate_reclaim(role: &str) {
     }
 }
 
+/// 임베드(vendor) agents.json 파싱 — 컴파일타임 내장 사본이 **코드 기본값** 계층의 원천이다.
+fn embedded_agents_json() -> Option<Value> {
+    cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "agents.json")
+        .and_then(|(_, c)| serde_json::from_str(c).ok())
+}
+
+/// ★(W4 · 재감사 §3 CS-1③ / 비평2 C-1) **필드 단위 계층 — 마커·trust 패턴 한정**.
+/// load_agent_spec 의 폴백은 종전 **agent 전체(whole-object)** 단위였다: 유저 agents.json 에 그
+/// 키가 있으면 부분적이어도 통째로 이기므로, 예전에 커스터마이즈한 `claude` 항목은 vendor 가 새로
+/// 출하한 `ready_marker`·`approval_patterns` 를 **영영 못 받는다**(동결 = readiness 시간폴백 퇴화,
+/// 폴더신뢰 자동확인 불발). 그래서 **판정 술어가 소비하는 이 2키만** 코드 기본값(vendor 임베드)
+/// + user override 계층으로 만든다. 전면 스키마 마이그레이션은 하지 않는다(의도적 보류).
+/// 규칙: 키가 **아예 없을 때만** 메모리상 반환값에 임베드 값을 채운다(디스크 파일 무접촉 — 사용자
+/// 소유 파일을 코드가 고쳐 쓰지 않는다 ★W-B). 명시적 `null` 은 "의도적으로 없음" 선언으로 보고
+/// 채우지 않는다(사용자 주권 보존). 어댑터 값이 객체가 아니면(손상 커스텀) 아무것도 하지 않는다.
+fn fill_missing_fields(resolved: &mut Value, embedded: Option<&Value>) {
+    const LAYERED_KEYS: [&str; 2] = ["ready_marker", "approval_patterns"];
+    let Some(emb) = embedded else { return };
+    if !resolved.is_object() {
+        return;
+    }
+    let mut filled: Vec<&str> = Vec::new();
+    for k in LAYERED_KEYS {
+        if resolved.get(k).is_some() {
+            continue; // 디스크 선언(null 포함)은 손대지 않는다
+        }
+        if let Some(v) = emb.get(k) {
+            resolved[k] = v.clone();
+            filled.push(k);
+        }
+    }
+    if !filled.is_empty() {
+        eprintln!(
+            "[agents] 내 agents.json 에 없는 [{}] 을 **내장 vendor 값으로 보강**했다 \
+             (필드 계층 · 디스크 파일 무변경). 영속 편입: cys pack-merge --file agents.json",
+            filled.join(", ")
+        );
+    }
+}
+
+/// ★(W4 · B19) 폴더신뢰 프롬프트 패턴을 **어댑터 선언에서** 읽는다 — 종전 하드코딩
+/// (`trustthisfolder`/`Doyoutrust`)은 claude 문면 변경·타 CLI 도입 때마다 코드 수정을 강요했다.
+/// 소스 = agents.json `approval_patterns` 중 `name=="trust-prompt"` 항목의 `pattern`.
+/// ★범위: **trust-prompt 항목만** 여기서 소비한다. 그 외 패턴(tool-permission 등)은 데몬 승인
+/// 격상 스캔용이고 자동 응답 대상이 아니다(agents.json `_doc` 계약 — 사람 판단 보존).
+/// 컴파일 실패는 None(=내장 needle 폴백) — 사용자가 정규식을 깨뜨려도 부트가 멈추지 않는다.
+fn trust_prompt_regex(spec: &Value) -> Option<regex::Regex> {
+    spec["approval_patterns"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|p| p["name"].as_str() == Some("trust-prompt"))
+                .and_then(|p| p["pattern"].as_str())
+        })
+        .and_then(|pat| match regex::Regex::new(pat) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                eprintln!(
+                    "[launch-agent] agents.json trust-prompt pattern 컴파일 실패({e}) \
+                     — 내장 needle 로 폴백"
+                );
+                None
+            }
+        })
+}
+
+/// 폴더신뢰 프롬프트가 **신규 출현분**에 있는가.
+/// ★매칭 대상 결정(정규식 vs delta_flat): 선언 `pattern` 은 **정규식**이라 공백·`(a|b)`·`?` 를
+///   쓰므로, 공백을 전부 제거한 `delta_flat` 에는 원리상 맞지 않는다(기존 하드코딩이 공백 없는
+///   `trustthisfolder` 형태였던 것도 매칭 대상이 flat 텍스트였기 때문이다). 그래서 정규식은
+///   **공백을 1칸으로 정규화한 원문 델타**에 돌린다 — 정규식의 공백 의미를 지키면서 TUI 폭에 따라
+///   프롬프트가 접히는 줄바꿈·들여쓰기도 흡수한다(원문 그대로 돌리면 줄바꿈 한 번에 매칭이 깨져
+///   자동확인이 불발하고, 그 대가는 '노드 0 + 고아 좌석'이다).
+/// ★내장 needle 은 지우지 않고 **OR 로 병존**시킨다: ①패턴 부재·컴파일 실패 시의 유일한 경로이고
+///   ②짧은 needle 은 박스 렌더·구 문면("Do you trust this folder?" — 선언 패턴엔 없다)에 더 강건하다.
+///   오탐 방향은 멱등 래치+전송 상한(G35)이 이미 흡수하므로, 병존은 감지력만 넓히고 위험을 늘리지
+///   않는다(무회귀 = 종전 감지의 **상위집합**).
+fn trust_prompt_hit(re: Option<&regex::Regex>, delta_text: &str, delta_flat: &str) -> bool {
+    if let Some(re) = re {
+        let norm: String = delta_text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if re.is_match(&norm) {
+            return true;
+        }
+    }
+    delta_flat.contains("trustthisfolder") || delta_flat.contains("Doyoutrust")
+}
+
 /// agents.json에서 어댑터 스펙 로드
 fn load_agent_spec(agent: &str) -> Result<Value, String> {
     let agents_path = cys::pack::pack_dir().join("agents.json");
@@ -4920,8 +5262,13 @@ fn load_agent_spec(agent: &str) -> Result<Value, String> {
              `cys init-pack`(vendor 본 재시드) → 백업에서 커스텀 어댑터만 되살리기",
         )
     })?;
+    // ★임베드는 두 경로가 **공통으로** 참조한다 — 디스크 히트에도 필드 계층(fill_missing_fields)이
+    //   걸리므로 whole-object 폴백보다 먼저 해소해 둔다.
+    let embedded_agents: Option<Value> = embedded_agents_json();
     if let Some(spec) = agents.get(agent) {
-        return Ok(spec.clone());
+        let mut spec = spec.clone();
+        fill_missing_fields(&mut spec, embedded_agents.as_ref().and_then(|v| v.get(agent)));
+        return Ok(spec);
     }
     // ★W-B 보완(성찰 2 적대검증 산물): user 승격의 대가 = 동결 — 사용자가 agents.json 을 수정해
     // 두면 vendor 가 **새 어댑터**를 출하해도 .new 병치만 되고 디스크 본엔 영영 안 들어와
@@ -4929,16 +5276,15 @@ fn load_agent_spec(agent: &str) -> Result<Value, String> {
     // 문제를 코드로 메우지만 agents.json 엔 그 보완이 없었다). 디스크에 없는 키만 **임베드
     // 어댑터로 폴백**해 '사용자 수정 보존'과 'vendor 신기능 즉시 사용'의 합집합을 만든다.
     // (덮어쓰기 0 — 디스크 정의가 있으면 항상 디스크가 이긴다.)
-    let embedded_agents: Option<Value> = cys::pack::PACK_ALL
-        .iter()
-        .find(|(r, _)| *r == "agents.json")
-        .and_then(|(_, c)| serde_json::from_str(c).ok());
     if let Some(spec) = embedded_agents.as_ref().and_then(|v| v.get(agent)) {
         eprintln!(
             "[agents] '{agent}' 은 내 agents.json 에 없어 **내장 정의로 폴백**했다 \
              (vendor 신규 어댑터 — 내 수정본은 그대로 보존됨). 편입하려면: cys pack-merge --file agents.json"
         );
-        return Ok(spec.clone());
+        let mut spec = spec.clone();
+        // 대칭 유지(경로별 특례 금지) — 같은 소스라 실제로 채울 것은 없다(no-op).
+        fill_missing_fields(&mut spec, embedded_agents.as_ref().and_then(|v| v.get(agent)));
+        return Ok(spec);
     }
     Err(format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
 }
@@ -5326,6 +5672,9 @@ fn boot_agent_on_surface(
     //   상한(2회)까지 재전송. 신뢰 분기는 더 이상 readiness 검사를 막지 않는다.
     let mut trust_sends: u32 = 0;
     let mut trust_seen_at: Option<u64> = None; // 프롬프트를 관측한 시점의 델타 커서
+    // ★(W4 · B19) 폴더신뢰 프롬프트 패턴을 **어댑터 선언에서** 읽는다(하드코딩 제거).
+    //   상세 근거는 trust_prompt_regex·trust_prompt_hit 정의부 주석.
+    let trust_re: Option<regex::Regex> = trust_prompt_regex(&spec);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(BUDGET_TICK_MS));
         // 화면(vt100 그리드) — 사람이 보는 현재 상태. 잔존 프롬프트도 여기 남는다.
@@ -5347,7 +5696,7 @@ fn boot_agent_on_surface(
             ));
         }
         // ② 폴더신뢰 프롬프트 — 멱등 래치·상한·소멸 확인. `continue` 하지 않는다(ready 검사 계속).
-        if delta_flat.contains("trustthisfolder") || delta_flat.contains("Doyoutrust") {
+        if trust_prompt_hit(trust_re.as_ref(), &delta_text, &delta_flat) {
             let first = trust_sends == 0;
             let persisted = trust_seen_at.map(|c| delta_cursor > c).unwrap_or(false);
             if first || (trust_sends < BUDGET_TRUST_MAX_SENDS && persisted) {
@@ -10111,6 +10460,202 @@ mod tests {
             Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
             None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
         }
+    }
+
+    /// ★(W4 · 재감사 CS-1③/비평2 C-1) **필드 단위 계층** 핀 — whole-object 폴백의 사각을 메운다:
+    /// 유저가 커스터마이즈해 둔 어댑터는 vendor 가 새로 출하한 `ready_marker`·`approval_patterns`
+    /// 를 못 받아 동결됐다(readiness 시간폴백 퇴화 · 폴더신뢰 자동확인 불발).
+    /// ①키 결손 → 임베드 값 보강 ②디스크 선언 존재 → 무접촉(위 테스트의 '디스크가 이긴다' 불변식
+    /// 을 필드 층에서도 유지) ③명시 `null` = 의도적 없음 → 보강 안 함 ④계층 대상 아닌 키 무접촉.
+    #[test]
+    fn load_agent_spec_field_layer_fills_marker_and_trust_pattern() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-agentfield-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        let embed = embedded_agents_json().expect("임베드 agents.json 파싱");
+        // 계층 2키를 실제로 가진 어댑터를 임베드에서 취득(하드코딩 금지 — 팩 진실이 사료).
+        let key = embed
+            .as_object()
+            .expect("객체")
+            .iter()
+            .find(|(k, v)| {
+                !k.starts_with('_')
+                    && v.get("ready_marker").is_some()
+                    && v.get("approval_patterns").is_some()
+            })
+            .map(|(k, _)| k.clone())
+            .expect("ready_marker+approval_patterns 를 가진 임베드 어댑터 존재");
+        let write_one = |spec: Value| {
+            let mut m = serde_json::Map::new();
+            m.insert(key.clone(), spec);
+            std::fs::write(
+                td.join("agents.json"),
+                serde_json::to_string(&Value::Object(m)).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // ① 두 키를 뺀 사용자본(구 커스터마이즈 재현) → 임베드 값으로 보강돼야
+        let mut stripped = embed[&key].clone();
+        let o = stripped.as_object_mut().unwrap();
+        o.remove("ready_marker");
+        o.remove("approval_patterns");
+        o.insert("notes".into(), json!("MY-EDIT"));
+        write_one(stripped);
+        let got = load_agent_spec(&key).expect("로드");
+        assert_eq!(
+            got["ready_marker"], embed[&key]["ready_marker"],
+            "결손 ready_marker 가 임베드(vendor)로 채워져야 — 동결 해소"
+        );
+        assert_eq!(
+            got["approval_patterns"], embed[&key]["approval_patterns"],
+            "결손 approval_patterns 가 임베드(vendor)로 채워져야"
+        );
+        assert_eq!(
+            got["notes"].as_str(),
+            Some("MY-EDIT"),
+            "계층 대상 아닌 키는 무접촉(사용자 수정 보존)"
+        );
+        // 디스크 파일은 고쳐 쓰지 않는다(★W-B: 사용자 소유 파일 무변경 — 메모리 보강만).
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(td.join("agents.json")).unwrap()).unwrap();
+        assert!(
+            on_disk[&key].get("ready_marker").is_none(),
+            "보강이 디스크에 기록되면 안 된다(사용자 파일 무접촉)"
+        );
+
+        // ② 디스크 선언 우선 — 커스텀 마커·패턴을 임베드가 덮지 않는다
+        let mut custom = embed[&key].clone();
+        custom["ready_marker"] = json!("MY-MARKER");
+        custom["approval_patterns"] = json!([]);
+        write_one(custom);
+        let got = load_agent_spec(&key).expect("로드");
+        assert_eq!(got["ready_marker"].as_str(), Some("MY-MARKER"), "디스크가 이긴다");
+        assert_eq!(got["approval_patterns"], json!([]), "빈 배열 선언도 존중");
+
+        // ③ 명시 null = "의도적으로 없음" 선언 → 임베드로 덮지 않는다
+        let mut nulled = embed[&key].clone();
+        nulled["ready_marker"] = Value::Null;
+        write_one(nulled);
+        let got = load_agent_spec(&key).expect("로드");
+        assert!(got["ready_marker"].is_null(), "명시 null 은 사용자 의도 — 보강 금지");
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+    }
+
+    /// ★(W4 · CS-1③) 감지 오라클 핀: extract_bin(env-prefix 건너뛰기) + 경로형 실재 + **실행권**.
+    /// 종전 부트 인라인 판정은 `exists()` 만 봤다 — 실행권 없는 파일을 '설치됨'으로 오탐하고
+    /// 기동에서야 EACCES 로 죽었다. python 오라클(os.access X_OK)과 판정이 어긋난 지점이기도 하다.
+    #[test]
+    fn detect_agent_binary_requires_exec_bit_and_skips_env_prefix() {
+        let td = std::env::temp_dir().join(format!("cys-agentdetect-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        let exec = td.join("fakeagent");
+        let noexec = td.join("fakeagent-noexec");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&noexec, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let agents = json!({
+            // env-prefix 가 붙어도 바이너리 토큰을 정확히 고른다(claude 어댑터 형태)
+            "ok": {"cmd": format!("FOO=bar {} --flag", exec.display())},
+            "noexec": {"cmd": noexec.display().to_string()},
+            "absent": {"cmd": td.join("nope-nonexistent").display().to_string()},
+        });
+        let d = detect_agent_binary("ok", &agents);
+        assert!(d.installed, "실행권 있는 경로형 바이너리는 installed({})", d.reason);
+        assert_eq!(
+            d.bin,
+            exec.display().to_string(),
+            "env-prefix 를 건너뛴 토큰이어야(extract_bin 단일 진실)"
+        );
+        assert_eq!(d.resolved.as_deref(), Some(exec.as_path()), "해소 경로 보고");
+        let d = detect_agent_binary("absent", &agents);
+        assert!(!d.installed, "부재 경로는 미설치");
+        assert!(d.resolved.is_none());
+        assert!(!d.hint.is_empty(), "미설치엔 안내 힌트가 붙는다");
+        // 실행권 판정은 unix 전용(Windows 는 실행권 개념이 없어 실재로만 본다)
+        #[cfg(unix)]
+        {
+            let d = detect_agent_binary("noexec", &agents);
+            assert!(
+                !d.installed,
+                "실행권 없는 파일은 미설치여야(X_OK 강화 — exists() 오탐 차단): {}",
+                d.reason
+            );
+        }
+        // agents.json 에 정의가 없으면 agent 이름을 바이너리로 보고 PATH 를 본다(종전 동형)
+        let d = detect_agent_binary("no-such-agent-xyz", &agents);
+        assert_eq!(d.bin, "no-such-agent-xyz");
+        assert!(!d.installed);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★(W4 · B19) 폴더신뢰 판정이 **어댑터 선언을 실제로 소비**하고, 내장 needle 폴백을
+    /// 잃지 않았음을 핀한다(무회귀 = 종전 감지의 상위집합).
+    #[test]
+    fn trust_prompt_hit_consumes_adapter_pattern_and_keeps_legacy_needles() {
+        fn flat(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let embed = embedded_agents_json().expect("임베드 agents.json");
+        let spec = &embed["claude"];
+        let re = trust_prompt_regex(spec).expect("claude 어댑터에 trust-prompt 선언 존재");
+
+        // ① 선언 문면 그대로
+        let t = "  Do you trust the files in this folder?  \n";
+        assert!(trust_prompt_hit(Some(&re), t, &flat(t)));
+        // ② TUI 폭에 따라 접힌 프롬프트 — 공백 정규화가 흡수한다(원문 정규식이면 여기서 깨진다)
+        let t = "Do you trust the files\n   in this folder?";
+        assert!(trust_prompt_hit(Some(&re), t, &flat(t)));
+        // ③ 구 문면(선언 패턴엔 없다) — 내장 needle 폴백이 잡는다
+        let t = "Do you trust this folder?";
+        assert!(trust_prompt_hit(Some(&re), t, &flat(t)), "선언+needle 병존");
+        assert!(trust_prompt_hit(None, t, &flat(t)), "패턴 부재 시 needle 단독 폴백");
+        // ④ 선언 패턴이 내장 needle 과 **무관한 문면**이어도 소비된다(하드코딩 탈출 증명)
+        let custom = json!({"approval_patterns": [
+            {"name": "trust-prompt", "pattern": "Vertraust du (diesem|dem) Ordner"},
+            {"name": "tool-permission", "pattern": "NEVER-AUTO-ANSWER"}
+        ]});
+        let re2 = trust_prompt_regex(&custom).expect("커스텀 trust-prompt 패턴");
+        let t = "Vertraust du\n  diesem Ordner?";
+        assert!(trust_prompt_hit(Some(&re2), t, &flat(t)), "어댑터 선언 소비 실패(B19)");
+        assert!(
+            !trust_prompt_hit(None, t, &flat(t)),
+            "그 문면은 내장 needle 로 안 잡힌다 — 선언 소비가 유일 경로임을 증명"
+        );
+        // ⑤ trust-prompt 외 패턴은 소비하지 않는다(사람 판단 보존 — 자동응답 금지 계약)
+        let t = "NEVER-AUTO-ANSWER";
+        assert!(!trust_prompt_hit(Some(&re2), t, &flat(t)), "tool-permission 을 소비하면 안 된다");
+        // ⑥ 무관한 출력에 오탐 금지
+        let t = "worker ready. no prompts here.";
+        assert!(!trust_prompt_hit(Some(&re), t, &flat(t)));
+        assert!(!trust_prompt_hit(None, t, &flat(t)));
+        // ⑦ 패턴 부재·깨진 정규식 → None(내장 needle 폴백 경로)
+        assert!(trust_prompt_regex(&json!({})).is_none(), "approval_patterns 부재");
+        assert!(
+            trust_prompt_regex(&json!({"approval_patterns": [{"name": "approve", "pattern": "x"}]}))
+                .is_none(),
+            "trust-prompt 항목 부재"
+        );
+        assert!(
+            trust_prompt_regex(
+                &json!({"approval_patterns": [{"name": "trust-prompt", "pattern": "(unclosed"}]})
+            )
+            .is_none(),
+            "깨진 정규식은 폴백(부트 중단 금지)"
+        );
     }
 
     /// minisign keypair 생성 → (pubkey_base64_rawline, sign_fn).
