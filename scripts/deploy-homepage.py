@@ -62,9 +62,38 @@ def ftp_list(e, path):
     return r.stdout.decode("utf-8", "replace").splitlines()
 
 
+def sftp_put(e, local, remote):
+    """FTPS 450 폴백 — Hostinger 는 해시밀도 높은 파일(pack-manifest.json)을 FTP 에서
+    "Link to file server lost"(450)로 차단한다(v0.13.3·v0.14.7 실측). SFTP(65002·같은 계정)가
+    정공법. ★docroot 차이: FTP 루트=docroot 직행 / SFTP 루트=계정 홈 → `domains/.../public_html/`
+    접두 필요. 암호는 expect 로 구동(셸 보간 금지 — $env 로만)."""
+    sftp_root = "domains/cysinsight.com/public_html/"
+    with tempfile.TemporaryDirectory() as td:
+        batch = os.path.join(td, "b")
+        open(batch, "w").write("put %s %s%s\n" % (local, sftp_root, remote))
+        exp = os.path.join(td, "e")
+        open(exp, "w").write(
+            'set timeout 300\n'
+            'spawn sftp -P %s -o BatchMode=no -o StrictHostKeyChecking=accept-new '
+            '-b %s %s@%s\n'
+            'expect {\n'
+            '  -re "(?i)password" { send -- "$env(CYS_SFTP_PASS)\\r"; exp_continue }\n'
+            '  eof {}\n'
+            '}\n'
+            'catch wait result\n'
+            'exit [lindex $result 3]\n'
+            % (e.get("FTP_SFTP_PORT", "65002"), batch, e["FTP_USER"], e["FTP_HOST"]))
+        env = dict(os.environ, CYS_SFTP_PASS=e["FTP_PASS"])
+        r = subprocess.run(["/usr/bin/expect", exp], capture_output=True, env=env)
+        return r.returncode == 0
+
+
 def ftp_put(e, local, remote):
     r = curl(ftp_auth(e) + ["-T", local, ftp_base(e) + remote])
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True
+    # FTPS 실패(450 등) → SFTP 폴백(정공법 — 함수 docstring 참조)
+    return sftp_put(e, local, remote)
 
 
 def ftp_delete(e, remote):
