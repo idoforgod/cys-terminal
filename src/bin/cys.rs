@@ -560,6 +560,13 @@ enum Command {
         /// Working directory for launched nodes
         #[arg(long)]
         cwd: Option<String>,
+        /// 기계 판독 결과를 stdout 마지막 줄에 JSON 으로 낸다(B1·G11·G29·B8):
+        /// `{"roles":[{"role","agent","outcome","mandatory","install_hint"}],"summary":{…}}`.
+        /// outcome ∈ launched | already_alive | busy | missing | failed | recovered.
+        /// ★bare exit 의미는 **구계약 유지**(0=Fatal 실패 없음 / 1=Fatal 실패) — busy 등의 타입
+        /// 구분은 이 필드로만 표현한다. exit 의미 전환은 GUI --json 소비 착지와 원자다(금지 방향 ⑧).
+        #[arg(long)]
+        json: bool,
     },
     /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출.
     /// 새로 만드는 파일에는 선언 블록 v1 한 줄이 **자동 동봉**된다(집계기는 파일명이 아니라 이 선언으로 귀속을 판정한다).
@@ -2007,14 +2014,12 @@ fn run(command: Command) -> i32 {
             })
         }),
 
-        Command::ClaimRole { role, surface, takeover_empty_seat } => target_surface(&surface, &None).and_then(|sid| {
-            request("system.claim_role", json!({"role": role, "surface_id": sid,
-                                                "takeover_empty_seat": takeover_empty_seat}))
-                .map(|r| println!("registered: {} → surface:{}", r["role"].as_str().unwrap_or("?"), sid))
-        }),
+        Command::ClaimRole { role, surface, takeover_empty_seat } => {
+            return run_claim_role(&role, surface, takeover_empty_seat)
+        }
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
-        Command::Boot { cwd } => return run_boot(cwd),
+        Command::Boot { cwd, json } => return run_boot(cwd, json),
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
@@ -4101,12 +4106,96 @@ enum BootLock {
     Busy,
 }
 
+/// ─────────── ★BUDGET parity 상수 블록 (T-0147-7 W2 · B9·B17·P3-A-120S) ───────────
+/// **이 블록의 값은 `cysjavis-pack/bin/javis_budget.py` 의 동명 leaf 와 기계 대조된다**
+/// (`javis_budget.RUST_PARITY_CONSTS` 표 + 건강성 러너 H-TIME-1). Rust 는 python 을 import 할 수
+/// 없으므로 파리티는 grep 기계 대조로만 보장된다 — 한쪽만 바꾸면 검체가 적색이 된다.
+///
+/// ★불변식(비평2 D-2): **내부 감액 금지**(이 값들은 냉시작 실측 하한이다) · 외부 상한은 python
+/// 쪽에서 이 값들의 합+마진으로 파생 · 침묵 창은 하트비트로 상쇄.
+/// ★카운트 회계 금지(B17): 아래 TICK 은 폴링 주기일 뿐 **시간 회계의 단위가 아니다** — 데드라인은
+/// `Instant` 벽시계로만 판정한다(종전 `waited += 2` 산술은 실효 대기를 25%+α 어긋나게 했다).
+const BUDGET_READINESS_FLOOR_SECS: u64 = 30;
+const BUDGET_READINESS_MULT: u64 = 2;
+const BUDGET_RESTORE_CAP_SECS: u64 = 20;
+const BUDGET_TICK_MS: u64 = 2500;
+const BUDGET_POST_MARKER_SETTLE_SECS: u64 = 2;
+const BUDGET_ACK_WAIT_SECS: u64 = 8;
+const BUDGET_TRUST_SETTLE_SECS: u64 = 2;
+const BUDGET_HEARTBEAT_INTERVAL_SECS: u64 = 20;
+/// G35: 폴더신뢰 자동확인 재전송 상한(멱등 래치 + 이 상한으로 매 tick 재전송을 절단).
+const BUDGET_TRUST_MAX_SENDS: u32 = 2;
+
+/// readiness 폴링 상한(벽시계) — python `javis_budget.launch_readiness_max_s` 와 동일 산식.
+fn budget_readiness_max(inject_delay_secs: u64, restore: bool) -> std::time::Duration {
+    let base = inject_delay_secs.max(BUDGET_READINESS_FLOOR_SECS) * BUDGET_READINESS_MULT;
+    let secs = if restore {
+        base.min(BUDGET_RESTORE_CAP_SECS)
+    } else {
+        base
+    };
+    std::time::Duration::from_secs(secs)
+}
+
 /// 현재 소켓(CYS_SOCKET 상속)의 boot 락 파일을 비차단 flock 획득 시도.
-fn acquire_boot_lock() -> BootLock {
-    let lock_path = cys::socket_path()
+fn boot_lock_path() -> std::path::PathBuf {
+    cys::socket_path()
         .parent()
         .map(|d| d.join("cys-boot.lock"))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/cys-boot.lock"));
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/cys-boot.lock"))
+}
+
+/// ★(W2 · G12) boot 락 **커버리지 확장**의 재진입 마커.
+///
+/// 종전 커버리지는 `cys boot` 본문 하나였다 — 그런데 팀 스폰은 세 경로로 일어난다:
+///   ① `cys boot`(GUI 버튼·훅 ④·LLM 직접)  ② ④-b `boot-reviewers` → `javis_boot_node` →
+///   **별도 프로세스 `cys launch-agent`**  ③ `cys restore`·`node-recover`.
+/// ②·③이 락 **밖**이라 ①과 겹치면 같은 리뷰어를 두 번 스폰하는 창이 열려 있었다(G12).
+/// 그래서 `launch-agent` 도 같은 소켓별 락에 참여시킨다. 두 겹의 재진입 방어:
+///   · 프로세스 내부: `BOOT_LOCK_HELD`(run_boot 가 이미 쥔 채 in-process 로 호출한다 — 같은
+///     프로세스에서 다른 fd 로 flock 을 재획득하면 자기 자신에게 막힌다).
+///   · 자식 프로세스: `CYS_BOOT_LOCK_HELD=1` env 전파(javis_boot_node 가 띄우는 `cys launch-agent`
+///     는 run_boot 의 자식이 아니지만, 미래에 그런 배선이 생겨도 자기 교착이 없다).
+static BOOT_LOCK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn boot_lock_already_held() -> bool {
+    BOOT_LOCK_HELD.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var("CYS_BOOT_LOCK_HELD").map(|v| v == "1").unwrap_or(false)
+}
+
+/// launch-agent 경로의 락 참여 — **보류가 아니라 유계 대기**다.
+/// Busy 에서 즉시 성공-skip 하면 호출자(boot_node)가 원하는 노드가 안 뜨고, 무한 대기하면 부트가
+/// 멈춘다. 그래서 짧게 기다렸다가(선행 boot 가 이 role 을 세울 시간) 여전히 Busy 면 **경고 후 진행**
+/// 한다 — 중복 스폰 창을 '무제한'에서 '대기 상한 이후의 꼬리'로 줄이는 것이 이 게이트의 목적이고,
+/// 최종 중복 방어는 데몬의 특권 가드·live-slot 계약이다(가용성 우선).
+fn acquire_launch_lock() -> Option<std::fs::File> {
+    if boot_lock_already_held() {
+        return None; // 이미 상위(run_boot)가 쥐고 있다 — 재획득은 자기 교착이다.
+    }
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+    loop {
+        match acquire_boot_lock() {
+            BootLock::Acquired(g) => {
+                BOOT_LOCK_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+                return g;
+            }
+            BootLock::Busy => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "[launch-agent] boot 락 대기 상한 초과 — 직렬화 없이 진행(중복은 데몬 특권 \
+                         가드·live-slot 계약이 방어). 동시 부트가 진행 중일 수 있다."
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+}
+
+fn acquire_boot_lock() -> BootLock {
+    let lock_path = boot_lock_path();
     if let Some(parent) = lock_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -4123,51 +4212,226 @@ fn acquire_boot_lock() -> BootLock {
             BootLock::Busy
         }
     }
+    // ★A8rs(T-0147-7 W2): non-unix 는 종전에 **무조건 `Acquired`** 였다 — 파일을 열기만 하고 어떤
+    //   상호배제도 하지 않은 채 "락을 얻었다"고 보고했다. 그 거짓 보고가 Windows 에서 ①리뷰어
+    //   중복 스폰 ②settings.json 3-writer 교차 파손을 무장했다(A8 재검증: 지배 실패 모드는 RMW
+    //   유실이 아니라 '공유 .tmp 교차 파손 → 등록부 수리 거부'와 '중복 스폰'이었다).
+    //   python 측 `javis_lock.py`(W1a 신설)와 **동형 규약**의 pidfile 락을 쓴다:
+    //     · O_CREAT|O_EXCL 로 `<lock>.pid` 를 만든 쪽만 승자(파일시스템 원자성).
+    //     · 보유자 pid 가 죽어 있으면 스테일로 회수(무한 거부 창 방지 — R1 과 동형).
+    //     · 파일시스템이 EXCL 을 못 주는 예외 상황에서만 `Acquired(None)`(종전 동작)로 강등한다.
     #[cfg(not(unix))]
     {
-        BootLock::Acquired(Some(f))
+        drop(f);
+        match win_pidfile_lock(&lock_path) {
+            WinLock::Won(g) => BootLock::Acquired(Some(g)),
+            WinLock::Busy => BootLock::Busy,
+            WinLock::Unavailable => BootLock::Acquired(None),
+        }
     }
 }
 
-fn run_boot(cwd: Option<String>) -> i32 {
+#[cfg(not(unix))]
+enum WinLock {
+    Won(std::fs::File),
+    Busy,
+    Unavailable,
+}
+
+/// A8rs: pidfile 기반 크로스플랫폼 락(non-unix 경로 전용). javis_lock.py 의 pidfile 백엔드와 동형.
+#[cfg(not(unix))]
+fn win_pidfile_lock(lock_path: &std::path::Path) -> WinLock {
+    use std::io::Write;
+    let pidfile = lock_path.with_extension("pid");
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&pidfile)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                let _ = f.flush();
+                return WinLock::Won(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt == 0 && pidfile_holder_dead(&pidfile) {
+                    // 스테일 회수 — 보유자가 죽었으면 무한 거부 창을 남기지 않는다.
+                    let _ = std::fs::remove_file(&pidfile);
+                    continue;
+                }
+                return WinLock::Busy;
+            }
+            Err(_) => return WinLock::Unavailable,
+        }
+    }
+    WinLock::Busy
+}
+
+#[cfg(not(unix))]
+fn pidfile_holder_dead(pidfile: &std::path::Path) -> bool {
+    let Ok(txt) = std::fs::read_to_string(pidfile) else {
+        return true; // 읽을 수 없는 락 파일 = 신뢰 불가 → 스테일 취급
+    };
+    let Ok(pid) = txt.trim().parse::<u32>() else {
+        return true;
+    };
+    // tasklist 로 생존 확인(Windows 표준 도구). 조회 실패는 '살아있음'으로 보수 판정(오회수 금지).
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            !s.contains(&pid.to_string())
+        }
+        Err(_) => false,
+    }
+}
+
+/// ★(W2 · B1) PLAN 정책 열 — `(role, agent, mandatory)`.
+/// **python 정본 `javis_orchestra.BOOT_PLAN` 과 기계 대조된다**(H-PRED-7·H-EXIT-4):
+///   mandatory=true  ↔ `FAIL_FATAL`   (cso·worker — 조직 최소 실행 단위. 실패=부트 실패)
+///   mandatory=false ↔ `FAIL_DEGRADE` (리뷰어 — 경고 강등 후 ④-b·⑤ 계속. 대체 폴백으로 보완)
+/// 종전엔 이 판정이 편성 테이블 **밖**(호출부 산문)에 있어, 리뷰어 1종 고장이 팀 전체 부트 실패로
+/// 번지는 영구 데드엔드였다(B1). 정책을 편성과 같은 행에 둔다 — 소비자는 산문 대신 이 열을 읽는다.
+const BOOT_PLAN: &[(&str, &str, bool)] = &[
+    ("cso", "claude", true),
+    ("worker", "claude", true),
+    ("reviewer-gemini", "gemini", false),
+    ("reviewer-codex", "codex", false),
+    ("reviewer-grok", "grok", false),
+];
+
+/// ★(W2 · A1 클래스 · B3) `cys boot` 의 **스킵 술어** 3등급 — surface.list 한 행 → 판정.
+/// `node_liveness`(python 정본 `javis_boot_node.node_liveness`) 의 Rust 미러다.
+/// 종전 술어는 `!exited` 단독이었다: role 을 쥔 채 에이전트가 죽은 좌석(=빈 좌석)을 '가동 중'으로
+/// 보고 건너뛰어, 부트가 영원히 팀을 못 세우는 라이브락을 먹였다(B3 — 데몬 주석이 예언한 재발).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatLiveness {
+    AwakeConfirmed,
+    AlivePresumed,
+    Unknown,
+    Absent,
+}
+
+fn seat_liveness(s: &Value) -> (SeatLiveness, &'static str) {
+    if s["exited"].as_bool().unwrap_or(false) {
+        return (SeatLiveness::Absent, "exited");
+    }
+    // ① awakened_at 래치 — 데몬 SOT·영속·단방향. 존재=각성 확정.
+    if s["awakened_at"].as_f64().unwrap_or(0.0) > 0.0 {
+        return (SeatLiveness::AwakeConfirmed, "awakened_at 래치");
+    }
+    // ② agent_alive — 프로세스 생존. **각성은 아니다**(B6) 그러나 재스폰 금지 대상이다.
+    if s["agent_alive"].as_bool().unwrap_or(false) {
+        return (SeatLiveness::AlivePresumed, "agent_alive(각성 미확인)");
+    }
+    // ③ 좌석(커널 사실). ★필드 부재(구 데몬)와 "unknown"(프로브 실패)을 **융합하지 않는다**:
+    //    부재는 '이 차원 무신호' → 아래로 흘러 absent(구 동작), unknown 은 이원 규칙 대상.
+    match s["seat"].as_str() {
+        Some("occupied") => (SeatLiveness::AlivePresumed, "좌석 점유(자손 프로세스)"),
+        Some("unknown") => (SeatLiveness::Unknown, "좌석 판정 불가(프로브 실패)"),
+        _ => (SeatLiveness::Absent, "좌석 비었음/무신호"),
+    }
+}
+
+/// role → 그 role 을 쥔 비종료 surface 행(없으면 None). worker 는 접두 수용(데몬 dedup: worker-N).
+fn find_seat_row<'a>(surfaces: &'a [Value], role: &str) -> Option<&'a Value> {
+    surfaces.iter().find(|s| {
+        let r = s["role"].as_str().unwrap_or("");
+        !s["exited"].as_bool().unwrap_or(true)
+            && (r == role || (role == "worker" && r.starts_with("worker")))
+    })
+}
+
+fn fetch_surfaces() -> Vec<Value> {
+    request("surface.list", json!({}))
+        .ok()
+        .and_then(|r| r["surfaces"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// 플랫폼별 설치 힌트(G29·B8) — 의무 CLI 미설치는 exit 0 성공이 아니라 typed `missing` outcome 이다.
+fn install_hint(agent: &str) -> &'static str {
+    match agent {
+        "claude" => {
+            if cfg!(windows) {
+                "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            } else {
+                "`curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭"
+            }
+        }
+        "codex" => "`npm i -g @openai/codex` (선택 리뷰어)",
+        "gemini" => "Antigravity CLI `agy` 설치 후 agents.json 의 cmd 경로 확인 (선택 리뷰어)",
+        "grok" => "grok CLI 설치 (선택 리뷰어 — 미설치면 건너뜀이 정상)",
+        _ => "해당 CLI 설치 후 agents.json 의 cmd 를 확인 (선택 노드)",
+    }
+}
+
+fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
     // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
     // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
     // spawn_orchestra_boot · 마스터 LLM이 스스로 boot). 두 boot가 겹치면 각자 "역할 미가동" 스냅샷을
-    // 보고 리뷰어(데몬 특권 가드 없음)를 중복 스폰할 수 있다. 소켓별 boot 락을 비차단 획득 —
-    // 이미 다른 boot가 진행 중이면 즉시 성공 반환(그 boot가 팀을 세운다·이 호출은 멱등 no-op).
+    // 보고 리뷰어(데몬 특권 가드 없음)를 중복 스폰할 수 있다. 소켓별 boot 락을 비차단 획득.
     // (claim-role의 boot 부작용은 아키텍트 성찰로 제거 — 레지스트리 op가 프로세스 스폰하는 결합 차단.)
+    //
+    // ★(W2 · G11) **busy 를 스폰 성공으로 오인하던 경로 차단**. 종전엔 락 경합에서 산문 한 줄만 찍고
+    // exit 0 을 냈다 — 소비부(javis_bootstrap ④)는 그 0을 '팀을 세웠다'로 읽고 **CEO 티켓을 소각**해
+    // 무스폰 티켓 소각(1회성 티켓 ⟺ 실스폰 불변식 파괴)이 났다. 이제 `--json` 의 outcome=`busy` 로
+    // 타입 구분하고, 소비부는 실스폰 확인 후에만 티켓을 태운다.
+    // ★bare exit 의미는 구계약 유지(0) — 전환은 W4 GUI --json 소비와 원자(금지 방향 ⑧).
     let _boot_lock = match acquire_boot_lock() {
-        BootLock::Acquired(g) => g,
+        BootLock::Acquired(g) => {
+            // ★(W2 · G12) 락 보유를 프로세스 내부·자식 프로세스에 알린다 — 아래에서 in-process 로
+            // 호출하는 run_launch_agent 가 같은 락을 재획득해 자기 자신에게 막히는 것을 막는다.
+            BOOT_LOCK_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::env::set_var("CYS_BOOT_LOCK_HELD", "1");
+            g
+        }
         BootLock::Busy => {
             println!("cys boot — 다른 boot 진행 중(락 보유) — 중복 스폰 방지로 skip (그 boot가 팀을 세움)");
+            if as_json {
+                let roles: Vec<Value> = BOOT_PLAN
+                    .iter()
+                    .map(|(role, agent, mandatory)| {
+                        json!({"role": role, "agent": agent, "outcome": "busy",
+                               "mandatory": mandatory, "reason": "boot 락 보유자 존재(중복 스폰 방지)"})
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    json!({"roles": roles,
+                           "summary": {"launched": 0, "already_alive": 0, "busy": BOOT_PLAN.len(),
+                                       "missing": 0, "failed": 0, "recovered": 0,
+                                       "fatal_failed": 0, "lock": "busy"}})
+                );
+            }
             return 0;
         }
     };
-    // (역할, 에이전트) 표준 편성 — 4차 의무 4종 + 선택 grok. 순서: CSO 먼저(감독).
-    const PLAN: &[(&str, &str)] = &[
-        ("cso", "claude"),
-        ("worker", "claude"),
-        ("reviewer-gemini", "gemini"),
-        ("reviewer-codex", "codex"),
-        ("reviewer-grok", "grok"),
-    ];
     let agents: Value = std::fs::read_to_string(cys::pack::pack_dir().join("agents.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
-    // 이미 가동 중인 역할은 중복 기동하지 않는다
-    let live_roles: std::collections::HashSet<String> = request("surface.list", json!({}))
-        .ok()
-        .and_then(|r| r["surfaces"].as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter(|s| !s["exited"].as_bool().unwrap_or(true))
-        .filter_map(|s| s["role"].as_str().map(|x| x.to_string()))
-        .collect();
-    let mut launched = 0;
-    let mut failed = 0;
+    // ★(W2 · G12) run_boot 은 **iteration 마다 role 생존을 재조회**한다(루프 안 `fetch_surfaces`).
+    // 종전엔 루프 진입 전에 한 번 스냅샷을 떠서, 앞 role 의 기동이 만든 상태 변화(dedup·좌석 승계·
+    // 중간에 붙은 다른 부트의 산물)를 못 봤다 — 락 커버리지 밖 변화에 stale 판정으로 중복 스폰했다.
+    let mut outcomes: Vec<Value> = Vec::new();
+    let (mut launched, mut failed, mut already, mut missing, mut recovered) = (0, 0, 0, 0, 0);
+    let mut fatal_failed = 0;
+    let started = std::time::Instant::now();
+    let mut last_hb = std::time::Instant::now();
     println!("cys boot — LLM orchestrating 편성 점검 (CSO·worker·agy·codex 4종 의무 + grok 선택)");
-    for (role, agent) in PLAN {
+    for (role, agent, mandatory) in BOOT_PLAN {
+        // 침묵 창 상쇄(B9 방향 ③) — 진행 하트비트는 stderr(stdout 기계 계약 무오염).
+        if last_hb.elapsed().as_secs() >= BUDGET_HEARTBEAT_INTERVAL_SECS {
+            eprintln!(
+                "[boot] 진행 중 {}s 경과 — 다음 대상 role={role}",
+                started.elapsed().as_secs()
+            );
+            last_hb = std::time::Instant::now();
+        }
         let bin = agents
             .get(*agent)
             .and_then(|a| a["cmd"].as_str())
@@ -4196,42 +4460,156 @@ fn run_boot(cwd: Option<String>) -> i32 {
             ok
         };
         if !found {
-            // 부트스트랩 무력화 사태(2026-07-09) UX 후속: worker·cso가 claude 미설치(또는 PATH 미발견)로
-            // 조용히 skip되면 사용자는 "pane 0개"의 원인을 모른다 — 설치 힌트를 병기해 자가 진단 가능하게.
-            let hint = match *agent {
-                "claude" => {
-                    if cfg!(windows) {
-                        " (설치: PowerShell에서 `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작)"
-                    } else {
-                        " (설치: `curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭)"
-                    }
-                }
-                "codex" => " (설치: `npm i -g @openai/codex` — 선택 리뷰어)",
-                "gemini" => " (Antigravity CLI `agy` — 선택 리뷰어)",
-                _ => " (선택 노드 — 미설치면 건너뜀이 정상)",
-            };
-            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀{hint}");
+            // ★(W2 · G29·B8) 미설치는 **typed `missing`** 이다 — 종전엔 산문 skip + exit 0 이라
+            // 소비부(bootstrap exit 4 계약)와 불일치했고, 의무 CLI 미설치가 '성공'으로 보고됐다.
+            let hint = install_hint(agent);
+            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀 (설치: {hint})");
+            missing += 1;
+            if *mandatory {
+                fatal_failed += 1;
+            }
+            outcomes.push(json!({"role": role, "agent": agent, "outcome": "missing",
+                                 "mandatory": mandatory, "bin": bin, "install_hint": hint}));
             continue;
         }
-        if live_roles.contains(*role) {
-            println!("· {agent}: 역할 '{role}' 이미 가동 중 — 건너뜀");
+        // ── ★(W2 · B3) 스킵 술어: `!exited` 단독 → `!exited ∧ (awake ∨ presumed ∨ unknown-해소)` ──
+        let surfaces = fetch_surfaces();
+        // 소유 클론 — 아래 Unknown 시한부 해소가 목록을 재조회하므로 참조를 들고 가지 않는다.
+        let mut seat: Option<Value> = find_seat_row(&surfaces, role).cloned();
+        let (mut grade, mut why) = match seat.as_ref() {
+            Some(row) => seat_liveness(row),
+            None => (SeatLiveness::Absent, "좌석 없음"),
+        };
+        // ★Unknown 이원 규칙(비평2 B-2)의 **스폰 경로 절반** — 시한부 해소.
+        //   파괴 경로(kill·reclaim)의 Unknown 은 무조건 hold 지만, 스폰 경로에서 영구 hold 하면
+        //   GUI 콜드스타트(앱 시작 즉시 spawn_orchestra_boot)에서 좌석 캐시가 아직 안 채워진 창에
+        //   술어가 구 `!exited` 로 퇴화해 B3 를 보존한다. seat_cache 의 유일 writer 는 watchdog 5초
+        //   틱이므로 **1주기 대기 후 재조회 1회**, 그래도 불명이면 결손 취급해 스폰한다(가용성 우선).
+        //   중복 스폰은 boot 락이 방어한다 — 그래서 이 fail-open 이 안전하다.
+        if grade == SeatLiveness::Unknown {
+            eprintln!("[boot] role={role}: 좌석 판정 불가 — 워치독 1주기(5s) 대기 후 재조회 1회");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let refreshed = fetch_surfaces();
+            seat = find_seat_row(&refreshed, role).cloned();
+            let (g2, w2) = match seat.as_ref() {
+                Some(row) => seat_liveness(row),
+                None => (SeatLiveness::Absent, "좌석 없음(재조회)"),
+            };
+            (grade, why) = if g2 == SeatLiveness::Unknown {
+                (SeatLiveness::Absent, "잔존 불명 → 결손 취급·스폰(중복은 boot 락이 방어)")
+            } else {
+                (g2, w2)
+            };
+        }
+        if matches!(grade, SeatLiveness::AwakeConfirmed | SeatLiveness::AlivePresumed) {
+            let label = if grade == SeatLiveness::AwakeConfirmed {
+                "각성 확정"
+            } else {
+                "생존추정"
+            };
+            println!("· {agent}: 역할 '{role}' 이미 가동 중({label}: {why}) — 건너뜀");
+            already += 1;
+            outcomes.push(json!({"role": role, "agent": agent, "outcome": "already_alive",
+                                 "mandatory": mandatory, "liveness": label, "reason": why}));
             continue;
+        }
+        // ── ★죽음 확정 좌석: node-recover(비파괴) 우선 → reclaim 에스컬레이션 자동 체인 ──
+        //   좌석이 남아 있는데 에이전트만 죽은 경우(B3 의 그 상태), 새 surface 를 만들면 특권 역할은
+        //   claim_denied 로 막히고 리뷰어는 litter 를 남긴다. 기존 pane 위에서 되살리는 것이
+        //   **비파괴적이고 정확한** 처방이다. 실패하면 reclaim(파괴)으로 한 단계 올린다.
+        if let Some(row) = seat.as_ref() {
+            let sref = row["surface_ref"].as_str().unwrap_or("").to_string();
+            if !sref.is_empty() {
+                println!("· {agent}: 역할 '{role}' 좌석은 있으나 죽음 확정({why}) — node-recover 시도(비파괴)");
+                if run_node_recover(Some(sref.clone()), Some((*role).to_string())) == 0 {
+                    recovered += 1;
+                    outcomes.push(json!({"role": role, "agent": agent, "outcome": "recovered",
+                                         "mandatory": mandatory, "surface_ref": sref,
+                                         "reason": format!("node-recover(비파괴): {why}")}));
+                    continue;
+                }
+                println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·보류 우선 판정 내장)");
+                escalate_reclaim(role);
+                let after = fetch_surfaces();
+                if find_seat_row(&after, role).is_some() {
+                    // reclaim 이 좌석을 못 비웠다 — 새 스폰은 claim_denied/litter 를 만들 뿐이다.
+                    println!("· {agent}: reclaim 후에도 좌석 잔존 — 스폰 보류(수동 점검 필요)");
+                    failed += 1;
+                    if *mandatory {
+                        fatal_failed += 1;
+                    }
+                    outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
+                                         "mandatory": mandatory,
+                                         "reason": "죽음 확정 좌석을 node-recover·reclaim 으로도 해소 못 함",
+                                         "install_hint": "javis_boot_node.py --reclaim --role 로 수동 회수 후 재부트"}));
+                    continue;
+                }
+            }
         }
         println!("· {agent}: 기동 시작 (role={role})…");
         if run_launch_agent(role, agent, cwd.clone()) == 0 {
             launched += 1;
+            outcomes.push(json!({"role": role, "agent": agent, "outcome": "launched",
+                                 "mandatory": mandatory}));
         } else {
             failed += 1;
+            if *mandatory {
+                fatal_failed += 1;
+            }
             println!("· {agent}: 기동 실패 — 나머지 노드는 계속 진행");
+            outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
+                                 "mandatory": mandatory,
+                                 "install_hint": install_hint(agent)}));
         }
     }
     println!(
-        "boot 완료: 신규 기동 {launched} · 실패 {failed} · 현황은 `cys list`로 확인 (role 열)"
+        "boot 완료: 신규 기동 {launched} · 회수복구 {recovered} · 이미가동 {already} · \
+         미설치 {missing} · 실패 {failed} (의무 실패 {fatal_failed}) · 현황은 `cys list`로 확인"
     );
-    if failed > 0 {
+    if as_json {
+        println!(
+            "{}",
+            json!({"roles": outcomes,
+                   "summary": {"launched": launched, "already_alive": already, "busy": 0,
+                               "missing": missing, "failed": failed, "recovered": recovered,
+                               "fatal_failed": fatal_failed, "lock": "acquired"}})
+        );
+    }
+    // ★bare exit 의미는 구계약 유지(비0=실패) — 단 '실패'의 정의를 **의무(Fatal) 실패**로 정확화한다.
+    //   선택 리뷰어 미설치·기동실패로 exit 1 을 내면 소비부가 exit 4(부트 실패)로 승격시켜 영구
+    //   데드엔드가 된다(B1). 타입 구분은 --json 이 담당하고, exit 는 Fatal 만 말한다.
+    if fatal_failed > 0 {
         1
     } else {
         0
+    }
+}
+
+/// 죽음 확정 좌석의 reclaim 에스컬레이션 — 팩 헬퍼(`javis_boot_node.py --reclaim`)에 위임한다.
+/// ★왜 위임인가: reclaim 은 kill 을 포함한 **파괴 행위**이고, 그 안전 판정(`_reclaim_verdict` 의
+/// hold-status/hold-alive/hold-pid 4분기 + kill 직전 pid 재확인)은 이미 감사·검체로 결박돼 있다.
+/// Rust 에 재구현하면 판정 이원화(RC1)를 새로 만든다 — 같은 술어를 두 번 쓰지 않는다.
+/// 선례: `run_skillscan_gate`(cys.rs)가 팩 python 헬퍼를 호출하는 형태와 동일.
+fn escalate_reclaim(role: &str) {
+    let helper = cys::pack::pack_dir().join("bin/javis_boot_node.py");
+    if !helper.exists() {
+        eprintln!("[boot] reclaim 헬퍼 부재({}) — 에스컬레이션 생략", helper.display());
+        return;
+    }
+    match std::process::Command::new("python3")
+        .arg(&helper)
+        .args(["--reclaim", "--role", role])
+        .output()
+    {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            eprintln!(
+                "[boot] reclaim(role={role}) rc={} — {}",
+                o.status.code().unwrap_or(-1),
+                out.trim()
+            );
+        }
+        Err(e) => eprintln!("[boot] reclaim 실행 실패(python3 부재?): {e}"),
     }
 }
 
@@ -4597,6 +4975,21 @@ fn boot_agent_on_surface(
     let mut env_pairs = agent_env_pairs(spec);
     apply_config_dir_override(&mut env_pairs, restore, config_dir);
     let (send, _send_env) = render_launch(&cmd, &env_pairs);
+    // ★(W2 · B4) **기동 send 직전 line_count 스냅샷** — readiness 판정의 시간 귀속 기준선.
+    //
+    // 종전 판정은 화면 **전체**를 봤다. claude 의 ready_marker 는 `❯`(agents.json)이고 그건
+    // powerlevel10k·starship 프롬프트 문자와 같다 — node-recover·좌석 재사용 경로에서 화면에 남은
+    // **잔존 ❯** 가 마커로 매칭돼 "준비됨"을 조기 선언하고, 디렉티브가 맨 셸(zsh)로 들어갔다(B4).
+    // 여기서 뜬 커서 이후의 **신규 출현분**만 매칭 재료로 삼는다(surface.read_text 의 since_line 델타).
+    //
+    // ★개수 비교 구현 금지(브리프 명문): "마커 개수가 늘었나"로 구현하면 TUI 재드로우가 개수를
+    //   흔들어 **영구 오부정**이 되고, T-0147-4 이후 롤백 close 가 실제로 성공하므로 그 오부정은
+    //   **건강한 surface 를 실제로 닫는다**. 그래서 개수가 아니라 '커서 이후 출현'으로 판정한다.
+    let since_line: u64 = fetch_surfaces()
+        .iter()
+        .find(|s| s["surface_id"].as_u64() == Some(sid))
+        .and_then(|s| s["line_count"].as_u64())
+        .unwrap_or(0);
     request(
         "surface.send_text",
         json!({"surface_id": sid, "text": send, "quiet": true, "authoritative": true}),
@@ -4625,51 +5018,99 @@ fn boot_agent_on_surface(
     // 역할이 readiness에서 stall해도 run_restore가 실패로 처리해 다음 역할로 진행하게 해, 한 노드
     // stall이 로스터 전체를 멈추는 것을 막는다(DRILL_LIVE_1: worker spawn 후 중단처럼 보인 근원).
     // agent_meta는 위에서 이미 등록됐으므로(①a) 짧은 캡에도 사망감지·status는 정상 동작한다.
-    let max_wait_secs = if restore {
-        (delay.max(30) * 2).min(20)
-    } else {
-        delay.max(30) * 2
-    };
-    let mut waited = 0u64;
+    // ★(W2 · B17/H-TIME-3) **카운트 회계 전폐** — `waited += 2` 산술을 지우고 `Instant` 벽시계
+    //   데드라인만 쓴다. 종전 회계는 틱당 실비용(RPC 왕복 + 2.5s sleep + trust 분기의 추가 sleep,
+    //   그중 trust 분기 sleep 은 아예 미집계)이 가정치 2s 와 어긋나 실효 대기가 25%+α 오차났다.
+    //   상한은 BUDGET 파생(하드코딩 30/2/20 제거 — javis_budget 와 기계 대조).
+    let max_wait = budget_readiness_max(delay, restore);
+    let max_wait_secs = max_wait.as_secs();
+    let deadline = std::time::Instant::now() + max_wait;
+    let time_fallback_at = std::time::Instant::now() + std::time::Duration::from_secs(delay.max(1));
     let mut ready = false;
     let mut last_screen = String::new();
-    while waited < max_wait_secs {
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-        waited += 2; // ~2.5s per tick (보수적 집계)
+    // ★(W2 · G35) 폴더신뢰 자동확인의 **멱등 래치 + 재전송 상한 + 소멸 확인 + ready 봉쇄 해제**.
+    //   종전 코드는 매 tick 화면을 매칭해 Return 을 **재전송**했고(래치 0·상한 0), 그 분기가
+    //   `continue` 로 끝나 **ready 검사 자체를 봉쇄**했다(준비 감지 구조 차단 — 레포 티켓 T-D2a).
+    //   실측 2회에서 기계 Return 1발이 claude 신뢰창을 종료시킨 적이 있어, 반복 전송은
+    //   '노드 0 + 고아 좌석'으로 번진다. 1회 전송 → 델타로 프롬프트 **소멸 확인** → 미소멸 시에만
+    //   상한(2회)까지 재전송. 신뢰 분기는 더 이상 readiness 검사를 막지 않는다.
+    let mut trust_sends: u32 = 0;
+    let mut trust_seen_at: Option<u64> = None; // 프롬프트를 관측한 시점의 델타 커서
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(BUDGET_TICK_MS));
+        // 화면(vt100 그리드) — 사람이 보는 현재 상태. 잔존 프롬프트도 여기 남는다.
         let screen = request("surface.read_text", json!({"surface_id": sid}))?;
         let text = screen["text"].as_str().unwrap_or("");
         last_screen = text.to_string();
-        let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        if screen_shows_launch_failure(&flat) {
+        // 델타(커서 이후 신규 출현분) — **시간 귀속이 있는** 유일한 재료(B4).
+        let delta = request(
+            "surface.read_text",
+            json!({"surface_id": sid, "since_line": since_line}),
+        )?;
+        let delta_text = delta["text"].as_str().unwrap_or("").to_string();
+        let delta_cursor = delta["next_cursor"].as_u64().unwrap_or(since_line);
+        let delta_flat: String = delta_text.chars().filter(|c| !c.is_whitespace()).collect();
+        // ① 기동 실패 — **신규 출현분에서만** 판정한다(잔존 에러 텍스트로 새 기동을 죽이지 않는다).
+        if screen_shows_launch_failure(&delta_flat) {
             return Err(format!(
-                "agent '{agent}' failed to start (command error on screen) — check cmd in agents.json"
+                "agent '{agent}' failed to start (command error in new output) — check cmd in agents.json"
             ));
         }
-        if flat.contains("trustthisfolder") || flat.contains("Doyoutrust") {
-            eprintln!("[launch-agent] folder-trust prompt detected → confirming");
-            request(
-                "surface.send_key",
-                json!({"surface_id": sid, "key": "Return", "authoritative": true}),
-            )?;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            continue;
+        // ② 폴더신뢰 프롬프트 — 멱등 래치·상한·소멸 확인. `continue` 하지 않는다(ready 검사 계속).
+        if delta_flat.contains("trustthisfolder") || delta_flat.contains("Doyoutrust") {
+            let first = trust_sends == 0;
+            let persisted = trust_seen_at.map(|c| delta_cursor > c).unwrap_or(false);
+            if first || (trust_sends < BUDGET_TRUST_MAX_SENDS && persisted) {
+                eprintln!(
+                    "[launch-agent] folder-trust prompt {} → confirm ({}/{})",
+                    if first { "detected(new output)" } else { "persisted" },
+                    trust_sends + 1,
+                    BUDGET_TRUST_MAX_SENDS
+                );
+                request(
+                    "surface.send_key",
+                    json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+                )?;
+                trust_sends += 1;
+                trust_seen_at = Some(delta_cursor);
+                std::thread::sleep(std::time::Duration::from_secs(BUDGET_TRUST_SETTLE_SECS));
+            }
+            // 상한 소진 후에는 더 보내지 않는다 — 반복 Return 이 신뢰창을 종료시키는 실측 경로 차단.
         }
+        // ③ ready 판정 — **마커 분기도 델타 우선 + screen_tail_is_shell_prompt 가드**를 받는다.
         match &ready_marker {
-            Some(m) if text.contains(m.as_str()) => {
-                ready = true;
-                break;
+            Some(m) => {
+                if delta_text.contains(m.as_str()) {
+                    // 신규 출현분에 마커 — 잔존 ❯ 오탐이 원리상 불가능한 유일한 판정.
+                    ready = true;
+                    break;
+                }
+                // 폴백: 델타 미검출이지만 화면엔 마커가 있고 **화면 꼬리가 셸 프롬프트가 아니며**
+                // 시간 폴백 시점을 지났다. TUI 가 개행 없이 그리드만 갱신하는 경우의 구제 경로다
+                // (영구 오부정 → T-0147-4 이후 건강 surface 실제 close 라는 반대 방향 사고 차단).
+                // 잔존 ❯ 상황에서는 꼬리가 곧 셸 프롬프트이므로 이 폴백은 발화하지 않는다.
+                if std::time::Instant::now() >= time_fallback_at
+                    && text.contains(m.as_str())
+                    && !screen_tail_is_shell_prompt(text)
+                {
+                    eprintln!(
+                        "[launch-agent] ready(폴백): 델타 미검출·화면 marker 존재·꼬리가 셸 프롬프트 아님"
+                    );
+                    ready = true;
+                    break;
+                }
             }
             // marker 미정의 에이전트(codex 등)의 시간 폴백 — 단 화면 끝이 여전히
             // 셸 프롬프트(%·$)면 에이전트(TUI)가 안 뜬 것이다(조용한 즉시 종료 등):
             // 시간만 믿고 주입하면 디렉티브가 zsh로 들어간다(맹주입 잔존 경로 차단).
-            None if waited >= delay => {
-                if screen_tail_is_shell_prompt(text) {
-                    continue; // 아직 셸 — max_wait까지 더 기다린다(못 뜨면 아래 Err)
+            None => {
+                if std::time::Instant::now() >= time_fallback_at
+                    && !screen_tail_is_shell_prompt(text)
+                {
+                    ready = true;
+                    break;
                 }
-                ready = true;
-                break;
             }
-            _ => {}
         }
     }
     if !ready {
@@ -4697,30 +5138,87 @@ fn boot_agent_on_surface(
         ));
     }
     // marker 감지 직후 TUI 입력 활성화까지 약간의 여유
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(BUDGET_POST_MARKER_SETTLE_SECS));
 
     // 3) 지침 주입 — bracketed paste로 감싸 단일 입력으로 전달
+    let inject_cursor: u64 = fetch_surfaces()
+        .iter()
+        .find(|s| s["surface_id"].as_u64() == Some(sid))
+        .and_then(|s| s["line_count"].as_u64())
+        .unwrap_or(since_line);
     inject_text(sid, &directive)?;
 
-    // 4) 주입 확인: 화면에 지침 머리말이 나타났는지 검사 (실패 시 경고)
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let screen = request(
-        "surface.read_text",
-        json!({"surface_id": sid, "lines": 200}),
-    )?;
-    let flat: String = screen["text"]
-        .as_str()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if flat.contains("ABSOLUTEDIRECTIVE") || flat.contains("절대지침") {
+    // ── 4) 주입 확인 — ★(W2 · B14/CS-3⑤) **신호의 질을 화면 문자열 → ack 계약으로 교체** ──
+    //
+    // 종전 검증은 "화면에 '절대지침' 문자열이 보이나"였고, 실패는 stderr 경고 1줄로 삼켜졌다
+    // (관측 채널 부재 — RC3). 화면 문자열은 ①TUI 스크롤·박스 렌더에 따라 안 보일 수 있고
+    // ②잔존 화면(직전 세션 잔재)으로 **거짓 통과**할 수도 있어 신호 자체가 약했다.
+    //
+    // 새 신호 = **데몬 SOT 의 `awakened_at` 래치**(주입 후 첫 set-status). 화면과 달리 위조·부패가
+    // 없고, 부트 성공의 계약(javis_boot_node docstring)과 문자 그대로 같은 사실이다.
+    //
+    // ★치명 격상 금지(금지 방향 ③ · 비평2 B14): 미확인을 실패로 올리면 '위경고 모드'가 된다 —
+    //   노드가 디렉티브를 **읽는 중**일 수도 있고(LLM 왕복은 수십 초), ack 창을 길게 잡으면 부트
+    //   전체가 그만큼 늘어난다. 그래서 판정을 **상태로 남기고 부트는 계속한다**(directive.verify).
+    // ★멱등 1회 재주입은 여기가 아니라 `javis_boot_node` VERIFY 가 담당한다(B11 3분기 + 짧은
+    //   각성문). 여기서 **전문 디렉티브를 재주입하면** 토큰 2배·중복 지침 혼선 + resume 직후
+    //   컨텍스트 임계라는, 이 함수가 이미 주석으로 경고하는 그 사고를 만든다.
+    let ack_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BUDGET_ACK_WAIT_SECS);
+    let mut verified = false;
+    let mut verify_reason = String::new();
+    while std::time::Instant::now() < ack_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(BUDGET_TICK_MS));
+        let row = fetch_surfaces()
+            .into_iter()
+            .find(|s| s["surface_id"].as_u64() == Some(sid));
+        if let Some(row) = row {
+            if row["awakened_at"].as_f64().unwrap_or(0.0) > 0.0 {
+                verified = true;
+                verify_reason = "awakened_at 래치(set-status ack)".into();
+                break;
+            }
+        }
+    }
+    if !verified {
+        // 보조 증거(주 신호가 아니다): 주입 커서 **이후 신규 출현분**에 지침 머리말이 있나.
+        // 잔존 화면 오통과를 막기 위해 델타에서만 본다(B4 와 같은 규율).
+        let delta = request(
+            "surface.read_text",
+            json!({"surface_id": sid, "since_line": inject_cursor}),
+        )
+        .ok();
+        let flat: String = delta
+            .as_ref()
+            .and_then(|d| d["text"].as_str())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let echoed = flat.contains("ABSOLUTEDIRECTIVE") || flat.contains("절대지침");
+        verify_reason = format!(
+            "ack 미확인({BUDGET_ACK_WAIT_SECS}s 창) · 화면 에코(신규 출현분)={}",
+            if echoed { "관측" } else { "미관측" }
+        );
         eprintln!(
-            "[launch-agent] directive injected & visible on screen ({} bytes)",
-            directive.len()
+            "[launch-agent] directive 주입 검증 미확인 — {verify_reason}. \
+             부트는 계속한다(치명 아님). 상태를 directive_verified=false 로 기록: \
+             `cys status --json` 또는 `cys read-screen --surface {}` 로 확인, \
+             필요하면 javis_boot_node.py --role <role> --agent <agent> 로 재각성하라",
+            surface_ref(sid)
         );
     } else {
-        eprintln!("[launch-agent] warning: directive not visible on screen — verify with `cys read-screen --surface {}`", surface_ref(sid));
+        eprintln!(
+            "[launch-agent] directive 주입 검증 확정 — {verify_reason} ({} bytes)",
+            directive.len()
+        );
+    }
+    // 상태화(경고 삼킴 제거) — 실패해도 부트를 막지 않는다(best-effort · 구 데몬은 미지 메서드 에러).
+    if let Err(e) = request(
+        "directive.verify",
+        json!({"surface_id": sid, "verified": verified, "reason": verify_reason}),
+    ) {
+        eprintln!("[launch-agent] directive_verified 상태 기록 실패(구 데몬?): {e}");
     }
 
     // 5) T2-5 에이전트 메타 등록은 ★Phase 5 ①a로 기동 직후(위)로 이동했다 — readiness 폴링/주입
@@ -4737,23 +5235,140 @@ fn boot_agent_on_surface(
 /// CYS_SURFACE_ID(데몬이 PTY에 주입·상속)로 자기 surface를 surface.list에서 찾아 데몬 roles 맵의
 /// role을 출력한다. 역할 미등록·env 부재·데몬 미응답이면 빈 줄 + exit 0(hook이 deny측 안전 판정).
 /// ★role은 self-declared가 아니라 데몬 권위 — claim_role/launch-agent가 신원검증 후 등록한 값.
+/// ★(W2 · A20/H-EXIT-3) `cys claim-role` **타입드 exit** — CLI 경계의 판정 타입 부재를 메운다.
+///
+/// 종전 계약은 성공 0 / 그 밖 전부 1 이었다. 그 1비트 붕괴 때문에 소비부(javis_bootstrap ③)는
+/// **에러 문자열을 grep** 해 '정당거부'와 '세션 컨텍스트 오류'를 갈라야 했다(문자열 계약 = 드리프트
+/// 시한폭탄). 이제 CLI 가 타입을 낸다:
+///
+/// | exit | 의미 | 소비 처방 |
+/// |---|---|---|
+/// | 0 | 등록 성공(멱등 재claim 포함) | 계속 |
+/// | 7 | **정당거부** — 살아있는 보유자가 있다(이 surface 는 그 역할이 아니다) | 지휘 중단·인계. boot-last 오염 금지(ok:null) |
+/// | 3 | 미도달 — 데몬 미응답·소켓 부재(요청이 데몬에 닿지 못했다) | `cys ping`·데몬 기동 |
+/// | 2 | 식별 불가 — surface 해석 실패·인자 오류(요청을 만들 수조차 없다) | 세션 배선(CYS_SURFACE_ID) 점검 |
+///
+/// ★W1b 의 bootstrap 소비 분기와 정합(H-EXIT-3 발효): bootstrap 은 exit 7 → EXIT_CLAIM_DENIED,
+///   exit 3/2 → EXIT_SESSION_CONTEXT 로 매핑하며 **둘 다 boot-last 에 ok:null** 을 쓴다(CS-2⑩).
+///   문자열 grep 은 구 바이너리 하위호환 폴백으로만 남는다.
+fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool) -> i32 {
+    let sid = match target_surface(&surface, &None) {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("[claim-role] 식별 불가: {e} (rc=2 — 세션 배선/인자를 점검하라)");
+            return 2;
+        }
+    };
+    match request(
+        "system.claim_role",
+        json!({"role": role, "surface_id": sid, "takeover_empty_seat": takeover_empty_seat}),
+    ) {
+        Ok(r) => {
+            println!(
+                "registered: {} → surface:{}",
+                r["role"].as_str().unwrap_or("?"),
+                sid
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("[claim-role] 실패: {e}");
+            // 데몬이 낸 에러 **코드**로 분기한다(request 가 "code: message" 로 합성한다).
+            // claim_denied = 데몬의 정당거부 마커(특권 역할 live 보유자·live-slot 보호·타 surface claim).
+            if e.starts_with("claim_denied") {
+                eprintln!(
+                    "[claim-role] 정당거부(rc=7): 살아있는 보유자가 그 역할을 쥐고 있다. \
+                     이 surface 는 그 역할이 아니다 — 지휘를 중단하고 기존 보유자에게 인계하라."
+                );
+                7
+            } else if e.starts_with("invalid_params") || e.starts_with("not_found") {
+                eprintln!("[claim-role] 식별 불가(rc=2): 요청 인자·surface 해석 실패.");
+                2
+            } else {
+                // connect 실패·wire 파손·타임아웃 — 요청이 데몬에 닿지 못했거나 판정을 못 받았다.
+                eprintln!(
+                    "[claim-role] 미도달(rc=3): 데몬 왕복 실패 — `cys ping` 으로 데몬을 확인하라. \
+                     ('남이 master' 라는 뜻이 아니다)"
+                );
+                3
+            }
+        }
+    }
+}
+
 fn run_surface_role() -> i32 {
+    // ★(W2 · A5) **3상화** — 종전 이 함수는 세 개의 다른 사실을 하나로 뭉갰다:
+    //   ⓐ 역할 있음        → stdout=role, exit 0
+    //   ⓑ 역할 없음(미claim) → stdout=빈 줄, exit 0
+    //   ⓒ **판정 불가**(데몬 미응답·소켓 hang·응답 파손) → 종전에도 stdout=빈 줄, exit 0
+    // ⓑ와 ⓒ가 같은 출력을 냈다(rc0+빈출력 삼킴 — 재검증이 서술을 교정한 실채널). 소비 훅
+    // (role-capability-gate·role-bootstrap)은 빈 줄을 '미claim'으로 읽어, **데몬이 죽은 상황을
+    // '빈 좌석'으로 오독**하고 부트 발화를 통과시켰다. 이제 ⓒ는 **exit 2 + stderr 진단**이다.
+    //
+    // ★request() 전역 기본 데드라인은 **바꾸지 않는다**(금지 방향 ④): request()는 93개 호출부의
+    //   공용 경로이고, 그중 `feed push --wait` 는 오너 승인을 데몬 응답 보류로 구현한다 —
+    //   전역 데드라인은 CEO 승격 동의 채널을 끊는다. 그래서 **이 경로 한정**으로 기존 유틸
+    //   `request_on_timeout` 을 쓴다(신규 데드라인 메커니즘 도입 0).
     let Some(my_sid) = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)) else {
+        // surface env 부재 = pane 밖 실행. 판정 불가가 아니라 '이 프로세스에 surface 가 없다'는
+        // 확정 사실이므로 종전대로 빈 줄 + exit 0(훅이 deny 측 안전 판정을 하게 둔다).
         println!();
         return 0;
     };
-    let role = request("surface.list", json!({}))
-        .ok()
-        .and_then(|r| {
-            r["surfaces"].as_array().and_then(|arr| {
-                arr.iter()
-                    .find(|s| s["surface_id"].as_u64() == Some(my_sid))
-                    .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
-            })
-        })
-        .unwrap_or_default();
-    println!("{role}");
-    0
+    // hang 방어 데드라인: readiness 틱 1회분 × 4(≈10s) — RPC 왕복 하나에 넉넉하고, 훅이 사람의
+    // 프롬프트 앞에서 무한 정지하지 않을 만큼 짧다. 값은 BUDGET 파생(하드코딩 금지).
+    let timeout = std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+    let socket = cys::socket_path();
+    // ★가용성 보존 1점: 소켓 파일이 **아예 없으면** 데몬이 내려간 것이고, 그 경우의 정답은 종전처럼
+    //   autostart 를 허용하는 `request()`(4s 유계)다. 소켓이 **있는데** 무응답이면 그것이 바로 A5 의
+    //   hang 이므로 데드라인 경로만 쓴다 — request() 로 폴백하면 무한 대기가 되살아난다.
+    let resp = if socket.exists() {
+        request_on_timeout(&socket, "surface.list", json!({}), timeout)
+    } else {
+        request("surface.list", json!({}))
+    };
+    match resp {
+        Ok(r) => {
+            let Some(arr) = r["surfaces"].as_array() else {
+                // 응답은 왔지만 계약 형상이 아니다 = 판정 불가(버전 스큐·응답 파손).
+                eprintln!(
+                    "[surface-role] 판정 불가: surface.list 응답에 surfaces 배열이 없다(버전 스큐/파손). \
+                     '미claim' 과 구분되는 사실이므로 exit 2 로 낸다."
+                );
+                return 2;
+            };
+            match arr
+                .iter()
+                .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+            {
+                // ⓐ/ⓑ: 내 surface 를 찾았다 — role 유무는 확정 사실(빈 문자열=미claim).
+                Some(s) => {
+                    println!("{}", s["role"].as_str().unwrap_or(""));
+                    0
+                }
+                // 내 surface 가 목록에 없다 = 이 pane 은 데몬이 모르는 surface(재기동 후 stale env 등).
+                // 미claim 과 구분되는 사실이지만 '역할 없음'은 참이므로 빈 줄 + exit 0 을 유지하고
+                // 진단만 남긴다(훅의 deny-측 안전 판정 계약 보존 — 여기서 exit 2 를 내면 stale env
+                // 하나가 능력 가드를 전면 차단한다).
+                None => {
+                    eprintln!(
+                        "[surface-role] CYS_SURFACE_ID={my_sid} 가 데몬 목록에 없다(stale env?) — \
+                         역할 없음으로 보고한다"
+                    );
+                    println!();
+                    0
+                }
+            }
+        }
+        Err(e) => {
+            // ⓒ 판정 불가 — 데몬 미응답·소켓 부재·hang(데드라인 초과). 빈 줄로 삼키지 않는다.
+            eprintln!(
+                "[surface-role] 판정 불가(데몬 왕복 실패: {e}) — '미claim'이 아니다. \
+                 `cys ping` 으로 데몬을 확인하라. (rc=2)"
+            );
+            2
+        }
+    }
 }
 
 /// 선언 블록 v1 한 줄을 만들고 **파서 왕복 검증**까지 한다(설계 §4-1 · S17).
@@ -4938,6 +5553,10 @@ fn run_launch_agent_opts(
     // (W1) restore가 topology에 기록된 원 계정 config_dir을 넘긴다(재해소 금지). 신규 기동은 None.
     config_dir_override: Option<String>,
 ) -> i32 {
+    // ★(W2 · G12) LAUNCH 경로의 boot 락 참여 — 별도 프로세스로 도는 `cys launch-agent`
+    //   (javis_boot_node → boot-reviewers 경로)를 GUI/훅 `cys boot` 와 직렬화한다.
+    //   run_boot 이 이미 쥐고 있으면 None(재진입 방어). Drop 에서 flock 자동 해제.
+    let _launch_lock = acquire_launch_lock();
     // 절대지침(앵커1-b): 워커는 워크플로우 폴더에서 산다 — cwd 미지정이면 호출 폴더가
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
     // 빈 문자열은 None으로 정규화 — 구버전 topology의 "cwd": "" 가 PTY 생성을 깨거나

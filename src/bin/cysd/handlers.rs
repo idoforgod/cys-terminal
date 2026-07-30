@@ -1025,6 +1025,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // PTY를 띄우기 전(create_surface 호출 전)에 차단해 좀비 셸도 남기지 않는다.
             // ★SEAT: 승계 대상(구 좌석)을 생성 성공 후 마무리(role 해제·큐 이관)하기 위해 상위 스코프에 둔다.
             let mut seat_takeover_from: Option<u64> = None;
+            // (W2 · G14) announce 를 성공 아크로 미루므로 role 문자열도 상위 스코프에 보존한다.
+            let role_for_announce = param_str(&params, "role").unwrap_or_default();
             if let Some(role) = param_str(&params, "role") {
                 if matches!(role.as_str(), "master" | "cso") {
                     // ★SEAT 승계(opt-in): 보유자가 '살아있으나 빈 좌석'(role 만 쥔 셸)이면 부활·부트가
@@ -1049,14 +1051,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     // ★락 밖에서 프로브: seat_claimable_now 는 전 프로세스 표를 refresh 한다(수십 ms).
                     // surfaces/roles 락을 쥔 채 하면 데몬 전체가 그동안 멈춘다 — 반드시 락 해제 후.
                     let mut held_by_live = holder_surface.is_some();
+                    let mut takeover_cancelled: Option<&'static str> = None;
                     if let Some((holder, hs)) = holder_surface {
                         if want_takeover && crate::governance::seat_claimable_now(&hs) {
-                            held_by_live = false;
-                            seat_takeover_from = Some(holder);
+                            // ★(W2 · G14) create 경로의 임계영역 재검증. create 는 게이트 통과 후
+                            // PTY 스폰(수백 ms)을 거쳐 state.rs 의 roles.insert(latest-wins)에
+                            // 도달한다 — **게이트와 insert 가 비원자**라 창이 claim_role 보다 훨씬
+                            // 넓다(G14). 프로세스 표 재조회 없이 값싼 반증만 다시 본다.
+                            match crate::governance::seat_takeover_recheck(&hs) {
+                                None => {
+                                    held_by_live = false;
+                                    seat_takeover_from = Some(holder);
+                                }
+                                Some(why) => takeover_cancelled = Some(why),
+                            }
                         }
-                    }
-                    if let Some(prev) = seat_takeover_from {
-                        announce_seat_takeover(daemon, prev, &role, "surface.create");
                     }
                     if held_by_live {
                         daemon.bus.publish(
@@ -1064,13 +1073,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "system",
                             None,
                             json!({"role": role, "reason": "privileged role held by live surface",
-                                   "path": "surface.create", "caller_pid": caller_pid}),
+                                   "path": "surface.create", "caller_pid": caller_pid,
+                                   "takeover_cancelled": takeover_cancelled}),
                         );
                         return Reply::Single(err_response(
                             &id,
                             "claim_denied",
                             &format!(
-                                "surface.create denied: privileged role '{role}' is held by a live surface"
+                                "surface.create denied: privileged role '{role}' is held by a live surface{}",
+                                takeover_cancelled
+                                    .map(|w| format!(" — 좌석 승계 취소: {w}"))
+                                    .unwrap_or_default()
                             ),
                         ));
                     }
@@ -1173,6 +1186,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 cfg_override,
             ) {
                 Ok(s) => {
+                    // ★(W2 · B6) 각성 래치 하이드레이션 — **restore 전용 채널**.
+                    // topology 에 영속된 래치를 `cys restore` 가 이 파라미터로 되돌려 넣는다. 재개는
+                    // `--resume`(원 .jsonl)이라 디렉티브가 이미 컨텍스트에 있으므로, 래치를 잃고
+                    // legacy-presumed 로 강등되면 부트 체인이 불필요한 재주입을 반복한다.
+                    // ★위양성 방지 3중 가드: ①명시 파라미터가 있어야 한다(유추 0) ②role 이 있는
+                    // 생성만(무역할 pane 은 부트 체인의 대상이 아니다) ③값이 과거 시각이어야 한다
+                    // (미래 시각 = 조작·시계 스큐 → 무시). 노드 pane 은 이 파라미터를 못 쓴다
+                    // (create 는 오케스트레이터 경로이고, 자기보고 래치는 status.set 이 유일 write path).
+                    if let Some(latch) = params.get("awakened_at").and_then(|v| v.as_f64()) {
+                        let now = crate::state::now_epoch();
+                        if latch > 0.0 && latch <= now && s.role.lock().unwrap().is_some() {
+                            *s.awakened_at.lock().unwrap() = Some(latch);
+                        }
+                    }
                     // ★SEAT 승계 마무리(create 경로) — create_surface_with_env 가 roles 맵을 새 surface 로
                     // 덮은 뒤이므로, 구 좌석의 role·caps 를 내리고 보류 큐를 새 좌석으로 옮긴다.
                     // claim_role 경로와 동일 규약(§migrate_seat_queue) — 두 경로가 갈라지면 한쪽만
@@ -1185,6 +1212,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             migrate_seat_queue(&prev_s, &s);
                             daemon.persist_queue_state(); // 이관 결과를 WAL 에 확정(재기동 생존)
                             crate::governance::persist_topology(daemon);
+                            // ★(W2 · G13/G14) announce 는 전이 확정 후 — spawn_failed 로 끝난 시도가
+                            // '승계됨'을 통보하던 경로를 닫는다(통보는 사실의 파생이어야 한다).
+                            announce_seat_takeover(daemon, prev, &role_for_announce, "surface.create");
                         }
                     }
                     // ★T-0147-4 생성자 기록 — 발신이 pane(surface)으로 해석될 때만. 이 한 줄이
@@ -1274,6 +1304,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(), // (W1) node-recover resume 게이트용
                         "agent": agent,
                         "agent_alive": agent_alive,
+                        // ★(W2 · B6) 각성 래치 — **단방향** 신호다. null 은 NOT-awake 가 아니라
+                        // '이 차원에 대해 말할 것이 없음'(legacy-presumed)이다. 소비자는 null 을
+                        // 기존 균형 술어로 강등만 하고, 재주입·재스폰을 유도해선 안 된다(금지 방향 ⑦).
+                        "awakened_at": *s.awakened_at.lock().unwrap(),
+                        // ★(W2 · B14) 주입 검증 상태 — true=ack 확인 / false=창 만료 미확인 / null=미판정.
+                        "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // ★(W2 · B4) 단조 라인 커서 — launch-agent 가 기동 send **직전** 스냅샷을 떠
+                        // readiness/실패/주입검증 매칭을 '커서 이후 신규 출현분'으로 한정한다(잔존 ❯
+                        // 오탐 차단). org.status 가 이미 같은 키를 노출하며, 여기 추가는 순수 additive.
+                        "line_count": s.line_count.load(Ordering::Relaxed),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                     })
@@ -1854,6 +1894,48 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // ★(W2 · A3=B7 / 비평2 C-5) **요청자-role 불변식 = 경고 + 감사로그**(무조건 거부 아님).
+            //
+            // A3 실사고는 "worker-2·cso-1 pane 이 master 를 자칭"이었다. 그 차단의 1층은 **훅
+            // allowlist**(W1b 착지 — master|미claim 만 부트 발화)이고, 데몬은 2층에서 **관측**한다.
+            // 데몬 레벨 영구 거부를 넣으면 handlers.rs claim_role 이 명시 지원하는 정당한 역할 전이
+            // ("팀 해체 후 워커 pane 을 master 로 재선언" 등)를 차단한다 — 그래서 거부하지 않고,
+            // 가족이 바뀌는 전이를 감사 대장에 남긴다(사후 추적 가능 · 정당 흐름 보존).
+            {
+                let prev_role = daemon
+                    .get_surface(sid)
+                    .and_then(|s| s.role.lock().unwrap().clone());
+                if let Some(prev) = prev_role {
+                    let fam = |r: &str| -> &'static str {
+                        if r == "master" {
+                            "master"
+                        } else if r.starts_with("worker") {
+                            "worker"
+                        } else if r.starts_with("cso") {
+                            "cso"
+                        } else if r.starts_with("reviewer") {
+                            "reviewer"
+                        } else {
+                            "other"
+                        }
+                    };
+                    if prev != role && fam(&prev) != fam(&role) {
+                        eprintln!(
+                            "[claim_role] 역할 가족 전이 관측: surface {sid} {prev} → {role} \
+                             (정당 전이일 수 있어 허용 — 감사 대장 role.family_transition 참조)"
+                        );
+                        daemon.bus.publish(
+                            "role.family_transition",
+                            "system",
+                            Some(sid),
+                            json!({"surface": sid, "from": prev, "to": role,
+                                   "from_family": fam(&prev), "to_family": fam(&role),
+                                   "note": "경고+감사(무조건 거부 아님 — 정당 역할 전이 보존). \
+                                            자칭 master 차단의 1층은 훅 allowlist."}),
+                        );
+                    }
+                }
+            }
             // 멤버십 확인 + 역할 전이를 surfaces 락 아래 한 임계영역에서 수행 —
             // 동시 close/claim과의 경합으로 dangling 역할 주소가 남는 것을 차단.
             // 락 순서 규약: surfaces → roles → surface.role (close_surface와 동일)
@@ -1888,10 +1970,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             } else {
                 None
             };
-            if let Some(prev) = seat_takeover_ok {
-                announce_seat_takeover(daemon, prev, &role, "claim_role");
-            }
+            // ★(W2 · G13) announce 를 **전이 확정 후로 미룬다**. 종전엔 프로브 직후 여기서
+            // announce_seat_takeover 를 쐈는데, 그 뒤 임계영역이 not_found·claim_denied 로 조기
+            // return 하면 **일어나지 않은 승계를 통보**한 셈이 됐다(pane 에 오해 메시지 주입 +
+            // role.takeover 이벤트 오발). 통보는 사실의 파생이어야 한다(CS-3 보고=실측).
             let master_after: Option<u64>;
+            // 임계영역 내 재검증 결과 — 취소되면 승계를 포기하고 종전 판정(거부)으로 흐른다.
+            let mut takeover_committed: Option<u64> = None;
+            let mut takeover_cancelled: Option<&'static str> = None;
             {
                 let surfaces = daemon.surfaces.lock().unwrap();
                 let Some(surface) = surfaces.get(&sid) else {
@@ -1910,14 +1996,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 경우의 정당한 승계는 허용 — governance의 live 판정과 동일 기준.
                 if matches!(role.as_str(), "master" | "cso") {
                     if let Some(&holder) = roles.get(&role) {
-                        // ★SEAT: 승계 판정(락 밖 프로브 결과)이 이 보유자를 지목하면 live 에서 제외한다.
-                        // 파라미터 미전달 시 seat_takeover_ok=None → 판정식은 종전과 byte-identical.
+                        // ★(W2 · G13) 임계영역 내 저비용 재검증 — 프로브↔여기 사이에 좌석이 다시
+                        // 채워졌는지 값싼 사실(exited·agent_meta·last_human_input·seat_cache)로만
+                        // 다시 본다. 하나라도 걸리면 승계를 **취소**하고 종전 판정(=거부)으로 흐른다.
+                        // 프로세스 표 재조회는 하지 않는다(락 보유 중 금지 규율 유지).
+                        let mut effective_takeover = seat_takeover_ok;
+                        if seat_takeover_ok == Some(holder) {
+                            if let Some(hs) = surfaces.get(&holder) {
+                                if let Some(why) = crate::governance::seat_takeover_recheck(hs) {
+                                    effective_takeover = None;
+                                    takeover_cancelled = Some(why);
+                                }
+                            }
+                        }
                         let holder_live = holder != sid
-                            && Some(holder) != seat_takeover_ok
+                            && Some(holder) != effective_takeover
                             && surfaces
                                 .get(&holder)
                                 .map(|h| !h.exited.load(Ordering::Relaxed))
                                 .unwrap_or(false);
+                        if !holder_live && effective_takeover == Some(holder) {
+                            takeover_committed = Some(holder);
+                        }
                         if holder_live {
                             daemon.bus.publish(
                                 "role.claim_denied",
@@ -1926,13 +2026,60 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                 json!({"role": role, "requested_surface": sid,
                                        "current_holder": holder, "reason": "privileged role held by live surface"}),
                             );
+                            daemon.bus.publish(
+                                "role.takeover_cancelled",
+                                "system",
+                                Some(holder),
+                                json!({"role": role, "requested_surface": sid,
+                                       "current_holder": holder,
+                                       "reason": takeover_cancelled.unwrap_or(
+                                           "보유자 생존(승계 미요청 또는 좌석 비어있지 않음)"),
+                                       "path": "claim_role"}),
+                            );
                             return Reply::Single(err_response(
                                 &id,
                                 "claim_denied",
                                 &format!(
-                                    "claim_role denied: privileged role '{role}' is held by live surface {holder}"
+                                    "claim_role denied: privileged role '{role}' is held by live surface {holder}{}",
+                                    takeover_cancelled
+                                        .map(|w| format!(" — 좌석 승계 취소: {w}"))
+                                        .unwrap_or_default()
                                 ),
                             ));
+                        }
+                    }
+                }
+                // ★(W2 · CS-5① / 금지 방향 ⑤) **live-slot 계약** — 비특권 역할의 latest-wins 를
+                // **agent_alive 좌석 한정으로만** 보호한다. 살아 일하는 리뷰어의 역할 주소를 새
+                // pane 이 조용히 빼앗아 라우팅·알림·감시를 끊는 경로를 닫되, 죽은·행 걸린 좌석은
+                // 현행 latest-wins 를 그대로 둔다(그것이 사실상의 self-heal 경로 — 전면 제거 금지).
+                if !matches!(role.as_str(), "master" | "cso") {
+                    if let Some(&holder) = roles.get(&role) {
+                        if holder != sid {
+                            let protected = surfaces
+                                .get(&holder)
+                                .map(|h| crate::governance::slot_agent_alive(h))
+                                .unwrap_or(false);
+                            if protected {
+                                daemon.bus.publish(
+                                    "role.claim_denied",
+                                    "system",
+                                    Some(sid),
+                                    json!({"role": role, "requested_surface": sid,
+                                           "current_holder": holder,
+                                           "reason": "live-slot: agent_alive holder protected"}),
+                                );
+                                return Reply::Single(err_response(
+                                    &id,
+                                    "claim_denied",
+                                    &format!(
+                                        "claim_role denied: role '{role}' is held by surface {holder} \
+                                         whose agent is alive (live-slot 보호). 그 노드를 회수하려면 \
+                                         node-recover(비파괴) 또는 javis_boot_node.py --reclaim 을 쓰라 \
+                                         — 죽은·행 좌석은 이 보호를 받지 않는다(latest-wins 유지)."
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1964,7 +2111,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // (surface.role 은 별도 저장소). 그러면 ①`cys list` 가 좌석 2개를 role=master 로
                 // 보이고 ②좌석 큐 게이트(role 유무 기준)가 오작동하며 ③교대 보호 카운트가 부풀린다.
                 // 같은 임계영역에서 구 좌석의 role·caps 를 내려 '일반 pane'으로 되돌린다(셸은 보존).
-                if let Some(prev) = seat_takeover_ok {
+                // ★(W2 · G13) 마무리 대상은 **재검증을 통과해 확정된** 승계(takeover_committed)뿐이다.
+                //   종전엔 락 밖 프로브 결과(seat_takeover_ok)를 그대로 소비해, 재검증에서 취소된
+                //   좌석의 role 까지 내릴 수 있었다(취소했는데 피해는 발생 — 부분 적용).
+                if let Some(prev) = takeover_committed {
                     if let Some(prev_s) = surfaces.get(&prev) {
                         *prev_s.role.lock().unwrap() = None;
                         *prev_s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
@@ -1977,8 +2127,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             // ★SEAT: 승계로 큐를 옮겼으면 WAL 을 최신화한다(락 해제 후 — persist 는 파일 I/O).
             // 없으면 재기동 시 구 좌석 기준의 스냅샷이 되살아나 이관이 되돌려진다.
-            if seat_takeover_ok.is_some() {
+            if let Some(prev) = takeover_committed {
                 daemon.persist_queue_state();
+                // ★(W2 · G13) announce 는 **전이 확정 후**에만 — 통보는 사실의 파생이다.
+                announce_seat_takeover(daemon, prev, &role, "claim_role");
             }
             // 벡터-9 방어심화 — master_claimed_at 갱신 (surfaces·roles 락 해제 후, master_claimed_at
             // 단일 락만 보유 → 락 순서 무변경). 이미 같은 surface가 master면 갱신 안 함(연속성 보존),
@@ -2819,6 +2971,33 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 *cur = Some(status);
                 (changed, task_changed)
             };
+            // ★(W2 · B6) 각성 래치 — **주입 후 첫 set-status 시각**을 못박는다(1회성·이후 불변).
+            // 단일 write path 는 여기뿐이다: 자기보고가 도착했다는 것은 "노드가 디렉티브를 읽고
+            // 스스로 신고했다"는 뜻이고, 그것이 부트 성공의 계약이다(javis_boot_node docstring).
+            // `is_none()` 가드가 래치의 1회성을 보장한다 — 재보고가 시각을 갱신하면 '첫 각성 시각'
+            // 이라는 의미가 사라지고 부패하는 신호(age)로 퇴화한다.
+            // 새로 세워졌을 때만 topology 영속을 트리거한다(쓰기 폭증 방지 · 이후 보고는 no-op).
+            let latched_now = {
+                let mut latch = surface.awakened_at.lock().unwrap();
+                if latch.is_none() {
+                    *latch = Some(crate::state::now_epoch());
+                    true
+                } else {
+                    false
+                }
+            };
+            if latched_now {
+                // 영속 필수(비평2 B-1): 인메모리 단독이면 데몬 재시작마다 건강한 전 팀이 래치를
+                // 잃고 legacy-presumed 로 강등된다(부트 체인이 '각성 확정'을 영영 못 본다).
+                crate::governance::persist_topology(daemon);
+                daemon.bus.publish(
+                    "role.awakened",
+                    "status",
+                    Some(sid),
+                    json!({"role": role, "awakened_at": *surface.awakened_at.lock().unwrap(),
+                           "state": state}),
+                );
+            }
             let status_evt =
                 json!({"role": role, "state": state, "context_pct": context_pct, "task": task});
             if changed {
@@ -2906,6 +3085,70 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 &id,
                 json!({"surface_id": sid, "pack_version": pack_version,
                        "directive_hash": directive_hash}),
+            ))
+        }
+
+        // ─── (W2 · B14/CS-3⑤) 디렉티브 주입 검증 상태의 단일 write path ───
+        // ★왜 전용 RPC 인가: 종전 검증은 launch-agent 의 '화면에 지침 머리말이 보이나'였고 실패는
+        //   stderr 경고 1줄로 삼켜졌다(RC3 관측 채널 부재). 신호의 질을 **ack 계약**으로 올리되,
+        //   치명 격상은 금지다(금지 방향 ③ — 위경고 모드 회귀). 그래서 판정을 **상태로 남긴다**:
+        //   부트는 계속되고, 실패 사실은 status/dashboard 에 남아 진단·재각성 처방의 근거가 된다.
+        // ★신원 게이트는 reinject.mark 와 동형: 노드 pane 은 자기 검증 결과를 자칭할 수 없다
+        //   (자기보고로 '검증됨'을 위조하면 검증이 무의미해진다). cysd-매개 발신(launch-agent·
+        //   node-recover 같은 일시적 CLI, caller_sid None)만 쓸 수 있다.
+        "directive.verify" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(verified) = params.get("verified").and_then(|v| v.as_bool()) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "missing verified (bool)",
+                ));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                daemon.bus.publish(
+                    "directive.verify_denied",
+                    "system",
+                    Some(sid),
+                    json!({"requested_surface": sid, "caller_surface": cs,
+                           "caller_pid": caller_pid}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "verify_denied",
+                    &format!(
+                        "directive.verify denied: node panes may not self-declare directive verification (caller surface {cs})"
+                    ),
+                ));
+            }
+            *surface.directive_verified.lock().unwrap() = Some(verified);
+            let reason = param_str(&params, "reason").unwrap_or_default();
+            // 실패는 조용히 지나가지 않는다 — 이벤트로 남겨 진단·알림이 소비한다(경고 삼킴 제거).
+            daemon.bus.publish(
+                if verified {
+                    "directive.verified"
+                } else {
+                    "directive.unverified"
+                },
+                "status",
+                Some(sid),
+                json!({"role": surface.role.lock().unwrap().clone(),
+                       "verified": verified, "reason": reason,
+                       "awakened_at": *surface.awakened_at.lock().unwrap()}),
+            );
+            Reply::Single(ok_response(
+                &id,
+                json!({"surface_id": sid, "directive_verified": verified}),
             ))
         }
 
@@ -3211,6 +3454,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         )
                         .as_str(),
                         "status": status,
+                        // ★(W2 · B6/B14) 각성 래치·주입 검증 상태 — org.status(대시보드)는 팩 부트
+                        // 체인이 소비하는 정본 status 채널이다(javis_boot_node.cys_status →
+                        // `cys status --json`). surface.list 와 **같은 키·같은 의미**를 노출한다.
+                        "awakened_at": *s.awakened_at.lock().unwrap(),
+                        "directive_verified": *s.directive_verified.lock().unwrap(),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),

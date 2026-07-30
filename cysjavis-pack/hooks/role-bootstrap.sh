@@ -221,14 +221,23 @@ command -v "$CYS_PY" >/dev/null 2>&1 || [ -x "$CYS_PY" ] || FIRE_FAIL="인터프
 # 결정론 부트스트랩 백그라운드 발화(env 상속). 부모(claude) 종료와 무관하게 완주.
 BOOT_PID=""
 if [ -z "$FIRE_FAIL" ]; then
+  # ★A18 조건부 내재화(W2 · W1b probe_pgid 실측 확정): 세션 분리를 python 안에서 한 번 더 시도한다.
+  #   W1b 실측 = **nohup 분기는 pgid 를 분리하지 않아** 하네스 group-kill 에 부트가 함께 죽는다
+  #   (대조군 생존 = 계측 타당). 그래서 발화부가 `--detach-session` 을 넘기고, python 이
+  #   **세션 리더 검사 후** os.setsid() 를 부른다(이미 setsid(1) 로 감싼 1순위 분기에서는 no-op —
+  #   가드가 없으면 EPERM 으로 훅 경로 전체가 크래시한다).
+  #   ★이 인자는 **훅 발화부 전용**이다: MASTER_DIRECTIVE §0 폴백의 포그라운드 직접 실행
+  #   (`python3 javis_bootstrap.py`)에는 넘기지 않는다 — 그쪽에 세션 분리를 걸면 호출자가 포기한
+  #   뒤에도 스폰이 계속되는 고아를 신설한다(job control 보존).
+  BOOT_ARGS="--detach-session"
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$CYS_PY" "$BOOT_N" >"$LOG" 2>&1 &
+    setsid "$CYS_PY" "$BOOT_N" $BOOT_ARGS >"$LOG" 2>&1 &
     BOOT_PID=$!
   elif command -v nohup >/dev/null 2>&1; then
-    nohup "$CYS_PY" "$BOOT_N" >"$LOG" 2>&1 &
+    nohup "$CYS_PY" "$BOOT_N" $BOOT_ARGS >"$LOG" 2>&1 &
     BOOT_PID=$!
   else
-    "$CYS_PY" "$BOOT_N" >"$LOG" 2>&1 &
+    "$CYS_PY" "$BOOT_N" $BOOT_ARGS >"$LOG" 2>&1 &
     BOOT_PID=$!
     disown 2>/dev/null
   fi
@@ -277,10 +286,15 @@ fi
 # ★A10 §0 단일 계약의 훅면: 이 문안이 곧 "훅 컨텍스트 존재" 신호다 — 모델은 부트를 재실행하지 않고
 #   **잔여 의무(③복원·⑤승인채널·⑥보고+next-action 자율 착수)** 만 수행한다. 종전 "오너 지시를 받아
 #   지휘하라"는 §0 ⑥('오너 지시 대기'는 폐기 — 앵커6 축1)과 정면 충돌하는 낡은 문구였다.
+# ★H-TIME-2(W2): 안내 숫자(생존확인 창)는 **하드코딩하지 않는다** — javis_budget 파생값을 주입한다.
+#   종전 "최대 120s" 는 CHECK_RETRIES×CHECK_INTERVAL_S 를 손으로 곱한 사본이라, 예산이 바뀌면
+#   문서만 거짓이 됐다(P3-A-120S 의 문서면). 예산 모듈 소비 불가 시에만 파생 실패를 명시한다.
+CHECK_WINDOW_S="$("$CYS_PY" "$PACK/bin/javis_budget.py" --note-check-window 2>/dev/null)"
+[ -n "$CHECK_WINDOW_S" ] || CHECK_WINDOW_S="예산 모듈 미소비(javis_budget 확인)"
 "$CYS_PY" -c 'import json,sys
 note=("[결정론 부트스트랩 발화됨 — 하네스 강제] \"너는 마스터다\" 선언을 UserPromptSubmit 훅이 감지해 "
       "javis_bootstrap.py를 백그라운드로 실행 중이다(발화 후 프로세스 생존 확인됨): preflight(비치명) → "
-      "master 역할 등록 → cys boot(CSO·워커·리뷰어2 팀 기동) → 생존확인(최대 120s). "
+      "master 역할 등록 → cys boot(CSO·워커·리뷰어2 팀 기동) → 생존확인(최대 %ss). "
       "완료 = master·cso·worker·reviewer×2 (5노드)가 "
       "화면에 뜨는 것. 지침: 너(LLM)는 이 부트스트랩을 재실행하지 마라(훅이 이미 결정론 집행 중) — "
       "MASTER_DIRECTIVE §0의 개별 명령(preflight·claim-role·cys boot·check)을 손으로 재현하는 것도 "
@@ -291,7 +305,8 @@ note=("[결정론 부트스트랩 발화됨 — 하네스 강제] \"너는 마�
       "cys list로 팀 기동을 확인하고, 완료되면 §0 ⑥대로 구동 보고 후 orchestra next-action으로 "
       "다음 액션 큐를 결정론 확인해 미완 작업이 있으면 자율 착수하라(\"오너 지시 대기\"는 폐기). "
       "만약 팀이 안 뜨면 원인이 "
-      "이번 런 로그 %s (최근 런 포인터: %s)·boot-last.json에 있고 실패 시 승인 Feed에 알림이 뜬다.") % (sys.argv[1], sys.argv[2])
+      "이번 런 로그 %s (최근 런 포인터: %s)·boot-last.json에 있고 실패 시 승인 Feed에 알림이 뜬다."
+      ) % (sys.argv[3], sys.argv[1], sys.argv[2])
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
-  "$LOG" "$LATEST"
+  "$LOG" "$LATEST" "$CHECK_WINDOW_S"
 exit 0

@@ -335,7 +335,11 @@ fn setup_isolated_config_dir() {
     let claude_md = cfg.join("CLAUDE.md");
     if !claude_md.exists() {
         if let Some((_, tmpl)) = PACK_ALL.iter().find(|(rel, _)| *rel == "CLAUDE.md.template") {
-            let _ = std::fs::write(&claude_md, tmpl);
+            // ★(W2 · A8rs) 비원자 `fs::write` → `write_atomic`(pid-suffixed tmp + rename + fsync).
+            // 비원자 쓰기는 부분 파일(torn write)을 남길 수 있고, 이 파일들은 **존재만으로 시드
+            // 완료로 판정**되므로(`!exists()` 가드) 반쪽 파일이 영구히 굳는다 — 그 뒤 어떤 재실행도
+            // 고치지 않는다(보존 모드가 덮지 않으므로). 원자 교체는 '옛 완본 또는 새 완본'만 남긴다.
+            let _ = write_atomic(&claude_md, tmpl.as_bytes());
         }
     }
     // hook: <cfg>/settings.json 에 SessionStart → session-start.sh + UserPromptSubmit →
@@ -358,7 +362,11 @@ fn setup_isolated_config_dir() {
             }
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(&settings, s);
+            // ★(W2 · A8rs/G16) 비원자 `fs::write` → `write_atomic`. settings.json 은 python
+            // preflight(C28)·Rust 시드·부서 마이그레이션의 **3-writer 대상**이고, 이 파일이 반쪽으로
+            // 굳으면 훅 등록부가 파싱 불가가 되어 **부트 발화 자체가 사라진다**(A8 재검증이 지배 실패
+            // 모드로 지목한 '등록부 수리 거부' 경로). tmp 이름은 pid 접미라 교차 파손도 없다.
+            let _ = write_atomic(&settings, s.as_bytes());
         }
     }
 }

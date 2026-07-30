@@ -189,6 +189,32 @@ pub struct Surface {
     pub parser_panics: AtomicU64,
     /// (W4) 마지막 파서 패닉 발생 epoch초(없으면 None) — 상습 트리거 포렌식용 health 신호.
     pub last_parser_panic: Mutex<Option<f64>>,
+    /// ★(T-0147-7 W2 · B6) **각성 래치** — 이 surface 가 처음 `status.set`(=cys set-status)을 보낸
+    /// epoch초. 단일 write path = status.set 핸들러의 `get_or_insert`(1회성 래치 · 이후 불변).
+    ///
+    /// **왜 필요한가**: 종전에 부트 체인이 '각성'의 근거로 쓸 수 있는 신호는 `agent_alive`(프로세스
+    /// 생존)와 `status.age_secs`(신선도)뿐이었다. 전자는 빈 CLI 도 참이라 **조용한 허위 성공**을
+    /// 만들었고(재검증 B6 — self-test 가 그 오답을 박제 중이었다), 후자는 시간이 지나면 부패해
+    /// "각성했는데 미기동" 오판으로 넘어갔다. 래치는 **부패하지 않는 사실**이다: "이 노드는 최소
+    /// 한 번 디렉티브를 읽고 스스로 신고했다."
+    ///
+    /// **단방향 계약(금지 방향 ⑦ · 비평2 B-1)**: 값 존재 = awake **확정**. 값 부재는 NOT-awake 가
+    /// **아니다** — 이 필드 배포 이전에 각성한 노드는 영원히 부재이므로, 소비자는 부재를 기존
+    /// 균형 술어(`agent_alive OR fresh set-status`)로 **강등**만 하고 재주입·재스폰을 유도하지
+    /// 못한다. 부재를 부정으로 읽으면 A1 라이브락의 역방향(건강한 전 팀 재스폰)이 신설된다.
+    ///
+    /// **영속(필수)**: topology.json 에 기록되고 restore 가 `surface.create`의 `awakened_at`
+    /// 파라미터로 되돌려 넣는다 — 인메모리 단독이면 데몬 재시작마다 건강한 전 팀이 래치를 잃는다.
+    pub awakened_at: Mutex<Option<f64>>,
+    /// ★(T-0147-7 W2 · B14/CS-3⑤) 디렉티브 주입 검증 상태 — Some(true)=ack 확인 / Some(false)=창
+    /// 만료까지 미확인 / None=미검증(아직 판정 안 함). 단일 write path = `surface.set_meta` 의
+    /// 동명 파라미터(launch-agent 가 주입 후 ack 창을 닫고 기록).
+    ///
+    /// **왜 상태인가**: 종전 검증은 "화면에 지침 머리말이 보이나"였고 실패는 stderr 경고 1줄로
+    /// 삼켜졌다(관측 채널 부재 — RC3). 신호의 질을 ack 로 올리되 **치명 격상은 금지**다
+    /// (금지 방향 ③ — 위경고 모드 회귀). 그래서 실패를 '상태'로 남겨 부트는 계속시키고,
+    /// 대시보드·진단이 그 사실을 읽는다.
+    pub directive_verified: Mutex<Option<bool>>,
 }
 
 pub struct HealthRule {
@@ -1869,6 +1895,11 @@ impl Daemon {
             osc_carry: Mutex::new(Vec::new()),
             parser_panics: AtomicU64::new(0),
             last_parser_panic: Mutex::new(None),
+            // ★W2 B6: 래치는 항상 None 으로 시작한다 — 생성 시점엔 아직 어떤 각성 증거도 없다.
+            // restore 경로의 하이드레이션은 surface.create 핸들러가 topology 값으로 명시 주입한다
+            // (여기서 유추하지 않는다 — 유추는 곧 위양성 래치이고, 그건 재주입 스킵 오판이 된다).
+            awakened_at: Mutex::new(None),
+            directive_verified: Mutex::new(None),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.

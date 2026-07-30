@@ -132,8 +132,21 @@ check("1f boot-last 단계 누적",
 check("1g ★R12 진행 신호(침묵 창 방지 — 단계 시작 stderr)",
       "[bootstrap] ①" in err and "[bootstrap] ⑤" in err, err[:200])
 src_boot = open(SCRIPT, encoding="utf-8").read()
-check("1h ★R6 ④-b timeout≥320(2슬롯×130s 순차 — 스텁은 즉시 반환이라 정적 핀·실기 미검증 정직 표기)",
-      "timeout=320" in src_boot)
+# ★T-0147-7 W2(B9) 갱신: ④-b 외부 상한은 **하드코딩 320 이 아니라 javis_budget 파생값**이다.
+#   종전 리터럴 핀은 예산 역전(외부 320 < 내부 2슬롯×2폴백×130=520)을 박제하고 있었다 —
+#   테스트 갱신이 수리의 일부다. 새 핀: ①파생 소비(리터럴 0) ②파생값이 구 하한 320 **이상**
+#   (내부 감액 금지 방향 — 값이 내려가면 조기실패 부활).
+_ok_derived = '_budget_derived("boot_reviewers_outer_s"' in src_boot and "timeout=320" not in src_boot
+_derived_val = None
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    import javis_budget as _BU
+    _derived_val = int(round(_BU.boot_reviewers_outer_s()))
+except Exception as _e:                                    # 예산 모듈 부재 = 파생 계약 미성립
+    _derived_val = None
+check("1h ★R6/W2 ④-b timeout=예산 파생(≥320 — 내부 감액 금지 방향·리터럴 핀 폐기)",
+      _ok_derived and _derived_val is not None and _derived_val >= 320,
+      "derived=%r literal320=%r" % (_derived_val, "timeout=320" in src_boot))
 shutil.rmtree(tmp)
 
 # ── 2. ⓐ 부서 소켓 컨텍스트: 성공해도 base 마커 미생성·⑦ 생략 ──

@@ -15,7 +15,9 @@ enqueue 직렬화: pending 파일별 read-modify-write를 .lock 디렉터리(mkd
 
 대상 생존 판정(zombie 가드) 우선순위:
   1) 테스트/강제 주입: JAVIS_WAKEUP_LIVENESS=alive|dead
-  2) `cys list` 출력에 target 문자열 존재 여부 (cys 없으면 unknown→배달 보류 아닌 경고 배달)
+  2) `cys list` **비종료 행의 role 열**을 공유 술어(javis_boot_node.requirement_satisfied)로 해소
+     — exited=true 행의 role 토큰에 속아 죽은 대상에 배달하던 결함(재감사 G27) 수리.
+     (cys 없으면 unknown→배달 보류 아닌 경고 배달)
 배달은 기본 드라이런(cys send --queued 명령을 출력만). --deliver 시 실제 실행.
 
 exit codes: 0 ok · 2 usage · 5 nothing-to-do
@@ -114,6 +116,48 @@ class _FileLock:
             pass
 
 
+def live_target_rows(list_output):
+    """★순수 판정(G27): `cys list` 출력 → **비종료** 행의 role 목록.
+
+    종전 가드는 `cys list` **출력 전문**에 target 문자열이 있으면 alive 로 봤다 — 그래서
+    `exited=true` 행의 role 토큰(죽은 노드가 남긴 litter 행)에 속아 **죽은 대상에 배달**했다
+    (재감사 G27). 행 단위로 파싱해 exited 행을 배제하고, role 열만 후보로 삼는다.
+    파싱 형식은 javis_boot_node.cys_list_rows 와 동형(TAB 구분 key=value 열).
+    """
+    roles = []
+    for ln in (list_output or "").splitlines():
+        cols = ln.split("\t")
+        if not cols or not cols[0].strip().startswith("surface:"):
+            continue
+        role, exited = None, None
+        for c in cols[1:]:
+            if "=" not in c:
+                continue
+            k, v = c.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k == "role":
+                role = v
+            elif k == "exited":
+                exited = (v == "true")
+        if role and exited is not True:
+            roles.append(role)
+    return roles
+
+
+def _target_matches(target, live_roles):
+    """대상 role 이 라이브 좌석으로 해소되는가 — **공유 술어 소비**(A1 클래스).
+
+    javis_boot_node.role_matches_requirement 가 단일 정의다(정확일치 + worker 접두만).
+    소비 불가(부서 팩 결손) 시에만 동형 폴백 — 조용한 접힘 금지(사유는 호출부가 남긴다).
+    """
+    try:
+        import javis_boot_node as _bn
+        return _bn.requirement_satisfied(target, set(live_roles))
+    except Exception:
+        return any(target == r or (target == "worker" and r.startswith("worker"))
+                   for r in live_roles)
+
+
 def _target_alive(target):
     """zombie 가드. 반환 'alive'|'dead'|'unknown'."""
     override = os.environ.get("JAVIS_WAKEUP_LIVENESS")
@@ -124,11 +168,9 @@ def _target_alive(target):
         return "unknown"
     try:
         out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10).stdout
-        # ★WP-8(P-ORCH-4): 부분일치 금지 — target을 식별자 경계로 정확일치. 'worker'가
-        #   'worker-2'·'coworker' 안에 부분매칭돼 죽은/다른 노드를 alive로 오판하던 경로 차단.
-        #   경계 = 앞뒤로 식별자문자([A-Za-z0-9._-])가 아닌 곳(공백·줄·구분자).
-        pat = re.compile(r"(?<![A-Za-z0-9._-])%s(?![A-Za-z0-9._-])" % re.escape(target))
-        return "alive" if pat.search(out) else "dead"
+        # ★G27: exited 행 배제 + 공유 술어(정확일치·worker 접두)로 해소. 종전의 전문 정규식
+        #   경계 매칭은 '부분일치'는 막았지만 '죽은 행'은 못 막았다 — 두 결함은 다른 축이다.
+        return "alive" if _target_matches(target, live_target_rows(out)) else "dead"
     except (subprocess.SubprocessError, OSError):
         return "unknown"
 

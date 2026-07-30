@@ -97,6 +97,87 @@ REVIEWER_SLOTS = [
     ("reviewer-codex",  "codex",  "reviewer-claude-2", "claude"),
 ]
 
+# ─────────────────── B1: PLAN 테이블 정책 열 (의무/선택을 편성과 같은 소스에) ───────────────────
+# ★재감사 B1: 의무 리뷰어가 지속 고장이면 종전 체인은 **영구 데드엔드**였다(자동 회복 0) —
+#   ④ cys boot 가 비0 을 내면 javis_bootstrap 이 exit 4 로 죽고, 리뷰어 1종 고장이 팀 전체
+#   기동 실패로 번졌다. 의무/선택 판정이 **편성 테이블 밖**(호출부 산문·주석)에 있었기 때문이다.
+#   정책을 편성과 같은 행에 둔다 — 소비자는 산문을 읽지 않고 이 열을 읽는다.
+#     Fatal   = 이 역할 기동 실패 = 부트 실패(exit 4). cso·worker(조직의 최소 실행 단위).
+#     Degrade = 경고로 강등하고 ④-b·⑤ 를 계속한다. 리뷰어(대체 폴백·익명 peer-review 로 보완 가능).
+#   ★{B1,B2} 동시 착륙 필수(하드 제약 3): B1 단독이면 데드엔드가 ④→⑤ 로 이동만 한다
+#   (④ 는 통과하는데 ⑤ check 가 네이티브 리뷰어를 계속 요구해 영구 적색).
+FAIL_FATAL = "Fatal"
+FAIL_DEGRADE = "Degrade"
+BOOT_PLAN = [
+    ("cso", "claude", FAIL_FATAL),
+    ("worker", "claude", FAIL_FATAL),
+    ("reviewer-gemini", "gemini", FAIL_DEGRADE),
+    ("reviewer-codex", "codex", FAIL_DEGRADE),
+    ("reviewer-grok", "grok", FAIL_DEGRADE),
+]
+
+
+def plan_policy(role):
+    """role → "Fatal"|"Degrade". PLAN 미등재 role 은 Degrade(보수 — 미지 역할이 부트를 죽이지 않게)."""
+    for r, _agent, policy in BOOT_PLAN:
+        if r == role:
+            return policy
+    return FAIL_DEGRADE
+
+
+def plan_mandatory_roles():
+    """Fatal 정책 역할 목록 — `cys boot --json` 의 `mandatory:true` 집합과 기계 대조된다(H-EXIT-4)."""
+    return [r for r, _a, p in BOOT_PLAN if p == FAIL_FATAL]
+
+
+# ─────────────────── 공유 술어 ③: slot_satisfied (B2 — 실충전자 라벨링) ───────────────────
+def _slot_for(required):
+    """required 리뷰어 역할이 속한 REVIEWER_SLOTS 행 반환(네이티브·대체 어느 이름으로도 조회)."""
+    for nrole, nagent, srole, sagent in REVIEWER_SLOTS:
+        if required in (nrole, srole):
+            return nrole, nagent, srole, sagent
+    return None
+
+
+def slot_satisfied(required, live_roles):
+    """★공유 술어 ③ — 의무 역할 `required` 가 라이브 좌석으로 충족되는가 + **누가 실제로 채웠는가**.
+
+    반환 (satisfied: bool, filler: str|None, native: bool|None, why: str).
+
+    ★B2 가 고치는 것: boot-reviewers 의 **2차 폴백**(네이티브 CLI 는 설치됐는데 각성 실패 →
+      reviewer-claude-N 로 전환)이 발생하면 좌석은 대체 역할명으로 서고, ⑤check 는 여전히
+      네이티브 역할명을 요구해 **영구 적색 + 재선언 불회복**이 됐다. 슬롯은 '네이티브 ∨ 대체'
+      로 충족되며, 보고는 **실충전자를 라벨링**한다(정직한 강등 — 은닉 성공 금지).
+    ★비-리뷰어(cso·worker)는 슬롯 개념이 없다 — 정확일치+worker 접두(role_matches_requirement)만.
+    ★전제(하드 제약 7): G2(session-start role case) 착지 완료. 미착지 상태로 대체 좌석을 GREEN
+      인정하면 '지침 없는 리뷰어 GREEN'(B6 동형 허위 성공)이 된다 — W1a 에서 이미 착지했다.
+    """
+    bn = _boot_node()
+    match = (bn.role_matches_requirement if bn is not None
+             else (lambda req, cand: req == cand or (req == "worker" and cand.startswith("worker"))))
+    for cand in live_roles:
+        if match(required, cand):
+            return True, cand, True, "네이티브 좌석 %s" % cand
+    slot = _slot_for(required)
+    if slot is None:
+        return False, None, None, "부재(슬롯 없는 역할 — 정확일치 요건)"
+    nrole, nagent, srole, sagent = slot
+    for cand in live_roles:
+        if cand == srole:
+            return (True, srole, False,
+                    "대체 좌석 %s(%s)가 슬롯 충전 — 네이티브 %s(%s) 부재"
+                    % (srole, sagent, nrole, nagent))
+    return False, None, None, "부재(네이티브 %s·대체 %s 모두 없음)" % (nrole, srole)
+
+
+def _boot_node():
+    """공유 술어 모듈 — 소비 불가 시 None(호출부가 명시 폴백. 조용한 접힘 금지)."""
+    try:
+        import javis_boot_node as _bn
+        return _bn
+    except Exception:
+        return None
+
 
 def _agents_json():
     try:
@@ -217,14 +298,50 @@ def _quiet_alive_roles(status, roles):
     reclaim 이 같은 상태를 반대로 해석하던 중복 로직 제거). status 를 surface_ref 에 결박해
     litter/exited row·과거이력 오인을 차단한다."""
     out = {}
-    try:
-        import javis_boot_node as _bn
-    except Exception:
+    bn = _boot_node()
+    if bn is None:
         return out
     for role in roles:
-        if _bn.quiet_but_alive(status, role):
+        if bn.quiet_but_alive(status, role):
             out[role] = True
     return out
+
+
+def live_role_names(status):
+    """status → 라이브(미exited) role 이름 집합. slot_satisfied·결손 판정의 공통 입력."""
+    return {s.get("role") for s in status.get("surfaces", [])
+            if s.get("role") and not s.get("exited")}
+
+
+def check_verdicts(status):
+    """★check 판정의 순수 함수 코어 — (verdicts, roster). 데몬 왕복 0(status 주입).
+
+    verdicts: required role → {"satisfied","grade","filler","native","why"}
+      grade ∈ awake_confirmed | alive_presumed | absent | unknown  (javis_boot_node.node_liveness)
+
+    ★B6 — 1차 통과 기준은 **fresh set-status ack(또는 awakened_at 래치)** 이고, `agent_alive`
+      단독은 '생존추정'으로 **강등 라벨링**된다. 강등은 라벨이지 실패가 아니다(exit 는 불변):
+      실패로 승격하면 래치 배포 이전 기계의 건강한 팀이 전부 적색이 되는 역방향 회귀다.
+    ★B2 — 슬롯 충족은 `slot_satisfied`(네이티브 ∨ 대체) 단일 술어를 소비하고 **실충전자**를 남긴다.
+    ★결손 판정(javis_bootstrap)·wakeup zombie 가드·reclaim 이 같은 함수를 소비한다(A1 클래스).
+    """
+    bn = _boot_node()
+    roster = reviewer_roster()
+    required = ["cso", "worker"] + [e["role"] for e in roster]
+    live = live_role_names(status)
+    verdicts = {}
+    for r in required:
+        sat, filler, native, why = slot_satisfied(r, live)
+        grade, greason = (bn.node_liveness(status, filler or r) if bn is not None
+                          else (("alive_presumed", "공유 술어 소비 불가 — 좌석 존재로 추정")
+                                if sat else ("absent", "공유 술어 소비 불가")))
+        # 좌석은 있는데 각성/생존 신호가 전부 없으면(absent) 충족이 아니다 — 이름공간과 생존을
+        # 함께 본다. 단 unknown(판정불가)은 좌석 존재 시 충족측으로 접는다(fail-open은 여기가
+        # 정당하다: check 는 파괴 행위를 하지 않고, unknown 에서 적색을 내면 콜드스타트마다 위경보).
+        satisfied = bool(sat) and grade != bn.LIVENESS_ABSENT if bn is not None else bool(sat)
+        verdicts[r] = {"satisfied": satisfied, "grade": grade, "filler": filler,
+                       "native": native, "why": "%s · %s" % (why, greason)}
+    return verdicts, roster
 
 
 # ── check: 4종 의무 노드 생존 판정 ──
@@ -233,19 +350,11 @@ def cmd_check(args):
     if status is None:
         print("[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행")
         return 2
-    # ★유효 의무 역할 = cso·worker + 감지 폴백 적용 리뷰어 로스터(agy/codex 미감지 시 Claude 대체).
-    roster = reviewer_roster()
-    required = ["cso", "worker"] + [e["role"] for e in roster]
-    alive = live_roles(status)
-    # 워커는 복수 인스턴스(worker, worker-2 …) — 하나라도 생존이면 'worker' 요건을 충족(접두 수용).
-    # 데몬이 둘째 워커부터 worker-N으로 dedup하므로 'worker' 키가 없을 수 있다.
-    if any(v for k, v in alive.items() if k == "worker" or k.startswith("worker-")):
-        alive["worker"] = True
-    # 각성 이력 있는 idle 노드(set-status 노후화·agent_alive None 으로 굳음)만 '생존추정'으로 보강.
-    # ★프로세스 단독 인증 아님(각성이력=status.state 필수·surface_ref 결박) — codex R1 결함5·R2 결함1·5 정합.
-    still_missing = [r for r in required if not alive.get(r)]
-    estimated = _quiet_alive_roles(status, still_missing) if still_missing else {}
-    alive.update(estimated)
+    # ★판정은 순수 함수(check_verdicts)에 있고 여기는 표현만 한다 — 같은 함수를 bootstrap 결손
+    #   판정·wakeup zombie 가드·reclaim 이 소비하므로 판정 이원화가 구조적으로 불가능하다(A1 클래스).
+    verdicts, roster = check_verdicts(status)
+    required = list(verdicts.keys())
+    alive_optional = live_roles(status)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
     # 리뷰어 대체 고지(오너 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
@@ -255,21 +364,28 @@ def cmd_check(args):
                   % (e["substituted_for"], e["reason"], e["role"]))
     missing = []
     for r in required:
-        if alive.get(r):
-            if estimated.get(r):
-                # fresh 각성이 아니라 '각성이력+프로세스' 추정 — 재각성(헬퍼) 권장 신호.
-                print("  ✓ %s — 생존추정(set-status 노후·프로세스 생존 · 재각성 권장)" % r)
-            else:
-                print("  ✓ %s — 생존" % r)
-        else:
-            print("  ✗ %s — 미기동" % r)
+        v = verdicts[r]
+        if not v["satisfied"]:
+            print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
             missing.append(r)
+            continue
+        # ★B2 실충전자 라벨링 — 대체 좌석이 슬롯을 채웠으면 그 사실을 숨기지 않는다.
+        fill = "" if v["native"] in (True, None) or v["filler"] == r else \
+               " ← 실충전자 %s(대체)" % v["filler"]
+        if v["grade"] == "awake_confirmed":
+            print("  ✓ %s — 각성 확정(%s)%s" % (r, v["why"], fill))
+        elif v["grade"] == "unknown":
+            print("  ✓ %s — 좌석 판정불가(프로브 실패 — 적색 아님·재확인 권장)%s" % (r, fill))
+        else:
+            # agent_alive 단독·좌석 점유·quiet_but_alive — 각성 확정이 아니다(B6 강등 라벨).
+            print("  ✓ %s — 생존추정(각성 미확인 · 재각성 권장: %s)%s" % (r, v["why"], fill))
     for r in OPTIONAL_ROLES:
-        print("  %s %s — %s" % ("✓" if alive.get(r) else "·", r,
-                                "생존" if alive.get(r) else "미설치/미기동(선택)"))
+        print("  %s %s — %s" % ("✓" if alive_optional.get(r) else "·", r,
+                                "생존" if alive_optional.get(r) else "미설치/미기동(선택)"))
     if missing:
-        only_rev = all(m.startswith("reviewer") for m in missing)
-        howto = ("javis_orchestra.py boot-reviewers (리뷰어 감지·자동 폴백)" if only_rev
+        # ★B1 정책 열 소비: 부재가 전부 Degrade(리뷰어)면 처방은 boot-reviewers(대체 폴백 포함)다.
+        only_degrade = all(plan_policy(m) == FAIL_DEGRADE for m in missing)
+        howto = ("javis_orchestra.py boot-reviewers (리뷰어 감지·자동 폴백)" if only_degrade
                  else "cys boot")
         print("종합: 필수 %d/%d 생존 — 부재: %s → `%s`로 기동하라"
               % (len(required) - len(missing), len(required), ", ".join(missing), howto))
@@ -279,15 +395,68 @@ def cmd_check(args):
 
 
 # ── boot-reviewers: 리뷰어 감지→기동, 미감지 시 Claude 대체 자동 폴백(멈춤 없음) ──
-def _boot_one_node(role, agent, timeout=130):
-    """javis_boot_node.py 로 단일 노드 결정론 부트. rc==0(각성확정) → True."""
-    bn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_boot_node.py")
+# ─────────────────── A12: 호출 exit 분류 (transient vs permanent) ───────────────────
+# ★재감사 A12: 674행 '죽은 초기화'가 설계 의도 소실의 물증이었다 — 모든 비0 을 뭉개 재시도하면
+#   영구 실패(스크립트 부재·인터프리터 깨짐)를 24회 재시도로 태우고 정확한 처방을 잃는다.
+#     2   = 치명(데몬 다운·인자 오류)   → **영구**: 즉시 fail + 정확 처방(재시도 금지)
+#     127 = 명령/스크립트 부재          → **영구**: 즉시 fail + 설치·경로 처방(재시도 금지)
+#     124 = timeout(부트가 느림)        → **transient**: 재시도 가치 있음
+#     그 밖 비0(1 등) = 실측 미확정      → transient(보수 — 종전 동작 보존)
+EXIT_CLASS_PERMANENT = "permanent"
+EXIT_CLASS_TRANSIENT = "transient"
+EXIT_CLASS_OK = "ok"
+
+
+def classify_call_exit(rc, target="호출"):
+    """순수 판정: 서브프로세스 rc → (class, 처방). class ∈ ok|permanent|transient."""
+    if rc == 0:
+        return EXIT_CLASS_OK, "성공"
+    if rc == 2:
+        return EXIT_CLASS_PERMANENT, (
+            "%s 치명(exit 2 — 데몬 다운 또는 인자 오류): 재시도는 무의미하다. "
+            "`cys ping` 으로 데몬을 확인하고 인자를 점검하라." % target)
+    if rc == 127:
+        return EXIT_CLASS_PERMANENT, (
+            "%s 부재(exit 127 — 스크립트/인터프리터 없음): 재시도는 무의미하다. "
+            "팩 경로(CYS_PACK_DIR)와 python 해소를 점검하라." % target)
+    if rc == 124:
+        return EXIT_CLASS_TRANSIENT, "%s timeout(exit 124) — 예산 내 재시도 가치 있음" % target
+    return EXIT_CLASS_TRANSIENT, "%s 실패(exit %s) — 실측 미확정, 보수적으로 재시도 대상" % (target, rc)
+
+
+def _boot_node_outer_timeout():
+    """_boot_one_node 가 씌우는 외부 상한 — javis_budget 파생(하드코딩 금지·B9 역전 해소)."""
     try:
-        r = subprocess.run([sys.executable, bn, "--role", role, "--agent", agent],
-                           timeout=timeout)
-        return r.returncode == 0
+        import javis_budget as _b
+        return float(_b.boot_node_outer_s())
     except Exception:
-        return False
+        return 130.0
+
+
+def _boot_one_node(role, agent, timeout=None):
+    """javis_boot_node.py 로 단일 노드 결정론 부트 → (ok, rc, exit_class, 처방).
+
+    ★B9 데드라인 전파: 외부 상한을 javis_budget 에서 파생하고 **같은 예산을 `--timeout` 으로
+      하위에 전달**한다. 종전엔 외부 130s 가 내부(90s + 데드라인 무시 서브프로세스 80s)를 넘지
+      못해 정상 진행 중인 부트를 잘랐다(예산 역전 2/3).
+    ★A12: rc 를 분류해 영구 실패는 재시도하지 않고 처방을 낸다.
+    """
+    outer = float(timeout) if timeout else _boot_node_outer_timeout()
+    inner = max(10.0, outer - 12.0)      # 하위 데드라인 < 외부 상한(잔여 granularity 확보)
+    bn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_boot_node.py")
+    if not os.path.isfile(bn):
+        cls, why = classify_call_exit(127, "javis_boot_node.py")
+        return False, 127, cls, why
+    try:
+        r = subprocess.run([sys.executable, bn, "--role", role, "--agent", agent,
+                            "--timeout", "%.0f" % inner], timeout=outer)
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except Exception:
+        rc = 2
+    cls, why = classify_call_exit(rc, "boot_node(%s)" % role)
+    return rc == 0, rc, cls, why
 
 
 def cmd_boot_reviewers(args):
@@ -298,28 +467,48 @@ def cmd_boot_reviewers(args):
     roster = reviewer_roster()
     print("[boot-reviewers] 리뷰어 슬롯 기동 (미감지/각성실패 시 Claude 대체로 자동 폴백):")
     results = []
+    fillers = []          # ★B2: 슬롯을 **실제로 채운** 역할 — check 재해소의 근거(라벨링 대상)
     for (nrole, nagent, srole, sagent), e in zip(REVIEWER_SLOTS, roster):
         role, agent = e["role"], e["agent"]
         if not e["native"]:
             print("  ⚠ %s 미감지(%s) — %s(Claude) 대체 기동" % (nagent, e["reason"], srole))
         if args.plan:
-            print("  · PLAN %-18s ← %s%s" % (role, agent,
+            print("  · PLAN %-18s ← %-8s [%s]%s" % (role, agent, plan_policy(nrole),
                   "" if e["native"] else " (대체: %s 부재)" % nagent))
             results.append("plan")
+            fillers.append({"slot": nrole, "filler": role, "native": e["native"]})
             continue
-        ok = _boot_one_node(role, agent)
+        ok, rc, cls, why = _boot_one_node(role, agent)
         if not ok and e["native"]:
+            if cls == EXIT_CLASS_PERMANENT:
+                # ★A12: 영구 실패(스크립트 부재·데몬 다운)는 대체 폴백으로도 못 고친다 —
+                #   같은 헬퍼를 다시 부르면 같은 영구 실패다. 정확 처방만 내고 재시도하지 않는다.
+                print("  ✗ %-18s ← %s — 영구 실패: %s" % (role, agent, why))
+                results.append("failed")
+                fillers.append({"slot": nrole, "filler": None, "native": None})
+                continue
             # 설치됐으나 각성 실패(미인증·깨짐) — 2차 폴백: Claude 대체로 전환
-            print("  ⚠ %s 기동/각성 실패 — %s(Claude) 대체로 2차 폴백" % (role, srole))
-            role, agent, ok = srole, sagent, _boot_one_node(srole, sagent)
-        print("  %s %-18s ← %s" % ("✓" if ok else "✗", role, agent))
+            print("  ⚠ %s 기동/각성 실패(%s) — %s(Claude) 대체로 2차 폴백" % (role, why, srole))
+            role, agent = srole, sagent
+            ok, rc, cls, why = _boot_one_node(srole, sagent)
+        print("  %s %-18s ← %s%s" % ("✓" if ok else "✗", role, agent,
+                                     "" if ok else " — %s" % why))
         results.append("awake" if ok else "failed")
+        fillers.append({"slot": nrole, "filler": role if ok else None,
+                        "native": (role == nrole) if ok else None})
     awoke = sum(1 for s in results if s in ("awake", "plan"))
+    # ★B2 실충전자 고지 — ⑤check 는 slot_satisfied 로 같은 사실을 재해소한다(대체 좌석=슬롯 충족).
+    for f in fillers:
+        if f["filler"] and f["native"] is False:
+            print("  ↳ 슬롯 %s 는 대체 좌석 %s 가 충전 — check 는 이 좌석으로 슬롯을 재해소한다"
+                  " (영구 적색·재선언 불회복 차단)" % (f["slot"], f["filler"]))
     if args.plan:
         print("종합(PLAN): 리뷰어 %d슬롯 — 감지 폴백 적용 로스터 출력(기동 안 함)" % len(results))
         return 0
     print("종합: 리뷰어 %d/2 각성 (Claude 대체 포함)%s"
           % (awoke, "" if awoke >= 2 else " — 부족: master 가 점검·수동 재기동"))
+    # ★B1 정책: 리뷰어는 Degrade 다 — 부족은 **경고**로 강등하고 상위 체인(④-b→⑤)을 계속시킨다.
+    #   비0 을 유지하되 소비부(javis_bootstrap ④-b)는 이 exit 로 부트를 죽이지 않는다(exit 4=Fatal 만).
     return 0 if awoke >= 2 else 1
 
 
@@ -1971,10 +2160,77 @@ def cmd_self_test(args):
         assert guard_master_verdict("31", []) == (0, "no_master"), "master 부재인데 PASS 아님"
         assert guard_master_verdict("31", None) == (0, "list_fail"), "cys list 실패인데 PASS/list_fail 아님(부팅 차단 회귀)"
         assert guard_master_verdict("notanumber", [99]) == (0, "unparsed"), "파싱불가 env가 false-block(회귀)"
+
+        # ─────────── W2: B1 PLAN 정책 열 · B2 slot_satisfied · check_verdicts · A12 분류 ───────────
+        # B1: 정책이 편성과 같은 행에 있고, Fatal 집합 = cso·worker(조직 최소 실행 단위)뿐이다.
+        assert [r for r, _a, _p in BOOT_PLAN] == \
+            ["cso", "worker", "reviewer-gemini", "reviewer-codex", "reviewer-grok"], \
+            "BOOT_PLAN 편성 변형(cys boot PLAN 과 파리티 깨짐)"
+        assert plan_mandatory_roles() == ["cso", "worker"], \
+            "Fatal 집합 변형 — 리뷰어가 Fatal 이면 리뷰어 1종 고장이 팀 전체 부트를 죽인다(B1 재발)"
+        assert plan_policy("reviewer-gemini") == FAIL_DEGRADE, "네이티브 리뷰어가 Degrade 아님"
+        assert plan_policy("reviewer-grok") == FAIL_DEGRADE, "선택 리뷰어가 Degrade 아님"
+        assert plan_policy("cso") == FAIL_FATAL and plan_policy("worker") == FAIL_FATAL, \
+            "cso·worker 가 Fatal 아님(조직 최소 실행 단위 붕괴)"
+        assert plan_policy("verifier") == FAIL_DEGRADE, "미지 role 이 Fatal 로 접힘(부트 사망 회귀)"
+        # PLAN 정책 열 ↔ effective_required_roles ↔ 결손 구성 3자 대조(H-PRED-7):
+        #   Fatal 역할은 전부 유효 의무 목록에 있어야 하고, 유효 의무 리뷰어는 슬롯으로 해소돼야 한다.
+        _yes = lambda ag, agents=None: (True, "테스트 주입")   # noqa: E731
+        _synth = {"gemini": {"cmd": "/x/agy"}, "codex": {"cmd": "/x/codex"}, "claude": {"cmd": "claude"}}
+        _eff = effective_required_roles(detect=_yes, agents=_synth)
+        assert set(plan_mandatory_roles()) <= set(_eff), \
+            "Fatal 역할이 유효 의무 목록에서 빠짐(부트는 요구하는데 check 는 안 봄)"
+        assert all(r in [p[0] for p in BOOT_PLAN] or r.startswith("reviewer-claude")
+                   for r in _eff), "유효 의무 역할이 PLAN 에도 슬롯에도 없음(고아 요건)"
+        # B2 slot_satisfied — 네이티브·대체·부재 3케이스 + 실충전자 라벨
+        s_ok, s_fill, s_nat, _ = slot_satisfied("reviewer-gemini", {"reviewer-gemini"})
+        assert (s_ok, s_fill, s_nat) == (True, "reviewer-gemini", True), "네이티브 좌석 충족 실패"
+        s_ok, s_fill, s_nat, _ = slot_satisfied("reviewer-gemini", {"reviewer-claude-1"})
+        assert (s_ok, s_fill, s_nat) == (True, "reviewer-claude-1", False), \
+            "2차 폴백 대체 좌석이 슬롯을 충족하지 못함(B2 영구 적색 재발)"
+        s_ok, s_fill, _, _ = slot_satisfied("reviewer-codex", {"reviewer-claude-1"})
+        assert s_ok is False and s_fill is None, "슬롯 교차 충전(codex 슬롯을 gemini 대체가 채움)"
+        assert slot_satisfied("cso", {"cso-1"})[0] is False, "cso-1 이 의무 cso 를 충족(G26 재발)"
+        assert slot_satisfied("worker", {"worker-2"})[0] is True, "worker-N dedup 좌석 수용 실패"
+        assert slot_satisfied("reviewer-gemini", {"reviewer-grok"})[0] is False, \
+            "선택 리뷰어(grok)가 의무 슬롯을 충족(G26 재발)"
+        # check_verdicts — B6 강등 라벨링(agent_alive 단독=생존추정)·좌석 empty=미충족
+        def _st(rows):
+            return {"surfaces": rows}
+        _base = [{"role": "cso", "exited": False, "awakened_at": 1.0},
+                 {"role": "worker-2", "exited": False, "status": {"age_secs": 3, "state": "working"}},
+                 {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
+                 {"role": "reviewer-codex", "exited": False, "seat": "empty", "agent_alive": False}]
+        _v, _ = check_verdicts(_st(_base))
+        assert _v["cso"]["grade"] == "awake_confirmed", "래치 좌석이 각성확정 아님"
+        assert _v["worker"]["satisfied"] and _v["worker"]["filler"] == "worker-2", \
+            "worker-2 dedup 좌석이 worker 요건을 못 채움"
+        assert _v["reviewer-gemini"]["grade"] == "alive_presumed", \
+            "agent_alive 단독이 각성확정으로 계상(B6 오답 잔존)"
+        assert _v["reviewer-gemini"]["satisfied"] is True, \
+            "생존추정 강등이 **실패로 승격**됐다(래치 이전 기계 전원 적색 — 역방향 회귀)"
+        assert _v["reviewer-codex"]["satisfied"] is False, "좌석 empty·무신호인데 충족으로 계상"
+        # 대체 좌석만 있는 상태 → 슬롯 재해소로 충족(B2)
+        _sub = [{"role": "cso", "exited": False, "awakened_at": 1.0},
+                {"role": "worker", "exited": False, "awakened_at": 1.0},
+                {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
+                {"role": "reviewer-claude-2", "exited": False, "awakened_at": 1.0}]
+        _v2, _ = check_verdicts(_st(_sub))
+        assert _v2["reviewer-codex"]["satisfied"] is True, "대체 좌석 재해소 실패(B2)"
+        assert _v2["reviewer-codex"]["native"] is False, "실충전자 라벨(native=False) 누락"
+        # A12 exit 분류
+        assert classify_call_exit(0)[0] == EXIT_CLASS_OK, "rc0 이 ok 아님"
+        assert classify_call_exit(2)[0] == EXIT_CLASS_PERMANENT, "exit 2 가 영구 실패 아님"
+        assert classify_call_exit(127)[0] == EXIT_CLASS_PERMANENT, "exit 127 이 영구 실패 아님"
+        assert classify_call_exit(124)[0] == EXIT_CLASS_TRANSIENT, "exit 124 가 재시도 대상 아님"
+        assert classify_call_exit(1)[0] == EXIT_CLASS_TRANSIENT, "exit 1 이 재시도 대상 아님(보수 이탈)"
+        assert "재시도는 무의미" in classify_call_exit(127)[1], "영구 실패에 재시도 금지 처방 누락"
+        assert _boot_node_outer_timeout() >= 100, "boot_node 외부 상한이 비정상(예산 파생 실패)"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_orchestra self-test OK (4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
+    print("javis_orchestra self-test OK (W2: PLAN 정책열·slot_satisfied 3케이스·check_verdicts "
+          "강등라벨·A12 exit 분류 + 4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
           "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
     return 0
 

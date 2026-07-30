@@ -21,7 +21,15 @@
 
 테스트/자동화 주입: --servers-override/--nodes-override/--load-override (라이브 측정 대체).
 사용 예: python3 javis_resource_gate.py check --context 42 --json
-exit codes: 0 allow · 1 soft · 2 hard · (3+ 내부 오류)
+exit codes(A13 타입드 — 코드 상수와 기계 대조):
+  0  EXIT_ALLOW     허용
+  1  EXIT_SOFT      soft_warn(경고 후 진행)
+  2  EXIT_HARD      hard_block(착수 거부) — **자원 판정**에만 쓰인다
+  64 EXIT_USAGE     EX_USAGE — 미지 서브커맨드·인자 오류(측정 자체가 일어나지 않음).
+                    종전 argparse 기본 exit 2 가 EXIT_HARD 와 충돌해, 오타 하나가 '팀 기동 거부'로
+                    오독됐다(재감사 A13 치환 결함). 소비부는 이 코드를 '측정 실패'로 loud 처리한다.
+  70 EXIT_INTERNAL  EX_SOFTWARE — 게이트 내부 예외(측정 실패 ≠ soft_warn. 종전 exit 1 오분류).
+자체검증: python3 javis_resource_gate.py --self-test
 """
 import argparse
 import json
@@ -32,6 +40,13 @@ import sys
 import time
 
 EXIT_ALLOW, EXIT_SOFT, EXIT_HARD = 0, 1, 2
+# ★A13(T-0147-7 W2 · 하드 제약 8) — argparse 의 exit 2 ↔ EXIT_HARD=2 **의미 공간 충돌** 해소.
+#   종전에는 `check --unknown-flag` 같은 사용오류가 argparse 기본 동작으로 exit 2 를 냈고,
+#   소비부(javis_bootstrap ④′)는 그 2를 '자원 hard_block'으로 읽어 **아무 측정도 없이 팀 기동을
+#   거부**했다(판정과 사용오류의 융합 — RC2). 사용오류는 sysexits.h 의 EX_USAGE(64)로 분리한다.
+#   ★내부 예외(게이트가 재다가 터진 경우)도 exit 1='soft' 로 오분류됐다 — EXIT_INTERNAL 로 분리한다.
+EXIT_USAGE = 64          # EX_USAGE — 미지 서브커맨드·인자 오류(측정 자체가 일어나지 않음)
+EXIT_INTERNAL = 70       # EX_SOFTWARE — 게이트 내부 예외(측정 실패 ≠ soft_warn)
 
 SERVER_PATTERNS = [
     r"bun .*server", r"node .*server", r"vite(\s|$)", r"next dev", r"uvicorn",
@@ -415,8 +430,32 @@ def cmd_enforce(a):
     return EXIT_ALLOW
 
 
+class _UsageExit(Exception):
+    """argparse 의 SystemExit(2) 를 가로채 EX_USAGE(64) 로 remap 하기 위한 내부 신호."""
+
+
+class _GateArgumentParser(argparse.ArgumentParser):
+    """★A13: argparse 의 사용오류 종료를 exit 2(=EXIT_HARD) 로 흘려보내지 않는다.
+
+    argparse 는 error()/exit(2) 로 SystemExit(2) 를 던진다 — 그 2가 이 도구의 '자원 hard_block'
+    코드와 같아서, 소비부가 **오타 하나를 팀 기동 거부로 오독**했다. usage 메시지는 그대로
+    stderr 에 내되(진단 보존), 종료 코드만 EX_USAGE(64)로 분리한다."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        raise _UsageExit(message)
+
+    def exit(self, status=0, message=None):
+        if message:
+            sys.stderr.write(message)
+        if status == 0:
+            raise SystemExit(0)          # --help 등 정상 종료는 보존
+        raise _UsageExit("argparse exit %s" % status)
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="자원 사전 게이트 — 착수 전 차단 (P0-3)")
+    p = _GateArgumentParser(description="자원 사전 게이트 — 착수 전 차단 (P0-3)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("check")
@@ -454,9 +493,89 @@ def main(argv=None):
     c.add_argument("--pids", type=int, nargs="*", default=None, help="테스트 주입(임계 우회)")
     c.set_defaults(fn=cmd_enforce)
 
-    a = p.parse_args(argv)
-    return a.fn(a)
+    try:
+        a = p.parse_args(argv)
+    except _UsageExit:
+        return EXIT_USAGE
+    # ★내부 예외를 exit 1('soft_warn')로 흘리지 않는다 — '측정 실패'와 '자원 경고'는 다른 사실이다.
+    #   traceback 은 stderr 로 남기고(진단 보존) 계약 채널(stdout)은 오염시키지 않는다.
+    try:
+        return a.fn(a)
+    except SystemExit:
+        raise
+    except Exception as e:                      # noqa: BLE001 — 최상위 경계에서 타입 분리가 목적
+        import traceback
+        traceback.print_exc()
+        sys.stderr.write("[resource-gate] 내부 예외로 측정 실패(exit %d=EX_SOFTWARE): %s\n"
+                         % (EXIT_INTERNAL, e))
+        return EXIT_INTERNAL
+
+
+def self_test():
+    """A13 타입드 exit 회귀 배터리 — 측정 없이 결정론(부작용 0)."""
+    fails = []
+
+    def chk(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    import io
+    import contextlib
+    # ① 미지 서브커맨드 → EX_USAGE(64), EXIT_HARD(2) 와 분리
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["definitely-not-a-subcommand"])
+    chk(rc == EXIT_USAGE, "미지 서브커맨드가 EX_USAGE(64) 아님: rc=%r" % rc)
+    chk(rc != EXIT_HARD, "사용오류가 hard_block(2)로 오독됨 — argparse↔EXIT_HARD 충돌 잔존")
+    # ② 미지 플래그도 동일
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["check", "--no-such-flag"])
+    chk(rc == EXIT_USAGE, "미지 플래그가 EX_USAGE(64) 아님: rc=%r" % rc)
+    # ③ 인자 없음(subparser required) → EX_USAGE
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main([])
+    chk(rc == EXIT_USAGE, "서브커맨드 부재가 EX_USAGE(64) 아님: rc=%r" % rc)
+    # ④ 정상 판정 경로는 무회귀(override 주입으로 측정 대체 — 라이브 ps 무의존)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_ALLOW, "정상 allow 경로 회귀: rc=%r" % rc)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = main(["check", "--servers-override", "99", "--nodes-override", "0",
+                   "--load-override", "0.0"])
+    chk(rc == EXIT_HARD, "servers hard 경로 회귀: rc=%r" % rc)
+    # ⑤ 내부 예외 → EX_SOFTWARE(70), 'soft'(1) 오분류 아님
+    import types
+    ns = types.SimpleNamespace(fn=lambda _a: (_ for _ in ()).throw(RuntimeError("boom")))
+    saved = _GateArgumentParser.parse_args
+    try:
+        _GateArgumentParser.parse_args = lambda self, argv=None: ns
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["check"])
+    finally:
+        _GateArgumentParser.parse_args = saved
+    chk(rc == EXIT_INTERNAL, "내부 예외가 EX_SOFTWARE(70) 아님: rc=%r" % rc)
+    chk(rc != EXIT_SOFT, "내부 예외가 soft_warn(1)로 오분류 — 측정 실패↔자원 경고 융합 잔존")
+    # ⑥ 계약 채널: --json 의 stdout 은 순수 JSON(진단 혼입 0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        main(["check", "--json", "--servers-override", "0", "--nodes-override", "0",
+              "--load-override", "0.0"])
+    try:
+        json.loads(buf.getvalue().strip())
+    except ValueError as e:
+        fails.append("--json stdout 이 순수 JSON 아님: %s" % e)
+
+    if fails:
+        print("javis_resource_gate self-test FAIL:")
+        for f in fails:
+            print("  ✗ " + f)
+        return 1
+    print("javis_resource_gate self-test OK — A13 타입드 exit 9종"
+          "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)")
+    return 0
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())
     sys.exit(main())

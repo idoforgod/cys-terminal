@@ -2498,14 +2498,29 @@ mod auto_restore_tests {
     use std::cell::RefCell;
     use std::time::Duration;
 
+    /// ★(T-0147-7 W2 부수) `CYS_PHOENIX_EXTRACT_FAIL` 은 **프로세스 전역** env 이고, 이 시임을 쓰는
+    /// 테스트와 정상 추출을 검증하는 테스트가 같은 테스트 바이너리에서 **병렬로** 돈다. 종전 코드는
+    /// `set_var` → 본문 → `remove_var` 였는데 그 사이 창에서 형제 테스트가 시임을 관측해
+    /// `b1_extract_writes_phoenix_and_deps` 가 "injected mid-extraction failure" 로 죽었다
+    /// (실측 재현 — 선재 red). 게다가 본문 assert 가 실패하면 언와인딩이 remove_var 를 건너뛰어
+    /// **누출이 영구화**된다. 수리는 두 겹이다:
+    ///   ① 이 락으로 시임 set/remove 윈도를 **직렬화**한다 → `--test-threads` 값과 무관하게 통과.
+    ///   ② 해제를 RAII(`cys::pack::EnvGuard`)로 바꿔 패닉 언와인딩에도 복원된다.
+    /// (pack.rs 의 `PACK_ENV_LOCK` 이 ENV_PACK_DIR 에 대해 쓰는 것과 같은 패턴 — 선례 재사용.)
+    static EXTRACT_FAIL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
     #[test]
     fn b1_extract_mid_failure_leaves_no_partial_root() {
+        let _serial = EXTRACT_FAIL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
-        std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
-        let res = extract_phoenix_embed(&sd);
-        std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        let res = {
+            let _g = cys::pack::EnvGuard::set("CYS_PHOENIX_EXTRACT_FAIL", "1");
+            extract_phoenix_embed(&sd)
+        }; // ← 여기서 EnvGuard drop = 시임 복원(패닉 경로 포함)
         assert!(res.is_err(), "주입된 중간 실패가 Err 여야 한다");
         // phoenix-embed 하위 child dir 0(즉시 정리 — 다음 부팅 prune 의존 금지).
         let root = sd.join("phoenix-embed");
@@ -2544,6 +2559,13 @@ mod auto_restore_tests {
     /// 임베드 내용 그대로 쓴다. temp 누수 0: 정리 후 디렉터리 소멸.
     #[test]
     fn b1_extract_writes_phoenix_and_deps() {
+        // ★같은 시임(전역 env)을 만지는 형제 테스트와 직렬화 — 이 테스트는 시임이 **없는** 상태를
+        //   전제하므로, 형제의 set/remove 윈도와 겹치면 결정론이 깨진다(선재 red 의 근저원인).
+        //   추가로 상속된 누출(이전 실행 잔재·외부 env)도 이 스코프에서 명시 제거한다.
+        let _serial = EXTRACT_FAIL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clean = cys::pack::EnvGuard::remove("CYS_PHOENIX_EXTRACT_FAIL");
         let sd = std::env::temp_dir().join(format!("cys-b1x-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
         let (root, script) = extract_phoenix_embed(&sd).expect("추출 성공");

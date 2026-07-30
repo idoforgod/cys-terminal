@@ -1121,7 +1121,13 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                        // 데몬 env 변동에도 원 대화(.jsonl)로 정확히 재개한다. 구 topology(필드 없음)는
                        // 로드 시 None → 기존 동작(템플릿 전개)으로 하위호환.
                        "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(),
-                       "pack_reinject": s.pack_reinject.lock().unwrap().clone()})
+                       "pack_reinject": s.pack_reinject.lock().unwrap().clone(),
+                       // ★(W2 · B6) 각성 래치 영속 — 데몬 재시작 생존이 **필수**다(비평2 B-1).
+                       // 인메모리 단독이면 재시작 직후 건강한 전 팀이 래치를 잃고, 부트 체인은
+                       // '각성 확정'을 영영 못 본다(legacy-presumed 로 영구 강등 = 신호 무력화).
+                       // restore 가 이 값을 surface.create 의 awakened_at 파라미터로 되돌린다.
+                       // 구 topology(키 부재)는 로드 시 null → None(하위호환·단방향 계약 유지).
+                       "awakened_at": *s.awakened_at.lock().unwrap()})
             })
         })
         .collect();
@@ -1447,6 +1453,70 @@ pub fn seat_claimable_now(s: &crate::state::Surface) -> bool {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
     seat_claimable(&sys, s)
+}
+
+/// ★(T-0147-7 W2 · CS-5① / 비평2 C-4) **live-slot 계약** — latest-wins 의 agent_alive 한정 보호.
+///
+/// 종전 계약: 비특권 역할(reviewer-* 등)은 `roles.insert` 의 **latest-wins**(최신 surface 승리 —
+/// state.rs:513·1881 명문). 그 결과 살아 일하는 리뷰어의 역할 주소를 새 pane 이 조용히 빼앗아
+/// `--to reviewer-codex` 라우팅·알림·deadman 감시가 끊길 수 있다.
+///
+/// **전면 제거는 금지다**(금지 방향 ⑤): latest-wins 는 사실상의 self-heal 경로다 — 행 걸린 리뷰어를
+/// "새로 띄우면 승리"로 회수하는 유일한 무마찰 수단이고, 그걸 없애면 B1/B2 가 고치려는 '리뷰어 영구
+/// 결손'을 다른 문으로 재도입한다. 그래서 보호 범위를 **agent_alive 좌석 하나로 한정**한다:
+///   agent_alive = agent_meta 등록됨 ∧ agent_seen ∧ ¬agent_exit_notified
+///   → 이 셋을 모두 만족하는 좌석만 보호(=탈취 거부). 죽은·행 걸린·메타 없는 좌석은 **현행 유지**.
+///
+/// 반환: true = 이 좌석은 살아있는 에이전트가 점유 중(보호 대상).
+pub fn slot_agent_alive(s: &crate::state::Surface) -> bool {
+    if s.exited.load(Ordering::Relaxed) {
+        return false;
+    }
+    let has_meta = s.agent_meta.lock().unwrap().is_some();
+    has_meta
+        && s.agent_seen.load(Ordering::Relaxed)
+        && !s.agent_exit_notified.load(Ordering::Relaxed)
+}
+
+/// ★(T-0147-7 W2 · G13/G14) 좌석 승계 **임계영역 내 저비용 재검증**.
+///
+/// **왜 필요한가**: `seat_claimable_now` 는 전 프로세스 표를 refresh 하므로 반드시 락 **밖**에서
+/// 돈다(락 보유 중 수십 ms = 데몬 전체 정지). 그 결과 '프로브 → 임계영역 진입' 사이에 창이 열려
+/// 있고, 종전에는 그 창에서 재검증이 **0**이었다(재감사 G13/G14): 프로브 후에 사용자가 그 pane 에
+/// claude 를 띄우거나(자손 생성) 타이핑을 시작해도 승계가 그대로 진행돼, **살아있는 좌석의 역할을
+/// 빼앗아** 알림·라우팅·deadman 감시를 끊었다.
+///
+/// **왜 이 함수는 저비용인가**: 프로세스 표를 다시 훑지 않는다. 승계 직전 창에서 **바뀔 수 있는
+/// 값싼 사실**만 다시 본다 —
+///   ① `exited`        : 그 사이 종료됐다(승계 대상이 아니라 정리 대상 — 다른 경로가 처리한다).
+///   ② `agent_meta`    : 그 사이 에이전트가 등록됐다(= 사람이 CLI 를 띄웠다. 죽은 에이전트의 좌석은
+///                       node-recover 영역이지 탈취 대상이 아니다 — seat_claimable 의 동일 규약).
+///   ③ `last_human_input`: 그 사이 사람이 타이핑했다(사용자가 지금 그 pane 을 쓰고 있다).
+///   ④ `seat_cache`    : watchdog 이 그 사이 Occupied 로 갱신했다(커널 사실이 값싸게 도착한 경로).
+/// 하나라도 걸리면 **승계를 취소**한다(TOCTOU 를 원리상 소거할 수는 없지만, 창을 '락 진입 1회'로
+/// 좁히고 값싼 반증을 모두 소진한다 — reclaim 의 kill-직전 재조회와 동형 설계).
+///
+/// 반환: `None`=승계 계속 / `Some(사유)`=승계 취소.
+pub fn seat_takeover_recheck(s: &crate::state::Surface) -> Option<&'static str> {
+    if s.exited.load(Ordering::Relaxed) {
+        return Some("프로브 후 좌석이 종료됨(승계 대상 아님 — reap 경로가 처리)");
+    }
+    if s.agent_meta.lock().unwrap().is_some() {
+        return Some("프로브 후 agent_meta 등록됨(사람이 CLI 를 띄웠다 — node-recover 영역)");
+    }
+    let human_recent = s
+        .last_human_input
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
+        .unwrap_or(false);
+    if human_recent {
+        return Some("프로브 후 사람 입력 관측(사용자가 그 pane 을 사용 중)");
+    }
+    if SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Occupied {
+        return Some("프로브 후 좌석 캐시가 Occupied 로 갱신됨(자손 프로세스 생성)");
+    }
+    None
 }
 
 /// Walk the process table and collect all descendants of `root`.

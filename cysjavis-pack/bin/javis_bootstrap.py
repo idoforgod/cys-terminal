@@ -122,8 +122,39 @@ BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 # ★예산 확대(오너 2026-07-15 적대검증 adv#4): 냉시작 claude는 모델 로드+MCP init로 30초 내
 # agent_alive/set-status ack가 안 나 check가 조기 실패(팀은 아직 뜨는 중)했다. 노드 기동은 비동기라
 # 넉넉히 기다린다 — 24×5s ≈ 120초 상한(무한 아님·자원 거버넌스 유지).
-CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES", "24")))
-CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S", "5"))  # 총 상한 ≈ 120초
+
+# ★시간 예산 단일 소스(W2 B9·B17·P3-A-120S) — 상수 곱 산술과 하드코딩 timeout 을 폐기한다.
+#   javis_budget 가 leaf(냉시작 실측 하한·감액 금지) 와 파생(외부 상한=하위 최악치 합+마진)의 SOT다.
+#   ★소비 불가(부서 팩 결손·팩 스큐) 시엔 **종전 하드코딩 값을 명시 폴백**으로 쓴다 — 예산 모듈
+#   부재가 새 크래시 지점이 되면 안 되고, 폴백은 조용하지 않다(사유가 step detail 에 남는다).
+try:
+    import javis_budget as _budget_mod
+except Exception:
+    _budget_mod = None
+
+
+def _budget_leaf(name, fallback):
+    if _budget_mod is None:
+        return fallback
+    try:
+        return _budget_mod.leaf(name)
+    except Exception:
+        return fallback
+
+
+def _budget_derived(fn_name, fallback):
+    if _budget_mod is None:
+        return fallback
+    try:
+        return int(round(float(getattr(_budget_mod, fn_name)())))
+    except Exception:
+        return fallback
+
+
+CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES",
+                                          str(_budget_leaf("CHECK_RETRIES", 24)))))
+CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S",
+                                        str(_budget_leaf("CHECK_INTERVAL_S", 5))))
 
 # ── exit 코드 단일 소스(A7·A14·A20 — 헤더 exit 표의 진실원천) ──
 # ★타입드 종료: '성공'·'정당거부'·'세션 컨텍스트 오류'·'정상 skip'·'사용오류'가 각자 코드를 갖는다.
@@ -201,6 +232,22 @@ def _run(cmd, timeout=120):
         return 127, "명령 없음: %s" % cmd[0]
     except subprocess.TimeoutExpired:
         return 124, "timeout(%ss): %s" % (timeout, " ".join(cmd))
+
+
+def _run_split(cmd, timeout=120):
+    """서브프로세스 실행 — (exit, stdout, stderr)를 **분리** 반환. `_run`(병합)의 additive 형제.
+
+    ★왜 분리판이 필요한가(A13): 기계 계약(JSON)이 stdout 이고 진단이 stderr 인 도구를 병합 텍스트로
+      파싱하면, 진단 한 줄이 계약을 파괴한다 — '판정 실패'가 '판정 결과'로 위장되는 경로다.
+      `_run` 은 종전 소비처(산문 진단 목적)가 많아 계약을 바꾸지 않고 그대로 둔다(무접촉)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout or ""), (r.stderr or "")
+    except FileNotFoundError:
+        return 127, "", "명령 없음: %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout(%ss): %s" % (timeout, " ".join(cmd))
 
 
 def _socket_is_base(sock):
@@ -664,26 +711,77 @@ def _team_roster_deficit(required, live):
     return False, "로스터 충족(의무 %s 전원 좌석 생존) — 결손 0(재선언)" % ", ".join(required)
 
 
-def _team_has_deficit():
-    """팀 결손 여부 산출 → (결손 bool, 사유). cys list 실패 → 보수적으로 결손 가정(게이트 진행).
+def _cys_status_json():
+    """`cys status --json` 파싱 결과(실패=None). 결손 판정이 check 와 **같은 신호**를 보게 하는 입구.
+    ★cys list 텍스트에는 agent_alive/seat/awakened_at 필드가 아예 없다(cys.rs 포맷) — 그래서 W0
+      단계의 결손 판정은 check 와 다른 신호를 쓸 수밖에 없었다. W2 는 그 원천을 status 로 올린다."""
+    code, out = _run(["cys", "status", "--json"], timeout=_budget_leaf("CYS_STATUS_TIMEOUT_S", 12))
+    if code != 0:
+        return None
+    try:
+        return json.loads(out.strip())
+    except (ValueError, TypeError):
+        return None
 
-    ★판정의 정직한 서술(구 docstring의 'orchestra check와 동일 신호' 주장은 객관적 거짓이었다 —
-      A1 재검증 부가 발견): **역할 이름공간**은 orchestra(effective_required_roles)와 동일 소스를
-      쓰지만, **생존 신호**는 여전히 cys list 텍스트(`role=` + `!exited`)이고 check의 신호
-      (agent_alive ∨ 신선 set-status ∨ quiet_but_alive)와 다르다 — cys list 포맷에는
-      agent_alive/seat 필드가 아예 없다(cys.rs:1499-1511). 즉 여기서 결손 0은 'check도 통과한다'는
-      뜻이 아니다. 술어 단일화는 W2(데몬 SOT 격상·reclaim 체인과 원자).
-    ★orchestra check 서브프로세스는 쓰지 않는다: ④-b(boot-reviewers)→⑤(check) orchestra 호출
-      순서·검증 계약을 오염시키지 않기 위함(deficit용 별도 check가 그 순서에 끼면 안 됨)."""
+
+def _shared_verdict_deficit(status):
+    """★A1 클래스 소멸: 결손 판정이 **⑤check 와 문자 그대로 같은 함수**를 소비한다.
+
+    `javis_orchestra.check_verdicts(status)` 는 cmd_check 가 화면 출력에 쓰는 그 판정 코어다
+    (공유 술어 `javis_boot_node.node_liveness`·`slot_satisfied` 소비). 결손 판정이 이 함수를
+    소비하면 '결손 0인데 check 실패'(=④ 생략 → ⑤ 실패 → exit 6 → 재선언 동일의 라이브락)가
+    **구조적으로 불가능**해진다 — 종전에는 이름공간(W0에서 정합)과 생존 신호(여기)가 갈려 있었다.
+
+    ★역방향 회귀 차단: node_liveness 는 `absent` 만 미충족으로 본다. agent_alive 단독·좌석 점유·
+      quiet_but_alive·**좌석 판정불가(unknown)** 는 전부 충족측이라, 건강한 quiet 노드를 결손>0
+      으로 오판해 자원 hard-block 을 되살리는 경로가 없다(W0 handoff 가 명시한 그 경계 유지).
+    반환 (결손 bool, 사유) | (None, 실패사유)."""
+    try:
+        import javis_orchestra as _orch
+        verdicts, _roster = _orch.check_verdicts(status)
+    except Exception as e:
+        return None, "check_verdicts 소비 불가(%s: %s)" % (type(e).__name__, e)
+    if not verdicts:
+        return None, "check_verdicts 빈 판정(로스터 산출 실패)"
+    missing = [r for r, v in verdicts.items() if not v.get("satisfied")]
+    presumed = [r for r, v in verdicts.items()
+                if v.get("satisfied") and v.get("grade") == "alive_presumed"]
+    if missing:
+        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+                      % (", ".join(verdicts), ", ".join(missing)))
+    note = ("" if not presumed
+            else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
+    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+                   % (", ".join(verdicts), note))
+
+
+def _team_has_deficit():
+    """팀 결손 여부 산출 → (결손 bool, 사유). 신호 원천 실패 → 보수적으로 결손 가정(게이트 진행).
+
+    ★W2 술어 단일화(A1 클래스·CS-1②): 1차 경로는 `javis_orchestra.check_verdicts` — ⑤check 가
+      쓰는 **같은 함수**다. 2차는 W0 의 로스터 판정(cys list `role=`+`!exited` — 이름공간만 정합),
+      3차는 구 가족 접두 계수(G26 한계 포함). 강등할 때마다 **사유를 사유 문자열에 남긴다**
+      (조용한 접힘 금지 — 어떤 신호로 판정했는지가 진단의 절반이다).
+    ★orchestra check **서브프로세스**는 여전히 쓰지 않는다: ④-b→⑤ 호출 순서·검증 계약에
+      deficit 용 별도 호출이 끼면 안 된다. 소비는 in-process import 다(W0 선례와 동일)."""
+    status = _cys_status_json()
+    if status is not None:
+        has, why = _shared_verdict_deficit(status)
+        if has is not None:
+            return has, why
+        why_shared = why
+    else:
+        why_shared = "cys status --json 실패/파싱 불가"
     roles = _live_role_names()
     if roles is None:
-        return True, "cys list 실패 — 결손 가정(게이트 진행·보수)"
+        return True, "cys status·cys list 모두 실패(%s) — 결손 가정(게이트 진행·보수)" % why_shared
     required, why_no_orch = _required_roles_from_orchestra()
     if required is not None:
-        return _team_roster_deficit(required, set(roles))
+        has, why = _team_roster_deficit(required, set(roles))
+        return has, "%s [강등: %s — W0 로스터 판정 사용]" % (why, why_shared)
     # graceful 폴백 — 구 가족 접두 계수(G26 한계 포함). 조용히 접히지 않게 사유를 사유 문자열에 남긴다.
     has, why = _team_composition_deficit(_family_counts(roles))
-    return has, "%s [폴백: %s — 구 가족 접두 계수 사용]" % (why, why_no_orch)
+    return has, "%s [폴백: %s / %s — 구 가족 접두 계수 사용]" % (why, why_shared, why_no_orch)
 
 
 def _live_role_names():
@@ -748,13 +846,28 @@ def _live_node_count():
 
 def _resource_gate_decision(gate_exit, gate_json, live_node_count):
     """순수 판정: 자원 게이트 exit·json·라이브 노드 수 → (verdict, 사유).
-    verdict ∈ allow|soft|hard-overcount|hard-block.
+    verdict ∈ allow|soft|hard-overcount|hard-block|usage-error|unknown-exit.
       exit 0=allow · 1=soft · 2=hard(단, nodes-only hard이고 라이브 노드<유효임계면 과계수→overcount로 무효화).
-      기타 exit(내부오류)=allow(보수적 — 게이트 내부오류로 부트를 막지 않되 진행)."""
+
+    ★A13(W2 · 하드 제약 8) — 미지 exit 의 fail-open 제거:
+      종전 반환은 **모든** 미지 exit 를 'allow(보수적 진행)'로 접었다. 그 결과 게이트가
+      **사용오류로 아무 측정도 못 한 상태**(argparse 가 exit 2 를 내던 구 코드에서는 EXIT_HARD 와
+      충돌해 hard 로 오독되기도 했다)를 '자원 여유 있음'과 동일하게 처리했다 — 판정과 판정불가의
+      융합(RC2)이다. 이제:
+        64(EX_USAGE) = 사용오류    → **명시 fail + loud**(조용한 allow 금지). 부트는 계속하되
+                                    '측정 실패'를 시끄럽게 남긴다(게이트가 없는 것과 같음을 고지).
+        그 밖 미지 exit           = 'unknown-exit' 라벨로 진행 + loud(과거의 조용한 allow 와 구분).
+      ★부트 차단(hard-block)으로 승격하지 않는 이유: 게이트 자체가 못 재는 상태에서 팀 기동을
+      거부하면 자원 무관 사유로 조직이 영구 정지한다(fail-closed 의 오적용). 방향은 'loud 진행'이다."""
     if gate_exit == 0:
         return "allow", "자원 게이트 allow"
     if gate_exit == 1:
         return "soft", "자원 게이트 soft_warn"
+    if gate_exit == 64:
+        return "usage-error", (
+            "자원 게이트 **사용오류**(exit 64=EX_USAGE) — 측정이 아예 일어나지 않았다. "
+            "게이트 없음과 동등하므로 자원 판정 없이 진행한다(조용한 allow 아님). "
+            "원인: 미지 서브커맨드·인자 오류·게이트 버전 스큐. 호출 인자를 점검하라.")
     if gate_exit == 2:
         trips = (gate_json or {}).get("trips") or []
         hard = [t for t in trips if t.get("level") == "hard"]
@@ -768,7 +881,52 @@ def _resource_gate_decision(gate_exit, gate_json, live_node_count):
                     "1회 경고 후 진행" % (nodes_hard[0].get("value"), live_node_count, eff))
         detail = ", ".join("%s=%s" % (t.get("metric"), t.get("value")) for t in hard) or "미상"
         return "hard-block", "자원 hard_block(트립: %s) — 팀 기동 거부" % detail
-    return "allow", "자원 게이트 미지 exit %s(내부오류) — 보수적 진행" % gate_exit
+    return "unknown-exit", (
+        "자원 게이트 미지 exit %s(내부오류) — **측정 신뢰 불가**. 자원 판정 없이 진행하되 "
+        "조용히 allow 로 접지 않는다(A13: 판정불가와 allow 의 융합 제거). 게이트 로그를 확인하라."
+        % gate_exit)
+
+
+def _parse_boot_json(out):
+    """`cys boot --json` 출력에서 JSON 오브젝트를 뽑는다(진행 산문과 섞여 나올 수 있다).
+    ★stdout 마지막 '{'…'}' 블록만 취한다 — 산문 로그와 기계 계약의 공존 규약(A7 채널 분리 정신).
+    반환 dict | None(구 바이너리·파싱 불가)."""
+    if not out:
+        return None
+    s = out.strip()
+    start = s.rfind("\n{")
+    cand = s[start + 1:] if start >= 0 else (s if s.startswith("{") else None)
+    if not cand:
+        return None
+    try:
+        v = json.loads(cand)
+    except (ValueError, TypeError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _boot_fatal_verdict(code, out):
+    """★B1 정책 열 소비 — `cys boot` 결과가 **Fatal 실패**인가. Fatal 이면 사유 문자열, 아니면 None.
+
+    판정 재료는 `cys boot --json` 의 role 별 `{outcome, mandatory}`:
+      Fatal 실패 = mandatory:true 인 role 의 outcome ∈ {failed, missing}.
+      busy(다른 boot 진행 중)·already_alive·launched 는 실패가 아니다(G11 — busy 를 성공으로
+      오인하지도, 실패로 오인하지도 않는다).
+    ★--json 소비 불가(구 바이너리·파싱 실패)면 **종전 계약으로 보수 폴백**: 비0 = Fatal.
+      새 계약을 못 읽는 상태에서 Degrade 로 접으면 진짜 실패를 은닉한다(fail-open 금지)."""
+    v = _parse_boot_json(out)
+    if v is None or not isinstance(v.get("roles"), list):
+        return (None if code == 0
+                else "cys boot 실패(exit %s) — --json 계약 소비 불가로 종전 계약(비0=Fatal) 적용:\n%s"
+                     % (code, out))
+    bad = [r for r in v["roles"]
+           if r.get("mandatory") and r.get("outcome") in ("failed", "missing")]
+    if not bad:
+        return None
+    detail = ", ".join("%s=%s%s" % (r.get("role"), r.get("outcome"),
+                                    (" [" + r["install_hint"] + "]") if r.get("install_hint") else "")
+                       for r in bad)
+    return "의무(Fatal) 역할 기동 실패: %s\n%s" % (detail, out)
 
 
 def _run_resource_gate(py, log):
@@ -778,14 +936,27 @@ def _run_resource_gate(py, log):
     if not os.path.isfile(gate):
         log.step("④′resource-gate", 0, "결손>0이나 resource_gate 부재 — 게이트 생략(계속)")
         return None
-    code, out = _run([py, gate, "check", "--json"], timeout=30)
+    # ★A13 잠복 경로 차단(착수 전 재검증 산물): 종전 호출은 `_run`(stdout+stderr **병합**)의
+    #   병합 텍스트를 json.loads 에 넣었다. 게이트가 stderr 를 한 줄이라도 흘리는 날(파이썬 경고·
+    #   미래 진단 로그) 파싱이 깨져 `gate_json=None` 이 되고, exit 2 + json None 은
+    #   nodes 과계수 무효화(hard-overcount)를 성립 불가로 만들어 **건강한 기계를 hard-block(exit 9)**
+    #   시킨다. 실측으로 재현 가능한 인접 결함이므로(원 메커니즘 판정은 기각) 채널을 분리한다:
+    #   **계약 채널은 stdout 뿐**이고 stderr 는 진단으로만 남긴다.
+    code, gout, gerr = _run_split([py, gate, "check", "--json"],
+                                  timeout=_budget_leaf("RPC_SLACK_S", 10) * 3)
     try:
-        gate_json = json.loads(out.strip())
+        gate_json = json.loads((gout or "").strip())
     except (ValueError, TypeError):
         gate_json = None
     live = _live_node_count() if code == 2 else None
     verdict, why = _resource_gate_decision(code, gate_json, live)
-    log.step("④′resource-gate", code, "결손>0 · verdict=%s · %s" % (verdict, why))
+    out = (gout or "") + (("\n[stderr] " + gerr.strip()) if (gerr or "").strip() else "")
+    log.step("④′resource-gate", code, "결손>0 · verdict=%s · %s\n%s" % (verdict, why, out))
+    if verdict in ("usage-error", "unknown-exit"):
+        # ★조용한 allow 금지 — 측정 실패는 시끄럽게(loud) 남기고 진행한다(fail-open 제거).
+        _progress("⚠ 자원 게이트 측정 실패(%s) — 자원 판정 없이 진행: %s" % (verdict, why))
+        _notify_loud("자원 게이트 측정 실패(%s)" % verdict, why)
+        return None
     if verdict == "hard-block":
         _progress("✗ 자원 hard_block — 팀 기동 0·CEO escalation: " + why)
         notified = _notify_loud("자원 hard_block(부트 중단)",
@@ -950,21 +1121,30 @@ def _cmd_run_chain(log):
     #     "다른 pane 이 이미 master 다"라는 **거짓 판정**을 주고, 그 처방(기존 master 탭으로 가라)은
     #     실제 원인(세션 배선)을 영영 못 찾게 만든다(A20: 판정·escalation 층위의 뭉개기).
     _progress("③ master 역할 등록…")
-    code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"], timeout=15)
+    code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"],
+                     timeout=_budget_leaf("CYS_CLAIM_TIMEOUT_S", 15))
     log.step("③claim-role", code, out)
     if code != 0:
         low = (out or "").lower()
-        if any(m in low for m in _CLAIM_DENIED_MARKERS):
+        # ★A20 타입드 exit 소비(W2 · H-EXIT-3): CLI 가 이제 판정 타입을 **exit 로** 낸다 —
+        #   0=성공 / 7=정당거부 / 3=미도달 / 2=식별불가. 문자열 grep 은 **구 바이너리 하위호환
+        #   폴백**으로만 남긴다(신 바이너리에서는 exit 가 1차 근거다). 종전엔 grep 이 유일 근거라
+        #   데몬 메시지 문안이 바뀌면 정당거부가 조용히 '세션 오류'로 오분류됐다(문자열 계약 드리프트).
+        if code == EXIT_CLAIM_DENIED or (code == 1 and any(m in low for m in _CLAIM_DENIED_MARKERS)):
             msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
                    "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
             # ★ok=None(CS-2⑩): 정당거부는 '이 레인의 부트가 깨졌다'가 아니다 — 공유 boot-last 의
             #   ok:true(건강한 master 의 완주 기록)를 ok:false 로 덮으면 §0 이 churn 한다.
             return log.fail("③claim-role", code, msg, EXIT_CLAIM_DENIED,
                             ok=None, state="declined")
-        msg = ("역할 등록 왕복이 **거부가 아닌** 사유로 실패했다(세션 컨텍스트 오류) — 데몬의 거부 "
-               "마커(claim_denied/privileged role held)가 출력에 없다. 흔한 원인: 이 세션이 cys "
-               "pane 밖(CYS_SURFACE_ID 부재)·데몬 미응답·cys 바이너리 부재. '다른 pane이 master' "
-               "라는 뜻이 **아니다** — 세션 배선을 확인하라.\n%s" % out)
+        # ★A20 타입드 exit 의 정확한 처방 분기(3=미도달 / 2=식별불가 / 그 밖=구 계약 산문 판정).
+        kind = {3: ("미도달 — 요청이 데몬에 닿지 못했다(소켓 부재·데몬 다운·왕복 실패). "
+                    "처방: `cys ping` 으로 데몬을 확인하라."),
+                2: ("식별 불가 — surface 해석 실패·인자 오류(요청을 만들 수조차 없었다). "
+                    "처방: 이 세션이 cys pane 안인지(CYS_SURFACE_ID) 확인하라.")}.get(
+            code, "구 계약(exit %s) — 거부 마커가 출력에 없다" % code)
+        msg = ("역할 등록 왕복이 **거부가 아닌** 사유로 실패했다(세션 컨텍스트 오류): %s "
+               "'다른 pane이 master' 라는 뜻이 **아니다** — 세션 배선을 확인하라.\n%s" % (kind, out))
         return log.fail("③claim-role-context", code, msg, EXIT_SESSION_CONTEXT,
                         ok=None, state="session_error")
     log.data["role_claimed"] = "master"   # 관측 파생 귀속(보고=실측)
@@ -1011,12 +1191,22 @@ def _cmd_run_chain(log):
             return gate_rc  # EXIT_RESOURCE_HARD(9) = 자원 hard_block(팀 기동 0·escalation)
 
         # ④ 4종 의무 노드 기동 — 결손>0에서만 호출(결손 0=스폰 경로 미진입)
-        _progress("④ 4종 의무 노드 기동 중(최대 300s)…")
-        code, out = _run(["cys", "boot"], timeout=300)
+        boot_budget = _budget_derived("cys_boot_outer_s", 300)
+        _progress("④ 4종 의무 노드 기동 중(최대 %ds — 예산 파생)…" % boot_budget)
+        code, out = _run(["cys", "boot", "--json"], timeout=boot_budget)
         log.step("④boot", code, out)
-        if code != 0:
+        # ★B1 PLAN 정책 열 소비 — exit 4(부트 실패)는 **Fatal 실패에서만** 낸다.
+        #   종전엔 `cys boot` 의 어떤 비0 도 exit 4 로 승격돼, 리뷰어 1종 고장(Degrade)이 팀 전체
+        #   기동 실패로 번지는 영구 데드엔드였다(B1). 판정은 --json 의 role 별 outcome·mandatory 를
+        #   읽어 내리고, --json 소비 불가(구 바이너리)면 종전 계약(비0=Fatal)으로 보수 폴백한다.
+        fatal_why = _boot_fatal_verdict(code, out)
+        if fatal_why is not None:
             # 티켓은 아직 미소비 — boot 실패(exit 4)면 보존돼 재시도 가능(R2-LOW-C)
-            return log.fail("④boot", code, out, EXIT_BOOT)
+            return log.fail("④boot", code, fatal_why, EXIT_BOOT)
+        if code != 0:
+            log.step("④boot-degrade", code,
+                     "비0 이지만 Fatal 역할은 전원 확보 — 경고 강등 후 ④-b·⑤ 계속(B1 정책 열)")
+            _progress("⚠ ④ 일부 선택/리뷰어 노드 미기동(Degrade) — 팀 기동 계속")
 
         # 부서 레인 CEO 티켓 소비 — ④ boot **성공 직후**(실스폰 발생)에만 1회성 소비(R2-LOW-C):
         # "1회성 티켓 ⟺ 실스폰" 불변식. 착수 전 소각은 boot 실패 시 재시도 티켓까지 태웠다.
@@ -1026,9 +1216,19 @@ def _cmd_run_chain(log):
         # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
         # CLI를 건너뛰므로 agy/codex 부재 기계(초보 전원)에서 대체 리뷰어(reviewer-claude-*)를 기동할
         # 주체가 없으면 ⑤ check가 영영 실패한다. 실패=기록만(best-effort) — 최종 게이트는 ⑤ check.
-        _progress("④-b 리뷰어 감지·폴백 기동 중(최대 320s — 대체 리뷰어 2슬롯 순차)…")
-        code, out = _run([py, orchestra, "boot-reviewers"], timeout=320)
+        rev_budget = _budget_derived("boot_reviewers_outer_s", 320)
+        _progress("④-b 리뷰어 감지·폴백 기동 중(최대 %ds — 예산 파생: 슬롯 %d × 폴백 %d회)…"
+                  % (rev_budget, _budget_leaf("REVIEWER_SLOT_COUNT", 2),
+                     _budget_leaf("REVIEWER_FALLBACK_ATTEMPTS", 2)))
+        code, out = _run([py, orchestra, "boot-reviewers"], timeout=rev_budget)
         log.step("④b-boot-reviewers", code, out)
+        # ★B1: 리뷰어는 Degrade — 비0 이어도 ⑤ 로 계속한다(최종 게이트는 ⑤ check). 단 A12 분류로
+        #   '영구 실패(2/127)'만은 처방을 정확히 남긴다(재시도 안내 금지 — 재시도해도 같은 결과).
+        if code in (2, 127):
+            log.step("④b-permanent", code,
+                     "boot-reviewers 영구 실패(exit %s — 데몬 다운 또는 스크립트/인터프리터 부재): "
+                     "재시도는 무의미하다. `cys ping`·CYS_PACK_DIR·python 해소를 점검하라." % code)
+            _progress("⚠ ④-b 영구 실패(exit %s) — 리뷰어는 Degrade 정책이라 ⑤ 로 계속(처방은 로그)" % code)
     else:
         log.step("④′resource-gate", 0,
                  "결손 0(%s) — 자원 게이트 생략(재선언 오탐 hard-block 방지)" % deficit_why)
@@ -1038,16 +1238,41 @@ def _cmd_run_chain(log):
         _progress("④ 결손 0(전 구성 생존) — 팀 기동 생략, ⑤ 생존 재확인으로 진행")
 
     # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
-    _progress("⑤ 노드 생존 결정론 확인(check · 최대 %d회×%.0fs 재시도)…" % (CHECK_RETRIES, CHECK_INTERVAL_S))
+    _progress("⑤ 노드 생존 결정론 확인(check · 최대 %d회×%.0fs 재시도 = %ds 창)…"
+              % (CHECK_RETRIES, CHECK_INTERVAL_S, _budget_derived("check_window_s", 120)))
+    check_timeout = _budget_leaf("CHECK_SUBPROC_TIMEOUT_S", 60)
+    hb_every = max(1, int(_budget_leaf("HEARTBEAT_INTERVAL_S", 20) // max(1, CHECK_INTERVAL_S)))
     code, out = 1, "orchestra 부재"
+    daemon_gone = False
     for attempt in range(1, CHECK_RETRIES + 1):
-        code, out = _run([py, orchestra, "check"], timeout=60)
+        code, out = _run([py, orchestra, "check"], timeout=check_timeout)
         log.step("⑤check#%d" % attempt, code, out)
         if code == 0:
             break
+        # ★G32/H-EXIT-7 — check exit 2 는 '노드 미기동'이 **아니다**: 데몬 소실·cys 부재·status 파손
+        #   (판정 불가)이다. 두 갈래를 뭉개면 처방이 뒤집힌다(2는 `cys ping`·데몬 기동, 1은 `cys boot`).
+        #   판정 불가에서는 재시도가 의미 없으므로 즉시 이탈해 정확한 처방으로 실패한다(A12 영구 분류).
+        if code == 2:
+            daemon_gone = True
+            break
+        if code == 127:
+            daemon_gone = True    # orchestra 스크립트/인터프리터 부재 — 영구, 처방이 다르다
+            break
         if attempt < CHECK_RETRIES:
+            if attempt % hb_every == 0:
+                # 침묵 창 상쇄(B9 방향 ③) — 진행 하트비트는 stderr(verdict 채널 무오염)
+                sys.stderr.write("[bootstrap] ⑤check 재시도 %d/%d 진행 중(노드 기동은 비동기)\n"
+                                 % (attempt, CHECK_RETRIES))
+                sys.stderr.flush()
             time.sleep(CHECK_INTERVAL_S)
     if code != 0:
+        if daemon_gone:
+            return log.fail("⑤check-unjudgeable", code,
+                            "check 가 **판정 불가**를 반환했다(exit %s) — '노드 미기동'이 아니다. "
+                            "exit 2=cysd 데몬 소실·cys 미설치·status 파손 / exit 127=orchestra "
+                            "스크립트·인터프리터 부재. 처방: `cys ping` 으로 데몬을, CYS_PACK_DIR·"
+                            "python 해소로 팩 배선을 확인하라(`cys boot` 는 이 상황의 처방이 아니다).\n%s"
+                            % (code, out), EXIT_CHECK)
         return log.fail("⑤check", code,
                         "%d회 재시도 후에도 의무 노드 미기동:\n%s" % (CHECK_RETRIES, out), EXIT_CHECK)
 
@@ -1219,7 +1444,54 @@ def cmd_self_test():
                            {"metric": "servers", "level": "hard", "value": 5}],
                  "measured": {"nodes_hard_effective": 18}}
         assert _resource_gate_decision(2, mixed, 5)[0] == "hard-block", "복합 hard가 과계수로 오무효화"
-        assert _resource_gate_decision(3, None, None)[0] == "allow", "미지 exit=보수적 allow"
+        # ★A13(W2): 미지 exit 의 fail-open 제거 — 'allow' 로 접히지 않고 타입으로 분리된다.
+        assert _resource_gate_decision(3, None, None)[0] == "unknown-exit", \
+            "미지 exit 이 여전히 allow 로 접힘(fail-open 잔존 — 판정불가↔allow 융합)"
+        assert _resource_gate_decision(64, None, None)[0] == "usage-error", \
+            "EX_USAGE(64)가 사용오류로 분리되지 않음(argparse 충돌·조용한 allow 재발)"
+        assert "조용한 allow 아님" in _resource_gate_decision(64, None, None)[1], \
+            "EX_USAGE 사유에 loud 계약 문구 누락"
+        # 정상 판정 3종은 종전 계약 그대로(무회귀)
+        assert _resource_gate_decision(0, None, None)[0] == "allow", "exit 0=allow 회귀"
+        assert _resource_gate_decision(1, None, None)[0] == "soft", "exit 1=soft 회귀"
+        # ★_run_split 채널 분리(A13 잠복 경로): stderr 오염이 stdout 계약을 파괴하지 않는다.
+        _rc, _so, _se = _run_split([sys.executable, "-c",
+                                    "import sys;sys.stderr.write('diag\\n');print('{\"verdict\":\"allow\"}')"])
+        assert _rc == 0 and _se.strip() == "diag", "_run_split 이 stderr 를 분리하지 못함"
+        assert json.loads(_so.strip())["verdict"] == "allow", \
+            "stderr 오염이 stdout JSON 계약을 파괴(A13 잠복 경로 잔존)"
+        # ★B1 PLAN 정책 소비: --json 계약에서 Fatal 실패만 exit 4 로 승격된다.
+        _degraded = json.dumps({"roles": [
+            {"role": "cso", "agent": "claude", "outcome": "launched", "mandatory": True},
+            {"role": "worker", "agent": "claude", "outcome": "already_alive", "mandatory": True},
+            {"role": "reviewer-grok", "agent": "grok", "outcome": "missing", "mandatory": False}]})
+        assert _boot_fatal_verdict(1, "진행 산문\n" + _degraded) is None, \
+            "Degrade 역할(선택 리뷰어) 실패가 Fatal 로 승격됨(B1 데드엔드 재발)"
+        _fatal = json.dumps({"roles": [
+            {"role": "cso", "agent": "claude", "outcome": "failed", "mandatory": True,
+             "install_hint": "claude 설치"}]})
+        assert _boot_fatal_verdict(1, _fatal) is not None, "Fatal 역할 실패가 exit 4 로 승격되지 않음"
+        assert "claude 설치" in _boot_fatal_verdict(1, _fatal), "Fatal 사유에 install_hint 미동봉"
+        _busy = json.dumps({"roles": [
+            {"role": "cso", "agent": "claude", "outcome": "busy", "mandatory": True}]})
+        assert _boot_fatal_verdict(0, _busy) is None, "busy 가 Fatal 실패로 오분류(G11)"
+        # --json 미소비(구 바이너리) → 종전 계약으로 보수 폴백(비0=Fatal · fail-open 금지)
+        assert _boot_fatal_verdict(1, "구 바이너리 산문 출력") is not None, \
+            "--json 소비 불가에서 비0 이 Degrade 로 접힘(진짜 실패 은닉)"
+        assert _boot_fatal_verdict(0, "구 바이너리 산문 출력") is None, "exit 0 이 Fatal 로 오판"
+        # ★결손 판정 ↔ check verdict 공유(H-PRED-1): 같은 status fixture 에서 판정이 갈리지 않는다.
+        _healthy = {"surfaces": [
+            {"role": "cso", "exited": False, "awakened_at": 1.0},
+            {"role": "worker-2", "exited": False, "status": {"age_secs": 3, "state": "working"}},
+            {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
+            {"role": "reviewer-codex", "exited": False, "agent_alive": True}]}
+        _has, _why = _shared_verdict_deficit(_healthy)
+        assert _has is False, "건강한 팀(생존추정 포함)을 결손>0 으로 오판: %s" % _why
+        _grok_only = {"surfaces": [
+            {"role": "reviewer-grok", "exited": False, "agent_alive": True},
+            {"role": "cso-1", "exited": False, "agent_alive": True}]}
+        _has2, _why2 = _shared_verdict_deficit(_grok_only)
+        assert _has2 is True, "grok·cso-1 좌석이 의무 슬롯을 채운 것으로 계상(G26 재발): %s" % _why2
 
         # ── t6: 결손 구성 판정(R1-MED-1 순수 로직 — 총수 비교 폐기) ──
         full = {"cso": 1, "worker": 1, "reviewer": 2}
@@ -1314,7 +1586,8 @@ def cmd_self_test():
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
     print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
-          "로스터 결손 신구 차분 9종 — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
+          "로스터 결손 신구 차분 9종 + W2(A13 타입드 게이트 exit·_run_split 채널분리·B1 PLAN 정책 "
+          "소비 6종·공유 판정 결손 2종) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
           "자원 게이트 결정·구성 결손·grok 좌석·cso-1 좌석·정상 5노드·결손 1·worker-N·대체 로스터)")
     return 0
 
@@ -1327,10 +1600,60 @@ exit: 0=완료/단독각성 · 3=ping · 4=boot · 5=assert-ready 게이트 · 6
 """
 
 
+def detach_session(argv=None, emit=None):
+    """★A18 조건부 내재화(T-0147-7 W2 · W1b 실측 확정) — 세션 분리를 **python 안에서** 수행한다.
+
+    ## 왜(실측 근거)
+    W1b 의 `probe_pgid.py` 실측이 확정한 사실: 훅 발화의 **nohup 분기는 pgid 를 분리하지 않아**
+    하네스의 group-kill(음수 pid kill)에 부트가 **함께 죽는다**(대조군은 생존 = 계측 타당성 확인).
+    원 감사의 'cysd 그룹정리 동사' 메커니즘은 반박됐지만, 이 잔존 위협은 실측으로 성립했다 →
+    A18 은 P3→P2 로 복귀했고 처방이 '조건부 내재화'로 확정됐다.
+
+    ## 3중 가드(이 함수의 존재 이유 전부)
+    ① **명시 opt-in**: `--detach-session` 인자가 있을 때만 동작한다. 이 인자는 **훅 발화부만**
+       넘긴다 — MASTER_DIRECTIVE §0 폴백의 **포그라운드 직접 실행 경로는 미적용**이다.
+       (그 경로에 setsid 를 걸면 호출자가 Ctrl-C 로 포기한 뒤에도 스폰이 계속되는 **고아 신설**이
+        된다 = MEMORY 'nohup 고아화' 와 같은 부류의 반대 방향 결함. job control 을 보존한다.)
+    ② **세션 리더 검사 후 no-op**: 훅의 1순위 분기는 이미 `setsid "$CYS_PY" "$BOOT"` 로 감싼다 —
+       그 경우 이 프로세스가 이미 세션 리더라 `os.setsid()` 는 **EPERM(PermissionError)** 을 던지고,
+       가드가 없으면 훅 경로 전체가 크래시한다(비평2 B-6 이 선제 내재화 처방을 철회시킨 이유).
+       `os.getsid(0) == os.getpid()` 면 조용히 no-op 한다(이미 목적 달성 상태).
+    ③ **플랫폼·실패 내성**: `os.setsid` 부재(Windows)·기타 OSError 는 no-op 로 강등한다.
+       세션 분리는 **강건성 보강**이지 부트의 전제조건이 아니다 — 실패가 부트를 죽이면 안 된다.
+
+    반환: (분리됨 bool, 사유) — 사유는 stderr 진단에만 쓴다(stdout 계약 무오염).
+    """
+    argv = sys.argv if argv is None else argv
+    log = emit if emit is not None else (lambda m: sys.stderr.write("[bootstrap] %s\n" % m))
+    if "--detach-session" not in argv:
+        return False, "미요청(포그라운드·직접 실행 경로는 미적용 — job control 보존)"
+    if not hasattr(os, "setsid") or not hasattr(os, "getsid"):
+        log("세션 분리 생략: os.setsid 미지원 플랫폼")
+        return False, "플랫폼 미지원"
+    try:
+        if os.getsid(0) == os.getpid():
+            # 이미 세션 리더 = 훅의 setsid(1) 분기가 이미 분리했다. 여기서 os.setsid()를 부르면
+            # EPERM 으로 훅 경로가 크래시한다 — no-op 이 정답이다.
+            return False, "이미 세션 리더(setsid 래핑 분기) — no-op"
+        os.setsid()
+        return True, "세션 분리 완료(group-kill 내성 확보 — nohup·bare & 분기)"
+    except (OSError, AttributeError) as e:
+        log("세션 분리 실패(무시·부트 계속): %s: %s" % (type(e).__name__, e))
+        return False, "실패(%s)" % type(e).__name__
+
+
 def main(argv):
     # preflight/CI 호환: `--self-test`는 subcommand 없이도 동작(가로채기).
     if "--self-test" in argv:
         return cmd_self_test()
+    # ★A18: 발화부에서 넘긴 명시 요청이 있을 때만 세션을 분리한다(위 3중 가드 참조).
+    #   subcommand 판정 **전에** 수행한다 — 분리는 프로세스 정체성의 문제이고, 어떤 서브커맨드든
+    #   하네스 group-kill 에 함께 죽는 것은 같은 결함이다.
+    if "--detach-session" in argv:
+        detached, why = detach_session(argv)
+        sys.stderr.write("[bootstrap] --detach-session: %s (%s)\n"
+                         % ("분리" if detached else "무동작", why))
+        argv = [a for a in argv if a != "--detach-session"]
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd == "issue-ticket":
         return cmd_issue_ticket(argv[2:])
