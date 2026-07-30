@@ -31,7 +31,8 @@
    (⓪의 --fix가 이미 기동했을 수 있다 — ping으로 확정만 한다).
 ② **역할 등록**: `cys claim-role master` (launch-agent로 기동됐다면 이미 등록 — `cys list`의
    role 열로 확인하고 중복 등록하지 않는다).
-③ **복원 점검**: `~/.cys/pack/round/SESSION_STATE.md` 를 읽는다. 미완 작업·미해결 게이트가
+③ **복원 점검**: `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/SESSION_STATE.md` 를 읽는다(자기 레인의
+   팩 — 부서 레인이 base 팩 상태를 읽는 교차 오염 금지). 미완 작업·미해결 게이트가
    있으면 RECOVERY.md 프로토콜로 **복원 모드**에 진입한다(완료된 단계 반복 금지).
 ④ **노드 자동 기동 (생략 금지·앵커4-1 의무)**: `cys boot` 를 실행한다 — 설치된 CLI를 자동
    감지해 **CSO·워커(claude)·리뷰어 agy(Antigravity CLI)·리뷰어 codex 4종을 의무 기동**하고(grok은 설치 시

@@ -5,10 +5,13 @@
 LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘뿐이다 — 산문 단계 수행 금지.
 
 단계 체인 (실패 시 즉시 중단·단계명+원인을 stderr와 boot-last.json에 기록):
-  ① preflight --fix READY        ② cys ping                ③ cys claim-role master
+  ① preflight --fix (**비치명** — FAIL은 경고로 강등하고 계속. 팀 부팅의 진짜 게이트는 ⑤)
+  ② cys ping                     ③ cys claim-role master
   ④ cys boot (결손>0에서만 — 결손 0=구성 충족이면 호출 생략·스폰 없음)
-  ⑤ orchestra check (bounded retry 3s×10 — 노드 스폰은
-  비동기·check는 무대기 스냅샷이므로 레이스 봉쇄)          ⑥ 완료 마커 write
+  ⑤ orchestra check (bounded retry **24회×5s ≈ 120s 상한** — 노드 스폰은 비동기·check는 무대기
+  스냅샷이므로 레이스 봉쇄. 값의 진실원천은 CHECK_RETRIES·CHECK_INTERVAL_S 상수이고 env
+  CYS_BOOT_CHECK_RETRIES·CYS_BOOT_CHECK_INTERVAL_S로만 덮인다 — 테스트 하네스 전용)
+                                                          ⑥ 완료 마커 write
   ⑦ cys-dept promote-if-pending --request-only (비대기 — 부트와 승격 동의의 분리)
   ⑧ 기계 요약 JSON 출력 (master는 이것을 인용해 보고한다)
 
@@ -17,20 +20,32 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
   - ★소켓 격리: CYS_SOCKET이 base가 아니면(부서 pane 부트) write하지 않는다 — 부서장 부트가
     base 마커를 오염시키면 CEO 승격 게이트(cys-dept)가 오개방된다.
 
-exit: 0=부트 완료(또는 부서장 단독 각성 — CEO 티켓 부재) / 2=preflight / 3=ping
-      7=claim 거부(이 surface는 master 아님 — 지휘 중단·인계) / 4=boot / 6=check 최종 실패
-      5=assert-ready 게이트 실패(하위 게이트 전용)
-      8=레인↔팩 정합 실패(부서 소켓↔부서 팩 교차 오염 차단 — 팀 기동 전 중단)
+exit(`run` 체인 — 코드 상수와 대조 유지): 0=부트 완료(또는 부서장 단독 각성=CEO 티켓 부재,
+      또는 단일 실행 락 skip — 이미 다른 pane이 부트 중) / 3=ping / 4=boot
+      6=check 최종 실패(CHECK_RETRIES 소진) / 7=claim 거부(이 surface는 master 아님 — 지휘 중단·인계)
+      8=레인↔팩 정합 실패 또는 불량 레인(빈 부서명) — 교차 오염 차단·팀 기동 전 중단
       9=자원 hard_block(결손 기준 자원 사전 게이트 — 팀 기동 전 착수 거부·CEO escalation)
+  다른 서브커맨드: 5=assert-ready 게이트 실패(하위 게이트 전용) / 2=`issue-ticket` 사용오류
+      (--dept 형식 위반 또는 base 레인 아님).
+  ★2는 preflight가 아니다 — ①preflight는 비치명(FAIL이어도 경고 강등·계속)이라 전용 exit가
+    없다. 구 헤더의 '2=preflight'는 낡은 계약이었다(G31).
 안전밸브: CYS_BOOT_GATE=warn(assert-ready 실패를 경고로 강등)|off(게이트 무력).
 
 부서 교리 게이트 (증분2 — D1 옵션 1'):
   ⓐ CEO 티켓 권한 게이트(P7): 부서 레인(CYS_SOCKET=부서 소켓)의 팀 기동은 CEO 발급 티켓 필수.
      티켓 부재/만료 → 실패가 아니라 '부서장 단독 각성'으로 강등(팀 기동만 생략·역할 등록/프리플라이트는
      정상·exit 0). 발급은 base 레인에서 `issue-ticket --dept <name>` 로만.
-  ⓑ 결손 기준 자원 게이트: 팀 기동 직전 결손을 cys list 라이브 노드의 **구성 판정**으로 산출 —
-     cso≥1 ∧ worker≥1 ∧ reviewer계열≥2 전부 충족 시에만 결손 0(구 총수 4 비교는 reviewer 4개+
-     cso/worker 사망을 결손 0으로 오판 — 폐기). 결손 0(재선언)이면 게이트와 ④ cys boot 호출 자체를
+  ⓑ 결손 기준 자원 게이트: 팀 기동 직전 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 —
+     의무 역할 목록은 `javis_orchestra.effective_required_roles()`(=⑤check가 검증하는 그 목록,
+     감지 폴백 적용)을 그대로 소비하고 좌석 이름은 정확일치(worker만 worker-N 접두 수용 — check와
+     동일 규약)로 대조한다. **역할 이름공간을 ⑤check와 하나로 묶는 것이 이 판정의 전부다**(W0 P0
+     지혈 · 재감사 G26 + A1 '결손 0 오판' 절반): 구 가족 접두 계수는 reviewer-grok(선택)·
+     reviewer-claude-*(대체)·cso-N(변형) 좌석을 의무 슬롯 충족으로 계상해 결손 0 → ④ 생략 →
+     ⑤check 실패 → exit 6 → 재선언 동일의 라이브락을 먹였다. orchestra 소비 불가(부서 팩 결손·
+     팩 스큐)면 구 가족 접두 계수로 graceful 폴백(사유를 판정 사유에 병기). ★생존 **술어**는
+     여전히 cys list의 role= + !exited이며 check 술어(agent_alive/ack)보다 관대하다 — 술어 격상은
+     W2 소속(여기서 격상하면 건강한 quiet 노드를 결손>0으로 오판하는 역방향 회귀).
+     결손 0(재선언)이면 게이트와 ④ cys boot 호출 자체를
      생략(스폰 없음·오탐 hard-block 방지 — "결손 0=스폰 없음"의 결정론화). 결손>0이면 자원 사전
      게이트 발동(hard=exit 9, 단 nodes 과계수 결함은 cys list 라이브 교차확인으로 무효화·1회 경고 후
      진행 / soft=매번 경고 후 진행 — 결손 0이면 게이트 자체를 생략하므로 soft 경고는 실팀기동
@@ -46,6 +61,17 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**
+#   (2026-07-29 Windows 0.14.4 실측: `ModuleNotFoundError: No module named 'javis_scrub'`).
+#   unix/mac 은 스크립트 폴더가 이미 sys.path[0] 이라 이 블록은 무동작(멱등).
+#   ★append 인 이유: **발견이 목적이지 기존 항목의 precedence 를 강등하지 않는다**(bin/ 을 stdlib
+#   앞에 놓지 않아 미래의 이름충돌 shadowing 을 원천 차단). 선례: javis_orchestra.py:72-74.
+#   계약(tests/test_import_guard.py): 가드를 건 뒤 형제 import 전까지 sys.path 를 건드리지 않는다.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
 
 # ★R3(D-IMPL-3): Windows 파이프 환경(cp949/cp1252)에서 한글 출력 UnicodeEncodeError 크래시 방어 —
 # PYTHONUTF8 export는 cys-dept 경로에만 있어 이 스크립트의 직접 실행을 보호하지 못한다.
@@ -356,12 +382,17 @@ def _consume_dept_ticket(path):
 # ── 증분2 ⓑ: 결손 기준 자원 사전 게이트 ──
 # 의무 구성(cso 1·worker 1·리뷰어계열 2 — grok 선택 제외). ★총수 비교가 아니라 역할별 구성 판정:
 # 총수 4 비교는 reviewer 4개 생존+cso/worker 사망을 결손 0으로 오판했다(R1-MED-1).
+# ★★이 가족 접두 계수는 이제 **폴백 전용**이다 — 1차 경로는 아래 `_team_roster_deficit`
+# (javis_orchestra.effective_required_roles 소비). 근거·경계는 그 함수 주석 참조(T-0147-7 W0 지혈).
 _REQUIRED_COMPOSITION = (("cso", 1), ("worker", 1), ("reviewer", 2))
 
 
 def _team_composition_deficit(counts):
-    """순수 판정: 역할별 라이브 카운트 dict → (결손 bool, 사유). cso≥1 ∧ worker≥1 ∧
-    reviewer계열≥2 **전부 충족** 시에만 결손 0(R1-MED-1 — 구 총수 4 비교 폐기)."""
+    """순수 판정(**폴백 전용** — orchestra 소비 불가 시): 역할별 가족 카운트 dict → (결손 bool, 사유).
+    cso≥1 ∧ worker≥1 ∧ reviewer계열≥2 **전부 충족** 시에만 결손 0(R1-MED-1 — 구 총수 4 비교 폐기).
+    ★이 판정의 알려진 한계가 G26이다: 'reviewer계열 2'는 이름공간을 뭉개서 reviewer-grok(선택)·
+    reviewer-claude-*(대체) 좌석이 의무 슬롯을 대신 채운 것으로 계상하고, cso-N 변형이 정확일치
+    'cso'를 요구하는 ⑤check를 만족시킨 것으로 계상한다. 그래서 1차 경로에서 밀어냈다."""
     missing = ["%s %d<%d" % (role, counts.get(role, 0), need)
                for role, need in _REQUIRED_COMPOSITION if counts.get(role, 0) < need]
     if missing:
@@ -370,25 +401,87 @@ def _team_composition_deficit(counts):
         counts.get("cso", 0), counts.get("worker", 0), counts.get("reviewer", 0))
 
 
+def _required_roles_from_orchestra():
+    """⑤check가 실제로 요구하는 **유효 의무 역할 목록**을 orchestra 단일 소스에서 가져온다.
+    = `javis_orchestra.effective_required_roles()` (cso·worker + 감지 폴백 적용 리뷰어 로스터).
+    ★형제 모듈 직접 import — cross-import 선례는 javis_orchestra.py:214(`import javis_boot_node`).
+      서브프로세스를 쓰지 않는 이유는 종전과 같다: ④-b(boot-reviewers)→⑤(check) orchestra 호출
+      순서·검증 계약에 deficit용 별도 호출이 끼면 안 된다.
+    ★graceful 폴백: 부서 팩 결손·팩 스큐로 import/호출이 실패하면 (None, 사유)를 돌려 호출부가
+      구 가족 접두 계수로 되돌아간다 — 지혈이 새 crash 지점이 되면 안 된다.
+    반환: (roles list, None) | (None, 실패사유)."""
+    try:
+        import javis_orchestra as _orch
+        roles = list(_orch.effective_required_roles())
+    except Exception as e:
+        return None, "orchestra 소비 불가(%s: %s)" % (type(e).__name__, e)
+    if not roles or not all(isinstance(r, str) and r for r in roles):
+        return None, "orchestra effective_required_roles 반환 이상(%r)" % (roles,)
+    return roles, None
+
+
+def _role_satisfied(role, live):
+    """순수 판정: required role 하나가 라이브 role 집합으로 충족되는가.
+    ★수용 규약은 `javis_orchestra.cmd_check`와 **동일**하게 유지한다(orchestra.py:239-241):
+      worker만 접두 수용(worker/worker-N — 데몬이 둘째 워커부터 worker-N으로 dedup), 그 밖은
+      정확일치. cso-N을 'cso'로 받거나 reviewer-*를 뭉개는 관용은 check에 없으므로 여기에도 없다."""
+    if role in live:
+        return True
+    if role == "worker":
+        return any(r == "worker" or r.startswith("worker-") for r in live)
+    return False
+
+
+def _team_roster_deficit(required, live):
+    """순수 판정: (⑤check의 유효 의무 역할 목록, 라이브 role 집합) → (결손 bool, 사유).
+
+    ★W0 P0 지혈(T-0147-7 재감사 G26 + A1 '결손 0 오판' 절반). 고치는 것은 **역할 이름공간 정합**
+    하나다: 결손 판정이 세는 좌석 집합을 ⑤check가 요구하는 좌석 집합과 같게 만든다. 종전 가족
+    접두 계수는 reviewer-grok(선택 좌석)·reviewer-claude-*(대체 좌석)·cso-N(변형 좌석)을 의무
+    슬롯 충족으로 계상해 **결손 0 → ④ boot 생략 → ⑤check 실패 → exit 6 → 재선언 동일**의
+    라이브락을 먹였다.
+    ★고치지 않는 것(경계 명시 — 이걸 여기서 건드리면 반대 방향 회귀다): 생존 **술어**는 여전히
+      cys list의 `role=` + `!exited`다. 이것은 check의 술어(agent_alive ∨ 신선 set-status ∨
+      quiet_but_alive)보다 **관대**하므로, 판정 방향은 '결손>0 ⟹ check도 부재'로만 흐른다
+      (좌석이 아예 없을 때만 결손). 건강한 quiet 노드를 결손>0으로 오판해 재선언 오탐
+      hard-block을 되살리는 역방향 회귀가 구조적으로 불가능하다. 술어 격상(agent 죽은 좌석의
+      결손 인식)은 W2 소속 — 데몬 SOT·reclaim 체인과 원자로 착지해야 한다."""
+    missing = [r for r in required if not _role_satisfied(r, live)]
+    if missing:
+        return True, "로스터 결손(의무 %s / 부재 %s / 라이브 %s) — 결손 존재" % (
+            ", ".join(required), ", ".join(missing), ", ".join(sorted(live)) or "없음")
+    return False, "로스터 충족(의무 %s 전원 좌석 생존) — 결손 0(재선언)" % ", ".join(required)
+
+
 def _team_has_deficit():
-    """팀 결손 여부를 cys list 라이브 노드의 **구성 판정**으로 산출(orchestra check의 판정 로직과
-    동일 신호 — role surface 생존). ★orchestra check 서브프로세스를 쓰지 않는다: ④-b(boot-reviewers)
-    →⑤(check) orchestra 호출 순서·검증 계약을 오염시키지 않기 위함(deficit용 별도 check가 그 순서에
-    끼면 안 됨). 반환: (결손 bool, 사유). cys list 실패 → 보수적으로 결손 가정(게이트 진행)."""
-    counts = _live_role_counts()
-    if counts is None:
+    """팀 결손 여부 산출 → (결손 bool, 사유). cys list 실패 → 보수적으로 결손 가정(게이트 진행).
+
+    ★판정의 정직한 서술(구 docstring의 'orchestra check와 동일 신호' 주장은 객관적 거짓이었다 —
+      A1 재검증 부가 발견): **역할 이름공간**은 orchestra(effective_required_roles)와 동일 소스를
+      쓰지만, **생존 신호**는 여전히 cys list 텍스트(`role=` + `!exited`)이고 check의 신호
+      (agent_alive ∨ 신선 set-status ∨ quiet_but_alive)와 다르다 — cys list 포맷에는
+      agent_alive/seat 필드가 아예 없다(cys.rs:1499-1511). 즉 여기서 결손 0은 'check도 통과한다'는
+      뜻이 아니다. 술어 단일화는 W2(데몬 SOT 격상·reclaim 체인과 원자).
+    ★orchestra check 서브프로세스는 쓰지 않는다: ④-b(boot-reviewers)→⑤(check) orchestra 호출
+      순서·검증 계약을 오염시키지 않기 위함(deficit용 별도 check가 그 순서에 끼면 안 됨)."""
+    roles = _live_role_names()
+    if roles is None:
         return True, "cys list 실패 — 결손 가정(게이트 진행·보수)"
-    return _team_composition_deficit(counts)
+    required, why_no_orch = _required_roles_from_orchestra()
+    if required is not None:
+        return _team_roster_deficit(required, set(roles))
+    # graceful 폴백 — 구 가족 접두 계수(G26 한계 포함). 조용히 접히지 않게 사유를 사유 문자열에 남긴다.
+    has, why = _team_composition_deficit(_family_counts(roles))
+    return has, "%s [폴백: %s — 구 가족 접두 계수 사용]" % (why, why_no_orch)
 
 
-def _live_role_counts():
-    """cys list 로 라이브(미exited) 노드의 역할별 카운트 산출 → {'cso','worker','reviewer'} dict.
-    변형 역할(cso-1·worker-2·reviewer-*)은 접두로 귀속(디렉티브 주입 dir_file 접두 규약과 정합).
+def _live_role_names():
+    """cys list 로 라이브(미exited) 노드의 role 문자열 목록 산출(빈 role 제외).
     파싱 불가/데몬 부재 → None(호출부 보수 판정)."""
     code, out = _run(["cys", "list"], timeout=15)
     if code != 0:
         return None
-    counts = {"cso": 0, "worker": 0, "reviewer": 0}
+    roles = []
     for line in out.splitlines():
         f = line.rstrip("\n").split("\t")
         if len(f) < 4:
@@ -396,6 +489,17 @@ def _live_role_counts():
         role = f[1][5:] if f[1].startswith("role=") else ""
         if f[3].strip().endswith("true"):  # exited surface 무시
             continue
+        if role:
+            roles.append(role)
+    return roles
+
+
+def _family_counts(roles):
+    """순수 함수(**폴백 전용**): 라이브 role 목록 → 가족 접두 카운트 dict.
+    변형 역할(cso-1·worker-2·reviewer-*)을 접두로 귀속한다 — 이 관용이 G26의 원인이라
+    1차 경로에서는 쓰지 않는다."""
+    counts = {"cso": 0, "worker": 0, "reviewer": 0}
+    for role in roles:
         if role == "cso" or role.startswith("cso-"):
             counts["cso"] += 1
         elif role == "worker" or role.startswith("worker-"):
@@ -403,6 +507,13 @@ def _live_role_counts():
         elif role.startswith("reviewer"):
             counts["reviewer"] += 1
     return counts
+
+
+def _live_role_counts():
+    """구 판정 호환 래퍼(폴백·self-test 경로) — cys list 라이브 노드의 가족 접두 카운트.
+    파싱 불가/데몬 부재 → None."""
+    roles = _live_role_names()
+    return None if roles is None else _family_counts(roles)
 
 
 def _live_node_count():
@@ -633,8 +744,10 @@ def cmd_run():
         log.step("③″ceo-ticket", 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
-    # 결손을 cys list 라이브 노드의 구성 판정(cso≥1∧worker≥1∧reviewer≥2)으로 산출(R1-MED-1):
-    # 결손 0(재선언·전 구성 생존) → 게이트와 ④ cys boot 호출 자체를 생략("결손 0=스폰 없음" 결정론화).
+    # 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 — 의무 역할 목록은 ⑤check와 동일 소스
+    # (javis_orchestra.effective_required_roles)를 소비한다(W0 P0 지혈 · G26/A1). R1-MED-1의 '총수
+    # 비교 폐기'는 그대로 유지되고, 그 위에서 역할 이름공간까지 check와 일치시킨 것이다.
+    # 결손 0(재선언·의무 좌석 전원 생존) → 게이트와 ④ cys boot 호출 자체를 생략("결손 0=스폰 없음").
     orchestra = os.path.join(PACK, "bin", "javis_orchestra.py")
     has_deficit, deficit_why = _team_has_deficit()
     if has_deficit:
@@ -741,7 +854,10 @@ def cmd_assert_ready():
 
 def cmd_self_test():
     """레인 격리 3종 순수 판정 자체검증(orchestra 관례 — assert 배터리 → OK/FAIL).
-    결정론·밀폐: env·데몬·파일 무접촉(순수 함수만 호출)."""
+    결정론·밀폐: env·데몬·파일 무접촉(순수 함수만 호출).
+    ★단 하나의 예외(t7 ⓗ): 형제 모듈 `javis_orchestra` import 1회 + `_required_roles_from_orchestra()`
+      1회 — 배선이 끊기면 결손 판정이 구 가족 접두 계수로 **조용히** 강등되므로 그 배선만은 실측한다.
+      로스터 자체는 detect/agents 주입으로 고정해 PATH·agents.json 내용에 의존하지 않는다."""
     try:
         # ── t1: base/dept 판정 매트릭스(unix base·unix dept·win pipe) ──
         assert _socket_is_base("") is True, "unset=base"
@@ -862,11 +978,89 @@ def cmd_self_test():
         assert _team_composition_deficit({"cso": 1, "worker": 1, "reviewer": 1})[0] is True, \
             "reviewer 1(<2)이 결손 0으로 오판"
         assert _team_composition_deficit({})[0] is True, "빈 카운트가 결손 0으로 오판"
+
+        # ── t7: 로스터 결손 판정(W0 P0 지혈 — G26 + A1 '결손 0 오판' 절반) ──
+        # ★신구 계수 판정을 같은 검체로 **차분**한다: 구 판정(_family_counts+_team_composition_deficit)
+        #   =가족 접두 계수, 신 판정(_team_roster_deficit)=⑤check와 동일한 역할 이름공간.
+        #   차분이 갈리는 검체가 바로 G26이 먹였던 라이브락 입력이다.
+        def _old(roles):
+            return _team_composition_deficit(_family_counts(roles))[0]
+
+        def _new(roles, required=("cso", "worker", "reviewer-gemini", "reviewer-codex")):
+            return _team_roster_deficit(list(required), set(roles))[0]
+
+        # ⓐ reviewer-grok 좌석이 의무 리뷰어 슬롯을 대신 채운 검체 — 구=결손 0(오판), 신=결손 존재
+        grok_seat = ["cso", "worker", "reviewer-gemini", "reviewer-grok"]
+        assert _old(grok_seat) is False, "검체 전제 붕괴: 구 판정이 grok 좌석을 이미 결손으로 봄"
+        assert _new(grok_seat) is True, \
+            "reviewer-grok(선택 좌석)이 의무 reviewer-codex 슬롯을 채운 것으로 계상(G26 미수리)"
+        assert "reviewer-codex" in _team_roster_deficit(
+            ["cso", "worker", "reviewer-gemini", "reviewer-codex"], set(grok_seat))[1], \
+            "결손 사유에 부재 역할(reviewer-codex) 미명시"
+        # ⓑ cso-1 변형 좌석 — 구=결손 0(오판: 접두 귀속), 신=결손 존재(check는 정확일치 'cso' 요구)
+        cso_variant = ["cso-1", "worker", "reviewer-gemini", "reviewer-codex"]
+        assert _old(cso_variant) is False, "검체 전제 붕괴: 구 판정이 cso-1을 이미 결손으로 봄"
+        assert _new(cso_variant) is True, \
+            "cso-1 변형 좌석이 정확일치 'cso' 의무를 충족한 것으로 계상(G26 미수리)"
+        # ⓒ 정상 5노드(의무 4 + 선택 grok) — 구·신 **모두** 결손 0(역방향 회귀 금지 핀)
+        healthy5 = ["cso", "worker", "reviewer-gemini", "reviewer-codex", "reviewer-grok"]
+        assert _old(healthy5) is False and _new(healthy5) is False, \
+            "정상 5노드가 결손>0으로 오판(재선언 오탐 hard-block 부활 — 역방향 회귀)"
+        # ⓓ 결손 1(reviewer-codex 부재) — 구·신 모두 결손 존재(합치 검체)
+        one_missing = ["cso", "worker", "reviewer-gemini"]
+        assert _old(one_missing) is True and _new(one_missing) is True, \
+            "결손 1 검체에서 신구 판정 불일치"
+        # ⓔ worker-N 접두 수용 — cmd_check(orchestra.py:239-241)와 동일 규약 유지(역방향 회귀 금지)
+        worker_n = ["cso", "worker-2", "reviewer-gemini", "reviewer-codex"]
+        assert _new(worker_n) is False, "worker-2가 'worker' 의무를 못 채움(check 규약 이탈·역방향 회귀)"
+        # ⓕ 대체 로스터(agy/codex 미감지 → reviewer-claude-1/2)도 좌석이 맞으면 결손 0
+        subst = ("cso", "worker", "reviewer-claude-1", "reviewer-claude-2")
+        assert _new(["cso", "worker", "reviewer-claude-1", "reviewer-claude-2"], subst) is False, \
+            "대체 리뷰어 좌석이 대체 로스터 의무를 못 채움"
+        assert _new(["cso", "worker", "reviewer-gemini", "reviewer-codex"], subst) is True, \
+            "대체 로스터 요구를 네이티브 좌석이 대신 채운 것으로 계상(이름공간 뭉갬 잔재)"
+        # ⓖ 빈 라이브·부분 좌석 — fail-safe 방향(결손 존재)
+        assert _new([]) is True, "라이브 0이 결손 0으로 오판"
+        assert _new(["cso"]) is True, "cso 단독이 결손 0으로 오판"
+        # ⓗ orchestra 소비 배선 — 형제 import가 실제로 해소되는가(해소 실패=구 판정으로 조용히 강등).
+        #    ★밀폐: 로스터는 detect/agents **주입**으로 고정한다(PATH·agents.json 무접촉).
+        #      전수 런타임 import 증명은 tests/test_import_guard.py ③이 담당한다.
+        try:
+            import javis_orchestra as _orch_st
+        except Exception:                                             # pragma: no cover
+            _orch_st = None       # 팩 스큐·부서 팩 결손 — 폴백 계약은 아래 반환 계약 assert가 지킨다
+        if _orch_st is not None:
+            nat = _orch_st.effective_required_roles(
+                detect=lambda a, g=None: (True, "stub-installed"), agents={})
+            sub = _orch_st.effective_required_roles(
+                detect=lambda a, g=None: (False, "stub-missing"), agents={})
+            assert nat == ["cso", "worker", "reviewer-gemini", "reviewer-codex"], \
+                "네이티브 로스터 계약 이탈: %r" % (nat,)
+            assert sub == ["cso", "worker", "reviewer-claude-1", "reviewer-claude-2"], \
+                "대체 로스터 계약 이탈: %r" % (sub,)
+            # 신 판정이 두 로스터를 각각 그대로 소비하는지(이름공간 결박 확인)
+            assert _team_roster_deficit(nat, set(healthy5))[0] is False, "네이티브 로스터 결박 실패"
+            assert _team_roster_deficit(sub, set(healthy5))[0] is True, \
+                "대체 로스터 요구인데 네이티브 좌석으로 결손 0(이름공간 미결박)"
+        # 반환 계약(roles XOR 사유) — 반환 이상은 폴백으로 강등하고 crash하지 않는다
+        req, why_no = _required_roles_from_orchestra()
+        assert (req is None) != (why_no is None), \
+            "_required_roles_from_orchestra 반환 계약 위반(roles/사유 동시 유효 또는 동시 부재)"
+        if req is not None:
+            assert "cso" in req and "worker" in req and len(req) >= 4, \
+                "orchestra 의무 역할 목록이 cso·worker+리뷰어 2를 포함하지 않음: %r" % (req,)
+        # ⓘ _role_satisfied 순수 규약 — worker만 접두, 그 밖은 정확일치
+        assert _role_satisfied("worker", {"worker-3"}) is True, "worker 접두 수용 소실"
+        assert _role_satisfied("cso", {"cso-1"}) is False, "cso 접두 관용 잔재(check 규약 이탈)"
+        assert _role_satisfied("reviewer-codex", {"reviewer-codex-2"}) is False, \
+            "리뷰어 접두 관용 잔재(check 규약 이탈)"
+        assert _role_satisfied("reviewer-gemini", {"reviewer-gemini"}) is True, "정확일치 실패"
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 — "
-          "base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·자원 게이트 결정·구성 결손)")
+    print("javis_bootstrap self-test OK (레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
+          "로스터 결손 신구 차분 9종 — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"
+          "자원 게이트 결정·구성 결손·grok 좌석·cso-1 좌석·정상 5노드·결손 1·worker-N·대체 로스터)")
     return 0
 
 

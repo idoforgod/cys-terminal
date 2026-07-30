@@ -8,7 +8,14 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
 
 서브커맨드:
   check                         4종 의무 노드(cso·worker·reviewer-gemini·reviewer-codex)
-                                생존을 cys status로 판정. exit 0=4종 생존, 1=부재 존재.
+                                생존을 cys status로 판정.
+                                exit 0=의무 역할 전원 생존 / 1=**노드 미기동**(실측 판정 —
+                                status는 받았고 그중 부재 역할이 있다) /
+                                2=**판정 불가**(cys 미설치·데몬 소실·status --json 비0/파손 —
+                                cys_status()가 None). ★2와 1은 다른 사실이다: 2는 노드에 대해
+                                아무것도 말하지 않는다(데몬 소실을 '노드 미기동'으로 오귀속하면
+                                처방이 뒤집힌다 — 2는 `cys ping`·데몬 기동, 1은 `cys boot`).
+                                소비자(javis_bootstrap ⑤ 등)는 두 갈래를 분기해야 한다.
   review-prompt --task T --scope S [--reviewer gemini|codex] [--round N] [--success X]
                                 REVIEWER_DIRECTIVE §2 제약 + 형식 + 회신 채널을 항상 포함한
                                 리뷰 의뢰 프롬프트를 출력(제약 누락 구조 차단). --success는

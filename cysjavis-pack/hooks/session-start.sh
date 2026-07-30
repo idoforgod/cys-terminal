@@ -40,7 +40,10 @@ list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' �
     "기동 완료"는 이 스크립트의 최종 JSON을 인용할 때만 선언할 수 있다 — 다른 근거 인용 금지.)
    · exit 7 = 이 surface는 master가 아니다(살아있는 master 존재) — 선언을 중단하고 기존 master에 인계하라.
    · 그 외 비0 exit = 부트 실패 — 출력의 단계·원인을 그대로 보고하라(자연어 재추론 금지).
-3) 마스터 외 역할은 \`cys claim-role <worker|cso|reviewer>\` 로 자기 surface를 역할 주소로 등록한다.
+3) 마스터 외 역할은 \`cys claim-role <worker|cso|reviewer-gemini|reviewer-codex>\` 로 자기 surface를
+   역할 주소로 등록한다. ⚠리뷰어는 **에이전트별 역할명**(reviewer-gemini·reviewer-codex, 대체
+   기동 시 reviewer-claude-1/reviewer-claude-2, 선택 reviewer-grok)을 쓴다 — generic
+   \`reviewer\`로 등록하면 orchestra check의 의무 노드 생존 판정이 그 좌석을 못 보고 실패한다.
 (역할 선언이 없으면 이 안내는 무시해도 된다.)
 EOF
   exit 0

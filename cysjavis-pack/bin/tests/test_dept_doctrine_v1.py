@@ -77,6 +77,14 @@ def _mock_pack(pack, orch_check_exit=1, gate_exit=0, gate_json="",
                 'out = %r\n'
                 'if out: print(out)\n'
                 'sys.exit(%d)\n' % (gate_log, gate_json, gate_exit))
+    # ★agents.json 시드 필수(W0 P0 지혈 이후): 결손 판정이 ⑤check와 **같은 소스**
+    # (javis_orchestra.effective_required_roles)에서 의무 역할 목록을 받으므로, 팩에 agents.json이
+    # 없으면 리뷰어 감지가 전부 미설치로 떨어져 로스터가 Claude 대체(reviewer-claude-1/2)로 치환된다
+    # — 실 레인에는 preflight가 agents.json을 시드하므로 그 상태가 정상이고, 시드 없는 목 팩은
+    # 픽스처 결함이었다. cmd를 sys.executable(절대경로·실행가능 확정)로 두어 PATH·호스트 설치
+    # 상태와 무관하게 **네이티브 로스터(reviewer-gemini·reviewer-codex)** 로 결정론 고정한다.
+    with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
+        json.dump({a: {"cmd": sys.executable} for a in ("claude", "gemini", "codex")}, f)
 
 
 def _run_bootstrap(home, pack, mockbin, socket=None):

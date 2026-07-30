@@ -46,8 +46,9 @@ esac
 HEAD="$(printf '%s' "$PROMPT" | tr '\n' ' ' | cut -c1-200)"
 # 의문/인용 오발화 억제(adv#8): "'너는 마스터다'가 무슨 뜻?" 류.
 echo "$HEAD" | grep -Eq '(무슨|무엇|뜻|의미|가 뭐|가 무|\?|라고 (말|하지|입력)|처럼|예시|예를)' && exit 0
-# 선언 감지: 너는/넌/너가/당신은/너 + (filler 최대 12자) + 마스터/master + 종결(다/야/이다/입니다/임/
-# 이야/로 각성/로 승격/가 되/가 돼/가 된다). you are ... master(영문). 부정은 선언 인접만 억제(adv#7).
+# 선언 감지: 너는/넌/너가/당신은/너 + (filler 최대 15자 — 아래 `.{0,15}`가 진실원천) + 마스터/master
+# + 종결(다/야/이다/입니다/임/이야/로 각성/로 승격/가 되/가 돼/가 된다). you are ... master(영문).
+# 부정은 선언 인접만 억제(adv#7).
 FIRE=0
 if echo "$HEAD" | grep -Eiq '(너는|넌|너가|당신은|너).{0,15}(마스터|master).{0,2}(다|야|이다|입니다|임|이야|여|로 *각성|로 *승격|가 *되|가 *돼|가 *된)'; then FIRE=1; fi
 if echo "$HEAD" | grep -Eiq 'you[[:space:]]+are[[:space:]]+(the[[:space:]]+|our[[:space:]]+|now[[:space:]]+)*master'; then FIRE=1; fi
