@@ -49,6 +49,12 @@ B1(Phase 1 Wave B1 · DESIGN-DECISIONS §2-1): completion-guard 태스크 바인
   claim 이 master surface 에 기록돼 **워커 pane 의 guard 가 무발동**한다 — master 는
   `--claim-surface <워커 sid>` 로 위임 대상 워커 surface 를 지정하거나, 워커가 자기
   pane 에서 동일-owner 재checkout(멱등 재진입 지원)해야 한다.
+- ★E2-1(BLOCKER R-02 교정): 위 위임 경로에서 **pid 는 기록하지 않는다**(`--claim-pid` 명시
+  또는 `--pid` 명시가 없으면 `pid: null` + `pid_source` 박제 + stderr WARN 1줄). 종전에는
+  호출자(master 셸) pid 를 채워 넣어, master `/clear`·재기동으로 그 pid 가 죽는 순간 워커
+  guard 가 claim 을 stale 로 보고 **영구 exit 0**(침묵형 무발동)이 됐다. guard 측 짝은
+  `javis_completion_guard._claim_liveness()` — pid 부재/사망 시 **태스크 레코드 상태**
+  (in_progress|in_review ∧ 레코드 신선도)로 판정하고 pid 는 보조 신호로 강등한다.
 - release·set-status 터미널 전이(done|cancelled) 성공 시 해당 task 를 가리키는
   guard-claim 을 삭제한다(교차 surface 호출 대비 — task_id 일치 항목 소거).
 - 사이드카 네임스페이스 격리(F5): guard 산출 사이드카(`<id>.guard.json`·
@@ -77,6 +83,17 @@ B2(Phase 1 Wave B2 · DESIGN-DECISIONS §3): 고위험 서명·done-deferred·ca
 - set-verify-spec 재등록 게이트(G2): 미해소 guard 상태(G1 동일 기준) 또는 기존 spec
   risk.class=high 교체는 --force-respec 명시 없이 exit 2 거부 — 무해 cmd 재등록으로
   done-deferred 차단·서명 의무를 세탁하는 우회 봉쇄. 강제 시 task-audit 원장 1줄 기록.
+
+E1-1(BLOCKER R-08 · 긴급 롤백 비대칭 수리): 위 done-deferred 검사는 `CYS_COMPLETION_GUARD`
+와 **무관**하다 — guard 를 끄면 잔존 신호를 리셋할 PASS 가 오지 않아 고위험 태스크 done 이
+exit 4 로 영구 차단됐다(안전밸브 부재). 밸브 2종을 신설:
+- `CYS_TASK_GUARD_SIGNAL_GATE=strict|warn|off`(기본 strict · alias
+  `CYS_TASK_GUARD_DEFERRED_GATE`) — evidence 게이트 env 3종과 동일 문법. warn=고위험도
+  통과+라벨, off=검사 생략. 미지 값은 strict(오타로 게이트가 열리지 않는다).
+- 자동 강등: `<id>.guard-disarmed`(회로차단기 개방 — 재무장은 수동 마커 삭제) 존재 시
+  strict 라도 warn 강등. "자동 자가치유 없음 + done 영구 차단" 이중 잠금 해제.
+두 경로 모두 stderr 1줄 고지 + `_round/evidence/guard_bypass_audit.jsonl` append-only 원장
++ task.evidence.guard_gate_bypass 병기(우회는 숨기지 않는다).
 """
 import argparse
 import contextlib
@@ -552,9 +569,22 @@ def _guard_surface_id():
     return re.sub(r"[^0-9A-Za-z_-]", "", raw)
 
 
-def _write_guard_claim(task_id, pid_arg, surface=None):
+def _write_guard_claim(task_id, pid_arg, surface=None, claim_pid=None):
     """F3: 명시 `--claim-surface` 인자 우선 — master 가 위임 대상 워커 surface 로 claim 을
-    기록할 수 있게 한다(guard-claim 이음매 해소). 기본은 현행 env(CYS_SURFACE_ID)."""
+    기록할 수 있게 한다(guard-claim 이음매 해소). 기본은 현행 env(CYS_SURFACE_ID).
+
+    ★E2-1(BLOCKER R-02 · 침묵형 무발동 근절): 종전에는 `--claim-surface` 위임 경로에서도
+    pid 를 **호출자(master 셸)** 것으로 채웠다(`os.getppid()`). 그 pid 는 워커와 무관하고
+    master 가 `/clear`·재기동하면 죽는다 ⇒ 워커 guard 가 `_pid_alive` 실패로 claim 을 stale
+    판정해 **영구 exit 0**(무장했는데 아무것도 검증 안 함 · 카나리아 1일차 통과·2일차 침묵).
+    교정: **pid 는 소유자가 확실할 때만 기록한다.**
+      · `--claim-pid <pid>` 명시 = 그 pid(위임 대상 워커 pane 의 pid — 소유자 확실)
+      · `--pid <pid>` 명시 = 락 생존 판정 pid 를 그대로 재사용(종전 계약 유지)
+      · 둘 다 없이 `--claim-surface` 로 **위임**한 경우 = pid 미기록(`None`)
+        → guard 는 pid 대신 **태스크 레코드 상태**로 생존을 판정한다(pid 는 보조 신호로 강등).
+      · `--claim-surface` 없이 자기 pane 에서 checkout = 종전대로 `os.getppid()`(소유자 일치)
+    `pid_source` 필드로 어느 경로였는지 claim 에 박제한다(사후 진단 · 무기록 이전 금지).
+    """
     if surface is not None:
         sid = re.sub(r"[^0-9A-Za-z_-]", "", str(surface).strip())
         if not sid:
@@ -565,9 +595,19 @@ def _write_guard_claim(task_id, pid_arg, surface=None):
         sid = _guard_surface_id()
     if not sid:
         return
-    rec = {"task_id": task_id,
-           "pid": pid_arg if pid_arg is not None else os.getppid(),  # _acquire_lock 관례 동일
-           "ts": _now()}
+    if claim_pid is not None:
+        pid_val, pid_src = claim_pid, "claim-pid(명시 — 위임 대상 pane pid)"
+    elif pid_arg is not None:
+        pid_val, pid_src = pid_arg, "pid(명시 — 락 생존 pid 재사용)"
+    elif surface is not None:
+        # 위임 경로: 호출자 pid 는 위임 대상과 무관하다 — 거짓 생존 신호를 남기지 않는다.
+        pid_val, pid_src = None, "delegated(미기록 — 태스크 상태 기반 판정)"
+        print("warn: --claim-surface 위임 — claim pid 미기록(호출자 pid 는 워커와 무관). "
+              "guard 는 태스크 레코드 상태로 claim 생존을 판정한다. 워커 pane pid 를 고정하려면 "
+              "`--claim-pid <워커 pid>` 를 주라.", file=sys.stderr)
+    else:
+        pid_val, pid_src = os.getppid(), "caller(자기 pane checkout)"  # _acquire_lock 관례 동일
+    rec = {"task_id": task_id, "pid": pid_val, "pid_source": pid_src, "ts": _now()}
     with contextlib.suppress(OSError):
         _write_json_atomic(os.path.join(TASKS_DIR, ".guard-claim.%s" % sid), rec)
 
@@ -1012,7 +1052,21 @@ def cmd_checkout(a):
         task["updated_at"] = _now()
         _write_json_atomic(_task_path(a.id), task)
     # B1(§2-1)·F3: completion-guard 바인딩 — 성공 경로에서만·명시 --claim-surface 우선
-    _write_guard_claim(a.id, a.pid, surface=getattr(a, "claim_surface", None))
+    # ★E1-4(BLOCKER F12/R-25 · 팩 배포 무게이트 발효 강등): **ambient `CYS_SURFACE_ID` 경로는
+    #   기본 OFF**다. 이 파일은 이미 6프로필에서 도는 공용 도구라 팩 install 즉시 발효하는데,
+    #   그 경로를 켠 채로 배포하면 cys pane 안의 **모든** checkout 이 종전에 없던 파일
+    #   `_round/tasks/.guard-claim.<sid>` 를 라이브 저장소에 만들기 시작한다(A/B 실측 확인 ·
+    #   회수 규칙도 없다 — R-15). 게다가 표준 플로우에서 checkout 은 master pane 이 실행하므로
+    #   그 claim 은 **엉뚱한 surface** 에 박히는, R-02 이음매의 진원이기도 하다.
+    #   따라서 자동 발효 대상에서 뺀다:
+    #     · 명시 `--claim-surface`/`--claim-pid` = 항상 기록(의도된 opt-in · OT-2 가 쓰는 경로)
+    #     · ambient env 경로 = `CYS_TASK_GUARD_CLAIM=1` 일 때만(OT-2 무장 스텝과 같은 창에서 켠다)
+    #   기본값에서 이 도구는 종전과 **바이트 동일한 산출물**을 남긴다(파일 0개 추가).
+    _claim_explicit = (getattr(a, "claim_surface", None) is not None
+                       or getattr(a, "claim_pid", None) is not None)
+    if _claim_explicit or os.environ.get("CYS_TASK_GUARD_CLAIM") == "1":
+        _write_guard_claim(a.id, a.pid, surface=getattr(a, "claim_surface", None),
+                           claim_pid=getattr(a, "claim_pid", None))
     print(json.dumps({"checkout": verdict, "id": a.id, "owner": a.owner}, ensure_ascii=False))
     return EXIT_OK
 
@@ -1301,24 +1355,56 @@ def cmd_set_status(a):
     artifact_records = None  # done 게이트 통과 시 채워져 wlock 안에서 task.evidence.artifacts로 저장
     skip_audit_pending = False  # skip 감사는 실제 done 진행(전이·settle 게이트 통과) 후에만 기록
     guard_deferred = False  # B2: guard 미검증 잔존 → evidence 'verify-deferred' 라벨 병기 예약
+    guard_bypass_rec = None  # E1-1(R-08): 안전밸브·자동강등으로 고위험 보류를 우회한 기록(원장)
     if a.status == "done":
         # ── B2 guard deferred 검사(조건 04①·20② 우선순위 통일 — 20② 채택 · cheap-first):
         #    <id>.guard.json 미해소 판정 = **내구 신호 합성**(G1 — _guard_unresolved:
         #    deferred ∨ last_verdict=VERIFY_FAIL ∨ block_count>0 ∨ last_sig≠None · 전부
         #    PASS 로만 리셋) — last_verdict 단독 판정의 SKIPPED_*/NO_BLOCK_PASS 마스킹 창 차단.
         #    risk.class=high 는 done 보류(exit 4) / 일반은 통과+라벨 병기(다이제스트 보고 대상).
-        #    guard.json 부재·손상 = 무간섭(회귀 0 — B1 이전 레코드·비무장 pane 동일 동작). ──
+        #    guard.json 부재·손상 = 무간섭(회귀 0 — B1 이전 레코드·비무장 pane 동일 동작).
+        #    ★E1-1(R-08 롤백 비대칭 수리): 이 검사는 `CYS_COMPLETION_GUARD` env 와 **무관**하다
+        #    — guard 를 끄면 잔존 신호를 리셋할 PASS 가 영원히 오지 않으므로, 안전밸브 없이는
+        #    고위험 태스크 done 이 exit 4 로 **영구 차단**된다. 그래서 밸브 2개를 둔다:
+        #      ① 명시 밸브 `CYS_TASK_GUARD_SIGNAL_GATE=strict|warn|off`(기본 strict · evidence
+        #         게이트 env 3종과 동일 문법·문체 · alias `CYS_TASK_GUARD_DEFERRED_GATE`)
+        #      ② 자동 강등: `<id>.guard-disarmed`(회로차단기 개방 = 수동 재무장 전까지 PASS
+        #         불가능) 존재 시 strict 라도 **warn 으로 강등**(차단 아님·라벨 유지).
+        #    두 경로 모두 stderr 1줄 고지 + `_round/evidence/guard_bypass_audit.jsonl` 원장. ──
         _gobj = _load_guard_obj(a.id)
-        if _guard_unresolved(_gobj):
+        _gmode = _guard_signal_gate_mode()
+        if _gmode == "off":
+            if _guard_unresolved(_gobj):
+                guard_deferred = True
+                guard_bypass_rec = {"reason": "env-off", "mode": _gmode,
+                                    "signals": _guard_signals(_gobj), "risk": None}
+                print("guard-signal-gate off: guard 미검증 잔존(%s) — done-deferred 검사 생략"
+                      "(CYS_TASK_GUARD_SIGNAL_GATE=off). 'verify-deferred' 라벨과 우회 원장"
+                      "(_round/evidence/guard_bypass_audit.jsonl)은 유지된다."
+                      % _guard_signals(_gobj), file=sys.stderr)
+        elif _guard_unresolved(_gobj):
             _vs = task.get("verify_spec")
             _rk = _vs.get("risk") if isinstance(_vs, dict) else None
             _risk_cls = _rk.get("class") if isinstance(_rk, dict) else None
-            if _risk_cls == "high":
+            _disarmed = _guard_disarmed_reason(a.id)
+            if _risk_cls == "high" and _gmode == "strict" and _disarmed is None:
                 print("done blocked(4): verify 미검증 잔존(%s) + risk.class=high — 고위험 "
                       "태스크는 verify 통과(guard PASS) 후 done(조건 20② 고위험 보류 · "
                       "G1 내구 신호 합성)" % _guard_signals(_gobj), file=sys.stderr)
+                print("  되돌리는 법(R-08 안전밸브): guard 를 껐다면 PASS 는 오지 않는다 — "
+                      "①`CYS_TASK_GUARD_SIGNAL_GATE=warn`(고위험도 통과+라벨) 또는 `=off`"
+                      "(검사 생략) ②또는 잔존 파일 제거 `rm $JAVIS_ROOT/_round/tasks/%s.guard.json`"
+                      % a.id, file=sys.stderr)
                 return EXIT_BLOCKED
             guard_deferred = True
+            if _risk_cls == "high":
+                _why = ("guard-disarmed(%s)" % _disarmed) if _disarmed is not None \
+                    else "CYS_TASK_GUARD_SIGNAL_GATE=warn"
+                guard_bypass_rec = {"reason": "auto-demote-disarmed" if _disarmed is not None
+                                    else "env-warn", "mode": _gmode,
+                                    "signals": _guard_signals(_gobj), "risk": _risk_cls}
+                print("guard-signal-gate warn: 고위험 보류를 라벨 강등 — %s. 잔존(%s)"
+                      % (_why, _guard_signals(_gobj)), file=sys.stderr)
             print("verify-deferred: guard 미검증 잔존(%s) — evidence 에 'verify-deferred' "
                   "라벨 자동 병기(미검증 목록 다이제스트 보고 대상 · 조건 04①·20②)"
                   % _guard_signals(_gobj), file=sys.stderr)
@@ -1401,6 +1487,9 @@ def cmd_set_status(a):
                       "터미널 전이는 in_progress|in_review에서 권장(전이표 W2-1)", file=sys.stderr)
         if skip_audit_pending:  # E1 R3: 전이 게이트 통과·done 확정 시점에만 append(재진입 오염 차단)
             _append_jsonl(_skip_audit_path(), {"ts": _now(), "task": a.id, "reason": skip_text})
+        if guard_bypass_rec is not None:  # E1-1(R-08): 안전밸브 사용 원장 — skip 감사와 동일 규약
+            _append_jsonl(_guard_bypass_audit_path(),
+                          dict(guard_bypass_rec, ts=_now(), task=a.id))
         if ev_text or skip_text:
             task["evidence"] = {"type": "evidence" if ev_text else "skip",
                                 "text": ev_text or skip_text, "at": _now()}
@@ -1417,6 +1506,8 @@ def cmd_set_status(a):
                 ev["text"] = "[verify-deferred]"
                 ev.setdefault("type", "evidence")
                 ev.setdefault("at", _now())
+            if guard_bypass_rec is not None:  # E1-1(R-08): 태스크 레코드에도 우회 사실 병기
+                ev["guard_gate_bypass"] = dict(guard_bypass_rec, at=_now())
         if settle_override_note is not None:
             task.setdefault("settle_overrides", []).append(
                 {"at": _now(), "reason": settle_override_note})
@@ -1504,6 +1595,44 @@ def _guard_unresolved(gobj):
             or gobj.get("last_verdict") == "VERIFY_FAIL"
             or bc_pos
             or gobj.get("last_sig") is not None)
+
+
+def _guard_signal_gate_mode():
+    """E1-1(R-08): done-deferred 게이트 안전밸브 모드 — strict(기본)|warn|off.
+
+    evidence 게이트 env 3종(`CYS_TASK_EVIDENCE_GATE`·`CYS_TASK_EVIDENCE_ARTIFACT_GATE`·
+    `CYS_TASK_TRANSITION_GATE`)과 **같은 문법·문체**다. 미지 값은 기본(strict) — 오타가
+    게이트를 조용히 여는 창을 만들지 않는다(안전측 고정).
+      · strict = 종전 동작(고위험 잔존 = exit 4 차단)
+      · warn   = 고위험도 통과 + 'verify-deferred' 라벨 + 우회 원장
+      · off    = 잔존 검사 자체를 생략(라벨·원장은 유지)
+    alias `CYS_TASK_GUARD_DEFERRED_GATE` — 대장(R-08 해소 조건) 문면과 OT 롤백 표가 이 이름을
+    쓰므로 둘 다 받는다(주 이름이 우선 · 둘 다 있으면 주 이름 승).
+    """
+    raw = (os.environ.get("CYS_TASK_GUARD_SIGNAL_GATE")
+           or os.environ.get("CYS_TASK_GUARD_DEFERRED_GATE") or "").strip().lower()
+    return raw if raw in ("strict", "warn", "off") else "strict"
+
+
+def _guard_disarmed_reason(task_id):
+    """`<id>.guard-disarmed` 마커 판독 → 사유 1줄(부재 = None).
+
+    회로차단기가 열린 태스크는 guard 가 **더 이상 발동하지 않으므로** PASS 로 잔존 신호를
+    리셋할 방법이 없다(재무장 = master 의 수동 마커 삭제). 그 상태에서 고위험 done 을
+    exit 4 로 계속 막는 것은 '자동 자가치유 없음 + done 영구 차단' 이중 잠금이다(R-08) —
+    따라서 strict 라도 **warn 으로 자동 강등**하고 사유를 원장에 남긴다.
+    """
+    p = os.path.join(TASKS_DIR, "%s.guard-disarmed" % task_id)
+    try:
+        with open(p, encoding="utf-8") as f:
+            head = (f.readline() or "").strip()
+    except OSError:
+        return None
+    return head[:200] or "사유 미기재"
+
+
+def _guard_bypass_audit_path():
+    return os.path.join(ROOT, "_round", "evidence", "guard_bypass_audit.jsonl")
 
 
 def _guard_signals(gobj):
@@ -2169,7 +2298,7 @@ def cmd_self_test(args):
             rc, _, e = run(croot, ["create", "Tc1", "--id", "Tc1"])
             assert rc == 0, "B1 create 실패: %s" % e
             rc, _, e = run(croot, ["checkout", "Tc1", "--owner", "w1", "--pid", "12345"],
-                           {"CYS_SURFACE_ID": "42"})
+                           {"CYS_SURFACE_ID": "42", "CYS_TASK_GUARD_CLAIM": "1"})
             assert rc == EXIT_OK, "B1 checkout 실패: %s" % e
             cl = read_claim("42")
             assert cl["task_id"] == "Tc1" and cl["pid"] == 12345 and cl.get("ts"), \
@@ -2180,7 +2309,7 @@ def cmd_self_test(args):
             assert not os.path.isfile(claim_path("42")), "B1 release 후 claim 잔존"
             # 재checkout + set-status done(타 surface 호출 시뮬 — env 무 sid) → claim 소거
             rc, _, e = run(croot, ["checkout", "Tc1", "--owner", "w1"],
-                           {"CYS_SURFACE_ID": "42"})
+                           {"CYS_SURFACE_ID": "42", "CYS_TASK_GUARD_CLAIM": "1"})
             assert rc == EXIT_OK, "B1 재checkout 실패: %s" % e
             assert os.path.isfile(claim_path("42")), "B1 재checkout claim 미기록"
             rc, _, e = run(croot, ["set-status", "Tc1", "done",
@@ -2188,6 +2317,15 @@ def cmd_self_test(args):
             assert rc == EXIT_OK, "B1 done 실패: %s" % e
             assert not os.path.isfile(claim_path("42")), \
                 "B1 터미널 전이(타 surface) 후 claim 잔존(교차 소거 실패)"
+            # ★E1-4(F12/R-25): ambient CYS_SURFACE_ID 만으로는 claim 을 만들지 않는다
+            #   (팩 install 즉시 발효 강등 — 기본 OFF). 명시 인자는 아래 F3 케이스가 증명한다.
+            rc, _, e = run(croot, ["create", "Tc1b", "--id", "Tc1b"])
+            assert rc == 0
+            rc, _, e = run(croot, ["checkout", "Tc1b", "--owner", "w1"],
+                           {"CYS_SURFACE_ID": "77"})
+            assert rc == EXIT_OK, "E1-4 ambient checkout 실패: %s" % e
+            assert not os.path.isfile(claim_path("77")), \
+                "E1-4 ambient claim 이 기본값에서 생성됨(무게이트 발효 재발)"
             # CYS_SURFACE_ID 부재 → claim 미생성(무동작)
             rc, _, e = run(croot, ["create", "Tc2", "--id", "Tc2"])
             assert rc == 0
@@ -2202,7 +2340,8 @@ def cmd_self_test(args):
             rc, _, e = run(croot, ["create", "Tc3", "--id", "Tc3"])
             assert rc == 0
             rc, _, e = run(croot, ["checkout", "Tc3", "--owner", "w1"],
-                           {"CYS_SURFACE_ID": "43", "JAVIS_VERIFY_GATE": "strict"})
+                           {"CYS_SURFACE_ID": "43", "JAVIS_VERIFY_GATE": "strict",
+                            "CYS_TASK_GUARD_CLAIM": "1"})
             assert rc == EXIT_VERIFY, "B1 strict 거부 기대: %s" % rc
             assert not os.path.isfile(claim_path("43")), "B1 거부 경로가 claim 생성"
 
@@ -2391,6 +2530,105 @@ def cmd_self_test(args):
             assert rc == EXIT_OK and "verify-deferred" in e, \
                 "G1 일반 spec NBP 잔존(last_sig) 라벨 미병기: rc=%s err=%s" % (rc, e)
 
+            # ══ E1-1(BLOCKER R-08): 긴급 롤백 비대칭 — done-deferred 안전밸브 ═══════════
+            #    고위험 + VERIFY_FAIL 잔존 고정 픽스처를 만들어 놓고 밸브만 바꿔가며 실측한다.
+            def _e1_fixture(tid, disarm=False):
+                setup_checked_out(broot, tid)
+                rc_, _o, e_ = run(broot, ["set-verify-spec", tid, "--json", del_spec,
+                                          "--signed-by", "master"])
+                assert rc_ == EXIT_OK, "E1-1 %s 서명 등록 실패: %s" % (tid, e_)
+                with open(os.path.join(b_tasks, "%s.guard.json" % tid), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"schema_version": 1, "task_id": tid, "deferred": True,
+                               "last_verdict": "VERIFY_FAIL", "block_count": 2,
+                               "last_sig": "sigE1"}, f)
+                if disarm:
+                    with open(os.path.join(b_tasks, "%s.guard-disarmed" % tid), "w",
+                              encoding="utf-8") as f:
+                        f.write("2026-07-31T00:00:00Z infra_count 3회 연속(마지막: spawn 실패)\n"
+                                "재무장: master 가 이 마커 파일을 삭제(명시 명령)\n")
+                return mkfile(broot, "e1-%s.txt" % tid, "e1 valve evidence\n")
+
+            def _bypass_audit():
+                p = os.path.join(broot, "_round", "evidence", "guard_bypass_audit.jsonl")
+                if not os.path.isfile(p):
+                    return []
+                with open(p, encoding="utf-8") as f:
+                    return [json.loads(ln) for ln in f if ln.strip()]
+
+            # ① 결함 재현 — guard env(CYS_COMPLETION_GUARD) 제거·부재만으로는 되돌아가지 않는다.
+            #    (javis_task 는 그 env 를 읽지 않는다 — 잔존 guard.json 만 본다.)
+            artE1 = _e1_fixture("Te1")
+            rc, _, e = run(broot, ["set-status", "Te1", "done", "--evidence",
+                                   "guard env 제거 후 시도", "--evidence-artifact", artE1] + OV,
+                           {"CYS_COMPLETION_GUARD": ""})
+            assert rc == EXIT_BLOCKED and "done blocked(4)" in e, \
+                "E1-1① guard env 제거로 차단이 풀렸다(재현 실패): rc=%s err=%s" % (rc, e)
+            assert "되돌리는 법" in e and "CYS_TASK_GUARD_SIGNAL_GATE" in e, \
+                "E1-1① 차단 문면에 안전밸브 안내 부재: %s" % e
+            assert _bypass_audit() == [], "E1-1① 차단인데 우회 원장이 기록됨"
+
+            # ② 명시 안전밸브 warn — 고위험도 통과 + 라벨 + 우회 원장 1줄
+            rc, _, e = run(broot, ["set-status", "Te1", "done", "--evidence",
+                                   "안전밸브 warn 통과", "--evidence-artifact", artE1] + OV,
+                           {"CYS_TASK_GUARD_SIGNAL_GATE": "warn"})
+            assert rc == EXIT_OK and "guard-signal-gate warn" in e and "verify-deferred" in e, \
+                "E1-1② warn 밸브 통과 실패: rc=%s err=%s" % (rc, e)
+            evE1 = read_task(broot, "Te1")["evidence"]
+            assert evE1.get("verify_deferred") is True \
+                and evE1.get("guard_gate_bypass", {}).get("reason") == "env-warn", \
+                "E1-1② 우회 병기 누락: %s" % evE1
+            aud = _bypass_audit()
+            assert len(aud) == 1 and aud[0]["task"] == "Te1" and aud[0]["reason"] == "env-warn", \
+                "E1-1② 우회 원장 1줄 아님: %s" % aud
+
+            # ③ off 밸브 — 검사 자체 생략(고지 문면 분기)·라벨/원장은 유지
+            artE2 = _e1_fixture("Te2")
+            rc, _, e = run(broot, ["set-status", "Te2", "done", "--evidence",
+                                   "안전밸브 off 통과", "--evidence-artifact", artE2] + OV,
+                           {"CYS_TASK_GUARD_SIGNAL_GATE": "off"})
+            assert rc == EXIT_OK and "guard-signal-gate off" in e, \
+                "E1-1③ off 밸브 통과 실패: rc=%s err=%s" % (rc, e)
+            assert read_task(broot, "Te2")["evidence"].get("guard_gate_bypass", {}) \
+                .get("reason") == "env-off", "E1-1③ off 우회 병기 누락"
+
+            # ④ alias(CYS_TASK_GUARD_DEFERRED_GATE) 동작 — 대장·OT 롤백 표 문면 호환
+            artE3 = _e1_fixture("Te3")
+            rc, _, e = run(broot, ["set-status", "Te3", "done", "--evidence",
+                                   "alias 밸브 통과", "--evidence-artifact", artE3] + OV,
+                           {"CYS_TASK_GUARD_DEFERRED_GATE": "off"})
+            assert rc == EXIT_OK and "guard-signal-gate off" in e, \
+                "E1-1④ alias 밸브 미인식: rc=%s err=%s" % (rc, e)
+
+            # ⑤ 자동 강등 — guard-disarmed(회로차단기 개방) 존재 시 strict 라도 차단 금지
+            artE4 = _e1_fixture("Te4", disarm=True)
+            rc, _, e = run(broot, ["set-status", "Te4", "done", "--evidence",
+                                   "회로차단기 개방 상태 완료", "--evidence-artifact", artE4] + OV)
+            assert rc == EXIT_OK and "guard-disarmed" in e, \
+                "E1-1⑤ disarmed 자동 강등 실패(영구 차단 잔존): rc=%s err=%s" % (rc, e)
+            aud4 = [r for r in _bypass_audit() if r["task"] == "Te4"]
+            assert len(aud4) == 1 and aud4[0]["reason"] == "auto-demote-disarmed", \
+                "E1-1⑤ 자동 강등 원장 누락: %s" % aud4
+
+            # ⑥ 미지 값은 strict 로 고정 — 오타가 게이트를 조용히 열지 않는다
+            artE5 = _e1_fixture("Te5")
+            rc, _, e = run(broot, ["set-status", "Te5", "done", "--evidence",
+                                   "오타 밸브 시도", "--evidence-artifact", artE5] + OV,
+                           {"CYS_TASK_GUARD_SIGNAL_GATE": "warnn"})
+            assert rc == EXIT_BLOCKED, \
+                "E1-1⑥ 미지 밸브 값이 게이트를 열었다: rc=%s err=%s" % (rc, e)
+
+            # ⑦ 회귀 0 — 밸브 미설정·guard.json 부재 = 종전과 동일(우회 원장도 늘지 않는다)
+            n_before = len(_bypass_audit())
+            setup_checked_out(broot, "Te6")
+            artE6 = mkfile(broot, "e1-Te6.txt", "clean evidence\n")
+            rc, _, e = run(broot, ["set-status", "Te6", "done", "--evidence",
+                                   "정상 완료 검증됨", "--evidence-artifact", artE6] + OV)
+            assert rc == EXIT_OK and "verify-deferred" not in e \
+                and "guard-signal-gate" not in e, \
+                "E1-1⑦ 기본 경로 회귀: rc=%s err=%s" % (rc, e)
+            assert len(_bypass_audit()) == n_before, "E1-1⑦ 무우회인데 원장이 증가"
+
             # ── G2(수리): 미해소 guard 상태(VERIFY_FAIL)의 무서명 재등록 거부 + force 원장 ──
             b2_runs = os.path.join(broot, "probe_runs.jsonl")
             rc, _, e = run(broot, ["set-verify-spec", "Tb4", "--json", benign_spec])
@@ -2456,7 +2694,10 @@ def cmd_self_test(args):
           "guard.json 무관 — G7d) / "
           "B2 수리 — G1 내구 신호 합성(SKIPPED_CYCLE+block_count 마스킹 차단·PASS 리셋 통과·"
           "NBP last_sig 라벨)·G2 재등록 게이트(high 교체/미해소 guard 거부·--force-respec "
-          "통과+task-audit 원장 1줄)·G4 대소문자 어휘(RM·CURL 검출))")
+          "통과+task-audit 원장 1줄)·G4 대소문자 어휘(RM·CURL 검출)"
+          " / E1-1 롤백 비대칭(R-08) — guard env 제거만으로 차단 잔존 재현·차단 문면 안전밸브 안내·"
+          "warn 밸브 통과+우회 원장 1줄·off 밸브 검사 생략·alias 인식·guard-disarmed 자동 강등·"
+          "미지 값 strict 고정·기본 경로 회귀 0)")
     return EXIT_OK
 
 
@@ -2485,6 +2726,11 @@ def main(argv=None):
     c.add_argument("--claim-surface", dest="claim_surface", default=None,
                    help="B1 F3: guard-claim 을 기록할 surface id — master 가 위임 대상 워커"
                         " pane 을 지정(명시 인자 우선·기본은 env CYS_SURFACE_ID)")
+    c.add_argument("--claim-pid", dest="claim_pid", type=int, default=None,
+                   help="E2-1(R-02): guard-claim 에 박을 **위임 대상 pane 의 pid**. 미지정 +"
+                        " --claim-surface 위임이면 pid 를 기록하지 않는다(호출자 pid 는 워커와"
+                        " 무관 — 거짓 생존 신호 금지). guard 는 pid 부재 시 태스크 레코드"
+                        " 상태로 claim 생존을 판정한다")
     c.add_argument("--brief", default=None,
                    help="T1: 위임 브리프 파일 — javis_brief_lint hard 경로(verify[] 형식 위반 = "
                         "exit 6 거부). 인세션 경고 경로는 hooks/brief-lint-warn.sh(fail-open)")

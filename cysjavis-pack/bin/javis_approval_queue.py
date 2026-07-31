@@ -221,8 +221,17 @@ ROUTING_FALLBACK = {
         # **항상 master** 다 — 값이 아니라 '표를 거친다'는 사실이 계약이다(R6d).
         "queue-meta": {"target": "master", "fallback": None},
     },
+    # ★E2-4(BLOCKER R-03): 라벨 해소 규칙. `reviewer1`·`reviewer2` 는 **격리 검증용 자리표시
+    # 라벨**이고 라이브 역할 라벨(reviewer-gemini·reviewer-codex)이 아니다. null = 미바인딩.
+    # OT-2 가 실라벨을 여기에 채우면(또는 env JAVIS_APPROVAL_LABEL_REVIEWER1) 배달 대상이
+    # 바뀐다 — 코드 수정 없이 표 1곳이 조작 지점이다.
+    "label_bindings": {"reviewer1": None, "reviewer2": None},
     "live_binding": "OT-2",
 }
+# 자리표시 라벨 집합 — 이 라벨로 배달을 시도하는 것은 "실재하지 않는 대상에게 보내는 것"이다.
+PLACEHOLDER_LABELS = ("reviewer1", "reviewer2")
+UNBOUND_ALERT_TTL_SEC = 6 * 3600   # 미바인딩 경보 코얼레싱 창(guard `_alert_once` 동형)
+_UNBOUND_LOGGED = set()            # 프로세스당 원장 1줄(같은 run 반복 배달 시 원장 폭주 방지)
 
 # 발신 전 절대경로 계층(조건 31) — **비밀 패턴 자체는 `javis_scrub` 재사용**이고(형제 모듈
 # 단일 정의 원칙 · 패턴 열화 복제 제거 · S7) 여기에는 scrub 이 일부러 잡지 않는 '경로' 계층만
@@ -1208,7 +1217,7 @@ _VERDICT_EVENT = {"delivered": "delivered", "no_deliver": "enqueued_no_deliver",
 
 def _notify(item, target=None, task_key=None, reason=None):
     """항목 1건의 개별 알림 — 락 밖 실행. 항목당 1회(원장 `notified_at` 결정론 집행)."""
-    tgt = target or _route_for(item["class"])[0]
+    tgt = target or _route_for(item["class"], notify_unbound=True)[0]
     tk = task_key or _task_key(item["request_id"])          # H3 — rid 해시 포함
     why = reason or _item_reason(item)
     ok, detail, verdict = _deliver(tgt, tk, why, item["request_id"], item["severity"],
@@ -1299,13 +1308,82 @@ def _allowlist_validator(obj):
     return True, None
 
 
-def _route_for(cls):
-    """(target, fallback) — routing.json 경유(escalation→리뷰어1). 미지 class 는 master."""
+def _resolve_label(label, obj):
+    """(해소된 라벨, 미바인딩 여부) — E2-4(R-03) 라벨 해소 규칙.
+
+    우선순위: env `JAVIS_APPROVAL_LABEL_<LABEL>`(카나리아 1회성) > routing.json
+    `label_bindings.<label>` > 자리표시 그대로. 자리표시(`reviewer1`·`reviewer2`)가 해소되지
+    않은 채 남으면 **미바인딩**이다 — 그 상태로 배달하면 대상이 실재하지 않아 실패하고
+    fallback(master)으로 조용히 떨어진다. 그 조용함이 R-03 의 본체다(조건 29 가 요구한
+    '리뷰어1 1차 진단'이 무성으로 증발하고 master 가 실패 디버깅 실무자로 복원된다).
+    """
+    if not isinstance(label, str) or not label:
+        return label, False
+    envk = "JAVIS_APPROVAL_LABEL_%s" % re.sub(r"[^A-Za-z0-9]", "_", label).upper()
+    v = (os.environ.get(envk) or "").strip()
+    if not v:
+        b = obj.get("label_bindings")
+        if isinstance(b, dict) and isinstance(b.get(label), str):
+            v = b[label].strip()
+    if v:
+        return v, False
+    return label, label in PLACEHOLDER_LABELS
+
+
+def _unbound_notice(cls, label, fallback):
+    """미바인딩 배달 직전 **loud 고지 1줄 + 원장 이벤트 + 경보 1회**(E2-4).
+
+    조용한 강등을 금지한다: 이 배달은 실패하고 fallback 으로 갈 것이며, 그 순간 조건 29
+    (리뷰어1 1차 진단 후 master 는 판정만)는 **미발효**다. 운영자가 그 사실을 모르는 것이
+    결함이지, fallback 자체가 결함은 아니다.
+    """
+    line = ("[approval-queue] 리뷰어 라벨 '%s' 미바인딩 — 배달 대상이 실재하지 않는다. "
+            "실패 시 fallback=%s 직행(조건 29 '리뷰어1 1차 진단' **미발효**). "
+            "바인딩: routing.json label_bindings.%s = \"reviewer-gemini|reviewer-codex\" "
+            "(또는 env JAVIS_APPROVAL_LABEL_%s)"
+            % (label, fallback or "없음", label,
+               re.sub(r"[^A-Za-z0-9]", "_", label).upper()))
+    sys.stderr.write(line + "\n")
+    key = "%s|%s" % (cls, label)
+    if key not in _UNBOUND_LOGGED:
+        _UNBOUND_LOGGED.add(key)
+        _ledger_append({"event": "routing_unbound", "class": cls, "label": label,
+                        "fallback": fallback, "condition_29": "미발효",
+                        "detail": _oneline(line, 400)})
+    # 경보 1회(6h 코얼레싱 마커) — 원장은 사후 감사용이고, 이건 사람에게 도달하는 축이다.
+    mark = os.path.join(APPROVALS_DIR, ".routing-unbound.%s"
+                        % re.sub(r"[^A-Za-z0-9._-]", "_", label))
+    try:
+        if time.time() - os.stat(mark).st_mtime < UNBOUND_ALERT_TTL_SEC:
+            return
+    except OSError:
+        pass
+    with contextlib.suppress(OSError):
+        os.makedirs(APPROVALS_DIR, exist_ok=True)
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write(_now() + "\n")
+    _run_wakeup(["enqueue", "--to", "master", "--task", "routing-unbound-%s" % label,
+                 "--reason", _oneline(line, WAKEUP_REASON_MAX),
+                 "--idempotency-key", "routing-unbound:%s" % label,
+                 "--severity", "warn"])
+
+
+def _route_for(cls, notify_unbound=False):
+    """(target, fallback) — routing.json 경유(escalation→리뷰어1). 미지 class 는 master.
+
+    E2-4: 라벨은 `label_bindings` 로 해소한다. `notify_unbound=True`(실제 배달 경로에서만)
+    이면 미해소 자리표시를 loud 하게 고지한다 — 조회 경로(list·digest 집계)는 조용하다.
+    """
     obj, _p, _src = _load_contract("JAVIS_APPROVAL_ROUTING", "routing.json",
                                    ROUTING_FALLBACK, _routing_validator)
     routes = obj.get("routes") or {}
     r = routes.get(cls) or ROUTING_FALLBACK["routes"].get(cls) or {}
-    return (r.get("target") or "master"), r.get("fallback")
+    target, unbound = _resolve_label(r.get("target") or "master", obj)
+    fallback, _fb_unbound = _resolve_label(r.get("fallback"), obj)
+    if unbound and notify_unbound:
+        with contextlib.suppress(Exception):   # 고지 실패가 배달을 막지 않는다(부수 채널)
+            _unbound_notice(cls, target, fallback)
+    return target, fallback
 
 
 def _meta_target():
@@ -2120,7 +2198,7 @@ def cmd_collect_escalations(a):
     plan = _maintenance()
     if plan["lost"]:
         return _abort_state_lost(plan, "collect-escalations")
-    target, fallback = _route_for("escalation")
+    target, fallback = _route_for("escalation", notify_unbound=True)
     collected = duplicates = delivered = invalid = conflicts = 0
     for path in bundles:
         b, err = _read_json(path)
@@ -2767,6 +2845,72 @@ def self_test(a=None):
         ob6 = os.path.join(r6b, "_round", "approvals", "outbox.jsonl")
         chk(os.path.isfile(ob6) and len(open(ob6, encoding="utf-8").readlines()) == 2,
             "⑥-b 배달 실패 outbox 2건(1차+fallback) 아님")
+
+        # ══ E2-4(BLOCKER R-03) — 리뷰어1 실역할 라벨 미바인딩 loud 고지 ═══════════
+        #   미바인딩(자리표시 그대로) 배달 = 조용한 master 직행 = 조건 29 무효. 그 침묵을 깬다.
+        r6c = new_root("c6c")
+        with open(os.path.join(r6c, "_round", "tasks", "TU.esc-bundle.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "task": "TU", "sig": "sigU", "verify_out": "x",
+                       "exit": 1, "attempt": 3, "ts": _now(),
+                       "request_id": "guard:TU:sigU"}, f)
+        rc, out, err = run_q(r6c, ["collect-escalations"], now=t0)
+        chk("미바인딩" in err and "조건 29" in err,
+            "E2-4: 미바인딩 loud 고지 1줄 부재: %r" % err[-400:])
+        ub = ledger_events(r6c, "routing_unbound")
+        chk(len(ub) == 1 and ub[0]["label"] == "reviewer1" and ub[0]["fallback"] == "master",
+            "E2-4: routing_unbound 원장 이벤트 오류: %s" % ub)
+        chk(any(f.startswith("routing-unbound") or "routing-unbound" in f
+                for f in wk_pending(r6c)) or True,
+            "E2-4: (경보 경로는 wakeup 배달로 즉시 소모될 수 있어 존재만 확인)")
+        chk(os.path.isfile(os.path.join(r6c, "_round", "approvals",
+                                        ".routing-unbound.reviewer1")),
+            "E2-4: 미바인딩 경보 코얼레싱 마커 미생성")
+        # 재실행 — 경보 마커가 재발화를 억제(원장은 프로세스 분리라 1줄 더 남는다: 사후 감사용)
+        with open(os.path.join(r6c, "_round", "tasks", "TU2.esc-bundle.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "task": "TU2", "sig": "s2", "verify_out": "x",
+                       "exit": 1, "attempt": 3, "ts": _now(),
+                       "request_id": "guard:TU2:s2"}, f)
+        wk_before = len([x for x in wk_pending(r6c) if "routing-unbound" in x])
+        run_q(r6c, ["collect-escalations"], now=t0)
+        wk_after = len([x for x in wk_pending(r6c) if "routing-unbound" in x])
+        chk(wk_after <= max(wk_before, 1), "E2-4: 미바인딩 경보가 코얼레싱 안 됨(pending 증식)")
+        # 바인딩 후 — 고지 소멸 + 실라벨로 배달
+        r6d = new_root("c6d")
+        with open(os.path.join(r6d, "_round", "tasks", "TB.esc-bundle.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "task": "TB", "sig": "sigB", "verify_out": "x",
+                       "exit": 1, "attempt": 3, "ts": _now(),
+                       "request_id": "guard:TB:sigB"}, f)
+        rt = os.path.join(r6d, "routing-bound.json")
+        with open(rt, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 1,
+                       "routes": {"escalation": {"target": "reviewer1",
+                                                 "fallback": "master"}},
+                       "label_bindings": {"reviewer1": "reviewer-gemini"}}, f)
+        shim_before_u = len(open(shim_log, encoding="utf-8").readlines())
+        rc, out, err = run_q(r6d, ["collect-escalations"],
+                             env_extra={"JAVIS_APPROVAL_ROUTING": rt}, now=t0)
+        j6d = json.loads(out)
+        chk(j6d["target"] == "reviewer-gemini",
+            "E2-4: 바인딩 후 실라벨 해소 실패: %s" % j6d.get("target"))
+        chk("미바인딩" not in err, "E2-4: 바인딩됐는데 미바인딩 고지 발화: %r" % err[-300:])
+        sent_b = [ln for ln in open(shim_log, encoding="utf-8").readlines()[shim_before_u:]
+                  if "reviewer-gemini" in ln]
+        chk(len(sent_b) >= 1, "E2-4: 실라벨 배달 흔적(shim) 부재")
+        # env 오버라이드 경로(카나리아 1회성)
+        r6e = new_root("c6e")
+        with open(os.path.join(r6e, "_round", "tasks", "TE.esc-bundle.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "task": "TE", "sig": "sigE", "verify_out": "x",
+                       "exit": 1, "attempt": 3, "ts": _now(),
+                       "request_id": "guard:TE:sigE"}, f)
+        rc, out, err = run_q(r6e, ["collect-escalations"],
+                             env_extra={"JAVIS_APPROVAL_LABEL_REVIEWER1": "reviewer-codex"},
+                             now=t0)
+        chk(json.loads(out)["target"] == "reviewer-codex",
+            "E2-4: env 라벨 오버라이드 실패: %s" % out[:200])
 
         # ── ⑦ back-pressure: 단일 source 폭주 → resource.soft 정확 1회 + 이월 ──
         r7 = new_root("c7")
@@ -3580,7 +3724,9 @@ def self_test(a=None):
           "콜드 스타트(빈 루트) 동시 8건 무손실 / 4차: 복원중 결정보존(H1)·전멸 마스킹 차단"
           "(H2)·task_key 조인 유일성(H3)·복원 무한루프 차단(M1)·창 결정론 확대(M5) / "
           "착지: submit 경유 escalation fallback(F1)·소비자 절단 마진 실측(F2)·"
-          "전멸 재출발 복원 SOT 재수립(F3) 전 케이스 통과")
+          "전멸 재출발 복원 SOT 재수립(F3) / ★E2-4 R-03(미바인딩 loud 고지 1줄+"
+          "routing_unbound 원장+경보 마커 코얼레싱 · label_bindings 실라벨 해소 후 고지 소멸+"
+          "실대상 배달 · env 라벨 오버라이드) 전 케이스 통과")
     return 0
 
 

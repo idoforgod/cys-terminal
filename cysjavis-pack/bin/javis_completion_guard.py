@@ -11,13 +11,27 @@ D2·D3·D5·D20·D27. 래퍼 = hooks/completion-guard.sh(14줄·무수정) — s
     exit 0(파일 stat 0회 — 완전 무발동).
   · 태스크 바인딩 = 파일 계약: javis_task checkout 이 쓰는
     `$JAVIS_ROOT/_round/tasks/.guard-claim.<surface>` (task_id·pid·ts). 부재 = 즉시 exit 0
-    (조건 23④ — 전수 스캔 금지·stat 1개). stale(pid 사망 or mtime 24h 초과) = 무시 exit 0
-    + 경보 1회. claim task_id 는 javis_task G10 allowlist 정규식 재사용으로 재검증(F8
-    심층방어) — 불일치 = claim-corrupt 경로(경보 1회 + exit 0).
+    (조건 23④ — 전수 스캔 금지·stat 1개). claim task_id 는 javis_task G10 allowlist 정규식
+    재사용으로 재검증(F8 심층방어) — 불일치 = claim-corrupt 경로(경보 1회 + exit 0).
     ★이음매 자인(F3): 표준 플로우에서 checkout 은 master pane 에서 실행되므로 그대로는
     claim 이 master surface 에 기록돼 워커 pane 의 guard 가 무발동한다 — master 는
     `javis_task checkout --claim-surface <워커 sid>` 로 위임 대상 워커 surface 에 claim 을
     기록하거나, 워커가 자기 pane 에서 동일-owner 재checkout(멱등 재진입)해야 한다.
+    ★E2-1(BLOCKER R-02) claim 생존 판정 재정의: 종전은 `pid 사망 = stale`이었는데 그 pid 는
+    **checkout 을 실행한 master 셸**의 것이라, master `/clear`·재기동만으로 워커 guard 가
+    영구 exit 0 이 됐다(무장했는데 아무것도 검증 안 함 = 정상과 구분 불가). 지금은
+    `_claim_liveness()` 가 ①claim mtime 24h 초과 = stale ②태스크 레코드가 활성
+    (in_progress|in_review) ∧ 신선 = **유효**(pid 사망이어도 유지 · 정보성 경보 1회)
+    ③그 밖 = pid 생존 여부로 판정한다. 즉 pid 는 **보조 신호로 강등**됐고 1차 근거는
+    "이 태스크가 아직 열려 있는가"라는 검증 가능한 사실이다. writer 짝은 javis_task 가
+    위임 경로에서 pid 를 아예 기록하지 않는 것(`--claim-pid` 명시 시에만 기록).
+  · ★E2-1(c) 침묵 탐지기 — 침묵형 결함의 일반 방어: 무장 상태에서 **아무것도 검증하지 않고
+    종결**(claim 부재/손상/stale·disarm·SKIPPED_*)한 횟수를 `.guard-silence.<surface>.json`
+    에 연속 계수하고, 임계(기본 5 · env CYS_GUARD_SILENCE_N)에서 경보 1회를 낸다. 실제
+    verify 가 1회라도 돌면 스트릭을 끊는다(파일 삭제). 부트 짝은 preflight C72 WARN —
+    "무장인데 침묵 지속"을 런타임·부트 2경로에서 표면화한다. **무장 ≠ 발동**이라는 사실
+    자체를 관측 가능하게 만드는 장치이며, 이 파일 밖의 다른 침묵 경로에도 같은 형태로
+    적용할 수 있다.
   · 판정 enum 10종: PASS | VERIFY_FAIL | SKIPPED_NO_SPEC | SKIPPED_BUDGET | SKIPPED_RESOURCE |
     SKIPPED_CONTEXT | SKIPPED_CYCLE | SKIPPED_GRACE | NO_BLOCK_PASS | INFRA_ERROR.
     **exit 2 는 오직 VERIFY_FAIL** — 그 외 모든 경로는 exit 0(무조건 exit 2 경로 부재를
@@ -55,8 +69,19 @@ D2·D3·D5·D20·D27. 래퍼 = hooks/completion-guard.sh(14줄·무수정) — s
     INFRA_ERROR 로 상태 적재(infra_count++·timeout_violations++·guard.json 기록 — 회로차단기
     편입)·escalated_at 저장~_escalate 사이 발화 시 esc-bundle 을 핸들러가 보강 기록한다.
     각 attempt 진입 전 `(경과+timeout_s) > 데드라인−여유 5s` 검사로 잔여 attempt 를 조기
-    INFRA 종결(n_of_m 누적이 데드라인을 초과할 수 없음). 외곽은 래퍼
-    hooks/completion-guard.sh 의 `timeout 60`(존재 시) — 60 > 50 > 30 3중 상한.
+    INFRA 종결(n_of_m 누적이 데드라인을 초과할 수 없음).
+    ★상한 사다리 정정(E1-2 · BLOCKER R-01 — 종전 문면 "60>50>30 3중 상한"은 이 배포 환경에서
+    사실이 아니었다): coreutils `timeout` 이 없는 기계(macOS 기본 · 실측 rc=1)에서는 래퍼
+    분기가 항상 폴백이었고 등록 도구도 settings 항목에 `timeout` 을 넣지 않아 **바깥 두 겹이
+    동시에 부재**했다 — 실효는 SIGALRM 50s 1겹. 지금의 겹은 환경 무관하게 4겹이다:
+      ① verify 개별 30s(VERIFY_TIMEOUT_MAX) ② 자체 데드라인 50s(POSIX=SIGALRM + **전 플랫폼
+      워치독 스레드** `_arm_self_deadline` — Windows 는 워치독이 유일 겹) ③ 래퍼 외곽 60s
+      (`cys_timeout_run`: timeout→gtimeout→CYS_PY 실행기라 coreutils 부재에도 존재)
+      ④ settings 훅 항목 `"timeout": 60`(javis_guard_register 가 등록 시 기입).
+    ★플랫폼 분기(E1-3 · BLOCKER R-09): `/bin/sh` 하드코딩 → `_shell_argv`(nt=COMSPEC),
+    killpg → `_win_taskkill`(`taskkill /T /F`), setsid → `CREATE_NEW_PROCESS_GROUP`.
+    다만 **Windows 노드는 기본 무장 거부**(`_windows_arming_refusal` · opt-in
+    `CYS_GUARD_ALLOW_WINDOWS=1`) — 거부는 상태 파일 생성 전이라 INFRA 누적·영구 disarm 0.
   · 블록: 재주입 head 1KB+tail 3KB 캡·전문 `<id>.verify_out.log`·기계 접두 stderr(조건 19②).
     블록 카운터 N=3 에서 escalation 전환(조건 08 채택 — 01③/23⑤/29 의 N=5 supersede).
     N≥8 설정은 코드 거부(하네스 cap+1=9 천장 · D2).
@@ -87,6 +112,11 @@ D2·D3·D5·D20·D27. 래퍼 = hooks/completion-guard.sh(14줄·무수정) — s
   · Stop hook stdin(JSON)은 소비하되 transcript_path 의 **내용은 절대 파싱하지 않는다**
     (D5 — "D2 200k 전과" 금지 명문).
 
+서브커맨드(E2-2 — Stop 훅 경로와 분리·명시 argv 로만 진입):
+  budget-init [--max-runs N] [--max-secs S] [--force]   verifier tax 활성화(디렉터리+policy.json)
+  budget-status [--json]                                 tax 활성/비활성·한도·현재 창 소비 조회
+  ※ 되돌리기 = `rm -rf $JAVIS_ROOT/_round/verify-budget` (부재 = 무제한 통과로 즉시 복귀).
+
 exit: 0 = 통과/양보/인프라(fail-open 전부) · 2 = VERIFY_FAIL 블록만.
       --self-test: 0 = 전부 통과 · 1 = 실패.
 
@@ -98,6 +128,7 @@ env 노브(테스트 주입 포함):
   CYS_GUARD_GRACE_SEC           부트 grace 창(기본 120)
   CYS_GUARD_BOOT_MARKER         role-bootstrap 완료 마커 경로(기본 ~/.cys/.master-bootstrapped)
   CYS_GUARD_LIVENESS=alive|dead claim pid 생존 결정론 주입(javis_task LIVENESS 관례)
+  CYS_GUARD_SILENCE_N           E2-1(c) 침묵 경보 임계 — 연속 무검증 종결 횟수(기본 5·<1 무시)
   CYS_GUARD_RESOURCE_ARGS       resource_gate 추가 인자(테스트 override 주입용 공백 구분)
   CYS_BIN                       cys 바이너리(기본 cys — 테스트는 PATH shim)
   JAVIS_VERIFY_BUDGET_RUNS      B2: verifier tax 창당 실행 상한(기본 60 — policy.json 보다 우선)
@@ -111,6 +142,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -130,7 +162,8 @@ EXIT_PASS, EXIT_BLOCK = 0, 2
 CTX_YIELD_PCT = 50.0          # §2-2 3단 — ctx≥50% = context yield(resource_gate soft 와 동일선)
 CYCLE_TTL_SEC = 30 * 60       # §2-2 1단 R1 — 만료 마커는 무시(고아화 영구 SKIP 차단)
 GRACE_SEC_DEFAULT = 120.0     # §2-2 2단 · 조건 04④
-CLAIM_STALE_SEC = 24 * 3600   # §2-1 — pid 사망 or 24h 초과 = stale
+CLAIM_STALE_SEC = 24 * 3600   # §2-1 — mtime 24h 초과 = stale(E2-1: pid 단독 판정은 폐기)
+ACTIVE_STATUSES = ("in_progress", "in_review")  # E2-1(a) — claim 생존의 1차 근거(javis_task 어휘)
 ALERT_TTL_SEC = 6 * 3600      # '경보 1회(세션 코얼레싱)' 마커 창
 ESC_N_DEFAULT = 3             # §2-3 — 조건 08 채택(N=5 supersede)
 ESC_N_CEILING = 8             # D2 — 하네스 cap+1=9 천장: N≥8 설정 코드 거부
@@ -138,6 +171,7 @@ VERIFY_TIMEOUT_DEFAULT = 10.0
 VERIFY_TIMEOUT_MAX = 30.0     # 조건 23① — 래퍼/설정 timeout 과 3중 상한의 자체 몫
 SELF_DEADLINE_SEC = 50        # U1 — 훅 기본 타임아웃 미의존 자체 데드라인
 DEADLINE_MARGIN_SEC = 5.0     # F1 — attempt 예산 검사 여유(경과+timeout_s > 데드라인−여유 = 조기 INFRA)
+WATCHDOG_MARGIN_SEC = 8       # E1-2/E1-3 — POSIX 워치독은 SIGALRM 뒤(50+8=58 < 래퍼 외곽 60)
 STOP_BLOCK_CAP_DEFAULT = 8    # F2 — 하네스 Stop 블록 상한 기본(CLAUDE_CODE_STOP_HOOK_BLOCK_CAP)
 HEAD_CAP, TAIL_CAP = 1024, 3072   # 조건 08 — 재주입 4KB 캡
 VERIFY_LOG_MAX = 8 * 1024 * 1024  # 전문 로그 상한(비대 방어 — 절단 표기)
@@ -165,15 +199,98 @@ def _self_deadline():
     return v if v >= 1 else SELF_DEADLINE_SEC
 
 
+def _windows_arming_refusal():
+    """E1-3(BLOCKER R-09): Windows 노드 **기본 무장 거부** 사유 1줄(허용이면 None).
+
+    오너가 특별 경고한 축이다("윈도우 설치파일에서 에러·코드 깨짐이 자주 발생한다"). 이 파일의
+    POSIX 전용 호출은 전부 분기됐지만(`_shell_argv`·`_popen_group`·`_kill_active_groups`·
+    `_arm_self_deadline`), **실기 Windows 회귀 하네스가 0**이다 — self-test 는 `os.mkfifo`
+    의존 케이스를 갖고 있어 Windows 실행 자체가 불완전하다. 검증되지 않은 플랫폼에서 turn 을
+    막는 게이트를 켜는 것은 "전 pane 에이전트 사망"(결함군 ④)의 가장 짧은 경로다.
+
+    그래서 **기능 자체를 비활성**한다(무장 거부 + stderr 고지). 핵심은 거부 시점이다:
+    상태 파일·claim·guard.json 을 만들기 **전**이라 `INFRA_ERROR` 가 한 번도 계상되지 않고,
+    따라서 `infra_count≥3 → guard-disarmed` 영구 잠금도 발생하지 않는다(브리프 E1-3 요구).
+    검증을 마친 뒤 켜려면 `CYS_GUARD_ALLOW_WINDOWS=1` 을 명시한다(분기 코드는 이미 산다).
+    """
+    if os.name != "nt" or os.environ.get("CYS_GUARD_ALLOW_WINDOWS") == "1":
+        return None
+    return ("Windows 노드는 기본 무장 거부(E1-3/R-09) — 플랫폼 분기는 구현됐으나 실기 회귀 "
+            "하네스가 없어 미검증이다. 상태 파일 생성 전에 끊으므로 INFRA 누적·영구 disarm 은 "
+            "일어나지 않는다. 검증 후 켜려면 CYS_GUARD_ALLOW_WINDOWS=1.")
+
+
+def _arm_self_deadline(deadline):
+    """자체 데드라인 무장 → **해제 콜러블** 반환(E1-2 R-01 · E1-3 R-09 공통 수리).
+
+    2겹으로 건다:
+      ① POSIX SIGALRM(deadline) — `_Deadline` 예외를 던져 **graceful** 종결(`_on_deadline`
+         이 killpg + INFRA 적재 + esc-bundle 보강까지 한다). 종전 유일한 겹.
+      ② 전 플랫폼 워치독 스레드(deadline + 여유) — 종전엔 없었다.
+         · Windows 에는 SIGALRM 이 아예 없어 **자체 상한이 0겹**이었다(R-09: "남는 상한은
+           하네스 기본 훅 타임아웃뿐이고 그때 verify 자식은 고아").
+         · POSIX 에서도 의미가 있다: SIGALRM 핸들러는 인터프리터가 제어를 되찾아야 실행되지만,
+           워치독 스레드는 주 스레드가 GIL 을 놓은 블로킹 C 호출에 갇혀 있어도 돈다.
+      워치독은 최후 수단이라 graceful 경로를 best-effort 로 한 번 시도한 뒤 `os._exit(0)` 한다
+      — **어떤 경우에도 블록(2)으로 승격하지 않는다**(조건 14·19 fail-open 계약).
+    """
+    fired = {"v": False}
+
+    def _watchdog():
+        fired["v"] = True
+        print("[completion-guard] 워치독 데드라인 %ds 초과 — 프로세스 그룹 정리 후 강제 "
+              "fail-open(exit 0)" % deadline, file=sys.stderr, flush=True)
+        _kill_active_groups()
+        with contextlib.suppress(Exception):
+            _on_deadline("자체 데드라인 %ds 초과(워치독 %s)"
+                         % (deadline, "primary" if os.name != "posix" else "backstop"))
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+        os._exit(EXIT_PASS)   # noqa: SLF001 — 스레드에서 프로세스를 끝내는 유일한 수단
+
+    # POSIX 는 SIGALRM 이 먼저 잡으므로 워치독은 여유를 두고 뒤에 선다(백스톱).
+    # Windows 는 워치독이 유일한 겹이라 여유 없이 deadline 에 선다.
+    margin = WATCHDOG_MARGIN_SEC if os.name == "posix" else 0
+    timer = threading.Timer(deadline + margin, _watchdog)
+    timer.daemon = True
+    timer.start()
+    if os.name == "posix":
+        signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(_Deadline()))
+        signal.alarm(deadline)
+
+    def _disarm():
+        with contextlib.suppress(Exception):
+            timer.cancel()
+        if os.name == "posix":
+            with contextlib.suppress(Exception):
+                signal.alarm(0)
+    return _disarm
+
+
+def _win_taskkill(pid):
+    """E1-3(R-09): Windows 프로세스 **트리** 종료 — killpg 대응물(`taskkill /T /F`).
+
+    POSIX 의 `os.killpg(pgid, SIGKILL)` 은 그룹 전체(손자 포함)를 죽인다. Windows 에는 그
+    개념이 없어 종전 코드는 `_ACTIVE_PGIDS.clear()` 로 **set 만 비우고 아무도 죽이지 않았다**
+    (고아 잔존). `taskkill /T` 가 자식 트리를 따라간다 — 도구 부재·이미 종료는 무해 통과.
+    """
+    with contextlib.suppress(Exception):
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+
+
 def _kill_active_groups():
-    """F1: 추적 중인 verify 프로세스 그룹 전부 killpg(SIGKILL) — 고아 0 계약."""
-    if os.name != "posix":
-        _ACTIVE_PGIDS.clear()
-        return
-    for pgid in list(_ACTIVE_PGIDS):
-        with contextlib.suppress(OSError):
-            os.killpg(pgid, signal.SIGKILL)
-        _ACTIVE_PGIDS.discard(pgid)
+    """F1: 추적 중인 verify 프로세스 그룹 전부 종료(고아 0 계약).
+
+    POSIX = killpg(SIGKILL) / Windows = taskkill /T /F(E1-3 · R-09 — 종전엔 set 만 비웠다).
+    """
+    for pid in list(_ACTIVE_PGIDS):
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+        else:
+            _win_taskkill(pid)
+        _ACTIVE_PGIDS.discard(pid)
 
 
 def _stop_block_cap():
@@ -330,6 +447,106 @@ def _alert_once(sid, kind, evt_type, fields):
         with open(mark, "w", encoding="utf-8") as f:
             f.write(_now() + "\n")
     return True
+
+
+# ── E2-1(a): claim 생존 판정 — pid 는 보조 신호, 태스크 레코드 상태가 1차 ──────
+def _claim_liveness(claim, claim_p, task_id):
+    """(live: bool, why: str) — claim 이 아직 살아 있는가.
+
+    ★BLOCKER R-02 교정. 종전 판정은 `pid 사망 = stale`이었고, 표준 플로우에서 그 pid 는
+    **checkout 을 실행한 master 셸**의 것이었다. master 가 `/clear`·재기동하면 pid 가 죽고
+    워커 guard 는 claim 을 stale 로 보고 **영구 exit 0** 한다 — 무장했는데 아무것도 검증하지
+    않는 상태가 정상 동작과 구분되지 않는다(카나리아 1일차 통과·2일차 침묵).
+
+    새 판정 순서(브리프 처방 (a)):
+      1) claim mtime > 24h  → stale (종전 유지 — 절대 상한)
+      2) 태스크 레코드가 **활성**(status ∈ in_progress|in_review) ∧ 레코드 신선(mtime ≤ 24h)
+         → **claim 유효**. pid 생존 여부는 보조 신호로 강등한다(죽어 있으면 정보성 경보 1회).
+      3) 그 밖 → pid 생존이면 유효, pid 부재/사망이면 stale.
+    즉 "누구의 pid 인가"라는 답할 수 없는 질문 대신 "이 태스크가 아직 열려 있는가"라는
+    **검증 가능한 사실**로 판정한다. 태스크가 done/cancelled 로 닫히면 checkout 측
+    `_remove_guard_claims` 가 claim 을 소거하므로 이 경로는 고아 claim 만 남는다.
+    """
+    try:
+        if time.time() - os.stat(claim_p).st_mtime > CLAIM_STALE_SEC:
+            return False, "claim mtime 24h 초과"
+    except OSError:
+        return False, "claim stat 실패"
+    pid = claim.get("pid")
+    pid_live = _pid_alive(pid) if pid is not None else False
+    task, terr = _read_json(os.path.join(TASKS_DIR, "%s.json" % task_id))
+    status = (task or {}).get("status")
+    fresh = False
+    if task is not None:
+        with contextlib.suppress(OSError):
+            fresh = (time.time()
+                     - os.stat(os.path.join(TASKS_DIR, "%s.json" % task_id)).st_mtime
+                     ) <= CLAIM_STALE_SEC
+    if status in ACTIVE_STATUSES and fresh:
+        why = "태스크 활성(status=%s)" % status
+        if not pid_live:
+            why += " · pid(%r·%s) 사망/부재 — 보조 신호로 강등" % (
+                pid, claim.get("pid_source") or "unknown")
+        return True, why
+    if pid_live:
+        return True, "pid %s 생존(태스크 status=%s)" % (pid, status)
+    if terr == "absent":
+        return False, "pid %r 사망/부재 ∧ 태스크 레코드 부재" % pid
+    return False, "pid %r 사망/부재 ∧ 태스크 비활성(status=%s·fresh=%s)" % (pid, status, fresh)
+
+
+# ── E2-1(c): 침묵 탐지기 — "무장했는데 연속 N회 아무것도 검증하지 않음" ────────
+#    침묵형 결함의 일반 처방이다. guard 뿐 아니라 어떤 게이트든 "무장 = 발동"이 아니고
+#    "무장 ∧ 조건 충족 = 발동"인 이상, 조건이 조용히 영영 거짓이 되는 경로가 존재한다.
+#    그 상태는 **정상 동작과 관측적으로 구분되지 않는다**(둘 다 exit 0·둘 다 무음).
+#    여기서는 무검증 종결을 연속 계수하고 임계에서 1회 경보 + 상태 파일을 남긴다
+#    (preflight C72 가 부트 시 그 파일을 WARN 으로 표면화한다 — 런타임·부트 2경로).
+SILENCE_N_DEFAULT = 5     # 연속 무검증 종결 임계(카나리아 1세션 기준 보수측)
+
+
+def _silence_n():
+    raw = os.environ.get("CYS_GUARD_SILENCE_N", "").strip()
+    try:
+        n = int(raw) if raw else SILENCE_N_DEFAULT
+    except ValueError:
+        return SILENCE_N_DEFAULT
+    return n if n >= 1 else SILENCE_N_DEFAULT
+
+
+def _silence_path(sid):
+    return os.path.join(TASKS_DIR, ".guard-silence.%s.json" % (sid or "nosid"))
+
+
+def _silence_note(sid, reason, task_id=None):
+    """무검증 종결 1회 계수 — 임계 도달 시 경보 1회(_alert_once 코얼레싱). best-effort."""
+    path = _silence_path(sid)
+    rec, _e = _read_json(path)
+    if not isinstance(rec, dict) or rec.get("schema_version") != 1:
+        rec = {"schema_version": 1, "streak": 0, "first_ts": _now(), "alerted_at": None}
+    rec["streak"] = int(rec.get("streak", 0) or 0) + 1
+    rec["last_ts"] = _now()
+    rec["last_reason"] = reason
+    rec["last_task"] = task_id
+    rec["threshold"] = _silence_n()
+    if rec["streak"] >= _silence_n():
+        fired = _alert_once(
+            sid, "guard-silent", "agent.error",
+            {"agent": _role(),
+             "summary": "[completion-guard][침묵 탐지] 무장(CYS_COMPLETION_GUARD=1)인데 "
+                        "연속 %d회 아무것도 검증하지 않고 종결했다(최근 사유: %s · task=%s). "
+                        "무장≠발동 — claim 소유/바인딩을 확인하라"
+                        % (rec["streak"], reason, task_id or "-")})
+        if fired:
+            rec["alerted_at"] = _now()
+    with contextlib.suppress(OSError):
+        _write_json_atomic(path, rec)
+    return rec["streak"]
+
+
+def _silence_reset(sid):
+    """실제 검증이 1회라도 돌면 침묵 스트릭을 끊는다(파일 삭제 = 무침묵 상태의 결정론 표현)."""
+    with contextlib.suppress(OSError):
+        os.remove(_silence_path(sid))
 
 
 # ── guard.json(guard_state) — §2-4 스키마·손상 격리 재생성 ────────────────────
@@ -600,6 +817,98 @@ def _budget_record(sid, secs):
         _write_json_atomic(path, shard)
 
 
+def budget_state():
+    """(active: bool, detail: dict) — verifier tax 활성 상태의 단일 판독 진실.
+
+    ★E2-2(BLOCKER R-07): tax 는 `_round/verify-budget/` **디렉터리 부재 = 무제한 통과**
+    (기본 OFF)인데, 종전에는 ①그 디렉터리를 만드는 생성자가 팩 전체에 0건이었고 ②활성화
+    절차가 어디에도 없었으며 ③OT-2 §2.8 은 "영원히 생기지 않는 파일"을 관찰하라고 지시했다
+    ⇒ 운영자는 "압력 없음"이라는 **거짓 확신**을 얻는다. 이 함수 + `budget-init` 서브커맨드
+    + preflight C72 의 상태 1줄이 그 침묵을 깬다(활성/비활성을 **말하게** 만든다).
+    """
+    active = os.path.isdir(BUDGET_DIR)
+    max_runs, max_secs = _budget_limits()
+    d = {"budget_dir": BUDGET_DIR, "active": active,
+         "policy_present": os.path.isfile(os.path.join(BUDGET_DIR, "policy.json")),
+         "max_runs": max_runs, "max_secs": max_secs,
+         "env_override": {
+             "JAVIS_VERIFY_BUDGET_RUNS": os.environ.get("JAVIS_VERIFY_BUDGET_RUNS") or None,
+             "JAVIS_VERIFY_BUDGET_SECS": os.environ.get("JAVIS_VERIFY_BUDGET_SECS") or None}}
+    if active:
+        exhausted, detail, stats = _budget_check()
+        d.update({"exhausted": exhausted, "usage": detail,
+                  "window": (stats or {}).get("window"),
+                  "shards": len([n for n in os.listdir(BUDGET_DIR)
+                                 if n.endswith(".json") and n != "policy.json"])
+                  if os.path.isdir(BUDGET_DIR) else 0})
+    return active, d
+
+
+def cmd_budget(argv):
+    """`budget-init` / `budget-status` — verifier tax 활성화·되돌리기·상태 조회(E2-2).
+
+    되돌리기는 **디렉터리 삭제 1개**다: `rm -rf $JAVIS_ROOT/_round/verify-budget`
+    (부재 = 무제한 통과로 즉시 복귀 — 코드 변경·재배포 불필요). 활성/비활성 전환은 어느
+    방향이든 guard 판정을 **차단 방향으로 바꾸지 않는다**(소진 = SKIPPED_BUDGET = exit 0).
+    """
+    sub = argv[0]
+    args = argv[1:]
+    as_json = "--json" in args
+    if sub == "budget-status":
+        active, d = budget_state()
+        if as_json:
+            print(json.dumps(d, ensure_ascii=False, indent=1))
+        else:
+            print("verifier tax: %s" % ("활성(ON)" if active else "비활성(OFF — 무제한 통과)"))
+            print("  디렉터리: %s (%s)" % (BUDGET_DIR, "존재" if active else "부재"))
+            print("  policy.json: %s" % ("있음" if d["policy_present"] else "없음(기본값 사용)"))
+            print("  유효 한도: %d회 / %.0f초 (1h 고정창)" % (d["max_runs"], d["max_secs"]))
+            if active:
+                print("  현재 창 소비: %s · 샤드 %d개 · 소진=%s"
+                      % (d.get("usage"), d.get("shards", 0), d.get("exhausted")))
+            else:
+                print("  ⚠ 비활성 상태에서는 `_round/verify-budget/*.json` 샤드가 "
+                      "**영원히 생기지 않는다** — 샤드 관찰 지시는 활성화 이후에만 유효하다.")
+        return 0
+    # ── budget-init ──
+    force = "--force" in args
+    max_runs, max_secs = BUDGET_MAX_RUNS_DEFAULT, BUDGET_MAX_SECS_DEFAULT
+    for i, tok in enumerate(args):
+        if tok == "--max-runs" and i + 1 < len(args):
+            with contextlib.suppress(ValueError):
+                max_runs = int(args[i + 1])
+        if tok == "--max-secs" and i + 1 < len(args):
+            with contextlib.suppress(ValueError):
+                max_secs = float(args[i + 1])
+    if max_runs <= 0 or max_secs <= 0:
+        print("budget-init 거부: 한도는 양수여야 한다(0/음수 = 상시 소진 footgun · G7b)",
+              file=sys.stderr)
+        return 2
+    pol_p = os.path.join(BUDGET_DIR, "policy.json")
+    if os.path.isfile(pol_p) and not force:
+        cur, _e = _read_json(pol_p)
+        print("이미 활성: %s (기존 policy=%r) — 덮어쓰려면 --force" % (BUDGET_DIR, cur))
+        return 0
+    try:
+        os.makedirs(BUDGET_DIR, exist_ok=True)
+        _write_json_atomic(pol_p, {
+            "schema_version": 1, "max_runs": max_runs, "max_secs": max_secs,
+            "window_sec": BUDGET_WINDOW_SEC, "created_at": _now(),
+            "note": "verifier tax 정책(B2 §3). 초기값은 카나리아 실측 전 보수 추정이다 — "
+                    "1시간 관찰 후 샤드 실측치로 조정하라. 되돌리기 = 이 디렉터리 삭제."})
+    except OSError as e:
+        print("budget-init 실패: %s" % e, file=sys.stderr)
+        return 1
+    print("verifier tax 활성화 완료")
+    print("  1) 디렉터리: %s" % BUDGET_DIR)
+    print("  2) policy.json: max_runs=%d · max_secs=%.0f · window_sec=%d"
+          % (max_runs, max_secs, BUDGET_WINDOW_SEC))
+    print("  3) 1시간 뒤 실측: python3 %s budget-status  (샤드 소비량 확인 후 한도 조정)"
+          % os.path.basename(__file__))
+    print("  되돌리기: rm -rf %s  (부재 = 무제한 통과 · 코드 변경 불필요)" % BUDGET_DIR)
+    return 0
+
+
 def _maybe_demote_calibrated(task_id, state, spec):
     """B2(조건 07②): timeout_violations ≥2 → verify_spec.calibrated=false 자동 강등 전이.
     집행은 javis_task `set-verify-spec <id> --demote-calibrated` 위임 — 레코드 갱신이
@@ -659,18 +968,40 @@ def _warn_armed_combo(sid):
 
 
 # ── verify 실행(setsid 그룹 + killpg — §2-2·조건 07③·23) ────────────────────
+def _shell_argv(cmd):
+    """E1-3(R-09): mode=command 의 셸 실행 argv — 플랫폼 분기.
+
+    종전: `["/bin/sh", "-c", cmd]` 하드코딩. Windows 에는 `/bin/sh` 가 없어 **모든** command
+    태스크가 `FileNotFoundError` → `INFRA_ERROR` 로 수렴하고, 3연속이면 태스크마다
+    `guard-disarmed` + critical wakeup 이 터진다(결함군 ① 폭주와 교차). 이제 `COMSPEC`
+    (기본 `cmd.exe`)로 분기한다 — 무장 자체가 기본 거부이므로 이 경로는 명시 opt-in 시에만
+    돈다(아래 `_windows_arming_refusal`).
+    """
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/c", cmd]
+    return ["/bin/sh", "-c", cmd]
+
+
 def _popen_group(argv, cwd, timeout):
-    """프로세스 그룹 실행 → (rc, out_text, timed_out, survivors). 종료 시 그룹 정리(killpg)."""
+    """프로세스 그룹 실행 → (rc, out_text, timed_out, survivors). 종료 시 그룹 정리.
+
+    POSIX = setsid 그룹 + killpg / Windows = CREATE_NEW_PROCESS_GROUP + taskkill /T(E1-3).
+    """
     kw = {}
     if os.name == "posix":
         kw["start_new_session"] = True  # setsid — 그룹 리더로 스폰
+    else:
+        # E1-3: 새 프로세스 그룹으로 스폰 — 부모(훅)의 Ctrl 이벤트가 verify 로 전파되지 않고,
+        #       종료는 taskkill /T 가 트리를 따라간다.
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     p = subprocess.Popen(argv, cwd=cwd or None, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
-    if os.name == "posix":
-        # F1: 활성 그룹 등록 — _Deadline·최상위 예외로 이 함수가 중도 이탈하면 등록이 남고,
-        #     핸들러(_kill_active_groups)가 killpg 로 정리한다. finally 해제는 금지 —
-        #     예외 unwinding 중 해제되면 핸들러가 죽일 대상을 잃는다(고아 재발).
-        _ACTIVE_PGIDS.add(p.pid)
+    # F1: 활성 그룹 등록 — _Deadline·최상위 예외로 이 함수가 중도 이탈하면 등록이 남고,
+    #     핸들러(_kill_active_groups)가 정리한다. finally 해제는 금지 — 예외 unwinding 중
+    #     해제되면 핸들러가 죽일 대상을 잃는다(고아 재발).
+    #     ★E1-3: 종전엔 posix 에서만 등록해 Windows 는 데드라인 경로의 정리 대상이 **아예
+    #     없었다**(고아 확정). 이제 전 플랫폼 등록하고 종료 수단만 분기한다.
+    _ACTIVE_PGIDS.add(p.pid)
     timed_out = False
     try:
         out, _ = p.communicate(timeout=timeout)
@@ -680,7 +1011,9 @@ def _popen_group(argv, cwd, timeout):
             with contextlib.suppress(OSError):
                 os.killpg(p.pid, signal.SIGKILL)
         else:
-            p.kill()
+            _win_taskkill(p.pid)   # E1-3: 트리 종료(자식만 kill 하면 손자가 파이프를 붙잡는다)
+            with contextlib.suppress(Exception):
+                p.kill()
         with contextlib.suppress(Exception):
             out, _ = p.communicate(timeout=5)
         out = out or b""
@@ -803,7 +1136,7 @@ def _run_verify(spec, task_id, sid):
             return {"verdict": "INFRA_ERROR", "rc": None, "out": "",
                     "detail": "cmd 부재(spec 파싱 실패 취급)", "elapsed": 0.0,
                     "timed_out_any": False, "survivors_any": False}
-        runner = ("sh", ["/bin/sh", "-c", cmd], spec.get("cwd"))
+        runner = ("sh", _shell_argv(cmd), spec.get("cwd"))   # E1-3(R-09): 플랫폼 분기
     else:
         return {"verdict": "INFRA_ERROR", "rc": None, "out": "",
                 "detail": "mode 미지(%r) — spec 파싱 실패 취급" % (mode,), "elapsed": 0.0,
@@ -1082,12 +1415,14 @@ def _hook_main():
     # 2) claim 바인딩 — stat 1개(조건 23④).
     claim_p = _claim_path(sid)
     if not os.path.isfile(claim_p):
+        _silence_note(sid, "claim 부재")   # E2-1(c) 침묵 계수
         return EXIT_PASS
     claim, cerr = _read_json(claim_p)
     if cerr == "corrupt" or not claim or not claim.get("task_id"):
         _alert_once(sid, "claim-corrupt", "agent.error",
                     {"agent": _role(),
                      "summary": "[completion-guard] guard-claim 파싱 실패(%s) — INFRA 무발동" % claim_p})
+        _silence_note(sid, "claim 손상")
         return EXIT_PASS
     task_id = str(claim["task_id"])
     # F8: claim task_id 심층방어 — javis_task G10 allowlist 재사용 검증(경로 조합 전).
@@ -1098,24 +1433,27 @@ def _hook_main():
                     {"agent": _role(),
                      "summary": "[completion-guard] guard-claim task_id allowlist 불일치(%r)"
                                 " — claim-corrupt 무발동" % task_id[:80]})
+        _silence_note(sid, "claim task_id 불일치")
         return EXIT_PASS
-    # stale claim(§2-1): pid 사망 or mtime 24h 초과 = 무시 + 경보 1회.
-    stale_why = None
-    try:
-        if time.time() - os.stat(claim_p).st_mtime > CLAIM_STALE_SEC:
-            stale_why = "mtime 24h 초과"
-    except OSError:
-        stale_why = "claim stat 실패"
-    if stale_why is None and not _pid_alive(claim.get("pid")):
-        stale_why = "pid %s 사망" % claim.get("pid")
-    if stale_why:
+    # stale claim(§2-1 · E2-1(a) 재정의): mtime 24h 초과 = stale. pid 는 **보조 신호**이고
+    # 1차 판정은 태스크 레코드 상태다(master 셸 pid 사망이 워커 무장을 끄던 R-02 이음매 차단).
+    claim_live, claim_why = _claim_liveness(claim, claim_p, task_id)
+    if not claim_live:
         _alert_once(sid, "claim-stale", "agent.error",
                     {"agent": _role(),
                      "summary": "[completion-guard] stale claim(%s · task=%s) — 무시 exit 0"
-                                % (stale_why, task_id)})
+                                % (claim_why, task_id)})
+        _silence_note(sid, "stale claim(%s)" % claim_why, task_id)
         return EXIT_PASS
+    if "보조 신호로 강등" in claim_why:
+        # 정보성 1회 — "pid 는 죽었지만 태스크가 살아 있어 계속 무장한다"를 표면화한다.
+        _alert_once(sid, "claim-pid-demoted", "agent.error",
+                    {"agent": _role(),
+                     "summary": "[completion-guard] claim pid 강등 판정(%s · task=%s) — "
+                                "태스크 활성이라 무장 유지(R-02 교정 경로)" % (claim_why, task_id)})
     # 3) 회로차단기 disarm — 이후 무발동(재무장=master 가 마커 삭제).
     if os.path.isfile(_disarm_path(task_id)):
+        _silence_note(sid, "회로차단기 disarm(%s)" % task_id, task_id)
         return EXIT_PASS
     # 3b) G6: 무장 조합 위험 경보 — 무장 guard 가 실제 발동(claim 유효)한 시점에 1회
     #     (에피소드 코얼레싱 — _alert_once). best-effort·판정 불개입.
@@ -1234,7 +1572,8 @@ def _hook_main():
     spec = task.get("verify_spec")
     if not isinstance(spec, dict) or not spec:
         return _finish_skip(state, "SKIPPED_NO_SPEC")
-    # ── verify 실행 ──
+    # ── verify 실행 ── (E2-1(c): 여기까지 왔다 = 실제로 검증한다 = 침묵 스트릭 절단)
+    _silence_reset(sid)
     res = _run_verify(spec, task_id, sid)
     if res.get("timed_out_any"):
         state["timeout_violations"] = int(state.get("timeout_violations", 0)) + 1
@@ -1300,8 +1639,14 @@ def _hook_main():
 
 
 def _finish_skip(state, verdict):
+    """양보·건너뜀 종결. E2-1(c): **양보는 통과가 아니다** — SKIPPED_* 는 "검증하지 않았다"의
+    다른 이름이라 침묵 스트릭에 계수한다(sid 는 state 적재 시 함께 박힌 _DEADLINE_CTX 재사용
+    — 호출부 6곳 시그니처 churn 회피). NO_BLOCK_PASS 는 verify 를 **실행**했으므로 여기로
+    오지 않는다(별도 경로)."""
     state["last_verdict"] = verdict
     _save_guard_state(state)
+    with contextlib.suppress(Exception):
+        _silence_note(_DEADLINE_CTX.get("sid"), verdict, state.get("task_id"))
     return EXIT_PASS
 
 
@@ -1362,13 +1707,22 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--self-test" in argv:
         return self_test()
+    # E2-2: 관리 서브커맨드 — **명시 argv 로만** 진입한다. Stop 훅 호출은 인자가 없으므로
+    #       무장 스위치 선검사(파일 stat 0회 무발동 계약 · 조건 37)는 그대로 보존된다.
+    if argv and argv[0] in ("budget-init", "budget-status"):
+        return cmd_budget(argv)
     # 무장 스위치는 어떤 파일 접근보다 먼저(완전 무발동 계약).
     if os.environ.get("CYS_COMPLETION_GUARD") != "1":
         return EXIT_PASS
+    # E1-3(BLOCKER R-09): Windows 기본 무장 거부 — **상태 파일을 만들기 전에** 끊는다.
+    #   여기서 끊지 않으면 미지원 경로가 INFRA_ERROR 로 수렴해 태스크마다 guard-disarmed
+    #   마커 + critical wakeup 이 쌓인다(영구 disarm + 폭주 교차). 거부는 파일 0개·경보 0건.
+    _win_refuse = _windows_arming_refusal()
+    if _win_refuse:
+        print("[completion-guard] %s" % _win_refuse, file=sys.stderr)
+        return EXIT_PASS
     deadline = _self_deadline()
-    if os.name == "posix":
-        signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(_Deadline()))
-        signal.alarm(deadline)
+    _disarm_deadline = _arm_self_deadline(deadline)
     try:
         return _hook_main()
     except _Deadline:
@@ -1382,8 +1736,94 @@ def main(argv=None):
         print("[completion-guard] 내부 예외 — INFRA fail-open(exit 0): %s" % e, file=sys.stderr)
         return EXIT_PASS
     finally:
-        if os.name == "posix":
-            signal.alarm(0)
+        _disarm_deadline()
+
+
+def _self_test_platform():
+    """E1-2(R-01)·E1-3(R-09) 회귀 — 플랫폼 분기와 데드라인 겹을 **모킹**으로 검증.
+
+    실기 Windows 가 없으므로 `os.name` 을 뒤집어 분기 함수를 직접 태운다(프로세스 스폰 0 ·
+    실행 시간 ~0). 이 방식의 한계는 자인한다: **구문·분기 선택만** 증명하고 Win32 실동작
+    (taskkill 실재·CREATE_NEW_PROCESS_GROUP 의미)은 증명하지 못한다 — 그래서 Windows 무장은
+    기본 거부로 남는다(`_windows_arming_refusal`).
+    """
+    fails = []
+
+    def chk(cond, msg):
+        if not cond:
+            fails.append("E1 platform: " + msg)
+
+    real_name = os.name
+    real_env = dict(os.environ)
+    try:
+        # ── ① 셸 argv 분기: posix=/bin/sh · nt=COMSPEC ──
+        os.name = "posix"
+        chk(_shell_argv("echo hi") == ["/bin/sh", "-c", "echo hi"],
+            "posix shell argv 회귀: %s" % _shell_argv("echo hi"))
+        os.name = "nt"
+        os.environ["COMSPEC"] = r"C:\WINDOWS\system32\cmd.exe"
+        chk(_shell_argv("echo hi") == [r"C:\WINDOWS\system32\cmd.exe", "/c", "echo hi"],
+            "nt shell argv 미분기(= /bin/sh 하드코딩 잔존): %s" % _shell_argv("echo hi"))
+        os.environ.pop("COMSPEC", None)
+        chk(_shell_argv("x")[0] == "cmd.exe", "nt COMSPEC 부재 폴백 실패: %s" % _shell_argv("x"))
+
+        # ── ② Windows 기본 무장 거부(+opt-in 해제) ──
+        os.environ.pop("CYS_GUARD_ALLOW_WINDOWS", None)
+        chk(_windows_arming_refusal() is not None, "nt 인데 무장이 거부되지 않음(R-09 재발)")
+        chk("CYS_GUARD_ALLOW_WINDOWS" in (_windows_arming_refusal() or ""),
+            "거부 문면에 해제 경로 부재")
+        os.environ["CYS_GUARD_ALLOW_WINDOWS"] = "1"
+        chk(_windows_arming_refusal() is None, "opt-in 인데 여전히 거부")
+        os.name = "posix"
+        os.environ.pop("CYS_GUARD_ALLOW_WINDOWS", None)
+        chk(_windows_arming_refusal() is None, "posix 인데 무장이 거부됨(회귀 — 라이브 정지)")
+
+        # ── ③ _kill_active_groups 가 nt 에서 **taskkill 을 실제로 부른다**(종전: set 만 비움) ──
+        called = []
+        real_run = subprocess.run
+        try:
+            os.name = "nt"
+            subprocess.run = lambda *a, **k: called.append(a[0]) or None
+            _ACTIVE_PGIDS.add(424242)
+            _kill_active_groups()
+            chk(len(called) == 1 and called[0][:1] == ["taskkill"],
+                "nt kill 경로가 taskkill 을 부르지 않음: %s" % called)
+            chk(424242 not in _ACTIVE_PGIDS, "nt kill 후 추적 set 미정리")
+        finally:
+            subprocess.run = real_run
+            _ACTIVE_PGIDS.discard(424242)
+
+        # ── ④ 워치독: 전 플랫폼 무장 + 해제 콜러블 · POSIX 는 SIGALRM 뒤(백스톱) ──
+        os.name = "posix"
+        os.environ["CYS_GUARD_SELF_DEADLINE_SEC"] = "45"
+        disarm = _arm_self_deadline(_self_deadline())
+        wd = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+        chk(len(wd) >= 1, "posix 워치독 스레드 미기동")
+        chk(all(t.daemon for t in wd), "워치독이 daemon 이 아님(프로세스 종료를 붙잡는다)")
+        chk(abs(getattr(wd[0], "interval", 0) - (45 + WATCHDOG_MARGIN_SEC)) < 0.01,
+            "posix 워치독이 SIGALRM 보다 먼저 선다(interval=%s)" % getattr(wd[0], "interval", None))
+        chk(signal.getitimer(signal.ITIMER_REAL)[0] > 0, "posix SIGALRM 미무장")
+        disarm()
+        chk(signal.getitimer(signal.ITIMER_REAL)[0] == 0, "disarm 후 SIGALRM 잔존")
+        for t in wd:
+            t.join(2)
+        chk(not any(t.is_alive() for t in wd), "disarm 후 워치독 타이머 잔존")
+        # Windows 경로: SIGALRM 없이도 워치독이 유일 겹으로 서고 여유 0(= deadline 정각)
+        os.name = "nt"
+        disarm2 = _arm_self_deadline(_self_deadline())
+        wd2 = [t for t in threading.enumerate() if isinstance(t, threading.Timer) and t.is_alive()]
+        chk(len(wd2) == 1 and abs(wd2[0].interval - 45) < 0.01,
+            "nt 워치독 interval 오류(= 자체 상한 0겹 재발): %s"
+            % [getattr(t, "interval", None) for t in wd2])
+        disarm2()
+        for t in wd2:
+            t.join(2)
+        chk(not any(t.is_alive() for t in wd2), "nt disarm 후 워치독 잔존")
+    finally:
+        os.name = real_name
+        os.environ.clear()
+        os.environ.update(real_env)
+    return fails
 
 
 # ═════════════════════════ self-test(§2-4 필수 5케이스 + 완료 기준 배터리) ═════
@@ -1398,6 +1838,18 @@ def self_test():
         print("javis_completion_guard self-test 실행 거부 — 격리 env 부재: %s "
               "(G1 라이브/사이드 경계 hard assert · 격리 스크래치 경로로 설정 후 재실행)"
               % ",".join(_missing_env), file=sys.stderr)
+        return 1
+
+    # ── E1-3(R-09): 이 배터리는 **POSIX 전용**이다 — `#!/bin/sh` 셔임·`os.mkfifo`·killpg 픽스처
+    #    의존. Windows 에서 조용히 크래시(AttributeError)하거나, 더 나쁘게는 "그린"으로 읽히지
+    #    않도록 여기서 명시 중단한다. 플랫폼 분기 케이스(_self_test_platform)는 플랫폼 무관이라
+    #    실행하고 결과를 보고한다. **Windows 회귀 하네스 부재가 Windows 기본 무장 거부의 근거**다.
+    if os.name != "posix":
+        pf = _self_test_platform()
+        print("javis_completion_guard self-test: POSIX 전용 배터리 미실행(os.name=%s · 셸 셔임·"
+              "FIFO·killpg 픽스처 의존). 플랫폼 분기 케이스만 실행 — %s. 이 플랫폼에 그린 러너는 "
+              "없으며 그것이 CYS_GUARD_ALLOW_WINDOWS 기본 거부의 근거다."
+              % (os.name, "OK" if not pf else "FAIL %d건: %s" % (len(pf), pf)), file=sys.stderr)
         return 1
 
     self_path = os.path.abspath(__file__)
@@ -1452,18 +1904,21 @@ def self_test():
             roots[name] = root
             return root, tasks
 
-        def mk_task(tasks, tid, spec):
-            rec = {"id": tid, "title": tid, "status": "in_progress",
+        def mk_task(tasks, tid, spec, status="in_progress"):
+            rec = {"id": tid, "title": tid, "status": status,
                    "created_at": _now(), "updated_at": _now()}
             if spec is not None:
                 rec["verify_spec"] = spec
             with open(os.path.join(tasks, "%s.json" % tid), "w", encoding="utf-8") as f:
                 json.dump(rec, f, ensure_ascii=False)
 
-        def mk_claim(tasks, sid, tid):
+        def mk_claim(tasks, sid, tid, pid=-1, pid_source="caller(자기 pane checkout)"):
+            """E2-1: pid=-1 = 이 프로세스 pid(기본·종전 동형) · pid=None = 위임 경로 미기록."""
+            rec = {"task_id": tid, "pid": os.getpid() if pid == -1 else pid,
+                   "pid_source": pid_source, "ts": _now()}
             with open(os.path.join(tasks, ".guard-claim.%s" % sid), "w",
                       encoding="utf-8") as f:
-                json.dump({"task_id": tid, "pid": os.getpid(), "ts": _now()}, f)
+                json.dump(rec, f)
 
         def run_guard(root, stdin_obj=None, env_extra=None, armed=True):
             env = dict(os.environ)
@@ -1501,6 +1956,24 @@ def self_test():
                                capture_output=True, text=True, env=env, timeout=120)
             return r.returncode, r.stdout, r.stderr
 
+        def run_cli(root, args, env_extra=None):
+            """E2-2: 관리 서브커맨드(budget-init/status) 실행 — **무장 env 없이** 돌린다.
+            Stop 훅 경로(인자 0개)와 분리돼 있음을 실행 자체로 확인한다."""
+            env = dict(os.environ)
+            for k in ("CYS_COMPLETION_GUARD", "JAVIS_VERIFY_BUDGET_RUNS",
+                      "JAVIS_VERIFY_BUDGET_SECS"):
+                env.pop(k, None)
+            env.update({"JAVIS_ROOT": root,
+                        "HUD_STATE_DIR": os.path.join(root, "hud"),
+                        "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
+                        "CYS_NO_AUTOSTART": "1",
+                        "PATH": shim_dir + os.pathsep + os.environ.get("PATH", "")})
+            if env_extra:
+                env.update(env_extra)
+            r = subprocess.run([sys.executable, self_path] + list(args),
+                               capture_output=True, text=True, env=env, timeout=120)
+            return r.returncode, r.stdout, r.stderr
+
         def gstate(root, tid):
             p = os.path.join(root, "_round", "tasks", "%s.guard.json" % tid)
             with open(p, encoding="utf-8") as f:
@@ -1534,12 +2007,13 @@ def self_test():
         chk(not os.path.isfile(os.path.join(tasks2, "T1.guard.json")),
             "claim 부재인데 guard.json 생성")
 
-        # ── stale claim: pid 사망 → exit 0 + 경보 1회 ──
+        # ── stale claim: pid 사망 ∧ **태스크 비활성** → exit 0 + 경보 1회 ──
+        #    (E2-1: pid 사망 단독으로는 더 이상 stale 이 아니다 — 아래 R-02 배터리 참조)
         root, tasks = new_root("r-stale")
-        mk_task(tasks, "T1", fail_spec)
+        mk_task(tasks, "T1", fail_spec, status="done")
         mk_claim(tasks, "7", "T1")
         rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
-        chk(rc == 0, "stale claim(pid dead)이 exit 0 아님: %s" % rc)
+        chk(rc == 0, "stale claim(pid dead ∧ 비활성)이 exit 0 아님: %s" % rc)
         ev = [x for x in spool_lines(root) if x["type"] == "agent.error"
               and "stale claim" in x["payload"].get("summary", "")]
         chk(len(ev) == 1, "stale claim 경보 1회 아님: %d" % len(ev))
@@ -1547,6 +2021,83 @@ def self_test():
         ev = [x for x in spool_lines(root) if x["type"] == "agent.error"
               and "stale claim" in x["payload"].get("summary", "")]
         chk(len(ev) == 1, "stale claim 경보가 코얼레싱 안 됨: %d" % len(ev))
+
+        # ══ E2-1(BLOCKER R-02) 배터리 — guard-claim 침묵형 무발동 ═══════════════
+        # (a) master 셸 pid 사망 + 태스크 활성 → claim 유효 유지 → **실제 발동**(exit 2).
+        #     종전 코드에서는 여기서 영구 exit 0(무장했는데 아무것도 안 함)이었다.
+        root, tasks = new_root("r-r02-alive")
+        mk_task(tasks, "T1", fail_spec)                 # status=in_progress
+        mk_claim(tasks, "7", "T1")
+        rc, _o, err = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
+        chk(rc == 2, "R-02(a): master pid 사망인데 태스크 활성 — 발동(exit 2) 실패: %s" % rc)
+        chk(os.path.isfile(os.path.join(tasks, "T1.guard.json")),
+            "R-02(a): 발동했는데 guard.json 미생성")
+        ev = [x for x in spool_lines(root) if x["type"] == "agent.error"
+              and "claim pid 강등 판정" in x["payload"].get("summary", "")]
+        chk(len(ev) == 1, "R-02(a): pid 강등 정보성 경보 1회 아님: %d" % len(ev))
+        # (a2) 위임 경로 pid 미기록(pid=None) + 태스크 활성 → 동일하게 발동
+        root, tasks = new_root("r-r02-nopid")
+        mk_task(tasks, "T1", fail_spec)
+        mk_claim(tasks, "7", "T1", pid=None, pid_source="delegated(미기록)")
+        rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
+        chk(rc == 2, "R-02(a2): pid 미기록 claim + 활성 태스크가 발동 안 함: %s" % rc)
+        # (c) 침묵 탐지기 — claim 부재로 연속 N회 무검증 종결 → 임계에서 경보 1회 + 상태파일
+        root, tasks = new_root("r-silence")
+        mk_task(tasks, "T1", fail_spec)                 # claim 은 만들지 않는다
+        for i in range(4):
+            rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "3"})
+            chk(rc == 0, "R-02(c): 침묵 경로가 exit 0 아님(i=%d): %s" % (i, rc))
+        sil_p = os.path.join(tasks, ".guard-silence.7.json")
+        chk(os.path.isfile(sil_p), "R-02(c): 침묵 상태 파일 미생성")
+        with open(sil_p, encoding="utf-8") as f:
+            sil = json.load(f)
+        chk(sil.get("streak") == 4 and sil.get("alerted_at"),
+            "R-02(c): 스트릭/경보 기록 오류: %r" % sil)
+        ev = [x for x in spool_lines(root) if x["type"] == "agent.error"
+              and "침묵 탐지" in x["payload"].get("summary", "")]
+        chk(len(ev) == 1, "R-02(c): 침묵 경보 1회 아님(코얼레싱 포함): %d" % len(ev))
+        # 임계 미달에서는 무경보(오탐 억제)
+        root, tasks = new_root("r-silence-quiet")
+        mk_task(tasks, "T1", fail_spec)
+        run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "5"})
+        ev = [x for x in spool_lines(root) if "침묵 탐지" in x["payload"].get("summary", "")]
+        chk(ev == [], "R-02(c): 임계 미달인데 침묵 경보 발화: %d" % len(ev))
+        # 실제 verify 가 돌면 스트릭 절단(파일 삭제)
+        root, tasks = new_root("r-silence-reset")
+        mk_task(tasks, "T1", ok_spec)
+        rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "2"})  # claim 부재 1회
+        chk(os.path.isfile(os.path.join(tasks, ".guard-silence.7.json")),
+            "R-02(c): 절단 전 상태 파일 부재")
+        mk_claim(tasks, "7", "T1")
+        rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "2"})
+        chk(rc == 0, "R-02(c): PASS spec 가 exit 0 아님: %s" % rc)
+        chk(not os.path.isfile(os.path.join(tasks, ".guard-silence.7.json")),
+            "R-02(c): 실제 verify 후에도 침묵 스트릭 잔존(절단 실패)")
+
+        # ══ E2-2(BLOCKER R-07) — verifier tax 활성화 절차 실재 ═════════════════
+        root, tasks = new_root("r-budget-init")
+        bdir = os.path.join(root, "_round", "verify-budget")
+        rc, out, _e = run_cli(root, ["budget-status", "--json"])
+        chk(rc == 0 and json.loads(out).get("active") is False,
+            "E2-2: 초기 상태가 비활성이 아님: rc=%s out=%s" % (rc, out[:200]))
+        chk(not os.path.isdir(bdir), "E2-2: budget-status 가 디렉터리를 생성(읽기전용 위반)")
+        rc, out, _e = run_cli(root, ["budget-init", "--max-runs", "7", "--max-secs", "11"])
+        chk(rc == 0 and os.path.isfile(os.path.join(bdir, "policy.json")),
+            "E2-2: budget-init 실패: rc=%s out=%s" % (rc, out[:200]))
+        rc, out, _e = run_cli(root, ["budget-status", "--json"])
+        st = json.loads(out)
+        chk(st.get("active") is True and st.get("max_runs") == 7 and st.get("max_secs") == 11,
+            "E2-2: 활성 상태 판독 오류: %r" % st)
+        rc, out2, _e = run_cli(root, ["budget-init"])   # 멱등 — 덮어쓰지 않는다
+        chk(rc == 0 and "이미 활성" in out2, "E2-2: budget-init 멱등 실패: %s" % out2[:200])
+        st2 = json.loads(run_cli(root, ["budget-status", "--json"])[1])
+        chk(st2.get("max_runs") == 7, "E2-2: 멱등 호출이 정책을 덮어씀: %r" % st2)
+        rc, _o, _e = run_cli(root, ["budget-init", "--max-runs", "0", "--force"])
+        chk(rc == 2, "E2-2: 0 한도(상시 소진 footgun) 미거부: %s" % rc)
+        import shutil as _sh                      # 되돌리기 = 디렉터리 삭제 1개
+        _sh.rmtree(bdir)
+        chk(json.loads(run_cli(root, ["budget-status", "--json"])[1]).get("active") is False,
+            "E2-2: 디렉터리 삭제 후에도 활성으로 판독(되돌리기 불성립)")
 
         # ── 사다리 1단: CYCLE 마커 → SKIPPED_CYCLE(verify 미실행) / 만료 마커 → 진행 ──
         root, tasks = new_root("r-cycle")
@@ -2278,6 +2829,8 @@ def self_test():
         chk(rc == 0 and gstate(root, "T1")["last_verdict"] == "PASS",
             "procedural factcheck 통과 경로 실패: %s" % gstate(root, "T1"))
 
+    fails.extend(_self_test_platform())   # E1-2/E1-3 — 플랫폼 분기·워치독(모킹 · 스폰 0)
+
     if fails:
         print("javis_completion_guard self-test FAIL %d건:" % len(fails), file=sys.stderr)
         for x in fails:
@@ -2298,7 +2851,14 @@ def self_test():
           "SIGALRM INFRA 적재·_on_deadline killpg+bundle 보강)·F4 warnings 판별 4상·"
           "F6 probe 3케이스+CYS_PROBE_RUNS 격리·F3 --claim-surface 조인·"
           "역경 배터리 exit2 부재(F8 claim id 방어 포함)·N≥8 거부·"
-          "emit 필드셋 parity·waiver/procedural 경로")
+          "emit 필드셋 parity·waiver/procedural 경로·"
+          "★E2-1 R-02(master pid 사망+태스크 활성→발동 exit2·pid 강등 경보 1회·pid 미기록 "
+          "claim 발동·침묵 탐지기 임계 경보 1회+상태파일·임계 미달 무경보·verify 후 스트릭 절단)·"
+          "★E2-2 R-07(budget-status 비활성 판독·읽기전용·budget-init 활성/멱등/0한도 거부/"
+          "디렉터리 삭제 복귀)·"
+          "★E1-2/E1-3 R-01·R-09(셸 argv 플랫폼 분기·COMSPEC 폴백·Windows 기본 무장 거부+opt-in·"
+          "posix 무영향·nt taskkill 실호출+추적 정리·워치독 daemon 무장/해제·posix 백스톱 여유 "
+          "8s·nt 워치독 유일 겹)")
     return 0
 
 

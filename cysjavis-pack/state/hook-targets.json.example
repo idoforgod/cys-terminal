@@ -1,0 +1,114 @@
+{
+ "_README": [
+  "[E2-3 · BLOCKER R-04] 훅 등록 **단일 대상표**의 스키마+실측값이다. 종전에는 대상표가 세 곳에",
+  "흩어져 서로 어긋나 있었다: ①javis_guard_register.py 의 하드코딩(MASTER_PROFILE_BASENAMES=",
+  "(\".claude\",) · '워커 2프로필') ②C74 경고 훅 대상표(master 포함) ③T0 실측 6프로필.",
+  "그 어긋남의 실효는 셋이다 —",
+  "  (a) 실제 라이브 master 세션 프로필은 `~/.claude-3` 인데(ps 실측 · 아래 evidence) 역할 경계가",
+  "      `.claude` 만 알아서 `--hook stop --profile ~/.claude-3 --apply` 가 **거부되지 않는다**",
+  "      ⇒ 조건 24② '비워커 프로필 등록=반려'가 기계 집행되지 않는다.",
+  "  (b) 경고 훅을 `~/.claude` 에만 걸면 **실제 master 세션(~/.claude-3)에 도달하지 않아**",
+  "      조건 11 흡수 선언의 실효가 0 이다.",
+  "  (c) `~/.cys/claude` 는 '워커 2프로필'의 하나가 아니라 **cys 함대 전 claude 노드의 공용",
+  "      프로필 1개**다(CSO 동거) — 프로필 단위 격리 가정이 문면만큼 단단하지 않다.",
+  "이 파일은 그 셋을 **실측 위에서** 한 장으로 확정한다. 코드가 표를 정하지 않고, 표가 코드를 정한다.",
+  "",
+  "설치 경로: $PACK/state/hook-targets.json   ($PACK = ${CYS_PACK_DIR:-$HOME/.cys/pack})",
+  "이 파일명(.example 접미)이 유지되는 한 **소비자는 없다** — 표 미공급 = 종전 하드코딩 동작 유지",
+  "(부재가 동작을 바꾸지 않는다는 계약 · 배포 안전).",
+  "",
+  "소비 계약(★E3-1 배선 완료 — javis_guard_register.py 가 이 표를 읽는다):",
+  "  1) javis_guard_register.py 의 역할 경계 검사가 MASTER_PROFILE_BASENAMES 하드코딩 대신",
+  "     이 표의 profiles[].eligibility 를 읽는다. 표 부재 시에만 하드코딩 폴백.",
+  "  2) 미지 프로필(표에 없는 basename)은 **기본 거부**이고 `--force-unknown` 명시로만 통과한다",
+  "     (deny-by-default — 새 프로필이 조용히 대상이 되는 경로를 닫는다).",
+  "  3) C73(guard 훅 무결성)·C74(경고 훅 배선) 판정 대상도 이 표에서 파생한다 —",
+  "     세 표가 다시 갈라지지 않게 **파생원을 하나로** 만든다.",
+  "되돌리는 법: 이 파일을 지우면 종전(코드 하드코딩) 판정으로 돌아간다.",
+  "손상 시: 도구는 폴백하지 않고 exit 2 + 쓰기 0 으로 멈춘다(침묵 폴백 금지 · 계약 §5)."
+ ],
+ "schema_version": 1,
+ "measured_at": "2026-07-31 (T0-BASELINE §1 hook-census 실측 · ps -E CLAUDE_CONFIG_DIR 대조)",
+ "evidence": [
+  "T0 hook-census §0-1: ls -d ~/.claude* → .claude · .claude-2 · .claude-2-dept-pub · .claude-3 · .claude-cysinsight",
+  "T0 hook-census §0-2: ps -E CLAUDE_CONFIG_DIR → 6번째 프로필 ~/.cys/claude (agents.json env 주입 · 함대 공용)",
+  "T0 hook-census §0-3: .zshrc — claude-ysfuture(master)=~/.claude · claude-cysinsight(워커 수동)=~/.claude-cysinsight · claude-3()=~/.claude-3",
+  "T0 hook-census §2: 6프로필 Stop 체인 전수 — completion-guard.sh 등록 0건(현재)",
+  "D5 렌즈 F1: 라이브 master 세션 실측 CLAUDE_CONFIG_DIR=/Users/cys-macbook/.claude-3 (MEMORY 경로 ~/.claude-3/projects/... 와 일치)"
+ ],
+ "policy": {
+  "unknown_profile": "deny",
+  "unknown_override_flag": "--force-unknown",
+  "master_guard_override_flag": "--force-master",
+  "note": "guard(Stop)와 경고 훅(PostToolUse)의 대상 집합은 **다르다**. 합치면 master pane 의 Stop 체인에 검증 블록이 걸려 회신 큐가 적체된다(D5 경고). 두 집합을 한 파일에 두되 **필드로 분리**한다 — 파일을 합치는 것과 판정을 합치는 것은 다르다."
+ },
+ "profiles": [
+  {
+   "basename": ".claude",
+   "path": "~/.claude",
+   "role": "master(별칭 claude-ysfuture — 전용 dotdir 없이 기본 dir 사용)",
+   "eligibility": {"guard_stop": "deny", "brief_warn": "allow"},
+   "why": "위임을 만드는 쪽이라 경고 훅은 필요하지만, Stop 검증 블록이 걸리면 master 회신이 막힌다(조건 24② 비워커 반려 대상).",
+   "measured": "hook-census §1-1 · Stop 3단(save-state→reflect-scan→grill-stop)"
+  },
+  {
+   "basename": ".claude-3",
+   "path": "~/.claude-3",
+   "role": "master(★라이브 실측 — 현재 master 세션의 실제 CLAUDE_CONFIG_DIR)",
+   "eligibility": {"guard_stop": "deny", "brief_warn": "allow"},
+   "why": "★R-04(a)(b) 핵심 행. 종전 하드코딩은 이 프로필을 몰라서 guard 등록을 거부하지 못했고(오인 등록 시 실제 master Stop 체인에 블록), 경고 훅 대상에서도 빠져 조건 11 흡수가 실제 master 에 도달하지 못했다.",
+   "measured": "hook-census §0-2 ps 실측(pid 27739·45789·50421) · §1-3 Stop 4단(+state-staleness)"
+  },
+  {
+   "basename": ".claude-cysinsight",
+   "path": "~/.claude-cysinsight",
+   "role": "worker(수동 프로필 — claude-cysinsight 별칭)",
+   "eligibility": {"guard_stop": "allow", "brief_warn": "allow"},
+   "why": "워커 전용 프로필. guard 1차 카나리아 대상.",
+   "measured": "hook-census §1-2 · Stop 4단(+state-staleness) · pid 50627"
+  },
+  {
+   "basename": "claude",
+   "path": "~/.cys/claude",
+   "role": "worker(★cys 함대 공용 — launch-agent 로 뜨는 **모든** claude 노드가 공유)",
+   "eligibility": {"guard_stop": "allow", "brief_warn": "allow"},
+   "why": "★R-04(c). '워커 2프로필'이라는 문면과 달리 이 파일 1개를 CSO·워커·리뷰어 노드가 **전부 공유**한다. 따라서 프로필 등록은 격리가 아니며, 실제 격리는 pane 단위 env(CYS_COMPLETION_GUARD=1)뿐이다(조건 37). OT-2 승인문은 '워커 2프로필'이 아니라 '워커 수동 프로필 + cys 함대 공용 프로필(전 역할 동거)'로 읽혀야 한다 — 오너가 승인하는 대상이 달라진다.",
+   "measured": "hook-census §0-2 agents.json env 주입 · §1-6 · pid 39432·39616·40202",
+   "basename_note": "dotdir 가 아니라 `~/.cys/claude` 이므로 basename 은 'claude' 다(선행 점 없음) — basename 문자열 일치 판정 시 `.claude` 와 혼동 금지."
+  },
+  {
+   "basename": ".claude-2",
+   "path": "~/.claude-2",
+   "role": "unclear(도달 경로 모호 — zsh alias 가 함수보다 먼저 전개돼 실제로는 ~/.claude-cysinsight 로 감)",
+   "eligibility": {"guard_stop": "deny", "brief_warn": "deny"},
+   "why": "누가 어떤 역할로 쓰는지 실측으로 확정되지 않았다. 모호한 대상은 등록하지 않는다(deny-by-default).",
+   "measured": "hook-census §0-3 충돌 · §1-4"
+  },
+  {
+   "basename": ".claude-2-dept-pub",
+   "path": "~/.claude-2-dept-pub",
+   "role": "dept 발행 전용",
+   "eligibility": {"guard_stop": "deny", "brief_warn": "deny"},
+   "why": "Phase 1 범위(워커 검증·위임 경고) 밖. statusLine 이 다른 팩(pack-dept-dept-1)을 가리키는 특수 프로필이라 부작용 표면이 다르다.",
+   "measured": "hook-census §1-5"
+  }
+ ],
+ "derived_tables": {
+  "c73_guard_hook_expected": {
+   "source": "profiles[].eligibility.guard_stop == 'allow'",
+   "current_value": ["~/.claude-cysinsight/settings.json", "~/.cys/claude/settings.json"],
+   "must_contain": "sh <PACK>/hooks/completion-guard.sh"
+  },
+  "c74_brief_warn_expected": {
+   "source": "profiles[].eligibility.brief_warn == 'allow'",
+   "current_value": [".claude", ".claude-3", ".claude-cysinsight", "claude"],
+   "note": "★종전 brief-warn-expected.txt.example 의 예시 3줄(.claude·.claude-cysinsight·claude)에는 `.claude-3` 가 **빠져 있다** — 그 표대로 등록하면 실제 master 세션에 경고가 도달하지 않는다(R-04(b))."
+  }
+ },
+ "open_gap": {
+  "consumer_wired": true,
+  "wired_at": "2026-07-31 (E3-1) — javis_guard_register.py 가 profiles[].eligibility 를 소비한다",
+  "detail": "HOOK_TARGETS_CONTRACT.md §4-1 재측정: GAP 7건 → 0건(`~/.claude-3 · stop = REFUSED` 실측). 소비 계약 1~3 전부 이행(3 은 --emit-warn-targets 신설로 C74 대상표까지 파생).",
+  "remaining": "preflight C74 검사 자체는 이 표를 읽지 않는다 — C74 는 주어진 대상표(brief-warn-expected.txt / CYS_BRIEF_WARN_PROFILES)만 보므로, 그 표를 손으로 쓰면 누락이 PASS 로 통과한다. 반드시 `--emit-warn-targets` 로 **파생**해서 공급하라(계약 §5-2)."
+ }
+}

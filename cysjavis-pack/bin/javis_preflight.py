@@ -4138,6 +4138,9 @@ class Preflight:
         ("SKIPPED_NO_SPEC", "판정 enum 10종 세대(B1)"),
         (".guard-claim.", "태스크 바인딩 파일 계약(B1 §2-1)"),
         ("verify-budget", "verifier tax 샤드 소비부(B1/B2 §3)"),
+        ("_claim_liveness", "claim 생존 판정=태스크 상태 기반(E2-1 · R-02 교정 세대)"),
+        (".guard-silence.", "침묵 탐지기 상태 파일(E2-1c — 무장≠발동 표면화)"),
+        ("budget-init", "verifier tax 활성화 절차(E2-2 · R-07)"),
     )
     C72_SCHEMA_MODE_ENUM = ["command", "procedural", "probe", "waiver"]
     _C72_RESERVED_RE = re.compile(r"RESERVED_ID_SUFFIXES\s*=\s*\(([^)]*)\)")
@@ -4228,6 +4231,47 @@ class Preflight:
         if stale_cyc:
             warns.append("stale CYCLE 마커(TTL %d분 초과 — 고아 clear 흔적·guard 는 무시 진행): %s"
                          % (cycle_ttl // 60, ", ".join(sorted(stale_cyc)[:8])))
+        # ★E2-1(c) 침묵 탐지기 표면화 — guard 런타임 경보의 **부트 짝**.
+        #   "무장했는데 연속 N회 아무것도 검증하지 않았다"는 상태는 런타임에서는 무음이고
+        #   정상 동작과 구분되지 않는다(R-02 침묵형 실패). guard 가 남긴 상태 파일을 부트에서
+        #   읽어 WARN 으로 올린다 — 경보 코얼레싱(6h)으로 런타임 알림이 이미 삼켜진 뒤에도
+        #   부트 진단에는 남는다.
+        silent = []
+        for n in names:
+            if not (n.startswith(".guard-silence.") and n.endswith(".json")):
+                continue
+            try:
+                with open(os.path.join(tasks_dir, n), encoding="utf-8") as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            streak = int(rec.get("streak", 0) or 0)
+            thr = int(rec.get("threshold", 0) or 0) or 5
+            if streak >= thr:
+                silent.append("%s(연속 %d회·사유 %s·최근 %s)"
+                              % (n[len(".guard-silence."):-len(".json")], streak,
+                                 rec.get("last_reason"), rec.get("last_ts")))
+        if silent:
+            warns.append("guard 침묵 지속(무장인데 검증 0회 — 무장≠발동): %s "
+                         "· claim 소유/바인딩 확인(javis_task checkout --claim-surface"
+                         " <워커 sid> [--claim-pid <워커 pid>])" % ", ".join(sorted(silent)[:8]))
+        # ★E2-2(R-07) verifier tax 활성/비활성 1줄 — 정보성이지만 **말하게** 만든다.
+        #   부재=무제한 통과(기본 OFF)라 "압력이 없다"는 관측은 tax 가 켜져 있을 때만
+        #   의미가 있다. 비활성 상태에서 샤드를 관찰하라는 지시는 영원히 생기지 않는 파일을
+        #   보라는 말이고, 그 침묵은 '정상'으로 오독된다.
+        budget_dir = os.path.join(root, "_round", "verify-budget")
+        tax_active = os.path.isdir(budget_dir)
+        tax_line = ("verifier tax: %s"
+                    % ("활성(policy.json %s)"
+                       % ("있음" if os.path.isfile(os.path.join(budget_dir, "policy.json"))
+                          else "없음 — 기본 60회/300초")
+                       if tax_active else "비활성(OFF · 무제한 통과) — 활성화는 "
+                                          "`javis_completion_guard.py budget-init`"))
+        if os.environ.get("CYS_COMPLETION_GUARD") == "1" and not tax_active:
+            warns.append("무장 pane 인데 " + tax_line
+                         + " · 이 상태에서 verify-budget 샤드는 생성되지 않는다(관찰 불가)")
         # G6(성찰 2): 무장 env 조합 점검 — 이 프로세스가 무장 pane 에서 돌 때만 의미(평시
         # master 프리플라이트는 비무장 → 무발화). 조합 = cap 미설정 ∧ self-cap 0: grill 블록
         # K 가 하네스 Stop 지갑(기본 8+1=9)을 선점하면 guard escalation(N=3) 도달 전 소진
@@ -4239,12 +4283,13 @@ class Preflight:
                          "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP 미설정 ∧ GRILL_STOP_SELF_CAP=0 — "
                          "cap 상향+self-cap 활성 원자 조합 적용 요망(OT-2)")
         if warns:
-            self.add(cid, WARN, "게이트 3점 세대 정합 OK · " + " | ".join(warns))
+            self.add(cid, WARN, "게이트 3점 세대 정합 OK · " + " | ".join(warns)
+                     + " · " + tax_line)
         else:
             self.add(cid, PASS, "Phase1 게이트 3점 세트 세대 정합(javis_task 마커 %d·guard 마커 "
                                 "%d·schema MODE_ENUM·예약 접미 상호 일치) · disarmed 0 · "
-                                "stale CYCLE 0" % (len(self.C72_TASK_PINS),
-                                                   len(self.C72_GUARD_PINS)))
+                                "stale CYCLE 0 · guard 침묵 0 · %s"
+                                % (len(self.C72_TASK_PINS), len(self.C72_GUARD_PINS), tax_line))
 
     # C73 — 워커 프로필 settings 훅 무결성(D4: 블록 압박 하 모델의 훅 자가제거 실측 대응).
     # 기대 집합 마커 = $PACK/state/guard-hook-expected.json (없으면 SKIP — OT-2 등록 전 상태).
@@ -4440,10 +4485,27 @@ class Preflight:
                      len(waiver_grace),
                      "(%s)" % ", ".join(waiver_grace[:10]) if waiver_grace else "",
                      " · 파싱 실패 %d건" % parse_fail if parse_fail else ""))
+        # ★E1-4(BLOCKER F12/R-25 · 무게이트 발효 강등): 심각도는 **strict 를 실제로 쫓고 있을
+        #   때만** FAIL 이다. 근거(실측): 이 검사가 무조건 FAIL 을 내면, 팩 install 직후의
+        #   라이브 보드(T0 실측 33건 · verify_spec 은 아직 0건)에서 부트 진단이 즉시 FAIL 로
+        #   전환된다 — 오너 승인 접점 없이 `preflight` 가 READY→NOT READY 로 뒤집힌다.
+        #   게다가 그 시점 게이트 모드는 출하 기본 `warn` 이라 **막고 있는 것이 아무것도 없다**:
+        #   "strict 승격 부적격"은 참이지만 승격을 시도하지도 않은 상태의 거짓 경보다.
+        #   판정: strict 추적 중(JAVIS_VERIFY_GATE=strict ∨ grandfather 마커 존재) → FAIL
+        #         그 밖(warn/off = 출하 기본) → WARN(정보성 · 종료코드는 FAIL 수만 본다).
+        strict_pursued = (os.environ.get("JAVIS_VERIFY_GATE", "").strip().lower() == "strict"
+                          or os.path.isfile(os.path.join(tasks_dir,
+                                                         getattr(_jt, "GATE_MARKER", ""))))
         if len(no_spec) > 5:
-            self.add(cid, FAIL, "strict 승격 부적격(조건 02④ — 열린+무spec %d건 > 5): "
-                                "grandfather 완료 전 배포 금지 · %s"
-                     % (len(no_spec), detail))
+            if strict_pursued:
+                self.add(cid, FAIL, "strict 승격 부적격(조건 02④ — 열린+무spec %d건 > 5): "
+                                    "grandfather 완료 전 배포 금지 · %s"
+                         % (len(no_spec), detail))
+            else:
+                self.add(cid, WARN, "strict 승격 부적격(조건 02④ — 열린+무spec %d건 > 5) — "
+                                    "다만 현재 게이트는 출하 기본(warn/off)이라 차단 중인 것은 "
+                                    "없다. strict 승격 전 해소 필요(그때 FAIL 로 승격) · %s"
+                         % (len(no_spec), detail))
         else:
             self.add(cid, PASS, "strict 승격 재스캔 OK(≤5) — " + detail)
 
