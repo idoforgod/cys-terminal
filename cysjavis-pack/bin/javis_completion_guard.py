@@ -946,6 +946,17 @@ def _failure_sig(cmd_repr, rc, out):
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def esc_request_id(task_id, sig):
+    """escalation·esc-bundle 멱등키 정규화 — **단일 정의**(Wave C 승인 큐가 import 재사용).
+
+    sig 부재(측정 실패·백필)는 `nosig` 로 접는다. 이 규칙이 갈라지면 guard 가 쏜 wakeup
+    멱등키와 큐가 만든 항목 request_id 가 서로 다른 문자열이 되어 **큐↔wakeup 조인이
+    끊긴다**(설계 §4 R1: request_id = 조인 키).
+    """
+    s = str(sig).strip() if sig else ""
+    return "guard:%s:%s" % (task_id, s or "nosig")
+
+
 def _spec_cmd_repr(spec):
     mode = spec.get("mode")
     if mode == "command":
@@ -1009,7 +1020,7 @@ def _pending_path_for(task_id):
 
 def _escalate(task_id, sig, rc, attempt, log_path):
     """태스크당 1회 — enqueue(critical·멱등키) + same-run drain 짝 + esc-bundle 기록."""
-    idem = "guard:%s:%s" % (task_id, sig)
+    idem = esc_request_id(task_id, sig)   # ★단일 정의(Wave C 큐 import 재사용 · nosig 규칙 통일)
     bundle = {"schema_version": 1, "task": task_id, "sig": sig,
               "verify_out": log_path, "exit": rc, "attempt": attempt,
               "ts": _now(), "request_id": idem}
@@ -1031,8 +1042,12 @@ def _refresh_pending_only(task_id, sig, note):
     pending 부재면 아무것도 만들지 않는다(코얼레싱이 신규 생성으로 오용되는 경로 차단)."""
     if not os.path.isfile(_pending_path_for(task_id)):
         return
+    # ★단일 정의 파생(R6e): override 멱등키도 `esc_request_id` 에서 **파생**한다. 손으로 쓴
+    #   `"guard:%s:%s:override"` 는 sig 부재 시 `guard:T::override` 가 되어 정규화(`nosig`)
+    #   규칙과 갈라졌고, 그 순간 큐↔wakeup 조인 키가 두 갈래가 된다.
     _wakeup(["enqueue", "--to", "master", "--task", "guard-esc-%s" % task_id,
-             "--reason", note, "--idempotency-key", "guard:%s:%s:override" % (task_id, sig),
+             "--reason", note,
+             "--idempotency-key", esc_request_id(task_id, sig) + ":override",
              "--severity", "critical"])
 
 
@@ -1333,7 +1348,7 @@ def _on_deadline(detail):
         bundle = {"schema_version": 1, "task": task_id, "sig": sig,
                   "verify_out": _verify_log_path(task_id), "exit": None,
                   "attempt": int(state.get("block_count", 0)), "ts": _now(),
-                  "request_id": "guard:%s:%s" % (task_id, sig),
+                  "request_id": esc_request_id(task_id, sig),
                   "note": "deadline-handler backfill(F1 — escalated_at 저장~_escalate 소실 창)"}
         with contextlib.suppress(OSError):
             _write_json_atomic(_bundle_path(task_id), bundle)
