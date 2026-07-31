@@ -40,10 +40,18 @@
   **거부되지 않았다**(조건 24② "비워커 프로필 등록=반려"가 기계 집행되지 않음 · E2 실측 GAP 7건).
   이제 이 도구는 `$PACK/state/hook-targets.json` 을 읽어 `profiles[].eligibility.<훅키>` 로
   허용/거부를 판정한다 — **코드가 표를 정하지 않고 표가 코드를 정한다**(계약 §1).
-    · 표 **부재** = 종전 하드코딩 폴백 + 경고 1줄(부재가 동작을 바꾸지 않는다 = 배포 안전).
-      배포 실물은 `hook-targets.json.example` 이라 install 직후 소비자는 없다.
+    · 표 **부재** = 같은 경로의 `.example`(배포 실물)을 **폴백 표로 로드** + 고지 1줄.
+      ★E4-1(사인오프 R-04 잔여 · HIGH): 종전에는 표 부재가 곧 코드 하드코딩 폴백이었는데,
+      배포 실물이 `hook-targets.json.example` 뿐이고 `.json` 을 만드는 설치 스텝이 팩·계약·
+      OT 롯북 어디에도 없었다(전수 grep 0건) ⇒ **install 직후 기본 상태에서 기계 방어가 죽어
+      있었다**(실측: 표 부재 모드 `--hook stop --profile ~/.claude-3` = WOULD-ADD·rc=0).
+      이제 `.example` 이 폴백 표로 집행되므로 install 직후에도 판정이 살아 있다. 명시 설치
+      (`cp state/hook-targets.json.example state/hook-targets.json`)는 여전히 운영 규율이고
+      (OT-DOSSIER §2.0), 폴백은 그 규율이 빠졌을 때의 **안전망**이다(둘은 대체가 아니다).
+    · 표·`.example` **둘 다 부재** = 종전 코드 하드코딩 폴백 + 경고 1줄(최종 안전망).
     · 표 **손상** = 폴백하지 않고 **exit 2 · 쓰기 0**(손상을 관대하게 접으면 침묵 무발동이
-      되고, 그것이 이 Phase 가 잡고 있는 결함 부류다 — R-02 동형).
+      되고, 그것이 이 Phase 가 잡고 있는 결함 부류다 — R-02 동형). `.example` 이 손상된
+      경우도 같다(배포물 손상 = 포장 결함이므로 조용히 약한 판정으로 접지 않는다).
     · 표에 **없는** basename = `policy.unknown_profile`(=deny)에 따라 거부 · `--force-unknown`
       명시 1회로만 통과(새 프로필 `~/.claude-4` 가 조용히 대상이 되는 경로를 닫는다).
     · `--from-table` = 대상 프로필 목록 자체를 표의 allow 집합에서 파생(타이핑 오류 제거).
@@ -101,10 +109,38 @@ MASTER_PROFILE_BASENAMES = (".claude",)   # ★폴백 전용 — 표 부재 시�
 # 합치는 것은 다르고, 합치면 master pane 의 Stop 체인에 검증 블록이 걸린다(D5 경고).
 HOOK_ELIGIBILITY_KEY = {"stop": "guard_stop", "brief-warn": "brief_warn"}
 TARGETS_REL = os.path.join("state", "hook-targets.json")
+TARGETS_EXAMPLE_SUFFIX = ".example"   # ★E4-1: 배포 실물 = <표>.example (폴백 표)
 
 
 def _targets_path(pack, override=None):
     return override or os.path.join(pack, TARGETS_REL)
+
+
+def _resolve_targets(pack, override=None):
+    """(table|None, err|None, path, source) — 표 해석 2단(운영 표 → 배포 예시표 폴백).
+
+    source ∈ {"file", "example", "none"}:
+      · "file"    = `$PACK/state/hook-targets.json`(또는 --hook-targets override) 실물
+      · "example" = 같은 경로 + `.example`(★E4-1 · install 직후 기본 상태)
+      · "none"    = 둘 다 부재 → 호출자가 코드 하드코딩 폴백으로 간다(최종 안전망)
+
+    폴백 규칙은 **경로 단위로 균일**하다 — override 를 줬으면 `<override>.example` 만 본다
+    (팩 예시표로 몰래 되돌아가지 않는다: 운영자가 고른 출처를 도구가 바꾸지 않는다).
+    손상은 어느 단계든 err 로 올라가고 호출자는 폴백 없이 멈춘다(exit 2 · 쓰기 0).
+    """
+    path = _targets_path(pack, override)
+    table, err = _load_targets(path)
+    if err:
+        return None, err, path, "file"
+    if table is not None:
+        return table, None, path, "file"
+    expath = path + TARGETS_EXAMPLE_SUFFIX
+    table, err = _load_targets(expath)
+    if err:
+        return None, err, expath, "example"
+    if table is not None:
+        return table, None, expath, "example"
+    return None, None, path, "none"
 
 
 def _load_targets(path):
@@ -358,7 +394,8 @@ def _sha(data):
 
 # ── 처리 ────────────────────────────────────────────────────────────────────
 def process(profiles, hook_key, apply_, force_master, pack, out=None,
-            repair_timeout=False, force_unknown=False, targets_path=None, table=None):
+            repair_timeout=False, force_unknown=False, targets_path=None, table=None,
+            table_source=None):
     # out 기본값을 def 시점에 sys.stdout 으로 **묶지 않는다** — 묶으면 호출자의
     # redirect_stdout 이 무효가 되고(자기검증 하네스가 출력을 회수하지 못한다) 그 무능이
     # "검증했다"로 오독된다(계측 타당성).
@@ -371,23 +408,31 @@ def process(profiles, hook_key, apply_, force_master, pack, out=None,
     rows = []
 
     # ★E3-1: 대상표 로드 — 판정 SOT. 부재=폴백 · 손상=중단(관대한 접기 금지).
+    # ★E4-1: 부재 폴백이 2단이다 — `.example`(배포 실물) → 코드 하드코딩.
     tpath = _targets_path(pack, targets_path)
-    if table is None:
-        table, terr = _load_targets(tpath)
+    tsource = table_source
+    if table is None and tsource is None:
+        table, terr, tpath, tsource = _resolve_targets(pack, targets_path)
         if terr:
-            print("대상표 손상: %s — %s" % (tpath, terr), file=out)
+            print("대상표 손상%s: %s — %s"
+                  % ("(배포 예시표)" if tsource == "example" else "", tpath, terr), file=out)
             print("→ 등록 중단(쓰기 0). 손상된 표를 하드코딩으로 조용히 대체하지 않는다 — "
                   "그 침묵이 R-04/R-02 가 잡고 있는 결함이다. 표를 고치거나 지워라"
-                  "(지우면 하드코딩 폴백).", file=out)
+                  "(운영 표를 지우면 배포 예시표 폴백, 예시표까지 없으면 하드코딩 폴백 · "
+                  "다른 표를 쓰려면 --hook-targets).", file=out)
             return EXIT_ARGS, [], command, spec
+    elif table is not None:
+        tpath, tsource = table["path"], (tsource or "file")
 
     print("훅: %s (%s · %s)" % (hook_key, spec["event"], spec["why"]), file=out)
     print("command: %s" % command, file=out)
     print("timeout: %s (settings 훅 항목 상한 — E1-2/R-01 · 사다리 바깥 겹)"
           % (spec.get("timeout") if spec.get("timeout") is not None else "미기재"), file=out)
     if table is None:
-        print("대상표: 부재(%s) — **코드 하드코딩 폴백**(master=%s · 실측 6프로필 중 1개만 안다)"
-              % (tpath, ", ".join(MASTER_PROFILE_BASENAMES)), file=out)
+        print("대상표: 부재(%s) · 배포 예시표도 부재(%s%s) — **코드 하드코딩 폴백**"
+              "(master=%s · 실측 6프로필 중 1개만 안다)"
+              % (tpath, tpath, TARGETS_EXAMPLE_SUFFIX, ", ".join(MASTER_PROFILE_BASENAMES)),
+              file=out)
         print("        ※ 이 상태에서는 조건 24②(비워커 프로필 등록=반려)가 기계 집행되지 "
               "않는다 — 표를 공급하라(HOOK_TARGETS_CONTRACT.md).", file=out)
     else:
@@ -395,6 +440,12 @@ def process(profiles, hook_key, apply_, force_master, pack, out=None,
               % (table["path"], table["doc"]["schema_version"], table["sha256"][:12],
                  len(table["index"]), table["policy"].get("unknown_profile"),
                  table["doc"].get("measured_at") or "미기재"), file=out)
+        if tsource == "example":
+            # ★E4-1 고지 1줄 — 폴백이 조용하면 그 자체가 이 Phase 가 잡는 결함 부류다.
+            print("        ※ 운영 표(%s) 부재 → **배포 예시표 폴백으로 판정 중**(기계 방어는 "
+                  "살아 있다). 운영 표를 확정하려면: cp %s%s %s (설치 후 measured_at 갱신)"
+                  % (_targets_path(pack, targets_path), _targets_path(pack, targets_path),
+                     TARGETS_EXAMPLE_SUFFIX, _targets_path(pack, targets_path)), file=out)
     print("모드: %s" % ("APPLY(쓰기)" if apply_ else "DRY-RUN(기본 — 쓰기 0)"), file=out)
     if not os.path.isfile(hook_path):
         print("경고: 훅 실물 부재 — %s (등록해도 래퍼가 없으면 무발동)" % hook_path, file=out)
@@ -777,8 +828,9 @@ def self_test():
                        ent(".claude-2-dept-pub", "deny", "deny", "dept 발행 전용"),
                    ]}
 
-        # ⑫ 결함 재현(표 부재 = 하드코딩 폴백) — 라이브 master `.claude-3` 에 stop 이
-        #    **거부되지 않는다**. 이것이 E2 가 실측한 GAP 7건의 핵심 행이다.
+        # ⑫ 최종 안전망(운영 표·배포 예시표 **둘 다** 부재 = 코드 하드코딩 폴백) — 이때만
+        #    라이브 master `.claude-3` 에 stop 이 거부되지 않는다(종전 동작 보존).
+        #    ★E4-1 이후 이 조건은 팩에서 `.example` 까지 지워야 성립한다(⑱ 참조).
         l3_before = open(live3_set, encoding="utf-8").read()
         buf = io.StringIO()
         rc, rows, _c, _s = process([live3], "stop", False, False, pack, out=buf)
@@ -895,6 +947,49 @@ def self_test():
         chk(rc == EXIT_TARGET and "REFUSED" in o,
             "⑰ CLI 경로에서 .claude-3+stop 이 거부되지 않음: rc=%s" % rc)
 
+        # ══ E4-1(사인오프 R-04 잔여 HIGH) 배포 기본 상태 = `.example` 폴백 ═════════════
+        # install 직후 실물은 `hook-targets.json.example` 뿐이다. 그 상태에서 기계 방어가
+        # 죽어 있으면(WOULD-ADD·rc=0) R-04 원 결함이 배포 기본값으로 되살아난다.
+        expath = mktable(tbl_doc, name="hook-targets.json.example")
+        os.remove(tp)                                       # 운영 표 제거 = install 직후
+        chk(not os.path.exists(tp) and os.path.exists(expath), "⑱ 픽스처 구성 실패")
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "stop", True, False, pack, out=buf)
+        chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
+            "⑱ **배포 기본 상태(.example 만 존재)에서 .claude-3+stop 이 통과** — R-04 재발: "
+            "rc=%s %s" % (rc, rows[0]["action"]))
+        chk("guard_stop=deny" in rows[0]["note"], "⑱ 예시표 폴백 거부 사유에 표 근거 부재")
+        chk(open(live3_set, encoding="utf-8").read() == l3_before, "⑱ 거부인데 파일이 변경됨")
+        chk("배포 예시표 폴백" in buf.getvalue(), "⑱ 폴백 출처 고지 부재(침묵 폴백 금지)")
+        chk("cp " in buf.getvalue() and "hook-targets.json.example" in buf.getvalue(),
+            "⑱ 운영 표 설치 안내(cp) 부재")
+        chk("하드코딩 폴백" not in buf.getvalue(), "⑱ 예시표가 있는데 하드코딩 폴백으로 고지")
+        # 훅별 분리·allow 프로필은 예시표 폴백에서도 종전 그대로
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([wdir], "stop", False, False, pack, out=buf)
+        chk(rc == EXIT_OK and rows[0]["action"].startswith("ALREADY"),
+            "⑱ 예시표 폴백에서 워커 프로필이 막힘: %s" % rows[0]["action"])
+        # CLI 경로 + --from-table 도 예시표에서 파생된다(운영 표 부재여도 파생원 존재)
+        rc, o = run_main(["--hook", "stop", "--profile", live3, "--pack", pack])
+        chk(rc == EXIT_TARGET and "REFUSED" in o,
+            "⑱ CLI 경로 예시표 폴백이 거부하지 않음: rc=%s" % rc)
+        rc, o = run_main(["--hook", "stop", "--from-table", "--pack", pack])
+        chk(rc == EXIT_OK and ".claude-cysinsight" in o and ".claude-3" not in o,
+            "⑱ --from-table 이 예시표에서 파생되지 않음: rc=%s" % rc)
+        # 예시표 손상도 폴백 금지(exit 2·쓰기 0) — 배포물 손상을 관대하게 접지 않는다
+        mktable("{ not json", name="hook-targets.json.example")
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "stop", True, False, pack, out=buf)
+        chk(rc == EXIT_ARGS and rows == [], "⑱ 손상 예시표가 exit 2 로 멈추지 않음: rc=%s" % rc)
+        chk("대상표 손상(배포 예시표)" in buf.getvalue(), "⑱ 예시표 손상 출처 미표기")
+        # 운영 표가 있으면 예시표 손상은 무관(우선순위: 운영 표 > 예시표)
+        mktable(tbl_doc)
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "stop", True, False, pack, out=buf)
+        chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
+            "⑱ 운영 표 존재 시에도 손상 예시표가 판정을 오염시킴: rc=%s" % rc)
+        os.remove(expath)
+
     if fails:
         print("javis_guard_register self-test FAIL %d건:" % len(fails), file=sys.stderr)
         for f in fails:
@@ -907,7 +1002,10 @@ def self_test():
           " · E3-1(R-04) 대상표 소비: 부재=폴백(결함 재현 WOULD-ADD)·공급 시 .claude-3+stop"
           " REFUSED·훅별 분리(brief-warn allow)·미지 deny-by-default+--force-unknown·"
           "basename 'claude'≠'.claude'·손상 표 exit 2 무폴백 4종·C73/C74 파생원 단일화·"
-          "--from-table 파생·CLI 경로 재확인")
+          "--from-table 파생·CLI 경로 재확인"
+          " · E4-1(R-04 배포 기본값) 예시표 폴백: `.example` 만 있는 install 직후 상태에서 "
+          ".claude-3+stop REFUSED(기계 방어 생존)·폴백 출처+cp 설치 안내 고지·워커 프로필 "
+          "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선")
     return 0
 
 
@@ -942,19 +1040,22 @@ def main(argv=None):
     if a.self_test:
         return self_test()
     pack = a.pack or _pack_dir()
-    tpath = _targets_path(pack, a.hook_targets)
-    table, terr = _load_targets(tpath)
+    # ★E4-1: 운영 표 → 배포 예시표 → 하드코딩 3단(손상은 어느 단계든 폴백 없이 exit 2).
+    table, terr, tpath, tsource = _resolve_targets(pack, a.hook_targets)
     if terr:
-        print("대상표 손상: %s — %s" % (tpath, terr), file=sys.stderr)
-        print("→ 등록 중단(쓰기 0). 표를 고치거나 지워라(지우면 하드코딩 폴백).", file=sys.stderr)
+        print("대상표 손상%s: %s — %s"
+              % ("(배포 예시표)" if tsource == "example" else "", tpath, terr), file=sys.stderr)
+        print("→ 등록 중단(쓰기 0). 표를 고치거나 지워라(운영 표를 지우면 배포 예시표 폴백, "
+              "예시표까지 없으면 하드코딩 폴백 · 다른 표는 --hook-targets).", file=sys.stderr)
         return EXIT_ARGS
 
     profiles = list(a.profile)
     if a.from_table:
         # ★E3-1: 대상 목록도 표에서 파생 — 손타이핑 누락(R-04(b))을 구조적으로 제거한다.
         if table is None:
-            ap.error("--from-table 인데 대상표가 없다(%s) — 표를 공급하거나 --profile 을 써라"
-                     % tpath)
+            ap.error("--from-table 인데 대상표가 없다(%s · 배포 예시표 %s%s 도 부재) — "
+                     "표를 공급하거나 --profile 을 써라"
+                     % (tpath, tpath, TARGETS_EXAMPLE_SUFFIX))
         if a.profile:
             ap.error("--from-table 과 --profile 은 함께 쓰지 않는다(파생원이 둘이 된다)")
         elig = _table_eligible(table, a.hook)
@@ -969,7 +1070,8 @@ def main(argv=None):
     rc, _rows, _cmd, _spec = process(profiles, a.hook, a.apply, a.force_master, pack,
                                      repair_timeout=a.repair_timeout,
                                      force_unknown=a.force_unknown,
-                                     targets_path=a.hook_targets, table=table)
+                                     targets_path=a.hook_targets, table=table,
+                                     table_source=tsource)
     if a.emit_expected:
         emit_expected(profiles, a.hook, pack, a.emit_expected, a.apply, table=table)
     if a.emit_warn_targets:
