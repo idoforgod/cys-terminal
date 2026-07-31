@@ -1,0 +1,38 @@
+{
+ "_README": [
+  "C73(preflight) 기대 집합 마커의 **스키마+예시**다. 실값이 아니다.",
+  "설치 경로: $PACK/state/guard-hook-expected.json  ($PACK = ${CYS_PACK_DIR:-$HOME/.cys/pack})",
+  "이 파일명(.example 접미)이 유지되는 한 C73 은 SKIP 이다 — 부재 SKIP 계약을 깨지 않으려고 일부러 접미를 붙였다.",
+  "실값 생성 절차(OT-2): python3 $PACK/bin/javis_guard_register.py --hook stop \\",
+  "                        --profile ~/.claude-cysinsight --profile ~/.cys/claude \\",
+  "                        --emit-expected $PACK/state/guard-hook-expected.json --apply",
+  "  · --apply 없이 돌리면 내용만 출력하고 파일을 만들지 않는다(미리보기).",
+  "  · 생성 시점의 settings.json sha256 이 박제되므로 **등록을 마친 뒤** 생성한다(등록 전 생성 = 첫 실행부터 WARN).",
+  "판정 서열(G7g · javis_preflight.c73_guard_hook_integrity):",
+  "  must_contain 미충족 / settings 판독 불가 = FAIL(훅 자가제거 의심 · D4)",
+  "  must_contain 충족 + sha256 불일치     = WARN 강등(settings 는 정당 사유로도 바뀐다)",
+  "  마커 부재 = SKIP(라이브 등록 전 정상) · 마커 손상 = WARN(감시 불능 표면화·부트 비차단)",
+  "갱신 책임: settings 를 정당 변경한 주체가 **같은 변경 안에서** 아래 sha256 을 재계산·갱신한다(방치 = WARN 잔존).",
+  "대상표 경계: 이 표는 **guard(Stop) 전용**이다 — 워커 2프로필만. master(~/.claude)는 넣지 않는다(설계 §1-3 분리 독립).",
+  "되돌리는 법: 이 파일을 지우면 C73 은 SKIP 으로 돌아간다(감시가 꺼질 뿐 부트·훅에는 영향 0)."
+ ],
+ "schema_version": 1,
+ "generated_at": "<UTC 20260731T000000Z — 생성 도구가 채운다>",
+ "note": "C73 기대 집합 마커 — must_contain 이 1급 신호이고 sha256 불일치는 must_contain 통과 시 WARN 강등(G7g).",
+ "profiles": [
+  {
+   "settings": "/Users/<user>/.claude-cysinsight/settings.json",
+   "sha256": "<등록 완료 후 settings.json 의 sha256 64자 · 선택 필드(생략 시 must_contain 만 검사)>",
+   "must_contain": [
+    "sh /Users/<user>/.cys/pack/hooks/completion-guard.sh"
+   ]
+  },
+  {
+   "settings": "/Users/<user>/.cys/claude/settings.json",
+   "sha256": "<동일>",
+   "must_contain": [
+    "sh /Users/<user>/.cys/pack/hooks/completion-guard.sh"
+   ]
+  }
+ ]
+}
