@@ -60,9 +60,9 @@
   판정 어휘는 신설하지 않았다: 거부는 종전과 같은 `REFUSED` 행이고 문면 형식도 같다.
 
 사용:
-  python3 javis_guard_register.py --hook stop --profile ~/.claude-cysinsight --profile ~/.cys/claude
+  python3 javis_guard_register.py --hook stop --profile ~/.claude-worker --profile ~/.cys/claude
   python3 javis_guard_register.py --hook brief-warn --profile ~/.claude --apply
-  python3 javis_guard_register.py --hook stop --profile ~/.claude-cysinsight --emit-expected out.json
+  python3 javis_guard_register.py --hook stop --profile ~/.claude-worker --emit-expected out.json
   python3 javis_guard_register.py --self-test
 
 exit: 0 = 정상(dry-run 포함) · 1 = 대상 오류(부재·손상·역할 경계 위반) · 2 = 인자 오류.
@@ -663,7 +663,7 @@ def self_test():
             open(p, "w", encoding="utf-8").write(body)
             return d, p
 
-        wdir, wset = mkprof(".claude-cysinsight",
+        wdir, wset = mkprof(".claude-worker",
                             '{\n  "model": "opus",\n  "hooks": {\n    "Stop": []\n  }\n}\n')
         mdir, mset = mkprof(".claude", '{\n  "hooks": {}\n}\n')
 
@@ -820,8 +820,8 @@ def self_test():
                        ent(".claude", "deny", "allow", "master"),
                        ent(".claude-3", "deny", "allow", "master(라이브 실측)",
                            path=os.path.join(td, ".claude-3")),
-                       ent(".claude-cysinsight", "allow", "allow", "worker",
-                           path=os.path.join(td, ".claude-cysinsight")),
+                       ent(".claude-worker", "allow", "allow", "worker",
+                           path=os.path.join(td, ".claude-worker")),
                        ent("claude", "allow", "allow", "worker(함대 공용)",
                            path=os.path.join(td, "claude")),
                        ent(".claude-2", "deny", "deny", "unclear"),
@@ -899,9 +899,9 @@ def self_test():
         tbl, terr = _load_targets(tp)
         chk(terr is None and tbl is not None, "⑯ 정상 표 로드 실패: %s" % terr)
         chk([e["basename"] for e in _table_eligible(tbl, "stop")]
-            == [".claude-cysinsight", "claude"], "⑯ guard allow 집합 파생 오류")
+            == [".claude-worker", "claude"], "⑯ guard allow 집합 파생 오류")
         chk([e["basename"] for e in _table_eligible(tbl, "brief-warn")]
-            == [".claude", ".claude-3", ".claude-cysinsight", "claude"],
+            == [".claude", ".claude-3", ".claude-worker", "claude"],
             "⑯ brief-warn allow 집합 파생 오류(.claude-3 누락 = R-04(b) 재발)")
         exp2 = os.path.join(td, "guard-hook-expected-2.json")
         emit_expected([wdir], "stop", pack, exp2, True, out=io.StringIO(), table=tbl)
@@ -920,7 +920,7 @@ def self_test():
         #   구현이 그랬다: `%-24s # role` 형태 → basename 이 통째로 오염).
         with open(wt, encoding="utf-8") as _f:
             names = [ln.strip() for ln in _f if ln.strip() and not ln.startswith("#")]
-        chk(names == [".claude", ".claude-3", ".claude-cysinsight", "claude"],
+        chk(names == [".claude", ".claude-3", ".claude-worker", "claude"],
             "⑯ C74 대상표 파생 오류(소비자 파서 기준): %r" % names)
 
         # ⑰ --from-table 파생 — 손타이핑 없이 allow 집합만 대상이 된다
@@ -937,7 +937,7 @@ def self_test():
         rc, o = run_main(["--hook", "stop", "--from-table", "--pack", pack,
                           "--hook-targets", tp])
         chk(rc == EXIT_OK, "⑰ --from-table dry-run rc=%s" % rc)
-        chk(".claude-cysinsight" in o and "claude" in o and ".claude-3" not in o,
+        chk(".claude-worker" in o and "claude" in o and ".claude-3" not in o,
             "⑰ --from-table 파생 대상 오류(deny 프로필 혼입/allow 누락)")
         rc, _o = run_main(["--hook", "stop", "--from-table", "--profile", wdir,
                            "--pack", pack, "--hook-targets", tp])
@@ -974,7 +974,7 @@ def self_test():
         chk(rc == EXIT_TARGET and "REFUSED" in o,
             "⑱ CLI 경로 예시표 폴백이 거부하지 않음: rc=%s" % rc)
         rc, o = run_main(["--hook", "stop", "--from-table", "--pack", pack])
-        chk(rc == EXIT_OK and ".claude-cysinsight" in o and ".claude-3" not in o,
+        chk(rc == EXIT_OK and ".claude-worker" in o and ".claude-3" not in o,
             "⑱ --from-table 이 예시표에서 파생되지 않음: rc=%s" % rc)
         # 예시표 손상도 폴백 금지(exit 2·쓰기 0) — 배포물 손상을 관대하게 접지 않는다
         mktable("{ not json", name="hook-targets.json.example")

@@ -174,7 +174,7 @@ class TestC73(Base):
         self.assertIn("등록 전", detail)
 
     def test_registered_pass_then_self_removal_fail(self):
-        sp = self.mkprofile(".claude-cysinsight",
+        sp = self.mkprofile(".claude-worker",
                             '{"hooks":{"Stop":[{"hooks":[{"type":"command",'
                             '"command":"sh /p/hooks/completion-guard.sh","timeout":60}]}]}}')
         import hashlib
@@ -196,7 +196,7 @@ class TestC73(Base):
 
     def test_sha_drift_is_warn_not_fail(self):
         """G7g 판정 서열: must_contain 통과 시 sha 불일치는 WARN 강등(오경보 양산 차단)."""
-        sp = self.mkprofile(".claude-cysinsight",
+        sp = self.mkprofile(".claude-worker",
                             '{"hooks":{"Stop":[{"hooks":[{"type":"command",'
                             '"command":"sh /p/hooks/completion-guard.sh"}]}]}}')
         self.expected([{"settings": sp, "sha256": "0" * 64,
@@ -299,7 +299,7 @@ class TestC74(Base):
                    for b, r, gs, bw in (
                        (".claude", "master", "deny", "allow"),
                        (".claude-3", "master(라이브)", "deny", "allow"),
-                       (".claude-cysinsight", "worker", "allow", "allow"),
+                       (".claude-worker", "worker", "allow", "allow"),
                        (".claude-2", "unclear", "deny", "deny"))]}
         with open(tpath, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False)
@@ -310,7 +310,7 @@ class TestC74(Base):
 
         reg = ('{"hooks":{"PostToolUse":[{"matcher":"Task|Agent","hooks":'
                '[{"type":"command","command":"sh /p/hooks/brief-lint-warn.sh"}]}]}}')
-        for b in (".claude", ".claude-3", ".claude-cysinsight"):
+        for b in (".claude", ".claude-3", ".claude-worker"):
             self.mkprofile(b, reg)
         self.mkprofile(".claude-2")                      # deny 대상 — 미등록이어도 무관
         st, detail = self.check("c74_brief_gate_paths", "C74")

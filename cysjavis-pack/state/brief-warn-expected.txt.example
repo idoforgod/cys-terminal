@@ -10,12 +10,12 @@
 #
 # ★대상표 분리 독립(설계 §1-3 · C74 판정 기준):
 #   · 경고 훅(brief-lint-warn.sh) = master `~/.claude` **포함** — 위임을 만드는 쪽이 master 이기 때문이다.
-#   · completion-guard(Stop)      = 워커 2프로필 **전용**(.claude-cysinsight · ~/.cys/claude) — C73 표에 있다.
+#   · completion-guard(Stop)      = 워커 2프로필 **전용**(.claude-worker · ~/.cys/claude) — C73 표에 있다.
 #   두 표를 합치면 master pane 에 guard 가 등록되는 사고 경로가 열린다. 절대 합치지 않는다.
 #
 # 실값 채우는 절차(OT-2):
 #   1) python3 $PACK/bin/javis_guard_register.py --hook brief-warn \
-#        --profile ~/.claude --profile ~/.claude-cysinsight --profile ~/.cys/claude      (dry-run 확인)
+#        --profile ~/.claude --profile ~/.claude-worker --profile ~/.cys/claude      (dry-run 확인)
 #   2) 같은 명령에 --apply 를 붙여 등록
 #   3) 아래 3줄에서 '#' 를 떼고 이 파일을 brief-warn-expected.txt 로 설치
 #   4) python3 $PACK/bin/javis_preflight.py | grep C74   → 미등록 0 이면 표 기준 통과
@@ -25,5 +25,5 @@
 #              .bak-guard-<타임스탬프> 백업을 되돌린다(javis_guard_register 가 등록 전에 만든다).
 
 #.claude
-#.claude-cysinsight
+#.claude-worker
 #claude

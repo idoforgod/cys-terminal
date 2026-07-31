@@ -6,7 +6,7 @@
 # 등록 대상: PostToolUse(Task|Agent) — W0-2 verify-reminder.sh 라인의 승계·흡수. 라이브 등록은
 # [OT-2] 오너 승인 후 개별 항목 등록(디스패처 편입 단독은 무음 비활성 — D22). ★등록 대상표는
 # completion-guard 와 분리 독립(설계 §1-3): 경고 훅 = master `~/.claude` **포함** / guard = 워커
-# 2프로필(`~/.claude-cysinsight`+`~/.cys/claude`) — C74(B2) 판정 기준이 이 표를 핀한다.
+# 2프로필(`~/.claude-worker`+`~/.cys/claude`) — C74(B2) 판정 기준이 이 표를 핀한다.
 #
 # ★조건 11 흡수 선언(설계 §1-3): javis_verify_reminder.py 는 descope(동일 기능 이중 구현 금지) —
 #   그 역할(위임 브리프 verify 부재 경고 주입)을 이 훅이 승계한다. 승계 계약 2:

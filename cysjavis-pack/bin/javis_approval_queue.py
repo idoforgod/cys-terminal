@@ -2988,13 +2988,21 @@ def self_test(a=None):
             "⑧S8: 빈 큐 다이제스트가 발행됨: rc=%s %s" % (rc, out[:200]))
 
         # ── ⑨ 시크릿 스캔: /Users/ 포함 payload → 발신 거부 + 경보 ──
+        #
+        # ★검체 리터럴 제약(릴리스 레인 함정 · 0.14.7 에서 실제로 CI 를 막았다): 이 파일은 공개
+        # 리포에 발행되고 팩에 임베드되므로 `scripts/secret-scan.sh` · `scan-pack-secrets.sh`
+        # 두 게이트를 통과해야 한다. 그래서 검체는 **스캐너가 허용하는 형태**로만 쓴다 —
+        #   · 홈경로는 `/Users/x/…` 더미만(실 사용자명은 PATH 규칙에 차단된다)
+        #   · `sk-` 키는 알파넘 **19자 이하**(게이트 하한 20자 미만). `javis_scrub` 의 탐지 하한은
+        #     8자라 이 검체는 여전히 스캔 대상이다 — 즉 짧게 써도 검증력은 그대로다.
+        # 이 두 제약을 어기면 테스트는 통과하지만 **태그 CI 가 pre-build 게이트에서 즉사**한다.
         r9 = new_root("c9")
         os.makedirs(os.path.join(r9, "_round", "approvals"), exist_ok=True)
         with open(os.path.join(r9, "_round", "approvals", ".slack-enabled"), "w") as f:
             f.write("on\n")
         rc, out, _e = run_q(r9, ["submit", "--request-id", "S1", "--class", "approval",
                                  "--source", "s1",
-                                 "--summary", "로그 경로 /Users/cys-macbook/x.log 확인"])
+                                 "--summary", "로그 경로 /Users/x/x.log 확인"])
         j9 = json.loads(out)
         chk(j9["slack"] == "blocked" and "절대경로" in j9["slack_detail"],
             "⑨시크릿 스캔 거부 실패: %s" % out[:300])
@@ -3008,7 +3016,7 @@ def self_test(a=None):
                                ("S3", "경로 /users/lower/x 확인", "대소문자 무시"),
                                ("S4", "홈 ~/secrets/x.log 확인", "~/ 홈경로"),
                                ("S5", "루트는 /Users", "후행 슬래시 없음"),
-                               ("S6", "키 sk-abcdefghijklmnop1234 노출", "sk- 키")):
+                               ("S6", "키 sk-abcdefghij12 노출", "sk- 키")):
             rc, out, _e = run_q(r9, ["submit", "--request-id", sid, "--class", "approval",
                                      "--source", "s1", "--summary", summ])
             chk(json.loads(out)["slack"] == "blocked", "⑨%s 미검출: %s" % (why, out[:200]))
