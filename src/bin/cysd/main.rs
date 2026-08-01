@@ -612,6 +612,10 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
             cmd.arg(&script)
                 // 브리지의 cys 호출이 라이벌 데몬을 autostart하는 재귀 차단(auto-restore와 동일 계약).
                 .env("CYS_NO_AUTOSTART", "1")
+                // ★SEAL-1: 브리지는 **장수 프로세스**라 import 표면이 가장 넓다 — 번들 python 이
+                // 여기서 `.pyc` 를 쓰면 코드서명 봉인이 깨진다. tokio 빌더라 python_command 팩토리를
+                // 못 쓰므로 같은 상수를 직접 소비한다(규약 산재 아님 · lib.rs ENV_PY_NO_BYTECODE).
+                .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
                 // 런타임 상태는 팩 트리 밖으로(팩 본체 오염 0 — 팩 편입 계약 HUD_STATE_DIR).
                 .env("HUD_STATE_DIR", state_dir.join("office-bridge"))
                 .stdin(std::process::Stdio::null())
@@ -826,7 +830,8 @@ fn extract_phoenix_embed(
 /// 실행성만 확인(데몬·상태 무접촉). 실패=false(호출측이 정리 후 디스크 폴백).
 fn phoenix_self_test(python: &str, script: &std::path::Path) -> bool {
     use crate::state::HideConsole;
-    let out = std::process::Command::new(python)
+    // ★SEAL-1: 동봉 python 직스폰 — 팩토리가 PYTHONDONTWRITEBYTECODE 를 얹는다(번들 봉인 보호).
+    let out = cys::python_command(python)
         .arg(script)
         .arg("--selftest")
         .env("CYS_NO_AUTOSTART", "1")
@@ -1084,7 +1089,9 @@ fn run_auto_restore_once(
     env: &[(String, String)],
     log_path: &std::path::Path,
 ) -> Option<i32> {
-    let mut cmd = std::process::Command::new(program);
+    // ★SEAL-1: program 은 동봉 python(decide_auto_restore 가 해석) — 팩토리가
+    // PYTHONDONTWRITEBYTECODE 를 얹어 콜드부트 복원이 번들 봉인을 깨지 않게 한다.
+    let mut cmd = cys::python_command(program);
     cmd.args(args).env("CYS_NO_AUTOSTART", "1");
     for (k, v) in env {
         cmd.env(k, v);

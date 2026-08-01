@@ -3431,6 +3431,11 @@ enum DiagStatus {
     Ok,
     Warn,
     Fail,
+    /// **판정 불가** — 대상 부재·플랫폼 미해당·검사 도구 부재로 *검사를 수행하지 못한* 상태.
+    /// ★거짓 FAIL·거짓 OK 동시 금지의 자리다: "검사하지 못했다"를 "이상 없다"(Ok)로 적으면
+    /// 관측 부재가 통과로 둔갑하고, Fail 로 적으면 정상 기계에 거짓 경보가 뜬다.
+    /// 종료코드는 Fail 수만 보므로 Skip 은 exit 0 을 바꾸지 않는다.
+    Skip,
 }
 
 impl DiagStatus {
@@ -3439,6 +3444,7 @@ impl DiagStatus {
             DiagStatus::Ok => "OK",
             DiagStatus::Warn => "WARN",
             DiagStatus::Fail => "FAIL",
+            DiagStatus::Skip => "SKIP",
         }
     }
 }
@@ -3461,6 +3467,9 @@ struct DoctorCtx {
     daemon_state_dir: std::path::PathBuf,
     settings_paths: Vec<String>,
     binary_version: String,
+    /// 자기 앱 번들 루트(`…/cys.app`). 번들 밖 실행(cargo run·비번들 설치)이면 None =
+    /// 코드서명 봉인 검사 **판정 불가**(Skip). 테스트는 여기에 임시 번들을 주입한다.
+    app_bundle: Option<std::path::PathBuf>,
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
@@ -4161,6 +4170,187 @@ fn diag_legacy_config(_ctx: &DoctorCtx) -> DiagItem {
     }
 }
 
+// ───────────────────── M3: 앱 번들 코드서명 봉인 자가진단 (app-seal) ─────────────────────
+//
+// ★실사고 2026-08-01(근본원인 확정): 번들 안 Python 런타임이 **실행 중**
+//   `Contents/Resources/runtime/python/lib/python3.12/**/__pycache__/*.pyc` 를 번들 *안에*
+//   생성한다. 그 순간 codesign 봉인(sealed resources)이 깨진다 —
+//   "a sealed resource is missing or invalid / file added: …/_compression.cpython-312.pyc".
+//   로컬에서는 이미 실행 중인 앱이라 아무 증상이 없다(무증상 보균). 그러나 이 상태의 번들을
+//   사용자가 **브라우저로 받아** 설치하면 quarantine 이 붙고, 첫 실행 시 Gatekeeper 가 번들
+//   **전체를 재검증**해 "손상되었기 때문에 열 수 없습니다"로 차단한다. 공증·staple 은 정상인데도.
+//   릴리스 검증이 curl 사본(quarantine 없음)만 봐서 이 경로를 한 번도 재현하지 못했다.
+//
+// 그래서 이 진단의 임무는 "고치는 것"이 아니라 **정직하게 알리는 것**이다: 이 기계의 설치본이
+// 이미 봉인을 깼는지, 깼다면 어떤 파일 때문인지, 그리고 어떻게 복구하는지.
+// ★doctor --fix 는 이 항목을 절대 자동 수정하지 않는다 — 번들 안 파일을 지우는 "부분 수리"는
+//   ⓐ App Management(TCC) 보호에 막히고 ⓑ 지운 파일이 원래 봉인에 있던 것이면 added 가
+//   missing 으로 바뀔 뿐 봉인은 여전히 깨진 채다. 유일한 복구는 **번들 통째 교체**다.
+
+/// 실행 파일 경로에서 자기 앱 번들 루트(`…/*.app`)를 찾는다. macOS 번들 레이아웃
+/// `X.app/Contents/MacOS/<exe>` 를 조상 방향으로 거슬러 올라가되, `Contents/Info.plist`
+/// 존재로 **진짜 번들임을 확증**한다(이름만 `.app` 인 디렉토리에 속지 않는다).
+/// 번들 밖 실행(cargo run·비번들 설치)이면 None → 호출부가 Skip 으로 강등한다.
+/// ★심링크: `current_exe()` 는 이미 realpath 라 `/usr/local/bin/cys → 번들 안 실체`로 불러도
+///   번들이 정상 탐지된다(심링크 경로를 그대로 쓰면 탐지 실패했을 자리).
+fn detect_app_bundle(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    for anc in exe.ancestors() {
+        let looks_app = anc
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".app"))
+            .unwrap_or(false);
+        if looks_app && anc.join("Contents").join("Info.plist").is_file() {
+            return Some(anc.to_path_buf());
+        }
+    }
+    None
+}
+
+/// codesign 진단 출력에서 봉인 파손의 **원인 파일**을 갈래별로 분류한다(순수 함수 = 테스트 대상).
+/// 반환 `(added, modified, missing, other)` — other 는 세 갈래에 안 잡힌 진단 문장(요약줄 포함).
+/// ★`--verbose` 필수: 무-verbose 출력은 "a sealed resource is missing or invalid" 요약 한 줄뿐이라
+///   *어떤 파일 때문인지*를 사용자에게 말할 수 없다(실측 확인).
+fn parse_codesign_seal_failure(out: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut missing = Vec::new();
+    let mut other = Vec::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(p) = l.strip_prefix("file added: ") {
+            added.push(p.trim().to_string());
+        } else if let Some(p) = l.strip_prefix("file modified: ") {
+            modified.push(p.trim().to_string());
+        } else if let Some(p) = l.strip_prefix("file missing: ") {
+            missing.push(p.trim().to_string());
+        } else if l.starts_with("--prepared:") || l.starts_with("--validated:") {
+            // verbose 진행 로그 — 진단이 아니다.
+            continue;
+        } else {
+            other.push(l.to_string());
+        }
+    }
+    (added, modified, missing, other)
+}
+
+/// 번들 루트 접두를 떼어 사람이 읽을 수 있게 줄인다(로그 폭·개인 경로 노출 축소).
+fn seal_rel(bundle: &std::path::Path, p: &str) -> String {
+    let b = bundle.to_string_lossy();
+    p.strip_prefix(b.as_ref())
+        .map(|r| r.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| p.to_string())
+}
+
+/// 봉인 파손 시 사용자에게 주는 **유일하게 통하는 복구 절차**.
+/// /Applications 안에서 파일을 지우는 부분 수정은 App Management(TCC)에 막히므로,
+/// 임시 폴더에 새 번들을 스테이징한 뒤 `mv` 로 통째 교체해야 한다.
+const APP_SEAL_RECOVERY: &str = "복구는 번들 통째 재설치뿐 — ①cys 종료 ②새 DMG의 cys.app 을 임시 폴더에 \
+스테이징(`ditto --rsrc --extattr --acl <dmg>/cys.app /tmp/cys-stage/cys.app`) ③`mv /Applications/cys.app \
+~/.Trash/cys.app.broken` ④`mv /tmp/cys-stage/cys.app /Applications/`. \
+★/Applications 안 번들의 파일을 지우는 '부분 수정'은 App Management 보호에 막히고, 막히지 않아도 \
+봉인은 복구되지 않는다(added 가 missing 으로 바뀔 뿐). ★재설치 전까지 이 사본을 다른 맥으로 \
+전달하지 말 것 — quarantine 이 붙은 첫 실행에서 '손상되었기 때문에 열 수 없습니다'로 차단된다";
+
+fn diag_app_seal(ctx: &DoctorCtx) -> DiagItem {
+    let name = "app-seal";
+    let skip = |detail: String| DiagItem {
+        name,
+        status: DiagStatus::Skip,
+        detail,
+        action: String::new(),
+    };
+    if !cfg!(target_os = "macos") {
+        return skip("macOS 아님 — 코드서명 봉인 검사 미해당".into());
+    }
+    let Some(bundle) = ctx.app_bundle.as_ref() else {
+        return skip("앱 번들 밖 실행(개발 빌드·비번들 설치) — 검사 대상 없음".into());
+    };
+    if !bundle.exists() {
+        return skip(format!("앱 번들 경로 소멸({}) — 판정 불가", bundle.display()));
+    }
+    // codesign 은 stock macOS 의 /usr/bin 상주 도구다. PATH 하이재킹을 피해 절대경로로 부르고,
+    // 부재(비정상 OS·축소 이미지)는 FAIL 이 아니라 판정 불가다.
+    let tool = std::path::Path::new("/usr/bin/codesign");
+    if !tool.exists() {
+        return skip("/usr/bin/codesign 부재 — 판정 불가".into());
+    }
+    // `--verify --strict` = Gatekeeper 가 보는 최상위 봉인 판정(+ 주 실행파일). `--deep` 은 쓰지
+    // 않는다: 이번 파손은 최상위 sealed resource 이고, --deep 은 중첩 서명까지 훑어 느리다.
+    // 읽기 전용·로컬·유계 연산이라 별도 타임아웃을 두지 않는다(실측: 실 번들 0.47s).
+    let out = match std::process::Command::new(tool)
+        .args(["--verify", "--strict", "--verbose"])
+        .arg(bundle)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return skip(format!("codesign 실행 실패({e}) — 판정 불가")),
+    };
+    if out.status.success() {
+        return DiagItem {
+            name,
+            status: DiagStatus::Ok,
+            detail: format!("코드서명 봉인 무결 — {}", bundle.display()),
+            action: String::new(),
+        };
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (added, modified, missing, other) = parse_codesign_seal_failure(&text);
+    let broken = !added.is_empty() || !modified.is_empty() || !missing.is_empty();
+    if !broken {
+        // codesign 이 실패했지만 봉인 파손 문장이 아니다(미서명 dev 번들·해석 불가 오류 등).
+        // 손상을 확증하지 못했으므로 FAIL 로 겁주지 않고, 관측 사실만 WARN 으로 남긴다.
+        let tail: String = other.join(" | ").chars().take(300).collect();
+        return DiagItem {
+            name,
+            status: DiagStatus::Warn,
+            detail: format!(
+                "codesign 검증 실패(exit {}) — 봉인 파손 파일은 특정되지 않음: {}",
+                out.status.code().unwrap_or(-1),
+                if tail.is_empty() { "(출력 없음)".into() } else { tail }
+            ),
+            action: "미서명 개발 빌드면 정상. 배포본이면 서명·공증 상태를 확인하라(codesign -dvvv)".into(),
+        };
+    }
+    let sample: Vec<String> = added
+        .iter()
+        .chain(modified.iter())
+        .chain(missing.iter())
+        .take(3)
+        .map(|p| seal_rel(bundle, p))
+        .collect();
+    let all: Vec<&String> = added.iter().chain(modified.iter()).chain(missing.iter()).collect();
+    // 자기유발 파손의 지문: 원인 파일이 전부 __pycache__ 면 번들 안 Python 런타임이 범인이다.
+    let pycache_note = if all.iter().all(|p| p.contains("__pycache__")) {
+        " ★원인 파일이 전부 __pycache__ — 번들 안 Python 런타임이 실행 중 스스로 생성해 봉인을 깼다(자기유발)."
+    } else {
+        ""
+    };
+    DiagItem {
+        name,
+        status: DiagStatus::Fail,
+        detail: format!(
+            "코드서명 봉인 파손 — {} · 추가 {}건·수정 {}건·누락 {}건 (예: {}){} \
+             이 번들을 브라우저로 배포하면 받는 쪽 첫 실행에서 Gatekeeper 가 '손상되었기 때문에 \
+             열 수 없습니다'로 차단한다(공증·staple 은 정상이어도).",
+            bundle.display(),
+            added.len(),
+            modified.len(),
+            missing.len(),
+            sample.join(", "),
+            pycache_note
+        ),
+        action: APP_SEAL_RECOVERY.into(),
+    }
+}
+
 fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
     vec![
         diag_pack_version(ctx),
@@ -4172,6 +4362,8 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_staging_residue(ctx, fix),
         diag_channels_db(ctx),
         diag_legacy_config(ctx),
+        // M3: 자기 앱 번들 코드서명 봉인(설치본이 스스로 봉인을 깼는지) — 읽기 전용, --fix 무관.
+        diag_app_seal(ctx),
     ]
 }
 
@@ -4201,10 +4393,13 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
         daemon_state_dir,
         settings_paths,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        // 번들 밖 실행이면 None → app-seal 은 Skip(판정 불가). 탐지 실패를 정상으로 적지 않는다.
+        app_bundle: std::env::current_exe().ok().as_deref().and_then(detect_app_bundle),
     };
     let items = run_doctor_diagnostics(&ctx, fix);
     let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
     let warns = items.iter().filter(|i| i.status == DiagStatus::Warn).count();
+    let skips = items.iter().filter(|i| i.status == DiagStatus::Skip).count();
     if json_out {
         let arr: Vec<Value> = items
             .iter()
@@ -4221,7 +4416,8 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "fix": fix,
-                "summary": {"ok": items.len() - fails - warns, "warn": warns, "fail": fails},
+                "summary": {"ok": items.len() - fails - warns - skips, "warn": warns,
+                            "fail": fails, "skip": skips},
                 "items": arr
             }))
             .unwrap_or_default()
@@ -4238,10 +4434,11 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
             }
         }
         println!(
-            "요약: {} OK · {} WARN · {} FAIL",
-            items.len() - fails - warns,
+            "요약: {} OK · {} WARN · {} FAIL · {} SKIP(판정 불가)",
+            items.len() - fails - warns - skips,
             warns,
-            fails
+            fails,
+            skips
         );
     }
     if fails > 0 {
@@ -5205,7 +5402,9 @@ fn escalate_reclaim(role: &str) {
         eprintln!("[boot] reclaim 헬퍼 부재({}) — 에스컬레이션 생략", helper.display());
         return;
     }
-    match std::process::Command::new("python3")
+    // ★SEAL-1: PATH 선두가 동봉 runtime 이면 이 `python3` 는 앱 번들 안의 인터프리터다 —
+    // 팩토리가 PYTHONDONTWRITEBYTECODE 를 얹어 `.pyc` 번들 오염(코드서명 봉인 파손)을 막는다.
+    match cys::python_command("python3")
         .arg(&helper)
         .args(["--reclaim", "--role", role])
         .output()
@@ -10140,7 +10339,8 @@ fn skillscan_warn(skill_dir: &std::path::Path) {
     if !scanner.exists() {
         return;
     }
-    match std::process::Command::new("python3")
+    // ★SEAL-1: 동봉 python 해소 시 `.pyc` 번들 오염 차단(팩토리가 env 주입 — lib.rs SOT).
+    match cys::python_command("python3")
         .arg(&scanner)
         .arg("scan")
         .arg(skill_dir)
@@ -12456,6 +12656,7 @@ mod tests {
             daemon_state_dir: base.to_path_buf(),
             settings_paths: vec![base.join("settings.json").to_string_lossy().into_owned()],
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_bundle: None, // 기본은 번들 밖 = app-seal Skip(다른 doctor 테스트에 부작용 0)
         }
     }
 
@@ -12703,6 +12904,149 @@ mod tests {
         std::fs::write(&db, b"this is definitely not sqlite").unwrap();
         assert_eq!(diag_channels_db(&ctx).status, DiagStatus::Fail);
         assert!(db.exists(), "doctor는 DB를 삭제하지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─── M3 app-seal: 앱 번들 코드서명 봉인 자가진단 ───
+
+    /// 임시 .app 골격을 만든다(Info.plist 로 '진짜 번들' 확증 경로까지 포함).
+    fn make_app_fixture(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let app = base.join(name);
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>"#,
+                r#"<key>CFBundleExecutable</key><string>fixture</string>"#,
+                r#"<key>CFBundleIdentifier</key><string>com.example.cysfixture</string>"#,
+                "</dict></plist>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(app.join("Contents/Resources/data.txt"), b"hello\n").unwrap();
+        app
+    }
+
+    #[test]
+    fn detect_app_bundle_walks_to_dot_app_root() {
+        let base = std::env::temp_dir().join(format!("cys-seal-det-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let app = make_app_fixture(&base, "Fixture.app");
+        let exe = app.join("Contents/MacOS/fixture");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            detect_app_bundle(&exe).as_deref(),
+            Some(app.as_path()),
+            "X.app/Contents/MacOS/<exe> → X.app 이 탐지돼야 한다"
+        );
+        // 번들 밖(개발 빌드 target/debug/cys) → None = 판정 불가
+        let plain = base.join("target/debug/cys");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(detect_app_bundle(&plain).is_none(), "번들 밖은 None");
+        // 이름만 .app 이고 Info.plist 가 없으면 번들이 아니다(가짜에 속지 않는다)
+        let fake = base.join("Fake.app/Contents/MacOS/x");
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        std::fs::write(&fake, b"x").unwrap();
+        assert!(
+            detect_app_bundle(&fake).is_none(),
+            "Info.plist 없는 .app 디렉토리는 번들로 인정하지 않는다"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_codesign_seal_failure_classifies_real_output() {
+        // 2026-08-01 실사고 원문(발췌) — verbose 진행 로그(--prepared/--validated)는 진단이 아니다.
+        let out = "--prepared:/Applications/cys.app/Contents/MacOS/cys\n\
+                   --validated:/Applications/cys.app/Contents/MacOS/cys\n\
+                   /Applications/cys.app: a sealed resource is missing or invalid\n\
+                   file added: /Applications/cys.app/Contents/Resources/runtime/python/lib/python3.12/__pycache__/_compression.cpython-312.pyc\n\
+                   file added: /Applications/cys.app/Contents/Resources/runtime/python/lib/python3.12/__pycache__/copyreg.cpython-312.pyc\n\
+                   file modified: /Applications/cys.app/Contents/Resources/runtime/python/lib/python3.12/encodings/__pycache__/utf_8.cpython-312.pyc\n\
+                   file missing: /Applications/cys.app/Contents/Resources/gone.txt\n";
+        let (added, modified, missing, other) = parse_codesign_seal_failure(out);
+        assert_eq!(added.len(), 2, "added 2건");
+        assert_eq!(modified.len(), 1, "modified 1건");
+        assert_eq!(missing.len(), 1, "missing 1건");
+        assert_eq!(
+            other,
+            vec!["/Applications/cys.app: a sealed resource is missing or invalid".to_string()],
+            "요약줄만 other 로 남고 --prepared/--validated 는 버려져야 한다"
+        );
+        assert!(added[0].ends_with("_compression.cpython-312.pyc"));
+        // 무-verdict 출력(정상)에서 오탐 0
+        let (a, m, s, _) = parse_codesign_seal_failure("cys.app: valid on disk\n");
+        assert!(a.is_empty() && m.is_empty() && s.is_empty(), "정상 출력에서 원인파일 0건");
+    }
+
+    #[test]
+    fn diag_app_seal_skips_when_unverifiable() {
+        let base = std::env::temp_dir().join(format!("cys-seal-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // ① 번들 밖 실행 → Skip (거짓 FAIL 금지)
+        let ctx = doctor_ctx_at(&base);
+        let it = diag_app_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Skip, "번들 미탐지는 Skip");
+        assert_eq!(it.name, "app-seal");
+        // ② 번들 경로가 소멸했으면 Skip (macOS 에서만 이 분기에 도달)
+        let mut ctx2 = doctor_ctx_at(&base);
+        ctx2.app_bundle = Some(base.join("Gone.app"));
+        assert_eq!(diag_app_seal(&ctx2).status, DiagStatus::Skip, "경로 소멸은 Skip");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★변이검증: 정상 서명 번들 = OK / 파일 하나만 추가한 격리 복제본 = FAIL.
+    /// 이 테스트가 2026-08-01 실사고(번들 안 __pycache__ 생성 → 봉인 파손 → Gatekeeper 차단)의
+    /// **탐지 능력**을 회귀 고정한다. codesign 부재·비 macOS 에서는 조용히 통과(판정 불가).
+    #[test]
+    fn diag_app_seal_detects_added_file_mutation() {
+        if !cfg!(target_os = "macos") || !std::path::Path::new("/usr/bin/codesign").exists() {
+            return; // 판정 불가 환경 — 거짓 실패를 만들지 않는다
+        }
+        let base = std::env::temp_dir().join(format!("cys-seal-mut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let app = make_app_fixture(&base, "Fixture.app");
+        // 주 실행파일은 실제 Mach-O 여야 서명이 성립한다(시스템 바이너리 복제 = ad-hoc 재서명 대상).
+        std::fs::copy("/bin/echo", app.join("Contents/MacOS/fixture")).unwrap();
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&app)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !signed {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // 서명 자체가 불가한 환경 — 판정 불가
+        }
+        let mut ctx = doctor_ctx_at(&base);
+        ctx.app_bundle = Some(app.clone());
+        let ok = diag_app_seal(&ctx);
+        assert_eq!(ok.status, DiagStatus::Ok, "정상 서명 번들은 OK: {}", ok.detail);
+
+        // 변이: 실사고와 같은 모양으로 __pycache__ 파일 하나를 번들 *안에* 만든다.
+        let pyc = app.join("Contents/Resources/runtime/python/lib/python3.12/__pycache__");
+        std::fs::create_dir_all(&pyc).unwrap();
+        std::fs::write(pyc.join("_compression.cpython-312.pyc"), b"x").unwrap();
+        let bad = diag_app_seal(&ctx);
+        assert_eq!(bad.status, DiagStatus::Fail, "파일 1개 추가로 FAIL: {}", bad.detail);
+        assert!(bad.detail.contains("__pycache__"), "원인 파일이 요약에 보여야 한다: {}", bad.detail);
+        assert!(bad.detail.contains("자기유발"), "전부 __pycache__ 면 자기유발로 지목: {}", bad.detail);
+        assert!(bad.action.contains("mv"), "복구 안내(스테이징 후 mv)가 있어야 한다: {}", bad.action);
+        assert!(
+            bad.action.contains("App Management"),
+            "부분 수정이 막히는 이유를 알려야 한다: {}",
+            bad.action
+        );
+        // 진단은 읽기 전용 — 변이 파일을 지우지 않는다(부분 수리 금지).
+        assert!(
+            pyc.join("_compression.cpython-312.pyc").exists(),
+            "doctor 는 번들 안 파일을 삭제하지 않는다"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

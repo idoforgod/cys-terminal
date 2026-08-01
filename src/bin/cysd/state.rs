@@ -3630,6 +3630,98 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★T2 자기증폭 루프 실증(2026-08-01 윈도우 실사고) — 임시 재현 테스트.
+    // 노드가 "경보를 논의하는 산문"을 화면에 출력하면 그 산문이 다시 health.alert를
+    // 발화시킨다. 발생원 0건인데 경보만 증식한 실사고의 기계 재현.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 실사고 표본 — 노드(master·CSO·리뷰어)가 경보를 **논의하며 화면에 실제로 출력한** 산문.
+    const INCIDENT_PROSE: &[&str] = &[
+        "[CSO] 경보 요약: rate_limited 룰이 6분 만에 4건 → 10건으로 늘었는데 실제 발생원은 0건입니다.",
+        "health.alert rule=rate_limited line=\"api: rate limit reached\" surface=3 — 원인 조사 중",
+        "리뷰어 진단: 이 경보를 논의하는 산문이 새 경보를 발화시키는 자기증폭 루프였다 (rate limit 언급 자체가 트리거).",
+        "master: token expired 경보도 같은 경로다 — 실제 세션은 정상인데 문장에 'token expired'가 들어가서 걸렸다.",
+        "CSO 보고: 노드가 not logged in 상태로 오인 판정됐습니다. 실제로는 로그인 유지 중.",
+        "복구 안내를 화면에 남깁니다 — 필요하면 please run /login 을 실행하세요.",
+        "watchdog.duplicate_procs 4~5건(powershell.exe·claude.exe) — 401 unauthorized 경보와는 무관합니다.",
+    ];
+
+    /// 진짜 고장 신호(양성 대조) — 실제 도구·API가 뱉는 실패 라인.
+    const REAL_FAILURE_LINES: &[&str] = &[
+        "Error: not logged in",
+        "HTTP 429 Too Many Requests",
+        "401 Unauthorized",
+        "your token has expired",
+        "Please run /login to continue",
+    ];
+
+    /// 격리 데몬 + 역할 surface 하나를 만들어 (daemon, surface) 반환. PTY는 `sleep 30`
+    /// (기존 governance/handlers 테스트와 동일 관행 — 라이브 원장·라이브 소켓 무접촉).
+    fn health_probe_daemon(tag: &str) -> (Arc<Daemon>, Arc<Surface>) {
+        let daemon = Daemon::new(isolated_sock(tag));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        (daemon, s)
+    }
+
+    /// 라인들을 실제 PTY 배수 경로(ingest_output)로 흘려 넣고 발화한 health.alert를 회수한다.
+    fn feed_lines_collect_alerts(
+        daemon: &Arc<Daemon>,
+        surface: &Arc<Surface>,
+        lines: &[&str],
+    ) -> Vec<(String, String)> {
+        let seq_before = daemon.bus.tail(1).first().and_then(|e| e["seq"].as_u64()).unwrap_or(0);
+        for l in lines {
+            daemon.ingest_output(surface, format!("{l}\n").as_bytes());
+        }
+        daemon
+            .bus
+            .replay_after(seq_before)
+            .into_iter()
+            .filter(|e| e["name"].as_str() == Some("health.alert"))
+            .map(|e| {
+                (
+                    e["payload"]["rule"].as_str().unwrap_or_default().to_string(),
+                    e["payload"]["line"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// ★재현(수리 전 = FAIL 예상): 경보를 논의하는 산문만 넣어도 신규 경보가 뜬다.
+    #[test]
+    fn repro_alert_discussion_prose_must_not_fire_alerts() {
+        let (daemon, s) = health_probe_daemon("health-amp-neg");
+        let alerts = feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
+        assert!(
+            alerts.is_empty(),
+            "경보 논의 산문에서 신규 경보 {}건 발화(자기증폭): {:#?}",
+            alerts.len(),
+            alerts
+        );
+    }
+
+    /// ★양성 대조: 진짜 고장 신호에는 여전히 경보가 떠야 한다(수리가 탐지를 죽이면 실패).
+    #[test]
+    fn repro_real_failure_lines_still_fire_alerts() {
+        let (daemon, s) = health_probe_daemon("health-amp-pos");
+        let alerts = feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
+        let rules: std::collections::HashSet<&str> =
+            alerts.iter().map(|(r, _)| r.as_str()).collect();
+        assert!(
+            rules.contains("not_logged_in")
+                && rules.contains("rate_limited")
+                && rules.contains("auth_401")
+                && rules.contains("token_expired")
+                && rules.contains("login_required"),
+            "진짜 고장 신호에서 경보 누락(탐지 사망): {:#?}",
+            alerts
+        );
+    }
+
     /// 테스트 전용 격리 소켓 경로 — 고유 하위 디렉터리를 만들어 그 안에 둔다. state_dir이
     /// 소켓의 '부모 디렉터리'라, 같은 temp_dir에 소켓을 두면 모든 테스트 데몬이 하나의
     /// feed.jsonl을 공유해 병렬 실행 시 서로 오염된다. 하위 디렉터리로 데몬마다 격리한다.

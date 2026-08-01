@@ -236,6 +236,26 @@ CYS_STATE_DIR="${CYS_STATE_DIR:-${HOME:-${USERPROFILE:-.}}/.cys/state}"
 export CYS_STATE_DIR
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 7. 바이트코드 쓰기 봉인 (★SEAL-1 · 2026-08-01 실사고 근본원인)
+# ─────────────────────────────────────────────────────────────────────────────
+# macOS 앱 번들은 자기 안의 python 을 PATH 선두로 물린다(`Contents/Resources/runtime/
+# python/bin`). 그 python 이 stdlib 을 import 하면 CPython 이 `__pycache__/*.pyc` 를
+# **번들 안에** 새로 쓰고, 그 순간 코드서명 봉인이 깨진다("a sealed resource is missing
+# or invalid / file added: …_compression.cpython-312.pyc"). 브라우저로 받은 사본은
+# quarantine 이 붙어 첫 실행 때 Gatekeeper 전체 재검증에 걸리므로 → "손상되었기 때문에
+# 열 수 없습니다"로 앱이 통째로 차단된다(공증·staple 은 정상이었다).
+#
+# 훅은 `$CYS_PY` 로 그 번들 python 을 부르는 최다 호출자다. Rust 층
+# (`cys::spawn_env_pairs` — pane·스케줄 자식)이 이미 같은 쌍을 상속시키지만, 훅이 다른
+# 경로(사용자가 직접 띄운 CLI 등)로 발화하면 그 상속을 못 받는다 → 여기서 한 번 더 잠근다.
+# 값 규약: CPython 은 **비어 있지 않으면 참**이다. 빈 문자열은 "끔"이므로 `1` 고정
+# (Rust 정본 = `src/lib.rs` `ENV_PY_NO_BYTECODE` · 대안 비교 근거도 그 주석에 있다).
+# 무조건 export 인 이유: 실패 방향이 하나뿐이다 — 최악이 "매번 재컴파일"이고, 봉인은
+# 절대 깨지지 않는다. PYTHONUTF8=1(cys-dept)과 같은 층위의 자식 전파 규약이다.
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :

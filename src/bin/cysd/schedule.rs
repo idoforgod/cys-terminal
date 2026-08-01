@@ -885,6 +885,11 @@ fn warn_shell_fallback(daemon: &Arc<Daemon>, flag: &str) {
 /// 회귀 핀(아래 `spawn_env_injects_runtime_path_and_backfills_home`)은 이제 `cys::spawn_env_pairs`
 /// 를 직접 호출해 **lib 구현 자체**를 결박한다 — 사본이 아니라 SOT 를 검증한다(RC1).
 ///
+/// ★SEAL-1 판정(2026-08-01): `schedule.json`·빌트인 잡의 `python3 …javis_*.py` 페이로드에는
+/// `PYTHONDONTWRITEBYTECODE=1` 접두를 **넣지 않는다** — 잡은 전부 이 함수를 거쳐 스폰되고
+/// `spawn_env_pairs` 가 그 쌍을 이미 싣기 때문이다(페이로드마다 접두를 박으면 잡이 추가될 때
+/// 또 빠지는 규약 산재가 된다). 즉 잡 명령은 무변경이고 봉인은 env 상속으로 달성된다.
+///
 /// spawn_env_pairs 를 현재 프로세스 env 로 계산해 명령에 적용한다(run_text_command·fire_command 공용).
 fn apply_spawn_env(cmd: &mut tokio::process::Command) {
     let exe_dir = std::env::current_exe()

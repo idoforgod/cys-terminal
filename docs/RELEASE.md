@@ -159,7 +159,71 @@ bash scripts/build-macos-signed.sh  # env 검증 → tauri build(자동 공증) 
   staple 을 자동 수행한다(별도 `codesign`/`notarytool` 수동 호출 불요).
 - **검증 통과 기준**: `spctl -a -vv cys.app` = **accepted**. (rejected면 공증 실패 — 빌드
   로그의 notarization 결과 확인.)
+  ⚠**이것만으로는 부족하다**(2026-08-01 실사고). 빌드 직후의 `.app`은 accepted 인데
+  **사용자가 브라우저로 받아 설치하면 "손상되었기 때문에 열 수 없습니다"로 차단**될 수 있다.
+  반드시 아래 실사용자 경로 게이트를 함께 돌려라.
 - 공증 빌드는 **ad-hoc 재서명·`xattr` 우회가 전혀 불필요**하다.
+
+#### ★실사용자 경로 게이트 — `scripts/verify-gatekeeper-user-path.sh` (2026-08-01 신설·필수)
+
+```sh
+bash scripts/verify-gatekeeper-user-path.sh dist-mac/cys-<V>-macos-arm64.dmg  # 로컬 빌드 산출물
+bash scripts/verify-gatekeeper-user-path.sh --version <V> --arch aarch64      # 발행본(원격)
+bash scripts/verify-gatekeeper-user-path.sh https://…/downloads/cys_<V>_x64.dmg  # 임의 URL
+#   exit 0 = PASS · 1 = FAIL(배포 금지) · 2 = 판정 불가(도구·자산 문제 — 통과 아님)
+```
+
+**왜 필요한가 — 2026-08-01 사고의 근본원인**: 앱 번들의 **동봉 Python 이 실행 중
+`Contents/Resources/runtime/python/lib/python3.12/**/__pycache__/*.pyc` 를 번들 안에 새로
+써서 코드서명 봉인을 스스로 깨뜨린다**. `codesign --verify` 진단 원문:
+`a sealed resource is missing or invalid / file added: …/__pycache__/_compression.cpython-312.pyc`.
+공증·staple 자체는 **정상**이다. 그런데 사용자가 브라우저로 받으면 파일에
+`com.apple.quarantine` 이 붙고, **첫 실행 시 Gatekeeper 가 전체 재검증**을 돌려 깨진 봉인을
+잡아내 실행을 차단한다.
+
+**검증 구멍**: 지금까지의 릴리스 검증(ⓓ)은 `curl` 사본만 봤다 — `curl` 로 받은 파일에는
+quarantine 이 **안 붙어서** Gatekeeper 전체 재검증 경로 자체가 돌지 않는다. 그래서 이 사고
+경로를 **한 번도 재현하지 못했다**. 이 스크립트가 그 구멍을 닫는다.
+
+**하는 일 6단계** — ① 실제 브라우저 다운로드에서 실측한 형식으로 DMG 에 `com.apple.quarantine`
+부착 → ② 마운트(격리 볼륨 확인) → ③ `ditto` 로 드래그 설치 모사 + **quarantine 상속 확인** →
+④ `spctl --assess --type execute --verbose=4` = accepted → ⑤ `codesign --verify --deep --strict`
++ `stapler validate` → ⑥ ★**봉인 자기파괴 재현**: 동봉 python 을 1회 돌린 뒤 `codesign --verify`
+재실행 → `file added` 가 나오면 **FAIL**.
+
+**⑥ 판정의 두 갈래**
+- **⑥-A**(판정 본체): env 완화를 못 타는 경로(셸·훅·pane 에서 도는 python)에서도 번들이 안
+  깨져야 한다 = **패키징 층위 불변식**. 닫는 방법은 둘뿐이다 — 서명 **전** `compileall
+  --invalidation-mode unchecked-hash` 로 stdlib `.pyc` 를 **서명 대상에 포함**시키거나,
+  런타임을 봉인 밖으로 빼는 것.
+- **⑥-B**: 앱이 python 을 스폰할 때 얹는 `PYTHONDONTWRITEBYTECODE=1`(SEAL-1 완화)이 실제로
+  쓰기를 막는지. 실측 v0.14.9: **⑥-B PASS**(.pyc 3→3) · **⑥-A FAIL**(.pyc 3→30).
+  즉 스폰 env 완화는 유효하지만 **번들 자체는 아직 깨질 수 있는 상태**다.
+
+**⑥ 이 `.app` 확장자를 뗀 사본에서 도는 이유**(실측 2026-08-01, macOS 25.5.0): macOS 는
+`.app` 번들에서 바이너리를 한 번이라도 exec 하면 그 번들을 **앱 번들 보호**로 잠가서, 그 뒤
+셸이 띄운 python 의 쓰기를 EPERM 으로 막는다 → **결함이 있어도 아무 일 없는 것처럼 보인다**
+(측정: `.app` 사본은 .pyc 3→3, codesign exit 0 = **거짓 PASS**). 실제 사고 경로에서는 쓰는
+주체가 **앱 자신**(같은 Team ID)이라 이 보호를 통과해 쓰기가 성사된다. 확장자를 떼는 것은
+검사를 약화시키는 우회가 아니라, **검증기 머신에서만 발생하는 OS 보호가 결함을 가리는 것을
+걷어내는 조치**다(서명·봉인 내용은 동일).
+
+**전제·비용**: macOS + Xcode CLT · 임시폴더에 약 2GB(DMG 227MB + 앱 사본 492MB × 3, 종료 시
+자동 삭제) · 로컬 DMG 기준 약 1분 · **앱을 실행하지 않는다**(동봉 python 만 1회 스폰).
+arm64 머신에서 x64 DMG 를 볼 땐 Rosetta 2 필요(없으면 ⑥-A 가 "검사 불성립"으로 FAIL —
+측정 불능은 통과가 아니다).
+
+**`scripts/verify-release-remote.py` 와의 관계 (직교 · 둘 다 필수)**
+
+| | `verify-release-remote.py` | `verify-gatekeeper-user-path.sh` |
+|---|---|---|
+| 시점 | 발행 **후** | 빌드 직후 + 발행 후 |
+| 보는 것 | 홈페이지 표기·링크·용량·SHA256 (=**올바른 파일이 올라갔나**) | 그 파일을 **받아서 설치했을 때 열리나** |
+| 대상 | 원격 HTML·HTTP 헤더·SHA256SUMS.txt | DMG 바이트 → 마운트 → 앱 번들 서명·봉인 |
+| 못 잡는 것 | 자산이 정상 링크·정상 해시로 올라가 있으면서 **열리지 않는 것** | 홈페이지 표기 오류·링크 누락 |
+
+즉 앞의 것은 "제대로 배포됐나", 뒤의 것은 "제대로 열리나"다. **하나가 다른 하나를 대신하지
+못한다.**
 
 > 인증서가 없을 때(개발용): env 없이 `bun x @tauri-apps/cli build` → ad-hoc 빌드. 이 빌드는
 > **다른 맥 전송 시 "손상됨"**이 뜨므로, 받은 맥에서 `xattr -dr com.apple.quarantine
@@ -168,6 +232,10 @@ bash scripts/build-macos-signed.sh  # env 검증 → tauri build(자동 공증) 
 ### ★비기술자(청중) 배포 전 게이트 체크리스트 (D6 제품 모드)
 오너 대표 산출물을 제3자에게 패키징해 내보내기 전, 아래를 **모두** 확인한다.
 - [ ] **공증 빌드**(`spctl -a -vv cys.app` = accepted) — 미공증은 비기술자 배포 금지(다른 맥에서 "손상됨" 차단).
+- [ ] **실사용자 경로 게이트 exit 0** — `bash scripts/verify-gatekeeper-user-path.sh <DMG>`.
+      accepted 인데도 "손상되었기 때문에 열 수 없습니다"로 막히는 경로(2026-08-01 사고)를
+      잡는 유일한 검사다. 비기술자는 이 화면을 만나면 **문의 없이 그냥 이탈한다** —
+      실패가 신고로 나타나지 않으므로 기계 게이트로만 막을 수 있다.
 - [ ] **신뢰선 라벨 활성** — 스킬 보드 산출물에 "🔒 AI 보조 생성 · 오너 검수 전"이 부착되는지(과대약속 "80~90%" 금지).
 - [ ] **외부발행은 master 승인 경유** — 제3자 공유/전송은 자율주행 denylist의 "외부발행(비가역)"에 해당. `cys feed push --wait`(master 승인)를 거친다. 임의 전송 금지(§4 외부발행 원칙 계승).
 - [ ] **HITL 미리보기 보존** — 제품 모드도 입력 모달·validate_ir 게이트·미리보기 확인을 우회하지 않는다("1클릭"이라도 게이트 제거는 REJECT).
@@ -281,6 +349,24 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 버전 문자열 4곳(+wxs 2곳) 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
       (**Cargo.lock 2패키지 포함 8곳**. 범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
+- [ ] **★★실사용자 경로 게이트 — DMG 2종 전부 exit 0 (2026-08-01 신설 · 필수 · 생략 불가)**
+
+      ```sh
+      # 로컬 빌드 산출물 이름은 dist-mac/cys-<V>-macos-{arm64,x64}.dmg 다
+      # (발행본 이름 cys_<V>_{aarch64,x64}.dmg 와 다르다 — build-macos-signed.sh:221)
+      bash scripts/verify-gatekeeper-user-path.sh dist-mac/cys-<V>-macos-arm64.dmg  # rc=0 필수
+      bash scripts/verify-gatekeeper-user-path.sh dist-mac/cys-<V>-macos-x64.dmg    # rc=0 필수
+      ```
+      `spctl -a -vv` accepted **만으로는 부족하다**. 2026-08-01 사고에서 공증·staple 이 전부
+      정상인 빌드가 사용자 머신에서 "손상되었기 때문에 열 수 없습니다"로 차단됐다 — 동봉
+      Python 이 실행 중 번들 안에 `.pyc` 를 써서 **코드서명 봉인을 스스로 깨뜨렸고**,
+      브라우저로 받은 사본에 붙은 `com.apple.quarantine` 때문에 첫 실행에서 Gatekeeper
+      전체 재검증에 걸린 것이다. **이 게이트가 없으면 같은 사고가 그대로 재발한다.**
+      · 실패 시 원인·수정 방향은 §1 「★실사용자 경로 게이트」 절 참조.
+      · **exit 2(판정 불가)도 통과가 아니다** — 도구·자산 문제를 고치고 다시 돌려라.
+      · 발행 후에는 원격 자산에 대고 한 번 더 돌린다:
+        `bash scripts/verify-gatekeeper-user-path.sh --version <V> --arch aarch64` (x64 도)
+      · **아키텍처별 머신에서 각자 돌리는 것이 정확하다**(교차 실행은 Rosetta 2 필요).
 - [ ] **★메인 페이지(`/`) 원격 검증 — 6항목 전부 (S28 + 2026-07-29 오너 지시 ⓐⓑⓒ · 자동화 밖의 수동 게이트)**
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기
@@ -362,6 +448,13 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             curl -sO "$B/SHA256SUMS.txt" && shasum -a 256 -c SHA256SUMS.txt
             ```
             **4줄 전건 OK** 여야 한다. 1건이라도 FAILED 면 미완이다.
+
+      ⚠**이 6항목이 보지 않는 것 — 2026-08-01 사고의 정확한 사각지대**: 여기서 자산을 받는
+      수단은 `curl` 이다. **`curl` 로 받은 파일에는 `com.apple.quarantine` 이 붙지 않는다.**
+      quarantine 이 없으면 첫 실행 시 Gatekeeper 전체 재검증 경로가 **아예 돌지 않아서**,
+      봉인이 깨진 앱도 이 6항목을 전부 통과한다(v0.14.9 실측: 링크·용량·해시 전건 정상,
+      그런데 사용자 설치 시 차단). 그래서 위 체크리스트의 **★★실사용자 경로 게이트**가
+      **별도 필수 항목**이다 — 이 6항목이 그것을 대신하지 못한다.
 
       ⚠**남은 한계**: 이 검증은 홈페이지의 SOT(밴드 구조·카피 규약)를 알지 못하고 **결과만** 본다.
       "링크가 200이고 버전이 맞다"는 "밴드가 의도대로 구성됐다"를 뜻하지 않는다.

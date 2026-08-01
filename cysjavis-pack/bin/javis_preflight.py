@@ -55,90 +55,128 @@ DIRECTIVES = [
 
 # 절대지침 핵심 조항의 내용 핀 — 디렉티브가 약화·소실되면 결정론으로 검출된다.
 CONTENT_PINS = {
+    # ★원자 전환 게이트 §9-7-2 부수 4 · §9-7-7 (2026-08-01 재산정)
+    #   재산정 규칙: 역할당 20~30핀 · 최대/최소 비 ≤ 1.5배(구 53 대 1 = 53배 격차 해소).
+#   근거·전수표: _work/absolute-rules-audit-20260731/gate-staging/pins/CONTENT_PINS.md
+    #   각 핀은 해당 역할 헌장의 조문 또는 운영계약의 집행 배선에 1:1로 대응한다.
+    #   구 문안 핀(구 종료 기준 리터럴 · 고정 향상률 · 구 호칭 · 구 Phase 보고 문구)은 전량 폐기.
     "MASTER_DIRECTIVE.md": [
-        ("오너 호칭", "호칭 규정(절대지침 G1) — 구체 호칭은 오너 주권이라 정책 라인만 핀"),
-        ("javis_preflight", "부트 ⓪ 결정론 프리플라이트 편입"),
-        ("60%", "컨텍스트 60% 임계 명문화(절대지침 9)"),
-        ("MASTER_TODO.md", "master 자신의 todo 영속(절대지침 7)"),
-        ("결정론", "결정론 환원 원칙 명문화"),
-        ("세계 최고", "최고 전문가 기반 평가기준(절대지침 2)"),
-        ("워크플로우 폴더", "탭 명명·작업 폴더 규칙(앵커1-b)"),
-        ("지시한 내용과 근거", "워커 지시 후 오너 보고 일반 의무(앵커1-f)"),
-        ("보고 채널은 master의 채팅 출력", "오너 보고 채널 명시(앵커1-f) — 의미 변형 탐지 보강 핀"),
-        ("--queued", "자동 Return 배달·타이핑 가드 인지(앵커1-c)"),
-        ("CYS_TYPING_GUARD_SECS", "타이핑 가드 초수 명시(앵커1-c)"),
-        ("양방향 소켓통신", "양방향 소켓 절대규칙(앵커3-A)"),
-        ("5분 주기 진행% 보고", "5분 주기 주인님 보고(앵커3-A6)"),
-        ("javis_report.py", "진행% 결정론 산출기 편입(앵커3-A6)"),
-        ("주기적 능동 점검", "능동 모니터링 강제(앵커3-B1)"),
-        ("라운드 사이클 의무 단계", "라운드마다 master 주기 점검(앵커3-B5)"),
-        ("CYS_IDLE_SECONDS", "idle 5분 임계 명시(앵커3-B3)"),
-        ("javis_route.py", "3단 사고 라우팅 결정론 엔진 편입(사고 모드 §1)"),
-        ("기억 증류", "slow 종료 게이트 증류 의무(§10)"),
-        ("javis_memory.py", "증류 결정론 도구 편입(§10)"),
-        ("4종 의무 노드", "LLM orchestrating 4노드 부트 의무(앵커4-1)"),
-        ("javis_orchestra.py", "LLM 오케스트레이션 결정론 도구 편입(앵커4)"),
-        ("5-1", "라운드 루프 5-1~5-8 명문화(앵커4-5)"),
-        ("맥킨지급", "라운드 완료 기준(앵커4 5-6·5-8)"),
-        ("직전 점수 +10%", "라운드 +10% 목표(앵커4 5-7)"),
-        ("deep research", "gemini deep research 담당(앵커4-6)"),
-        ("ChatGPT Image 2.0", "image 생성 도구 명시(앵커4-6)"),
-        ("task-prompt", "위임 티켓 결정론 생성기 의무(앵커5-1·4 — 생존 게이트+4규칙 주입)"),
-        ("수기 티켓 위임은 금지", "§2 위임 티켓 의무 블록 고유 핀 — 교차참조 겹침 무력화 방지(앵커5-1)"),
-        ('"run command"·"update" 요청은 모두 승인', "run command·update 전부 승인(앵커5-3)"),
-        ("가장 좋은 옵션", "bash 승인 즉각 최선 옵션 확인 후 승인(앵커5-2)"),
-        ("무지성 승인이 아니라", "최선 옵션 '확인 후' 승인 집행문 핀(앵커5-2 — 제목만 잔존 방지)"),
-        ("절대 강조 4규칙", "위임 시마다 4규칙 절대 강조(앵커5-4)"),
-        ("a) **품질 절대우선**", "4규칙 a 불릿 고유 핀(앵커5-4a — §6 제목·§2 열거와 겹침 방지)"),
-        ("hallucination-guard", "환각방지 전담 sub-skill 사용·생성 지시(앵커5-4b)"),
-        ("몽상", "몽상·망상 촉진 절대 금지(앵커5-4b)"),
-        ("Garbage-in", "토대 오염 차단(앵커5-4b)"),
-        ("grill-me", "의도 합의 — 합의까지 질문 반복(앵커5-4c)"),
-        ("길이는 원문 수준", "요약·압축 절대 금지·길이 보존(앵커5-4d)"),
-        ("충돌 시 상위 기준 절대 우선", "②검증 동요 시 ①③ 중단·오너 보고 게이트(앵커5-4)"),
-        ("자율주행 위임권", "§14 자율주행 3축 명문(앵커6)"),
-        ("gate-status", "축1 게이트 4자 수렴 결정론 판정 도구 편입(앵커6)"),
-        ("GATE CONVERGED", "축1 수렴 시에만 자동 전환(앵커6 — 눈대중 차단)"),
-        ("축2 — 자율 컨텍스트 수명주기", "축2 불릿 고유 핀(앵커6 — 소실 검출)"),
-        ("cys schedule add", "축3 자기 웨이크업 고유 핀(앵커6 — next-action 다중출현 보완)"),
-        ("정지 경계 (denylist", "denylist 5종에서만 정지(앵커6 — 고유 불릿 핀)"),
-        ("로컬 커밋은 가역", "외부 발행≠로컬 커밋 구분(앵커6 denylist ③)"),
-        ("next-action", "축3 다음 액션 큐 결정론 추출 도구 편입(앵커6)"),
-        ("kill-switch 최우선", "오너 입력=즉시 일시정지(앵커6 메타)"),
-        ("Phase 종료 시 오너에게 1줄 push", "Phase 보고 의무(앵커6 메타·감사)"),
-        ("품질 게이트를 무르게 하지 않는다", "자율화=전환 주체만·게이트 불변(앵커6 메타)"),
+        # 헌장 제0조 — 정지 경계
+        ("정지 경계", "다섯 정지의 상주 배치(마스터 헌장 제0조)"),
+        ("로컬 커밋은 가역", "외부 발행≠로컬 커밋 구분(제0조 1항 denylist)"),
+        ("팩 템플릿 강제 복원은 절대 금지", "부트 ⓪ 절대 금지 1줄 — 무백업 소실 차단(계약 §1-1·§11-13)"),
+        # 헌장 제1조 — 정체와 호칭 (구체 호칭은 주인님 주권이라 정책 라인만 핀)
+        ("호칭의 정의처는 마스터 헌장 제1조", "호칭 단일 정의처 참조 규정(제1조)"),
+        # 헌장 제2조·계약 §1 — 부트·라우팅
+        ("javis_bootstrap.py", "부트 실행 주체 단일 계약(계약 §1-1)"),
+        ("javis_preflight", "부트 ⓪ 결정론 프리플라이트 편입(계약 §1-1·§1-5)"),
+        ("lane-path", "레인 격리 경로 규약 — base 경로 하드코딩 금지(계약 §1-6)"),
+        # 헌장 제3조 — 역할 경계
+        ("4종 의무 노드", "의무 노드 4종 상시(제3조 확정값)"),
+        ("javis_orchestra.py", "기동 확인·라운드·게이트 결정론 도구 편입"),
+        ("task-prompt", "위임 티켓 결정론 생성기 의무(계약 §1-4)"),
+        ("수기 티켓 위임은 금지", "티켓 도구 우회 차단 고유 핀(계약 §1-4)"),
+        # 헌장 제4조 — 품질 불가침 (절대 강조 4규칙)
+        ("절대 강조 4규칙", "위임 시마다 4규칙 절대 강조"),
+        ("a) **품질 절대우선**", "4규칙 a 불릿 고유 핀 — 교차참조 겹침 무력화 방지"),
+        ("hallucination-guard", "환각방지 전담 sub-skill 가동(계약 §6-0)"),
+        ("몽상", "몽상·망상 촉진 절대 금지"),
+        ("Garbage-in", "토대 오염 차단 — 다듬어도 거짓만 정교해진다"),
+        ("grill-me", "의도 합의 — 합의까지 질문 반복"),
+        ("길이는 원문 수준", "요약·압축 절대 금지·길이 보존"),
+        ("충돌 시 상위 기준 절대 우선", "검증 토대 붕괴 시 결론 도출 중단 게이트(제0조 5항)"),
+        # 헌장 제9조·제10조 — 검증·라운드·RSI (구 종료 기준 리터럴 대체)
+        ("잠근 합격 기준의 미달 항목 0", "라운드 통과·종료 기준(제9조·계약 §7-1) — 구 리터럴 대체"),
+        ("keep-or-discard", "라운드 종결 방식 — 고정 향상률 목표 금지의 대체(계약 §7-6)"),
+        ("gate-status", "4자 수렴 결정론 판정 도구 편입(계약 §6-8)"),
+        ("GATE CONVERGED", "수렴 시에만 자동 전환 — 눈대중 차단"),
+        # 헌장 제5조·제6조 — 자율·승인
+        ("next-action", "축3 다음 액션 큐 결정론 추출 도구 편입(계약 §9-3)"),
+        ("javis_resource_gate.py", "②등급 자원 게이트 선행 의무(제6조·계약 §5-1)"),
+        ("가장 좋은 옵션", "무지성 승인이 아니라 최선 옵션 확인 후 승인(계약 §4-5)"),
+        # 헌장 제7조·제11조 — 컨텍스트·영속
+        ("60%", "컨텍스트 임계 명문화(제7조)"),
+        ("MASTER_TODO.md", "master 자신의 todo 영속(제11조·계약 §8-1)"),
+        ("Phase 종료 시 주인님께 1줄 push", "Phase 보고 의무(계약 §9-2) — 구 문안 대체"),
+        ("품질 게이트를 무르게 하지 않는다", "자율화=전환 주체만·게이트 엄격성 불변(제5조)"),
     ],
     "WORKER_DIRECTIVE.md": [
-        ("_TODO.md", "워커 todo 영속(절대지침 7)"),
-        ("60%", "컨텍스트 60% 임계 명문화(절대지침 9)"),
-        ("set-status", "컨텍스트 자기보고 의무"),
-        ("--queued", "자동 Return 배달 인지(앵커1-c)"),
-        ("javis_memory.py", "slow 종료 게이트 증류 도구(§10)"),
-        ("절대 강조 4규칙", "4규칙 기본 계약 — 티켓 누락 시에도 준수(앵커5-4)"),
-        # 아래 핀들은 orchestra RULE_MARKERS와 패리티를 이룬다(orchestra --self-test (e)가
-        # 기계 검증) — 마커 소실로 task-prompt가 폴백 강등될 때 C03이 같은 원인을 가리킨다.
-        ("a) **품질 절대우선**", "4규칙 a 불릿 고유 핀(앵커5-4a) — 추출 원천 약화 전파 차단"),
-        ("할루시네이션 방지", "4규칙 b 핀(앵커5-4b) — 마커 패리티"),
-        ("hallucination-guard", "환각방지 전담 sub-skill 사용(앵커5-4b)"),
-        ("몽상", "몽상·망상 촉진 절대 금지(앵커5-4b) — 추출 원천 핀"),
-        ("Garbage-in", "토대 오염 차단(앵커5-4b) — 추출 원천 핀"),
-        ("grill-me", "의도 합의 스킬(앵커5-4c)"),
-        ("합의에 이를 때까지", "의도 합의 핵심 술어 — 합의까지 질문 반복(앵커5-4c)"),
-        ("요약·압축 절대 금지", "4규칙 d 핀(앵커5-4d) — 마커 패리티"),
-        ("전문용어·약호", "일반인 첨삭 — 전문용어·약호만 쉬운 말로(앵커5-4d)"),
-        ("길이는 원문 수준", "요약·압축 금지·길이 보존(앵커5-4d) — 추출 원천 핀"),
-        ("충돌 시 상위 기준 절대 우선", "②검증 동요 시 ①③ 중단·보고 게이트(앵커5-4)"),
+        ("정지 경계", "다섯 정지의 상주 배치(워커 헌장 제0조)"),
+        ("호칭의 정의처는 마스터 헌장 제1조", "호칭 단일 정의처 참조 규정"),
+        ("충돌 시 헌장 > 운영계약 > 이 디렉티브", "정의처 우선순위 1줄 — 배치본 성격 고지"),
+        ("WORKER_TODO.md", "워커 todo 영속(워커 헌장 제10조)"),
+        ("60%", "컨텍스트 임계 명문화(워커 헌장 제11조)"),
+        ("set-status", "컨텍스트·태스크 상태 자기보고 의무"),
+        ("--queued", "자동 Return 배달 인지(계약 §2-1)"),
+        # 아래 핀들은 orchestra RULE_MARKERS 와 패리티를 이룬다(orchestra --self-test 가
+        # 기계 검증) — 마커 소실로 task-prompt 가 폴백 강등될 때 C03 이 같은 원인을 가리킨다.
+        ("절대 강조 4규칙", "4규칙 기본 계약 — 티켓 누락 시에도 준수"),
+        ("a) **품질 절대우선**", "4규칙 a 불릿 고유 핀 — 추출 원천 약화 전파 차단"),
+        ("할루시네이션 방지", "4규칙 b 핀 — 마커 패리티"),
+        ("hallucination-guard", "환각방지 전담 sub-skill 사용"),
+        ("몽상", "몽상·망상 촉진 절대 금지 — 추출 원천 핀"),
+        ("Garbage-in", "토대 오염 차단 — 추출 원천 핀"),
+        ("grill-me", "의도 합의 스킬"),
+        ("합의에 이를 때까지", "의도 합의 핵심 술어 — 합의까지 질문 반복"),
+        ("요약·압축 절대 금지", "4규칙 d 핀 — 마커 패리티"),
+        ("전문용어·약호", "일반인 첨삭 — 전문용어·약호만 쉬운 말로"),
+        ("길이는 원문 수준", "요약·압축 금지·길이 보존 — 추출 원천 핀"),
+        ("충돌 시 상위 기준 절대 우선", "검증 토대 붕괴 시 중단·보고 게이트"),
+        ("cys run --", "서버 생명주기 강제 종료 — 프로세스 그룹 원장 등록(워커 헌장 제3조)"),
+        ("javis_task.py", "위임 태스크 체크아웃·상태 전이 결정론 도구"),
+        ("--evidence", "done 전이 증거 게이트 — 부재 시 거부"),
+        ("잠근 합격 기준의 미달 항목 0", "라운드 통과·종료 기준 — 구 리터럴 대체"),
+        ("top goal", "RSI 목표 4필드 수립·보고 의무(마스터 헌장 제10조)"),
     ],
     "CSO_DIRECTIVE.md": [
-        ("CSO_TODO.md", "CSO todo 영속(절대지침 7)"),
-        ("context.threshold", "60% 임계 이벤트 대응(절대지침 9)"),
-        ("hallucination-guard", "환각방지 전담 sub-skill(앵커5-4b — master·CSO·워커 공통)"),
-        ("몽상", "몽상·망상 촉진 절대 금지(앵커5-4b — CSO 공통 의무)"),
-        ("검증 엄밀성", "3요소(검증 엄밀성·평가 신뢰성·환각 안전장치) 핀(앵커5-4b)"),
-        ("master 컨텍스트 사이클 1차 집행", "축2 — CSO가 master cycle verifier(앵커6)"),
+        ("정지 경계", "다섯 정지의 상주 배치(CSO 헌장 제0조)"),
+        ("살아있는 타 노드·세션의 종료", "오살 금지 denylist 항 — 효과 기반 판정"),
+        ("호칭의 정의처는 마스터 헌장 제1조", "호칭 단일 정의처 참조 규정"),
+        ("충돌 시 헌장 > 운영계약 > 이 디렉티브", "정의처 우선순위 1줄 — 배치본 성격 고지"),
+        ("cys status --json", "노드·헬스 관측 실재 명령(계약 §10 대응표)"),
+        ("health_recent", "헬스 관측 필드 고유 핀 — 부재 명령 승계 차단"),
+        ("javis_orchestra.py check", "좌석 생존 등급 판정 실재 명령"),
+        ("javis_report_gate.py", "게이트 대장 조회 실재 명령"),
+        ("능동 점검", "주기 10분 능동 점검 의무(CSO 헌장 제3조)"),
+        ("CYS_IDLE_SECONDS", "idle 5분 임계 명시(계약 §2-5)"),
+        ("--queued", "자동 Return 배달 인지(계약 §2-1)"),
+        ("javis_resource_gate.py", "사전 자원 게이트 판정자(계약 §5-1)"),
+        ("cys run --", "서버 생명주기 — 프로세스 그룹 강제 종료가 기본 동작"),
+        ("백프레셔", "큐 적체 행동 규칙(계약 §5-3)"),
+        ("자가치유 주기 잡 생존", "CSO 단독 책임 — 순환 의존 차단(CSO 헌장 제8조·계약 §2-8)"),
+        ("last_fired", "잡 생존 판정 필드 고유 핀 — 미발화 배수 판정"),
+        ("cys cycle-agent", "clear 상호 집행 핸드셰이크 도구(계약 §3-3)"),
+        ("60%", "컨텍스트 임계 명문화(CSO 헌장 제6조)"),
+        ("CSO_TODO.md", "CSO todo 영속(CSO 헌장 제9조)"),
+        ("SESSION_STATE", "복원 정본 갱신 의무(계약 §8-2·§8-5)"),
+        ("AUTOPILOT_PAUSED", "kill-switch 2경로 파일 규약(계약 §9-4)"),
+        ("오살 금지", "회생 가능 노드 종료 금지 원칙(CSO 헌장 제5조)"),
+        # v0.4 집합 통일(재정 R-03) — pause 중 허용 범위 = 생명 유지 목록 그 자체. 이 두 핀이 빠지면
+        # 정지 중 살아있는 타 노드 종료 금지가 문서에서 소리 없이 사라진다.
+        ("일시정지 중 허용 범위 = 바로 위 생명 유지 목록", "pause 중 허용 범위 = 생명 유지 목록 그 자체(CSO 헌장 제0조 4항 · 계약 §9-4 · v0.4 집합 통일)"),
+        ("exited=true", "산 노드/죽은 노드 구분의 결정론 판정 기준 — 판정 불능은 산 노드로 보류"),
     ],
     "REVIEWER_DIRECTIVE.md": [
-        ("_TODO.md", "리뷰어 todo 영속(절대지침 7)"),
+        ("정지 경계", "다섯 정지의 상주 배치(리뷰어 헌장 제0조)"),
+        ("호칭의 정의처는 마스터 헌장 제1조", "호칭 단일 정의처 참조 규정"),
+        ("충돌 시 헌장 > 운영계약 > 이 디렉티브", "정의처 우선순위 1줄 — 배치본 성격 고지"),
+        ("producer", "producer ≠ evaluator 분리 원칙(리뷰어 헌장 제1조)"),
+        ("무관한 repo 및 파일 배회 금지", "엄격 제약 1(계약 §6-3)"),
+        ("도구 남용 금지", "엄격 제약 2"),
+        ("지정 파일과 task만 검토", "엄격 제약 3"),
+        ("서버 기동/상태 변경 명령 금지", "엄격 제약 4 — 자원 오염 차단"),
+        ("REVIEWER_VERDICT_CONTRACT.md", "verdict 정본 스키마 참조(계약 §6-4)"),
+        ("ACCEPT | REVISE | BLOCK | ESCALATE", "verdict enum 4종 — 그 외 값 금지"),
+        ("evidence", "근거 필수 — 근거 없는 YES는 검증이 아니다"),
+        ("file:line", "근거 형식 고유 핀"),
+        ("score` 필드 금지", "점수(0-100) 금지 — 평균·다수결 affordance 차단"),
+        ("다수결·judge auto-pick 금지", "합의 대체 금지 원칙"),
+        ("독립 재유도", "불일치 결착 방식 — master 원출처 재유도"),
+        ("anonymized peer-review", "고위험 포인트 2차 교차반박"),
+        ("steelman antithesis", "ACCEPT 전 최강 반론 1개 구성 의무"),
+        ("대상 커밋 해시", "리비전 바인딩 — 대상이 바뀌면 검증이 무효(계약 §6-6·§6-7)"),
+        ("잠근 합격 기준의 미달 항목 0", "라운드 종료 기준 — 구 리터럴 대체"),
+        ("REVIEWER_TODO.md", "리뷰어 todo 영속(리뷰어 헌장 제8조)"),
     ],
 }
 
@@ -858,8 +896,11 @@ class Preflight:
             if lost:
                 self.add(
                     cid, FAIL,
-                    "%s에서 소실된 조항: %s — 템플릿 복원은 `cys init-pack --force`"
-                    "(사용자 수정 덮어씀, 오너 결정 필요)" % (f, "; ".join(lost)),
+                    "%s에서 소실된 조항: %s — ★복원 절차(운영계약 §9-7-6·§11-13): "
+                    "①먼저 백업한다 `cp <파일> <파일>.bak-$(date +%%Y%%m%%dT%%H%%M%%S)` "
+                    "②주인님께 보고하고 지시에 따라 복구한다. 팩 템플릿 강제 복원은 "
+                    "사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 절대 금지다."
+                    % (f, "; ".join(lost)),
                 )
             else:
                 self.add(cid, PASS, "%s 핀 %d개 전부 존재" % (f, len(pins)))
@@ -2595,7 +2636,8 @@ class Preflight:
             self.add(cid, FAIL,
                      "work 스킬 결함: %s — `cys init-pack` 또는 --fix"
                      "(파일이 존재하되 깨진/약화된 경우 init-pack은 보존한다 — "
-                     "`cys init-pack --force`로 템플릿 복원, 사용자 수정 덮어씀 주의)"
+                     "강제 복원 플래그는 사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 "
+                     "쓰지 않는다. 백업 선행 + 주인님 보고 후 복구 · 운영계약 §11-13)"
                      % "; ".join(problems))
         elif repaired:
             self.add(cid, FIXED, "init-pack 수리 완료: %s" % "; ".join(repaired))
@@ -2770,8 +2812,10 @@ class Preflight:
             return
         lost = [pin for pin in AUTOPILOT_MEMORY_PINS if pin not in ftext]
         if lost:
-            self.add(cid, FAIL, "자율주행 메모리 본문 핀 소실: %s — `cys init-pack --force`"
-                     "(사용자 수정 덮어씀 주의)로 템플릿 복원" % "·".join(lost))
+            self.add(cid, FAIL, "자율주행 메모리 본문 핀 소실: %s — ★복원 절차"
+                     "(운영계약 §9-7-6·§11-13): ①먼저 백업 ②주인님께 보고 후 지시에 따라 복구. "
+                     "팩 템플릿 강제 복원은 무백업 소실을 낳는 비가역 조작이라 절대 금지다."
+                     % "·".join(lost))
             return
         try:
             itext = open(idx, encoding="utf-8", errors="replace").read()
@@ -4509,6 +4553,112 @@ class Preflight:
         else:
             self.add(cid, PASS, "strict 승격 재스캔 OK(≤5) — " + detail)
 
+    # ── C76 앱 번들 코드서명 봉인 (2026-08-01 실사고 M3 — 무증상 보균 탐지·WARN-only) ──
+    #
+    # 실사고: 번들 안 Python 런타임이 **실행 중** Contents/Resources/runtime/python/lib/
+    # python3.12/**/__pycache__/*.pyc 를 번들 *안에* 만들어 codesign 봉인(sealed resources)을
+    # 스스로 깼다. 로컬은 이미 실행 중이라 증상이 0이다(무증상 보균) — 그러나 그 번들을
+    # 사용자가 브라우저로 받아 설치하면 quarantine 이 붙고 첫 실행 Gatekeeper 전체 재검증에서
+    # "손상되었기 때문에 열 수 없습니다"로 차단된다(공증·staple 은 정상인데도). 릴리스 검증이
+    # curl 사본(quarantine 없음)만 봐서 이 경로를 한 번도 재현하지 못했다.
+    # ★등급 WARN 고정(부팅 비차단): 봉인 파손은 *배포 시* 사고이지 이 기계의 부팅 불능이
+    #   아니다 — 여기서 FAIL 을 내면 이미 파손된 기계가 READY→NOT READY 로 뒤집혀 부팅
+    #   자체가 막힌다(C75 E1-4 선례와 동일 판단). 대신 detail 이 원인 파일과 복구 절차를 말한다.
+    # ★판정 불가(비 macOS·번들 미발견·codesign 부재·타임아웃)는 전부 SKIP — 거짓 경보 금지.
+    # ★--fix 에서도 자동 수정 없음: 번들 안 파일 삭제는 App Management(TCC)에 막히고, 막히지
+    #   않아도 added 가 missing 으로 바뀔 뿐 봉인은 복구되지 않는다(통째 재설치만이 복구).
+    APP_SEAL_RECOVERY = ("복구는 번들 통째 재설치뿐 — 새 DMG의 cys.app 을 임시 폴더에 스테이징"
+                         "(ditto --rsrc --extattr --acl) 후 `mv` 로 /Applications 교체"
+                         "(/Applications 안 부분 수정은 App Management 보호에 막힘)")
+
+    @staticmethod
+    def _app_bundle_of(path):
+        """실행 파일 경로에서 자기 앱 번들 루트(…/*.app)를 찾는다. Contents/Info.plist 로 진짜
+        번들임을 확증(이름만 .app 인 디렉토리 오탐 차단). 번들 밖이면 None."""
+        p = os.path.realpath(path)          # 심링크(/usr/local/bin/cys)를 풀어야 번들이 보인다
+        while True:
+            parent = os.path.dirname(p)
+            if not p or parent == p:
+                return None
+            if p.endswith(".app") and os.path.isfile(os.path.join(p, "Contents", "Info.plist")):
+                return p
+            p = parent
+
+    def _find_app_bundle(self):
+        """이 기계가 실제로 쓰는 cys 의 앱 번들(심링크 해소). 없으면 표준 설치 경로. 둘 다 없으면 None.
+        (분리 이유: 회귀 하네스가 라이브 /Applications 를 건드리지 않고 픽스처 번들을 주입한다.)"""
+        cys = shutil.which("cys")
+        if cys:
+            b = self._app_bundle_of(cys)
+            if b:
+                return b
+        if os.path.isdir("/Applications/cys.app/Contents"):
+            return "/Applications/cys.app"
+        return None
+
+    def c76_app_seal(self):
+        cid = "C76.app-seal"
+        if self.skipped(cid):
+            return
+        if sys.platform != "darwin":
+            self.add(cid, SKIP, "macOS 아님 — 코드서명 봉인 검사 미해당")
+            return
+        bundle = self._find_app_bundle()
+        if not bundle:
+            self.add(cid, SKIP, "앱 번들 미발견(비번들 설치·개발 빌드) — 검사 대상 없음")
+            return
+        tool = "/usr/bin/codesign"
+        if not os.path.exists(tool):
+            self.add(cid, SKIP, "%s 부재 — 판정 불가" % tool)
+            return
+        # --verify --strict = Gatekeeper 가 보는 최상위 봉인 판정. --verbose 는 **필수**:
+        # 없으면 "a sealed resource is missing or invalid" 한 줄뿐이라 원인 파일을 못 말한다(실측).
+        # --deep 은 쓰지 않는다(이번 파손은 최상위 sealed resource · deep 은 느리다).
+        try:
+            r = subprocess.run([tool, "--verify", "--strict", "--verbose", bundle],
+                               capture_output=True, timeout=60, env=_utf8_env())
+        except subprocess.TimeoutExpired:
+            self.add(cid, SKIP, "codesign 시간초과(60s) — 판정 불가")
+            return
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "codesign 실행 실패(%s) — 판정 불가" % e)
+            return
+        if r.returncode == 0:
+            self.add(cid, PASS, "코드서명 봉인 무결 — %s" % bundle)
+            return
+        out = ((r.stdout or b"").decode("utf-8", "replace")
+               + (r.stderr or b"").decode("utf-8", "replace"))
+        added, modified, missing, other = [], [], [], []
+        for line in out.splitlines():
+            ln = line.strip()
+            if not ln:
+                continue
+            for pfx, bucket in (("file added: ", added), ("file modified: ", modified),
+                                ("file missing: ", missing)):
+                if ln.startswith(pfx):
+                    bucket.append(ln[len(pfx):].strip())
+                    break
+            else:
+                if not ln.startswith("--prepared:") and not ln.startswith("--validated:"):
+                    other.append(ln)
+        culprits = added + modified + missing
+        if not culprits:
+            # codesign 은 실패했으나 봉인 파손 문장이 아니다(미서명 개발 번들 등) — 손상을
+            # 확증하지 못했으므로 원문만 남긴다(거짓 단정 금지).
+            self.add(cid, WARN, "codesign 검증 실패(rc=%d) — 봉인 파손 파일은 특정되지 않음: %s "
+                                "(미서명 개발 빌드면 정상)"
+                     % (r.returncode, (" | ".join(other))[:300] or "(출력 없음)"))
+            return
+        rel = [c[len(bundle):].lstrip("/") if c.startswith(bundle) else c for c in culprits[:3]]
+        pycache = " ★전부 __pycache__ — 번들 안 Python 런타임이 실행 중 스스로 생성(자기유발)" \
+            if all("__pycache__" in c for c in culprits) else ""
+        self.add(cid, WARN,
+                 "코드서명 봉인 파손 — %s · 추가 %d건·수정 %d건·누락 %d건(예: %s)%s · 이 번들을 "
+                 "브라우저로 배포하면 받는 쪽 첫 실행에서 Gatekeeper 가 '손상되었기 때문에 열 수 "
+                 "없습니다'로 차단한다(공증·staple 정상이어도) · %s"
+                 % (bundle, len(added), len(modified), len(missing), ", ".join(rel), pycache,
+                    self.APP_SEAL_RECOVERY))
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -4544,6 +4694,8 @@ class Preflight:
             # Phase 1 Wave B2(C72~C75) — 마지막 고정 슬롯(C62·C68) 앞(§5-4 배선 규율).
             self.c72_phase1_gate_set, self.c73_guard_hook_integrity,
             self.c74_brief_gate_paths, self.c75_verify_spec_rescan,
+            # C76(2026-08-01 실사고 M3) — 앱 번들 코드서명 봉인. 읽기 전용·WARN-only.
+            self.c76_app_seal,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

@@ -22,6 +22,61 @@ pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
 pub const ENV_SURFACE_REF: &str = "CYS_SURFACE_REF";
 pub const ENV_ROLE: &str = "CYS_ROLE";
 
+/// ★SEAL-1 (2026-08-01 실사고 근본원인 · "손상되었기 때문에 열 수 없습니다"):
+/// 동봉 Python 이 **자기 번들 안에** 바이트코드를 쓰면 코드서명 봉인이 스스로 깨진다.
+///
+/// 재현 사슬: 번들 python(`Contents/Resources/runtime/python/bin/python3`)이 stdlib 을 import
+/// → CPython 이 `.../lib/python3.12/__pycache__/*.pyc` 를 **번들 안에** 새로 쓴다 →
+/// `codesign --verify` 가 `a sealed resource is missing or invalid / file added:
+/// .../__pycache__/_compression.cpython-312.pyc` 로 실패 → 브라우저로 받은 사본은 quarantine 이
+/// 붙어 있어 **첫 실행 시 Gatekeeper 전체 재검증**에 걸려 실행이 차단된다(공증·staple 은 정상).
+///
+/// **왜 PYTHONDONTWRITEBYTECODE 이고 PYTHONPYCACHEPREFIX(번들 밖 캐시)가 아닌가** — 근거 3:
+/// ① **활용할 동봉 .pyc 가 애초에 없다**: 동봉본은 python-build-standalone `install_only`
+///    tar 를 그대로 전개한 것이라(`scripts/prep-mac-runtime.sh`) 선컴파일 `.pyc` 가 없다.
+///    실측(2026-08-01 설치본): `.pyc` 46개 · `__pycache__` 디렉터리 **5개뿐**이고 그 집합이
+///    정확히 기동 시 import 되는 것들(최상위·re·encodings·json·collections)이며 mtime 이
+///    전부 그날 실행 시각이다 — 전 stdlib 선컴파일이라면 200개 넘는 디렉터리여야 한다.
+///    즉 "기존 동봉 .pyc 활용"은 성립하지 않아 PYCACHEPREFIX 의 재사용 이점이 사라진다
+///    (첫 실행에서 어차피 전부 새로 컴파일한다).
+/// ② **기동 대가는 지불 가능한 크기**(동봉 python 실측 · 2026-08-01 · 격리 사본):
+///    캐시 적중(PYCACHEPREFIX warm) 대비 매번 재컴파일(DONTWRITEBYTECODE)의 차이는
+///    훅 hot path(`import sys,json` · 20회 평균) **13.6ms → 37.5ms (+23.9ms)**,
+///    무거운 팩 스크립트급 import 16종(10회 평균) **23.8ms → 88.8ms (+65.0ms)** 였다.
+///    자식 대부분이 수백 ms~수십 s 짜리 잡(스케줄·phoenix·게이트)이라 감내 가능하고,
+///    **이 손해를 되찾는 올바른 수단은 PYCACHEPREFIX 가 아니라 ※의 빌드타임 선컴파일이다**
+///    (그쪽은 캐시 이득과 봉인 안전을 동시에 준다 — 트레이드오프가 아니다).
+/// ③ **실패모드가 안전하다**: PYCACHEPREFIX 는 값이 **빈 문자열이면 미설정과 동일**하게
+///    취급돼 in-tree 쓰기(=봉인 파손)로 조용히 되돌아간다. 즉 "env 가 어긋나면 사고가
+///    그대로 재발"한다. 게다가 캐시 디렉터리라는 새 쓰기 상태·경로 계산을 하나 더 떠안는다
+///    (HOME 붕괴 환경까지 따라온다 — hooks/_lib.sh 가 backfill 하는 바로 그 문제).
+///    DONTWRITEBYTECODE 는 상태 0 · 경로 0 이고 "안 쓴다"는 한 방향으로만 실패한다
+///    (최악 = 매번 재컴파일, 봉인은 절대 안 깨짐). 봉인 파손의 대가가 **앱 실행 불가**라
+///    비대칭이 압도적이다.
+///
+/// ※ 잔여 갭(이 상수의 범위 밖 · 빌드 층위 · 후속 권고): 서명 **전**에
+///   `compileall --invalidation-mode unchecked-hash` 로 stdlib 을 미리 컴파일해 `.pyc` 를
+///   **서명 대상**으로 넣으면 ⓐ 어떤 호출 경로(우리가 스폰하지 않은 python 포함)에서도 새
+///   쓰기가 없고 ⓑ ②의 기동 손해도 사라진다. 그건 패키징 변경이라 여기(스폰 env)와 별개다.
+pub const ENV_PY_NO_BYTECODE: &str = "PYTHONDONTWRITEBYTECODE";
+/// `ENV_PY_NO_BYTECODE` 의 켜짐 값. CPython 은 **비어 있지 않으면** 참으로 읽는다 —
+/// 빈 문자열은 "끔"이므로 반드시 이 상수를 쓴다(빈 값 주입 = 봉인 파손 복귀).
+pub const PY_NO_BYTECODE_ON: &str = "1";
+
+/// 동봉 Python 을 **직접** 스폰하는 모든 지점의 단일 팩토리(SEAL-1 · 중복 구현 금지).
+/// `std::process::Command::new(python)` 을 이걸로 바꾸기만 하면 `.pyc` 번들 오염이 봉쇄된다.
+///
+/// 셸을 거쳐 python 이 도는 경로(pane·스케줄 잡·훅)는 이 팩토리를 못 타므로
+/// `spawn_env_pairs`(PATH·HOME 과 같은 자리)가 같은 쌍을 얹어 **상속**으로 덮는다 —
+/// 두 층이 같은 상수를 소비하므로 규약이 산재하지 않는다.
+/// tokio 자식처럼 `std::process::Command` 가 아닌 빌더는
+/// `.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)` 한 줄로 같은 상수를 소비한다.
+pub fn python_command<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.env(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON);
+    cmd
+}
+
 /// 이행기 호환: CYS_* 우선 → 구 JAVIS_* → 구 AITERM_* 순 폴백.
 pub fn env_compat(primary: &str) -> Option<String> {
     let javis = primary.replacen("CYS_", "JAVIS_", 1);
@@ -216,6 +271,12 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
 /// ② HOME: Windows 의 비로그인 셸(`bash -c`)·순수 cmd 스폰은 HOME 이 없어 페이로드의
 ///    `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로 붕괴한다 → **미설정일 때만**
 ///    USERPROFILE 로 채운다. HOME 이 이미 있으면 무접촉(unix 는 항상 이 경로 → 무변경).
+/// ③ PYTHONDONTWRITEBYTECODE(★SEAL-1): ①이 PATH 선두에 **번들 python** 을 꽂는 바로 그 자리다 —
+///    그래서 이 자식들이 부르는 `python3` 는 곧 앱 번들 안의 인터프리터이고, 그게 `__pycache__`
+///    를 번들에 쓰면 코드서명 봉인이 깨져 다음 실행이 Gatekeeper 에 차단된다(2026-08-01 실사고).
+///    pane·스케줄 잡·훅은 셸을 거치므로 `python_command` 팩토리를 못 탄다 → **상속**으로 덮는
+///    유일한 지점이 여기다. 항상 얹는다(무조건 쌍 1개 추가 — PATH 무변경이어도 이건 나간다).
+///    근거·대안 비교는 `ENV_PY_NO_BYTECODE` 상수 주석.
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
@@ -237,6 +298,11 @@ pub fn spawn_env_pairs(
             env.push(("HOME".to_string(), up.to_string()));
         }
     }
+    // ③ SEAL-1: 셸 경유 python(pane·훅·스케줄 잡)이 번들에 .pyc 를 못 쓰게 상속으로 봉인.
+    env.push((
+        ENV_PY_NO_BYTECODE.to_string(),
+        PY_NO_BYTECODE_ON.to_string(),
+    ));
     env
 }
 
@@ -608,6 +674,46 @@ mod tests {
         assert_eq!(parse_surface_ref("surface:31"), Some(31));
         assert_eq!(parse_surface_ref("31"), Some(31));
         assert_eq!(parse_surface_ref("x"), None);
+    }
+
+    /// ★SEAL-1 회귀 핀(2026-08-01 실사고): 번들 python 이 번들 안에 `.pyc` 를 쓰면 코드서명
+    /// 봉인이 깨져 다음 실행이 Gatekeeper 에 차단된다. 두 층(직스폰 팩토리·상속 env)이
+    /// **같은 상수**로 잠겨 있어야 한다 — 한쪽만 남으면 셸 경유 경로가 다시 새어 사고가 재발한다.
+    #[test]
+    fn python_spawns_never_write_bytecode_into_the_bundle() {
+        // 값 규약: CPython 은 "비어 있지 않으면 참"이라 빈 값은 곧 봉인 파손 복귀다.
+        assert_eq!(ENV_PY_NO_BYTECODE, "PYTHONDONTWRITEBYTECODE");
+        assert!(!PY_NO_BYTECODE_ON.is_empty(), "빈 값은 CPython 이 '끔'으로 읽는다");
+
+        // 층1 — 직스폰 팩토리(cysd phoenix·office-bridge·cys 헬퍼·GUI 직스폰).
+        let cmd = python_command("python3");
+        let got = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(ENV_PY_NO_BYTECODE))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            got.as_deref(),
+            Some(PY_NO_BYTECODE_ON),
+            "python_command 는 반드시 바이트코드 쓰기를 끈 채로 나와야 한다"
+        );
+
+        // 층2 — 상속 env(pane·스케줄 잡·훅: 셸을 거쳐 python 이 도는 경로).
+        // PATH 가 무변경이어도(=주입 쌍 없음) 이 쌍은 **항상** 나가야 한다.
+        let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
+        for pairs in [
+            spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None),
+            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\me")),
+        ] {
+            assert_eq!(
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == ENV_PY_NO_BYTECODE)
+                    .map(|(_, v)| v.as_str()),
+                Some(PY_NO_BYTECODE_ON),
+                "셸 경유 python 은 상속으로만 막을 수 있다 — 쌍이 빠지면 pane/훅이 번들을 오염시킨다"
+            );
+        }
     }
 
     #[test]

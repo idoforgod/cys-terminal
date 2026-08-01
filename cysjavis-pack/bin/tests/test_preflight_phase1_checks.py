@@ -406,5 +406,109 @@ class TestC75(Base):
         self.assertIn("파싱 실패 1건", detail)
 
 
+# ══ C76 — 앱 번들 코드서명 봉인(2026-08-01 실사고 M3) ═══════════════════════════════
+#
+# 계측 타당성: "정상 번들 PASS" 만으로는 아무것도 증명하지 않는다 — 파일 **하나**를 번들 안에
+# 넣었을 때 판정이 PASS→WARN 으로 실제로 뒤집히는지(변이검증)까지 잰다. 뒤집히지 않으면 이
+# 검사는 실사고를 다시 놓친다.
+# 라이브 무접촉: /Applications/cys.app 는 절대 대상이 되지 않는다 — _find_app_bundle 를 픽스처로
+# 대체해 임시 디렉터리 안의 번들만 검사한다.
+_CODESIGN = "/usr/bin/codesign"
+_CAN_SIGN = sys.platform == "darwin" and os.path.exists(_CODESIGN)
+
+
+class TestC76(Base):
+    def _fixture_bundle(self, sign=True):
+        """임시 .app 골격 + ad-hoc 서명(라이브 번들 무접촉)."""
+        import subprocess
+        app = os.path.join(self.td, "Fixture.app")
+        os.makedirs(os.path.join(app, "Contents", "MacOS"), exist_ok=True)
+        os.makedirs(os.path.join(app, "Contents", "Resources"), exist_ok=True)
+        wr(os.path.join(app, "Contents", "Info.plist"),
+           '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
+           '<key>CFBundleExecutable</key><string>fixture</string>'
+           '<key>CFBundleIdentifier</key><string>com.example.cysfixture</string>'
+           '</dict></plist>')
+        wr(os.path.join(app, "Contents", "Resources", "data.txt"), "hello\n")
+        # 주 실행파일은 실제 Mach-O 여야 서명이 성립한다(시스템 바이너리 복제 → ad-hoc 재서명).
+        # copy2 는 금물 — /bin/echo 의 SIP 제한 플래그(chflags)까지 옮기려다 EPERM 이 난다.
+        exe = os.path.join(app, "Contents", "MacOS", "fixture")
+        shutil.copyfile("/bin/echo", exe)
+        os.chmod(exe, 0o755)
+        if sign:
+            r = subprocess.run([_CODESIGN, "--force", "--sign", "-", app],
+                               capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 0,
+                             "픽스처 ad-hoc 서명 실패 — 계측기 무효: %r" % r.stderr)
+        return app
+
+    def _use(self, bundle):
+        """검사가 볼 번들을 픽스처로 고정(라이브 /Applications 유입 차단)."""
+        orig = pf.Preflight._find_app_bundle
+        pf.Preflight._find_app_bundle = lambda _self: bundle
+        self.addCleanup(setattr, pf.Preflight, "_find_app_bundle", orig)
+
+    def test_non_macos_is_skip_not_fail(self):
+        """비 macOS 는 판정 불가 = SKIP. 여기서 FAIL 을 내면 리눅스 부트가 거짓 적색이 된다."""
+        import unittest.mock as mock
+        with mock.patch.object(pf.sys, "platform", "linux"):
+            st, detail = self.check("c76_app_seal", "C76")
+        self.assertEqual(st, SKIP, detail)
+        self.assertIn("macOS 아님", detail)
+
+    def test_no_bundle_is_skip(self):
+        """번들 미발견(비번들 설치·개발 빌드)은 SKIP — 없는 것을 파손으로 적지 않는다."""
+        if sys.platform != "darwin":
+            self.skipTest("darwin 전용 경로")
+        self._use(None)
+        st, detail = self.check("c76_app_seal", "C76")
+        self.assertEqual(st, SKIP, detail)
+        self.assertIn("검사 대상 없음", detail)
+
+    @unittest.skipUnless(_CAN_SIGN, "codesign 부재 — 봉인 검사 판정 불가 환경")
+    def test_clean_bundle_pass_then_added_file_flips_to_warn(self):
+        """★변이검증: 정상 서명 = PASS / 파일 1개 추가 = WARN(원인 파일·복구 안내 포함)."""
+        app = self._fixture_bundle()
+        self._use(app)
+        st, detail = self.check("c76_app_seal", "C76")
+        self.assertEqual(st, PASS, "정상 서명 번들이 PASS 가 아님: %s" % detail)
+
+        # 결함 주입 — 실사고와 같은 모양(번들 안 __pycache__ 생성) 파일 하나.
+        pyc = os.path.join(app, "Contents", "Resources", "runtime", "python",
+                           "lib", "python3.12", "__pycache__")
+        os.makedirs(pyc, exist_ok=True)
+        wr(os.path.join(pyc, "_compression.cpython-312.pyc"), "x")
+        st2, detail2 = self.check("c76_app_seal", "C76")
+        self.assertEqual(st2, WARN, "파일 1개 추가가 WARN 으로 뒤집히지 않음: %s" % detail2)
+        self.assertNotEqual(st2, FAIL, "부팅을 막는 FAIL 이어서는 안 된다(WARN 고정 계약)")
+        self.assertIn("__pycache__", detail2, "원인 파일이 보고에 없다")
+        self.assertIn("자기유발", detail2, "전부 __pycache__ 면 자기유발로 지목해야 한다")
+        self.assertIn("App Management", detail2, "복구 안내(부분 수정 차단 이유)가 없다")
+        # 진단은 읽기 전용 — 주입한 파일을 지우지 않는다(부분 수리 금지).
+        self.assertTrue(os.path.exists(os.path.join(pyc, "_compression.cpython-312.pyc")),
+                        "preflight 가 번들 안 파일을 삭제했다(부분 수리 금지 위반)")
+
+    @unittest.skipUnless(_CAN_SIGN, "codesign 부재 — 봉인 검사 판정 불가 환경")
+    def test_modified_file_is_also_caught(self):
+        """추가뿐 아니라 기존 sealed 파일 '수정'도 잡아야 한다(파손 갈래 누락 방지)."""
+        app = self._fixture_bundle()
+        self._use(app)
+        wr(os.path.join(app, "Contents", "Resources", "data.txt"), "tampered")
+        st, detail = self.check("c76_app_seal", "C76")
+        self.assertEqual(st, WARN, detail)
+        self.assertIn("수정 1건", detail)
+        self.assertNotIn("자기유발", detail, "__pycache__ 아닌 파손에 자기유발을 단정하면 오진")
+
+    @unittest.skipUnless(_CAN_SIGN, "codesign 부재 — 봉인 검사 판정 불가 환경")
+    def test_unsigned_bundle_is_warn_not_false_alarm_of_seal_break(self):
+        """미서명 개발 번들: codesign 은 실패하지만 '봉인 파손 파일'을 단정하지 않는다."""
+        app = self._fixture_bundle(sign=False)
+        self._use(app)
+        st, detail = self.check("c76_app_seal", "C76")
+        self.assertIn(st, (PASS, WARN), detail)
+        if st == WARN:
+            self.assertIn("특정되지 않음", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

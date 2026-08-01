@@ -888,6 +888,15 @@ pub(crate) fn ownership(rel: &str) -> Ownership {
         // 어댑터는 .new 병치+병합으로 전달되고, 소비자(launch-agent·cysd)는 어댑터 결손 시 해당
         // 어댑터만 비활성(전체 파손 아님)이라 동결 리스크 < 사용자 수정 소실.
         || rel == "agents.json"
+        // ★W-ACL(오너 승인 2026-08-01): acl.json 은 "이 설치본에서 누가 누구에게 stdin 을 넣을 수
+        // 있는가"를 정하는 **설치별 운영 정책**이다(부서 편성·오너가 확정한 송신 규칙). 성격이 같은
+        // schedule.json·agents.json 은 이미 user 로 보존되는데 acl.json 만 system 이라, 매 설치
+        // 스윕이 vendor 기본 정책으로 강제 치유해 확정 정책이 되돌아갔다(2026-08-01 실증).
+        // 전례 그대로 user 승격 — vendor 신규 규칙은 `.new` 병치+pack-merge 로 전달되고, 데몬의
+        // ACL 평가는 파일 부재·파싱 실패 시 fail-OPEN(cysd check_send_acl)이라 동결 리스크 <
+        // 정책 원복. ★is_constitution_file 에는 넣지 않는다 — 헌법 문서가 아니라 정책 파일이라
+        // pack-merge 대화형 강제(--yes 무시·안전핵 검증)가 아니라 일반 user-owned 병합 경로를 탄다.
+        || rel == "acl.json"
     {
         return Ownership::User;
     }
@@ -2546,7 +2555,9 @@ mod tests {
             .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
         let sys_a = "README.md";  // system·비수정 → 갱신 + pristine 미러
         let user_b = "soul.md";   // user-owned·수정 + vendor 전진 → 보존 + .new + pending
-        let sys_c = "acl.json";   // system·수정 → 치유 + .user + pending
+        // ★W-ACL 이후 acl.json 은 user 등급이라 system 픽스처가 될 수 없다 — 성격이 같은
+        // 루트 JSON 설정 중 system 으로 남은 alerts-config.json 으로 대조군을 옮긴다.
+        let sys_c = "alerts-config.json"; // system·수정 → 치유 + .user + pending
         std::fs::create_dir_all(&td).unwrap();
         for (rel, stale) in [(sys_a, "OLD-INSTALLED"), (user_b, "USER-SOUL"), (sys_c, "SYS-DRIFT")] {
             std::fs::write(td.join(rel), stale).unwrap();
@@ -2566,7 +2577,7 @@ mod tests {
         assert_eq!(read("soul.md.new"), get(user_b), ".new = 임베드 신버전");
         // ② system 수정본: 치유(임베드) + 사용자본 .user 보존 + 원장 healed.
         assert_eq!(read(sys_c), get(sys_c), "system 치유(P0-4 불변)");
-        assert_eq!(read("acl.json.user"), "SYS-DRIFT", "치유 전 사용자본 보존(파괴 0)");
+        assert_eq!(read(&format!("{sys_c}.user")), "SYS-DRIFT", "치유 전 사용자본 보존(파괴 0)");
         let pending = load_merge_pending(&td);
         assert_eq!(pending.get(user_b).and_then(|e| e["kind"].as_str()), Some("new-pending"));
         assert_eq!(pending.get(sys_c).and_then(|e| e["kind"].as_str()), Some("healed"));
@@ -2598,7 +2609,7 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         std::fs::write(td.join("README.md"), "OLD-INSTALLED").unwrap();
         std::fs::write(td.join("soul.md"), "USER-SOUL").unwrap();
-        std::fs::write(td.join("acl.json"), "SYS-DRIFT").unwrap();
+        std::fs::write(td.join("alerts-config.json"), "SYS-DRIFT").unwrap(); // system 대조군(W-ACL 이후)
         let manifest = serde_json::json!({
             "README.md": content_hash("OLD-INSTALLED"),
             "soul.md": content_hash("OLD-SOUL-BASE"),
@@ -2610,13 +2621,13 @@ mod tests {
         assert!(plan.blocked.is_none());
         assert!(plan.update.iter().any(|r| r == "README.md"), "비수정 → update");
         assert!(plan.merge_new.iter().any(|r| r == "soul.md"), "user-owned+전진 → merge_new");
-        assert!(plan.heal.iter().any(|r| r == "acl.json"), "system 수정 → heal");
+        assert!(plan.heal.iter().any(|r| r == "alerts-config.json"), "system 수정 → heal");
         // 실제 install 이 플랜과 같은 행동을 하는지 대조.
         install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
         assert_eq!(read("soul.md"), "USER-SOUL");
         assert!(td.join("soul.md.new").exists());
-        assert!(td.join("acl.json.user").exists());
+        assert!(td.join("alerts-config.json.user").exists());
 
         let _ = std::fs::remove_dir_all(&td);
     }
@@ -2632,7 +2643,7 @@ mod tests {
             .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
         let sys_a = "README.md";       // system·비수정(manifest 일치) → 갱신
         let user_b = "soul.md";        // user·수정 → 보존
-        let sys_c = "acl.json";        // system·manifest 부재·상이 → 강제 갱신(B2/P0-4)
+        let sys_c = "alerts-config.json"; // system·manifest 부재·상이 → 강제 갱신(B2/P0-4)
         let user_d = "directives/MASTER_DIRECTIVE.md"; // user·manifest 부재·상이 → 보존
         let (sys_a_c, user_b_c, sys_c_c, user_d_c) =
             (get(sys_a), get(user_b), get(sys_c), get(user_d));
@@ -2695,6 +2706,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// ★W-ACL(오너 승인 2026-08-01): acl.json 은 user-owned — **force 설치에도 오너가 확정한 송신
+    /// 정책이 그대로 남고**, vendor 신버전은 `<rel>.new` 로 주차된다(schedule.json·agents.json 동형).
+    ///
+    /// 무엇이 깨졌었나 — acl.json 만 system 등급이라 매 설치 스윕(P0-4 강제 치유)이 vendor 기본
+    /// 정책으로 덮어써, "external→worker 차단" 같은 **설치별 운영 정책이 매 설치마다 원복**됐다
+    /// (2026-08-01 실증). 이 테스트는 보존(등급)뿐 아니라 **동결이 아님**(vendor 신규 규칙이 .new +
+    /// 병합 원장으로 도달)까지 함께 고정한다 — 보존만 하고 전달 경로가 없으면 정책이 영구 동결된다.
+    #[test]
+    fn install_force_preserves_user_acl_and_parks_vendor_new() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!("cys-acl-owner-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let _env = set_pack_env(&td, td.join("cysclaude"));
+        std::fs::create_dir_all(&td).unwrap();
+
+        // 오너가 이 설치본에서 확정한 송신 정책(임베드 기본값과 상이).
+        let user_acl = r#"{"default":"deny","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
+        std::fs::write(td.join("acl.json"), user_acl).unwrap();
+        let embed = PACK_ALL.iter().find(|(r, _)| *r == "acl.json").map(|(_, c)| *c)
+            .expect("팩에 acl.json 부재");
+        assert_ne!(embed, user_acl, "픽스처 전제: 오너 정책 ≠ vendor 기본 정책");
+
+        // ★가장 공격적인 스윕: force 재설치(= `cys init-pack --force`).
+        install(true, None).expect("install(force) 실패");
+        let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
+
+        // ① 보존: 오너 확정 정책이 vendor 기본으로 원복되지 않는다.
+        assert_eq!(read("acl.json"), user_acl,
+                   "강제갱신이 오너 확정 ACL 정책을 vendor 기본으로 원복시켰다 — W-ACL 위반");
+        // ①-b Keep 은 '백업 후 교체'가 아니라 '무접촉' — 치유 사이드카(.user)가 생기면 안 된다.
+        assert!(!td.join("acl.json.user").exists(), "Keep 인데 .user 사이드카가 생겼다(치유 경로 오진입)");
+
+        // ② 동결 아님: vendor 신버전은 .new 로 주차 + 병합 원장 등재(pack-merge 가 소비).
+        assert_eq!(read("acl.json.new"), embed, ".new = vendor 신버전 주차");
+        assert_eq!(load_merge_pending(&td).get("acl.json").and_then(|e| e["kind"].as_str()),
+                   Some("new-pending"), "병합 원장 미등재 — 신규 vendor 규칙 전달 경로 소실");
+
+        // ③ 헌법 파일이 **아니다**: 정책 파일이므로 pack-merge 대화형 강제(--yes 무시·안전핵 검증)
+        //    대상에 들어가면 안 된다(일반 user-owned 병합 경로).
+        assert!(!is_constitution_file("acl.json"), "acl.json 이 헌법 특례에 들어갔다");
+
+        // ④ 멱등: 재실행이 보존·주차 상태를 흔들지 않는다(원장 중복 기록 없음).
+        install(true, None).expect("재실행 실패");
+        assert_eq!(read("acl.json"), user_acl, "④재실행 후에도 보존 불변");
+        assert_eq!(read("acl.json.new"), embed, "④재실행 후에도 .new 유지");
+
+        // ⑤ 해소: 오너가 vendor 본을 채택(디스크=임베드)하면 .new·원장이 자동 청소된다.
+        std::fs::write(td.join("acl.json"), embed).unwrap();
+        install(false, None).expect("3차 실행 실패");
+        assert!(!td.join("acl.json.new").exists(), "채택 후 .new 청소");
+        assert!(load_merge_pending(&td).get("acl.json").is_none(), "채택 후 원장 소거");
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// ★W-1 회귀 핀 ①(순수 판정 · P0 · 2026-08-01): **판독 불가(disk=None) user-owned 는 force 여도 Keep.**
     ///
     /// 무엇이 깨졌었나 — ko-KR Windows 에서 헌법 파일을 CP949/ANSI 로 저장하면 `read_to_string` 이
@@ -2713,7 +2779,7 @@ mod tests {
         // ① ★수리 본체: user-owned + 존재 + 판독 불가 → force 여도 Keep(덮어쓰기 금지).
         //    매니페스트 유무 두 갈래 모두 — 구설치본(None)이 오히려 흔한 실사용 형상이다.
         for rel in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
-                    "schedule.json", "agents.json", "sub/dir/CSO_DIRECTIVE.md"] {
+                    "schedule.json", "agents.json", "acl.json", "sub/dir/CSO_DIRECTIVE.md"] {
             assert_eq!(decide_file_action(rel, embed, true, None, None, true), keep,
                        "①force=true·판독불가·매니페스트부재 → Keep 이어야: {rel}");
             assert_eq!(decide_file_action(rel, embed, true, None, Some(eh.as_str()), true), keep,
@@ -2738,14 +2804,14 @@ mod tests {
                    Write { heal_user_copy: false }, "②-b 부재 → 신규 설치(수리가 막지 않는다)");
 
         // ③ system-owned **불변**: 판독 불가여도 P0-4 강제 치유 유지(동결 = 배포 스큐 재앙의 근원).
-        for rel in ["bin/javis_phoenix.py", "acl.json", "README.md", "CLAUDE.md.template",
+        for rel in ["bin/javis_phoenix.py", "alerts-config.json", "README.md", "CLAUDE.md.template",
                     "directives/CEO_TEMPLATE.md"] {
             assert_eq!(decide_file_action(rel, embed, true, None, None, true),
                        Write { heal_user_copy: false }, "③system·판독불가·force → 치유 유지: {rel}");
             assert_eq!(decide_file_action(rel, embed, true, None, None, false),
                        Write { heal_user_copy: false }, "③system·판독불가·비force → 치유 유지: {rel}");
         }
-        assert_eq!(decide_file_action("acl.json", embed, true, Some("SYS-DRIFT"), None, true),
+        assert_eq!(decide_file_action("alerts-config.json", embed, true, Some("SYS-DRIFT"), None, true),
                    Write { heal_user_copy: true }, "③system 수정본은 .user 보존 후 치유(종전 동일)");
 
         // ④ seed-once 는 종전부터 판독 불가에도 불가침 — 우선순위가 뒤집히지 않았음을 재확인.
@@ -2779,7 +2845,7 @@ mod tests {
             .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
 
         let unreadable_user = ["soul.md", "directives/MASTER_DIRECTIVE.md"]; // 헌법 파일
-        let unreadable_sys = "acl.json";      // 대조군: system 등급 + 판독 불가
+        let unreadable_sys = "alerts-config.json"; // 대조군: system 등급 + 판독 불가
         let readable_user = "agents.json";    // 대조군: user 등급 + 정상 UTF-8 수정
         let readable_sys = "README.md";       // 대조군: system 등급 + 정상 UTF-8 수정
 
@@ -2848,13 +2914,18 @@ mod tests {
     fn is_user_owned_classification() {
         // agents.json: ★W-B 승격 핀 — _doc 이 "사용자 환경에 맞게 수정 가능"이라 선언하는 혼합
         // 설정(schedule.json 동형). system 으로 되돌리면 사용자 어댑터 수정이 매 스윕 소실된다.
+        // acl.json: ★W-ACL 승격 핀 — 설치별 운영 정책(누가 누구에게 stdin 을 넣는가)이라
+        // schedule.json·agents.json 동형. system 으로 되돌리면 오너가 확정한 송신 정책이 매
+        // 설치 스윕마다 vendor 기본으로 원복된다(2026-08-01 실증).
         for u in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
-                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json", "agents.json"] {
+                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json", "agents.json",
+                  "acl.json"] {
             assert!(is_user_owned(u), "user 여야: {u}");
         }
         for s in ["bin/javis_phoenix.py", "hooks/session_start.sh", "README.md",
-                  "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
-                  "directives/CEO_TEMPLATE.md", "sub/schedule.json", "sub/agents.json"] {
+                  "alerts-config.json", "CLAUDE.md.template", "skills/x/SKILL.md",
+                  "directives/CEO_TEMPLATE.md", "sub/schedule.json", "sub/agents.json",
+                  "sub/acl.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
         }
     }
@@ -2904,7 +2975,7 @@ mod tests {
         // 술어 래퍼 배타성: 단일 SOT 의 배타 등급이므로 어떤 rel 에서도 동시 참 불가.
         for rel in ["memory/CLAUDE.md", "memory/MEMORY.md", "soul.md", "CLAUDE.md",
                     "round/SESSION_STATE.md", "round/capability_catalog.json",
-                    "schedule.json", "bin/javis_phoenix.py"] {
+                    "schedule.json", "acl.json", "bin/javis_phoenix.py"] {
             assert!(!(is_user_owned(rel) && is_seed_once(rel)), "이중 등급: {rel}");
         }
     }

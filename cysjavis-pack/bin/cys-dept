@@ -32,6 +32,14 @@ export CYS_BIN="$CYS"
 # agents.json·directives 읽기가 UnicodeDecodeError로 크래시(부서 seed 실패 등). PYTHONUTF8=1로 전 python
 # heredoc·자식 python을 UTF-8 기본으로 강제(unix 무영향). 개별 open(encoding=) 누락도 이걸로 방어.
 export PYTHONUTF8=1
+# ★SEAL-1(2026-08-01 실사고): 이 도구가 spawn 하는 자식들은 cys.app 번들 안의 python 을 물 수 있다
+# (PATH 선두 = Contents/Resources/runtime/python/bin). 그 python 이 stdlib import 중 번들 안에
+# `__pycache__/*.pyc` 를 쓰면 코드서명 봉인이 깨지고("file added: …cpython-312.pyc"), quarantine 이
+# 붙은 사본은 Gatekeeper 재검증에서 "손상되었기 때문에 열 수 없습니다"로 차단된다. PYTHONUTF8 과
+# 같은 자리에서 같은 방식(단일 지점 export → 전 자식 상속)으로 봉인한다.
+# 값은 반드시 비어 있지 않아야 한다(CPython 은 빈 문자열을 '끔'으로 읽는다) — Rust 정본은
+# src/lib.rs ENV_PY_NO_BYTECODE, 대안(PYTHONPYCACHEPREFIX) 비교 근거도 그 주석에 있다.
+export PYTHONDONTWRITEBYTECODE=1
 
 # RC-4: 부서 소켓 규약 — Windows(MSYS/Git-Bash)는 named pipe `\\.\pipe\cys-dept-<n>`
 # (cysd가 CYS_SOCKET을 named pipe로 바인드·Rust cys::dept_socket_path와 정합), 그 외는 unix .sock.

@@ -1775,7 +1775,15 @@ fn no_console(cmd: &mut std::process::Command) {
 /// runtime이 없어 순정 Windows서 bash/python3 lookup 실패 → ＋부서·티켓 무반응이었다(cysd PTY 자식만
 /// 주입 수혜). cysd와 동일한 공용 로직(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.
 /// 타 OS는 exe_dir만 얹혀 사실상 무영향(제거 없음).
+///
+/// ★SEAL-1(2026-08-01 실사고): 여기에 PYTHONDONTWRITEBYTECODE 도 함께 얹는다. **이 함수가
+/// 하는 일이 곧 "자식이 번들 python 을 쓰게 만드는 것"**이므로, 번들 python 이 자기 번들에
+/// `__pycache__/*.pyc` 를 써서 코드서명 봉인을 깨는 경로와 호출부 집합이 정확히 같다
+/// (직스폰 python3 3곳 + bash 경유로 python 을 부르는 곳 전부). 호출부마다 한 줄씩 더하면
+/// 새 스폰이 생길 때 또 빠진다 — 배선의 단일 지점에 둔다. 근거·대안 비교는 lib.rs
+/// `ENV_PY_NO_BYTECODE` 주석. python 이 아닌 자식(cys/bash)에게는 무해한 무시 변수다.
 fn inject_runtime_path(cmd: &mut std::process::Command) {
+    cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
