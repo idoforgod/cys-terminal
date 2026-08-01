@@ -449,10 +449,23 @@ def _binary_version():
     return out.strip().splitlines()[0] if code == 0 and out.strip() else "unknown"
 
 
-def _my_surface_id():
-    """이 런이 속한 surface 참조(귀속 키). 구 env 이름도 수용(프리루드 A2 게이트와 동일 규약)."""
+def my_surface_id():
+    """이 런이 속한 surface 참조(귀속 키). 구 env 이름도 수용(프리루드 A2 게이트와 동일 규약).
+
+    ★surface 판독 규약의 **단일 소유자**(2026-08-02 R6 · 사본 금지). 훅 게이트
+      (`hooks/_lib.sh::in_cys_pane`)와 형제 모듈(`javis_task._env_surface`)이 신·구 env 를
+      **함께** 보는데 `javis_mission._surface()` 만 `CYS_SURFACE_ID` 하나만 봐서, 구 env 로만
+      선 pane 에서는 훅 게이트는 통과하고 임무 게이트의 **surface 결박(층1 의 전제)** 은 빈
+      문자열로 무너지는 비대칭이 있었다. 판독을 여기 한 곳으로 모아 그 갈림을 없앤다.
+      (공개 이름 = 다른 팩 모듈이 이 규약을 재구현하지 말라는 신호다.)
+    """
     return (os.environ.get("CYS_SURFACE_ID", "")
             or os.environ.get("AITERM_SURFACE_ID", "") or "")
+
+
+def _my_surface_id():
+    """구 내부 이름 — 호출부 보존용 얇은 별칭(규약 본체는 `my_surface_id`)."""
+    return my_surface_id()
 
 
 # ── 단계 정체성 레지스트리 (P3-A-STEP-NAME · W3) ─────────────────────────────

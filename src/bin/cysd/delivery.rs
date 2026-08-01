@@ -93,6 +93,28 @@
 //! 부서 레인의 배달이 base master 의 판별에 섞이면 안 된다(`javis_bootstrap.lane_state_path`
 //! 의 skip·lock 과 동일 규약).
 //!
+//! ## ★★R6 수리 — 원장의 기록 단위를 **실제 제출 단위**에 맞춘다 (멀티라인 행 분할)
+//! 라운드5 검증자 실측(관통·치명): `record` 는 전문 1건만 남기는데, 비-`clear_first` 경로는
+//! `WriteReq::Data(text.as_bytes())` 로 **원시 바이트**를 PTY 에 쓴다(`handlers.rs`). 본문의
+//! 개행은 그대로 Enter 가 되므로 TUI 는 그것을 **행 단위로 쪼개 여러 번 제출**한다. 그러면
+//! 제출된 각 프롬프트는 원장 레코드의 **진부분**이라 ⓐ전문 해시가 어긋나고 ⓑ판독자의 부분
+//! 일치도 `chars > len(prompt)` 조건에서 레코드를 통째로 건너뛴다 → 층1 전건 미스 → 무라벨이면
+//! 층2도 통과 → 게이트 개방.
+//!
+//! 근본 교정은 **원장이 '실제로 무엇이 제출되는가'를 반영하는 것**이다(층1 의 전제). 그래서
+//! `record` 는 전문 레코드에 더해 **제출 단위(개행 분할) 조각**을 각각 한 줄씩 남긴다
+//! (`part`·`parent` 필드 · 전문 레코드에는 `units` = 조각 수). 판정 규칙은 하나도 늘지 않는다 —
+//! 조각도 그냥 레코드이므로 판독자는 **종전의 전문 해시 대조**로 잡는다(구 판독자도 그대로 잡는다
+//! = 팩 스큐 순방향 호환).
+//!
+//! ★대안 비교(택하지 않은 것): "Data 경로도 bracketed paste 로 감싸 분할 자체를 없앤다."
+//!   실제 분할을 없애는 가장 근본적인 수리지만 **주입 런타임 동작을 바꾼다** — bracketed paste 를
+//!   켜지 않은 수신 앱(평범한 셸·구 TUI)에는 `ESC[200~` 가 그대로 문자로 들어가 배달이 깨지고,
+//!   셸 pane 에서는 "여러 줄을 즉시 실행" 의미가 사라진다. 라이브에서 검증할 수 없는 변경이라
+//!   **관측(원장)을 현실에 맞추는 쪽**을 택했다. (`Inject` 분기는 이미 bracketed paste 라 한 덩어리로
+//!   제출되지만, 앱이 그 모드를 안 켰으면 거기서도 쪼개진다 — 그래서 조각은 **경로를 가리지 않고**
+//!   남긴다. 불변식 ③: 애매하면 기록한다.)
+//!
 //! ## 판독자(python) 와의 계약
 //! `javis_mission.py` 가 같은 정규화·같은 해시·같은 경로 규약을 구현한다. 양쪽 규칙이 갈리면
 //! 원장은 조용히 무력화되므로, 정규화 규칙은 이 파일과 `javis_mission._normalize_delivery`
@@ -112,6 +134,18 @@ pub const LEDGER_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// 레코드에 남기는 정규화 본문 미리보기 상한(문자). 판정은 sha256 로 하며 이 값은 **진단용**이다.
 /// 원장에 본문 전체를 남기면 그 자체가 프롬프트 유출 저장소가 된다 — 짧게 자른다.
 pub const PREVIEW_CHARS: usize = 64;
+
+/// 배달 1건이 남기는 **제출 단위 조각**(개행 분할) 레코드의 최대 개수(R6).
+///
+/// 상한을 두는 이유는 성능이 아니라 **원장 예산**이다 — 조각이 무제한이면 긴 지침 1회 주입이
+/// 2 MiB 상한을 밀어 회전시켜 과거 배달의 판별 근거를 통째로 날린다(회전 꼬리 = SOT §4-6 ⓑ).
+/// 초과분은 조용히 버리지 않고 `delivery.parts_capped` 이벤트로 드러낸다.
+pub const MAX_PARTS: usize = 500;
+
+/// 원장 append 1회 write 의 바이트 예산. O_APPEND 단일 write 는 이 크기 이하에서 사실상 원자라
+/// 여러 스레드가 붙어도 줄이 섞이지 않는다 — 조각 N 건을 **한 번에** 쓰되 이 크기로 끊는다
+/// (열기/닫기는 1회, write 는 여러 번).
+const APPEND_CHUNK_BYTES: usize = 4096;
 
 /// 주입 유래 — 원장의 `origin` 필드. 판정에는 쓰이지 않고 사후 진단·감사에 쓴다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,15 +467,61 @@ pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
 /// 원장 파일에 JSON 1줄 append(공통부). append 모드 단일 write — O_APPEND 라 여러 스레드가
 /// 붙어도 라인이 섞이지 않는다(PIPE_BUF 이하 · 레코드는 수백 바이트).
 fn append_line(p: &Path, rec: &Value) -> Outcome {
-    let mut line = rec.to_string();
-    line.push('\n');
-    match std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        Ok(mut f) => match f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
-            Ok(()) => Outcome::Recorded,
-            Err(e) => Outcome::Failed(format!("원장 write 실패: {e}")),
-        },
-        Err(e) => Outcome::Failed(format!("원장 open 실패({}): {e}", p.display())),
+    append_lines(p, std::slice::from_ref(rec))
+}
+
+/// 여러 레코드를 **한 번 열어** append 한다(R6 조각 기록용). 파일 열기는 1회지만 write 는
+/// `APPEND_CHUNK_BYTES` 이하로 끊는다 — 한 번에 수십 KB 를 쓰면 O_APPEND 원자성이 깨져
+/// 동시 기록자와 줄이 섞일 수 있기 때문이다(섞인 줄은 판독자에서 `ledger_bad_lines`).
+fn append_lines(p: &Path, recs: &[Value]) -> Outcome {
+    if recs.is_empty() {
+        return Outcome::Recorded;
     }
+    let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        Ok(f) => f,
+        Err(e) => return Outcome::Failed(format!("원장 open 실패({}): {e}", p.display())),
+    };
+    let mut buf = String::new();
+    for rec in recs {
+        let mut line = rec.to_string();
+        line.push('\n');
+        if !buf.is_empty() && buf.len() + line.len() > APPEND_CHUNK_BYTES {
+            if let Err(e) = f.write_all(buf.as_bytes()) {
+                return Outcome::Failed(format!("원장 write 실패: {e}"));
+            }
+            buf.clear();
+        }
+        buf.push_str(&line);
+    }
+    match f.write_all(buf.as_bytes()).and_then(|_| f.flush()) {
+        Ok(()) => Outcome::Recorded,
+        Err(e) => Outcome::Failed(format!("원장 write 실패: {e}")),
+    }
+}
+
+/// ★R6 — 이 텍스트가 pane 에 **몇 번에 나눠 제출되는가**(정규화된 제출 단위 목록).
+///
+/// 원시 바이트 주입(`WriteReq::Data`)에서 본문 개행은 그대로 Enter 다. 그래서 TUI 는 텍스트를
+/// 행 단위로 쪼개 각각 제출하고, 훅은 **행 하나하나**를 프롬프트로 본다. 원장이 전문만 알고
+/// 있으면 그 행들은 어느 레코드와도 일치하지 않는다(관통 경로 · 모듈 머리말 R6).
+///
+/// 규칙: `\n`·`\r` 로 분해(`\r\n` 은 가운데가 빈 조각이 되어 자동 탈락) → 각 행을 `normalize` →
+/// 빈 행 제외 → **같은 문장 중복 제거**(원장은 sha 집합으로 소비되므로 중복은 순수 낭비다).
+/// 순서는 **첫 출현 순**으로 보존한다 — 감사에서 `part` 인덱스가 원문의 어디쯤인지 가리킨다
+/// (중복을 접었으므로 원문 행 번호와 1:1 은 아니다).
+pub fn submit_units(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in text.split(['\n', '\r']) {
+        let n = normalize(raw);
+        if n.is_empty() {
+            continue;
+        }
+        if seen.insert(n.clone()) {
+            out.push(n);
+        }
+    }
+    out
 }
 
 /// 크기 상한 초과 시 1세대 회전. 실패는 무시(회전 실패가 기록을 막으면 판별이 열린다 —
@@ -461,6 +541,12 @@ fn rotate_if_needed(p: &Path) {
 /// 오인될 수 있음'(경미)이고, 반대(주입은 됐는데 원장에 없음)는 게이트 개방(치명)이다.
 ///
 /// ★호출부는 되도록 `record_audited` 를 쓴다 — 실패를 이벤트로 남겨야 흔적이 생긴다.
+///
+/// ★R6 이후 **테스트 전용**이다(선례: `digest`). 생산 경로는 조각 기록의 성패까지 이벤트로
+/// 드러내야 하므로 `record_audited` → `record_full` 을 쓴다. 여기 남겨 둔 이유는 "전문 레코드
+/// 하나만 보면 되는" 기존 회귀 테스트의 가독성이며, 삭제하면 그 테스트들이 보고 싶지 않은
+/// 조각 필드까지 열게 된다. (`#[cfg(test)]` 을 붙이는 이유는 신규 `dead_code` 경고 0 규약.)
+#[cfg(test)]
 pub fn record(
     socket_path: &Path,
     surface_id: u64,
@@ -468,20 +554,60 @@ pub fn record(
     origin: Origin,
     from_surface: Option<u64>,
 ) -> Outcome {
+    record_full(socket_path, surface_id, text, origin, from_surface).outcome
+}
+
+/// `record_full` 의 결과 — 전문 레코드의 성패에 **조각(R6) 기록의 성패**를 더한 것.
+///
+/// 조각이 빠지면 그 행이 제출될 때 층1 이 미스한다(= 게이트 개방 방향). 차단할 수는 없으니
+/// (주입을 막으면 배달이 죽는다) 호출부가 이벤트로 드러낼 수 있게 사실을 그대로 돌려준다.
+#[derive(Debug)]
+pub struct RecordReport {
+    /// 전문 레코드의 결과(종전 `record` 의 반환값과 동일 의미).
+    pub outcome: Outcome,
+    /// 실제로 남긴 제출 단위 조각 수(전문 레코드 제외).
+    pub parts_written: usize,
+    /// 상한(`MAX_PARTS`)에 걸려 **남기지 못한** 조각 수. 0 이 아니면 그 행들은 층1 미대조다.
+    pub parts_dropped: usize,
+    /// 조각 append 실패 사유(있으면 그 이후 조각이 없다).
+    pub parts_failed: Option<String>,
+}
+
+/// ★주입 **직전** 호출(감사 상세 포함) — 전문 + 제출 단위 조각을 원장에 남긴다.
+///
+/// 호출 규약·불변식은 `record` 와 같다. 조각의 의미와 대안 비교는 모듈 머리말 R6 절.
+pub fn record_full(
+    socket_path: &Path,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+) -> RecordReport {
+    let blank = |o: Outcome| RecordReport {
+        outcome: o,
+        parts_written: 0,
+        parts_dropped: 0,
+        parts_failed: None,
+    };
     let norm = normalize(text);
     if norm.is_empty() {
-        return Outcome::Blank; // 공백뿐 — 프롬프트가 될 수 없다(훅도 빈 프롬프트를 판정하지 않는다)
+        // 공백뿐 — 프롬프트가 될 수 없다(훅도 빈 프롬프트를 판정하지 않는다)
+        return blank(Outcome::Blank);
     }
     let p = ledger_path(socket_path);
     if let Some(d) = p.parent() {
         if let Err(e) = std::fs::create_dir_all(d) {
-            return Outcome::Failed(format!("상태 디렉터리 생성 실패: {e}"));
+            return blank(Outcome::Failed(format!("상태 디렉터리 생성 실패: {e}")));
         }
     }
     rotate_if_needed(&p);
     let epoch = crate::state::now_epoch();
     let preview: String = norm.chars().take(PREVIEW_CHARS).collect();
     let sha = digest_normalized(&norm);
+    // ★R6: 실제 제출 단위. 단일 행이면 units==1 이고 조각은 0 건이다(종전과 동일한 원장 모양).
+    let units = submit_units(text);
+    let parts: Vec<&String> = units.iter().filter(|u| **u != norm).collect();
+    let dropped = parts.len().saturating_sub(MAX_PARTS);
     let rec = json!({
         "v": LEDGER_SCHEMA,
         // ★surface 는 pane env `CYS_SURFACE_ID` 와 **같은 표기**(정수 문자열)다 —
@@ -494,9 +620,50 @@ pub fn record(
         "from": from_surface.map(|s| s.to_string()),
         "chars": norm.chars().count(),
         "preview": preview,
+        // ★R6: 이 배달이 몇 번에 나뉘어 제출되는가. 1 이면 쪼개질 수 없다 —
+        //   판독자가 "프롬프트가 이 레코드의 조각인가" 를 물을 필요조차 없는 레코드다.
+        "units": units.len(),
     });
     // flush 까지 마친 뒤에만 호출자가 try_send 로 넘어간다(불변식 ①).
-    append_line(&p, &rec)
+    let outcome = append_line(&p, &rec);
+    if !matches!(outcome, Outcome::Recorded) || parts.is_empty() {
+        let mut r = blank(outcome);
+        r.parts_dropped = dropped;
+        return r;
+    }
+    let recs: Vec<Value> = parts
+        .iter()
+        .take(MAX_PARTS)
+        .enumerate()
+        .map(|(i, u)| {
+            json!({
+                "v": LEDGER_SCHEMA,
+                "surface": surface_id.to_string(),
+                "ts_epoch": epoch,
+                "ts": iso_utc(epoch),
+                "sha256": digest_normalized(u),
+                "origin": origin.as_str(),
+                "from": from_surface.map(|s| s.to_string()),
+                "chars": u.chars().count(),
+                "preview": u.chars().take(PREVIEW_CHARS).collect::<String>(),
+                // 감사용 결속 — 이 조각이 어느 배달의 몇 번째 제출 단위인가.
+                "part": i + 1,
+                "parent": sha,
+            })
+        })
+        .collect();
+    let n = recs.len();
+    let (written, failed) = match append_lines(&p, &recs) {
+        Outcome::Recorded => (n, None),
+        Outcome::Blank => (n, None), // 도달 불가(빈 슬라이스 아님) — 방어적
+        Outcome::Failed(why) => (0, Some(why)),
+    };
+    RecordReport {
+        outcome,
+        parts_written: written,
+        parts_dropped: dropped,
+        parts_failed: failed,
+    }
 }
 
 /// ★감사 포함 기록 — 실패를 **이벤트로 남긴다**(OUT OF SCOPE 대응: 막을 수 없는 것을 보이게).
@@ -512,7 +679,27 @@ pub fn record_audited(
     origin: Origin,
     from_surface: Option<u64>,
 ) -> bool {
-    match record(&daemon.socket_path, surface_id, text, origin, from_surface) {
+    let report = record_full(&daemon.socket_path, surface_id, text, origin, from_surface);
+    // ★R6: 조각(제출 단위) 기록이 불완전하면 그 행들은 층1 미대조다 — 차단할 수 없으니 드러낸다.
+    if report.parts_dropped > 0 || report.parts_failed.is_some() {
+        let path = ledger_path(&daemon.socket_path);
+        daemon.bus.publish(
+            "delivery.parts_incomplete",
+            "system",
+            Some(surface_id),
+            json!({
+                "origin": origin.as_str(),
+                "written": report.parts_written,
+                "dropped": report.parts_dropped,
+                "cap": MAX_PARTS,
+                "reason": report.parts_failed,
+                "path": path.to_string_lossy(),
+                "impact": "이 배달의 일부 행이 배달 원장에 없다 — 그 행이 단독 제출되면 임무 \
+                           게이트가 기계 push 를 오너 임무로 오인할 수 있다(오너 보고 대상)."
+            }),
+        );
+    }
+    match report.outcome {
         Outcome::Recorded => true,
         Outcome::Blank => false,
         Outcome::Failed(why) => {
@@ -568,6 +755,17 @@ pub(crate) mod tests {
     // 갈려 교착이 열린다(실제로 기존 두 테스트는 STATE→ACL 순, 하네스 경유는 ACL→STATE 순이
     // 된다). thread-local 은 락이 없어 두 문제를 **원천적으로 만들지 않는다**.
     //
+    // ## ★관측성 — 우선순위가 감사자를 속이지 않게 (R6 · 2026-08-02)
+    // ① 이 thread-local 은 `CYS_STATE_DIR` **보다 우선**이다. 그래서 감사자가
+    // `CYS_STATE_DIR=<스크래치> cargo test` 로 "테스트가 원장을 어디에 쓰는지 보자"고 해도,
+    // 격리된 테스트(대부분)는 그 스크래치가 아니라 `$TMPDIR` 샌드박스에 썼다 — **지정한
+    // 디렉터리가 텅 비어 보이고**, 그것은 "테스트가 원장을 안 건드렸다"로 오독된다.
+    // 우선순위를 바꾸면(env 가 이기게 하면) ① 의 병렬성·무락 성질이 죽으므로, 대신
+    // **샌드박스 루트 자체가 러너 지정 디렉터리를 존중**하게 했다(`sandbox_root_for`):
+    //   · `CYS_STATE_DIR` 지정 → 격리분은 `<지정>/iso-*/`, 격리 잊은 분은 `<지정>/` 최상위
+    //   · 미지정               → 종전대로 `$TMPDIR/cys-test-state-<pid>/`
+    // 즉 **우선순위는 그대로 두고 목적지를 합쳤다** — 감사자는 자기가 지정한 한 곳만 보면 된다.
+    //
     // ## 정직 고지 — 이 층이 못 하는 것
     //  · 데몬이 **배경 스레드**에서 쓰는 원장은 thread-local 을 보지 못한다. 그 경로는 ②/③ 으로
     //    내려가며, 라이브 오염을 막는 것은 ③ 이다(격리 정밀도는 떨어지고 안전성은 유지된다).
@@ -575,8 +773,12 @@ pub(crate) mod tests {
     //    (`join().ok()`) 뮤텍스를 poison 시켜 무관한 테스트를 무너뜨린다 — 즉 탐지기로서
     //    신뢰할 수 없고 새 flakiness 원인이 된다. 대신 **탐지를 결정론으로** 돌린다:
     //    격리를 잊은 쓰기는 전부 샌드박스 루트 **최상위**에 떨어지므로, 아래 한 줄이 회귀 게이트다.
-    //      `ls "$TMPDIR"/cys-test-state-*/delivery-*.jsonl | wc -l`  → **0 이어야 한다**
+    //      `ls "$CYS_STATE_DIR"/delivery-*.jsonl | wc -l`            → **0 이어야 한다**
+    //      (미지정이면 `ls "$TMPDIR"/cys-test-state-*/delivery-*.jsonl | wc -l`)
     //    (배경 스레드 위반까지 잡는다 — panic 방식은 못 잡는 범주다.)
+    //  · `CYS_STATE_DIR` 을 **라이브**(`~/.cys/state`)로 지정하면 테스트가 라이브를 쓴다. 그건
+    //    러너의 명시 선택이며 종전(②)도 같았다 — 대신 아래
+    //    `test_build_never_resolves_state_root_to_live_home` 이 **하드 실패**로 고함친다.
     // ══════════════════════════════════════════════════════════════════════════
 
     thread_local! {
@@ -590,10 +792,24 @@ pub(crate) mod tests {
         THREAD_STATE_ROOT.with(|c| c.borrow().clone())
     }
 
-    /// 이 테스트 프로세스의 샌드박스 루트. 격리 디렉터리(①)의 부모이자, 격리를 **잊은**
-    /// 쓰기(③)가 떨어지는 자리다. 최상위에 `delivery-*.jsonl` 이 있으면 = 잊은 테스트가 있다.
+    /// 샌드박스 루트 해소의 **순수 함수**(env 를 읽지 않는다 — 그래야 병렬 러너를 건드리지 않고
+    /// 회귀 핀을 걸 수 있다). `runner_dir` = `CYS_STATE_DIR` 원문.
+    ///
+    /// ★R6 관측성: 러너가 디렉터리를 지정했으면 **그곳을 쓴다**. thread-local 격리(①)가
+    /// `CYS_STATE_DIR`(②)보다 우선이라, 종전엔 감사자가 지정한 스크래치가 텅 빈 채로 남아
+    /// "테스트가 원장을 안 건드렸다"로 오독됐다. 우선순위는 그대로 두고 **목적지를 합친다.**
+    pub(crate) fn sandbox_root_for(runner_dir: Option<&str>) -> PathBuf {
+        match runner_dir {
+            Some(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+            _ => std::env::temp_dir().join(format!("cys-test-state-{}", std::process::id())),
+        }
+    }
+
+    /// 이 테스트 프로세스의 샌드박스 루트 = **감사 루트**. 격리 디렉터리(①)의 부모이자,
+    /// 격리를 **잊은** 쓰기(③)가 떨어지는 자리다. 최상위에 `delivery-*.jsonl` 이 있으면
+    /// = 잊은 테스트가 있다(격리분은 `iso-*/` 하위로 들어가므로 최상위에 안 나온다).
     pub(crate) fn test_sandbox_root() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("cys-test-state-{}", std::process::id()));
+        let p = sandbox_root_for(std::env::var("CYS_STATE_DIR").ok().as_deref());
         let _ = std::fs::create_dir_all(&p);
         p
     }
@@ -686,18 +902,80 @@ pub(crate) mod tests {
     /// 이것이 깨지면 격리를 잊은 테스트 하나가 곧바로 라이브 원장(`~/.cys/state/delivery-*.jsonl`)
     /// 을 만든다 — 실제로 67개가 그렇게 쌓였다(제품 결함이 아니라 테스트 위생 결함이지만,
     /// 오너의 라이브 상태를 오염시키므로 방어는 코드에 있어야 한다).
+    ///
+    /// ★R6: 러너가 `CYS_STATE_DIR` 을 **라이브로** 겨누면 여기서 하드 실패한다 — 종전에는
+    /// thread-local 우선순위 덕에 조용히 지나갔지만, 그건 "안전"이 아니라 **오조준의 은폐**였다.
     #[test]
     fn test_build_never_resolves_state_root_to_live_home() {
         let live_root = cys::home_dir().join(".cys");
         let got = default_state_root();
         assert!(
             !got.starts_with(&live_root),
-            "테스트 빌드의 기본 상태 루트가 라이브 HOME 안이다: {} (라이브: {})",
+            "테스트 빌드의 기본 상태 루트가 라이브 HOME 안이다: {} (라이브: {}) — \
+             CYS_STATE_DIR 이 라이브를 겨누고 있지 않은지 확인하라",
             got.display(),
             live_root.display()
         );
-        assert_eq!(got, test_sandbox_root(), "기본 루트는 프로세스 temp 샌드박스여야 한다");
-        assert!(got.starts_with(std::env::temp_dir()), "샌드박스는 temp 아래여야 한다");
+        assert_eq!(got, test_sandbox_root(), "기본 루트는 감사 루트와 같아야 한다");
+        // 러너 미지정일 때만 temp 아래다(지정 시엔 지정한 곳이 감사 루트 — 위 라이브 가드가 지킨다).
+        assert!(
+            sandbox_root_for(None).starts_with(std::env::temp_dir()),
+            "러너 미지정 샌드박스는 temp 아래여야 한다"
+        );
+    }
+
+    /// ★R6 회귀 핀 — **감사 가능성**: 러너가 지정한 디렉터리가 곧 감사 루트여야 한다.
+    ///
+    /// 결함(관측성): thread-local 격리(①)가 `CYS_STATE_DIR`(②)보다 우선이라, 감사자가
+    /// `CYS_STATE_DIR=<스크래치> cargo test` 로 돌려도 격리된 테스트는 `$TMPDIR` 에 썼다 →
+    /// 지정한 스크래치가 **텅 비어** "테스트가 원장을 안 건드렸다"로 오독된다. 우선순위는
+    /// 유지하고 목적지만 합쳤으므로, 그 합류가 깨지면 여기서 잡힌다.
+    ///
+    /// ★env 를 **쓰지 않고 읽기만** 한다(set_var 는 프로세스 전역이라 병렬 러너를 오염시킨다).
+    /// 그 대가로 핵심 단언(감사 루트 == 러너 지정 디렉터리)은 `CYS_STATE_DIR` 이 **설정된
+    /// 실행에서만** 발동한다 — 정직 고지다. 이 저장소의 규약 실행은 항상 지정이며
+    /// (`CYS_STATE_DIR=<스크래치> cargo test`), 지정이 없으면 애초에 "감사자가 지정한 곳"이
+    /// 존재하지 않아 검사할 대상이 없다.
+    #[test]
+    fn isolation_dirs_live_under_runner_specified_audit_root() {
+        assert_eq!(
+            sandbox_root_for(Some("/tmp/cys-audit-scratch")),
+            PathBuf::from("/tmp/cys-audit-scratch"),
+            "러너 지정 디렉터리를 존중해야 한다"
+        );
+        // ★배선 핀: 순수 함수가 옳아도 `test_sandbox_root()` 가 그것을 **안 부르면** 의미가 없다.
+        //   (이 단언이 없으면 해소를 `sandbox_root_for(None)` 으로 되돌려도 테스트가 통과한다 —
+        //    실제로 반사실 대조에서 그렇게 통과하는 것을 확인하고 추가했다.)
+        if let Ok(v) = std::env::var("CYS_STATE_DIR") {
+            if !v.trim().is_empty() {
+                assert_eq!(
+                    test_sandbox_root(),
+                    PathBuf::from(v.trim()),
+                    "러너가 CYS_STATE_DIR 을 지정했는데 감사 루트가 그곳이 아니다 — \
+                     감사자가 지정한 스크래치가 비어 보여 '테스트가 원장을 안 건드렸다'로 오독된다"
+                );
+            }
+        }
+        assert_eq!(
+            sandbox_root_for(Some("   ")),
+            sandbox_root_for(None),
+            "공백뿐인 지정은 미지정과 같게 다뤄야 한다(pack_state_dir 의 trim 규약과 동형)"
+        );
+        let audit = test_sandbox_root();
+        let g = isolate_state_dir("audit-visibility");
+        assert!(
+            g.path().starts_with(&audit),
+            "격리 디렉터리가 감사 루트 밖이다 — 감사자가 지정한 곳이 비어 보인다: {} (감사 루트: {})",
+            g.path().display(),
+            audit.display()
+        );
+        assert!(
+            ledger_path(Path::new("/x/cys.sock")).starts_with(&audit),
+            "격리 중 원장 경로가 감사 루트 밖이다"
+        );
+        // 격리분은 하위 디렉터리에 들어간다 = 감사 루트 **최상위**의 delivery-* 개수가
+        // '격리를 잊은 쓰기'의 척도라는 계약이 유지된다(모듈 머리말의 회귀 게이트 한 줄).
+        assert_ne!(g.path(), audit, "격리 디렉터리가 감사 루트 자신이면 최상위 개수 척도가 죽는다");
     }
 
     /// ★R5-B 회귀: 스레드 로컬 격리가 실제로 원장 경로를 접고, drop 후 복원되는가.
@@ -925,6 +1203,155 @@ pub(crate) mod tests {
             for t in ["다음 액션 착수", "이어서 진행해", "[[중첩]] 대괄호 우회", "［전각］ 라벨 우회"] {
                 assert!(body.contains(&digest(t)), "원장에 없다: {t}");
             }
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ★R6 — 멀티라인 배달의 **제출 단위**가 원장에 남는가 (관통 봉합 · 모듈 머리말 R6)
+    //
+    // 관통 경로: `WriteReq::Data` 는 원시 바이트라 본문 개행이 그대로 Enter 다 → TUI 가 행
+    // 단위로 쪼개 제출 → 각 프롬프트는 전문 레코드의 **진부분**이라 층1 이 전건 미스한다.
+    // 아래 테스트들이 "원장이 실제 제출 단위를 안다"를 박제한다.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// 제출 단위 분해 규칙(순수 함수) — 개행 종류·중복·빈 줄.
+    #[test]
+    fn submit_units_splits_on_every_newline_flavor() {
+        assert_eq!(submit_units("한 줄"), vec!["한 줄".to_string()], "단일 행이면 1건");
+        assert_eq!(
+            submit_units("첫 줄\n둘째 줄\r\n셋째 줄\r넷째 줄"),
+            vec![
+                "첫 줄".to_string(),
+                "둘째 줄".to_string(),
+                "셋째 줄".to_string(),
+                "넷째 줄".to_string()
+            ],
+            "LF·CRLF·CR 모두 제출 경계다(CRLF 의 빈 조각은 탈락)"
+        );
+        assert_eq!(
+            submit_units("A\n\n\n  \nB"),
+            vec!["A".to_string(), "B".to_string()],
+            "빈 줄·공백 줄은 프롬프트가 될 수 없다"
+        );
+        assert_eq!(
+            submit_units("같은 줄\n같은 줄\n다른 줄"),
+            vec!["같은 줄".to_string(), "다른 줄".to_string()],
+            "중복은 sha 가 같아 원장에서 무의미하다"
+        );
+    }
+
+    /// ★관통 재현 차단: 멀티라인 push 의 **각 행**이 원장에서 전문 해시로 대조 가능해야 한다.
+    /// 이 어서션이 깨지면 그 행이 단독 제출될 때 층1 이 미스하고, 무라벨이면 층2 도 통과해
+    /// 오너 임무로 기록된다(2026-08-01 실사고와 같은 결과).
+    #[test]
+    fn multiline_delivery_records_each_submitted_line() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text = "[wakeup] 큐 배달 머리말\n다음 액션 착수\n이어서 T5 잔여를 처리해라\n";
+            let report = record_full(sock, 11, text, Origin::Send, None);
+            assert!(matches!(report.outcome, Outcome::Recorded));
+            assert_eq!(report.parts_written, 3, "행 3개가 전부 남아야 한다");
+            assert_eq!(report.parts_dropped, 0);
+            assert!(report.parts_failed.is_none());
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            for line in ["다음 액션 착수", "이어서 T5 잔여를 처리해라", "[wakeup] 큐 배달 머리말"] {
+                assert!(
+                    body.contains(&digest(line)),
+                    "행이 원장에 없다 — 이 행이 단독 제출되면 층1 이 미스한다: {line}"
+                );
+            }
+            assert!(body.contains(&digest(text)), "전문 레코드도 그대로 남는다(회귀)");
+            let recs: Vec<serde_json::Value> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(recs.len(), 4, "전문 1 + 조각 3");
+            assert_eq!(recs[0]["units"], 3, "전문 레코드는 제출 단위 수를 안다");
+            assert_eq!(recs[1]["part"], 1);
+            assert_eq!(recs[1]["parent"], digest(text), "조각은 부모 배달에 결속된다");
+            for r in &recs {
+                assert_eq!(r["surface"], "11", "조각도 같은 pane 에 결박된다");
+                assert_eq!(r["v"], LEDGER_SCHEMA, "조각도 같은 스키마다(구 판독자 호환)");
+                assert_eq!(r["origin"], "send");
+            }
+        });
+    }
+
+    /// 단일 행 배달은 원장 모양이 종전 그대로다(조각 0건) — 원장 예산 회귀 방지.
+    #[test]
+    fn single_line_delivery_adds_no_parts() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let r = record_full(sock, 5, "  다음 액션 착수  ", Origin::Queue, None);
+            assert_eq!(r.parts_written, 0);
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            assert_eq!(body.lines().count(), 1, "전문 1건뿐이어야 한다");
+            let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            assert_eq!(v["units"], 1, "쪼개질 수 없는 배달임을 판독자에게 알린다");
+        });
+    }
+
+    /// 상한 초과는 **조용히 버리지 않는다** — 남긴 수·버린 수가 보고되어야 감사가 성립한다.
+    #[test]
+    fn part_cap_is_reported_not_silent() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text: String = (0..MAX_PARTS + 7)
+                .map(|i| format!("행 번호 {i} 의 지시문\n"))
+                .collect();
+            let r = record_full(sock, 3, &text, Origin::Send, None);
+            assert_eq!(r.parts_written, MAX_PARTS);
+            assert_eq!(r.parts_dropped, 7, "버린 조각 수가 사실대로 보고돼야 한다");
+        });
+    }
+
+    /// ★교차언어 앵커(R6) — python 판독자가 **진짜 생산자 출력**으로 접히는지 확인할 수단.
+    ///
+    /// 왜 필요한가: `javis_mission.py` self-test 는 원장 fixture 를 **손으로 미러**한다
+    /// (`_rec_multiline`). 미러가 생산자와 갈리면 양쪽 테스트가 다 초록인 채로 층1 이 조용히
+    /// 무력화된다 — 이 모듈이 정규화·해시를 양쪽에 박제한 것과 같은 위험이다. 그래서 진짜
+    /// `record_full` 출력을 파일로 떨어뜨려 python 이 그대로 읽게 한다.
+    ///
+    /// 평시엔 아무 것도 내보내지 않는다. `CYS_XLANG_LEDGER_OUT=<dir>` 이 있을 때만 그 디렉터리에
+    /// 레인 규약 파일명(`delivery-base.jsonl`)으로 복사한다 — 소비 절차:
+    ///   `CYS_XLANG_LEDGER_OUT=/tmp/x cargo test --bin cysd xlang_ledger_fixture`
+    ///   `CYS_STATE_DIR=/tmp/x CYS_SURFACE_ID=4242 python3 …/javis_mission.py delivery-path --json`
+    #[test]
+    fn xlang_ledger_fixture_matches_reader_expectations() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text = "[wakeup] 자동 기상 알림\n다음 액션 착수\n이어서 T5 잔여 항목을 처리하고 결과를 보고하라\n";
+            let r = record_full(sock, 4242, text, Origin::Send, None);
+            assert_eq!(r.parts_written, 3);
+            let src = ledger_path(sock);
+            // 판독자가 **반드시** 보는 필드들(하나라도 이름이 바뀌면 층1 이 조용히 죽는다)
+            let body = std::fs::read_to_string(&src).unwrap();
+            for line in body.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                for k in ["v", "surface", "ts_epoch", "sha256", "chars", "preview", "origin"] {
+                    assert!(!v[k].is_null(), "판독자 필수 필드 {k} 가 없다: {line}");
+                }
+            }
+            if let Ok(out) = std::env::var("CYS_XLANG_LEDGER_OUT") {
+                if !out.trim().is_empty() {
+                    let dir = PathBuf::from(out);
+                    std::fs::create_dir_all(&dir).expect("교차언어 출력 디렉터리");
+                    std::fs::copy(&src, dir.join("delivery-base.jsonl")).expect("fixture 복사");
+                }
+            }
+        });
+    }
+
+    /// 기록은 **주입 직전**이므로 조각까지 포함해 flush 가 끝나 있어야 한다(불변식 ①의 확장).
+    #[test]
+    fn parts_are_flushed_before_record_returns() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text = "첫 행 지시\n둘째 행 지시";
+            let _ = record_full(sock, 8, text, Origin::Schedule, None);
+            // 반환 직후 **다른 판독자**(훅)가 읽는 상황을 그대로 재현한다.
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            assert!(body.contains(&digest("둘째 행 지시")), "반환 시점에 조각이 디스크에 없다");
         });
     }
 

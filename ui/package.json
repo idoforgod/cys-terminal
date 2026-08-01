@@ -4,7 +4,8 @@
   "version": "0.14.9",
   "scripts": {
     "build": "sh build.sh",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "bunx tsc -p tsconfig.check.json"
   },
   "dependencies": {
     "@tauri-apps/plugin-notification": "^2.3.3",

@@ -145,13 +145,28 @@
   보장 범위의 정의처(SOT)는 저장소 문서 `docs/THREAT-MODEL-mission-gate.md` 하나이며,
   범위·근거를 늘려 쓰려면 그 문서를 고친다(여기에 사본을 만들지 마라).
 - ★**이상징후 보고 의무 (탐지 가능성 — 위 OUT OF SCOPE 의 유일한 무기)**: 차단할 수 없는 조작은
-  **흔적으로 남긴다**. 도구가 `[mission] ★이상징후(<코드>): …` 를 내면(원장 회전·손상 줄·0바이트
-  절단·표식有 원장無·env 창/TTL 하한 거부·상한 절단 · **원장 부재**(`ledger_absent` — 층1 근거
-  없이 라벨로만 판별 중) · **창 밖 일치**(`delivery_out_of_window`) · **조각 연접·부분 포함**
-  (`delivery_concatenated`/`delivery_substring` — 기계 배달 둘이 한 프롬프트로 합쳐진 정황) 등)
-  **판정(exit)과 무관하게 오너에게 그대로 보고한다.** 게이트가 exit 0 이어도 보고한다 — 이상은 보고 대상이지 판정 입력이 아니다
-  (이상을 판정에 섞으면 조작자가 이상을 유발해 게이트를 흔들 수 있다). **은폐·요약 생략은 규약
-  위반**이며, 흔적은 `javis_mission.py status --json` 의 `anomalies` · 임무 대장의 같은 필드 ·
+  **흔적으로 남긴다**. 도구가 `[mission] ★이상징후(<코드>): …` 를 내면 **판정(exit)과 무관하게
+  오너에게 그대로 보고한다.** 게이트가 exit 0 이어도 보고한다 — 이상은 보고 대상이지 판정 입력이 아니다
+  (이상을 판정에 섞으면 조작자가 이상을 유발해 게이트를 흔들 수 있다). **은폐·요약 생략은 규약 위반**이다.
+  ★**코드 전수 (2026-08-02 R6 · 등재소 = `javis_mission.py::ANOMALY_CODES` · 이 열거와 1:1 이
+  아니면 `--self-test` 가 FAIL 한다 — 종전엔 손으로 유지돼 `ledger_rotated`·`delivery_anchor_capped`
+  가 누락돼 있었다)**:
+  | 코드 | 뜻 |
+  |---|---|
+  | `ledger_absent` | 배달 원장 부재 — 층1(원장 대조) 근거 없이 층2(라벨)로만 판별 중 |
+  | `ledger_rotated` | 원장 회전 — 소실 구간의 기계 push 는 층1 로 대조 불가 |
+  | `ledger_bad_lines` | 해석 불가 줄 혼입(부분쓰기·조작 정황) |
+  | `ledger_schema_skew` | 원장에 판독자가 모르는 스키마 버전이 섞임 — **그 배달은 층1 에서 통째로 안 보인다**(데몬↔팩 버전 스큐) |
+  | `delivery_out_of_window` | 창 밖 배달과 전문 일치 — 접었으나 지연이 비정상 |
+  | `delivery_concatenated` | 기계 배달 둘 이상이 한 프롬프트로 연접 제출됨 |
+  | `delivery_substring` | 기계 배달이 프롬프트에 통째로 포함됨 |
+  | `delivery_anchor_capped` | 부분 일치 탐색이 예산 도달 — 못 본 구간이 있어 **판정을 접었다**(fail-closed) |
+  | `delivery_prompt_within_delivery` | 프롬프트가 더 긴 기계 배달의 한 조각과 겹침(멀티라인 행 분할 정황 · 근거는 preview 평문이며 해시 확증이 아니다) |
+  | `env_not_int` / `env_below_floor` / `env_above_cap` | 창·TTL env 오버라이드가 비정수·하한 미만(거부)·상한 초과(절단) |
+  ★**이상징후가 아닌 것과 헷갈리지 마라**: 0바이트 절단·표식有 원장無·스캔상한 초과·원장 자리가
+  디렉터리는 **이상징후가 아니라 판정 그 자체**(fail-closed)이며 `ledger_status=unreadable` 과
+  `reason` 으로 보고된다. 둘을 섞으면 "무엇이 판정을 바꾸고 무엇이 보고 전용인가"가 흐려진다.
+  흔적은 `javis_mission.py status --json` 의 `anomalies` · 임무 대장의 같은 필드 ·
   데몬 이벤트 `delivery.record_failed`/`delivery.operator_token_from_pane` 에 남는다.
   ★훅은 `record` 의 stderr 를 버리므로, 기계로 접힌 프롬프트에서 관측된 이상은 **대장에 병합돼**
   다음 `status` 에 실린다(판정 필드는 불변 · 2026-08-02 R5). 즉 **`status` 를 보는 것이 보고

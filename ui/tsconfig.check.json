@@ -1,0 +1,22 @@
+{
+  "_why": [
+    "★타입 검증 전용 설정(2026-08-02 R6). 파일명이 tsconfig.json 이 **아닌** 것은 의도다 —",
+    "bun 번들러는 tsconfig.json 만 자동으로 읽으므로, 이 파일은 빌드 산출물에 어떤 영향도 주지",
+    "않는다(번들 동작 무변경 보장). `bun build` 는 트랜스파일만 하고 타입을 보지 않으므로,",
+    "종전 UI 검증은 '문법만 통과'였다. 타입 검증은 다음 한 줄로 재현한다:",
+    "    cd ui && bunx tsc -p tsconfig.check.json",
+    "typescript 를 devDependencies 에 넣지 않은 이유: bun.lock 을 건드리지 않고(오프라인 빌드",
+    "계약 보존) 검증만 온디맨드로 돌리기 위해서다."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}

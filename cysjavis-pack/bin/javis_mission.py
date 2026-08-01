@@ -253,9 +253,47 @@ ENV_ANOMALIES = []
 # 판독 시점 이상(원장 회전·손상 줄 등). read_delivery 가 채운다.
 _ANOMALY_SINK = []
 
+# ── 이상징후 코드 등재소 (★단일 SOT · 2026-08-02 R6) ──────────────────────────
+# ## 왜 등재소가 필요한가
+# 보고 의무(MASTER_DIRECTIVE §0-C '은폐 금지')는 **어떤 코드가 존재하는가**를 오너가 알아야
+# 성립한다. 그런데 R5 까지 문서 열거는 손으로 유지됐고, 실제로 `ledger_rotated`(발행 O)는
+# 코드명이 문서에 없었고 `delivery_anchor_capped`(발행 O)는 프로즈에도 없었다 —
+# **열거 불완전은 규약의 이행 범위를 흐린다**(발행됐는데 "보고 대상 목록"에 없으면, 보고에서
+# 빠져도 규약 위반으로 잡히지 않는다).
+# ## 그래서 코드는 여기 한 곳에서만 태어난다
+#   ① 새 코드 추가 → 이 dict 에 등재
+#   ② `MASTER_DIRECTIVE.md` §0-C 열거에 같은 코드 기재
+# 둘 중 하나라도 빠지면 `--self-test` 가 FAIL 한다(회귀 핀: `_selftest_anomaly_registry`).
+# ## 이것이 **아닌** 것
+# 이 목록은 `anomalies` 필드에 실리는 코드 전수다. **판정을 접는 fail-closed 상태**
+# (`ledger_status=unreadable` 의 사유들 — 0바이트 절단·표식有 원장無·스캔상한 초과·디렉터리)는
+# 이상징후가 아니라 **판정 그 자체**이며 `ledger_status`/`reason` 으로 보고된다. 둘을 같은
+# 목록에 섞으면 "무엇이 판정을 바꾸고 무엇이 보고 전용인가"가 흐려진다(§0-C 의 핵심 구분).
+ANOMALY_CODES = {
+    # ── 원장(ledger) 상태 유래 — 매 판독마다 재관측된다 ──
+    "ledger_absent": "배달 원장 부재 — 층1(원장 대조) 근거 없이 층2(라벨)로만 판별 중",
+    "ledger_rotated": "원장 회전 — 소실 구간의 기계 push 는 층1 로 대조 불가",
+    "ledger_bad_lines": "해석 불가 줄 혼입(부분쓰기·조작 정황)",
+    "ledger_schema_skew": "원장에 이 판독자가 모르는 스키마 버전이 섞였다 — 그 배달은 층1 에서 통째로 보이지 않는다",
+    # ── 프롬프트 유래 — 그 프롬프트에서 1회만 관측된다(대장에 병합해 영속) ──
+    "delivery_out_of_window": "창 밖 배달과 전문 일치 — 접었으나 지연이 비정상",
+    "delivery_concatenated": "기계 배달 둘 이상이 한 프롬프트로 연접 제출됨",
+    "delivery_substring": "기계 배달이 프롬프트에 통째로 포함됨",
+    "delivery_anchor_capped": "부분 일치 탐색이 예산에 도달 — 못 본 구간이 있어 **판정을 접었다**(R6 ②: 종전엔 불완전한 결과로 계속 판정했다 = fail-open)",
+    "delivery_prompt_within_delivery": "프롬프트가 더 긴 기계 배달의 한 조각과 겹침(멀티라인 행 분할 정황 · 근거는 preview 평문 대조이며 해시 확증이 아니다)",
+    # ── env 오버라이드 유래 — import 시점 확정 ──
+    "env_not_int": "정수 아닌 env 오버라이드 — 기본값 적용",
+    "env_below_floor": "하한 미만 env 오버라이드 — 거부하고 기본값 적용",
+    "env_above_cap": "상한 초과 env 오버라이드 — 상한으로 절단",
+}
+
 
 def _push_anomaly(code, detail):
-    """판독·판정 중 관측된 이상 1건 적재(중복 제거는 collected_anomalies 가 한다)."""
+    """판독·판정 중 관측된 이상 1건 적재(중복 제거는 collected_anomalies 가 한다).
+
+    ★미등재 코드도 **버리지 않는다** — 흔적을 잃는 것이 미등재보다 나쁘다. 대신 등재 누락은
+      `--self-test` 가 결정론으로 잡는다(런타임 예외로 훅을 죽이지 않는다).
+    """
     _ANOMALY_SINK.append((code, detail))
 
 
@@ -347,8 +385,25 @@ PREVIEW_CHARS = 64                 # delivery.rs::PREVIEW_CHARS 미러(갈리면
 #   IN SCOPE(오너 개입 0)에서 프롬프트는 100% 기계 조합이므로 전량 커버가 본진이고,
 #   부분문자열 규칙은 오너 개입이 섞인 회색지대용 심층 방어다.
 DELIVERY_PART_MIN_CHARS = 24
-# 레코드 1건당 앵커 반복 탐색 상한(성능 상한). 도달하면 조용히 넘기지 않고 이상징후로 남긴다.
-DELIVERY_PART_MAX_OCC = 32
+# ★R6 ②(fail-open 봉합) — 종전 `DELIVERY_PART_MAX_OCC = 32`(레코드 1건당 앵커 반복 상한)를
+#   **전역 예산**으로 바꾼다. 종전 구현은 상한에 걸리면 "일부 구간을 못 봤을 수 있다"고 인정한
+#   채 **그 불완전한 spans 로 판정을 계속**했고, 라운드5 검증자가 24자 미만 동일 배달을 33·40회
+#   연접시켜 게이트를 여는 것을 실측했다(CAP33·CAP40). 상한이 곧 우회 파라미터였던 셈이다.
+#     · 이제 레코드당 상한은 **없다**(= 앵커 전수 열거 = 슬라이딩 전수 스캔과 동치. 앵커는
+#       레코드 본문의 선두 조각이므로 실제 출현은 모두 `find` 로 걸린다 — 완전 열거다).
+#     · 대신 전 레코드 합산 **해시 확증 횟수**에 예산을 둔다(훅은 매 프롬프트마다 도는 경로다).
+#     · 예산 소진은 '못 본 구간이 있다' 이므로 **판정을 접는다**(fail-closed · delivery.rs 불변식 ③).
+#   ★오너 오차단 여지: 예산을 넘기려면 한 프롬프트 안에서 기계 배달 앵커가 10만 회 출현해야
+#     한다(정상 프롬프트는 레코드당 0~1회). 사람이 도달할 수 없는 자리에 경계를 두고, 도달 시엔
+#     이상징후로 사유가 드러난다.
+DELIVERY_SPAN_OCC_BUDGET = 100000
+# ★R6 ①-ⓐ(양방향 포함) — 프롬프트가 **더 긴 배달 레코드의 한 조각**일 때 요구하는 최소 길이.
+#   멀티라인 push 가 행 단위로 쪼개져 제출되면 각 프롬프트는 레코드의 진부분이다. 생산자가 조각을
+#   따로 기록하면(delivery.rs R6) 전문 해시로 잡히지만, **구 데몬 + 신 팩** 스큐에서는 조각
+#   레코드가 없다 — 그때의 잔여 방어선이다. 원장은 본문을 통째로 보관하지 않으므로(유출 방지)
+#   대조 가능한 것은 `preview` 뿐이고, 따라서 이 규칙만은 **해시가 아니라 평문**이다.
+#   그래서 자물쇠를 둘 건다: ⓐ이 하한 이상 ⓑ preview 안에서 **행/어절 경계**에 맞아떨어질 것.
+DELIVERY_WITHIN_MIN_CHARS = 24
 
 # ★정규화 규칙 — 생산자 `delivery.rs::normalize` 와 **문자 단위로 동일**해야 한다.
 #   ① 모든 유니코드 공백(White_Space)을 ASCII 공백 하나로 ② 연속 공백 접기 ③ 앞뒤 제거.
@@ -447,7 +502,8 @@ def read_delivery(now=None):
     반환 dict 의 값은 `{"ts", "age", "stale", "chars", "preview", "origin"}` 이다
     (종전 float `ts` → dict. 소비자는 `in`·`len`·`.get` 만 쓰므로 호출 규약은 그대로다).
 
-    ★surface 결박: 원장의 `surface` 는 pane env `CYS_SURFACE_ID` 와 같은 표기(정수 문자열)다.
+    ★surface 결박: 원장의 `surface` 는 pane env(`CYS_SURFACE_ID`, 구 `AITERM_SURFACE_ID`)와
+      같은 표기(정수 문자열)다 — 판독 규약의 소유자는 `_surface()` → `javis_bootstrap.my_surface_id`.
       다른 pane 에 간 배달로 이 pane 의 판별이 흔들리면 안 된다.
 
     ## ★R5 관통 봉합 ① — 창(DELIVERY_WINDOW_S) 밖 배달을 **버리지 않는다**
@@ -538,6 +594,7 @@ def read_delivery(now=None):
                 % (len(lines), DELIVERY_SCAN_LINES, p))
     out, bad, good, stale_n = {}, 0, 0, 0
     oldest_ts = None
+    skew = {}                              # {관측된 v: 건수} — 스키마 혼재 진단(아래 ★R6)
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -551,7 +608,23 @@ def read_delivery(now=None):
             bad += 1
             continue
         if rec.get("v") != SCHEMA_VERSION:
+            # ★R6 스키마 혼재(잠재 결함 · 선제 봉합):
+            #   원장은 **생산자(delivery.rs::LEDGER_SCHEMA)** 가 버전을 찍고 이 판독자가 대조한다.
+            #   두 쪽이 갈리는 순간(데몬만 먼저 올라간 배포·롤백·부서 데몬 스큐) 신 스키마 배달은
+            #   전부 이 분기로 떨어져 `matches` 에서 사라진다. 그런데 구 스키마 레코드가 한 줄이라도
+            #   남아 있으면 `good>0` 이라 상태는 **LEDGER_OK** 다 — 층1 이 "정상 판독"인 얼굴로
+            #   신규 배달만 통째로 못 보는 상태가 되고, 무라벨 기계 push 는 층2 도 통과해
+            #   **오너 임무로 기록된다**(§1 #7 과 같은 결과 · 흔적은 일반 '손상 줄' 에 묻힌다).
+            #   → 부분쓰기·잡음과 **다른 코드로 분리**해 발행한다(`ledger_schema_skew`).
+            #   → 전량 스큐(good==0)는 아래 `bad and not good` 이 이미 판독 불가로 접는다.
+            #   ★채택하지 않은 대안: '스큐 1건이라도 있으면 무조건 UNREADABLE'. 그러면 같은 UID 가
+            #     `{"v":999,…}` 한 줄을 append 하는 것만으로 **오너가 임무를 영영 줄 수 없게** 된다
+            #     (부트스트랩 불가침 위반 · 차단이 새 가용성 구멍을 만드는 형태). 혼재는 탐지로,
+            #     전량 스큐는 차단으로 — 비대칭 원칙에 맞는 경계는 여기다.
             bad += 1                       # 미지 스키마 — 판독 불가로 계수(조용히 무시 금지)
+            _k = rec.get("v")
+            _k = _k if isinstance(_k, (int, str)) else repr(_k)
+            skew[_k] = skew.get(_k, 0) + 1
             continue
         # ★`good` 은 '이 파일을 해석할 수 있는가'의 척도다 — surface·창 필터링 **전**에 센다.
         #   여기서 세지 않고 `out`(내 pane 레코드) 로 손상을 판정하면, "남의 pane 배달만
@@ -570,7 +643,12 @@ def read_delivery(now=None):
         age = now - ts
         out[sha] = {"ts": ts, "age": age, "stale": age > DELIVERY_WINDOW_S,
                     "chars": rec.get("chars"), "preview": rec.get("preview"),
-                    "origin": rec.get("origin")}
+                    "origin": rec.get("origin"),
+                    # ★R6: 이 배달이 몇 번에 나뉘어 제출되는가(생산자가 알려 준다 · 구 데몬은 없음).
+                    #   `units==1` 이면 개행이 없어 쪼개질 수 없으므로 역포함 판정 대상이 아니다.
+                    "units": rec.get("units"),
+                    # 조각 레코드 표식(감사용) — 판정에는 쓰지 않는다. 판정은 언제나 sha 다.
+                    "part": rec.get("part"), "parent": rec.get("parent")}
     stale_n = sum(1 for m in out.values() if m["stale"])
     if bad and not good:
         # 내용은 있는데 해석 가능한 레코드가 **하나도** 없다 = 손상으로 본다(fail-closed).
@@ -586,9 +664,19 @@ def read_delivery(now=None):
             "(그 구간의 기계 push 는 층2 라벨로만 걸린다)."
             % (generations, len(lines) - rotated_lines, rotated, rotated_lines,
                _fmt_ts(oldest_ts))))
-    if bad:
+    if skew:
+        # 혼재 = 층1 이 '정상'인 얼굴로 신규 배달만 못 보는 상태다. 코드를 분리해 발행한다.
+        anomalies.append((
+            "ledger_schema_skew",
+            "원장에 이 판독자(v=%s)가 모르는 스키마 레코드가 섞였다 — %s. 해당 배달은 층1 대조에서 "
+            "통째로 보이지 않으므로, 무라벨이면 오너 임무로 기록될 수 있다(층2 폴백). 생산자"
+            "(cysd delivery.rs::LEDGER_SCHEMA)와 판독자 버전을 맞춰라"
+            % (SCHEMA_VERSION,
+               " · ".join("v=%r %d건" % (k, n) for k, n in sorted(skew.items(), key=repr)))))
+    if bad - sum(skew.values()) > 0:
         anomalies.append(("ledger_bad_lines",
-                          "원장에 해석 불가 줄 %d개(스키마 스큐·부분쓰기·조작 정황)" % bad))
+                          "원장에 해석 불가 줄 %d개(부분쓰기·조작 정황 · 스키마 스큐는 별도 코드)"
+                          % (bad - sum(skew.values()))))
     if anomalies:
         _ANOMALY_SINK.extend(anomalies)
     return out, LEDGER_OK, ("원장 해석 %d건 중 이 pane %d건(창 밖 %d · 손상 줄 %d): %s"
@@ -649,38 +737,48 @@ def _delivery_spans(norm, delivery):
     탐색 방식: `preview`(생산자가 넣는 **정규화 본문의 앞 PREVIEW_CHARS 자**)를 평문 앵커로
     `str.find` 한 뒤, 그 위치에서 `chars` 길이를 잘라 **sha256 으로 확증**한다. 앵커는 후보를
     좁히는 용도이고 판정은 언제나 해시다 — preview 만 같고 뒤가 다른 문장은 걸러진다.
-      · 비용: 레코드당 C 레벨 find + 최대 DELIVERY_PART_MAX_OCC 회 해시. 슬라이딩 전수 해시
-        (O(n·L))를 피하려고 앵커를 쓴다 — 훅은 매 프롬프트마다 도는 경로다.
+      · **완전성**: 앵커 출현을 하나도 빠뜨리지 않고(`start=i+1` 로 겹침까지) 열거하므로,
+        이 탐색은 슬라이딩 전수 스캔과 **결과가 같다**(레코드 본문은 반드시 자기 앵커로 시작한다).
+        종전의 레코드당 반복 상한(R5 `DELIVERY_PART_MAX_OCC`)은 그 완전성을 깨서 33회 이상
+        연접에 게이트를 열어 줬다(R6 ② · 상수 절 참조).
+      · 비용: 레코드당 C 레벨 find(전체 합 O(n)) + 확증 해시. 해시 횟수만 **전역 예산**으로
+        묶고, 예산 소진은 `capped=True` 로 호출자에게 넘긴다(호출자가 fail-closed 로 접는다).
       · `chars`·`preview` 가 없는 레코드(구 스키마·수기 작성)는 **건너뛴다** — 전문 해시 대조는
         그대로 유효하므로 판별이 약해지는 방향이 아니다(부분 일치만 포기).
       · 기동 표식(sentinel: chars=0·preview="")은 여기서 자동 배제된다(chars<1).
     """
     spans, capped = [], False
     n = len(norm)
+    budget = DELIVERY_SPAN_OCC_BUDGET
     for sha, meta in (delivery or {}).items():
         if not isinstance(meta, dict):
             continue                        # 구 호출 규약(sha→ts float) — 전문 해시만 가능
         chars, prev = meta.get("chars"), meta.get("preview")
         if not isinstance(chars, int) or chars < 1 or not prev or chars > n:
             continue
-        start, occ = 0, 0
+        start = 0
         while True:
             i = norm.find(prev, start)
             if i < 0:
                 break
-            occ += 1
-            if occ > DELIVERY_PART_MAX_OCC:
-                capped = True               # 조용히 끊지 않는다 — 호출자가 이상징후로 남긴다
+            if budget <= 0:
+                # 예산 소진 = **못 본 구간이 있다**. 종전처럼 불완전한 spans 로 판정을 계속하면
+                # 그 자체가 fail-open 이므로, 여기서 끊고 호출자가 접게 한다.
+                capped = True
                 break
+            budget -= 1
             j = i + chars
             if j <= n and _digest_norm(norm[i:j]) == sha:
                 spans.append((i, j, sha, meta))
             start = i + 1
+        if capped:
+            break
     return spans, capped
 
 
 def _composition(norm, delivery):
-    """(kind, detail) — 프롬프트가 기계 배달 조각으로 설명되는가. kind ∈ (None, 'concat', 'substr').
+    """(kind, detail) — 프롬프트가 기계 배달 조각으로 설명되는가.
+    kind ∈ (None, 'concat', 'substr', 'capped').
 
     ## 왜 필요한가 (R5 관통 봉합 ③ · 라운드4 검증자 실측)
     `cys send` 계열은 텍스트만 넣고 제출(Return)은 따로 한다. 그래서 큐 배달 "A" 가 pane 버퍼에
@@ -701,46 +799,120 @@ def _composition(norm, delivery):
        프롬프트에 우연히 포함돼 임무가 영영 안 열리는 거짓 음성 폭발을 막는다.
        ★대가(수용·SOT §4-2b): 오너가 기계 문안을 24자 이상 **그대로 인용**하고 자기 지시를
        덧붙이면 프롬프트 전체가 접힌다. 인용 대신 자기 말로 쓰면 그대로 열린다.
+       ★★R6 ③ — **같은 조각의 반복만으로는 하한을 채우지 못한다.** 종전엔 병합 구간이
+       "1자 배달 × 24회" 로도 24자를 채워 substr 이 성립했다. 그 결과 원장에 짧은 배달(예 "가")
+       하나만 있으면 그 글자가 24자 이어지는 **오너의 평범한 문장**(마크다운 구분선·강조 반복·
+       같은 어절 반복)이 통째로 차단됐다 — 이 규칙의 목적("짧은 기계 문장이 우연히 섞여 임무가
+       영영 안 열리는 것을 막는다")과 정면으로 배치된다. 그래서 병합 구간이 **서로 다른 sha
+       2건 이상**으로 덮이거나 **단일 레코드 자체가 하한 이상**일 것을 요구한다. 전량 커버(①)는
+       길이와 무관한 규칙이라 이 조건과 무관하며, 따라서 방어는 약해지지 않는다(IN SCOPE 의
+       본진은 ①이다).
+       ★가장 긴 구간이 자격 미달이어도 **다음 구간을 계속 본다** — 자격 있는 구간이 뒤에
+       있는데 첫 후보에서 포기하면 그것도 fail-open 이다.
+    ③ **capped(판정 불가)** — 탐색 예산이 소진돼 **못 본 구간이 있다**. 접는다(fail-closed).
     """
     spans, capped = _delivery_spans(norm, delivery)
     if capped:
-        _push_anomaly("delivery_anchor_capped",
-                      "부분 일치 탐색이 레코드당 반복 상한 %d 에 도달했다 — 일부 구간을 보지 "
-                      "못했을 수 있다(연접 판정이 약해지는 방향)" % DELIVERY_PART_MAX_OCC)
+        # ★R6 ②: 종전엔 이상징후만 남기고 **불완전한 spans 로 판정을 계속**했다(fail-open).
+        #   '애매하면 접는다'(delivery.rs 불변식 ③)에 맞춰 판정 자체를 접는다.
+        return "capped", ("부분 일치 탐색이 전역 예산 %d(해시 확증 횟수)에 도달해 프롬프트의 "
+                          "일부 구간을 보지 못했다 — 못 본 구간이 기계 배달일 수 있으므로 "
+                          "판정을 열지 않는다(fail-closed). 프롬프트 %d자 · 원장 레코드 %d건"
+                          % (DELIVERY_SPAN_OCC_BUDGET, len(norm), len(delivery or {})))
     if not spans:
         return None, ""
+    # merged[k] = [시작, 끝, [기여 span…]] — 기여 span 을 들고 있어야 R6 ③ 자격 판정이 된다.
     merged = []
-    for i, j, _sha, _m in sorted(spans):
+    for i, j, sha, _m in sorted(spans):
         if merged and i <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], j)
+            merged[-1][2].append((i, j, sha))
         else:
-            merged.append([i, j])
+            merged.append([i, j, [(i, j, sha)]])
     pos, gaps = 0, []
-    for a, b in merged:
+    for a, b, _c in merged:
         if a > pos:
             gaps.append(norm[pos:a])
         pos = max(pos, b)
     if pos < len(norm):
         gaps.append(norm[pos:])
-    covered = sum(b - a for a, b in merged)
+    covered = sum(b - a for a, b, _c in merged)
     if all(g.strip() == "" for g in gaps):
         return "concat", ("프롬프트 %d자가 원장 배달 %d조각(구간 %d개)으로 남김없이 설명된다 — "
                           "두 기계 배달이 한 프롬프트로 합쳐진 경우다(제출 전 버퍼 연접). "
                           "조각 미리보기: %s"
                           % (len(norm), len(spans), len(merged),
-                             " ⧉ ".join(repr(norm[a:b][:40]) for a, b in merged[:4])))
-    longest = max(merged, key=lambda ab: ab[1] - ab[0])
-    span_len = longest[1] - longest[0]
-    if span_len >= DELIVERY_PART_MIN_CHARS:
-        # 척도는 **연속 구간 길이**다(레코드 1건 길이가 아니다 — docstring ② 참조).
-        # 진단을 위해 '가장 긴 단일 레코드'도 함께 보고한다(둘이 다르면 짧은 배달 여럿이 맞물린 것).
-        single = max((j - i) for i, j, _s, _m in spans)
+                             " ⧉ ".join(repr(norm[a:b][:40]) for a, b, _c in merged[:4])))
+    # ★R6 ③: 자격 있는 구간 중 가장 긴 것으로 판정한다(자격 = 서로 다른 sha 2건 이상 ∨
+    #   단일 레코드 자체가 하한 이상). 자격 없는 구간은 '같은 짧은 배달의 반복'이며, 그것은
+    #   기계 조합의 증거가 아니라 **오너 문장에도 흔한 모양**이다.
+    best = None
+    for a, b, contrib in merged:
+        if b - a < DELIVERY_PART_MIN_CHARS:
+            continue
+        distinct = {sha for _i, _j, sha in contrib}
+        single = max(j - i for i, j, _s in contrib)
+        if len(distinct) < 2 and single < DELIVERY_PART_MIN_CHARS:
+            continue                        # 같은 짧은 조각의 반복만으로는 접지 않는다
+        if best is None or (b - a) > (best[1] - best[0]):
+            best = (a, b, distinct, single)
+    if best is not None:
+        a, b, distinct, single = best
         return "substr", ("프롬프트 %d자 안에 기계 배달로만 설명되는 연속 구간 %d자가 있다"
-                          "(단일 레코드 최장 %d자 · 총 덮인 %d자 · 위치 %d) — 기계 배달과 다른 "
-                          "문자열이 한 프롬프트로 합쳐졌다. 구간: %r"
-                          % (len(norm), span_len, single, covered, longest[0],
-                             norm[longest[0]:longest[1]][:60]))
+                          "(서로 다른 레코드 %d건 · 단일 레코드 최장 %d자 · 총 덮인 %d자 · "
+                          "위치 %d) — 기계 배달과 다른 문자열이 한 프롬프트로 합쳐졌다. 구간: %r"
+                          % (len(norm), b - a, len(distinct), single, covered, a, norm[a:b][:60]))
     return None, ""
+
+
+def _prompt_within_delivery(norm, delivery):
+    """(bool, 사유) — 프롬프트가 **더 긴 배달 레코드의 한 조각**인가(R6 ①-ⓐ 양방향 포함).
+
+    ## 왜 (라운드5 검증자 실측 · 관통)
+    데몬은 멀티라인 push 를 전문 1건으로 기록하는데, 원시 바이트 주입 경로에서는 본문 개행이
+    그대로 Enter 라 TUI 가 **행 단위로 쪼개** 제출한다. 그러면 각 프롬프트는 레코드의 진부분이라
+    ⓐ전문 해시가 어긋나고 ⓑ`_delivery_spans` 는 `chars > n` 에서 그 레코드를 통째로 건너뛴다 —
+    층1 전건 미스. 근본 수리는 생산자가 **제출 단위 조각을 따로 기록**하는 것이고(delivery.rs R6),
+    그러면 이 프롬프트는 조각 레코드와 **전문 해시로** 일치해 여기까지 오지 않는다.
+    이 함수는 그 조각 레코드가 없는 경우, 즉 **구 데몬 + 신 팩 스큐**의 잔여 방어선이다.
+
+    ## 왜 이 규칙만 평문인가 (정직 고지)
+    원장은 본문을 통째로 보관하지 않는다(그 자체가 프롬프트 유출 저장소가 되므로 `preview` 64자만
+    남긴다). 그래서 "레코드 안에 이 프롬프트가 있는가"는 **해시로 확증할 수 없고** preview 평문
+    대조밖에 방법이 없다 — 이 모듈에서 유일하게 증거 등급이 낮은 규칙이며, 그만큼 좁게 건다.
+
+    ## 오너 오차단을 막는 두 자물쇠 (실측으로 정한 값)
+      ⓐ **최소 길이** `DELIVERY_WITHIN_MIN_CHARS` — 짧은 문장이 "어떤 레코드의 부분"이라는
+        이유로 상시 차단되면 실사용 장애다. 하한 미만은 아예 보지 않는다.
+      ⓑ **경계 정합** — 매치가 preview 안에서 행/어절 경계(앞뒤가 공백이거나 preview 끝)에
+        맞아떨어져야 한다. 실제 관통은 '행 하나가 통째로 제출된 것'이므로 정규화 후 그 조각의
+        양옆은 반드시 공백(원래 개행)이다. 어절 중간을 자르는 우연한 포함은 이 조건에서 죽는다.
+      ⓒ `units == 1`(쪼개질 수 없는 배달 — 신 데몬이 알려 준다)은 아예 건너뛴다.
+    """
+    n = len(norm)
+    if n < DELIVERY_WITHIN_MIN_CHARS:
+        return False, ""
+    for sha, meta in (delivery or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        chars, prev = meta.get("chars"), meta.get("preview")
+        if not isinstance(chars, int) or chars <= n or not prev:
+            continue                        # 전문 일치·부분 일치는 앞 규칙들의 몫이다
+        units = meta.get("units")
+        if isinstance(units, int) and units <= 1:
+            continue                        # 개행이 없어 쪼개질 수 없는 배달
+        i = prev.find(norm)
+        while i >= 0:
+            left_ok = i == 0 or prev[i - 1] == " "
+            right_ok = i + n == len(prev) or prev[i + n] == " "
+            if left_ok and right_ok:
+                return True, ("프롬프트 %d자가 더 긴 배달(레코드 %d자 · sha256=%s…)의 한 조각과 "
+                              "정확히 겹친다(위치 %d · 행/어절 경계 정합) — 멀티라인 기계 push 가 "
+                              "행 단위로 쪼개져 제출된 정황이다. ★근거는 preview 평문 대조이며 "
+                              "해시 확증이 아니다(원장은 본문을 보관하지 않는다)"
+                              % (n, chars, sha[:12], i))
+            i = prev.find(norm, i + 1)
+    return False, ""
 
 
 def machine_origin(prompt, delivery=None, ledger_status=None):
@@ -749,7 +921,11 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
     판별은 2층이며 **층1이 정답**이다:
       층1 배달 원장 대조 — 데몬이 주입 직전 남긴 해시와 일치하면 기계 유래가 **확정**된다.
                           라벨 유무·문안 규약과 무관하므로 **문안 규약을 우회하는 push** 도 잡는다.
-                          ⓐ 전문 일치 ⓑ 창 밖 전문 일치(R5 ①) ⓒ 조각 연접·부분 포함(R5 ③).
+                          ⓐ 전문 일치 ⓑ 창 밖 전문 일치(R5 ①) ⓒ 조각 연접·부분 포함(R5 ③)
+                          ⓓ **제출 단위 조각과의 전문 일치**(R6 ① — 멀티라인 push 가 행 단위로
+                            쪼개져 제출되는 경로. 데몬이 조각을 따로 기록하므로 여기서는 ⓐ 와
+                            같은 규칙으로 잡힌다) ⓔ 역포함(구 데몬 스큐 한정 · 평문 근거)
+                          ⓕ 탐색 예산 소진(R6 ② — 못 본 구간이 있으면 접는다).
       층2 push 규약 라벨 — 원장이 없거나(아직 배달 이력 없음) 판독 불가일 때의 폴백.
                           여기서만 문자열에 의존한다.
     ★한 방향으로만 공격적이다: 어느 층이든 걸리면 기계로 접는다.
@@ -790,6 +966,11 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
             return True, ("배달 원장 일치(sha256=%s… origin=daemon) — 데몬이 이 pane 에 주입한 "
                           "바로 그 문장이다" % sha[:12])
         kind, detail = _composition(norm, delivery)
+        if kind == "capped":
+            # ★R6 ②: 탐색 예산 소진 = 판정 근거 불완전. 종전은 이상징후만 남기고 통과시켰다.
+            _push_anomaly("delivery_anchor_capped",
+                          "부분 일치 탐색이 예산에 도달해 판정을 접었다(fail-closed) — %s" % detail)
+            return True, "배달 원장 대조 불완전 — %s" % detail
         if kind == "concat":
             _push_anomaly("delivery_concatenated",
                           "기계 배달 연접을 한 프롬프트로 제출받았다 — %s" % detail)
@@ -798,6 +979,14 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
             _push_anomaly("delivery_substring",
                           "프롬프트에 기계 배달이 통째로 포함됐다 — %s" % detail)
             return True, "배달 원장 부분 포함 — %s" % detail
+        within, wdetail = _prompt_within_delivery(norm, delivery)
+        if within:
+            # ★R6 ①-ⓐ: 신 데몬이면 조각 레코드가 있어 여기까지 오지 않는다 — 이 발행은
+            #   "구 데몬 + 신 팩 스큐에서 평문 근거로 접었다"는 사실의 고지다(증거 등급 명시).
+            _push_anomaly("delivery_prompt_within_delivery",
+                          "프롬프트가 더 긴 기계 배달의 조각과 겹쳐 접었다(평문 preview 근거) — "
+                          "%s" % wdetail)
+            return True, "배달 원장 역포함(멀티라인 행 분할 정황) — %s" % wdetail
     if has_machine_label(prompt):
         return True, "push 규약 라벨 선두(%r) — 기계 채널(wake/노드 push/훅 알림)" % _label_head(prompt)
     return False, ""
@@ -850,7 +1039,23 @@ def daemon_epoch():
 
 
 def _surface():
-    return os.environ.get("CYS_SURFACE_ID", "") or ""
+    """이 pane 의 surface 참조 — 규약 소유자는 `javis_bootstrap.my_surface_id` 하나다(사본 금지).
+
+    ★R6 통일: 종전엔 여기서만 `CYS_SURFACE_ID` 를 봤다. 그런데 훅 게이트(`hooks/_lib.sh`)와
+      형제 모듈(`javis_task`·`javis_orchestra`)은 구 이름 `AITERM_SURFACE_ID` 도 수용한다.
+      구 env 로만 선 pane 에서는 **훅은 돌고 surface 결박만 빈 문자열로 풀리는** 비대칭이
+      생긴다 — 그 상태에서 `read_delivery` 는 원장의 모든 레코드를 '남의 pane'으로 걸러
+      층1 이 통째로 비고, 무라벨 기계 push 가 오너 임무가 된다(SOT §1 #7 과 같은 결과).
+      surface 결박은 층1 의 **전제**이므로 판독 규약이 모듈마다 갈리면 안 된다.
+    모듈 결손 시에도 판독이 한쪽 env 로 좁아지지 않게 같은 규칙을 폴백에 둔다(경로 계약과 달리
+    여기서 None 을 돌려주면 결박이 아니라 판별 전체가 죽는다 — degrade 가 정답).
+    """
+    try:
+        import javis_bootstrap
+        return javis_bootstrap.my_surface_id()
+    except Exception:
+        return (os.environ.get("CYS_SURFACE_ID", "")
+                or os.environ.get("AITERM_SURFACE_ID", "") or "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1377,12 +1582,65 @@ def cmd_delivery_path(argv):
 
 
 # ── 밀폐 self-test(assert 배터리 · preflight/CI 관례 — 선례 javis_detect.cmd_self_test) ──
+def _selftest_anomaly_registry(fails):
+    """★R6 회귀 핀 — **발행 코드 전수 ↔ 등재소 ↔ 문서 열거**를 1:1 로 묶는다.
+
+    ## 왜 (라운드6 적발)
+    `MASTER_DIRECTIVE.md` §0-C 는 "이상징후를 판정과 무관하게 그대로 보고하라"고 규정하면서
+    보고 대상을 **손으로 열거**했다. 그 열거에서 `ledger_rotated`(코드명 누락)·
+    `delivery_anchor_capped`(통째 누락)가 빠져 있었다 — 둘 다 실제 발행되는 코드다.
+    열거가 불완전하면 "보고했는가"를 판정할 기준이 흐려지고, 은폐가 규약 위반으로 잡히지 않는다.
+    앞으로 코드를 추가하면서 문서를 잊으면 **여기서 잡힌다**.
+
+    ## 어떻게 (자연어 추론이 아니라 결정론)
+      ⓐ 자기 소스에서 **발행 지점의 문자열 리터럴**을 뽑는다 → 전부 `ANOMALY_CODES` 에 있어야 한다.
+      ⓑ `ANOMALY_CODES` 의 모든 키가 배포 팩의 `directives/MASTER_DIRECTIVE.md` 에 있어야 한다.
+    ★한계(정직 고지): ⓐ 는 리터럴만 본다. 코드를 변수·포맷 문자열로 만들면 이 핀은 못 잡는다 —
+      그래서 발행은 **리터럴로만** 한다는 것이 이 모듈의 규약이다.
+    """
+    import re as _re
+    try:
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            src = f.read()
+    except Exception as e:
+        fails.append("이상징후 등재 핀: 자기 소스를 읽지 못했다(%s)" % e)
+        return
+    emit = _re.compile(r'(?:_push_anomaly\(|anomalies\.append\(\(|ENV_ANOMALIES\.append\(\()'
+                       r'\s*"([a-z_]+)"')
+    emitted = set(emit.findall(src))
+    if not emitted:
+        fails.append("이상징후 등재 핀: 발행 지점을 하나도 찾지 못했다 — 정규식이 코드와 갈렸다"
+                     "(핀이 조용히 무력화된 상태)")
+    for code in sorted(emitted - set(ANOMALY_CODES)):
+        fails.append("이상징후 %r 를 발행하는데 ANOMALY_CODES 등재소에 없다 — 등재소가 SOT 다"
+                     % code)
+    for code in sorted(set(ANOMALY_CODES) - emitted):
+        fails.append("이상징후 %r 가 등재소에만 있고 발행 지점이 없다(죽은 항목 — 문서에 "
+                     "허수 보고 대상이 생긴다)" % code)
+    doc = os.path.join(os.path.dirname(_SELF_DIR), "directives", "MASTER_DIRECTIVE.md")
+    if not os.path.isdir(os.path.dirname(doc)):
+        print("javis_mission self-test NOTE: directives/ 부재 — 문서 열거 대조는 건너뛴다",
+              file=sys.stderr)
+        return
+    try:
+        with open(doc, encoding="utf-8") as f:
+            body = f.read()
+    except Exception as e:
+        fails.append("이상징후 등재 핀: MASTER_DIRECTIVE.md 를 읽지 못했다(%s): %s" % (e, doc))
+        return
+    for code in sorted(ANOMALY_CODES):
+        if ("`%s`" % code) not in body:
+            fails.append("이상징후 %r 가 MASTER_DIRECTIVE §0-C 열거에 없다 — 보고 의무의 이행 "
+                         "범위가 코드와 문서로 갈렸다(은폐가 위반으로 잡히지 않는다)" % code)
+
+
 def cmd_self_test():
     detect = _detect_mod()
     if detect is None:
         print("javis_mission self-test SKIP(javis_detect 부재)", file=sys.stderr)
         return 1
     fails = []
+    _selftest_anomaly_registry(fails)
 
     def want_none(p, why):
         m, r = extract_mission(p, detect)
@@ -1929,6 +2187,281 @@ def cmd_self_test():
                     if not (_vF.get("anomalies") or []):
                         fails.append("이상징후 전용 레코드의 흔적이 verdict 에 실리지 않았다")
 
+                # ══════════════════════════════════════════════════════════════
+                # ★R6 회귀 핀 — 스키마 혼재 원장 (잠재 결함 · 선제 봉합)
+                # 생산자(delivery.rs::LEDGER_SCHEMA)가 판독자보다 먼저 올라가면 신 스키마
+                # 배달이 층1 에서 통째로 사라지는데, 구 레코드가 한 줄이라도 남아 있으면
+                # 상태는 LEDGER_OK 다 — "정상"의 얼굴을 한 층1 무력화다.
+                # ══════════════════════════════════════════════════════════════
+                def _rec_v(text, ver, ts=None):
+                    _n = _normalize_delivery(text)
+                    return json.dumps({"v": ver, "surface": _surface(),
+                                       "ts_epoch": time.time() if ts is None else ts,
+                                       "sha256": _digest_norm(_n), "origin": "send",
+                                       "chars": len(_n), "preview": _n[:PREVIEW_CHARS]},
+                                      ensure_ascii=False) + "\n"
+
+                #  ①혼재(구 정상 + 신 스키마) — 판정은 OK 여도 **전용 코드**로 반드시 드러난다
+                _reset_ledgers()
+                _future = "신 스키마로 배달된 무라벨 자율 착수 지시"
+                _write(_dp, _rec("구 스키마 정상 배달") + _rec_v(_future, SCHEMA_VERSION + 1))
+                _dX, _stX, _detX = read_delivery()
+                _skewA = [a for a in collected_anomalies() if a["code"] == "ledger_schema_skew"]
+                if _stX == LEDGER_OK and not _skewA:
+                    fails.append("★스키마 혼재 원장이 LEDGER_OK 로 통과하면서 흔적도 없다 — 신 "
+                                 "스키마 배달이 층1 에서 통째로 사라져 무라벨 push 가 오너 임무가 "
+                                 "된다(치명). '혼재=UNREADABLE 또는 명시적 anomaly' 계약 위반")
+                if _stX == LEDGER_OK and _skewA and "v=%d" % (SCHEMA_VERSION + 1) not in _skewA[0]["detail"]:
+                    fails.append("스키마 혼재 이상징후에 관측된 버전이 없다 — 어느 쪽이 앞섰는지 "
+                                 "오너가 알 수 없다: %r" % _skewA[0]["detail"])
+                #  ②혼재는 일반 '손상 줄'과 **섞이지 않는다**(코드가 갈려야 원인 진단이 산다)
+                if any(a["code"] == "ledger_bad_lines" for a in collected_anomalies()):
+                    fails.append("스키마 스큐가 'ledger_bad_lines' 로도 계수됐다 — 부분쓰기 잡음과 "
+                                 "버전 스큐는 처방이 달라 같은 코드로 묶으면 진단이 죽는다")
+                #  ③전량 스큐(구 레코드 0건)는 **판독 불가**로 접는다(fail-closed)
+                _reset_ledgers()
+                _write(_dp, _rec_v("신 스키마 배달 1", SCHEMA_VERSION + 1)
+                       + _rec_v("신 스키마 배달 2", SCHEMA_VERSION + 1))
+                if read_delivery()[1] != LEDGER_UNREADABLE:
+                    fails.append("전량 미지 스키마 원장이 판독 불가로 접히지 않았다 — 판독자가 "
+                                 "아무것도 대조할 수 없는 상태에서 게이트가 열린다(치명)")
+                #  ④음성 대조: 잡음 1줄 append 로 **게이트를 잠글 수는 없다**(가용성 구멍 금지).
+                #    부트스트랩 불가침 — 오너가 임무를 못 주게 되는 방향의 과잉 차단도 결함이다.
+                _reset_ledgers()
+                _write(_dp, _rec("정상 배달") + "{not json at all}\n")
+                if read_delivery()[1] != LEDGER_OK:
+                    fails.append("잡음 1줄이 섞였다고 원장 전체가 판독 불가로 접혔다 — 같은 UID 가 "
+                                 "한 줄 append 로 오너의 임무 부여를 영영 막을 수 있다(가용성 구멍)")
+                if not any(a["code"] == "ledger_bad_lines" for a in collected_anomalies()):
+                    fails.append("잡음 줄이 이상징후로 드러나지 않았다")
+
+                # ══════════════════════════════════════════════════════════════
+                # ★R6 회귀 핀 — surface env 판독 통일(층1 의 전제)
+                # 훅 게이트(_lib.sh)·형제 모듈은 구 이름 AITERM_SURFACE_ID 도 수용한다.
+                # 여기만 신 이름을 보면 구 env pane 에서 결박이 조용히 풀린다.
+                # ══════════════════════════════════════════════════════════════
+                _sid_c = os.environ.pop("CYS_SURFACE_ID", None)
+                _sid_a = os.environ.pop("AITERM_SURFACE_ID", None)
+                try:
+                    os.environ["AITERM_SURFACE_ID"] = "77"
+                    if _surface() != "77":
+                        fails.append("★구 env(AITERM_SURFACE_ID)만 선 pane 에서 surface 결박이 "
+                                     "빈 값으로 풀린다 — 원장의 모든 레코드가 '남의 pane'으로 걸러져 "
+                                     "층1 이 통째로 비고 무라벨 push 가 오너 임무가 된다(치명). "
+                                     "판독 소유자=javis_bootstrap.my_surface_id")
+                    os.environ["CYS_SURFACE_ID"] = "42"
+                    if _surface() != "42":
+                        fails.append("신 env 가 구 env 보다 우선하지 않는다(_lib.sh·javis_task 규약 이탈)")
+                    #    ★결박이 실제로 작동하는가 — 구 env pane 의 배달이 층1 에 잡혀야 한다
+                    os.environ.pop("CYS_SURFACE_ID", None)
+                    _reset_ledgers()
+                    _oldenv = "구 env pane 으로 배달된 무라벨 지시"
+                    _write(_dp, _rec(_oldenv))          # surface=_surface()="77"
+                    _dE, _stE, _ = read_delivery()
+                    if _stE != LEDGER_OK or not machine_origin(_oldenv, _dE, _stE)[0]:
+                        fails.append("구 env pane 의 배달이 층1 대조에서 사라졌다(surface 결박 이탈)")
+                finally:
+                    os.environ.pop("AITERM_SURFACE_ID", None)
+                    os.environ.pop("CYS_SURFACE_ID", None)
+                    if _sid_c is not None:
+                        os.environ["CYS_SURFACE_ID"] = _sid_c
+                    if _sid_a is not None:
+                        os.environ["AITERM_SURFACE_ID"] = _sid_a
+
+                # ══════════════════════════════════════════════════════════════
+                # ★★R6-A — 층1 대조 규칙 3결함 (라운드5 검증자 실측 · 관통 3종)
+                #   ① 멀티라인 기계 push 가 **행 단위로 쪼개져** 제출되면 층1 전건 미스
+                #   ② 앵커 상한 소진(capped)에서 불완전한 결과로 판정 지속 = fail-open
+                #   ③ substr 병합이 sha 동일성을 안 봐 **오너 정상 프롬프트**를 상시 차단
+                # 각 항목마다 **양성(막는가) / 음성(오너를 막지 않는가)** 를 함께 박제한다.
+                # ══════════════════════════════════════════════════════════════
+
+                def _rec_multiline(text, ts=None, with_parts=True):
+                    """생산자(delivery.rs::record_full)를 **그대로** 미러 — 전문 + 제출 단위 조각.
+
+                    `with_parts=False` 는 **구 데몬**(R6 이전)의 원장 모양이다: 전문 1건뿐이고
+                    `units` 필드도 없다 — 팩만 먼저 올라간 스큐에서 잔여 방어선(역포함)이
+                    실제로 도는지 보려면 이 모양이 필요하다.
+                    """
+                    _t = time.time() if ts is None else ts
+                    _n = _normalize_delivery(text)
+                    _units = []
+                    for _ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                        _u = _normalize_delivery(_ln)
+                        if _u and _u not in _units:
+                            _units.append(_u)
+                    _head = {"v": SCHEMA_VERSION, "surface": _surface(), "ts_epoch": _t,
+                             "sha256": _digest_norm(_n), "origin": "send",
+                             "chars": len(_n), "preview": _n[:PREVIEW_CHARS]}
+                    if with_parts:
+                        _head["units"] = len(_units)
+                    _out = json.dumps(_head, ensure_ascii=False) + "\n"
+                    if not with_parts:
+                        return _out
+                    for _i, _u in enumerate(u for u in _units if u != _n):
+                        _out += json.dumps({"v": SCHEMA_VERSION, "surface": _surface(),
+                                            "ts_epoch": _t, "sha256": _digest_norm(_u),
+                                            "origin": "send", "chars": len(_u),
+                                            "preview": _u[:PREVIEW_CHARS],
+                                            "part": _i + 1, "parent": _digest_norm(_n)},
+                                           ensure_ascii=False) + "\n"
+                    return _out
+
+                # ── ①-a 관통 재현 차단: 멀티라인 push 의 **각 행**이 층1 에 걸린다 ─────────
+                #    종전: 전문 해시 불일치 + `chars > len(prompt)` 로 레코드 통째 건너뛰기
+                #    → 층1 전건 미스 → 무라벨이라 층2 통과 → 오너 임무 기록(치명).
+                _ml = ("[wakeup] 자동 기상 알림\n"
+                       "다음 액션 착수\n"
+                       "이어서 T5 잔여 항목을 처리하고 결과를 보고하라\n")
+                _reset_ledgers()
+                _write(_dp, _rec_multiline(_ml))
+                _dM, _stM, _detM = read_delivery()
+                if _stM != LEDGER_OK:
+                    fails.append("멀티라인 코퍼스에서 원장 판독 실패(%s): %s" % (_stM, _detM))
+                else:
+                    for _line in ("다음 액션 착수",
+                                  "이어서 T5 잔여 항목을 처리하고 결과를 보고하라"):
+                        if not machine_origin(_line, _dM, _stM)[0]:
+                            fails.append("★R6 ① 미봉합: 멀티라인 기계 push 의 행 %r 가 단독 "
+                                         "제출됐는데 층1 이 미스했다 — 레코드는 전문 1건이고 "
+                                         "프롬프트는 그 진부분이라 해시가 어긋난다. 무라벨이면 "
+                                         "층2 도 통과해 오너 임무가 된다(치명)" % _line)
+                    #    전문이 한 덩어리로 제출되는 경우(bracketed paste)도 종전대로 접힌다
+                    if not machine_origin(_ml, _dM, _stM)[0]:
+                        fails.append("멀티라인 전문 제출이 접히지 않았다(회귀) — 조각 기록이 "
+                                     "전문 레코드를 대체해선 안 된다")
+                    #    버퍼에 남은 마지막 행 + 다음 배달의 연접도 조각 덕분에 잡힌다
+                    if not machine_origin("다음 액션 착수 이어서 T5 잔여 항목을 처리하고 "
+                                          "결과를 보고하라", _dM, _stM)[0]:
+                        fails.append("행 조각 2개의 연접이 접히지 않았다(제출 전 버퍼 병합 경로)")
+
+                # ── ①-b 구 데몬 스큐(조각 레코드 없음)에서도 잔여 방어선이 돈다 ──────────
+                #    ★증거 등급이 낮은 규칙(preview 평문)이므로 하한·경계 조건을 함께 박제한다.
+                _reset_ledgers()
+                _write(_dp, _rec_multiline(_ml, with_parts=False))
+                _dO, _stO, _ = read_delivery()
+                _long_line = "이어서 T5 잔여 항목을 처리하고 결과를 보고하라"
+                if len(_long_line) < DELIVERY_WITHIN_MIN_CHARS:
+                    fails.append("역포함 corpus 가 무의미하다 — 대상 행이 하한 미만이다")
+                if not machine_origin(_long_line, _dO, _stO)[0]:
+                    fails.append("★R6 ①-ⓐ 미봉합: 구 데몬(조각 레코드 없음) 원장에서 멀티라인 "
+                                 "행이 층1 을 통과했다 — 팩만 먼저 올라간 스큐에서 관통이 그대로 "
+                                 "남는다")
+                elif not any(a["code"] == "delivery_prompt_within_delivery"
+                             for a in collected_anomalies()):
+                    fails.append("역포함으로 접었는데 이상징후를 발행하지 않았다 — 증거 등급이 "
+                                 "낮은 규칙일수록 흔적이 필요하다")
+                #    음성: 하한 미만(짧은 행)은 **접지 않는다**(오너 오차단 방지의 핵심 자물쇠)
+                if machine_origin("다음 액션 착수", _dO, _stO)[0]:
+                    fails.append("★오너 오차단: %d자 미만인데 '어떤 레코드의 부분'이라는 이유로 "
+                                 "접혔다 — 짧은 문장이 상시 차단되면 실사용 장애다"
+                                 % DELIVERY_WITHIN_MIN_CHARS)
+                #    음성: 어절 경계를 안 맞는 우연한 포함은 접지 않는다
+                if machine_origin("서 T5 잔여 항목을 처리하고 결과를 보고하", _dO, _stO)[0]:
+                    fails.append("역포함이 어절 중간을 잘라 매치했다 — 경계 정합 자물쇠가 없다")
+                #    음성: `units==1`(쪼개질 수 없는 배달)은 역포함 대상이 아니다
+                _reset_ledgers()
+                _write(_dp, _rec_multiline("한 줄짜리 긴 배달 문장이며 개행이 전혀 없다 정말로"))
+                _dU, _stU, _ = read_delivery()
+                if machine_origin("한 줄짜리 긴 배달 문장이며", _dU, _stU)[0]:
+                    fails.append("units==1 레코드에 역포함 규칙이 걸렸다 — 개행이 없으면 행 분할 "
+                                 "제출 자체가 불가능하다(과확장)")
+
+                # ── ② capped fail-open: 24자 미만 동일 배달의 33·40회 연접 ────────────────
+                #    종전: 레코드당 반복 상한 32 → 33회부터 spans 불완전 → 전량 커버 실패 →
+                #    substr 도 미달 → **게이트 개방**(CAP33·CAP40 실측).
+                _short = "다음 액션 착수"
+                if len(_short) >= DELIVERY_PART_MIN_CHARS:
+                    fails.append("CAP corpus 가 무의미하다 — 조각이 이미 하한 이상이다")
+                _reset_ledgers()
+                _write(_dp, _rec(_short))
+                _dK, _stK, _ = read_delivery()
+                for _n_rep in (33, 40, 64):
+                    if not machine_origin(" ".join([_short] * _n_rep), _dK, _stK)[0]:
+                        fails.append("★R6 ② 미봉합: 하한 미만 배달의 %d회 연접이 통과했다 — "
+                                     "탐색 상한이 곧 우회 파라미터다(CAP%d 실측 재현)"
+                                     % (_n_rep, _n_rep))
+                #    예산이 실제로 소진되면 **접는다**(fail-closed). 예산을 낮춰 경로를 강제한다.
+                _save_budget = globals()["DELIVERY_SPAN_OCC_BUDGET"]
+                try:
+                    globals()["DELIVERY_SPAN_OCC_BUDGET"] = 4
+                    del _ANOMALY_SINK[:]
+                    _okB, _whyB = machine_origin(" ".join([_short] * 40) + " 그리고 오너 지시",
+                                                 _dK, _stK)
+                    if not _okB:
+                        fails.append("★R6 ② 미봉합: 탐색 예산이 소진돼 '못 본 구간'이 있는데 "
+                                     "판정을 열었다 — 애매하면 접는다(불변식 ③) 위반")
+                    elif not any(a["code"] == "delivery_anchor_capped"
+                                 for a in collected_anomalies()):
+                        fails.append("예산 소진으로 접었는데 이상징후가 없다(사유 불명 차단)")
+                finally:
+                    globals()["DELIVERY_SPAN_OCC_BUDGET"] = _save_budget
+
+                # ── ③ substr 병합이 sha 동일성을 본다 — 오너 정상 프롬프트 무차단 ────────
+                #    원장에 1자 배달이 있으면, 종전 규칙은 그 글자가 24자 이어지기만 해도
+                #    병합 구간이 하한을 채워 **오너 문장 전체**를 삼켰다.
+                _reset_ledgers()
+                _write(_dp, _rec("가") + _rec("-"))
+                _dR, _stR, _ = read_delivery()
+                for _p, _why in (
+                    ("정말 좋다 가가가가가가가가가가가가가가가가가가가가가가가가 이거 반영해줘",
+                     "1자 배달의 반복이 병합 하한을 채웠다"),
+                    ("--------------------------- 위 구분선 아래 내용을 반영해줘",
+                     "마크다운 구분선이 1자 배달의 반복으로 접혔다"),
+                    ("리뷰어 의견 정리해서 보고해줘 ------------------------ 끝",
+                     "인용 구분선이 오너 지시를 통째로 삼켰다"),
+                ):
+                    if machine_origin(_p, _dR, _stR)[0]:
+                        fails.append("★R6 ③ 미봉합(오너 오차단): %s — %r 가 기계로 접혔다. "
+                                     "병합 구간은 서로 다른 sha 2건 이상이거나 단일 레코드가 "
+                                     "하한 이상일 때만 유효하다" % (_why, _p[:40]))
+                #    ★음성 대조가 방어를 깎지 않았음을 같은 코퍼스로 증명한다:
+                #      전량 커버(concat)는 길이·동일성과 무관하므로 그대로 접힌다.
+                if not machine_origin("가" * 24, _dR, _stR)[0]:
+                    fails.append("전량 커버(프롬프트 전체가 기계 배달의 조합)가 접히지 않았다 — "
+                                 "R6 ③ 수정이 본진 규칙까지 깎았다(방어 약화)")
+                if not machine_origin("가 가 가 - 가", _dR, _stR)[0]:
+                    fails.append("공백만 사이에 둔 전량 커버가 접히지 않았다(회귀)")
+                #    단일 레코드가 하한 이상이면 종전대로 접힌다(자격 조건 ⓑ)
+                _reset_ledgers()
+                _long2 = "워커 3번이 보고한 게이트 통과 판정을 지금 즉시 반영하라"
+                _write(_dp, _rec("가") + _rec(_long2))
+                _dR2, _stR2, _ = read_delivery()
+                if not machine_origin(_long2 + " 그리고 내 코멘트", _dR2, _stR2)[0]:
+                    fails.append("하한 이상 단일 레코드의 부분 포함이 접히지 않았다(회귀)")
+                #    ★가장 긴 구간이 자격 미달이어도 **자격 있는 다음 구간**을 봐야 한다
+                if not machine_origin("가" * 40 + " 사이 오너 문장 " + _long2, _dR2, _stR2)[0]:
+                    fails.append("자격 미달 구간(1자 반복 40자)이 더 길다는 이유로 자격 있는 "
+                                 "구간(하한 이상 단일 레코드)을 못 보고 통과시켰다(fail-open)")
+
+                # ── ★오너 정상 프롬프트 무차단 코퍼스 (음성 대조 · 실사용 장애 방지) ──────
+                #    "짧은 문장·마크다운·인용" 이 섞인 현실 프롬프트가, 조각 레코드가 잔뜩 쌓인
+                #    원장 앞에서도 **하나도 접히지 않아야** 한다.
+                _reset_ledgers()
+                _write(_dp, _rec_multiline(
+                    "[worker-1 완료] 게이트 통과\n"
+                    "확인\n"
+                    "네\n"
+                    "- 항목 1\n"
+                    "- 항목 2\n"
+                    "다음 단계로 진행하겠습니다\n"))
+                _dN, _stN, _ = read_delivery()
+                for _p in ("보고서 초안 만들어줘",
+                           "그거 다시 확인해줘",
+                           "## 결론\n오늘은 여기까지 정리해줘",
+                           "리뷰어가 '확인' 이라고만 답했는데 왜 그런지 캐물어봐",
+                           "- 항목 3 을 추가하고 재검토해줘",
+                           "네 그렇게 진행하고 결과 보고해줘",
+                           "다음 단계로 진행하겠습니다 라고 워커가 말했는데 근거를 대라고 해",
+                           "짧게 답해줘"):
+                    if machine_origin(_p, _dN, _stN)[0]:
+                        fails.append("★오너 오차단(실사용 장애): 정상 프롬프트 %r 가 기계로 "
+                                     "접혔다 — 조각 레코드가 쌓여도 오너 문장은 열려야 한다" % _p)
+                #    같은 원장에서 **기계 행 단독 제출**은 여전히 접힌다(방어 유지 증명)
+                for _p in ("다음 단계로 진행하겠습니다", "[worker-1 완료] 게이트 통과", "확인"):
+                    if not machine_origin(_p, _dN, _stN)[0]:
+                        fails.append("기계 배달 행 %r 가 단독 제출됐는데 접히지 않았다" % _p)
+
                 # ── ④-부수: 원장 부재도 이상징후로 드러난다(층1 근거 없음 고지) ──────────
                 _reset_ledgers()
                 if read_delivery()[1] != LEDGER_ABSENT:
@@ -1979,7 +2512,13 @@ def cmd_self_test():
           "세대 크기상한 · env 창/TTL 하한거부·상한절단 · 이상징후 대장·verdict 노출 · "
           "★R5: 창밖 배달 4종(6.1h~30일) 접기+흔적 · 창안 오탐 없음 · 연접 4배치 접기 · "
           "짧은 조각+오너문장 혼합은 미접기 · 긴 배달 부분포함 접기 · preview 앵커≠판정 · "
-          "기동표식 무해 · 원장부재 고지 · 회전 소실구간 고지)"
+          "기동표식 무해 · 원장부재 고지 · 회전 소실구간 고지 · "
+          "★R6: 이상징후 발행↔등재소↔MASTER_DIRECTIVE 1:1 · 스키마 혼재 전용코드 발행 · "
+          "전량 스큐=판독불가 · 잡음 1줄로는 잠기지 않음(가용성) · surface 신구 env 통일 · "
+          "★R6-A: 멀티라인 행 분할 제출 접기(조각 레코드) · 구 데몬 스큐 역포함 접기+하한/경계 "
+          "음성대조 · units==1 미적용 · CAP33/40/64 연접 접기 · 예산소진=접기(fail-closed) · "
+          "1자 배달 반복으로는 substr 불성립(오너 구분선·반복문 무차단) · 전량커버는 그대로 접기 · "
+          "자격 미달 구간 뒤의 자격 구간 탐지 · 오너 정상 프롬프트 무차단 코퍼스 8종)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 
