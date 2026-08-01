@@ -166,6 +166,29 @@ fi
 echo "== runtime/git dedup (git-core 빌트인 → 동일 디렉토리 git 심볼릭링크) =="
 bash scripts/dedup-git-core.sh "$APP"
 
+# ── 잔여 역참조 심볼릭링크 전량 복원 (같은 upstream #13219 결함의 나머지 피해 부위) ──
+# ★위 dedup은 "git-core/git 과 바이트동일"인 142개만 되돌린다. 소스 트리의 심볼릭링크는 157개이고,
+#   나머지 15개는 그 기준에 안 걸려 **실복사본인 채로 출하돼 왔다**(회귀 아님 — 0.13.18·0.14.9 동일 파손).
+#   그중 node/bin/{npm,npx,corepack} 은 용량이 아니라 **기능 파손**이다: 링크 대신 런처 스크립트가
+#   bin/ 에 복사되는 바람에 내부 `require('../lib/cli.js')` 가 realpath 가 아닌 복사 위치 기준으로 풀려
+#   MODULE_NOT_FOUND 로 죽는다 → src/lib.rs:197·:827 이 PATH 에 얹는 앱 안의 모든 npm/npx 호출 불능.
+#   ★반드시 이 자리(=.app 생성 후 · 아래 재봉인 전)여야 한다 — 서명 전이어야 복원된 링크가 봉인에
+#   포함되고, 서명 뒤에 손대면 봉인이 깨져 Gatekeeper 가 앱을 차단한다(dedup 과 완전히 같은 이유).
+#   dedup 뒤에 두는 이유: dedup 이 자기 잔존-중복 가드를 원래 트리 상태에서 판정하게 두고, 이 단계는
+#   그 위에서 '소스 심볼릭링크 전량 = .app 링크' 를 fail-closed 로 마무리하는 상위집합 안전망이 된다.
+#   로직·게이트·자가검증은 scripts/restore-runtime-symlinks.sh 단일 출처(CI 도 이 스크립트를 탄다).
+echo "== runtime 역참조 심볼릭링크 복원 (node/bin/npm·npx·corepack 기능 복구 포함) =="
+bash scripts/restore-runtime-symlinks.sh "$APP" src-tauri/runtime
+
+# SEAL-2 무회귀 재확인: 위 두 단계(dedup·링크복원)가 Resources 를 건드렸으므로, 선컴파일 `.pyc` 반입
+# 개수가 그대로인지 **서명 직전에** 다시 못박는다. 복원 대상은 소스가 심볼릭링크인 경로뿐이라 `.pyc`
+# 와 겹칠 수 없지만, 이 불변식은 사고 재발 비용이 커서(2026-08-01 "손상되었기 때문에 열 수 없습니다")
+# 값싼 재확인을 남긴다 — 여기서 줄면 봉인이 사용자 머신에서 스스로 깨진다.
+APP_PYC2=$({ find "$APP/Contents/Resources/runtime" -name '*.pyc' 2>/dev/null || true; } | wc -l | tr -d ' ')
+[ "$APP_PYC2" = "$SRC_PYC" ] || {
+  echo "  ✗ dedup·링크복원 후 .pyc 개수 변동: ${SRC_PYC} → ${APP_PYC2} (봉인 무회귀 위반)" >&2; exit 1; }
+echo "  ✓ SEAL-2 무회귀: .pyc ${APP_PYC2}개 유지 (dedup·링크복원이 선컴파일 봉인을 건드리지 않음)"
+
 # dedup은 Resources를 바꿔 Tauri가 봉인한 외부 앱 서명을 깬다 → 외부 앱 서명만 재봉인(--force · ★--deep 금지).
 # 중첩 Mach-O(pre-sign된 runtime bin/git·Tauri가 서명한 sidecar/framework/메인바이너리)는 그대로 유효하다.
 echo "== dedup 후 외부 앱 서명 재봉인 (inside-out 유지·--deep 금지) =="
