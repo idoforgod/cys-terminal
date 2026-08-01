@@ -335,7 +335,7 @@ OUT OF SCOPE를 상대로 우리가 가진 것은 차단이 아니라 **흔적**
        500은 **여유 10%가 아니라 이미 초과 상태**였고, `launch-agent`·`reinject`·`cycle`마다
        약 200행이 원장에서 조용히 빠지고 있었다.
      · **봉합 ①(상한 상향 · 실측 근거)** `MAX_PARTS` 500 → **4000**. 실측 최대(699)의 5.7배이며,
-       초과분 1건의 원장 비용은 4000 × ~297 B ≈ 1.3 MB로 `LEDGER_MAX_BYTES`(8 MiB)의 15%다
+       초과분 1건의 원장 비용은 4000 × ~297 B ≈ 1.2 MB로 `LEDGER_MAX_BYTES`(8 MiB)의 14%다
        (초장문 push 한 번이 원장을 통째로 밀어내지 못한다). **거리는 테스트가 지킨다** —
        `delivery.rs::deployed_directive_payload_fits_part_cap_with_headroom`이 합성 문안의 실제
        제출단위를 재서 상한 대비 여유가 4배 미만이면 실패한다(문안이 커지면 잡힌다).
