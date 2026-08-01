@@ -659,7 +659,7 @@
       "path": "skills/voice-clone-elevenlabs-synth-qc/SKILL.md"
     },
     {
-      "description": "텍스트를 100% 온디바이스 로컬 TTS로 합성하는 대표 스킬 — 종량제 API 0(오너 \"Max 구독제만·종량제 금지\" 절대제약 부합). 엔진을 필요(한국어·클로닝·CPU·표현)별로 선택, 무제한 길이 문장경계 청킹+크로스페이드, TTS 아티팩트 trim, 경계 음질 QC, 후처리는 audio-post로 위임. voice-clone-elevenlabs(종량제 API)의 로컬 대체. \"로컬 음성 합성 / 온디바이스 tts / 종량제 없이 나레이션 / 한국어 음성 / 로컬 보이스 클론 / voice-local\" 트리거. ★기본 음성 라우팅 절체는 오너 결정(ESCALATE).",
+      "description": "텍스트를 100% 온디바이스 로컬 TTS로 합성하는 대표 스킬 — 종량제 API 0(기본 제약 \"구독제만·종량제 금지\" 부합). 엔진을 필요(한국어·클로닝·CPU·표현)별로 선택, 무제한 길이 문장경계 청킹+크로스페이드, TTS 아티팩트 trim, 경계 음질 QC, 후처리는 audio-post로 위임. voice-clone-elevenlabs(종량제 API)의 로컬 대체. \"로컬 음성 합성 / 온디바이스 tts / 종량제 없이 나레이션 / 한국어 음성 / 로컬 보이스 클론 / voice-local\" 트리거. ★기본 음성 라우팅 절체는 오너 결정(ESCALATE).",
       "id": "skill:voice-local",
       "kind": "skill",
       "name": "voice-local",

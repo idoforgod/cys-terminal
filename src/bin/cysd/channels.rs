@@ -1458,6 +1458,14 @@ fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
     let Some(surface) = daemon.get_surface(sid) else {
         return false;
     };
+    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
+    crate::delivery::record(
+        &daemon.socket_path,
+        sid,
+        envelope,
+        crate::delivery::Origin::Channel,
+        None,
+    );
     surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {

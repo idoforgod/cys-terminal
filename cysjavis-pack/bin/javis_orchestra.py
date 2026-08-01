@@ -50,7 +50,8 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
   gate-status  --task T [--round N]           자율주행(앵커6 축1) 게이트 4자 수렴 결정론 판정:
                                 해당 라운드에 gemini·codex·master·machine 4평가자의 승인
                                 (PASS/수렴/approve/ok/green 접두) 기록이 전부 있어야 CONVERGED.
-                                exit 0=수렴(다음 단계 자동 착수 가) / 1=미수렴(사유 출력).
+                                exit 0=수렴+임무 있음(다음 단계 자동 착수 가) / 1=미수렴 /
+                                2=정직한 SKIP / **4=수렴했으나 오너 임무 미지정(자동 착수 금지)**.
   next-action                   자율주행(앵커6 축3) 다음 액션 결정론 추출: pack/round/
                                 SESSION_STATE.md '## 다음 액션' 섹션의 첫 미완 항목을 출력.
                                 ★임무 게이트(T1 2026-08-01): 큐에 항목이 있어도 **이 세션에
@@ -1602,6 +1603,13 @@ def gate_verdicts(rows, rnd):
     return out
 
 
+# gate-status exit 계약(결정론 환원 — 소비자는 이 코드만 본다):
+#   0=수렴+임무 있음(자동 착수 가) · 1=미수렴 · 2=정직한 SKIP · 4=수렴했으나 임무 미지정(정지).
+# ★4를 3이 아닌 값으로 둔 이유: 3은 `next-action` 이 이미 '임무 미지정'에 쓰고 있어, 같은 숫자를
+#   다른 도구가 다른 의미로 쓰면 소비자 분기가 섞인다. 4는 이 도구에서 미사용이었다.
+GATE_EXIT_NO_MISSION = 4
+
+
 def cmd_gate_status(args):
     p = round_path(args.task)
     if not os.path.exists(p):
@@ -1647,15 +1655,22 @@ def cmd_gate_status(args):
                   "갱신 요건(축1)을 이행했는지 확인하라.", file=sys.stderr)
     except OSError:
         pass
-    print("종합: GATE CONVERGED — 4자 수렴. 커밋+SESSION_STATE 갱신 후 다음 로드맵 단계를 "
-          "자동 착수하라(앵커6 축1 — denylist 해당 시에만 정지).")
     # ★T1(2026-08-01 실사고): 축1도 임무 게이트가 선행 조건이다 — 수렴은 '이 산출물이 통과했다'는
     #   뜻이지 '지금 달려도 된다'는 뜻이 아니다. 오너 임무가 없으면 여기서도 멈추고 보고한다.
+    # ★적발 (c) 수리(2026-08-01 R2): 종전엔 임무 미지정을 감지하고도 **exit 0**(=CONVERGED)을
+    #   냈다. 자연어 경고는 게이트가 아니다 — 소비자는 exit code 만 본다(결정론 환원 원칙).
+    #   그래서 별도 exit 코드로 분기한다:
+    #     0 = 수렴 + 임무 있음 → 자동 착수 가
+    #     4 = **수렴했으나 임무 미지정** → 수렴 사실만 보고하고 정지(자동 착수 금지)
+    #   1(미수렴)·2(정직한 SKIP)와 구분되므로 "왜 멈췄는가"가 exit 하나로 읽힌다.
     _mrc, _mv = _mission_gate()
     if _mrc != 0:
-        print("주의: 이 세션에 오너 임무 지정이 없다(%s) — 수렴했더라도 **자동 착수는 금지**다"
-              "(§0-C 임무 게이트). 수렴 사실만 보고하고 오너 지시를 기다려라." % _mv.get("reason"),
-              file=sys.stderr)
+        print("종합: 수렴했으나 **임무 미지정 — 자동 착수 금지**(exit 4). 수렴 사실만 오너에게 "
+              "보고하고 지시를 기다려라(§0-C 임무 게이트).")
+        print("[gate-status] 임무 게이트 미통과: %s" % _mv.get("reason"), file=sys.stderr)
+        return GATE_EXIT_NO_MISSION
+    print("종합: GATE CONVERGED — 4자 수렴. 커밋+SESSION_STATE 갱신 후 다음 로드맵 단계를 "
+          "자동 착수하라(앵커6 축1 — denylist 해당 시에만 정지).")
     # (RSI 자율추천 ii) 종료 게이트 — slow 작업 수렴(종료) 시 '더 나은 방법' 학습 1회 추천
     # (추천만·사람 승인·directive §4). gate-status는 폴링되므로 (task,round)당 1회 마커로 스팸 차단.
     _recommend_learn_once("gate", "%s R%d 종료 — 더 나은 방법론" % (args.task, rnd),
@@ -1780,9 +1795,14 @@ def cmd_next_action(args):
         print("대기 중인 작업 %d건이 있습니다. 이어서 하시겠습니까? (첫 항목: %s)" % (n, item))
         print("[next-action] 임무 미지정 — 자율 착수 금지(exit 3). 사유: %s"
               % mv.get("reason"), file=sys.stderr)
+        # ★적발 (b) 수리(2026-08-01 R2): 이 안내문의 유일한 독자는 **방금 차단당한 master 본인**
+        #   이다. 여기에 `javis_mission.py set` 을 적어 두면 게이트가 자기 우회법을 가르치는 것이
+        #   된다(그 명령은 이제 `cys feed push --wait` 오너 승인에 결박됐지만, 안내 자체를 두면
+        #   "일단 쳐 보라"는 유인이 남는다). 해제 경로는 **오너 채널 하나**로만 안내한다.
         print("  이 큐는 이전 세션의 잔무다. **보고 대상이지 자동 착수 대상이 아니다.**\n"
-              "  해제: 오너가 이 세션에 임무를 지정하면 훅이 자동 기록한다(구두 지시는 "
-              "`javis_mission.py set \"<임무>\"`).", file=sys.stderr)
+              "  지금 할 일: 위 stdout 한 줄을 오너에게 그대로 보고하고 **멈춘다**.\n"
+              "  해제는 오너가 이 세션에 임무를 말할 때만 일어난다(UserPromptSubmit 훅이 자동 기록).",
+              file=sys.stderr)
         return 3
     print(item)
     return 0

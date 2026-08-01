@@ -43,9 +43,12 @@ python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" next-action   
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_mission.py" status                       # ★임무 게이트 — 이 세션에 오너 임무가 있는가 (0=있음 / 1=없음 / 2=판독불가=없음 취급)
 cys schedule add --id wake --in 20m --text "[wakeup] 다음 액션 착수" --to master  # 자율주행 자기 웨이크업 (원샷·자동삭제)
 cys launch-agent --role worker --agent claude   # 노드 개별 기동(지침 자동 주입)
-cys send --to master "..."                      # 역할 주소로 push (타이핑만)
+cys send --to master "[라벨] ..."               # 역할 주소로 push (타이핑만) · ★본문은 `[라벨] ` 로 시작
 cys send-key --to master Return                 # 전송 확정 (send 후 필수)
-cys send --queued --to worker "..."             # 대상이 조용할 때 자동 Return 배달 (send-key 불필요·타이핑 가드 안전)
+cys send --queued --to worker "[라벨] ..."      # 대상이 조용할 때 자동 Return 배달 (send-key 불필요·타이핑 가드 안전)
+# ★라벨을 붙이는 이유: 라벨 없는 push 는 수신 노드의 임무 게이트에서 '오너가 직접 친 문장'과
+#   in-band 로 구별되지 않는다(2026-08-01 사고 기제). 1차 방어는 데몬의 배달 원장이고
+#   라벨은 원장이 없을 때의 2차 방어다 — 둘 다 있어야 심층 방어가 성립한다.
 cys status --json                               # 전 노드 1콜 스냅샷 (주기적 능동 점검·폴링 대체)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py"   # 진행% 결정론 산출 (5분 주기 주인님 보고)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_route.py" --request "<요청>"  # 3단 사고 라우팅 (slow>deliberate>fast)

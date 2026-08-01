@@ -106,7 +106,7 @@ def _voice_mode():
     """TTS 라우팅 판정 — 'vm'(voice-jarvis 경유)|'plain'(say 직접)|'text'(발화 불가·텍스트만).
 
     에코 루프 방어(2026-07-03 실기 결함의 재발 방지): 음성 노드가 청취 중일 때 briefing이
-    독자적으로 say를 부르면 자비스 발화가 박사님 발화로 오인·재주입된다. 노드 가동 중이면
+    독자적으로 say를 부르면 자비스 발화가 오너 발화로 오인·재주입된다. 노드 가동 중이면
     반드시 voice_mcp.tool_speak(화자잠금+speak_start 로그=노드의 에코 방어 원천) 경유.
     테스트 주입: JAVIS_BRIEFING_VOICE_MODE=vm|plain|text
     """

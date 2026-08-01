@@ -2674,6 +2674,19 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             let Some(text) = q.front().cloned() else {
                 continue;
             };
+            // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 사고 경로
+            //   `cys send --queued --to master "…"` 는 enqueue 시점에 조기 반환하므로 **여기가
+            //   유일한 주입 지점**이다. 임계영역(pending_queue 락) 안인 이유: 락 밖에서 미리
+            //   기록하면 "A 를 기록하고 B 를 배달"하는 창이 열려 배달분이 원장에 없을 수 있다
+            //   (= 게이트 개방 = 치명). 레코드는 수백 바이트 append 라 락 보유는 순간이고,
+            //   블로킹 PTY write 는 여전히 writer 스레드가 한다(watchdog 무정지).
+            crate::delivery::record(
+                &daemon.socket_path,
+                s.id,
+                &text,
+                crate::delivery::Origin::Queue,
+                None,
+            );
             let req = crate::state::WriteReq::Inject {
                 text: text.clone(),
                 cr_delay_ms: 400,

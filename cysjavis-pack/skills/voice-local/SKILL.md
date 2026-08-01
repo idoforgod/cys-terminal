@@ -1,11 +1,11 @@
 ---
 name: voice-local
-description: 텍스트를 100% 온디바이스 로컬 TTS로 합성하는 대표 스킬 — 종량제 API 0(오너 "Max 구독제만·종량제 금지" 절대제약 부합). 엔진을 필요(한국어·클로닝·CPU·표현)별로 선택, 무제한 길이 문장경계 청킹+크로스페이드, TTS 아티팩트 trim, 경계 음질 QC, 후처리는 audio-post로 위임. voice-clone-elevenlabs(종량제 API)의 로컬 대체. "로컬 음성 합성 / 온디바이스 tts / 종량제 없이 나레이션 / 한국어 음성 / 로컬 보이스 클론 / voice-local" 트리거. ★기본 음성 라우팅 절체는 오너 결정(ESCALATE).
+description: 텍스트를 100% 온디바이스 로컬 TTS로 합성하는 대표 스킬 — 종량제 API 0(기본 제약 "구독제만·종량제 금지" 부합). 엔진을 필요(한국어·클로닝·CPU·표현)별로 선택, 무제한 길이 문장경계 청킹+크로스페이드, TTS 아티팩트 trim, 경계 음질 QC, 후처리는 audio-post로 위임. voice-clone-elevenlabs(종량제 API)의 로컬 대체. "로컬 음성 합성 / 온디바이스 tts / 종량제 없이 나레이션 / 한국어 음성 / 로컬 보이스 클론 / voice-local" 트리거. ★기본 음성 라우팅 절체는 오너 결정(ESCALATE).
 ---
 
 # voice-local
 
-텍스트를 **클라우드 없이, 사용량 과금 없이** 음성으로 합성한다. 오너 절대제약(Max 구독제만·종량제
+텍스트를 **클라우드 없이, 사용량 과금 없이** 음성으로 합성한다. 기본 제약(구독제만·종량제
 API 금지)을 음성 영역에서 충족하는 유일한 길 — 모델·음성·텍스트가 기기를 떠나지 않는다. 설계 DNA는
 Voicebox(MIT, github.com/jamiepine/voicebox)의 검증된 로컬 음성 스택에서 채택했다(전수조사
 [[voicebox-upgrade-research]], 보고서 `_research/Voicebox_박사급_연구보고서.md`).
@@ -68,7 +68,7 @@ Voicebox(MIT, github.com/jamiepine/voicebox)의 검증된 로컬 음성 스택�
 
 ## 경계 (ESCALATE — 자율 실행 금지)
 
-- **기본 음성 라우팅 절체**(오너 설교/목회·콘텐츠의 기본 음성을 ElevenLabs→voice-local로 전환)는
+- **기본 음성 라우팅 절체**(오너 상시 콘텐츠의 기본 음성을 ElevenLabs→voice-local로 전환)는
   **오너 결정**이다([[feedback_owner-claude-max-no-api]] 'pending owner decision'). 이 스킬은 *역량*만
   제공한다 — 기본 전환은 오너 승인 후.
 - **한국어 품질 정량 측정**(오너 실제 음성으로 Sohee/Chatterbox 클론 품질)은 후속 PoC(연구보고서

@@ -11,7 +11,7 @@ korean-patent-search · korean-stock-search · daishin-report-search · library-
 
 주의: kosis-stats·korean-stock-search·library-book-search 기본 경로는 운영자 프록시
 (`k-skill-proxy.nomadamas.org`) 경유다 — `KSKILL_PROXY_BASE_URL`로 자가 호스팅 전환 가능,
-kosis는 BYOK 직접 경로 지원. (korean-law-search·naver-news-search는 오너 결정으로 미채택 —
+kosis는 BYOK 직접 경로 지원. (korean-law-search·naver-news-search는 미채택 —
 법령은 전용 MCP로 대체 예정.)
 
 ## MIT License (NomaDamas/k-skill)
@@ -56,7 +56,7 @@ test-pressure-*·test-academic*)은 제외. hook·부트스트랩 메타 스킬(
 채택 기준: 2026-06-12 감사 — A급 1(git-guardrails-claude-code: denylist의 PreToolUse hook
 기계화) + B급 5(grill-with-docs·prototype·improve-codebase-architecture·zoom-out·handoff) +
 집필 3부작(writing-fragments·writing-beats·writing-shape — 업스트림 in-progress 단계,
-오너 결정으로 채택·자체 보강 예정). grill-me는 본 pack의 상위판(work 앵커 제작)이 이미
+채택·자체 보강 예정). grill-me는 본 pack의 상위판(work 앵커 제작)이 이미
 존재해 업스트림판을 덮지 않는다. tdd·diagnose는 superpowers 채택분과 중복이라 불채택.
 
 ## 설계 차용 (코드 미벤더링) — Voicebox (MIT License, Copyright (c) 2026 Voicebox Contributors)

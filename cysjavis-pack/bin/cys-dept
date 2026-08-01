@@ -748,7 +748,7 @@ acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
 print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expandvars(dep['cwd'])]))
 PY
 ) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
-    # 부서별 config dir 분리(오너 결정): primary(공유) 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
+    # 부서별 config dir 분리(제품 기본 절차): primary(공유) 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
     # primary 계정 키는 env CYS_PRIMARY_ACCOUNT로 외부화(기본 'owner')·오너는 자기 primary 핸들 값으로 설정하면 동일 동작 유지.
     # Max 계정 토큰은 macOS Keychain(계정단위)으로 공유 유지·dir만 분리. 단독 계정(부서 1개)은 이미 단독이라 불변.
     if [ "$acctkey" = "${CYS_PRIMARY_ACCOUNT:-owner}" ]; then acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"; fi

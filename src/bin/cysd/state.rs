@@ -2376,7 +2376,9 @@ fn clear_settle_ms() -> u64 {
         .unwrap_or(150)
 }
 
-fn run_writer_loop<W: Write>(
+/// (테스트 가시성) `delivery` 모듈의 race 봉쇄 실증이 이 루프를 직접 구동한다 —
+/// "원장 기록이 PTY write 보다 앞선다"는 불변식은 **실제 writer 루프**로만 증명된다.
+pub(crate) fn run_writer_loop<W: Write>(
     mut writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
     stop: Arc<AtomicBool>,

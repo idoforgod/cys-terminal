@@ -743,14 +743,29 @@ _LANE_STATE_KINDS = {
     #   상태. 소유자는 `javis_mission.py`(판정)이고 **경로 규약만** 여기서 발급한다(사본 금지).
     #   레인별인 이유: 부서 레인의 오너 임무가 base master 의 자율 착수 권한이 되면 안 된다.
     "mission": (_STATE, "mission", ".json"),
+    # ★R1(2026-08-01 배달 원장): **데몬(cysd)이 쓰고 훅이 읽는** out-of-band 채널.
+    #   - delivery       : pane stdin 주입 직전의 append-only 원장(JSONL) — '이 문장은 기계가
+    #                      밀어 넣은 것'의 증거. 문자열 라벨(발신자가 고를 수 있는 값)에
+    #                      의존하던 기계/오너 판별을 대체한다.
+    #   - delivery_epoch : 데몬 인스턴스 표식 — 임무의 **세션 결박**(과거 임무 무기한 유효 차단).
+    #   ★둘 다 **항상 레인 접미**다(base 도 `delivery-base.jsonl`). 역사적 무접미 경로가 없어
+    #     base 예외를 둘 이유가 없고, 접미가 항상 있으면 파일명만으로 레인이 결정론이다.
+    #   ★생산자는 Rust `src/bin/cysd/delivery.rs`(ledger_path/epoch_path) — 경로 규약이 갈리면
+    #     원장이 **조용히** 무력화되므로 양쪽에 교차 테스트를 둔다.
+    "delivery": (_STATE, "delivery", ".jsonl"),
+    "delivery_epoch": (_STATE, "delivery", ".epoch.json"),
 }
+
+# 항상 레인 접미가 붙는 종류(base 예외 없음) — 위 주석의 규약을 코드로 고정한다.
+_ALWAYS_LANE_SUFFIXED = ("skip", "lock", "delivery", "delivery_epoch")
 
 
 def lane_state_path(kind, sock=None):
-    """레인 스코프 상태 파일 경로. kind ∈ marker|boot_last|skip|lock|mission.
+    """레인 스코프 상태 파일 경로.
+    kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch.
     base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
     비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
-    ※ skip·lock 은 종전부터 레인별이었다 — 규약을 이 함수 하나로 모은다(사본 3벌 제거)."""
+    ※ skip·lock·delivery* 는 **항상** 레인별이다 — 규약을 이 함수 하나로 모은다(사본 금지)."""
     try:
         base_dir, stem, ext = _LANE_STATE_KINDS[kind]
     except KeyError:
@@ -758,7 +773,7 @@ def lane_state_path(kind, sock=None):
     if base_dir == _STATE:                       # 지연 해소(위 주석) — 호출 시점의 env 를 본다
         base_dir = state_dir()
     key = lane_key(sock)
-    if kind in ("skip", "lock"):
+    if kind in _ALWAYS_LANE_SUFFIXED:
         return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))   # 항상 레인별(구 동작 보존)
     if key == "base":
         return os.path.join(base_dir, stem + ext)
@@ -1919,6 +1934,16 @@ def cmd_self_test():
         # ⓒ skip·lock 은 base 에서도 레인 접미(구 동작 보존)
         assert lane_state_path("lock", _base_sock).endswith("bootstrap-base.lock"), "base 락 경로 변경"
         assert lane_state_path("skip", _base_sock).endswith("boot-skip-base.json"), "base skip 경로 변경"
+        # ⓓ ★R1 배달 원장 — Rust 생산자(src/bin/cysd/delivery.rs)와 **파일명이 정확히** 같아야
+        #    한다. 갈리면 훅이 빈 원장을 읽어 기계 push 를 오너 임무로 기록한다(사고 재현).
+        assert lane_state_path("delivery", _base_sock).endswith("delivery-base.jsonl"), \
+            "배달 원장 base 파일명 규약 이탈(cysd delivery::ledger_path 와 불일치)"
+        assert lane_state_path("delivery_epoch", _base_sock).endswith("delivery-base.epoch.json"), \
+            "데몬 표식 base 파일명 규약 이탈(cysd delivery::epoch_path 와 불일치)"
+        assert lane_state_path("delivery", _dept_sock) != lane_state_path("delivery", _base_sock), \
+            "부서 레인 배달 원장이 base 와 섞인다(교차 레인 오판)"
+        assert os.path.dirname(lane_state_path("delivery", _base_sock)) == state_dir(), \
+            "배달 원장이 팩 계약 상태 디렉터리(CYS_STATE_DIR‖~/.cys/state) 밖에 있다"
         try:
             lane_state_path("nope")
             raise AssertionError("미지 상태 종류가 조용히 통과(오타가 새 파일을 만든다)")

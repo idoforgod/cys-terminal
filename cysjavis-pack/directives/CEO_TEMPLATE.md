@@ -19,10 +19,13 @@
 ## [지시 — CEO → 부서장]
 
 ```bash
-cys --socket <부서>.sock send --to master "<지시>"
+# ★본문은 반드시 `[라벨] ` 로 시작한다 — 라벨 없는 push 는 수신 노드의 임무 게이트에서
+#   '오너가 직접 친 문장'과 in-band 로 구별되지 않는다(2026-08-01 사고 기제).
+#   1차 방어는 데몬의 배달 원장이지만, 라벨은 원장이 없을 때의 2차 방어다.
+cys --socket <부서>.sock send --to master "[CEO 지시] <지시>"
 cys --socket <부서>.sock send-key --to master Return
 # 부서장이 조용하면:
-cys --socket <부서>.sock send --queued --to master "<지시>"
+cys --socket <부서>.sock send --queued --to master "[CEO 지시] <지시>"
 ```
 
 ## [보고 — 부서장 → CEO]

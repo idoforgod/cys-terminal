@@ -652,6 +652,13 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
             .ok_or("push job missing 'text' or 'text_command'")?
             .to_string()
     };
+    // ★R1 심층 방어(원장과 **독립인 2층**): 스케줄 push 는 정의상 기계 유래인데, 라벨 없는 문안
+    //   (`--text "다음 액션 착수"`)이 그대로 master stdin 에 꽂히면 in-band 로는 오너 입력과
+    //   구별할 수 없었다. 데몬이 발화 시점에 기계 라벨을 **강제 부착**한다 — 클라이언트가
+    //   schedule.json 을 손으로 편집해도 우회할 수 없는 자리다(`cys schedule add` 는 파일을
+    //   직접 쓰므로 CLI 검증만으로는 부족하다). 이미 라벨이 있는 문안(`[heartbeat] …`·`[wakeup] …`)
+    //   은 건드리지 않는다 = 기존 잡 무회귀.
+    let text = ensure_machine_label(&text, &job.id);
     let text = text.as_str();
 
     // fresh 모드: 살아있는 역할이 있어도 무조건 새 surface 기동 → 그 surface에 직접 주입.
@@ -723,11 +730,53 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     Ok(format!("pushed to {to} (surface:{sid})"))
 }
 
+/// 선두 라벨(`[...]`) 유무 판정 — 판독자 `javis_mission._label_head` 와 **같은 규칙**이다:
+/// 선행 공백과 투명문자(Cf: ZWSP/ZWNJ/ZWJ/BOM/word-joiner 등)를 벗긴 뒤 첫 글자가
+/// `[`(U+005B) 또는 전각 `［`(U+FF3B) 이면 라벨이다. **길이 상한은 두지 않는다** —
+/// 종전 80자 창은 그 자체가 공격 표적이었다(80자 넘는 라벨로 우회).
+///
+/// ★정직한 한계: 투명문자 집합은 python 쪽이 `unicodedata` 로 Cf **전체**를 보는 반면 여기는
+///   실사용 목록만 열거한다. 두 판정은 **독립 층**이라(여기=부착 강제 / python=수신 판별)
+///   불일치의 결과는 "이미 라벨인 문안에 라벨을 한 번 더 붙일 뻔한다" 정도이고, 그마저도
+///   양쪽 목록에 없는 희귀 Cf 로 시작하는 문안에서만 일어난다 — 안전 방향의 차이다.
+fn has_machine_label(text: &str) -> bool {
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        // Cf(format)·zero-width 류: 눈에 안 보이는 선두 문자로 라벨 판정을 비껴가는 우회 차단.
+        if matches!(ch, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{2064}' | '\u{feff}' | '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{2066}'..='\u{2069}' | '\u{202a}'..='\u{202e}')
+        {
+            continue;
+        }
+        return ch == '[' || ch == '\u{ff3b}';
+    }
+    false
+}
+
+/// 라벨이 없으면 `[schedule <job-id>] ` 을 앞에 붙인다(실물 라벨 규약 `[wakeup <W-id>]` 와 동형).
+fn ensure_machine_label(text: &str, job_id: &str) -> String {
+    if has_machine_label(text) {
+        return text.to_string();
+    }
+    format!("[schedule {job_id}] {text}")
+}
+
 /// 살아있는 세션의 stdin에 과업을 주입 (bracketed paste + Return).
 /// 전체 시퀀스가 writer 스레드의 단일 Inject 항목으로 직렬화돼
 /// 동시 발화·동시 배달과 섞이지 않는다 (메시지 병합·오염 차단).
 fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
     let surface = daemon.get_surface(sid).ok_or("surface gone")?;
+    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 자기 예약 wake
+    //   (`cys schedule add --text "[wakeup] 다음 액션 착수" --to master`)가 시간이 지나
+    //   stdin 으로 돌아오는 경로가 바로 여기다.
+    crate::delivery::record(
+        &daemon.socket_path,
+        sid,
+        text,
+        crate::delivery::Origin::Schedule,
+        None,
+    );
     surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {
@@ -1024,6 +1073,32 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// ★R1 심층 방어 층3: schedule push 는 정의상 기계 유래 — 라벨 없는 문안이 master stdin 에
+    /// 그대로 꽂히면 in-band 구별이 불가능했다(라운드1 검증자 임시 완화 ①). 데몬이 발화 시점에
+    /// 강제 부착하며, 이미 라벨이 있으면 무접촉(기존 built-in 잡 무회귀).
+    #[test]
+    fn schedule_push_forces_machine_label_without_touching_labeled_text() {
+        // 라벨 없음 → 강제 부착
+        assert_eq!(
+            ensure_machine_label("다음 액션 착수", "self-wake"),
+            "[schedule self-wake] 다음 액션 착수"
+        );
+        // 이미 라벨 있음 → 무접촉(built-in `[heartbeat] …`·`[wakeup] …` 무회귀)
+        for t in [
+            "[heartbeat] 일일 환경스캐닝을 시작하라",
+            "[wakeup W-3f2a1c] task=next-action",
+            "  [wakeup] 다음 액션 착수",             // 선행 공백
+            "［전각］ 라벨",                          // 전각 대괄호도 라벨이다
+            "\u{200b}[zwsp] 라벨",                    // 투명문자 선행
+            "[여러 줄\n라벨] 본문",                   // 라벨 안 개행 — 종전 정규식이 놓치던 우회
+            &format!("[{}] 본문", "긴".repeat(100)), // 80자 초과 — 종전 상한 우회
+        ] {
+            assert_eq!(ensure_machine_label(t, "j"), t, "라벨 있는 문안을 건드렸다: {t:?}");
+        }
+        // 선두 비공백 우회(라벨이 문두가 아님) → 라벨 없음으로 판정해 부착
+        assert!(ensure_machine_label("x [wakeup] 다음 액션", "j").starts_with("[schedule j] "));
+    }
 
     /// 테스트 전용 격리 데몬 — 고유 하위 디렉터리에 소켓을 둬 병렬 실행 시 상태가 섞이지 않게 한다.
     fn test_daemon() -> Arc<Daemon> {

@@ -161,8 +161,10 @@ def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=No
     #   지정했는가"로 갈린다 — 임무가 없으면 관측·기록만 하고 노드를 띄우지 않는다.
     #   이 하네스가 재는 것은 **감지·게이트 배선**(A2·A4·A3=B7·G9·G25)이고 그 계약은
     #   '선언을 감지하면 발화한다'이므로, 발화가 계약인 조건 = 임무 지정 세션을 명시 주입한다
-    #   (실재 수단: `javis_mission.gate()` ①번 신호 `CYS_MISSION` — launch-agent 기동 시점
-    #   지정과 동일 경로). 상속에 기대면 실행 위치에 따라 결과가 흔들린다(결정론 파괴).
+    #   (실재 수단: `javis_mission.gate()` ①번 신호 `CYS_MISSION`).
+    #   ★정정(2026-08-01 R2 적발 (d)): 이 변수를 자동으로 채우는 launcher 는 **없다** — pane env 는
+    #   데몬 프로세스 env 를 상속하므로 `cys launch-agent` 호출 시점의 값은 전달되지 않는다.
+    #   여기서는 하네스가 직접 주입한다. 상속에 기대면 실행 위치에 따라 결과가 흔들린다(결정론 파괴).
     #   ※임무 미지정 경로(신규 사용자 · spawn 0)의 계약은 run_bootstrap_health H-MISSION-1 소속.
     env["CYS_MISSION"] = "test_role_bootstrap_hook 검체 임무(오너 지정 가정)"
     if surface_env:

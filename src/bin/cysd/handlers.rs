@@ -256,6 +256,14 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
                 "# [cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
                  (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
             );
+            // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
+            crate::delivery::record(
+                &daemon.socket_path,
+                prev_sid,
+                &text,
+                crate::delivery::Origin::SeatTakeover,
+                None,
+            );
             // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
             // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
             let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
@@ -918,6 +926,14 @@ fn deliver_to_ceo(
         return CeoDelivery::SeatEmpty;
     }
     let text = build_ceo_injection(item, over_pressure);
+    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). CEO 자동 라우팅은 100% 기계 유래다.
+    crate::delivery::record(
+        &daemon.socket_path,
+        sid,
+        &text,
+        crate::delivery::Origin::Feed,
+        item.publisher_surface,
+    );
     let req = crate::state::WriteReq::Inject {
         text,
         cr_delay_ms: 500,
@@ -1454,6 +1470,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 }
+            }
+            // ★R1 배달 원장 — **주입보다 반드시 앞**(delivery.rs 불변식 ①). try_write 는 writer
+            //   채널로 넘기고 실제 PTY 쓰기는 writer 스레드가 하므로, 여기서 기록하면
+            //   기록 → try_send → 수신 → write 순서가 구조적으로 보장된다.
+            //   ★human 은 기록하지 않는다(불변식 ②): 오너가 GUI 로 친 문장이 원장에 남으면
+            //     자기 해시와 매치돼 **오너 임무가 기계로 접힌다** = 온보딩 전면 사망.
+            //   ★clear_first 여부(Inject/Data 두 분기)를 가리지 않는다 — 사고 경로인
+            //     `cys send --to master "다음 액션 착수"` 는 Data 분기다(clear_first 없음).
+            if !human {
+                let from_sid = verified_from.or_else(|| {
+                    params
+                        .get("from")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| params.get("from").and_then(|v| v.as_str()).and_then(|s| {
+                            s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
+                        }))
+                });
+                crate::delivery::record(
+                    &daemon.socket_path,
+                    sid,
+                    &text,
+                    crate::delivery::Origin::Send,
+                    from_sid,
+                );
             }
             // clear_first면 원자 Inject(Ctrl-U 선정리 → paste → CR 제출)로, 아니면 현행 Data(원시
             // 바이트, 제출은 별도 send_key Return)로. 단일 try_send이라 부분 전달(clear만 들어가고
@@ -4829,6 +4869,85 @@ mod tests {
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★R1 배달 원장 — send_text 전 경로 커버리지(사고 경로 그대로) + 사람 입력 무기록.
+    ///
+    /// 적발 인계 ②: `cys send --to master "…"` 는 `clear_first` 없이 **Data 분기**를 탄다.
+    /// 원장을 Inject 사이트에만 걸면 정작 사고 경로가 원장에 남지 않는다. 여기서 두 분기를
+    /// 모두 dispatch 로 관통시켜 박제한다.
+    /// 인계 ③(방향 역전 금지): `human:true`(GUI 키)는 **절대 기록하지 않는다** — 오너 문장이
+    /// 자기 해시와 매치돼 기계로 접히면 온보딩이 전면 사망한다.
+    #[test]
+    fn send_text_records_machine_delivery_but_never_human_input() {
+        let _sg = crate::delivery::tests::STATE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!("cys-deliv-h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let prev_state = std::env::var("CYS_STATE_DIR").ok();
+        std::env::set_var("CYS_STATE_DIR", &td);
+
+        let (daemon, dir) = daemon_with_acl("delivery-ledger", r#"{"default":"allow","rules":[]}"#);
+        let master = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create master surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(master.id, master.clone());
+
+        // ① 라벨 없는 기계 push (Data 분기 — 사고 경로 그대로)
+        let machine = "다음 액션 착수";
+        let Reply::Single(r1) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": master.id, "text": machine}),
+            },
+            None,
+        ) else {
+            panic!("single reply");
+        };
+        assert_eq!(r1["ok"], json!(true), "전송이 성공해야 한다: {r1}");
+
+        // ② 오너가 GUI 로 친 문장 (human:true) — 원장에 남으면 안 된다
+        let owner = "T1 근본수정 진행해";
+        let Reply::Single(r2) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": master.id, "text": owner, "human": true}),
+            },
+            None,
+        ) else {
+            panic!("single reply");
+        };
+        assert_eq!(r2["ok"], json!(true), "전송이 성공해야 한다: {r2}");
+
+        let body =
+            std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).unwrap();
+        assert!(
+            body.contains(&crate::delivery::digest(machine)),
+            "라벨 없는 기계 push 가 원장에 없다 — 사고 경로가 그대로 열려 있다 (원장: {body})"
+        );
+        assert!(
+            !body.contains(&crate::delivery::digest(owner)),
+            "사람 입력(human:true)이 원장에 기록됐다 — 오너 임무가 기계로 접혀 온보딩이 사망한다"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        match prev_state {
+            Some(v) => std::env::set_var("CYS_STATE_DIR", v),
+            None => std::env::remove_var("CYS_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     /// 회귀(ACL 거부 발신의 부작용 누수 → 타이핑 가드 오염·교착):

@@ -16,6 +16,7 @@ mod channels;
 mod classifier;
 mod cost;
 mod deadman;
+mod delivery;
 mod events;
 mod governance;
 mod handlers;
@@ -238,6 +239,11 @@ async fn main() {
         }
     }
     let daemon = Daemon::new(socket_path.clone());
+    // ★R1 배달 원장: 이 데몬 인스턴스 표식을 팩 계약 상태 디렉터리에 쓴다(best-effort).
+    //   임무 대장(javis_mission)이 이 값을 **세션 결박**에 쓴다 — 데몬이 재기동하면 과거 세션의
+    //   오너 임무는 무효가 된다(적발 (a): ts 를 기록만 하고 읽지 않아 과거 임무가 무기한 유효했다).
+    //   실패해도 기동을 막지 않는다: 표식 부재는 판독자 쪽에서 'TTL 만 적용'으로 degrade 된다.
+    delivery::write_epoch(&socket_path);
 
     governance::spawn_watchdog(Arc::clone(&daemon));
     // ★B2-1(W3): built-in phoenix 잡을 부트 시 idempotent ensure — schedule.json 이 user-owned 로 전환돼
