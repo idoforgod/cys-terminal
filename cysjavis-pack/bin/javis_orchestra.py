@@ -1755,13 +1755,24 @@ def extract_next_action(text):
 
 def _mission_gate():
     """(exit_code, verdict) — 판정의 단일 소유자는 `javis_mission.gate()` 다(사본 금지).
-    모듈이 없으면 **fail-closed**: 임무 없음으로 접는다(팩 스큐가 자율주행을 열지 않는다)."""
+    모듈이 없으면 **fail-closed**: 임무 없음으로 접는다(팩 스큐가 자율주행을 열지 않는다).
+
+    ★R4 탐지 가능성(2026-08-02): verdict 의 `anomalies` 를 **판정과 무관하게 항상** stderr 로
+      흘린다. 동일 UID 의 원장 삭제·절단·창 축소 시도는 원리적으로 차단할 수 없으므로
+      (보장 범위 SOT: docs/THREAT-MODEL-mission-gate.md), 남은 무기는 흔적이 master 눈에
+      **반드시 닿는 것**이다. master 가 실제로 게이트를 보는 지점이 여기(next-action·gate-status)
+      이므로 `javis_mission status` 에만 찍고 끝내면 아무도 안 본다. 은폐는 규약 위반이다.
+    """
     try:
         import javis_mission as _m
-        return _m.gate()
+        rc, v = _m.gate()
     except Exception as e:
         return 2, {"have_mission": False, "mission": None,
                    "reason": "javis_mission 미적재(%s) — fail-closed" % e}
+    for _a in (v.get("anomalies") or []):
+        print("[mission] ★이상징후(%s): %s — 오너에게 보고하라(은폐 금지)"
+              % (_a.get("code"), _a.get("detail")), file=sys.stderr)
+    return rc, v
 
 
 def cmd_next_action(args):

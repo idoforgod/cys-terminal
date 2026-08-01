@@ -934,7 +934,7 @@ mod tests {
         assert_eq!(pb.len(), 1, "casing·후행슬래시 변형 dedup=1개: {out_b}");
         assert_eq!(pb[0], r"C:\Windows\System32\", "출력은 원문(최초 등장=process 형태) 유지: {out_b}");
 
-        // (c) ★순서보장 핀(박사님 통찰): fresh_base 에 경쟁 python(C:\Python312)이 있어도 동봉 runtime 이 항상 앞.
+        // (c) ★순서보장 핀(오너 통찰): fresh_base 에 경쟁 python(C:\Python312)이 있어도 동봉 runtime 이 항상 앞.
         let out_c = compose_pane_path(&prefixes, Some(r"C:\Python312"), &[], "", sep);
         let pc: Vec<&str> = out_c.split(sep).collect();
         let rt_idx = pc.iter().position(|&p| p == r"C:\app\runtime\python").unwrap();

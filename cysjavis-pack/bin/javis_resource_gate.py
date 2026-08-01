@@ -3,7 +3,8 @@
 
 계약(출처: _research/Paperclip_박사급_연구보고서.md §4 P0-3 · §2-7):
 - Paperclip의 진짜 런어웨이 차단 = "새 run 시작 전 라이브 재계산해 초과면 착수 거부"(사전 게이트).
-- 정액제(Claude Max)엔 달러 예산이 무력하므로 metric을 자원으로 치환:
+- 승인 패턴은 **구독제(정액) 전용·종량제 과금 금지**다. 정액 구독엔 달러 예산이라는 브레이크가
+  아예 없으므로(쓴 만큼 청구되는 축이 없다) metric을 달러가 아닌 자원으로 치환한다:
     servers  = 로컬 dev/서버 프로세스 수         (자원 거버넌스 '서버 누적' 사고 이력)
     nodes    = claude/agy/codex 노드 프로세스 수
     load     = 1분 load average / CPU 코어 수 비율
@@ -156,7 +157,7 @@ def measure(a):
             "active_depts": active_depts, "nodes_hard_effective": nodes_hard_effective}
 
 
-# ── ★opt-in rate 축(soft-only) — 정액제(Claude Max) 5h rate 사용률 사전 경고 ──
+# ── ★opt-in rate 축(soft-only) — 구독제(정액) 5h rate 사용률 사전 경고 ──
 def _rate_enabled(a):
     """rate 축은 opt-in — --rate-check 플래그 또는 env CYS_GATE_RATE=1일 때만 발화."""
     return bool(getattr(a, "rate_check", False)) or os.environ.get("CYS_GATE_RATE") == "1"

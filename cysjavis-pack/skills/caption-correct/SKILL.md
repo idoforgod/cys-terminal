@@ -32,7 +32,7 @@ javis_select rank --catalog "${CYS_PACK_DIR:-$HOME/.cys/pack}/round/video_provid
 
 - **무료·로컬 바닥**: `correct_align_local`(difflib류 시퀀스 정렬·무키·로컬·LLM 호출 0). 대본 토큰과
   ASR 토큰을 정렬해 대본 철자를 ASR 타이밍 위로 전사(轉寫)한다. 키 없이 항상 가용. **토큰 소비 0
-  — Max 구독 한도를 쓰지 않는다**(자원 거버넌스·토큰 경제).
+  — 구독 한도를 쓰지 않는다**(자원 거버넌스·토큰 경제).
 - 결정론 정렬로 애매한 동음이의만 남으면 상위 티어(LLM 보조)를 `--prefer`로 선택 가능(선택적).
 - `--free-first`로 무료 바닥 우선.
 
@@ -82,4 +82,5 @@ javis_select rank --catalog "${CYS_PACK_DIR:-$HOME/.cys/pack}/round/video_provid
 - 아키타입 매니페스트(D4) 정정 단계 success_criteria 예(닫힌 check enum만 사용):
   `{"kind":"json_valid"}` + `{"kind":"field_present","value":"segments"}` +
   `{"kind":"min_items","value":{"field":"segments","min":1}}`. 타임스탬프 불변은 video-verify가 확인.
-- cost_class=light: 로컬 결정론 정렬·LLM 무호출이 기본 — 토큰 한도 보존(Max 구독제 정합).
+- cost_class=light: 로컬 결정론 정렬·LLM 무호출이 기본 — 토큰 한도 보존(기본 제약 "구독제만·
+  종량제 금지" 정합).

@@ -2680,8 +2680,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             //   기록하면 "A 를 기록하고 B 를 배달"하는 창이 열려 배달분이 원장에 없을 수 있다
             //   (= 게이트 개방 = 치명). 레코드는 수백 바이트 append 라 락 보유는 순간이고,
             //   블로킹 PTY write 는 여전히 writer 스레드가 한다(watchdog 무정지).
-            crate::delivery::record(
-                &daemon.socket_path,
+            crate::delivery::record_audited(
+                daemon,
                 s.id,
                 &text,
                 crate::delivery::Origin::Queue,

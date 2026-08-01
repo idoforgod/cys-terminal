@@ -69,8 +69,9 @@ Voicebox(MIT, github.com/jamiepine/voicebox)의 검증된 로컬 음성 스택�
 ## 경계 (ESCALATE — 자율 실행 금지)
 
 - **기본 음성 라우팅 절체**(오너 상시 콘텐츠의 기본 음성을 ElevenLabs→voice-local로 전환)는
-  **오너 결정**이다([[feedback_owner-claude-max-no-api]] 'pending owner decision'). 이 스킬은 *역량*만
-  제공한다 — 기본 전환은 오너 승인 후.
+  **오너 결정**이다(사유: 승인 패턴이 **구독제(정액) 전용·종량제 과금 금지**라, 종량 과금되는
+  외부 음성 API를 기본 경로로 두는가가 정책 사안이다 — 상태 `pending owner decision`).
+  이 스킬은 *역량*만 제공한다 — 기본 전환은 오너 승인 후.
 - **한국어 품질 정량 측정**(오너 실제 음성으로 Sohee/Chatterbox 클론 품질)은 후속 PoC(연구보고서
   이니셔티브1). 측정 전 '검증됨' 보고 금지.
 - voice-clone-elevenlabs는 폐기하지 않고 **공존**한다(부활조건=로컬 품질 미달 시 폴백, retention gate).

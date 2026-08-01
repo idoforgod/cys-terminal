@@ -257,8 +257,8 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
                  (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
             );
             // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
-            crate::delivery::record(
-                &daemon.socket_path,
+            crate::delivery::record_audited(
+                daemon,
                 prev_sid,
                 &text,
                 crate::delivery::Origin::SeatTakeover,
@@ -453,6 +453,27 @@ fn check_caps_gate(
         "capability denied: {from_role} lacks '{}' for {path} (deny-by-default)",
         need.as_str()
     ))
+}
+
+/// ★R4 — 요청에 붙은 `operator_token` 이 **이 데몬이 기동 시 발급한 값**과 일치하는가.
+///
+/// 이것이 데몬이 "발신 주체가 오퍼레이터(사람) GUI 세션이다"를 스스로 아는 유일한 근거다
+/// (`state.rs::write_operator_token` — state_dir/operator.token · unix 0600). 붙이는 지점은
+/// Tauri 백엔드 단 한 곳이며(`src-tauri/src/main.rs`), 공용 `cys` CLI 는 어떤 경로에서도
+/// 붙이지 않는다(`grep operator_token src/bin/cys.rs` = 0건). `feed.reply` 의 §3.2 면제와
+/// **같은 메커니즘·같은 신뢰수준**이다.
+///
+/// ★정직한 한계(OUT OF SCOPE): 암호학적 방어가 아니다. 동일 UID 프로세스는 토큰 파일을 읽어
+/// 그대로 첨부할 수 있다. 이 게이트가 실제로 닫는 것은 **평시 정상 동작**(CLI·워커 push·큐
+/// 배달·schedule 발화)이 사람 입력을 사칭하는 경로이며, 의도적 위조는 차단이 아니라
+/// 감사(`delivery.operator_token_from_pane` 이벤트)로 다룬다.
+///
+/// 토큰이 없거나(구 GUI·CLI) 데몬이 토큰 발급에 실패했으면 false = **기록한다**(fail-closed).
+fn operator_token_ok(daemon: &Daemon, params: &Value) -> bool {
+    param_str(params, "operator_token")
+        .zip(daemon.operator_token.as_deref())
+        .map(|(t, d)| !d.is_empty() && t == d)
+        .unwrap_or(false)
 }
 
 /// T3-13 타이핑 가드 창 (초). 0 = 비활성.
@@ -927,8 +948,8 @@ fn deliver_to_ceo(
     }
     let text = build_ceo_injection(item, over_pressure);
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). CEO 자동 라우팅은 100% 기계 유래다.
-    crate::delivery::record(
-        &daemon.socket_path,
+    crate::delivery::record_audited(
+        daemon,
         sid,
         &text,
         crate::delivery::Origin::Feed,
@@ -1361,7 +1382,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "surface process has exited",
                 ));
             }
-            // T3-13: 사람(UI) 키 입력 신호 — 타이핑 가드 시각만 기록하고 즉시 통과
+            // T3-13: 사람(UI) 키 입력 **자기신고** — 타이핑 가드 시각만 기록하고 즉시 통과.
+            // ★이 값은 신뢰 근거가 아니다(아래 human_verified 참조).
             let human = params
                 .get("human")
                 .and_then(|v| v.as_bool())
@@ -1474,11 +1496,49 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★R1 배달 원장 — **주입보다 반드시 앞**(delivery.rs 불변식 ①). try_write 는 writer
             //   채널로 넘기고 실제 PTY 쓰기는 writer 스레드가 하므로, 여기서 기록하면
             //   기록 → try_send → 수신 → write 순서가 구조적으로 보장된다.
-            //   ★human 은 기록하지 않는다(불변식 ②): 오너가 GUI 로 친 문장이 원장에 남으면
-            //     자기 해시와 매치돼 **오너 임무가 기계로 접힌다** = 온보딩 전면 사망.
             //   ★clear_first 여부(Inject/Data 두 분기)를 가리지 않는다 — 사고 경로인
             //     `cys send --to master "다음 액션 착수"` 는 Data 분기다(clear_first 없음).
-            if !human {
+            //
+            // ★★R4 관통 봉합(라운드3 검증자 N3 실측): 종전 조건은 `if !human` 이었다. 그런데
+            //   `human` 은 **클라이언트 자기신고**라, 원시 소켓 한 줄
+            //   (`{"method":"surface.send_text","params":{...,"human":true}}`)이면 원장에 아무것도
+            //   남지 않고 → 훅이 층2 라벨 폴백으로 내려가 → 무라벨 push 가 오너 임무가 됐다.
+            //   같은 함수가 위(1379행)에서 ACL 목적으로는 이미 "human 은 위조 가능"이라 못 박고
+            //   있었다 — **같은 값을 한쪽에선 불신하고 한쪽에선 신뢰한 비대칭**이 결함의 본체다.
+            //   이제 기록 억제 근거는 데몬이 발급·보관하는 `operator.token`(0600) 뿐이다.
+            //   판정 불가는 **기록하는 쪽**(=기계 취급)이 fail-closed 다.
+            //   (충돌 지점과 어느 쪽으로 접었는지는 delivery.rs 헤더 'R4 수리' 절에 명시.)
+            //
+            // ★★R5 관통 봉합(라운드4 검증자 실측 · 신규 치명): 토큰만으로는 부족하다.
+            //   `operator_token` 이 증명하는 것은 **'사람이 앉은 GUI 세션'**이지 **'사람이 친
+            //   문장'**이 아니다. GUI 는 사용자가 자판으로 친 입력(`term.onData`)뿐 아니라
+            //   **자기가 조립한 문안**(전출 지시 전문·노드 재기동 명령·경로 삽입)도 같은
+            //   `surface.send_text` 로 보내며, R4 배선은 거기에도 토큰을 붙였다 → 무기록 →
+            //   훅이 층2 라벨 폴백 → 무라벨이라 통과 → **오너 임무로 기록**(실측 rc=0·흔적 0).
+            //   그래서 UI 가 **프로그램적으로 만든** 주입에는 `machine_origin` 표식을 달게 하고,
+            //   표식이 있으면 토큰이 유효해도 **기록**한다(origin=gui_auto 로 감사에서 구별).
+            //   ★불변식 ② 는 그대로다 — 표식 없는 실키 입력(sendRaw)은 여전히 무기록이다.
+            let machine_origin = params
+                .get("machine_origin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let human_verified = human && !machine_origin && operator_token_ok(daemon, &params);
+            if human_verified && verified_from.is_some() {
+                // 오퍼레이터 토큰이 **pane 에서** 왔다. GUI(Tauri)는 어떤 surface 의 자손도 아니므로
+                // 정상 경로에서는 나올 수 없는 조합이다 — 토큰 파일을 읽은 동일 UID 프로세스일
+                // 가능성이 크다(원리적으로 차단 불가 = OUT OF SCOPE). 차단하지 않는 이유: dev 가
+                // pane 안에서 GUI 를 띄우는 정상 시나리오를 죽이면 온보딩이 깨진다. 대신 **흔적을
+                // 남긴다** — 막을 수 없는 것을 보이게 하는 것이 이 이벤트의 목적이다.
+                daemon.bus.publish(
+                    "delivery.operator_token_from_pane",
+                    "system",
+                    Some(sid),
+                    json!({"from_surface": verified_from, "caller_pid": caller_pid,
+                           "note": "오퍼레이터 토큰이 pane 소속 발신자에게서 왔다 — 배달 원장 기록이 \
+                                    억제됐다. 정상 GUI 는 어떤 pane 에도 귀속되지 않는다(감사 대상)."}),
+                );
+            }
+            if !human_verified {
                 let from_sid = verified_from.or_else(|| {
                     params
                         .get("from")
@@ -1487,11 +1547,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
                         }))
                 });
-                crate::delivery::record(
-                    &daemon.socket_path,
+                crate::delivery::record_audited(
+                    daemon,
                     sid,
                     &text,
-                    crate::delivery::Origin::Send,
+                    // ★R5: GUI 자동 주입은 `gui_auto` 로 남긴다 — 원장만 봐도 "사람이 친 것이
+                    //   아니라 UI 가 만든 문안"임이 드러나야 감사가 성립한다.
+                    if machine_origin {
+                        crate::delivery::Origin::GuiAuto
+                    } else {
+                        crate::delivery::Origin::Send
+                    },
                     from_sid,
                 );
             }
@@ -1510,8 +1576,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
-            if !human {
-                // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게
+            if !human_verified {
+                // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
+                // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
+                //   — 위조 human 이 에코 제외 창을 건너뛰어 헬스룰을 오발시키던 경로가 닫힌다.
                 *surface.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             }
             // quiet=true: interactive keystrokes (UI) — skip event publish to avoid spam.
@@ -4778,6 +4846,10 @@ mod tests {
     /// 격리된 임시 디렉터리에 acl.json을 깔고 그 안에 소켓 경로를 둔 Daemon을 만든다.
     /// 반환된 _guard가 살아있는 동안 CYS_PACK_DIR가 이 디렉터리를 가리킨다.
     fn daemon_with_acl(tag: &str, acl_json: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+        // ★R5-B: dispatch(surface.send_text / feed 자동 라우팅)가 배달 원장에 append 하므로,
+        // 격리가 없으면 `pack_state_dir()` 이 실 HOME 으로 해소돼 라이브 원장이 더러워진다.
+        // 하네스에서 일괄로 접는다(개별 테스트가 잊어도 새지 않게 — delivery.rs tests 머리말 참조).
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
         let dir = std::env::temp_dir().join(format!(
             "cys-acl-{}-{}-{}",
             tag,
@@ -4871,26 +4943,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★R1 배달 원장 — send_text 전 경로 커버리지(사고 경로 그대로) + 사람 입력 무기록.
+    /// ★R1 배달 원장 + ★★R4 human 신뢰 제거 — send_text 전 경로 커버리지를 한 자리에 박제한다.
     ///
     /// 적발 인계 ②: `cys send --to master "…"` 는 `clear_first` 없이 **Data 분기**를 탄다.
     /// 원장을 Inject 사이트에만 걸면 정작 사고 경로가 원장에 남지 않는다. 여기서 두 분기를
     /// 모두 dispatch 로 관통시켜 박제한다.
-    /// 인계 ③(방향 역전 금지): `human:true`(GUI 키)는 **절대 기록하지 않는다** — 오너 문장이
-    /// 자기 해시와 매치돼 기계로 접히면 온보딩이 전면 사망한다.
+    ///
+    /// ★R4 계약 교체(라운드3 검증자 N3 실측 봉합): 종전 이 테스트는 "`human:true` 면 무조건
+    /// 무기록"을 박제했는데, 그 계약 자체가 결함이었다 — `human` 은 클라이언트 자기신고라
+    /// 원시 소켓 한 줄이면 누구나 붙일 수 있고, 그 순간 원장이 비어 층2 라벨 폴백으로 내려가
+    /// 무라벨 push 가 오너 임무가 됐다. 새 계약은 **데몬이 발급한 operator.token 이 일치할 때만**
+    /// 무기록이다. 아래 ②/③ 대조가 그 분기점이며, ③(인계 ③ 불변식)이 깨지면 온보딩이 사망한다.
     #[test]
-    fn send_text_records_machine_delivery_but_never_human_input() {
-        let _sg = crate::delivery::tests::STATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn send_text_ledger_records_unless_operator_token_verifies_human() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
-        let td = std::env::temp_dir().join(format!("cys-deliv-h-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&td);
-        std::fs::create_dir_all(&td).unwrap();
-        let prev_state = std::env::var("CYS_STATE_DIR").ok();
-        std::env::set_var("CYS_STATE_DIR", &td);
-
+        // ★R5-B: 상태 디렉터리 격리는 `daemon_with_acl` 이 스레드 로컬로 건다(종전의 손수
+        // 짠 `CYS_STATE_DIR` 저장/복원 + 전역 뮤텍스는 제거 — 프로세스 전역 env 라 병렬 러너에서
+        // 서로를 덮었고, `ACL_ENV_LOCK` 과 획득 순서가 갈려 교착 위험도 있었다).
         let (daemon, dir) = daemon_with_acl("delivery-ledger", r#"{"default":"allow","rules":[]}"#);
+        let token = daemon
+            .operator_token
+            .clone()
+            .expect("데몬 기동 시 operator.token 이 발급돼야 한다(없으면 GUI 무기록 경로가 죽는다)");
         let master = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
             .expect("create master surface");
@@ -4900,54 +4974,138 @@ mod tests {
             .unwrap()
             .insert(master.id, master.clone());
 
-        // ① 라벨 없는 기계 push (Data 분기 — 사고 경로 그대로)
-        let machine = "다음 액션 착수";
-        let Reply::Single(r1) = dispatch(
-            &daemon,
-            Request {
-                id: json!(1),
-                method: "surface.send_text".into(),
-                params: json!({"surface_id": master.id, "text": machine}),
-            },
-            None,
-        ) else {
-            panic!("single reply");
+        let send = |n: u64, params: Value| {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(n),
+                    method: "surface.send_text".into(),
+                    params,
+                },
+                None,
+            ) else {
+                panic!("single reply");
+            };
+            assert_eq!(r["ok"], json!(true), "전송이 성공해야 한다: {r}");
         };
-        assert_eq!(r1["ok"], json!(true), "전송이 성공해야 한다: {r1}");
 
-        // ② 오너가 GUI 로 친 문장 (human:true) — 원장에 남으면 안 된다
+        // ① 라벨 없는 기계 push (Data 분기 — 사고 경로 그대로) → 기록된다
+        let machine = "다음 액션 착수";
+        send(1, json!({"surface_id": master.id, "text": machine}));
+
+        // ② ★N3 관통 재현: 원시 소켓 1줄이 human 을 자기신고한다(토큰 없음) → **기록돼야** 한다.
+        //    종전 코드에서는 여기가 무기록이라 게이트가 열렸다(실측 완료).
+        let forged = "위조 human 으로 밀어 넣은 자율 착수 지시";
+        send(2, json!({"surface_id": master.id, "text": forged, "human": true}));
+
+        // ③ 토큰이 **틀린** human 신고(토큰 파일을 못 읽는 구 GUI·추측 시도) → 기록된다.
+        let wrong_tok = "잘못된 토큰을 붙인 human 신고";
+        send(
+            3,
+            json!({"surface_id": master.id, "text": wrong_tok, "human": true,
+                   "operator_token": "deadbeef-not-the-token"}),
+        );
+
+        // ④ ★인계 ③ 불변식: 진짜 오너 GUI 키 입력(human + 유효 토큰) → **무기록**이어야 한다.
+        //    깨지면 오너 문장이 자기 해시와 매치돼 기계로 접히고 온보딩이 전면 사망한다.
         let owner = "T1 근본수정 진행해";
-        let Reply::Single(r2) = dispatch(
-            &daemon,
-            Request {
-                id: json!(2),
-                method: "surface.send_text".into(),
-                params: json!({"surface_id": master.id, "text": owner, "human": true}),
-            },
-            None,
-        ) else {
-            panic!("single reply");
-        };
-        assert_eq!(r2["ok"], json!(true), "전송이 성공해야 한다: {r2}");
+        send(
+            4,
+            json!({"surface_id": master.id, "text": owner, "human": true,
+                   "operator_token": token}),
+        );
+
+        // ⑤ ★★R5 관통 재현: GUI 가 **프로그램적으로 만든** 주입(전출 지시 전문 등)은 사람이 앉은
+        //    세션에서 발화하므로 human + 유효 토큰을 그대로 갖는다. R4 계약에서는 이것이 ④ 와
+        //    구별되지 않아 **무기록**이었고, 대상 pane 의 훅이 이 문안을 오너 임무로 기록했다
+        //    (실측 rc=0·흔적 0). 이제 `machine_origin` 표식이 있으면 토큰이 유효해도 기록한다.
+        let gui_auto = "지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드로 기록하라";
+        send(
+            5,
+            json!({"surface_id": master.id, "text": gui_auto, "human": true,
+                   "operator_token": token, "machine_origin": true, "clear_first": false}),
+        );
 
         let body =
             std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).unwrap();
+        // ★교차언어 e2e 채널(`-- --nocapture`): 데몬이 실제로 쓴 원장 전체를 python 훅
+        //   (`javis_mission record`)에 그대로 먹여 "N3 위조가 이제 기계로 접히는가"를 실측한다.
+        println!("LEDGER-SURFACE {}", master.id);
+        for l in body.lines() {
+            println!("LEDGER-LINE {l}");
+        }
         assert!(
             body.contains(&crate::delivery::digest(machine)),
             "라벨 없는 기계 push 가 원장에 없다 — 사고 경로가 그대로 열려 있다 (원장: {body})"
         );
         assert!(
+            body.contains(&crate::delivery::digest(forged)),
+            "★N3 관통 미봉합: 자기신고 human:true 만으로 원장 기록이 억제됐다 — 원시 소켓 1줄로 \
+             임무 게이트가 열린다 (원장: {body})"
+        );
+        assert!(
+            body.contains(&crate::delivery::digest(wrong_tok)),
+            "토큰 불일치 human 신고가 무기록으로 통과했다(fail-open) (원장: {body})"
+        );
+        assert!(
             !body.contains(&crate::delivery::digest(owner)),
-            "사람 입력(human:true)이 원장에 기록됐다 — 오너 임무가 기계로 접혀 온보딩이 사망한다"
+            "검증된 오너 GUI 입력이 원장에 기록됐다 — 오너 임무가 기계로 접혀 온보딩이 사망한다"
+        );
+        assert!(
+            body.contains(&crate::delivery::digest(gui_auto)),
+            "★R5 관통 미봉합: GUI 자동 주입(유효 토큰 + machine_origin)이 무기록으로 통과했다 — \
+             UI 가 만든 문안이 대상 pane 의 훅에게 오너 임무로 보인다(자율 착수 권한 오발급) \
+             (원장: {body})"
+        );
+        // 감사 구별: 자동 주입은 origin=gui_auto 로 남아 사람 키 입력과 사후에 갈린다.
+        let auto_line = body
+            .lines()
+            .find(|l| l.contains(&crate::delivery::digest(gui_auto)))
+            .expect("gui_auto 레코드");
+        let auto_rec: Value = serde_json::from_str(auto_line).expect("레코드 JSON");
+        assert_eq!(
+            auto_rec["origin"],
+            json!("gui_auto"),
+            "GUI 자동 주입이 일반 send 와 구별되지 않는다 — 감사에서 '사람이 친 문장'과 섞인다"
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
-        match prev_state {
-            Some(v) => std::env::set_var("CYS_STATE_DIR", v),
-            None => std::env::remove_var("CYS_STATE_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★R4 fail-open ② 봉합의 생산자 쪽 박제: 데몬 기동 표식(sentinel)이 원장에 1줄 남는가.
+    ///
+    /// 이것이 있어야 판독자가 "존재하지만 0바이트 = 손상"을 fail-closed 로 판정할 수 있다
+    /// (종전엔 빈 파일이 LEDGER_OK 로 통과해, 원장을 `: >` 로 비우기만 하면 게이트가 열렸다).
+    /// 표식은 **구 판독자에서도 정상 파싱**돼야 하므로 v/surface/ts_epoch/sha256 을 전부 채우고,
+    /// surface 는 어떤 pane(정수 문자열)과도 매치되지 않는 "-" 여야 한다.
+    #[test]
+    fn boot_sentinel_makes_empty_ledger_detectable() {
+        // ★R5-B: 스레드 로컬 격리(가드 drop 시 복원·삭제) — 라이브 `~/.cys/state` 무접촉.
+        let _sg = crate::delivery::tests::isolate_state_dir("boot-sentinel");
+
+        let sock = std::path::Path::new("/Users/x/.local/state/cys/cys.sock");
+        assert!(
+            matches!(
+                crate::delivery::write_boot_sentinel(sock),
+                crate::delivery::Outcome::Recorded
+            ),
+            "기동 표식 기록 실패"
+        );
+        let body =
+            std::fs::read_to_string(crate::delivery::ledger_path(sock)).expect("원장이 생성돼야");
+        assert!(!body.is_empty(), "기동 직후 원장이 0바이트다 — '빈 파일=손상' 근거가 성립하지 않는다");
+        // ★교차언어 검증 채널: `-- --nocapture` 로 실제 산출 줄을 뽑아 python 판독자
+        //   (`javis_mission.read_delivery`)에 그대로 먹여 볼 수 있게 한다(양쪽 박제만으로는
+        //   "같은 문자열"을 보장하지 못한다 — 실물 1줄이 오가야 한다).
+        println!("SENTINEL-LINE {}", body.lines().next().unwrap());
+        let v: Value = serde_json::from_str(body.lines().next().unwrap()).expect("표식은 JSON 1줄");
+        assert_eq!(v["origin"], json!("boot"));
+        assert_eq!(v["v"], json!(crate::delivery::LEDGER_SCHEMA));
+        assert_eq!(v["surface"], json!("-"), "어떤 pane 과도 매치되면 안 된다");
+        assert_eq!(v["sha256"], json!("-"), "어떤 프롬프트 해시와도 같으면 안 된다");
+        assert!(v["ts_epoch"].as_f64().unwrap() > 0.0, "구 판독자 파싱 호환(ts_epoch 필수)");
+        // 격리 해제·정리는 `_sg` 가드의 Drop 이 한다(패닉 경로에서도 새지 않는다).
     }
 
     /// 회귀(ACL 거부 발신의 부작용 누수 → 타이핑 가드 오염·교착):

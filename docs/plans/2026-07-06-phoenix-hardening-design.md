@@ -1,6 +1,6 @@
 # Phoenix 완전판 설계안 — 재발 원천 차단 (2026-07-06)
 
-> 발주: 박사님 — "이 문제가 절대 재발하지 않도록. 윈도우·맥 배포용에서도 수정. 숨은 오류·약점·잠재 리스크 전부 발굴, 이번에 전부 고치자."
+> 발주: 오너 — "이 문제가 절대 재발하지 않도록. 윈도우·맥 배포용에서도 수정. 숨은 오류·약점·잠재 리스크 전부 발굴, 이번에 전부 고치자."
 > 방법: 6방향 병렬 적대 감사(phoenix.py 전 2027줄 정독 · cysd Rust 체인 · 팩 배포 스큐 · Windows 동작성 · 상태파일 계약 · 격리 실테스트/재현) + master 직접 표본 검증(P0급 4건 원문 대조 확정) + 하네스 실증(손상 시나리오 FAIL 재현).
 > 기준선: cys-terminal HEAD = a07cc7f (CloseCause 도입). 오늘 아침 잔재 묘비 4개는 수동 해제 완료.
 
@@ -79,7 +79,7 @@
 
 ### 축 A. 묘비 소유권 일원화 (성찰 ④ 제거 — 제3겹·P0-6·P1-1·P1-4의 공통 근본)
 
-**결정 확정(2026-07-06 박사님 승인권 위임 → master 확정): 옵션 A + R1 안전조건 3종.**
+**결정 확정(2026-07-06 오너 승인권 위임 → master 확정): 옵션 A + R1 안전조건 3종.**
 
 - **옵션 A (확정): 데몬 topology.json = 묘비 유일 진실. phoenix desired 묘비 = 미러(조건부 replace 의미론).**
   - `observe_and_persist_roster`가 topology 묘비 집합을 **add-merge가 아니라 그대로 대입**(있으면 유지·없으면 해제). 데몬의 claim/create 해제가 자동으로 phoenix에 흐른다 → 제3겹 영구 소멸, 수동 `tombstone --remove` 불요화.
@@ -110,7 +110,7 @@
   - **1단계 retention-critical**(topology tombstones·desired/dept roster): 손상 시 `.corrupt-<ts>` rename 보존(**최근 3개만 유지·초과 prune** — inode DoS 차단, gemini R2 수용) → **폴백 체인**: 직전 유효본(.bak, 매 성공 write마다 유지) → 세대 스냅샷 tombstones → 전부 불가 시에만 부활 중단+escalation(exit 6). **폴백 복원 = degraded 모드**(gemini R2 "stale-bak 묘비 leak" 수용): 백업은 과거 시점이라 최근 폐역이 빠졌을 수 있으므로, degraded에서는 묘비 상태가 불확실한 역할의 부활을 **보류+escalation**(불확실 시 부활하지 않는 쪽이 fail-safe — 묘비 일원화 원칙과 모순 없게). `unwrap_or_default()`(P0-3)도 동일 체인. **C2-1. degraded 보류 = 영속 sentinel (W3 게이트 발견 · codex W3 blocking · 2026-07-06 설계 확정)**: 폴백 복원이 primary를 유효본으로 교체하고 DEGRADED(exit 3)를 반환하면, C1의 비0 1회 재시도가 2차 실행에서 유효 파일만 보고 보류 없이 부활을 진행하는 **웨이브 간 상호작용 우회**(W1 재시도 × W3 보류 — 보류가 1회성 휘발 상태로 전락)가 생긴다. 확정: **degraded 보류는 프로세스 상태가 아니라 디스크 영속 sentinel**(`pending-degraded` 마커 — 복원 파일과 함께 원자 기록)로 유지하며, auto-retry·수동 restore를 불문하고 sentinel 존재 시 동일 보류를 적용한다. 해제는 명시 ack(`phoenix roster --rebase` 등 운영자 확인)로만 — 시간·재시도 횟수에 의한 암묵 해제 금지. 게이트 subcase: corrupt+.bak → attempt1 DEGRADED → auto-retry 2차도 보류 유지·부활 0 → 명시 ack 후에만 부활 재개.
   - **2단계 보조 상태**(breaker·journal·lease): isolate+warn 또는 안전측 reset — 부활을 막지 않는다.
 - **C3. 설명-가능-축소 불변식** (R1 개정 + R2 정밀화): write 거부는 **설명 불가능한 축소**에만 — 감소분이 묘비(OwnerClose)·ephemeral 플래그로 설명되면 정당한 스케일다운. 설명 불가 축소는 영구 교착이 아니라 해당 write 1회 거부+EVT, **다음 관측 사이클 재평가**(gemini R2 TOCTOU 수용: 데몬의 entries 제거↔묘비 등록 사이 지연이 오판을 만들 수 있으므로 1사이클 유예가 자연 해소) + 운영자 명시 재기반(`phoenix roster --rebase`). **데몬 측 대응**: close의 엔트리 제거와 묘비 삽입을 단일 persist로 원자화(W2). 쓰기 실패는 `except: pass` 제거 → log+EVT.
-- **C6. 죽은 surface 잔재 자동 정리** (2026-07-06 박사님 신규 지시 — "죽은 화면 잔재 제거, 데몬엔 없으므로 안전"): phoenix restore 파이프라인에 **S0 정리 단계** 추가 — ①데몬 관측에서 `exited=true` surface와 데몬에 실체 없는 GUI pane 잔재를 열거 ②**반드시 Reap 사유로 회수**(기존 reap_exited 경로 재사용 또는 W2의 cause 파라미터 — 현행 surface.close RPC는 고정 OwnerClose라 이 기능이 P0-6 함정을 그대로 밟아 역할을 묘비화한다: **절대 금지 경로**) ③라이브(exited=false) surface는 절대 비대상 ④정리 결과를 restore 저널에 기록(몇 개 회수·묘비 0 확인). 수용 게이트: "잔재 정리가 묘비를 1개도 만들지 않음" + "라이브 surface 오회수 0".
+- **C6. 죽은 surface 잔재 자동 정리** (2026-07-06 오너 신규 지시 — "죽은 화면 잔재 제거, 데몬엔 없으므로 안전"): phoenix restore 파이프라인에 **S0 정리 단계** 추가 — ①데몬 관측에서 `exited=true` surface와 데몬에 실체 없는 GUI pane 잔재를 열거 ②**반드시 Reap 사유로 회수**(기존 reap_exited 경로 재사용 또는 W2의 cause 파라미터 — 현행 surface.close RPC는 고정 OwnerClose라 이 기능이 P0-6 함정을 그대로 밟아 역할을 묘비화한다: **절대 금지 경로**) ③라이브(exited=false) surface는 절대 비대상 ④정리 결과를 restore 저널에 기록(몇 개 회수·묘비 0 확인). 수용 게이트: "잔재 정리가 묘비를 1개도 만들지 않음" + "라이브 surface 오회수 0".
 - **C4. 전 raw subprocess에 try/except**(TimeoutExpired→rc=124 정직 강등, P1-5) · breaker는 실제 spawn 시도에만 기록+NOOP 리셋(P1-3) · verify done은 verified/fresh만(P2-3) · lease atexit 해제+deploy 내부 lease 우회(P2-7).
 - **C5. liveness를 구조화 소스로**: 화면 정규식 대신 `cys status --json`(P1-6). readiness는 배너 리터럴 대신 구조화 ack(P1-10). 하네스는 `CYS_PHOENIX_ALLOW_LIVE=1` 명시 opt-in 없으면 LIVE write 거부(P1-10).
 
@@ -159,7 +159,7 @@
 
 - 오분류 묘비 4개(cso·worker·reviewer-codex·reviewer-gemini) `tombstone --remove` 해제 → desired_roster tombstones=[] 검증 완료. 함대 5역할 전원 로스터 복귀·생존.
 
-## 5. 결정 확정 (2026-07-06 박사님 "모든 승인 사항 master 최고 선택" 위임 → master 확정)
+## 5. 결정 확정 (2026-07-06 오너 "모든 승인 사항 master 최고 선택" 위임 → master 확정)
 
 1. **축 A = 옵션 A** (데몬=묘비 유일 진실) + R1 안전조건 A-S1~S3. 근거: 작성자 일원화·자동 화해·수동 해제 불요화. gemini의 싹쓸이 공격은 A-S1(검증된-건강 replace)로 무력화, 이원화 공격은 소켓별 격리 실측으로 반박 종결.
 2. **B1 범위 = phoenix 우선** (실증 사고 지점). 훅 python 8종은 B2 소유권 매니페스트로 커버 후 관찰.
@@ -181,13 +181,13 @@ R1 진행 중 데몬이 재교체(pid 54067)되며 함대 전체가 전멸, auto
 
 - **gemini R2: REVISE** — 단 R1 반박(이원화 격리)은 **명시 ACCEPT**. 잔여 공격 전건 수용: A-S1 부분손상 통과→tombstones_rev 단조 카운터 / legacy 키부재→무기한 보류 대신 경고+진행 / A-S2 태그=canonical state dir / A-S3→intent 저널 재설계(TOCTOU 소멸) / C2 stale-bak leak→degraded 부활 보류 / .corrupt DoS→3개 cap / C3 TOCTOU→1사이클 재평가+데몬 원자 persist / side-effects 3건(다중설치 스큐→identity check·하네스 오염→폴백 비활성·B3 은폐→PHOENIX_STRICT_CYS 게이트).
 - **codex R2: REVISE** — R1 수용 6건의 v2 반영 **전건 verified**. 잔여 지적 7건 전건 수용: _which 스큐→W1 Rust 소패치 승격+identity check / W4 게이트 5종 추가 / missing-vs-corrupt fresh-install 게이트 / legacy fresh-* quarantine / 지연 재시도 중복스폰 가드 / A-S3 동일정책 / wave별 게이트 표 고정.
-- **박사님 추가 지시 반영**: C6 죽은 surface 잔재 자동 정리(Reap 사유 강제 — P0-6 함정 회피 명문화).
+- **오너 추가 지시 반영**: C6 죽은 surface 잔재 자동 정리(Reap 사유 강제 — P0-6 함정 회피 명문화).
 - **종결 판단(master)**: R1→R2에서 지적 고도가 아키텍처→정책→게이트로 단조 하강, 양 리뷰어가 상호 독립적으로 반영 정확성을 확인. 설계 라운드 **종결(v3 확정)** — 이후 검증은 웨이브별 4자수렴 게이트에서 계속(리뷰 루프는 구현 단계로 이관). 본 문서 = **v3(구현 기준본)**.
 
-## 8. 구현 착수 전 최종 성찰 (박사님 명령 이행 · 2026-07-06)
+## 8. 구현 착수 전 최종 성찰 (오너 명령 이행 · 2026-07-06)
 
 1. **원 결함 대비 완결성 재확인**: 3겹(팩 스큐→W4 / 오묘비→W2 / add-only→W2 옵션A) + 라이브 사건 2건(FileNotFoundError→W1 / 침묵실패→W1) + 26결함 전건이 웨이브에 매핑됨 — 대응 공백 0 확인.
 2. **설계 자체의 잔여 리스크 2건과 대응**: ①이 리포는 병렬 세션이 공유한다(v0.12.15 태그 경합 사고 전례) → 구현은 **전용 브랜치(phoenix-hardening)+별도 worktree**에서 진행, 웨이브 게이트 통과 시에만 main 로컬 머지 — 트리 경합 원천 차단. ②C6(잔재 정리)은 W1 시점에 안전한 Reap RPC가 없으면 **탐지·보고만** 구현하고 실제 회수는 W2(cause 파라미터)와 함께 — OwnerClose 오묘비 함정(P0-6)을 새 기능이 밟지 않게 순서 강제.
 3. **가장 경계할 자기기만**: 폴백·완화 장치가 근본수리를 가리는 false-green(리뷰어 양쪽이 독립 지적) — 전 웨이브 게이트에 STRICT 모드 검증을 유지한다.
-5. **미결(open question · 결정=박사님·master, gemini R3 advisory)**: degraded 모드(C2 폴백 후 묘비 불확실 역할 부활 보류)의 **자동 자가치유 복귀** 여부 — 주기적 attest 재시도로 정상 topology를 재확인하면 자동으로 degraded 해제·부활 재개할지, 아니면 운영자 `phoenix roster --rebase` 수동 복귀만 둘지. 자동 복귀는 무한 보류 DoS(gemini R3 minor)를 완화하나 손상 진동 시 부활 플랩 위험 — **현 설계 기본값 = 수동 `--rebase`(fail-safe)**, 자동 복귀는 미채택(박사님·master 결정 대기).
+5. **미결(open question · 결정=오너·master, gemini R3 advisory)**: degraded 모드(C2 폴백 후 묘비 불확실 역할 부활 보류)의 **자동 자가치유 복귀** 여부 — 주기적 attest 재시도로 정상 topology를 재확인하면 자동으로 degraded 해제·부활 재개할지, 아니면 운영자 `phoenix roster --rebase` 수동 복귀만 둘지. 자동 복귀는 무한 보류 DoS(gemini R3 minor)를 완화하나 손상 진동 시 부활 플랩 위험 — **현 설계 기본값 = 수동 `--rebase`(fail-safe)**, 자동 복귀는 미채택(오너·master 결정 대기).
 4. 결론: 설계 고도에서 더 짜낼 것 없음 — 구현 단계의 4자수렴 게이트가 다음 방어선. **W1 착수.**

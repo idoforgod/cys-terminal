@@ -431,6 +431,9 @@ async fn send_input(
     data: String,
     queued: Option<bool>,
     clear_first: Option<bool>,
+    // ★R5: 이 문안을 **UI 코드가 조립했는가**(전출 지시·재기동 명령·경로 삽입 = true) —
+    // 사용자가 자판으로 친 실키(sendRaw/붙여넣기)는 false(미지정)다. 아래 본문 주석 참조.
+    machine_origin: Option<bool>,
 ) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
     // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다.
@@ -439,16 +442,40 @@ async fn send_input(
     // clear_first=true는 데몬 T3-13 권위 전달(Ctrl-U 정리→paste→지연 CR 원자 제출) —
     // raw "\r" 동봉은 Claude CLI가 paste로 삼켜 미제출된다(전출 e2e 실측). queued와 결합 불가.
     // 전출 지시도 사람의 클릭에서 발화하므로 human 유지(타이핑 가드 결정론 통과).
+    //
+    // ★R4(2026-08-02): `human`은 클라이언트 자기신고라 데몬이 그것만으로 **배달 원장 기록을
+    // 억제하지 않는다**(원시 소켓 1줄로 임무 게이트가 열리던 N3 관통). 억제 근거는 데몬이
+    // 발급·0600 보관하는 operator.token 뿐이다 — 이 pane 이 붙어 있는 **그 데몬의** 토큰을
+    // 읽어 첨부한다(부서 데몬은 자기 state 디렉토리에 자기 토큰을 갖는다). 첨부 실패(구 데몬·
+    // 권한)면 데몬이 fail-closed 로 **기록**한다: 오너 키 입력이 원장에 남아도 원장 단위는
+    // 키 조각(term.onData)이고 훅은 프롬프트 전문을 해시하므로 매치되지 않는다(피해 경미).
+    // 매 호출 신선 재독(캐시 금지) — 데몬 재기동마다 토큰이 재발급된다.
+    //
+    // ★★R5(2026-08-02): 토큰이 증명하는 것은 **'사람이 앉은 GUI 세션'**이지 **'사람이 친 문장'**이
+    // 아니다. 이 커맨드는 두 종류를 함께 나른다 —
+    //   ⓐ 사용자가 자판으로 친 실키(`sendRaw` ← `term.onData`·붙여넣기) → machine_origin 없음
+    //   ⓑ UI 코드가 조립한 문안(전출 지시 전문·`launchCmd`·`restartNode`·`injectRawToPane`)
+    //      → 호출부가 `machineOrigin: true` 를 넘긴다
+    // R4 배선은 ⓑ 에도 토큰을 붙여 **배달 원장 기록을 억제**했고, 그래서 GUI 가 자동 주입한
+    // 문안이 훅에게 **오너 임무**로 보였다(실측 rc=0·흔적 0 — 자율 착수 권한 오발급). 이제
+    // 표식을 그대로 데몬에 전달하고, 데몬은 표식이 있으면 토큰이 유효해도 기록한다
+    // (`handlers.rs::surface.send_text` · origin=`gui_auto`).
+    // ⓐ 는 **반드시 무기록**이어야 한다 — 기록되면 오너 문장이 자기 해시와 매치돼 임무를 영영
+    // 줄 수 없다(온보딩 사망). 두 경로를 여기서 섞지 말 것.
     let q = queued.unwrap_or(false);
     let cf = clear_first.unwrap_or(false);
-    rpc_on(
-        &resolve_socket(&socket),
-        "surface.send_text",
-        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q,
-               "queued": q, "clear_first": cf}),
-    )
-    .await
-    .map(|_| ())
+    let mo = machine_origin.unwrap_or(false);
+    let sock = resolve_socket(&socket);
+    let mut params = json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q,
+                            "queued": q, "clear_first": cf, "machine_origin": mo});
+    // 표식이 붙은 자동 주입에는 토큰을 아예 붙이지 않는다(데몬도 표식으로 무시하지만, 첨부 자체를
+    // 하지 않는 편이 "토큰은 사람 키 전용"이라는 계약을 코드 한 곳에서 더 분명히 만든다).
+    if !q && !mo {
+        if let Some(tok) = read_operator_token_for(&sock) {
+            params["operator_token"] = json!(tok);
+        }
+    }
+    rpc_on(&sock, "surface.send_text", params).await.map(|_| ())
 }
 
 /// 전출(F6-2) 핸드오프 폴백 경로용 홈 디렉토리 — cwd가 루트류(/·C:\)인 pane은
@@ -1542,19 +1569,48 @@ async fn feed_list(status: Option<String>) -> Result<Value, String> {
     rpc("feed.list", json!({"status": status})).await
 }
 
-/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 기본 데몬 state 디렉토리의 operator.token을 읽는다 —
-/// cysd state_dir(RC-13)의 기본 데몬 매핑과 동형(unix=기본 소켓의 부모 디렉토리,
-/// windows=%LOCALAPPDATA%\cys). feed_reply는 기본 데몬 전용(rpc 기본 소켓)이라 부서 pipe 슬러그
-/// 분기는 불필요. 매 호출 신선 재독(캐시 금지) — 데몬 재시작(churn)마다 토큰이 재발급되기 때문.
-/// 부재·빈 파일=None(구 데몬 호환 — 첨부 없이 기존대로 호출).
-fn read_operator_token() -> Option<String> {
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15 · R4 2026-08-02 소켓 인지 확장):
+/// **지정한 소켓의 데몬**이 쓴 state 디렉토리에서 operator.token 을 읽는다.
+/// cysd `state::state_dir`(RC-13) 미러 — unix=소켓의 부모 디렉토리,
+/// windows=%LOCALAPPDATA%\cys(기본 데몬) 또는 그 하위 pipe 슬러그 디렉토리(부서 데몬).
+///
+/// ★부서 데몬 분기가 R4 에서 필요해진 이유: `send_input` 은 부서 워크스페이스 pane 에도 쓰이는데
+/// (`socket: Some(...)`), 기본 데몬의 토큰을 붙이면 부서 데몬에서 **불일치**가 되어 오너 GUI
+/// 키 입력이 배달 원장에 기록된다(불변식 ② 이탈). 토큰은 반드시 그 pane 이 붙은 데몬의 것이어야 한다.
+/// 매 호출 신선 재독(캐시 금지) — 데몬 재시작(churn)마다 토큰이 재발급되기 때문.
+/// 부재·빈 파일=None(구 데몬 호환 — 첨부 없이 호출).
+fn read_operator_token_for(socket: &std::path::Path) -> Option<String> {
     #[cfg(windows)]
-    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?).join("cys");
+    let dir = {
+        // cysd state::pipe_slug 미러: `\\.\pipe\<name>` 의 마지막 컴포넌트에서 파일시스템
+        // 안전 문자만 남긴다. 기본 데몬(`cys`)은 루트 유지, 부서는 슬러그 하위(격리).
+        let root = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?).join("cys");
+        let last = socket
+            .to_string_lossy()
+            .rsplit(|c| c == '\\' || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let slug: String = last
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if slug.is_empty() || slug == "cys" {
+            root
+        } else {
+            root.join(slug)
+        }
+    };
     #[cfg(not(windows))]
-    let dir = default_socket().parent()?.to_path_buf();
+    let dir = socket.parent()?.to_path_buf();
     let tok = std::fs::read_to_string(dir.join("operator.token")).ok()?;
     let tok = tok.trim().to_string();
     (!tok.is_empty()).then_some(tok)
+}
+
+/// 기본 데몬(feed_reply 전용) 토큰 — 소켓 인지 판을 기본 소켓으로 부른다(사본 금지).
+fn read_operator_token() -> Option<String> {
+    read_operator_token_for(&default_socket())
 }
 
 #[tauri::command]

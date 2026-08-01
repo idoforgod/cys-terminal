@@ -54,7 +54,7 @@ const SENDER_MAXLEN: usize = 16;
 /// 승인 미러 본문 요지 최대 길이(초과 시 … 절단·L4 매직넘버 상수화).
 const SUMMARY_MAXLEN: usize = 200;
 /// V7 일일 원격 승인(allow) 상한(§5) — 채널계정 탈취 시 무단 allow 폭발반경을 하루 N건으로 제한.
-/// 초과분은 원격 거부·로컬 feed로 강등(fail-closed). deny 해소는 안전측이라 비계수(§4 박사님 확정=20).
+/// 초과분은 원격 거부·로컬 feed로 강등(fail-closed). deny 해소는 안전측이라 비계수(§4 오너 확정=20).
 const REMOTE_APPROVE_DAILY_CAP: u64 = 20;
 /// V4 연속 실패 임계(§5) — 한 sender가 interaction 검증에 연속 N회 실패하면 쿨다운(브루트 속도제한).
 const SENDER_COOLDOWN_FAIL_THRESHOLD: u64 = 5;
@@ -1459,8 +1459,8 @@ fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
         return false;
     };
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
-    crate::delivery::record(
-        &daemon.socket_path,
+    crate::delivery::record_audited(
+        daemon,
         sid,
         envelope,
         crate::delivery::Origin::Channel,
@@ -1805,7 +1805,7 @@ fn lockdown(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
 /// "0" 복원 경로가 없어 1회 잠금이 영구 불능(DB 수동편집 외 복구 불가)이었다. 이 RPC가 그 유일한
 /// 해제 경로다. LOW-2: 인가 경계는 인바운드 차단 논리가 아니라 소켓 0o600 same-UID 봉인이다
 /// (pause/resume 등 여타 RPC와 동일 신뢰층위 — 브리지는 lockdown 시 kill되고 소켓은 어차피 동일
-/// UID 전용). 긴급 unlock에 추가 인가(박사님 토큰/feed)를 원하면 별도 결합 — 현재는 미결합. 해제는 desired-state를
+/// UID 전용). 긴급 unlock에 추가 인가(오너 토큰/feed)를 원하면 별도 결합 — 현재는 미결합. 해제는 desired-state를
 /// 되돌리지 않는다(enabled는 그대로 0) — 채널 재개는 `cys channel start`로 명시한다(안전측).
 fn unlock(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
     let was = lockdown_active(conn);
@@ -2181,6 +2181,10 @@ mod tests {
     use crate::state::Daemon;
 
     fn tmp_daemon(tag: &str) -> Arc<Daemon> {
+        // ★R5-B: 이 데몬을 거치는 주입은 `inject_master` 에서 배달 원장에 append 된다
+        // (Origin::Channel). 격리를 안 걸면 `pack_state_dir()` 이 실 HOME 으로 해소돼
+        // `~/.cys/state/delivery-<임시소켓>.jsonl` 이 실제로 생긴다 — 하네스에서 일괄로 접는다.
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
         let dir = std::env::temp_dir().join(format!("cys_chan_test_{}_{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

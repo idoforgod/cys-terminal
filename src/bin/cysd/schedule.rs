@@ -770,8 +770,8 @@ fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 자기 예약 wake
     //   (`cys schedule add --text "[wakeup] 다음 액션 착수" --to master`)가 시간이 지나
     //   stdin 으로 돌아오는 경로가 바로 여기다.
-    crate::delivery::record(
-        &daemon.socket_path,
+    crate::delivery::record_audited(
+        daemon,
         sid,
         text,
         crate::delivery::Origin::Schedule,

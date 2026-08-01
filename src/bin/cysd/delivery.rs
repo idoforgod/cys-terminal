@@ -9,19 +9,82 @@
 //!   · 라벨 규약 우회 5종(중첩 대괄호·라벨 내 개행·80자 초과·선두 비공백·전각 대괄호)
 //! 이 전부 **오너 임무**로 기록돼 자율주행 게이트를 열었다(= 사고 그 자체).
 //!
-//! 문자열은 발신자가 고를 수 있다. 그래서 판별 근거를 **master 가 고를 수 없는 층**으로 내린다:
-//! **데몬만이 쓸 수 있는 배달 원장**. 훅은 프롬프트를 같은 규칙으로 해시해 원장과 대조한다.
-//! 일치 = 기계가 방금 이 pane 에 밀어 넣은 바로 그 문자열 = 오너 임무 아님.
+//! 라벨 문자열은 **발신자가 고르는 값**이라, 규약을 안 지킨 push 하나로 게이트가 열렸다. 그래서
+//! 판별 근거를 문자열에서 **주입한 쪽이 남긴 사실 기록**으로 옮긴다: 데몬이 주입 직전에 쓰는
+//! 배달 원장. 훅은 프롬프트를 같은 규칙으로 해시해 원장과 대조하고, 일치하면 "기계가 방금 이
+//! pane 에 밀어 넣은 바로 그 문자열" = 오너 임무 아님으로 접는다.
+//! ★이것이 닫는 것은 **평시 정상 동작 경로**뿐이다 — 동일 UID 의 의도적 위조는 닫지 못한다.
+//!   보장 범위의 정의처(SOT)는 `docs/THREAT-MODEL-mission-gate.md` 하나이며, 아래 '막을 수 없는
+//!   것'은 그 문서의 배달층 각주다(모델 서술을 여기서 늘리지 말고 SOT 에 쓴다).
 //!
 //! ## 절대 불변식 3개 (튜닝 시 반드시 보존)
 //! ① **원장 기록이 주입보다 반드시 선행한다.** 구현 규약: 기록을 `write_tx.try_send(..)`
 //!    **직전**에 둔다. writer 스레드는 채널 수신 이후에만 PTY 에 쓰므로, 기록→try_send→(수신)→write
 //!    순서가 구조적으로 보장된다(happens-before). 반대로 두면 훅이 "아직 없는 원장"을 읽어
 //!    기계 push 를 오너 임무로 기록하는 race 가 열린다.
-//! ② **사람 입력(human:true·GUI 키)은 절대 기록하지 않는다.** 오너 문장이 자기 해시와 매치돼
-//!    기계로 접히면 온보딩이 전면 사망한다(임무를 영영 줄 수 없다). 기록 대상은 기계 유래 경로뿐.
+//! ② **데몬이 검증한 오너 GUI 입력만 기록에서 제외한다.** 오너 문장이 자기 해시와 매치돼
+//!    기계로 접히면 온보딩이 전면 사망한다(임무를 영영 줄 수 없다). 단 제외 근거는 **클라이언트
+//!    자기신고가 아니라 데몬이 아는 사실**이어야 한다 — 아래 R4 참조.
 //! ③ **거짓 양성(기계→오너 오인)이 치명 / 거짓 음성(오너→기계 오인)은 경미**. 원장이 넓을수록
-//!    안전하다 — 애매하면 기록한다(단 ②는 예외 없음).
+//!    안전하다 — 애매하면 기록한다(②의 제외는 **검증됐을 때만** 적용).
+//!
+//! ## ★R4 수리 — 기록 억제 근거를 '자기신고 human' → '데몬 검증 오퍼레이터'로 교체
+//! 종전 `handlers.rs` 는 `if !human { record(..) }` 였다. 그런데 `human` 은 **클라이언트가
+//! 스스로 붙이는 불리언**이고, 같은 함수의 ACL 주석이 이미 "어떤 pane 이든 위조 가능"이라
+//! 못 박고 있었다 — 즉 **같은 코드가 ACL 목적으로는 human 을 불신하면서 원장 기록 여부만
+//! 신뢰하는 비대칭**이 결함의 본체였다. 원시 소켓 한 줄
+//! (`{"method":"surface.send_text","params":{...,"human":true}}`)로 원장 무기록 → 훅이 층2
+//! 라벨 폴백 → 무라벨이라 통과 → 임무 게이트 개방이 실측됐다(라운드3 검증자 N3).
+//!
+//! 이제 억제 근거는 **데몬이 기동 시 자기가 발급하고 0600 으로 보관하는 `operator.token`** 이다
+//! (`state.rs::write_operator_token` · GUI 승인 채널이 이미 쓰는 그 메커니즘). GUI(Tauri 백엔드)
+//! 만이 그 파일을 읽어 첨부하고, 공용 `cys` CLI 는 **어떤 경로에서도 첨부하지 않는다**.
+//!
+//! ### 두 요구가 충돌하는 지점과 어느 쪽으로 접었는지 (명시)
+//!  · 요구 A(불변식 ②): 진짜 오너 GUI 키 입력은 기록되면 **안 된다**.
+//!  · 요구 B(fail-closed): 발신 주체를 데몬이 확정 못 하면 **기록해야** 한다(기계로 취급).
+//!  두 요구는 "GUI 인지 아닌지 판정 불가"인 지점에서 충돌한다. **B 로 접었다** — 판정 불가는
+//!  기록한다. 반대로 B 를 포기하면 원시 소켓 한 줄로 게이트가 열린다(실측된 치명 결함).
+//!  그래서 GUI 는 토큰을 첨부하도록 배선하고(`src-tauri/src/main.rs::send_input`), 토큰이 없거나
+//!  틀리면 **기록**한다.
+//!
+//! ## ★★R5 수리 — `operator_token` 은 '사람이 앉은 GUI 세션'이지 '사람이 친 문장'이 아니다
+//! 라운드4 검증자 실측(신규 치명): GUI 는 **사용자가 자판으로 친 입력**만 보내는 게 아니라
+//! **자기가 만든 문안**도 같은 `surface.send_text` 로 보낸다 — 전출 지시 전문(`ui/src/main.ts`
+//! `clear_first:true` + 자동 CR)·노드 재기동 명령·경로 삽입이 그것이다. R4 배선은 그 호출에도
+//! 토큰을 붙였으므로 `human_verified=true` 가 되어 **원장에 아무것도 남지 않았고**, 훅은 층2
+//! 라벨 폴백으로 내려가 무라벨 문안을 **오너 임무로 기록**했다(실측 rc=0 · 흔적 0).
+//!
+//! 근본 교정: 토큰은 "이 요청이 오퍼레이터 GUI 세션에서 왔다"만 증명한다. 거기에 더해 UI 가
+//! **그 문안을 사람이 쳤는지, UI 코드가 만들었는지**를 알려야 한다. 그래서 신호를 하나 더 흘린다
+//! (`machine_origin` · UI → tauri → cysd). **표식이 있으면 토큰이 유효해도 기록**하며 원장
+//! `origin` 은 `gui_auto` 로 남아 감사에서 구별된다.
+//!
+//! ★불변식 ② 절대 보존 — 두 경로를 코드에서 명확히 가른다:
+//!   · `ui/src/main.ts::sendRaw`(= `term.onData`/붙여넣기 = **사람이 친 실키**) → 표식 **없음**
+//!     → 종전대로 무기록. 여기가 기록되면 오너가 임무를 줄 수 없어 온보딩이 전면 사망한다.
+//!   · UI 가 문자열을 조립해 보내는 호출(전출 지시·`launchCmd`·`restartNode`·`injectRawToPane`)
+//!     → 표식 **있음** → 기록. 새 자동 주입을 UI 에 추가할 때 표식을 빠뜨리면 이 구멍이 재발하므로,
+//!     "UI 가 만든 문자열을 보내면 표식"을 규칙으로 삼는다(사람 키만 예외).
+//!
+//! ★정직 고지: 이 표식도 **클라이언트가 붙이는 값**이다. 위조 방향은 "표식을 떼는 것"인데,
+//!   표식을 떼도 **토큰까지 있어야** 기록이 억제되므로 공격자는 결국 토큰 파일을 읽어야 한다 —
+//!   그 순간 §2 OUT OF SCOPE(동일 UID 의도적 위조)이고 `delivery.operator_token_from_pane`
+//!   감사 이벤트의 대상이다. 즉 이 표식이 닫는 것은 **평시 정상 동작**(GUI 가 선의로 만든 자동
+//!   주입)이 게이트를 여는 경로뿐이다.
+//!
+//! ## ★막을 수 없는 것 (정직 고지 — 닫는 시늉 금지 · 전문은 SOT)
+//! 정의처는 `docs/THREAT-MODEL-mission-gate.md` §2 다. 여기 적는 것은 **배달층에 국한된 각주**이며,
+//! 범위·근거·감사 절차를 늘려 쓰고 싶으면 SOT 를 고친다(두 곳에 쓰면 반드시 어긋난다).
+//! 이 원장은 **동일 UID 구성요소의 의도적 위조를 막지 못한다.** master 는 Bash 를 가지므로
+//! ① `operator.token` 파일을 그대로 읽어 첨부할 수 있고 ② 원장 파일을 직접 지우거나 덮어쓸 수
+//! 있고 ③ 임무 대장을 직접 쓸 수 있다. 어떤 in-band 장치로도 원리적으로 닫히지 않는다
+//! (동일 신뢰경계 안에서의 자기위조 = 커널 밖에서 풀 수 없는 문제).
+//! 이 층이 실제로 보장하는 것은 **평시 정상 동작이 자율 착수 권한을 발급하지 않는다** 하나다.
+//! 위조 범주에 대한 무기는 차단이 아니라 **감사 가능성**이다 — 기록 실패·판독 실패·창 밖 배달·
+//! pane 에서 온 오퍼레이터 토큰을 전부 사유 코드로 남기고(`delivery.*` 이벤트 + 임무 대장
+//! `anomalies`), master 가 그것을 오너에게 보고하게 한다. "완전 방어"를 주장하는 문장은
+//! 그 자체가 결함이다.
 //!
 //! ## 경로 계약 (★두 디렉터리를 혼동하지 말 것)
 //! Rust `state::state_dir(socket)` = 소켓 옆(`~/.local/state/cys`) 이고, **팩 계약**은
@@ -35,7 +98,7 @@
 //! 원장은 조용히 무력화되므로, 정규화 규칙은 이 파일과 `javis_mission._normalize_delivery`
 //! 주석에 **동일 문구로** 박제하고 양쪽에 회귀 테스트를 둔다.
 
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +128,13 @@ pub enum Origin {
     Channel,
     /// 빈 좌석 승계 고지(`# [cys] …` 주석 주입)
     SeatTakeover,
+    /// ★GUI 가 **프로그램적으로 만든** 주입(전출 지시·노드 재기동 명령·경로 삽입 등).
+    /// 오퍼레이터 토큰이 붙어 있어도 **기록한다** — 사람이 앉은 세션이라는 사실과 사람이 친
+    /// 문장이라는 사실은 다르다(아래 'R5 수리' 절).
+    GuiAuto,
+    /// ★기동 표식(sentinel) — 실제 배달이 아니다. 데몬이 기동 시 1줄 append 해
+    /// "정상 원장은 절대 0바이트가 아니다"를 성립시킨다(판독자의 '빈 파일 = 손상' 근거).
+    Boot,
 }
 
 impl Origin {
@@ -76,8 +146,23 @@ impl Origin {
             Origin::Feed => "feed",
             Origin::Channel => "channel",
             Origin::SeatTakeover => "seat_takeover",
+            Origin::Boot => "boot",
+            Origin::GuiAuto => "gui_auto",
         }
     }
+}
+
+/// `record` 의 결과 — 종전 `bool` 은 "공백이라 안 씀"과 "쓰려다 실패"를 같은 false 로 뭉쳐서
+/// **기록 실패가 조용히 사라졌다**(그 상태에서 주입된 텍스트는 훅에 오너 임무로 보인다 = 게이트
+/// 개방). 감사 가능성 확보를 위해 셋을 가른다.
+#[derive(Debug)]
+pub enum Outcome {
+    /// 원장에 append 됐다(판별 근거 확보).
+    Recorded,
+    /// 정규화 후 빈 문자열 — 프롬프트가 될 수 없어 기록 대상이 아니다(정상).
+    Blank,
+    /// ★기록 **실패**. 이 주입은 원장에 없으므로 훅이 오너 임무로 오인할 수 있다.
+    Failed(String),
 }
 
 /// ★정규화 규칙 (판독자 `javis_mission._normalize_delivery` 와 **문자 단위로 동일**해야 한다)
@@ -113,7 +198,15 @@ fn digest_normalized(norm: &str) -> String {
     format!("{:x}", Sha256::digest(norm.as_bytes()))
 }
 
-/// 정규화 본문의 sha256 소문자 hex. 판정의 유일한 대조 키.
+/// 정규화 본문의 sha256 소문자 hex. **테스트 전용 편의 함수**다.
+///
+/// ★R4 정정: 라운드3 보고서는 "cargo check 신규 경고 0" 이라고 썼지만 사실이 아니었다 —
+/// 이 함수가 `dead_code` 경고를 내고 있었다(`warning: function \`digest\` is never used`).
+/// 생산 경로(`record`)는 `normalize` 결과를 preview·chars 산출에 재사용해야 해서
+/// `normalize` + `digest_normalized` 를 따로 부른다(이중 정규화 회피). 즉 이 함수는 배선
+/// 누락이 아니라 **교차언어 앵커용 테스트 헬퍼**이므로 test 빌드로 좁힌다(삭제하지 않는 이유:
+/// python `javis_mission.delivery_digest` 와의 동치를 박제하는 것이 이 함수의 유일한 임무다).
+#[cfg(test)]
 pub fn digest(text: &str) -> String {
     digest_normalized(&normalize(text))
 }
@@ -121,11 +214,32 @@ pub fn digest(text: &str) -> String {
 /// 팩 계약 상태 루트 — `CYS_STATE_DIR` 우선, 없으면 `~/.cys/state`.
 /// (`javis_bootstrap.state_dir()` 와 동일 규약 — 사본이 아니라 **미러**이며, 갈리면 원장이
 /// 조용히 무력화되므로 양쪽에 테스트를 둔다.)
+///
+/// ★R5-B 테스트 위생: **테스트 빌드에서는 실 HOME 으로 해소되지 않는다**(`default_state_root`
+/// 의 cfg 분기). 근거와 대안 비교는 아래 `tests` 모듈 머리말에 있다.
 pub fn pack_state_dir() -> PathBuf {
+    // 테스트 스레드 전용 격리 루트가 있으면 그것이 최우선(락 없이 테스트마다 분리된다).
+    #[cfg(test)]
+    if let Some(p) = tests::thread_state_root() {
+        return p;
+    }
     match std::env::var("CYS_STATE_DIR") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => cys::home_dir().join(".cys").join("state"),
+        _ => default_state_root(),
     }
+}
+
+/// `CYS_STATE_DIR` 미설정 시의 기본 루트 — **생산 빌드**: 팩 계약 경로(`~/.cys/state`).
+#[cfg(not(test))]
+fn default_state_root() -> PathBuf {
+    cys::home_dir().join(".cys").join("state")
+}
+
+/// `CYS_STATE_DIR` 미설정 시의 기본 루트 — **테스트 빌드**: 실 HOME 이 아니라 temp 샌드박스.
+/// (개별 테스트가 격리를 잊어도 라이브 원장이 더러워지지 않게 하는 최종 방어선 · R5-B)
+#[cfg(test)]
+fn default_state_root() -> PathBuf {
+    tests::unisolated_sandbox_root()
 }
 
 /// `javis_bootstrap._socket_is_base` 미러. 소켓 미설정('')=base.
@@ -279,6 +393,57 @@ pub fn write_epoch(socket_path: &Path) {
     }
 }
 
+/// ★기동 시 1회 — 원장에 **기동 표식(sentinel)** 1줄을 append 한다(`write_epoch` 와 짝).
+///
+/// 왜 필요한가(R4 fail-open ② 봉합): 종전 판독자는 "파일이 존재하는데 0바이트"를 **정상**으로
+/// 셌다(`bad=0, good=0` → LEDGER_OK). 그래서 원장을 `: > delivery-base.jsonl` 로 비우기만 하면
+/// 대조할 해시가 사라져 모든 기계 push 가 층2 라벨 폴백으로 내려가고, 무라벨 push 는 그대로
+/// 오너 임무가 됐다. 데몬이 기동 때마다 표식 1줄을 남기면 **정상 원장은 절대 0바이트가 아니다**
+/// 가 성립하고, 판독자는 '빈 파일 = 손상'을 fail-closed 로 판정할 수 있다.
+///
+/// 표식 레코드는 **구 판독자에서도 정상 파싱돼야 한다**(팩 스큐: 신 데몬 + 구 javis_mission).
+/// 그래서 `sha256`·`ts_epoch`·`surface` 필드를 전부 채우되, surface 는 어떤 pane 과도 매치되지
+/// 않는 `"-"`(surface id 는 항상 정수 문자열)로 둔다 — 구 판독자는 '남의 pane 배달'로 건너뛰고
+/// `good` 으로 세므로 손상 오판이 나지 않는다.
+pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
+    let p = ledger_path(socket_path);
+    if let Some(d) = p.parent() {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return Outcome::Failed(format!("상태 디렉터리 생성 실패: {e}"));
+        }
+    }
+    rotate_if_needed(&p);
+    let epoch = crate::state::now_epoch();
+    let rec = json!({
+        "v": LEDGER_SCHEMA,
+        "surface": "-",           // 어떤 pane 과도 매치되지 않는 표기(surface id 는 정수 문자열)
+        "ts_epoch": epoch,
+        "ts": iso_utc(epoch),
+        "sha256": "-",            // 어떤 프롬프트의 sha256 과도 같을 수 없다
+        "origin": Origin::Boot.as_str(),
+        "from": Value::Null,
+        "chars": 0,
+        "preview": "",
+        "daemon_epoch": epoch,
+        "pid": std::process::id(),
+    });
+    append_line(&p, &rec)
+}
+
+/// 원장 파일에 JSON 1줄 append(공통부). append 모드 단일 write — O_APPEND 라 여러 스레드가
+/// 붙어도 라인이 섞이지 않는다(PIPE_BUF 이하 · 레코드는 수백 바이트).
+fn append_line(p: &Path, rec: &Value) -> Outcome {
+    let mut line = rec.to_string();
+    line.push('\n');
+    match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        Ok(mut f) => match f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+            Ok(()) => Outcome::Recorded,
+            Err(e) => Outcome::Failed(format!("원장 write 실패: {e}")),
+        },
+        Err(e) => Outcome::Failed(format!("원장 open 실패({}): {e}", p.display())),
+    }
+}
+
 /// 크기 상한 초과 시 1세대 회전. 실패는 무시(회전 실패가 기록을 막으면 판별이 열린다 —
 /// 원장 부재는 곧 게이트 개방 방향이므로, 회전보다 기록 지속이 우선이다).
 fn rotate_if_needed(p: &Path) {
@@ -289,26 +454,28 @@ fn rotate_if_needed(p: &Path) {
     }
 }
 
-/// ★주입 **직전** 호출 — 배달 사실을 원장에 append 한다. 반환: 기록 성공 여부(진단용).
+/// ★주입 **직전** 호출 — 배달 사실을 원장에 append 한다.
 ///
 /// 호출 규약(불변식 ①): 반드시 `write_tx.try_send(..)` **직전**에 부른다. try_send 가 실패해
 /// 실제 주입이 없었더라도 원장에 남는 것은 무해하다 — 그 방향의 오류는 '오너 문장이 기계로
 /// 오인될 수 있음'(경미)이고, 반대(주입은 됐는데 원장에 없음)는 게이트 개방(치명)이다.
+///
+/// ★호출부는 되도록 `record_audited` 를 쓴다 — 실패를 이벤트로 남겨야 흔적이 생긴다.
 pub fn record(
     socket_path: &Path,
     surface_id: u64,
     text: &str,
     origin: Origin,
     from_surface: Option<u64>,
-) -> bool {
+) -> Outcome {
     let norm = normalize(text);
     if norm.is_empty() {
-        return false; // 공백뿐 — 프롬프트가 될 수 없다(훅도 빈 프롬프트를 판정하지 않는다)
+        return Outcome::Blank; // 공백뿐 — 프롬프트가 될 수 없다(훅도 빈 프롬프트를 판정하지 않는다)
     }
     let p = ledger_path(socket_path);
     if let Some(d) = p.parent() {
-        if std::fs::create_dir_all(d).is_err() {
-            return false;
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return Outcome::Failed(format!("상태 디렉터리 생성 실패: {e}"));
         }
     }
     rotate_if_needed(&p);
@@ -328,13 +495,48 @@ pub fn record(
         "chars": norm.chars().count(),
         "preview": preview,
     });
-    let mut line = rec.to_string();
-    line.push('\n');
-    // append 모드 단일 write — 같은 파일에 여러 스레드가 붙어도 O_APPEND 로 라인이 섞이지 않는다
-    // (PIPE_BUF 이하 · 레코드는 수백 바이트). flush 까지 마친 뒤에만 호출자가 try_send 로 넘어간다.
-    match std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        Ok(mut f) => f.write_all(line.as_bytes()).and_then(|_| f.flush()).is_ok(),
-        Err(_) => false,
+    // flush 까지 마친 뒤에만 호출자가 try_send 로 넘어간다(불변식 ①).
+    append_line(&p, &rec)
+}
+
+/// ★감사 포함 기록 — 실패를 **이벤트로 남긴다**(OUT OF SCOPE 대응: 막을 수 없는 것을 보이게).
+///
+/// 기록 실패는 조용히 지나가면 안 된다. 그 순간 주입된 텍스트는 원장에 없으므로 훅에게
+/// **오너 임무로 보이고**, 게이트가 열린다. 차단할 수는 없다(주입을 막으면 배달 자체가 죽는다)
+/// — 대신 `delivery.record_failed` 이벤트 + 데몬 로그로 흔적을 남겨 사후에 반드시 드러나게 한다.
+/// 반환값은 종전 호출부 호환을 위한 bool(기록됨=true).
+pub fn record_audited(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+) -> bool {
+    match record(&daemon.socket_path, surface_id, text, origin, from_surface) {
+        Outcome::Recorded => true,
+        Outcome::Blank => false,
+        Outcome::Failed(why) => {
+            let path = ledger_path(&daemon.socket_path);
+            eprintln!(
+                "cysd: ★배달 원장 기록 실패 — surface={surface_id} origin={} path={} 사유={why} \
+                 (이 주입은 원장에 없어 임무 게이트가 오너 입력으로 오인할 수 있다)",
+                origin.as_str(),
+                path.display()
+            );
+            daemon.bus.publish(
+                "delivery.record_failed",
+                "system",
+                Some(surface_id),
+                json!({
+                    "origin": origin.as_str(),
+                    "reason": why,
+                    "path": path.to_string_lossy(),
+                    "impact": "이 주입은 배달 원장에 없다 — 임무 게이트가 기계 push 를 오너 임무로 \
+                               오인할 수 있다(자율 착수 권한 오발급 위험). 오너에게 보고 대상."
+                }),
+            );
+            false
+        }
     }
 }
 
@@ -343,23 +545,189 @@ pub fn record(
 pub(crate) mod tests {
     use super::*;
 
-    /// `CYS_STATE_DIR` 은 프로세스 전역 env — 이 배터리 전체를 직렬화한다(pack.rs PACK_ENV_LOCK 패턴).
-    pub(crate) static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ══════════════════════════════════════════════════════════════════════════
+    // ★R5-B 테스트 상태 격리 — "라이브 원장을 테스트가 더럽히지 않는다"
+    //
+    // ## 결함(실측)
+    // `pack_state_dir()` 는 `CYS_STATE_DIR` 이 없으면 실 HOME 으로 해소된다. 그래서 원장을
+    // 건드리는 테스트가 격리를 **잊으면** `~/.cys/state/delivery-<임시소켓>.jsonl` 이 진짜로
+    // 생긴다(1회 실행당 9개 · 누적 67개 실측). 원장 배선이 `record_audited` 로 넓어지며
+    // 악화됐고, 앞으로 더 넓어질수록 "잊을 자리"도 함께 늘어난다.
+    //
+    // ## 그래서 방어를 개별 테스트가 아니라 **해소 함수 자체**에 둔다 (해소 우선순위)
+    //   ① 이 테스트 스레드의 격리 루트(`isolate_state_dir*`)
+    //   ② `CYS_STATE_DIR`(러너 전역 지정)
+    //   ③ 그것도 없으면 — **실 HOME 이 아니라** 프로세스별 temp 샌드박스
+    // ③ 이 본체다. 개별 테스트가 잊어도 라이브는 절대 안 더러워진다.
+    //
+    // ## 왜 env 가 아니라 thread-local 인가 (①)
+    // `CYS_STATE_DIR` 은 **프로세스 전역**이라 병렬 러너에서 서로를 덮어쓴다 — 그래서 종전
+    // `with_state_dir` 은 전역 뮤텍스로 배터리 전체를 직렬화해야 했다. 공용 하네스
+    // (`channels::tests::tmp_daemon` 51곳 · `handlers::tests::daemon_with_acl` 15곳)에 그 방식을
+    // 그대로 확대하면 ⓐ 66개 테스트가 직렬화되고 ⓑ 기존 `ACL_ENV_LOCK` 과의 **획득 순서**가
+    // 갈려 교착이 열린다(실제로 기존 두 테스트는 STATE→ACL 순, 하네스 경유는 ACL→STATE 순이
+    // 된다). thread-local 은 락이 없어 두 문제를 **원천적으로 만들지 않는다**.
+    //
+    // ## 정직 고지 — 이 층이 못 하는 것
+    //  · 데몬이 **배경 스레드**에서 쓰는 원장은 thread-local 을 보지 못한다. 그 경로는 ②/③ 으로
+    //    내려가며, 라이브 오염을 막는 것은 ③ 이다(격리 정밀도는 떨어지고 안전성은 유지된다).
+    //  · 하드 실패(panic)는 **채택하지 않았다**. 배경 스레드에서의 panic 은 조용히 삼켜지거나
+    //    (`join().ok()`) 뮤텍스를 poison 시켜 무관한 테스트를 무너뜨린다 — 즉 탐지기로서
+    //    신뢰할 수 없고 새 flakiness 원인이 된다. 대신 **탐지를 결정론으로** 돌린다:
+    //    격리를 잊은 쓰기는 전부 샌드박스 루트 **최상위**에 떨어지므로, 아래 한 줄이 회귀 게이트다.
+    //      `ls "$TMPDIR"/cys-test-state-*/delivery-*.jsonl | wc -l`  → **0 이어야 한다**
+    //    (배경 스레드 위반까지 잡는다 — panic 방식은 못 잡는 범주다.)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    thread_local! {
+        /// 이 테스트 스레드 전용 원장 루트(①). `None` 이면 ②→③ 으로 내려간다.
+        static THREAD_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// `pack_state_dir()` 가 최우선으로 참조하는 훅(①).
+    pub(crate) fn thread_state_root() -> Option<PathBuf> {
+        THREAD_STATE_ROOT.with(|c| c.borrow().clone())
+    }
+
+    /// 이 테스트 프로세스의 샌드박스 루트. 격리 디렉터리(①)의 부모이자, 격리를 **잊은**
+    /// 쓰기(③)가 떨어지는 자리다. 최상위에 `delivery-*.jsonl` 이 있으면 = 잊은 테스트가 있다.
+    pub(crate) fn test_sandbox_root() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("cys-test-state-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    }
+
+    /// ③ 최종 방어선 — 실 HOME 대신 이 경로를 돌려준다. 프로세스당 1회 stderr 로 고지한다
+    /// (`cargo test -- --nocapture` 에서 보인다).
+    ///
+    /// ★이 고지 자체는 **위반 신호가 아니다.** 아래 R5-B 자기검증 테스트 둘이 이 경로를
+    /// 일부러 해소하므로 정상 실행에서도 반드시 1회 뜬다. 판정은 **경로 해소**가 아니라
+    /// **실제 쓰기**로 한다 — 권위 있는 회귀 게이트는 주석 머리말의 파일 개수 한 줄이다.
+    pub(crate) fn unisolated_sandbox_root() -> PathBuf {
+        let p = test_sandbox_root();
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            eprintln!(
+                "cysd(test): CYS_STATE_DIR 미설정 — 배달 원장을 실 HOME(~/.cys/state) 대신 \
+                 {} 로 강제 격리한다(R5-B). ★위반 판정은 이 줄이 아니라 다음 개수로 한다: \
+                 이 디렉터리 **최상위**의 delivery-* 가 0 이 아니면 격리를 잊은 테스트가 있다 \
+                 (delivery::tests::isolate_state_dir* 를 그 테스트/하네스에 적용할 것).",
+                p.display()
+            );
+        });
+        p
+    }
+
+    /// 격리 디렉터리 이름 충돌 방지용 일련번호(스레드 재사용·동일 tag 중복 호출 대비).
+    static ISO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn new_isolated_dir(tag: &str) -> PathBuf {
+        let n = ISO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slug: String = tag
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let d = test_sandbox_root().join(format!("iso-{n:04}-{slug}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("격리 상태 디렉터리 생성");
+        d
+    }
+
+    /// 이 테스트 스레드의 원장 루트를 새 임시 디렉터리로 고정한다(①). 가드가 drop 되면
+    /// 이전 값으로 복원하고 디렉터리를 지운다 — **가드를 붙들 자리가 있는 테스트**용.
+    pub(crate) fn isolate_state_dir(tag: &str) -> StateDirGuard {
+        let dir = new_isolated_dir(tag);
+        let prev = THREAD_STATE_ROOT.with(|c| c.borrow_mut().replace(dir.clone()));
+        StateDirGuard { dir, prev }
+    }
+
+    /// 가드를 돌려줄 자리가 없는 **공용 하네스**(`tmp_daemon`·`daemon_with_acl`)용 —
+    /// 이 테스트 스레드가 끝날 때까지 유효한 격리 루트를 설정한다(복원 없음 · 호출 시마다 새 dir).
+    /// libtest 는 테스트마다 스레드를 새로 띄우므로 스레드 종료가 곧 해제이고, 스레드가 재사용
+    /// 되더라도 다음 하네스 호출이 새 디렉터리로 **덮어쓴다**(오염된 값이 살아남지 않는다).
+    pub(crate) fn isolate_state_dir_for_thread(tag: &str) -> PathBuf {
+        let dir = new_isolated_dir(tag);
+        THREAD_STATE_ROOT.with(|c| *c.borrow_mut() = Some(dir.clone()));
+        dir
+    }
+
+    /// `isolate_state_dir` 의 RAII 가드.
+    pub(crate) struct StateDirGuard {
+        dir: PathBuf,
+        prev: Option<PathBuf>,
+    }
+
+    impl StateDirGuard {
+        pub(crate) fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            THREAD_STATE_ROOT.with(|c| *c.borrow_mut() = self.prev.clone());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// `record` 는 이제 3상(Recorded/Blank/Failed)을 돌려준다 — "기록됐는가"만 보는 축약.
+    fn rec_ok(o: Outcome) -> bool {
+        matches!(o, Outcome::Recorded)
+    }
 
     fn with_state_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _g = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let td = std::env::temp_dir().join(format!("cys-deliv-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&td);
-        std::fs::create_dir_all(&td).unwrap();
-        let prev = std::env::var("CYS_STATE_DIR").ok();
-        std::env::set_var("CYS_STATE_DIR", &td);
-        let out = f(&td);
-        match prev {
-            Some(v) => std::env::set_var("CYS_STATE_DIR", v),
-            None => std::env::remove_var("CYS_STATE_DIR"),
+        let g = isolate_state_dir("delivery-unit");
+        let dir = g.path().to_path_buf();
+        f(&dir)
+    }
+
+    /// ★R5-B 회귀: **테스트 빌드는 실 HOME 으로 절대 해소되지 않는다.**
+    /// 이것이 깨지면 격리를 잊은 테스트 하나가 곧바로 라이브 원장(`~/.cys/state/delivery-*.jsonl`)
+    /// 을 만든다 — 실제로 67개가 그렇게 쌓였다(제품 결함이 아니라 테스트 위생 결함이지만,
+    /// 오너의 라이브 상태를 오염시키므로 방어는 코드에 있어야 한다).
+    #[test]
+    fn test_build_never_resolves_state_root_to_live_home() {
+        let live_root = cys::home_dir().join(".cys");
+        let got = default_state_root();
+        assert!(
+            !got.starts_with(&live_root),
+            "테스트 빌드의 기본 상태 루트가 라이브 HOME 안이다: {} (라이브: {})",
+            got.display(),
+            live_root.display()
+        );
+        assert_eq!(got, test_sandbox_root(), "기본 루트는 프로세스 temp 샌드박스여야 한다");
+        assert!(got.starts_with(std::env::temp_dir()), "샌드박스는 temp 아래여야 한다");
+    }
+
+    /// ★R5-B 회귀: 스레드 로컬 격리가 실제로 원장 경로를 접고, drop 후 복원되는가.
+    /// (env 를 건드리지 않으므로 병렬 러너에서 다른 테스트와 간섭하지 않는다 — 그것이 채택 이유다.)
+    #[test]
+    fn isolate_state_dir_scopes_paths_to_this_thread_and_restores() {
+        let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+        let before = pack_state_dir();
+        {
+            let g = isolate_state_dir("scope-check");
+            assert_eq!(pack_state_dir(), g.path(), "격리 중에는 가드 경로가 이긴다");
+            assert!(
+                ledger_path(sock).starts_with(g.path()),
+                "원장 경로가 격리 디렉터리 밖이다: {}",
+                ledger_path(sock).display()
+            );
+            assert!(
+                epoch_path(sock).starts_with(g.path()),
+                "epoch 표식도 같은 격리 안에 있어야 한다"
+            );
+            // 중첩 격리도 성립해야 한다(하네스가 이미 격리한 위에 테스트가 다시 격리하는 형태).
+            let inner_dir = {
+                let g2 = isolate_state_dir("scope-check-inner");
+                assert_eq!(pack_state_dir(), g2.path());
+                g2.path().to_path_buf()
+            };
+            assert_ne!(inner_dir, g.path());
+            assert_eq!(pack_state_dir(), g.path(), "중첩 가드 drop 후 바깥 격리로 복원");
         }
-        let _ = std::fs::remove_dir_all(&td);
-        out
+        assert_eq!(pack_state_dir(), before, "가드 drop 후 원래 루트로 복원돼야 한다");
     }
 
     #[test]
@@ -448,8 +816,8 @@ pub(crate) mod tests {
     fn record_appends_matchable_line_and_skips_blank() {
         with_state_dir(|_td| {
             let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
-            assert!(record(sock, 7, "[wakeup] 다음 액션 착수", Origin::Send, Some(3)));
-            assert!(!record(sock, 7, "   \n ", Origin::Send, None), "공백뿐이면 미기록");
+            assert!(rec_ok(record(sock, 7, "[wakeup] 다음 액션 착수", Origin::Send, Some(3))));
+            assert!(!rec_ok(record(sock, 7, "   \n ", Origin::Send, None)), "공백뿐이면 미기록");
             let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
             let lines: Vec<&str> = body.lines().collect();
             assert_eq!(lines.len(), 1);
@@ -469,7 +837,7 @@ pub(crate) mod tests {
             let p = ledger_path(sock);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, vec![b'x'; (LEDGER_MAX_BYTES + 1) as usize]).unwrap();
-            assert!(record(sock, 1, "hello", Origin::Send, None));
+            assert!(rec_ok(record(sock, 1, "hello", Origin::Send, None)));
             assert!(p.with_extension("jsonl.1").exists(), "1세대 회전");
             let body = std::fs::read_to_string(&p).unwrap();
             assert_eq!(body.lines().count(), 1, "회전 후 새 파일에 1건");
@@ -526,7 +894,7 @@ pub(crate) mod tests {
             let h = std::thread::spawn(move || crate::state::run_writer_loop(probe, rx, stop));
 
             // ── 호출 규약 그대로: 기록 **먼저**, 그 다음 writer 채널 인계 ──
-            assert!(record(sock, 42, text, Origin::Send, None));
+            assert!(rec_ok(record(sock, 42, text, Origin::Send, None)));
             tx.send(WriteReq::Data(text.as_bytes().to_vec())).unwrap();
             drop(tx);
             h.join().ok();
@@ -551,7 +919,7 @@ pub(crate) mod tests {
                 "[[중첩]] 대괄호 우회",
                 "［전각］ 라벨 우회",
             ] {
-                assert!(record(sock, 9, t, Origin::Send, None), "기록 실패: {t}");
+                assert!(rec_ok(record(sock, 9, t, Origin::Send, None)), "기록 실패: {t}");
             }
             let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
             for t in ["다음 액션 착수", "이어서 진행해", "[[중첩]] 대괄호 우회", "［전각］ 라벨 우회"] {

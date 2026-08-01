@@ -1,6 +1,6 @@
 ---
 name: skillscan-semantic
-description: 스킬 보안·품질의 시맨틱(LLM) 분석을 cys 워커로 수행하는 스킬 — javis_skillscan.py(정적·결정론)가 못 잡는 의미 잔여(패러프레이즈 jailbreak·정중한 주입·서사적 기만·선언vs행위 괴리)를 Max 구독 워커/서브에이전트로 판정한다(종량제 API 0). SkillSpector의 semantic_developer_intent(SDI)·security_discovery(SSD)·quality_policy(SQP)·tool_poisoning TP4 프롬프트 이식. 한국어 콘텐츠 주 커버처(LLM 언어무관 — 영어 regex가 한국어 prose에 미도달하는 갭을 메운다). 트리거: 스킬/외부repo 채택·등재 전 정밀 시맨틱 검사, javis_skillscan REVISE/HIGH 결과의 2차 판정, "스킬 시맨틱 스캔/의미 위협 검사/skillscan-semantic".
+description: 스킬 보안·품질의 시맨틱(LLM) 분석을 cys 워커로 수행하는 스킬 — javis_skillscan.py(정적·결정론)가 못 잡는 의미 잔여(패러프레이즈 jailbreak·정중한 주입·서사적 기만·선언vs행위 괴리)를 구독형 워커/서브에이전트로 판정한다(종량제 API 0). SkillSpector의 semantic_developer_intent(SDI)·security_discovery(SSD)·quality_policy(SQP)·tool_poisoning TP4 프롬프트 이식. 한국어 콘텐츠 주 커버처(LLM 언어무관 — 영어 regex가 한국어 prose에 미도달하는 갭을 메운다). 트리거: 스킬/외부repo 채택·등재 전 정밀 시맨틱 검사, javis_skillscan REVISE/HIGH 결과의 2차 판정, "스킬 시맨틱 스캔/의미 위협 검사/skillscan-semantic".
 ---
 
 # skillscan-semantic — 스킬 시맨틱 보안·품질 게이트 (무-API)

@@ -1928,6 +1928,12 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
 
   // 전송 직렬화 체인: 빠른 타자에서 비동기 IPC 호출이 경주하면 도착 순서가 뒤집힌다 —
   // promise 체인으로 같은 pane의 모든 입력을 발사 순서대로 보장한다.
+  //
+  // ★★불변식(delivery.rs 불변식 ② · 절대 보존): 이 경로는 **사용자가 자판으로 친 실키**
+  // (term.onData·붙여넣기·Shift+Enter)다 — 여기에 `machineOrigin` 을 붙이면 오너가 친 문장이
+  // 배달 원장에 남아 자기 해시와 매치돼 **기계로 접히고, 임무를 영영 줄 수 없다**(온보딩 사망).
+  // UI 가 문자열을 조립해 보내는 호출(전출 지시·launchCmd·restartNode·injectRawToPane)에만
+  // 표식을 붙인다. 새 자동 주입을 추가할 때 이 구분을 지키는 것이 R5 봉합의 유일한 전제다.
   let sendChain: Promise<unknown> = Promise.resolve();
   const sendRaw = (data: string) => {
     follow = true; // 입력 = 프롬프트 사용 의사 — 바닥 고정 재개(xterm scrollOnUserInput과 정합)
@@ -2298,7 +2304,17 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         `(디렉토리가 없으면 mkdir -p로 생성). 각 필드는 정확히 "## Decided" "## Rejected" "## Risks" ` +
         `"## Files" "## Remaining" 마크다운 헤더로 쓰고, 해당 없음은 "없음"으로 명기하라. ` +
         `5필드가 모두 기록된 파일이 전출 준비 완료 신호다.`;
-      await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst, clearFirst: true });
+      // ★R5 machineOrigin: 이 문안은 **UI 코드가 조립한 것**이지 사용자가 자판으로 친 것이
+      // 아니다. 표식이 없으면 데몬이 오퍼레이터 토큰만 보고 배달 원장 기록을 억제하고, 그러면
+      // 대상 pane 의 훅이 이 지시를 **오너 임무**로 기록해 자율 착수 게이트가 열린다(실측 관통).
+      // 사용자 실키(sendRaw)에는 절대 붙이지 않는다 — 붙이면 오너 문장이 기계로 접힌다.
+      await invoke("send_input", {
+        socket: srcSock,
+        surfaceId: sid,
+        data: inst,
+        clearFirst: true,
+        machineOrigin: true,
+      });
       // ② 5필드 내용 검증 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일 내용 확인(결정론).
       stickyToast("transfer", "feed", "전출 준비 중", "핸드오프 기록 대기(최대 120초)…");
       // 파일 실존≠내용 유효 — 5필드(HANDOFF_CONTRACT)가 전부 갖춰질 때까지 대기한다.
@@ -2334,11 +2350,12 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     // ③ 이후 실패는 보상 트랜잭션 — 새 pane 회수+트리 복원으로 "원본 보존"을 거짓말이 아니게 한다.
     try {
       if (isAgent) {
-        // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령)
+        // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령) — UI 가 조립한 명령이므로 machineOrigin
         await invoke("send_input", {
           socket: destWs.socket,
           surfaceId: newSid,
           data: `${launchCmd}\r`,
+          machineOrigin: true,
         });
         // agent-ready 폴링(최대 60초): agent_meta 등록을 확인한 뒤 복원 지시를 보낸다 —
         // queued(조용 시점 배달)만으로는 부팅 중 quiet 순간에 떨어져 유실될 수 있다(이중 안전).
@@ -2357,6 +2374,9 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
           surfaceId: newSid,
           data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
           queued: true,
+          // queued 는 배달자(Origin::Queue)가 별도로 기록하지만, 표식을 붙여 두면 경로가 바뀌어도
+          // "UI 가 만든 문안"이라는 사실이 유지된다(누락 재발 방지 규칙: UI 조립 = 표식).
+          machineOrigin: true,
         });
       }
       // ⑤ 재기동 성공 후에만 원본 정리
@@ -3732,9 +3752,12 @@ async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
 }
 
 // 주입 공통부 — 성공 피드백(헤더 플래시+토스트)·실패 토스트(무음 삼킴 금지). 자동 Return 없음.
+// ★R5 machineOrigin: 경로 문자열도 **UI 가 조립한 문안**이다(사용자가 자판으로 친 것이 아니다).
+// 자동 Return 이 없어 보통은 사용자가 뒤에 문장을 이어 붙여 제출하므로 프롬프트 전문과는 매치되지
+// 않지만, 판정 불가는 기록하는 쪽이 fail-closed 다(delivery.rs 불변식 ③).
 async function injectRawToPane(rt: PaneRuntime, data: string) {
   try {
-    await invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data });
+    await invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data, machineOrigin: true });
     rt.el.classList.add("inject-flash");
     setTimeout(() => rt.el.classList.remove("inject-flash"), 700);
     toast("feed", "경로 삽입됨", `${rt.titleEl.textContent || rt.sid} — Enter를 눌러야 전송됩니다`);
@@ -4470,6 +4493,8 @@ function cycleHotNodes(hot: OrgSurface[], socket?: string) {
 }
 
 // 재기동: role의 첫 surface로 명령+개행 주입(send_input human=true 재사용, data에 "\n"으로 원자 제출 — 계약 변경 금지).
+// ★R5 machineOrigin: 이 명령문은 UI 코드가 만든 것이므로 배달 원장에 기록돼야 한다(자동 제출까지
+// 하므로 대상 pane 의 훅이 그대로 프롬프트로 본다 — 표식이 없으면 오너 임무로 기록된다).
 async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], socket?: string) {
   const target = surfaces.find((s) => s.role === role && !(s.status?.state === "offline"));
   if (!target) {
@@ -4477,7 +4502,12 @@ async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], so
     return;
   }
   jumpToSurface(target.surface_id, socket);
-  await invoke("send_input", { socket: socket ?? null, surfaceId: target.surface_id, data: cmd + "\n" });
+  await invoke("send_input", {
+    socket: socket ?? null,
+    surfaceId: target.surface_id,
+    data: cmd + "\n",
+    machineOrigin: true,
+  });
 }
 
 // feed 승인: feed_list로 request_id 획득(org.status엔 count만) → 가장 오래된 pending Allow.
