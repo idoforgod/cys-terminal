@@ -968,6 +968,19 @@ pub(crate) fn decide_file_action(
                 let new_pending = manifest_hash != Some(content_hash(embed).as_str());
                 return FileAction::Keep { adopt_hash: false, new_pending };
             }
+        } else {
+            // ★W-1 수리(P0 · 2026-08-01): **판독 불가(disk=None)면 force 여도 무조건 보존.**
+            // read_to_string 실패(ko-KR Windows 의 CP949/ANSI 저장·권한·잠금)는 "사용자 수정이
+            // 없다"는 증거가 아니라 **비교 자체가 불가능하다**는 뜻이다. 종전엔 위 Some(d) 가드와
+            // 아래 `exists && !force` 가드를 둘 다 통과해 최종 폴백의 Write{heal_user_copy:false}로
+            // 떨어졌다 — 헌법 파일(*_DIRECTIVE.md·soul.md·CLAUDE.md·schedule.json·agents.json)이
+            // **무경고·무백업**으로 임베드에 덮여 비가역 소실된다(발화 경로: preflight C03 가 CP949
+            // 파일의 한국어 핀을 전부 '소실'로 오판 → 화면이 `cys init-pack --force` 를 권고).
+            // ★백업 후 교체가 아니라 Keep 이 기본인 이유: 백업 실행부(install_into 의 heal_user_copy)
+            // 자체가 `disk.as_deref()` 의 Some 에 갇혀 있어 disk=None 에선 어떤 백업도 뜨지 못한다
+            // — 플래그만 켜는 수리는 실효 0(측정 완료). 읽을 수 없는 사용자 파일은 더더욱 덮으면
+            // 안 된다. system 등급은 이 분기 밖이라 P0-4 강제 치유는 그대로 유지된다.
+            return FileAction::Keep { adopt_hash: false, new_pending: false };
         }
     }
     if exists && !force {
@@ -982,7 +995,9 @@ pub(crate) fn decide_file_action(
             _ => {
                 // 사용자 수정본·매니페스트 부재·읽기 실패.
                 if is_user_owned(rel) {
-                    // (여기 도달 = 읽기 실패 케이스 — 내용 상이는 위 첫 블록이 잡는다) 보존.
+                    // ★W-1 이후 이 가지는 도달 불가다(읽기 실패는 위 else 가 force 무관하게 먼저
+                    // 잡고, 내용 상이는 첫 블록이 잡는다). 다중 방어로 남겨둔다 — 위 분기가 훗날
+                    // 리팩터링으로 흔들려도 force=false 경로의 보존은 여기서 한 번 더 성립한다.
                     return FileAction::Keep { adopt_hash: false, new_pending: false };
                 }
                 // system: 강제 치유(P0-4 — 임베드 진실). 진짜 사용자 수정본이면 먼저 .user 보존.
@@ -1325,10 +1340,16 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             *dirty = true;
         }
     };
+    // ★W-1: 존재하지만 판독 불가(비UTF-8·권한·잠금)라 **덮지 않고 그대로 둔** 파일 목록.
+    // 병합 대기 원장(.user/.new)에는 잡히지 않는 등급이라, 여기서 따로 세지 않으면 같은 실행의
+    // 사용자 보고("내 커스텀은 지워지지 않았습니다")가 이 파일들을 침묵으로 빠뜨린다.
+    let mut unreadable_kept: Vec<String> = Vec::new();
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
+        let unreadable = exists && disk.is_none();
         let mhash: Option<String> = manifest.get(rel).cloned();
         match decide_file_action(rel, content, exists, disk.as_deref(), mhash.as_deref(), force) {
             FileAction::Keep { adopt_hash, new_pending } => {
@@ -1347,16 +1368,22 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         let _ = write_atomic(&new_path, content.as_bytes());
                     }
                     upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
-                } else if pending
-                    .get(rel)
-                    .and_then(|e| e.get("kind"))
-                    .and_then(|k| k.as_str())
-                    == Some("new-pending")
+                } else if !unreadable
+                    && pending
+                        .get(rel)
+                        .and_then(|e| e.get("kind"))
+                        .and_then(|k| k.as_str())
+                        == Some("new-pending")
                 {
                     // 병합 대기 해소(사용자가 vendor 본 채택 등) — 원장·.new 잔재 청소.
+                    // ★W-1: 판독 불가로 보존된 건은 '해소'가 아니라 '비교 불가'다 — 대기 상태를
+                    // 그대로 둬야 한다(읽지 못했다는 이유로 vendor 신버전 사본을 지우면 정보 손실).
                     pending.remove(rel);
                     pending_dirty = true;
                     let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                }
+                if unreadable {
+                    unreadable_kept.push(rel.to_string());
                 }
                 kept += 1;
                 continue;
@@ -1398,16 +1425,33 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     if pending_dirty {
         save_merge_pending(&dir, &pending);
     }
+    // ★W-1(P0): 판독 불가라 손대지 않은 파일은 **같은 실행의 출력에 반드시 드러난다.** 침묵하면
+    // 사용자는 "덮어썼는지 아닌지"를 알 길이 없고, 아래 병합 대기 수치를 전량으로 오독한다.
+    if !unreadable_kept.is_empty() {
+        println!(
+            "[init-pack] 읽을 수 없어 손대지 않은 파일 {}건 — 내용이 UTF-8 이 아니거나(한국어 Windows 의 \
+             CP949/ANSI 저장 등) 권한·잠금으로 읽기 실패. 덮어쓰기·백업 **둘 다 하지 않았고** 파일은 그대로입니다: {}\n\
+             \x20 조치: 해당 파일을 UTF-8 로 다시 저장하면 다음 설치부터 정상 비교·병합 대상이 됩니다.",
+            unreadable_kept.len(),
+            unreadable_kept.join(", ")
+        );
+    }
     if !pending.is_empty() {
         // ★W-E2: 사용자 언어 요약 — "지워진 게 아니라 보존됐다"를 등급별 수치로 즉시 증명.
         let healed_n = pending.values()
             .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("healed"))
             .count();
         let new_n = pending.len() - healed_n;
+        // ★W-1: 판독 불가 보존분은 원장에 없다 — 위 수치가 '전량'으로 읽히지 않게 같은 줄에 덧붙인다.
+        let unreadable_note = if unreadable_kept.is_empty() {
+            String::new()
+        } else {
+            format!(" · 판독 불가라 손대지 않음 {}건(위 안내)", unreadable_kept.len())
+        };
         println!(
-            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건)\n\
+            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건){}\n\
              \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
-            pending.len(), healed_n, new_n
+            pending.len(), healed_n, new_n, unreadable_note
         );
     }
     // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
@@ -2649,6 +2693,154 @@ mod tests {
             "강제갱신이 사용자 schedule.json 잡을 소실시켰다 — B2-1 위반. after={after}"
         );
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★W-1 회귀 핀 ①(순수 판정 · P0 · 2026-08-01): **판독 불가(disk=None) user-owned 는 force 여도 Keep.**
+    ///
+    /// 무엇이 깨졌었나 — ko-KR Windows 에서 헌법 파일을 CP949/ANSI 로 저장하면 `read_to_string` 이
+    /// 실패해 disk=None 이 된다. 종전 코드는 ⓐuser-owned 보존 블록의 `if let Some(d) = disk` 와
+    /// ⓑ`exists && !force` 블록을 **둘 다 통과**해 최종 폴백 `Write { heal_user_copy: false }` 로
+    /// 떨어졌다 — 무경고·무백업 덮어쓰기. 폭발 반경 = *_DIRECTIVE.md·soul.md·CLAUDE.md·
+    /// schedule.json·agents.json. 이 테스트는 그 한 칸(교집합)만이 아니라 **주변 칸이 변하지 않았음**도
+    /// 함께 고정해, 수리가 Keep 범위를 넓혀 system 강제 치유(P0-4)를 마비시키지 않았음을 증명한다.
+    #[test]
+    fn w1_unreadable_user_owned_kept_even_under_force() {
+        use super::FileAction::*;
+        let embed = "EMBED-V2";
+        let eh = content_hash(embed);
+        let keep = Keep { adopt_hash: false, new_pending: false };
+
+        // ① ★수리 본체: user-owned + 존재 + 판독 불가 → force 여도 Keep(덮어쓰기 금지).
+        //    매니페스트 유무 두 갈래 모두 — 구설치본(None)이 오히려 흔한 실사용 형상이다.
+        for rel in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
+                    "schedule.json", "agents.json", "sub/dir/CSO_DIRECTIVE.md"] {
+            assert_eq!(decide_file_action(rel, embed, true, None, None, true), keep,
+                       "①force=true·판독불가·매니페스트부재 → Keep 이어야: {rel}");
+            assert_eq!(decide_file_action(rel, embed, true, None, Some(eh.as_str()), true), keep,
+                       "①force=true·판독불가·매니페스트有 → Keep 이어야: {rel}");
+            // force=false 도 동일(종전에도 보존됐던 칸 — 회귀 금지).
+            assert_eq!(decide_file_action(rel, embed, true, None, None, false), keep,
+                       "①force=false·판독불가 → Keep 유지: {rel}");
+        }
+
+        // ② 정상 UTF-8 user-owned 경로 **무변화**(수리가 판독 가능한 쪽 의미론을 건드리지 않았다).
+        assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"), Some(eh.as_str()), true),
+                   keep, "②읽기성공·상이·vendor 무전진 → 보존만(종전 동일)");
+        assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
+                       Some(content_hash("EMBED-V1").as_str()), true),
+                   Keep { adopt_hash: false, new_pending: true },
+                   "②읽기성공·상이·vendor 전진 → 보존 + .new 병치(종전 동일)");
+        assert_eq!(decide_file_action("soul.md", embed, true, Some(embed), Some(eh.as_str()), true),
+                   Write { heal_user_copy: false },
+                   "②디스크=임베드 + force → 동일 내용 재기록(종전 동일 — Keep 으로 넓히지 않았다)");
+        // ②-b 부재(신규 설치)는 판독 불가 개념 자체가 없다 — 시드 설치가 막히면 안 된다.
+        assert_eq!(decide_file_action("soul.md", embed, false, None, None, true),
+                   Write { heal_user_copy: false }, "②-b 부재 → 신규 설치(수리가 막지 않는다)");
+
+        // ③ system-owned **불변**: 판독 불가여도 P0-4 강제 치유 유지(동결 = 배포 스큐 재앙의 근원).
+        for rel in ["bin/javis_phoenix.py", "acl.json", "README.md", "CLAUDE.md.template",
+                    "directives/CEO_TEMPLATE.md"] {
+            assert_eq!(decide_file_action(rel, embed, true, None, None, true),
+                       Write { heal_user_copy: false }, "③system·판독불가·force → 치유 유지: {rel}");
+            assert_eq!(decide_file_action(rel, embed, true, None, None, false),
+                       Write { heal_user_copy: false }, "③system·판독불가·비force → 치유 유지: {rel}");
+        }
+        assert_eq!(decide_file_action("acl.json", embed, true, Some("SYS-DRIFT"), None, true),
+                   Write { heal_user_copy: true }, "③system 수정본은 .user 보존 후 치유(종전 동일)");
+
+        // ④ seed-once 는 종전부터 판독 불가에도 불가침 — 우선순위가 뒤집히지 않았음을 재확인.
+        assert_eq!(decide_file_action("memory/MEMORY.md", embed, true, None, None, true), keep,
+                   "④seed-once 판독불가·force → 불가침(종전 동일)");
+    }
+
+    /// ★W-1 회귀 핀 ②(실파일 · 바이트 단위): 프로덕션 `cys init-pack --force` 와 **같은 경로**
+    /// (`install_staged` → staging 복사 → `install_into` → 원자 교체)로 CP949 바이트 디렉티브가
+    /// 살아남는지 검증한다. 순수 판정만 보는 핀 ①과 달리, staging 복사·prune·atomic swap 이
+    /// 중간에서 파일을 갈아치울 여지까지 닫는다. 대조군(system 등급·정상 UTF-8 user)이 종전대로
+    /// 동작함을 같은 실행에서 함께 증명해, 보존이 "설치가 아무것도 안 한" 우연이 아님을 고정한다.
+    #[test]
+    fn w1_force_install_preserves_unreadable_user_files_bytewise() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-w1-cp949-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        let _env = set_pack_env(&pd, base.join("claude"));
+
+        // "# 마스터 절대지침\n주인님 호칭 유지. 내 커스텀 규칙 3개.\n" 의 CP949 인코딩 —
+        // 0xB8 이 UTF-8 시작 바이트로 불법이라 read_to_string 이 반드시 실패한다(disk=None 재현).
+        const CP949: &[u8] = b"\x23\x20\xb8\xb6\xbd\xba\xc5\xcd\x20\xc0\xfd\xb4\xeb\xc1\xf6\xc4\xa7\x0a\
+\xc1\xd6\xc0\xce\xb4\xd4\x20\xc8\xa3\xc4\xaa\x20\xc0\xaf\xc1\xf6\x2e\x20\xb3\xbb\x20\
+\xc4\xbf\xbd\xba\xc5\xd2\x20\xb1\xd4\xc4\xa2\x20\x33\xb0\xb3\x2e\x0a";
+        assert!(String::from_utf8(CP949.to_vec()).is_err(), "픽스처 전제: CP949 바이트는 비UTF-8");
+
+        // ⓪ 정상 설치 1회(매니페스트·pristine 기준선 확보 — 실사용 형상과 동일).
+        install_staged(false, None).unwrap();
+        let embed_of = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
+
+        let unreadable_user = ["soul.md", "directives/MASTER_DIRECTIVE.md"]; // 헌법 파일
+        let unreadable_sys = "acl.json";      // 대조군: system 등급 + 판독 불가
+        let readable_user = "agents.json";    // 대조군: user 등급 + 정상 UTF-8 수정
+        let readable_sys = "README.md";       // 대조군: system 등급 + 정상 UTF-8 수정
+
+        for rel in unreadable_user {
+            std::fs::write(pd.join(rel), CP949).unwrap();
+        }
+        std::fs::write(pd.join(unreadable_sys), CP949).unwrap();
+        std::fs::write(pd.join(readable_user), "{\"adapters\":{\"my-cli\":\"MINE\"}}").unwrap();
+        std::fs::write(pd.join(readable_sys), "SYS-EDIT-XYZ").unwrap();
+        // readable_user 의 마지막 적용본을 과거로 되돌려 vendor 전진(.new 병치) 갈래까지 태운다.
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(readable_user.to_string(), content_hash("OLD-AGENTS-BASE"));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        // ★가장 공격적인 스윕: force 재설치(= `cys init-pack --force`).
+        install_staged(true, None).unwrap();
+
+        // ① 판독 불가 헌법 파일 = **바이트 단위 불변**(내용 비교가 아니라 원본 바이트 그대로).
+        for rel in unreadable_user {
+            assert_eq!(
+                std::fs::read(pd.join(rel)).unwrap(), CP949,
+                "★W-1: force 가 판독 불가 user-owned 를 덮었다(무백업 소실 재발) — {rel}"
+            );
+            // 백업 사이드카가 없다는 사실도 박제 — Keep 은 '백업 후 교체'가 아니라 '무접촉'이다.
+            assert!(!pd.join(format!("{rel}.user")).exists(), "Keep 인데 .user 가 생겼다 — {rel}");
+        }
+        // ② 정상 UTF-8 user-owned: 종전 계약 그대로(보존 + vendor 신버전 .new 병치).
+        assert_eq!(
+            std::fs::read_to_string(pd.join(readable_user)).unwrap(),
+            "{\"adapters\":{\"my-cli\":\"MINE\"}}",
+            "②user-owned 정상 UTF-8 수정본 보존(종전 동작 불변)"
+        );
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{readable_user}.new"))).unwrap(),
+                   embed_of(readable_user), "②vendor 신버전 .new 병치(종전 동작 불변)");
+        // ③ system-owned: 판독 가능/불가 모두 강제 치유 유지(P0-4 마비 없음).
+        assert_eq!(std::fs::read_to_string(pd.join(readable_sys)).unwrap(), embed_of(readable_sys),
+                   "③system 수정본 → 임베드 치유(종전 동작 불변)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{readable_sys}.user"))).unwrap(),
+                   "SYS-EDIT-XYZ", "③치유 전 사용자본 .user 보존(종전 동작 불변)");
+        assert_eq!(std::fs::read(pd.join(unreadable_sys)).unwrap(), embed_of(unreadable_sys).as_bytes(),
+                   "③system 은 판독 불가여도 치유 — 수리가 Keep 범위를 넓히지 않았다");
+
+        // ④ 멱등: 판독 불가 파일이 남아 있어도 재실행이 상태를 흔들지 않는다.
+        install_staged(true, None).unwrap();
+        for rel in unreadable_user {
+            assert_eq!(std::fs::read(pd.join(rel)).unwrap(), CP949, "④재실행 후에도 불변 — {rel}");
+        }
+
+        // ⑤ 병합 대기 중이던 파일이 판독 불가가 되면 대기를 **해소로 오인하지 않는다**.
+        //    (읽지 못한 것은 '사용자가 vendor 본을 채택했다'는 증거가 아니다 — .new·원장 유지.)
+        assert!(load_merge_pending(&pd).get(readable_user).is_some(), "⑤전제: 대기 항목 존재");
+        std::fs::write(pd.join(readable_user), CP949).unwrap();
+        install_staged(true, None).unwrap();
+        assert_eq!(std::fs::read(pd.join(readable_user)).unwrap(), CP949, "⑤판독 불가 전환 후에도 불변");
+        assert!(pd.join(format!("{readable_user}.new")).exists(),
+                "⑤판독 불가를 '병합 해소'로 오인해 vendor 신버전 사본을 지웠다");
+        assert!(load_merge_pending(&pd).get(readable_user).is_some(), "⑤원장 대기 항목도 유지");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md·혼합 설정)만 preserve, 나머지=system.
