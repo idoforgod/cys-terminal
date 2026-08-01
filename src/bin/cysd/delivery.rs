@@ -128,19 +128,58 @@ use std::path::{Path, PathBuf};
 pub const LEDGER_SCHEMA: u64 = 1;
 
 /// 원장 파일 크기 상한(바이트). 초과 시 1세대 회전(`.1` 로 rename 후 새 파일).
-/// 2 MiB ≈ 레코드 ~1만 건 — 판별 창(수 시간)보다 훨씬 길다.
-pub const LEDGER_MAX_BYTES: u64 = 2 * 1024 * 1024;
+///
+/// ★R7 상향 2 MiB → 8 MiB (실측 근거 · SOT §4-6). R6 이 조각 레코드를 도입하면서 **디렉티브급
+/// push 1회의 원장 비용이 294 B → 약 220 KB** 가 됐고, 2 MiB 에서는 그런 push 10 회면 회전해
+/// 과거 구간의 층1 대조 근거가 통째로 사라졌다(회전 꼬리 = SOT §4-6 ⓑ '치명 방향').
+///
+/// 상한을 무한정 올릴 수는 없다 — 판독자(`javis_mission.read_delivery`)는 **오너 프롬프트마다**
+/// 본 세대 + 회전 세대를 전수 파싱하므로 비용이 원장 크기에 선형이다. 실측(python 3.13 ·
+/// 이 저장소 디렉티브 실문안): 판독+판정 **약 8.3 ms/MiB**.
+///   · 2 MiB(현행) → 2세대 4 MiB → 33 ms
+///   · 8 MiB(채택) → 2세대 16 MiB → 135 ms   ← 대화형 훅이 감당하는 상한으로 본다
+///   · 16 MiB      → 2세대 32 MiB → 267 ms   ← 매 프롬프트 지연으로 과하다(기각)
+/// 즉 이 값의 상한을 정하는 것은 디스크가 아니라 **훅 지연**이다. 바꿀 때는 반드시
+/// `javis_mission.LEDGER_MAX_READ_BYTES`(= 이 값의 2배)와 `DELIVERY_SCAN_LINES`(아래 주석의
+/// 유도식)를 함께 옮긴다 — 한쪽만 올리면 정상 데몬 출력이 판독자의 '조작 정황' 상한을 넘겨
+/// **게이트가 영구 fail-closed** 로 잠긴다(부트스트랩 불가침 위반).
+pub const LEDGER_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// 레코드에 남기는 정규화 본문 미리보기 상한(문자). 판정은 sha256 로 하며 이 값은 **진단용**이다.
-/// 원장에 본문 전체를 남기면 그 자체가 프롬프트 유출 저장소가 된다 — 짧게 자른다.
+/// 레코드에 남기는 정규화 본문 미리보기 상한(문자). 판정은 sha256 로 하며 이 값은 **진단용**이자
+/// 판독자의 **부분 일치 앵커**다(SOT §3). 원장에 본문 전체를 남기면 그 자체가 프롬프트 유출
+/// 저장소가 된다 — 짧게 자른다.
 pub const PREVIEW_CHARS: usize = 64;
 
-/// 배달 1건이 남기는 **제출 단위 조각**(개행 분할) 레코드의 최대 개수(R6).
+/// **조각 레코드**의 미리보기 상한(문자) — 전문 레코드(`PREVIEW_CHARS`)보다 짧다(R7 경량화).
+///
+/// 앵커로서의 요건은 "정규화 본문의 **접두사**일 것" 하나다(판독자는 `find(preview)` 로 후보
+/// 위치를 잡고 `chars` 길이를 잘라 sha256 로 **확증**한다). 짧아지면 후보 위치가 늘어 탐색
+/// 예산(`DELIVERY_SPAN_OCC_BUDGET` 10만)을 조금 더 쓸 뿐 **판정은 한 글자도 바뀌지 않는다**.
+/// 24자로 줄이면 한글 조각 1건이 약 417 B → 318 B(실측 -24%)가 되고, 그만큼 회전이 늦어진다.
+/// (`DELIVERY_PART_MIN_CHARS` 와 같은 24 인 것은 우연이 아니다 — 그 하한보다 짧은 앵커는
+/// 부분 일치 규칙이 어차피 단독으로 쓰지 않는다.)
+pub const PART_PREVIEW_CHARS: usize = 24;
+
+/// 배달 1건이 남기는 **제출 단위 조각**(개행 분할) 레코드의 최대 개수(R6 · R7 상향).
 ///
 /// 상한을 두는 이유는 성능이 아니라 **원장 예산**이다 — 조각이 무제한이면 긴 지침 1회 주입이
-/// 2 MiB 상한을 밀어 회전시켜 과거 배달의 판별 근거를 통째로 날린다(회전 꼬리 = SOT §4-6 ⓑ).
-/// 초과분은 조용히 버리지 않고 `delivery.parts_capped` 이벤트로 드러낸다.
-pub const MAX_PARTS: usize = 500;
+/// 크기 상한을 밀어 회전시켜 과거 배달의 판별 근거를 통째로 날린다(회전 꼬리 = SOT §4-6 ⓑ).
+///
+/// ★R7 상향 500 → 4000 (실측 근거 · SOT §4-7 ⓑ). 라운드6 은 "실배포 디렉티브 최대 454 단위 ⇒
+/// 여유 46" 으로 봤지만 그건 **파일 하나**의 값이다. 실제로 pane 에 들어가는 것은
+/// `cys.rs::compose_directive` 가 합성한 문안(역할 디렉티브 + RSI + soul.md + 장기메모리 색인 +
+/// 스킬 색인 + 오버레이)이고, 실측하면 master 가 **702 고유 제출단위**다 — 즉 500 상한은
+/// **이미 초과 상태**였고 매 `launch-agent`·`reinject`·`cycle` 마다 약 200 행이 원장에서
+/// 조용히 빠지고 있었다(회귀 핀: `deployed_directive_payload_fits_part_cap_with_headroom`).
+/// 4000 은 실측 최대(702)의 5.7 배이며, 초과분 1건의 원장 비용은 4000 × ~318 B ≈ 1.3 MB 로
+/// 위 `LEDGER_MAX_BYTES` 의 15% 다(한 번의 초장문 push 가 원장을 통째로 밀어내지 못한다).
+///
+/// 초과분은 조용히 버리지 않는다 — ⓐ`delivery.parts_incomplete` 이벤트(데몬 버스)와
+/// ⓑ**전문 레코드의 `parts_capped` 필드**로 남긴다. ⓑ 가 R7 의 본체다: 데몬 버스는 임무
+/// 게이트의 판독 경로가 아니어서, 종전에는 초과가 나도 임무 verdict 에 흔적이 0 이었다.
+/// 판독자는 `parts_capped` 를 보면 **그 배달에 대한 판정을 접는다**(fail-closed · 불변식 ③ ·
+/// `javis_mission.py::DELIVERY_CAPPED_FOLD_S`).
+pub const MAX_PARTS: usize = 4000;
 
 /// 원장 append 1회 write 의 바이트 예산. O_APPEND 단일 write 는 이 크기 이하에서 사실상 원자라
 /// 여러 스레드가 붙어도 줄이 섞이지 않는다 — 조각 N 건을 **한 번에** 쓰되 이 크기로 끊는다
@@ -608,7 +647,7 @@ pub fn record_full(
     let units = submit_units(text);
     let parts: Vec<&String> = units.iter().filter(|u| **u != norm).collect();
     let dropped = parts.len().saturating_sub(MAX_PARTS);
-    let rec = json!({
+    let mut rec = json!({
         "v": LEDGER_SCHEMA,
         // ★surface 는 pane env `CYS_SURFACE_ID` 와 **같은 표기**(정수 문자열)다 —
         //   판독자가 재조립 없이 문자열 비교로 조인한다(state.rs: builder.env(ENV_SURFACE_ID, id)).
@@ -624,6 +663,15 @@ pub fn record_full(
         //   판독자가 "프롬프트가 이 레코드의 조각인가" 를 물을 필요조차 없는 레코드다.
         "units": units.len(),
     });
+    if dropped > 0 {
+        // ★R7 — **판독자가 볼 수 있는 자리**에 초과 사실을 남긴다.
+        //   종전에는 데몬 버스 이벤트(`delivery.parts_incomplete`)뿐이었고, 임무 게이트는 버스를
+        //   구독하지 않으므로 초과가 나도 임무 verdict 에 흔적이 0 이었다 — 즉 "원장에 없는 행이
+        //   오너 임무를 발급"하는 경로가 **조용히** 열려 있었다(SOT §4-7 ⓑ).
+        //   필드가 붙으면 판독자는 그 배달에 대한 판정을 접고(fail-closed) 이상징후로 고지한다.
+        //   ★구 판독자 호환: 모르는 필드는 무시되므로 스큐에서도 종전 동작 그대로다(회귀 0).
+        rec["parts_capped"] = json!(dropped);
+    }
     // flush 까지 마친 뒤에만 호출자가 try_send 로 넘어간다(불변식 ①).
     let outcome = append_line(&p, &rec);
     if !matches!(outcome, Outcome::Recorded) || parts.is_empty() {
@@ -636,16 +684,21 @@ pub fn record_full(
         .take(MAX_PARTS)
         .enumerate()
         .map(|(i, u)| {
+            // ★R7 경량화 — 조각 레코드는 **판독자 필수 필드 + 감사 결속**만 남긴다.
+            //   전문 레코드에 있는 `ts`(ISO 문자열)·`from` 은 조각에서 뺐다: 판독자
+            //   (`javis_mission.read_delivery`)가 읽는 필드는 v·surface·ts_epoch·sha256·chars·
+            //   preview·origin·units·part·parent 뿐이고, `ts` 는 `ts_epoch` 에서 유도되며 `from`
+            //   은 같은 배달의 전문 레코드에 그대로 있다(같은 `ts_epoch`·`parent` 로 결속된다).
+            //   빼는 이유는 미학이 아니라 **회전 예산**이다 — 조각 1건당 약 42 B, 디렉티브급
+            //   push 1회당 약 30 KB 다(SOT §4-6).
             json!({
                 "v": LEDGER_SCHEMA,
                 "surface": surface_id.to_string(),
                 "ts_epoch": epoch,
-                "ts": iso_utc(epoch),
                 "sha256": digest_normalized(u),
                 "origin": origin.as_str(),
-                "from": from_surface.map(|s| s.to_string()),
                 "chars": u.chars().count(),
-                "preview": u.chars().take(PREVIEW_CHARS).collect::<String>(),
+                "preview": u.chars().take(PART_PREVIEW_CHARS).collect::<String>(),
                 // 감사용 결속 — 이 조각이 어느 배달의 몇 번째 제출 단위인가.
                 "part": i + 1,
                 "parent": sha,
@@ -695,7 +748,10 @@ pub fn record_audited(
                 "reason": report.parts_failed,
                 "path": path.to_string_lossy(),
                 "impact": "이 배달의 일부 행이 배달 원장에 없다 — 그 행이 단독 제출되면 임무 \
-                           게이트가 기계 push 를 오너 임무로 오인할 수 있다(오너 보고 대상)."
+                           게이트가 기계 push 를 오너 임무로 오인할 수 있다(오너 보고 대상). \
+                           ★R7: 상한 초과(dropped>0)는 전문 레코드의 `parts_capped` 필드로도 \
+                           남아 임무 게이트가 그 배달에 대한 판정을 접는다(fail-closed) — 이 \
+                           이벤트는 데몬 버스 구독자용이고, 게이트가 보는 것은 원장 쪽이다."
             }),
         );
     }
@@ -1292,6 +1348,10 @@ pub(crate) mod tests {
     }
 
     /// 상한 초과는 **조용히 버리지 않는다** — 남긴 수·버린 수가 보고되어야 감사가 성립한다.
+    ///
+    /// ★R7: 보고 채널이 둘이다. ⓐ`RecordReport`(호출부 → 데몬 버스 이벤트) ⓑ**전문 레코드의
+    /// `parts_capped` 필드**(→ 임무 게이트). ⓑ 가 없으면 게이트는 초과를 영영 모른다 —
+    /// 데몬 버스는 `javis_mission.py` 의 판독 경로가 아니기 때문이다(SOT §4-7 ⓑ).
     #[test]
     fn part_cap_is_reported_not_silent() {
         with_state_dir(|_td| {
@@ -1302,6 +1362,219 @@ pub(crate) mod tests {
             let r = record_full(sock, 3, &text, Origin::Send, None);
             assert_eq!(r.parts_written, MAX_PARTS);
             assert_eq!(r.parts_dropped, 7, "버린 조각 수가 사실대로 보고돼야 한다");
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            let head: serde_json::Value =
+                serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                head["parts_capped"], 7,
+                "판독자(임무 게이트)가 보는 자리에 초과 사실이 없다 — 데몬 버스만으로는 \
+                 게이트가 영영 모른다(조용한 실패)"
+            );
+        });
+    }
+
+    /// 상한을 넘지 않은 배달에는 `parts_capped` 가 **아예 없다** — 평시 레코드 모양 불변.
+    ///
+    /// 필드가 상시 붙으면(예: `parts_capped: 0`) 판독자 쪽 fail-closed 조건이 "0 인지 보기"에
+    /// 의존하게 되고, 그 비교를 한 번 잘못 쓰는 순간 **모든 배달이 접힌다**(오너 전면 차단 =
+    /// 부트스트랩 사망). 존재 자체가 곧 이상이라는 모양이 그 사고를 구조적으로 막는다.
+    #[test]
+    fn uncapped_delivery_carries_no_capped_marker() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text = "첫 행 지시\n둘째 행 지시\n셋째 행 지시";
+            let r = record_full(sock, 6, text, Origin::Send, None);
+            assert_eq!(r.parts_dropped, 0);
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            for line in body.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(
+                    v.get("parts_capped").is_none(),
+                    "상한을 넘지 않았는데 초과 표식이 붙었다: {line}"
+                );
+            }
+        });
+    }
+
+    /// ★R7 회귀 핀 ① — **실배포 디렉티브가 조각 상한에 얼마나 다가갔는가**를 파일에서 직접 잰다.
+    ///
+    /// ## 왜 이 핀이 필요한가 (라운드6 검증자 적발의 본체)
+    /// 상한은 숫자로 박혀 있고 디렉티브는 **라운드마다 커진다**. 둘의 거리는 아무도 안 보면
+    /// 조용히 0 이 되고, 그 순간부터 초과분 행은 원장에 없다 = 그 행이 단독 제출되면 기계 push 가
+    /// 오너 임무를 발급한다. 그래서 거리를 **테스트가 지킨다**.
+    ///
+    /// ## 무엇을 재는가 — 파일 하나가 아니라 **합성 문안**
+    /// pane 에 실제로 들어가는 것은 `cys.rs::compose_directive` 의 출력이다(역할 디렉티브 +
+    /// RSI + soul.md + 장기메모리 색인 + 스킬 색인). 라운드6 은 `MASTER_DIRECTIVE.md` **단독**
+    /// 454 단위만 보고 "여유 46" 이라고 했지만, 합성본은 master 기준 700 단위대여서 종전 상한
+    /// 500 은 **이미 초과 상태**였다. 이 핀은 그 착시를 다시 만들지 않는다.
+    /// (합성 로직은 `cys` 바이너리에 있으므로 여기서는 **같은 구성요소를 같은 순서로 이어붙여**
+    ///  재현한다. 구성요소가 늘면 이 핀이 과소평가하게 되므로 목록은 compose_directive 와 함께
+    ///  갱신한다 — 그래도 '파일 하나만 보던' 종전보다 언제나 정확하다.)
+    #[test]
+    fn deployed_directive_payload_fits_part_cap_with_headroom() {
+        // 상한 대비 이 배수 이상 여유가 없으면 실패한다(=상한을 올리거나 문안을 줄이라는 신호).
+        // 4 배: 디렉티브가 지금의 4 배가 되기 전에 반드시 사람이 한 번 본다.
+        const REQUIRED_HEADROOM: usize = 4;
+        let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
+        let read = |rel: &str| std::fs::read_to_string(pack.join(rel)).unwrap_or_default();
+        // compose_directive 와 같은 순서 — 역할 디렉티브 → RSI → soul → 장기메모리 색인 → 스킬 색인
+        let mut composed = read("directives/MASTER_DIRECTIVE.md");
+        composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
+        composed.push_str(&read("soul.md"));
+        composed.push_str(&read("memory/MEMORY.md"));
+        if let Ok(entries) = std::fs::read_dir(pack.join("skills")) {
+            for e in entries.flatten() {
+                let skill = std::fs::read_to_string(e.path().join("SKILL.md")).unwrap_or_default();
+                // 색인은 `- <name>: <description>` 한 줄이다(compose_directive 와 동형).
+                let field = |k: &str| {
+                    skill
+                        .lines()
+                        .take(10)
+                        .find_map(|l| l.strip_prefix(k))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let (name, desc) = (field("name:"), field("description:"));
+                if !name.is_empty() {
+                    composed.push_str(&format!("\n- {name}: {desc}"));
+                }
+            }
+        }
+        assert!(
+            !composed.is_empty(),
+            "합성 문안이 비었다 — 팩 경로가 갈렸다({})",
+            pack.display()
+        );
+        let units = submit_units(&composed).len();
+        assert!(
+            units * REQUIRED_HEADROOM <= MAX_PARTS,
+            "실배포 디렉티브 합성 문안이 {units} 제출단위인데 조각 상한은 {MAX_PARTS} 다 \
+             (요구 여유 {REQUIRED_HEADROOM}배 = {} 단위 이하). 상한을 올리거나 문안을 줄여라 \
+             — 상한을 넘긴 행은 원장에 없고, 그 행이 단독 제출되면 임무 게이트가 기계 push 를 \
+             오너 임무로 오인한다(SOT §4-7 ⓑ).",
+            MAX_PARTS / REQUIRED_HEADROOM
+        );
+    }
+
+    /// ★R7 회귀 핀 ② — **디렉티브급 push 1회의 원장 비용과 회전까지의 횟수**를 실측으로 묶는다.
+    ///
+    /// R6 이 조각 레코드를 도입하며 회전이 572 배 빨라졌다는 것이 라운드6 검증자의 실측이었다
+    /// (회전으로 소실된 구간은 층1 대조가 불가능 = SOT §4-6 ⓑ '치명 방향'). 여기서 재는 것은
+    /// **바이트/1회 push** 와 **`LEDGER_MAX_BYTES` 기준 회전까지 push 횟수**이며, 수치가 나빠지면
+    /// (레코드가 다시 비대해지거나 상한이 내려가면) 실패한다.
+    #[test]
+    fn directive_grade_push_keeps_rotation_budget() {
+        // 디렉티브급 push 를 이 횟수 이상 담지 못하면 실패(=회전 꼬리가 다시 짧아졌다).
+        const REQUIRED_PUSHES_TO_ROTATE: u64 = 30;
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            // 실배포 디렉티브 본문을 그대로 쓴다(합성 규모 = 700 단위대의 대표값).
+            let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
+            let mut text = std::fs::read_to_string(pack.join("directives/MASTER_DIRECTIVE.md"))
+                .expect("배포 디렉티브를 읽어야 실측이다");
+            text.push_str(
+                &std::fs::read_to_string(pack.join("directives/RSI_LEARNING_DIRECTIVE.md"))
+                    .unwrap_or_default(),
+            );
+            let units = submit_units(&text).len();
+            let r = record_full(sock, 77, &text, Origin::Send, None);
+            assert_eq!(r.parts_dropped, 0, "이 규모는 상한 안이어야 한다(핀 ①과 같은 취지)");
+            let bytes = std::fs::metadata(ledger_path(sock)).unwrap().len();
+            let pushes = LEDGER_MAX_BYTES / bytes.max(1);
+            assert!(
+                pushes >= REQUIRED_PUSHES_TO_ROTATE,
+                "디렉티브급 push({units} 단위)가 1회에 {bytes} B 를 쓴다 — 원장 상한 \
+                 {LEDGER_MAX_BYTES} B 기준 {pushes} 회면 회전한다(요구 {REQUIRED_PUSHES_TO_ROTATE} \
+                 회 이상). 회전으로 소실된 구간은 층1 대조가 불가능하다(SOT §4-6 ⓑ)."
+            );
+            // 조각 1건당 바이트도 함께 고정한다(레코드가 다시 비대해지는 회귀 방지).
+            let per_part = bytes / (r.parts_written as u64 + 1);
+            assert!(
+                per_part <= 400,
+                "조각 1건이 평균 {per_part} B 다 — 경량화(ts/from 제거·preview {PART_PREVIEW_CHARS}자)가 \
+                 풀렸는지 확인하라"
+            );
+        });
+    }
+
+    /// ★R7 회귀 핀 ③ — **생산자 상한과 판독자 상한이 함께 움직였는가**(교차언어 결합).
+    ///
+    /// `LEDGER_MAX_BYTES` 를 올리면서 판독자(`javis_mission.py`)의
+    /// `LEDGER_MAX_READ_BYTES`·`DELIVERY_SCAN_LINES` 를 그대로 두면 **정상 데몬 출력이 판독자의
+    /// '조작 정황' 상한을 넘긴다** → 원장이 판독 불가로 접히고, 그 상태에서는 오너가 임무를 줄
+    /// 수 없다(부트스트랩 불가침 위반 · 차단이 만든 가용성 사고). 두 파일이 다른 언어·다른
+    /// 배포 단위라 사람이 한쪽만 고치기 쉬운 자리이므로, 결합을 테스트로 못 박는다.
+    #[test]
+    fn reader_scan_limits_track_producer_rotation_cap() {
+        let py = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("cysjavis-pack/bin/javis_mission.py");
+        let src = std::fs::read_to_string(&py).expect("판독자 소스를 읽어야 결합을 확인한다");
+        // `NAME = <식>` 한 줄에서 정수 리터럴 곱을 계산한다(주석은 `#` 이후를 버린다).
+        let konst = |name: &str| -> u64 {
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} = ")))
+                .unwrap_or_else(|| panic!("판독자에서 {name} 을 못 찾았다 — 이름이 갈렸다"));
+            let expr = line.split('=').nth(1).unwrap().split('#').next().unwrap();
+            expr.split('*')
+                .map(|t| t.trim().parse::<u64>().expect("정수 리터럴 곱만 지원한다"))
+                .product()
+        };
+        // 상한 초과 표식의 **필드명**이 양쪽에서 같아야 한다. 이름이 갈리면 데몬은 성실히
+        // 남기고 판독자는 영영 못 보는 상태가 되며, 그건 R7 이전(흔적 0)과 정확히 같다.
+        assert!(
+            src.contains("\"parts_capped\""),
+            "판독자가 `parts_capped` 필드를 읽지 않는다 — 생산자만 남기면 임무 게이트는 상한 \
+             초과를 영영 모른다(조용한 실패)"
+        );
+        let read_cap = konst("LEDGER_MAX_READ_BYTES");
+        let scan_cap = konst("DELIVERY_SCAN_LINES");
+        assert!(
+            read_cap >= LEDGER_MAX_BYTES,
+            "판독자 세대당 바이트 상한({read_cap})이 데몬 회전 상한({LEDGER_MAX_BYTES})보다 작다 \
+             — 정상 원장이 '판독 불가'가 되어 게이트가 영구 잠긴다"
+        );
+        // 데몬이 만들 수 있는 최대 줄 수(2세대 · 회전 검사는 append 앞이므로 세대당 상한 + push 1회).
+        // 최소 레코드 바이트는 보수적으로 잡는다(작게 잡을수록 요구 줄수가 커진다 = 안전측).
+        const MIN_RECORD_BYTES: u64 = 150;
+        let max_push_bytes = MAX_PARTS as u64 * 400;
+        let producible_lines = 2 * (LEDGER_MAX_BYTES + max_push_bytes) / MIN_RECORD_BYTES;
+        assert!(
+            scan_cap > producible_lines,
+            "판독자 스캔 상한({scan_cap} 줄)이 데몬이 정상 동작으로 만들 수 있는 줄 수\
+             ({producible_lines})보다 작다 — 평시 원장이 '조작 정황'으로 접힌다(fail-closed 오발)"
+        );
+    }
+
+    /// 조각 레코드는 **판독자 필수 필드**를 전부 갖고, 뺀 필드(`ts`·`from`)는 전문에만 있다.
+    ///
+    /// 경량화가 판독자 계약을 건드리면 층1 이 **조용히** 죽는다(양쪽 테스트가 다 초록인 채로).
+    /// 그래서 뺄 수 있는 것과 없는 것을 여기서 못 박는다.
+    #[test]
+    fn part_records_are_slim_but_keep_reader_contract() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let text = "첫 행 지시문입니다\n둘째 행 지시문입니다";
+            let _ = record_full(sock, 9, text, Origin::Send, Some(3));
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            let recs: Vec<serde_json::Value> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(recs.len(), 3, "전문 1 + 조각 2");
+            // 전문 레코드는 종전 그대로(감사 머리)
+            assert!(!recs[0]["ts"].is_null() && !recs[0]["from"].is_null());
+            for r in &recs[1..] {
+                for k in ["v", "surface", "ts_epoch", "sha256", "chars", "preview", "origin"] {
+                    assert!(!r[k].is_null(), "판독자 필수 필드 {k} 가 조각에서 사라졌다: {r}");
+                }
+                assert_eq!(r["parent"], recs[0]["sha256"], "감사 결속(parent)은 유지한다");
+                assert_eq!(r["ts_epoch"], recs[0]["ts_epoch"], "같은 배달임이 ts_epoch 로 결속된다");
+                assert!(r.get("ts").is_none(), "조각의 ISO ts 는 뺀다(ts_epoch 로 유도)");
+                assert!(r.get("from").is_none(), "조각의 from 은 뺀다(전문에 있다)");
+            }
         });
     }
 

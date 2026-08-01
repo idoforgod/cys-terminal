@@ -157,6 +157,7 @@
   | `ledger_rotated` | 원장 회전 — 소실 구간의 기계 push 는 층1 로 대조 불가 |
   | `ledger_bad_lines` | 해석 불가 줄 혼입(부분쓰기·조작 정황) |
   | `ledger_schema_skew` | 원장에 판독자가 모르는 스키마 버전이 섞임 — **그 배달은 층1 에서 통째로 안 보인다**(데몬↔팩 버전 스큐) |
+  | `delivery_parts_capped` | 배달이 조각 상한을 넘겨 **초과분 행이 원장에 없다** — 그 배달 직후(10분)의 미매치 프롬프트는 판정을 접는다(fail-closed) |
   | `delivery_out_of_window` | 창 밖 배달과 전문 일치 — 접었으나 지연이 비정상 |
   | `delivery_concatenated` | 기계 배달 둘 이상이 한 프롬프트로 연접 제출됨 |
   | `delivery_substring` | 기계 배달이 프롬프트에 통째로 포함됨 |

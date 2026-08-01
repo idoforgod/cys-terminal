@@ -275,6 +275,7 @@ ANOMALY_CODES = {
     "ledger_rotated": "원장 회전 — 소실 구간의 기계 push 는 층1 로 대조 불가",
     "ledger_bad_lines": "해석 불가 줄 혼입(부분쓰기·조작 정황)",
     "ledger_schema_skew": "원장에 이 판독자가 모르는 스키마 버전이 섞였다 — 그 배달은 층1 에서 통째로 보이지 않는다",
+    "delivery_parts_capped": "배달이 조각 상한을 넘겨 초과분 행이 원장에 없다 — 그 배달 직후의 미매치 프롬프트는 **판정을 접는다**(R7 fail-closed)",
     # ── 프롬프트 유래 — 그 프롬프트에서 1회만 관측된다(대장에 병합해 영속) ──
     "delivery_out_of_window": "창 밖 배달과 전문 일치 — 접었으나 지연이 비정상",
     "delivery_concatenated": "기계 배달 둘 이상이 한 프롬프트로 연접 제출됨",
@@ -358,14 +359,22 @@ def _env_bounded(name, default, lo, hi):
 DELIVERY_WINDOW_S = _env_bounded("CYS_DELIVERY_WINDOW_S", 21600,
                                  DELIVERY_WINDOW_MIN_S, DELIVERY_WINDOW_MAX_S)   # 기본 6시간
 # 원장 뒤에서부터 훑는 최대 줄 수 — **성능 상한이 아니라 안전 상한**이다.
-# 데몬이 2 MiB 에서 1세대 회전하므로 판독 대상(본+.1)은 최대 ~4 MiB ≈ 1.6만 레코드다. 즉 이 값에
-# 도달한다는 것은 원장이 데몬이 허용하지 않는 크기라는 뜻(외부 조작 정황)이므로, 도달하면
-# **조용히 자르지 않고 판독 불가(fail-closed)** 로 접는다 — 종전엔 여기서 조용히 잘라
+# 이 값에 도달한다는 것은 원장이 **데몬이 만들 수 없는 크기**라는 뜻(외부 조작 정황)이므로,
+# 도달하면 **조용히 자르지 않고 판독 불가(fail-closed)** 로 접는다 — 종전엔 여기서 조용히 잘라
 # "4000줄 밀어내기"로 층1 을 무력화할 수 있었다(R4 fail-open ①).
-DELIVERY_SCAN_LINES = 50000
+#
+# ★★생산자와 **함께 움직여야 하는 값**이다(R7 · 이 결합을 놓치면 게이트가 영구 잠긴다).
+#   유도식: 데몬 최대 줄 수 = 2세대 × (LEDGER_MAX_BYTES + 최대 push 1회) ÷ 최소 레코드 바이트
+#           = 2 × (8 MiB + 4000조각×~300 B) ÷ ~190 B ≈ 10.2만 줄
+#   여기에 종전과 같은 ~2.5배 안전 여유를 둬 25만으로 잡는다. 이 값을 그대로 두고 데몬 쪽
+#   `LEDGER_MAX_BYTES` 만 올리면 **정상 데몬 출력이 '조작 정황' 상한을 넘겨** 판독 불가가 되고,
+#   그 상태에서는 오너가 임무를 줄 수 없다(부트스트랩 불가침 위반 = 차단이 만든 가용성 사고).
+DELIVERY_SCAN_LINES = 250000
 # 세대당 판독 바이트 상한 — **읽기 전에** 검사해 거대 파일로 훅을 잠그는 경로를 막는다.
-# 데몬 회전 상한(delivery.rs::LEDGER_MAX_BYTES = 2 MiB)의 2배 여유. 초과 = 판독 불가(자르지 않는다).
-LEDGER_MAX_READ_BYTES = 4 * 1024 * 1024
+# 데몬 회전 상한(delivery.rs::LEDGER_MAX_BYTES = 8 MiB · R7 상향)의 2배 여유.
+# 초과 = 판독 불가(자르지 않는다). ★데몬은 회전 검사를 append **앞**에 하므로 한 세대가
+#   상한 + push 1회를 넘길 수 없다 — 즉 2배 여유는 조작 내성이지 정상 동작의 여지가 아니다.
+LEDGER_MAX_READ_BYTES = 16 * 1024 * 1024
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ★R5 — 두 기계 배달의 **연접**(concatenation) 봉합에 쓰는 수치
@@ -378,6 +387,14 @@ LEDGER_MAX_READ_BYTES = 4 * 1024 * 1024
 # PREVIEW_CHARS 자를 그대로** 넣으므로, 평문 `str.find` 로 후보 위치를 O(n) 에 찾고 그 위치에서
 # `chars` 길이를 잘라 sha256 로 **확증**한다(앵커는 탐색용, 판정은 해시).
 PREVIEW_CHARS = 64                 # delivery.rs::PREVIEW_CHARS 미러(갈리면 앵커가 조용히 빗나간다)
+# ★R7: **조각 레코드**의 preview 는 더 짧다(delivery.rs::PART_PREVIEW_CHARS 미러 · 회전 예산).
+#   앵커 규칙은 길이에 의존하지 않는다 — 요건은 "정규화 본문의 접두사일 것" 하나이고 판정은
+#   언제나 `chars` 길이를 잘라 낸 sha256 다. 짧아지면 후보 위치가 늘어 탐색 예산을 조금 더 쓸 뿐,
+#   접는/여는 판정은 한 글자도 바뀌지 않는다(양쪽 코퍼스 실측).
+#   ★판독 코드는 이 값을 **쓰지 않는다**(preview 를 있는 그대로 앵커로 쓴다). 여기 두는 이유는
+#     self-test 의 원장 미러가 생산자와 같은 모양을 만들게 하기 위해서다 — 미러가 갈리면 양쪽
+#     테스트가 다 초록인 채로 층1 이 조용히 죽는다.
+PART_PREVIEW_CHARS = 24
 # 부분문자열 하나만으로 접을 때 요구하는 최소 레코드 길이(정규화 문자수).
 # ★이 하한이 없으면 "네"·"확인" 같은 짧은 기계 배달이 오너 프롬프트 어디에나 우연히 포함돼
 #   오너 임무가 영영 안 열린다(거짓 음성 폭발 = 그것도 장애다). 반면 **전량 커버(연접)** 판정은
@@ -404,6 +421,29 @@ DELIVERY_SPAN_OCC_BUDGET = 100000
 #   대조 가능한 것은 `preview` 뿐이고, 따라서 이 규칙만은 **해시가 아니라 평문**이다.
 #   그래서 자물쇠를 둘 건다: ⓐ이 하한 이상 ⓑ preview 안에서 **행/어절 경계**에 맞아떨어질 것.
 DELIVERY_WITHIN_MIN_CHARS = 24
+# ══════════════════════════════════════════════════════════════════════════════
+# ★R7 — 조각 상한 초과(`parts_capped`) 배달 뒤에 판정을 접는 창(초)
+# ══════════════════════════════════════════════════════════════════════════════
+# ## 무엇을 막는가
+# 데몬이 `MAX_PARTS` 를 넘는 배달을 받으면 초과분 행은 **원장에 없다**. 그 행이 단독 제출되면
+# 층1 은 전건 미스이고, 무라벨이면 층2 도 통과해 기계 push 가 오너 임무를 발급한다(§1 #17 과
+# 같은 결과). 종전에는 이 사실이 데몬 버스 이벤트에만 있어 임무 verdict 에 흔적이 0 이었다.
+# 이제 생산자가 전문 레코드에 `parts_capped` 를 남기므로, 판독자는 **그 배달 뒤에 오는 미매치
+# 프롬프트를 접는다**(fail-closed · delivery.rs 불변식 ③ "애매하면 접는다").
+#
+# ## 왜 '무기한'이 아니라 창인가 (★이 선택이 이 상수의 전부다)
+# "capped 레코드가 하나라도 있으면 무조건 접는다"는 더 강해 **보이지만**, 그건 이 모듈이
+# 스키마 스큐에서 이미 기각한 안티패턴이다 — 원장에 그런 레코드 한 줄만 있으면 **오너가 임무를
+# 영영 줄 수 없다**(부트스트랩 불가침 위반 · 차단이 새 가용성 구멍을 만드는 형태). 실제로
+# R6 상한(500)은 실배포 합성 디렉티브(702 단위)에 **이미 미달**이어서, 무기한 규칙이었다면
+# master 를 띄울 때마다 오너 온보딩이 죽었을 것이다.
+# 창의 근거는 물리다: 잘린 행들은 TUI 가 **지금 재생 중인 붙여넣기의 꼬리**이므로 제출은 초
+# 단위로 끝난다. 10분은 그보다 두 자릿수 큰 여유이며, 그 사이 오너가 접히는 것은 "상한을 넘는
+# 초장문 push 직후"라는 이상 상태에서만이다(평시 최대는 상한의 1/5 — 회귀 핀이 지킨다).
+# ## 정직 고지(잔여)
+# pane 이 창보다 오래 막혀 있다가 꼬리를 뒤늦게 제출하면 그 행은 여전히 열린다 — 차단이 아니라
+# **좁힘**이다. 그 경우에도 `delivery_parts_capped` 이상징후는 원장이 회전할 때까지 남는다.
+DELIVERY_CAPPED_FOLD_S = 600
 
 # ★정규화 규칙 — 생산자 `delivery.rs::normalize` 와 **문자 단위로 동일**해야 한다.
 #   ① 모든 유니코드 공백(White_Space)을 ASCII 공백 하나로 ② 연속 공백 접기 ③ 앞뒤 제거.
@@ -472,8 +512,8 @@ def _read_ledger_lines(path):
     """(lines, err) — 원장 파일 1개를 줄 목록으로. 파일 부재는 ([], None).
 
     ★크기 상한을 **읽기 전에** 본다. 판독자는 파일 전체를 봐야 하는데(tail 절단이 곧 fail-open ①),
-      상한 없이 전체를 읽으면 거대 파일 하나로 훅이 메모리·시간에 잠긴다. 데몬은 2 MiB 에서
-      1세대 회전하므로 정상 최대는 세대당 ~2 MiB 다 — 그 이상은 데몬이 만들 수 없는 크기,
+      상한 없이 전체를 읽으면 거대 파일 하나로 훅이 메모리·시간에 잠긴다. 데몬은 8 MiB 에서
+      1세대 회전하므로 정상 최대는 세대당 ~8 MiB 다 — 그 이상은 데몬이 만들 수 없는 크기,
       즉 **외부 조작 정황**이므로 자르지 않고 판독 불가로 접는다(fail-closed + 흔적).
     """
     if not os.path.exists(path):
@@ -485,7 +525,7 @@ def _read_ledger_lines(path):
     except Exception as e:
         return None, "크기 조회 실패(%s): %s" % (e, path)
     if size > LEDGER_MAX_READ_BYTES:
-        return None, ("크기 %d바이트가 상한 %d 초과 — 데몬 회전 상한(세대당 2 MiB)으로는 "
+        return None, ("크기 %d바이트가 상한 %d 초과 — 데몬 회전 상한(세대당 8 MiB)으로는 "
                       "만들어질 수 없는 크기다(조작 정황): %s"
                       % (size, LEDGER_MAX_READ_BYTES, path))
     try:
@@ -494,6 +534,28 @@ def _read_ledger_lines(path):
     except Exception as e:
         return None, "판독 실패(%s): %s" % (e, path)
     return raw.decode("utf-8", "replace").splitlines(), None
+
+
+def _capped_count(meta):
+    """조각 상한 초과 행 수(0 = 초과 없음) — 생산자 필드 `parts_capped` 의 해석.
+
+    ★판정을 바꾸는 값이므로 **관대하게 접는 쪽**으로 읽는다: 필드가 붙어 있다는 사실 자체가
+      "이 배달을 원장이 다 담지 못했다"는 생산자의 자백이다. 값이 정수가 아니거나 0·음수여도
+      최소 1로 센다 — 숫자만 망가뜨려 fail-open 시키는 경로를 만들지 않는다(불변식 ③).
+      필드 부재(구 데몬·평시 배달)만 0 이다.
+    """
+    if not isinstance(meta, dict):
+        return 0
+    v = meta.get("parts_capped")
+    if v is None or v is False:
+        return 0
+    if isinstance(v, bool):
+        return 1
+    try:
+        n = int(v)
+    except Exception:
+        return 1
+    return n if n > 0 else 1
 
 
 def read_delivery(now=None):
@@ -521,7 +583,7 @@ def read_delivery(now=None):
     ① **tail 절단이 surface 필터 앞**이었다. 종전은 `splitlines()[-4000:]` 로 **먼저** 자르고
        그 다음 내 pane 인지 봤다. 그래서 다른 pane 앞으로 온 레코드(또는 아무 잡음 줄)를 4000줄
        밀어 넣으면 **내 pane 의 진짜 배달이 창 밖이 아니라 '스캔 밖'으로 밀려나** 층1 대조가
-       조용히 실패했다 = 무라벨 push 가 오너 임무가 된다. 또 데몬이 2 MiB 에서 회전(`.jsonl.1`)
+       조용히 실패했다 = 무라벨 push 가 오너 임무가 된다. 또 데몬이 8 MiB 에서 회전(`.jsonl.1`)
        하는데 회전 세대를 **아예 읽지 않아**, 회전 직후 배달이 판별에서 사라졌다.
        → 이제 **본 파일 + 회전 세대(`.1`) 를 통째로** 훑고, surface·창 필터는 **레코드 단위로**
          적용한다(줄 수로 미리 자르지 않는다). 크기·줄수 상한에 걸리면 조용히 자르지 않고
@@ -574,7 +636,7 @@ def read_delivery(now=None):
                 "(fail-closed): %s" % p)
 
     # ★회전 세대까지 판독: 회전 직후에는 최근 배달이 `.1` 에 있다. 종전엔 이걸 아예 안 읽어,
-    #   원장을 2 MiB 넘게 밀어 회전만 시키면 최근 배달이 판별에서 사라졌다(fail-open ①의 짝).
+    #   원장을 8 MiB 넘게 밀어 회전만 시키면 최근 배달이 판별에서 사라졌다(fail-open ①의 짝).
     rotated = p + ".1"                     # delivery.rs::rotate_if_needed 와 같은 이름 규약
     anomalies = []
     generations, rotated_lines = 1, 0
@@ -647,9 +709,25 @@ def read_delivery(now=None):
                     # ★R6: 이 배달이 몇 번에 나뉘어 제출되는가(생산자가 알려 준다 · 구 데몬은 없음).
                     #   `units==1` 이면 개행이 없어 쪼개질 수 없으므로 역포함 판정 대상이 아니다.
                     "units": rec.get("units"),
+                    # ★R7: 조각 상한 초과분(있으면 그 행들은 원장에 **없다**). 이 필드는 판정을
+                    #   바꾸는 몇 안 되는 원장 필드다 — 아래 `machine_origin` 이 창 안에서 접는다.
+                    "parts_capped": rec.get("parts_capped"),
                     # 조각 레코드 표식(감사용) — 판정에는 쓰지 않는다. 판정은 언제나 sha 다.
                     "part": rec.get("part"), "parent": rec.get("parent")}
     stale_n = sum(1 for m in out.values() if m["stale"])
+    # ★R7: 상한 초과 배달은 **원장이 그 배달을 다 담지 못했다**는 자백이다. 창 안이든 밖이든
+    #   사실은 사실이므로 관측 즉시 고지한다(접는 것은 창 안에서만 — 위 상수 주석의 비대칭).
+    _capped = [(s, m) for s, m in out.items() if _capped_count(m)]
+    if _capped:
+        _worst = max(_capped, key=lambda kv: _capped_count(kv[1]))
+        anomalies.append((
+            "delivery_parts_capped",
+            "이 pane 앞으로 온 배달 %d건이 조각 상한을 넘겼다(최대 %d행 누락 · 배달시각 %s · "
+            "sha256=%s…). 넘긴 행은 원장에 없으므로 그 행이 단독 제출되면 층1 이 전건 미스이고, "
+            "무라벨이면 오너 임무로 기록될 수 있다. 창(%ds) 안이면 미매치 프롬프트를 접는다"
+            "(fail-closed). 생산자 상한은 delivery.rs::MAX_PARTS 다."
+            % (len(_capped), _capped_count(_worst[1]), _fmt_ts(_worst[1].get("ts")),
+               _worst[0][:12], DELIVERY_CAPPED_FOLD_S)))
     if bad and not good:
         # 내용은 있는데 해석 가능한 레코드가 **하나도** 없다 = 손상으로 본다(fail-closed).
         return {}, LEDGER_UNREADABLE, "원장에 판독 가능한 레코드가 없다(손상 줄 %d): %s" % (bad, p)
@@ -804,9 +882,13 @@ def _composition(norm, delivery):
        하나만 있으면 그 글자가 24자 이어지는 **오너의 평범한 문장**(마크다운 구분선·강조 반복·
        같은 어절 반복)이 통째로 차단됐다 — 이 규칙의 목적("짧은 기계 문장이 우연히 섞여 임무가
        영영 안 열리는 것을 막는다")과 정면으로 배치된다. 그래서 병합 구간이 **서로 다른 sha
-       2건 이상**으로 덮이거나 **단일 레코드 자체가 하한 이상**일 것을 요구한다. 전량 커버(①)는
-       길이와 무관한 규칙이라 이 조건과 무관하며, 따라서 방어는 약해지지 않는다(IN SCOPE 의
-       본진은 ①이다).
+       2건 이상**으로 덮이거나 **단일 레코드 자체가 하한 이상**일 것을 요구한다.
+       ★★R7 정정 — 여기 있던 "전량 커버(①)는 길이와 무관하니 **방어는 약해지지 않는다**"는
+       문장은 **거짓이라 삭제한다**(판본 A/B 실측 반증). ①이 무사한 것과 ②를 좁힌 대가가 0인
+       것은 다른 명제다 — ②는 애초에 ①이 성립하지 **않을 때만** 도는 규칙이기 때문이다.
+       무엇이 좁아졌고(잔여 글자가 있는 프롬프트) 무엇이 넓어졌으며(§1 #18 전량 커버)
+       무엇이 **여전히 안 고쳐졌는지**(구분선 단독 입력은 ①로 계속 접힌다) 는 전부
+       SOT `docs/THREAT-MODEL-mission-gate.md` §4-2b 에 수치와 함께 있다 — 여기 다시 쓰지 않는다.
        ★가장 긴 구간이 자격 미달이어도 **다음 구간을 계속 본다** — 자격 있는 구간이 뒤에
        있는데 첫 후보에서 포기하면 그것도 fail-open 이다.
     ③ **capped(판정 불가)** — 탐색 예산이 소진돼 **못 본 구간이 있다**. 접는다(fail-closed).
@@ -915,6 +997,28 @@ def _prompt_within_delivery(norm, delivery):
     return False, ""
 
 
+def _capped_recent(delivery):
+    """상한 초과 배달이 **창(DELIVERY_CAPPED_FOLD_S) 안에** 있으면 사유 문자열, 없으면 "".
+
+    창을 두는 근거(그리고 무기한을 기각한 근거)는 `DELIVERY_CAPPED_FOLD_S` 주석에 있다 —
+    한 줄로: 무기한 규칙은 원장에 그런 레코드 한 줄만 있으면 오너를 영구 차단한다.
+    """
+    best = None
+    for sha, meta in (delivery or {}).items():
+        n = _capped_count(meta)
+        if not n:
+            continue
+        age = meta.get("age")
+        if not isinstance(age, (int, float)) or age > DELIVERY_CAPPED_FOLD_S:
+            continue                        # 창 밖 — 접지 않는다(고지는 read_delivery 가 한다)
+        if best is None or age < best[1]:
+            best = (sha, age, n)
+    if best is None:
+        return ""
+    return ("조각 상한을 넘긴 배달이 %.0fs 전에 있었다(누락 %d행 · sha256=%s…)"
+            % (best[1], best[2], best[0][:12]))
+
+
 def machine_origin(prompt, delivery=None, ledger_status=None):
     """(bool, 사유) — 이 프롬프트가 **기계 채널**(wake 예약·노드 push·훅 알림)로 왔는가.
 
@@ -925,7 +1029,9 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
                           ⓓ **제출 단위 조각과의 전문 일치**(R6 ① — 멀티라인 push 가 행 단위로
                             쪼개져 제출되는 경로. 데몬이 조각을 따로 기록하므로 여기서는 ⓐ 와
                             같은 규칙으로 잡힌다) ⓔ 역포함(구 데몬 스큐 한정 · 평문 근거)
-                          ⓕ 탐색 예산 소진(R6 ② — 못 본 구간이 있으면 접는다).
+                          ⓕ 탐색 예산 소진(R6 ② — 못 본 구간이 있으면 접는다)
+                          ⓖ **조각 상한 초과 배달 직후**(R7 — 원장이 그 배달을 다 담지 못했으면
+                            '불일치'가 '기계 아님'을 뜻하지 못한다 · `_capped_recent`).
       층2 push 규약 라벨 — 원장이 없거나(아직 배달 이력 없음) 판독 불가일 때의 폴백.
                           여기서만 문자열에 의존한다.
     ★한 방향으로만 공격적이다: 어느 층이든 걸리면 기계로 접는다.
@@ -979,6 +1085,14 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
             _push_anomaly("delivery_substring",
                           "프롬프트에 기계 배달이 통째로 포함됐다 — %s" % detail)
             return True, "배달 원장 부분 포함 — %s" % detail
+        capped = _capped_recent(delivery)
+        if capped:
+            # ★R7 — 원장이 그 배달을 **다 담지 못했다**. 넘긴 행은 대조할 해시가 아예 없으므로
+            #   "일치하지 않았다"가 "기계가 아니다"를 뜻하지 못한다(§1 #18 의 capped 와 같은 성질:
+            #   근거 불완전은 통과 근거가 아니다). 이상징후는 read_delivery 가 이미 발행했다.
+            return True, ("배달 원장 불완전 — %s. 이 배달의 초과분 행은 원장에 없어 대조 자체가 "
+                          "불가능하므로 판정을 열지 않는다(fail-closed · 창 %ds)"
+                          % (capped, DELIVERY_CAPPED_FOLD_S))
         within, wdetail = _prompt_within_delivery(norm, delivery)
         if within:
             # ★R6 ①-ⓐ: 신 데몬이면 조각 레코드가 있어 여기까지 오지 않는다 — 이 발행은
@@ -1924,7 +2038,7 @@ def cmd_self_test():
                     fails.append("회전 세대 판독에서 상태가 %s: %s" % (_st6, _det6))
                 elif not machine_origin(_rotated_push, _d6, _st6)[0]:
                     fails.append("★fail-open ① 미봉합: 회전 세대(.1)를 읽지 않아 회전 직전 배달이 "
-                                 "판별에서 사라졌다 — 2 MiB 밀어 넣기로 층1 이 비워진다")
+                                 "판별에서 사라졌다 — 상한 초과 밀어 넣기로 층1 이 비워진다")
                 if not any(a["code"] == "ledger_rotated" for a in collected_anomalies()):
                     fails.append("회전 판독이 이상징후로 기록되지 않았다(탐지 가능성 누락)")
 
@@ -2276,12 +2390,15 @@ def cmd_self_test():
                 # 각 항목마다 **양성(막는가) / 음성(오너를 막지 않는가)** 를 함께 박제한다.
                 # ══════════════════════════════════════════════════════════════
 
-                def _rec_multiline(text, ts=None, with_parts=True):
+                def _rec_multiline(text, ts=None, with_parts=True, cap=None):
                     """생산자(delivery.rs::record_full)를 **그대로** 미러 — 전문 + 제출 단위 조각.
 
                     `with_parts=False` 는 **구 데몬**(R6 이전)의 원장 모양이다: 전문 1건뿐이고
                     `units` 필드도 없다 — 팩만 먼저 올라간 스큐에서 잔여 방어선(역포함)이
                     실제로 도는지 보려면 이 모양이 필요하다.
+
+                    ★`cap` 은 생산자의 `MAX_PARTS` 자리다(R7). 조각 수가 이를 넘으면 초과분은
+                      **쓰지 않고** 전문 레코드에 `parts_capped` 를 단다 — 실제 데몬 동작과 동형.
                     """
                     _t = time.time() if ts is None else ts
                     _n = _normalize_delivery(text)
@@ -2290,19 +2407,24 @@ def cmd_self_test():
                         _u = _normalize_delivery(_ln)
                         if _u and _u not in _units:
                             _units.append(_u)
+                    _parts = [u for u in _units if u != _n]
+                    _dropped = 0 if cap is None else max(0, len(_parts) - cap)
                     _head = {"v": SCHEMA_VERSION, "surface": _surface(), "ts_epoch": _t,
                              "sha256": _digest_norm(_n), "origin": "send",
                              "chars": len(_n), "preview": _n[:PREVIEW_CHARS]}
                     if with_parts:
                         _head["units"] = len(_units)
+                    if _dropped:
+                        _head["parts_capped"] = _dropped
                     _out = json.dumps(_head, ensure_ascii=False) + "\n"
                     if not with_parts:
                         return _out
-                    for _i, _u in enumerate(u for u in _units if u != _n):
+                    for _i, _u in enumerate(_parts if cap is None else _parts[:cap]):
                         _out += json.dumps({"v": SCHEMA_VERSION, "surface": _surface(),
                                             "ts_epoch": _t, "sha256": _digest_norm(_u),
                                             "origin": "send", "chars": len(_u),
-                                            "preview": _u[:PREVIEW_CHARS],
+                                            # ★R7: 조각 preview 는 전문보다 짧다(생산자 미러)
+                                            "preview": _u[:PART_PREVIEW_CHARS],
                                             "part": _i + 1, "parent": _digest_norm(_n)},
                                            ensure_ascii=False) + "\n"
                     return _out
@@ -2462,6 +2584,87 @@ def cmd_self_test():
                     if not machine_origin(_p, _dN, _stN)[0]:
                         fails.append("기계 배달 행 %r 가 단독 제출됐는데 접히지 않았다" % _p)
 
+                # ══════════════════════════════════════════════════════════════
+                # ★★R7 — 조각 상한 초과(`parts_capped`)의 조용한 실패
+                #   종전: 상한을 넘긴 행은 원장에 없고, 그 사실은 **데몬 버스 이벤트**에만
+                #         있었다. 임무 게이트는 버스를 구독하지 않으므로 verdict 의
+                #         `anomalies` 는 비었고, 넘긴 행이 단독 제출되면 그대로 오너 임무였다.
+                #   지금: 생산자가 전문 레코드에 `parts_capped` 를 남기고, 판독자는 ⓐ고지하고
+                #         ⓑ창 안이면 미매치 프롬프트를 **접는다**(fail-closed).
+                #   ★음성 대조가 이 블록의 절반이다 — 무기한 차단은 오너를 영구 차단한다.
+                # ══════════════════════════════════════════════════════════════
+                _capped_text = "".join("상한 시험 행 번호 %d 의 지시문\n" % _i for _i in range(12))
+                # cap=4 → 조각 4건만 기록되고 나머지 7건은 원장에 없다(전문 1건 + 조각 11건 중)
+                _reset_ledgers()
+                _write(_dp, _rec_multiline(_capped_text, cap=4))
+                _dC, _stC, _detC = read_delivery()
+                if _stC != LEDGER_OK:
+                    fails.append("상한 초과 코퍼스에서 원장 판독 실패(%s): %s" % (_stC, _detC))
+                else:
+                    if not any(a["code"] == "delivery_parts_capped"
+                               for a in collected_anomalies()):
+                        fails.append("★R7 미봉합: 조각 상한 초과가 이상징후로 드러나지 않았다 — "
+                                     "데몬 버스에만 남으면 임무 verdict 에 흔적이 0 이다")
+                    # ⓐ 원장에 **없는** 행(초과분)이 단독 제출돼도 판정을 연다면 그것이 관통이다
+                    _dropped_line = "상한 시험 행 번호 11 의 지시문"
+                    if _dropped_line in [m.get("preview") for m in _dC.values()]:
+                        fails.append("코퍼스 오류: 초과분이라고 가정한 행이 원장에 있다")
+                    if not machine_origin(_dropped_line, _dC, _stC)[0]:
+                        fails.append("★R7 미봉합: 상한 초과 배달 직후에 **원장에 없는 행**이 "
+                                     "단독 제출됐는데 게이트가 열렸다 — 대조할 해시가 없다는 "
+                                     "것은 '기계가 아니다'의 근거가 못 된다(fail-open)")
+                    # ⓑ 창 안에서는 오너 문장도 함께 접힌다 — **의도된 대가**임을 박제한다
+                    #    (이 상태는 상한 초과라는 이상 상황에서만 성립하고, 평시 최대는 상한의
+                    #     1/5 이며 그 거리는 delivery.rs 회귀 핀이 지킨다)
+                    if not machine_origin("보고서 초안 만들어줘", _dC, _stC)[0]:
+                        fails.append("상한 초과 창 안인데 미매치 프롬프트가 열렸다 — 접는 규칙이 "
+                                     "'미매치 전부'가 아니라면 초과분 행을 가려낼 방법이 없다")
+                    # ⓒ 이미 매치되는 문장은 종전 사유 그대로(초과가 판정을 덮어쓰지 않는다)
+                    _ok, _why = machine_origin("상한 시험 행 번호 0 의 지시문", _dC, _stC)
+                    if not _ok or "불완전" in _why:
+                        fails.append("원장에 있는 행이 초과 사유로 접혔다 — 정상 일치의 사유가 "
+                                     "덮이면 감사에서 원인을 못 읽는다: %r" % _why)
+                # ⓓ ★음성(가장 중요): 창 **밖**의 초과 배달은 오너를 접지 않는다.
+                #    무기한 차단이면 원장에 그런 레코드 한 줄만 있어도 오너가 임무를 영영 못 준다
+                #    (스키마 스큐에서 이미 기각한 안티패턴 · 부트스트랩 불가침).
+                #    ★창 길이를 **상수에 상대적으로** 잡으면 이 핀은 상수를 무한대로 키우는
+                #      뮤턴트를 못 잡는다(실측으로 확인했다). 그래서 ⓓ-1 은 상수와 무관한 절대
+                #      시각(6h 전 = 붙여넣기 재생이 끝나고도 한참 뒤)을 쓰고, ⓓ-2 가 상수 자체의
+                #      상·하한을 못 박는다. 둘이 함께 있어야 "유한한 창"이 규약으로 성립한다.
+                if not 60 <= DELIVERY_CAPPED_FOLD_S <= 3600:
+                    fails.append("DELIVERY_CAPPED_FOLD_S=%s 가 [60, 3600] 밖이다 — 너무 짧으면 "
+                                 "fail-closed 가 무의미하고, 너무 길면 상한 초과 1회로 오너가 "
+                                 "사실상 영구 차단된다(부트스트랩 불가침)" % DELIVERY_CAPPED_FOLD_S)
+                for _age, _label in ((21600.0, "6시간"), (DELIVERY_CAPPED_FOLD_S + 60, "창+60s")):
+                    _reset_ledgers()
+                    _write(_dp, _rec_multiline(_capped_text, cap=4, ts=time.time() - _age))
+                    _dC2, _stC2, _ = read_delivery()
+                    for _p in ("보고서 초안 만들어줘", "그거 다시 확인해줘", "짧게 답해줘"):
+                        if machine_origin(_p, _dC2, _stC2)[0]:
+                            fails.append("★오너 오차단(부트스트랩 불가침): %s 전의 상한 초과 "
+                                         "배달이 정상 프롬프트 %r 를 접었다 — 접는 창은 "
+                                         "유한해야 한다" % (_label, _p))
+                    if not any(a["code"] == "delivery_parts_capped"
+                               for a in collected_anomalies()):
+                        fails.append("창 밖(%s)이라 접지는 않지만 **고지는** 해야 한다(원장이 "
+                                     "불완전하다는 사실 자체는 창과 무관하다)" % _label)
+                # ⓔ 값이 망가져도(문자열·0) 필드가 붙었다는 사실만으로 접는다(fail-closed)
+                _reset_ledgers()
+                _bad = json.loads(_rec_multiline("한 줄 배달").splitlines()[0])
+                _bad["parts_capped"] = "???"
+                _write(_dp, json.dumps(_bad, ensure_ascii=False) + "\n")
+                _dC3, _stC3, _ = read_delivery()
+                if not machine_origin("보고서 초안 만들어줘", _dC3, _stC3)[0]:
+                    fails.append("`parts_capped` 값을 비정수로 만들면 접기가 풀린다 — 숫자만 "
+                                 "망가뜨려 fail-open 시키는 우회면이 생긴다")
+                # ⓕ 평시(초과 없음) 원장에서는 이 코드가 **발행되지 않는다**(신호대잡음)
+                _reset_ledgers()
+                _write(_dp, _rec_multiline("첫 행 지시\n둘째 행 지시\n"))
+                read_delivery()
+                if any(a["code"] == "delivery_parts_capped" for a in collected_anomalies()):
+                    fails.append("초과가 없는데 상한 이상징후가 발행됐다 — 상시 발화하면 "
+                                 "이상징후의 신호대잡음이 무너진다")
+
                 # ── ④-부수: 원장 부재도 이상징후로 드러난다(층1 근거 없음 고지) ──────────
                 _reset_ledgers()
                 if read_delivery()[1] != LEDGER_ABSENT:
@@ -2518,7 +2721,10 @@ def cmd_self_test():
           "★R6-A: 멀티라인 행 분할 제출 접기(조각 레코드) · 구 데몬 스큐 역포함 접기+하한/경계 "
           "음성대조 · units==1 미적용 · CAP33/40/64 연접 접기 · 예산소진=접기(fail-closed) · "
           "1자 배달 반복으로는 substr 불성립(오너 구분선·반복문 무차단) · 전량커버는 그대로 접기 · "
-          "자격 미달 구간 뒤의 자격 구간 탐지 · 오너 정상 프롬프트 무차단 코퍼스 8종)"
+          "자격 미달 구간 뒤의 자격 구간 탐지 · 오너 정상 프롬프트 무차단 코퍼스 8종 · "
+          "★R7: 조각 상한 초과 고지+창 안 접기(fail-closed) · 원장에 없는 초과분 행 접기 · "
+          "정상 일치 사유 무덮어쓰기 · 창 밖은 오너 무차단(부트스트랩 불가침) · "
+          "비정수 parts_capped 도 접기 · 초과 없으면 무발행)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 
