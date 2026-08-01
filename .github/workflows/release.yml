@@ -292,6 +292,17 @@ jobs:
           mkdir -p "$RT/LICENSES"
           printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
           ls -la "$RT/git/usr/bin/bash.exe" "$RT/git/cmd/git.exe" "$RT/python/python3.exe"
+          # ★훅 bash 하드 단언 (2026-08-01 · 윈도우 감사 T3-3 · windows-build.yml 과 동일 게이트).
+          # Claude Code 는 훅을 PortableGit 런처 bash(`runtime\git\bin\bash.exe`)로 띄운다 —
+          # MSYS 실 바이너리 `usr\bin\bash.exe` 와 다른 파일이고, 데몬 셸 탐지도 `runtime/git/bin` 을
+          # 본진으로 명시한다(src/bin/cysd/schedule.rs:805-810). 여기가 **실제 배포 산출물을 만드는**
+          # 게이트이므로 이 경로가 빠진 채로 릴리스가 나가면 윈도우 훅이 통째로 죽는다.
+          if [ ! -f "$RT/git/bin/bash.exe" ]; then
+            echo "FATAL: runtime/git/bin/bash.exe 부재 — Claude Code 훅 실행 경로가 사라졌다."
+            ls -la "$RT/git" || true
+            exit 1
+          fi
+          ls -la "$RT/git/bin/bash.exe"
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
       # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를

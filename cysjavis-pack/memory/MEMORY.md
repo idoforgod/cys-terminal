@@ -32,4 +32,4 @@ metadata:
 ## 색인 (한 줄 = 메모리 1건)
 
 <!-- - [제목](파일.md) — 핵심 한 줄 -->
-- [자율주행 위임권](feedback_autonomous-pilot-mandate.md) — 3축 완전 자율주행·denylist에서만 정지·kill-switch 최우선 (🔒상주 필수 — 제거 금지)
+- [자율 진행 권한 템플릿](feedback_autonomous-pilot-mandate.md) — **기본 미부여**. 오너가 soul.md에 직접 부여했을 때만 발효하는 3축 계약·denylist에서만 정지·kill-switch 최우선 (🔒상주 필수 — 제거 금지)

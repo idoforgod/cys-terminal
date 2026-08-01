@@ -135,12 +135,32 @@ PACK = _pack_from_env()
 #   cys-dept 의 `ceo_promote` 가 이 파일의 **존재**로 승격 게이트를 연다. 레인별 마커를 여기에
 #   쓰면 부서장 부트가 CEO 게이트를 오개방한다(P3-A-DEPT-LANE 금지 방향 ① — 절대 금지).
 MARKER = os.path.join(CYS_DIR, ".master-bootstrapped")
-STATE_DIR = os.path.join(CYS_DIR, "state")
+
+
+def state_dir():
+    """상태 파일 루트 — `CYS_STATE_DIR` 우선, 없으면 역사적 기본값 `~/.cys/state`.
+
+    ★경로 계약 통일(2026-08-01 T1 봉합): 종전 이 모듈만 env 를 **무시**하고 HOME 만 봤다.
+      같은 계약을 이미 env-우선으로 쓰는 소비자들: `hooks/_lib.sh:235`(CYS_STATE_DIR 기본값
+      주입·export) · `javis_formation.py:92` · `javis_state_ledger.py:131` ·
+      `javis_memory_inject.py:65` · `hooks/fullauto/50-state-ledger.sh:125`.
+      한쪽만 env 를 안 보면 **격리해서 돌린 것이 실 HOME 을 읽는다** — 실제로
+      `javis_mission.py --self-test ⑧`(CYS_STATE_DIR=tmp 로 격리)이 사용자의 진짜 임무 대장을
+      읽어, **임무를 정상 수신한 세션에서 preflight C77 이 FAIL** 하는 밀폐 붕괴가 났다.
+    ★프로덕션 무변경: 훅 경로는 `_lib.sh` 가 CYS_STATE_DIR 을 정확히 `$HOME/.cys/state` 로
+      채워 export 하므로 값이 동일하다. 모델의 §0 폴백(직접 실행)은 env 미설정 → 같은 기본값.
+    ★불변식 유지: `MARKER`(CEO 승격 게이트 SOT)와 `CYS_DIR` 은 여기 걸리지 않는다 —
+      마커 경로 불변은 금지 방향 ①이다.
+    """
+    return os.environ.get("CYS_STATE_DIR") or os.path.join(CYS_DIR, "state")
+
+
+STATE_DIR = state_dir()
 # ★base 레인 boot-last(§0 산문·GUI·테스트가 읽는 역사적 경로) — 비-base 레인은 `lane_state_path`
 #   가 `boot-last-<lane>.json` 으로 분리한다(G15).
 BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 # ⑤ bounded retry — 무한 대기 금지(자원 거버넌스). env 오버라이드는 테스트 하네스 전용.
-# ★예산 확대(오너 2026-07-15 적대검증 adv#4): 냉시작 claude는 모델 로드+MCP init로 30초 내
+# ★예산 확대(2026-07-15 적대검증 adv#4): 냉시작 claude는 모델 로드+MCP init로 30초 내
 # agent_alive/set-status ack가 안 나 check가 조기 실패(팀은 아직 뜨는 중)했다. 노드 기동은 비동기라
 # 넉넉히 기다린다 — 24×5s ≈ 120초 상한(무한 아님·자원 거버넌스 유지).
 
@@ -593,7 +613,7 @@ class _Log:
         self.step(name, code, detail)
         self.result(ok=ok, state=state, failed_step=name, exit=exit_code)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
-        # ★실패 가시화(오너 2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
+        # ★실패 가시화(2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
         # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — 알림으로 승격.
         #
         # ★W1a A15+R2 — notifier 단일화 + ②ping 카브아웃 제거:
@@ -710,16 +730,24 @@ def lane_key(sock=None):
 #   ⓑ base 레인의 경로는 **역사적 경로 그대로**다(§0 산문·GUI·테스트 호환·회귀 0). 접미는
 #      비-base 레인에만 붙는다.
 # ★같은 레인의 다중 pane 오염은 이 분리로 해결되지 않는다 — 그쪽은 run 귀속(CS-2⑩·W1b)이 담당한다.
+# ★base_dir 자리의 `_STATE` 는 **지연 해소 표식**이다(리터럴 경로 아님) — import 시점에 얼린
+#   문자열을 넣으면 `CYS_STATE_DIR` 을 나중에 바꾼 격리 실행(self-test·테스트 하네스)에서
+#   경로가 실 HOME 으로 새어 나간다(2026-08-01 T1 밀폐 붕괴의 기제).
+_STATE = "\0state_dir"
 _LANE_STATE_KINDS = {
     "marker": (CYS_DIR, ".master-bootstrapped", ""),
-    "boot_last": (STATE_DIR, "boot-last", ".json"),
-    "skip": (STATE_DIR, "boot-skip", ".json"),
-    "lock": (STATE_DIR, "bootstrap", ".lock"),
+    "boot_last": (_STATE, "boot-last", ".json"),
+    "skip": (_STATE, "boot-skip", ".json"),
+    "lock": (_STATE, "bootstrap", ".lock"),
+    # ★T1(2026-08-01 윈도우 실사고): 임무 대장 — '이 세션에 오너가 임무를 지정했는가'의 결정론
+    #   상태. 소유자는 `javis_mission.py`(판정)이고 **경로 규약만** 여기서 발급한다(사본 금지).
+    #   레인별인 이유: 부서 레인의 오너 임무가 base master 의 자율 착수 권한이 되면 안 된다.
+    "mission": (_STATE, "mission", ".json"),
 }
 
 
 def lane_state_path(kind, sock=None):
-    """레인 스코프 상태 파일 경로. kind ∈ marker|boot_last|skip|lock.
+    """레인 스코프 상태 파일 경로. kind ∈ marker|boot_last|skip|lock|mission.
     base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
     비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
     ※ skip·lock 은 종전부터 레인별이었다 — 규약을 이 함수 하나로 모은다(사본 3벌 제거)."""
@@ -727,6 +755,8 @@ def lane_state_path(kind, sock=None):
         base_dir, stem, ext = _LANE_STATE_KINDS[kind]
     except KeyError:
         raise ValueError("미지 레인 상태 종류: %r" % kind)
+    if base_dir == _STATE:                       # 지연 해소(위 주석) — 호출 시점의 env 를 본다
+        base_dir = state_dir()
     key = lane_key(sock)
     if kind in ("skip", "lock"):
         return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))   # 항상 레인별(구 동작 보존)
@@ -741,7 +771,7 @@ def _singleflight_path():
 
 
 def _acquire_singleflight():
-    """부트스트랩 전체 단일 실행 락(오너 2026-07-15 적대검증·아키텍트: preflight 300s는 boot 락으로
+    """부트스트랩 전체 단일 실행 락(2026-07-15 적대검증·아키텍트: preflight 300s는 boot 락으로
     직렬화되지 않아 중복 fire가 settings.json read-modify-write를 경쟁하고 300s 프리플라이트를 중복
     실행했다). 소켓별 비차단 — 이미 진행 중이면 None 반환(호출부가 no-op 종료).
 
@@ -1287,7 +1317,7 @@ def _cmd_run_chain(log):
         log.result(ok=False, state="failed", failed_step="lane-pack", exit=EXIT_LANE_PACK)
         return EXIT_LANE_PACK
 
-    # ★TCC 보조 경고(오너 2026-07-15): macOS 폴더 권한 리셋(서명 변경 업그레이드) 시 pane 자식이
+    # ★TCC 보조 경고(2026-07-15): macOS 폴더 권한 리셋(서명 변경 업그레이드) 시 pane 자식이
     # EPERM으로 죽는 실사고 — 부트가 살아있는 세션에서라도 조기 경고(주 안내는 GUI perm-warning).
     for _probe, _label in _tcc_probe_targets():
         try:
@@ -1300,7 +1330,7 @@ def _cmd_run_chain(log):
         except OSError:
             pass
 
-    # ① preflight --fix — ★비치명화(오너 2026-07-15 적대검증 adv#1 CRITICAL): 종전엔 preflight가
+    # ① preflight --fix — ★비치명화(2026-07-15 적대검증 adv#1 CRITICAL): 종전엔 preflight가
     # 완전-green(exit 0)이 아니면 여기서 abort해 ④ 팀 부팅이 영영 안 됐다. preflight는 60+ 체크
     # 표면이라 자동수리 불가 FAIL 하나(구 hook·수동 디렉티브 핀·git 부재)만 있어도 팀 0개 — "5노드
     # 100%" 요구와 정면 충돌(이 기계도 잔여 FAIL 존재). 팀 부팅의 진짜 게이트는 ⑤ check다. 따라서
@@ -1962,7 +1992,8 @@ def cmd_lane_path(argv):
     try:
         print(lane_state_path(kind))
     except ValueError:
-        sys.stderr.write("[bootstrap] 미지 레인 상태 종류: %r (marker|boot_last|skip|lock|all)\n" % kind)
+        sys.stderr.write("[bootstrap] 미지 레인 상태 종류: %r "
+                         "(marker|boot_last|skip|lock|mission|all)\n" % kind)
         return EXIT_USAGE
     return 0
 

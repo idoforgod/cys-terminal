@@ -1,6 +1,6 @@
 ---
 name: rsi-learning-loop
-description: RSI(재귀적 자기개선) 오너 5단계 학습 루프의 운영 플레이북 — "학습하라/공부하라/RSI하라" 명령을 받거나 master가 능력 갭을 감지해 오너 승인이 나면, ①검색·탐색 ②패턴·철학 추출 ③LOCKED ref eval 평가 ④저장 ⑤skill/harness 제작·발전을 순서대로 돌려 배운 것을 도구화하고 채택물을 다음 사이클 베이스라인으로 재기록(루프 폐쇄)한다. 결정론 엔진=javis_learn.py, 전체 계약=RSI_LEARNING_DIRECTIVE.md, 봉쇄 강제자=rsi-gate.sh를 배선한다. 무결성 8장치(LOCKED eval·retention gate·측정실패 hard fail·학습물=데이터·staging·실패 검역·트리거 2채널·기계한계 판별) 불가침. 트리거: RSI 학습 착수, 학습 티켓(learn-) 실행, skill/harness 진화, "재귀적 자기개선/rsi-learning-loop".
+description: RSI(재귀적 자기개선) 5단계 학습 루프의 운영 플레이북 — "학습하라/공부하라/RSI하라" 명령을 받거나 master가 능력 갭을 감지해 오너 승인이 나면, ①검색·탐색 ②패턴·철학 추출 ③LOCKED ref eval 평가 ④저장 ⑤skill/harness 제작·발전을 순서대로 돌려 배운 것을 도구화하고 채택물을 다음 사이클 베이스라인으로 재기록(루프 폐쇄)한다. 결정론 엔진=javis_learn.py, 전체 계약=RSI_LEARNING_DIRECTIVE.md, 봉쇄 강제자=rsi-gate.sh를 배선한다. 무결성 8장치(LOCKED eval·retention gate·측정실패 hard fail·학습물=데이터·staging·실패 검역·트리거 2채널·기계한계 판별) 불가침. 트리거: RSI 학습 착수, 학습 티켓(learn-) 실행, skill/harness 진화, "재귀적 자기개선/rsi-learning-loop".
 ---
 
 # rsi-learning-loop — RSI 오너 5단계 학습 루프 (운영 플레이북)

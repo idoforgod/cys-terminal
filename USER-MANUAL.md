@@ -316,8 +316,41 @@ cys health-rules
 - **watchdog**(5초 주기): load 폭주·프로세스 수·중복 명령·idle(기본 300초 무출력)·에이전트
   사망·좀비를 감시해 이벤트를 발행합니다. 중복 프로세스 자동 kill은 opt-in
   (`CYS_AUTOKILL_DUP=1`, 최고(最古) 프로세스 보존).
+- **중복 서버 판정(2026-08-01 개정)**: "이름이 같은 것"이 아니라 "같은 것을 두 번 점유한 것"만
+  경보합니다. 노드 CLI(claude·codex·agy)·pane 셸·`cys` 자신은 **노드당 1개가 정상**이므로
+  계수에서 빠지고, 나머지는 두 갈래로 봅니다 —
+  ① `scope=surface`: **한 pane 안**에 같은 명령이 `CYS_DUP_THRESHOLD`(기본 3)개 이상
+     (예: 워커가 `bun server.ts`를 쌓은 경우). 자동 kill 대상은 이쪽뿐입니다.
+  ② `scope=endpoint`: **같은 포트·유닉스 소켓**을 `CYS_DUP_ENDPOINT_THRESHOLD`(기본 2)개 이상이
+     점유(45초 이상 산 프로세스만 · `--port`/`--listen`/`--addr`/`--bind`/`--socket` 표기 인식).
+     이름·소유 노드가 달라도 충돌이므로 경보하되, **자동 kill은 하지 않습니다**(정리는 `cys kill`).
+  경보 쿨다운은 그룹당 60초입니다. 노드를 몇 개로 늘려도 정상 편성만으로는 경보가 늘지 않습니다.
 - 기본 헬스룰: 로그인 풀림·401·token expired·rate limit (30초 디바운스).
 - 헬스룰에 조치를 묶을 수 있습니다(opt-in): `--action pause-queue` — queued 배달만 일시정지.
+- **자기증폭 차단(2026-08-01)**: 헬스룰은 화면 텍스트를 매칭하므로, 경보 자체가 화면에 다시
+  찍히면 그 글이 또 경보가 되는 되먹임이 생깁니다(`cys events` 구독 pane·`cys status` 출력·
+  노드가 경보를 논의한 문장). 두 겹으로 끊습니다 —
+  ① **발신 봉인**: 경보에 실리는 문장은 매칭 부분이 `‹health-rule›`로 가려진 형태뿐이며,
+     **한 줄에 트리거가 여럿이면 전부** 가립니다 — 그 문장은 어떤 헬스룰에도 다시 매칭되지
+     않습니다(룰 이름은 경보의 `rule` 필드에 따로 실립니다).
+  ② **수신 격리**: "경보를 논하는 문장"은 매칭에서 제외합니다 — 경보 기계장치 이름
+     (`health.alert`·`rule=`·룰 이름 등)이 들어간 줄, 트리거를 따옴표로 인용한 줄,
+     한글 산문 서술(매칭 구간 밖 한글 8자 이상 · `CYS_HEALTH_NARRATION_CJK_MIN`로 조정,
+     `0`이면 비활성).
+  진짜 고장 줄(`Error: not logged in`·`401 Unauthorized`·`HTTP 429 …`)은 그대로 경보가 뜹니다.
+
+  **정직한 교환 고지(트레이드오프)** — 이 차단에는 대가가 있습니다.
+  - 발신 봉인은 **진단 정보를 지웁니다**. 경보·`cys status`·HUD에 남는 문장은 `‹health-rule›`로
+    가려진 형태라, "무엇이 걸렸는지"(어떤 URL·어떤 토큰·어떤 응답 문구)는 **읽을 수 없습니다**.
+    남는 것은 어떤 룰이 어느 pane에서 걸렸는지(`rule`·`surface_id`)까지입니다. 원문 확인은
+    해당 pane 화면을 직접 보셔야 합니다(`cys read-screen`).
+  - 수신 격리는 **진짜 고장을 삼킬 수 있습니다**. 한국어로 실패를 알리는 도구·복구 스크립트
+    출력이 "산문 서술"로 분류될 수 있습니다. 그래서 **억제는 경보(발신)까지만** 적용하고,
+    안전 인터록(`recent_health` 기록 → 401 무한 재기동 차단)에는 **그대로 남깁니다**.
+    억제된 항목은 `discourse` 표시가 붙습니다. 억제가 몇 번 일어났는지는 사유별로 셉니다.
+    · 예외: 경보 기계장치 이름이 든 줄(우리 경보의 반사)은 인터록에도 남기지 않습니다.
+  - `{"error":"rate limit"}` 같은 **구조화 출력(JSON·logfmt 값 자리)** 은 인용으로 보지 않고
+    정상 경보를 냅니다(진짜 고장 은폐 차단).
 
 ### kill-switch
 
@@ -609,8 +642,9 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_SHELL` | `$SHELL`→zsh | pane 셸 |
 | `CYS_PACK_DIR` | `~/.cys/pack` | 팩 위치 |
 | `CYS_LOAD_THRESHOLD` | 코어수×2 | watchdog load 임계 |
-| `CYS_PROC_THRESHOLD` / `CYS_DUP_THRESHOLD` | 50 / 3 | 프로세스 수·중복 임계 |
-| `CYS_AUTOKILL_DUP` | 0 | 중복 프로세스 자동 kill (opt-in) |
+| `CYS_PROC_THRESHOLD` / `CYS_DUP_THRESHOLD` | 50 / 3 | 프로세스 수·**pane 내** 동일 명령 중복 임계 |
+| `CYS_DUP_ENDPOINT_THRESHOLD` | 2 (0=off) | 동일 포트·소켓 점유 중복 임계 |
+| `CYS_AUTOKILL_DUP` | 0 | 중복 프로세스 자동 kill (opt-in · `scope=surface`만) |
 | `CYS_IDLE_SECONDS` | 300 | idle 감지 |
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
@@ -729,7 +763,8 @@ todo.updated   approval.request   approval.stalled   master.deadman   osc.notify
 
 | 증상 | 조치 |
 |---|---|
-| macOS "손상되어 열 수 없음" | 공증 빌드인지 확인, 우클릭→열기. 미서명 빌드는 quarantine 때문일 수 있음 |
+| macOS "손상되었기 때문에 열 수 없습니다" | **원인 두 가지 — ①반쪽 설치(덮어쓰기로 설치) ②quarantine/미공증.** ①이 훨씬 흔하다: 기존 `cys.app`을 **먼저 휴지통으로 옮긴 뒤** DMG에서 새로 드래그(덮어쓰기 금지 — 일부 파일만 막혀 세대 혼합 번들이 남는다). ②는 `xattr -d com.apple.quarantine /Applications/cys.app`. 원인 판별은 `cys doctor`(app-seal 항목)·`codesign --verify --strict /Applications/cys.app`. 전체 절차: `docs/INSTALL.md` → "손상되었기 때문에 열 수 없습니다" 해결 |
+| 앱이 *"설치본이 온전하지 않습니다 — 재설치 필요"* 안내를 띄움 | 기동 자기점검이 **빠진 구성요소를 이름으로** 찾아낸 것이다(반쪽 설치). 안내에 적힌 파일을 보고 위와 같은 절차로 **통째 재설치**한다. 번들 안 파일만 채워 넣는 부분 수리는 통하지 않는다(macOS 보호에 막히고, 막혀도 서명 봉인이 깨진 채 남는다). 설정·대화기록(`~/.cys`)은 번들 밖이라 보존된다 |
 | `cys ping` 실패 | 앱 실행(데몬 자동 기동) 또는 `cysd` 직접 기동. `cys doctor --fix` |
 | 데몬이 두 개 뜬 것 같음 | 실제로는 불가(중복 기동 거부). 업데이트 후 스큐 배지가 떠 있으면 클릭해 교대 |
 | 팩 업데이트가 거부됨 | 정상일 수 있음 — 서명·신선도·replay 검증은 fail-closed. `cys pack-update --dry-run`·`cys doctor`로 원인 확인 |

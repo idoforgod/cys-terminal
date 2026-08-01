@@ -89,6 +89,18 @@ if [ ! -x "src-tauri/runtime/python/bin/python3" ] || [ "$RT_CUR" != "$TARGET" ]
   bash scripts/prep-mac-runtime.sh "$TARGET"
   printf '%s' "$TARGET" > "$RT_MARKER"
 fi
+
+# ── SEAL-2: 동봉 python 선컴파일 (★조건 없이 매 빌드 · 서명 직전) ──
+# prep-mac-runtime.sh 안에도 같은 호출이 있지만, 위 블록은 `.prep-target` 이 맞으면 prep 자체를
+# **건너뛴다** — 이 변경 이전에 만들어진(=`.pyc` 없는) 런타임 트리가 남아 있으면 그 조용한 경로로
+# 봉인이 깨진 앱이 나간다. 그래서 여기서 무조건 한 번 더 돈다(이미 컴파일돼 있으면 동일 결과를
+# 다시 쓰고 검증만 통과 — 실측 ~1.2초). 스크립트가 커버리지 100% + 전량 unchecked-hash 를
+# fail-closed 로 검증하므로, 통과하면 "이 트리에는 런타임에 새로 쓸 `.pyc` 가 없다"가 보장된다.
+# ★반드시 `tauri build` **전**에 = `.app` 밖에서 돌아야 한다: `.app` 안 바이너리를 exec 하면
+#   macOS 가 앱 번들 보호를 걸어 python 이 SIGKILL 되고 codesign 이 "Operation not permitted"가
+#   된다(2026-08-01 실측). 자세한 근거는 precompile-bundled-python.sh 머리 주석.
+bash scripts/precompile-bundled-python.sh src-tauri/runtime
+
 echo "== 동봉 runtime Mach-O inside-out 재서명 (Developer ID + hardened + timestamp) =="
 ENT="src-tauri/entitlements.plist"
 SIGN_N=0
@@ -126,6 +138,27 @@ env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API
 
 APP="$BUNDLE_BASE/macos/cys.app"
 DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
+
+# ── SEAL-2 반입 확인: 선컴파일 산출물이 실제로 .app 안에 실렸는가 (fail-closed) ──
+# Tauri 번들러가 `__pycache__` 를 빠뜨리면 선컴파일을 해도 봉인엔 안 들어가고, 사용자 머신에서
+# 그대로 새로 쓰이며 봉인이 깨진다 — 서명·공증에 20분 쓰기 **전에** 여기서 잡는다.
+# 개수가 어긋나면(누락·중복 복사) 원인을 규명하기 전엔 진행 금지.
+# ★`set -euo pipefail` 하에서 find 가 0이 아닌 코드를 내면 대입 자체가 스크립트를 조용히 죽인다
+# (경로 부재·권한). 그러면 아래 명시적 실패 메시지가 안 나온다 → find 실패를 삼키고 개수만 센다.
+# ★개수의 의미 (2026-08-01 opt 레벨 봉합 이후): `*.pyc` 는 최적화 레벨별로 **별개 파일**이라
+#   선컴파일 산출물은 `.py` 1개당 3개(opt-0 무태그 + `.opt-1` + `.opt-2`)다. 이 대조는 태그를
+#   가리지 않는 **총량 동일성**만 보므로 레벨이 늘어도 그대로 정합한다 — 실측(python+node 트리):
+#   opt-0 전용 1140/1140 PASS · 3종 3420/3420 PASS(옮겨진 뒤에도 opt-1 1140·opt-2 1140 보존).
+#   레벨별 커버리지 자체는 precompile-bundled-python.sh 의 fail-closed 검증부가 이미 보증한다.
+SRC_PYC=$({ find src-tauri/runtime -name '*.pyc' 2>/dev/null || true; } | wc -l | tr -d ' ')
+APP_PYC=$({ find "$APP/Contents/Resources/runtime" -name '*.pyc' 2>/dev/null || true; } | wc -l | tr -d ' ')
+if [ "$SRC_PYC" -gt 0 ] && [ "$APP_PYC" = "$SRC_PYC" ]; then
+  echo "  ✓ 선컴파일 .pyc ${APP_PYC}개가 .app 에 그대로 반입됨 (봉인 대상)"
+else
+  echo "  ✗ 선컴파일 .pyc 반입 불일치: runtime 트리 ${SRC_PYC}개 vs .app ${APP_PYC}개" >&2
+  echo "    → 이대로 서명하면 사용자 머신에서 .pyc 가 새로 쓰여 봉인이 깨진다(2026-08-01 사고 재발)." >&2
+  exit 1
+fi
 
 # ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) — 공유 스크립트로 통일 ──
 # 로직·기준점(libexec/git-core/git)·자기제외·동일디렉토리 링크·잔존 중복본 가드는
@@ -176,6 +209,13 @@ if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   bun x @tauri-apps/cli signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$APP.tar.gz"
 fi
 
+# ★DMG 델타 실측 (2026-08-01 · SEAL-2 opt 레벨 3종 봉합의 배포 크기 비용)
+#   동일 조립·ad-hoc 서명 번들(python 3.12.13 + node 22.17.1)로 이 줄과 **같은 UDZO** 를 생성해 비교:
+#     opt-0 전용 : 스테이지 213MB → DMG 102,180,464 B (97.4MB)
+#     opt-0/1/2  : 스테이지 252MB → DMG 123,644,389 B (117.9MB)
+#     델타       : **+21,463,925 B (+20.5MB, +21.0%)** — 비압축 트리 +57MB 가 UDZO 로 약 2.7:1 압축된 값.
+#   ※위 수치의 분모는 python+node 만 담은 부분 스테이지다. 실제 DMG 에는 git·uv·앱 바이너리·UI 가
+#     더 들어가 **분모가 커지므로 증가율은 위보다 작아진다**(절대 델타 ≈ +20.5MB 는 그대로).
 echo "== dedup·staple된 앱으로 UDZO DMG 생성(hdiutil — Tauri 기본 포맷과 동일) =="
 DMGSTAGE="$(mktemp -d)"; ditto "$APP" "$DMGSTAGE/cys.app"; ln -s /Applications "$DMGSTAGE/Applications"
 mkdir -p "$(dirname "$DMG")"

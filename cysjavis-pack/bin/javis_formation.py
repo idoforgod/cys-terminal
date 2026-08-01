@@ -112,7 +112,7 @@ def _run(argv, timeout=30):
         return 127, "", str(e)
 
 
-# ── ① kill-switch(gate-check) — ★fail-closed 봉인(2026-08-01 F1 · 주인님 불변식) ──
+# ── ① kill-switch(gate-check) — ★fail-closed 봉인(2026-08-01 F1 · 제품 불변식) ──
 PAUSED_BASENAME = "AUTOPILOT_PAUSED"
 # 판정 불능일 때만 유효한 **명시 opt-in** 우회 스위치(기본 미설정 = fail-closed).
 GATE_BYPASS_ENV = "CYS_FORMATION_IGNORE_GATE"

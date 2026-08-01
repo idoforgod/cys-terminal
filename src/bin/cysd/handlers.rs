@@ -3492,15 +3492,35 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .max();
                 (pending.len(), oldest)
             };
+            // ★T3-G2: 이것은 **경보** 목록이다. `discourse` 가 붙은 항목은 경보가 아니라
+            // auth 인터록을 위해 남긴 기록이므로 여기서 뺀다 — 수다가 진짜 경보를 10칸 밖으로
+            // 밀어내면 운영자가 진짜 고장을 못 본다. 억제가 일어난 사실은 아래 요약으로 보인다.
             let health_recent: Vec<Value> = daemon
                 .recent_health
                 .lock()
                 .unwrap()
                 .iter()
                 .rev()
+                .filter(|e| crate::state::is_alert_record(e))
                 .take(10)
                 .cloned()
                 .collect();
+            // 억제 관측(침묵 금지) — (룰, 사유)별 누적 횟수. T2가 세기만 하고 어디에도 내보내지
+            // 않던 카운터를 여기서 처음 노출한다(순수 추가 필드 — 구 UI 무영향).
+            let health_suppressed: Value = {
+                let sup = daemon.health_suppressed.lock().unwrap();
+                let mut rows: Vec<Value> = sup
+                    .iter()
+                    .map(|((rule, reason), n)| json!({"rule": rule, "reason": reason, "count": n}))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    b["count"]
+                        .as_u64()
+                        .cmp(&a["count"].as_u64())
+                        .then_with(|| a["rule"].as_str().cmp(&b["rule"].as_str()))
+                });
+                json!({"total": sup.values().sum::<u64>(), "by_rule": rows})
+            };
             let todo: Value = {
                 // ★락 순서 규약(SOT 주석: governance.rs `todo_verdict_map` 위) — 이 블록이
                 // **TP→TV 중첩을 실제로 수행하는 유일한 지점**이며, 그래서 전역 순서를 정한다.
@@ -3572,6 +3592,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
                     "health_recent": health_recent,
+                    "health_suppressed": health_suppressed,
                     "todo": todo,
                 }),
             ))
@@ -3586,11 +3607,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 블로킹 sleep을 쓰던 구 패턴은 tokio 워커를 상시 점유했다. 폴링 간격=측정 창).
             let (cpu_pct, mem_used, mem_total) = crate::hwmon::cpu_mem();
             // 최근 health 에러(노드 state=error 판정) — 30초 창
+            // ★T3-G2: `discourse` 표시가 붙은 항목은 **경보가 억제된 담화**다(자기증폭 차단이
+            //   경보 발신을 막은 줄). 그 원장은 auth 인터록을 위해 기록만 남기는 것이므로,
+            //   여기서 세면 "경보를 논한 노드"가 화면에서 빨갛게 물들어 노드들이 그것을 다시
+            //   수리 일감으로 삼는다 — 우리가 끊으려는 그 루프의 시각적 재현이다.
             let err_surfaces: std::collections::HashSet<u64> = daemon
                 .recent_health
                 .lock()
                 .unwrap()
                 .iter()
+                .filter(|e| crate::state::is_alert_record(e))
                 .filter(|e| now - e["ts"].as_f64().unwrap_or(0.0) < 30.0)
                 .filter_map(|e| e["surface_id"].as_u64())
                 .collect();

@@ -14,7 +14,11 @@
 3. 마스터 선언이면 부트는 **산문으로 수행하지 않는다** — 계약의 정본은 MASTER_DIRECTIVE
    **§0-A(실행 주체 단일 계약)** 이고, 이 파일은 그 포인터일 뿐이다. 두 갈래만 있다:
    · 컨텍스트에 `[결정론 부트스트랩 발화됨 — 하네스 강제]` 블록이 있으면 **재실행 금지** —
-     잔여 의무(§0 ③복원 점검·⑤승인 채널·⑥구동 보고+next-action 자율 착수)만 수행한다.
+     잔여 의무(§0 ③복원 점검·⑤승인 채널·⑥구동 보고+next-action)만 수행한다.
+     ★임무 게이트(§0-C): next-action이 **exit 3(임무 미지정)** 이면 자율 착수 금지 —
+     "대기 중인 작업 N건이 있습니다. 이어서 하시겠습니까?"로 보고하고 멈춘다. 이전 세션
+     잔무 큐는 보고 대상이지 자동 착수 대상이 아니다(큐=master가 쓴 파일 → 자기인가 금지).
+     자율 착수는 exit 0(오너가 이 세션에 임무를 지정)일 때만이다.
    · 그 블록이 없거나(훅 미발화 기계) 자기 surface의 최신 완주 런이 실패면 **훅 미발화 시
      폴백**으로 `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를
      **1회** 실행하고 그 **최종 JSON만** 인용해 보고한다.
@@ -35,7 +39,8 @@ cys boot                                        # 4종 의무 노드 부트(CSO�
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" check   # 4종 생존 결정론 확인
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>" --scope "<범위>" --success "<기준>"  # 위임 티켓 (워커 생존 게이트 + 절대 강조 4규칙 자동 주입)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" gate-status --task "<T>"   # 자율주행 축1 — 게이트 4자 수렴 결정론 판정 (CONVERGED=다음 단계 자동 착수)
-python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" next-action                # 자율주행 축3 — 다음 액션 큐 결정론 추출 (빈 큐=정지·오너 보고)
+python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" next-action                # 자율주행 축3 — 다음 액션 큐 결정론 추출 (0=착수 가 / 3=임무 미지정→보고·정지 / 1=빈 큐 / 2=신규)
+python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_mission.py" status                       # ★임무 게이트 — 이 세션에 오너 임무가 있는가 (0=있음 / 1=없음 / 2=판독불가=없음 취급)
 cys schedule add --id wake --in 20m --text "[wakeup] 다음 액션 착수" --to master  # 자율주행 자기 웨이크업 (원샷·자동삭제)
 cys launch-agent --role worker --agent claude   # 노드 개별 기동(지침 자동 주입)
 cys send --to master "..."                      # 역할 주소로 push (타이핑만)

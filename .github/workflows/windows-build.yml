@@ -81,6 +81,18 @@ jobs:
           printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
           echo "== 확인 =="
           ls -la "$RT/git/usr/bin/bash.exe" "$RT/git/cmd/git.exe" "$RT/python/python3.exe"
+          # ★훅 bash 하드 단언 (2026-08-01 · 윈도우 감사 T3-3). Claude Code 는 훅(hook) 실행에
+          # PortableGit 의 **런처** bash(`runtime\git\bin\bash.exe`)를 쓴다 — MSYS 실 바이너리인
+          # `usr\bin\bash.exe` 와 **다른 파일**이고, 데몬의 셸 탐지도 `runtime/git/bin` 을 본진으로
+          # 명시한다(src/bin/cysd/schedule.rs:805-810 windows_bash_candidates). 종전 게이트는
+          # usr\bin 만 단언해 이 경로가 무검증이었다 — 빠지면 훅이 통째로 죽는다(무증상 배포).
+          if [ ! -f "$RT/git/bin/bash.exe" ]; then
+            echo "FATAL: runtime/git/bin/bash.exe 부재 — Claude Code 훅 실행 경로가 사라졌다."
+            echo "       (PortableGit 레이아웃 변경 또는 경량화 스텝이 git/bin 을 지웠을 가능성)"
+            ls -la "$RT/git" || true
+            exit 1
+          fi
+          ls -la "$RT/git/bin/bash.exe"
           du -sh "$RT" "$RT/git" "$RT/python" || true
 
       - name: Build Windows x64 (Tauri → NSIS setup.exe)
@@ -129,6 +141,19 @@ jobs:
           if ($bash.FullName -notmatch 'runtime\\git\\usr\\bin\\bash\.exe$') { throw "bash 경로가 cysd 기대(runtime\git\usr\bin)와 불일치: $($bash.FullName)" }
           if ($py.FullName   -notmatch 'runtime\\python\\python3\.exe$')     { throw "python3 경로가 cysd 기대(runtime\python)와 불일치: $($py.FullName)" }
           & $bash.FullName --version
+          # ★훅 bash 하드 단언 — 설치된 트리에서도 검증한다(빌드 트리 단언의 짝).
+          # Claude Code 는 훅을 `<git>\bin\bash.exe -c "<명령>"` 형태로 띄운다. 존재만이 아니라
+          # **그 형태로 실제 실행되는지**까지 확인해야 "있는데 못 도는" 상태를 잡는다.
+          $hookBash = Join-Path $dir 'runtime\git\bin\bash.exe'
+          if (-not (Test-Path $hookBash)) {
+            Get-ChildItem (Join-Path $dir 'runtime\git') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            throw "훅 bash 부재: $hookBash (Claude Code 훅 실행 경로 — 빠지면 훅이 통째로 죽는다)"
+          }
+          $hookOut = (& $hookBash -c "echo hook-bash-ok") -join ''
+          if ($LASTEXITCODE -ne 0 -or $hookOut -notmatch 'hook-bash-ok') {
+            throw "훅 bash 실행 실패: $hookBash (exit=$LASTEXITCODE out='$hookOut')"
+          }
+          Write-Host "hook bash: $hookBash  ->  $hookOut"
           & $py.FullName --version
           & $py.FullName -c "import sqlite3, ssl, json, hashlib, urllib.request, ast; print('embeddable stdlib OK (sqlite3+ssl+json+hashlib+urllib+ast)')"
           if ($LASTEXITCODE -ne 0) { throw "동봉 python3 stdlib import 실패" }
@@ -333,11 +358,32 @@ jobs:
           Write-Host ("T4-4 RESULT: {0}  cysd.prev.exe 존재(rename 증거)" -f ($(if($prevOk){'PASS'}else{'FAIL'})))
           $newOk = Test-Path $cysd
           Write-Host ("T4-5 RESULT: {0}  새 cysd.exe 존재" -f ($(if($newOk){'PASS'}else{'FAIL'})))
+          # ★T4-11/T4-12 (2026-08-01 · 윈도우 실사고 "CLI 소실" 회귀 잠금).
+          # 실사고 상태는 "cys.exe·cysd.exe 가 둘 다 부재하고 .prev.exe 만 잔존"이었다. 종전 T4는
+          # cysd.exe 존재만 봤고 cys.exe 는 직접 단언하지 않았으며, 무엇보다 "파일이 있다"와
+          # "새 빌드가 실제로 들어왔다"를 구분하지 못했다 — SetOverwrite try 는 추출 실패를
+          # 조용히 스킵하므로 구본이 그대로 남아도 존재 검사는 통과한다(무증상 반쪽 업그레이드).
+          # T4-11 = 존재(소실 회귀), T4-12 = 내용 동일성(신본 반영). 둘 다 결정론이다.
+          $cliOk = Test-Path $cys
+          Write-Host ("T4-11 RESULT: {0}  새 cys.exe 존재(CLI 소실 회귀 잠금)" -f ($(if($cliOk){'PASS'}else{'FAIL'})))
+          function ShaOf($p) { if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash } else { 'MISSING' } }
+          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
+          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
+          if (-not $srcCys -or -not $srcCysd) { throw "T4-12: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
+          $freshCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
+          $freshCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
+          $freshOk = $freshCys -and $freshCysd
+          Write-Host ("T4-12 RESULT: {0}  설치된 cys/cysd = 방금 빌드한 사이드카와 바이트 동일(신본 반영 · cys={1} cysd={2})" -f ($(if($freshOk){'PASS'}else{'FAIL'})), $freshCys, $freshCysd)
           $bashAlive = -not $bp.HasExited
           Write-Host ("T4-7 RESULT: {0}  잠금 bash 생존(무사망)" -f ($(if($bashAlive){'PASS'}else{'FAIL'})))
           $msysOk = Test-Path (Join-Path $dir 'runtime\git\usr\bin\msys-2.0.dll')
           Write-Host ("T4-8 RESULT: {0}  msys-2.0.dll 신본 추출(잠금 스윕 검증)" -f ($(if($msysOk){'PASS'}else{'FAIL'})))
-          if (-not ($alive -and $sessOk -and $prevOk -and $newOk -and $bashAlive -and $msysOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
+          # ★T4-13: 실패 흔적 파일(POSTINSTALL 검증 게이트가 남기는 유일한 무인 판독원)이 없어야 한다.
+          $failMark = Join-Path $dir 'cys-install-failure.txt'
+          $noFail = -not (Test-Path $failMark)
+          if (-not $noFail) { Write-Host "== cys-install-failure.txt =="; Get-Content $failMark }
+          Write-Host ("T4-13 RESULT: {0}  설치 실패 흔적(cys-install-failure.txt) 부재" -f ($(if($noFail){'PASS'}else{'FAIL'})))
+          if (-not ($alive -and $sessOk -and $prevOk -and $newOk -and $cliOk -and $freshOk -and $noFail -and $bashAlive -and $msysOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
 
           # ③' T4-9 rotate_daemon 1단계 스모크: 스큐(lame-duck) 상태의 구 데몬이 drain RPC를 봉사하는지.
           # rotate_daemon(src-tauri/main.rs)은 drain을 best-effort(let _ =)로 취급하므로 exit 코드는

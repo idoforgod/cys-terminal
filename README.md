@@ -242,7 +242,7 @@ RBAC PII 가림(`CYS_CONTROL_REDACT=1`). 상세 설계: docs/CONTROL_CENTER_DESI
 
 | 완화책 | 기능 | 명령/이벤트 |
 |---|---|---|
-| ① 로그인 감지 강화 | 모든 출력 라인에 헬스 룰(기본: Not logged in·401·token expired·rate limit) 매칭 → 30초 디바운스 push | `health.alert` · `cys add-health-rule <name> <regex>` |
+| ① 로그인 감지 강화 | 모든 출력 라인에 헬스 룰(기본: Not logged in·401·token expired·rate limit) 매칭 → 30초 디바운스 push. **자기증폭 차단**: 경보 문장은 `‹health-rule›`로 전 트리거를 마스킹해 내보내고(발신 봉인 — 어떤 룰에도 재매칭 불가), 경보를 논하는 줄(기계장치 이름·인용·한글 산문)은 매칭에서 제외(수신 격리) | `health.alert` · `cys add-health-rule <name> <regex>` · `CYS_HEALTH_NARRATION_CJK_MIN` |
 | ② 짧은 작업 단위 | idle(기본 300초 무출력) 감지 push → 분할·점검 판단 | `pane.idle` 이벤트 |
 | ③ 서버 생명주기 강제 종료 | **scoped 실행**(새 프로세스 그룹+원장, 종료 시 그룹째 정리) · **close-surface**(자식 트리 전멸) · **watchdog**(load/자식 수/중복 명령 감지) | `cys run -- <cmd>` · `cys ps` · `cys kill <pid>` · `watchdog.*` |
 

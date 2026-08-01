@@ -2,7 +2,7 @@
 # PreToolUse GATE hook (matcher Edit|Write|NotebookEdit): grill-me 최소 질문 게이트.
 # 의도(워크플로 가드레일, 보안 경계 아님): grill-me 인터뷰가 floor(20·복잡30)만큼
 # 서로 다른 결정 브랜치를 해소하기 전에는 '합의 결과물 쓰기(구현)'를 막아 "충분히
-# 캐물은 뒤 합의→구현" 순서를 강제한다(오너 요구 2026-06-27).
+# 캐물은 뒤 합의→구현" 순서를 강제한다(제품 기본 절차).
 #
 # ★GATE hook 클래스(cys-hook.sh의 OBSERVABILITY 불변과 별개 — 차단이 목적):
 #   appbuild-gate.sh·role-capability-gate.sh와 동일 계열. 단 차단은 grill_gate.py가

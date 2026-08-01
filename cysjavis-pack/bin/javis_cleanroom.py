@@ -196,7 +196,7 @@ def vendor_verdict(cls):
 
 
 def license_verdict(cls):
-    """OPP-20 verdict enum(score 금지). AGPL은 오너 승인 전제로 ESCALATE 큐잉(BLOCK 아님)."""
+    """OPP-20 verdict enum(score 금지). AGPL은 오너 결정 전제로 ESCALATE 큐잉(BLOCK 아님)."""
     if cls["no_spdx"] or cls["missing_dir"] or cls["notice_missing"]:
         return "BLOCK", cls
     if cls["policy_escalate"]:

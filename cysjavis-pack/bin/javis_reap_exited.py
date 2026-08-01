@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """javis_reap_exited.py — exited surface 결정론 자동 회수(reap) 도구.
 
-CSO_DIRECTIVE [절대규칙 — exited surface 자동 reap](오너 2026-07-10 · 즉시성 2026-07-16)의
+CSO_DIRECTIVE [절대규칙 — exited surface 자동 reap](제품 기본 절차 · 즉시성 포함)의
 산문 조항을 코드 불변식으로 격상한다. CSO는 능동 모니터링 사이클/이벤트 수신마다 이 스크립트를
 1콜 실행하며, 판단은 이 스크립트의 exit code·stdout JSON만이 사실이다(LLM 자연어 재추론 금지).
 

@@ -20,7 +20,7 @@ javis_phoenix.py — 불사조(무손실 복원) Phase 2: 부활 저널 상태�
     각 단계를 저널에 기록하고, 중단 시 완료 단계는 skip하고 미완 단계부터 재개한다.
     dedup 키 = (role, ticket_id) — role당 복수 워커 정책과 충돌하지 않게 티켓 ID를 포함한다.
 
-라이브 게이트(2026-07-05 박사님 지시 — 상시 라이브·기본 허용·명시적 opt-out):
+라이브 게이트(제품 기본값 — 상시 라이브·기본 허용·명시적 opt-out):
   저널·산출은 항상 소켓의 상태 디렉터리 하위 'phoenix/'에만 쓴다(라이브 상태 파일 자체는 무접촉).
   기본값 = 라이브 허용(불사조 가동 시작·상시 라이브 고정). opt-out `PHOENIX_FORBID_LIVE=1` 일 때만
   라이브 상태 디렉터리 대상 실행을 거부한다(격리 하네스·순수 개발 재현용). 레거시 `PHOENIX_ALLOW_LIVE`
@@ -400,7 +400,7 @@ def state_dir_for(socket):
 
 def phoenix_home(socket):
     """저널·산출 루트 = <상태 디렉터리>/phoenix/. 라이브 상태 파일 자체는 절대 건드리지 않는다(phoenix/ 하위만).
-    ★2026-07-05 박사님 지시 — 상시 라이브(기본 허용). opt-out PHOENIX_FORBID_LIVE=1 일 때만 라이브 대상 거부."""
+    ★제품 기본값 — 상시 라이브(기본 허용). opt-out PHOENIX_FORBID_LIVE=1 일 때만 라이브 대상 거부."""
     sd = state_dir_for(socket)
     if sd == LIVE_STATE and os.environ.get("PHOENIX_FORBID_LIVE") == "1":
         die("라이브 상태 디렉터리(%s) 대상 실행이 opt-out(PHOENIX_FORBID_LIVE=1)으로 거부됐다. "

@@ -13,7 +13,7 @@
 
 | actor | 실체 | 권한 요지 |
 |---|---|---|
-| `doctor` | 박사님(오너·인간) | 헌법 변경·외부발행·비가역 삭제·break-glass·고위험 승격의 유일 승인자 |
+| `doctor` | 오너(인간) | 헌법 변경·외부발행·비가역 삭제·break-glass·고위험 승격의 유일 승인자 |
 | `master` | master 노드(Claude CLI) | 기술 판단·리뷰·위임·검증 집행. 오너가 위임한 기술 결정 대행. 인간 전속 항목은 대행 불가 |
 | `worker` | 구현 노드 | 위임 범위 내 구현·자기검증. 승인 발급 불가 |
 | `verifier` | agy(Gemini)·codex(GPT) 이종모델 | advisory 판정(ACCEPT/REVISE/BLOCK/ESCALATE)·근거 제시. 집행 권한 없음 |

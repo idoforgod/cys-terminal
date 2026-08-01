@@ -927,7 +927,7 @@ if tool == "Bash" and command:
 
 if tool in WRITE_TOOLS and file_path:
     if protected(file_path):
-        # ★주인님 인가 루트(2026-06-07 주인님 제정): 주인님 직접명령('헌법에 넣어라'·'절대규칙에 기록')→
+        # ★오너 인가 루트(제품 기본 절차): 오너 직접명령('헌법에 넣어라'·'절대규칙에 기록')→
         #   master가 CONSTITUTION_EDIT_AUTHORIZED 토큰(스코프=헌법 basename 또는 '*') 생성→해당 파일 헌법편집 인가.
         #   ★autopilot(ACTIVE) 중엔 CONST_AUTH=0 강제(bash)=자율주행 자기인가·실수 차단 · TTL30분 · master 편집 직후 토큰 제거(단일배치).
         _scope_toks = (CONST_SCOPE.splitlines()[0].lower().split() if CONST_SCOPE.strip() else [])  # ★스코프=첫 줄 토큰만(주석의 * 오인 차단)·정확매칭
@@ -945,7 +945,7 @@ PY
 GUARD_PAUSED=0; [ -e "$PAUSED_FILE" ] && GUARD_PAUSED=1
 GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 
-# ★주인님 직접명령 헌법편집 인가 토큰(2026-06-07): 非ACTIVE + 토큰존재(비심링크) + TTL 30분 → CONST_AUTH=1·스코프 전달
+# ★오너 직접명령 헌법편집 인가 토큰: 非ACTIVE + 토큰존재(비심링크) + TTL 30분 → CONST_AUTH=1·스코프 전달
 GUARD_CONST_AUTH=0; GUARD_CONST_SCOPE=""
 CONST_TOKEN="$SCRIPT_DIR/CONSTITUTION_EDIT_AUTHORIZED"
 if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" ]; then

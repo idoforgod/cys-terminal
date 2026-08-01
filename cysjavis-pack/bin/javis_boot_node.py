@@ -127,7 +127,7 @@ ROLE_AGENT = {
     "cso": "claude", "worker": "claude", "master": "claude",
     "reviewer-gemini": "gemini", "reviewer-codex": "codex",
     "reviewer-grok": "grok", "reviewer": "claude",
-    # ★무구독 폴백(오너 2026-06-14): agy/codex 미감지 시 Claude 대체 리뷰어 슬롯.
+    # ★무구독 폴백(2026-06-14): agy/codex 미감지 시 Claude 대체 리뷰어 슬롯.
     "reviewer-claude-1": "claude", "reviewer-claude-2": "claude",
 }
 # role → (각성 지침에서 가리킬 디렉티브 자연어 명칭[확장자 없음 — F4], 기본 set-status state)
@@ -743,7 +743,7 @@ def self_test():
     chk("cys claim-role reviewer-gemini" in awaken_message("reviewer-gemini"), "reviewer-gemini claim 풀네임 누락")
     chk("claim-role reviewer " not in awaken_message("reviewer-codex"), "generic reviewer claim 잔존")
     chk(".md" not in awaken_message("cso"), "각성 메시지 .md 포함(헌법가드 오탐)")
-    # ★무구독 폴백 슬롯(오너 2026-06-14): Claude 대체 리뷰어 역할이 claude 로 매핑·REVIEWER 각성
+    # ★무구독 폴백 슬롯(2026-06-14): Claude 대체 리뷰어 역할이 claude 로 매핑·REVIEWER 각성
     chk(ROLE_AGENT.get("reviewer-claude-1") == "claude", "reviewer-claude-1 agent 매핑 누락")
     chk(ROLE_AGENT.get("reviewer-claude-2") == "claude", "reviewer-claude-2 agent 매핑 누락")
     chk("cys claim-role reviewer-claude-1" in awaken_message("reviewer-claude-1"), "reviewer-claude-1 claim 풀네임 누락")

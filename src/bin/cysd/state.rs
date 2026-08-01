@@ -334,7 +334,11 @@ pub struct Config {
     pub lang: String,
     pub load_high_threshold: f64,
     pub proc_count_threshold: usize,
+    /// 불투명 명령의 중복 임계 — **한 surface 안**에서 동일 cmdline 이 몇 개면 중복인가(기본 3).
     pub duplicate_threshold: usize,
+    /// ★T3-G2 종단점(동일 포트·유닉스 소켓) 중복 임계 — 같은 종단점을 몇이 점유하면 진짜 충돌인가.
+    /// 오너 계약 "동일 서버 2개+ 즉시 정리"에 맞춰 기본 2(`CYS_DUP_ENDPOINT_THRESHOLD`). 0=비활성.
+    pub duplicate_endpoint_threshold: usize,
     pub auto_kill_duplicates: bool,
     pub idle_seconds: u64,
     /// (E-a) 동시 살아있는 worker-* 한도. 0=무제한(하위호환 escape hatch).
@@ -354,6 +358,7 @@ impl Config {
             load_high_threshold: env_f64("CYS_LOAD_THRESHOLD", cores * 2.0),
             proc_count_threshold: env_f64("CYS_PROC_THRESHOLD", 50.0) as usize,
             duplicate_threshold: env_f64("CYS_DUP_THRESHOLD", 3.0) as usize,
+            duplicate_endpoint_threshold: env_f64("CYS_DUP_ENDPOINT_THRESHOLD", 2.0) as usize,
             auto_kill_duplicates: cys::env_compat("CYS_AUTOKILL_DUP")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -762,6 +767,10 @@ pub struct Daemon {
     pub health_hits: Mutex<HashMap<(u64, String), Vec<f64>>>,
     /// T1-2 status 보드용 최근 health alert 링 (최대 50)
     pub recent_health: Mutex<VecDeque<serde_json::Value>>,
+    /// ★T2 자기증폭 차단 관측 카운터 — (rule, 억제사유) → 횟수. 침묵 금지: 억제가 **일어나고
+    /// 있다는 사실**은 보이게 두되 트리거 원문은 담지 않는다. 키 공간이 (룰 수 × 사유 4)로
+    /// 유계라 무한 성장이 없다(다른 맵과 달리 prune 불필요).
+    pub health_suppressed: Mutex<HashMap<(String, &'static str), u64>>,
     /// T4-15 kill-switch: pause 중에는 큐 배달·스케줄 발화가 동결된다 (직접 send는 통과)
     pub paused: AtomicBool,
     pub pause_info: Mutex<Option<(f64, String)>>, // (since, reason)
@@ -1346,6 +1355,7 @@ impl Daemon {
             health_debounce: Mutex::new(HashMap::new()),
             health_hits: Mutex::new(HashMap::new()),
             recent_health: Mutex::new(VecDeque::new()),
+            health_suppressed: Mutex::new(HashMap::new()),
             paused: AtomicBool::new(pause_restored.is_some()),
             pause_info: Mutex::new(pause_restored),
             todo_progress: Mutex::new(HashMap::new()),
@@ -2228,18 +2238,62 @@ impl Daemon {
         let rules = self.health_rules.lock().unwrap();
         for line in lines {
             for rule in rules.iter() {
-                if rule.regex.is_match(line) {
+                // ★T2: is_match → find. 매칭 **구간**을 알아야 ⓐ 마스킹·ⓑ 인용/서술 판정이 가능하다.
+                // (find는 is_match와 같은 1-pass — `for line × for rule` 핫패스 비용 동등.)
+                if let Some(m) = rule.regex.find(line) {
+                    // ⓑ 수신 격리 — "경보를 논하는 라인"은 경보가 아니다(자기증폭 차단).
+                    // 룰 이름 표식은 `rules`를 직접 훑는다(핫패스 할당 0 — 매칭 시에만 실행).
+                    let discourse = alert_discourse_reason(line, m.start(), m.end(), &rules);
+                    if let Some(reason) = discourse {
+                        // 관측 가능성 유지: 억제 사실만 남기고(원문·트리거 미포함) 발화는 하지 않는다.
+                        let mut sup = self.health_suppressed.lock().unwrap();
+                        *sup.entry((rule.name.clone(), reason)).or_insert(0) += 1;
+                        drop(sup);
+                        // ★T3-G2: 억제의 사정거리는 **발신(경보)** 까지다. 여기서 통째로 `continue`
+                        // 하면 아래 `recent_health` 인터록 기록까지 함께 사라지는데, 그것은
+                        // governance::check_agent_death 의 auth 무한 재기동 차단(auth_blocked)이
+                        // 보는 **유일한** 근거다(governance.rs `auth_blocked` 참조). 한국어 문맥이
+                        // 붙은 진짜 401 라인이 narration-prose 로 분류되는 순간 차단 장치가 통째로
+                        // 죽는다 = 401 상대 무한 재기동. 그래서 클래스를 둘로 가른다:
+                        //   · 기계 에코(alert-machinery-token) = **우리 경보의 반사**. 새 정보량 0이고
+                        //     인터록 창만 갱신해 자기지속 상태를 만든다 → 완전 폐기(종전대로).
+                        //   · 산문 계열(narration-prose·quoted-mention·rule-name-mention) = 진짜일
+                        //     **수** 있다(현지화 CLI·구조화 로그·에러코드 문자열이 룰 이름과 동형).
+                        //     → 경보는 계속 억제하되 인터록에는 남긴다.
+                        // 비대칭의 근거: 놓치면 무한 재기동(시스템 사망), 헛치면 재기동 보류 1건
+                        // (master 개입 1회). 안전한 쪽으로 기운다.
+                        if is_alert_echo_reason(reason) {
+                            continue;
+                        }
+                    }
+                    // ⓐ 발신 봉인 — 이 문자열만 데몬 밖으로 나간다(원문 트리거 유출 0).
+                    let safe_line = mask_health_line(line, &rules);
                     let key = (surface_id, rule.name.clone());
-                    // status 보드용 최근 alert 링 (디바운스와 무관하게 기록, cap 50)
+                    // status 보드용 최근 alert 링 + ★auth 인터록 원장 (디바운스와 무관하게 기록, cap 50)
                     {
                         let mut recent = self.recent_health.lock().unwrap();
-                        if recent.len() >= 50 {
-                            recent.pop_front();
+                        if recent.len() >= HEALTH_RING_CAP {
+                            // ★T3-G2: 자리가 없으면 **담화(억제) 항목을 먼저** 밀어낸다.
+                            // 링이 인터록의 근거 원장이기도 하므로, 경보를 논하는 수다가 진짜 경보
+                            // 기록을 창 밖으로 밀어내면 auth 무한 재기동 차단이 근거를 잃는다.
+                            // (담화 항목을 남기는 것보다 진짜 항목을 남기는 쪽이 항상 안전하다.)
+                            let victim = recent
+                                .iter()
+                                .position(|e| !e["discourse"].is_null())
+                                .unwrap_or(0);
+                            recent.remove(victim);
                         }
                         recent.push_back(json!({
                             "ts": now_epoch(), "surface_id": surface_id,
-                            "rule": rule.name, "line": line.chars().take(200).collect::<String>(),
+                            "rule": rule.name, "line": safe_line,
+                            // 담화로 분류돼 **경보는 억제**된 항목임을 정직하게 표시한다.
+                            // status 보드가 "경보"와 "인터록만"을 구분해 보일 수 있게 하는 유일한 필드.
+                            "discourse": discourse,
                         }));
+                    }
+                    if discourse.is_some() {
+                        // 발신 억제 유지 — 이벤트·조치 바인딩 없음(자기증폭 경로 원천 차단).
+                        continue;
                     }
                     let mut debounce = self.health_debounce.lock().unwrap();
                     let fire = match debounce.get(&key) {
@@ -2253,7 +2307,7 @@ impl Daemon {
                             "health.alert",
                             "health",
                             Some(surface_id),
-                            json!({"rule": rule.name, "line": line}),
+                            json!({"rule": rule.name, "line": safe_line, "masked": true}),
                         );
                     }
                     // T4-17 조치 바인딩 — 60초 창 내 threshold회 이상 매칭 시에만 발동
@@ -2554,6 +2608,225 @@ fn mac_runtime_lc_prefix() -> Option<String> {
     let mut dirs = cys::runtime_bin_dirs(&exe_dir);
     dirs.push(cys::home_dir().join(".local").join("bin"));
     mac_lc_path_prefix(&dirs)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★T2 자기증폭 루프 차단 (2026-08-01 윈도우 실사고 · 6분 만에 경보 4→10건, 발생원 0건)
+//
+// 사고의 구조: `run_health_rules`는 **화면 텍스트(PTY 라인)** 를 정규식으로 매칭한다.
+// 그런데 그 매칭 결과(`payload.line` = 원문 그대로)가 다시 **화면에 렌더**된다:
+//   ① `cys events --category health --reconnect`(CSO_DIRECTIVE.md:23 상시 구독)는 이벤트
+//      JSON 라인을 그대로 `println!`(cys.rs stream_events) → 구독 pane 의 PTY 출력 → 그 pane 에서
+//      run_health_rules 재매칭 → 새 health.alert → 모든 구독 pane 으로 다시… (LLM 서술 없이도
+//      성립하는 **순수 기계 루프**, 이득 = 구독 pane 수).
+//   ② `cys status`/control.dashboard/HUD 가 `recent_health[].line` 을 출력하는 경로.
+//   ③ 노드가 경보를 **자연어로 논의**하며 트리거 문구를 화면에 다시 쓰는 경로.
+// 발생원이 0건인데 경보만 증식한 이유가 이것이다.
+//
+// 차단은 두 겹이다(둘 다 필요 — 한쪽만으로는 다른 다리가 남는다):
+//   ⓐ **발신 봉인(containment)**: cysd 는 매칭 원문을 다시 내보내지 않는다. 매칭 구간을
+//      `‹health-rule:NAME›` 마스크로 치환한 문자열만 이벤트·원장에 싣는다 → ①② 기계 루프가
+//      물리적으로 성립 불가(트리거 문자열이 데몬 밖으로 나가지 않는다).
+//   ⓑ **수신 격리(quarantine)**: "경보인 라인"과 "경보를 **논하는** 라인"을 가르는 순수 술어로
+//      후자를 매칭에서 제외 → ③ 서술 루프 차단.
+// (ⓒ 축자인용 금지는 ⓐ에 포함, ⓓ 디바운스는 기존 30초 유지 — 단독으로는 근본이 아니라 완화다.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ⓐ 마스크 토큰. 매칭 구간은 전부 이것으로 치환된다.
+///
+/// ★**룰 이름을 담지 않는다**(이름은 `payload.rule` 필드에 따로 실린다). 담으면
+/// `‹health-rule:rate_limited›` 가 `rate.?limit` 에 **스스로 다시 매칭**돼 마스킹이 수렴하지
+/// 않는다 — 마스크가 새 트리거를 만드는 자기증폭의 축소판이다.
+pub(crate) const HEALTH_MASK: &str = "\u{2039}health-rule\u{203a}";
+/// ⓑ 격리 표식으로도 쓰는 마스크 접두(마스크가 찍힌 줄은 cysd 가 만든 경보 표현이다).
+pub(crate) const HEALTH_MASK_OPEN: &str = "\u{2039}health-rule";
+/// 마스킹 수렴 상한 — 사용자 정의 룰이 마스크 토큰 자체에 매칭하는 병리적 정규식을 등록해도
+/// 유한 시간에 끝난다(그 경우 잔여 매칭은 ⓑ 격리가 받는다).
+const MASK_PASS_CAP: usize = 8;
+
+/// ⓑ 경보 기계장치 식별자 — **우리가 만든 이름**만 넣는다(자연어 낱말 금지). 제3자 CLI 의
+/// 진짜 에러 출력에는 나타날 수 없는 문자열이라 위음성(진짜 고장 은폐) 위험이 없다.
+const ALERT_MACHINERY_MARKERS: &[&str] = &[
+    HEALTH_MASK_OPEN,
+    "health.alert",
+    "health.action",
+    "health.storm",
+    "watchdog.",
+    "add-health-rule",
+    "health-rules",
+    "health.add_rule",
+    "health.list_rules",
+    "recent_health",
+    "run_health_rules",
+    "rule=",
+    "\"rule\":",
+];
+
+/// ⓑ 서술(narration) 판정 임계 — 매칭 구간 **밖**의 한글/CJK 글자 수가 이 값 이상이면 산문으로 본다.
+/// 근거: 내장·운영 룰의 패턴은 전부 **영문 토큰**이다. 영문 에러 토큰을 담은 라인에 한글 문장이
+/// 붙어 있으면 그것은 제3자 CLI 의 에러 출력이 아니라 **노드가 그 에러를 논한 문장**이다.
+/// (한국어로 현지화된 CLI 가 영문 토큰을 함께 뱉는 희귀 사례만 위음성 — 임계를 넉넉히 두고
+/// `CYS_HEALTH_NARRATION_CJK_MIN`으로 조정·비활성(0)할 수 있게 한다.)
+fn narration_cjk_min() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CYS_HEALTH_NARRATION_CJK_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0xAC00..=0xD7A3      // 한글 음절
+        | 0x1100..=0x11FF    // 한글 자모
+        | 0x3130..=0x318F    // 호환 자모
+        | 0x3040..=0x30FF    // 가나
+        | 0x4E00..=0x9FFF    // CJK 통합한자
+    )
+}
+
+/// ⓑ 매칭 구간이 따옴표로 감싸였는가 — "인용 표기 인식"(경보 문구를 인용한 서술).
+///
+/// ★T3-G2 정밀화: **JSON 값 자리의 따옴표는 인용이 아니다.** `{"error":"401 Unauthorized"}`
+/// 처럼 진짜 도구가 뱉는 구조화 에러 출력은 매칭 구간이 통째로 `"…"` 안에 들어가므로 구
+/// 판정에서는 "인용된 서술"로 오분류돼 **경보가 통째로 사라졌다**(진짜 고장 은폐). 여는
+/// 따옴표 바로 앞이 JSON 구조 문자(`:` `,` `{` `[` `=`)면 값 자리로 보고 인용에서 제외한다.
+/// 산문 인용(`the "rate limit" alarm`)은 여는 따옴표 앞이 공백·문장부호라 판정이 그대로다.
+fn match_is_quoted(line: &str, start: usize, end: usize) -> bool {
+    let before = line[..start].chars().next_back();
+    let after = line[end..].chars().next();
+    if before == Some('"') {
+        // 여는 따옴표 앞 글자(공백 제외)가 JSON 구조 문자면 값 자리 = 구조화 신호.
+        let prev = line[..start - 1].chars().rev().find(|c| !c.is_whitespace());
+        if matches!(prev, Some(':') | Some(',') | Some('{') | Some('[') | Some('=')) {
+            return false;
+        }
+    }
+    matches!(
+        (before, after),
+        (Some('"'), Some('"'))
+            | (Some('\''), Some('\''))
+            | (Some('`'), Some('`'))
+            | (Some('\u{201c}'), Some('\u{201d}'))   // “ ”
+            | (Some('\u{2018}'), Some('\u{2019}'))   // ‘ ’
+            | (Some('\u{300c}'), Some('\u{300d}'))   // 「 」
+            | (Some('\u{00ab}'), Some('\u{00bb}'))   // « »
+    )
+}
+
+/// ⓑ 핵심 순수 술어 — 이 라인이 "경보를 논하는 담화"면 사유를, 진짜 신호면 None 을 반환한다.
+///
+/// `rules`: 현재 등록된 전 룰(런타임 추가분 포함). 룰 **이름**을 표식으로 쓰되 **식별자 꼴**
+/// (`_`·`-`·`.` 포함)만 채택한다 — `relogin` 같은 짧은 일반어 룰 이름을 표식으로 삼으면
+/// "please relogin" 같은 진짜 에러가 은폐되기 때문이다(위음성 차단).
+pub(crate) fn alert_discourse_reason(
+    line: &str,
+    start: usize,
+    end: usize,
+    rules: &[HealthRule],
+) -> Option<&'static str> {
+    if ALERT_MACHINERY_MARKERS.iter().any(|m| line.contains(m)) {
+        return Some("alert-machinery-token");
+    }
+    if rules
+        .iter()
+        .any(|r| r.name.contains(['_', '-', '.']) && line.contains(r.name.as_str()))
+    {
+        return Some("rule-name-mention");
+    }
+    if match_is_quoted(line, start, end) {
+        return Some("quoted-mention");
+    }
+    let min = narration_cjk_min();
+    if min > 0 {
+        let outside = line[..start]
+            .chars()
+            .chain(line[end..].chars())
+            .filter(|c| is_cjk(*c))
+            .count();
+        if outside >= min {
+            return Some("narration-prose");
+        }
+    }
+    None
+}
+
+/// ★T3-G2: 담화 사유 중 **우리 경보의 기계 에코**인가(= 새 정보량 0이라 인터록에도 남기지
+/// 않는 부류인가). `alert-machinery-token` 만 그렇다 — 표식이 전부 우리가 지은 식별자
+/// (`health.alert`·`watchdog.`·`"rule":`·마스크 토큰…)라 제3자 CLI 출력에 나타날 수 없다.
+///
+/// 나머지 셋은 **진짜 신호일 수 있다**:
+///   · `narration-prose` — 한국어로 실패를 보고하는 현지화 CLI·복구 스크립트 출력
+///   · `quoted-mention` — 값이 따옴표에 담긴 구조화 로그
+///   · `rule-name-mention` — 룰 이름이 곧 벤더 에러코드인 경우(`{"error":"token_expired"}`,
+///     사용자가 `add-health-rule` 로 에러코드를 그대로 룰 이름에 쓰면 100% 겹친다)
+/// 이 셋은 경보만 억제하고 인터록에는 남긴다(fail-safe).
+pub(crate) fn is_alert_echo_reason(reason: &str) -> bool {
+    reason == "alert-machinery-token"
+}
+
+/// governance 의 auth 무한 재기동 차단이 보는 룰 집합 — 단일 등재소.
+/// (governance.rs `check_agent_death` 가 문자열 배열을 자기 안에 복제해 갖고 있으면
+/// 한쪽만 고쳐질 때 차단이 조용히 새므로 여기 하나로 모은다.)
+pub const AUTH_INTERLOCK_RULES: &[&str] =
+    &["not_logged_in", "auth_401", "token_expired", "login_required"];
+
+/// auth 인터록 창(초) — 이 시간 안에 auth 계열 신호가 있었으면 자동 재기동을 막는다.
+pub const AUTH_INTERLOCK_WINDOW_SECS: f64 = 300.0;
+
+/// `recent_health` 링 상한 — status 보드용이자 auth 인터록의 근거 원장(둘을 겸한다).
+pub const HEALTH_RING_CAP: usize = 50;
+
+/// ★T3-G2 — `recent_health` 항목이 **사람에게 보일 경보**인가(= 담화로 억제돼 인터록 전용으로만
+/// 남긴 기록이 아닌가).
+///
+/// 링 하나가 두 소비자를 겸하기 때문에 필요한 술어다:
+///   · 안전 인터록(`auth_blocked_by_recent_health`)은 담화 항목도 **센다**(놓치면 무한 재기동).
+///   · 사람이 보는 경보 목록·노드 `state=error` 판정은 담화 항목을 **세면 안 된다** —
+///     경보를 논한 노드가 화면에서 빨갛게 물들면 그것이 다시 수리 일감이 되어, 우리가 끊으려는
+///     자기증폭 루프가 시각 층에서 되살아난다.
+pub fn is_alert_record(entry: &serde_json::Value) -> bool {
+    entry["discourse"].is_null()
+}
+
+/// ★T3-G2 순수 술어 — `recent_health` 원장에서 "이 surface 는 지금 auth 로 막혀 있다"를 읽는다.
+/// governance::check_agent_death 가 인라인으로 갖고 있던 판정을 그대로 옮긴 것(동작 동일)으로,
+/// 무한 재기동 차단의 **유일한 근거**라 테스트로 직접 핀을 박을 수 있어야 한다.
+pub fn auth_blocked_by_recent_health(
+    recent: &VecDeque<serde_json::Value>,
+    surface_id: u64,
+    now: f64,
+) -> bool {
+    recent.iter().any(|h| {
+        h["surface_id"].as_u64() == Some(surface_id)
+            && AUTH_INTERLOCK_RULES.contains(&h["rule"].as_str().unwrap_or(""))
+            && now - h["ts"].as_f64().unwrap_or(0.0) < AUTH_INTERLOCK_WINDOW_SECS
+    })
+}
+
+/// ⓐ **전 룰**의 매칭 구간을 `‹health-rule›`로 치환하고 200자로 자른다(문자 경계 안전).
+///
+/// 불변식: 반환 문자열은 **어떤 헬스룰에도 매칭되지 않는다**. 발화한 룰 하나만 가리면
+/// 같은 줄에 있는 다른 룰의 트리거가 원문 그대로 새어 나가고(예: 401 은 가렸는데 같은 줄의
+/// `token expired` 는 남는다), 그 문자열이 화면에 다시 찍히는 순간 루프가 부활한다.
+/// 반환값만이 데몬 밖으로 나간다 — 원문 트리거는 어떤 이벤트·원장·표면에도 싣지 않는다.
+pub(crate) fn mask_health_line(line: &str, rules: &[HealthRule]) -> String {
+    let mut out = line.to_string();
+    for _ in 0..MASK_PASS_CAP {
+        let mut changed = false;
+        for r in rules {
+            if let Some(m) = r.regex.find(&out) {
+                out = format!("{}{}{}", &out[..m.start()], HEALTH_MASK, &out[m.end()..]);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out.chars().take(200).collect()
 }
 
 /// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
@@ -3656,6 +3929,17 @@ mod tests {
         "Please run /login to continue",
     ];
 
+    /// ★수리 전(pre-fix) `run_health_rules` 매칭 미러 — 게이트도 마스킹도 없이 `is_match` 만
+    /// 하던 구 로직 그대로다(D5 `ingest_step_pre_refactor` 와 동일 관행: 비교 기준을 코드로 박제).
+    /// 이 미러가 매칭하는데 프로덕션 경로가 매칭하지 않으면 = 자기증폭 차단이 실제로 작동한 것.
+    fn health_matches_pre_fix(line: &str) -> Vec<String> {
+        default_health_rules()
+            .into_iter()
+            .filter(|r| r.regex.is_match(line))
+            .map(|r| r.name)
+            .collect()
+    }
+
     /// 격리 데몬 + 역할 surface 하나를 만들어 (daemon, surface) 반환. PTY는 `sleep 30`
     /// (기존 governance/handlers 테스트와 동일 관행 — 라이브 원장·라이브 소켓 무접촉).
     fn health_probe_daemon(tag: &str) -> (Arc<Daemon>, Arc<Surface>) {
@@ -3691,9 +3975,20 @@ mod tests {
             .collect()
     }
 
-    /// ★재현(수리 전 = FAIL 예상): 경보를 논의하는 산문만 넣어도 신규 경보가 뜬다.
+    /// ★음성 대조(수용 기준) — 경보를 **논의하는 산문**은 신규 경보 0건이어야 한다.
+    /// 델타 증명을 겸한다: 같은 표본을 수리 전 미러에 넣으면 매칭이 나온다(= 사고 재현).
     #[test]
     fn repro_alert_discussion_prose_must_not_fire_alerts() {
+        // 수리 전 미러: 실사고 표본 전부가 매칭됐다(전 5룰 발화가 실측된 그 조건).
+        let pre_fix: Vec<String> = INCIDENT_PROSE
+            .iter()
+            .flat_map(|l| health_matches_pre_fix(l))
+            .collect();
+        assert!(
+            pre_fix.len() >= 5,
+            "전제 실패: 수리 전 미러가 실사고 표본을 매칭하지 않음 ({pre_fix:?})"
+        );
+
         let (daemon, s) = health_probe_daemon("health-amp-neg");
         let alerts = feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
         assert!(
@@ -3719,6 +4014,355 @@ mod tests {
                 && rules.contains("login_required"),
             "진짜 고장 신호에서 경보 누락(탐지 사망): {:#?}",
             alerts
+        );
+    }
+
+    /// ★기계 루프 차단(ⓐ 발신 봉인) — 사고의 주범 경로. CSO_DIRECTIVE.md:23 이 지시하는
+    /// `cys events --category health --reconnect` 는 이벤트 JSON 라인을 그대로 `println!`
+    /// (cys.rs stream_events)하므로, **경보 이벤트 자체가 구독 pane 의 화면 텍스트가 된다**.
+    /// 그 라인을 다시 넣었을 때 새 경보가 나면 = LLM 서술 없이 성립하는 순수 자기증폭 루프.
+    #[test]
+    fn health_alert_event_echoed_into_a_pane_must_not_refire() {
+        let (daemon, producer) = health_probe_daemon("health-echo-src");
+        // ① 진짜 고장 라인 → 경보 발화(발생원 pane)
+        let fired = feed_lines_collect_alerts(&daemon, &producer, REAL_FAILURE_LINES);
+        assert!(!fired.is_empty(), "전제: 진짜 고장은 경보를 낸다");
+
+        // ② ★봉인 불변식: 발화된 경보의 payload.line 은 마스킹돼 있고, **어떤 룰에도
+        //    매칭되지 않는다**(= 그 문자열이 화면에 다시 찍혀도 재발화 불가).
+        let all_rules = default_health_rules();
+        for (rule, line) in &fired {
+            assert!(
+                line.contains(HEALTH_MASK_OPEN),
+                "경보 payload.line 이 마스킹되지 않음 (rule={rule}): {line}"
+            );
+            for r in &all_rules {
+                assert!(
+                    !r.regex.is_match(line),
+                    "경보 payload.line 이 룰 {}에 여전히 매칭(봉인 실패): {line}",
+                    r.name
+                );
+            }
+        }
+
+        // ③ 그 경보 이벤트들을 `cys events` 가 출력하는 형태(JSON 한 줄)로 직렬화해
+        //    구독자 pane(CSO 역할)의 화면 텍스트로 되먹인다.
+        let echoed: Vec<String> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"].as_str() == Some("health.alert"))
+            .map(|e| serde_json::to_string(&e).unwrap())
+            .collect();
+        assert!(!echoed.is_empty());
+
+        // ④ ★수리 전 참조 미러(ingest_step_pre_refactor 와 같은 관행) — 구 `run_health_rules`는
+        //    게이트·마스킹 없이 `is_match` 만 했다. **원문 payload 를 실은 구 이벤트 라인**을
+        //    구 로직에 넣으면 새 경보가 나온다 = 루프가 실재했음을 기계로 보인다.
+        let legacy_event_line = serde_json::to_string(&json!({
+            "name": "health.alert", "category": "health", "surface_id": 3,
+            "payload": {"rule": "rate_limited", "line": "api error: rate limit reached, retry later"},
+        }))
+        .unwrap();
+        let pre_fix_hits = health_matches_pre_fix(&legacy_event_line);
+        assert!(
+            !pre_fix_hits.is_empty(),
+            "전제 실패: 수리 전 로직이 경보 에코 라인에 재매칭하지 않음"
+        );
+        // 같은 라인을 **수리 후** 경로에 넣으면 0건이어야 한다.
+        let post_fix = feed_lines_collect_alerts(&daemon, &producer, &[legacy_event_line.as_str()]);
+        assert!(
+            post_fix.is_empty(),
+            "수리 후에도 구형 에코 라인이 재발화: {post_fix:#?}"
+        );
+
+        let subscriber = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("cso".into()), 24, 80)
+            .expect("create subscriber surface");
+        daemon.surfaces.lock().unwrap().insert(subscriber.id, subscriber.clone());
+        let refs: Vec<&str> = echoed.iter().map(|s| s.as_str()).collect();
+        let refired = feed_lines_collect_alerts(&daemon, &subscriber, &refs);
+        assert!(
+            refired.is_empty(),
+            "경보 이벤트 에코가 신규 경보 {}건 재발화(기계 자기증폭 루프): {:#?}",
+            refired.len(),
+            refired
+        );
+    }
+
+    /// ★`cys status`/control.dashboard 에코 경로 — recent_health 링의 line 도 마스킹되어
+    /// 화면에 다시 렌더돼도 재발화하지 않아야 한다.
+    #[test]
+    fn recent_health_ring_is_masked_and_not_refirable() {
+        let (daemon, s) = health_probe_daemon("health-ring-mask");
+        feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
+        let ring: Vec<String> = daemon
+            .recent_health
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        assert_eq!(ring.len(), REAL_FAILURE_LINES.len(), "전제: 5건 기록");
+        for raw in REAL_FAILURE_LINES {
+            for entry in &ring {
+                assert!(
+                    !entry.contains(raw),
+                    "recent_health 에 트리거 원문 유출: {entry}"
+                );
+            }
+        }
+        let refs: Vec<&str> = ring.iter().map(|s| s.as_str()).collect();
+        let refired = feed_lines_collect_alerts(&daemon, &s, &refs);
+        assert!(refired.is_empty(), "status 에코가 재발화: {refired:#?}");
+    }
+
+    /// ⓑ 격리 술어 단위 핀 — 사유별 판정과 **위음성 금지**(진짜 에러는 통과)를 박제한다.
+    #[test]
+    fn alert_discourse_reason_classifies_discourse_but_passes_real_errors() {
+        // 매칭 구간을 직접 계산해 술어에 넘긴다(run_health_rules 와 동일 입력).
+        let judge = |line: &str, rule: &str| -> Option<&'static str> {
+            let rules = default_health_rules();
+            let r = rules.iter().find(|r| r.name == rule).unwrap();
+            let m = r.regex.find(line).unwrap_or_else(|| panic!("no match: {line}"));
+            alert_discourse_reason(line, m.start(), m.end(), &rules)
+        };
+        // ① 기계장치 식별자
+        assert_eq!(
+            judge("health.alert rule=rate_limited line=\"rate limit\"", "rate_limited"),
+            Some("alert-machinery-token")
+        );
+        // ② 룰 이름 언급(식별자 꼴)
+        assert_eq!(
+            judge("token_expired 룰 확인 요망 — token expired", "token_expired"),
+            Some("rule-name-mention")
+        );
+        // ③ 인용 표기
+        assert_eq!(judge("the \"rate limit\" alarm was noisy", "rate_limited"), Some("quoted-mention"));
+        // ④ 한글 산문 서술
+        assert_eq!(
+            judge("이 경보를 논의하는 산문이 새 경보를 발화시킨다 (rate limit 언급 자체가 트리거)", "rate_limited"),
+            Some("narration-prose")
+        );
+        // ⑤ ★위음성 금지 — 진짜 에러 라인은 전부 통과(None)
+        for (line, rule) in [
+            ("Error: not logged in", "not_logged_in"),
+            ("HTTP 429 Too Many Requests", "rate_limited"),
+            ("401 Unauthorized", "auth_401"),
+            ("your token has expired", "token_expired"),
+            ("Please run /login to continue", "login_required"),
+            // 로그 프리픽스·후행 텍스트가 붙은 실제 로그 라인도 통과해야 한다
+            ("2026-08-01T10:00:00Z [api] request failed: 401 Unauthorized, retrying", "auth_401"),
+            // 짧은 한글이 섞인 현지화 라인은 임계(8) 미만이라 통과
+            ("인증 실패: 401 Unauthorized", "auth_401"),
+        ] {
+            assert_eq!(judge(line, rule), None, "진짜 에러가 억제됨: {line}");
+        }
+    }
+
+    /// ⓐ 마스킹 함수 핀 — 트리거 구간만 치환·나머지 보존·200자 상한(문자 경계 안전),
+    /// 그리고 ★핵심 불변식: **산출물은 어떤 룰에도 매칭되지 않는다**(다중 트리거 한 줄 포함).
+    #[test]
+    fn mask_health_line_leaves_no_trigger_matchable() {
+        let rules = default_health_rules();
+        let masked = mask_health_line("Error: not logged in (session 3)", &rules);
+        assert_eq!(masked, "Error: \u{2039}health-rule\u{203a} (session 3)");
+        assert!(!masked.contains("not logged in"), "트리거 원문 잔존");
+
+        // ★다중 트리거 한 줄 — 발화 룰 하나만 가리면 나머지가 새어 나간다(회귀 핀).
+        let multi = "api: 401 Unauthorized and your token has expired, rate limit hit";
+        let masked_multi = mask_health_line(multi, &rules);
+        for r in &rules {
+            assert!(
+                !r.regex.is_match(&masked_multi),
+                "마스킹 산출물이 룰 {}에 여전히 매칭: {masked_multi}",
+                r.name
+            );
+        }
+        // 마스크 토큰 자체가 룰을 재발화시키지 않는다(수렴 보장의 근거).
+        for r in &rules {
+            assert!(!r.regex.is_match(HEALTH_MASK), "마스크 토큰이 룰 {}에 매칭", r.name);
+        }
+        // 200자 상한 — 멀티바이트 경계에서 잘라도 패닉 없음
+        let long = format!("{}not logged in", "가".repeat(300));
+        assert_eq!(mask_health_line(&long, &rules).chars().count(), 200);
+    }
+
+    /// ⓑ 억제 관측 카운터 — 억제가 침묵하지 않고 사유별로 집계된다(원문은 담지 않는다).
+    #[test]
+    fn suppression_is_counted_by_reason_not_silent() {
+        let (daemon, s) = health_probe_daemon("health-suppress-count");
+        feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
+        let sup = daemon.health_suppressed.lock().unwrap();
+        let total: u64 = sup.values().sum();
+        assert!(total >= INCIDENT_PROSE.len() as u64 - 2, "억제 집계 누락: {sup:?}");
+        assert!(
+            sup.keys().any(|(_, reason)| *reason == "narration-prose"),
+            "한글 서술 억제 사유 미기록: {sup:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★T3-G2 동반 수리(적대 검증 FAIL 봉합) — 억제가 **안전 인터록까지** 삼키면 안 된다.
+    //
+    // T2 는 담화 판정이 서면 `continue` 로 룰 처리를 통째로 건너뛰었다. 그런데 그 건너뛴
+    // 구간에는 경보 발신뿐 아니라 **`recent_health` 인터록 기록**이 함께 들어 있었다.
+    // governance::check_agent_death 의 auth 무한 재기동 차단(`auth_blocked`)은 오직
+    // `recent_health` 만 보므로, 한국어가 섞인 진짜 auth 실패 라인이 narration-prose 로
+    // 분류되는 순간 차단 장치가 통째로 무력화된다(= 401 상대로 무한 재기동).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 진짜 auth 실패인데 한국어 문맥이 붙은 라인들(현장 실측형). narration-prose 로
+    /// 분류되지만 **신호는 진짜**다 — 인터록에는 반드시 도달해야 한다.
+    const KOREAN_REAL_AUTH_FAILURES: &[&str] = &[
+        "node-recover: worker-1 재기동 중 401 unauthorized 가 반환되었습니다",
+        "에이전트 기동 실패 — 응답 본문에 not logged in 이 담겨 돌아왔습니다 (자동 복구 중단)",
+    ];
+
+    #[test]
+    fn korean_real_auth_failure_reaches_recent_health_interlock() {
+        let (daemon, s) = health_probe_daemon("health-auth-interlock");
+        // 전제 ①: 이 라인들은 (수리 전 로직 기준) 확실히 auth 계열 룰에 매칭된다.
+        for line in KOREAN_REAL_AUTH_FAILURES {
+            let hits = health_matches_pre_fix(line);
+            assert!(
+                hits.iter().any(|r| AUTH_INTERLOCK_RULES.contains(&r.as_str())),
+                "전제 실패: 표본이 auth 룰에 매칭되지 않음 ({line} → {hits:?})"
+            );
+        }
+        // 전제 ②: 이 라인들은 담화(narration-prose)로 분류된다 — 즉 억제 경로를 탄다.
+        {
+            let rules = default_health_rules();
+            for line in KOREAN_REAL_AUTH_FAILURES {
+                let r = rules.iter().find(|r| r.regex.is_match(line)).unwrap();
+                let m = r.regex.find(line).unwrap();
+                assert_eq!(
+                    alert_discourse_reason(line, m.start(), m.end(), &rules),
+                    Some("narration-prose"),
+                    "전제 실패: 표본이 narration-prose 로 분류되지 않음 ({line})"
+                );
+            }
+        }
+
+        let alerts = feed_lines_collect_alerts(&daemon, &s, KOREAN_REAL_AUTH_FAILURES);
+        // ★핵심: 인터록(recent_health)에는 도달해야 한다 — 이것이 auth_blocked 의 유일 근거.
+        assert!(
+            auth_blocked_by_recent_health(&daemon.recent_health.lock().unwrap(), s.id, now_epoch()),
+            "진짜 auth 실패가 인터록에 도달하지 못함 → governance auth_blocked 무력화 \
+             (recent_health={:?}, alerts={alerts:?})",
+            daemon.recent_health.lock().unwrap()
+        );
+        // 인터록 기록도 마스킹 불변식을 지킨다(원문 유출 0 · 재매칭 0).
+        let rules = default_health_rules();
+        for e in daemon.recent_health.lock().unwrap().iter() {
+            let line = e["line"].as_str().unwrap_or_default();
+            for r in &rules {
+                assert!(!r.regex.is_match(line), "인터록 기록이 룰 {}에 재매칭: {line}", r.name);
+            }
+        }
+    }
+
+    /// 반대 방향(음성 대조) — 경보를 **논의하는 산문**은 여전히 신규 경보 0건이어야 한다.
+    /// (인터록 기록이 살아났다고 해서 발신 억제가 풀리면 자기증폭이 부활한다.)
+    #[test]
+    fn interlock_record_does_not_reopen_alert_amplification() {
+        let (daemon, s) = health_probe_daemon("health-interlock-neg");
+        let alerts = feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
+        assert!(alerts.is_empty(), "산문에서 신규 경보 발화(자기증폭 부활): {alerts:#?}");
+        let alerts2 = feed_lines_collect_alerts(&daemon, &s, KOREAN_REAL_AUTH_FAILURES);
+        assert!(
+            alerts2.is_empty(),
+            "담화 분류 라인은 인터록에만 남고 경보는 발신하지 않아야 한다: {alerts2:#?}"
+        );
+    }
+
+    /// ★구조화 신호(JSON 값 자리)는 억제 대상이 아니다 — T2 의 `quoted-mention` 이 진짜 도구의
+    /// 구조화 에러 출력을 "인용된 서술"로 오분류해 **경보를 통째로 지웠다**(진짜 고장 은폐).
+    /// 산문 인용은 그대로 억제된다(양방향).
+    #[test]
+    fn structured_json_error_is_not_treated_as_quoted_mention() {
+        let rules = default_health_rules();
+        let judge = |line: &str| {
+            let r = rules.iter().find(|r| r.regex.is_match(line)).unwrap();
+            let m = r.regex.find(line).unwrap();
+            alert_discourse_reason(line, m.start(), m.end(), &rules)
+        };
+        // ① 구조화 에러 출력(JSON 값 자리·logfmt 값 자리) = 진짜 신호 → 통과(None)
+        assert_eq!(judge(r#"{"error":"rate limit"}"#), None);
+        assert_eq!(judge(r#"level=error msg="rate limit" svc=api"#), None);
+        // ② 산문 인용 = 여전히 담화(회귀 금지 — T2 판정 그대로 보존)
+        assert_eq!(
+            judge("the \"rate limit\" alarm was noisy"),
+            Some("quoted-mention")
+        );
+        // ③ 실제 발신 경로에서도 구조화 라인은 경보를 낸다
+        let (daemon, s) = health_probe_daemon("health-structured");
+        let alerts = feed_lines_collect_alerts(&daemon, &s, &[r#"{"error":"rate limit"}"#]);
+        assert!(!alerts.is_empty(), "구조화 실패 신호가 경보를 내지 못함");
+    }
+
+    /// ★인터록 원장 보호 — 경보를 논하는 수다(담화 항목)가 링을 채워도 진짜 auth 기록은
+    /// 밀려나지 않아야 한다. 밀려나면 auth 무한 재기동 차단이 창 안에서 근거를 잃는다.
+    #[test]
+    fn discourse_entries_do_not_evict_real_alerts_from_interlock_ring() {
+        let (daemon, s) = health_probe_daemon("health-ring-evict");
+        // ① 진짜 실패 1건을 먼저 남긴다.
+        feed_lines_collect_alerts(&daemon, &s, &["401 Unauthorized"]);
+        assert!(auth_blocked_by_recent_health(
+            &daemon.recent_health.lock().unwrap(),
+            s.id,
+            now_epoch()
+        ));
+        // ② 담화 라인을 링 용량의 두 배 넘게 쏟아붓는다(수다로 밀어내기 시도).
+        let chatter: Vec<String> = (0..HEALTH_RING_CAP * 2)
+            .map(|i| format!("[CSO] {i}번째 보고: rate limit 경보를 계속 논의하는 중입니다"))
+            .collect();
+        let refs: Vec<&str> = chatter.iter().map(|s| s.as_str()).collect();
+        let alerts = feed_lines_collect_alerts(&daemon, &s, &refs);
+        assert!(alerts.is_empty(), "담화가 경보를 발화(자기증폭): {alerts:#?}");
+        // ③ 링은 상한을 지키면서도 진짜 항목은 살아남는다 → 인터록 유지.
+        let recent = daemon.recent_health.lock().unwrap();
+        assert!(recent.len() <= HEALTH_RING_CAP, "링 상한 위반: {}", recent.len());
+        assert!(
+            auth_blocked_by_recent_health(&recent, s.id, now_epoch()),
+            "수다가 진짜 auth 기록을 밀어내 인터록이 무력화됨"
+        );
+    }
+
+    /// ★두 소비자 분기 핀 — 같은 링을 인터록은 세고, 사람이 보는 경보 목록·`state=error` 판정은
+    /// 세지 않는다. 이 비대칭이 깨지면 ①(인터록이 담화를 무시) 무한 재기동이 부활하거나
+    /// ②(화면이 담화를 경보로 표시) 노드가 그 빨간불을 수리 일감으로 삼아 루프가 되살아난다.
+    #[test]
+    fn discourse_records_feed_interlock_but_not_the_human_alert_view() {
+        let (daemon, s) = health_probe_daemon("health-two-consumers");
+        feed_lines_collect_alerts(&daemon, &s, KOREAN_REAL_AUTH_FAILURES);
+        let recent = daemon.recent_health.lock().unwrap();
+        assert!(!recent.is_empty(), "전제: 인터록 기록이 남아야 한다");
+        // ① 인터록은 센다
+        assert!(auth_blocked_by_recent_health(&recent, s.id, now_epoch()));
+        // ② 사람이 보는 경보 목록·error 판정에서는 전부 빠진다
+        assert!(
+            recent.iter().all(|e| !is_alert_record(e)),
+            "담화 항목이 사람 경보 뷰에 노출됨: {recent:?}"
+        );
+        // 진짜 경보는 반대로 둘 다에 잡힌다
+        drop(recent);
+        feed_lines_collect_alerts(&daemon, &s, &["401 Unauthorized"]);
+        let recent = daemon.recent_health.lock().unwrap();
+        assert!(recent.iter().any(is_alert_record), "진짜 경보가 사람 뷰에서 누락");
+    }
+
+    /// 기계 에코(우리 경보의 반사)는 인터록에도 남기지 않는다 — 정보량 0인데 창만 갱신하면
+    /// 인터록이 스스로 살아남는다(자기지속 상태).
+    #[test]
+    fn alert_machinery_echo_never_reaches_interlock() {
+        let (daemon, s) = health_probe_daemon("health-echo-interlock");
+        let echo = r#"{"name":"health.alert","payload":{"rule":"auth_401","line":"401 unauthorized"}}"#;
+        feed_lines_collect_alerts(&daemon, &s, &[echo]);
+        assert!(
+            daemon.recent_health.lock().unwrap().is_empty(),
+            "경보 기계 에코가 인터록에 기록됨: {:?}",
+            daemon.recent_health.lock().unwrap()
         );
     }
 

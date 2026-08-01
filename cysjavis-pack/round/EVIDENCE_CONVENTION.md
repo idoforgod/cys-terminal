@@ -1,6 +1,6 @@
 # 매체별 증거 규약 (EVIDENCE_CONVENTION) — 레버② SOT
 
-- 출처: `_round/QUALITY_LEVERS_DESIGN.md` §2 (레버② · 박사님 승인 2026-07-15) — 이 문서가 §2 표를 완결 규약으로 확정한다.
+- 출처: `_round/QUALITY_LEVERS_DESIGN.md` §2 (레버②) — 이 문서가 §2 표를 완결 규약으로 확정한다.
 - 상태: 규약(convention) — **코드 변경 0**. `~/.cys/pack/bin/javis_verdict.py` 등 어떤 코드도 수정하지 않는다.
 - 적용 대상: 검증자(agy·codex·sub-agent·검증 페인·video-verify 관문)가 결함을 지적하는 **모든 verdict**.
 

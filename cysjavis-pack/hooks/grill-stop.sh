@@ -1,6 +1,6 @@
 #!/bin/sh
 # Stop GATE hook: grill 수집 중(collecting)·floor 미충족이면 턴 종료를 차단한다.
-# 의도(오너 2026-07-16): 파일 쓰기가 없는 순수 계획·합의 flow에서는 기존 PreToolUse
+# 의도(2026-07-16): 파일 쓰기가 없는 순수 계획·합의 flow에서는 기존 PreToolUse
 # 게이트(Edit/Write)가 발동할 트리거 자체가 없어 조기 합의 선언을 아무도 막지 못했다.
 # 이 hook이 그 갭을 닫는다 — 미해소 결정축이 floor에 미달하면 종료 대신 계속 질문하게 한다.
 #

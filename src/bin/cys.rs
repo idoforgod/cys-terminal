@@ -10562,6 +10562,11 @@ fn run_scoped(surface: Option<String>, command: Vec<String>) -> Result<i32, Stri
 
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
+    // ★SEAL-1 방어심도: `cys run -- <명령>` 은 CLAUDE.md 가 워커 표준 실행 형태로 규정한 경로라
+    // 임의의 명령(그 안의 python 포함)이 여기로 들어온다. 임의 명령 스폰이라 python_command
+    // 팩토리를 못 쓰므로 같은 상수를 직접 소비한다(규약 산재 아님 · 정본 = lib.rs
+    // ENV_PY_NO_BYTECODE). python 이 아닌 자식에겐 무해한 무시 변수다.
+    cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

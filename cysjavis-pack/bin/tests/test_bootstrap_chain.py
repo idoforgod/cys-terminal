@@ -226,7 +226,7 @@ check("5d 인계 지시 출력", "인계" in err)
 shutil.rmtree(tmp)
 
 # ── 6. 선행 단계 실패 exit 매핑: ping=3 · boot=4 (부팅-치명 전제 위반) ──
-# ★preflight는 제외(오너 2026-07-15 적대검증 adv#1): preflight FAIL은 팀 부팅을 abort하지 않는다
+# ★preflight는 제외(2026-07-15 적대검증 adv#1): preflight FAIL은 팀 부팅을 abort하지 않는다
 # (60+ 체크 중 하나만 FAIL이어도 팀 0개였던 "100% 완료" 위반 수리). 진짜 게이트는 ⑤ check. → 6b 참조.
 for name, kw, want in (("ping", {"ping_exit": 1}, 3),
                        ("boot", {"boot_exit": 1}, 4)):

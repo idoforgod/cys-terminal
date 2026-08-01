@@ -5151,6 +5151,19 @@ async function start() {
   } catch {
     /* 비-macOS·조회 실패는 정상 부트로 흘려보냄(안전모드는 macOS 전용 게이트) */
   }
+  // ★설치본 무결성 pull(ATOMIC-1 짝 · 2026-08-01 "손상되었기 때문에 열 수 없습니다" 실사고):
+  // 정규 위치에 설치됐는데도 구성요소가 빠진 '반쪽 번들'이면 어떤 파일이 없는지와 재설치 절차를
+  // 알린다. 안전모드와 **별개 토스트**다 — 원인도 처방도 다르므로 같은 제목에 섞으면 오히려
+  // 사용자를 헤매게 한다("위치를 옮기라"고 해도 해결되지 않는 고장이다). bundle-damaged 이벤트는
+  // 벨트앤서스펜더(같은 id 라 중복 발화해도 dedupe).
+  try {
+    const damage = await invoke("bundle_integrity");
+    if (typeof damage === "string" && damage) {
+      stickyToast("bundle-damaged", "health", "설치본이 온전하지 않습니다 — 재설치 필요", damage);
+    }
+  } catch {
+    /* 비-macOS·번들 밖 실행은 해당 없음 */
+  }
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {
@@ -5339,6 +5352,17 @@ async function start() {
         ? e.payload
         : "cys.app을 응용 프로그램(Applications) 폴더로 옮긴 뒤 다시 열어 주세요.";
     stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", msg);
+  });
+
+  // ★반쪽 번들 알림(ATOMIC-1 짝): 기동 자기점검과 **업데이트 설치 후 검증** 양쪽이 이 이벤트를 쏜다.
+  // 후자는 재시작을 중단하고 이 안내를 띄운다 — 깨진 번들로 재시작하면 다음 기동을 Gatekeeper 가
+  // 막아 사용자가 원인 없는 "손상되었기 때문에 열 수 없습니다"만 보게 되기 때문이다.
+  await listen("bundle-damaged", (e) => {
+    const msg =
+      typeof e.payload === "string"
+        ? e.payload
+        : "cys 설치본의 일부 구성요소가 빠졌습니다. 최신 DMG로 재설치해 주세요.";
+    stickyToast("bundle-damaged", "health", "설치본이 온전하지 않습니다 — 재설치 필요", msg);
   });
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)

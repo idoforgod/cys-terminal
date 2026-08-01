@@ -27,7 +27,7 @@
     "cmd": "~/.local/bin/agy --dangerously-skip-permissions",
     "inject_delay_secs": 12,
     "ready_marker": "? for shortcuts",
-    "notes": "Antigravity CLI(agy) — 구 Gemini CLI가 2026-06-18 소비자 티어(무료·AI Pro·Ultra) 중단되어 이주(오너 Google AI Ultra 연동 실측 2026-06-13). 키 이름 'gemini' 유지: 역할(reviewer-gemini)·orchestra check·boot PLAN 계약 무변. 로그인은 사람 단계(Google OAuth — 첫 기동 시 화면 안내). 절대경로인 이유: 설치 스크립트가 ~/.profile에만 PATH를 넣어 zsh 비로그인 셸에서 'agy'가 안 잡힌다.",
+    "notes": "Antigravity CLI(agy) — 구 Gemini CLI가 2026-06-18 소비자 티어(무료·AI Pro·Ultra) 중단되어 이주(2026-06-13 실측). 키 이름 'gemini' 유지: 역할(reviewer-gemini)·orchestra check·boot PLAN 계약 무변. 로그인은 사람 단계(Google OAuth — 첫 기동 시 화면 안내). 절대경로인 이유: 설치 스크립트가 ~/.profile에만 PATH를 넣어 zsh 비로그인 셸에서 'agy'가 안 잡힌다.",
     "clear_cmd": "/clear",
     "resume_arg": "--continue",
     "capabilities": [

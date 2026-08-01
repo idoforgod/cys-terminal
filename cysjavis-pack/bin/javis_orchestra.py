@@ -53,8 +53,13 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 exit 0=수렴(다음 단계 자동 착수 가) / 1=미수렴(사유 출력).
   next-action                   자율주행(앵커6 축3) 다음 액션 결정론 추출: pack/round/
                                 SESSION_STATE.md '## 다음 액션' 섹션의 첫 미완 항목을 출력.
-                                exit 0=항목 있음 / 1=큐 비음(전 작업 완료 — 정지·오너 보고)
-                                / 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기).
+                                ★임무 게이트(T1 2026-08-01): 큐에 항목이 있어도 **이 세션에
+                                오너 임무 지정이 없으면 착수하지 않는다** — 큐는 master 자신이
+                                쓴 파일이라 자기인가가 되기 때문이다(판정=javis_mission.gate).
+                                exit 0=항목 있음+임무 지정됨(자율 착수 가)
+                                / 1=큐 비음(전 작업 완료 — 정지·오너 보고)
+                                / 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기)
+                                / 3=항목 있음·임무 미지정 → 보고하고 멈춘다(자율 착수 금지).
 
 의존성: 파이썬 표준 라이브러리 + PATH의 cys(check만 필요).
 """
@@ -87,7 +92,7 @@ REQUIRED_ROLES = ["cso", "worker", "reviewer-gemini", "reviewer-codex"]
 OPTIONAL_ROLES = ["reviewer-grok"]
 MAX_ROUNDS = 10  # 마스터 헌장 제9조: 잠근 합격 기준의 미달 항목 0 또는 10R 상한 도달 시 멈춘다
 
-# ★리뷰어 슬롯 + 무구독 폴백(오너 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
+# ★리뷰어 슬롯 + 무구독 폴백(2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
 # '기본 전제'일 뿐 절대 전제가 아니다 — 사용자가 다른 임무를 줄 수도, 구독·CLI가 없을 수도 있다.
 # master 부트 후 리뷰어를 '호출하는 단계'에서 감지하지 못하면 멈추지 말고 곧바로 Claude 대체
 # 리뷰어로 폴백한다. 감지는 LLM 자연어 재추론이 아니라 아래 결정론 함수만이 사실이다(§12).
@@ -447,7 +452,7 @@ def cmd_check(args):
     required = list(verdicts.keys())
     alive_optional = live_roles(status)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
-    # 리뷰어 대체 고지(오너 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
+    # 리뷰어 대체 고지(2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
         if not e["native"]:
             print("  ⚠ %s 미감지(%s) → %s(Claude 대체) — 보편적이나 벤더 다양성 약함, "
@@ -551,7 +556,7 @@ def _boot_one_node(role, agent, timeout=None):
 
 
 def cmd_boot_reviewers(args):
-    """★오너 2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
+    """★2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
     감지를 못하면 멈추지 말고 곧바로 Claude 대체 리뷰어로 폴백 기동한다.
     2층 감지: (1) 바이너리 미설치 → 즉시 대체(detect_reviewer). (2) 설치됐으나 부트가
     각성(set-status ack)에 실패(미인증·깨짐) → 대체로 2차 폴백. 절대 halt 하지 않는다."""
@@ -1644,6 +1649,13 @@ def cmd_gate_status(args):
         pass
     print("종합: GATE CONVERGED — 4자 수렴. 커밋+SESSION_STATE 갱신 후 다음 로드맵 단계를 "
           "자동 착수하라(앵커6 축1 — denylist 해당 시에만 정지).")
+    # ★T1(2026-08-01 실사고): 축1도 임무 게이트가 선행 조건이다 — 수렴은 '이 산출물이 통과했다'는
+    #   뜻이지 '지금 달려도 된다'는 뜻이 아니다. 오너 임무가 없으면 여기서도 멈추고 보고한다.
+    _mrc, _mv = _mission_gate()
+    if _mrc != 0:
+        print("주의: 이 세션에 오너 임무 지정이 없다(%s) — 수렴했더라도 **자동 착수는 금지**다"
+              "(§0-C 임무 게이트). 수렴 사실만 보고하고 오너 지시를 기다려라." % _mv.get("reason"),
+              file=sys.stderr)
     # (RSI 자율추천 ii) 종료 게이트 — slow 작업 수렴(종료) 시 '더 나은 방법' 학습 1회 추천
     # (추천만·사람 승인·directive §4). gate-status는 폴링되므로 (task,round)당 1회 마커로 스팸 차단.
     _recommend_learn_once("gate", "%s R%d 종료 — 더 나은 방법론" % (args.task, rnd),
@@ -1673,15 +1685,28 @@ def _recommend_learn_once(reason, topic, marker_key):
         pass
 
 
-def extract_next_action(text):
-    """SESSION_STATE '## 다음 액션' 섹션의 첫 미완 항목 — 순수 함수(self-test 박제).
+def next_action_items(text):
+    """SESSION_STATE '## 다음 액션' 섹션의 **미완 항목 전량**(순서 보존) — 순수 함수.
 
     지원 형식: 'N. 항목' 번호 목록 · '- [ ] 항목' 체크박스 · '- 항목' 불릿.
-    제외: '(없음)' 류 빈 표시 · 완료 체크(- [x]). 반환: 항목 문자열 또는 None.
+    제외: '(없음)' 류 빈 표시 · 완료 체크(- [x]).
+
+    ★섹션 종료 경계 = 다음 `## ` 헤딩 **또는 예약 블록**(`<!-- CYS:RESERVED:`).
+      종전엔 `## ` 만 경계여서, 팩 기본 템플릿의 예약 블록
+          <!-- CYS:RESERVED:restore_pointer __CYS__RESERVED__ -->
+          - 복원 포인터: (없음)
+      이 **큐 항목으로 계수**됐다. 실효가 치명적이었다 — 큐가 `1. (없음)`(=갓 설치·전 작업
+      완료)인 상태에서도 `extract_next_action` 이 `'복원 포인터: (없음)'` 을 반환해 **exit 0
+      (=자율 착수 가)** 이 났다. 즉 **한 번도 쓰지 않은 SESSION_STATE 로도 자율주행이 시동**됐다
+      (T1 2026-08-01 검증 중 실측 발견 · 아래 self-test 로 박제).
+      ※ `- 복원 포인터: (없음)` 자체는 '없음' 빈-표시 패턴에 걸리지 않는다 — 접두어가 붙어 있어
+        `^[(]?\\s*없음` 매칭이 성립하지 않기 때문이다. 그래서 필터가 아니라 **경계**로 고쳐야 한다.
     """
-    m = re.search(r"(?m)^##\s*다음 액션[^\n]*\n(.*?)(?:\n##\s|\Z)", text, re.S)
+    m = re.search(r"(?m)^##\s*다음 액션[^\n]*\n(.*?)(?:\n##\s|\n<!--\s*CYS:RESERVED:|\Z)",
+                  text, re.S)
     if not m:
-        return None
+        return []
+    out = []
     for ln in m.group(1).splitlines():
         s = ln.strip()
         if not s:
@@ -1703,13 +1728,38 @@ def extract_next_action(text):
         # 빈 표시: '없음' 단독 또는 괄호/구두점 부가 설명만 빈 칸이다 — "없음 처리 로직
         # 구현" 같은 실제 과제명은 빈 칸이 아니다(시작-매칭 과확장 차단, 6차 R2).
         if item and not re.match(r"^[\(（]?\s*없음\s*[\)）.。\s]*([\(（].*)?$", item):
-            return item
-    return None
+            out.append(item)
+    return out
+
+
+def extract_next_action(text):
+    """첫 미완 항목 또는 None(구 계약 보존 — 소비자 다수)."""
+    items = next_action_items(text)
+    return items[0] if items else None
+
+
+def _mission_gate():
+    """(exit_code, verdict) — 판정의 단일 소유자는 `javis_mission.gate()` 다(사본 금지).
+    모듈이 없으면 **fail-closed**: 임무 없음으로 접는다(팩 스큐가 자율주행을 열지 않는다)."""
+    try:
+        import javis_mission as _m
+        return _m.gate()
+    except Exception as e:
+        return 2, {"have_mission": False, "mission": None,
+                   "reason": "javis_mission 미적재(%s) — fail-closed" % e}
 
 
 def cmd_next_action(args):
-    # exit 계약: 0=다음 액션 있음(stdout) / 1=빈 큐(전 작업 완료 — 정지·오너 보고) /
-    # 2=SESSION_STATE 부재(신규 시작 — 오너 지시 대기). 1과 2는 다른 대응이다(§0-⑥ vs §14).
+    # ★exit 계약 v2 (2026-08-01 윈도우 실사고 T1 — 임무 게이트 신설):
+    #   0 = 다음 액션 있음 **그리고** 이 세션에 오너 임무 지정이 있다 → 자율 착수 가
+    #   1 = 빈 큐(전 작업 완료 — 정지·오너 보고)
+    #   2 = SESSION_STATE 부재(신규 시작 — 오너 지시를 기다린다)
+    #   3 = 큐에 항목은 있으나 **임무 미지정** → 자율 착수 금지. "대기 중인 작업 N건이 있습니다.
+    #       이어서 하시겠습니까?"로 **보고하고 멈춘다**.
+    # 왜 3이 필요한가: 구 계약은 exit 0(항목 있음)만 보고 달렸다. 그런데 큐는 master 자신이 쓴
+    # SESSION_STATE 다 — 산출자가 자기 산출물로 착수 권한을 발급하는 자기인가였다. 오너가 임무를
+    # 주지 않은 부팅에서 **이전 세션 잔무 큐**를 집어 무한 작업에 들어간 실사고의 직접 원인이다.
+    # 이전 세션 잔무는 **보고 대상**이지 자동 착수 대상이 아니다.
     p = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
     try:
         text = open(p, encoding="utf-8", errors="replace").read()
@@ -1717,11 +1767,23 @@ def cmd_next_action(args):
         print("[next-action] SESSION_STATE 없음(신규 시작): %s — 오너 지시를 기다려라."
               % p, file=sys.stderr)
         return 2
-    item = extract_next_action(text)
+    items = next_action_items(text)
+    item = items[0] if items else None
     if item is None:
         print("[next-action] 다음 액션 큐 비어 있음 — 전 작업 완료. 자율 루프 정지·오너 보고.",
               file=sys.stderr)
         return 1
+    mrc, mv = _mission_gate()
+    if mrc != 0:                                  # 1=임무 없음 · 2=판독 불가(둘 다 착수 금지)
+        n = len(items)
+        # stdout 은 **오너에게 그대로 읽어줄 보고 문안**이다(master가 문장을 지어내지 않게).
+        print("대기 중인 작업 %d건이 있습니다. 이어서 하시겠습니까? (첫 항목: %s)" % (n, item))
+        print("[next-action] 임무 미지정 — 자율 착수 금지(exit 3). 사유: %s"
+              % mv.get("reason"), file=sys.stderr)
+        print("  이 큐는 이전 세션의 잔무다. **보고 대상이지 자동 착수 대상이 아니다.**\n"
+              "  해제: 오너가 이 세션에 임무를 지정하면 훅이 자동 기록한다(구두 지시는 "
+              "`javis_mission.py set \"<임무>\"`).", file=sys.stderr)
+        return 3
     print(item)
     return 0
 
@@ -2091,6 +2153,27 @@ def cmd_self_test(args):
         # ★'없음' 시작-매칭 과확장 차단(6차 R2): "없음 처리 로직" 같은 실제 과제는 빈 칸 아님
         assert extract_next_action("# S\n## 다음 액션 큐\n1. 없음 처리 로직 구현\n") \
             == "없음 처리 로직 구현", "'없음'으로 시작하는 실제 과제가 silent skip"
+        # ★T1(2026-08-01) 회귀 핀 — **예약 블록은 큐가 아니다**.
+        #   구 코드는 섹션 경계가 `## ` 뿐이라, 팩 기본 템플릿의
+        #   `<!-- CYS:RESERVED:restore_pointer -->` / `- 복원 포인터: (없음)` 을 큐 항목으로 읽었다.
+        #   실효: 큐가 `1. (없음)`(갓 설치·전 작업 완료)인데도 exit 0(자율 착수 가)이 났다 —
+        #   **한 번도 쓰지 않은 SESSION_STATE 로 자율주행이 시동**되는 경로였다.
+        ss_res = ("# S\n## 다음 액션 큐\n1. (없음)\n\n"
+                  "<!-- CYS:RESERVED:restore_pointer __CYS__RESERVED__ -->\n"
+                  "- 복원 포인터: (없음)\n"
+                  "<!-- /CYS:RESERVED:restore_pointer -->\n")
+        assert extract_next_action(ss_res) is None, \
+            "예약 블록(복원 포인터)이 다음 액션으로 반환 — 빈 큐가 자율 착수로 오판(T1 회귀)"
+        # 팩 동봉 템플릿 실물로도 확인한다(문서와 코드가 같이 늙지 않게 · 부재 시 건너뜀)
+        _tpl = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
+        if os.path.isfile(_tpl):
+            _t = open(_tpl, encoding="utf-8", errors="replace").read()
+            if "1. (없음)" in _t:
+                assert extract_next_action(_t) is None, \
+                    "팩 기본 SESSION_STATE 템플릿이 빈 큐인데 액션을 반환한다(T1 회귀)"
+        # 계수는 추출과 **같은 필터**를 쓴다(보고 숫자와 착수 판정이 갈리지 않게)
+        assert len(next_action_items(ss2)) == 2, "미완 항목 계수 불일치"
+        assert len(next_action_items(ss4)) == 1, "완료([x]) 항목이 계수에 포함"
         # (e) 핀↔마커 패리티: 마커 소실로 폴백 강등될 때 안내하는 preflight C03(WORKER 핀)이
         # 같은 소실을 검출할 수 있어야 진단 루프가 닫힌다. javis_preflight가 같은 bin에
         # 있을 때만 검사(없는 환경에서는 자기 검증 불가 — 건너뜀).
@@ -2105,7 +2188,7 @@ def cmd_self_test(args):
             for mark in RULE_MARKERS:
                 assert any(mark in pin or pin in mark for pin in worker_pins), \
                     "마커 '%s'가 WORKER C03 핀에 비커버 — 폴백 강등 원인을 preflight가 못 본다" % mark
-        # ── 리뷰어 감지·무구독 폴백 배터리(오너 2026-06-14 · 밀폐 가짜 감지기) ──
+        # ── 리뷰어 감지·무구독 폴백 배터리(2026-06-14 · 밀폐 가짜 감지기) ──
         # 표준 슬롯 계약 고정: agy/codex 네이티브 + claude 대체 2슬롯(변형 시 폴백 붕괴).
         assert [s[1] for s in REVIEWER_SLOTS] == ["gemini", "codex"], "표준 리뷰어 슬롯 변형"
         assert [s[3] for s in REVIEWER_SLOTS] == ["claude", "claude"], "대체 agent 는 claude 여야 함"

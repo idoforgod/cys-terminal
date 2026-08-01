@@ -5,6 +5,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub mod action_catalog;
+/// 앱 번들 완본 검증 + 원자 교체 계약(ATOMIC-1) — 2026-08-01 "손상되었기 때문에 열 수 없습니다" 사고의
+/// 재발 차단. SEAL-1(아래 `ENV_PY_NO_BYTECODE`)이 **번들이 스스로 봉인을 깨는 것**을 막는다면,
+/// 이쪽은 **교체가 반쪽으로 끝나는 것**을 막는다(같은 사고의 다른 절반).
+pub mod app_bundle;
 pub mod directive_compose;
 pub mod edit_kinds;
 pub mod license;
@@ -54,10 +58,16 @@ pub const ENV_ROLE: &str = "CYS_ROLE";
 ///    (최악 = 매번 재컴파일, 봉인은 절대 안 깨짐). 봉인 파손의 대가가 **앱 실행 불가**라
 ///    비대칭이 압도적이다.
 ///
-/// ※ 잔여 갭(이 상수의 범위 밖 · 빌드 층위 · 후속 권고): 서명 **전**에
-///   `compileall --invalidation-mode unchecked-hash` 로 stdlib 을 미리 컴파일해 `.pyc` 를
-///   **서명 대상**으로 넣으면 ⓐ 어떤 호출 경로(우리가 스폰하지 않은 python 포함)에서도 새
-///   쓰기가 없고 ⓑ ②의 기동 손해도 사라진다. 그건 패키징 변경이라 여기(스폰 env)와 별개다.
+/// ※ 이 상수가 못 덮는 갭과 그 해소(SEAL-2 · 빌드 층위 · **구현 완료**): 이 env 는 **우리가
+///   스폰하는** python 만 덮는다. 사용자·에이전트가 번들 python 을 절대경로로 **직접** 부르면
+///   env 를 못 타고 `.pyc` 가 번들 안에 쓰인다. 그래서 서명 **전**에
+///   `compileall --invalidation-mode unchecked-hash` 로 동봉 런타임 전체(stdlib·site-packages·
+///   node-gyp/gyp)를 미리 컴파일해 `.pyc` 를 **서명 대상**으로 넣는다
+///   (`scripts/precompile-bundled-python.sh` — prep-mac-runtime.sh·build-macos-signed.sh 가 호출).
+///   그러면 ⓐ 어떤 호출 경로에서도 새로 쓸 것이 없고 ⓑ ②의 기동 손해도 사라진다.
+///   ★두 층은 대체가 아니라 심층방어다 — 이 env 는 사용자가 팩을 밖으로 꺼내 쓰는 등
+///   봉인 밖 경로까지 덮고, SEAL-2 는 env 를 못 타는 직접 호출을 덮는다.
+///   기계 확인은 `scripts/verify-gatekeeper-user-path.sh` ⑥-A(SEAL-2)·⑥-B(이 env).
 pub const ENV_PY_NO_BYTECODE: &str = "PYTHONDONTWRITEBYTECODE";
 /// `ENV_PY_NO_BYTECODE` 의 켜짐 값. CPython 은 **비어 있지 않으면** 참으로 읽는다 —
 /// 빈 문자열은 "끔"이므로 반드시 이 상수를 쓴다(빈 값 주입 = 봉인 파손 복귀).

@@ -810,6 +810,44 @@ fn translocation_guidance(verdict: BootPathVerdict) -> String {
     )
 }
 
+// ── ATOMIC-1 짝: 설치본 자기 무결성(반쪽 번들) 기동 점검 ────────────────────────
+//
+// ★2026-08-01 실사고: `/Applications/cys.app/Contents/Info.plist` 가 사라진 **반쪽 번들**이
+//   남았고, 사용자에게 보이는 얼굴은 "손상되었기 때문에 열 수 없습니다" 한 줄뿐이었다.
+//   교체를 수행하는 주체가 우리 코드가 아닐 때(Finder 드래그의 '바꾸기' · tauri-plugin-updater)
+//   교체 자체는 계약화할 수 없다 — 그래서 **설치 후/기동 시 검증**으로 덮는다.
+//
+// ★왜 안전모드처럼 부트를 멈추지 않고 '알리기만' 하는가(의도적 divergence):
+//   translocation 게이트가 멈추는 이유는 부수효과가 **능동적으로 해롭기** 때문이다(휘발 경로가
+//   launchd plist 에 각인되면 죽은 경로 데몬을 무한 스폰한다). 반쪽 번들은 그런 종류가 아니라
+//   '기능이 빠진' 상태다. 여기서 부트를 멈추면 ⓐ 오탐 1건이 정상 사용자의 앱을 통째로 무력화하고
+//   ⓑ 아직 동작하는 기능까지 뺏는다. 사고의 진짜 피해는 "고장을 아무도 말해주지 않은 것"이었으므로,
+//   처방도 거기에 맞춘다 — **정확히 무엇이 빠졌는지 말하고 복구 절차를 준다.**
+#[cfg(target_os = "macos")]
+fn bundle_integrity_guidance() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    // 레이아웃 기반 탐지(cys::app_bundle) — Info.plist 실재를 번들 확증 조건으로 쓰지 않는다.
+    // 그걸 조건으로 걸면 **사고 상태에서 정확히 탐지가 꺼진다**(가장 파괴적인 손상이 무판정).
+    let bundle = cys::app_bundle::enclosing_bundle(&exe)?;
+    let defects = cys::app_bundle::verify(&bundle, &cys::app_bundle::VerifySpec::installed());
+    if defects.is_empty() {
+        return None;
+    }
+    Some(cys::app_bundle::damaged_bundle_guidance(&bundle, &defects))
+}
+
+/// 프론트 pull 경로(`boot_verdict` 와 같은 이유 — emit-before-listen 레이스 회피).
+/// 정상 설치본·번들 밖 실행·비 macOS 는 None.
+#[tauri::command]
+fn bundle_integrity() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return bundle_integrity_guidance();
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
 fn build_install_script(
     cys: &std::path::Path,
@@ -2935,6 +2973,22 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
         )
         .await
         .map_err(|e| e.to_string())?;
+    // 2-b) ★설치 후 검증(ATOMIC-1 계약 ④의 대체 집행 · 2026-08-01 실사고).
+    //   교체를 수행한 주체는 tauri-plugin-updater 이고 우리는 그 내부를 못 고친다. 실측된 결함:
+    //   ⓐ `rename(현재 .app → TempDir)` 후 최종 rename 이 실패해도 **되돌리는 코드가 없다**
+    //      (백업이 TempDir 이라 프로세스 종료와 함께 증발 → 앱 영구 소실),
+    //   ⓑ 권한상승 폴백은 `rm -rf '<app>' && mv …` 로 **삭제가 먼저**다(이동 실패 = 앱 전소),
+    //   ⓒ 교체 후 하는 일이 `touch` 뿐 — **검증이 0건**이다.
+    //   우리가 덮을 수 있는 건 ⓒ다. 여기서 완본이 아니면 **재시작하지 않고 큰 소리로 실패**한다:
+    //   깨진 번들로 재시작하면 다음 기동은 Gatekeeper 가 막아 사용자는 원인 없는 "손상되었기 때문에
+    //   열 수 없습니다"만 보게 된다(무증상 성공 금지). 구 프로세스는 계속 살아 있으므로 사용자는
+    //   최소한 안내를 읽고 재설치할 수 있다.
+    #[cfg(target_os = "macos")]
+    if let Some(msg) = bundle_integrity_guidance() {
+        eprintln!("[cys-app] 업데이트 설치 후 검증 실패 — 재시작을 중단합니다\n{msg}");
+        let _ = app.emit("bundle-damaged", msg.clone());
+        return Err(msg);
+    }
     // 3) 데몬 핸드오프: 구 데몬을 정상 종료(SIGTERM — scoped 정리·소켓 제거)해야
     //    재시작 후 새 번들의 cysd가 뜬다. 종료 안 하면 구 데몬이 계속 세션을 들고 돈다.
     // drain(best-effort): 재시작 전 살아있는 노드에 저장 신호 + 유예를 준다. 노드 LLM 협조 의존이라
@@ -3298,6 +3352,8 @@ fn main() {
             install_cli_to_path,
             app_version,
             boot_verdict,
+            // ATOMIC-1 짝: 설치본이 '반쪽 번들'인지 기동 시 스스로 확인해 복구 절차를 준다.
+            bundle_integrity,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -3319,6 +3375,14 @@ fn main() {
                         );
                         let _ = handle.emit("translocation-blocked", msg);
                         return;
+                    }
+                    // ★설치본 자기 무결성(ATOMIC-1 짝 · 2026-08-01 실사고): 정규 설치 위치인데도
+                    // 구성요소가 빠진 '반쪽 번들'인지 확인한다. 위 안전모드와 달리 **부트를 멈추지
+                    // 않는다** — 이유는 bundle_integrity_guidance 주석. 침묵만 깬다(사고의 실제 피해는
+                    // 고장이 아니라 '아무도 말해주지 않은 것'이었다). stat 몇 번이라 부트 비용 무시 가능.
+                    if let Some(msg) = bundle_integrity_guidance() {
+                        eprintln!("[cys-app] 설치본 무결성 결손 — 재설치가 필요합니다\n{msg}");
+                        let _ = handle.emit("bundle-damaged", msg);
                     }
                 }
                 // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
@@ -3896,6 +3960,37 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         std::env::set_var("CYS_ALLOW_NONCANONICAL", "1");
         assert!(boot_verdict().is_none(), "escape env 에서는 None(정상 부트 — 안내 미표시)");
         std::env::remove_var("CYS_ALLOW_NONCANONICAL");
+    }
+
+    /// ★ATOMIC-1 짝 회귀 핀(2026-08-01 실사고): 반쪽 번들 기동 점검이 **거짓 경보를 내지 않고**
+    /// **진짜 결손은 이름으로 말하는지**를 커맨드 층위에서 고정한다.
+    /// 실행 프로세스(test 하네스)는 번들 밖이라 `bundle_integrity()` 는 None 이어야 한다 —
+    /// 여기서 Some 이 나오면 모든 개발 빌드가 손상 경보를 띄운다(가장 비싼 오탐).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_integrity_is_silent_outside_a_bundle_and_names_defects_inside_one() {
+        assert!(
+            bundle_integrity().is_none(),
+            "번들 밖 실행(개발 빌드·테스트 하네스)에서는 어떤 경보도 내면 안 된다"
+        );
+        // 번들 안 판정은 순수 함수 조합으로 검사한다(프로세스 exe 를 옮길 수는 없으므로).
+        // 사고 상태(Info.plist 유실)를 그대로 만들어, 탐지가 꺼지지 않고 결손을 지목하는지 본다.
+        let base = std::env::temp_dir().join(format!("cys-app-integ-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("cys.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        let exe = app.join("Contents/MacOS/cys-app");
+        std::fs::write(&exe, b"x").unwrap();
+        // Info.plist 없음 = 실사고 최종 상태.
+        let found = cys::app_bundle::enclosing_bundle(&exe).expect("레이아웃만으로 번들을 지목해야 한다");
+        let defects = cys::app_bundle::verify(&found, &cys::app_bundle::VerifySpec::installed());
+        assert!(
+            defects.contains(&cys::app_bundle::BundleDefect::InfoPlistMissing),
+            "가장 파괴적인 손상이 '판정 불가'로 새면 안 된다: {defects:?}"
+        );
+        let msg = cys::app_bundle::damaged_bundle_guidance(&found, &defects);
+        assert!(msg.contains("Info.plist") && msg.contains("휴지통"), "원인 + 복구 절차");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

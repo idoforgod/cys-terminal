@@ -31,7 +31,7 @@ if _SELF_DIR not in sys.path:
 import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
 
 EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
-EXIT_DEGRADED = 4  # 해법④(2026-07-14 오너 승인): 미지 타입=부패 아닌 '방출자가 더 새로움' — 무음 드롭 금지
+EXIT_DEGRADED = 4  # 해법④(2026-07-14 채택): 미지 타입=부패 아닌 '방출자가 더 새로움' — 무음 드롭 금지
 
 WIRE_PREFIX = "[EVT v2]"
 # ★v3 타입(round.closed) 추가에 따라 파서는 v3 라인도 수용한다. 방출 prefix 는 v2 유지 —

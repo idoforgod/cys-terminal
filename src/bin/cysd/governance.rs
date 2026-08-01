@@ -327,13 +327,15 @@ fn check_agent_death(
         if !auto_restart {
             continue;
         }
-        // 401·로그인 만료로 죽은 에이전트의 무한 재기동 루프 차단
-        let auth_rules = ["not_logged_in", "auth_401", "token_expired", "login_required"];
-        let auth_blocked = daemon.recent_health.lock().unwrap().iter().any(|h| {
-            h["surface_id"].as_u64() == Some(s.id)
-                && auth_rules.contains(&h["rule"].as_str().unwrap_or(""))
-                && now - h["ts"].as_f64().unwrap_or(0.0) < 300.0
-        });
+        // 401·로그인 만료로 죽은 에이전트의 무한 재기동 루프 차단.
+        // ★판정은 state::auth_blocked_by_recent_health 단일 술어 — 여기서 룰 목록·창을 복제해
+        //   갖고 있으면 한쪽만 바뀔 때 차단이 조용히 샌다(T3-G2). 근거 원장은 recent_health 뿐이며,
+        //   run_health_rules 는 담화로 억제한 매칭도 이 원장에는 남긴다(억제≠인터록 해제).
+        let auth_blocked = crate::state::auth_blocked_by_recent_health(
+            &daemon.recent_health.lock().unwrap(),
+            s.id,
+            now,
+        );
         if auth_blocked {
             // T5-6 strand-2: auth 차단(401·로그인 만료)으로 죽은 자식은 재기동도 막혔으니
             // 재사용 풀에서도 배제 — 오염 격리.
@@ -1767,22 +1769,253 @@ fn plan_duplicate_kills(mut ages: Vec<(u32, f64)>, now: f64, min_age_secs: f64) 
     (kept, killed)
 }
 
-/// 완화책 ③: surface별 자식 수 감시 + 동일 cmdline 중복 서버 감지 (예: bun server.ts × 36).
+// ─────────────────────────────────────────────────────────────────────────────
+// ★T3-G2 중복 서버 오탐 수리 (2026-08-01 윈도우 실사고 · 스크린샷 실측)
+//
+// 사고: 5노드 **정상** 편성에서 `중복 서버 4개: powershell.exe` · `중복 서버 5개: claude.exe`
+// 경보가 연발했다. 원인은 판정이 **이름(cmdline 문자열) 전역 계수**였다는 것 하나다 —
+// 구 `check_surfaces` 는 전 surface 의 자손을 **하나의 cmdline_groups 맵**에 부어 넣고
+// `pids.len() >= duplicate_threshold(3)` 이면 발화했다. 노드 CLI 는 **노드당 1개**가 정상인데,
+// 노드가 3개만 되면 그 정상 편성 자체가 임계를 넘는다(=편성 규모가 곧 경보). 발생원이 없는데
+// 경보만 나니 노드들이 그 경보를 수리 일감으로 삼아 무한 자가수리 루프의 연료가 됐다.
+//
+// 수리 원칙: "중복 서버"는 **이름이 같은 것**이 아니라 **같은 것을 두 번 점유한 것**이다.
+//   ① 소유 기반 제외 — 노드 소속 인프라(등록된 에이전트 CLI·pane 셸/콘솔 호스트·cys 자신)는
+//      계수 분모에서 뺀다. 노드당 1개가 정상인 프로세스는 애초에 중복의 후보가 아니다.
+//   ② 스코프 분리 — 불투명 명령의 중복은 **한 surface 안**에서만 센다(`bun server.ts × 36`
+//      = 한 워커가 서버를 쌓은 진짜 사고). surface 를 가로지르는 같은 이름은 편성이지 중복이 아니다.
+//   ③ 종단점 기반 진짜 중복 — cmdline 에 **명시 포트·유닉스 소켓**이 있으면 그것이 서비스의
+//      정체다. 같은 종단점을 둘 이상이 점유하면 이름·소유자가 달라도 진짜 충돌 → 임계 2
+//      (오너 계약 "동일 서버 2개+ 즉시 정리").
+//   ④ 조상 사슬 접기 — `sh -c "bun --port 3000"` 처럼 부모·자식이 같은 종단점을 물려 받으면
+//      2개로 세지 않는다(래퍼는 서버가 아니다).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 중복 판정 임계·쿨다운 (단일 등재소).
+/// · 불투명 명령(surface 스코프): `Config::duplicate_threshold` 기본 **3** (`CYS_DUP_THRESHOLD`) — 종전값 유지.
+/// · 종단점(포트·소켓) 스코프: `Config::duplicate_endpoint_threshold` 기본 **2** (`CYS_DUP_ENDPOINT_THRESHOLD`).
+/// · 쿨다운: 그룹 키당 **60초**. `LOAD_DEBOUNCE_SECS` 와 **같은 값이어야 한다** —
+///   `prune_watchdog_debounce_maps` 가 `last_dup_alert` 를 그 창으로 만료시키므로, 여기만 늘리면
+///   프룬이 창 안 엔트리를 먼저 비워 재발화가 앞당겨진다(디바운스 의미 파손).
+const DUP_ALERT_COOLDOWN_SECS: f64 = LOAD_DEBOUNCE_SECS;
+
+/// 자동 정리(auto_kill) 최소 나이 — 빌드 중 잠깐 뜬 프로세스 오살 방지.
+const DUP_MIN_AGE_SECS: f64 = 45.0;
+
+/// 한 프로세스의 관측 사실(순수 판정 입력). sys·daemon 의존 수집은 `check_surfaces` 에 잔류한다.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcObs {
+    pub pid: u32,
+    /// 부모 pid(조상 사슬 접기용). 미상이면 0.
+    pub ppid: u32,
+    /// 이 프로세스를 자손으로 갖는 surface.
+    pub surface_id: u64,
+    pub cmdline: String,
+    /// ★소유 판정: 이 프로세스가 **노드 자체**(등록 에이전트 CLI·pane 셸/콘솔 호스트·cys 계열)인가.
+    /// 노드당 1개가 정상이므로 중복 계수에서 제외하고, 자동 정리 대상에서도 영구 배제한다.
+    pub node_owned: bool,
+    /// 관측 시점의 나이(초). 종단점 스코프의 **오탐 완충**에만 쓴다 — `psql --port 5432` 같은
+    /// 클라이언트 도구가 잠깐 겹쳐 뜬 것을 "서버 2개 점유"로 오판하지 않게 한다.
+    pub age_secs: f64,
+}
+
+/// 중복으로 판정된 한 그룹.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DupGroup {
+    /// "surface" = 한 surface 안의 동일 명령 다중 인스턴스 / "endpoint" = 동일 포트·소켓 다중 점유.
+    pub scope: &'static str,
+    /// 디바운스·payload 키(스코프 포함 — 스코프가 다르면 별개 그룹).
+    pub key: String,
+    /// 대표 cmdline(구 payload 하위호환 — UI `중복 서버 N개: <cmdline>`).
+    pub cmdline: String,
+    /// surface 스코프일 때만 Some.
+    pub surface_id: Option<u64>,
+    pub pids: Vec<u32>,
+    /// 자동 정리 허용 여부. surface 스코프만 true — 종단점 판정은 휴리스틱(클라이언트 인자
+    /// `--port` 오인 가능)이라 **경보만** 하고 집행은 사람(CSO)에게 남긴다.
+    pub killable: bool,
+}
+
+/// "3000" · "127.0.0.1:3000" · ":3000" → 3000. 0·비수치는 None.
+fn parse_port(v: &str) -> Option<u16> {
+    let tail = v.rsplit(':').next()?;
+    let p: u16 = tail.parse().ok()?;
+    (p != 0).then_some(p)
+}
+
+/// cmdline 에서 **명시 종단점**(포트·유닉스 소켓)을 뽑는다. 없으면 None(=불투명 명령).
+///
+/// ★`-p` 단문자 플래그는 **의도적으로 제외**한다 — `mkdir -p`·`docker -p`·`ssh -p 22` 처럼
+/// 의미가 과적된 플래그라 클라이언트를 서버로 오인한다. 명시적 장문 플래그만 신뢰한다.
+pub(crate) fn endpoint_key(cmdline: &str) -> Option<String> {
+    const PORT_EQ: &[&str] = &["--port=", "-port=", "port=", "--listen=", "--addr=", "--bind="];
+    const PORT_SP: &[&str] = &["--port", "-port", "--listen", "--addr", "--bind"];
+    const SOCK_EQ: &[&str] = &["--socket=", "--unix-socket=", "--unix=", "--sock="];
+    const SOCK_SP: &[&str] = &["--socket", "--unix-socket", "--unix", "--sock"];
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        let lower = t.to_ascii_lowercase();
+        for pfx in PORT_EQ {
+            if let Some(v) = lower.strip_prefix(pfx) {
+                if let Some(p) = parse_port(v) {
+                    return Some(format!("port:{p}"));
+                }
+            }
+        }
+        if PORT_SP.contains(&lower.as_str()) {
+            if let Some(p) = toks.get(i + 1).and_then(|v| parse_port(v)) {
+                return Some(format!("port:{p}"));
+            }
+        }
+        for pfx in SOCK_EQ {
+            if let Some(v) = lower.strip_prefix(pfx) {
+                if !v.is_empty() {
+                    return Some(format!("socket:{v}"));
+                }
+            }
+        }
+        if SOCK_SP.contains(&lower.as_str()) {
+            if let Some(v) = toks.get(i + 1) {
+                if !v.is_empty() && !v.starts_with('-') {
+                    return Some(format!("socket:{v}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// ★순수 판정 — 관측치에서 **진짜 중복**만 뽑는다. 부작용 0 · sys 무의존 → 양방향 시뮬로 실증한다.
+///
+/// 불변식:
+///  ① `node_owned` 프로세스는 어떤 그룹에도 들어가지 않는다(정상 편성 = 경보 0의 근거).
+///  ② 불투명 명령은 **같은 surface 안**에서만 계수한다 — 노드 수가 늘어도 경보가 늘지 않는다.
+///  ③ 종단점(포트·소켓)이 명시된 프로세스는 종단점 스코프로만 계수한다(이중 발화 금지).
+///  ④ 같은 그룹 안에서 부모가 함께 잡히면 부모를 뺀다(래퍼 중복 계수 금지).
+///  ⑤ 종단점 스코프는 `min_age_secs` 이상 산 프로세스만 센다 — 클라이언트 도구(`psql --port …`)가
+///     잠깐 겹친 것을 "서버 2개"로 오판하면 경보 소음이 되살아난다. surface 스코프(같은 pane 안
+///     동일 명령 N개)는 그 자체로 명확해 나이 게이트를 두지 않는다(종전 동작 보존).
+///  ⑥ 출력은 결정론 정렬(scope, key) · pids 는 asc.
+pub(crate) fn plan_duplicate_alerts(
+    obs: &[ProcObs],
+    dup_threshold: usize,
+    endpoint_threshold: usize,
+    min_age_secs: f64,
+) -> Vec<DupGroup> {
+    // pid 중복 관측(트리 겹침) 제거 — 첫 관측을 채택.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let cands: Vec<&ProcObs> = obs
+        .iter()
+        .filter(|o| !o.node_owned && !o.cmdline.is_empty()) // 불변식 ①
+        .filter(|o| seen.insert(o.pid))
+        .collect();
+
+    // 그룹 키 산출 — 종단점 우선(불변식 ③).
+    let mut groups: HashMap<(&'static str, String), Vec<&ProcObs>> = HashMap::new();
+    for o in &cands {
+        let (scope, key) = match endpoint_key(&o.cmdline) {
+            Some(ep) => ("endpoint", ep),
+            // surface 스코프 키: `<sid>#<cmdline>` — sid 는 숫자이므로 `#` 하나로 모호성이 없다.
+            None => ("surface", format!("{}#{}", o.surface_id, o.cmdline)), // 불변식 ②
+        };
+        groups.entry((scope, key)).or_default().push(o);
+    }
+
+    let mut out: Vec<DupGroup> = Vec::new();
+    for ((scope, key), members) in groups {
+        // 불변식 ④: 같은 그룹 안에 부모가 있으면 그 부모는 뺀다(래퍼).
+        let member_pids: std::collections::HashSet<u32> = members.iter().map(|m| m.pid).collect();
+        let mut kept: Vec<&&ProcObs> = members
+            .iter()
+            .filter(|m| !members.iter().any(|c| c.ppid == m.pid && member_pids.contains(&c.pid)))
+            // 불변식 ⑤: 종단점만 나이 게이트.
+            .filter(|m| scope != "endpoint" || m.age_secs >= min_age_secs)
+            .collect();
+        kept.sort_by_key(|m| m.pid); // 불변식 ⑥
+        let threshold = if scope == "endpoint" { endpoint_threshold } else { dup_threshold };
+        if threshold == 0 || kept.len() < threshold {
+            continue;
+        }
+        let first = kept[0];
+        out.push(DupGroup {
+            scope,
+            key: format!("{scope}:{key}"),
+            cmdline: first.cmdline.clone(),
+            surface_id: (scope == "surface").then_some(first.surface_id),
+            pids: kept.iter().map(|m| m.pid).collect(),
+            killable: scope == "surface",
+        });
+    }
+    out.sort_by(|a, b| (a.scope, &a.key).cmp(&(b.scope, &b.key))); // 불변식 ⑥
+    out
+}
+
+/// pane 기동 사슬의 **배관**(셸·콘솔 호스트). 노드마다 1개 이상 항상 존재하는 것이 정상이며
+/// 그 자체로 서버가 될 수 없다. 윈도우 실사고의 `powershell.exe × 4` 가 바로 이 부류다.
+const SHELL_BASENAMES: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "login", "env", "powershell",
+    "pwsh", "cmd", "conhost", "openconsole", "winpty", "conpty",
+];
+
+/// 한 자손 프로세스가 **노드 소속 인프라**인가 — 중복 계수·자동 정리에서 빼는 유일 판정.
+///
+/// `agent_bins` = 살아있는 전 surface 가 `launch-agent` 로 등록한 에이전트 실행 파일 basename
+/// 목록(= 데몬이 아는 "노드 소속"의 유일 근거). **`Surface.cmd` 는 쓰지 않는다** — 그 필드는
+/// 셸이 아니라 *사용자 명령*을 담기도 해서(`cmd.unwrap_or(shell)`, state.rs `create_surface_with_env`),
+/// 그걸 소유 근거로 쓰면 `cmd="bun server.ts"` 로 연 pane 에서 **정작 감시해야 할 bun 이 통째로
+/// 제외**된다(자기무력화).
+///
+/// ★의도된 비대칭: 판정이 흔들릴 때는 "제외" 쪽으로 기운다. 여기서 헛치면(위양성) 경보 소음이
+/// 노드의 자가수리 루프를 먹이고, 놓치면(위음성) 중복 서버 하나를 사람이 `cys ps` 로 잡으면 된다.
+pub(crate) fn is_node_owned(cmdline: &str, agent_bins: &[String]) -> bool {
+    // ① 등록된 에이전트 CLI — 노드당 1개가 정상(claude·codex·agy…).
+    if agent_bins.iter().any(|b| cmdline_matches_agent(cmdline, b)) {
+        return true;
+    }
+    let base = cmdline
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    if base.is_empty() {
+        return false;
+    }
+    // ② cys 자신(CLI·데몬·채널 브리지) — 관측자가 관측 대상이 되면 안 된다.
+    // ③ 셸·콘솔 호스트 배관.
+    matches!(base, "cys" | "cysd") || SHELL_BASENAMES.contains(&base)
+}
+
+/// 완화책 ③: surface별 자식 수 감시 + ★소유·종단점 기반 진짜 중복 서버 감지.
 fn check_surfaces(
     daemon: &Daemon,
     sys: &System,
     last_dup_alert: &mut HashMap<String, f64>,
     last_proc_alert: &mut HashMap<u64, f64>,
 ) {
-    let surfaces: Vec<(u64, u32)> = daemon
-        .surfaces
-        .lock()
-        .unwrap()
-        .values()
-        .map(|s| (s.id, s.pid))
-        .collect();
+    // ★락 순서: surfaces 맵 락은 **여기서 끝낸다**(Arc 복제 후 즉시 해제). agent_meta 는 그 뒤에
+    //   잠근다 — surfaces 를 쥔 채 agent_meta 를 잠그면 check_agent_death·handlers 의
+    //   (surfaces 해제 → agent_meta) 순서와 역전돼 교착 여지가 생긴다.
+    let live: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    let surfaces: Vec<(u64, u32)> = live.iter().map(|s| (s.id, s.pid)).collect();
+    // ★소유 원장: 살아있는 전 surface 가 launch-agent 로 등록한 에이전트 실행 파일 basename.
+    // "노드 소속 프로세스"를 데몬이 아는 유일한 근거이며, 이것이 이름 계수를 소유 계수로 바꾼다.
+    let agent_bins: Vec<String> = {
+        let mut v: Vec<String> = live
+            .iter()
+            .filter_map(|s| s.agent_meta.lock().unwrap().clone())
+            .map(|(_, bin)| bin.rsplit(['/', '\\']).next().unwrap_or(&bin).to_string())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
 
-    let mut cmdline_groups: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut obs: Vec<ProcObs> = Vec::new();
     for (sid, root_pid) in &surfaces {
         let descendants = collect_descendants(sys, *root_pid);
         if descendants.len() > daemon.config.proc_count_threshold {
@@ -1802,61 +2035,96 @@ fn check_surfaces(
                 );
             }
         }
+        let obs_now = now_epoch();
         for (pid, cmdline) in descendants {
-            if !cmdline.is_empty() {
-                cmdline_groups.entry(cmdline).or_default().push(pid);
+            if cmdline.is_empty() {
+                continue;
             }
+            let (ppid, age_secs) = sys
+                .process(Pid::from_u32(pid))
+                .map(|p| {
+                    (
+                        p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                        obs_now - p.start_time() as f64,
+                    )
+                })
+                .unwrap_or((0, 0.0));
+            obs.push(ProcObs {
+                pid,
+                ppid,
+                surface_id: *sid,
+                node_owned: is_node_owned(&cmdline, &agent_bins),
+                cmdline,
+                age_secs,
+            });
         }
     }
 
-    for (cmdline, pids) in cmdline_groups {
-        if pids.len() >= daemon.config.duplicate_threshold {
-            let now = now_epoch();
-            let fire = last_dup_alert
-                .get(&cmdline)
-                .map(|t| now - t > LOAD_DEBOUNCE_SECS)
-                .unwrap_or(true);
-            if !fire {
-                continue;
-            }
-            last_dup_alert.insert(cmdline.clone(), now);
-            daemon.bus.publish(
-                "watchdog.duplicate_procs",
-                "watchdog",
-                None,
-                json!({"cmdline": cmdline, "count": pids.len(), "pids": pids,
-                       "auto_kill": daemon.config.auto_kill_duplicates}),
-            );
-            if daemon.config.auto_kill_duplicates {
-                // 디렉티브 스펙 "45초+/3개+": 정책 판정은 순수 함수(plan_duplicate_kills)에
-                // 위임하고, sys 의존 입력 수집·집행(kill_pid·publish)만 controller에 잔류한다.
-                const MIN_AGE_SECS: f64 = 45.0;
-                // sys 의존 입력을 순수 경계 밖에서 미리 수집(start_time은 System에서만 조회 가능).
-                let ages: Vec<(u32, f64)> = pids
-                    .iter()
-                    .filter_map(|&pid| {
-                        sys.process(Pid::from_u32(pid))
-                            .map(|p| (pid, p.start_time() as f64))
-                    })
-                    .collect();
-                if !ages.is_empty() {
-                    let (kept, killed) = plan_duplicate_kills(ages, now, MIN_AGE_SECS);
-                    if !killed.is_empty() {
-                        for &pid in &killed {
-                            kill_pid(pid); // 집행 (controller 잔류)
-                        }
-                        daemon.bus.publish(
-                            // 집행 (controller 잔류)
-                            "watchdog.duplicates_killed",
-                            "watchdog",
-                            None,
-                            json!({"cmdline": cmdline, "kept": kept, "killed": killed,
-                                   "min_age_secs": MIN_AGE_SECS}),
-                        );
-                    }
-                }
-            }
+    // ★판정은 순수 함수 단독(부작용 0) — 집행(publish·kill)만 여기 잔류한다.
+    let groups = plan_duplicate_alerts(
+        &obs,
+        daemon.config.duplicate_threshold,
+        daemon.config.duplicate_endpoint_threshold,
+        DUP_MIN_AGE_SECS,
+    );
+    for g in groups {
+        let now = now_epoch();
+        // 쿨다운: 그룹 키당 DUP_ALERT_COOLDOWN_SECS(60초).
+        let fire = last_dup_alert
+            .get(&g.key)
+            .map(|t| now - t > DUP_ALERT_COOLDOWN_SECS)
+            .unwrap_or(true);
+        if !fire {
+            continue;
         }
+        last_dup_alert.insert(g.key.clone(), now);
+        let auto_kill = daemon.config.auto_kill_duplicates && g.killable;
+        daemon.bus.publish(
+            "watchdog.duplicate_procs",
+            "watchdog",
+            g.surface_id,
+            // 구 필드(cmdline·count·pids·auto_kill)는 그대로 — UI·HUD 하위호환. 나머지는 순수 추가.
+            json!({"cmdline": g.cmdline, "count": g.pids.len(), "pids": g.pids,
+                   "auto_kill": auto_kill, "scope": g.scope, "key": g.key,
+                   "surface_id": g.surface_id,
+                   "threshold": if g.scope == "endpoint" {
+                       daemon.config.duplicate_endpoint_threshold
+                   } else {
+                       daemon.config.duplicate_threshold
+                   }}),
+        );
+        if !auto_kill {
+            continue;
+        }
+        // 디렉티브 스펙 "45초+/3개+": 정책 판정은 순수 함수(plan_duplicate_kills)에
+        // 위임하고, sys 의존 입력 수집·집행(kill_pid·publish)만 controller에 잔류한다.
+        // sys 의존 입력을 순수 경계 밖에서 미리 수집(start_time은 System에서만 조회 가능).
+        let ages: Vec<(u32, f64)> = g
+            .pids
+            .iter()
+            .filter_map(|&pid| {
+                sys.process(Pid::from_u32(pid))
+                    .map(|p| (pid, p.start_time() as f64))
+            })
+            .collect();
+        if ages.is_empty() {
+            continue;
+        }
+        let (kept, killed) = plan_duplicate_kills(ages, now, DUP_MIN_AGE_SECS);
+        if killed.is_empty() {
+            continue;
+        }
+        for &pid in &killed {
+            kill_pid(pid); // 집행 (controller 잔류)
+        }
+        daemon.bus.publish(
+            // 집행 (controller 잔류)
+            "watchdog.duplicates_killed",
+            "watchdog",
+            g.surface_id,
+            json!({"cmdline": g.cmdline, "kept": kept, "killed": killed,
+                   "min_age_secs": DUP_MIN_AGE_SECS, "scope": g.scope, "key": g.key}),
+        );
     }
 }
 
@@ -2444,8 +2712,9 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_wakeup_suppressed, learn_stuck_candidates, merged_approval_patterns,
-        plan_duplicate_kills, wakeup_entry_ids,
+        approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
+        is_node_owned, kill_pid, learn_stuck_candidates, merged_approval_patterns,
+        plan_duplicate_alerts, plan_duplicate_kills, wakeup_entry_ids, ProcObs,
     };
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2706,6 +2975,390 @@ mod tests {
         assert_eq!(learn_stuck_candidates(&counts, &deb, 3, 3600.0, 5000.0), vec![10, 12]);
         // threshold=0 = 비활성(보수적 옵트아웃)
         assert!(learn_stuck_candidates(&counts, &deb, 0, 3600.0, now).is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★T3-G2 중복 서버 오탐 수리 — 양방향 대조(수용 기준).
+    //   ① 정상 편성 시뮬(노드 5 = claude 5 · powershell 5) → 경보 0
+    //   ② 진짜 중복 시뮬(동일 종단점 서버 2개 / 한 surface 안 동일 명령 3개) → 경보 발화
+    // 델타 증명: 같은 ①입력을 **수리 전 판정 미러**에 넣으면 실사고 그대로 경보가 나온다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// ★수리 전(pre-fix) 판정 미러 — 구 `check_surfaces` 의 이름 전역 계수 그대로다
+    /// (`cmdline_groups: HashMap<String, Vec<u32>>` 에 전 surface 자손을 부어 넣고
+    /// `pids.len() >= threshold` 면 발화). 비교 기준을 코드로 박제한다
+    /// (state.rs `health_matches_pre_fix` 와 같은 관행).
+    fn dup_alerts_pre_fix(obs: &[ProcObs], threshold: usize) -> Vec<(String, usize)> {
+        let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
+        for o in obs {
+            if !o.cmdline.is_empty() {
+                groups.entry(o.cmdline.clone()).or_default().push(o.pid);
+            }
+        }
+        let mut out: Vec<(String, usize)> = groups
+            .into_iter()
+            .filter(|(_, pids)| pids.len() >= threshold)
+            .map(|(c, pids)| (c, pids.len()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// 5노드 정상 편성 관측치: surface 마다 셸(powershell.exe) 1 + 에이전트 CLI(claude.exe) 1.
+    /// 실사고 스크린샷("중복 서버 4개: powershell.exe" · "중복 서버 5개: claude.exe")의 구성이다.
+    fn normal_formation_obs() -> Vec<ProcObs> {
+        let agent_bins = vec!["claude.exe".to_string()];
+        let mut obs = Vec::new();
+        for i in 0..5u64 {
+            let root = 1000 + (i as u32) * 10;
+            for (off, cmdline) in [(1u32, "powershell.exe -NoLogo"), (2, "claude.exe --resume")] {
+                let cmdline = cmdline.to_string();
+                obs.push(ProcObs {
+                    pid: root + off,
+                    ppid: if off == 1 { root } else { root + 1 },
+                    surface_id: i,
+                    node_owned: is_node_owned(&cmdline, &agent_bins),
+                    cmdline,
+                    age_secs: 3600.0,
+                });
+            }
+        }
+        obs
+    }
+
+    /// ★①정상 편성 → 경보 0 (+ 수리 전 미러에서는 경보가 났다는 델타 증명).
+    #[test]
+    fn normal_five_node_formation_raises_zero_duplicate_alerts() {
+        let obs = normal_formation_obs();
+
+        // 델타(전제): 수리 전 이름 전역 계수는 실사고 그대로 2건을 발화했다.
+        let pre = dup_alerts_pre_fix(&obs, 3);
+        assert_eq!(
+            pre,
+            vec![
+                ("claude.exe --resume".to_string(), 5),
+                ("powershell.exe -NoLogo".to_string(), 5),
+            ],
+            "전제 실패: 수리 전 미러가 실사고를 재현하지 못함"
+        );
+
+        // 수리 후: 소유 제외 + surface 스코프 계수 → 0건.
+        let after = plan_duplicate_alerts(&obs, 3, 2, 45.0);
+        assert!(after.is_empty(), "정상 편성에서 중복 경보 발화: {after:#?}");
+
+        // 소유 판정 자체도 핀 — 노드 CLI·자기 셸은 전부 노드 소속으로 인식돼야 한다.
+        assert!(obs.iter().all(|o| o.node_owned), "노드 인프라 소유 판정 누락: {obs:#?}");
+    }
+
+    /// 노드가 20개로 늘어도 경보는 0 — "편성 규모가 곧 경보"였던 구조적 결함의 회귀 가드.
+    #[test]
+    fn formation_scale_does_not_create_alerts() {
+        let agent_bins = vec!["claude".to_string()];
+        let obs: Vec<ProcObs> = (0..20u64)
+            .map(|i| ProcObs {
+                pid: 5000 + i as u32,
+                ppid: 1,
+                surface_id: i,
+                cmdline: "/usr/local/bin/claude --dangerously-skip-permissions".into(),
+                node_owned: is_node_owned(
+                    "/usr/local/bin/claude --dangerously-skip-permissions",
+                    &agent_bins,
+                ),
+                age_secs: 3600.0,
+            })
+            .collect();
+        assert!(plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty());
+    }
+
+    /// ★②-a 진짜 중복: 서로 다른 노드(=역할)가 **같은 포트**를 점유 → 임계 2에서 발화.
+    #[test]
+    fn same_endpoint_held_by_two_roles_fires_alert() {
+        let mk = |pid: u32, sid: u64, cmd: &str| ProcObs {
+            pid,
+            ppid: 1,
+            surface_id: sid,
+            cmdline: cmd.to_string(),
+            node_owned: false,
+            age_secs: 3600.0,
+        };
+        let obs = vec![
+            mk(2001, 1, "bun /work/api/server.ts --port 3000"),
+            // 이름도 소유 노드도 다르지만 같은 포트 = 진짜 충돌
+            mk(2002, 2, "node /work/api/dist/main.js --port=3000"),
+            // 무관한 다른 포트는 그룹이 다르다(오탐 금지)
+            mk(2003, 3, "vite --port 5173"),
+        ];
+        let alerts = plan_duplicate_alerts(&obs, 3, 2, 45.0);
+        assert_eq!(alerts.len(), 1, "동일 포트 2개 점유가 발화하지 않음: {alerts:#?}");
+        assert_eq!(alerts[0].scope, "endpoint");
+        assert_eq!(alerts[0].key, "endpoint:port:3000");
+        assert_eq!(alerts[0].pids, vec![2001, 2002]);
+        assert!(!alerts[0].killable, "종단점 판정은 경보만 — 자동 kill 금지");
+    }
+
+    /// ★②-b 진짜 중복: **한 surface 안**에 같은 명령 3개(실사고 원형 `bun server.ts × 36`).
+    #[test]
+    fn same_command_piled_in_one_surface_fires_alert_and_is_killable() {
+        let mk = |pid: u32| ProcObs {
+            pid,
+            ppid: 900,
+            surface_id: 7,
+            cmdline: "bun /work/server.ts".into(),
+            node_owned: false,
+            age_secs: 3600.0,
+        };
+        let obs = vec![mk(3003), mk(3001), mk(3002)];
+        let alerts = plan_duplicate_alerts(&obs, 3, 2, 45.0);
+        assert_eq!(alerts.len(), 1, "한 surface 내 3중복이 발화하지 않음: {alerts:#?}");
+        assert_eq!(alerts[0].scope, "surface");
+        assert_eq!(alerts[0].surface_id, Some(7));
+        assert_eq!(alerts[0].pids, vec![3001, 3002, 3003], "pid asc 결정론 정렬");
+        assert!(alerts[0].killable, "한 surface 내 동일 명령 누적은 자동 정리 대상");
+    }
+
+    /// 같은 명령이 여러 surface 에 **1개씩** 흩어진 것은 중복이 아니다(스코프 분리의 핵심).
+    #[test]
+    fn same_command_spread_one_per_surface_is_not_duplicate() {
+        let mk = |pid: u32, sid: u64| ProcObs {
+            pid,
+            ppid: 900,
+            surface_id: sid,
+            cmdline: "python3 -m http.server".into(),
+            node_owned: false,
+            age_secs: 3600.0,
+        };
+        let obs = vec![mk(4001, 1), mk(4002, 2), mk(4003, 3), mk(4004, 4)];
+        assert!(plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty());
+    }
+
+    /// 래퍼(부모)와 서버(자식)가 같은 종단점을 물려받아도 2개로 세지 않는다(불변식 ④).
+    #[test]
+    fn wrapper_parent_and_child_sharing_endpoint_collapse_to_one() {
+        let obs = vec![
+            ProcObs { pid: 100, ppid: 1, surface_id: 1, age_secs: 3600.0,
+                      cmdline: "sh -c bun server.ts --port 8080".into(), node_owned: false },
+            ProcObs { pid: 101, ppid: 100, surface_id: 1, age_secs: 3600.0,
+                      cmdline: "bun server.ts --port 8080".into(), node_owned: false },
+        ];
+        assert!(
+            plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty(),
+            "래퍼-자식 사슬을 중복으로 오판"
+        );
+    }
+
+    /// 소유 제외는 자동 정리 후보에서도 노드 CLI 를 영구 배제한다 —
+    /// 구 로직 + `CYS_AUTOKILL_DUP=1` 이면 정상 편성 5노드 중 **4개를 죽였을** 잠복 결함의 가드.
+    #[test]
+    fn node_cli_is_never_a_kill_candidate_even_when_piled() {
+        let agent_bins = vec!["claude".to_string()];
+        let obs: Vec<ProcObs> = (0..4u32)
+            .map(|i| ProcObs {
+                pid: 7000 + i,
+                ppid: 900,
+                surface_id: 3, // 같은 surface 안에 4개 — 스코프 계수로도 임계 초과 조건
+                cmdline: "claude --resume".into(),
+                node_owned: is_node_owned("claude --resume", &agent_bins),
+                age_secs: 3600.0,
+            })
+            .collect();
+        assert!(
+            plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty(),
+            "노드 CLI 가 중복/kill 후보로 승격됨 — 오살 경로"
+        );
+    }
+
+    /// 종단점 추출 계약 핀 — 명시 장문 플래그만 신뢰하고 `-p` 류 과적 플래그는 보지 않는다.
+    #[test]
+    fn endpoint_key_extracts_explicit_forms_only() {
+        assert_eq!(endpoint_key("bun server.ts --port 3000"), Some("port:3000".into()));
+        assert_eq!(endpoint_key("node main.js --port=3000"), Some("port:3000".into()));
+        assert_eq!(endpoint_key("uvicorn app:app --bind 0.0.0.0:8000"), Some("port:8000".into()));
+        assert_eq!(endpoint_key("app --socket /tmp/app.sock"), Some("socket:/tmp/app.sock".into()));
+        // 과적 플래그·비수치·포트0은 종단점으로 보지 않는다(클라이언트 오인 차단)
+        assert_eq!(endpoint_key("ssh -p 22 host"), None);
+        assert_eq!(endpoint_key("mkdir -p /tmp/x"), None);
+        assert_eq!(endpoint_key("srv --port 0"), None);
+        assert_eq!(endpoint_key("srv --port auto"), None);
+        assert_eq!(endpoint_key("plain command with args"), None);
+    }
+
+    /// 소유 판정 계약 핀 — 무관한 서드파티 프로세스는 노드 소속이 아니다(과잉 제외 금지).
+    #[test]
+    fn is_node_owned_does_not_swallow_third_party_processes() {
+        let bins = vec!["claude".to_string(), "codex".to_string()];
+        assert!(is_node_owned("claude --resume", &bins));
+        assert!(is_node_owned("/opt/x/codex exec", &bins));
+        assert!(is_node_owned("/bin/zsh -l", &bins), "pane 배관(셸)");
+        assert!(is_node_owned("powershell.exe -NoLogo", &bins), "windows 콘솔 배관");
+        assert!(is_node_owned("cys send --to master hi", &bins), "cys 자신");
+        // 서드파티 서버·도구는 반드시 계수 대상으로 남아야 한다
+        assert!(!is_node_owned("bun /work/server.ts", &bins));
+        assert!(!is_node_owned("node /work/main.js", &bins));
+        assert!(!is_node_owned("python3 -m http.server", &bins));
+    }
+
+    /// 종단점 나이 게이트(불변식 ⑤) — 갓 뜬 클라이언트 도구가 잠깐 겹친 것은 "서버 2개"가 아니다.
+    /// surface 스코프(같은 pane 안 동일 명령 N개)는 종전대로 나이 게이트 없이 즉시 발화한다.
+    #[test]
+    fn endpoint_scope_requires_minimum_age_but_surface_scope_does_not() {
+        let young = |pid: u32, sid: u64, cmd: &str| ProcObs {
+            pid,
+            ppid: 1,
+            surface_id: sid,
+            cmdline: cmd.to_string(),
+            node_owned: false,
+            age_secs: 3.0, // 방금 뜸
+        };
+        // 종단점: 둘 다 어리면 발화하지 않는다
+        let obs = vec![
+            young(11, 1, "psql --port 5432 mydb"),
+            young(12, 2, "psql --port 5432 other"),
+        ];
+        assert!(
+            plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty(),
+            "갓 뜬 클라이언트 겹침을 중복 서버로 오판"
+        );
+        // 나이 게이트를 0으로 낮추면 같은 입력이 발화한다(게이트가 원인임을 확정)
+        assert_eq!(plan_duplicate_alerts(&obs, 3, 2, 0.0).len(), 1);
+        // surface 스코프는 어려도 발화(종전 동작 보존)
+        let piled = vec![
+            young(21, 5, "bun server.ts"),
+            young(22, 5, "bun server.ts"),
+            young(23, 5, "bun server.ts"),
+        ];
+        assert_eq!(plan_duplicate_alerts(&piled, 3, 2, 45.0).len(), 1);
+    }
+
+    /// 임계 0 = 비활성(escape hatch) — 종단점 판정을 끌 수 있어야 한다.
+    #[test]
+    fn zero_threshold_disables_scope() {
+        let obs = vec![
+            ProcObs { pid: 1, ppid: 0, surface_id: 1, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0 },
+            ProcObs { pid: 2, ppid: 0, surface_id: 2, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0 },
+        ];
+        assert_eq!(plan_duplicate_alerts(&obs, 3, 2, 45.0).len(), 1);
+        assert!(plan_duplicate_alerts(&obs, 3, 0, 45.0).is_empty(), "endpoint 임계 0 = 비활성");
+    }
+
+    // ── ★격리 실행(live) 실증 — 실제 프로세스 트리로 `check_surfaces` 전 경로를 돌린다.
+    //    순수함수 단위테스트가 판정을 보증한다면, 아래 둘은 **배선**(관측 수집→소유 판정→발화)이
+    //    실제 커널 사실 위에서 같은 결론을 내는지 본다. 라이브 데몬·라이브 원장 무접촉(격리 소켓).
+
+    /// 자손 프로세스가 뜰 때까지 최대 ~5초 기다렸다가 check_surfaces 를 돌리고 발화 경보를 회수.
+    #[cfg(unix)]
+    fn drill_duplicate_alerts(daemon: &Arc<Daemon>, expect_descendants: usize) -> Vec<serde_json::Value> {
+        use sysinfo::{ProcessesToUpdate, System};
+        let mut sys = System::new();
+        let roots: Vec<u32> = daemon.surfaces.lock().unwrap().values().map(|s| s.pid).collect();
+        let mut seen = 0usize;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            sys.refresh_processes(ProcessesToUpdate::All, true);
+            seen = roots.iter().map(|r| collect_descendants(&sys, *r).len()).sum();
+            if seen >= expect_descendants {
+                break;
+            }
+        }
+        assert!(
+            seen >= expect_descendants,
+            "전제 실패: 자손 프로세스가 뜨지 않음(관측 {seen} < 기대 {expect_descendants})"
+        );
+        let seq = daemon.bus.tail(1).first().and_then(|e| e["seq"].as_u64()).unwrap_or(0);
+        let mut dup: HashMap<String, f64> = HashMap::new();
+        let mut proc_: HashMap<u64, f64> = HashMap::new();
+        check_surfaces(daemon, &sys, &mut dup, &mut proc_);
+        daemon
+            .bus
+            .replay_after(seq)
+            .into_iter()
+            .filter(|e| e["name"].as_str() == Some("watchdog.duplicate_procs"))
+            .collect()
+    }
+
+    /// ★①(live) 5노드 정상 편성 — 각 pane 이 같은 명령 1개씩 → 신규 중복 경보 **0건**.
+    /// 수리 전 이름 전역 계수라면 `sleep …` 5개가 임계 3을 넘겨 발화했을 구성이다.
+    #[cfg(unix)]
+    #[test]
+    fn live_normal_formation_fires_no_duplicate_alert() {
+        let daemon = drill_daemon("dup-live-normal");
+        for _ in 0..5 {
+            // `; :` 로 셸의 exec 최적화를 막아 자식 프로세스가 실제로 갈라지게 한다.
+            let s = daemon
+                .create_surface(None, Some("sleep 12 ; :".into()), None, None, 24, 80)
+                .expect("create surface");
+            daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        }
+        // 델타 증명(live): **같은 순간의 실제 프로세스 표**를 수리 전 이름 전역 계수에 넣으면
+        // 정상 편성인데도 경보가 난다 — 실사고가 코드가 아니라 현실에서 성립했음을 보인다.
+        {
+            use sysinfo::{ProcessesToUpdate, System};
+            let mut sys = System::new();
+            let mut pre: Vec<(String, usize)> = Vec::new();
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                sys.refresh_processes(ProcessesToUpdate::All, true);
+                let obs: Vec<ProcObs> = daemon
+                    .surfaces
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .flat_map(|s| {
+                        collect_descendants(&sys, s.pid)
+                            .into_iter()
+                            .map(move |(pid, cmdline)| ProcObs {
+                                pid,
+                                ppid: 0,
+                                surface_id: s.id,
+                                cmdline,
+                                node_owned: false,
+                                age_secs: 0.0,
+                            })
+                    })
+                    .collect();
+                pre = dup_alerts_pre_fix(&obs, 3);
+                if !pre.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                !pre.is_empty(),
+                "전제 실패: live 정상 편성이 수리 전 미러에서 경보를 내지 않음"
+            );
+        }
+
+        let alerts = drill_duplicate_alerts(&daemon, 5);
+        assert!(alerts.is_empty(), "정상 편성 live 드릴에서 중복 경보 발화: {alerts:#?}");
+        for s in daemon.surfaces.lock().unwrap().values() {
+            kill_pid(s.pid);
+        }
+    }
+
+    /// ★②(live) 진짜 중복 — 한 pane 이 같은 명령 3개를 쌓았다 → 경보 **1건**(surface 스코프).
+    #[cfg(unix)]
+    #[test]
+    fn live_real_pile_in_one_surface_fires_duplicate_alert() {
+        let daemon = drill_daemon("dup-live-pile");
+        let s = daemon
+            .create_surface(
+                None,
+                Some("sleep 13 & sleep 13 & sleep 13 & wait".into()),
+                None,
+                None,
+                24,
+                80,
+            )
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let alerts = drill_duplicate_alerts(&daemon, 3);
+        assert_eq!(alerts.len(), 1, "진짜 중복이 발화하지 않음: {alerts:#?}");
+        let p = &alerts[0]["payload"];
+        assert_eq!(p["scope"].as_str(), Some("surface"));
+        assert_eq!(p["surface_id"].as_u64(), Some(s.id));
+        assert!(p["count"].as_u64().unwrap_or(0) >= 3, "count 필드 하위호환: {p}");
+        // ★macOS 관측 한계 기록: sysinfo 가 인자를 못 읽으면 cmdline 이 이름("sleep")으로 축약된다
+        //   → 이름 계수의 해상도는 플랫폼에 따라 더 나빠진다(소유·스코프 기반 판정이 필요한 또 하나의 근거).
+        assert!(p["cmdline"].as_str().unwrap_or("").contains("sleep"), "cmdline 필드 하위호환: {p}");
+        kill_pid(s.pid);
     }
 
     /// ★불변식 박제: 45초/3개 중복-kill 정책의 최古보존·나이게이트·결정론정렬을 핀한다.

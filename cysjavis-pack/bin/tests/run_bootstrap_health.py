@@ -151,7 +151,10 @@ def _calls(tmp):
 def _base_env(extra=None, drop=()):
     env = dict(os.environ)
     for k in ("CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_SOCKET", "CYS_PACK_DIR",
-              "CYS_ROLE", "CYS_STATE_DIR", "CYS_LOCK_BACKEND", "CYS_ROOT", "CYS_SOUL"):
+              "CYS_ROLE", "CYS_STATE_DIR", "CYS_LOCK_BACKEND", "CYS_ROOT", "CYS_SOUL",
+              # ★임무 게이트 신호는 러너 환경에서 새어 들어오면 안 된다(검체가 자기 조건을
+              #   명시적으로 만든다 — `_rb_sandbox(mission=...)`).
+              "CYS_MISSION"):
         env.pop(k, None)
     for k in drop:
         env.pop(k, None)
@@ -160,8 +163,18 @@ def _base_env(extra=None, drop=()):
     return env
 
 
-def _rb_sandbox(tmp, *, boot_body=None, surface=True, mock_py=None, pack_has_boot=True):
-    """role-bootstrap.sh 격리 실행 환경. 반환: (env, home, pack, bindir, state_dir)."""
+def _rb_sandbox(tmp, *, boot_body=None, surface=True, mock_py=None, pack_has_boot=True,
+                mission="health-suite 검체 임무(오너 지정 가정)"):
+    """role-bootstrap.sh 격리 실행 환경. 반환: (env, home, pack, bindir, state_dir).
+
+    ★`mission` 기본값이 있는 이유(2026-08-01 D4-a 착지): 훅의 spawn 은 이제 **임무 게이트**로
+      갈린다 — 임무가 없으면 관측·기록만 하고 노드를 띄우지 않는다. H-DETECT-* 계열은 '선언을
+      감지해 **발화**하는가'(A4·G9·G25·A2·A3·A5·A6·A16·R3)를 재는 검체이므로, 발화가 계약인
+      조건 = **오너가 임무를 준 세션**에서 돌려야 원래 커버리지가 보존된다. 그 조건을 만드는
+      실재 수단이 `CYS_MISSION` 이다(`javis_mission.gate()` 의 ①번 신호 — `cys launch-agent`
+      기동 시점 명시 지정과 같은 경로). 단언은 하나도 바꾸지 않는다.
+      `mission=None` 으로 넘기면 임무 미지정 경로(신규 사용자)를 재현한다 — H-MISSION-1 소속.
+    """
     home = os.path.join(tmp, "home")
     pack = os.path.join(tmp, "pack")
     bindir = os.path.join(tmp, "bin")
@@ -178,6 +191,10 @@ def _rb_sandbox(tmp, *, boot_body=None, surface=True, mock_py=None, pack_has_boo
                      "PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
     if surface:
         env["CYS_SURFACE_ID"] = "7"
+    if mission:
+        env["CYS_MISSION"] = mission
+    else:
+        env.pop("CYS_MISSION", None)
     return env, home, pack, bindir, state
 
 
@@ -757,12 +774,15 @@ def h_detect_10():
     # 이관됐다)는 정상 위임하고, **부트 스크립트 실행만 exec 실패(127)** 로 만든다.
     # ★목을 좁힌 이유: 이 검체가 재는 것은 '부트 발화의 pre-exec 사망'이지 '감지 불가'가 아니다.
     #   감지기까지 죽이면 훅이 A22 cannot-judge 분기로 빠져 A6 표면을 아예 통과하지 않는다.
+    #   ★같은 이유로 **임무 게이트도 정상 위임**한다(2026-08-01 D4-a): 게이트를 죽이면 훅이
+    #     fail-closed 로 접혀 no-spawn 경로를 타므로, 역시 A6 표면에 도달하지 않는다.
     mock = ("#!/bin/sh\n"
             'case "$1" in\n'
             '  -c) exec "%s" "$@" ;;\n'
             "  *javis_detect.py) exec \"%s\" \"$@\" ;;\n"
+            "  *javis_mission.py) exec \"%s\" \"$@\" ;;\n"
             "esac\n"
-            "exit 127\n" % (real, real))
+            "exit 127\n" % (real, real, real))
     with tempfile.TemporaryDirectory() as tmp:
         env, _home, _pack, _bind, state = _rb_sandbox(tmp, mock_py=mock)
         r = _run_rb(env)
@@ -817,6 +837,70 @@ def h_detect_11():
         left = [n for n in os.listdir(state) if re.match(r"^role-bootstrap-\d+-\d+\.log$", n)]
         need(len(left) <= 10, "개수 상한 미작동(%d개 잔여)" % len(left))
     return "런별 %d파일 분리·마커 %d종 보존·latest 포인터·상한 10 준수" % (len(names), len(markers))
+
+
+@specimen("H-MISSION-1", "W5",
+          "임무 미지정 부팅 → 노드 spawn 0(관측·기록만) + 주입문↔실행 1:1(D4-a 순서 결함)",
+          ["D4-a", "T1 자기인가"])
+def h_mission_1():
+    """D4-a: UserPromptSubmit 훅은 **모델이 프롬프트를 보기 전에** 돌기 때문에, 종전 구조에서는
+    모델이 거부를 답한 시점에 이미 preflight --fix·claim-role·cys boot 가 끝나 있었다 —
+    주입문은 요청 형식이지만 실제로는 사후 통보였다(온보딩 거부 사유 ①③⑤의 구조적 뿌리).
+    수리: **임무 미지정 경로에서는 spawn 하지 않는다.** 그리고 그 경로의 주입문이 서술하는
+    '이미 한 일'은 훅이 실제로 한 일과 1:1 이어야 한다(정직성 불변식)."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # ⓐ 임무 미지정(신규 사용자: 선언 단독) → 부트 스크립트가 **한 번도 실행되지 않는다**
+        env, _home, _pack, _bind, state = _rb_sandbox(tmp, mission=None)
+        r = _run_rb(env, prompt="너는 마스터다")
+        need(r.returncode == 0, "훅이 비0 종료(exit=%d)" % r.returncode)
+        need("MOCK-BOOT" not in r.stdout, "임무 미지정인데 부트가 실행됐다(D4-a 미수리)")
+        logs = [n for n in (os.listdir(state) if os.path.isdir(state) else [])
+                if re.match(r"^role-bootstrap-\d+-\d+\.log$", n)]
+        need(not logs, "spawn 하지 않았는데 발화 로그가 생겼다(무발화 경로 오염): %s" % logs)
+        need("발화됨" not in r.stdout, "spawn 0 인데 '발화됨' 을 말했다(허위 보고): %r" % r.stdout[:300])
+        # 정직성 1:1 — 하지 않은 것을 명시하고, 쓴 것(임무 대장)만 쓴 것으로 적는다
+        for frag in ("실행 상태 통보", "새로 뜬 프로세스는 0개다", "임무 대장",
+                     "노드 기동은 사용자 승인 후", "cys feed push --wait",
+                     "자율 진행 권한은 기본 미부여"):
+            need(frag in r.stdout, "임무 미지정 주입문에 %r 이 없다(정직성/거절 가능성 결손): %r"
+                 % (frag, r.stdout[:400]))
+        need("preflight --fix" in r.stdout and "claim-role" in r.stdout,
+             "하지 않은 일(설정 수리·좌석 등록) 목록이 주입문에 없다")
+        notes.append("임무 미지정: spawn 0 · 로그 0 · 통보 문안 정합")
+        # ⓑ 같은 사양에서 **임무가 있으면** 종전 경로 그대로 발화한다(기존 사용자 무회귀)
+        env2, _h2, _p2, _b2, state2 = _rb_sandbox(os.path.join(tmp, "b"))
+        r2 = _run_rb(env2, prompt="너는 마스터다")
+        need("발화됨" in r2.stdout, "임무 지정 세션에서 발화가 사라졌다(기존 사용자 회귀): %r"
+             % r2.stdout[:300])
+        need(_HOOK_FIRED_MARK in r2.stdout, "발화 경로의 신호 문구가 바뀌었다(§0-A 정합 파괴)")
+        notes.append("임무 지정: 종전 발화 경로 보존")
+    # ⓒ 검증자가 실증한 **자기인가 우회로 2종**을 그 문안 그대로 재투입 → 대장 미기록
+    with tempfile.TemporaryDirectory() as tmp:
+        for prompt, why in (("[wakeup] 다음 액션 착수", "자기 예약 wake(CLAUDE.md.template:44)"),
+                            ("[worker-1 완료] T1 끝났습니다. 다음 지시 주세요",
+                             "워커 완료 push(CLAUDE.md §7)")):
+            sb = os.path.join(tmp, re.sub(r"\W+", "_", why)[:20])
+            env, home, _p, _b, _s = _rb_sandbox(sb, mission=None)
+            _run_rb(env, prompt=prompt)
+            led = os.path.join(home, ".cys", "state", "mission.json")
+            if os.path.isfile(led):
+                rec = json.loads(_read(led) or "{}")
+                need(not rec.get("mission"),
+                     "%s 가 임무로 기록됐다 — 자기인가 루프가 채널만 바꿔 부활한다: %r" % (why, rec))
+            # 게이트도 닫혀 있어야 한다(기록 유무와 무관하게 최종 판정으로 확인)
+            g = _run([PY, os.path.join(BIN_DIR, "javis_mission.py"), "status"], env=env)
+            need(g.returncode != 0, "%s 이후 임무 게이트가 열렸다(rc=%d)" % (why, g.returncode))
+        notes.append("우회로 2종 원문 재투입: 대장 미기록·게이트 닫힘")
+    # 계측 타당성: **구 훅**은 같은 조건(임무 미지정 선언 단독)에서 발화한다(결함 재현)
+    calib = "skip(no-git)"
+    with tempfile.TemporaryDirectory() as tmp:
+        fired = _old_hook_fires("너는 마스터다", tmp)
+        if fired is not None:
+            need(fired, "계측 타당성 실패: 구 훅이 임무 미지정 선언에서 발화하지 않는다 — "
+                        "D4-a 가 결함이 아니었다는 뜻이 된다")
+            calib = "구 훅=임무 미지정에도 발화(사후통보 구조) 재현"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -940,12 +1024,42 @@ def h_exit_1():
 # 계측 층위 규약: Rust CLI 경계의 계약은 ①레포 소스 구조 단언(배포 팩에선 Skip) + ②빌드된
 # 바이너리가 있으면 **부작용 0 경로만** 실행(데몬 없는 미도달·인자 오류)로 잰다. 노드를 스폰할 수
 # 있는 경로(`cys boot` 본문)는 러너에서 절대 실행하지 않는다 — 검체가 조직을 건드리면 안 된다.
+_CYS_BIN_SKIP_REASON = "바이너리 미빌드"
+
+
 def _cys_bin():
-    """빌드된 cys 바이너리(있으면) — 부작용 0 경로 실측용. 없으면 None(구조 단언만)."""
+    """빌드된 **진짜** cys 바이너리(있으면) — 부작용 0 경로 실측용. 없으면 None(구조 단언만).
+
+    ★신원 확인이 필수인 이유(2026-08-01 실측 회귀): 형제 워크플로우의 빌드 픽스처가
+      `target/debug/cys` 에 **10바이트 `#!/bin/sh` 스텁**을 남겼고(같은 시각 `cysd`·
+      `pack.tar.gz`(빈 gzip)·`pack-manifest.json`(`{}`)·`runtime/.stub` 동반), 종전 판정
+      (`isfile` + `X_OK`)이 그것을 바이너리로 받아들였다. 스텁은 무엇을 시켜도 rc=0 이라
+      H-EXIT-3 이 "데몬 미도달이 exit 3 이 아니다(rc=0)" 라는 **거짓 적색**을 냈다
+      (원인 증명: 깨끗한 HEAD 클론에 같은 스텁을 넣자 PASS→동일 FAIL 로 뒤집혔다).
+    ★이것은 게이트 약화가 아니다 — 이 러너 헤더의 **계측기 자기검증** 규약("탐지기가 구 결함을
+      못 잡으면 신 코드의 PASS 는 아무 의미가 없다")의 역방향 적용이다. 계측 대상이 가짜면
+      PASS 도 FAIL 도 무의미하므로, 신원이 확인되지 않으면 **실측을 건너뛰고 그 사유를 노트에
+      남긴다**(조용한 skip 금지 — `_CYS_BIN_SKIP_REASON`).
+    """
+    global _CYS_BIN_SKIP_REASON
+    reasons = []
     for rel in (os.path.join("target", "debug", "cys"), os.path.join("target", "release", "cys")):
         p = os.path.join(REPO_DIR, rel)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
+        if not (os.path.isfile(p) and os.access(p, os.X_OK)):
+            continue
+        try:
+            r = _run([p, "--version"], timeout=30)
+        except Exception as e:                      # 실행 자체가 불가 = 바이너리 아님
+            reasons.append("%s 실행 불가(%s)" % (rel, e))
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        # clap 정본: `#[command(name = "cys", version)]` → "cys <semver>"
+        if r.returncode == 0 and re.search(r"(?m)^\s*cys\s+\d+\.\d+", out):
+            _CYS_BIN_SKIP_REASON = None
             return p
+        reasons.append("%s 는 cys 바이너리가 아니다(rc=%d · --version=%r · %dB) — 빌드 픽스처 스텁 의심"
+                       % (rel, r.returncode, out.strip()[:40], os.path.getsize(p)))
+    _CYS_BIN_SKIP_REASON = "; ".join(reasons) if reasons else "바이너리 미빌드"
     return None
 
 
@@ -1049,7 +1163,7 @@ def h_exit_3():
     # 실측(부작용 0 경로만): 데몬 소켓 부재 → 미도달(3) / surface 식별 불가 → 2.
     cys = _cys_bin()
     if cys is None:
-        notes.append("바이너리 미빌드 — 실측 생략(구조 단언만)")
+        notes.append("실측 생략(구조 단언만) — 사유: %s" % _CYS_BIN_SKIP_REASON)
     else:
         tmp = tempfile.mkdtemp(prefix="cys-h-exit3-")
         try:
@@ -1844,7 +1958,7 @@ def h_safe_2():
           "Windows 전용 락 안전성 — 영구 Busy 불가능성(나이 backstop)·RAII 해제·fail-open + 타깃 타입검사",
           ["W2-자체감사", "A8rs", "④ Windows 온보딩 전멸"])
 def h_safe_w():
-    """★오너 지시("맥은 문제없어도 윈도우 설치파일에서 에러·코드 깨짐이 잦다")에 대한 구조적 응답.
+    """★알려진 실패 양상("맥은 문제없어도 윈도우 설치파일에서 에러·코드 깨짐이 잦다")에 대한 구조적 응답.
 
     W2 가 신설한 `cfg(not(unix))` 락 코드는 **macOS 컴파일러가 한 번도 검사하지 않는 영역**이다.
     두 종류의 위험을 각각 못박는다:
@@ -3354,13 +3468,35 @@ def _repo_file(rel):
 
 
 def _no_wait_for_owner(text, where):
-    """'오너 지시 대기' 문구 금지(H-DOC-1) — 단, **폐기 선언**으로 인용한 것은 허용한다.
+    """'무조건 오너 지시 대기' 문구 금지(H-DOC-1) — 단, **폐기 선언**·**임무 게이트 조건부 대기**로
+    인용한 것은 허용한다.
     ★규칙을 '문자열 부재'로 두면 폐기 선언 자체를 쓸 수 없다(문서가 결함을 설명 못 한다) →
-      출현마다 근처(±40자)에 부정 마커(폐기/아니라/금지)가 있어야 한다는 형태 규칙으로 판정한다."""
+      출현마다 근처(±40자)에 부정 마커(폐기/아니라/금지)가 있어야 한다는 형태 규칙으로 판정한다.
+    ★T1(2026-08-01 실사고) 이후 허용 마커 확장: 계약이 '항상 자율 착수'에서 **'임무 있으면 자율,
+      없으면 보고 후 정지'** 로 바뀌었다. 그래서 '임무'·'exit 3' 근처의 대기 서술은 **정당한
+      계약**이며 금지 대상이 아니다 — 금지되는 것은 여전히 **무조건 대기**(구 §0 문안)뿐이다."""
+    ok_markers = ("폐기", "아니라", "금지", "임무", "exit 3", "미지정")
     for m in re.finditer(r"오너 지시 대기|오너의? 지시를 기다|오너 지시를 받아", text):
         window = text[max(0, m.start() - 40):m.end() + 40]
-        need(any(k in window for k in ("폐기", "아니라", "금지")),
-             "%s 에 '오너 지시 대기' 계열 문구가 살아 있다(§0 ⑥·앵커6 축1 위반): …%s…"
+        need(any(k in window for k in ok_markers),
+             "%s 에 **무조건** '오너 지시 대기' 문구가 살아 있다(§0 ⑥ 위반 — 임무 게이트 §0-C "
+             "조건부 대기라면 근처에 '임무'·'exit 3'을 명시하라): …%s…"
+             % (where, window.replace("\n", " ")))
+
+
+def _mission_gate_pinned(text, where):
+    """★T1 회귀 핀(2026-08-01 윈도우 실사고): 자율 착수 안내가 **임무 게이트 없이** 살아 있으면
+    안 된다. 사고는 '큐에 항목이 있으면 무조건 자율 착수'라는 문안이 임무 미지정 부팅에서
+    이전 세션 잔무 큐를 집어 온 것이었다 — 그 문안 자체를 기계로 금지한다."""
+    if "next-action" not in text:
+        return
+    need(any(k in text for k in ("임무 게이트", "javis_mission", "exit 3", "임무 미지정")),
+         "%s 가 next-action 을 안내하면서 **임무 게이트를 명시하지 않는다**"
+         "(T1 회귀 — 임무 없는 부팅에서 잔무 큐 자율 착수가 되살아난다)" % where)
+    for m in re.finditer(r"미완 작업이 있으면 자율 착수|있으면 자율 착수하라", text):
+        window = text[max(0, m.start() - 80):m.end() + 80]
+        need(any(k in window for k in ("임무", "exit 3", "폐기", "아니라")),
+             "%s 에 무조건 자율 착수 문안이 살아 있다(T1 회귀): …%s…"
              % (where, window.replace("\n", " ")))
 
 
@@ -3385,7 +3521,16 @@ def h_doc_1():
     need("재실행하지 마라" in hook, "훅 note 에 재실행 금지가 없다")
     need("next-action" in hook, "훅 note 가 next-action 자율 착수를 가리키지 않는다")
     _no_wait_for_owner(_code_lines(hook), "훅 note")   # 주석(수정 이력 설명)은 스캔 제외
-    notes.append("훅 note 신호·잔여의무 정합")
+    _mission_gate_pinned(_code_lines(hook), "훅 note")  # ★T1 회귀 핀
+    # ★T1: 디렉티브 §0-C(임무 게이트 정의처)와 exit 3 계약이 실재하는가 — 산문만 고치고 도구는
+    #      안 고치는(또는 그 반대) 반쪽 수리 차단.
+    need("0-C" in md and "임무 게이트" in md, "§0-C 임무 게이트 절이 없다(T1 미착지)")
+    need("자기인가" in md, "§0-C 가 '큐=master 산출물 → 자기인가' 근본원인을 명문하지 않는다")
+    need("javis_mission.py" in md, "§0-C 가 판정 도구(javis_mission.py)를 가리키지 않는다")
+    orch_src = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
+    need("return 3" in orch_src and "이어서 하시겠습니까" in orch_src,
+         "next-action 이 exit 3(임무 미지정 → 보고·정지) 경로를 갖지 않는다(문서만 수리)")
+    notes.append("훅 note 신호·잔여의무 정합 · T1 임무 게이트 핀")
     # ③ template 2벌 사본이 §0 포인터 + 폴백 보존 문구를 갖고, **서로 동일**한가
     bodies = []
     for rel in _CLAUDE_MD_COPIES:
@@ -3397,6 +3542,7 @@ def h_doc_1():
         need("javis_preflight.py" not in t.split("## 터미널")[0],
              "%s 부트절이 아직 preflight 산문 지시를 담고 있다(A10 미수리)" % rel)
         _no_wait_for_owner(t, rel)
+        _mission_gate_pinned(t, rel)                   # ★T1 회귀 핀(template 사본 2벌 동일 적용)
         bodies.append(t.split("## 터미널")[0])
     need(bodies[0] == bodies[1],
          "template 2벌 사본의 부트절이 갈렸다(사본 드리프트) — 길이 %d vs %d"

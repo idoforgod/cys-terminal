@@ -1,6 +1,6 @@
 #!/bin/sh
 # PreToolUse ARM hook (matcher Skill): grill-me 스킬 발동 시 grill_gate 자동 무장(begin).
-# 의도(오너 2026-07-16): floor(20·복잡30) 게이트의 무장이 LLM 자발 `begin` 실행에 달려
+# 의도(2026-07-16): floor(20·복잡30) 게이트의 무장이 LLM 자발 `begin` 실행에 달려
 # 있던 갭을 결정론으로 봉인 — grill-me를 쓸 때마다 최소 질문 수 강제가 반드시 발동한다.
 #
 # ★관측/무장 클래스 — 절대 차단하지 않는다(모든 경로 exit 0 · fail-open):

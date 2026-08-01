@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_role_bootstrap_hook.py — 마스터 선언 발화 계층 회귀(감지기 함수 + 훅 통합).
 
-오너 절대요구(2026-07-15): "너는 마스터다" 입력 → 부트스트랩 100% 발화. 2회 성찰(적대검증+아키텍트)이
+제품 절대요구(출하 기본 계약): "너는 마스터다" 입력 → 부트스트랩 100% 발화. 2회 성찰(적대검증+아키텍트)이
 지적한 트리거 미검증(arch#2)·감지 오류(adv#2)·role-blind(arch#1)·인용 오발화(adv#8)·부정 오억제(adv#7)를
 회귀로 핀한다.
 
@@ -157,6 +157,14 @@ def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=No
     # 'cys pane 안'을 재현하므로 CYS_SURFACE_ID를 **명시** 주입한다 — os.environ 상속에 의존하면
     # 테스트 결과가 실행 위치(cys pane 안/밖)에 따라 흔들린다(결정론 파괴).
     env.pop("AITERM_SURFACE_ID", None)
+    # ★임무 게이트(2026-08-01 D4-a): 훅의 **발화(spawn)** 는 이제 "오너가 이 세션에 임무를
+    #   지정했는가"로 갈린다 — 임무가 없으면 관측·기록만 하고 노드를 띄우지 않는다.
+    #   이 하네스가 재는 것은 **감지·게이트 배선**(A2·A4·A3=B7·G9·G25)이고 그 계약은
+    #   '선언을 감지하면 발화한다'이므로, 발화가 계약인 조건 = 임무 지정 세션을 명시 주입한다
+    #   (실재 수단: `javis_mission.gate()` ①번 신호 `CYS_MISSION` — launch-agent 기동 시점
+    #   지정과 동일 경로). 상속에 기대면 실행 위치에 따라 결과가 흔들린다(결정론 파괴).
+    #   ※임무 미지정 경로(신규 사용자 · spawn 0)의 계약은 run_bootstrap_health H-MISSION-1 소속.
+    env["CYS_MISSION"] = "test_role_bootstrap_hook 검체 임무(오너 지정 가정)"
     if surface_env:
         env["CYS_SURFACE_ID"] = "7"
     else:

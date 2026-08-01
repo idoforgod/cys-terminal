@@ -41,6 +41,10 @@
 #   A = 그 env 를 못 타는 경로(셸·훅·pane 에서 도는 python)에서도 번들이 안 깨지는지
 #       = **패키징 층위 불변식**. 서명 전 `compileall` 로 stdlib .pyc 를 봉인에 넣거나
 #       런타임을 봉인 밖으로 빼야 A 가 통과한다. A 는 완화가 아니라 구조로만 닫힌다.
+#   ★A·B 모두 **동봉 python 의 종료코드(rc)≠0 이면 그 자리에서 FAIL** 한다(2026-08-01 추가).
+#     실행이 죽으면 ".pyc 개수 불변 + codesign 통과"가 저절로 성립해 버리므로, rc 를 보지 않는
+#     검사는 **측정 불능을 통과로 세는 구멍**이 된다(실측 사례: 격리된 미공증 사본의 nested
+#     python = AMFI 가 즉시 SIGKILL, exit 137 — 아무것도 안 돌았는데 두 술어는 다 참이 된다).
 #
 # 사용
 #   bash scripts/verify-gatekeeper-user-path.sh <DMG경로>
@@ -58,7 +62,7 @@
 #   · 임시 작업 폴더에 **DMG 227MB + 앱 사본 492MB × 3 ≒ 2GB** 를 쓴다. 끝나면 지운다(--keep 로 보존).
 #   · 소요 ~1분(로컬 DMG) / ~1분30초(원격 다운로드 포함).
 #   · 대상 아키텍처의 python 을 실제로 실행하므로, arm64 머신에서 x64 DMG 를 볼 땐 Rosetta 2 가
-#     필요하다. 없으면 ⑥-A 가 "동봉 python 실행 실패 — 검사 불성립"으로 **FAIL** 한다(측정 불능은
+#     필요하다. 없으면 ⑥-A·⑥-B 가 "동봉 python 실행 실패 — 검사 불성립"으로 **FAIL** 한다(측정 불능은
 #     통과가 아니다). 확실히 하려면 각 아키텍처 머신에서 자기 DMG 를 돌려라.
 #   · 앱을 **실행하지 않는다**(동봉 python 만 1회 스폰). 데몬·창이 뜨지 않는다.
 #
@@ -318,8 +322,15 @@ else
       PYB="$(find_py "$PROBE_B")"
       PYCB0=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
       PYTHONDONTWRITEBYTECODE=1 "$PYB" -c "import argparse,tempfile,uuid" >"$WORK/pyB.log" 2>&1
+      PYB_RC=$?
       PYC_B=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
-      if codesign --verify --deep --strict --verbose=2 "$PROBE_B" >"$WORK/csB.log" 2>&1 && [ "$PYC_B" = "$PYCB0" ]; then
+      # ★rc 하드페일 — ⑥-A(PY_RC) 와 동일한 계약. python 이 아예 못 돌면 "완화가 쓰기를 막았다"가
+      #   아니라 **아무 일도 일어나지 않은 것**인데, 그때도 `.pyc 개수 불변`과 `codesign 통과`는
+      #   저절로 참이 되어 PASS 가 새어 나간다(측정 불능 ≠ 통과). 아래 두 술어는 그대로 두고
+      #   rc 조건만 앞에 얹는다 — 통과 조건이 좁아지기만 하고 넓어지지 않는다.
+      if [ "$PYB_RC" -ne 0 ]; then
+        bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "동봉 python 실행 실패(rc=$PYB_RC) — 검사 불성립(측정 불능은 통과가 아니다) · .pyc ${PYCB0}→$PYC_B: $(tail -2 "$WORK/pyB.log" 2>/dev/null | tr '\n' ' ')"
+      elif codesign --verify --deep --strict --verbose=2 "$PROBE_B" >"$WORK/csB.log" 2>&1 && [ "$PYC_B" = "$PYCB0" ]; then
         ok "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" ".pyc ${PYCB0}→$PYC_B · 봉인 유지"
       else
         bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "완화가 무효다 · .pyc ${PYCB0}→$PYC_B · $(grep -Ei 'sealed|file (added|modified)' "$WORK/csB.log" | head -2 | tr '\n' ' ' | sed "s|$PROBE_B|<probe>|g")"

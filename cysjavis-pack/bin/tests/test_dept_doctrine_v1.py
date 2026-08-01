@@ -354,7 +354,7 @@ class MigrateIdempotent(unittest.TestCase):
 
 STALE_DIRECTIVE = """# MASTER ABSOLUTE DIRECTIVE — 지휘 노드 절대지침
 
-## [부서장 스코프 절대규칙] (2026-07-11 박사님 승인·dept-recovery §3)
+## [부서장 스코프 절대규칙] (제품 기본 절차·dept-recovery §3)
 
 - 너는 부서장(dept-master)이다 — 메인 CEO가 아니다.
 - 내부 노드는 CEO의 명시적 작업배정 티켓이 있을 때만 기동한다. 각성 기본값=부서장 단독 대기.

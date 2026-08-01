@@ -1903,7 +1903,7 @@ function advanceOwner(dt, t){
     owner.busy = false; owner.manual = false; owner.pr.swing(0); owner.plan.shift();
   } else owner.plan.shift();
 }
-// ---------- 주인 직접 조종 (MMORPG · 2026-07-07 박사님 지시) ----------
+// ---------- 오너 직접 조종 (MMORPG · 2026-07-07) ----------
 let FLOORS = [];            // buildWorld가 채움 (로비·부서층·옥상 y 목록)
 const FLOOR_NAMES = new Map();
 const keys = {};
@@ -2453,7 +2453,7 @@ function announce(text){
 }
 
 // ---------- 시네마틱 디렉터 (#1) ----------
-let directorOn = false;   // 기본 OFF — 줌인은 주인의 층 진입시에만 (2026-07-07 박사님 지시)
+let directorOn = false;   // 기본 OFF — 줌인은 오너의 층 진입시에만 (2026-07-07)
 function directorCut(pos){
   if (!directorOn || replay.mode) return;
   setCam('director', pos.x*0.8, pos.y+1.1, pos.z*0.8, 11, 3000);
@@ -2656,7 +2656,7 @@ const legend = document.getElementById('legend');
  .forEach(([c,t])=>{ const d=document.createElement('div');
    d.innerHTML=`<i style="background:${c}"></i>${t}`; legend.appendChild(d); });
 
-// ---------- 근접 대화 팝업 (2026-07-07 박사님 지시 — 실전달·흉내 아님) ----------
+// ---------- 근접 대화 팝업 (2026-07-07 — 실전달·흉내 아님) ----------
 const talkEl = document.getElementById('talk');
 const talkInput = document.getElementById('t-input');
 const talkStatus = document.getElementById('t-status');

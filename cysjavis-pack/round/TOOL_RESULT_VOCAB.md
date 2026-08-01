@@ -29,7 +29,7 @@
 | B2 check_manifest check | 0 / 1 | skipped / (생성 필요 — 어휘 없음, 판정 전 상태) |
 | cys feed push --wait | 0 / 2 / 3 | ok / rejected / retryable(timeout) |
 
-## 디렉티브 반영 문안 (ESCALATE ③ — 박사님 승인 대기, 여기서는 초안만)
+## 디렉티브 반영 문안 (ESCALATE ③ — 오너 승인 대기, 여기서는 초안만)
 
 > "도구가 `completed`를 반환하지 않은 작업을 완료라고 보고하지 않는다. `started`는 완료가 아니다. `skipped`는 산출물 실존이 확인된 경우에만 유효하다."
 

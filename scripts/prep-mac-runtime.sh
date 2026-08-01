@@ -63,5 +63,15 @@ rm -rf "$RT/node/include"
 #   바뀌어 '정보 불변' 엄격 해석에 걸릴 여지가 있어 retention 원칙으로 보존 — 오너 명시 승인 시 추가 트림.
 
 printf 'Bundled runtimes and their licenses (macOS):\n- CPython (python-build-standalone): PSF License (https://github.com/astral-sh/python-build-standalone)\n- git (desktop/dugite-native): GPLv2 (https://github.com/desktop/dugite-native)\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
+
+# ── SEAL-2: 동봉 python 선컴파일 (서명 전 필수 · 2026-08-01 실사고 구조적 봉인) ──
+# install_only tar 에는 `.pyc` 가 없어서, 이 트리를 그대로 서명하면 나중에 **누가 번들 python 을
+# 부르든** CPython 이 번들 안에 `__pycache__/*.pyc` 를 새로 써서 코드서명 봉인이 깨진다
+# (→ quarantine 사본이 첫 실행에서 "손상됨"으로 차단). 여기서 미리 컴파일해 `.pyc` 가
+# **서명 대상**이 되게 하면 이후 새로 쓸 것이 없다. 근거·모드 선택(unchecked-hash)·검증은
+# scripts/precompile-bundled-python.sh 머리 주석. ★node(node-gyp/gyp) 의 python 도 같은 표면이라
+# 런타임 트리 전체를 대상으로 한다 → 반드시 python·node 내려받기가 **끝난 뒤**에 돈다.
+bash scripts/precompile-bundled-python.sh "$RT"   # 이 스크립트는 상단에서 repo 루트로 cd 한 상태다
+
 ls -la "$RT/python/bin/python3" "$RT/git/bin/git" "$RT/uv/uv" "$RT/node/bin/node"
 echo "✓ macOS 런타임 준비 완료 ($TARGET)"

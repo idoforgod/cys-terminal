@@ -415,7 +415,7 @@ def case7_keepalive_respawn():
         pong_ev = ("%.0fs" % pong_elapsed) if pong_elapsed is not None else "미관측"
         respawned = epoch1 is not None and epoch2 is not None and epoch1 != epoch2
         ev = "epoch %s->%s · pong복귀=%s · elapsed=%.0fs(예산 %ds)" % (epoch1, epoch2, pong_ev, elapsed, BUDGET)
-        # ★라벨 전환(박사님 승인 2026-07-05 · CI run 28736698338 vs 28737327371 실증): Task Scheduler 의
+        # ★라벨 전환(2026-07-05 · CI run 28736698338 vs 28737327371 실증): Task Scheduler 의
         #   RestartOnFailure 반응 시점은 OS 내부 사정으로 비결정(+242s 부활 vs 425s 미부활) — 실시간 관측을
         #   per-commit CI hard gate 로 두면 가짜 빨간불이 CI 신뢰를 갉는다. 예산 내 부활=PASS(경과시간 evidence),
         #   미부활=FAIL 아닌 OBSERVED-TIMEOUT 정직 라벨(능력 은폐 아님 — 검증 자리 이동: 설정·수동 /Run 재기동은

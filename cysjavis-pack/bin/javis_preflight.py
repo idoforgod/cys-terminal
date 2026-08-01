@@ -182,7 +182,7 @@ CONTENT_PINS = {
 
 ROLES = ["master", "worker", "cso", "reviewer"]
 
-# Harness Creator 툴체인(오너 제작) 핀 — 2026-06-12 통합 시점 커밋.
+# Harness Creator 툴체인(1st-party) 핀 — 2026-06-12 통합 시점 커밋.
 # 스킬(pack/skills/harness-creator)은 임베드 배포되지만 이미터·검증기·게놈 툴체인은
 # 6MB+ 개발 저장소라 클론 설치한다. 해석 순서: $CYS_HARNESS_HOME → ~/.cys/harness-creator
 # → ~/Desktop/CYSjavis/cys-harness-creator(로컬 원본).
@@ -200,13 +200,13 @@ NLM_PIN = ("notebooklm-mcp-cli @ git+https://github.com/jacob-bd/notebooklm-mcp-
 
 TODO_FILES = ["MASTER_TODO.md", "CSO_TODO.md", "WORKER_TODO.md", "REVIEWER_TODO.md"]
 
-# 한국 법령 전용 MCP(korean-law-mcp) 핀 — 2026-06-12 감사(v4.4.1, npm) · 오너 채택.
+# 한국 법령 전용 MCP(korean-law-mcp) 핀 — 2026-06-12 감사(v4.4.1, npm) · 기본 채택.
 # k-skill의 korean-law-search(프록시 경유)를 대체하는 전용 경로 — 인용 검증·판례 생사
 # 확인(citator)·행위시법 판단 등 환각 방지 기능 내장. 키는 법제처 무료 OC(사람 단계).
 KLAW_MIN_VERSION = (4, 4, 1)
 KLAW_PIN = "korean-law-mcp@4.4.1"
 
-# ── Serena 코드-의미 인덱스 MCP(uvx 온디맨드 채택 — 미설치) · 2026-06-25 오너 채택 ──
+# ── Serena 코드-의미 인덱스 MCP(uvx 온디맨드 채택 — 미설치) · 2026-06-25 기본 채택 ──
 # 심볼 단위 nav(get_symbols_overview/find_symbol/find_referencing_symbols)로 통째-Read·
 # 전체-Grep을 대체해 code-nav 슬라이스의 토큰을 줄인다(산문/SOT/설교/markdown=비코드 0).
 # 등록은 기계(--fix), 노드 활성화·신뢰(enable/trust)는 사람 전용 단계(denylist).
@@ -228,7 +228,7 @@ SERENA_STDIO_ARGS = [
     "--open-web-dashboard", "false",      # S4: 브라우저 spawn 방지
 ]
 
-# cys-video-creator 영상 자동제작 스킬(오너 제작 32종) — pack 임베드로 배포되고, C26이
+# cys-video-creator 영상 자동제작 스킬(1st-party 32종) — pack 임베드로 배포되고, C26이
 # 네이티브 Claude Code(/goal) 발견을 위해 프로필 skills/ 로 심링크한다. 대표 7기둥 +
 # 하위 + 공통 규약. 새 스킬 추가 시 이 목록과 pack.rs 임베드 불변식을 함께 갱신한다.
 VIDEO_SKILLS = [
@@ -254,7 +254,7 @@ VIDEO_VENDOR_COMMANDS = [
 ]
 VIDEO_RUNTIME_KEYS = ["ELEVENLABS_API_KEY", "HEYGEN_API_KEY", "FAL_KEY"]
 
-# appbuild 웹/앱 빌드 스킬(오너 제작 20종·워커 필수) — 스펙 기반 기획→감독관 검증→자율빌드.
+# appbuild 웹/앱 빌드 스킬(1st-party 20종·워커 필수) — 스펙 기반 기획→감독관 검증→자율빌드.
 # pack 임베드 배포 + C27이 프로필 심링크 + 코드선행 금지 hook(PreToolUse) 등록.
 # 새 스킬 추가 시 이 목록·pack.rs 임베드 불변식을 함께 갱신한다.
 APPBUILD_SKILLS = [
@@ -270,7 +270,7 @@ APPBUILD_SKILLS = [
 APPBUILD_HOOK = "appbuild-gate.sh"  # PreToolUse 코드선행 금지 게이트
 
 # grill-me 최소 질문(결정론 floor) 게이트 — C55가 엔진 self-test·hook·등록·SKILL 핀 검증.
-# (오너 절대규칙 2026-06-27: grill-me는 합의 전 최소 20·복잡30 결정 브랜치를 강제 해소)
+# (제품 절대규칙: grill-me는 합의 전 최소 20·복잡30 결정 브랜치를 강제 해소)
 GRILL_ENGINE = "grill_gate.py"
 GRILL_HOOK = "grill-gate.sh"            # PreToolUse check(gatekeeper) — distinct<floor면 deny
 GRILL_HOOK_EVENT = "PreToolUse"
@@ -285,7 +285,7 @@ GRILL_STOP_HOOK = "grill-stop.sh"       # Stop — floor 미충족 턴 종료 �
 GRILL_STOP_EVENT = "Stop"
 GRILL_STOP_MATCHER = ""
 # (GATE check hook, count evaluator hook) 쌍 — 둘 다 없으면 게이트가 fail-closed/무력.
-# + (arm, stop) 쌍(오너 2026-07-16) — 없으면 무장이 LLM 자발 의존으로 회귀(강제 약화).
+# + (arm, stop) 쌍(2026-07-16) — 없으면 무장이 LLM 자발 의존으로 회귀(강제 약화).
 GRILL_HOOKS = (
     (GRILL_HOOK, GRILL_HOOK_EVENT, GRILL_HOOK_MATCHER),
     (GRILL_COUNT_HOOK, GRILL_COUNT_EVENT, GRILL_COUNT_MATCHER),
@@ -303,7 +303,7 @@ SELFCORR_HOOKS = [
     ("save-state.sh", [("Stop", None), ("PreCompact", None)]),
     ("reflect-scan.sh", [("Stop", None), ("SessionEnd", None)]),
     ("commit-memory-nudge.sh", [("PostToolUse", "Bash")]),
-    # ★결정론 부트스트랩 발화(오너 2026-07-15 절대요구): "너는 마스터다" 선언 입력 시 LLM 재량과
+    # ★결정론 부트스트랩 발화(제품 절대요구): "너는 마스터다" 선언 입력 시 LLM 재량과
     # 무관하게 하네스가 javis_bootstrap.py(팀 5노드 기동)를 발화 — 산문 계약의 코드 결정론 격상.
     ("role-bootstrap.sh", [("UserPromptSubmit", None)]),
     # ★W-C1(커스텀 생존 2026-07-17): vendor(system·임베드) 팩 파일 수정 감지 → 치유 예고 +
@@ -340,7 +340,7 @@ WORK_SKILL_PINS = {
 # 외부 에이전트 운영체계(거버넌스 점유형 스킬 모음)의 결정론 감지 시그니처 — C23.
 # 충돌 정의: cysjavis가 배선된 프로필(우리 SessionStart hook 등록)과 **같은 프로필**에
 # 동거할 때만 충돌이다 — 전용 프로필 분리 설치는 격리 수칙 준수로 보고 경고하지 않는다.
-# (2026-06-12 gstack 감사·오너 승인: 금지가 아니라 'WARN + 격리 수칙 안내'가 목적.)
+# (2026-06-12 gstack 감사: 금지가 아니라 'WARN + 격리 수칙 안내'가 목적.)
 FOREIGN_AGENT_OS = {
     "gstack": {
         "skills_dir": "gstack",
@@ -372,6 +372,9 @@ SOUL_AUTOPILOT_TEMPLATE = """
 
 - master는 승인된 로드맵을 오너 수동개입 없이 **자율 완주**할 권한을 가진다
   (MASTER_DIRECTIVE §14 — 3축: 진행권·컨텍스트 수명주기·재기동 루프).
+- **★시동 조건 — 이 권한은 오너가 그 세션에 임무를 지정했을 때만 발효한다**(MASTER_DIRECTIVE
+  §0-C 임무 게이트). 임무 없는 부팅에서는 대기 중인 작업을 **보고만 하고 멈춘다** — 자율주행은
+  "준 일을 끝까지 하는 권한"이지 "줄 일을 스스로 찾는 권한"이 아니다.
 - **정지 경계는 위 금지선(denylist)뿐이다**: 로드맵 이탈 새 범위·soul/CLAUDE/디렉티브 변경·
   외부 발행/발송·비가역 삭제·오너 명시 보유 결정권 — 여기서만 멈춰 오너 승인을 받는다.
   로컬 커밋은 가역이므로 허용된다.
@@ -387,8 +390,9 @@ AUTOPILOT_MEMORY_FILE = "feedback_autonomous-pilot-mandate.md"
 AUTOPILOT_MEMORY_PINS = ["축1", "축2", "축3", "로드맵 이탈", "오너 아무 입력=즉시 일시정지",
                          "How to apply"]
 AUTOPILOT_MEMORY_INDEX_LINE = (
-    "- [자율주행 위임권](feedback_autonomous-pilot-mandate.md) — 3축 완전 자율주행·"
-    "denylist에서만 정지·kill-switch 최우선 (🔒상주 필수 — 제거 금지)"
+    "- [자율 진행 권한 템플릿](feedback_autonomous-pilot-mandate.md) — **기본 미부여**. "
+    "오너가 soul.md에 직접 부여했을 때만 발효하는 3축 계약·denylist에서만 정지·"
+    "kill-switch 최우선 (🔒상주 필수 — 제거 금지)"
 )
 
 
@@ -2434,9 +2438,9 @@ class Preflight:
             self.add(cid, PASS, "%s self-test OK (벤더링 5상태 분류·1바이트 변이→DRIFTED 자기공격·"
                      "snapshot owner 승인게이트 박제)" % p)
 
-    # ── C52 THIRD_PARTY/NOTICE 라이선스 추적 게이트 (AGENTREACH OPP-20 — AGPL copyleft 오너 승인) ──
+    # ── C52 THIRD_PARTY/NOTICE 라이선스 추적 게이트 (AGENTREACH OPP-20 — AGPL copyleft 오너 결정) ──
     # 동일 javis_cleanroom.py self-test 가 라이선스 변이검증(MIT vendored=ACCEPT·AGPL embed=
-    # ESCALATE·unknown SPDX=BLOCK·SPDX 정규화)을 박제하나만 검증. AGPL 은 오너 승인됨 →
+    # ESCALATE·unknown SPDX=BLOCK·SPDX 정규화)을 박제하나만 검증. AGPL 은 오너 결정 대상 →
     # copyleft 추적·ESCALATE 큐잉(부트 비차단). C51 과 동일 도구라 self-test 1회로 양쪽 보증.
     def c52_license_gate(self):
         cid = "C52.license-gate"
@@ -2448,7 +2452,7 @@ class Preflight:
             return
         # C51 이 이미 self-test 를 돌렸으므로 여기선 존재만 재확인(중복 subprocess 회피·외과적).
         self.add(cid, PASS, "javis_cleanroom.py license self-test 박제 OK (MIT=ACCEPT·AGPL embed="
-                 "ESCALATE·unknown SPDX=BLOCK·정규화) — AGPL copyleft 추적(오너 승인·ESCALATE 큐잉)")
+                 "ESCALATE·unknown SPDX=BLOCK·정규화) — AGPL copyleft 추적(오너 결정·ESCALATE 큐잉)")
 
     # ── C53 관찰 명령 부작용 금지 멱등성 봉인 (AGENTREACH OPP-21) ──
     # javis_idempotency.py self-test 가 spy/AST 배터리를 결정론 실행: cmd_check 관찰멱등
@@ -2467,7 +2471,7 @@ class Preflight:
         return self._register_mcp(mcp_path, "notebooklm-mcp", "notebooklm-mcp")
 
     # ── C20 NotebookLM SOT 도구 (nlm CLI + MCP 등록 + 인증) ──
-    # 자동화 경계(오너 확정 2026-06-12): 설치·MCP 등록은 기계가 수행(--fix),
+    # 자동화 경계(제품 기본 절차): 설치·MCP 등록은 기계가 수행(--fix),
     # Google 로그인은 사람 전용 단계 — "빠진 것을 기계가 알려주는" 수준으로
     # 정확한 명령을 안내한다(부트 비차단 WARN).
     def c20_nlm_sot(self):
@@ -2524,7 +2528,7 @@ class Preflight:
         self.add(cid, FIXED if fixed else PASS,
                  "nlm %s · 인증 OK%s%s" % (ver_s, mcp_note, suffix))
 
-    # ── C21 Harness Creator 툴체인 (오너 제작 메타스킬의 도구 본체) ──
+    # ── C21 Harness Creator 툴체인 (1st-party 메타스킬의 도구 본체) ──
     # 스킬은 pack 임베드로 자동 배포 — 이 검사는 스킬이 호출하는 TOOLS_ROOT의 존재를
     # 결정론 검증하고, 신규 머신에서는 --fix가 핀 커밋을 자동 클론한다.
     @staticmethod
@@ -3214,7 +3218,7 @@ class Preflight:
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
 
-    # ── C30 git 결정론 점검 (오너 2026-06-14 — git 온보딩) ──
+    # ── C30 git 결정론 점검 (2026-06-14 — git 온보딩) ──
     # git은 기여자 clone·harness-creator(C21) 툴체인 자동설치·RSI 자기개선 push에 필요하다.
     # 일반 .dmg 사용자 기본 기능엔 불필요 → 부재는 FAIL이 아니라 WARN(기능별 필수).
     def c30_git(self):
@@ -3231,7 +3235,7 @@ class Preflight:
                      "Windows git-scm.org · Linux `apt/dnf install git`. "
                      "(일반 .dmg 사용자 기본기능엔 불필요 — 기능별 필수)")
 
-    # ── C31 config dir 격리 + 오염 감지 (오너 2026-06-15) ──
+    # ── C31 config dir 격리 + 오염 감지 (2026-06-15) ──
     # cys 마스터는 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 격리 기동돼 사용자 ~/.claude 의
     # 외부 터미널 체계·구 지침 오염에 영향받지 않는다. 이 체크는 ①격리 라우터 설치 확인 ②사용자
     # 프로필 오염 감지(경고만 — 자동삭제 절대 안 함, 사용자 데이터 불가침)다.
@@ -3311,7 +3315,7 @@ class Preflight:
         else:
             self.add(cid, PASS, "cysd 코어 파일 LOC-cap 이내(%d개 감시)" % len(caps))
 
-    # ── C55 grill-me 최소 질문 게이트 (오너 절대규칙 2026-06-27) ──
+    # ── C55 grill-me 최소 질문 게이트 (제품 절대규칙) ──
     # grill-me가 합의 전 floor(20·복잡30) 결정 브랜치를 강제 해소하도록 하는 인프라:
     # 엔진(grill_gate.py)·hook(grill-gate.sh, PreToolUse deny)·SKILL 핀(pack+메인)을 검증.
     # 등록은 결정론(마커 밖 fail-open이라 무관·무해 작업을 막지 않음 — 안전).
@@ -3379,7 +3383,7 @@ class Preflight:
                     fails.append("pack grill-me 핀 소실: %s" % "·".join(lost))
             except (OSError, UnicodeDecodeError) as e:
                 warns.append("pack grill-me 읽기 실패: %s" % e)
-        # (f) ★지침 조항 핀(오너 2026-07-16 절대규칙 드리프트 감시 — WARN 전용·자동수리 금지:
+        # (f) ★지침 조항 핀(절대규칙 드리프트 감시 — WARN 전용·자동수리 금지:
         #     *_DIRECTIVE는 guard 보호 헌법파일이라 preflight가 편집하지 않는다. 가시화만.)
         clause_pins = [
             ("MASTER_DIRECTIVE.md", ["todo 이중화"]),
@@ -4596,6 +4600,31 @@ class Preflight:
             return "/Applications/cys.app"
         return None
 
+    # ── C77 임무 게이트 (2026-08-01 실사고 T1 — 임무 없는 부팅의 자율 착수 차단) ──
+    def c77_mission_gate(self):
+        """`javis_mission.py` 는 '자율 착수해도 되는가'의 **단일 판정처**다. 이 파일이 팩에서
+        빠지면 `next-action` 이 영구 exit 3(fail-closed)으로 접혀 자율주행이 통째로 죽는다 —
+        조용한 기능 소실이므로 존재+자기검증을 결정론으로 못 박는다(누락 시 init-pack 수리)."""
+        cid = "C77.mission-gate"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_mission.py")
+        if not p:
+            return
+        # 배선 확인: next-action 이 실제로 임무 게이트를 소비하는가(도구만 있고 미배선 차단).
+        orch = os.path.join(pack_dir(), "bin", "javis_orchestra.py")
+        try:
+            src = open(orch, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            self.add(cid, FAIL, "javis_orchestra.py 판독 불가: %s" % e)
+            return
+        if "javis_mission" not in src or "return 3" not in src:
+            self.add(cid, FAIL,
+                     "next-action 이 임무 게이트를 소비하지 않는다(도구는 있으나 미배선) — "
+                     "임무 없는 부팅에서 잔무 큐 자율 착수가 되살아난다")
+            return
+        self.add(cid, PASS, "%s self-test OK + next-action 임무 게이트 배선(exit 3) 확인" % p)
+
     def c76_app_seal(self):
         cid = "C76.app-seal"
         if self.skipped(cid):
@@ -4696,6 +4725,8 @@ class Preflight:
             self.c74_brief_gate_paths, self.c75_verify_spec_rescan,
             # C76(2026-08-01 실사고 M3) — 앱 번들 코드서명 봉인. 읽기 전용·WARN-only.
             self.c76_app_seal,
+            # C77(2026-08-01 실사고 T1) — 임무 게이트 도구 존재 + next-action 배선.
+            self.c77_mission_gate,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
