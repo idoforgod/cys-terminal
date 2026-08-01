@@ -17,6 +17,18 @@
 #   잔여4 flag env override 는 GUARD_TEST_MODE 테스트 전용 — 운영은 canonical path 고정+심링크 거부
 #   잔여5 STRICT 중 python 부재/크래시 = deny-by-default(LOOSE degraded 금지)
 #
+# ★F3 회귀 3건 수리(2026-08-01 · 근거 _work/absolute-rules-audit-20260731/PERF_COMPARISON_0148_vs_0149.md §4):
+#   R-01(중대·지연) 데몬 무응답 시 판정 스톨 — LOOSE 8,084.5ms · STRICT 5,056.7ms(= 원장조회 5s +
+#        승인확인 3s **직렬 합산**). 자원 회수가 필요한 바로 그 순간 회수가 마비되는 역설.
+#        → 게이팅 경로 **전체를 합산 예산**(GATE_BUDGET_S)으로 묶고 초과 즉시 fail-closed DENY.
+#   R-05(중간·오염) 가드의 원장 조회가 죽은 데몬을 **자동기동**(cys connect → spawn_detached_daemon ·
+#        src/bin/cys.rs:1501·1535) — 실측에서 없는 소켓을 준 프로브가 cysd 1개를 띄우고 5노드를 부팅.
+#        "가드가 상태를 바꾸지 않는다"는 주석이 거짓이 되는 경로다.
+#        → 조회 전 **소켓 실재 선확인**(부재면 subprocess 자체를 띄우지 않음) + CYS_NO_AUTOSTART=1 이중봉인.
+#   R-04(중간·게이트 정확도) `--socket` 재지정 시 guard 는 언제나 **기본 데몬**을 조회 → 대상 데몬에서
+#        살아있는 노드가 기본 원장에선 안 보여 ALLOW. 현 머신 cysd 3개 동시가동 = 가설 아닌 실재 조건.
+#        → cys_sub_strict 가 --socket 값을 보존해 조회 argv(`cys --socket <v> …`)에 그대로 전달.
+#
 # ★deny = exit 2 + stderr(무조건 차단 보장) + SPEC PreToolUse JSON(stdout). exit0+JSON 은 malformed시 fail-OPEN.
 # ★fail-closed: 파싱불가·미해석·allowlist밖 → deny.
 set -u
@@ -80,7 +92,7 @@ if [ "${GUARD_TEST_MODE:-0}" != "1" ]; then
 fi
 
 IFS= read -r -d '' PYSRC <<'PY'
-import sys, json, re, unicodedata, os, shlex
+import sys, json, re, unicodedata, os, shlex, time
 
 PREFLIGHT = os.environ.get("GUARD_PREFLIGHT", "0") == "1"
 PAUSED    = os.environ.get("GUARD_PAUSED", "0") == "1"
@@ -222,6 +234,66 @@ CYS_KILL_PAUSED_DENY = ("AUTOPILOT_PAUSED: cys %s 전면 금지 — pause 중 �
                         "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
                         "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
 
+# ★R-02 부트스트랩 불가침 (2026-08-01 F2): cys 를 ALLOWLIST 에 **통째로** 등재한 부작용으로
+#   STRICT 에서 팩 자기변경 서브커맨드가 열렸다(A=0.14.8 에선 cys 가 allowlist 밖이라 전부 DENY).
+#   자율주행이 팩을 재설치·되돌릴 수 있으면 잔여3(STRICT Write/Edit guard 자기보호 trust boundary)이
+#   한 명령으로 무력화된다 — Write/Edit 로는 못 건드리는 guard.sh 를 `cys pack-update` 가 통째로
+#   갈아끼우기 때문이다. 그래서 CYS_KILL_SUBS 와 달리 대상 판정·조회 없이 **무조건 DENY** 한다.
+#   ★전수 식별(`cys --help` 실측 2026-08-01 · /usr/local/bin/cys) — 팩 파일을 쓰는 서브커맨드:
+#     · pack-update            "무중단 팩 업데이트(재시작 0) — 서명된 팩을 검증→디스크 반영→…reinject"
+#     · init-pack              "Install the CYSJavis Pack … to ~/.cys/pack"
+#     · pack-rollback          "직전 설치 보존본(<pack>.prev)에서 파일 단위 복원"
+#     · pack-downgrade-to-free "pro 팩 설치를 free(내장 팩)로 강등 — 유일한 pro→free 경로"
+#     · pack-merge             "커스터마이즈 병합 — …신버전(.new)·보존본(.user)을 검토·해소"
+#   비대상(팩 본체 쓰기 없음 → 기존대로 allow · **과차단 금지**):
+#     pack-plan("설치 **전에** 표시(쓰기 0)")·pack-ownership("소유권 등급 판정 — …결정론 조회")·
+#     pack-manifest("stdout JSON으로 방출")·pack-repair-channel(".pack-state.json(채널 상태)" 한정)·
+#     license(열쇠 번들)·doctor(--fix 도 "사용자 데이터·pack 본체·DB 미삭제").
+#   ★LOOSE(평시)는 기존대로 allow — 주인님 직접 팩 업데이트가 사람 운영 경로다(막으면 자기잠금).
+CYS_PACK_MUTATING_SUBS = {"pack-update", "init-pack", "pack-rollback",
+                          "pack-downgrade-to-free", "pack-merge"}
+CYS_PACK_DENY = ("[부트스트랩 불가침] cys %s 금지 — 팩 자기변경(guard.sh 를 포함한 팩 전체 재설치·"
+                 "복원)은 자율주행이 자기 안전장치를 갈아끼우는 경로다. 승인 경유로만 — 주인님 직접 "
+                 "실행 또는 AUTOPILOT_ACTIVE 해제 후(평시 LOOSE 는 허용).")
+
+# ★R-03 PAUSED 상한 화이트리스트 (2026-08-01 F2): `cys` 가 PAUSED readonly 집합에 **통째로** 등재된
+#   상속 결함으로 launch-agent·boot·node-recover·restore·cycle-agent·new-surface·tombstone·
+#   doctor --fix·persona set 이 pause 중에도 전부 통과했다. 규범(운영계약 v0.4 · 색인 §6 메타안전)의
+#   pause 중 허용 상한은 **관측·저장·보고·자기 프로세스 종료** 넷이므로, cys 만은 denylist 가 아니라
+#   **allowlist** 로 뒤집는다(guard 전체의 deny-by-default 철학과 같은 방향).
+#   ★각 항목 근거 = `cys --help` 실측 설명(2026-08-01 · /usr/local/bin/cys):
+#     관측 · status "T1-2 통합 관제 보드: 전 노드 상태를 1콜로" / list "List surfaces" /
+#            read-screen "Read a surface's screen (vt100-accurate)…" / identify "Identify daemon + caller" /
+#            ps "Show the process ledger" / events "Subscribe to the daemon event stream (push; no polling)" /
+#            gate-check "preflight 게이트: exit 0 = running, 4 = paused" /
+#            attest → pin "Print the current chain pin" · verify "Verify a previously saved pin
+#                     (exit 0=match, 2=mismatch)" = 두 하위 모두 출력·대조 전용(쓰기 없음)
+#     저장 · todo-path "Print (creating if absent) this surface's role-specific TODO file path"
+#            (자기 역할 todo 파일뿐 — `--role` 은 "경로 산출 전용(파일 생성·기록 없음)") /
+#            drain "살아있는 노드에 저장 신호 + 유예(best-effort drain)"(--verify 도 SESSION_STATE 확인)
+#     보고 · send "Inject text into a surface's stdin" / send-key "Inject a named key" /
+#            set-status "이 에이전트의 상태·컨텍스트%·작업을 데몬에 신고"
+#     제어 · resume "kill-switch 해제 — 동결된 큐·스케줄 재개" / pause "T4-15 kill-switch"
+#            (deny 사유가 안내하는 해제 경로는 PAUSED 에서도 도달 가능해야 한다 — 자기잠금 방지 §1-3)
+#   ★그 외 전부 DENY. 특히 실측으로 '상태를 만든다'가 확인된 것들:
+#     launch-agent "Launch an AI agent in a new role surface" · boot "Boot the standard node set" ·
+#     new-surface "Create a new surface (PTY session)" · node-recover "죽은 에이전트를 …재기동" ·
+#     restore "…죽은 역할들을 일괄 재기동" · cycle-agent "…clear→지침 재주입" ·
+#     tombstone "역할을 topology 묘비에 심는다" · doctor(--fix 수리) · persona set(오버라이드 저장) ·
+#     run "Run a command in a new process group"(임의 명령 실행) 등.
+CYS_PAUSED_OK = {"status", "list", "read-screen", "identify", "ps", "todo-path",
+                 "send", "send-key", "set-status", "resume", "pause", "gate-check",
+                 "queue", "events", "attest", "drain"}
+# 화이트리스트 안이지만 **하위 커맨드가 조회/파괴로 갈리는 것** — 조회 하위만 allow(그 외 fail-closed).
+#   queue(실측): list "List undelivered queued messages"=조회 allow /
+#                clear "Drop all undelivered queued messages for a surface"=파괴 deny
+#   attest·drain 은 하위·플래그가 전부 조회·저장이라 분리 불필요(위 근거 주석 참조).
+CYS_PAUSED_SUBSUB_OK = {"queue": {"list"}}
+CYS_PAUSED_SUB_DENY = ("AUTOPILOT_PAUSED: cys %s 금지 — pause 중 허용 상한은 **관측·저장·보고·"
+                       "자기 프로세스 종료** 넷뿐이다(cys 허용: %s). 해제는 주인님 명시 지시로만 — "
+                       "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
+                       "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
+
 SHELL_KEYWORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until",
                   "do", "done", "case", "esac", "in", "{", "}", "!", "select", "function"}
 SEPARATORS = {";", "|", "&", "&&", "||", "(", ")", "{", "}", "\n", "|&", ";;"}
@@ -279,46 +351,136 @@ def git_sub_strict(args):
     return None, []
 
 def cys_sub_strict(args):
-    """cys 서브커맨드 + 위치인자 추출(git_sub_strict 와 동일 관용구).
-    반환 (sub, positionals) · 서브커맨드 불명이면 (None, [])."""
+    """cys 서브커맨드 + 위치인자 + --socket 값 추출(git_sub_strict 와 동일 관용구).
+    반환 (sub, positionals, socket) · 서브커맨드 불명이면 (None, [], socket).
+    ★F3-R04: socket 은 **미지정이면 None**, `--socket` 이 붙었는데 값을 못 읽으면 `''`(빈 문자열)이다 —
+      빈 문자열은 '어느 데몬을 볼지 불명'이므로 호출부가 fail-closed DENY 한다(값 판독 실패=거부)."""
     i = 0
     sub = None
     pos = []
+    sock = None
     while i < len(args):
         a = args[i]
         if a.startswith("-"):
-            if "=" in a: i += 1; continue
-            if a in CYS_VAL_OPTS: i += 2; continue
+            if "=" in a:
+                k, v = a.split("=", 1)
+                if k in CYS_VAL_OPTS: sock = v            # --socket=/path/cys.sock
+                i += 1; continue
+            if a in CYS_VAL_OPTS:
+                sock = args[i+1] if i + 1 < len(args) else ""   # 값 누락 → '' = 판독 불가
+                i += 2; continue
             i += 1; continue
         if sub is None:
             sub = a
         else:
             pos.append(a)
         i += 1
-    return sub, pos
+    return sub, pos, sock
 
-def _cys_run(argv, timeout=5):
-    """cys 결정론 조회 러너 — 성공 시 stdout(str), 실패·예외·비0 exit 은 None(=fail-closed 신호).
-    ★조회는 읽기전용 서브커맨드(status/list)로만 한다 — 가드가 상태를 바꾸지 않는다."""
+# ── F3-R01: 게이팅 경로 **합산 예산** ────────────────────────────────────────────────
+# 회귀 실측(§R-01): 데몬 무응답 시 원장조회 timeout 5s + 승인확인 timeout 3s 가 직렬 합산돼
+# 판정 하나가 LOOSE 8,084.5ms · STRICT 5,056.7ms 멈췄다. 타임아웃 상수가 지배하므로 머신 성능과
+# 무관하게 재현되고, "데몬이 아플 때만" 나타나 정상 테스트에 안 걸리는 최악의 실패 양식이다.
+# → 외부 조회 **전체**를 하나의 예산으로 묶는다. 예산 초과 = 판정 불가 = 즉시 fail-closed DENY
+#   (느리게 통과시키느니 빠르게 거부한다).
+# 수치 근거(실측): 정상 경로 `cys status --json` 20~30ms · `cys list`·`approval check` <10ms.
+#   최악 산식 = 첫 조회 CAP(0.6s) + 잔여 예산(0.4s) = **BUDGET 1.0s**, 여기에 bash 프리루드·
+#   인터프리터 기동 실측 45~55ms 를 더해도 **총 1.5초 계약** 대비 ~30% 여유다(예산 시계가 python
+#   진입 시점 기준이므로 그 앞 구간은 헤드룸으로 흡수). 단일 조회 600ms 는 정상치의 20~30배라
+#   정상 경로 오탐 0 — 그보다 느린 데몬은 '아픈 데몬'이고, 그때의 DENY 는 의도된 fail-closed 다.
+GATE_BUDGET_S = 1.0      # 게이팅 1회당 외부 조회 합산 상한
+PROBE_CAP_S   = 0.6      # 단일 조회 상한(하나가 예산을 독식해 뒤 조회를 굶기지 못하게)
+MIN_SLICE_S   = 0.05     # 남은 예산이 이보다 적으면 조회를 시작하지 않는다(시작해도 무의미)
+if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_GATE_BUDGET_MS", ""):
+    try:                                                  # 테스트 전용(잔여4 GUARD_TEST_MODE 관용구)
+        GATE_BUDGET_S = float(os.environ["GUARD_TEST_GATE_BUDGET_MS"]) / 1000.0
+        PROBE_CAP_S = min(PROBE_CAP_S, GATE_BUDGET_S)
+    except Exception:
+        pass
+GATE_T0 = time.monotonic()
+
+def budget_left():
+    return GATE_BUDGET_S - (time.monotonic() - GATE_T0)
+
+def gate_timeout_deny(where):
+    """예산 초과 → 즉시 fail-closed DENY. out_deny 는 아래 '메인' 절에서 정의되지만 이 함수는
+    디스패치 시점에만 호출되므로(모듈 로드 시 아님) 이름 해석이 늦어도 안전하다."""
+    out_deny("판정 시간 초과(게이팅 합산 예산 %.2fs · %s) — 안전상 거부(fail-closed). "
+             "데몬 무응답 시 판정을 기다리지 않는다(회복 후 재시도)." % (GATE_BUDGET_S, where))
+
+# ── F3-R04/R05: 조회 대상 데몬 해석 + 소켓 실재 선확인 ───────────────────────────────
+# 해석 순서 근거(코드 실측): src/bin/cys.rs:957 `--socket` → CYS_SOCKET env 주입 ·
+# src/lib.rs:20 ENV_SOCKET="CYS_SOCKET" · src/lib.rs:26 env_compat = CYS_→JAVIS_→AITERM_ 폴백 ·
+# src/lib.rs:54 기본 = (XDG_STATE_HOME|~/.local/state)/cys/cys.sock · windows = \\.\pipe\cys.
+def cys_socket_path(explicit=None):
+    if explicit is not None:
+        return explicit
+    for k in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    if os.name == "nt":
+        return r"\\.\pipe\cys"
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "cys", "cys.sock")
+
+def socket_ready(path):
+    """★F3-R05 — 조회 **전** 소켓 실재 확인. cys 의 connect() 는 소켓이 없으면
+    spawn_detached_daemon() 으로 데몬을 자동기동한다(src/bin/cys.rs:1501·1535) — 실측에서
+    없는 소켓을 준 프로브가 cysd 를 띄우고 그 데몬이 5노드를 자동 부팅했다.
+    가드는 **관측만** 해야 하므로 부재면 조회 자체를 하지 않는다(= 상태 무변경 주석의 참값 복구)."""
+    if not path:
+        return False
+    if os.name == "nt":
+        return True     # named pipe 는 stat 계약이 달라 존재검사 생략 — CYS_NO_AUTOSTART 로 방어
+    try:
+        import stat as _stat
+        return _stat.S_ISSOCK(os.stat(path).st_mode)   # 심링크 추적 = cys connect 와 동일 관점
+    except Exception:
+        return False
+
+def _cys_exec(tail, socket=None, soft=False):
+    """cys 결정론 조회 러너 — (returncode, stdout str) · 조회 불가는 None(=fail-closed 신호).
+    tail = 서브커맨드 이하(['status','--json']) · 전역 옵션은 여기서 붙인다.
+    ★조회는 읽기전용 서브커맨드로만 한다 — 가드가 상태를 바꾸지 않는다(R-05 이중봉인:
+      소켓 실재 선확인 + CYS_NO_AUTOSTART=1 · 후자는 cys 0.14.7 바이너리에 실재하는 옵트아웃).
+    ★R-04: 해석된 소켓을 `--socket` 으로 **명시 전달** — 어느 데몬을 봤는지가 argv 에 남는다.
+    ★R-01: 남은 예산으로 timeout 을 잘라 쓰고, 예산 소진은 즉시 DENY(soft=True 면 None 반환)."""
     import subprocess
+    sock = cys_socket_path(socket)
+    left = budget_left()
+    if left <= MIN_SLICE_S:
+        if soft:
+            return None
+        gate_timeout_deny("cys " + " ".join(tail[:2]))
+    if not socket_ready(sock):
+        return None                      # 소켓 부재 = 조회 불가 → 호출부 fail-closed(데몬 기동 시도 0)
+    env = dict(os.environ)
+    env["CYS_NO_AUTOSTART"] = "1"        # stale 소켓(파일만 남고 데몬 사망)에서도 자동기동 금지
     try:
-        p = subprocess.run(argv, capture_output=True, timeout=timeout)
+        p = subprocess.run(["cys", "--socket", sock] + list(tail), capture_output=True,
+                           timeout=min(left, PROBE_CAP_S), stdin=subprocess.DEVNULL, env=env)
     except Exception:
-        return None
-    if p.returncode != 0:
-        return None
+        return None                      # 타임아웃·spawn 실패 = 조회 불가(fail-closed)
     try:
-        return (p.stdout or b"").decode("utf-8", "replace")
+        return (p.returncode, (p.stdout or b"").decode("utf-8", "replace"))
     except Exception:
         return None
 
-def cys_surfaces():
+def _cys_run(tail, socket=None):
+    """성공(exit 0) 시 stdout(str), 실패·예외·비0 exit 은 None(=fail-closed 신호) — 기존 계약 유지."""
+    r = _cys_exec(tail, socket=socket)
+    if r is None or r[0] != 0:
+        return None
+    return r[1]
+
+def cys_surfaces(socket=None):
     """`cys status --json` → surfaces[] (데몬 권위 판정). 조회·파싱 불가면 None = fail-closed 신호.
     ★javis_reap_exited.fetch_surfaces 와 동일 계약 — 화면 파싱 금지, JSON 계약만."""
     if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_CYS_STATUS", ""):
         raw = os.environ["GUARD_TEST_CYS_STATUS"]        # 테스트 전용(잔여4 GUARD_TEST_MODE 관용구)
     else:
-        raw = _cys_run(["cys", "status", "--json"])
+        raw = _cys_run(["status", "--json"], socket=socket)
     if raw is None:
         return None
     try:
@@ -328,14 +490,14 @@ def cys_surfaces():
     s = d.get("surfaces") if isinstance(d, dict) else None
     return s if isinstance(s, list) else None
 
-def cys_live_pids():
+def cys_live_pids(socket=None):
     """살아있는(exited != true) surface 의 pid 집합. 조회 불가면 None = fail-closed 신호.
     ★`cys status --json` 에는 pid 필드가 없다(실측) → pid↔surface 매핑의 유일 소스가 `cys list` 다.
       줄 형식: 'surface:238\\trole=worker\\tpid=97239\\texited=false\\t...' → 구분자 비의존 정규식으로 판독."""
     if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_CYS_LIST", ""):
         raw = os.environ["GUARD_TEST_CYS_LIST"]          # 테스트 전용
     else:
-        raw = _cys_run(["cys", "list"])
+        raw = _cys_run(["list"], socket=socket)
     if raw is None:
         return None
     live = {}
@@ -364,16 +526,21 @@ def _surface_key(tok):
         t = t.split(":", 1)[1]
     return t.strip()
 
-def cys_kill_allowed(sub, pos):
-    """오살 금지 판정 — (allow: bool, reason: str). **판정 불가는 전부 deny(fail-closed)**."""
+def cys_kill_allowed(sub, pos, socket=None):
+    """오살 금지 판정 — (allow: bool, reason: str). **판정 불가는 전부 deny(fail-closed)**.
+    ★F3-R04: socket 은 명령이 겨냥한 데몬이다 — 판정 원장은 **그 데몬**에서 읽는다."""
+    if socket is not None and not str(socket).strip():
+        return False, ("cys %s: --socket 값 판독 불가 — 어느 데몬의 원장으로 판정할지 불명 "
+                       "fail-closed. %s" % (sub, CYS_KILL_DENY_TAIL))
     if not pos:
         return False, "cys %s 대상 인자 불명(fail-closed). %s" % (sub, CYS_KILL_DENY_TAIL)
     target = pos[0]
     if sub == "close-surface":
-        surfaces = cys_surfaces()
+        surfaces = cys_surfaces(socket)
         if surfaces is None:
-            return False, ("cys close-surface: 데몬 상태 조회 실패(`cys status --json`) — "
-                           "대상 생사 판정 불가 fail-closed. %s" % CYS_KILL_DENY_TAIL)
+            return False, ("cys close-surface: 데몬 상태 조회 실패(`cys --socket %s status --json`) — "
+                           "대상 생사 판정 불가 fail-closed. %s"
+                           % (cys_socket_path(socket), CYS_KILL_DENY_TAIL))
         key = _surface_key(target)
         for s in surfaces:
             if not isinstance(s, dict):
@@ -390,10 +557,10 @@ def cys_kill_allowed(sub, pos):
     # allow 가 기본이되, 그 pid 가 **살아있는 surface 의 pid** 면 노드 오살이므로 deny.
     if not re.match(r"^\d+$", target.strip()):
         return False, "cys kill 대상 pid 판독 불가('%s') fail-closed. %s" % (target, CYS_KILL_DENY_TAIL)
-    live = cys_live_pids()
+    live = cys_live_pids(socket)
     if live is None:
-        return False, ("cys kill: surface 원장 조회 실패(`cys list`) — pid 소유 판정 불가 fail-closed. %s"
-                       % CYS_KILL_DENY_TAIL)
+        return False, ("cys kill: surface 원장 조회 실패(`cys --socket %s list`) — pid 소유 판정 불가 "
+                       "fail-closed. %s" % (cys_socket_path(socket), CYS_KILL_DENY_TAIL))
     ref = live.get(target.strip())
     if ref:
         return False, ("cys kill %s: 살아있는 surface(%s)의 pid — 노드 오살. %s"
@@ -492,9 +659,13 @@ def prog_allowed(prog, args):
         # ★오살 금지 게이팅: 종료 능력 보유 서브커맨드만 대상 생사를 결정론 조회해 판정한다.
         #   그 외 cys 서브커맨드(send·send-key·list·status·read-screen…)는 **기존과 동일하게 allow**
         #   — 노드 간 정상 통신을 막으면 오케스트레이션 자체가 죽는다(과차단 금지).
-        sub, pos = cys_sub_strict(args)
+        sub, pos, sock = cys_sub_strict(args)
         if sub in CYS_KILL_SUBS:
-            return cys_kill_allowed(sub, pos)
+            return cys_kill_allowed(sub, pos, sock)
+        # ★R-02 부트스트랩 불가침(STRICT 전용 · LOOSE 는 사람 운영 경로라 불변):
+        #   팩 자기변경은 대상·상태 판정 없이 무조건 deny(자율주행이 guard.sh 를 재설치하는 경로 봉인).
+        if sub in CYS_PACK_MUTATING_SUBS:
+            return False, CYS_PACK_DENY % sub
         return True, ""
     if prog == "find":
         if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprintf", "-fprint", "-fls") for a in args):
@@ -601,10 +772,32 @@ def cys_kill_scan(n):
         prog, args = l_cmd_word(seg)
         if prog != "cys":
             continue
-        sub, pos = cys_sub_strict(args)
+        sub, pos, sock = cys_sub_strict(args)
         if sub in CYS_KILL_SUBS:
-            return sub, pos
-    return None, []
+            return sub, pos, sock
+    return None, [], None
+
+def cys_paused_scan(n):
+    """R-03 PAUSED 진입로 — 정규화 명령문 n 의 **모든 세그먼트**에서 cys 호출을 찾아
+    화이트리스트(CYS_PAUSED_OK) 밖 서브커맨드를 돌려준다(없으면 None).
+    ★cys_kill_scan 과 같은 전(全) 세그먼트 진입로를 쓴다 — 첫 세그먼트만 보면
+      `ls ; cys launch-agent --role worker` 가 그대로 샌다(기존 PAUSED 판정의 구멍).
+    ★서브커맨드 판독 불가(`cys` 단독·옵션만)도 위반으로 본다(fail-closed · 판정 불가는 deny)."""
+    for seg in l_segments(n):
+        prog, args = l_cmd_word(seg)
+        if prog != "cys":
+            continue
+        sub, pos, _sock = cys_sub_strict(args)
+        if sub is None:
+            return "(서브커맨드 불명)"
+        if sub not in CYS_PAUSED_OK:
+            return sub
+        allowed2 = CYS_PAUSED_SUBSUB_OK.get(sub)
+        if allowed2 is not None:                      # 하위 커맨드가 조회/파괴로 갈리는 것(queue)
+            sub2 = pos[0] if pos else None
+            if sub2 not in allowed2:
+                return "%s %s" % (sub, sub2 if sub2 else "(하위 커맨드 불명)")
+    return None
 
 def loose_deny(n, n_slash=""):
     for seg in l_segments(n):
@@ -614,9 +807,9 @@ def loose_deny(n, n_slash=""):
             # ★오살 금지는 모드 무관 절대규칙 — LOOSE 도 STRICT 와 **동일 기준**(exited=true 만 allow)을
             #   같은 판정 함수로 집행한다. 그 외 cys 서브커맨드(send·list·status·read-screen…)는
             #   여기서 아무 것도 하지 않는다 = 평시 동작 완전 무변화(과차단 금지).
-            sub, pos = cys_sub_strict(args)
+            sub, pos, sock = cys_sub_strict(args)
             if sub in CYS_KILL_SUBS:
-                ok, reason = cys_kill_allowed(sub, pos)
+                ok, reason = cys_kill_allowed(sub, pos, sock)
                 if not ok:
                     return reason
         if prog == "git":
@@ -684,9 +877,17 @@ if PAUSED and not PREFLIGHT:
         #   ★이 검사가 없으면 PAUSED 가 세 모드 중 가장 느슨해진다 — `cys` 가 아래 readonly 집합에
         #     있어 `cys close-surface <살아있는 노드>` 가 PAUSED 게이트를 그대로 통과하기 때문이다.
         #   ★readonly/is_control 판정보다 **먼저** 두어 규범 사유가 그대로 회신되게 한다.
-        _psub, _ = cys_kill_scan(nl)
+        _psub, _ppos, _psock = cys_kill_scan(nl)
         if _psub:
             out_deny(CYS_KILL_PAUSED_DENY % _psub)
+        # ★R-03 pause 상한 집행(2026-08-01 F2): cys 는 **화이트리스트 방식** — 상한(관측·저장·보고·
+        #   자기 프로세스 종료) 밖 서브커맨드는 전부 deny. 아래 readonly/is_control 판정보다 **먼저**
+        #   두어야 한다 — `cys` 가 readonly 집합에 통째로 있어 그 뒤로 가면 무조건 통과해버린다
+        #   (이 상속 결함이 launch-agent·boot·node-recover·restore·cycle-agent·new-surface·
+        #    tombstone·doctor --fix·persona set 을 pause 중에도 열어둔 원인이다).
+        _bad = cys_paused_scan(nl)
+        if _bad:
+            out_deny(CYS_PAUSED_SUB_DENY % (_bad, " ".join(sorted(CYS_PAUSED_OK))))
         first = (l_cmd_word(l_segments(nl)[0]) if l_segments(nl) else (None, []))[0]
         readonly = {"ls", "cat", "head", "tail", "grep", "rg", "find", "pwd", "echo", "wc", "stat", "file",
                     "which", "ps", "df", "du", "date", "env", "git", "python3", "pytest", "shasum", "sha256sum", "jq", "cys"}
@@ -710,13 +911,17 @@ if tool == "Bash" and command:
         if r:
             # P1-2 HMAC 서명 우회: master가 서명한 명령 접두는 LOOSE deny를 우회한다.
             # cys approval check exit 0 = 서명됨 → 허용 / 미서명·cysd미가용 = fail-closed(deny 유지).
-            import subprocess
+            # ★F3-R01: 이 확인도 **같은 합산 예산** 안에서 한다(종전 timeout 3s 가 원장조회 5s 뒤에
+            #   직렬로 붙어 8.08s 스톨을 만들었다). 예산이 남지 않으면 확인을 **건너뛰고 즉시 DENY** —
+            #   원장 조회가 이미 실패한 상황이라 결론은 어차피 DENY 로 동일하다(보고서 완화책 ②).
+            # ★F3-R05: 이 경로도 cys connect → 자동기동 표면이므로 _cys_exec 의 소켓 실재 선확인·
+            #   CYS_NO_AUTOSTART 를 그대로 탄다(가드는 관측만 한다).
             try:
-                _sc = subprocess.run(["cys", "approval", "check", "--command", command,
-                                      "--cwd", os.getcwd()], capture_output=True, timeout=3).returncode
+                _cwd = os.getcwd()
             except Exception:
-                _sc = 1
-            if _sc == 0:
+                _cwd = "."
+            _ap = _cys_exec(["approval", "check", "--command", command, "--cwd", _cwd], soft=True)
+            if _ap is not None and _ap[0] == 0:
                 sys.exit(0)  # 서명됨 → LOOSE deny 우회 허용
             out_deny("[LOOSE] " + r)
 

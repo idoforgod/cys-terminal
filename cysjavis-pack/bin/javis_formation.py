@@ -13,7 +13,8 @@
   pending-cli = CLI 전무 → 빈 셸 유지(온보딩 보존·기능1).
   pending-resource = 곱셈 자원 예산 초과(hard) — 대기·자동 재시도.
 
-ensure(socket): ①cys gate-check(paused→pending 유지 종료) ②소켓키 싱글플라이트 락
+ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 · paused·판정 불능 모두
+    편성 보류 종료) ②소켓키 싱글플라이트 락
   ③probe_cli(로그인셸 우산) 역할별 CLI 판정 ③′라이브 로스터 관측·분류 — **이미 complete 면 자원
     게이트를 보지 않고 즉시 complete 기록·표면화**(신규 스폰 0 = 자원 소비 0. 구 순서는 complete 레인을
     pending-resource 로 조기 반환해 배너 소멸 신호를 영구 차단했다)
@@ -111,14 +112,101 @@ def _run(argv, timeout=30):
         return 127, "", str(e)
 
 
-# ── ① kill-switch(gate-check) ──
-def gate_check():
-    """cys gate-check → 편성 진행 허용 여부. paused(exit 4)=False(pending 유지). 데몬 부재 등
-    기타 실패는 True(보수적 진행 — 게이트 부재가 편성을 영구 봉쇄하지 않음)."""
-    code, _out, _err = _run(["cys", "gate-check"], timeout=10)
+# ── ① kill-switch(gate-check) — ★fail-closed 봉인(2026-08-01 F1 · 주인님 불변식) ──
+PAUSED_BASENAME = "AUTOPILOT_PAUSED"
+# 판정 불능일 때만 유효한 **명시 opt-in** 우회 스위치(기본 미설정 = fail-closed).
+GATE_BYPASS_ENV = "CYS_FORMATION_IGNORE_GATE"
+
+
+class _GateVerdict(int):
+    """gate_check() 반환값 — bool 처럼 쓰이면서 **보류 사유**를 함께 나른다.
+
+    종전 계약(bool)과 완전 호환이다: 진릿값이 1/0 이라 `if not gate_check():` 가 그대로 돌고,
+    True/False 를 돌려주는 기존 스텁(test_formation._ensure_harness)도 무수정 동작한다.
+    호출부는 사유를 `getattr(v, "reason", "")` 로 **선택적으로** 읽는다 — 평범한 bool 이 와도
+    빈 문자열로 안전하게 흐른다(스텁 호환의 근거).
+    ※사유를 반환값에 실은 이유: ensure 가 소비하는 seam 을 gate_check() 하나로 유지하기 위해서다.
+      별도 조회 함수를 ensure 가 직접 부르면 gate_check 스텁이 무력화돼 테스트가 라이브 데몬을
+      건드리게 된다(밀폐 파괴).
+    """
+
+    def __new__(cls, allowed, code=None, reason=""):
+        o = int.__new__(cls, 1 if allowed else 0)
+        o.allowed = bool(allowed)
+        o.code = code
+        o.reason = reason
+        return o
+
+    def __repr__(self):
+        return "<GateVerdict allowed=%r code=%r reason=%r>" % (
+            self.allowed, self.code, self.reason)
+
+
+def _truthy_env(name):
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def paused_paths():
+    """kill-switch 파일 2경로(§9-4 2중 기록 규약 — javis_wakeup·javis_cycle_autopilot 와 동일 식).
+    하나라도 존재하면 paused 다 — 데몬이 죽어 gate-check 가 응답 못 해도 정지가 관철된다."""
+    root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+    return [os.path.join(PACK_DIR, PAUSED_BASENAME),
+            os.path.join(root, "_round", PAUSED_BASENAME)]
+
+
+def _paused_file_hit():
+    """PAUSED 파일 적중 경로(문자열) 또는 None. 확인 불능(OSError)도 적중으로 본다(fail-closed)."""
+    for p in paused_paths():
+        try:
+            if os.path.exists(p):
+                return p
+        except OSError as e:
+            return "%s (확인 불능: %s)" % (p, e)
+    return None
+
+
+def _gate_verdict(code, err="", paused_file=None, bypass=False):
+    """gate 판정 **순수 함수**(subprocess·파일 접촉 0 · self-test 핀 대상).
+
+    계약(2026-08-01 F1 신):
+      PAUSED 파일 적중            → False (gate-check 결과와 무관 · 우회 불가)
+      exit 0(running)             → True  (**진행은 살아있는 허가가 있을 때만**)
+      exit 4(paused)              → False (kill-switch 존중 · 우회 불가)
+      그 외(비0·비4·타임아웃·바이너리 부재 127) → False = fail-closed
+                                    단 CYS_FORMATION_IGNORE_GATE=1 이면 True(명시 opt-in 우회)
+
+    구(폐기) 계약은 'exit 4 만 False, 그 외 전부 True(보수적 진행)' 였다 — 데몬 부재·조회 실패
+    한 번에 **일시정지 여부를 모르는 채** 노드를 기동시켰다(격리 실측: exit 3 → launch-agent 5건).
+    측정 불능은 어떤 게이트에서도 통과가 아니다.
+
+    ★우회가 '판정 불능'에만 적용되는 이유: 명시적 kill-switch(exit 4·PAUSED 파일)까지 env 로
+      풀어주면 봉인이 아니라 뒷문이 된다. 자기잠금 방지는 '모르는 상태'에서만 필요하다."""
+    if paused_file:
+        return _GateVerdict(False, 4, "kill-switch(paused) — 편성 보류(PAUSED 파일: %s)"
+                            % paused_file)
+    if code == 0:
+        return _GateVerdict(True, 0, "")
     if code == 4:
-        return False
-    return True
+        return _GateVerdict(False, 4, "kill-switch(paused) — 편성 보류(gate-check 존중 · exit 4)")
+    base = "gate-check 판정 불능(exit %s)" % code
+    tail = (err or "").strip().replace("\n", " ")[:120]
+    if tail:
+        base += " · stderr=%s" % tail
+    if bypass:
+        return _GateVerdict(True, code, base + " — %s=1 명시 우회로 진행(fail-closed 해제)"
+                            % GATE_BYPASS_ENV)
+    return _GateVerdict(False, code, base + " — 안전상 편성 보류. 데몬 확인 후 재시도"
+                        "(강제 진행: %s=1)" % GATE_BYPASS_ENV)
+
+
+def gate_check():
+    """cys gate-check → 편성 진행 허용 여부(_GateVerdict · bool 호환). 판정식은 _gate_verdict 참조.
+    PAUSED 파일이 적중하면 데몬을 조회하지 않는다(파일 존재 = paused · 데몬 무응답에도 정지 관철)."""
+    hit = _paused_file_hit()
+    if hit:
+        return _gate_verdict(4, "", hit, False)
+    code, _out, err = _run(["cys", "gate-check"], timeout=10)
+    return _gate_verdict(code, err, None, _truthy_env(GATE_BYPASS_ENV))
 
 
 # ── ② 소켓키 싱글플라이트 락(fcntl/msvcrt — cys-dept reg_upsert 패턴 재사용·Sim S2-3/S2-6) ──
@@ -539,15 +627,20 @@ def ensure(socket=None, cwd=None, force_surface=False):
     앱 부트 레인 전용. 주기 잡은 기본값 False 로 스팸 억제 계약을 유지한다). 상태 판정·기록에는
     아무 영향이 없다(INV-1: complete 는 여전히 classify()==complete 일 때만)."""
     prev = _read_state(socket)   # 전이 감지용(배너 수명 신호는 전이 시에만 표면화)
-    # ① kill-switch
-    if not gate_check():
-        # paused: 현 관측 기준 상태를 계산해 기록만(기동 없이 pending 유지).
+    # ① kill-switch — ★fail-closed(2026-08-01 F1): 허용은 exit 0 에서만, 판정 불능도 보류다.
+    gate = gate_check()
+    if not gate:
+        # 보류: 현 관측 기준 상태를 계산해 기록만(신규 기동 0 — 관측·저장·보고는 pause 중 허용 범위).
         installed = _installed_clis()
         live = _live_roles(socket) or set()
         state = classify(installed=installed, live=live, resource_ok=True)
+        # exit 4·PAUSED 파일 = 확정 정지(paused) / 그 외 = 판정 불능(gate-unknown) — 상태 문자열로 구분.
+        hold = "paused" if getattr(gate, "code", 4) == 4 else "gate-unknown"
         if state == "complete":
-            state = "partial:paused"  # paused 중엔 complete 로 승격하지 않음
-        detail = "kill-switch(paused) — 편성 보류(gate-check 존중)" + _external_note()
+            state = "partial:" + hold  # 보류 중엔 complete 로 승격하지 않음
+        # ★자기잠금 방지: 무엇에 막혔는지를 상태파일 detail 과 stdout(_cmd_ensure JSON)에 남긴다.
+        detail = (getattr(gate, "reason", "")
+                  or "kill-switch(paused) — 편성 보류(gate-check 존중)") + _external_note()
         _write_state(socket, state, detail, live)
         return state, detail
 
@@ -756,6 +849,22 @@ def self_test():
     ck(classify(installed=set(), live=set(), resource_ok=True,
                 external_roles={"master"}) == "pending-cli:cso,reviewer-codex,reviewer-gemini,worker",
        "pending-cli 역할 목록에서 외부 역할 미제외")
+    # ★kill-switch fail-closed 봉인(2026-08-01 F1) — 판정은 순수 함수 _gate_verdict 로 핀한다
+    #   (subprocess·파일 접촉 0 = 라이브 데몬 무접촉·환경 무관 결정론).
+    ck(bool(_gate_verdict(0)) is True, "exit 0(running) 인데 편성 진행 불허")
+    ck(bool(_gate_verdict(4)) is False, "exit 4(paused) 인데 편성 강행 — kill-switch 무력화")
+    for bad in (1, 2, 3, 127):
+        ck(bool(_gate_verdict(bad)) is False,
+           "exit %d(판정 불능) 을 진행 허용으로 오판 — fail-open 회귀" % bad)
+    ck(bool(_gate_verdict(3, bypass=True)) is True,
+       "%s=1 명시 우회가 동작하지 않음(자기잠금)" % GATE_BYPASS_ENV)
+    # 우회는 '판정 불능' 전용 — 확정 정지(exit 4·PAUSED 파일)를 env 로 풀면 봉인이 아니라 뒷문이다.
+    ck(bool(_gate_verdict(4, bypass=True)) is False, "우회 env 가 exit 4(paused) 까지 무력화")
+    ck(bool(_gate_verdict(0, paused_file="/x/AUTOPILOT_PAUSED", bypass=True)) is False,
+       "PAUSED 파일 적중을 gate-check exit 0·우회 env 가 덮음")
+    ck("판정 불능" in _gate_verdict(3).reason and "3" in _gate_verdict(3).reason,
+       "보류 사유(exit 코드 포함)가 detail 로 노출되지 않음 — 자기잠금 진단 불가")
+    ck(len(paused_paths()) == 2, "PAUSED kill-switch 파일 2경로 규약(§9-4) 이탈")
     # 두 경로 동등성(plan_roster)
     b, mn = plan_roster("button"), plan_roster("manual")
     ck(b.ensure_fn is mn.ensure_fn, "두 경로 ensure 수렴 실패")
@@ -765,7 +874,7 @@ def self_test():
         print("javis_formation self-test FAIL: %s" % fails, file=sys.stderr)
         return 1
     print("javis_formation self-test OK (classify 5상태·락 키 유일성·plan_roster 동등성"
-          "·external-roles 제외)")
+          "·external-roles 제외·gate fail-closed)")
     return 0
 
 
@@ -825,7 +934,10 @@ def main(argv):
                      "[--force-surface] | "
                      "classify --installed a,b --live x,y [--no-resource] | self-test\n"
                      "env: CYS_FORMATION_EXTERNAL_ROLES=<role,role> "
-                     "(외부 세션 담당 역할 — 로스터·좌석 생성에서 제외 · 기본 빈값=제외 0)\n")
+                     "(외부 세션 담당 역할 — 로스터·좌석 생성에서 제외 · 기본 빈값=제외 0)\n"
+                     "     CYS_FORMATION_IGNORE_GATE=1 "
+                     "(gate-check **판정 불능**일 때만 fail-closed 해제 · 기본 미설정=보류 · "
+                     "paused(exit 4)·PAUSED 파일은 우회 불가)\n")
     return 2
 
 

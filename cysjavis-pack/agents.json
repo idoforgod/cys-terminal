@@ -46,9 +46,9 @@
     ]
   },
   "codex": {
-    "cmd": "~/.npm-global/bin/codex --dangerously-bypass-approvals-and-sandbox",
+    "cmd": "codex --dangerously-bypass-approvals-and-sandbox",
     "inject_delay_secs": 12,
-    "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip. 홈 기반 경로(~)인 이유: brew 본 /opt/homebrew/bin/codex가 dangling symlink(Caskroom 0.76.0 타깃 소멸)라 PATH 순서·로그인셸 차이에 따라 끊긴 본을 잡을 수 있다 → npm 설치본(~/.npm-global/bin/codex)으로 고정해 회피. ~ 는 로그인셸이 전개(gemini agy 어댑터와 동일 방식). 설치 위치가 다르면 이 경로를 수정.",
+    "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip. ★경로 비의존(PATH 조회) — claude·grok 어댑터와 같은 이름 선언 형태다. 감지는 경로형이 아니면 which/where 로 해소하고(cys.rs detect_agent_binary · python detect_reviewer 의 shutil.which), 기동은 로그인셸이 PATH 로 해소하므로 npm(-g)·standalone·brew 어느 설치 방식이든 잡힌다. Windows 는 PATH 미발견 시 .cmd/.exe/.bat/.ps1 변형과 %APPDATA%\\npm·%LOCALAPPDATA%\\npm 후보를 자동 순회한다(B8). 종전에는 `~/.npm-global/bin/codex` 절대경로를 박아 두어(brew 본 /opt/homebrew/bin/codex 가 dangling symlink 였던 시기의 회피책) npm 전역 설치를 쓰지 않는 환경에서는 그 경로가 아예 없어 부트가 codex 를 통째로 건너뛰었다 — 신규 설치자 전원에게 같은 실패가 재현됐다. 특정 본을 고정해야 하면(끊긴 symlink 회피·다중 설치본 중 선택) 이 cmd 를 절대경로로 바꾸면 된다. ~ 는 로그인셸이 전개(gemini agy 어댑터와 동일 방식).",
     "clear_cmd": "/new",
     "resume_arg": "resume {session_id}",
     "resume_arg_fallback": "resume --last",
