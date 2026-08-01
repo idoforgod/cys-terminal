@@ -197,11 +197,11 @@
 
 ### 4.7 hierarchical (2단계 위임, depth ≤ 2)
 
-`_topology_addendum` 레시피(`### 토폴로지: hierarchical-delegation`): Level-1은 sub-coordinator들의 팀(`TeamCreate`). Level-2는 각 coordinator가 자신의 sub-agent를 `Agent()`로 spawn한다(팀원은 sub-agent를 spawn할 수 있으나 **팀은 중첩 불가**). **위임 깊이는 2로 제한**한다.
+`_topology_addendum` 레시피(`### 토폴로지: hierarchical-delegation`): Level-1은 sub-coordinator들의 팀(`TeamCreate`). Level-2는 각 coordinator가 자신의 sub-agent를 `Agent()`로 spawn한다(팀원은 sub-agent를 spawn할 수 있으나 **팀은 중첩 불가**). **위임 깊이는 2로 제한**한다. (★CYSjavis 현행 규범: 마스터 헌장 제8조 "위임 깊이는 1단까지만 허용하며, 받은 일을 통째로 다시 넘기는 위임은 금지한다"가 우선한다 — 이 레퍼런스의 2단은 일반론이며 본 시스템에서는 **1단이 상한**이다 · 근거 `~/.cys/pack/directives/MASTER_CHARTER.md:78` · 2026-08-01 master)
 
 - **적합:** 자연히 계층적이고 각 하위 조정자가 독립 하위 작업군을 관리할 때(대규모 데이터 파이프라인 설계).
 - **예시(8-use-case):** Data Pipeline Design — hierarchical + team.
-- **주의:** 깊이 ≤ 2 하드 제한(원본의 "3단계 이상은 지연·컨텍스트 손실" 경고 보존). 더 깊은 도메인은 평탄화하거나 2단계 sink 합성으로 근사.
+- **주의:** 깊이 ≤ 2 하드 제한(원본의 "3단계 이상은 지연·컨텍스트 손실" 경고 보존). 더 깊은 도메인은 평탄화하거나 2단계 sink 합성으로 근사. (★CYSjavis에서는 위 §4.7 본문 주석대로 **헌장 제8조의 1단이 상한**이므로 이 "≤ 2"는 적용되지 않는다 · 2026-08-01 master)
 
 ---
 

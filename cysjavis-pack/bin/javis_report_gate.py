@@ -136,10 +136,18 @@ CHANNEL_POLICY = {
 
 # 수신 계층(설계 §2 층2): push 1차 수신자는 CSO다. "critical만 master 직송"은 **허가**이지
 # 의무가 아니다 — 어느 trigger 가 master 로 직송되는지는 아래 표(데이터)가 정한다.
-#   · deadlock  → CSO 1줄 push(층2 표 명문)
-#   · stall_confirmed·death → master 직송(critical — 즉각 판단 주체가 master다)
+#   · deadlock         → CSO 1줄 push(층2 표 명문)
+#   · stall_confirmed  → CSO(2026-08-01 master 재정 ①)
+#   · death            → CSO(2026-08-01 master 재정 ①)
+#   ★2026-08-01 재정 ① — stall_confirmed·death 의 종전 `master` 직송을 **cso** 로 되돌린다.
+#     근거는 규범 "시스템·자원 사안의 1차 수신자는 CSO"(CLAUDE.md §4)의 기계 반영이다: 노드
+#     사망·확증 stall 은 전형적인 시스템·자원 사안이고, 판단 주체가 master 라는 것과 **경보를
+#     누가 먼저 받는가**는 다른 문제다(보고 사슬은 CSO→master 로 이어지므로 끊기지 않는다).
+#     부수 효과로 death:master 의 자기참조(죽은 master 에게 자기 부고 배달 → 영구 재발화)가
+#     표 층위에서 사라진다 — 다만 그것은 결과이지 이 표의 목적이 아니므로, 자기참조 차단은
+#     `_push_target(avoid=...)` 에 **독립 장치**로 남긴다(death:cso 를 막는 것이 그쪽 몫이다).
 #   CSO 부재 시에는 전부 master 폴백(M3: "CSO(부재 시 master)").
-PUSH_TARGET = {"deadlock": "cso", "stall_confirmed": "master", "death": "master"}
+PUSH_TARGET = {"deadlock": "cso", "stall_confirmed": "cso", "death": "cso"}
 
 # 전달 티어(설계 §2 층3 A3′ 상태머신):
 #   warn-tier     = enqueue 성공 시 disarm (at-most-once · 유실은 badge 가 보완)
@@ -1195,6 +1203,10 @@ def build_death_warnings(events):
             "idem": "gate-death-%s" % role,
             "badge_detail": {"role": role, "seq": ev.get("seq"), "payload": payload},
             "cooldown": DEATH_DEBOUNCE_SECS,
+            #   ★자기참조 차단 입력 — "누가 죽었는가"를 라우터까지 옮긴다. live_roles 로는 판정할
+            #     수 없다(빈 셸이 role 을 쥐면 로스터상 '생존'으로 보인다 — 실측 surface:241).
+            #     사망 당사자의 유일한 권위 판정은 deadman 이벤트의 role 이다.
+            "avoid_role": role,
         }))
     return out
 
@@ -1894,7 +1906,17 @@ class Gate:
         if not claimed:
             reasons.append("push_suppressed_seen:%s(%s)" % (trigger, rec.get("state")))
             return None
-        target, fallback = self._push_target(trigger, live_roles)
+        target, fallback = self._push_target(trigger, live_roles, w.get("avoid_role"))
+        if target is None:
+            #   수신자 = 사망 당사자인데 대체 수신자도 없다 → push 만 억제한다(ledger·EVT·badge 는
+            #   이미 이 warn 에 대해 기록됐다 = 침묵이 아니라 채널 강등). seen 을 되돌려 좌석이
+            #   복구되면 자연 재시도(enqueue 실패 경로와 동형 — 레벨 트리거의 자가치유 보존).
+            try:
+                os.unlink(seen_path(self.state_dir, key))
+            except OSError:
+                pass
+            reasons.append("push_suppressed_self_target:%s" % fallback)
+            return None
         #   ★층4 — 나가는 본문에 **판정 소스·샘플 시각·실측값**을 스탬프한다. 수신자가 "무엇을
         #     재서 그렇게 판정했는가"를 되물으러 오지 않아도 되게 하는 것이 목적이고, 사후에
         #     오발화를 역추적할 때 유일한 단서이기도 하다(설계 §2 층4).
@@ -1943,10 +1965,47 @@ class Gate:
             res = self.runner.enqueue(target, task, body, idem)
         return _rc_and_id(res)
 
-    def _push_target(self, trigger, live_roles):
-        """수신 계층 — 1차 CSO, critical 은 표에 따라 master 직송, CSO 부재 시 master 폴백."""
+    def _push_target(self, trigger, live_roles, avoid=None):
+        """수신 계층 — 1차 CSO, 표가 지정한 trigger 만 master 직송, CSO 부재 시 master 폴백.
+
+        ★자기참조 차단(2026-08-01 실사고 수리): 사망 당사자에게 그 사망 경보를 보내지 않는다.
+          종전 PUSH_TARGET["death"]="master" 는 **누가 죽었는지와 무관하게** master 직송이라,
+          death:master 가 죽은 master 자신에게 배달됐다. 좌석이 비어 배달이 성립하지 않으니
+          queue.delivered 영수증도 영영 없고, critical 은 at-least-once 라 seen 이 inflight 로
+          남아 TTL(30분)마다 재발화 → 죽은 좌석 큐에 자기 부고가 무한 적재된다.
+          라이브 실측(surface:241): 11.5h 동안 death push 23회 · queue depth 36 · 재발화 간격
+          중앙값 정확히 1800s(=SEEN_TTL_SECS).
+          재정 ①(표 → cso)로 death:master 갈래는 표 층위에서 사라졌지만, 이 장치는 **남긴다**:
+          표가 cso 를 가리키는 한 death:cso 는 같은 병을 앓고, 표는 언제든 다시 바뀐다.
+          `avoid` 는 오직 deadman 이 확증한 사망 당사자만 담는다(stall·deadlock 은 좌석이 살아
+          있어 자기수신이 곧 처방이므로 대상이 아니다 — 넘기지 않는 것이 계약이다).
+        """
         want = PUSH_TARGET.get(trigger, "cso")
-        if want == "cso" and not any(role_family(r) == "cso" for r in (live_roles or ())):
+        has_cso = any(role_family(r) == "cso" for r in (live_roles or ()))
+        want_fam = role_family(want)
+        if avoid and want_fam is not None and want_fam == role_family(avoid):
+            #   수신자 자신이 사망 당사자 → 살아있는 대체 수신자(CSO)로 이관.
+            if want != "cso" and has_cso:
+                return "cso", "self_target_avoided:%s" % avoid
+            #   대체 수신자 없음 → push 억제(호출자가 배지·EVT 로 강등). 죽은 대상 재송신 금지.
+            #   ※ master 로는 폴백하지 않는다: 재정 ① 이후 master 는 이 표의 수신처가 아니고,
+            #     `cso_absent` 폴백은 '부재'용이지 '사망 당사자 회피'용이 아니다(경보는 ledger·
+            #     EVT·badge 로 남아 master 능동 모니터링이 회수한다).
+            return None, "self_target_no_alt:%s" % avoid
+        if want == "cso" and not has_cso:
+            #   ★A4 잔존결함 수리(2026-08-01 적대검증): 이 폴백도 `avoid` 를 봐야 한다.
+            #     위 자기참조 분기는 want 가족 == avoid 가족일 때만 걸린다. want='cso' 인데
+            #     죽은 것이 master 면 가족이 달라 그 분기를 통과하고, 여기서 CSO 부재 폴백이
+            #     **죽은 master 에게 자기 부고를 배달**한다 — 위 docstring 이 닫았다고 적은
+            #     바로 그 병리(배달 불성립 → queue.delivered 영수증 영영 없음 → critical
+            #     at-least-once 라 seen 이 inflight 로 남아 SEEN_TTL_SECS(1800s)마다 재발화)가
+            #     폴백 경로로 되살아난다. 실측 재현: _push_target('death', ['worker'], 'master')
+            #     → ('master','cso_absent') · _push_target('death', [], 'master') → 동일.
+            #     처방: 폴백 수신자(master)가 사망 당사자면 push 억제(None) — 호출부의 기존
+            #     자기참조 억제 분기(seen unlink + reasons `push_suppressed_self_target`)가
+            #     그대로 받아 레벨 트리거 자가치유를 보존하고, 경보 자체는 ledger·EVT·badge 로 산다.
+            if avoid and role_family(avoid) == "master":
+                return None, "self_target_no_alt:%s" % avoid
             return "master", "cso_absent"
         return want, ""
 

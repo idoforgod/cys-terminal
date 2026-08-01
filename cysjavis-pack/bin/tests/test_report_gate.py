@@ -600,5 +600,104 @@ class C16ReportScheduleGate(unittest.TestCase):
             self.assertEqual(res["status"], "PASS", res)   # 하위호환
 
 
+class PushTargetRouting(unittest.TestCase):
+    """push 수신자 라우팅 회귀 핀 — 2026-08-01 실사고(surface:241) 수리분 잠금.
+
+    사고: `death` 가 표 층위에서 master 직송이라 **죽은 master 에게 자기 부고**가 갔다.
+    좌석이 비어 배달이 성립하지 않으니 `queue.delivered` 영수증도 영영 없고, critical 은
+    at-least-once 라 seen 이 `inflight` 로 남아 SEEN_TTL_SECS(1800s)마다 재발화한다.
+    실측: 11.5h 동안 death push 23회 · queue depth 36 · 재발화 간격 중앙값 정확히 1800s.
+
+    수리는 **두 겹**이고 두 겹 다 여기서 핀한다(한 겹만 되돌려져도 사고가 재현되므로):
+      ① 표(PUSH_TARGET) → 세 트리거 전부 cso (규범 "시스템·자원 사안의 1차 수신자는 CSO")
+      ② `avoid` 자기참조 차단 — 표가 언제 다시 바뀌어도 사망 당사자에게는 보내지 않는 독립 장치.
+         ②는 다시 두 갈래다: (가) want 가족 == avoid 가족  (나) **CSO 부재 폴백**(cso_absent).
+         (나)는 적대검증 A4 잔존결함이었다 — want='cso' 인데 죽은 것이 master 면 가족이 달라
+         (가)를 통과하고, 폴백이 그대로 master 를 돌려줬다.
+    """
+
+    def setUp(self):
+        # _push_target 은 상태 무의존 순수 라우팅 — 인스턴스 없이도 되지만 실제 바인딩을 쓴다.
+        self.g = G.Gate.__new__(G.Gate)
+
+    # ── ⓐ 표 자체(재정 ①) ──
+    def test_push_target_table_routes_all_three_triggers_to_cso(self):
+        self.assertEqual(
+            G.PUSH_TARGET,
+            {"deadlock": "cso", "stall_confirmed": "cso", "death": "cso"},
+            "표가 바뀌었다 — master 직송 복귀는 자기부고 사고(surface:241)의 1차 원인이다")
+
+    # ── ⓑ 정상 라우팅(무회귀) ──
+    def test_death_routes_to_cso_when_cso_alive(self):
+        self.assertEqual(self.g._push_target("death", ["cso", "worker"], None), ("cso", ""))
+
+    def test_death_with_dead_master_still_routes_to_live_cso(self):
+        # 죽은 것이 master 여도 CSO 가 살아 있으면 정상 수신자는 CSO 다(억제가 아니다).
+        self.assertEqual(self.g._push_target("death", ["cso", "worker"], "master"), ("cso", ""))
+
+    # ── ⓒ 자기참조 억제 — want 가족 == avoid 가족 ──
+    def test_death_of_cso_itself_is_suppressed(self):
+        self.assertEqual(self.g._push_target("death", ["cso"], "cso"),
+                         (None, "self_target_no_alt:cso"))
+
+    # ── ⓓ ★A4 잔존결함 — cso_absent 폴백도 avoid 를 봐야 한다 ──
+    def test_cso_absent_fallback_never_targets_the_dead_master(self):
+        """죽은 master + CSO 부재 → master 폴백 금지(=None). 이 핀이 A4 재현 케이스다."""
+        for live in ([], ["worker"], ["worker", "reviewer-gemini"]):
+            got = self.g._push_target("death", live, "master")
+            self.assertIsNone(
+                got[0],
+                "죽은 master 에게 자기 부고를 폴백 배달했다(live=%r) → %r" % (live, got))
+            self.assertEqual(got[1], "self_target_no_alt:master")
+
+    def test_cso_absent_fallback_to_master_preserved_when_master_alive(self):
+        """무회귀 대칭축: avoid 가 없으면 CSO 부재 폴백은 **그대로 master** 여야 한다.
+        (ⓓ를 '항상 억제'로 과잉 수리하면 CSO 부재 레인의 경보가 통째로 사라진다.)"""
+        for trig in ("death", "stall_confirmed", "deadlock"):
+            self.assertEqual(self.g._push_target(trig, ["worker"], None),
+                             ("master", "cso_absent"), trig)
+
+    def test_stall_and_deadlock_routing_unchanged(self):
+        for trig in ("stall_confirmed", "deadlock"):
+            self.assertEqual(self.g._push_target(trig, ["cso", "worker"], None), ("cso", ""), trig)
+
+    # ── ⓔ 엔드투엔드 — 억제 갈래가 seen 을 되돌리고 사유를 남기는가(자가치유 보존) ──
+    def test_suppressed_push_unlinks_seen_and_records_reason(self):
+        """None 갈래에서 seen 이 지워져야 레벨 트리거가 좌석 복구 시 자연 재시도한다.
+        seen 이 남으면 정확히 사고 당시의 병리(inflight 고착 → TTL 재발화)로 되돌아간다."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            g = gate(t, r)
+            w = {"trigger": "death", "severity": G.SEV_CRIT, "idem": "death:master",
+                 "task": "gate-death", "cooldown": 0, "avoid_role": "master",
+                 "wake_body": "master 좌석 사망 확증", "stamp": {}}
+            reasons, counters = [], {}
+            target = g._push(w, counters, 1_000_000.0, reasons, ["worker"])   # CSO 부재
+
+            self.assertIsNone(target, "죽은 master 에게 배달됐다")
+            self.assertEqual(r.enqueues, [], "억제 갈래인데 큐에 실렸다")
+            self.assertIn("push_suppressed_self_target:self_target_no_alt:master", reasons)
+            key = G.seen_key("death", "death:master", G.SEV_CRIT)
+            self.assertFalse(os.path.exists(G.seen_path(t, key)),
+                             "seen 이 남았다 — TTL(1800s)마다 재발화하는 사고 형태로 회귀한다")
+
+    def test_normal_push_still_enqueues_and_keeps_seen(self):
+        """ⓔ의 대조군 — 정상 갈래는 큐에 싣고 seen 을 유지한다(억제가 전면화되지 않았음)."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            g = gate(t, r)
+            w = {"trigger": "death", "severity": G.SEV_CRIT, "idem": "death:worker",
+                 "task": "gate-death", "cooldown": 0, "avoid_role": "worker",
+                 "wake_body": "worker 좌석 사망 확증", "stamp": {}}
+            reasons, counters = [], {}
+            target = g._push(w, counters, 1_000_000.0, reasons, ["cso", "master"])
+
+            self.assertEqual(target, "cso")
+            self.assertEqual(len(r.enqueues), 1, r.enqueues)
+            self.assertEqual(r.enqueues[0][0], "cso")
+            key = G.seen_key("death", "death:worker", G.SEV_CRIT)
+            self.assertTrue(os.path.exists(G.seen_path(t, key)))
+
+
 if __name__ == "__main__":
     unittest.main()

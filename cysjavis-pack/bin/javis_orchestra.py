@@ -41,12 +41,12 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 pipeline·cys 워커 순차 위임으로 실행(스킬 안내).
                                 exit: 0=출력 / 2=phases 비었거나 역할명 위반.
   round-init   --task T                       라운드 장부 생성
-  round-log    --task T --round N --evaluator E [--score X --verdict V | --from-cmd CMD | --verdict-json J]
+  round-log    --task T --round N --evaluator E [--verdict V | --from-cmd CMD | --verdict-json J]
                                 라운드 기록 append. --from-cmd는 기계검증 명령을 직접 실행해
                                 exit code로 verdict 자동 기록(machine 평가자 규약 — 전사 금지).
                                 exit: 0=기록(검증 통과 포함) / 1=기록됨·기계검증 실패
                                 (기록 성공≠검증 통과 — 판정의 단일 진실은 gate-status).
-  round-status --task T                       현재 라운드·10R 도달·최근 점수 결정론 판정
+  round-status --task T                       현재 라운드·10R 도달·최근 기록값 결정론 판정
   gate-status  --task T [--round N]           자율주행(앵커6 축1) 게이트 4자 수렴 결정론 판정:
                                 해당 라운드에 gemini·codex·master·machine 4평가자의 승인
                                 (PASS/수렴/approve/ok/green 접두) 기록이 전부 있어야 CONVERGED.
@@ -85,7 +85,7 @@ if _SELF_DIR not in sys.path:
 # 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
 REQUIRED_ROLES = ["cso", "worker", "reviewer-gemini", "reviewer-codex"]
 OPTIONAL_ROLES = ["reviewer-grok"]
-MAX_ROUNDS = 10  # 앵커4 5-8: 맥킨지급 도달 또는 10R 완료 시 멈춤
+MAX_ROUNDS = 10  # 마스터 헌장 제9조: 잠근 합격 기준의 미달 항목 0 또는 10R 상한 도달 시 멈춘다
 
 # ★리뷰어 슬롯 + 무구독 폴백(오너 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
 # '기본 전제'일 뿐 절대 전제가 아니다 — 사용자가 다른 임무를 줄 수도, 구독·CLI가 없을 수도 있다.
@@ -746,9 +746,14 @@ def cmd_review_prompt(args):
     lines.append("")
     lines.append("리뷰 형식: [문제점] [논쟁점] [다음 단계 조언] — 각 지적에 파일:라인 또는 구체 근거.")
     lines.append("근거 없는 인상비평·칭찬만 하는 리뷰 금지. 결함을 찾는 것이 직무다.")
+    # ★전환 게이트 §9-7-2 부수 2: 라운드 목표는 고정 향상률이 아니라 "잠근 합격 기준"이다
+    # (운영계약 §7-1 통과 조건 · §7-6 고정 향상률 문구 전면 금지). 점수(0-100)는 §6-4가
+    # 금지한다 — 평균·다수결 affordance 차단. 이 줄은 라운드 무관하게 항상 주입된다.
+    lines.append("통과 조건: **잠근 합격 기준의 미달 항목 0** — 점수(0-100)·고정 향상률 목표는 금지. "
+                 "판정은 verdict enum(ACCEPT|REVISE|BLOCK|ESCALATE) + evidence(file:line)로만 한다.")
     if rnd and rnd > 1:
-        lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 평가하고 "
-                     "**직전 점수 +10%%** 목표로 본다. 단순 코드수정이 아니라 재귀적 개선 관점으로." % rnd)
+        lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 재귀적 개선 관점에서 "
+                     "평가한다(단순 코드수정 금지). 이 라운드의 종결 조건도 위 통과 조건과 같다." % rnd)
     lines.append("회신: `cys send --queued --to master \"[리뷰] ...\"` (자동 Return 배달 — "
                  "타이핑 가드 안전·send-key 불필요).")
     print("\n".join(lines))
@@ -1253,9 +1258,11 @@ def cmd_round_init(args):
         return 0
     open(p, "w", encoding="utf-8").write(
         "# ORCHESTRATION 라운드 장부 — %s\n\n"
-        "> 절대지침 4차 5-1~5-8. 완료조건: 맥킨지급 도달(외부 리뷰어 판정) 또는 %dR 완료.\n"
-        "> 자기채점 금지 — score는 producer≠evaluator(외부 리뷰어)가 매긴다.\n\n"
-        "| 라운드 | 평가자 | 점수 | 판정 |\n|---|---|---|---|\n" % (args.task, MAX_ROUNDS)
+        "> 라운드 루프(운영계약 §6-5·§6-6). 완료조건: **잠근 합격 기준의 미달 항목 0**"
+        "(외부 리뷰어 판정) 또는 %dR 상한 도달 — 먼저 온 것이 종결 사유다.\n"
+        "> 자기채점 금지 · 점수(0-100) 금지(§6-4) — 판정은 producer≠evaluator(외부 리뷰어)의\n"
+        "> verdict enum + evidence(file:line)다. 기록값 칸은 등급이 아니라 증거 발췌다.\n\n"
+        "| 라운드 | 평가자 | 기록값 | 판정 |\n|---|---|---|---|\n" % (args.task, MAX_ROUNDS)
     )
     print("라운드 장부 생성: %s" % p)
     return 0
@@ -1270,7 +1277,10 @@ def cmd_round_log(args):
     p = round_path(args.task)
     if not os.path.exists(p):
         cmd_round_init(args)
-    score, verdict = args.score, args.verdict
+    # ★전환 게이트 §9-7-2 부수 1: --score 플래그를 제거했다(§6-4 점수 금지).
+    #   기록값 칸의 기본은 "-" 이며, --from-cmd 경로에서만 기계검증 출력 꼬리를 담는다
+    #   (등급이 아니라 증거 발췌다 — 평균·다수결 affordance 없음).
+    score, verdict = "-", args.verdict
     machine_fail = False
     # machine 평가자의 결정론 기록(앵커6 축1): --from-cmd는 기계검증 명령을 이 도구가
     # 직접 실행해 exit code로 verdict를 자동 기록한다 — master(전환 이해당사자)의
@@ -1334,7 +1344,7 @@ def cmd_round_log(args):
     with open(p, "a", encoding="utf-8") as f:
         f.write("| %d | %s | %s | %s |\n"
                 % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
-    print("기록: 라운드 %d · 평가자 %s · 점수 %s · 판정 %s"
+    print("기록: 라운드 %d · 평가자 %s · 기록값 %s · 판정 %s"
           % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
     # --from-cmd 검증 실패는 exit 1 — 기록은 성공했지만 && 체인이 "검증 통과"로
     # 오독하지 않게 한다(판정의 단일 진실은 gate-status).
@@ -1365,12 +1375,14 @@ def cmd_round_status(args):
     print("  기록된 라운드: %d / 상한 %d" % (last, MAX_ROUNDS))
     if rows:
         r = rows[-1]
-        print("  최근: 라운드 %d · 평가자 %s · 점수 %s · 판정 %s"
+        print("  최근: 라운드 %d · 평가자 %s · 기록값 %s · 판정 %s"
               % (r["round"], r["evaluator"], r["score"], r["verdict"]))
     if last >= MAX_ROUNDS:
-        print("  → %dR 상한 도달: 무한 루프 금지. 맥킨지급 미달이면 오너에게 격차 보고하라." % MAX_ROUNDS)
+        print("  → %dR 상한 도달: 무한 루프 금지. 잠근 합격 기준에 미달이면 주인님께 "
+              "격차를 보고하고 추가 라운드 여부를 여쭈어라(운영계약 §6-5)." % MAX_ROUNDS)
         return 0
-    print("  → 다음 라운드 %d 진행 가능(맥킨지급 도달 전까지). 외부 리뷰어가 +10%% 목표로 평가." % (last + 1))
+    print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
+          "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
     return 0
 
 
@@ -1466,7 +1478,7 @@ SILENT_FAILURES = [
      "kind": "deterministic"},
     {"id": "SF-ESCALATION-MISSING",
      "source": "§6 라운드 루프 8(10R escalation)",
-     "constraint": "10R 도달·맥킨지급 미달이면 무한루프 금지 + 오너 격차 보고·판단 요청 필수",
+     "constraint": "10R 도달인데 잠근 합격 기준에 미달이면 무한루프 금지 + 주인님께 격차 보고·판단 요청 필수",
      "detection": "기록 라운드>=10 AND 수렴 미달인데 SESSION_STATE에 ESCALATION 레코드+master→owner push가 없으면 위반",
      "kind": "deterministic"},
     {"id": "SF-DIRECTIVE-NOT-INJECTED",
@@ -1867,7 +1879,9 @@ def cmd_self_test(args):
         with contextlib.redirect_stdout(buf):
             cmd_review_prompt(_A())
         out = buf.getvalue()
-        for must in ("엄격 제약", "배회 금지", "문제점", "회신", "+10%"):
+        # ★전환 게이트 §9-7-2: 고정 향상률 리터럴의 "존재 필수" 검사를 새 기준으로 교체.
+        for must in ("엄격 제약", "배회 금지", "문제점", "회신",
+                     "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
         # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
         import tempfile as _tf
@@ -2420,7 +2434,7 @@ def main():
     ri = sub.add_parser("round-init"); ri.add_argument("--task", required=True)
     rl = sub.add_parser("round-log")
     rl.add_argument("--task", required=True); rl.add_argument("--round", type=int, required=True)
-    rl.add_argument("--evaluator", required=True); rl.add_argument("--score", default="-")
+    rl.add_argument("--evaluator", required=True)   # --score 제거: §6-4 점수 금지 · §9-7-2 부수 1
     rl.add_argument("--verdict", default="")
     rl.add_argument("--from-cmd", dest="from_cmd", default=None,
                     help="기계검증 명령을 직접 실행해 exit code로 verdict 자동 기록"

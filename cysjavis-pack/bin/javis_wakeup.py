@@ -27,7 +27,12 @@ enqueue 직렬화: pending 파일별 read-modify-write를 .lock 디렉터리(mkd
      (cys 없으면 unknown→배달 보류 아닌 경고 배달)
 배달은 기본 드라이런(cys send --queued 명령을 출력만). --deliver 시 실제 실행.
 
-exit codes: 0 ok · 2 usage · 5 nothing-to-do
+exit codes: 0 ok · 2 usage · **4 paused(kill-switch 로 배달 거부)** · 5 nothing-to-do
+
+★운영계약 §9-7 항목 11(v0.4):
+- `drain --deliver` 는 배달 **전에** `AUTOPILOT_PAUSED` 2경로를 확인하고, 어느 하나라도
+  존재하면 배달하지 않고 exit 4 로 거부한다(fail-closed · 확인 불능도 거부).
+- `cancel` 은 pending 을 실제로 취소·삭제한다(종전에는 취소 인터페이스 자체가 없었다).
 """
 import argparse
 import json
@@ -59,6 +64,47 @@ PENDING_DIR = os.path.join(WK_DIR, "pending")
 LEDGER = os.path.join(WK_DIR, "queue.jsonl")
 
 EXIT_OK, EXIT_USAGE, EXIT_EMPTY = 0, 2, 5
+# ★운영계약 §9-7 항목 11(a) · §9-4 · §9-1 조건③ — kill-switch 배달 차단.
+#   정지 중 `drain --deliver` 가 자율 루프를 wake 로 재점화시키는 경로를 닫는다.
+#   exit 4 는 `cys gate-check` 의 paused 코드와 같은 의미로 맞춘다(호출부 분기 일관성).
+EXIT_PAUSED = 4
+PAUSED_BASENAME = "AUTOPILOT_PAUSED"
+# 팩 경로 env 키 목록·순서는 Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS` 와 동일하다
+# (javis_orchestra·javis_report·javis_bootstrap 과 같은 목록 — 한 곳만 고치면 계약이 깨진다).
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
+def pack_dir():
+    for key in PACK_DIR_ENV_KEYS:
+        v = os.environ.get(key, "")
+        if v:
+            return v
+    return os.path.join(os.path.expanduser("~"), ".cys", "pack")
+
+
+def paused_paths():
+    """kill-switch 파일 2경로(§9-4 2중 기록 규약과 동일 판정식).
+
+    set 은 둘 다 기록하고, 확인은 **어느 하나라도 존재하면 정지**다(fail-closed).
+    """
+    return [os.path.join(pack_dir(), PAUSED_BASENAME),
+            os.path.join(ROOT, "_round", PAUSED_BASENAME)]
+
+
+def paused_evidence():
+    """(paused: bool, evidence: list[str]) — 확인 불능도 거부(정지와 동일 취급).
+
+    측정 불능을 '정지 아님'으로 읽으면 kill-switch 가 측정 실패 한 번으로
+    무력화된다 — 이 계약에서 측정 불능은 통과가 아니다.
+    """
+    hits = []
+    for p in paused_paths():
+        try:
+            if os.path.exists(p):
+                hits.append(p)
+        except OSError as e:
+            hits.append("%s (확인 불능: %s)" % (p, e))
+    return bool(hits), hits
 
 # ★T-0147-2 층1 I6 — severity 등급. 순서가 곧 계약이다(코얼레싱은 **상승만**).
 _SEV_DEFAULT = "warn"
@@ -372,6 +418,49 @@ def _bump_failcount(target, reset=False):
         return fc[target]
 
 
+def cmd_cancel(a):
+    """★운영계약 §9-7 항목 11(b) — pending wake 를 **실제로** 취소·삭제한다.
+
+    종전에는 취소 인터페이스가 없어(§11-18) "해제 전까지 drain --deliver 를 실행하지
+    않는 것"이 취소의 집행이었다 — 사람의 규율뿐이라 누군가 한 번 실행하면 끝이었다.
+
+    선택자(--target / --task / --idempotency-key) 가 하나도 없으면 거부한다 —
+    전량 취소는 **--all 명시로만** 한다(오조작 전면 삭제 차단).
+    취소는 관측·안전 조작이므로 **정지 중에도 허용**된다(재점화 위험을 줄이는 방향).
+    """
+    if not (a.target or a.task or a.idempotency_key or a.all):
+        print("usage: cancel 은 --target / --task / --idempotency-key 중 하나 이상, 또는 "
+              "--all 을 명시해야 한다(전량 오삭제 차단).", file=sys.stderr)
+        return EXIT_USAGE
+    hit = []
+    for path, rec in _iter_pending():
+        if a.target and rec.get("target") != a.target:
+            continue
+        if a.task and rec.get("task_key") != a.task:
+            continue
+        if a.idempotency_key and a.idempotency_key not in (rec.get("idempotency_keys") or []):
+            continue
+        hit.append((path, rec))
+    if not hit:
+        print("nothing to cancel")
+        return EXIT_EMPTY
+    cancelled = []
+    for path, rec in hit:
+        try:
+            os.remove(path)
+        except OSError as e:
+            print("cancel failed: %s — %s" % (rec.get("id"), e), file=sys.stderr)
+            continue
+        _ledger_append({"event": "cancelled", "target": rec.get("target"),
+                        "task_key": rec.get("task_key"), "wakeup_id": rec.get("id"),
+                        "why": a.reason or "manual cancel"})
+        cancelled.append(rec.get("id"))
+        print("cancelled: %s → %s (task=%s)"
+              % (rec.get("id"), rec.get("target"), rec.get("task_key")))
+    print(json.dumps({"cancelled": len(cancelled), "ids": cancelled}, ensure_ascii=False))
+    return EXIT_OK if cancelled else EXIT_EMPTY
+
+
 def cmd_drain(a):
     """★T-0147-2 층1 I6 — **target 별 digest 배달**(종전: pending 1건당 cys send 1회).
 
@@ -385,6 +474,19 @@ def cmd_drain(a):
         바꾸면 배달 성공이 실패로 뒤집힌다.
       · zombie 가드(G27)·fast-fail 임계(G13)·원장 마스킹(G2)·exit code 전부 유지.
     """
+    # ★운영계약 §9-7 항목 11(a): 배달 **전에** kill-switch 2경로를 확인한다.
+    #   드라이런(--deliver 없음)은 관측이므로 정지 중에도 허용한다(§9-4 허용 범위).
+    if getattr(a, "deliver", False):
+        paused, evidence = paused_evidence()
+        if paused:
+            _ledger_append({"event": "deliver_refused_paused",
+                            "target": getattr(a, "target", None), "evidence": evidence})
+            print("refused: AUTOPILOT_PAUSED — 정지 중에는 wake 를 배달하지 않는다"
+                  "(자율 루프 재점화 차단 · 운영계약 §9-4·§9-7-11). 근거: %s"
+                  % "; ".join(evidence), file=sys.stderr)
+            print(json.dumps({"delivered": 0, "skipped": 0, "refused": "paused",
+                              "evidence": evidence}, ensure_ascii=False))
+            return EXIT_PAUSED
     fastfail_max = int(os.environ.get("JAVIS_FASTFAIL_MAX", "3"))
     pending = _iter_pending()
     if a.target:
@@ -479,8 +581,21 @@ def main(argv=None):
 
     c = sub.add_parser("drain")
     c.add_argument("--target", help="특정 대상만")
-    c.add_argument("--deliver", action="store_true", help="실제 cys send 실행(기본 드라이런)")
+    c.add_argument("--deliver", action="store_true",
+                   help="실제 cys send 실행(기본 드라이런). "
+                        "AUTOPILOT_PAUSED 2경로 중 하나라도 존재하면 배달을 거부한다(exit 4)")
     c.set_defaults(fn=cmd_drain)
+
+    # ★운영계약 §9-7 항목 11(b) — pending 을 실제로 취소·삭제한다.
+    c = sub.add_parser("cancel")
+    c.add_argument("--target", help="대상(역할/노드 이름)만 취소")
+    c.add_argument("--task", help="task_key 만 취소")
+    c.add_argument("--idempotency-key", dest="idempotency_key",
+                   help="해당 멱등키를 가진 pending 만 취소")
+    c.add_argument("--all", action="store_true",
+                   help="선택자 없이 전량 취소(명시 필수 — 오삭제 차단)")
+    c.add_argument("--reason", help="취소 사유(원장 기록)")
+    c.set_defaults(fn=cmd_cancel)
 
     a = p.parse_args(argv)
     return a.fn(a)

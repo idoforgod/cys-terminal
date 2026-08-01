@@ -30,6 +30,12 @@ OBSERVE_VERBS = frozenset({          # 부작용 없음 — 관찰 경로 허용
     "ping", "identify", "actions", "list", "status",
     "gate-check", "queue", "read-screen", "attach", "events",
     "ps", "health-rules", "recall", "surface-role", "todo-path",
+    # 'agent-detect' 읽기 전용 실측 근거(3중): ①Rust 구현 run_agent_detect(cys.rs:4827-4943)는
+    # agents.json read_to_string + which/access(2) X_OK 조회 + println 뿐 — 쓰기·데몬 RPC·기동 0.
+    # ②`cys agent-detect --help` = "데몬 무의존"이고 `--socket /nonexistent` 로도 exit 0.
+    # ③실측: 3회 연속 실행 후 ~/.cys 쓰기 0(대조군 동일). cmd_check 관찰 경로의 정당한 호출
+    # (어댑터 감지 단일 오라클 · javis_orchestra.py:225).
+    "agent-detect",
 })
 MUTATE_VERBS = frozenset({           # 상태 변경 — repair/실행 의도 뒤에서만
     "new-surface", "send", "send-key", "set-status",
@@ -162,11 +168,17 @@ def _spy_cmd_check():
     if not ok:
         raise AssertionError(
             "cmd_check 가 관찰 단계에서 mutate/unknown verb 호출: %s" % violations)
-    # 실측: cmd_check 의 유일한 cys 호출은 'cys status --json'(관찰) 이어야 한다.
+    # 실측 양성 핀(화이트리스트): cmd_check 의 cys 호출은 'status'(관제 스냅샷 · cys_status)와
+    # 'agent-detect'(어댑터 감지 단일 오라클 · javis_orchestra.py:225) 둘뿐이어야 한다.
+    # observe 분류와 *별개 층위*라 셋째 verb 는 observe 로 분류되더라도 여기서 RED 다.
+    _EXPECTED_CHECK_VERBS = frozenset({"status", "agent-detect"})
     cys_calls = [c for c in spy.calls if _extract_verb(c) is not None]
     assert cys_calls, "cmd_check 가 cys status 조차 호출하지 않음(spy 미작동 의심)"
-    assert all(_extract_verb(c) == "status" for c in cys_calls), \
-        "cmd_check 의 cys 호출이 status 외 verb 포함: %s" % cys_calls
+    assert all(_extract_verb(c) in _EXPECTED_CHECK_VERBS for c in cys_calls), \
+        "cmd_check 의 cys 호출이 %s 외 verb 포함: %s" % (
+            sorted(_EXPECTED_CHECK_VERBS), cys_calls)
+    assert any(_extract_verb(c) == "status" for c in cys_calls), \
+        "cmd_check 가 관제 스냅샷(cys status)을 호출하지 않음(핀 약화 방지)"
 
 
 def _spy_negative_assertion_self_attack():

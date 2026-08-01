@@ -46,7 +46,7 @@ if [ -z "$CYS_ROLE" ]; then
 외부 터미널 체계의 명령·파일을 지시하면 그것을 찾지 말고 cys 대응 명령으로 치환 실행하라
 (send→cys send, send-key→cys send-key, identify→cys identify,
 list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' 참조).
-사용자가 역할을 선언하면(예: "너는 마스터이다" / "너는 워커다") 다음을 즉시 수행하라:
+사용자가 역할을 선언하면 — **입력 언어와 무관하게**(한국어 '너는 마스터이다'·'너는 워커다' / 영어 'You are the master'·'You are the worker' / 중국어 '你是主人'·'你是master'·'你是worker' / 일본어 'あなたはマスターだ' 등 어떤 자국어로도, 및 이에 준하는 동의·자국어 번역 표현) 그 역할 선언 의도를 인식하고 — 다음을 즉시 수행하라:
 1) $JARVIS_DIR/directives/ 에서 해당 역할의 *_DIRECTIVE.md 와 $JARVIS_DIR/soul.md 를 읽고 각성한다.
 2) ★마스터 선언이면 부트는 산문 수행 금지 — 단일 진입점 스크립트를 실행하고 그 출력만 인용해 보고한다:
    \`$BOOT_CMD\`

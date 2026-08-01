@@ -34,7 +34,10 @@ EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
 EXIT_DEGRADED = 4  # 해법④(2026-07-14 오너 승인): 미지 타입=부패 아닌 '방출자가 더 새로움' — 무음 드롭 금지
 
 WIRE_PREFIX = "[EVT v2]"
-WIRE_RE = re.compile(r"^\[EVT v[12]\]\s+(?P<type>[a-z_.]+)\s+(?P<json>\{.*\})\s*$")
+# ★v3 타입(round.closed) 추가에 따라 파서는 v3 라인도 수용한다. 방출 prefix 는 v2 유지 —
+#   hooks/fullauto/owner-active.sh 가 "[EVT v2] " 리터럴로 감지하므로 승격은 무음 파괴다
+#   (타입은 additive 이고 소비자는 prefix 가 아니라 type 으로 분기한다).
+WIRE_RE = re.compile(r"^\[EVT v[123]\]\s+(?P<type>[a-z_.]+)\s+(?P<json>\{.*\})\s*$")
 
 # spool 귀속 key(--surface): bare surface:N 또는 정식 부서 키 <slug>@surface:N (검증 확장·§4d).
 SURFACE_KEY_RE = re.compile(r"^(?:[a-z0-9_-]{1,32}@)?surface:\d{1,8}$")
@@ -106,7 +109,15 @@ SCHEMA = {
     "task.unblocked": ["task"],
     "briefing": ["counts"],
     "task_progress": ["task", "stage"],  # v2(ViMax OPP-14): 작업 내부 스테이지 — pct·detail·cost_usd_cum 선택
+    # ★v3(원자 전환 게이트 §9-7-9): 라운드 종결 전용 타입. 운영계약 §6-6 7단계의
+    #   종결 레코드를 task_progress 매핑 없이 직접 발행한다.
+    #   선택 키: revision(리뷰 대상 커밋 해시) · evaluators(배열) · unmet(미달 항목 수)
+    "round.closed": ["task", "round", "outcome"],
 }
+
+# round.closed.outcome 허용값 — 종결 사유를 산문이 아니라 enum 으로 고정한다
+# (운영계약 §7-1 통과 조건 · §6-5 상한·예산 소진 · §6-2 ESCALATE 경로).
+ROUND_CLOSED_OUTCOMES = ("criteria-met", "budget-exhausted", "escalated")
 
 SPEAK = {
     "run.queued": "{agent}의 {task} 작업이 대기열에 들어갔습니다.",
@@ -123,6 +134,7 @@ SPEAK = {
     "briefing": ("가동 {running}건, 처리할 일 {inbox}건, "
                  "승인대기 {approvals}건, 경보 {alerts}건입니다."),
     "task_progress": "{task} 작업이 {stage} 단계입니다.",
+    "round.closed": "{task}의 라운드 {round}이 종결됐습니다({outcome}).",
 }
 
 
@@ -137,6 +149,12 @@ def validate(evt_type, payload):
         return False, f"missing required keys for {evt_type}: {missing}"
     if evt_type == "agent.silent" and payload.get("level") not in ("suspicious", "critical"):
         return False, "agent.silent.level must be suspicious|critical"
+    if evt_type == "round.closed":
+        if payload.get("outcome") not in ROUND_CLOSED_OUTCOMES:
+            return False, ("round.closed.outcome must be %s"
+                           % "|".join(ROUND_CLOSED_OUTCOMES))
+        if not isinstance(payload.get("round"), int) or payload["round"] < 1:
+            return False, "round.closed.round must be a positive integer"
     if evt_type == "briefing":
         counts = payload.get("counts")
         need = ["running", "inbox", "approvals", "alerts"]
@@ -156,7 +174,7 @@ def parse_wire(line, lenient_unknown=False):
     """(evt_type, payload) 또는 ValueError. lenient_unknown=미지 타입만 통과(해법④)."""
     m = WIRE_RE.match(line.strip())
     if not m:
-        raise ValueError("not an EVT v1/v2 line")
+        raise ValueError("not an EVT v1/v2/v3 line")
     evt_type = m.group("type")
     try:
         payload = json.loads(m.group("json"))

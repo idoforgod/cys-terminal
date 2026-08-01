@@ -2,12 +2,12 @@
 # guard.sh — Autopilot 집행 hook (Claude Code PreToolUse 진입점) · R3 deny-by-default allowlist
 # SOT: _round/autopilot/SPEC.md · master 거버넌스(soul AUTONOMOUS PILOT ANCHOR 이행조건)
 #
-# ★박사님 (B') 결정: effect-denylist 는 shell Turing-complete 라 우회불가피(codex 입증)
+# ★주인님 (B') 결정: effect-denylist 는 shell Turing-complete 라 우회불가피(codex 입증)
 #   → deny-by-default allowlist parser 근본전환(Phase3 R3 "무엇만 남길까" 명령레벨 적용).
 #
 # ★모드 분리:
 #   - AUTOPILOT_ACTIVE 존재 = 자율주행 → STRICT: shlex grammar 파서, ALLOWLIST 외 전부 deny
-#   - 플래그 無 = 평시(박사님 직접작업) → LOOSE : 명백 비가역만 차단(효과기반 denylist)
+#   - 플래그 無 = 평시(주인님 직접작업) → LOOSE : 명백 비가역만 차단(효과기반 denylist)
 #   - AUTOPILOT_PAUSED 존재 = kill-switch(상위) → 비읽기 deny(autopilot.sh 도달성 예외)
 #
 # ★R3 반영(codex 재게이트 5잔여):
@@ -85,7 +85,7 @@ import sys, json, re, unicodedata, os, shlex
 PREFLIGHT = os.environ.get("GUARD_PREFLIGHT", "0") == "1"
 PAUSED    = os.environ.get("GUARD_PAUSED", "0") == "1"
 ACTIVE    = os.environ.get("GUARD_ACTIVE", "0") == "1"   # 자율주행 → STRICT
-CONST_AUTH  = os.environ.get("GUARD_CONST_AUTH", "0") == "1"   # ★박사님 직접명령 헌법편집 인가 토큰 유효(bash 계산: 토큰존재+非ACTIVE+TTL30분)
+CONST_AUTH  = os.environ.get("GUARD_CONST_AUTH", "0") == "1"   # ★주인님 직접명령 헌법편집 인가 토큰 유효(bash 계산: 토큰존재+非ACTIVE+TTL30분)
 CONST_SCOPE = os.environ.get("GUARD_CONST_SCOPE", "")          # 인가 스코프(헌법 basename 목록 또는 '*')
 
 raw = sys.stdin.read()
@@ -177,11 +177,51 @@ WRAPPERS = {"sudo", "doas", "env", "command", "exec", "nohup", "nice", "ionice",
 
 # ================= STRICT (deny-by-default allowlist) =================
 ALLOWLIST = {"ls", "cat", "head", "tail", "grep", "rg", "find", "git", "pytest",
-             "echo", "wc", "stat", "jq", "shasum", "cmux", "sed", "python3"}
+             "echo", "wc", "stat", "jq", "shasum", "cys", "sed", "python3"}
 # 가역 서브명령(add·commit·diff·log·status·stash·show·branch·restore)=git reset/restore 로 되돌림 가능 → allow.
 # ★보호파일(soul·CLAUDE·*_DIRECTIVE) basename 이 있어도 이들은 allow(staging·diff·commit 은 파일내용 변경 아님·가역) —
 #   실제 보호는 Write/Edit·redirect 차단으로(격리). push·remote·tag생성=비가역 외부발행→제외(deny). (master 결정 2026-06-07)
 GIT_OK = {"status", "log", "diff", "add", "show", "branch", "stash", "commit", "restore"}
+
+# ★오살(誤殺) 금지 기계집행 (2026-08-01): cys 는 ALLOWLIST 상 **서브커맨드 구분 없이 통째 allow**였다
+#   → STRICT 에서 `cys close-surface <살아있는 surface>` 가 무저항 통과(= 살아있는 노드 학살 경로).
+#   준거 규범: CSO_DIRECTIVE [exited surface 자동 reap] "exited=true 를 발견 즉시 --reap 로 회수" ·
+#   javis_reap_exited.py 불변식 "close-surface 는 오직 exited==true 로 수집된 ref 에만 호출된다.
+#   live(exited=false) surface 는 어떤 인자·경로로도 대상이 되지 않는다".
+#   → 산문 규범을 GIT_OK 와 같은 서브커맨드 게이팅으로 격상한다(deny-by-default 방향).
+#
+#   ★전수 식별(`cys --help` 전 서브커맨드 검토) — surface/프로세스 **종료** 능력 보유:
+#     · close-surface = "Close a surface and force-kill its entire descendant process tree"  → 게이팅
+#     · kill          = "Kill a ledger-registered process (group) by pid"                    → 게이팅
+#   비대상(종료 능력 없음 → 기존대로 allow · **과차단 금지**):
+#     send/send-key/list/status/read-screen/attach/events/identify/ps/run(자기 그룹만)/feed/
+#     queue/quiesce/watch/todo-path/surface-role/set-status/recall/skill/approval/… 전부.
+#     tombstone(=폐역 표식·`--remove` 로 가역·surface 를 죽이지 않음) · drain(저장 신호) ·
+#     cycle-agent(clear) · node-recover/restore(죽은 노드 **재기동** = 복구 경로 — 막으면 §5-6 자기잠금)
+#     는 '종료 능력' 요건 미충족이라 본 게이트 밖이다(별도 정책 층위로 남긴다).
+#
+#   ★모드 확장(2026-08-01 2차 수리 · 독립검증 갭 적발): 1차 수리는 게이팅을 **STRICT 경로에만**
+#     걸었다 → LOOSE(평시)·PAUSED 에서 `cys close-surface <살아있는 surface>` 가 그대로 통과했다.
+#     오살 금지는 모드에 딸린 편의규칙이 아니라 **모드 무관 절대규칙**이므로 판정 함수
+#     (cys_kill_allowed)를 세 경로가 **공유**한다 — 진입로(STRICT=shlex 토큰 / LOOSE·PAUSED=
+#     norm_loose 세그먼트)만 다르고 판정 기준은 하나다(단일 SOT · 기준 표류 방지).
+#     · STRICT · LOOSE : exited=true 만 allow (동일 기준)
+#     · PAUSED         : **무조건 deny** — 규범이 "pause 중 살아있는 타 노드 종료·재기동 전면 금지"·
+#                        "pause 중 허용 상한 = 관측·저장·보고·자기 프로세스 종료 넷"이라
+#                        exited=true 잔재 회수조차 pause 중엔 금지다(해제 후 하라).
+CYS_KILL_SUBS = {"close-surface", "kill"}
+# 값을 소비하는 cys 전역 옵션 — 건너뛰지 않으면 그 값이 위치인자(대상)로 오인된다.
+CYS_VAL_OPTS = {"--socket"}
+# deny 사유 공통 꼬리(주인님 가이드 문구 고정)
+CYS_KILL_DENY_TAIL = ("오살 금지 — exited=true(죽은 잔재)만 회수 가능. 강제는 승인 경유"
+                      "(주인님 승인 · `cys approval` 서명 prefix).")
+# PAUSED 전용 사유(전면 금지 · 해제 경로 안내로 자기잠금 방지)
+CYS_KILL_PAUSED_DENY = ("AUTOPILOT_PAUSED: cys %s 전면 금지 — pause 중 허용 상한은 "
+                        "관측·저장·보고·자기 프로세스 종료 넷뿐이고, **살아있는 타 노드 종료·재기동은 "
+                        "전면 금지**다. exited=true 잔재 회수도 pause 중엔 금지 — 해제 후 하라: "
+                        "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
+                        "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
+
 SHELL_KEYWORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until",
                   "do", "done", "case", "esac", "in", "{", "}", "!", "select", "function"}
 SEPARATORS = {";", "|", "&", "&&", "||", "(", ")", "{", "}", "\n", "|&", ";;"}
@@ -237,6 +277,128 @@ def git_sub_strict(args):
             i += 1; continue
         return a, args[i+1:]
     return None, []
+
+def cys_sub_strict(args):
+    """cys 서브커맨드 + 위치인자 추출(git_sub_strict 와 동일 관용구).
+    반환 (sub, positionals) · 서브커맨드 불명이면 (None, [])."""
+    i = 0
+    sub = None
+    pos = []
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-"):
+            if "=" in a: i += 1; continue
+            if a in CYS_VAL_OPTS: i += 2; continue
+            i += 1; continue
+        if sub is None:
+            sub = a
+        else:
+            pos.append(a)
+        i += 1
+    return sub, pos
+
+def _cys_run(argv, timeout=5):
+    """cys 결정론 조회 러너 — 성공 시 stdout(str), 실패·예외·비0 exit 은 None(=fail-closed 신호).
+    ★조회는 읽기전용 서브커맨드(status/list)로만 한다 — 가드가 상태를 바꾸지 않는다."""
+    import subprocess
+    try:
+        p = subprocess.run(argv, capture_output=True, timeout=timeout)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return (p.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return None
+
+def cys_surfaces():
+    """`cys status --json` → surfaces[] (데몬 권위 판정). 조회·파싱 불가면 None = fail-closed 신호.
+    ★javis_reap_exited.fetch_surfaces 와 동일 계약 — 화면 파싱 금지, JSON 계약만."""
+    if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_CYS_STATUS", ""):
+        raw = os.environ["GUARD_TEST_CYS_STATUS"]        # 테스트 전용(잔여4 GUARD_TEST_MODE 관용구)
+    else:
+        raw = _cys_run(["cys", "status", "--json"])
+    if raw is None:
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    s = d.get("surfaces") if isinstance(d, dict) else None
+    return s if isinstance(s, list) else None
+
+def cys_live_pids():
+    """살아있는(exited != true) surface 의 pid 집합. 조회 불가면 None = fail-closed 신호.
+    ★`cys status --json` 에는 pid 필드가 없다(실측) → pid↔surface 매핑의 유일 소스가 `cys list` 다.
+      줄 형식: 'surface:238\\trole=worker\\tpid=97239\\texited=false\\t...' → 구분자 비의존 정규식으로 판독."""
+    if os.environ.get("GUARD_TEST_MODE", "0") == "1" and os.environ.get("GUARD_TEST_CYS_LIST", ""):
+        raw = os.environ["GUARD_TEST_CYS_LIST"]          # 테스트 전용
+    else:
+        raw = _cys_run(["cys", "list"])
+    if raw is None:
+        return None
+    live = {}
+    rows = 0
+    for line in raw.splitlines():
+        mp = re.search(r"\bpid=(\d+)\b", line)
+        me = re.search(r"\bexited=(\w+)\b", line)
+        if not mp or not me:
+            continue
+        rows += 1
+        if me.group(1).strip().lower() == "true":        # 죽은 잔재의 pid 는 회수 대상 → live 아님
+            continue
+        mr = re.match(r"\s*(\S+)", line)
+        live[mp.group(1)] = (mr.group(1) if mr else "?")
+    # ★fail-open 봉인(자체 하네스 ⑥-b 적발): '판독 성공했고 live 0건'과 '아예 판독 불가'를 구분한다.
+    #   판독 가능한 surface 행이 **한 줄도** 없으면 형식 변경·출력 잘림·오류문구이므로 None(=deny).
+    #   빈 dict 를 그대로 돌려주면 `cys kill <살아있는 노드 pid>` 가 전부 통과한다(오살 재개통).
+    if rows == 0:
+        return None
+    return live
+
+def _surface_key(tok):
+    """'surface:238' 과 '238' 을 같은 키로 정규화(대상 지정 표기 흔들림 흡수)."""
+    t = (tok or "").strip()
+    if t.lower().startswith("surface:"):
+        t = t.split(":", 1)[1]
+    return t.strip()
+
+def cys_kill_allowed(sub, pos):
+    """오살 금지 판정 — (allow: bool, reason: str). **판정 불가는 전부 deny(fail-closed)**."""
+    if not pos:
+        return False, "cys %s 대상 인자 불명(fail-closed). %s" % (sub, CYS_KILL_DENY_TAIL)
+    target = pos[0]
+    if sub == "close-surface":
+        surfaces = cys_surfaces()
+        if surfaces is None:
+            return False, ("cys close-surface: 데몬 상태 조회 실패(`cys status --json`) — "
+                           "대상 생사 판정 불가 fail-closed. %s" % CYS_KILL_DENY_TAIL)
+        key = _surface_key(target)
+        for s in surfaces:
+            if not isinstance(s, dict):
+                continue
+            if _surface_key(str(s.get("surface_ref") or "")) != key and str(s.get("surface_id")) != key:
+                continue
+            if s.get("exited") is True:   # ★엄격 bool 비교(truthy 오염 차단 · reap 도구 불변식과 동일)
+                return True, ""
+            return False, ("cys close-surface %s: 대상이 **살아있다**(exited=false · role=%s). %s"
+                           % (target, s.get("role"), CYS_KILL_DENY_TAIL))
+        return False, ("cys close-surface %s: 데몬 원장에 없는 대상 — 생사 판정 불가 fail-closed. %s"
+                       % (target, CYS_KILL_DENY_TAIL))
+    # sub == "kill": 원장 프로세스(서버 잔재) 정리는 정당한 자원 거버넌스(§5-1 `cys ps`·`cys kill`)라
+    # allow 가 기본이되, 그 pid 가 **살아있는 surface 의 pid** 면 노드 오살이므로 deny.
+    if not re.match(r"^\d+$", target.strip()):
+        return False, "cys kill 대상 pid 판독 불가('%s') fail-closed. %s" % (target, CYS_KILL_DENY_TAIL)
+    live = cys_live_pids()
+    if live is None:
+        return False, ("cys kill: surface 원장 조회 실패(`cys list`) — pid 소유 판정 불가 fail-closed. %s"
+                       % CYS_KILL_DENY_TAIL)
+    ref = live.get(target.strip())
+    if ref:
+        return False, ("cys kill %s: 살아있는 surface(%s)의 pid — 노드 오살. %s"
+                       % (target, ref, CYS_KILL_DENY_TAIL))
+    return True, ""
 
 def sed_has_write(args):
     # ★R6 근본전환(codex 권고·보수적 deny): sed 옵션을 정밀 파싱 — 안전옵션(read-only)만 허용하고
@@ -325,6 +487,14 @@ def prog_allowed(prog, args):
             return False, "git commit --amend (히스토리 변경) 금지"
         # ★git add 헌법파일 stage 는 가역(git reset 언스테이지)이라 allow — 차단하면 master 정당커밋 막힘.
         #   보호는 Write/Edit·redirect 차단으로 격리(staging 은 파일내용 변경 아님). (master 결정 2026-06-07 오탐수정)
+        return True, ""
+    if prog == "cys":
+        # ★오살 금지 게이팅: 종료 능력 보유 서브커맨드만 대상 생사를 결정론 조회해 판정한다.
+        #   그 외 cys 서브커맨드(send·send-key·list·status·read-screen…)는 **기존과 동일하게 allow**
+        #   — 노드 간 정상 통신을 막으면 오케스트레이션 자체가 죽는다(과차단 금지).
+        sub, pos = cys_sub_strict(args)
+        if sub in CYS_KILL_SUBS:
+            return cys_kill_allowed(sub, pos)
         return True, ""
     if prog == "find":
         if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprintf", "-fprint", "-fls") for a in args):
@@ -422,32 +592,55 @@ def l_fileop_allowed(args):
             return False
     return True
 
+def cys_kill_scan(n):
+    """LOOSE/PAUSED 진입로 — 정규화 명령문 n 의 **모든 세그먼트**에서 종료능력 cys 서브커맨드를
+    찾아 (sub, positionals) 를 돌려준다(없으면 (None, [])).
+    ★첫 세그먼트만 보면 `ls ; cys close-surface 238` 이 샌다(PAUSED 기존 판정은 첫 세그먼트만 본다).
+      이 스캔은 close-surface/kill **두 서브커맨드에만** 작용하므로 다른 명령의 판정은 불변이다."""
+    for seg in l_segments(n):
+        prog, args = l_cmd_word(seg)
+        if prog != "cys":
+            continue
+        sub, pos = cys_sub_strict(args)
+        if sub in CYS_KILL_SUBS:
+            return sub, pos
+    return None, []
+
 def loose_deny(n, n_slash=""):
     for seg in l_segments(n):
         prog, args = l_cmd_word(seg)
         if prog is None: continue
+        if prog == "cys":
+            # ★오살 금지는 모드 무관 절대규칙 — LOOSE 도 STRICT 와 **동일 기준**(exited=true 만 allow)을
+            #   같은 판정 함수로 집행한다. 그 외 cys 서브커맨드(send·list·status·read-screen…)는
+            #   여기서 아무 것도 하지 않는다 = 평시 동작 완전 무변화(과차단 금지).
+            sub, pos = cys_sub_strict(args)
+            if sub in CYS_KILL_SUBS:
+                ok, reason = cys_kill_allowed(sub, pos)
+                if not ok:
+                    return reason
         if prog == "git":
             sub, subargs = l_git_sub(args)
-            if sub == "push": return "git push (외부발행=비가역). 박사님 승인 필요"
+            if sub == "push": return "git push (외부발행=비가역). 주인님 승인 필요"
             if sub == "remote" and any(x in subargs for x in ("set-url", "add", "remove", "rm", "rename")):
-                return "git remote set-url/add/remove/rename (발행대상 변경). 박사님 승인 필요"
+                return "git remote set-url/add/remove/rename (발행대상 변경). 주인님 승인 필요"
             if sub == "tag":
                 create = any(x in subargs for x in ("-a", "-s", "-d", "-f", "-m")) or any(not x.startswith("-") for x in subargs)
                 if create and not any(x in subargs for x in ("-l", "--list", "-n")):
-                    return "git tag 생성/삭제. 박사님 승인 필요"
+                    return "git tag 생성/삭제. 주인님 승인 필요"
         if prog == "gh":
             if "release" in args and any(x in args for x in ("create", "upload", "delete", "edit")):
-                return "gh release 발행. 박사님 승인 필요"
+                return "gh release 발행. 주인님 승인 필요"
             if "pr" in args and any(x in args for x in ("create", "merge")):
-                return "gh pr create/merge. 박사님 승인 필요"
+                return "gh pr create/merge. 주인님 승인 필요"
         if prog in ("rm", "rmdir", "mv", "truncate", "chmod", "chown"):
             if not l_fileop_allowed(args):
-                return "%s (비가역 파일연산). _round/autopilot/ 외 → 박사님 승인 필요" % prog
+                return "%s (비가역 파일연산). _round/autopilot/ 외 → 주인님 승인 필요" % prog
         if prog == "scp":
-            return "scp (외부전송). 박사님 승인 필요"
+            return "scp (외부전송). 주인님 승인 필요"
         if prog == "rsync":
             if any(("@" in a) or re.match(r"^[^/\-][^/]*:", a) or "::" in a for a in args):
-                return "rsync 원격전송. 박사님 승인 필요"
+                return "rsync 원격전송. 주인님 승인 필요"
         if prog in ("curl", "wget"):
             up = False
             if prog == "curl":
@@ -460,7 +653,7 @@ def loose_deny(n, n_slash=""):
             else:
                 up = any(a.startswith("--post-data") or a.startswith("--post-file") or a.startswith("--method=post") for a in (x.lower() for x in args))
             if up:
-                return "%s 업로드/POST (외부전송). 박사님 승인 필요" % prog
+                return "%s 업로드/POST (외부전송). 주인님 승인 필요" % prog
     # G18: 두 정규화 변형(백슬래시 삭제형 + 슬래시 변환형)의 토큰을 합쳐 보호파일을 스캔한다.
     alltoks = n.split() + (n_slash.split() if n_slash else [])
     if any(protected(t) for t in alltoks):
@@ -479,16 +672,34 @@ def out_deny(reason):
 
 if PAUSED and not PREFLIGHT:
     if tool in WRITE_TOOLS:
-        out_deny("AUTOPILOT_PAUSED (박사님 kill-switch): 쓰기 도구 차단. `autopilot.sh resume` 필요")
+        out_deny("AUTOPILOT_PAUSED (주인님 kill-switch · 호칭 정의처=마스터 헌장 제1조): "
+                 "쓰기 도구 차단. 해제는 주인님 명시 지시로만 — ①`cys resume` "
+                 "②AUTOPILOT_PAUSED 파일 2곳 제거($PACK/AUTOPILOT_PAUSED · "
+                 "<프로젝트루트>/_round/AUTOPILOT_PAUSED)")
     if tool == "Bash":
         nl = norm_loose(command); ntok = nl.split()
+        # ★PAUSED 상한(운영계약 v0.4 · 색인 §6 자율주행 메타안전): "pause 중 허용 범위 상한은
+        #   관측·저장·보고·자기 프로세스 종료 넷"이며 "살아있는 타 노드 종료·재기동 pause 중 전면 금지".
+        #   → close-surface/kill 은 **exited=true 여도 무조건 deny**(회수는 해제 후).
+        #   ★이 검사가 없으면 PAUSED 가 세 모드 중 가장 느슨해진다 — `cys` 가 아래 readonly 집합에
+        #     있어 `cys close-surface <살아있는 노드>` 가 PAUSED 게이트를 그대로 통과하기 때문이다.
+        #   ★readonly/is_control 판정보다 **먼저** 두어 규범 사유가 그대로 회신되게 한다.
+        _psub, _ = cys_kill_scan(nl)
+        if _psub:
+            out_deny(CYS_KILL_PAUSED_DENY % _psub)
         first = (l_cmd_word(l_segments(nl)[0]) if l_segments(nl) else (None, []))[0]
         readonly = {"ls", "cat", "head", "tail", "grep", "rg", "find", "pwd", "echo", "wc", "stat", "file",
-                    "which", "ps", "df", "du", "date", "env", "git", "python3", "pytest", "shasum", "sha256sum", "jq", "cmux"}
-        is_control = "autopilot.sh" in nl
+                    "which", "ps", "df", "du", "date", "env", "git", "python3", "pytest", "shasum", "sha256sum", "jq", "cys"}
+        # ★자기잠금 방지(운영계약 §1-3 준용): deny 메시지가 안내하는 해제 경로는 PAUSED
+        #   상태에서도 도달 가능해야 한다. 존재하지 않는 스크립트 대신 실재 해제 명령
+        #   (`cys resume`·`cys pause`·`cys gate-check`)만 통제 명령으로 인정한다.
+        is_control = bool(re.match(r"\s*cys\s+(resume|pause|gate-check)\b", nl))
         has_redirect = (">" in ntok) or (">>" in ntok) or any(w.startswith(">") for w in ntok)
         if not is_control and (has_redirect or first not in readonly):
-            out_deny("AUTOPILOT_PAUSED: 비읽기 Bash 차단(%s). `autopilot.sh resume` 필요" % (first or "?"))
+            out_deny("AUTOPILOT_PAUSED: 비읽기 Bash 차단(%s). 해제는 주인님 명시 지시로만 — "
+                     "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
+                     "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)"
+                     % (first or "?"))
 
 if tool == "Bash" and command:
     if ACTIVE:
@@ -511,14 +722,14 @@ if tool == "Bash" and command:
 
 if tool in WRITE_TOOLS and file_path:
     if protected(file_path):
-        # ★박사님 인가 루트(2026-06-07 박사님 제정): 박사님 직접명령('헌법에 넣어라'·'절대규칙에 기록')→
+        # ★주인님 인가 루트(2026-06-07 주인님 제정): 주인님 직접명령('헌법에 넣어라'·'절대규칙에 기록')→
         #   master가 CONSTITUTION_EDIT_AUTHORIZED 토큰(스코프=헌법 basename 또는 '*') 생성→해당 파일 헌법편집 인가.
         #   ★autopilot(ACTIVE) 중엔 CONST_AUTH=0 강제(bash)=자율주행 자기인가·실수 차단 · TTL30분 · master 편집 직후 토큰 제거(단일배치).
         _scope_toks = (CONST_SCOPE.splitlines()[0].lower().split() if CONST_SCOPE.strip() else [])  # ★스코프=첫 줄 토큰만(주석의 * 오인 차단)·정확매칭
         if CONST_AUTH and (("*" in _scope_toks) or (basename(file_path).lower() in _scope_toks)):
-            sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(박사님 직접명령 토큰·%s)\n" % basename(file_path))
+            sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(주인님 직접명령 토큰·%s)\n" % basename(file_path))
         else:
-            out_deny("헌법파일(%s) %s 차단. 변경 불가 (박사님 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
+            out_deny("헌법파일(%s) %s 차단. 변경 불가 (주인님 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
     if ACTIVE and guard_infra(file_path):   # 잔여3: STRICT trust boundary
         out_deny("[STRICT] guard 인프라(%s) %s 차단(자기보호 trust boundary)" % (basename(file_path), tool))
 
@@ -529,7 +740,7 @@ PY
 GUARD_PAUSED=0; [ -e "$PAUSED_FILE" ] && GUARD_PAUSED=1
 GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 
-# ★박사님 직접명령 헌법편집 인가 토큰(2026-06-07): 非ACTIVE + 토큰존재(비심링크) + TTL 30분 → CONST_AUTH=1·스코프 전달
+# ★주인님 직접명령 헌법편집 인가 토큰(2026-06-07): 非ACTIVE + 토큰존재(비심링크) + TTL 30분 → CONST_AUTH=1·스코프 전달
 GUARD_CONST_AUTH=0; GUARD_CONST_SCOPE=""
 CONST_TOKEN="$SCRIPT_DIR/CONSTITUTION_EDIT_AUTHORIZED"
 if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" ]; then
@@ -547,10 +758,10 @@ run_loose_backstop() {
   low="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z' | tr -s ' \t' ' ')"
   case "$low" in
     *"git push"*|*"git remote set-url"*|*"git remote remove"*|*"gh release create"*|*"gh pr create"*|*"scp "*)
-      emit_deny "백스톱: 비가역 명령. 박사님 승인 필요" ;;
+      emit_deny "백스톱: 비가역 명령. 주인님 승인 필요" ;;
   esac
   if printf '%s' "$low" | grep -Eq '(^| )rm +-[a-z]*[rf]|(^| )(rmdir|chmod|chown|truncate) '; then
-    case "$low" in *"_round/autopilot/"*) : ;; *) emit_deny "백스톱: 파괴적 파일연산. 박사님 승인 필요" ;; esac
+    case "$low" in *"_round/autopilot/"*) : ;; *) emit_deny "백스톱: 파괴적 파일연산. 주인님 승인 필요" ;; esac
   fi
   case "$(basename "$fp" 2>/dev/null | tr 'A-Z' 'a-z')" in
     soul.md|claude.md|*_directive.md) emit_deny "백스톱: 헌법파일 쓰기. 변경 불가" ;;
