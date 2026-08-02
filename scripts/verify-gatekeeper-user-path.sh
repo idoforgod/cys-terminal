@@ -265,7 +265,11 @@ make_probe() {  # $1 = 태그 → 표준출력으로 경로
   cp -R "$APP_SRC" "$p" >"$WORK/probe.$1.log" 2>&1 || return 1
   printf '%s' "$p"
 }
-find_py() { find "$1/Contents" -type f -perm +111 -name 'python3' -print -quit 2>/dev/null; }
+# ★탐색 술어(2026-08-02 수정): 228b930 이 python3 을 python3.12 심링크로 복원 → `-type f` 가
+#   인터프리터를 놓쳐 ⑥ 이 측정 불능=FAIL 로 접혔다. 심링크도 후보로 잡되, 해석 후 정규파일이며
+#   실행 가능([ -f ]·[ -x ] 는 링크를 따라간다)일 때만 채택 — 끊긴 링크는 여전히 미발견=FAIL
+#   (fail-closed 보존). ⑥ 판정식·PYC 계수·codesign 호출은 건드리지 않았다.
+find_py() { local p; p="$(find "$1/Contents" \( -type f -o -type l \) -perm +111 -name 'python3' -print -quit 2>/dev/null)"; [ -f "$p" ] && [ -x "$p" ] && printf '%s' "$p"; }
 
 PROBE_A="$(make_probe a || true)"
 if [ -z "$PROBE_A" ] || [ ! -d "$PROBE_A" ]; then
