@@ -70,3 +70,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography",  # R-CLI-1: BCryptGenRandom(CNG CSPRNG) — 브리지 토큰 예측가능 폴백 제거
     "Win32_System_Registry",    # ★stale PATH: RegGetValueW(HKLM/HKCU Environment\Path 신선 재합성)
 ] }
+
+# Windows 전용(호스트 게이트): cys.exe·cysd.exe(순수 Rust CLI)에 PE 버전리소스·매니페스트·아이콘을
+# 임베드해 Microsoft Defender ML 평판을 정상화한다(무인증서·사용자 무조치). .rsrc 섹션이 아예 없는
+# 무버전·무매니페스트·무아이콘 바이너리는 SmartScreen/ML 평판이 낮다. winresource는 rc.exe/windres를
+# 호출하는 경량 빌드 도구(런타임 크레이트 링크 없음). ★이 build-dep는 cfg(windows) 호스트 게이트라
+# macOS/Linux 호스트 빌드는 아예 당기지 않아 산출 바이너리 바이트 무영향. cys 릴리스의 Windows 레그는
+# 전부 windows-latest 네이티브(host==target)이므로 host 기준 게이트로 충분하다.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

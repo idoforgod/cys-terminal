@@ -137,6 +137,72 @@ fn main() {
     );
     fs::write(Path::new(&out_dir).join("license_revoked.rs"), revoked_code)
         .expect("license_revoked.rs 생성 실패");
+
+    // ── Windows 전용: PE 버전리소스(VERSIONINFO)·매니페스트·아이콘 임베드 ──
+    // 목적: cys.exe·cysd.exe(순수 Rust CLI)에 .rsrc 섹션을 부여해 Microsoft Defender ML/SmartScreen
+    // 평판을 정상화한다(무인증서·사용자 무조치). cys-app.exe(tauri-winres)는 이미 3종을 임베드해
+    // 생존하나 루트 CLI 2종은 무버전·무매니페스트·무아이콘이라 평판이 낮았다.
+    // ★게이트: 이 블록·winresource build-dep 모두 cfg(windows) 호스트 게이트다. build.rs는 호스트에서
+    //   컴파일·실행되므로 #[cfg(target_os="windows")]는 호스트를 뜻한다 — cys의 모든 Windows 빌드 레그는
+    //   windows-latest 네이티브(host==target=x86_64-pc-windows-msvc)라 host 게이트로 정확히 일치한다.
+    //   macOS/Linux 호스트에선 winresource를 당기지도, 이 코드를 컴파일하지도 않아 바이트 무영향.
+    #[cfg(target_os = "windows")]
+    embed_windows_resources();
+}
+
+/// Windows PE 리소스(VERSIONINFO/manifest/icon)를 크레이트의 모든 bin(cys·cysd)에 임베드한다.
+/// winresource::compile()은 `cargo:rustc-link-lib`/`cargo:rustc-link-search`를 방출하며, 이는 크레이트의
+/// 모든 바이너리 타깃(cys·cysd)에 동일 리소스를 링크한다. winresource엔 per-bin `compile_for`가 없고
+/// `write_resource_file`은 .rc 소스만 써서 링크 불가라, per-bin FileDescription 분리는 링크 위험 대비
+/// 실익이 없어 미채택(공유 리소스로 두 bin 모두 버전·매니페스트·아이콘을 획득 — 목표 충족).
+#[cfg(target_os = "windows")]
+fn embed_windows_resources() {
+    use winresource::WindowsResource;
+
+    // 아이콘 재사용(tauri와 동일 SOT). 부재 시 무아이콘 출하(목표 미달)를 조용히 넘기지 않고 빌드 중단.
+    let icon = "src-tauri/icons/icon.ico";
+    assert!(
+        Path::new(icon).exists(),
+        "Windows 리소스 임베드용 아이콘 부재: {icon}"
+    );
+    println!("cargo:rerun-if-changed={icon}");
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // 최소 app.manifest: requestedExecutionLevel=asInvoker(권한 상승 없음) + comctl32 v6 assemblyIdentity.
+    const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="cysjavis.cys" version="0.0.0.0" processorArchitecture="*"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
+"#;
+
+    // 버전 문자열 SOT = Cargo.toml package.version. WindowsResource::new()이 CARGO_PKG_VERSION_*에서
+    // FileVersion/ProductVersion을 자동 채우지만, 빌드 스크립트 런타임 env에서 명시로 다시 못박아
+    // 하드코딩을 배제하고 SOT 연동을 분명히 한다.
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION 없음");
+
+    let mut res = WindowsResource::new();
+    res.set_icon(icon)
+        .set("ProductName", "cys")
+        .set("CompanyName", "cysjavis")
+        .set("LegalCopyright", "Copyright (c) cysjavis — MIT License")
+        .set("FileDescription", "cys command line / cys daemon (CYSJavis terminal)")
+        .set("FileVersion", &version)
+        .set("ProductVersion", &version)
+        .set_manifest(MANIFEST);
+    res.compile()
+        .expect("Windows 리소스 컴파일 실패(rc.exe 부재?) — PE 메타데이터 임베드 불가");
 }
 
 /// tauri.conf.json 등에서 `"key": "value"` 첫 매치의 value를 추출(JSON 파서 build-dep 없이).
