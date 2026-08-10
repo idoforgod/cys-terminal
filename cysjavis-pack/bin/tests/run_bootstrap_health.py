@@ -2728,9 +2728,20 @@ def h_win_5():
                 d = os.path.dirname(src)
                 if d not in dirs and shutil.which("python3", path=d) is None:
                     dirs.append(d)
-            pydir = os.path.dirname(os.path.abspath(PY))
+            # ★python 은 venv 로 공급한다(run 31404416739 실측): 실 설치 디렉터리는 setup-python
+            #   이 python3.exe 를 함께 두어 격리 전제(python3 부재)가 구성 불가였다. Windows venv
+            #   의 Scripts 는 python.exe/pythonw.exe 만 만들고(런처가 pyvenv.cfg 로 base 를 해소
+            #   — DLL·stdlib 상대 해소 무손상), python3.exe 는 만들지 않는다 — 'python 만 있는
+            #   PATH' 를 표준 라이브러리 수단으로 정확히 재현한다.
+            venv_dir = os.path.join(tmp, "pyvenv")
+            rv = _run([PY, "-m", "venv", "--without-pip", venv_dir], timeout=180)
+            need(rv.returncode == 0,
+                 "nt 격리용 venv 생성 실패(rc=%d): %r" % (rv.returncode, rv.stderr[-200:]))
+            pydir = os.path.join(venv_dir, "Scripts")
+            need(shutil.which("python", path=pydir) is not None,
+                 "venv Scripts 에 python 이 없다: %s" % pydir)
             need(shutil.which("python3", path=pydir) is None,
-                 "실 python 디렉터리(%s)가 python3 를 노출 — nt 격리 PATH 전제 구성 불가" % pydir)
+                 "venv Scripts 가 python3 를 노출 — nt 격리 PATH 전제 구성 불가")
             iso_path = os.pathsep.join(dirs + [pydir])
         else:
             _w(os.path.join(binp, "python"), '#!/bin/sh\nexec "%s" "$@"\n' % real)
