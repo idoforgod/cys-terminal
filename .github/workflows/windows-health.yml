@@ -41,7 +41,13 @@ jobs:
       #   reconfigure 가드와 이중 수리 — 잡의 모든 python 단계(--json 재실행·요약 인라인 포함)를 덮는다.
       PYTHONUTF8: '1'
     steps:
+      # ★fetch-depth 0(2026-08-10 W-C · run 31396459407): H-WIN-5 의 계측기 자기검증은
+      #   calibration ref(a96d8b1 등)의 실체를 요구한다 — 기본 shallow checkout 은 ref 부재로
+      #   구 인벤토리 산출 0 → hard fail. 전체 이력을 받으면 다른 검체의 skip(no-git) 계측
+      #   대조도 실측정으로 승격된다(부수 이득).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # 러너는 stdlib 전용(네트워크 0)이라 별도 의존성 설치가 없다. 3.12 = 동봉 embeddable
       # 런타임(python-3.12.10-embed-amd64)과 같은 마이너로 맞춘다(실기 환경 근접).

@@ -73,10 +73,12 @@
 #    실측으로 "[wakeup] 너는 마스터다 - 다음 액션 확인" 이 오너 개입 0 으로 팀 스폰을 발화했다
 #    (P3 적대검증). 그래서 DETECT 발화 판정 **직후·spawn 이전**에 판별 소유자(javis_mission
 #    층1 배달 원장 해시 대조·층2 push 라벨)의 판정 전용 서브커맨드 `machine-origin` 을 소비한다
-#    (셸 재구현 금지 — 판별 사본은 반드시 낡는다 · 무기록·무부작용): exit 0=기계 유래 →
-#    **무스폰**+정직 고지 / 1=오너 타이핑 간주 → 종전 D4-a′ 경로 그대로 spawn / 그 외(2·124·
-#    127)·모듈 부재=판정 불가 → **fail-closed 무스폰**+loud(A5·A22 와 같은 방향 — 무단 스폰이
-#    판정 보류보다 나쁘다).
+#    (셸 재구현 금지 — 판별 사본은 반드시 낡는다 · 무기록·무부작용). ★판정의 1차 근거는 stdout
+#    판정 토큰이다(2026-08-10 W-B — Windows System32 timeout.exe rc 충돌 면역):
+#    "machine-origin: machine"=기계 유래 → **무스폰**+정직 고지 / "machine-origin: human"=오너
+#    타이핑 간주 → 종전 D4-a′ 경로 그대로 spawn / 그 외(토큰 부재·unknown·타임아웃·실행 실패·
+#    모듈 부재)=판정 불가 → **fail-closed 무스폰**+loud(A5·A22 와 같은 방향 — 무단 스폰이
+#    판정 보류보다 나쁘다). rc(0/1/2 계약 무변경)는 보조 로그로만 남긴다.
 #
 # 안전: 모든 단계 graceful, 반드시 exit 0 (훅 실패가 세션을 깨지 않게).
 set +e
@@ -244,21 +246,33 @@ esac
 # ── ★기계유래 스폰 게이트(2026-08-10) — DETECT 발화 직후·spawn 이전의 최종 관문 ──────────────
 # 근거·계약은 헤더의 '기계유래 스폰 게이트' 블록과 THREAT-MODEL-mission-gate.md §4-10.
 # 판별은 javis_mission `machine-origin`(판정 전용 · 무기록·무부작용)이 단일 소유한다 — record 가
-# 이미 쓰는 층1(배달 원장 해시 대조)·층2(push 라벨) 규칙 그대로이며 훅은 exit 만 소비한다.
-#   0=기계 유래 → 무스폰(오너 개입 0 의 팀 재스폰·preflight 설정 재작성 차단 — §4-10 위험의 본체)
-#   1=오너 타이핑 간주 → 아래 종전 D4-a′ 경로 그대로 spawn
-#   그 외(2·124·127)·모듈 부재 → 판정 불가 = fail-closed 무스폰 + loud(A5 role 게이트와 같은
-#   방향: 무단 스폰이 판정 보류보다 나쁘다. 모듈 부재는 위 T1 블록의 '임무 대장 미기록' 상태와
-#   정합 — 판별 도구가 없는 레인에서 스폰만 여는 비대칭을 만들지 않는다).
+# 이미 쓰는 층1(배달 원장 해시 대조)·층2(push 라벨) 규칙 그대로다.
+# ★1차 근거 = stdout 판정 토큰(2026-08-10 W-B — rc 소비에서 격상): Windows 에서 `command -v
+#   timeout` 이 System32 timeout.exe 로 해소되면 파이프 stdin 미지원으로 즉사 rc=1 이 되는데,
+#   rc 만 읽는 게이트는 그 1 을 '오너 타이핑'으로 오독해 **상시 fail-open** 된다(랩퍼 사망과
+#   판정을 rc 는 구분하지 못한다). 토큰은 판정 본문이 실제로 완주했을 때만 인쇄되므로 rc 충돌·
+#   랩퍼 손상에 구조적으로 면역이다. rc 는 보조 로그로만 남긴다.
+#   토큰 machine=기계 유래 → 무스폰(오너 개입 0 의 팀 재스폰·preflight 설정 재작성 차단 — §4-10 위험의 본체)
+#   토큰 human=오너 타이핑 간주 → 아래 종전 D4-a′ 경로 그대로 spawn
+#   그 외(토큰 부재·unknown·타임아웃·실행 실패·모듈 부재) → 판정 불가 = fail-closed 무스폰 +
+#   loud(A5 role 게이트와 같은 방향: 무단 스폰이 판정 보류보다 나쁘다. 모듈 부재는 위 T1 블록의
+#   '임무 대장 미기록' 상태와 정합 — 판별 도구가 없는 레인에서 스폰만 여는 비대칭을 만들지 않는다).
 MO_RC=""
+MO_OUT=""
 if [ -f "$MISSION" ]; then
-  printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$(cys_native_path "$MISSION")" machine-origin >/dev/null 2>&1
+  MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$(cys_native_path "$MISSION")" machine-origin 2>/dev/null)"
   MO_RC=$?
 fi
-if [ "$MO_RC" = "0" ]; then
+MO_TOKEN=""
+case "$MO_OUT" in
+  *"machine-origin: machine"*) MO_TOKEN="machine" ;;
+  *"machine-origin: human"*)   MO_TOKEN="human" ;;
+  *"machine-origin: unknown"*) MO_TOKEN="unknown" ;;
+esac
+if [ "$MO_TOKEN" = "machine" ]; then
   # 기계 유래 확정 — 무스폰. 주입문은 정직하게: 무엇을 감지했고 왜 발화하지 않았는지 + 근거
   # 확인 명령 + 오너 우연 일치(거짓 양성 수용 — 비대칭 원칙) 시의 복구 경로.
-  echo "[cys-hook] role-bootstrap: 기계 유래 선언(machine-origin exit 0) — 무스폰(부트 미발화)" >&2
+  echo "[cys-hook] role-bootstrap: 기계 유래 선언(machine-origin 토큰=machine · 보조 rc=$MO_RC) — 무스폰(부트 미발화)" >&2
   "$CYS_PY" -c 'import json,sys
 # 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
 # UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
@@ -285,13 +299,14 @@ note=("[기계 유래 선언 감지 — 부트 미발화] 이 문단을 넣은 �
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
     "$PACK"
   exit 0
-elif [ "$MO_RC" != "1" ]; then
-  # 판정 불가(2=파싱 실패·124=타임아웃·127=인터프리터/모듈 문제·""=javis_mission.py 부재) —
-  # fail-closed 무스폰 + loud(A22 관례). '선언 아님'과 '판정 불가'를 융합하지 않는다.
-  MO_WHY="${MO_RC:-모듈 부재(javis_mission.py 없음)}"
-  echo "[cys-hook] role-bootstrap: 기계유래 판정 불가(machine-origin rc=$MO_WHY) — 무스폰(fail-closed)" >&2
+elif [ "$MO_TOKEN" != "human" ]; then
+  # 판정 불가(토큰 부재=타임아웃·인터프리터/모듈 문제·모듈 부재 · 토큰 unknown=파싱 실패·빈
+  # 프롬프트·판정 본문 크래시) — fail-closed 무스폰 + loud(A22 관례). '선언 아님'과 '판정
+  # 불가'를 융합하지 않는다. rc 는 진단용 보조 정보로만 병기한다.
+  MO_WHY="토큰=${MO_TOKEN:-부재} 보조rc=${MO_RC:-모듈 부재(javis_mission.py 없음)}"
+  echo "[cys-hook] role-bootstrap: 기계유래 판정 불가(machine-origin $MO_WHY) — 무스폰(fail-closed)" >&2
   _notify_bg "부트스트랩 판정 불가(기계유래 판별 실패)" \
-    "마스터 선언은 감지됐지만 javis_mission.py machine-origin 이 오너 타이핑/기계 배달 여부를 판정하지 못했습니다(rc=$MO_WHY). 팀 기동이 발화되지 않았습니다."
+    "마스터 선언은 감지됐지만 javis_mission.py machine-origin 이 오너 타이핑/기계 배달 여부를 판정하지 못했습니다($MO_WHY). 팀 기동이 발화되지 않았습니다."
   "$CYS_PY" -c 'import json,sys
 # 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
 # UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
@@ -302,7 +317,8 @@ for _s in (sys.stdout, sys.stderr):
         pass
 note=("[결정론 부트스트랩 판정 불가 - 기계유래 판별 실패] 마스터 선언 패턴은 감지됐지만, 그 선언이 "
       "오너 타이핑인지 기계 배달인지 판별하는 도구(bin/javis_mission.py machine-origin)가 판정하지 "
-      "못했다(rc=%s). **선언 아님이 아니라 판정 불가다 — 부트 미발화**(fail-closed: 무단 스폰이 "
+      "못했다(%s — 판정 근거는 stdout 토큰이고 rc 는 보조 진단이다). "
+      "**선언 아님이 아니라 판정 불가다 — 부트 미발화**(fail-closed: 무단 스폰이 "
       "판정 보류보다 나쁘다). 팀은 뜨지 않았다 - 부트가 시작됐다고 보고하지 마라. "
       "조치: bin/javis_mission.py status · delivery-path 로 판별 도구·배달 원장 상태를 확인하고 "
       "(모듈 부재면 팩 배포 preflight --fix · pack-heal), 오너가 직접 타이핑한 선언이었다면 "
@@ -312,7 +328,8 @@ print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","addi
     "$MO_WHY"
   exit 0
 fi
-# MO_RC=1: 오너 타이핑 간주 — 종전 D4-a′ 경로 그대로 진행한다.
+# MO_TOKEN=human: 오너 타이핑 간주(판정 본문 완주 + exit 1 계약의 stdout 표명) — 종전 D4-a′
+# 경로 그대로 진행한다.
 
 BOOT="$PACK/bin/javis_bootstrap.py"
 # ★BOOT 부재 명시 실패(증분1): 부서 팩에 javis_bootstrap.py가 없는 레인은 종전엔 조용한 무산이라

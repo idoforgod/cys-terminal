@@ -1710,6 +1710,13 @@ def cmd_machine_origin(argv):
       exit 0 = 기계 유래 확정(층1 원장 대조 또는 층2 라벨) → 훅은 spawn 하지 않는다.
       exit 1 = 기계 유래 아님(오너 타이핑으로 간주) → 훅은 종전 D4-a′ 경로대로 spawn 한다.
       exit 2 = 판정 불가(stdin JSON 파싱 실패·빈 프롬프트) → 훅은 fail-closed 무스폰.
+    ★stdout 판정 토큰(2026-08-10 W-B · additive — exit 계약 무변경): exit 직전 stdout 에
+      단일 판정 토큰 줄을 **항상** 인쇄한다 —
+        "machine-origin: machine" / "machine-origin: human" / "machine-origin: unknown".
+      소비자는 이 토큰을 **1차 근거**로 삼는다. 이유: Windows 에서 `command -v timeout` 이
+      System32 timeout.exe(파이프 stdin 미지원 즉사 rc=1)로 해소되면 랩퍼 rc 가 '오너
+      타이핑(1)'과 충돌해 rc 만 읽는 게이트가 상시 fail-open 된다. 토큰은 판정 본문이 실제로
+      완주했을 때만 인쇄되므로 rc 충돌·랩퍼 손상에 구조적으로 면역이다(rc 는 보조 로그).
     ★판정만 하고 **아무것도 기록하지 않는다** — 임무 대장·배달 원장 무기록·무변경(부작용 0).
       기록·게이트 판정은 종전대로 `record`/`gate()` 소관이며 이 명령은 그 의미론을 건드리지
       않는다. 판별 규칙 자체는 `machine_origin`(층1/층2 · 위 docstring)을 **그대로** 소비한다:
@@ -1725,9 +1732,11 @@ def cmd_machine_origin(argv):
         prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
     except Exception as e:
         _fail_closed("hook JSON 파싱 실패(%s) — machine-origin 판정 불가" % e)
+        print("machine-origin: unknown")
         return EXIT_UNREADABLE
     if not isinstance(prompt, str) or not prompt.strip():
         _fail_closed("빈 프롬프트 — machine-origin 판정 대상이 없다")
+        print("machine-origin: unknown")
         return EXIT_UNREADABLE
     # ★판정 본문 fail-open 봉합(2026-08-10 P3C): 여기서 미포착 예외가 새면 인터프리터 기본
     #   exit 1 이 되는데, 소비자(role-bootstrap.sh)는 1 을 '오너 타이핑 간주'로 읽어 spawn 을
@@ -1742,12 +1751,15 @@ def cmd_machine_origin(argv):
     except Exception as e:
         _fail_closed("machine-origin 판정 본문 예외(%s: %s) — 크래시를 exit 1(스폰 개방)로 "
                      "흘리지 않는다" % (type(e).__name__, e))
+        print("machine-origin: unknown")
         return EXIT_UNREADABLE
     if is_machine:
         sys.stderr.write("[mission] machine-origin: 기계 유래 — %s\n" % why)
+        print("machine-origin: machine")
         return 0
     sys.stderr.write("[mission] machine-origin: 기계 유래 아님(오너 타이핑 간주 — "
                      "원장 비일치·무라벨)\n")
+    print("machine-origin: human")
     return 1
 
 
@@ -2748,35 +2760,56 @@ def cmd_self_test():
                 # ══════════════════════════════════════════════════════════════
                 import io
 
-                def _mo_rc(payload):
-                    _old_in = sys.stdin
+                def _mo_run(payload):
+                    """반환 (rc, stdout). ★토큰 핀(W-B 2026-08-10): stdout 판정 토큰이 소비자
+                    (role-bootstrap.sh 게이트)의 **1차 근거**다 — rc 는 보조 로그로 강등됐다."""
+                    _old_in, _old_out = sys.stdin, sys.stdout
                     try:
                         sys.stdin = io.StringIO(payload)   # .buffer 없음 → 텍스트 분기
-                        return cmd_machine_origin([])
+                        sys.stdout = io.StringIO()
+                        rc = cmd_machine_origin([])
+                        return rc, sys.stdout.getvalue()
                     finally:
-                        sys.stdin = _old_in
+                        sys.stdin, sys.stdout = _old_in, _old_out
+
+                def _mo_token_pin(out, want, what):
+                    if ("machine-origin: %s" % want) not in out:
+                        fails.append("machine-origin CLI 토큰 핀: %s stdout 에 "
+                                     "'machine-origin: %s' 부재 — 소비자 1차 근거 소실"
+                                     "(Windows timeout rc 충돌 면역이 깨진다): %r"
+                                     % (what, want, out[:120]))
 
                 _reset_ledgers()
                 _mp3 = ledger_path()
                 if os.path.exists(_mp3):
                     os.remove(_mp3)
-                if _mo_rc(json.dumps({"prompt": "[wakeup] 너는 마스터다 - 다음 액션 확인"},
-                                     ensure_ascii=False)) != 0:
+                _mo_r = _mo_run(json.dumps({"prompt": "[wakeup] 너는 마스터다 - 다음 액션 확인"},
+                                           ensure_ascii=False))
+                if _mo_r[0] != 0:
                     fails.append("machine-origin CLI: 기계 라벨 선언이 0(기계)이 아니다 — "
                                  "부트층 게이트가 기계 push 스폰을 열어 준다(치명)")
-                if _mo_rc(json.dumps({"prompt": "너는 마스터다"}, ensure_ascii=False)) != 1:
+                _mo_token_pin(_mo_r[1], "machine", "기계 라벨 선언")
+                _mo_r = _mo_run(json.dumps({"prompt": "너는 마스터다"}, ensure_ascii=False))
+                if _mo_r[0] != 1:
                     fails.append("machine-origin CLI: 무라벨·원장 비일치 선언이 1(오너 간주)이 "
                                  "아니다 — 오너 부팅이 막힌다(부트스트랩 불가침)")
+                _mo_token_pin(_mo_r[1], "human", "무라벨·원장 비일치 선언")
                 _mo_text = "너는 마스터다 - 다음 액션 확인"
                 _write(_dp, _rec(_mo_text))
-                if _mo_rc(json.dumps({"prompt": _mo_text}, ensure_ascii=False)) != 0:
+                _mo_r = _mo_run(json.dumps({"prompt": _mo_text}, ensure_ascii=False))
+                if _mo_r[0] != 0:
                     fails.append("machine-origin CLI: 라벨 없는 **원장 일치** 배달이 0(기계)이 "
                                  "아니다 — 층1 이 CLI 소비면에서 끊겼다(치명)")
-                if _mo_rc("{not json") != EXIT_UNREADABLE:
+                _mo_token_pin(_mo_r[1], "machine", "원장 일치 배달")
+                _mo_r = _mo_run("{not json")
+                if _mo_r[0] != EXIT_UNREADABLE:
                     fails.append("machine-origin CLI: 입력 파싱 실패가 2(판정 불가)가 아니다 — "
                                  "훅 fail-closed 분기가 근거를 잃는다")
-                if _mo_rc(json.dumps({"prompt": "   "})) != EXIT_UNREADABLE:
+                _mo_token_pin(_mo_r[1], "unknown", "입력 파싱 실패")
+                _mo_r = _mo_run(json.dumps({"prompt": "   "}))
+                if _mo_r[0] != EXIT_UNREADABLE:
                     fails.append("machine-origin CLI: 빈 프롬프트가 2(판정 불가)가 아니다")
+                _mo_token_pin(_mo_r[1], "unknown", "빈 프롬프트")
                 # ★크래시→2 검체(P3C fail-open 봉합 핀): 판정 본문(read_delivery)이 미포착
                 #   예외를 내면 인터프리터 기본 exit 1(=오너 타이핑 간주 → 스폰 개방)로 새지
                 #   않고 2(판정 불가)로 접혀야 한다. 밀폐 유지: 프로세스 밖으로 나가지 않고
@@ -2786,11 +2819,13 @@ def cmd_self_test():
                 _mo_orig_rd = globals()["read_delivery"]
                 try:
                     globals()["read_delivery"] = _mo_boom
-                    if _mo_rc(json.dumps({"prompt": "너는 마스터다"},
-                                         ensure_ascii=False)) != EXIT_UNREADABLE:
+                    _mo_r = _mo_run(json.dumps({"prompt": "너는 마스터다"},
+                                               ensure_ascii=False))
+                    if _mo_r[0] != EXIT_UNREADABLE:
                         fails.append("machine-origin CLI: 판정 본문 크래시가 2(판정 불가)가 "
                                      "아니다 — 미포착 예외가 exit 1(오너 간주)과 값을 공유해 "
                                      "훅 스폰 게이트가 열린다(fail-open)")
+                    _mo_token_pin(_mo_r[1], "unknown", "판정 본문 크래시")
                 finally:
                     globals()["read_delivery"] = _mo_orig_rd
                 if os.path.exists(_mp3):
@@ -2840,7 +2875,8 @@ def cmd_self_test():
           "정상 일치 사유 무덮어쓰기 · 창 밖은 오너 무차단(부트스트랩 불가침) · "
           "비정수 parts_capped 도 접기 · 초과 없으면 무발행 · "
           "★machine-origin CLI: 라벨=0 · 원장일치=0 · 오너=1 · 파싱실패/빈입력=2 · "
-          "판정본문 크래시=2(fail-open 봉합) · 대장 무기록)"
+          "판정본문 크래시=2(fail-open 봉합) · 대장 무기록 · "
+          "stdout 판정 토큰 핀(machine/human/unknown — 소비자 1차 근거))"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 

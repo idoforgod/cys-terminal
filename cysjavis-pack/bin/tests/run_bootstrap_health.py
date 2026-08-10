@@ -40,6 +40,11 @@ PACK_DIR = os.path.dirname(BIN_DIR)
 HOOKS_DIR = os.path.join(PACK_DIR, "hooks")
 REPO_DIR = os.path.dirname(PACK_DIR)          # 레포 체크아웃일 때만 유효(배포 팩은 무의미)
 PY = sys.executable or "python3"
+# ★bash 단일 해소(2026-08-10 W-A · run 31396459407/31396849323 근저원인): 네이티브 Windows
+#   python 의 CreateProcess 는 PATH 탐색 **이전에** System32 를 뒤져 WSL 스텁 bash.exe 를
+#   집는다 — 리터럴 "bash" 스폰은 Windows 실기에서 훅 검체 전군을 오판시킨다. 전 스폰 지점을
+#   이 모듈 레벨 상수로 보낸다(H-WIN-5 의 기존 정답 패턴을 모듈로 승격 · macOS 동작 불변).
+BASH = shutil.which("bash") or "bash"
 
 # 기준 커밋 핀(재감사 헤더) — 계측기 자기검증(구 코드 FIRE 확인)의 대조 트리.
 # W0 착지 커밋을 쓴다: W1a 이전 상태이면서 W0 지혈이 반영된 트리.
@@ -208,7 +213,7 @@ def _rb_sandbox(tmp, *, boot_body=None, surface=True, mock_py=None, pack_has_boo
 
 
 def _run_rb(env, prompt="너는 마스터다"):
-    return _run(["bash", _hook("role-bootstrap.sh")], input=json.dumps({"prompt": prompt}), env=env)
+    return _run([BASH, _hook("role-bootstrap.sh")], input=json.dumps({"prompt": prompt}), env=env)
 
 
 def _code_lines(body):
@@ -241,7 +246,7 @@ def _old_hook_fires(prompt, tmp, env_extra=None):
     env, _h, _p, _b, _st = _rb_sandbox(os.path.join(tmp, "oldsb"))
     if env_extra:
         env.update(env_extra)
-    r = _run(["bash", oldhook], input=json.dumps({"prompt": prompt}), env=env)
+    r = _run([BASH, oldhook], input=json.dumps({"prompt": prompt}), env=env)
     return "발화됨" in r.stdout
 
 
@@ -343,7 +348,9 @@ def g_syntax():
     for rel in targets:
         p = os.path.join(HOOKS_DIR, rel)
         for sh in ("sh", "bash"):
-            r = _run([sh, "-n", p], timeout=30)
+            # bash 는 모듈 상수 BASH 로 해소한다(W-A — System32 WSL 스텁 회피). sh 는 System32
+            # 동명 스텁이 없어 리터럴 유지가 안전하다.
+            r = _run([BASH if sh == "bash" else sh, "-n", p], timeout=30)
             if r.returncode != 0:
                 bad.append("%s(%s): %s" % (rel, sh, r.stderr.strip()[:200]))
     need(not bad, "구문 오류:\n  " + "\n  ".join(bad))
@@ -385,7 +392,7 @@ def g_prelude():
         shutil.copy2(lib, os.path.join(fakepack, "hooks", "_lib.sh"))
         proj2 = os.path.join(tmp, "p2")
         os.makedirs(os.path.join(proj2, "_round"), exist_ok=True)
-        r1 = _run(["bash", os.path.join(fake, "save-state.sh")],
+        r1 = _run([BASH, os.path.join(fake, "save-state.sh")],
                   input=json.dumps({"cwd": proj2, "hook_event_name": "Stop"}),
                   env=_base_env({"HOME": os.path.join(tmp, "h2"), "CYS_PACK_DIR": fakepack}))
         need(r1.returncode == 0, "2단 폴백 경로에서 훅이 비0 종료: %d" % r1.returncode)
@@ -394,7 +401,7 @@ def g_prelude():
         need("Stop" in _read(os.path.join(proj2, "_round", ".state_log")),
              "2단 폴백 경로에서 훅 본체가 동작하지 않았다")
         # loud-skip 규약: **양 단계 모두** 실패 → stderr 1줄 + exit 0 + stdout 무오염
-        r2 = _run(["bash", os.path.join(fake, "save-state.sh")], input="{}",
+        r2 = _run([BASH, os.path.join(fake, "save-state.sh")], input="{}",
                   env=_base_env({"HOME": os.path.join(tmp, "h3"),
                                  "CYS_PACK_DIR": os.path.join(tmp, "nowhere")}))
         need(r2.returncode == 0, "loud-skip 이 exit 0 아님: %d" % r2.returncode)
@@ -458,12 +465,12 @@ def g_smoke():
         env = _base_env({"HOME": os.path.join(tmp, "home"), "CYS_PACK_DIR": os.path.join(tmp, "nopack")})
         payload = json.dumps({"source": "clear", "cwd": proj, "hook_event_name": "PreCompact"})
         # ① inject-context: 작업기억 주입 + exit 0
-        r = _run(["bash", _hook("inject-context.sh")], input=payload, env=env)
+        r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env)
         need(r.returncode == 0, "inject-context exit=%d" % r.returncode)
         need("SMOKE-STATE-MARKER" in r.stdout, "inject-context 가 작업기억을 주입하지 않았다")
         notes.append("inject-context OK")
         # ② save-state: .state_log append + 타임스탬프 갱신
-        r = _run(["bash", _hook("save-state.sh")], input=payload, env=env)
+        r = _run([BASH, _hook("save-state.sh")], input=payload, env=env)
         need(r.returncode == 0, "save-state exit=%d" % r.returncode)
         log = _read(os.path.join(proj, "_round", ".state_log"))
         need("PreCompact" in log, "save-state 가 .state_log 를 남기지 않았다: %r" % log[:200])
@@ -471,10 +478,10 @@ def g_smoke():
              "save-state 가 '최종 갱신' 타임스탬프를 갱신하지 않았다")
         notes.append("save-state OK")
         # ③ guard: 무해 명령 통과 / 헌법파일 차단
-        r = _run(["bash", _hook("guard.sh")],
+        r = _run([BASH, _hook("guard.sh")],
                  input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls -la"}}), env=env)
         need(r.returncode == 0, "guard 가 무해 명령을 차단(exit=%d)" % r.returncode)
-        r = _run(["bash", _hook("guard.sh")],
+        r = _run([BASH, _hook("guard.sh")],
                  input=json.dumps({"tool_name": "Write",
                                    "tool_input": {"file_path": "/x/.claude/soul.md"}}), env=env)
         need(r.returncode == 2, "guard 가 헌법파일 쓰기를 통과(exit=%d)" % r.returncode)
@@ -678,7 +685,7 @@ def h_detect_7():
             env, _h, _p, _b, _s = _rb_sandbox(os.path.join(sb, "sb"))
             _mock_cys(os.path.join(sb, "sb", "bin"), os.path.join(sb, "sb"),
                       'case "$1" in surface-role) echo "worker-2"; exit 0;; esac')
-            r = _run(["bash", oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env)
+            r = _run([BASH, oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env)
             need("발화됨" in r.stdout,
                  "계측 타당성 실패: 구 코드가 worker-2 에서 오발화하지 않는다 — 검체가 결함을 재현 못함")
             calib = "구 코드 worker-2 오발화 재현"
@@ -809,7 +816,7 @@ def h_detect_10():
             _w(oldhook, old)
             _w(os.path.join(tmp2, "hooks", "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
             env2, _h, _p, _b, _s = _rb_sandbox(os.path.join(tmp2, "sb"), mock_py=mock)
-            r2 = _run(["bash", oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env2)
+            r2 = _run([BASH, oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env2)
             need("발화됨" in r2.stdout,
                  "계측 타당성 실패: 구 코드가 이 목에서 허위 '발화됨' 을 내지 않는다 — 목이 결함을 재현하지 못함")
             calib = "구 코드 허위 '발화됨' 재현 확인"
@@ -966,7 +973,7 @@ def h_mission_1():
         env3, _h3, pack3, _b3, _s3 = _rb_sandbox(os.path.join(tmp, "c"), mission=None)
         _w(os.path.join(pack3, "bin", "javis_detect.py"),
            _read(os.path.join(BIN_DIR, "javis_detect.py")), 0o644)
-        r3 = _run(["bash", curhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env3)
+        r3 = _run([BASH, curhook], input=json.dumps({"prompt": "너는 마스터다"}), env=env3)
         need("발화됨" not in r3.stdout,
              "판별 도구(javis_mission.py) 부재 레인에서 spawn 이 열렸다 — 기계유래 판정 불가가 "
              "fail-closed 로 접히지 않는다(무단 스폰 > 판정 보류 역전): %r" % r3.stdout[:300])
@@ -1099,7 +1106,7 @@ def h_mission_1():
                      "계측 대조 불가: %s 의 bin/javis_detect.py 를 얻지 못했다(git show 실패) — "
                      "측정 불능은 통과가 아니다" % D4A_REF)
                 _w(os.path.join(opack, "bin", "javis_detect.py"), det, 0o644)
-            ro = _run(["bash", oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=oenv)
+            ro = _run([BASH, oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=oenv)
             if tag == "d4a":
                 need("판정 불가" not in ro.stdout,
                      "계측 무효: D4-a 시대 훅(%s)이 '판정 불가'로 조기 종료했다(감지기·인터프리터 "
@@ -1120,7 +1127,7 @@ def h_mission_1():
                      "계측 타당성 실패: T1 이전 훅에 이미 착수금지 문안이 있다 — "
                      "핀이 신·구를 구분하지 못한다")
                 # ③ ⓓ-1 무스폰 검출기 계측(위 주석 ③): 기계 라벨 선언 → 구 훅은 발화해야 한다
-                rmach = _run(["bash", oldhook],
+                rmach = _run([BASH, oldhook],
                              input=json.dumps(
                                  {"prompt": "[wakeup] 너는 마스터다 - 다음 액션 확인"}),
                              env=oenv)
@@ -2488,11 +2495,11 @@ def h_win_1():
         ("C:\\x\\notes.md", 0, "무해 파일(과차단 대조)"),
     ]
     for fp, want, label in cases:
-        r = _run(["bash", g], env=env,
+        r = _run([BASH, g], env=env,
                  input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": fp}}))
         need(r.returncode == want, "%s: exit=%d(기대 %d)" % (label, r.returncode, want))
     # Bash 경로(LOOSE)도 같은 정규화가 걸리는가
-    r = _run(["bash", g], env=env, input=json.dumps(
+    r = _run([BASH, g], env=env, input=json.dumps(
         {"tool_name": "Bash", "tool_input": {"command": "echo x | tee C:\\Users\\x\\soul.md"}}))
     need(r.returncode == 2, "LOOSE bash 백슬래시 경로 우회(exit=%d)" % r.returncode)
     calib = "skip(no-git)"
@@ -2502,7 +2509,7 @@ def h_win_1():
             og = os.path.join(tmp, "guard.sh")
             _w(og, old)
             _w(os.path.join(tmp, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
-            r2 = _run(["bash", og], env=env, input=json.dumps(
+            r2 = _run([BASH, og], env=env, input=json.dumps(
                 {"tool_name": "Write", "tool_input": {"file_path": "C:\\Users\\x\\.claude\\soul.md"}}))
             need(r2.returncode == 0,
                  "계측 타당성 실패: 구 guard 가 백슬래시 경로를 이미 차단한다면 이 검체는 무의미")
@@ -2533,19 +2540,19 @@ def h_win_2():
         for cwd in ("C:/proj/sub", "C:\\proj\\sub"):
             payload = json.dumps({"source": "clear", "cwd": cwd, "hook_event_name": "Stop",
                                   "transcript_path": ""})
-            r = _run(["bash", _hook("inject-context.sh")], input=payload, env=env, cwd=tmp)
+            r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env, cwd=tmp)
             need("WIN-STATE-MARKER" in r.stdout,
                  "inject-context: cwd=%r 에서 작업기억 미발견" % cwd)
-            r = _run(["bash", _hook("save-state.sh")], input=payload, env=env, cwd=tmp)
+            r = _run([BASH, _hook("save-state.sh")], input=payload, env=env, cwd=tmp)
             need("Stop" in _read(os.path.join(drive, "proj", "_round", ".state_log")),
                  "save-state: cwd=%r 에서 write-ahead 미기록" % cwd)
             os.remove(os.path.join(drive, "proj", "_round", ".state_log"))
-            r = _run(["bash", _hook("reflect-scan.sh")], input=payload, env=env, cwd=tmp)
+            r = _run([BASH, _hook("reflect-scan.sh")], input=payload, env=env, cwd=tmp)
             need("WARN:memory" in _read(os.path.join(drive, "proj", "_round", ".state_log")),
                  "reflect-scan: cwd=%r 에서 _round 해소 실패" % cwd)
             os.remove(os.path.join(drive, "proj", "_round", ".state_log"))
             # vibe-regression 은 상향탐색이 아니라 cwd 를 **직접** 쓴다 → 루트 표기로 대입.
-            r = _run(["bash", os.path.join(HOOKS_DIR, "vibecoding", "vibe-regression.sh")],
+            r = _run([BASH, os.path.join(HOOKS_DIR, "vibecoding", "vibe-regression.sh")],
                      env=env, cwd=tmp, input=json.dumps(
                          {"tool_input": {"command": "javis_task.py set-status T done"},
                           "cwd": cwd.rsplit("/", 1)[0].rsplit("\\", 1)[0]}))
@@ -2566,7 +2573,7 @@ def h_win_3():
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "MAIN-LANE-MARKER\n", 0o644)
         env = _base_env({"HOME": os.path.join(tmp, "home"), "CYS_PACK_DIR": dept})
-        r = _run(["bash", _hook("inject-context.sh")], env=env,
+        r = _run([BASH, _hook("inject-context.sh")], env=env,
                  input=json.dumps({"source": "clear", "cwd": proj}))
         need("DEPT-ROUND-MARKER" in r.stdout, "명명 부서 팩이 부서 정본을 주입하지 않았다(G4)")
         need("MAIN-LANE-MARKER" not in r.stdout, "명명 부서 레인에 메인 레인 작업기억이 오주입됐다(격리 파괴)")
@@ -2574,7 +2581,7 @@ def h_win_3():
         env2 = _base_env({"HOME": os.path.join(tmp, "home"),
                           "CYS_PACK_DIR": os.path.join(tmp, "pack"),
                           "CYS_SOCKET": r"\\.\pipe\cys-dept-sales"})
-        r2 = _run(["bash", _hook("inject-context.sh")], env=env2,
+        r2 = _run([BASH, _hook("inject-context.sh")], env=env2,
                   input=json.dumps({"source": "clear", "cwd": proj}))
         need("부서 pack round SESSION_STATE 부재" in r2.stdout,
              "named pipe 부서 소켓이 부서 컨텍스트로 인식되지 않았다(G20): %r" % r2.stdout[:300])
@@ -2684,7 +2691,7 @@ def h_win_5():
             src = shutil.which(tool)
             if src and not os.path.exists(os.path.join(binp, tool)):
                 os.symlink(src, os.path.join(binp, tool))
-        BASH = shutil.which("bash") or "/bin/bash"
+        # bash 해소는 모듈 상수 BASH(W-A) — 종전 이 자리의 지역 해소가 모듈로 승격됐다.
         proj = os.path.join(tmp, "proj")
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "NOPY3-MARKER\n", 0o644)
@@ -2714,7 +2721,7 @@ def h_win_6():
                          "PATH": binp + os.pathsep + os.environ.get("PATH", ""),
                          "CYS_PACK_DIR": "C:/Users/x/.cys/pack",
                          "TMPDIR": os.path.join(tmp, "stamps")})
-        r = _run(["bash", _hook("pack-guard.sh")], env=env, input=json.dumps(
+        r = _run([BASH, _hook("pack-guard.sh")], env=env, input=json.dumps(
             {"tool_input": {"file_path": "C:\\Users\\x\\.cys\\pack\\hooks\\guard.sh"},
              "session_id": "s1"}))
         need(r.returncode == 0, "pack-guard 비0 종료(%d)" % r.returncode)
@@ -2724,7 +2731,7 @@ def h_win_6():
              "REL 산출·경고 문안 이상: %r" % r.stdout[:400])
         # 과차단 대조: 팩 밖 파일은 무동작
         env["TMPDIR"] = os.path.join(tmp, "stamps2")
-        r2 = _run(["bash", _hook("pack-guard.sh")], env=env, input=json.dumps(
+        r2 = _run([BASH, _hook("pack-guard.sh")], env=env, input=json.dumps(
             {"tool_input": {"file_path": "C:\\other\\x.sh"}, "session_id": "s2"}))
         need(r2.stdout.strip() == "", "팩 밖 파일에 경고를 냈다(과탐): %r" % r2.stdout[:200])
     return "백슬래시 팩 접두 매칭 + 팩 밖 무동작"
@@ -2760,11 +2767,18 @@ def h_win_7():
         chk = _run(["sh", rt], env=_base_env())
         need(chk.stdout == "X:\\Prog Files\\javis_bootstrap.py",
              "인용 왕복 실패(복사 실행 불가): %r (line=%r)" % (chk.stdout, line))
-        # unix(cygpath 부재) 무변경 대조
+        # unix(cygpath 부재) 무변경 대조 — ★전제 실측(W-D · 하우스 3상 규율): 이 leg 의 전제
+        # 'cygpath 부재'는 Windows 러너(Git Bash = cygpath 실재)에서 거짓이다. 전제가 거짓이면
+        # 미측정이지 FAIL 이 아니다 — 사유 명시 skip 으로 접는다. 비교는 구분자 정규화 후
+        # 수행한다(훅이 os.path 산출 경로를 백슬래시로 렌더해도 경로 동일성 판정은 불변).
         env.pop("CYS_ROLE")
         env["PATH"] = os.environ.get("PATH", "")
+        if shutil.which("cygpath", path=env["PATH"]):
+            return ("cygpath 변환·인용 왕복 검증 · unix 대조 leg skip"
+                    "(실행 환경에 cygpath 실재=전제 미충족 — 미측정이지 FAIL 아님)")
         r3 = _run(["sh", _hook("session-start.sh")], env=env, stdin=subprocess.DEVNULL)
-        need(os.path.join(pack, "bin", "javis_bootstrap.py") in r3.stdout,
+        expect3 = os.path.join(pack, "bin", "javis_bootstrap.py").replace("\\", "/")
+        need(expect3 in r3.stdout.replace("\\", "/"),
              "cygpath 부재 환경에서 경로가 변형됐다(unix 회귀): %r" % r3.stdout[:500])
     return "cygpath 변환·인용 왕복 검증 · unix 무변경"
 
@@ -4459,7 +4473,7 @@ def h_seed_4():
             'verify_lane_account_seed "%s" "" && echo NOACCT=OK || echo NOACCT=FAIL\n'
         ) % (fns, dpack, dpack, acct, dpack, dpack)
         env = _base_env({"HOME": home, "CYS_PACK_DIR": pack, "CYS_DEPTS_JSON": reg})
-        r = _run(["bash", "-c", script], env=env, timeout=90)
+        r = _run([BASH, "-c", script], env=env, timeout=90)
         out = r.stdout
         need("REG=" + acct in out, "레지스트리 account_dir 유도 실패: %r" % out)
         need("RESOLVE=" + acct in out, "유도 3순위가 레지스트리 값을 못 집었다: %r" % out)
@@ -4825,7 +4839,7 @@ def h_obs_3():
                 os.symlink(src, os.path.join(binp, tool))
         env = _base_env({"HOME": os.path.join(tmp, "home"), "PATH": binp,
                          "CYS_PACK_DIR": os.path.join(tmp, "nopack")})
-        r = _run(["bash", _hook("inject-context.sh")], env=env,
+        r = _run([BASH, _hook("inject-context.sh")], env=env,
                  input=json.dumps({"source": "clear", "cwd": proj}))
         need("동시에 도는 claude 세션이 2개 감지됨" in r.stdout,
              "claude 세션 2개를 계수하지 못했다: %r" % r.stdout[-500:])
