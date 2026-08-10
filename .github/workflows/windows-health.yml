@@ -64,7 +64,9 @@ jobs:
           R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
           [ -f "$R" ] || { echo "건강성 러너 누락: $R (git add 누락 의심)" >&2; exit 1; }
           # 플랫폼 검체 목록의 단일 출처(이 한 줄). H-WIN-11 은 잡 계약 자기검증 + 실기 재실행.
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-CONC-1,H-CONC-3,H-DETECT-10"
+          # H-MISSION-1(기계유래 스폰 게이트 §4-10)은 Windows 실기 편입(2026-08-10 P3C) — git
+          # 계측 대조(D4A_REF·pre-t1)는 shallow checkout 에서 graceful skip(no-git) 검증됨.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           python "$R" --only "$WIN_SPECIMENS"
           python "$R" --only "$WIN_SPECIMENS" --json > win-health.json

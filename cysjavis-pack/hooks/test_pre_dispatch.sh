@@ -39,12 +39,15 @@ export REAL_HOOKS
 export REAL_GUARD
 
 # ---- cys 스텁: usage-event 만 기록, approval check 는 미서명(exit 1)으로 guard LOOSE deny 유지 ----
+# ★위치 무관 매칭(6d1871f 추적): guard 가 조회 argv 에 전역 옵션 `--socket <sock>` 을 서브커맨드
+#   **앞에** 삽입한다(`cys --socket <v> approval check …`) — `case "$1"` 고정 매칭은 서브커맨드를
+#   놓쳐 approval 이 `*) exit 0`(=서명됨)으로 흘러 deny 행렬이 무너진다(실측: block 기대 1→0).
 mkdir -p "$T/bin"
 cat >"$T/bin/cys" <<'STUB'
 #!/bin/sh
-case "$1" in
-  usage-event-stdin) cat >/dev/null 2>&1; echo usage-event >> "$CYS_LOG"; exit 0 ;;
-  approval) exit 1 ;;
+case " $* " in
+  *" usage-event-stdin "*) cat >/dev/null 2>&1; echo usage-event >> "$CYS_LOG"; exit 0 ;;
+  *" approval "*) exit 1 ;;
   *) exit 0 ;;
 esac
 STUB

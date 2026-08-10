@@ -1501,7 +1501,8 @@ def cmd_record(argv):
     """stdin(UserPromptSubmit hook JSON) → 대장 갱신. 훅 전용(1왕복).
 
     ★반환값 = **갱신 후 `gate()` 의 판정**이다(자기 판단이 아니라 정의처의 판정). 훅이 이 exit
-      하나로 노드 spawn 여부를 가르므로(hooks/role-bootstrap.sh — D4-a 순서 결함 수리), 여기서
+      로 주입문의 착수 규율 문안(MISSION_SENT)만 가르므로(hooks/role-bootstrap.sh — D4-a′
+      2026-08-10: spawn 은 감지·기계유래 게이트가 가르고 이 exit 와는 무관하다), 여기서
       독자 규칙으로 답하면 `status` 와 갈릴 수 있다. 판정처는 언제나 `gate()` 하나다.
     """
     detect = _detect_mod()
@@ -1693,6 +1694,61 @@ def cmd_delivery_path(argv):
     else:
         print(p)
     return 0
+
+
+def cmd_machine_origin(argv):
+    """stdin(UserPromptSubmit hook JSON — `record` 와 동일 입력) → **기계 유래 판정만** 한다.
+
+    ★신설(2026-08-10 · THREAT-MODEL-mission-gate.md §4-10 부트층 유사체 차단): D4-a′("선언=
+      기동 명령")의 동의 신호는 오너가 친 선언에만 성립하는데, 감지기(javis_detect)는 오너
+      타이핑과 기계 배달을 구분하지 않는다 — 실측으로 "[wakeup] 너는 마스터다 - 다음 액션 확인"
+      이 오너 개입 0 으로 팀 스폰을 발화했다(P3 적대검증). 층1(배달 원장 해시 대조)·층2(push
+      라벨) 판별의 단일 소유자는 이 모듈이므로, 훅(hooks/role-bootstrap.sh)이 spawn 직전에
+      셸 재구현 없이 이 서브커맨드의 exit 를 소비한다(사본 금지 — 사본은 반드시 낡는다).
+
+    ## 계약 (소비자 = role-bootstrap.sh 기계유래 스폰 게이트)
+      exit 0 = 기계 유래 확정(층1 원장 대조 또는 층2 라벨) → 훅은 spawn 하지 않는다.
+      exit 1 = 기계 유래 아님(오너 타이핑으로 간주) → 훅은 종전 D4-a′ 경로대로 spawn 한다.
+      exit 2 = 판정 불가(stdin JSON 파싱 실패·빈 프롬프트) → 훅은 fail-closed 무스폰.
+    ★판정만 하고 **아무것도 기록하지 않는다** — 임무 대장·배달 원장 무기록·무변경(부작용 0).
+      기록·게이트 판정은 종전대로 `record`/`gate()` 소관이며 이 명령은 그 의미론을 건드리지
+      않는다. 판별 규칙 자체는 `machine_origin`(층1/층2 · 위 docstring)을 **그대로** 소비한다:
+      원장 판독 불가(unreadable)면 machine_origin 이 층2 라벨 폴백으로 접는 것까지 동일하다
+      (라벨 없는 unreadable 상태는 exit 1 — `record` 가 같은 상태에서 임무를 기록하되
+      ledger_status=unreadable 로 게이트를 닫는 기존 비대칭과 같은 방향이다).
+    """
+    _ = argv
+    try:
+        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+        payload = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        obj = json.loads(payload)
+        prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
+    except Exception as e:
+        _fail_closed("hook JSON 파싱 실패(%s) — machine-origin 판정 불가" % e)
+        return EXIT_UNREADABLE
+    if not isinstance(prompt, str) or not prompt.strip():
+        _fail_closed("빈 프롬프트 — machine-origin 판정 대상이 없다")
+        return EXIT_UNREADABLE
+    # ★판정 본문 fail-open 봉합(2026-08-10 P3C): 여기서 미포착 예외가 새면 인터프리터 기본
+    #   exit 1 이 되는데, 소비자(role-bootstrap.sh)는 1 을 '오너 타이핑 간주'로 읽어 spawn 을
+    #   연다 — **허용 방향(1)과 크래시가 같은 값을 공유하면 안 된다.** 크래시는 stderr 1줄
+    #   사유와 함께 2(판정 불가)로 접는다(훅면 fail-closed 무스폰과 정합).
+    try:
+        deliv, lstatus, ldetail = read_delivery()
+        if lstatus == LEDGER_UNREADABLE:
+            # record 와 동일한 고지(침묵 금지) — 층1 근거 없이 층2 라벨로만 판별한다는 사실.
+            _fail_closed("배달 원장 판독 불가 — 라벨 규약 폴백으로만 판별한다: %s" % ldetail)
+        is_machine, why = machine_origin(prompt, deliv, lstatus)
+    except Exception as e:
+        _fail_closed("machine-origin 판정 본문 예외(%s: %s) — 크래시를 exit 1(스폰 개방)로 "
+                     "흘리지 않는다" % (type(e).__name__, e))
+        return EXIT_UNREADABLE
+    if is_machine:
+        sys.stderr.write("[mission] machine-origin: 기계 유래 — %s\n" % why)
+        return 0
+    sys.stderr.write("[mission] machine-origin: 기계 유래 아님(오너 타이핑 간주 — "
+                     "원장 비일치·무라벨)\n")
+    return 1
 
 
 # ── 밀폐 self-test(assert 배터리 · preflight/CI 관례 — 선례 javis_detect.cmd_self_test) ──
@@ -2683,6 +2739,64 @@ def cmd_self_test():
                 elif ("세대" not in _rotA[0]["detail"] or "epoch=" not in _rotA[0]["detail"]):
                     fails.append("회전 이상징후에 세대 수·소실 추정 구간이 없다 — "
                                  "어디까지 대조 가능한지 오너가 알 수 없다")
+                # ══════════════════════════════════════════════════════════════
+                # ★machine-origin CLI (2026-08-10 부트층 스폰 게이트 소비면) — 판정만·무기록
+                #   소비자: hooks/role-bootstrap.sh 의 spawn 전 기계유래 게이트(THREAT-MODEL
+                #   §4-10 부트층 유사체 차단). 판별 자체는 위에서 박제한 machine_origin
+                #   (층1/층2)을 그대로 소비하므로 여기서는 **CLI exit 계약**(0=기계/1=오너/
+                #   2=판정 불가)과 **무부작용**(임무 대장 무생성)만 못 박는다.
+                # ══════════════════════════════════════════════════════════════
+                import io
+
+                def _mo_rc(payload):
+                    _old_in = sys.stdin
+                    try:
+                        sys.stdin = io.StringIO(payload)   # .buffer 없음 → 텍스트 분기
+                        return cmd_machine_origin([])
+                    finally:
+                        sys.stdin = _old_in
+
+                _reset_ledgers()
+                _mp3 = ledger_path()
+                if os.path.exists(_mp3):
+                    os.remove(_mp3)
+                if _mo_rc(json.dumps({"prompt": "[wakeup] 너는 마스터다 - 다음 액션 확인"},
+                                     ensure_ascii=False)) != 0:
+                    fails.append("machine-origin CLI: 기계 라벨 선언이 0(기계)이 아니다 — "
+                                 "부트층 게이트가 기계 push 스폰을 열어 준다(치명)")
+                if _mo_rc(json.dumps({"prompt": "너는 마스터다"}, ensure_ascii=False)) != 1:
+                    fails.append("machine-origin CLI: 무라벨·원장 비일치 선언이 1(오너 간주)이 "
+                                 "아니다 — 오너 부팅이 막힌다(부트스트랩 불가침)")
+                _mo_text = "너는 마스터다 - 다음 액션 확인"
+                _write(_dp, _rec(_mo_text))
+                if _mo_rc(json.dumps({"prompt": _mo_text}, ensure_ascii=False)) != 0:
+                    fails.append("machine-origin CLI: 라벨 없는 **원장 일치** 배달이 0(기계)이 "
+                                 "아니다 — 층1 이 CLI 소비면에서 끊겼다(치명)")
+                if _mo_rc("{not json") != EXIT_UNREADABLE:
+                    fails.append("machine-origin CLI: 입력 파싱 실패가 2(판정 불가)가 아니다 — "
+                                 "훅 fail-closed 분기가 근거를 잃는다")
+                if _mo_rc(json.dumps({"prompt": "   "})) != EXIT_UNREADABLE:
+                    fails.append("machine-origin CLI: 빈 프롬프트가 2(판정 불가)가 아니다")
+                # ★크래시→2 검체(P3C fail-open 봉합 핀): 판정 본문(read_delivery)이 미포착
+                #   예외를 내면 인터프리터 기본 exit 1(=오너 타이핑 간주 → 스폰 개방)로 새지
+                #   않고 2(판정 불가)로 접혀야 한다. 밀폐 유지: 프로세스 밖으로 나가지 않고
+                #   모듈 전역을 in-process 로 바꿨다가 finally 로 복원한다(부작용 0).
+                def _mo_boom():
+                    raise RuntimeError("selftest-crash(판정 본문 인위 예외)")
+                _mo_orig_rd = globals()["read_delivery"]
+                try:
+                    globals()["read_delivery"] = _mo_boom
+                    if _mo_rc(json.dumps({"prompt": "너는 마스터다"},
+                                         ensure_ascii=False)) != EXIT_UNREADABLE:
+                        fails.append("machine-origin CLI: 판정 본문 크래시가 2(판정 불가)가 "
+                                     "아니다 — 미포착 예외가 exit 1(오너 간주)과 값을 공유해 "
+                                     "훅 스폰 게이트가 열린다(fail-open)")
+                finally:
+                    globals()["read_delivery"] = _mo_orig_rd
+                if os.path.exists(_mp3):
+                    fails.append("machine-origin CLI 가 임무 대장을 만들었다 — 판정 전용 계약 "
+                                 "위반(무기록·무부작용)")
+
                 _reset_ledgers()
                 _mp2 = ledger_path()
                 if os.path.exists(_mp2):
@@ -2724,18 +2838,23 @@ def cmd_self_test():
           "자격 미달 구간 뒤의 자격 구간 탐지 · 오너 정상 프롬프트 무차단 코퍼스 8종 · "
           "★R7: 조각 상한 초과 고지+창 안 접기(fail-closed) · 원장에 없는 초과분 행 접기 · "
           "정상 일치 사유 무덮어쓰기 · 창 밖은 오너 무차단(부트스트랩 불가침) · "
-          "비정수 parts_capped 도 접기 · 초과 없으면 무발행)"
+          "비정수 parts_capped 도 접기 · 초과 없으면 무발행 · "
+          "★machine-origin CLI: 라벨=0 · 원장일치=0 · 오너=1 · 파싱실패/빈입력=2 · "
+          "판정본문 크래시=2(fail-open 봉합) · 대장 무기록)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 
 
-_USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|delivery-path] [--self-test]
+_USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|delivery-path|machine-origin] [--self-test]
   record : stdin=UserPromptSubmit hook JSON → 임무 대장 갱신(훅 전용)
   status : 0=임무 있음(자율 착수 가) / 1=임무 없음(보고·정지) / 2=판독 불가(=없음 취급)
   set    : 오너 확인 채널(`cys feed push --wait` exit 0) 승인 시에만 기록
            — **이 명령 경로로는** 자기해제 불가(파일 직접 조작은 별개 · 보장 범위는
              docs/THREAT-MODEL-mission-gate.md)
   clear  : 대장 폐기  ·  path : 대장 경로 1줄  ·  delivery-path [--json] : 배달 원장 진단
+  machine-origin : stdin=UserPromptSubmit hook JSON → 기계 유래 **판정만**(무기록·무부작용).
+           0=기계 유래(층1 원장 대조·층2 라벨) / 1=아님(오너 타이핑 간주) / 2=판정 불가.
+           소비자는 role-bootstrap.sh 스폰 게이트(§4-10 부트층 유사체 차단 · fail-closed)
 """
 
 
@@ -2745,7 +2864,8 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else "status"
     rest = argv[2:]
     table = {"record": cmd_record, "status": cmd_status, "set": cmd_set,
-             "clear": cmd_clear, "path": cmd_path, "delivery-path": cmd_delivery_path}
+             "clear": cmd_clear, "path": cmd_path, "delivery-path": cmd_delivery_path,
+             "machine-origin": cmd_machine_origin}
     fn = table.get(cmd)
     if fn is None:
         sys.stderr.write(_USAGE)

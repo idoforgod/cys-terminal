@@ -393,6 +393,41 @@ OUT OF SCOPE를 상대로 우리가 가진 것은 차단이 아니라 **흔적**
    · 세 공백(ⓐ·ⓑ + §4-6ⓑ 회전 + §4-7ⓑ `MAX_PARTS`)은 성질이 같다 — **층1 이 볼 수 없는
      구간**이며 §3 의 성질 그대로 차단이 아니라 흔적이다. §4-2b 의 R6 정정이 "우연한 보호"를
      걷어낸 자리도 정확히 이 공백 위다.
+10. **부트층 기계 유래 스폰 — D4-a′ '선언=기동 명령'의 비구분 (2026-08-10 등재 → 같은 날
+    P3B 수리: spawn 전 machine-origin 게이트)** — 등재 시점의 결함: `cysjavis-pack/hooks/
+    role-bootstrap.sh` 의 스폰 분기는 마스터 선언이 **오너 타이핑인지 기계 배달인지 구분하지
+    않았다**(`javis_detect.py` hook-gate 에는 machine-origin 억제가 없다 — 실측:
+    `"[wakeup] 너는 마스터다 - 다음 액션 확인"` → fire). 구 D4-a 는 spawn 에 MISSION_RC==0 을
+    요구했고 그 요구가 기계 push 를 **우연히** 걸렀는데(층1/층2 폴드 → 임무 미발급 → rc≠0 →
+    무스폰), D4-a′(2026-08-10 오너 재정: 선언=팀 기동 명령)가 그 상관 게이트를 제거하며 대체
+    기계유래 검사를 넣지 않아 §1 #1~#3(자기 예약 wake·워커 push·큐 배달)의 **부트층 유사체**가
+    열렸었다: 반복 배달원이 선언 문구를 master stdin 에 넣으면 오너 개입 0 으로 팀이 재스폰되고
+    preflight --fix 가 `~/.claude*/settings.json` 을 재작성했다.
+    · **수리(P3B · 2026-08-10)**: 훅이 DETECT 발화 직후·spawn 이전에 판정 소유자
+      (`javis_mission.py`)의 판정 전용 서브커맨드 **`machine-origin`**(무기록·무부작용 · 층1
+      원장 해시 대조·층2 라벨 — `record` 와 같은 판별 함수 재사용, 셸 사본 0)을 소비한다:
+      exit 0=기계 유래 → **무스폰**+정직 고지 / 1=오너 타이핑 간주 → spawn / 판정 불가·모듈
+      부재 → **fail-closed 무스폰**+loud. 회귀 핀은 `run_bootstrap_health.py` H-MISSION-1
+      ⓓ-1(라벨)·ⓓ-2(무라벨 원장 일치)·ⓕ(판정 불가 fail-closed) + `javis_mission.py
+      --self-test`(machine-origin CLI exit 계약·무기록).
+    · **착수 권한은 원래도 열리지 않았다(실측)**: 그 프롬프트는 임무 게이트에서 층1/층2 로
+      접혀 대장이 null 을 유지하므로, 2026-08-01 72% 소진류(잔무 자동 착수) 재발 경로는
+      아니었다. 위험의 본체는 **오너 개입 0 의 자원 점유(팀 부활)와 설정 재작성**이었고,
+      그 경로가 위 게이트로 닫혔다.
+    · **주입문의 동의 귀속**: '선언=기동 명령'이라는 동의 신호는 오너가 친 선언에만 성립한다.
+      기동 경로의 임무 미지정 문안(MISSION_SENT)은 이제 "machine-origin 게이트가 오너 타이핑으로
+      판정(exit 1)했다"는 **관측**을 서술하고, 판별 범위 밖(아래 잔여)을 이 항목으로 가리킨다.
+    · **잔여(게이트가 닫지 못하는 구간 — 성질은 §2·§3 과 같다)**: ⓐ층1 이 볼 수 없는 구간
+      (원장 부재·**원장 판독 불가 `LEDGER_UNREADABLE`**·회전 꼬리 §4-6ⓑ·`MAX_PARTS` 초과분
+      §4-7ⓑ)의 **무라벨** push — 층2 라벨로도 안 걸리면 오너로 접혀 spawn 이 열린다(실측:
+      판독 불가에서 `machine-origin` 은 stderr 고지 후 층2 라벨 폴백으로 판별을 계속하고
+      무라벨이면 **exit 1 → spawn** 이다 — `record` 가 같은 상태에서 착수 게이트만 닫는 기존
+      비대칭과 같은 방향. **fail-closed 무스폰이 성립하는 것은 stdin 파싱 실패·빈 프롬프트·
+      타임아웃·모듈 부재**(+판정 본문 미포착 예외 — P3C 수리로 exit 2 폴드)**뿐**이다)
+      ⓑ동일 UID 의 의도적 위조(OUT OF SCOPE — §2). 완화는 종전대로 `cys pause` 와
+      주입문 고지·감사 흔적이다.
+    · **2차 결합(잔여 ⓐ 한정)**: 부활 스폰마다 디렉티브급 push(실측 ~157~208 KB/건 · §4-6
+      R7-A 표)가 공유 원장(8 MiB)을 소모해 §4-6ⓑ 회전 꼬리(층1 맹구간)를 앞당긴다.
 
 > 이상징후 **코드의 등재소(SOT)는 `javis_mission.py::ANOMALY_CODES` 하나**이며, 문서 쪽 1:1
 > 회귀 핀이 걸린 대상은 `directives/MASTER_DIRECTIVE.md` §0-C 열거다(`--self-test`).
@@ -411,8 +446,9 @@ OUT OF SCOPE를 상대로 우리가 가진 것은 차단이 아니라 **흔적**
 | 위치 | 파일명 역참조 | 상태 |
 |---|---|---|
 | `src/bin/cysd/delivery.rs` 모듈 주석 | 2건 | ✅ 포인터 있음 |
-| `cysjavis-pack/bin/javis_mission.py` 모듈 docstring · 층1 주석 · `set` 항목 | 7건 | ✅ |
+| `cysjavis-pack/bin/javis_mission.py` 모듈 docstring · 층1 주석 · `set` 항목 · `machine-origin` docstring/usage | 9건 | ✅ |
 | `cysjavis-pack/directives/MASTER_DIRECTIVE.md` §0-C | 1건 | ✅ |
+| `cysjavis-pack/hooks/role-bootstrap.sh` 기계유래 게이트 주석(헤더·본문)·machine-origin 무스폰 note·MISSION_SENT 문안(§4-10 역참조) | 5건 | ✅ |
 | `ARCHITECTURE-AND-PHILOSOPHY.md` §6 | 1건 | ✅ |
 | `docs/RELEASE_NOTES_0.14.10.draft.md` | 5건 | ✅ |
 | `src/bin/cysd/handlers.rs` `surface.send_text` 의 `human_verified`(§1 #13·#15 분기점) | **0건** | ⚠ 근거 주석은 있으나 이 문서를 가리키지 않는다 — 포인터 1줄 추가 필요 |

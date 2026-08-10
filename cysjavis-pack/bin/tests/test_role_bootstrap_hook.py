@@ -153,19 +153,26 @@ def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=No
     env["CYS_PACK_DIR"] = pack
     env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
     env.pop("CYS_SOCKET", None)
+    # ★기계유래 스폰 게이트(2026-08-10 P3B): 훅은 spawn 전에 javis_mission machine-origin 으로
+    #   배달 원장을 **읽는다**(층1 해시 대조). 러너 환경의 CYS_STATE_DIR 이 새면 실사용 원장이
+    #   판정에 끼어들어 FIRE 행렬이 실행 위치에 따라 흔들린다(결정론 파괴) — HOME 격리(tempdir)에
+    #   맞춰 명시 제거한다(원장 경로가 격리 HOME 아래로 해소되게 · run_bootstrap_health._base_env
+    #   와 같은 규율).
+    env.pop("CYS_STATE_DIR", None)
     # ★A2 surface 이중 게이트(T-0147-7 W1a): 훅은 cys pane 안에서만 발화한다. 이 하네스는
     # 'cys pane 안'을 재현하므로 CYS_SURFACE_ID를 **명시** 주입한다 — os.environ 상속에 의존하면
     # 테스트 결과가 실행 위치(cys pane 안/밖)에 따라 흔들린다(결정론 파괴).
     env.pop("AITERM_SURFACE_ID", None)
-    # ★임무 게이트(2026-08-01 D4-a): 훅의 **발화(spawn)** 는 이제 "오너가 이 세션에 임무를
-    #   지정했는가"로 갈린다 — 임무가 없으면 관측·기록만 하고 노드를 띄우지 않는다.
-    #   이 하네스가 재는 것은 **감지·게이트 배선**(A2·A4·A3=B7·G9·G25)이고 그 계약은
-    #   '선언을 감지하면 발화한다'이므로, 발화가 계약인 조건 = 임무 지정 세션을 명시 주입한다
+    # ★임무 게이트(2026-08-10 D4-a′ 오너 재정): 훅의 **발화(spawn)** 는 이제 임무 유무와
+    #   무관하다(선언=기동 명령) — 임무 게이트 exit 는 주입문의 **착수 규율 문안**(MISSION_SENT)
+    #   만 가른다. 이 하네스가 재는 것은 **감지·게이트 배선**(A2·A4·A3=B7·G9·G25)이므로,
+    #   문안 변인을 고정하기 위해 임무 지정 세션을 명시 주입한다
     #   (실재 수단: `javis_mission.gate()` ①번 신호 `CYS_MISSION`).
     #   ★정정(2026-08-01 R2 적발 (d)): 이 변수를 자동으로 채우는 launcher 는 **없다** — pane env 는
     #   데몬 프로세스 env 를 상속하므로 `cys launch-agent` 호출 시점의 값은 전달되지 않는다.
     #   여기서는 하네스가 직접 주입한다. 상속에 기대면 실행 위치에 따라 결과가 흔들린다(결정론 파괴).
-    #   ※임무 미지정 경로(신규 사용자 · spawn 0)의 계약은 run_bootstrap_health H-MISSION-1 소속.
+    #   ※임무 미지정 경로(신규 사용자 · spawn 1 + 착수금지 문안)의 계약은
+    #     run_bootstrap_health H-MISSION-1 소속.
     env["CYS_MISSION"] = "test_role_bootstrap_hook 검체 임무(오너 지정 가정)"
     if surface_env:
         env["CYS_SURFACE_ID"] = "7"
