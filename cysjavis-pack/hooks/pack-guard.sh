@@ -20,7 +20,8 @@ try:
   ti = json.load(sys.stdin).get('tool_input', {})
   print(ti.get('file_path', '') or ti.get('path', ''))
 except Exception:
-  print('')" 2>/dev/null)
+  print('')" 2>/dev/null | tr -d '\r')
+# ★CR 제거(2026-08-10 Windows 실기 H-WIN-5): 네이티브 python \r\n — 경로 꼬리 CR 차단(unix 무변).
 [ -z "$FP" ] && exit 0
 
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
@@ -36,7 +37,7 @@ REL="${_FP_N#"$_PACK_N"/}"
 # 세션·파일당 1회 코얼레싱 스탬프.
 SID=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('session_id', 'nosession'))
-except Exception: print('nosession')" 2>/dev/null)
+except Exception: print('nosession')" 2>/dev/null | tr -d '\r')
 STAMP_DIR="${TMPDIR:-/tmp}/cys-pack-guard"
 mkdir -p "$STAMP_DIR" 2>/dev/null
 KEY=$(printf '%s' "$REL" | tr '/. ' '___')

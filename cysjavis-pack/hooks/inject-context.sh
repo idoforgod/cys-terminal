@@ -20,13 +20,17 @@ INPUT=$(cat 2>/dev/null)
 # JSON stdin 을 python 1회 스폰으로 source·cwd 동시 파싱(콜드스타트 절감 — 기존 2회 스폰 병합).
 # __CYS_END__ sentinel 로 cwd 공백 시에도 필드 경계를 결정론 보존($()가 후행 개행을 삭제해도
 # 마지막 줄이 sentinel 이라 두 read 가 정확히 source·cwd 를 집는다). 어떤 예외든 graceful(startup/'').
+# ★CR 제거(2026-08-10 Windows 실기 run 31404860883 근저원인): 네이티브 Windows python 은
+#   **파이프에도 \r\n** 을 쓴다 — 꼬리 CR 이 SOURCE 완전일치(case)와 CWD 상향탐색을 무너뜨린다.
+#   cwd 가 프로젝트 루트보다 깊으면 dirname 이 첫 상승에서 CR 성분을 버려 우연히 살고, cwd 가
+#   **루트 자신**이면 첫 -f 판정부터 전멸한다(작업기억 미발견). unix python 은 \n 만 내므로 무변.
 _PARSED=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
     d=json.load(sys.stdin)
     print(d.get('source','startup')); print(d.get('cwd',''))
 except Exception:
     print('startup'); print('')
-print('__CYS_END__')" 2>/dev/null)
+print('__CYS_END__')" 2>/dev/null | tr -d '\r')
 { IFS= read -r SOURCE; IFS= read -r CWD; } <<< "$_PARSED"
 [ -z "$SOURCE" ] && SOURCE="startup"
 # ── G19: 절대경로 게이트를 드라이브 경로까지 (Windows `C:\proj` cwd 공란화 해소) ──

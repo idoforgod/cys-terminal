@@ -19,12 +19,13 @@ ROOT="${CYS_ROOT:-$HOME}"
 # 미해소(빈 값)면 이 훅은 판정 재료를 얻을 수 없으므로 조용히 통과한다(기존 graceful 계약 유지).
 [ -n "$CYS_PY" ] || exit 0
 
+# ★CR 제거(2026-08-10 Windows 실기 H-WIN-5): 네이티브 python \r\n — 경로 꼬리 CR 차단(unix 무변).
 TRANSCRIPT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('transcript_path',''))
-except Exception: print('')" 2>/dev/null)
+except Exception: print('')" 2>/dev/null | tr -d '\r')
 CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
-except Exception: print('')" 2>/dev/null)
+except Exception: print('')" 2>/dev/null | tr -d '\r')
 # G19: 드라이브/UNC 경로 정규화 후 절대경로 판정(Windows `C:\` cwd 공란화 해소·POSIX 무변경)
 CWD="$(cys_norm_cwd "$CWD")"
 cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (무한루프 방지)

@@ -15,16 +15,18 @@ set +e
 INPUT=$(cat 2>/dev/null)
 # 인터프리터 해소는 프리루드(python3→python→py) — 기존 계약(비어 있으면 안 됨)은 명시 폴백.
 [ -n "$CYS_PY" ] || CYS_PY="python3"
+# ★CR 제거(2026-08-10 Windows 실기 H-WIN-5): 네이티브 python 은 파이프에도 \r\n 을 쓴다 —
+#   꼬리 CR 이 cwd 상향탐색·이벤트 완전일치를 무너뜨린다(unix 무변 · inject-context 동일 규약).
 CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
-except Exception: print('')" 2>/dev/null)
+except Exception: print('')" 2>/dev/null | tr -d '\r')
 # G19: 드라이브/UNC 경로 정규화 후 절대경로 판정(Windows `C:\` cwd 공란화 해소·POSIX 무변경)
 CWD="$(cys_norm_cwd "$CWD")"
 cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (무한루프 방지)
 EVENT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
  d=json.load(sys.stdin); print(d.get('hook_event_name', d.get('trigger','event')))
-except Exception: print('event')" 2>/dev/null)
+except Exception: print('event')" 2>/dev/null | tr -d '\r')
 
 ROOT="${CYS_ROOT:-$HOME}"
 DIR="$CWD"; RD=""; PREV=""
