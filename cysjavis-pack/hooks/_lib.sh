@@ -233,6 +233,14 @@ except subprocess.TimeoutExpired:
 # Windows 비로그인 셸(`bash -c`)은 HOME이 없어 `$HOME/.cys/state` 가 `/.cys/state` 로
 # 붕괴한다. Rust측 spawn_env_pairs(HOME←USERPROFILE backfill)의 셸 대응물이다.
 CYS_STATE_DIR="${CYS_STATE_DIR:-${HOME:-${USERPROFILE:-.}}/.cys/state}"
+# ★네이티브 표기 정규화(2026-08-10 Windows 실기 H-MISSION-1 · run 31400677188): Git Bash(msys)는
+#   기동 시 HOME 을 POSIX(/c/…)로 변환하므로 그 값으로 만든 CYS_STATE_DIR 은 POSIX 경로가 된다.
+#   msys 는 네이티브 자식에게 PATH·HOME·TMP 류만 되변환하고 **커스텀 변수는 그대로** 넘기므로,
+#   네이티브 python(javis_mission·javis_bootstrap — state_dir() 이 env 우선)이 `/c/…` 를
+#   `C:\c\…` 로 오해석해 배달 원장·임무 대장을 통째로 못 봤다 — 층1(원장 해시 대조)이 무너져
+#   라벨 없는 기계 배달이 오너 타이핑으로 오판되고 spawn 이 열렸다(§4-10 재개방).
+#   cygpath 실재 환경(Windows)만 네이티브로 접고, unix 는 무변환이다(cys_native_path 계약).
+CYS_STATE_DIR="$(cys_native_path "$CYS_STATE_DIR")"
 export CYS_STATE_DIR
 
 # ─────────────────────────────────────────────────────────────────────────────

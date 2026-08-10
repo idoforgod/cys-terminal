@@ -2529,28 +2529,41 @@ def h_win_2():
              "%s 에 구 `/*` 전용 게이트가 남았다" % f)
     notes = ["정적: 4훅 전수 cys_is_abs"]
     with tempfile.TemporaryDirectory() as tmp:
-        # $TMP 안에 'C:' 디렉터리를 만들고 cwd를 상대 해석시켜 드라이브 경로를 macOS에서 재현.
-        drive = os.path.join(tmp, "C:")
-        os.makedirs(os.path.join(drive, "proj", "_round"), exist_ok=True)
-        os.makedirs(os.path.join(drive, "proj", "tests"), exist_ok=True)
-        _w(os.path.join(drive, "proj", "_round", "SESSION_STATE.md"), "WIN-STATE-MARKER\n", 0o644)
+        if os.name == "nt":
+            # ★Windows 실기(run 31400677188 근저원인): 종전 픽스처는 $TMP 안에 'C:' **리터럴
+            #   디렉터리**를 만들어 cwd 상대 해석으로 드라이브 경로를 재현하는 macOS 전용
+            #   트릭이었다 — NTFS 는 파일명에 콜론을 금지하고, ntpath.join 은 'C:' 성분을 드라이브
+            #   상대 표기로 접어 **통째로 소실**시킨다. 그 결과 훅은 실재하지 않는 실제 C:/proj 를
+            #   상향탐색했다(검체가 아니라 픽스처 전제가 거짓). 실 Windows 에서는 **실 tmp
+            #   절대경로 자체가 드라이브 경로**이므로 그것을 2표기(C:/…·C:\…)로 넘긴다 —
+            #   실물 드라이브 cwd 상향탐색의 더 직접적인 측정이다(검체 약화 아님).
+            projroot = os.path.join(tmp, "proj")
+            cwds = (projroot.replace("\\", "/") + "/sub",
+                    projroot.replace("/", "\\") + "\\sub")
+        else:
+            # $TMP 안에 'C:' 디렉터리를 만들고 cwd를 상대 해석시켜 드라이브 경로를 macOS에서 재현.
+            projroot = os.path.join(tmp, "C:", "proj")
+            cwds = ("C:/proj/sub", "C:\\proj\\sub")
+        os.makedirs(os.path.join(projroot, "_round"), exist_ok=True)
+        os.makedirs(os.path.join(projroot, "tests"), exist_ok=True)
+        _w(os.path.join(projroot, "_round", "SESSION_STATE.md"), "WIN-STATE-MARKER\n", 0o644)
         pack = os.path.join(tmp, "pack")
         _w(os.path.join(pack, "bin", "javis_memory.py"), "import sys; sys.exit(1)\n", 0o644)
         env = _base_env({"HOME": os.path.join(tmp, "home"), "CYS_PACK_DIR": pack})
-        for cwd in ("C:/proj/sub", "C:\\proj\\sub"):
+        for cwd in cwds:
             payload = json.dumps({"source": "clear", "cwd": cwd, "hook_event_name": "Stop",
                                   "transcript_path": ""})
             r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env, cwd=tmp)
             need("WIN-STATE-MARKER" in r.stdout,
                  "inject-context: cwd=%r 에서 작업기억 미발견" % cwd)
             r = _run([BASH, _hook("save-state.sh")], input=payload, env=env, cwd=tmp)
-            need("Stop" in _read(os.path.join(drive, "proj", "_round", ".state_log")),
+            need("Stop" in _read(os.path.join(projroot, "_round", ".state_log")),
                  "save-state: cwd=%r 에서 write-ahead 미기록" % cwd)
-            os.remove(os.path.join(drive, "proj", "_round", ".state_log"))
+            os.remove(os.path.join(projroot, "_round", ".state_log"))
             r = _run([BASH, _hook("reflect-scan.sh")], input=payload, env=env, cwd=tmp)
-            need("WARN:memory" in _read(os.path.join(drive, "proj", "_round", ".state_log")),
+            need("WARN:memory" in _read(os.path.join(projroot, "_round", ".state_log")),
                  "reflect-scan: cwd=%r 에서 _round 해소 실패" % cwd)
-            os.remove(os.path.join(drive, "proj", "_round", ".state_log"))
+            os.remove(os.path.join(projroot, "_round", ".state_log"))
             # vibe-regression 은 상향탐색이 아니라 cwd 를 **직접** 쓴다 → 루트 표기로 대입.
             r = _run([BASH, os.path.join(HOOKS_DIR, "vibecoding", "vibe-regression.sh")],
                      env=env, cwd=tmp, input=json.dumps(
@@ -2681,23 +2694,45 @@ def h_win_5():
         calib = "구 인벤토리 %d훅 중 %d훅 FIRE" % (len(old_sh), fired)
 
     # ── 기능: python3 부재·python 만 있는 PATH 에서 대표 훅이 정상 동작 ──
-    real = shutil.which("python3") or PY
+    # ★nt 는 shim 표적을 하네스 자신의 인터프리터(PY)로 고정한다 — Windows 의 `python3` 는
+    #   Store 실행 별칭(실행 불능 스텁)일 수 있어 which 결과를 믿을 수 없다(PY 는 항상 실재).
+    real = PY if os.name == "nt" else (shutil.which("python3") or PY)
+    tools = ("sh", "bash", "env", "sed", "grep", "date", "wc", "tr", "awk", "head",
+             "tail", "cat", "cut", "sort", "dirname", "basename", "ls", "rm", "mkdir",
+             "sleep", "printf", "git", "locale", "stat", "uname", "mktemp", "chmod")
     with tempfile.TemporaryDirectory() as tmp:
         binp = os.path.join(tmp, "bin")
         _w(os.path.join(binp, "python"), '#!/bin/sh\nexec "%s" "$@"\n' % real)
-        for tool in ("sh", "bash", "env", "sed", "grep", "date", "wc", "tr", "awk", "head",
-                     "tail", "cat", "cut", "sort", "dirname", "basename", "ls", "rm", "mkdir",
-                     "sleep", "printf", "git", "locale", "stat", "uname", "mktemp", "chmod"):
-            src = shutil.which(tool)
-            if src and not os.path.exists(os.path.join(binp, tool)):
-                os.symlink(src, os.path.join(binp, tool))
+        if os.name == "nt":
+            # ★심링크 팜 금지(Windows 실기 run 31400677188 근저원인): NTFS 심링크로 exe 를 격리
+            #   디렉터리에 옮기면 Windows 로더의 DLL 탐색이 **심링크 위치** 기준이라 msys 도구가
+            #   자기 옆의 msys-2.0.dll 을 못 찾아 **무음 스폰 실패**한다 → `$(dirname "$0")` 가
+            #   공출력 → 프리루드 1단 해소 실패 → 전 훅 loud-skip('_lib.sh 소실') 강등.
+            #   격리의 목적은 'python3 부재'이지 coreutils 부재가 아니므로, 도구의 **실 디렉터리**
+            #   를 그대로 PATH 에 얹되 python3 를 내놓는 디렉터리는 제외한다. 전제(python3
+            #   미해소)는 아래 need 가 최종 PATH 전체에 대해 그대로 못 박는다 — 검체 약화 아님.
+            dirs = []
+            for tool in tools:
+                src = shutil.which(tool)
+                if not src:
+                    continue
+                d = os.path.dirname(src)
+                if d not in dirs and shutil.which("python3", path=d) is None:
+                    dirs.append(d)
+            iso_path = os.pathsep.join([binp] + dirs)
+        else:
+            for tool in tools:
+                src = shutil.which(tool)
+                if src and not os.path.exists(os.path.join(binp, tool)):
+                    os.symlink(src, os.path.join(binp, tool))
+            iso_path = binp
         # bash 해소는 모듈 상수 BASH(W-A) — 종전 이 자리의 지역 해소가 모듈로 승격됐다.
         proj = os.path.join(tmp, "proj")
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "NOPY3-MARKER\n", 0o644)
-        env = _base_env({"HOME": os.path.join(tmp, "home"), "PATH": binp,
+        env = _base_env({"HOME": os.path.join(tmp, "home"), "PATH": iso_path,
                          "CYS_PACK_DIR": os.path.join(tmp, "nopack")})
-        need(shutil.which("python3", path=binp) is None, "격리 PATH 에 python3 가 남아 있다")
+        need(shutil.which("python3", path=iso_path) is None, "격리 PATH 에 python3 가 남아 있다")
         payload = json.dumps({"source": "clear", "cwd": proj, "hook_event_name": "PreCompact"})
         r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env)
         need(r.returncode == 0 and "NOPY3-MARKER" in r.stdout,

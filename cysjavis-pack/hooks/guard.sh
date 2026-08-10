@@ -980,8 +980,22 @@ if [ -z "$PYBIN" ]; then
   run_loose_backstop
 fi
 
-PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
-RC=$?
+# ★H-WIN-1(2026-08-10 Windows 실기 run 31400677188): PYSRC(≈42k자)를 `-c` argv 로 넘기면
+#   Windows CreateProcess 명령행 상한(32,767자)에 걸려 **파서 스폰 자체가 실패**한다(E2BIG) —
+#   모든 판정이 bash 백스톱으로 강등돼, Write 차단은 우연히(cygwin basename 이 백슬래시를
+#   성분으로 취급) 살아남지만 LOOSE 의 writers(tee 등) 헌법파일 차단이 무음 통과했다.
+#   → 소스를 mktemp 파일로 내리고 파일 경로(cys_native_path 변환)로 실행한다. mktemp/쓰기
+#   불가 환경만 종전 argv 경로로 폴백한다(POSIX 는 argv 상한이 커서 종전 경로도 안전).
+GUARD_PYFILE="$(mktemp "${TMPDIR:-/tmp}/.guard_pysrc.XXXXXX" 2>/dev/null || printf '%s' '')"
+if [ -n "$GUARD_PYFILE" ] && printf '%s' "$PYSRC" > "$GUARD_PYFILE" 2>/dev/null; then
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" "$(cys_native_path "$GUARD_PYFILE")" 2>/tmp/.guard_py_err.$$)"
+  RC=$?
+  rm -f "$GUARD_PYFILE" 2>/dev/null
+else
+  [ -n "$GUARD_PYFILE" ] && rm -f "$GUARD_PYFILE" 2>/dev/null
+  PYOUT="$(printf '%s' "$INPUT" | GUARD_PAUSED="$GUARD_PAUSED" GUARD_ACTIVE="$GUARD_ACTIVE" GUARD_CONST_AUTH="$GUARD_CONST_AUTH" GUARD_CONST_SCOPE="$GUARD_CONST_SCOPE" GUARD_PREFLIGHT="$PREFLIGHT" "$PYBIN" -c "$PYSRC" 2>/tmp/.guard_py_err.$$)"
+  RC=$?
+fi
 rm -f /tmp/.guard_py_err.$$ 2>/dev/null
 if [ "$RC" -eq 0 ]; then
   exit 0
