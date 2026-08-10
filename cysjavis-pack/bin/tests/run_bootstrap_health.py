@@ -201,7 +201,16 @@ def _rb_sandbox(tmp, *, boot_body=None, surface=True, mock_py=None, pack_has_boo
     _mock_cys(bindir, tmp, 'case "$1" in surface-role) echo ""; exit 0;; esac')
     if mock_py:
         _w(os.path.join(bindir, "python3"), mock_py)
-    env = _base_env({"HOME": home, "CYS_PACK_DIR": pack,
+    # ★CYS_STATE_DIR 명시 핀(2026-08-10 Windows 실기 run 31403557039 근저원인): 종전엔 HOME 만
+    #   덮어 상태를 격리했는데, **ntpath.expanduser 는 env HOME 을 무시**하고 USERPROFILE 을
+    #   쓴다(javis_bootstrap.HOME=expanduser("~")). 그래서 Windows 에서는 env 미설정 네이티브
+    #   python(ⓓ-2 원장 픽스처 등)이 **러너 실사용자 ~/.cys/state** 에 쓰고, 훅 경유 자식은
+    #   _lib.sh 가 샌드박스 HOME 로 만든 CYS_STATE_DIR 을 읽어 — 쓰는 쪽과 읽는 쪽이 갈라져
+    #   층1(배달 원장 대조)이 공전했다(+"어떤 검체도 사용자 HOME 을 건드리지 않는다" 하네스
+    #   계약도 Windows 에서 깨져 있었다). 값은 macOS 에서 _lib.sh 파생값과 문자열까지 동일
+    #   (`<home>/.cys/state`)이라 posix 동작 무변경이고, _lib.sh 는 `${CYS_STATE_DIR:-…}` 로
+    #   기존값을 보존하므로 훅 경유·직접 실행 어느 쪽도 같은 경로를 본다.
+    env = _base_env({"HOME": home, "CYS_PACK_DIR": pack, "CYS_STATE_DIR": state,
                      "PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
     if surface:
         env["CYS_SURFACE_ID"] = "7"
@@ -2694,23 +2703,23 @@ def h_win_5():
         calib = "구 인벤토리 %d훅 중 %d훅 FIRE" % (len(old_sh), fired)
 
     # ── 기능: python3 부재·python 만 있는 PATH 에서 대표 훅이 정상 동작 ──
-    # ★nt 는 shim 표적을 하네스 자신의 인터프리터(PY)로 고정한다 — Windows 의 `python3` 는
-    #   Store 실행 별칭(실행 불능 스텁)일 수 있어 which 결과를 믿을 수 없다(PY 는 항상 실재).
-    real = PY if os.name == "nt" else (shutil.which("python3") or PY)
+    real = shutil.which("python3") or PY
     tools = ("sh", "bash", "env", "sed", "grep", "date", "wc", "tr", "awk", "head",
              "tail", "cat", "cut", "sort", "dirname", "basename", "ls", "rm", "mkdir",
              "sleep", "printf", "git", "locale", "stat", "uname", "mktemp", "chmod")
     with tempfile.TemporaryDirectory() as tmp:
         binp = os.path.join(tmp, "bin")
-        _w(os.path.join(binp, "python"), '#!/bin/sh\nexec "%s" "$@"\n' % real)
         if os.name == "nt":
-            # ★심링크 팜 금지(Windows 실기 run 31400677188 근저원인): NTFS 심링크로 exe 를 격리
-            #   디렉터리에 옮기면 Windows 로더의 DLL 탐색이 **심링크 위치** 기준이라 msys 도구가
-            #   자기 옆의 msys-2.0.dll 을 못 찾아 **무음 스폰 실패**한다 → `$(dirname "$0")` 가
-            #   공출력 → 프리루드 1단 해소 실패 → 전 훅 loud-skip('_lib.sh 소실') 강등.
-            #   격리의 목적은 'python3 부재'이지 coreutils 부재가 아니므로, 도구의 **실 디렉터리**
-            #   를 그대로 PATH 에 얹되 python3 를 내놓는 디렉터리는 제외한다. 전제(python3
-            #   미해소)는 아래 need 가 최종 PATH 전체에 대해 그대로 못 박는다 — 검체 약화 아님.
+            # ★심링크 팜·shim 금지(Windows 실기 run 31400677188/31403557039 근저원인 2건):
+            #   ① NTFS 심링크로 exe 를 격리 디렉터리에 옮기면 Windows 로더의 DLL 탐색이 **심링크
+            #     위치** 기준이라 msys 도구가 자기 옆의 msys-2.0.dll 을 못 찾아 무음 스폰 실패
+            #     → `$(dirname "$0")` 공출력 → 프리루드 1단 강등('_lib.sh 소실').
+            #   ② 확장자 없는 shebang shim(`python`)은 cygdrive 실행권 판정·PATH 탐색이 환경
+            #     의존이라 `command -v python` 해소가 실기에서 침묵 실패했다(exit=0 stderr='').
+            #   격리의 목적은 'python3 부재'이지 coreutils/python 실물 부재가 아니므로, 필요
+            #   도구의 **실 디렉터리**(+ 하네스 인터프리터 PY 의 실 디렉터리)를 그대로 PATH 에
+            #   얹되 python3 를 내놓는 디렉터리는 제외한다. 전제(python3 미해소)는 아래 need 가
+            #   최종 PATH 전체에 대해 그대로 못 박는다 — 검체 약화 아님.
             dirs = []
             for tool in tools:
                 src = shutil.which(tool)
@@ -2719,8 +2728,12 @@ def h_win_5():
                 d = os.path.dirname(src)
                 if d not in dirs and shutil.which("python3", path=d) is None:
                     dirs.append(d)
-            iso_path = os.pathsep.join([binp] + dirs)
+            pydir = os.path.dirname(os.path.abspath(PY))
+            need(shutil.which("python3", path=pydir) is None,
+                 "실 python 디렉터리(%s)가 python3 를 노출 — nt 격리 PATH 전제 구성 불가" % pydir)
+            iso_path = os.pathsep.join(dirs + [pydir])
         else:
+            _w(os.path.join(binp, "python"), '#!/bin/sh\nexec "%s" "$@"\n' % real)
             for tool in tools:
                 src = shutil.which(tool)
                 if src and not os.path.exists(os.path.join(binp, tool)):
@@ -2736,7 +2749,8 @@ def h_win_5():
         payload = json.dumps({"source": "clear", "cwd": proj, "hook_event_name": "PreCompact"})
         r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env)
         need(r.returncode == 0 and "NOPY3-MARKER" in r.stdout,
-             "python3 부재 PATH 에서 inject-context 실패: exit=%d %r" % (r.returncode, r.stderr[-300:]))
+             "python3 부재 PATH 에서 inject-context 실패: exit=%d stderr=%r stdout=%r"
+             % (r.returncode, r.stderr[-200:], r.stdout[-200:]))
         r = _run([BASH, _hook("save-state.sh")], input=payload, env=env)
         need(r.returncode == 0 and "PreCompact" in _read(os.path.join(proj, "_round", ".state_log")),
              "python3 부재 PATH 에서 save-state 실패")
