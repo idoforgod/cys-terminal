@@ -5550,6 +5550,15 @@ def h_w5_c3():
 # 러너
 # ═══════════════════════════════════════════════════════════════════════════
 def main(argv=None):
+    # ★로케일 비의존 I/O(하우스 관례 javis_detect.py · 선례 javis_bootstrap.py R3): windows-latest
+    #   가 stdout 을 cp1252 로 열면 한글 검체 title 인쇄(아래 print(line))가 UnicodeEncodeError 로
+    #   죽어 **판정 전체가 관측 불능**이 된다(run 31395642155). 러너 자신의 스트림만 재설정하므로
+    #   각 검체의 서브프로세스 캡처(별도 파이프·명시 인코딩)에는 영향이 없다.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description="부트스트랩 상시 건강성 1커맨드 게이트")
     ap.add_argument("--json", action="store_true", help="기계 판독 결과(JSON)")
     ap.add_argument("--list", action="store_true", help="검체 대장만 출력")

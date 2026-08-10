@@ -35,6 +35,11 @@ jobs:
   #   부채 V4(무검증 베이스라인)의 재생산이다. 예산이 문제면 트리거(on:)를 좁혀라.
   win-health:
     runs-on: windows-latest
+    env:
+      # ★Windows 러너 stdout 기본 cp1252 방어(run 31395642155): 한글 검체 title 인쇄가
+      #   UnicodeEncodeError 로 죽어 실기 판정 전체가 관측 불능이 되던 결함. 러너 main 진입부
+      #   reconfigure 가드와 이중 수리 — 잡의 모든 python 단계(--json 재실행·요약 인라인 포함)를 덮는다.
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
 
