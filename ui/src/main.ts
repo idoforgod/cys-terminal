@@ -1627,6 +1627,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       // 위로 스크롤 = 즉시 해제 — rAF 판정까지 기다리면 스트리밍 중 write 스냅이 먼저 끌어내려
       // 사용자가 위로 못 올라가는 경주가 생긴다. 실제 위치 판정은 xterm이 휠을 처리한 뒤(rAF).
       if (e.deltaY < 0) follow = false;
+      // ★2026-08-11: WebView2 환경에서 xterm 자체의 마우스휠→스크롤 리포팅(coreMouseService)이
+      // 동작하지 않는 문제의 우회 — PTY 왕복 없이 로컬 뷰포트만 직접 넘긴다(scrollLines는
+      // 스크롤백 탐색일 뿐 PTY로 아무것도 보내지 않으므로 앱의 마우스트래킹 모드와 무관하게 항상 동작).
+      term.scrollLines(e.deltaY > 0 ? 3 : -3);
       requestAnimationFrame(() => {
         follow = atBottom();
       });
@@ -1930,7 +1934,19 @@ function setFocus(sid: number) {
   focusedSid = sid;
   const key = paneKey(sid, current()?.socket);
   for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
-  panes.get(key)?.term.focus();
+  // ★2026-08-11: term.focus() → 내부 textarea.focus()의 브라우저 기본 동작(scroll-into-view)이
+  // 스크롤백을 보던 중이어도 뷰포트를 강제로 바닥(커서 위치)까지 끌어내린다 — 클릭 한 번에
+  // 이전 기록을 볼 수 없게 되는 원인. 포커스 전 뷰포트 위치를 기억했다가 그대로 복원한다.
+  const rt = panes.get(key);
+  if (rt) {
+    const buf = rt.term.buffer.active;
+    const savedViewportY = buf.viewportY;
+    const wasAtBottom = buf.viewportY >= buf.baseY;
+    rt.term.focus();
+    if (!wasAtBottom) {
+      requestAnimationFrame(() => rt.term.scrollToLine(savedViewportY));
+    }
+  }
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
