@@ -239,8 +239,55 @@ fi
 #     델타       : **+21,463,925 B (+20.5MB, +21.0%)** — 비압축 트리 +57MB 가 UDZO 로 약 2.7:1 압축된 값.
 #   ※위 수치의 분모는 python+node 만 담은 부분 스테이지다. 실제 DMG 에는 git·uv·앱 바이너리·UI 가
 #     더 들어가 **분모가 커지므로 증가율은 위보다 작아진다**(절대 델타 ≈ +20.5MB 는 그대로).
+# ── 설치 도우미(Install cys.app) 빌드·서명·공증·staple (3번째 공증 제출) ──
+# 왜: Finder 드래그(=최종 경로 직접 복사)는 트랜잭션이 아니라 복사 도중 최종 경로에 반쪽 번들을
+#   노출한다 → 그 순간 실행하면 "손상되었기 때문에 열 수 없습니다". 설치 도우미가 원자 교체(숨김
+#   스테이징 → 단일 rename/renamex_np)로 그 경합을 제거한다. 원자 로직은 재구현하지 않고 레포 정본
+#   scripts/atomic_bundle.py 를 번들 내부에 봉인해 그대로 부른다(installer.applescript → 번들 내부
+#   install-core.sh → 번들 내부 atomic_bundle.py). ★install-core 는 오직 서명·공증된 번들 내부에서만
+#   실행된다(LPE 방어: DMG 형제·쓰기가능 경로 스크립트를 root 로 실행하는 경로 없음).
+# 기존 app/dmg 서명·공증·staple 경로는 그대로 두고, 설치 도우미를 3번째 공증 제출로 **추가**한다.
+echo "== 설치 도우미(Install cys.app) 빌드·서명·공증·staple (3번째 제출) =="
+INSTALLER_WORK="$(mktemp -d)"
+INSTALLER_APP="$INSTALLER_WORK/Install cys.app"
+osacompile -o "$INSTALLER_APP" scripts/installer-app/installer.applescript
+# CFBundleIdentifier — osacompile 기본값을 com.cysjavis.installer 로 강제(Add 실패 시 Set 폴백).
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.cysjavis.installer" "$INSTALLER_APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.cysjavis.installer" "$INSTALLER_APP/Contents/Info.plist"
+# ★번들 내부 봉인(LPE 방어): 코어 셸 + 정본 원자 교체 파이썬을 Contents/Resources 에 복사한 뒤 서명한다
+#   (복사는 반드시 codesign 前 — 서명이 이 리소스들을 봉인해야 설치 시점 변조가 불가능).
+cp scripts/installer-app/install-core.sh "$INSTALLER_APP/Contents/Resources/install-core.sh"
+cp scripts/atomic_bundle.py            "$INSTALLER_APP/Contents/Resources/atomic_bundle.py"
+chmod 0755 "$INSTALLER_APP/Contents/Resources/install-core.sh"
+# 기존 인증서만: Developer ID Application + hardened runtime + timestamp(app/dmg 와 동일 신원·옵션).
+codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$INSTALLER_APP"
+echo "== 공증: 설치 도우미(zip 제출) → staple =="
+INSTZIP="$INSTALLER_WORK/installer.notarize.zip"
+ditto -c -k --keepParent "$INSTALLER_APP" "$INSTZIP"
+xcrun notarytool submit "$INSTZIP" "${NOTARY_ARGS[@]}" --wait
+xcrun stapler staple "$INSTALLER_APP"
+rm -f "$INSTZIP"
+# 게이트(app/dmg 게이트 동형 · hard-fail): 설치 도우미 자체 Gatekeeper + 공증 티켓.
+if spctl -a -t exec -vv "$INSTALLER_APP" 2>&1 | grep -qi "accepted"; then
+  echo "  ✓ 설치 도우미 spctl: accepted (다른 맥에서도 경고 없이 열림)"
+else
+  echo "  ✗ 설치 도우미 spctl 거부 — 공증 실패. 위 notarytool 결과 확인"; exit 1
+fi
+if xcrun stapler validate "$INSTALLER_APP" >/dev/null 2>&1; then
+  echo "  ✓ 설치 도우미 공증 티켓 stapled"
+else
+  echo "  ✗ 설치 도우미 staple 검증 실패" >&2; exit 1
+fi
+
+# ── DMG 조립: 설치 도우미를 가시 항목으로, cys.app 은 숨김 .support/ 로 ──
+# ★ln -s /Applications 제거: 드래그 설치 자체를 유도하지 않는다(사용자는 'Install cys.app' 만 클릭).
+#   cys.app 은 .support/ 아래로 숨겨 원본으로만 쓰이게 하고, 설치 도우미가 거기서 원자 설치한다.
 echo "== dedup·staple된 앱으로 UDZO DMG 생성(hdiutil — Tauri 기본 포맷과 동일) =="
-DMGSTAGE="$(mktemp -d)"; ditto "$APP" "$DMGSTAGE/cys.app"; ln -s /Applications "$DMGSTAGE/Applications"
+DMGSTAGE="$(mktemp -d)"
+mkdir -p "$DMGSTAGE/.support"
+ditto "$APP"           "$DMGSTAGE/.support/cys.app"   # 원본 앱(숨김) — staple 티켓 승계(ditto)
+ditto "$INSTALLER_APP" "$DMGSTAGE/Install cys.app"    # 가시 항목 = 설치 도우미
+rm -rf "$INSTALLER_WORK"
 mkdir -p "$(dirname "$DMG")"
 hdiutil create -volname "cys" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"
 rm -rf "$DMGSTAGE"

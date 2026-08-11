@@ -35,6 +35,7 @@
 import ctypes
 import os
 import subprocess
+import sys
 
 # ── 완본의 정의 (Rust `VerifySpec::installed()` 와 동일 목록 — 어긋나면 둘 중 하나가 거짓말이다) ──
 REQUIRED_EXECUTABLES = ("cys-app", "cysd", "cys")
@@ -248,3 +249,46 @@ def sweep_stale_staging(dest):
             subprocess.run(["/bin/rm", "-rf", p], check=False)
             swept.append(p)
     return swept
+
+
+# ── 설치 도우미(Install cys.app) 전용 얇은 CLI 래퍼 ────────────────────────────
+# ★로직 이중구현 금지 — 아래는 stage_copy + install_atomically 를 **부르는 배선일 뿐**이다.
+#   설치 도우미의 install-core.sh 는 `/usr/bin/python3 atomic_bundle.py install <src> <dst>` 로 이 경로만
+#   탄다(번들 내부에 봉인된 사본). 계약(순서·검증·실패 처리)은 위 함수들이 곧 정본이다.
+def _cli_install(src, dest):
+    """소스 cys.app 을 목적지에 **원자적으로** 설치한다(신규=rename · 업그레이드=renamex_np SWAP).
+
+    ② 스왑 직전 게이트는 **봉인(codesign)까지** 본다 — 스테이플된 소스의 무결성이 ditto 복사로
+       그대로 승계됐는지 설치 직전에 확인한다(DEMO3: Gatekeeper 승계). 봉인이 깨진 반쪽/변조 소스는
+       목적지를 건드리지 않고 거부된다.
+    ④ 스왑 직후 재검증은 **구조 완본성만**(codesign=False) 본다 — 스왑은 비트를 한 바이트도 바꾸지
+       않으므로 봉인 판정은 ②(같은 비트·스왑 직전)에 이미 있고, 업그레이드 시 살아있는 구 데몬이 새
+       경로에 `.pyc` 를 써 봉인 검사를 깨뜨려 **성공한 교체를 자동 원복**시키는 실측 경합을 피한다
+       (deploy_gate.POST_SWAP_VERIFY 와 동형 · 근거는 deploy_gate.swap_bundle_into_place 주석)."""
+    src = src.rstrip("/")
+    dest = dest.rstrip("/")
+    if not os.path.isdir(os.path.join(src, "Contents")):
+        print(f"✗ 소스가 .app 번들이 아님: {src}", file=sys.stderr)
+        return 2
+    staged = staging_path(dest)
+    try:
+        print(f"① 스테이징 완본 복사 → {staged}")
+        stage_copy(src, staged)
+        print("②③④⑤ 완본 검증 → 원자 교체 → 재검증")
+        previous = install_atomically(staged, dest, post_verify_kwargs={"codesign": False})
+    except BundleError as e:
+        subprocess.run(["/bin/rm", "-rf", staged], check=False)  # 실패 시 스테이징 잔해 정리(설치본 무접촉)
+        print(f"✗ 설치 실패 — {e}", file=sys.stderr)
+        return 1
+    if previous:  # 업그레이드: 스왑으로 밀려난 옛 번들(숨김 스테이징)을 정리
+        subprocess.run(["/bin/rm", "-rf", previous], check=False)
+    print(f"✓ 원자 설치 완료: {dest}")
+    return 0
+
+
+if __name__ == "__main__":
+    _argv = sys.argv[1:]
+    if len(_argv) == 3 and _argv[0] == "install":
+        raise SystemExit(_cli_install(_argv[1], _argv[2]))
+    print("사용: atomic_bundle.py install <SRC cys.app> <DEST cys.app>", file=sys.stderr)
+    raise SystemExit(64)
