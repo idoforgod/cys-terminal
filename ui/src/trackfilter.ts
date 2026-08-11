@@ -86,9 +86,14 @@ export function filterChunk(input: Uint8Array): { out: Uint8Array; carry: Uint8A
     }
     const fin = input[j];
     if (fin !== 0x68 && fin !== 0x6c) {
-      // 'h'/'l' 아님(DECRQM `$p` 등) — 스캔한 원문 전체 통과
-      for (let k = i; k <= j; k++) out.push(input[k]);
-      i = j + 1;
+      // 'h'/'l' 아님(DECRQM `$p` 등) — 스캔한 원문 통과. ★fin 은 소비하지 않고 그 위치에서
+      // 재스캔한다(2026-08-12 R2 확정): 종전처럼 fin 까지 push·i=j+1 로 건너뛰면, fin==ESC
+      // (중단된 후보 직후에 새 시퀀스가 시작하는 `\x1b[?25\x1b[?1003h` 류)에서 뒤따르는 마우스
+      // enable 이 필터를 그대로 통과하고 — 이후 disable(`?1003l`)은 정상 스트리핑돼 걷히므로
+      // pane 이 닫힐 때까지 트래킹이 영구 고착됐다(sticky). fin 을 남겨 두면 ESC 는 다음 루프의
+      // 후보 스캔으로, 일반 바이트는 원문 통과로 각각 올바르게 처리된다(출력 바이트 불변).
+      for (let k = i; k < j; k++) out.push(input[k]);
+      i = j;
       continue;
     }
     // DECSET(h)/DECRST(l) — 마우스 파라미터만 제거, 나머지는 보존해 재조립.

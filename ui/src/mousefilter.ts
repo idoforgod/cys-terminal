@@ -134,9 +134,27 @@ export type OnDataRoute =
 //    앱이 클릭·모션 보고를 정상 소비하므로 빼앗을 이유가 없고, 오폐기의 비용(입력 소실)이
 //    유출 1회보다 크다는 비대칭 원칙도 그대로다.
 //  · pass  → forward(원문 동일 참조 — 바이트 하나 건드리지 않는다는 계약 불변).
-export function routeOnData(data: string, isWindows: boolean): OnDataRoute {
+//
+// ★opts 계약(2026-08-12 R2/R3 확정 — 두 결함의 동시 봉합):
+//  · allowAppMouse: 킬스위치가 켜지면 **분류 없이 원문 forward**(참조 동일). 종전엔 킬스위치가
+//    출력측(trackfilter)만 우회해 앱이 트래킹은 켜는데 보고(클릭·드래그·휠)는 이 필터가 계속
+//    가로채·폐기해 — 킬스위치를 켠 사용자의 TUI(vim mouse=a)가 마우스를 하나도 못 받았다.
+//    킬스위치의 의미는 '앱이 마우스를 갖는다'이므로 입·출력 양측을 함께 우회해야 참이다.
+//  · altScreen: 대체 화면(스크롤백 없는 전체화면 TUI)에서 휠 로컬 스크롤은 no-op이다 — 트래킹
+//    보고가 유출 경로(스트리핑 누락·경계 결함)로 발생한 경우, 비-Windows 는 앱에 forward(앱이
+//    트래킹을 켰으니 소비 의사가 있다)하고 Windows 는 폐기(ConPTY 깨짐이 휠 보고에도 적용 —
+//    no-op 로컬 스크롤과 실효 동일하나 정직한 폐기).
+export function routeOnData(
+  data: string,
+  isWindows: boolean,
+  opts?: { allowAppMouse?: boolean; altScreen?: boolean },
+): OnDataRoute {
+  if (opts?.allowAppMouse) return { action: "forward", data };
   const verdict = classifyMouseReport(data);
   if (verdict.kind === "wheel") {
+    if (opts?.altScreen) {
+      return isWindows ? { action: "discard" } : { action: "forward", data };
+    }
     return { action: "scroll", lines: verdict.dir * WHEEL_LINES * verdict.count };
   }
   if (verdict.kind === "drop" && isWindows) return { action: "discard" };

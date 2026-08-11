@@ -112,3 +112,37 @@ describe("청크 경계 — 어디서 잘라도 통짜와 동일 (앵커④ 봉�
     expect(asStr(carry)).toBe("\x1b[?100");
   });
 });
+
+describe("ESC 중단 후보 직후의 마우스 enable — sticky 고착 봉인 (2026-08-12 R2 확정)", () => {
+  // ★결함 기전: 종전 코드는 h/l 아닌 최종 바이트(fin)를 '소비'하고 j+1 로 건너뛰었다 —
+  // fin==ESC(중단된 DECSET 후보 직후 새 시퀀스 시작)이면 뒤따르는 `?1003h` 가 ESC 없는 일반
+  // 바이트로 흘러 필터를 통과했고, 이후 disable(`?1003l`)은 정상 스트리핑돼 pane 이 닫힐
+  // 때까지 트래킹이 영구 고착됐다. fin 을 남겨 재스캔하면 후속 enable 도 정상 스트리핑된다.
+  it("`ESC[?25` 중단 직후의 `ESC[?1003h` 는 스트리핑된다(통짜)", () => {
+    const f = new MouseTrackingFilter();
+    const got = asStr(f.feed(bytes("\x1b[?25\x1b[?1003hX")));
+    expect(got).toBe("\x1b[?25X");
+  });
+  it("중단 접두 + enable/disable 쌍 — 어느 쪽도 유출되지 않는다", () => {
+    const f = new MouseTrackingFilter();
+    const got = asStr(f.feed(bytes("A\x1b[?25\x1b[?1003hmid\x1b[?1003lB")));
+    expect(got).toBe("A\x1b[?25midB");
+  });
+  it("fin 이 일반 바이트(DECRQM `$p` 류)인 기존 경로는 출력 불변", () => {
+    const f = new MouseTrackingFilter();
+    const s = "q\x1b[?1003$pw";
+    expect(asStr(f.feed(bytes(s)))).toBe(s);
+  });
+  it("청크 경계: 중단 접두와 enable 이 분할돼 와도 동일", () => {
+    const whole = (() => {
+      const f = new MouseTrackingFilter();
+      return asStr(f.feed(bytes("\x1b[?25\x1b[?1003hX")));
+    })();
+    const raw = bytes("\x1b[?25\x1b[?1003hX");
+    for (let cut = 0; cut <= raw.length; cut++) {
+      const f = new MouseTrackingFilter();
+      const got = asStr(f.feed(raw.slice(0, cut))) + asStr(f.feed(raw.slice(cut)));
+      expect(got).toBe(whole);
+    }
+  });
+});

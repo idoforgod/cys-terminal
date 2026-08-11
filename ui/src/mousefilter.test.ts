@@ -234,3 +234,44 @@ describe("routeOnData — 배선 결정(플랫폼 분기 포함)을 순수 함�
     else throw new Error("bracketed paste가 forward가 아니면 붙여넣기가 통째로 사라진다");
   });
 });
+
+describe("routeOnData opts — 킬스위치·alt screen (2026-08-12 R2/R3 확정)", () => {
+  // ★킬스위치 계약: '앱이 마우스를 갖는다'는 입·출력 양측에서 참이어야 한다. 종전엔 출력측
+  // (trackfilter)만 우회해, 킬스위치를 켠 사용자의 TUI(vim mouse=a)가 트래킹은 켜지는데
+  // 클릭·드래그·휠 보고를 입력측 필터가 계속 가로채 마우스를 하나도 못 받았다.
+  it("킬스위치: 휠 보고도 분류 없이 forward 원문 참조 동일 (mac·win)", () => {
+    const wheel = sgr(64, 10, 20);
+    for (const win of [false, true]) {
+      const r = routeOnData(wheel, win, { allowAppMouse: true });
+      expect(r.action).toBe("forward");
+      if (r.action === "forward") expect(r.data).toBe(wheel);
+    }
+  });
+  it("킬스위치: Windows 비-휠 보고도 폐기하지 않고 forward(앱이 마우스를 갖는다)", () => {
+    const click = sgr(35, 10, 20);
+    const r = routeOnData(click, true, { allowAppMouse: true });
+    expect(r.action).toBe("forward");
+    if (r.action === "forward") expect(r.data).toBe(click);
+  });
+  // ★alt screen 계약: 스크롤백 없는 대체 화면에서 휠 로컬 스크롤은 no-op(이중사망)이다 —
+  // 트래킹 보고가 유출 경로로 발생했다면 앱에 소비 의사가 있으니 비-Windows 는 forward.
+  it("alt screen(mac): 휠 보고 → 앱 forward(로컬 스크롤 no-op 이중사망 방지)", () => {
+    const wheel = sgr(64, 10, 20);
+    const r = routeOnData(wheel, false, { altScreen: true });
+    expect(r.action).toBe("forward");
+    if (r.action === "forward") expect(r.data).toBe(wheel);
+  });
+  it("alt screen(win): 휠 보고 → discard(ConPTY 깨짐 — 보고 유출 금지)", () => {
+    expect(routeOnData(sgr(64, 10, 20), true, { altScreen: true })).toEqual({ action: "discard" });
+  });
+  it("alt screen: 일반 텍스트는 여전히 forward 원문 참조 동일", () => {
+    const t = "hello";
+    const r = routeOnData(t, false, { altScreen: true });
+    expect(r.action).toBe("forward");
+    if (r.action === "forward") expect(r.data).toBe(t);
+  });
+  it("opts 생략(normal screen 기본값): 종전 계약 불변 — 휠은 scroll", () => {
+    expect(routeOnData(sgr(65, 1, 1), false)).toEqual({ action: "scroll", lines: 3 });
+    expect(routeOnData(sgr(65, 1, 1), true)).toEqual({ action: "scroll", lines: 3 });
+  });
+});

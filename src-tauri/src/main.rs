@@ -424,6 +424,17 @@ fn ime_debug_enabled() -> bool {
         || cys::home_dir().join(".cys/ime-debug").exists()
 }
 
+/// 앱 마우스 킬스위치 게이트(파일/환경변수 — ime_debug_enabled 와 동형 · 2026-08-12 R3 확정):
+/// USER-MANUAL 이 안내하던 localStorage.cysAllowAppMouse 는 릴리스 빌드에 devtools 가 없어
+/// 최종 사용자가 설정할 수단 자체가 없었다('현장 롤백 채널' 불변식이 출고 산출물에서 허구).
+/// → ~/.cys/allow-app-mouse 파일 존재 또는 CYS_ALLOW_APP_MOUSE=1 이면 트래킹 스트리핑·입력측
+/// 마우스 필터를 모두 우회해 TUI 앱(vim mouse=a 등)이 마우스를 갖는다(새 pane 부터 적용).
+#[tauri::command]
+fn app_mouse_enabled() -> bool {
+    std::env::var("CYS_ALLOW_APP_MOUSE").map(|v| v == "1").unwrap_or(false)
+        || cys::home_dir().join(".cys/allow-app-mouse").exists()
+}
+
 #[tauri::command]
 async fn send_input(
     socket: Option<String>,
@@ -3367,6 +3378,7 @@ fn main() {
             save_pasted_image,
             log_ime,
             ime_debug_enabled,
+            app_mouse_enabled,
             rename_surface,
             resize_surface,
             close_surface,

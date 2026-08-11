@@ -2021,6 +2021,15 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // 리스너 — xterm _inputEvent 포함 — 보다 먼저 실행되므로 유출 시점을 정확히 포착).
   let insertLeak: string | null = null;
 
+  // ★앱 마우스 킬스위치 판독(새 pane부터 · 앱이 마우스를 갖는다 — 입·출력 양측 우회):
+  // localStorage.cysAllowAppMouse="1"(devtools 있는 빌드용) 또는 ~/.cys/allow-app-mouse 파일 /
+  // CYS_ALLOW_APP_MOUSE=1(릴리스 빌드용 — devtools 부재로 localStorage 설정 수단이 없다.
+  // ime_debug 게이트와 동형). ★아래 onData 클로저가 참조하므로 등록 **앞**에서 정의한다 —
+  // 뒤에 두면 attach await 구간의 입력이 TDZ ReferenceError 로 죽는다.
+  const allowAppMouse =
+    localStorage.getItem("cysAllowAppMouse") === "1" ||
+    (await invoke("app_mouse_enabled").catch(() => false)) === true;
+
   term.onData((data) => {
     // ★마우스 보고 필터 (현장 결함 1호 Windows 유출 + 2026-08 macOS 스크롤백 접근 불가).
     // Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면 xterm.js가 마우스 보고를 PTY로 보낸다.
@@ -2032,7 +2041,13 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     //             ESC 소실 `[555;98;34M...`가 리터럴로 무한 타이핑되는 결함 1호 차단).
     //             macOS는 비-휠 보고를 forward 유지(앱의 클릭 소비 보존·오폐기=입력 소실 회피).
     //   forward → 마우스 보고가 아니면 바이트 하나 건드리지 않고 아래 IME 경로로 그대로.
-    const route = routeOnData(data, IS_WINDOWS);
+    // ★opts(2026-08-12): allowAppMouse=킬스위치(분류 없이 원문 forward — 앱이 마우스를 갖는다는
+    //   의미를 입력측까지 관철) · altScreen=대체 화면(스크롤백 없음 — 유출 트래킹의 휠은 로컬
+    //   스크롤 no-op 대신 앱 forward/윈도우 폐기). 판단은 전부 routeOnData(테스트 고정)에 있다.
+    const route = routeOnData(data, IS_WINDOWS, {
+      allowAppMouse,
+      altScreen: term.buffer.active.type === "alternate",
+    });
     if (route.action === "scroll") {
       term.scrollLines(route.lines);
       return;
@@ -2103,8 +2118,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // ★마우스 트래킹 스트리핑(B안 근본 수리 · trackfilter.ts 계약 주석 참조): 앱의 DECSET
   // 1003h/1006h 류가 xterm 에 닿지 않게 걷어내 휠 스크롤·일반 드래그 선택·복사를 기본 동작으로
   // 복원한다. pane 수명 전체 단일 인스턴스 — 스냅샷 재생과 라이브 스트림이 같은 필터를 지난다.
-  // 킬스위치: localStorage.cysAllowAppMouse="1"(새 pane부터) → 필터 우회(앱이 마우스를 갖는다).
-  const allowAppMouse = localStorage.getItem("cysAllowAppMouse") === "1";
+  // 킬스위치 allowAppMouse 는 onData 등록 앞(insertLeak 아래)에서 판독했다 — 여기서는 소비만.
   const trackFilter = new MouseTrackingFilter();
   const un1 = await listen(ev.output_event, (e) => {
     outStamp.t = Date.now();
