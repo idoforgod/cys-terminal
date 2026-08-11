@@ -330,6 +330,11 @@ print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","addi
 fi
 # MO_TOKEN=human: 오너 타이핑 간주(판정 본문 완주 + exit 1 계약의 stdout 표명) — 종전 D4-a′
 # 경로 그대로 진행한다.
+# ★선언 유래 마커(2026-08-12 · 폭주 봉인 ⓑ 실강제): 아래 스폰이 상속하는 env 에 human 판정
+#   통과 사실을 싣는다. javis_bootstrap._dept_fallback 은 이 마커가 있을 때만 부서 자동 생성을
+#   허용한다 — CLAUDE.md §0 폴백(직접 실행)은 마커가 없어 구계약(정당거부 안내)으로 흐른다.
+#   이 export 는 훅 프로세스와 그 자식(부트 스폰)에만 미친다(선언 pane 셸 env 무오염).
+export CYS_DECL_ORIGIN="hook-human"
 
 BOOT="$PACK/bin/javis_bootstrap.py"
 # ★BOOT 부재 명시 실패(증분1): 부서 팩에 javis_bootstrap.py가 없는 레인은 종전엔 조용한 무산이라

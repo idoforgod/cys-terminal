@@ -254,7 +254,9 @@ def make_dept_fb_stubs(tmp, env, home):
         "  sock) echo '%(s)s'; exit 0;;\n"
         "  dept-7) shift; [ \"$1\" = '--' ] && shift; CYS_SOCKET='%(s)s' CYS_PACK_DIR='%(p)s' \"$@\"; exit $?;;\n"
         "esac\nexit 0\n") % {"t": tmp, "s": dept_sock, "p": dept_pack})
-    # cys 스텁 확장: launch-agent → surface:42 + master.flag · list → flag 있으면 master 생존 보고
+    # cys 스텁 확장: launch-agent → surface:42 + master.flag · status --json → 부서장 판정 소스
+    # (★P0 교정 대응: _dept_master_alive 는 이제 status --json 의 agent_alive/seat 를 본다.
+    #  master.flag=agent 살아있는 부서장 · master-shell.flag=allocate 직후의 role=master 빈 셸)
     w(os.path.join(bindir, "cys"), (
         "#!/bin/sh\n"
         "echo \"cys $@ [sock=${CYS_SOCKET:-base}]\" >> \"%(t)s/calls.log\"\n"
@@ -262,6 +264,15 @@ def make_dept_fb_stubs(tmp, env, home):
         "  ping) exit 0;;\n"
         "  claim-role) echo 'claim_denied: privileged role held by live surface' >&2; exit 7;;\n"
         "  launch-agent) echo 'surface:42'; touch \"%(t)s/master.flag\"; exit 0;;\n"
+        "  status)\n"
+        "    if [ -f \"%(t)s/master.flag\" ]; then\n"
+        "      echo '{\"surfaces\":[{\"surface_id\":42,\"role\":\"master\",\"exited\":false,\"agent\":\"claude\",\"agent_alive\":true,\"seat\":\"occupied\"}]}'\n"
+        "    elif [ -f \"%(t)s/master-shell.flag\" ]; then\n"
+        "      echo '{\"surfaces\":[{\"surface_id\":41,\"role\":\"master\",\"exited\":false,\"agent\":null,\"agent_alive\":null,\"seat\":\"empty\"}]}'\n"
+        "    else\n"
+        "      echo '{\"surfaces\":[]}'\n"
+        "    fi\n"
+        "    exit 0;;\n"
         "  list) [ -f \"%(t)s/master.flag\" ] && echo 'surface:42	role=master	pid=1	exited=false	x'; exit 0;;\n"
         "  boot) exit 0;;\n"
         "  send) exit 0;;\n"
@@ -271,6 +282,9 @@ def make_dept_fb_stubs(tmp, env, home):
 
 tmp = tempfile.mkdtemp(prefix="boot-t5fb-")
 env, home = make_env(tmp, claim_exit=1)
+# ★폭주 봉인 ⓑ 실강제(2026-08-12) 대응: 폴백은 훅이 human 판정 직후 스폰에 싣는 마커를
+# 요구한다 — 이 시나리오는 훅 발화 경로를 모사한다(마커 부재 경로의 핀은 5fb-n).
+env["CYS_DECL_ORIGIN"] = "hook-human"
 dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
 code, out, err = run(env)
 check("5fb-a 폴백 성공 exit 0", code == 0, "exit=%d err=%s" % (code, err[-300:]))
@@ -298,6 +312,52 @@ check("5fb-j 재선언 exit 0(멱등)", code2 == 0, "exit=%d" % code2)
 check("5fb-k allocate 1회(재생성 없음)", c2.count("cys-dept allocate") == 1, "count=%d" % c2.count("cys-dept allocate"))
 check("5fb-l launch-agent 1회(생존 master 존중)",
       c2.count("launch-agent --role master") == 1, "count=%d" % c2.count("launch-agent --role master"))
+shutil.rmtree(tmp)
+
+# ── 5-fb-m. ★P0 회귀 핀(2026-08-12 R2 확정): allocate 가 만든 role=master '빈 셸'은
+#    살아있는 부서장이 아니다 — 빈 셸을 생존으로 오판해 launch-agent 를 생략하면 신규 부서의
+#    부서장(claude)이 영영 안 뜬다. 빈 셸(agent 없음·seat empty)만 있는 부서에서 launch-agent
+#    가 반드시 발화해야 한다. ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbm-")
+env, home = make_env(tmp, claim_exit=1)
+env["CYS_DECL_ORIGIN"] = "hook-human"
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+open(os.path.join(tmp, "master-shell.flag"), "w").close()  # allocate 직후의 빈 셸 상태 모사
+code, out, err = run(env)
+check("5fb-m1 빈 셸 부서 폴백 성공 exit 0", code == 0, "exit=%d err=%s" % (code, err[-300:]))
+check("5fb-m2 빈 셸 위에 launch-agent 발화(P0 핀 — 생략 금지)",
+      "launch-agent --role master" in calls(tmp), calls(tmp)[-400:])
+shutil.rmtree(tmp)
+
+# ── 5-fb-n. ★폭주 봉인 ⓑ 실강제 핀(2026-08-12): 직접 실행(CYS_DECL_ORIGIN 마커 무 — CLAUDE.md
+#    §0 폴백·기계 배달 경로)은 부서 자동 생성으로 이어지지 않는다(구계약 exit 7·부서 미생성). ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbn-")
+env, home = make_env(tmp, claim_exit=1)
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+env.pop("CYS_DECL_ORIGIN", None)
+code, out, err = run(env)
+check("5fb-n1 마커 무 → 폴백 비적용 exit 7", code == 7, "exit=%d" % code)
+check("5fb-n2 부서 생성 미시도(폭주 봉인)", "cys-dept allocate" not in calls(tmp))
+shutil.rmtree(tmp)
+
+# ── 5-fb-o. ★오염 차단 핀(2026-08-12 R2 확정): 폴백 실패는 base 건강 기록(boot-last)을
+#    ok:false 로 덮지 않는다 — base master 는 건강하다(그래서 정당거부가 났다). 실패는
+#    ok=null·state=dept_fallback_failed 로 귀속만 남긴다(§0 재부트 churn 차단). ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbo-")
+env, home = make_env(tmp, claim_exit=1)
+env["CYS_DECL_ORIGIN"] = "hook-human"
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+_cd = os.path.join(home, ".cys", "pack", "bin", "cys-dept")
+with open(_cd, "w", encoding="utf-8", newline="\n") as f:
+    f.write("#!/bin/sh\necho 'allocate 실패 모사' >&2\nexit 1\n")
+os.chmod(_cd, 0o755)
+code, out, err = run(env)
+check("5fb-o1 allocate 실패 → exit 4(EXIT_BOOT)", code == 4, "exit=%d" % code)
+bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
+check("5fb-o2 boot-last ok=null·state=dept_fallback_failed(오염 차단)",
+      bl.get("result", {}).get("ok") is None
+      and bl.get("result", {}).get("state") == "dept_fallback_failed",
+      json.dumps(bl.get("result", {}), ensure_ascii=False)[:200])
 shutil.rmtree(tmp)
 
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
