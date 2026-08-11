@@ -1508,15 +1508,30 @@ pub fn refresh_seat_cache(daemon: &Arc<Daemon>, sys: &System) {
     }
 }
 
+/// ★SEAT 승계 봉쇄 판정 — 이 좌석의 agent_meta 가 승계를 막아야 하는가.
+///
+/// **죽은 에이전트의 meta 는 봉쇄하지 않는다**(2026-08-12 R3 확정 · 계약 개정): 관측 기반
+/// 등록(claim_role_probe)이 선언 master 전원에 meta 를 심은 뒤로, "meta 존재=무조건 봉쇄"는
+/// master 의 CLI 가 죽은 좌석을 영구 봉쇄해 — 오너의 재선언(직전 릴리스까지 좌석 승계로
+/// 성공하던 제스처)이 claim_denied → 부서 자동 창설로 격상되는 회귀를 낳았다. 사망감지
+/// 상태머신이 이미 진실을 안다: agent_exit_notified=true(죽음 관측·복귀 시 자동 리셋)면
+/// 그 meta 는 죽은 좌석의 기록이지 살아있는 점유가 아니다. node-recover 부활과의 경합은
+/// 오너 명시 제스처(재선언·launch-agent)가 이긴다 — 부활은 역할 선점 시 정중히 물러난다.
+/// meta 있음 ∧ 죽음 미관측(살아있거나 미상)은 종전대로 봉쇄(fail-closed).
+fn meta_blocks_seat(s: &crate::state::Surface) -> bool {
+    let has_meta = s.agent_meta.lock().unwrap().is_some();
+    has_meta && !s.agent_exit_notified.load(Ordering::Relaxed)
+}
+
 /// ★SEAT 2차(승계 정책): 이 좌석의 특권 role 을 다른 surface 가 가져가도 되는가.
-/// 커널 사실이 Empty 이고 + agent_meta 부재(죽은 에이전트의 좌석은 node-recover 영역이지 탈취
-/// 대상이 아니다) + 최근 사람 입력 없음(사용자가 지금 claude 를 띄우려 타이핑 중일 수 있다)
+/// 커널 사실이 Empty 이고 + 살아있는 agent_meta 부재(죽은 에이전트의 meta 는 봉쇄하지 않는다 —
+/// meta_blocks_seat) + 최근 사람 입력 없음(사용자가 지금 claude 를 띄우려 타이핑 중일 수 있다)
 /// 셋을 **모두** 만족할 때만 true. Unknown 은 false(현행=거부 유지).
 pub fn seat_claimable(sys: &System, s: &crate::state::Surface) -> bool {
     if seat_state(sys, s) != SeatState::Empty {
         return false;
     }
-    if s.agent_meta.lock().unwrap().is_some() {
+    if meta_blocks_seat(s) {
         return false;
     }
     let human_recent = s
@@ -1582,8 +1597,11 @@ pub fn seat_takeover_recheck(s: &crate::state::Surface) -> Option<&'static str> 
     if s.exited.load(Ordering::Relaxed) {
         return Some("프로브 후 좌석이 종료됨(승계 대상 아님 — reap 경로가 처리)");
     }
-    if s.agent_meta.lock().unwrap().is_some() {
-        return Some("프로브 후 agent_meta 등록됨(사람이 CLI 를 띄웠다 — node-recover 영역)");
+    // ★죽은 좌석 승계 개정(2026-08-12)과 짝: 프로브 시점에 이미 있던 '죽은 에이전트의 meta'
+    //   (exit_notified=true)는 취소 사유가 아니다 — 그것까지 취소하면 seat_claimable 개정이
+    //   이 재검증에서 전부 무효화된다. 살아있는(또는 미상) meta 만 '그 사이 CLI 기동'의 증거다.
+    if meta_blocks_seat(s) {
+        return Some("프로브 후 살아있는 agent_meta 관측(사람이 CLI 를 띄웠다 — node-recover 영역)");
     }
     let human_recent = s
         .last_human_input
@@ -1702,6 +1720,54 @@ pub fn cmdline_matches_agent(cmdline: &str, bin_base: &str) -> bool {
     })
 }
 
+/// ★등록 전용 엄격 매처(2026-08-12 R2 확정 — governance FP 교정).
+///
+/// 생존판정 매처(`cmdline_matches_agent`)는 오살(false-negative) 방지를 위해 **의도적으로
+/// 넓다** — 경로 세그먼트(`…/claude/…`)까지 생존 증거로 승격한다. 그 비용 부호가 **등록**에서는
+/// 뒤집힌다: Linux(argv 가시 플랫폼)에서 `tail -f /home/u/claude/dev.log` 나
+/// `vim /home/u/proj/claude-code/README.md` 가 도는 agent 없는 pane 을 claim 하는 순간, 세그먼트
+/// 매칭이 meta=(claude,claude)·agent_seen=true 를 **오등록**하고 topology 에 영속시켜 콜드부트가
+/// 엉뚱한 CLI 를 부활시킨다(무기록이 오기록보다 낫다는 관측 등록 원칙 위반).
+///
+/// 등록은 좁게 본다: ①토큰 basename 정확 일치(win 확장자 정규화 동일) ②`.js` 번들 basename
+/// 일치(`…/gemini.js`) ③npm 패키지 세그먼트(`<bin>-cli`/`<bin>-code`)는 **실행 스크립트 토큰
+/// (basename 이 `.js` 로 끝나는 경로)에서만** — `node …/@anthropic-ai/claude-code/cli.js` 는
+/// 잡고, `vim …/claude-code/README.md` 는 버린다.
+///
+/// 비대칭 안전성: 이 매처는 생존 매처의 **부분집합**이다(strict ⊆ broad). 위험한 방향의
+/// 비대칭은 "등록은 됐는데 사망감지가 못 보는" 쪽(등록 broad·생존 strict)이고, 그 반대인
+/// 이 구성에서는 등록된 좌석을 사망감지가 반드시 본다 — 오살 경로 신설 없음.
+pub fn cmdline_matches_agent_exec(cmdline: &str, bin_base: &str) -> bool {
+    if bin_base.is_empty() {
+        return false;
+    }
+    let (want, want_win) = strip_win_exec_ext(bin_base);
+    if want.is_empty() {
+        return false;
+    }
+    let pkg_cli = format!("{bin_base}-cli");
+    let pkg_code = format!("{bin_base}-code");
+    cmdline.split_whitespace().any(|tok| {
+        let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+        let (tok_base, tok_win) = strip_win_exec_ext(base);
+        let name_hit = if tok_win || want_win {
+            tok_base.eq_ignore_ascii_case(want)
+        } else {
+            tok_base == want
+        };
+        if name_hit || base.strip_suffix(".js").is_some_and(|b| b == want) {
+            return true;
+        }
+        // 패키지 세그먼트는 실행 스크립트 경로(basename 이 .js)에서만 — 문서·로그 등
+        // 데이터 파일 인자의 디렉터리명은 실행 증거가 아니다.
+        base.ends_with(".js")
+            && tok.contains(['/', '\\'])
+            && tok
+                .split(['/', '\\'])
+                .any(|seg| seg == pkg_cli || seg == pkg_code)
+    })
+}
+
 pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
     // parent → children index
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1799,8 +1865,10 @@ pub fn agent_candidates_from_json(agents: &serde_json::Value) -> Vec<(String, St
 
 /// 자손 cmdline 목록 × 후보 목록 → 관측된 에이전트. **정확히 한 에이전트**가 매칭될 때만
 /// Some — 둘 이상 매칭(모호)·무매칭이면 None(무기록이 오기록보다 낫다) — 순수 함수.
-/// 매처는 사망감지와 동일한 SOT(`cmdline_matches_agent`)를 재사용한다: 등록과 생존 판정이
-/// 다른 눈을 쓰면 "등록은 됐는데 사망감지가 못 보는" 비대칭(오살·죽음 은폐)이 생긴다.
+/// ★매처는 등록 전용 엄격판(`cmdline_matches_agent_exec` — strict ⊆ broad)이다(2026-08-12
+/// R2 확정): 종전의 생존 매처 재사용은 경로 세그먼트 FP(`tail -f ~/claude/dev.log`)를 등록으로
+/// 승격시켰다. strict 로 등록된 좌석은 broad 생존 매처가 반드시 보므로(부분집합) "등록은 됐는데
+/// 사망감지가 못 보는" 비대칭(오살)은 신설되지 않는다 — 위험 방향은 그 반대뿐이다.
 pub fn select_observed_agent(
     descendant_cmds: &[String],
     candidates: &[(String, String)],
@@ -1809,7 +1877,7 @@ pub fn select_observed_agent(
     for (agent, bin_base) in candidates {
         if descendant_cmds
             .iter()
-            .any(|cmd| cmdline_matches_agent(cmd, bin_base))
+            .any(|cmd| cmdline_matches_agent_exec(cmd, bin_base))
         {
             match &hit {
                 None => hit = Some((agent.clone(), bin_base.clone())),
@@ -3718,6 +3786,40 @@ mod tests {
         assert_eq!(sel(&s(&["-zsh", "vim notes.md"]), &cands), None);
         // 빈 후보(agents.json 파싱 불가) → None (관측 등록이 조용히 꺼진다)
         assert_eq!(sel(&s(&["claude --x"]), &[]), None);
+    }
+
+    /// ★등록 매처 FP 회귀 핀(2026-08-12 R2 확정 · governance.rs 경로 세그먼트 FP):
+    /// 생존 매처의 경로 세그먼트 규칙이 등록에서는 오등록(콜드부트가 엉뚱한 CLI 부활)을 낳는다 —
+    /// 등록은 strict 매처(cmdline_matches_agent_exec)를 쓰고, 데이터 파일 인자의 디렉터리명은
+    /// 실행 증거로 승격되지 않는다. strict ⊆ broad(생존) 포함 관계도 함께 핀.
+    #[test]
+    fn registration_matcher_rejects_path_segment_data_args() {
+        use super::select_observed_agent as sel;
+        use super::{cmdline_matches_agent, cmdline_matches_agent_exec};
+        let cands: Vec<(String, String)> = vec![("claude".into(), "claude".into())];
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 데이터 파일 인자의 디렉터리 세그먼트 — 생존 매처는 잡지만(넓음·의도) 등록은 거부한다.
+        for fp in [
+            "tail -f /home/u/claude/dev.log",
+            "vim /home/u/proj/claude-code/README.md",
+            "less /var/tmp/claude-code/notes.txt",
+        ] {
+            assert!(cmdline_matches_agent(fp, "claude"), "생존 매처는 넓다(전제): {fp}");
+            assert!(!cmdline_matches_agent_exec(fp, "claude"), "등록 매처는 FP 거부: {fp}");
+            assert_eq!(sel(&s(&[fp]), &cands), None, "등록 오등록 금지: {fp}");
+        }
+        // 실행 증거는 계속 잡는다: 네이티브 바이너리·npm 래퍼(.js 실행 스크립트).
+        for tp in [
+            "claude --dangerously-skip-permissions",
+            "node /n/m/@anthropic-ai/claude-code/cli.js",
+            "node --max-old-space-size=4096 /n/m/@google/gemini-cli/bundle/gemini.js",
+        ] {
+            let want = if tp.contains("gemini") { "gemini" } else { "claude" };
+            assert!(cmdline_matches_agent_exec(tp, want), "등록 매처 실행 증거 유지: {tp}");
+            assert!(cmdline_matches_agent(tp, want), "strict ⊆ broad 포함 관계: {tp}");
+        }
+        // .js 로 끝나지 않는 경로의 세그먼트 매칭은 등록에서 무효(broad 전용).
+        assert!(!cmdline_matches_agent_exec("node /home/u/claude-code/helper.py", "claude"));
     }
 
     use super::{

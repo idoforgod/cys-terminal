@@ -6227,7 +6227,9 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
                     eprintln!(
                         "[claim-role] 새 부서장을 세우려는 경우: GUI '부서 워크스페이스 추가' 또는 \
                          `cys-dept allocate` 로 독립 부서(전용 데몬·역할 공간)를 만들고 그 안에서 \
-                         선언하라. 오너 타이핑 마스터 선언은 부트스트랩이 부서 자동 생성으로 이어준다."
+                         선언하라. 부서 자동 생성은 **오너가 직접 타이핑한** 마스터 선언(훅 발화 \
+                         경로 · base 레인 unix)에서만 이어진다 — 직접 실행·기계 배달 선언은 폭주 \
+                         봉인으로 비적용이다."
                     );
                 }
                 7

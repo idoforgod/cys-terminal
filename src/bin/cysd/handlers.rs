@@ -2279,16 +2279,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 여기는 최초 등록 + 실관측이라 의미가 다르다).
             #[cfg(unix)]
             if let Some(s) = daemon.get_surface(sid) {
-                if s.agent_meta.lock().unwrap().is_none() {
+                // ★첫 관측 영구 고착 해제(2026-08-12 R2 확정): 종전 `meta==None 일 때만`은 좌석
+                // 재용도화(claude 종료 → 같은 pane 에 agy 기동 → 재선언)에서 재관측을 영구 생략해,
+                // topology 에 '엉뚱한 CLI' 가 영속되고 콜드부트가 잘못된 에이전트를 부활시켰다.
+                // 사망감지가 죽음을 관측한 좌석(exit_notified=true — 복귀 시 자동 리셋)은 현재
+                // 관측으로 meta 를 갱신한다. 산 좌석의 meta 는 종전대로 불변(set_meta 보호와 동형).
+                // 재관측 실패(무관측·모호)면 기존 meta 유지 — 죽은 좌석의 정직한 기록은 node-recover
+                // 의 부활 재료다(무기록 강등보다 낫다).
+                let dead_reobserve = {
+                    let has_meta = s.agent_meta.lock().unwrap().is_some();
+                    has_meta && s.agent_exit_notified.load(Ordering::Relaxed)
+                };
+                if s.agent_meta.lock().unwrap().is_none() || dead_reobserve {
                     if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
                         *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                         s.agent_seen.store(true, Ordering::Relaxed);
+                        s.agent_exit_notified.store(false, Ordering::Relaxed);
                         daemon.bus.publish(
                             "agent.observed",
                             "system",
                             Some(sid),
                             json!({"role": claimed_role, "agent": agent, "agent_bin": bin,
-                                   "via": "claim_role_probe"}),
+                                   "via": if dead_reobserve { "claim_role_reprobe" }
+                                          else { "claim_role_probe" }}),
                         );
                     }
                 }
