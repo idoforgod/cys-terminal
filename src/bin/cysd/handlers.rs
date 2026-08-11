@@ -2286,15 +2286,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 관측으로 meta 를 갱신한다. 산 좌석의 meta 는 종전대로 불변(set_meta 보호와 동형).
                 // 재관측 실패(무관측·모호)면 기존 meta 유지 — 죽은 좌석의 정직한 기록은 node-recover
                 // 의 부활 재료다(무기록 강등보다 낫다).
-                let dead_reobserve = {
-                    let has_meta = s.agent_meta.lock().unwrap().is_some();
-                    has_meta && s.agent_exit_notified.load(Ordering::Relaxed)
-                };
-                if s.agent_meta.lock().unwrap().is_none() || dead_reobserve {
+                let prev_agent = s
+                    .agent_meta
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(a, _)| a.clone());
+                let dead_reobserve =
+                    prev_agent.is_some() && s.agent_exit_notified.load(Ordering::Relaxed);
+                if prev_agent.is_none() || dead_reobserve {
                     if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
                         *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                         s.agent_seen.store(true, Ordering::Relaxed);
                         s.agent_exit_notified.store(false, Ordering::Relaxed);
+                        // ★이종 재용도화 시 stale 세션 핀 무효화(2026-08-12 재검증 지적):
+                        // agent_session_id 는 usage 관측이 1회 핀(is_none 게이트)하는 값이라,
+                        // claude→codex 재용도화에서 그대로 두면 topology 에 agent=codex +
+                        // session_id=<claude uuid> 짝이 영속되고 콜드부트 restore 가 비-claude
+                        // 에이전트에 실재 검증 없이 `resume <claude-uuid>` 를 부착한다. 에이전트가
+                        // 바뀐 재관측에서만 리셋(None → usage 가 새 세션을 재핀) — 동일 에이전트
+                        // 재기동은 종전 유지(claude 방향은 restore 의 jsonl 실재 검증이 지킨다).
+                        if dead_reobserve && prev_agent.as_deref() != Some(agent.as_str()) {
+                            *s.agent_session_id.lock().unwrap() = None;
+                        }
                         daemon.bus.publish(
                             "agent.observed",
                             "system",

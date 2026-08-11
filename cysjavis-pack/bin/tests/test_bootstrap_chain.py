@@ -361,8 +361,12 @@ check("5fb-o2 boot-last ok=null·state=dept_fallback_failed(오염 차단)",
 shutil.rmtree(tmp)
 
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
+# ★마커를 실어 레인 게이트(_is_base_socket)를 실검증한다(2026-08-12 재검증 지적): 마커 없이
+#   돌리면 origin 게이트가 먼저 None 을 반환해 이 핀이 엉뚱한 게이트로 green — 레인 게이트가
+#   무핀 상태가 된다(마커 보유 부서 pane 의 부서-안-부서 스폰을 막는 유일한 중화 장치).
 tmp = tempfile.mkdtemp(prefix="boot-t5fbd-")
 env, home = make_env(tmp, claim_exit=1, socket="/x/cys-dept-alpha/cys.sock", pack_dept="alpha")
+env["CYS_DECL_ORIGIN"] = "hook-human"
 code, out, err = run(env)
 check("5fbd-a 부서 레인 claim 거부 → 폴백 없이 exit 7", code == 7, "exit=%d" % code)
 check("5fbd-b 부서 생성 미시도", "cys-dept allocate" not in calls(tmp))

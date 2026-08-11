@@ -124,16 +124,9 @@ jobs:
                   "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
                   "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다.",
               ),
-              "test_bootstrap_chain": (
-                  set(),
-                  "★백포트 상태(0.14.2 레인): 스위트 파일은 트리에 **실재**하지만 이 레인의 어느 "
-                  "워크플로우에도 아직 배선돼 있지 않다(원 레인은 ci-branch 의 '능력 파리티' 스텝에서 "
-                  "돌렸는데, 그 스텝은 이 백포트 범위 밖이라 가져오지 않았다). 부트 체인(heal "
-                  "프리플라이트 배선) 회귀는 밀폐(실 데몬·실 Claude 불요)라 세 레인 어디서든 돌릴 수 "
-                  "있으므로 이것은 **잔여 격차**다 — 능력 파리티 스텝을 편입할 때 ALLOWED 에서 지우고 "
-                  "레인에 배선하는 편이 정답이다(오너 판단 대기).",
-              ),
           }
+          # (2026-08-12 편입 완료: test_bootstrap_chain 을 3레인 전부에 배선 — 위계 폴백의 유일
+          #  회귀 핀 세트가 CI 0회 실행이던 격차를 봉합. ALLOWED 예외도 함께 제거 — 대칭이 정본.)
 
           # 이 게이트 스텝 자신을 스캔에서 도려내는 표식(한계 5). 없으면 위 ALLOWED 의 이름들이
           # ci-branch.yml 의 코드로 읽혀 자기 자신을 근거로 "있음" 판정하는 자기참조 오판이 난다.
@@ -469,7 +462,7 @@ jobs:
         run: |
           set -euo pipefail
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
-                   test_import_guard; do
+                   test_import_guard test_bootstrap_chain; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
