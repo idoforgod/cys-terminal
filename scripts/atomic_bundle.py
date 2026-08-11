@@ -264,7 +264,13 @@ def _cli_install(src, dest):
     ④ 스왑 직후 재검증은 **구조 완본성만**(codesign=False) 본다 — 스왑은 비트를 한 바이트도 바꾸지
        않으므로 봉인 판정은 ②(같은 비트·스왑 직전)에 이미 있고, 업그레이드 시 살아있는 구 데몬이 새
        경로에 `.pyc` 를 써 봉인 검사를 깨뜨려 **성공한 교체를 자동 원복**시키는 실측 경합을 피한다
-       (deploy_gate.POST_SWAP_VERIFY 와 동형 · 근거는 deploy_gate.swap_bundle_into_place 주석)."""
+       (deploy_gate.POST_SWAP_VERIFY 와 동형 · 근거는 deploy_gate.swap_bundle_into_place 주석).
+
+    ★소스 진위 게이트(서명·Team ID Q43YA2NMF9·Apple 공증)는 여기가 아니라 **위층**
+      installer-app/install-core.sh 에 있다 — 소스의 동봉 python 을 실행하기 **전에** 시스템
+      codesign·spctl 로 검증해야 공격자 소스 코드를 root 로 돌리는 LPE 경로를 닫는다(순서 불변).
+      이 공유 함수에 공증 게이트를 넣지 않는 이유: deploy_gate.py 는 아직 공증 전인 자기 빌드
+      산출물을 이 경로로 설치하므로, 여기서 공증을 강제하면 정상 배포 파이프라인이 깨진다."""
     src = src.rstrip("/")
     dest = dest.rstrip("/")
     if not os.path.isdir(os.path.join(src, "Contents")):

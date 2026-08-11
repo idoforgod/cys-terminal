@@ -205,9 +205,15 @@ else
   echo; echo "=== 판정 불가 ==="; exit 2
 fi
 
-APP_SRC="$(find "$MP" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null)"
+# ★검사 대상은 사용자가 실제로 실행하는 cys.app 이다 — 설치 도우미 DMG 레이아웃에서 최상위 유일
+#   *.app 은 'Install cys.app'(설치 도우미 애플릿)이고 진짜 cys.app 은 .support/cys.app(depth 2)로
+#   숨겨진다. 최상위 *.app 만 잡으면(구 로직) ⑥ 봉인 자기파괴 재현이 동봉 python 없는 설치 도우미를
+#   보고 vacuous PASS 한다(finding 5). 그래서 cys.app 을 이름으로 우선 탐색(depth 2 = .support 포함)하고,
+#   없을 때만 최상위 *.app 으로 폴백(설치 도우미 없는 구 레이아웃 DMG 호환).
+APP_SRC="$(find "$MP" -maxdepth 2 -name 'cys.app' -type d -print -quit 2>/dev/null)"
+[ -n "$APP_SRC" ] || APP_SRC="$(find "$MP" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null)"
 if [ -z "$APP_SRC" ]; then
-  bad "② 앱 번들 탐색" "$MP 최상위에 *.app 없음"
+  bad "② 앱 번들 탐색" "$MP 에서 cys.app(및 최상위 *.app) 없음"
   echo; echo "=== 판정 불가 ==="; exit 2
 fi
 APP_NAME="$(basename "$APP_SRC")"
