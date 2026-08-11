@@ -1747,6 +1747,120 @@ pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
     out
 }
 
+// ── 관측 기반 에이전트 등록 (2026-08 · 현장 결함 2호: claim-role 전용 pane 부활 불가) ──
+//
+// 문제: `cys claim-role` 로만 역할을 쥔 pane(사람이 직접 CLI 를 띄운 좌석)은 agent_meta 가
+// 영영 None 이라 topology.json 에 agent 없이 영속되고, 콜드부트 부활(`cys restore`·phoenix)이
+// "agent 미상 — 건너뜀"으로 그 역할을 영구 제외한다 — 재부팅마다 역할 소실이 100% 재현됐다.
+// 원설계가 기본값 추정을 거부한 이유("임의 기본값(claude) 추정은 다른 에이전트를 쓰는 좌석에
+// 엉뚱한 CLI 를 띄운다" — cys.rs restore 주석)는 옳다. 그래서 추정이 아니라 **관측**을 기록한다:
+// claim 순간 좌석의 자손 프로세스에서 기지(旣知) 에이전트가 '정확히 하나' 보일 때만 그 관측값을
+// agent_meta 로 등록한다(모호·무관측=무기록 — 현행과 동일하게 fail-closed).
+//
+// 관할 확장 주의(성찰 확정): agent_meta 는 사망감지·좌석승계·node-recover 의 관할 스위치다.
+// 그래서 등록은 ①역할 claim 시점 1회 ②agent_meta==None 일 때만 ③unix 한정(Windows 는 래퍼
+// cmd/node 계층이 관측을 흐려 오식별→오살 위험, 2026-07-29 교훈 — fail-closed 유지)으로 좁힌다.
+
+/// agents.json(JSON 값)에서 (에이전트 이름, 실행 바이너리 basename) 후보를 파생한다 — 순수 함수.
+/// `_` 접두 키(_schema·_doc)는 메타라 제외. cmd 의 선두 env 대입(`KEY=val`)을 건너뛴 첫 토큰의
+/// basename 이 바이너리다(cys.rs extract_bin 과 동일 규약 — `CLAUDE_CONFIG_DIR=… claude …`).
+pub fn agent_candidates_from_json(agents: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(obj) = agents.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, spec) in obj {
+        if name.starts_with('_') {
+            continue;
+        }
+        let Some(cmd) = spec.get("cmd").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // env 대입 토큰 판별: `IDENT=…` 형태(cys.rs is_env_assignment 과 동일 취지의 보수 판정).
+        let is_env_assign = |tok: &str| {
+            tok.split('=').next().is_some_and(|k| {
+                !k.is_empty()
+                    && tok.contains('=')
+                    && k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !k.chars().next().unwrap_or('0').is_ascii_digit()
+            })
+        };
+        let Some(bin_tok) = cmd.split_whitespace().find(|t| !is_env_assign(t)) else {
+            continue;
+        };
+        let base = bin_tok.rsplit(['/', '\\']).next().unwrap_or(bin_tok);
+        if !base.is_empty() {
+            out.push((name.clone(), base.to_string()));
+        }
+    }
+    out
+}
+
+/// 자손 cmdline 목록 × 후보 목록 → 관측된 에이전트. **정확히 한 에이전트**가 매칭될 때만
+/// Some — 둘 이상 매칭(모호)·무매칭이면 None(무기록이 오기록보다 낫다) — 순수 함수.
+/// 매처는 사망감지와 동일한 SOT(`cmdline_matches_agent`)를 재사용한다: 등록과 생존 판정이
+/// 다른 눈을 쓰면 "등록은 됐는데 사망감지가 못 보는" 비대칭(오살·죽음 은폐)이 생긴다.
+pub fn select_observed_agent(
+    descendant_cmds: &[String],
+    candidates: &[(String, String)],
+) -> Option<(String, String)> {
+    let mut hit: Option<(String, String)> = None;
+    for (agent, bin_base) in candidates {
+        if descendant_cmds
+            .iter()
+            .any(|cmd| cmdline_matches_agent(cmd, bin_base))
+        {
+            match &hit {
+                None => hit = Some((agent.clone(), bin_base.clone())),
+                // 서로 다른 에이전트가 동시 매칭 = 모호 → 무기록.
+                Some((prev, _)) if prev != agent => return None,
+                Some(_) => {}
+            }
+        }
+    }
+    hit
+}
+
+/// 후보 원천: 디스크 pack_dir/agents.json(user 소유 — 있으면 그 키가 이긴다) ∪ 임베드
+/// agents.json(디스크에 없는 키만 보충 — cys.rs load_agent_spec 의 폴백 계층과 동일 취지).
+/// 어느 쪽도 파싱 불가면 빈 목록(fail-closed — 관측 등록 자체가 조용히 꺼진다).
+pub fn known_agent_candidates() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(cys::pack::pack_dir().join("agents.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            out = agent_candidates_from_json(&v);
+        }
+    }
+    if let Some((_, content)) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == "agents.json") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+            for cand in agent_candidates_from_json(&v) {
+                if !out.iter().any(|(n, _)| *n == cand.0) {
+                    out.push(cand);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 좌석의 자손 프로세스를 그 시점 프로브로 관측해 에이전트를 식별한다.
+/// 전 프로세스 표 refresh 비용을 지불하므로 **드문 경로(claim-role)에서, 락 밖에서만** 부른다
+/// (seat_claimable_now 와 동일 근거 — 락 보유 중 수십 ms = 데몬 전체 정지).
+pub fn observe_agent_on_surface(s: &crate::state::Surface) -> Option<(String, String)> {
+    let candidates = known_agent_candidates();
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let cmds: Vec<String> = collect_descendants(&sys, s.pid)
+        .into_iter()
+        .map(|(_, cmd)| cmd)
+        .collect();
+    select_observed_agent(&cmds, &candidates)
+}
+
 /// 중복 프로세스 kill 정책 — 순수 판정(테스트 핀). check_surfaces가 sys·daemon에서
 /// 입력을 미리 수집해 넘기고, 집행(kill_pid·bus.publish)은 호출부에 잔류한다.
 ///
@@ -3539,6 +3653,71 @@ mod tests {
         assert!(!m("node C:\\work\\claude.cmd\\helper.js", "claude"));
         assert!(!m("node C:\\work\\claude.exe\\helper.js", "claude"));
         assert!(!m("node /work/gemini.cmd/helper.js", "gemini"));
+    }
+
+    /// ★관측 기반 agent 등록(2026-08 현장 결함 2호) — 후보 파생의 계약 박제.
+    /// agents.json 의 cmd 에서 선두 env 대입을 건너뛴 첫 토큰 basename 이 바이너리다.
+    /// 임베드 팩 실물(agents.json)로도 교차 검증한다 — 스키마 드리프트 시 여기서 먼저 죽는다.
+    #[test]
+    fn agent_candidates_from_json_derives_bin_basenames() {
+        use super::agent_candidates_from_json as cands;
+        let v: serde_json::Value = serde_json::json!({
+            "_schema": 2,
+            "_doc": "메타 — 후보가 아니다",
+            "claude": {"cmd": "claude --dangerously-skip-permissions"},
+            "gemini": {"cmd": "~/.local/bin/agy --dangerously-skip-permissions"},
+            "withenv": {"cmd": "CLAUDE_CONFIG_DIR=\"$HOME/.cys/claude\" claude --x"},
+            "nocmd": {"notes": "cmd 없음 — 후보 제외"},
+        });
+        let got = cands(&v);
+        assert!(got.contains(&("claude".into(), "claude".into())));
+        assert!(got.contains(&("gemini".into(), "agy".into()))); // 절대경로 → basename
+        assert!(got.contains(&("withenv".into(), "claude".into()))); // env 대입 건너뜀
+        assert!(!got.iter().any(|(n, _)| n == "_schema" || n == "_doc" || n == "nocmd"));
+        // 임베드 팩 실물 교차 검증: claude·gemini(agy)·codex 가 파생돼야 한다.
+        let embedded: serde_json::Value = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| *r == "agents.json")
+            .map(|(_, c)| serde_json::from_str(c).expect("임베드 agents.json 파싱"))
+            .expect("임베드에 agents.json 존재");
+        let real = cands(&embedded);
+        assert!(real.contains(&("claude".into(), "claude".into())));
+        assert!(real.contains(&("gemini".into(), "agy".into())));
+        assert!(real.contains(&("codex".into(), "codex".into())));
+    }
+
+    /// 선택 규칙 박제: 정확히 한 에이전트 매칭일 때만 Some — 모호(2종 동시)·무매칭은 None.
+    /// 오기록(엉뚱한 CLI 부활·사망감지 오배선)보다 무기록(현행 유지)이 낫다는 fail-closed 계약.
+    #[test]
+    fn select_observed_agent_requires_exactly_one_match() {
+        use super::select_observed_agent as sel;
+        let cands: Vec<(String, String)> = vec![
+            ("claude".into(), "claude".into()),
+            ("gemini".into(), "agy".into()),
+            ("codex".into(), "codex".into()),
+        ];
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 단일 관측 → Some (셸·무관 프로세스 혼재 무해)
+        assert_eq!(
+            sel(&s(&["-zsh", "claude --dangerously-skip-permissions"]), &cands),
+            Some(("claude".into(), "claude".into()))
+        );
+        // npm 래퍼 형태도 SOT 매처를 그대로 탄다
+        assert_eq!(
+            sel(&s(&["node /n/m/@anthropic-ai/claude-code/cli.js"]), &cands),
+            Some(("claude".into(), "claude".into()))
+        );
+        // 같은 에이전트 다중 프로세스(부모+헬퍼)는 모호가 아니다
+        assert_eq!(
+            sel(&s(&["claude --x", "node /n/m/@anthropic-ai/claude-code/cli.js"]), &cands),
+            Some(("claude".into(), "claude".into()))
+        );
+        // 서로 다른 에이전트 동시 관측 = 모호 → None
+        assert_eq!(sel(&s(&["claude --x", "codex --y"]), &cands), None);
+        // 무관측 → None
+        assert_eq!(sel(&s(&["-zsh", "vim notes.md"]), &cands), None);
+        // 빈 후보(agents.json 파싱 불가) → None (관측 등록이 조용히 꺼진다)
+        assert_eq!(sel(&s(&["claude --x"]), &[]), None);
     }
 
     use super::{

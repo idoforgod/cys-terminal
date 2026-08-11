@@ -2267,6 +2267,32 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★W2a 해제 불변식: claim_role = 명시적 역할 (재)등록 = 부활 의도. 묘비에서 제거해
             // 이후 이 역할의 비정상 종료는 다시 정상 부활 대상이 되게 한다. tombstones는 리프 락.
             daemon.tombstones.lock().unwrap().remove(&claimed_role);
+            // ★관측 기반 agent 등록(2026-08 · 현장 결함 2호): claim-role 로만 등록된 pane 은
+            // agent_meta 가 None 이라 topology 에 agent 없이 영속되고, 콜드부트 부활이 그 역할을
+            // "agent 미상 — 건너뜀"으로 영구 제외한다(재부팅마다 역할 소실). 역할을 쥔 이 순간
+            // 좌석 자손에서 기지 에이전트가 '정확히 하나' 관측될 때만 관측값을 기록한다(추정 0 ·
+            // 모호/무관측=무기록 fail-closed). 프로세스 표 refresh 는 임계영역 밖(위 락 규약과
+            // 동일 — seat_claimable_now 의 근거). unix 한정: Windows 는 래퍼(cmd/node) 계층이
+            // 관측을 흐려 오식별→오살 위험(2026-07-29 교훈)이라 현행(None) 유지.
+            // agent_seen=true 는 추정이 아니라 방금의 관측 파생이다 — 사망감지 상태머신을 허위
+            // DEAD 과도기 없이 정직하게 무장한다(set_meta RPC 의 false 리셋은 '재등록' 대비책이고
+            // 여기는 최초 등록 + 실관측이라 의미가 다르다).
+            #[cfg(unix)]
+            if let Some(s) = daemon.get_surface(sid) {
+                if s.agent_meta.lock().unwrap().is_none() {
+                    if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
+                        *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
+                        s.agent_seen.store(true, Ordering::Relaxed);
+                        daemon.bus.publish(
+                            "agent.observed",
+                            "system",
+                            Some(sid),
+                            json!({"role": claimed_role, "agent": agent, "agent_bin": bin,
+                                   "via": "claim_role_probe"}),
+                        );
+                    }
+                }
+            }
             daemon.bus.publish(
                 "role.claimed",
                 "system",
