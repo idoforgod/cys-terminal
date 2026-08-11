@@ -1,7 +1,7 @@
 // mousefilter.ts 순수 함수 회귀 테스트 (bun test — 신규 의존성 0).
 //
-// 회귀 핀의 계약: 이 필터는 main.ts에서 **Windows일 때만** 배선된다(macOS 무변경).
-// 여기 테스트는 플랫폼과 무관한 '분류 판단'만 고정한다 — 배선 조건은 main.ts 주석이 지킨다.
+// 회귀 핀의 계약(2026-08 개정): 휠 보고→로컬 스크롤은 **모든 플랫폼**, 비-휠 보고 폐기는
+// **Windows만**(macOS는 forward 유지 — 앱의 클릭 소비 보존). 배선 실행은 main.ts가 한다.
 //
 // 지키는 것 두 가지:
 //  (1) 마우스 보고는 전부 잡아낸다 — 놓치면 Windows에서 `[555;98;34M` 리터럴 유출이 재발한다.
@@ -158,16 +158,39 @@ describe("X10 필드 하한 — 길이만 맞는 3바이트를 마우스로 오�
 });
 
 describe("routeOnData — 배선 결정(플랫폼 분기 포함)을 순수 함수로 고정", () => {
-  it("★macOS 계약: isWindows=false면 마우스 보고여도 원문 그대로 forward", () => {
+  it("★macOS 계약(개정): 비-휠 마우스 보고는 원문 그대로 forward — 앱의 클릭 소비 보존", () => {
     const report = sgr(35, 10, 20);
     const r = routeOnData(report, false);
     expect(r).toEqual({ action: "forward", data: report });
     // 참조 동일성 — 바이트 하나 건드리지 않는다는 계약을 값이 아니라 동일성으로 못박는다.
     if (r.action === "forward") expect(r.data).toBe(report);
   });
-  it("macOS에선 휠 보고도 forward(로컬 스크롤 번역 없음 — 앱이 정상 소비)", () => {
-    const wheel = sgr(64, 10, 20);
-    expect(routeOnData(wheel, false)).toEqual({ action: "forward", data: wheel });
+  it("★macOS 계약(개정): 휠 보고는 로컬 스크롤로 번역 — 마우스 트래킹 중 스크롤백 접근 복구", () => {
+    expect(routeOnData(sgr(64, 10, 20), false)).toEqual({ action: "scroll", lines: -3 });
+    expect(routeOnData(sgr(65, 10, 20), false)).toEqual({ action: "scroll", lines: 3 });
+  });
+  it("macOS 휠다운 5연속 배칭 → scroll lines +15 (Windows와 동일 산식)", () => {
+    expect(routeOnData(sgr(65, 1, 1).repeat(5), false)).toEqual({ action: "scroll", lines: 15 });
+  });
+  it("macOS 상쇄 휠(drop 판정)은 discard가 아니라 forward — 폐기는 Windows 한정", () => {
+    const chunk = sgr(64, 1, 1) + sgr(65, 1, 1);
+    const r = routeOnData(chunk, false);
+    expect(r).toEqual({ action: "forward", data: chunk });
+    if (r.action === "forward") expect(r.data).toBe(chunk);
+  });
+  it("macOS 클릭 보고(X10·urxvt 포함) → forward 원문 참조 동일", () => {
+    for (const report of [sgr(0, 10, 20), x10(0, 10, 20), urxvt(0, 10, 20)]) {
+      const r = routeOnData(report, false);
+      expect(r).toEqual({ action: "forward", data: report });
+      if (r.action === "forward") expect(r.data).toBe(report);
+    }
+  });
+  it("macOS 일반 텍스트·한글·bracketed paste → forward 원문 참조 동일", () => {
+    for (const text of ["hello", "너", `${ESC}[200~붙여넣은 텍스트${ESC}[201~`]) {
+      const r = routeOnData(text, false);
+      expect(r).toEqual({ action: "forward", data: text });
+      if (r.action === "forward") expect(r.data).toBe(text);
+    }
   });
 
   it("Windows 휠업 1노치 → scroll lines -3", () => {

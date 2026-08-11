@@ -1,10 +1,14 @@
 // xterm.js가 PTY로 보내려는 '마우스 보고' 시퀀스를 분류한다 — 순수 함수.
 //
-// 왜 필요한가(현장 결함 1호 · Parallels Windows 실기 제보):
-// Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면 xterm.js는 마우스 이벤트마다
-// `ESC[<b;x;y M/m` 같은 보고를 onData로 발화해 PTY로 보낸다. macOS는 앱이 이를 정상 소비하지만,
-// Windows는 ConPTY 입력 계층이 시퀀스를 깨뜨려 선두 ESC가 소실된 `[555;98;34M...` 문자열이
-// Claude Code 입력창에 리터럴로 무한 타이핑된다. ∴ Windows에서는 보고를 PTY로 보내지 않는다.
+// 왜 필요한가 — 현장 결함 2건이 이 필터의 존재 이유다:
+//  · 결함 1호(Parallels Windows 실기 제보): Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면
+//    xterm.js는 마우스 이벤트마다 `ESC[<b;x;y M/m` 같은 보고를 onData로 발화해 PTY로 보낸다.
+//    Windows는 ConPTY 입력 계층이 시퀀스를 깨뜨려 선두 ESC가 소실된 `[555;98;34M...` 문자열이
+//    Claude Code 입력창에 리터럴로 무한 타이핑된다. ∴ Windows에서는 보고를 PTY로 보내지 않는다.
+//  · 결함(macOS 스크롤백 접근 불가, 2026-08 현장 제보): 마우스 트래킹 중 xterm은 휠을 로컬
+//    스크롤 대신 보고로 앱에 보내므로, Claude Code가 떠 있는 동안 사용자가 스크롤백을 읽을 수
+//    없다. ∴ 휠 보고만은 **모든 플랫폼**에서 로컬 스크롤로 번역한다(비-휠 보고는 macOS에서
+//    기존대로 앱에 전달 — 클릭 소비 보존·오폐기=입력 소실 비대칭 회피).
 //
 // 이 모듈은 '판단'만 한다(플랫폼 판별·스크롤 실행은 호출측 main.ts). 순수 함수라 인코딩 변형·
 // 배칭·오탐 경계를 결정론으로 회귀 테스트할 수 있다(mousefilter.test.ts).
@@ -122,17 +126,19 @@ export type OnDataRoute =
 // 플랫폼 분기까지 포함한 배선 결정을 순수 함수로 뽑아낸다 — main.ts에는 실행만 남기고
 // '어떤 조건에서 무엇을 하는가'는 전부 여기서 테스트로 고정한다(배선 회귀를 테스트가 지키게).
 //
-// ★macOS 계약: isWindows=false면 분류 함수를 호출조차 하지 않고 무조건 forward다.
-// macOS는 앱이 마우스 보고를 정상 소비하므로 필터가 개입할 이유가 없고, 개입하지 않음이
-// '회귀 0'의 근거다. 이 조기 반환을 없애면 macOS가 필터 오탐에 노출된다.
+// ★플랫폼 계약(2026-08 개정 — 구계약 "macOS는 분류조차 않고 forward"를 의도적으로 파기):
+//  · wheel  → **모든 플랫폼**에서 로컬 스크롤. macOS도 마우스 트래킹 중 스크롤백을 읽을 수
+//    있어야 한다(현장 제보). 방향키 시퀀스 주입은 금지(의도된 결정 — Claude Code의 입력
+//    히스토리를 오염시킨다).
+//  · drop(비-휠 보고·상쇄된 휠) → Windows만 폐기(ConPTY 깨짐 방지). macOS는 **forward 유지**:
+//    앱이 클릭·모션 보고를 정상 소비하므로 빼앗을 이유가 없고, 오폐기의 비용(입력 소실)이
+//    유출 1회보다 크다는 비대칭 원칙도 그대로다.
+//  · pass  → forward(원문 동일 참조 — 바이트 하나 건드리지 않는다는 계약 불변).
 export function routeOnData(data: string, isWindows: boolean): OnDataRoute {
-  if (!isWindows) return { action: "forward", data };
-
   const verdict = classifyMouseReport(data);
   if (verdict.kind === "wheel") {
-    // 방향키 시퀀스 주입은 금지다(의도된 결정) — Claude Code의 입력 히스토리를 오염시킨다.
     return { action: "scroll", lines: verdict.dir * WHEEL_LINES * verdict.count };
   }
-  if (verdict.kind === "drop") return { action: "discard" };
+  if (verdict.kind === "drop" && isWindows) return { action: "discard" };
   return { action: "forward", data };
 }

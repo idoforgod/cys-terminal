@@ -1870,6 +1870,13 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
     theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
     scrollback: 5000,
+    // ★복사 불가 수리(2026-08 현장 제보): Claude Code TUI가 마우스 트래킹을 켜면 xterm은
+    // 선택(selection)을 끄고, mac에서 강제 선택의 유일한 통로가 Option+드래그 && 이 옵션이다
+    // (xterm SelectionService.shouldForceSelection — mac은 shift가 아니라 alt 경로).
+    // 미설정이면 마우스 트래킹 중 어떤 조합으로도 드래그 선택·복사가 불가능했다.
+    // 트레이드오프(의도된 결정): 이 옵션은 Option+클릭 커서 이동(altClickMovesCursor)을 mac
+    // 전역에서 비활성화한다 — 스크롤백 복사 복구가 커서 점프보다 우선한다(오너 버그 수정 지시).
+    macOptionClickForcesSelection: true,
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
@@ -2014,16 +2021,15 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   let insertLeak: string | null = null;
 
   term.onData((data) => {
-    // ★Windows 마우스 보고 유출 차단 (현장 결함 1호 · Parallels Windows 실기 제보).
-    // Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면 xterm.js가 마우스 보고를 PTY로 보내는데,
-    // Windows는 ConPTY 입력 계층이 시퀀스를 깨뜨려 선두 ESC가 소실된 `[555;98;34M...`가 Claude Code
-    // 입력창에 리터럴로 무한 타이핑된다. macOS는 앱이 정상 소비하므로 **Windows에서만** 개입한다
-    // (계약: isWindows=false면 routeOnData가 분류조차 하지 않고 forward — macOS 회귀 0의 근거.
-    //  IS_WINDOWS 인자를 상수 true로 바꾸거나 빼면 macOS가 필터 오탐에 노출된다).
+    // ★마우스 보고 필터 (현장 결함 1호 Windows 유출 + 2026-08 macOS 스크롤백 접근 불가).
+    // Claude Code TUI가 마우스 트래킹(1003h/1006h)을 켜면 xterm.js가 마우스 보고를 PTY로 보낸다.
     // 판단은 전부 mousefilter.routeOnData(순수 함수·테스트가 고정)에 있고 여기는 실행만 한다:
-    //   scroll  → 휠을 PTY 전송 대신 로컬 스크롤로 번역(방향키 시퀀스 주입은 금지 — 의도된 결정.
-    //             Claude Code의 입력 히스토리를 오염시킨다).
-    //   discard → 그 외 마우스 보고는 무음 폐기.
+    //   scroll  → 휠 보고를 PTY 전송 대신 로컬 스크롤로 번역 — **모든 플랫폼**(2026-08 개정:
+    //             macOS도 트래킹 중 스크롤백을 읽을 수 있어야 한다. 방향키 시퀀스 주입은 금지 —
+    //             의도된 결정. Claude Code의 입력 히스토리를 오염시킨다).
+    //   discard → 비-휠 마우스 보고 무음 폐기 — **Windows 한정**(ConPTY가 시퀀스를 깨뜨려 선두
+    //             ESC 소실 `[555;98;34M...`가 리터럴로 무한 타이핑되는 결함 1호 차단).
+    //             macOS는 비-휠 보고를 forward 유지(앱의 클릭 소비 보존·오폐기=입력 소실 회피).
     //   forward → 마우스 보고가 아니면 바이트 하나 건드리지 않고 아래 IME 경로로 그대로.
     const route = routeOnData(data, IS_WINDOWS);
     if (route.action === "scroll") {
