@@ -225,9 +225,12 @@ jobs:
           #   · 게이트 대장 회귀 65종(javis_report_gate + javis_gate_check)
           # CYS_PACK_DIR 을 빈 임시 디렉터리로 고정하는 이유는 위 게이트들과 같다 — 러너의 실제
           # 팩·홈 디렉터리에 판정이 의존하면 초록이 근거가 되지 못한다.
-          echo "== todo 선언·유령집계 소비자 회귀 7종(+import 가드) =="
+          echo "== todo 선언·유령집계 소비자 회귀 7종(+import 가드)+부트체인 =="
+          # ★test_bootstrap_chain 등재(2026-08-12 R3 확정): 위계 폴백(부서 자동 생성)의 유일한
+          #   회귀 핀 세트가 종전엔 CI 어느 레인에서도 돌지 않았다 — 배송 팩이 검증 0회로 서명됐다.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard; do
+                   test_report_gate test_todo_shared_constants test_import_guard \
+                   test_bootstrap_chain; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -540,9 +543,11 @@ jobs:
             echo "::error::[pack] 선언 파서 2언어 파리티 실패 — 배송될 Python 파서가 Rust 와 갈렸다. 서명 전 차단." >&2
             exit 1
           fi
-          echo "== [pack] todo 선언·유령집계 소비자 회귀 7종(+import 가드) =="
+          echo "== [pack] todo 선언·유령집계 소비자 회귀 7종(+import 가드)+부트체인 =="
+          # ★test_bootstrap_chain 등재(2026-08-12 R3 확정 — 위 build 레그와 동일 사유).
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard; do
+                   test_report_gate test_todo_shared_constants test_import_guard \
+                   test_bootstrap_chain; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="

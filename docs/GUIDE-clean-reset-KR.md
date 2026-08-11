@@ -19,7 +19,7 @@
 
 "다 없어져도 된다"는 분만 진행하세요. 남기고 싶은 결과물 파일(문서·코드 등)이
 바탕화면이나 내 문서 같은 **일반 폴더**에 있다면 그건 지워지지 않으니 안심하세요.
-지워지는 것은 cys의 **숨김 폴더(`.cys`)와 앱 자체**뿐입니다.
+지워지는 것은 **cys 앱과 cys 전용 데이터 폴더들**(숨김 폴더 `.cys`·상태 폴더·화면 저장값)뿐입니다.
 
 **2. 왜 앱 안에서 CEO에게 "초기화해줘"라고 해도 부서가 남을까요?**
 
@@ -116,7 +116,12 @@ sudo rm -rf /Applications/cys.app
 sudo rm -f /usr/local/bin/cys /usr/local/bin/cysd
 
 # ⑤ 데이터·부서·세팅 전부 삭제 — 이 줄이 "포맷하듯 초기화"입니다
-rm -rf ~/.cys ~/.local/state/cys
+#    (부서마다 대화 기록이 cys-dept-부서명 폴더에 따로 있고, 앱에서 지운 부서의
+#     격리 보관본은 cys-trash 폴더에 남습니다 — 넷 다 지워야 진짜 전부입니다)
+rm -rf ~/.cys ~/.local/state/cys ~/.local/state/cys-dept-* ~/.local/state/cys-trash
+
+# ⑥ 앱 화면 저장값(테마·화면 배치 등 앱이 브라우저 저장소에 남긴 설정) 삭제
+rm -rf ~/Library/WebKit/com.cysjavis.terminal ~/Library/Caches/com.cysjavis.terminal
 ```
 
 > - ①에서 "not found" 비슷한 말이 나와도 괜찮습니다(이미 꺼져 있다는 뜻).
@@ -159,8 +164,10 @@ cys는 설치 중에 Claude Code(claude 명령)의 설정 파일에 자기 연�
 # 자주 묻는 질문
 
 **Q. 정말 PC 포맷은 안 해도 되나요?**
-네. cys가 컴퓨터에 남기는 것은 ①앱 ②숨김 데이터 폴더(`.cys`) ③(맥) 자동 실행 등록
-④Claude Code 훅, 이 넷이 전부입니다. 위 단계가 넷을 모두 지웁니다.
+네. cys가 컴퓨터에 남기는 것은 ①앱 ②숨김 데이터 폴더(`.cys`) ③상태 폴더(맥은
+`~/.local/state`의 `cys`·`cys-dept-…`·`cys-trash`, 윈도우는 `%LOCALAPPDATA%\cys` 하나)
+④(맥) 자동 실행 등록 ⑤Claude Code 훅 ⑥앱 화면 저장값(테마·배치), 이 여섯이 전부입니다.
+위 단계가 여섯을 모두 지웁니다.
 
 **Q. 부서를 앱에서 지웠는데 왜 자꾸 돌아왔나요?**
 부서 정보가 `.cys` 폴더에 남아 있으면 데몬이 되살릴 수 있습니다. 이 가이드는

@@ -143,6 +143,15 @@ cys doctor          # 자기진단 (문제 시 --fix)
 프로젝트 간 장애·자원·통신이 격리됩니다. Control Center "작업" 탭과 `cys fleet`은 모든
 부서를 집계해 보여줍니다.
 
+- **마스터 선언 → 부서 자동 생성(위계 폴백)**: 이미 살아있는 마스터(CEO)가 있는 조직에서
+  **오너가 직접 타이핑한** "너는 마스터다" 선언(base 레인·unix)은 거부로 끝나지 않고,
+  새 부서를 자동 생성해 부서장(claude)·팀을 기동합니다. 첫 부서 생성 시 기존 마스터는
+  CEO로 자동 승격됩니다. 에이전트가 배달한 선언·스크립트 직접 실행은 이 폴백을 타지
+  않습니다(폭주 봉인 — 거부 안내만).
+- **킬스위치 `CYS_DEPT_FALLBACK=0`**: 위 자동 생성을 끄고 구계약(거부 rc=7 + 안내)으로
+  되돌립니다(무배포 현장 롤백 채널). 예: `CYS_DEPT_FALLBACK=0` 을 셸 환경에 넣고 앱/데몬을
+  재시작.
+
 ### 4.5 입력
 
 - **한글 IME**: macOS에서 조합 중 자모 유출을 막는 상태 머신이 내장되어 있습니다.
@@ -171,9 +180,14 @@ cys doctor          # 자기진단 (문제 시 --fix)
   움직입니다(위로 굴리면 지나간 내용 읽기, 바닥 복귀·키 입력 시 다시 최신 출력 따라감).
 - **드래그 선택·복사**: 마우스 드래그로 선택하고 ⌘C(또는 우클릭 메뉴)로 복사합니다.
   Option+드래그도 동일하게 동작합니다.
-- 앱(TUI)이 마우스를 직접 받아야 하는 경우(vim `mouse=a` 등): 개발자도구 콘솔에서
-  `localStorage.cysAllowAppMouse="1"` 설정 후 새 pane 을 열면 그 pane 은 앱에 마우스를
-  넘깁니다(되돌리기: `localStorage.removeItem("cysAllowAppMouse")`).
+- 앱(TUI)이 마우스를 직접 받아야 하는 경우(vim `mouse=a` 등) — 터미널에서 아래 한 줄을
+  실행하고 **새 pane** 을 열면 그 pane 은 클릭·드래그·휠 전부를 앱에 넘깁니다:
+  ```sh
+  touch ~/.cys/allow-app-mouse        # 켜기 (되돌리기: rm ~/.cys/allow-app-mouse)
+  ```
+  환경변수 `CYS_ALLOW_APP_MOUSE=1` 로 앱을 띄워도 같습니다. (개발자도구가 있는 빌드에서는
+  콘솔의 `localStorage.cysAllowAppMouse="1"` 도 동작하지만, 릴리스 빌드에는 개발자도구가
+  없으므로 위 파일 방식이 표준입니다.)
 
 ### 4.7 테마·폰트
 
@@ -670,6 +684,8 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
+| `CYS_ALLOW_APP_MOUSE` | — (`1`=on) | 앱 마우스 킬스위치 — TUI가 마우스를 갖는다 (§4.6b · `~/.cys/allow-app-mouse` 파일과 동등) |
+| `CYS_DEPT_FALLBACK` | — (`0`/`off`=끔) | 마스터 선언→부서 자동 생성 폴백 끄기 (§4.4 · 구계약 rc=7 복원) |
 
 (이 밖에 진단·튜닝용 변수 다수 — `CYS_DEBUG`, `CYS_USAGE_POLL_SECS`, `CYS_REAP_EXITED*`,
 `CYS_CRASH_WINDOW_SECS`, `CYS_MAX_RESPONSE_BYTES`, `CYS_ABI_VERIFY` 등. 소스 grep
