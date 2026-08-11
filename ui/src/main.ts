@@ -18,6 +18,7 @@ import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
+import { MouseTrackingFilter } from "./trackfilter";
 import {
   toastTtl,
   toastTimerPlan,
@@ -2099,11 +2100,21 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     exited_event: string;
   };
   const outStamp = { t: 0 }; // 마지막 출력 시각 — rt.lastOutputAt(스트리밍 가드)의 원천
+  // ★마우스 트래킹 스트리핑(B안 근본 수리 · trackfilter.ts 계약 주석 참조): 앱의 DECSET
+  // 1003h/1006h 류가 xterm 에 닿지 않게 걷어내 휠 스크롤·일반 드래그 선택·복사를 기본 동작으로
+  // 복원한다. pane 수명 전체 단일 인스턴스 — 스냅샷 재생과 라이브 스트림이 같은 필터를 지난다.
+  // 킬스위치: localStorage.cysAllowAppMouse="1"(새 pane부터) → 필터 우회(앱이 마우스를 갖는다).
+  const allowAppMouse = localStorage.getItem("cysAllowAppMouse") === "1";
+  const trackFilter = new MouseTrackingFilter();
   const un1 = await listen(ev.output_event, (e) => {
     outStamp.t = Date.now();
-    term.write(b64ToBytes(e.payload as string), snapToBottom);
+    const raw = b64ToBytes(e.payload as string);
+    term.write(allowAppMouse ? raw : trackFilter.feed(raw), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
+    // 필터 잔여 carry 방류(시퀀스 중간 사망 시에도 바이트 소실 0) 후 종료 배너.
+    const rest = trackFilter.flush();
+    if (rest.length > 0) term.write(rest);
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n", snapToBottom);
   });
   // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
