@@ -222,6 +222,38 @@ xcrun notarytool submit "$APPZIP" "${NOTARY_ARGS[@]}" --wait
 xcrun stapler staple "$APP"
 rm -f "$APPZIP"
 
+# ── (조건부) 공증 .pkg 설치관리자 생성 — Installer 신원이 있을 때만 ──
+# 초보 사용자의 "DMG 열고 아이콘을 /Applications 로 드래그" 단계는 복사 중 경합(반쯤 복사된 앱을
+# 실행·재복사 충돌·xattr quarantine 잔류)을 일으킨다. .pkg 는 installer 가 /Applications 에 **원자적**
+# 으로 배치하므로 그 경합이 근본 소멸한다(초보자 더블클릭 → 다음 → 설치 완료).
+# ★조건부: APPLE_INSTALLER_SIGNING_IDENTITY(Developer ID Installer)가 설정된 경우에만 이 블록이 돈다.
+#   미설정이면 통째로 skip → 기존 DMG/업데이터 경로는 완전 무손상으로 진행한다(현행 파이프라인 불변).
+#   $APP 은 이 시점에 Application 서명 + 공증 + staple 이 끝난 상태 = .pkg 페이로드로 그대로 감싼다.
+if [ -n "${APPLE_INSTALLER_SIGNING_IDENTITY:-}" ]; then
+  PKG="$BUNDLE_BASE/macos/cys_${VERSION}_${DMG_ARCH}.pkg"
+  echo "== (조건부) .pkg 설치관리자 생성: $PKG =="
+  productbuild --component "$APP" /Applications "$PKG.unsigned"
+  productsign --sign "$APPLE_INSTALLER_SIGNING_IDENTITY" "$PKG.unsigned" "$PKG"
+  rm -f "$PKG.unsigned"
+  echo "== 공증: .pkg 제출 → staple =="
+  xcrun notarytool submit "$PKG" "${NOTARY_ARGS[@]}" --wait
+  xcrun stapler staple "$PKG"
+  # 설치 게이트 검증(hard-fail) — spctl 의 **install** 타입은 codesign(open)과 별개 게이트다.
+  # .pkg 서명·공증이 어긋나면 소비자 머신에서 "확인되지 않은 개발자" 로 막히므로 여기서 못박는다.
+  echo "== 검증: 설치 게이트(spctl -a --type install) — hard-fail =="
+  if spctl -a -vv --type install "$PKG" 2>&1 | grep -qi "accepted"; then
+    echo "  ✓ .pkg spctl(install): accepted — 초보자 더블클릭 설치 무경고"
+  else
+    echo "  ✗ .pkg spctl(install) 거부 — productsign 신원/공증 확인 필요" >&2
+    exit 1
+  fi
+  mkdir -p dist-mac
+  cp "$PKG" "dist-mac/cys_${VERSION}_${DMG_ARCH}.pkg"
+  echo "✓ 공증 .pkg 준비: $PKG (원자 설치 → 드래그 복사 경합 근본 제거)"
+else
+  echo "ℹ .pkg skipped(no installer identity) — APPLE_INSTALLER_SIGNING_IDENTITY 미설정. 기존 DMG 경로 무손상 진행."
+fi
+
 # 업데이터 아티팩트 재생성(dedup 반영): Tauri가 만든 fat cys.app.tar.gz(447MB)를 dedup·staple된 앱으로
 # 다시 tar(심볼릭링크 보존 → 다운로드 축소)하고 업데이터 키로 재서명. make-update-manifest.sh가 이 .sig를 읽는다.
 # (주의: Tauri 업데이터 *클라이언트*의 심볼릭링크 보존은 버전의존 #7480 — 다운로드는 축소되나 설치 후 on-disk

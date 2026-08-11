@@ -327,6 +327,11 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # ★(조건부) Developer ID Installer 인증서 — 있으면 .pkg 서명용으로 같은 키체인에 추가 import.
+          #   3개 모두 미설정이면 import 스크립트가 조용히 skip → Application 경로 무변경(DMG 무손상).
+          APPLE_INSTALLER_CERTIFICATE_B64: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_B64 }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLE_INSTALLER_SIGNING_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
         run: bash scripts/import-macos-signing-certificate.sh
 
       - name: Build, notarize, staple + 산출물 정규화 (macOS 전용)
@@ -339,6 +344,9 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          # ★(조건부) 설치관리자 신원 — 설정 시 build-macos-signed.sh 가 공증 .pkg 를 추가 생성한다.
+          #   미설정이면 스크립트의 .pkg 블록이 통째로 skip → DMG/업데이터 산출만(현행 무손상).
+          APPLE_INSTALLER_SIGNING_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           TRIPLE="${{ matrix.target }}"
@@ -452,6 +460,26 @@ jobs:
                                   #   별도 집행(발행=외부 공개 denylist). 구 'false 자동발행'은 승인 게이트와 충돌.
           prerelease: false
           args: --target ${{ matrix.target }}
+
+      # ★(조건부) 공증 .pkg 설치관리자 업로드 — tauri-action 은 .dmg/.app.tar.gz 만 수집하므로 .pkg 는
+      #   여기서 별도 업로드한다. build-macos-signed.sh 가 Installer 신원이 있을 때만 .pkg 를 만들므로,
+      #   신원 미설정이면 파일이 없어 이 스텝은 조용히 no-op(기존 DMG 발행 무손상). 러너에 표준 gh CLI 상주.
+      #   대상은 build 잡이 만든 비공개 draft 릴리스(--clobber) — 공개 발행·latest 마킹은 오너 승인 후 별도.
+      - name: Upload notarized .pkg to source release (조건부 — Installer 신원 있을 때만)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 네이티브(target/release/bundle) · 크로스(target/<triple>/release/bundle) 양 경로에서 이 레그의 .pkg 탐색.
+          PKG="$(ls target/*/release/bundle/macos/cys_*.pkg target/release/bundle/macos/cys_*.pkg 2>/dev/null | head -1 || true)"
+          if [ -n "$PKG" ] && [ -f "$PKG" ]; then
+            gh release upload "${{ github.ref_name }}" "$PKG" -R "$SRC_REPO" --clobber
+            echo "✅ 공증 .pkg 업로드: $PKG (draft 유지 — 공개는 오너 승인 후)"
+          else
+            echo "ℹ .pkg 없음 — APPLE_INSTALLER_SIGNING_IDENTITY 미설정으로 build-macos-signed.sh 가 skip. DMG만 발행(무손상)."
+          fi
 
       # 러너 키체인 잔류 방지 — 실패 경로 포함 항상 정리 (v0.13.23 구조 준용·브라우저 키 정리는 해당 없음)
       - name: Remove ephemeral macOS keychain
