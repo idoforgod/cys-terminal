@@ -490,6 +490,16 @@ _STEP_DEFS = (
     ("PING", "②ping"),
     ("CLAIM_ROLE", "③claim-role"),
     ("CLAIM_ROLE_CONTEXT", "③claim-role-context"),
+    # ★위계 폴백(2026-08 현장 결함 3호 · 오너 결정 D1ⓐ/D2/D3): base 레인에서 살아있는 master 가
+    #   있어 ③이 정당거부될 때, 선언(=오너 타이핑·MO 게이트 통과)을 '부서 창설 의도'로 해석해
+    #   부서 자동 생성 → 티켓 발급 → 부서장·팀 기동으로 이어주는 단계들. ③ 거부 직후에만 돈다.
+    ("DEPT_FB", "③-d dept-fallback"),
+    ("DEPT_FB_ALLOC", "③-d dept-alloc"),
+    ("DEPT_FB_TICKET", "③-d dept-ticket"),
+    ("DEPT_FB_MASTER", "③-d dept-master"),
+    ("DEPT_FB_TEAM", "③-d dept-team"),
+    ("DEPT_FB_CHECK", "③-d dept-check"),
+    ("DEPT_FB_NOTIFY", "③-d dept-notify"),
     ("CEO_TICKET", "③″ceo-ticket"),
     ("RESOURCE_GATE_ABSENT", "④′resource-gate-absent"),
     ("RESOURCE_GATE", "④′resource-gate"),
@@ -641,7 +651,11 @@ class _Log:
         #   ③ 알림 결과 채널명을 boot-last에 남긴다 — '알렸다'는 주장이 아니라 실측 파생 기록
         #      (CS-3 보고=실측). 'none(...)' 이면 비제로 exit·boot-last가 최종 증거다.
         # ★키는 STEP 상수다(리터럴 금지) — 라벨이 바뀌면 힌트가 조용히 안 붙는 드리프트를 차단한다.
-        hint = {STEP.CLAIM_ROLE: "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
+        hint = {STEP.CLAIM_ROLE: "다른 pane이 이미 master입니다(조직당 master 1명). 새 부서장을 세우려면 "
+                                 "GUI ＋부서(부서 워크스페이스 추가)를 쓰거나, base 레인(unix)에서는 재선언이 "
+                                 "부서 자동 생성으로 이어집니다.",
+                STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP 기본 8)·~/.cys/depts.json 을 확인하세요.",
+                STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — GUI 부서 탭의 ▶부서장 버튼으로 재시도하세요.",
                 STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
                 STEP.CHECK: "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
                 STEP.PING: "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",
@@ -877,6 +891,241 @@ def _consume_dept_ticket(path):
         return "소비(.used)"
     except OSError as e:
         return "소비 실패(%s — 이미 rename됐거나 권한): 계속" % e
+
+
+# ---------------- 위계 폴백: 2번째 마스터 선언 → 부서 자동 생성 (현장 결함 3호) ----------------
+#
+# 절대규칙(오너): 1번째 선언=master, 2번째 선언(다른 워크스페이스)=첫 master 는 CEO 로 승격되고
+# 선언자는 새 '부서장'이 되며 팀(cso·worker·리뷰어들)이 기동돼야 한다 — N번째도 동일(부서 증식).
+# 종전 현실: 같은 데몬에서의 2번째 선언은 ③정당거부(exit 7) 데드엔드였고, 위계 기계(cys-dept 의
+# CEO 승격·부서 데몬·티켓)는 GUI ＋부서 버튼으로만 발동했다 — 선언 경로와 미배선.
+#
+# 오너 결정(2026-08-12): D1ⓐ 선언=부서 창설 동의(즉시 진행·멱등 동반) · D2 "선언 pane 이 그대로
+# 부서장이 되는" 것은 PTY 소속 구조상 불가 — 새 부서에 부서장을 기동하고 선언 pane 에는 결과
+# 컨텍스트를 주입한다 · D3 티켓 자동 발급(오너 타이핑 선언=발급 동의 — base 레인의 "선언=팀 기동
+# 승인" 기존 재정의(role-bootstrap.sh)를 부서 레인으로 일관 확장).
+#
+# ★폭주 봉인(ABSOLUTE ANCHOR ①): 이 폴백에 도달하려면 이미 ⓐ훅 allowlist(master|미claim pane 만
+#   발화) ⓑmachine-origin 게이트(오너 타이핑 판정 — 기계 배달 선언은 스폰 자체가 없다) ⓒ레인
+#   싱글플라이트 락을 전부 통과한 상태다. 여기에 ⓓsurface별 멱등 맵(재선언=기존 부서 재사용)
+#   ⓔcys-dept allocate 의 live-count 상한(CYS_DEPT_CAP 기본 8) ⓕunix 한정(Windows 는 안내만 —
+#   설치파일 신중 앵커)을 얹는다. 에이전트끼리 선언 문구를 주고받아 부서가 증식하는 경로는
+#   ⓑ가 원천 차단한다(배달 원장 해시·라벨 기반 — 원장 밖 동일 UID 위조는 기존 잔여위험과 동일).
+#
+# ★caller 게이트 우회 금지(설계 제약 실측): 데몬 claim_role 은 "발신 pane==대상 surface" 를
+#   커널 peer 로 강제한다 — pane 밖 프로세스(이 폴백)는 어떤 surface 의 역할도 claim 할 수 없다.
+#   그래서 폴백은 **claim-free 프리미티브만** 쓴다: cys-dept allocate(부서 데몬+CEO 승격),
+#   launch-agent(role 은 surface.create 가 등록 — GUI ▶부서장 start_dept_master 와 동일 명령),
+#   cys boot(팀 스폰 — BOOT_PLAN 에 master 없음). 티켓은 **소비하지 않고 남긴다**: 부서장의
+#   in-pane 부트 체인(session-start 부트 브리지)이 유효 티켓으로 결손을 자가치유하는 인가가 된다
+#   (P7 게이트 의미 보존 — G11 "티켓 소비 ⟺ 실스폰"은 그 체인이 지킨다. TTL 24h 자연 만료).
+
+_DEPT_FB_MAP = os.path.join(STATE_DIR, "dept-fallback-map.json")
+
+
+def _run_env(cmd, env, timeout=120):
+    """_run 의 env 지정판 — (exit, stdout, stderr) **분리** 반환(cys-dept allocate 의
+    'stdout 마지막 줄=부서명' 계약을 병합 텍스트에서 긁는 오파싱 방지)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace", env=env)
+        return r.returncode, (r.stdout or ""), (r.stderr or "")
+    except FileNotFoundError:
+        return 127, "", "명령 없음: %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout(%ss): %s" % (timeout, " ".join(str(c) for c in cmd))
+
+
+def _dept_fb_load_map():
+    try:
+        with open(_DEPT_FB_MAP, encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _dept_lane_env(sock, pack):
+    """부서 대상 명령의 env — ★G34: 소켓과 팩은 항상 쌍으로 간다(start_dept_master 와 동일 계약).
+    ★CYS_SURFACE_ID/REF 제거: base pane 의 표적이 부서 데몬의 동번호 surface 로 오배선되는
+    교차 오염 차단(다른 데몬 = 다른 id 공간)."""
+    e = dict(os.environ)
+    e["CYS_SOCKET"] = sock
+    e["CYS_PACK_DIR"] = pack
+    e.pop("CYS_SURFACE_ID", None)
+    e.pop("CYS_SURFACE_REF", None)
+    return e
+
+
+def _dept_master_alive(dept_env):
+    """부서에 살아있는 master 좌석이 있는가 — `cys list` 실측(role=master ∧ exited=false)."""
+    code, out, err = _run_env(["cys", "list"], dept_env, timeout=15)
+    if code != 0:
+        return False
+    return any(("role=master" in ln and "exited=false" in ln) for ln in (out + err).splitlines())
+
+
+def _dept_fallback(log, claim_out):
+    """③정당거부 → 부서 자동 생성 폴백. 반환: exit 코드(처리함) 또는 None(비적용 — 종전 exit 7 경로로).
+
+    비적용 조건(전부 fail-closed·조용한 강등 없이 step 기록): 킬스위치 / Windows /
+    비-base 레인 / cys-dept 부재. 이 함수는 cmd_run 체인 안에서만 불린다(싱글플라이트 락 보유).
+
+    ★킬스위치: `CYS_DEPT_FALLBACK=0|off` — 현장 롤백 채널(구계약 exit 7 즉시 복원). 새 자동
+    스폰 경로에는 반드시 무배포 롤백 수단을 함께 싣는다(B안 필터 킬스위치와 동일 원칙)."""
+    if os.environ.get("CYS_DEPT_FALLBACK", "").lower() in ("0", "off"):
+        return None  # 명시 비활성 — 구계약(정당거부 exit 7) 그대로
+    if os.name == "nt":
+        return None  # Windows 는 자동 스폰 금지(설치파일 신중 앵커) — 강화된 안내만
+    if not _is_base_socket():
+        return None  # 부서 레인의 master 충돌은 부서 내부 문제 — 부서 안에 부서를 만들지 않는다
+    cys_dept = os.path.join(PACK, "bin", "cys-dept")
+    if not os.path.isfile(cys_dept):
+        log.step(STEP.DEPT_FB, 1, "cys-dept 부재(%s) — 폴백 비적용" % cys_dept)
+        return None
+
+    sid = re.sub(r"[^0-9]", "", os.environ.get("CYS_SURFACE_ID", "")) or "unknown"
+    _progress("③-d 위계 폴백: 살아있는 master 존재 — 선언을 '부서 창설'로 해석(D1ⓐ)…")
+    log.step(STEP.DEPT_FB, 0, "정당거부 → 부서 자동 생성 진입(선언 surface=%s)" % sid)
+
+    # base 셸 env: cys-dept 는 base 레지스트리 대상 — CYS_SOCKET 제거(ceo_reinject_master 동형).
+    # PATH 에 이 인터프리터 디렉토리를 선두 주입 — cys-dept 내부 python3(레지스트리 flock RMW)가
+    # 번들 런타임으로 해소되게 한다(GUI 의 inject_runtime_path 와 동일 취지).
+    base_env = dict(os.environ)
+    base_env.pop("CYS_SOCKET", None)
+    base_env["PATH"] = os.path.dirname(sys.executable or "python3") + os.pathsep + base_env.get("PATH", "")
+
+    # ⓓ멱등: 같은 surface 의 재선언은 새 부서를 만들지 않고 기존 부서를 재사용한다(살아 있을 때).
+    fb_map = _dept_fb_load_map()
+    name = None
+    prev = fb_map.get(sid)
+    if isinstance(prev, dict) and prev.get("dept"):
+        code, out, err = _run_env(["bash", cys_dept, "sock", prev["dept"]], base_env, timeout=30)
+        if code == 0 and out.strip():
+            probe_env = _dept_lane_env(out.strip().splitlines()[-1], prev.get("pack", ""))
+            pc, _o, _e = _run_env(["cys", "ping"], probe_env, timeout=10)
+            if pc == 0:
+                name = prev["dept"]
+                log.step(STEP.DEPT_FB_ALLOC, 0, "멱등 재사용: 기존 부서 %s 생존 — 신규 생성 생략" % name)
+
+    if name is None:
+        code, out, err = _run_env(["bash", cys_dept, "allocate"], base_env,
+                                  timeout=_budget_leaf("CYS_DEPT_FB_ALLOC_S", 240))
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        name = lines[-1] if lines else ""
+        log.step(STEP.DEPT_FB_ALLOC, code, "allocate → %r\n%s%s" % (name, out[-1500:], err[-1500:]))
+        if code != 0 or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""):
+            return log.fail(STEP.DEPT_FB_ALLOC, code or 1,
+                            "부서 생성 실패(allocate exit %s · name=%r). 상한(CYS_DEPT_CAP 기본 8) 도달"
+                            " 여부·레지스트리(~/.cys/depts.json)를 확인하라.\n%s%s" % (code, name, out[-800:], err[-800:]),
+                            EXIT_BOOT)
+
+    # 부서 (소켓, 팩) 쌍 — cys-dept 가 SOT(`<name> -- <cmd>` env 주입 경로)다. 중복 유도 금지.
+    code, out, err = _run_env(
+        ["bash", cys_dept, name, "--", "sh", "-c", 'printf "%s\\n%s\\n" "$CYS_SOCKET" "$CYS_PACK_DIR"'],
+        base_env, timeout=30)
+    pair = [ln for ln in out.splitlines() if ln.strip()]
+    if code != 0 or len(pair) < 2:
+        return log.fail(STEP.DEPT_FB_ALLOC, code or 1,
+                        "부서 소켓/팩 쌍 유도 실패(%s)\n%s%s" % (name, out[-500:], err[-500:]), EXIT_BOOT)
+    sock, pack = pair[0].strip(), pair[1].strip()
+    dept_env = _dept_lane_env(sock, pack)
+
+    # 멱등 맵 영속(부분 실패 후 재선언도 같은 부서로 수렴하게 — 생성 직후 기록).
+    fb_map[sid] = {"dept": name, "sock": sock, "pack": pack, "at": time.time(),
+                   "at_iso": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    _atomic_write_json(_DEPT_FB_MAP, fb_map)
+
+    # D3: CEO 티켓 자동 발급(오너 타이핑 선언=발급 동의 — cmd_issue_ticket 와 동일 스키마·경로).
+    tpath = _ticket_path(name)
+    if not _peek_dept_ticket(name)[0]:
+        now = time.time()
+        _atomic_write_json(tpath, {
+            "dept": name, "issued_at": now,
+            "issued_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "issuer": "dept-fallback(surface %s)" % sid})
+        log.step(STEP.DEPT_FB_TICKET, 0, "티켓 발급(D3): %s" % tpath)
+    else:
+        log.step(STEP.DEPT_FB_TICKET, 0, "유효 티켓 기존재 — 재발급 생략: %s" % tpath)
+
+    # 부서 팩 준비 대기 — 부서 데몬 부팅 자동설치가 pack-dept-<name> 을 채운다(G34: 팩 없이
+    # launch-agent 를 쏘면 본부 팩 교차 서빙·레인 가드 exit 8 계열 결함 재현).
+    dept_boot_py = os.path.join(pack, "bin", "javis_bootstrap.py")
+    deadline = time.time() + _budget_leaf("CYS_DEPT_FB_PACK_S", 90)
+    while time.time() < deadline and not os.path.isfile(dept_boot_py):
+        time.sleep(1)
+    if not os.path.isfile(dept_boot_py):
+        return log.fail(STEP.DEPT_FB_MASTER, 1,
+                        "부서 팩 미준비(%s — 데몬 자동설치 대기 초과). 부서 데몬 기동 상태를 확인하라."
+                        % dept_boot_py, EXIT_BOOT)
+
+    # D2: 부서장 기동 — GUI ▶부서장(start_dept_master)과 동일 명령. 이미 살아 있으면 생략(멱등).
+    sref = None
+    if _dept_master_alive(dept_env):
+        log.step(STEP.DEPT_FB_MASTER, 0, "부서장 생존 — 기동 생략(멱등)")
+    else:
+        code, out, err = _run_env(["cys", "launch-agent", "--role", "master", "--agent", "claude"],
+                                  dept_env, timeout=_budget_leaf("CYS_DEPT_FB_MASTER_S", 420))
+        m = re.search(r"surface:\d+", out + err)
+        sref = m.group(0) if m else None
+        log.step(STEP.DEPT_FB_MASTER, code, "launch-agent master → %s\n%s%s"
+                 % (sref, out[-1200:], err[-1200:]))
+        if code != 0:
+            return log.fail(STEP.DEPT_FB_MASTER, code,
+                            "부서장 기동 실패(%s). claude CLI 설치·부서 데몬 상태를 확인하라.\n%s%s"
+                            % (name, out[-800:], err[-800:]), EXIT_BOOT)
+
+    # 팀 결정론 스폰 — cys boot(BOOT_PLAN: cso·worker 의무 + 리뷰어들. master 는 스폰 대상 아님).
+    # busy(75)=다른 boot 가 진행 중 — 실패 아님(그 boot 가 팀을 세운다).
+    code, out, err = _run_env(["cys", "boot", "--json"], dept_env,
+                              timeout=_budget_leaf("CYS_DEPT_FB_TEAM_S", 600))
+    boot_exit = code
+    log.step(STEP.DEPT_FB_TEAM, 0 if code in (0, 75) else code,
+             "cys boot exit=%s%s\n%s%s" % (code, " (busy — 진행 중 boot 존중)" if code == 75 else "",
+                                           out[-1500:], err[-1500:]))
+    # ④-b 동형: 리뷰어 슬롯 재확인(Degrade 정책 — 비0 이어도 계속).
+    orch = os.path.join(pack, "bin", "javis_orchestra.py")
+    if os.path.isfile(orch):
+        code, out, err = _run_env([sys.executable, orch, "boot-reviewers"], dept_env,
+                                  timeout=_budget_leaf("CYS_DEPT_FB_REV_S", 300))
+        log.step(STEP.DEPT_FB_TEAM, 0 if code == 0 else code,
+                 "boot-reviewers exit=%s(Degrade 계속)\n%s%s" % (code, out[-800:], err[-800:]))
+    # ⑤ 동형 1패스: 생존 판정은 보고용(바운디드 — 재시도 루프는 부서장 in-pane 체인 소관).
+    check_exit = None
+    if os.path.isfile(orch):
+        code, out, err = _run_env([sys.executable, orch, "check"], dept_env,
+                                  timeout=_budget_leaf("CYS_DEPT_FB_CHECK_S", 180))
+        check_exit = code
+        log.step(STEP.DEPT_FB_CHECK, 0 if code == 0 else code,
+                 "orchestra check exit=%s(보고용 1패스)\n%s%s" % (code, out[-800:], err[-800:]))
+
+    # D2: 선언 pane 컨텍스트 주입(queued — 조용 시점 배달) + 승인 Feed loud 알림.
+    note = ("[부서 자동 생성 — 위계 폴백] 이 조직(base)에는 살아있는 master(CEO)가 있어, 절대규칙에 따라 "
+            "새 부서 %(d)s 를 생성하고 부서장(claude)을 기동했습니다%(m)s. 팀 스폰 exit=%(b)s · "
+            "생존 판정 exit=%(c)s(0=전원 생존·부서장 체인이 결손을 자가치유). 첫 부서 생성 시 기존 "
+            "master 는 CEO 규약으로 자동 승격됩니다(cys-dept). 이 pane 은 역할 없는 일반 세션으로 "
+            "유지됩니다 — 부서장 대화는 부서 워크스페이스 pane(GUI 탭이 없으면 ＋부서 버튼의 부서 "
+            "선택에서 %(d)s 를 여세요) 또는 `CYS_SOCKET=%(s)s cys send --to master` 를 쓰세요."
+            % {"d": name, "m": (" (%s)" % sref if sref else ""), "b": boot_exit,
+               "c": check_exit, "s": sock})
+    channel = _notify_loud("부서 자동 생성: %s (마스터 선언 폴백)" % name, note)
+    sent = "미시도(선언 surface 미상)"
+    if sid != "unknown":
+        code, _o, _e = _run_env(["cys", "send", "--queued", "--surface", sid, note],
+                                dict(os.environ), timeout=20)
+        sent = "queued 주입 exit=%s" % code
+    log.step(STEP.DEPT_FB_NOTIFY, 0, "feed=%s · 선언 pane=%s" % (channel, sent))
+
+    summary = {"ok": True, "state": "dept_fallback", "dept": name, "dept_socket": sock,
+               "dept_pack": pack, "master": sref or "reused", "boot_exit": boot_exit,
+               "check_exit": check_exit, "ticket": tpath,
+               "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
+               "lane": log.lane, "boot_last": log.path}
+    # ★ok=None(CS-2⑩ 동형): 이 런은 base 팀을 부트한 것도, base 부트가 깨진 것도 아니다 —
+    #   공유 boot-last 의 건강 기록을 어느 방향으로도 덮지 않는다. 사실은 state 가 말한다.
+    log.result(ok=None, state="dept_fallback", dept=name, exit=EXIT_OK)
+    print(json.dumps(summary, ensure_ascii=False))
+    return EXIT_OK
 
 
 # ── 증분2 ⓑ: 결손 기준 자원 사전 게이트 ──
@@ -1417,8 +1666,16 @@ def _cmd_run_chain(log):
         #   폴백**으로만 남긴다(신 바이너리에서는 exit 가 1차 근거다). 종전엔 grep 이 유일 근거라
         #   데몬 메시지 문안이 바뀌면 정당거부가 조용히 '세션 오류'로 오분류됐다(문자열 계약 드리프트).
         if code == EXIT_CLAIM_DENIED or (code == 1 and any(m in low for m in _CLAIM_DENIED_MARKERS)):
+            # ★위계 폴백(현장 결함 3호 · D1ⓐ): 정당거부는 '유령 master 차단'이지 '조직 확장
+            #   금지'가 아니다. base 레인 + unix 면 선언을 부서 창설로 이어준다(_dept_fallback
+            #   상단 계약 주석 참조). 비적용(None)이면 종전 exit 7 경로 그대로(안내만 보강).
+            fb = _dept_fallback(log, out)
+            if fb is not None:
+                return fb
             msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
-                   "선언을 중단하고 기존 master에 인계하라.\n%s" % out)
+                   "선언을 중단하고 기존 master에 인계하라. 새 부서장을 세우려는 의도였다면: GUI "
+                   "＋부서(부서 워크스페이스 추가) 또는 base 레인 unix 에서의 재선언(부서 자동 생성)"
+                   "을 사용하라.\n%s" % out)
             # ★ok=None(CS-2⑩): 정당거부는 '이 레인의 부트가 깨졌다'가 아니다 — 공유 boot-last 의
             #   ok:true(건강한 master 의 완주 기록)를 ok:false 로 덮으면 §0 이 churn 한다.
             return log.fail(STEP.CLAIM_ROLE, code, msg, EXIT_CLAIM_DENIED,

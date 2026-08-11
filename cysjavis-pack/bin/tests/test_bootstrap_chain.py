@@ -215,14 +215,97 @@ attempts = int(open(os.path.join(tmp, "check.count"), encoding="utf-8").read())
 check("4c 시도수=상한(4)", attempts == 4, "attempts=%d" % attempts)
 shutil.rmtree(tmp)
 
-# ── 5. claim 거부 → exit 7·boot 미호출·마커 무 ──
+# ── 5. claim 거부(폴백 비활성 CYS_DEPT_FALLBACK=0) → 구계약: exit 7·boot 미호출·마커 무 ──
+# ★2026-08 위계 폴백(D1ⓐ) 도입 후 이 케이스는 '킬스위치 off 시 구계약 보존'의 핀이다.
 tmp = tempfile.mkdtemp(prefix="boot-t5-")
 env, home = make_env(tmp, claim_exit=1)
+env["CYS_DEPT_FALLBACK"] = "0"
 code, out, err = run(env)
-check("5a claim 거부 exit 7", code == 7, "exit=%d" % code)
+check("5a claim 거부(폴백 off) exit 7", code == 7, "exit=%d" % code)
 check("5b 마커 미생성", not os.path.exists(marker_path(home)))
 check("5c 거부 후 boot 미호출", "cys boot" not in calls(tmp))
 check("5d 인계 지시 출력", "인계" in err)
+shutil.rmtree(tmp)
+
+# ── 5-fb. claim 거부 + base 레인(unix) → 위계 폴백: 부서 자동 생성·부서장·팀 기동 (D1ⓐ·D2·D3) ──
+# 스텁 계약: cys-dept allocate → dept-7 · `<name> --` env 주입 실행 · launch-agent 는 master.flag
+# 를 만들어 이후 `cys list` 가 살아있는 master 를 보고하게 한다(멱등 재선언 검증 재료).
+def make_dept_fb_stubs(tmp, env, home):
+    bindir = os.path.join(tmp, "stubbin")
+    pack = os.path.join(home, ".cys", "pack")
+    dept_pack = os.path.join(home, ".cys", "pack-dept-dept-7")
+    dept_sock = os.path.join(tmp, "cys-dept-dept-7.sock")
+    os.makedirs(os.path.join(dept_pack, "bin"), exist_ok=True)
+    def w(path, body, mode=0o755):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        os.chmod(path, mode)
+    # 부서 팩: 준비 폴링 대상 + 팀 단계(orchestra) 스텁
+    w(os.path.join(dept_pack, "bin", "javis_bootstrap.py"), "# dept pack ready\n", 0o644)
+    w(os.path.join(dept_pack, "bin", "javis_orchestra.py"),
+      "import sys\nopen('%s/orch-dept.log','a').write(' '.join(sys.argv[1:])+'\\n')\nsys.exit(0)\n" % tmp,
+      0o644)
+    # cys-dept 스텁: allocate=이름 발급 · sock=소켓 경로 · `<name> -- <cmd>`=env 주입 exec
+    w(os.path.join(pack, "bin", "cys-dept"), (
+        "#!/bin/sh\n"
+        "echo \"cys-dept $@\" >> \"%(t)s/calls.log\"\n"
+        "case \"$1\" in\n"
+        "  allocate) echo '[cys-dept] spawn...' >&2; echo dept-7; exit 0;;\n"
+        "  sock) echo '%(s)s'; exit 0;;\n"
+        "  dept-7) shift; [ \"$1\" = '--' ] && shift; CYS_SOCKET='%(s)s' CYS_PACK_DIR='%(p)s' \"$@\"; exit $?;;\n"
+        "esac\nexit 0\n") % {"t": tmp, "s": dept_sock, "p": dept_pack})
+    # cys 스텁 확장: launch-agent → surface:42 + master.flag · list → flag 있으면 master 생존 보고
+    w(os.path.join(bindir, "cys"), (
+        "#!/bin/sh\n"
+        "echo \"cys $@ [sock=${CYS_SOCKET:-base}]\" >> \"%(t)s/calls.log\"\n"
+        "case \"$1\" in\n"
+        "  ping) exit 0;;\n"
+        "  claim-role) echo 'claim_denied: privileged role held by live surface' >&2; exit 7;;\n"
+        "  launch-agent) echo 'surface:42'; touch \"%(t)s/master.flag\"; exit 0;;\n"
+        "  list) [ -f \"%(t)s/master.flag\" ] && echo 'surface:42	role=master	pid=1	exited=false	x'; exit 0;;\n"
+        "  boot) exit 0;;\n"
+        "  send) exit 0;;\n"
+        "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
+        "esac\nexit 0\n") % {"t": tmp})
+    return dept_sock, dept_pack
+
+tmp = tempfile.mkdtemp(prefix="boot-t5fb-")
+env, home = make_env(tmp, claim_exit=1)
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+code, out, err = run(env)
+check("5fb-a 폴백 성공 exit 0", code == 0, "exit=%d err=%s" % (code, err[-300:]))
+try:
+    summary = json.loads(out.strip().splitlines()[-1])
+except Exception:
+    summary = {}
+check("5fb-b 최종 JSON state=dept_fallback", summary.get("state") == "dept_fallback", out[-300:])
+check("5fb-c 부서명 dept-7", summary.get("dept") == "dept-7")
+c = calls(tmp)
+check("5fb-d allocate 호출", "cys-dept allocate" in c)
+check("5fb-e launch-agent master(부서 소켓)", "launch-agent --role master --agent claude [sock=%s]" % dept_sock in c)
+check("5fb-f 팀 boot(부서 소켓)", "boot --json [sock=%s]" % dept_sock in c)
+ticket = os.path.join(home, ".cys", "state", "dept-boot-tickets", "dept-7.ticket")
+check("5fb-g 티켓 발급(D3)·미소비", os.path.exists(ticket), ticket)
+check("5fb-h base 마커 미생성(부서 폴백은 base 부트가 아니다)", not os.path.exists(marker_path(home)))
+bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
+check("5fb-i boot-last state=dept_fallback·ok=null",
+      bl.get("result", {}).get("state") == "dept_fallback" and bl.get("result", {}).get("ok") is None,
+      json.dumps(bl.get("result", {}), ensure_ascii=False)[:200])
+# 멱등 재선언: 같은 surface 재실행 → allocate 재호출 없음·launch-agent 재호출 없음(생존 master)
+code2, out2, err2 = run(env)
+c2 = calls(tmp)
+check("5fb-j 재선언 exit 0(멱등)", code2 == 0, "exit=%d" % code2)
+check("5fb-k allocate 1회(재생성 없음)", c2.count("cys-dept allocate") == 1, "count=%d" % c2.count("cys-dept allocate"))
+check("5fb-l launch-agent 1회(생존 master 존중)",
+      c2.count("launch-agent --role master") == 1, "count=%d" % c2.count("launch-agent --role master"))
+shutil.rmtree(tmp)
+
+# ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbd-")
+env, home = make_env(tmp, claim_exit=1, socket="/x/cys-dept-alpha/cys.sock", pack_dept="alpha")
+code, out, err = run(env)
+check("5fbd-a 부서 레인 claim 거부 → 폴백 없이 exit 7", code == 7, "exit=%d" % code)
+check("5fbd-b 부서 생성 미시도", "cys-dept allocate" not in calls(tmp))
 shutil.rmtree(tmp)
 
 # ── 6. 선행 단계 실패 exit 매핑: ping=3 · boot=4 (부팅-치명 전제 위반) ──
