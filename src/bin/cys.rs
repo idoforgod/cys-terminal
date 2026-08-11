@@ -6220,6 +6220,16 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
                     "[claim-role] 정당거부(rc=7): 살아있는 보유자가 그 역할을 쥐고 있다. \
                      이 surface 는 그 역할이 아니다 — 지휘를 중단하고 기존 보유자에게 인계하라."
                 );
+                // ★출구 안내(2026-08 위계 배선): 이 거부는 '유령 마스터 차단'이지 '조직 확장 금지'가
+                // 아니다. 새 부서장을 세우려는 정당한 의도라면 갈 길이 따로 있음을 여기서 알려준다 —
+                // 안내가 없으면 선언 pane 의 에이전트가 출구 없이 인계 산문만 반복한다(현장 결함 3호).
+                if role == "master" {
+                    eprintln!(
+                        "[claim-role] 새 부서장을 세우려는 경우: GUI '부서 워크스페이스 추가' 또는 \
+                         `cys-dept allocate` 로 독립 부서(전용 데몬·역할 공간)를 만들고 그 안에서 \
+                         선언하라. 오너 타이핑 마스터 선언은 부트스트랩이 부서 자동 생성으로 이어준다."
+                    );
+                }
                 7
             } else if e.starts_with("invalid_params") || e.starts_with("not_found") {
                 eprintln!("[claim-role] 식별 불가(rc=2): 요청 인자·surface 해석 실패.");

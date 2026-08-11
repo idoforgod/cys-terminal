@@ -4630,7 +4630,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
-    { id: "act:dept", title: "부서 워크스페이스 추가", keywords: "dept workspace 부서", action: () => addDeptWorkspace() },
+    { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => addDeptWorkspace() },
   );
   return items;
 }
