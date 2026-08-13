@@ -370,6 +370,212 @@ pub fn damaged_bundle_guidance_with_previous(
     )
 }
 
+// ─────────────────── 설치 후 봉인 자가진단(SEAL-DIAG · advisory) ───────────────────
+//
+// ★무엇을 하는 검사인가: 이 기계에 설치된 번들의 코드서명 봉인이 **이미 깨져 있는지**를
+//   앱이 스스로 확인해 사용자에게 정직하게 말한다. SEAL-1(env)·SEAL-2(선컴파일)가 파손을
+//   *예방*한다면, 이쪽은 그 둘을 뚫고 이미 벌어진 파손을 *발견*한다(예방과 치유는 다른 일이다).
+//
+// ★advisory 전용 — 어떤 판정에서도 기동을 막거나 지연시키지 않는다. 근거는
+//   `bundle_integrity_guidance`(src-tauri) 주석과 동일: 봉인 파손은 '능동적으로 해로운' 상태가
+//   아니라 '이 사본을 옮기면 열리지 않는' 상태다. 여기서 부트를 멈추면 오탐 1건이 정상 사용자의
+//   앱을 통째로 무력화하고, 아직 멀쩡한 기능까지 뺏는다. 사고의 실제 피해는 "아무도 말해주지
+//   않은 것"이었으므로 처방도 거기에 맞춘다.
+//
+// ★`cys doctor` 의 `app-seal` 항목과 중복이 아니라 **역할 분담**이다:
+//   doctor = 사람이 물었을 때 답하는 대화형 진단(빠른 `--strict`, 파손 파일 전량 + 복구 명령).
+//   이쪽    = 아무도 묻지 않아도 기동 때 한 번 스스로 보는 자가진단(느려도 되는 `--deep`,
+//             문구는 일반 사용자용 한 문단). 판정 **어휘**는 아래 `parse_seal_failure` 하나를
+//             양쪽이 공유해 갈리지 않게 한다(cys.rs 는 이 함수로 위임한다).
+
+/// codesign `--verbose` 출력에서 봉인 파손의 **원인 파일**을 갈래별로 분류한다(순수 함수).
+/// 반환 `(added, modified, missing, other)` — other 는 세 갈래에 안 잡힌 진단 문장(요약줄 포함).
+///
+/// ★`--verbose` 가 필수인 이유: 무-verbose 출력은 "a sealed resource is missing or invalid"
+///   요약 한 줄뿐이라 *어떤 파일 때문인지*를 사용자에게 말할 수 없다(실측 확인).
+/// ★`other` 를 파손으로 접지 않는 것이 이 분류의 핵심 계약이다 — 미서명 개발 빌드·중첩 서명
+///   불만 같은 문장이 전부 여기로 떨어지고, 그것들은 "봉인이 깨졌다"와 **다른 사실**이다.
+pub fn parse_seal_failure(out: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut missing = Vec::new();
+    let mut other = Vec::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(p) = l.strip_prefix("file added: ") {
+            added.push(p.trim().to_string());
+        } else if let Some(p) = l.strip_prefix("file modified: ") {
+            modified.push(p.trim().to_string());
+        } else if let Some(p) = l.strip_prefix("file missing: ") {
+            missing.push(p.trim().to_string());
+        } else if l.starts_with("--prepared:") || l.starts_with("--validated:") {
+            // verbose 진행 로그 — 진단이 아니다.
+            continue;
+        } else {
+            other.push(l.to_string());
+        }
+    }
+    (added, modified, missing, other)
+}
+
+/// 봉인 자가진단의 **3값** 판정. bool 로 접지 않는 이유가 곧 이 타입의 존재 이유다 —
+/// "판정 불가"를 "파손"으로 접으면 미서명 개발 빌드·도구 부재가 사용자에게 오보로 나간다
+/// (관측 부재는 판정이 아니다). 반대로 "통과"로 접으면 진짜 파손이 침묵한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealVerdict {
+    /// 봉인 무결(codesign exit 0).
+    Intact,
+    /// 봉인 파손 확증 — codesign 이 원인 파일을 **이름으로** 지목했다.
+    Broken {
+        /// 원인 파일(added/modified/missing 합본, 번들 루트 상대경로).
+        culprits: Vec<String>,
+        /// 원인이 전부 `__pycache__` 인가 = 번들 안 Python 이 스스로 깬 자기유발 파손의 지문.
+        self_inflicted: bool,
+    },
+    /// 판정 불가(도구 부재·실행 실패·번들 아님·파손 문장 미특정). **알리지 않는다.**
+    Undetermined(String),
+}
+
+/// codesign 실행 결과 → 판정(순수 함수 = 회귀 핀 대상 · IO 없음).
+///
+/// ★`success == false` 를 곧바로 파손으로 읽지 않는 것이 이 함수의 전부다. `--deep` 은
+/// 중첩 코드(동봉 python·node·git 안의 Mach-O)까지 훑으므로 "code object is not signed at
+/// all" 같은 **봉인 파손이 아닌** 실패 문장을 낼 수 있다. 그런 문장은 `other` 로 떨어지고
+/// 여기서 `Undetermined` 가 된다 — 그래야 미서명 개발 빌드·부분서명 사본에 "재설치하세요"를
+/// 들이밀지 않는다(오보 금지 계약).
+pub fn classify_seal_output(success: bool, exit_code: Option<i32>, text: &str) -> SealVerdict {
+    if success {
+        return SealVerdict::Intact;
+    }
+    let (added, modified, missing, other) = parse_seal_failure(text);
+    let culprits: Vec<String> = added
+        .into_iter()
+        .chain(modified)
+        .chain(missing)
+        .collect();
+    if culprits.is_empty() {
+        let tail: String = other.join(" | ").chars().take(300).collect();
+        return SealVerdict::Undetermined(format!(
+            "codesign exit {} · 봉인 파손 문장 미특정: {}",
+            exit_code.unwrap_or(-1),
+            if tail.is_empty() { "(출력 없음)".into() } else { tail }
+        ));
+    }
+    let self_inflicted = culprits.iter().all(|p| p.contains("__pycache__"));
+    SealVerdict::Broken {
+        culprits,
+        self_inflicted,
+    }
+}
+
+/// 번들 루트 접두를 떼어 사람이 읽을 수 있게 줄인다(로그 폭·개인 경로 노출 축소).
+///
+/// ★`codesign` 은 원인 파일을 **realpath 로** 보고한다 — 우리가 들고 있는 번들 경로가 심링크를
+/// 거친 형태면(`/tmp/…` = `/private/tmp/…`, 홈이 심링크된 볼륨 등) 문자 그대로의 접두 비교는
+/// 조용히 실패하고, 그러면 사용자 알림에 **전체 절대경로가 그대로 노출**된다. 그래서 원경로와
+/// 정규화 경로를 **둘 다** 시도한다. (이 결함은 e2e 핀 `seal_deep_verify_detects_real_bundle_mutation`
+/// 이 실제 codesign 출력으로 잡아냈다 — 순수 함수 핀만 있었으면 통과했을 자리다.)
+pub fn seal_relative(bundle: &Path, p: &str) -> String {
+    let mut roots = vec![bundle.to_path_buf()];
+    if let Ok(real) = bundle.canonicalize() {
+        if real != *bundle {
+            roots.push(real);
+        }
+    }
+    for root in &roots {
+        if let Some(rel) = p.strip_prefix(root.to_string_lossy().as_ref()) {
+            return rel.trim_start_matches('/').to_string();
+        }
+    }
+    p.to_string()
+}
+
+/// `codesign --verify --deep --strict --verbose` 로 설치본 봉인을 확인한다(macOS 전용 IO).
+///
+/// ★`--deep` 을 쓰는 이유(doctor 의 `--strict` 단독과 의도적으로 다르다): 이 검사는 사용자를
+/// 기다리게 하지 않는 **백그라운드 스레드**에서 버전당 한 번만 돌기 때문에 느려도 되고, 그
+/// 대가로 중첩 코드(동봉 python/node/git)의 파손까지 본다. doctor 는 사람이 답을 기다리는
+/// 대화형 경로라 빠른 최상위 판정을 고른다 — 둘 다 옳고, 판정 어휘는 위에서 공유한다.
+/// `--deep` 이 늘리는 오탐 표면은 `classify_seal_output` 의 Undetermined 강등이 막는다.
+///
+/// 비 macOS·`/usr/bin/codesign` 부재·실행 실패는 전부 `Undetermined`(무음 skip 대상).
+pub fn verify_seal_deep(bundle: &Path) -> SealVerdict {
+    if !cfg!(target_os = "macos") {
+        return SealVerdict::Undetermined("macOS 아님".into());
+    }
+    if !bundle.exists() {
+        return SealVerdict::Undetermined(format!("번들 경로 소멸({})", bundle.display()));
+    }
+    // PATH 하이재킹 회피 — stock macOS 상주 절대경로.
+    let tool = Path::new("/usr/bin/codesign");
+    if !tool.exists() {
+        return SealVerdict::Undetermined("/usr/bin/codesign 부재".into());
+    }
+    let out = match std::process::Command::new(tool)
+        .args(["--verify", "--deep", "--strict", "--verbose"])
+        .arg(bundle)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return SealVerdict::Undetermined(format!("codesign 실행 실패({e})")),
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    match classify_seal_output(out.status.success(), out.status.code(), &text) {
+        SealVerdict::Broken {
+            culprits,
+            self_inflicted,
+        } => SealVerdict::Broken {
+            culprits: culprits.iter().map(|p| seal_relative(bundle, p)).collect(),
+            self_inflicted,
+        },
+        v => v,
+    }
+}
+
+/// 봉인 파손을 사용자에게 알리는 문구(순수 함수 = 회귀 핀 대상).
+///
+/// ★문구 계약(과장 금지): ⓐ 지금 당장 앱이 못 쓰게 된 게 **아니라는** 사실을 먼저 말한다
+/// (실제로 지금 돌고 있으니까 — 겁주면 오히려 신뢰를 잃는다) ⓑ 실제 위험은 "이 사본을 옮기거나
+/// 다시 받아서 열 때 macOS 가 차단할 수 있다"는 조건부라는 것을 그대로 말한다 ⓒ 해결은 재설치
+/// 하나뿐임을 링크와 함께 준다. 번들 안 파일을 지우라는 '부분 수리'는 **절대 안내하지 않는다**
+/// (App Management 보호에 막히고, 막히지 않아도 added 가 missing 으로 바뀔 뿐이다 — `RECOVERY_STEPS` 참조).
+pub fn seal_broken_notice(bundle: &Path, culprits: &[String], self_inflicted: bool) -> String {
+    let sample: Vec<&str> = culprits.iter().take(3).map(|s| s.as_str()).collect();
+    let more = culprits.len().saturating_sub(sample.len());
+    let sample_line = if more > 0 {
+        format!("{} 외 {}건", sample.join(", "), more)
+    } else {
+        sample.join(", ")
+    };
+    let cause = if self_inflicted {
+        "\n원인 파일이 전부 파이썬 캐시(__pycache__)입니다 — 앱 안의 파이썬이 실행 중에 스스로 만든 파일이며, \
+         최신 버전에서는 이 현상이 차단되어 있습니다."
+    } else {
+        ""
+    };
+    format!(
+        "cys 설치본의 코드서명 봉인이 깨져 있습니다(자가진단 결과).\n\
+         위치: {}\n\
+         봉인과 어긋난 파일 {}건: {}{}\n\n\
+         지금 실행 중인 이 앱은 계속 사용할 수 있습니다. 다만 이 상태의 사본을 다른 맥으로 옮기거나 \
+         내려받아 처음 열면, macOS Gatekeeper 가 \"손상되었기 때문에 열 수 없습니다\"로 차단할 수 있습니다.\n\n\
+         해결 방법은 최신 버전 재설치 하나뿐입니다 — www.cysinsight.com/downloads 에서 내려받아 \
+         응용 프로그램 폴더의 기존 cys.app 을 휴지통으로 옮긴 뒤 새로 설치해 주세요.\n\
+         (설정·대화기록은 앱 밖 ~/.cys 에 있어 재설치로 지워지지 않습니다.)",
+        bundle.display(),
+        culprits.len(),
+        sample_line,
+        cause
+    )
+}
+
 // ───────────────────────── 원자 교체(ATOMIC-1) ─────────────────────────
 
 /// 교체 실패의 갈래. **어느 갈래든 "기존 번들이 어떤 상태인지"를 타입이 말하게** 한다 —
@@ -741,6 +947,141 @@ pub fn install_bundle_atomically_verifying(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★SEAL-DIAG 회귀 핀 ①: 판정이 **3값**으로 갈리는가. 이 핀이 지키는 것은 "판정 불가를
+    /// 파손으로 오보하지 않는다"는 계약 하나다 — 그게 무너지면 미서명 개발 빌드와 중첩 서명
+    /// 불만(=`--deep` 이 새로 여는 오탐 표면)이 전부 사용자에게 "재설치하세요"로 나간다.
+    #[test]
+    fn seal_verdict_never_reports_undetermined_as_broken() {
+        // ⓐ 통과.
+        assert_eq!(classify_seal_output(true, Some(0), ""), SealVerdict::Intact);
+
+        // ⓑ 실제 사고 출력(2026-08-01) — 원인 파일이 전부 __pycache__ = 자기유발 지문.
+        let real = "/Applications/cys.app: a sealed resource is missing or invalid\n\
+                    file added: /Applications/cys.app/Contents/Resources/runtime/python/lib/python3.12/__pycache__/_compression.cpython-312.pyc\n\
+                    file modified: /Applications/cys.app/Contents/Resources/runtime/python/lib/python3.12/encodings/__pycache__/utf_8.cpython-312.pyc\n\
+                    --prepared:/Applications/cys.app/Contents/MacOS/cys\n";
+        match classify_seal_output(false, Some(1), real) {
+            SealVerdict::Broken {
+                culprits,
+                self_inflicted,
+            } => {
+                assert_eq!(culprits.len(), 2, "added+modified 둘 다 원인으로 셈해야 한다");
+                assert!(self_inflicted, "전부 __pycache__ = 번들 안 python 자기유발");
+                assert!(
+                    !culprits.iter().any(|c| c.starts_with("--prepared")),
+                    "verbose 진행 로그는 진단이 아니다"
+                );
+            }
+            v => panic!("실사고 출력은 파손으로 확증돼야 한다: {v:?}"),
+        }
+
+        // ⓒ ★`--deep` 이 새로 여는 오탐 표면: 중첩 코드 미서명은 **봉인 파손이 아니다**.
+        //    doctor 의 `--strict` 단독에는 없던 갈래라 이 핀이 SEAL-DIAG 전용 방어다.
+        let nested = "/Applications/cys.app/Contents/Resources/runtime/node/bin/node: \
+                      code object is not signed at all\nIn subcomponent: /Applications/cys.app/…\n";
+        assert!(
+            matches!(
+                classify_seal_output(false, Some(1), nested),
+                SealVerdict::Undetermined(_)
+            ),
+            "중첩 서명 불만을 파손으로 접으면 정상 사용자에게 오보가 나간다"
+        );
+
+        // ⓓ 미서명 개발 빌드(가장 흔한 오탐 후보)도 판정 불가다.
+        assert!(matches!(
+            classify_seal_output(false, Some(1), "test.app: code object is not signed at all\n"),
+            SealVerdict::Undetermined(_)
+        ));
+    }
+
+    /// ★SEAL-DIAG 회귀 핀 ②: 사용자 문구가 **정직**한가(과장 금지·부분 수리 금지).
+    /// 문구는 이 기능의 유일한 산출물이라 내용 계약을 코드로 잠근다.
+    #[test]
+    fn seal_broken_notice_is_honest_and_never_suggests_partial_repair() {
+        let bundle = Path::new("/Applications/cys.app");
+        let culprits = vec![
+            "Contents/Resources/runtime/python/lib/python3.12/__pycache__/a.pyc".to_string(),
+            "Contents/Resources/runtime/python/lib/python3.12/__pycache__/b.pyc".to_string(),
+            "Contents/Resources/runtime/python/lib/python3.12/__pycache__/c.pyc".to_string(),
+            "Contents/Resources/runtime/python/lib/python3.12/__pycache__/d.pyc".to_string(),
+        ];
+        let msg = seal_broken_notice(bundle, &culprits, true);
+        assert!(msg.contains("www.cysinsight.com/downloads"), "재설치 경로를 줘야 한다");
+        assert!(msg.contains("계속 사용할 수 있습니다"), "지금 못 쓴다고 겁주지 않는다");
+        assert!(msg.contains("차단할 수 있습니다"), "위험은 조건부임을 그대로 말한다");
+        assert!(msg.contains("외 1건"), "원인 파일은 샘플 3건 + 나머지 개수로 줄인다");
+        // ★번들 안 파일을 지우라는 안내는 절대 나가면 안 된다(App Management 에 막히고,
+        //   막히지 않아도 added 가 missing 으로 바뀔 뿐 봉인은 그대로 깨진 채다).
+        for forbidden in ["rm -rf", "__pycache__ 를 삭제", "codesign --force"] {
+            assert!(!msg.contains(forbidden), "부분 수리 안내 금지: {forbidden}");
+        }
+        // 자기유발이 아니면 python 원인 문장이 붙지 않는다(없는 사실을 말하지 않는다).
+        let other = seal_broken_notice(bundle, &["Contents/Resources/x".into()], false);
+        assert!(!other.contains("__pycache__"), "지문이 없으면 원인을 단정하지 않는다");
+    }
+
+    /// ★SEAL-DIAG 회귀 핀 ③(e2e · 실 codesign): 위 두 핀은 **문자열을 가정**한다 — 그 가정이
+    /// 실제 `codesign --deep` 출력과 어긋나면 진단이 통째로 무음이 된다(가장 위험한 고장 모양).
+    /// 그래서 진짜로 서명하고, 실사고와 같은 모양으로 `__pycache__` 파일 하나를 번들 안에 심어,
+    /// `verify_seal_deep` 이 파손을 잡아내는지 본다. 서명 불가 환경은 **거짓 실패를 만들지 않고** skip
+    /// (측정 불능은 실패가 아니다 — 그 갈래가 곧 `Undetermined` 의 존재 이유이기도 하다).
+    #[test]
+    fn seal_deep_verify_detects_real_bundle_mutation() {
+        if !cfg!(target_os = "macos") || !Path::new("/usr/bin/codesign").exists() {
+            return;
+        }
+        let root = tmp_root("sealdeep");
+        let app = root.join("Probe.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+             <key>CFBundleExecutable</key><string>probe</string>\
+             <key>CFBundleIdentifier</key><string>com.cys.probe</string></dict></plist>",
+        )
+        .unwrap();
+        // 주 실행파일은 실제 Mach-O 여야 ad-hoc 서명이 성립한다.
+        std::fs::copy("/bin/echo", app.join("Contents/MacOS/probe")).unwrap();
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&app)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !signed {
+            let _ = std::fs::remove_dir_all(&root);
+            return; // 서명 불가 환경 — 판정 불가
+        }
+        assert_eq!(
+            verify_seal_deep(&app),
+            SealVerdict::Intact,
+            "갓 서명한 번들은 --deep 에서도 무결이어야 한다(오탐 0 확인)"
+        );
+
+        let pyc = app.join("Contents/Resources/runtime/python/lib/python3.12/__pycache__");
+        std::fs::create_dir_all(&pyc).unwrap();
+        std::fs::write(pyc.join("_compression.cpython-312.pyc"), b"x").unwrap();
+        match verify_seal_deep(&app) {
+            SealVerdict::Broken {
+                culprits,
+                self_inflicted,
+            } => {
+                assert!(self_inflicted, "전부 __pycache__ = 자기유발 지문");
+                // 번들 루트 접두가 떨어져 사용자에게 읽히는 형태여야 한다(개인 경로 노출 축소).
+                assert!(
+                    culprits.iter().all(|c| c.starts_with("Contents/")),
+                    "번들 상대경로로 줄여야 한다: {culprits:?}"
+                );
+                let msg = seal_broken_notice(&app, &culprits, self_inflicted);
+                assert!(msg.contains("www.cysinsight.com/downloads"));
+            }
+            v => panic!("파일 1개 추가로 봉인이 깨져야 한다: {v:?}"),
+        }
+        // 진단은 읽기 전용 — 변이 파일을 지우지 않는다(부분 수리 금지).
+        assert!(pyc.join("_compression.cpython-312.pyc").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn tmp_root(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("cys-atomic-{tag}-{}", std::process::id()));

@@ -63,8 +63,18 @@ fn scrub_claude_session_env() {
     }
 }
 
+/// ★SEAL-1 층3 배선 지점(sync main). `#[tokio::main]` 은 `async_main` 으로 내려가 있고, 여기서
+/// **런타임(=워커 스레드)이 만들어지기 전에** 프로세스 env 를 봉인한다 — `set_var` 는 프로세스
+/// 전역이라 스레드가 살아 있는 동안 쓰면 경합한다(lib.rs `seal_python_bytecode_in_process` 계약).
+/// 이 한 줄로 데몬의 **모든** 자손이 덮인다: pane(층2 가 이미 명시 주입) + 층1·층2 가 닿지 않는
+/// 임의 명령 경로 — `channels::spawn_bridge`(사용자 bridge_cmd)·`accounts` cmd 어댑터(주기 폴링).
+fn main() {
+    cys::seal_python_bytecode_in_process();
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     // ★수리 세대 부팅 로그 — 릴리스 게이트 마커의 확정 임베드 지점(v4).
     // main() 첫 실행 경로라 어떤 타깃·최적화에서도 데드코드 제거가 불가능하다
     // (v3 status() 참조는 x86_64 코드젠에서 함수째 소거됨 — run 30367192331 실증).

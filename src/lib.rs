@@ -87,6 +87,31 @@ pub fn python_command<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Co
     cmd
 }
 
+/// ★SEAL-1 층3 — **프로세스 자기 env 에 한 번 심어 모든 자손이 상속하게 한다**(드리프트 봉인).
+///
+/// 층1(`python_command`)·층2(`spawn_env_pairs`)는 **우리가 프로그램을 아는** 스폰만 덮는다.
+/// 그런데 세 프로세스 패밀리에는 프로그램을 **모르는** 스폰이 남는다 — 대표 둘(실측):
+///   · cysd `channels.rs::spawn_bridge` — 사용자 설정 `bridge_cmd` 를 `sh -c`/`cmd /C` 로 실행
+///   · cysd `accounts.rs` cmd 어댑터 — 사용자 설정 `cmd` 를 **≥60초 주기로 반복** 실행
+/// 여기에 python 이 들어오면 층1·층2 어느 쪽도 닿지 않는다. 특히 두 번째는 반복 스폰이라
+/// "한 번만 새면 봉인이 깨진다"는 이 사고의 성질과 최악으로 맞물린다.
+///
+/// **왜 호출부마다 `.env(...)` 를 더하지 않는가**: 그건 스폰 지점 수에 비례하는 사본이고,
+/// 새 스폰이 생기는 순간 또 빠진다(= 이 사고의 원래 기제). 프로세스 env 는 스폰 지점 수와
+/// 무관하게 한 번에 닫힌다 — 층1·층2 를 대체하는 게 아니라 **그 아래를 받치는 바닥**이다
+/// (층1·층2 는 명시적이라 회귀 핀을 걸 수 있고, 이 층은 빠짐없음을 보장한다).
+///
+/// ★계약: **스레드가 생기기 전**(각 바이너리 `main` 첫 줄)에만 부른다. `set_var` 는 프로세스
+/// 전역 상태라 다른 스레드가 env 를 읽는 중이면 경합한다. 세 진입점이 이 계약을 지킨다 —
+/// `cys`(sync main 선두) · `cysd`(sync `main` 이 tokio 런타임을 만들기 **전**) · `cys-app`
+/// (tauri Builder 전). 그래서 cysd 의 `#[tokio::main]` 은 `async_main` 으로 내려가 있다.
+///
+/// 무조건 강제(setdefault 아님): 이 키의 실패 방향은 하나뿐이고(최악 = 매번 재컴파일),
+/// 반대 방향의 대가는 **앱 실행 불가**다. 비대칭이 압도적이라 운영자 오프스위치를 두지 않는다.
+pub fn seal_python_bytecode_in_process() {
+    std::env::set_var(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON);
+}
+
 /// 이행기 호환: CYS_* 우선 → 구 JAVIS_* → 구 AITERM_* 순 폴백.
 pub fn env_compat(primary: &str) -> Option<String> {
     let javis = primary.replacen("CYS_", "JAVIS_", 1);
@@ -722,6 +747,40 @@ mod tests {
                     .map(|(_, v)| v.as_str()),
                 Some(PY_NO_BYTECODE_ON),
                 "셸 경유 python 은 상속으로만 막을 수 있다 — 쌍이 빠지면 pane/훅이 번들을 오염시킨다"
+            );
+        }
+    }
+
+    /// ★SEAL-1 층3 회귀 핀: 프로세스 env 봉인이 실제로 **상속 가능한 자리**에 심기는가.
+    ///
+    /// 층1·층2 는 "우리가 아는 프로그램"만 덮는다 — 임의 명령 스폰(cysd 채널 브리지·계정
+    /// cmd 어댑터·`cys run -- …`)은 이 층이 유일한 방어다. 이 핀이 검사하는 것은 **자식이
+    /// 실제로 상속하는 것과 같은 원천**(현재 프로세스 env)이다: `Command` 는 명시 `.env()` 가
+    /// 없으면 부모 env 를 그대로 물려주므로, 여기서 값이 보이면 자식도 본다.
+    ///
+    /// env 를 실제로 쓰는 유일한 테스트인데도 안전한 이유: 값이 **멱등**(항상 같은 "1")이고,
+    /// 다른 테스트가 이 키를 읽거나 쓰지 않으며, 방향이 하나뿐이라(켜기) 경합해도 결과가 같다.
+    #[test]
+    fn process_env_seal_is_inheritable_by_arbitrary_children() {
+        seal_python_bytecode_in_process();
+        assert_eq!(
+            std::env::var(ENV_PY_NO_BYTECODE).ok().as_deref(),
+            Some(PY_NO_BYTECODE_ON),
+            "층3 부재 = 임의 명령 스폰(브리지·계정 cmd)이 번들에 .pyc 를 쓴다"
+        );
+        // e2e: 사고 경로와 **같은 형태**(임의 명령을 셸로 스폰, 명시 `.env()` 없음)로 실제
+        // 자식을 띄워 상속을 확증한다. 단언을 프로세스 env 읽기로만 끝내면 "심었다"까지만
+        // 증명하고 "자식이 받는다"는 증명하지 못한다 — 이 층의 존재 이유가 후자다.
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", "printf %s \"$PYTHONDONTWRITEBYTECODE\""])
+                .output()
+                .expect("/bin/sh 스폰 실패");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                PY_NO_BYTECODE_ON,
+                "임의 명령 셸 자식이 봉인을 상속하지 못했다 — 브리지·계정 cmd 가 그대로 샌다"
             );
         }
     }

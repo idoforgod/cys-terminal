@@ -874,6 +874,93 @@ fn bundle_integrity_guidance() -> Option<String> {
     Some(cys::app_bundle::damaged_bundle_guidance(&bundle, &defects))
 }
 
+// ── SEAL-DIAG: 설치 후 코드서명 봉인 자가진단(macOS 전용 · ★advisory 전용) ──────────
+//
+// 위 `bundle_integrity_guidance` 가 **구조 결손**(반쪽 번들 = stat 몇 번)을 보는 데 반해,
+// 이쪽은 **봉인 파손**(codesign)을 본다. 둘은 같은 사고(2026-08-01)의 다른 절반이고,
+// 비용도 성질도 달라서 발화 방식이 다르다:
+//   · 구조 결손 = 즉시(수 ms) → setup 안에서 그대로 판정.
+//   · 봉인 파손 = `codesign --deep`(초 단위) → **별도 스레드**로 내보내 부트 경로에서 완전히 뗀다.
+//
+// ★절대 계약: 어떤 판정에서도 기동을 막거나 지연시키지 않는다. `std::thread::spawn` 은 즉시
+//   반환하고, 이 스레드는 tauri 런타임과 무관하게 돈다 — setup 이 이 검사를 기다리는 지점이
+//   한 곳도 없다(그게 곧 "부트 차단 없음"의 기계적 근거다).
+//
+// ★알림 채널은 기존 `bundle-damaged` 스티키 토스트를 **재사용**한다(새 이벤트를 만들지 않는다):
+//   ⓐ 사용자에게 하는 말이 정확히 같다 — "설치본이 온전하지 않습니다 — 재설치 필요".
+//   ⓑ 새 이벤트는 프론트(ui/src/main.ts + 빌드 산출물 ui/dist)까지 함께 고쳐야 발화하는데,
+//      그 연쇄가 끊기면 **알림이 조용히 사라진다**(이 기능의 유일한 임무가 알리는 것인데).
+//   두 판정이 동시에 참이면 나중 것이 토스트를 덮지만, 둘 다 결론이 "재설치"라 안내는 어긋나지 않는다.
+
+/// 스로틀 마커 경로 — `~/.cys/state/selfdiag-<version>`.
+/// 버전을 파일명에 넣는 이유: 업데이트되면 **새 번들이므로 다시 봐야 한다**(마커 삭제 로직 불요).
+#[cfg(target_os = "macos")]
+fn seal_selfdiag_marker() -> std::path::PathBuf {
+    cys::home_dir()
+        .join(".cys/state")
+        .join(format!("selfdiag-{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// 마커 내용으로 "이번 기동에는 검사를 건너뛰어도 되는가"를 판정한다(순수 함수 = 회귀 핀 대상).
+///
+/// 마커에는 **직전 판정**을 적는다(존재 여부가 아니라). 그래야 요구 두 개를 동시에 만족한다:
+/// ⓐ 평시(무결·판정불가)에는 버전당 한 번만 돌아 매 기동 `codesign --deep` 비용을 물지 않는다.
+/// ⓑ **파손이 확인된 뒤에는 마커를 무시하고 매 기동 다시 보고 다시 알린다** — 고쳐질 때까지
+///    침묵하면 안 되고, 재설치로 고쳐졌는지도 다시 봐야 알 수 있다.
+/// 미지의 문자열은 "모른다 → 다시 본다"로 읽는다(fail-open toward checking).
+#[cfg(target_os = "macos")]
+fn seal_selfdiag_skips(marker: Option<&str>) -> bool {
+    matches!(marker.map(str::trim), Some("intact") | Some("undetermined"))
+}
+
+/// 봉인 자가진단을 **백그라운드 스레드로 내보낸다**(호출 즉시 반환 — 부트 무영향).
+///
+/// 판정별 처리:
+///   · Intact        → 마커 `intact` 기록 · 알림 없음(정상은 말이 없어야 한다).
+///   · Undetermined  → 마커 `undetermined` 기록 · **무음 skip** + stderr 디버그 한 줄.
+///                     (미서명 개발 빌드·codesign 부재·중첩서명 불만 — 파손으로 오보하지 않는다.)
+///   · Broken        → 마커 기록 **안 함**(다음 기동에 다시 본다) · 사용자 알림 발화.
+#[cfg(target_os = "macos")]
+fn spawn_seal_selfdiag(handle: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        // 번들 미탐지(cargo run·비번들 설치) = 검사 대상 없음 → 완전 무음.
+        let Some(bundle) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| cys::app_bundle::enclosing_bundle(&exe))
+        else {
+            return;
+        };
+        let marker = seal_selfdiag_marker();
+        if seal_selfdiag_skips(std::fs::read_to_string(&marker).ok().as_deref()) {
+            return;
+        }
+        let verdict = cys::app_bundle::verify_seal_deep(&bundle);
+        // 마커 쓰기는 best-effort — 실패해도 다음 기동에 한 번 더 도는 것뿐이라 무해하다.
+        let record = |token: &str| {
+            if let Some(dir) = marker.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&marker, token);
+        };
+        match verdict {
+            cys::app_bundle::SealVerdict::Intact => record("intact"),
+            cys::app_bundle::SealVerdict::Undetermined(why) => {
+                eprintln!("[cys-app] 봉인 자가진단 판정 불가(무음 skip) — {why}");
+                record("undetermined");
+            }
+            cys::app_bundle::SealVerdict::Broken {
+                culprits,
+                self_inflicted,
+            } => {
+                let msg =
+                    cys::app_bundle::seal_broken_notice(&bundle, &culprits, self_inflicted);
+                eprintln!("[cys-app] 코드서명 봉인 파손 감지 — 재설치가 필요합니다\n{msg}");
+                let _ = handle.emit("bundle-damaged", msg);
+            }
+        }
+    });
+}
+
 /// 프론트 pull 경로(`boot_verdict` 와 같은 이유 — emit-before-listen 레이스 회피).
 /// 정상 설치본·번들 밖 실행·비 macOS 는 None.
 #[tauri::command]
@@ -3336,6 +3423,10 @@ async fn stop_running_daemon() {
 }
 
 fn main() {
+    // ★SEAL-1 층3: tauri 런타임(=스레드) 생성 전에 프로세스 env 봉인. GUI 는 이 앱의 **뿌리
+    // 프로세스**라 여기서 심으면 cysd·pane·팩 python 까지 전부 상속으로 덮인다(lib.rs SOT).
+    // `inject_runtime_path`(층1·2)는 그대로 둔다 — 그쪽은 명시 계약이라 회귀 핀이 걸린다.
+    cys::seal_python_bytecode_in_process();
     tauri::Builder::default()
         // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
         // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
@@ -3452,6 +3543,12 @@ fn main() {
                         eprintln!("[cys-app] 설치본 무결성 결손 — 재설치가 필요합니다\n{msg}");
                         let _ = handle.emit("bundle-damaged", msg);
                     }
+                    // ★SEAL-DIAG(같은 사고의 다른 절반): 구조는 멀쩡한데 **봉인만** 깨진 사본을
+                    // 스스로 발견해 알린다. 위 검사와 달리 codesign 이 초 단위라 별도 스레드로
+                    // 내보낸다 — 이 호출은 즉시 반환하고 아래 부트 시퀀스는 조금도 기다리지 않는다
+                    // (advisory 전용 · 어떤 판정도 기동을 막지 않는다). 버전당 1회 스로틀,
+                    // 단 파손 확인 시에는 고쳐질 때까지 매 기동 다시 본다(spawn_seal_selfdiag).
+                    spawn_seal_selfdiag(handle.clone());
                 }
                 // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
                 // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
@@ -3544,6 +3641,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★SEAL-DIAG 스로틀 회귀 핀: **파손은 마커로 침묵시킬 수 없다.**
+    /// 스로틀의 목적은 평시 `codesign --deep` 비용 절감이지 고장 은폐가 아니다 —
+    /// 이 구분이 무너지면 첫 기동에 파손을 한 번 알리고 그 뒤로는 영원히 조용해진다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seal_selfdiag_throttle_never_silences_a_broken_seal() {
+        // 평시(무결·판정불가)는 버전당 1회로 접는다.
+        assert!(seal_selfdiag_skips(Some("intact")));
+        assert!(seal_selfdiag_skips(Some("undetermined")));
+        assert!(seal_selfdiag_skips(Some("  intact\n")), "공백·개행 관용");
+
+        // 마커 없음 = 아직 안 봤다 → 본다.
+        assert!(!seal_selfdiag_skips(None));
+        // ★파손 기록은 skip 대상이 아니다(애초에 기록하지 않지만, 손으로 심어도 다시 본다).
+        assert!(!seal_selfdiag_skips(Some("broken")));
+        // 미지의 값 = "모른다" → 건너뛰지 않고 다시 본다(fail-open toward checking).
+        assert!(!seal_selfdiag_skips(Some("")));
+        assert!(!seal_selfdiag_skips(Some("ok")));
+
+        // 마커는 버전에 묶인다 — 업데이트되면 새 번들이므로 자동으로 다시 본다.
+        assert!(seal_selfdiag_marker()
+            .to_string_lossy()
+            .ends_with(&format!("selfdiag-{}", env!("CARGO_PKG_VERSION"))));
+    }
 
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
     /// 비존재 경로는 metadata 게이트에서 거절(스폰 없음). force 경로는 실제 스폰이라 여기서 검사하지 않는다.

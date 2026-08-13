@@ -948,6 +948,10 @@ enum FeedAction {
 }
 
 fn main() {
+    // ★SEAL-1 층3: 스레드 생성 전 프로세스 env 봉인 — 이 CLI 가 띄우는 **모든** 자손
+    // (`cys run -- <임의명령>`·`launch-agent` 로 뜨는 pane·팩 python 헬퍼)이 상속으로 덮인다.
+    // 층1(python_command)·층2(spawn_env_pairs)가 못 닿는 임의 명령 경로의 바닥(lib.rs SOT).
+    cys::seal_python_bytecode_in_process();
     // 파이프(head 등)로 출력이 끊겨도 패닉하지 않도록 SIGPIPE 기본 동작 복원
     #[cfg(unix)]
     unsafe {
@@ -4211,38 +4215,21 @@ fn detect_app_bundle(exe: &std::path::Path) -> Option<std::path::PathBuf> {
 /// 반환 `(added, modified, missing, other)` — other 는 세 갈래에 안 잡힌 진단 문장(요약줄 포함).
 /// ★`--verbose` 필수: 무-verbose 출력은 "a sealed resource is missing or invalid" 요약 한 줄뿐이라
 ///   *어떤 파일 때문인지*를 사용자에게 말할 수 없다(실측 확인).
+/// ★lib 로 승격됨(`cys::app_bundle::parse_seal_failure`) — doctor 와 기동 자가진단(SEAL-DIAG)이
+/// **같은 판정 어휘**를 쓰게 하려는 것이 이 위임의 전부다. 사본을 둘로 두면 한쪽만 고쳐졌을 때
+/// 같은 codesign 출력을 놓고 두 진단이 다른 말을 한다(=규약 산재). 아래 회귀 핀은 그대로 둔다 —
+/// 위임이 끊기면 그 핀이 먼저 깨진다.
 fn parse_codesign_seal_failure(out: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let mut added = Vec::new();
-    let mut modified = Vec::new();
-    let mut missing = Vec::new();
-    let mut other = Vec::new();
-    for line in out.lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
-        }
-        if let Some(p) = l.strip_prefix("file added: ") {
-            added.push(p.trim().to_string());
-        } else if let Some(p) = l.strip_prefix("file modified: ") {
-            modified.push(p.trim().to_string());
-        } else if let Some(p) = l.strip_prefix("file missing: ") {
-            missing.push(p.trim().to_string());
-        } else if l.starts_with("--prepared:") || l.starts_with("--validated:") {
-            // verbose 진행 로그 — 진단이 아니다.
-            continue;
-        } else {
-            other.push(l.to_string());
-        }
-    }
-    (added, modified, missing, other)
+    cys::app_bundle::parse_seal_failure(out)
 }
 
 /// 번들 루트 접두를 떼어 사람이 읽을 수 있게 줄인다(로그 폭·개인 경로 노출 축소).
+/// ★lib 로 승격됨(`cys::app_bundle::seal_relative`) — 여기 있던 사본은 codesign 이 **realpath 로**
+/// 보고한다는 사실을 몰라서, 심링크를 거친 설치 경로에서는 접두를 못 떼고 전체 절대경로를 그대로
+/// 노출했다(SEAL-DIAG e2e 핀이 실 codesign 출력으로 잡은 결함). 판정 어휘와 마찬가지로 표시 규약도
+/// 하나만 둔다 — doctor 와 기동 자가진단이 같은 문면을 쓴다.
 fn seal_rel(bundle: &std::path::Path, p: &str) -> String {
-    let b = bundle.to_string_lossy();
-    p.strip_prefix(b.as_ref())
-        .map(|r| r.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| p.to_string())
+    cys::app_bundle::seal_relative(bundle, p)
 }
 
 /// 봉인 파손 시 사용자에게 주는 **유일하게 통하는 복구 절차**.
