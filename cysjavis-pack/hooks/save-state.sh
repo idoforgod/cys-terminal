@@ -76,4 +76,15 @@ if [ -f "$LOG" ]; then
     echo "$NOW	rotate	.state_log>${LOG_MAX} → archive (kept ${LOG_KEEP})" >> "$LOG" 2>/dev/null
   fi
 fi
+
+# ---------- (C) BOOT_SNAPSHOT 생성 (관측 전용 · 마스터 pane 한정 · 실패 무해 · W-수리1 배선) ----------
+# 도구 부재 시 -f 가드로 조용히 생략 · 비마스터 skip 판정은 도구 내부 게이트(javis_snapshot.py) 소관.
+# 어떤 실패(타임아웃 124·미설치 127 포함)도 exit 0 보존 — 기존 write-ahead 동작 불변.
+# Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환(inject-context CHK·GATE 동일 규약).
+PACK_BIN="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin"
+SNAP_PY="$PACK_BIN/javis_snapshot.py"
+command -v cygpath >/dev/null 2>&1 && SNAP_PY="$(cygpath -w "$SNAP_PY" 2>/dev/null || printf '%s' "$SNAP_PY")"
+if [ -n "$RD" ] && [ -f "$SNAP_PY" ]; then
+  cys_timeout_run 10 "$CYS_PY" "$SNAP_PY" generate --round-dir "$RD" >/dev/null 2>&1 || true
+fi
 exit 0

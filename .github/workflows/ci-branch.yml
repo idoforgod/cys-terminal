@@ -462,7 +462,7 @@ jobs:
         run: |
           set -euo pipefail
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
-                   test_import_guard test_bootstrap_chain; do
+                   test_import_guard test_bootstrap_chain test_snapshot; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="

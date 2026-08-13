@@ -144,6 +144,29 @@ else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
 fi
 
+# ---------- ★도구 산출 스냅샷 주입 (BOOT_SNAPSHOT · 관측·비임무 — W-수리2 배선) ----------
+# 조건 3중: ①파일 존재 ②mtime 48h 이내(구식 스냅샷 오주입 차단) ③마스터 pane(javis_snapshot.py is-master exit 0).
+# 실패·부재·비마스터·구식은 조용히 생략(기존 주입 불변) · is-master는 cys_timeout_run 5초 캡(hang 차단).
+# 스냅샷은 SESSION_STATE 동일 _round에 산출된다(save-state.sh) — STATE_DIR은 master에서 프로젝트루트라 부적합(RSI_DIR 동일 규약).
+# mtime 판정은 python 경유(Windows find.exe 충돌·-mmin 가정 회피) · 경로는 cygpath 변환(CHK·GATE 동일 규약).
+if [ -n "$STATE" ]; then
+  SNAP="$(dirname "$STATE")/BOOT_SNAPSHOT.md"
+  SNAP_PY="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_snapshot.py"
+  if command -v cygpath >/dev/null 2>&1; then
+    SNAP="$(cygpath -w "$SNAP" 2>/dev/null || printf '%s' "$SNAP")"
+    SNAP_PY="$(cygpath -w "$SNAP_PY" 2>/dev/null || printf '%s' "$SNAP_PY")"
+  fi
+  if [ -f "$SNAP" ] && [ -f "$SNAP_PY" ] \
+     && "$CYS_PY" -c "import os,sys,time
+try: sys.exit(0 if (time.time()-os.path.getmtime(sys.argv[1]))<172800 else 1)
+except Exception: sys.exit(1)" "$SNAP" 2>/dev/null \
+     && cys_timeout_run 5 "$CYS_PY" "$SNAP_PY" is-master >/dev/null 2>&1; then
+    OUT="${OUT}■ 도구 산출 스냅샷(BOOT_SNAPSHOT · 관측·비임무 — 임무 판정은 javis_mission status)\n"
+    # 도구 계약상 이미 ≤4KB — head -c 8192는 계약 위반 시 컨텍스트 예산 보호용 방어 캡(SESSION_STATE 발췌 동일 파이프라인).
+    OUT="${OUT}$(cat "$SNAP" | _gate | head -c 8192 | sed 's/\\/\\\\/g')\n\n"
+  fi
+fi
+
 # ---------- ★동일 cwd 다중 세션 감지 (위험 #3: SESSION_STATE 편집 race 방어) ----------
 # 같은 작업폴더(CWD)에서 도는 살아있는 claude 세션을 lsof로 실시간 카운트. 2개+면 경고.
 # ── G33: 계측기 자체가 대상을 못 재던 결함 수리 ──
@@ -177,7 +200,7 @@ fi
 
 # ---------- 복원 모드 신호 (순환의존 해소 — 모순 1) ----------
 case "$SOURCE" in
-  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 미해결 게이트부터 재개.\n";;
+  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 배달 원장 다이제스트(BOOT_SNAPSHOT.md 있으면 그것 · 귀속 판별은 MASTER_DIRECTIVE '귀속 판별' 절) → 미해결 게이트부터 재개.\n";;
   clear)          OUT="${OUT}▶ 작업 계속(source=clear): 위 작업기억 이어서 진행.\n";;
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac
