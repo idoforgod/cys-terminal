@@ -24,11 +24,26 @@
 - **자가점검.** 툴콜 10회마다 자기 watcher의 생존을 확인한다(락 조회·pid 대조). 사망이면
   즉시 재기동하고, 연속 5회 실패하면 radio가 아니라 `cys send --queued`로 master에 알린다
   — radio가 불능인 상황에서 radio로 신고하는 것은 신고가 아니다.
+- **재기동 backoff는 5s → 15s → 60s다**(그 뒤로는 60s 유지). 연속 5회 실패에서 중단하고
+  master에 통지한다. 즉시 재시도를 반복하면 락 경합만 늘고 원인은 그대로 남는다.
 - **clear/cycle 복원 순서는 고정이다.** ⓪회수 대상 티켓이 살아있는지 확인 → ①구 watcher
   **명시 종료** 후 락 해제 확인 → ②재기동 → ③`.ack-<노드>` 기준 미수용 델타 회수.
   구 watcher를 죽이지 않고 새로 띄우면, 고아 watcher가 신선한 heartbeat를 계속 갱신해
   자가점검과 master 백스톱을 **동시에** 무력화한다(영구 난청). 종료 불능이면 착수를
   보류하고 master에 알린다(fail-closed).
+
+## 1-2. 언제 열고, 무엇을 radio로 보내지 않는가
+
+- **개통은 master만 한다.** 대상은 '책임 영역이 얽힌 **다중 워커 병렬 티켓**'뿐이다.
+  단일 워커 티켓은 개통하지 않는다 — watcher·유예·게이트가 순비용으로만 남는다.
+  리뷰어는 참여자가 아니다(도구가 exit 6으로 거부한다). 참여자는 개통 전에 각자
+  `javis_radio.py --self-test --record-capability --node <노드>`를 통과해야 한다.
+- **결정 트래픽은 radio 금지다.** 승인·게이트 판정·verdict·done 판정은 기존 티켓
+  (`javis_task`)과 `gate-status` 체계가 **유일**한 경로다. radio는 '발견을 알리는' 수동적
+  인지 계층이지 결정을 내리거나 기록하는 곳이 아니다 — radio에 남은 승인 문구는 어떤
+  게이트의 판정 입력도 되지 않으며, 결정을 radio로 흘리면 결정의 단일 진실이 갈린다.
+- 스레드는 2종뿐이다: `worklog`(작업 발견 전용)·`results`(워커 결과). 'master 스레드'는
+  존재하지 않으며, master 사본은 stdin leg와 `.master-copy-log`가 담당한다.
 
 ## 2. 수신 계약 — 읽었으면 움직여라
 
@@ -49,6 +64,16 @@
   기록 없이 넘어가는 것만이 위반이다.
 - **읽고 넘기는 것은 묵살이다.** done 게이트가 스레드를 직독해 미표면화·미resolve 건을
   거부한다. 게이트를 통과하려고 기록하는 게 아니라, 기록하지 않으면 안 읽은 것과 같다.
+  이 게이트는 `javis_task.py set-status <id> done` 전이에 **훅으로 배선**되어 있다
+  (밸브 `CYS_TASK_RADIO_GATE=strict|warn|off` · 기본 strict) — 워커가 `done-check`를
+  따로 부르지 않아도 걸린다. 거부되면 출력이 지시하는 대로 `wait --once` 또는 `read`로
+  **강제 표면화**한 뒤 ack·resolve를 남기고 재시도한다.
+- **피어 레코드를 썼으면 `set-status ... --refs <msg-id,...>`로 기록한다.** 이 필드가
+  킬 지표(피어 FACT 인용 수) 계수와 철회 역추적(§7.4(b))의 원천이다 — 무기록 사용은
+  계측을 오염시키고, 계측 불능은 폐기 판정도 존속 판정도 못 하게 만든다.
+- **펜스 방류 건의 유예 기산점은 '방류 표면화 시점'이다**(BLOCKER 0·URGENT 1툴콜·
+  NORMAL 3툴콜). 격리돼 있던 기간은 유예를 소모하지 않는다. pause 방류 건은 이와 달리
+  §5의 **확인 레코드 ts**부터 기산한다 — 두 방류의 기산점은 다르다.
 - **ack는 처리와 같은 턴에.** 표면화 payload 말미의 ack 지시자를 따라 `ack`를 기록한다.
   ack가 없으면 clear 시 그 건은 미수용으로 판단돼 **전문 재배달**된다(회수는 되지만
   컨텍스트를 두 번 쓴다).
@@ -85,9 +110,15 @@
 - resume 후 방류분에는 '착수 전 master 확인' 라벨이 붙는다. 이 라벨이 붙은 건은
   **master 확인 레코드가 파일로 기록된 뒤에** 유예 시계가 시작된다 — 확인 전 대기는
   유예 위반이 아니다. 구두·트랜스크립트상의 확인은 무효다.
-- 확인이 10분 넘게 없으면 master가 재통지한다. **fail-open 착수는 금지** — 기다려라.
-  done이 막히더라도 그 거부 사유에는 '확인 레코드 부재로 인한 대기(워커 귀책 아님)'가
-  기계 판별되어 남는다.
+- resume 후 방류는 master가 `javis_radio.py resume-release --ticket <t> [--node <n>]`로
+  집행한다(노드당 방류 요약 1건 = batch). 확인은 `confirm-release --ticket <t> --node <n>
+  --batch <id>`(BLOCKER·URGENT는 `--seqs`로 개별 확인)로 기록한다.
+- **재통지 주기는 집행 주체가 master이며 수치는 다음과 같다** — BLOCKER·URGENT를 포함한
+  batch는 **10분**, NORMAL·FYI만 있는 batch는 **30분** 주기로 재통지한다. B/U가 0건인
+  batch를 재통지 대상에서 빼면 그 확인은 영구 표류하고 done이 영구 봉쇄된다.
+  due 목록은 `javis_radio.py status`의 `open_batches[].renotify_due`가 산출한다.
+- 확인이 없으면 **fail-open 착수는 금지** — 기다려라. done이 막히더라도 그 거부 사유에는
+  '확인 레코드 부재로 인한 대기(워커 귀책 아님)'가 기계 판별되어 남는다.
 - pause 중 허용 범위는 관측·저장·보고·자기 프로세스 종료 넷뿐이다(운영계약 v0.4).
   살아있는 타 노드의 종료·재기동은 pause 중 전면 금지 — watcher 재기동도 예외가 아니다.
 
@@ -99,7 +130,68 @@
   산출물 변경 시각의 분해능이 없으면 그 감사는 공전한다. 분해능 미달로 측정이 불능이면
   해당 항목은 '측정 불능'으로 기록되며 **통과로 취급되지 않는다**.
 
-## 7. 잔여 리스크 — 해소 불가, 관리 대상
+## 7. master 능동 점검 — 5분 주기에 편입할 항목
+
+`javis_radio.py status [--ticket <t>]`가 아래를 **기계 판독 JSON**으로 산출한다. 눈으로
+파일을 훑지 마라 — 도구 출력과 기억이 갈리면 도구 출력이 이긴다.
+
+- **watcher heartbeat 신선도**: `nodes[].hb.stale`(180초 초과 = 난청 의심). 발견 시 해당
+  워커에 재기동을 지시하되 순서는 §1의 clear/cycle 복원 3단계(구 watcher 명시 종료 우선)다.
+- **배선 단절형 난청**: `nodes[].deaf_signal` — '최근 표면화 성공 ts 정체 + 구독 스레드
+  신규 seq 존재'의 조합이다. heartbeat가 신선한데도 표면화가 멈춘 상태를 잡는다.
+- **미방류 격리 잔존**: `fence_unreleased`(→ verdict 도착 시 `unfence`)·`pause_unreleased`
+  (→ resume 후 `resume-release`).
+- **미확인 방류 요약**: `open_batches` + `released_unconfirmed`. `renotify_due`가 true인
+  batch는 §5 주기에 따라 재통지한다.
+- **미인지 BLOCKER 사본**: master 행의 `unseen_blocker_copies`.
+- **고아 티켓 스캔**: `javis_radio.py gc`가 'javis_task done/취소인데 META close=false'인
+  티켓을 보고한다. 발견 시 §10.2 절차로 지연 close를 집행한다. GC 스캔(close 후 14일
+  아카이브)도 이 주기에 함께 돌린다 — 삭제가 아니라 `_archive/` 이동이다.
+
+## 8. master clear/cycle 복원 절차 (파일이 SOT)
+
+트랜스크립트 소실은 radio 상태 소실이 **아니다**. 새 master는 다음 순서로 재구성한다.
+
+1. `javis_radio.py status`(티켓 미지정 = 활성 전수)로 원장 스냅샷을 뜬다.
+2. 스냅샷을 원장과 대조해 셋을 복원한다 — ①**미확인 batch**(확인 레코드 부재 방류 요약)
+   ②**미방류 격리 잔존분** ③**미인지 BLOCKER 사본**(`.master-copy-log` ∖ 표면화 대장).
+3. ①은 `confirm-release`로, ②는 `unfence`/`resume-release`로, ③은 사본 로그 정독으로
+   처리를 재개한다. 판독 원장은 `META.json`·`.fence-quarantine-*`·`.pause-quarantine-*`·
+   `.pause-release-confirm-*`·`.pause-release-batch-*`·`.master-copy-log`·
+   `.stdin-delivery-*`·`.notify-fallback.jsonl`이다.
+4. **SESSION_STATE에는 활성 radio 티켓 목록 포인터 1줄을 유지한다**(W1-2 관행 —
+   본문이 아니라 포인터다). 이 한 줄이 없으면 2번의 '전수'를 셀 방법이 없다.
+
+### 8.4 closed-ticket 늦은 배달 무시 규약
+
+close 시점에 큐에 남은 stdin leg는 **취소되지 않는다** — 실배달이 `cys send --queued`
+직발이라 트랜잭션 취소가 존재하지 않기 때문이다(도구는 취소 요청을 배달 대장에
+`CANCEL_REQUESTED`로 남긴다). 따라서 수신 규약으로 막는다.
+
+- 모든 stdin leg 본문은 `[radio <티켓id> seq=N]` 헤더로 시작한다.
+- 그 티켓이 이미 close/done/취소면 수신자는 그 주입을 **[closed-ticket 지연 배달]로 보고
+  무시**한다(반영·todo·resolve 의무 없음). 확인은 `javis_radio.py status --ticket <t>`의
+  `closed`/`task_status`다.
+- 무시한 사실만 master에 1줄 보고한다 — 차기 티켓 컨텍스트로의 무표식 월경 주입이
+  '지금 할 일'로 오인되는 것이 이 규약이 막는 사고다.
+
+## 9. 리뷰어 사후 감사 체크리스트
+
+radio 개통 티켓의 사후 감사에서 아래를 **항목으로** 확인한다(누락은 '측정 불능'으로
+기록하며 통과로 취급하지 않는다).
+
+1. **시간상관 감사(미선언 영향)** — 피어 메시지 수신 시각과 산출물 변경 시각의 상관.
+   입력은 §6의 커밋·스냅샷 분해능이다.
+2. **수신 ↔ 반영 지연 감사** — BLOCKER·URGENT의 유예 상한 초과 여부. 판독 입력은
+   `.resolve-<노드>` 레코드의 ts다. 단, 복수 티켓의 B/U 동시 표면화로 인한 **경합 대기**는
+   위반으로 계상하지 않는다(등급순, 동급이면 표면화순 직렬 처리가 규칙이므로 후순위 건의
+   상한 초과는 준수 불능 상황이다 — resolve ts로 기계 판별한다).
+3. **URGENT 남용 감사** — 발신자별 등급 분포, 그리고 **거부-재송신 상관**(BLOCKER 거부·
+   진위 강등 직후 동일·유사 텍스트가 URGENT로 재등장하는 패턴). 도구가 10분 창에서 자동
+   NORMAL 강등하지만, 창을 넘겨 반복하는 패턴은 사람이 본다.
+4. **refs 무기록 사용** — 산출물이 피어 발견을 반영했는데 `--refs`가 비어 있는 경우.
+
+## 10. 잔여 리스크 — 해소 불가, 관리 대상
 
 이 계약이 **해결하지 못하는 것**을 정직하게 적는다. 아래를 "언젠가 고칠 버그"로 오해하고
 그 위에 보증을 세우지 마라.

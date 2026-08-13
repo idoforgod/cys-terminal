@@ -94,6 +94,15 @@ exit 4 로 영구 차단됐다(안전밸브 부재). 밸브 2종을 신설:
   strict 라도 warn 강등. "자동 자가치유 없음 + done 영구 차단" 이중 잠금 해제.
 두 경로 모두 stderr 1줄 고지 + `_round/evidence/guard_bypass_audit.jsonl` append-only 원장
 + task.evidence.guard_gate_bypass 병기(우회는 숨기지 않는다).
+
+W0-3 radio 편승(RADIO_SPEC_v4 AA38 §5.2(e)): 티켓에 radio 가 개통돼 있으면(=
+`_round/radio/<id>/META.json` 실존) done 전이가 `javis_radio.py done-check` 를 **호출**해
+피어 BLOCKER·URGENT 의 미표면화·미resolve 잔존을 검사한다 — 게이트를 워커의 자발적 호출에
+맡기면 "안 부르면 안 걸리는" 게이트가 되어 묵살 금지의 기계 집행이 성립하지 않는다.
+밸브는 evidence 게이트 3종과 동일 문법 `CYS_TASK_RADIO_GATE=strict|warn|off`(기본 strict ·
+미지 값은 strict). 판정 노드는 `--radio-node` > task.owner 순으로 정한다(둘 다 없으면
+strict 에서 거부 — 측정 불능은 통과가 아니다). `--refs` 는 피어 radio 레코드 인용 기록
+(AA33(b)① 킬 지표 계측 · §7.4(b) 철회 역추적의 입력)으로 task.refs 에 영속한다.
 """
 import argparse
 import contextlib
@@ -1374,6 +1383,73 @@ def _append_audit(task_id, audit_kind):
         print("task: WARN audit receipt append failed: %s" % e, file=sys.stderr)
 
 
+def _radio_gate_mode():
+    """`CYS_TASK_RADIO_GATE=strict|warn|off` — evidence 게이트 env 3종과 동일 문법·문체.
+    미지 값은 strict(오타로 게이트가 열리지 않는다)."""
+    raw = (os.environ.get("CYS_TASK_RADIO_GATE") or "").strip().lower()
+    return raw if raw in ("strict", "warn", "off") else "strict"
+
+
+def _radio_meta_path(task_id):
+    root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+    return os.path.join(root, "_round", "radio", task_id, "META.json")
+
+
+def _radio_done_gate(task_id, task, radio_node, refs):
+    """AA38 §5.2(e) 편승 — radio 개통 티켓의 done 전이에서 `javis_radio.py done-check` 를
+    호출한다. 반환: None=통과(또는 비대상) · 정수=거부 exit code.
+
+    ★왜 훅인가: 게이트가 수동 단독 명령으로만 존재하면 '워커가 부르지 않으면 걸리지 않는'
+      게이트다 — 묵살 금지의 기계 집행이 성립하지 않는다. radio 미개통 티켓에는 아무
+      부작용도 없다(META 부재 = 비대상)."""
+    mode = _radio_gate_mode()
+    if mode == "off":
+        return None
+    meta_path = _radio_meta_path(task_id)
+    if not os.path.isfile(meta_path):
+        return None                     # radio 미개통 — 비대상(회귀 0)
+    node = (radio_node or task.get("owner") or "").strip()
+    if not node:
+        msg = ("radio done-check: 판정 노드 미상(--radio-node 또는 task.owner 필요) — "
+               "측정 불능은 통과가 아니다")
+        if mode == "strict":
+            print(msg + " (밸브: CYS_TASK_RADIO_GATE=warn|off)", file=sys.stderr)
+            return EXIT_NO_EVIDENCE
+        print("radio warn: " + msg, file=sys.stderr)
+        return None
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_radio.py")
+    if not os.path.isfile(script):
+        msg = "radio done-check: javis_radio.py 부재 — 게이트 실행 불능"
+        if mode == "strict":
+            print(msg + " (밸브: CYS_TASK_RADIO_GATE=warn|off)", file=sys.stderr)
+            return EXIT_NO_EVIDENCE
+        print("radio warn: " + msg, file=sys.stderr)
+        return None
+    import subprocess  # E1 self-test 관례(지역 import) — 모듈 상단 결합 회피
+    argv = [sys.executable, script, "done-check", "--ticket", task_id, "--node", node]
+    if refs:
+        argv += ["--refs", refs]
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=120)
+    except Exception as e:
+        msg = "radio done-check 실행 불가: %s" % e
+        if mode == "strict":
+            print(msg + " (밸브: CYS_TASK_RADIO_GATE=warn|off)", file=sys.stderr)
+            return EXIT_NO_EVIDENCE
+        print("radio warn: " + msg, file=sys.stderr)
+        return None
+    out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace").strip()
+    if r.returncode == 0:
+        return None
+    if mode == "strict":
+        print("radio done-check BLOCK(%d): %s" % (r.returncode, out[-1200:]), file=sys.stderr)
+        print("  강제 표면화(`javis_radio.py wait --once` 또는 `read`) 후 ack·resolve 를 "
+              "기록하고 재시도하라. 밸브: CYS_TASK_RADIO_GATE=warn|off", file=sys.stderr)
+        return EXIT_NO_EVIDENCE
+    print("radio warn: done-check 비0(%d) — %s" % (r.returncode, out[-600:]), file=sys.stderr)
+    return None
+
+
 def cmd_set_status(a):
     task = _read_task(a.id)
     if not task:
@@ -1489,6 +1565,12 @@ def cmd_set_status(a):
                     print("probe receipt mismatch(5): " + pwhy, file=sys.stderr)
                     return EXIT_NO_EVIDENCE
                 print("probe receipt warn: " + pwhy, file=sys.stderr)
+        # ── radio done 게이트 편승(AA38 §5.2(e)) — evidence 게이트 **뒤**·settle sleep 앞.
+        #    radio 미개통 티켓에는 아무 일도 하지 않는다(회귀 0).
+        rc_radio = _radio_done_gate(a.id, task, getattr(a, "radio_node", None),
+                                    getattr(a, "refs", None))
+        if rc_radio is not None:
+            return rc_radio
         # skip 감사(R3): skip-reason이 done 통과의 부담 근거(유효 artifact 부재)이면 예약 — art_mode와
         #   무관하다(★어태커 결함1: off 밸브에서도 --skip-reason은 텍스트 게이트 통과 근거로 쓰이므로
         #   기록해야 원장이 완전하다). 실제 기록은 전이·settle 게이트를 통과해 done이 확정된 뒤
@@ -1526,6 +1608,15 @@ def cmd_set_status(a):
         if guard_bypass_rec is not None:  # E1-1(R-08): 안전밸브 사용 원장 — skip 감사와 동일 규약
             _append_jsonl(_guard_bypass_audit_path(),
                           dict(guard_bypass_rec, ts=_now(), task=a.id))
+        # AA33(b)① 인용 기록 의무의 저장 표면 — 킬 지표 계수(②)와 §7.4(b) 철회 역추적이
+        #   읽는 원천이다(radio 측 _retract_backtrace 가 task.refs 를 스캔한다).
+        _refs = [x.strip() for x in (getattr(a, "refs", None) or "").split(",") if x.strip()]
+        if _refs:
+            merged = list(task.get("refs") or [])
+            for x in _refs:
+                if x not in merged:
+                    merged.append(x)
+            task["refs"] = merged
         if ev_text or skip_text:
             task["evidence"] = {"type": "evidence" if ev_text else "skip",
                                 "text": ev_text or skip_text, "at": _now()}
@@ -2794,6 +2885,13 @@ def main(argv=None):
                         "task.evidence.artifacts 기록. done 전이 필수(strict) 또는 --skip-reason")
     c.add_argument("--skip-reason", dest="skip_reason", default=None,
                    help="W0-3·E1: 검증 불가 사유 — evidence/artifact 대체(사용 시 skip_audit.jsonl 감사 기록)")
+    c.add_argument("--refs", default=None,
+                   help="AA33(b)①: 산출물이 사용한 피어 radio 레코드 msg-id(쉼표 구분) — "
+                        "task.refs 에 영속. 킬 지표 계수와 철회 역추적(§7.4(b))의 입력이며 "
+                        "radio done 게이트의 인용 검사에도 그대로 전달된다")
+    c.add_argument("--radio-node", dest="radio_node", default=None,
+                   help="radio done 게이트의 판정 노드(미지정 시 task.owner) — "
+                        "밸브 CYS_TASK_RADIO_GATE=strict|warn|off(기본 strict)")
     c.set_defaults(fn=cmd_set_status)
 
     c = sub.add_parser("set-verify-spec",

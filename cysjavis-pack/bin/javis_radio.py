@@ -84,19 +84,21 @@ EXIT_CONFLICT = 9        # javis_task checkout 충돌 코드와 정렬
 
 GRADES = ("BLOCKER", "URGENT", "NORMAL", "FYI")
 GRADE_RANK = {g: i for i, g in enumerate(GRADES)}      # 작을수록 우선(§4.3 등급 우선 절단)
-EPISTEMIC = ("FACT", "HYPOTHESIS")
+EPISTEMIC = ("FACT", "HYPOTHESIS", "QUESTION")         # §3.1 기본 열거값 전수
 # §3.9 관리 레코드 — grade:=FYI 고정·도구 자동 부여·wake/델타 제외
 MGMT_TYPES = ("ROTATED", "ROTATED_FROZEN", "GAP", "CLOSE")
 MSG_TYPE = "MSG"
 RETRACT_TYPE = "RETRACT"
 
-# §2.5 스레드 2종 전수 — 'master 스레드' 는 존재하지 않는다(A10(c)).
-THREADS = ("main", "review")
-DEFAULT_THREAD = "main"
+# §2.5 스레드 2종 전수 — worklog(작업 발견 전용)·results(워커 결과).
+#   'master 스레드' 는 존재하지 않는다(A10(c)) · 2종 수량 불변식도 불변이다.
+THREADS = ("worklog", "results")
+DEFAULT_THREAD = "worklog"
 
 ROTATE_BYTES = 5 * 1024 * 1024      # §2.3(b)
 SURFACE_CAP_BYTES = 16 * 1024       # §4.3 — 단일 표면화 폭 제한(총 토큰 절약 아님·A15)
 READ_LIMIT_DEFAULT = 40             # §4.10
+READ_LIMIT_MAX = 200                # §4.10 — 구제 경로가 캡 목적을 무효화하지 않게 하는 상한
 COMPACT_TEXT_CHARS = 140            # §4.9 하한
 POLL_INTERVAL = 5.0                 # §4.2② — 크로스플랫폼 폴링 고정
 HEARTBEAT_SEC = 60.0                # §4.5
@@ -108,6 +110,11 @@ BREAKER_MAX = 12                    # §3.5 — 발신자 **전역** 스코프(A
 DEMOTE_DETECT_SEC = 600.0           # §3.10(b) 강등 탐지 창
 GC_RETAIN_DAYS = 14                 # §10.5
 HB_STALE_SEC = 180.0                # §4.5 신선도 상한
+FYI_DIGEST_SEC = 1800.0             # §5.2(d) — FYI 단독 보류 상한(30분 뒤 digest 1회)
+CONFIRM_RENOTIFY_BU_SEC = 600.0     # A25(c) — B/U 포함 batch 재통지 주기(10분)
+CONFIRM_RENOTIFY_NF_SEC = 1800.0    # A31(e) — N/F-only batch 저빈도 재통지 주기(30분)
+PAUSE_RELEASE_LABEL = "pause 중 도착 — 착수 전 master 확인"   # §9.2 라벨
+RECOVERY_LABEL = "cycle 복원 재배달"                          # AA22 §10.3③ 라벨
 
 SENTINEL_CLOSED = "WATCHER CLOSED — 재기동 금지"   # A36(b)①
 SENTINEL_EXITED = "WATCHER EXITED — 즉시 재기동"   # A36(b)②
@@ -516,6 +523,36 @@ def is_unknown(rec):
 
 
 # ── 임계구역 append (§2.3(a) · §2.6 · A37 TOCTOU) ────────────────────────────
+def _append_in_lock(ticket, thread, rec, allow_closed=False):
+    """★임계구역 **안**에서만 호출한다(`.seq-lock-<스레드>` 보유 전제).
+
+    ★AA20 §2.3(a) 치명 수리: seq 는 로테이션 **뒤에** 확정한다. 종전 구현은 로테이션
+      전에 `final_seq+1` 로 seq 를 잡아두고 tombstone 에도 같은 값을 줘, 로테이션이
+      일어난 순간 tombstone 과 신규 메시지가 **동일 seq** 를 갖고 read_thread 의 seq
+      dedup 이 파일 순서상 앞선 tombstone 만 남겨 메시지를 **영구 은닉**했다.
+      이제 로테이션이 소비한 seq 수(`consumed`)를 돌려받아 그 다음 번호를 쓴다 —
+      tombstone 도 임계구역 안에서 정식으로 seq 를 소비하는 레코드다.
+    """
+    meta = read_meta(ticket)
+    if meta.get("closed") and not allow_closed:
+        return None, EXIT_CLOSED
+    recs, _ = read_thread(ticket, thread, meta)
+    base = final_seq(recs)
+    path = thread_path(ticket, thread, meta)
+    consumed = _rotate_if_needed(ticket, thread, path, recs, meta)
+    path = thread_path(ticket, thread, read_meta(ticket))
+    _heal_trailing_newline(path)
+    seq = base + consumed + 1
+    rec = dict(rec)
+    rec["seq"] = seq
+    rec.setdefault("schema_version", SCHEMA_VERSION)
+    rec.setdefault("ts", _now())
+    rec["thread"] = thread          # §3.1 필드 — msg_id 파싱 없이 소속 스레드가 읽히게
+    rec["msg_id"] = "%s:%s:%d" % (ticket, thread, seq)
+    _jsonl_append(path, rec)
+    return rec, EXIT_OK
+
+
 def append_record(ticket, thread, rec, allow_closed=False, owner="radio"):
     """seq 할당 → 말미 무결성 → 로테이션 → append 를 **단일 임계구역**에서 수행한다.
     반환 (레코드, exit코드). exit 7 = close 후 거부 · 9 = 락 충돌."""
@@ -527,25 +564,41 @@ def append_record(ticket, thread, rec, allow_closed=False, owner="radio"):
         with lk:
             # ★A37 TOCTOU 봉쇄: close 검사를 임계구역 **안**에서 한다. 밖에서 하면
             #   CLOSE 이후 seq 에 append 가 exit 0 으로 성공하는 유령 레코드가 생긴다.
-            meta = read_meta(ticket)
-            if meta.get("closed") and not allow_closed:
-                return None, EXIT_CLOSED
-            recs, _ = read_thread(ticket, thread, meta)
-            seq = final_seq(recs) + 1
-            path = thread_path(ticket, thread, meta)
-            _rotate_if_needed(ticket, thread, path, recs, meta)
-            path = thread_path(ticket, thread, read_meta(ticket))
-            _heal_trailing_newline(path)
-            rec = dict(rec)
-            rec["seq"] = seq
-            rec.setdefault("schema_version", SCHEMA_VERSION)
-            rec.setdefault("ts", _now())
-            rec["msg_id"] = "%s:%s:%d" % (ticket, thread, seq)
-            _jsonl_append(path, rec)
-            return rec, EXIT_OK
+            return _append_in_lock(ticket, thread, rec, allow_closed=allow_closed)
     except javis_lock.LockError as e:
         sys.stderr.write("seq 락 획득 실패(%s) — 재시도하지 말고 상위에 보고하라\n" % e.status)
         return None, EXIT_CONFLICT
+
+
+def close_commit(ticket, rec):
+    """AA37 TOCTOU 봉쇄(close 측): CLOSE append 와 META closed=true 갱신을 **동일**
+    `.seq-lock` 임계구역에서 수행한다. 둘이 갈리면 그 창에서 send 가 closed=false 를
+    읽고 CLOSE 이후 seq 에 exit 0 append 하는 유령 레코드가 생긴다.
+
+    락 획득 순서는 THREADS 순서로 고정한다 — 다른 경로(send·retract)는 스레드 락을
+    하나만 잡으므로 순환 대기가 성립하지 않는다."""
+    os.makedirs(ticket_dir(ticket), exist_ok=True)
+    locks = []
+    try:
+        for th in THREADS:
+            lk = javis_lock.FileLock(_tp(ticket, ".seq-lock-%s" % th),
+                                     owner="radio-close", blocking=True, timeout=15.0)
+            if lk.acquire() != javis_lock.ACQUIRED:
+                return EXIT_CONFLICT
+            locks.append(lk)
+        for th in THREADS:
+            _r, code = _append_in_lock(ticket, th, dict(rec))
+            if code != EXIT_OK:
+                return code
+        meta_update(ticket, lambda m: (m.__setitem__("closed", True),
+                                       m.__setitem__("closed_at", _now())))
+        return EXIT_OK
+    except javis_lock.LockError as e:
+        sys.stderr.write("close 락 획득 실패(%s)\n" % e.status)
+        return EXIT_CONFLICT
+    finally:
+        for lk in reversed(locks):
+            lk.release()
 
 
 def _heal_trailing_newline(path):
@@ -568,12 +621,16 @@ def _heal_trailing_newline(path):
 
 def _rotate_if_needed(ticket, thread, path, recs, meta):
     """§2.3(b)(c) — 5MB 도달 시 rename + tombstone. rename 불가(Windows 공유 위반)면
-    구파일에 ROTATED_FROZEN 을 찍고 신규 세그먼트를 즉시 개시한다."""
+    구파일에 ROTATED_FROZEN 을 찍고 신규 세그먼트를 즉시 개시한다.
+
+    반환 = **이 로테이션이 소비한 seq 수**(0=미발생 · 1=tombstone · 2=동결마커+tombstone).
+    호출자는 이 값만큼 건너뛴 다음 번호를 신규 레코드에 준다 — 동일 seq 충돌로 인한
+    메시지 영구 은닉(AA20 §2.3(a) 치명 결함)의 봉쇄 지점이다."""
     try:
         if not os.path.exists(path) or os.path.getsize(path) < ROTATE_BYTES:
-            return
+            return 0
     except OSError:
-        return
+        return 0
     fseq = final_seq(recs)
     seg_recs, _ = _jsonl_read(path)
     try:
@@ -601,10 +658,11 @@ def _rotate_if_needed(ticket, thread, path, recs, meta):
         tomb["frozen_fallback"] = True
         tomb["msg_id"] = "%s:%s:%d" % (ticket, thread, fseq + 2)
         _jsonl_append(_tp(ticket, newname), tomb)
-        return
+        return 2
     tomb["seq"] = fseq + 1
     tomb["msg_id"] = "%s:%s:%d" % (ticket, thread, fseq + 1)
     _jsonl_append(path, tomb)
+    return 1
 
 
 def verify_rotation(ticket, thread):
@@ -613,8 +671,27 @@ def verify_rotation(ticket, thread):
     problems = []
     meta = read_meta(ticket)
     recs, _ = read_thread(ticket, thread, meta)
+    # §2.3(c) 동결 폴백 — 동결 마커 **이후** 구파일에 레코드가 나타나면 URGENT 사유다.
+    frozen = {r.get("seq"): r for r in recs if r.get("type") == "ROTATED_FROZEN"}
+    for fseq_marker in sorted(x for x in frozen if isinstance(x, int)):
+        for p in segment_paths(ticket, thread, meta):
+            seg, _b = _jsonl_read(p)
+            if not any(x.get("seq") == fseq_marker for x in seg):
+                continue        # 이 세그먼트에는 동결 마커가 없다 — 대상 아님
+            late = [x.get("seq") for x in seg
+                    if isinstance(x.get("seq"), int) and x["seq"] > fseq_marker]
+            if late:
+                problems.append("동결 마커(seq=%d) 이후 구파일 레코드 발견: %s"
+                                % (fseq_marker, sorted(late)[:5]))
     for r in recs:
         if r.get("type") != "ROTATED":
+            continue
+        if r.get("frozen_fallback"):
+            # 폴백 경로에는 rename 이 없었다 — 아카이브 파일명 대조는 상시 오탐이 된다.
+            # 대신 짝이 되는 동결 마커의 존재로 연속성을 확인한다(위 late 검사가 표류 담당).
+            if (r.get("prev_final_seq") or 0) + 1 not in frozen:
+                problems.append("동결 폴백 tombstone 의 짝 ROTATED_FROZEN 부재: prev=%s"
+                                % r.get("prev_final_seq"))
             continue
         pf = r.get("prev_final_seq")
         archived = _tp(ticket, "%s.%s.jsonl" % (thread, pf))
@@ -768,7 +845,7 @@ def quarantined_seqs(ticket, node):
       · `released`        = §6.2 방류가 수행됐는가(**상태**). true 가 한 행이라도 있으면 true.
     """
     out = {}
-    for p in (fence_ledger(ticket, node), pause_ledger(ticket, node)):
+    for kind, p in (("fence", fence_ledger(ticket, node)), ("pause", pause_ledger(ticket, node))):
         recs, _ = _jsonl_read(p)
         for r in recs:
             s = r.get("seq")
@@ -777,12 +854,19 @@ def quarantined_seqs(ticket, node):
             cur = out.get(s)
             if cur is None:
                 cur = {"seq": s, "grade": r.get("grade"), "from": r.get("from"),
-                       "stdin_delivered": bool(r.get("stdin_delivered")), "released": False}
+                       "stdin_delivered": bool(r.get("stdin_delivered")),
+                       "released": False, "kind": kind, "label": None, "batch": None}
                 out[s] = cur
             if not r.get("stdin_delivered"):
                 cur["stdin_delivered"] = False
             if r.get("released"):
                 cur["released"] = True
+            if r.get("label"):
+                cur["label"] = r["label"]
+            if r.get("batch"):
+                cur["batch"] = r["batch"]
+            if kind == "pause":
+                cur["kind"] = "pause"       # pause 격리는 확인 레코드 요구가 붙는다
     return out
 
 
@@ -857,13 +941,16 @@ def cite_count(target_id, records):
     return n
 
 
-def find_pair_evidence(hypo_id, node, records):
-    """§5.5 짝 증거 — 다음 5요건 전부 충족하는 레코드가 1건+ 인가.
+def find_pair_evidence(hypo_id, node, records, ticket=None):
+    """§5.5 짝 증거 — 다음 6요건 전부 충족하는 레코드가 1건+ 인가.
       ①동일 티켓 스레드 ②수신자 자신이 발신 ③refs 에 해당 HYPOTHESIS msg-id 포함
       ④기계 진위 검증을 통과한 FACT(자동 강등분 제외 — demoted_from 부재)
       ⑤철회 집합에 비포함(AA28 §5.5 요건 5호)
-    javis_task evidence-artifact 등 radio 외부 레코드는 짝으로 인정하지 않는다(탐색 결정론)."""
+      ⑥★AA34(b) 라인 해시 **재검증** 통과 — 저장 시점 verified 플래그만 보면 사후 파일
+        변조·근거 소멸이 무탐지로 done 을 통과한다. 불일치 건은 짝 자격을 잃고 master 에
+        통지된다(반환 (레코드, 사유))."""
     rset = retracted_ids(records)
+    stale = []
     for r in records:
         if r.get("from") != node:
             continue
@@ -875,8 +962,19 @@ def find_pair_evidence(hypo_id, node, records):
             continue
         if r.get("msg_id") in rset:
             continue
-        return r
-    return None
+        ok, why = recheck_evidence(r.get("evidence"))
+        if not ok:
+            stale.append((r.get("msg_id"), why))
+            if ticket:
+                notify_master(ticket, "pair-evidence-stale",
+                              "짝 증거 재검증 실패 — %s: %s (짝 자격 상실 · AA34(b))"
+                              % (r.get("msg_id"), why),
+                              idem="pair-stale-%s" % r.get("msg_id"))
+            continue
+        return r, ""
+    if stale:
+        return None, "재검증 실패로 짝 자격 상실: %s" % "; ".join("%s(%s)" % s for s in stale)
+    return None, ""
 
 
 # ── send ─────────────────────────────────────────────────────────────────────
@@ -896,6 +994,7 @@ def cmd_send(a):
         return EXIT_THROTTLED
 
     grade, epistemic, text = a.grade, a.epistemic, a.text
+    orig_text = a.text          # §3.10(b) 유사 판정용 — 강등 접두가 섞이지 않은 원문
     evidence, everr = parse_evidence(a.evidence)
     if everr:
         sys.stderr.write("evidence 형식 위반: %s\n" % "; ".join(everr))
@@ -910,7 +1009,7 @@ def cmd_send(a):
         if not evidence:
             sys.stderr.write("evidence required(5): BLOCKER 는 --evidence 필수 "
                              "(파일:라인:스니펫 — 미검증 주장의 stdin 직배달 차단)\n")
-            record_blocker_rejection(ticket, node, text, evidence, "evidence 부재")
+            record_blocker_rejection(ticket, node, orig_text, evidence, "evidence 부재")
             return EXIT_NO_EVIDENCE
 
     # §3.4/§3.10(a) 쿨다운 — 위반은 exit 거부 + 시계 미소모(무언 강등·큐잉 구현 금지)
@@ -919,7 +1018,7 @@ def cmd_send(a):
         sys.stderr.write("쿨다운: %s 재발신까지 %.0f초 — 일시 거부(exit 8·시계 미소모)\n"
                          % (grade, left))
         if grade == "BLOCKER":
-            record_blocker_rejection(ticket, node, text, evidence, "쿨다운 위반")
+            record_blocker_rejection(ticket, node, orig_text, evidence, "쿨다운 위반")
         notify_master(ticket, "cooldown-reject",
                       "%s 의 %s 발신이 쿨다운으로 거부됨(잔여 %.0fs)" % (node, grade, left),
                       idem="cooldown-%s-%s" % (node, grade))
@@ -947,17 +1046,24 @@ def cmd_send(a):
                 grade = "URGENT"
                 stdin_privileged = False
                 demotion_reason = (demotion_reason or vwhy)
-                record_blocker_rejection(ticket, node, text, evidence, "진위 검증 실패: %s" % vwhy)
+                record_blocker_rejection(ticket, node, orig_text, evidence, "진위 검증 실패: %s" % vwhy)
                 text = "[GRADE-DEMOTED:진위 검증 실패 — %s] %s" % (vwhy, text)
     elif epistemic == "FACT":
-        epistemic = "HYPOTHESIS"
-        demoted_from, demotion_reason = "FACT", "evidence 없음(기계 검증 불능)"
-        confidence = "UNVERIFIED"
-        text = "[DEMOTED:evidence 없음(기계 검증 불능)] %s" % text
+        # §3.2 문언: '자동 강등'은 **검증 실패** 시의 처치이고, evidence **자체 부재**는
+        # exit 5 거부다. 무증거 FACT 를 강등 저장으로 받아주면 '근거 없는 사실 주장'이
+        # 스레드에 상시 축적된다(§3.2 가 명시적으로 봉쇄한 경로).
+        sys.stderr.write("evidence required(5): FACT 는 --evidence 필수 "
+                         "(파일:라인:스니펫 — 자동 강등은 '검증 실패' 시의 처치이지 "
+                         "무증거 주장의 수용 경로가 아니다 · §3.2)\n")
+        if grade == "BLOCKER":
+            record_blocker_rejection(ticket, node, orig_text, evidence, "FACT evidence 부재")
+        return EXIT_NO_EVIDENCE
 
-    # §3.10(b) URGENT 남용 방어 — BLOCKER 거부 후 10분 내 유사 URGENT 자동 NORMAL 강등
+    # §3.10(b) URGENT 남용 방어 — BLOCKER 거부 후 10분 내 유사 URGENT 자동 NORMAL 강등.
+    #   ★대조는 **원문 기준**이다(거부 이력에도 원문 text140 을 저장한다) — 한쪽에만
+    #   [DEMOTED:...] 접두가 섞이면 같은 문장이 문자 불일치로 탐지를 빠져나간다.
     if grade == "URGENT" and not demoted_from:
-        abuse, why = urgent_abuse_demotion(ticket, node, text, evidence)
+        abuse, why = urgent_abuse_demotion(ticket, node, orig_text, evidence)
         if abuse:
             grade = "NORMAL"
             demotion_reason = why
@@ -1001,8 +1107,12 @@ def cmd_send(a):
         return code
 
     cooldown_consume(ticket, node, grade)     # ★통과 건만 시계 소모
-    if stdin_privileged and grade == "BLOCKER":
-        _blocker_stdin_legs(ticket, node, rec)
+    # ★AA27: ⓪진위 강등으로 stdin 특권을 잃은 건도 **master 사본은 유지**한다(강등 사유
+    #   동봉 — 남용 시도의 즉시 가시화). 종전 구현은 강등 시 leg 전체를 건너뛰어
+    #   .master-copy-log·통지가 모두 사라졌고 남용 탐지 입력이 로컬 파일에만 남았다.
+    if a.grade == "BLOCKER":
+        _blocker_stdin_legs(ticket, node, rec, stdin_privileged=stdin_privileged,
+                            demotion_reason=(None if stdin_privileged else demotion_reason))
     print(json.dumps({"sent": rec["msg_id"], "seq": rec["seq"], "grade": grade,
                       "epistemic": epistemic, "verified": verified,
                       "demoted_from": demoted_from, "masked": nmask},
@@ -1010,23 +1120,31 @@ def cmd_send(a):
     return EXIT_OK
 
 
-def _blocker_stdin_legs(ticket, sender, rec):
-    """§3.4 배달 규약 — 게이트 순서 고정·fail-closed: ⓪진위(이미 통과) ①pause ②펜스.
-    두 게이트를 통과한 건만 stdin 직배달하고, 결과는 §3.11 배달 대장에 즉시 기록한다."""
+def _blocker_stdin_legs(ticket, sender, rec, stdin_privileged=True, demotion_reason=None):
+    """§3.4 배달 규약 — 게이트 순서 고정·fail-closed: ⓪진위 ①pause ②펜스.
+    두 게이트를 통과한 건만 stdin 직배달하고, 결과는 §3.11 배달 대장에 즉시 기록한다.
+
+    ★AA27: ⓪진위 게이트에서 강등된 건(`stdin_privileged=False`)은 수신자 leg 를 수행하지
+      않되 **master 사본은 강등 사유를 동봉해 유지**한다 — 최고 배달 특권 남용 시도가
+      master 에게 즉시 보이게 하는 것이 이 조문의 목적이다."""
     seq = rec["seq"]
     header = "[radio %s seq=%d]" % (ticket, seq)     # A30(d) 수신측 중복·지연 식별 근거
     body = "%s %s [BLOCKER] %s" % (header, rec.get("reason") or "", rec.get("text") or "")
+    if demotion_reason:
+        body = "%s [GRADE-DEMOTED:%s · stdin 특권 박탈 — master 사본만 유지(AA27)] %s %s" % (
+            header, demotion_reason, rec.get("reason") or "", rec.get("text") or "")
     meta = read_meta(ticket)
     recipients = [n for n in (rec.get("to") or []) if n] or \
                  [n for n in (meta.get("participants") or []) if n != sender]
 
     paused, hits = paused_now()
-    for node in recipients:
+    for node in (recipients if stdin_privileged else []):
         if paused:
             # §9.1 후단 — append 는 수행했고 stdin leg 만 정지시켜 격리 대장에 편입한다.
             _jsonl_append(pause_ledger(ticket, node),
                           {"seq": seq, "grade": rec["grade"], "from": sender,
-                           "stdin_delivered": False, "ts": _now(), "why": "pause: %s" % hits})
+                           "stdin_delivered": False, "ts": _now(), "why": "pause: %s" % hits,
+                           "label": PAUSE_RELEASE_LABEL})
             continue
         if _fenced(meta, node, seq):
             # §3.4(a)② 펜스 게이트 — 확인 불능도 펜스 중으로 취급(fail-closed).
@@ -1039,22 +1157,61 @@ def _blocker_stdin_legs(ticket, sender, rec):
                       {"seq": seq, "leg": "recipient", "state": "ENQUEUED" if ok else "FAILED",
                        "ts": _now(), "idem_key": "radio-%s-%d-%s" % (ticket, seq, node),
                        "detail": detail})
+        if ok:
+            # §3.11(c) ENQUEUED→INJECTED 전이 — 관측 표면이 '큐 비었음'을 주면 주입 확정.
+            #   조회 불능·미제공은 미주입(fail-closed) 유지 → 델타에 전문 동승한다.
+            _probe_and_mark_injected(ticket, node, [seq])
 
-    # (c) master 사본 — 수신자 배달·격리 여부와 무관하게 즉시. 영속 로그가 사본의 단일 진실.
+    # (c) master 사본 — 수신자 배달·격리·강등 여부와 무관하게 즉시. 영속 로그가 단일 진실.
     _jsonl_append(_tp(ticket, ".master-copy-log"),
                   {"seq": seq, "from": sender, "grade": rec["grade"], "ts": _now(),
                    "reason": rec.get("reason"), "text": rec.get("text"),
+                   "demotion_reason": demotion_reason,
                    "evidence": rec.get("evidence")})
     if paused:
         _jsonl_append(pause_ledger(ticket, "master"),
                       {"seq": seq, "grade": rec["grade"], "from": sender,
-                       "stdin_delivered": False, "ts": _now(), "why": "pause(master 사본)"})
+                       "stdin_delivered": False, "ts": _now(), "why": "pause(master 사본)",
+                       "label": PAUSE_RELEASE_LABEL})
     else:
         ok, detail = cys_send_queued("master", body)
         _jsonl_append(delivery_ledger(ticket, "master"),
                       {"seq": seq, "leg": "master_copy", "state": "ENQUEUED" if ok else "FAILED",
                        "ts": _now(), "idem_key": "radio-%s-%d-master" % (ticket, seq),
                        "detail": detail})
+        if ok:
+            _probe_and_mark_injected(ticket, "master", [seq], leg="master_copy")
+
+
+def _probe_and_mark_injected(ticket, node, seqs, leg="recipient"):
+    """§3.11(c) — 주입 확인 성공 시에만 state=INJECTED 를 대장에 추가한다.
+    실패·조회 불능은 아무것도 쓰지 않는다(ENQUEUED 유지 = 미주입 취급 = fail-closed)."""
+    if not seqs:
+        return
+    if not probe_injected(node):
+        return
+    for s in seqs:
+        _jsonl_append(delivery_ledger(ticket, node),
+                      {"seq": s, "leg": leg, "state": "INJECTED", "ts": _now(),
+                       "idem_key": "radio-%s-%d-%s" % (ticket, s, node)})
+
+
+def promote_injected(ticket, node):
+    """build_delta **직전** 호출 — 아직 ENQUEUED 인 leg 를 관측 표면으로 재확인해
+    INJECTED 로 전이시킨다. 전이가 없으면 그 건은 델타에 전문 동승한다(소실 0회 우선)."""
+    st = delivery_state(ticket, node)
+    pend = [s for s, legs in st.items()
+            if "INJECTED" not in legs.values() and "ENQUEUED" in legs.values()]
+    if not pend:
+        return
+    legs_by_seq = {s: [lg for lg, v in st[s].items() if v == "ENQUEUED"] for s in pend}
+    if not probe_injected(node):
+        return
+    for s, legs in legs_by_seq.items():
+        for lg in legs:
+            _jsonl_append(delivery_ledger(ticket, node),
+                          {"seq": s, "leg": lg, "state": "INJECTED", "ts": _now(),
+                           "idem_key": "radio-%s-%d-%s" % (ticket, s, node)})
 
 
 def _fenced(meta, node, seq):
@@ -1109,8 +1266,42 @@ def full_line(rec):
     return "\n".join(out)
 
 
+def _quarantine_nonblocker(ticket, node, rec, why="fence"):
+    """AA29 §6.3 — 비BLOCKER 격리 대장 기입 주체는 **수신자 watcher 단독**이다.
+    (BLOCKER 는 송신 게이트가 이미 기입했다 — seq 멱등이라 중복 행이 생겨도 방류는 1회.)"""
+    _jsonl_append(fence_ledger(ticket, node),
+                  {"seq": rec.get("seq"), "grade": rec.get("grade"), "from": rec.get("from"),
+                   "stdin_delivered": False, "ts": _now(), "why": why})
+
+
+def fence_retro_notice(ticket, node, meta, records):
+    """AA29 §6.1 추가문 — '펜스 fence_seq 초과인데 이미 표면화된 건'은 소급 격리가 불가능
+    하므로(표면화는 비가역) '펜스 후 표면화됨' 라벨로 master 에 **1회** 통지해 리뷰 오염
+    판정 입력을 남긴다. 통지 이력은 사이드카로 멱등 보장한다."""
+    if not _fenced(meta, node, 10 ** 12):        # 그 노드에 활성 펜스가 없으면 대상 없음
+        return []
+    shown = surfaced_seqs(ticket, node)
+    side = _tp(ticket, ".fence-retro-%s" % _safe(node))
+    known = {r.get("seq") for r in _jsonl_read(side)[0]}
+    fresh = []
+    for r in records:
+        s = r.get("seq")
+        if not isinstance(s, int) or s in known or s not in shown:
+            continue
+        if _fenced(meta, node, s):
+            fresh.append(s)
+    if not fresh:
+        return []
+    for s in fresh:
+        _jsonl_append(side, {"seq": s, "ts": _now()})
+    notify_master(ticket, "fence-after-surface",
+                  "'펜스 후 표면화됨' — %s 앞 seq %s (리뷰 오염 여부 판정 입력 · 소급 격리 불가)"
+                  % (node, sorted(fresh)[:10]), idem="fence-retro-%s" % node)
+    return fresh
+
+
 def build_delta(ticket, node, thread, cursor, records, meta,
-                recovery=False, pilot=True):
+                recovery=False, pilot=True, enforce_fence=True):
     """(payload, 표시된 seq 집합, 정착(settled) seq 집합, 은닉분).
 
     표기 형태 결정(§4.3·A10(d)·A15·A22):
@@ -1148,7 +1339,20 @@ def build_delta(ticket, node, thread, cursor, records, meta,
             settled.add(seq)                    # §4.2③ 자기 에코 제외
             continue
         q = quar.get(seq)
-        if q is not None and not q.get("released") and not recovery:
+        # ★§6.1 펜스 표면화 격리(치명 공백 수리): 종전 build_delta 는 meta 를 받고도
+        #   펜스를 판정에 **전혀 쓰지 않아** 비BLOCKER 메시지가 펜스 중에도 그대로
+        #   표면화됐다(freeze 오염 차단이라는 §6 의 존재 이유가 무력). 이제 표면화 결정
+        #   직전 META(재독본)로 판정하고, 격리 편입을 대장에 **즉시** 기록한다(A12 §6.3).
+        if q is None and enforce_fence and _fenced(meta, node, seq):
+            _quarantine_nonblocker(ticket, node, rec)
+            quar[seq] = {"seq": seq, "grade": rec.get("grade"), "from": rec.get("from"),
+                         "stdin_delivered": False, "released": False,
+                         "kind": "fence", "label": None, "batch": None}
+            continue                            # 격리 — 표면화도 정착도 아니다
+        if q is not None and not q.get("released"):
+            # ★격리는 cycle 복원(recovery)에서도 유지한다 — 미방류분은 애초에 표면화된
+            #   적이 없으므로 회수 대상이 아니며(대장이 보존한다), 회수가 격리를 우회하면
+            #   §6 리뷰 격리에 구멍이 난다.
             continue                            # 격리 — 방류(§6.2) 전에는 커서 미전진
         mention = node in (rec.get("to") or [])
         form = "full"
@@ -1193,9 +1397,24 @@ def build_delta(ticket, node, thread, cursor, records, meta,
         else:
             body = full_line(rec)
             if recovery:
-                body = "[cycle 복원 재배달] " + body
+                body = "[%s] " % RECOVERY_LABEL + body
+            qq = quar.get(rec.get("seq")) or {}
+            if qq.get("label"):
+                body = "[%s] " % qq["label"] + body      # §9.2 방류 라벨
             if rec.get("msg_id") in rset:
                 body = "[RETRACTED] " + body
+            # AA30(d): 미주입(ENQUEUED) stdin leg 는 전문을 동승시킨 **직후** 취소 요청을
+            #   대장에 남긴다. 실배달이 `cys send --queued` 직발이라 트랜잭션 취소는
+            #   불가능하므로, 취소 불능을 감사 가능한 기록으로 격하한다(불변식 위계:
+            #   '전문 표면화 0회 금지 > 1회 초과 금지').
+            if not recovery and rec.get("grade") == "BLOCKER":
+                for lg, st in (deliv.get(rec.get("seq")) or {}).items():
+                    if st == "ENQUEUED":
+                        _jsonl_append(delivery_ledger(ticket, node),
+                                      {"seq": rec.get("seq"), "leg": lg,
+                                       "state": "CANCEL_REQUESTED", "ts": _now(),
+                                       "detail": "전문 동승 직후 취소 요청 — 직발 큐는 "
+                                                 "트랜잭션 취소 불가(헤더 식별로 폴백)"})
         b = len(body.encode("utf-8")) + 1
         if size + b > SURFACE_CAP_BYTES and lines:
             hidden.append(rec)
@@ -1255,6 +1474,89 @@ def _generation():
         return "unknown"
 
 
+def surfaceable_records(ticket, node, cursor, records, meta, quar=None):
+    """표면화 후보 — build_delta 의 필터와 같은 판정(관리·자기발신·봉인·격리·펜스 제외).
+    wake 판정(FYI digest)과 pause 보류가 같은 집합을 보게 하는 단일 정의다."""
+    quar = quar if quar is not None else quarantined_seqs(ticket, node)
+    sealed = sealed_seqs(records)
+    out = []
+    for r in records:
+        s = r.get("seq")
+        if not isinstance(s, int) or s <= cursor:
+            continue
+        if s in sealed or is_mgmt(r) or r.get("from") == node:
+            continue
+        q = quar.get(s)
+        if q is not None and not q.get("released"):
+            continue
+        if q is None and _fenced(meta, node, s):
+            continue
+        out.append(r)
+    return out
+
+
+def _settled_only(node, records, cursor):
+    """pause 보류 중에도 커서가 전진해도 되는 seq — 봉인·관리 레코드·자기 발신뿐이다."""
+    sealed = sealed_seqs(records)
+    out = set()
+    for r in records:
+        s = r.get("seq")
+        if not isinstance(s, int) or s <= cursor:
+            continue
+        if s in sealed or is_mgmt(r) or r.get("from") == node:
+            out.add(s)
+    return out
+
+
+def pause_hold(ticket, node, cursor, records, meta):
+    """§9.2 — pause 중 표면화 **보류**. 관측(스레드 판독)·기록(격리 대장)·커서(정착분)·
+    heartbeat 는 계속하고 표면화만 멈춘다(pause 허용 상한 = 관측·저장·보고).
+    보류분은 pause 격리 대장에 편입되어 `resume-release` 로만 방류된다 — 종전 구현은
+    pause 를 아예 확인하지 않아 kill-switch 중에도 델타가 워커 컨텍스트로 유입됐다."""
+    quar = quarantined_seqs(ticket, node)
+    held = []
+    for r in surfaceable_records(ticket, node, cursor, records, meta, quar):
+        s = r["seq"]
+        if s in quar:
+            continue                # 이미 격리(방류 대기) — 중복 편입 금지
+        _jsonl_append(pause_ledger(ticket, node),
+                      {"seq": s, "grade": r.get("grade"), "from": r.get("from"),
+                       "stdin_delivered": False, "ts": _now(),
+                       "why": "pause: 표면화 보류(§9.2)", "label": PAUSE_RELEASE_LABEL})
+        held.append(s)
+    return held
+
+
+def fyi_hold(ticket, node, candidates):
+    """§5.2(d) — FYI 단독 신규는 wake 를 발동하지 않는다(digest 코얼레싱).
+    (surface_now, note). 비FYI 가 하나라도 있으면 즉시 표면화하며 FYI 는 동승한다.
+    보류가 30분을 넘기면 단독 digest 1회를 내보낸다 — 무기한 미도달을 막는 상한이다."""
+    hp = _tp(ticket, ".fyi-hold-%s.json" % _safe(node))
+    if not candidates:
+        return False, ""
+    if any((r.get("grade") or "") != "FYI" for r in candidates):
+        if os.path.exists(hp):
+            try:
+                os.unlink(hp)
+            except OSError:
+                pass
+        return True, ""
+    st = _read_json(hp, default=None) or {}
+    first = st.get("first_ts")
+    now = _now()
+    if not isinstance(first, (int, float)):
+        javis_lock.atomic_write_json(hp, {"first_ts": now,
+                                          "seqs": [r.get("seq") for r in candidates]})
+        return False, "FYI 단독 %d건 — 보류(digest 코얼레싱)" % len(candidates)
+    if now - first < FYI_DIGEST_SEC:
+        return False, "FYI 단독 %d건 — 보류 %.0fs" % (len(candidates), now - first)
+    try:
+        os.unlink(hp)
+    except OSError:
+        pass
+    return True, "FYI digest(%.0f분 경과 — 단독 1회)" % (FYI_DIGEST_SEC / 60.0)
+
+
 def _write_hb(ticket, node, last_surfaced_ts, generation):
     """§4.5 heartbeat 사이드카 — META 비접촉(경합 원천 제거) + A22 '최근 표면화 성공 ts'."""
     javis_lock.atomic_write_json(hb_path(ticket, node),
@@ -1307,28 +1609,50 @@ def cmd_wait(a):
             # ★AA29 §6.1 — META 는 '스레드 읽기 후·표면화 결정 직전'에 재독한다.
             #   폴 초입의 stale META 를 판정 기준으로 삼는 것은 금지.
             meta = read_meta(ticket)
+            fence_retro_notice(ticket, node, meta, records)
             cursor = _read_cursor(cursor_path(ticket, node))
             fseq = final_seq(records)
+            # ★§9.1 '표면화 전' pause 게이트 — 종전에는 배달(stdin) leg 에만 있고 watcher
+            #   에는 전혀 없어서 kill-switch 중에도 델타가 계속 유입됐다(fail-open).
+            paused, _hits = paused_now()
+
             if meta.get("closed"):
                 # §10.2 — CLOSE 처리 순서는 '미표면화 델타 선표면화 → sentinel → 종료' 고정.
-                payload, disp, settled, _h = build_delta(ticket, node, thread, cursor,
-                                                         records, meta)
-                if payload:
-                    _emit(ticket, node, payload, disp)
-                    cursor = advance_cursor(cursor, records, settled)
-                    _write_cursor(cursor_path(ticket, node), cursor)
+                #   단 pause 중이면 표면화 대신 보류(AA37(ii) — 방류 주체는 close 절차/master).
+                if paused:
+                    pause_hold(ticket, node, cursor, records, meta)
+                    sys.stderr.write("pause 중 close — 미표면화분은 pause 격리 대장으로 "
+                                     "보류했다(방류는 resume-release · AA37(ii))\n")
+                else:
+                    payload, disp, settled, _h = build_delta(ticket, node, thread, cursor,
+                                                             records, meta)
+                    if payload:
+                        _emit(ticket, node, payload, disp)
+                        cursor = advance_cursor(cursor, records, settled)
+                        _write_cursor(cursor_path(ticket, node), cursor)
                 print(SENTINEL_CLOSED)
                 return EXIT_OK
 
-            if fseq > cursor:       # §4.2 wake 판정 = 단조 seq 비교 하나(카운트 기반 금지)
-                payload, disp, settled, _h = build_delta(ticket, node, thread, cursor,
-                                                         records, meta)
-                if payload:
-                    _emit(ticket, node, payload, disp)
-                    last_surfaced = _now()
-                new_cur = advance_cursor(cursor, records, settled)
+            if paused:
+                pause_hold(ticket, node, cursor, records, meta)
+                new_cur = advance_cursor(cursor, records, _settled_only(node, records, cursor))
                 if new_cur != cursor:
                     _write_cursor(cursor_path(ticket, node), new_cur)
+            elif fseq > cursor:     # §4.2 wake 판정 = 단조 seq 비교 하나(카운트 기반 금지)
+                promote_injected(ticket, node)      # §3.11(c) ENQUEUED→INJECTED 재확인
+                cand = surfaceable_records(ticket, node, cursor, records, meta)
+                go, note = fyi_hold(ticket, node, cand)
+                if go or not cand:
+                    payload, disp, settled, _h = build_delta(ticket, node, thread, cursor,
+                                                             records, meta)
+                    if payload:
+                        if note:
+                            payload = "[%s]\n%s" % (note, payload)
+                        _emit(ticket, node, payload, disp)
+                        last_surfaced = _now()
+                    new_cur = advance_cursor(cursor, records, settled)
+                    if new_cur != cursor:
+                        _write_cursor(cursor_path(ticket, node), new_cur)
 
             if _now() - last_hb >= HEARTBEAT_SEC or polls == 1:
                 _write_hb(ticket, node, last_surfaced, gen0)
@@ -1378,9 +1702,16 @@ def cmd_read(a):
     records, diag = read_thread(a.ticket, a.thread)
     _ = diag
     start = a.from_seq or 0
+    # §4.10 — --limit 에 **상한**을 건다. 상한이 없으면 `--limit 999999` 로 단일 호출
+    #   무캡 출력이 가능해, 캡의 구제 경로가 캡 목적을 무효화하는 바로 그 경로가 열린다.
+    limit = max(1, min(int(a.limit or READ_LIMIT_DEFAULT), READ_LIMIT_MAX))
+    capped = (a.limit or READ_LIMIT_DEFAULT) > READ_LIMIT_MAX
     sel = [r for r in records if isinstance(r.get("seq"), int) and r["seq"] > start]
-    page, rest = sel[:a.limit], sel[a.limit:]
+    page, rest = sel[:limit], sel[limit:]
     out = []
+    if capped:
+        out.append("[--limit 상한 %d 적용 — 초과분은 페이지네이션으로만 열람한다(§4.10)]"
+                   % READ_LIMIT_MAX)
     rset = retracted_ids(records)
     for r in page:
         line = full_line(r) if not is_mgmt(r) else "· [관리] seq=%s type=%s" % (r.get("seq"), r.get("type"))
@@ -1445,6 +1776,17 @@ def _retract_backtrace(ticket, thread, target, records):
     재검토 플래그를 기록하고 master 에 1건 통지한다(팬아웃 아님 · master 단일 수신).
     짝 증거(§5.5)로 쓰인 경우도 대상에 포함한다."""
     hits = []
+    idx = _by_id(records)
+    # ★AA28 §7.4(b) 확장 — 철회 대상이 어떤 HYPOTHESIS 의 **짝 증거**로 쓰였다면, 그
+    #   가설에 의존해 done 을 통과한 티켓도 재검토 대상이다. 이 의존은 역방향이라
+    #   (티켓 refs → 가설 → …) forward closure 스캔으로는 절대 잡히지 않는다.
+    via_pair = set()
+    tgt_rec = idx.get(target)
+    if tgt_rec and tgt_rec.get("epistemic") == "FACT":
+        for rid in tgt_rec.get("refs") or []:
+            r2 = idx.get(rid)
+            if r2 and r2.get("epistemic") == "HYPOTHESIS":
+                via_pair.add(rid)
     tasks = os.path.join(ROOT(), "_round", "tasks")
     try:
         names = sorted(n for n in os.listdir(tasks) if n.endswith(".json"))
@@ -1458,7 +1800,7 @@ def _retract_backtrace(ticket, thread, target, records):
         if not isinstance(refs, list):
             continue
         closure = transitive_refs(refs, records)
-        if target in closure:
+        if target in closure or (closure & via_pair):
             hits.append(t.get("id") or n)
     # radio 내부: 대상을 폐쇄에 포함하는 자기 레코드(짝 증거 포함)도 플래그 대상이다.
     for r in records:
@@ -1490,12 +1832,15 @@ def cmd_done_check(a):
     ack = _read_cursor(ack_path(ticket, node))
     resolved = resolved_seqs(ticket, node)
     quar = quarantined_seqs(ticket, node)
-    confirm = os.path.exists(_tp(ticket, ".pause-release-confirm-%s" % _safe(node)))
     reasons = []
 
     mine = []
     for r in records:
         if is_mgmt(r) or r.get("from") == node:
+            continue
+        # AA32(a) — 미지(전방호환) 레코드에는 **반영 의무를 부과하지 않는다**. 종전 구현은
+        #   미래 schema_version + BLOCKER 레코드 하나로 done 을 영구 봉쇄했다.
+        if is_unknown(r):
             continue
         if r.get("grade") not in ("BLOCKER", "URGENT"):
             continue
@@ -1506,11 +1851,14 @@ def cmd_done_check(a):
 
     for r in mine:
         seq = r["seq"]
-        if seq > cursor or seq > ack:
-            why = "미표면화/미수용 seq=%d(커서=%d ack=%d)" % (seq, cursor, ack)
-            if seq in quar and not confirm:
-                why += " ※master 확인 레코드 부재로 인한 대기 — 워커 귀책 아님(A25(c))"
-            reasons.append(why)
+        q = quar.get(seq)
+        if q is not None and not confirm_covers(ticket, node, seq, q):
+            # A25(c) — 확인 대기 중 건이 잔존하면 거부하되 **워커 귀책이 아님**을 기계
+            #   판별해 남긴다(master 재통지의 근거 겸용 · fail-open 착수는 금지).
+            reasons.append("pause 방류 확인 대기 seq=%d(batch=%s) — master 확인 레코드 부재로 "
+                           "인한 대기 · 워커 귀책 아님(A25(c))" % (seq, q.get("batch")))
+        elif seq > cursor or seq > ack:
+            reasons.append("미표면화/미수용 seq=%d(커서=%d ack=%d)" % (seq, cursor, ack))
         elif seq not in resolved:
             reasons.append("resolve 레코드 부재 seq=%d — 반영·기각 기록 필요(§5.6)" % seq)
 
@@ -1521,19 +1869,327 @@ def cmd_done_check(a):
     if hit:
         reasons.append("철회된 근거 인용(이행적 폐쇄 교집합): %s" % ", ".join(sorted(hit)))
     idx = _by_id(records)
-    for rid in closure:
+    # ★A19 §5.5: 짝 증거를 요구하는 범위는 '산출물이 refs 인용한' **직접 집합**이다.
+    #   이행적 폐쇄 전체에 요구하면 타인의 짝 증거 FACT 가 인용한 간접 가설에까지
+    #   수신자 본인의 독립 재유도를 요구해, A19 가 봉쇄하려던 오거부 경로가 재개방된다.
+    #   (철회 대조는 폐쇄 전체 유지 — 다단 체인 오통과 차단이 목적이라 층위가 다르다.)
+    for rid in refs:
         rec = idx.get(rid)
         if rec and rec.get("epistemic") == "HYPOTHESIS":
-            if not find_pair_evidence(rid, node, records):
-                reasons.append("HYPOTHESIS %s 의 짝 증거 0건(§5.5) — 독립 재유도 필요" % rid)
+            pair, why = find_pair_evidence(rid, node, records, ticket=ticket)
+            if not pair:
+                reasons.append("HYPOTHESIS %s 의 짝 증거 0건(§5.5) — 독립 재유도 필요%s"
+                               % (rid, (" · " + why) if why else ""))
 
     if reasons:
         for r in reasons:
             print("[DONE-BLOCK] %s" % r)
+        print("복구 경로: 미표면화 건은 `javis_radio.py wait --ticket %s --node %s --once` "
+              "또는 `javis_radio.py read --ticket %s --from <seq>` 로 **강제 표면화**한 뒤 "
+              "ack·resolve 를 기록하고 재시도하라(AA38 ①)." % (ticket, node, ticket))
         print("done 게이트: BLOCK — exit %d" % EXIT_NO_EVIDENCE)
         return EXIT_NO_EVIDENCE
     print("done 게이트: PASS (미표면화 0 · resolve 완비 · 철회 인용 0 · 짝 증거 완비)")
     return EXIT_OK
+
+
+# ── 펜스 설정·해제 (§6.1 · §6.2 · §8.2 master 옵저버 권한) ────────────────────
+def cmd_fence(a):
+    """§6.1 — master 가 리뷰 격리를 건다. 종전에는 펜스 **판독**만 있고 기입 도구가 없어
+    master 가 META 를 수기 편집해야 했다(A11 락 규율 우회 위험)."""
+    ticket, target = a.ticket, a.target
+    if not os.path.isdir(ticket_dir(ticket)):
+        sys.stderr.write("티켓 미개통: %s\n" % ticket)
+        return EXIT_USAGE
+    fseq = a.seq
+    if fseq is None:
+        fseq = max(final_seq(read_thread(ticket, th)[0]) for th in THREADS)
+    meta = meta_update(ticket, lambda m: m.setdefault("fences", {}).__setitem__(
+        target, {"fence_seq": int(fseq), "at": _now(), "by": a.node,
+                 "reason": a.reason or ""}))
+    print(json.dumps({"fenced": target, "fence_seq": int(fseq),
+                      "fences": meta.get("fences")}, ensure_ascii=False))
+    return EXIT_OK
+
+
+def release_quarantine(ticket, node, kind=None, label=None, batch=None, by="release"):
+    """§6.2·AA29 — 격리 대장 잔존분을 **seq 멱등**으로 방류 기입한다(중복 행이 물리적으로
+    있어도 방류 기입은 seq 당 1회). 반환: 방류된 seq 목록."""
+    ledgers = []
+    if kind in (None, "fence"):
+        ledgers.append(("fence", fence_ledger(ticket, node)))
+    if kind in (None, "pause"):
+        ledgers.append(("pause", pause_ledger(ticket, node)))
+    out = []
+    for _k, ledger in ledgers:
+        rows, _ = _jsonl_read(ledger)
+        state = {}
+        for r in rows:
+            s = r.get("seq")
+            if not isinstance(s, int):
+                continue
+            cur = state.setdefault(s, dict(r))
+            if r.get("released"):
+                cur["released"] = True
+        for s, r in sorted(state.items()):
+            if r.get("released"):
+                continue
+            row = dict(r, seq=s, released=True, released_at=_now(), released_by=by)
+            if label:
+                row["label"] = label
+            if batch:
+                row["batch"] = batch
+            _jsonl_append(ledger, row)
+            out.append(s)
+    return out
+
+
+def cmd_unfence(a):
+    """§6.2 — verdict 도착 → 펜스 해제 → 격리분 일괄 방류(다음 wake 델타에 전문 동승).
+    종전에는 released 기입 주체가 close 뿐이라 리뷰 종료 시점의 방류가 불가능했다."""
+    ticket, target = a.ticket, a.target
+    if not os.path.isdir(ticket_dir(ticket)):
+        sys.stderr.write("티켓 미개통: %s\n" % ticket)
+        return EXIT_USAGE
+    meta_update(ticket, lambda m: (m.setdefault("fences", {}).pop(target, None), m))
+    freed = release_quarantine(ticket, target, kind="fence", by="unfence")
+    print(json.dumps({"unfenced": target, "released": freed,
+                      "note": "방류 건의 §5.2 유예는 **방류 표면화 시점**부터 기산한다(A16 §6.2)"},
+                     ensure_ascii=False))
+    return EXIT_OK
+
+
+# ── pause 방류·확인 (§9.2 · §9.3 · AA25 · AA31(e)) ───────────────────────────
+def batch_ledger(ticket, node):
+    return _tp(ticket, ".pause-release-batch-%s" % _safe(node))
+
+
+def confirm_path(ticket, node):
+    return _tp(ticket, ".pause-release-confirm-%s" % _safe(node))
+
+
+def read_confirms(ticket, node):
+    d = _read_json(confirm_path(ticket, node), default=None) or {}
+    out = d.get("confirmations")
+    return out if isinstance(out, list) else []
+
+
+def confirm_covers(ticket, node, seq, q):
+    """A25(a) — 확인은 **기계 판독 레코드로만** 성립한다. pause 방류 건만 확인 대상이며
+    (펜스 방류는 §6.2 경로라 master 확인 요건이 없다), batch 확인 또는 개별 seq 확인 중
+    하나가 그 seq 를 덮어야 한다."""
+    if (q or {}).get("kind") != "pause":
+        return True
+    batch = (q or {}).get("batch")
+    for c in read_confirms(ticket, node):
+        if c.get("scope") == "batch" and batch and c.get("batch") == batch:
+            return True
+        if seq in (c.get("seqs") or []):
+            return True
+    return False
+
+
+def open_batches(ticket, node):
+    """미확인 방류 요약(batch) 목록 — A25(c)·A31(e) 재통지 대상 판정 입력."""
+    rows, _ = _jsonl_read(batch_ledger(ticket, node))
+    confirmed = {c.get("batch") for c in read_confirms(ticket, node)
+                 if c.get("scope") == "batch"}
+    return [r for r in rows if r.get("batch") not in confirmed]
+
+
+def cmd_resume_release(a):
+    """§9.2·AA24(c) — resume 후 pause 격리분 **일괄 방류**. 각 건에 '착수 전 master 확인'
+    라벨을 붙이고, 노드당 방류 요약 1건(batch)을 만들어 확인 폭풍을 막는다(A12 §9.3).
+    종전에는 released 기입 주체가 close 뿐이라 resume 후에도 close 까지 표면화가 잠겼다."""
+    ticket = a.ticket
+    if not os.path.isdir(ticket_dir(ticket)):
+        sys.stderr.write("티켓 미개통: %s\n" % ticket)
+        return EXIT_USAGE
+    paused, hits = paused_now()
+    if paused and not a.force:
+        sys.stderr.write("아직 pause 중이다(%s) — 방류는 resume 후에만(exit 4·fail-closed)\n"
+                         % hits)
+        return EXIT_PAUSED
+    meta = read_meta(ticket)
+    nodes = [a.node] if a.node else (list(meta.get("participants") or []) + ["master"])
+    out = []
+    for node in nodes:
+        batch = "B-%s-%s-%d" % (_safe(ticket), _safe(node), int(_now()))
+        freed = release_quarantine(ticket, node, kind="pause",
+                                   label=PAUSE_RELEASE_LABEL, batch=batch, by="resume-release")
+        if not freed:
+            continue
+        quar = quarantined_seqs(ticket, node)
+        grades = {}
+        bu = []
+        for s in freed:
+            g = (quar.get(s) or {}).get("grade") or "NORMAL"
+            grades[g] = grades.get(g, 0) + 1
+            if g in ("BLOCKER", "URGENT"):
+                bu.append(s)
+        rec = {"batch": batch, "node": node, "ts": _now(), "count": len(freed),
+               "grades": grades, "bu": sorted(bu), "seqs": sorted(freed),
+               "label": PAUSE_RELEASE_LABEL}
+        _jsonl_append(batch_ledger(ticket, node), rec)
+        notify_master(ticket, "pause-release",
+                      "%s 방류 요약 %s — %d건(등급 %s · B/U %s) · 확인 필요: "
+                      "`javis_radio.py confirm-release --ticket %s --node %s --batch %s`"
+                      % (node, batch, len(freed), grades, sorted(bu), ticket, node, batch),
+                      urgent=bool(bu), idem="pause-release-%s" % batch)
+        out.append(rec)
+    print(json.dumps({"released_batches": out,
+                      "note": "확인 레코드 기록 전까지 §5.2 유예 시계는 기산되지 않는다(A25(b))"},
+                     ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_confirm_release(a):
+    """AA25(a) — master 확인 레코드 기록(temp-write-rename · A11 패턴).
+    구두·트랜스크립트상의 확인은 무효다 — 이 파일만이 게이트 판정 입력이다."""
+    ticket, node = a.ticket, a.node
+    seqs = sorted({int(x) for x in (a.seqs or "").replace(" ", "").split(",") if x})
+    if not a.batch and not seqs:
+        sys.stderr.write("확인 범위 필요: --batch <id> 또는 --seqs 1,2,3\n")
+        return EXIT_USAGE
+    entry = {"batch": a.batch, "ts": _now(), "by": a.by or "master",
+             "scope": "batch" if a.batch and not seqs else "seqs", "seqs": seqs,
+             "note": a.note or ""}
+    cur = read_confirms(ticket, node)
+    cur.append(entry)
+    javis_lock.atomic_write_json(confirm_path(ticket, node), {"confirmations": cur})
+    print(json.dumps({"confirmed": entry, "node": node}, ensure_ascii=False))
+    return EXIT_OK
+
+
+# ── cycle 복원 회수 (§10.3③ · AA22 · AA39(d)) ────────────────────────────────
+def _task_status(ticket):
+    t = _read_json(os.path.join(ROOT(), "_round", "tasks", "%s.json" % ticket), default=None)
+    return (t or {}).get("status")
+
+
+def cmd_recover(a):
+    """§10.3③ — `.ack-<노드>` 기준 **미수용** 델타 회수. 표면화 커서만으로 회수하는 구현은
+    금지다(표면화≠통합 — clear 로 트랜스크립트와 함께 소실된 건은 표면화 커서상 '완료'다).
+    회수 델타는 압축·'기배달'·'기표시' 종결 규칙을 적용하지 않고 전 건 전문 재표기한다 —
+    '전문 표면화 정확히 1회' 회계가 clear 시점에 그 노드에 한해 리셋되기 때문(A22).
+
+    AA39(d) 가드: done/취소/close 티켓은 회수를 스킵하고 고아 상태를 master 에 보고한다
+    (죽은 티켓의 스테일 URGENT 가 신선 컨텍스트에 되살아나는 경로 봉쇄)."""
+    ticket, node = a.ticket, a.node
+    if not os.path.isdir(ticket_dir(ticket)):
+        sys.stderr.write("티켓 미개통: %s\n" % ticket)
+        return EXIT_USAGE
+    meta = read_meta(ticket)
+    st = _task_status(ticket)
+    if meta.get("closed") or st in ("done", "DONE", "cancelled", "canceled"):
+        notify_master(ticket, "recover-dead-ticket",
+                      "%s 의 회수 요청 — 티켓이 이미 close/done/취소(status=%s) 이므로 스킵"
+                      % (node, st), idem="recover-dead-%s" % ticket)
+        print(json.dumps({"skipped": ticket, "reason": "closed/done/cancelled",
+                          "task_status": st, "closed": bool(meta.get("closed"))},
+                         ensure_ascii=False))
+        return EXIT_OK
+    ack = _read_cursor(ack_path(ticket, node))
+    total = 0
+    for th in ([a.thread] if a.thread else list(THREADS)):
+        records, _ = read_thread(ticket, th, meta)
+        payload, disp, _settled, _h = build_delta(ticket, node, th, ack, records, meta,
+                                                  recovery=True)
+        if payload:
+            print("── [%s] thread=%s (ack=%d 이후 미수용분)" % (RECOVERY_LABEL, th, ack))
+            _emit(ticket, node, payload, disp)
+            total += len(disp)
+    if not total:
+        print("(회수 대상 없음 — ack=%d 이후 미수용 델타 0건)" % ack)
+    return EXIT_OK
+
+
+# ── status (§4.5 · §8.3 · AA31(d)(e) master 점검·복원 절차의 도구 표면) ───────
+def cmd_status(a):
+    """master 능동 점검·복원 절차(§8.3)의 기계 판독 표면. 사람 눈이 아니라 JSON 이다.
+      · heartbeat 신선도(HB_STALE_SEC 180초) — 종전에는 상수만 있고 판독 주체가 없었다
+      · 배선 단절형 난청 신호(표면화 성공 ts 정체 + 구독 스레드 신규 seq)  — A22 §4.5
+      · 펜스·격리 잔존(미방류)·미확인 batch — AA31(d) ①②
+      · 미인지 BLOCKER(master 사본 중 표면화 대장에 없는 건) — AA31(d) ③
+      · 확인 재통지 due(B/U 10분 · N/F-only 30분) — AA31(e)"""
+    now = _now()
+    try:
+        tickets = [a.ticket] if a.ticket else sorted(
+            n for n in os.listdir(radio_dir())
+            if os.path.isdir(os.path.join(radio_dir(), n)) and not n.startswith("_"))
+    except OSError:
+        tickets = []
+    out = {"ts": now, "hb_stale_sec": HB_STALE_SEC, "tickets": []}
+    for t in tickets:
+        meta = read_meta(t)
+        finals = {}
+        for th in THREADS:
+            finals[th] = final_seq(read_thread(t, th, meta)[0])
+        info = {"ticket": t, "closed": bool(meta.get("closed")),
+                "participants": list(meta.get("participants") or []),
+                "fences": meta.get("fences") or {}, "final_seq": finals,
+                "task_status": _task_status(t), "nodes": [],
+                "notify_fallback": len(_jsonl_read(_tp(t, ".notify-fallback.jsonl"))[0])}
+        master_copies = {r.get("seq") for r in _jsonl_read(_tp(t, ".master-copy-log"))[0]
+                         if isinstance(r.get("seq"), int)}
+        for node in list(meta.get("participants") or []) + ["master"]:
+            hb = _read_json(hb_path(t, node), default=None) or {}
+            hb_ts = hb.get("ts")
+            age = (now - hb_ts) if isinstance(hb_ts, (int, float)) else None
+            cursor = _read_cursor(cursor_path(t, node))
+            ack = _read_cursor(ack_path(t, node))
+            quar = quarantined_seqs(t, node)
+            shown = surfaced_seqs(t, node)
+            lst = hb.get("last_surfaced_ts")
+            # A22 — '표면화 성공 ts 정체 + 신규 seq 존재' 조합이 배선 단절형 난청 신호다.
+            backlog = max(finals.values() or [0]) > cursor
+            deaf = bool(backlog and (lst is None or (now - lst) > HB_STALE_SEC))
+            batches = []
+            for b in open_batches(t, node):
+                period = CONFIRM_RENOTIFY_BU_SEC if b.get("bu") else CONFIRM_RENOTIFY_NF_SEC
+                batches.append({"batch": b.get("batch"), "ts": b.get("ts"),
+                                "count": b.get("count"), "bu": b.get("bu") or [],
+                                "renotify_period_sec": period,
+                                "renotify_due": (now - (b.get("ts") or now)) >= period})
+            nd = {"node": node,
+                  "hb": {"ts": hb_ts, "age_sec": age,
+                         "stale": (age is None or age > HB_STALE_SEC),
+                         "last_surfaced_ts": lst, "generation": hb.get("generation")},
+                  "cursor": cursor, "ack": ack,
+                  "deaf_signal": deaf,
+                  "fence_unreleased": sorted(s for s, q in quar.items()
+                                             if q.get("kind") == "fence" and not q.get("released")),
+                  "pause_unreleased": sorted(s for s, q in quar.items()
+                                             if q.get("kind") == "pause" and not q.get("released")),
+                  "released_unconfirmed": sorted(
+                      s for s, q in quar.items()
+                      if q.get("released") and not confirm_covers(t, node, s, q)),
+                  "open_batches": batches,
+                  "unresolved_bu": sorted(_unresolved_bu(t, node))}
+            if node == "master":
+                nd["unseen_blocker_copies"] = sorted(master_copies - shown)
+            info["nodes"].append(nd)
+        out["tickets"].append(info)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return EXIT_OK
+
+
+def _unresolved_bu(ticket, node):
+    """자기 앞 BLOCKER·URGENT 중 resolve 레코드가 없는 seq(§5.2(e) 판정 입력과 동형)."""
+    resolved = resolved_seqs(ticket, node)
+    out = set()
+    for th in THREADS:
+        for r in read_thread(ticket, th)[0]:
+            if is_mgmt(r) or is_unknown(r) or r.get("from") == node:
+                continue
+            if r.get("grade") not in ("BLOCKER", "URGENT"):
+                continue
+            to = r.get("to") or []
+            if to and node not in to:
+                continue
+            if r.get("seq") not in resolved:
+                out.add(r.get("seq"))
+    return out
 
 
 # ── open (§1.2 · AA33(a)) ────────────────────────────────────────────────────
@@ -1566,6 +2222,25 @@ def cmd_open(a):
             "(radio 불능 노드의 난청 등록·재기동 무한 루프를 개통 시점에 차단)\n" % ", ".join(missing))
         notify_master(ticket, "capability-gate", "능력 게이트 미통과 노드: %s" % ", ".join(missing))
         return EXIT_CAPABILITY
+    if missing and a.skip_capability_gate:
+        # 우회는 막지 않되 숨기지 않는다(close --force 와 동형 규율).
+        if len((a.skip_reason or "").strip()) < 8:
+            sys.stderr.write("skip reason required(5): --skip-capability-gate 는 "
+                             "--skip-reason 필수(최소 8자) — fail-closed 약화는 기록 없이 "
+                             "허용되지 않는다\n")
+            return EXIT_NO_EVIDENCE
+        _jsonl_append(_tp(ticket, ".gate-bypass.jsonl"),
+                      {"ts": _now(), "ticket": ticket, "gate": "capability",
+                       "nodes": missing, "reason": a.skip_reason.strip()})
+        notify_master(ticket, "capability-gate-bypass",
+                      "능력 게이트 우회 — 노드 %s · 사유: %s"
+                      % (", ".join(missing), a.skip_reason.strip()), urgent=True)
+
+    # §1.2 — radio 는 '책임 영역이 얽힌 다중 워커 병렬 티켓'에서만 쓴다. 단일 워커 티켓의
+    #   개통은 순비용(watcher·유예·게이트)만 남기므로 개통 시점에 고지한다.
+    if len(parts) < 2:
+        sys.stderr.write("주의(§1.2): 참여자 %d명 — radio 는 다중 워커 병렬 티켓 전용이다. "
+                         "단일 워커 티켓 개통은 순비용이며 계약상 미사용 대상이다.\n" % len(parts))
 
     os.makedirs(ticket_dir(ticket), exist_ok=True)
     meta = {"ticket": ticket, "schema_version": SCHEMA_VERSION, "participants": parts,
@@ -1592,37 +2267,36 @@ def cmd_close(a):
     if meta.get("closed"):
         print(json.dumps({"closed": ticket, "already": True}, ensure_ascii=False))
         return EXIT_OK
+    # ★AA37 게이트 우회의 **비은닉화**: --force 는 '전문 표면화 0회 금지' 불변식의 기계
+    #   집행을 무력화하는 행위다. 제거하지는 않되(현장에서 고아 티켓을 닫을 최후 수단이
+    #   필요하다) 사유를 강제하고 우회 사실을 원장·master 통지로 가시화한다.
+    if a.force and len((a.force_reason or "").strip()) < 8:
+        sys.stderr.write("force reason required(5): --force 는 --force-reason 필수(최소 8자) — "
+                         "드레인·잔존0 게이트 우회는 기록 없이 허용되지 않는다\n")
+        return EXIT_NO_EVIDENCE
     parts = list(meta.get("participants") or [])
-    report = {"released": 0, "cancelled": 0, "cancel_failed": 0, "drain_short": [], "residual": []}
+    report = {"released": 0, "cancel_requested": 0, "drain_short": [], "residual": []}
 
     # (i)(ii) 펜스 강제 해제 + 격리 대장 잔존분 방류 — verdict 종류·취소 여부와 무관.
     meta_update(ticket, lambda m: m.__setitem__("fences", {}))
     for node in parts + ["master"]:
-        for ledger in (fence_ledger(ticket, node), pause_ledger(ticket, node)):
-            rows, _ = _jsonl_read(ledger)
-            state = {}
-            for r in rows:
-                s = r.get("seq")
-                if not isinstance(s, int):
-                    continue
-                cur = state.setdefault(s, dict(r))   # seq 멱등 — 중복 행이 있어도 1건으로 접는다
-                if r.get("released"):
-                    cur["released"] = True
-            for s, r in sorted(state.items()):
-                if r.get("released"):
-                    continue                          # 이미 방류된 건은 재방류하지 않는다
-                _jsonl_append(ledger, dict(r, seq=s, released=True,
-                                           released_at=_now(), released_by="close"))
-                report["released"] += 1
+        freed = release_quarantine(ticket, node, by="close")
+        report["released"] += len(freed)
 
-    # (iii) stdin leg 정리 — 해당 티켓 radio 발 pending 을 큐에서 취소(멱등키).
-    ok, detail = _cancel_pending(ticket)
-    if ok:
-        report["cancelled"] += 1
-    else:
-        report["cancel_failed"] += 1
-        _jsonl_append(_tp(ticket, ".stdin-cancel-log.jsonl"),
-                      {"ts": _now(), "ok": False, "detail": detail})
+    # (iii) stdin leg 정리 — 실배달은 `cys send --queued` **직발**이라 트랜잭션 취소가
+    #   존재하지 않는다. 종전 구현은 발신에 쓰지도 않은 wakeup 큐 키로 취소를 시도해
+    #   '취소했다'는 거짓 성공을 보고했다. 정직한 사실은 '취소 불능'이므로, 취소 요청을
+    #   배달 대장에 기록하고 수신측이 `[radio <티켓> seq=N]` 헤더로 '[closed-ticket 지연
+    #   배달]'을 식별해 무시하게 한다(RADIO_CONTRACT §8.4 등재).
+    for node in parts + ["master"]:
+        for s, legs in sorted(delivery_state(ticket, node).items()):
+            for leg, stt in legs.items():
+                if stt in ("ENQUEUED",):
+                    _jsonl_append(delivery_ledger(ticket, node),
+                                  {"seq": s, "leg": leg, "state": "CANCEL_REQUESTED",
+                                   "ts": _now(), "detail": "close 정리 — 직발 큐 취소 불가 · "
+                                                           "지연 배달은 헤더로 식별해 무시"})
+                    report["cancel_requested"] += 1
 
     # (iv) 드레인 게이트 — 전 참여 워커의 표면화 커서 == 스레드 최종 비관리 seq
     for th in THREADS:
@@ -1636,6 +2310,8 @@ def cmd_close(a):
                 report["drain_short"].append("%s/%s cursor=%d < %d" % (node, th, cur, target))
 
     # (v) 잔존 0 게이트 — 미방류(stdin_delivered:false)·미처리 FAILED 잔존 0건 기계 검증
+    master_copies = {r.get("seq") for r in _jsonl_read(_tp(ticket, ".master-copy-log"))[0]
+                     if isinstance(r.get("seq"), int)}
     for node in parts + ["master"]:
         for s, r in sorted(quarantined_seqs(ticket, node).items()):
             if not r.get("released"):
@@ -1643,44 +2319,44 @@ def cmd_close(a):
         # A30(b): FAILED 는 stdin 배달이 없었던 건이므로 **델타 전문 표기가 곧 복구 경로**다.
         # 따라서 '미처리 FAILED' 는 아직 그 노드에 표면화되지 않은 건만을 뜻한다 — 이미
         # 표면화된 FAILED 를 잔존으로 세면 정상 복구된 건이 close 를 영구 봉쇄한다.
+        # ★master_copy leg 의 FAILED 는 §3.4(c) 영속 로그(A31(a))가 보존을 담보한다
+        #   (A30(b) 명문) — 로그에 있는 seq 는 잔존이 아니다. 그렇지 않으면 master 가
+        #   watcher 를 돌리지 않는 구조상 close 가 영구 불가능해진다.
         shown = surfaced_seqs(ticket, node)
         for s, legs in delivery_state(ticket, node).items():
             for leg, st in legs.items():
-                if st == "FAILED" and s not in shown:
-                    report["residual"].append("%s %s seq=%d FAILED 미표면화" % (node, leg, s))
+                if st != "FAILED" or s in shown:
+                    continue
+                if leg == "master_copy" and s in master_copies:
+                    continue
+                report["residual"].append("%s %s seq=%d FAILED 미표면화" % (node, leg, s))
 
-    if (report["drain_short"] or report["residual"]) and not a.force:
-        for x in report["drain_short"] + report["residual"]:
-            print("[CLOSE-BLOCK] %s" % x)
-        print("close 거부 — 드레인·잔존0 게이트 미통과(exit %d)" % EXIT_NO_EVIDENCE)
-        return EXIT_NO_EVIDENCE
+    if report["drain_short"] or report["residual"]:
+        if not a.force:
+            for x in report["drain_short"] + report["residual"]:
+                print("[CLOSE-BLOCK] %s" % x)
+            print("close 거부 — 드레인·잔존0 게이트 미통과(exit %d). 미표면화분은 해당 워커의 "
+                  "`wait --once` 또는 `read` 로 강제 표면화하고, 격리분은 `unfence`/"
+                  "`resume-release` 로 방류한 뒤 재시도하라." % EXIT_NO_EVIDENCE)
+            return EXIT_NO_EVIDENCE
+        bypass = {"ts": _now(), "ticket": ticket, "by": a.node,
+                  "reason": a.force_reason.strip(),
+                  "drain_short": report["drain_short"], "residual": report["residual"]}
+        _jsonl_append(_tp(ticket, ".gate-bypass.jsonl"), bypass)
+        report["forced"] = bypass
+        notify_master(ticket, "close-force-bypass",
+                      "close 게이트 우회(--force) — 사유: %s · 드레인 미달 %d · 잔존 %d"
+                      % (bypass["reason"], len(report["drain_short"]), len(report["residual"])),
+                      urgent=True, idem="close-force-%s" % ticket)
 
     rec = {"schema_version": SCHEMA_VERSION, "type": "CLOSE", "grade": "FYI",
            "from": a.node, "ts": _now(), "report": report}
-    for th in THREADS:
-        r2, code = append_record(ticket, th, dict(rec), owner="radio-close")
-        if code not in (EXIT_OK,):
-            return code
-    meta_update(ticket, lambda m: (m.__setitem__("closed", True),
-                                   m.__setitem__("closed_at", _now())))
+    # ★AA37 TOCTOU: CLOSE append 와 META closed=true 를 동일 임계구역에서 커밋한다.
+    code = close_commit(ticket, rec)
+    if code != EXIT_OK:
+        return code
     print(json.dumps({"closed": ticket, **report}, ensure_ascii=False))
     return EXIT_OK
-
-
-def _cancel_pending(ticket):
-    """§10.2(iii) — cys 명령이 가용하면 wakeup 큐 취소를 시도하고, 불가하면 대장에 기록한다.
-    취소 불능 지연 배달분은 A30(d) 의 `[radio <티켓> seq=N]` 헤더로 수신측이 식별한다."""
-    wk = os.path.join(_SELF_DIR, "javis_wakeup.py")
-    if not _cys_bin() or not os.path.isfile(wk):
-        return False, "cys 미가용 — 큐 취소 시도 불가(헤더 식별로 폴백)"
-    try:
-        r = subprocess.run([sys.executable, wk, "cancel", "--task", "radio-%s" % _safe(ticket),
-                            "--reason", "radio close"], capture_output=True, timeout=20)
-        if r.returncode == 0:
-            return True, "cancelled"
-        return False, "wakeup cancel exit %d" % r.returncode
-    except Exception as e:
-        return False, "wakeup cancel 실행 불가: %s" % e
 
 
 # ── GAP 봉인 (§2.7(c)) ───────────────────────────────────────────────────────
@@ -1907,10 +2583,13 @@ def _self_test(record_capability=None):
         if tgt not in retracted_ids(recs):
             fails.append("철회 집합에 등재되지 않았다")
 
-        # ⑭ close 후 send 는 exit 7, RETRACT 는 예외
-        rc = run(["close", "--ticket", T, "--node", "master", "--force"])
+        # ⑭ close — **정상 경로**(드레인·잔존0 게이트 통과)로 닫는다. --force 는 게이트
+        #    우회이므로 자기검증의 기본 경로가 되어서는 안 된다.
+        for n in ("w1", "w2"):
+            run(["wait", "--ticket", T, "--node", n, "--once", "--interval", "0"])
+        rc = run(["close", "--ticket", T, "--node", "master"])
         if rc != EXIT_OK:
-            fails.append("close 실패 rc=%s" % rc)
+            fails.append("정상 경로 close 실패 rc=%s (드레인·잔존0 게이트)" % rc)
         if run(["send", "--ticket", T, "--node", "w1", "--grade", "FYI",
                 "--epistemic", "HYPOTHESIS", "--confidence", "low",
                 "--text", "닫힌 뒤"]) != EXIT_CLOSED:
@@ -1941,6 +2620,33 @@ def _self_test(record_capability=None):
                        "epistemic": "FACT", "type": MSG_TYPE, "unknown_field": 1}):
             fails.append("미지 **필드**가 미지 레코드로 오분류됐다(무시해야 한다)")
 
+        # ⑱ ★로테이션 소실 회귀(AA20 §2.3(a) 최상위 불변식) — tombstone 이 seq 를
+        #    소비하지 않으면 신규 메시지와 seq 가 겹쳐 read dedup 이 메시지를 영구 은닉한다.
+        T2 = "T-rot"
+        for n in ("w1", "w2"):
+            javis_lock.atomic_write_json(capability_receipt(n), {"ok": True, "ts": _now()})
+        run(["open", "--ticket", T2, "--participants", "w1,w2"])
+        _bak_rot = globals()["ROTATE_BYTES"]
+        globals()["ROTATE_BYTES"] = 400
+        try:
+            # ★발신자는 신규 노드로 — 차단기(분당 12건·발신자 전역)가 앞선 케이스의 발신에
+            #   섞이면 '소실'이 아니라 '거부'를 소실로 오판한다.
+            for i in range(10):
+                if run(["send", "--ticket", T2, "--node", "rotw", "--grade", "NORMAL",
+                        "--epistemic", "HYPOTHESIS", "--confidence", "low",
+                        "--text", "로테이션 본문 %d" % i]) != EXIT_OK:
+                    fails.append("로테이션 시험 send %d 실패(차단기·쿨다운 오염)" % i)
+        finally:
+            globals()["ROTATE_BYTES"] = _bak_rot
+        rrecs, _ = read_thread(T2, DEFAULT_THREAD)
+        texts = [r.get("text") for r in rrecs if r.get("type") == MSG_TYPE]
+        missing = [i for i in range(10) if ("로테이션 본문 %d" % i) not in texts]
+        if missing:
+            fails.append("로테이션 소실: 메시지 %s 가 은닉됐다(tombstone seq 충돌)" % missing)
+        rseqs = [r.get("seq") for r in rrecs]
+        if rseqs != list(range(1, len(rseqs) + 1)):
+            fails.append("로테이션 관통 seq 연속 위반: %s" % rseqs[:20])
+
     finally:
         for k, v in env_bak.items():
             if v is None:
@@ -1963,10 +2669,10 @@ def _self_test(record_capability=None):
         for f in fails:
             sys.stderr.write("FAIL %s\n" % f)
         return 1
-    print("javis_radio self-test OK — 18 케이스(명명 대조·능력 게이트·리뷰어 거부·FACT 강등·"
+    print("javis_radio self-test OK — 19 케이스(명명 대조·능력 게이트·리뷰어 거부·FACT 강등·"
           "verified 저장·BLOCKER evidence/사유 하한·쿨다운 시계 미소모·차단기·seq 연속·"
-          "반줄 복구·wait 커서·ack/resolve·retract 폐쇄·close 시퀀스·exit 7/RETRACT 예외·"
-          "pause·전방호환) · lock=%s" % javis_lock.backend_name())
+          "반줄 복구·wait 커서·ack/resolve·retract 폐쇄·close 정상경로 시퀀스·exit 7/RETRACT "
+          "예외·pause·전방호환·로테이션 무손실) · lock=%s" % javis_lock.backend_name())
     return 0
 
 
@@ -1990,7 +2696,10 @@ def build_parser():
     p.add_argument("--ticket", required=True)
     p.add_argument("--participants", required=True, help="쉼표 구분 노드 목록")
     p.add_argument("--skip-capability-gate", action="store_true",
-                   help="능력 게이트 우회(원장에 기록됨 — 상시 사용 금지)")
+                   help="능력 게이트 우회(--skip-reason 필수 · .gate-bypass.jsonl 원장 기록 "
+                        "+ master 통지 — 상시 사용 금지)")
+    p.add_argument("--skip-reason", dest="skip_reason", default="",
+                   help="--skip-capability-gate 동반 필수 사유(최소 8자)")
 
     p = sub.add_parser("send", help="메시지 발신(진위·쿨다운·차단기 게이트)")
     common(p)
@@ -2039,7 +2748,48 @@ def build_parser():
     p.add_argument("--ticket", required=True)
     p.add_argument("--node", default="master")
     p.add_argument("--force", action="store_true",
-                   help="드레인·잔존0 게이트 미달을 감수하고 닫는다(원장에 기록)")
+                   help="드레인·잔존0 게이트 미달을 감수하고 닫는다(--force-reason 필수 · "
+                        ".gate-bypass.jsonl 원장 기록 + master 통지)")
+    p.add_argument("--force-reason", dest="force_reason", default="",
+                   help="--force 동반 필수 사유(최소 8자) — 우회의 비은닉화")
+
+    p = sub.add_parser("fence", help="리뷰 격리 설정(master · §6.1)")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--node", default="master", help="집행 주체(기록용)")
+    p.add_argument("--target", required=True, help="펜스 대상 노드")
+    p.add_argument("--seq", type=int, default=None,
+                   help="fence_seq(이 seq 초과분을 격리) · 기본=현재 최종 seq")
+    p.add_argument("--reason", default="")
+
+    p = sub.add_parser("unfence", help="verdict 후 펜스 해제 + 격리분 일괄 방류(§6.2)")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--node", default="master")
+    p.add_argument("--target", required=True, help="펜스 해제 대상 노드")
+
+    p = sub.add_parser("resume-release",
+                       help="pause 격리분 일괄 방류 + 방류 요약(batch) 생성(§9.2·§9.3)")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--node", default=None, help="미지정이면 전 참여자 + master")
+    p.add_argument("--force", action="store_true",
+                   help="pause 지속 중에도 방류(기본은 exit 4 거부 · fail-closed)")
+
+    p = sub.add_parser("confirm-release",
+                       help="master 확인 레코드 기록(AA25(a) — 구두 확인은 무효)")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--node", required=True, help="확인 대상 노드")
+    p.add_argument("--batch", default="", help="방류 요약 id(batch 단위 확인)")
+    p.add_argument("--seqs", default="", help="개별 확인 seq 목록(쉼표 구분 · B/U 용)")
+    p.add_argument("--by", default="master")
+    p.add_argument("--note", default="")
+
+    p = sub.add_parser("recover", help="clear/cycle 복원 — ack 기준 미수용 델타 회수(§10.3③)")
+    p.add_argument("--ticket", required=True)
+    p.add_argument("--node", required=True)
+    p.add_argument("--thread", default=None, choices=list(THREADS),
+                   help="미지정이면 2종 전수")
+
+    p = sub.add_parser("status", help="master 점검·복원 절차의 기계 판독 상태(JSON · §8.3)")
+    p.add_argument("--ticket", default=None, help="미지정이면 활성 티켓 전수")
 
     p = sub.add_parser("seal-gap", help="오염 구간 GAP 봉인(master 승인 필요 — §2.7(c))")
     common(p)
@@ -2067,7 +2817,9 @@ def main(argv=None):
             "open": cmd_open, "send": cmd_send, "wait": cmd_wait, "read": cmd_read,
             "ack": cmd_ack, "resolve": cmd_resolve, "retract": cmd_retract,
             "done-check": cmd_done_check, "close": cmd_close, "seal-gap": cmd_seal_gap,
-            "gc": cmd_gc,
+            "gc": cmd_gc, "fence": cmd_fence, "unfence": cmd_unfence,
+            "resume-release": cmd_resume_release, "confirm-release": cmd_confirm_release,
+            "recover": cmd_recover, "status": cmd_status,
         }[a.cmd](a)
     except RadioConflict as e:
         sys.stderr.write("충돌: %s\n" % e)
