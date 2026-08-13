@@ -29,12 +29,26 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{15,}"),
 ]
 
-_CTRL_ZW = re.compile("[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+# 비밀 토큰을 눈에 안 띄게 쪼개 패턴 매칭을 우회시키는 '비가시 분리문자'는 유니코드
+# 일반 카테고리로 포괄 제거한다 — Cc(제어)·Cf(포맷: zero-width/WORD JOINER/bidi
+# isolate U+2066‥2069/BOM 등)·Zl(U+2028 LINE SEPARATOR)·Zp(U+2029 PARAGRAPH
+# SEPARATOR). 하드코딩 범위 나열은 U+2028/2029·U+2066‥2069 를 빠뜨려 우회를 허용했다
+# (실측 재현). 단, \t \n \r 은 텍스트 구조라 보존한다(개행 파괴 금지).
+_KEEP_CTRL = frozenset("\t\n\r")
+_STRIP_CATS = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _strip_invisibles(text):
+    """제어·포맷·행/문단 분리문자 제거 — \\t \\n \\r 만 예외로 보존."""
+    return "".join(
+        c for c in text
+        if c in _KEEP_CTRL or unicodedata.category(c) not in _STRIP_CATS
+    )
 
 
 def _normalize(text):
-    """NFKC + 제어/zero-width 제거 (매칭 우회 차단 — voice_gate 원칙 7 승계)."""
-    return _CTRL_ZW.sub("", unicodedata.normalize("NFKC", text))
+    """NFKC + 비가시 분리문자 제거 (매칭 우회 차단 · \\t\\n\\r 보존 — voice_gate 원칙 7 승계)."""
+    return _strip_invisibles(unicodedata.normalize("NFKC", text))
 
 
 def scrub(text):
