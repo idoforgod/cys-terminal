@@ -100,8 +100,9 @@ W0-3 radio 편승(RADIO_SPEC_v4 AA38 §5.2(e)): 티켓에 radio 가 개통돼 �
 피어 BLOCKER·URGENT 의 미표면화·미resolve 잔존을 검사한다 — 게이트를 워커의 자발적 호출에
 맡기면 "안 부르면 안 걸리는" 게이트가 되어 묵살 금지의 기계 집행이 성립하지 않는다.
 밸브는 evidence 게이트 3종과 동일 문법 `CYS_TASK_RADIO_GATE=strict|warn|off`(기본 strict ·
-미지 값은 strict). 판정 노드는 `--radio-node` > task.owner 순으로 정한다(둘 다 없으면
-strict 에서 거부 — 측정 불능은 통과가 아니다). `--refs` 는 피어 radio 레코드 인용 기록
+미지 값은 strict). ★판정 노드는 **task.owner 로 고정**한다(A1-R3 · 종전 `--radio-node > owner`
+는 워커가 '깨끗한 노드'를 지정해 resolve 의무를 회피하는 우회로였다 — 이제 --radio-node 는
+무시된다). owner 부재면 거부 — 측정 불능은 통과가 아니다. `--refs` 는 피어 radio 레코드 인용 기록
 (AA33(b)① 킬 지표 계측 · §7.4(b) 철회 역추적의 입력)으로 task.refs 에 영속한다.
 """
 import argparse
@@ -1408,9 +1409,14 @@ def _radio_done_gate(task_id, task, radio_node, refs):
     meta_path = _radio_meta_path(task_id)
     if not os.path.isfile(meta_path):
         return None                     # radio 미개통 — 비대상(회귀 0)
-    node = (radio_node or task.get("owner") or "").strip()
+    # ★A1-R3(G2) — 판정 노드는 **task.owner 로 고정**한다(체크아웃한 산출자). 종전엔
+    #   `radio_node > owner` 라 워커가 `--radio-node <깨끗한 노드>` 로 done-check 를 돌려 자기
+    #   앞 BLOCKER/URGENT 의 resolve 의무를 회피할 수 있었다(묵살 금지 기계 집행 무력화).
+    #   --radio-node 는 더 이상 판정 노드를 임의 지정하지 못한다(무시).
+    _ = radio_node
+    node = (task.get("owner") or "").strip()
     if not node:
-        msg = ("radio done-check: 판정 노드 미상(--radio-node 또는 task.owner 필요) — "
+        msg = ("radio done-check: 판정 노드 미상(task.owner 필요 — 판정 노드는 owner 로 고정) — "
                "측정 불능은 통과가 아니다")
         if mode == "strict":
             print(msg + " (밸브: CYS_TASK_RADIO_GATE=warn|off)", file=sys.stderr)
@@ -2890,8 +2896,8 @@ def main(argv=None):
                         "task.refs 에 영속. 킬 지표 계수와 철회 역추적(§7.4(b))의 입력이며 "
                         "radio done 게이트의 인용 검사에도 그대로 전달된다")
     c.add_argument("--radio-node", dest="radio_node", default=None,
-                   help="radio done 게이트의 판정 노드(미지정 시 task.owner) — "
-                        "밸브 CYS_TASK_RADIO_GATE=strict|warn|off(기본 strict)")
+                   help="(폐기·무시 · A1-R3) radio done 게이트 판정 노드는 task.owner 로 "
+                        "고정된다 — 밸브 CYS_TASK_RADIO_GATE=strict|warn|off(기본 strict)")
     c.set_defaults(fn=cmd_set_status)
 
     c = sub.add_parser("set-verify-spec",

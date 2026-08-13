@@ -72,8 +72,10 @@ class Lane(object):
         return rc, buf.getvalue()
 
     def open(self, ticket="T1", participants="w1,w2"):
+        # A1-R7 — 무결성 서명 영수증. 종전엔 raw {"ok":True} 를 썼으나 능력 게이트가 서명을
+        #   검증하게 강화됐으므로 정식 발급 경로(write_capability_receipt)로 발급한다.
         for n in participants.split(","):
-            R.javis_lock.atomic_write_json(R.capability_receipt(n.strip()), {"ok": True})
+            R.write_capability_receipt(n.strip())
         return self.run(["open", "--ticket", ticket, "--participants", participants])
 
     def probe_file(self, body="첫줄\n표식-ALPHA\n"):
@@ -130,12 +132,16 @@ def t_open_capability_gate():
     with Lane() as L:
         rc, _ = L.run(["open", "--ticket", "T1", "--participants", "w1"])
         check("open: 능력 영수증 부재 exit 3(fail-closed)", rc == R.EXIT_CAPABILITY, rc)
-        R.javis_lock.atomic_write_json(R.capability_receipt("w1"), {"ok": False})
+        R.write_capability_receipt("w1", ok=False)
         rc, _ = L.run(["open", "--ticket", "T1", "--participants", "w1"])
         check("open: 실패 영수증도 거부", rc == R.EXIT_CAPABILITY, rc)
+        # ★A1-R7 — 서명 없는 위조 {"ok":true} 는 통과하지 못한다(무결성 검증 강화)
         R.javis_lock.atomic_write_json(R.capability_receipt("w1"), {"ok": True})
+        rc, _ = L.run(["open", "--ticket", "T1", "--participants", "w1"])
+        check("★A1-R7: 서명 없는 위조 영수증 거부", rc == R.EXIT_CAPABILITY, rc)
+        R.write_capability_receipt("w1")
         rc, out = L.run(["open", "--ticket", "T1", "--participants", "w1"])
-        check("open: 통과 영수증이면 개통", rc == R.EXIT_OK, rc)
+        check("open: 무결성 서명 통과 영수증이면 개통", rc == R.EXIT_OK, rc)
         check("스레드 2종 = worklog·results(§2.5 명명 정합)",
               json.loads(out)["threads"] == ["worklog", "results"], out)
 
@@ -263,8 +269,9 @@ def t_urgent_cooldown_independent():
 
 def t_breaker_global():
     with Lane() as L:
-        L.open()
-        L.run(["open", "--ticket", "T2", "--participants", "w1,w2"])
+        # burst 는 발신자이므로 참여자로 등록한다(신원 게이트 A1-R3 강화 — 비참여자 send 거부).
+        L.open("T1", "w1,w2,burst")
+        L.open("T2", "w1,w2,burst")
         rcs = [L.send(node="burst", grade="FYI", text="x")[0] for _ in range(R.BREAKER_MAX)]
         check("차단기: 상한까지는 통과", all(r == R.EXIT_OK for r in rcs), rcs)
         rc, _ = L.send(node="burst", grade="FYI", text="x")
@@ -337,7 +344,7 @@ def t_rotation_no_message_loss():
     이 케이스는 '가시 레코드의 seq 연속'만 보지 않는다 — 그 검사는 소실을 통과시킨다.
     보내진 **본문 전수가 판독에 살아있는지**를 직접 단언한다."""
     with Lane() as L:
-        L.open()
+        L.open("T1", "w1,w2,rotw")     # rotw = 발신자(참여자 등록 · A1-R3)
         bak = R.ROTATE_BYTES
         R.ROTATE_BYTES = 400          # 로테이션을 결정론으로 유발(매 건 로테이션)
         try:
@@ -382,7 +389,7 @@ def t_rotation_no_message_loss():
 def t_rotation_delta_surfaces_all():
     """로테이션이 표면화 경로에서도 무손실인가 — 델타에 전 메시지가 실린다(소실 재현 시나리오)."""
     with Lane() as L:
-        L.open()
+        L.open("T1", "w1,w2,rotw")     # rotw = 발신자(참여자 등록 · A1-R3)
         bak = R.ROTATE_BYTES
         R.ROTATE_BYTES = 400
         try:
@@ -596,13 +603,19 @@ def t_pause_hold_and_resume_release():
         rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2"])
         check("A25(c): 확인 레코드 부재 시 done 거부", rc == R.EXIT_NO_EVIDENCE, out)
         check("A25(c): 거부 사유에 '워커 귀책 아님' 기계 명시", "워커 귀책 아님" in out, out)
+        # ★A4-R04 — URGENT(B/U)는 --batch 만으로는 부족하고 --seqs 개별 확인이 필요하다.
         rc, _ = L.run(["confirm-release", "--ticket", "T1", "--node", "w2",
-                       "--batch", batches[0]["batch"], "--note", "확인함"])
+                       "--batch", batches[0]["batch"], "--note", "batch만"])
+        rc_bu, out_bu = L.run(["done-check", "--ticket", "T1", "--node", "w2"])
+        check("★A4-R04: B/U 는 batch 확인만으로 done 통과 못 함",
+              rc_bu == R.EXIT_NO_EVIDENCE, out_bu)
+        rc, _ = L.run(["confirm-release", "--ticket", "T1", "--node", "w2",
+                       "--batch", batches[0]["batch"], "--seqs", "1", "--note", "개별 확인"])
         check("AA25(a): 확인 레코드 기록 명령 존재", rc == R.EXIT_OK, rc)
         check("AA25(a): 확인은 기계 판독 레코드로 성립",
               os.path.exists(R.confirm_path("T1", "w2")))
         rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2"])
-        check("A25(c): 확인 후 done 통과", rc == R.EXIT_OK, out)
+        check("A25(c)+A4-R04: B/U 개별 seq 확인 후 done 통과", rc == R.EXIT_OK, out)
 
 
 def t_recover_cycle_redelivery():
@@ -696,7 +709,8 @@ def t_cap_truncation_indicator():
 
 def t_read_pagination_and_limit_cap():
     with Lane() as L:
-        L.open()
+        # p0..p4 = 발신자(참여자 등록). 5개 발신자로 분산해 차단기(12/분·발신자 전역)를 피한다.
+        L.open("T1", "w1,w2,p0,p1,p2,p3,p4")
         for i in range(50):
             L.send(node="p%d" % (i // 10), text="m%d" % i)
         rc, out = L.run(["read", "--ticket", "T1", "--limit", "10"])
@@ -931,19 +945,28 @@ def t_close_sequence_gates():
         L.send(node="w1", text="미드레인 건")
         rc, out = L.run(["close", "--ticket", "T1", "--node", "master"])
         check("close (iv): 드레인 미달이면 거부", rc == R.EXIT_NO_EVIDENCE and "CLOSE-BLOCK" in out, out)
-        # 격리 잔존이 있으면 (i) 방류 후에도 (iv) 드레인이 막는다 — 표면화 강제가 해소 경로
+        # ★A4-R01 — 게이트 판정을 상태 변형 **전에** 한다. 펜스 격리 잔존은 (v) 잔존0 게이트를
+        #   막고, 거부 시 close 는 펜스·격리를 **건드리지 않는다**(종전엔 게이트 거부에도
+        #   격리를 released:true 로 비가역 방류해 §6 리뷰 격리가 붕괴했다).
         L.run(["fence", "--ticket", "T1", "--target", "w2", "--seq", "0"])
         L.drain()
         rc, out = L.run(["close", "--ticket", "T1", "--node", "master"])
-        check("close (i): 격리 잔존분 방류 수행(게이트 판정과 무관)",
-              R.quarantined_seqs("T1", "w2").get(1, {}).get("released") is True,
-              R.quarantined_seqs("T1", "w2"))
-        check("close (iv): 방류해도 미표면화면 드레인이 막는다(표면화 강제가 해소 경로)",
+        check("★A4-R01: 격리 미방류면 close 거부(exit 5)",
               rc == R.EXIT_NO_EVIDENCE and "CLOSE-BLOCK" in out, out)
+        check("★A4-R01: 거부 시 격리 미방류(released 아님 — 펜스 보존)",
+              R.quarantined_seqs("T1", "w2").get(1, {}).get("released") is not True,
+              R.quarantined_seqs("T1", "w2"))
+        check("★A4-R01: 거부 시 META 펜스 무손상",
+              (R.read_meta("T1").get("fences") or {}).get("w2") is not None,
+              R.read_meta("T1").get("fences"))
+        # verdict 도착 → unfence 로 방류·표면화 → close 통과(정상 해소 경로)
         L.run(["unfence", "--ticket", "T1", "--target", "w2"])
         L.drain()
         rc, out = L.run(["close", "--ticket", "T1", "--node", "master"])
         check("close: 드레인·잔존0 통과 시 정상 종결", rc == R.EXIT_OK, out)
+        check("close: 통과 시 격리 방류 수행",
+              R.quarantined_seqs("T1", "w2").get(1, {}).get("released") is True,
+              R.quarantined_seqs("T1", "w2"))
         meta = R.read_meta("T1")
         check("close: META closed=true", meta.get("closed") is True, meta)
         check("close: 펜스 강제 해제", meta.get("fences") == {}, meta.get("fences"))
@@ -1113,23 +1136,34 @@ def t_task_done_radio_hook():
         art = os.path.join(L.tmp, "art.txt")
         with open(art, "w", encoding="utf-8") as f:
             f.write("검증 산출물\n")
+        # ★A1-R3(G2) — 판정 노드는 task.owner 로 **고정**된다(--radio-node 무시). 성공 done 은
+        #   owner 를 소거하므로 게이트를 걸려면 매번 재체크아웃해 owner 를 세운다.
         done = ["set-status", "T1", "done", "--evidence", "테스트 31/31 PASS",
-                "--settled-override", "테스트", "--skip-reason", "radio 훅 시험",
-                "--radio-node", "w2"]
-        # radio 미개통 티켓 = 비대상(회귀 0)
+                "--settled-override", "테스트", "--skip-reason", "radio 훅 시험"]
+        # radio 미개통 티켓 = 비대상(회귀 0 · done 성공 → owner 소거)
         rc, out = task_run(done)
         check("훅: radio 미개통 티켓에는 무간섭", rc == 0, out)
-        # 재개통 후 미표면화 URGENT 잔존 → strict 는 거부
+        # 재개통 후 미표면화 URGENT 잔존 → strict 는 거부(판정 노드=owner)
         task_run(["set-status", "T1", "in_progress"])
+        task_run(["checkout", "T1", "--owner", "w2"])
         L.open("T1", "w1,w2")
         L.send(node="w1", grade="URGENT", text="반영 필요", to="w2")
         rc, out = task_run(done)
         check("★훅(strict): radio done-check 비0이면 done 거부", rc == 5, out)
-        # 판정 노드 미상(--radio-node·owner 둘 다 부재) = 측정 불능 → strict 는 통과가 아니다
-        rc, out2 = task_run([x for x in done if x not in ("--radio-node", "w2")])
-        check("훅(strict): 판정 노드 미상은 거부(측정 불능≠통과)",
-              rc == 5 and "판정 노드 미상" in out2, out2[-300:])
         check("훅: 거부 출력에 강제 표면화 지시", "강제 표면화" in out, out[-500:])
+        # ★A1-R3(G2) — --radio-node 로 '깨끗한 노드'를 지정해도 판정 노드는 owner 로 고정된다.
+        #   (owner=w2 는 의무 잔존 · w1 은 의무 없음이지만 무시되어 여전히 거부)
+        rc, out3 = task_run(done + ["--radio-node", "w1"])
+        check("★A1-R3: --radio-node 로 판정 노드 회피 불가(owner 고정)",
+              rc == 5 and "강제 표면화" in out3, out3[-300:])
+        # 판정 노드(owner) 부재 = 측정 불능 → strict 는 통과가 아니다. owner 없는(체크아웃
+        #   이력 없는) radio 티켓으로 재현한다(release 후 owner 소거 타이밍에 의존하지 않는다).
+        task_run(["create", "노드 미상 시험", "--id", "T2"])
+        L.open("T2", "w1,w2")
+        rc, out2 = task_run(["set-status", "T2", "done", "--evidence", "e 31/31",
+                             "--settled-override", "x", "--skip-reason", "미상 시험"])
+        check("훅(strict): 판정 노드(owner) 미상은 거부(측정 불능≠통과)",
+              rc == 5 and "판정 노드 미상" in out2, out2[-300:])
         rc, out = task_run(done, env_extra={"CYS_TASK_RADIO_GATE": "warn"})
         check("훅(warn): 통과 + 경고", rc == 0 and "radio warn" in out, out[-300:])
         task_run(["set-status", "T1", "in_progress"])
@@ -1143,6 +1177,415 @@ def t_task_done_radio_hook():
         check("훅: --refs 가 task.refs 로 영속(킬 지표·역추적 입력)",
               tj.get("refs") == ["T1:%s:1" % TH], tj.get("refs"))
         _ = radio, art
+
+
+# ════════════════════════ R2 적대적 검증 확정 결함 회귀 잠금 ════════════════════════
+# 각 케이스는 '위반이 막히는 방향'으로 단언한다(공격 재현 → 차단 실증).
+
+def t_atk_empty_snippet_fact_demoted():   # A1-R1 · A3-R03
+    with Lane() as L:
+        L.open()
+        p = L.probe_file()
+        rc, _ = L.send(node="w1", epistemic="FACT", text="빈 스니펫 허위",
+                       evidence="%s:2:" % p)   # 스니펫 없음
+        r = L.recs()[-1]
+        check("★A1-R1: 빈 스니펫 FACT 는 verified=false", r.get("verified") is not True, r)
+        check("A1-R1: 빈 스니펫 FACT 는 HYPOTHESIS 강등", r.get("epistemic") == "HYPOTHESIS", r)
+        rc, _ = L.send(node="w2", grade="BLOCKER", epistemic="FACT", text="빈 스니펫 블로커",
+                       reason="근거 없는 최고 등급 시도", evidence="%s:2:" % p)
+        r2 = L.recs()[-1]
+        check("★A1-R1: 빈 스니펫 BLOCKER→URGENT 강등(stdin 특권 박탈)",
+              r2.get("grade") == "URGENT", r2)
+        vok, _w, _e = R.verify_evidence([{"file": p, "line": 2, "snippet": "짧"}])
+        check("A1-R1: 6자 미만 스니펫도 검증 실패(자명 통과 봉쇄)", not vok)
+
+
+def t_atk_self_forged_pair_same_source():   # A1-R2
+    with Lane() as L:
+        L.open()
+        p = L.probe_file("표식-ALPHA\n표식-BETA-LINE\n")
+        L.send(node="w1", epistemic="HYPOTHESIS", confidence="low", text="가설",
+               evidence="%s:1:표식-ALPHA" % p)
+        h = L.recs()[-1]["msg_id"]
+        L.send(node="w2", epistemic="FACT", text="자작 재유도(동일 출처)", refs=h,
+               evidence="%s:1:표식-ALPHA" % p)
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2", "--refs", h])
+        check("★A1-R2: 원 가설과 동일 출처 짝 증거는 자작 재유도로 거부",
+              rc == R.EXIT_NO_EVIDENCE, out)
+        L.send(node="w2", epistemic="FACT", text="독립 재유도(다른 출처)", refs=h,
+               evidence="%s:2:표식-BETA-LINE" % p)
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2", "--refs", h])
+        check("A1-R2: 다른 출처의 독립 재유도는 통과", rc == R.EXIT_OK, out)
+
+
+def t_atk_node_rotation_blocked():   # A1-R3
+    with Lane() as L:
+        L.open("T1", "w1,w2")
+        rc, _ = L.send(node="spoofA", grade="BLOCKER", epistemic="FACT",
+                       text="위장", reason="위장 발신 시도임", evidence="x:1:zzzzzz")
+        check("★A1-R3: 비참여자 --node send 거부", rc == R.EXIT_USAGE, rc)
+        rc, _ = L.send(node="spoofB", grade="BLOCKER", epistemic="FACT",
+                       text="위장2", reason="회전 발신 시도임", evidence="x:1:zzzzzz")
+        check("A1-R3: --node 회전(spoofB)도 거부(쿨다운·차단기 우회 봉쇄)", rc == R.EXIT_USAGE, rc)
+        rc, _ = L.send(node="w1", text="정상 참여자")
+        check("A1-R3: 참여자 send 는 정상", rc == R.EXIT_OK, rc)
+
+
+def t_atk_reviewer_send_wait_blocked():   # A1-R4
+    with Lane() as L:
+        L.open("T1", "w1,w2")
+        rc, _ = L.send(node="reviewer-gemini", text="리뷰어 라이브 개입")
+        check("★A1-R4: 리뷰어 send 거부(exit 6)", rc == R.EXIT_REVIEWER, rc)
+        rc, _ = L.run(["wait", "--ticket", "T1", "--node", "reviewer-gemini",
+                       "--once", "--interval", "0"])
+        check("★A1-R4: 리뷰어 wait 거부(exit 6)", rc == R.EXIT_REVIEWER, rc)
+        rc, _ = L.send(node="gemini", text="어댑터 키 별칭 우회")
+        check("A1-R4: 어댑터 키 gemini send 거부", rc == R.EXIT_REVIEWER, rc)
+        rc, _ = L.run(["open", "--ticket", "T2", "--participants", "codex,w1"])
+        check("A1-R4: 어댑터 키 codex open 등록 거부(exit 6)", rc == R.EXIT_REVIEWER, rc)
+
+
+def t_atk_retract_seq_form_normalized():   # A1-R5
+    with Lane() as L:
+        L.open()
+        p = L.probe_file()
+        L.send(node="w1", epistemic="FACT", text="근거", evidence="%s:2:표식-ALPHA" % p)
+        m = L.recs()[-1]["msg_id"]
+        seq = L.recs()[-1]["seq"]
+        rc, _ = L.run(["retract", "--ticket", "T1", "--node", "w1", str(seq), "--reason", "오류"])
+        check("A1-R5: seq 형태 retract 수용", rc == R.EXIT_OK, rc)
+        check("★A1-R5: 철회 집합에 정규 msg_id 로 등재(형식 불일치 해소)",
+              m in R.retracted_ids(L.recs()), R.retracted_ids(L.recs()))
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2", "--refs", m])
+        check("★A1-R5: seq 형태 철회도 done 게이트가 검출해 거부", rc == R.EXIT_NO_EVIDENCE, out)
+
+
+def t_atk_capability_forgery_rejected():   # A1-R7
+    with Lane() as L:
+        R.javis_lock.atomic_write_json(R.capability_receipt("forge"), {"ok": True})
+        rc, _ = L.run(["open", "--ticket", "T1", "--participants", "forge"])
+        check("★A1-R7: 서명 없는 위조 {\"ok\":true} 영수증 거부(exit 3)",
+              rc == R.EXIT_CAPABILITY, rc)
+        R.write_capability_receipt("forge")
+        rc, _ = L.run(["open", "--ticket", "T1", "--participants", "forge"])
+        check("A1-R7: 정식 서명 영수증이면 개통", rc == R.EXIT_OK, rc)
+
+
+def t_atk_done_gate_results_thread():   # A2-CONC-01
+    with Lane() as L:
+        L.open()
+        L.send(node="w2", grade="URGENT", text="results STOP", to="w1", thread="results")
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w1"])   # 훅 동형(--thread 미지정)
+        check("★A2-CONC-01: results 스레드 미표면화 URGENT 도 done 거부", rc == R.EXIT_NO_EVIDENCE, out)
+        check("A2-CONC-01: 거부 사유에 [results] 스레드 명시", "results" in out, out)
+
+
+def t_atk_dual_thread_no_cursor_suppression():   # A2-CONC-02
+    with Lane() as L:
+        L.open()
+        for i in range(5):
+            L.send(node="w2", text="wl%d" % i)
+        L.send(node="w2", text="results 건", to="w1", thread="results")
+        L.run(["wait", "--ticket", "T1", "--node", "w1", "--once", "--interval", "0"])
+        check("A2-CONC-02: worklog 커서 전진",
+              R._read_cursor(R.cursor_path("T1", "w1", "worklog")) == 5)
+        check("A2-CONC-02: watcher 락 스코프는 노드×스레드(동시 감시 가능)",
+              R.watcher_lock_path("T1", "w1", "worklog")
+              != R.watcher_lock_path("T1", "w1", "results"))
+        rc, out = L.run(["wait", "--ticket", "T1", "--node", "w1", "--once",
+                         "--interval", "0", "--thread", "results"])
+        check("★A2-CONC-02: results 메시지가 worklog 커서에 억제되지 않고 표면화",
+              "results 건" in out, out)
+        check("A2-CONC-02: results 커서 별도 전진",
+              R._read_cursor(R.cursor_path("T1", "w1", "results")) == 1)
+
+
+def t_atk_ack_monotonic_guard():   # A2-CONC-03
+    with Lane() as L:
+        L.open()
+        L.run(["ack", "--ticket", "T1", "--node", "w1", "10"])
+        check("ack: 10 기록", R._read_cursor(R.ack_path("T1", "w1")) == 10)
+        L.run(["ack", "--ticket", "T1", "--node", "w1", "3"])
+        check("★A2-CONC-03: 역순 ack 는 커서를 후퇴시키지 않는다(단조)",
+              R._read_cursor(R.ack_path("T1", "w1")) == 10,
+              R._read_cursor(R.ack_path("T1", "w1")))
+
+
+def t_atk_confirm_release_concurrent():   # A2-CONC-04
+    if not hasattr(os, "fork"):
+        check("A2-CONC-04: fork 미지원 — 스킵(락으로 구조 보증)", True)
+        return
+    with Lane() as L:
+        L.open()
+        N = 8
+        pids = []
+        for i in range(N):
+            pid = os.fork()
+            if pid == 0:
+                with open(os.devnull, "w") as dn:
+                    with contextlib.redirect_stdout(dn), contextlib.redirect_stderr(dn):
+                        try:
+                            R.main(["confirm-release", "--ticket", "T1", "--node", "w1",
+                                    "--seqs", str(i + 1), "--note", "동시 확인 %d" % i])
+                        except Exception:
+                            pass
+                os._exit(0)
+            pids.append(pid)
+        for pid in pids:
+            os.waitpid(pid, 0)
+        confs = R.read_confirms("T1", "w1")
+        check("★A2-CONC-04: 동시 confirm-release 8건 전부 영속(lost-update 0)",
+              len(confs) == N, len(confs))
+
+
+def t_atk_cooldown_toctou_atomic():   # A2-CONC-05
+    if not hasattr(os, "fork"):
+        check("A2-CONC-05: fork 미지원 — 스킵(락으로 구조 보증)", True)
+        return
+    with Lane() as L:
+        L.open()
+        pids = []
+        for i in range(6):     # 동일 참여자 w1 이 URGENT 를 동시 6건 발신
+            pid = os.fork()
+            if pid == 0:
+                rc = 99
+                with open(os.devnull, "w") as dn:
+                    with contextlib.redirect_stdout(dn), contextlib.redirect_stderr(dn):
+                        try:
+                            rc = R.main(["send", "--ticket", "T1", "--node", "w1",
+                                         "--grade", "URGENT", "--epistemic", "HYPOTHESIS",
+                                         "--confidence", "low", "--text", "동시 %d" % i])
+                        except Exception:
+                            rc = 98
+                os._exit(0 if rc == R.EXIT_OK else 1)
+            pids.append(pid)
+        oks = 0
+        for pid in pids:
+            _p, st = os.waitpid(pid, 0)
+            if os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0:
+                oks += 1
+        urg = [r for r in L.recs() if r.get("grade") == "URGENT"]
+        check("★A2-CONC-05: 동시 URGENT 6건 중 쿨다운 통과 정확히 1건(check→consume 원자화)",
+              oks == 1 and len(urg) == 1, (oks, len(urg)))
+
+
+def t_atk_seal_gap_range_cap():   # A3-R02
+    with Lane() as L:
+        L.open()
+        for i in range(3):
+            L.send(text="m%d" % i)
+        rc, _ = L.run(["seal-gap", "--ticket", "T1", "--node", "master",
+                       "--from", "1", "--to", str(10 ** 12), "--reason", "거대", "--confirm"])
+        check("★A3-R02: 거대 GAP 범위 봉인 거부(상한)", rc == R.EXIT_USAGE, rc)
+        rc, _ = L.run(["seal-gap", "--ticket", "T1", "--node", "master",
+                       "--from", "1", "--to", "999", "--reason", "초과", "--confirm"])
+        check("A3-R02: final_seq 초과 봉인 거부", rc == R.EXIT_USAGE, rc)
+        # 파일에 거대 GAP 레코드가 있어도 sealed_seqs 는 materialize 하지 않는다(hang/OOM 방지)
+        R._jsonl_append(R.thread_path("T1", TH),
+                        {"type": "GAP", "gap_from": 5, "gap_to": 10 ** 9, "seq": 99,
+                         "schema_version": 1})
+        recs, _ = R.read_thread("T1", TH)
+        sealed = R.sealed_seqs(recs)
+        check("★A3-R02: sealed_seqs 는 구간 멤버십(거대 범위 무-materialize)",
+              (7 in sealed) and (10 ** 9 in sealed) and (3 not in sealed))
+
+
+def t_atk_ticket_path_traversal_blocked():   # A3-R04
+    with Lane() as L:
+        for n in ("w1", "w2"):
+            R.write_capability_receipt(n)
+        rc, _ = L.run(["open", "--ticket", "../../ESCAPED_RADIO", "--participants", "w1,w2"])
+        check("★A3-R04: ../ ticket 개통 거부", rc == R.EXIT_USAGE, rc)
+        rc, _ = L.run(["open", "--ticket", "a/b/c", "--participants", "w1,w2"])
+        check("A3-R04: 경로 구분자 포함 ticket 거부", rc == R.EXIT_USAGE, rc)
+        check("A3-R04: radio 밖 ESCAPED 디렉터리 미생성",
+              not os.path.exists(os.path.join(L.tmp, "ESCAPED_RADIO")))
+
+
+def t_atk_evidence_outside_root_rejected():   # A3-R05
+    with Lane() as L:
+        L.open()
+        outside = os.path.join(tempfile.gettempdir(), "radio_outside_ev.txt")
+        with open(outside, "w", encoding="utf-8") as f:
+            f.write("첫줄\n표식-OUTSIDE-LINE\n")
+        try:
+            rc, _ = L.send(node="w1", epistemic="FACT", text="외부 파일 인용",
+                           evidence="%s:2:표식-OUTSIDE-LINE" % outside)
+            r = L.recs()[-1]
+            check("★A3-R05: 워크스페이스 밖 evidence 는 verified=false(강등)",
+                  r.get("verified") is not True and r.get("epistemic") == "HYPOTHESIS", r)
+            vok, why, _e = R.verify_evidence(
+                [{"file": outside, "line": 2, "snippet": "표식-OUTSIDE-LINE"}])
+            check("A3-R05: verify_evidence 가 ROOT 밖 파일 거부", not vok and "밖" in why, why)
+        finally:
+            os.unlink(outside)
+
+
+def t_atk_bom_and_control_first_record():   # A3-R06
+    with Lane() as L:
+        L.open()
+        p = R.thread_path("T1", TH)
+        rec1 = json.dumps({"seq": 1, "type": "MSG", "text": "BOM 앞", "msg_id": "T1:%s:1" % TH})
+        rec2 = json.dumps({"seq": 2, "type": "MSG", "text": "널포함", "msg_id": "T1:%s:2" % TH})
+        rec2 = rec2.replace("널포함", "널\x00포함")     # 값 내부에 raw 널바이트
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\ufeff" + rec1 + "\n" + rec2 + "\n")
+        recs, _diag = R.read_thread("T1", TH)
+        seqs = {r.get("seq") for r in recs}
+        check("★A3-R06: 선두 BOM 레코드(seq1) 회생(첫 레코드 유실 방지)", 1 in seqs, seqs)
+        check("★A3-R06: 널바이트 포함 정상 레코드(seq2) 회생", 2 in seqs, seqs)
+
+
+def t_atk_jsonl_trailing_semantics():   # A3-R07 · A5-R04
+    with Lane() as L:
+        L.open()
+        p = R.thread_path("T1", TH)
+        a = json.dumps({"seq": 1, "type": "MSG", "text": "a", "msg_id": "T1:%s:1" % TH})
+        b = json.dumps({"seq": 2, "type": "MSG", "text": "b", "msg_id": "T1:%s:2" % TH})
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(a + "\n" + b + "\n")
+        check("§2.7: 개행 종료 파일은 전 레코드 판독",
+              {1, 2} <= {r["seq"] for r in R.read_thread("T1", TH)[0]})
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(a + "\n" + b)          # b 는 개행 없음 = 기록 진행 중
+        check("★A3-R07: 개행 없는 말미 라인은 무시(기록 진행 중 · 죽은 삼항 제거 의도 고정)",
+              {r["seq"] for r in R.read_thread("T1", TH)[0]} == {1},
+              {r["seq"] for r in R.read_thread("T1", TH)[0]})
+
+
+def t_atk_pause_gates_state_ops():   # A4-R02
+    with Lane() as L:
+        L.open()
+        L.send(node="w1", text="본문")
+        L.pause_on()
+        rc, _ = L.run(["close", "--ticket", "T1", "--node", "master"])
+        check("★A4-R02: pause 중 close 금지(exit 4)", rc == R.EXIT_PAUSED, rc)
+        rc, _ = L.run(["fence", "--ticket", "T1", "--target", "w2"])
+        check("★A4-R02: pause 중 fence 금지(exit 4)", rc == R.EXIT_PAUSED, rc)
+        rc, _ = L.run(["unfence", "--ticket", "T1", "--target", "w2"])
+        check("★A4-R02: pause 중 unfence 금지(exit 4)", rc == R.EXIT_PAUSED, rc)
+        check("A4-R02: pause 중 거부된 close 는 META closed 무변경(타 노드 watcher 무영향)",
+              R.read_meta("T1").get("closed") is not True)
+        L.pause_off()
+        L.drain()
+        rc, _ = L.run(["close", "--ticket", "T1", "--node", "master"])
+        check("A4-R02: resume 후 close 정상", rc == R.EXIT_OK, rc)
+
+
+def t_atk_evidence_parser_colon_snippet():   # A4-R03
+    out, _errs = R.parse_evidence(["a.py:5:x:10:y"])
+    check("★A4-R03: 왼쪽부터 파일·라인 분리(스니펫 내 :숫자: 오파싱 방지)",
+          out and out[0]["file"] == "a.py" and out[0]["line"] == 5
+          and out[0]["snippet"] == "x:10:y", out)
+    out2, _ = R.parse_evidence([r"C:\x.py:12:snip:val"])
+    check("A4-R03: Windows 드라이브 경로도 정상 파싱",
+          out2 and out2[0]["file"] == r"C:\x.py" and out2[0]["line"] == 12
+          and out2[0]["snippet"] == "snip:val", out2)
+
+
+def t_atk_confirm_batch_insufficient_for_bu():   # A4-R04
+    with Lane() as L:
+        L.open()
+        L.send(node="w1", grade="URGENT", text="pause 중 BU", to="w2")
+        L.pause_on()
+        L.run(["wait", "--ticket", "T1", "--node", "w2", "--once", "--interval", "0"])
+        L.pause_off()
+        L.run(["resume-release", "--ticket", "T1", "--node", "w2"])
+        b = R.open_batches("T1", "w2")[0]["batch"]
+        L.run(["wait", "--ticket", "T1", "--node", "w2", "--once", "--interval", "0"])
+        L.run(["ack", "--ticket", "T1", "--node", "w2", "1"])
+        L.run(["resolve", "--ticket", "T1", "--node", "w2", "1",
+               "--action", "reflected", "--note", "반영 완료 — 근거 첨부함"])
+        L.run(["confirm-release", "--ticket", "T1", "--node", "w2", "--batch", b])
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2"])
+        check("★A4-R04: B/U 는 batch 확인만으로 done 통과 못 함", rc == R.EXIT_NO_EVIDENCE, out)
+        L.run(["confirm-release", "--ticket", "T1", "--node", "w2", "--batch", b, "--seqs", "1"])
+        rc, out = L.run(["done-check", "--ticket", "T1", "--node", "w2"])
+        check("A4-R04: B/U 개별 seq 확인 후 done 통과", rc == R.EXIT_OK, out)
+
+
+def t_atk_single_oversize_record_capped():   # A5-R01 · A5-R06
+    with Lane() as L:
+        L.open()
+        p = L.probe_file()
+        big = "가" * 200000                # ≈600KB
+        L.send(node="w1", grade="NORMAL", epistemic="FACT", to="w2",
+               evidence="%s:2:표식-ALPHA" % p, text=big)
+        recs, _ = R.read_thread("T1", TH)
+        payload, _disp, _settled, _hidden = R.build_delta("T1", "w2", TH, 0, recs,
+                                                          R.read_meta("T1"))
+        check("★A5-R01: 단일 초대형 레코드 payload 는 캡 이내로 제한",
+              len(payload.encode("utf-8")) < 3 * R.SURFACE_CAP_BYTES,
+              len(payload.encode("utf-8")))
+        check("A5-R01: 초대형 절단 지시자 표기", "초대형" in payload and "read --from" in payload)
+        check("A5-R01: 600KB 본문이 전량 표면화되지 않음", payload.count("가") < 20000)
+
+
+def t_atk_rotation_notify_dedup():   # A5-R02
+    with Lane() as L:
+        L.open("T1", "w1,w2,rotw")
+        bak = R.ROTATE_BYTES
+        R.ROTATE_BYTES = 300
+        try:
+            for i in range(6):
+                L.send(node="rotw", text="rot %d" % i)
+        finally:
+            R.ROTATE_BYTES = bak
+        arch = [q for q in R.segment_paths("T1", TH) if os.path.basename(q) != "%s.jsonl" % TH]
+        if arch:
+            with open(arch[0], "a", encoding="utf-8") as f:
+                f.write(json.dumps({"seq": 999, "type": "MSG", "text": "표류"}) + "\n")
+        check("전제: verify_rotation 불일치 지속", R.verify_rotation("T1", TH) != [])
+        before = len(R._jsonl_read(R._tp("T1", ".notify-fallback.jsonl"))[0])
+        for _ in range(4):
+            L.run(["wait", "--ticket", "T1", "--node", "w2", "--once", "--interval", "0"])
+        after = len(R._jsonl_read(R._tp("T1", ".notify-fallback.jsonl"))[0])
+        check("★A5-R02: 동일 로테이션 불일치는 dedup(폴마다 긴급 통지 폭주 안 함)",
+              after - before <= 1, (before, after))
+
+
+def t_atk_watcher_poll_skips_unchanged():   # A5-R03
+    with Lane() as L:
+        L.open()
+        L.send(node="w1", text="본문")
+        calls = {"n": 0}
+        bak = R.verify_rotation
+
+        def counting(ticket, thread):
+            calls["n"] += 1
+            return bak(ticket, thread)
+
+        R.verify_rotation = counting
+        try:
+            L.run(["wait", "--ticket", "T1", "--node", "w2",
+                   "--max-polls", "3", "--interval", "0"])
+        finally:
+            R.verify_rotation = bak
+        check("★A5-R03: 무변경 폴은 verify_rotation(재-SHA) 재실행 안 함(≤1)",
+              calls["n"] <= 1, calls["n"])
+
+
+def t_atk_second_scrub_failclosed_no_advance():   # A5-R05
+    with Lane() as L:
+        L.open()
+        L.send(node="w1", grade="URGENT", text="긴급 반영", to="w2")
+        bak = R.javis_scrub.scrub
+
+        def boom(x):
+            raise RuntimeError("scrub 불능 재현")
+
+        R.javis_scrub.scrub = boom
+        try:
+            rc, out = L.run(["wait", "--ticket", "T1", "--node", "w2",
+                             "--once", "--interval", "0"])
+        finally:
+            R.javis_scrub.scrub = bak
+        check("★A5-R05: scrub fail-closed 시 플레이스홀더 출력(내용 미노출)",
+              "출력 보류" in out, out)
+        check("★A5-R05: fail-closed 시 표면화 커서 미전진(다음 폴 재시도)",
+              R._read_cursor(R.cursor_path("T1", "w2")) == 0)
+        check("A5-R05: fail-closed 시 surfaced 대장 미기록(스텁 영구 축소 방지)",
+              R.surfaced_seqs("T1", "w2") == set())
 
 
 def main():
