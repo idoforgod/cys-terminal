@@ -711,6 +711,7 @@ def _read_task(task_id):
         return None
 
 
+# javis_snapshot 소비 — 리네임 시 동반 수정
 def _list_tasks():
     if not os.path.isdir(TASKS_DIR):
         return []

@@ -194,11 +194,13 @@ cys_fix_locale() {
 cys_timeout_run() {
   _cys_to="${1:-2}"
   shift
-  if command -v timeout >/dev/null 2>&1; then
+  # ★GNU 판별 선행: Windows PortableGit 은 System32 timeout.exe(인자 받으면 즉시 rc=1 함정 ·
+  #   MEMORY cys-01411 #3)를 해소한다 — `--version` rc 0(GNU 계열)만 ①② 사용, 아니면 ③ 폴백.
+  if command -v timeout >/dev/null 2>&1 && timeout --version >/dev/null 2>&1; then
     timeout "$_cys_to" "$@"
     return $?
   fi
-  if command -v gtimeout >/dev/null 2>&1; then
+  if command -v gtimeout >/dev/null 2>&1 && gtimeout --version >/dev/null 2>&1; then
     gtimeout "$_cys_to" "$@"
     return $?
   fi
