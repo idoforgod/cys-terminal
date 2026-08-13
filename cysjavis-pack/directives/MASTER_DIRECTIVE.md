@@ -183,6 +183,9 @@
      `delivery-<레인>.jsonl`(base 도 접미 有 — `delivery-base.jsonl`)을 직접 읽는다.
   ② 문제 텍스트의 본문 조각으로 레코드를 대조한다 — 대조는 **파이썬 경유**로 한다(grep 등
      POSIX 도구 가정 금지 — Windows).
+     ★결정론 CLI: 전문 프롬프트의 기계/오너 판정은 `python3 ".../javis_mission.py" machine-origin`
+     (stdout 판정 토큰) · 원장 레코드 나열·대조는 `python3 ".../javis_snapshot.py" generate` 산출
+     (BOOT_SNAPSHOT) 또는 파이썬 파일 실행 형태 — `python3 -c` 원라이너는 STRICT 에서 deny 다.
   ③ `origin` 판독표: `send`(+`from`)=타 노드 push(launch-agent 디렉티브 주입 포함) ·
      `queue`=wakeup 큐 · `schedule`=정기 잡 · `feed`=승인 Feed 자동 라우팅 · `channel`=외부
      채널 봉투 · `seat_takeover`=좌석 승계 고지 · `gui_auto`=GUI 자동 문안 · `boot`=데몬 기동

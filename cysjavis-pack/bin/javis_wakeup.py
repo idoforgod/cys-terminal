@@ -324,6 +324,7 @@ def cmd_enqueue(a):
         return EXIT_OK
 
 
+# javis_snapshot 소비 — 리네임 시 동반 수정
 def _iter_pending():
     if not os.path.isdir(PENDING_DIR):
         return []

@@ -3016,6 +3016,42 @@ def h_win_11():
     return "실기 %d PASS / %d SKIP (Windows 러너) · 잡 계약 충족" % (s["pass"], s["skip"])
 
 
+@specimen("H-WIN-12", "W5", "System32 timeout 함정 하 save-state → BOOT_SNAPSHOT 생성(마스터 게이트)",
+          ["SYS32-TIMEOUT"])
+def h_win_12():
+    """MEMORY cys-01411 #3: Windows PortableGit 은 `command -v timeout` 으로 **System32
+    timeout.exe**(인자를 받으면 즉시 rc=1)를 해소한다 — 종전 cys_timeout_run ①분기는 GNU 를
+    가정해 래핑 명령이 한 번도 실행되지 않았다(save-state.sh:88 generate·inject-context.sh
+    is-master 가 Windows 에서 무증상 무력화). 수리는 ①②분기 진입 전 `--version` rc 0 GNU
+    판별(_lib.sh 단일 소유처)이다. 이 검체는 System32 **의미론 스텁**(timeout·gtimeout 둘 다
+    인자 즉시 rc=1)을 PATH 선두에 두어 그 함정을 전 플랫폼에서 결정론 재현하고(모듈 헤더의
+    스텁 목 규약 — Windows 실기에서는 스텁이 안 잡혀도 System32 실물이 같은 함정이라 판정
+    동일), PreCompact 모조 stdin 으로 save-state.sh 를 돌려 **exit 0 AND fixture _round 에
+    BOOT_SNAPSHOT.md 실재**를 단언한다. 마스터 게이트 조건은 CYS_ROLE=master env
+    (javis_snapshot.is_master ①신호)로 충족한다 — 플랫폼 무관 판정."""
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
+        binp = os.path.join(tmp, "bin")
+        stub = "#!/bin/sh\necho 'ERROR: Invalid argument/option - --version' >&2\nexit 1\n"
+        _w(os.path.join(binp, "timeout"), stub)
+        _w(os.path.join(binp, "gtimeout"), stub)
+        # 실물 팩(javis_snapshot.py)을 소비하되 상태는 tmp 로 격리(하네스 계약: 사용자 HOME 불가침).
+        env = _base_env({"HOME": os.path.join(tmp, "home"),
+                         "CYS_PACK_DIR": PACK_DIR,
+                         "CYS_STATE_DIR": os.path.join(tmp, "state"),
+                         "CYS_ROLE": "master",
+                         "PATH": binp + os.pathsep + os.environ.get("PATH", "")})
+        payload = json.dumps({"source": "clear", "cwd": proj, "hook_event_name": "PreCompact"})
+        r = _run([BASH, _hook("save-state.sh")], input=payload, env=env)
+        need(r.returncode == 0, "save-state exit=%d stderr=%r" % (r.returncode, r.stderr[-300:]))
+        snap = os.path.join(proj, "_round", "BOOT_SNAPSHOT.md")
+        need(os.path.isfile(snap),
+             "System32 timeout 함정에서 BOOT_SNAPSHOT.md 미생성 — cys_timeout_run GNU 판별 회귀")
+        need("BOOT_SNAPSHOT" in _read(snap), "스냅샷 본문 판독 불가: %r" % _read(snap)[:120])
+    return "System32 스텁(timeout·gtimeout) 하 save-state exit 0 + BOOT_SNAPSHOT.md 실재"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. H-PRED / H-TIME / H-DOC / H-SEED / H-LIFE / H-OBS
 # ═══════════════════════════════════════════════════════════════════════════

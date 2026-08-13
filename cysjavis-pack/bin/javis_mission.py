@@ -508,6 +508,7 @@ LEDGER_OK = "ok"
 LEDGER_UNREADABLE = "unreadable"  # 손상·권한·디렉터리 — **fail-closed 대상**
 
 
+# javis_snapshot 소비 — 리네임 시 동반 수정
 def _read_ledger_lines(path):
     """(lines, err) — 원장 파일 1개를 줄 목록으로. 파일 부재는 ([], None).
 
@@ -1152,6 +1153,7 @@ def daemon_epoch():
         return None, "표식 판독 실패(%s): %s" % (e, p)
 
 
+# javis_snapshot 소비 — 리네임 시 동반 수정
 def _surface():
     """이 pane 의 surface 참조 — 규약 소유자는 `javis_bootstrap.my_surface_id` 하나다(사본 금지).
 

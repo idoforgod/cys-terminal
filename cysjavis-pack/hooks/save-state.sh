@@ -81,10 +81,27 @@ fi
 # 도구 부재 시 -f 가드로 조용히 생략 · 비마스터 skip 판정은 도구 내부 게이트(javis_snapshot.py) 소관.
 # 어떤 실패(타임아웃 124·미설치 127 포함)도 exit 0 보존 — 기존 write-ahead 동작 불변.
 # Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환(inject-context CHK·GATE 동일 규약).
+# ★레인 정합(경미3-1): 부서 pane(CYS_SOCKET=부서 데몬·CYS_PACK_DIR=pack-dept-*)의 스냅샷은
+#   inject-context.sh 부서 레인 선택 규약(G4+G20 술어 미러)이 읽는 $CYS_PACK_DIR/round 에 산출한다 —
+#   base/메인 _round 로 새면 격리 파괴(R2/R3). 부서 컨텍스트인데 pack round 미해소/부재면 생성 생략.
+SNAP_RD="$RD"
+_PACK_N="$(cys_norm_path "${CYS_PACK_DIR:-}")"
+_PACK_BASE="${_PACK_N%/}"; _PACK_BASE="${_PACK_BASE##*/}"
+_SOCK_N="$(cys_norm_path "${CYS_SOCKET:-}")"
+DEPT_CTX=""
+case "$_PACK_BASE" in pack-dept-?*) DEPT_CTX=1 ;; esac
+case "/$_SOCK_N" in */cys-dept-?*) DEPT_CTX=1 ;; esac
+if [ -n "$DEPT_CTX" ]; then
+  case "$_PACK_BASE" in
+    pack-dept-?*) SNAP_RD="$CYS_PACK_DIR/round" ;;
+    *)            SNAP_RD="" ;;
+  esac
+fi
 PACK_BIN="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin"
 SNAP_PY="$PACK_BIN/javis_snapshot.py"
 command -v cygpath >/dev/null 2>&1 && SNAP_PY="$(cygpath -w "$SNAP_PY" 2>/dev/null || printf '%s' "$SNAP_PY")"
-if [ -n "$RD" ] && [ -f "$SNAP_PY" ]; then
-  cys_timeout_run 10 "$CYS_PY" "$SNAP_PY" generate --round-dir "$RD" >/dev/null 2>&1 || true
+if [ -n "$SNAP_RD" ] && [ -d "$SNAP_RD" ] && [ -f "$SNAP_PY" ]; then
+  # --round-dir 도 cys_native_path 변환(_lib.sh) — 종전 SNAP_PY만 변환·RD 미변환 비대칭 해소.
+  cys_timeout_run 10 "$CYS_PY" "$SNAP_PY" generate --round-dir "$(cys_native_path "$SNAP_RD")" >/dev/null 2>&1 || true
 fi
 exit 0

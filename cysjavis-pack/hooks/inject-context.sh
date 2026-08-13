@@ -163,7 +163,8 @@ except Exception: sys.exit(1)" "$SNAP" 2>/dev/null \
      && cys_timeout_run 5 "$CYS_PY" "$SNAP_PY" is-master >/dev/null 2>&1; then
     OUT="${OUT}■ 도구 산출 스냅샷(BOOT_SNAPSHOT · 관측·비임무 — 임무 판정은 javis_mission status)\n"
     # 도구 계약상 이미 ≤4KB — head -c 8192는 계약 위반 시 컨텍스트 예산 보호용 방어 캡(SESSION_STATE 발췌 동일 파이프라인).
-    OUT="${OUT}$(cat "$SNAP" | _gate | head -c 8192 | sed 's/\\/\\\\/g')\n\n"
+    # 말미 tr -d '\r' — 네이티브 Windows python(_gate) 파이프 CRLF 방어(상단 :33 기존 규약과 동일).
+    OUT="${OUT}$(cat "$SNAP" | _gate | head -c 8192 | sed 's/\\/\\\\/g' | tr -d '\r')\n\n"
   fi
 fi
 
@@ -200,7 +201,7 @@ fi
 
 # ---------- 복원 모드 신호 (순환의존 해소 — 모순 1) ----------
 case "$SOURCE" in
-  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 배달 원장 다이제스트(BOOT_SNAPSHOT.md 있으면 그것 · 귀속 판별은 MASTER_DIRECTIVE '귀속 판별' 절) → 미해결 게이트부터 재개.\n";;
+  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 배달 원장 다이제스트(BOOT_SNAPSHOT.md 있으면 그것 · 귀속 판별은 MASTER_DIRECTIVE '귀속 판별' 절(절이 없으면 constitution 병합 대기 — cys pack-merge 승인 필요)) → 미해결 게이트부터 재개.\n";;
   clear)          OUT="${OUT}▶ 작업 계속(source=clear): 위 작업기억 이어서 진행.\n";;
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac

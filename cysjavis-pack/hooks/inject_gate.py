@@ -16,6 +16,14 @@ import sys
 
 
 def main():
+    # ★CRLF 근본 차단(H-WIN-5 계열): 네이티브 Windows python 은 파이프 stdout 에도 \r\n 을
+    #   쓴다 — newline="\n" 재구성으로 개행 번역을 끈다(SESSION_STATE 주입 경로의 기존 동일
+    #   결함까지 이 단일 소유처에서 치유). reconfigure 미지원 인터프리터(<3.7)는 폴백 통과 —
+    #   스냅샷 파이프라인의 tr -d '\r' 이 제2벽.
+    try:
+        sys.stdout.reconfigure(newline="\n")
+    except Exception:
+        pass
     text = sys.stdin.read()
     try:
         pack = os.path.expanduser(os.environ.get("CYS_PACK_DIR", "") or "~/.cys/pack")
