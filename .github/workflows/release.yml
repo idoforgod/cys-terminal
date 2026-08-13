@@ -387,6 +387,35 @@ jobs:
           PYEOF
           echo "✓ macOS 서명·공증 산출물 준비: $DST/dmg/cys_${VERSION}_${ARCH}.dmg + $DST/macos/cys.app.tar.gz(.sig)"
 
+      # ★macOS 격리 속성 + Gatekeeper 실평가 게이트 — 업로드 **전** (2026-08-13 신설).
+      #   위 스텝이 서명·공증·staple 을 끝냈다. 그러나 그 산출물이 **실사용자 환경**에서 열리는지는
+      #   아직 측정되지 않았다: 사용자는 브라우저로 받고, 그때 파일에 `com.apple.quarantine` 이 붙으며,
+      #   첫 실행에서 Gatekeeper 가 **전체 재검증**을 돈다. quarantine 이 없으면 그 재검증 경로 자체가
+      #   돌지 않아, 봉인이 깨진 앱도 조용히 통과한다(2026-08-01 실사고 "손상되었기 때문에 열 수
+      #   없습니다" — 공증·staple 은 정상이었고 동봉 python 의 .pyc 쓰기가 봉인을 깼다. 당시 검증은
+      #   curl 사본=quarantine 없음만 봐서 사고 경로를 한 번도 재현하지 못했다).
+      #   이 스텝은 그 경로를 CI 에서 기계로 재현한다 — 사본에 quarantine 부착 → 마운트 → ditto 설치
+      #   모사 → codesign --verify --deep --strict + stapler validate + spctl --assess.
+      # **왜 여기(업로드 앞)인가**: Windows CRT 게이트와 동형. tauri-action(수집·업로드) 뒤에 두면
+      #   draft 정책이 뒤집히는 순간 공개된 산출물을 사후 실패시키는 구조 의존이 된다. 앞에 세워
+      #   어떤 발행 정책에서도 게이트가 업로드 자체를 선행 차단하게 한다.
+      # 매트릭스가 아키텍처별(aarch64·x64)이므로 각 레그가 자기 DMG 를 본다 = **DMG 2종 모두 커버**.
+      # 러너 정책이 `spctl --status = assessments disabled` 면 스크립트가 skip 이 아니라
+      #   **codesign/stapler 단독 모드로 강등**하고 ::warning 배너를 남긴다(무음 통과 금지).
+      - name: macOS Gatekeeper 게이트 (quarantine 부착 + spctl 실평가 · 업로드 전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 글롭 미해소를 실패로 잡는다(Windows CRT 게이트 스텝과 동일 관례) — 무음 통과 금지.
+          DMGS=(target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          [ "${#DMGS[@]}" -ge 1 ] && [ -f "${DMGS[0]}" ] || { echo "::error::DMG 후보 이상(글롭 미해소 포함): ${DMGS[*]}" >&2; exit 1; }
+          for d in "${DMGS[@]}"; do
+            echo "=== Gatekeeper 게이트 대상: $d ==="
+            # exit 0=PASS · 1=FAIL(발행 금지) · 2=판정 불가(도구 부재·마운트 실패 → 통과 아님)
+            bash scripts/release-gate-gatekeeper.sh "$d"
+          done
+
       # ★Windows 직접 빌드 + CRT 발행 차단 게이트 — 업로드 **전** (R2 agy 구조 권고 수용 · 2026-07-28).
       #   종전(R1)엔 tauri-action(빌드+업로드 일체)이 먼저라 게이트가 업로드 뒤였다 — draft 정책이
       #   유지되는 한 안전하지만, 정책 회귀(releaseDraft 반전) 시 공개된 산출물을 사후 실패시키는
