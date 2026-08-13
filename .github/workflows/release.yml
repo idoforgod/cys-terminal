@@ -229,7 +229,7 @@ jobs:
           # ★test_bootstrap_chain 등재(2026-08-12 R3 확정): 위계 폴백(부서 자동 생성)의 유일한
           #   회귀 핀 세트가 종전엔 CI 어느 레인에서도 돌지 않았다 — 배송 팩이 검증 0회로 서명됐다.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard \
+                   test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
@@ -575,7 +575,7 @@ jobs:
           echo "== [pack] todo 선언·유령집계 소비자 회귀 7종(+import 가드)+부트체인 =="
           # ★test_bootstrap_chain 등재(2026-08-12 R3 확정 — 위 build 레그와 동일 사유).
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard \
+                   test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
