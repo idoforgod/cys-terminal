@@ -65,7 +65,7 @@ for name, secret, needle in [
 NORMAL = {
     "한국어 문장": "주인님께 보고드립니다. 오늘 작업은 정상 완료되었습니다.",
     "멀티라인 개행탭": "line1\n\tindented line2\r\nline3",
-    "파일경로": "/Users/runner/work/cys-terminal/cysjavis-pack/bin/javis_scrub.py:42",
+    "파일경로": "/Users/x/proj/cysjavis-pack/bin/javis_scrub.py:42",
     "URL": "https://example.com/path?a=1&b=2#frag",
     "코드 스니펫": "def f(x):\n    return x_key + api  # not a secret literal",
 }
