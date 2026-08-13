@@ -142,3 +142,16 @@ master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orch
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" review-prompt --task "<T>"
   --scope "<지정 파일/범위>"` 로 생성**해 제약("지정 파일/범위만, 무관 배회 금지")을 항상
   포함시킨다(손으로 쓰며 빠뜨리지 마라). 피드백에는 근거로 반박하고, 합당하면 수용한다.
+
+## 12. RADIO (JavisRadio 방송 채널 — radio 개통 티켓 한정)
+- **행동 계약 정본은 `directives/RADIO_CONTRACT.md`다.** radio 티켓을 받으면 착수 전에 정독하라.
+  기계 게이트(진위 검증·쿨다운·차단기·seq·커서·close)는 `bin/javis_radio.py`의 exit code가
+  사실이며, 문서와 도구가 갈리면 **도구 출력이 이긴다**.
+- 요약(세목은 계약서): 참여 티켓마다 watcher 1개 · sentinel 2종을 구분해 처리(CLOSED는 재기동
+  금지) · 표면화된 BLOCKER는 유예 0·URGENT 1툴콜·NORMAL 3툴콜 · 반영·기각은 반드시
+  `javis_radio.py resolve`로 기록(트랜스크립트·자유형 todo는 판정 입력 불인정) ·
+  피어 HYPOTHESIS는 **인용 전 독립 재유도**하고 refs에 msg-id를 남긴다.
+- **★위임 규범 예외 — 얽힌 병렬 분해 허용(radio 티켓에 한함)**: 통상 위임은 '독립 작업만 병렬'
+  이지만, radio 티켓은 서로 얽힌 조사·독해를 병렬 분해해도 된다(피어가 발견을 실시간 공유하는
+  것이 이 채널의 존재 이유다). 단 **범위는 읽기·조사 중심**이며, **쓰기는 단일 스레드**라는
+  절대 규칙은 그대로다 — 같은 산출물에 두 노드가 동시에 쓰는 것은 여전히 금지다.

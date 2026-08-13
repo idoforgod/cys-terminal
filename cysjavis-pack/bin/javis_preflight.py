@@ -4625,6 +4625,40 @@ class Preflight:
             return
         self.add(cid, PASS, "%s self-test OK + next-action 임무 게이트 배선(exit 3) 확인" % p)
 
+    # ── C78 JavisRadio 도구 존재 + 자기검증 (RADIO_SPEC_v4 · 2026-08-13) ──
+    # ★WARN 티어(READY 미차단): radio 는 파일럿 단계 기능이라 부재·self-test 실패가 부트를
+    #   통째로 막으면 안 된다(C62·C76 선례의 'WARN(READY 미차단)' 규율).
+    #   그러나 **조용히** 없으면 안 된다 — 이 노드에서 self-test 가 실패하면 AA33(a) 능력
+    #   게이트가 open 시점에 이 노드의 radio 등록을 거부하고(exit 3), §4.5 heartbeat 백스톱은
+    #   '스크립트 부재로 재기동 불능'인 워커에게 재기동 지시를 무한 반복한다. 부트 ⓪ 출력에
+    #   상태를 올려 그 난청을 개통 **전에** 관측 가능하게 한다.
+    #   읽기 전용(self.results/planned 미참조 — report 병렬 워커 안전)·--fix 무관(자동수리 불가).
+    #   cid 는 C78(C63·C64 결번 재사용 금지 — T0 §5-4).
+    def c78_radio(self):
+        cid = "C78.radio"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "bin", "javis_radio.py")
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "pack/bin/javis_radio.py 부재 — 이 노드는 radio 미개통 "
+                                "(AA33(a) 능력 게이트에서 등록 거부된다) · `cys init-pack` 으로 설치")
+            return
+        try:
+            r = subprocess.run([sys.executable, p, "--self-test"],
+                               capture_output=True, timeout=60, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, WARN, "javis_radio.py --self-test 실행 불가: %s "
+                                "— radio 능력 미검증(READY 미차단)" % e)
+            return
+        if r.returncode != 0:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, WARN, "javis_radio.py --self-test 실패(exit %d): %s "
+                                "— 이 노드는 radio 능력 게이트에서 등록 거부된다(READY 미차단)"
+                     % (r.returncode, tail[-300:]))
+            return
+        self.add(cid, PASS, "%s self-test OK (명명 대조·진위 게이트·쿨다운/차단기·seq/로테이션·"
+                            "커서·close 시퀀스)" % p)
+
     def c76_app_seal(self):
         cid = "C76.app-seal"
         if self.skipped(cid):
@@ -4727,6 +4761,9 @@ class Preflight:
             self.c76_app_seal,
             # C77(2026-08-01 실사고 T1) — 임무 게이트 도구 존재 + next-action 배선.
             self.c77_mission_gate,
+            # C78(2026-08-13 RADIO_SPEC_v4) — radio 도구 존재 + self-test. WARN-only.
+            # 마지막 고정 슬롯(C62·C68) **앞**에 둔다(§5-4 배선 규율).
+            self.c78_radio,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

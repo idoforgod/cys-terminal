@@ -24,7 +24,6 @@ append-only·끝개행 보정·flock(단일 writer). 테스트는 반드시 _wor
 """
 
 import argparse
-import fcntl
 import getpass
 import hashlib
 import json
@@ -34,6 +33,41 @@ import shlex
 import subprocess
 import sys
 import time
+
+# ★Windows 즉사 차단(P0): top-level `import fcntl` 은 Windows 에 그 모듈이 없어
+#   ModuleNotFoundError 로 이 스크립트 **전체**를 불능화한다 — javis_org.py:9-22 가 같은
+#   사고를 먼저 겪고 msvcrt 폴백으로 지혈한 선례가 있다.
+#   여기서는 **이름 `fcntl` 을 그대로 유지하는 shim** 을 바인딩한다. 아래 `_append_receipt`
+#   의 `fcntl.flock(fd, fcntl.LOCK_EX)` 호출을 한 글자도 바꾸지 않으므로
+#     · posix: 진짜 fcntl 모듈이 그대로 바인딩되어 동작이 **바이트 단위로 보존**된다.
+#     · Windows: msvcrt 바이트락으로만 접힌다.
+#   (`_append_receipt` 의 규약은 javis_task.py:1278-1300 이 복제해 쓰는 공유 계약이라
+#    본문 변경은 양쪽 드리프트를 만든다 — import 층에서만 접는다.)
+try:
+    import fcntl
+except ImportError:  # Windows
+    import msvcrt as _msvcrt
+
+    class _FcntlShim(object):
+        LOCK_EX = 2      # 값은 posix fcntl 과 동일 — 호출부가 이 상수만 쓰므로 자기정합
+        LOCK_UN = 8
+
+        @staticmethod
+        def flock(fd, op):
+            # msvcrt.locking 은 '현재 위치의 1바이트' 영역락이라 잠글 때와 풀 때의 위치가
+            # 같아야 짝이 맞는다 → 위치를 0으로 고정해 걸고 원복한다(중간 lseek 와 무관).
+            pos = os.lseek(fd, 0, os.SEEK_CUR)
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    _msvcrt.locking(
+                        fd, _msvcrt.LK_LOCK if op == _FcntlShim.LOCK_EX else _msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass          # best-effort — 락 실패가 기록 자체를 막지는 않는다
+            finally:
+                os.lseek(fd, pos, os.SEEK_SET)
+
+    fcntl = _FcntlShim()
 
 SCHEMA_VERSION = 1
 
