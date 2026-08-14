@@ -19,6 +19,7 @@
 | **[Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md)** | 설계 철학 10명제·시스템 아키텍처·보안 모델·불변식 |
 | **[User Manual](USER-MANUAL.md)** | 설치부터 함대 운용, CLI·환경변수·프로토콜 전체 레퍼런스까지 |
 | [INSTALL.md](docs/INSTALL.md) · [INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md) | 설치 상세 |
+| [GUIDE-clean-reset-KR.md](docs/GUIDE-clean-reset-KR.md) | 초보자용 완전 초기화 가이드 (macOS·Windows) |
 | [SECURITY.md](SECURITY.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [NOTICE.md](NOTICE.md) | 보안 신고 · 기여 · 서드파티 귀속 |
 
 ## 왜 만들었나
@@ -31,6 +32,12 @@
 그리고 네 번째 문제 — **에이전트들을 어떻게 조직으로 묶을 것인가** — 를 내장 팩
 (CYSJavis: 역할별 절대지침 + 결정론 운영 도구)으로 해결합니다.
 
+자원의 벽은 실행 중만이 아니라 **배포·업그레이드 중에도** 다룹니다 — 앱을 새 버전으로
+교체하는 순간에도 "정지" 명령을 잃지 않는 것(크로스플랫폼 원자 교체)이 1급 목표입니다.
+
+한 가지 문서 규약: 이 저장소는 개선을 서술할 때 **사용자가 잃는 것을 먼저 고지**합니다
+— 마케팅 과장을 금지하고, 실제 코드·릴리스가 뒷받침하는 것만 적는 것이 규약입니다.
+
 ## 설계 원칙 (ABSOLUTE)
 
 1. **양방향 소켓통신** — 단방향 send + capture 폴링을 쓰지 않는다.
@@ -41,16 +48,26 @@
 3. **코어/UI 분리** — 데몬(cysd)은 UI와 무관하게 동작. UI가 hang이어도 소켓 제어 채널은 항상 살아있다(OOB 회생).
 4. **fail-closed 서명** — 앱은 Tauri updater 서명, 팩은 minisign(공개키 바이너리 핀).
    검증에 실패하면 설치·전개 자체가 거부된다.
+   *자기봉인 불변식* — 서명된 번들은 실행 중 자기 내용을 바꾸지 않는다(번들 `.pyc`
+   자기생성 봉인 3층 + 서명 후 개수 대조 게이트).
 5. **지침과 기계의 한 몸** — 역할별 절대지침·운영 도구·스킬(CYSJavis 팩)이 터미널과 함께
    빌드·서명·배포되고, 노드 기동 시 자동 주입된다.
+6. **수동적 인지 계층(radio)** — 발견 알림과 결정을 물리적으로 분리한다.
+   원칙1(능동 push)이 결정·조향 채널이라면, radio는 다중 워커가 병렬로 티켓을 돌 때
+   서로의 **발견**을 알리는 수동적 계층이다. 승인·verdict·done 같은 결정 트래픽은
+   radio에 싣지 않는다 — 결정의 단일 진실은 여전히 티켓·`gate-status`다.
 
 ## 설치
 
 [Releases](https://github.com/idoforgod/cys-terminal/releases/latest)에서 받으세요.
 받는 사람은 **데몬을 따로 설치할 필요가 없습니다** — 앱이 자동 기동하고 팩도 자동 설치됩니다.
 
-- **macOS**: `cys_<버전>_aarch64.dmg` (Apple Silicon) — 드래그 설치 후 앱 실행이면 끝.
+- **macOS**: `cys_<버전>_aarch64.dmg` (Apple Silicon) — 동봉된 **"Install cys.app" 도우미**가
+  숨김 스테이징 후 단일 시스템콜(`renamex_np`)로 원자 교체해, Finder 드래그가 복사 도중
+  반쪽 번들을 노출하던 경합을 제거합니다(덮어쓰기 대신 도우미 설치 권장).
 - **Windows**: `cys_<버전>_x64-setup.exe` — 데몬·CLI·런타임 동봉(자기완결 설치).
+  PE 버전리소스·매니페스트·아이콘 임베드로 SmartScreen/Defender 마찰을 낮췄으나
+  **여전히 미서명이라 첫 실행 경고가 뜰 수 있습니다**(정직 고지).
   상세: [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md)
 - 24/365 상시 가동(선택): `cys daemon install` (launchd KeepAlive / 작업 스케줄러).
 - 외부 터미널에서 `cys` 명령 쓰기: 앱 Control Center → **"셸에 cys 설치"** 1클릭.
@@ -74,12 +91,13 @@ cys boot                                      # 표준 노드 세트 일괄 기�
 ## 구조
 
 ```
-cys.app  Tauri 데스크톱 앱: 터미널 UI(xterm.js) + Control Center — 데몬의 thin client
+cys.app  Tauri 데스크톱 앱: 터미널 UI(xterm.js, TUI 위에서도 휠 스크롤·드래그 선택·복사
+         기본 복원) + Control Center — 데몬의 thin client
 cysd     헤드리스 코어 데몬: NDJSON 소켓 서버(UDS / win named pipe), PTY(portable-pty:
          macOS openpty·Windows ConPTY), vt100 화면 재구성, 이벤트 버스, watchdog,
          프로세스 원장, 사용량/비용 수집기, 영속 분석(SQLite), 스케줄러
-cys      CLI: pane 안의 AI가 쓰는 동등 노드 클라이언트 (60+ 서브커맨드 — `cys actions`)
-pack     cysjavis-pack/: 절대지침 6·결정론 도구 56·훅 18·스킬 102·스키마 3
+cys      CLI: pane 안의 AI가 쓰는 동등 노드 클라이언트 (수십 종 서브커맨드 — `cys actions`로 열람)
+pack     cysjavis-pack/: 절대지침 10·결정론 도구 90+·훅 25+·스킬 114+·스키마 4
          (빌드 시 임베드 · minisign 서명 배포 · 사용자 수정 파일 불가침)
 ```
 
@@ -98,10 +116,18 @@ pane 안의 AI는 `cys identify`로 자기 주소를 즉시 안다. PTY는 데�
 | CYSJavis 팩 | 역할별 절대지침·결정론 운영 도구·훅·스킬 | `cys init-pack` |
 | 개인 층 | soul.md(우선순위·금지선)·장기기억 | **사용자가 사용하며 축적** |
 
+**마스터 선언 위계 폴백** — 오너가 친 "너는 마스터다" 한 문장으로 5노드 팀이 자동
+기동하고(부트/착수 분리), **2번째 선언은 충돌(거부)이 아니라 새 부서를 자동 생성**하며
+첫 부서 생성 시 기존 마스터가 CEO로 자동 승격됩니다. 부서 생성 경로가 GUI 버튼 외에
+'선언 경로'로 확장된 것입니다. 단, 에이전트가 배달·실행한 선언은 machine-origin 게이트로
+이 폴백이 적용되지 않습니다(사람 채널에서만).
+
 soul.md와 memory/는 **의도적으로 비어 있는 골격**입니다 — "운영 취향과 장기기억은 빌려
 쓰는 것이 아니라 사용자 자신이 채워가는 것"이라는 설계 철학입니다. 자율주행(승인된 로드맵
 자율 완주)은 오너가 soul.md에 명시적으로 부여할 때만 켜지며, **오너의 어떤 입력이든
-즉시 일시정지시키는 kill-switch**가 최우선입니다.
+즉시 일시정지시키는 kill-switch**가 최우선입니다. 대칭으로, 자율 착수의 **시작 권한도
+오너 채널에서만** 나옵니다 — 큐에 미완 작업이 있어도 임무가 지정되지 않으면 보고 후
+정지하는 **임무 게이트**가 kill-switch의 반대편(착수 게이트)을 지킵니다.
 
 상세: [Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md) §2–4,
 운용법: [User Manual](USER-MANUAL.md) §12.
@@ -109,7 +135,7 @@ soul.md와 memory/는 **의도적으로 비어 있는 골격**입니다 — "운
 ## 세 가지 사용 구성 비교 — 온보딩 없이도 무엇을 얻는가
 
 cys-terminal은 자비스 온보딩 없이 **그냥 claude만 연결해도** 전통 터미널과 다른 경험을 제공합니다.
-세 구성을 33항목 × 6영역으로 비교한 결과입니다 (2026-07-17 신선 기계 E2E 실측 + 배포 코드 v0.12.77 추적 기반):
+세 구성을 33항목 × 6영역으로 비교한 결과입니다 (신선 기계 E2E 실측 골격 + 배포 코드 v0.14.x 라인 추적·팩 수치 재측정 기반):
 
 - **①** 전통 터미널(iTerm 등) + claude CLI
 - **②** cys-terminal + 순정 claude (자비스 온보딩 없이 일상 사용)
@@ -121,7 +147,7 @@ cys-terminal은 자비스 온보딩 없이 **그냥 claude만 연결해도** 전
 
 | 항목 | ① 전통 터미널 + claude | ② cys + 순정 claude | ③ cys + 자비스 (기준) |
 |---|---|---|---|
-| 자동 배치 | ✕ | ○ 팩 334파일+격리 config [실측] | ○ 동일 + preflight 전체 배선 |
+| 자동 배치 | ✕ | ○ 전 스킬 세트(팩 570+파일)+격리 config [실측] | ○ 동일 + preflight 전체 배선 |
 | 개인 `~/.claude` 보호 | — (직접 사용) | ○ 불가침 [실측] | △ base 온보딩 시 계장 가능 |
 | Claude 첫기동 게이트 | △ 5단 다이얼로그 1회 | △ 동일 — 첫 스킬런 막힘(F1) [실측] | △ 동일 함정 |
 | 로그인 | △ 1회 | △ 격리 config 별도 1회(F2) [실측] | △ 프로필별 각 1회 |
@@ -163,18 +189,19 @@ cys-terminal은 자비스 온보딩 없이 **그냥 claude만 연결해도** 전
 
 | 항목 | ① 전통 터미널 | ② cys + 순정 | ③ cys + 자비스 |
 |---|---|---|---|
-| 스킬 보유 | ✕ 수동 설치 | ○ 107종 + 보드 6종 [실측] | ◎ + 프로필 설치·role 주입 |
+| 스킬 보유 | ✕ 수동 설치 | ○ 114+종 + 보드 6종 [실측] | ◎ + 프로필 설치·role 주입 |
 | 스킬 실행 | ✕ 수동 호출 | ○ 보드 → 75초 완주 [실측] | ◎ + 티켓·게이트·검증 |
 | MCP 등록 | ✕ 수동 | ✕ | ○ 자동 (serena·nlm) |
 | 장기기억 | ✕ | ✕ | ○ javis_memory + 훅 |
-| 박사님 SOT 연동 | ✕ | ✕ | ○ NotebookLM 의무 |
+| 오너 SOT 연동 | ✕ | ✕ | ○ NotebookLM 의무 |
 
 ### F. 조직·자율성 — 자비스 온보딩의 고유 가치
 
 | 항목 | ① 전통 터미널 | ② cys + 순정 | ③ cys + 자비스 |
 |---|---|---|---|
-| 팀 구성 | ✕ | ✕ (선언 1문장 승격 가능) | ○ 5노드 자동 |
+| 팀 구성 | ✕ | ✕ (선언 1문장 승격 가능) | ○ 5노드 자동 + 부서 자동 기동(2번째 선언) |
 | 위임·검증 루프 | ✕ | ✕ | ○ 티켓·리뷰어·RSI·eval |
+| 노드 간 발견 공유(radio) | ✕ | ✕ | ○ 병렬 티켓 발견 채널(결정 트래픽 제외) |
 | 세션 간 작업 복원 | ✕ | △ pane 수준만 | ○ SESSION_STATE·RECOVERY |
 | 자율주행 | ✕ | ✕ | ○ 4자 수렴·denylist 경계 |
 | 안전 게이트 | △ Claude 기본 | △ 기본 (+실행물만 워커 규율) | ◎ guard·grill·skillscan |
@@ -211,7 +238,7 @@ cys-terminal은 자비스 온보딩 없이 **그냥 claude만 연결해도** 전
 비기술자용 요약 화면) · 워크스페이스 그룹 · **부서**(독립 데몬으로 프로젝트 격리) ·
 RBAC PII 가림(`CYS_CONTROL_REDACT=1`). 상세 설계: docs/CONTROL_CENTER_DESIGN.md
 
-## 자비스 네이티브 기능 (19건)
+## 자비스 네이티브 기능 (22건)
 
 > 설계 철학: **지침이 오케스트레이터에게 수동으로 시키는 모든 운영 의무 = 터미널의 기능 결함 목록.**
 > ①규약→데몬 보증으로 기계화 ②자기보고 우선·화면 파싱은 fallback ③자동화 3단 안전등급(alert→escalate→act, deny-by-default).
@@ -237,12 +264,15 @@ RBAC PII 가림(`CYS_CONTROL_REDACT=1`). 상세 설계: docs/CONTROL_CENTER_DESI
 | T4-17 | **헬스룰 조치 바인딩**(opt-in): queued 배달만 일시정지 | `cys add-health-rule n p --action pause-queue` |
 | T4-18 | **트랜스크립트 해시체인 attest**: 변조 증거성(producer≠evaluator) | `cys attest pin/verify` |
 | T4-19 | **recall 보존 정책**: 트랜스크립트 무한 성장 차단 | `CYS_RECALL_RETAIN_DAYS` |
+| T5-20 | **수동적 인지(radio)**: 병렬 워커의 발견 공유 · FACT 진위검증(파일·라인·스니펫, 미검증은 자동 강등) · BLOCKER 게이트 · 결정 트래픽 금지 | `javis_radio open/send/wait/read` |
+| T5-21 | **BOOT_SNAPSHOT**: clear/컴팩트 후 기억을 읽기전용 원장 다이제스트로 복원(명령형 문구 0 · 마스터 게이트 · 워커·리뷰어 pane 주입 0) | `javis_snapshot generate` |
+| T5-22 | **귀속 판별 원장**: pane 텍스트 위조 의심 시 수정 착수 전 배달 원장 선행 조회(무증거 귀속 무효) | `javis_mission delivery-path`·machine-origin |
 
 ## 자원 거버넌스 (3대 완화책)
 
 | 완화책 | 기능 | 명령/이벤트 |
 |---|---|---|
-| ① 로그인 감지 강화 | 모든 출력 라인에 헬스 룰(기본: Not logged in·401·token expired·rate limit) 매칭 → 30초 디바운스 push | `health.alert` · `cys add-health-rule <name> <regex>` |
+| ① 로그인 감지 강화 | 모든 출력 라인에 헬스 룰(기본: Not logged in·401·token expired·rate limit) 매칭 → 30초 디바운스 push. **자기증폭 차단**: 경보 문장은 `‹health-rule›`로 전 트리거를 마스킹해 내보내고(발신 봉인 — 어떤 룰에도 재매칭 불가), 경보를 논하는 줄(기계장치 이름·인용·한글 산문)은 매칭에서 제외(수신 격리) | `health.alert` · `cys add-health-rule <name> <regex>` · `CYS_HEALTH_NARRATION_CJK_MIN` |
 | ② 짧은 작업 단위 | idle(기본 300초 무출력) 감지 push → 분할·점검 판단 | `pane.idle` 이벤트 |
 | ③ 서버 생명주기 강제 종료 | **scoped 실행**(새 프로세스 그룹+원장, 종료 시 그룹째 정리) · **close-surface**(자식 트리 전멸) · **watchdog**(load/자식 수/중복 명령 감지) | `cys run -- <cmd>` · `cys ps` · `cys kill <pid>` · `watchdog.*` |
 
@@ -268,7 +298,7 @@ cys feed reply <request_id> allow                            # CLI 또는 UI All
 
 시작 시 + 6시간마다 조용히 확인. 재설치 후 "디스크는 새 버전·프로세스는 구 데몬" 스큐가
 남으면 배지 클릭 교대 또는 유휴 자동 교대(라이브 세션 0일 때 — 무손실)로 해소됩니다.
-진단·수리는 `cys doctor [--fix]`.
+진단·수리는 `cys doctor [--fix]`, 설치본 코드서명 봉인 자가진단은 `cys doctor app-seal`.
 
 **커스터마이즈와 공존**: 사용자 수정본은 업데이트가 파괴하지 않습니다 — user-owned 파일은
 보존+신버전 `.new` 병치, system 파일은 치유 전 `.user` 보존, `~/.cys/local/` 오버레이
@@ -284,7 +314,7 @@ cys feed reply <request_id> allow                            # CLI 또는 UI All
 
 ## 프로토콜 · 환경변수
 
-NDJSON(한 줄 = JSON 하나), RPC 60여 개 + `channel.*` 13종, 이벤트 60여 종.
+NDJSON(한 줄 = JSON 하나), RPC 수십 종 + `channel.*` 13종, 이벤트 수십 종.
 전수 목록과 환경변수 표는 [User Manual §16–17](USER-MANUAL.md)에 있습니다.
 
 ## 소스 빌드 (기여 시)
@@ -307,10 +337,17 @@ UI 재시작·앱 재설치에도 세션 유지(재attach).
 - 네트워크 리스너 없음 — 사용자 소유 Unix 소켓(macOS) / DACL 봉인 named pipe(Windows)만.
 - 발신자 신원은 커널 peer pid로 검증(자기신고 불신) · role→role ACL · 능력 게이트는
   deny-by-default(리뷰어는 읽기 전용).
+- **귀속(누가 보냈나)은 화면 문자열이 아니라 배달 원장이 판정한다** — 자기신고·pane 문자열을
+  불신하고, 원장 조회 증거 없이는 귀속 주장을 무효로 다룬다.
 - 업데이트 이중 서명 — 앱은 Tauri updater 서명, 팩은 minisign(공개키 바이너리 핀·replay
   단조성·fail-closed).
 - 승인 자동응답 없음(HITL) · 자기결재 차단 · 외부 URL은 하드 허용목록(로컬 설정으로만 확장).
-- 발행 전 비밀/PII 게이트: `scripts/secret-scan.sh --all` (fail-closed).
+- 발행 전 비밀/PII 게이트: `scripts/secret-scan.sh --all` (fail-closed). 비밀 마스킹은
+  비가시 문자 우회를 하드코딩 열거가 아니라 **유니코드 카테고리 포괄**(Cc/Cf/Zl/Zp 제거)로
+  차단한다("열거는 다음 우회에 진다 — 범주로 막는다").
+- **출고 게이트**: 릴리스 전 실사용자 경로를 CI가 재현 — macOS는 사본에 quarantine을 부착 후
+  Gatekeeper 실평가(spctl/codesign/stapler), Windows는 PE 평판으로 검증하고, 못 통과하면
+  업로드 자체를 차단한다(fail-closed · 정적 패턴이 아니라 사용자가 실제로 걷는 경로를 재현).
 
 취약점 신고: [SECURITY.md](SECURITY.md) · 상세: [Architecture & Philosophy §6](ARCHITECTURE-AND-PHILOSOPHY.md)
 
@@ -322,6 +359,18 @@ UI 재시작·앱 재설치에도 세션 유지(재attach).
 - NPU는 활용률(%) 공개 API가 없어 실측 전력(W)으로 표시(macOS).
 - 단일-UID 신뢰 모델 — 승인 서명·자기결재 차단은 같은 계정 내 악성 프로세스에 대한
   암호학적 방어가 아니라 탐지·fail-safe 층입니다.
+- **임무 게이트**는 동일 UID의 위조를 암호학적으로 막지 못합니다 — 배달 원장 감사흔적으로 다룹니다.
+- **Windows 업그레이드 원자성** 수리는 맥 개발기 코드판독·모델검증까지이며, 실기 확인은 진행 중입니다(정직 고지).
+- **macOS 설치본은 무인증서**입니다 — 설치도우미로 마찰을 낮췄어도 첫 실행 경고가 뜰 수 있고,
+  '반쪽 설치 vs quarantine' 판별은 `cys doctor app-seal`로 합니다.
+- **radio**는 교차채널 exactly-once·난청(놓침) 창 0을 원리적으로 보장하지 못합니다(해소 불가 — 관리 대상 잔여 리스크).
+
+## 문제 해결 · 초기화
+
+- macOS **"손상되어 열 수 없음"** 은 두 원인입니다 — ① 반쪽 설치(드래그 복사 경합) ② quarantine 속성.
+  판별은 `cys doctor app-seal`, 설치는 **"Install cys.app" 도우미** 사용을 권장합니다.
+- **완전 초기화**(윈도우 WebView2 저장값·잔존 부서 격리본 삭제 포함)는
+  [docs/GUIDE-clean-reset-KR.md](docs/GUIDE-clean-reset-KR.md)를 따르세요.
 
 ## 기여 · 라이선스
 
