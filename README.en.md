@@ -307,6 +307,58 @@ by one: **8 are homework Jarvis must do** (public benchmark, Windows signing, su
 time**. We applied the same yardstick to Hermes's own weak spots. Item-by-item evidence (file:line)
 and the full table: report §7-1.
 
+## Jarvis stack vs OpenClaw — the layer the world's #1 wrote down as "will not build"
+
+**OpenClaw** (386,229 stars · 81,179 forks · 372 registered contributors — measured 2026-08-14 /
+GitHub API) is the most-starred software project in GitHub history. It is a **personal AI assistant**:
+message it on WhatsApp, Telegram or 24 other channels and it works on your machine. We cloned the whole
+repository (commit db4379bd) and compared it across 10 areas — survey, scoring and rebuttal were done
+by different agents, and the rebuttal pass returned **0 false claims · 10 corrections**, all applied.
+Verdict: **Jarvis ahead on 4 · even on 1 · OpenClaw ahead on 5**, and they are the bigger system
+(~86× production code, ~14,000× stars).
+
+In one line — the two lines they put on their **"What We Will Not Merge"** list (VISION.md:134-135),
+"agent-hierarchy frameworks" and "heavy orchestration layers", are exactly what Jarvis is. Full
+evidence: the lane report `자비스-vs-OpenClaw-전수조사-최종보고서-2026-08-14.md`
+(adversarial-review-hardened).
+
+### ✅ Where Jarvis is ahead — command, verification, control (4)
+
+| # | Capability | In plain words (all measured) |
+|---|---|---|
+| 1 | Running many AIs as an organization | Jarvis **checks by machine that four seats are alive** — chief of staff, worker, and two reviewers from different vendors — and can clone a whole department. OpenClaw agents spawn children at depth 1 by default, with no master/worker/reviewer roles |
+| 2 | Filtering results before trusting them | Jarvis **machine-rejects an evidence-free "done"**, and reviewers use four closed outcomes (accept/revise/block/escalate) instead of scores, with a counter-argument required before passing. In OpenClaw, verifying a child's result is **one sentence of guidance**, and there is no verifier module |
+| 3 | Security (narrow lead) | Jarvis opens no inbound door, persists risky-command approvals with unforgeable signatures, and has a kill switch plus a pre-flight resource check. OpenClaw's own security engineering is top tier, but in early 2026 it saw **135,000+ instances exposed without a password**, a one-click remote-execution flaw (patched next day), 341→824 malicious skills, and a Chinese government usage restriction |
+| 4 | Release & supply-chain integrity | Jarvis notarizes automatically, signs app and pack separately, and **refuses to install if even one file is missing from the signed manifest**. OpenClaw's dependency hygiene is exemplary, but its open skill marketplace actually shipped malware |
+
+**Even (1) — recovery**: they are stronger at protecting the conversation store; Jarvis is stronger at
+restoring organizational state and at **blocking a convincing but false restore** (claims are
+reconciled against measurement right after recovery).
+
+### ❌ Where OpenClaw is ahead — all of it
+
+| # | Capability | Fact | Why the gap exists |
+|---|---|---|---|
+| 1 | Messaging channels | 26 channels + duplicate suppression across the delivery path / Jarvis has 2 | Half choice, half time — the owner locked the scope ("exclude Telegram, Slack and Discord only", 2026-07-04) and two is what one person can maintain. The inconvenience is real: **if you only use Telegram, you cannot approve from your phone.** On duplicates, **23 of their 26 channels (88%) are in the same position as Jarvis** |
+| 2 | Tests & CI | ~120,000 test calls · 86 CI lanes / Jarvis has 1,664 · 5 | Mostly a size difference — our production code is 1/86th, so per thousand lines it is 41 vs 27 (1.6×). But **having zero tooling to measure which code never runs** is homework with no excuse |
+| 3 | Feature breadth | 152 extensions · iOS/Android apps · UI in 21 languages / Jarvis has 114+ skills · macOS and Windows | Mostly choice — **83 of their 149 manifests (56%) are per-vendor adapters**, so the two sides count different things. Having no marketplace is also a choice (our installer rejects any file absent from the signed manifest, which cannot coexist with an open one) — the cost is that **you cannot install someone else's add-on**. No Linux, however, is homework: the code is ready and only the release matrix has no slot |
+| 4 | Users & community | 386k stars · hundreds of contributors · major press / Jarvis has 28 stars · 53 forks | Mostly direction and time — **publishing externally is blocked without owner approval**, so going public is the exception (the repo and releases are public; 20,624 asset downloads across the last 12 releases). But **not having proven "is this better than a single AI?"** is homework — we ran the same tasks and our pipeline lost 2–0 to a single agent (raw evidence was summarized away between stages) |
+| 5 | Documentation | 770 documents · auto-translated into 20 languages / Jarvis has 254, Korean | Choice — the primary readers of those documents are **programs, not people** (directives are injected into each agent, and a failed injection stops it from starting). An English README exists. Having **no documentation site** is homework |
+
+### Where the differences come from — one paragraph
+
+The two systems aim in opposite directions. OpenClaw aims at "**an assistant anyone can use
+anywhere**" and broadened its surfaces — which is why its own vision document says it **will not
+build** agent hierarchies or heavy orchestration layers. Jarvis aims at "**running many AIs so the
+results can be trusted**" and made exactly that layer its core. Taking the 12 items where OpenClaw is
+ahead one by one: **4 are homework Jarvis must do** (coverage measurement, performance evidence,
+Linux, a documentation site); the rest are differences born of the different aim, or of time and
+headcount. We applied the same yardstick to them — in OpenClaw, extensions run with the same
+privileges as the core, and damage from installing a bad extension is not even accepted as a security
+report under their policy. That is the price of breadth and openness. And our own messaging layer is
+itself **what we learned by surveying OpenClaw** (no code copied — rules re-implemented, with what we
+rejected written down too).
+
 ## Control Center (real-time monitoring + persistent analytics)
 
 A dedicated full panel in the app — `cysd` serves fleet, usage, and system over a single
