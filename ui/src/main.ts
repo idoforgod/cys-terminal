@@ -1,6 +1,26 @@
 // cys UI — xterm.js panes over the cysd socket (thin client).
 // 세션 영속은 구조로 해결: 세션(PTY)은 데몬 소유, UI는 attach만 한다.
 
+// ★2026-08-11: 이 WebView2 환경에서 xterm의 coreMouseService(마우스트래킹 리포팅)가 제대로
+// 동작하지 않아 앱(claude.exe 등)이 마우스트래킹을 요청(DECSET ?1000/1002/1003/1006 등)하는
+// 순간부터 xterm의 selectionService가 비활성화되고 드래그선택·Ctrl+C복사·클릭 동작이 전부
+// 불안정해진다(Shift로 강제선택은 우회되지만 그 경우도 xterm 자신의 selection이 아닌 브라우저
+// 네이티브 selection이라 Ctrl+C 복사가 안 걸린다). 애초에 이 앱들은 마우스트래킹을 실질적으로
+// 쓰지 않으므로(휠 스크롤은 별도로 scrollLines 직접호출로 이미 우회함), PTY 출력에서 마우스트래킹
+// 활성화 시퀀스 자체를 걸러내 xterm이 항상 "마우스트래킹 꺼짐" 상태로 selectionService의 정상
+// (그리고 이미 잘 검증된) 코드 경로만 타게 만든다. 바이트 단위로만 다뤄 UTF-8 내용은 손상 없음
+// (latin1 1:1 매핑 왕복 — 조각난 멀티바이트 청크 경계에서도 안전).
+const MOUSE_TRACKING_DECSET_RE = /\x1b\[\?(?:1000|1001|1002|1003|1004|1005|1006|1015|1016)[hl]/g;
+function stripMouseTracking(bytes: Uint8Array): Uint8Array {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  if (!/\x1b\[\?1\d{3}[hl]/.test(s)) return bytes; // 흔한 경로(마우스트래킹 시퀀스 없음) 빠른 반환
+  s = s.replace(MOUSE_TRACKING_DECSET_RE, "");
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
@@ -1646,6 +1666,24 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
     // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return false;
+    // ★복사(Ctrl/Cmd+C): 실제 선택된 텍스트가 있을 때만(hasSelection()은 폭 0인 선택에도
+    // true를 반환하므로 getSelection() 길이로 판정 — reviewer-claude-1 지적) 클립보드로만
+    // 복사하게 false 반환 — 브라우저 네이티브 copy를 막고 직접 writeText한다. writeText는
+    // 비동기라 return false 시점엔 성공 여부를 알 수 없으므로, 실패하면(예: WebView2 권한
+    // 문제 — 이 앱의 붙여넣기가 겪었던 것과 같은 부류) fail-open으로 인터럽트 바이트(\x03)를
+    // 뒤늦게라도 PTY로 보내 "복사도 인터럽트도 둘 다 조용히 실패"를 막는다(reviewer-claude-1 지적).
+    // 선택이 없으면 true를 반환해 기존 동작(Ctrl+C=인터럽트 전송)을 그대로 보존.
+    if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C") && e.type === "keydown") {
+      const selText = term.getSelection();
+      if (selText.length > 0) {
+        navigator.clipboard.writeText(selText).catch((err) => {
+          console.error("clipboard writeText 실패 — fail-open으로 인터럽트 전송", err);
+          sendRaw("\x03");
+        });
+        return false;
+      }
+      return true;
+    }
     // ★Shift+Enter = 줄바꿈(오너 요청 2026-07-12): Option/Alt+Enter가 보내는 것과 동일한
     // 바이트(ESC+CR)를 PTY로 전송 — claude 등 CLI가 meta-Enter로 해석해 프롬프트에 개행 삽입.
     // mac·Windows 공통(플랫폼 분기 불요). keydown에서만 전송하고 keypress/keyup은 흡수해 이중 전송 방지.
@@ -1806,7 +1844,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     exited_event: string;
   };
   const un1 = await listen(ev.output_event, (e) => {
-    term.write(b64ToBytes(e.payload as string), snapToBottom);
+    term.write(stripMouseTracking(b64ToBytes(e.payload as string)), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n", snapToBottom);
