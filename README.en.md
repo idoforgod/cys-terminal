@@ -280,20 +280,35 @@ are all **trust & control**; their five are all **economy, convenience & opennes
 |---|---|---|
 | 1 | Inter-agent broadcast (passive awareness) | No JavisRadio counterpart in the Hermes **core** (exhaustive grep — every broadcast targets human channels or UI clients). Nearest: a task-scoped, CLI-only, polling blackboard |
 | 2 | Child agents pushing upward | Hermes children have `send_message` stripped — the parent can only tail logs. Jarvis workers push straight to the master's stdin (a fresh turn) |
-| 3 | Always-on, blocking verification gates | Jarvis: evidence-less "done" rejected with exit 5 · four-party convergence gate · FACT broadcasts machine-verified. Hermes: real verification *skills* exist but are **opt-in**; its always-on completion guard declares itself "never blocks completion" |
+| 3 | Always-on, blocking verification gates | Jarvis: evidence-less "done" rejected with exit 5 · four-party convergence gate · FACT broadcasts machine-verified. Hermes: real verification *skills* exist but are **opt-in**; its always-on completion guard declares itself "deliberately passive… never blocks completion" |
 | 4 | A seated, heterogeneous review bench | Three-vendor reviewers (Claude · Gemini · Codex) hold **standing seats** wired into gates, vs MoA advisory ensembles (not a verdict gate) and delegate-to-other-CLI skills — we also disclose we have not yet published live stats for our bench |
 | 5 | Agent-driven self-organization | The Jarvis master runs ticket → worker → convergence entirely through tools. Hermes's swarm topology (verifier/synthesizer) is CLI-only — not model-exposed |
 | 6 | Pre-flight resource control + signing chain | Resource gate before work starts (exit 2 = refuse) · process ledger / macOS notarization + minisign as a **fail-closed automated CI chain**, vs zero signing wiring across 27 CI workflows (notarization scripts skip **fail-open** without credentials) |
 
 ### ❌ Where Hermes leads — all of it, honestly
 
-| # | Capability | Fact |
-|---|---|---|
-| 1 | Scale & breadth | 9.1× code · ~20× tests · 87 tools (+unlimited MCP) · 197 skills · 22 messenger platforms · 7 execution backends · 8 interfaces |
-| 2 | Execution security & sandboxing | 4,919-line approval engine (12 hardline + 99 dangerous patterns · de-obfuscation · LLM judge) · backend isolation · secret-source integrations — code signing is our only edge here |
-| 3 | Delegation economics & policy | Per-delegation cost/token rollup implemented / dangerous subagent commands **denied by default** (our auto-approve is a prose rule) |
-| 4 | Continuity & interop | Same session across CLI↔TUI↔desktop↔messengers / three open standards: A2A v1.0 · MCP server · ACP (+7-layer peer auth & audit log) |
-| 5 | Maturity & ecosystem | 230,268 vs 27 stars · 398 account contributors vs effectively one person · 388 vs 62 days · 22,240 vs 528 commits (same basis) |
+| # | Capability | Fact | Root cause (measured — report §7-1) |
+|---|---|---|---|
+| 1 | Scale & breadth | 9.1× code · ~20× tests · 87 tools (+unlimited MCP) · 197 skills · 22 messenger platforms · 7 execution backends · 8 interfaces | ⚖️ Mixed — we built messaging **narrowly** (approval/report-only bridges — see 'Channel bridge' below), not not-at-all. Direction = a width of 2 vs 22 under data sovereignty; debt = the width itself, voice, mobile. Code/test multiples are a function of time & headcount |
+| 2 | Execution security & sandboxing | 4,919-line approval engine (12 hardline + 99 dangerous patterns · de-obfuscation · LLM judge) · backend isolation · secret-source integrations — code signing is our only edge here | ⚖️ Mixed — our network surface is small (zero listeners), but an approval engine guards against the **agent itself**, so the permission-surface debt is ours — porting de-obfuscation/injection scanning is roadmap |
+| 3 | Delegation economics & policy | Per-delegation cost/token rollup implemented / dangerous subagent commands **denied by default** (our auto-approve is a prose rule) | Policy = ⚖️ mixed (placing defenses before work and after output is a choice; the product's stated philosophy is HITL + signed prefixes, and that promotion is unfinished — debt) / cost rollup = 🔧 debt |
+| 4 | Continuity & interop | Same session across CLI↔TUI↔desktop↔messengers / three open standards: A2A v1.0 · MCP server · ACP (+7-layer peer auth & audit log) | Continuity = 🧭 direction (cross-device session sync means data leaving the machine — a direct conflict with the principle) / standards = ⚖️ (only A2A is direction; stdio MCP/ACP are debt — roadmap) |
+| 5 | Maturity & ecosystem | 230,268 vs 27 stars · 398 account contributors vs effectively one person · 388 vs 62 days · 22,240 vs 528 commits (same basis) | ⏳ A function of calendar & headcount — the dev model is one owner plus an AI fleet (and the calendar gap is not something debts can repay — stated as is) |
+
+### Why we lose — measured root causes
+
+Classifying all 20 losing axes/items against both sides' design documents (report §7-1; passed two
+delta adversarial audits): **🔧 pure debt 8 · ⚖️ mixed choice-and-debt 9 · 🧭 direction (direct
+conflict with a stated principle) 2 · ⏳ function of time 1**. The eight debts (public benchmark,
+Windows signing, supply-chain CI, cost rollup, …) are a list to pay off, no excuses. The common
+background of the rest is a different design center — ours is **"local-first: data never leaves the
+machine"** (zero network listeners · kernel-derived identity · a single-machine trust boundary);
+Hermes chose the opposite ("capability lives at the edges" · "$5 VPS… not tied to your laptop") and
+broadened its surfaces. So we built messaging narrowly (approval/report-only bridges — see 'Channel
+bridge' below) rather than not at all, and we did not build external telemetry because monitoring
+data must not leave the machine. We applied the same rule to Hermes: its opt-in verification is
+recognized as *their* direction ("deliberately passive" · narrow waist) — which does not change the
+verdict that no always-on blocking gate exists. Full 20-item table: report §7-1.
 
 ### Honest disclosure
 
@@ -302,7 +317,8 @@ restraint; our JAVIS-BENCH is underway). Hermes does have a verification culture
 ledger skill, an independent-reviewer skill, an unusually honest threat model) — our draft's "zero
 verification" claim was refuted in adversarial review and retracted, with the retraction kept on record.
 Our weaknesses, same yardstick: bus factor ≈ 1 · no open-standard surface (MCP server/A2A/ACP) ·
-unauthenticated radio nodes · no public benchmark. The two systems are complements, not substitutes —
+unauthenticated radio nodes · no public benchmark — which of these are choices and which are debts
+is recorded, measured, in the table above and report §7-1. The two systems are complements, not substitutes —
 when **the result must be trusted**, you need our six capabilities; when **it must run anywhere,
 cheaply**, you need their five. Full numbers, file:line evidence and review records: the lane report
 `JAVIS-vs-Hermes-Agent-종합성능비교보고서-2026-08-14.md` (v2).
