@@ -184,51 +184,88 @@ denylist boundary. The only real friction in ② is two one-time gates:
 
 Moving from ② to ③ is a **single sentence**: "you are the master."
 
-## Head-to-head — Coral AgentRadio (full-repo audit, 2026-08)
+## JavisRadio vs AgentRadio — where we lead, where we fall short
 
-The same concept — a passive-awareness broadcast layer where agents "hear while they work" — was published by academia
-as an experiment and shipped by cys as a product. We audited [Coral-Protocol/AgentRadio](https://github.com/Coral-Protocol/AgentRadio)
-(the reproduction repo for [arXiv:2607.28430](https://arxiv.org/abs/2607.28430)) **file by file, with measurements**, followed by
-two independent adversarial reviews. As of 2026-08-14 (cys v0.14.15 ↔ AgentRadio HEAD 5e4e137).
+cys's passive-awareness layer (Design Principle 6 · T5-20) is a re-implementation of the
+three primitives of **AgentRadio** (arXiv:2607.28430) by Coral Protocol, hardened with
+machine gates. The original research showed that letting four coding agents listen
+*while* they work lifts SWE-Atlas QnA task accuracy from 32.3% (single agent) to 62.1%
+(four agents, McNemar p=0.0023), with a DeepSeek replication (29.0%→50.8%, p=0.0026) and
+a **B1 budget control** (one agent with 6× budget still reaches only 37.9% — blocking
+the "you just spent more compute" objection by design): textbook experimental work.
+Below is the verdict of a full source-level survey of the original paper and repo
+(2026-08-14; triple-verified — two independent sessions + two adversarial reviewers +
+number re-execution), scored on 10 axes — **wins and losses first**.
 
-> **Honest framing** — one side is paper-experiment code (3,318 executable lines), the other a product in daily operation
-> for two months (151,307 executable lines). Different weight classes; the tables below report measured differences per axis,
-> not a victory lap.
+### At a glance — from cys/Jarvis's side: 8 ahead · 1 conditional · 1 behind
 
-### Where Jarvis leads — 6 of 8 judged axes (all measured)
+| # | Axis | Verdict | One-line reason |
+|---|---|:---:|---|
+| 1 | Communication (passive awareness) | ⚠️ conditional lead | ports the 3 primitives + 14 defense commands · zero-loss surfacing (duplicates are audited exceptions) · retraction with contamination-cascade closure · idempotent queue — but **the concept and the field data belong to AgentRadio** |
+| 2 | Role topology | ✅ ahead | heterogeneous three-vendor reviewers (claude · agy · codex) block correlated errors vs four same-model agents (a shared blind spot goes uncaught) |
+| 3 | Verification & quality gates | ✅ ahead | completion claims without evidence are machine-rejected via exit codes + a four-party convergence gate vs a pipeline whose only machine gate is checking that answer.txt exists — unanimity is a prompt sentence ("count the APPROVEs yourself") |
+| 4 | Recovery & durability | ✅ ahead | multi-layer recovery canon (SESSION_STATE · RECOVERY · persistent todos) + repairs born from real incidents (message-loss bug AA20 → single critical section; a 72%-quota burn → mission gate) vs single-layer process resume — server death = team state gone, token expiry = spin |
+| 5 | Resource control | ✅ ahead | pre-start resource gate · process ledger · group cleanup vs none (relies on container disposal) |
+| 6 | Human-in-the-loop | ✅ ahead | Approval Feed (exit 0/2/3) · kill-switch · denylist boundary vs "do NOT ask for human input" as the spec |
+| 7 | Everyday generality | ✅ ahead | daily operation + 114 skills + departments + offline-local (zero network listeners) vs a single-domain benchmark reproduction requiring Docker + Modal cloud + pinned Harbor (17 days of repo activity) |
+| 8 | Shipping maturity | ✅ ahead | notarization · dual-channel signed auto-update · 6 platform targets · release-gate CI vs no packaging · hardcoded version '0.1.0' · a checksum-less 106MB JAR from Google Drive |
+| 9 | **Measured performance proof** | ❌ **behind** | AgentRadio proved its method on a public benchmark — 124 tasks × 4 configs × 2 model families with statistical testing — **we have no system-level accuracy measurement, and the radio live pilot has not run yet** (remediation started: JAVIS-BENCH, a pilot on the same task set) |
+| 10 | Ecosystem | ✅ ahead | 86 deterministic tools + 114 skills + heterogeneous CLI adapters **already running in-house** vs 3 primitives (an MCP open-protocol agent-ecosystem ambition exists on their side) |
 
-| Axis | cys / Jarvis | AgentRadio |
+> Fairness note: AgentRadio is a **research artifact** built to prove one hypothesis, so
+> the absence of axes 5·6·8 is outside its design goal. Read the per-axis evidence, not
+> the totals; the axis-9 loss is our named next task. On judging (a same-vendor AI
+> judge): the same judge is fixed across all configurations, so **the bias cancels out in
+> the L2→L3 relative comparison** — what it does threaten is the absolute numbers and the
+> "leaderboard #1" narrative (the current single-agent leader at 63.17% exceeds 62.1%,
+> though the ~±5 confidence intervals overlap so neither direction is statistically
+> settled; AgentRadio is self-reported, not on the leaderboard). Cost, per the authors'
+> own figures: $2.96 → $19.45 per task (6.6×).
+
+### The quantitative scale — size and depth, all re-measured
+
+| Metric | AgentRadio | cys/Jarvis stack |
 |---|---|---|
-| Architecture (durability · recovery) | radio state is **files** (survives session clear & context compaction) · ack-cursor recovery · idempotency keys | server **JVM memory** (crash loses all conversation) · no dedup |
-| Feature surface | 66 CLI subcommands · 68 RPC methods · 86 deterministic tools · 114 skills | 3 comm primitives + state read |
-| Reliability · verification | **1,710 automated test cases** · 5 CI pipelines · radio: 297 assertions all PASS | **0** own tests · **0** CI · grader triplicated with divergent copies |
-| Security | fail-closed dual signing · kernel-derived sender identity · ACL · pre-publish secret scan | static credential `test` · unchecksummed 106MB JAR · all agents in permission-bypass mode |
-| Operations · observability | 9-tab Control Center · process ledger · watchdog · pre-flight resource gate | metering function is a no-op (token usage never collected) |
-| Maturity · distribution | 149 releases in 2 months · notarized macOS DMG · zero-downtime pack updates | 1 release (v1.0.0) |
+| Code size | ~3,300 lines (Python 2,017 + shell 1,301) | **~169,000 lines** (Rust 63,371 + pack Python 105,833 + more) = **~50 : 1** |
+| Self tests | **0** (no tests or CI for its own harness code) | **~1,700** — Rust `#[test]` 883 (src) · 920 (whole repo) + pack 531 + radio 297 (incl. 23 red-team cases; re-run same-day, all PASS) + 16 UI test files |
+| Communication surface | 3 primitives | 66 CLI subcommands (incl. 17 radio subcommands · a 10-code exit contract) |
+| CI | none (1 visible commit) | 5 lanes + flaky-test gate + notarization regression check |
+| Benchmark assets | **124 tasks · 1,306 rubrics · contamination canaries · statistical testing** (their strongest suit) | none — JAVIS-BENCH started to close this |
+| Docs languages | README in 6 languages (their win) | Korean canonical + an English README |
 
-In the broadcast-layer head-to-head (17 items), **radio (Jarvis) leads on all 11 durability/security/verification items** —
-machine-verified evidence with automatic claim demotion, two-stage secret scrubbing, and 4-level urgency with cooldowns have
-no counterpart in AgentRadio.
+> The 50:1 ratio cuts both ways — evidence of our depth, and of our complexity; their
+> smallness (fully auditable in an afternoon) is a scientific virtue, though one
+> undercut by an unauditable 106MB server binary.
 
-### Where AgentRadio leads — 2 axes + 3 items (acknowledged as-is)
+### ❌ Where we fall short — all of it, from the same survey
 
-| Their strength | Detail |
-|---|---|
-| Published benchmark score | SWE-Atlas QnA, 124 tasks: 32.3% solo → 62.1% with 4 agents (arXiv + press). **cys has no public benchmark score yet** |
-| External visibility · ecosystem | 3-paper arXiv lineage · VentureBeat coverage · README in 6 languages · MCP ecosystem (coral-server) |
-| Zero-modification portability | copy a few shell scripts into any harness — cys radio requires the cys stack |
-| Instant mention wake-up | server push returns immediately — radio's normal path polls at 5s (only BLOCKER gets direct stdin delivery) |
-| Cross-model evidence | reports the same effect direction on both Opus and DeepSeek |
+| # | Gap | Fact |
+|---|---|---|
+| 1 | **Zero public benchmark evidence** | we have no outcome-level proof that our orchestration raises task scores — JAVIS-BENCH (single agent vs Jarvis-style orchestration on the same SWE-Atlas QnA tasks) has been started to close this |
+| 2 | **Zero live radio tickets** | implementation, tests, and contracts are complete, but no ticket has run through it — at the radio layer alone, the field evidence is theirs |
+| 3 | **Intellectual priority is theirs** | passive awareness and the 3 primitives are AgentRadio's; our own spec declares the port. Ours is a hardened port |
+| 4 | **Single machine, no node auth** | radio is single-machine and unauthenticated (the name 'master' is always trusted) — their MCP server aims at cross-framework, multi-host reach |
+| 5 | **Docs language accessibility** | we have far more documentation, but mostly Korean — their README ships in 6 languages |
+| 6 | Other honest disclosures | no published cost figures (they publish theirs, down to the 6.6×) · Windows binaries not Authenticode-signed · radio's own docs admit full exactly-once and zero deaf-windows are not guaranteed (the hardening is partial) |
 
-That 62.1% cannot be quoted at face value, though — five discount findings confirmed by the audit: no aggregation code in the
-repo (unreproducible), an arithmetic error in the results table propagated to all 6 language READMEs, two lenient-bias defects
-in the grader, not listed on the official leaderboard (self-reported), and statistical indistinguishability from neighboring scores.
+### Detail — the radio layer 1:1 (the evidence behind the structural lead)
 
-### Our gaps — same yardstick, disclosed
+| | AgentRadio (original research) | JavisRadio (cys pack) |
+|---|---|---|
+| Surface | 3 primitives (create_thread / send_message / wait_for_mention) | those 3 + 14 defense commands = 17 subcommands |
+| Broadcast truth | none — content relayed as-is | FACT claims machine-verified against evidence (file · line · snippet); failures auto-demoted to hypothesis/unverified |
+| Duplication / loss | no idempotency keys, acks, or sequence numbers (mention delivery itself is a server push; the timeout-fallback detection is grep string-counting) — dedup delegated to LLM cognition | monotonic seq + separate surfacing/acceptance cursors — invariant hierarchy "never zero > never twice" |
+| Retracting a false broadcast | no concept | `retract` — closes the contamination cascade, including broadcasts that cited it |
+| Completion gate | the only machine check is that answer.txt exists (2-hour polling) — unanimity is a prompt sentence | done-check rejects unsurfaced/unresolved broadcasts via exit codes (10-code contract) |
+| Infrastructure | resident 106MB message server (auth key 'test') — server death = team state gone | no resident server — append-only files are the source of truth (rotation keeps seq continuity, archive after close) |
+| Abuse defense | none | cooldowns · per-sender circuit breaker · secret masking · record cap · pause isolation |
+| Verifiers | four same-model agents agreeing with each other | heterogeneous three-vendor reviewers combined with producer≠evaluator gates |
 
-No Windows Authenticode signing (no certificate) · no public benchmark score · external-adoption metrics unmeasured ·
-one stale figure set in the architecture doc. Next step: obtain a benchmark score on the same public harness (Harbor)
-under a producer≠evaluator protocol.
+JavisRadio's current evidence is 297 checks across 73 sealed cases — including 23
+red-team regressions, adversarial tests locking "a violation must be stopped by the
+exact exit code" — and a **live pilot has not run yet** (see Known limitations).
+Closing the axis-9 gap runs in that order: ① radio live pilot → ② the JAVIS-BENCH
+main experiment.
 
 ## Control Center (real-time monitoring + persistent analytics)
 
