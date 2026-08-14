@@ -263,6 +263,50 @@ red-team regressions, adversarial tests locking "a violation must be stopped by 
 exact exit code". The axis-9 gap is being closed through the JAVIS-BENCH main
 experiment.
 
+## Jarvis stack vs Hermes Agent — head-to-head with a heavyweight platform
+
+We compared NousResearch **Hermes Agent** (self-improving personal-agent platform · 230,268 stars ·
+1,377,316 lines of executable code — measured 2026-08-14 / GitHub API) via a full-repo survey plus two
+independent adversarial review passes. Unlike the AgentRadio comparison, **the other side is bigger**
+(~9.1× code, ~20× test cases) — we state that first, and keep only the Jarvis advantages that survived
+refutation attempts. Nine-axis verdict: **Jarvis 1 · Hermes 4 · split 3**; same-layer head-to-head
+(multi-agent orchestration & trust layer), 14 items: **Jarvis 6 · Hermes 5 · even 3**. Jarvis's six wins
+are all **trust & control**; their five are all **economy, convenience & openness** — in one line:
+**"they broadened capability; we locked down procedure."**
+
+### ✅ Where Jarvis leads — trust & control (6)
+
+| # | Capability | Measured fact |
+|---|---|---|
+| 1 | Inter-agent broadcast (passive awareness) | No JavisRadio counterpart in the Hermes **core** (exhaustive grep — every broadcast targets human channels or UI clients). Nearest: a task-scoped, CLI-only, polling blackboard |
+| 2 | Child agents pushing upward | Hermes children have `send_message` stripped — the parent can only tail logs. Jarvis workers push straight to the master's stdin (a fresh turn) |
+| 3 | Always-on, blocking verification gates | Jarvis: evidence-less "done" rejected with exit 5 · four-party convergence gate · FACT broadcasts machine-verified. Hermes: real verification *skills* exist but are **opt-in**; its always-on completion guard declares itself "never blocks completion" |
+| 4 | A seated, heterogeneous review bench | Three-vendor reviewers (Claude · Gemini · Codex) hold **standing seats** wired into gates, vs MoA advisory ensembles (not a verdict gate) and delegate-to-other-CLI skills — we also disclose we have not yet published live stats for our bench |
+| 5 | Agent-driven self-organization | The Jarvis master runs ticket → worker → convergence entirely through tools. Hermes's swarm topology (verifier/synthesizer) is CLI-only — not model-exposed |
+| 6 | Pre-flight resource control + signing chain | Resource gate before work starts (exit 2 = refuse) · process ledger / macOS notarization + minisign as a **fail-closed automated CI chain**, vs zero signing wiring across 27 CI workflows (notarization scripts skip **fail-open** without credentials) |
+
+### ❌ Where Hermes leads — all of it, honestly
+
+| # | Capability | Fact |
+|---|---|---|
+| 1 | Scale & breadth | 9.1× code · ~20× tests · 87 tools (+unlimited MCP) · 197 skills · 22 messenger platforms · 7 execution backends · 8 interfaces |
+| 2 | Execution security & sandboxing | 4,919-line approval engine (12 hardline + 99 dangerous patterns · de-obfuscation · LLM judge) · backend isolation · secret-source integrations — code signing is our only edge here |
+| 3 | Delegation economics & policy | Per-delegation cost/token rollup implemented / dangerous subagent commands **denied by default** (our auto-approve is a prose rule) |
+| 4 | Continuity & interop | Same session across CLI↔TUI↔desktop↔messengers / three open standards: A2A v1.0 · MCP server · ACP (+7-layer peer auth & audit log) |
+| 5 | Maturity & ecosystem | 230,268 vs 27 stars · 398 account contributors vs effectively one person · 388 vs 62 days · 22,240 vs 528 commits (same basis) |
+
+### Honest disclosure
+
+Neither side has public benchmark scores (their 264-line README claims zero performance numbers — honest
+restraint; our JAVIS-BENCH is underway). Hermes does have a verification culture (the grounded-citations
+ledger skill, an independent-reviewer skill, an unusually honest threat model) — our draft's "zero
+verification" claim was refuted in adversarial review and retracted, with the retraction kept on record.
+Our weaknesses, same yardstick: bus factor ≈ 1 · no open-standard surface (MCP server/A2A/ACP) ·
+unauthenticated radio nodes · no public benchmark. The two systems are complements, not substitutes —
+when **the result must be trusted**, you need our six capabilities; when **it must run anywhere,
+cheaply**, you need their five. Full numbers, file:line evidence and review records: the lane report
+`JAVIS-vs-Hermes-Agent-종합성능비교보고서-2026-08-14.md` (v2).
+
 ## Control Center (real-time monitoring + persistent analytics)
 
 A dedicated full panel in the app — `cysd` serves fleet, usage, and system over a single
