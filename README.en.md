@@ -184,34 +184,53 @@ denylist boundary. The only real friction in ② is two one-time gates:
 
 Moving from ② to ③ is a **single sentence**: "you are the master."
 
-## JavisRadio vs AgentRadio — where the radio layer comes from, and what we hardened
+## JavisRadio vs AgentRadio — where we lead, where we fall short
 
-cys's passive-awareness layer (Design Principle 6 · T5-20) has a cited origin —
-**AgentRadio** (arXiv:2607.28430) by Coral Protocol showed that letting four coding
-agents listen *while* they work lifts SWE-Atlas QnA task accuracy from 32.3% (single
-agent) to 62.1% (four agents, McNemar p=0.0023). JavisRadio ports its three primitives,
-then locks broadcast *trust* with machine gates instead of prompts. Summary of a full
-source-level survey of the original paper and repo (2026-08-14):
+cys's passive-awareness layer (Design Principle 6 · T5-20) is a re-implementation of the
+three primitives of **AgentRadio** (arXiv:2607.28430) by Coral Protocol, hardened with
+machine gates. The original research showed that letting four coding agents listen
+*while* they work lifts SWE-Atlas QnA task accuracy from 32.3% (single agent) to 62.1%
+(four agents, McNemar p=0.0023). Below is the verdict of a full source-level survey of
+the original paper and repo (2026-08-14), scored on 10 axes — **wins and losses first**.
+
+### At a glance — from cys/Jarvis's side: 8 ahead · 1 conditional · 1 behind
+
+| # | Axis | Verdict | One-line reason |
+|---|---|:---:|---|
+| 1 | Communication (passive awareness) | ⚠️ conditional lead | ports the 3 primitives + 14 defense commands · exactly-once surfacing · idempotent queue — but **the concept and the field data belong to AgentRadio** |
+| 2 | Role topology | ✅ ahead | heterogeneous three-vendor reviewers (claude · agy · codex) block correlated errors vs four same-model agents (a shared blind spot goes uncaught) |
+| 3 | Verification & quality gates | ✅ ahead | completion claims without evidence are machine-rejected via exit codes + a four-party convergence gate vs a prompt sentence ("count the APPROVEs yourself") with no verifying code |
+| 4 | Recovery & durability | ✅ ahead | multi-layer recovery canon (SESSION_STATE · RECOVERY · persistent todos) vs single-layer process resume — server death = team state gone, token expiry = spin |
+| 5 | Resource control | ✅ ahead | pre-start resource gate · process ledger · group cleanup vs none (relies on container disposal) |
+| 6 | Human-in-the-loop | ✅ ahead | Approval Feed (exit 0/2/3) · kill-switch · denylist boundary vs "do NOT ask for human input" as the spec |
+| 7 | Everyday generality | ✅ ahead | daily operation + 114 skills + departments vs a single-domain benchmark reproduction (17 days of repo activity) |
+| 8 | Shipping maturity | ✅ ahead | notarization · dual signing · 6 platform targets · release-gate CI vs a checksum-less 106MB JAR from Google Drive |
+| 9 | **Measured performance proof** | ❌ **behind** | AgentRadio proved its method on a public benchmark — 124 tasks × 4 configs × 2 model families with statistical testing — **we have no system-level accuracy measurement, and the radio live pilot has not run yet** |
+| 10 | Ecosystem | ✅ ahead | 86 deterministic tools + 114 skills + heterogeneous CLI adapters built in vs 3 primitives (an external agent ecosystem exists on their side) |
+
+> Fairness note: AgentRadio is a **research artifact** built to prove one hypothesis, so
+> the absence of axes 5·6·8 is outside its design goal. Read the per-axis evidence, not
+> the totals; the axis-9 loss is our named next task (public-benchmark measurement).
+> Context: the original's four-agent setup costs $2.96 → $19.45 per task (the authors'
+> own figures), and the benchmark's current single-agent leader (63.17%) already exceeds
+> 62.1%.
+
+### Detail — the radio layer 1:1 (the evidence behind the structural lead)
 
 | | AgentRadio (original research) | JavisRadio (cys pack) |
 |---|---|---|
 | Surface | 3 primitives (create_thread / send_message / wait_for_mention) | those 3 + 14 defense commands = 17 subcommands |
 | Broadcast truth | none — content relayed as-is | FACT claims machine-verified against evidence (file · line · snippet); failures auto-demoted to hypothesis/unverified |
 | Duplication / loss | no idempotency keys, acks, or sequence numbers — dedup delegated to LLM cognition | monotonic seq + separate surfacing/acceptance cursors — invariant hierarchy "never zero > never twice" |
-| Completion gate | a prompt sentence ("count the APPROVEs yourself") with no verifying code | done-check rejects unsurfaced/unresolved broadcasts via exit codes (10-code contract) |
+| Completion gate | a prompt sentence with no verifying code | done-check rejects unsurfaced/unresolved broadcasts via exit codes (10-code contract) |
 | Infrastructure | resident 106MB message server — server death = team state gone | no resident server — append-only files are the source of truth (rotation keeps seq continuity, archive after close) |
 | Abuse defense | none | cooldowns · per-sender circuit breaker · secret masking · record cap · pause isolation |
-| Verifiers | four same-model agents agreeing with each other (correlated errors go uncaught) | heterogeneous three-vendor reviewers (claude · agy · codex) combined with producer≠evaluator gates |
+| Verifiers | four same-model agents agreeing with each other | heterogeneous three-vendor reviewers combined with producer≠evaluator gates |
 
-**Where the original research is ahead, we say so** (house rule): AgentRadio proved its
-method on a public benchmark — 124 tasks × 4 configurations × 2 model families, a clean
-ablation ladder. That measurement rigor is exemplary. JavisRadio's current evidence is
-297 adversarial test assertions ("a violation must be stopped by the exact exit code");
-a **live pilot has not run yet** (see Known limitations). Context: the original's
-four-agent setup costs $2.96 → $19.45 per task (the authors' own figures), and the
-benchmark's current single-agent leader (63.17%) already exceeds 62.1% — the principle
-that communication structure lifts performance holds; specific superiority narratives
-have a shelf life. That is the survey's conclusion.
+JavisRadio's current evidence is 297 adversarial test assertions ("a violation must be
+stopped by the exact exit code"); a **live pilot has not run yet** (see Known
+limitations) — and closing the axis-9 gap runs in that order: ① radio live pilot →
+② public-benchmark measurement.
 
 ## Control Center (real-time monitoring + persistent analytics)
 
