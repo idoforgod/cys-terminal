@@ -2,7 +2,7 @@
 
 > cys-terminal + CYSJavis 팩이 **무엇을, 왜, 어떻게** 이렇게 만들었는지를 설명하는 문서입니다.
 > 설치·사용법은 [User Manual](USER-MANUAL.md), 첫인상은 [README](README.md)를 보세요.
-> 본문 주장의 근거는 저장소 소스 경로로 표기합니다. (v0.12.x 기준)
+> 본문 주장의 근거는 저장소 소스 경로로 표기합니다. (v0.14.x 기준)
 
 ---
 
@@ -188,7 +188,7 @@ CYSJavis 팩은 에이전트를 다섯 역할로 조직한다. 각 역할은 기
 │                                                                                │
 │  cys       CLI — pane 안의 AI가 쓰는 동등 노드 클라이언트 (60+ 서브커맨드)          │
 │                                                                                │
-│  pack      cysjavis-pack/ — 절대지침 6·결정론 도구 56·훅 18·스킬 102·스키마 3.    │
+│  pack      cysjavis-pack/ — 절대지침 10·결정론 도구 86·훅 31·스킬 114·스키마 4.   │
 │            빌드 시 바이너리에 임베드, 배포 시 minisign 서명                        │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -227,14 +227,14 @@ flock으로 거부.
 응답  {"id":1,"ok":true,"result":{...}} | {"id":1,"ok":false,"error":{"code","message"}}
 ```
 
-RPC는 60여 개 + `channel.*` 13종, 이벤트는 60여 종이 흐른다(전수 목록은
+RPC는 60여 개 + `channel.*` 13종, 이벤트는 90여 종이 흐른다(전수 목록은
 [User Manual §17](USER-MANUAL.md)). 서버→클라이언트 방향은 `events.stream` 푸시
 스트림이며 시퀀스 번호로 재접속 이어받기가 된다 — 구독을 replay보다 먼저 등록해 갭을
 막고, 밀리면(Lagged) 연결을 끊어 재접속 replay를 강제한다.
 
 ### 5.4 팩 실행 계층 — 지침을 집행하는 도구들
 
-팩의 `bin/`에는 **결정론 도구 56종**이 있다(표준 라이브러리·네트워크 0·LLM 호출 0이
+팩의 `bin/`에는 **결정론 도구 86종**이 있다(표준 라이브러리·네트워크 0·LLM 호출 0이
 기본). 오케스트레이션 한 사이클이 도구로 어떻게 이어지는지:
 
 ```
@@ -251,13 +251,13 @@ RPC는 60여 개 + `channel.*` 13종, 이벤트는 60여 종이 흐른다(전수
 복원      javis_state_snapshot (세대 보관) · javis_phoenix (부활 저널·정직 상태 enum)
 ```
 
-훅(`hooks/`, 18종)은 두 계급으로 명시 분리된다 — **OBSERVABILITY**(절대 차단 금지·항상
+훅(`hooks/`, 31종)은 두 계급으로 명시 분리된다 — **OBSERVABILITY**(절대 차단 금지·항상
 exit 0: 사용량 관측, statusline)와 **GATE**(deny-by-default·차단이 목적: 자율주행 guard,
 역할 능력 게이트, 기획 선행 게이트). 보안 스캐너(`javis_skillscan.py` — 46 규칙, 스킬
 정적 스캔 + 복원 주입 경로의 메모리 포이즌 스캔)와 MCP 거버넌스 게이트(`javis_mcpgate.py`
 — tool-poisoning·rug-pull 감지)가 공급망 방향을 지킨다.
 
-스킬은 102종(`skills/`)이 실리며, 외부 유래 스킬은 커밋 핀 + 파일별 sha256 매니페스트
+스킬은 114종(`skills/`)이 실리며, 외부 유래 스킬은 커밋 핀 + 파일별 sha256 매니페스트
 (`skills/_VENDOR_MANIFEST.json`)로 잠그고 `skills/THIRD_PARTY.md`에 귀속을 남긴다.
 
 ### 5.5 UI는 thin client다
