@@ -81,7 +81,7 @@ pack automatically.
 - **Windows**: `cys_<version>_x64-setup.exe` — daemon, CLI, and runtime bundled
   (self-contained). PE version-resource, manifest, and icon embedding reduce
   SmartScreen/Defender friction, but the build **is still unsigned, so a first-run
-  warning can appear** (honest disclosure). See
+  warning can appear**. See
   [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md).
 - Optional 24/365 always-on: `cys daemon install` (launchd KeepAlive / Task Scheduler).
 - Use `cys` from an external terminal: app Control Center → **"Install cys to shell"** (one click).
@@ -243,7 +243,7 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 | 1 | **Zero public benchmark evidence** | we have no outcome-level proof that our orchestration raises task scores — JAVIS-BENCH (single agent vs Jarvis-style orchestration on the same SWE-Atlas QnA tasks) has been started to close this |
 | 2 | **Intellectual priority is theirs** | passive awareness and the 3 primitives are AgentRadio's; our own spec declares the port. Ours is a hardened port |
 | 3 | **Single machine, no node auth** | radio is single-machine and unauthenticated (the name 'master' is always trusted) — their MCP server aims at cross-framework, multi-host reach |
-| 4 | Other honest disclosures | no published cost figures (they publish theirs, down to the 6.6×) · Windows binaries not Authenticode-signed · radio's own docs admit full exactly-once and zero deaf-windows are not guaranteed (the hardening is partial) |
+| 4 | Other known gaps | no published cost figures (they publish theirs, down to the 6.6×) · Windows binaries not Authenticode-signed · radio's own docs admit full exactly-once and zero deaf-windows are not guaranteed (the hardening is partial) |
 
 ### Detail — the radio layer 1:1 (the evidence behind the structural lead)
 
@@ -265,63 +265,47 @@ experiment.
 
 ## Jarvis stack vs Hermes Agent — head-to-head with a heavyweight platform
 
-We compared NousResearch **Hermes Agent** (self-improving personal-agent platform · 230,268 stars ·
-1,377,316 lines of executable code — measured 2026-08-14 / GitHub API) via a full-repo survey plus two
-independent adversarial review passes. Unlike the AgentRadio comparison, **the other side is bigger**
-(~9.1× code, ~20× test cases) — we state that first, and keep only the Jarvis advantages that survived
-refutation attempts. Nine-axis verdict: **Jarvis 1 · Hermes 4 · split 3**; same-layer head-to-head
-(multi-agent orchestration & trust layer), 14 items: **Jarvis 6 · Hermes 5 · even 3**. Jarvis's six wins
-are all **trust & control**; their five are all **economy, convenience & openness** — in one line:
-**"they broadened capability; we locked down procedure."**
+We compared NousResearch **Hermes Agent** (230,268 stars · 1,377,316 lines of executable code —
+measured 2026-08-14 / GitHub API) via a full-repo survey plus independent adversarial reviews. It is
+the bigger system (~9× code, ~20× test cases). Nine-axis verdict: **Jarvis ahead on 1 · Hermes ahead
+on 4 · split on 3**; a same-layer comparison of 14 capabilities: **Jarvis ahead on 6 · Hermes ahead
+on 5 · even on 3**. The six where Jarvis is ahead are all about **making results trustworthy** (trust
+& control); the five where Hermes is ahead are all about **running anywhere, cheaply and
+conveniently**. In one line: **Hermes broadened capability; Jarvis locked down procedure.** Neither
+side has public benchmark scores (our JAVIS-BENCH is underway). Full evidence: the lane report
+`JAVIS-vs-Hermes-Agent-종합성능비교보고서-2026-08-14.md` (adversarial-review-hardened).
 
-### ✅ Where Jarvis leads — trust & control (6)
+### ✅ Where Jarvis is ahead — trust & control (6)
 
-| # | Capability | Measured fact |
+| # | Capability | In plain words (all measured) |
 |---|---|---|
-| 1 | Inter-agent broadcast (passive awareness) | No JavisRadio counterpart in the Hermes **core** (exhaustive grep — every broadcast targets human channels or UI clients). Nearest: a task-scoped, CLI-only, polling blackboard |
-| 2 | Child agents pushing upward | Hermes children have `send_message` stripped — the parent can only tail logs. Jarvis workers push straight to the master's stdin (a fresh turn) |
-| 3 | Always-on, blocking verification gates | Jarvis: evidence-less "done" rejected with exit 5 · four-party convergence gate · FACT broadcasts machine-verified. Hermes: real verification *skills* exist but are **opt-in**; its always-on completion guard declares itself "deliberately passive… never blocks completion" |
-| 4 | A seated, heterogeneous review bench | Three-vendor reviewers (Claude · Gemini · Codex) hold **standing seats** wired into gates, vs MoA advisory ensembles (not a verdict gate) and delegate-to-other-CLI skills — we also disclose we have not yet published live stats for our bench |
-| 5 | Agent-driven self-organization | The Jarvis master runs ticket → worker → convergence entirely through tools. Hermes's swarm topology (verifier/synthesizer) is CLI-only — not model-exposed |
-| 6 | Pre-flight resource control + signing chain | Resource gate before work starts (exit 2 = refuse) · process ledger / macOS notarization + minisign as a **fail-closed automated CI chain**, vs zero signing wiring across 27 CI workflows (notarization scripts skip **fail-open** without credentials) |
+| 1 | A broadcast channel between agents | Jarvis has a radio (JavisRadio): news from teammates flows in while you keep working. Hermes core has no such broadcast (verified exhaustively — its closest thing is a board that agents poll) |
+| 2 | Workers reporting on their own | Hermes child agents have their send capability stripped; the boss must open their logs. Jarvis workers push reports straight to the master |
+| 3 | Machine-checked "done" | Jarvis rejects an evidence-free "done" by machine. Hermes has checking tools too, but the AI must choose to use them — and its always-on guard describes itself as an advisory that "never blocks completion" |
+| 4 | A review bench from different vendors | Jarvis seats Claude, Gemini and Codex reviewers full-time, wired into pass/fail gates (so they don't share the same blind spots). Hermes has multi-vendor *advice* and delegate-to-other-AI skills — but not a verdict gate |
+| 5 | Agents organizing their own team | The Jarvis master issues tickets, launches workers and checks convergence entirely through tools. Hermes's team topology (verifier/synthesizer) can only be set up by a human at the command line |
+| 6 | Braking before work + signed releases | Jarvis blocks work before it starts if resources fail the check, and refuses to install a release whose signature fails. Hermes has no signing/notarization in CI, and its scripts quietly skip signing when credentials are absent |
 
-### ❌ Where Hermes leads — all of it, honestly
+### ❌ Where Hermes is ahead — all of it
 
-| # | Capability | Fact | Root cause (measured — report §7-1) |
+| # | Capability | Fact | Why the gap exists (report §7-1) |
 |---|---|---|---|
-| 1 | Scale & breadth | 9.1× code · ~20× tests · 87 tools (+unlimited MCP) · 197 skills · 22 messenger platforms · 7 execution backends · 8 interfaces | ⚖️ Mixed — we built messaging **narrowly** (approval/report-only bridges — see 'Channel bridge' below), not not-at-all. Direction = a width of 2 vs 22 under data sovereignty; debt = the width itself, voice, mobile. Code/test multiples are a function of time & headcount |
-| 2 | Execution security & sandboxing | 4,919-line approval engine (12 hardline + 99 dangerous patterns · de-obfuscation · LLM judge) · backend isolation · secret-source integrations — code signing is our only edge here | ⚖️ Mixed — our network surface is small (zero listeners), but an approval engine guards against the **agent itself**, so the permission-surface debt is ours — porting de-obfuscation/injection scanning is roadmap |
-| 3 | Delegation economics & policy | Per-delegation cost/token rollup implemented / dangerous subagent commands **denied by default** (our auto-approve is a prose rule) | Policy = ⚖️ mixed (placing defenses before work and after output is a choice; the product's stated philosophy is HITL + signed prefixes, and that promotion is unfinished — debt) / cost rollup = 🔧 debt |
-| 4 | Continuity & interop | Same session across CLI↔TUI↔desktop↔messengers / three open standards: A2A v1.0 · MCP server · ACP (+7-layer peer auth & audit log) | Continuity = 🧭 direction (cross-device session sync means data leaving the machine — a direct conflict with the principle) / standards = ⚖️ (only A2A is direction; stdio MCP/ACP are debt — roadmap) |
-| 5 | Maturity & ecosystem | 230,268 vs 27 stars · 398 account contributors vs effectively one person · 388 vs 62 days · 22,240 vs 528 commits (same basis) | ⏳ A function of calendar & headcount — the dev model is one owner plus an AI fleet (and the calendar gap is not something debts can repay — stated as is) |
+| 1 | Size & breadth | 9.1× code · ~20× tests · 87 tools · 197 skills · 22 messengers · 7 execution backends | Half choice, half homework — Jarvis built messaging too, but narrowly: two approval/report-only bridges (see 'Channel bridge' below). We kept "data never leaves the machine" instead of broadening; the width itself is genuinely behind |
+| 2 | Command safety checks | A 4,919-line dangerous-command engine (111 patterns · de-obfuscation · an AI judge) | Half choice, half homework — Jarvis puts its checks before work starts and after results come out; the thinner mid-run check is homework we intend to import |
+| 3 | Cost tracking & worker policy | Auto-sums what child agents spend / risky child commands denied by default | Cost rollup is homework for Jarvis. The approval-policy difference is half choice, half homework |
+| 4 | Conversations that follow you · open standards | The same conversation continues across terminal↔app↔messengers / connects to outside AIs via three standards (A2A · MCP · ACP) | For a conversation to follow you across devices, data must leave the machine — a direct conflict with our principle (choice). Standards are half choice, half homework |
+| 5 | Age & adoption | 230,268 vs 27 stars · 398 contributors vs effectively one person · 388 vs 62 days | Neither philosophy nor homework — a function of calendar and headcount |
 
-### Why we lose — measured root causes
+### Where the differences come from — one paragraph
 
-Classifying all 20 losing axes/items against both sides' design documents (report §7-1; passed two
-delta adversarial audits): **🔧 pure debt 8 · ⚖️ mixed choice-and-debt 9 · 🧭 direction (direct
-conflict with a stated principle) 2 · ⏳ function of time 1**. The eight debts (public benchmark,
-Windows signing, supply-chain CI, cost rollup, …) are a list to pay off, no excuses. The common
-background of the rest is a different design center — ours is **"local-first: data never leaves the
-machine"** (zero network listeners · kernel-derived identity · a single-machine trust boundary);
-Hermes chose the opposite ("capability lives at the edges" · "$5 VPS… not tied to your laptop") and
-broadened its surfaces. So we built messaging narrowly (approval/report-only bridges — see 'Channel
-bridge' below) rather than not at all, and we did not build external telemetry because monitoring
-data must not leave the machine. We applied the same rule to Hermes: its opt-in verification is
-recognized as *their* direction ("deliberately passive" · narrow waist) — which does not change the
-verdict that no always-on blocking gate exists. Full 20-item table: report §7-1.
-
-### Honest disclosure
-
-Neither side has public benchmark scores (their 264-line README claims zero performance numbers — honest
-restraint; our JAVIS-BENCH is underway). Hermes does have a verification culture (the grounded-citations
-ledger skill, an independent-reviewer skill, an unusually honest threat model) — our draft's "zero
-verification" claim was refuted in adversarial review and retracted, with the retraction kept on record.
-Our weaknesses, same yardstick: bus factor ≈ 1 · no open-standard surface (MCP server/A2A/ACP) ·
-unauthenticated radio nodes · no public benchmark — which of these are choices and which are debts
-is recorded, measured, in the table above and report §7-1. The two systems are complements, not substitutes —
-when **the result must be trusted**, you need our six capabilities; when **it must run anywhere,
-cheaply**, you need their five. Full numbers, file:line evidence and review records: the lane report
-`JAVIS-vs-Hermes-Agent-종합성능비교보고서-2026-08-14.md` (v2).
+The two systems aim at different things. Hermes aims at "**a capable assistant that goes everywhere
+with you**" and broadened its surfaces (their design doc: "capability lives at the edges"). Jarvis
+aims at "**on my machine, with results I can trust**" and locked its boundary (our design doc:
+"local-first — data never leaves the machine"). Taking the 20 axes/items where Hermes is ahead one
+by one: **8 are homework Jarvis must do** (public benchmark, Windows signing, supply-chain checks,
+…), **11 are differences born of the different aim** (wholly or partly), **1 is a function of
+time**. We applied the same yardstick to Hermes's own weak spots. Item-by-item evidence (file:line)
+and the full table: report §7-1.
 
 ## Control Center (real-time monitoring + persistent analytics)
 
@@ -468,7 +452,7 @@ PTY is daemon-owned — sessions persist across UI restart and app reinstall (re
 Report vulnerabilities per [SECURITY.md](SECURITY.md); details in
 [Architecture & Philosophy §6](ARCHITECTURE-AND-PHILOSOPHY.md).
 
-## Known limitations (honest disclosure)
+## Known limitations
 
 - On macOS, if sysinfo can't read the full cmdline, processes are grouped by name
   (possible over-grouping).
@@ -482,7 +466,7 @@ Report vulnerabilities per [SECURITY.md](SECURITY.md); details in
   a delivery-ledger audit trail.
 - The **Windows upgrade-atomicity** repair goes as far as code review and model
   verification on a Mac dev machine; real-hardware confirmation is in progress
-  (honest disclosure).
+ .
 - The **macOS build is unsigned** — the installer helper lowers friction, but a first-run
   warning can still appear, and "half-install vs. quarantine" is disambiguated with
   `cys doctor app-seal`.
