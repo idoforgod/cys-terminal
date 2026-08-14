@@ -1622,7 +1622,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     fontSize,
     // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
     theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
-    scrollback: 5000,
+    // 5000줄은 며칠씩 상주하는 에이전트 pane(각성 핑·지침 재주입 반복)에서 반나절 안에 꽉 차
+    // 오래된 줄이 물리적으로 버려진다 — "스크롤이 일정 화면까지만 올라가고 멈춘다"의 실제 원인.
+    scrollback: 100000,
   });
   const fit = new FitAddon();
   term.loadAddon(fit);
