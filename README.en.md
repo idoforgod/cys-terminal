@@ -184,6 +184,52 @@ denylist boundary. The only real friction in ② is two one-time gates:
 
 Moving from ② to ③ is a **single sentence**: "you are the master."
 
+## Head-to-head — Coral AgentRadio (full-repo audit, 2026-08)
+
+The same concept — a passive-awareness broadcast layer where agents "hear while they work" — was published by academia
+as an experiment and shipped by cys as a product. We audited [Coral-Protocol/AgentRadio](https://github.com/Coral-Protocol/AgentRadio)
+(the reproduction repo for [arXiv:2607.28430](https://arxiv.org/abs/2607.28430)) **file by file, with measurements**, followed by
+two independent adversarial reviews. As of 2026-08-14 (cys v0.14.15 ↔ AgentRadio HEAD 5e4e137).
+
+> **Honest framing** — one side is paper-experiment code (3,318 executable lines), the other a product in daily operation
+> for two months (151,307 executable lines). Different weight classes; the tables below report measured differences per axis,
+> not a victory lap.
+
+### Where Jarvis leads — 6 of 8 judged axes (all measured)
+
+| Axis | cys / Jarvis | AgentRadio |
+|---|---|---|
+| Architecture (durability · recovery) | radio state is **files** (survives session clear & context compaction) · ack-cursor recovery · idempotency keys | server **JVM memory** (crash loses all conversation) · no dedup |
+| Feature surface | 66 CLI subcommands · 68 RPC methods · 86 deterministic tools · 114 skills | 3 comm primitives + state read |
+| Reliability · verification | **1,710 automated test cases** · 5 CI pipelines · radio: 297 assertions all PASS | **0** own tests · **0** CI · grader triplicated with divergent copies |
+| Security | fail-closed dual signing · kernel-derived sender identity · ACL · pre-publish secret scan | static credential `test` · unchecksummed 106MB JAR · all agents in permission-bypass mode |
+| Operations · observability | 9-tab Control Center · process ledger · watchdog · pre-flight resource gate | metering function is a no-op (token usage never collected) |
+| Maturity · distribution | 149 releases in 2 months · notarized macOS DMG · zero-downtime pack updates | 1 release (v1.0.0) |
+
+In the broadcast-layer head-to-head (17 items), **radio (Jarvis) leads on all 11 durability/security/verification items** —
+machine-verified evidence with automatic claim demotion, two-stage secret scrubbing, and 4-level urgency with cooldowns have
+no counterpart in AgentRadio.
+
+### Where AgentRadio leads — 2 axes + 3 items (acknowledged as-is)
+
+| Their strength | Detail |
+|---|---|
+| Published benchmark score | SWE-Atlas QnA, 124 tasks: 32.3% solo → 62.1% with 4 agents (arXiv + press). **cys has no public benchmark score yet** |
+| External visibility · ecosystem | 3-paper arXiv lineage · VentureBeat coverage · README in 6 languages · MCP ecosystem (coral-server) |
+| Zero-modification portability | copy a few shell scripts into any harness — cys radio requires the cys stack |
+| Instant mention wake-up | server push returns immediately — radio's normal path polls at 5s (only BLOCKER gets direct stdin delivery) |
+| Cross-model evidence | reports the same effect direction on both Opus and DeepSeek |
+
+That 62.1% cannot be quoted at face value, though — five discount findings confirmed by the audit: no aggregation code in the
+repo (unreproducible), an arithmetic error in the results table propagated to all 6 language READMEs, two lenient-bias defects
+in the grader, not listed on the official leaderboard (self-reported), and statistical indistinguishability from neighboring scores.
+
+### Our gaps — same yardstick, disclosed
+
+No Windows Authenticode signing (no certificate) · no public benchmark score · external-adoption metrics unmeasured ·
+one stale figure set in the architecture doc. Next step: obtain a benchmark score on the same public harness (Harbor)
+under a producer≠evaluator protocol.
+
 ## Control Center (real-time monitoring + persistent analytics)
 
 A dedicated full panel in the app — `cysd` serves fleet, usage, and system over a single
