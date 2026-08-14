@@ -209,7 +209,7 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 | 6 | Human-in-the-loop | ✅ ahead | Approval Feed (exit 0/2/3) · kill-switch · denylist boundary vs "do NOT ask for human input" as the spec |
 | 7 | Everyday generality | ✅ ahead | daily operation + 114 skills + departments + offline-local (zero network listeners) vs a single-domain benchmark reproduction requiring Docker + Modal cloud + pinned Harbor (17 days of repo activity) |
 | 8 | Shipping maturity | ✅ ahead | notarization · dual-channel signed auto-update · 6 platform targets · release-gate CI vs no packaging · hardcoded version '0.1.0' · a checksum-less 106MB JAR from Google Drive |
-| 9 | **Measured performance proof** | ❌ **behind** | AgentRadio proved its method on a public benchmark — 124 tasks × 4 configs × 2 model families with statistical testing — **we have no system-level accuracy measurement, and the radio live pilot has not run yet** (remediation started: JAVIS-BENCH, a pilot on the same task set) |
+| 9 | **Measured performance proof** | ❌ **behind** | AgentRadio proved its method on a public benchmark — 124 tasks × 4 configs × 2 model families with statistical testing — **we have no system-level accuracy measurement** (remediation started: JAVIS-BENCH, a pilot on the same task set) |
 | 10 | Ecosystem | ✅ ahead | 86 deterministic tools + 114 skills + heterogeneous CLI adapters **already running in-house** vs 3 primitives (an MCP open-protocol agent-ecosystem ambition exists on their side) |
 
 > Fairness note: AgentRadio is a **research artifact** built to prove one hypothesis, so
@@ -231,7 +231,6 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 | Communication surface | 3 primitives | 66 CLI subcommands (incl. 17 radio subcommands · a 10-code exit contract) |
 | CI | none (1 visible commit) | 5 lanes + flaky-test gate + notarization regression check |
 | Benchmark assets | **124 tasks · 1,306 rubrics · contamination canaries · statistical testing** (their strongest suit) | none — JAVIS-BENCH started to close this |
-| Docs languages | README in 6 languages (their win) | Korean canonical + an English README |
 
 > The 50:1 ratio cuts both ways — evidence of our depth, and of our complexity; their
 > smallness (fully auditable in an afternoon) is a scientific virtue, though one
@@ -242,11 +241,9 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 | # | Gap | Fact |
 |---|---|---|
 | 1 | **Zero public benchmark evidence** | we have no outcome-level proof that our orchestration raises task scores — JAVIS-BENCH (single agent vs Jarvis-style orchestration on the same SWE-Atlas QnA tasks) has been started to close this |
-| 2 | **Zero live radio tickets** | implementation, tests, and contracts are complete, but no ticket has run through it — at the radio layer alone, the field evidence is theirs |
-| 3 | **Intellectual priority is theirs** | passive awareness and the 3 primitives are AgentRadio's; our own spec declares the port. Ours is a hardened port |
-| 4 | **Single machine, no node auth** | radio is single-machine and unauthenticated (the name 'master' is always trusted) — their MCP server aims at cross-framework, multi-host reach |
-| 5 | **Docs language accessibility** | we have far more documentation, but mostly Korean — their README ships in 6 languages |
-| 6 | Other honest disclosures | no published cost figures (they publish theirs, down to the 6.6×) · Windows binaries not Authenticode-signed · radio's own docs admit full exactly-once and zero deaf-windows are not guaranteed (the hardening is partial) |
+| 2 | **Intellectual priority is theirs** | passive awareness and the 3 primitives are AgentRadio's; our own spec declares the port. Ours is a hardened port |
+| 3 | **Single machine, no node auth** | radio is single-machine and unauthenticated (the name 'master' is always trusted) — their MCP server aims at cross-framework, multi-host reach |
+| 4 | Other honest disclosures | no published cost figures (they publish theirs, down to the 6.6×) · Windows binaries not Authenticode-signed · radio's own docs admit full exactly-once and zero deaf-windows are not guaranteed (the hardening is partial) |
 
 ### Detail — the radio layer 1:1 (the evidence behind the structural lead)
 
@@ -261,11 +258,10 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 | Abuse defense | none | cooldowns · per-sender circuit breaker · secret masking · record cap · pause isolation |
 | Verifiers | four same-model agents agreeing with each other | heterogeneous three-vendor reviewers combined with producer≠evaluator gates |
 
-JavisRadio's current evidence is 297 checks across 73 sealed cases — including 23
+JavisRadio's quality evidence is 297 checks across 73 sealed cases — including 23
 red-team regressions, adversarial tests locking "a violation must be stopped by the
-exact exit code" — and a **live pilot has not run yet** (see Known limitations).
-Closing the axis-9 gap runs in that order: ① radio live pilot → ② the JAVIS-BENCH
-main experiment.
+exact exit code". The axis-9 gap is being closed through the JAVIS-BENCH main
+experiment.
 
 ## Control Center (real-time monitoring + persistent analytics)
 
