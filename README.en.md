@@ -201,7 +201,7 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 
 | # | Axis | Verdict | One-line reason |
 |---|---|:---:|---|
-| 1 | Communication (passive awareness) | ⚠️ conditional lead | ports the 3 primitives + 14 defense commands · exactly-once surfacing · retraction with contamination-cascade closure · idempotent queue — but **the concept and the field data belong to AgentRadio** |
+| 1 | Communication (passive awareness) | ⚠️ conditional lead | ports the 3 primitives + 14 defense commands · zero-loss surfacing (duplicates are audited exceptions) · retraction with contamination-cascade closure · idempotent queue — but **the concept and the field data belong to AgentRadio** |
 | 2 | Role topology | ✅ ahead | heterogeneous three-vendor reviewers (claude · agy · codex) block correlated errors vs four same-model agents (a shared blind spot goes uncaught) |
 | 3 | Verification & quality gates | ✅ ahead | completion claims without evidence are machine-rejected via exit codes + a four-party convergence gate vs a pipeline whose only machine gate is checking that answer.txt exists — unanimity is a prompt sentence ("count the APPROVEs yourself") |
 | 4 | Recovery & durability | ✅ ahead | multi-layer recovery canon (SESSION_STATE · RECOVERY · persistent todos) + repairs born from real incidents (message-loss bug AA20 → single critical section; a 72%-quota burn → mission gate) vs single-layer process resume — server death = team state gone, token expiry = spin |
@@ -217,8 +217,9 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 > the totals; the axis-9 loss is our named next task. On judging (a same-vendor AI
 > judge): the same judge is fixed across all configurations, so **the bias cancels out in
 > the L2→L3 relative comparison** — what it does threaten is the absolute numbers and the
-> "leaderboard #1" narrative (the current single-agent leader at 63.17% already exceeds
-> 62.1%; AgentRadio is self-reported, not on the leaderboard). Cost, per the authors'
+> "leaderboard #1" narrative (the current single-agent leader at 63.17% exceeds 62.1%,
+> though the ~±5 confidence intervals overlap so neither direction is statistically
+> settled; AgentRadio is self-reported, not on the leaderboard). Cost, per the authors'
 > own figures: $2.96 → $19.45 per task (6.6×).
 
 ### The quantitative scale — size and depth, all re-measured
@@ -227,7 +228,7 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 |---|---|---|
 | Code size | ~3,300 lines (Python 2,017 + shell 1,301) | **~169,000 lines** (Rust 63,371 + pack Python 105,833 + more) = **~50 : 1** |
 | Self tests | **0** (no tests or CI for its own harness code) | **~1,700** — Rust `#[test]` 883 (src) · 920 (whole repo) + pack 531 + radio 297 (incl. 23 red-team cases; re-run same-day, all PASS) + 16 UI test files |
-| Communication surface | 3 primitives | 67 CLI subcommands (incl. 17 radio subcommands · a 10-code exit contract) |
+| Communication surface | 3 primitives | 66 CLI subcommands (incl. 17 radio subcommands · a 10-code exit contract) |
 | CI | none (1 visible commit) | 5 lanes + flaky-test gate + notarization regression check |
 | Benchmark assets | **124 tasks · 1,306 rubrics · contamination canaries · statistical testing** (their strongest suit) | none — JAVIS-BENCH started to close this |
 | Docs languages | README in 6 languages (their win) | Korean canonical + an English README |
@@ -253,7 +254,7 @@ number re-execution), scored on 10 axes — **wins and losses first**.
 |---|---|---|
 | Surface | 3 primitives (create_thread / send_message / wait_for_mention) | those 3 + 14 defense commands = 17 subcommands |
 | Broadcast truth | none — content relayed as-is | FACT claims machine-verified against evidence (file · line · snippet); failures auto-demoted to hypothesis/unverified |
-| Duplication / loss | no idempotency keys, acks, or sequence numbers (message detection is grep string-counting) — dedup delegated to LLM cognition | monotonic seq + separate surfacing/acceptance cursors — invariant hierarchy "never zero > never twice" |
+| Duplication / loss | no idempotency keys, acks, or sequence numbers (mention delivery itself is a server push; the timeout-fallback detection is grep string-counting) — dedup delegated to LLM cognition | monotonic seq + separate surfacing/acceptance cursors — invariant hierarchy "never zero > never twice" |
 | Retracting a false broadcast | no concept | `retract` — closes the contamination cascade, including broadcasts that cited it |
 | Completion gate | the only machine check is that answer.txt exists (2-hour polling) — unanimity is a prompt sentence | done-check rejects unsurfaced/unresolved broadcasts via exit codes (10-code contract) |
 | Infrastructure | resident 106MB message server (auth key 'test') — server death = team state gone | no resident server — append-only files are the source of truth (rotation keeps seq continuity, archive after close) |
