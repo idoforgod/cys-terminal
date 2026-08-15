@@ -1460,6 +1460,80 @@ pub(crate) mod tests {
         );
     }
 
+    /// ★(W4 · D2 part-cap CEO 변형) — 핀 ① 의 **CEO 승격 합성 케이스**(≈59KB 페이로드 상당).
+    ///
+    /// 승격 후 CEO pane 에 실제로 들어가는 라이브 md 는 마스터 단독이 아니라 **CEO 합성본**
+    /// = [CEO 머리글 fragment] + [합성 서문 ≈600자] + [구분선] + [MASTER 본문 바이트 무수정]
+    /// (스펙 §D2 — 기대 수치 ≈780 제출단위 · 4배 여유 3,120 ≤ 4,000). 핀 ① 이 master 합성만
+    /// 재면 승격 함대의 실배포 규모가 사각이 된다 — 여기서 그 규모를 직접 잰다.
+    ///
+    /// ★전방 호환(gen_ceo_template.py 재합성 이전/이후 자기조정): D2 재합성 후에는
+    /// `CEO_TEMPLATE.md` 파일 자체가 이미 [머리글+서문+MASTER 연접]이다 — 그때 이 테스트가
+    /// MASTER 를 또 이어붙이면 이중 합산(≈113KB)으로 핀이 **오발화**한다. 그래서 템플릿이
+    /// MASTER 본문을 이미 포함하면(containment 판별) 파일 그대로를 합성본으로 쓰고,
+    /// 현행 6KB 머리글 템플릿이면 스펙 §D2 모양대로 여기서 연접한다.
+    #[test]
+    fn deployed_ceo_directive_payload_fits_part_cap_with_headroom() {
+        const REQUIRED_HEADROOM: usize = 4;
+        let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
+        let read = |rel: &str| std::fs::read_to_string(pack.join(rel)).unwrap_or_default();
+        let ceo = read("directives/CEO_TEMPLATE.md");
+        let master = read("directives/MASTER_DIRECTIVE.md");
+        assert!(
+            !ceo.is_empty() && !master.is_empty(),
+            "팩 경로가 갈렸다({}) — CEO/MASTER 디렉티브를 읽어야 실측이다",
+            pack.display()
+        );
+        let synthesized = if ceo.contains(master.trim_end()) {
+            ceo // 재합성 이후: 파일이 곧 완성 합성본(이중 합산 금지)
+        } else {
+            // 재합성 이전: §D2 모양(머리글+서문 600자 상당+구분선+MASTER 무수정)을 여기서 연접.
+            let preamble: String = std::iter::repeat(
+                "직할/부서 위임 판단 트리·자원 관할 분리·RSI 범위·verdict 계약 — CEO 합성 서문 상당 문안\n",
+            )
+            .take(15)
+            .collect();
+            format!("{ceo}\n{preamble}\n---\n\n{master}")
+        };
+        assert!(
+            synthesized.len() >= 55_000,
+            "합성본이 ≈59KB 페이로드 상당이어야 케이스가 성립한다 (실측 {} bytes)",
+            synthesized.len()
+        );
+        // compose_directive 후첨과 같은 순서 — RSI → soul → 장기메모리 색인 → 스킬 색인(핀 ① 동형).
+        let mut composed = synthesized;
+        composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
+        composed.push_str(&read("soul.md"));
+        composed.push_str(&read("memory/MEMORY.md"));
+        if let Ok(entries) = std::fs::read_dir(pack.join("skills")) {
+            for e in entries.flatten() {
+                let skill = std::fs::read_to_string(e.path().join("SKILL.md")).unwrap_or_default();
+                let field = |k: &str| {
+                    skill
+                        .lines()
+                        .take(10)
+                        .find_map(|l| l.strip_prefix(k))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let (name, desc) = (field("name:"), field("description:"));
+                if !name.is_empty() {
+                    composed.push_str(&format!("\n- {name}: {desc}"));
+                }
+            }
+        }
+        let units = submit_units(&composed).len();
+        assert!(
+            units * REQUIRED_HEADROOM <= MAX_PARTS,
+            "CEO 합성 문안이 {units} 제출단위인데 조각 상한은 {MAX_PARTS} 다 \
+             (요구 여유 {REQUIRED_HEADROOM}배 = {} 단위 이하 · 스펙 기대 ≈780 단위·3,120≤4,000). \
+             상한을 올리거나 서문/디렉티브를 줄여라 — 초과 행은 원장에 없고, 그 행이 단독 \
+             제출되면 임무 게이트가 기계 push 를 오너 임무로 오인한다(SOT §4-7 ⓑ).",
+            MAX_PARTS / REQUIRED_HEADROOM
+        );
+    }
+
     /// ★R7 회귀 핀 ② — **디렉티브급 push 1회의 원장 비용과 회전까지의 횟수**를 실측으로 묶는다.
     ///
     /// R6 이 조각 레코드를 도입하며 회전이 572 배 빨라졌다는 것이 라운드6 검증자의 실측이었다

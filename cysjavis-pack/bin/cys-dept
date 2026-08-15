@@ -67,7 +67,9 @@ dept_tombstone(){
   # ★D-IMPL-2 대칭 계약: phoenix 묘비와 데몬 묘비(base cysd topology)는 항상 쌍으로 set/remove —
   # 데몬 묘비는 리바이버(spawn_org_restore·프론트 복원)의 게이트, phoenix 묘비는 보호집합의 게이트.
   # GUI 삭제의 의도-선기록(Tauri dept_tombstone_by_socket)과는 멱등 중복(무해). best-effort.
-  env -u CYS_SOCKET "$CYS" tombstone "$1" --dept >/dev/null 2>&1 || true
+  # ★D3(i) 인자 위생: clap `--` 옵션 종단 — '-' 선두 등재명(레거시 잔재)이 옵션으로 오파싱돼
+  #   묘비가 무음 미기록되는 부활 구멍 봉합(cys 호출 공통 규약: --dept [--remove] -- "$name").
+  env -u CYS_SOCKET "$CYS" tombstone --dept -- "$1" >/dev/null 2>&1 || true
   ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
   [ -f "$ph" ] || return 0
   python3 "$ph" tombstone "$1" --dept >/dev/null 2>&1 || true
@@ -83,7 +85,8 @@ dept_tombstone_remove(){
   # spawn_org_restore가 묘비로 오판해 reap(재생성-살해). phoenix와 쌍 유지.
   # ★R11(적대검증 A2): 해소 실패는 무음 금지 — 잔존 묘비=재생성 부서 reap이므로 WARN 가시화
   # (비치명: 다음 재생성/lifecycle 재시도가 재해소).
-  env -u CYS_SOCKET "$CYS" tombstone "$1" --dept --remove >/dev/null 2>&1 \
+  # ★D3(i) 인자 위생: `--` 종단(위 dept_tombstone과 동일 규약).
+  env -u CYS_SOCKET "$CYS" tombstone --dept --remove -- "$1" >/dev/null 2>&1 \
     || echo "[cys-dept] WARN: 데몬 묘비 해소 미확정($1 — base 미도달) — 재시도 필요(잔존 시 재시작에서 부서 reap 위험)" >&2
   ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
   [ -f "$ph" ] || return 0
@@ -173,12 +176,70 @@ graceful_kill(){
   esac
 }
 
+# ── ★D3(i) 부서명 검증 (v4 수리 스펙 — `launch --help` 유령부서→껍데기 CEO 승격 실사고 봉합) ──
+# 화이트리스트 ^[A-Za-z0-9][A-Za-z0-9_-]*$ — '.' 불허(Windows pipe_slug(state.rs:1133-1139)가 '.'을
+# 소거해 점만 다른 두 부서의 상태 디렉토리가 병합되는 격리 붕괴 봉합)·'-' 선두 불허(옵션 오파싱)·
+# 최대 40자(macOS unix 소켓 104B 한계 여유)·LC_ALL=C(로케일 무관 결정론).
+# 거부 exit=2(기존 usage 계열과 통일) 고정 — ★재사용 금지 집합={1,3,4,5,6,7,8,9}
+# (1=기동실패·3/4=카탈로그·5=계정·6=시드·7=단일소유·8=cap/미등재·9=rotate 미응답 — GUI 분기 오동작 방지).
+dept_name_ok(){ LC_ALL=C printf '%s' "$1" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$'; }
+# 거부 진단 단일 지점: $1=name, $2=해당 동사 usage 1줄(빈값=무진단·비0 반환만 — passthrough 판별용),
+# $3=추가 안내(rotate '비정형 등재' 등). 불합격=stderr 진단(+usage 1줄 병기)+exit 2.
+validate_dept_name(){
+  local name="$1" u="${2:-}" hint="${3:-}"
+  dept_name_ok "$name" && return 0
+  [ -n "$u" ] || return 1
+  echo "[cys-dept] 부적격 부서명('$name') — 허용 ^[A-Za-z0-9][A-Za-z0-9_-]*$ (최대 40자·빈이름/'.'포함/'-'선두 불가)" >&2
+  echo "usage: cys-dept $u" >&2
+  if [ -n "$hint" ]; then echo "[cys-dept] $hint" >&2; fi
+  exit 2
+}
+# ★A2 slug-fold 중복 거부: fold=소문자화+'.' 제거 — Windows pipe_slug 정규화·대소문자 불감 FS와 정합
+# (fold가 같으면 win에서 상태 디렉토리(transcripts.db·feed.jsonl)가 병합된다). 거부 = fold(신규)==
+# fold(기존 등재명) ∧ 신규≠기존(바이트 동일 자기 항목 제외 — 자기 제외가 없으면 GUI 복원 재-launch·
+# rotate 재귀가 전부 거부된다). 회귀 핀: 기존명 재-launch/rotate 통과. 검사 지점=reg_upsert 진입부와
+# allocate 예약 사후 assert 공통(+launch는 부작용-이전 조기 호출). 기존 충돌 쌍 가시화는 preflight 소관.
+dept_name_fold(){ printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | tr -d '.'; }
+reject_slug_collision(){
+  local name="$1" fold ex
+  fold="$(dept_name_fold "$name")"
+  # 파이프 대신 heredoc(reap 관용) — 파이프 서브셸이면 exit 2가 스크립트를 못 끝낸다.
+  while IFS= read -r ex; do
+    [ -n "$ex" ] || continue
+    [ "$ex" = "$name" ] && continue          # 자기 항목(바이트 동일) — 재-launch/rotate 통과
+    if [ "$(dept_name_fold "$ex")" = "$fold" ]; then
+      echo "[cys-dept] 부서명 slug 충돌: '$name' ↔ 기존 등재 '$ex' (fold='$fold' 동일 — win 상태 디렉토리 병합 위험) — 거부(개명 후 재시도)" >&2
+      exit 2
+    fi
+  done <<EOF
+$(reg_names)
+EOF
+}
+# cmd 위치 --help/-h 전용 usage(stdout) — name 위치의 --help는 usage가 아니라 검증 거부(exit 2)다.
+usage(){
+  cat <<'USAGE'
+usage: cys-dept <verb> ...
+  cys-dept launch <name>                        부서 데몬 spawn+ACL 시드+등재 (name: ^[A-Za-z0-9][A-Za-z0-9_-]*$·최대 40자)
+  cys-dept allocate                             lowest-unused dept-N 자동 발급·기동
+  cys-dept create <catalog-key>                 카탈로그 기반 완전 자동 부서 생성
+  cys-dept down <name> [--purge-state]          teardown(+state 격리)
+  cys-dept down-sock <socket>                   socket 기준 teardown
+  cys-dept rotate <name>                        버전 스큐 세대교체(재기동·폐기 아님)
+  cys-dept reap [--dry]                         죽은 등록·유휴 부서 회수
+  cys-dept promote-ceo                          CEO 승격(오너 지명)
+  cys-dept promote-if-pending [--request-only]  보류 승격 해소(알림만=--request-only)
+  cys-dept list                                 부서명 목록
+  cys-dept sock <name>                          부서 소켓 경로 출력
+  cys-dept <name> -- <cmd>                      부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
+USAGE
+}
+
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
 reg_count(){ reg_init; python3 -c "import json;print(len(json.load(open('$REG'))['depts']))"; }
 reg_names(){ reg_init; python3 -c "import json;[print(k) for k in json.load(open('$REG'))['depts']]"; }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
-reg_upsert(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
 import json,sys,os
 try:
     import fcntl
@@ -538,11 +599,33 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   # ★동시 승격 직렬화(2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
   # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
   # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
-  _swap(){ [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"; }
+  # ★승격 영수증(G0 D3·스펙 D3(ii)): _swap이 cp 후 적용 템플릿의 sha256을 pack 트리 내
+  #   directives/.ceo-template-applied 에 기록(내용=hex 해시 1줄) — preflight C03이 '영수증 해시
+  #   등가 > 표지 3핀 폴백' 우선순위로 승격 표지를 결정론 판정한다. 위치를 ~/.cys/state가 아닌
+  #   pack 트리에 두는 근거=Tier1 백업 원자성(.pre-ceo와 같은 축·복원 시 세대 불일치 방지).
+  #   기록 실패는 승격 불차단(fail-open — 판정은 표지 핀 폴백). shasum=mac/win PortableGit 공통 가용.
+  _swap(){
+    [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"
+    local h
+    if h="$(shasum -a 256 "$md" 2>/dev/null)" && [ -n "$h" ]; then
+      printf '%s\n' "${h%% *}" > "$PACK_DEFAULT/directives/.ceo-template-applied"
+    else
+      echo "[cys-dept] WARN: 승격 영수증 기록 실패(.ceo-template-applied) — C03은 표지 핀 폴백으로 판정" >&2
+    fi
+  }
   if command -v flock >/dev/null 2>&1; then
     ( flock 9; _swap ) 9>"$md.promote.lock"
   else
-    _swap
+    # ★A13(win): PortableGit엔 flock CLI가 없어 종전엔 무락(D-5 동시 승격 레이스 방어 부재) —
+    #   mkdir 원자 락 폴백(원자적 mkdir 성공=락 획득). 획득 실패=경고 후 진행(현행 무락보다 강화·
+    #   인간 페이스 더블클릭은 저위험이라 차단하지 않는다 — 잔존 락은 수동 rmdir 안내).
+    if mkdir "$md.promote.lock.d" 2>/dev/null; then
+      _swap
+      rmdir "$md.promote.lock.d" 2>/dev/null || true
+    else
+      echo "[cys-dept] WARN: 승격 락($md.promote.lock.d) 획득 실패 — 동시 승격 의심, 무락 진행(잔존 락은 rmdir로 정리)" >&2
+      _swap
+    fi
   fi
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
@@ -560,14 +643,34 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
+  local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
+  local receipt="$PACK_DEFAULT/directives/.ceo-template-applied"
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 부서 0 = 승격 사유 소멸 — PENDING 청소(승격 이력 무관)
-  [ -f "$md.pre-ceo" ] || return 0
+  if [ ! -f "$md.pre-ceo" ]; then
+    # ★무음 no-op 승격(스펙 A6/E2): 승격 표지(md==CEO 템플릿 또는 영수증 실재)가 있는데 복원 백업이
+    #   없으면 '강등 불능(비가역 상태)'다 — 종전 무음 return 0은 이 상태를 영구 잠복시켰다. stderr
+    #   경보+feed push(비대기)로 가시화하되 return 0 유지(teardown 체인 불파괴 — 부트 비치명 계약).
+    #   미승격 머신(표지 없음)의 .pre-ceo 부재는 정상 no-op — 경보 없음(위경보 소음 금지).
+    #   영수증은 여기서 삭제하지 않는다(비가역 상태의 판정 증거 보존 — C03 소관).
+    if cmp -s "$md" "$ceo" 2>/dev/null || [ -f "$receipt" ]; then
+      echo "[cys-dept] WARN: CEO 강등 불능 — 복원 백업(.pre-ceo) 부재(비가역 상태). preflight C03 안내(.pristine 재건/pack-merge)로 MASTER_DIRECTIVE.md 복원 필요" >&2
+      env -u CYS_SOCKET "$CYS" feed push --title "CEO 강등 불능(.pre-ceo 부재)" \
+        --body "부서 0개 도달로 CEO 강등을 시도했으나 복원 백업(MASTER_DIRECTIVE.md.pre-ceo)이 없어 표준 master로 원복하지 못했습니다. preflight C03 안내에 따라 .pristine 재건 또는 pack-merge로 MASTER_DIRECTIVE.md를 복원하십시오." >/dev/null 2>&1 \
+        || echo "[cys-dept] WARN: 강등 불능 알림 push 실패(데몬 미기동?) — 위 stderr 경보가 유일 흔적" >&2
+    fi
+    return 0
+  fi
   cp "$md.pre-ceo" "$md"; rm -f "$md.pre-ceo"
+  rm -f "$receipt" 2>/dev/null || true   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸(stale 영수증 방지)
   echo "[cys-dept] CEO 강등(표준 master 원복)"
   ceo_reinject_master "표준 master 복귀"
 }
 
 cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|list|sock <name> | <name> -- <cmd>}"
+# ★D3(i): cmd 위치 --help/-h만 usage(stdout·exit 0) — 읽기 전용이라 단일소유 가드(exit 7)보다 앞·역할
+#   무관. ★name 위치의 --help/-h는 usage가 아니라 검증 거부 exit 2다(`launch --help`가 '--help' 부서를
+#   등재→껍데기 CEO 승격까지 간 실사고의 재발 차단 — 가드(exit 7)는 name 검증보다는 선행 유지).
+case "$cmd" in --help|-h) usage; exit 0 ;; esac
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
@@ -588,7 +691,13 @@ case "$cmd" in
 esac
 case "$cmd" in
   launch)
-    name="${2:?usage: cys-dept launch <name>}"
+    name="${2:-}"
+    # ★D3(i): name 확보 직후·일체 부작용(dept_sock 산출·mkdir·reg_upsert) 이전 검증 — 빈/미지정 포함
+    #   전부 exit 2. CYS_DEPT_ROTATE=1(rotate 재귀)에도 검증 유지(rotate 진입부 사전 검증과 이중 방어).
+    #   slug 충돌도 부작용 이전 조기 거부(reg_upsert 진입부 검사와 공통 헬퍼 — 기존명 재-launch는 자기
+    #   제외로 통과).
+    validate_dept_name "$name" "launch <name>"
+    reject_slug_collision "$name"
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
@@ -678,6 +787,10 @@ PY
 ) || exit $?   # ★cap 거부(exit 8)·예약 실패 코드 그대로 전파
     [ -n "$name" ] || { echo "[cys-dept] allocate: 번호 발급 실패" >&2; exit 1; }
     trap 'reg_remove "$name" 2>/dev/null || true' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
+    # ★D3(i) 사후 assert: allocate name은 기계 생성(dept-N)이라 항상 정형이 정상 — 불변식 위반·
+    #   slug 충돌(레거시 'DEPT-N' 등재 등)은 여기서 거부(exit 2·위 trap이 예약 회수). A2 공통 헬퍼.
+    validate_dept_name "$name" "allocate"
+    reject_slug_collision "$name"
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     # ★계정격리(Fix1'): 기본계정 base 해석 → 부서별 fork dir(<base>-<name>). base 해석불가=fail-closed.
     # 기본계정은 CYS_DEPT_DEFAULT_ACCOUNT로 명시 지정한다(공개 배포본에 특정 오너 핸들을 박지 않는다 —
@@ -732,7 +845,10 @@ PY
     ;;
   create)
     # ＋부서 자동화: 카탈로그 기반 완전 자동 부서 생성(부서명·계정·미션·각성). 레거시 allocate 무변경.
-    key="${2:?usage: cys-dept create <catalog-key>}"
+    key="${2:-}"
+    # ★D3(i): 카탈로그 key도 동일 화이트리스트 — acctdir('-$key' 접미)·미션 경로($MISS/$key.md) 합성
+    #   인자다. 카탈로그 존재 검사(exit 3)보다 앞(부적격 key는 카탈로그 유무와 무관하게 exit 2).
+    validate_dept_name "$key" "create <catalog-key>"
     CAT="${CYS_DEPT_CATALOG:-$HOME/.cys/dept-catalog.json}"
     MISS="${CYS_DEPT_MISSIONS:-$HOME/.cys/dept-missions}"
     [ -f "$CAT" ] || { echo "[cys-dept] 카탈로그 부재: $CAT (GUI=레거시 allocate fallback)" >&2; exit 3; }  # fail-closed
@@ -820,6 +936,14 @@ PY
 ) || exit $?   # ★cap 거부(exit 8) 등 예약 실패 코드 그대로 전파
     verb="${res%% *}"; name="${res#* }"
     [ -n "$name" ] || { echo "[cys-dept] create: 예약 실패" >&2; exit 1; }
+    # ★D3(i) 3분기 공통 관문(NEW/REUSE_UP·BOOTING/REUSE_DEAD): 예약 산출 name 검증 — 이 지점(verb/name
+    #   분해 직후·case 이전)이 3분기를 전부 덮는 유일한 단일 삽입점이다. NEW는 기계 생성(dept-N)이라
+    #   항상 통과 — 불합격=REUSE_*의 기존 등재가 비정형인 경우: '비정형 등재'로 stderr 보고만 하고
+    #   exit 2(★자동 삭제 금지 — 정리는 정리 동사(down/down-sock)·D1(b) 수동 격리 소관).
+    if ! dept_name_ok "$name"; then
+      echo "[cys-dept] create: 비정형 등재 발견('$name' — mission_key 매칭 기존 엔트리) — 자동 삭제 금지·down-sock/D1(b) 정리 후 재시도" >&2
+      exit 2
+    fi
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     # 멱등 3분기 봉인(CSO): UP/BOOTING=즉시반환(boot tail 안 함=더블각성·더블미션 봉인)·DEAD=ensure-up revive·NEW=신규.
     case "$verb" in
@@ -944,10 +1068,14 @@ PY
     sock="$(dept_sock "$name")"
     # ★필수2(A·리뷰) 사전 게이트: 미등재(down됨/없음) 부서는 즉시 중단(exit 8·부활 금지). ping/identify(autostart
     # 부작용) 이전에 레지스트리(SOT)부터 확인해 side-effect 0으로 빠르게 거부한다. reg_names(SOT) 재사용.
-    if ! reg_names | grep -Fxq "$name"; then
+    if ! reg_names | grep -Fxq -- "$name"; then
       echo "[cys-dept] $name 미등재(down됨) — rotate 중단(부활 금지)" >&2
       exit 8
     fi
+    # ★D3(i) 사전 검증(등재 게이트 직후·kill 이전): rotate 꼬리=생성 동사 launch 재귀라, 비정형 등재명은
+    #   kill 후 launch 검증 거부 = 데몬 죽고 등재만 남는 반파괴 half-op이 된다 — kill 없이 여기서 exit 2.
+    #   grep `--`는 인자 위생(D3(i) — '-' 선두 등재명 옵션 오파싱 봉합, L974 재확인 게이트 동일).
+    validate_dept_name "$name" "rotate <name>" "비정형 등재 — kill 미수행(데몬 불변). 정리는 cys-dept down-sock <sock> 또는 D1(b) 수동 격리로."
     # ★필수4(B·리뷰): rotate 대상 데몬이 실제 살아있는지 ping으로 먼저 확인(autostart 없는 연결 프로브).
     # ★함정: `cys identify`는 죽은 소켓에서 cysd를 autostart하는 부작용이 있어(스모크 실증) pid가 항상 채워져
     # "미확인" 판정을 못 한다 → ping(연결만·autostart 없음)으로 게이트한다. 미응답=소유자 사망 미확인이므로
@@ -971,7 +1099,7 @@ PY
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     # ★필수2(A·리뷰) TOCTOU 재확인: kill·rm 도중 CSO down(reg_remove+dept_tombstone)이 레이스로 끼어들어
     # 폐기됐으면 launch(부활) 금지 — 사전 게이트 이후 창을 최소화하려 launch 직전에 한 번 더 확인(미등재→exit 8).
-    if ! reg_names | grep -Fxq "$name"; then
+    if ! reg_names | grep -Fxq -- "$name"; then
       echo "[cys-dept] $name 미등재(down됨·rotate 중 폐기) — rotate 중단(부활 금지)" >&2
       exit 8
     fi
@@ -1076,9 +1204,18 @@ EOF
     [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$(reg_count)" -ge 1 ] && _pend_ok=1
     if [ "${2:-}" = "--request-only" ]; then
       if [ "$_pend_ok" -eq 1 ]; then
-        env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
-          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." >/dev/null 2>&1 || true
-        echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
+        # ★A11 dedupe: 미해결 동종(pending·제목 'CEO 승격 대기')이 이미 있으면 push 생략(로그 1줄) —
+        #   부트 ⑦가 세션마다 재발행해 feed가 동종 pending으로 적체되는 폭주 봉합. 출력 계약=
+        #   `id\t[status]\tkind\ttitle\tdecision=x`(javis_cycle_verifier.parse_feed_list 실측 형식 —
+        #   제목=4번째 탭 필드). 조회 실패(데몬 미기동 등)=fail-open(현행대로 재발행).
+        if env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
+             | awk -F'\t' '$4=="CEO 승격 대기"{found=1} END{exit !found}'; then
+          echo "[cys-dept] CEO 승격 대기 알림 이미 pending — 재발행 생략(A11 dedupe)"
+        else
+          env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
+            --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." >/dev/null 2>&1 || true
+          echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
+        fi
       else
         echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$(reg_count))"
       fi
@@ -1091,10 +1228,32 @@ EOF
     fi
     ;;
   list) reg_names ;;
-  sock) dept_sock "${2:?usage: cys-dept sock <name>}" ;;
+  sock)
+    name="${2:-}"
+    # ★D3(i): sock은 read-only(방송 fan-out 루프 `sock "$d"` 호출부)라 기존 등재의 레거시 비정형명
+    #   (개명 전 이행기 — preflight WARN 소관)을 깨지 않도록 전체 화이트리스트는 강제하지 않는다.
+    #   다만 '-' 선두(name 위치 '-' 전면 거부 규칙 — `sock --help`가 'cys-dept---help' 경로를 오출력)·
+    #   빈 이름은 exit 2.
+    case "$name" in
+      ""|-*)
+        echo "[cys-dept] sock: 부적격 이름('$name') — 빈 이름·'-' 선두 불가" >&2
+        echo "usage: cys-dept sock <name>" >&2
+        exit 2 ;;
+    esac
+    dept_sock "$name"
+    ;;
   *)
     name="$cmd"; shift; [ "${1:-}" = "--" ] && shift
     [ "$#" -ge 1 ] || { echo "usage: cys-dept <name> -- <cmd>" >&2; exit 2; }
+    # ★D3(i) passthrough(정리 동사형 규칙): 등재 또는 디스크 실존(state dir/pack dir) 이름은 비정형이라도
+    #   허용 — 기존 부서 컨텍스트 실행·잔재 정리를 불차단. 비실존+비정형=exit 2(verb 오타가 passthrough로
+    #   흡수돼 하류 cys autostart가 무등재 유령 데몬·state dir을 만드는 사고 절반 봉합). 비실존·정형=
+    #   허용하되 CYS_NO_AUTOSTART=1 동반 export(★G0 D10 확정) — 죽은 소켓에서 cysd 부활 차단.
+    if ! { reg_names | grep -Fxq -- "$name"; } \
+       && [ ! -e "$(dept_state "$name")" ] && [ ! -e "$(dept_pack "$name")" ]; then
+      validate_dept_name "$name" "<name> -- <cmd>" "비실존 부서 — verb 오타 의심. 신규 생성은 launch/create, 목록은 list."
+      export CYS_NO_AUTOSTART=1
+    fi
     export CYS_SOCKET="$(dept_sock "$name")" CYS_PACK_DIR="$(dept_pack "$name")"
     exec "$@"
     ;;

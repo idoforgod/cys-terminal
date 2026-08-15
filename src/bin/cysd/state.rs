@@ -215,6 +215,12 @@ pub struct Surface {
     /// (금지 방향 ③ — 위경고 모드 회귀). 그래서 실패를 '상태'로 남겨 부트는 계속시키고,
     /// 대시보드·진단이 그 사실을 읽는다.
     pub directive_verified: Mutex<Option<bool>>,
+    /// ★(W4 · D5 관측) 이 pane 이 지금 vt100 **alternate screen**(전체화면 TUI 버퍼)에 있는가.
+    /// 단일 write path = reader 스레드(parser 락 임계영역 안에서 `screen().alternate_screen()`
+    /// 스냅샷 — 파서 패닉 재초기화 시 fresh 파서의 false 로 자연 정합). 소비 = surface.list ·
+    /// org.status **양쪽 동일 키**(`alt_screen` — 동형성 핀 handlers.rs) + launch-agent 의
+    /// mac claude fullscreen WARN(D5 env 방어층 우회 관측). additive bool — 구 소비자 무영향.
+    pub alt_screen: AtomicBool,
 }
 
 pub struct HealthRule {
@@ -1910,6 +1916,8 @@ impl Daemon {
             // (여기서 유추하지 않는다 — 유추는 곧 위양성 래치이고, 그건 재주입 스킵 오판이 된다).
             awakened_at: Mutex::new(None),
             directive_verified: Mutex::new(None),
+            // (W4 · D5) 신생 pane 은 primary screen 에서 출발 — 첫 청크 반영 시 reader 가 갱신.
+            alt_screen: AtomicBool::new(false),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
@@ -2037,6 +2045,11 @@ impl Daemon {
                                     chunk.len()
                                 );
                             }
+                            // (W4 · D5) alt_screen 관측 — 파서 락 임계영역 안에서 스냅샷을 떠
+                            // 청크 반영과 원자 정합. 패닉 재초기화 경로도 fresh 파서의 false 를
+                            // 그대로 반영한다(별도 분기 불요 — 화면 스냅샷 소실과 동일 의미론).
+                            surf.alt_screen
+                                .store(parser.screen().alternate_screen(), Ordering::Relaxed);
                             // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
                             // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);

@@ -406,6 +406,10 @@ enum Command {
         /// 확인 프롬프트 없이 적용 (헌법 파일 병합·교체는 --yes 여도 확인 필수)
         #[arg(long)]
         yes: bool,
+        /// (A12 승격 가드 override · 결정 D8) CEO 승격 중(.pre-ceo 존재)에도 MASTER_DIRECTIVE.md
+        /// 를 vendor 본으로 강제 교체 — 승격 파괴를 승인하는 명시 플래그(기본 거부)
+        #[arg(long)]
+        force_vendor: bool,
     },
     /// 팩 상대경로의 소유권 등급(system|user|seed-once) 판정 — pack-guard hook·스크립트용 결정론 조회
     #[command(name = "pack-ownership")]
@@ -425,6 +429,10 @@ enum Command {
         /// 확인 프롬프트 없이 적용
         #[arg(long)]
         yes: bool,
+        /// (A12 승격 가드 override · 결정 D8) CEO 승격 중(.pre-ceo 존재)에도 MASTER_DIRECTIVE.md
+        /// 를 보존본으로 강제 후진 — 승격 파괴를 승인하는 명시 플래그(기본 거부)
+        #[arg(long)]
+        force_vendor: bool,
     },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
@@ -2096,8 +2104,8 @@ fn run(command: Command) -> i32 {
             return run_pack_update(from, manifest_url, dry_run);
         }
         Command::PackPlan { force } => return run_pack_plan(force),
-        Command::PackMerge { file, take_new, keep_mine, ai, to_local, propose, yes } => {
-            return run_pack_merge(file, take_new, keep_mine, ai, to_local, propose, yes);
+        Command::PackMerge { file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor } => {
+            return run_pack_merge(file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor);
         }
         Command::PackOwnership { rel, quiet } => {
             // 결정론 조회 전용(쓰기 0) — 분류 SOT 는 pack::ownership() 한 곳(pack-guard hook 이 소비).
@@ -2118,8 +2126,8 @@ fn run(command: Command) -> i32 {
             }
             return 0;
         }
-        Command::PackRollback { file, yes } => {
-            return run_pack_rollback(file, yes);
+        Command::PackRollback { file, yes, force_vendor } => {
+            return run_pack_rollback(file, yes, force_vendor);
         }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
@@ -5826,6 +5834,47 @@ fn apply_config_dir_override(
     }
 }
 
+/// ★(W4 · D5 관측) launch-agent ready 판정 직후의 alternate-screen 통지 판정 — 순수 함수.
+///
+/// 입력 `alt_screen` = 데몬 surface.list 의 동명 필드(`as_bool()` — **필드 부재(구 데몬)는
+/// None = 판정 불가**로 통지 자체를 생략한다. FAIL 격상 금지 — 스큐 규칙, 스펙 §D5).
+/// 반환 = Some((stderr 1줄, directive.verify reason 에 부기할지)) / None = 발화 없음.
+///  · mac ∧ claude ∧ true → **WARN**(D5 env 방어층이 우회된 fullscreen — 휠이 앱으로 들어가
+///    프롬프트 히스토리 오염 경로가 열려 있다) + reason 부기 true.
+///  · win ∧ claude ∧ true → 힌트 1줄(경보 아님·차단 없음 — win fullscreen 옵트인은 문제2 동형
+///    발현이라 비지원 선언이고, 사용자가 원인을 자가진단할 단서만 남긴다) + reason 부기 false.
+/// OS 를 인자로 받아 어느 호스트에서든 양 분기를 테스트한다(lib compose_pane_path 관례).
+fn alt_screen_notice(
+    alt_screen: Option<bool>,
+    agent: &str,
+    is_macos: bool,
+    is_windows: bool,
+) -> Option<(String, bool)> {
+    if agent != "claude" || alt_screen != Some(true) {
+        return None; // None(구 데몬)=판정 불가 생략 · false=정상(inline) — 무발화.
+    }
+    if is_macos {
+        return Some((
+            "[launch-agent] WARN: claude 가 alternate screen(fullscreen)으로 떴다 — D5 기본 env \
+             (CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1)가 settings tui 키 등으로 우회된 상태. \
+             fullscreen 휠은 프롬프트 히스토리 오염 경로다: 해당 계정 settings 의 tui 키 제거 \
+             (D1(d) 정규화·.bak 관례) 또는 agents.json env 확인."
+                .to_string(),
+            true,
+        ));
+    }
+    if is_windows {
+        return Some((
+            "[launch-agent] hint: claude 가 alternate screen(fullscreen)으로 떴습니다 — Windows \
+             fullscreen 은 비지원(옵트인 시 휠 방향키 합성 잔존 — 릴리스 노트 '알려진 제한'). \
+             settings 의 tui 키를 제거하면 inline 으로 복귀합니다."
+                .to_string(),
+            false,
+        ));
+    }
+    None
+}
+
 /// launch-agent(새 surface)와 node-recover(기존 surface 재기동)가 공유한다.
 fn boot_agent_on_surface(
     sid: u64,
@@ -5872,6 +5921,10 @@ fn boot_agent_on_surface(
     // (주입은 run_launch_agent_opts의 surface.create에서 이미 수행) — send 문자열만 취한다.
     let mut env_pairs = agent_env_pairs(spec);
     apply_config_dir_override(&mut env_pairs, restore, config_dir);
+    // ★D5(v4 · W4): mac claude 에 fullscreen(alternate screen) 차단 기본값을 주입 — spec env 에
+    // 키가 **부재할 때만**(사용자 "0" 옵트인 불가침·append+sort 금지 함정은 lib 헬퍼 주석 참조).
+    // 게이트 = cfg!(macos) ∧ extract_bin(cmd)=='claude'(:1081 헬퍼 재사용 — 어댑터 키 개명 내성).
+    cys::inject_claude_alt_screen_default(&mut env_pairs, extract_bin(&cmd, agent));
     let (send, _send_env) = render_launch(&cmd, &env_pairs);
     // ★(W2 · B4) **기동 send 직전 line_count 스냅샷** — readiness 판정의 시간 귀속 기준선.
     //
@@ -6067,6 +6120,22 @@ fn boot_agent_on_surface(
     // marker 감지 직후 TUI 입력 활성화까지 약간의 여유
     std::thread::sleep(std::time::Duration::from_secs(BUDGET_POST_MARKER_SETTLE_SECS));
 
+    // ★(W4 · D5 관측) ready 판정 직후 alternate-screen 확인 — 판정·문안은 alt_screen_notice
+    // (순수 fn) 참조. 필드 부재(구 데몬)면 as_bool()=None → 판정 불가·통지 생략(FAIL 금지).
+    let alt_verify_tag: Option<&'static str> = {
+        let alt = fetch_surfaces()
+            .iter()
+            .find(|s| s["surface_id"].as_u64() == Some(sid))
+            .and_then(|s| s["alt_screen"].as_bool());
+        match alt_screen_notice(alt, agent, cfg!(target_os = "macos"), cfg!(windows)) {
+            Some((line, attach_reason)) => {
+                eprintln!("{line}");
+                attach_reason.then_some(" · alt_screen=true(ready 직후 관측 — D5 env 우회 fullscreen)")
+            }
+            None => None,
+        }
+    };
+
     // 3) 지침 주입 — bracketed paste로 감싸 단일 입력으로 전달
     let inject_cursor: u64 = fetch_surfaces()
         .iter()
@@ -6139,6 +6208,11 @@ fn boot_agent_on_surface(
             "[launch-agent] directive 주입 검증 확정 — {verify_reason} ({} bytes)",
             directive.len()
         );
+    }
+    // ★(W4 · D5) alt-screen WARN 이 있었으면 verify reason 에 부기한다 — 대시보드·진단이
+    // '주입은 됐는데 fullscreen 상태였다'는 맥락을 상태로 읽을 수 있게(stderr 휘발 보완).
+    if let Some(tag) = alt_verify_tag {
+        verify_reason.push_str(tag);
     }
     // 상태화(경고 삼킴 제거) — 실패해도 부트를 막지 않는다(best-effort · 구 데몬은 미지 메서드 에러).
     if let Err(e) = request(
@@ -6532,7 +6606,15 @@ fn run_launch_agent_opts(
         // RC-3(B′): Windows는 해소된 env(CLAUDE_CONFIG_DIR 등)를 surface.create로 넘겨 데몬이
         // PTY spawn 시 builder.env로 주입한다(순수 cmd send와 짝). unix는 빈 맵 — 셸 인라인 전개가
         // 진실원(무회귀). render_launch와 동일 규약이라 두 경로 결정론 일치.
-        let (_, inject_env) = render_launch("", &agent_env_pairs(&spec));
+        // ★D5(v4 · W4): 두 소비처(여기 surface.create env 맵 · boot_agent_on_surface 인라인
+        // 재조립)가 **모두 lib 헬퍼를 경유**한다(사본 금지). mac 은 unix 인라인 전개가 진실원이라
+        // 이 맵이 비어 무영향이고, 게이트(mac ∧ claude)상 win 은 미삽입 — 규약만 단일화한다.
+        let mut create_env_pairs = agent_env_pairs(&spec);
+        cys::inject_claude_alt_screen_default(
+            &mut create_env_pairs,
+            extract_bin(spec["cmd"].as_str().unwrap_or(""), agent),
+        );
+        let (_, inject_env) = render_launch("", &create_env_pairs);
         let env_obj: serde_json::Map<String, Value> = inject_env
             .into_iter()
             .map(|(k, v)| (k, Value::String(v)))
@@ -9608,6 +9690,60 @@ fn report_overlay_skill_drift() {
 ///   diff3/--ai 3-way 병합(base=.pristine 조상) · --to-local(healed system 파일을 오버레이로 이동).
 /// system(healed) 파일은 rel 로 되쓰기 금지 — 다음 기동 install 이 다시 치유(P0-4)하므로
 /// 지원 경로는 to-local(스킬 shadowing)뿐임을 명시한다.
+/// ★A12 코드 가드(v4 · W4 — 결정 D8: override 플래그명 `--force-vendor`).
+///
+/// CEO 승격 중(= `<pack>/directives/MASTER_DIRECTIVE.md.pre-ceo` 실재)의 base MASTER 를
+/// vendor/보존 본으로 **덮는** 두 동사를 기계 거부한다: `pack-merge --take-new` 와
+/// `pack-rollback --file` (R2 가 치명 분류한 승격 파괴 벡터 — 후자는 롤백 '도구'라서 더
+/// 위험하다). '금지 명문화'(runbook)를 기계 집행으로 승격한 것이며, keep-mine(승격본 유지)
+/// 절차는 종전대로 통과한다. 반환 = Some(stderr 전문·exit 비0) / None = 통과.
+#[derive(Clone, Copy, PartialEq)]
+enum CeoGuardVerb {
+    TakeNew,  // pack-merge --take-new
+    Rollback, // pack-rollback --file
+}
+
+const MASTER_DIRECTIVE_REL: &str = "directives/MASTER_DIRECTIVE.md";
+
+fn ceo_vendor_overwrite_rejection(
+    pack_dir: &std::path::Path,
+    rel: &str,
+    force_vendor: bool,
+    verb: CeoGuardVerb,
+) -> Option<String> {
+    if rel != MASTER_DIRECTIVE_REL || force_vendor {
+        return None;
+    }
+    let pre_ceo = pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
+    if !pre_ceo.exists() {
+        return None;
+    }
+    let (verb_label, procedure) = match verb {
+        CeoGuardVerb::TakeNew => (
+            "--take-new",
+            // D1(a) MASTER 정본 절차 — ①② 순서 역전 금지(keep-mine 이 .new 를 삭제한다).
+            format!(
+                " 올바른 절차(A12 runbook · keep-mine):\n\
+                 \x20  ① cp <pack>/{MASTER_DIRECTIVE_REL}.new <pack>/{MASTER_DIRECTIVE_REL}.pre-ceo   # 복원 백업을 신본으로 갱신\n\
+                 \x20  ② cys pack-merge --file {MASTER_DIRECTIVE_REL} --keep-mine   # 승격본 유지(.new 해소 — ①② 역전 금지)"
+            ),
+        ),
+        CeoGuardVerb::Rollback => (
+            "pack-rollback",
+            " 정본 롤백 경로(A12): 직전 릴리스 재설치 → 같은 세션에서 promote-ceo 재실행\n\
+             \x20 (md 파일 단위 수동/후진 복원 금지 — '비정형 승격 FAIL' 자가 제조 경로)"
+                .to_string(),
+        ),
+    };
+    Some(format!(
+        "⛔ 거부: '{MASTER_DIRECTIVE_REL}' 는 CEO 승격 중이다({} 존재) — {verb_label} 는 승격본을 \
+         덮어 강등 가역성(.pre-ceo↔md 쌍)을 파괴한다.\n{procedure}\n\
+         \x20 정말 덮으려면(승격 파괴 승인) --force-vendor 를 명시하라.",
+        pre_ceo.display()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_pack_merge(
     file: Option<String>,
     take_new: bool,
@@ -9616,6 +9752,7 @@ fn run_pack_merge(
     to_local: bool,
     propose: bool,
     yes: bool,
+    force_vendor: bool,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
     let mut pending = cys::pack::load_merge_pending(&dir);
@@ -9708,6 +9845,13 @@ fn run_pack_merge(
             };
             let ours = std::fs::read_to_string(&target).unwrap_or_default();
             if take_new {
+                // ★A12 승격 가드 — 승격 중 base MASTER 의 vendor 채택은 confirm 이전에 기계 거부.
+                if let Some(msg) =
+                    ceo_vendor_overwrite_rejection(&dir, &rel, force_vendor, CeoGuardVerb::TakeNew)
+                {
+                    eprintln!("{msg}");
+                    return 1;
+                }
                 if confirm(&format!("'{rel}' 을 vendor 신버전으로 교체(내 수정 폐기)?")) {
                     if let Err(e) = cys::pack::write_atomic(&target, theirs.as_bytes()) {
                         eprintln!("쓰기 실패: {e}");
@@ -9963,7 +10107,7 @@ fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
 /// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
 /// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원은 다음 부트 스윕이
 /// 재치유함을 정직하게 고지 — 영속 경로(--to-local/--propose)로 안내한다.
-fn run_pack_rollback(file: Option<String>, yes: bool) -> i32 {
+fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let prev = cys::pack::pack_prev_dir(&dir);
     if !prev.is_dir() {
@@ -10020,6 +10164,11 @@ fn run_pack_rollback(file: Option<String>, yes: bool) -> i32 {
     };
     if rel.contains("..") || rel.starts_with('/') {
         eprintln!("잘못된 경로: {rel}");
+        return 1;
+    }
+    // ★A12 승격 가드 — 롤백 '도구' 자체가 승격 파괴 벡터(R2 치명 분류): 승격 중 MASTER 후진 거부.
+    if let Some(msg) = ceo_vendor_overwrite_rejection(&dir, &rel, force_vendor, CeoGuardVerb::Rollback) {
+        eprintln!("{msg}");
         return 1;
     }
     let own = cys::pack::ownership_name(&rel);
@@ -10663,6 +10812,86 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★A12 승격 가드 단위 테스트(v4 · W4): 승격 중(.pre-ceo 존재) base MASTER 를 덮는
+    /// 두 동사(take-new·rollback)만 거부 — keep-mine 경로·타 파일·비승격 상태·--force-vendor
+    /// 는 통과. 거부 문안에 keep-mine 절차(merge)/재설치·promote-ceo(rollback) 안내가 실린다.
+    #[test]
+    fn ceo_vendor_overwrite_rejection_truth_table() {
+        let td = std::env::temp_dir().join(format!("cys-a12-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("directives")).unwrap();
+        let rel = MASTER_DIRECTIVE_REL;
+
+        // ① 비승격(.pre-ceo 부재): 양 동사 모두 통과.
+        for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
+            assert!(
+                ceo_vendor_overwrite_rejection(&td, rel, false, verb).is_none(),
+                ".pre-ceo 부재면 가드가 발화하면 안 된다"
+            );
+        }
+
+        // 승격 상태 진입: .pre-ceo 실재.
+        std::fs::write(td.join(format!("{rel}.pre-ceo")), "backup").unwrap();
+
+        // ② 승격 중 take-new → 거부 + keep-mine 절차 안내.
+        let msg = ceo_vendor_overwrite_rejection(&td, rel, false, CeoGuardVerb::TakeNew)
+            .expect("승격 중 --take-new 는 거부돼야 한다");
+        assert!(msg.contains("--keep-mine"), "keep-mine 절차 안내 누락: {msg}");
+        assert!(msg.contains("--force-vendor"), "override 안내 누락: {msg}");
+
+        // ③ 승격 중 rollback → 거부 + 재설치·promote-ceo 정본 경로 안내.
+        let msg = ceo_vendor_overwrite_rejection(&td, rel, false, CeoGuardVerb::Rollback)
+            .expect("승격 중 pack-rollback 은 거부돼야 한다");
+        assert!(msg.contains("promote-ceo"), "정본 롤백 경로 안내 누락: {msg}");
+
+        // ④ --force-vendor override → 통과(승격 파괴 승인은 오너 명시 의사).
+        for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
+            assert!(
+                ceo_vendor_overwrite_rejection(&td, rel, true, verb).is_none(),
+                "--force-vendor 는 가드를 통과해야 한다"
+            );
+        }
+
+        // ⑤ 타 파일(WORKER 등)은 승격 중에도 무간섭.
+        assert!(
+            ceo_vendor_overwrite_rejection(
+                &td,
+                "directives/WORKER_DIRECTIVE.md",
+                false,
+                CeoGuardVerb::TakeNew
+            )
+            .is_none(),
+            "MASTER 외 파일은 가드 대상이 아니다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★(W4 · D5 관측) alt_screen_notice 진리표 — 필드 부재(None)=판정 불가·무발화(FAIL 금지),
+    /// mac claude fullscreen=WARN+reason 부기, win claude fullscreen=힌트(경보 아님·부기 없음),
+    /// false/타 에이전트=무발화.
+    #[test]
+    fn alt_screen_notice_truth_table() {
+        // 구 데몬(필드 부재) → 판정 불가, 어떤 OS 에서도 무발화.
+        assert!(alt_screen_notice(None, "claude", true, false).is_none());
+        assert!(alt_screen_notice(None, "claude", false, true).is_none());
+        // 정상(inline) → 무발화.
+        assert!(alt_screen_notice(Some(false), "claude", true, false).is_none());
+        // mac ∧ claude ∧ true → WARN + verify reason 부기.
+        let (line, attach) = alt_screen_notice(Some(true), "claude", true, false)
+            .expect("mac claude fullscreen 은 WARN");
+        assert!(line.contains("WARN"), "WARN 표식 누락: {line}");
+        assert!(attach, "mac WARN 은 directive.verify reason 에 부기해야 한다");
+        // win ∧ claude ∧ true → 힌트(경보 아님) + 부기 없음.
+        let (line, attach) = alt_screen_notice(Some(true), "claude", false, true)
+            .expect("win claude fullscreen 은 힌트");
+        assert!(line.contains("hint"), "힌트는 경보(WARN)가 아니어야 한다: {line}");
+        assert!(!attach, "win 힌트는 reason 부기 없음");
+        // 타 에이전트(codex 등) → 무발화.
+        assert!(alt_screen_notice(Some(true), "codex", true, false).is_none());
+        // 기타 OS(linux 등) → 무발화.
+        assert!(alt_screen_notice(Some(true), "claude", false, false).is_none());
+    }
 
     // ★루트 cwd 교정(2026-07-15 실사고): 루트류는 home으로, 정상 경로는 불변.
     #[test]
@@ -12254,6 +12483,63 @@ mod tests {
             assert!(!inject[0].1.contains("${"), "주입 값은 해소됨: {:?}", inject[0].1);
             assert!(!inject[0].1.contains("$HOME"), "HOME 전개됨: {:?}", inject[0].1);
         }
+    }
+
+    /// ★D5 두-소비처 회귀 핀(v4 · W4): 주입 로직이 lib 헬퍼 단일 SOT 라도, **두 소비처**
+    /// (boot_agent_on_surface 인라인 재조립 · run_launch_agent_opts surface.create env 맵)의
+    /// 합성 결과에서 각각 검증한다 — 사용자 "0"(agents.json env) 이 있으면 최종 산출 어디에도
+    /// "1" 미출현, 키 부재 + mac claude 면 삽입. (CI 상주 핀은 lib claude_alt_screen_env_injection_pins.)
+    #[test]
+    fn d5_env_injection_covers_both_consumers() {
+        let cmd = "claude --dangerously-skip-permissions";
+        // ① 사용자 "0" override — 두 소비처 최종 산출에 "1" 미출현.
+        let spec = serde_json::json!({
+            "cmd": cmd,
+            "env": {
+                "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "0",
+                "CLAUDE_CONFIG_DIR": "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}"
+            }
+        });
+        // 소비처 1: 인라인 재조립(boot_agent_on_surface 동형 순서).
+        let mut env_pairs = agent_env_pairs(&spec);
+        cys::inject_claude_alt_screen_default(&mut env_pairs, extract_bin(cmd, "claude"));
+        let (send, _) = render_launch(cmd, &env_pairs);
+        assert!(
+            !send.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=\"1\""),
+            "사용자 '0' 이 있으면 인라인 문자열에 '1' 이 나오면 안 된다: {send}"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            send.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=\"0\""),
+            "사용자 '0' 은 인라인에 보존돼야 한다: {send}"
+        );
+        // 소비처 2: surface.create env 맵(run_launch_agent_opts 동형 순서).
+        let mut create_pairs = agent_env_pairs(&spec);
+        cys::inject_claude_alt_screen_default(&mut create_pairs, extract_bin(cmd, "claude"));
+        let (_, inject_env) = render_launch("", &create_pairs);
+        assert!(
+            !inject_env
+                .iter()
+                .any(|(k, v)| k == cys::ENV_CLAUDE_NO_ALT_SCREEN && v == "1"),
+            "사용자 '0' 이 있으면 create env 맵에도 '1' 미출현: {inject_env:?}"
+        );
+        // ② 키 부재 spec — mac claude 는 두 소비처 파이프라인에서 기본 "1" 이 산출에 실린다.
+        #[cfg(target_os = "macos")]
+        {
+            let bare = serde_json::json!({"cmd": cmd, "env": {}});
+            let mut pairs = agent_env_pairs(&bare);
+            cys::inject_claude_alt_screen_default(&mut pairs, extract_bin(cmd, "claude"));
+            let (send2, _) = render_launch(cmd, &pairs);
+            assert!(
+                send2.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=\"1\""),
+                "mac claude 키 부재면 기본 '1' 이 인라인에 실려야 한다: {send2}"
+            );
+        }
+        // ③ 타 에이전트(codex) — 어느 소비처에도 미삽입.
+        let codex_cmd = "codex --dangerously-bypass-approvals-and-sandbox";
+        let mut codex_pairs: Vec<(String, String)> = Vec::new();
+        cys::inject_claude_alt_screen_default(&mut codex_pairs, extract_bin(codex_cmd, "codex"));
+        assert!(codex_pairs.is_empty(), "타 에이전트 미삽입: {codex_pairs:?}");
     }
 
     #[test]

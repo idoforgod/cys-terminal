@@ -1,0 +1,155 @@
+{
+  "_schema": "A9 공유 코퍼스 — TS(ui/src/mousefilter.ts classifyMouseReport :29-112)와 Rust(src/lib.rs mousereport) 매처 패리티 픽스처. bytes 의 제어문자는 JSON \\u 이스케이프 표기 (양쪽 모두 표준 JSON 파서가 실제 제어문자로 복원 — 커스텀 디코딩 금지). pure=true ⇔ '수신 텍스트 전체가 마우스 보고 시퀀스의 연접'(classify 판정 != pass). \\u001b[200~ 접두(bracketed paste)는 무조건 pure=false(A9 비면제). 소비자: src/lib.rs mousereport 테스트(cargo test --lib)·ui/src/mousefilter.test.ts(W3). 케이스 추가 시 양쪽 테스트가 자동 소비한다 — 한쪽 구현만 고치면 여기서 빨간불.",
+  "cases": [
+    {
+      "name": "sgr-wheel-up-press",
+      "bytes": "\u001b[<64;10;20M",
+      "pure": true
+    },
+    {
+      "name": "sgr-wheel-down",
+      "bytes": "\u001b[<65;10;20M",
+      "pure": true
+    },
+    {
+      "name": "sgr-wheel-up-with-shift-modifier",
+      "bytes": "\u001b[<68;10;20M",
+      "pure": true
+    },
+    {
+      "name": "sgr-click-press",
+      "bytes": "\u001b[<0;5;7M",
+      "pure": true
+    },
+    {
+      "name": "sgr-release",
+      "bytes": "\u001b[<0;5;7m",
+      "pure": true
+    },
+    {
+      "name": "sgr-pixels-wheel-large-coords",
+      "bytes": "\u001b[<64;555;321M",
+      "pure": true
+    },
+    {
+      "name": "sgr-pixels-motion",
+      "bytes": "\u001b[<35;800;600M",
+      "pure": true
+    },
+    {
+      "name": "urxvt-wheel-up",
+      "bytes": "\u001b[96;40;33M",
+      "pure": true
+    },
+    {
+      "name": "urxvt-click",
+      "bytes": "\u001b[32;40;33M",
+      "pure": true
+    },
+    {
+      "name": "urxvt-release",
+      "bytes": "\u001b[35;40;33M",
+      "pure": true
+    },
+    {
+      "name": "x10-wheel-up",
+      "bytes": "\u001b[M`*%",
+      "pure": true
+    },
+    {
+      "name": "x10-click",
+      "bytes": "\u001b[M !!",
+      "pure": true
+    },
+    {
+      "name": "x10-release",
+      "bytes": "\u001b[M#!!",
+      "pure": true
+    },
+    {
+      "name": "batch-sgr-wheel-x3",
+      "bytes": "\u001b[<64;10;20M\u001b[<64;10;21M\u001b[<65;10;22M",
+      "pure": true
+    },
+    {
+      "name": "batch-mixed-encodings-all-reports",
+      "bytes": "\u001b[<64;10;20M\u001b[96;40;33M\u001b[M`*%",
+      "pure": true
+    },
+    {
+      "name": "batch-wheel-up-down-cancel",
+      "bytes": "\u001b[<64;10;20M\u001b[<65;10;20M",
+      "pure": true
+    },
+    {
+      "name": "plain-text",
+      "bytes": "hello",
+      "pure": false
+    },
+    {
+      "name": "empty-chunk",
+      "bytes": "",
+      "pure": false
+    },
+    {
+      "name": "arrow-key",
+      "bytes": "\u001b[A",
+      "pure": false
+    },
+    {
+      "name": "mixed-report-then-text",
+      "bytes": "\u001b[<64;10;20Mx",
+      "pure": false
+    },
+    {
+      "name": "mixed-text-then-report",
+      "bytes": "x\u001b[<64;10;20M",
+      "pure": false
+    },
+    {
+      "name": "truncated-sgr",
+      "bytes": "\u001b[<64;10;2",
+      "pure": false
+    },
+    {
+      "name": "truncated-x10-two-trailing-units",
+      "bytes": "\u001b[M !",
+      "pure": false
+    },
+    {
+      "name": "truncated-tail-in-batch",
+      "bytes": "\u001b[<64;10;20M\u001b[M !",
+      "pure": false
+    },
+    {
+      "name": "x10-value-below-offset",
+      "bytes": "\u001b[M\u0007!!",
+      "pure": false
+    },
+    {
+      "name": "urxvt-button-below-offset",
+      "bytes": "\u001b[10;40;33M",
+      "pure": false
+    },
+    {
+      "name": "urxvt-coord-below-offset",
+      "bytes": "\u001b[96;10;33M",
+      "pure": false
+    },
+    {
+      "name": "sgr-two-params-no-match",
+      "bytes": "\u001b[<64;10M",
+      "pure": false
+    },
+    {
+      "name": "paste-wrapped-report",
+      "bytes": "\u001b[200~\u001b[<64;10;20M\u001b[201~",
+      "pure": false
+    },
+    {
+      "name": "paste-wrapped-plain",
+      "bytes": "\u001b[200~hi\u001b[201~",
+      "pure": false
+    }
+  ]
+}

@@ -1347,6 +1347,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "awakened_at": *s.awakened_at.lock().unwrap(),
                         // ★(W2 · B14) 주입 검증 상태 — true=ack 확인 / false=창 만료 미확인 / null=미판정.
                         "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // ★(W4 · D5) alternate screen 관측 — org.status 와 **같은 키·같은 의미**
+                        // (동형성 핀). launch-agent 가 mac claude fullscreen WARN 판정에 소비한다.
+                        "alt_screen": s.alt_screen.load(Ordering::Relaxed),
                         // ★(W2 · B4) 단조 라인 커서 — launch-agent 가 기동 send **직전** 스냅샷을 떠
                         // readiness/실패/주입검증 매칭을 '커서 이후 신규 출현분'으로 한정한다(잔존 ❯
                         // 오탐 차단). org.status 가 이미 같은 키를 노출하며, 여기 추가는 순수 additive.
@@ -1406,7 +1409,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
-            if human {
+            // ★A9(v4 수리 · D4 DoD "데몬측 예외 1건"): GUI 는 mac 에서 비-휠 마우스 보고를
+            // 앱에 forward 하는데 그 경로가 send_input(human=true)라 보고가 사람 타이핑으로
+            // 위장된다 — 오너가 pane 을 스크롤해 읽는 동안 --queued 배달이 무기 연기되고
+            // (큐 적체 앵커 위반) seat 판정이 오염된다. **수신 텍스트 전체가 마우스 보고
+            // 시퀀스의 연접일 때만** 갱신을 생략한다(판정 SOT = cys::mousereport —
+            // ui/src/mousefilter.ts classifyMouseReport 동형·\x1b[200~ 접두는 무조건 비면제).
+            // 혼합·절단 청크는 갱신 유지: 사람 텍스트가 섞였을 가능성을 보호하는 쪽이 안전.
+            if human && !cys::mousereport::is_pure_mouse_report(&text) {
                 *surface.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
             }
             // T3-13 권위 전달(clear_first): 잔존 미제출 텍스트를 Ctrl-U로 지운 깨끗한 라인에
@@ -3631,6 +3641,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // `cys status --json`). surface.list 와 **같은 키·같은 의미**를 노출한다.
                         "awakened_at": *s.awakened_at.lock().unwrap(),
                         "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // ★(W4 · D5) alternate screen 관측 — surface.list 와 **같은 키·같은 의미**
+                        // (동형성 핀). status --json(launch-agent·preflight·fleet digest)이 소비.
+                        "alt_screen": s.alt_screen.load(Ordering::Relaxed),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),
@@ -5229,6 +5242,82 @@ mod tests {
         assert!(
             worker.last_human_input.lock().unwrap().is_none(),
             "ACL 거부된 human:true 발신이 worker의 last_human_input을 갱신했다 (타이핑 가드 오염)"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A9 회귀 핀(v4 수리 — R2 SIM 발견 8 'forward 마우스 보고의 human 위장'):
+    /// GUI 가 mac 에서 forward 하는 마우스 보고는 send_input(human=true) 경로라 사람 타이핑으로
+    /// 위장된다 — 오너가 pane 을 스크롤해 읽는 동안 --queued 배달이 무기 연기(큐 적체 앵커 위반).
+    /// 계약: **순수 보고(휠·클릭·모션, 전 인코딩)=last_human_input 미갱신** ·
+    /// **비순수(혼합·paste 래퍼·일반 텍스트)=갱신**(판정 SOT = cys::mousereport, TS 동형).
+    #[test]
+    fn send_text_pure_mouse_report_does_not_touch_typing_guard() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("mouse-human-exempt", r#"{ "default": "allow", "rules": [] }"#);
+
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon.surfaces.lock().unwrap().insert(worker.id, worker.clone());
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create sender surface");
+        daemon.surfaces.lock().unwrap().insert(sender.id, sender.clone());
+        let sender_pid = 999_400_u32;
+        bind_caller(&daemon, sender_pid, sender.id);
+
+        let send_human = |text: &str, id: u64| {
+            let req = Request {
+                id: json!(id),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": worker.id, "text": text, "quiet": true, "human": true }),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(sender_pid)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "전제: 전송 자체는 성공해야 한다 (응답: {resp})");
+        };
+
+        // ① 순수 보고(휠 SGR·클릭 SGR-릴리스·X10·urxvt·배칭 혼합 인코딩) → 전부 미갱신.
+        for pure in [
+            "\u{1b}[<64;10;20M",                                // SGR 휠업
+            "\u{1b}[<0;5;7m",                                   // SGR 릴리스
+            "\u{1b}[M`*%",                                      // X10 휠업
+            "\u{1b}[96;40;33M",                                 // urxvt 휠업
+            "\u{1b}[<64;10;20M\u{1b}[96;40;33M\u{1b}[M`*%",     // 배칭(전 인코딩 연접)
+        ] {
+            send_human(pure, 1);
+            assert!(
+                worker.last_human_input.lock().unwrap().is_none(),
+                "순수 마우스 보고 {pure:?} 가 last_human_input 을 갱신했다 (A9 면제 회귀)"
+            );
+        }
+
+        // ② 비순수(보고+텍스트 혼합) → 갱신.
+        send_human("\u{1b}[<64;10;20Mx", 2);
+        assert!(
+            worker.last_human_input.lock().unwrap().is_some(),
+            "혼합 청크(보고+텍스트)는 사람 입력 보호를 위해 갱신해야 한다"
+        );
+
+        // ③ paste 래퍼(\x1b[200~ 접두)는 안에 보고가 들어 있어도 **무조건 갱신**(비면제).
+        *worker.last_human_input.lock().unwrap() = None;
+        send_human("\u{1b}[200~\u{1b}[<64;10;20M\u{1b}[201~", 3);
+        assert!(
+            worker.last_human_input.lock().unwrap().is_some(),
+            "bracketed paste 래퍼는 무조건 비면제(갱신)여야 한다"
+        );
+
+        // ④ 일반 텍스트 → 갱신(기존 동작 무회귀).
+        *worker.last_human_input.lock().unwrap() = None;
+        send_human("hello", 4);
+        assert!(
+            worker.last_human_input.lock().unwrap().is_some(),
+            "일반 텍스트 human:true 는 종전대로 갱신해야 한다"
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
@@ -6964,6 +7053,8 @@ mod tests {
                 Some(("gemini".into(), "gemini".into()));
             surfaces[&live].agent_seen.store(true, Ordering::Relaxed);
             surfaces[&live].agent_exit_notified.store(false, Ordering::Relaxed);
+            // ★(W4 · D5) alt_screen 동형성 재료 — live 는 alt(true), bare 는 primary(false).
+            surfaces[&live].alt_screen.store(true, Ordering::Relaxed);
         }
 
         for (method, key) in [("surface.list", "surfaces"), ("org.status", "surfaces")] {
@@ -6993,6 +7084,18 @@ mod tests {
             assert!(
                 bare_e["agent"].is_null() && bare_e["agent_alive"].is_null(),
                 "{method}: 메타 없는 surface인데 agent/agent_alive가 null이 아니다: {bare_e}"
+            );
+
+            // ★(W4 · D5) alt_screen 동형성 — 두 메서드가 **같은 키·같은 값**(불리언)을 노출한다.
+            // 한쪽에만 있거나 값이 갈리면 launch-agent(WARN)·preflight(status --json) 소비가
+            // 판정 이원화된다 — 여기서 기계 고정.
+            assert_eq!(
+                surface_entry(&resp, key, live)["alt_screen"], json!(true),
+                "{method}: alt 진입 surface 의 alt_screen 이 true 가 아니다"
+            );
+            assert_eq!(
+                bare_e["alt_screen"], json!(false),
+                "{method}: primary surface 의 alt_screen 이 false 가 아니다: {bare_e}"
             );
         }
     }

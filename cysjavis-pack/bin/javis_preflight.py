@@ -15,6 +15,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -178,7 +179,37 @@ CONTENT_PINS = {
         ("잠근 합격 기준의 미달 항목 0", "라운드 종료 기준 — 구 리터럴 대체"),
         ("REVIEWER_TODO.md", "리뷰어 todo 영속(리뷰어 헌장 제8조)"),
     ],
+    # ── CEO_TEMPLATE.md — 라이브 CEO 템플릿 파일 자체의 내용 핀(스펙 v4 §D2 · cid 는
+    #    :파일명 첫 토큰 규칙으로 C03.pin.ceo 자연 파생). 승격 '표지' 술어(MARKER_PINS)와
+    #    앞 3핀을 공유하되 상수는 분리 유지한다 — 여기는 파일 검사 전용 집합이다. ──
+    "CEO_TEMPLATE.md": [
+        ("master of master", "CEO 정체 선언 — 거버넌스 머리글(구·신 템플릿 공통)"),
+        ("단일소유 강제", "부서 수명주기 단일소유 강제 절(구·신 템플릿 공통)"),
+        ("exit 7", "단일소유 가드 exit 7 계약(구·신 공통 · 약핀 — 단독 판정 금지)"),
+        # ★Wave2 대기 핀: 아래 문구는 Wave2 합성 서문(scripts/gen_ceo_template.py 재합성)이
+        #   넣을 문구라 **당장 repo 템플릿엔 없어 FAIL — 정상**이며 Wave2 재합성 후 green 이
+        #   된다. 이 핀은 라이브 템플릿 파일 검사 전용 — 승격 '표지' 술어(MARKER_PINS)에는
+        #   절대 편입하지 않는다(R3 A7: 구 템플릿에 부재라 구판 승격 표지가 사멸 → 위경보 재발).
+        ("직접 구현은 §1-A 사소 예외 없이 금지",
+         "CEO 직접 구현 금지 — 직할/부서 위임 판단 트리(합성 서문 · Wave2 재합성 후 green)"),
+    ],
 }
+
+# ── CEO 승격 '표지' 핀(MARKER_PINS) — C03 승격 상태 판정 전용 부분집합 ──
+# ★불변식: 표지 핀은 **구·신 양쪽 CEO_TEMPLATE 에 실존하는 핀만** 편입한다(R3 A7 실측 —
+#   4번째 핀 '직접 구현…'은 구 6KB 템플릿에 부재(grep 0건)라 표지 술어에 넣으면 구판 승격
+#   표지가 사멸해 '비정형 승격 상태' FAIL 위경보가 재발한다). 신 템플릿 개정 시 이 불변식은
+#   gen_ceo_template.py --check 가 단언한다(스펙 §D2 — 구·신 양쪽 템플릿 실존 필수).
+# ★약핀 주석: "exit 7" 은 MASTER_DIRECTIVE 에도 등장하는 약핀이라 단독 판정 금지 —
+#   표지 판정은 언제나 3핀 **전수**를 요구한다.
+MARKER_PINS = ("master of master", "단일소유 강제", "exit 7")
+
+# C03 소실 FAIL 의 현행 복원 절차 문안(사용자 수정본이 의심될 때의 처방 — 무수정 배포본에는
+# _c03_cause_line 의 원인 분류가 이 문안을 대체한다 · R1 시나리오10 오진 차단).
+_C03_RESTORE_GUIDE = ("★복원 절차(운영계약 §9-7-6·§11-13): "
+                      "①먼저 백업한다 `cp <파일> <파일>.bak-$(date +%Y%m%dT%H%M%S)` "
+                      "②주인님께 보고하고 지시에 따라 복구한다. 팩 템플릿 강제 복원은 "
+                      "사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 절대 금지다.")
 
 ROLES = ["master", "worker", "cso", "reviewer"]
 
@@ -436,6 +467,14 @@ def gate_state_dir_for_pack(pack=None):
     root = os.path.join(os.path.expanduser("~"), ".cys", "state")
     return os.path.join(root, "report_gate-%s" % m.group(1)) if m \
         else os.path.join(root, "report_gate")
+
+
+def c03_fingerprint_path():
+    """C03 상태 지문 원장 위치(스펙 v4 A6) — 기존 state 관용(~/.cys/state ·
+    gate_state_dir_for_pack 과 동일 루트)을 따른다. base 팩 전용이다 — dept/CEO 팩은
+    c03_content_pins 의 early-return 으로 승격 로직 자체에 진입하지 않아 레인 분리 불요."""
+    return os.path.join(os.path.expanduser("~"), ".cys", "state",
+                        "preflight-c03-fingerprint.json")
 
 
 def gate_command_with_lane(command, state_dir):
@@ -879,33 +918,318 @@ class Preflight:
         else:
             self.add(cid, PASS, "4종 디렉티브 존재·비공백")
 
-    # ── C03 내용 핀 (절대지침 조항이 문서에 살아있는가) ──
+    # ── C03 내용 핀 — 두 축 분리 재구성(스펙 v4 §D3(ii)+A6 · base 팩 한정 승격 로직) ──
+    #
+    # [핀 축] C03.pin.<role> — 절대지침 조항이 문서에 살아있는가. master 는 승격 상태
+    #   결정론 판정(표지 = 바이트 등가 > 영수증 > 표지 3핀 폴백)을 포함한다.
+    # [건전성 축] C03.demote-guard — 승격 표지 시 항상, 핀 결과와 **독립**으로 .pre-ceo
+    #   (강등 백업)의 건전성을 검사한다(R2 E2 봉합: 핀 축 ① 조기 PASS 가 강등-불능 검출을
+    #   영구 차폐하던 결함).
+    # ★C03 에는 --fix 경로가 절대 없다(계약): 디렉티브·.pre-ceo 는 user-owned 헌법 파일이라
+    #   preflight 가 편집하지 않는다 — 가시화만(부트 ⓪ '팩 템플릿 강제 복원 절대 금지' 동일 원칙).
+
+    @staticmethod
+    def _c03_read_bytes(path):
+        """바이트 등가(cmp 동형 — 개행 정규화 없음) 판정용 원시 읽기. 부재/불가 = None."""
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _c03_cmp_label(a, b):
+        """cmp 결과 라벨 — 비정형 FAIL detail 의 진단 첨부용(파괴적 조치 대신 관찰 제공)."""
+        if a is None or b is None:
+            return "판정 불능(파일 부재)"
+        return "등가" if a == b else "부등"
+
+    def _c03_receipt_hash(self, receipt_path):
+        """승격 영수증(directives/.ceo-template-applied) 해시 추출 — cys-dept `_swap` 이
+        기록하고 `ceo_demote` 가 삭제한다(스펙 결정 D3 · pack 트리 내부 = Tier1 백업 원자성,
+        ~/.cys/state 금지). 내용 규약 = 적용 시점 md sha256 hex. 관용 파서: 본문에서 첫
+        64자리 hex 토큰만 취한다(개행·JSON 래핑 허용). 없으면 None."""
+        try:
+            with open(receipt_path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            return None
+        m = re.search(r"\b[0-9a-fA-F]{64}\b", text)
+        return m.group(0).lower() if m else None
+
+    def _c03_cause_line(self, f, live_b):
+        """FAIL 원인 분류 1줄(R1 시나리오10 — 오진 처방 차단): live==.pristine/directives/<f>
+        등가면 벤더 동기 문제(사용자 과실 아님 — '사용자 소실 복원 절차' 처방은 오진)라 전용
+        문안을 반환하고, 부등/판정 불능이면 None(호출부가 현행 복원 절차 문안 유지).
+        .pristine 미러는 pack.rs:1324 커스터마이즈 절충 원장이 실존을 보장한다."""
+        pristine_b = self._c03_read_bytes(
+            os.path.join(pack_dir(), ".pristine", "directives", f))
+        if live_b is None or pristine_b is None or live_b != pristine_b:
+            return None
+        line = ("원인 분류: 무수정 배포본(live==.pristine) — 핀 기준 선행"
+                "(벤더 동기 필요·사용자 과실 아님)")
+        if os.path.isfile(os.path.join(pack_dir(), "directives", f + ".new")):
+            line += (" · .new 병치 — `cys pack-merge --file directives/%s --take-new`"
+                     "(무수정본 한정)" % f)
+        return line
+
+    def _c03_promotion_state(self):
+        """승격 판정에 필요한 파일 전부를 1회 읽어 상태 dict 로 환원한다(순수 관찰).
+
+        승격 '표지' 판정 우선순위(스펙 결정 D3):
+          ① md == 라이브 CEO_TEMPLATE 바이트 등가
+          ② 승격 영수증 해시 == md sha256 — stale 영수증(부등)은 판정 근거로
+             미사용·경고 없이 무시(R3 시나리오3)
+          ③ 폴백: md 가 표지 3핀(MARKER_PINS) 전수 포함 ∧ .pre-ceo 존재"""
+        d = os.path.join(pack_dir(), "directives")
+        md_p = os.path.join(d, "MASTER_DIRECTIVE.md")
+        st = {"tmpl_p": os.path.join(d, "CEO_TEMPLATE.md"),
+              "pre_p": md_p + ".pre-ceo", "new_p": md_p + ".new",
+              "receipt_p": os.path.join(d, ".ceo-template-applied"),
+              "pristine_p": os.path.join(pack_dir(), ".pristine", "directives",
+                                         "MASTER_DIRECTIVE.md")}
+        md_b = self._c03_read_bytes(md_p)
+        tmpl_b = self._c03_read_bytes(st["tmpl_p"])
+        pre_b = self._c03_read_bytes(st["pre_p"])
+        st.update(md_b=md_b, tmpl_b=tmpl_b, pre_b=pre_b,
+                  new_b=self._c03_read_bytes(st["new_p"]),
+                  pristine_b=self._c03_read_bytes(st["pristine_p"]))
+        st["md_text"] = md_b.decode("utf-8", "replace") if md_b is not None else None
+        st["pre_text"] = pre_b.decode("utf-8", "replace") if pre_b is not None else None
+        st["md_sha"] = hashlib.sha256(md_b).hexdigest() if md_b is not None else None
+        st["pre_sha"] = hashlib.sha256(pre_b).hexdigest() if pre_b is not None else None
+        byte_equal = md_b is not None and tmpl_b is not None and md_b == tmpl_b
+        receipt = self._c03_receipt_hash(st["receipt_p"])
+        receipt_equal = (receipt is not None and st["md_sha"] is not None
+                        and receipt == st["md_sha"])
+        marker_pins_ok = (st["md_text"] is not None
+                        and all(p in st["md_text"] for p in MARKER_PINS))
+        st.update(byte_equal=byte_equal, receipt_equal=receipt_equal,
+                  marker_pins_ok=marker_pins_ok, pre_exists=pre_b is not None)
+        st["marker"] = byte_equal or receipt_equal or (marker_pins_ok and st["pre_exists"])
+        st["marker_via"] = ("md==라이브 CEO_TEMPLATE 바이트 등가" if byte_equal
+                           else "승격 영수증 해시 등가" if receipt_equal
+                           else "표지 3핀+.pre-ceo 폴백" if st["marker"] else None)
+        # 퇴화 = .pre-ceo 가 CEO 템플릿 사본으로 오염(동시 승격 레이스 잔재 · R1 E3) —
+        # 강등하면 템플릿을 재적용하게 되어 강등 경로 자체가 파괴된 상태.
+        st["degenerate"] = st["pre_exists"] and tmpl_b is not None and pre_b == tmpl_b
+        st["classification"] = None   # 주축 분류 — _c03_master_axis 가 채운다(지문 성분).
+        st["guard_bits"] = None       # demote-guard 3항 비트 — _c03_demote_guard 가 채운다.
+        return st
+
+    def _c03_master_axis(self, st, pins):
+        """[핀 축·master] (status, detail) 반환 + st['classification'] 기록.
+
+        판정 우선순위(R1 시나리오5 — md 직접/우회 이중 판정 충돌 소멸):
+          ① md 표준 핀 전수 → PASS(승격 무관 — D2 합성본 자연 통과·사용자 주권 편집 허용.
+             '개행 변경도 비정형 판정됨' 문구는 ③ 비정형 FAIL 쪽에 둔다 — 스펙 §D3(ii)①)
+          ② 승격 표지 → 검사 표면을 .pre-ceo 로 승격 상태 세분(정상/구판/구본화/파괴/소실)
+          ③ .pre-ceo 존재 ∧ 표지 전부 실패 → '비정형 승격 상태' FAIL(파괴적 조치 금지)
+          ④ 그 외 → 현행 소실 FAIL(+원인 분류 1줄)"""
+        if st["md_text"] is None:
+            st["classification"] = "unreadable"
+            return (FAIL, "MASTER_DIRECTIVE.md 읽기 불가 (C02 먼저 해결)")
+        lost_md = [label for pin, label in pins if pin not in st["md_text"]]
+        if not lost_md:
+            st["classification"] = "pins-pass"
+            return (PASS, "MASTER_DIRECTIVE.md 핀 %d개 전부 존재"
+                          "(승격 여부 무관 — 사용자 주권 편집 허용)" % len(pins))
+        promote_hint = ("신 템플릿 재적용: promote-ceo 재실행 — 오너 role-less 셸 또는 CSO "
+                        "seat CLI `bash ~/.cys/pack/bin/cys-dept promote-ceo`"
+                        "(CEO/master pane 의 exit 7 거부는 계약)")
+        rebuild_hint = ".pristine/directives/MASTER_DIRECTIVE.md 로 .pre-ceo 재건(오너 승인)"
+        if st["marker"]:
+            if not st["pre_exists"]:
+                # ④ 사분면(R1 시나리오6): 등가/영수증 승격인데 강등 백업이 없다 — demote 로
+                #   자연 회복 불가한 고착 상태라 전용 FAIL. demote-guard 의 부재 WARN 과
+                #   중복 발화는 의도(독립 축).
+                st["classification"] = "promoted-backup-missing"
+                return (FAIL, "복원 백업 소실(강등 불능) — 승격 상태(%s)인데 "
+                              "MASTER_DIRECTIVE.md.pre-ceo 부재. 파괴적 조치 금지 — %s"
+                        % (st["marker_via"], rebuild_hint))
+            prefix = "승격 상태 — 표준 핀은 MASTER_DIRECTIVE.md.pre-ceo에서 검사"
+            if st["degenerate"]:
+                # ★연동 규칙(R3 conflicts2): 퇴화 검출 시 '구본화' 분류를 **억제**하고 전용
+                #   분류로 승격한다 — 퇴화 머신에서도 .new 병치 시 구본화 술어(.pre-ceo 핀
+                #   부족 ∧ 동일 핀이 .new 에 존재)가 참이 되어 '승격 백업 파괴'가 '구본화'로
+                #   오표기되는 것을 차단.
+                st["classification"] = "promoted-backup-destroyed"
+                return (FAIL, "%s: 승격 백업 파괴(강등 불능) — cmp(.pre-ceo, CEO_TEMPLATE.md) "
+                              "바이트 등가(퇴화 — 동시 승격 레이스 잔재). 파괴적 조치 금지 — %s"
+                        % (prefix, rebuild_hint))
+            lost_pre = [(pin, label) for pin, label in pins if pin not in st["pre_text"]]
+            legacy_tail = "" if st["byte_equal"] else \
+                " · 정상 승격(구판 템플릿 — md≠라이브 CEO_TEMPLATE). %s" % promote_hint
+            if not lost_pre:
+                if st["byte_equal"]:
+                    st["classification"] = "promoted-current"
+                    return (PASS, "%s: 핀 %d개 전부 존재(%s)"
+                            % (prefix, len(pins), st["marker_via"]))
+                # 구판 템플릿 승격 = 정상 상태의 WARN(FAIL 아님 — 템플릿 전진 릴리스 직후
+                # 전 기승격 머신 위경보 차단 · R2 시나리오6) + 재적용 안내.
+                st["classification"] = "promoted-legacy"
+                return (WARN, "정상 승격(구판 템플릿) — md≠라이브 CEO_TEMPLATE(%s). "
+                              "%s: 핀 %d개 전부 존재. %s"
+                        % (st["marker_via"], prefix, len(pins), promote_hint))
+            new_text = (st["new_b"].decode("utf-8", "replace")
+                        if st["new_b"] is not None else None)
+            if new_text is not None and all(pin in new_text for pin, _ in lost_pre):
+                # 구본화(R1 E1): 승격 유지 중 벤더 전진으로 .pre-ceo 만 낡았다 — 신본 채택
+                # 대기 분류로 결정론 안내(매번 수동 진단 반복 차단).
+                st["classification"] = "promoted-stale-backup"
+                return (FAIL, "%s: 구본화 — 신본 채택 대기: 소실 핀(%s) 전부가 "
+                              "MASTER_DIRECTIVE.md.new 에 존재. D1(a)형 갱신(순서 역전 금지): "
+                              "① `cp MASTER_DIRECTIVE.md.new MASTER_DIRECTIVE.md.pre-ceo` "
+                              "② `cys pack-merge --file directives/MASTER_DIRECTIVE.md "
+                              "--keep-mine`(keep-mine 이 .new 를 삭제)%s"
+                        % (prefix, "; ".join(l for _, l in lost_pre), legacy_tail))
+            st["classification"] = "promoted-backup-pins-lost"
+            if st["pristine_b"] is not None and st["pre_b"] == st["pristine_b"]:
+                # 검사 표면(.pre-ceo)이 무수정 배포본 — 사용자 과실 아님. 주의: 승격 중
+                # MASTER 에 --take-new 를 처방하지 않는다(A12 가드 — 재사용 금지 경로).
+                cause = ("원인 분류: 무수정 배포본(.pre-ceo==.pristine) — 핀 기준 선행"
+                         "(벤더 동기 필요·사용자 과실 아님)")
+            else:
+                cause = _C03_RESTORE_GUIDE
+            return (FAIL, "%s: 소실된 조항: %s — %s%s"
+                    % (prefix, "; ".join(l for _, l in lost_pre), cause, legacy_tail))
+        if st["pre_exists"]:
+            # ③ 비정형 승격 상태 — 파괴적 조치 금지·cmp 진단 첨부(R1 시나리오4).
+            st["classification"] = "anomalous-promotion"
+            return (FAIL, "비정형 승격 상태 — .pre-ceo 존재 ∧ md 표준 핀 실패 ∧ 승격 표지"
+                          "(바이트 등가·영수증·표지 3핀) 전부 실패. ★파괴적 조치 금지(주인님께 "
+                          "보고 후 지시 대기). 사용자 주권 편집은 허용이나 개행 변경도 비정형 "
+                          "판정됨(바이트 등가 기준·정규화 없음). cmp: md vs .pre-ceo=%s · "
+                          "md vs .pristine(MASTER)=%s · md vs 라이브 CEO_TEMPLATE=%s. "
+                          "CEO_TEMPLATE 전진 직후라면 promote-ceo 재실행으로 해소(재스왑·"
+                          ".pre-ceo 보존). 소실된 조항: %s"
+                    % (self._c03_cmp_label(st["md_b"], st["pre_b"]),
+                       self._c03_cmp_label(st["md_b"], st["pristine_b"]),
+                       self._c03_cmp_label(st["md_b"], st["tmpl_b"]),
+                       "; ".join(lost_md)))
+        # ④ 비승격 일반 소실 — 원인 분류 1줄(무수정 배포본이면 복원 절차 처방을 대체).
+        st["classification"] = "pins-fail"
+        cause = self._c03_cause_line("MASTER_DIRECTIVE.md", st["md_b"])
+        return (FAIL, "MASTER_DIRECTIVE.md에서 소실된 조항: %s — %s"
+                % ("; ".join(lost_md), cause or _C03_RESTORE_GUIDE))
+
+    def _c03_demote_guard(self, st):
+        """[건전성 축] C03.demote-guard — 승격 표지 시 항상 (status, detail)|None 반환 +
+        st['guard_bits'] 기록. 핀 축 결과와 독립이다(R2 E2).
+
+        ★WARN 등급 유지 근거 = 부트 비치명 계약(R1 E3 의 '전용 FAIL' 요구를 R2 가 하향한
+          근거의 명문화): preflight FAIL 은 부트를 차단(exit 1)하는데, 강등 백업 건전성은
+          '지금 부트를 막을 사유'가 아니라 '강등 시점에 터질 잠복 위험'의 상시 가시화다 —
+          FAIL 로 두면 승격 함대 전체의 부트가 관측 목적에 볼모로 잡힌다. 같은 상태를 핀
+          축이 FAIL 로 병행 발화할 수 있고(④ 백업 소실 등) 그 중복은 의도다(독립 축 —
+          모순 아닌 중복 신호 · R3 minor).
+        guard_bits = [pre 존재, 퇴화, 핀 전수] (1/0 · 부재 단락 시 후속 = None) — 지문 성분."""
+        if not st["marker"]:
+            return None    # 비승격 — 건전성 축 해당 없음(행 미발화 · 소음 0)
+        if not st["pre_exists"]:
+            st["guard_bits"] = [0, None, None]
+            return (WARN, "승격 표지(%s)인데 .pre-ceo 부재 — 강등 불능. 후속 검사(퇴화·핀) "
+                          "단락. .pristine/directives/MASTER_DIRECTIVE.md 로 재건(오너 승인). "
+                          "핀 축 '복원 백업 소실' FAIL 과의 중복 발화는 의도(독립 축)"
+                    % st["marker_via"])
+        pins_lost = [(pin, label) for pin, label in CONTENT_PINS["MASTER_DIRECTIVE.md"]
+                     if pin not in st["pre_text"]]
+        st["guard_bits"] = [1, 1 if st["degenerate"] else 0, 0 if pins_lost else 1]
+        if st["degenerate"]:
+            return (WARN, "승격 백업 파괴 — cmp(.pre-ceo, CEO_TEMPLATE.md) 바이트 등가(퇴화)"
+                          "·강등 불능 — .pristine/directives/MASTER_DIRECTIVE.md 로 재건"
+                          "(오너 승인)")
+        if pins_lost:
+            new_text = (st["new_b"].decode("utf-8", "replace")
+                        if st["new_b"] is not None else None)
+            if new_text is not None and all(pin in new_text for pin, _ in pins_lost):
+                return (WARN, "구본화 — 신본 채택 대기: .pre-ceo 소실 핀(%s) 전부가 "
+                              "MASTER_DIRECTIVE.md.new 에 존재. D1(a)형 갱신: "
+                              "① `cp MASTER_DIRECTIVE.md.new MASTER_DIRECTIVE.md.pre-ceo` "
+                              "② `cys pack-merge --file directives/MASTER_DIRECTIVE.md "
+                              "--keep-mine`" % "; ".join(l for _, l in pins_lost))
+            return (WARN, ".pre-ceo 표준 핀 부족: %s — 강등 시 조항 소실 위험"
+                    % "; ".join(l for _, l in pins_lost))
+        return (PASS, "승격 백업 건전 — .pre-ceo 존재·비퇴화(≠CEO_TEMPLATE)·표준 핀 전수")
+
+    def _c03_fingerprint_dedupe(self, fp):
+        """상태 지문 dedupe(스펙 A6 · ①폭주 앵커) — 반환 True = 동일 지문(detail 1줄 축약).
+
+        지문 = [md sha256, 주축 분류, .pre-ceo sha256|'absent', demote-guard 3항 비트].
+        demote-guard 축도 지문에 편입돼 .pre-ceo 소실/퇴화 전이는 **항상 새 지문**이 되어
+        축약을 뚫는다(즉시 전문 재발화 · R3 minor2). 오너 통보(heartbeat/fleet digest 인용)는
+        지문 변화 시에만 — 소비처가 이 파일의 changed_at 을 참조한다(배선은 티켓 범위 밖).
+        ★report 모드에서도 기록한다: 이 파일은 설정이 아니라 관측 dedupe 원장(기계 소유·
+          가역·~/.cys/state)이라 OPP-17 비가역 게이트 범위 밖이고, 스펙 A6 이 '동일 지문
+          축약'을 매 부트 결정론으로 요구한다. 쓰기 실패는 무시(부트 게이트 crash 금지)."""
+        path = c03_fingerprint_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = None
+        same = isinstance(old, dict) and old.get("fingerprint") == fp
+        if not same:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".c03-fp-")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({"fingerprint": fp, "changed_at": int(time.time())},
+                              f, ensure_ascii=False)
+                os.replace(tmp, path)   # 원자 교체(반쪽 JSON 차단 — G16 관용)
+            except OSError:
+                pass
+        return same
+
     def c03_content_pins(self):
+        # ★dept 면제 early-return 선행 불변(멀티마스터 F1) — 어떤 신설 로직도 이 가드보다
+        #   앞서지 않는다(부서/CEO 커스텀 디렉티브에 표준 핀·승격 판정을 들이대지 않는다).
         if is_dept_pack():
             self.add("C03.pin", WARN,
                      "부서/CEO pack(%s) — 표준 디렉티브 핀 검사 면제(CEO/부서장 커스텀 디렉티브가 정상)"
                      % pack_dir())
             return
+        # [핀 축·master + 건전성 축 + 상태 지문] — base 팩 한정 승격 로직.
+        mcid, gcid = "C03.pin.master", "C03.demote-guard"
+        st = self._c03_promotion_state()
+        mrow = None
+        if not self.skipped(mcid):
+            mrow = self._c03_master_axis(st, CONTENT_PINS["MASTER_DIRECTIVE.md"])
+        grow = None
+        if not self.skipped(gcid):
+            grow = self._c03_demote_guard(st)
+        if mrow is not None:
+            fp = [st["md_sha"] or "unreadable", st["classification"],
+                  st["pre_sha"] or "absent", st["guard_bits"]]
+            same = self._c03_fingerprint_dedupe(fp)
+            self.add(mcid, mrow[0],
+                     ("[지문 동일 — 축약] %s (md=%s) — 전문은 지문 변화 시 재발화"
+                      % (st["classification"], (st["md_sha"] or "?")[:12]))
+                     if same else mrow[1])
+            if grow is not None:
+                self.add(gcid, grow[0],
+                         ("[지문 동일 — 축약] demote-guard bits=%s" % (st["guard_bits"],))
+                         if same else grow[1])
+        elif grow is not None:
+            # master 축이 --skip 됐어도 건전성 축은 독립 발화(지문 dedupe 없이 전문).
+            self.add(gcid, grow[0], grow[1])
+        # [핀 축 — 그 외 역할 + CEO 템플릿] (master 는 위 승격 축 판정이 대체)
         for f, pins in CONTENT_PINS.items():
+            if f == "MASTER_DIRECTIVE.md":
+                continue
             cid = "C03.pin.%s" % f.split("_")[0].lower()
             if self.skipped(cid):
                 continue
-            p = os.path.join(pack_dir(), "directives", f)
-            try:
-                text = open(p, encoding="utf-8", errors="replace").read()
-            except OSError:
+            live_b = self._c03_read_bytes(os.path.join(pack_dir(), "directives", f))
+            if live_b is None:
                 self.add(cid, FAIL, "%s 읽기 불가 (C02 먼저 해결)" % f)
                 continue
+            text = live_b.decode("utf-8", "replace")
             lost = [label for pin, label in pins if pin not in text]
             if lost:
-                self.add(
-                    cid, FAIL,
-                    "%s에서 소실된 조항: %s — ★복원 절차(운영계약 §9-7-6·§11-13): "
-                    "①먼저 백업한다 `cp <파일> <파일>.bak-$(date +%%Y%%m%%dT%%H%%M%%S)` "
-                    "②주인님께 보고하고 지시에 따라 복구한다. 팩 템플릿 강제 복원은 "
-                    "사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 절대 금지다."
-                    % (f, "; ".join(lost)),
-                )
+                cause = self._c03_cause_line(f, live_b)
+                self.add(cid, FAIL, "%s에서 소실된 조항: %s — %s"
+                         % (f, "; ".join(lost), cause or _C03_RESTORE_GUIDE))
             else:
                 self.add(cid, PASS, "%s 핀 %d개 전부 존재" % (f, len(pins)))
 

@@ -18,7 +18,8 @@ import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
-import { MouseTrackingFilter } from "./trackfilter";
+import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
+import { shouldSuppressWheel } from "./wheelgate";
 import {
   toastTtl,
   toastTimerPlan,
@@ -102,6 +103,8 @@ interface PaneRuntime {
   lastOutputAt: () => number;
   // IME 조합 pending 여부 — 조합 중 주입의 순서 역전(자모 뒤섞임) 차단.
   imeBusy: () => boolean;
+  // 마우스 트래킹 정합기(스펙 D4) — agent.exited 리셋 훅이 세대 캡처·장부 소거에 쓴다.
+  trackFilter: MouseTrackingFilter;
 }
 
 // ---------- T5 사용량 관측 배지 (pane 헤더) ----------
@@ -2115,20 +2118,47 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     exited_event: string;
   };
   const outStamp = { t: 0 }; // 마지막 출력 시각 — rt.lastOutputAt(스트리밍 가드)의 원천
-  // ★마우스 트래킹 스트리핑(B안 근본 수리 · trackfilter.ts 계약 주석 참조): 앱의 DECSET
+  // ★마우스 트래킹 스트리핑+정합기(스펙 D4 · trackfilter.ts 계약 주석 참조): 앱의 DECSET
   // 1003h/1006h 류가 xterm 에 닿지 않게 걷어내 휠 스크롤·일반 드래그 선택·복사를 기본 동작으로
-  // 복원한다. pane 수명 전체 단일 인스턴스 — 스냅샷 재생과 라이브 스트림이 같은 필터를 지난다.
+  // 복원하고, mac 은 alt 화면 구간만 장부 재생 주입으로 앱에 마우스를 돌려준다(fullscreen 휠
+  // →프롬프트 히스토리 오염 봉인). pane 수명 전체 단일 인스턴스 — 스냅샷 재생과 라이브
+  // 스트림이 같은 필터를 지난다. os·롤백 스위치는 pane 생성 시 캡처(라이브 재판독 금지 —
+  // 수명 중 토글 시 필터/휠 억제 상태 분열. allowAppMouse 킬스위치와 동형 계약).
   // 킬스위치 allowAppMouse 는 onData 등록 앞(insertLeak 아래)에서 판독했다 — 여기서는 소비만.
-  const trackFilter = new MouseTrackingFilter();
+  // 롤백 스위치 cysMouseReconcilerOff="1" = 정합기 전체 비활성(win 비활성 코드 경로 재사용).
+  const reconcile = localStorage.getItem("cysMouseReconcilerOff") !== "1";
+  const trackFilter = new MouseTrackingFilter({ os: IS_WINDOWS ? "win" : "mac", reconcile });
+  // ★휠 억제(스펙 D4 — mac 전용): [alt buffer ∧ 장부 트래킹 요청 ∧ xterm 트래킹 미진입]이면
+  // 휠을 소비한다(return false = xterm 기본 차단) — 미진입 창의 휠이 방향키로 합성돼 Claude
+  // Code 프롬프트 히스토리를 오염시키는 결함 봉인. 판단은 wheelgate 순수 함수(테스트 고정).
+  // less/man(트래킹 무요청)은 술어 불충족 → 방향키 합성 보존. Windows 는 핸들러 미등록
+  // (vim mouse=a 휠 회귀 방지 — 현행 유지)·롤백 스위치 off 도 미등록(win 경로 재사용).
+  // ★attachCustomWheelEventHandler 는 인스턴스당 단일 슬롯(덮어쓰기)이다 — 두 번째 용도가
+  // 생기면 합성 함수로 묶을 것(현재 ui/src 에 다른 등록 없음).
+  if (!IS_WINDOWS && reconcile) {
+    term.attachCustomWheelEventHandler(
+      () =>
+        !shouldSuppressWheel({
+          altActive: term.buffer.active.type === "alternate",
+          ledgerWantsMouse: trackFilter.ledgerWantsMouse(),
+          xtermTracking: term.modes.mouseTrackingMode !== "none",
+          allowAppMouse,
+          isWindows: IS_WINDOWS,
+        }),
+    );
+  }
   const un1 = await listen(ev.output_event, (e) => {
     outStamp.t = Date.now();
     const raw = b64ToBytes(e.payload as string);
     term.write(allowAppMouse ? raw : trackFilter.feed(raw), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
-    // 필터 잔여 carry 방류(시퀀스 중간 사망 시에도 바이트 소실 0) 후 종료 배너.
+    // 순서 고정(스펙 D4 ③): ①필터 잔여 carry 방류(시퀀스 중간 사망 시에도 바이트 소실 0)
+    // ②정합기 reset — 장부 소거 + 8종 상수 DECRST 를 **필터 우회 term.write 직접** 기록
+    //   (feed 재진입 금지 — 자기 스트리핑. 트래킹 소등·선택 복원, 1049l 미포함) ③종료 배너.
     const rest = trackFilter.flush();
     if (rest.length > 0) term.write(rest);
+    term.write(trackFilter.reset());
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n", snapToBottom);
   });
   // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
@@ -2142,7 +2172,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "" };
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "", trackFilter };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -5147,6 +5177,26 @@ function onDaemonEvent(event: Record<string, unknown>) {
     toast("alert", "❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`);
     osBanner("❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`); // B4 OS 배너(고우선)
     refreshSidebarStatus();
+    // ★정합기 리셋 훅(스펙 D4 ②): 앱 즉사(SIGKILL — 복원 시퀀스 없음)로 유출·잔존한 트래킹을
+    // 소등한다. 조준은 socket_slug **실해석 성공** pane 만(:5194 선례 — slug 부재·미해석 시
+    // 기본 데몬 폴백 금지, 생략: 타 부서 동일 sid pane 의 정합기 오파괴 방지).
+    // 에포크 가드: 이벤트 채널(cys-event)과 출력 스트림은 순서 보장이 없다 — 수신 시점 세대를
+    // 캡처하고 한 태스크 양보 뒤 비교해, 그 사이(딜리버리 스큐 창) 새 앱의 명시 DECSET/alt
+    // 전이가 관측됐으면 장부 소거를 생략(새 앱 상태 보호)하고 상수 소등 주입만 멱등 수행한다.
+    // 관측 카운터는 필터의 세대 번호(trackfilter.generation)로 구현돼 있다.
+    const exSock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;
+    if (exSock && sid != null) {
+      const rt = panes.get(paneKey(Number(sid), exSock));
+      if (rt) {
+        const gen = rt.trackFilter.generation();
+        window.setTimeout(() => {
+          const live = panes.get(paneKey(Number(sid), exSock));
+          if (live !== rt) return; // pane 이 이미 파괴·교체됨 — dispose 된 term 에 write 금지
+          rt.trackFilter.clearLedgerIfGeneration(gen); // 세대 변화 시 장부 보존(소거 생략)
+          rt.term.write(MOUSE_ALL_OFF); // 상수 소등 주입은 항상 멱등(1049l 미포함·필터 우회)
+        }, 0);
+      }
+    }
     return;
   }
   if (name === "master.deadman") {

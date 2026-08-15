@@ -275,3 +275,31 @@ describe("routeOnData opts — 킬스위치·alt screen (2026-08-12 R2/R3 확정
     expect(routeOnData(sgr(65, 1, 1), true)).toEqual({ action: "scroll", lines: 3 });
   });
 });
+
+// ── A9 공유 코퍼스 패리티 (스펙 A9 — src/testdata 픽스처 소비) ──
+// W4 생성 src/testdata/mouse_report_corpus.json(4인코딩 × 휠/클릭/릴리스/하한 미달/혼합/
+// 절단/paste 래퍼, {_schema, cases:[{name, bytes, pure}]})을 TS classifyMouseReport 와
+// Rust 데몬 매처(last_human_input 면제 — src/lib.rs mousereport)가 **같은 파일**로 소비해
+// 판정 동형을 핀한다. bytes 의 제어문자는 JSON \u 이스케이프 — 표준 파서가 실제 제어문자로
+// 복원한다(코퍼스 _schema 계약: 커스텀 디코딩 금지). pure=true ⇔ '수신 전체가 마우스 보고
+// 시퀀스의 연접' ⇔ classify 비-pass(drop|wheel). `\x1b[200~`(bracketed paste) 접두는
+// 무조건 pure=false. 파일 부재(코퍼스 미착지) 시 skip — 착지 후 자동 활성화된다.
+import { existsSync, readFileSync } from "node:fs";
+
+// 픽스처 경로는 이 테스트 파일 기준 상대(URL) — cwd 비의존(레포 루트/ui 어디서 돌려도 동일).
+const CORPUS_URL = new URL("../../src/testdata/mouse_report_corpus.json", import.meta.url);
+const hasCorpus = existsSync(CORPUS_URL);
+
+describe("A9 공유 코퍼스 — classifyMouseReport 판정 = pure 동형", () => {
+  (hasCorpus ? it : it.skip)("코퍼스 전 항목: pure ⇔ 비-pass(연접 판정 일치)", () => {
+    const corpus = JSON.parse(readFileSync(CORPUS_URL, "utf-8")) as {
+      cases: { name: string; bytes: string; pure: boolean }[];
+    };
+    expect(corpus.cases.length).toBeGreaterThan(0);
+    for (const e of corpus.cases) {
+      const got = classifyMouseReport(e.bytes).kind !== "pass";
+      // 불일치 항목을 name 으로 식별 가능하게 — 항목별 (name → 판정) 문자열 비교.
+      expect(`${e.name} → pure:${got}`).toBe(`${e.name} → pure:${e.pure}`);
+    }
+  });
+});

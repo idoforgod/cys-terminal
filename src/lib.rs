@@ -581,6 +581,44 @@ pub fn resolve_claude_config_dir() -> String {
         .unwrap_or_else(|| home_dir().join(".cys").join("claude").to_string_lossy().into_owned())
 }
 
+/// ★D5(v4 수리 — 문제2 env 방어층): claude 가 macOS 에서 alternate screen(fullscreen TUI)으로
+/// 뜨면 휠 보고가 앱으로 들어가 프롬프트 히스토리를 오염시킨다(스펙 §D5). 이 키를 기본 "1" 로
+/// 주입해 fullscreen 진입 자체를 막되, **사용자가 agents.json env 에 이미 값을 적었으면(특히
+/// "0" 옵트인) 절대 덮지 않는다** — 주입은 '키 부재 시에만'이 계약이다.
+pub const ENV_CLAUDE_NO_ALT_SCREEN: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
+
+/// D5 주입 헬퍼 — **두 소비처(cys.rs `boot_agent_on_surface` 인라인 재조립·`run_launch_agent_opts`
+/// surface.create env)가 모두 이 함수를 경유**한다(사본 금지 — lib 에 있는 이유는 `cargo test --lib`
+/// 레인이 회귀 핀을 상주 실행하기 때문. cys.rs 테스트 모듈은 CI 0회 실행이라 핀이 죽는다).
+///
+/// 게이트 = `cfg!(target_os = "macos")` ∧ `bin == "claude"`(호출부가 cys.rs `extract_bin`(:1081
+/// 헬퍼)으로 env-prefix 를 걷어낸 실제 바이너리 토큰을 넘긴다 — 어댑터 키 개명 내성).
+///
+/// ★함정 주석(스펙 명문): `agent_env_pairs` 는 내부에서 이미 `v.sort()` 를 끝냈다 — 여기서
+/// **append 후 재정렬을 하면 안 된다**. CLAUDE_CODE_… 는 사전순으로 CLAUDE_CONFIG_DIR 보다
+/// 앞이라, 재정렬은 무해해 '보이지만' 미래에 같은 키의 사용자 "0" 쌍과 기본 "1" 쌍이 공존하는
+/// 버그가 생겼을 때 정렬이 **사용자 "0" 을 "1" 뒤로 뒤집어** 셸 전개 순서상 기본값이 이기게
+/// 만든다. 그래서 계약은 정렬이 아니라 **contains 검사 후 부재 시에만 append** 다.
+pub fn inject_claude_alt_screen_default(env_pairs: &mut Vec<(String, String)>, bin: &str) {
+    inject_claude_alt_screen_default_for(env_pairs, bin, cfg!(target_os = "macos"));
+}
+
+/// D5 순수 코어 — OS 게이트를 인자로 받아 **어느 호스트에서든 양 분기를 테스트**할 수 있게 한다
+/// (compose_pane_path 등 이 파일의 'windows 로직을 mac에서 검증' 관례와 동일).
+pub fn inject_claude_alt_screen_default_for(
+    env_pairs: &mut Vec<(String, String)>,
+    bin: &str,
+    is_macos: bool,
+) {
+    if !is_macos || bin != "claude" {
+        return;
+    }
+    if env_pairs.iter().any(|(k, _)| k == ENV_CLAUDE_NO_ALT_SCREEN) {
+        return; // 사용자 값(특히 "0" 옵트인) 절대 불가침 — 부재 시에만 기본값.
+    }
+    env_pairs.push((ENV_CLAUDE_NO_ALT_SCREEN.to_string(), "1".to_string()));
+}
+
 /// Claude Code projects/ 디렉터리명 munge — 실측: '/'와 특수문자가 '-'로 치환된다.
 /// ASCII 영숫자·'-'만 보존하는 보수 구현. resume 사전검증 게이트(cys.rs)와 usage 휴리스틱이 공유한다.
 pub fn claude_project_component(cwd: &str) -> String {
@@ -698,6 +736,172 @@ pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
         }
     };
     Some(seq.to_vec())
+}
+
+/// ★A9(v4 수리 — 문제2 데몬측 예외 1건): xterm 마우스 보고 시퀀스 판별 — **TS 이식본**.
+///
+/// 정본은 `ui/src/mousefilter.ts` 의 `classifyMouseReport`(:29-112)이고, 이 모듈은 그 규칙을
+/// 바이트 단위로 동일하게 Rust 로 옮긴 것이다(TS 대응 좌표를 각 항목에 병기). 두 구현의
+/// 패리티는 공유 코퍼스 `src/testdata/mouse_report_corpus.json` 이 기계 고정한다 — 규칙을
+/// 고칠 땐 **양쪽 + 코퍼스**를 함께 고쳐라(한쪽만 고치면 코퍼스 테스트가 빨간불).
+///
+/// 왜 데몬에 필요한가: GUI 는 mac 에서 비-휠 마우스 보고(클릭·모션)를 앱에 forward 하는데,
+/// 그 경로가 `send_input`(human=true) → `surface.send_text` 라서 보고가 **사람 타이핑으로
+/// 위장**된다 — 오너가 pane 을 스크롤해 읽는 동안 `--queued` 배달이 무기 연기되고(큐 적체
+/// 앵커 위반) seat 판정이 오염된다(R2 SIM 발견 8). 데몬은 '수신 텍스트 **전체**가 마우스
+/// 보고의 연접'일 때만 last_human_input 갱신을 생략한다(`is_pure_mouse_report`).
+pub mod mousereport {
+    /// mousefilter.ts:21-24 `MouseVerdict` 동형. `Wheel.dir`: -1=위로, +1=아래로(scrollLines 규약).
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum MouseVerdict {
+        Pass,
+        Drop,
+        Wheel { dir: i8, count: u32 },
+    }
+
+    /// mousefilter.ts:34 — urxvt·X10 은 좌표/버튼을 32 오프셋으로 싣는다(제어문자 회피).
+    const OFFSET: u16 = 32;
+
+    /// bracketed paste 개시 시퀀스 — A9 계약: 이 접두가 붙은 텍스트는 **무조건 비면제**
+    /// (2004-off 상태의 ESC 붙여넣기 등 극저확률 역방향 창까지 명시적으로 봉인 — R3 RISK 4-①).
+    pub const BRACKETED_PASTE_PREFIX: &str = "\u{1b}[200~";
+
+    /// mousefilter.ts:40-46 `wheelDelta` 동형 — 휠 비트 64·확장버튼 128 배제(0xC0 마스크),
+    /// 하위 2비트만 방향(0=업, 1=다운, 2/3=가로휠→0). button 은 JS `Number(..) & 0xc0` 의
+    /// ToInt32 절단과 등가가 되도록 u64 → u32 wrapping 캐스트를 거친다(2^53 초과는 JS f64
+    /// 반올림과 갈릴 수 있으나 실보고 값 범위 밖 — 이론 한계 주석).
+    fn wheel_delta(button: u64) -> i32 {
+        let b = button as u32;
+        if (b & 0xc0) != 0x40 {
+            return 0;
+        }
+        match b & 3 {
+            0 => -1, // 휠업 → 위로 스크롤
+            1 => 1,  // 휠다운 → 아래로 스크롤
+            _ => 0,
+        }
+    }
+
+    /// mousefilter.ts:48-51 `Hit` 동형 — end = 보고가 끝나는 인덱스(다음 스캔 시작점).
+    struct Hit {
+        end: usize,
+        wheel: i32,
+    }
+
+    /// `u[i..]` 에서 십진 숫자(≥1자리)를 읽는다. JS `\d`(ASCII 0-9 한정) 동형.
+    /// 값은 u64 wrapping 누적 — wheel_delta 의 ToInt32 절단 주석 참조.
+    fn read_digits(u: &[u16], mut i: usize) -> Option<(u64, usize)> {
+        let start = i;
+        let mut v: u64 = 0;
+        while i < u.len() && (0x30..=0x39).contains(&u[i]) {
+            v = v.wrapping_mul(10).wrapping_add((u[i] - 0x30) as u64);
+            i += 1;
+        }
+        if i == start {
+            None
+        } else {
+            Some((v, i))
+        }
+    }
+
+    /// mousefilter.ts:53-85 `matchReport` 동형 — u[from] 에서 시작하는 보고 하나를 매칭.
+    /// 시도 순서(SGR → X10 → urxvt)와 각 분기의 non-match/null 반환 지점까지 동일하다.
+    /// 입력은 UTF-16 코드유닛 열 — TS 의 charCodeAt/정규식 lastIndex 의미론과 정확히 겹친다.
+    fn match_report(u: &[u16], from: usize) -> Option<Hit> {
+        let esc = 0x1b_u16;
+        // RE_SGR(ts:29): ESC [ < d+ ; d+ ; d+ [Mm]  — SGR(1006)과 SGR-Pixels(1016) 공통
+        // (픽셀 좌표는 대형 십진수 — 자릿수 제한 없음).
+        if u.len() > from + 2 && u[from] == esc && u[from + 1] == b'[' as u16 && u[from + 2] == b'<' as u16 {
+            if let Some((b, i)) = read_digits(u, from + 3) {
+                if u.get(i) == Some(&(b';' as u16)) {
+                    if let Some((_x, i)) = read_digits(u, i + 1) {
+                        if u.get(i) == Some(&(b';' as u16)) {
+                            if let Some((_y, i)) = read_digits(u, i + 1) {
+                                if u.get(i) == Some(&(b'M' as u16)) || u.get(i) == Some(&(b'm' as u16)) {
+                                    return Some(Hit { end: i + 1, wheel: wheel_delta(b) });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // RE_X10(ts:31): ESC [ M + 원시 3 코드유닛. ts:60-72 — 정규식은 자릿수만 세므로
+        // 값 하한(셋 다 OFFSET 이상)을 별도 검증하고, 매치 후 하한 미달이면 **null 반환**
+        // (urxvt 재시도 없이 — TS 의 return null 과 동일 구조. ESC[M 은 urxvt 문법과
+        // 겹치지 않아 행동 차이는 없다).
+        if u.len() > from + 5 && u[from] == esc && u[from + 1] == b'[' as u16 && u[from + 2] == b'M' as u16 {
+            let (b, x, y) = (u[from + 3], u[from + 4], u[from + 5]);
+            if b >= OFFSET && x >= OFFSET && y >= OFFSET {
+                return Some(Hit { end: from + 6, wheel: wheel_delta((b - OFFSET) as u64) });
+            }
+            return None;
+        }
+        // RE_URXVT(ts:30): ESC [ d+ ; d+ ; d+ M — 접두가 평범해 오탐 여지(ts:78-80):
+        // 버튼(원시-32 ≥ 0)·좌표(≥ OFFSET) 하한을 만족할 때만 마우스로 인정.
+        if u.len() > from + 1 && u[from] == esc && u[from + 1] == b'[' as u16 {
+            if let Some((braw, i)) = read_digits(u, from + 2) {
+                if u.get(i) == Some(&(b';' as u16)) {
+                    if let Some((x, i)) = read_digits(u, i + 1) {
+                        if u.get(i) == Some(&(b';' as u16)) {
+                            if let Some((y, i)) = read_digits(u, i + 1) {
+                                if u.get(i) == Some(&(b'M' as u16))
+                                    && braw >= OFFSET as u64
+                                    && x >= OFFSET as u64
+                                    && y >= OFFSET as u64
+                                {
+                                    return Some(Hit { end: i + 1, wheel: wheel_delta(braw - OFFSET as u64) });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// mousefilter.ts:96-112 `classifyMouseReport` 동형 — 청크 **전체가 보고로만 구성**될 때만
+    /// Drop/Wheel, 그 외(혼합·절단·빈 청크)는 전부 Pass. 혼합을 Pass 로 두는 비대칭 근거
+    /// (오폐기=입력 소실 > 유출 1회)는 TS 머리 주석(ts:89-95) 참조.
+    pub fn classify_mouse_report(text: &str) -> MouseVerdict {
+        if text.is_empty() {
+            return MouseVerdict::Pass; // 빈 청크는 손대지 않는다(ts:97)
+        }
+        let u: Vec<u16> = text.encode_utf16().collect();
+        let mut i = 0usize;
+        let mut reports = 0u32;
+        let mut net: i64 = 0; // 휠 노치 순증감(+아래/-위) — 배칭 청크를 한 번의 스크롤로 접는다
+        while i < u.len() {
+            let Some(hit) = match_report(&u, i) else {
+                return MouseVerdict::Pass; // 마우스 아닌 유닛이 하나라도 있으면 통째로 통과(ts:104)
+            };
+            reports += 1;
+            net += hit.wheel as i64;
+            i = hit.end;
+        }
+        if reports == 0 {
+            return MouseVerdict::Pass; // 도달 불가(빈 문자열은 위에서 컷) — 방어(ts:109)
+        }
+        if net == 0 {
+            return MouseVerdict::Drop; // 휠 아님, 또는 상쇄(ts:110)
+        }
+        MouseVerdict::Wheel {
+            dir: if net > 0 { 1 } else { -1 },
+            count: net.unsigned_abs().min(u32::MAX as u64) as u32,
+        }
+    }
+
+    /// A9 면제 술어 — cysd `surface.send_text` human 경로가 소비한다.
+    /// 참 = '수신 텍스트 전체가 마우스 보고 시퀀스의 연접'(classify != Pass) ∧ bracketed
+    /// paste 접두 아님. **참일 때만** last_human_input 갱신을 생략한다(순수 보고=미갱신·
+    /// 비순수(혼합·절단·paste 래퍼)=갱신 — 회귀 핀은 코퍼스+handlers 테스트).
+    pub fn is_pure_mouse_report(text: &str) -> bool {
+        if text.starts_with(BRACKETED_PASTE_PREFIX) {
+            return false; // 무조건 비면제(스펙 §D4+A9 명문)
+        }
+        classify_mouse_report(text) != MouseVerdict::Pass
+    }
 }
 
 #[cfg(test)]
@@ -1206,5 +1410,102 @@ mod tests {
             Some(v) => std::env::set_var("CYS_ACCOUNT_DIR", v),
             None => std::env::remove_var("CYS_ACCOUNT_DIR"),
         }
+    }
+
+    /// ★A9 패리티 핀 — 공유 코퍼스(src/testdata/mouse_report_corpus.json)를 소비해
+    /// Rust 매처의 판정이 코퍼스 `pure` 와 전건 일치함을 단언한다. 같은 파일을 TS 테스트
+    /// (ui/src/mousefilter.test.ts — W3)도 소비하므로, 이 테스트가 green 이면 TS↔Rust
+    /// 이중 구현 드리프트가 구조적으로 불가능하다(R3 RISK 4-② 봉합).
+    #[test]
+    fn mouse_report_corpus_parity() {
+        let raw = include_str!("testdata/mouse_report_corpus.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).expect("코퍼스는 유효 JSON");
+        let cases = doc["cases"].as_array().expect("cases 배열");
+        assert!(cases.len() >= 30, "코퍼스 축소 금지(4인코딩×휠/클릭/릴리스/하한/혼합/절단/paste)");
+        for c in cases {
+            let name = c["name"].as_str().unwrap_or("?");
+            let bytes = c["bytes"].as_str().expect("bytes 문자열");
+            let pure = c["pure"].as_bool().expect("pure 불리언");
+            assert_eq!(
+                mousereport::is_pure_mouse_report(bytes),
+                pure,
+                "코퍼스 케이스 '{name}' 판정 불일치 (bytes={bytes:?}, 기대 pure={pure})"
+            );
+        }
+    }
+
+    /// A9 verdict 세부 핀 — 코퍼스는 pure 만 고정하므로, 휠 방향·배칭 접기·상쇄는 여기서
+    /// TS 의미론(ts:110-111)과 대조한다.
+    #[test]
+    fn mouse_report_verdict_semantics() {
+        use mousereport::{classify_mouse_report, MouseVerdict};
+        // 휠업 단독 → dir=-1, count=1.
+        assert_eq!(
+            classify_mouse_report("\u{1b}[<64;10;20M"),
+            MouseVerdict::Wheel { dir: -1, count: 1 }
+        );
+        // 배칭(업2+다운1) → 순증감 -1.
+        assert_eq!(
+            classify_mouse_report("\u{1b}[<64;1;1M\u{1b}[<64;1;1M\u{1b}[<65;1;1M"),
+            MouseVerdict::Wheel { dir: -1, count: 1 }
+        );
+        // 상쇄 → Drop(스크롤할 것 없음). 클릭·릴리스도 Drop.
+        assert_eq!(
+            classify_mouse_report("\u{1b}[<64;1;1M\u{1b}[<65;1;1M"),
+            MouseVerdict::Drop
+        );
+        assert_eq!(classify_mouse_report("\u{1b}[<0;5;7m"), MouseVerdict::Drop);
+        // X10 인코딩 휠업(b=96 → 64) — 오프셋 복원 경로.
+        assert_eq!(
+            classify_mouse_report("\u{1b}[M`*%"),
+            MouseVerdict::Wheel { dir: -1, count: 1 }
+        );
+        // paste 래퍼는 classify 로도 Pass 이고, 술어로는 접두 규칙이 이중 봉인한다.
+        assert_eq!(
+            classify_mouse_report("\u{1b}[200~\u{1b}[<64;10;20M\u{1b}[201~"),
+            MouseVerdict::Pass
+        );
+        assert!(!mousereport::is_pure_mouse_report("\u{1b}[200~\u{1b}[<64;10;20M\u{1b}[201~"));
+    }
+
+    /// ★D5 회귀 핀(--lib 상주 — cys.rs 테스트 모듈은 CI 0회 실행이라 여기 둔다):
+    /// ① 사용자 "0"(옵트인) 이 있으면 최종 산출에 "1" 이 **절대 미출현**(append+sort 뒤집기 함정 봉인)
+    /// ② mac ∧ claude 면 기본 "1" 삽입 ③ 비-mac(win 포함)·타 에이전트는 미삽입.
+    #[test]
+    fn claude_alt_screen_env_injection_pins() {
+        let k = ENV_CLAUDE_NO_ALT_SCREEN;
+        // ① 사용자 "0" 불가침 — mac 게이트가 참이어도 덮지 않는다.
+        let mut with_zero = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string()),
+            (k.to_string(), "0".to_string()),
+        ];
+        inject_claude_alt_screen_default_for(&mut with_zero, "claude", true);
+        let vals: Vec<&str> = with_zero.iter().filter(|(key, _)| key == k).map(|(_, v)| v.as_str()).collect();
+        assert_eq!(vals, ["0"], "사용자 '0' 이 유지되고 '1' 은 미출현이어야 한다: {with_zero:?}");
+        // ② mac ∧ claude ∧ 키 부재 → "1" 삽입(기존 쌍 순서 불변 — 재정렬 금지 계약).
+        let mut absent = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(&mut absent, "claude", true);
+        assert_eq!(absent[0].0, "CLAUDE_CONFIG_DIR", "기존 쌍 순서 불변(재정렬 금지)");
+        assert_eq!(
+            absent.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()),
+            Some("1"),
+            "mac claude 는 기본 '1' 이 삽입돼야 한다: {absent:?}"
+        );
+        // ③-a 비-mac(win 등)은 미삽입.
+        let mut win = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(&mut win, "claude", false);
+        assert!(win.iter().all(|(key, _)| key != k), "비-mac 은 미삽입: {win:?}");
+        // ③-b 타 에이전트(codex 등)는 mac 이어도 미삽입.
+        let mut codex: Vec<(String, String)> = Vec::new();
+        inject_claude_alt_screen_default_for(&mut codex, "codex", true);
+        assert!(codex.is_empty(), "타 에이전트는 미삽입: {codex:?}");
+        // 공개 래퍼는 현 빌드 OS 게이트를 그대로 소비한다(cfg! 정합 — 스모크).
+        let mut wrapped: Vec<(String, String)> = Vec::new();
+        inject_claude_alt_screen_default(&mut wrapped, "claude");
+        assert_eq!(
+            wrapped.iter().any(|(key, _)| key == k),
+            cfg!(target_os = "macos"),
+            "래퍼 게이트는 cfg!(macos) 와 일치해야 한다"
+        );
     }
 }
