@@ -134,6 +134,14 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     proj_round = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round")
     srcs.append(os.path.join(proj_round, "SESSION_STATE.md"))
     srcs.extend(sorted(_glob.glob(os.path.join(proj_round, "*_TODO.md"))))
+    #   ★복원 무결성: 위 $JAVIS_ROOT/CWD 기반 '_round' 는 스케줄러가 잡을 실행할 때의 CWD
+    #   (pack/bin)에서 빗나가, 정작 SESSION_STATE·TODO 가 한 번도 세대에 담기지 않는다
+    #   (실측: 50세대 전부 0건 — G1(d)의 목적이 조용히 배신됨). cys 표준 위치인
+    #   ~/.cys/pack/round 를 HOME 파생으로 명시 추가한다(개인경로 하드코딩 아님 · 위
+    #   장기기억 glob 과 동일 관례). 기존 라인은 부서/프로젝트 _round 하위호환 위해 존치.
+    cys_round = os.path.join(home, ".cys", "pack", "round")
+    srcs.append(os.path.join(cys_round, "SESSION_STATE.md"))
+    srcs.extend(sorted(_glob.glob(os.path.join(cys_round, "*_TODO.md"))))
     srcs.extend(sorted(_glob.glob(os.path.join(
         home, ".claude*", "projects", "*", "memory", "*.md"))))
     return srcs
