@@ -183,10 +183,10 @@ jobs:
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
-          # TODO(A10 · 스펙 v4 §D5 핀 활성화 순서): `cargo test --bin cys` 는 아직 여기 넣지 않는다 —
-          #   ci-branch.yml 의 리허설 스텝이 최소 1사이클 green 을 증명한 뒤에만 이 레인으로 승격하라
-          #   (휴면 테스트 112개 릴리스 레인 직행 금지 · 환경 의존 실패 시 위 --skip hwmon:: 선례 패턴).
-          #   D5 env 핀 자체는 바로 윗줄 `cargo test --lib`(lib 헬퍼 편승·1순위 배선)가 이미 릴리스에서 잡는다.
+          # ★A10 승격(2026-08-16): ci-branch 리허설 1사이클 green 실증(feat/v4-repair 18dc9a6 run
+          #   success — 115 passed/0 failed) 후 릴리스 레인 편입. 환경 의존 실패 발견 시 위
+          #   --skip hwmon:: 선례 패턴으로 격리하라(테스트 삭제 금지).
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
 
       # ── ★todo 선언·유령집계 게이트(C-1 교정 · 2026-07-26) ──
       # **왜 여기 있어야 하는가**: 이 게이트 3종은 `ci-branch.yml` 에만 있었고 그 워크플로는
