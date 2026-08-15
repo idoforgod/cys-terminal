@@ -49,6 +49,12 @@ else
   echo "$NONPACK" | head -15 | sed 's/^/    /'
   [ "$N_NP" -gt 15 ] && echo "    … 외 $((N_NP-15))건"
   echo "  절차: 버전 6곳 범프 + Cargo.lock + version-check + git tag vX.Y.Z"
+  # ★A13(v4-repair · 2026-08-16): 릴리스 시퀀싱 1단계는 'win T3 green 증적→태그'다. 태그 파이프라인
+  #   (release.yml)과 windows-build.yml 은 기계 결합이 없으므로(트리거 분리·의도), 이 판별기가
+  #   런북 수동 순서를 상기시키는 것이 명시 배선이다 — 증적 없이 태그하면 게이트를 사람 손으로 건너뛴 것.
+  echo "  ★A13(win T3): 태그 **전** windows-build.yml 최신 run 의 T3 확장 행"
+  echo "    (ng1~ng3 이름검증·tpl 템플릿 바이트·c03 preflight·alt_screen) green 증적을 확보하라"
+  echo "    — 릴리스 시퀀싱 1단계(win T3 green 증적→태그). 실행: Actions 탭 workflow_dispatch."
   if [ -n "$LATEST_PACK" ]; then
     PKV="${LATEST_PACK#pack-v}"
     echo "  ★버전 충돌 가드: 다음 본체 버전은 반드시 $PKV (최신 pack-v) 보다 커야 한다"

@@ -78,7 +78,9 @@ check("A2 reg_remove(레지스트리 비움)",
 check("A3 묘비 기록(tombstone dept-3 --dept)", "tombstone dept-3 --dept" in phoenix_log(tmp))
 calls_a = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read() if \
     os.path.exists(os.path.join(tmp, "calls.log")) else ""
-check("A4 데몬 묘비 병행 기록(D-IMPL-2)", "tombstone dept-3 --dept" in calls_a, calls_a[-120:])
+check("A4 데몬 묘비 병행 기록(D-IMPL-2)", "tombstone --dept -- dept-3" in calls_a, calls_a[-120:])
+# ↑ D3(i) 인자 위생: cys 호출은 `--dept [--remove] -- "$name"`(clap `--` 종단) 형식 — 핀 의도
+#   (데몬 묘비 병행 set)는 불변, 기대 형식만 현행 소스와 정합(v4 A14 기대값 갱신).
 shutil.rmtree(tmp)
 
 # ── B. D8: 역인덱스 실패여도 슬러그 파생 → 묘비 기록 ──
@@ -115,14 +117,36 @@ check("W4 helper --remove", "--dept --remove" in src)
 check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
 # ★D-IMPL-2 대칭 핀: phoenix 묘비와 데몬 묘비는 set/remove가 항상 쌍으로 — 한쪽만 있으면
 # "삭제→재생성→재시작 시 새 부서 살해"(데몬 묘비 잔존) 또는 부활 구멍(데몬 묘비 미기록).
-check("W6 데몬 묘비 set 병행", '"$CYS" tombstone "$1" --dept' in src)
-check("W7 데몬 묘비 remove 병행", '"$CYS" tombstone "$1" --dept --remove' in src)
+# D3(i) 인자 위생 형식(`--dept [--remove] -- "$1"`)으로 기대 갱신 — 핀 의도(set/remove 쌍 배선)는 불변.
+check("W6 데몬 묘비 set 병행", '"$CYS" tombstone --dept -- "$1"' in src)
+check("W7 데몬 묘비 remove 병행", '"$CYS" tombstone --dept --remove -- "$1"' in src)
+
+
+# ★파서 견고화(v4 A14): 종전 `split("  down)")[1].split(";;")[0]`는 down 플래그 파서(기능2 하드닝)의
+#   내부 case문 인라인 ';;'(`--purge-state) purge_state=1 ;;`)에서 블록을 조기 절단해 W8이
+#   ValueError crash — 분기 종결자는 '공백+";;"뿐인 독립 줄'로만 인식한다(인라인 ';;'는 통과).
+def case_arm(source, label):
+    body = source.split("\n  %s)" % label, 1)[1]
+    kept = []
+    for ln in body.split("\n"):
+        if ln.strip() == ";;":
+            break
+        kept.append(ln)
+    return "\n".join(kept)
+
+
+def precedes(block, first, second):
+    """두 실행문이 모두 실재 ∧ first 선행이면 True — 부재는 FAIL로 보고(crash 금지)."""
+    i, j = block.find(first), block.find(second)
+    return 0 <= i < j
+
+
 # ★R7(적대검증 W1): down/down-sock 모두 묘비가 reg_remove보다 선행(set -e abort 시 등재+미묘비 창 봉쇄)
-_down = src.split("  down)", 1)[1].split(";;", 1)[0]
-check("W8 down: 묘비 선기록", _down.index('dept_tombstone "$name"') < _down.index('reg_remove "$name"'))
-_ds = src.split("  down-sock)", 1)[1].split(";;", 1)[0]
+_down = case_arm(src, "down")
+check("W8 down: 묘비 선기록", precedes(_down, 'dept_tombstone "$name"', 'reg_remove "$name"'))
+_ds = case_arm(src, "down-sock")
 check("W9 down-sock: 묘비 선기록(실행문 정박 — 주석 오매치 방지)",
-      _ds.index('dept_tombstone "$name"') < _ds.index('reg_remove "$name"'))
+      precedes(_ds, 'dept_tombstone "$name"', 'reg_remove "$name"'))
 check("W10 ★R11 해소 실패 WARN 가시화", "데몬 묘비 해소 미확정" in src)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")

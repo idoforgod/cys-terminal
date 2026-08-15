@@ -183,6 +183,10 @@ jobs:
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
+          # TODO(A10 · 스펙 v4 §D5 핀 활성화 순서): `cargo test --bin cys` 는 아직 여기 넣지 않는다 —
+          #   ci-branch.yml 의 리허설 스텝이 최소 1사이클 green 을 증명한 뒤에만 이 레인으로 승격하라
+          #   (휴면 테스트 112개 릴리스 레인 직행 금지 · 환경 의존 실패 시 위 --skip hwmon:: 선례 패턴).
+          #   D5 env 핀 자체는 바로 윗줄 `cargo test --lib`(lib 헬퍼 편승·1순위 배선)가 이미 릴리스에서 잡는다.
 
       # ── ★todo 선언·유령집계 게이트(C-1 교정 · 2026-07-26) ──
       # **왜 여기 있어야 하는가**: 이 게이트 3종은 `ci-branch.yml` 에만 있었고 그 워크플로는
@@ -228,9 +232,13 @@ jobs:
           echo "== todo 선언·유령집계 소비자 회귀 7종(+import 가드)+부트체인 =="
           # ★test_bootstrap_chain 등재(2026-08-12 R3 확정): 위계 폴백(부서 자동 생성)의 유일한
           #   회귀 핀 세트가 종전엔 CI 어느 레인에서도 돌지 않았다 — 배송 팩이 검증 0회로 서명됐다.
+          # ★W8(2026-08-16): v4-repair 스위트 3종 편입 — 부서 이름검증(`launch --help` 실사고 회귀 핀)·
+          #   preflight C03 두 축 상태기계·CONTENT_PINS↔디렉티브 패리티(P0 스큐 봉인 — 신선 설치
+          #   C03 FAIL 온보딩 오염의 재발 차단). 격리 HOME/목 바이너리 하네스(라이브 무접촉).
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
-                   test_bootstrap_chain test_snapshot; do
+                   test_bootstrap_chain test_snapshot \
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -252,6 +260,22 @@ jobs:
             echo "::error::todo 스캔 집합 파리티 실패 — C1(보고기)과 C2(데몬)가 다른 파일을 본다. 릴리스 차단." >&2
             exit 1
           fi
+
+      # ★W8: CEO_TEMPLATE 재합성 드리프트 게이트(스펙 v4 §D2 · gen --check) — **릴리스 차단**.
+      #   재합성(생성기) 결과가 커밋본과 1바이트라도 다르면 태그 레인이 멈춘다 — 수동 편집·fragment
+      #   드리프트가 팩으로 서명·봉인되는 경로 차단(드리프트 게이트가 fan-out 문안까지 바이트 봉인하는
+      #   구조라, 게이트 없는 재합성은 A3×A7 계열 사고의 재발 문이다). --check 계약(생성기 소유=D2
+      #   티켓): ①드리프트(재합성==커밋본) ②표지 핀 구·신 템플릿 공통 실존 ③bash 스니펫 실행 스모크.
+      #   ci-branch.yml 의 같은 게이트가 조기 경보, 여기가 최종 차단선. 레그는 macOS 네이티브 1회
+      #   (게이트 대상 = 리포 커밋본 텍스트라 OS 무관 — 위 계약 게이트와 같은 레그 고정 근거).
+      - name: CEO_TEMPLATE 재합성 드리프트 게이트 (gen --check · 릴리스 차단)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          g="scripts/gen_ceo_template.py"
+          [ -f "$g" ] || { echo "::error::재합성 생성기 누락: $g (D2 티켓 산출물 — git add 누락 의심)" >&2; exit 1; }
+          python3 "$g" --check
 
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
       # tauri.windows.conf.json bundle.resources("runtime/")가 이 트리를 NSIS에 싣는다.

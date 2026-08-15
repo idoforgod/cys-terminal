@@ -129,9 +129,13 @@ jobs:
             exit 1
           fi
           echo "== [pack-only] todo 선언·유령집계 소비자 회귀 7종(+import 가드) =="
+          # ★W8(2026-08-16): v4-repair 스위트 3종 편입(3완전 레인 대칭 — ci-branch·release 와 동시).
+          #   부서 이름검증·preflight C03 상태기계·CONTENT_PINS↔디렉티브 패리티 — cys-dept·preflight·
+          #   디렉티브 전부 이 레인이 서명·배송하는 팩 내용물이라 서명 전 차단이 정위치다.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
-                   test_bootstrap_chain test_snapshot; do
+                   test_bootstrap_chain test_snapshot \
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="

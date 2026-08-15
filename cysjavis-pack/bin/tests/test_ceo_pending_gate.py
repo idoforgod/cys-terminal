@@ -6,7 +6,7 @@
   1) 마커 無 + 승격 시도 → PENDING·디렉티브 무교체(사고 R2 봉쇄) + truthful exit 5
      (af6fcb6 D-2 post-verify: 미승격인데 exit 0이면 GUI가 "승격 완료"로 오보 — 부서 흐름
      불파괴는 내부 ceo_promote의 return 0이 담당, 지명 서브커맨드는 진실 보고)
-  2) 마커 생성 후 promote-if-pending(대기형) → 동의 게이트 경유 승격·PENDING 해소
+  2) 마커 생성 후 promote-if-pending(대기형) → 자동 승격(제품 기본 정책)·PENDING 해소·비대기 고지
   3) --request-only → 무변조·알림만·exit 0 (부트 ⑦ 비대기 계약)
   4) 단일소유 가드: master 세션 대기형=exit 7 / --request-only=허용
   5) 이미 승격 상태에서 재호출 → stale PENDING 청소·멱등
@@ -90,7 +90,7 @@ check("1c 디렉티브 무교체", md(home) == "STANDARD-MASTER\n")
 check("1d .pre-ceo 미생성", not os.path.exists(pre))
 check("1e fail-visible(feed 알림)", "feed push" in open(os.path.join(tmp, "calls.log"), encoding="utf-8").read())
 
-# ── 2. 마커 생성 → promote-if-pending(대기형) → 동의 경유 승격·PENDING 해소 ──
+# ── 2. 마커 생성 → promote-if-pending(대기형) → 자동 승격·PENDING 해소 ──
 with open(marker, "w", encoding="utf-8") as f:
     json.dump({"orchestra_check": "exit 0"}, f)
 code, out = run(env, "promote-if-pending")
@@ -99,7 +99,12 @@ check("2b 승격됨(CEO 템플릿)", md(home) == "CEO-TEMPLATE\n")
 check("2c .pre-ceo 보존 헌법", os.path.exists(pre) and open(pre, encoding="utf-8").read() == "STANDARD-MASTER\n")
 check("2d PENDING 해소", not os.path.exists(pend))
 calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
-check("2e 동의 게이트 경유(--wait)", "feed push --wait" in calls)
+# ★자동 승격 정책 전환(2026-07·v4 A14 재정의): 종전 feed --wait 동의 게이트는 소스에서 폐지 —
+#   현행 계약 = PENDING(부트 마커) 게이트가 유일 관문(1a~1d에서 핀)이고, 승격 자체는 자동이며
+#   완료를 **비대기** feed로 고지한다. --wait 동의 대기는 어디에도 없어야 한다(정책 역회귀 핀).
+check("2e 자동 승격 고지(비대기 feed·--wait 동의 게이트 폐지)",
+      "feed push --title CEO 승격 완료(자동)" in calls and "--wait" not in calls,
+      calls[-200:])
 
 # ── 5. 이미 승격 + stale PENDING → 재호출이 청소·멱등 ──
 with open(pend, "w", encoding="utf-8") as f:

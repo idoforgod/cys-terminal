@@ -20,6 +20,25 @@ bash scripts/secret-scan.sh --all  # secret/PII gate (fail-closed)
 sh scripts/version-check.sh      # version SOT consistency (release PRs only)
 ```
 
+## Directive edits
+
+- **`cysjavis-pack/directives/CEO_TEMPLATE.md` is a generated file — never edit it
+  by hand.** It is synthesized from the non-shipped fragment
+  `scripts/ceo_template_header.md` + a separator + the byte-identical
+  `MASTER_DIRECTIVE.md` body. Whenever you edit the MASTER body (or the fragment),
+  you **must** re-run `python3 scripts/gen_ceo_template.py` — otherwise the drift
+  gate `python3 scripts/gen_ceo_template.py --check` goes red (exit 1) in CI.
+- Never write the guarded lifecycle verbs
+  (`launch`|`allocate`|`create`|`down`|`down-sock`|`rotate`|`reap`|`promote-ceo`)
+  in **call form** — i.e. `cys-dept <verb>`, backticked or not — inside directives.
+  The single-owner guard rejects those calls from the CEO (exit 7), so a directive
+  instructing them would contradict its own enforcement; both the H-DOC-3 health
+  specimen and `gen_ceo_template.py --check` fail on it. Prose mentions of a bare
+  verb (`launch`) are fine — just don't prefix it with `cys-dept `.
+- After resynthesis, run the part-cap pin locally:
+  `cargo test --bin cysd deployed_ceo` (CEO synthesized payload must fit the
+  delivery part cap with 4x headroom).
+
 ## Test isolation — pack sandbox (W0)
 
 Tests must never touch the live pack at `~/.cys/pack`. `cargo test`/`cargo run`

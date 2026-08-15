@@ -2641,6 +2641,27 @@ fn ceo_pending() -> bool {
     cys::home_dir().join(".cys/state/ceo-pending").exists()
 }
 
+/// ★D4(v4 · 결정 D4): CEO 승격 드리프트 — [.pre-ceo 존재 ∧ md≠라이브 CEO_TEMPLATE] 여부.
+/// 팔레트 'CEO 승격 재실행(템플릿 전진 적용)' 항목의 노출 게이트로, 템플릿 전진 릴리스 직후
+/// "이미 승격된 md 가 구본화된" 상태를 감지한다(스펙 §3 R2·`.pristine` 등가 판정의 위경보 교정 짝).
+/// 판정은 순수 함수로 분리(회귀 핀 대상) — 판독 불가(파일 부재·IO 실패)는 노출 억제(보수적 false):
+/// 비정형 승격 상태의 진단·안내는 preflight C03 의 관할이지 팔레트가 아니다.
+/// 경로 규약 = cys-dept `ceo_promote`(`$PACK_DEFAULT/directives/…`)와 동일 파일 쌍 · ceo_pending 관례
+/// (동기 fn·프론트 온디맨드 조회 — 신규 타이머 금지).
+fn ceo_drift_verdict(pre_ceo_exists: bool, md: Option<&[u8]>, template: Option<&[u8]>) -> bool {
+    pre_ceo_exists && matches!((md, template), (Some(m), Some(t)) if m != t)
+}
+
+#[tauri::command]
+fn ceo_promotion_drift() -> bool {
+    let dir = cys::pack::pack_dir().join("directives");
+    ceo_drift_verdict(
+        dir.join("MASTER_DIRECTIVE.md.pre-ceo").exists(),
+        std::fs::read(dir.join("MASTER_DIRECTIVE.md")).ok().as_deref(),
+        std::fs::read(dir.join("CEO_TEMPLATE.md")).ok().as_deref(),
+    )
+}
+
 /// ★R8: PENDING 해소 실행 — cys-dept promote-if-pending(대기형·자체 동의 게이트 feed --wait 경유).
 /// GUI는 role-less(CYS_ROLE 제거 명시)라 단일소유 가드를 통과한다. async라 UI 무블록,
 /// feed --wait의 timeout(deny/timeout=보류) 규약이 상한을 보장한다.
@@ -3446,6 +3467,7 @@ fn main() {
             start_master,
             start_dept_master,
             ceo_pending,
+            ceo_promotion_drift,
             promote_pending_ceo,
             approve_ceo_promotion,
             daemon_status,
@@ -3665,6 +3687,25 @@ mod tests {
         assert!(seal_selfdiag_marker()
             .to_string_lossy()
             .ends_with(&format!("selfdiag-{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    /// ★D4 팔레트 노출 게이트 회귀 핀: 드리프트 = [.pre-ceo 존재 ∧ md≠라이브 CEO_TEMPLATE] **만**이다.
+    /// 특히 R2 실측 교정 두 가지를 고정한다 — ⓐ md==템플릿(정상 승격 최신)은 .pre-ceo 가 있어도
+    /// 비노출(위경보 0) ⓑ 판독 불가(부재·IO 실패)는 보수적 비노출(비정형 상태 안내는 C03 관할).
+    #[test]
+    fn ceo_drift_verdict_gate_matrix() {
+        let old = Some("CEO v1".as_bytes());
+        let new = Some("CEO v2".as_bytes());
+        // 유일한 노출 케이스: 승격 상태(.pre-ceo)에서 템플릿 전진으로 md 가 구본화됨.
+        assert!(ceo_drift_verdict(true, old, new));
+        // 정상 승격 최신(md==템플릿) → 비노출.
+        assert!(!ceo_drift_verdict(true, new, new));
+        // 미승격(.pre-ceo 부재) → md 가 달라도 비노출(주권 편집·미승격 머신).
+        assert!(!ceo_drift_verdict(false, old, new));
+        // 판독 불가(어느 쪽이든) → 비노출(보수) — 템플릿 소실 시 promote-ceo 재실행 권유 금지.
+        assert!(!ceo_drift_verdict(true, None, new));
+        assert!(!ceo_drift_verdict(true, old, None));
+        assert!(!ceo_drift_verdict(true, None, None));
     }
 
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),

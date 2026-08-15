@@ -20,6 +20,7 @@ import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./app
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
 import { shouldSuppressWheel } from "./wheelgate";
+import { ceoPaletteEntries } from "./selfdiag";
 import {
   toastTtl,
   toastTimerPlan,
@@ -4657,23 +4658,55 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   }
 
   // ── (4-b) ★R8(WP-2): CEO 승격 대기 해소 — cys-dept PENDING(부트 게이트 보류)의 즉시 경로.
-  // 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0). 대기형은 오너 동의 게이트(feed --wait) 경유.
-  if (await invoke("ceo_pending").catch(() => false)) {
-    items.push({
-      id: "act:ceo-promote",
-      title: "CEO 승격 진행 (대기 중)",
-      subtitle: "부서가 존재·base 부트 완료 — 동의 게이트(feed)를 거쳐 승격합니다",
-      keywords: "ceo promote 승격 pending 대기",
-      confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다(동의 요청이 feed에 뜹니다 · .pre-ceo 백업으로 가역)." },
-      action: async () => {
-        try {
-          const r = (await invoke("promote_pending_ceo")) as string;
-          toast("feed", "CEO 승격 처리", r || "완료");
-        } catch (e) {
-          toast("health", "CEO 승격 실패", String(e));
-        }
-      },
-    });
+  // ── (4-c) ★D4(v4 · 결정 D4): CEO 승격 재실행(템플릿 전진 적용) — 노출 게이트=[.pre-ceo 존재
+  // ∧ md≠라이브 CEO_TEMPLATE](ceo_promotion_drift · 파일 실측). 템플릿 전진 릴리스 후 구본화된
+  // 승격본을 갱신하는 오너 GUI 경로(종전엔 CLI promote-ceo 재실행이 유일 — 막다른 흐름 제거).
+  // 둘 다 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0)·상호 배타 노출(pending 우선 — 결정
+  // 로직은 selfdiag.ceoPaletteEntries 순수 함수에 고정, 회귀 핀 selfdiag.test.ts).
+  const [ceoPend, ceoDrift] = await Promise.all([
+    invoke("ceo_pending").catch(() => false),
+    invoke("ceo_promotion_drift").catch(() => false),
+  ]);
+  for (const ceoEntry of ceoPaletteEntries({ pending: ceoPend === true, drift: ceoDrift === true })) {
+    if (ceoEntry === "pending") {
+      // 대기형은 오너 동의 게이트(feed --wait) 경유.
+      items.push({
+        id: "act:ceo-promote",
+        title: "CEO 승격 진행 (대기 중)",
+        subtitle: "부서가 존재·base 부트 완료 — 동의 게이트(feed)를 거쳐 승격합니다",
+        keywords: "ceo promote 승격 pending 대기",
+        confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다(동의 요청이 feed에 뜹니다 · .pre-ceo 백업으로 가역)." },
+        action: async () => {
+          try {
+            const r = (await invoke("promote_pending_ceo")) as string;
+            toast("feed", "CEO 승격 처리", r || "완료");
+          } catch (e) {
+            toast("health", "CEO 승격 실패", String(e));
+          }
+        },
+      });
+    } else {
+      // 재실행=approve_ceo_promotion(promote-ceo consented) 재사용 — _swap 이 기존 .pre-ceo 를
+      // 보존한 채 새 템플릿만 md 에 적용(가역성 불파괴). 실패는 exit 5 truthful 표시 관례(:3963).
+      items.push({
+        id: "act:ceo-repromote",
+        title: "CEO 승격 재실행 (템플릿 전진 적용)",
+        subtitle: "릴리스 전진으로 승격본이 구본화됨(md≠라이브 CEO_TEMPLATE) — 새 템플릿을 재적용합니다",
+        keywords: "ceo promote 승격 재실행 템플릿 전진 drift repromote",
+        confirm: {
+          title: "CEO 승격 재실행",
+          body: "새 CEO_TEMPLATE를 MASTER_DIRECTIVE.md에 재적용합니다(.pre-ceo 백업은 보존 — 부서 0개 시 자동 강등 가역성 유지).",
+        },
+        action: async () => {
+          try {
+            const r = (await invoke("approve_ceo_promotion")) as string;
+            toast("watchdog", "✅ CEO 승격 재실행 완료", r || "새 템플릿을 적용했습니다.");
+          } catch (e) {
+            toast("health", "CEO 승격 재실행 실패", String(e));
+          }
+        },
+      });
+    }
   }
 
   // ── (5) 빌트인 webview 액션(정적) ──

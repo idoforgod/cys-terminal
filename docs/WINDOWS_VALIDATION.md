@@ -1,5 +1,7 @@
 # Windows 실검증 보고 (WINDOWS_VALIDATION)
 
+> ★역사 기록(v0.14.1 검증 시점) — 본 문서는 당시 스냅샷이며 현행 릴리스의 Windows 검증 절차가 아니다(현행은 `docs/plans/v4-runbook.md`·`docs/RELEASE.md`의 win T3 게이트).
+
 > 근거: `scripts/win/win-test*-result.txt` 결과 로그 4종 + `scripts/win/run-test*.bat` 5종 +
 > `scripts/win-test.ps1` + git log(커밋 `6ae8d66`). 이 문서의 모든 서술은 위 파일들에서 직접
 > 추적 가능하며, 파일에 없는 내용은 "기록 없음"으로 명시한다.

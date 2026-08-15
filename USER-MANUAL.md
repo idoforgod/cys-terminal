@@ -176,18 +176,23 @@ cys doctor          # 자기진단 (문제 시 --fix)
 
 ### 4.6b 스크롤·복사 (마우스)
 
-- **휠 스크롤**: Claude Code 같은 TUI가 떠 있어도 휠은 항상 이 pane 의 스크롤백을
-  움직입니다(위로 굴리면 지나간 내용 읽기, 바닥 복귀·키 입력 시 다시 최신 출력 따라감).
+- **휠 스크롤**: 일반 pane 과 inline TUI(macOS 의 claude 기본 화면 등)에서는 휠이 항상 이
+  pane 의 스크롤백을 움직입니다(위로 굴리면 지나간 내용 읽기, 바닥 복귀·키 입력 시 다시
+  최신 출력 따라감). **마우스를 요청하는 전체화면 TUI** — claude fullscreen·codex·vim
+  `mouse=a`·tmux `mouse on` 등 — 에서는 휠이 **앱 자체 스크롤**로 들어갑니다(macOS —
+  예: claude fullscreen 은 트랜스크립트가 굴러갑니다). 마우스를 요청하지 않는 전체화면
+  앱(less·man)은 종전처럼 휠로 페이지가 굴러갑니다.
 - **드래그 선택·복사**: 마우스 드래그로 선택하고 ⌘C(또는 우클릭 메뉴)로 복사합니다.
-  Option+드래그도 동일하게 동작합니다.
-- 앱(TUI)이 마우스를 직접 받아야 하는 경우(vim `mouse=a` 등) — 터미널에서 아래 한 줄을
-  실행하고 **새 pane** 을 열면 그 pane 은 클릭·드래그·휠 전부를 앱에 넘깁니다:
-  ```sh
-  touch ~/.cys/allow-app-mouse        # 켜기 (되돌리기: rm ~/.cys/allow-app-mouse)
-  ```
-  환경변수 `CYS_ALLOW_APP_MOUSE=1` 로 앱을 띄워도 같습니다. (개발자도구가 있는 빌드에서는
-  콘솔의 `localStorage.cysAllowAppMouse="1"` 도 동작하지만, 릴리스 빌드에는 개발자도구가
-  없으므로 위 파일 방식이 표준입니다.)
+  **전체화면 마우스 TUI 에서는** 일반 드래그가 앱으로 가므로 **Option+드래그로 선택한 뒤
+  ⌘C** 로 복사하세요.
+- **앱 마우스 킬스위치**: 일반 화면에서도 클릭·드래그·휠 전부를 앱이 직접 받아야 하면
+  `touch ~/.cys/allow-app-mouse` 후 **새 pane**(되돌리기 `rm ~/.cys/allow-app-mouse` ·
+  env `CYS_ALLOW_APP_MOUSE=1` 동등). ⚠ **Windows 에서는 켜지 마세요** — ConPTY 가 마우스
+  시퀀스를 깨뜨려 입력창에 `[555;98;34M` 같은 리터럴이 타이핑됩니다.
+- 전체화면 마우스 동작이 이상하면 정합기 롤백 스위치로 구동작에 복귀할 수 있습니다:
+  콘솔에서 `localStorage.cysMouseReconcilerOff="1"`(새 pane 부터 적용).
+- 릴리스 마이그레이션이 계정 settings(fullscreen `tui` 키 제거 등)를 정규화할 때는 반드시
+  같은 자리에 `.bak-*` 백업을 먼저 남깁니다 — 되돌리기는 그 백업 복원입니다.
 
 ### 4.7 테마·폰트
 
@@ -685,6 +690,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
 | `CYS_ALLOW_APP_MOUSE` | — (`1`=on) | 앱 마우스 킬스위치 — TUI가 마우스를 갖는다 (§4.6b · `~/.cys/allow-app-mouse` 파일과 동등) |
+| `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | mac·claude 기동 시 `"1"` 기본 주입 | cys가 읽는 게 아니라 **주입**하는 변수(claude가 소비) — fullscreen(alt screen) 진입 차단. 계정별 되살리기는 팩 `agents.json` env에 `"0"`(키가 있으면 주입하지 않음 · §4.6b) |
 | `CYS_DEPT_FALLBACK` | — (`0`/`off`=끔) | 마스터 선언→부서 자동 생성 폴백 끄기 (§4.4 · 구계약 rc=7 복원) |
 
 (이 밖에 진단·튜닝용 변수 다수 — `CYS_DEBUG`, `CYS_USAGE_POLL_SECS`, `CYS_REAP_EXITED*`,

@@ -202,10 +202,14 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────────
       # T3 기능 스모크 (WINFIX_T3_SMOKE_PLAN.md · row별 PASS/FAIL). release 무관.
       # 행별 결과를 "T3-N RESULT: PASS|FAIL" 로 stdout에 남긴다(매트릭스 승격 판독원). 크리티컬 행만 throw.
+      # ★W8 확장(2026-08-16 · 스펙 v4 §A13 ⓐ~ⓕ — 기대값은 Wave1 현행 계약): ng1~ng3(부서 이름검증
+      #   거부·usage·부작용0) · tpl(설치 팩 CEO 템플릿 == 리포 커밋본 바이트) · c03(신선 팩 preflight
+      #   C03 4종+pin.ceo 전부 PASS) · alt(status --json 의 alt_screen 관측 키). 전부 크리티컬 행 —
+      #   릴리스 시퀀싱 1단계 'win T3 green 증적→태그'의 판독원이다(release-lane-check.sh 가 상기).
       # ─────────────────────────────────────────────────────────────────────────
-      - name: T3 기능 스모크 (온보딩·hook·env주입·부서·python3)
+      - name: T3 기능 스모크 (온보딩·hook·env주입·부서·python3·이름검증·CEO템플릿·C03·alt_screen)
         shell: pwsh
-        timeout-minutes: 12   # ★백스톱: 어떤 하위 호출이 hang해도 12분에 스텝 종료(6h 방지)
+        timeout-minutes: 20   # ★백스톱: 어떤 하위 호출이 hang해도 20분에 스텝 종료(6h 방지 · W8 preflight 전수 실행 예산 포함)
         run: |
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $inst) { throw "설치된 cysd.exe 미발견" }
@@ -288,11 +292,99 @@ jobs:
             if ($deptOk) { (Bx $bash @($deptTool,'down',$name) 30000) | Out-Null }
           } catch { Rec 7 $false "$_"; Rec 10 $false "$_" }
 
+          # ═══ W8 확장 행 (스펙 v4 §A13 · Wave1 현행 계약 = 정본 기대값) ═══
+          # 도구 경로·PATH·PYTHONUTF8 을 T3-7 블록과 독립으로 재확립한다(그 try 가 실패해도 여기는 돈다).
+          $bash2 = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
+          $py2 = Join-Path $dir 'runtime\python\python3.exe'
+          $deptTool2 = Join-Path $userHome '.cys\pack\bin\cys-dept'
+          $env:PATH = "$dir;$(Join-Path $dir 'runtime\git\usr\bin');$(Join-Path $dir 'runtime\python');$env:PATH"
+          $env:PYTHONUTF8 = '1'   # 임베디드 python cp1252 기본 인코딩에서 한글 디렉티브 UTF-8 강제(RC-16 관례)
+          $reg = Join-Path $userHome '.cys\depts.json'
+
+          # ── ng1(ⓐ): `launch --help` = **name 위치** → exit 2 가 정본(★구 시뮬레이션 문서의
+          #    'usage exit 0' 기대값은 폐기됨 — '--help' 부서 등재→껍데기 CEO 승격 실사고의 재발 차단).
+          #    단언 4종: exit 2 · stderr 진단(usage 1줄 병기 — ASCII 부분으로 매칭·인코딩 비의존) ·
+          #    %LOCALAPPDATA% state(log) dir 부재 · depts.json 무등재(부작용 0).
+          try {
+            $r = Bx $bash2 @($deptTool2,'launch','--help') 30000
+            $diagOk = ($r.Out -match 'usage: cys-dept launch')
+            $dirAbsent = -not (Test-Path (Join-Path $env:LOCALAPPDATA 'cys\cys-dept---help'))
+            $regClean = (-not (Test-Path $reg)) -or ((Get-Content $reg -Raw) -notmatch [regex]::Escape('"--help"'))
+            Rec 'ng1' ($r.Code -eq 2 -and $diagOk -and $dirAbsent -and $regClean) "launch --help exit=$($r.Code)(기대2) diag=$diagOk stateAbsent=$dirAbsent regClean=$regClean"
+          } catch { Rec 'ng1' $false "$_" }
+
+          # ── ng2(ⓑ): **cmd 위치** --help = usage(stdout)·exit 0 — 가드(exit 7)·검증보다 앞·역할 무관 ──
+          try {
+            $r = Bx $bash2 @($deptTool2,'--help') 30000
+            Rec 'ng2' ($r.Code -eq 0 -and $r.Out -match 'usage: cys-dept') "--help exit=$($r.Code)(기대0) usage=$($r.Out -match 'usage: cys-dept')"
+          } catch { Rec 'ng2' $false "$_" }
+
+          # ── ng3(ⓒ): 비정형 이름('.' 포함 — win pipe_slug 점 소거 충돌 봉합의 표적) → 전부 exit 2·부작용 0.
+          #    rotate 는 미등재=exit 8 이 선행하므로 비정형명을 레지스트리에 직접 시드해 '등재됐어도
+          #    kill 이전 exit 2'(반파괴 half-op 봉합)를 잰다 — 시드는 검사 직후 원복. create 는 exit 2
+          #    (≠3)로 'key 화이트리스트가 카탈로그 존재 검사보다 선행'까지 함께 단언한다.
+          try {
+            $r1 = Bx $bash2 @($deptTool2,'launch','bad.name') 30000
+            $ok1 = ($r1.Code -eq 2 -and -not (Test-Path (Join-Path $env:LOCALAPPDATA 'cys\cys-dept-bad.name')) -and ((-not (Test-Path $reg)) -or ((Get-Content $reg -Raw) -notmatch [regex]::Escape('"bad.name"'))))
+            & $py2 -c "import json,os; p=os.path.expanduser('~/.cys/depts.json'); d=json.load(open(p,encoding='utf-8')) if os.path.exists(p) else {'depts':{}}; d.setdefault('depts',{})['bad.name']={}; open(p,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False))"
+            $r2 = Bx $bash2 @($deptTool2,'rotate','bad.name') 30000
+            $ok2 = ($r2.Code -eq 2)
+            & $py2 -c "import json,os; p=os.path.expanduser('~/.cys/depts.json'); d=json.load(open(p,encoding='utf-8')); d.get('depts',{}).pop('bad.name',None); open(p,'w',encoding='utf-8').write(json.dumps(d,ensure_ascii=False))"
+            $r3 = Bx $bash2 @($deptTool2,'create','bad.key') 30000
+            $ok3 = ($r3.Code -eq 2)
+            Rec 'ng3' ($ok1 -and $ok2 -and $ok3) "launch=$($r1.Code) rotate(등재 비정형)=$($r2.Code) createKey=$($r3.Code) — 전부 2 기대·부작용 0=$ok1"
+          } catch { Rec 'ng3' $false "$_" }
+
+          # ── tpl(ⓓ): 설치 팩의 CEO_TEMPLATE.md == 리포 커밋본 **바이트** 대조(sha256) — 설치 경로가
+          #    템플릿을 변형하면(개행·인코딩 포함) 승격 표지·드리프트 게이트 전제가 무너진다 ──
+          try {
+            $repoTpl = Join-Path (Get-Location) 'cysjavis-pack\directives\CEO_TEMPLATE.md'
+            $instTpl = Join-Path $userHome '.cys\pack\directives\CEO_TEMPLATE.md'
+            $tplOk = (Test-Path $repoTpl) -and (Test-Path $instTpl) -and ((Get-FileHash -Algorithm SHA256 $repoTpl).Hash -eq (Get-FileHash -Algorithm SHA256 $instTpl).Hash)
+            Rec 'tpl' $tplOk "설치 팩 CEO_TEMPLATE.md sha256 == 리포 커밋본 (repo=$(Test-Path $repoTpl) inst=$(Test-Path $instTpl))"
+          } catch { Rec 'tpl' $false "$_" }
+
+          # ── c03(ⓔ): 신선 팩(T3-1 init-pack 산출) preflight 를 **임베디드 python**으로 전수 실행
+          #    (--safe=무변경 진단·--json) → C03 4종(master/worker/cso/reviewer)+C03.pin.ceo 전부 PASS.
+          #    전체 exit 코드는 게이트가 아니다(러너엔 claude 등 부재 — 다른 검사의 FAIL 은 정상 소음).
+          #    stdout/stderr 를 분리 캡처한다(Bx 는 병합이라 JSON 파싱이 stderr 소음에 오염됨).
+          try {
+            $pfScript = Join-Path $userHome '.cys\pack\bin\javis_preflight.py'
+            if (-not (Test-Path $pfScript)) { throw "신선 팩 preflight 부재: $pfScript" }
+            $pfOut = Join-Path $env:RUNNER_TEMP 'preflight-c03.json'
+            $pfErr = Join-Path $env:RUNNER_TEMP 'preflight-c03.err'
+            $pp = Start-Process -FilePath $py2 -ArgumentList @($pfScript,'--safe','--json') -NoNewWindow -PassThru -RedirectStandardOutput $pfOut -RedirectStandardError $pfErr
+            if (-not $pp.WaitForExit(360000)) { try{$pp.Kill($true)}catch{}; throw "preflight --safe --json 6분 타임아웃" }
+            $doc = Get-Content $pfOut -Raw | ConvertFrom-Json
+            $need = @('C03.pin.master','C03.pin.worker','C03.pin.cso','C03.pin.reviewer','C03.pin.ceo')
+            $bad = @()
+            foreach ($cid in $need) {
+              $rows = @($doc.checks | Where-Object { $_.id -eq $cid })
+              if ($rows.Count -lt 1) { $bad += "$cid=미발화" }
+              else { foreach ($row in $rows) { if ($row.status -ne 'PASS') { $bad += "$cid=$($row.status)" } } }
+            }
+            if ($bad.Count -gt 0) {
+              Write-Host "== C03 비-PASS 상세 =="
+              foreach ($cid in $need) { @($doc.checks | Where-Object { $_.id -eq $cid }) | ForEach-Object { Write-Host ("  [{0}] {1} - {2}" -f $_.status, $_.id, $_.detail) } }
+            }
+            Rec 'c03' ($bad.Count -eq 0) ("신선 팩 C03 4종+pin.ceo: " + $(if($bad.Count -eq 0){'전부 PASS'}else{$bad -join ' / '}))
+          } catch { Rec 'c03' $false "$_" }
+
+          # ── alt(ⓕ): T3 는 데몬을 띄우므로(위 pipe 행) status --json(org.status)에 D5 관측 필드
+          #    alt_screen 키가 실린다를 단언 — surface 1개를 명시 생성해 노드 0개 무의미 통과를 차단 ──
+          try {
+            (Bx $cys @('new-surface','--title','t3-altscreen') 30000).Out | Out-Host
+            $st = Bx $cys @('status','--json') 30000
+            $altOk = ($st.Code -eq 0 -and $st.Out -match '"alt_screen"')
+            Rec 'alt' $altOk "status --json alt_screen 키 존재(code=$($st.Code)) — D5 surface.list/org.status 동형 관측 필드"
+          } catch { Rec 'alt' $false "$_" }
+
           # ── 집계 + 크리티컬 게이트 ──
           Write-Host "== T3 SMOKE 집계 =="
           $results.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host ("  T3-{0}: {1}" -f $_.Key, ($(if($_.Value){'PASS'}else{'FAIL'}))) }
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          $crit = @('1','2','1b','pipe','13')
+          # ★W8 확장 행 전부 크리티컬 — A13 이 이 판독을 릴리스 차단 게이트의 증적으로 지정한다.
+          $crit = @('1','2','1b','pipe','13','ng1','ng2','ng3','tpl','c03','alt')
           $failed = $crit | Where-Object { -not $results["$_"] }
           if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
           Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"

@@ -9,6 +9,11 @@ name: ci-branch
 #   원 레인의 나머지 스텝(bundle-prep·cargo check --workspace·능력 파리티 7종·C03 전핀·
 #   bun UI 잡·Windows 잡)은 이 브랜치의 범위가 아니어서 **의도적으로 가져오지 않았다**.
 #   그것들을 나중에 편입할 때는 아래 레인 대조 게이트의 ALLOWED 도 함께 갱신해야 한다.
+# ★W8(2026-08-16 · v4-repair): 이 레인에 세 가지를 추가했다 —
+#   ①신설 팩 스위트 3종(부서 이름검증·C03 상태기계·핀 패리티)을 3완전 레인 **동시** 등재
+#     (대칭 = 정본 · ALLOWED 등재 불요 — 2026-08-12 부트체인 편입과 같은 형태)
+#   ②CEO_TEMPLATE 재합성 드리프트 게이트(gen --check · release.yml 최종 차단선의 조기 경보)
+#   ③`cargo test --bin cys` 리허설(A10 — 릴리스 레인 직행 금지·1사이클 green 후 승격).
 
 on:
   push:
@@ -375,6 +380,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # rustc 단독 컴파일(파리티 덤퍼)엔 캐시가 불요하지만, 말미의 `cargo test --bin cys` 리허설
+      # (W8)은 전체 의존 그래프를 빌드한다 — release.yml 관례(swatinem)와 동형으로 캐시를 건다.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ci-branch
+
       # 게이트 대장 회귀 65종(javis_report_gate + javis_gate_check). v0.13.17 까지 이 스위트는
       # CI 에도 릴리스 게이트 문서에도 편입돼 있지 않았다(실측) — 게이트 코어를 고치면서 자동
       # 검증이 전무했다는 뜻이라 여기서 편입한다. 파리티 목록과 동형으로 파일 존재도 게이트한다.
@@ -461,8 +473,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # ★W8(2026-08-16): v4-repair 스위트 3종 편입 — 부서 이름검증(`launch --help` 실사고 회귀 핀)·
+          #   preflight C03 두 축 상태기계·CONTENT_PINS↔디렉티브 패리티(P0 스큐 봉인). 전부 격리
+          #   HOME/목 바이너리 하네스라 러너 자기완결(라이브 무접촉) — 3완전 레인 동시 등재(대칭).
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
-                   test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot; do
+                   test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
@@ -486,3 +502,30 @@ jobs:
           [ -f "scripts/todo_scan_dump.rs" ] || { echo "Rust 덤퍼 누락: scripts/todo_scan_dump.rs" >&2; exit 1; }
           [ -f "src/todo_scan.rs" ] || { echo "스캔 단일 구현 누락: src/todo_scan.rs" >&2; exit 1; }
           python3 "$h"
+
+      # ★W8: CEO_TEMPLATE 재합성 드리프트 게이트(스펙 v4 §D2 · gen --check). 재합성 결과가 커밋본과
+      #   달라지는 순간(수동 편집·fragment 드리프트) 브랜치에서 즉시 빨간불을 켠다 — release.yml 의
+      #   같은 게이트가 최종 차단선이고 여기는 조기 경보다. --check 계약(생성기 소유=D2 티켓):
+      #   ①드리프트(재합성==커밋본) ②표지 핀 구·신 템플릿 공통 실존 ③템플릿 내 bash 스니펫 실행 스모크.
+      #   존재-단언은 이 리포 관례(`[ -f ] || exit 1`) — 생성기 미랜딩 상태의 초록은 거짓말이다.
+      - name: CEO_TEMPLATE 재합성 드리프트 게이트 (gen --check)
+        shell: bash
+        run: |
+          set -euo pipefail
+          g="scripts/gen_ceo_template.py"
+          [ -f "$g" ] || { echo "재합성 생성기 누락: $g (D2 티켓 산출물 — git add 누락 의심)" >&2; exit 1; }
+          python3 "$g" --check
+
+      # ★W8(A10 · 스펙 v4 §D5 핀 활성화 순서): `cargo test --bin cys` **리허설 레인** — 릴리스 레인
+      #   직행 금지. D5 env 핀의 1순위 배선은 lib 헬퍼(src/lib.rs inject_claude_alt_screen_default*)의
+      #   기존 `cargo test --lib` 편승(release.yml phoenix 게이트)이고, --bin cys 전체(휴면 테스트
+      #   112개 포함)는 이 스텝이 최소 1사이클 green 을 증명한 뒤에만 release.yml 로 승격한다(그 TODO
+      #   는 release.yml phoenix 게이트 스텝에 있다). 환경 의존 실패가 나오면 release.yml 의
+      #   `--skip hwmon::` 선례 패턴(가상 러너 하드웨어 의존 모듈 명시 스킵)을 그대로 적용하라.
+      #   CYS_PACK_DIR 임시 격리는 이 파일 다른 스텝들과 같은 근거 — 러너 실팩·홈 의존 차단.
+      # 예산: 콜드 수 분·캐시 히트 시 단축(위 Rust cache 스텝이 그 근거).
+      - name: cargo test --bin cys (릴리스 승격 전 리허설 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
