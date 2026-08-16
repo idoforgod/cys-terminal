@@ -982,6 +982,39 @@ def _dept_master_alive(dept_env):
     return False
 
 
+def _base_live_master(exclude_sid):
+    """이 레인에 **살아있는 master 보유자**가 실제로 있는가 — `cys status --json` 실측.
+
+    반환: (판정, 사유)  판정 = True(있음) / False(없음) / None(측정 실패 — 알 수 없음)
+
+    ★왜 별도 술어인가(_dept_master_alive 와 다른 질문): _dept_master_alive 는 "부서에 **에이전트가
+      붙은** 부서장이 있는가"(agent_alive/seat)를 묻는다 — launch-agent 를 생략할지 결정하는
+      기준이다. 여기서 필요한 것은 데몬 claim_role 이 **거부 판정에 쓴 그 기준**(roles["master"]
+      보유자가 exited 가 아닌 다른 surface 인가 — handlers.rs `holder_live`)이다. 기준을 섞으면
+      가드가 데몬과 다른 사실을 보고 서로 어긋난다(빈 셸 master 를 '없음'으로 판정 → 정당한 부서
+      창설을 막는 반대 방향 결함).
+    """
+    code, out, err = _run_env(["cys", "status", "--json"], dict(os.environ), timeout=15)
+    if code != 0:
+        return None, "cys status 실패(rc=%s): %s" % (code, (err or out or "")[-200:])
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return None, "cys status --json 파싱 실패"
+    if not isinstance(st, dict):
+        return None, "cys status --json 스키마 불일치"
+    for s in (st.get("surfaces") or []):
+        if not isinstance(s, dict):
+            continue
+        if s.get("role") != "master" or s.get("exited"):
+            continue
+        holder = s.get("surface_id")
+        if str(holder) == str(exclude_sid):
+            continue  # 자기 자신은 '남의 보유'가 아니다(멱등 재claim 경로)
+        return True, "살아있는 master 보유자 surface=%s" % holder
+    return False, "roles 에 살아있는 master 보유자가 없다"
+
+
 def _dept_fallback(log, claim_out):
     """③정당거부 → 부서 자동 생성 폴백. 반환: exit 코드(처리함) 또는 None(비적용 — 종전 exit 7 경로로).
 
@@ -1016,8 +1049,30 @@ def _dept_fallback(log, claim_out):
     #   env(AITERM_SURFACE_ID)로만 선 pane 들을 전부 'unknown' 단일 멱등 키로 수렴시켜, 서로
     #   다른 pane 의 선언이 한 부서로 합쳐지고 결과 컨텍스트 주입(cys send --surface)이 생략됐다.
     sid = re.sub(r"[^0-9]", "", my_surface_id()) or "unknown"
-    _progress("③-d 위계 폴백: 살아있는 master 존재 — 선언을 '부서 창설'로 해석(D1ⓐ)…")
-    log.step(STEP.DEPT_FB, 0, "정당거부 → 부서 자동 생성 진입(선언 surface=%s)" % sid)
+
+    # ★L3 실측 가드(2026-08-16 현장 결함 — "없는 master 를 있다고 믿고 부서를 만든다") ────────
+    # 이 폴백의 **유일한 전제**는 "살아있는 master 가 이미 있다"이다. 종전엔 그 전제를 데몬의
+    # 거부 코드 하나로 추론했는데, 그 코드(claim_denied)가 신원 해석 실패까지 뭉쳐 담고 있어서
+    # **보유자가 0명인 기계에서도** 폴백이 돌았다(실측: role=- 인 채 dept-N 증식). 코드 분리(L1)로
+    # 그 오역 경로는 닫혔지만, 이 가드는 그것과 **독립적으로** 전제를 직접 잰다 —
+    #   · 구 데몬(코드 미분리)과 신 팩이 만나는 스큐 조합에서도 부서 증식을 막고,
+    #   · 앞으로 rc 7 로 접히는 **다른 경로**가 생겨도 전제 없는 스폰을 막는다.
+    # 측정 실패(None)는 **폴백 비적용**이다 — 이 레포의 스폰 게이트 규율(무단 스폰이 판정 보류보다
+    # 나쁘다 · role-bootstrap.sh 기계유래 게이트와 같은 방향)을 그대로 따른다.
+    have, why = _base_live_master(sid)
+    if have is not True:
+        detail = ("부서 자동 생성 **미진입** — 폴백의 전제(살아있는 master 보유자 존재)가 실측으로 "
+                  "확인되지 않았다: %s. 이 거부는 '조직 사실'이 아니라 **세션 배선 사실**일 가능성이 "
+                  "높다(발신 pane 미해석 — 세션 분리·재부모화·pane 밖 실행). 진단: `cys list` 의 "
+                  "role 열이 비어 있는데 claim 이 거부됐다면 신원 배선 문제다. "
+                  "claim 출력:\n%s" % (why, (claim_out or "")[-800:]))
+        log.step(STEP.DEPT_FB, 1, detail)
+        return log.fail(STEP.CLAIM_ROLE_CONTEXT, 1, detail, EXIT_SESSION_CONTEXT,
+                        ok=None, state="session_error")
+
+    _progress("③-d 위계 폴백: 살아있는 master 존재(실측 확인) — 선언을 '부서 창설'로 해석(D1ⓐ)…")
+    log.step(STEP.DEPT_FB, 0,
+             "정당거부 → 부서 자동 생성 진입(선언 surface=%s · 전제 실측: %s)" % (sid, why))
 
     # base 셸 env: cys-dept 는 base 레지스트리 대상 — CYS_SOCKET 제거(ceo_reinject_master 동형).
     # PATH 에 이 인터프리터 디렉토리를 선두 주입 — cys-dept 내부 python3(레지스트리 flock RMW)가
@@ -1692,10 +1747,29 @@ def _cmd_run_chain(log):
     #     surface 를 못 정함)·데몬 미응답·바이너리 부재·사용오류 등. 이걸 7로 보고하면 사용자에게
     #     "다른 pane 이 이미 master 다"라는 **거짓 판정**을 주고, 그 처방(기존 master 탭으로 가라)은
     #     실제 원인(세션 배선)을 영영 못 찾게 만든다(A20: 판정·escalation 층위의 뭉개기).
+    # ★L2 선행 claim 소비(2026-08-16 현장 결함 근본수리) ──────────────────────────────────
+    # 데몬 claim_role 은 발신 pane 을 **커널 peer pid 의 조상 체인**으로 확정한다(위조 방지 —
+    # 클라이언트 자기신고 CYS_SURFACE_ID 는 신뢰하지 않는다). 그런데 훅은 이 스크립트를 백그라운드로
+    # 발화하고 곧 종료하므로, 이 프로세스는 **재부모화(ppid→1)** 되어 조상 체인이 끊긴다 → 여기서
+    # claim 을 치면 언제나 '발신 pane 미해석'으로 거부된다(실측 e2e: 같은 surface 에서 동기 실행은
+    # 성공·분리 실행은 거부). 그래서 훅 발화 경로에서는 **조상 체인이 온전한 훅 프로세스**가 spawn
+    # 이전에 claim 을 끝내고, 이 스크립트는 그 판정을 소비한다(claim 을 두 번 치지 않는다 — 중복
+    # claim 은 좌석 프로브·감사 이벤트를 두 번 태운다).
+    # 판정 전달은 env 다: CYS_CLAIM_RC(필수·정수) / CYS_CLAIM_OUT(진단 문안·선택).
+    # env 가 없으면(§0 폴백의 포그라운드 직접 실행·구 훅) 종전대로 여기서 직접 claim 한다 —
+    # 그 경로는 조상 체인이 온전하므로 정상 동작한다(하위호환·스큐 안전).
     _progress("③ master 역할 등록…")
-    code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"],
-                     timeout=_budget_leaf("CYS_CLAIM_TIMEOUT_S", 15))
-    log.step(STEP.CLAIM_ROLE, code, out)
+    _pre_rc = os.environ.get("CYS_CLAIM_RC", "")
+    if _pre_rc.strip().lstrip("-").isdigit():
+        code = int(_pre_rc.strip())
+        out = os.environ.get("CYS_CLAIM_OUT", "") or "(선행 claim 출력 없음)"
+        out = ("[선행 claim 소비] 훅(role-bootstrap.sh)이 **조상 체인이 온전한 시점에** "
+               "claim-role 을 수행했고 이 런은 그 판정(rc=%d)을 소비한다.\n%s" % (code, out))
+        log.step(STEP.CLAIM_ROLE, code, out)
+    else:
+        code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"],
+                         timeout=_budget_leaf("CYS_CLAIM_TIMEOUT_S", 15))
+        log.step(STEP.CLAIM_ROLE, code, out)
     if code != 0:
         low = (out or "").lower()
         # ★A20 타입드 exit 소비(W2 · H-EXIT-3): CLI 가 이제 판정 타입을 **exit 로** 낸다 —
@@ -1718,8 +1792,14 @@ def _cmd_run_chain(log):
             #   ok:true(건강한 master 의 완주 기록)를 ok:false 로 덮으면 §0 이 churn 한다.
             return log.fail(STEP.CLAIM_ROLE, code, msg, EXIT_CLAIM_DENIED,
                             ok=None, state="declined")
-        # ★A20 타입드 exit 의 정확한 처방 분기(3=미도달 / 2=식별불가 / 그 밖=구 계약 산문 판정).
-        kind = {3: ("미도달 — 요청이 데몬에 닿지 못했다(소켓 부재·데몬 다운·왕복 실패). "
+        # ★A20 타입드 exit 의 정확한 처방 분기(6=신원 미확정 / 3=미도달 / 2=식별불가 / 그 밖=구 계약).
+        #   ※ 이 숫자들은 **cys CLI 의 rc 이름공간**이다(위 EXIT_* 는 이 스크립트의 이름공간 —
+        #     값이 겹쳐 보여도 다른 계약이다. rc 6 ≠ EXIT_CHECK).
+        kind = {6: ("발신 신원 미확정 — 데몬은 응답했으나 이 프로세스를 발신 pane 에 붙이지 못했다"
+                    "(세션 분리·재부모화로 조상 체인 단절 · pane 밖 실행 · 타 surface 지정). "
+                    "**'다른 pane 이 master' 라는 뜻이 아니다** — 부서 자동 생성으로 이어지지 않는다. "
+                    "처방: pane 안에서(훅 발화 경로면 훅이 선행 claim 한다) 재선언하라."),
+                3: ("미도달 — 요청이 데몬에 닿지 못했다(소켓 부재·데몬 다운·왕복 실패). "
                     "처방: `cys ping` 으로 데몬을 확인하라."),
                 2: ("식별 불가 — surface 해석 실패·인자 오류(요청을 만들 수조차 없었다). "
                     "처방: 이 세션이 cys pane 안인지(CYS_SURFACE_ID) 확인하라.")}.get(

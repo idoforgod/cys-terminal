@@ -2000,20 +2000,48 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             match caller_sid {
                 Some(cs) if cs == sid => {}
                 _ => {
+                    // ★(2026-08-16 현장 결함 — 신원 실패 ⇄ 정당거부 **코드 분리**)
+                    // 종전엔 이 게이트의 거부와 아래 "살아있는 특권 보유자" 거부가 같은 코드
+                    // (claim_denied)였다. 소비 사슬(cys.rs run_claim_role → rc 7 →
+                    // javis_bootstrap ③ → 위계 폴백)이 그 코드 하나만 보고 **"살아있는 master가
+                    // 있다"**로 읽어, 실제로는 아무도 master가 아닌 기계에서 부서를 자동 생성하고
+                    // master를 영영 등록하지 않았다(실측 e2e: 훅이 분리 발화한 부트의 claim이
+                    // "caller (surface None)"으로 거부 → role=- 유지 → dept-N 증식).
+                    //
+                    // 두 사실은 층위가 다르다:
+                    //   · 신원 미해석/소유 불일치 = **세션 배선** 사실(누가 요청했는지 모른다)
+                    //   · 살아있는 보유자        = **조직** 사실(그 역할은 남의 것이다)
+                    // 코드를 가르지 않으면 소비부는 전자를 후자로 오역할 수밖에 없다(A20과 같은
+                    // '판정 층위 뭉개기'의 데몬면). 이벤트 이름(role.claim_denied)은 기존 관측자
+                    // 호환을 위해 유지하고, payload에 error_code·reason을 실어 구분한다.
+                    let (code, why) = match caller_sid {
+                        None => (
+                            "claim_caller_unresolved",
+                            format!(
+                                "claim_role: 발신 pane을 확정하지 못했다(caller_pid={caller_pid:?}) — \
+                                 이 요청은 pane 밖이거나, 세션 분리(setsid/nohup)·재부모화로 조상 \
+                                 체인이 끊긴 프로세스에서 왔다. '살아있는 {role} 보유자가 있다'는 \
+                                 뜻이 **아니다** — pane 안에서(조상 체인이 살아있는 프로세스로) \
+                                 claim 하라."
+                            ),
+                        ),
+                        Some(cs) => (
+                            "claim_not_owner",
+                            format!(
+                                "claim_role: 발신 surface {cs}는 대상 surface {sid}의 소유자가 아니다 \
+                                 — 역할 등록은 자기 surface에만 허용된다('{role}' 보유자 유무와 무관)."
+                            ),
+                        ),
+                    };
                     daemon.bus.publish(
                         "role.claim_denied",
                         "system",
                         Some(sid),
                         json!({"role": role, "requested_surface": sid,
-                               "caller_surface": caller_sid, "caller_pid": caller_pid}),
+                               "caller_surface": caller_sid, "caller_pid": caller_pid,
+                               "error_code": code, "reason": "identity"}),
                     );
-                    return Reply::Single(err_response(
-                        &id,
-                        "claim_denied",
-                        &format!(
-                            "claim_role denied: caller (surface {caller_sid:?}) may only claim its own surface, not {sid}"
-                        ),
-                    ));
+                    return Reply::Single(err_response(&id, code, &why));
                 }
             }
             // ★(W2 · A3=B7 / 비평2 C-5) **요청자-role 불변식 = 경고 + 감사로그**(무조건 거부 아님).
@@ -5784,7 +5812,9 @@ mod tests {
             resp["ok"], json!(false),
             "타 surface에 대한 claim이 통과했다 (응답: {resp})"
         );
-        assert_eq!(resp["error"]["code"], json!("claim_denied"));
+        // ★코드 분리(2026-08-16): 소유 불일치는 '살아있는 보유자가 있다'가 아니라 **신원** 사실이다.
+        // claim_denied 로 뭉치면 소비부(bootstrap ③)가 이를 정당거부로 읽어 부서를 자동 생성한다.
+        assert_eq!(resp["error"]["code"], json!("claim_not_owner"));
         // victim surface의 role이 오염되지 않았는지 확인 (insert가 일어나지 않아야 함).
         assert!(
             daemon.surfaces.lock().unwrap()[&victim].role.lock().unwrap().is_none(),
@@ -6142,6 +6172,8 @@ mod tests {
     }
 
     /// 익명/추적 불가 발신(caller_pid=None)은 신원 확정 불가 → claim 거부.
+    /// ★코드는 claim_denied 가 아니라 claim_caller_unresolved 다(2026-08-16 분리) — 아래 회귀
+    ///   테스트가 그 이유(부서 자동 생성 오발동)를 박제한다.
     #[test]
     fn claim_role_rejects_anonymous_caller() {
         let daemon = claim_daemon();
@@ -6151,7 +6183,46 @@ mod tests {
             resp["ok"], json!(false),
             "신원 미확정 익명 claim이 통과했다 (응답: {resp})"
         );
-        assert_eq!(resp["error"]["code"], json!("claim_denied"));
+        assert_eq!(resp["error"]["code"], json!("claim_caller_unresolved"));
+    }
+
+    /// 발견(2026-08-16 현장 결함 — 없는 master를 '있다'고 판정해 부서 증식): 훅이 부트스트랩을
+    /// 세션 분리(setsid/nohup)로 발화하면 훅 셸 종료와 함께 부트가 재부모화돼 조상 체인이
+    /// 끊긴다 → resolve_caller_surface 가 None → claim_role 이 거부. 그 거부 코드가 "살아있는
+    /// 특권 보유자" 거부와 **같은 claim_denied** 였던 탓에, 소비 사슬(cys.rs rc 7 →
+    /// javis_bootstrap ③ → 위계 폴백)이 이를 정당거부로 읽고 **부서를 자동 생성**했다.
+    /// 실측 e2e: 격리 데몬에서 같은 surface에 대해 분리 실행=거부(role 미등록) / 동기 실행=성공.
+    ///
+    /// 이 테스트가 박제하는 불변식: **신원 미해석 거부는 절대 claim_denied 로 나오지 않는다.**
+    /// (claim_denied 로 회귀하면 소비부는 다시 '살아있는 master 있음'으로 오역한다.)
+    #[test]
+    fn claim_role_unresolved_caller_is_not_claim_denied() {
+        let daemon = claim_daemon();
+        let s = make_surface(&daemon, None);
+        // 살아있는 master 보유자는 **없다** — 그런데도 거부가 난다는 것이 이 결함의 핵심이다.
+        assert!(daemon.roles.lock().unwrap().get("master").is_none());
+
+        // 조상 체인이 끊긴 발신자 재현: caller_cache 미주입 + 존재하지 않는 pid
+        // (resolve_caller_surface 가 조상 추적에 실패해 None 을 돌리는 그 상태).
+        let orphan_pid = 4_294_000_001_u32;
+        let resp = claim(&daemon, "master", s, Some(orphan_pid));
+
+        assert_eq!(resp["ok"], json!(false), "신원 미해석 claim 이 통과했다 (응답: {resp})");
+        assert_ne!(
+            resp["error"]["code"],
+            json!("claim_denied"),
+            "신원 미해석이 '정당거부(claim_denied)'로 나왔다 — 소비부가 '살아있는 master 있음'으로 \
+             오역해 부서를 자동 생성한다(2026-08-16 결함 재발). 응답: {resp}"
+        );
+        assert_eq!(resp["error"]["code"], json!("claim_caller_unresolved"));
+        // 거부 사유 문안이 '보유자 있음'을 암시하면 안 된다(오진 문구가 사용자에게 중계된다).
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !msg.contains("privileged role") && !msg.contains("held by live"),
+            "신원 실패 문안이 보유자 있음을 암시한다: {msg}"
+        );
+        // 역할은 등록되지 않아야 한다.
+        assert!(daemon.roles.lock().unwrap().get("master").is_none());
     }
 
     fn set_meta(

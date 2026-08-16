@@ -6676,8 +6676,16 @@ fn boot_agent_on_surface(
 /// |---|---|---|
 /// | 0 | 등록 성공(멱등 재claim 포함) | 계속 |
 /// | 7 | **정당거부** — 살아있는 보유자가 있다(이 surface 는 그 역할이 아니다) | 지휘 중단·인계. boot-last 오염 금지(ok:null) |
+/// | 6 | **발신 신원 미확정** — 데몬은 응답했으나 발신 pane 을 붙이지 못했다(분리 실행·타 surface) | 세션 배선 점검. **부서 자동 생성 금지** |
 /// | 3 | 미도달 — 데몬 미응답·소켓 부재(요청이 데몬에 닿지 못했다) | `cys ping`·데몬 기동 |
 /// | 2 | 식별 불가 — surface 해석 실패·인자 오류(요청을 만들 수조차 없다) | 세션 배선(CYS_SURFACE_ID) 점검 |
+///
+/// ★rc=6 신설(2026-08-16 현장 결함): 데몬이 **신원 미해석**(claim_caller_unresolved)과 **소유
+///   불일치**(claim_not_owner)를 "살아있는 보유자 있음"(claim_denied)과 같은 코드로 내던 것을
+///   갈랐다. 종전 사슬은 훅이 세션 분리로 발화한 부트의 claim 이 조상 체인 단절로 거부되면 그것을
+///   rc 7(정당거부)로 접었고, javis_bootstrap ③이 이를 "다른 master 가 산다"로 읽어 **부서를 자동
+///   생성**했다(master 영구 미등록·dept 증식). 6 은 그 오역을 구조적으로 불가능하게 만든다 —
+///   bootstrap 은 6 을 EXIT_SESSION_CONTEXT(세션 배선 오류)로 소비하고 위계 폴백에 진입하지 않는다.
 ///
 /// ★W1b 의 bootstrap 소비 분기와 정합(H-EXIT-3 발효): bootstrap 은 exit 7 → EXIT_CLAIM_DENIED,
 ///   exit 3/2 → EXIT_SESSION_CONTEXT 로 매핑하며 **둘 다 boot-last 에 ok:null** 을 쓴다(CS-2⑩).
@@ -6724,6 +6732,14 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
                     );
                 }
                 7
+            } else if e.starts_with("claim_caller_unresolved") || e.starts_with("claim_not_owner") {
+                // ★신원 실패는 조직 사실이 아니다(rc=6 · 2026-08-16) — 정당거부(7)와 융합 금지.
+                eprintln!(
+                    "[claim-role] 발신 신원 미확정(rc=6): 데몬은 응답했으나 이 프로세스를 발신 \
+                     pane 에 붙이지 못했다(세션 분리·재부모화·pane 밖 실행·타 surface 지정). \
+                     살아있는 보유자가 있다는 뜻이 **아니다** — 세션 배선을 점검하라."
+                );
+                6
             } else if e.starts_with("invalid_params") || e.starts_with("not_found") {
                 eprintln!("[claim-role] 식별 불가(rc=2): 요청 인자·surface 해석 실패.");
                 2

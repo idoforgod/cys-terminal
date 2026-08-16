@@ -79,7 +79,11 @@ jobs:
           # 계측 대조(D4A_REF·pre-t1)는 shallow checkout 에서 graceful skip(no-git) 검증됨.
           # H-WIN-12(SYS32-TIMEOUT · 2026-08-13): System32 timeout.exe 함정에서 save-state.sh
           # BOOT_SNAPSHOT 생성 경로가 실행됨을 Windows 실기로 증명 — cys_timeout_run GNU 판별 수리의 검체.
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1"
+          # ★H-IDENT-1 동승(2026-08-16): claim 신원 실패 ⇄ 정당거부 분리 3겹. 이 결함은 조상 체인
+          #   단절이 원인이라 **Windows 에서 더 자주** 발현한다(git-bash 한 겹 + 고아 프로세스의
+          #   부모 pid 소멸). 검체 자체는 소스 구조 판정이라 플랫폼 무관이지만, Windows 러너가
+          #   빌드하는 그 트리에 3겹이 실제로 실려 있는지를 이 레인에서도 확증한다.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           python "$R" --only "$WIN_SPECIMENS"
           python "$R" --only "$WIN_SPECIMENS" --json > win-health.json

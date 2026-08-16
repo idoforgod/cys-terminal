@@ -265,7 +265,13 @@ def make_dept_fb_stubs(tmp, env, home):
         "  claim-role) echo 'claim_denied: privileged role held by live surface' >&2; exit 7;;\n"
         "  launch-agent) echo 'surface:42'; touch \"%(t)s/master.flag\"; exit 0;;\n"
         "  status)\n"
-        "    if [ -f \"%(t)s/master.flag\" ]; then\n"
+        "    if [ -z \"${CYS_SOCKET:-}\" ]; then\n"
+        # ★base 레인(2026-08-16 L3 가드 대응): 위계 폴백의 **전제**는 '살아있는 master 보유자가
+        #   이미 있다'이다. 종전 스텁은 claim 거부만 흉내내고 그 전제는 모사하지 않아, 전제 없이
+        #   부서가 만들어지는 실제 결함(role=- 인 채 dept 증식)을 재현조차 못 했다. 이제 base
+        #   레인 status 는 그 전제를 사실로 제공한다(전제 부재 시나리오의 핀은 5fb-p).
+        "      echo '{\"surfaces\":[{\"surface_id\":9,\"role\":\"master\",\"exited\":false,\"agent\":\"claude\",\"agent_alive\":true,\"seat\":\"occupied\"}]}'\n"
+        "    elif [ -f \"%(t)s/master.flag\" ]; then\n"
         "      echo '{\"surfaces\":[{\"surface_id\":42,\"role\":\"master\",\"exited\":false,\"agent\":\"claude\",\"agent_alive\":true,\"seat\":\"occupied\"}]}'\n"
         "    elif [ -f \"%(t)s/master-shell.flag\" ]; then\n"
         "      echo '{\"surfaces\":[{\"surface_id\":41,\"role\":\"master\",\"exited\":false,\"agent\":null,\"agent_alive\":null,\"seat\":\"empty\"}]}'\n"
@@ -358,6 +364,64 @@ check("5fb-o2 boot-last ok=null·state=dept_fallback_failed(오염 차단)",
       bl.get("result", {}).get("ok") is None
       and bl.get("result", {}).get("state") == "dept_fallback_failed",
       json.dumps(bl.get("result", {}), ensure_ascii=False)[:200])
+shutil.rmtree(tmp)
+
+# ── 5-fb-p. ★L3 실측 가드 핀(2026-08-16 현장 결함 — "없는 master 를 있다고 믿고 부서를 만든다") ──
+#    실사고: 훅이 부트를 세션 분리로 발화 → 부트가 재부모화돼 조상 체인 단절 → 데몬이 claim 을
+#    '발신 pane 미해석'으로 거부 → 종전 데몬은 그 거부를 '살아있는 보유자 있음'과 **같은 코드**로
+#    냈고 → 부트가 정당거부로 읽어 **부서를 자동 생성**했다(role=- 인 채 dept-N 증식).
+#    L1(데몬 코드 분리)이 그 오역을 닫았지만, 이 가드는 **독립적으로** 폴백의 전제를 직접 잰다 —
+#    구 데몬 × 신 팩 스큐에서도, 앞으로 rc 7 로 접히는 다른 경로가 생겨도 전제 없는 스폰을 막는다.
+tmp = tempfile.mkdtemp(prefix="boot-t5fbp-")
+env, home = make_env(tmp, claim_exit=1)
+env["CYS_DECL_ORIGIN"] = "hook-human"
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+# base 레인 status 가 **살아있는 master 보유자 없음**을 보고하게 덮어쓴다(현장 결함 재현).
+_cys_stub = os.path.join(tmp, "stubbin", "cys")
+with open(_cys_stub, "w", encoding="utf-8", newline="\n") as f:
+    f.write("#!/bin/sh\n"
+            "echo \"cys $@ [sock=${CYS_SOCKET:-base}]\" >> \"%s/calls.log\"\n"
+            "case \"$1\" in\n"
+            "  ping) exit 0;;\n"
+            "  claim-role) echo 'claim_denied: privileged role held by live surface' >&2; exit 7;;\n"
+            "  status) echo '{\"surfaces\":[]}'; exit 0;;\n"
+            "  list) exit 0;;\n"
+            "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
+            "esac\nexit 0\n" % tmp)
+os.chmod(_cys_stub, 0o755)
+code, out, err = run(env)
+check("5fb-p1 전제 미확인 → 부서 자동 생성 미진입(exit 10 세션 배선 오류)", code == 10, "exit=%d" % code)
+check("5fb-p2 allocate 미호출(없는 master 로 부서 만들지 않는다)",
+      "cys-dept allocate" not in calls(tmp), calls(tmp)[-300:])
+bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
+check("5fb-p3 boot-last ok=null·state=session_error(공유 기록 오염 0)",
+      bl.get("result", {}).get("ok") is None
+      and bl.get("result", {}).get("state") == "session_error",
+      json.dumps(bl.get("result", {}), ensure_ascii=False)[:200])
+shutil.rmtree(tmp)
+
+# ── 5-fb-q/r. ★L2 선행 claim 소비 핀(2026-08-16): 훅이 **조상 체인이 온전한 시점에** claim 을
+#    끝내고 판정을 env(CYS_CLAIM_RC)로 넘긴다. 부트는 그것을 소비하고 claim 을 다시 치지 않는다
+#    (분리된 이 프로세스가 다시 claim 하면 언제나 신원 미해석으로 거부된다 — 결함의 본체).
+tmp = tempfile.mkdtemp(prefix="boot-t5fbq-")
+env, home = make_env(tmp)
+env["CYS_CLAIM_RC"] = "0"
+env["CYS_CLAIM_OUT"] = "registered: master → surface:1"
+code, out, err = run(env)
+check("5fb-q1 선행 claim rc0 소비 → 체인 계속 exit 0", code == 0, "exit=%d err=%s" % (code, err[-300:]))
+check("5fb-q2 claim-role 재호출 없음(중복 claim 금지)",
+      "cys claim-role" not in calls(tmp), calls(tmp)[-300:])
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="boot-t5fbr-")
+env, home = make_env(tmp)
+env["CYS_DECL_ORIGIN"] = "hook-human"
+dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
+env["CYS_CLAIM_RC"] = "6"   # 발신 신원 미확정 — '다른 pane 이 master' 가 아니다
+code, out, err = run(env)
+check("5fb-r1 선행 claim rc6 → 세션 배선 오류 exit 10", code == 10, "exit=%d" % code)
+check("5fb-r2 rc6 은 부서 자동 생성으로 이어지지 않는다",
+      "cys-dept allocate" not in calls(tmp), calls(tmp)[-300:])
 shutil.rmtree(tmp)
 
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──

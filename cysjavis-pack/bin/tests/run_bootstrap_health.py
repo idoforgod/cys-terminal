@@ -58,7 +58,7 @@ PRE_W0_REF = os.environ.get("CYS_HEALTH_PRE_W0_REF", "b35f01d")
 D4A_REF = os.environ.get("CYS_HEALTH_D4A_REF", "58337fb")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
-LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5")
+LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5", "W6")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
 
@@ -1451,6 +1451,69 @@ def h_exit_3():
         need("fn run_claim_role(" not in old,
              "계측 타당성 실패: 구 코드에 이미 타입드 claim-role 핸들러가 있다")
         calib = "구 코드=성공 0/그 밖 1(1비트 붕괴) 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-IDENT-1", "W6",
+          "claim 신원 실패 ⇄ 정당거부 3겹 분리(데몬 코드·훅 선행 claim·폴백 실측 가드)",
+          ["FIELD-2026-08-16"])
+def h_ident_1():
+    """현장 결함(2026-08-16 · macOS·Windows 공통): 훅이 부트스트랩을 **세션 분리**로 발화하고
+    곧 종료한다 → 부트가 재부모화(ppid→1)돼 **조상 체인이 끊긴다** → 데몬 claim_role 이 발신
+    pane 을 확정하지 못해 거부 → 그 거부 코드가 "살아있는 특권 보유자" 거부와 **같은
+    claim_denied** 라, 소비 사슬(cys.rs rc 7 → javis_bootstrap ③ → 위계 폴백)이 이를 정당거부로
+    읽고 **부서를 자동 생성**했다. 결과: master 영구 미등록(role=-)·선언마다 dept-N 증식.
+
+    실측 e2e(격리 데몬): 같은 surface·같은 순간에 동기 실행 claim=성공 / 분리 실행 claim=거부.
+    수리 3겹을 각각 박제한다 — 어느 한 겹만 되돌려도 이 검체가 적색이 된다."""
+    notes = []
+
+    # ── L1 데몬: 신원 실패 전용 에러코드(정당거부와 분리) + CLI rc 6 매핑 ──
+    h = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    need('"claim_caller_unresolved"' in h,
+         "데몬이 발신 pane 미해석을 전용 코드로 내지 않는다(claim_denied 와 융합 잔존)")
+    need('"claim_not_owner"' in h,
+         "데몬이 소유 불일치를 전용 코드로 내지 않는다(claim_denied 와 융합 잔존)")
+    c = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    need('e.starts_with("claim_caller_unresolved")' in c and 'e.starts_with("claim_not_owner")' in c,
+         "CLI 가 신원 실패 코드를 분기하지 않는다 — rc 7(정당거부)로 다시 접힌다")
+    notes.append("L1 데몬/CLI: 신원 실패 전용 코드 + rc 6 분기")
+
+    # ── L2 훅: 조상 체인이 온전한 시점(spawn 이전)의 선행 claim + env 판정 전달 ──
+    hook = _read(_hook("role-bootstrap.sh"))
+    need("cys claim-role master" in hook,
+         "훅이 선행 claim 을 하지 않는다 — 분리된 부트가 claim 하면 언제나 신원 미해석이다")
+    need("export CYS_CLAIM_RC=" in hook, "훅이 claim 판정을 부트에 넘기지 않는다(env 계약 부재)")
+    i_claim, i_spawn = hook.find("cys claim-role master"), hook.find("BOOT_ARGS=")
+    need(0 <= i_claim < i_spawn,
+         "선행 claim 이 spawn(분리 발화) **이후**에 있다 — 조상 체인이 이미 끊긴 뒤라 무의미하다")
+    bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need('os.environ.get("CYS_CLAIM_RC"' in bsrc, "부트가 선행 claim 판정을 소비하지 않는다")
+    need("6: (\"발신 신원 미확정" in bsrc, "부트가 rc 6 의 정확한 처방을 분기하지 않는다")
+    notes.append("L2 훅 선행 claim(spawn 이전) + 부트 소비 + rc6 처방")
+
+    # ── L3 폴백: '살아있는 master 존재'라는 전제를 실측으로 재확인 ──
+    need("def _base_live_master(" in bsrc, "폴백 전제 실측 술어가 없다")
+    fb = bsrc[bsrc.find("def _dept_fallback("):]
+    fb = fb[:fb.find("\ndef ", 10)] if "\ndef " in fb[10:] else fb
+    # 앵커는 **실제 호출부**여야 한다(주석·독스트링의 'allocate' 낱말이 아니라 — 그것은 함수
+    # 상단 계약 주석에 먼저 나와서 순서 판정을 뒤집는다).
+    i_guard, i_alloc = fb.find("_base_live_master("), fb.find('cys_dept, "allocate"')
+    need(i_guard >= 0, "폴백이 전제(살아있는 master)를 실측하지 않는다 — 없는 master 로 부서 생성")
+    need(i_alloc < 0 or i_guard < i_alloc,
+         "전제 실측이 부서 allocate **이후**에 있다 — 이미 만들고 나서 재는 것은 가드가 아니다")
+    notes.append("L3 폴백: allocate 이전 전제 실측(측정 실패=미진입)")
+
+    # ── 계측 타당성: 구 트리에는 이 3겹이 **없어야** 한다(있으면 탐지기가 무엇도 못 잡는다) ──
+    old_h = _git_show(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    old_hook = _git_show(os.path.join("cysjavis-pack", "hooks", "role-bootstrap.sh"))
+    calib = "skip(no-git)"
+    if old_h is not None and old_hook is not None:
+        need("claim_caller_unresolved" not in old_h,
+             "계측 타당성 실패: 구 데몬에 이미 신원 전용 코드가 있다")
+        need("CYS_CLAIM_RC" not in old_hook,
+             "계측 타당성 실패: 구 훅에 이미 선행 claim 계약이 있다")
+        calib = "구 트리=코드 융합·선행 claim 부재 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
