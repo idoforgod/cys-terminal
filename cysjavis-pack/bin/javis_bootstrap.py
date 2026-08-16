@@ -26,7 +26,10 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
       8=레인↔팩 정합 실패 또는 불량 레인(빈 부서명) — 교차 오염 차단·팀 기동 전 중단
       9=자원 hard_block(결손 기준 자원 사전 게이트 — 팀 기동 전 착수 거부·CEO escalation)
       10=세션 컨텍스트 오류(claim 왕복이 정당거부가 **아닌** 사유로 실패 — CYS_SURFACE_ID 부재·
-         데몬 미응답·바이너리 부재 등. 7과 분리해야 '남의 master' 오보를 안 만든다 — A20)
+         **발신 pane 미식별**(세션 분리·재부모화로 조상 체인 단절 = CLI rc 6)·데몬 미응답·
+         바이너리 부재 등. 7과 분리해야 '남의 master' 오보를 안 만든다 — A20).
+         ★여기에는 '부서 자동 생성 전제 미확인'(③-d dept-guard)도 포함된다 — 폴백의 전제인
+         살아있는 master 보유자가 실측되지 않으면 부서를 만들지 않고 이 코드로 종결한다.
       11=skipped_inflight(단일 실행 락 패자 — 이미 다른 런이 부트 중. **실패 아님**)
   다른 서브커맨드: 5=assert-ready 게이트 실패(하위 게이트 전용) / 2=`issue-ticket` 사용오류
       (--dept 형식 위반 또는 base 레인 아님) / 64=EX_USAGE(미지 서브커맨드 — A14).
@@ -219,8 +222,12 @@ EXIT_USAGE = 64              # EX_USAGE(sysexits.h) — 미지 서브커맨드·
 #   이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
 CYS_BOOT_EXIT_BUSY = 75
 
-# claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — session-start.sh:101 과 동일 어휘).
+# claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — hooks/session-start.sh 의 self-demote
+# 대조 지점과 동일 어휘. 종전 주석은 `session-start.sh:101` 을 가리켰으나 실제 대조는 그 아래
+# `$CLAIM_OUT` grep 이다 — 낡은 라인 참조를 지운다).
 # 이 마커가 없는 rc≠0 은 거부가 아니라 세션 컨텍스트 오류다(A20: 판정·escalation 층위 뭉개기 해소).
+# ★2026-08-16 이후 데몬은 신원 실패를 claim_caller_unresolved·claim_not_owner 로 낸다 — 두 코드
+#   모두 위 마커 부분문자열을 **포함하지 않으므로** 이 상수는 무변경으로 정확하다(구 데몬 호환).
 _CLAIM_DENIED_MARKERS = ("claim_denied", "privileged role held")
 
 # ── 증분2: 부서 교리 게이트 상태 ──
@@ -494,6 +501,10 @@ _STEP_DEFS = (
     #   있어 ③이 정당거부될 때, 선언(=오너 타이핑·MO 게이트 통과)을 '부서 창설 의도'로 해석해
     #   부서 자동 생성 → 티켓 발급 → 부서장·팀 기동으로 이어주는 단계들. ③ 거부 직후에만 돈다.
     ("DEPT_FB", "③-d dept-fallback"),
+    # ★전제 실측 가드(2026-08-16): 폴백 **미진입** 판정의 전용 단계. 종전엔 이 결과를
+    #   CLAIM_ROLE_CONTEXT(order 7)로 적었는데, 그건 DEPT_FB(order 8) 뒤에 오는 역행이라
+    #   boot-last 가 매번 order_violation 을 남겼다(계측기가 스스로 '깨졌다'고 기록).
+    ("DEPT_FB_GUARD", "③-d dept-guard"),
     ("DEPT_FB_ALLOC", "③-d dept-alloc"),
     ("DEPT_FB_TICKET", "③-d dept-ticket"),
     ("DEPT_FB_MASTER", "③-d dept-master"),
@@ -655,6 +666,10 @@ class _Log:
                                  "GUI ＋부서(부서 워크스페이스 추가)를 쓰거나, base 레인(unix)에서 오너가 "
                                  "직접 타이핑한 선언(훅 발화)으로 재선언하세요 — 그 경로만 부서 자동 생성으로 "
                                  "이어집니다.",
+                STEP.DEPT_FB_GUARD: "부서 자동 생성의 전제(살아있는 master)가 확인되지 않아 만들지 "
+                                    "않았습니다 — 역할 등록이 '신원 미확정'으로 거부됐을 가능성이 "
+                                    "큽니다(세션 배선). `cys list` 의 role 열을 확인하고, pane 안에서 "
+                                    "재선언하세요. 새 부서가 목적이면 GUI ＋부서·`cys-dept allocate` 를 쓰세요.",
                 STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP 기본 8)·~/.cys/depts.json 을 확인하세요.",
                 STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — GUI 부서 탭의 ▶부서장 버튼으로 재시도하세요.",
                 STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
@@ -955,6 +970,11 @@ def _dept_lane_env(sock, pack):
     e["CYS_PACK_DIR"] = pack
     e.pop("CYS_SURFACE_ID", None)
     e.pop("CYS_SURFACE_REF", None)
+    # ★선행 claim 판정 위생(2026-08-16): 이 판정은 **base pane 의 것**이다 — 부서 레인 명령에
+    #   딸려 들어가면 그 레인의 부트가 남의 판정을 자기 것으로 소비할 여지가 생긴다(현재 하류
+    #   소비자는 없지만, env 누수는 소비자가 생기는 순간 결함이 된다 — 근원에서 끊는다).
+    for _k in ("CYS_CLAIM_RC", "CYS_CLAIM_OUT", "CYS_CLAIM_SID", "CYS_CLAIM_AT"):
+        e.pop(_k, None)
     return e
 
 
@@ -982,10 +1002,13 @@ def _dept_master_alive(dept_env):
     return False
 
 
-def _base_live_master(exclude_sid):
-    """이 레인에 **살아있는 master 보유자**가 실제로 있는가 — `cys status --json` 실측.
+def _live_master_from_status(status, exclude_sid):
+    """`cys status --json` 스냅샷에 **살아있는 master 보유자**가 있는가 — 순수 판정.
 
-    반환: (판정, 사유)  판정 = True(있음) / False(없음) / None(측정 실패 — 알 수 없음)
+    반환: (판정, 사유)  판정 = True(있음) / False(없음) / None(판독 불가 — 알 수 없음)
+
+    ★순수 함수인 이유: 이 판정은 부서 자동 생성이라는 **비가역 스폰의 유일한 전제**다.
+      I/O 와 붙여 두면 `--self-test`(밀폐 계약)로 핀할 수 없어, 판정이 조용히 낡는다.
 
     ★왜 별도 술어인가(_dept_master_alive 와 다른 질문): _dept_master_alive 는 "부서에 **에이전트가
       붙은** 부서장이 있는가"(agent_alive/seat)를 묻는다 — launch-agent 를 생략할지 결정하는
@@ -994,16 +1017,12 @@ def _base_live_master(exclude_sid):
       가드가 데몬과 다른 사실을 보고 서로 어긋난다(빈 셸 master 를 '없음'으로 판정 → 정당한 부서
       창설을 막는 반대 방향 결함).
     """
-    code, out, err = _run_env(["cys", "status", "--json"], dict(os.environ), timeout=15)
-    if code != 0:
-        return None, "cys status 실패(rc=%s): %s" % (code, (err or out or "")[-200:])
-    try:
-        st = json.loads(out)
-    except ValueError:
-        return None, "cys status --json 파싱 실패"
-    if not isinstance(st, dict):
-        return None, "cys status --json 스키마 불일치"
-    for s in (st.get("surfaces") or []):
+    if not isinstance(status, dict):
+        return None, "cys status --json 판독 불가(데몬 미응답·파싱 실패)"
+    surfaces = status.get("surfaces")
+    if not isinstance(surfaces, list):
+        return None, "cys status --json 스키마 불일치(surfaces 배열 없음)"
+    for s in surfaces:
         if not isinstance(s, dict):
             continue
         if s.get("role") != "master" or s.get("exited"):
@@ -1013,6 +1032,12 @@ def _base_live_master(exclude_sid):
             continue  # 자기 자신은 '남의 보유'가 아니다(멱등 재claim 경로)
         return True, "살아있는 master 보유자 surface=%s" % holder
     return False, "roles 에 살아있는 master 보유자가 없다"
+
+
+def _base_live_master(exclude_sid):
+    """위 판정의 I/O 래퍼 — status 입구는 **기존 단일 SOT**(_cys_status_json)를 재사용한다.
+    세 번째 status 리더를 만들지 않는다(예산·채널 분리 규약이 그 한 곳에 산다)."""
+    return _live_master_from_status(_cys_status_json(), exclude_sid)
 
 
 def _dept_fallback(log, claim_out):
@@ -1066,8 +1091,9 @@ def _dept_fallback(log, claim_out):
                   "높다(발신 pane 미해석 — 세션 분리·재부모화·pane 밖 실행). 진단: `cys list` 의 "
                   "role 열이 비어 있는데 claim 이 거부됐다면 신원 배선 문제다. "
                   "claim 출력:\n%s" % (why, (claim_out or "")[-800:]))
-        log.step(STEP.DEPT_FB, 1, detail)
-        return log.fail(STEP.CLAIM_ROLE_CONTEXT, 1, detail, EXIT_SESSION_CONTEXT,
+        # 단일 단계로 종결한다 — DEPT_FB(order 8) 기록 후 CLAIM_ROLE_CONTEXT(order 7)로 실패시키면
+        # 단계 순서가 역행해 boot-last 에 order_violation 이 매번 남는다(계측기 자기파손).
+        return log.fail(STEP.DEPT_FB_GUARD, 1, detail, EXIT_SESSION_CONTEXT,
                         ok=None, state="session_error")
 
     _progress("③-d 위계 폴백: 살아있는 master 존재(실측 확인) — 선언을 '부서 창설'로 해석(D1ⓐ)…")
@@ -1079,6 +1105,8 @@ def _dept_fallback(log, claim_out):
     # 번들 런타임으로 해소되게 한다(GUI 의 inject_runtime_path 와 동일 취지).
     base_env = dict(os.environ)
     base_env.pop("CYS_SOCKET", None)
+    for _k in ("CYS_CLAIM_RC", "CYS_CLAIM_OUT", "CYS_CLAIM_SID", "CYS_CLAIM_AT"):
+        base_env.pop(_k, None)   # 선행 claim 판정 위생(_dept_lane_env 와 같은 이유)
     base_env["PATH"] = os.path.dirname(sys.executable or "python3") + os.pathsep + base_env.get("PATH", "")
 
     # ⓓ멱등: 같은 surface 의 재선언은 새 부서를 만들지 않고 기존 부서를 재사용한다(살아 있을 때).
@@ -1758,13 +1786,30 @@ def _cmd_run_chain(log):
     # 판정 전달은 env 다: CYS_CLAIM_RC(필수·정수) / CYS_CLAIM_OUT(진단 문안·선택).
     # env 가 없으면(§0 폴백의 포그라운드 직접 실행·구 훅) 종전대로 여기서 직접 claim 한다 —
     # 그 경로는 조상 체인이 온전하므로 정상 동작한다(하위호환·스큐 안전).
+    # ★판정 결박(무바인딩 env 금지): 정수처럼 보이는 env 하나로 claim 을 건너뛰면, 사용자 셸·
+    #   래퍼에 남은 값이 **치지도 않은 claim 을 '실측'으로** boot-last 에 적게 된다(CS-3 보고=실측
+    #   위반). 그래서 판정은 ⓐ같은 surface 귀속(CYS_CLAIM_SID) ⓑ신선도(CYS_CLAIM_AT, 300s)까지
+    #   갖췄을 때만 소비한다. 하나라도 어긋나면 **무시하고 직접 claim** 한다(구 훅·직접 실행과
+    #   동일 경로 — 하위호환이 곧 안전한 기본값이다).
     _progress("③ master 역할 등록…")
-    _pre_rc = os.environ.get("CYS_CLAIM_RC", "")
-    if _pre_rc.strip().lstrip("-").isdigit():
-        code = int(_pre_rc.strip())
+    _pre_rc = os.environ.get("CYS_CLAIM_RC", "").strip()
+    _pre_sid = re.sub(r"[^0-9]", "", os.environ.get("CYS_CLAIM_SID", ""))
+    _my_sid = re.sub(r"[^0-9]", "", my_surface_id())
+    try:
+        _pre_age = time.time() - float(os.environ.get("CYS_CLAIM_AT") or 0)
+    except (TypeError, ValueError):
+        _pre_age = float("inf")
+    _pre_bound = (_pre_rc.lstrip("-").isdigit() and _pre_sid and _pre_sid == _my_sid
+                  and 0 <= _pre_age < float(os.environ.get("CYS_CLAIM_MAX_AGE_S") or 300))
+    if _pre_rc and not _pre_bound:
+        sys.stderr.write("[bootstrap] 선행 claim 판정 미결박 — 무시하고 직접 claim 한다"
+                         "(rc=%r sid=%r≠%r age=%.0fs)\n" % (_pre_rc, _pre_sid, _my_sid, _pre_age))
+    if _pre_bound:
+        code = int(_pre_rc)
         out = os.environ.get("CYS_CLAIM_OUT", "") or "(선행 claim 출력 없음)"
         out = ("[선행 claim 소비] 훅(role-bootstrap.sh)이 **조상 체인이 온전한 시점에** "
-               "claim-role 을 수행했고 이 런은 그 판정(rc=%d)을 소비한다.\n%s" % (code, out))
+               "claim-role 을 수행했고 이 런은 그 판정(rc=%d · surface=%s · %.0fs 전)을 "
+               "소비한다.\n%s" % (code, _my_sid, _pre_age, out))
         log.step(STEP.CLAIM_ROLE, code, out)
     else:
         code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"],
@@ -2338,6 +2383,25 @@ def cmd_self_test():
         except ValueError:
             pass
 
+        # ── t8b: 폴백 전제 판정(부서 자동 생성의 유일한 전제 — 2026-08-16) ──
+        # 이 판정이 틀리면 **없는 master 로 부서가 생기거나**(거짓 양성) **정당한 부서 창설이
+        # 막힌다**(거짓 음성). 비가역 스폰의 게이트라 순수 함수로 분리하고 여기서 박제한다.
+        _S = lambda *rows: {"surfaces": list(rows)}                       # noqa: E731
+        _m = lambda sid, role="master", ex=False: {"surface_id": sid, "role": role, "exited": ex}  # noqa: E731
+        for _st, _sid, _want, _why in (
+            (_S(), "7", False, "빈 로스터"),
+            (_S(_m(7)), "7", False, "자기 자신만 보유(멱등 재claim) = '남의 보유' 아님"),
+            (_S(_m(9)), "7", True, "타 surface 가 살아있는 master"),
+            (_S(_m(9, ex=True)), "7", False, "exited master 는 보유자가 아니다"),
+            (_S(_m(9, role="worker-1")), "7", False, "master 아닌 역할은 무관"),
+            (_S(_m(7), _m(9)), "7", True, "자기+타 surface 혼재 → 타 surface 가 보유"),
+            (None, "7", None, "status 판독 불가 = 알 수 없음(없음으로 접지 않는다)"),
+            ({"surfaces": "nope"}, "7", None, "스키마 불일치 = 알 수 없음"),
+        ):
+            _got, _reason = _live_master_from_status(_st, _sid)
+            assert _got is _want, "폴백 전제 판정 오류(%s): got=%r want=%r · %s" % (
+                _why, _got, _want, _reason)
+
         # ── t9: 단계 정체성 레지스트리(P3-A-STEP-NAME · H-LIFE-2) ──
         assert len(set(STEP_ORDER)) == len(STEP_ORDER), \
             "단계 라벨 중복(동명이의 재사용 재발): %r" % (
@@ -2357,6 +2421,10 @@ def cmd_self_test():
         assert STEP_INDEX[STEP.RESOURCE_GATE] < STEP_INDEX[STEP.BOOT], "자원 게이트가 ④boot 뒤"
         assert STEP_INDEX[STEP.CHECK] < STEP_INDEX[STEP.MARKER] < STEP_INDEX[STEP.PROMOTE_REQUEST], \
             "⑤check→⑥marker→⑦promote 순서 이탈"
+        # ⓑ′ 폴백 전제 가드는 ③-d 진입(DEPT_FB) **뒤**로 선언한다 — 앞으로 선언하면 기록이
+        #    역행해 boot-last 가 매 발동마다 order_violation 을 남긴다(2026-08-16 자기파손 수리).
+        assert STEP_INDEX[STEP.DEPT_FB] < STEP_INDEX[STEP.DEPT_FB_GUARD] \
+            < STEP_INDEX[STEP.DEPT_FB_ALLOC], "③-d 전제 가드 서수가 진입~allocate 사이가 아니다"
         # ⓒ 동명이의였던 3쌍이 이제 서로 다른 라벨이다
         for _a, _b in ((STEP.LANE_MALFORMED, STEP.LANE_PACK),
                        (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_SKIP),
@@ -2381,7 +2449,8 @@ def cmd_self_test():
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
+    print("javis_bootstrap self-test OK (W6: 폴백 전제 판정 8종(부서 자동 생성 게이트) · "
+          "W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
           "레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
           "로스터 결손 신구 차분 9종 + W2(A13 타입드 게이트 exit·_run_split 채널분리·B1 PLAN 정책 "
           "소비 6종·공유 판정 결손 2종) — base/dept 판정·불량 레인·락 키·레인↔팩·CEO 티켓 TTL·"

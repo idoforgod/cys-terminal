@@ -181,7 +181,13 @@ case "$CYS_ROLE" in
       else
         CLAIM_OUT=$(cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
       fi
-      if [ "$CLAIM_RC" -ne 0 ] && printf '%s' "$CLAIM_OUT" | grep -qi 'claim_denied\|privileged role held'; then
+      # ★rc 6 = 발신 신원 미확정(2026-08-16 코드 분리): 데몬은 응답했지만 이 프로세스를 발신
+      #   pane 에 붙이지 못한 경우다(pane 밖·세션 분리 실행). 아래 self-demote 조건(거부 마커)에는
+      #   걸리지 않아 **동작은 이미 안전**하지만, 마지막 fail-open 문안이 "데몬 미응답"이라고
+      #   말해 사실과 다르다 — 전용 팔로 정확히 고지한다(오진 문구가 오너 보고로 중계되지 않게).
+      if [ "$CLAIM_RC" -eq 6 ]; then
+        echo "■ 고지: 발신 신원 미확정(pane 밖·세션 분리 실행) — 역할 재대조를 건너뛴다. 현행 각성 유지(fail-open)."
+      elif [ "$CLAIM_RC" -ne 0 ] && printf '%s' "$CLAIM_OUT" | grep -qi 'claim_denied\|privileged role held'; then
         echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_ROLE — 레지스트리의 살아있는 보유자가 우위)"
         echo "이 surface는 더 이상 $CYS_ROLE 역할이 아니다. 역할 지휘·역할 행동을 중단하고,"
         echo "레지스트리의 $CYS_ROLE 노드에 인계하라(\`cys send --to $CYS_ROLE\`). 이 세션은 일반 세션으로 동작한다."

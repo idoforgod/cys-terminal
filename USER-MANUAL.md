@@ -796,6 +796,8 @@ health.alert/action
 schedule.fired/missed/error/command_done/tick_panic
 autopilot.paused/resumed/master_changed/approval_checked/approval_signed
 role.claimed/claim_denied   worker.limit_denied
+  └ claim_denied payload: reason·current_holder(보유자 있음) 또는 error_code=claim_caller_unresolved
+    |claim_not_owner + reason=identity(발신 pane 미식별·소유 불일치 — 보유자 유무와 무관)
 usage.session_registered/updated/register_denied/report_denied/tick_panic
 channel.* (bridge.exited·auth.denied·registered·message·outbound.<ch>·lockdown·… 15종)
 daemon.started/stopping   acl.denied   context.threshold   status.changed   task.changed

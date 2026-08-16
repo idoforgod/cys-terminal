@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(SELF, "..", "javis_bootstrap.py")
@@ -110,6 +111,12 @@ def marker_path(home):
 def calls(tmp):
     p = os.path.join(tmp, "calls.log")
     return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+
+
+def called(tmp, prefix):
+    """호출 로그에 `prefix` 로 **시작하는 줄**이 있는가 — 부분문자열 대조 금지.
+    알림 본문·안내문에 명령 문자열이 들어가면 부분문자열 판정은 '호출됨'을 오보한다."""
+    return any(line.startswith(prefix) for line in calls(tmp).splitlines())
 
 
 # ── 1. happy path: exit 0 · 마커 생성 · ⑧ JSON · ⑦ --request-only(ⓓ) ──
@@ -392,7 +399,7 @@ os.chmod(_cys_stub, 0o755)
 code, out, err = run(env)
 check("5fb-p1 전제 미확인 → 부서 자동 생성 미진입(exit 10 세션 배선 오류)", code == 10, "exit=%d" % code)
 check("5fb-p2 allocate 미호출(없는 master 로 부서 만들지 않는다)",
-      "cys-dept allocate" not in calls(tmp), calls(tmp)[-300:])
+      not called(tmp, "cys-dept allocate"), calls(tmp)[-300:])
 bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
 check("5fb-p3 boot-last ok=null·state=session_error(공유 기록 오염 0)",
       bl.get("result", {}).get("ok") is None
@@ -403,10 +410,19 @@ shutil.rmtree(tmp)
 # ── 5-fb-q/r. ★L2 선행 claim 소비 핀(2026-08-16): 훅이 **조상 체인이 온전한 시점에** claim 을
 #    끝내고 판정을 env(CYS_CLAIM_RC)로 넘긴다. 부트는 그것을 소비하고 claim 을 다시 치지 않는다
 #    (분리된 이 프로세스가 다시 claim 하면 언제나 신원 미해석으로 거부된다 — 결함의 본체).
+def bind_claim(env, rc, out="(선행 claim 출력)"):
+    """훅이 싣는 **결박된** 선행 claim 판정(rc + surface 귀속 + 신선도).
+    결박 없는 rc 는 부트가 무시해야 한다(아래 5fb-s 핀)."""
+    env["CYS_CLAIM_RC"] = str(rc)
+    env["CYS_CLAIM_OUT"] = out
+    env["CYS_CLAIM_SID"] = env.get("CYS_SURFACE_ID", "7")
+    env["CYS_CLAIM_AT"] = str(int(time.time()))
+    return env
+
+
 tmp = tempfile.mkdtemp(prefix="boot-t5fbq-")
 env, home = make_env(tmp)
-env["CYS_CLAIM_RC"] = "0"
-env["CYS_CLAIM_OUT"] = "registered: master → surface:1"
+bind_claim(env, 0, "registered: master → surface:7")
 code, out, err = run(env)
 check("5fb-q1 선행 claim rc0 소비 → 체인 계속 exit 0", code == 0, "exit=%d err=%s" % (code, err[-300:]))
 check("5fb-q2 claim-role 재호출 없음(중복 claim 금지)",
@@ -417,12 +433,31 @@ tmp = tempfile.mkdtemp(prefix="boot-t5fbr-")
 env, home = make_env(tmp)
 env["CYS_DECL_ORIGIN"] = "hook-human"
 dept_sock, dept_pack = make_dept_fb_stubs(tmp, env, home)
-env["CYS_CLAIM_RC"] = "6"   # 발신 신원 미확정 — '다른 pane 이 master' 가 아니다
+bind_claim(env, 6)   # 발신 신원 미확정 — '다른 pane 이 master' 가 아니다
 code, out, err = run(env)
 check("5fb-r1 선행 claim rc6 → 세션 배선 오류 exit 10", code == 10, "exit=%d" % code)
 check("5fb-r2 rc6 은 부서 자동 생성으로 이어지지 않는다",
-      "cys-dept allocate" not in calls(tmp), calls(tmp)[-300:])
+      not called(tmp, "cys-dept allocate"), calls(tmp)[-300:])
 shutil.rmtree(tmp)
+
+# ── 5-fb-s. ★판정 결박 핀(2026-08-16 · L2 가 만든 신규 실패 클래스 봉인): 정수처럼 보이는 env
+#    하나로 claim 을 건너뛰면, 사용자 셸·래퍼에 남은 값이 **치지도 않은 claim 을 '실측'으로**
+#    boot-last 에 적는다(CS-3 보고=실측 위반). 결박(같은 surface·300s 신선도)이 없거나 어긋나면
+#    무시하고 직접 claim 해야 한다 — 하위호환이 곧 안전한 기본값이다.
+for _tag, _mut, _why in (
+    ("s1 결박 무(sid·at 부재)", lambda e: e.update({"CYS_CLAIM_RC": "0"}), "구 훅·수동 export"),
+    ("s2 타 surface 판정", lambda e: (bind_claim(e, 0), e.update({"CYS_CLAIM_SID": "99"})),
+     "남의 pane 판정 유입"),
+    ("s3 신선도 초과(1h 전)", lambda e: (bind_claim(e, 0), e.update(
+        {"CYS_CLAIM_AT": str(int(time.time()) - 3600)})), "낡은 판정 재사용"),
+):
+    tmp = tempfile.mkdtemp(prefix="boot-t5fbs-")
+    env, home = make_env(tmp)
+    _mut(env)
+    code, out, err = run(env)
+    check("5fb-%s → 무시하고 직접 claim(%s)" % (_tag, _why),
+          "cys claim-role" in calls(tmp), "calls=%s" % calls(tmp)[-200:])
+    shutil.rmtree(tmp)
 
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
 # ★마커를 실어 레인 게이트(_is_base_socket)를 실검증한다(2026-08-12 재검증 지적): 마커 없이

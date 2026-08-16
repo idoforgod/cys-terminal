@@ -368,6 +368,11 @@ CLAIM_OUT_RAW="$(cys_timeout_run "$CYS_CLAIM_TIMEOUT_S" cys claim-role master --
 CLAIM_RC=$?
 export CYS_CLAIM_RC="$CLAIM_RC"
 export CYS_CLAIM_OUT="$CLAIM_OUT_RAW"
+# ★판정 결박(무바인딩 env 금지): 부트는 이 두 값으로 "이 판정이 **이 surface** 의 것이고
+#   **방금** 난 것"임을 확인한 뒤에만 소비한다. 결박이 없으면 사용자 셸·래퍼에 남은 값이
+#   치지도 않은 claim 을 '실측'으로 둔갑시킨다(부트가 claim 을 건너뛰고 가짜 rc 를 기록).
+export CYS_CLAIM_SID="${CYS_SURFACE_ID:-}"
+export CYS_CLAIM_AT="$(date +%s 2>/dev/null || echo 0)"
 echo "[cys-hook] role-bootstrap: 선행 claim-role master → rc=$CLAIM_RC" >&2
 # 정직성 불변식(:63-66)의 입력 — 아래 주입문이 이 관측치로 서술 강도를 가른다.
 case "$CLAIM_RC" in

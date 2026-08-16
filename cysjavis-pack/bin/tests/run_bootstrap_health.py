@@ -1392,7 +1392,12 @@ def h_exit_3():
     src = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("fn run_claim_role(" in src, "claim-role 타입드 핸들러(run_claim_role)가 없다")
     i = src.find("fn run_claim_role(")
-    body = src[i:i + 3000]
+    # ★창 폭(2026-08-16): 종전 3000 은 함수 길이(≈2742)에 아슬아슬해, rc 6 분기가 들어오자
+    #   `" 3\n"` 오프셋이 2707 까지 밀렸다 — 산문 몇 줄만 더 붙으면 이 검체가 **결함 없이도**
+    #   적색이 되는 시한폭탄이었다. 창은 '함수 전체'를 덮도록 넉넉히 잡는다(판정 대상은 함수
+    #   본문이지 임의의 3000자가 아니다). 다음 fn 경계로 자르지 않는 이유는 이 파일의 다른
+    #   검체들과 같은 관용(고정 창)을 유지하기 위해서다.
+    body = src[i:i + 4500]
     for code, why in ((" 7\n", "정당거부"), (" 3\n", "미도달"), (" 2;\n", "식별불가(early)")):
         need(code in body or code.strip() in body, "claim-role 타입드 exit %s(%s) 부재" % (code.strip(), why))
     need('e.starts_with("claim_denied")' in body,
@@ -1487,10 +1492,15 @@ def h_ident_1():
     i_claim, i_spawn = hook.find("cys claim-role master"), hook.find("BOOT_ARGS=")
     need(0 <= i_claim < i_spawn,
          "선행 claim 이 spawn(분리 발화) **이후**에 있다 — 조상 체인이 이미 끊긴 뒤라 무의미하다")
+    need("export CYS_CLAIM_SID=" in hook and "export CYS_CLAIM_AT=" in hook,
+         "선행 claim 판정에 결박(surface 귀속·신선도)이 없다 — 셸에 남은 값이 "
+         "'치지도 않은 claim'을 실측으로 둔갑시킨다")
     bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
     need('os.environ.get("CYS_CLAIM_RC"' in bsrc, "부트가 선행 claim 판정을 소비하지 않는다")
+    need("_pre_bound" in bsrc and "CYS_CLAIM_SID" in bsrc and "CYS_CLAIM_AT" in bsrc,
+         "부트가 결박(surface·신선도) 검증 없이 판정을 소비한다(무바인딩 env 소비)")
     need("6: (\"발신 신원 미확정" in bsrc, "부트가 rc 6 의 정확한 처방을 분기하지 않는다")
-    notes.append("L2 훅 선행 claim(spawn 이전) + 부트 소비 + rc6 처방")
+    notes.append("L2 훅 선행 claim(spawn 이전)+결박 + 부트 소비 검증 + rc6 처방")
 
     # ── L3 폴백: '살아있는 master 존재'라는 전제를 실측으로 재확인 ──
     need("def _base_live_master(" in bsrc, "폴백 전제 실측 술어가 없다")
@@ -1502,7 +1512,13 @@ def h_ident_1():
     need(i_guard >= 0, "폴백이 전제(살아있는 master)를 실측하지 않는다 — 없는 master 로 부서 생성")
     need(i_alloc < 0 or i_guard < i_alloc,
          "전제 실측이 부서 allocate **이후**에 있다 — 이미 만들고 나서 재는 것은 가드가 아니다")
-    notes.append("L3 폴백: allocate 이전 전제 실측(측정 실패=미진입)")
+    need("def _live_master_from_status(" in bsrc,
+         "전제 판정이 순수 함수로 분리돼 있지 않다 — --self-test 로 핀할 수 없다")
+    need("_cys_status_json()" in bsrc[bsrc.find("def _base_live_master("):][:400],
+         "status 입구를 재구현했다(세 번째 리더) — 단일 SOT 규율 위반")
+    need("STEP.DEPT_FB_GUARD" in fb,
+         "폴백 미진입을 전용 단계로 적지 않는다 — 단계 순서 역행(order_violation) 재발")
+    notes.append("L3 폴백: allocate 이전 전제 실측(측정 실패=미진입)·순수 판정·전용 단계")
 
     # ── 계측 타당성: 구 트리에는 이 3겹이 **없어야** 한다(있으면 탐지기가 무엇도 못 잡는다) ──
     old_h = _git_show(os.path.join("src", "bin", "cysd", "handlers.rs"))
