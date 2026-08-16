@@ -100,6 +100,23 @@ jobs:
               sys.exit(1)
           PY
 
+      # ★P1-4(완전 초기화 시뮬레이션 확정 2026-08-16): `src/factory_reset.rs` 의 Windows 계약
+      #   (%LOCALAPPDATA% 상태 루트·`cysd.prev*.exe` 세대 잔재 판정·`bash "C:/…"` 훅 문자열·
+      #   디렉토리 심링크 제거·CREATE_NO_WINDOW)은 지금까지 **macOS 에서만** 검증됐다 —
+      #   이 파일 머리말이 말하는 "스텁 초록 ≠ 플랫폼 증명"의 정확한 재현이다. 완전 초기화는
+      #   전 데몬을 죽이고 사용자 데이터를 옮기는 최고 위험 등급이라, Windows 회귀를 잡지 못하는
+      #   게이트로는 출하할 수 없다. 대상을 `factory_reset::` 로 좁혀 예산을 지킨다.
+      #   ⚠이 스텝에 `if:` 조건을 달지 마라 — 위 잡 주석의 근거와 동일(돌지 않는 초록 금지).
+      - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test --lib factory_reset (Windows 실기)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # CYS_PACK_DIR 임시 격리 — W0-a 봉인(테스트가 라이브 ~/.cys/pack 접촉 금지) 충족.
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4

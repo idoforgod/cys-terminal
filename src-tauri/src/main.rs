@@ -1992,6 +1992,12 @@ async fn ensure_daemon() -> Result<(), String> {
     if connect().await.is_ok() {
         return Ok(());
     }
+    // ★A3(성찰 확정): 완전 초기화 진행 중에는 데몬을 스폰하지 않는다 — 이 경로가 리셋 도중
+    // cysd 를 되살리는 주 통로였다(부트 재시도 루프·재시작·drain 사이드카가 모두 여기로 온다).
+    // fail-open 판정(TTL·pid 생존)이라 리셋이 비정상 종료해도 다음 기동은 정상이다.
+    if cys::factory_reset::reset_in_progress() {
+        return Err("완전 초기화가 진행 중 — 데몬 기동을 보류한다(완료 후 앱을 다시 실행하라)".into());
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -2879,6 +2885,140 @@ fn dept_purge_preview_by_socket(socket: String) -> Result<Value, String> {
     }))
 }
 
+/// ★완전 초기화(팩토리 리셋) 프리뷰 — 읽기 전용(쓰기 0). 코어·인벤토리는 CLI `cys factory-reset`
+/// 과 동일한 `cys::factory_reset`(DESIGN-factory-reset.md) — GUI 는 표시·확인만 담당한다.
+/// 라이선스·미등록 파일(오너 배치 *.env 등) 보존이 코어 계약이라 GUI 가 따로 지킬 것이 없다.
+/// ★P0-2: 종전엔 집계 5개만 반환해 GUI 사용자가 **무엇이 사라지는지 볼 방법이 없었다**
+/// (같은 기능의 CLI `--plan` 은 전 경로를 찍는다 — 정보 비대칭). 이제 전 항목·강조 표식·
+/// report_only·사전점검·중단흔적·세션 수를 넘겨 모달이 승인 전에 다 보여준다.
+/// 또 `fn` 이라 대용량 재귀 stat 동안 창이 굳었다 — 실행 커맨드와 같은 `spawn_blocking` 으로.
+#[tauri::command]
+async fn factory_reset_preview() -> Result<Value, String> {
+    let live_sessions = live_session_count().await.unwrap_or(0);
+    let dept_count = list_depts()
+        .ok()
+        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()))
+        .unwrap_or(0);
+    tokio::task::spawn_blocking(move || {
+        let roots =
+            cys::factory_reset::ResetRoots::live().ok_or("홈 디렉토리를 해석할 수 없다")?;
+        let plan = cys::factory_reset::build_plan(
+            &roots,
+            &cys::factory_reset::ResetOptions {
+                purge_license: false,
+                purge_local: false,
+                purge_round: false,
+            },
+        );
+        Ok(json!({
+            "quarantine_count": plan.quarantine.len(),
+            "total_bytes": plan.quarantine_total_bytes(),
+            "trash_dir": plan.trash_dir.to_string_lossy(),
+            "quarantine": plan.quarantine.iter().map(|i| json!({
+                "path": i.path.to_string_lossy(),
+                "label": i.label,
+                "size_bytes": i.size_bytes,
+                "outside_state": i.outside_state,
+            })).collect::<Vec<_>>(),
+            "kept": plan.keep.iter().map(|k| json!({
+                "path": k.path.to_string_lossy(), "label": k.label,
+            })).collect::<Vec<_>>(),
+            "strip_profiles": plan.strip_settings.len(),
+            "report_only": plan.report_only,
+            "live_sessions": live_sessions,
+            "dept_count": dept_count,
+            "trash_root_ready": plan.trash_root_ready.is_ok(),
+            "trash_root_error": plan.trash_root_ready.as_ref().err(),
+            "interrupted_prior": plan.interrupted_prior.iter()
+                .map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// ★완전 초기화 실행 — 데몬 전멸(launchd 해제 우선·전멸 실측이 격리 하드 게이트) 후
+/// cys-trash/factory-reset-<UTC>/ 로 격리 + manifest + 훅·statusLine·스킬 심링크 해제.
+/// 진행은 `reset-progress` 이벤트({phase:"step",detail}), 결과는 반환 JSON(restore-progress 관례의
+/// invoke-반환 변형 — 장시간 단계가 kill 대기 ~12s 뿐이라 3-phase emit 전부는 과함).
+/// 실패는 Err 로 정직 표기(무음 삼킴 금지). 완료 후 앱 상태는 재시작 전까지 반쪽(데몬 없음)이므로
+/// UI 는 곧장 종료 안내 모달로 이어야 한다(factory_reset_quit_app).
+#[tauri::command]
+async fn factory_reset_execute(
+    app: AppHandle,
+    purge_license: bool,
+    purge_local: bool,
+) -> Result<Value, String> {
+    // ★가드 대칭(CLI 와 동일): pane 셸에서 앱을 띄웠다면 이 프로세스도 surface env 를 상속한다 —
+    // 그 경우 리셋이 자기 세션을 끊으므로 거부한다(CLI run_factory_reset 과 같은 근거).
+    if std::env::var("CYS_SURFACE_ID").map(|v| !v.is_empty()).unwrap_or(false) {
+        return Err(
+            "cys surface 안에서 기동된 앱에서는 완전 초기화를 실행할 수 없다 — 앱을 독립 실행하라"
+                .into(),
+        );
+    }
+    tokio::task::spawn_blocking(move || {
+        let roots =
+            cys::factory_reset::ResetRoots::live().ok_or("홈 디렉토리를 해석할 수 없다")?;
+        let plan = cys::factory_reset::build_plan(
+            &roots,
+            &cys::factory_reset::ResetOptions {
+                purge_license,
+                purge_local,
+                purge_round: false,
+            },
+        );
+        // ★P0-6: 격리 목적지를 못 쓰는 상태면 데몬을 건드리기 전에 거부한다.
+        if let Err(e) = &plan.trash_root_ready {
+            return Err(format!("격리 폴더를 쓸 수 없어 초기화를 시작하지 않는다: {e}"));
+        }
+        let mut progress = |phase: &str, detail: &str| {
+            let _ = app.emit("reset-progress", json!({"phase": phase, "detail": detail}));
+        };
+        // ★P0-1: RAII 센티널 — 조기 return·패닉에도 Drop 이 해제한다(잔존 시 데몬 기동 불가).
+        let _sentinel = cys::factory_reset::ResetSentinel::arm();
+        cys::factory_reset::stop_daemons_and_unregister(&plan, &mut progress).map_err(|e| {
+            // ★P0-6: 정지 단계가 이미 남긴 비가역 부수효과를 숨기지 않는다.
+            format!("{e}\n{}", cys::factory_reset::stop_side_effects_note())
+        })?;
+        let rep = cys::factory_reset::execute_quarantine(
+            &plan,
+            &roots,
+            &cys::factory_reset::live_pid_is_cysd,
+            &cys::factory_reset::live_any_cysd_running,
+            &mut progress,
+        )?;
+        Ok(json!({
+            "ok": rep.ok(),
+            "trash_dir": rep.trash_dir.to_string_lossy(),
+            "moved": rep.moved.len(),
+            "failed": rep.failed.iter().map(|(p, e)| json!({
+                "path": p.to_string_lossy(), "error": e,
+            })).collect::<Vec<_>>(),
+            "kept": rep.kept.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            "stripped": rep.stripped,
+            "revived_warning": rep.revived_warning,
+            "deferred": rep.deferred.iter().map(|(p, e)| json!({
+                "path": p.to_string_lossy(), "error": e,
+            })).collect::<Vec<_>>(),
+            "skipped_absent": rep.skipped_absent,
+            "manifest_written": rep.manifest_written,
+            "report_path": rep.trash_dir.join("REPORT.txt").to_string_lossy(),
+            "interrupted_prior": rep.interrupted_prior.iter()
+                .map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 완전 초기화 후 앱 종료 — `app.restart()` 는 single-instance 락 레이스(install_update 주석의
+/// 재활성화 경고)가 있어 쓰지 않는다. 정직한 종료 + "다시 실행하면 온보딩" 안내가 계약.
+#[tauri::command]
+fn factory_reset_quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 /// A안(2026-07-11 오너 승인): 교대·설치 게이트가 세는 "지킬 세션" = **role 또는 agent 가 붙은
 /// 살아있는 surface**만. 맨 셸 pane(role·agent 모두 없음)은 drain+restore 가 되살리므로 무손실
 /// 자동 교대를 막지 않는다 — 종전 '살아있는 pane 전부' 기준은 기본 pane 1개만으로 자동 교대가
@@ -3527,6 +3667,9 @@ fn main() {
             stop_dept_daemon_by_socket,
             purge_dept_daemon_by_socket,
             dept_purge_preview_by_socket,
+            factory_reset_preview,
+            factory_reset_execute,
+            factory_reset_quit_app,
             rotate_dept_daemon,
             list_depts,
             read_dept_catalog,
@@ -3606,6 +3749,16 @@ fn main() {
                 };
                 if result.is_err() {
                     for attempt in 1..=20u32 {
+                        // ★P1-3: 완전 초기화가 진행 중이면 데몬은 **일부러** 없는 것이다.
+                        // 이 루프가 그걸 모르고 "로그인 항목을 허용하세요"라는 엉뚱한 처방을
+                        // 완료 모달과 나란히 띄웠다(시뮬레이션 지적). 재시도를 즉시 접는다.
+                        if cys::factory_reset::reset_in_progress() {
+                            let _ = handle.emit(
+                                "daemon-error",
+                                "완전 초기화가 진행 중입니다 — 끝난 뒤 앱을 종료했다가 다시 실행하세요.".to_string(),
+                            );
+                            return;
+                        }
                         let _ = handle.emit(
                             "daemon-error",
                             format!("데몬 대기 중 — 재시도 {attempt}/20 (15초 간격)"),
@@ -3621,10 +3774,13 @@ fn main() {
                     }
                 }
                 if let Err(e) = result {
-                    let _ = handle.emit(
-                        "daemon-error",
-                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목에서 cys 백그라운드 항목을 허용한 뒤 앱을 다시 여세요."),
-                    );
+                    // ★P1-3: 리셋 중이면 원인이 다르다 — 처방도 달라야 한다.
+                    let msg = if cys::factory_reset::reset_in_progress() {
+                        "완전 초기화가 진행 중입니다 — 끝난 뒤 앱을 종료했다가 다시 실행하세요.".to_string()
+                    } else {
+                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목에서 cys 백그라운드 항목을 허용한 뒤 앱을 다시 여세요.")
+                    };
+                    let _ = handle.emit("daemon-error", msg);
                     return;
                 }
                 let _ = handle.emit("daemon-ready", ());
@@ -4286,6 +4442,43 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             "GUI purge 가 --purge-workdir 를 다시 요청함 — 홈 파괴 경로 재개방(실사고 2026-07-16 재발)"
         );
         assert!(seg.contains("--purge-state"), "purge 명령 골격 변형 — 트립와이어 재검토 필요");
+    }
+
+    /// ★완전 초기화 트립와이어(DESIGN-factory-reset.md §7): GUI 커맨드는 ①직접 rm 을 만들지
+    /// 않고(격리 독트린 — 삭제는 lib 코어의 mv·manifest 경로뿐) ②lib 코어(cys::factory_reset)에
+    /// 위임하며 ③부서 purge 실사고의 --purge-workdir 류 작업폴더 파괴 경로를 절대 열지 않는다.
+    #[test]
+    fn factory_reset_cmd_delegates_and_never_deletes_directly() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("async fn factory_reset_execute")
+            .expect("factory_reset_execute 정의 소실 — 트립와이어 재배선 필요");
+        let seg = &src[start..start + src[start..].find("\n#[tauri::command]").unwrap_or(src.len() - start)];
+        for banned in ["rm -rf", "remove_dir_all", "remove_file", "--purge-workdir"] {
+            assert!(
+                !seg.contains(banned),
+                "factory_reset_execute 가 '{banned}' 를 포함 — 격리 독트린 위반(직접 삭제 금지)"
+            );
+        }
+        assert!(
+            seg.contains("cys::factory_reset::execute_quarantine"),
+            "factory_reset_execute 가 lib 코어 위임을 벗어남 — 이중 구현 금지(계약: DESIGN-factory-reset.md)"
+        );
+        assert!(
+            seg.contains("stop_daemons_and_unregister"),
+            "정지 단계 소실 — 살아있는 데몬 밑에서 격리하는 경로가 열린다"
+        );
+        // ★P0-1: GUI 실행 경로도 RAII 센티널을 무장해야 한다(누락 시 리셋 중 데몬이 되살아나고,
+        // 실패 시 해제자가 없어 데몬 기동이 최대 15분 막힌다 — 시뮬레이션 확정 결함).
+        assert!(
+            seg.contains("ResetSentinel::arm()"),
+            "GUI 실행 경로에 센티널 무장이 없다(P0-1)"
+        );
+        // ★P0-6: 격리 목적지 사전 점검 없이 데몬을 죽이면 안 된다.
+        assert!(
+            seg.contains("trash_root_ready"),
+            "격리 폴더 사전 점검이 빠졌다 — 데몬만 죽이고 실패하는 경로가 열린다(P0-6)"
+        );
     }
 
     // ══════════════ 팀 부트 단일 계약(W4 · B5·B15·B16 · G34 GUI) ══════════════

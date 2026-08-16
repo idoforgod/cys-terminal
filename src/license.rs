@@ -53,6 +53,10 @@ pub enum LicenseStatus {
 /// 이 목록 경유로만 배선된다(T3에서 기능 추가 시 (이름, 설명) 등재).
 pub const PRO_FEATURES: &[(&str, &str)] = &[];
 
+/// 라이선스 파일 basename(§8-1 표면) — 정적 핀(license.json 리터럴은 license.rs에만)에 따라
+/// 파일명 지식이 필요한 외부 소비자(factory_reset의 "기본 보존" 판별)는 이 상수만 쓴다.
+pub const LICENSE_BASENAMES: [&str; 2] = ["license.json", "license.json.minisig"];
+
 /// 라이선스 파일 경로 — pack_dir 부모(~/.cys). pack 전체 교체·재설치와 독립인 위치
 /// (.pack-accepted.json과 동일 base — 팩 갱신이 라이선스를 건드리지 않는다).
 fn license_paths() -> (PathBuf, PathBuf) {
@@ -60,7 +64,7 @@ fn license_paths() -> (PathBuf, PathBuf) {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    (base.join("license.json"), base.join("license.json.minisig"))
+    (base.join(LICENSE_BASENAMES[0]), base.join(LICENSE_BASENAMES[1]))
 }
 
 /// 검증 코어(§4 ⓐ~ⓕ) — 키링·폐기 명단 주입형(테스트·프로덕션 동일 경로).

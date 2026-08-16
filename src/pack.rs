@@ -474,7 +474,17 @@ pub fn personal_profile_settings_paths() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
     };
-    let Ok(entries) = std::fs::read_dir(&home) else {
+    personal_profile_dirs_under(&home)
+        .into_iter()
+        .map(|d| d.join("settings.json"))
+        .collect()
+}
+
+/// 홈 직하 개인 Claude 프로필 **디렉토리**(`.claude` / `.claude-*`) 열거 — 홈 주입판.
+/// 소비자: 위 settings 경로 파생 + factory_reset(훅 strip·스킬 심링크 제거 대상 열거).
+/// 판별 규칙이 두 곳에 갈리면 등록과 해제가 서로 다른 프로필을 보게 되므로 여기 한 곳에만 둔다.
+pub fn personal_profile_dirs_under(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(home) else {
         return vec![];
     };
     let mut dirs_found: Vec<PathBuf> = entries
@@ -486,7 +496,7 @@ pub fn personal_profile_settings_paths() -> Vec<PathBuf> {
                 .unwrap_or(false)
                 && e.path().is_dir()
         })
-        .map(|e| e.path().join("settings.json"))
+        .map(|e| e.path())
         .collect();
     dirs_found.sort();
     dirs_found

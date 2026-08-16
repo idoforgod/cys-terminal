@@ -252,6 +252,20 @@ CYS_KILL_PAUSED_DENY = ("AUTOPILOT_PAUSED: cys %s 전면 금지 — pause 중 �
 #   ★LOOSE(평시)는 기존대로 allow — 주인님 직접 팩 업데이트가 사람 운영 경로다(막으면 자기잠금).
 CYS_PACK_MUTATING_SUBS = {"pack-update", "init-pack", "pack-rollback",
                           "pack-downgrade-to-free", "pack-merge"}
+
+# ★R-02b 완전 초기화 불가침 (2026-08-16 성찰 확정): `cys factory-reset` 은 팩 자기변경보다
+#   **강한** 파괴력이다 — guard.sh 를 포함한 팩 전체·전 부서·대화기억·훅 등록을 격리하고 전 데몬을
+#   죽인다(=오케스트레이션 자체의 소멸). R-02 가 "팩 재설치는 자기 안전장치 갈아끼우기라 무조건
+#   DENY" 라면, 이 명령은 그 안전장치를 **통째로 들어내는** 상위 클래스다.
+#   ★모드 무관 DENY 인 이유(R-02 와 다른 점): R-02 는 LOOSE 를 열어 뒀다 — 주인님의 팩 업데이트가
+#   사람 운영 경로이기 때문이다. 그러나 factory-reset 의 사람 운영 경로는 **에이전트 pane 밖**
+#   (GUI '완전 초기화' 버튼 · 외부 터미널)이고, CLI 자신도 pane 안 실행을 거부한다(cys.rs 자기살해
+#   방지 가드). 즉 pane 안에서 이 명령이 나오는 상황은 정상 운영에 존재하지 않으므로 평시에도 막는다.
+#   자기잠금 없음 — 주인님은 GUI 버튼·외부 터미널로 언제든 실행할 수 있다.
+CYS_OWNER_ONLY_SUBS = {"factory-reset"}
+CYS_OWNER_ONLY_DENY = ("[완전 초기화 불가침] cys %s 금지 — 전 데몬 종료 + 팩(guard.sh 포함)·부서·"
+                       "대화기억·훅 전량 격리는 에이전트가 실행할 명령이 아니다. 주인님이 직접 "
+                       "GUI '완전 초기화' 버튼 또는 **에이전트 pane 밖 터미널**에서 실행한다.")
 CYS_PACK_DENY = ("[부트스트랩 불가침] cys %s 금지 — 팩 자기변경(guard.sh 를 포함한 팩 전체 재설치·"
                  "복원)은 자율주행이 자기 안전장치를 갈아끼우는 경로다. 승인 경유로만 — 주인님 직접 "
                  "실행 또는 AUTOPILOT_ACTIVE 해제 후(평시 LOOSE 는 허용).")
@@ -666,6 +680,9 @@ def prog_allowed(prog, args):
         #   팩 자기변경은 대상·상태 판정 없이 무조건 deny(자율주행이 guard.sh 를 재설치하는 경로 봉인).
         if sub in CYS_PACK_MUTATING_SUBS:
             return False, CYS_PACK_DENY % sub
+        # ★R-02b: 완전 초기화는 모드 무관 DENY(위 상수 주석의 근거 — 사람 운영 경로가 pane 밖이다).
+        if sub in CYS_OWNER_ONLY_SUBS:
+            return False, CYS_OWNER_ONLY_DENY % sub
         return True, ""
     if prog == "find":
         if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprintf", "-fprint", "-fls") for a in args):
@@ -812,6 +829,9 @@ def loose_deny(n, n_slash=""):
                 ok, reason = cys_kill_allowed(sub, pos, sock)
                 if not ok:
                     return reason
+            # ★R-02b: 완전 초기화는 평시(LOOSE)에도 DENY — 사람 운영 경로가 pane 밖이라 자기잠금 0.
+            if sub in CYS_OWNER_ONLY_SUBS:
+                return CYS_OWNER_ONLY_DENY % sub
         if prog == "git":
             sub, subargs = l_git_sub(args)
             if sub == "push": return "git push (외부발행=비가역). 주인님 승인 필요"

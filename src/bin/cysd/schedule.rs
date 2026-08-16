@@ -404,6 +404,24 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     let mut state = load_state(daemon);
     state.schema_version = SCHEDULE_STATE_VERSION; // 구파일(0) → 현재 버전 스탬프(다음 save 시 영속)
     let mut dirty = false;
+    // ★P2-2 ⑥(완전 초기화 시뮬레이션 확정 2026-08-16): 상태 파일이 **없는 첫 가동**(신규 설치·
+    // 완전 초기화 직후)에는 last_fired 가 0이라 전 주기 잡의 만기가 **동시에** 성립한다. 그러면
+    // ①마스터가 있으면 6h·24h·주간 잡이 한꺼번에 주입돼 갓 각성한 마스터를 큐로 덮치고(폭주 결함군)
+    // ②마스터가 없으면 `if_absent: skip` 으로 전부 소인돼 다음 주기까지 침묵한다 — 어느 쪽도 의도가
+    // 아니다. 첫 가동에는 시계를 **지금**으로 맞춰 다음 주기부터 정상 리듬을 타게 한다.
+    // 실패 방향: 첫 주기 1회가 늦어질 뿐(보고성 잡이라 무해). 상태 파일이 있으면 전혀 관여하지 않는다.
+    if state.last_fired.is_empty() && !state_path(daemon).exists() {
+        for job in jobs.iter().filter(|j| j.every_minutes.is_some()) {
+            state.last_fired.insert(job.id.clone(), now_ts);
+        }
+        if !state.last_fired.is_empty() {
+            dirty = true;
+            eprintln!(
+                "[cysd] schedule: 첫 가동 — 주기 잡 {}개의 기준 시각을 now 로 초기화(동시 만기 방지)",
+                state.last_fired.len()
+            );
+        }
+    }
     let today = now.date_naive();
     for job in jobs {
         // 주기(every_minutes) job: 마지막 발화 후 N분 경과 시 반복 발화 (master 5분 보고 하트비트).
@@ -1300,6 +1318,29 @@ mod tests {
     }
 
     /// ★불변식 박제 (절대지침 — master 5분 주기 보고 하트비트):
+    /// ★P2-2 ⑥ 회귀: 첫 가동(상태 파일 부재)에서 주기 잡이 **동시에 만기**가 되면 안 된다.
+    /// 그 상태의 실제 피해는 두 갈래다 — 마스터가 있으면 큐 폭탄(폭주 결함군), 없으면
+    /// `if_absent: skip` 으로 전부 소인돼 다음 주기까지 침묵. 시드 후에는 어느 잡도 즉시 만기가
+    /// 아니어야 한다(다음 주기부터 정상 리듬).
+    #[test]
+    fn first_run_seeding_prevents_simultaneous_due() {
+        let now = 1_700_000_000i64;
+        let builtin = builtin_jobs();
+        let intervals: Vec<u64> = builtin
+            .iter()
+            .filter_map(|j| j.get("every_minutes").and_then(|v| v.as_u64()))
+            .collect();
+        assert!(intervals.len() >= 2, "주기 잡이 여럿이어야 이 회귀가 의미 있다");
+        // 시드 이전(last_fired=0): 전부 즉시 만기 — 이것이 결함 상태다.
+        assert!(intervals.iter().all(|m| interval_due(Some(*m), 0, now)));
+        // 시드 이후(last_fired=now): 어느 것도 즉시 만기가 아니다.
+        assert!(intervals.iter().all(|m| !interval_due(Some(*m), now, now)));
+        // 리듬은 유지된다 — 각자 자기 주기가 지나면 발화.
+        for m in intervals {
+            assert!(interval_due(Some(m), now, now + (m as i64) * 60));
+        }
+    }
+
     /// interval_due는 마지막 발화 후 every_minutes분 경과 시에만 true. 0·None은 비활성.
     #[test]
     fn interval_due_fires_every_n_minutes() {

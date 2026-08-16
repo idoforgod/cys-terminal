@@ -479,6 +479,20 @@ cys skill list / show <name> / run <name> / new   # 경험을 스킬로 영속·
   병합합니다.
 - 진단·수리: `cys doctor [--fix]` — 팩 스큐·stale lock·고아 소켓·훅 등록을 진단하고,
   `--fix`는 사용자 데이터·팩 본체·DB를 건드리지 않는 범위만 수리합니다.
+- **완전 초기화(팩토리 리셋)**: 연습으로 쌓인 부서·세션·대화기억·작업기억·훅을 한 번에
+  정리하고 "설치 초기 상태"로 되돌리려면 topbar **완전 초기화** 버튼 또는
+  `cys factory-reset`(미리보기 `--plan`, 쓰기 0). 즉시 삭제가 아니라
+  `~/.local/state/cys-trash/factory-reset-<시각>/`으로 **격리 보관**되어 그 안의
+  `manifest.json`(중도 중단 시 `journal.ndjson`)으로 되돌릴 수 있습니다.
+  보존되는 것: 라이선스, 직접 만든 오버레이 `~/.cys/local`(지침 append·스킬·훅),
+  `~/.cys`에 직접 넣은 파일(인증서 `.env` 등), 그리고 **사용자 프로젝트 폴더 안의
+  작업기억 `_round`**(어디에 남는지는 화면이 알려줍니다). 이것들까지 지우려면
+  `--purge-license`·`--purge-local`·`--purge-round`를 붙입니다.
+  되돌리기: `cys factory-reset --undo <격리폴더>` (격리 폴더의 `REPORT.txt`에 요약이 남습니다). 완료 후 앱을 다시 실행하면 온보딩이
+  처음부터 시작됩니다. ⚠ CLI로 실행할 때는 **앱을 먼저 종료**하세요(앱이 살아 있으면
+  초기화 도중 데몬을 되살립니다 — CLI가 이를 감지해 거부합니다).
+  ★에이전트(마스터·워커)는 이 명령을 실행할 수 없습니다 — 오너 전용입니다(guard.sh R-02b).
+  앱까지 지우는 완전 제거는 `docs/GUIDE-clean-reset-KR.md` 참조.
 
 ---
 
@@ -646,6 +660,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | 분류 | 명령 | 설명 |
 |---|---|---|
 | 기본 | `ping` `identify` `actions` `doctor` | 데몬 확인·자기 주소·명령 카탈로그·자기진단(`--fix`) |
+| 초기화 | `factory-reset` | 완전 초기화 — 사용 흔적 전량 격리 후 설치 초기 상태로(`--plan` 미리보기·`--verbose` 전량 목록·`--yes` 확인 생략·`--purge-license`·`--purge-local`·`--purge-round`). 되돌리기 `--undo <격리폴더>`. **오너 전용**(에이전트 pane 안 실행 거부) |
 | surface | `new-surface` `list` `attach` `read-screen` `resize` `close-surface` `quiesce` `tombstone` | 세션 생성·목록·미러링·화면 읽기·크기·닫기(자식 트리 전멸)·주입 보류·묘비 |
 | 통신 | `send` `send-key` `events` `watch` | stdin 주입·키 주입·이벤트 구독·regex 완료 대기 |
 | 역할·함대 | `launch-agent` `boot` `claim-role` `surface-role` `status` `fleet` `set-status` `todo-path` | 역할 노드 기동·일괄 부트·역할 등록/조회·관제 보드·자기보고·역할별 TODO 경로 |
@@ -798,6 +813,7 @@ todo.updated   approval.request   approval.stalled   master.deadman   osc.notify
 | macOS "손상되었기 때문에 열 수 없습니다" | **원인 두 가지 — ①반쪽 설치(덮어쓰기로 설치) ②quarantine/미공증.** ①이 훨씬 흔하다: 기존 `cys.app`을 **먼저 휴지통으로 옮긴 뒤** DMG에서 새로 드래그(덮어쓰기 금지 — 일부 파일만 막혀 세대 혼합 번들이 남는다). ②는 `xattr -d com.apple.quarantine /Applications/cys.app`. 원인 판별은 `cys doctor`(app-seal 항목)·`codesign --verify --strict /Applications/cys.app`. 전체 절차: `docs/INSTALL.md` → "손상되었기 때문에 열 수 없습니다" 해결 |
 | 앱이 *"설치본이 온전하지 않습니다 — 재설치 필요"* 안내를 띄움 | 기동 자기점검이 **빠진 구성요소를 이름으로** 찾아낸 것이다(반쪽 설치). 안내에 적힌 파일을 보고 위와 같은 절차로 **통째 재설치**한다. 번들 안 파일만 채워 넣는 부분 수리는 통하지 않는다(macOS 보호에 막히고, 막혀도 서명 봉인이 깨진 채 남는다). 설정·대화기록(`~/.cys`)은 번들 밖이라 보존된다 |
 | `cys ping` 실패 | 앱 실행(데몬 자동 기동) 또는 `cysd` 직접 기동. `cys doctor --fix` |
+| 연습 흔적(부서·세션·기억)이 자꾸 살아나 충돌 | topbar **완전 초기화** 버튼 또는 `cys factory-reset` — 사용 흔적 전부를 격리 보관하고 설치 초기 상태로(§11 "완전 초기화" 참조·격리 폴더 manifest.json으로 복구). 미리보기는 `cys factory-reset --plan`(쓰기 0). CLI 실행 전 앱 종료 필요 |
 | 데몬이 두 개 뜬 것 같음 | 실제로는 불가(중복 기동 거부). 업데이트 후 스큐 배지가 떠 있으면 클릭해 교대 |
 | 팩 업데이트가 거부됨 | 정상일 수 있음 — 서명·신선도·replay 검증은 fail-closed. `cys pack-update --dry-run`·`cys doctor`로 원인 확인 |
 | 노드에 메시지가 안 들어감 | 타이핑 가드(사람 입력 직후 3초)·ACL(`acl.denied` 이벤트)·kill-switch(`cys gate-check`) 순서로 확인 |

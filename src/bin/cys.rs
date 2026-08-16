@@ -496,6 +496,36 @@ enum Command {
         #[arg(long)]
         custom_report: bool,
     },
+    /// 완전 초기화(팩토리 리셋) — 연습·사용 흔적 전부(부서·세션·대화기억·상태·훅·스킬링크)를
+    /// cys-trash 로 격리하고 "설치 초기 상태"로 되돌린다. 라이선스·미등록 파일(오너 배치 *.env 등)은
+    /// 보존, 복구는 격리 폴더 manifest.json 역방향 mv(14일 후 reap 자동 소거). DESIGN-factory-reset.md
+    FactoryReset {
+        /// 쓰기 0 프리뷰 — 격리·보존·해제 계획만 표시하고 아무것도 바꾸지 않는다.
+        #[arg(long)]
+        plan: bool,
+        /// 확인 문구 입력 생략(스크립트용). 대화식에선 "완전 초기화" 정확 입력이 필요하다.
+        #[arg(long)]
+        yes: bool,
+        /// 계획·결과를 JSON으로 출력.
+        #[arg(long)]
+        json: bool,
+        /// 라이선스 파일도 격리한다(기본은 보존 — 구매물).
+        #[arg(long)]
+        purge_license: bool,
+        /// 직접 만든 오버레이(~/.cys/local — 지침 append·스킬·훅)도 격리한다(기본은 보존).
+        #[arg(long)]
+        purge_local: bool,
+        /// 사용자 프로젝트 폴더 안의 작업기억(_round)까지 격리한다(기본은 고지만 하고 남긴다).
+        #[arg(long)]
+        purge_round: bool,
+        /// 계획 목록을 접지 않고 전량 표시한다(기본은 큰 항목 8건 + 분류별 소계).
+        #[arg(long)]
+        verbose: bool,
+        /// 되돌리기 — 격리 폴더(cys-trash/factory-reset-*)의 복구 지도로 원위치 복원.
+        /// `--plan` 과 함께 쓰면 무엇이 복구되는지만 표시한다(쓰기 0).
+        #[arg(long, value_name = "TRASH_DIR")]
+        undo: Option<String>,
+    },
     /// Search the persistent transcript memory of ALL agents' terminal activity (FTS)
     Recall {
         /// Search text (substring matching via trigram FTS)
@@ -976,6 +1006,8 @@ fn main() {
             | Command::Daemon {
                 action: DaemonAction::Status
             }
+            // 완전 초기화는 데몬을 죽이는 명령 — 어떤 경로로도 자동 기동을 발화하면 안 된다.
+            | Command::FactoryReset { .. }
     ) {
         AUTOSTART.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1522,6 +1554,15 @@ fn connect() -> Result<ConnStream, String> {
                 || AUTOSTART_TRIED.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 return Err(first);
+            }
+            // ★A3(성찰 확정): 다른 프로세스가 완전 초기화를 **진행 중**이면 데몬을 되살리지
+            // 않는다 — 되살아난 cysd 가 격리와 경합하고(살아있는 DB 이동) phoenix 로 조직까지
+            // 복원해 "설치 초기 상태" 계약을 깬다. 판정은 fail-open(TTL·pid 생존)이라 리셋이
+            // 죽어도 다음 기동을 영구히 막지 않는다(부트 체인 불가침).
+            if cys::factory_reset::reset_in_progress() {
+                return Err(
+                    "완전 초기화가 진행 중이라 데몬을 기동하지 않는다 — 끝난 뒤 다시 실행하라".into(),
+                );
             }
             // launchd 위임 우선(macOS·적재 시). 실패 시 아래 sibling 경로로 폴백.
             #[cfg(target_os = "macos")]
@@ -2140,6 +2181,14 @@ fn run(command: Command) -> i32 {
             }
             return run_doctor(fix, json);
         }
+        Command::FactoryReset {
+            plan, yes, json, purge_license, purge_local, purge_round, verbose, undo,
+        } => {
+            if let Some(dir) = undo {
+                return run_factory_reset_undo(&dir, plan, yes, json);
+            }
+            return run_factory_reset(plan, yes, json, purge_license, purge_local, purge_round, verbose);
+        }
 
         Command::License { action } => {
             let now = chrono::Utc::now().timestamp();
@@ -2458,7 +2507,14 @@ fn stream_events(
             .as_ref()
             .and_then(|p| read_event_cursor(p).ok().flatten())
     });
+    // ★P1-3 ⑥: 완전 초기화 중이면 구독이 조용히 끊긴 것처럼 보인다(원인은 "데몬을 일부러 껐다").
+    // 사유를 한 번만 알리고, --reconnect 는 그대로 재시도해 초기화 후 자동 복귀시킨다.
+    let mut reset_notified = false;
     loop {
+        if cys::factory_reset::reset_in_progress() && !reset_notified {
+            eprintln!("[events] 완전 초기화가 진행 중 — 데몬이 없습니다. 끝나면 자동 재연결합니다.");
+            reset_notified = true;
+        }
         let attempt = (|| -> Result<(), String> {
             let mut stream = connect()?;
             let req = json!({
@@ -4360,6 +4416,380 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         // M3: 자기 앱 번들 코드서명 봉인(설치본이 스스로 봉인을 깼는지) — 읽기 전용, --fix 무관.
         diag_app_seal(ctx),
     ]
+}
+
+/// 사람용 바이트 표기(완전 초기화 프리뷰 전용 — 근사치로 충분).
+fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = b as f64;
+    let mut u = 0usize;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{b}B")
+    } else {
+        format!("{v:.1}{}", UNITS[u])
+    }
+}
+
+/// 완전 초기화 확인 문구 — GUI(resetconfirm.ts)와 동일 문자열 계약.
+const FACTORY_RESET_PHRASE: &str = "완전 초기화";
+
+fn factory_reset_plan_json(plan: &cys::factory_reset::ResetPlan) -> Value {
+    json!({
+        "stamp": plan.stamp,
+        "trash_dir": plan.trash_dir.to_string_lossy(),
+        "total_bytes": plan.quarantine_total_bytes(),
+        "quarantine": plan.quarantine.iter().map(|i| json!({
+            "path": i.path.to_string_lossy(), "label": i.label, "size_bytes": i.size_bytes,
+        })).collect::<Vec<_>>(),
+        "keep": plan.keep.iter().map(|i| json!({
+            "path": i.path.to_string_lossy(), "label": i.label,
+        })).collect::<Vec<_>>(),
+        "strip_settings": plan.strip_settings.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "strip_skill_dirs": plan.strip_skill_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "temp_sweep_count": plan.temp_sweep.len(),
+        "report_only": plan.report_only,
+        "purge_license": plan.purge_license,
+        "purge_local": plan.purge_local,
+        "purge_round": plan.purge_round,
+        "trash_root_ready": plan.trash_root_ready.is_ok(),
+        "trash_root_error": plan.trash_root_ready.as_ref().err(),
+        "interrupted_prior": plan.interrupted_prior.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+    })
+}
+
+/// 완전 초기화(팩토리 리셋) 실행기 — 코어는 cys::factory_reset(계약: DESIGN-factory-reset.md).
+/// exit: 0=성공(--plan 포함) · 1=부분 실패/확인 불일치/정지 실패 · 2=가드 거부.
+/// 되돌리기 — 격리 폴더의 복구 지도로 원위치 복원(P0: "복구 가능" 고지의 이행).
+fn run_factory_reset_undo(trash_dir: &str, plan_only: bool, yes: bool, json_out: bool) -> i32 {
+    let dir = std::path::PathBuf::from(shellexpand_home(trash_dir));
+    let plan = match cys::factory_reset::read_undo_plan(&dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if json_out {
+        println!("{}", json!({
+            "mode": if plan_only { "undo-plan" } else { "undo" },
+            "trash_dir": plan.trash_dir.to_string_lossy(),
+            "source": plan.source,
+            "restorable": plan.entries.len(),
+            "blocked": plan.blocked.iter().map(|(_, to)| to.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!("복구 계획 — {} (지도: {})", plan.trash_dir.display(), plan.source);
+        for (from, to) in &plan.entries {
+            println!("  복구  {} → {}", from.display(), to.display());
+        }
+        for (_, to) in &plan.blocked {
+            println!("  건너뜀 {} — 원위치에 이미 항목이 있다(덮어쓰지 않는다)", to.display());
+        }
+    }
+    if plan_only {
+        return 0;
+    }
+    if plan.entries.is_empty() {
+        println!("복구할 항목이 없다.");
+        return 0;
+    }
+    if !yes {
+        print!("복구를 실행하려면 y 를 입력: ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            eprintln!("중단(아무것도 변경되지 않음)");
+            return 1;
+        }
+    }
+    let mut progress = |_p: &str, d: &str| {
+        if !json_out {
+            println!("[undo] {d}");
+        }
+    };
+    let (restored, failed) = cys::factory_reset::execute_undo(&plan, &mut progress);
+    if json_out {
+        println!("{}", json!({
+            "mode": "undo", "restored": restored,
+            "failed": failed.iter().map(|(p, e)| json!({"path": p.to_string_lossy(), "error": e})).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!("\n복구 완료 — {restored}건 원위치");
+        for (p, e) in &failed {
+            eprintln!("  실패  {}: {e}", p.display());
+        }
+        println!("데몬·팩을 다시 세우려면 앱을 실행하거나 `cys init-pack && cys daemon install`");
+    }
+    if failed.is_empty() { 0 } else { 1 }
+}
+
+/// `~` 시작 경로를 홈으로 확장(셸을 거치지 않은 인자 대비).
+fn shellexpand_home(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(h) = dirs::home_dir() {
+            return h.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    p.to_string()
+}
+
+fn run_factory_reset(
+    plan_only: bool,
+    yes: bool,
+    json_out: bool,
+    purge_license: bool,
+    purge_local: bool,
+    purge_round: bool,
+    verbose: bool,
+) -> i32 {
+    // 자기 살해 방지: cys surface(데몬 PTY) 안에서 실행하면 데몬 kill 이 자기 세션을 끊는다.
+    if cys::env_compat(ENV_SURFACE_ID).filter(|v| !v.is_empty()).is_some() {
+        eprintln!(
+            "cys surface 안에서는 완전 초기화를 실행할 수 없다 — 데몬이 죽는 순간 이 세션도 \
+             끊긴다. 외부 터미널(맥 기본 터미널 등)이나 GUI '완전 초기화' 버튼에서 실행하라."
+        );
+        return 2;
+    }
+    let Some(roots) = cys::factory_reset::ResetRoots::live() else {
+        eprintln!("홈 디렉토리를 해석할 수 없다 — 완전 초기화 불가");
+        return 2;
+    };
+    // ★A3b(성찰 확정): GUI 앱이 떠 있으면 그 앱이 리셋 도중 데몬을 되살린다(부트 재시도 루프·
+    // 재시작 버튼·drain 사이드카). 프리뷰(--plan)는 읽기 전용이라 허용하고, 실집행만 거부한다.
+    if !plan_only && cys::factory_reset::gui_app_running() {
+        eprintln!(
+            "지금 켜져 있는 cys 앱의 상단바 '완전 초기화' 버튼을 쓰는 것이 가장 쉽다.\n\
+             터미널에서 실행하려면 앱을 먼저 종료하라(맥: ⌘Q 또는 메뉴 → 종료 / \
+             윈도: 창 닫기 후 작업 표시줄 아이콘 우클릭 → 종료).\n\
+             앱이 살아 있으면 초기화 도중 데몬을 되살려 격리와 경합한다."
+        );
+        return 2;
+    }
+    let opts = cys::factory_reset::ResetOptions { purge_license, purge_local, purge_round };
+    let plan = cys::factory_reset::build_plan(&roots, &opts);
+
+    if json_out && plan_only {
+        println!("{}", json!({"mode": "plan", "plan": factory_reset_plan_json(&plan)}));
+        return 0;
+    }
+    if !json_out {
+        println!("완전 초기화 계획 — 격리 {}건({}) → {}", plan.quarantine.len(),
+            fmt_bytes(plan.quarantine_total_bytes()), plan.trash_dir.display());
+        // ★P0-2: 사용자 폴더 안에서 사라지는 것은 **맨 앞에서 따로** 보여준다(묻히면 안 된다).
+        let outside: Vec<_> = plan.quarantine.iter().filter(|i| i.outside_state).collect();
+        if !outside.is_empty() {
+            println!("\n  ⚠ 내 폴더 안에서 사라지는 항목 — 승인 전에 반드시 확인하세요:");
+            for i in &outside {
+                println!("     {}  ({})", i.path.display(), fmt_bytes(i.size_bytes));
+            }
+            println!();
+        }
+        // ★P2-1: 34줄 평면 나열은 가장 아픈 항목(대화기억 1.5GB·프로젝트 작업기억)을 묻는다.
+        // 라벨별 소계 → 큰 것부터 상위 N → 나머지는 접는다(`--verbose` 로 전량).
+        {
+            let mut by_label: Vec<(String, usize, u64)> = Vec::new();
+            for i in &plan.quarantine {
+                match by_label.iter_mut().find(|(l, _, _)| *l == i.label) {
+                    Some(e) => {
+                        e.1 += 1;
+                        e.2 += i.size_bytes;
+                    }
+                    None => by_label.push((i.label.clone(), 1, i.size_bytes)),
+                }
+            }
+            by_label.sort_by(|a, b| b.2.cmp(&a.2));
+            println!("\n  분류별 소계:");
+            for (label, n, bytes) in &by_label {
+                println!("     {label}: {n}건 · {}", fmt_bytes(*bytes));
+            }
+            let mut items: Vec<&cys::factory_reset::PlanItem> = plan.quarantine.iter().collect();
+            items.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            let show = if verbose { items.len() } else { items.len().min(8) };
+            println!("\n  큰 항목부터:");
+            for i in items.iter().take(show) {
+                println!("     {}  ({}, {})", i.path.display(), i.label, fmt_bytes(i.size_bytes));
+            }
+            if show < items.len() {
+                println!("     …외 {}건 (전량 보기: --verbose)", items.len() - show);
+            }
+            println!();
+        }
+        for i in &plan.keep {
+            println!("  보존  {}  ({})", i.path.display(), i.label);
+        }
+        for s in &plan.strip_settings {
+            println!("  해제  {}  (cys 훅·statusLine 제거)", s.display());
+        }
+        for s in &plan.strip_skill_dirs {
+            println!("  해제  {}  (pack 스킬 심링크 제거)", s.display());
+        }
+        if !plan.temp_sweep.is_empty() {
+            println!("  소거  임시 캐시 {}건 ($TMPDIR)", plan.temp_sweep.len());
+        }
+        for r in &plan.report_only {
+            println!("  안내  {r}");
+        }
+        for d in &plan.interrupted_prior {
+            println!("  ⚠ 이전 초기화가 중단된 흔적: {} (복구 지도 journal.ndjson)", d.display());
+        }
+        println!(
+            "  복구  cys factory-reset --undo {}  (또는 그 폴더의 manifest.json / journal.ndjson 을 역방향 mv)",
+            plan.trash_dir.display()
+        );
+        println!("        격리본은 약 14일 뒤 정리 작업에서 소거될 수 있습니다(직접 지우려면 rm -rf).");
+    }
+    // ★P0-6: 격리 목적지가 못 쓰는 상태면 **데몬을 건드리기 전에** 거부한다.
+    if let Err(e) = &plan.trash_root_ready {
+        eprintln!("\n격리 폴더를 쓸 수 없어 초기화를 시작하지 않는다: {e}");
+        return 2;
+    }
+    if plan_only {
+        // ★P0-2/P2: 프리뷰만 본 사용자가 놓치던 정보(재로그인·비가역·다음 행동)를 마무리에 싣는다.
+        if !json_out {
+            println!("\n⚠ 실행하면: 열려 있던 세션이 저장 신호 없이 즉시 종료되고, 에이전트 계정 \
+로그인(~/.cys/claude*)이 격리되어 재로그인이 필요합니다.");
+            println!("쓰기 0 — 아무것도 변경되지 않았습니다.");
+            println!("실제로 실행하려면: cys factory-reset   (cys 앱은 먼저 종료)");
+        }
+        return 0;
+    }
+
+    if json_out && !yes {
+        // 계약 정합: `--json` 은 기계 소비용인데 확인 프롬프트가 stdout 을 오염시키고 stdin 을
+        // 블록한다. 조용히 섞지 말고 명시적으로 거부한다(무음 오염 금지).
+        eprintln!("--json 실집행은 --yes 와 함께 써야 한다(확인 프롬프트가 JSON 출력을 오염시킨다)");
+        return 2;
+    }
+    if !yes {
+        println!(
+            "\n⚠ 지금 열려 있는 세션(마스터·워커·부서)이 **저장 신호 없이 즉시 종료**된다 — \
+중요한 작업은 먼저 마무리하라.\n\
+             모든 부서·대화기억·작업기억이 격리되고 설치 초기 상태로 돌아간다.\n\
+             에이전트 계정 로그인(~/.cys/claude*)도 격리되어 재로그인이 필요하다."
+        );
+        // ★P2-1: 따옴표 동반 복사·NFD 자모·NBSP/전각/ZWSP 는 육안상 같은 입력이므로 같게 받고
+        // (normalize_confirm_phrase), 틀리면 **사유를 말하고 최대 3회** 다시 받는다.
+        // 종전엔 한 번 어긋나면 즉시 exit 1 이라, 프롬프트가 유도한 따옴표 복사로도 튕겼다.
+        use std::io::Write;
+        let want = cys::factory_reset::normalize_confirm_phrase(FACTORY_RESET_PHRASE);
+        let mut ok = false;
+        for attempt in 1..=3 {
+            print!("실행하려면 {FACTORY_RESET_PHRASE} 를 그대로 입력({attempt}/3): ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() || line.is_empty() {
+                break; // EOF(파이프·Ctrl-D) — 대화가 불가능하므로 중단.
+            }
+            let got = cys::factory_reset::normalize_confirm_phrase(&line);
+            if got == want {
+                ok = true;
+                break;
+            }
+            if got.is_empty() {
+                eprintln!("  입력이 비어 있다.");
+            } else {
+                eprintln!("  입력 \"{got}\" 는 \"{FACTORY_RESET_PHRASE}\" 와 다르다(띄어쓰기까지 그대로).");
+            }
+        }
+        if !ok {
+            eprintln!("문구 불일치 — 중단(아무것도 변경되지 않음)");
+            return 1;
+        }
+    }
+
+    let mut progress = |phase: &str, detail: &str| {
+        if !json_out {
+            println!("[{phase}] {detail}");
+        }
+    };
+    // ★P0-1: 여기서 센티널을 무장한다(RAII — 조기 return·패닉에도 Drop 이 해제).
+    let _sentinel = cys::factory_reset::ResetSentinel::arm();
+    if let Err(e) = cys::factory_reset::stop_daemons_and_unregister(&plan, &mut progress) {
+        eprintln!("정지 실패: {e}");
+        // ★P0-6: 이미 일어난 비가역 부수효과를 숨기지 않는다("실패=원래대로"라는 오해 차단).
+        eprintln!("{}", cys::factory_reset::stop_side_effects_note());
+        return 1;
+    }
+    match cys::factory_reset::execute_quarantine(
+        &plan,
+        &roots,
+        &cys::factory_reset::live_pid_is_cysd,
+        &cys::factory_reset::live_any_cysd_running,
+        &mut progress,
+    ) {
+        Ok(rep) => {
+            if json_out {
+                println!("{}", json!({
+                    "mode": "reset",
+                    "ok": rep.ok(),
+                    "trash_dir": rep.trash_dir.to_string_lossy(),
+                    "moved": rep.moved.len(),
+                    "failed": rep.failed.iter().map(|(p, e)| json!({
+                        "path": p.to_string_lossy(), "error": e,
+                    })).collect::<Vec<_>>(),
+                    "kept": rep.kept.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                    "stripped": rep.stripped,
+                    "temp_swept": rep.temp_swept,
+                    "deferred": rep.deferred.iter().map(|(p, e)| json!({
+                        "path": p.to_string_lossy(), "error": e,
+                    })).collect::<Vec<_>>(),
+                    "revived_warning": rep.revived_warning,
+                    "skipped_absent": rep.skipped_absent,
+                    "manifest_written": rep.manifest_written,
+                    "interrupted_prior": rep.interrupted_prior.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                }));
+            } else {
+                // ★P0-4: 예고 건수와 완료 건수의 차이를 **분해해서** 보여준다(설명 없는 불일치 금지).
+                println!(
+                    "\n완전 초기화 {} — 이동 {}건 · 이미 없음 {}건 · 이연 {}건 · 실패 {}건 → {}",
+                    if rep.ok() { "완료" } else { "부분 완료" },
+                    rep.moved.len(),
+                    rep.skipped_absent,
+                    rep.deferred.len(),
+                    rep.failed.len(),
+                    rep.trash_dir.display()
+                );
+                if !rep.manifest_written {
+                    eprintln!("  ⚠ 복구 지도(manifest.json)를 쓰지 못했다 — journal.ndjson 이 유일한 지도다");
+                }
+                for (p, e) in &rep.failed {
+                    eprintln!("  실패  {}: {e}", p.display());
+                }
+                for s in &rep.stripped {
+                    println!("  해제  {s}");
+                }
+                for (p, e) in &rep.deferred {
+                    println!("  이연  {} ({e}) — 앱 종료 후 다시 실행하면 정리된다", p.display());
+                }
+                if let Some(w) = &rep.revived_warning {
+                    eprintln!("  ⚠ {w}");
+                }
+                for d in &rep.interrupted_prior {
+                    println!("  ⚠ 이전 중단 흔적: {} (복구 지도 journal.ndjson)", d.display());
+                }
+                println!(
+                    "\n결과 요약 파일: {}/REPORT.txt (화면이 사라져도 여기 남는다)\n\
+                     다음 앱 실행 시 설치 온보딩이 처음부터 시작된다.\n\
+                     CLI 재구성: cys init-pack && cys daemon install\n\
+                     되돌리기: cys factory-reset --undo {}",
+                    rep.trash_dir.display(),
+                    rep.trash_dir.display()
+                );
+            }
+            if rep.ok() { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!("완전 초기화 실패(격리 시작 전 중단): {e}");
+            eprintln!("{}", cys::factory_reset::stop_side_effects_note());
+            1
+        }
+    }
 }
 
 fn run_doctor(fix: bool, json_out: bool) -> i32 {

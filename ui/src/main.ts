@@ -14,6 +14,16 @@ import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
+import {
+  RESET_PHRASE,
+  resetPhraseMatches,
+  resetMismatchHint,
+  resetNoticeLines,
+  resetResultTitle,
+  resetResultBody,
+  type ResetPreview,
+  type ResetResult,
+} from "./resetconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
@@ -3347,6 +3357,8 @@ function openThemePopover(anchor: HTMLElement) {
   window.addEventListener("keydown", onKey, true);
 }
 
+/// ⚠ 내부 복구 경로(마지막 탭 닫힘·purge 후 빈 목록)도 이 함수를 부른다 — 여기서 던지거나
+/// 막으면 그 복구가 깨진다. 리셋 가드는 **사용자 진입점**(btn-ws-new·팔레트)에만 배선한다(P1-3).
 async function addWorkspace(): Promise<Workspace> {
   const sid = await newSurface();
   const ws: Workspace = { id: wsCounter++, name: UNTITLED, tree: { type: "pane", sid } };
@@ -3375,6 +3387,11 @@ function deptNameFromSocket(sock: string | undefined): string | null {
 // ② 고아 방지(안 A): 빈 newSurface를 만들지 않는다. cys-dept가 띄우는 role=master surface가
 //    refreshPaneTitles 자동입양으로 '첫 pane'이 되게 한다(빈 셸 미생성 → 고아 0).
 async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
+  // ★A4(성찰 확정): 이 경로는 **새 부서 cysd 를 spawn** 한다(allocate_dept_daemon→cys-dept launch) —
+  // 리셋 진행/완료 중이면 격리 게이트를 Err 로 만들어 리셋을 반토막 내거나, 격리로 옮겨지는
+  // ~/.cys·state 밑에 레지스트리를 재생성한다. 그래서 **모든 호출부가 daemonActionBlocked()로
+  // 먼저 막는다**(여기서 throw 하지 않는 이유: 팔레트 경로가 미처리 rejection이 된다).
+  // 신규 호출부를 추가하면 그 진입점에도 같은 가드를 반드시 배선하라.
   // 클릭 즉시 placeholder 탭(tree:null·socket 미정) push+render — launch await 동안 시각 피드백 제공.
   // 번호는 백엔드 allocate(레지스트리 flock RMW)가 확정하므로 placeholder name은 미정("…")으로 두고
   // 반환 info.name으로 확정한다(UI 번호 계산 폐기 → lowest-unused 재사용·멀티창 충돌0).
@@ -3446,6 +3463,9 @@ async function newSurface(cwd: string | null = null, socket?: string): Promise<n
 // 피닉스 복원 후에도 새 워크스페이스·pane은 항상 홈에서 시작. 첫 pane 경로 상속 폐기)
 
 async function actionNew() {
+  // ★P1-3: 리셋 진행/완료(래치) 중에는 새 pane 을 만들지 않는다. 종전엔 완료 후 '나중에'를
+  // 고른 사용자가 + New·Split 를 눌러도 **토스트 하나 없이 무반응**이라 앱이 죽은 것처럼 보였다.
+  if (daemonActionBlocked()) return;
   if (current()?.pending) return; // 부서 데몬 준비 중(빈 socket placeholder) — surface 생성 금지(기본 데몬 고아 차단)
   const sid = await newSurface(null, current().socket);
   const ws = current();
@@ -3457,6 +3477,7 @@ async function actionNew() {
 }
 
 async function actionSplit(dir: "row" | "col") {
+  if (daemonActionBlocked()) return; // ★P1-3: 리셋 진행/완료 중 분할 차단(무반응 금지)
   const ws = current();
   // stale focusedSid 검증 — 트리에 없는 대상을 분할하면 replaceNode가 무음 no-op 되어
   // 보이지 않는 고아 surface(살아있는 PTY)가 생긴다
@@ -4089,6 +4110,9 @@ async function checkForUpdate(silent: boolean) {
 /// 데몬 핸드오프 → 앱 재시작(부서·노드는 피닉스·resume으로 자동 복원). 진행 표시는
 /// update-progress 리스너("upd-bin" sticky)가 전담한다.
 async function promptBinaryPatch() {
+  // ★A7(성찰 확정): install_update 는 앱을 교체·재시작한다 — 리셋 실행 중이면 격리 스레드가
+  // 중도 사멸해 manifest(복구 지도) 없는 반쪽 격리가 남는다. 완료 래치 상태에서도 무의미하다.
+  if (daemonActionBlocked()) return;
   if (!updateAvailable) {
     await checkForUpdate(false);
     return;
@@ -4120,6 +4144,32 @@ let rotatingDaemon = false;
 // ★[F3] 부서 완전 폐역(purge) 진행 플래그 — purge와 데몬 교대(restart)는 같은 부서 데몬을 동시에 건드리면
 // 경합한다. purge는 rotatingDaemon을, restart는 purgingDept를 서로 존중해 상호 배제한다.
 let purgingDept = false;
+// ★완전 초기화(팩토리 리셋) 진행 플래그 — 리셋은 전 데몬을 죽이므로 restart(부활)·purge와
+// 절대 겹치면 안 된다. 세 플래그가 서로를 존중한다(F3 상호 배제 확장).
+let factoryResetting = false;
+// ★A6(성찰 확정): 리셋 **성공 후 래치**. 성공 시점부터 이 앱 프로세스는 "설치 직후"를 향한
+// 반쪽 상태(pack·훅·launchd 부재)다 — 여기서 데몬을 되살리면 pack 없는 유령 데몬이 서고
+// 다음 실행 온보딩이 살아있는 데몬 위로 겹쳐 돈다(설계 §4 계약 침식). 종료 전까지 데몬을
+// 생성·부활시키는 모든 경로를 영구 차단한다(플래그는 성공 경로에서 절대 해제되지 않는다).
+let resetCompleted = false;
+
+// 데몬 생성·부활 액션이 막힌 사유 — 세 진행 플래그·완료 래치를 하나의 안내 문구로.
+function daemonActionBlockedMsg(): string {
+  if (resetCompleted)
+    return "완전 초기화가 끝났습니다 — 앱을 종료하세요. 다시 실행하면 설치 온보딩이 시작됩니다.";
+  if (factoryResetting) return "완전 초기화가 진행 중입니다 — 끝날 때까지 기다려 주세요.";
+  if (purgingDept) return "부서 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.";
+  return "데몬 교대·재시작이 진행 중입니다 — 잠시 후 다시 시도하세요.";
+}
+
+// 데몬을 새로 만들거나 되살리는 액션의 공통 진입 가드(true면 차단·안내 완료).
+function daemonActionBlocked(): boolean {
+  if (rotatingDaemon || purgingDept || factoryResetting || resetCompleted) {
+    toast("feed", "실행 불가", daemonActionBlockedMsg());
+    return true;
+  }
+  return false;
+}
 let verSkewBadge: HTMLElement | null = null;
 let skewNoticeShown = false; // C: 세션당 1회 능동 안내 플래그(스큐 해소 시 리셋)
 
@@ -4214,9 +4264,11 @@ function showSkewBadge(
 
 // 배지 클릭(수동) — 확인 1회 후 force=true로 순차 교대(메인→부서). app.restart 없는 경로라 토스트까지 책임.
 async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: SkewedDept[]) {
-  if (rotatingDaemon) {
+  // ★A3(성찰 확정): purge·완전 초기화 중에도 막는다 — 이 경로는 rotate_daemon→ensure_daemon 으로
+  // cysd 를 **되살리므로**, 리셋 진행 중 클릭되면 격리와 경합하거나 리셋을 반토막으로 중단시킨다.
+  if (rotatingDaemon || purgingDept || factoryResetting || resetCompleted) {
     // 리뷰 2R MIN-C: 자동 교대·주기 재검 진행 중 클릭이 조용히 무시돼 "안 눌림"으로 보이던 무피드백 해소.
-    toast("feed", "교대 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    toast("feed", "교대 불가", daemonActionBlockedMsg());
     return;
   }
   const nodes = (heldMain ? 1 : 0) + heldDepts.length;
@@ -4334,11 +4386,9 @@ function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
 // cys 코어가 --verify를 미지원하면(구버전) plain drain 폴백(skipDrain=false)+경고. '무손실' 표현 금지 —
 // 대화 원문은 트랜스크립트 복원, 이 기능은 증류 체크포인트(SESSION_STATE·TODO) 최신성만 보증한다.
 async function manualRestartAllDaemons() {
-  if (rotatingDaemon || purgingDept) {
-    // ★[F3] 부서 완전 폐역(purge) 진행 중이면 같은 부서 데몬 경합을 피해 재시작을 보류·안내.
-    toast("feed", "작업 진행 중", "데몬 교대 또는 부서 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
-    return;
-  }
+  // ★[F3]+A6: purge·완전 초기화 진행 중이거나 **초기화 완료 래치**가 걸렸으면 재시작을 막는다
+  // (완료 후 재시작은 pack 없는 유령 데몬을 세워 "설치 직후" 계약을 무음 침식한다).
+  if (daemonActionBlocked()) return;
   const ok = await confirmModal(
     "데몬 재시작",
     "재시작 전에 각 노드의 체크포인트(SESSION_STATE·TODO) 저장을 먼저 검증합니다. 검증이 끝나면 데몬(메인+부서)을 " +
@@ -4398,7 +4448,7 @@ async function manualRestartAllDaemons() {
 
 // 시작 시 1회 + 5분 주기(B) — 스큐 재검·배지 멱등 갱신·무손실 자동 교대·1회 능동 안내(C).
 async function checkVersionSkew() {
-  if (rotatingDaemon || purgingDept) return; // 교대·purge 진행 중 중복 발동 방지(주기 타이머·수동 클릭) [F3]
+  if (rotatingDaemon || purgingDept || factoryResetting || resetCompleted) return; // 교대·purge·초기화 진행/완료 중 중복 발동 방지(주기 타이머·수동 클릭) [F3+A6]
   let appVer = "";
   try {
     appVer = (await invoke("app_version")) as string;
@@ -4448,6 +4498,8 @@ async function checkVersionSkew() {
 /// 진행/완료/경고는 pack-progress·pack-updated·update-warning 리스너가 표시한다(아래 startup).
 /// ★"재시작" 확인 다이얼로그를 띄우지 않는다 — 세션이 죽지 않는 게 바이너리 경로와의 핵심 차이.
 async function promptPackInstall() {
+  // ★A7: 팩 설치는 격리로 이동 중인 ~/.cys/pack 을 재생성한다 — 리셋 진행/완료 중 금지.
+  if (daemonActionBlocked()) return;
   if (!packUpdateAvailable) {
     await checkForUpdate(false);
     return;
@@ -4718,7 +4770,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
-    { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => addDeptWorkspace() },
+    { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => { if (daemonActionBlocked()) return; void addDeptWorkspace(); } },
   );
   return items;
 }
@@ -4806,17 +4858,25 @@ async function openPalette() {
 
 // ★확인 버튼 라벨 매개변수화(오너 2026-07-15 실보고): 업데이트 창용 "설치" 하드코딩이 모든
 // 확인 창에 노출(완전 삭제 창의 확인 버튼이 "설치"로 표시). 호출부가 동작 동사를 지정한다.
-function confirmModal(title: string, body: string, yesLabel = "확인"): Promise<boolean> {
+/// `noLabel` — 거절 버튼 라벨(기본 "아니오"). 완료 보고형 모달에서 "아니오"는 의미가 어긋나
+/// "나중에" 처럼 상황에 맞는 말이 필요하다(P0-4 시뮬레이션 지적). 본문은 길어질 수 있어 스크롤한다.
+function confirmModal(
+  title: string,
+  body: string,
+  yesLabel = "확인",
+  noLabel = "아니오",
+): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     ov.innerHTML =
-      `<div class="modal"><h3></h3><p></p>` +
-      `<div class="modal-btns"><button class="modal-no">아니오</button>` +
+      `<div class="modal"><h3></h3><p style="white-space:pre-wrap;max-height:52vh;overflow-y:auto"></p>` +
+      `<div class="modal-btns"><button class="modal-no"></button>` +
       `<button class="modal-yes"></button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = title;
     (ov.querySelector("p") as HTMLElement).textContent = body;
     (ov.querySelector(".modal-yes") as HTMLElement).textContent = yesLabel;
+    (ov.querySelector(".modal-no") as HTMLElement).textContent = noLabel;
     const done = (v: boolean) => {
       ov.remove();
       resolve(v);
@@ -4948,10 +5008,21 @@ function purgeConfirmModal(
       yes.disabled = !purgeNameMatches(inp.value, name);
       hint.textContent = purgeMismatchHint(inp.value, name);
     });
+    let onKey: ((e: KeyboardEvent) => void) | null = null;
     const done = (v: boolean) => {
+      if (onKey) document.removeEventListener("keydown", onKey, true);
       ov.remove();
       resolve(v);
     };
+    // Esc = 취소. 파괴적 다이얼로그가 "닫히지 않는 창"으로 보이지 않게(초보 시뮬레이션 지적).
+    onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        done(false);
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
     yes.addEventListener("click", () => {
       if (!yes.disabled) done(true);
     });
@@ -4968,11 +5039,8 @@ function purgeConfirmModal(
 // 기존 close(2-click 대체) 경로와 별개: 이건 대화기억까지 격리하고 부활을 영구 차단한다(javis_org destroy).
 async function purgeDept(ws: Workspace) {
   if (!ws.socket) return;
-  // ★[F3] 데몬 교대(restart)나 다른 purge가 진행 중이면 같은 부서 데몬 경합을 피해 거부·안내.
-  if (rotatingDaemon || purgingDept) {
-    toast("feed", "작업 진행 중", "데몬 재시작 또는 다른 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
-    return;
-  }
+  // ★[F3] 데몬 교대(restart)·완전 초기화가 진행/완료 상태면 같은 부서 데몬 경합을 피해 거부·안내.
+  if (daemonActionBlocked()) return;
   let info: {
     name?: string;
     size_bytes?: number;
@@ -5047,6 +5115,162 @@ async function purgeDept(ws: Workspace) {
   }
 }
 
+// ★완전 초기화(팩토리 리셋) 확인 — 고정 문구 타이핑 일치 시에만 활성(resetconfirm.ts 순수 판정).
+// purgeConfirmModal 규약 계승: textContent 주입(XSS-safe)·자동교정 차단·불일치 사유 표시·정직 고지.
+function factoryResetConfirmModal(info: ResetPreview): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.innerHTML =
+      `<div class="modal"><h3></h3>` +
+      // 고지문이 길어졌으므로(경로·강조·안내) 본문만 스크롤시킨다 — 확인 입력·버튼은 항상 보인다.
+      `<p class="modal-label" style="white-space:pre-wrap;max-height:46vh;overflow-y:auto"></p>` +
+      `<input class="modal-input" type="text" />` +
+      `<div class="modal-hint" aria-live="polite"></div>` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes" disabled>완전 초기화</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = "완전 초기화(팩토리 리셋) — 설치 초기 상태로";
+    (ov.querySelector(".modal-label") as HTMLElement).textContent = resetNoticeLines(info).join("\n\n");
+    const inp = ov.querySelector(".modal-input") as HTMLInputElement;
+    const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
+    const hint = ov.querySelector(".modal-hint") as HTMLElement;
+    for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);
+    inp.placeholder = RESET_PHRASE;
+    inp.addEventListener("input", () => {
+      yes.disabled = !resetPhraseMatches(inp.value);
+      hint.textContent = resetMismatchHint(inp.value);
+    });
+    const done = (v: boolean) => {
+      ov.remove();
+      resolve(v);
+    };
+    yes.addEventListener("click", () => {
+      if (!yes.disabled) done(true);
+    });
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(false));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(false);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => inp.focus(), 50);
+  });
+}
+
+// ★완전 초기화 실행 — 프리뷰(쓰기 0) → 문구 확인 → factory_reset_execute(코어=cys::factory_reset:
+// 데몬 전멸 하드 게이트 → cys-trash 격리+manifest → 훅·스킬링크 해제) → 종료 안내.
+// 완료 후 데몬이 없으므로 앱은 반쪽 상태 — 곧장 종료를 권한다(재실행 시 설치 온보딩).
+async function factoryResetFlow() {
+  if (daemonActionBlocked()) return;
+  let info: {
+    quarantine_count?: number;
+    total_bytes?: number;
+    trash_dir?: string;
+    quarantine?: { path: string; label: string; size_bytes: number; outside_state?: boolean }[];
+    kept?: { path: string; label: string }[];
+    strip_profiles?: number;
+    report_only?: string[];
+    live_sessions?: number;
+    dept_count?: number;
+    trash_root_ready?: boolean;
+    trash_root_error?: string | null;
+    interrupted_prior?: string[];
+  } = {};
+  // ★P0-2: 프리뷰는 전 트리 재귀 stat 이라 수 초 걸린다 — 무피드백이면 "버튼이 안 눌렸다"로
+  // 보여 재클릭을 부른다(백엔드는 spawn_blocking 이라 창은 굳지 않는다).
+  stickyToast("reset-preview", "feed", "⟲ 격리 대상 계산 중", "무엇이 지워지는지 확인하는 중…");
+  try {
+    info = (await invoke("factory_reset_preview", {})) as typeof info;
+  } catch (e) {
+    dismissToast("reset-preview");
+    toast("watchdog", "초기화 프리뷰 실패", `${e} — 초기화를 중단합니다. 다시 시도해 주세요.`);
+    return;
+  }
+  dismissToast("reset-preview");
+  // ★P0-6: 격리 폴더를 못 쓰는 상태면 **모달을 띄우지 않고** 사전 거부한다(데몬 무접촉).
+  if (info.trash_root_ready === false) {
+    toast(
+      "watchdog",
+      "초기화를 시작할 수 없습니다",
+      `${info.trash_root_error ?? "격리 폴더를 쓸 수 없습니다"} — 해결한 뒤 다시 시도하세요.`,
+    );
+    return;
+  }
+  const preview: ResetPreview = {
+    quarantineCount: info.quarantine_count ?? 0,
+    totalBytes: Number(info.total_bytes ?? 0),
+    keptCount: (info.kept ?? []).length,
+    stripProfiles: info.strip_profiles ?? 0,
+    trashDir: info.trash_dir ?? "~/.local/state/cys-trash",
+    items: info.quarantine ?? [],
+    reportOnly: info.report_only ?? [],
+    liveSessions: info.live_sessions ?? 0,
+    deptCount: info.dept_count ?? 0,
+    interruptedPrior: info.interrupted_prior ?? [],
+  };
+  const ok = await factoryResetConfirmModal(preview);
+  if (!ok) return;
+  // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
+  if (rotatingDaemon || purgingDept) {
+    toast("feed", "작업 진행 중", "데몬 재시작 또는 부서 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  factoryResetting = true;
+  const failId = "reset-fail";
+  try {
+    stickyToast("factory-reset", "watchdog", "⟲ 완전 초기화 중", "데몬 정지·격리 진행 중… 앱을 닫지 마세요.");
+    let rep: ResetResult;
+    try {
+      // purgeLicense/purgeLocal=false — 라이선스와 직접 만든 오버레이(~/.cys/local)는 보존이 기본이다
+      // (CLI 는 --purge-license·--purge-local 로 선택 격리 가능·모달 고지문과 동일 계약).
+      rep = (await invoke("factory_reset_execute", { purgeLicense: false, purgeLocal: false })) as typeof rep;
+    } catch (e) {
+      dismissToast("factory-reset");
+      stickyToast(failId, "watchdog", "완전 초기화 실패", `${e} — 아무것도(또는 일부만) 변경되지 않았을 수 있습니다. 재시도하거나 cys factory-reset --plan 으로 상태를 확인하세요.`);
+      return;
+    }
+    dismissToast("factory-reset");
+    // ★A6(성찰 확정): 여기부터 이 앱 프로세스는 되돌릴 수 없는 반쪽 상태다(데몬·pack·훅 부재).
+    // 부분 실패든 성공이든 **격리가 시작된 이상** 데몬 소생 경로를 영구 차단한다(래치는 해제되지 않는다).
+    resetCompleted = true;
+    // ★P0-4: 실패·부활은 토스트(60초 수명)로만 알리면 완료 모달 뒤에 가려지고 앱을 끄면
+    // 영영 사라진다. **모달 제목·본문 자체**가 결과에서 파생되도록 하고(정면 노출),
+    // 디스크의 REPORT.txt 경로를 함께 안내한다. 토스트는 보조로만 남긴다.
+    if (rep.ok === false) {
+      const fails = (rep.failed ?? []).map((f) => `${f.path}: ${f.error}`).join("\n");
+      stickyToast(failId, "watchdog", "완전 초기화 부분 실패", `일부 항목이 이동되지 않았습니다:\n${fails}\n격리 보관함: ${rep.trash_dir ?? ""}`);
+    } else {
+      dismissToast(failId);
+    }
+    if (rep.revived_warning) {
+      stickyToast("reset-revived", "health", "⚠ 초기화 중 데몬 부활", rep.revived_warning);
+    }
+    // ★P1-2: "되돌릴 수 있습니다"를 실제로 손에 쥐여 준다 — 격리 폴더를 파일 관리자로 연다.
+    // 초보가 터미널 없이도 무엇이 보관됐는지(REPORT.txt 포함) 눈으로 확인할 수 있는 유일한 경로.
+    if (rep.trash_dir) {
+      toast(
+        "feed",
+        "격리 보관함",
+        `${rep.trash_dir} — 클릭하면 폴더를 엽니다(REPORT.txt 에 요약, --undo 로 복구).`,
+        () => void invoke("reveal_path", { path: rep.trash_dir }).catch(() => {}),
+      );
+    }
+    const quit = await confirmModal(resetResultTitle(rep), resetResultBody(rep), "앱 종료", "나중에");
+    if (quit) {
+      // ★P1-3: 화면 저장값(레이아웃·테마·핀)은 WebView 저장소에 있어, 앱이 살아 있는 동안
+      // 파일 격리만으로는 지워지지 않는다(Windows 는 rename 자체가 실패해 항상 남는다).
+      // 종료 직전 여기서 직접 비우면 "이연" 여부와 무관하게 다음 실행이 초기 화면이 된다.
+      try {
+        localStorage.clear();
+      } catch {
+        /* 저장소 접근 실패는 종료를 막지 않는다 */
+      }
+      await invoke("factory_reset_quit_app", {}).catch(() => {});
+    }
+  } finally {
+    factoryResetting = false;
+  }
+}
+
 // ---------- toasts (daemon push events) ----------
 
 // ★T-0147-3(2026-07-30): 모든 토스트는 종류 불문 유한 수명을 갖는다(정책=toastttl.ts).
@@ -5074,7 +5298,9 @@ function addToastCloseButton(el: HTMLElement, id?: string) {
   el.appendChild(x);
 }
 
-function toast(category: string, name: string, detail: string) {
+/// `onClick` — 토스트 본문을 눌렀을 때의 동작(선택). 완전 초기화 완료 후 격리 폴더를 여는
+/// 것처럼 **행동으로 이어지는 안내**에만 쓴다(P1-2). 닫기 버튼 클릭과는 분리한다.
+function toast(category: string, name: string, detail: string, onClick?: () => void) {
   recordAlarm(category, name, detail);
   const box = document.getElementById("toasts")!;
   const el = document.createElement("div");
@@ -5082,6 +5308,13 @@ function toast(category: string, name: string, detail: string) {
   el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
+  if (onClick) {
+    el.style.cursor = "pointer";
+    el.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest(".toast-x")) return; // 닫기(×)는 제외
+      onClick();
+    });
+  }
   addToastCloseButton(el);
   box.appendChild(el);
   setTimeout(() => el.remove(), toastTtl("volatile").ttlMs);
@@ -5440,8 +5673,19 @@ async function start() {
       `pane 안의 claude 등이 EPERM으로 꺼질 수 있습니다 — 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더(또는 전체 디스크 접근 권한)에서 cys를 허용한 뒤 앱을 재시작하세요.`,
     );
   });
+  // 완전 초기화 진행 이벤트 — sticky toast 본문을 단계 상세로 갱신(결과는 invoke 반환이 정본).
+  await listen("reset-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string; detail?: string };
+    if (factoryResetting && p.detail) {
+      stickyToast("factory-reset", "watchdog", "⟲ 완전 초기화 중", `[${p.phase ?? ""}] ${p.detail}`);
+    }
+  });
+
   await listen("restore-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; hq_ok?: boolean; ok?: number; fail?: number; detail?: string };
+    // ★P1-3: 방금 조직을 지운 사용자에게 "직원 복귀 중"은 정반대 신호다. 리셋 진행/완료
+    // 상태에서는 복원 토스트를 띄우지 않는다(복원 자체는 백엔드 판단이므로 표시만 억제).
+    if (factoryResetting || resetCompleted) return;
     if (p.phase === "start") {
       stickyToast("restore", "feed", "👥 직원 복귀 중", "노드 세션 복원 중… (본부·부서)");
     } else if (p.phase === "done") {
@@ -5801,6 +6045,7 @@ document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
 document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
+document.getElementById("btn-factory-reset")!.addEventListener("click", () => void factoryResetFlow());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );
@@ -5808,7 +6053,10 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
 // (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 "+부서"(btn-ws-dept→addDeptWorkspace) 전담.
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
-document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+document.getElementById("btn-ws-new")!.addEventListener("click", () => {
+  if (daemonActionBlocked()) return; // ★P1-3: 리셋 진행/완료 중 새 워크스페이스 차단(무반응 금지)
+  void addWorkspace();
+});
 
 // ★WP-1 결정 e(BOOTSTRAP_HARDENING v1.1): "마스터 시작" — cys launch-agent --role master 배선.
 // worker/cso 기동과 동일 메커니즘(앵커: 시스템은 노드만 띄우고 지휘하지 않는다). 초보를 "올바른
@@ -5916,6 +6164,7 @@ const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | nu
 // ⑤(gemini R2): invoke 실패 reject 를 try/catch 로 받아 토스트+버튼 disabled 해제(버튼 freeze 방지).
 // ①(gemini R2 ★BLOCKER): create exit code 별 분기 — exit5(account dir 미존재=계정누수)는 레거시 폴백 절대 금지.
 async function launchDept(catalogKey?: string) {
+  if (daemonActionBlocked()) return; // ★A4: 리셋 진행/완료 중 부서 데몬 spawn 차단
   if (!deptBtn || deptBtn.disabled) return; // 연타 차단 — in-flight launch 중 재실행 방지
   const prevLabel = deptBtn.textContent;
   deptBtn.disabled = true;
@@ -5994,6 +6243,9 @@ deptBtn?.addEventListener("click", async () => {
 window.addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // IME 조합 중 무시
   if (paletteOpen) return; // 07: 팔레트 열림 중 전역 단축키 누수 차단(검색 타이핑이 ⌘W/T/D/G 발화 방지 · 적대검증 교정)
+  // ★P1-3: 확인 모달이 떠 있으면 전역 단축키가 **뒤의 세션을 건드리지 못하게** 막는다.
+  // 시뮬레이션 지적: 파괴적 다이얼로그를 닫으려던 사용자의 ⌘W 가 확인 없이 뒤 pane 을 죽였다.
+  if (document.querySelector(".modal-overlay")) return;
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
   if (e.key === "k") {
