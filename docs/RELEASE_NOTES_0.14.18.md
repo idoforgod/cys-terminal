@@ -51,3 +51,25 @@ Windows 에서 더 자주 나타났습니다.
 - 부팅 체인 테스트: 전제(살아있는 마스터) 미확인 시 부서 미생성·`exit 10` / 선행 등록 판정 소비 시 중복 등록 0.
 - 건강성 검체 `H-IDENT-1`: 세 겹이 모두 실려 있고 **순서까지** 맞는지(등록이 분리보다 먼저,
   실측이 부서 생성보다 먼저) 확인하며, Windows 실기 레인에서도 함께 돕니다.
+
+## Windows Defender / SmartScreen 안내 (유지)
+
+Windows 설치 파일은 코드 서명 평판이 쌓이기 전까지 SmartScreen 경고("알 수 없는
+게시자")가 뜰 수 있습니다. **"추가 정보" → "실행"** 으로 진행하시고, 다운로드한 파일은
+홈페이지의 `SHA256SUMS.txt` 와 대조해 무결성을 확인할 수 있습니다. Defender 오탐은 WDSI
+신고를 거쳐 릴리스마다 최소화합니다.
+
+### Defender가 `cys.exe` 를 격리한 경우 — 복구는 **순서**가 생명입니다
+
+드물게 Defender의 행동 휴리스틱(`Behavior:Win32/Execution.A!ml`)이 명령줄 실행 파일만
+오탐 격리할 수 있습니다. 이때 앱과 데몬은 살아 있는데 CLI만 사라져 부팅 체인이 멈춥니다.
+**제외를 먼저 등록하고, 그 다음 복원하세요** — 순서를 바꾸면 실시간 보호가 복원 직후
+다시 격리합니다.
+
+```powershell
+# ① 제외 먼저 (관리자 PowerShell)
+Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\cys"
+# ② 그 다음 복원
+& "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Restore `
+    -Name "Behavior:Win32/Execution.A!ml" -Path "$env:LOCALAPPDATA\cys\cys.exe"
+```
