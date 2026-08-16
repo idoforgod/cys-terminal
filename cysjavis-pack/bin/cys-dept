@@ -235,12 +235,16 @@ USAGE
 }
 
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
-reg_count(){ reg_init; python3 -c "import json;print(len(json.load(open('$REG'))['depts']))"; }
+reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['depts']))" "$REG" | tr -d '\r'; }
 # ★CRLF 위생(2026-08-16 win T3-ng3 실증): Windows 임베디드 python 의 stdout 은 텍스트 모드라
 #   줄끝이 \r\n 이다. $(...) 캡처는 MSYS bash 가 \r 을 벗겨 안전(allocate 상시 green 이 실증)하나
 #   파이프 소비자(`reg_names | grep -Fxq -- name` — rotate 등재 게이트 L:rotate·TOCTOU 재확인)는
 #   'name\r' 을 못 맞춰 등재명을 미등재(exit 8)로 오판했다 — 단일 지점에서 \r 을 소거한다.
-reg_names(){ reg_init; python3 -c "import json;[print(k) for k in json.load(open('$REG'))['depts']]" | tr -d '\r'; }
+# ★경로는 -c 문자열에 내장하지 말고 argv 로 넘긴다(2026-08-16 T3-ng3 2차 실증): MSYS 는 네이티브
+#   실행 인자의 POSIX 경로만 Windows 경로로 자동 변환한다 — -c 코드 안의 '/c/Users/…' 는 미변환이라
+#   Windows python 이 FileNotFoundError 로 죽고, 파이프 소비자(rotate 등재 게이트)·reg_count 캡처
+#   ("부서 수" 산정·down 의 강등 판정)가 전부 빈 값이 됐다(win 잠복 결함).
+reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1]))['depts']]" "$REG" | tr -d '\r'; }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
 reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
