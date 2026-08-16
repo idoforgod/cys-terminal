@@ -186,6 +186,30 @@ def guard_critical(fp):
 
 WRAPPERS = {"sudo", "doas", "env", "command", "exec", "nohup", "nice", "ionice",
             "time", "timeout", "stdbuf", "setsid", "caffeinate", "xargs", "builtin"}
+# ★래퍼 **옵션**도 건너뛴다 (2026-08-16 감사 확정 · 실측 우회):
+#   종전엔 래퍼 '이름'만 건너뛰어 `env -u CYS_SURFACE_ID cys factory-reset` 의 prog 가 `-u` 로
+#   잡혔다 — cys 분기가 아예 발동하지 않아 오살 금지·R-02·R-02b 가 통째로 우회됐다.
+#   값을 먹는 옵션은 다음 토큰까지 함께 건너뛴다. timeout/time 의 선행 기간 인자도 흡수한다.
+WRAPPER_VAL_OPTS = {"-u", "-n", "-c", "-C", "-I", "-t", "-i", "--chdir", "--unset", "--niceness"}
+DUR_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[smhd]?$")
+def skip_wrapper_opts(toks, i, n, wrapper):
+    """래퍼 뒤의 옵션·값·기간 인자를 건너뛴 위치를 돌려준다(순수 인덱스 계산)."""
+    while i < n:
+        t = toks[i]
+        if t.startswith("-") and t != "--":
+            if t in WRAPPER_VAL_OPTS and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+            continue
+        if t == "--":
+            i += 1
+            continue
+        if wrapper in ("timeout", "time") and DUR_RE.match(t):
+            i += 1
+            continue
+        break
+    return i
 
 # ================= STRICT (deny-by-default allowlist) =================
 ALLOWLIST = {"ls", "cat", "head", "tail", "grep", "rg", "find", "git", "pytest",
@@ -263,6 +287,14 @@ CYS_PACK_MUTATING_SUBS = {"pack-update", "init-pack", "pack-rollback",
 #   방지 가드). 즉 pane 안에서 이 명령이 나오는 상황은 정상 운영에 존재하지 않으므로 평시에도 막는다.
 #   자기잠금 없음 — 주인님은 GUI 버튼·외부 터미널로 언제든 실행할 수 있다.
 CYS_OWNER_ONLY_SUBS = {"factory-reset"}
+# ★`cys run -- <명령>` 우회 봉인 (2026-08-16 감사 확정 · 실측 우회):
+#   `run` 은 임의 명령을 프로세스 원장에 얹어 실행한다 — 그래서 `cys run -- cys factory-reset` 이
+#   cys 서브커맨드 게이트(오살 금지·R-02·R-02b)를 통째로 빠져나갔다. `run` 자체는 서버 기동의
+#   정당 경로라 전면 금지하지 않고(과차단 금지), **인자 안에 게이팅 대상 서브커맨드가 보이면**
+#   거부한다. 판정은 토큰 정확 일치라 `--run-factory-reset-notes` 같은 무관 문자열은 걸리지 않는다.
+CYS_RUN_GATED_TOKENS = CYS_OWNER_ONLY_SUBS | CYS_PACK_MUTATING_SUBS | CYS_KILL_SUBS
+CYS_RUN_DENY = ("[우회 차단] cys run 의 내부 명령에 게이팅 대상 서브커맨드(%s)가 있다 — "
+                "run 으로 감싸도 같은 규칙이 적용된다. 직접 실행 경로의 안내를 따르라.")
 CYS_OWNER_ONLY_DENY = ("[완전 초기화 불가침] cys %s 금지 — 전 데몬 종료 + 팩(guard.sh 포함)·부서·"
                        "대화기억·훅 전량 격리는 에이전트가 실행할 명령이 아니다. 주인님이 직접 "
                        "GUI '완전 초기화' 버튼 또는 **에이전트 pane 밖 터미널**에서 실행한다.")
@@ -337,7 +369,9 @@ def extract_commands(toks):
             if i < n and toks[i] in SHELL_KEYWORDS:
                 i += 1; continue
             while i < n and toks[i].rsplit("/", 1)[-1].lower() in WRAPPERS:
+                w = toks[i].rsplit("/", 1)[-1].lower()
                 i += 1
+                i = skip_wrapper_opts(toks, i, n, w)
                 while i < n and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]):
                     i += 1
             if i < n and toks[i] not in SEPARATORS:
@@ -683,6 +717,10 @@ def prog_allowed(prog, args):
         # ★R-02b: 완전 초기화는 모드 무관 DENY(위 상수 주석의 근거 — 사람 운영 경로가 pane 밖이다).
         if sub in CYS_OWNER_ONLY_SUBS:
             return False, CYS_OWNER_ONLY_DENY % sub
+        if sub == "run":
+            hit = [a for a in args if a in CYS_RUN_GATED_TOKENS]
+            if hit:
+                return False, CYS_RUN_DENY % ", ".join(sorted(set(hit)))
         return True, ""
     if prog == "find":
         if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprintf", "-fprint", "-fls") for a in args):
@@ -751,7 +789,10 @@ def l_strip_env(ws):
 def l_cmd_word(seg):
     ws = l_strip_env(l_words(seg))
     while ws and ws[0].rsplit("/", 1)[-1].lower() in WRAPPERS:
-        ws = l_strip_env(ws[1:])
+        w = ws[0].rsplit("/", 1)[-1].lower()
+        rest = ws[1:]
+        rest = rest[skip_wrapper_opts(rest, 0, len(rest), w):]
+        ws = l_strip_env(rest)
     if not ws: return None, []
     return ws[0].rsplit("/", 1)[-1], ws[1:]
 def l_segments(n): return [p.strip() for p in re.split(r"[;&|\n]+", n) if p.strip()]
@@ -832,6 +873,10 @@ def loose_deny(n, n_slash=""):
             # ★R-02b: 완전 초기화는 평시(LOOSE)에도 DENY — 사람 운영 경로가 pane 밖이라 자기잠금 0.
             if sub in CYS_OWNER_ONLY_SUBS:
                 return CYS_OWNER_ONLY_DENY % sub
+            if sub == "run":
+                hit = [a for a in args if a in CYS_RUN_GATED_TOKENS]
+                if hit:
+                    return CYS_RUN_DENY % ", ".join(sorted(set(hit)))
         if prog == "git":
             sub, subargs = l_git_sub(args)
             if sub == "push": return "git push (외부발행=비가역). 주인님 승인 필요"

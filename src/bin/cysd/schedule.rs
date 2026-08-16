@@ -329,17 +329,71 @@ fn load_state(daemon: &Daemon) -> ScheduleState {
     }
 }
 
-fn save_state(daemon: &Daemon, state: &ScheduleState) {
-    if let Ok(s) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(state_path(daemon), s);
+/// ★★디스크가 죽어도 **간격 의미를 지키는** 프로세스 메모리 오버레이(감사 확정 2026-08-16).
+///
+/// 왜 필요한가 — 스케줄러의 모든 안전성은 `schedule_state.json` 영속에 걸려 있었다. 쓰기가
+/// 지속 실패하면(디스크 가득참·쿼터·읽기전용·권한) 매 tick 이 "처음"으로 보여 두 파국 중
+/// 하나로 간다:
+///   ①`last_fired` 가 영원히 비어 전 주기 잡이 **30초마다 재발화** → 마스터 stdin 폭주(앵커 ①②)
+///   ②반쪽 쓰기(0바이트·잘림)가 남으면 손상 격리→재시드 루프로 **어느 잡도 영영 발화 안 함**(앵커 ③)
+/// 어느 쪽도 허용할 수 없다. 그래서 발화 시각을 **메모리에도** 남기고, 매 tick 디스크 상태 위에
+/// 덮어쓴다. 디스크가 정상이면 아무것도 달라지지 않고(같은 값), 죽어 있으면 이 프로세스가 사는
+/// 동안 정확한 간격이 유지된다. 데몬 재시작 시 초기화되는 것은 의도된 한계다(그때는 디스크가
+/// 유일한 진실이며, 재시작은 드물다).
+fn mem_last_fired() -> &'static std::sync::Mutex<HashMap<String, i64>> {
+    static MEM: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    MEM.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn mem_merge_into(state: &mut ScheduleState) {
+    if let Ok(m) = mem_last_fired().lock() {
+        for (k, v) in m.iter() {
+            // 메모리가 더 최신이면 그것이 진실이다(디스크 쓰기 실패분을 복원).
+            let cur = state.last_fired.get(k).copied().unwrap_or(0);
+            if *v > cur {
+                state.last_fired.insert(k.clone(), *v);
+            }
+        }
     }
+}
+
+fn mem_record(id: &str, ts: i64) {
+    if let Ok(mut m) = mem_last_fired().lock() {
+        m.insert(id.to_string(), ts);
+    }
+}
+
+/// 상태 저장 — **원자쓰기(tmp+rename)** 로 반쪽 파일을 남기지 않는다(ensure_builtin_jobs 관례와 동일).
+/// 종전 `fs::write` 는 create(성공)+write_all(실패) 사이에서 **0바이트 파일**을 남길 수 있었고,
+/// 그 파일은 다음 tick 에 파싱 실패→손상 격리→재시드 루프의 씨앗이 됐다.
+/// 반환값으로 성공 여부를 알린다(호출부가 '영속됐다'를 exists() 로 오판하지 않도록).
+fn save_state(daemon: &Daemon, state: &ScheduleState) -> std::io::Result<()> {
+    save_state_to(&state_path(daemon), state)
+}
+
+/// 경로 주입판(테스트 가능) — 위 함수의 본체.
+fn save_state_to(path: &std::path::Path, state: &ScheduleState) -> std::io::Result<()> {
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// 주기 job 발화 판정 — 순수 함수(회귀 핀). 마지막 발화 후 every_minutes분 경과 시 true.
 /// every_minutes None·0은 비활성(상시발화 방지). last_fired=0(최초)는 epoch 차가 커 즉시 발화.
 fn interval_due(every_minutes: Option<u64>, last_fired: i64, now_ts: i64) -> bool {
     match every_minutes {
-        Some(m) if m > 0 => now_ts - last_fired >= (m as i64) * 60,
+        // ★미래 last_fired 방어(감사 확정): 첫 부팅이 시각 동기화 전이라 벽시계가 미래로 튀면
+        // 그 값이 박제되고, 시각이 교정된 뒤에는 `now - last` 가 영원히 음수라 **주기 잡이
+        // 영구 침묵**한다. 미래 기록은 신뢰할 수 없으므로 즉시 만기로 취급해 리듬을 되찾는다.
+        Some(m) if m > 0 => last_fired > now_ts || now_ts - last_fired >= (m as i64) * 60,
         _ => false,
     }
 }
@@ -403,6 +457,8 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     let now_ts = now.timestamp();
     let mut state = load_state(daemon);
     state.schema_version = SCHEDULE_STATE_VERSION; // 구파일(0) → 현재 버전 스탬프(다음 save 시 영속)
+    // ★디스크 쓰기가 실패해도 간격을 지키도록 메모리 기록을 먼저 덮는다(mem_last_fired 주석 참조).
+    mem_merge_into(&mut state);
     let mut dirty = false;
     // ★P2-2 ⑥(완전 초기화 시뮬레이션 확정 2026-08-16): 상태 파일이 **없는 첫 가동**(신규 설치·
     // 완전 초기화 직후)에는 last_fired 가 0이라 전 주기 잡의 만기가 **동시에** 성립한다. 그러면
@@ -410,16 +466,60 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     // ②마스터가 없으면 `if_absent: skip` 으로 전부 소인돼 다음 주기까지 침묵한다 — 어느 쪽도 의도가
     // 아니다. 첫 가동에는 시계를 **지금**으로 맞춰 다음 주기부터 정상 리듬을 타게 한다.
     // 실패 방향: 첫 주기 1회가 늦어질 뿐(보고성 잡이라 무해). 상태 파일이 있으면 전혀 관여하지 않는다.
-    if state.last_fired.is_empty() && !state_path(daemon).exists() {
+    // ★★fail-safe 방향 고정(부트 체인 불가침): 시드를 **디스크에 남기지 못하면 채택하지 않는다**.
+    // 이 순서가 계약인 이유 — 시드를 메모리에만 적용하고 save_state 가 실패하면(디스크 가득참·
+    // 권한·경로 소실) 매 tick 이 다시 "첫 가동"으로 보여 last_fired 가 영원히 now 로 리셋되고,
+    // 그러면 **주기 자가치유 잡이 영영 발화하지 않는다**(무발화 침묵 = 마스터가 바보가 되는 그 결함).
+    // 저장 실패 시에는 종전 의미(last_fired=0 → 즉시 만기)로 되돌린다: 잡이 한 번에 몰리는 쪽이
+    // 영원히 안 도는 쪽보다 **압도적으로 덜 위험하다**(전자는 시끄럽고 후자는 조용히 죽는다).
+    // ★손상 격리를 '첫 가동'으로 오인하지 않는다(감사 확정): load_state 가 손상본을
+    // `<name>.corrupt-<epoch>` 로 rename 하면 원본 자리가 비어 '처음'처럼 보인다. 그 상태에서
+    // 시드하면 **몇 달 된 기계의 전 주기 잡 시계가 통째로 리셋**되고 로그도 거짓말을 한다.
+    // 격리 흔적(형제 .corrupt-* 파일)이 하나라도 있으면 첫 가동이 아니다.
+    let had_corrupt = state_path(daemon)
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("schedule_state.json.corrupt-")
+            })
+        })
+        .unwrap_or(false);
+    if state.last_fired.is_empty() && !state_path(daemon).exists() && !had_corrupt {
+        let mut seeded: HashMap<String, i64> = HashMap::new();
         for job in jobs.iter().filter(|j| j.every_minutes.is_some()) {
-            state.last_fired.insert(job.id.clone(), now_ts);
+            // ★복구 소스를 만드는 잡(phoenix 세대 스냅샷)은 **시드하지 않는다** — 시드하면
+            // 첫 6시간 동안 롤백 세대가 0이라, 그 사이 손상되면 치유 소스가 아예 없다.
+            // 한 잡이 부팅 직후 1회 도는 것은 '몰림'이 아니다(동시 만기 방지가 목적이었다).
+            if job.id.starts_with("phoenix-snapshot") {
+                continue;
+            }
+            seeded.insert(job.id.clone(), now_ts);
         }
-        if !state.last_fired.is_empty() {
-            dirty = true;
-            eprintln!(
-                "[cysd] schedule: 첫 가동 — 주기 잡 {}개의 기준 시각을 now 로 초기화(동시 만기 방지)",
-                state.last_fired.len()
-            );
+        if !seeded.is_empty() {
+            // ★시드는 **메모리에 먼저** 박는다 — 디스크 성패와 무관하게 이 프로세스에서는
+            // 재시드가 다시 일어나지 않는다(재시드 루프 = 주기 잡 영구 침묵의 원인).
+            for (k, v) in &seeded {
+                mem_record(k, *v);
+            }
+            state.last_fired = seeded;
+            let probe = ScheduleState {
+                schema_version: SCHEDULE_STATE_VERSION,
+                last_fired: state.last_fired.clone(),
+            };
+            match save_state(daemon, &probe) {
+                Ok(()) => eprintln!(
+                    "[cysd] schedule: 첫 가동 — 주기 잡 {}개의 기준 시각을 now 로 초기화(동시 만기 방지)",
+                    state.last_fired.len()
+                ),
+                Err(e) => eprintln!(
+                    "[cysd] schedule: 첫 가동 시드 영속 실패({}: {e}) — 메모리 기록으로 간격을 유지한다\
+                     (데몬 재시작 전까지 유효). 디스크 쓰기 문제를 해결하라.",
+                    state_path(daemon).display()
+                ),
+            }
         }
     }
     let today = now.date_naive();
@@ -433,6 +533,7 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
             let last = state.last_fired.get(&job.id).copied().unwrap_or(0);
             if interval_due(job.every_minutes, last, now_ts) {
                 state.last_fired.insert(job.id.clone(), now_ts);
+                mem_record(&job.id, now_ts); // 디스크 실패해도 다음 tick 이 간격을 지킨다.
                 dirty = true;
                 let d = Arc::clone(daemon);
                 let j = job.clone();
@@ -499,7 +600,10 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
         }
     }
     if dirty {
-        save_state(daemon, &state);
+        if let Err(e) = save_state(daemon, &state) {
+            // 조용히 삼키지 않는다 — 이 실패가 지속되면 재시작 시 간격이 초기화된다.
+            eprintln!("[cysd] schedule: 상태 저장 실패({e}) — 메모리 기록으로 계속 진행");
+        }
     }
 }
 
@@ -1339,6 +1443,54 @@ mod tests {
         for m in intervals {
             assert!(interval_due(Some(m), now, now + (m as i64) * 60));
         }
+    }
+
+    /// ★★감사 확정 회귀(앵커 ①③ 동시 방어): 디스크 영속이 실패해도
+    ///  ①전 주기 잡이 30초마다 재발화하지 않고(폭주) ②영원히 침묵하지도 않는다(자가치유 전멸).
+    /// 메모리 오버레이가 그 둘 사이의 유일한 올바른 상태(정확한 간격)를 유지한다.
+    #[test]
+    fn memory_overlay_keeps_interval_when_disk_write_fails() {
+        // 오버레이는 프로세스 전역이라 이 테스트 전용 키를 쓴다(다른 테스트와 간섭 금지).
+        let id = "test-overlay-job";
+        let now = 1_700_000_000i64;
+        mem_record(id, now);
+        let mut st = ScheduleState::default();
+        assert!(st.last_fired.is_empty());
+        mem_merge_into(&mut st);
+        assert_eq!(st.last_fired.get(id).copied(), Some(now), "메모리 기록이 복원되어야 한다");
+
+        // 간격 의미가 유지된다 — 방금 발화한 잡은 즉시 만기가 아니다(폭주 차단).
+        assert!(!interval_due(Some(360), st.last_fired[id], now));
+        // 그리고 주기가 지나면 정상 발화한다(침묵 차단).
+        assert!(interval_due(Some(360), st.last_fired[id], now + 360 * 60));
+
+        // 디스크가 더 최신이면 디스크가 이긴다(정상 경로에서 오버레이가 과거를 되살리지 않는다).
+        let mut st2 = ScheduleState::default();
+        st2.last_fired.insert(id.to_string(), now + 10_000);
+        mem_merge_into(&mut st2);
+        assert_eq!(st2.last_fired[id], now + 10_000);
+    }
+
+    /// 원자쓰기 회귀: 저장은 tmp+rename+fsync 이고 **결과를 반환**한다(exists() 로 영속을
+    /// 오판하지 않는다). 반쪽 파일이 남으면 다음 tick 이 손상 격리→재시드 루프로 간다.
+    #[test]
+    fn save_state_is_atomic_and_reports_failure() {
+        let dir = std::env::temp_dir().join(format!("cys-sched-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedule_state.json");
+        let mut st = ScheduleState::default();
+        st.last_fired.insert("j".into(), 123);
+        assert!(save_state_to(&path, &st).is_ok());
+        let back: ScheduleState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.last_fired.get("j").copied(), Some(123));
+        // tmp 잔재 없음(rename 으로 넘어갔다).
+        assert!(!path.with_extension("json.tmp").exists());
+        // 쓸 수 없는 경로는 **정직하게 Err** — exists() 로 영속을 오판하던 결함의 회귀 핀.
+        let bad = dir.join("no-such-dir").join("schedule_state.json");
+        assert!(save_state_to(&bad, &st).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// interval_due는 마지막 발화 후 every_minutes분 경과 시에만 true. 0·None은 비활성.

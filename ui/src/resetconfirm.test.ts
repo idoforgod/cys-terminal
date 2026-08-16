@@ -96,9 +96,9 @@ describe("resetNoticeLines", () => {
   it("★P0-2: 사용자 폴더 안에서 사라지는 항목은 경로를 반드시 노출한다", () => {
     const info = preview({
       items: [
-        { path: "/Users/x/.cys/pack", label: "팩", size_bytes: 17_000_000 },
+        { path: "/dummy-home/.cys/pack", label: "팩", size_bytes: 17_000_000 },
         {
-          path: "/Users/x/Desktop/CYSjavis/cys-homepage/_round",
+          path: "/dummy-home/Desktop/CYSjavis/cys-homepage/_round",
           label: "작업기억(_round)",
           size_bytes: 279_000_000,
           outside_state: true,
@@ -145,7 +145,7 @@ describe("resetResultTitle / resetResultBody", () => {
       moved: 31,
       skipped_absent: 2,
       trash_dir: "/t/factory-reset-X",
-      failed: [{ path: "/Users/x/.claude/settings.json", error: "is a symlink — refusing" }],
+      failed: [{ path: "/dummy-home/.claude/settings.json", error: "is a symlink — refusing" }],
       report_path: "/t/factory-reset-X/REPORT.txt",
     };
     expect(resetResultTitle(rep)).toContain("부분 완료");

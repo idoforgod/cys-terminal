@@ -92,6 +92,47 @@ const TEMP_SWEEP_PREFIX: [&str; 7] = [
     "cysd-task.xml",
 ];
 
+/// ★★Windows 전용 치명 방어(감사 확정 2026-08-16): `%LOCALAPPDATA%\cys` 는 **NSIS 설치
+/// 디렉토리이자 동시에 메인 데몬의 상태 디렉토리**다(tauri.windows.conf.json installMode
+/// "currentUser" + productName "cys" · cysd/state.rs state_dir). 그래서 이 디렉토리를 통째로
+/// 격리하면 **앱 자신(cys.exe·cysd.exe·runtime/·resources/)을 언인스톨**해 버린다.
+/// → `~/.cys` 와 같은 교리를 적용한다: **알려진 상태 항목만** 격리하고 나머지(=설치본)는 보존.
+/// 놓친 상태 파일이 남는 것은 불편이지만, 앱을 옮기는 것은 복구 불능급 사고다(fail-safe 방향).
+const WIN_STATE_EXACT: [&str; 21] = [
+    "transcripts.db",
+    "analytics.db",
+    "channels.db",
+    "feed.jsonl",
+    "feed.jsonl.tmp",
+    "approval_audit.jsonl",
+    "queue-state.json",
+    "queue-state-v2.json",
+    "autopilot.json",
+    "topology.json",
+    "dept_tombstones.json",
+    "event.seq",
+    "schedule_state.json",
+    "learn_stuck_debounce.json",
+    "operator.token",
+    "heartbeat",
+    "lockloss.state",
+    "cysd.log",
+    "phoenix-restore.log",
+    "dead-letters.jsonl",
+    "oob-cooldowns.json",
+];
+
+/// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
+const WIN_STATE_PREFIX: [&str; 7] = [
+    "cys-dept-",          // 부서 데몬 슬러그 디렉토리(state.rs pipe_slug 규약)
+    "phoenix",            // phoenix/ · phoenix-embed/
+    "office-bridge",      // office-bridge/ · office-bridge.log
+    "report_gate",        // report_gate*/badges.json 레인
+    "cycle_autopilot",    // 사이클 오토파일럿 상태
+    "schedule_state.json.corrupt-", // 손상 격리본
+    "analytics.db-",      // WAL/SHM 사이드카
+];
+
 /// D1a 계승 보호 루트 — realpath 가 이 중 하나면 어떤 격리도 금지.
 const PROTECTED_ROOTS: [&str; 6] = ["/", "/Users", "/tmp", "/var", "/private/tmp", "/private/var"];
 
@@ -525,21 +566,36 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
         }
     }
 
-    // ── Windows 층: %LOCALAPPDATA%\cys(데몬 상태 전체) + WebView 데이터 ──
-    for (p, label) in [
-        (&roots.win_local_state, "데몬 상태(Windows LOCALAPPDATA)"),
-        (&roots.win_webview_data, "GUI 저장값(WebView)"),
-    ] {
-        if let Some(p) = p {
-            if p.exists() {
-                // Windows 웹층(%LOCALAPPDATA%\com.cysjavis.terminal)은 실행 중 앱이 점유 →
-                // 이연 등급. 데몬 상태 루트(%LOCALAPPDATA%\cys)는 정규 격리 대상이다.
-                if p.ends_with("com.cysjavis.terminal") {
-                    push_best_effort(&mut quarantine, p.clone(), label);
+    // ── Windows 층 ──
+    // ★%LOCALAPPDATA%\cys 는 **앱 설치 디렉토리와 같은 곳**이다(WIN_STATE_* 주석 참조).
+    // 통째로 옮기면 앱을 언인스톨한다 — 알려진 상태 항목만 골라 격리하고 설치본은 보존한다.
+    if let Some(root) = &roots.win_local_state {
+        if let Ok(rd) = std::fs::read_dir(root) {
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let known = WIN_STATE_EXACT.contains(&name.as_str())
+                    || WIN_STATE_PREFIX.iter().any(|p| name.starts_with(p));
+                if known {
+                    push_quarantine(&mut quarantine, e.path(), "데몬 상태(Windows)");
                 } else {
-                    push_quarantine(&mut quarantine, p.clone(), label);
+                    keep.push(PlanItem {
+                        size_bytes: 0, // 설치본 크기는 세지 않는다(대상이 아니므로 계산도 낭비).
+                        path: e.path(),
+                        label: "앱 설치 파일 — 보존(초기화 대상 아님)".into(),
+                        action: Action::Keep,
+                        best_effort: false,
+                        outside_state: false,
+                    });
                 }
             }
+        }
+    }
+    // WebView2 데이터는 별도 디렉토리라 통째 격리 가능하나, 실행 중 앱이 점유하므로 이연 등급.
+    if let Some(p) = &roots.win_webview_data {
+        if p.exists() {
+            push_best_effort(&mut quarantine, p.clone(), "GUI 저장값(WebView)");
         }
     }
 
@@ -799,12 +855,36 @@ fn pid_alive(pid: u32) -> bool {
 
 /// 센티널 기록(형식: `<unix_ts> <pid>`). 실패는 무시 — 센티널은 **보조** 방어층이고,
 /// 이걸 못 써서 리셋 자체가 막히면 안 된다(주 방어는 정지 실측 + quiescent 게이트).
+/// 이 pid 가 cys 계열 프로세스인가(리셋을 실행할 수 있는 주체) — 센티널 소유자 검증용.
+fn pid_is_cys_family(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true);
+    sys.process(sysinfo::Pid::from_u32(pid))
+        .and_then(|p| p.name().to_str().map(|s| s.to_ascii_lowercase()))
+        .map(|b| {
+            let b = b.rsplit(['/', '\\']).next().unwrap_or(&b).to_string();
+            b == "cys" || b == "cys.exe" || b == "cys-app" || b == "cys-app.exe"
+        })
+        .unwrap_or(false)
+}
+
+/// 부팅 식별자 — 재부팅하면 값이 바뀐다. 센티널이 재부팅을 건너 살아남는 것을 막는다.
+fn boot_id() -> u64 {
+    sysinfo::System::boot_time()
+}
+
 fn write_sentinel() {
     if let Some(p) = sentinel_path() {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&p, format!("{} {}", now_unix(), std::process::id()));
+        let _ = std::fs::write(
+            &p,
+            format!("{} {} {}", now_unix(), std::process::id(), boot_id()),
+        );
     }
 }
 
@@ -832,6 +912,12 @@ impl Drop for ResetSentinel {
 /// 지금 다른 프로세스가 완전 초기화를 진행 중인가 — 데몬 스폰 직전에 묻는 질문.
 /// **fail-open**: 파일 없음·형식 불량·TTL 초과·기록 pid 사망은 전부 false(+ 잔재 정리).
 pub fn reset_in_progress() -> bool {
+    reset_in_progress_with(&|pid| pid_alive(pid) && pid_is_cys_family(pid))
+}
+
+/// 위 함수의 판정자 주입판 — 테스트가 "리셋 주인이 살아있다"를 흉내낼 수 있게 한다
+/// (테스트 바이너리의 프로세스 이름은 cys 계열이 아니므로 라이브 판정자로는 검증 불가).
+pub fn reset_in_progress_with(owner_alive: &dyn Fn(u32) -> bool) -> bool {
     let Some(p) = sentinel_path() else {
         return false;
     };
@@ -841,9 +927,19 @@ pub fn reset_in_progress() -> bool {
     let mut it = body.split_whitespace();
     let ts = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let pid = it.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    // ★부팅 식별자(선택 필드 — 구 형식 호환): 재부팅 후에는 **같은 pid 가 다른 프로세스**일 수
+    // 있고, 그때 센티널을 살아있다고 오판하면 데몬이 최대 TTL 동안 못 뜬다(전 pane 사망 등급).
+    let recorded_boot = it.next().and_then(|v| v.parse::<u64>().ok());
+    // ★허용오차 필수(감사 확정): Windows 의 boot_time 은 tick 파생이라 호출마다 초 단위로
+    // 흔들린다. 정확 일치를 요구하면 **같은 부팅인데 불일치**로 판정해 살아있는 센티널을
+    // 삭제하고 가드를 통째로 무력화한다. 재부팅은 분 단위로 값이 달라지므로 120초 창이면
+    // "다른 부팅"만 정확히 걸러낸다.
+    const BOOT_SKEW_TOLERANCE: u64 = 120;
+    let same_boot = recorded_boot
+        .map(|b| b.abs_diff(boot_id()) <= BOOT_SKEW_TOLERANCE)
+        .unwrap_or(true);
     let fresh = ts > 0 && now_unix().saturating_sub(ts) < SENTINEL_TTL_SECS;
-    let owner_alive = pid_alive(pid);
-    if fresh && owner_alive {
+    if fresh && owner_alive(pid) && same_boot {
         return true;
     }
     let _ = std::fs::remove_file(&p); // 만료·고아 센티널은 즉시 청소(자기잠금 방지).
@@ -895,7 +991,9 @@ fn scan_cysd_pids() -> Vec<u32> {
 /// 실패·중단 경로 전부(CLI stderr·GUI 토스트)가 이 문장을 쓴다 — "실패했으니 원래대로겠지"라는
 /// 치명적 오해를 막는다(실제로는 세션이 전멸했고 자동시작 등록이 해제됐다).
 pub fn stop_side_effects_note() -> &'static str {
-    "⚠ 데몬은 이미 정지되었고(열려 있던 세션 전부 종료) launchd/작업 스케줄러 자동시작 등록이      해제되었습니다. 격리는 진행되지 않아 데이터는 그대로입니다.      되살리려면: 앱을 다시 실행하거나 `cys daemon install`"
+    "⚠ 데몬은 이미 정지되었고(열려 있던 세션 전부 종료) 자동시작 등록이 해제/비활성되었습니다. \
+     격리는 진행되지 않아 데이터는 그대로입니다. 되살리려면: 앱을 다시 실행하거나 \
+     `cys daemon install` (Windows 에서 작업이 비활성으로 남았다면 `schtasks /Change /TN cysd /ENABLE`)"
 }
 
 /// 격리가 성공한 뒤에만 plist 파일을 지운다(P0-6 — 실패 시 자동시작을 잃지 않게).
@@ -2010,20 +2108,53 @@ mod tests {
         }
     }
 
-    /// Windows 루트가 계획에 잡히는지 검증(경로 조립은 OS 무관 — unix에서도 판정 가능).
+    /// ★★Windows 치명 회귀(감사 확정 2026-08-16): `%LOCALAPPDATA%\cys` 는 **NSIS 설치
+    /// 디렉토리이자 메인 데몬 상태 디렉토리**다(installMode currentUser · productName cys).
+    /// 통째 격리는 앱 언인스톨과 같다 — 상태 항목만 골라 옮기고 설치본은 반드시 보존한다.
+    /// 이 핀이 없으면 "맥은 멀쩡한데 윈도에서 앱이 사라지는" 사고가 그대로 난다.
     #[test]
-    fn windows_roots_are_planned_when_present() {
+    fn windows_install_dir_is_never_quarantined() {
         let td = test_home("winroots");
         let mut r = fake_roots(&td);
         let lad = td.join("AppData/Local");
-        mk(&lad.join("cys/cys-dept-d1"));
+        let inst = lad.join("cys");
+        // 설치본(NSIS currentUser) — 절대 대상이 아니다.
+        for f in ["cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe"] {
+            touch(&inst.join(f), "MZ");
+        }
+        mk(&inst.join("runtime"));
+        mk(&inst.join("resources"));
+        // 데몬 상태 — 격리 대상.
+        touch(&inst.join("transcripts.db"), "db");
+        touch(&inst.join("topology.json"), "{}");
+        touch(&inst.join("cysd.log"), "log");
+        mk(&inst.join("cys-dept-d1"));
+        mk(&inst.join("phoenix"));
         mk(&lad.join("com.cysjavis.terminal"));
-        r.win_local_state = Some(lad.join("cys"));
+        r.win_local_state = Some(inst.clone());
         r.win_webview_data = Some(lad.join("com.cysjavis.terminal"));
+
         let plan = build_plan(&r, &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
         let q: Vec<String> = plan.quarantine.iter().map(|i| norm(&i.path)).collect();
-        assert!(q.iter().any(|p| p.ends_with("AppData/Local/cys")), "{q:?}");
+        let k: Vec<String> = plan.keep.iter().map(|i| norm(&i.path)).collect();
+
+        for app in ["cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe", "runtime", "resources"] {
+            let suffix = format!("/cys/{app}");
+            assert!(
+                !q.iter().any(|p| p.ends_with(&suffix)),
+                "설치본을 격리하면 앱이 사라진다: {app} / {q:?}"
+            );
+            assert!(k.iter().any(|p| p.ends_with(&suffix)), "보존 목록 누락: {app} / {k:?}");
+        }
+        for st in ["transcripts.db", "topology.json", "cysd.log", "cys-dept-d1", "phoenix"] {
+            let suffix = format!("/cys/{st}");
+            assert!(q.iter().any(|p| p.ends_with(&suffix)), "상태 누락: {st} / {q:?}");
+        }
         assert!(q.iter().any(|p| p.ends_with("com.cysjavis.terminal")), "{q:?}");
+        assert!(
+            plan.quarantine.iter().any(|i| i.best_effort && i.path.ends_with("com.cysjavis.terminal")),
+            "WebView 는 이연 등급이어야 한다"
+        );
     }
 
     fn seed_practice_tree(home: &Path) -> ResetRoots {
@@ -2413,29 +2544,50 @@ mod tests {
         };
 
         // ① 신선 + 자기 pid 생존 → 차단.
+        // 라이브 판정자는 "cys 계열 프로세스"를 요구하므로(테스트 바이너리는 아니다) 주입한다.
+        let alive = |_pid: u32| true;
+        let dead = |_pid: u32| false;
         write(&format!("{} {}", now_unix(), std::process::id()));
-        assert!(reset_in_progress(), "신선한 센티널은 차단해야 한다");
+        assert!(reset_in_progress_with(&alive), "신선한 센티널은 차단해야 한다");
+        // ★pid 재사용 오탐 차단: 주인이 cys 계열이 아니면(=남의 프로세스) 무효 + 자동 청소.
+        assert!(!reset_in_progress_with(&dead), "남의 pid 는 리셋 주인이 아니다");
+        assert!(!path.exists());
 
         // ② TTL 초과 → 무시 + 자동 청소.
         write(&format!("{} {}", now_unix() - SENTINEL_TTL_SECS - 1, std::process::id()));
-        assert!(!reset_in_progress(), "만료 센티널은 무시해야 한다");
+        assert!(!reset_in_progress_with(&alive), "만료 센티널은 무시해야 한다");
         assert!(!path.exists(), "만료 센티널은 자동 청소되어야 한다");
 
         // ③ 죽은 pid(예약 상한 근처의 미사용 pid) → 무시 + 청소.
         write(&format!("{} 4294967294", now_unix()));
-        assert!(!reset_in_progress(), "고아 센티널은 무시해야 한다");
+        assert!(!reset_in_progress_with(&dead), "고아 센티널은 무시해야 한다");
         assert!(!path.exists());
 
         // ④ 형식 불량 → 무시.
         write("garbage");
-        assert!(!reset_in_progress());
+        assert!(!reset_in_progress_with(&alive));
+
+        // ⑤ 재부팅 후 pid 재사용 → 무시(부팅 식별자 불일치). 이 검사가 없으면 살아있는 남의
+        // 프로세스를 리셋 주인으로 오판해 데몬이 TTL 동안 못 뜬다(전 pane 사망 등급).
+        write(&format!("{} {} {}", now_unix(), std::process::id(), boot_id() + 100_000));
+        assert!(!reset_in_progress_with(&alive), "다른 부팅의 센티널은 무효여야 한다");
+        assert!(!path.exists());
+
+        // ⑤-b Windows boot_time 흔들림(초 단위)은 같은 부팅으로 본다 — 정확 일치를 요구하면
+        // 살아있는 센티널을 스스로 지워 가드가 무력화된다(맥에선 재현 안 되는 Windows 사고).
+        write(&format!("{} {} {}", now_unix(), std::process::id(), boot_id() + 3));
+        assert!(reset_in_progress_with(&alive), "초 단위 흔들림은 같은 부팅으로 인정해야 한다");
+
+        // ⑥ 구 형식(부팅 식별자 없음)은 호환 — 신선+생존이면 여전히 차단(fail-open 회귀 금지).
+        write(&format!("{} {}", now_unix(), std::process::id()));
+        assert!(reset_in_progress_with(&alive), "구 형식 센티널도 인식해야 한다");
 
         // ⑤ RAII 가드는 Drop 에서 반드시 해제한다.
         {
             let _g = ResetSentinel::arm();
-            assert!(reset_in_progress());
+            assert!(reset_in_progress_with(&alive));
         }
-        assert!(!reset_in_progress(), "가드 Drop 후 센티널이 남으면 안 된다");
+        assert!(!reset_in_progress_with(&alive), "가드 Drop 후 센티널이 남으면 안 된다");
 
         if let Some(body) = restore {
             std::fs::write(&path, body).unwrap();
@@ -2686,13 +2838,16 @@ mod tests {
     /// ★P1-1 ②: needle 경계 일치 — 사용자가 만든 `~/.cys/pack-notes` 훅은 우리 것이 아니다.
     #[test]
     fn needle_matches_pack_boundary_only() {
-        let base = Path::new("/Users/u/.cys");
-        assert!(command_points_into_pack("sh /Users/u/.cys/pack/hooks/a.sh", base));
-        assert!(command_points_into_pack("sh /Users/u/.cys/pack-dept-d1/hooks/a.sh", base));
-        assert!(command_points_into_pack("bash \"/Users/u/.cys/pack/hooks/a.sh\"", base));
+        // 개인 경로 리터럴 금지(secret-scan 하드 게이트) — 더미 홈 루트로 조립한다.
+        let home = "/dummy-home";
+        let base_s = format!("{home}/.cys");
+        let base = Path::new(&base_s);
+        assert!(command_points_into_pack(&format!("sh {base_s}/pack/hooks/a.sh"), base));
+        assert!(command_points_into_pack(&format!("sh {base_s}/pack-dept-d1/hooks/a.sh"), base));
+        assert!(command_points_into_pack(&format!("bash \"{base_s}/pack/hooks/a.sh\""), base));
         // 사용자 저작 디렉토리 — 파일은 보존되므로 훅도 보존해야 대칭이다.
-        assert!(!command_points_into_pack("sh /Users/u/.cys/pack-notes/hooks/a.sh", base));
-        assert!(!command_points_into_pack("sh /Users/u/.cys/packages/x.sh", base));
+        assert!(!command_points_into_pack(&format!("sh {base_s}/pack-notes/hooks/a.sh"), base));
+        assert!(!command_points_into_pack(&format!("sh {base_s}/packages/x.sh"), base));
     }
 
     /// ★P1-1 ③⑤: 백업은 격리 폴더 안으로, 원본 권한(0444 잠금)은 보존된다.

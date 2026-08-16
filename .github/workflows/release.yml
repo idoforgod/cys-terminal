@@ -445,6 +445,19 @@ jobs:
       #   유지되는 한 안전하지만, 정책 회귀(releaseDraft 반전) 시 공개된 산출물을 사후 실패시키는
       #   구조 의존이었다. macOS 패턴과 동형으로 직접 빌드→게이트→(tauri-action은 수집만)로 전환해
       #   게이트가 어떤 정책에서도 업로드 자체를 선행 차단하게 한다.
+      # ★P1-4b(완전 초기화 감사 확정 2026-08-16): factory-reset 의 Windows 계약
+      #   (%LOCALAPPDATA%\cys 가 **설치 디렉토리이자 상태 디렉토리** · schtasks 비활성 실측 ·
+      #   boot_id 허용오차 · 디렉토리 심링크 제거 · 훅 문자열 `bash "C:/…"`)은 지금까지
+      #   **feat/** 브랜치 레인에서만 돌았다. 태그(릴리스) 경로에 검증이 0이면, 브랜치를 거치지
+      #   않은 핫픽스 태그가 Windows 회귀를 그대로 싣는다 — 이 파일 자신이 규탄한 "태그 경로
+      #   보증 0" 구조의 재생산이다. 대상을 factory_reset:: 로 좁혀 예산을 지킨다.
+      - name: cargo test --lib factory_reset (Windows 계약 · 태그 레인)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
+
       - name: Windows 직접 빌드 + CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers · 업로드 전)
         if: matrix.platform == 'windows-latest'
         shell: bash

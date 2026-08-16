@@ -3751,13 +3751,15 @@ fn main() {
                     for attempt in 1..=20u32 {
                         // ★P1-3: 완전 초기화가 진행 중이면 데몬은 **일부러** 없는 것이다.
                         // 이 루프가 그걸 모르고 "로그인 항목을 허용하세요"라는 엉뚱한 처방을
-                        // 완료 모달과 나란히 띄웠다(시뮬레이션 지적). 재시도를 즉시 접는다.
+                        // 완료 모달과 나란히 띄웠다. 사유만 바로잡고 **재시도 루프만 접는다** —
+                        // ★여기서 return 하면 아래 event-forwarder·온보딩까지 통째로 건너뛰어
+                        // 그 앱 세션의 이벤트 파이프가 재실행 전까지 영구 사망한다(감사 확정).
                         if cys::factory_reset::reset_in_progress() {
                             let _ = handle.emit(
                                 "daemon-error",
                                 "완전 초기화가 진행 중입니다 — 끝난 뒤 앱을 종료했다가 다시 실행하세요.".to_string(),
                             );
-                            return;
+                            break;
                         }
                         let _ = handle.emit(
                             "daemon-error",
