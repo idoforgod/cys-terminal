@@ -6271,8 +6271,27 @@ fn apply_config_dir_override(
 /// 반환 = Some((stderr 1줄, directive.verify reason 에 부기할지)) / None = 발화 없음.
 ///  · mac ∧ claude ∧ true → **WARN**(D5 env 방어층이 우회된 fullscreen — 휠이 앱으로 들어가
 ///    프롬프트 히스토리 오염 경로가 열려 있다) + reason 부기 true.
-///  · win ∧ claude ∧ true → 힌트 1줄(경보 아님·차단 없음 — win fullscreen 옵트인은 문제2 동형
+///  · win ∧ claude ∧ true → 힌트 1줄(경보 아님·차단 없음 — win fullscreen 은 문제2 동형
 ///    발현이라 비지원 선언이고, 사용자가 원인을 자가진단할 단서만 남긴다) + reason 부기 false.
+///    ★정정(2026-08-17 실측): 이 분기를 'claude 쪽 설정을 건드린 사용자만 밟는다'고 적었던 종전
+///    문안은 틀렸다 — Claude Code 2.1.233 의 fullscreen 판정 함수 `ra()` 에 순수 Windows→inline
+///    분기가 없고 Windows 관련 분기는 `Windows ∧ SSH` 하나뿐이며, settings 의 `tui` 키가 없으면
+///    최종 판정은 서버측 기능 게이트가 한다. 즉 fullscreen 여부는 OS 가 아니라 계정·롤아웃이
+///    결정하므로 이 분기는 아무 설정도 만진 적 없는 win 사용자에게도 걸린다(그래서 힌트는
+///    유지하되 등급은 그대로 — 등급 상향은 win 에 차단 수단이 없는 상태에서 소음만 늘린다).
+///    ★등급이 mac(WARN)과 다른 이유가 강등 후 **하나 더 늘었다**: mac 은 D5 env 를 기본 주입하므로
+///    fullscreen 목격 = '기본 방어가 우회됨' 이라는 이상 신호지만, Windows 는 D5 가 **옵트인**
+///    (기본 미주입 — lib.rs `d5_gate_for_os` doc)이라 fullscreen 은 이상이 아니라 **기본 상태**다.
+///    기본 상태를 WARN 으로 찍으면 그것은 경보가 아니라 소음이다.
+///    ★문안 함정(고치지 마라 — 일부러 이렇게 적었다): 이 힌트를 실제로 찍는 곳은
+///    `boot_agent_on_surface` 안이고, 그 함수는 **기존 pane 재기동(node-recover)에도** 쓰인다.
+///    Windows 의 그 경로는 `render_launch` 의 env 를 폐기하므로(`let (send, _send_env) = …`),
+///    "agents.json env 를 확인하라"를 **확실한 해결책으로 안내하면 거짓말이 된다**. 그래서 문안은
+///    ①본체 방어가 GUI 휠 가드임을 먼저 밝히고 ②env 경로는 '새 surface 를 만드는 launch-agent
+///    기동에서만 실린다'는 조건을 붙여 말하며 ③**Windows 의 D5 는 옵트인이라 스위치를 먼저 켜야
+///    한다**는 조건을 함께 말한다(③ 이 빠지면 "새 pane 을 띄우면 된다"가 거짓 안내가 된다 —
+///    기본값에서는 새 pane 을 띄워도 그 env 가 주입되지 않는다). 진리표 핀은 `hint` 토큰과 부기
+///    false 만 보므로 문안 개정은 자유롭다 — 다만 이 세 조건절을 지우지 마라.
 /// OS 를 인자로 받아 어느 호스트에서든 양 분기를 테스트한다(lib compose_pane_path 관례).
 fn alt_screen_notice(
     alt_screen: Option<bool>,
@@ -6296,8 +6315,20 @@ fn alt_screen_notice(
     if is_windows {
         return Some((
             "[launch-agent] hint: claude 가 alternate screen(fullscreen)으로 떴습니다 — Windows \
-             fullscreen 은 비지원(옵트인 시 휠 방향키 합성 잔존 — 릴리스 노트 '알려진 제한'). \
-             settings 의 tui 키를 제거하면 inline 으로 복귀합니다."
+             fullscreen 은 비지원(릴리스 노트 '알려진 제한'). fullscreen 여부는 OS 가 아니라 \
+             계정·롤아웃이 결정하므로 설정을 만진 적이 없어도 이렇게 뜹니다: settings 의 tui 키 \
+             제거는 판정을 서버측 기능 게이트에 넘길 뿐 inline 을 보장하지 않습니다. 휠→방향키 \
+             합성 오염은 GUI 의 Windows 휠 가드가 막습니다 — 끄려면 PowerShell 에서 \
+             `New-Item -ItemType File -Force $HOME\\.cys\\win-wheel-guard-off` 를 실행한 뒤 \
+             **새 pane 을 여세요** (`touch` 는 PowerShell·cmd 에 없는 명령입니다. 되돌리기 \
+             취소는 Remove-Item). \
+             env(CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN)로 inline 을 강제하려면 **두 가지가 함께** \
+             필요합니다 — ①Windows 는 이 env 주입이 **기본 off(옵트인)** 입니다(실기 검증 전이라 \
+             그렇습니다): `New-Item -ItemType File -Force $HOME\\.cys\\win-no-alt-screen` \
+             (되돌리기 Remove-Item · env CYS_WIN_NO_ALT_SCREEN=1 도 동등하나 GUI 재시작 필요). \
+             ②그 뒤 이 pane 이 아니라 **새 pane 을 launch-agent 로 기동**하세요 — Windows 에서 \
+             env 는 새 surface 를 만들 때만 실립니다(기존 pane 재기동 경로는 env 를 싣지 \
+             못합니다). agents.json 에 '0' 이 적혀 있으면 옵트인해도 주입하지 않습니다."
                 .to_string(),
             false,
         ));
@@ -6351,9 +6382,27 @@ fn boot_agent_on_surface(
     // (주입은 run_launch_agent_opts의 surface.create에서 이미 수행) — send 문자열만 취한다.
     let mut env_pairs = agent_env_pairs(spec);
     apply_config_dir_override(&mut env_pairs, restore, config_dir);
-    // ★D5(v4 · W4): mac claude 에 fullscreen(alternate screen) 차단 기본값을 주입 — spec env 에
-    // 키가 **부재할 때만**(사용자 "0" 옵트인 불가침·append+sort 금지 함정은 lib 헬퍼 주석 참조).
-    // 게이트 = cfg!(macos) ∧ extract_bin(cmd)=='claude'(:1081 헬퍼 재사용 — 어댑터 키 개명 내성).
+    // ★D5(v4 · W4): claude 에 fullscreen(alternate screen) 차단 기본값을 주입 — spec env 에
+    // 키가 **부재할 때만**(사용자 "0" 불가침 — fullscreen 되살리기 · append+sort 금지 함정은
+    // lib 헬퍼 주석 참조).
+    // 게이트 = `d5_gate_for_os(OS, d5_win_opt_in())` ∧ extract_bin(cmd)=='claude'
+    // (`fn extract_bin` 헬퍼 재사용 — 어댑터 키 개명 내성).
+    // ★게이트 매핑은 **mac = 무조건 · Windows = 옵트인(`~/.cys/win-no-alt-screen` ·
+    // `CYS_WIN_NO_ALT_SCREEN=1`)했을 때만 · 그 외 = 미주입**이다. Windows 가 기본이 아닌 이유
+    // (앵커 ④ 전 pane 사망 위험 · 실기 스모크 B-5 미수행)와 기본 on 승격 절차는 lib.rs 의
+    // `d5_gate_for_os` doc 이 정본이다.
+    //
+    // ★★그리고 **이 호출은 Windows 에서 pane 에 도달하지 않는다**(옵트인해도 그렇다).
+    // 바로 아래 `let (send, _send_env) = render_launch(...)` 가 증거다: unix 는 env 를 `KEY="val" cmd`
+    // 인라인으로 send 문자열에 실어 셸이 전개하지만, Windows 는 순수 cmd 만 보내고 env 는
+    // `_send_env` 로 **폐기**된다(이 경로엔 surface.create 가 없다 — 이미 존재하는 pane 에 붙는다).
+    // 저장소 자신이 같은 구멍을 restore 의 계정격리 가드(E8) 주석에 문서화하고 있다
+    // (grep `★계정격리 가드(E8)` — Windows 는 순수 cmd 라 CLAUDE_CONFIG_DIR 이 실리지 않아
+    // 빈 좌석 재연결이 fail-closed 한다). ∴ Windows 에서 이 벨트가 실제로
+    // 닿는 경로는 run_launch_agent_opts 의 surface.create env 맵 하나뿐이고, Windows 휠 오염의
+    // **본체 방어는 UI 가드**(ui/src/wheelgate.ts 의 shouldSuppressWheelWin)다. 여기 호출이
+    // 있다는 이유로 "Windows 는 env 로 막힌다"고 판단하지 마라 — 규약 단일화(사본 금지)를 위해
+    // 두 소비처가 모두 lib 헬퍼를 경유할 뿐이다.
     cys::inject_claude_alt_screen_default(&mut env_pairs, extract_bin(&cmd, agent));
     let (send, _send_env) = render_launch(&cmd, &env_pairs);
     // ★(W2 · B4) **기동 send 직전 line_count 스냅샷** — readiness 판정의 시간 귀속 기준선.
@@ -7053,8 +7102,19 @@ fn run_launch_agent_opts(
         // PTY spawn 시 builder.env로 주입한다(순수 cmd send와 짝). unix는 빈 맵 — 셸 인라인 전개가
         // 진실원(무회귀). render_launch와 동일 규약이라 두 경로 결정론 일치.
         // ★D5(v4 · W4): 두 소비처(여기 surface.create env 맵 · boot_agent_on_surface 인라인
-        // 재조립)가 **모두 lib 헬퍼를 경유**한다(사본 금지). mac 은 unix 인라인 전개가 진실원이라
-        // 이 맵이 비어 무영향이고, 게이트(mac ∧ claude)상 win 은 미삽입 — 규약만 단일화한다.
+        // 재조립)가 **모두 lib 헬퍼를 경유**한다(사본 금지).
+        // · mac: unix 는 인라인 `KEY="val" cmd` 전개가 진실원이라 render_launch 가 이 맵을 비워
+        //   보낸다 → 여기 삽입은 무영향(규약 단일화 목적).
+        // · Windows: 게이트가 **옵트인**(`~/.cys/win-no-alt-screen` · `CYS_WIN_NO_ALT_SCREEN=1`)
+        //   일 때만 참이므로, **기본값에서는 여기서 아무것도 삽입되지 않는다**(강등 전 출고본과
+        //   동일 — 2026-08-17 강등, 근거·승격 절차는 lib.rs `d5_gate_for_os` doc).
+        //   옵트인한 경우에만 삽입되고, 그때는 실제로 pane 에 실린다 — Windows 는 순수 cmd send 라
+        //   env 를 인라인으로 못 싣고 데몬이 surface.create 의 이 맵을 PTY spawn 시 builder.env 로
+        //   주입하기 때문이다. ★즉 **이 경로가 D5 env 벨트가 Windows 에서 도달하는 유일한 경로**다
+        //   (새 surface 를 만들며 기동하는 launch-agent 한정 — 기존 pane 에 붙는
+        //   boot_agent_on_surface 는 env 를 폐기하고, Tauri GUI 의 create_surface 는 env 를 아예
+        //   넘기지 않는다: src-tauri/src/main.rs 의 surface.create 페이로드 참조).
+        //   그래서 이것은 '벨트'이고 본체는 UI 가드(ui/src/wheelgate.ts)다 — lib 헬퍼 주석 정본.
         let mut create_env_pairs = agent_env_pairs(&spec);
         cys::inject_claude_alt_screen_default(
             &mut create_env_pairs,
@@ -12934,7 +12994,14 @@ mod tests {
     /// ★D5 두-소비처 회귀 핀(v4 · W4): 주입 로직이 lib 헬퍼 단일 SOT 라도, **두 소비처**
     /// (boot_agent_on_surface 인라인 재조립 · run_launch_agent_opts surface.create env 맵)의
     /// 합성 결과에서 각각 검증한다 — 사용자 "0"(agents.json env) 이 있으면 최종 산출 어디에도
-    /// "1" 미출현, 키 부재 + mac claude 면 삽입. (CI 상주 핀은 lib claude_alt_screen_env_injection_pins.)
+    /// "1" 미출현, 키 부재 + claude 면 삽입. (CI 상주 핀은 lib claude_alt_screen_env_injection_pins.)
+    ///
+    /// ★lib.rs 핀과의 분업(중복 아님): **게이트 값**(OS × 옵트인 매핑)은 lib.rs 의
+    /// `claude_alt_screen_env_injection_pins` ④ 가 어느 호스트에서든 전 행을 조회해 고정한다.
+    /// 여기가 고정하는 것은 그 값이 **OS별 파이프라인의 실제 산출물**로 이어지는 배선이다 —
+    /// 아래 ②(mac)·②-win(windows)은 서로 **다른 산출물**(인라인 send 문자열 vs surface.create
+    /// env 맵)을 보므로 각 OS 의 CI 에서만 컴파일·실행된다. lib 핀이 초록이어도 여기가 빨갛다면
+    /// '게이트는 맞는데 그 OS 에서 env 가 실리는 자리가 틀렸다'는 뜻이다.
     #[test]
     fn d5_env_injection_covers_both_consumers() {
         let cmd = "claude --dangerously-skip-permissions";
@@ -12979,6 +13046,53 @@ mod tests {
             assert!(
                 send2.contains("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=\"1\""),
                 "mac claude 키 부재면 기본 '1' 이 인라인에 실려야 한다: {send2}"
+            );
+        }
+        // ②-win ★Windows 파이프라인 핀(Windows 호스트에서만 컴파일·실행 — windows-health 의
+        //  `cargo test --bin cys d5_env_injection` 스텝이 유일한 실행처). 검증 대상이 mac 과
+        //  **다르다**: Windows 는 인라인 `KEY="val" cmd` 전개를 쓰지 않아 send 가 순수 cmd 이므로,
+        //  주입이 실리는 곳은 surface.create 로 넘어가는 **env 맵**이다(데몬이 PTY spawn 시
+        //  builder.env 로 주입한다). 그래서 키를 찾는 위치가 send2 가 아니라 inject2 다.
+        //
+        //  ★2026-08-17 강등 개정(의미가 바뀐 핀): Windows 의 D5 는 **기본 off · 옵트인 시에만**
+        //   주입이다(lib.rs `d5_gate_for_os` doc — 앵커 ④ · 실기 스모크 B-5 미수행). 그래서 두 행을
+        //   **모두** 고정한다: ⓐ기본(미옵트인) = 키 미출현 ⓑ옵트인 = "1" 출현.
+        //  ★게이트 값을 `inject_claude_alt_screen_default`(래퍼)가 아니라 `d5_gate_for_os` 로
+        //   **명시해 먹인다**: 래퍼는 러너 홈의 파일·env 를 읽으므로 CI 환경 상태에 따라 결과가
+        //   흔들려 두 행을 결정론으로 고정할 수 없다. 여기서 보려는 것은 옵트인 판독기가 아니라
+        //   **게이트 값 → 파이프라인 산출물** 배선이다(판독기 자체는 형제 게이트와 동형 1줄).
+        #[cfg(windows)]
+        {
+            let bare = serde_json::json!({"cmd": cmd, "env": {}});
+            // ⓐ 기본(옵트인 없음) — 강등 전 출고본과 동일하게 **아무것도 실리지 않는다**.
+            let mut default_pairs = agent_env_pairs(&bare);
+            cys::inject_claude_alt_screen_default_for(
+                &mut default_pairs,
+                extract_bin(cmd, "claude"),
+                cys::d5_gate_for_os("windows", false),
+            );
+            let (send_d, inject_d) = render_launch(cmd, &default_pairs);
+            assert_eq!(send_d, cmd, "windows send 는 순수 cmd 여야 한다(인라인 전개 없음): {send_d}");
+            assert!(
+                !inject_d
+                    .iter()
+                    .any(|(k, _)| k == cys::ENV_CLAUDE_NO_ALT_SCREEN),
+                "windows 기본(미옵트인)은 create env 맵에 D5 키가 없어야 한다: {inject_d:?}"
+            );
+            // ⓑ 옵트인 — 그때는 create env 맵에 "1" 이 실린다(이 경로가 Windows 유일 도달 경로).
+            let mut opt_in_pairs = agent_env_pairs(&bare);
+            cys::inject_claude_alt_screen_default_for(
+                &mut opt_in_pairs,
+                extract_bin(cmd, "claude"),
+                cys::d5_gate_for_os("windows", true),
+            );
+            let (send2, inject2) = render_launch(cmd, &opt_in_pairs);
+            assert_eq!(send2, cmd, "windows send 는 순수 cmd 여야 한다(인라인 전개 없음): {send2}");
+            assert!(
+                inject2
+                    .iter()
+                    .any(|(k, v)| k == cys::ENV_CLAUDE_NO_ALT_SCREEN && v == "1"),
+                "windows 옵트인 + 키 부재면 create env 맵에 '1' 이 실려야 한다: {inject2:?}"
             );
         }
         // ③ 타 에이전트(codex) — 어느 소비처에도 미삽입.

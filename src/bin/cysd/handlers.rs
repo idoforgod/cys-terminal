@@ -2681,6 +2681,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     FEED_REQ_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 )
             });
+            // ★`daemon-` 접두는 **데몬 예약 네임스페이스**다 — 클라이언트 지정값으로는 만들 수
+            //   없다(적대검증 2R). 이 접두는 이 저장소에서 '데몬이 화면 패턴으로 감지해 올린
+            //   승인'의 **식별자**로 쓰인다: state.rs 의 has_pending_daemon_approval·
+            //   pending_daemon_approvals, governance.rs 의 approval.stalled 스캔, 그리고 GUI 의
+            //   '데몬 감지 항목' 분기(ui/src/main.ts)가 전부 같은 판정을 본다.
+            //   ※ 그 판정의 단일 정의처는 `state::is_daemon_issued`(접두 정의 = DAEMON_REQ_PREFIX)
+            //     이고, GUI 는 리터럴을 재구현하는 대신 feed.list 가 실어 주는 파생 필드
+            //     `daemon_issued` 를 읽는다(아래 feed.list arm).
+            //   push 경로가 그 접두를 그대로 받아 주면 아무 프로세스나
+            //   `cys feed push --kind approval --request-id daemon-… --wait` 로
+            //   ①GUI 에서 Allow 버튼을 사라지게 만들고(오너가 승인할 수 없다 — '치우기'는
+            //     decision="dismissed" 라 CLI 매핑상 exit 2 = 거부로 종결된다)
+            //   ②그 surface 의 L3 코얼레싱 가드를 상시 참으로 만들어 **진짜** 데몬 승인 감지의
+            //     발행을 억제할 수 있다.
+            //   ∴ 여기서 fail-closed 로 거부한다. 정품 발행 경로는
+            //   Daemon::push_feed_notification(state.rs) 하나뿐이고 그것은 이 핸들러를 지나지
+            //   않는다. 저장소 안에 이 접두를 명시 지정하는 호출자는 0건이다(pack·scripts 실측).
+            if crate::state::is_daemon_issued(&request_id) {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "request_id prefix 'daemon-' is reserved for daemon-issued items",
+                ));
+            }
             let wait = params
                 .get("wait")
                 .and_then(|v| v.as_bool())
@@ -2925,6 +2949,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "body": i.body, "surface_id": i.surface_id, "status": i.status,
                         "decision": i.decision, "created_at": i.created_at,
                         "resolved_at": i.resolved_at, "tier": i.tier,
+                        // ★파생 필드(2026-08-17 · 성찰3 설계렌즈 major): '데몬이 스스로 발행한
+                        //   항목인가'를 **서버 사실로** 실어 준다. 종전에는 GUI 가 request_id 의
+                        //   `daemon-` 접두를 스스로 다시 파싱했고(교차 모듈 계약이 매직 스트링
+                        //   복제로 표현됨), 그 자리의 주석은 '서버 필드를 쓸 수 없다 — feed.list
+                        //   가 직렬화하지 않는다'고 적혀 있었다. 그 전제를 여기서 없앤다.
+                        //   판정의 정의처는 state::is_daemon_issued 하나다.
+                        "daemon_issued": crate::state::is_daemon_issued(&i.request_id),
                     })
                 })
                 .collect();
@@ -7591,6 +7622,104 @@ mod tests {
             }
         }
         assert_eq!(tier_none.as_deref(), Some("d"), "무태그는 이벤트에 d로 표기(fail-closed)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★`daemon-` 접두 예약 네임스페이스 (적대검증 2R 수리 핀).
+    ///
+    /// 이 접두는 '데몬이 화면 패턴으로 감지해 올린 승인'의 식별자로 네 곳이 공유한다
+    /// (state.rs 의 has_pending_daemon_approval·pending_daemon_approvals, governance.rs 의
+    /// approval.stalled 스캔, GUI 의 데몬 감지 분기). 클라이언트가 그 접두를 지정할 수 있으면
+    /// ①GUI 에서 Allow 가 사라져 오너가 승인할 수 없고(치우기는 exit 2=거부로 종결)
+    /// ②그 surface 의 L3 코얼레싱 가드를 상시 참으로 만들어 진짜 감지 발행을 억제한다.
+    /// ∴ push 경로에서 fail-closed 로 거부한다. 정품 발행은 push_feed_notification 전용 경로다.
+    #[test]
+    fn feed_push_rejects_reserved_daemon_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys_feed_resv_{}_{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+
+        // ① 예약 접두 → invalid_params 거부 + 항목 미생성(부작용 0).
+        let req = Request {
+            id: json!(1),
+            method: "feed.push".into(),
+            params: json!({"kind": "approval", "title": "spoof", "body": "b",
+                           "request_id": "daemon-1-0", "wait": false}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(false), "예약 접두는 거부돼야 한다: {resp}");
+        assert_eq!(resp["error"]["code"].as_str(), Some("invalid_params"), "{resp}");
+        assert!(
+            daemon.feed_items.lock().unwrap().is_empty(),
+            "거부된 push 는 항목을 만들지 않아야 한다(부작용 0)"
+        );
+
+        // ② 데몬 자신의 발행 경로는 같은 접두를 계속 쓴다 — 핸들러를 지나지 않는다.
+        daemon.push_feed_notification("approval", "t", "b", Some(1));
+        assert!(
+            daemon
+                .feed_items
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|i| i.request_id.starts_with("daemon-")),
+            "정품 데몬 발행은 daemon- 접두를 그대로 만든다"
+        );
+        assert!(
+            daemon.has_pending_daemon_approval(1),
+            "정품 발행은 데몬 감지 판별식에 그대로 걸린다(회귀 0)"
+        );
+
+        // ③ 일반 접두는 종전대로 통과(정상 경로 무회귀).
+        let ok_req = Request {
+            id: json!(2),
+            method: "feed.push".into(),
+            params: json!({"kind": "permission", "title": "t", "body": "b",
+                           "request_id": "req-normal", "wait": false}),
+        };
+        let Reply::Single(ok_resp) = dispatch(&daemon, ok_req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(ok_resp["ok"], json!(true), "{ok_resp}");
+
+        // ④ feed.list 가 '데몬 발행인가'를 **파생 필드로** 실어 준다(2026-08-17 · 성찰3 설계렌즈).
+        //    GUI 는 이 필드를 읽고 접두를 재파싱하지 않는다 — 교차 모듈 계약의 진리원을
+        //    state::is_daemon_issued 하나로 모으는 것이 이 단언의 목적이다.
+        //    ★판별력: 필드를 지우거나 상수(true/false)로 굳히면 아래 두 줄 중 하나가 반드시 깨진다
+        //      (정품 데몬 항목 1건 + 일반 push 항목 1건을 같은 목록에서 대조하기 때문).
+        let Reply::Single(list) = dispatch(
+            &daemon,
+            Request { id: json!(3), method: "feed.list".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        let items = list["result"]["items"].as_array().expect("items array");
+        let daemon_item = items
+            .iter()
+            .find(|i| i["request_id"].as_str().unwrap_or("").starts_with("daemon-"))
+            .expect("정품 데몬 발행 항목이 목록에 있어야 한다");
+        let normal_item = items
+            .iter()
+            .find(|i| i["request_id"] == json!("req-normal"))
+            .expect("일반 push 항목이 목록에 있어야 한다");
+        assert_eq!(
+            daemon_item["daemon_issued"],
+            json!(true),
+            "데몬 발행 항목은 daemon_issued=true 로 직렬화돼야 한다: {daemon_item}"
+        );
+        assert_eq!(
+            normal_item["daemon_issued"],
+            json!(false),
+            "클라이언트 발행 항목은 daemon_issued=false 여야 한다: {normal_item}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

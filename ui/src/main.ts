@@ -29,7 +29,13 @@ import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } fro
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
-import { shouldSuppressWheel } from "./wheelgate";
+import {
+  shouldSuppressWheel,
+  shouldSuppressWheelWin,
+  wheelHandlerKind,
+  macGateInputs,
+  winGateInputs,
+} from "./wheelgate";
 import { ceoPaletteEntries } from "./selfdiag";
 import {
   toastTtl,
@@ -360,6 +366,12 @@ function setCcOpen(open: boolean) {
     if (ccTimer != null) { clearInterval(ccTimer); ccTimer = null; }
     if (ccHwTimer != null) { clearInterval(ccHwTimer); ccHwTimer = null; }
     if (ccClockTimer != null) { clearInterval(ccClockTimer); ccClockTimer = null; }
+    // 대기 렌더 상한 복원 — feedPendingExpanded 선언 주석이 '패널을 닫으면 되돌린다'고 적고
+    // 있었는데 이 경로에 그 코드가 없어 **거짓 계약**이었다(성찰3 설계렌즈 minor). 재열기가
+    // 리셋을 보장하지도 않는다: 재열기의 setCcTab(ccTab) 은 `ccDensity !== "glance"` 조건부라
+    // glance 밀도에서는 상한이 풀린 채 돌아온다. 주석을 좁히는 대신 코드를 참으로 만든다 —
+    // 패널을 닫는 것은 자연스러운 '처음부터' 경계이고, 되살리는 비용은 '더 보기' 클릭 1회다.
+    feedPendingExpanded = false;
   }
 }
 
@@ -502,7 +514,12 @@ function setCcTab(view: CcTab) {
   if (view === "learn") refreshLearn();
   if (view === "board") refreshBoard();
   if (view === "tasks") refreshTasks();
-  if (view === "feed") refreshFeed();
+  if (view === "feed") {
+    // 탭 진입 시 대기 렌더 상한을 되살린다 — '더 보기'로 푼 확장이 세션 내내 상주하면
+    // 5초 주기 refreshFeed 가 매번 전건 DOM 을 재구성한다(상한을 둔 취지가 사라진다).
+    feedPendingExpanded = false;
+    refreshFeed();
+  }
   if (view === "alarms") renderAlarmHistory();
   if (view === "office") openOfficeView();
 }
@@ -1575,7 +1592,24 @@ const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
 type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
 const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
-let pendingApprovals = 0; // org.status feed.pending 집계
+let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 구동 — 이 값만 배지가 쓴다)
+// 같은 순회의 **소켓별** 대기 수. 배너("다른 워크스페이스에 N건")가 이 맵을 직접 읽는다.
+// ★왜 합계를 나누는가(성찰3 설계렌즈 minor): 종전 배너는 `pendingApprovals - pendingItems.length`
+//   라는 **스코프가 다른 두 카운터의 뺄셈**이었다 — 피감수는 기본 데몬 feed_list 목록 길이,
+//   감수는 전 소켓 합산이라 (ⓐ부서 데몬 1개가 일시 미응답이면 그 소켓이 0으로 접혀 결과가
+//   과소·음수(배너 소실) (ⓑ두 조회 사이 스큐로 과대(→ '다른 워크스페이스에 N건' 오안내)가
+//   났다. 소켓별로 갖고 있으면 뺄셈이 사라지고 '기본 소켓이 아닌 것들의 합'을 직접 읽는다.
+// 키 = Workspace.socket ?? DEFAULT_SOCKET_KEY(=기본 데몬). 값 = 마지막으로 **성공 조회한** 대기 수.
+const pendingBySocket = new Map<string, number>();
+const DEFAULT_SOCKET_KEY = ""; // Workspace.socket === undefined(기본 데몬)의 맵 키
+// 기본 데몬이 **아닌** 소켓들의 대기 합 — 승인 Feed 목록(기본 데몬 전용)이 원리적으로 닿지
+// 못하는 건수다. 파생이 아니라 직접 합이므로 음수가 될 수 없고, 기본 데몬 목록의 길이·갱신
+// 시점과 무관하다(두 조회 사이 스큐가 문구를 오염시키지 않는다).
+const otherSocketPending = (): number => {
+  let n = 0;
+  for (const [sock, cnt] of pendingBySocket) if (sock !== DEFAULT_SOCKET_KEY) n += cnt;
+  return n;
+};
 const root = document.getElementById("root")!;
 
 // ---------- 배경 테마 커스텀 (cys-bg-color) ----------
@@ -1957,11 +1991,136 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // UI 가 문자열을 조립해 보내는 호출(전출 지시·launchCmd·restartNode·injectRawToPane)에만
   // 표식을 붙인다. 새 자동 주입을 추가할 때 이 구분을 지키는 것이 R5 봉합의 유일한 전제다.
   let sendChain: Promise<unknown> = Promise.resolve();
+
+  // ── 전송 실패 표면화(무음 삼킴 금지 · W-3) ─────────────────────────────────────
+  // ★고친 결함: 종전 `.catch(() => {})` 는 데몬의 acl_denied·process_exited·write_stalled·
+  //   write_failed(소켓/writer 절단)를 **전부 무음 처리**했다. 그래서 cso·worker pane 이 입력을
+  //   전혀 받지 못하는 실제 결함이 "키를 쳐도 아무 일이 없다"로만 나타나고 화면에도 알람 이력에도
+  //   흔적이 0이라, 사용자는 물론 조사팀조차 원인을 볼 수 없었다. 대조군 injectRawToPane(아래
+  //   injectRawToPane 정의)은 같은 invoke("send_input") 실패를 토스트한다 — 그 형태를 따른다.
+  // ★catch 는 반드시 유지한다(제거 금지): sendChain 은 pane 수명 전체를 잇는 **단일 promise
+  //   체인**이라 거부가 체인에 남으면 이후 모든 then 이 건너뛰어져 그 pane 의 입력이 영구히 죽는다.
+  //   ∴ 이 수리는 '삼킴 제거'가 아니라 '삼키던 자리에서 표면화'다.
+  // ★토스트 폭주 방지(빠른 타자에서 매 키가 실패하면 초당 수십 건): ①sticky 토스트 id 를 pane
+  //   당 하나로 고정 — stickyToast 는 같은 id 재호출 시 엘리먼트를 재사용하고 TTL 만 리셋하므로
+  //   화면에는 언제나 한 줄만 남는다 ②표시 간격을 쿨다운(3초)으로 **무조건** 제한하고, 그 창의
+  //   실패는 건수로 합산해 1회만 낸다.
+  //   ★쿨다운에 예외를 두지 않는 이유(적대검증 지적 반영 — 초판 결함): 초판은 '사유가 바뀌면
+  //   즉시 표시'라는 예외를 뒀는데, 그러면 **두 사유가 번갈아 오는 순간 가드가 완전히 무력**해진다
+  //   (매 실패가 changed=true → wait=0 → 키마다 토스트 = 막겠다던 초당 수십 건이 그대로 재현).
+  //   실패 사유가 흔들리는 상황은 드물지 않다(예: 절단 직후 write_failed 와 process_exited 교대).
+  //   ∴ 예외를 없애고 대신 **정보는 지연될 뿐 소실되지 않게** 한다: 창 안에 새 사유가 오면 표시할
+  //   사유를 최신 것으로 갈아끼우고 예약된 flush 를 그대로 두므로, 최대 3초 뒤 최신 사유가 뜬다.
+  //   (첫 실패는 sendFailShownAt=0 이라 언제나 wait=0 = 즉시 — 최초 통지 지연은 없다.)
+  //   ★건수 의미: '마지막 표시 이후 이 창에서 누적된 전 실패 수'다. 사유가 바뀌어도 리셋하지 않고
+  //   이어 세며(표시되는 사유만 최신으로 교체), flush 가 표시 직후 0 으로 되돌린다 — 초판은 flush
+  //   에서 리셋하지 않아 (3건)→(60건)→(1200건) 처럼 **단조 증가**했다. 소실되는 정보는 '창 안의
+  //   이전 사유 문자열' 하나뿐이고, 창이 최대 3초라 실용상 무해하다.
+  //   합산 대기 중인 타이머는 pane 당 최대 1개·최대 3초짜리이고, pane 파기 시 unlisten 배열의
+  //   cancelSendFail 이 정리한다(닫힌 pane 의 유령 토스트 차단).
+  // ★flush 는 **예외를 밖으로 내보내지 않는다**(try/catch 필수 — 위 '체인 유지' 계약의 짝):
+  //   noteSendFail 은 `.catch(...)` 안에서 **동기로** 실행될 수 있고(wait===0 경로), 거기서 예외가
+  //   하나라도 새면 catch 의 반환 promise 가 rejected 로 굳어 sendChain 이 영구 거부 = 그 pane 의
+  //   입력이 죽는다 — 무음 삼킴을 고치려던 코드가 정확히 그 결함보다 나쁜 결함을 만드는 셈이다.
+  //   현재 stickyToast 경로가 실제로 throw 하지는 않지만(#toasts 는 index.html 에 정적으로 존재),
+  //   불변식이 **외부 DOM 의 존재**에만 의존하게 두지 않는다.
+  // ★사유는 원문 그대로 보인다: send_input 은 rpc_on 경로라 데몬의 error.code 가 UI 까지 오지
+  //   않고 message 만 온다(src-tauri/src/main.rs 의 rpc_on — error.message 만 String 으로 승격).
+  //   ∴ feedReplyErrorText 같은 코드 기반 분류를 쓸 수 없다. 대신 데몬 메시지가 이미 자기설명적이다
+  //   ("surface process has exited" / "surface input channel full (pane not consuming input)" 등).
+  //   ★상한값 3초의 근거(임의 수가 아니다): ①이 창이 곧 표시 상한을 정의한다 — 표시는 창당
+  //   1회이므로 **3초에 1회(≈0.33건/초)·pane 당**이 실제 상한이고, 화면에 남는 줄은 아래
+  //   sendFailToastId 고정 재사용으로 언제나 1줄이다. ②창은 '합산이 실제로 일어나는' 길이여야
+  //   한다: 빠른 타자·키 자동반복은 초당 수십 건까지 가므로 3초면 그 수십~수백 건이 1줄로
+  //   접힌다(창이 100~200ms 면 접히는 게 거의 없어 가드가 사실상 없는 것과 같다).
+  //   ③창은 sticky 토스트 수명(STICKY_TTL_MS=60초,
+  //   toastttl.ts)보다 훨씬 짧아야 한다 — 창이 TTL 에 가까우면 갱신 전에 토스트가 만료돼
+  //   "실패가 이어지는데 화면은 비어 있는" 구간이 생긴다. 3초는 ②와 ③ 사이에서 넉넉히 안전하다.
+  const SEND_FAIL_COOLDOWN_MS = 3000;
+  const sendFailToastId = `send-fail-${socket ?? ""}-${sid}`;
+  let sendFailReason = "";
+  let sendFailCount = 0;
+  let sendFailShownAt = 0;
+  let sendFailTimer: number | undefined;
+  const flushSendFail = () => {
+    sendFailTimer = undefined;
+    sendFailShownAt = Date.now();
+    const n = sendFailCount > 1 ? ` (${sendFailCount}건)` : "";
+    const reason = sendFailReason;
+    sendFailCount = 0; // 표시했으므로 창을 닫는다 — 미리셋 시 라벨이 단조 증가한다.
+    try {
+      const label = titleEl.textContent || `surface ${sid}`;
+      stickyToast(sendFailToastId, "health", `입력 전송 실패${n}`, `${label} — ${reason}`);
+    } catch (err) {
+      // 표시 실패는 여기서 끝낸다 — 밖으로 새면 sendChain 이 영구 거부로 굳는다(위 계약).
+      // 무음 삼킴은 아니다: 최후 폴백으로 콘솔에 남긴다. 그 콘솔 호출조차 실패할 수 있으므로
+      // (WebView 확장·후킹이 console 을 갈아끼운 경우) 한 겹 더 감싸 침묵으로 끝낸다.
+      // ※정직 표기: 릴리스 빌드에는 devtools 가 없어 이 줄은 개발 빌드에서만 읽힌다. 그래도
+      //   토스트 경로가 통째로 깨졌을 때 남는 유일한 흔적이라 둔다(사용자 통지 수단은 아니다).
+      try {
+        console.error("[send-fail] 토스트 표시 실패", err);
+      } catch {
+        /* 최후 폴백의 폴백 — 여기서는 아무것도 하지 않는다(계약: 절대 throw 금지). */
+      }
+    }
+  };
+  const noteSendFail = (e: unknown) => {
+    try {
+      sendFailReason = String(e); // 표시할 사유는 언제나 최신 것(창 안 교체 — 지연될 뿐 미소실)
+      sendFailCount++;
+      // 마지막 표시로부터 쿨다운이 찰 때까지 합산한다(예외 없음 — 위 폭주 가드 근거).
+      // ★Math.min 상한: Date.now() 는 단조가 아니다(NTP 보정·수동 시계 변경으로 뒤로 뛴다).
+      //   그러면 sendFailShownAt 이 미래가 되어 wait 이 쿨다운을 훨씬 넘고, 토스트가 그 차이만큼
+      //   (최악 수 시간) 지연되는 기아가 생긴다. 대기는 어떤 경우에도 창 길이를 넘지 않는다.
+      const wait = Math.min(
+        SEND_FAIL_COOLDOWN_MS,
+        Math.max(0, SEND_FAIL_COOLDOWN_MS - (Date.now() - sendFailShownAt)),
+      );
+      if (wait === 0) {
+        if (sendFailTimer !== undefined) {
+          clearTimeout(sendFailTimer);
+          sendFailTimer = undefined;
+        }
+        flushSendFail();
+      } else if (sendFailTimer === undefined) {
+        // 이미 예약돼 있으면 재예약하지 않는다 — 재예약은 실패가 이어지는 동안 경계를 계속
+        // 뒤로 밀어 토스트가 **영영 안 뜨는** 기아를 만든다(초판의 clearTimeout+재예약 결함).
+        sendFailTimer = window.setTimeout(flushSendFail, wait);
+      }
+    } catch (err) {
+      // 상동 — 표면화 실패가 입력 경로를 죽이는 일은 없어야 한다.
+      // (여기까지 오는 경로 예: String(e) 가 toString 이 던지는 객체를 받는 경우.)
+      try {
+        console.error("[send-fail] 실패 기록 실패", err);
+      } catch {
+        /* 최후 폴백의 폴백 — 아무것도 하지 않는다(계약: 절대 throw 금지). */
+      }
+    }
+  };
+  // ★거부 0 증명 — sendChain 이 rejected 로 굳는 경로가 없음을 코드로 확인한 결과(실측):
+  //  ⓐ sendChain 이 코드에 등장하는 곳은 셋뿐이다 — 선언(`= Promise.resolve()`), 아래 sendRaw 의
+  //    대입(`.then(() => invoke(...)).catch(noteSendFail)`), 그리고 그 `return sendChain`.
+  //    ∴ 체인에 붙는 핸들러는 그 then·catch 한 쌍이 전부다(pane 클로저 밖으로 새지 않는다).
+  //  ⓑ then 콜백의 동기 예외와 invoke 의 거부는 **바로 뒤 catch** 가 전부 받는다.
+  //  ⓒ 그 catch 핸들러(noteSendFail)는 본문 전체가 try/catch 안이고, 내부에서 부르는
+  //    flushSendFail 도 마찬가지이며, 두 catch 의 폴백(console)도 다시 try/catch 다.
+  //    ∴ noteSendFail 은 throw 하지 않는다. 또 아무것도 반환하지 않으므로(undefined)
+  //    catch 가 만드는 promise 는 thenable 흡수 없이 **항상 이행**된다.
+  //  ⓓ ∴ 매 sendRaw 가 새로 대입하는 sendChain 은 언제나 fulfilled 로 정착한다 —
+  //    이후 then 이 건너뛰어져 pane 입력이 죽는 경로는 0이다.
+  //  ⓔ 반환값도 안전하다: sendRaw 의 호출자(onData 경로 · 초기 "\x1b\r" 전송)는 반환 promise 에
+  //    핸들러를 달지 않으며, 달더라도 ⓓ에 의해 거부가 오지 않는다(unhandledrejection 0).
+  // pane 파기 훅(unlisten 배열에 실어 destroyPaneRuntime 이 호출) — 대기 중 토스트 취소.
+  const cancelSendFail = () => {
+    if (sendFailTimer !== undefined) clearTimeout(sendFailTimer);
+    sendFailTimer = undefined;
+  };
+
   const sendRaw = (data: string) => {
     follow = true; // 입력 = 프롬프트 사용 의사 — 바닥 고정 재개(xterm scrollOnUserInput과 정합)
     sendChain = sendChain
       .then(() => invoke("send_input", { socket, surfaceId: sid, data }))
-      .catch(() => {});
+      .catch(noteSendFail); // 체인 유지(위 계약) + 실패를 사용자에게 보이게 한다
     return sendChain;
   };
 
@@ -2040,9 +2199,38 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // CYS_ALLOW_APP_MOUSE=1(릴리스 빌드용 — devtools 부재로 localStorage 설정 수단이 없다.
   // ime_debug 게이트와 동형). ★아래 onData 클로저가 참조하므로 등록 **앞**에서 정의한다 —
   // 뒤에 두면 attach await 구간의 입력이 TDZ ReferenceError 로 죽는다.
-  const allowAppMouse =
-    localStorage.getItem("cysAllowAppMouse") === "1" ||
-    (await invoke("app_mouse_enabled").catch(() => false)) === true;
+  const lsAllowAppMouse = localStorage.getItem("cysAllowAppMouse") === "1";
+
+  // ★Windows 휠 가드 롤백 게이트 판독(새 pane부터 · 라이브 재판독 금지 — allowAppMouse와 동형):
+  // localStorage.cysWinWheelGuardOff="1"(devtools 있는 빌드용) 또는 ~/.cys/win-wheel-guard-off 파일 /
+  // CYS_WIN_WHEEL_GUARD_OFF=1(릴리스 빌드용 — devtools 부재로 localStorage 설정 수단이 없다.
+  // Tauri 커맨드 win_wheel_guard_disabled · ime_debug/app_mouse 게이트와 동형). true면 아래 Windows
+  // 휠 억제 핸들러를 **등록하지 않는다** = 종전(방향키 합성) 동작으로 즉시 복귀.
+  // ★기존 allow-app-mouse 킬스위치를 이 롤백 용도로 재사용하면 안 된다 — 그것은 입·출력 양측을
+  //   열어 Windows ConPTY 결함 1호(마우스 보고가 리터럴로 무한 타이핑)를 되살린다. 그래서 '출력측
+  //   휠 억제만' 끄는 전용 게이트를 따로 둔다.
+  // ★위치: allowAppMouse와 같은 자리(term.onData 등록 **앞**)다 — 뒤에 두면 attach await 구간에
+  //   도착한 입력이 TDZ ReferenceError로 죽는다(바로 위 킬스위치 주석의 함정과 같은 이유).
+  // ★IS_WINDOWS 단락평가: 이 값은 아래 Windows 분기에서만 소비된다. mac에서 invoke 왕복을 한 번
+  //   더 태우면 pane attach가 그만큼 늦어지므로 조회 자체를 건너뛴다(mac에서는 항상 false이고,
+  //   mac 경로는 이 값을 읽지 않는다 — 읽는 코드를 새로 만들지 말 것).
+  const lsWinWheelGuardOff = localStorage.getItem("cysWinWheelGuardOff") === "1";
+
+  // ★두 게이트 조회는 **병렬**이다(적대검증 2R note — 앵커 ④ 인접 결함 봉인). 직렬 await 두
+  //   번이면 term.onData 등록 전 공백이 왕복 2회분으로 넓어지고, 그 창에 도착한 키 입력은
+  //   조용히 유실된다(Windows 에서만 늘어나던 증분). 서로 독립이라 순서 의존이 없다.
+  // ★단락평가는 보존한다: localStorage 로 이미 켜진 게이트는 invoke 를 아예 발사하지 않고,
+  //   win_wheel_guard_disabled 는 IS_WINDOWS 일 때만 발사한다(mac 왕복 0 — 종전과 동일).
+  // ★거부 폴백 방향도 종전과 동일하다: `.catch(() => false)` = **가드를 켠 채 유지**
+  //   (fail-closed). 커맨드가 미등록인 빌드에서는 invoke 가 reject 되는데, 그때 가드가
+  //   꺼지면(=결함 복원) 안 되기 때문이다. ※ 이 커맨드는 UI 와 같은 바이너리에 묶여 나가므로
+  //   (ui/dist 임베드) 실제로는 버전 스큐가 생기지 않는다 — 그래도 폴백 방향은 안전측으로 둔다.
+  const [beAllowAppMouse, beWinWheelGuardOff] = await Promise.all([
+    lsAllowAppMouse ? false : invoke("app_mouse_enabled").catch(() => false),
+    IS_WINDOWS && !lsWinWheelGuardOff ? invoke("win_wheel_guard_disabled").catch(() => false) : false,
+  ]);
+  const allowAppMouse = lsAllowAppMouse || beAllowAppMouse === true;
+  const winWheelGuardOff = IS_WINDOWS && (lsWinWheelGuardOff || beWinWheelGuardOff === true);
 
   term.onData((data) => {
     // ★마우스 보고 필터 (현장 결함 1호 Windows 유출 + 2026-08 macOS 스크롤백 접근 불가).
@@ -2139,23 +2327,50 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // 롤백 스위치 cysMouseReconcilerOff="1" = 정합기 전체 비활성(win 비활성 코드 경로 재사용).
   const reconcile = localStorage.getItem("cysMouseReconcilerOff") !== "1";
   const trackFilter = new MouseTrackingFilter({ os: IS_WINDOWS ? "win" : "mac", reconcile });
-  // ★휠 억제(스펙 D4 — mac 전용): [alt buffer ∧ 장부 트래킹 요청 ∧ xterm 트래킹 미진입]이면
-  // 휠을 소비한다(return false = xterm 기본 차단) — 미진입 창의 휠이 방향키로 합성돼 Claude
-  // Code 프롬프트 히스토리를 오염시키는 결함 봉인. 판단은 wheelgate 순수 함수(테스트 고정).
-  // less/man(트래킹 무요청)은 술어 불충족 → 방향키 합성 보존. Windows 는 핸들러 미등록
-  // (vim mouse=a 휠 회귀 방지 — 현행 유지)·롤백 스위치 off 도 미등록(win 경로 재사용).
-  // ★attachCustomWheelEventHandler 는 인스턴스당 단일 슬롯(덮어쓰기)이다 — 두 번째 용도가
-  // 생기면 합성 함수로 묶을 것(현재 ui/src 에 다른 등록 없음).
-  if (!IS_WINDOWS && reconcile) {
+  // ★휠 억제 — OS로 **배타 분기**한다(mac=shouldSuppressWheel · Windows=shouldSuppressWheelWin).
+  // (mac·스펙 D4) [alt buffer ∧ 장부 트래킹 요청 ∧ xterm 트래킹 미진입]이면 휠을 소비한다
+  // (return false = xterm 기본 차단) — 미진입 창의 휠이 방향키로 합성돼 Claude Code 프롬프트
+  // 히스토리를 오염시키는 결함 봉인. 판단은 wheelgate 순수 함수(테스트 고정). less/man(트래킹
+  // 무요청)은 술어 불충족 → 방향키 합성 보존. mac 롤백 스위치 off(reconcile=false)면 미등록.
+  //
+  // (a) ★Windows도 이제 등록한다(스펙 C-2 — 종전에는 미등록이었다). 다만 술어는 **다른 함수**이고
+  //     판별자를 1003(any-motion)으로 좁혔다: claude fullscreen은 1000+1002+1003+1006("full")을
+  //     켜므로 충족(=억제)이고, vim `mouse=a`는 통상 1003을 켜지 않아 불충족(=방향키 합성 보존
+  //     → 현행 Windows vim 휠 UX 무회귀)이다. 근거와 최대 미확정은 wheelgate.ts의 (b)·(d) 주석.
+  // (b) ★종전 미등록의 근거였던 "Windows claude는 기본 inline이라 문제2가 미발현"은 **반증됐다**:
+  //     Claude Code 2.1.233의 fullscreen 판정 함수 ra()에 순수 Windows→inline 분기가 없고
+  //     (Windows 관련 분기는 Windows∧SSH 하나뿐), settings의 tui 키가 없으면 최종 판정은 서버측
+  //     기능 게이트가 한다 — 즉 화면 모드는 OS가 아니라 **계정·롤아웃**이 결정한다. 아무것도
+  //     옵트인하지 않은 Windows 사용자에게도 fullscreen이 뜰 수 있으므로 방어가 필요하다.
+  // (c) ★롤백: winWheelGuardOff(위 판독 — env/파일 게이트)면 등록하지 않는다 = 종전 동작 복귀.
+  // (d) ★정직 고지 — 억제는 그 휠 노치를 **버린다**: 억제가 걸린 창에서 휠은 스크롤도 방향키도
+  //     아닌 **무동작**이 된다(alt 화면엔 스크롤백이 없어 로컬 스크롤이라는 대안 자체가 없다).
+  //     그 대가로 막는 것은 프롬프트 히스토리 오염(원 결함)이고, 억제 대상은 1003 을 켠 앱으로
+  //     한정된다 — vim·less·man 은 술어 불충족이라 종전 동작 그대로다.
+  //     ※ 종전 이 자리에 있던 deltaMode=DOM_DELTA_PAGE 절대 상한(pageMode 항)은 **제거했다**
+  //       (2026-08-17). 근거 전문은 wheelgate.ts (c) — 요지는 그 항이 덮는 영역이 이중 가정의
+  //       사각뿐인데 비용은 'PAGE 보고 환경에서 페이저 휠 전멸'이고 탈출구가 가드 전체 끄기
+  //       (=원 결함 복원)뿐이었다는 것. 그래서 이 배선에는 WheelEvent 를 읽는 코드가 없다.
+  // ★Windows 분기에 reconcile(정합기 롤백 스위치) 조건이 없는 이유: 장부 기록은 소비(consume)와
+  //   무관하게 공통이다 — trackfilter의 ReconcilerState.consume 주석대로 win·reconcile=false
+  //   인스턴스도 ledger는 채운다. ∴ cysMouseReconcilerOff는 '정합기 소비'의 스위치이고, 이 가드의
+  //   스위치는 winWheelGuardOff다(둘을 섞으면 롤백 의미가 흐려진다). 그 규칙의 정본은 이제
+  //   wheelgate.wheelHandlerKind 이고 8조합 진리표가 고정한다.
+  // ★attachCustomWheelEventHandler 는 인스턴스당 단일 슬롯(덮어쓰기)이다 — 두 갈래가 다 등록되면
+  //   뒤가 앞을 조용히 덮어 mac 억제가 사라진다 = 설계 위반. 종전에는 그것을 `else if` 한 단어가
+  //   지켰고 그 계약을 지키는 테스트가 0건이었다(성찰3 테스트렌즈 major). 이제 판정을 순수 함수로
+  //   내려 **반환값이 하나뿐인 타입**으로 강제한다 — 여기서 OS·게이트를 다시 읽지 마라.
+  //   판정에 먹이는 입력 조립(장부 접근자 선택·xterm 리터럴)도 같은 이유로 순수 함수다:
+  //   ledgerWantsAnyMotion 자리에 인접 접근자 ledgerWantsMouse 를 쓰면 Windows vim 휠이 죽는데,
+  //   인라인이던 시절엔 그 오배선을 잡는 단언이 저장소에 0건이었다.
+  const wheelKind = wheelHandlerKind({ isWindows: IS_WINDOWS, reconcile, winWheelGuardOff });
+  if (wheelKind === "mac") {
     term.attachCustomWheelEventHandler(
-      () =>
-        !shouldSuppressWheel({
-          altActive: term.buffer.active.type === "alternate",
-          ledgerWantsMouse: trackFilter.ledgerWantsMouse(),
-          xtermTracking: term.modes.mouseTrackingMode !== "none",
-          allowAppMouse,
-          isWindows: IS_WINDOWS,
-        }),
+      () => !shouldSuppressWheel(macGateInputs(term, trackFilter, allowAppMouse, IS_WINDOWS)),
+    );
+  } else if (wheelKind === "win") {
+    term.attachCustomWheelEventHandler(
+      () => !shouldSuppressWheelWin(winGateInputs(term, trackFilter, allowAppMouse)),
     );
   }
   const un1 = await listen(ev.output_event, (e) => {
@@ -2183,7 +2398,12 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "", trackFilter };
+  // unlisten 은 destroyPaneRuntime 이 전건 호출한다 — 이벤트 해제 외에 pane 수명에 묶인 타이머
+  // 정리(cancelSendFail)도 여기 실어 필드를 늘리지 않는다(닫힌 pane 의 지연 토스트 차단).
+  // ★cancelSendFail 을 **맨 앞**에 둔다: destroyPaneRuntime 의 forEach 는 앞 항목이 던지면
+  //  뒤를 실행하지 못하므로, 뒤에 두면 un1/un2 가 던졌을 때 예약된 토스트가 죽은 pane 이름으로
+  //  최대 3초 뒤 떠버린다. 순서 외의 의미는 없다(세 훅은 서로 독립).
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [cancelSendFail, un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "", trackFilter };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -2828,6 +3048,10 @@ async function actionEqualize() {
 async function refreshSidebarStatus() {
   const sockets = new Set(workspaces.map((w) => w.socket));
   let pend = 0;
+  // 사라진 소켓(워크스페이스 폐기·부서 삭제)의 잔재를 남기지 않는다 — 남기면 배너가 존재하지
+  // 않는 부서의 대기를 영원히 보고한다.
+  for (const key of [...pendingBySocket.keys()])
+    if (![...sockets].some((s) => (s ?? DEFAULT_SOCKET_KEY) === key)) pendingBySocket.delete(key);
   for (const sock of sockets) {
     try {
       const r = (await invoke("org_status", { socket: sock })) as {
@@ -2835,6 +3059,10 @@ async function refreshSidebarStatus() {
         feed?: { pending?: number };
       };
       pend += r.feed?.pending ?? 0;
+      // 성공 조회만 기록한다. 실패(catch)는 **덮어쓰지 않는다** — 직전 성공값을 유지하는 편이
+      // 0으로 접는 것보다 낫다(일시 미응답으로 배너가 사라지지 않는다). 그 대신 배지 합계
+      // pend 는 종전대로 그 소켓을 0으로 세므로, 두 값이 잠시 어긋날 수 있다(배지=보수적 하한).
+      pendingBySocket.set(sock ?? DEFAULT_SOCKET_KEY, r.feed?.pending ?? 0);
       for (const n of r.surfaces ?? [])
         nodeSig.set(`${sock}#${n.surface_id}`, {
           role: n.role,
@@ -3548,6 +3776,35 @@ interface FeedItem {
   // W3: cysd가 title·body에서 파생한 위험 클래스("auto"|"high"|"human") + 자동결재 라우팅 여부.
   risk_class?: string | null;
   auto_route?: boolean;
+  // 데몬이 스스로 발행한 항목인가 — cysd 의 feed.list 가 실어 주는 **파생 필드**(진리원 =
+  // state::is_daemon_issued). 아래 isDaemonDetectedApproval 하나만 읽는다.
+  // optional 인 이유는 구 데몬 프로세스가 살아 있는 스큐뿐이다(그 경우의 폴백도 그 함수에 있다).
+  daemon_issued?: boolean;
+}
+
+// '데몬이 화면 패턴으로 감지해 올린 승인 항목'인가 — CC 패널(refreshFeed)과 커맨드 팔레트의
+// 'feed 승인' 액션이 **같은 술어**를 써야 한다(팔레트가 패널에서 없앤 기만 버튼을 되살리던
+// 결함의 수리 · 적대검증 2R major). 그래서 한 곳에 둔다.
+//
+// ★판별 기준 = **서버가 실어 준 사실**(2026-08-17 교체 — 성찰3 설계렌즈 major):
+//   feed.list 응답의 파생 필드 `daemon_issued` 를 읽는다. 그 값의 정의처는 데몬의
+//   `state::is_daemon_issued`(접두 상수 DAEMON_REQ_PREFIX) 하나이고, 데몬 자신의 세 소비자
+//   (has_pending_daemon_approval · pending_daemon_approvals · governance 의 approval.stalled
+//   스캔)도 같은 함수를 지난다. 종전에는 이 UI 가 `request_id.startsWith("daemon-")` 로 접두를
+//   **재파싱**했다 — 교차 모듈 계약이 진리원 없는 매직 스트링 복제로 표현돼 있었다.
+//   (그 자리의 종전 주석은 '서버 필드는 쓸 수 없다 — feed.list 가 직렬화하지 않는다'고 적었는데,
+//    같은 라운드가 그 handlers.rs 를 편집하고 있었으므로 전제 자체를 없애는 편이 옳았다.)
+// ★위조 불가: 데몬이 feed.push 경로에서 그 접두를 예약 네임스페이스로 거부한다(handlers.rs —
+//   `request_id prefix 'daemon-' is reserved`). ∴ 이 분류는 클라이언트가 만들 수 없다.
+// ★필드 부재 시(구 데몬이 살아 있는 스큐: cysd 는 GUI 와 수명이 달라 예전 프로세스가 계속 떠
+//   있을 수 있다) — `daemon_issued === undefined` 면 **fail-closed** 로 접두를 본다.
+//   오판 방향이 안전한 쪽이기 때문이다: true 로 잘못 보면 그 항목은 Allow 버튼 대신 점프·치우기
+//   경로로 가고(승인 위조 0), false 로 잘못 보면 팔레트가 아무 효과 없는 승인을 시도한다(W-4 결함
+//   재현). ∴ 모르면 데몬 항목으로 취급한다. 이 한 줄이 저장소에 남은 마지막 접두 리터럴이다.
+// ※ 특례 보존: ceo-promote-request 는 kind 가 달라 이 술어에 걸리지 않는다(Allow 경로 그대로).
+function isDaemonDetectedApproval(i: FeedItem): boolean {
+  if (i.kind !== "approval") return false;
+  return i.daemon_issued ?? i.request_id.startsWith("daemon-");
 }
 
 // 승인 Feed는 Control Center의 '승인 Feed' 탭으로 편입됨(독립 패널 폐기).
@@ -3919,6 +4176,14 @@ function feedReplyErrorText(e: unknown): string {
   return `전송 오류: ${s}`;
 }
 
+// 대기 렌더 상한을 사용자가 명시적으로 푼 상태인가(아래 '더 보기' 버튼) — 되돌리는 경로는
+// **정확히 둘**이다: ①feed 탭에 **진입**할 때(setCcTab 의 feed 분기) ②CC 패널을 **닫을 때**
+// (setCcOpen 의 close 분기). 그 밖의 탭 이동은 되돌리지 않는다 — feed 탭이 아니면 refreshFeed
+// 가 렌더 자체를 건너뛰므로(아래 `ccOpen && ccTab==="feed"` 가드) 비용이 발생하지 않는다.
+// ※ ②는 2026-08-17에 **추가**했다. 종전 이 주석은 '패널을 닫으면 되돌린다'고 적었으나 그
+//    코드가 없어 거짓 계약이었다(성찰3 설계렌즈 minor — 주석=계약 규약 위반).
+let feedPendingExpanded = false;
+
 async function refreshFeed() {
   const r = (await invoke("feed_list", { status: null }).catch(() => null)) as
     | { items: FeedItem[] }
@@ -3932,10 +4197,77 @@ async function refreshFeed() {
   const box = document.getElementById("cc-feed-items")!;
   box.innerHTML = "";
   if (items.length === 0) {
-    box.textContent = "(비어 있음)";
+    // ★'비어 있음'만 적으면 거짓말이 될 수 있다 — 이 목록은 기본 데몬 1개만 보므로 부서 데몬에
+    //  대기가 남아 있어도 비기 때문이다. 그 경우 사유를 함께 적는다.
+    //  ※ 수치는 **타 소켓 직접 합**(otherSocketPending)이다 — 전 소켓 합산(pendingApprovals)을
+    //    쓰면 기본 데몬 자신의 대기까지 '다른 워크스페이스'로 오안내한다(두 조회 사이 스큐).
+    const elsewhere = otherSocketPending();
+    box.textContent =
+      elsewhere > 0
+        ? `(기본 데몬에는 항목이 없습니다 — 대기 ${elsewhere}건은 다른 워크스페이스(부서 데몬)에 있습니다. 해당 워크스페이스로 전환하세요.)`
+        : "(비어 있음)";
     return;
   }
-  for (const item of items.slice(0, 50)) {
+  // ★대기 항목을 **먼저·많이** 렌더한다. 종전엔 최신순 50건만 잘랐는데, 데몬의 보존 한도가
+  //  "pending 전부 + 종결 최근 1000건"(state.rs 의 FEED_RETAIN)이라 **오래된 pending 은 종결
+  //  항목 더미에 밀려 화면에 안 나온다**. 그런데 대기 배지(refreshSidebarStatus)는 데몬 집계라
+  //  그 항목까지 세므로 "배지에는 있는데 목록에는 없어 치울 수 없는" pending 이 생긴다 —
+  //  아래 '알림 치우기'가 닿지 못하는 사각이다. ∴ pending 을 앞에 놓고 남는 자리만 종결로 채운다.
+  //
+  // ★상한을 둔다(PENDING_RENDER_CAP) — 종전의 '전건 렌더'는 무상한이었고 그것은 위험했다:
+  //  pending 은 상한이 없는 집합이고(FEED_RETAIN 은 종결 항목에만 적용), 승인 프롬프트를 띄운
+  //  채 pane 이 죽으면 stale-clear 가 종료 surface 를 건너뛰어(governance.rs) 그 항목은 영구
+  //  잔존한다. refreshFeed 는 모든 feed.* 이벤트마다 돌므로 N 건을 하나씩 치우면 O(N²) DOM
+  //  재구성이 된다 — 앵커 ④(전 pane 사망) 시나리오에서 UI 가 함께 굳는다.
+  //  ※ 같은 라운드에 상수배도 줄였다: 치우기 핸들러의 finally 에 있던 refreshFeed 를 없애
+  //    이벤트 구동 1회로 합쳤다(종전엔 클릭 1회당 2회 재렌더 — 아래 dismiss 주석 참조).
+  //  상한을 두되 '지울 수 없는 pending 은 없어야 한다'는 목표는 아래 '나머지 보기'로 유지한다.
+  //
+  // ★스코프 정직 고지(종전 주석은 여기서 **거짓**이었다 — 적대검증 2R major):
+  //  이 목록·치우기는 **기본 데몬 1개**만 본다(feed_list·feed_reply 둘 다 default_socket 고정).
+  //  반면 대기 배지는 전 워크스페이스 소켓의 org_status.feed.pending 합산이다. ∴ 부서 데몬의
+  //  pending 은 지금도 '배지에는 있으나 이 목록에 없는' 상태로 남는다 — 종전 주석의
+  //  "절대 조건: GUI 에서 지울 수 없는 pending 은 없어야 한다(달성)" 은 기본 데몬 한정으로만
+  //  참이었다. 그 차이를 숨기지 않고 아래 배너로 표시한다(사각을 아는 것이 사각을 없애기 전의
+  //  최소 의무다). 근본 수리는 feed_list/feed_reply 의 소켓 인지화이며 이번 릴리스 범위 밖이다.
+  const PENDING_RENDER_CAP = 200;
+  const pendingItems = items.filter((i) => i.status === "pending");
+  const settledItems = items.filter((i) => i.status !== "pending");
+  const pendingShown = feedPendingExpanded ? pendingItems : pendingItems.slice(0, PENDING_RENDER_CAP);
+  const pendingHidden = pendingItems.length - pendingShown.length;
+  const shown = pendingShown.concat(settledItems.slice(0, Math.max(0, 50 - pendingShown.length)));
+
+  // (a) 이 목록이 닿지 못하는 대기(=부서 데몬 등 타 소켓)를 명시한다.
+  //     ★값의 출처(2026-08-17 교체 — 성찰3 설계렌즈 minor): 종전에는
+  //     `pendingApprovals - pendingItems.length` 라는 **스코프가 다른 두 값의 뺄셈**이었다.
+  //     피감수는 이 목록(기본 데몬 feed_list)의 pending 수, 감수는 전 소켓 합산이라
+  //     ⓐ부서 데몬 하나가 일시 미응답이면(refreshSidebarStatus 의 catch 가 0으로 접는다)
+  //       결과가 과소·음수가 되어 배너가 사라지고, ⓑ두 조회 사이 스큐로는 과대가 되어
+  //       "다른 워크스페이스에 N건" 이 사실이 아닌 수를 단정했다.
+  //     이제 refreshSidebarStatus 가 같은 순회에서 소켓별로 보관한 값을 직접 합산한다
+  //     (otherSocketPending = 기본 소켓을 뺀 합) — 뺄셈이 없으니 음수가 불가능하고, 이 목록의
+  //     길이·갱신 시점과 무관하다.
+  const outOfScope = otherSocketPending();
+  if (outOfScope > 0) {
+    const warn = document.createElement("div");
+    warn.className = "cc-empty";
+    warn.textContent =
+      `⚠ 다른 워크스페이스(부서 데몬)의 대기 ${outOfScope}건은 이 목록에 나오지 않습니다 — ` +
+      `해당 워크스페이스로 전환한 뒤 그 pane 에서 처리하세요. (이 목록·버튼은 기본 데몬 전용입니다.)`;
+    box.appendChild(warn);
+  }
+  // (b) 상한 초과분은 '나머지 보기'로 연다 — 지울 수 없는 pending 을 만들지 않기 위함이다.
+  if (pendingHidden > 0) {
+    const more = document.createElement("button");
+    more.textContent = `대기 ${pendingHidden}건 더 보기 (총 ${pendingItems.length}건)`;
+    more.title = "대량 렌더는 UI 를 느리게 만들 수 있습니다 — 필요할 때만 펼치세요.";
+    more.addEventListener("click", () => {
+      feedPendingExpanded = true;
+      refreshFeed();
+    });
+    box.appendChild(more);
+  }
+  for (const item of shown) {
     const el = document.createElement("div");
     el.className = `feed-item ${item.status}`;
     const title = document.createElement("div");
@@ -3948,7 +4280,107 @@ async function refreshFeed() {
     body.className = "fi-body";
     body.textContent = item.body;
     el.append(title, meta, body);
-    if (item.status === "pending") {
+    // ★데몬이 화면 패턴으로 감지해 올린 승인 항목은 Allow/Deny가 **아무 효과도 내지 못한다**(W-4).
+    //  근거(코드 실측):
+    //   ① 발행 경로는 governance.rs 의 check_approvals — 그 함수 doc이 "★자동 응답 절대 금지 —
+    //      감지·격상만"이라고 못박고 있고, 발행에 쓰는 Daemon::push_feed_notification(state.rs)은
+    //      **waiter를 등록하지 않는다**(feed.push의 wait 경로와 달리 oneshot 채널이 없다).
+    //   ② feed.reply 핸들러(handlers.rs)는 항목을 resolved로 바꾸고 대기자를 깨우고 감사에 남길
+    //      뿐, PTY에는 **한 바이트도 쓰지 않는다**(그 핸들러 전체에 WriteReq·try_write 사용 0건).
+    //  ∴ 버튼을 눌러도 앱의 프롬프트는 그대로 남고 목록에서 항목만 사라진다 = 사용자를 속이는
+    //  버튼이다. 실제 응답은 그 pane에서 사람이 직접 해야 하므로 '점프' 버튼으로 대체한다.
+    //
+    //  ★판별 기준은 isDaemonDetectedApproval(위 FeedItem 선언 옆)에 단일화돼 있다 — 커맨드
+    //  팔레트의 'feed 승인' 액션이 **같은 술어**로 이 부류를 제외해야 하기 때문이다(팔레트가
+    //  여기서 없앤 기만 버튼을 되살리던 결함의 수리 · 적대검증 2R). 근거·위조 불가 논증은
+    //  그 함수 주석에 있다.
+    //
+    //  ★그러나 **수동 해소 경로는 반드시 남긴다**(적대검증 지적 반영 — 초판은 '점프'만 두어
+    //  치우기를 없앴고 그것은 지울 수 없는 항목을 만들었다). 초판 주석은 "항목 정리는 데몬이
+    //  한다(stale-clear)"고 적었는데 그 서술은 **불완전**하다:
+    //   · stale-clear 를 도는 루프(governance.rs check_approvals)는 surface 목록을 돌면서
+    //     `if s.exited { continue; }` 로 **종료된 surface 를 건너뛴다** → 그 surface 의 pending
+    //     감지 항목은 stale-clear 를 영원히 못 받는다.
+    //   · surface 종료·삭제 시 feed 항목을 해소하는 훅도 없다(resolve_feed_item 호출처는
+    //     feed.reply 핸들러 · 채널 응답 · 위 stale-clear 셋뿐 — exit 훅 0건).
+    //  ∴ 승인 프롬프트를 띄운 채 pane 이 죽으면 그 항목은 자동으로도 수동으로도 사라지지 않아
+    //  대기 배지를 영구 오염시킨다. 그래서 '치우기'를 항상 제공한다.
+    //
+    //  ★두 버튼의 의미를 분리해 사용자를 속이지 않는다(이 수리의 원래 목적 보존):
+    //   · '이 pane에서 직접 응답' = 점프만. 실제 응답은 사람이 그 pane 에서 한다.
+    //   · '알림 치우기' = **목록 정리 전용**. feed_reply 로 항목만 resolved 로 바꾼다 — 앱의
+    //     프롬프트에는 한 바이트도 가지 않는다(그 사실을 버튼 라벨·note·title 에 명시).
+    //  ★decision="dismissed" 인 이유: "deny" 를 쓰면 데몬의 거부 카운터(record_approval_deny —
+    //   approve_auto_route ON 일 때 back-pressure 집계)에 잡혀 '거부가 쌓였다'는 **거짓 신호**가
+    //   된다. 그 카운터는 deny|no|reject 만 세므로 별도 어휘를 쓰면 집계에 오염이 없고, 해소된
+    //   항목에는 `→ dismissed` 로 표시돼(아래 fi-decision 분기) 감사에서도 '앱 응답'과 구분된다.
+    //   decision 문자열은 데몬이 검증하지 않는다 — feed.reply 핸들러는 param_str 로 받아
+    //   resolve_feed_item_audited 에 그대로 넘길 뿐 어휘 화이트리스트가 없다(handlers.rs).
+    //  ★자기승인 가드(§3.2)에 걸리지 않는 근거는 **두 겹**이다(둘 중 하나만으로도 충분):
+    //   ① is_self_approval 은 `decision != "allow"` 면 즉시 false 다(state.rs 첫 줄 분기) —
+    //     "dismissed" 는 어떤 발행자 조합에서도 가드에 닿지 않는다.
+    //   ② 데몬 발행 항목은 publisher_pid·publisher_pgid·publisher_surface 가 **모두 None** 이라
+    //     (state.rs push_feed_notification) pid/pgid 일치·surface 분기 세 갈래가 전부 불성립이다.
+    //     ※ publisher_surface 까지 None 인 것이 중요하다 — Some 이면 surface 미귀속 호출자
+    //       (GUI)는 fail-closed 로 차단되므로 ②만으로는 안전하지 않았을 것이다.
+    const daemonDetected = isDaemonDetectedApproval(item);
+    if (item.status === "pending" && daemonDetected) {
+      const note = document.createElement("div");
+      note.className = "fi-meta";
+      // ★'치우기'의 데몬측 부작용을 숨기지 않는다(적대검증 2R minor). "앱에는 아무것도 전달되지
+      //  않습니다"는 참이지만 '아무 일도 일어나지 않는다'로 읽힌다 — 실제로는 두 가지가 일어난다:
+      //   ① 화면에 승인 프롬프트가 **아직 살아 있으면** 데몬의 재발행 억제(L3 코얼레싱 가드
+      //      has_pending_daemon_approval)가 풀려, (surface,pattern) 60초 debounce 뒤 같은
+      //      에피소드가 다시 올라온다(≤60초 내 재출현 + 토스트·OS 배너 재발화). 정상 동작이다.
+      //   ② 새 항목은 created_at 이 갱신되므로 '사람 개입 필요' 격상(approval.stalled)의
+      //      방치 시계가 그때마다 처음부터 다시 간다.
+      //  ∴ 치우기는 '이미 사람이 응답했거나 pane 이 죽은' 항목에 쓰는 정리 버튼이다.
+      note.textContent =
+        "데몬이 화면에서 감지한 승인 대기입니다 — 여기서 승인/거부해도 앱에는 전달되지 않습니다. 해당 pane에서 직접 응답하세요. " +
+        "('알림 치우기'는 이 목록에서만 지웁니다. 그 pane에 승인 프롬프트가 아직 떠 있으면 데몬이 잠시 뒤 다시 감지해 항목이 재등장할 수 있고, 치울 때마다 방치 경보 대기시간이 다시 시작됩니다.)";
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const jump = document.createElement("button");
+      jump.textContent = "이 pane에서 직접 응답";
+      const target = item.surface_id;
+      if (target == null) {
+        // surface 미상(구 영속 라인 등) — 점프 대상이 없으면 비활성해 헛클릭을 막는다.
+        // ★이때도 아래 '치우기'는 살아 있다 — 그것이 이 항목에 남는 유일한 동작이다(무동작 금지).
+        jump.disabled = true;
+        jump.title = "대상 surface 미상 — 해당 pane을 직접 찾아 응답하세요";
+      } else {
+        jump.addEventListener("click", () => {
+          // feed_list는 기본 데몬 1개만 조회한다(위 refreshFeed 주석) → socket 미지정 = 기본 데몬 ws.
+          jumpToSurface(target);
+          setCcOpen(false); // CC 패널이 pane을 가리므로 닫는다 — 프롬프트를 바로 보고 답하게.
+        });
+      }
+      const dismiss = document.createElement("button");
+      dismiss.textContent = "알림 치우기";
+      dismiss.title =
+        "이 알림 항목만 목록에서 지웁니다 — 앱에는 아무것도 전달되지 않습니다(pane 종료 등으로 데몬 자동 정리가 닿지 않는 항목의 수동 해소 경로).\n" +
+        "⚠ 해당 pane에 승인 프롬프트가 아직 떠 있으면 데몬이 잠시 뒤(최대 1분) 다시 감지해 항목이 재등장합니다 — 정상 동작입니다.\n" +
+        "⚠ 치울 때마다 '사람 개입 필요' 방치 경보(approval.stalled)의 대기시간이 처음부터 다시 시작됩니다.";
+      dismiss.addEventListener("click", async () => {
+        // in-flight 이중클릭 차단 → finally 에서 재활성. ★재렌더는 여기서 부르지 않는다 —
+        // feed.item.resolved 이벤트가 refreshFeed 를 이미 부르므로(이벤트 핸들러의 feed 분기)
+        // 여기서 또 부르면 클릭 1회당 전체 재렌더가 2회 난다(N 건 정리 = O(N²) DOM 재구성).
+        // 배지 갱신은 이벤트 경로에도 있으나(refreshSidebarStatus) 데몬 이벤트 유실 대비로 남긴다
+        // — 그것은 목록 DOM 을 만들지 않아 비용이 다르다.
+        dismiss.disabled = true;
+        try {
+          await invoke("feed_reply", { requestId: item.request_id, decision: "dismissed" });
+        } catch (e) {
+          toast("health", "알림 치우기 실패", feedReplyErrorText(e));
+          refreshFeed(); // 실패 시엔 이벤트가 오지 않으므로 여기서 되돌린다(버튼 상태 복구)
+        } finally {
+          dismiss.disabled = false;
+          refreshSidebarStatus(); // 해소 직후 집계 배지 즉시 갱신
+        }
+      });
+      actions.append(jump, dismiss);
+      el.append(note, actions);
+    } else if (item.status === "pending") {
       const actions = document.createElement("div");
       actions.className = "fi-actions";
       const btns: HTMLButtonElement[] = [];
@@ -4013,28 +4445,37 @@ async function refreshFeed() {
 
 // ---------- 자동 업데이트 ----------
 
+// invoke 응답의 신뢰 모양 — **명명 타입으로 둔다**(인라인 금지). 아래 checkForUpdate 가
+// `as typeof bin` 으로 단언하던 자리에서 TS2339('… does not exist on type never')가 7건 났던
+// 원인이 이것이다: `as typeof X` 는 선언 타입이 아니라 **그 지점의 좁혀진 타입**을 가리키는데,
+// 바로 위에서 null 로 초기화했으므로 typeof X = null 이 되고 → 대입 후 X 는 null 로 좁혀지며
+// → `X && X.version` 의 truthy 분기가 never 가 된다. 명명 별칭은 좁혀지지 않으므로 원래 의도
+// (응답을 이 모양으로 신뢰)를 그대로 표현하면서 게이트(bunx tsc -p tsconfig.check.json)를 통과한다.
+type BinUpdateInfo = { version: string; current?: string; notes?: string };
+type PackUpdateInfo = { pack_version: string; manifest_url: string; binary_too_old: boolean };
+
 let updateAvailable: { version: string; notes?: string } | null = null;
 // 무중단 팩 업데이트(check_pack_update) 결과 — 팩만 변경 시 세션·데몬 유지 경로(install_pack_update).
-let packUpdateAvailable: { pack_version: string; manifest_url: string; binary_too_old: boolean } | null = null;
+let packUpdateAvailable: PackUpdateInfo | null = null;
 
 /// 업데이트 확인. silent=true면 시작 시 백그라운드 체크(결과 없으면 조용히).
 /// 바이너리(check_update·재시작)와 무중단 팩(check_pack_update·세션 유지)을 둘 다 확인해 분기한다.
 async function checkForUpdate(silent: boolean) {
   // 1) 바이너리 업데이트(Tauri updater latest.json) — 재시작 경로.
-  let bin: { version: string; current?: string; notes?: string } | null = null;
+  let bin: BinUpdateInfo | null = null;
   let binCheckFailed = false;
   try {
-    bin = (await invoke("check_update")) as typeof bin;
+    bin = (await invoke("check_update")) as BinUpdateInfo | null;
   } catch (e) {
     // ★early-return 안 함(팩 체크는 계속) — 단, 바이너리 상태 불명을 기억해 아래 '최신' 단정을 억제한다.
     binCheckFailed = true;
     if (!silent) toast("health", "업데이트 확인 실패", String(e));
   }
   // 2) 무중단 팩 업데이트(pack-manifest.json) — 세션·데몬 유지 경로. 실패는 조용히(폴링).
-  let pack: { pack_version: string; manifest_url: string; binary_too_old: boolean } | null = null;
+  let pack: PackUpdateInfo | null = null;
   let packCheckFailed = false;
   try {
-    pack = (await invoke("check_pack_update")) as typeof pack;
+    pack = (await invoke("check_pack_update")) as PackUpdateInfo | null;
   } catch {
     /* 팩 체크 실패(네트워크·부재) = 조용히 무시 */
     packCheckFailed = true;
@@ -4624,18 +5065,32 @@ async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], so
   });
 }
 
-// feed 승인: feed_list로 request_id 획득(org.status엔 count만) → 가장 오래된 pending Allow.
-async function approveOldestFeed() {
-  const r = (await invoke("feed_list", { status: "pending" }).catch(() => null)) as { items: FeedItem[] } | null;
-  const pending = (r?.items ?? []).filter((i) => i.status === "pending");
-  if (pending.length === 0) {
-    toast("feed", "feed 승인", "대기 요청 없음");
-    return;
+// feed 승인(팔레트 액션): **대상이 확정된 뒤에만** 노출한다 — 아래 buildPaletteItems 가
+// feed_list 로 실제 대상을 뽑아 confirm 본문에 kind·title·request_id 를 박고, 그 항목의
+// request_id 를 이 함수에 넘긴다.
+//
+// ★종전 설계의 결함 3종(적대검증 2R major — 전부 이 라운드에서 수리):
+//  ① **맹목 승인**: 인자 없이 호출돼 실행 시점에 스스로 [0] 을 골랐고 confirm 본문은 "가장
+//    오래된 pending 요청을 Allow 합니다." 뿐이었다 — 오너는 **무엇을 승인하는지 모른 채**
+//    눌렀다. 팔레트 조회와 실행 사이에 새 항목이 끼어들면 대상이 바뀌기까지 했다.
+//  ② **데몬 감지 항목 오승인**: 데몬이 화면 패턴으로 올린 approval 은 waiter 가 없어 Allow 가
+//    앱에 아무 영향도 못 준다(그래서 CC 패널에서는 Allow 를 없애고 '점프+치우기'로 바꿨다).
+//    그런데 이 액션은 같은 항목을 그대로 allow 로 소각해, 패널에서 없앤 기만 버튼이 팔레트에
+//    살아 있었다. 이제 아래 게이트가 그 항목을 **대상에서 제외**한다(패널과 동일 술어 재사용).
+//  ③ **소켓 불일치**: 노출 게이트는 활성 ws 소켓의 org_status.feed.pending 이었는데 실제
+//    feed_reply 는 **기본 데몬** 고정이다(src-tauri feed_reply = default_socket()). 부서 ws 에서
+//    누르면 무관한 본부 항목이 승인됐다. 이제 게이트도 실행과 같은 기본 데몬 feed_list 다.
+async function approveFeedItem(requestId: string) {
+  try {
+    await invoke("feed_reply", { requestId, decision: "allow" });
+    toast("feed", "✅ feed 승인", requestId);
+  } catch (e) {
+    // 종전엔 await 결과를 버려 실패가 무음이었다(거부 시 unhandled rejection) — 사유를 표시한다.
+    toast("health", "feed 승인 실패", feedReplyErrorText(e));
+  } finally {
+    refreshFeed();
+    refreshSidebarStatus(); // 승인 직후 집계 배지 즉시 갱신
   }
-  const oldest = pending[0]; // feed.list는 삽입순(handlers.rs items.iter()) → [0]=가장 오래된
-  await invoke("feed_reply", { requestId: oldest.request_id, decision: "allow" });
-  refreshFeed();
-  refreshSidebarStatus(); // 승인 직후 집계 배지 즉시 갱신
 }
 
 // org.status로 노드 행 생성 + 빌트인 액션 행 추가. socket = 활성 ws socket(1차: 단일 소켓).
@@ -4697,15 +5152,39 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     });
   }
 
-  // ── (4) feed 승인(가장 오래된 pending Allow) ──
-  if ((org.feed?.pending ?? 0) > 0) {
+  // ── (4) feed 승인(가장 오래된 응답 가능 pending Allow) ──
+  // ★게이트를 org_status(활성 ws 소켓 집계)에서 **기본 데몬 feed_list** 로 바꿨다 —
+  //   feed_reply 가 기본 데몬 고정이므로(src-tauri feed_reply = default_socket()) 게이트와
+  //   실행의 소켓이 같아야 한다. 종전엔 부서 ws 를 보고 있는데 본부 항목이 승인됐다.
+  // ★대상을 **여기서 확정**해 confirm 본문에 kind·title·request_id 를 적는다(맹목 승인 제거).
+  //   조회~실행 사이에 새 항목이 끼어들어도 승인 대상은 여기서 고른 그 항목 하나다.
+  // ★데몬 감지 항목은 제외한다 — Allow 가 앱에 닿지 않아(waiter 없음) 사용자를 속이는 버튼이
+  //   되기 때문이고, CC 패널이 같은 이유로 이미 Allow 를 없앴다(술어 공유 =
+  //   isDaemonDetectedApproval). 그 항목의 처리 경로는 패널의 '점프 / 알림 치우기'다.
+  const feedPending = ((await invoke("feed_list", { status: "pending" }).catch(() => null)) as
+    | { items: FeedItem[] }
+    | null)?.items ?? [];
+  // feed.list 는 삽입순(handlers.rs items.iter()) → [0] = 가장 오래된.
+  const approvable = feedPending.filter((i) => i.status === "pending" && !isDaemonDetectedApproval(i));
+  const oldestApprovable = approvable[0];
+  if (oldestApprovable) {
+    const rid = oldestApprovable.request_id;
     items.push({
       id: "act:feed-approve",
-      title: `feed 승인 (대기 ${org.feed!.pending})`,
-      subtitle: "가장 오래된 pending 요청 Allow",
+      title: `feed 승인 (응답 가능 ${approvable.length})`,
+      subtitle: `${oldestApprovable.kind} · ${oldestApprovable.title}`,
       keywords: "feed approve allow 승인 피드 대기",
-      confirm: { title: "feed 승인", body: "가장 오래된 pending 요청을 Allow 합니다." },
-      action: () => approveOldestFeed(),
+      confirm: {
+        title: "feed 승인",
+        body:
+          `다음 요청 1건을 Allow 합니다(기본 데몬):\n` +
+          `· kind: ${oldestApprovable.kind}\n` +
+          `· 제목: ${oldestApprovable.title}\n` +
+          `· request_id: ${rid}\n` +
+          (oldestApprovable.surface_id != null ? `· surface: ${oldestApprovable.surface_id}\n` : "") +
+          `\n본문: ${oldestApprovable.body.slice(0, 300)}`,
+      },
+      action: () => approveFeedItem(rid),
     });
   }
 

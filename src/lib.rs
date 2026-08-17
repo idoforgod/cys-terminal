@@ -582,18 +582,82 @@ pub fn resolve_claude_config_dir() -> String {
         .unwrap_or_else(|| home_dir().join(".cys").join("claude").to_string_lossy().into_owned())
 }
 
-/// ★D5(v4 수리 — 문제2 env 방어층): claude 가 macOS 에서 alternate screen(fullscreen TUI)으로
-/// 뜨면 휠 보고가 앱으로 들어가 프롬프트 히스토리를 오염시킨다(스펙 §D5). 이 키를 기본 "1" 로
-/// 주입해 fullscreen 진입 자체를 막되, **사용자가 agents.json env 에 이미 값을 적었으면(특히
-/// "0" 옵트인) 절대 덮지 않는다** — 주입은 '키 부재 시에만'이 계약이다.
+/// ★D5(v4 수리 — 문제2 env 방어층): claude 가 alternate screen(fullscreen TUI)으로 뜨면 휠
+/// 보고가 앱으로 들어가 프롬프트 히스토리를 오염시킨다(스펙 §D5). 이 키를 "1" 로 주입해
+/// fullscreen 진입 자체를 막되, **사용자가 agents.json env 에 이미 값을 적었으면(특히
+/// "0" 옵트아웃) 절대 덮지 않는다** — 주입은 '키 부재 시에만'이 계약이다.
+/// ★주입 여부는 OS 게이트가 정한다: **macOS = 기본 주입 · Windows = 옵트인 시에만 · 그 외 =
+/// 미주입**(`d5_gate_for_os` — 그 함수 doc 이 강등 근거와 승격 절차의 정본).
 pub const ENV_CLAUDE_NO_ALT_SCREEN: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN";
 
 /// D5 주입 헬퍼 — **두 소비처(cys.rs `boot_agent_on_surface` 인라인 재조립·`run_launch_agent_opts`
 /// surface.create env)가 모두 이 함수를 경유**한다(사본 금지 — lib 에 있는 이유는 `cargo test --lib`
 /// 레인이 회귀 핀을 상주 실행하기 때문. cys.rs 테스트 모듈은 CI 0회 실행이라 핀이 죽는다).
 ///
-/// 게이트 = `cfg!(target_os = "macos")` ∧ `bin == "claude"`(호출부가 cys.rs `extract_bin`(:1081
-/// 헬퍼)으로 env-prefix 를 걷어낸 실제 바이너리 토큰을 넘긴다 — 어댑터 키 개명 내성).
+/// 게이트 = `d5_gate_for_os(std::env::consts::OS, d5_win_opt_in())` ∧ `bin == "claude"`
+/// (호출부가 cys.rs 의 `fn extract_bin` 으로 env-prefix 를 걷어낸 실제 바이너리 토큰을 넘긴다 —
+/// 어댑터 키 개명 내성). OS 매핑은 **macOS = 무조건 주입 · Windows = 옵트인했을 때만 ·
+/// 그 외 = 미주입**이다. 왜 Windows 만 옵트인인지(앵커 ④ · 실기 스모크 B-5 미수행)와
+/// **기본 on 승격 절차**는 `d5_gate_for_os` 의 doc 이 정본이다 — 여기서 중복 서술하지 않는다.
+///
+/// ★이 doc 의 상호참조는 **줄번호를 쓰지 않는다**(적대검증 2R minor 수리). 종전 판은
+/// `extract_bin`(:1081)·`boot_agent_on_surface`(:6358)·`8889-8893`·`main.rs:382-395` 네 곳을
+/// 줄번호로 인용했는데 **네 개가 전부 어긋나 있었다**(각각 실제 :1125 · :6328 · 무관한 묘비
+/// skip 코드 · 383-396). 병렬 편집이 몇 줄만 밀어도 즉시 거짓이 되는 인용 형식이라, 다음
+/// 조사자를 엉뚱한 코드로 보낸다 — 이 저장소가 "주석을 계약으로 취급"하는 이상 그 자체가
+/// 결함이다. 그래서 **심볼명 또는 grep 가능한 마커**로만 가리킨다.
+///
+/// ★Windows 를 사정권에 넣은 근거(v0.14 품질 라인 — 반증된 전제 정정): 종전 게이트가 mac
+/// 단독이었던 이유는 "Windows 의 claude 는 기본 inline 이라 fullscreen 이 미발현"이라는
+/// 전제였는데, 그 전제는 실측으로 반증됐다. Claude Code 2.1.233 의 fullscreen 판정 함수 `ra()`
+/// 에는 순수 Windows→inline 분기가 없고 Windows 관련 분기는 `Windows ∧ SSH` 하나뿐이며,
+/// settings 의 `tui` 키가 부재하면 최종 판정을 서버측 기능게이트가 한다 — 즉 **OS 가 아니라
+/// 계정·롤아웃이 결정한다**. 저장소 안에 그 전제를 뒷받침하는 버전 핀·감지 코드는 0건이었다.
+/// ∴ Windows 에서도 fullscreen 은 **뜰 수 있다**(그래서 UI 휠 가드가 본체 방어로 들어갔다).
+/// ★단, 그 사실이 곧 "그러니 env 를 기본 주입하자"는 아니다 — 주입의 최악 결과가 앵커 ④
+/// (전 pane 사망)라서, 2026-08-17 에 Windows 는 **기본 주입에서 옵트인으로 강등**됐다.
+/// 강등 근거·승격 절차는 `d5_gate_for_os` doc.
+///
+/// ★정직 주석(이것은 '벨트'이고 '본체'가 아니다 — 다음 조사자가 같은 함정을 밟지 않도록):
+/// 이 env 가 **옵트인한 Windows 사용자에게** 실제로 도달하는 경로는 `cys launch-agent` 가
+/// **새 surface 를 만들며 기동한 pane** 하나뿐이다(`run_launch_agent_opts` 의 `surface.create`
+/// env 주입 경로). 옵트인하지 않았다면 도달 경로는 **0건**이다(게이트가 거짓이라 주입 자체가
+/// 없다 — Windows 기본 동작은 강등 전 출고본과 동일하다).
+/// · `fn boot_agent_on_surface`(src/bin/cys.rs)는 Windows 에서 `render_launch` 의 env 를
+///   그대로 폐기한다 — `let (send, _send_env) = render_launch(&cmd, &env_pairs);` 로 send 문자열만
+///   취하고, Windows 는 인라인 `KEY="val" cmd` 를 쓰지 않으므로 env 가 pane 에 실리지 않는다.
+///   저장소 자신이 같은 구멍(빈 셸 pane 은 env 가 비어 Windows 는 계정 격리가 깨진다)을
+///   restore 의 계정격리 가드에 문서화하고 있다 — src/bin/cys.rs 에서
+///   grep `★계정격리 가드(E8)`.
+/// · Tauri GUI 의 `fn create_surface`(src-tauri/src/main.rs)는 `surface.create` RPC 에
+///   cwd/title/rows/cols 만 실어 보내고 env 는 **아예 넘기지 않는다**.
+/// ∴ 기존 pane 에 붙는 기동·GUI 기동에는 이 벨트가 닿지 않는다. Windows 휠 오염의 **본체 방어는
+/// UI 가드**(`ui/src/wheelgate.ts` 의 Windows 전용 억제 술어)이고, 이 함수는 그 위에 덧대는
+/// 벨트일 뿐이다. 여기를 고쳤다고 Windows 문제가 닫혔다고 판단하지 마라.
+///
+/// ★CI 실행 경로(2026-08-17 갱신 — 종전의 "Windows 레인 0건" 고지는 **해소됐다**):
+/// 적대검증 2R 이 major 로 지목한 "Windows 전용 신규 코드가 Windows 러너에서 한 줄도
+/// 컴파일·실행되지 않는다"를 워크플로 변경으로 닫았다.
+/// · `.github/workflows/release.yml` — Windows 레그(`if: matrix.platform == 'windows-latest'`)의
+///   rust 스텝이 `cargo test --lib factory_reset::` 에 더해 **`cargo test --lib claude_alt_screen`**
+///   를 실행한다(태그 경로 = 사용자에게 도달하는 유일한 경로). 비용 0 — lib 은 이미 컴파일돼
+///   있고 D5 핀은 순수 매핑이다.
+/// · `.github/workflows/windows-health.yml` — **`cargo test --bin cys d5_env_injection`** 스텝을
+///   추가했다. 아래 ②-win 파이프라인 핀(`#[cfg(windows)]`)을 **처음으로 컴파일·실행하는 곳**이
+///   여기다. 태그 레인이 아니라 health 레인에 둔 이유: 그 테스트 하네스는 이 저장소에서 한 번도
+///   Windows 컴파일된 적이 없어 D5 와 무관한 이유로 깨질 수 있고, 그 발견은 태그를 만드는
+///   순간이 아니라 그 전에 나야 하기 때문이다.
+/// · 여전한 한계(정직): windows-health 는 `push: branches: ['feat/**']` + workflow_dispatch 로만
+///   돈다. 릴리스 브랜치에서는 **사람이 workflow_dispatch 로 1회 기동해야** 이 핀이 돈다 —
+///   릴리스 체크리스트(docs/plans/v0.14.16-release-notes.md 의 Windows 스모크 절)에 그것을
+///   조건으로 적어 두었다.
+/// ∴ 지금 Windows 러너가 증명하는 것은 (a) OS × 옵트인 매핑(`d5_gate_for_os` — 기본 미주입 행
+/// 포함)과 (b) health 레인을 돌렸다면 두 소비처 파이프라인의 env 산출물(기본·옵트인 두 행)이다. 그러나 **claude 가 이 env 를 실제로 존중하는가**
+/// (=화면 모드가 바뀌는가)는 어느 자동 테스트도 증명하지 않는다 — 그것은 실기 스모크의 몫이다.
+/// ★그 미증명 축이 바로 Windows 강등의 이유다(2026-08-17): 자동 레인이 닿지 못하는 곳에
+/// 앵커 ④(전 pane 사망)가 있고 실기 스모크 B-5 를 수행할 기계가 없었으므로, 기본값을
+/// 미주입으로 돌려 **자동 레인이 증명하는 범위 안으로 위험을 축소**했다. 옵트인한 사용자만
+/// 그 미증명 축을 밟는다(그리고 그 사용자는 스위치를 지우면 즉시 되돌릴 수 있다).
 ///
 /// ★함정 주석(스펙 명문): `agent_env_pairs` 는 내부에서 이미 `v.sort()` 를 끝냈다 — 여기서
 /// **append 후 재정렬을 하면 안 된다**. CLAUDE_CODE_… 는 사전순으로 CLAUDE_CONFIG_DIR 보다
@@ -601,21 +665,162 @@ pub const ENV_CLAUDE_NO_ALT_SCREEN: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN
 /// 버그가 생겼을 때 정렬이 **사용자 "0" 을 "1" 뒤로 뒤집어** 셸 전개 순서상 기본값이 이기게
 /// 만든다. 그래서 계약은 정렬이 아니라 **contains 검사 후 부재 시에만 append** 다.
 pub fn inject_claude_alt_screen_default(env_pairs: &mut Vec<(String, String)>, bin: &str) {
-    inject_claude_alt_screen_default_for(env_pairs, bin, cfg!(target_os = "macos"));
+    inject_claude_alt_screen_default_for(
+        env_pairs,
+        bin,
+        d5_gate_for_os(std::env::consts::OS, d5_win_opt_in()),
+    );
+}
+
+/// D5 Windows 옵트인 스위치의 **env 이름**(형제 게이트와 동형 — `CYS_…`, 값 `"1"` 만 참).
+///
+/// ★이름 극성 주의(왜 `CYS_WIN_ALT_SCREEN_OFF` 가 아닌가): 이 저장소의 `_OFF` 접미는
+/// `CYS_WIN_WHEEL_GUARD_OFF` 처럼 **'우리 기능을 끈다'**(킬스위치) 극성으로 이미 쓰이고 있어,
+/// 같은 `~/.cys/` 안에 `win-wheel-guard-off`(보호를 끔)와 `win-alt-screen-off`(보호를 켬)가
+/// 나란히 놓이면 사용자·후임 조사자 모두 극성을 오독한다. 게다가 기본 on 승격 뒤에 정말 필요한
+/// 것은 롤백 킬스위치이고 그 자리의 자연스러운 이름이 바로 `CYS_WIN_ALT_SCREEN_OFF` 다 —
+/// 지금 그 이름을 반대 극성으로 태워 버리면 승격 시점에 이름을 잃는다. 그래서 긍정형으로
+/// 짓되 **주입되는 키 이름(`ENV_CLAUDE_NO_ALT_SCREEN`)과 같은 어휘**를 써 대응을 자명하게 했다.
+pub const D5_WIN_OPT_IN_ENV: &str = "CYS_WIN_NO_ALT_SCREEN";
+
+/// D5 Windows 옵트인 스위치의 **파일 경로**(홈 기준 상대 — 형제: `.cys/ime-debug`,
+/// `.cys/allow-app-mouse`, `.cys/win-wheel-guard-off`).
+pub const D5_WIN_OPT_IN_FILE: &str = ".cys/win-no-alt-screen";
+
+/// D5 Windows 옵트인 판독(**부작용 있음** — env 1회 + 파일 stat 1회).
+///
+/// 형제 게이트(`src-tauri/src/main.rs` 의 `ime_debug_enabled`·`app_mouse_enabled`·
+/// `win_wheel_guard_disabled`)와 **동형**이다: `env == "1"` 또는 파일 존재. 그 **판정 규약
+/// 자체는 순수 코어 `d5_win_opt_in_from` 에 있고**, 이 함수는 두 채널을 관측해 먹이기만 하는
+/// 얇은 래퍼다(그렇게 쪼갠 이유는 그 함수의 doc — 판독기에 회귀 핀을 걸기 위해서다).
+///
+/// ★왜 Tauri 커맨드가 아니라 여기(코어 lib)인가: D5 를 소비하는 것은 GUI 가 아니라 **Rust CLI
+/// 의 부트 경로**(`cys launch-agent` → `run_launch_agent_opts` / `boot_agent_on_surface`)다.
+/// Tauri 커맨드는 UI(TS)가 invoke 로 묻는 채널이라 이 경로에서 부를 수 없다. 그래서 형제들과
+/// **판독 규약은 같게**, 소재지는 CLI·GUI 가 함께 링크하는 `cys` lib 로 두었다.
+///
+/// ★두 수단의 적용 시점(사용자 문서와 같은 내용 — USER-MANUAL env 표):
+/// · 파일 — `cys launch-agent` 는 **호출마다 새로 뜨는 단명 프로세스**라 매 기동에 stat 한다
+///   → **다음 기동부터 즉시** 반영. Windows 권장 수단.
+/// · env — 이 프로세스가 **상속한 값**만 보인다. Windows 의 pane 은 GUI→데몬→pane 순으로
+///   env 를 물려받으므로 `setx` 만으로는 이미 떠 있는 GUI 계보에 반영되지 않는다(GUI 재시작
+///   필요). 그래서 정본 안내는 파일이다.
+///
+/// ★비용: macOS 는 게이트가 옵트인 값과 무관하게 참이라 이 판독이 낭비다(호출부가 인자를
+/// eager 하게 평가한다). 그러나 pane 기동당 stat 1회이고, 게이트를 **순수 함수로 유지**해
+/// mac 호스트에서 `("windows", false)`·`("windows", true)` 두 행을 함께 핀으로 박는 값이
+/// 그 비용보다 크다.
+pub fn d5_win_opt_in() -> bool {
+    d5_win_opt_in_from(
+        std::env::var(D5_WIN_OPT_IN_ENV).ok().as_deref(),
+        home_dir().join(D5_WIN_OPT_IN_FILE).exists(),
+    )
+}
+
+/// D5 옵트인 **판독 규약의 순수 코어** — 두 채널의 관측값만 받아 판정한다
+/// (`env_val` = `CYS_WIN_NO_ALT_SCREEN` 의 값 · `file_exists` = `~/.cys/win-no-alt-screen` 존재).
+/// 규약은 형제 게이트와 동형인 **`env == "1"` ∨ 파일 존재**이고, `"true"`·`"yes"`·빈 값 같은
+/// 느슨한 truthy 는 **참이 아니다**(형제들과 같은 엄격 비교 — 오타로 켜지는 사고 방지).
+///
+/// ★왜 쪼갰는가(고친 결함 · 2026-08-17 적대검증 2R minor): 강등의 안전 사슬에서 **판독기만
+/// 핀이 없었다**. 게이트 매핑(`d5_gate_for_os`)·삽입 배선·래퍼 라우팅은 모두 고정돼 있었지만
+/// '**런타임 기본값이 거짓인가**'를 단언하는 테스트가 저장소 전체에 0건이라, 종전 본문의
+/// `unwrap_or(false)` → `unwrap_or(true)` 급 1글자 퇴행이 **전 레인 초록인 채로** Windows 를
+/// 기본 on 으로 되돌릴 수 있었다(그 최악이 앵커 ④ — 전 pane 사망). 부작용을 래퍼에 남기고
+/// 판정만 순수 함수로 떼면 그 축이 `claude_alt_screen_win_opt_in_reader_pins` 로 고정된다.
+/// 판독 규약을 바꾸려면 그 핀을 **함께 뒤집는 의도적 행위**여야 한다.
+pub fn d5_win_opt_in_from(env_val: Option<&str>, file_exists: bool) -> bool {
+    env_val == Some("1") || file_exists
+}
+
+/// D5 OS 게이트의 **단일 진리원** — `macOS = 무조건 · Windows = 옵트인 시에만 · 그 외 = 비대상`.
+///
+/// ★왜 Windows 가 '기본 on' 이 아니라 '옵트인' 인가(2026-08-17 강등 · 오너 부재 중 대리 판단):
+/// D5 확장은 v0.14 품질 라인 diff 에서 **부트 체인에 닿는 유일한 변경**이었고, 그 최악 결과가
+/// 릴리스 위험표의 유일한 '고' 등급 R2 = **앵커 ④(전 pane 사망)** 이다 — 이 env 가 Windows 의
+/// claude 를 깨뜨리면 `cys boot` 로 뜬 4종 노드가 **전부** 죽고, 오너가 부재면 복구 수단이 없다.
+/// 그 가능성을 배제하는 유일한 증거는 **Windows 실기 스모크 B-5**(`cys boot` 4종 노드 정상 +
+/// pane 안 env 실림)인데, 물리 Windows 기계가 없어 **수행하지 못했다**. 자동 레인은 이 축을
+/// 대신하지 못한다(레인이 증명하는 것은 OS→게이트 매핑과 env 산출물까지이고, claude 가 그 env 를
+/// 존중하는가는 실기의 몫이다 — 위 `inject_claude_alt_screen_default` doc 의 CI 실행 경로 절).
+/// 결정을 강제한 것은 **비대칭**이다: 기본 on 의 최악은 '전 pane 사망·복구 불가', 옵트인의
+/// 최악은 '부트 관측성이 오늘과 동일'(= Windows 회귀 0). 오너 지침("Windows 설치파일
+/// 업데이트에 신중에 신중")과도 같은 방향이다. **조건을 건너뛴 것이 아니라, 조건이 걸린 변경
+/// 자체를 무장 해제한 것**이다.
+///
+/// ★기본 on 승격 절차(다음 사람은 이 주석만 읽고 승격할 수 있어야 한다):
+///  · 조건 — Windows 실기에서 **B-5 1회 통과**. 즉 옵트인(`~/.cys/win-no-alt-screen` 생성)
+///    상태로 `cys boot` 가 4종 노드를 정상 기동하고, 각 pane 에서
+///    `$env:CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` 이 `1` 이며 claude 가 정상 표시될 것.
+///  · 바꿀 한 줄 — 아래 match 의 `"windows" => win_opt_in,` → `"windows" => true,`.
+///  · 동반 개정(빠뜨리면 거짓 산문이 남는다 — ④⑤ 는 2026-08-17 적대검증 2R 이 **누락을 지적해**
+///    추가된 자리다. 목록을 줄이지 마라) —
+///    ① 이 파일의 핀 `claude_alt_screen_env_injection_pins` 의 ④-b·⑤-b(미옵트인=미주입) 행과
+///       `src/bin/cys.rs` 의 `d5_env_injection_covers_both_consumers` 의 `#[cfg(windows)]` 블록.
+///    ② `USER-MANUAL.md` env 표의 `CYS_WIN_NO_ALT_SCREEN` 행 · `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` 행.
+///    ③ `docs/plans/v0.14.16-release-notes.md` 의 'Windows D5 는 옵트인' 문단과 B-5 의 지위.
+///    ④ `src/bin/cysd/state.rs` 의 `env_injected` 주석과 그 회귀 핀
+///       (`create_surface_with_env_records_env_injected_flag` 의 D5 절). 둘 다 'D5 한 쌍만으로
+///       `env_injected` 가 **격리 키 없이** 참이 되는' 조합을 서술하는데, 승격하면 그 조합의
+///       조건에서 **옵트인 항이 사라진다**(Windows 전부가 해당). 조건을 지우지 않으면 산문이
+///       실제보다 좁게 읽혀 in-seat 가드(`src/bin/cys.rs` grep `★계정격리 가드(E8)`)를 조사하는
+///       사람이 그 경로를 배제한다.
+///    ⑤ `src/bin/cys.rs` 의 `alt_screen_notice` **Windows 힌트 문안** — '①Windows 는 이 env
+///       주입이 기본 off(옵트인) 입니다' 가 통째로 거짓이 되고, 사용자에게 없는 절차를 시킨다.
+///       진리표 핀은 `hint` 토큰만 보므로 **자동 검출되지 않는다**(문안은 사람이 지켜야 한다).
+///  · 승격하면 이 옵트인 스위치는 무의미해지고, 그때 필요한 것은 **롤백 킬스위치**다 —
+///    그 이름으로 `CYS_WIN_ALT_SCREEN_OFF`(파일 `~/.cys/win-alt-screen-off`)를 비워 두었다
+///    (형제 `CYS_WIN_WHEEL_GUARD_OFF` 와 같은 `_OFF` = '우리 기능 끄기' 극성).
+///    그 교체를 하면 `d5_win_opt_in`·`d5_win_opt_in_from` 과 그 핀
+///    (`claude_alt_screen_win_opt_in_reader_pins`)은 **함께 킬스위치 쪽으로 옮겨야 한다** —
+///    극성이 뒤집히므로 핀의 ①(기본=거짓)은 ①(기본=**참**)이 된다. 판독기를 핀 없이 남기지
+///    마라: 그 핀이 없던 것이 이번 라운드에 지적된 결함이다(그 함수의 doc 참조).
+///
+/// ★왜 `cfg!` 가 아니라 문자열 매핑인가(가짜 핀 제거 — v0.14 품질 라인):
+/// `cfg!` 는 컴파일 시각에 상수로 접힌다. 그래서 mac 호스트에서는 확장 **전**(`cfg!(macos)`)과
+/// **후**(`cfg!(macos) || cfg!(windows)`)가 둘 다 참이라, 어떤 단언을 써도 두 상태를 갈라내지
+/// 못했다 — 종전의 'windows 도 삽입된다' 핀이 감시력 0 의 장식이었던 구조적 원인이 이것이다.
+/// OS 판정을 순수 함수로 빼면 **어느 호스트에서든 세 OS 를 동시에 조회**할 수 있어, 누군가
+/// 매핑을 흔들면(mac 단독 회귀·Windows 무조건 승격 모두) mac CI 에서 즉시 빨개진다.
+///
+/// ★두 번째 인자가 bool 인 이유(강등 후에도 그 판별력을 지키기 위해): 옵트인 판독은 env·파일
+/// stat = **부작용**이라 이 함수 **바깥**(`d5_win_opt_in`)에서 하고, 여기는 순수 매핑으로
+/// 남긴다. 그래야 mac 호스트에서 `("windows", false)`·`("windows", true)` 두 행을 함께 조회해
+/// **'기본 미주입'과 '옵트인 시 주입'을 각각** 핀으로 박을 수 있다.
+///
+/// 값 동치: `std::env::consts::OS` 는 컴파일 대상의 상수 문자열("macos"/"windows"/"linux"…)이라
+/// `cfg!(target_os = …)` 과 같은 것을 가리킨다. 그 동치는 아래 테스트가 옵트인 축을 **상수로
+/// 고정**해 대조한다 — `(OS, true)` ↔ `cfg!(macos) || cfg!(windows)`,
+/// `(OS, false)` ↔ `cfg!(macos)`(현 빌드 OS 1개 한정).
+///
+/// ★적용 범위 주의: 이 함수는 '이 OS·옵트인 조합이 D5 env 주입 대상인가'만 답한다. 그 env 가
+/// 실제로 pane 까지 실리는지는 OS별 파이프라인의 문제이고, Windows 쪽 한계는 위 doc 의 정직
+/// 주석을 보라.
+pub fn d5_gate_for_os(os: &str, win_opt_in: bool) -> bool {
+    match os {
+        "macos" => true,
+        "windows" => win_opt_in,
+        _ => false,
+    }
 }
 
 /// D5 순수 코어 — OS 게이트를 인자로 받아 **어느 호스트에서든 양 분기를 테스트**할 수 있게 한다
 /// (compose_pane_path 등 이 파일의 'windows 로직을 mac에서 검증' 관례와 동일).
+///
+/// `gated` 는 '이 기동이 D5 주입 대상인가'다 — 즉 `d5_gate_for_os(OS, 옵트인)` 의 결과다
+/// (구 이름 `is_macos` — Windows 확장으로 의미가 어긋나 개명했다. 호출부는 위치 인자라 시그니처
+/// 호환은 유지된다). 이 함수는 OS 도 옵트인도 모른다: **불가침 3계약**(키 부재 시에만 append ·
+/// 사용자 값 불가침 · 재정렬 금지)만 지킨다. 게이트를 넓히든 좁히든 이 셋은 건드리지 마라.
 pub fn inject_claude_alt_screen_default_for(
     env_pairs: &mut Vec<(String, String)>,
     bin: &str,
-    is_macos: bool,
+    gated: bool,
 ) {
-    if !is_macos || bin != "claude" {
+    if !gated || bin != "claude" {
         return;
     }
     if env_pairs.iter().any(|(k, _)| k == ENV_CLAUDE_NO_ALT_SCREEN) {
-        return; // 사용자 값(특히 "0" 옵트인) 절대 불가침 — 부재 시에만 기본값.
+        return; // 사용자 값(특히 fullscreen 을 되살리는 "0") 절대 불가침 — 부재 시에만 기본값.
     }
     env_pairs.push((ENV_CLAUDE_NO_ALT_SCREEN.to_string(), "1".to_string()));
 }
@@ -1470,8 +1675,36 @@ mod tests {
     }
 
     /// ★D5 회귀 핀(--lib 상주 — cys.rs 테스트 모듈은 CI 0회 실행이라 여기 둔다):
-    /// ① 사용자 "0"(옵트인) 이 있으면 최종 산출에 "1" 이 **절대 미출현**(append+sort 뒤집기 함정 봉인)
-    /// ② mac ∧ claude 면 기본 "1" 삽입 ③ 비-mac(win 포함)·타 에이전트는 미삽입.
+    /// ① 사용자 "0"(fullscreen 되살리기) 이 있으면 최종 산출에 "1" 이 **절대 미출현**
+    ///    (append+sort 뒤집기 함정 봉인)
+    /// ② 게이트 참 ∧ claude 면 기본 "1" 삽입 ③ 게이트 거짓(리눅스 등)·타 에이전트는 미삽입.
+    ///
+    /// ★2026-08-17 강등 개정(의미가 바뀐 핀): Windows 는 이제 **기본 미주입 · 옵트인 시에만
+    /// 주입**이다(근거·승격 절차는 `d5_gate_for_os` doc — 앵커 ④ · 실기 스모크 B-5 미수행).
+    /// 그래서 ④ 가 고정하는 것은 OS 축 하나가 아니라 **OS × 옵트인 2축 매트릭스**다
+    /// (⑤ 는 그 결론을 산출물 모양으로 되비출 뿐이다 — 아래 '⑤ 의 지위'):
+    ///   macos → 주입 · windows∧미옵트인 → **미주입** · windows∧옵트인 → 주입 ·
+    ///   windows∧옵트인∧사용자 "0" → **여전히 "0"** · 그 외 OS → 미주입.
+    /// 이 다섯 행이 함께 있어야 '기본 off' 와 '옵트인이 실제로 동작함'이 **동시에** 지켜진다 —
+    /// 어느 한쪽만 있으면 스위치가 죽은 채(항상 false) 또는 강등이 무효화된 채(항상 true)
+    /// 초록이 된다.
+    ///
+    /// ★①~③ 은 '게이트 bool 이 주어졌을 때의 삽입 규칙'만 본다(OS·옵트인 무지). 그래서
+    /// 이들만으로는 'Windows 가 대상인가'를 한 글자도 증명하지 못한다 — 그 구멍을 메우는 것은
+    /// **④ 하나**다(순수 매핑표를 세 OS × 옵트인 2축으로 직접 조회한다).
+    ///
+    /// ★⑤ 의 지위(정직 — 2026-08-17 적대검증 2R 의 과장 지적을 반영해 문안을 낮췄다):
+    /// ⑤ 는 ④ 의 결론을 **산출물 형태로 재확인**할 뿐이고 **독립 판별력이 없다**. 실패 집합이
+    /// ④ ∧ ①②③ 에 완전히 포함되기 때문이다 — 예로 ⑤-b 는 `d5_gate_for_os("windows", false)`
+    /// 가 참이 되거나(그러면 ④-b 가 **먼저** 깨진다) 코어가 gated=false 에서 삽입해야만
+    /// (그러면 ③-a 가 먼저 깨진다) 실패한다. 두 순수 함수를 테스트 안에서 합성할 뿐
+    /// **프로덕션 배선을 지나지 않기** 때문이며, 실제 배선을 보는 것은 ⑥ 하나다.
+    /// 그럼에도 남겨 둔 이유는 문서 가치다: 'mac=주입 · win 기본=미주입 · win 옵트인=주입 ·
+    /// 사용자 "0" 불가침' 네 행이 **최종 산출물 모양으로** 한자리에 보인다.
+    /// 이 문단을 '판별력의 소재지' 로 되돌려 쓰지 마라 — 그 형태의 과장이 바로 이 저장소가
+    /// 직전 라운드에 '가짜 핀'으로 규탄한 것이다(다만 ⑤ 는 중복일 뿐 거짓 초록은 만들지 않는다).
+    /// 게이트 값을 리터럴이 아니라 `d5_gate_for_os(...)` 로 먹이는 형식은 유지하라(종전 개정판은
+    /// `..., true)` 리터럴이라 ②와 **문자 그대로 동치**여서, 문서 가치조차 없었다).
     #[test]
     fn claude_alt_screen_env_injection_pins() {
         let k = ENV_CLAUDE_NO_ALT_SCREEN;
@@ -1483,30 +1716,180 @@ mod tests {
         inject_claude_alt_screen_default_for(&mut with_zero, "claude", true);
         let vals: Vec<&str> = with_zero.iter().filter(|(key, _)| key == k).map(|(_, v)| v.as_str()).collect();
         assert_eq!(vals, ["0"], "사용자 '0' 이 유지되고 '1' 은 미출현이어야 한다: {with_zero:?}");
-        // ② mac ∧ claude ∧ 키 부재 → "1" 삽입(기존 쌍 순서 불변 — 재정렬 금지 계약).
+        // ② 게이트 참(mac) ∧ claude ∧ 키 부재 → "1" 삽입(기존 쌍 순서 불변 — 재정렬 금지 계약).
         let mut absent = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
         inject_claude_alt_screen_default_for(&mut absent, "claude", true);
         assert_eq!(absent[0].0, "CLAUDE_CONFIG_DIR", "기존 쌍 순서 불변(재정렬 금지)");
         assert_eq!(
             absent.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()),
             Some("1"),
-            "mac claude 는 기본 '1' 이 삽입돼야 한다: {absent:?}"
+            "게이트 참 + claude 는 기본 '1' 이 삽입돼야 한다: {absent:?}"
         );
-        // ③-a 비-mac(win 등)은 미삽입.
-        let mut win = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
-        inject_claude_alt_screen_default_for(&mut win, "claude", false);
-        assert!(win.iter().all(|(key, _)| key != k), "비-mac 은 미삽입: {win:?}");
-        // ③-b 타 에이전트(codex 등)는 mac 이어도 미삽입.
+        // ③-a 게이트 거짓(리눅스 등 비대상 OS)은 미삽입 — 순수 코어의 OS-게이트 계약.
+        let mut ungated = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(&mut ungated, "claude", false);
+        assert!(
+            ungated.iter().all(|(key, _)| key != k),
+            "게이트 거짓이면 미삽입: {ungated:?}"
+        );
+        // ③-b 타 에이전트(codex 등)는 게이트가 참이어도 미삽입.
         let mut codex: Vec<(String, String)> = Vec::new();
         inject_claude_alt_screen_default_for(&mut codex, "codex", true);
         assert!(codex.is_empty(), "타 에이전트는 미삽입: {codex:?}");
-        // 공개 래퍼는 현 빌드 OS 게이트를 그대로 소비한다(cfg! 정합 — 스모크).
+        // ④ ★OS × 옵트인 매핑표 — **이 테스트의 유일한 판별력 소재지**. `cfg!` 가 아니라 순수
+        //    문자열 함수라서 mac 호스트에서도 windows·linux 행을 함께 조회한다.
+        //    ④-a macOS 는 옵트인과 **무관하게** 주입 대상(강등은 Windows 축만 건드렸다 —
+        //         mac 회귀 0 이 강등 결정의 전제였다).
+        assert!(d5_gate_for_os("macos", false), "macOS 는 옵트인 없이도 D5 주입 대상(기본)");
+        assert!(d5_gate_for_os("macos", true), "macOS 는 옵트인 여부와 무관하게 주입 대상");
+        //    ④-b ★강등 핀: windows ∧ 옵트인 없음 → **비대상**. 누가 `"windows" => true` 로
+        //         승격하면(= 실기 스모크 B-5 없이 기본 on 복귀) 이 줄이 **mac CI 에서 깨진다**.
+        //         승격은 이 줄을 함께 뒤집는 의도적 행위여야 한다(`d5_gate_for_os` doc 의 승격 절차).
+        assert!(
+            !d5_gate_for_os("windows", false),
+            "Windows 는 옵트인 없이는 비대상이어야 한다(2026-08-17 강등 — 앵커 ④ · 실기 B-5 미수행)"
+        );
+        //    ④-c ★스위치 생존 핀: windows ∧ 옵트인 → 대상. 누가 `"windows" => false` 로
+        //         적으면(= 스위치가 죽은 채 초록) 여기서 깨진다.
+        assert!(d5_gate_for_os("windows", true), "Windows 는 옵트인하면 주입 대상이어야 한다");
+        assert!(!d5_gate_for_os("linux", false), "linux 는 비대상");
+        assert!(!d5_gate_for_os("linux", true), "linux 는 옵트인해도 비대상(스위치는 Windows 전용)");
+        assert!(!d5_gate_for_os("freebsd", true), "미지 OS 는 비대상(기본 거짓)");
+        //    ④-d ★문서 결합 핀: 옵트인 채널 이름은 사용자 표면이다. 코드에서 이름을 바꾸면
+        //         USER-MANUAL env 표·릴리스 노트·cys.rs 의 Windows 힌트 문안이 **한꺼번에**
+        //         거짓이 된다 — 그 세 곳을 함께 고치라는 실패 메시지를 남긴다.
+        assert_eq!(
+            (D5_WIN_OPT_IN_ENV, D5_WIN_OPT_IN_FILE),
+            ("CYS_WIN_NO_ALT_SCREEN", ".cys/win-no-alt-screen"),
+            "옵트인 채널 이름을 바꿨다면 USER-MANUAL env 표 · v0.14.16 릴리스 노트 · \
+             src/bin/cys.rs 의 alt_screen_notice Windows 힌트 문안을 함께 고쳐라"
+        );
+        // ⑤ 합성 재확인(**독립 판별력 없음** — 위 doc 의 '⑤ 의 지위' 참조): 게이트를 리터럴이
+        //    아니라 매핑표에서 뽑아 코어에 먹여, ④ 의 결론을 최종 산출물 모양으로 한자리에
+        //    보인다. 여기가 깨지면 ④ 나 ①②③ 이 **먼저** 깨진다.
+        //    ⑤-a windows ∧ **옵트인** ∧ claude ∧ 키 부재 → 삽입.
+        let mut win = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(&mut win, "claude", d5_gate_for_os("windows", true));
+        assert_eq!(
+            win.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()),
+            Some("1"),
+            "windows 는 옵트인하면 '1' 이 삽입돼야 한다: {win:?}"
+        );
+        //    ⑤-b 강등 재확인(산출물 쪽): windows ∧ 옵트인 없음 → 산출물에 키 자체가 없다.
+        //         ④-b 가 게이트 값을, 여기가 그 값에서 나오는 **산출물 모양**을 보인다
+        //         (같은 실패 집합 — 프로덕션 배선을 보는 것은 ⑥ 이다).
+        let mut win_default = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(
+            &mut win_default,
+            "claude",
+            d5_gate_for_os("windows", false),
+        );
+        assert!(
+            win_default.iter().all(|(key, _)| key != k),
+            "windows 기본(미옵트인)은 미삽입이어야 한다 — 강등 전 출고본과 동일: {win_default:?}"
+        );
+        //    ⑤-c windows ∧ 옵트인 ∧ 사용자 값 "0" → **여전히 "0"**. 게이트를 어떻게 흔들어도
+        //        '키 부재 시에만 append' 불가침 계약은 한 치도 약해지지 않는다.
+        let mut win_zero = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string()),
+            (k.to_string(), "0".to_string()),
+        ];
+        inject_claude_alt_screen_default_for(
+            &mut win_zero,
+            "claude",
+            d5_gate_for_os("windows", true),
+        );
+        let win_vals: Vec<&str> =
+            win_zero.iter().filter(|(key, _)| key == k).map(|(_, v)| v.as_str()).collect();
+        assert_eq!(
+            win_vals, ["0"],
+            "windows 옵트인이라도 사용자 '0' 은 불가침이어야 한다('1' 미출현): {win_zero:?}"
+        );
+        //    ⑤-d linux 를 매핑표에서 뽑아 먹이면 미삽입 — ③-a(리터럴 false)와 달리 **OS 이름이
+        //        게이트 거짓으로 이어지는 배선**까지 함께 본다.
+        let mut linux = vec![("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())];
+        inject_claude_alt_screen_default_for(&mut linux, "claude", d5_gate_for_os("linux", true));
+        assert!(linux.iter().all(|(key, _)| key != k), "linux 는 미삽입: {linux:?}");
+        // ⑥ 래퍼 배선 스모크 — 공개 래퍼가 `d5_gate_for_os(consts::OS, d5_win_opt_in())` 로
+        //    라우팅되는지를 핀으로 박는다. 좌변은 래퍼의 **실제 산출물**, 우변은 같은 입력을
+        //    **독립 재계산**한 값이다(리터럴 하드코딩이면 어긋난다).
+        //    ★강등이 이 핀의 감시력을 **키웠다**(종전 doc 의 정직한 한계 고지가 부분 해소됐다):
+        //      종전에는 `--lib` 을 도는 레인(mac·Windows) 둘 다 게이트가 참이라 래퍼의 세 번째
+        //      인자를 `true` 로 하드코딩해도 어느 레인에서도 죽지 않았다. 이제 **Windows 러너는
+        //      옵트인이 없어 게이트가 거짓**이므로(러너 홈에 `~/.cys/win-no-alt-screen` 도
+        //      `CYS_WIN_NO_ALT_SCREEN` 도 없다), 그 하드코딩은 release.yml 의
+        //      `cargo test --lib claude_alt_screen` Windows 스텝에서 빨개진다.
+        //    ★남은 한계(정직): 여전히 **현재 빌드 OS 한 행**만 본다. 나머지 행은 ④ 가 지킨다.
         let mut wrapped: Vec<(String, String)> = Vec::new();
         inject_claude_alt_screen_default(&mut wrapped, "claude");
         assert_eq!(
             wrapped.iter().any(|(key, _)| key == k),
+            d5_gate_for_os(std::env::consts::OS, d5_win_opt_in()),
+            "래퍼는 d5_gate_for_os(consts::OS, d5_win_opt_in()) 로 라우팅돼야 한다"
+        );
+        // ⑦ consts::OS ↔ cfg! 동치 — 옵트인 축을 **상수로 고정**해 두 표현을 대조한다.
+        //    (옵트인을 참으로 고정하면 매핑은 정확히 mac ∨ windows, 거짓으로 고정하면 mac 단독.)
+        assert_eq!(
+            d5_gate_for_os(std::env::consts::OS, true),
+            cfg!(target_os = "macos") || cfg!(windows),
+            "옵트인 참 고정 시 매핑은 cfg!(macos) ∨ cfg!(windows) 와 일치해야 한다"
+        );
+        assert_eq!(
+            d5_gate_for_os(std::env::consts::OS, false),
             cfg!(target_os = "macos"),
-            "래퍼 게이트는 cfg!(macos) 와 일치해야 한다"
+            "옵트인 거짓 고정 시 매핑은 cfg!(macos) 단독이어야 한다(Windows 기본 미주입)"
+        );
+    }
+
+    /// ★D5 옵트인 **판독기** 핀(2026-08-17 적대검증 2R minor 수리 — 강등 안전 사슬의 유일한
+    /// 미핀 고리였다).
+    ///
+    /// 종전 실측: 게이트 매핑(위 ④)·삽입 재확인(⑤)·래퍼 라우팅(⑥)은 모두 고정돼 있었으나
+    /// '**런타임 기본값이 거짓인가**'를 단언하는 테스트가 저장소 전체에 0건이었다. 그래서
+    /// `d5_win_opt_in` 의 판정이 참으로 퇴행하면 Windows 가 기본 on 으로 되돌아가
+    /// **앵커 ④(전 pane 사망)가 재무장**되는데도 어느 레인도 빨개지지 않았다:
+    ///   · mac 레인 — 게이트가 옵트인과 무관하게 참이라 전건 초록.
+    ///   · Windows `cargo test --lib claude_alt_screen` 레인 — 위 ⑥ 은 좌·우변이 **같은 판독기를
+    ///     재호출**하므로 둘이 함께 참이 되어 여전히 초록(판독기에 대한 판별력 0).
+    ///   · windows-health 의 `#[cfg(windows)]` 블록 — 게이트를 `d5_gate_for_os("windows", …)` 로
+    ///     명시 주입해 판독기를 **의도적으로 우회**한다.
+    /// 그래서 판정 규약을 순수 함수(`d5_win_opt_in_from`)로 떼어 여기서 직접 못박는다.
+    ///
+    /// ★이름에 `claude_alt_screen` 을 넣은 것은 **의도**다: Windows 레인은 전체가 아니라
+    /// `cargo test --lib claude_alt_screen` **필터**로 돈다(release.yml 태그 레인 ·
+    /// windows-health 는 `factory_reset::`/`d5_env_injection`). 이 축이 실제로 문제가 되는 OS 의
+    /// 레인에서 함께 돌게 하려면 이름이 그 필터에 걸려야 한다 — 개명 시 그 사실을 확인하라.
+    #[test]
+    fn claude_alt_screen_win_opt_in_reader_pins() {
+        // ① ★기본값 핀 — 두 채널 모두 없으면 **거짓**. 이 한 줄이 '강등이 살아 있는가'다.
+        assert!(
+            !d5_win_opt_in_from(None, false),
+            "옵트인 채널이 하나도 없으면 판독은 거짓이어야 한다(Windows 기본 미주입 — 앵커 ④)"
+        );
+        // ② env 채널은 정확히 "1" 만 참(형제 게이트와 동형 · 느슨한 truthy 금지).
+        assert!(d5_win_opt_in_from(Some("1"), false), "CYS_WIN_NO_ALT_SCREEN=1 은 옵트인");
+        assert!(!d5_win_opt_in_from(Some("0"), false), "\"0\" 은 옵트인이 아니다");
+        assert!(!d5_win_opt_in_from(Some("true"), false), "\"1\" 이외 값은 옵트인이 아니다");
+        assert!(!d5_win_opt_in_from(Some(""), false), "빈 값은 옵트인이 아니다");
+        // ③ 파일 채널은 단독으로 참 — Windows 정본 안내가 파일인 이유(setx 는 이미 뜬 GUI
+        //    계보에 반영되지 않는다)는 `d5_win_opt_in` doc 참조.
+        assert!(d5_win_opt_in_from(None, true), "~/.cys/win-no-alt-screen 존재만으로 옵트인");
+        // ④ 두 채널은 OR — 파일이 있으면 env 가 "0" 이어도 참이다. env 로 **끄는** 극성은 이
+        //    스위치가 아니라 승격 후의 `CYS_WIN_ALT_SCREEN_OFF` 몫이다(`d5_gate_for_os` doc).
+        assert!(d5_win_opt_in_from(Some("0"), true), "두 채널은 OR — 파일이 있으면 참");
+        // ⑤ 래퍼 배선 스모크 — 부작용 판독을 테스트가 **독립 재현**해 순수 코어에 먹인 값과
+        //    래퍼 산출물이 일치해야 한다.
+        //    ★판별력의 한계(정직): '읽는 위치'(env 이름·파일 경로)는 래퍼와 테스트가 같은
+        //    상수를 공유하므로 이 줄이 아니라 ④-d(문서 결합 핀)가 지킨다. 여기서 잡는 것은
+        //    래퍼의 **하드코딩·극성 반전**이다 — 옵트인이 없는 러너·개발기에서
+        //    `fn d5_win_opt_in() -> bool { true }` 나 `!d5_win_opt_in_from(...)` 은 즉시 빨개진다.
+        let env_now = std::env::var(D5_WIN_OPT_IN_ENV).ok();
+        let file_now = home_dir().join(D5_WIN_OPT_IN_FILE).exists();
+        assert_eq!(
+            d5_win_opt_in(),
+            d5_win_opt_in_from(env_now.as_deref(), file_now),
+            "d5_win_opt_in 은 (env {D5_WIN_OPT_IN_ENV}, ~/{D5_WIN_OPT_IN_FILE} 존재)를 \
+             d5_win_opt_in_from 에 먹이는 얇은 래퍼여야 한다"
         );
     }
 }

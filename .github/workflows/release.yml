@@ -451,12 +451,26 @@ jobs:
       #   **feat/** 브랜치 레인에서만 돌았다. 태그(릴리스) 경로에 검증이 0이면, 브랜치를 거치지
       #   않은 핫픽스 태그가 Windows 회귀를 그대로 싣는다 — 이 파일 자신이 규탄한 "태그 경로
       #   보증 0" 구조의 재생산이다. 대상을 factory_reset:: 로 좁혀 예산을 지킨다.
-      - name: cargo test --lib factory_reset (Windows 계약 · 태그 레인)
+      # ★D5 게이트(v0.14 품질 라인) 편입 — 적대검증 2R major 수리.
+      #   `cys::d5_gate_for_os` 는 Windows 를 사정권에 넣되 **옵트인일 때만** 참이다
+      #   (2026-08-17 강등 — 근거·승격 절차는 `src/lib.rs` 의 그 함수 doc). 그 매핑을 Windows
+      #   호스트에서 실행하는 레인이 0건이었다(전체 `cargo test --lib`·`--bin cys` 는 이 파일
+      #   위쪽 스텝의 `if: matrix.target == 'aarch64-apple-darwin'` 로 macOS 전용).
+      #   mac 초록은 Windows 파이프라인을 전혀 증명하지 않는다.
+      #   ★강등이 이 스텝의 감시력을 키웠다: 러너에는 옵트인 스위치가 없어 게이트가 **거짓**이므로,
+      #   래퍼(`inject_claude_alt_screen_default`)의 게이트 인자를 `true` 로 하드코딩하는 변이가
+      #   여기서 빨개진다. 강등 전에는 mac·Windows 두 레인 모두 게이트가 참이라 그 변이가 어느
+      #   레인에서도 죽지 않았다(그 한계는 당시 핀 주석에 정직하게 적혀 있던 것이다).
+      #   비용은 0 에 가깝다 — lib 은 바로 위 factory_reset 스텝에서 이미 컴파일돼 있고,
+      #   D5 핀은 순수 문자열 매핑이라 실행이 밀리초다.
+      #   ⚠필터를 지우지 마라. 지우면 이 레인은 다시 '돌지 않는 초록'이 된다.
+      - name: cargo test --lib factory_reset + D5 (Windows 계약 · 태그 레인)
         if: matrix.platform == 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib claude_alt_screen -- --test-threads=1
 
       - name: Windows 직접 빌드 + CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers · 업로드 전)
         if: matrix.platform == 'windows-latest'

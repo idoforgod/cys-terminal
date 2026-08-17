@@ -435,6 +435,36 @@ fn app_mouse_enabled() -> bool {
         || cys::home_dir().join(".cys/allow-app-mouse").exists()
 }
 
+/// Windows 휠 가드 롤백 게이트(파일/환경변수 — 위 두 게이트와 완전 동형 · C-4):
+/// Windows 에서 alt 화면 TUI(Claude Code fullscreen 등)에 휠을 굴리면 xterm 이 노치당
+/// 방향키를 합성해 쏘는 문제를 UI 측 술어(shouldSuppressWheelWin)로 억제하는데, 그 억제가
+/// 누군가의 워크플로를 깨뜨렸을 때 되돌릴 탈출구가 필요하다. 릴리스 빌드엔 devtools 가 없어
+/// localStorage 는 최종 사용자의 롤백 수단이 될 수 없다(ime_debug_enabled 주석과 같은 함정) →
+/// ~/.cys/win-wheel-guard-off 파일 존재 또는 CYS_WIN_WHEEL_GUARD_OFF=1 이면 가드를 끈다.
+/// ★기존 allow-app-mouse 킬스위치를 이 탈출구로 재사용하면 안 된다 — 그것은 입·출력 양측을
+/// 열어 Windows ConPTY 결함 1호(마우스 보고가 리터럴로 타이핑되는 현상)를 되살린다.
+/// 그래서 '출력측 휠 억제만' 끄는 전용 게이트를 따로 둔다.
+///
+/// ★두 수단의 **적용 시점이 다르다**(사용자 문서에 같은 내용이 명시돼 있다 — USER-MANUAL
+/// §4.6b · env 표): 파일은 pane 을 만들 때마다 stat 하므로 **새 pane 부터 즉시** 반영되지만,
+/// env 는 이 GUI 프로세스가 **기동 시 상속한 값**만 보므로 터미널에서 set/setx 해도 이미 떠
+/// 있는 GUI 에는 반영되지 않는다(=GUI 재시작 필요). Windows 는 GUI 를 탐색기·바로가기로
+/// 띄우는 것이 보통이라 실질 권장 수단은 **파일**이다. 그 파일을 PowerShell 에서 만드는
+/// 정본 명령은 `New-Item -ItemType File -Force $HOME\.cys\win-wheel-guard-off` 다
+/// (`touch` 는 PowerShell·cmd 에 존재하지 않는다 — 안내 문안에 쓰지 마라).
+///
+/// ★이름은 **술어형**이다(2026-08-17 개명 — 성찰3 설계렌즈 note): 종전 `win_wheel_guard_off`
+/// 는 불리언 질의인데 명령형 동작("가드를 꺼라")으로 오독될 여지가 있었고, 형제 게이트 둘
+/// (`app_mouse_enabled`·`ime_debug_enabled`)이 모두 술어형이라 doc 이 주장한 '완전 동형'이
+/// 이름에서만 깨져 있었다. 커맨드는 이 바이너리에 UI 와 함께 묶여 나가므로(ui/dist 임베드)
+/// 외부 호환 부담이 없다 — 호출부는 ui/src/main.ts 의 invoke 문자열 하나뿐이다.
+/// 사용자 표면(env `CYS_WIN_WHEEL_GUARD_OFF` · 파일 `~/.cys/win-wheel-guard-off`)은 **불변**이다.
+#[tauri::command]
+fn win_wheel_guard_disabled() -> bool {
+    std::env::var("CYS_WIN_WHEEL_GUARD_OFF").map(|v| v == "1").unwrap_or(false)
+        || cys::home_dir().join(".cys/win-wheel-guard-off").exists()
+}
+
 #[tauri::command]
 async fn send_input(
     socket: Option<String>,
@@ -3632,6 +3662,7 @@ fn main() {
             log_ime,
             ime_debug_enabled,
             app_mouse_enabled,
+            win_wheel_guard_disabled,
             rename_surface,
             resize_surface,
             close_surface,

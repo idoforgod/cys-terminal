@@ -110,8 +110,9 @@ diff 검토 후 처분한다(결정 D6 — 실측 후 결정, 자동 채택 금�
 | 대상 | 절차 |
 |---|---|
 | **D2 (CEO 템플릿)** | 「직전 릴리스 재설치 → **같은 세션에서 promote-ceo 재실행**」. **md 파일 수동 복귀 금지**(비정형 승격 FAIL 자가 제조 경로 — pack-rollback 도 승격 중엔 기계 거부). 다운그레이드 설치 리허설 1회를 릴리스 게이트에 편입(R-4). |
-| **D4 (마우스 정합기)** | `localStorage.cysMouseReconcilerOff="1"` — 정합기 소비 전부 비활성(win 비활성 코드 경로 재사용 · 새 pane 부터). |
-| **D5 (env 게이트)** | 전 계정 팩 `agents.json` env 에 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "0"` **일괄** 기입 — 주입 계약이 '키 부재 시에만'이라 `"0"` 이 항상 이긴다. |
+| **D4 (마우스 정합기 · macOS)** | `localStorage.cysMouseReconcilerOff="1"` — 정합기 소비 전부 비활성(win 비활성 코드 경로 재사용 · 새 pane 부터). ⚠**이 스위치는 Windows 휠 가드를 끄지 못한다**(아래 행) — 종전에는 Windows 에 휠 핸들러가 없어 이 구분이 없었다. |
+| **D4-W (Windows 휠 가드)** | PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-wheel-guard-off` 후 **새 pane**(env `CYS_WIN_WHEEL_GUARD_OFF=1` 동등하나 GUI 가 상속한 값만 읽으므로 GUI 재시작 필요 — 정본 수단은 파일. `touch` 는 PowerShell 에 없다). ⚠**결함 복원 스위치**다 — 끄면 claude fullscreen 휠→방향키 합성이 되살아나 프롬프트 입력창이 다시 오염될 수 있다. `allow-app-mouse` 로 대신하지 마라(ConPTY 결함 1호 재발). |
+| **D5 (env 게이트)** | 전 계정 팩 `agents.json` env 에 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "0"` **일괄** 기입 — 주입 계약이 '키 부재 시에만'이라 `"0"` 이 항상 이긴다. ※**Windows 는 v0.14.19 부터 기본 미주입(옵트인)** 이라 되돌릴 것이 없다 — 옵트인한 사용자는 `~/.cys/win-no-alt-screen` 삭제로 즉시 복귀한다(`src/lib.rs` 의 `d5_gate_for_os` doc 이 정본). |
 | **릴리스 전체** | 이전 자산 재게시 → `SHA256SUMS.txt` 재갱신 → 원격검증 재실행 → updater 채널 처분(구버전 재공개 또는 잠금). |
 
 ## 8. 사후 검증 14일

@@ -385,8 +385,9 @@ describe("정합기 — CARRY_CAP fail-open 불변 (소비 활성에서도)", ()
 
 describe("win-parity — 소비 비활성 출력 = 현행 filterChunk 와 byte-identical (스펙 D4)", () => {
   // 소비 비활성 3형(무인자·os:'win'·reconcile:false)은 장부를 기록하되 출력은 v1 그대로여야
-  // 한다. 휠 핸들러의 win 미등록은 main.ts 배선(IS_WINDOWS 게이트) — wheelgate.test.ts 가
-  // 술어 측을, 이 핀이 출력 측을 고정한다.
+  // 한다. main.ts 는 Windows 에도 휠 핸들러를 등록하지만(별도 win 전용 술어
+  // shouldSuppressWheelWin) 그것은 **입력 이벤트 측**이고, 이 핀은 **출력 바이트 측**을
+  // 고정한다 — wheelgate.test.ts 가 술어 측을, 이 핀이 출력 측을 맡는 분업은 그대로다.
   const parityOpts = [
     undefined,
     { os: "win", reconcile: true },
@@ -423,5 +424,147 @@ describe("win-parity — 소비 비활성 출력 = 현행 filterChunk 와 byte-i
       const got = asStr(f.feed(raw.slice(0, cut))) + asStr(f.feed(raw.slice(cut))) + asStr(f.flush());
       expect(got).toBe(whole);
     }
+  });
+});
+
+// ★정정 이력 — 위 win-parity 블록의 산문 한 줄이 한때 "휠 핸들러의 win 미등록은 main.ts 배선"
+//   이라고 적혀 있었고 그것은 거짓이 됐다(main.ts 는 Windows 에도 등록한다 — 별도 win 전용 술어
+//   wheelgate.shouldSuppressWheelWin). 이번 라운드에 **문장을 사실로 고쳤다**. 무수정이 계약인
+//   것은 그 블록의 `expect` 식(출력 바이트 회귀 감시선)이지 그것을 설명하는 산문이 아니다 —
+//   거짓이 된 산문을 남기는 것은 감시선 보존이 아니라 결함이다. 단언은 한 줄도 바뀌지 않았다.
+//   ★오히려 이 핀이 win 휠 가드의 **전제**를 지킨다: 출력 소비가 계속 비활성이어야 xterm 이
+//   Windows 에서 트래킹에 진입하지 못하고(mouseTrackingMode="none"), 그래야 win 술어의
+//   `!xtermTracking` 항이 상수 true 로 유지된다. 이 핀이 깨지면 win 가드의 상태 모델도 함께 깨진다.
+describe("ledgerWantsAnyMotion — 1003 단독 조회 (C-1: Windows 휠 억제 술어 입력)", () => {
+  // 이 접근자는 ledgerWantsMouse('아무 마우스 파라미터나 하나')보다 **좁다**. 좁혀야 하는 이유가
+  // 이 describe 의 존재 이유다: Claude Code 는 fullscreen 진입 시 1003 을 켜지만 vim `mouse=a`
+  // 는 통상 켜지 않으므로, 1003 을 술어로 삼아야 Windows 휠 억제가 claude 에만 걸리고 vim 의
+  // 방향키 합성 UX 는 그대로 보존된다. ★vim 의 실제 DECSET 캡처는 저장소에 0건 — 이 전제가
+  // 이 설계의 최대 미확정이고, 아래 "vim 시나리오" 케이스는 그 **전제를 명문화한 핀**이다.
+  it("초기 장부는 비어 있다 → false", () => {
+    expect(mac().ledgerWantsAnyMotion()).toBe(false);
+    expect(new MouseTrackingFilter().ledgerWantsAnyMotion()).toBe(false);
+  });
+  it("1003h 뒤 true / 명시 1003l 뒤 false", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1003h");
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+    feedS(f, "\x1b[?1003l");
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+  });
+  it("claude 시나리오(1000;1002;1003;1006h — 'full') → true", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1000;1002;1003;1006h");
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+    expect(f.ledgerWantsMouse()).toBe(true);
+  });
+  it("★vim 시나리오(mouse=a: 1000/1002/1006 만 — 1003 부재) → false, 단 wantsMouse 는 true", () => {
+    // 두 접근자가 갈리는 지점 = 억제/비억제가 갈리는 지점. wantsMouse 를 그대로 썼다면
+    // vim 에서도 휠이 억제돼 현행 UX 가 회귀한다 — 그래서 좁은 술어가 필요하다.
+    const f = mac();
+    feedS(f, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+    expect(f.ledgerWantsMouse()).toBe(true);
+  });
+  it("1003 만 끈 뒤에도 다른 파라미터는 남는다 — 분리 입증(claude→부분 해제)", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1000;1002;1003;1006h");
+    feedS(f, "\x1b[?1003l");
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+    expect(f.ledgerWantsMouse()).toBe(true); // 1000/1002/1006 은 여전히 h
+  });
+  it("RIS(ESC c) 는 장부를 소거한다 → false", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1003h");
+    feedS(f, "\x1bc");
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+  });
+  it("reset() 뒤 false (장부 소거 — 리셋 훅 경로)", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1003h");
+    f.reset();
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+  });
+  it("clearLedgerIfGeneration 소거 뒤에도 false (에포크 가드 경로)", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1003h");
+    expect(f.clearLedgerIfGeneration(f.generation())).toBe(true);
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+  });
+  it("소비 비활성(win)에서도 장부 기록은 공통이므로 조회된다 — 실사용 대상이 Windows 다", () => {
+    // 술어의 유일한 소비자가 Windows 휠 게이트라, 소비 비활성 인스턴스에서 장부가 비면
+    // 술어가 영구 false 가 돼 기능 자체가 죽는다. 장부 기록의 OS 무관성을 여기서 핀한다.
+    const f = new MouseTrackingFilter({ os: "win", reconcile: true });
+    expect(feedS(f, "\x1b[?1003h")).toBe(""); // 출력은 v1 스트리핑 그대로(win-parity 무접촉)
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+  });
+  it("alt 구간에서 통과된 1003h 도 장부에 오른다(방출 경로와 무관하게 기록)", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1049h");
+    expect(feedS(f, "\x1b[?1003h")).toBe("\x1b[?1003h"); // alt 중 원문 통과
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+  });
+});
+
+// ★alt 이탈 장부 소거 — Windows 휠 가드 stale 봉인 (적대검증 2R major).
+//
+// 왜 이 핀이 필요한가: Windows 는 `!xtermTracking` 항이 상수 true 라(wheelgate.ts (b))
+// 억제를 푸는 해제항이 없다. 그래서 장부에 1003 이 남으면 **다음** 전체화면 앱(less·man·vim)
+// 이 alt 에 들어가는 순간 술어가 충족돼 그 pane 이 닫힐 때까지 휠이 죽었다. 소비 비활성
+// 경로에는 재생 주입이 없어 장부를 alt 이탈 후까지 보존할 이유가 하나도 없다 — 그래서 지운다.
+// mac(소비 활성)은 그 장부가 재생 주입의 원본이므로 **보존이 계약**이고, 위 :188 블록의
+// suspend/resume 핀이 그것을 이미 고정하고 있다. 이 블록은 두 경로가 갈리는 지점을 못박는다.
+describe("alt 이탈 장부 소거 — 소비 비활성(win) 한정 (휠 가드 stale 봉인)", () => {
+  for (const t of [47, 1047, 1049]) {
+    it(`win: ?${t}l 이탈 시 1003 이 내려간다 → 다음 alt 앱에 새지 않는다`, () => {
+      const f = new MouseTrackingFilter({ os: "win", reconcile: true });
+      feedS(f, "\x1b[?1000;1002;1003;1006h"); // claude 'full'
+      feedS(f, `\x1b[?${t}h`);
+      expect(f.ledgerWantsAnyMotion()).toBe(true); // alt 중에는 억제가 걸려야 한다
+      feedS(f, `\x1b[?${t}l`); // 앱이 alt 를 떠난다(1003l 을 보내지 않은 채)
+      expect(f.ledgerWantsAnyMotion()).toBe(false); // ← 이것이 없으면 휠 영구 사망
+      expect(f.ledgerWantsMouse()).toBe(false);
+      // 다음 앱(less: 트래킹 무요청)이 alt 에 들어가도 술어는 불충족이어야 한다.
+      feedS(f, `\x1b[?${t}h`);
+      expect(f.ledgerWantsAnyMotion()).toBe(false);
+    });
+  }
+  it("★win: alt 진입을 못 본 상태(재부착)에서도 이탈 관측이면 소거 — 재부착 사각 봉인", () => {
+    // 재부착이 보내는 초기 화면은 셀 내용 스냅샷뿐이라 alt 진입 시퀀스가 재발행되지 않는다
+    // → 이미 전체화면인 앱에 붙어도 내부 altActive 는 false 로 시작한다. 그 상태에서 앱이
+    // 마우스 DECSET 을 다시 내면 장부에 1003 이 오르는데, 이어지는 ?1049l 을 '전이 아님'으로
+    // 흘려보내면 장부가 영구 잔존해 **다음** 앱부터 휠이 죽는다. 소거 조건을 altActive 에
+    // 묶지 않는 이유가 이것이다(processChunk 의 [전이] 블록 주석).
+    // 오판 방향은 안전하다: 잘못 지우면 비억제(=가드 도입 전 동작)로 떨어질 뿐이고, 앱이
+    // 마우스 모드를 다시 선언하면 즉시 재무장한다.
+    const f = new MouseTrackingFilter({ os: "win", reconcile: true });
+    feedS(f, "\x1b[?1003h"); // 재부착 후 앱이 다시 선언(진입 시퀀스는 못 봤다)
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+    expect(feedS(f, "\x1b[?1049l")).toBe("\x1b[?1049l"); // 출력은 v1 그대로
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
+    // 재무장 확인 — 앱이 다시 선언하면 술어가 되살아난다(영구 무력화가 아니다).
+    feedS(f, "\x1b[?1049h\x1b[?1003h");
+    expect(f.ledgerWantsAnyMotion()).toBe(true);
+  });
+  it("★mac(소비 활성)은 이탈에도 장부를 보존한다 — 재생 주입 원본(비대칭 확정)", () => {
+    const f = mac();
+    feedS(f, "\x1b[?1003h");
+    feedS(f, "\x1b[?1049h");
+    feedS(f, "\x1b[?1049l");
+    expect(f.ledgerWantsAnyMotion()).toBe(true); // mac 은 suspend/resume 재생을 위해 유지
+    expect(feedS(f, "\x1b[?1049h")).toBe("\x1b[?1049h\x1b[?1003h"); // 재생이 빈손이 아님
+  });
+  it("★출력 바이트 무변경 — 소거는 win-parity 계약에 닿지 않는다", () => {
+    // 이 소거가 출력에 한 바이트라도 보태면 win-parity(스펙 D4)가 깨진다. 위 :386 블록의
+    // 코퍼스가 이미 통짜로 고정하지만, 소거를 넣은 이 전이 자체를 여기서 직접 못박는다.
+    const f = new MouseTrackingFilter({ os: "win", reconcile: true });
+    feedS(f, "\x1b[?1003h\x1b[?1049h");
+    expect(feedS(f, "\x1b[?1049l")).toBe("\x1b[?1049l"); // 소등 주입 없음(=v1 그대로)
+  });
+  it("정합기 롤백(mac·reconcile=false)도 같은 비소비 경로 — 신규 분기 0", () => {
+    const f = new MouseTrackingFilter({ os: "mac", reconcile: false });
+    feedS(f, "\x1b[?1003h\x1b[?1049h");
+    expect(feedS(f, "\x1b[?1049l")).toBe("\x1b[?1049l");
+    expect(f.ledgerWantsAnyMotion()).toBe(false);
   });
 });

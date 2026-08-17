@@ -1041,6 +1041,28 @@ impl Consumption {
 /// (E-c) create_idem 캐시 엔트리 TTL — 클라이언트 재시도 창. 만료분은 조회 시 lazy GC.
 pub const CREATE_IDEM_TTL_SECS: f64 = 120.0;
 
+/// **데몬 발행 feed 항목의 예약 request_id 접두** — 이 네임스페이스의 단일 정의처다.
+///
+/// 왜 상수인가(2026-08-17 · 성찰3 설계렌즈 major): 종전에는 `"daemon-"` 리터럴이 생성 1곳 +
+/// 판정 5곳 + UI 1곳에 흩어져 있었고 정의는 어디에도 없었다 — '예약 네임스페이스'라고 선언만
+/// 하고 네임스페이스의 진리원이 없는 상태였다(같은 저장소가 D5 키에 대해서는
+/// `cys::ENV_CLAUDE_NO_ALT_SCREEN` 을 두고 '사본 금지'를 명문화한 것과 어긋난다).
+/// 이 접두를 만드는 곳은 `Daemon::push_feed_notification` 하나뿐이고, 읽는 곳은 전부 아래
+/// `is_daemon_issued` 를 지난다. 리터럴을 새로 적지 마라 — 늘리려면 여기를 참조하라.
+pub const DAEMON_REQ_PREFIX: &str = "daemon-";
+
+/// 이 request_id 가 **데몬이 스스로 발행한** 항목의 것인가(= 외부 caller 가 만들 수 없는 항목).
+///
+/// 의미: 데몬이 화면 패턴으로 감지해 올린 승인/알림. 이 부류는 ①GUI 에서 Allow/Deny 가 아무
+/// 효과를 내지 못하고(응답을 받을 waiter 가 없다) ②surface 의 재발행 코얼레싱 판정에 쓰이며
+/// ③governance 의 stalled 스캔 대상이다. 세 소비자가 같은 술어를 봐야 한다.
+///
+/// 위조 불가의 근거: `handlers.rs` 의 `feed.push` arm 이 클라이언트 지정 request_id 에 이
+/// 접두가 있으면 fail-closed 로 거부한다. ∴ 이 술어의 참값은 **서버측 사실**이다.
+pub fn is_daemon_issued(request_id: &str) -> bool {
+    request_id.starts_with(DAEMON_REQ_PREFIX)
+}
+
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1423,8 +1445,10 @@ impl Daemon {
         surface_id: Option<u64>,
     ) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // 예약 네임스페이스의 **유일한 생성처**다(접두 정의 = DAEMON_REQ_PREFIX).
         let request_id = format!(
-            "daemon-{}-{}",
+            "{}{}-{}",
+            DAEMON_REQ_PREFIX,
             now_epoch() as u64,
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -1476,7 +1500,7 @@ impl Daemon {
             i.status == "pending"
                 && i.kind == "approval"
                 && i.surface_id == Some(surface_id)
-                && i.request_id.starts_with("daemon-")
+                && is_daemon_issued(&i.request_id)
         })
     }
 
@@ -1492,7 +1516,7 @@ impl Daemon {
                 i.status == "pending"
                     && i.kind == "approval"
                     && i.surface_id == Some(surface_id)
-                    && i.request_id.starts_with("daemon-")
+                    && is_daemon_issued(&i.request_id)
             })
             .map(|i| i.request_id.clone())
             .collect()
@@ -1862,7 +1886,38 @@ impl Daemon {
             cwd: cwd_str,
             pid,
             created_at: now_epoch(),
-            env_injected: !env.is_empty(), // RC-3 잔여(T2.1): env 주입 여부 기록(node-recover 안전 판정)
+            // RC-3 잔여(T2.1): env 주입 여부 기록(node-recover·in-seat 재연결의 Windows 안전 판정).
+            // ★의미 주의(v0.14 D5 확장 이후 · 적대검증 2R): 이 플래그는 '**무엇이든** env 가
+            //   실렸나'이지 '계정격리 키(CLAUDE_CONFIG_DIR)가 실렸나'가 아니다. D5 게이트가
+            //   mac 단독에서 넓어진 뒤로는 `cys launch-agent` 가 만드는 surface.create env 맵이
+            //   **CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 한 쌍만으로도 비지 않을 수 있다**
+            //   (agent spec 의 env 가 비어 있는 커스텀 구성). 그러면 소비처의 fail-closed 가드
+            //   (src/bin/cys.rs — grep `★계정격리 가드(E8)` 와 node-recover 의 `env_injected`
+            //   검사)가 격리 키 없이도 열린다.
+            // ★그 조합의 정확한 조건(2026-08-17 D5 강등 반영 — 무조건 확장이 아니다):
+            //   이 플래그를 **실제로 소비하는 것은 Windows 뿐**이다(실측: in-seat 가드는
+            //   `let safe = cfg!(unix) || env_injected;` 라 unix 에선 값과 무관하게 열리고,
+            //   node-recover 의 검사는 `#[cfg(windows)]` 로 감싸여 있다).
+            //   그리고 Windows 의 D5 는 강등 후 **옵트인**이다(`~/.cys/win-no-alt-screen` ·
+            //   `CYS_WIN_NO_ALT_SCREEN=1` — 정본은 lib.rs `d5_gate_for_os` doc). ∴ 플립이
+            //   일어나는 조합은 **Windows ∧ 옵트인 ∧ spec env 부재** 3중 조건이다. 기본값
+            //   Windows 에서는 D5 가 주입되지 않으므로, spec env 가 비어 있으면 맵도 그대로
+            //   비어(=env_injected 거짓) 가드가 닫힌 채다.
+            //   (Windows 가 기본 on 으로 승격되면 '∧ 옵트인' 항이 사라져 조건이 넓어진다 —
+            //    그 개정 의무는 `d5_gate_for_os` doc 의 승격 절차 **'동반 개정' ④항**에 있다.
+            //    거기의 번호는 개정 목록의 번호이지 '앵커 ④' 와 무관하다.)
+            // ★그럼에도 이번 라운드에 술어를 좁히지 않은 근거(실측):
+            //   ① 동봉 pack 의 claude spec 은 CLAUDE_CONFIG_DIR 을 항상 갖는다(cysjavis-pack/
+            //      agents.json) → 기본 구성에서는 D5 이전에도 이미 true 였고 변화가 0 이다.
+            //   ② 플립이 일어나는 유일한 조합(spec env 부재)에서는 **애초에 실릴 격리 키가 없다**
+            //      — 그 pane 을 순수 cmd 로 재기동하는 것은 새로 launch-agent 하는 것과 동일한
+            //      격리 수준이라, 가드가 열려도 잃는 격리가 없다.
+            //   ③ `cys new-surface` 로 만든 빈 셸은 env 를 아예 넘기지 않으므로 여전히 false 다
+            //      (D5 는 launch-agent 경로에서만 주입된다) → in-seat 가드의 원 목적은 보존된다.
+            //   ∴ 지금 고치면 얻는 안전은 0 이고 Windows 부트 경로의 판정만 흔든다. 정본 수리는
+            //     '격리 키가 pane 에 실렸는가'를 별도 bool 로 기록하는 것이며, 그때 이 주석과
+            //     아래 회귀 핀(create_surface_with_env_records_env_injected_flag)을 함께 고쳐라.
+            env_injected: !env.is_empty(),
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
             write_tx,
@@ -3001,6 +3056,54 @@ mod tests {
             )
             .unwrap();
         assert!(!s2.env_injected, "env 미주입 surface는 env_injected=false → Windows node-recover fail-closed");
+
+        // ★D5 한 쌍만 실린 경우 = **의도된 현상**으로 못박는다(2026-08-17 · 성찰3 테스트렌즈 note).
+        //  create_surface_with_env 의 주석이 경고하는 조합이다: agent spec 의 env 가 비어 있어도
+        //  D5 한 쌍만으로 맵이 비지 않아 env_injected 가 **격리 키 없이 true** 가 된다.
+        //  ★그 조합의 조건(강등 반영): 플래그를 소비하는 것은 Windows 뿐이고 Windows 의 D5 는
+        //  **옵트인**이므로, 실제 성립 조건은 `Windows ∧ 옵트인 ∧ spec env 부재` 3중이다
+        //  (기본값 Windows 는 D5 미주입 → 맵이 비어 가드가 닫힌 채다. 정본은 lib.rs
+        //  `d5_gate_for_os` doc). 아래 단언 자체는 OS·옵트인과 **무관한 순수 술어 계약**이라
+        //  강등·승격 어느 쪽으로도 흔들리지 않는다 — 흔들리는 것은 이 조건절뿐이다.
+        //  지금은 좁히지 않는 것이 옳다고 판단했고(근거 ①②③은 그 주석에 있다), 나중에 술어를
+        //  '격리 키가 실렸는가'로 좁히면 이 단언이 **정확히 그 변경 지점을 가리키며** 깨진다 —
+        //  그때 주석과 함께 고쳐라.
+        let s3 = daemon
+            .create_surface_with_env(
+                None, Some("sleep 30".into()), None, Some("worker-3".into()), 24, 80,
+                &[(cys::ENV_CLAUDE_NO_ALT_SCREEN.to_string(), "1".to_string())],
+                None,
+            )
+            .unwrap();
+        assert!(
+            s3.env_injected,
+            "D5 한 쌍만 실려도 현재 술어(!env.is_empty())는 true 다 — 좁히려면 주석의 정본 수리를 따르라"
+        );
+    }
+
+    /// ★동봉 pack 의 claude spec 이 계정격리 키를 갖는다 — env_injected 를 좁히지 않기로 한
+    /// 판단의 **1번 근거**(create_surface_with_env 의 주석 ①)를 실제 감시선으로 만든다.
+    ///
+    /// 종전에는 그 근거를 고정하는 테스트가 0건이었다(성찰3 테스트렌즈 note): 이 데이터 파일에서
+    /// CLAUDE_CONFIG_DIR 이 빠지면 "기본 구성에서는 D5 이전에도 이미 true 였고 변화가 0" 이라는
+    /// 문장이 조용히 거짓이 되고, 그 순간 `env_injected` 는 격리 키 없이 열리는 플래그가 된다.
+    /// 값 자체가 아니라 **키의 존재**만 본다(경로 표현은 사용자 환경에 따라 바뀔 수 있다).
+    #[test]
+    fn packaged_claude_spec_carries_account_isolation_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack/agents.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("동봉 pack 의 agents.json 을 읽을 수 없다({}): {e}", path.display()));
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("agents.json 파싱");
+        let env = &v["claude"]["env"];
+        assert!(
+            env.is_object(),
+            "claude spec 에 env 맵이 있어야 한다(없으면 env_injected 근거 ①이 무너진다): {env}"
+        );
+        assert!(
+            env.get("CLAUDE_CONFIG_DIR").is_some(),
+            "claude spec env 에 CLAUDE_CONFIG_DIR 이 있어야 한다 — 이것이 사라지면 \
+             surface.create 의 env 맵이 D5 한 쌍만 남아 env_injected 가 격리 키 없이 참이 된다: {env}"
+        );
     }
 
     /// ★W2/P1-2: master 역할로 surface 를 (재)기동하면 master_claimed_at 이 스탬프돼 approval.sign 이 즉시

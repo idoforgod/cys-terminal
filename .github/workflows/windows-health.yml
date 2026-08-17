@@ -121,6 +121,32 @@ jobs:
           # CYS_PACK_DIR 임시 격리 — W0-a 봉인(테스트가 라이브 ~/.cys/pack 접촉 금지) 충족.
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
 
+      # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
+      #
+      #   무엇을 보는가(2026-08-17 강등 반영): `cys::d5_gate_for_os` 는 **mac = 무조건 ·
+      #   Windows = 옵트인(`~/.cys/win-no-alt-screen` · `CYS_WIN_NO_ALT_SCREEN=1`)일 때만** 참이다.
+      #   그래서 이 핀은 Windows 산출물의 **두 행**을 고정한다 —
+      #    ⓐ 기본(미옵트인): `cys launch-agent` 가 만드는 surface.create env 맵에 D5 키가 **없다**
+      #       (= Windows 기본 동작이 강등 전 출고본과 동일하다는 주장의 실기 증명).
+      #    ⓑ 옵트인: 그 맵에 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 이 실린다.
+      #   강등 근거(앵커 ④ 전 pane 사망 · 실기 스모크 B-5 미수행)는 `src/lib.rs` 의
+      #   `d5_gate_for_os` doc 이 정본이다. 옵트인은 **에이전트 부트 체인을 건드리는** 경로이므로,
+      #   오너 절대앵커("Windows 설치파일 업데이트에 신중")를 이유로 기본값에서 빠져 있다.
+      #
+      #   왜 여기(health 레인)인가 — 태그 레인이 아니라:
+      #    · `--lib` D5 핀(OS × 옵트인 매핑)은 비용 0 이라 태그 레인(release.yml)에도 넣었다.
+      #    · 그러나 **`src/bin/cys.rs` 의 `#[cfg(windows)]` ②-win 파이프라인 핀**(surface.create
+      #      env 맵의 실 산출물을 보는 유일한 단언)은 지금까지 **어디서도 컴파일된 적이 없다**.
+      #      처음 컴파일하는 15k 줄 테스트 하네스라 D5 와 무관한 이유로 깨질 수 있고, 그 발견은
+      #      **태그를 만드는 순간이 아니라 그 전에** 나야 한다.
+      #      ∴ 발견용 비용은 이 health 레인이 지고, 태그 레인은 확실한 것만 싣는다.
+      #   ⚠이 스텝에 `if:` 를 달지 마라(잡 머리말의 '돌지 않는 초록 금지'와 같은 근거).
+      - name: cargo test --bin cys D5 파이프라인 핀 (Windows 실기 · cfg(windows) 블록 최초 컴파일)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys d5_env_injection -- --test-threads=1
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4

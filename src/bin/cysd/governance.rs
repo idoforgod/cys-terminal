@@ -1064,7 +1064,7 @@ fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::Hash
             .filter(|i| {
                 i.status == "pending"
                     && i.kind == "approval"
-                    && i.request_id.starts_with("daemon-")
+                    && crate::state::is_daemon_issued(&i.request_id)
             })
             .map(|i| i.request_id.clone())
             .collect();
@@ -1073,7 +1073,7 @@ fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::Hash
             .filter(|i| {
                 i.status == "pending"
                     && i.kind == "approval"
-                    && i.request_id.starts_with("daemon-")
+                    && crate::state::is_daemon_issued(&i.request_id)
                     && now - i.created_at >= stall as f64
             })
             .map(|i| (i.request_id.clone(), i.title.clone(), now - i.created_at, i.surface_id))

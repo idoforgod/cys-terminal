@@ -486,6 +486,13 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .feed-item button.allow { border-color: var(--ok); color: var(--ok); }
 .feed-item button.deny { border-color: var(--error); color: var(--error); }
 .feed-item .fi-decision { color: var(--ok); font-weight: 700; }
+/* 대기 렌더 상한 초과분을 펼치는 '더 보기' — .feed-item 바깥의 직계 자식이라 위
+   `.feed-item button` 규칙이 닿지 않는다(브라우저 기본 버튼이 어두운 패널에 흰 덩어리로
+   뜨던 것을 막는다). 목록 항목이 아니므로 flex:1 은 주지 않는다. */
+#cc-feed-items > button {
+  padding: 5px 0; border-radius: 6px; cursor: pointer; font-size: 12px;
+  border: 1px solid var(--border); background: #21262d; color: var(--text);
+}
 
 /* ★T-0147-3: 높이 상한 없던 구 구현은 알람이 몰리면 화면 전체를 덮었다(무한 스택).
    상한 + 스크롤로 캔버스를 지키고, 넘친 이력은 Control Center 알람 탭에서 본다. */

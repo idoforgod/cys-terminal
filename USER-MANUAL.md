@@ -189,8 +189,61 @@ cys doctor          # 자기진단 (문제 시 --fix)
   `touch ~/.cys/allow-app-mouse` 후 **새 pane**(되돌리기 `rm ~/.cys/allow-app-mouse` ·
   env `CYS_ALLOW_APP_MOUSE=1` 동등). ⚠ **Windows 에서는 켜지 마세요** — ConPTY 가 마우스
   시퀀스를 깨뜨려 입력창에 `[555;98;34M` 같은 리터럴이 타이핑됩니다.
+- **Windows 휠 가드**(v0.14 품질 라인 신규): Windows 에서는 마우스를 앱에 넘기는 경로가
+  없어(위 킬스위치 금지 — ConPTY 결함) 전체화면 TUI 의 휠이 **방향키로 합성돼** 앱에
+  들어갑니다. claude fullscreen 에서는 그것이 프롬프트 히스토리를 헤집어 **입력창이 지나간
+  프롬프트로 바뀌어 버리므로**, 그 조합에서만 휠을 **소비**합니다(= 그 노치는 스크롤도
+  방향키도 아닌 무동작이 됩니다). vim `mouse=a` 처럼 휠→방향키가 정상 UX 인 앱은 대상이
+  아닙니다 — 다만 이 구분은 "앱이 어떤 마우스 추적 모드를 켰는가"로 기계가 판정하므로,
+  그 모드(any-motion)를 켜는 vim 설정·플러그인 조합이라면 그 앱의 전체화면 휠도 무동작이
+  될 수 있습니다. 그때는 아래 스위치로 가드를 통째로 끄십시오.
+  · (억제 조건은 그 하나뿐) 위 판정에 걸리지 않는 앱 — `less`·`man` 처럼 마우스를 요청하지
+  않는 전체화면 앱 — 의 휠은 **어떤 환경에서도 종전 그대로**입니다.
+  · (적용 범위) 가드는 **앱이 마우스 모드를 선언한 뒤** 걸립니다. 그래서 GUI 를 재시작해
+  **이미 떠 있던 전체화면 앱에 다시 붙은 pane**(세션 복원·재부착)에서는 걸리지 않을 수
+  있습니다 — 재부착이 보내는 초기 화면 스냅샷에는 앱의 마우스 모드 선언이 들어 있지 않기
+  때문입니다. 그 pane 에서 휠 오염이 보이면 앱을 한 번 나갔다 다시 들어가거나(모드 재선언)
+  pane 을 새로 여세요.
+  · (알려진 증상) 전체화면 앱이 **비정상 종료**(강제 종료·크래시)한 뒤 그 pane 의 휠이 계속
+  안 들으면, 앱이 마우스 모드를 끄는 시퀀스를 못 보내고 죽어 판정이 남아 있는 경우입니다 —
+  **pane 을 새로 여세요**(정상 종료·전체화면 이탈에서는 자동으로 풀립니다).
+  · **끄는 법(롤백)** — 아래 중 하나 후 **새 pane**(이미 열린 pane 은 그대로입니다):
+    - PowerShell(Windows 기본 셸): `New-Item -ItemType File -Force $HOME\.cys\win-wheel-guard-off`
+      · 되돌리기 취소 `Remove-Item $HOME\.cys\win-wheel-guard-off`
+      ※ `touch` 는 PowerShell·cmd 에 **없는 명령**입니다. 아래 macOS/Linux 표기와 혼동하지 마세요.
+    - macOS·Linux 셸: `touch ~/.cys/win-wheel-guard-off` · 되돌리기 취소 `rm ~/.cys/win-wheel-guard-off`
+    - env `CYS_WIN_WHEEL_GUARD_OFF=1` 도 동등하지만 **GUI 프로세스가 그 값을 상속해야** 합니다 —
+      터미널에서 `setx` 로 설정해도 **이미 떠 있는 cys 에는 반영되지 않으니 GUI 를 재시작**하세요.
+      (파일 방식은 새 pane 을 열 때마다 확인하므로 재시작이 필요 없습니다 — Windows 권장 수단입니다.)
+    - devtools 가 있는 빌드라면 `localStorage.cysWinWheelGuardOff="1"` 도 동등(릴리스 빌드에는
+      devtools 가 없어 최종 사용자 수단이 못 됩니다).
+  · ⚠ **이것은 결함을 되살리는 스위치입니다.** 끄면 Windows 전체화면 휠이 다시 방향키로
+  합성되므로, claude fullscreen 에서 휠을 굴리면 **프롬프트 입력창이 다시 오염될 수
+  있습니다**(이번 릴리스가 막은 바로 그 증상). 즉 "vim 등에서 휠→방향키가 꼭 필요하다"는
+  이유로만 끄고, 켜 둔 채 claude fullscreen 을 쓰면 그 오염을 감수하는 것입니다.
+  · ⚠ 이 용도로 `allow-app-mouse` 를 켜지 마세요 — 그것은 입·출력 양측을 열어 위의 ConPTY
+  리터럴 타이핑(`[555;98;34M` 이 입력창에 찍히는 결함)을 되살립니다. **휠 억제만** 끄는
+  전용 스위치가 이것입니다.
+- **Windows 에서 claude 를 전체화면 대신 inline 으로 띄우기**(옵트인 · **기본 off**): 위 휠 가드는
+  오염을 *막을* 뿐 화면 모드를 바꾸지는 않습니다. claude 자체를 inline 으로 띄우고 싶다면
+  `New-Item -ItemType File -Force $HOME\.cys\win-no-alt-screen` 후 **`cys launch-agent` 로 새
+  pane 을 기동**하세요. 그 pane 의 claude 에 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` 이 실립니다
+  (macOS 는 이 스위치 없이 늘 실립니다).
+  · 되돌리기 `Remove-Item $HOME\.cys\win-no-alt-screen` · env `CYS_WIN_NO_ALT_SCREEN=1` 도
+  동등하지만 **GUI 가 상속한 값만** 읽으므로 `setx` 후 GUI 재시작이 필요합니다(권장은 파일).
+  · **왜 Windows 만 기본 off 인가**: 이 env 가 Windows 의 claude 를 깨뜨리면 `cys boot` 로 띄운
+  pane 이 **한꺼번에** 죽는 경로입니다. 실기 Windows 에서 그 확인(`cys boot` 4종 노드 정상 기동)을
+  마치기 전에는 안전한 쪽을 기본값으로 둡니다 — 켜지 않아도 **휠 오염은 위 휠 가드가 막습니다**.
+  · **적용 범위**: 이미 열린 pane 의 재기동(node-recover)·GUI 에서 연 pane 에는 실리지 않습니다
+  (**새 surface 를 만들며 기동하는 `cys launch-agent` 한정**). 팩 `agents.json` env 에 `"0"` 을
+  적어 두었다면 켜도 주입하지 않습니다(사용자 값이 언제나 우선).
 - 전체화면 마우스 동작이 이상하면 정합기 롤백 스위치로 구동작에 복귀할 수 있습니다:
-  콘솔에서 `localStorage.cysMouseReconcilerOff="1"`(새 pane 부터 적용).
+  콘솔에서 `localStorage.cysMouseReconcilerOff="1"`(새 pane 부터 적용). ※ 이것과 위 Windows
+  휠 가드는 **다른 스위치**입니다 — 정합기 스위치는 출력 정합(mac 소비 경로)을, 휠 가드
+  스위치는 Windows 휠 억제만 끕니다. ⚠ **Windows 에서는 정합기 스위치를 꺼도 휠 가드는 그대로
+  삽니다** — 정합기(출력 소비)는 원래 macOS 전용이라 이 스위치는 Windows 에서 실질적으로 하는
+  일이 없었고, 이번에 생긴 휠 가드도 이 스위치로는 꺼지지 않습니다. Windows 휠 가드를 끄는
+  스위치는 위의 `win-wheel-guard-off` 하나뿐입니다.
 - 릴리스 마이그레이션이 계정 settings(fullscreen `tui` 키 제거 등)를 정규화할 때는 반드시
   같은 자리에 `.bak-*` 백업을 먼저 남깁니다 — 되돌리기는 그 백업 복원입니다.
 
@@ -704,8 +757,10 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
-| `CYS_ALLOW_APP_MOUSE` | — (`1`=on) | 앱 마우스 킬스위치 — TUI가 마우스를 갖는다 (§4.6b · `~/.cys/allow-app-mouse` 파일과 동등) |
-| `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | mac·claude 기동 시 `"1"` 기본 주입 | cys가 읽는 게 아니라 **주입**하는 변수(claude가 소비) — fullscreen(alt screen) 진입 차단. 계정별 되살리기는 팩 `agents.json` env에 `"0"`(키가 있으면 주입하지 않음 · §4.6b) |
+| `CYS_ALLOW_APP_MOUSE` | — (`1`=on) | 앱 마우스 킬스위치 — TUI가 마우스를 갖는다 (§4.6b · `~/.cys/allow-app-mouse` 파일과 동등 · 새 pane부터). ⚠ **Windows에서는 켜지 마세요** — ConPTY가 마우스 시퀀스를 깨뜨려 입력창에 `[555;98;34M` 같은 리터럴이 타이핑됩니다. Windows 휠 가드를 끄는 용도로도 쓰면 안 됩니다(그건 아래 전용 스위치) |
+| `CYS_WIN_WHEEL_GUARD_OFF` | — (`1`=off로 되돌림) | **Windows 전용** 휠 가드 롤백 — 전체화면 TUI 휠 억제를 끄고 종전(방향키 합성)으로 복귀 (§4.6b). ⚠ **적용 시점이 파일 게이트와 다릅니다**: env는 **GUI 프로세스가 상속한 값만** 읽으므로 `setx` 후 **GUI 재시작**이 필요하고, 동등 수단인 `~/.cys/win-wheel-guard-off` **파일은 새 pane부터 즉시** 반영됩니다(Windows 권장 수단은 파일 — PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-wheel-guard-off`, `touch`는 PowerShell에 없는 명령입니다). ⚠ **결함 복원 스위치** — 켜면 claude fullscreen에서 휠이 다시 방향키로 합성돼 **프롬프트 입력창이 오염될 수 있습니다.** ⚠ 이 용도로 `CYS_ALLOW_APP_MOUSE`를 대신 쓰지 마세요 — 입·출력 양측이 열려 ConPTY 리터럴 타이핑이 되살아납니다 |
+| `CYS_WIN_NO_ALT_SCREEN` | — (`1`=on · **Windows 기본 off**) | **Windows 전용 옵트인** — claude를 기동할 때 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`을 함께 실어 **전체화면(alt screen) 대신 inline으로 뜨게** 합니다(아래 줄과 짝 · macOS는 이 스위치 없이 늘 주입됩니다). **왜 Windows만 기본 off인가**: 이 env가 Windows의 claude를 깨뜨리면 `cys boot`로 띄운 **모든 pane이 한꺼번에 죽는** 경로라, 실기 Windows에서 그 확인(`cys boot` 4종 노드 정상 기동)을 마치기 전에는 기본값으로 켜지 않습니다. 켜지 않아도 **전체화면 휠 오염은 Windows 휠 가드가 막습니다**(위 §4.6b — 그쪽이 본체 방어이고 이 env는 덧대는 벨트입니다). **켜는 법**: PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-no-alt-screen` 후 **`cys launch-agent`로 새 pane 기동**(되돌리기 `Remove-Item …`). env `CYS_WIN_NO_ALT_SCREEN=1`도 동등하지만 **GUI가 상속한 값만** 읽으므로 `setx` 후 GUI 재시작이 필요합니다(권장 수단은 파일). ⚠ **켜도 새 surface를 만들며 기동한 pane에만** 도달합니다 — 이미 열린 pane의 재기동(node-recover)·GUI에서 연 pane에는 실리지 않습니다. ⚠ `agents.json` env에 `"0"`이 적혀 있으면 켜도 주입하지 않습니다(사용자 값 우선) |
+| `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | macOS: claude 기동 시 `"1"` 기본 주입 · **Windows: 기본 주입 없음**(위 `CYS_WIN_NO_ALT_SCREEN` 옵트인 시에만) | cys가 읽는 게 아니라 **주입**하는 변수(claude가 소비) — fullscreen(alt screen) 진입 차단. 계정별 되살리기는 팩 `agents.json` env에 `"0"`(키가 있으면 주입하지 않음 · §4.6b). ⚠ Windows는 옵트인해도 **새 surface를 만들며 기동한 pane에만** 주입이 도달합니다(벨트 — 이것만으로 fullscreen을 막았다고 보면 안 됩니다) |
 | `CYS_DEPT_FALLBACK` | — (`0`/`off`=끔) | 마스터 선언→부서 자동 생성 폴백 끄기 (§4.4 · 구계약 rc=7 복원) |
 
 (이 밖에 진단·튜닝용 변수 다수 — `CYS_DEBUG`, `CYS_USAGE_POLL_SECS`, `CYS_REAP_EXITED*`,

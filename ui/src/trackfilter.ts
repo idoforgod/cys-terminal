@@ -39,9 +39,15 @@
 const MOUSE_PARAMS = new Set([9, 1000, 1002, 1003, 1005, 1006, 1015, 1016]);
 
 // alt 화면 전이 감시 파라미터 — h=alt 진입, l=복귀 (xterm InputHandler 와 동일 집합).
-// ★전이는 장부를 변경하지 않는다 — 장부는 앱의 명시 마우스 DECSET/DECRST 로만 갱신되는
-// '희망 상태'이고, 전이는 주입/소등 트리거일 뿐이다(suspend/resume 재진입에서 재생이 빈손이
-// 되지 않게 — 스펙 D4 장부 의미론).
+// ★전이는 **소비 활성(mac) 경로에서** 장부를 변경하지 않는다 — 장부는 앱의 명시 마우스
+// DECSET/DECRST 로만 갱신되는 '희망 상태'이고, 전이는 주입/소등 트리거일 뿐이다
+// (suspend/resume 재진입에서 재생이 빈손이 되지 않게 — 스펙 D4 장부 의미론).
+// ★예외 1건(소비 비활성 = Windows·정합기 롤백): **alt 이탈 파라미터를 '관측'하면 장부를
+// 소거한다** — 내부 altActive 추적 상태와 무관하게(재부착 pane 은 진입을 못 봐 altActive 가
+// false 로 시작하므로, 전이로 묶으면 그 pane 의 stale 이 영구 잔존한다). 그 경로엔 재생 주입이
+// 없어 보존할 이유가 없고, 남겨 두면 다음 전체화면 앱이 이전 앱의 1003 을 물려받아 Windows
+// 휠 가드가 오발한다(아래 [전이] 블록의 `!consume` 분기 주석이 정본).
+// 출력 바이트는 무변경이라 win-parity 계약과 무충돌이다.
 const ALT_PARAMS = new Set([47, 1047, 1049]);
 
 // 복귀·리셋 소등용 **전 집합 상수** DECRST — 장부 부분집합이 아니라 상수로 고정한다:
@@ -214,6 +220,36 @@ function processChunk(
         st.altActive = false;
         if (st.consume) pushStr(out, MOUSE_ALL_OFF); // 전 집합 상수 소등 후 스트리핑 재개
       }
+      // ★소비 비활성(=Windows · 정합기 롤백) 한정 장부 소거 — 휠 가드 stale 봉인
+      //   (적대검증 2R major). **출력 바이트는 한 개도 바뀌지 않는다**(win-parity 불변).
+      //
+      // 왜 이 경로에서만 지우는가: 소비 활성(mac)에서 장부는 '재생 주입의 원본'이라 alt 이탈
+      // 후에도 보존해야 한다(suspend/resume 재진입에서 재생이 빈손이 되지 않게 — 위 ALT_PARAMS
+      // 주석의 장부 의미론). 그러나 **소비 비활성 경로에는 재생이 아예 없다** — 장부의 유일한
+      // 독자는 wheelgate 의 Windows 술어가 읽는 ledgerWantsAnyMotion() 하나이고 그 술어는 alt
+      // 화면일 때만 의미가 있다. ∴ 이 경로에서 alt 이탈 뒤의 장부는 '다음 전체화면 앱에게
+      // 물려주는 오염'일 뿐이다.
+      //
+      // 무엇을 막는가: Windows 는 `!xtermTracking` 이 상수 true 라(wheelgate.ts (b) 의 단일
+      // 방어선 고지) 억제를 푸는 해제항이 없다. 그래서 장부에 1003 이 남은 채 다음 앱이 alt 에
+      // 들어가면 — 그 앱이 마우스를 요청하지 않는 less·man·vim 이라도 — 술어가 충족돼 그 pane 이
+      // 닫힐 때까지 휠이 죽는다.
+      //
+      // ★위 else-if 안이 아니라 **밖**에 두는 이유(재부착 경로 봉인): 소거 조건을
+      // `st.altActive` 가 참일 때로 묶으면 **재부착 pane 의 사각**이 남는다. 재부착이 보내는
+      // 초기 화면은 셀 내용 스냅샷뿐이라 alt 진입 시퀀스가 재발행되지 않는다 → 이미 전체화면인
+      // 앱에 붙어도 st.altActive 는 false 로 시작한다. 그 상태에서 앱이 마우스 DECSET 을 다시
+      // 내면 장부에는 1003 이 오르는데, 이어지는 `?1049l` 은 (altActive=false 라) 전이로 잡히지
+      // 않아 장부가 그대로 남는다 — 그 다음 앱부터 휠이 죽는다. 관측된 이탈 시퀀스는 추적
+      // 상태와 무관하게 '전체화면 소유자가 끝났다'는 사실이므로, 여기서는 그것만 본다.
+      // 오판 방향도 안전하다: 잘못 지우면 **비억제**(=가드 도입 전 HEAD 동작)로 떨어질 뿐이고,
+      // 앱이 마우스 모드를 다시 선언하면 즉시 재무장한다.
+      //
+      // 남는 잔여(정직 고지): 앱이 **이탈 시퀀스조차 못 내고 즉사**하면(Windows 는 Job 오브젝트
+      // 강제종료라 mac 보다 구조적으로 흔하다) 여기 도달하지 않는다. 그 경우 화면은 이미 alt
+      // 버퍼에 갇혀 있어 사용자 처방이 'pane 을 새로 연다'로 같고(USER-MANUAL §4.6b 명기),
+      // 에이전트 pane 은 main.ts 의 agent.exited 훅이 에포크 가드로 장부를 소거한다.
+      if (!st.consume && !isSet) st.ledger.clear();
     }
     i = j + 1;
   }
@@ -276,6 +312,33 @@ export class MouseTrackingFilter {
   ledgerWantsMouse(): boolean {
     for (const on of this.st.ledger.values()) if (on) return true;
     return false;
+  }
+
+  // 장부에 1003(any-motion)이 희망 h 로 올라 있는가 — Windows 전용 휠 억제 술어
+  // (wheelgate.shouldSuppressWheelWin)의 ledgerWantsAnyMotion 입력. **읽기 전용**이다:
+  // 장부는 processChunk 만 갱신하고 이 접근자는 조회만 한다(출력 바이트 무접촉 — win-parity 핀).
+  //
+  // ★왜 1003 인가(ledgerWantsMouse 의 '아무거나 하나' 보다 좁게 보는 이유):
+  //  · Claude Code TUI 는 alt 진입 시 1000+1002+1003+1006("full" 마우스 모드)을 한꺼번에 켠다
+  //    → 1003 이 반드시 장부에 오른다 → 술어 충족 → fullscreen 휠 억제 발동.
+  //  · vim 의 `set mouse=a` 는 통상 1000/1002/1006 만 켜고 1003 은 켜지 않는다 → 술어 불충족
+  //    → Windows 에서도 방향키 합성이 그대로 보존된다(현행 vim 휠 UX 무회귀).
+  //  ∴ 1003 은 "앱이 버튼 안 눌린 상태의 이동까지 원한다" = 전면 마우스 장악 의사의 표지이고,
+  //    그것이 휠을 앱에 넘겨야 하는(=xterm 의 방향키 합성을 막아야 하는) 경우와 겹친다.
+  //
+  // ★이 설계의 최대 미확정(정직 고지): 위 vim 서술은 이 저장소가 **실측으로 뒷받침하지 못한다** —
+  //  vim 의 실제 DECSET 캡처가 저장소에 0건이다(Claude Code 쪽 "full" 집합만 근거가 있다).
+  //  vim 빌드·설정에 따라 1003 을 켜는 경로가 있다면 ⓑ(vim 비억제) 전제가 무너진다.
+  //  다음 조사자는 win/mac vim 의 실제 출력 바이트를 캡처해 이 주석을 갱신하라.
+  //
+  // ★수명(stale 봉인 — 적대검증 2R): 이 값이 참인 구간은 **1003h 관측 ~ 다음 alt 이탈 관측**
+  //  까지다. 소비 비활성(=Windows) 인스턴스는 alt 이탈 파라미터(1049l·47l·1047l)를 관측하면
+  //  내부 altActive 상태와 무관하게 장부를 소거한다(processChunk 의 [전이] `!consume` 분기 —
+  //  재부착 pane 까지 덮기 위함). RIS(ESC c)·reset()·clearLedgerIfGeneration 도 같은 효과다.
+  //  Windows 는 `!xtermTracking` 항이 상수 true 라 억제를 푸는 해제항이 없어, 이 소거가 없으면
+  //  그 pane 이 닫힐 때까지 휠이 죽었다.
+  ledgerWantsAnyMotion(): boolean {
+    return this.st.ledger.get(1003) === true;
   }
 
   // 관측 세대 번호 — agent.exited 리셋 훅의 에포크 가드가 캡처한다(main.ts).
