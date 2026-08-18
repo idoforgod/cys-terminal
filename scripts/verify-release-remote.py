@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""원격 발행 검증 — `docs/RELEASE.md` 의 메인 페이지 검증 6항목을 기계로 돌린다.
+"""원격 발행 검증 — `docs/RELEASE.md` 의 메인·다운로드 페이지 검증 6항목을 기계로 돌린다.
 
 ★배경: 이 6항목은 지금까지 **100% 수동 게이트**였다(`verify-release-remote.sh`·
 `release-assemble.py` 는 이 레인에 존재하지 않는다 — 실측). 수동이라 v0.13.17 에서
@@ -12,7 +12,11 @@
   ④ 다운로드 링크 4종 HEAD 200
      ★정적 `href="…"` 만 보면 **JS 로 설정되는 zip 링크를 놓친다**(실측: 라이브 zip 은
        `w.setAttribute('href','/downloads/…zip')` 로 붙는다). 그래서 정적/동적 양쪽을 본다.
-  ⑤ Windows Defender/SmartScreen 안내 섹션 잔존 (오너 지시 ⓐ·ⓒ)
+  ⑤ Windows Defender 안내 섹션 잔존 — **다운로드 페이지**(`/downloads/`)의 섹션 마커
+     `data-cys-release-marker="windows-defender-guidance-v2"` 를 **정확히 1건** 단언 (오너 지시 ⓐ·ⓒ)
+     ★루트(`/`)가 아니다 — 오너 체크리스트 ⓐ 가 검사 대상을 "다운로드 페이지"로 못박는다.
+     ★낱말 grep(smartscreen/defender/…)은 **제거하지 않고 보조 축으로 AND** 유지한다
+       (마커 껍데기만 남고 카피가 비는 사고 + 기존 루트 밴드 감시 축 보존).
   ⑥ SHA256SUMS.txt — 신버전 전수·구버전 0줄 + **실자산 바이트 해시 대조** (오너 지시 ⓑ)
 
 사용: python3 scripts/verify-release-remote.py 0.14.5 [이전버전]
@@ -27,6 +31,18 @@ import sys
 SITE = "https://www.cysinsight.com"
 UA = "Mozilla/5.0"
 results = []
+
+# ⑤ 전용 상수 — 다운로드 페이지 Windows Defender 안내 섹션의 지문.
+# 라이브 실측(2026-08-17):
+#   /downloads/ → windows-defender-guidance-v2 1건 · macos-install-guidance-v1 1건
+#   /          → data-cys-release-marker 0건
+DEFENDER_MARKER = 'data-cys-release-marker="windows-defender-guidance-v2"'
+DEFENDER_MARKER_EXPECT = 1
+GUIDANCE_WORDS = r"(?i)smartscreen|defender|추가 정보|알 수 없는 게시자"
+# ★마커 속성 자체를 낱말 집계에서 **빼기 위한** 정규식. 이유는 아래 ⑤ 주석의 항진명제 절 참조.
+#   값이 무엇이든(`…-v2`·`macos-install-guidance-v1`·앞으로 생길 마커) 전부 지운다 — 마커
+#   문자열에 감시 낱말이 섞이는 사고를 이름 규칙에 의존하지 않고 구조적으로 차단한다.
+MARKER_ATTR_RE = re.compile(r'data-cys-release-marker="[^"]*"')
 
 
 def check(name, ok, detail=""):
@@ -97,9 +113,48 @@ def main(argv):
     check("④ 다운로드 링크 4종 HEAD 200", len(full) == 4 and not bad,
           "링크 %d개 · 비200 %s" % (len(full), bad or "없음"))
 
-    # ⑤ Defender 안내 잔존
-    n = len(re.findall(r"(?i)smartscreen|defender|추가 정보|알 수 없는 게시자", main_html))
-    check("⑤ Defender/SmartScreen 안내 잔존", n >= 1, "marker %d" % n)
+    # ⑤ Defender 안내 섹션 잔존 — 다운로드 페이지의 섹션 마커가 정본 (오너 지시 ⓐ·ⓒ)
+    #
+    # ★왜 루트(`/`)가 아니라 다운로드 페이지(`/downloads/`)인가 — 오너 체크리스트 정본 문언:
+    #   「ⓐ**다운로드 페이지** Defender 안내 섹션 잔존 grep 확인 ⓑSHA256SUMS 전 자산 갱신·누락 0
+    #    ⓒ**원격 검증(verify-release-remote)에 안내 섹션 출현 포함**」
+    #   ★출처(리포 내 정본): docs/RELEASE.md 의 발행 후 검증 ⑤ 항목. 종전 이 인용은 저장소
+    #     어디에도 원문이 없어 주석만 읽는 사람이 출처에 도달할 수 없었다(적대적 리뷰 지적).
+    #     2026-08-18 에 RELEASE.md ⑤ 를 이 구현에 맞춰 갱신하면서 그 문언을 문서에 심었다.
+    #   안내 섹션의 실체는 /downloads/ 의 <section data-cys-release-marker="…-v2"> 이고,
+    #   루트에는 밴드 카피의 낱말만 흩어져 있다(실측: 루트 마커 0건 · 다운로드 1건).
+    #   구 구현은 루트만 봤으므로 ⓐ 가 지목한 페이지를 **한 번도 받지 않았다** = ⓒ 미구현.
+    #
+    # ★왜 낱말 grep 이 아니라 마커인가 — 낱말 grep 은 섹션이 통째로 사라져도 페이지 다른 곳에
+    #   'Defender' 한 낱말만 남아 있으면 통과한다(무증상 통과). 마커는 섹션 그 자체의 지문이라
+    #   섹션이 빠지면 즉시 0이 된다. 개수까지 단언해 중복 삽입(마커 2건)도 잡는다.
+    #
+    # ★낱말 grep 은 제거하지 않고 **보조 축으로 AND** 한다 — 회귀 감시 축이 줄면 안 되므로
+    #   (a) 다운로드 낱말 ≥1: 마커 <section> 껍데기만 남고 본문 카피가 비는 사고 차단
+    #   (b) 루트   낱말 ≥1: 기존 감시 축(버전 범프 일괄 치환이 밴드 카피를 통째로 갈아끼워
+    #                        루트 안내가 조용히 사라지는 사고 — RELEASE.md ⑤) 그대로 보존
+    #
+    # ★2026-08-18 교정 — (a) 는 **항진명제였다**(적대적 리뷰 지적 · 실측 반증됨).
+    #   마커 문자열 `data-cys-release-marker="windows-defender-guidance-v2"` 안에 'defender'
+    #   가 들어 있어, GUIDANCE_WORDS 가 마커 자신에게 걸렸다. 즉 mk==1 인 한 dlw>=1 이
+    #   **구조적으로 보장**돼 (a) 는 절대 실패할 수 없었다 — 주석이 막는다고 쓴 바로 그 사고
+    #   (마커 껍데기만 남고 본문 카피가 빈 <section>)가 그대로 통과했다.
+    #   고침: 낱말을 세기 **전에** 마커 속성을 전부 지운다. 그러면 낱말은 오직 **본문 카피**에서만
+    #   나온다. 라이브 실측(2026-08-18 · 읽기 전용 GET): /downloads/ 낱말 원본 5 → 마커 제거 후
+    #   **4**(전부 본문 'Defender'), 마커 1건 — 즉 이 교정으로 현행 페이지 판정은 안 바뀌고
+    #   (여전히 PASS) 항진명제만 사라진다. 루트(`/`)는 마커가 0건이라(실측) 제거 전후 8로 동일하다.
+    dl_html = get(SITE + "/downloads/")
+    if not dl_html:
+        check("⑤ Defender 안내 섹션 마커 (다운로드 페이지)", False, "/downloads/ 빈 응답")
+    else:
+        mk = dl_html.count(DEFENDER_MARKER)
+        # 마커 속성을 지운 **본문**에서만 낱말을 센다(항진명제 차단).
+        dlw = len(re.findall(GUIDANCE_WORDS, MARKER_ATTR_RE.sub("", dl_html)))
+        rootw = len(re.findall(GUIDANCE_WORDS, MARKER_ATTR_RE.sub("", main_html)))
+        ok5 = mk == DEFENDER_MARKER_EXPECT and dlw >= 1 and rootw >= 1
+        check("⑤ Defender 안내 섹션 마커 (다운로드 페이지)", ok5,
+              "마커 %d(기대 %d) · 다운로드 본문 낱말 %d(보조·마커 제외) · 루트 낱말 %d(보조)"
+              % (mk, DEFENDER_MARKER_EXPECT, dlw, rootw))
 
     # ⑥ SHA256SUMS.txt
     sums = get("%s/downloads/SHA256SUMS.txt" % SITE)

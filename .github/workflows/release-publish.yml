@@ -1,0 +1,144 @@
+name: release-publish
+
+# ── 보호된 공개 발행 레인 ──────────────────────────────────────────────────────
+# draft 릴리스를 **오너 승인 + 기계 재검증** 을 통과한 경우에만 공개로 승격한다.
+# 자산을 만들지도 태그를 옮기지도 않는다. 하는 일은 딱 하나 — `--draft=false`.
+#
+# ★2026-08-18 수리: 검증기를 **2차 체크아웃**에서 부르도록 고쳤다 (결함 6-2)
+#   d67d8c3 이 0418f17 에서 이 워크플로 1개만 체리픽해 오는 바람에, 이 파일이 부르던
+#   `scripts/release-verify.py` 가 main·태그 어디에도 따라오지 않았다. 그래서 1차 체크아웃
+#   (= 발행 대상 태그 트리)에는 검증기가 없다 — v0.14.19 태그는 검증기보다 먼저 잘렸다.
+#   실측: `contents/scripts/release-verify.py?ref=v0.14.19` → HTTP 404.
+#   그대로 두면 `python3 scripts/release-verify.py` 가 `can't open file` 로 죽어(exit 2)
+#   승격 step 이 영원히 실행되지 않는다. fail-closed 라 안전하지만 **발행이 불가능**했다.
+#
+#   고친 방식: 검증 도구는 발행 대상 태그가 아니라 **이 워크플로 자신의 커밋**(`github.sha`)
+#   에서 가져온다. 검증기가 (버전, 디렉터리)만의 순수 함수 — 네트워크·토큰·리포 내 다른 파일에
+#   의존하지 않는다 — 이라서 성립하는 배선이다(release-verify.py 의 "자격증명을 쓰지 않는다" 절).
+#   덕분에 **이미 잘린 태그도** 검증기를 나중에 고쳐서 발행할 수 있다.
+#   ★버전 SOT 검사(`version-check.sh`)만은 여전히 **태그 트리**에서 돌린다 — 그건 발행 대상
+#   자신의 성질을 묻는 검사라 도구 쪽에서 가져오면 의미가 없다.
+#
+# ★`environment:` 는 job 레벨 게이트라 **오너 승인이 검증보다 먼저** 걸린다. 이건 의도된
+#   설계다 — 승인 후에 다운로드·검증·승격이 **한 job 안에서 연속**으로 일어나므로 검증과
+#   승격 사이에 draft 가 바뀌는 TOCTOU 창이 없다. job 을 쪼개 검증을 앞당기면 승인 대기
+#   시간만큼 그 창이 열린다. 승인 UX 를 위해 안전성을 내주지 않는다.
+#
+# 사용:
+#   gh workflow run release-publish.yml -R idoforgod/cys-terminal --ref <ALLOWED_REF> \
+#     -f tag=vX.Y.Z -f release_bundle_sha256=<SHA256SUMS.txt 의 sha256> -f confirm=PUBLISH
+#   ★<ALLOWED_REF> 는 environment `release-production` 의 deployment branch policy 가
+#     허용하는 ref 여야 한다(허용 밖이면 step 실행 전에 job 이 죽는다).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed draft tag (vX.Y.Z)
+        required: true
+        type: string
+      release_bundle_sha256:
+        description: SHA-256 of the reviewed SHA256SUMS.txt
+        required: true
+        type: string
+      confirm:
+        description: Type PUBLISH to request public promotion
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-public-promotion
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: inputs.confirm == 'PUBLISH'
+    environment: release-production
+    runs-on: ubuntu-latest
+    steps:
+      # ① 발행 대상 — 태그 트리. version-check.sh 는 반드시 여기서 돈다.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      # ② 검증 도구 — 이 워크플로 자신의 커밋. ★순서가 중요하다: 루트 체크아웃이 나중에
+      #    돌면 하위 경로가 함께 지워진다. 반드시 ① 다음에 ②.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+
+      # ③ 관문 자체가 살아 있는지 먼저 본다 — 검증기가 통째로 비거나 무력화된 채
+      #    "조용히 통과"하는 사고를 막는다(합성 픽스처 · 네트워크 불요 · 1초 미만).
+      - name: Self-test the verifier before trusting it
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .release-tools/scripts/release-verify.py \
+            || { echo "verifier missing from tooling checkout" >&2; exit 1; }
+          python3 .release-tools/scripts/tests/test_release_verify.py
+
+      - name: Re-download and verify the exact draft subject
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          EXPECTED_BUNDLE_SHA256: ${{ inputs.release_bundle_sha256 }}
+          SRC_REPO: idoforgod/cys-terminal
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid tag" >&2; exit 2; }
+          [[ "$EXPECTED_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid release digest" >&2; exit 2; }
+          sh scripts/version-check.sh "$TAG"
+          IS_DRAFT="$(gh release view "$TAG" -R "$SRC_REPO" --json isDraft --jq .isDraft)"
+          [ "$IS_DRAFT" = "true" ] || { echo "release is not a draft" >&2; exit 1; }
+          mkdir reviewed-release
+          gh release download "$TAG" -R "$SRC_REPO" --dir reviewed-release
+          VERSION="${TAG#v}"
+          python3 .release-tools/scripts/release-verify.py \
+            --version "$VERSION" --release-dir reviewed-release
+          ACTUAL_BUNDLE_SHA256="$(shasum -a 256 reviewed-release/SHA256SUMS.txt | awk '{print $1}')"
+          [ "$ACTUAL_BUNDLE_SHA256" = "$EXPECTED_BUNDLE_SHA256" ] || {
+            echo "reviewed release digest mismatch" >&2
+            exit 1
+          }
+
+      # ④ 승격 — 이 레인에서 **유일하게 비가역**인 지점. 아래 두 장치는 그래서 있다.
+      - name: Public promotion (environment approval required)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SRC_REPO: idoforgod/cys-terminal
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ★`--tag "$TAG"` 를 반드시 동봉한다(2026-08-18 추가).
+          #   릴리스 PATCH 에 `tag_name` 을 빠뜨리면 **draft 의 tag_name 이 `untagged-<sha>`
+          #   슬러그로 리셋**되는 사고가 이 저장소에서 실측된 적이 있다. 승격 순간에 그 일이
+          #   나면 공개된 릴리스의 다운로드 URL 이 전부 어긋나고(latest.json 은
+          #   `/releases/download/v<V>/` 를 가리킨다) 앱 내 Update 가 통째로 죽는다.
+          #   종전 이 step 은 `--draft=false --latest` 만 보내 tag_name 을 생략했다.
+          #   ※과거 실적으로는 터진 적이 없다(실측 2026-08-18: 승격 성공 18건 · 전 릴리스
+          #     100건에 `untagged-` 0건). 그래도 비가역 지점이라 명시적으로 못박는다.
+          #   ※같은 값을 다시 보내는 것이라 태그를 옮기지 않는다 — 원격 `refs/tags/$TAG` 가
+          #     이미 존재하면 그 태그에 그대로 묶인다.
+          gh release edit "$TAG" -R "$SRC_REPO" --tag "$TAG" --draft=false --latest
+
+          # ★사후 단언 — 승격이 "의도한 모습"으로 끝났는지 되읽어 확인한다.
+          #   공개 자체는 되돌릴 수 없지만 tag_name 리셋은 되돌릴 수 있다(REST 로 tag_name 재설정).
+          #   그러니 조용히 넘어가지 말고 여기서 크게 죽어야 사람이 즉시 고칠 수 있다.
+          if ! AFTER="$(gh release view "$TAG" -R "$SRC_REPO" --json tagName,isDraft 2>/dev/null)"; then
+            echo "::error::승격 후 $TAG 로 릴리스를 찾을 수 없다 — tag_name 이 리셋됐을 수 있다." >&2
+            echo "::error::복구: PATCH /repos/$SRC_REPO/releases/<id> {\"tag_name\":\"$TAG\"}" >&2
+            exit 1
+          fi
+          AFTER_TAG="$(jq -r .tagName <<<"$AFTER")"
+          AFTER_DRAFT="$(jq -r .isDraft <<<"$AFTER")"
+          [ "$AFTER_TAG" = "$TAG" ] || {
+            echo "::error::승격 후 tag_name 이 어긋났다: $AFTER_TAG (기대 $TAG)" >&2; exit 1; }
+          [ "$AFTER_DRAFT" = "false" ] || {
+            echo "::error::승격 후에도 draft 다: isDraft=$AFTER_DRAFT" >&2; exit 1; }
+          echo "✅ 공개 발행 완료 — tag_name=$AFTER_TAG · isDraft=$AFTER_DRAFT"
