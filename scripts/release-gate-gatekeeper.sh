@@ -13,12 +13,14 @@
 #   ② codesign --verify --deep --strict --verbose=2  — 봉인 무결(파손·추가 파일 검출)
 #   ③ xcrun stapler validate — 공증 티켓 동봉(오프라인 증거)
 #   ④ spctl --assess --type execute --verbose=4 — Gatekeeper 실평가 (accepted 필수)
-#   ⑤ SEAL-2 불변식 정적 검사 — 동봉 python 런타임 트리(.py N개)가 opt-0/1/2 3레벨 .pyc 로
-#      **전량 선컴파일**(개수 == 3N · 레벨별 == N)돼 있고, 표본 .pyc 헤더 flags==1
-#      (unchecked-hash)인지. 불변식 정의처 = scripts/precompile-bundled-python.sh.
+#   ⑤ SEAL-2 불변식 전칭(∀) 정적 검사 — 동봉 python 런타임 트리의 **모든** .py 각각에
+#      기대 .pyc 3종(__pycache__/<stem>.<tag>{,.opt-1,.opt-2}.pyc · <tag> 는 하드코딩 없이
+#      실재 pyc 파일명에서 추출)이 실재하고(파일별 대응 — 총계 상쇄 불가), 소스 없는 고아
+#      pyc 가 0이며, 발견된 pyc **전량**의 헤더 flags==1(unchecked-hash)인지(표본화 제거 —
+#      F1 전칭 격상 2026-08-20). 불변식 정의처 = scripts/precompile-bundled-python.sh.
 #      하나라도 어긋나면 그 레벨/파일로 부르는 순간 CPython 이 번들 안에 .pyc 를 새로 써서
-#      봉인이 깨진다(2026-08-01 실사고 재발 경로). ★실행 0 — 파일 계수(find)와 헤더 8바이트
-#      판독(러너 python3)만 한다. **번들 안 python 실행 절대 금지**: .app 안 바이너리를 한 번
+#      봉인이 깨진다(2026-08-01 실사고 재발 경로). ★실행 0 — 디렉터리 워크·이름 대조와 헤더
+#      8바이트 판독(러너 python3 단일 호출)만 한다. **번들 안 python 실행 절대 금지**: .app 안 바이너리를 한 번
 #      이라도 exec 하면 macOS 가 앱 번들 보호를 걸어 SIGKILL·거짓 PASS 를 만든다
 #      (docs/RELEASE.md 의 ⑥ 확장자 분리 실측 — 같은 함정).
 #
@@ -26,12 +28,17 @@
 #   이 게이트도 macOS 전용이다 — 여기서 수리하지 않는다. 오너 앵커: 윈도우 설치파일은 신중 접근,
 #   그리고 코드서명 봉인 파손→Gatekeeper 차단은 macOS 고유 경로라 Windows 는 피해 경로가 아니라는 판정.
 #
-# ★spctl 정책 강등 (무음 통과 금지)
-#   러너·머신 정책에 따라 `spctl --status` 가 "assessments disabled" 일 수 있다. 그때 ④ 는
-#   **skip 이 아니라** 게이트를 "codesign 검증 단독 모드(DEGRADED)"로 **강등**하고 그 사실을
-#   큰 배너로 로그에 남긴다. 강등 모드에서도 ①②③ 은 전부 필수이며 하나라도 실패하면 exit 1 이다.
-#   (③ stapler validate 가 강등 모드의 공증 증거를 대신 잡는다 — 없으면 "서명은 됐지만 공증
-#    안 된 앱"이 조용히 통과하는 구멍이 생긴다.)
+# ★spctl 정책 강등 = 판정 불가 폐쇄 (F2 · 2026-08-20 — 측정 불능≠통과)
+#   러너·머신 정책에 따라 `spctl --status` 가 "assessments disabled" 일 수 있다. 종전에는
+#   ④ 만 생략하는 "codesign/stapler 단독 모드(DEGRADED)"로 강등해 최종 rc=0 을 냈으나,
+#   발행 승인 경로(release.yml 게이트 스텝 · release-postprocess.py 5단계)가 rc=0 을 승인
+#   신호로 소비하므로 그것은 "측정 불능≠통과" 계약 위반이다. 기본(릴리스) 모드에서
+#   degraded 는 이제 **`GATE_MODE=degraded` 1줄 출력 후 exit 2(판정 불가)로 폐쇄**된다.
+#   강등 평가가 필요한 진단은 옵트인 `--diagnose-degraded-ok`(LOUD 고지 · 발행 경로 사용
+#   금지 — release.yml·release-postprocess.py 가 이 플래그를 싣지 않음은
+#   scripts/tests/test_release_postprocess_gate.py 가 문자열 핀으로 못박는다)로만 연다.
+#   CI 실측(v0.14.19 · run 32039644404)은 macOS 양 레그 모두 `assessments enabled → 모드
+#   =full` 이었으므로 이 폐쇄로 인한 릴리스 경로 회귀는 0이다.
 #
 # 대상 앱 = DMG 안의 **모든** *.app (maxdepth 2)
 #   이 제품의 DMG 레이아웃(scripts/build-macos-signed.sh:282-293)은 최상위에 설치 도우미
@@ -42,13 +49,18 @@
 #   bash scripts/release-gate-gatekeeper.sh <DMG경로>
 #   bash scripts/release-gate-gatekeeper.sh /Applications/cys.app      # .app 직접 지정(로컬 스모크)
 #   옵션: --keep(작업 폴더 보존) · --quarantine-value <문자열>(기본 = 실측 Safari 형식)
+#         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤ 강등 평가 · 발행 경로 사용 금지)
+#         --seal2-only(진단 전용 — 대상 .app 에 ⑤ 전칭 검사만 단독 실행 · 적대 픽스처 테스트의 호출 지점)
 #
 # 종료 코드
-#   0 = 전 검사 PASS (강등 모드면 ④ 제외 전부 PASS · 배너로 명시)
+#   0 = 전 검사 PASS (기본 모드에선 full 에서만 도달 가능 · --diagnose-degraded-ok 의 0 은 진단용이다)
 #   1 = 하나 이상 FAIL → **업로드 금지**
-#   2 = 사용법 오류 · 도구 부재 · 마운트/복사 실패 · ⑤ 계수/표본 판독 불능 = **판정 불가(통과가 아니다)**
-#   판정에 도달한 실행(exit 0·1)은 stdout 마지막 줄에 기계 요약 `GATE_MODE=full|degraded` 를
-#   고정 출력한다 — CI(release.yml 게이트 스텝)가 GITHUB_STEP_SUMMARY 로 승격하는 증적 라인이다.
+#   2 = 사용법 오류 · 도구 부재 · 마운트/복사 실패 · ⑤ 판독 불능 · **degraded 폐쇄(기본 모드
+#       · F2)** = **판정 불가(통과가 아니다)**
+#   GATE_MODE 계약: 판정에 도달한 실행(exit 0·1)은 stdout 마지막 줄에 기계 요약
+#   `GATE_MODE=full|degraded` 를 고정 출력하고, **degraded-폐쇄 exit 2 도 폐쇄 직전에
+#   `GATE_MODE=degraded` 를 출력**한다(그 외 exit 2 경로는 미출력) — CI(release.yml 게이트
+#   스텝)가 GITHUB_STEP_SUMMARY 로 승격하는 증적 라인이다.
 #
 # scripts/verify-gatekeeper-user-path.sh 와의 관계 — 겹치지 않는 상·하위 게이트다.
 #   그쪽(로컬·수동)은 여기 검사 전부 + ⑥ **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
@@ -61,6 +73,8 @@ set -uo pipefail
 KEEP=0
 QVAL=""
 TARGET=""
+DIAG_DEGRADED=0
+SEAL2_ONLY=0
 
 usage() {
   cat <<'USAGE'
@@ -68,8 +82,11 @@ usage() {
 옵션:
   --keep                    작업 폴더를 지우지 않는다(디버깅)
   --quarantine-value <str>  부착할 com.apple.quarantine 값(기본: <flags>;<epoch16>;CI;<UUID>)
+  --diagnose-degraded-ok    진단 전용: degraded(spctl assessments disabled) 폐쇄를 열어
+                            ①②③⑤ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
+  --seal2-only              진단 전용: 대상 .app 에 ⑤ SEAL-2 전칭 검사만 단독 실행
   -h, --help                이 도움말
-종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가
+종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(degraded 폐쇄 포함)
 USAGE
 }
 
@@ -77,6 +94,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --keep) KEEP=1; shift ;;
     --quarantine-value) QVAL="${2:-}"; shift 2 ;;
+    --diagnose-degraded-ok) DIAG_DEGRADED=1; shift ;;
+    --seal2-only) SEAL2_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; usage >&2; exit 2 ;;
     *) TARGET="$1"; shift ;;
@@ -86,10 +105,13 @@ done
 [ -n "$TARGET" ] || { usage >&2; exit 2; }
 
 # ── 도구 fail-closed (없으면 판정 불가 = exit 2 · 통과 아님) ──
-for t in hdiutil spctl codesign xattr ditto find uuidgen; do
-  command -v "$t" >/dev/null 2>&1 || { echo "✗ 필수 도구 없음: $t (macOS + Xcode CLT 필요)" >&2; exit 2; }
-done
-command -v xcrun >/dev/null 2>&1 || { echo "✗ xcrun 없음 — Xcode CLT 필요(stapler validate 불가)" >&2; exit 2; }
+# --seal2-only(진단)는 ⑤ 만 돌므로 러너 python3 해소만 요구한다 — macOS 밖(픽스처 테스트)에서도 돈다.
+if [ "$SEAL2_ONLY" != "1" ]; then
+  for t in hdiutil spctl codesign xattr ditto find uuidgen; do
+    command -v "$t" >/dev/null 2>&1 || { echo "✗ 필수 도구 없음: $t (macOS + Xcode CLT 필요)" >&2; exit 2; }
+  done
+  command -v xcrun >/dev/null 2>&1 || { echo "✗ xcrun 없음 — Xcode CLT 필요(stapler validate 불가)" >&2; exit 2; }
+fi
 
 # ── ⑤용 러너 python3 해소 (fail-closed · 번들 인터프리터 절대 금지) ──
 # 헤더 8바이트(magic 4 + flags 4) 파싱은 인터프리터 버전 무관 — 러너 python3 로 충분하다.
@@ -103,7 +125,7 @@ for cand in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
   case "$cand:$real" in *".app/"*) continue ;; esac
   GATE_PY="$cand"; break
 done
-[ -n "$GATE_PY" ] || { echo "✗ 번들 밖 python3 없음 — ⑤ SEAL-2 표본 판독 불가(측정 불능은 통과가 아니다)" >&2; exit 2; }
+[ -n "$GATE_PY" ] || { echo "✗ 번들 밖 python3 없음 — ⑤ SEAL-2 전칭 판독 불가(측정 불능은 통과가 아니다)" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cys-gk-gate.XXXXXX")" || exit 2
 # macOS 는 /var·/tmp 가 심볼릭링크라 mount·codesign 이 실경로(/private/…)로 되돌려 출력한다.
@@ -126,81 +148,85 @@ ok()   { PASS_N=$((PASS_N+1)); printf 'PASS %s%s\n' "$1" "${2:+ | $2}"; }
 bad()  { FAIL_N=$((FAIL_N+1)); printf 'FAIL %s%s\n' "$1" "${2:+ | $2}"; }
 info() { printf '     %s\n' "$1"; }
 
-# ── spctl 정책 선확인 → 모드 결정 (무음 통과 금지) ──
-SPCTL_STATUS="$(spctl --status 2>&1 || true)"
-if printf '%s' "$SPCTL_STATUS" | grep -qi 'assessments enabled'; then
-  MODE="full"
-else
-  MODE="degraded"
-fi
-
-echo "═══ macOS 릴리스 게이트: 격리 속성 + Gatekeeper 실평가 ═══"
-echo "대상 : $TARGET"
-echo "작업 : $WORK"
-echo "spctl: $SPCTL_STATUS → 모드=$MODE"
-if [ "$MODE" = "degraded" ]; then
-  cat <<'BANNER'
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-!!  ★게이트 강등 — spctl 평가 불능 (assessments disabled)
-!!  이 실행은 Gatekeeper **실평가(spctl --assess)를 수행하지 못했다**.
-!!  codesign 봉인 검증 + stapler 공증 티켓 검증 **단독 모드**로 내려간다.
-!!  skip 이 아니다: ①②③ 은 그대로 필수이며 실패 시 exit 1 이다.
-!!  그러나 "Gatekeeper 통과"는 이 실행으로 증명되지 않았다 — 판정 범위가 좁아졌다.
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-BANNER
-  echo "::warning title=Gatekeeper 게이트 강등::spctl assessments disabled — codesign/stapler 단독 모드로 평가함(실평가 미수행)"
-fi
-echo
-
-# ── ⑤ SEAL-2 불변식 정적 검사 (실행 0 — find 계수 + 러너 python3 헤더 판독만) ──
-# 불변식(정의처 scripts/precompile-bundled-python.sh): 동봉 런타임 트리의 모든 .py(N개)는
-# 서명 **전에** opt-0/1/2 3레벨 .pyc 로 선컴파일돼 봉인에 들어 있고(총 3N · 레벨별 N),
-# 전량 unchecked-hash(헤더 flags==1 · PEP 552: bit0=hash-based, bit1=check_source)다.
+# ── ⑤ SEAL-2 불변식 전칭(∀) 정적 검사 (실행 0 — 러너 python3 단일 호출 1회 · 전량 판독) ──
+# 불변식(정의처 scripts/precompile-bundled-python.sh): 동봉 런타임 트리의 모든 .py 는
+# 서명 **전에** opt-0/1/2 3레벨 .pyc 로 선컴파일돼 봉인에 들어 있고, 전량 unchecked-hash
+# (헤더 flags==1 · PEP 552: bit0=hash-based, bit1=check_source)다.
 # 검사 범위는 runtime **트리 전체**(python stdlib + node 동봉 gyp) — precompile 스크립트의
 # 컴파일 범위와 정확히 같다(python/lib 만 보면 gyp 갭이 남는다).
+# ★F1 전칭 격상(2026-08-20): 종전 "레벨별 총계 동일성 + 표본 25개 flags"는 (a)결손 1 +
+#   동수 고아 1 의 총계 상쇄와 (b)표본 밖 flags 변조를 통과시켰다(둘 다 적대 픽스처로
+#   test_release_postprocess_gate.py Seal2UniversalCheckTests 에 박제 — FAIL 재현 강제).
+#   지금은 단일 python 호출 1회로 ①파일별 3레벨 대응(<tag> 하드코딩 금지 — 실재 pyc
+#   파일명에서 추출) ②고아 pyc 0(기대 집합 밖 pyc 전부 = 소스 없는 pyc·이탈 태그 포함)
+#   ③발견된 pyc 전량 헤더 8바이트 flags==1 을 검사한다.
+#   성능 실측(2026-08-20 · M-시리즈 로컬): .py 1,140 · pyc 3,420 전량 헤더 판독이
+#   /Applications/cys.app 트리 0.10초 · v0.14.19 DMG(aarch64) 마운트 트리 0.13초 —
+#   표본화가 필요 없는 비용이다.
 # ★magic 4바이트는 버전마다 달라 러너 python 의 MAGIC_NUMBER 와 대조하지 않는다(러너≠번들
 #   버전이면 오탐). flags 필드 오프셋(4..8)·리틀엔디언은 전 버전 동일 — 인터프리터 무관 판독.
 # 반환: 0=검사 수행(위반은 ok/bad 로 집계 — FAIL 은 말미 판정이 exit 1) · 2=판정 불가 · 3=대상 아님(python 런타임 미동봉 앱)
 seal2_static_check() {
-  local app="$1" name rt n_py n_opt0 n_opt1 n_opt2 n_all s_out s_rc
+  local app="$1" name rt s_out s_rc
   name="$(basename "$app")"
   rt="$app/Contents/Resources/runtime"
   [ -d "$rt/python/lib" ] || return 3
-  # N = __pycache__ 밖 .py 전수 — precompile 검증(PYCHECK)과 동일 산식.
-  n_py=$(find "$rt" -type d -name __pycache__ -prune -o -type f -name '*.py' -print 2>/dev/null | wc -l | tr -d ' ')
-  n_opt0=$(find "$rt" -type f -path '*/__pycache__/*.pyc' ! -name '*.opt-1.pyc' ! -name '*.opt-2.pyc' 2>/dev/null | wc -l | tr -d ' ')
-  n_opt1=$(find "$rt" -type f -path '*/__pycache__/*.opt-1.pyc' 2>/dev/null | wc -l | tr -d ' ')
-  n_opt2=$(find "$rt" -type f -path '*/__pycache__/*.opt-2.pyc' 2>/dev/null | wc -l | tr -d ' ')
-  n_all=$(find "$rt" -type f -path '*/__pycache__/*.pyc' 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$n_py" -eq 0 ]; then
-    echo "✗ ⑤ SEAL-2($name): python 런타임 디렉터리는 있는데 .py 가 0개 — 계수 불성립(레이아웃 변경?)" >&2
-    return 2
-  fi
-  info "⑤ 계수($name): .py $n_py · __pycache__/*.pyc $n_all (opt-0 $n_opt0 · opt-1 $n_opt1 · opt-2 $n_opt2) · 기대 3N=$((n_py*3))"
-  if [ "$n_opt0" -eq "$n_py" ] && [ "$n_opt1" -eq "$n_py" ] && [ "$n_opt2" -eq "$n_py" ] && [ "$n_all" -eq $((n_py*3)) ]; then
-    ok "⑤ SEAL-2 선컴파일 커버리지($name)" "3레벨 × $n_py = $n_all"
-  else
-    bad "⑤ SEAL-2 선컴파일 커버리지($name)" \
-        "레벨 결손/과잉(.py $n_py 대비 opt-0 $n_opt0 · opt-1 $n_opt1 · opt-2 $n_opt2 · 총 $n_all ≠ 3N) — 결손 레벨로 부르는 순간 번들에 .pyc 가 쓰여 봉인이 깨진다"
-  fi
-  # 표본 헤더 flags==1 — 러너 python3($GATE_PY). 판독 실패는 위반이 아니라 판정 불가(rc 2).
   s_out="$("$GATE_PY" - "$rt" <<'PYSEAL'
-import os, struct, sys
+import os, struct, sys, time
 root = sys.argv[1]
+t0 = time.monotonic()
+CAP = 10  # 위반 상세 출력 상한(종류별) — 전체 건수는 FAIL 요약 줄이 든다
+py_files = []   # (디렉터리, stem)
 pycs = []
-for dp, _dn, fn in os.walk(root):
-    if os.path.basename(dp) != "__pycache__":
+for dp, dn, fn in os.walk(root):
+    if os.path.basename(dp) == "__pycache__":
+        dn[:] = []
+        for f in fn:
+            if f.endswith(".pyc"):
+                pycs.append(os.path.join(dp, f))
         continue
     for f in fn:
-        if f.endswith(".pyc"):
-            pycs.append(os.path.join(dp, f))
-pycs.sort()
+        if f.endswith(".py"):
+            py_files.append((dp, f[:-3]))
+if not py_files:
+    print("NO-PY: python 런타임 디렉터리는 있는데 .py 가 0개 — 계수 불성립(레이아웃 변경?)")
+    sys.exit(2)
 if not pycs:
-    print("NO-PYC"); sys.exit(2)
-step = max(1, len(pycs) // 24)
-samples = pycs[::step][:25]
-bad = []
-for p in samples:
+    # 측정은 성립했다(.py N개 · pyc 0개) — 판정 불가가 아니라 전량 결손 위반이다.
+    print("FAIL: .py %d개인데 pyc 0개 — 선컴파일 전량 결손" % len(py_files))
+    sys.exit(1)
+
+# <tag> 추출 — 하드코딩 금지: 실재 pyc 이름 <stem>.<tag>[.opt-N].pyc 에서 뽑는다.
+tag_count = {}
+for p in pycs:
+    s = os.path.basename(p)[:-4]
+    for o in (".opt-1", ".opt-2"):
+        if s.endswith(o):
+            s = s[:-len(o)]
+            break
+    if "." in s:
+        t = s.rsplit(".", 1)[1]
+        tag_count[t] = tag_count.get(t, 0) + 1
+if not tag_count:
+    print("FAIL: pyc %d개 전부 무태그 이름 — 선컴파일 산출물 형식이 아니다" % len(pycs))
+    sys.exit(1)
+tag = max(tag_count, key=tag_count.get)   # 지배 태그 — 이탈 태그 pyc 는 아래 ② 고아로 걸린다
+
+# ① 파일별 대응 — .py 마다 기대 pyc 3종 실재(레벨별 총계 동일성의 상쇄 허용 결함 제거)
+expected = set()
+missing = []
+for dp, stem in py_files:
+    for opt in ("", ".opt-1", ".opt-2"):
+        e = os.path.join(dp, "__pycache__", "%s.%s%s.pyc" % (stem, tag, opt))
+        expected.add(e)
+        if not os.path.isfile(e):
+            missing.append(os.path.relpath(e, root))
+# ② 고아 — 기대 집합(실재 .py × 3레벨 × 지배 태그) 밖의 모든 pyc:
+#    소스 없는 pyc·이탈 태그·무태그 pyc 가 전부 여기 걸린다(총계 상쇄 불가).
+orphans = [os.path.relpath(p, root) for p in pycs if p not in expected]
+# ③ flags 전수 — 발견된 pyc 전량 헤더 8바이트(magic 4 + flags 4) 판독(표본화 제거)
+badflags = []
+for p in pycs:
     try:
         with open(p, "rb") as fh:
             head = fh.read(8)
@@ -211,24 +237,97 @@ for p in samples:
     flags = struct.unpack("<I", head[4:8])[0]
     if flags != 1:
         kind = "timestamp" if not (flags & 1) else ("checked-hash" if flags == 3 else "flags=%d" % flags)
-        bad.append("%s: %s(flags=%d)" % (os.path.relpath(p, root), kind, flags))
-if bad:
-    print("BAD %d/%d" % (len(bad), len(samples)))
-    for b in bad[:10]:
-        print("  - " + b)
+        badflags.append("%s: %s(flags=%d)" % (os.path.relpath(p, root), kind, flags))
+dt = time.monotonic() - t0
+print("계수: .py %d · pyc %d · tag=%s · 전수 판독 %.2fs" % (len(py_files), len(pycs), tag, dt))
+nv = 0
+for label, items in (("MISSING(기대 pyc 결손)", missing),
+                     ("ORPHAN(고아 pyc)", orphans),
+                     ("BADFLAGS(flags!=1)", badflags)):
+    if items:
+        nv += len(items)
+        print("%s %d건 — 상한 %d건만 출력:" % (label, len(items), CAP))
+        for it in items[:CAP]:
+            print("  - " + it)
+if nv:
+    print("FAIL: missing=%d · orphan=%d · badflags=%d — 결손 레벨/파일로 부르는 순간 CPython 이 번들 안에 .pyc 를 새로 써 봉인이 깨진다"
+          % (len(missing), len(orphans), len(badflags)))
     sys.exit(1)
-print("표본 %d/%d 전부 flags=1(unchecked-hash)" % (len(samples), len(pycs)))
+print("OK: .py %d × 3레벨 전수 대응 · 고아 0 · flags==1 전수 %d/%d · 판독 %.2fs"
+      % (len(py_files), len(pycs), len(pycs), dt))
 PYSEAL
 )"; s_rc=$?
   case "$s_rc" in
-    0) ok "⑤ SEAL-2 표본 헤더($name)" "$s_out" ;;
-    1) bad "⑤ SEAL-2 표본 헤더($name)" "unchecked-hash 아님 — 재컴파일·재기록이 살아난다: $(printf '%s' "$s_out" | tr '\n' ' ')" ;;
-    *) echo "✗ ⑤ SEAL-2($name) 표본 판독 불가(rc=$s_rc): $(printf '%s' "$s_out" | tr '\n' ' ')" >&2
+    0) printf '%s\n' "$s_out" | sed 's/^/     ⑤ /'
+       ok "⑤ SEAL-2 전칭 검사($name)" "$(printf '%s\n' "$s_out" | tail -1)" ;;
+    1) printf '%s\n' "$s_out" | sed 's/^/     ⑤ /'
+       bad "⑤ SEAL-2 전칭 검사($name)" "$(printf '%s\n' "$s_out" | tail -1)" ;;
+    *) echo "✗ ⑤ SEAL-2($name) 판독 불능(rc=$s_rc): $(printf '%s' "$s_out" | tr '\n' ' ')" >&2
        return 2 ;;
   esac
   return 0
 }
 SEAL2_TARGETS=0   # python 런타임을 실제로 검사한 앱 수 — 0이면 판정 불가(측정 불능≠통과)
+
+# ── 진단 전용: --seal2-only — ⑤ 전칭 검사만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
+#   적대 픽스처 박제(test_release_postprocess_gate.py Seal2UniversalCheckTests)의 호출 지점.
+#   발행 경로(release.yml·release-postprocess.py)가 이 플래그를 싣지 않음은 같은 테스트의 핀이 지킨다.
+if [ "$SEAL2_ONLY" = "1" ]; then
+  TARGET="${TARGET%/}"
+  [ -d "$TARGET" ] || { echo "✗ --seal2-only 대상 없음(.app 디렉터리 필요): $TARGET" >&2; exit 2; }
+  echo "[진단 전용] --seal2-only: $TARGET — ⑤ SEAL-2 전칭 검사만 돈다(발행 판정 아님)"
+  seal2_static_check "$TARGET"; SEAL2_RC=$?
+  case "$SEAL2_RC" in
+    0) ;;
+    3) echo "✗ --seal2-only: 동봉 python 런타임 없음(Contents/Resources/runtime/python/lib)" >&2; exit 2 ;;
+    *) exit 2 ;;
+  esac
+  [ "$FAIL_N" -gt 0 ] && exit 1
+  exit 0
+fi
+
+# ── spctl 정책 선확인 → 모드 결정 (무음 통과 금지) ──
+# CYS_GATE_FORCE_DEGRADED=1 = 시험 주입점(degraded 폐쇄의 단위 재현 전용): degraded **방향
+# 으로만** 강제할 수 있다 — full 을 강제하는 주입점은 우회 벡터라 만들지 않는다(fail-closed 단방향).
+SPCTL_STATUS="$(spctl --status 2>&1 || true)"
+if [ "${CYS_GATE_FORCE_DEGRADED:-0}" = "1" ]; then
+  MODE="degraded"
+  SPCTL_STATUS="$SPCTL_STATUS [CYS_GATE_FORCE_DEGRADED=1 — 시험 주입: 강제 degraded]"
+elif printf '%s' "$SPCTL_STATUS" | grep -qi 'assessments enabled'; then
+  MODE="full"
+else
+  MODE="degraded"
+fi
+
+echo "═══ macOS 릴리스 게이트: 격리 속성 + Gatekeeper 실평가 ═══"
+echo "대상 : $TARGET"
+echo "작업 : $WORK"
+echo "spctl: $SPCTL_STATUS → 모드=$MODE"
+if [ "$MODE" = "degraded" ]; then
+  if [ "$DIAG_DEGRADED" != "1" ]; then
+    # ── F2 폐쇄(기본 = 릴리스 모드): degraded = 판정 불가 — 측정 불능은 통과가 아니다 ──
+    #   종전엔 ④ 만 생략하고 최종 rc=0 을 냈다. 발행 승인 경로(release.yml 게이트 스텝 ·
+    #   release-postprocess.py 5단계)가 rc=0 을 승인 신호로 소비하므로, spctl 실평가가
+    #   없는 실행은 여기서 즉시 폐쇄한다. 진단은 --diagnose-degraded-ok(발행 경로 사용 금지).
+    echo "✗ degraded(spctl assessments disabled) — Gatekeeper 실평가 불능 = 판정 불가(폐쇄 · exit 2)" >&2
+    echo "::error title=Gatekeeper 게이트 폐쇄(degraded)::spctl assessments disabled — 실평가 불능은 통과가 아니다(exit 2). 진단은 --diagnose-degraded-ok(발행 경로 사용 금지)"
+    echo "GATE_MODE=degraded"
+    exit 2
+  fi
+  echo '!!!! [진단 전용] --diagnose-degraded-ok — 이 실행의 exit 0 은 발행 승인 신호가 아니다.'
+  echo '!!!! 발행 경로 사용 금지: release.yml·release-postprocess.py 는 이 플래그를 절대 싣지 않는다(테스트 핀).'
+  cat <<'BANNER'
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!  ★게이트 강등 — spctl 평가 불능 (assessments disabled)
+!!  이 실행은 Gatekeeper **실평가(spctl --assess)를 수행하지 못했다**.
+!!  codesign 봉인 검증 + stapler 공증 티켓 검증 **단독 모드**로 내려간다.
+!!  skip 이 아니다: ①②③⑤ 는 그대로 필수이며 실패 시 exit 1 이다.
+!!  그러나 "Gatekeeper 통과"는 이 실행으로 증명되지 않았다 — 판정 범위가 좁아졌다.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+BANNER
+  echo "::warning title=Gatekeeper 게이트 강등(진단 전용)::spctl assessments disabled — codesign/stapler 단독 모드로 평가함(실평가 미수행 · 발행 판정 아님)"
+fi
+echo
 
 # ── quarantine 값 (실측 4필드 형식: <flags4hex>;<epoch16진>;<에이전트>;<UUID>) ──
 # 실측 표본: 0281;6a62b3d6;Chrome;1772ABA8-…  ·  0083;6a62000f;Safari;137E3038-…
@@ -345,10 +444,10 @@ for APP_SRC in "${APPS[@]}"; do
       printf '%s\n' "$SPCTL_OUT" | sed "s|$APP|<app>|g" | sed 's/^/     | /'
     fi
   else
-    echo "SKIP ④ spctl --assess($APP_NAME) — assessments disabled (게이트 강등 · 위 배너 참조)"
+    echo "SKIP ④ spctl --assess($APP_NAME) — assessments disabled (진단 전용 강등 · --diagnose-degraded-ok · 위 배너 참조)"
   fi
 
-  # ── ⑤ SEAL-2 불변식 정적 검사 — 원본 트리(마운트된 DMG 안 / 직접 지정 .app) 판독 전용 ──
+  # ── ⑤ SEAL-2 불변식 전칭 정적 검사 — 원본 트리(마운트된 DMG 안 / 직접 지정 .app) 판독 전용 ──
   seal2_static_check "$APP_SRC"; SEAL2_RC=$?
   case "$SEAL2_RC" in
     0) SEAL2_TARGETS=$((SEAL2_TARGETS+1)) ;;
@@ -380,7 +479,7 @@ if [ "$FAIL_N" -gt 0 ]; then
   echo "::error title=Gatekeeper 게이트 FAIL::$TARGET — 격리 상태 평가에서 $FAIL_N 건 실패(위 verbatim 출력 참조)"
   RC=1
 elif [ "$MODE" = "degraded" ]; then
-  echo "✓ 강등 모드 전 항목 PASS — 단, Gatekeeper 실평가는 수행되지 않았다(무음 통과 아님·배너 고지됨)"
+  echo "✓ [진단 전용] 강등 모드 전 항목 PASS — Gatekeeper 실평가는 수행되지 않았다(발행 판정 아님 · --diagnose-degraded-ok · 배너 고지됨)"
 else
   echo "✓ 전 항목 PASS — 격리된 사본이 Gatekeeper 실평가를 통과했다"
 fi

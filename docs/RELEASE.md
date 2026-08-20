@@ -234,16 +234,19 @@ v0.14.19 실측(run 32039644404): 두 레그 모두 `spctl: assessments enabled 
 
 ```sh
 bash scripts/release-gate-gatekeeper.sh <DMG | .app>
-#   exit 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(도구 부재·마운트 실패 — 통과 아님)
+#   exit 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(도구 부재·마운트 실패·degraded 폐쇄 — 통과 아님)
 ```
 
 - 검사 = quarantine 부착·상속 → 마운트 → `codesign --verify --deep --strict` +
-  `stapler validate` + `spctl --assess --type execute` + ⑤ SEAL-2 불변식 정적 검사
-  (동봉 python 선컴파일 커버리지·표본 `.pyc` 헤더 — 실행 0 · 2026-08-20 추가, 세목은
-  스크립트 머리 주석). 대상은 DMG 안 **모든** `*.app`
-  (설치 도우미 `Install cys.app` + 숨김 `.support/cys.app`). 러너 정책이 `assessments
-  disabled` 면 skip 이 아니라 **codesign/stapler 단독 모드(DEGRADED)로 강등**하고 배너로
-  고지한다(무음 통과 금지).
+  `stapler validate` + `spctl --assess --type execute` + ⑤ SEAL-2 불변식 **전칭(∀) 정적
+  검사**(모든 `.py` 의 3레벨 `.pyc` 파일별 대응 + 고아 `.pyc` 0 + 발견된 `.pyc` 전량 헤더
+  flags==1 — 실행 0 · 표본화 제거 F1 격상 2026-08-20, 세목은 스크립트 머리 주석). 대상은
+  DMG 안 **모든** `*.app`(설치 도우미 `Install cys.app` + 숨김 `.support/cys.app`).
+  러너 정책이 `assessments disabled`(=degraded) 면 **판정 불가 exit 2 로 폐쇄**된다
+  (F2 수리 2026-08-20 — 측정 불능≠통과 · `GATE_MODE=degraded` 1줄 출력 후 즉시 종료).
+  강등 평가가 필요한 진단은 `--diagnose-degraded-ok`(LOUD 고지 · **발행 경로 사용 금지**
+  — release.yml·release-postprocess.py 가 이 플래그를 싣지 않음은
+  `scripts/tests/test_release_postprocess_gate.py` 의 문자열 핀이 지킨다)로만 연다.
 - **`verify-gatekeeper-user-path.sh` 와의 관계 — 겹치지 않는 상·하위 게이트다.** 그쪽
   (로컬·수동)은 여기 검사 전부 + ⑥ **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
   본다. 대신 대상 아키텍처 python 을 실행하므로 arm64 러너에서 x64 DMG 를 보려면 Rosetta 2

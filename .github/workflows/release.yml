@@ -424,8 +424,12 @@ jobs:
       #   draft 정책이 뒤집히는 순간 공개된 산출물을 사후 실패시키는 구조 의존이 된다. 앞에 세워
       #   어떤 발행 정책에서도 게이트가 업로드 자체를 선행 차단하게 한다.
       # 매트릭스가 아키텍처별(aarch64·x64)이므로 각 레그가 자기 DMG 를 본다 = **DMG 2종 모두 커버**.
-      # 러너 정책이 `spctl --status = assessments disabled` 면 스크립트가 skip 이 아니라
-      #   **codesign/stapler 단독 모드로 강등**하고 ::warning 배너를 남긴다(무음 통과 금지).
+      # 러너 정책이 `spctl --status = assessments disabled`(=degraded) 면 게이트가 **판정 불가
+      #   exit 2 로 폐쇄**된다(F2 수리 2026-08-20 — 측정 불능≠통과 · rc=0 은 full 실평가에서만).
+      #   진단 전용 강등 플래그(게이트 스크립트 --help 참조)는 발행 경로 사용 금지 — 이 파일이
+      #   그 플래그 문자열 자체를 싣지 않음은 test_release_postprocess_gate.py 의 핀이 지키므로
+      #   여기 주석에도 문자열을 쓰지 않는다. v0.14.19 실측
+      #   (run 32039644404) 두 레그 모두 full 모드였으므로 이 폐쇄의 릴리스 경로 회귀는 0이다.
       - name: macOS Gatekeeper 게이트 (quarantine 부착 + spctl 실평가 · 업로드 전)
         if: matrix.platform == 'macos-latest'
         shell: bash
@@ -436,7 +440,7 @@ jobs:
           [ "${#DMGS[@]}" -ge 1 ] && [ -f "${DMGS[0]}" ] || { echo "::error::DMG 후보 이상(글롭 미해소 포함): ${DMGS[*]}" >&2; exit 1; }
           for d in "${DMGS[@]}"; do
             echo "=== Gatekeeper 게이트 대상: $d ==="
-            # exit 0=PASS · 1=FAIL(발행 금지) · 2=판정 불가(도구 부재·마운트 실패 → 통과 아님)
+            # exit 0=PASS · 1=FAIL(발행 금지) · 2=판정 불가(도구 부재·마운트 실패·degraded 폐쇄 → 통과 아님)
             # ── GATE_MODE·spctl 모드 증적 승격(GITHUB_STEP_SUMMARY · F1 검증 공백 수리) ──
             #   강등(degraded = spctl 실평가 미수행)은 로그 배너만으로는 라운드 감사에서 묻힌다 —
             #   게이트 스크립트가 stdout 마지막 줄에 내는 기계 요약(GATE_MODE=full|degraded)과
@@ -451,7 +455,7 @@ jobs:
               echo "### macOS Gatekeeper 게이트 — $(basename "$d") (${{ matrix.target }})"
               grep -E '^GATE_MODE=' "$GLOG" | tail -1 || echo 'GATE_MODE=(미출력 — 태그 트리의 게이트 스크립트가 구판)'
               grep -E '^spctl: ' "$GLOG" | tail -1 || true
-              echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가)"
+              echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가·degraded 폐쇄 포함)"
               echo
             } >> "$GITHUB_STEP_SUMMARY"
             [ "$rc" -eq 0 ] || exit "$rc"

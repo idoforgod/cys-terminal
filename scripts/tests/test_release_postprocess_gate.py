@@ -15,6 +15,13 @@
   실물 대조는 별도다 — `python3 scripts/release-postprocess.py v0.14.19`(dry-run · 백업 실물
   DMG 에 실평가). 경로는 전부 tempfile — 개인 경로·실 홈 디렉터리 금지(test_release_verify.py 관례).
 
+★확장(2026-08-20 · codex REVISE 수리): 이 파일은 release-gate-gatekeeper.sh 의 두 계약도 박제한다.
+  · F1 — SEAL-2 전칭 검사 적대 픽스처 2종(총계 상쇄·표본 밖 flags 변조 → FAIL) — 합성 트리
+    (tempfile · 라이브 앱·저장소 무접촉)에 --seal2-only(진단 전용 · ⑤ 단독)로 실검증.
+  · F2 — degraded(spctl 실평가 불능)=판정 불가(exit 2) 폐쇄 + 진단 플래그
+    (--diagnose-degraded-ok·--seal2-only)가 발행 경로(release-postprocess.py·release.yml)에
+    실리지 않는다는 문자열 핀 2건.
+
 사용: python3 scripts/tests/test_release_postprocess_gate.py
 """
 
@@ -22,6 +29,9 @@ import contextlib
 import importlib.util
 import io
 import os
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -31,6 +41,10 @@ _RP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relea
 _spec = importlib.util.spec_from_file_location("release_postprocess", _RP_PATH)
 rp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rp)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_GATE_SH = os.path.join(_HERE, "..", "release-gate-gatekeeper.sh")
+_RELEASE_YML = os.path.join(_HERE, "..", "..", ".github", "workflows", "release.yml")
 
 V = "0.14.19"
 
@@ -175,6 +189,138 @@ class MainWiringContractTests(unittest.TestCase):
     def test_12_gate_return_value_terminates_main(self):
         """반환값을 버리면(호출만 하면) 비영 rc 가 통과로 둔갑한다."""
         self.assertIn("if gate_rc:\n        return gate_rc", self.src)
+
+
+class DiagnoseFlagAbsencePins(unittest.TestCase):
+    """F2 핀 — 진단 전용 플래그(--diagnose-degraded-ok·--seal2-only)가 발행 경로에 실리는
+    순간 빨개진다. 게이트 스크립트가 아무리 옳아도 발행 경로가 진단 플래그를 실으면
+    degraded 가 도로 rc=0 이 된다 — 문자열 층위에서 못박는다(F2 수리 2026-08-20)."""
+
+    DIAG_FLAGS = ("--diagnose-degraded-ok", "--seal2-only")
+
+    def test_13_postprocess_source_carries_no_diagnose_flag(self):
+        with open(_RP_PATH, encoding="utf-8") as fh:
+            src = fh.read()
+        for flag in self.DIAG_FLAGS:
+            self.assertNotIn(flag, src,
+                             "release-postprocess.py 가 진단 전용 플래그를 실었다: %s" % flag)
+
+    def test_14_release_yml_carries_no_diagnose_flag(self):
+        with open(_RELEASE_YML, encoding="utf-8") as fh:
+            yml = fh.read()
+        # 핀의 전제: 게이트 스텝 실재 — 스텝 자체가 사라지면 플래그 부재 단언은 공허하다.
+        self.assertIn("release-gate-gatekeeper.sh", yml,
+                      "게이트 스텝이 release.yml 에서 사라졌다 — 무검증 발행 경로")
+        for flag in self.DIAG_FLAGS:
+            self.assertNotIn(flag, yml,
+                             "release.yml 이 진단 전용 플래그를 실었다: %s" % flag)
+
+
+class Seal2UniversalCheckTests(unittest.TestCase):
+    """F1 적대 픽스처 — SEAL-2 전칭 검사(파일별 대응·고아·flags 전수)를 합성 트리로 박제.
+
+    구판(레벨별 총계 동일성 + 표본 25개 flags)이 통과시키던 두 결함을 FAIL 로 못박는다:
+      (a) 결손 1 + 동수 고아 1 = 총계 상쇄   (b) 구판 표본 밖 1개 flags 변조.
+    트리는 tempfile 합성(라이브 앱·저장소 무접촉) — 검사는 파일명 + 헤더 8바이트만 보므로
+    pyc 본문은 위조로 충분하다. 호출은 --seal2-only(⑤ 단독 · hdiutil/spctl 불요)."""
+
+    TAG = "cpython-312"   # 픽스처 안 태그 — 게이트는 이 값을 하드코딩하지 않고 파일명에서 추출한다
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.app = os.path.join(self._tmp.name, "Fake.app")
+        self.pkg = os.path.join(self.app, "Contents", "Resources", "runtime",
+                                "python", "lib", "pkg")
+        self.cache = os.path.join(self.pkg, "__pycache__")
+        os.makedirs(self.cache)
+        # 3N > 25(구판 표본 상한) — "표본 밖" 변조 지점이 실제로 존재하도록 N=12(pyc 36개).
+        for i in range(12):
+            with open(os.path.join(self.pkg, "m%02d.py" % i), "w") as fh:
+                fh.write("x = %d\n" % i)
+            for opt in ("", ".opt-1", ".opt-2"):
+                self._pyc(os.path.join(self.cache, "m%02d.%s%s.pyc" % (i, self.TAG, opt)))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _pyc(self, path, flags=1):
+        with open(path, "wb") as fh:
+            fh.write(b"\x6f\x0d\x0d\x0a")          # magic 4B — 게이트는 값 대조를 안 한다(버전 무관)
+            fh.write(struct.pack("<I", flags))     # flags 4B (PEP 552 · 1 = unchecked-hash)
+            fh.write(b"\x00" * 8)                  # source-hash 8B — 내용 무관
+
+    def _run(self):
+        p = subprocess.run(["bash", _GATE_SH, "--seal2-only", self.app],
+                           capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_15_baseline_synthetic_tree_passes(self):
+        """기준선 rc=0 — 이게 깨지면 아래 FAIL 단언들은 '무조건 빨간 검사'를 오독한 것이다."""
+        rc, out = self._run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("OK:", out)
+
+    def test_16_missing_plus_orphan_cancellation_fails(self):
+        """(a) 한 소스의 pyc 1종 삭제 + 동수 고아 추가 — 레벨별 총계가 그대로라 구판은 초록."""
+        os.remove(os.path.join(self.cache, "m00.%s.opt-2.pyc" % self.TAG))
+        self._pyc(os.path.join(self.cache, "ghost.%s.opt-2.pyc" % self.TAG))  # 소스 없는 고아
+        rc, out = self._run()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISSING", out)
+        self.assertIn("ORPHAN", out)
+
+    def test_17_out_of_sample_flags_tamper_fails(self):
+        """(b) 구판 표본(정렬 선두 25개) 밖의 1개를 flags=3 으로 변조 — 전수 판독만 잡는다."""
+        victim = sorted(os.listdir(self.cache))[-1]   # 정렬 마지막 = 36개 중 36번째 — 구판 [:25] 밖
+        self._pyc(os.path.join(self.cache, victim), flags=3)
+        rc, out = self._run()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BADFLAGS", out)
+
+
+@unittest.skipUnless(sys.platform == "darwin",
+                     "게이트 전체 실행은 macOS 도구(hdiutil·spctl 등)가 필요하다")
+class DegradedClosureTests(unittest.TestCase):
+    """F2 — degraded(spctl 실평가 불능)는 기본 모드에서 판정 불가(exit 2)로 폐쇄된다.
+    주입점 CYS_GATE_FORCE_DEGRADED=1 은 degraded **방향으로만** 강제한다(full 을 강제하는
+    주입점은 우회 벡터라 없다)."""
+
+    def _mini_app(self, root):
+        pkg = os.path.join(root, "Fake.app", "Contents", "Resources", "runtime",
+                           "python", "lib", "pkg")
+        cache = os.path.join(pkg, "__pycache__")
+        os.makedirs(cache)
+        with open(os.path.join(pkg, "a.py"), "w") as fh:
+            fh.write("x = 1\n")
+        for opt in ("", ".opt-1", ".opt-2"):
+            with open(os.path.join(cache, "a.cpython-312%s.pyc" % opt), "wb") as fh:
+                fh.write(b"\x6f\x0d\x0d\x0a" + struct.pack("<I", 1) + b"\x00" * 8)
+        return os.path.join(root, "Fake.app")
+
+    def test_18_degraded_closes_exit2_with_gate_mode_line(self):
+        env = dict(os.environ, CYS_GATE_FORCE_DEGRADED="1")
+        p = subprocess.run(["bash", _GATE_SH, "/nonexistent-target.dmg"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        # 폐쇄 직전 GATE_MODE=degraded 를 stdout 마지막 줄로 출력한다(헤더 GATE_MODE 계약).
+        lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+        self.assertEqual(lines[-1], "GATE_MODE=degraded", p.stdout)
+        # 폐쇄는 대상 평가 이전이다 — 개별 검사(①-⑤)가 하나도 돌지 않아야 한다.
+        self.assertNotIn("── 대상 앱", p.stdout)
+
+    def test_19_diagnose_flag_keeps_degraded_open_with_loud_notice(self):
+        """진단 옵트인은 폐쇄를 열되(판정 도달 exit 0·1) LOUD 고지를 남긴다 — 가짜 앱은
+        codesign 에서 FAIL 이므로 판정 도달 = exit 1 + GATE_MODE=degraded 마지막 줄."""
+        with tempfile.TemporaryDirectory() as td:
+            app = self._mini_app(td)
+            env = dict(os.environ, CYS_GATE_FORCE_DEGRADED="1")
+            p = subprocess.run(["bash", _GATE_SH, "--diagnose-degraded-ok", app],
+                               capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)   # 판정 도달(폐쇄 아님)
+        lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+        self.assertEqual(lines[-1], "GATE_MODE=degraded", p.stdout)
+        loud = [ln for ln in p.stdout.splitlines() if ln.startswith("!!!!")]
+        self.assertGreaterEqual(len(loud), 2, "LOUD 고지 2줄 계약 위반: %r" % p.stdout)
 
 
 if __name__ == "__main__":
