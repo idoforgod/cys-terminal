@@ -646,8 +646,12 @@ def resolve_save_files(role, row, packdir=None, runner=run):
     rd, how = node_round_dir(cwd)
     fallback = rd is None
     if fallback:
-        rd = os.path.join(PROJECT, "_round")   # 해석 실패 시에만 — 원장에 fallback 기록
-        how = "project-fallback"
+        # [R2 유령 lease 수리·안A] 해석 실패 폴백 = 팩 정본(실존 출하 디렉터리) — 유령 경로 금지.
+        #   구 폴백 PROJECT/_round 는 PROJECT 최종 폴백이 $HOME 인데 ~/_round 는 자동 생성이
+        #   없어 '존재 불가능 경로'를 lease 에 넣었고, ALL-match 검증자(javis_cycle_verifier)가
+        #   부재 파일 1건에 V_DENY_AMBIGUOUS → master 전자동 사이클이 OS 무관 매번 deny 됐다.
+        rd = os.path.join(packdir or pack_dir(), "round")   # 해석 실패 시에만 — 원장에 fallback 기록
+        how = "pack-fallback"
     files = ([os.path.join(rd, "SESSION_STATE.md"), todo] if role == "master" else [todo])
     return {"files": files, "round_dir": rd, "how": how, "cwd": cwd,
             "cwd_source": cwd_src, "fallback": fallback}
@@ -1064,10 +1068,10 @@ def cmd_tick(args):
                       "fallback": sfr["fallback"]},
                   "gates": [{"n": x["id"], "ok": x["ok"]} for x in verdict["gates"]]}
         if sfr["fallback"]:
-            # 해석 실패 = 전역 PROJECT 폴백. 조용히 넘어가면 R2 BLOCK 이 재발하므로 원장에 못 박는다.
+            # 해석 실패 = 팩 정본(pack/round) 폴백. 조용히 넘어가면 R2 BLOCK 이 재발하므로 원장에 못 박는다.
             log_append({"ts": now_ts, "cycle_id": cid, "phase": "skip", "role": role,
                         "surface": surface,
-                        "detail": {"warn": "save-file 경로 해석 실패 — PROJECT 폴백 사용",
+                        "detail": {"warn": "save-file 경로 해석 실패 — pack 폴백 사용(pack/round 정본)",
                                    "save_files_origin": detail["save_files_origin"]}})
         if mode() == MODE_SHADOW:
             # [R2-A] shadow 증거: 실제로 넘어갈 argv 를 그대로 원장에 남긴다(음성대조용).
@@ -1986,14 +1990,19 @@ def cmd_self_test(args):
         return {"role": role, "surface_id": sid, "live_cwd": cwd, "cwd": cwd,
                 "surface_ref": "surface:%d" % sid}
 
-    # 7-a) node_round_dir — save-state.sh 동형 상향탐색 (실디렉터리 대조)
-    HOME = os.path.expanduser("~")
-    rd, how = node_round_dir(HOME)
-    t.check("cwd=$HOME → 홈 _round 정본 (save-state.sh 동형)",
-            rd == os.path.join(HOME, "_round") and how == "cwd-ascend", "%s/%s" % (rd, how))
-    rd2, how2 = node_round_dir(os.path.join(HOME, "Desktop", "CYSjavis"))
+    # 7-a) node_round_dir — save-state.sh 동형 상향탐색 (tmpdir 픽스처 실디렉터리 대조)
+    #   [픽스처] 실HOME(~/_round 존재 여부)에 걸면 기계마다 PASS/FAIL 이 갈린다(환경 의존
+    #   FAIL 2건의 원천) — tmpd 안에 가짜 홈·프로젝트를 만들어 결정론화한다. 로직 무변경.
+    FHOME = os.path.join(tmpd, "home")
+    FPROJ = os.path.join(FHOME, "Desktop", "CYSjavis")
+    os.makedirs(os.path.join(FHOME, "_round"))
+    os.makedirs(os.path.join(FPROJ, "_round"))
+    rd, how = node_round_dir(FHOME)
+    t.check("cwd=홈 → 홈 _round 정본 (save-state.sh 동형)",
+            rd == os.path.join(FHOME, "_round") and how == "cwd-ascend", "%s/%s" % (rd, how))
+    rd2, how2 = node_round_dir(FPROJ)
     t.check("cwd=프로젝트 → 프로젝트 _round",
-            rd2 == os.path.join(HOME, "Desktop", "CYSjavis", "_round") and how2 == "cwd-ascend",
+            rd2 == os.path.join(FPROJ, "_round") and how2 == "cwd-ascend",
             str(rd2))
     deep = os.path.join(tmpd, "a", "b", "c")
     os.makedirs(os.path.join(tmpd, "a", "_round"))
@@ -2013,37 +2022,60 @@ def cmd_self_test(args):
     t.check("ACTIVE_PROJECT 폴백 동작",
             rd6 == os.path.join(tmpd, "a", "_round") and how6 == "active-project", str(rd6))
 
-    # 7-b) ★R2 BLOCK 회귀 핀 — master cwd=$HOME 이면 홈 정본이 나와야 한다
-    sfr_m = resolve_save_files("master", norow("master", HOME, 198), packdir="/PK")
-    t.check("★[R2-A] master(cwd=$HOME) save-file = 홈 _round 정본",
-            sfr_m["files"] == [os.path.join(HOME, "_round", "SESSION_STATE.md"),
+    # 7-b) ★R2 BLOCK 회귀 핀 — master cwd=홈이면 홈 정본이 나와야 한다
+    #   (핀 의도: 실존 _round 를 cwd-ascend 로 찾는 경로 — 폴백과 무관. 대상만 픽스처 홈.)
+    sfr_m = resolve_save_files("master", norow("master", FHOME, 198), packdir="/PK")
+    t.check("★[R2-A] master(cwd=홈) save-file = 홈 _round 정본",
+            sfr_m["files"] == [os.path.join(FHOME, "_round", "SESSION_STATE.md"),
                                "/PK/round/MASTER_TODO.md"], str(sfr_m["files"]))
     t.check("★[R2-A] 전역 PROJECT 에 결박되지 않음",
-            os.path.join(PROJECT, "_round", "SESSION_STATE.md") not in sfr_m["files"]
-            or PROJECT == HOME, str(sfr_m["files"]))
+            os.path.join(PROJECT, "_round", "SESSION_STATE.md") not in sfr_m["files"],
+            str(sfr_m["files"]))
     t.check("파생 출처가 기록됨(cwd·round_dir·how·fallback)",
-            sfr_m["cwd"] == HOME and sfr_m["how"] == "cwd-ascend"
+            sfr_m["cwd"] == FHOME and sfr_m["how"] == "cwd-ascend"
             and sfr_m["fallback"] is False and sfr_m["cwd_source"] == "status.live_cwd")
-    sfr_mp = resolve_save_files("master", norow("master", os.path.join(HOME, "Desktop", "CYSjavis"),
-                                                198), packdir="/PK")
+    sfr_mp = resolve_save_files("master", norow("master", FPROJ, 198), packdir="/PK")
     t.check("master(cwd=프로젝트) 는 프로젝트 정본",
-            sfr_mp["files"][0] == os.path.join(HOME, "Desktop", "CYSjavis", "_round",
-                                               "SESSION_STATE.md"), str(sfr_mp["files"]))
-    sfr_w = resolve_save_files("worker", norow("worker", os.path.join(HOME, "Desktop", "CYSjavis")),
-                               packdir="/PK")
+            sfr_mp["files"][0] == os.path.join(FPROJ, "_round", "SESSION_STATE.md"),
+            str(sfr_mp["files"]))
+    sfr_w = resolve_save_files("worker", norow("worker", FPROJ), packdir="/PK")
     t.check("worker save-file 단독 WORKER_TODO.md(round_dir 무관)",
             sfr_w["files"] == ["/PK/round/WORKER_TODO.md"], str(sfr_w["files"]))
     t.check("reviewer-codex → REVIEWER_CODEX_TODO.md",
-            resolve_save_files("reviewer-codex", norow("reviewer-codex", HOME),
+            resolve_save_files("reviewer-codex", norow("reviewer-codex", FHOME),
                                packdir="/PK")["files"] == ["/PK/round/REVIEWER_CODEX_TODO.md"])
 
-    # 7-c) cwd 해석 실패 → PROJECT 폴백 + fallback 플래그
-    sfr_fb = resolve_save_files("master", {"role": "master", "surface_id": None},
-                                packdir="/PK", runner=lambda *a, **k: (1, "", "no daemon"))
-    t.check("cwd 해석 실패 → PROJECT 폴백 + fallback=True",
-            sfr_fb["fallback"] is True
-            and sfr_fb["files"][0] == os.path.join(PROJECT, "_round", "SESSION_STATE.md"),
+    # 7-c) cwd 해석 실패 → 팩 정본(pack/round) 폴백 + fallback 플래그 [R2 유령 lease 수리·안A]
+    #   [픽스처] CYS_ROOT 를 _round 없는 tmpdir 로 못 박아 실HOME ACTIVE_PROJECT 폴백을
+    #   차단(해석 실패 분기의 결정론화). 팩도 round/ 실존 tmpdir — 출하 팩 골격과 동형.
+    _old_cys_root = os.environ.get("CYS_ROOT")
+    os.environ["CYS_ROOT"] = os.path.join(tmpd, "no-such-root")
+    PACKFIX = os.path.join(tmpd, "packfix")
+    os.makedirs(os.path.join(PACKFIX, "round"))
+    try:
+        sfr_fb = resolve_save_files("master", {"role": "master", "surface_id": None},
+                                    packdir=PACKFIX, runner=lambda *a, **k: (1, "", "no daemon"))
+    finally:
+        if _old_cys_root is None:
+            os.environ.pop("CYS_ROOT", None)
+        else:
+            os.environ["CYS_ROOT"] = _old_cys_root
+    t.check("cwd 해석 실패 → 팩 정본 폴백 + fallback=True + how=pack-fallback",
+            sfr_fb["fallback"] is True and sfr_fb["how"] == "pack-fallback"
+            and sfr_fb["files"] == [os.path.join(PACKFIX, "round", "SESSION_STATE.md"),
+                                    os.path.join(PACKFIX, "round", "MASTER_TODO.md")],
             str(sfr_fb))
+    # ★반유령 핀 — 폴백 files 에 '존재 불가능 경로'($HOME/_round 류 유령) 0건.
+    #   ALL-match 검증자는 부재 파일 1건이면 V_DENY_AMBIGUOUS 라, 폴백이 유령 경로를 lease 에
+    #   넣는 순간 master 전자동 사이클이 매번 deny 된다 — 전 경로의 부모 디렉터리 실존을 단정.
+    t.check("★반유령: 폴백 files 전 경로의 부모 디렉터리 실존(유령 0건)",
+            all(os.path.isdir(os.path.dirname(f)) for f in sfr_fb["files"]),
+            str(sfr_fb["files"]))
+    t.check("★반유령: 구 유령 폴백($HOME/_round·PROJECT/_round) 미등장",
+            os.path.join(os.path.expanduser("~"), "_round", "SESSION_STATE.md")
+            not in sfr_fb["files"]
+            and os.path.join(PROJECT, "_round", "SESSION_STATE.md") not in sfr_fb["files"],
+            str(sfr_fb["files"]))
 
     # 7-d) cys list 폴백 파싱
     listing = ("surface:198\trole=master\tpid=92636\texited=false\tmaster-claude · testhost\t"

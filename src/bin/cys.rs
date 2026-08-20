@@ -8483,6 +8483,26 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
     out
 }
 
+/// ★A′ — [CYCLE] 저장 지시문 생성(순수): 지시문이 안내하는 경로 = 게이트가 감시하는 경로.
+///
+/// 종전 고정 산문("~/.cys/pack/round/<역할>_TODO.md" 틸드 하드코딩 + "_round/ 또는 pack
+/// round/ 정본" 모호 안내)은 lease/게이트 실경로와 어긋날 수 있었다 — 노드가 산문을 따라
+/// **목록 밖**에 저장하면 파일 게이트·ALL-match 검증자(javis_cycle_verifier)가 deny 를
+/// 반복한다. 감시 목록(files)을 그대로 열거해 그 갈림을 원천 제거한다.
+///
+/// 재기록 지시는 목록 '전부'가 아니라 **네 역할 소관 파일**로 한정한다 — 수동 레인
+/// (--save-file 미지정 기본 탐지)의 감시 목록에는 cwd/_round 의 **타 역할** *_TODO.md 가
+/// 포함될 수 있어(todo_decl_excluded 통과분 전부 수집), '전부 재기록' 강제는 남의 역할
+/// TODO 쓰기('같은 산출물 쓰기는 단일 스레드' 규율 위반)를 유도한다. 전자동 레인의
+/// ALL-match 정합은 불변이다 — lease 는 애초에 역할 소관 파일로만 구성되기 때문이다.
+/// ② CYCLE-SAVED 마커 문장(plain 한 줄)은 종전 계약 그대로 보존한다.
+fn cycle_save_directive(files: &[String]) -> String {
+    format!(
+        "[CYCLE] 컨텍스트 순환 절차 개시. ① 아래는 저장 검증이 감시하는 파일 경로 목록이다 — 이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록 밖 경로에 저장하면 검증에 인정되지 않는다: {} ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.",
+        files.join(" · ")
+    )
+}
+
 /// 저장 게이트 1틱 판정(ANY-match) — 하나라도 `start_time` 이후 갱신됐고 해시가 baseline과
 /// 다르면 통과. 화면 마커(CYCLE-SAVED)는 참고 신호일 뿐이고 **파일 변화가 사실**이다
 /// (reward-hack·stale 마커 차단).
@@ -8656,7 +8676,8 @@ fn run_cycle_agent(
 
         // 1) 저장 지시
         eprintln!("[cycle 1/5] 저장 지시 주입 → surface:{sid} ({role_name})");
-        inject_text(sid, "[CYCLE] 컨텍스트 순환 절차 개시. 지금 즉시: ① 자기 TODO 파일(~/.cys/pack/round/<역할>_TODO.md)과 SESSION_STATE(_round/ 또는 pack round/ 정본)에 현재 작업 상태·미해결 게이트·다음 액션을 저장하라. ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.")?;
+        // ★A′: 고정 산문 대신 감시 목록(files) 실경로 열거 — 지시 경로↔게이트 경로 정합.
+        inject_text(sid, &cycle_save_directive(&files))?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         match cycle_verify_plan(force_no_verify, baseline.len()) {
@@ -15058,6 +15079,50 @@ mod tests {
             "새로 생성된 게이트 파일이 '갱신'으로 인정되지 않는다 — C2 전제가 깨졌다"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★A′ 회귀 핀: [CYCLE] 지시문은 감시 목록(files)의 실경로를 **그대로 전부** 열거해야
+    /// 한다 — 고정 산문(틸드 하드코딩 "~/.cys/pack/round/<역할>_TODO.md"·"_round/ 또는 pack
+    /// round/" 모호 안내)이 lease 실경로와 어긋나면 노드가 목록 밖에 저장해 파일 게이트·
+    /// ALL-match 검증자 deny 가 잔존한다. ② plain 한 줄 CYCLE-SAVED 마커 문장은 계약 보존.
+    #[test]
+    fn cycle_directive_enumerates_watched_paths_and_keeps_marker_contract() {
+        let files = vec![
+            "/tmp/pk/round/SESSION_STATE.md".to_string(),
+            "/tmp/pk/round/MASTER_TODO.md".to_string(),
+        ];
+        let d = cycle_save_directive(&files);
+        for f in &files {
+            assert!(d.contains(f.as_str()), "감시 경로가 지시문에서 빠졌다: {f}\n{d}");
+        }
+        assert!(d.contains("물리적으로 재기록"), "재기록 명령 문구 소실: {d}");
+        // REVISE-1: 재기록 범위는 '목록 전부'가 아니라 **역할 소관 파일**이다 — 수동 레인
+        // 기본 탐지 목록엔 타 역할 TODO가 섞일 수 있어, '전부' 강제가 되살아나면 단일 스레드
+        // 쓰기 규율 위반을 지시문이 유도한다.
+        assert!(
+            d.contains("네 역할 소관 파일"),
+            "역할 소관 한정 문구가 빠졌다: {d}"
+        );
+        assert!(
+            !d.contains("목록 **전부**"),
+            "'전부 재기록' 강제가 되살아났다(수동 레인 타 역할 TODO 재기록 유도): {d}"
+        );
+        assert!(
+            d.contains("plain 한 줄로 CYCLE-SAVED"),
+            "② CYCLE-SAVED 마커 문장 계약이 깨졌다: {d}"
+        );
+        // 구 산문 회귀 차단 — 틸드 하드코딩·모호 이중 안내가 되살아나면 정합이 다시 깨진다.
+        assert!(
+            !d.contains("~/.cys/pack/round/<역할>_TODO.md"),
+            "틸드 하드코딩 산문이 되살아났다: {d}"
+        );
+        assert!(
+            !d.contains("_round/ 또는 pack round/"),
+            "모호 이중 안내 산문이 되살아났다: {d}"
+        );
+        // 단일 파일 목록도 그대로 열거된다(워커 cycle).
+        let one = vec!["/w/pack/round/WORKER_TODO.md".to_string()];
+        assert!(cycle_save_directive(&one).contains("/w/pack/round/WORKER_TODO.md"));
     }
 
     // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
