@@ -575,6 +575,32 @@ def _utf8_env(extra=None):
     return env
 
 
+def heartbeat_verdict(mtime, now_ts, max_age):
+    """[C79·R6 W0-5] 검증자 heartbeat 신선도 판정(순수) — (state, age).
+
+    state ∈ absent(파일 부재) | fresh(age ≤ max_age) | stale. 부등호는 autopilot 게이트6
+    (`(now_ts - hb) <= HEARTBEAT_MAX_AGE`)과 동일하게 ≤ 다(경계 판정 드리프트 금지).
+    미래 mtime(시계 스큐)은 age<0 ≤ max_age 로 fresh — 방금 touch 된 파일을 노화로
+    오판해 불필요한 재기동을 트리거하지 않는 보수측."""
+    if mtime is None:
+        return "absent", None
+    age = now_ts - mtime
+    return ("fresh" if age <= max_age else "stale"), age
+
+
+def _cycle_autopilot_mod():
+    """javis_cycle_autopilot 형제 모듈 import — HEARTBEAT 경로·HEARTBEAT_MAX_AGE 의 SOT.
+
+    경로·수치를 여기 복제하면 autopilot 개정 때 조용히 드리프트한다 — import 가 유일한
+    무드리프트 채널이다(_SELF_DIR 이 sys.path 에 있어 pack/bin·레포 양쪽에서 성립).
+    import 는 상수 정의·경로 해석뿐(파일 쓰기 0 — 부작용 없음). 실패=None(C79 가 WARN)."""
+    try:
+        import javis_cycle_autopilot as _ap
+        return _ap
+    except Exception:  # noqa: BLE001 — 팩 스큐·부분 배포는 체크를 죽이지 않는다
+        return None
+
+
 def is_dept_pack():
     """부서/CEO pack 컨텍스트인가 — pack_dir이 기본(~/.cys/pack)이 아니면 부서/CEO 데몬이다.
     부서장·CEO의 MASTER_DIRECTIVE는 표준 핀이 없는 게 정상이라 C03 표준 핀 검사를 면제한다
@@ -4983,6 +5009,56 @@ class Preflight:
         self.add(cid, PASS, "%s self-test OK (명명 대조·진위 게이트·쿨다운/차단기·seq/로테이션·"
                             "커서·close 시퀀스)" % p)
 
+    # ── C79 cycle-verifier heartbeat (R6 W0-5) — 전 등급 WARN 티어(READY 미차단) ──
+    # ★FAIL 금지 근거: 검증자 pane 은 전자동 사이클 **live** 단계의 전제(autopilot 게이트6)
+    #   일 뿐, S0 shadow 단계 전에는 미필수다 — 부트 비치명. 부재·노화·수리 실패 전부
+    #   WARN 강등(C78 radio 의 'WARN(READY 미차단)' 규율 동형). cid 는 C79(결번 재사용 금지).
+    #   report 모드에선 읽기 전용(mtime 조회만 — 병렬 워커 안전) · --fix 에서만 subprocess.
+    def c79_cycle_verifier_heartbeat(self):
+        cid = "C79.cycle-verifier-heartbeat"
+        if self.skipped(cid):
+            return
+        ap = _cycle_autopilot_mod()
+        if ap is None:
+            self.add(cid, WARN, "javis_cycle_autopilot import 불가(팩 스큐?) — heartbeat 판정 "
+                                "보류(READY 미차단) · `cys init-pack` 으로 팩 정합 복구")
+            return
+        try:
+            hb_mtime = os.path.getmtime(ap.HEARTBEAT)
+        except OSError:
+            hb_mtime = None
+        state, age = heartbeat_verdict(hb_mtime, time.time(), ap.HEARTBEAT_MAX_AGE)
+        if state == "fresh":
+            self.add(cid, PASS, "verifier heartbeat 신선(%.1fs ≤ %.0fs) — %s"
+                     % (age, ap.HEARTBEAT_MAX_AGE, ap.HEARTBEAT))
+            return
+        why = ("verifier heartbeat 부재(%s)" % ap.HEARTBEAT) if state == "absent" else \
+            "verifier heartbeat 노화(%.1fs > %.0fs)" % (age, ap.HEARTBEAT_MAX_AGE)
+        if self.fix:
+            script = os.path.abspath(ap.__file__)
+            try:
+                # --ensure = 멱등 게이트(P0-1): 이 서브프로세스 안에서 실재+신선을 재판정하고
+                # 건강하면 no-op — preflight 와 워치독 잡이 겹쳐 떠도 중복 pane 0.
+                r = subprocess.run([sys.executable, script, "bootstrap-verifier", "--ensure"],
+                                   capture_output=True, text=True, timeout=60, env=_utf8_env())
+            except Exception as e:  # noqa: BLE001
+                self.add(cid, WARN, "%s — bootstrap-verifier --ensure 실행 불가(%s) · "
+                                    "WARN 강등(부트 비치명 — S0 shadow 전 미필수·FAIL 금지)"
+                         % (why, e))
+                return
+            if r.returncode == 0:
+                self.add(cid, FIXED, "%s → bootstrap-verifier --ensure 수행(heartbeat 는 워처 "
+                                     "기동 후 touch 주기 %.0fs 내 생성)"
+                         % (why, ap.HEARTBEAT_TOUCH_SECS))
+            else:
+                tail = ((r.stdout or "") + (r.stderr or "")).strip()[-200:]
+                self.add(cid, WARN, "%s — --ensure 실패(exit %d): %s · WARN 강등(부트 비치명 — "
+                                    "검증자는 S0 shadow 전 미필수·FAIL 금지)"
+                         % (why, r.returncode, tail))
+            return
+        self.add(cid, WARN, "%s — 수리: javis_cycle_autopilot.py bootstrap-verifier --ensure "
+                            "또는 --fix (WARN 티어 — S0 shadow 전 미필수)" % why)
+
     def c76_app_seal(self):
         cid = "C76.app-seal"
         if self.skipped(cid):
@@ -5088,6 +5164,8 @@ class Preflight:
             # C78(2026-08-13 RADIO_SPEC_v4) — radio 도구 존재 + self-test. WARN-only.
             # 마지막 고정 슬롯(C62·C68) **앞**에 둔다(§5-4 배선 규율).
             self.c78_radio,
+            # C79(R6 W0-5) — cycle-verifier heartbeat 신선도. WARN-only(S0 shadow 전 미필수).
+            self.c79_cycle_verifier_heartbeat,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
@@ -5127,7 +5205,50 @@ class Preflight:
         return buf
 
 
+def _self_test():
+    """--self-test 가로채기(팩 bin 도구 관례 — _check_bin_tool 이 부르는 그 형태와 동형).
+
+    범위는 **순수 판정 핀만**이다(네트워크·데몬·subprocess 0): C79 heartbeat 판정 함수 +
+    WARN 강등·배선의 정적 계약. 전체 체크 배터리는 self-test 대상이 아니다 — 그것은
+    preflight 실행 자체가 검증한다(부작용 있는 체크를 여기서 돌리면 '관찰이 상태를
+    바꾸는' PHIL-04 위반이 된다)."""
+    import inspect
+    fails, total = [], [0]
+
+    def check(name, cond):
+        total[0] += 1
+        print("  %s  %s" % ("PASS" if cond else "FAIL", name))
+        if not cond:
+            fails.append(name)
+
+    print("== javis_preflight.py self-test ==")
+    now = 1000000.0
+    check("heartbeat 부재 → absent", heartbeat_verdict(None, now, 90.0) == ("absent", None))
+    check("age 10s → fresh", heartbeat_verdict(now - 10, now, 90.0) == ("fresh", 10.0))
+    check("경계 age==max_age → fresh(게이트6 부등호 ≤ 동일)",
+          heartbeat_verdict(now - 90, now, 90.0)[0] == "fresh")
+    check("age 200s → stale", heartbeat_verdict(now - 200, now, 90.0)[0] == "stale")
+    check("미래 mtime(시계 스큐) → fresh(보수측)",
+          heartbeat_verdict(now + 5, now, 90.0)[0] == "fresh")
+    src = inspect.getsource(Preflight.c79_cycle_verifier_heartbeat)
+    check("C79 는 FAIL 을 내지 않는다(WARN 강등 계약 — 부트 비치명)",
+          "self.add(cid, FAIL" not in src)
+    check("C79 --fix 는 bootstrap-verifier --ensure(멱등)로 수리",
+          '"bootstrap-verifier", "--ensure"' in src)
+    check("C79 report 모드는 읽기 전용(fix 분기 밖 subprocess 없음)",
+          src.index("if self.fix:") < src.index("subprocess.run("))
+    run_src = inspect.getsource(Preflight.run)
+    check("C79 run() 배선(마지막 고정 슬롯 C62 앞)",
+          "c79_cycle_verifier_heartbeat" in run_src
+          and run_src.index("c79_cycle_verifier_heartbeat") < run_src.index("c62_pack_heal_ledger"))
+    print("결과: PASS %d / FAIL %d" % (total[0] - len(fails), len(fails)))
+    return 1 if fails else 0
+
+
 def main():
+    # --self-test 가로채기 — argparse 앞(팩 bin 도구 관례: 인자 스키마와 독립인 자기검증 채널).
+    if "--self-test" in sys.argv[1:]:
+        return _self_test()
     ap = argparse.ArgumentParser(description="CYSJavis 결정론 부트 프리플라이트")
     ap.add_argument("--fix", action="store_true", help="수리 가능한 항목 자동 수리")
     # OPP-17: --fix 의 시스템 변경을 단일 Mutation 게이트로 수렴.

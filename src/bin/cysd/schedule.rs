@@ -88,7 +88,8 @@ pub fn schedule_path() -> PathBuf {
 }
 
 /// ★B2-1(W3): built-in 잡 정의 버전. 잡 내용이 바뀌면 올린다 — 부트 ensure 가 구버전 항목을 갱신하는 기준.
-const BUILTIN_JOBS_VERSION: u64 = 1;
+/// v2: R6 W0-4/W0-5 — cycle 전자동 잡 2종(cycle-autopilot-tick·cycle-verifier-watchdog) 추가.
+const BUILTIN_JOBS_VERSION: u64 = 2;
 
 /// built-in 잡 정의(phoenix 인프라 + learn 학습 루프) — 팩 schedule.json 배달이 아니라 코드가 소유한다
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
@@ -139,12 +140,47 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "learn",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // ── (R6 W0-4) cycle 전자동 틱 — javis_cycle_autopilot.py tick 매분 구동 ──────────
+        // ★action="command" 핀(크리틱 B3 ①): 이 잡을 push 로 만들면 매분 master stdin 에
+        //   기계 문안이 꽂힌다(폭주 — 라운드1 홍수 결함군 재생산). command 레인(fire_command)
+        //   은 stdin 주입 0 이고, R-CLI-4 정확일치 게이트는 text_command(push 레인) 전용이라
+        //   command 레인과 충돌하지 않는다 — 선례: pack seed 의 owner-progress-gate-5min
+        //   (GUIDE-fullauto-cycle §3 배선안과 동일 레인).
+        // ★모드/역할은 STATE_DIR/mode·roles **파일 채널**(javis_cycle_autopilot.mode()/roles()):
+        //   command 문자열에 CYS_AUTOPILOT_MODE=live 접두를 심으면, 이 잡은 `_builtin` 마커
+        //   잡이라 BUILTIN_JOBS_VERSION 범프 때 apply_builtin_jobs 가 코드 정의로 통째 교체 —
+        //   live 가 shadow 로 **무언 회귀**한다(크리틱 B3 ②). 파일 채널은 잡 문자열과 독립이라
+        //   버전 범프에 살아남는다.
+        // ★shadow 기본이라 이 배선 자체는 무해 — tick 은 would_fire 를 원장에 기록만 하고
+        //   아무것도 발화하지 않는다(live 승격은 운영자의 STATE_DIR/mode 파일이 별도 수행).
+        //   tick 은 정상 skip 도 exit 0([v2.1 ③] 계약)이라 `; exit 0` 꼬리 불요 — 비0 은
+        //   진짜 내부 오류뿐이고 그것만 schedule.error 로 표면화되는 것이 의도다.
+        json!({
+            "id": "cycle-autopilot-tick",
+            "every_minutes": 1,
+            "action": "command",
+            "command": "CYS_PROJECT_ROOT=\"${CYS_PROJECT_ROOT:-$HOME}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\" tick",
+            "_builtin": "cycle",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+        // ── (R6 W0-5) 검증자 워치독 — bootstrap-verifier --ensure 10분 주기 ────────────
+        // --ensure 는 멱등(P0-1): 검증자 surface 실재 + heartbeat 신선이면 no-op exit 0 —
+        // 건강 상태에서 중복 pane 생성 0. 죽은/부재 워처만 현행 기동 로직으로 재기동한다.
+        // action="command" 이유·모드 파일 채널·shadow 무해성은 위 tick 잡 주석과 동일.
+        json!({
+            "id": "cycle-verifier-watchdog",
+            "every_minutes": 10,
+            "action": "command",
+            "command": "CYS_PROJECT_ROOT=\"${CYS_PROJECT_ROOT:-$HOME}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\" bootstrap-verifier --ensure",
+            "_builtin": "cycle",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
     ]
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
-///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn") → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle") → 버전 상이 시 교체(갱신)·동버전 무접촉
 ///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
 /// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
 fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
@@ -163,7 +199,7 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
             Some(pos) => {
                 // ★codex W3 major: built-in 마커(_builtin)가 코드 정의(bj)의 마커와 일치하는 항목만
                 //   우리 소유 → 버전 갱신. 마커 없는/다른 동명 항목은 사용자가 그 id 를 선점한 것
-                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프)
+                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프·"cycle"=전자동 사이클)
                 let want_marker = bj.get("_builtin").and_then(|v| v.as_str());
                 let is_ours = want_marker.is_some()
                     && jobs[pos].get("_builtin").and_then(|v| v.as_str()) == want_marker;
@@ -1243,7 +1279,7 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 4개(phoenix2 + learn2) 생성 → changed=true.
+        // 1차: built-in 6개(phoenix2 + learn2 + cycle2) 생성 → changed=true.
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
@@ -1253,9 +1289,14 @@ mod tests {
             ids.contains(&"learn-ttl-audit") && ids.contains(&"fleet-digest"),
             "learn gaps C12③ 잡 2종 생성"
         );
+        assert!(
+            ids.contains(&"cycle-autopilot-tick") && ids.contains(&"cycle-verifier-watchdog"),
+            "R6 W0-4/W0-5 cycle 잡 2종 생성"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 5, "사용자1 + built-in4");
-        // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080).
+        assert_eq!(jobs.len(), 7, "사용자1 + built-in6");
+        // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080),
+        // cycle tick=매분(1), verifier watchdog=10분(10).
         let period = |id: &str| {
             jobs.iter()
                 .find(|j| j["id"].as_str() == Some(id))
@@ -1265,6 +1306,21 @@ mod tests {
         assert_eq!(period("phoenix-drill-weekly"), Some(10080), "drill 7일");
         assert_eq!(period("learn-ttl-audit"), Some(1440), "learn audit 일 1회");
         assert_eq!(period("fleet-digest"), Some(10080), "fleet digest 주 1회");
+        assert_eq!(period("cycle-autopilot-tick"), Some(1), "cycle tick 매분");
+        assert_eq!(period("cycle-verifier-watchdog"), Some(10), "verifier watchdog 10분");
+        // ★크리틱 B3 ① 회귀 핀: cycle 잡 2종은 push 가 아니라 command 레인이어야 한다
+        //   (push 면 매분 master stdin 주입 폭주 + R-CLI-4 정확일치 게이트와 충돌).
+        for id in ["cycle-autopilot-tick", "cycle-verifier-watchdog"] {
+            let j = jobs.iter().find(|j| j["id"].as_str() == Some(id)).unwrap();
+            assert_eq!(j["action"].as_str(), Some("command"), "{id} 는 command 레인 핀");
+            assert!(j.get("to").is_none() && j.get("text").is_none() && j.get("text_command").is_none(),
+                "{id} 는 push 계열 필드(to/text/text_command)를 갖지 않는다");
+            // ★크리틱 B3 ② 회귀 핀: live 승격을 잡 문자열(env 접두)에 심지 않는다 —
+            //   버전 범프 때 코드 정의 교체로 shadow 무언 회귀하는 채널이기 때문.
+            let cmd = j["command"].as_str().unwrap();
+            assert!(!cmd.contains("CYS_AUTOPILOT_MODE"),
+                "{id} command 에 모드 env 접두 금지(파일 채널 STATE_DIR/mode 가 정본)");
+        }
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
         let (c2, _) = apply_builtin_jobs(&mut jobs);
@@ -1274,7 +1330,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 5, "중복 없이 5개 유지");
+        assert_eq!(jobs.len(), 7, "중복 없이 7개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {

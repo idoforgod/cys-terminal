@@ -540,14 +540,44 @@ def ctx_threshold(role, packdir=None):
     return 60
 
 
-def mode():
-    m = os.environ.get("CYS_AUTOPILOT_MODE", "").strip().lower() or MODE_SHADOW
+def _knob_file(name, state_dir=None):
+    """STATE_DIR 노브 파일 첫 줄(strip) — 부재·손상(비UTF8·빈 값)=None (fail-safe 입력층)."""
+    try:
+        with open(os.path.join(state_dir or STATE_DIR, name), "r", encoding="utf-8") as f:
+            v = f.readline().strip()
+        return v or None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def mode(state_dir=None):
+    """실행 모드 shadow|live — env 우선 → STATE_DIR/mode 파일(한 줄) → 부재·손상=shadow.
+
+    ★live 승격이 **파일 채널**인 이유(크리틱 B3 — builtin 잡 무언 회귀 차단):
+      틱 잡은 schedule.rs builtin_jobs 의 `_builtin` 마커 잡이다. 잡 command 문자열의
+      env 접두(CYS_AUTOPILOT_MODE=live …)로 승격하면, BUILTIN_JOBS_VERSION 범프 때
+      apply_builtin_jobs(schedule.rs:186-236 계약)가 그 잡을 **코드 정의로 통째 교체**해
+      live 가 shadow 로 **무언 회귀**한다. STATE_DIR/mode 파일은 잡 문자열과 독립이라
+      버전 범프에 살아남는다. 승격 = `echo live > STATE_DIR/mode` · 강등 = 파일 삭제.
+      env 는 여전히 우선한다(테스트·수동 오버라이드 경로 보존).
+    부재·손상 = shadow (오판이 나도 무발화 쪽으로 접히는 fail-safe).
+    """
+    m = os.environ.get("CYS_AUTOPILOT_MODE", "").strip().lower()
+    if not m:
+        m = (_knob_file("mode", state_dir) or "").lower()
     return m if m in (MODE_SHADOW, MODE_LIVE) else MODE_SHADOW
 
 
-def roles():
-    raw = os.environ.get("CYS_AUTOPILOT_ROLES", "").strip() or "worker"
-    return [r.strip() for r in raw.split(",") if r.strip()]
+def roles(state_dir=None):
+    """대상 역할 — env 우선 → STATE_DIR/roles 파일(한 줄·콤마 구분) → 부재·손상=worker.
+
+    mode() 와 동일 패턴(크리틱 B3 — 잡 문자열 밖의 노브 채널). 전량 공백·손상은
+    ["worker"] 로 접는다(빈 대상 목록 = 틱 무동작 침묵을 기본값으로 치유).
+    """
+    raw = os.environ.get("CYS_AUTOPILOT_ROLES", "").strip()
+    if not raw:
+        raw = _knob_file("roles", state_dir) or "worker"
+    return [r.strip() for r in raw.split(",") if r.strip()] or ["worker"]
 
 
 def idle_min(role):
@@ -1075,6 +1105,10 @@ def cmd_tick(args):
             return EXIT_OK
         # 집행자 사망 — phase 로 인계 판정 [v2.1 ④]
         ph = lease.get("phase")
+        # [P0-2] 집행자가 죽었으면 그 자식 cycle-agent 의 quiesce-off 도 보장이 없다 —
+        #   인계 종결 전에 잔존 해제(멱등·fail-soft — 살아있는 고아 cycle-agent 가 나중에
+        #   자기 off 를 다시 쳐도 같은 종착 상태).
+        release_quiesce(lease.get("surface"), cid, role, "takeover(dead executor, phase=%s)" % ph)
         if ph in ("executor_exited", "fired"):
             # fired 상태에서 집행자가 죽었어도 clear 가 났는지는 사후검증만이 안다 → 인계.
             verdict = post_verify(role, cid, lease, takeover=True)
@@ -1353,6 +1387,32 @@ def _finalize(cycle_id, role, surface, phase, detail):
             save_state(st)
 
 
+def release_quiesce(surface, cycle_id, role, reason, runner=run, log_path=None):
+    """[P0-2] abort/takeover 로 사이클이 접힐 때 대상 surface 의 quiescing 잔존을 해제한다.
+
+    quiesce on/off 의 정상 소유자는 `cys cycle-agent` 다(cys.rs set_surface_quiescing —
+    clear 직전 on · resume 후 **실패해도** off). 그 프로세스가 in-flight kill-switch 의
+    SIGTERM 이나 집행자 사망(takeover)으로 중간에 접히면 off 가 영영 오지 않아 대상
+    surface 가 quiescing(채널 inbox 주입 보류)으로 남는 잔존 창이 열린다 — 여기서 봉합한다.
+
+    ·이중 해제는 무해(멱등): `cys quiesce --off` = surface.quiesce {on:false} 재기록뿐이다
+      (cys.rs:2224 실측 — 상태 플래그 셋이지 토글이 아니다). cycle-agent 가 이미 off 를
+      쳤어도, 애초에 on 을 못 쳤어도 같은 종착 상태다.
+    ·fail-soft: 해제 실패가 사이클 종결(_finalize)을 막지 않는다 — 원장 1줄만 남긴다.
+    반환 (ok, why) — 호출부는 결과로 분기하지 않는다(기록용).
+    """
+    if not surface:
+        return False, "surface 미상"
+    rc, _o, err = runner([CYS, "quiesce", "--surface", str(surface), "--off"])
+    ok = rc == 0
+    log_append({"ts": time.time(), "cycle_id": cycle_id, "phase": "quiesce_release",
+                "role": role, "surface": surface,
+                "detail": {"ok": ok, "reason": reason,
+                           "err": (err or "").strip()[:160] if not ok else ""}},
+               path=log_path)
+    return ok, "" if ok else "quiesce --off rc=%d" % rc
+
+
 def cmd_execute(args):
     cid, role = args.cycle_id, args.role
     with _StateLock():
@@ -1446,6 +1506,8 @@ def cmd_execute(args):
     rc = child.poll()
 
     if aborted is not None:
+        # [P0-2] SIGTERM 으로 접힌 cycle-agent 는 자기 quiesce-off 를 못 쳤을 수 있다 — 봉합.
+        release_quiesce(surface, cid, role, "in-flight kill-switch abort")
         _finalize(cid, role, surface, "failed",
                   {"reason": "in-flight kill-switch: %s" % aborted, "child_rc": rc,
                    "tail": tail[-400:], "residual_window": RESIDUAL_WINDOW_NOTE})
@@ -1740,13 +1802,51 @@ def cmd_status(args):
     return EXIT_OK
 
 
+def ensure_verifier_noop(status, heartbeat_mtime, now_ts):
+    """[P0-1] bootstrap-verifier --ensure 판정(순수·조회 주입식) — (noop, why).
+
+    noop = ①cycle-verifier 역할 surface 실재(살아있는 row · surface_row 계약 그대로)
+           **그리고** ②heartbeat 신선(HEARTBEAT_MAX_AGE 이내) — 둘 다 참일 때만.
+    판정 불능(status=None·heartbeat 부재)은 '기동 필요' 쪽으로 접힌다: noop 오판은
+    죽은 검증자를 방치(게이트6 영구 skip)하고, 기동 오판의 중복 pane 위험은 건강 상태
+    에선 이 게이트가, 데몬 불능 상태에선 new-surface 실패가 각각 차단한다.
+    """
+    row = surface_row(status, VERIFIER_ROLE)
+    if row is None:
+        return False, "verifier surface 부재"
+    if heartbeat_mtime is None:
+        return False, "heartbeat 부재"
+    age = now_ts - heartbeat_mtime
+    if age > HEARTBEAT_MAX_AGE:
+        return False, "heartbeat 노화(%.1fs > %.0fs)" % (age, HEARTBEAT_MAX_AGE)
+    return True, "surface %s 실재 + heartbeat %.1fs" % (row.get("surface_ref"), age)
+
+
 def cmd_bootstrap_verifier(args):
     """검증자 전용 pane 신설 + 워처 포그라운드 기동 (게이트6 전제).
 
     ★pane 안에서 포그라운드로 돌려야 한다 — detach/데몬 spawn 은 feed.reply 가
       self_approval_denied 로 fail-closed 된다(cysd state.rs:1046-1074 실측: 외부 프로세스인데
-      어떤 surface 에도 귀속되지 않으면 자기승인으로 간주).
+      어떤 surface 에도 귀속되지 않으면 자기승인으로 간주). --ensure 도 이 메커니즘을
+      바꾸지 않는다 — 기동이 필요하면 아래 현행 경로(new-surface + send + Return) 그대로다.
+
+    [P0-1] --ensure: 기동 **전** 멱등 게이트. 검증자 surface 실재 + heartbeat 신선이면
+      pane 을 만들지 않고 no-op exit 0(원장 ensure-noop 1줄) — 워치독 잡(10분 주기)이
+      건강 상태에서 중복 pane 을 만들지 않는 것이 계약이다. 미충족이면 현행 기동 로직
+      수행(죽은 워처의 옛 pane 은 회수하지 않는다 — 회수는 운영자/reaper 소관, 여기는
+      가용성 복구만).
     """
+    ensure_why = None
+    if getattr(args, "ensure", False):
+        now_ts = time.time()
+        noop, why = ensure_verifier_noop(fetch_status(), mtime_of(HEARTBEAT), now_ts)
+        if noop:
+            log_append({"ts": now_ts, "cycle_id": None, "phase": "bootstrap",
+                        "role": VERIFIER_ROLE, "surface": None,
+                        "detail": {"ensure_noop": True, "reason": why}})
+            print(json.dumps({"result": "ensure-noop", "reason": why}, ensure_ascii=False))
+            return EXIT_OK
+        ensure_why = why
     watcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_cycle_verifier.py")
     if not os.path.exists(watcher):
         print("검증자 스크립트 부재: %s" % watcher, file=sys.stderr)
@@ -1777,6 +1877,7 @@ def cmd_bootstrap_verifier(args):
     ok = rc1 == 0 and rc2 == 0
     log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap", "role": VERIFIER_ROLE,
                 "surface": ref, "detail": {"ok": ok, "cmd": cmdline,
+                                           "ensure_reason": ensure_why,
                                            "err": (e1 + e2).strip()[:200]}})
     print(json.dumps({"result": "bootstrap", "surface": ref, "ok": ok}, ensure_ascii=False))
     return EXIT_OK if ok else EXIT_ERR
@@ -2463,6 +2564,108 @@ def cmd_self_test(args):
     t.check("dispatch: rc==127 로 플랫폼을 추정하지 않음(os_name 단일 분기)",
             "127" not in _insp.getsource(count_cycle_agent).split('"""')[2])
 
+    # 14) [P0-1] bootstrap-verifier --ensure 멱등 게이트 (조회 주입식 — 데몬 0)
+    print("[14] [P0-1] bootstrap-verifier --ensure 멱등 게이트")
+    now3 = time.time()
+    vrow = {"role": VERIFIER_ROLE, "surface_id": 3, "exited": False, "surface_ref": "surface:3"}
+    stt = {"surfaces": [vrow]}
+    noop, why = ensure_verifier_noop(stt, now3 - 10, now3)
+    t.check("surface 실재 + heartbeat 신선 → no-op(중복 pane 0 계약)", noop is True, why)
+    t.check("surface 부재 → 기동 필요",
+            ensure_verifier_noop({"surfaces": []}, now3 - 10, now3)[0] is False)
+    t.check("status 조회 불능(None) → 기동 쪽(중복은 new-surface 실패가 자연 차단)",
+            ensure_verifier_noop(None, now3 - 10, now3)[0] is False)
+    t.check("exited surface 는 실재 아님(surface_row 계약 그대로)",
+            ensure_verifier_noop({"surfaces": [dict(vrow, exited=True)]},
+                                 now3 - 10, now3)[0] is False)
+    t.check("heartbeat 부재 → 기동 필요", ensure_verifier_noop(stt, None, now3)[0] is False)
+    t.check("heartbeat 노화(>HEARTBEAT_MAX_AGE) → 기동 필요",
+            ensure_verifier_noop(stt, now3 - HEARTBEAT_MAX_AGE - 1, now3)[0] is False)
+    t.check("경계 age==HEARTBEAT_MAX_AGE 는 신선(게이트6과 동일 부등호 <=)",
+            ensure_verifier_noop(stt, now3 - HEARTBEAT_MAX_AGE, now3)[0] is True)
+    bv_src = _insp.getsource(cmd_bootstrap_verifier)
+    t.check("--ensure 게이트가 new-surface 보다 선행(소스 순서 핀)",
+            bv_src.index("ensure_verifier_noop(") < bv_src.index("new_surface"))
+    t.check("--ensure 는 pane 상주 메커니즘 무접촉(new-surface+send+Return 현행 경로 보존)",
+            "send-key" in bv_src and '"Return"' in bv_src)
+
+    # 15) [P0-2] quiesce 잔존 봉합 — abort/takeover 해제(멱등·fail-soft)
+    print("[15] [P0-2] quiesce 잔존 봉합")
+    qlog = os.path.join(tmpd, "qlog.jsonl")
+    qcalls = []
+
+    def _qr_ok(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
+        qcalls.append(cmd)
+        return 0, "surface:9 quiescing=off", ""
+    okq, whyq = release_quiesce("surface:9", 42, "worker", "test-abort",
+                                runner=_qr_ok, log_path=qlog)
+    t.check("해제 성공 → (True, '')", okq is True and whyq == "")
+    t.check("argv = cys quiesce --surface <ref> --off (on 재마킹 아님)",
+            qcalls[0] == [CYS, "quiesce", "--surface", "surface:9", "--off"], str(qcalls))
+    okq2, whyq2 = release_quiesce("surface:9", 42, "worker", "test-fail",
+                                  runner=lambda *a, **k: (1, "", "boom"), log_path=qlog)
+    t.check("해제 실패 → fail-soft(False·예외 없음·사유 보존)",
+            okq2 is False and "rc=1" in whyq2)
+    okq3, _w3 = release_quiesce(None, 42, "worker", "no-surface",
+                                runner=_qr_ok, log_path=qlog)
+    t.check("surface 미상 → 호출 0회 + False", okq3 is False and len(qcalls) == 1)
+    qrecs = [json.loads(l) for l in open(qlog, encoding="utf-8").read().splitlines() if l.strip()]
+    t.check("호출당 원장 1줄 + phase=quiesce_release(실패도 기록)",
+            len(qrecs) == 2 and all(r["phase"] == "quiesce_release" for r in qrecs)
+            and qrecs[1]["detail"]["ok"] is False)
+    lvq = ledger_view([{"ts": 1, "cycle_id": 8, "phase": "armed", "role": "worker"},
+                       {"ts": 2, "cycle_id": 8, "phase": "quiesce_release", "role": "worker"},
+                       {"ts": 3, "cycle_id": 8, "phase": "failed", "role": "worker"}],
+                      "worker", 0)
+    t.check("quiesce_release 는 종결 판정을 오염하지 않음(terminal=failed 공존)",
+            not lvq["incomplete"] and lvq["last_terminal_phase"] == "failed")
+    exec_src2 = _insp.getsource(cmd_execute)
+    t.check("execute abort 경로에 release 배선(종결 레코드보다 선행)",
+            "release_quiesce(" in exec_src2
+            and exec_src2.index("release_quiesce(") < exec_src2.index('"in-flight kill-switch: %s"'))
+    tick_src2 = _insp.getsource(cmd_tick)
+    t.check("tick takeover 경로에 release 배선(사후검증 인계보다 선행)",
+            "release_quiesce(" in tick_src2
+            and tick_src2.index("release_quiesce(") < tick_src2.index("post_verify("))
+
+    # 16) [크리틱 B3] mode/roles 파일 채널 — env 우선·부재 시 STATE_DIR 파일·손상=기본값
+    print("[16] mode/roles 노브 — STATE_DIR 파일 채널(버전 범프 무언 회귀 차단)")
+    kd = os.path.join(tmpd, "knobs")
+    os.makedirs(kd)
+    _envs = {k: os.environ.pop(k, None)
+             for k in ("CYS_AUTOPILOT_MODE", "CYS_AUTOPILOT_ROLES")}
+    try:
+        t.check("env·파일 둘 다 부재 → shadow", mode(state_dir=kd) == MODE_SHADOW)
+        t.check("roles: env·파일 둘 다 부재 → [worker]", roles(state_dir=kd) == ["worker"])
+        open(os.path.join(kd, "mode"), "w", encoding="utf-8").write("live\n")
+        t.check("파일 live → live(승격 채널)", mode(state_dir=kd) == MODE_LIVE)
+        open(os.path.join(kd, "mode"), "w", encoding="utf-8").write("  LIVE \n둘째줄무시\n")
+        t.check("첫 줄 strip+소문자 정규화", mode(state_dir=kd) == MODE_LIVE)
+        open(os.path.join(kd, "mode"), "w", encoding="utf-8").write("banana\n")
+        t.check("미지 값 → shadow(fail-safe)", mode(state_dir=kd) == MODE_SHADOW)
+        open(os.path.join(kd, "mode"), "wb").write(b"\xff\xfe\x00live")
+        t.check("비UTF8 손상 → shadow(fail-safe)", mode(state_dir=kd) == MODE_SHADOW)
+        open(os.path.join(kd, "mode"), "w", encoding="utf-8").write("live\n")
+        os.environ["CYS_AUTOPILOT_MODE"] = "shadow"
+        t.check("env 우선(파일 live 여도 env shadow 가 이김)", mode(state_dir=kd) == MODE_SHADOW)
+        os.environ.pop("CYS_AUTOPILOT_MODE", None)
+        open(os.path.join(kd, "roles"), "w", encoding="utf-8").write("worker, master\n")
+        t.check("roles 파일 콤마 구분 파싱", roles(state_dir=kd) == ["worker", "master"])
+        os.environ["CYS_AUTOPILOT_ROLES"] = "cso"
+        t.check("roles env 우선", roles(state_dir=kd) == ["cso"])
+        os.environ.pop("CYS_AUTOPILOT_ROLES", None)
+        open(os.path.join(kd, "roles"), "w", encoding="utf-8").write(",, ,\n")
+        t.check("roles 전량 공백 손상 → [worker] 폴백", roles(state_dir=kd) == ["worker"])
+        mode_src = _insp.getsource(mode)
+        t.check("mode() 이유 주석 — builtin 잡 문자열 채널 금지(B3) 명기",
+                "무언 회귀" in mode_src and "apply_builtin_jobs" in mode_src)
+    finally:
+        for k, v in _envs.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:
         for n in t.fail:
@@ -2485,6 +2688,9 @@ def main(argv=None):
     rs.add_argument("--reason", required=True)
     bv = sub.add_parser("bootstrap-verifier", help="검증자 pane 신설 + 워처 기동")
     bv.add_argument("--dry-run", action="store_true")
+    bv.add_argument("--ensure", action="store_true",
+                    help="[P0-1] 멱등 게이트: surface 실재+heartbeat 신선이면 no-op exit 0 "
+                         "(워치독 잡용 — 중복 pane 0)")
     sub.add_parser("status", help="현재 모드·lease·게이트 판정(부수효과 0)")
     sub.add_parser("self-test", help="데몬 없이 픽스처 검증")
     args = ap.parse_args(argv)
