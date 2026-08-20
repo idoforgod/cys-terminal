@@ -478,12 +478,31 @@ jobs:
           #   HOME/목 바이너리 하네스라 러너 자기완결(라이브 무접촉) — 3완전 레인 동시 등재(대칭).
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
-                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
+                   test_role_bootstrap_hook; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
             CYS_PACK_DIR="$(mktemp -d)" python3 "$f"
           done
+          # ★W-CI(2026-08-21): Wave 1 부트 결정론 회귀 핀 2종 편입 — "안 도는 검체는 게이트가
+          #   아니다"(리뷰어 2기 독립 적발: 두 핀 모두 어느 CI 레인에서도 0회 실행이던 격차 봉합).
+          #   ① test_role_bootstrap_hook(위 루프 말미 · 실측 약 45s): 훅 _notify_bg 백그라운드
+          #      파이프 해제(exec fd 분리 + cys_timeout_run 유계·send 폴백)와 ≤0.3s 정렬 창,
+          #      감지기 함수+훅 통합 발화/무시 행렬의 회귀 핀. 격리 HOME·목 cys 하네스라 러너
+          #      자기완결(라이브 무접촉) · 소요의 대부분은 hang 주입 케이스의 유계 대기다
+          #      (내부 subprocess timeout 20~30s 가 상한 — 무한 hang 불가).
+          #   ② javis_detect --self-test(아래 · 실측 0.03s): 감지기 4축 억제(neg·pre·quote·
+          #      quotative)와 무구두점 후속 의문=발화 판정을 corpus 로 핀. corpus 단일 원본
+          #      (tests/fixtures/detect-corpus.json) 로딩 검증 포함 — fixture 가 있는데 불량이면
+          #      폴백 없이 hard fail(조용한 축소 실행 금지).
+          #   3완전 레인(ci-branch·release·pack-release) 동시·대칭 등재. test_role_bootstrap_hook
+          #   은 위 '팩 스위트 레인 대조' 게이트가 레인 이탈을 기계로 잡는다. self-test 는 `test_`
+          #   토큰이 아니라 그 게이트의 시야 밖이다 — 대칭 유지는 3레인 동시 수정 + 이 주석이 지킨다.
+          g="cysjavis-pack/bin/javis_detect.py"
+          [ -f "$g" ] || { echo "감지기 누락: $g (git add 누락 의심)" >&2; exit 1; }
+          echo "== javis_detect --self-test (mac) =="
+          CYS_PACK_DIR="$(mktemp -d)" python3 "$g" --self-test
 
       # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
       #   그쪽은 "같은 파일을 같게 판정하는가", 여기는 "**애초에 같은 파일을 보는가**"를 묻는다.
