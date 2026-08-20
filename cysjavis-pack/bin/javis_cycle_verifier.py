@@ -450,9 +450,24 @@ def state_socket_dir():
     snap = _snapshot_mod()
     if snap is not None:
         return snap._win_state_dir_for_socket(sock or "\\\\.\\pipe\\cys")
-    # 최후 폴백(스냅샷 모듈 소실) — state.rs 기본 데몬 규칙만 직접 접는다.
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(
+    return _fallback_state_dir(sock or "\\\\.\\pipe\\cys")
+
+
+def _fallback_state_dir(sock, localappdata=None):
+    """최후 폴백(스냅샷 모듈 소실) — state.rs **기본 데몬** 규칙만 직접 접는다.
+
+    [codex·gemini R1 교차 지적 수용 2026-08-20] 부서 파이프(cys-dept-*)까지 base/cys 로
+    접으면 부서 격리가 붕괴한다(남의 feed 를 읽고 판정). 슬러그 규칙 복제는 사본 드리프트라
+    금지(정본 = javis_state_snapshot 한 곳)이므로, 부서 파이프는 **실존 불가 센티널 경로**를
+    돌려 fail-closed 한다 — 이후 feed 조회가 비어 V_DENY_AMBIGUOUS 로 접힌다(검증자 철학
+    '모호=deny' 정합). localappdata 인자는 self-test 주입용(프로덕션은 env 경로).
+    """
+    base = localappdata or os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
+    if "cys-dept-" in sock:
+        print("⚠ [cycle-verifier] 부서 파이프 상태 dir 매핑 불가(스냅샷 모듈 소실) — "
+              "fail-closed", file=sys.stderr)
+        return os.path.join(base, "cys", ".dept-mapping-unavailable")
     return os.path.join(base, "cys")
 
 
@@ -1195,6 +1210,17 @@ def cmd_self_test(args):
         t.check("슬러그 규칙 = state.rs pipe_slug 동형",
                 snap._win_pipe_slug(pipe_default) == "cys"
                 and snap._win_pipe_slug(pipe_dept) == "cys-dept-x")
+
+    # [codex·gemini R1 수용] 최후 폴백(스냅샷 모듈 소실 시뮬) — 함수 분리(_fallback_state_dir)
+    # +인자 주입으로 폴백 분기를 직접 검증한다(모듈 로드 성공 여부와 무관).
+    lad_fb = os.path.join(tmpd, "LAD-fallback")
+    t.check("최후 폴백: 기본 파이프 → base/cys (state.rs 기본 규칙 직조립 유지)",
+            _fallback_state_dir("\\\\.\\pipe\\cys", localappdata=lad_fb)
+            == os.path.join(lad_fb, "cys"))
+    _fb_dept = _fallback_state_dir("\\\\.\\pipe\\cys-dept-x", localappdata=lad_fb)
+    t.check("최후 폴백: 부서 파이프 → 센티널 경로 fail-closed (base/cys 접힘 금지)",
+            ".dept-mapping-unavailable" in _fb_dept
+            and _fb_dept != os.path.join(lad_fb, "cys"))
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

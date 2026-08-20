@@ -931,7 +931,8 @@ def _consume_dept_ticket(path):
 # ★caller 게이트 우회 금지(설계 제약 실측): 데몬 claim_role 은 "발신 pane==대상 surface" 를
 #   커널 peer 로 강제한다 — pane 밖 프로세스(이 폴백)는 어떤 surface 의 역할도 claim 할 수 없다.
 #   그래서 폴백은 **claim-free 프리미티브만** 쓴다: cys-dept allocate(부서 데몬+CEO 승격),
-#   launch-agent(role 은 surface.create 가 등록 — GUI ▶부서장 start_dept_master 와 동일 명령),
+#   launch-agent(role 은 surface.create 가 등록 — start_dept_master 와 동일 명령 · 구 GUI
+#   ▶부서장 버튼 경로는 2026-08-20 P2로 제거, Rust 커맨드 start_dept_master 는 존치),
 #   cys boot(팀 스폰 — BOOT_PLAN 에 master 없음). 티켓은 **소비하지 않고 남긴다**: 부서장의
 #   in-pane 부트 체인(session-start 부트 브리지)이 유효 티켓으로 결손을 자가치유하는 인가가 된다
 #   (P7 게이트 의미 보존 — G11 "티켓 소비 ⟺ 실스폰"은 그 체인이 지킨다. TTL 24h 자연 만료).
@@ -962,7 +963,8 @@ def _dept_fb_load_map():
 
 
 def _dept_lane_env(sock, pack):
-    """부서 대상 명령의 env — ★G34: 소켓과 팩은 항상 쌍으로 간다(start_dept_master 와 동일 계약).
+    """부서 대상 명령의 env — ★G34: 소켓과 팩은 항상 쌍으로 간다(start_dept_master 와 동일 계약
+    — 구 GUI ▶부서장 버튼은 2026-08-20 P2로 제거, Rust 커맨드는 존치).
     ★CYS_SURFACE_ID/REF 제거: base pane 의 표적이 부서 데몬의 동번호 surface 로 오배선되는
     교차 오염 차단(다른 데몬 = 다른 id 공간)."""
     e = dict(os.environ)
@@ -1178,7 +1180,8 @@ def _dept_fallback(log, claim_out):
                         "부서 팩 미준비(%s — 데몬 자동설치 대기 초과). 부서 데몬 기동 상태를 확인하라."
                         % dept_boot_py, EXIT_BOOT, ok=None, state="dept_fallback_failed")
 
-    # D2: 부서장 기동 — GUI ▶부서장(start_dept_master)과 동일 명령. 이미 살아 있으면 생략(멱등).
+    # D2: 부서장 기동 — start_dept_master(구 GUI ▶부서장 버튼 경로 — 버튼은 2026-08-20 P2로
+    #     제거·Rust 커맨드는 존치)와 동일 명령. 이미 살아 있으면 생략(멱등).
     sref = None
     if _dept_master_alive(dept_env):
         log.step(STEP.DEPT_FB_MASTER, 0, "부서장 생존 — 기동 생략(멱등)")

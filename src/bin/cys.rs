@@ -8496,9 +8496,17 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
 /// TODO 쓰기('같은 산출물 쓰기는 단일 스레드' 규율 위반)를 유도한다. 전자동 레인의
 /// ALL-match 정합은 불변이다 — lease 는 애초에 역할 소관 파일로만 구성되기 때문이다.
 /// ② CYCLE-SAVED 마커 문장(plain 한 줄)은 종전 계약 그대로 보존한다.
-fn cycle_save_directive(files: &[String]) -> String {
+///
+/// [codex R1 수용 2026-08-20] 역할 인지형 개정 — "네 역할 소관"의 해석을 LLM 에 맡기지 않고 role 인자로 소관을 문구에 결정론 명시한다(비master 노드의 공유 SESSION_STATE 오재기록 차단).
+fn cycle_save_directive(role: &str, files: &[String]) -> String {
+    let scope = if role == "master" {
+        // master 소관 = 자기 TODO + SESSION_STATE (종전 취지 유지).
+        "이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장)."
+    } else {
+        "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율)."
+    };
     format!(
-        "[CYCLE] 컨텍스트 순환 절차 개시. ① 아래는 저장 검증이 감시하는 파일 경로 목록이다 — 이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록 밖 경로에 저장하면 검증에 인정되지 않는다: {} ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.",
+        "[CYCLE] 컨텍스트 순환 절차 개시. ① 아래는 저장 검증이 감시하는 파일 경로 목록이다 — {scope} 목록 밖 경로에 저장하면 검증에 인정되지 않는다: {} ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라.",
         files.join(" · ")
     )
 }
@@ -8677,7 +8685,7 @@ fn run_cycle_agent(
         // 1) 저장 지시
         eprintln!("[cycle 1/5] 저장 지시 주입 → surface:{sid} ({role_name})");
         // ★A′: 고정 산문 대신 감시 목록(files) 실경로 열거 — 지시 경로↔게이트 경로 정합.
-        inject_text(sid, &cycle_save_directive(&files))?;
+        inject_text(sid, &cycle_save_directive(&role_name, &files))?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         match cycle_verify_plan(force_no_verify, baseline.len()) {
@@ -15091,7 +15099,7 @@ mod tests {
             "/tmp/pk/round/SESSION_STATE.md".to_string(),
             "/tmp/pk/round/MASTER_TODO.md".to_string(),
         ];
-        let d = cycle_save_directive(&files);
+        let d = cycle_save_directive("master", &files);
         for f in &files {
             assert!(d.contains(f.as_str()), "감시 경로가 지시문에서 빠졌다: {f}\n{d}");
         }
@@ -15102,6 +15110,11 @@ mod tests {
         assert!(
             d.contains("네 역할 소관 파일"),
             "역할 소관 한정 문구가 빠졌다: {d}"
+        );
+        // [codex R1 수용] (b) master 소관엔 SESSION_STATE 가 명시된다.
+        assert!(
+            d.contains("자기 TODO·자기 SESSION_STATE"),
+            "master 의 SESSION_STATE 소관 문구가 빠졌다: {d}"
         );
         assert!(
             !d.contains("목록 **전부**"),
@@ -15120,9 +15133,30 @@ mod tests {
             !d.contains("_round/ 또는 pack round/"),
             "모호 이중 안내 산문이 되살아났다: {d}"
         );
+        // [codex R1 수용] (a) 비master 소관은 결정론 문구다 — 자기 역할 TODO 파일만 쓰고,
+        // 목록의 공유 SESSION_STATE·타 역할 TODO 는 감시(관찰) 대상일 뿐 쓰기 금지(단일 스레드
+        // 쓰기 규율). LLM 해석 위임이 되살아나면 워커가 공유 SESSION_STATE 를 재기록한다.
+        let wfiles = vec![
+            "/tmp/pk/round/SESSION_STATE.md".to_string(),
+            "/tmp/pk/round/WORKER_TODO.md".to_string(),
+            "/tmp/pk/round/CSO_TODO.md".to_string(),
+        ];
+        let w = cycle_save_directive("worker", &wfiles);
+        for f in &wfiles {
+            assert!(w.contains(f.as_str()), "worker 지시문에서 감시 경로가 빠졌다: {f}\n{w}");
+        }
+        assert!(w.contains("자기 역할 TODO 파일만"), "worker 소관 한정 문구 소실: {w}");
+        assert!(
+            w.contains("쓰기 금지"),
+            "SESSION_STATE·타 역할 TODO 쓰기 금지 문구 소실: {w}"
+        );
+        assert!(
+            w.contains("plain 한 줄로 CYCLE-SAVED"),
+            "worker 지시문의 ② CYCLE-SAVED 마커 계약 소실: {w}"
+        );
         // 단일 파일 목록도 그대로 열거된다(워커 cycle).
         let one = vec!["/w/pack/round/WORKER_TODO.md".to_string()];
-        assert!(cycle_save_directive(&one).contains("/w/pack/round/WORKER_TODO.md"));
+        assert!(cycle_save_directive("worker", &one).contains("/w/pack/round/WORKER_TODO.md"));
     }
 
     // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
