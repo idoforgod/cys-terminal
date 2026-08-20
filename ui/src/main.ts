@@ -6242,6 +6242,19 @@ async function start() {
         : "cys 설치본의 일부 구성요소가 빠졌습니다. 최신 DMG로 재설치해 주세요.";
     stickyToast("bundle-damaged", "health", "설치본이 온전하지 않습니다 — 재설치 필요", msg);
   });
+  // ★[F3 재-pull] listen 등록 **직후** 1회 재-pull: start() 의 기동 pull 과 위 listen 등록
+  // 사이 창에서 나간 emit 은 양쪽 다 놓친다(pull 이후·listen 이전 — emit-before-listen 의
+  // 잔여 격차). 백엔드 캐시(SEAL_BROKEN_CACHE 합산 bundle_integrity)를 등록 직후 한 번 더
+  // 읽어 그 창을 봉합한다. 같은 토스트 id("bundle-damaged")라 push/기동 pull 과 중복돼도
+  // stickyToast dedupe 가 흡수한다(화면엔 한 줄). src-tauri 변경 불요 — 기존 커맨드 재사용.
+  try {
+    const damage = await invoke("bundle_integrity");
+    if (typeof damage === "string" && damage) {
+      stickyToast("bundle-damaged", "health", "설치본이 온전하지 않습니다 — 재설치 필요", damage);
+    }
+  } catch {
+    /* 비-macOS·번들 밖 실행은 해당 없음 */
+  }
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);

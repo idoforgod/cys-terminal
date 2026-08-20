@@ -403,6 +403,10 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
         DMG 2종 = **발행될 실물 바이트**에 `release-gate-gatekeeper.sh` 실평가를 자동
         수행한다(네이티브 아키텍처 DMG 는 본 게이트 ⑥ 포함까지) — rc≠0(1·2 모두)이면
         postprocess 비영 종료·`--apply` 거부(fail-closed · §1 「★CI 자동판 게이트」 절 참조).
+      · 복구 절차 주의 — **pre-SEAL 태그**(2026-08-20 SEAL 게이트 도입 이전 발행분)를 자산
+        유실 복구 등으로 재후처리할 때는 ⑤ SEAL-2 정적 검사가 구조적으로 FAIL 한다: 이미
+        발행·검증된 과거 실물 바이트에 한해 `--unsafe-skip-gatekeeper` 로 우회한다
+        (LOUD 경고 감수 · 신규 발행에는 절대 사용 금지).
 - [ ] **★메인 페이지(`/`) 원격 검증 — 6항목 전부 (S28 + 2026-07-29 오너 지시 ⓐⓑⓒ · 자동화 밖의 수동 게이트)**
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기

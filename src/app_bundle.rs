@@ -568,7 +568,9 @@ pub fn seal_broken_notice(bundle: &Path, culprits: &[String], self_inflicted: bo
          내려받아 처음 열면, macOS Gatekeeper 가 \"손상되었기 때문에 열 수 없습니다\"로 차단할 수 있습니다.\n\n\
          해결 방법은 최신 버전 재설치 하나뿐입니다 — www.cysinsight.com/downloads 에서 내려받아 \
          응용 프로그램 폴더의 기존 cys.app 을 휴지통으로 옮긴 뒤 새로 설치해 주세요.\n\
-         (설정·대화기록은 앱 밖 ~/.cys 에 있어 재설치로 지워지지 않습니다.)",
+         (설정·대화기록은 앱 밖 ~/.cys 에 있어 재설치로 지워지지 않습니다.)\n\
+         재설치 후 이 앱을 완전히 종료하고 새로 열어 주세요 — 자가진단이 다시 돌아 정상이면 \
+         이 알림은 나타나지 않습니다.",
         bundle.display(),
         culprits.len(),
         sample_line,
@@ -1011,6 +1013,12 @@ mod tests {
         assert!(msg.contains("계속 사용할 수 있습니다"), "지금 못 쓴다고 겁주지 않는다");
         assert!(msg.contains("차단할 수 있습니다"), "위험은 조건부임을 그대로 말한다");
         assert!(msg.contains("외 1건"), "원인 파일은 샘플 3건 + 나머지 개수로 줄인다");
+        // [g] 재시작 안내 — 재설치 후에도 구 프로세스가 살아 있으면 알림이 남아 "고쳐지지
+        // 않았다"로 오독된다. 완전 종료→재실행 시 자가진단이 다시 돌아 스스로 해소됨을 말한다.
+        assert!(
+            msg.contains("완전히 종료하고 새로 열어 주세요"),
+            "재설치 후 재시작 안내가 있어야 한다(알림 잔존 오독 방지)"
+        );
         // ★번들 안 파일을 지우라는 안내는 절대 나가면 안 된다(App Management 에 막히고,
         //   막히지 않아도 added 가 missing 으로 바뀔 뿐 봉인은 그대로 깨진 채다).
         for forbidden in ["rm -rf", "__pycache__ 를 삭제", "codesign --force"] {

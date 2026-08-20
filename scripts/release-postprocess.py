@@ -23,8 +23,11 @@
 인증: `git credential fill`(osxkeychain)에서 GitHub 토큰을 얻는다. gh CLI 불요.
 
 사용:
-  python3 scripts/release-postprocess.py v0.14.5            # dry-run(다운로드·생성·검증만)
-  python3 scripts/release-postprocess.py v0.14.5 --apply    # 업로드까지
+  python3 scripts/release-postprocess.py v0.14.19           # dry-run(다운로드·생성·검증만)
+  python3 scripts/release-postprocess.py v0.14.19 --apply   # 업로드까지
+  ※예시는 **SEAL 세대 태그**다 — 5단계 게이트의 ⑤ SEAL-2 정적 검사(선컴파일 커버리지)는
+    SEAL 도입(2026-08-20) 이후 빌드에서만 성립한다. pre-SEAL 태그 재후처리는 아래
+    비상 플래그 없이는 구조적으로 FAIL 한다(docs/RELEASE.md 복구 절차 참조).
   옵션: --unsafe-skip-gatekeeper  Gatekeeper 게이트 생략 — 비상 탈출구(LOUD 경고·평시 금지,
         `--force-no-verify` 선례와 동형: 어떤 자동 경로도 이 플래그를 실어서는 안 된다)
 """

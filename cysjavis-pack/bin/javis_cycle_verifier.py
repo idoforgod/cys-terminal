@@ -430,8 +430,11 @@ def _snapshot_mod():
             _SNAPSHOT_MOD = _s
         except Exception as e:  # noqa: BLE001 — 아래 최후 폴백이 있어 fail-soft
             _SNAPSHOT_MOD = False
+            # [d] 문구 현행화 — 폴백의 실제 행동과 일치시킨다(_fallback_state_dir 참조):
+            #   기본 파이프는 LOCALAPPDATA 직조립, 부서 파이프는 fail-closed 센티널 경로.
             print("⚠ [cycle-verifier] javis_state_snapshot 로드 실패 — Windows 상태 dir "
-                  "매핑을 최후 폴백(LOCALAPPDATA 직접 조립·부서 슬러그 미지원)으로 접는다: %s" % e,
+                  "매핑을 최후 폴백으로 접는다(기본 파이프=LOCALAPPDATA 직조립·부서 파이프="
+                  "fail-closed 센티널): %s" % e,
                   file=sys.stderr)
     return _SNAPSHOT_MOD or None
 
@@ -621,6 +624,21 @@ def adjudicate_body(entries, unparsed, created_at, statfn=default_statfn,
             "files": files}
 
 
+def foreign_request(res):
+    """[C3 · 성찰 R3] 미매핑(mapped=False) 요청 = 전자동 사이클 발행분으로 **증명 불가** — skip 대상.
+
+    수동 레인(`cys cycle-agent --verifier <LLM역할>`)의 cycle-verify 요청도 같은 feed kind 로
+    흐른다 — lease/baseline 이 없으니 match_baseline 은 'baseline 부재/lease 부재/집합·role
+    불일치' 계열로 실패한다. 그 요청을 이 결정론 워처가 선점 deny 하면 지정 LLM 검증자가
+    심사할 기회 자체가 사라져 master 수동 사이클의 2-phase handshake 가 무력화된다(성찰 R3).
+    → deny 대신 **무응답 skip**(원장 'foreign-request skip' 1줄). allow 로 새는 길은 없다
+    (fail-closed 유지): 매핑 성립한 자기 발행분의 ambiguous/stale deny 는 현행 그대로다
+    (ALL-match 불변). 자기 발행분이 매핑 실패로 skip 되는 최악 경로도 cycle-agent 의
+    --timeout(120s)이 유한 종결한다 — 즉시 deny 가 timeout 실패로 바뀔 뿐 allow 오판이 없다.
+    """
+    return not bool(res.get("mapped"))
+
+
 def recheck_ready(row):
     """allow 발신 직전 대상 유휴 재확인(순수). 고속 allow 의 busy-clear 재도입 봉합."""
     if not row:
@@ -766,6 +784,24 @@ def adjudicate_request(request_id, apply_reply, runner=run, wait_idle=True):
                 "surface_id": rec.get("surface_id"),
                 "created_at": rec.get("created_at"), "title": rec.get("title"),
                 "cycle_id": (lease or {}).get("cycle_id")})
+
+    # [C3] 수동 레인 handshake 보존 — 미매핑 요청은 deny 가 아니라 무응답 skip.
+    #   (foreign_request docstring 참조. reply·escalate 0 — 원장 1줄만 남기고 pending 을
+    #   지정 검증자(수동 레인의 LLM 역할)에게 넘긴다.)
+    if foreign_request(res):
+        res["verdict"] = "skip"
+        res["decision"] = None
+        res["replied"] = False
+        res["reply_err"] = "foreign-request skip(무응답 — 수동 레인 보존)"
+        log_append({"ts": time.time(), "cycle_id": res.get("cycle_id"), "phase": "verify",
+                    "role": res.get("role"),
+                    "surface": (None if res.get("surface_id") is None
+                                else "surface:%s" % res["surface_id"]),
+                    "detail": {"event": "foreign-request skip",
+                               "request_id": request_id,
+                               "map_reason": res.get("map_reason"),
+                               "title": res.get("title")}})
+        return res
 
     if res["verdict"] == V_ALLOW:
         ok, why = _allow_recheck(rec.get("surface_id"), runner=runner, wait_idle=wait_idle)
@@ -1053,6 +1089,37 @@ def cmd_self_test(args):
                         role_from_req="master")
     t.check("한 건만 재기록 → deny_stale (ALL-match 계약)",
             r["verdict"] == V_DENY_STALE and r["evidence"] == 1, str(r))
+
+    # 2-b) [C3] 수동 레인 보존 — foreign(미매핑) 요청은 deny 가 아니라 무응답 skip 대상
+    print("[2-b] [C3] foreign(미매핑) skip — 수동 레인 2-phase handshake 보존")
+    rf = adjudicate_body([("/p", new_h)], [], created, stat(True, started + 10, new_h),
+                         lease=None, baseline_rec=None, role_from_req="worker")
+    t.check("★lease·baseline 둘 다 부재(수동 레인 전형) → foreign",
+            foreign_request(rf) is True, str(rf.get("map_reason")))
+    rf2 = adjudicate_body([("/p", new_h)], [], created, stat(True, started + 10, new_h),
+                          lease=LEASE, baseline_rec=None, role_from_req="worker")
+    t.check("baseline 부재(전자동 발행분 아님) → foreign", foreign_request(rf2) is True)
+    rf3 = adjudicate_body([("/p", old_h)], [], created, stat(True, started + 10, old_h),
+                          lease=LEASE, baseline_rec=BASE, role_from_req="worker")
+    t.check("매핑 성립 deny_stale 은 foreign 아님(자기 발행분 deny 현행 유지 · ALL-match 불변)",
+            foreign_request(rf3) is False and rf3["verdict"] == V_DENY_STALE)
+    rf4 = adjudicate_body([("/p", new_h)], [], created, stat(False, None, None),
+                          lease=LEASE, baseline_rec=BASE, role_from_req="worker")
+    t.check("매핑 성립 deny_ambiguous(파일 소실)도 foreign 아님(escalation 경로 보존)",
+            foreign_request(rf4) is False and rf4["verdict"] == V_DENY_AMBIGUOUS)
+    rf5 = adjudicate_body([("/p", new_h)], [], created, stat(True, started + 10, new_h),
+                          lease=LEASE, baseline_rec=BASE, role_from_req="master")
+    t.check("role 불일치(타 역할 요청) → foreign(선점 deny 금지)", foreign_request(rf5) is True)
+    import inspect as _insp3
+    aj_src = _insp3.getsource(adjudicate_request)
+    t.check("★adjudicate_request: foreign 분기가 reply(_finish 최종 호출)보다 선행 = 무응답 계약",
+            "foreign_request(" in aj_src
+            and aj_src.index("foreign_request(") < aj_src.index("escalate_it=(res"))
+    t.check("foreign skip 원장 1줄 배선('foreign-request skip')",
+            '"foreign-request skip"' in aj_src and "log_append" in aj_src)
+    t.check("foreign skip 은 send_reply 를 타지 않는다(분기 내 reply 부재·return 선행)",
+            "send_reply" not in aj_src.split("foreign_request(res)")[1]
+            .split("if res[\"verdict\"] == V_ALLOW")[0])
 
     # 3) 실파일 통합 심사
     print("[3] 실파일 통합 심사(baseline 결합)")

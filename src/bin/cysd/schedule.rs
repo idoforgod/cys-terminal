@@ -209,6 +209,25 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
                 }
                 let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
                 if cur_ver != Some(want_ver) {
+                    // [가청화 · 2026-08-20] 버전 교체는 기존 항목을 코드 정의로 **통째** 덮는다 —
+                    // 운영자가 command/every_minutes 등을 손으로 고쳐 둔 경우 그 편집이 무언
+                    // 소실되는 지점이다(파일 채널(STATE_DIR/mode) 밖의 잡 문자열 편집은 여기서
+                    // 살아남지 못한다 — builtin_jobs() 상단 B3 주석과 같은 기제). 로직은 불변
+                    // (교체는 그대로) — 소실 사실만 경고 1줄로 가청화한다. 버전 필드 차이는
+                    // 갱신의 정의 자체라 비교에서 제외한다.
+                    let strip = |v: &serde_json::Value| {
+                        let mut c = v.clone();
+                        if let Some(o) = c.as_object_mut() {
+                            o.remove("_builtin_version");
+                        }
+                        c
+                    };
+                    if strip(&jobs[pos]) != strip(&bj) {
+                        eprintln!(
+                            "[cysd] ensure_builtin_jobs: built-in 잡 '{id}' 버전 교체 — 기존 항목이 코드 정의와 달라 그 편집이 소실됩니다(구 항목: {})",
+                            jobs[pos]
+                        );
+                    }
                     jobs[pos] = bj; // built-in 구버전 → 갱신
                     changed = true;
                 }

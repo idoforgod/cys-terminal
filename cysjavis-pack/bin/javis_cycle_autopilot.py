@@ -501,6 +501,9 @@ KILL_POLL_SECS = 1.0
 RESIDUAL_WINDOW_NOTE = ("allow→clear 구간 수초는 kill-switch 회수 불가(수용된 안전 한계 · "
                         "설계 v2.1 C1)")
 RESET_COOLDOWN_SECS = 180.0       # 운영자 reset 후 재발화 최소 간격(무한 재시도 연타 방지)
+# [C2-④] bootstrap-verifier 백오프 — 워처 즉사 반복 병리에서 pane 무한 누적 차단.
+BOOTSTRAP_BACKOFF_WINDOW = 3600.0  # 시도 계수 창(60분)
+BOOTSTRAP_BACKOFF_MAX = 3          # 창 내 시도 상한 — 도달 시 자동(--ensure) 기동 skip + escalate
 LEASE_TTL = 900.0                 # lease 갱신 없음 + pid 사망 = 인계 대상
 OBSERVE_WINDOW = 180.0            # audit 오탐 oracle 의 사후 관측 창
 SWEEP_STATE = os.path.join(STATE_DIR, "sweep.json")   # [v2.1 ⑤] 틱 스윕 커서
@@ -541,12 +544,29 @@ def ctx_threshold(role, packdir=None):
 
 
 def _knob_file(name, state_dir=None):
-    """STATE_DIR 노브 파일 첫 줄(strip) — 부재·손상(비UTF8·빈 값)=None (fail-safe 입력층)."""
+    """STATE_DIR 노브 파일 첫 줄(strip) — 부재·빈 값=None (fail-safe 입력층).
+
+    [b] BOM 내성: 기본 인코딩은 utf-8-sig(평문 utf-8 동작 불변 + UTF-8 BOM 흡수).
+    Windows PowerShell 의 `>`·`Set-Content` 기본 인코딩이 UTF-16(LE·BOM)이라, 운영자가
+    GUIDE 대로 live 승격 파일을 만들어도 utf-8 로 안 읽혀 **조용히 shadow 로 접히는** 함정이
+    있었다 — utf-16 재시도(BOM 감지 codec)로 봉합한다(GUIDE §3-5 의 `-Encoding ascii` 권고와
+    이중 방어). 그래도 실패면 LOUD 1줄 + None(기본값 = shadow — fail-safe 방향은 유지).
+    """
+    p = os.path.join(state_dir or STATE_DIR, name)
     try:
-        with open(os.path.join(state_dir or STATE_DIR, name), "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             v = f.readline().strip()
         return v or None
-    except (OSError, UnicodeDecodeError, ValueError):
+    except UnicodeDecodeError:
+        try:
+            with open(p, "r", encoding="utf-16") as f:
+                v = f.readline().strip()
+            return v or None
+        except (OSError, UnicodeDecodeError, ValueError):
+            print("⚠ [cycle-autopilot] 노브 파일 %s 디코드 불가(utf-8/utf-16 모두 실패) — "
+                  "무시하고 기본값(shadow 방향)으로 접는다" % p, file=sys.stderr)
+            return None
+    except (OSError, ValueError):
         return None
 
 
@@ -681,6 +701,14 @@ def resolve_save_files(role, row, packdir=None, runner=run):
         #   없어 '존재 불가능 경로'를 lease 에 넣었고, ALL-match 검증자(javis_cycle_verifier)가
         #   부재 파일 1건에 V_DENY_AMBIGUOUS → master 전자동 사이클이 OS 무관 매번 deny 됐다.
         rd = os.path.join(packdir or pack_dir(), "round")   # 해석 실패 시에만 — 원장에 fallback 기록
+        # [c] 팩 round/ 실존 보증 — 신설·부분 설치 팩엔 round/ 가 없을 수 있고, 그러면 이
+        #   폴백 자체가 다시 '존재 불가능 경로'(유령)가 된다(ALL-match 검증자가 부재 파일
+        #   1건에 V_DENY_AMBIGUOUS — R2 재발 모양). 생성 대상은 팩 **내부** 디렉터리 하나뿐이라
+        #   PROJECT/HOME 결박 부작용이 없다(R2 안A 의 '실존 출하 디렉터리' 취지를 기계로 보증).
+        try:
+            os.makedirs(rd, exist_ok=True)
+        except OSError:
+            pass  # 생성 불가면 반유령 핀·fallback 원장 기록이 표면화한다(무음 아님)
         how = "pack-fallback"
     files = ([os.path.join(rd, "SESSION_STATE.md"), todo] if role == "master" else [todo])
     return {"files": files, "round_dir": rd, "how": how, "cwd": cwd,
@@ -921,11 +949,19 @@ def _pid_alive_windows(pid, kernel32=None):
     ERROR_ACCESS_DENIED = 5
     try:
         import ctypes
+        injected = kernel32 is not None           # 테스트 페이크 주입 경로(GetLastError 보존)
         if kernel32 is None:
-            kernel32 = ctypes.windll.kernel32     # nt 전용 — posix 는 주입 경로만 온다
+            # [a] windll.kernel32(전역 공유 캐시)의 GetLastError() 직접 호출은 그 사이 끼어드는
+            #   ctypes 내부 호출이 LastError 를 덮을 수 있어 판독이 오염될 수 있다 —
+            #   WinDLL(use_last_error=True) 는 각 외부 호출 직후 오류코드를 스레드 로컬로
+            #   포획하고 ctypes.get_last_error() 가 그 포획본을 읽는다(정석 경로).
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
-            return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+            # 페이크 주입(self-test [13-c])은 GetLastError 인터페이스 그대로 — 실경로만
+            # get_last_error() 판독으로 갈린다(주입 인터페이스 비파괴).
+            err = kernel32.GetLastError() if injected else ctypes.get_last_error()
+            return err == ERROR_ACCESS_DENIED
         try:
             code = ctypes.c_ulong(0)
             ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
@@ -1105,9 +1141,27 @@ def cmd_tick(args):
             return EXIT_OK
         # 집행자 사망 — phase 로 인계 판정 [v2.1 ④]
         ph = lease.get("phase")
+        # [C5] takeover quiesce 해제 가드 — 고아 cycle-agent 생존 시 해제 유보.
+        #   집행자(부모)가 죽어도 자식 cycle-agent 는 고아로 살아 handshake~clear 를 계속할
+        #   수 있다. 그 도중 외부에서 quiesce --off 를 치면 '채널 inbox 주입 보류' 보호가
+        #   clear 직전 창에서 걷혀 오염 주입이 열린다 — 살아있는 고아의 off 는 정상 소유자인
+        #   자기 자신이 친다(cys.rs set_surface_quiescing: resume 후 실패해도 off).
+        #   해제·인계 전체를 다음 틱으로 유보(원장 1줄): 고아는 --timeout(120s) 상한의 유한
+        #   수명이라 수 분 내 풀린다. 판정 불능(count_cycle_agent=보수적 1)도 유보(fail-closed).
+        #   ★abort 경로(cmd_execute — SIGTERM/SIGKILL 직후 release)는 현행 유지: 그 경로는
+        #   자식을 방금 직접 죽였으므로 '살아있는 고아' 창이 구조적으로 없다.
+        orphans = count_cycle_agent()
+        if orphans > 0:
+            log_append({"ts": now_ts, "cycle_id": cid, "phase": "skip", "role": role,
+                        "surface": lease.get("surface"),
+                        "detail": {"warn": "orphan alive, release deferred",
+                                   "orphans": orphans, "dead_phase": ph,
+                                   "lease_status": lstatus}})
+            print(json.dumps({"result": "takeover-deferred", "cycle_id": cid, "role": role,
+                              "orphans": orphans, "phase": ph}, ensure_ascii=False))
+            return EXIT_OK
         # [P0-2] 집행자가 죽었으면 그 자식 cycle-agent 의 quiesce-off 도 보장이 없다 —
-        #   인계 종결 전에 잔존 해제(멱등·fail-soft — 살아있는 고아 cycle-agent 가 나중에
-        #   자기 off 를 다시 쳐도 같은 종착 상태).
+        #   인계 종결 전에 잔존 해제(멱등·fail-soft — 위 [C5] 가드로 이 시점엔 고아 0 확인됨).
         release_quiesce(lease.get("surface"), cid, role, "takeover(dead executor, phase=%s)" % ph)
         if ph in ("executor_exited", "fired"):
             # fired 상태에서 집행자가 죽었어도 clear 가 났는지는 사후검증만이 안다 → 인계.
@@ -1803,42 +1857,154 @@ def cmd_status(args):
 
 
 def ensure_verifier_noop(status, heartbeat_mtime, now_ts):
-    """[P0-1] bootstrap-verifier --ensure 판정(순수·조회 주입식) — (noop, why).
+    """[P0-1][C2-③] bootstrap-verifier --ensure 판정(순수·조회 주입식) — (noop, why).
 
-    noop = ①cycle-verifier 역할 surface 실재(살아있는 row · surface_row 계약 그대로)
-           **그리고** ②heartbeat 신선(HEARTBEAT_MAX_AGE 이내) — 둘 다 참일 때만.
-    판정 불능(status=None·heartbeat 부재)은 '기동 필요' 쪽으로 접힌다: noop 오판은
-    죽은 검증자를 방치(게이트6 영구 skip)하고, 기동 오판의 중복 pane 위험은 건강 상태
-    에선 이 게이트가, 데몬 불능 상태에선 new-surface 실패가 각각 차단한다.
+    noop 충분조건 = **heartbeat 신선(HEARTBEAT_MAX_AGE 이내) 하나**다. heartbeat 는 워처
+    자신이 30초마다 touch 하는 생존의 직접 증거라, status 조회 실패(None)·row 부재 판독과
+    **무관하게** 그것만으로 '워처 살아있음 = 기동 불요'가 성립한다.
+    ★[C2-③ 순서 교정] 종전엔 [surface 실재 AND heartbeat 신선]이라 status 일시 불능·파싱
+    실패가 '기동 필요'로 오판돼 **살아있는 워처 옆에 중복 pane** 을 만들 수 있었다.
+    heartbeat 부재·노화 = 기동 필요(row 가 살아있어도 — 죽은 워처의 살아있는 pane 은
+    cmd_bootstrap_verifier 의 재주입 경로[C2-⑤]가 재사용한다). status 는 사유 문자열
+    보강(관측)에만 쓴다. 판정 불능(heartbeat 부재)은 종전대로 '기동 필요' 쪽 — 중복 pane
+    위험은 [C2-⑤] 재사용+락과 [C2-④] 백오프가 각각 차단한다.
     """
+    if heartbeat_mtime is not None:
+        age = now_ts - heartbeat_mtime
+        if age <= HEARTBEAT_MAX_AGE:
+            return True, "heartbeat %.1fs 신선(독립 충분조건 — status 조회와 무관)" % age
+        row = surface_row(status, VERIFIER_ROLE)
+        return False, "heartbeat 노화(%.1fs > %.0fs · row=%s)" % (
+            age, HEARTBEAT_MAX_AGE, (row or {}).get("surface_ref") or "부재")
     row = surface_row(status, VERIFIER_ROLE)
-    if row is None:
-        return False, "verifier surface 부재"
-    if heartbeat_mtime is None:
-        return False, "heartbeat 부재"
-    age = now_ts - heartbeat_mtime
-    if age > HEARTBEAT_MAX_AGE:
-        return False, "heartbeat 노화(%.1fs > %.0fs)" % (age, HEARTBEAT_MAX_AGE)
-    return True, "surface %s 실재 + heartbeat %.1fs" % (row.get("surface_ref"), age)
+    return False, "heartbeat 부재(row=%s)" % ((row or {}).get("surface_ref") or "부재")
+
+
+def _watch_cmdline(watcher, os_name=os.name, executable=None):
+    """검증자 워처 기동 명령 문자열(순수) — pane 셸 **방언별**로 조립한다.
+
+    [C1 · BLOCKER 수리 — 채택안 ① `cys new-surface --cmd` 직결 · 실측 근거 2026-08-20]
+      · CLI: `cys new-surface --help` 에 `--cmd <CMD>` 실재(설치본 0.14 계열 실측) —
+        src/bin/cys.rs:41-55 NewSurface{cmd} → :1705 surface.create {"cmd"} RPC.
+      · 데몬: src/bin/cysd/state.rs:1753-1779 spawn — posix 는 `<shell> -lc <cmd>`,
+        Windows 는 `builder.args([windows_exec_flag(&shell), cmd])`(:2615 —
+        cmd.exe→`/C` · powershell/pwsh→`-Command`). launch-agent 와 동일한 spawn 경로다.
+      · 귀속: --cmd 로 뜬 워처는 pane PTY 의 루트 자식이라 조상추적으로 surface 에
+        귀속된다(state.rs:1124-1152 is_self_approval — '외부 프로세스+미귀속'만 fail-closed).
+        타이핑 주입(send+send-key Return)의 파스·레이스 자체가 신규 생성 경로에서 사라진다.
+    ★다만 windows_exec_flag 는 셸별 **플래그**만 고르지, 명령 문자열의 **방언**은 호출자
+      몫이다: PowerShell 은 선두 따옴표 토큰을 표현식(문자열 리터럴)으로 파스해 실행하지
+      않는다 — 호출 연산자 `&` 가 필요하다(채택안 ② 문법을 ① 의 문자열에 적용).
+      한계 명기: `CYS_SHELL` 로 cmd.exe 를 지정한 비표준 구성에서는 `&` 가 명령 구분자로
+      파스돼 깨진다 — Windows 기본 pane 셸 = powershell.exe(state.rs default_shell) 전제.
+      posix(-lc: sh/zsh/bash)는 선두 따옴표 토큰이 정상 명령이라 현행 형태 유지.
+    [R3] python3 리터럴 금지(sys.executable) + 경로 따옴표(공백 내성)는 종전 그대로.
+    """
+    exe = executable or sys.executable
+    if os_name != "posix":
+        return '& "%s" "%s" watch' % (exe, watcher)
+    return '"%s" "%s" watch' % (exe, watcher)
+
+
+def bootstrap_attempts_within(records, now_ts, window=BOOTSTRAP_BACKOFF_WINDOW):
+    """[C2-④] CYCLE_LOG 의 bootstrap **실기동 시도** 레코드 계수(순수).
+
+    시도 = phase=="bootstrap" AND detail 에 "ok" 키 존재(신규 생성·재주입의 결과 레코드).
+    ensure-noop/shadow-noop/kill-switch/backoff 레코드는 "ok" 키가 없어 계수에서 제외된다.
+    워처가 즉사를 반복하는 병리(C1류 파스 불능 포함)에서 워치독(10분 주기)이 pane·재주입을
+    무한 누적하는 것을 상한(BOOTSTRAP_BACKOFF_MAX회/창)으로 차단하는 판정 입력이다.
+    """
+    n = 0
+    for r in records or []:
+        if r.get("phase") != "bootstrap":
+            continue
+        d = r.get("detail")
+        if not isinstance(d, dict) or "ok" not in d:
+            continue
+        ts = r.get("ts") or 0
+        if 0 <= now_ts - ts <= window:
+            n += 1
+    return n
+
+
+class _BootstrapLock(object):
+    """[C2-⑤] bootstrap 판정→생성 구간 직렬화 — preflight --fix × watchdog 동시 기동 경합 차단.
+
+    _StateLock 동형(flock — Windows 는 상단 shim 의 msvcrt 바이트락으로 접힘) · 락 파일만
+    분리한다(STATE_DIR/bootstrap.lock): bootstrap 은 status 조회~pane 생성까지 수 초를
+    점유하므로 state.json 락을 쓰면 tick 의 lease 경로를 그 시간만큼 막는다.
+    """
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        _ensure_state_dir()
+        self.fd = os.open(os.path.join(STATE_DIR, "bootstrap.lock"),
+                          os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
 
 
 def cmd_bootstrap_verifier(args):
-    """검증자 전용 pane 신설 + 워처 포그라운드 기동 (게이트6 전제).
+    """검증자 전용 pane 확보 + 워처 포그라운드 기동 (게이트6 전제).
 
-    ★pane 안에서 포그라운드로 돌려야 한다 — detach/데몬 spawn 은 feed.reply 가
+    ★pane 안에서 포그라운드로 돌아야 한다 — detach/데몬 spawn 은 feed.reply 가
       self_approval_denied 로 fail-closed 된다(cysd state.rs:1046-1074 실측: 외부 프로세스인데
-      어떤 surface 에도 귀속되지 않으면 자기승인으로 간주). --ensure 도 이 메커니즘을
-      바꾸지 않는다 — 기동이 필요하면 아래 현행 경로(new-surface + send + Return) 그대로다.
+      어떤 surface 에도 귀속되지 않으면 자기승인으로 간주).
+    [C1] 신규 생성은 `new-surface --cmd` 직결 — 워처가 pane 루트 자식(포그라운드)으로 떠
+      귀속 계약을 그대로 만족하며, pane 셸 타이핑 주입의 파스 의존(PowerShell 선두 따옴표
+      토큰 파스 불능)이 신규 경로에서 사라진다(_watch_cmdline 채택 근거 참조).
+      재주입(살아있는 pane 재사용 [C2-⑤])만 send+send-key Return 을 유지한다 — 그 pane 이
+      맨 셸 프롬프트(레거시 기동 잔재)일 수 있어 방언 문자열(_watch_cmdline)이 그대로 쓰인다.
 
-    [P0-1] --ensure: 기동 **전** 멱등 게이트. 검증자 surface 실재 + heartbeat 신선이면
-      pane 을 만들지 않고 no-op exit 0(원장 ensure-noop 1줄) — 워치독 잡(10분 주기)이
-      건강 상태에서 중복 pane 을 만들지 않는 것이 계약이다. 미충족이면 현행 기동 로직
-      수행(죽은 워처의 옛 pane 은 회수하지 않는다 — 회수는 운영자/reaper 소관, 여기는
-      가용성 복구만).
+    가드 5종(순서 고정):
+      [C2-①] kill-switch 선확인(tick 선두와 대칭) → EXIT_KILL no-op(원장 1줄).
+      [C2-②] --ensure(자동=워치독 잡) 는 mode()==live 에서만 실기동 — shadow 는
+        'shadow-noop' exit 0(원장 1줄·pane 생성 0). 근거: 검증자 **자동** 상주는 live 승격
+        후에만 필요하다(S0 shadow 틱은 would_fire 기록뿐 — 발화 0). shadow 관측에 검증자가
+        필요하면 GUIDE §3-3 의 **수동 호출(--ensure 없음)** 로 띄운다 — 그 경로는 운영자
+        명시 기동이라 현행 유지. 이 게이트가 b218f43 의 'shadow=행동 변화 0' 주장을 사실로
+        만든다(종전엔 shadow 에서도 워치독이 pane 을 만들었다).
+      [P0-1·C2-③] --ensure 멱등 게이트 — heartbeat 신선 = 독립 noop 충분조건
+        (ensure_verifier_noop 참조 · 원장 ensure-noop 1줄).
+      [C2-④] 백오프 — 최근 60분 실기동 시도 ≥BOOTSTRAP_BACKOFF_MAX 이면 자동(--ensure)
+        기동 skip + escalate 1회(멱등 task_key) + 원장 'bootstrap-backoff' 1줄.
+        수동 호출은 백오프 비적용(운영자 명시 복구를 막지 않는다 — 누적 병리의 원천은
+        10분 주기 워치독이다).
+      [C2-⑤] 살아있는 verifier row 재사용 + 기동 락 — row(exited=false)가 있으면
+        new-surface 대신 그 pane 에 재주입. 판정→생성 구간은 _BootstrapLock 으로 원자화.
+        중복 재주입은 무해하다(워처 상주 pane 의 주입 텍스트는 stdin sink 가 흡수).
     """
+    now_ts = time.time()
+    # [C2-①] kill-switch 선확인 — pause 중 pane 생성·주입은 상태 변화라 no-op 가 맞다.
+    #   (PAUSED 파일 kill-switch 중엔 워치독 잡이 계속 돌므로 exit 4 가 schedule.error 로
+    #   보인다 — pause 는 운영자 개입 상태라 가청이 의도다. `cys pause` 경로는 스케줄 자체가
+    #   동결이라 잡이 돌지 않는다.)
+    killed, kreason = kill_switch()
+    if killed:
+        log_append({"ts": now_ts, "cycle_id": None, "phase": "bootstrap",
+                    "role": VERIFIER_ROLE, "surface": None,
+                    "detail": {"noop": "kill-switch", "reason": kreason}})
+        print(json.dumps({"result": "kill-switch", "reason": kreason}, ensure_ascii=False))
+        return EXIT_KILL
+    ensure = bool(getattr(args, "ensure", False))
+    # [C2-②] shadow 에서 --ensure 는 무집행 noop(자동 경로 한정 — 수동 호출은 §3-3 보존).
+    if ensure and mode() != MODE_LIVE:
+        log_append({"ts": now_ts, "cycle_id": None, "phase": "bootstrap",
+                    "role": VERIFIER_ROLE, "surface": None,
+                    "detail": {"noop": "shadow", "mode": mode()}})
+        print(json.dumps({"result": "shadow-noop", "mode": mode()}, ensure_ascii=False))
+        return EXIT_OK
     ensure_why = None
-    if getattr(args, "ensure", False):
-        now_ts = time.time()
+    if ensure:
         noop, why = ensure_verifier_noop(fetch_status(), mtime_of(HEARTBEAT), now_ts)
         if noop:
             log_append({"ts": now_ts, "cycle_id": None, "phase": "bootstrap",
@@ -1851,11 +2017,10 @@ def cmd_bootstrap_verifier(args):
     if not os.path.exists(watcher):
         print("검증자 스크립트 부재: %s" % watcher, file=sys.stderr)
         return EXIT_ERR
-    # [R3] python3 리터럴 금지(escalate 의 sys.executable 선례와 정합) + 경로 따옴표
-    #   (공백 경로 파손 병기 수리 — pane 셸에 문자열로 주입되므로 인용이 필수다).
-    cmdline = '"%s" "%s" watch' % (sys.executable, watcher)
+    cmdline = _watch_cmdline(watcher)
     plan = {"new_surface": [CYS, "new-surface", "--role", VERIFIER_ROLE,
-                            "--title", "cycle-verifier", "--cwd", PROJECT],
+                            "--title", "cycle-verifier", "--cwd", PROJECT,
+                            "--cmd", cmdline],
             "send": cmdline}
     if args.dry_run:
         print(json.dumps({"result": "dry-run", "plan": plan}, ensure_ascii=False, indent=2))
@@ -1864,23 +2029,67 @@ def cmd_bootstrap_verifier(args):
         print(json.dumps({"result": "blocked", "reason": "CYS_AUTOPILOT_NO_SEND=1"},
                          ensure_ascii=False))
         return EXIT_GATE
-    rc, out, err = run(plan["new_surface"])
-    if rc != 0:
-        print("new-surface 실패: %s" % err.strip()[:200], file=sys.stderr)
-        return EXIT_ERR
-    ref = (out or "").strip().split()[-1] if out.strip() else ""
-    if not ref.startswith("surface:"):
-        print("surface ref 파싱 실패: %r" % out, file=sys.stderr)
-        return EXIT_ERR
-    rc1, _o, e1 = run([CYS, "send", "--surface", ref, cmdline])
-    rc2, _o2, e2 = run([CYS, "send-key", "--surface", ref, "Return"])
-    ok = rc1 == 0 and rc2 == 0
-    log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap", "role": VERIFIER_ROLE,
-                "surface": ref, "detail": {"ok": ok, "cmd": cmdline,
-                                           "ensure_reason": ensure_why,
-                                           "err": (e1 + e2).strip()[:200]}})
-    print(json.dumps({"result": "bootstrap", "surface": ref, "ok": ok}, ensure_ascii=False))
-    return EXIT_OK if ok else EXIT_ERR
+    with _BootstrapLock():
+        # [C2-④] 백오프 — 자동(--ensure) 경로 한정.
+        if ensure:
+            records, _bad = read_ledger()
+            n = bootstrap_attempts_within(records, now_ts)
+            if n >= BOOTSTRAP_BACKOFF_MAX:
+                log_append({"ts": now_ts, "cycle_id": None, "phase": "bootstrap",
+                            "role": VERIFIER_ROLE, "surface": None,
+                            "detail": {"noop": "bootstrap-backoff", "attempts_window": n,
+                                       "window_secs": BOOTSTRAP_BACKOFF_WINDOW,
+                                       "ensure_reason": ensure_why}})
+                escalate("[CYCLE-AUTOPILOT] bootstrap-verifier 백오프 — 최근 60분 실기동 "
+                         "시도 %d회 이상, 자동 재기동 중단. 워처 즉사 병리 점검 필요"
+                         "(CYCLE_LOG phase=bootstrap 레코드·검증자 pane 화면)."
+                         % BOOTSTRAP_BACKOFF_MAX,
+                         task_key="autopilot-bootstrap-backoff")  # ★I3: 사건 종류별 병합 단위
+                print(json.dumps({"result": "bootstrap-backoff", "attempts": n},
+                                 ensure_ascii=False))
+                return EXIT_GATE
+        # [C2-⑤] 살아있는 row 재사용 — 락 획득 **후** 재조회(대기 중 타 경로 생성분 반영).
+        row = surface_row(fetch_status(), VERIFIER_ROLE)
+        if row is not None:
+            ref = row.get("surface_ref")
+            rc1, _o, e1 = run([CYS, "send", "--surface", str(ref), cmdline])
+            rc2, _o2, e2 = run([CYS, "send-key", "--surface", str(ref), "Return"])
+            ok = rc1 == 0 and rc2 == 0
+            log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap",
+                        "role": VERIFIER_ROLE, "surface": ref,
+                        "detail": {"ok": ok, "cmd": cmdline, "reused_surface": True,
+                                   "ensure_reason": ensure_why,
+                                   "err": (e1 + e2).strip()[:200]}})
+            print(json.dumps({"result": "bootstrap", "surface": ref, "ok": ok,
+                              "reused": True}, ensure_ascii=False))
+            return EXIT_OK if ok else EXIT_ERR
+        # [C1] 신규 생성 — --cmd 직결(타이핑 주입 없음 · 워처=pane 루트 포그라운드 자식).
+        rc, out, err = run(plan["new_surface"])
+        if rc != 0:
+            log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap",
+                        "role": VERIFIER_ROLE, "surface": None,
+                        "detail": {"ok": False, "cmd": cmdline, "via": "new-surface --cmd",
+                                   "ensure_reason": ensure_why, "err": err.strip()[:200]}})
+            print("new-surface 실패: %s" % err.strip()[:200], file=sys.stderr)
+            return EXIT_ERR
+        ref = (out or "").strip().split()[-1] if out.strip() else ""
+        if not ref.startswith("surface:"):
+            # 파싱 실패여도 pane 은 생성됐을 수 있다 — 시도 레코드("ok" 키)를 남겨 [C2-④]
+            # 백오프가 이 병리(생성은 되는데 ref 회수 불능 반복)도 계수하게 한다.
+            log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap",
+                        "role": VERIFIER_ROLE, "surface": None,
+                        "detail": {"ok": False, "cmd": cmdline, "via": "new-surface --cmd",
+                                   "ensure_reason": ensure_why,
+                                   "err": "surface ref 파싱 실패: %r" % (out or "")[:160]}})
+            print("surface ref 파싱 실패: %r" % out, file=sys.stderr)
+            return EXIT_ERR
+        log_append({"ts": time.time(), "cycle_id": None, "phase": "bootstrap",
+                    "role": VERIFIER_ROLE, "surface": ref,
+                    "detail": {"ok": True, "cmd": cmdline, "via": "new-surface --cmd",
+                               "ensure_reason": ensure_why, "err": ""}})
+        print(json.dumps({"result": "bootstrap", "surface": ref, "ok": True},
+                         ensure_ascii=False))
+        return EXIT_OK
 
 
 # ── self-test ─────────────────────────────────────────────────────────
@@ -2226,11 +2435,12 @@ def cmd_self_test(args):
 
     # 7-c) cwd 해석 실패 → 팩 정본(pack/round) 폴백 + fallback 플래그 [R2 유령 lease 수리·안A]
     #   [픽스처] CYS_ROOT 를 _round 없는 tmpdir 로 못 박아 실HOME ACTIVE_PROJECT 폴백을
-    #   차단(해석 실패 분기의 결정론화). 팩도 round/ 실존 tmpdir — 출하 팩 골격과 동형.
+    #   차단(해석 실패 분기의 결정론화). [c] 팩의 round/ 는 **일부러 만들지 않는다** —
+    #   폴백이 스스로 makedirs 로 실존을 보증하는지(반유령 핀 강화)를 여기서 박제한다.
     _old_cys_root = os.environ.get("CYS_ROOT")
     os.environ["CYS_ROOT"] = os.path.join(tmpd, "no-such-root")
     PACKFIX = os.path.join(tmpd, "packfix")
-    os.makedirs(os.path.join(PACKFIX, "round"))
+    os.makedirs(PACKFIX)   # round/ 미생성 — 신설·부분 설치 팩 재현
     try:
         sfr_fb = resolve_save_files("master", {"role": "master", "surface_id": None},
                                     packdir=PACKFIX, runner=lambda *a, **k: (1, "", "no daemon"))
@@ -2247,9 +2457,13 @@ def cmd_self_test(args):
     # ★반유령 핀 — 폴백 files 에 '존재 불가능 경로'($HOME/_round 류 유령) 0건.
     #   ALL-match 검증자는 부재 파일 1건이면 V_DENY_AMBIGUOUS 라, 폴백이 유령 경로를 lease 에
     #   넣는 순간 master 전자동 사이클이 매번 deny 된다 — 전 경로의 부모 디렉터리 실존을 단정.
+    #   [c] 강화: 픽스처가 round/ 를 만들지 않았으므로 이 핀의 성립 = 폴백 분기의 makedirs
+    #   가 실제로 디렉터리를 보증했다는 증명이다(존재 전제 → 존재 보증으로 계약 격상).
     t.check("★반유령: 폴백 files 전 경로의 부모 디렉터리 실존(유령 0건)",
             all(os.path.isdir(os.path.dirname(f)) for f in sfr_fb["files"]),
             str(sfr_fb["files"]))
+    t.check("★[c] 폴백이 팩 round/ 를 스스로 생성(픽스처 미생성 → 호출 후 실존)",
+            os.path.isdir(os.path.join(PACKFIX, "round")))
     t.check("★반유령: 구 유령 폴백($HOME/_round·PROJECT/_round) 미등장",
             os.path.join(os.path.expanduser("~"), "_round", "SESSION_STATE.md")
             not in sfr_fb["files"]
@@ -2561,33 +2775,54 @@ def cmd_self_test(args):
     t.check("nt 분기 비파괴 구조 — os.kill 0회 + OpenProcess/GetExitCodeProcess 사용",
             "os.kill" not in src_win and "OpenProcess" in src_win
             and "GetExitCodeProcess" in src_win and "TerminateProcess" not in src_win)
+    t.check("★[a] 실경로 kernel32 = WinDLL(use_last_error=True) + get_last_error() 판독"
+            "(windll 공유 캐시·GetLastError 직접 판독 금지 — 페이크 주입 경로는 보존)",
+            'ctypes.WinDLL("kernel32", use_last_error=True)' in src_win
+            and "ctypes.get_last_error()" in src_win
+            and "ctypes.windll" not in src_win)
     t.check("dispatch: rc==127 로 플랫폼을 추정하지 않음(os_name 단일 분기)",
             "127" not in _insp.getsource(count_cycle_agent).split('"""')[2])
 
-    # 14) [P0-1] bootstrap-verifier --ensure 멱등 게이트 (조회 주입식 — 데몬 0)
-    print("[14] [P0-1] bootstrap-verifier --ensure 멱등 게이트")
+    # 14) [P0-1·C2] bootstrap-verifier --ensure 멱등 게이트 + 가드 5종 (조회 주입식 — 데몬 0)
+    print("[14] [P0-1·C2] bootstrap-verifier --ensure 멱등 게이트 + 가드 5종")
     now3 = time.time()
     vrow = {"role": VERIFIER_ROLE, "surface_id": 3, "exited": False, "surface_ref": "surface:3"}
     stt = {"surfaces": [vrow]}
     noop, why = ensure_verifier_noop(stt, now3 - 10, now3)
     t.check("surface 실재 + heartbeat 신선 → no-op(중복 pane 0 계약)", noop is True, why)
-    t.check("surface 부재 → 기동 필요",
-            ensure_verifier_noop({"surfaces": []}, now3 - 10, now3)[0] is False)
-    t.check("status 조회 불능(None) → 기동 쪽(중복은 new-surface 실패가 자연 차단)",
-            ensure_verifier_noop(None, now3 - 10, now3)[0] is False)
-    t.check("exited surface 는 실재 아님(surface_row 계약 그대로)",
+    # [C2-③] heartbeat 신선 = 독립 noop 충분조건 — status 상태와 무관(핀 갱신: 종전엔
+    #   아래 세 케이스가 '기동 필요'였고 그 오판이 살아있는 워처 옆 중복 pane 의 원천이었다).
+    t.check("★[C2-③] status 조회 불능(None) + heartbeat 신선 → no-op(중복 pane 차단)",
+            ensure_verifier_noop(None, now3 - 10, now3)[0] is True)
+    t.check("★[C2-③] surface 부재 판독 + heartbeat 신선 → no-op(heartbeat=생존 직접 증거)",
+            ensure_verifier_noop({"surfaces": []}, now3 - 10, now3)[0] is True)
+    t.check("★[C2-③] exited row + heartbeat 신선 → no-op",
             ensure_verifier_noop({"surfaces": [dict(vrow, exited=True)]},
-                                 now3 - 10, now3)[0] is False)
-    t.check("heartbeat 부재 → 기동 필요", ensure_verifier_noop(stt, None, now3)[0] is False)
-    t.check("heartbeat 노화(>HEARTBEAT_MAX_AGE) → 기동 필요",
+                                 now3 - 10, now3)[0] is True)
+    t.check("heartbeat 부재 → 기동 필요(row 실재해도)",
+            ensure_verifier_noop(stt, None, now3)[0] is False)
+    t.check("heartbeat 노화(>HEARTBEAT_MAX_AGE) → 기동 필요(row 실재해도 — 재사용은 [C2-⑤])",
             ensure_verifier_noop(stt, now3 - HEARTBEAT_MAX_AGE - 1, now3)[0] is False)
     t.check("경계 age==HEARTBEAT_MAX_AGE 는 신선(게이트6과 동일 부등호 <=)",
             ensure_verifier_noop(stt, now3 - HEARTBEAT_MAX_AGE, now3)[0] is True)
     bv_src = _insp.getsource(cmd_bootstrap_verifier)
     t.check("--ensure 게이트가 new-surface 보다 선행(소스 순서 핀)",
             bv_src.index("ensure_verifier_noop(") < bv_src.index("new_surface"))
-    t.check("--ensure 는 pane 상주 메커니즘 무접촉(new-surface+send+Return 현행 경로 보존)",
-            "send-key" in bv_src and '"Return"' in bv_src)
+    t.check("★[C2-①] kill-switch 선확인이 최선두(--ensure 게이트보다 선행 · EXIT_KILL)",
+            bv_src.index("kill_switch()") < bv_src.index("ensure_verifier_noop(")
+            and "return EXIT_KILL" in bv_src)
+    t.check("★[C2-②] shadow-noop 게이트가 --ensure 실기동보다 선행(live 승격 전 pane 0)",
+            '"shadow-noop"' in bv_src
+            and bv_src.index("MODE_LIVE") < bv_src.index("ensure_verifier_noop("))
+    t.check("★[C2-④] 백오프 판정이 pane 생성보다 선행 + 원장 bootstrap-backoff",
+            bv_src.index("bootstrap_attempts_within(") < bv_src.index('run(plan["new_surface"])')
+            and '"bootstrap-backoff"' in bv_src)
+    t.check("★[C2-⑤] 살아있는 row 재사용이 신규 생성보다 선행 + _BootstrapLock 원자화",
+            bv_src.index("surface_row(") < bv_src.index('run(plan["new_surface"])')
+            and "_BootstrapLock()" in bv_src
+            and bv_src.index("_BootstrapLock()") < bv_src.index("surface_row("))
+    t.check("★[C1] 신규 생성은 new-surface --cmd 직결 · 재주입(재사용) 경로만 send+Return 보존",
+            '"--cmd"' in bv_src and "send-key" in bv_src and '"Return"' in bv_src)
 
     # 15) [P0-2] quiesce 잔존 봉합 — abort/takeover 해제(멱등·fail-soft)
     print("[15] [P0-2] quiesce 잔존 봉합")
@@ -2627,6 +2862,15 @@ def cmd_self_test(args):
     t.check("tick takeover 경로에 release 배선(사후검증 인계보다 선행)",
             "release_quiesce(" in tick_src2
             and tick_src2.index("release_quiesce(") < tick_src2.index("post_verify("))
+    # [C5] takeover quiesce 해제 가드 — 고아 cycle-agent 0 확인이 해제보다 선행하고,
+    #   생존 시 유보 원장(warn)과 함께 인계 자체를 다음 틱으로 미룬다.
+    t.check("★[C5] takeover: count_cycle_agent 확인이 release_quiesce 보다 선행",
+            "count_cycle_agent()" in tick_src2
+            and tick_src2.index("count_cycle_agent()") < tick_src2.index("release_quiesce("))
+    t.check("★[C5] 고아 생존 → 'orphan alive, release deferred' 원장 + 유보 반환",
+            '"orphan alive, release deferred"' in tick_src2
+            and '"takeover-deferred"' in tick_src2
+            and tick_src2.index('"takeover-deferred"') < tick_src2.index("release_quiesce("))
 
     # 16) [크리틱 B3] mode/roles 파일 채널 — env 우선·부재 시 STATE_DIR 파일·손상=기본값
     print("[16] mode/roles 노브 — STATE_DIR 파일 채널(버전 범프 무언 회귀 차단)")
@@ -2645,6 +2889,13 @@ def cmd_self_test(args):
         t.check("미지 값 → shadow(fail-safe)", mode(state_dir=kd) == MODE_SHADOW)
         open(os.path.join(kd, "mode"), "wb").write(b"\xff\xfe\x00live")
         t.check("비UTF8 손상 → shadow(fail-safe)", mode(state_dir=kd) == MODE_SHADOW)
+        # [b] BOM 내성 — PowerShell `>`/Set-Content 기본(UTF-16 LE·BOM)과 UTF-8 BOM.
+        open(os.path.join(kd, "mode"), "wb").write(
+            b"\xff\xfe" + "live\n".encode("utf-16-le"))
+        t.check("★[b] UTF-16LE(BOM) 'live' → live(PowerShell 기본 인코딩 내성)",
+                mode(state_dir=kd) == MODE_LIVE)
+        open(os.path.join(kd, "mode"), "wb").write(b"\xef\xbb\xbflive\n")
+        t.check("★[b] UTF-8 BOM 'live' → live(utf-8-sig 흡수)", mode(state_dir=kd) == MODE_LIVE)
         open(os.path.join(kd, "mode"), "w", encoding="utf-8").write("live\n")
         os.environ["CYS_AUTOPILOT_MODE"] = "shadow"
         t.check("env 우선(파일 live 여도 env shadow 가 이김)", mode(state_dir=kd) == MODE_SHADOW)
@@ -2665,6 +2916,35 @@ def cmd_self_test(args):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    # 17) [C1·C2-④] 워처 기동 명령 방언 + 백오프 계수(순수)
+    print("[17] [C1] _watch_cmdline 셸 방언 + [C2-④] bootstrap_attempts_within")
+    wl = _watch_cmdline("/W S/javis_cycle_verifier.py", os_name="posix",
+                        executable="/P Y/python3")
+    t.check("posix: 선두 따옴표 경로 인용(공백 내성 · -lc POSIX 셸 방언)",
+            wl == '"/P Y/python3" "/W S/javis_cycle_verifier.py" watch', wl)
+    wn = _watch_cmdline("C:\\W S\\v.py", os_name="nt", executable="C:\\P\\python.exe")
+    t.check("★[C1] nt: PowerShell 호출 연산자 & 선행(선두 따옴표 토큰=표현식 파스 불능 봉합)",
+            wn == '& "C:\\P\\python.exe" "C:\\W S\\v.py" watch', wn)
+    t.check("기본 executable = sys.executable(python3 리터럴 금지 관례 유지)",
+            _watch_cmdline("/w.py", os_name="posix").startswith('"%s" ' % sys.executable))
+    recsB = [
+        {"ts": 100.0, "phase": "bootstrap", "detail": {"ok": True}},
+        {"ts": 200.0, "phase": "bootstrap", "detail": {"ok": False}},
+        {"ts": 300.0, "phase": "bootstrap", "detail": {"ensure_noop": True, "reason": "x"}},
+        {"ts": 350.0, "phase": "bootstrap", "detail": {"noop": "shadow", "mode": "shadow"}},
+        {"ts": 320.0, "phase": "verify", "detail": {"ok": True}},
+        {"ts": 1.0, "phase": "bootstrap", "detail": {"ok": True}},
+    ]
+    t.check("시도 계수 = 'ok' 키 보유 bootstrap 레코드만(noop·타 phase·창 밖 제외)",
+            bootstrap_attempts_within(recsB, 400.0, window=350.0) == 2)
+    t.check("창 밖 전건 → 0(백오프는 창이 지나면 자연 해제)",
+            bootstrap_attempts_within(recsB, 4000.0, window=100.0) == 0)
+    t.check("상한 계약 — %d회/%.0f초" % (BOOTSTRAP_BACKOFF_MAX, BOOTSTRAP_BACKOFF_WINDOW),
+            BOOTSTRAP_BACKOFF_MAX == 3 and BOOTSTRAP_BACKOFF_WINDOW == 3600.0)
+    t.check("_BootstrapLock 은 전용 락 파일(bootstrap.lock — state.json 락과 분리·lease 경로 비점유)",
+            'os.path.join(STATE_DIR, "bootstrap.lock")' in _insp.getsource(_BootstrapLock)
+            and "STATE_JSON" not in _insp.getsource(_BootstrapLock))
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

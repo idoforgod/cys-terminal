@@ -320,7 +320,7 @@ let _ = journal.sync_data();
 7. [ ] 실패 주입 B: `~/.local/state/cys-trash` 를 **파일**로 만든 뒤 실행 → 데몬이 죽기 **전에** 사전 거부되는가(P0-6)
 8. [ ] 실패 주입 C: 정지 단계에서 `Ctrl-C` → `데몬은 이미 정지되었고 launchd 자동시작 등록이 해제되었습니다 … cys daemon install` 이 출력되는가
 9. [ ] 리셋 후 `launchctl list | grep cysjavis` 미적재 확인 → 앱 재실행 시 `register_if_absent` 로 재등록되는가
-10. [ ] 재실행 첫 화면: `직원 복귀 중` 토스트가 **뜨지 않고**, 온보딩 카드(에이전트 로그인 → ▶CEO → ＋부서)가 보이는가. `로그인 항목을 허용하세요` 배너가 공존하지 않는가
+10. [ ] 재실행 첫 화면: `직원 복귀 중` 토스트가 **뜨지 않고**, 온보딩 카드가 보이는가(※괄호 예시 「에이전트 로그인 → ▶CEO → ＋부서」는 2026-08-20 P2 이후 구판 — 현행 온보딩은 pane 마스터 선언·`cys launch-agent` 경로다. ▶CEO·▶부서장 버튼은 제거됨). `로그인 항목을 허용하세요` 배너가 공존하지 않는가
 11. [ ] 재실행 후 테마·창 배치·워크스페이스가 **초기값**인가(localStorage `cys-layout-v2` 소거 확인)
 12. [ ] `cys factory-reset --undo <trash-dir>` → 부서·대화기억·`_round` 가 원위치로 돌아오고 앱이 정상 기동하는가
 13. [ ] 에이전트 pane 안에서 `cys factory-reset` → guard.sh DENY 문구 + exit 2 (오케스트레이션 앵커 보전)
