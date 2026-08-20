@@ -806,7 +806,7 @@ def evaluate_gates(role, ctx, now_ts):
     # 5. single-flight
     procs = ctx.get("cycle_agent_procs", 0)
     add(6, "single-flight", ctx.get("lease_free", False) and procs == 0,
-        "lease_free=%s pgrep(cys cycle-agent)=%d" % (ctx.get("lease_free"), procs))
+        "lease_free=%s procs(cycle-agent)=%d" % (ctx.get("lease_free"), procs))
 
     # 6. 검증자 워처 생존
     hb = ctx.get("heartbeat_mtime")
@@ -876,9 +876,41 @@ def save_state(st):
     os.replace(tmp, STATE_JSON)
 
 
-def pid_alive(pid):
+def _pid_alive_windows(pid, kernel32=None):
+    """[R3] Windows 비파괴 생존확인 — OpenProcess(QUERY_LIMITED)+GetExitCodeProcess.
+
+    ★os.kill(pid, 0) 금지: Windows CPython 의 os.kill 은 시그널 0 도 OpenProcess+
+      TerminateProcess 계열로 접힌다 — "생존확인이 대상을 죽일 개연성"(CPython 문서에
+      sig 0 이 예외적으로 무해하다는 보장이 없다). 표준 라이브러리(ctypes)만 사용.
+    판정 계약: 핸들 획득 → GetExitCodeProcess == STILL_ACTIVE(259) 만 생존.
+      OpenProcess 실패 중 ERROR_ACCESS_DENIED(5) = '존재하는데 접근 불가' → True(보수적).
+      그 외 실패·예외 = False. kernel32 인자는 테스트 주입점(posix 에서 분기 직접 검증).
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+    try:
+        import ctypes
+        if kernel32 is None:
+            kernel32 = ctypes.windll.kernel32     # nt 전용 — posix 는 주입 경로만 온다
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong(0)
+            ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def pid_alive(pid, os_name=os.name):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os_name != "posix":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -904,8 +936,43 @@ def lease_state(st, now_ts):
     return lease, "live"
 
 
-def count_cycle_agent(runner=run):
-    """pgrep -f 'cys cycle-agent' 건수. 판정 불능이면 보수적으로 1(=발화 금지)."""
+# [R3] Windows single-flight 계수 명령 — 함정 2종 회피가 이 문자열의 계약이다:
+#   (a) 질의 프로세스 자기매칭: powershell 자신의 CommandLine 에 'cycle-agent' 리터럴이
+#       실리므로 Name='cys.exe'/'cys' 필터 + ProcessId -ne $PID 자기제외를 겹친다.
+#   (b) 절대경로·따옴표 기동("C:\...\cys.exe" cycle-agent)은 'cys cycle-agent' 부분문자열이
+#       불성립 → 패턴은 'cycle-agent' 단독 + Name 필터로 좁힌다.
+_WIN_COUNT_PS = (
+    "Get-CimInstance Win32_Process -Filter \"Name='cys.exe' OR Name='cys'\" | "
+    "Where-Object { $_.CommandLine -match 'cycle-agent' -and $_.ProcessId -ne $PID } | "
+    "Measure-Object | Select-Object -ExpandProperty Count")
+
+
+def _count_cycle_agent_windows(runner):
+    """[R3] Windows: PowerShell CIM 계수. PS 실패(rc≠0·타임아웃·비숫자)=보수적 1(fail-closed).
+
+    출력 파싱은 방어적으로 마지막 비공백 줄의 숫자만 신뢰한다 — run() 은 text 모드라
+    cp1252 콘솔 이력(MEMORY cys-01411 #4)상 잡음 섞임·디코드 실패(→rc 127) 모두 1 로 접힌다.
+    """
+    rc, out, _e = runner(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", _WIN_COUNT_PS])
+    if rc != 0:
+        return 1
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if not lines or not lines[-1].isdigit():
+        return 1
+    return int(lines[-1])
+
+
+def count_cycle_agent(runner=run, os_name=os.name):
+    """cycle-agent 프로세스 건수. 판정 불능이면 보수적으로 1(=발화 금지).
+
+    [R3] 분기 조건은 os_name(기본 os.name) 뿐이다 — rc==127 로 Windows 를 추정하는
+    판정은 금지: run() 이 **모든** 예외(POSIX pgrep 타임아웃 포함)를 127 로 정규화하므로
+    127 분기는 POSIX 판정불능을 Windows 경로로 fail-open 반전시킨다.
+    POSIX 경로(pgrep)는 종전과 동일(바이트 불변).
+    """
+    if os_name != "posix":
+        return _count_cycle_agent_windows(runner)
     rc, out, _e = runner(["pgrep", "-f", "cys cycle-agent"])
     if rc == 1:
         return 0
@@ -1537,7 +1604,7 @@ def post_verify(role, cycle_id, lease, takeover=False):
 
     # ⓒ /clear 큐 걸림 — 재집행 금지, 복원 포인터만 멱등 선적재
     if not v["a_effective"] and (v.get("queue_depth") or 0) > 0:
-        rc, _o, e = run(["python3", os.path.join(pack_dir(), "bin", "javis_wakeup.py"), "enqueue",
+        rc, _o, e = run([sys.executable, os.path.join(pack_dir(), "bin", "javis_wakeup.py"), "enqueue",
                          "--to", role, "--task", "cycle-resume",
                          "--reason", "cycle-%d clear 큐 걸림 — 복원 포인터 선적재" % cycle_id,
                          "--idempotency-key", nonce_for(cycle_id)])
@@ -1684,7 +1751,9 @@ def cmd_bootstrap_verifier(args):
     if not os.path.exists(watcher):
         print("검증자 스크립트 부재: %s" % watcher, file=sys.stderr)
         return EXIT_ERR
-    cmdline = "python3 %s watch" % watcher
+    # [R3] python3 리터럴 금지(escalate 의 sys.executable 선례와 정합) + 경로 따옴표
+    #   (공백 경로 파손 병기 수리 — pane 셸에 문자열로 주입되므로 인용이 필수다).
+    cmdline = '"%s" "%s" watch' % (sys.executable, watcher)
     plan = {"new_surface": [CYS, "new-surface", "--role", VERIFIER_ROLE,
                             "--title", "cycle-verifier", "--cwd", PROJECT],
             "send": cmdline}
@@ -1764,34 +1833,43 @@ def cmd_self_test(args):
     print("[1] 원장 동시 append (O_APPEND + flock + 단일 write)")
     tmpd = tempfile.mkdtemp(prefix="cycautotest-")
     logp = os.path.join(tmpd, "cycle_autopilot_log.jsonl")
-    kids, NPROC, NLINE = [], 8, 60
-    for i in range(NPROC):
-        pid = os.fork()
-        if pid == 0:
+    # ★Windows(R3): os.fork 는 POSIX 전용 → 이 케이스만 [SKIP](PASS 아님·나머지 배터리는
+    #   전부 실행). 동시성 계약 자체는 POSIX drill(mac CI)이 확증한다 —
+    #   javis_state_snapshot T2 선례 동형(블랜킷 skip 금지). hasattr 겹은 fork **부재**가
+    #   판정 실체이기 때문(winsim 재현 포함 — nt 에서는 hasattr 이 항상 False 라 동치).
+    if os.name == "nt" or not hasattr(os, "fork"):
+        print("  [SKIP] 동시 append 는 os.fork(POSIX) 필요 — Windows 미지원(mac CI 가 확증). "
+              "나머지 케이스는 실행.")
+    else:
+        kids, NPROC, NLINE = [], 8, 60
+        for i in range(NPROC):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    for j in range(NLINE):
+                        log_append({"ts": time.time(), "cycle_id": i * 1000 + j,
+                                    "phase": "would_fire",
+                                    "role": "w%d" % i, "surface": "surface:%d" % i,
+                                    "detail": {"x": "y" * 200}}, path=logp)
+                finally:
+                    os._exit(0)
+            kids.append(pid)
+        for pid in kids:
+            os.waitpid(pid, 0)
+        lines = [l for l in open(logp, encoding="utf-8").read().splitlines() if l.strip()]
+        parsed, badk = 0, 0
+        for l in lines:
             try:
-                for j in range(NLINE):
-                    log_append({"ts": time.time(), "cycle_id": i * 1000 + j, "phase": "would_fire",
-                                "role": "w%d" % i, "surface": "surface:%d" % i,
-                                "detail": {"x": "y" * 200}}, path=logp)
-            finally:
-                os._exit(0)
-        kids.append(pid)
-    for pid in kids:
-        os.waitpid(pid, 0)
-    lines = [l for l in open(logp, encoding="utf-8").read().splitlines() if l.strip()]
-    parsed, badk = 0, 0
-    for l in lines:
-        try:
-            r = json.loads(l)
-        except ValueError:
-            continue
-        parsed += 1
-        if set(r.keys()) != set(LOG_KEYS):
-            badk += 1
-    t.check("append 라인수 == %d" % (NPROC * NLINE), len(lines) == NPROC * NLINE,
-            "실제 %d" % len(lines))
-    t.check("전 라인 JSON 파싱", parsed == len(lines), "%d/%d" % (parsed, len(lines)))
-    t.check("전 라인 키 == LOG_KEYS", badk == 0, "위반 %d" % badk)
+                r = json.loads(l)
+            except ValueError:
+                continue
+            parsed += 1
+            if set(r.keys()) != set(LOG_KEYS):
+                badk += 1
+        t.check("append 라인수 == %d" % (NPROC * NLINE), len(lines) == NPROC * NLINE,
+                "실제 %d" % len(lines))
+        t.check("전 라인 JSON 파싱", parsed == len(lines), "%d/%d" % (parsed, len(lines)))
+        t.check("전 라인 키 == LOG_KEYS", badk == 0, "위반 %d" % badk)
 
     # 2) 로그 절단
     print("[2] LOG_MAX_BYTES 절단")
@@ -1898,7 +1976,7 @@ def cmd_self_test(args):
     v = evaluate_gates("worker", ctx_of(heartbeat_mtime=None), now_ts)
     t.check("verifier heartbeat 부재 → skip", not v["pass"])
     v = evaluate_gates("worker", ctx_of(cycle_agent_procs=1), now_ts)
-    t.check("pgrep cycle-agent 1건 → skip", not v["pass"])
+    t.check("procs cycle-agent 1건 → skip", not v["pass"])
     v = evaluate_gates("worker", ctx_of(lease_free=False), now_ts)
     t.check("lease 점유 → skip", not v["pass"])
     v = evaluate_gates("worker", ctx_of(ledger={"cycles": 2, "last_terminal_phase": SUCCESS_PHASE,
@@ -2309,6 +2387,81 @@ def cmd_self_test(args):
     t.check("execute 가 executor_exited 로 종료 phase 기록",
             '"executor_exited"' in exec_src and '"cleared"' not in exec_src)
     t.check("in-flight 폴링 1s", KILL_POLL_SECS == 1.0)
+
+    # 13) [R3] Windows single-flight 개통 — 분기표(runner 주입)·pid_alive 비파괴
+    print("[13] R3 — count_cycle_agent 분기표 + pid_alive 비파괴(주입식)")
+    # 13-a) posix 분기 — pgrep rc 계약(바이트 불변 경로)
+    t.check("posix: pgrep rc=1(0건) → 0",
+            count_cycle_agent(lambda cmd: (1, "", ""), os_name="posix") == 0)
+    t.check("posix: rc=0 + pid 목록 → N",
+            count_cycle_agent(lambda cmd: (0, "123\n456\n", ""), os_name="posix") == 2)
+    t.check("posix: rc=127(러너 예외 정규화) → 보수적 1",
+            count_cycle_agent(lambda cmd: (127, "", "runner error"), os_name="posix") == 1)
+    # 13-b) nt 분기 — PS count 파싱·fail-closed (os.name 몽키패치 대신 os_name 인자 주입)
+    seen_argv = {}
+
+    def _ps_ok(cmd):
+        seen_argv["cmd"] = cmd
+        return 0, "2\r\n", ""
+    t.check("nt: PS 성공 count=2 파싱", count_cycle_agent(_ps_ok, os_name="nt") == 2)
+    ps_cmd = " ".join(seen_argv.get("cmd") or [])
+    t.check("nt: powershell -NoProfile 경유", seen_argv["cmd"][0] == "powershell"
+            and "-NoProfile" in seen_argv["cmd"], str(seen_argv.get("cmd"))[:120])
+    t.check("nt: 자기매칭 함정 회피(ProcessId 자기제외 + Name 필터)",
+            "$PID" in ps_cmd and "Name='cys.exe'" in ps_cmd, ps_cmd[:160])
+    t.check("nt: 패턴은 'cycle-agent'(절대경로·따옴표 기동 포섭 — 'cys cycle-agent' 아님)",
+            "'cycle-agent'" in ps_cmd and "'cys cycle-agent'" not in ps_cmd)
+    t.check("nt: PS rc≠0 → 보수적 1",
+            count_cycle_agent(lambda cmd: (1, "", "err"), os_name="nt") == 1)
+    t.check("nt: rc=127(타임아웃 정규화) → 보수적 1",
+            count_cycle_agent(lambda cmd: (127, "", ""), os_name="nt") == 1)
+    t.check("nt: 비숫자 출력 → 보수적 1",
+            count_cycle_agent(lambda cmd: (0, "Get-CimInstance : error\n", ""), os_name="nt") == 1)
+    t.check("nt: 공백·잡음 줄 뒤 마지막 숫자 줄만 신뢰",
+            count_cycle_agent(lambda cmd: (0, "\n 0 \n", ""), os_name="nt") == 0)
+    # 13-c) pid_alive — 실 pid 핀(현 플랫폼 dispatch) + nt 분기 주입식·비파괴 구조
+    t.check("pid_alive: 자기 pid → True", pid_alive(os.getpid()) is True)
+    t.check("pid_alive: 불가능 pid(2**22+9999) → False", pid_alive(2 ** 22 + 9999) is False)
+
+    class _FakeK32(object):
+        """kernel32 주입 페이크 — OpenProcess/GetExitCodeProcess/CloseHandle/GetLastError."""
+
+        def __init__(self, handle, exit_code=259, last_error=0, ok=1):
+            self.handle, self.exit_code, self.last_error, self.ok = \
+                handle, exit_code, last_error, ok
+            self.closed = 0
+
+        def OpenProcess(self, access, inherit, pid):
+            return self.handle
+
+        def GetLastError(self):
+            return self.last_error
+
+        def GetExitCodeProcess(self, h, ref):
+            ref._obj.value = self.exit_code
+            return self.ok
+
+        def CloseHandle(self, h):
+            self.closed += 1
+            return 1
+
+    k = _FakeK32(handle=1234, exit_code=259)
+    t.check("nt 주입: 핸들 획득 + STILL_ACTIVE(259) → True",
+            _pid_alive_windows(42, kernel32=k) is True)
+    t.check("nt 주입: 핸들은 반드시 CloseHandle", k.closed == 1)
+    t.check("nt 주입: 핸들 획득 + exit code 0(종료됨) → False",
+            _pid_alive_windows(42, kernel32=_FakeK32(handle=1234, exit_code=0)) is False)
+    t.check("nt 주입: OpenProcess 실패 + ERROR_ACCESS_DENIED(5) → True(보수적)",
+            _pid_alive_windows(42, kernel32=_FakeK32(handle=0, last_error=5)) is True)
+    t.check("nt 주입: OpenProcess 실패 + 그 외(87) → False",
+            _pid_alive_windows(42, kernel32=_FakeK32(handle=0, last_error=87)) is False)
+    # docstring 은 금지어(os.kill)를 설명 용도로 담으므로 코드 본문만 검사한다.
+    src_win = _insp.getsource(_pid_alive_windows).split('"""')[2]
+    t.check("nt 분기 비파괴 구조 — os.kill 0회 + OpenProcess/GetExitCodeProcess 사용",
+            "os.kill" not in src_win and "OpenProcess" in src_win
+            and "GetExitCodeProcess" in src_win and "TerminateProcess" not in src_win)
+    t.check("dispatch: rc==127 로 플랫폼을 추정하지 않음(os_name 단일 분기)",
+            "127" not in _insp.getsource(count_cycle_agent).split('"""')[2])
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

@@ -83,7 +83,11 @@ jobs:
           #   단절이 원인이라 **Windows 에서 더 자주** 발현한다(git-bash 한 겹 + 고아 프로세스의
           #   부모 pid 소멸). 검체 자체는 소스 구조 판정이라 플랫폼 무관이지만, Windows 러너가
           #   빌드하는 그 트리에 3겹이 실제로 실려 있는지를 이 레인에서도 확증한다.
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1"
+          # ★H-CYCLE-1 동승(2026-08-20 R3): cycle-autopilot Windows single-flight 개통 —
+          #   count_cycle_agent os_name 분기표(nt=PowerShell CIM fail-closed) · pid_alive
+          #   비파괴(OpenProcess 계열 · os.kill 0회) · self-test os.fork 케이스 한정 SKIP.
+          #   판정은 주입식(전 플랫폼 결정론)이지만 Windows 실기 트리에 실려 있음을 이 레인이 확증한다.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           python "$R" --only "$WIN_SPECIMENS"
           python "$R" --only "$WIN_SPECIMENS" --json > win-health.json

@@ -1121,31 +1121,40 @@ def cmd_self_test(args):
     # 6) 동시성 append (계약 공유)
     print("[6] 원장 동시 append")
     logp = os.path.join(tmpd, "cycle_autopilot_log.jsonl")
-    kids, NPROC, NLINE = [], 6, 50
-    for i in range(NPROC):
-        pid = os.fork()
-        if pid == 0:
+    # ★Windows(R3): os.fork 는 POSIX 전용 → 이 케이스만 [SKIP](PASS 아님·나머지 배터리와
+    #   패리티 [7] 은 전부 실행). 동시성 계약 자체는 POSIX drill(mac CI)이 확증한다 —
+    #   javis_state_snapshot T2 선례 동형(블랜킷 skip 금지). hasattr 겹은 fork **부재**가
+    #   판정 실체이기 때문(winsim 재현 포함 — nt 에서는 hasattr 이 항상 False 라 동치).
+    if os.name == "nt" or not hasattr(os, "fork"):
+        print("  [SKIP] 동시 append 는 os.fork(POSIX) 필요 — Windows 미지원(mac CI 가 확증). "
+              "나머지 케이스는 실행.")
+    else:
+        kids, NPROC, NLINE = [], 6, 50
+        for i in range(NPROC):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    for j in range(NLINE):
+                        log_append({"ts": time.time(), "cycle_id": None, "phase": "verify",
+                                    "role": "v%d" % i, "surface": None,
+                                    "detail": {"pad": "q" * 150, "j": j}}, path=logp)
+                finally:
+                    os._exit(0)
+            kids.append(pid)
+        for pid in kids:
+            os.waitpid(pid, 0)
+        lines = [l for l in open(logp, encoding="utf-8").read().splitlines() if l.strip()]
+        good = 0
+        for l in lines:
             try:
-                for j in range(NLINE):
-                    log_append({"ts": time.time(), "cycle_id": None, "phase": "verify",
-                                "role": "v%d" % i, "surface": None,
-                                "detail": {"pad": "q" * 150, "j": j}}, path=logp)
-            finally:
-                os._exit(0)
-        kids.append(pid)
-    for pid in kids:
-        os.waitpid(pid, 0)
-    lines = [l for l in open(logp, encoding="utf-8").read().splitlines() if l.strip()]
-    good = 0
-    for l in lines:
-        try:
-            r = json.loads(l)
-            if set(r.keys()) == set(LOG_KEYS):
-                good += 1
-        except ValueError:
-            pass
-    t.check("라인수 == %d" % (NPROC * NLINE), len(lines) == NPROC * NLINE, "실제 %d" % len(lines))
-    t.check("전 라인 무결(JSON+키)", good == len(lines), "%d/%d" % (good, len(lines)))
+                r = json.loads(l)
+                if set(r.keys()) == set(LOG_KEYS):
+                    good += 1
+            except ValueError:
+                pass
+        t.check("라인수 == %d" % (NPROC * NLINE), len(lines) == NPROC * NLINE,
+                "실제 %d" % len(lines))
+        t.check("전 라인 무결(JSON+키)", good == len(lines), "%d/%d" % (good, len(lines)))
 
     # 7) 계약 블록 동일성
     print("[7] 두 스크립트 계약 블록 동일성")

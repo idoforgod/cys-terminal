@@ -3131,6 +3131,70 @@ def h_win_12():
     return "System32 스텁(timeout·gtimeout) 하 save-state exit 0 + BOOT_SNAPSHOT.md 실재"
 
 
+@specimen("H-CYCLE-1", "W6",
+          "cycle-autopilot Windows single-flight — os_name 분기표·pid_alive 비파괴·fork SKIP",
+          ["R3-WIN-SF"])
+def h_cycle_1():
+    """R3 개통 슬라이스 회귀 핀 3속(전 플랫폼 결정론 — 분기는 인자 주입으로 직접 구동).
+
+    ① count_cycle_agent 분기표: 분기 조건은 os_name 뿐(rc==127 플랫폼 추정 금지 — run() 이
+       POSIX pgrep 타임아웃까지 127 로 정규화하므로 127 분기는 fail-open 반전). posix=pgrep
+       rc 계약 그대로, nt=PowerShell CIM(자기매칭 함정 회피: Name 필터+$PID 자기제외,
+       패턴 'cycle-agent' 단독) · PS 실패=보수적 1(fail-closed).
+    ② pid_alive nt 분기 비파괴 구조: os.kill(sig 0 도 Windows CPython 에서 OpenProcess+
+       TerminateProcess 계열로 접힘) 0회 — OpenProcess(QUERY_LIMITED)+GetExitCodeProcess
+       +CloseHandle 만. ACCESS_DENIED(5)=True(보수적)·그 외 실패=False.
+    ③ self-test os.fork SKIP: 양 스크립트 cmd_self_test 의 fork 케이스만 os.name=="nt"
+       가드(javis_state_snapshot T2 선례 동형 · 블랜킷 skip 금지) — Windows 실기에서
+       self-test 배터리·계약 패리티가 계속 돈다."""
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import importlib
+    import inspect
+    A = importlib.import_module("javis_cycle_autopilot")
+    # ① 분기표 — posix 경로(pgrep rc 계약)
+    need(A.count_cycle_agent(lambda cmd: (1, "", ""), os_name="posix") == 0,
+         "posix rc=1(0건) → 0 위반")
+    need(A.count_cycle_agent(lambda cmd: (0, "11\n22\n", ""), os_name="posix") == 2,
+         "posix rc=0 pid 2건 → 2 위반")
+    need(A.count_cycle_agent(lambda cmd: (127, "", "boom"), os_name="posix") == 1,
+         "posix rc=127(러너 예외 정규화) → 보수적 1 위반")
+    # ① 분기표 — nt 경로(PS 성공 파싱·실패 fail-closed·자기매칭 함정 회피 명령 계약)
+    seen = {}
+
+    def _cap(cmd):
+        seen["cmd"] = cmd
+        return 0, "3\r\n", ""
+    need(A.count_cycle_agent(_cap, os_name="nt") == 3, "nt PS count=3 파싱 위반")
+    ps = " ".join(seen["cmd"])
+    need(seen["cmd"][0] == "powershell" and "-NoProfile" in seen["cmd"],
+         "nt 계수는 powershell -NoProfile 경유여야 한다: %r" % seen["cmd"][:3])
+    need("$PID" in ps and "Name='cys.exe'" in ps,
+         "자기매칭 함정 회피(ProcessId 자기제외+Name 필터) 소실: %s" % ps[:160])
+    need("'cycle-agent'" in ps and "'cys cycle-agent'" not in ps,
+         "패턴은 'cycle-agent' 단독(절대경로·따옴표 기동 포섭)이어야 한다")
+    need(A.count_cycle_agent(lambda cmd: (1, "", "err"), os_name="nt") == 1,
+         "nt PS rc≠0 → 보수적 1 위반")
+    need(A.count_cycle_agent(lambda cmd: (0, "not-a-number\n", ""), os_name="nt") == 1,
+         "nt 비숫자 출력 → 보수적 1 위반")
+    # ② pid_alive — 현 플랫폼 dispatch 실측 + nt 분기 코드 본문의 비파괴 구조
+    need(A.pid_alive(os.getpid()) is True, "자기 pid 생존확인 False")
+    need(A.pid_alive(2 ** 22 + 9999) is False, "불가능 pid 가 True")
+    body = inspect.getsource(A._pid_alive_windows).split('"""')[2]   # docstring 제외 코드만
+    need("os.kill" not in body and "TerminateProcess" not in body,
+         "nt 생존확인에 파괴 계열(os.kill/TerminateProcess) 재유입")
+    need("OpenProcess" in body and "GetExitCodeProcess" in body and "CloseHandle" in body,
+         "nt 생존확인이 OpenProcess+GetExitCodeProcess+CloseHandle 3종을 잃음")
+    # ③ self-test fork SKIP 가드 — 양 스크립트(케이스 한정 · 블랜킷 skip 아님).
+    #   가드는 nt + fork 부재(hasattr) 이중 — winsim(os.fork 만 제거) 재현까지 포섭한다.
+    for mod in ("javis_cycle_autopilot", "javis_cycle_verifier"):
+        src = inspect.getsource(importlib.import_module(mod).cmd_self_test)
+        need('os.name == "nt" or not hasattr(os, "fork")' in src and "os.fork()" in src,
+             "%s cmd_self_test 에 fork 케이스 한정 SKIP 가드(nt+fork 부재) 부재" % mod)
+    return ("분기표(posix pgrep 불변·nt PS fail-closed)+비파괴 pid_alive+fork SKIP 가드 "
+            "— 전 플랫폼 주입식 판정")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. H-PRED / H-TIME / H-DOC / H-SEED / H-LIFE / H-OBS
 # ═══════════════════════════════════════════════════════════════════════════
