@@ -395,6 +395,67 @@ def escalate(text, runner=run):
 # ═══════════════════════ CONTRACT BLOCK v1 END ═══════════════════════
 
 
+# ── (블록 밖 · I3 선례) R1 — Windows 상태 dir 정합 override ──────────────────
+#
+# ⚠이 재정의가 CONTRACT BLOCK v1 **밖**에 있는 것은 의도다(회피가 아니라 범위 준수):
+#   블록은 javis_cycle_autopilot.py 와 **바이트 동일**해야 하고 self-test [7]의
+#   contract-parity 검사가 그것을 박제한다. 그래서 블록은 원형 그대로 두고 **모듈
+#   수준에서 심볼만 덮어쓴다** — 선례 = autopilot 의 I3 escalate 재정의
+#   (javis_cycle_autopilot.py:386-403). 이 파일 안의 소비자는 feed_jsonl_path 하나뿐이며
+#   아래 재정의를 본다. 블록을 옮길 때(양쪽 동시 갱신)는 이 override 를 블록으로 흡수하라.
+#
+# 왜 필요한가(실측): 블록 원형 state_socket_dir 는 "소켓 dirname = 상태 dir"(unix 전제)를
+#   가정한다. Windows 의 소켓은 named pipe(`\\.\pipe\cys`)라 파일시스템 부모가 없다 —
+#   dirname 은 `\\.\pipe` 로 접히고, env 부재 폴백 ~/.local/state/cys 도 데몬 정본
+#   %LOCALAPPDATA%\cys(src/bin/cysd/state.rs::pipe_slug/state_dir)와 불일치한다.
+#   → feed.jsonl 을 영영 못 읽어 전건 V_DENY_AMBIGUOUS(Windows 검증자 무력화).
+
+# 번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+# append 인 이유: 발견이 목적이지 기존 항목의 precedence 강등이 아니다(선례: javis_memory.py:41-43).
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+_SNAPSHOT_MOD = None            # None=미시도 · False=로드 실패(LOUD 1회 박제) · 모듈=성공
+
+
+def _snapshot_mod():
+    """형제 파일 javis_state_snapshot 로드·캐시 — Windows 파이프→상태 dir 매핑 규칙의
+    단일 소스 재사용(중복 구현 금지 · javis_phoenix.py _snap_mod 동형). 실패 시 None
+    (LOUD stderr 1줄 · 실패도 캐시 — watch 2초 폴링의 스팸 방지)."""
+    global _SNAPSHOT_MOD
+    if _SNAPSHOT_MOD is None:
+        try:
+            import javis_state_snapshot as _s
+            _SNAPSHOT_MOD = _s
+        except Exception as e:  # noqa: BLE001 — 아래 최후 폴백이 있어 fail-soft
+            _SNAPSHOT_MOD = False
+            print("⚠ [cycle-verifier] javis_state_snapshot 로드 실패 — Windows 상태 dir "
+                  "매핑을 최후 폴백(LOCALAPPDATA 직접 조립·부서 슬러그 미지원)으로 접는다: %s" % e,
+                  file=sys.stderr)
+    return _SNAPSHOT_MOD or None
+
+
+_state_socket_dir_contract = state_socket_dir   # 블록 원형 보존(POSIX 동작 바이트 불변)
+
+
+def state_socket_dir():
+    """[R1] Windows: 소켓 dirname ≠ 상태 dir(named pipe 엔 파일시스템 부모가 없다) —
+    데몬 정본(%LOCALAPPDATA%\\cys · state.rs pipe_slug/state_dir 규칙)을 따른다.
+    매핑 단일 소스 = javis_state_snapshot._win_state_dir_for_socket 재사용(복제 금지)."""
+    if os.name != "nt":
+        return _state_socket_dir_contract()
+    sock = (os.environ.get("AITERM_SOCKET", "").strip()
+            or os.environ.get("CYS_SOCKET", "").strip())  # 키 순서 = 블록 원형 그대로(변경 금지)
+    snap = _snapshot_mod()
+    if snap is not None:
+        return snap._win_state_dir_for_socket(sock or "\\\\.\\pipe\\cys")
+    # 최후 폴백(스냅샷 모듈 소실) — state.rs 기본 데몬 규칙만 직접 접는다.
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local")
+    return os.path.join(base, "cys")
+
+
 # ── 검증자 고유 상수 ──────────────────────────────────────────────────
 FEED_KIND = "cycle-verify"
 POLL_SECS = 2.0                 # pending 폴링 주기
@@ -1094,6 +1155,46 @@ def cmd_self_test(args):
             src.count("start_new" + "_session") == 0 and src.count("os." + "setsid") == 0
             and src.count("preexec" + "_fn") == 0)
     t.check("clear 명령 직접 타이핑 0회", src.count("--clear" + "-cmd") == 0)
+
+    # 9) [R1] 블록 밖 Windows 상태 dir override 정합 — mac 에서 실행 가능한 회귀 핀
+    print("[9] R1 — Windows 상태 dir override(블록 밖·I3 선례) 정합")
+    t.check("블록 원형 심볼 보존(_state_socket_dir_contract)",
+            callable(_state_socket_dir_contract)
+            and _state_socket_dir_contract is not state_socket_dir)
+    saved_env = {k: os.environ.get(k) for k in ("AITERM_SOCKET", "CYS_SOCKET")}
+    try:
+        os.environ.pop("AITERM_SOCKET", None)
+        os.environ["CYS_SOCKET"] = os.path.join(tmpd, "cys.sock")
+        if os.name != "nt":
+            t.check("POSIX 관통 — override == 블록 원형(소켓 env 주입)",
+                    state_socket_dir() == _state_socket_dir_contract() == tmpd,
+                    "%s vs %s" % (state_socket_dir(), tmpd))
+            t.check("feed_jsonl_path 가 override 를 경유(소켓 env 주입)",
+                    feed_jsonl_path() == os.path.join(tmpd, "feed.jsonl"))
+            os.environ.pop("CYS_SOCKET", None)
+            t.check("POSIX 관통 — env 부재 폴백도 블록 원형과 동일",
+                    state_socket_dir() == _state_socket_dir_contract())
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    snap = _snapshot_mod()
+    t.check("매핑 단일 소스(javis_state_snapshot) 로드", snap is not None)
+    if snap is not None:
+        lad = os.path.join(tmpd, "LocalAppData")
+        pipe_default = "\\\\.\\pipe\\cys"
+        pipe_dept = "\\\\.\\pipe\\cys-dept-x"
+        t.check("기본 파이프 → LOCALAPPDATA/cys (주입식 매핑)",
+                snap._win_state_dir_for_socket(pipe_default, localappdata=lad)
+                == os.path.realpath(os.path.join(lad, "cys")))
+        t.check("부서 파이프 → cys/<슬러그> 격리 dir (주입식 매핑)",
+                snap._win_state_dir_for_socket(pipe_dept, localappdata=lad)
+                == os.path.realpath(os.path.join(lad, "cys", "cys-dept-x")))
+        t.check("슬러그 규칙 = state.rs pipe_slug 동형",
+                snap._win_pipe_slug(pipe_default) == "cys"
+                and snap._win_pipe_slug(pipe_dept) == "cys-dept-x")
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

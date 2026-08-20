@@ -75,9 +75,15 @@ def index_links(index_text):
             if "/" not in m.group(1) and m.group(1) != INDEX_FILE]
 
 
+# ★팩 경로 env 키의 우선순위 목록(W14 S19 · P3). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+#   목록·순서가 기계 대조된다(bin/tests/test_todo_shared_constants.py). 종전 3키에는
+#   `AITERM_PACK_DIR`가 빠져 있어 레거시 env 환경에서 memory 위치가 다른 도구와 갈렸다.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def default_memory_dir():
-    """pack 위치 결정 — src/pack.rs pack_dir()의 폴백을 그대로 미러링한다."""
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """pack 위치 결정 — src/pack.rs pack_dir()의 폴백(PACK_DIR_ENV_KEYS)을 그대로 미러링한다."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return os.path.join(v, "memory")

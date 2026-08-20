@@ -50,11 +50,17 @@ def read_stdin(timeout=5.0):
     return buf.get("data")
 
 
+# ★팩 경로 env 키의 우선순위 목록(W14 S19 · P3). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+#   목록·순서가 기계 대조된다(bin/tests/test_todo_shared_constants.py). 종전 2키는 레거시
+#   AITERM_* 2종을 전부 놓쳐 주입 스캔 위치가 memory 생성 위치와 갈렸다.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def memory_dir():
-    v = os.environ.get("CYS_MEMORY_DIR")
+    v = os.environ.get("CYS_MEMORY_DIR")  # 명시 memory dir 최우선 — 유지(계약)
     if v:
         return v
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR"):
+    for key in PACK_DIR_ENV_KEYS:
         p = os.environ.get(key, "")
         if p:
             return os.path.join(p, "memory")

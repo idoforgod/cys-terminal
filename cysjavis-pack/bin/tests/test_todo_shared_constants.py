@@ -32,6 +32,9 @@ REPO = os.path.dirname(os.path.dirname(BIN))                             # 저�
 sys.path.insert(0, BIN)
 
 import javis_bootstrap as BOOT                                           # noqa: E402
+import javis_distill as DST                                              # noqa: E402
+import javis_memory as MEM                                               # noqa: E402
+import javis_memory_inject as INJ                                        # noqa: E402
 import javis_orchestra as ORC                                            # noqa: E402
 import javis_preflight as PFL                                            # noqa: E402
 import javis_report as RP                                                # noqa: E402
@@ -89,6 +92,15 @@ class PackDirEnvKeys(unittest.TestCase):
                          "preflight 팩 env 목록이 갈렸다 — 검사 대상 팩 ≠ 실사용 팩(A11)")
         self.assertEqual(RP.PACK_DIR_ENV_KEYS, BOOT.PACK_DIR_ENV_KEYS,
                          "bootstrap 팩 env 목록이 갈렸다 — 부트가 다른 팩을 기동(A11)")
+        # ★P3: memory-dir env 가족 3구현도 같은 목록을 갖는다. 실측 분열은
+        #   memory·distill=3키(AITERM_PACK_DIR 누락) · inject=2키(레거시 AITERM_* 전부 누락)
+        #   — 레거시 env 기계에서 기억 생성 위치와 주입 스캔 위치가 갈리는 경로였다.
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, MEM.PACK_DIR_ENV_KEYS,
+                         "javis_memory 팩 env 목록이 갈렸다 — 기억 저장 위치 분열(P3)")
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, DST.PACK_DIR_ENV_KEYS,
+                         "javis_distill 팩 env 목록이 갈렸다 — 증류 미러 위치 분열(P3)")
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, INJ.PACK_DIR_ENV_KEYS,
+                         "javis_memory_inject 팩 env 목록이 갈렸다 — 주입 스캔 위치 분열(P3)")
 
     def test_preflight_and_bootstrap_resolve_legacy_key(self):
         """★A11 행동 축 — `AITERM_PACK_DIR`만 설정된 환경에서 부트 체인 전원이 같은 팩을 본다."""
@@ -134,6 +146,29 @@ class PackDirEnvKeys(unittest.TestCase):
             self.assertEqual(RP.pack_dir(), "/tmp/legacy-pack")
             self.assertEqual(ORC.pack_dir(), "/tmp/legacy-pack")
             self.assertEqual(ST.pack_dir(), "/tmp/legacy-pack")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_memory_dir_family_resolves_legacy_key(self):
+        """★P3 행동 축 — `AITERM_PACK_DIR`만 설정된 환경에서 memory 가족 3구현이 같은 곳을
+        본다(+ inject 의 `CYS_MEMORY_DIR` 최우선 계약은 유지)."""
+        keys = list(RP.PACK_DIR_ENV_KEYS) + ["CYS_MEMORY_DIR"]
+        saved = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ["AITERM_PACK_DIR"] = "/tmp/legacy-pack-p3"
+            want = os.path.join("/tmp/legacy-pack-p3", "memory")
+            self.assertEqual(MEM.default_memory_dir(), want)
+            self.assertEqual(DST.default_memory_dir(), want)
+            self.assertEqual(INJ.memory_dir(), want)
+            os.environ["CYS_MEMORY_DIR"] = "/tmp/explicit-mem"
+            self.assertEqual(INJ.memory_dir(), "/tmp/explicit-mem",
+                             "inject 의 CYS_MEMORY_DIR 최우선이 깨졌다")
         finally:
             for k, v in saved.items():
                 if v is None:

@@ -199,8 +199,14 @@ def latest_receipt_body(receipts, rule_id):
 
 # ── memory 미러(derivative index — 읽기 전용 접근이 기본) ────────
 
+# ★팩 경로 env 키의 우선순위 목록(W14 S19 · P3). Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS`와
+#   목록·순서가 기계 대조된다(bin/tests/test_todo_shared_constants.py).
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def default_memory_dir():
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"):
+    """memory 미러 위치 — src/pack.rs pack_dir() 폴백(PACK_DIR_ENV_KEYS) 미러링."""
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return os.path.join(v, "memory")
