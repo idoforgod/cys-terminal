@@ -16,6 +16,8 @@
    alt_screen 관측 · win-parity 바이트 핀 · agents.json `"0"` override. 이 증적이 릴리스
    차단 게이트다(태그 파이프라인과의 결합은 본 런북의 수동 순서가 정본).
 2. 태그(mac) → 3. win 빌드 → 4. **WDSI 신고**(Defender 오탐 최소화) → 5. **애플 공증**
+
+> ★2026-08-20 실측(v0.14.20): WDSI 익명 제출은 Microsoft가 전면 차단(전 트랙 OAuth 로그인 필수 — 페이지 소스에 'TODO: uncomment when we re-enable anonymous submissions' 주석 실재). 제출에는 Microsoft 계정 로그인 1회 필요. 폼 셀렉터 지도·기입값·자동 제출 스크립트(fill.js — CAPTCHA 감지 시 exit 42 중단)는 준비됨: 분류=#userOpinionClean(Incorrectly detected)·탐지명=#detectionName·업로드=#filePicker. 오너 로그인 후 약 2분 소요.
    (`~/.cys/apple-notary.env` 자격 — 무공증이면 Gatekeeper 차단) →
 6. **전 자산 일괄 업로드** → `SHA256SUMS.txt` 전 자산 재생성(`scripts/release-postprocess.py` —
    구버전 줄 잔존 금지 · ★백업 DMG 2종에 Gatekeeper 게이트 자동 실평가, rc≠0 이면 `--apply`
