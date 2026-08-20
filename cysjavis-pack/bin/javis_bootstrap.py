@@ -671,7 +671,7 @@ class _Log:
                                     "큽니다(세션 배선). `cys list` 의 role 열을 확인하고, pane 안에서 "
                                     "재선언하세요. 새 부서가 목적이면 GUI ＋부서·`cys-dept allocate` 를 쓰세요.",
                 STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP 기본 8)·~/.cys/depts.json 을 확인하세요.",
-                STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — GUI 부서 탭의 ▶부서장 버튼으로 재시도하세요.",
+                STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — 그 부서 pane에서 claude 실행 후 '너는 마스터다' 선언(훅 자동 부트) 또는 부서 pane 안에서 cys launch-agent --role master --agent claude 로 재시도하세요.",
                 STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
                 STEP.CHECK: "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
                 STEP.PING: "cysd 데몬에 응답이 없습니다 — cys list로 데몬 상태를 확인하세요(자동 기동 대기 중일 수 있음).",

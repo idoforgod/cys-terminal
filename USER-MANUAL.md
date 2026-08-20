@@ -76,9 +76,8 @@ cys daemon uninstall
 
 ### 2.4 외부 터미널에서 `cys` 쓰기 (셸 설치)
 
-- **권장(macOS)**: 앱 Control Center 헤더 → **"셸에 cys 설치"** 1클릭(관리자 승인 1회) —
-  `/usr/local/bin/cys`·`cysd` 심볼릭 링크가 생기고, 앱 업데이트에도 자동 추종합니다.
-- Windows는 설치기가 PATH를 구성합니다.
+- macOS: 터미널에서 `sudo ln -sf /Applications/cys.app/Contents/MacOS/cys /usr/local/bin/cys && sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd` (1회 · 상세 docs/INSTALL.md §B)
+- Windows: 앱 pane 안에서는 PATH가 자동 주입되어 cys를 바로 쓸 수 있습니다(설치기는 외부 PATH를 등록하지 않음). 외부 터미널에서 쓰려면 %LOCALAPPDATA%\cys 를 PATH에 추가하거나 전체 경로로 실행하세요.
 
 ### 2.5 설치 확인
 

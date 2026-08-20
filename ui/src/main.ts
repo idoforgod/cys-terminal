@@ -6460,19 +6460,6 @@ document.getElementById("btn-cc-density")!.addEventListener("click", () =>
 document.getElementById("btn-cc-glance-face")!.addEventListener("click", () =>
   applyGlanceFace(ccGlanceFace === "tasks" ? "live" : "tasks"),
 );
-document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
-  try {
-    const r = (await invoke("install_cli_to_path")) as {
-      cys_link: string; cysd_link: string; shadowed_by: string | null; warnings: string[];
-    };
-    // B-11: alert()는 WKWebView에서 억제될 수 있음(confirm() 무동작 실측과 동계열) — toast로 통일
-    let msg = `${r.cys_link} · ${r.cysd_link} — 새 터미널에서 'cys' 사용 가능`;
-    if (r.warnings?.length) msg += ` ⚠ ${r.warnings.join(" ⚠ ")}`;
-    toast("system", "셸 설치 완료", msg);
-  } catch (e) {
-    toast("watchdog", "셸 설치 실패", String(e));
-  }
-});
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
@@ -6537,41 +6524,8 @@ document.getElementById("btn-ws-new")!.addEventListener("click", () => {
   void addWorkspace();
 });
 
-// ★WP-1 결정 e(BOOTSTRAP_HARDENING v1.1): "마스터 시작" — cys launch-agent --role master 배선.
-// worker/cso 기동과 동일 메커니즘(앵커: 시스템은 노드만 띄우고 지휘하지 않는다). 초보를 "올바른
-// surface에서 마법 문구 입력"이라는 취약한 산문 계약에서 해방. 명령 자체가 base 데몬 고정
-// (CYS_SOCKET 제거 — start_master)이라 어느 탭에서 눌러도 부서 오염 불가. 생성 surface는 자동입양.
-// 중복 클릭은 데몬 claim_denied가 비파괴 방어(두 번째 master 거부 — 위 btn-ws-new 주석과 동일 축).
-// ★조직 모델(오너 2026-07-15): 본부=▶CEO(마스터 오브 마스터 자리) · 부서 탭=▶부서장(부서 데몬별
-// 독립 마스터). "데몬당 살아있는 마스터 1명" 규칙은 조직 단위별 적용 — 부서 10개면 마스터 10명.
-// claim_denied 원문은 초보에게 불친절 → 조직 모델 언어로 번역.
-function masterDeniedMsg(e: unknown, where: string): string {
-  const s = String(e);
-  if (/claim_denied|privileged role/i.test(s))
-    return `이미 ${where}에 마스터가 실행 중입니다 — 기존 마스터 탭(pane)을 사용하세요. (조직 단위당 마스터 1명 — 부서장은 각 부서 탭에서 세웁니다)`;
-  return s;
-}
-document.getElementById("btn-master-start")?.addEventListener("click", async () => {
-  try {
-    await invoke("start_master");
-    toast("feed", "▶ CEO 시작", "본부(base)에 마스터 오브 마스터 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다. 부서가 있으면 승인 후 CEO 규약으로 승격됩니다.");
-  } catch (e) {
-    toast("health", "CEO 시작 실패", masterDeniedMsg(e, "본부(base)"));
-  }
-});
-document.getElementById("btn-dept-master")?.addEventListener("click", async () => {
-  const ws = workspaces[activeWs];
-  if (!ws?.socket) {
-    toast("health", "▶부서장은 부서 탭에서", "지금 보고 있는 탭이 본부입니다 — 부서 탭을 연 상태에서 누르세요(본부 마스터는 ▶CEO).");
-    return;
-  }
-  try {
-    await invoke("start_dept_master", { socket: ws.socket });
-    toast("feed", "▶ 부서장 시작", `${ws.name ?? "부서"}에 마스터(부서장) 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.`);
-  } catch (e) {
-    toast("health", "부서장 시작 실패", masterDeniedMsg(e, `이 부서(${ws.name ?? ws.socket})`));
-  }
-});
+// (2026-08-20 P2) ▶CEO/▶부서장/셸설치 버튼 제거 — 기동 경로는 pane 마스터 선언(role-bootstrap 훅 체인)·cys launch-agent·phoenix 복원으로 잔존.
+// Rust 커맨드(start_master 등)는 존치(git log 참조). 버튼 복원은 HTML 2줄+핸들러 재추가로 가역.
 
 // ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
 // "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).

@@ -70,7 +70,7 @@
   **여전히 미서명이라 첫 실행 경고가 뜰 수 있습니다**.
   상세: [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md)
 - 24/365 상시 가동(선택): `cys daemon install` (launchd KeepAlive / 작업 스케줄러).
-- 외부 터미널에서 `cys` 명령 쓰기: 앱 Control Center → **"셸에 cys 설치"** 1클릭.
+- 외부 터미널에서 `cys` 쓰기: [docs/INSTALL.md](docs/INSTALL.md) §B(수동 심링크 1회).
 
 설치·제거 상세는 [docs/INSTALL.md](docs/INSTALL.md), 사용법 전체는
 [User Manual](USER-MANUAL.md).

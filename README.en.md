@@ -84,7 +84,7 @@ pack automatically.
   warning can appear**. See
   [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md).
 - Optional 24/365 always-on: `cys daemon install` (launchd KeepAlive / Task Scheduler).
-- Use `cys` from an external terminal: app Control Center → **"Install cys to shell"** (one click).
+- Use `cys` from an external terminal: [docs/INSTALL.md](docs/INSTALL.md) §B (one-time manual symlink).
 
 Install/uninstall details: [docs/INSTALL.md](docs/INSTALL.md). Full usage:
 [User Manual](USER-MANUAL.md).

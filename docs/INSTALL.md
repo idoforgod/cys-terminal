@@ -39,7 +39,7 @@
 | ID | 위험 명령 | 왜 경계인가 | 워커 처리 |
 |---|---|---|---|
 | INST-DENY-01 | `cys daemon install --takeover` | **가동 중인 세션이 소멸**합니다(비가역 — 아래 "C. 상시 가동" line 참조). | 자율 실행 금지 → 정지·오너 보고 |
-| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. **단, GUI "셸에 cys 설치" 버튼은 사용자 명시 클릭 + osascript 1회 승격이라 이 경계를 위반하지 않음**(워커가 그 버튼을 자율 클릭하는 것은 여전히 금지). |
+| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. |
 | INST-DENY-03 | `rm -rf ~/.cys ~/.local/state/cys` | pack·트랜스크립트·상태 **완전 삭제**(비가역). | 자율 실행 금지 → 정지·오너 보고 |
 | INST-DENY-04 | DMG 우클릭·Gatekeeper "열기"·코드사이닝 | 사람 GUI/보안 결정 단계. | 사람(🧑)이 직접 → 워커는 위임 |
 
@@ -151,18 +151,15 @@ codesign --verify --strict --verbose /Applications/cys.app
 > 입력한 뒤 다시 열어 보세요.
 
 ### 🧑 B. CLI도 외부 터미널에서 쓰려면 (선택)
-앱 번들 안의 cys·cysd를 PATH(`/usr/local/bin`)에 노출합니다. **권장: 앱 안에서 1클릭.**
-
-1. **권장 — GUI 1클릭(1회 관리자 승인):** Control Center 헤더 → **"셸에 cys 설치"** 클릭 →
-   macOS 비밀번호 1회 입력. `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생기고,
-   새 터미널에서 `cys`가 바로 동작합니다. (앱 업데이트에도 경로 유지 — 심볼릭이라 자동 추종.)
-2. **폴백 — 수동 sudo(에이전트 자율 금지):** GUI를 못 쓰는 환경에서만.
+앱 번들 안의 cys·cysd를 PATH(`/usr/local/bin`)에 노출합니다. **수동 sudo 심링크 1회(에이전트 자율 금지 — 사람이 직접).**
 ```sh
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-02] sudo 심링크 — 사람이 직접
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 ```
-(pane *안*에서는 PATH가 자동 주입되므로 이 단계는 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
+`/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생기고 새 터미널에서 `cys`가 바로
+동작합니다. (앱 업데이트에도 경로 유지 — 심볼릭이라 자동 추종. pane *안*에서는 PATH가 자동
+주입되므로 이 단계는 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
 
 ### 🧑 C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영) [HUMAN]
 재부팅 후에도 데몬이 자동으로 살아 있게 launchd에 등록:
