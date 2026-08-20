@@ -86,6 +86,21 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
+# ★로케일 비의존 I/O(W-A4 · 선례 javis_bootstrap.py R3/D-IMPL-3 · javis_detect.py G9 · javis_mission.py):
+#   ANSI 코드페이지가 UTF-8 이 아닌 Windows(한국어 cp949·서구 cp1252·일본 cp932)에서 stdout 이
+#   파이프로 캡처되면(부트 체인 ⑤ 가 check 출력을 캡처하는 경로가 정확히 그것) `✓`/`✗`/`⚠`/`↳`·`—`
+#   또는 첫 한글 출력에서 UnicodeEncodeError 로 즉사한다 — 실측: PYTHONIOENCODING=cp949 에서
+#   `--note-team-roster` 가 U+2014(—) position 66 크래시. 팀이 실제로 5개 다 떠 있어도 ⑤ 의
+#   24회 재시도가 전부 같은 크래시로 죽어 부트 exit 6·완료 마커 미기록(허위 실패)이 됐다.
+#   출력 인코딩만 고정한다 — 판정 로직·exit code 무접촉. errors="replace" 라 최악에도 '깨진
+#   글자'일 뿐 크래시가 아니다. try/except 는 reconfigure 부재(구형 파이썬·비 TextIOWrapper
+#   스트림) 허용 — 형태는 선례와 자구 동일(사본 드리프트 방지).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
 # ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
 # 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
@@ -328,12 +343,37 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def _cys_status_timeout_s():
+    """cys_status 서브프로세스 상한 — javis_budget leaf `CYS_STATUS_TIMEOUT_S` 파생(W-A4).
+
+    종전 하드코딩 10 은 예산 위반이었다: LEAF_FLOORS 의 냉시작 실측 하한이 12 고, 그 주석이
+    이미 'orchestra.cys_status' 를 소비자로 명기하는데 실물만 10 으로 더 작았다(장부↔실물
+    사본 드리프트). 데몬 냉시작·프로세스 표 refresh 로 status 가 10~12s 걸리는 창에서 정상
+    데몬이 None(판정 불가)으로 접혀 check exit 2 오귀속을 만든다.
+    ★짝 사본 주의(W-A4b 실측 교정 — 종전 '두 사본이 같은 leaf 를 본다'는 허위였다):
+    javis_boot_node.cys_status 는 여전히 `timeout=12` **하드코딩**이다 — leaf 하한과 값이
+    같을 뿐 `CYS_STATUS_TIMEOUT_S` 를 읽지 않는다. 같은 파일에 budget() 헬퍼가 이미 있으나
+    소비처는 BOOT_NODE_* leaf 넷뿐이고, cys RPC 계열(cys_status·cys_list_rows 등)은 아직
+    하드코딩이다. 즉 두 사본은 '같은 leaf 를 보는' 게 아니라 **값이 우연히 같을 뿐**이고,
+    leaf 가 12 에서 움직이면 저쪽 사본만 낡는다.
+    저쪽 leaf 편입(배선)은 후속 티켓 Wave 2 W-B1 소유 — 이 파일에서 선반영하지 않는다.
+    import 실패(부서 팩 결손·팩 스큐)는 leaf 하한 12 명시 폴백 — 예산 모듈 부재가 새 크래시
+    지점이 되면 안 된다(선례: 같은 파일 _boot_node_outer_timeout · javis_bootstrap._budget_leaf).
+    """
+    try:
+        import javis_budget as _b
+        return float(_b.leaf("CYS_STATUS_TIMEOUT_S"))
+    except Exception:
+        return 12.0
+
+
 def cys_status():
     cys = shutil.which("cys")
     if not cys:
         return None
     try:
-        r = subprocess.run([cys, "status", "--json"], capture_output=True, timeout=10)
+        r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                           timeout=_cys_status_timeout_s())
         if r.returncode != 0:
             return None
         return json.loads(r.stdout.decode("utf-8", "replace"))

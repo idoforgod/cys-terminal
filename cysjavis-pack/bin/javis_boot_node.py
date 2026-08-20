@@ -72,6 +72,20 @@ import subprocess
 import sys
 import time
 
+# ★로케일 비의존 I/O(W-A4 · 선례 javis_bootstrap.py R3/D-IMPL-3 · javis_detect.py G9): ANSI
+#   코드페이지가 UTF-8 이 아닌 Windows(한국어 cp949·서구 cp1252·일본 cp932)에서 stdout 이
+#   파이프로 캡처되면 한글 진단·`—` 류 특수문자 출력이 UnicodeEncodeError 로 즉사한다 —
+#   실측: PYTHONIOENCODING=cp949 에서 --self-test 의 "self-test OK — …" 가 U+2014 크래시.
+#   '기동은 됐는데 보고가 크래시'는 미확정(exit 1)/치명(exit 2) 계약 밖의 파이썬 traceback
+#   exit 1 로 접혀 오귀속을 만든다. 출력 인코딩만 고정 — node_liveness·seat_state 등 판정
+#   로직 무접촉(W-A4 허용 범위 = 이 블록 추가뿐). try/except 는 reconfigure 부재(구형
+#   파이썬·비 TextIOWrapper) 허용 — 형태는 선례와 자구 동일(사본 드리프트 방지).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 PACK_DIR = os.environ.get("CYS_PACK_DIR") or os.path.expanduser("~/.cys/pack")
 STATUS_FRESH_SECS = 600   # set-status 신선도 임계('살아 일하는 중' 인정 폭)
 

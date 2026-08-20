@@ -58,6 +58,19 @@ LEAF_FLOORS = {
     "CYS_CLAIM_TIMEOUT_S": 15,       # javis_bootstrap ③ claim-role
     "RPC_SLACK_S": 10,               # 한 계층이 흘리는 비유계 RPC 왕복 여유(잔여 granularity)
 
+    # ② ping 재시도 창(W-A4 선등재 · 소비자는 W-A3 javis_bootstrap ② 재시도 루프).
+    #   단발 ping(CYS_PING_TIMEOUT_S=15) 1회로는 '데몬 자동기동+소켓 바인드+프로세스 표
+    #   refresh' 최악 냉시작을 놓칠 수 있다 — 창을 두되 무한 대기는 금지한다(자원 거버넌스).
+    #   ★값 근거: TOTAL 45 = 시도당 상한 15(위 냉시작 실측 하한) × 3회분 — 하한 계열에서
+    #   파생한 크기라 leaf 실측성이 유지된다. INTERVAL 3 = 시도 간 백오프 —
+    #   BOOT_NODE_INJECT_BACKOFF_S(2)·CHECK_INTERVAL_S(5) 사이 크기로, 데몬 기동 직후 소켓
+    #   바인드(~1s)를 여유 있게 넘기면서 45s 창의 시도 기회를 잠식하지 않는다(즉시 거절되는
+    #   fail-fast ping 에서도 최대 ~15회로 유계 — 재시도 폭주 없음).
+    #   ★TOTAL 은 **벽시계 데드라인**이다(B17 카운트 회계 금지) — 소비자는 횟수 셈이 아니라
+    #   time.monotonic() 데드라인으로 창을 닫아야 한다.
+    "CYS_PING_RETRY_TOTAL_S": 45,
+    "CYS_PING_RETRY_INTERVAL_S": 3,
+
     # javis_boot_node 내부
     "BOOT_NODE_TOTAL_S": 90,         # --timeout 기본(전체 데드라인)
     "BOOT_NODE_LAUNCH_SUBPROC_S": 80,  # `cys launch-agent` 서브프로세스 상한
@@ -198,10 +211,27 @@ def check_inner_worst_s():
                      * (_leaf("CHECK_SUBPROC_TIMEOUT_S") + _leaf("CHECK_INTERVAL_S"))))
 
 
+def ping_retry_worst_s():
+    """② ping 재시도 루프(W-A3)의 내부 최악치: 벽시계 데드라인 + 마지막 시도 1회의 granularity.
+
+    boot_node_inner_worst_s 의 'TOTAL + granularity' 와 동일한 유계화 패턴 — 데드라인 직전에
+    진입한 마지막 ping 이 자기 시도 상한(CYS_PING_TIMEOUT_S)을 다 쓸 수 있으므로 창 총량만
+    계상하면 과소다(과소계상 = 이 모듈이 죽이려는 조기실패의 씨앗).
+    """
+    return _leaf("CYS_PING_RETRY_TOTAL_S") + _leaf("CYS_PING_TIMEOUT_S")
+
+
 def bootstrap_chain_worst_s():
-    """cmd_run 전체 최악치(냉부팅 상한 — 산문 '1555s' 의 파생 대체값)."""
+    """cmd_run 전체 최악치(냉부팅 상한 — 산문 '1555s' 의 파생 대체값).
+
+    ★② 항은 단발 ping timeout 이 아니라 재시도 창 최악치를 계상한다(W-A4): W-A3 가 ② 를
+      재시도 루프로 바꾸는데 단발 15s 계상이 남으면 '계상 상한 < 내부 최악치' — 이 모듈의
+      존재 이유인 바로 그 역전이 문서면에 재발한다. W-A3 미착륙 상태에서도 이 값은 유효한
+      상한이다(현행 단발 실최악 15s ≤ 계상 60s — 증액 방향은 안전하고, 위험한 것은 과소계상
+      뿐이다 · 불변식 2). 소비처 실측 0(table 문서면 전용)이라 timeout 집행에는 영향이 없다.
+    """
     return int(round(_leaf("PREFLIGHT_OUTER_S")
-                     + _leaf("CYS_PING_TIMEOUT_S")
+                     + ping_retry_worst_s()
                      + _leaf("CYS_CLAIM_TIMEOUT_S")
                      + cys_boot_outer_s()
                      + boot_reviewers_outer_s()
@@ -250,6 +280,7 @@ def table():
             "LAUNCH_PER_NODE_WORST_S": launch_per_node_worst_s(),
             "CYS_BOOT_INNER_WORST_S": cys_boot_inner_worst_s(),
             "CYS_BOOT_OUTER_S": cys_boot_outer_s(),
+            "PING_RETRY_WORST_S": ping_retry_worst_s(),
             "CHECK_WINDOW_S": check_window_s(),
             "CHECK_INNER_WORST_S": check_inner_worst_s(),
             "BOOTSTRAP_CHAIN_WORST_S": bootstrap_chain_worst_s(),
@@ -310,6 +341,13 @@ def self_test():
         assert check_window_s() == int(round(LEAF_FLOORS["CHECK_RETRIES"]
                                              * LEAF_FLOORS["CHECK_INTERVAL_S"])), \
             "check 안내 창이 상수 파생이 아니다"
+        # ⑦ ② ping 재시도 창 정합(W-A4): 창이 1회 시도 상한보다 작으면 재시도가 구조적으로
+        #    0회로 접히고, 간격이 창 이상이면 2회차 진입 전에 창이 닫힌다 — 둘 다 '키만 있고
+        #    재시도는 없는' 죽은 예산이므로 회귀를 여기서 hard fail 시킨다.
+        assert _leaf("CYS_PING_RETRY_TOTAL_S") >= _leaf("CYS_PING_TIMEOUT_S"), \
+            "ping 재시도 창이 1회 시도 상한보다 작다(재시도 무의미)"
+        assert _leaf("CYS_PING_RETRY_INTERVAL_S") < _leaf("CYS_PING_RETRY_TOTAL_S"), \
+            "ping 재시도 간격이 창을 잠식한다"
     except AssertionError as e:
         print("javis_budget self-test FAIL: %s" % e)
         return 1
