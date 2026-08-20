@@ -79,6 +79,12 @@
 #    타이핑 간주 → 종전 D4-a′ 경로 그대로 spawn / 그 외(토큰 부재·unknown·타임아웃·실행 실패·
 #    모듈 부재)=판정 불가 → **fail-closed 무스폰**+loud(A5·A22 와 같은 방향 — 무단 스폰이
 #    판정 보류보다 나쁘다). rc(0/1/2 계약 무변경)는 보조 로그로만 남긴다.
+#  - **★W-A0 알림 파이프 점유 해제(2026-08-21)**: `_notify_bg`(+동일 패턴 인라인 사본 2곳 → 호출
+#    통일)의 백그라운드 서브셸이 훅의 stdout/stderr 를 상속한 채 남아, 데몬 wedge 로 `cys feed
+#    push` 가 응답하지 않으면 하네스가 훅 stdout 의 EOF 를 영영 못 받았다(프롬프트 제출 먹통).
+#    서브셸 진입 즉시 exec 로 fd 를 끊고 cys_timeout_run 데드라인(CYS_NOTIFY_TIMEOUT_S)을
+#    씌운다(+정렬 창 ≤0.3s — 건강 경로에선 '알림 시도'가 훅 종료 전에 관측면에 닿는 종전 순서를
+#    보존하고, wedge 면 포기하고 배경 진행). 발화 조건·알림 개수는 불변이다(줄이지도 늘리지도 않는다).
 #
 # 안전: 모든 단계 graceful, 반드시 exit 0 (훅 실패가 세션을 깨지 않게).
 set +e
@@ -155,9 +161,46 @@ _maybe_declaration() {
     *) return 1 ;;
   esac
 }
+# ★W-A0 알림 데드라인(초): 알림은 best-effort 다 — 데몬이 wedge 면 짧게 포기하는 것이 맞다
+#   (주 통보는 어차피 additionalContext·stderr 가 하고, 여기서 잃는 것은 보조 알림 1건뿐이다).
+#   명명·배치는 파일 관례(CYS_ROLE_GATE_TIMEOUT_S·CYS_CLAIM_TIMEOUT_S — 소비처 직전) 그대로.
+CYS_NOTIFY_TIMEOUT_S=5
 _notify_bg() {   # 승인 채널 best-effort(백그라운드·graceful — 훅을 죽이거나 행 걸지 않게)
-  ( cys feed push --kind bootstrap-fail --title "$1" --body "$2" >/dev/null 2>&1 \
-    || cys send --queued --to master "[$1] $2" >/dev/null 2>&1 ) &
+  # ★W-A0 파이프 점유 해제(2026-08-21): 종전 `( cys … >/dev/null 2>&1 || … ) &` 는 리다이렉션이
+  #   **명령별**이라 서브셸 프로세스 자신은 훅의 stdout/stderr(fd1·2)를 상속한 채 남았다.
+  #   UserPromptSubmit 훅의 stdout 은 하네스가 파이프로 읽으므로, 훅 본체가 exit 0 해도 이 자식이
+  #   파이프 쓰기 끝을 쥐고 있으면 하네스는 EOF 를 못 받는다 — 데몬 wedge 로 `cys feed push` 가
+  #   응답하지 않으면 사용자의 프롬프트 제출이 영영 안 끝났다(입력 먹통). 수리 2속성:
+  #   ⓐ 서브셸 진입 즉시 exec 로 fd0·1·2 를 훅에서 끊는다 — 자손(cys·timeout 랩퍼) 전체가
+  #      /dev/null 을 상속하므로 종전의 명령별 `>/dev/null 2>&1` 은 이 한 줄로 대체된다. stdin 도
+  #      끊는다: 호출 시점엔 훅 stdin 이 이미 소진(INPUT=$(cat))이지만 자식이 상속 fd 를 쥐는
+  #      표면 자체를 없앤다(위 role 게이트 `</dev/null` 과 같은 규율).
+  #   ⓑ cys_timeout_run(_lib.sh 프리루드) 데드라인 — 파이프는 ⓐ가 이미 끊었으니 hang 이 먹통은
+  #      아니지만, wedge 데몬에서 60s+ 잔존하는 서브셸이 발화마다 누적되는 것은 자원 낭비다.
+  #      타임아웃(124)도 rc≠0 이므로 send 폴백으로 넘어가는 `||` 의미는 종전 그대로다.
+  #   ⓒ 정렬 창(≤0.3s): ⓐ로 EOF 가 훅 종료 즉시가 되면서, 종전 파이프 점유가 **부수적으로**
+  #      보장하던 순서 — "훅이 끝났으면 알림 시도는 이미 관측면(데몬·호출 로그)에 도달했다" —
+  #      가 사라졌다. 실측: run_bootstrap_health H-DETECT-9 가 훅 종료 직후 목 cys 호출 로그를
+  #      읽는데, 분리 직후엔 8/8 로 로그가 아직 비어 있었다(레이스 상시 패배). 그래서 서브셸
+  #      종료를 6×0.05s 만 폴링한다: 건강한 데몬/목은 수십 ms 에 끝나 순서가 보장되고, wedge 면
+  #      0.3s 후 포기해 배경 진행한다(파이프는 이미 분리 — 프롬프트 먹통은 재발하지 않는다).
+  #      ★kill -0 은 미회수 좀비에도 참이므로 조기 break 는 최적화일 뿐이다 — 폴링이 창을 다
+  #      기다려도 손해는 0.3s 하나고, '죽어 있음'을 늦게 알아도 순서는 이미 보장된 뒤다(죽음=
+  #      작업 완료). 정확성이 셸의 reap 타이밍에 의존하지 않는다.
+  #   ★발화 조건·호출부는 불변 — 알림을 줄이지도 늘리지도 않는다. 대안 기각: ①setsid 재부모화만
+  #     으로는 fd 상속이 그대로라 파이프가 안 끊긴다(끊을 대상은 세션이 아니라 fd 다) ②훅이
+  #     서브셸을 무제한 wait 하면 wedge 에서 프롬프트가 데드라인 합(~10s)만큼 걸린다(정렬 창은
+  #     그래서 상한이 데드라인이 아니라 0.3s 다) ③완료 마커 파일은 wedge 지각 완료가 고아
+  #     마커를 흘린다(무잔재인 폴링 채택).
+  ( exec >/dev/null 2>&1 </dev/null
+    cys_timeout_run "$CYS_NOTIFY_TIMEOUT_S" cys feed push --kind bootstrap-fail --title "$1" --body "$2" \
+      || cys_timeout_run "$CYS_NOTIFY_TIMEOUT_S" cys send --queued --to master "[$1] $2" ) &
+  _NB_PID=$!
+  _NB_I=0
+  while [ "$_NB_I" -lt 6 ] && kill -0 "$_NB_PID" 2>/dev/null; do
+    _NB_I=$((_NB_I + 1))
+    sleep 0.05 2>/dev/null || { sleep 1; break; }   # 소수 sleep 미지원 셸은 1s 단창 후 포기(부트 생존확인 폴백과 같은 관례)
+  done
 }
 
 # ── A22: 인터프리터 미해소(python 전무) — cannot-judge 를 시끄럽게 ──
@@ -339,11 +382,12 @@ export CYS_DECL_ORIGIN="hook-human"
 BOOT="$PACK/bin/javis_bootstrap.py"
 # ★BOOT 부재 명시 실패(증분1): 부서 팩에 javis_bootstrap.py가 없는 레인은 종전엔 조용한 무산이라
 # "팀이 뜬다"는 기대와 달리 아무 일도 없었다. 원인·조치를 additionalContext로 명시하고 승인 채널로도
-# 시끄럽게 알린다. 알림은 백그라운드+graceful(데몬 부재 등 실패가 훅을 죽이거나 행 걸지 않게). 훅은 exit 0.
+# 시끄럽게 알린다. 알림은 _notify_bg 단일 구현이다(★W-A0 사본 3벌→1벌 통일: 파이프 분리·데드라인이
+# 전 호출부에 동일 적용된다. send 폴백 문안만 시그니처 통일로 "[제목] 본문" 형태가 되는데, 그 형태는
+# javis_mission 층2 라벨 판별이 기계 유래로 접는 문서화된 규약이라 안전하다). 훅은 exit 0.
 if [ ! -f "$BOOT" ]; then
   MSG="[부트스트랩 불가] 이 레인의 팩($PACK)에 bin/javis_bootstrap.py가 없어 마스터 팀을 기동할 수 없습니다. 팩 배포(preflight --fix·pack-heal)를 확인하거나 CYS_PACK_DIR이 올바른 레인을 가리키는지 점검하세요."
-  ( cys feed push --kind bootstrap-fail --title "부트스트랩 불가(BOOT 부재)" --body "$MSG" >/dev/null 2>&1 \
-    || cys send --queued --to master "$MSG" >/dev/null 2>&1 ) &
+  _notify_bg "부트스트랩 불가(BOOT 부재)" "$MSG"
   "$CYS_PY" -c 'import json,sys
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":sys.argv[1]}}, ensure_ascii=False))' \
     "[결정론 부트스트랩 불가 — 명시 실패] 이 레인의 팩에 bin/javis_bootstrap.py가 없어 마스터 팀 기동을 발화할 수 없습니다(조용한 무산 아님). 조치: 팩 배포 상태(preflight --fix·pack-heal)와 CYS_PACK_DIR 레인 정합을 확인하세요. 승인 Feed에도 알림을 시도했습니다."
@@ -507,9 +551,10 @@ fi
 # ★상태 파생(CS-3①): 성공/실패 문안이 관측 결과에서 갈린다. 실패 경로는 '발화됨'을 절대 말하지 않고
 #   런 로그 경로를 안내한다.
 if [ -n "$FIRE_FAIL" ]; then
-  ( cys feed push --kind bootstrap-fail --title "부트스트랩 발화 실패" \
-      --body "role-bootstrap 훅이 javis_bootstrap.py 발화에 실패했습니다($FIRE_FAIL). 로그: $LOG" >/dev/null 2>&1 \
-    || cys send --queued --to master "[부트 발화 실패] $FIRE_FAIL — 로그: $LOG" >/dev/null 2>&1 ) &
+  # ★W-A0: 인라인 사본 → _notify_bg 통일(파이프 분리·데드라인 동승). send 폴백은 "[제목] 본문"
+  #   형태가 되지만 정보량($FIRE_FAIL·$LOG)은 그대로다.
+  _notify_bg "부트스트랩 발화 실패" \
+    "role-bootstrap 훅이 javis_bootstrap.py 발화에 실패했습니다($FIRE_FAIL). 로그: $LOG"
   "$CYS_PY" -c 'import json,sys
 note=("[결정론 부트스트랩 발화 실패 — 상태 파생 보고] \"너는 마스터다\" 선언은 감지했으나 "
       "javis_bootstrap.py 발화가 실패했다(사유: %s). 팀은 뜨지 않았다 — 부트가 시작됐다고 "
