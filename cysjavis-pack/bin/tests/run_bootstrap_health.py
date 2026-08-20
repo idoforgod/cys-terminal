@@ -56,6 +56,12 @@ PRE_W0_REF = os.environ.get("CYS_HEALTH_PRE_W0_REF", "b35f01d")
 # 선언에서 spawn 하지 않았고(2択 혼동 결함), D4-a′(2026-08-10 오너 재정: 선언=기동 명령)가
 # 대체했다. 위 두 기준과 같은 이유로 **고정 해시**를 쓴다(HEAD 는 D4-a′ 착지와 함께 움직인다).
 D4A_REF = os.environ.get("CYS_HEALTH_D4A_REF", "58337fb")
+# W2 착지 이후·W-A3(⑤ exit 2 `cys ping` 재확인 분기 · 2026-08-21) **이전** 트리 — H-EXIT-7
+# 신계약의 계측 대조용. 그 트리엔 ⑤check-unjudgeable(즉시 이탈)은 있으나 `cys ping` 재확인·
+# '팩 결손 가능성' 진단이 없다(exit 2 전부를 '데몬 소실'로 오진하던 구 계약 + 127='orchestra
+# 스크립트 부재' 사문 문안). 위 기준들과 같은 이유로 **고정 해시**를 쓴다(HEAD 는 W-A3 착지와
+# 함께 움직인다).
+PRE_WA3_REF = os.environ.get("CYS_HEALTH_PRE_WA3_REF", "8def22a")
 
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
 LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5", "W6")
@@ -1681,49 +1687,182 @@ def h_exit_6():
             "boot-reviewers 영구 분기 · 계측검증=%s" % calib)
 
 
-@specimen("H-EXIT-7", "W2", "check exit 2(데몬 소실) 별도 분기", ["G32", "A12"])
+@specimen("H-EXIT-7", "W2",
+          "check exit 2 — `cys ping` 1회 재확인 분기(데몬 소실=즉시 이탈 / 팩 결손=유계)",
+          ["G32", "A12"])
 def h_exit_7():
-    """G32: orchestra check 의 exit 2 는 '노드 미기동'이 아니라 **판정 불가**(데몬 소실)다.
-    두 갈래를 뭉개면 처방이 뒤집힌다(2=`cys ping`, 1=`cys boot`). ⑤ 가 별도 분기하고
-    판정 불가에서는 **재시도하지 않는다**(A12 영구 분류)."""
+    """G32+W-A3: orchestra check 의 exit 2 는 '노드 미기동'(exit 1)이 아니라 **판정 불가**다 —
+    그리고 판정 불가는 단일 사건이 아니므로 `cys ping` **1회 재확인**으로 실측 분리한다:
+      t1) exit 2 + (⑤ 시점) ping 사망 → 데몬 소실 **확정** — 재시도 0·즉시 이탈(처방=`cys ping`·데몬)
+      t2) exit 2 + ping 생존 → 데몬은 살아 있다 — 재시도 창 안에서 계속하되 이 분기 전용
+          **별도 상한**(CHECK_UNJUDGEABLE_RETRIES·budget 키 부재 시 3)으로 유계, 소진 시
+          '팩 결손 가능성' 진단(처방=CYS_PACK_DIR·팩 재설치 — `cys boot`·데몬 재기동 처방 금지)
+      t3) exit 1 → 종전대로 재시도 소진(대조군 — 이 계약은 불변)
+
+    ★구 계약("판정 불가에서는 재시도하지 않는다 — A12 영구 분류")을 폐기한 이유: 그 전제
+      'check exit 2 = 데몬 소실'이 실측으로 틀렸다(W-A3).
+      ⓐ `_run([py, orchestra, …])` 는 cmd[0] 이 sys.executable 이라 **orchestra 스크립트가
+         없어도 python 자신이 rc 2** 를 낸다(127 이 아니다 — 아래 t2-b 가 step exit 로 박제).
+         즉 구 계약은 팩 결손을 '데몬 소실'로 오진하고 처방(`cys ping`·데몬 기동)을 정반대로
+         뒤집었다 — 팩이 깨진 기계에서 사용자를 데몬 수리로 보내는 데드엔드.
+      ⓑ 그 결과 구 코드의 'exit 127 = orchestra 스크립트·인터프리터 부재' 분기 문안은 스크립트
+         부재 쪽으로는 **도달 불가 사문**이었다(127 의 유일 실경로 = 인터프리터 자체 소실).
+    ★검체 유의(master 실측 2026-08-21): ping 이 처음부터 죽어 있으면 W-A3 의 ②ping 유계
+      재시도가 먼저 EXIT_PING(3)으로 끝나 ⑤ 에 도달조차 못 한다(실측 43.4s·⑤ 단계 0개) —
+      t1 은 '② 는 통과, ⑤ 시점에만 사망'을 상태 파일 카운터 목(첫 ping=0·이후 ping=3)으로
+      만든다."""
     boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
     src = _read(boot)
     need("⑤check-unjudgeable" in src, "⑤ 가 판정 불가를 별도 단계로 분기하지 않는다")
+    need("`cys ping` 재확인" in src, "⑤ exit 2 의 `cys ping` 1회 재확인이 소스에 없다(신계약 부재)")
+    need("팩 결손 가능성" in src, "⑤ exit 2 의 '팩 결손 가능성' 진단 분기가 소스에 없다(신계약 부재)")
+    # 별도 상한 기대값 — bootstrap 과 **동일 산식**(javis_budget leaf · 키 부재=폴백 3)으로
+    # 파생한다. 수치 하드코딩이 아니라 SOT 동행: 키가 budget 에 등재되면 검체도 자동 추종한다.
+    sys.path.insert(0, BIN_DIR)
+    try:
+        try:
+            import javis_budget as _bud
+            cap = max(1, int(_bud.leaf("CHECK_UNJUDGEABLE_RETRIES")))
+        except Exception:
+            cap = 3
+    finally:
+        sys.path.remove(BIN_DIR)
+
+    def _attempt_steps(recs):
+        """orchestra check **실호출**(`⑤check#N`)만 센다 — `⑤check#N-ping`(재확인 실측 기록)도
+        "⑤check#" 로 시작하므로, 구 검체의 접두 카운트는 신계약에서 재확인 기록을 '재시도'로
+        오산한다(구 `startswith` 계수의 폐기 이유)."""
+        return [s for s in recs if re.fullmatch(r"⑤check#\d+", s["step"])]
+
+    def _recheck_steps(recs):
+        return [s for s in recs if re.fullmatch(r"⑤check#\d+-ping", s["step"])]
+
+    def _unjudge_detail(recs):
+        rows = [s for s in recs if s["step"] == "⑤check-unjudgeable"]
+        need(rows, "⑤check-unjudgeable 단계가 없다: %r" % [s["step"] for s in recs])
+        return rows[-1].get("detail", "")
+
+    notes = []
     with tempfile.TemporaryDirectory() as tmp:
-        # 판정 불가: orchestra check → exit 2. 재시도 없이 즉시 이탈해야 한다.
-        env, home = _boot_sandbox(os.path.join(tmp, "unjudge"), check_exit=2)
+        # ── t1. exit 2 + (⑤ 시점) ping 사망 → 데몬 소실 확정: 재확인 1회 실측·재시도 0·즉시 이탈 ──
+        sub = os.path.join(tmp, "gone")
+        pingf = os.path.join(sub, "ping.n")
+        env, home = _boot_sandbox(sub, check_exit=2, cys_extra=(
+            'case "$1" in ping)\n'
+            '  _n=$(cat "%s" 2>/dev/null || echo 0)\n'
+            '  _n=$((_n+1)); printf %%s "$_n" > "%s"\n'
+            '  [ "$_n" -ge 2 ] && exit 3\n'
+            '  exit 0\n'
+            ';; esac' % (pingf, pingf)))
         env["CYS_BOOT_CHECK_RETRIES"] = "5"
         env["CYS_BOOT_CHECK_INTERVAL_S"] = "2"
         t0 = time.time()
         r = _run([PY, boot], env=env, timeout=180)
         dt = time.time() - t0
-        need(r.returncode == 6, "판정 불가 exit≠6(EXIT_CHECK): %d" % r.returncode)
-        bl = _boot_last(home)
-        steps = [s["step"] for s in bl.get("steps", [])]
+        need(r.returncode == 6, "t1 데몬 소실 exit≠6(EXIT_CHECK): %d" % r.returncode)
+        recs = _boot_last(home).get("steps", [])
+        steps = [s["step"] for s in recs]
+        need(sum(1 for s in steps if s == "②ping" or s.startswith("②ping#")) == 1,
+             "t1 검체 무효: ②ping 이 1회 통과가 아니다(⑤ 시점 사망 재현 실패): %r" % steps)
         need("⑤check-unjudgeable" in steps,
-             "판정 불가가 '노드 미기동'과 같은 단계로 기록됐다: %r" % steps)
-        need(sum(1 for s in steps if s.startswith("⑤check#")) == 1,
-             "판정 불가인데 재시도했다(영구 분류 위반): %r" % steps)
-        need(dt < 8, "판정 불가에서 재시도 대기를 태웠다(%.1fs)" % dt)
-        detail = " ".join(s.get("detail", "") for s in bl.get("steps", []))
-        need("cys ping" in detail, "판정 불가 처방(`cys ping`)이 기록에 없다")
-        # 대조군: exit 1(실측 부재) → 재시도 소진 + '미기동' 단계
-        env2, home2 = _boot_sandbox(os.path.join(tmp, "missing"), check_exit=1)
-        env2["CYS_BOOT_CHECK_RETRIES"] = "3"
+             "t1 판정 불가가 별도 단계로 기록되지 않았다: %r" % steps)
+        need(len(_attempt_steps(recs)) == 1,
+             "t1 데몬 소실 확정인데 check 를 재시도했다: %r" % steps)
+        rech = _recheck_steps(recs)
+        need(len(rech) == 1 and rech[0]["exit"] != 0 and "재확인 실패" in rech[0].get("detail", ""),
+             "t1 `cys ping` 재확인 실측 기록(⑤check#1-ping·비0)이 없다 — 이탈이 재확인 없이"
+             "(구 계약 형태로) 일어났다: %r" % [(s["step"], s["exit"]) for s in recs][-6:])
+        need(dt < 8, "t1 즉시 이탈이어야 하는데 재시도 대기를 태웠다(%.1fs)" % dt)
+        d1 = _unjudge_detail(recs)
+        need("데몬 소실" in d1 and "`cys ping`" in d1,
+             "t1 진단에 데몬 처방(`cys ping`)이 없다: %r" % d1[:300])
+        need("팩 결손" not in d1, "t1 데몬 소실 확정에 '팩 결손' 진단이 섞였다: %r" % d1[:300])
+        notes.append("t1 데몬소실=재확인1·재시도0·즉시이탈·데몬처방")
+
+        # ── t2-a. exit 2 + ping 생존(orchestra 스크립트 실재) → 별도 상한 유계 + '팩 결손 가능성' ──
+        env2, home2 = _boot_sandbox(os.path.join(tmp, "alive"), check_exit=2)
+        env2["CYS_BOOT_CHECK_RETRIES"] = "5"
         env2["CYS_BOOT_CHECK_INTERVAL_S"] = "0.05"
         r2 = _run([PY, boot], env=env2, timeout=180)
-        need(r2.returncode == 6, "노드 미기동 exit≠6: %d" % r2.returncode)
-        steps2 = [s["step"] for s in _boot_last(home2).get("steps", [])]
-        need(sum(1 for s in steps2 if s.startswith("⑤check#")) == 3,
-             "미기동 경로가 재시도를 소진하지 않았다: %r" % steps2)
-        need("⑤check-unjudgeable" not in steps2, "미기동이 판정 불가로 오분류됐다")
-    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
+        need(r2.returncode == 6, "t2-a exit≠6: %d" % r2.returncode)
+        recs2 = _boot_last(home2).get("steps", [])
+        n2 = len(_attempt_steps(recs2))
+        need(1 < n2 <= cap and n2 < 5,
+             "t2-a 재시도가 유계(1<n≤상한 %d<창 5)가 아니다: n=%d %r"
+             % (cap, n2, [s["step"] for s in recs2]))
+        need(n2 == cap, "t2-a 별도 상한(%d)에서 멈추지 않았다: n=%d" % (cap, n2))
+        rech2 = _recheck_steps(recs2)
+        need(len(rech2) == n2 and all(s["exit"] == 0 for s in rech2),
+             "t2-a 매 시도의 ping 생존 재확인(rc 0) 실측이 없다: %r"
+             % [(s["step"], s["exit"]) for s in rech2])
+        d2 = _unjudge_detail(recs2)
+        need("팩 결손 가능성" in d2 and "데몬 소실이 아니라" in d2,
+             "t2-a 진단이 '팩 결손 가능성'이 아니다(오진 부활): %r" % d2[:300])
+        need("있음" in d2 and "CYS_PACK_DIR" in d2,
+             "t2-a 스크립트 실재 실측·팩 점검 처방이 진단에 없다: %r" % d2[:300])
+        need("데몬을 확인·기동하라" not in d2,
+             "t2-a 팩 결손 가능성에 데몬 처방이 섞였다(처방 반전): %r" % d2[:300])
+        notes.append("t2a ping생존=유계 %d회·팩결손가능성 진단" % n2)
+
+        # ── t2-b. **팩 결손 실물**(orchestra 스크립트 삭제 — python 자신이 rc 2 를 낸다) →
+        #    같은 유계 + '팩 결손 확정적' 처방. 구 계약이 '데몬 소실'로 오진하던 바로 그 입력의
+        #    실물 재현이다(위 ⓐ 의 실증 — ⓑ 의 '스크립트 부재=127' 문안이 사문이었음도 여기서
+        #    step exit==2 실측으로 확정된다). ──
+        sub3 = os.path.join(tmp, "packgone")
+        env3, home3 = _boot_sandbox(sub3, check_exit=0)
+        os.remove(os.path.join(home3, ".cys", "pack", "bin", "javis_orchestra.py"))
+        env3["CYS_BOOT_CHECK_RETRIES"] = "5"
+        env3["CYS_BOOT_CHECK_INTERVAL_S"] = "0.05"
+        r3 = _run([PY, boot], env=env3, timeout=180)
+        need(r3.returncode == 6, "t2-b 팩 결손 exit≠6: %d" % r3.returncode)
+        recs3 = _boot_last(home3).get("steps", [])
+        att3 = _attempt_steps(recs3)
+        need(att3 and all(s["exit"] == 2 for s in att3),
+             "t2-b 검체 무효: 스크립트 부재의 실측 rc 가 2 가 아니다(ⓐ 전제 붕괴 — 127 문안 "
+             "부활?): %r" % [(s["step"], s["exit"]) for s in att3])
+        need(len(att3) == cap, "t2-b 팩 결손이 별도 상한(%d) 유계가 아니다: %d" % (cap, len(att3)))
+        d3 = _unjudge_detail(recs3)
+        need("팩 결손 확정적" in d3 and "없음" in d3,
+             "t2-b 스크립트 부재 실측('없음')·확정 진단이 없다: %r" % d3[:300])
+        need("이 상황의 처방이 아니다" in d3,
+             "t2-b 가 오진 처방(`cys boot`·데몬 재기동)을 명시 부인하지 않는다: %r" % d3[:300])
+        notes.append("t2b 팩결손 실물=rc2 실측·확정 진단(데몬 오진 소멸)")
+
+        # ── t3. 대조군: exit 1(노드 미기동) → 종전대로 재시도 소진 · 판정불가 단계 부재 ──
+        env4, home4 = _boot_sandbox(os.path.join(tmp, "missing"), check_exit=1)
+        env4["CYS_BOOT_CHECK_RETRIES"] = "3"
+        env4["CYS_BOOT_CHECK_INTERVAL_S"] = "0.05"
+        r4 = _run([PY, boot], env=env4, timeout=180)
+        need(r4.returncode == 6, "t3 노드 미기동 exit≠6: %d" % r4.returncode)
+        recs4 = _boot_last(home4).get("steps", [])
+        steps4 = [s["step"] for s in recs4]
+        need(len(_attempt_steps(recs4)) == 3,
+             "t3 미기동 경로가 재시도를 소진하지 않았다: %r" % steps4)
+        need("⑤check-unjudgeable" not in steps4, "t3 미기동이 판정 불가로 오분류됐다")
+        need(not _recheck_steps(recs4),
+             "t3 exit 1 에 ping 재확인이 붙었다(재확인은 exit 2 전용 — 과확장): %r" % steps4)
+        notes.append("t3 미기동=재시도 3회 소진·재확인 0(불변)")
+    # ── 계측 타당성(구 코드 대조) — 관례 유지하되 방향을 갱신: 구 코드에 **신계약이 없음**을
+    #    단언한다(위 t1 재확인 실측·t2 '팩 결손' 문면 단언이 구 코드에서 FIRE 하는 문자 근거). ──
     calib = "skip(no-git)"
-    if old is not None:
-        need("unjudgeable" not in old, "계측 타당성 실패: 구 코드에 이미 판정 불가 분기가 있다")
-        calib = "구 코드=exit 2 를 '미기동'과 동일 경로로 재시도 확인"
-    return ("판정 불가=별도 단계·재시도 0·`cys ping` 처방 / 대조군 미기동=재시도 3회 소진 · "
-            "계측검증=%s" % calib)
+    old_w0 = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
+    if old_w0 is not None:
+        # W0 트리: 판정 불가 분기 자체가 없다(G32 원결함 — exit 2 를 미기동과 동일 재시도).
+        need("unjudgeable" not in old_w0, "계측 타당성 실패: W0 코드에 이미 판정 불가 분기가 있다")
+        calib = "W0=분기 자체 부재"
+        old_w2 = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"),
+                           ref=PRE_WA3_REF)
+        if old_w2 is not None:
+            need("⑤check-unjudgeable" in old_w2,
+                 "계측 기준 오류: PRE_WA3_REF 트리에 W2 분기가 없다(기준 해시 확인)")
+            need("`cys ping` 재확인" not in old_w2,
+                 "계측 타당성 실패: 구(W2) 코드에 이미 ping 재확인이 있다")
+            need("팩 결손 가능성" not in old_w2,
+                 "계측 타당성 실패: 구(W2) 코드에 이미 팩 결손 진단이 있다")
+            need("orchestra 스크립트/인터프리터 부재" in old_w2,
+                 "계측 기준 오류: 구(W2) 코드의 127 오진 문안을 못 찾았다(ⓑ 사문의 실물)")
+            calib += " · W2=재확인·팩결손 진단 부재(즉시 이탈 단일 처방 + 127 오진 문안) 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 # ★H-EXIT-8(G1 discover sentinel)은 **W3 소속**이다(재감사 §4: G1 → W3 시드·등록 웨이브).
