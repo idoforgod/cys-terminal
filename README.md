@@ -84,7 +84,7 @@ cys send --to worker "상태 보고해줘"            # 역할 주소로 push
 cys send-key --to worker Return               # 전송 확정
 cys status --json                             # 전 노드 1콜 스냅샷
 cys events --reconnect                        # 이벤트 푸시 구독 (폴링 대체)
-cys run --scoped -- python -m http.server     # 생명주기 관리되는 스코프드 실행
+cys run -- python -m http.server              # 생명주기 관리되는 스코프드 실행
 cys boot                                      # 표준 노드 세트 일괄 기동(설치된 CLI 자동 감지)
 ```
 
@@ -170,7 +170,7 @@ cys-terminal은 자비스 온보딩 없이 **그냥 claude만 연결해도** 전
 | pane 간 메시지 | ✕ | ○ `cys send --surface` 자발 사용 실증 [실측] | ◎ 역할 주소·양방향 소켓 |
 | GUI 승인 요청 | ✕ 터미널 프롬프트뿐 | ○ `cys feed push --wait` | ◎ 승인 자동화 체계 |
 | 이벤트 push 구독 | ✕ 폴링뿐 | ○ `cys events` | ◎ EVT v1 계약 12종 |
-| 서버 생명주기 | ✕ 수동 | ○ `cys run --scoped` | ◎ + 사전 자원 게이트 |
+| 서버 생명주기 | ✕ 수동 | ○ `cys run` | ◎ + 사전 자원 게이트 |
 | 예약·웨이크업 | ✕ OS cron 수동 | ○ `cys schedule` | ◎ 자율주행 웨이크업 |
 | 역할 주소 통신 | — | ✕ | ○ master·cso·worker·reviewer |
 

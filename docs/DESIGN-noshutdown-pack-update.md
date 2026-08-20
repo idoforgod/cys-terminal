@@ -353,7 +353,7 @@ timeout→드리프트 오판→전문 주입으로 **대화 컨텍스트 파괴
 | **Tauri UI** | 보드 카탈로그·설정 메모리 캐시 | ★cys CLI엔 AppHandle 없음 → **Tauri command가 `cys pack-update` 사이드카를 래핑**해 종료 후 **자신이** `app.emit("pack-updated", {pack_version})`(브리지, §2-② "UI 갱신 브리지"). 프런트가 `read_board_catalog`(`main.rs:521`) 등 재호출. 대안: cysd event bus로 push 후 UI 구독(emit 패턴 `main.rs:498,1095` 동형) |
 | **디렉티브 의존 노드**(master·worker·reviewer) | 컨텍스트 상주 디렉티브 | §7-② reinject(디렉티브 변경 시·idle에서) |
 | **스크립트·스킬**(`bin/*.py`·`skills/*/SKILL.md`) | **무캐시**(사용 시점 파일 읽기) | 트리거 불요 — 다음 호출에 자동 신버전 |
-| **MCP 서버**(serena 등 scoped 데몬) | 프로세스 메모리 | idle 시점 graceful: `cys run --scoped`(`src/bin/cys.rs:3942`)로 띄운 것은 생명주기 강제종료가 보장되므로, 팩이 MCP 설정/바이너리를 바꾼 경우 **해당 scoped 프로세스만** idle에서 재기동(전체 무중단 유지). 설정만 바뀌고 서버가 핫리로드 지원하면 시그널, 아니면 idle graceful restart. |
+| **MCP 서버**(serena 등 scoped 데몬) | 프로세스 메모리 | idle 시점 graceful: `cys run`(scoped 실행 · `src/bin/cys.rs`)로 띄운 것은 생명주기 강제종료가 보장되므로, 팩이 MCP 설정/바이너리를 바꾼 경우 **해당 scoped 프로세스만** idle에서 재기동(전체 무중단 유지). 설정만 바뀌고 서버가 핫리로드 지원하면 시그널, 아니면 idle graceful restart. |
 
 원칙: **무캐시 자산(스크립트·스킬)은 트리거 불요, 캐시 자산만 명시 리로드**. 어느 소비자도
 cys-app/cysd 재시작을 요구하지 않는다(§5 무중단 불변).

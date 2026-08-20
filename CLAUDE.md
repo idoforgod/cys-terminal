@@ -47,7 +47,7 @@ python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_route.py" --request "<요청
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_memory.py" add --type <t> --name <slug> --desc "..." --body "..."  # 장기기억 증류 (원자적·색인 동기 — MEMORY.md 손편집 금지)
 cys feed push --wait --title "..." --body "..." # 승인 요청 (0=allow 2=deny 3=timeout)
 cys events --reconnect                          # push 구독 (폴링 금지)
-cys run --scoped -- <서버명령>                  # 서버는 반드시 scoped로 (생명주기 강제 종료)
+cys run -- <서버명령>                           # 서버는 반드시 이 형태로 (run은 항상 scoped — 종료 시 그룹 강제 종료)
 cys read-screen --surface <ref>                 # 보조 확인 수단 (상시 폴링 금지)
 cys set-status --state working --context <pct>  # 컨텍스트 자기보고 — 60% 도달 시 데몬이 결정론 통보
 ```

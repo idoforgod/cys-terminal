@@ -200,7 +200,7 @@ python3 scripts/timesfm_forecast.py --input /dev/null --horizon 4; echo "exit=$?
 
 - 가중치(~800MB)는 HuggingFace → `~/.cache/huggingface`(또는 `HF_HOME`) 캐시. PACK 텍스트에
   바이너리 봉인 금지(Apache-2.0 귀속 + 'not officially supported Google product' 면책).
-- `timesfm_forecast.py`는 장시간 추론 시 `cys run --scoped`로 생명주기 강제종료 권장.
+- `timesfm_forecast.py`는 장시간 추론 시 `cys run -- <명령>`으로 생명주기 강제종료 권장.
 - 모든 정확도(MAE/RMSE/MAPE/coverage) 주장은 **hold-out 실측 전까지 '미검증' 라벨** —
   자가보고 우위 신뢰 금지.
 

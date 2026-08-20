@@ -154,7 +154,7 @@ let _ = journal.sync_data();
 1. **순서 교정**: `plan.launchd_plist` 삭제를 `stop_daemons_and_unregister` 에서 빼고 `execute_quarantine` 성공 직후로 이동(bootout/unload 는 그대로 stop 에 유지 — KeepAlive 부활 방지가 목적이라 파일 삭제는 불요).
 2. **사전 점검**: `build_plan` 에 `trash_root_ready: Result<(),String>` 필드 추가(디렉토리인지·쓰기 가능한지 — `create_dir_all` 대신 `metadata` + 임시 파일 생성 시도). CLI `--plan`·GUI 프리뷰에서 부적격이면 **모달을 아예 띄우지 않고** `~/.local/state/cys-trash 가 파일입니다 — 그 파일을 지운 뒤 다시 시도하세요` 로 사전 거부. 실집행 경로에서는 격리 디렉토리를 **stop 이전에 선생성**.
 3. **부수효과 고지 공통 함수** `stop_side_effects_note()` 신설: `데몬은 이미 정지되었고 launchd 자동시작 등록이 해제되었습니다(격리는 진행되지 않았습니다). 복구: cys daemon install`. `src/bin/cys.rs:4533`·`:4590` 와 GUI 실패 토스트(main.ts:5178)에 모두 삽입.
-4. **SIGINT 핸들러**: run_factory_reset 실행 구간에서 `ctrlc`(리포에 이미 `cys run --scoped` 용 핸들러 존재, cys.rs:10972 참조)를 걸어 같은 안내를 출력하고 exit 130.
+4. **SIGINT 핸들러**: run_factory_reset 실행 구간에서 `ctrlc`(리포에 이미 `cys run`(scoped 실행) 용 핸들러 존재, cys.rs:10972 참조)를 걸어 같은 안내를 출력하고 exit 130.
 5. **진행 표시**: 폴링 루프에서 1초마다 `progress("stop", "cysd 종료 대기 N/12초")`.
 6. **문구 정직화**: 윈도우 분기의 `정상 종료 신호(TERM)` 를 `프로세스 트리 강제 종료(taskkill /T /F — 미저장분 손실)` 로 교체.
 

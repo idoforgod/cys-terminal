@@ -98,7 +98,7 @@ cys send --to worker "status report, please"  # push by role address
 cys send-key --to worker Return               # confirm submission
 cys status --json                             # one-call fleet snapshot
 cys events --reconnect                        # push event stream (replaces polling)
-cys run --scoped -- python -m http.server     # lifecycle-managed scoped execution
+cys run -- python -m http.server              # lifecycle-managed scoped execution
 cys boot                                      # boot the standard node set (auto-detects installed CLIs)
 ```
 

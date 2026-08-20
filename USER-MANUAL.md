@@ -387,7 +387,7 @@ cys approval check  # 서명 유효성 확인
 에이전트가 남긴 고아 서버로 시스템이 마비되는 것을 막는 1급 기능입니다.
 
 ```bash
-cys run --scoped -- python -m http.server   # 새 프로세스 그룹+원장 등록. 종료 시 그룹째 강제 정리
+cys run -- python -m http.server            # 새 프로세스 그룹+원장 등록. 종료 시 그룹째 강제 정리
 cys ps                                      # 프로세스 원장
 cys kill <pid>                              # 원장 등록 프로세스(그룹) 종료
 cys add-health-rule relogin "Not logged in" # 출력 라인 헬스룰 추가 → health.alert
