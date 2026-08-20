@@ -2938,6 +2938,40 @@ fn default_health_rules() -> Vec<HealthRule> {
 mod tests {
     use super::*;
 
+    // ★SEAL-1 pane 층 회귀 핀(2026-08-01 실사고): pane 자식(훅·CLI 가 셸 경유로 부르는 python)의
+    // 바이트코드 쓰기는 spawn_env_pairs 상속으로만 끈다(직스폰 팩토리 python_command 를 못 타는 경로).
+    // ① 단위 핀 — pane 스폰과 같은 모양으로 pairs → CommandBuilder.env 적재 후 get_env 되읽기
+    //    (portable-pty 에 env 조회 API 실재 — vendor/portable-pty/src/cmdbuilder.rs get_env).
+    // ② 소스 핀 — create_surface_with_env 본문이 spawn_env_pairs_from_process 를 계속 소비한다
+    //    (main.rs gui_boot_diagnosis_has_no_prose_matching 소스핀 관례 동형 · 로직 무변경 검증 전용).
+    // 실패 시 새는 것: pane 에서 도는 훅/스크립트 python 이 번들 안에 __pycache__/*.pyc 를 써서
+    // 코드서명 봉인이 깨진다(다음 실행이 Gatekeeper 에 차단).
+    #[test]
+    fn pane_children_inherit_no_bytecode_env() {
+        let mut b = CommandBuilder::new("true");
+        for (k, v) in
+            cys::spawn_env_pairs_from_process(std::path::Path::new("/nonexistent-exe-dir-for-pin"))
+        {
+            b.env(k, v);
+        }
+        assert_eq!(
+            b.get_env(cys::ENV_PY_NO_BYTECODE),
+            Some(std::ffi::OsStr::new(cys::PY_NO_BYTECODE_ON)),
+            "pane CommandBuilder 에 PYTHONDONTWRITEBYTECODE=1 미적재 — 훅 경유 python 이 번들을 오염시킨다"
+        );
+        let src = include_str!("state.rs");
+        let start = src.find("fn create_surface_with_env").expect("pane 스폰 함수 소실");
+        let end = start
+            + src[start..]
+                .find("\n    fn ingest_output")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        let seg = &src[start..end];
+        assert!(
+            seg.contains("spawn_env_pairs_from_process"),
+            "pane 스폰이 spawn_env_pairs_from_process 소비를 잃었다 — PATH/HOME 과 함께 SEAL-1 상속도 끊긴다"
+        );
+    }
+
     // ── M4: 자기승인 pgid 격상 순수 판정 — 같은 pgid(별개 CLI 프로세스)면 차단, 다른 pgid는 허용 ──
     #[test]
     fn is_self_approval_pgid_promotion() {

@@ -921,6 +921,11 @@ fn bundle_integrity_guidance() -> Option<String> {
 //   ⓑ 새 이벤트는 프론트(ui/src/main.ts + 빌드 산출물 ui/dist)까지 함께 고쳐야 발화하는데,
 //      그 연쇄가 끊기면 **알림이 조용히 사라진다**(이 기능의 유일한 임무가 알리는 것인데).
 //   두 판정이 동시에 참이면 나중 것이 토스트를 덮지만, 둘 다 결론이 "재설치"라 안내는 어긋나지 않는다.
+//
+// ★pull 백스톱(F3 격차1): emit(push)은 프론트가 listen 을 걸기 **전**이면 그대로 유실된다
+//   (emit-before-listen 레이스 — 웹뷰 리로드·기동 타이밍이 대표 경로). 그래서 Broken 판정은
+//   emit 과 별개로 전역 캐시(SEAL_BROKEN_CACHE)에 적재하고, 프론트 기동 pull(`bundle_integrity`)
+//   이 구조 결손 안내와 **합산**해 회수한다 — push 가 유실된 기동에도 알림이 기계적으로 성립한다.
 
 /// 스로틀 마커 경로 — `~/.cys/state/selfdiag-<version>`.
 /// 버전을 파일명에 넣는 이유: 업데이트되면 **새 번들이므로 다시 봐야 한다**(마커 삭제 로직 불요).
@@ -941,6 +946,40 @@ fn seal_selfdiag_marker() -> std::path::PathBuf {
 #[cfg(target_os = "macos")]
 fn seal_selfdiag_skips(marker: Option<&str>) -> bool {
     matches!(marker.map(str::trim), Some("intact") | Some("undetermined"))
+}
+
+/// SEAL-DIAG pull 캐시 — 봉인 자가진단의 **Broken 안내문만** 담는다(위 ★pull 백스톱 주석).
+/// Intact/Undetermined 는 저장하지 않는다: 알릴 것이 없는 판정이 캐시에 남으면
+/// 정상 기동·개발 빌드에서 "재설치" 오보가 pull 로 새어 나간다.
+#[cfg(target_os = "macos")]
+static SEAL_BROKEN_CACHE: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn seal_broken_cache() -> &'static Mutex<Option<String>> {
+    SEAL_BROKEN_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 판정 → pull 캐시에 적재할 안내문(순수 함수 = 회귀 핀 대상).
+///
+/// 문구는 `app_bundle::seal_broken_notice` 산출물 **그대로**다(push 와 동문 — 이원화 금지):
+/// push 가 유실된 기동에서 pull 이 다른 문구를 보이면 같은 고장이 두 얼굴을 갖게 된다.
+/// Broken 외 판정은 None — 캐시에 아무것도 적재하지 않는다.
+#[cfg(target_os = "macos")]
+fn seal_cache_payload(
+    bundle: &std::path::Path,
+    verdict: &cys::app_bundle::SealVerdict,
+) -> Option<String> {
+    match verdict {
+        cys::app_bundle::SealVerdict::Broken {
+            culprits,
+            self_inflicted,
+        } => Some(cys::app_bundle::seal_broken_notice(
+            bundle,
+            culprits,
+            *self_inflicted,
+        )),
+        _ => None,
+    }
 }
 
 /// 봉인 자가진단을 **백그라운드 스레드로 내보낸다**(호출 즉시 반환 — 부트 무영향).
@@ -972,18 +1011,18 @@ fn spawn_seal_selfdiag(handle: tauri::AppHandle) {
             }
             let _ = std::fs::write(&marker, token);
         };
-        match verdict {
+        match &verdict {
             cys::app_bundle::SealVerdict::Intact => record("intact"),
             cys::app_bundle::SealVerdict::Undetermined(why) => {
                 eprintln!("[cys-app] 봉인 자가진단 판정 불가(무음 skip) — {why}");
                 record("undetermined");
             }
-            cys::app_bundle::SealVerdict::Broken {
-                culprits,
-                self_inflicted,
-            } => {
-                let msg =
-                    cys::app_bundle::seal_broken_notice(&bundle, &culprits, self_inflicted);
+            cys::app_bundle::SealVerdict::Broken { .. } => {
+                let msg = seal_cache_payload(&bundle, &verdict)
+                    .expect("Broken 판정은 항상 안내문을 산출한다(seal_cache_payload 계약)");
+                // ★캐시 적재는 emit 보다 먼저다: emit 이 listen 전에 나가 유실돼도
+                //   프론트 기동 pull(bundle_integrity)이 이 값을 회수한다(F3 격차1의 기계 보장).
+                *seal_broken_cache().lock().unwrap() = Some(msg.clone());
                 eprintln!("[cys-app] 코드서명 봉인 파손 감지 — 재설치가 필요합니다\n{msg}");
                 let _ = handle.emit("bundle-damaged", msg);
             }
@@ -991,13 +1030,29 @@ fn spawn_seal_selfdiag(handle: tauri::AppHandle) {
     });
 }
 
+/// pull 응답 합산(순수 함수 = 회귀 핀 대상): 구조 결손 안내 ⊕ 캐시된 봉인 파손 안내.
+///
+/// 덮어쓰기 의미론 계약(위 SEAL-DIAG ★알림 채널 주석)을 pull 에도 그대로 보존한다 —
+/// push 경로에서는 봉인 판정이 codesign(초 단위) 탓에 **나중에** 도착해 토스트를 덮으므로,
+/// 둘 다 참이면 pull 도 봉인 쪽을 돌려준다. 어느 쪽이 이겨도 결론은 "재설치" 하나라
+/// 안내가 어긋나지 않는다. 한쪽만 참이면 그것을, 둘 다 없으면 None(무음).
+#[cfg(target_os = "macos")]
+fn merge_integrity_pull(
+    structural: Option<String>,
+    seal_broken: Option<String>,
+) -> Option<String> {
+    seal_broken.or(structural)
+}
+
 /// 프론트 pull 경로(`boot_verdict` 와 같은 이유 — emit-before-listen 레이스 회피).
-/// 정상 설치본·번들 밖 실행·비 macOS 는 None.
+/// 구조 결손(즉시 판정)과 **캐시된 봉인 파손**(백그라운드 자가진단이 적재 · F3 격차1)을
+/// 합산해 돌려준다. 정상 설치본·번들 밖 실행·비 macOS 는 None.
 #[tauri::command]
 fn bundle_integrity() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return bundle_integrity_guidance();
+        let seal = seal_broken_cache().lock().unwrap().clone();
+        return merge_integrity_pull(bundle_integrity_guidance(), seal);
     }
     #[allow(unreachable_code)]
     None
@@ -3878,6 +3933,59 @@ mod tests {
             .ends_with(&format!("selfdiag-{}", env!("CARGO_PKG_VERSION"))));
     }
 
+    /// ★SEAL-DIAG pull 캐시 회귀 핀 ①(F3 격차1): **Broken 만 적재 대상이고, 문구는
+    /// push 가 쓰는 seal_broken_notice 산출물과 바이트 동일하다(이원화 0).**
+    /// Intact/Undetermined 가 안내문을 만들면 정상 기동·개발 빌드에서 "재설치" 오보가
+    /// pull 로 새고, 문구가 갈라지면 push 유실 기동에서 같은 고장이 두 얼굴을 갖는다.
+    /// (전역 SEAL_BROKEN_CACHE 는 건드리지 않는다 — 병렬 테스트의
+    ///  bundle_integrity_is_silent_outside_a_bundle… 가 빈 캐시를 전제하기 때문.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seal_cache_stores_only_broken_and_speaks_the_canonical_notice() {
+        use cys::app_bundle::SealVerdict;
+        let bundle = std::path::Path::new("/Applications/cys.app");
+        // 알릴 것 없는 판정 → 적재 없음(오보 차단).
+        assert_eq!(seal_cache_payload(bundle, &SealVerdict::Intact), None);
+        assert_eq!(
+            seal_cache_payload(bundle, &SealVerdict::Undetermined("codesign 부재".into())),
+            None
+        );
+        // Broken → 반드시 Some 이며, push 문구와 바이트 동일(이원화 금지 계약).
+        let culprits = vec!["Contents/Resources/pack/__pycache__/x.pyc".to_string()];
+        let got = seal_cache_payload(
+            bundle,
+            &SealVerdict::Broken {
+                culprits: culprits.clone(),
+                self_inflicted: true,
+            },
+        )
+        .expect("Broken 판정은 항상 안내문을 산출해야 한다");
+        assert_eq!(
+            got,
+            cys::app_bundle::seal_broken_notice(bundle, &culprits, true),
+            "push(emit)와 pull(캐시) 문구가 갈라졌다 — 이원화 금지 계약 위반"
+        );
+    }
+
+    /// ★SEAL-DIAG pull 캐시 회귀 핀 ②(F3 격차1): 합산은 **어느 파손 판정도 떨어뜨리지
+    /// 않는다.** 둘 다 참이면 봉인 쪽을 돌려준다 — push 에서 codesign(초 단위)이 나중에
+    /// 도착해 토스트를 덮는 순서의 pull 판 보존(덮어쓰기 의미론 계약 · 결론은 양쪽 다
+    /// "재설치"라 안내 불일치 없음). 여기가 무너지면 push 유실 기동에서 봉인 파손이
+    /// 구조 무결(None)에 가려 침묵한다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_integrity_merge_never_drops_a_damage_verdict() {
+        let s = || Some("구조 결손 안내".to_string());
+        let b = || Some("봉인 파손 안내".to_string());
+        // 무고장 = 무음(오보 없음).
+        assert_eq!(merge_integrity_pull(None, None), None);
+        // 한쪽만 참 → 그 판정이 그대로 살아 나간다(어느 쪽도 소실 금지).
+        assert_eq!(merge_integrity_pull(s(), None), s());
+        assert_eq!(merge_integrity_pull(None, b()), b());
+        // 둘 다 참 → 봉인(나중 도착)이 덮는다 — push 토스트 덮어쓰기 순서와 동일.
+        assert_eq!(merge_integrity_pull(s(), b()), b());
+    }
+
     /// ★D4 팔레트 노출 게이트 회귀 핀: 드리프트 = [.pre-ceo 존재 ∧ md≠라이브 CEO_TEMPLATE] **만**이다.
     /// 특히 R2 실측 교정 두 가지를 고정한다 — ⓐ md==템플릿(정상 승격 최신)은 .pre-ceo 가 있어도
     /// 비노출(위경보 0) ⓑ 판독 불가(부재·IO 실패)는 보수적 비노출(비정형 상태 안내는 C03 관할).
@@ -4633,5 +4741,26 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
         assert_eq!(launched_surface_ref(b""), None);
         assert_eq!(launched_surface_ref(b"error: nope\n"), None);
+    }
+
+    /// ★SEAL-1 GUI 직스폰 층 회귀 핀(2026-08-01 실사고): `inject_runtime_path` 는 "자식이
+    /// 번들 python 을 쓰게 만드는" 배선의 단일 지점이다 — 여기서 ENV_PY_NO_BYTECODE=1 이
+    /// 빠지면 GUI 직스폰(bash/python3) 자식이 번들 안에 `__pycache__/*.pyc` 를 써서
+    /// 코드서명 봉인을 깬다(다음 실행이 Gatekeeper 에 차단). lib.rs 의 python_command·
+    /// spawn_env_pairs 핀과 **별개 층**이다 — 둘이 남아도 이 함수가 쌍을 잃으면 GUI 경로가 샌다.
+    #[test]
+    fn gui_direct_spawns_never_write_bytecode_into_the_bundle() {
+        let mut cmd = std::process::Command::new("true");
+        inject_runtime_path(&mut cmd);
+        let got = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(cys::ENV_PY_NO_BYTECODE))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            got.as_deref(),
+            Some(cys::PY_NO_BYTECODE_ON),
+            "inject_runtime_path 가 바이트코드 쓰기 차단 쌍을 잃었다 — GUI 직스폰 python 이 번들을 오염시킨다"
+        );
     }
 }

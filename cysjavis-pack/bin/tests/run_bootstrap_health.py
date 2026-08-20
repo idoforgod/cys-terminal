@@ -3195,6 +3195,66 @@ def h_cycle_1():
             "— 전 플랫폼 주입식 판정")
 
 
+@specimen("H-PYSEAL-1", "W6",
+          "훅 셸 층 SEAL-1 — 프리루드 source 만으로 PYTHONDONTWRITEBYTECODE=1 무조건 export",
+          ["SEAL-1-HOOK"])
+def h_pyseal_1():
+    """SEAL-1(2026-08-01 실사고 · 정본 src/lib.rs ENV_PY_NO_BYTECODE) 3층 가운데 **훅 셸 층** 기계 핀.
+
+    번들 python 이 번들 안에 `__pycache__/*.pyc` 를 쓰면 코드서명 봉인이 깨져 다음 실행이
+    Gatekeeper 에 차단된다("손상되었기 때문에 열 수 없습니다"). Rust 두 층(python_command·
+    spawn_env_pairs)은 cargo 테스트가 잠갔지만, **사용자가 직접 띄운 CLI 에서 훅이 $CYS_PY 로
+    번들 python 을 부르는 경로**는 그 상속을 못 받는다 — _lib.sh 의 무조건
+    `PYTHONDONTWRITEBYTECODE=1; export`(:265-266)만이 막는다. 이 검체가 깨지면: 그 경로의
+    python 이 .pyc 를 다시 쓰기 시작하고, SEAL-2(선컴파일)가 못 덮는 **봉인 밖 팩 사본**까지
+    오염된다. 실패 시 새는 것 = 훅 발 python 스폰 전군의 바이트코드 쓰기 차단.
+
+    프로브 rc 계약: 3=하네스 누수(source 전에 이미 값 존재 — 검체 무효) · 4=source 실패 ·
+    5=값≠1(SEAL-1 소실) · 6=값은 있으나 export 아님(자식 미상속 = 사실상 소실) · 0=PASS.
+    검사 셸은 `sh`(POSIX) — 프리루드 계약 ⓐ와 같은 층위이고, System32 동명 스텁이 없어
+    리터럴이 안전하다(G-SYNTAX 의 관례)."""
+    lib = os.path.join(HOOKS_DIR, "_lib.sh")
+    need(os.path.isfile(lib), "_lib.sh 부재 — 프리루드 미착지")
+
+    def _probe(libpath):
+        return (
+            '[ -z "${PYTHONDONTWRITEBYTECODE:-}" ] || { echo "PRE-LEAK=$PYTHONDONTWRITEBYTECODE" >&2; exit 3; }; '
+            '. "%s" || exit 4; '
+            '[ "${PYTHONDONTWRITEBYTECODE:-}" = "1" ] || { echo "VAL=${PYTHONDONTWRITEBYTECODE:-unset}" >&2; exit 5; }; '
+            "env | grep -q '^PYTHONDONTWRITEBYTECODE=1$' || { echo NO-EXPORT >&2; exit 6; }" % libpath
+        )
+
+    # 러너가 cys pane 안에서 돌면 부모 env 에 이미 1이 상속돼 있다(바로 이 export 의 산물) —
+    # 지우지 않으면 export 가 소실돼도 초록이 나오는 거짓 PASS 다. drop + rc=3 프리가드 이중.
+    env = _base_env(drop=("PYTHONDONTWRITEBYTECODE",))
+    r = _run(["sh", "-c", _probe(lib)], env=env)
+    need(r.returncode != 3,
+         "하네스 자기검증 실패: source 전에 이미 값이 있다(env 누수 — 검체 무효): %r" % r.stderr[:200])
+    need(r.returncode != 4, "_lib.sh source 가 비0 종료(프리루드 계약 ⓓ 위반): %r" % r.stderr[:200])
+    need(r.returncode != 5,
+         "SEAL-1 훅 층 소실: source 후 PYTHONDONTWRITEBYTECODE 가 1이 아니다 — "
+         "직접 띄운 CLI 의 훅 python 이 번들에 .pyc 를 쓴다: %r" % r.stderr[:200])
+    need(r.returncode != 6,
+         "값은 있으나 export 아님 — 자식 python 에 상속되지 않아 차단이 무효다: %r" % r.stderr[:200])
+    need(r.returncode == 0, "프로브 비정상 종료 rc=%d stderr=%r" % (r.returncode, r.stderr[:200]))
+
+    # 계측기 자기검증(MEMORY 3칙): SEAL-1 착지(f43a0e4) **직전** 트리 6d1871f 의 _lib.sh 에서
+    # 같은 프로브가 rc=5 로 FIRE 하는가. 기본 기준(a96d8b1)은 _lib.sh 자체가 없어 대조 불능이라
+    # 고정 해시를 따로 쓴다(_git_show ref 인자 규약 — PRE_W0_REF 와 같은 이유).
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/hooks/_lib.sh", ref="6d1871f")
+    if old is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            oldlib = os.path.join(tmp, "_lib.sh")
+            _w(oldlib, old, 0o644)
+            r2 = _run(["sh", "-c", _probe(oldlib)], env=env)
+            need(r2.returncode == 5,
+                 "계측 타당성 실패: 구 _lib.sh(6d1871f · SEAL-1 이전)에서 rc=%d (기대 5) — "
+                 "검체가 결함 부재를 재현하지 못한다: %r" % (r2.returncode, r2.stderr[:200]))
+            calib = "구 _lib.sh(6d1871f) rc=5 재현"
+    return "sh source 만으로 값=1 + export(자식 상속) 확인 · 계측검증 %s" % calib
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. H-PRED / H-TIME / H-DOC / H-SEED / H-LIFE / H-OBS
 # ═══════════════════════════════════════════════════════════════════════════

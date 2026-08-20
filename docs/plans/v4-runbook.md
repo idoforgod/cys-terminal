@@ -18,7 +18,8 @@
 2. 태그(mac) → 3. win 빌드 → 4. **WDSI 신고**(Defender 오탐 최소화) → 5. **애플 공증**
    (`~/.cys/apple-notary.env` 자격 — 무공증이면 Gatekeeper 차단) →
 6. **전 자산 일괄 업로드** → `SHA256SUMS.txt` 전 자산 재생성(`scripts/release-postprocess.py` —
-   구버전 줄 잔존 금지) → **원격검증 6항**(`scripts/verify-release-remote.py` — 다운로드 4URL
+   구버전 줄 잔존 금지 · ★백업 DMG 2종에 Gatekeeper 게이트 자동 실평가, rc≠0 이면 `--apply`
+   거부=fail-closed) → **원격검증 6항**(`scripts/verify-release-remote.py` — 다운로드 4URL
    200 · Defender/SmartScreen 안내 섹션 잔존 grep ≥1 포함).
 
 - updater 채널 공개는 **본 머신 런북(아래 ①~⑥) 완주 후**. 앞당기려면 'WARN 창 수용'을

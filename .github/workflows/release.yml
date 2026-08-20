@@ -437,7 +437,24 @@ jobs:
           for d in "${DMGS[@]}"; do
             echo "=== Gatekeeper 게이트 대상: $d ==="
             # exit 0=PASS · 1=FAIL(발행 금지) · 2=판정 불가(도구 부재·마운트 실패 → 통과 아님)
-            bash scripts/release-gate-gatekeeper.sh "$d"
+            # ── GATE_MODE·spctl 모드 증적 승격(GITHUB_STEP_SUMMARY · F1 검증 공백 수리) ──
+            #   강등(degraded = spctl 실평가 미수행)은 로그 배너만으로는 라운드 감사에서 묻힌다 —
+            #   게이트 스크립트가 stdout 마지막 줄에 내는 기계 요약(GATE_MODE=full|degraded)과
+            #   spctl 상태 줄을 요약 페이지에 박아, "실평가 없는 초록"이 증적 층에서도 보이게 한다.
+            #   FAIL 실행도 증적은 먼저 남긴다(tee 캡처 → 요약 승격 → rc 그대로 종료 · pipefail 이
+            #   게이트 rc 를 보존한다). 산출물($d)은 읽기만 한다(원본 무변경 계약 유지).
+            # ★주의(태그 트리 함정): 릴리스는 태그 시점의 트리로 돈다 — 이 스텝 수정은 이 커밋을
+            #   담은 **다음 태그부터** 유효하다. 지난 태그 재실행에는 소급되지 않는다.
+            GLOG="$(mktemp)"; rc=0
+            bash scripts/release-gate-gatekeeper.sh "$d" 2>&1 | tee "$GLOG" || rc=$?
+            {
+              echo "### macOS Gatekeeper 게이트 — $(basename "$d") (${{ matrix.target }})"
+              grep -E '^GATE_MODE=' "$GLOG" | tail -1 || echo 'GATE_MODE=(미출력 — 태그 트리의 게이트 스크립트가 구판)'
+              grep -E '^spctl: ' "$GLOG" | tail -1 || true
+              echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가)"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            [ "$rc" -eq 0 ] || exit "$rc"
           done
 
       # ★Windows 직접 빌드 + CRT 발행 차단 게이트 — 업로드 **전** (R2 agy 구조 권고 수용 · 2026-07-28).

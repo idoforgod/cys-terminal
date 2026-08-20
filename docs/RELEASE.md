@@ -225,6 +225,38 @@ arm64 머신에서 x64 DMG 를 볼 땐 Rosetta 2 필요(없으면 ⑥-A 가 "검
 즉 앞의 것은 "제대로 배포됐나", 뒤의 것은 "제대로 열리나"다. **하나가 다른 하나를 대신하지
 못한다.**
 
+#### ★CI 자동판 게이트 — `scripts/release-gate-gatekeeper.sh` (2026-08-13 신설 · release.yml 이 업로드 전 자동 실행)
+
+위 실사용자 경로 게이트의 **정적 CI 판(判)**이다. `release.yml` 의 macOS 두 레그가
+tauri-action 업로드 **전에** 자기 아키텍처 DMG 에 자동으로 돌린다(= DMG 2종 커버).
+v0.14.19 실측(run 32039644404): 두 레그 모두 `spctl: assessments enabled → 모드=full`
+로 실평가가 돌았다(강등 아님).
+
+```sh
+bash scripts/release-gate-gatekeeper.sh <DMG | .app>
+#   exit 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(도구 부재·마운트 실패 — 통과 아님)
+```
+
+- 검사 = quarantine 부착·상속 → 마운트 → `codesign --verify --deep --strict` +
+  `stapler validate` + `spctl --assess --type execute` + ⑤ SEAL-2 불변식 정적 검사
+  (동봉 python 선컴파일 커버리지·표본 `.pyc` 헤더 — 실행 0 · 2026-08-20 추가, 세목은
+  스크립트 머리 주석). 대상은 DMG 안 **모든** `*.app`
+  (설치 도우미 `Install cys.app` + 숨김 `.support/cys.app`). 러너 정책이 `assessments
+  disabled` 면 skip 이 아니라 **codesign/stapler 단독 모드(DEGRADED)로 강등**하고 배너로
+  고지한다(무음 통과 금지).
+- **`verify-gatekeeper-user-path.sh` 와의 관계 — 겹치지 않는 상·하위 게이트다.** 그쪽
+  (로컬·수동)은 여기 검사 전부 + ⑥ **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
+  본다. 대신 대상 아키텍처 python 을 실행하므로 arm64 러너에서 x64 DMG 를 보려면 Rosetta 2
+  가 필요하고(없으면 FAIL) 임시 디스크 ~2GB 를 쓴다 — 그대로 CI 매트릭스에 걸면 x64 레그가
+  구조적으로 깨진다. 이 스크립트는 실행을 전혀 하지 않는 **정적 평가만** 남긴 CI 판이다.
+  로컬 릴리스 절차에서는 여전히 위 실사용자 경로 게이트를 돌려라.
+- ★**발행 층위 훅**(F2 · 2026-08-20 신설): `scripts/release-postprocess.py` 가 4단계
+  (자기 검증) 직후에 draft 백업 DMG 2종 = **발행될 실물 바이트**에 이 게이트를 자동 실행하고,
+  네이티브 아키텍처 DMG 에는 `verify-gatekeeper-user-path.sh`(⑥ 포함)까지 얹는다.
+  rc≠0(1·2 모두)이면 postprocess 전체가 비영 종료해 `--apply` 가 거부된다(fail-closed ·
+  측정 불능≠통과 · macOS 밖에서는 판정 불가로 fail-closed). 비상 탈출구
+  `--unsafe-skip-gatekeeper`(LOUD 경고 2줄 · 평시 금지).
+
 > 인증서가 없을 때(개발용): env 없이 `bun x @tauri-apps/cli build` → ad-hoc 빌드. 이 빌드는
 > **다른 맥 전송 시 "손상됨"**이 뜨므로, 받은 맥에서 `xattr -dr com.apple.quarantine
 > /Applications/cys.app` 로만 우회 가능(배포용 아님).
@@ -367,6 +399,10 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       · 발행 후에는 원격 자산에 대고 한 번 더 돌린다:
         `bash scripts/verify-gatekeeper-user-path.sh --version <V> --arch aarch64` (x64 도)
       · **아키텍처별 머신에서 각자 돌리는 것이 정확하다**(교차 실행은 Rosetta 2 필요).
+      · ★후처리 자동판(F2 · 2026-08-20): `scripts/release-postprocess.py` 가 draft 백업
+        DMG 2종 = **발행될 실물 바이트**에 `release-gate-gatekeeper.sh` 실평가를 자동
+        수행한다(네이티브 아키텍처 DMG 는 본 게이트 ⑥ 포함까지) — rc≠0(1·2 모두)이면
+        postprocess 비영 종료·`--apply` 거부(fail-closed · §1 「★CI 자동판 게이트」 절 참조).
 - [ ] **★메인 페이지(`/`) 원격 검증 — 6항목 전부 (S28 + 2026-07-29 오너 지시 ⓐⓑⓒ · 자동화 밖의 수동 게이트)**
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기

@@ -6012,6 +6012,14 @@ async function start() {
   // 알린다. 안전모드와 **별개 토스트**다 — 원인도 처방도 다르므로 같은 제목에 섞으면 오히려
   // 사용자를 헤매게 한다("위치를 옮기라"고 해도 해결되지 않는 고장이다). bundle-damaged 이벤트는
   // 벨트앤서스펜더(같은 id 라 중복 발화해도 dedupe).
+  //
+  // ★봉인 파손 합산(F3 격차1 · SEAL-DIAG): 이 pull 은 구조 결손만이 아니라 **캐시된 코드서명
+  // 봉인 파손 판정**도 백엔드가 합산해 돌려준다(src-tauri bundle_integrity → merge_integrity_pull).
+  // 봉인 자가진단의 push(bundle-damaged emit)는 아래 listen 등록 **전**에 나가면 유실되는데
+  // (emit-before-listen 레이스 — 리로드·기동 타이밍), 이 pull 이 그 유실을 기계적으로 회수한다.
+  // ★중복 토스트 금지: push 가 먼저(또는 나중에) 와도 토스트 id 가 "bundle-damaged" 하나라
+  // stickyToast 가 같은 엘리먼트를 재사용한다(같은 id 재호출 = 갱신·TTL 리셋 — 화면엔 한 줄).
+  // 둘 다 결론이 "재설치"라 어느 쪽 문구가 남아도 안내는 어긋나지 않는다.
   try {
     const damage = await invoke("bundle_integrity");
     if (typeof damage === "string" && damage) {
@@ -6224,6 +6232,9 @@ async function start() {
   // ★반쪽 번들 알림(ATOMIC-1 짝): 기동 자기점검과 **업데이트 설치 후 검증** 양쪽이 이 이벤트를 쏜다.
   // 후자는 재시작을 중단하고 이 안내를 띄운다 — 깨진 번들로 재시작하면 다음 기동을 Gatekeeper 가
   // 막아 사용자가 원인 없는 "손상되었기 때문에 열 수 없습니다"만 보게 되기 때문이다.
+  // SEAL-DIAG 봉인 파손 emit 도 이 채널로 온다 — listen 등록 전에 나간 emit 은 위 start() 의
+  // bundle_integrity pull 캐시 합산이 회수하고(F3 격차1), 여기 도착분과는 같은 토스트 id 로
+  // dedupe 된다(stickyToast 같은 id 재호출 = 갱신 — 중복 토스트 없음).
   await listen("bundle-damaged", (e) => {
     const msg =
       typeof e.payload === "string"
