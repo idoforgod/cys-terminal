@@ -2773,8 +2773,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // W3.1 서버측 위험 파생 — 발행자 tier/kind 자기신고 무관, title·body 서술만으로.
             let risk = crate::approval_risk::derive_risk(&title, &body);
             // W3.2 자동결재 대상 = flag ON + risk=AutoEligible일 때만(fail-safe 기본 OFF).
+            // + W4-A(결함7-e): 발행자 무명(publisher_surface=None — 고아화/setsid/pane 밖 발행)은
+            //   CEO 자동결재 원천 제외(fail-closed: 발행 주체를 증명 못 하는 요청이 무검증 자동
+            //   해소로 흐르지 않는다). 항목은 pending 유지 = HighRisk 취급(사람 결재 경로).
             let auto_route = daemon.config.approve_auto_route
-                && risk == crate::approval_risk::RiskClass::AutoEligible;
+                && risk == crate::approval_risk::RiskClass::AutoEligible
+                && publisher_surface.is_some();
             let item = FeedItem {
                 request_id: request_id.clone(),
                 kind: kind.clone(),
@@ -2793,6 +2797,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 publisher_surface,
                 risk_class: Some(risk.as_str().to_string()),
                 auto_route,
+                resolver_surface: None, // W4-A: 각인은 feed.reply 단일 해소 경로에서만.
+                resolver_pid: None,
             };
             // waiter 등록을 항목 공개와 같은 임계영역에서 수행 — 항목이 다른 커넥션에
             // 보이는 순간 waiter가 이미 존재해, 빠른 feed.reply의 결정이 유실되지 않는다.
@@ -2857,7 +2863,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let over_pressure = record_approval_request(daemon, publisher_surface);
                 match risk {
                     crate::approval_risk::RiskClass::AutoEligible => {
-                        route_auto_approval(daemon, &item, over_pressure)
+                        // W4-A(결함7-e): auto_route 게이트(위 계산 — 발행자 무명 제외 포함)를
+                        // 라우팅에도 균일 적용 — 무명 발행은 CEO 배달도 escalation도 없이
+                        // pending 유지(HighRisk 취급). 게이트를 여기서 안 보면 auto_route=false
+                        // 항목이 CEO로 배달되는 표리부동이 생긴다.
+                        if item.auto_route {
+                            route_auto_approval(daemon, &item, over_pressure)
+                        }
                     }
                     crate::approval_risk::RiskClass::HumanOnly => {
                         // AutoEligible과 동일한 의미 키 멱등 — 동일 재발행 중복 escalation 차단(F5).
@@ -2947,21 +2959,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                      caller pid={caller_pid:?} pgid={caller_pgid:?} sid={caller_sid:?} / \
                      publisher pid={pub_pid:?} pgid={pub_pgid:?} sid={pub_sid:?}"
                 );
+                // W4-A: 미귀속 caller까지 균일 차단이 확장돼 pane 밖(SSH 등) 정당한 allow도 여기
+                // 걸릴 수 있다 — 거부 메시지에 합법 경로 3종을 안내한다(무안내 거부 금지 관례).
                 return Reply::Single(err_response(
                     &id,
                     "self_approval_denied",
-                    "요청 발행자는 자기 요청을 승인할 수 없다 — 다른 노드/오퍼레이터가 승인해야 한다(§3.2)",
+                    "요청 발행자·미귀속 외부 프로세스는 allow할 수 없다(§3.2 fail-closed) — \
+                     합법 경로: ①pane 안에서 cys feed reply ②GUI 오퍼레이터 승인(operator token) \
+                     ③정책 파일(deny_self_approve OFF)로 게이트 해제",
                 ));
             }
             // W3.3 --reason: 결재 사유(한글·공백은 CLI가 단일 인용 인코딩). 감사에 기록된다.
             let reason = param_str(&params, "reason");
             // 위임: persist·waiter wake·feed.item.resolved 발행 + W3.5 감사 append를
             // resolve_feed_item_audited가 단일 수행한다(reason·caller 포함).
+            // W4-A: caller_sid(위에서 이미 조상 추적으로 해석)를 함께 넘겨 해소 주체를 각인한다
+            // — operator token 해소는 caller_sid=None이라 resolver_pid만 남는다(사실 그대로).
             match daemon.resolve_feed_item_audited(
                 &request_id,
                 &decision,
                 reason.as_deref(),
                 caller_pid,
+                caller_sid,
             ) {
                 Some(_) => {
                     // W3.6 거부 카운터(형해화 back-pressure) — deny 계열 결재만 집계.
@@ -3005,6 +3024,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         //   가 직렬화하지 않는다'고 적혀 있었다. 그 전제를 여기서 없앤다.
                         //   판정의 정의처는 state::is_daemon_issued 하나다.
                         "daemon_issued": crate::state::is_daemon_issued(&i.request_id),
+                        // W4-A additive(결함7 영수증 데이터 공급선): 해소 주체 각인. null=미해소·
+                        // 비-pane 해소(stale-clear·채널·operator token)·구 데몬 라인. cycle-agent의
+                        // 영수증 검증(cycle_receipt_ok·W4-B)이 resolver_surface==지정 검증자를
+                        // 대조한다. 기존 키 삭제·개명 0건 — cys feed list 텍스트 열 계약 무변경.
+                        "resolver_surface": i.resolver_surface,
+                        "resolver_pid": i.resolver_pid,
                     })
                 })
                 .collect();
@@ -8131,6 +8156,18 @@ mod tests {
         }
     }
 
+    /// W4-A: synthetic pid→sid를 caller_cache에 심어 발신자를 pane 귀속으로 만든다
+    /// (send ACL 테스트의 기존 관례 동형 — 커널 조상 추적의 테스트 대역). 결함7-e 이후
+    /// auto_route는 발행자 귀속(publisher_surface=Some)을 요구하므로, CEO 자동결재를
+    /// 검증하는 w3 테스트는 push를 귀속 발행자로 보내야 한다.
+    fn seed_caller(daemon: &Arc<Daemon>, pid: u32, sid: u64) {
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+    }
+
     /// 구독 rx에서 전체 이벤트를 벡터로 뽑는다(name·payload 매칭 편의).
     fn drain(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
         let mut out = Vec::new();
@@ -8242,12 +8279,14 @@ mod tests {
     }
 
     /// ② CEO 좌석 부재: flag ON + auto-eligible → 즉시 escalation(ceo_seat_empty). auto_route=true.
+    /// (W4-A: 발행자는 pane 귀속이어야 auto_route 성립 — synthetic 귀속으로 발행.)
     #[test]
     fn w3_ceo_seat_empty_escalates() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         let (daemon, dir) = daemon_auto("w3-empty", true);
+        seed_caller(&daemon, 900_001, 55);
         let mut rx = daemon.bus.subscribe();
-        let _ = dispatch(&daemon, w3_push(1, "e1", "[RSI 학습 추천]", "확인", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "e1", "[RSI 학습 추천]", "확인", None), Some(900_001));
         let evs = drain(&mut rx);
         let p = created_payload(&evs, "e1").expect("created");
         assert_eq!(p["payload"]["auto_route"], json!(true), "ON+auto인데 auto_route=false");
@@ -8302,13 +8341,15 @@ mod tests {
 
     /// ④ 멱등 의미 키: 같은 kind+title+publisher+body를 새 request_id로 재발행해도 CEO
     /// 재주입(여기선 escalation)은 1회만(중복 억제). 좌석 부재로 첫 건만 escalation.
+    /// (W4-A: 같은 귀속 발행자 pid로 두 번 발행 — 의미 키의 publisher_surface도 동일해진다.)
     #[test]
     fn w3_idempotent_semantic_key() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         let (daemon, dir) = daemon_auto("w3-idem", true);
+        seed_caller(&daemon, 900_002, 56);
         let mut rx = daemon.bus.subscribe();
-        let _ = dispatch(&daemon, w3_push(1, "r1", "[RSI 학습 추천]", "동일본문", None), None);
-        let _ = dispatch(&daemon, w3_push(2, "r2", "[RSI 학습 추천]", "동일본문", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "r1", "[RSI 학습 추천]", "동일본문", None), Some(900_002));
+        let _ = dispatch(&daemon, w3_push(2, "r2", "[RSI 학습 추천]", "동일본문", None), Some(900_002));
         let evs = drain(&mut rx);
         // 두 항목 모두 생성(pending)되지만 escalation은 의미 키로 1회만.
         assert_eq!(count_named(&evs, "feed.item.created"), 2, "두 push 다 created 돼야");
@@ -8336,8 +8377,10 @@ mod tests {
         daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
         daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
 
+        // W4-A: 발행자 pane 귀속(auto_route 성립 조건) — CEO와 다른 synthetic surface.
+        seed_caller(&daemon, 900_003, 57);
         let mut rx = daemon.bus.subscribe();
-        let _ = dispatch(&daemon, w3_push(1, "d1", "[RSI 학습 추천]", "제안", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "d1", "[RSI 학습 추천]", "제안", None), Some(900_003));
         let evs = drain(&mut rx);
         assert_eq!(
             count_named(&evs, "feed.auto_routed"),
@@ -8396,6 +8439,9 @@ mod tests {
             publisher_surface: Some(3),
             risk_class: Some("auto".into()),
             auto_route: true,
+            // W4-A resolver 각인 필드도 wire round-trip에 포함(Some으로 채워 직렬화 검증).
+            resolver_surface: Some(9),
+            resolver_pid: Some(4242),
         };
         let resp = json!({"id": 1, "ok": true, "result": {"item": item}});
         let framed = cys::wire::frame_response(&resp);
@@ -8417,6 +8463,132 @@ mod tests {
         let evs = drain(&mut rx);
         assert_eq!(count_named(&evs, "approval.backpressure"), 1, "임계 교차 이벤트 1회");
         std::env::remove_var("CYS_APPROVE_BACKPRESSURE_N");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [W4-A 회귀 핀·결함7-e] auto_route 발행자 무명 제외: flag ON + auto 마커 서술이라도
+    /// caller가 surface로 해석되지 않으면(고아화/setsid/pane 밖) item.auto_route=false·
+    /// CEO 배달 0건·escalation 0건·pending 유지. ★판별력: 게이트(`publisher_surface.is_some()`
+    /// + AutoEligible arm의 `if item.auto_route`)를 제거하면 구 코드는 좌석 부재 escalation
+    /// (approval.stalled)을 발행해 아래 0건 단언이 반드시 깨진다.
+    #[test]
+    fn w3_auto_route_requires_publisher_attribution() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w4-anon", true);
+        let mut rx = daemon.bus.subscribe();
+        // caller_pid는 있으나 어떤 surface에도 귀속 불가(실재하지 않는 pid → 조상 추적 실패).
+        let _ = dispatch(&daemon, w3_push(1, "an1", "[RSI 학습 추천]", "확인", None), Some(900_004));
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "an1").expect("created");
+        assert_eq!(p["payload"]["risk_class"], json!("auto"), "risk 파생은 귀속 무관");
+        assert_eq!(
+            p["payload"]["auto_route"],
+            json!(false),
+            "발행자 무명인데 auto_route=true(결함7-e 회귀)"
+        );
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "무명 발행이 CEO로 배달됨");
+        assert_eq!(
+            count_named(&evs, "approval.stalled"),
+            0,
+            "무명 발행이 escalation을 유발함 — pending 유지(HighRisk 취급)여야 한다"
+        );
+        {
+            let items = daemon.feed_items.lock().unwrap();
+            let it = items.iter().find(|i| i.request_id == "an1").unwrap();
+            assert_eq!(it.status, "pending", "무명 발행 항목은 사람 결재 대기로 남아야");
+            assert!(!it.auto_route, "영속 스냅샷에도 auto_route=false 각인");
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [W4-A 회귀 핀·결함7-d] resolver 각인 3면 일치: feed.push→feed.reply(allow, 타 surface
+    /// pane 귀속 caller) 후 ①인메모리 스냅샷 ②feed.list 출력 ③feed.jsonl 마지막 라인에서
+    /// resolver_surface==caller sid·resolver_pid==caller pid. + feed.item.resolved 이벤트와
+    /// approval_audit.jsonl에도 additive 노출. stale-clear(resolve_feed_item 얇은 래퍼) 경로는
+    /// 두 필드 None 유지(비-pane 해소는 무주체가 사실).
+    #[test]
+    fn feed_reply_imprints_resolver_three_sides() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // 감사 append는 flag ON에서만(C-4) — 감사면까지 검증하려고 ON 데몬.
+        let (daemon, dir) = daemon_auto("w4-resolver", true);
+        // 발행자(surface 61)·승인자(surface 62)를 서로 다른 pane에 귀속.
+        seed_caller(&daemon, 900_005, 61);
+        seed_caller(&daemon, 900_006, 62);
+        // HighRisk 서술(무마커)로 발행 — 라우팅 부작용 없이 결재 경로만 본다.
+        let _ = dispatch(&daemon, w3_push(1, "res1", "수동 결재 요청", "본문", None), Some(900_005));
+        let mut rx = daemon.bus.subscribe();
+        let rr = Request {
+            id: json!(2),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "res1", "decision": "allow", "reason": "근거 확인"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, rr, Some(900_006)) else {
+            panic!("single");
+        };
+        assert_eq!(resp["ok"], json!(true), "타 pane 귀속 allow가 거부됨: {resp}");
+        // ① 인메모리 스냅샷.
+        {
+            let items = daemon.feed_items.lock().unwrap();
+            let it = items.iter().find(|i| i.request_id == "res1").unwrap();
+            assert_eq!(it.resolver_surface, Some(62), "resolver_surface 각인 실패");
+            assert_eq!(it.resolver_pid, Some(900_006), "resolver_pid 각인 실패");
+        }
+        // ② feed.list additive 노출.
+        let Reply::Single(list) = dispatch(
+            &daemon,
+            Request { id: json!(3), method: "feed.list".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("single");
+        };
+        let li = list["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["request_id"] == json!("res1"))
+            .expect("res1 in list");
+        assert_eq!(li["resolver_surface"], json!(62), "feed.list resolver_surface 누락: {li}");
+        assert_eq!(li["resolver_pid"], json!(900_006), "feed.list resolver_pid 누락: {li}");
+        // ③ feed.jsonl 마지막 res1 라인(last-wins 영속).
+        let feed_path = crate::state::state_dir(&daemon.socket_path).join("feed.jsonl");
+        let content = std::fs::read_to_string(&feed_path).expect("feed.jsonl");
+        let last = content
+            .lines()
+            .filter(|l| l.contains("\"res1\""))
+            .last()
+            .expect("res1 영속 라인");
+        let restored: crate::state::FeedItem = serde_json::from_str(last).unwrap();
+        assert_eq!(restored.resolver_surface, Some(62), "영속 라인에 resolver 미각인");
+        assert_eq!(restored.resolver_pid, Some(900_006));
+        // + feed.item.resolved 이벤트 additive 키.
+        let evs = drain(&mut rx);
+        let resolved = evs
+            .iter()
+            .find(|e| e["name"].as_str() == Some("feed.item.resolved")
+                && e["payload"]["request_id"] == json!("res1"))
+            .expect("resolved 이벤트");
+        assert_eq!(
+            resolved["payload"]["resolver_surface"],
+            json!(62),
+            "feed.item.resolved에 resolver_surface 누락: {resolved}"
+        );
+        // + approval_audit.jsonl additive 키(스냅샷=각인 후 기록 증명).
+        let audit = crate::state::state_dir(&daemon.socket_path).join("approval_audit.jsonl");
+        let audit_line = std::fs::read_to_string(&audit)
+            .expect("audit 파일")
+            .lines()
+            .find(|l| l.contains("\"res1\""))
+            .map(str::to_string)
+            .expect("res1 감사 라인");
+        let av: Value = serde_json::from_str(&audit_line).unwrap();
+        assert_eq!(av["resolver_surface"], json!(62), "감사 레코드 resolver_surface 누락");
+        // stale-clear(얇은 래퍼) 경로 — resolver 두 필드 None 유지.
+        let _ = dispatch(&daemon, w3_push(4, "res2", "수동 결재 요청 2", "본문", None), Some(900_005));
+        let snap = daemon.resolve_feed_item("res2", "stale-cleared").expect("resolve");
+        assert_eq!(snap.resolver_surface, None, "래퍼 경로가 resolver를 각인함(무주체가 사실)");
+        assert_eq!(snap.resolver_pid, None);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8471,7 +8643,9 @@ mod tests {
             "자기승인 거부인데 상태가 바뀜"
         );
 
-        // ② 다른 노드가 승인(allow, 발행자 != 승인자) → 허용
+        // ② 다른 노드가 승인(allow, 발행자 != 승인자·pane 귀속 caller) → 허용
+        //    (W4-A: 미귀속 allow는 균일 차단이므로 승인자를 synthetic surface에 귀속시킨다.)
+        seed_caller(&daemon, approver, 77);
         let r2 = reply("f_self", "allow", approver);
         assert_eq!(r2["ok"], json!(true), "타 노드 승인이 거부됨: {r2}");
 
@@ -8480,7 +8654,10 @@ mod tests {
         let r3 = reply("f_deny", "deny", publisher);
         assert_eq!(r3["ok"], json!(true), "자기-거부가 차단됨(허용돼야): {r3}");
 
-        // ④ 발행 pid 미상(None) → 자기승인 판정 비적용(허용)
+        // ④ [W4-A 반전 핀·결함7] 발행 pid 미상(None)이라도 **미귀속 외부 allow는 차단**.
+        //    종전엔 '발행자 미상 → 판정 비적용 → 허용'이었다 — double-fork/setsid 고아화로
+        //    publisher를 지운 뒤 자기 승인하는 우회로가 이 구멍을 지났다. 의도적 반전(차단 확장).
+        //    (publisher pid=4242는 caller_cache 미등재 = 미귀속.)
         {
             let req = Request {
                 id: json!(1),
@@ -8490,13 +8667,19 @@ mod tests {
             let _ = dispatch(&daemon, req, None); // caller_pid None → publisher_pid None
         }
         let r4 = reply("f_anon", "allow", publisher);
-        assert_eq!(r4["ok"], json!(true), "발행 pid 미상인데 자기승인 판정이 걸림: {r4}");
+        assert_eq!(r4["ok"], json!(false), "발행자 미상 + 미귀속 allow가 통과됨(W4-A 회귀): {r4}");
+        assert_eq!(r4["error"]["code"], json!("self_approval_denied"), "코드 불일치: {r4}");
+
+        // ⑤ [W4-A 신설] 발행자 미상 + caller pane 귀속 allow → 통과(정상 결재 경로 보존).
+        let r5 = reply("f_anon", "allow", approver); // approver는 ②에서 surface 77 귀속
+        assert_eq!(r5["ok"], json!(true), "발행자 미상 + pane 귀속 allow가 거부됨: {r5}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ★GUI 오퍼레이터 승인(오너 2026-07-15): operator_token 일치 → §3.2 가드 면제,
-    // 불일치·부재 → 기존 거부 유지. 회귀 핀은 위 feed_reply_blocks_self_approval(무수정 green).
+    // 불일치·부재 → 기존 거부 유지. 회귀 핀은 위 feed_reply_blocks_self_approval
+    // (W4-A에서 ④ 미귀속 allow 케이스만 의도적 반전 — 토큰 면제 계약은 무변경).
     #[test]
     fn feed_reply_operator_token_bypasses_self_approval() {
         let dir = std::env::temp_dir().join(format!(

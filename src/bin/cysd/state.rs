@@ -547,6 +547,20 @@ pub struct FeedItem {
     /// 연장(90초) 판단에 쓴다. serde default 하위호환(구 라인·비대상=false).
     #[serde(default)]
     pub auto_route: bool,
+    /// W4-A(결함7 무명 해소 봉인): 해소 주체 각인 — 결재(allow/deny)를 한 caller의 pane 귀속
+    /// surface. None=미해소·구 영속 라인·데몬 내부 해소(stale-clear)·채널 미러·GUI operator
+    /// token 해소(surface 비귀속 — resolver_pid만 남는다·사실 그대로). Some은 feed.reply 단일
+    /// 해소 경로(resolve_feed_item_audited)에서만 각인된다. serde default 하위호환.
+    /// ⚠하위호환의 정직한 한계: 구 바이너리로 롤백하면 기동 compaction(Daemon::new의 자기
+    /// 구조체 기준 재직렬화 전면 재작성)이 이 두 필드를 feed.jsonl 전 라인에서 **물리 소거**한다
+    /// (재업그레이드해도 복구 불가). 감사 이력은 approval_audit.jsonl append 라인에만 잔존 —
+    /// 배포 노트 명기 사항(W4-A MAJOR).
+    #[serde(default)]
+    pub resolver_surface: Option<u64>,
+    /// W4-A: 해소 caller의 커널 peer pid(자기신고 아님). None 의미는 resolver_surface와 동일하되
+    /// GUI operator token 경유 해소는 pid만 Some(surface는 None)일 수 있다.
+    #[serde(default)]
+    pub resolver_pid: Option<u32>,
 }
 
 pub struct Config {
@@ -1379,14 +1393,20 @@ pub fn pid_alive(pid: u32) -> bool {
     !signaled
 }
 
-/// 자기승인 판정(순수·MED-2 surface 격상) — decision="allow"일 때 아래 중 하나면 자기승인이다:
+/// 자기승인 판정(순수·MED-2 surface 격상·W4-A 균일 fail-closed) — decision="allow"일 때
+/// 아래 중 하나면 자기승인(=차단)이다:
 ///  1. pid 동일 OR pgid 동일(M4 기존) — push/reply가 별개 CLI라도 같은 노드면 pgid로 잡는다.
-///  2. pub_sid가 Some일 때:
-///     - caller가 같은 surface(caller_sid == pub_sid) → pgid가 달라도 자기승인(발행자 surface에서 승인).
-///     - caller가 외부 프로세스(caller_pid.is_some())인데 어떤 surface에도 귀속 안 됨(caller_sid.is_none())
-///       → **fail-closed 차단**: `setsid cys feed reply`로 새 세션/그룹을 만들어 pid·pgid 매칭을 탈출한
-///       경로다. 정당한 승인은 항상 master surface에서 와 귀속되므로 미귀속=탈출로 본다.
-/// caller_pid.is_none()(데몬 내부 흐름)은 규칙 2가 caller_pid.is_some()을 명시하므로 걸리지 않는다.
+///  2. caller가 발행자와 같은 surface(caller_sid == pub_sid, 둘 다 Some) → pgid가 달라도
+///     자기승인(발행자 surface에서 승인).
+///  3. caller가 외부 프로세스(caller_pid.is_some())인데 어떤 surface에도 귀속 안 됨
+///     (caller_sid.is_none()) → **균일 fail-closed 차단**(W4-A 결함7 확장): `setsid`/double-fork
+///     로 새 세션·그룹을 만들거나 고아화로 publisher_surface까지 지운 발행-승인 우회로다.
+///     종전에는 pub_sid.is_some()일 때만 이 분기가 작동해 '발행자 무명(pub 전부 None) + 미귀속
+///     caller'의 allow가 통과했다 — 발행자 정보 유무와 무관하게 '미귀속 외부 allow'를 균일
+///     차단한다(부재=무증명). 정당한 승인은 pane 안 reply(귀속)·GUI operator token·정책 파일
+///     스위치(deny_self_approve_policy OFF) 세 경로로 항상 가능하다.
+/// caller_pid.is_none()(데몬 내부 흐름·stale-clear)은 규칙 3이 caller_pid.is_some()을 명시하므로
+/// 걸리지 않는다. deny는 항상 통과(자기 요청 취소는 무해 — allow 한정 게이트).
 /// master가 워커 feed를 승인하는 정상 흐름은 caller_sid=Some(master)≠pub_sid라 통과한다.
 /// 정책 게이트(deny_self_approve_policy)는 호출자가 AND로 결합한다(순수 테스트 가능하게 분리).
 pub fn is_self_approval(
@@ -1406,15 +1426,14 @@ pub fn is_self_approval(
     if pid_match || pgid_match {
         return true;
     }
-    if pub_sid.is_some() {
-        // 같은 surface → 자기승인(pgid 달라도).
-        if caller_sid.is_some() && caller_sid == pub_sid {
-            return true;
-        }
-        // 외부 프로세스인데 surface 미귀속 = setsid/detached 탈출 → fail-closed.
-        if caller_pid.is_some() && caller_sid.is_none() {
-            return true;
-        }
+    // 같은 surface → 자기승인(pgid 달라도).
+    if pub_sid.is_some() && caller_sid.is_some() && caller_sid == pub_sid {
+        return true;
+    }
+    // W4-A: 외부 프로세스인데 surface 미귀속 = setsid/detached/고아화 탈출 → 균일 fail-closed
+    // (발행자 무명이어도 적용 — pub_sid.is_some() 블록 밖으로 이동한 것이 이 확장의 전부).
+    if caller_pid.is_some() && caller_sid.is_none() {
+        return true;
     }
     false
 }
@@ -1790,6 +1809,8 @@ impl Daemon {
             // 데몬 자동 알림은 자동결재 대상이 아니다(notification 축약 경로) — 무파생·무라우팅.
             risk_class: None,
             auto_route: false,
+            resolver_surface: None, // W4-A: 미해소 — 각인은 feed.reply 단일 경로에서만.
+            resolver_pid: None,
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -1849,20 +1870,25 @@ impl Daemon {
     /// feed_waiters(feed.push와 동일). channels 락을 잡은 채 호출돼도 안전하다(feed_items→channels
     /// 역순 경로 없음 — mirror는 feed_items 해제 후 호출).
     /// 얇은 래퍼(하위호환 — reason·caller 미상 경로: stale-clear·채널 미러). 감사에는
-    /// decision만 남고 reason/caller는 null이 된다.
+    /// decision만 남고 reason/caller는 null이 된다. resolver 각인도 None 유지(W4-A —
+    /// 데몬 내부·미러 해소는 pane 귀속 주체가 없다는 사실 그대로).
     pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> Option<FeedItem> {
-        self.resolve_feed_item_audited(request_id, decision, None, None)
+        self.resolve_feed_item_audited(request_id, decision, None, None, None)
     }
 
     /// 단일 해소 경로(M7) + W3.5 감사(producer≠auditor). 모든 결재는 이 코어를 지나며 cysd가
     /// approval_audit.jsonl에 자동 append한다(CEO 자기기록 아님). reason·caller는 feed.reply
-    /// 경로에서만 Some.
+    /// 경로에서만 Some. W4-A: caller_surface(=resolve_caller_surface의 pane 귀속)를 받아
+    /// resolver_surface/resolver_pid로 임계영역 안에서 각인한다 — 스냅샷 clone에 포함되므로
+    /// 영속(feed.jsonl last-wins)·이벤트(feed.item.resolved)·감사(approval_audit) 3면에
+    /// 해소 주체가 남는다(무명 해소 봉인).
     pub fn resolve_feed_item_audited(
         &self,
         request_id: &str,
         decision: &str,
         reason: Option<&str>,
         caller_pid: Option<u32>,
+        caller_surface: Option<u64>,
     ) -> Option<FeedItem> {
         let snapshot = {
             let mut items = self.feed_items.lock().unwrap();
@@ -1873,6 +1899,11 @@ impl Daemon {
             item.status = "resolved".into();
             item.decision = Some(decision.to_string());
             item.resolved_at = Some(now_epoch());
+            // W4-A 해소 주체 각인 — allow/deny 무관 모든 결재의 주체를 남긴다. 래퍼 경유
+            // (stale-clear·채널 미러)는 둘 다 None 그대로(위장 방지: 자기신고 없음 — 커널
+            // peer pid와 그 조상 추적만이 입력이다).
+            item.resolver_pid = caller_pid;
+            item.resolver_surface = caller_surface;
             item.clone()
         };
         self.persist_feed_item(&snapshot);
@@ -1890,7 +1921,9 @@ impl Daemon {
             None,
             json!({"request_id": request_id, "decision": decision,
                    // 미러/브리지 tier 필터용(§2.4-3). None(무태그)=D 표기(fail-closed).
-                   "tier": snapshot.tier.as_deref().unwrap_or("d")}),
+                   "tier": snapshot.tier.as_deref().unwrap_or("d"),
+                   // W4-A additive: 해소 주체 surface(null=비-pane 해소). 기존 키 불변.
+                   "resolver_surface": snapshot.resolver_surface}),
         );
         Some(snapshot)
     }
@@ -1938,6 +1971,9 @@ impl Daemon {
             "caller": caller_pid,
             "decision": decision,
             "reason": reason,
+            // W4-A additive: 해소 주체 pane 귀속(스냅샷은 각인 후라 여기 값이 사실).
+            // null=비-pane 해소(stale-clear·채널·operator token). 기존 키 불변.
+            "resolver_surface": item.resolver_surface,
         });
         let Ok(line) = serde_json::to_string(&record) else {
             return;
@@ -3419,20 +3455,38 @@ mod tests {
     }
 
     // ── M4: 자기승인 pgid 격상 순수 판정 — 같은 pgid(별개 CLI 프로세스)면 차단, 다른 pgid는 허용 ──
+    // (W4-A 균일 fail-closed 확장으로 '통과' 케이스는 caller가 pane 귀속(caller_sid=Some)이어야
+    //  한다 — 종전 caller_sid=None 통과 케이스는 아래 확장 반전 핀 테스트에서 명시적으로 반전.)
     #[test]
     fn is_self_approval_pgid_promotion() {
         // 같은 pid → 차단(allow). (pub_sid·caller_sid None)
         assert!(is_self_approval(Some(100), None, None, Some(100), None, None, "allow"));
         // 다른 pid이지만 같은 pgid(push/reply가 별개 프로세스·같은 노드) → 차단.
         assert!(is_self_approval(Some(100), Some(50), None, Some(200), Some(50), None, "allow"));
-        // 다른 pid·다른 pgid(master가 워커 feed 승인)·pub_sid None → 통과.
-        assert!(!is_self_approval(Some(100), Some(50), None, Some(200), Some(60), None, "allow"));
+        // 다른 pid·다른 pgid(master가 워커 feed 승인·pane 귀속 caller)·pub_sid None → 통과.
+        assert!(!is_self_approval(Some(100), Some(50), None, Some(200), Some(60), Some(9), "allow"));
         // deny는 항상 통과(자기 요청 취소는 무해).
         assert!(!is_self_approval(Some(100), Some(50), None, Some(100), Some(50), None, "deny"));
-        // 발행자 pid·pgid·sid 미상(구 라인) → 차단 근거 없음 → 통과.
-        assert!(!is_self_approval(None, None, None, Some(100), Some(50), None, "allow"));
-        // pgid만 미상이고 pid 불일치·pub_sid None → 통과(pgid None은 매칭 안 함).
-        assert!(!is_self_approval(Some(100), None, None, Some(200), Some(50), None, "allow"));
+        // pgid만 미상이고 pid 불일치·pub_sid None·pane 귀속 caller → 통과(pgid None은 매칭 안 함).
+        assert!(!is_self_approval(Some(100), None, None, Some(200), Some(50), Some(9), "allow"));
+    }
+
+    // ── W4-A 확장 반전 핀(결함7): '미귀속 외부 allow'는 발행자 정보 유무와 무관하게 균일 차단 ──
+    // 종전(pub_sid.is_some() 블록 안)에는 '발행자 미상(pub 전부 None) → 차단 근거 없음 → 통과'
+    // 였다 — double-fork/setsid 고아화로 publisher_surface를 지운 뒤 자기 승인하는 우회로.
+    // 이 핀은 그 케이스의 **의도적 반전**이다(약화 아님 — 차단 확장).
+    #[test]
+    fn is_self_approval_unattributed_caller_uniform_fail_closed() {
+        // ① 발행자 전부 미상 + caller_pid=Some + caller_sid=None + allow → 차단(반전 핀).
+        assert!(is_self_approval(None, None, None, Some(100), Some(50), None, "allow"));
+        // ② 발행자 전부 미상 + caller가 pane 귀속(타 surface) + allow → 통과(정상 결재 유지).
+        assert!(!is_self_approval(None, None, None, Some(100), Some(50), Some(9), "allow"));
+        // ③ deny는 미귀속이라도 항상 통과(allow 한정 게이트).
+        assert!(!is_self_approval(None, None, None, Some(100), Some(50), None, "deny"));
+        // ④ caller_pid=None(데몬 내부 흐름·stale-clear) → 통과(fail-closed 미적용).
+        assert!(!is_self_approval(None, None, None, None, None, None, "allow"));
+        // ⑤ 기존 pub_sid=Some 미귀속 차단(MED-2)도 그대로(확장은 상위집합 — 약화 0).
+        assert!(is_self_approval(Some(100), Some(50), Some(7), Some(200), Some(60), None, "allow"));
     }
 
     // ── MED-2: 자기승인 surface 격상 — 같은 surface·setsid 탈출 fail-closed·master 정상흐름 통과 ──
@@ -3462,6 +3516,27 @@ mod tests {
         assert!(is_self_approval(
             Some(100), None, Some(7), Some(100), None, Some(9), "allow"
         ));
+    }
+
+    // ── W4-A(결함7) resolver 필드 JSONL 하위호환: 구 라인(필드 부재) 역직렬화 → None 복원 +
+    //    신 라인 round-trip 보존(기존 tier/publisher_* serde default 관례 확장) ──
+    #[test]
+    fn feed_item_resolver_fields_jsonl_compat() {
+        // 구 영속 라인(resolver 2필드 부재 — Wave 4 이전 데몬이 쓴 feed.jsonl) → None 복원.
+        let legacy = r#"{"request_id":"old1","kind":"permission","title":"t","body":"b","surface_id":7,"status":"resolved","decision":"allow","created_at":1.0,"resolved_at":2.0}"#;
+        let item: FeedItem = serde_json::from_str(legacy)
+            .expect("구 라인 역직렬화 실패 — serde default 하위호환 회귀");
+        assert_eq!(item.resolver_surface, None, "구 라인은 해소 주체 미상 = None");
+        assert_eq!(item.resolver_pid, None);
+        // 신 라인 round-trip: Some 값이 직렬화→역직렬화에서 보존된다(last-wins 영속의 전제).
+        let mut item2 = sample_feed_item("new1", "b".into());
+        item2.resolver_surface = Some(42);
+        item2.resolver_pid = Some(777);
+        let line = serde_json::to_string(&item2).unwrap();
+        assert!(line.contains("\"resolver_surface\":42"), "직렬화 누락: {line}");
+        let back: FeedItem = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.resolver_surface, Some(42));
+        assert_eq!(back.resolver_pid, Some(777));
     }
 
     // ── T6b.1 회귀 핀(codex): mac -lc PATH 프리픽스는 POSIX single-quote로 특수문자 리터럴화 ──
@@ -4996,6 +5071,8 @@ mod tests {
             publisher_surface: None,
             risk_class: None,
             auto_route: false,
+            resolver_surface: None,
+            resolver_pid: None,
         }
     }
 
