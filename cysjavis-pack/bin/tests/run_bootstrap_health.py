@@ -5042,6 +5042,77 @@ def h_seed_5():
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
+@specimen("H-SEED-6", "W6",
+          "Rust↔Python 부서 판정 파리티 + 제거 엔진 단일(hooks-prune) + 폴백 dir 0(G3 축1)",
+          ["G3-AXIS1"])
+def h_seed_6():
+    """G3 축1(2026-08 확정): 부서 판정 술어가 2언어에 흩어져 있다 — Python 게이트는 이미 실재
+    (`_discover_isolation_block._pack_is_dept` · 2026-06-30)하므로 **C28 부서 게이트를 새로 만들지
+    않고**, Rust 신설 소비자(`pack::dept_scope_of` — config 시드 표적·hooks-prune 게이트)가 같은
+    'pack-dept-' 접두 규칙을 쓰는지 기계 대조한다. 함께 봉인: ①레거시 폴백 dir(claude-dept-<name>)
+    미생성(아무도 안 읽는 dir에 쓰지 않는다) ②부서+무acct = 시드 생략 loud WARN ③제거 엔진은
+    hooks-prune 단일(cys-dept down/down-sock 배선 포함) ④C56 탐지 레인 존치(약화 금지)."""
+    notes = []
+    # ⓐ Rust 술어: dept_scope_of 가 'pack-dept-' 접두 규칙으로 실재
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+    need("pub fn dept_scope_of(" in pk, "Rust 부서 판정 순수 함수(dept_scope_of)가 없다")
+    di = pk.find("pub fn dept_scope_of(")
+    dbody = pk[di:pk.find("\n}\n", di)]
+    need('strip_prefix("pack-dept-")' in dbody,
+         "dept_scope_of 가 'pack-dept-' 접두 규칙을 쓰지 않는다(명명 규칙 드리프트)")
+    notes.append("Rust 술어=pack-dept- 접두")
+    # ⓑ Python 술어(기존 게이트 실측 — 신설 아님): _pack_is_dept 동일 접두
+    pf_src = _read(os.path.join(BIN_DIR, "javis_preflight.py"))
+    need("_pack_is_dept" in pf_src and '"pack-dept-" in os.path.basename' in pf_src,
+         "preflight 기존 부서 게이트(_pack_is_dept · 'pack-dept-' 접두)를 못 찾았다")
+    # 셸 정본(cys-dept dept_pack)도 같은 접두 — 명명 규칙 3소스 일치
+    dept_src = _read(os.path.join(BIN_DIR, "cys-dept"))
+    need('dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }' in dept_src,
+         "cys-dept dept_pack 명명 규칙이 바뀌었다(pack-dept- 접두 파리티 파손)")
+    notes.append("Python·셸 술어 파리티")
+    # ⓑ′ 기능 실측: 부서 팩 + 무 CYS_ACCOUNT_DIR → 등록 금지(기존 게이트가 산다)
+    PF = _preflight_mod()
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        with _env_patch(HOME=home, CYS_PACK_DIR=os.path.join(home, ".cys", "pack-dept-d1"),
+                        CYS_ACCOUNT_DIR=None, CLAUDE_CONFIG_DIR=None):
+            reason, narrow = PF._discover_isolation_block()
+            need(reason is not None and list(narrow or []) == [],
+                 "부서 팩(무acct)인데 파이썬 게이트가 등록 금지를 반환하지 않는다: %r" % reason)
+    notes.append("파이썬 게이트 기능 실측")
+    # ⓒ 폴백 dir 0 + 시드 생략 WARN: Rust config 시드가 부서+무acct 에서 생략으로 접힌다
+    # (주석 제외 — 결함을 설명한 doc 주석까지 잡으면 문서화가 곧 회귀로 보고된다: _code_lines 규약의 Rust 판)
+    pk_code = "\n".join(l for l in pk.splitlines() if not l.strip().startswith("//"))
+    need("claude-dept-" not in pk_code,
+         "레거시 폴백 dir(claude-dept-<name>)이 pack.rs 코드에 생겼다 — 판독자 전무 사각 디렉터리 금지"
+         "(G3 축1 BLOCKER 확정 위반)")
+    si = pk.find("fn setup_isolated_config_dir()")
+    need(si > 0, "setup_isolated_config_dir 을 못 찾았다")
+    sbody = pk[si:pk.find("\n}\n", si)]
+    need("CYS_ACCOUNT_DIR 미설정" in sbody and "시드 생략" in sbody,
+         "부서+무acct 시드 생략 loud WARN 이 없다(무음 공용 오염 또는 무음 스킵)")
+    notes.append("폴백 0·시드 생략 WARN")
+    # ⓓ 제거 엔진 단일: Rust hooks-prune 실재 + cys-dept down/down-sock 배선 + 파이썬 신규 제거 0
+    fr = _repo_file(os.path.join("src", "factory_reset.rs"))
+    need("pub fn strip_hooks_pointing_into_pack(" in fr, "제거 엔진(strip_hooks_pointing_into_pack) 부재")
+    cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    need('#[command(name = "hooks-prune")]' in cy, "cys hooks-prune 서브커맨드가 없다")
+    for verb in ("\n  down)", "\n  down-sock)"):
+        vi = dept_src.find(verb)
+        need(vi > 0, "cys-dept %s 분기를 못 찾았다" % verb.strip())
+        # verb 본문 경계: 라벨부터 고정 창(다음 verb 까지 충분) — 정밀 파싱 불요한 grep 계약.
+        vbody = dept_src[vi:vi + 3500]
+        need("hooks-prune --pack-dir" in vbody,
+             "cys-dept %s teardown 에 hooks-prune 배선이 없다(잔존 훅 = Claude 기동 실패 벡터)"
+             % verb.strip())
+    notes.append("제거 엔진 단일+teardown 배선")
+    # ⓔ C56 탐지 레인 존치(약화 금지 — 탐지 마커 '/pack-dept-')
+    need('"/pack-dept-" in' in pf_src, "C56 dept 훅 누수 탐지 마커가 사라졌다(탐지 레인 약화)")
+    notes.append("C56 탐지 존치")
+    return " · ".join(notes)
+
+
 def _dept_boot_sandbox(tmp, name="d1"):
     """부서 레인 부트 격리 환경 — (env, home, pack, sock). base 팩·부서 팩을 모두 세운다."""
     home = os.path.join(tmp, "home")

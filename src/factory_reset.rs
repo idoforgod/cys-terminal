@@ -1883,6 +1883,154 @@ fn strip_settings_inner(
     strip_local: bool,
     backup_dir: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    // 매칭 술어만 주입형으로 일반화(G3 축1 — hooks-prune 이 세 번째 소비자) — factory reset 의
+    // 기존 거동(전체 설치 소유 판정 + statusLine 원복 + 백업 규약)은 byte-identical 로 보존한다.
+    let matcher = |c: &str| command_points_into_quarantined(c, cys_base, strip_local);
+    match backup_dir {
+        Some(dir) => {
+            strip_settings_matching(settings_path, cys_base, &matcher, true, StripBackup::Dir(dir))
+        }
+        None => strip_settings_matching(
+            settings_path,
+            cys_base,
+            &matcher,
+            true,
+            StripBackup::Suffix(".bak-factory-reset"),
+        ),
+    }
+}
+
+/// strip 계열의 백업 지정 — 기존 두 형태(옆자리 접미 / 격리 폴더)를 한 타입으로 표현한다.
+/// hooks-prune(`.bak-cys-dept`)이 세 번째 소비자가 되면서 승격 — 각 소비자의 거동은 종전 그대로.
+enum StripBackup<'a> {
+    /// `<settings>.<suffix>` 옆자리 백업(단독 호출·테스트 폴백·hooks-prune).
+    Suffix(&'a str),
+    /// 지정 디렉터리 안 `<프로필태그>.settings.json`(factory reset 격리 폴더 규약 · P1-1 ③).
+    Dir(&'a Path),
+}
+
+/// 명령 문자열이 **특정 팩 루트** 아래를 가리키는가 — `cys hooks-prune` 의 소유 판정.
+/// 훅 명령 문자열(`hook_command_for`)에는 설치 시점 팩 절대경로가 그대로 박혀 있으므로
+/// **경로가 곧 소유 ID** 다(태깅 제2 SOT 기각 — G3 축1 확정).
+///
+/// 정규화: 양변 '/' 통일 + pack_root 는 원문과 `pack::resolve_for_compare`(존재 접두 canonicalize —
+/// macOS /tmp↔/private/tmp·심링크 흡수) **두 형태 모두** 후보로 삼는다 — 죽은 경로(팩 삭제 후
+/// 잔존 훅)는 canonicalize 가 원문으로 접히고, 산 경로는 심링크 차이를 흡수한다.
+/// 경계 일치는 `command_points_into_pack` 과 동일 규약(뒤가 '/'·따옴표·공백·끝) — 부분 문자열
+/// 오판(`pack-dept-d1` 이 `pack-dept-d10` 을 잡는 것)을 차단한다.
+pub(crate) fn command_points_into_pack_root(command: &str, pack_root: &Path) -> bool {
+    let cmd = command.replace('\\', "/");
+    let raw = pack_root.to_string_lossy().replace('\\', "/");
+    let resolved = crate::pack::resolve_for_compare(pack_root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut needles: Vec<String> = vec![raw.trim_end_matches('/').to_string()];
+    let r = resolved.trim_end_matches('/').to_string();
+    if !needles.contains(&r) {
+        needles.push(r);
+    }
+    for needle in needles {
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0usize;
+        while let Some(i) = cmd[from..].find(&needle) {
+            let at = from + i;
+            let rest = &cmd[at + needle.len()..];
+            if rest.is_empty()
+                || rest.starts_with('/')
+                || rest.starts_with('"')
+                || rest.starts_with('\'')
+                || rest.starts_with(char::is_whitespace)
+            {
+                return true;
+            }
+            from = at + needle.len();
+        }
+    }
+    false
+}
+
+/// settings.json 에서 **지정 팩 루트를 가리키는 훅 항목만** 제거한다(G3 축1 치유층 코어).
+///
+/// 계약(strip_cys_from_settings 대칭 — 검증된 기계 재사용·신규 파서 0):
+///  · 제거만 한다 — 사용자 훅·타 도구 훅·타 팩(base 포함) 훅·배열 순서 불가침.
+///  · **훅 항목만** 본다(statusLine 은 factory reset 소유 판정 소관 — 여기서 건드리지 않는다).
+///  · 변경이 없으면 파일을 쓰지 않는다(백업도 안 만든다 — 멱등).
+///  · symlink 는 홈 아래 일반 파일로 해소될 때만 그 실파일 대상, 그 외 거부 / 파싱 실패 = 거부.
+///  · 변경 시 백업(`backup_dir` 지정 시 그 안 / 아니면 옆자리 `.bak-cys-dept`) 후 write_atomic
+///    + 원 권한 복원 — 실패 시 무변조(Err).
+///
+/// 반환: 사람용 제거 라벨(`"SessionStart×1"`) — 빈 벡터 = 대상 없음.
+pub fn strip_hooks_pointing_into_pack(
+    settings_path: &Path,
+    pack_root: &Path,
+    backup_dir: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    // 홈 경계 파생용 base 는 팩 루트의 부모(~/.cys 규약) — strip_settings_inner 와 동일 파생.
+    let cys_base = pack_root
+        .parent()
+        .ok_or_else(|| format!("pack root has no parent: {}", pack_root.display()))?
+        .to_path_buf();
+    let matcher = |c: &str| command_points_into_pack_root(c, pack_root);
+    match backup_dir {
+        Some(dir) => {
+            strip_settings_matching(settings_path, &cys_base, &matcher, false, StripBackup::Dir(dir))
+        }
+        None => strip_settings_matching(
+            settings_path,
+            &cys_base,
+            &matcher,
+            false,
+            StripBackup::Suffix(".bak-cys-dept"),
+        ),
+    }
+}
+
+/// 읽기 전용 판정판(--dry-run·doctor 탐지용) — 제거 대상 라벨만 산출하고 아무것도 쓰지 않는다.
+/// 파일 부재 = 빈 벡터(대상 없음) / 파싱 실패 = Err(측정 불능 ≠ 통과 — fail-closed 보고).
+pub fn hooks_pointing_into_pack(
+    settings_path: &Path,
+    pack_root: &Path,
+) -> Result<Vec<String>, String> {
+    let raw = match std::fs::read_to_string(settings_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("read error: {e}")),
+    };
+    let root: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse error: {e}"))?;
+    let mut out: Vec<String> = Vec::new();
+    if let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) {
+        for (ev, arr) in hooks {
+            let Some(arr) = arr.as_array() else { continue };
+            let n = arr
+                .iter()
+                .filter_map(|entry| entry.get("hooks").and_then(|v| v.as_array()))
+                .flatten()
+                .filter(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| command_points_into_pack_root(c, pack_root))
+                        .unwrap_or(false)
+                })
+                .count();
+            if n > 0 {
+                out.push(format!("{ev}×{n}"));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn strip_settings_matching(
+    settings_path: &Path,
+    cys_base: &Path,
+    matcher: &dyn Fn(&str) -> bool,
+    strip_statusline: bool,
+    backup: StripBackup,
+) -> Result<Vec<String>, String> {
     // ★P1-1 ①: 도트파일 저장소로 settings.json 을 **심링크**해 쓰는 구성은 흔하다. 종전엔
     // 그냥 거부해서, 리셋 후 그 사용자는 매 Claude Code 세션마다 사라진 팩을 가리키는 훅이
     // 전부 "No such file" 로 실패하는 걸 봐야 했다(조치 안내도 없이).
@@ -1938,7 +2086,7 @@ fn strip_settings_inner(
                 inner.retain(|h| {
                     !h.get("command")
                         .and_then(|c| c.as_str())
-                        .map(|c| command_points_into_quarantined(c, cys_base, strip_local))
+                        .map(matcher)
                         .unwrap_or(false)
                 });
                 let n = before - inner.len();
@@ -1967,8 +2115,9 @@ fn strip_settings_inner(
         .and_then(|s| s.get("command"))
         .and_then(|c| c.as_str())
         .map(str::to_string)
+        .filter(|_| strip_statusline)
     {
-        if command_points_into_quarantined(&cmd, cys_base, strip_local) {
+        if matcher(&cmd) {
             // ★W1(성찰 확정): 구분자는 OS별 훅 명령 형식과 1:1 이다 —
             // unix `sh <abs>` / Windows `bash "<정슬래시 abs>"`(javis_preflight._cys_hook_cmd·
             // pack::hook_command_for). `" sh "` 만 찾으면 Windows 에서 항상 원복 실패 →
@@ -2003,8 +2152,8 @@ fn strip_settings_inner(
     // ★P1-1 ③: 백업은 **격리 폴더 안**으로. 종전엔 프로필 옆에 `.bak-factory-reset` 을 만들어
     // "cys 흔적을 지운다"면서 cys 훅 전문이 든 파일을 프로필마다 새로 늘렸다(그리고 그 백업을
     // 되돌리면 죽은 훅이 부활한다). backup_dir 이 없으면(단독 호출·테스트) 종전 위치로 폴백한다.
-    match backup_dir {
-        Some(dir) => {
+    match backup {
+        StripBackup::Dir(dir) => {
             let _ = std::fs::create_dir_all(dir);
             // 프로필 식별자를 파일명에 담는다(.claude / .claude-2 …가 전부 settings.json 이므로).
             let tag = settings_path
@@ -2015,8 +2164,8 @@ fn strip_settings_inner(
             std::fs::copy(settings_path, dir.join(format!("{tag}.settings.json")))
                 .map_err(|e| format!("backup failed: {e}"))?;
         }
-        None => {
-            let backup = format!("{}.bak-factory-reset", settings_path.display());
+        StripBackup::Suffix(sfx) => {
+            let backup = format!("{}{sfx}", settings_path.display());
             std::fs::copy(settings_path, &backup).map_err(|e| format!("backup failed: {e}"))?;
         }
     }
@@ -2848,6 +2997,134 @@ mod tests {
         // 사용자 저작 디렉토리 — 파일은 보존되므로 훅도 보존해야 대칭이다.
         assert!(!command_points_into_pack(&format!("sh {base_s}/pack-notes/hooks/a.sh"), base));
         assert!(!command_points_into_pack(&format!("sh {base_s}/packages/x.sh"), base));
+    }
+
+    /// G3 축1: 특정 팩 루트 소유 판정(hooks-prune) — 경계 일치·역슬래시 정규화·형제 팩 무오판.
+    #[test]
+    fn pack_root_boundary_match() {
+        let root = Path::new("/home/u/.cys/pack-dept-d1");
+        assert!(command_points_into_pack_root("sh /home/u/.cys/pack-dept-d1/hooks/a.sh", root));
+        assert!(command_points_into_pack_root(
+            "bash \"/home/u/.cys/pack-dept-d1/hooks/a.sh\"",
+            root
+        ));
+        // Windows 훅 명령(역슬래시) 정규화
+        assert!(command_points_into_pack_root(
+            "bash \"C:\\Users\\u\\.cys\\pack-dept-d1\\hooks\\a.sh\"",
+            Path::new("C:\\Users\\u\\.cys\\pack-dept-d1")
+        ));
+        // 형제 팩 오판 금지: d1 판정이 d10 을 잡으면 사용자/타 부서 훅 오삭제다
+        assert!(!command_points_into_pack_root("sh /home/u/.cys/pack-dept-d10/hooks/a.sh", root));
+        // base 팩 루트 판정은 부서 팩을 잡지 않는다(--allow-base prune 이 부서 훅을 못 지움)
+        assert!(!command_points_into_pack_root(
+            "sh /home/u/.cys/pack-dept-d1/hooks/a.sh",
+            Path::new("/home/u/.cys/pack")
+        ));
+        assert!(!command_points_into_pack_root("sh /home/u/myhooks/a.sh", root));
+    }
+
+    /// G3 축1(hooks_prune_scope): base 훅·사용자 외부 훅·형제 부서 훅 혼재에서 **대상 부서 훅만**
+    /// 제거 — 순서/타 항목 보존 · 백업(.bak-cys-dept) 생성 · 2회차 무변경 무쓰기(멱등) ·
+    /// statusLine 무접촉(훅 항목만) · 죽은 경로(팩 dir 부재)도 제거(치유 대상).
+    #[test]
+    fn hooks_prune_scope_removes_only_target_pack() {
+        let home = std::env::temp_dir().join(format!(
+            "cys-hooks-prune-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let base = home.join(".cys");
+        std::fs::create_dir_all(&base).unwrap();
+        let dept = base.join("pack-dept-d1"); // 의도적으로 디스크 미생성 = 죽은 경로 치유 검증
+        let base_s = base.to_string_lossy().into_owned();
+        let settings = home.join("settings.json");
+        let body = serde_json::json!({
+            "theme": "dark",
+            "statusLine": {"type": "command",
+                           "command": format!("sh {base_s}/pack-dept-d1/hooks/status.sh")},
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command",
+                                "command": format!("sh {base_s}/pack/hooks/session-start.sh")}]},
+                    {"hooks": [{"type": "command",
+                                "command": format!("sh {base_s}/pack-dept-d1/hooks/session-start.sh")}]},
+                    {"hooks": [{"type": "command",
+                                "command": format!("sh {base_s}/pack-dept-d10/hooks/session-start.sh")}]},
+                    {"hooks": [{"type": "command", "command": "sh /home/u/myhooks/mine.sh"}]}
+                ],
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command",
+                                "command": format!("sh {base_s}/pack-dept-d1/hooks/role-bootstrap.sh")}]}
+                ]
+            }
+        });
+        std::fs::write(&settings, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+
+        // 읽기 전용 판정판(dry-run·doctor 탐지)이 같은 술어로 같은 라벨을 낸다 + 무변경.
+        let before = std::fs::read_to_string(&settings).unwrap();
+        let mut probe = hooks_pointing_into_pack(&settings, &dept).unwrap();
+        probe.sort();
+        assert_eq!(probe, vec!["SessionStart×1".to_string(), "UserPromptSubmit×1".to_string()]);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before, "판정판이 파일을 썼다");
+
+        let removed = strip_hooks_pointing_into_pack(&settings, &dept, None).unwrap();
+        assert_eq!(removed.len(), 2, "부서 훅 2건(이벤트 2종) 제거 기대: {removed:?}");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(after["theme"], "dark", "비-훅 키 소실");
+        assert_eq!(
+            after["statusLine"]["command"],
+            format!("sh {base_s}/pack-dept-d1/hooks/status.sh"),
+            "hooks-prune 이 statusLine 을 건드렸다(훅 항목만 계약 위반)"
+        );
+        let ss = after["hooks"]["SessionStart"].as_array().unwrap();
+        let cmds: Vec<&str> =
+            ss.iter().map(|e| e["hooks"][0]["command"].as_str().unwrap()).collect();
+        assert_eq!(
+            cmds,
+            vec![
+                format!("sh {base_s}/pack/hooks/session-start.sh"),
+                format!("sh {base_s}/pack-dept-d10/hooks/session-start.sh"),
+                "sh /home/u/myhooks/mine.sh".to_string()
+            ],
+            "base·형제 부서·사용자 훅 보존 + 순서 보존 위반"
+        );
+        assert!(
+            after["hooks"].get("UserPromptSubmit").is_none(),
+            "빈 이벤트 껍데기가 청소되지 않았다"
+        );
+        let backup = home.join("settings.json.bak-cys-dept");
+        assert!(backup.exists(), "per-run 백업(.bak-cys-dept) 부재");
+        let backup_body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&backup).unwrap()).unwrap();
+        assert_eq!(
+            backup_body["hooks"]["SessionStart"].as_array().unwrap().len(),
+            4,
+            "백업이 제거 전 원본이 아니다(복원 불가)"
+        );
+
+        // 멱등: 2회차 무변경·무쓰기(백업 클로버 없음 — 원본 mtime/내용 불변으로 판정)
+        let after_body = std::fs::read_to_string(&settings).unwrap();
+        std::fs::write(&backup, "sentinel").unwrap();
+        let removed2 = strip_hooks_pointing_into_pack(&settings, &dept, None).unwrap();
+        assert!(removed2.is_empty(), "멱등 위반: {removed2:?}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), after_body, "무변경인데 재작성");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "sentinel",
+            "무변경 재실행이 백업을 클로버했다"
+        );
+
+        // 파싱 실패 = 거부(측정 불능 ≠ 통과) · 파일 부재 = 대상 없음(Ok 빈 벡터)
+        let broken = home.join("broken.json");
+        std::fs::write(&broken, "{not json").unwrap();
+        assert!(strip_hooks_pointing_into_pack(&broken, &dept, None).is_err());
+        assert!(hooks_pointing_into_pack(&broken, &dept).is_err());
+        assert!(strip_hooks_pointing_into_pack(&home.join("absent.json"), &dept, None)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// ★P1-1 ③⑤: 백업은 격리 폴더 안으로, 원본 권한(0444 잠금)은 보존된다.

@@ -638,6 +638,20 @@ def _path_under_tempdir(p):
     return False
 
 
+# ── 부서 판정 술어 통일표 (2언어 · G3 축1 확정 — H-SEED-6 파리티 핀이 기계 대조) ──────────
+# 같은 "부서인가" 질문에 **새 술어를 추가하지 마라**(제3 술어 중복 = 드리프트 원천 — C28 부서
+# 게이트 신설안은 이 이유로 기각·2026-08 확정). 현존 술어와 소관:
+#   Python ① `_discover_isolation_block._pack_is_dept` — basename 'pack-dept-' 접두(2026-06-30).
+#             소관: 훅 **등록(쓰기) 금지/좁힘** 게이트(C28 포함 모든 등록기가 resolve_registration_
+#             targets 경유로 이 게이트를 소비한다 — C28 에 별도 게이트 불요).
+#          ② `is_dept_pack` — pack_dir ≠ 기본(~/.cys/pack). CEO·임시 팩 포함 **광의**(C03 면제용).
+#          ③ C56 `_dept_hooks_in` — 훅 command 의 '/pack-dept-' 경로 앵커. 소관: 글로벌 누수
+#             invariant **탐지**(+레거시 청소 — 기존 거동 유지).
+#   Rust   ④ `pack::dept_scope_of` — basename `pack-dept-` 접두(①과 동일 규칙 · 파리티 핀 대상).
+#             소관: config 시드 표적 판정·hooks-prune 게이트·init-pack 부서 게이트.
+#          ⑤ `factory_reset::command_points_into_pack` — `<base>/pack` 경계+`-dept-` 꼬리(리셋 광의).
+# **제거 엔진은 `cys hooks-prune`(Rust `strip_hooks_pointing_into_pack`) 단일**이다 — 부서 잔존
+# 훅의 신규 제거 배선은 파이썬에 늘리지 않는다(teardown 은 cys-dept down 이 hooks-prune 을 호출).
 def _discover_isolation_block():
     """등록 금지(격리) 컨텍스트인가 — (사유|None, 좁힌 대상|None).
 

@@ -435,6 +435,20 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// 공용(~/.cys/claude)·개인(~/.claude*) settings.json 에서 **지정 팩을 가리키는 훅만** 제거 —
+    /// 부서 teardown 잔존 치유의 단일 진입점(G3 축1 · 제거 엔진 단일). 경로 접두가 곧 소유 ID.
+    #[command(name = "hooks-prune")]
+    HooksPrune {
+        /// 소유 팩 디렉터리(훅 명령 문자열에 박힌 절대경로 접두로 판정)
+        #[arg(long)]
+        pack_dir: String,
+        /// 제거 대상·건수만 표시하고 아무것도 쓰지 않는다(관측 우선)
+        #[arg(long)]
+        dry_run: bool,
+        /// base 팩(비 pack-dept-*) 대상 허용 — 기본은 게이트 거부(exit 7 · base 훅 오제거 fail-closed)
+        #[arg(long)]
+        allow_base: bool,
+    },
     /// 직전 설치 보존본(<pack>.prev)에서 파일 단위 복원 — 업데이트 직후 "잃었다" 순간의 원커맨드 되돌리기
     #[command(name = "pack-rollback")]
     PackRollback {
@@ -2409,6 +2423,9 @@ fn run(command: Command) -> i32 {
         Command::PackRollback { file, yes, force_vendor, force_unsafe_core } => {
             return run_pack_rollback(file, yes, force_vendor, force_unsafe_core);
         }
+        Command::HooksPrune { pack_dir, dry_run, allow_base } => {
+            return run_hooks_prune(&pack_dir, dry_run, allow_base);
+        }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version, pack_version);
@@ -3613,6 +3630,19 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     let targets = match claude_settings {
         Some(p) => vec![p],
         None => {
+            // ★G3 축1(결함2 두 번째 오염 표면): 부서 팩 컨텍스트의 init-pack 이 개인 프로필
+            //   (~/.claude*)에 부서 경로 훅을 기록하던 경로 봉인 — 데몬 경로에 이미 있는 base-전용
+            //   게이트(pack.rs merge_awakening_hooks_into_personal_profiles :531-534)를 CLI 경로에도
+            //   일관 적용한다. --claude-settings 명시 시엔 존중(운영자의 명시 의도 — 위 Some 분기).
+            if cys::pack::dept_scope_of(&dir).is_some() {
+                println!(
+                    "부서 팩 컨텍스트({}) — 개인 프로필(~/.claude*) 훅 무접촉(공용 프로필 무변조 \
+                     기본 계약). 부서 훅은 부서 acctdir 시드(cys-dept launch/rotate) 소관이며, \
+                     명시 대상은 --claude-settings 로.",
+                    dir.display()
+                );
+                return 0;
+            }
             let found = discover_claude_settings();
             if found.is_empty() {
                 // 신규 머신: Claude Code 기본 경로에 생성해 "켜는 순간부터 활성화"를 보장.
@@ -3728,6 +3758,168 @@ fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Resul
         "hook registered in {settings_path}: {} (backup: .bak-cys)",
         added.join(", ")
     ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cys hooks-prune (G3 축1 치유층) — 공용/개인 settings.json 에서 지정 팩을 가리키는
+// 훅만 제거한다. 훅 명령 문자열(hook_command_for)에 팩 절대경로가 박혀 있으므로 **경로
+// 접두가 곧 소유 ID** 다(태깅 제2 SOT 기각). teardown(cys-dept down)·수동 치유의 단일
+// 진입점이며, doctor(dept-hook-residue) --fix 도 같은 제거 엔진을 소비한다(제거 엔진 단일).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// hooks-prune 게이트 거부 exit — claim-role 정당거부(7) 계열 고정(예약 {0,1,2,64} 회피 ·
+/// EXIT_UNSAFE_CORE_REFUSED·EXIT_QUEUE_GATE_REFUSED 선례). 오류(IO·파싱 거부)는 exit 1.
+const EXIT_HOOKS_PRUNE_GATE_REFUSED: i32 = 7;
+
+/// 게이트 순수부(진리표 테스트용) — base 팩(비 `pack-dept-*`) 대상은 `--allow-base` 없이는
+/// 거부한다(부서 전용 기본 · base 훅 오제거 fail-closed).
+fn hooks_prune_gate_refused(pack: &std::path::Path, allow_base: bool) -> bool {
+    cys::pack::dept_scope_of(pack).is_none() && !allow_base
+}
+
+/// `<settings>.cys-lock` 파일락 획득(G16 3-writer 직렬화)[MAJOR 명기].
+///
+/// python preflight 는 settings.json RMW 를 파일별 락 `<settings>.cys-lock`(javis_lock.FileLock ·
+/// unix=flock/win=msvcrt)으로 직렬화한다(javis_preflight.py G16 계약). Rust 신규 작성자
+/// (hooks-prune·doctor --fix 의 잔존 제거)가 락 없이 RMW 하면 C28 재등록과 교차해 lost-update
+/// (한쪽 쓰기 증발)가 난다 — 같은 락 파일로 직렬화한다.
+///  · unix: flock(LOCK_EX) **블로킹**(보유 창 = 파일 1개 RMW, 수 ms) · 락 파일 열기 실패 = None
+///    (직렬화만 포기하고 치유는 진행 — write_atomic 이 파손은 이미 차단, 락 실패가 치유를 막으면
+///    잔존 훅이 영구화된다).
+///  · windows: **미획득(None) — 감수 범위 명기**: python 쪽 백엔드가 msvcrt 바이트락이라 flock 과
+///    상호 배제가 성립하지 않고(이종 락), Windows 부서 churn 표면은 현 릴리스에 없다. 파손은
+///    원자 교체가 차단하며 최악은 RMW lost-update(다음 preflight C28/부트 시드가 재수렴). 승격 시
+///    LockFileEx 동형 배선이 조건이다.
+fn acquire_settings_lock(settings: &std::path::Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = std::path::PathBuf::from(format!("{}.cys-lock", settings.display()));
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return None;
+        }
+        Some(f)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = settings;
+        None
+    }
+}
+
+/// hooks-prune 의 대상 settings 목록 — 공용 격리 config(팩 부모/claude · 결함2 의 오염 표면) +
+/// 개인 프로필(~/.claude*) 전부. 부서 자신의 acctdir 는 대상이 아니다(그곳의 훅은 그 부서의
+/// 정당한 시드 — teardown 후엔 아무도 그 dir 로 claude 를 띄우지 않으므로 무해 잔존).
+fn hooks_prune_targets(pack: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(parent) = pack.parent() {
+        targets.push(parent.join("claude").join("settings.json"));
+    }
+    for p in cys::pack::personal_profile_settings_paths() {
+        if !targets.contains(&p) {
+            targets.push(p);
+        }
+    }
+    targets
+}
+
+/// exit: 0=제거 완료·대상 없음 / 1=IO·파싱 거부(fail-closed) / 7=게이트 거부(base 팩 + --allow-base 부재).
+fn run_hooks_prune(pack_dir_arg: &str, dry_run: bool, allow_base: bool) -> i32 {
+    let pack = std::path::PathBuf::from(shellexpand_home(pack_dir_arg));
+    let pack = if pack.is_absolute() {
+        pack
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(pack)
+    };
+    if hooks_prune_gate_refused(&pack, allow_base) {
+        eprintln!(
+            "hooks-prune 게이트 거부: {} 는 부서 팩(pack-dept-*)이 아니다 — base 팩 훅 오제거를 \
+             막는 기본 게이트(fail-closed). base 팩 훅을 정말 제거하려면 --allow-base 를 명시하라.",
+            pack.display()
+        );
+        return EXIT_HOOKS_PRUNE_GATE_REFUSED;
+    }
+    let mut rc = 0;
+    let mut any = false;
+    for t in hooks_prune_targets(&pack) {
+        let res = if dry_run {
+            cys::factory_reset::hooks_pointing_into_pack(&t, &pack)
+        } else {
+            // 락은 파일별 · RMW 구간만 보유(스코프 drop 해제). 규약·감수 범위는 acquire 문서 참조.
+            let _lock = acquire_settings_lock(&t);
+            cys::factory_reset::strip_hooks_pointing_into_pack(&t, &pack, None)
+        };
+        match res {
+            Ok(labels) if labels.is_empty() => {}
+            Ok(labels) => {
+                any = true;
+                println!(
+                    "{}: {}{}",
+                    t.display(),
+                    labels.join("·"),
+                    if dry_run { " (dry-run — 무변경)" } else { " (백업: .bak-cys-dept)" }
+                );
+            }
+            Err(e) => {
+                eprintln!("error: {}: {e}", t.display());
+                rc = 1;
+            }
+        }
+    }
+    if !any && rc == 0 {
+        println!("제거 대상 없음 — {} 를 가리키는 훅 0", pack.display());
+    }
+    rc
+}
+
+/// 훅 명령 문자열에서 부서 팩 루트(`<base>/pack-dept-<name>`)를 추출한다(순수 —
+/// dept-hook-residue 탐지). 경로경계 앵커: base 접두 + `/pack-dept-` + 비구분자 이름.
+fn dept_pack_of_command(command: &str, cys_base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = cys_base.to_string_lossy().replace('\\', "/");
+    let cmd = command.replace('\\', "/");
+    let needle = format!("{}/pack-dept-", base.trim_end_matches('/'));
+    let at = cmd.find(&needle)?;
+    let rest = &cmd[at + needle.len()..];
+    let end = rest
+        .find(|c: char| c == '/' || c == '"' || c == '\'' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    if name.is_empty() {
+        return None;
+    }
+    Some(cys_base.join(format!("pack-dept-{name}")))
+}
+
+/// 부서 팩 agents.json 이 시드한 계정 config dir(CLAUDE_CONFIG_DIR) — cys-dept `pack_seeded_acct`
+/// 와 동일 규약(env 맵 우선 · 레거시 cmd 인라인 리터럴 폴백). None = 계정격리 미사용/판독 불가.
+fn dept_seeded_acct_dir(dept_pack: &std::path::Path) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(dept_pack.join("agents.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let claude = v.get("claude")?;
+    if let Some(d) = claude
+        .get("env")
+        .and_then(|e| e.get("CLAUDE_CONFIG_DIR"))
+        .and_then(|d| d.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(std::path::PathBuf::from(d));
+    }
+    let cmd = claude.get("cmd").and_then(|c| c.as_str())?;
+    let i = cmd.find("CLAUDE_CONFIG_DIR=\"")? + "CLAUDE_CONFIG_DIR=\"".len();
+    let rest = &cmd[i..];
+    let d = &rest[..rest.find('"')?];
+    if d.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(d))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3984,6 +4176,155 @@ fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             missing.join(" | ")
         ),
         action: "cys doctor --fix 또는 cys init-pack 로 등록".into(),
+    }
+}
+
+/// dept-hook-residue(G3 축1 마이그레이션 진단) — 공용 격리 config(~/.cys/claude)·개인 프로필
+/// (~/.claude*) settings 에 **부서 팩(pack-dept-*) 경로 훅**이 남아 있는가.
+///
+///  · 죽은 경로(팩 dir 부재) = **FAIL** — 그 훅은 매 Claude 세션 "No such file" 실패 벡터다.
+///    --fix: 무조건 제거.
+///  · 산 경로(부서 실재 = 공용 오염) = **WARN** — 신계약(부서 훅은 자기 acctdir 시드)상 오염이나,
+///    --fix 는 **그 부서 acctdir 에 각성 훅 시드가 실측 확인된 경우에만** 제거한다
+///    (`verify_desired_hooks_registered` 빈 벡터 — 실측 없는 제거는 부서 각성 공백 창을 연다:
+///    절대 불변 앵커 ③④ '조용한 광역 회귀 금지'). 미확인이면 보존 + 부서 rotate 안내.
+///  · 제거 엔진은 hooks-prune 와 **동일 함수**(`strip_hooks_pointing_into_pack`) — 제거 로직
+///    이원화 금지(제거 엔진 단일 · dept_scope_of 술어 통일표 참조).
+///  · 판정 불능(파싱 실패)은 통과가 아니다 — WARN 이상으로 가시화한다.
+fn diag_dept_hook_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    let mut targets: Vec<std::path::PathBuf> =
+        vec![ctx.state_base.join("claude").join("settings.json")];
+    for p in &ctx.settings_paths {
+        let pb = std::path::PathBuf::from(p);
+        if !targets.contains(&pb) {
+            targets.push(pb);
+        }
+    }
+    let mut unreadable: Vec<String> = Vec::new();
+    // (대상 settings, 부서 팩, 훅 수) — 판정·조치의 단위.
+    let mut residues: Vec<(std::path::PathBuf, std::path::PathBuf, usize)> = Vec::new();
+    for t in &targets {
+        let raw = match std::fs::read_to_string(t) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                unreadable.push(format!("{}: {e}", t.display()));
+                continue;
+            }
+        };
+        let root: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                unreadable.push(format!("{}: parse error: {e}", t.display()));
+                continue;
+            }
+        };
+        let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) else {
+            continue;
+        };
+        for h in hooks
+            .values()
+            .filter_map(|v| v.as_array())
+            .flatten()
+            .filter_map(|e| e.get("hooks").and_then(|v| v.as_array()))
+            .flatten()
+        {
+            let Some(cmd) = h.get("command").and_then(|c| c.as_str()) else {
+                continue;
+            };
+            let Some(pack) = dept_pack_of_command(cmd, &ctx.state_base) else {
+                continue;
+            };
+            match residues.iter_mut().find(|(rt, rp, _)| rt == t && rp == &pack) {
+                Some((_, _, n)) => *n += 1,
+                None => residues.push((t.clone(), pack, 1)),
+            }
+        }
+    }
+    if residues.is_empty() && unreadable.is_empty() {
+        return DiagItem {
+            name: "dept-hook-residue",
+            status: DiagStatus::Ok,
+            detail: format!("공용·개인 settings {}개에 부서 훅 잔존 0", targets.len()),
+            action: String::new(),
+        };
+    }
+    let dead_cnt = residues.iter().filter(|(_, p, _)| !p.is_dir()).count();
+    if !fix {
+        let listing: Vec<String> = residues
+            .iter()
+            .map(|(t, p, n)| {
+                format!(
+                    "{}←{}({})×{n}",
+                    t.display(),
+                    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                    if p.is_dir() { "산 부서 오염" } else { "죽은 경로" }
+                )
+            })
+            .chain(unreadable.iter().map(|u| format!("판정 불능 {u}")))
+            .collect();
+        return DiagItem {
+            name: "dept-hook-residue",
+            status: if dead_cnt > 0 { DiagStatus::Fail } else { DiagStatus::Warn },
+            detail: format!("부서 훅 잔존 탐지: {}", listing.join(" | ")),
+            action: "cys doctor --fix(죽은 경로 무조건 · 산 부서는 acctdir 시드 실측 확인 시만) \
+                     또는 cys hooks-prune --pack-dir <부서 팩>"
+                .into(),
+        };
+    }
+    let mut removed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut errs: Vec<String> = unreadable.clone();
+    for (t, pack, _) in &residues {
+        let live = pack.is_dir();
+        if live {
+            // 산 부서: acctdir 시드 실측(있다고 주장이 아니라 디스크 실측 — CS-3) 후에만 제거.
+            let seeded_ok = dept_seeded_acct_dir(pack)
+                .map(|a| {
+                    cys::pack::verify_desired_hooks_registered(
+                        &a.join("settings.json"),
+                        pack,
+                        &cys::pack::AWAKENING_HOOKS,
+                    )
+                    .is_empty()
+                })
+                .unwrap_or(false);
+            if !seeded_ok {
+                kept.push(format!(
+                    "{}←{}(acctdir 시드 미확인 — 보존)",
+                    t.display(),
+                    pack.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                ));
+                continue;
+            }
+        }
+        let _lock = acquire_settings_lock(t);
+        match cys::factory_reset::strip_hooks_pointing_into_pack(t, pack, None) {
+            Ok(labels) => removed.push(format!("{}: {}", t.display(), labels.join("·"))),
+            Err(e) => errs.push(format!("{}: {e}", t.display())),
+        }
+    }
+    let status = if !errs.is_empty() {
+        DiagStatus::Fail
+    } else if !kept.is_empty() {
+        DiagStatus::Warn
+    } else {
+        DiagStatus::Ok
+    };
+    DiagItem {
+        name: "dept-hook-residue",
+        status,
+        detail: format!(
+            "제거 {}건{}{}",
+            removed.len(),
+            if kept.is_empty() { String::new() } else { format!(" · 보존 {}", kept.join(", ")) },
+            if errs.is_empty() { String::new() } else { format!(" · 실패 {}", errs.join("; ")) }
+        ),
+        action: if kept.is_empty() {
+            "제거 완료(백업: .bak-cys-dept) — ★claude 재시작 후 적용".into()
+        } else {
+            "보존된 산 부서 훅은 부서 rotate(acctdir 재시드) 후 doctor --fix 재실행".into()
+        },
     }
 }
 
@@ -4643,6 +4984,7 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_pack_state(ctx),
         diag_install_manifest(ctx),
         diag_hook(ctx, fix),
+        diag_dept_hook_residue(ctx, fix),
         diag_orphan_socket(ctx, fix),
         diag_stale_lock(ctx, fix),
         diag_staging_residue(ctx, fix),
@@ -12075,6 +12417,88 @@ mod tests {
         assert_eq!(queue_deliver_exit_code("error: paused: nested"), 1, "중간 등장은 게이트 아님");
     }
 
+    /// ★G3 축1 hooks-prune 게이트 exit 계약 핀 — base 팩 대상 + --allow-base 부재 = 7
+    /// (claim-role 정당거부(7) 계열 · 예약 {0,1,2,64} 비충돌), IO·파싱 거부 = 1, 정상/대상없음 = 0.
+    /// 게이트 순수부(hooks_prune_gate_refused) 진리표 동봉 — 부서 전용 기본(fail-closed).
+    #[test]
+    fn hooks_prune_gate_exit_is_seven_and_dept_only_by_default() {
+        for reserved in [0, 1, 2, 64] {
+            assert_ne!(
+                EXIT_HOOKS_PRUNE_GATE_REFUSED, reserved,
+                "게이트 거부 exit 가 예약 코드와 충돌: {reserved}"
+            );
+        }
+        assert_eq!(EXIT_HOOKS_PRUNE_GATE_REFUSED, 7, "claim-role 정당거부(7) 계열 고정");
+        let dept = std::path::Path::new("/h/.cys/pack-dept-d1");
+        let base = std::path::Path::new("/h/.cys/pack");
+        assert!(!hooks_prune_gate_refused(dept, false), "부서 팩은 기본 통과");
+        assert!(!hooks_prune_gate_refused(dept, true));
+        assert!(hooks_prune_gate_refused(base, false), "base 팩은 --allow-base 없이는 거부");
+        assert!(!hooks_prune_gate_refused(base, true), "--allow-base 명시 시 통과");
+        assert!(
+            hooks_prune_gate_refused(std::path::Path::new("/h/.cys/pack-dept-"), false),
+            "빈 부서명(불량 레인)은 부서로 인정하지 않는다"
+        );
+    }
+
+    /// ★G3 축1 dept-hook-residue 탐지 순수부 — 훅 명령에서 부서 팩 루트 추출(경계·정규화).
+    #[test]
+    fn dept_pack_of_command_matrix() {
+        let base = std::path::Path::new("/h/.cys");
+        assert_eq!(
+            dept_pack_of_command("sh /h/.cys/pack-dept-d1/hooks/session-start.sh", base),
+            Some(std::path::PathBuf::from("/h/.cys/pack-dept-d1"))
+        );
+        // Windows 훅 명령(역슬래시·quote) 정규화 — 백슬래시 base 와 명령 모두
+        assert_eq!(
+            dept_pack_of_command(
+                "bash \"C:/Users/u/.cys/pack-dept-sales/hooks/a.sh\"",
+                std::path::Path::new("C:\\Users\\u\\.cys")
+            ),
+            Some(std::path::PathBuf::from("C:\\Users\\u\\.cys").join("pack-dept-sales"))
+        );
+        assert_eq!(dept_pack_of_command("sh /h/.cys/pack/hooks/a.sh", base), None, "base 팩 무탐지");
+        assert_eq!(dept_pack_of_command("sh /h/.cys/pack-dept-", base), None, "빈 부서명");
+        assert_eq!(
+            dept_pack_of_command("sh /elsewhere/.cys/pack-dept-d1/h.sh", base),
+            None,
+            "타 base 아래는 이 설치의 부서가 아니다"
+        );
+    }
+
+    /// ★G3 축1 부서 acctdir 해소(agents.json 시드값) — cys-dept `pack_seeded_acct` 동일 규약 핀.
+    #[test]
+    fn dept_seeded_acct_dir_resolves_env_and_legacy_cmd() {
+        let td = std::env::temp_dir().join(format!("cys-acctdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack = td.join("pack-dept-d1");
+        std::fs::create_dir_all(&pack).unwrap();
+        // ① 신구조: env 맵
+        std::fs::write(
+            pack.join("agents.json"),
+            r#"{"claude":{"cmd":"claude","env":{"CLAUDE_CONFIG_DIR":"/h/.cys/claude-d1"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dept_seeded_acct_dir(&pack),
+            Some(std::path::PathBuf::from("/h/.cys/claude-d1"))
+        );
+        // ② 레거시: cmd 인라인 리터럴
+        std::fs::write(
+            pack.join("agents.json"),
+            r#"{"claude":{"cmd":"CLAUDE_CONFIG_DIR=\"/h/.cys/claude-legacy\" claude"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dept_seeded_acct_dir(&pack),
+            Some(std::path::PathBuf::from("/h/.cys/claude-legacy"))
+        );
+        // ③ 미시드·부재 = None(계정격리 미사용 부서 — 실측 불가는 제거 부적격으로 흐른다)
+        std::fs::write(pack.join("agents.json"), r#"{"claude":{"cmd":"claude"}}"#).unwrap();
+        assert_eq!(dept_seeded_acct_dir(&pack), None);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// ★G4(W4-C) reap-surface 게이트 exit 계약 핀 — reap_denied(사유 8종 어느 것이든) = 7
     /// (claim-role rc=7 선례 계열 · 예약 {0,1,2,64} 비충돌), 그 외(not_found·invalid·통신) = 1.
     /// 소비 스크립트(javis_reap_exited.py)가 rc=7 + stderr 사유 코드로 분기하는 계약의 CLI 측.
@@ -14300,6 +14724,95 @@ mod tests {
     /// 이 값을 set/remove하는 doctor 테스트가 병렬로 겹치면 서로의 값을 읽어 오탐(사전 존재한 레이스)이
     /// 나므로, 해당 env를 만지는 테스트를 이 락으로 직렬화한다(W0 테스트 격리 정신 — 전역 env 교대 창 제거).
     static DOCTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// ★G3 축1 dept-hook-residue 진단 시나리오 3종 — ①죽은 경로=FAIL·--fix 무조건 제거
+    /// ②산 부서(acctdir 시드 미확인)=WARN·--fix 보존(각성 공백 창 금지) ③산 부서(시드 실측
+    /// 확인)=--fix 제거. 제거 엔진은 hooks-prune 와 동일 함수임을 백업 흔적(.bak-cys-dept)으로 확인.
+    #[test]
+    fn diag_dept_hook_residue_dead_fail_live_conditional() {
+        let base = std::env::temp_dir().join(format!("cys-doc-residue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("claude")).unwrap();
+        let base_s = base.to_string_lossy().into_owned();
+        let shared = base.join("claude").join("settings.json");
+        let dead_hook = format!("sh {base_s}/pack-dept-gone/hooks/session-start.sh");
+        let write_shared = |hook: &str| {
+            std::fs::write(
+                &shared,
+                serde_json::to_string_pretty(&json!({
+                    "hooks": {"SessionStart": [
+                        {"hooks": [{"type": "command", "command": hook}]},
+                        {"hooks": [{"type": "command", "command": "sh /home/u/myhooks/mine.sh"}]}
+                    ]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let ctx = doctor_ctx_at(&base);
+
+        // ① 죽은 경로(팩 dir 부재): 진단=FAIL → --fix 무조건 제거 → 재진단 Ok
+        write_shared(&dead_hook);
+        let it = diag_dept_hook_residue(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Fail, "죽은 경로 잔존은 FAIL: {}", it.detail);
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap().contains(&dead_hook),
+            true,
+            "진단(읽기전용)이 파일을 고쳤다"
+        );
+        let fixed = diag_dept_hook_residue(&ctx, true);
+        assert_eq!(fixed.status, DiagStatus::Ok, "죽은 경로 --fix 실패: {}", fixed.detail);
+        let after = std::fs::read_to_string(&shared).unwrap();
+        assert!(!after.contains(&dead_hook), "죽은 부서 훅이 남았다");
+        assert!(after.contains("myhooks/mine.sh"), "사용자 훅이 소실됐다");
+        assert!(
+            base.join("claude").join("settings.json.bak-cys-dept").exists(),
+            "제거 엔진(strip_hooks_pointing_into_pack) 백업 흔적 부재 — 엔진 이원화 의심"
+        );
+        assert_eq!(diag_dept_hook_residue(&ctx, false).status, DiagStatus::Ok, "재진단 잔존 0");
+
+        // ② 산 부서 + acctdir 시드 미확인: 진단=WARN → --fix 도 보존(fail-closed)
+        let live = base.join("pack-dept-live");
+        std::fs::create_dir_all(&live).unwrap();
+        let live_hook = format!("sh {base_s}/pack-dept-live/hooks/session-start.sh");
+        write_shared(&live_hook);
+        assert_eq!(
+            diag_dept_hook_residue(&ctx, false).status,
+            DiagStatus::Warn,
+            "산 부서 오염은 WARN"
+        );
+        let kept = diag_dept_hook_residue(&ctx, true);
+        assert_eq!(kept.status, DiagStatus::Warn, "시드 미확인 산 부서는 보존: {}", kept.detail);
+        assert!(
+            std::fs::read_to_string(&shared).unwrap().contains(&live_hook),
+            "시드 실측 없이 산 부서 훅을 제거했다(부서 각성 공백 창 — 절대 불변 위반)"
+        );
+
+        // ③ 산 부서 + acctdir 시드 실측 확인: --fix 제거
+        let acct = base.join("claude-live");
+        std::fs::create_dir_all(&acct).unwrap();
+        std::fs::write(
+            live.join("agents.json"),
+            format!(
+                r#"{{"claude":{{"cmd":"claude","env":{{"CLAUDE_CONFIG_DIR":"{}"}}}}}}"#,
+                acct.display()
+            ),
+        )
+        .unwrap();
+        cys::pack::merge_desired_hooks(
+            &acct.join("settings.json"),
+            &live,
+            &cys::pack::AWAKENING_HOOKS,
+        )
+        .unwrap();
+        let fixed2 = diag_dept_hook_residue(&ctx, true);
+        assert_eq!(fixed2.status, DiagStatus::Ok, "시드 확인 산 부서 제거 실패: {}", fixed2.detail);
+        assert!(
+            !std::fs::read_to_string(&shared).unwrap().contains(&live_hook),
+            "시드 확인 후에도 공용 오염이 남았다"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn doctor_pack_version_ok_and_skew() {

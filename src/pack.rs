@@ -179,6 +179,34 @@ fn scope_id_of(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 부서 팩 판정(순수 · G3 축1) — basename 의 `pack-dept-` 접두를 벗겨 부서명을 얻는다
+/// (빈 이름 = 불량 레인 = None · `lane_pack_for_socket` 의 `_socket_malformed_dept` 판정과 동형).
+///
+/// 명명 규칙의 등재소는 **하나**다: `cys-dept` 의 `dept_pack`(cysjavis-pack/bin/cys-dept:52
+/// `~/.cys/pack-dept-<name>`)·위 `lane_pack_for_socket` 과 동일 규칙이며, 세 번째 소비자
+/// (config 시드 표적 판정·hooks-prune 게이트·init-pack 부서 게이트)가 생기면서 순수 함수로
+/// 승격했다 — 같은 규칙을 소비처마다 다시 쓰면 RC1(사본 드리프트)의 새 인스턴스가 된다.
+///
+/// ★부서 판정 술어 통일표(2언어 — H-SEED-6 파리티 핀이 기계 대조 · G3 축1 확정):
+///   Rust   ① `pack::dept_scope_of`(이 함수 — basename `pack-dept-` 접두)
+///          ② `factory_reset::command_points_into_pack`(`<base>/pack` 경계 + `-dept-` 꼬리 —
+///             "이 설치의 팩 전체" 소유 판정 · factory reset 전용 광의)
+///   Python ③ `javis_preflight._discover_isolation_block` 의 `_pack_is_dept`(basename
+///             'pack-dept-' 접두 · 2026-06-30 실재) — **C28 부서 게이트를 새로 만들지 않는다**
+///             (같은 함수에 제3 술어 중복 = 드리프트 원천)
+///          ④ `javis_preflight.is_dept_pack`(pack_dir ≠ 기본 — CEO·임시 팩 포함 광의 · C03 면제용)
+///          ⑤ `javis_preflight` C56 `_dept_hooks_in`('/pack-dept-' 경로 앵커 — 글로벌 누수
+///             invariant **탐지**)
+///   **제거 엔진은 `cys hooks-prune`(`factory_reset::strip_hooks_pointing_into_pack`) 단일**이다 —
+///   C56/C57 은 탐지 invariant(+기존 레거시 청소) 레인이며 파이썬에 신규 제거 로직을 늘리지 않는다.
+pub fn dept_scope_of(pack: &Path) -> Option<String> {
+    absolutize(pack)
+        .file_name()
+        .and_then(|n| n.to_str().map(str::to_owned))
+        .and_then(|n| n.strip_prefix("pack-dept-").map(str::to_owned))
+        .filter(|s| !s.is_empty())
+}
+
 /// `scope_exists`의 순수 부분(팩 경로 주입형).
 fn scope_exists_in(pack: &Path, scope: &str) -> bool {
     // 경로 탈출 방어 — G4 값 문법(`[A-Za-z0-9._:-]+`)상 정상 선언엔 나올 수 없는 형태지만,
@@ -249,7 +277,7 @@ impl PackWriteAuth {
 /// 경로를 비교 가능한 정규형으로 해소: 존재하는 최장 접두를 canonicalize(심링크·`..`·상대경로
 /// 해소)하고 남은 **미존재 꼬리**를 그대로 이어 붙인다. macOS `/tmp`→`/private/tmp` 심링크와
 /// 아직 생성되지 않은 pack 디렉터리(rename 대상)를 둘 다 정확히 비교하기 위함.
-fn resolve_for_compare(p: &Path) -> PathBuf {
+pub(crate) fn resolve_for_compare(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -580,22 +608,66 @@ pub fn role_bootstrap_hook_command(pack_dir: &Path) -> String {
 /// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
 /// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
 /// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
-/// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). pack_dir 형제(~/.cys/claude).
-pub fn config_dir() -> PathBuf {
-    if let Some(d) = crate::env_compat(ENV_CONFIG_DIR) {
-        return PathBuf::from(d);
+/// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). base 팩은 pack_dir 형제(~/.cys/claude).
+///
+/// ★G3 축1(부서 인식 · 확정 재설계): 부서 팩(`pack-dept-*`) 스코프에서는 공용 ~/.cys/claude 가
+/// **아니라** 그 부서 claude 가 실제로 읽는 dir 를 표적한다 — 실소비 SOT 는
+/// `${CYS_ACCOUNT_DIR:-~/.cys/claude}`(lib.rs `resolve_claude_config_dir`·agents.json 템플릿·
+/// cys-dept 3자 일치)이며, 부서 스코프에서 CYS_ACCOUNT_DIR 이 없으면 **None**(시드 표적 없음)이다.
+/// 레거시 폴백 dir(claude-dept-<name>)은 만들지 않는다 — 그 위치의 판독자는 생태계에 전무해
+/// "아무도 안 읽는 dir에 쓰는" 사각 디렉터리가 된다(fail-closed·성찰 BLOCKER 확정).
+pub fn config_dir() -> Option<PathBuf> {
+    let pack = pack_dir();
+    config_dir_for(
+        crate::env_compat(ENV_CONFIG_DIR).as_deref(),
+        dept_scope_of(&pack).as_deref(),
+        std::env::var("CYS_ACCOUNT_DIR").ok().as_deref(),
+        &pack,
+    )
+}
+
+/// `config_dir` 의 순수부(env 주입형 — 전 OS 단위 테스트 가능). 우선순위는 계약이다:
+///  ① CYS_CONFIG_DIR(호환 접두 포함) — 항상 최우선(기존 1순위 불변 핀)
+///  ② 부서 스코프: CYS_ACCOUNT_DIR 비어있지 않으면 그 값 / 없으면 **None**(시드 생략 신호 —
+///     호출부가 loud WARN + doctor anomaly 로 처리한다. 공용 claude 로 폴백하면 결함2 재발)
+///  ③ base 스코프: pack 부모/"claude"(기존 거동 byte-identical — base 레인 무변경 보증)
+pub fn config_dir_for(
+    cfg_env: Option<&str>,
+    dept_scope: Option<&str>,
+    acct_env: Option<&str>,
+    pack: &Path,
+) -> Option<PathBuf> {
+    if let Some(d) = cfg_env.filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(d));
     }
-    pack_dir()
-        .parent()
-        .map(|p| p.join("claude"))
-        .unwrap_or_else(|| PathBuf::from(".cys/claude"))
+    if dept_scope.is_some() {
+        return acct_env.filter(|s| !s.is_empty()).map(PathBuf::from);
+    }
+    Some(
+        pack.parent()
+            .map(|p| p.join("claude"))
+            .unwrap_or_else(|| PathBuf::from(".cys/claude")),
+    )
 }
 
 /// 격리 config dir 셋업: cys 라우터(CLAUDE.md)와 SessionStart hook(settings.json)을 설치한다.
 /// ★보존 모드 — 기존 파일은 덮지 않는다(사용자 커스터마이즈 불가침). best-effort(실패해도
 /// pack 설치 자체는 유효). 사용자 ~/.claude 는 절대 건드리지 않는다(격리의 핵심).
 fn setup_isolated_config_dir() {
-    let cfg = config_dir();
+    let Some(cfg) = config_dir() else {
+        // ★G3 축1(확정 재설계): 부서 팩 스코프 + CYS_ACCOUNT_DIR 부재 = 실소비 SOT 없음 →
+        //   **시드 생략**(fail-closed). 종전엔 config_dir 가 공용 ~/.cys/claude 로 접혀 부서 경로
+        //   훅이 공용 프로필에 병합됐다(결함2 — 공용 프로필 무변조 기본 계약 위반). 레거시 폴백
+        //   dir(claude-dept-<name>)은 판독자 전무라 만들지 않는다("아무도 안 읽는 dir에 쓰지
+        //   않는다"). 정상 부서 부트(cys-dept launch/rotate/create/allocate)는 CYS_ACCOUNT_DIR 을
+        //   주입하므로 이 분기는 이상 기동 신호다 — loud WARN + doctor(dept-hook-residue) 가시화.
+        eprintln!(
+            "[pack] ⚠ 부서 팩({}) 컨텍스트인데 CYS_ACCOUNT_DIR 미설정 — 격리 config 시드 생략(fail-closed). \
+             부서 재기동(cys-dept launch/rotate)이 계정 dir 주입 후 재시드한다 · 진단: cys doctor",
+            pack_dir().display()
+        );
+        return;
+    };
     if std::fs::create_dir_all(&cfg).is_err() {
         return;
     }
@@ -3106,6 +3178,136 @@ mod tests {
             assert!(!scope_exists_in(&me, bad), "경로 탈출 후보가 통과했다: {bad:?}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G3 축1: 부서 판정 순수 함수 진리표 — `pack-dept-` 접두(cys-dept `dept_pack`·
+    /// preflight `_pack_is_dept` 와 동일 규칙 · H-SEED-6 파리티 핀의 Rust 측).
+    #[test]
+    fn dept_scope_of_matrix() {
+        assert_eq!(dept_scope_of(Path::new("/h/.cys/pack")), None, "base 팩은 부서 아님");
+        assert_eq!(
+            dept_scope_of(Path::new("/h/.cys/pack-dept-dept-2")),
+            Some("dept-2".to_string())
+        );
+        assert_eq!(dept_scope_of(Path::new("/h/.cys/pack-dept-sales")), Some("sales".to_string()));
+        assert_eq!(dept_scope_of(Path::new("/h/.cys/pack-dept-")), None, "빈 부서명 = 불량 레인");
+        assert_eq!(dept_scope_of(Path::new("/h/.cys/pack-notes")), None, "접두 유사 비부서");
+        assert_eq!(dept_scope_of(Path::new("/h/.cys/claude")), None);
+    }
+
+    /// [회귀 핀·G3 축1] base 레인 거동 박제 — 팩이 `pack`(비부서)이면 시드 표적은 종전과
+    /// byte-identical 하게 `<부모>/claude` 다. **CYS_ACCOUNT_DIR 이 잔류해 있어도** base 레인은
+    /// 영향 0(성찰 위험④ 핀 — account-dir 참조는 부서 스코프 분기 안에만 있다).
+    #[test]
+    fn config_dir_base_unchanged() {
+        let pack = Path::new("/t/.cys/pack");
+        let scope = dept_scope_of(pack);
+        assert_eq!(
+            config_dir_for(None, scope.as_deref(), None, pack),
+            Some(PathBuf::from("/t/.cys/claude"))
+        );
+        assert_eq!(
+            config_dir_for(None, scope.as_deref(), Some("/t/acct"), pack),
+            Some(PathBuf::from("/t/.cys/claude")),
+            "base 레인에 CYS_ACCOUNT_DIR 우발 발효 금지"
+        );
+        // CYS_CONFIG_DIR 1순위 불변 핀
+        assert_eq!(
+            config_dir_for(Some("/cfg"), scope.as_deref(), Some("/t/acct"), pack),
+            Some(PathBuf::from("/cfg"))
+        );
+    }
+
+    /// G3 축1(확정 재설계): 부서 스코프 시드 표적 — CYS_ACCOUNT_DIR 있으면 그 dir(실소비 SOT),
+    /// 없으면 **None**(시드 생략 신호). 레거시 폴백 dir(claude-dept-<name>)은 만들지 않는다.
+    #[test]
+    fn config_dir_dept_scope() {
+        let pack = Path::new("/t/.cys/pack-dept-2");
+        let scope = dept_scope_of(pack);
+        assert_eq!(scope.as_deref(), Some("2"));
+        assert_eq!(
+            config_dir_for(Some("/cfg"), scope.as_deref(), Some("/acct"), pack),
+            Some(PathBuf::from("/cfg")),
+            "CYS_CONFIG_DIR 1순위는 부서 스코프에서도 불변"
+        );
+        assert_eq!(
+            config_dir_for(None, scope.as_deref(), Some("/acct"), pack),
+            Some(PathBuf::from("/acct"))
+        );
+        assert_eq!(config_dir_for(None, scope.as_deref(), Some(""), pack), None, "빈 값 = 부재");
+        assert_eq!(
+            config_dir_for(None, scope.as_deref(), None, pack),
+            None,
+            "부서+무acct = 시드 생략(공용 claude 폴백 금지 — 결함2 재발 방지)"
+        );
+    }
+
+    /// [무변조 계약 핀·G3 축1] 부서 팩 설치는 ①공용 <base>/claude 를 **byte-identical** 로 두고
+    /// ②CYS_ACCOUNT_DIR(acctdir)에 각성 훅 2종을 결정론 시드하며 ③acct 부재 시엔 시드를 통째로
+    /// 생략한다(레거시 폴백 dir 미생성). 결함2(공용 프로필 오염)의 기계 증거.
+    #[test]
+    fn dept_install_never_touches_shared_claude() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-dept-install-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let dpack = td.join("pack-dept-2");
+        std::fs::create_dir_all(&dpack).unwrap();
+        let shared = td.join("claude");
+        std::fs::create_dir_all(&shared).unwrap();
+        let shared_settings = shared.join("settings.json");
+        let shared_body = r#"{"theme":"dark"}"#;
+        std::fs::write(&shared_settings, shared_body).unwrap();
+        let acct = td.join("acct");
+        let items = [("CLAUDE.md.template", "router\n")];
+
+        // ① acct 주입 설치: 공용 무변조 + acctdir 시드
+        {
+            let _g1 = EnvGuard::set(ENV_PACK_DIR, &dpack);
+            let _g2 = EnvGuard::remove(ENV_CONFIG_DIR);
+            let _g3 = EnvGuard::set("CYS_ACCOUNT_DIR", &acct);
+            install_into(dpack.clone(), items.iter().copied(), false, "1.0.0", false, true, None)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&shared_settings).unwrap(),
+            shared_body,
+            "부서 설치가 공용 claude settings 를 변조했다(결함2 재발)"
+        );
+        assert!(
+            verify_desired_hooks_registered(
+                &acct.join("settings.json"),
+                &dpack,
+                &AWAKENING_HOOKS
+            )
+            .is_empty(),
+            "부서 acctdir 에 각성 훅 2종이 시드되지 않았다"
+        );
+
+        // ② acct 부재 설치: 시드 생략(공용 무변조 유지 + 폴백 dir 미생성)
+        let dpack3 = td.join("pack-dept-3");
+        std::fs::create_dir_all(&dpack3).unwrap();
+        {
+            let _g1 = EnvGuard::set(ENV_PACK_DIR, &dpack3);
+            let _g2 = EnvGuard::remove(ENV_CONFIG_DIR);
+            let _g3 = EnvGuard::remove("CYS_ACCOUNT_DIR");
+            install_into(dpack3.clone(), items.iter().copied(), false, "1.0.0", false, true, None)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&shared_settings).unwrap(),
+            shared_body,
+            "acct 부재 부서 설치가 공용 claude 로 폴백했다(fail-closed 위반)"
+        );
+        // (H-SEED-6 파리티 핀이 코드라인의 폴백 dir 리터럴 부재를 감시하므로 조립해 쓴다)
+        assert!(
+            !td.join(format!("{}-{}", "claude-dept", 3)).exists(),
+            "레거시 폴백 dir 가 생성됐다(아무도 안 읽는 사각 디렉터리 금지 — BLOCKER 확정 위반)"
+        );
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

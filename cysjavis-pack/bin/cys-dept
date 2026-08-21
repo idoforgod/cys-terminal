@@ -1028,6 +1028,11 @@ PY
     # (disk-full·권한)가 묘비를 스킵하면 '등재+미묘비' 부활 창. 의도-선기록 순서(GUI 제1행위)와
     # 통일. dept_tombstone은 항상 0 반환(:49-58)이라 set -e 안전.
     dept_tombstone "$name"
+    # ★G3 축1(결함2 치유층): 공용/개인 settings 의 이 부서 훅 잔존 정리 — 죽은 경로 훅은 매 Claude
+    # 세션 "No such file" 실패 벡터다. best-effort(dept_tombstone 규약과 동형 — 실패가 teardown 을
+    # 깨지 않는다 · 구 바이너리엔 없는 서브커맨드라 실패 허용). 제거 엔진은 hooks-prune 단일.
+    env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
+      || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
     reg_remove "$name"
     [ "$(reg_count)" = "0" ] && ceo_demote || true
     # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
@@ -1063,6 +1068,11 @@ PY
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     # ★R7: 묘비 선기록(순서 통일 — down verb·GUI 제1행위와 동일 축)
     [ -n "$name" ] && dept_tombstone "$name" || true
+    # ★G3 축1: down verb 와 동일한 훅 잔존 정리(best-effort — teardown 불파괴 규약 동형).
+    if [ -n "$name" ]; then
+      env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
+        || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
+    fi
     [ -n "$name" ] && reg_remove "$name" || true
     [ "$(reg_count)" = "0" ] && ceo_demote || true
     echo "[cys-dept] socket teardown 완료(name=${name:-미등록}). 부서 수=$(reg_count)"
@@ -1263,6 +1273,12 @@ EOF
       export CYS_NO_AUTOSTART=1
     fi
     export CYS_SOCKET="$(dept_sock "$name")" CYS_PACK_DIR="$(dept_pack "$name")"
+    # ★G3 축1: 부서 컨텍스트 실행에 계정 dir 동반 주입(유도 3순위 resolve_lane_acctdir 재사용) —
+    # 부서 스코프 config 시드 표적은 ${CYS_ACCOUNT_DIR}(실소비 SOT · 폴백 dir 없음)이라, 이 주입이
+    # 없으면 컨텍스트 CLI(init-pack 등)의 훅 시드가 생략(loud WARN)으로 접힌다. 유도 실패 = 계정격리
+    # 미사용 부서 → 무주입(기존 거동 · 회귀 0).
+    _ctx_acct="$(resolve_lane_acctdir "$name" "$(dept_pack "$name")" | tail -1)"
+    [ -n "$_ctx_acct" ] && export CYS_ACCOUNT_DIR="$_ctx_acct" || true   # set -e 안전(무주입=정상)
     exec "$@"
     ;;
 esac
