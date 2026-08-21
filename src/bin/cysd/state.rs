@@ -356,6 +356,14 @@ pub struct Surface {
     /// writer), 읽기 = surface.list·status·deliver_queued. 승계 게이트만은 캐시를 믿지 않고 그 시점
     /// 프로브를 새로 뜬다(드문 경로·판정이 role 재바인딩을 좌우하므로 stale 금지).
     pub seat_cache: AtomicU8,
+    /// ★G2(W3-A BLOCK 교정) 좌석 에이전트 엄격 관측 캐시: 이 틱의 신선한 자손 관측에서
+    /// **기지(旣知) 에이전트 엄격 매칭**(governance::cmdline_matches_agent_exec — R2 확정
+    /// strict 매처)이 잡혔는가. 쓰기 = `governance::refresh_seat_cache` 단독(seat_cache 와
+    /// 동일한 단일 writer 규약) · 읽기 = check_role_deadman 의 meta 부재 보조축 arming.
+    /// **무meta 좌석 한정 유지**(meta 좌석은 agent_seen 상태머신이 담당 — 판정 이원화 금지).
+    /// 원시 Occupied(아무 자손)로 armed 하면 vim/less/빌드 좌석의 프롬프트 복귀가 사망 후보가
+    /// 된다(결함 8 동형) — armed 경계는 반드시 이 엄격 관측이다.
+    pub seat_agent_cache: AtomicBool,
     /// T5 사용량 관측 스냅샷 (usage.rs 수집기가 갱신 — 자기보고 agent_status와 별개 층위)
     pub observed_usage: Mutex<Option<crate::usage::ObservedUsage>>,
     /// T5 세션 트랜스크립트 등록 (`usage.register` — SessionStart hook의 결정론 매핑)
@@ -2355,6 +2363,8 @@ impl Daemon {
             // Unknown의 소비 규약은 "현행 동작 유지"다(§소비처: 큐=배달·승계=거부) — 판정 미도달이
             // 새로운 실패를 만들지 않는다.
             seat_cache: AtomicU8::new(0),
+            // 신생 좌석은 미관측(false) — 첫 watchdog 틱의 엄격 관측이 확정한다(fail-closed).
+            seat_agent_cache: AtomicBool::new(false),
             agent_meta: Mutex::new(None),
             agent_seen: AtomicBool::new(false),
             agent_exit_notified: AtomicBool::new(false),
