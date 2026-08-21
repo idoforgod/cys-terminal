@@ -3460,11 +3460,18 @@ _SEAT_CORPUS = {
 
 @specimen("H-PRED-1", "W2", "결손 판정↔check verdict 공유 fixture 기계 차분", ["A1", "G26"])
 def h_pred_1():
-    """A1 클래스 소멸의 핵심 단언: **결손 판정과 check 판정이 갈리지 않는다**.
+    """A1 클래스 소멸의 핵심 단언: **결손 판정과 check 판정이 갈리지 않는다** — 유일한
+    의도된 예외가 W-B3 신계약(unknown 잔존)이다.
 
     A1 라이브락의 구조는 "결손 0 → ④ boot 생략 → ⑤ check 실패 → exit 6 → 재선언 동일"이었다.
     그 성립 조건은 두 판정이 **다른 함수**라는 것이다. W2 는 결손 판정이 `check_verdicts` 를
-    문자 그대로 소비하게 만든다 → 공유 fixture 전수에서 차분이 0 이어야 한다."""
+    문자 그대로 소비하게 만든다 → 공유 fixture 전수에서 차분이 0 이어야 한다.
+    ★W-B3 신계약(부트 경로 unknown=결손 · 잔여 B3 폐쇄): unknown 등급 검체만 **의도된
+      차분**을 갖는다 — ⑤check 는 충족(콜드스타트 fail-open 불변 · exit 6 라이브락 금지) ∧
+      결손 산출은 시한부 해소(resolve_unknown_for_spawn · `cys boot` 스폰 규약 동일) 후
+      잔존 시 결손>0(`cys boot` 호출 유도). 그래서 차분 0 계약은 unknown 잔존을 예외로 두고,
+      unknown 검체는 신계약(⑤불변·잔존=결손·해소=복귀)으로 잰다. 결손 산출의 정본은
+      `javis_orchestra._shared_verdict_deficit` 이고 bootstrap 판은 **위임 래퍼**다(소비 배선)."""
     BN, O, B = _shared_pred()
     need("_shared_verdict_deficit" in _read(os.path.join(BIN_DIR, "javis_bootstrap.py")),
          "결손 판정이 공유 판정 함수를 소비하지 않는다")
@@ -3473,21 +3480,73 @@ def h_pred_1():
         st = _fx(rows)
         verdicts, _roster = O.check_verdicts(st)
         check_missing = sorted(r for r, v in verdicts.items() if not v["satisfied"])
-        has, why = B._shared_verdict_deficit(st)
+        unknown_ok = sorted(r for r, v in verdicts.items()
+                            if v["satisfied"] and v["grade"] == "unknown")
+        # 밀폐 주입: 재조회=같은 fixture(잔존 unknown 재현)·tick 0 — 수면 0·라이브 데몬 왕복 0.
+        has, why = B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0)
         need(has is not None, "%s: 공유 판정 소비 실패 — %s" % (name, why))
-        # 차분 계약: check 가 부재를 보면 결손>0, check 가 전원 충족이면 결손 0.
-        if bool(check_missing) != bool(has):
-            diffs.append("%s: check_missing=%r vs deficit=%r" % (name, check_missing, has))
+        # 차분 계약: check 부재 ⟺ 결손>0. ★유일 예외 = unknown 잔존(W-B3 신계약 — 의도된 차분).
+        expect = bool(check_missing) or bool(unknown_ok)
+        if bool(has) is not expect:
+            diffs.append("%s: check_missing=%r unknown=%r vs deficit=%r"
+                         % (name, check_missing, unknown_ok, has))
     need(not diffs, "결손 판정↔check verdict 차분 발생(A1 라이브락 재성립): %r" % diffs)
     # G26 좌석: grok·cso-1 은 의무 슬롯을 채우지 못한다(양쪽 동일 결론).
     st = _fx(_SEAT_CORPUS["g26_variant_seats"])
     v, _ = O.check_verdicts(st)
     need(not v["cso"]["satisfied"], "cso-1 변형 좌석이 의무 cso 를 충족(G26 재발)")
     need(not v["reviewer-gemini"]["satisfied"], "reviewer-grok 이 의무 리뷰어 슬롯을 충족(G26 재발)")
-    need(B._shared_verdict_deficit(st)[0] is True, "G26 좌석에서 결손 0 오판")
+    need(B._shared_verdict_deficit(st, requery=lambda: st, tick_s=0)[0] is True,
+         "G26 좌석에서 결손 0 오판")
     # 대조군: 정상 팀은 양쪽 모두 충족.
     st_ok = _fx(_SEAT_CORPUS["healthy_latched"])
-    need(B._shared_verdict_deficit(st_ok)[0] is False, "정상 팀을 결손>0 으로 오판(역방향 회귀)")
+    need(B._shared_verdict_deficit(st_ok, requery=lambda: st_ok, tick_s=0)[0] is False,
+         "정상 팀을 결손>0 으로 오판(역방향 회귀)")
+    # ★W-B3 신계약 3단 통제(로스터 적응형 — 이 기계의 리뷰어 감지 결과에 무관하게 성립):
+    #   ⓐ ⑤check satisfied 불변(unknown=충족측) ⓑ 잔존 unknown ⟹ 결손>0(의도된 차분·배선 발효)
+    #   ⓒ 재조회 생존 확인 ⟹ 결손 0 복귀(시한부 — 건강한 콜드스타트 팀 오판·boot churn 금지)
+    req_roles = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster()]
+    unk_st = _fx([{"role": req_roles[0], "exited": False, "seat": "unknown"}] +
+                 [{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles[1:]])
+    ok_st = _fx([{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles])
+    v_unk, _ = O.check_verdicts(unk_st)
+    need(v_unk[req_roles[0]]["grade"] == "unknown", "unknown 통제 fixture 가 unknown 등급이 아님")
+    need(v_unk[req_roles[0]]["satisfied"] is True,
+         "⑤check 가 unknown 을 미충족으로 뒤집음(콜드스타트 exit 6 라이브락 재발)")
+    need(B._shared_verdict_deficit(unk_st, requery=lambda: unk_st, tick_s=0)[0] is True,
+         "잔존 unknown 이 결손으로 계상되지 않음(W-B3 배선 미발효 — BOOT_SKIP 잔존)")
+    need(B._shared_verdict_deficit(unk_st, requery=lambda: ok_st, tick_s=0)[0] is False,
+         "재조회 생존 확인된 unknown 을 결손으로 계상(불필요 boot·churn — 역방향 회귀)")
+    # ★배선 실재 핀(소비자 0 재발 금지): bootstrap 판은 orchestra 정본으로 위임하고, 로컬
+    #   구현은 폴백 전용 이름으로만 남는다(동명 쌍둥이 드리프트 함정 제거).
+    bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need('getattr(_orch, "_shared_verdict_deficit"' in bsrc,
+         "④ 결손 산출이 orchestra 정본으로 위임하지 않는다(신설 함수 소비자 0 — W-B3 미발효)")
+    need("def _shared_verdict_deficit_fallback(" in bsrc,
+         "구 팩 스큐 폴백(로컬 구 계약) 소실 — 신팩+구팩 혼재에서 부트 경로 취약")
+    # ★구 팩 스큐 시뮬(orchestra 에 정본 부재): 폴백이 유효 판정을 내고(부트 불사·구 계약
+    #   unknown=충족측) stderr 1줄로 고지된다(조용한 강등 금지).
+    import types as _types
+    import io as _io
+    import contextlib as _ctx
+    stub = _types.ModuleType("javis_orchestra")
+    stub.check_verdicts = O.check_verdicts      # 구 팩에도 있던 W2 판정 코어만 남긴 형상
+    real = sys.modules.get("javis_orchestra")
+    buf = _io.StringIO()
+    try:
+        sys.modules["javis_orchestra"] = stub
+        with _ctx.redirect_stderr(buf):
+            fb_ok = B._shared_verdict_deficit(ok_st)
+            fb_unk = B._shared_verdict_deficit(unk_st)
+    finally:
+        if real is not None:
+            sys.modules["javis_orchestra"] = real
+        else:                                                         # pragma: no cover
+            sys.modules.pop("javis_orchestra", None)
+    need(fb_ok[0] is False, "구 팩 스큐 폴백이 정상 팀을 오판(부트 경로 사망 위험): %r" % (fb_ok,))
+    need(fb_unk[0] is False,
+         "구 팩 스큐 폴백이 unknown 을 결손으로 계상(구 계약 이탈 — 폴백은 unknown=충족측)")
+    need("폴백" in buf.getvalue(), "폴백 발동이 stderr 1줄로 고지되지 않음(조용한 강등)")
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
     calib = "skip(no-git)"
     if old is not None:
@@ -3496,8 +3555,9 @@ def h_pred_1():
         need("cys list 텍스트" in old or "_live_role_names" in old,
              "계측 타당성 실패: 구 코드의 cys list 기반 결손 판정을 못 찾았다")
         calib = "구 코드=cys list 텍스트 신호(check 와 다른 함수) 확인"
-    return ("공유 fixture %d종 차분 0 · G26 좌석 양쪽 결손>0 · 정상 팀 결손 0 · 계측검증=%s"
-            % (len(_SEAT_CORPUS), calib))
+    return ("공유 fixture %d종 차분 0(unknown 잔존=의도된 차분 1) · G26 좌석 양쪽 결손>0 · "
+            "정상 팀 결손 0 · W-B3: ⑤불변+잔존 unknown 결손+시한부 복귀+위임 배선+구팩 폴백"
+            "(스큐 시뮬·stderr 고지) · 계측검증=%s" % (len(_SEAT_CORPUS), calib))
 
 
 @specimen("H-PRED-2", "W2", "생존 술어 parity(boot 스킵·wakeup zombie·reclaim)", ["B3", "B13", "G27"])

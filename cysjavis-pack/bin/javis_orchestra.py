@@ -502,14 +502,15 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None):
     동일(신술어 발명 금지). 대기 1주기는 **역할 수와 무관하게 1회**다(재조회 status 공유 —
     unknown 좌석이 N 개라고 5s×N 을 태우면 부트 경로 예산이 계약 없이 부푼다).
 
-    ★소비 배선 현황(정직 표기 · 2026-08-21): 이 함수의 소비자는 아직 없다 —
-      `javis_bootstrap._shared_verdict_deficit`(④ boot 호출 생략 판정의 현행 정본)가 이 함수로
-      위임하는 1줄 배선은 W-B1 허용 파일 밖(javis_bootstrap.py)이라 후속 소유다. 배선 시
-      주의 2건: ①반환 계약은 bootstrap 판 (bool|None, 사유) 와 동일하게 설계돼 drop-in 이다.
-      ②run_bootstrap_health H-PRED-1 의 '결손↔check 차분 0' 계약은 seat_unknown corpus 에서
-      **의도된 차분**(check 충족 vs 결손>0)이 생기므로 그 검체의 차분 계약을 unknown 등급
-      제외로 함께 개정해야 한다(안 하면 배선 커밋이 H-PRED-1 적색 — 침묵 회귀가 아니라
-      계약 갱신 누락이다).
+    ★소비 배선 현황(정직 표기 · 2026-08-21 배선 완료 · W-B3): 이 함수가 **정본**이고
+      소비자는 `javis_bootstrap._shared_verdict_deficit` 위임 래퍼다(④ boot 호출 생략 판정).
+      bootstrap 의 로컬 구현은 `_shared_verdict_deficit_fallback` 으로 개명돼 **구 팩 스큐
+      (이 함수 부재·import 실패·위임 예외) 전용 폴백**으로만 남았고, 폴백 발동은 stderr 1줄로
+      고지된다(조용한 강등 금지). 배선 시 주의 2건은 **둘 다 이행 완료**다:
+      ①반환 계약 (bool|None, 사유) 3자(정본·래퍼·폴백) 동일 — 실측 대조 완료.
+      ②run_bootstrap_health H-PRED-1 의 '결손↔check 차분 0' 계약은 seat_unknown corpus 의
+      **의도된 차분**(check 충족 vs 결손>0)을 예외로 두도록 개정됐고, 배선 실재·폴백 실재·
+      ⑤check satisfied 불변을 그 검체가 함께 핀한다(소비자 0 재발 시 적색).
 
     requery/tick_s 는 밀폐 테스트 주입(기본: cys_status 재조회 · 워치독 1주기 대기)."""
     bn = _boot_node()

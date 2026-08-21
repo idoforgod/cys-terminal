@@ -1405,18 +1405,50 @@ def _cys_status_json():
         return None
 
 
-def _shared_verdict_deficit(status):
-    """★A1 클래스 소멸: 결손 판정이 **⑤check 와 문자 그대로 같은 함수**를 소비한다.
+def _shared_verdict_deficit(status, requery=None, tick_s=None):
+    """★부트 ④ 결손 산출 — `javis_orchestra._shared_verdict_deficit`(정본) **위임 소비**(W-B3 배선).
 
-    `javis_orchestra.check_verdicts(status)` 는 cmd_check 가 화면 출력에 쓰는 그 판정 코어다
-    (공유 술어 `javis_boot_node.node_liveness`·`slot_satisfied` 소비). 결손 판정이 이 함수를
-    소비하면 '결손 0인데 check 실패'(=④ 생략 → ⑤ 실패 → exit 6 → 재선언 동일의 라이브락)가
-    **구조적으로 불가능**해진다 — 종전에는 이름공간(W0에서 정합)과 생존 신호(여기)가 갈려 있었다.
+    정본(orchestra 판)은 check_verdicts(⑤check 판정 코어) 소비에 더해 **unknown 등급을
+    시한부 해소 후 잔존 시 결손**으로 계상한다(`javis_boot_node.resolve_unknown_for_spawn`
+    — `cys boot` 스폰 경로가 이미 쓰는 규약: 워치독 1주기 대기 → 재조회 1회·전 역할 공유 1회).
+    죽었는데 프로브만 실패한 좌석이 '충족'으로 접혀 ④ boot 가 영영 생략되는 잔여 B3 를
+    닫는다. 중복 스폰은 boot 락 + `cys boot` 자체의 Unknown 시한부 해소 +
+    seat_death_confirmed 죽음확정 게이트가 방어한다.
 
-    ★역방향 회귀 차단: node_liveness 는 `absent` 만 미충족으로 본다. agent_alive 단독·좌석 점유·
-      quiet_but_alive·**좌석 판정불가(unknown)** 는 전부 충족측이라, 건강한 quiet 노드를 결손>0
-      으로 오판해 자원 hard-block 을 되살리는 경로가 없다(W0 handoff 가 명시한 그 경계 유지).
-    반환 (결손 bool, 사유) | (None, 실패사유)."""
+    ★역방향 회귀 차단(경계 갱신 — W-B3): agent_alive 단독·좌석 점유·quiet_but_alive 는 종전대로
+      충족측이고, **unknown 만** 시한부 해소(생존 확인 시 충족 복귀) 후 잔존할 때 결손이다 —
+      건강한 quiet 노드를 결손>0 으로 오판하는 경로는 여전히 없다(W0 handoff 경계 유지).
+    ★⑤check 의 satisfied 는 불변이다(unknown=충족측 fail-open 유지 — 결손 산출만 갈린다).
+      같은 함수에 넣으면 데몬 콜드스타트 창에서 ⑤check 실패 → exit 6 라이브락(감사 확정).
+      불변 핀: tests/test_seat_latch_negation.py BootDeficitUnknown · H-PRED-1 신계약 절.
+    ★스큐 폴백: orchestra import 실패·구 팩(함수 부재)·위임 호출 예외 시 종전 로컬 산출
+      (`_shared_verdict_deficit_fallback` — unknown=충족측 구 계약)로 되돌아간다. 신팩
+      bootstrap + 구팩 orchestra 혼재에서 부트가 죽으면 안 된다. 폴백 발동은 stderr 1줄
+      고지(조용한 강등 금지 — 어느 계약으로 판정했는지가 진단의 절반이다).
+    requery/tick_s 는 밀폐 테스트 주입(기본: cys status 재조회·워치독 1주기) — 정본에 그대로
+    전달된다. 반환 계약 (결손 bool, 사유) | (None, 실패사유)는 정본·폴백 동일(drop-in —
+    양판 반환문 직접 대조로 확인 2026-08-21)."""
+    try:
+        import javis_orchestra as _orch
+        _fn = getattr(_orch, "_shared_verdict_deficit", None)
+        if _fn is not None:
+            return _fn(status, requery=requery, tick_s=tick_s)
+        skew_why = "구 팩 스큐(javis_orchestra 에 _shared_verdict_deficit 부재)"
+    except Exception as e:
+        skew_why = "orchestra 위임 불가(%s: %s)" % (type(e).__name__, e)
+    print("[bootstrap] 결손 산출 폴백 발동: %s — 로컬 구 계약(unknown=충족측) 시도" % skew_why,
+          file=sys.stderr)
+    return _shared_verdict_deficit_fallback(status)
+
+
+def _shared_verdict_deficit_fallback(status):
+    """★폴백 전용(정본 아님) — 구 팩 스큐에서만 호출되는 종전 W2 로컬 산출.
+
+    orchestra 에 부트 경로 산출기(`_shared_verdict_deficit`)가 없는 구 팩과 혼재할 때만
+    위 위임 래퍼가 여기로 강등한다(동명 쌍둥이 드리프트 함정 제거 — W-B3). 구 계약
+    그대로: check_verdicts 소비 · **unknown=충족측**(시한부 해소 없음 — 잔여 B3 는 이
+    폴백에선 열려 있고, 그래서 폴백 발동이 stderr 로 고지된다). 정본 경로가 살아 있으면
+    절대 호출되지 않는다. 반환 (결손 bool, 사유) | (None, 실패사유) — 래퍼와 동일 계약."""
     try:
         import javis_orchestra as _orch
         verdicts, _roster = _orch.check_verdicts(status)
@@ -1428,19 +1460,21 @@ def _shared_verdict_deficit(status):
     presumed = [r for r, v in verdicts.items()
                 if v.get("satisfied") and v.get("grade") == "alive_presumed"]
     if missing:
-        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일·폴백]"
                       % (", ".join(verdicts), ", ".join(missing)))
     note = ("" if not presumed
             else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
-    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일·폴백]"
                    % (", ".join(verdicts), note))
 
 
 def _team_has_deficit():
     """팀 결손 여부 산출 → (결손 bool, 사유). 신호 원천 실패 → 보수적으로 결손 가정(게이트 진행).
 
-    ★W2 술어 단일화(A1 클래스·CS-1②): 1차 경로는 `javis_orchestra.check_verdicts` — ⑤check 가
-      쓰는 **같은 함수**다. 2차는 W0 의 로스터 판정(cys list `role=`+`!exited` — 이름공간만 정합),
+    ★W2 술어 단일화(A1 클래스·CS-1②) + W-B3 위임: 1차 경로는 orchestra 정본
+      `_shared_verdict_deficit` — ⑤check 판정 코어(check_verdicts)를 소비하고 unknown 은
+      시한부 해소 후 잔존 시 결손이다(⑤ satisfied 는 불변 — 위 래퍼 docstring).
+      2차는 W0 의 로스터 판정(cys list `role=`+`!exited` — 이름공간만 정합),
       3차는 구 가족 접두 계수(G26 한계 포함). 강등할 때마다 **사유를 사유 문자열에 남긴다**
       (조용한 접힘 금지 — 어떤 신호로 판정했는지가 진단의 절반이다).
     ★orchestra check **서브프로세스**는 여전히 쓰지 않는다: ④-b→⑤ 호출 순서·검증 계약에
@@ -1990,9 +2024,9 @@ def _cmd_run_chain(log):
         log.step(STEP.CEO_TICKET, 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
-    # 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 — 의무 역할 목록은 ⑤check와 동일 소스
-    # (javis_orchestra.effective_required_roles)를 소비한다(W0 P0 지혈 · G26/A1). R1-MED-1의 '총수
-    # 비교 폐기'는 그대로 유지되고, 그 위에서 역할 이름공간까지 check와 일치시킨 것이다.
+    # 결손 산출 1차 경로는 orchestra 정본 _shared_verdict_deficit 위임(⑤check 판정 코어 소비
+    # + unknown 시한부 해소 — W-B3)이고, cys list 로스터 판정(W0 · effective_required_roles
+    # 소비)은 강등 폴백이다(_team_has_deficit docstring). R1-MED-1의 '총수 비교 폐기'는 그대로.
     # 결손 0(재선언·의무 좌석 전원 생존) → 게이트와 ④ cys boot 호출 자체를 생략("결손 0=스폰 없음").
     orchestra = os.path.join(PACK, "bin", "javis_orchestra.py")
     has_deficit, deficit_why = _team_has_deficit()
