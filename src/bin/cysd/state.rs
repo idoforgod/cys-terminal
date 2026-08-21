@@ -118,13 +118,27 @@ pub struct QueueEntry {
 /// drain·handlers queue.clear)가 공유한다. 기존 키(reason/count/bytes) 의미 불변,
 /// `queue_entry_ids`는 additive(발신자가 자기 항목 유실을 결정론 확인하는 조준점).
 /// reason 어휘(현행 3종): "process_exited" | "surface_closed" | "cleared".
-pub fn queue_dropped_payload(reason: &str, dropped: &[QueueEntry]) -> Value {
-    json!({
+///
+/// ★G4(W4-C) additive 파라미터 `reclaim`: queue.clear의 **권위 role(master/cso) + 대상
+/// exited 예외**(exited_reclaim — 죽은 좌석 회수의 큐 인멸을 명시 행위로 감사)를 경유할
+/// 때만 Some((cleared_by_surface, via)) — {cleared_by, via} 두 키를 additive 로 얹는다.
+/// 자기 큐 clear·자력종료·close drain 등 기존 경로는 전부 None(payload 바이트 동일 유지).
+pub fn queue_dropped_payload(
+    reason: &str,
+    dropped: &[QueueEntry],
+    reclaim: Option<(u64, &str)>,
+) -> Value {
+    let mut p = json!({
         "reason": reason,
         "count": dropped.len(),
         "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>(),
         "queue_entry_ids": dropped.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
-    })
+    });
+    if let Some((cleared_by, via)) = reclaim {
+        p["cleared_by"] = json!(cleared_by);
+        p["via"] = json!(via);
+    }
+    p
 }
 
 /// queue.enqueued payload — enqueue 3경로(handlers send/send-key·governance
@@ -2641,7 +2655,7 @@ impl Daemon {
                     "queue.dropped",
                     "queue",
                     Some(surf.id),
-                    queue_dropped_payload("process_exited", &dropped),
+                    queue_dropped_payload("process_exited", &dropped, None),
                 );
             }
             daemon.bus.publish(
@@ -5786,11 +5800,13 @@ mod tests {
 
     /// 폐기 3발행처 공용 스키마 핀 — reason 어휘 3종 전부에서 기존 키(reason/count/bytes)
     /// 값 불변 + queue_entry_ids 순서 보존. `entry_ids` 키(W-id 에코 계약)는 절대 부재.
+    /// ★G4(W4-C): reclaim=None(기존 경로 전부)이면 cleared_by/via 키 자체가 없어야 하고
+    /// (payload 바이트 동일 = 하위호환의 기계 증명), Some 이면 두 키만 additive 로 실린다.
     #[test]
     fn queue_dropped_payload_pins_existing_keys_and_adds_queue_entry_ids() {
         let dropped = vec![w2b_entry("qa.1", 1, "첫", 10.0), w2b_entry("qa.2", 2, "둘째", 20.0)];
         for reason in ["process_exited", "surface_closed", "cleared"] {
-            let p = queue_dropped_payload(reason, &dropped);
+            let p = queue_dropped_payload(reason, &dropped, None);
             assert_eq!(p["reason"], json!(reason), "기존 키 reason 불변");
             assert_eq!(p["count"], json!(2), "기존 키 count 불변");
             assert_eq!(
@@ -5807,11 +5823,21 @@ mod tests {
                 p.get("entry_ids").is_none(),
                 "entry_ids 키명은 W-id 에코 전용(javis_report_gate disarm 조인 키) — 재사용 금지"
             );
+            assert!(
+                p.get("cleared_by").is_none() && p.get("via").is_none(),
+                "reclaim=None(기존 3발행처)인데 cleared_by/via 키가 실렸다 — 하위호환 파손"
+            );
         }
         // 빈 drain 은 발행처가 발행 자체를 생략하지만, 빌더 자체도 안전해야 한다.
-        let empty = queue_dropped_payload("cleared", &[]);
+        let empty = queue_dropped_payload("cleared", &[], None);
         assert_eq!(empty["count"], json!(0));
         assert_eq!(empty["queue_entry_ids"], json!([] as [&str; 0]));
+        // ★G4(W4-C) exited_reclaim 예외 경유: cleared_by/via 두 키만 additive — 기존 키 불변.
+        let reclaimed = queue_dropped_payload("cleared", &dropped, Some((7, "exited_reclaim")));
+        assert_eq!(reclaimed["reason"], json!("cleared"), "reclaim 경유도 기존 키 reason 불변");
+        assert_eq!(reclaimed["count"], json!(2), "reclaim 경유도 기존 키 count 불변");
+        assert_eq!(reclaimed["cleared_by"], json!(7), "additive cleared_by = 발신 surface id");
+        assert_eq!(reclaimed["via"], json!("exited_reclaim"), "additive via = 예외 경로 태그");
     }
 
     /// enqueue 3경로 공용 스키마 핀 — 기존 키(bytes/depth/from · send-key 만 key) 불변 +

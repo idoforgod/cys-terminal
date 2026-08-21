@@ -197,6 +197,77 @@ fn record_create_owner(daemon: &Daemon, new_sid: u64, creator_sid: u64) {
     owners.insert(new_sid, (creator_sid, now));
 }
 
+/// ★G4(W4-C) 권위 role 집합의 **단일 정의처** — authoritative_caller_ok(타이핑 가드 면제)·
+/// surface.reap(수동 좌석 회수)·queue.clear exited 예외(죽은 좌석 큐 정리)가 공유한다.
+/// 집합 변경 시 세 게이트가 갈라지지 않게 여기 한 곳만 고친다.
+fn privileged_role(r: &str) -> bool {
+    r == "master" || r == "cso"
+}
+
+/// ★G4(W4-C) 수동 reap(surface.reap) 순수 판정부 — **7조건 AND, 첫 미달에서 사유 코드 반환**
+/// (None=허용). rollback_allowed 관례 동형: 판정을 순수 함수로 박아 full Daemon 없이
+/// 조건 매트릭스를 테스트한다. deny-by-default — **부재는 무증명이다**(exited_at 스탬프
+/// 부재 = grace 미경과 취급, caller role 부재 = 권위 아님).
+///
+/// 조건(브리프 확정 · 결함 6): ①caller 해석 가능(호출부에서 선판정 — caller_unresolved)
+/// ∧ ②caller role∈{master,cso} ∧ ③대상 exited=true(**active 절대 불가 — 치명위험 앵커 ④**)
+/// ∧ ④agent 프로세스 부재(agent_meta 생존·원장 소유 pid·자손 프로세스 전부 0)
+/// ∧ ⑤queue_depth=0(pending+restored — 큐 인멸은 queue.clear 명시 행위로만)
+/// ∧ ⑥데몬 조상 아님(자기 조상 살해 = 데몬 동반사망) ∧ ⑦grace 경과.
+/// grace 판정은 governance::exited_surface_due 재사용 — 수치 단일 정의처(watchdog 자동
+/// reap 과 동일 잣대. 다르면 '수동은 통과, 자동은 미달' 드리프트).
+#[allow(clippy::too_many_arguments)]
+fn manual_reap_denial(
+    caller_role: Option<&str>,
+    exited: bool,
+    exited_elapsed: Option<u64>,
+    has_role: bool,
+    agent_alive: bool,
+    live_owned: usize,
+    live_descendants: usize,
+    queue_depth: usize,
+    daemon_ancestor: bool,
+) -> Option<&'static str> {
+    // ② 권위 role 한정 — 자기신고가 아니라 caller surface 의 role 락에서 읽은 값이 입력이다.
+    if !caller_role.is_some_and(privileged_role) {
+        return Some("caller_role_forbidden");
+    }
+    // ③ active surface 절대 불가 — 어떤 조합에서도 살아있는 좌석은 회수 대상이 아니다.
+    if !exited {
+        return Some("active_surface");
+    }
+    // ④ 프로세스 잔존 — 셋 중 하나라도 남아 있으면 '죽은 잔재'가 아니다(오살 방지).
+    if agent_alive || live_owned > 0 || live_descendants > 0 {
+        return Some("agent_still_alive");
+    }
+    // ⑤ 큐 잔존 — reap 은 큐를 자동 drop 하지 않는다(인멸은 queue.clear 명시 행위 2단계로).
+    if queue_depth > 0 {
+        return Some("queue_not_empty");
+    }
+    // ⑥ 데몬이 대상 surface 의 자손이면 회수 = 자기 조상 트리 kill(동반사망) — 거부.
+    if daemon_ancestor {
+        return Some("daemon_ancestor");
+    }
+    // ⑦ grace — 스탬프 부재(None)는 무증명이므로 미경과 취급(deny-by-default).
+    match exited_elapsed {
+        Some(el) if governance::exited_surface_due(has_role, el) => None,
+        _ => Some("grace_not_elapsed"),
+    }
+}
+
+/// ★G4(W4-C) [MAJOR TOCTOU] close 직전 재검증 순수 판정 — 판정(사실 수집·sysinfo)과
+/// close_surface 실행 사이 창에서 **신규 enqueue** 가 유입되면 close 의 큐 drain 이 그
+/// 메시지를 무음 폐기한다(메시지 유실 계급). exited 는 단방향 래치라 산 surface 오살
+/// 경로는 구조적으로 없지만(!still_exited 분기는 방어심화), 큐 재확인은 실효 방어다.
+/// 반환 Some("state_changed")=abort. 잔여 창(재검→close 의 맵 제거 사이)은 원리상
+/// 소거 불가 — seat_takeover_recheck 관례대로 '창을 값싼 재검 1회로 좁힌다'(정직 표기).
+fn manual_reap_recheck(still_exited: bool, queue_depth_now: usize) -> Option<&'static str> {
+    if !still_exited || queue_depth_now > 0 {
+        return Some("state_changed");
+    }
+    None
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -553,10 +624,12 @@ fn caller_in_restore_root(
 /// 거부된다(fail-closed). launch-agent 는 master 실행이면 (a), phoenix 복원 자손이면 (b)로 해소된다.
 fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>, caller_pid: Option<u32>) -> bool {
     // (a) 권위 노드(master/cso) — 기존 불변식(role 자체가 권한 메커니즘).
+    //     집합은 privileged_role 단일 정의처(★G4 W4-C — surface.reap·queue.clear 예외와 공유).
     if from_sid
         .and_then(|sid| daemon.get_surface(sid))
         .and_then(|s| s.role.lock().unwrap().clone())
-        .map_or(false, |r| r == "master" || r == "cso")
+        .as_deref()
+        .is_some_and(privileged_role)
     {
         return true;
     }
@@ -1921,6 +1994,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // OwnerClose(묘비)로 폴백(오타로 부활 폭주하지 않게).
             // ★T-0147-4: cause를 소유 게이트 **앞으로** 옮겼다 — 게이트의 생성자 롤백 예외가 cause를
             // 판정 입력으로 쓴다(Reap만 예외 대상). 파싱은 순수 함수라 순서 이동에 부작용이 없다.
+            // ★G4(W4-C): exited 좌석의 사후 회수는 surface.reap(별도 RPC·role 게이트·grace 창)이
+            // 담당 — 이 게이트에 예외를 더하지 않는다. creator_rollback(생성 직후 TTL 창·생성자
+            // 전용·산 surface 롤백)과 reap(사망 후 grace 창·권위 role 전용·죽은 좌석 회수)은
+            // 생애주기 축에서 상호 배타 — 두 예외가 한 게이트에 누적되지 않게 여기서 봉인한다.
             let cause = close_cause_from_params(&params);
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
             if let Some(cs) = caller_sid {
@@ -1963,6 +2040,185 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &id,
                     json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
                 )),
+                Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
+            }
+        }
+
+        // ─── ★G4(W4-C) 결함 6: 수동 좌석 회수 RPC — surface.close 와 별개 계약 ───
+        // 죽은(exited) 좌석을 권위 노드(master/cso)가 즉시 회수하는 전용 RPC. surface.close
+        // 의 self-only 게이트는 일절 건드리지 않는다(절대 불변 — 예외 누적 금지, 위 주석 참조).
+        // 7조건 AND 는 순수 판정부 manual_reap_denial 이 판정하고, 실행은 기존 단일 파괴 경로
+        // governance::close_surface(Reap — 묘비 미생성=부활 대상 유지)로만 위임한다.
+        // 감사 3종: reap_requested(요청 — 성패 무관)·reap_denied(거부+사유)·surface.reaped(실행).
+        "surface.reap" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            // 익명(pane 밖·caller 미해석) 즉시 거부 — surface.close 는 익명(데몬 내부 경로)을
+            // 통과시키지만 reap 은 **의도적으로 다른 계약**이다: 수동 회수는 '누가'가 감사의
+            // 핵심이고, 데몬 내부 자동 회수는 reap_exited_surfaces(watchdog 레인)가 따로 있어
+            // 익명 통로가 필요 없다(fail-closed).
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let Some(cs) = caller_sid else {
+                daemon.bus.publish(
+                    "surface.reap_denied",
+                    "surface",
+                    Some(sid),
+                    json!({"requested_surface": sid, "caller_surface": Value::Null,
+                           "caller_pid": caller_pid, "reason": "caller_unresolved"}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "reap_denied",
+                    "surface.reap denied: caller_unresolved — 발신이 pane 으로 해석되지 않음(익명 회수 금지)",
+                ));
+            };
+            // caller_role 은 caller surface 의 role 락에서 읽는다 — 자기신고 불신
+            // (resolve_caller_surface = 커널 peer pid 조상 추적이 유일한 신원 근거).
+            let caller_role = daemon
+                .get_surface(cs)
+                .and_then(|s| s.role.lock().unwrap().clone());
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            // 요청 감사 — 성공/거부 무관 항상 발행(수동 파괴 시도는 전부 원장에 남는다).
+            daemon.bus.publish(
+                "surface.reap_requested",
+                "surface",
+                Some(sid),
+                json!({"requested_surface": sid, "caller_surface": cs,
+                       "caller_pid": caller_pid, "caller_role": caller_role}),
+            );
+            // 사실 수집 — 락 규약: sysinfo 전 프로세스 refresh(수십 ms)는 **어떤 데몬 락도
+            // 쥐지 않은 채** 1회만(close_surface 가 동일 비용을 락 밖에서 지불하는 기존 관례).
+            // reap 은 사람/권위 노드 페이스의 저빈도 RPC 라 벤치 불요. 수집→판정→실행 분리.
+            let exited = surface.exited.load(Ordering::Relaxed);
+            let exited_elapsed = surface
+                .exited_at
+                .lock()
+                .unwrap()
+                .map(|t| t.elapsed().as_secs());
+            let target_role = surface.role.lock().unwrap().clone();
+            let agent_alive = governance::slot_agent_alive(&surface);
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            // 원장(ledger)에서 이 surface 소유로 등록된 **살아있는** pid 수.
+            let live_owned = {
+                let ledger = daemon.ledger.lock().unwrap();
+                ledger
+                    .values()
+                    .filter(|e| {
+                        e.surface_id == Some(sid)
+                            && sys.process(sysinfo::Pid::from_u32(e.pid)).is_some()
+                    })
+                    .count()
+            };
+            let live_descendants = governance::collect_descendants(&sys, surface.pid).len();
+            // 큐 깊이 = 라이브 pending + 아직 미소비 restored(WAL 복원분) 중 이 surface 몫.
+            let queue_depth = surface.pending_queue.lock().unwrap().len()
+                + daemon
+                    .restored_queue
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|it| it.get("surface_id").and_then(|v| v.as_u64()) == Some(sid))
+                    .count();
+            // 데몬 조상 판정: 데몬 자신의 부모 체인 32홉 안에 surface.pid 가 있으면 회수 =
+            // 자기 조상 트리 kill(동반사망). 루프 가드는 resolve_caller_surface 관례 복제.
+            // fail-closed: 데몬 자기 프로세스가 관측 불능이면(측정 불능은 통과가 아니다)
+            // 조상 '있음' 측으로 폴백해 거부한다. 순간 관측 TOCTOU 창은 잔존 — cysd 가 pane
+            // 자손인 배치는 dev 한정이라 실효 위험 낮음(정직 표기).
+            let daemon_ancestor = {
+                let self_pid = std::process::id();
+                if sys.process(sysinfo::Pid::from_u32(self_pid)).is_none() {
+                    true // 관측 실패 = 무증명 → deny 측
+                } else {
+                    let mut cur = self_pid;
+                    let mut found = false;
+                    for _ in 0..32 {
+                        if cur == surface.pid {
+                            found = true;
+                            break;
+                        }
+                        match sys
+                            .process(sysinfo::Pid::from_u32(cur))
+                            .and_then(|p| p.parent())
+                        {
+                            Some(parent) if parent.as_u32() != cur && parent.as_u32() > 1 => {
+                                cur = parent.as_u32();
+                            }
+                            _ => break,
+                        }
+                    }
+                    found
+                }
+            };
+            if let Some(reason) = manual_reap_denial(
+                caller_role.as_deref(),
+                exited,
+                exited_elapsed,
+                target_role.is_some(),
+                agent_alive,
+                live_owned,
+                live_descendants,
+                queue_depth,
+                daemon_ancestor,
+            ) {
+                daemon.bus.publish(
+                    "surface.reap_denied",
+                    "surface",
+                    Some(sid),
+                    json!({"requested_surface": sid, "caller_surface": cs,
+                           "caller_pid": caller_pid, "reason": reason}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "reap_denied",
+                    &format!("surface.reap denied: {reason}"),
+                ));
+            }
+            // [MAJOR TOCTOU] close 직전 재검증 — 판정(위 sysinfo 수집) 후 유입된 신규 enqueue 가
+            // close 의 drain 으로 무음 폐기되는 유실 창을 값싼 재검 1회로 좁힌다(exited 는 단방향
+            // 래치 — 산 surface 오살 경로는 구조적으로 없고, 이 분기는 방어심화). 변화 시 abort.
+            {
+                let still_exited = surface.exited.load(Ordering::Relaxed);
+                let queue_depth_now = surface.pending_queue.lock().unwrap().len();
+                if let Some(reason) = manual_reap_recheck(still_exited, queue_depth_now) {
+                    daemon.bus.publish(
+                        "surface.reap_denied",
+                        "surface",
+                        Some(sid),
+                        json!({"requested_surface": sid, "caller_surface": cs,
+                               "caller_pid": caller_pid, "reason": reason}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "reap_denied",
+                        &format!("surface.reap denied: {reason}"),
+                    ));
+                }
+            }
+            match governance::close_surface(daemon, sid, governance::CloseCause::Reap) {
+                Ok(()) => {
+                    // 기존 이벤트 타입 surface.reaped 재사용 + additive payload — UI(main.ts)가
+                    // 이미 pane 정리 트리거로 구독 중이라 수동 회수도 GUI 에 즉시 반영된다.
+                    // watchdog 발행분({surface_ref, reason:"exited_grace_elapsed", role})은 불변.
+                    daemon.bus.publish(
+                        "surface.reaped",
+                        "surface",
+                        Some(sid),
+                        json!({"surface_ref": surface_ref(sid), "reason": "manual_reclaim",
+                               "role": target_role, "by_surface": cs, "by_role": caller_role}),
+                    );
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"surface_id": sid, "reaped": true, "role": target_role}),
+                    ))
+                }
                 Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
             }
         }
@@ -4409,25 +4665,42 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 만 비울 수 있다. 익명 발신(caller_pid None = 데몬 내부 경로)은 통과 — pane은 peer pid가
             // 항상 자기 surface로 해석되므로 익명을 위조할 수 없다.
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // ★G4(W4-C) exited_reclaim 예외 통과 표식 — queue.dropped 에 cleared_by/via additive.
+            let mut reclaim: Option<(u64, &str)> = None;
             if let Some(cs) = caller_sid {
                 if cs != sid {
-                    daemon.bus.publish(
-                        "queue.clear_denied",
-                        "queue",
-                        Some(sid),
-                        json!({"requested_surface": sid,
-                               "caller_surface": cs, "caller_pid": caller_pid}),
-                    );
-                    return Reply::Single(err_response(
-                        &id,
-                        "clear_denied",
-                        &format!(
-                            "queue.clear denied: caller (surface {cs}) may only clear its own surface queue, not surface {sid}"
-                        ),
-                    ));
+                    // ★G4(W4-C) 예외 하나: **권위 role(master/cso) 발신 + 대상 exited=true** 만
+                    // 통과(exited_reclaim). surface.reap 의 queue_depth=0 선행조건을 실제로 충족
+                    // 가능하게 하는 유일 경로다(회수 전 큐 인멸을 '명시 행위'로 강제하는 2단계
+                    // 설계). exited 한정이라 **살아있는 타 노드 큐 인멸(기존 위협모델)은 여전히
+                    // 전부 거부** — 거부 이벤트 queue.clear_denied 는 현행 그대로다.
+                    let caller_role = daemon
+                        .get_surface(cs)
+                        .and_then(|s| s.role.lock().unwrap().clone());
+                    let privileged = caller_role.as_deref().is_some_and(privileged_role);
+                    let target_exited = surface.exited.load(Ordering::Relaxed);
+                    if !(privileged && target_exited) {
+                        daemon.bus.publish(
+                            "queue.clear_denied",
+                            "queue",
+                            Some(sid),
+                            json!({"requested_surface": sid,
+                                   "caller_surface": cs, "caller_pid": caller_pid}),
+                        );
+                        return Reply::Single(err_response(
+                            &id,
+                            "clear_denied",
+                            &format!(
+                                "queue.clear denied: caller (surface {cs}) may only clear its own surface queue, not surface {sid}"
+                            ),
+                        ));
+                    }
+                    reclaim = Some((cs, "exited_reclaim"));
                 }
             }
             // ★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유.
+            // (★G4 W4-C: exited_reclaim 예외 경유 시에만 cleared_by/via additive — 감사 원장에
+            //  '누가 죽은 좌석의 큐를 비웠는지'가 남아 포렌식 가치 소실을 명시 행위로 기록한다.)
             let dropped: Vec<crate::state::QueueEntry> =
                 surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
@@ -4435,7 +4708,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "queue.dropped",
                     "queue",
                     Some(sid),
-                    crate::state::queue_dropped_payload("cleared", &dropped),
+                    crate::state::queue_dropped_payload("cleared", &dropped, reclaim),
                 );
             }
             // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
@@ -7268,6 +7541,338 @@ mod tests {
             daemon.surfaces.lock().unwrap()[&own].pending_queue.lock().unwrap().is_empty(),
             "자기 clear가 통과했는데 큐가 남아 있다"
         );
+    }
+
+    // ─────────── ★G4(W4-C): surface.reap — 수동 좌석 회수 7조건 게이트 핀 ───────────
+
+    fn reap_surface_rpc(daemon: &Arc<Daemon>, surface_id: u64, caller_pid: Option<u32>) -> Value {
+        let req = Request {
+            id: json!(1),
+            method: "surface.reap".into(),
+            params: json!({ "surface_id": surface_id }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// 대상 surface 를 '죽은 좌석' 픽스처로 만든다 — 자식 kill+wait(자손 0) 후 exited 래치·
+    /// 스탬프. watchdog 의 자력종료 감지와 동일한 최종 상태를 수동 재현(reader 스레드 불요).
+    fn mark_surface_dead(daemon: &Arc<Daemon>, sid: u64) {
+        let s = daemon.surfaces.lock().unwrap()[&sid].clone();
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        s.exited.store(true, Ordering::Relaxed);
+        *s.exited_at.lock().unwrap() = Some(std::time::Instant::now());
+    }
+
+    fn count_bus(daemon: &Arc<Daemon>, name: &str) -> usize {
+        daemon.bus.tail(60).iter().filter(|ev| ev["name"] == name).count()
+    }
+
+    /// 순수 판정부 매트릭스 — 7조건 각각 단독 미달 → 해당 사유 코드, 전부 충족 → None
+    /// (rollback_allowed_requires_all_three_conditions 관례 동형). grace 는 env 로 읽으므로
+    /// 공유 락 + 기본값 명시 고정(governance·handlers 의 grace env 터치 테스트와 직렬화).
+    #[test]
+    fn manual_reap_denial_seven_condition_matrix() {
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _env = crate::governance::ReapEnvGuard::set(&[
+            ("CYS_REAP_EXITED_GRACE_SECS", "60"),
+            ("CYS_REAP_EXITED_NONROLE_GRACE_SECS", "10"),
+        ]);
+        // 기준점: 전 조건 충족 → 허용(None). cso·master 둘 다 권위 role.
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, false, 0, 0, 0, false),
+            None,
+            "전 조건 충족(cso)인데 거부됐다"
+        );
+        assert_eq!(
+            manual_reap_denial(Some("master"), true, Some(60), true, false, 0, 0, 0, false),
+            None,
+            "전 조건 충족(master)인데 거부됐다"
+        );
+        // ② 권위 role 아님 — worker·role 부재 전부 거부(deny-by-default).
+        assert_eq!(
+            manual_reap_denial(Some("worker"), true, Some(60), true, false, 0, 0, 0, false),
+            Some("caller_role_forbidden")
+        );
+        assert_eq!(
+            manual_reap_denial(None, true, Some(60), true, false, 0, 0, 0, false),
+            Some("caller_role_forbidden"),
+            "caller role 부재 = 무증명 → 거부"
+        );
+        // ③ active surface 절대 불가 — 치명위험 앵커 ④.
+        assert_eq!(
+            manual_reap_denial(Some("cso"), false, Some(60), true, false, 0, 0, 0, false),
+            Some("active_surface")
+        );
+        // ④ 프로세스 잔존 3원(agent_meta 생존·원장 소유 pid·자손) 각각 단독으로 거부.
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, true, 0, 0, 0, false),
+            Some("agent_still_alive")
+        );
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, false, 1, 0, 0, false),
+            Some("agent_still_alive")
+        );
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, false, 0, 1, 0, false),
+            Some("agent_still_alive")
+        );
+        // ⑤ 큐 잔존 — 인멸은 queue.clear 명시 행위 2단계로만.
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, false, 0, 0, 1, false),
+            Some("queue_not_empty")
+        );
+        // ⑥ 데몬 조상 — 자기 조상 트리 kill(동반사망) 거부.
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(60), true, false, 0, 0, 0, true),
+            Some("daemon_ancestor")
+        );
+        // ⑦ grace — 미경과·스탬프 부재(무증명) 거부. 수치는 exited_surface_due 단일 정의처
+        //    (역할 60s·비역할 10s 경계 재확인 = 수동/자동 동일 잣대의 핀).
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(59), true, false, 0, 0, 0, false),
+            Some("grace_not_elapsed")
+        );
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, None, true, false, 0, 0, 0, false),
+            Some("grace_not_elapsed"),
+            "exited_at 스탬프 부재 = 무증명 → 거부"
+        );
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(9), false, false, 0, 0, 0, false),
+            Some("grace_not_elapsed"),
+            "비역할 grace(10s) 미경과 → 거부"
+        );
+        assert_eq!(
+            manual_reap_denial(Some("cso"), true, Some(10), false, false, 0, 0, 0, false),
+            None,
+            "비역할 grace 경계(10s) → 허용"
+        );
+    }
+
+    /// [MAJOR TOCTOU] close 직전 재검증 순수 판정 + 배선 소스핀 — 판정 후 유입 신규 enqueue 가
+    /// close drain 으로 무음 폐기되는 유실 창을 abort(state_changed)로 막는다.
+    #[test]
+    fn manual_reap_recheck_pins_state_changed_abort() {
+        assert_eq!(manual_reap_recheck(true, 0), None, "무변화 → 진행");
+        assert_eq!(
+            manual_reap_recheck(true, 1),
+            Some("state_changed"),
+            "판정 후 신규 enqueue → abort(메시지 무음 폐기 차단)"
+        );
+        assert_eq!(
+            manual_reap_recheck(false, 0),
+            Some("state_changed"),
+            "exited 반전(구조상 불가·방어심화) → abort"
+        );
+        // 배선 소스핀: surface.reap arm 몸통 안에서 재검증이 close_surface **앞**에 있다
+        // (governance 소스핀 관례 동형 — 로직 무변경 검증 전용).
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm_at = prod.find("\"surface.reap\" =>").expect("surface.reap arm 소실");
+        let arm_body = &prod[arm_at..];
+        let recheck_at = arm_body.find("manual_reap_recheck(").expect(
+            "surface.reap arm 이 close 직전 재검증(manual_reap_recheck)을 잃었다 — TOCTOU 유실 창 재개방",
+        );
+        let close_at = arm_body
+            .find("governance::close_surface(daemon, sid, governance::CloseCause::Reap)")
+            .expect("surface.reap 의 단일 파괴 경로(close_surface Reap) 위임 소실");
+        assert!(
+            recheck_at < close_at,
+            "재검증이 close_surface 뒤에 있다 — abort 가 파괴를 막지 못한다"
+        );
+    }
+
+    /// [회귀 핀·결함6 핵심] active surface(exited=false)는 cso 발신이라도 절대 회수 불가 —
+    /// 치명위험 앵커 ④의 박제. 거부 시 surface·roles 완전 무부작용 + 감사 이벤트
+    /// (reap_requested 1·reap_denied 1·surface.reaped 0)까지 고정한다.
+    #[test]
+    fn reap_denies_active_surface() {
+        let daemon = claim_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let victim = make_surface(&daemon, Some("master"));
+        let cso_pid = 995_101_u32;
+        bind_caller(&daemon, cso_pid, cso);
+
+        let resp = reap_surface_rpc(&daemon, victim, Some(cso_pid));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "살아있는 surface 에 대한 reap 이 통과했다 — 치명위험 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("reap_denied"));
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("active_surface"),
+            "거부 사유 코드(active_surface)가 메시지에 없다 (응답: {resp})"
+        );
+        assert!(
+            daemon.surfaces.lock().unwrap().contains_key(&victim),
+            "거부됐는데 victim surface 가 닫혔다"
+        );
+        assert_eq!(
+            daemon.roles.lock().unwrap().get("master").copied(),
+            Some(victim),
+            "거부됐는데 victim 의 role 매핑이 정리됐다"
+        );
+        assert_eq!(count_bus(&daemon, "surface.reap_requested"), 1, "요청 감사는 성패 무관 1건");
+        assert_eq!(count_bus(&daemon, "surface.reap_denied"), 1, "거부 감사 1건");
+        assert_eq!(count_bus(&daemon, "surface.reaped"), 0, "거부인데 reaped 발행");
+    }
+
+    /// 비권위 role(worker)의 reap 은 죽은 좌석이라도 거부 — 권위 집합은 privileged_role
+    /// 단일 정의처({master,cso}).
+    #[test]
+    fn reap_denies_non_privileged() {
+        let daemon = claim_daemon();
+        let worker = make_surface(&daemon, Some("worker-1"));
+        let dead = make_surface(&daemon, Some("worker-2"));
+        mark_surface_dead(&daemon, dead);
+        let worker_pid = 995_201_u32;
+        bind_caller(&daemon, worker_pid, worker);
+
+        let resp = reap_surface_rpc(&daemon, dead, Some(worker_pid));
+        assert_eq!(resp["ok"], json!(false), "worker 발신 reap 이 통과했다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("reap_denied"));
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("caller_role_forbidden"),
+            "사유 코드 caller_role_forbidden 부재 (응답: {resp})"
+        );
+        assert!(daemon.surfaces.lock().unwrap().contains_key(&dead), "거부인데 좌석이 닫혔다");
+    }
+
+    /// 익명 발신(caller_pid None = 데몬 내부·pane 밖)은 거부 — **익명을 통과시키는
+    /// surface.close 와 의도적으로 다른 계약**이다: 수동 회수는 '누가'가 감사의 핵심이고,
+    /// 데몬 내부 자동 회수는 watchdog 레인(reap_exited_surfaces)이 따로 있다(fail-closed).
+    #[test]
+    fn reap_denies_anonymous() {
+        let daemon = claim_daemon();
+        let dead = make_surface(&daemon, Some("worker-3"));
+        mark_surface_dead(&daemon, dead);
+
+        let resp = reap_surface_rpc(&daemon, dead, None);
+        assert_eq!(resp["ok"], json!(false), "익명 reap 이 통과했다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("reap_denied"));
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("caller_unresolved"),
+            "사유 코드 caller_unresolved 부재 (응답: {resp})"
+        );
+        assert!(daemon.surfaces.lock().unwrap().contains_key(&dead), "거부인데 좌석이 닫혔다");
+        assert_eq!(
+            count_bus(&daemon, "surface.reap_requested"),
+            0,
+            "caller 미해석은 요청 감사 이전에 끊긴다(reap_denied 만 발행)"
+        );
+        assert_eq!(count_bus(&daemon, "surface.reap_denied"), 1);
+    }
+
+    /// 허용 아크: exited + grace 경과 + agent 부재 + 큐 0 에 cso 발신 → 회수. role 점유
+    /// 해제 + **tombstones 미삽입**(부활 대상 유지 — P0-6 오묘비화 회귀 방지) +
+    /// surface.reaped{reason:"manual_reclaim", by_surface, by_role:"cso"} additive 발행.
+    #[test]
+    fn reap_allows_privileged_after_grace() {
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _env = crate::governance::ReapEnvGuard::set(&[("CYS_REAP_EXITED_GRACE_SECS", "0")]);
+        let daemon = claim_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let dead = make_surface(&daemon, Some("worker-9"));
+        mark_surface_dead(&daemon, dead);
+        let cso_pid = 995_301_u32;
+        bind_caller(&daemon, cso_pid, cso);
+
+        let resp = reap_surface_rpc(&daemon, dead, Some(cso_pid));
+        assert_eq!(resp["ok"], json!(true), "정당한 수동 회수가 막혔다 (응답: {resp})");
+        assert_eq!(resp["result"]["reaped"], json!(true));
+        assert_eq!(resp["result"]["role"], json!("worker-9"));
+        assert!(
+            !daemon.surfaces.lock().unwrap().contains_key(&dead),
+            "회수됐는데 surface 가 맵에 남아 있다"
+        );
+        assert!(
+            !daemon.roles.lock().unwrap().contains_key("worker-9"),
+            "회수 후에도 role 점유가 잔존한다(고아 좌석)"
+        );
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains("worker-9"),
+            "수동 reap 이 role 을 묘비화했다 — 부활 대상 유지 위반(P0-6 오묘비화 회귀)"
+        );
+        let reaped = daemon
+            .bus
+            .tail(60)
+            .into_iter()
+            .find(|ev| ev["name"] == "surface.reaped")
+            .expect("실행 감사(surface.reaped) 미발행");
+        assert_eq!(reaped["payload"]["reason"], json!("manual_reclaim"));
+        assert_eq!(reaped["payload"]["role"], json!("worker-9"));
+        assert_eq!(reaped["payload"]["by_surface"], json!(cso));
+        assert_eq!(reaped["payload"]["by_role"], json!("cso"));
+        assert_eq!(count_bus(&daemon, "surface.reap_requested"), 1, "요청 감사 1건");
+        assert_eq!(count_bus(&daemon, "surface.reap_denied"), 0, "허용인데 거부 감사 발행");
+    }
+
+    /// 2단계 시나리오(결함 6 봉인): ①큐 잔존 좌석 reap → queue_not_empty 거부(reap 은 큐를
+    /// 자동 drop 하지 않는다 — 인멸을 명시 행위로 강제) ②cso 의 queue.clear 가 exited 예외
+    /// (exited_reclaim)로 통과 — queue.dropped 에 cleared_by/via additive ③reap 재시도 통과.
+    /// 대조 핀: cso 라도 **살아있는** 타 surface 의 queue.clear 는 여전히 clear_denied.
+    #[test]
+    fn reap_denies_queue_nonempty_then_queue_clear_exited_reclaim() {
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _env = crate::governance::ReapEnvGuard::set(&[("CYS_REAP_EXITED_GRACE_SECS", "0")]);
+        let daemon = claim_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let dead = make_surface(&daemon, Some("worker-q"));
+        let live = make_surface(&daemon, Some("worker-live"));
+        mark_surface_dead(&daemon, dead);
+        let cso_pid = 995_401_u32;
+        bind_caller(&daemon, cso_pid, cso);
+        let entry = daemon.next_queue_entry("미배달 보고".into(), None, "test");
+        let entry_id = entry.id.clone();
+        daemon.surfaces.lock().unwrap()[&dead].pending_queue.lock().unwrap().push_back(entry);
+
+        // ① 큐 잔존 → reap 거부(무부작용 — 큐 보존).
+        let resp = reap_surface_rpc(&daemon, dead, Some(cso_pid));
+        assert_eq!(resp["ok"], json!(false), "큐 잔존인데 reap 통과 (응답: {resp})");
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or("").contains("queue_not_empty"),
+            "사유 코드 queue_not_empty 부재 (응답: {resp})"
+        );
+        assert_eq!(
+            daemon.surfaces.lock().unwrap()[&dead].pending_queue.lock().unwrap().len(),
+            1,
+            "거부됐는데 큐가 인멸됐다"
+        );
+
+        // 대조 핀: 살아있는 타 surface 큐는 cso 라도 인멸 불가(기존 위협모델 불변).
+        let resp = queue_clear_rpc(&daemon, live, Some(cso_pid));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "cso 가 살아있는 타 surface 큐를 인멸했다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("clear_denied"));
+
+        // ② exited 예외: cso 의 죽은 좌석 큐 clear 통과 + cleared_by/via additive 감사.
+        let resp = queue_clear_rpc(&daemon, dead, Some(cso_pid));
+        assert_eq!(resp["ok"], json!(true), "exited 예외 clear 가 막혔다 (응답: {resp})");
+        assert_eq!(resp["result"]["cleared"].as_u64(), Some(1));
+        let dropped = daemon
+            .bus
+            .tail(60)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.dropped")
+            .expect("queue.dropped 미발행");
+        assert_eq!(dropped["payload"]["reason"], json!("cleared"), "기존 키 reason 불변");
+        assert_eq!(dropped["payload"]["queue_entry_ids"], json!([entry_id]));
+        assert_eq!(dropped["payload"]["cleared_by"], json!(cso), "additive cleared_by=발신 cso");
+        assert_eq!(dropped["payload"]["via"], json!("exited_reclaim"), "additive via 태그");
+
+        // ③ 큐 0 → reap 재시도 통과.
+        let resp = reap_surface_rpc(&daemon, dead, Some(cso_pid));
+        assert_eq!(resp["ok"], json!(true), "큐 정리 후 reap 이 막혔다 (응답: {resp})");
+        assert!(!daemon.surfaces.lock().unwrap().contains_key(&dead));
     }
 
     // ─────────── ★G1(W2-E): queue.deliver RPC — 게이트 ①②·응답 계약 핀 ───────────

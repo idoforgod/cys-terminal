@@ -272,6 +272,14 @@ enum Command {
         #[arg(long)]
         reap: bool,
     },
+    /// ★G4(W4-C): 죽은(exited) 좌석 수동 회수 — surface.reap RPC(권위 role 전용·7조건 게이트)
+    ///
+    /// close-surface(자기/생성자 한정)와 별개 계약: master/cso pane 에서 타 노드의 **죽은**
+    /// 좌석을 즉시 회수한다(active surface 는 어떤 조합에서도 거부). exit 0=회수 완료 ·
+    /// 7=게이트 거부(사유 stderr — claim-role rc=7 계열) · 1=오류.
+    ReapSurface {
+        surface: String,
+    },
     /// ★W2/A-S3: 역할을 topology 묘비에 심는다(의도적 폐역). 데몬이 묘비 유일 작성자(단일 작성자 원칙).
     #[command(name = "tombstone")]
     Tombstone {
@@ -729,6 +737,47 @@ fn queue_deliver_exit_code(err: &str) -> i32 {
         EXIT_QUEUE_GATE_REFUSED
     } else {
         1
+    }
+}
+
+/// ★G4(W4-C) reap-surface 거부 exit 판정(순수) — request() 에러 문자열("code: message")의
+/// code 접두로 '게이트 거부(reap_denied)'=exit 7 과 '오류(통신·not_found·invalid)'=exit 1 을
+/// 가른다(queue_deliver_exit_code 관례 동형 · rc=7 = claim-role 정당거부·EXIT_UNSAFE_CORE_
+/// REFUSED 선례 계열). 사유 코드(caller_unresolved|caller_role_forbidden|active_surface|
+/// agent_still_alive|queue_not_empty|daemon_ancestor|grace_not_elapsed|state_changed)는
+/// 메시지에 실려 소비 스크립트(javis_reap_exited.py)가 사유별 분기한다.
+fn reap_surface_exit_code(err: &str) -> i32 {
+    if err.starts_with("reap_denied:") {
+        EXIT_QUEUE_GATE_REFUSED
+    } else {
+        1
+    }
+}
+
+/// ★G4(W4-C) `cys reap-surface <ref>` — surface.reap RPC 호출. exit 0=회수 완료 ·
+/// 7=게이트 거부(사유 코드 stderr) · 1=오류. close-surface 의미(자기/생성자 한정)는
+/// 불변 유지 — 소비자 계약 보존(별도 동사·별도 RPC).
+fn run_reap_surface(surface: &str) -> i32 {
+    let Some(sid) = parse_surface_ref(surface) else {
+        eprintln!("error: invalid surface ref: {surface}");
+        return 1;
+    };
+    match request("surface.reap", json!({"surface_id": sid})) {
+        Ok(r) => {
+            println!(
+                "reaped {} (manual reclaim{})",
+                surface,
+                r["role"]
+                    .as_str()
+                    .map(|role| format!(", role {role} released"))
+                    .unwrap_or_default()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            reap_surface_exit_code(&e)
+        }
     }
 }
 
@@ -2450,6 +2499,9 @@ fn run(command: Command) -> i32 {
                     let _ = r;
                 })
             }),
+
+        // ★G4(W4-C): 수동 좌석 회수 — 게이트 거부는 exit 7(사유 stderr), 오류는 1.
+        Command::ReapSurface { surface } => return run_reap_surface(&surface),
 
         Command::Tombstone { role, remove, dept } => {
             if dept {
@@ -12021,6 +12073,38 @@ mod tests {
         // 접두 판정 핀: 게이트 코드가 문자열 중간·유사 접두에 있어도 오분류하지 않는다.
         assert_eq!(queue_deliver_exit_code("paused_x: y"), 1, "유사 접두는 게이트 아님");
         assert_eq!(queue_deliver_exit_code("error: paused: nested"), 1, "중간 등장은 게이트 아님");
+    }
+
+    /// ★G4(W4-C) reap-surface 게이트 exit 계약 핀 — reap_denied(사유 8종 어느 것이든) = 7
+    /// (claim-role rc=7 선례 계열 · 예약 {0,1,2,64} 비충돌), 그 외(not_found·invalid·통신) = 1.
+    /// 소비 스크립트(javis_reap_exited.py)가 rc=7 + stderr 사유 코드로 분기하는 계약의 CLI 측.
+    #[test]
+    fn reap_surface_gate_exit_is_seven_and_unreserved() {
+        // 게이트 거부(reap_denied 접두) — 사유 코드 8종 전부 exit 7.
+        for reason in [
+            "caller_unresolved",
+            "caller_role_forbidden",
+            "active_surface",
+            "agent_still_alive",
+            "queue_not_empty",
+            "daemon_ancestor",
+            "grace_not_elapsed",
+            "state_changed",
+        ] {
+            let err = format!("reap_denied: surface.reap denied: {reason}");
+            assert_eq!(reap_surface_exit_code(&err), 7, "{err}");
+        }
+        // 게이트 밖(대상 없음·파라미터·통신·프레임) → 일반 오류 1.
+        for err in [
+            "not_found: surface 9 not found",
+            "invalid_params: missing surface_id",
+            "abi: LenMismatch",
+            "connect: no daemon",
+        ] {
+            assert_eq!(reap_surface_exit_code(err), 1, "{err}");
+        }
+        // 접두 판정 핀 — 중간 등장은 게이트 아님.
+        assert_eq!(reap_surface_exit_code("error: reap_denied: nested"), 1);
     }
 
     /// ★G3-축3 위험 요약 핀: 소실 키워드 계수와 사라질 ours 조항 줄이 적시되고, 무관 줄은

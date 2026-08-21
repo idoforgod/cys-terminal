@@ -2825,7 +2825,10 @@ fn reap_exited_enabled() -> bool {
 /// 종료 후 경과초가 grace 이상이면 회수 대상. grace는 비정상 크래시의 포렌식·노드복구
 /// 윈도우 — 역할 노드(worker/cso/reviewer/master)는 길게(기본 60초), 비역할(스크래치·
 /// one-shot)은 짧게(기본 10초). 경계값을 박제하기 위해 순수 함수로 분리한다.
-fn exited_surface_due(has_role: bool, elapsed_secs: u64) -> bool {
+/// ★G4(W4-C) pub(crate) 격상: handlers `manual_reap_denial`(수동 reap RPC의 grace 판정)이
+/// 재사용한다 — 수치 단일 정의처. 수동/자동 reap이 다른 잣대를 쓰면 '수동은 통과, 자동은
+/// 미달' 드리프트가 난다(grace 값 변경은 반드시 이 함수 한 곳에서만).
+pub(crate) fn exited_surface_due(has_role: bool, elapsed_secs: u64) -> bool {
     let grace = if has_role {
         env_u64("CYS_REAP_EXITED_GRACE_SECS", 60)
     } else {
@@ -3053,7 +3056,7 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
             "queue.dropped",
             "queue",
             Some(id),
-            crate::state::queue_dropped_payload("surface_closed", &dropped),
+            crate::state::queue_dropped_payload("surface_closed", &dropped, None),
         );
     }
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
@@ -3755,6 +3758,45 @@ fn deliver_queued(
         if deliver_head_locked(daemon, &s, false, overdue, None).is_some() {
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
+        }
+    }
+}
+
+/// reap 계열 테스트는 CYS_REAP_EXITED*·CYS_ROLE_DEADMAN* env를 만지므로 직렬화한다.
+/// ★G4(W4-C): governance::tests 사설 static 에서 **크레이트 테스트 공용**(pub(crate))으로
+/// 격상 — handlers::tests 의 수동 reap 테스트도 같은 env 를 읽으므로(grace 판정
+/// exited_surface_due 재사용), 모듈별 락 두 개로는 서로를 직렬화하지 못한다.
+#[cfg(test)]
+pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
+/// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
+#[cfg(test)]
+pub(crate) struct ReapEnvGuard {
+    prev: Vec<(&'static str, Option<String>)>,
+}
+#[cfg(test)]
+impl ReapEnvGuard {
+    pub(crate) fn set(vars: &[(&'static str, &str)]) -> Self {
+        let prev = vars
+            .iter()
+            .map(|(k, v)| {
+                let old = std::env::var(k).ok();
+                std::env::set_var(k, v);
+                (*k, old)
+            })
+            .collect();
+        ReapEnvGuard { prev }
+    }
+}
+#[cfg(test)]
+impl Drop for ReapEnvGuard {
+    fn drop(&mut self) {
+        for (k, old) in &self.prev {
+            match old {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 }
@@ -5744,9 +5786,16 @@ mod tests {
 
     /// reap 경계: exited 후 grace 미만이면 보존(포렌식·복구 윈도우), 이상이면 회수.
     /// 역할 노드는 60초, 비역할은 10초로 더 빨리 정리 — 자력종료 surface 누수 차단의 핵심 불변식.
+    /// ★G4(W4-C): 공유 락 + 기본값 명시 고정 — grace env 를 만지는 테스트(governance·handlers
+    /// 수동 reap)와 직렬화해, env 설정 창과 겹칠 때의 경계값 flake 를 소거한다(핀 강화·무약화).
     #[test]
     fn exited_surface_due_respects_role_grace() {
         use super::exited_surface_due;
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_REAP_EXITED_GRACE_SECS", "60"),
+            ("CYS_REAP_EXITED_NONROLE_GRACE_SECS", "10"),
+        ]);
         // 역할 노드: 기본 60초 grace — 경계 직전 보존, 경계에서 회수
         assert!(!exited_surface_due(true, 59), "역할 노드는 grace 내(59s)에 보존돼야");
         assert!(exited_surface_due(true, 60), "역할 노드는 grace 경계(60s)에서 회수돼야");
@@ -5763,37 +5812,10 @@ mod tests {
     };
     use std::sync::atomic::Ordering as AtomicOrdering;
 
-    /// reap 계열 테스트는 CYS_REAP_EXITED* env를 만지므로 직렬화(다른 env-터치 테스트와 충돌 방지).
-    static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// CYS_REAP_EXITED* env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
-    /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
-    struct ReapEnvGuard {
-        prev: Vec<(&'static str, Option<String>)>,
-    }
-    impl ReapEnvGuard {
-        fn set(vars: &[(&'static str, &str)]) -> Self {
-            let prev = vars
-                .iter()
-                .map(|(k, v)| {
-                    let old = std::env::var(k).ok();
-                    std::env::set_var(k, v);
-                    (*k, old)
-                })
-                .collect();
-            ReapEnvGuard { prev }
-        }
-    }
-    impl Drop for ReapEnvGuard {
-        fn drop(&mut self) {
-            for (k, old) in &self.prev {
-                match old {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    // reap 계열 env 직렬화 락·원복 가드 — ★G4(W4-C) 모듈 스코프(pub(crate)·cfg(test))로
+    // 격상해 handlers::tests(수동 reap RPC의 grace 판정 테스트)와 **한 락을 공유**한다.
+    // 모듈별 사설 락 두 개는 서로를 직렬화하지 못해 CYS_REAP_EXITED_GRACE_SECS 경합 flake 가 난다.
+    use super::{ReapEnvGuard, REAP_ENV_LOCK};
 
     /// 격리 데몬 — temp 소켓 디렉터리(개인 경로 하드코딩 금지).
     fn drill_daemon(tag: &str) -> Arc<Daemon> {

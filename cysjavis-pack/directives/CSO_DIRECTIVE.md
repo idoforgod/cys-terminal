@@ -134,7 +134,8 @@ reap·watchdog·하트비트 같은 **자가치유 주기 잡 생존**의 감시
 
 ## [절대규칙 — exited surface 자동 reap] (제품 기본 절차 · 즉시성 강화 포함)
 
-- **상설 의무**: CSO는 능동 모니터링 사이클마다 `cys list`를 점검해 `exited=true`(데몬 권위 판정 = 프로세스 종료된 죽은 pane) surface를 발견하면 **즉시 `cys close-surface <surface> --reap`로 자동 회수(kill)**한다. 이는 사전 승인된 청소 작업이다 — master 개별 승인 불요.
-- **★즉시성(제품 기본 절차)**: 사이클 폴링만 기다리지 않는다 — `cys events` 구독 중 surface 종료(`surface.exited`류) 이벤트를 수신하면 **수신 즉시** 위 reap을 집행한다([surface exited] 표시 pane이 다음 사이클까지 잔존하는 것 금지). 집행은 결정론 도구 `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_reap_exited.py"` 1콜로 한다(자동 스냅샷 `round/reap_log/` 보존 포함) — 판단은 이 스크립트의 exit code·stdout JSON만이 사실이다(화면 파싱·자연어 재추론 금지).
-- **안전 경계(불가침·kill-safety)**: 오직 `exited=true`만 대상. **live(exited=false) surface는 절대 자동 kill 금지** — live 노드 강제종료는 master 승인 필요. '미등록=잔재'로 단정 금지. 판정 근거는 오직 데몬의 exited 플래그(화면 파싱·추측 금지).
-- **--reap 사유**: 죽은 잔재 회수 모드(묘비 미생성·부활 대상 유지)라 의도적 폐역(OwnerClose)과 구분된다. 사용자 데이터·작업 산출물은 삭제하지 않는다(§5 금지선 불변).
+- **상설 의무**: CSO는 능동 모니터링 사이클마다 `cys list`를 점검해 `exited=true`(데몬 권위 판정 = 프로세스 종료된 죽은 pane) surface를 발견하면 **즉시 `cys reap-surface <surface>`로 자동 회수(kill)**한다(★G4: 전용 RPC `surface.reap` — 권위 role(master/cso) 게이트·7조건 판정·감사 이벤트. 구 바이너리에 명령이 없으면 기존 `cys close-surface <surface> --reap` 폴백). 이는 사전 승인된 청소 작업이다 — master 개별 승인 불요.
+- **★즉시성(제품 기본 절차)**: 사이클 폴링만 기다리지 않는다 — `cys events` 구독 중 surface 종료(`surface.exited`류) 이벤트를 수신하면 **수신 즉시** 위 reap을 집행한다([surface exited] 표시 pane이 다음 사이클까지 잔존하는 것 금지). 집행은 결정론 도구 `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_reap_exited.py"` 1콜로 한다(자동 스냅샷 `round/reap_log/` 보존 + 신/구 바이너리 분기·거부 사유별 처리 내장) — 판단은 이 스크립트의 exit code·stdout JSON만이 사실이다(화면 파싱·자연어 재추론 금지).
+- **거부 사유별 처리(rc=7 게이트 거부는 스크립트가 자동 분기)**: `grace_not_elapsed`/`state_changed`=실패 아님(grace 기본 60s는 포렌식·복구 창 — 데몬 자동 reap 레인·다음 사이클이 수렴) · `queue_not_empty`=`cys queue clear <surface>`(권위+exited 예외) 선행 후 재시도 2단계 · `caller_*`=이 도구를 **CSO pane 안**에서 실행하라는 신호(익명 수동 회수 금지 계약). 반복 거부만 master 보고 대상이다.
+- **안전 경계(불가침·kill-safety)**: 오직 `exited=true`만 대상. **live(exited=false) surface는 절대 자동 kill 금지** — 데몬 게이트도 `active_surface`로 이중 거부한다(치명위험 앵커 ④). live 노드 강제종료는 master 승인 필요. '미등록=잔재'로 단정 금지. 판정 근거는 오직 데몬의 exited 플래그(화면 파싱·추측 금지).
+- **reap 사유**: 죽은 잔재 회수 모드(묘비 미생성·부활 대상 유지)라 의도적 폐역(OwnerClose)과 구분된다. 사용자 데이터·작업 산출물은 삭제하지 않는다(§5 금지선 불변).
