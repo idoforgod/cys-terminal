@@ -937,6 +937,11 @@ pub fn ownership_name(rel: &str) -> &'static str {
 
 /// 병합 대기 원장 파일명 (pack_dir 루트 · install-manifest 형제 · 매니페스트 비등재라 prune 불가침).
 pub const MERGE_PENDING_FILE: &str = ".merge-pending.json";
+/// ★G3-축3 병합 감사 원장(append-only) — take-new/keep-mine/force 해소·거부의 사후 추적.
+/// 매니페스트 비등재 dotfile 이라 prune 불가침이며, apply_pack_transactional backup_set 에도
+/// **의도적 비등재**다: 감사는 rollback 을 생존해야 한다(MERGE_PENDING_FILE 은 상태라 저널
+/// 편입이 맞지만, 원장은 되감기면 거부·강제 라인이 소거돼 원장이 아니게 된다).
+pub const MERGE_AUDIT_FILE: &str = ".merge-audit.jsonl";
 /// pristine 미러 디렉터리 — 마지막 적용 vendor 원본(3-way base). 매니페스트 비등재.
 pub const PRISTINE_DIR: &str = ".pristine";
 
@@ -1047,6 +1052,26 @@ pub fn save_merge_pending(dir: &Path, pending: &serde_json::Map<String, serde_js
     if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone())) {
         let _ = write_atomic(&dir.join(MERGE_PENDING_FILE), json.as_bytes());
     }
+}
+
+/// ★G3-축3 감사 원장 1줄 append. 다중 프로세스 appender 전제라 O_APPEND + **라인당 단일
+/// write_all** 규율 — 커널 append 원자성으로 라인 교차를 막는다(프로세스 내 락으로는 부족).
+/// serde 직렬화가 문자열 내 개행을 이스케이프하므로 엔트리 1건 = 물리 1줄이 보장된다.
+/// write_atomic(임시파일 rename)을 쓰지 않는 이유: 교체 쓰기는 동시 appender 의 라인을
+/// 유실시킨다 — append-only 원장은 append 로만 자란다.
+pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), String> {
+    use std::io::Write;
+    let mut line =
+        serde_json::to_string(entry).map_err(|e| format!("감사 엔트리 직렬화 실패: {e}"))?;
+    line.push('\n');
+    let path = dir.join(MERGE_AUDIT_FILE);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("감사 원장 열기 실패 {}: {e}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
 
 /// install 드라이런 리포트(④ 투명성) — `cys pack-plan` 이 설치 **전에** 사용자에게 보여준다.
@@ -1966,6 +1991,7 @@ where
         .collect();
     backup_set.extend(side_paths);
     backup_set.insert(MERGE_PENDING_FILE.to_string());
+    // ★MERGE_AUDIT_FILE 은 의도적 비등재 — append-only 감사 원장은 rollback 을 생존한다(G3-축3).
     write_journal(target_version, &backup_set)?;
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
@@ -3418,6 +3444,41 @@ mod tests {
         assert_eq!(pv.trim(), "1.0.0", ".pack-version 불변이어야(미커밋)");
         assert!(!journal_exists, "rollback 후 저널 잔존");
         assert_eq!(pre_fp, post_fp, "rollback이 pre-state로 복원 못함(부분적용 잔존)");
+    }
+
+    /// ★G3-축3 감사 원장 수명주기 핀: append-only(누적·트렁케이트 0)·라인당 유효 JSON 1건 +
+    /// 성공 트랜잭션(prune 스윕)·실패 트랜잭션(rollback) 양쪽 생존. backup_set 에 MERGE_AUDIT_FILE
+    /// 을 등재하면 rollback 이 거부·강제 라인을 되감아 소거한다 — 이 핀이 그 회귀를 막는다.
+    #[test]
+    fn merge_audit_appends_and_survives_transactions() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let (base, pd, _env) = txn_prestate("audit", &[("README.md", "OLD")], "1.0.0");
+        let e1 = serde_json::json!({"ts": 1, "file": "soul.md", "action": "take-new"});
+        append_merge_audit(&pd, &e1).unwrap();
+        // ① 성공 트랜잭션 후에도 원장 잔존 — 매니페스트 비등재 dotfile 은 prune 불가침.
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
+        apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || Ok(()))
+            .expect("정상 트랜잭션 실패");
+        let after_ok = std::fs::read_to_string(pd.join(MERGE_AUDIT_FILE)).unwrap();
+        assert_eq!(after_ok.lines().count(), 1, "성공 트랜잭션이 감사 원장을 건드렸다");
+        // ② append 누적(truncate 0).
+        let e2 = serde_json::json!({"ts": 2, "file": "soul.md", "action": "take-new", "flags": ["refused"]});
+        append_merge_audit(&pd, &e2).unwrap();
+        // ③ mid-apply fault 로 rollback 을 타도 원장은 생존(backup_set 비등재 계약).
+        let bad: Vec<(&str, &str)> = vec![("collide", "X"), ("collide/child", "Y")];
+        assert!(
+            apply_pack_transactional(&bad, "3.0.0", &test_free_state("3.0.0"), None, || Ok(()))
+                .is_err(),
+            "fault 주입이 성공으로 둔갑"
+        );
+        let after_rb = std::fs::read_to_string(pd.join(MERGE_AUDIT_FILE)).unwrap();
+        let lines: Vec<&str> = after_rb.lines().collect();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(lines.len(), 2, "rollback 이 감사 라인을 되감았다(backup_set 등재 금지)");
+        for l in &lines {
+            let v: serde_json::Value = serde_json::from_str(l).expect("라인당 유효 JSON 1건");
+            assert!(v.get("action").is_some(), "action 필드 부재: {l}");
+        }
     }
 
     /// v4 §3 재배치 핀(R3 codex blocking 결착): record_accepted는 post-commit — 실패해도

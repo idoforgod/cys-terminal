@@ -98,11 +98,30 @@ pub fn sanitize_local_directive(raw: &str) -> (String, Vec<String>) {
 /// 사라지면 위반. 한쪽에만 있는 키워드는 정당한 진화(추가·개편)일 수 있어 요구하지 않는다 —
 /// 존재 검사라 재문구화(rewording)는 통과시키되 통째 소실은 차단하는, 오탐 낮은 안전측 핀.
 /// 반환 Err = 소실 키워드 목록(병합 적용을 거부해야 함 — fail-closed).
+///
+/// ★항진성 주의(G3-축3): 이 술어는 **3-way 병합 전용**이다. merged==theirs 인 전량 교체
+/// (take-new·rollback)에서는 조건이 ours∧theirs∧¬theirs=⊥ 로 구조적 항진(항상 Ok)이라
+/// 어떤 소실도 잡지 못한다 — 교체 경로는 verify_constitution_takeover 를 써야 한다.
 pub fn verify_constitution_merge(ours: &str, theirs: &str, merged: &str) -> Result<(), Vec<String>> {
     let (lo, lt, lm) = (ours.to_lowercase(), theirs.to_lowercase(), merged.to_lowercase());
     let lost: Vec<String> = SAFETY_KEYWORDS
         .iter()
         .filter(|kw| lo.contains(*kw) && lt.contains(*kw) && !lm.contains(*kw))
+        .map(|kw| kw.to_string())
+        .collect();
+    if lost.is_empty() { Ok(()) } else { Err(lost) }
+}
+
+/// ★G3-축3(결함 5): 전량 교체(take-new·rollback) 전용 안전핵 소실 검증. 교체에는 병합과 달리
+/// "양측 합의" 개념이 없다 — 결과본이 통째로 theirs 가 되므로, **내 것(ours)에만 있는** 안전핵
+/// 키워드가 theirs 에 없으면 그 조항은 흔적 없이 사라진다. ours-only 소실을 fail-closed 로
+/// 잡되, theirs 에 키워드가 잔존하면(재문구화 포함) 통과 — merge 술어와 같은 존재-검사 결이라
+/// 오탐이 낮다. 마커 집합은 SAFETY_KEYWORDS 단일 SOT 재사용. 반환 Err = 소실 키워드 목록.
+pub fn verify_constitution_takeover(ours: &str, theirs: &str) -> Result<(), Vec<String>> {
+    let (lo, lt) = (ours.to_lowercase(), theirs.to_lowercase());
+    let lost: Vec<String> = SAFETY_KEYWORDS
+        .iter()
+        .filter(|kw| lo.contains(*kw) && !lt.contains(*kw))
         .map(|kw| kw.to_string())
         .collect();
     if lost.is_empty() { Ok(()) } else { Err(lost) }
@@ -352,5 +371,29 @@ mod tests {
         let theirs_v2 = "- autopilot denylist"; // vendor 가 eval-driven 조항 제거
         let merged_v2 = "- autopilot denylist";
         assert!(verify_constitution_merge(ours_only, theirs_v2, merged_v2).is_ok());
+    }
+
+    /// ★G3-축3 takeover 핀: merge 술어 ④(ours-only 키워드 무요구)의 **반전** — 전량 교체는
+    /// 결과본에 ours 가 남지 않으므로 ours-only 소실이 곧 안전핵 소실이다(fail-closed).
+    #[test]
+    fn constitution_takeover_detects_ours_only_loss() {
+        let ours = "- autopilot denylist 준수\n- kill-switch: 주인 입력 즉시 정지\n- 커스텀 조항";
+        // ① theirs 가 ours 의 전 안전핵 키워드 보유(재문구화 포함) → Ok.
+        let theirs_ok = "- denylist(autopilot 정지 경계) 강화\n- kill-switch 재선언\n- vendor 신규";
+        assert!(verify_constitution_takeover(ours, theirs_ok).is_ok());
+        // ② theirs 에 kill-switch 계열 부재 → Err 에 소실 키워드 적시, 잔존 키워드는 미포함.
+        let theirs_bad = "- autopilot denylist 준수\n- vendor 신규 조항";
+        let lost = verify_constitution_takeover(ours, theirs_bad).unwrap_err();
+        assert!(lost.iter().any(|k| k.contains("kill")), "kill-switch 소실 검출: {lost:?}");
+        assert!(!lost.iter().any(|k| k == "denylist"), "잔존 키워드가 소실로 오탐: {lost:?}");
+        // ③ theirs-only 신규 키워드는 무요구 — vendor 의 안전핵 추가는 정당한 진화.
+        assert!(verify_constitution_takeover("무관 조항뿐", "- 새 recovery 조항").is_ok());
+        // ④ 회귀 핀(항진성 실증): 같은 소실 픽스처를 merge 술어에 merged==theirs 로 넣으면
+        //    구조적으로 Ok(ours∧theirs∧¬theirs=⊥) — takeover 경로가 merge 술어를 재사용하면
+        //    안 되는 이유의 박제. 이 단언이 깨지면 술어 계약이 바뀐 것이니 설계 주석부터 갱신하라.
+        assert!(
+            verify_constitution_merge(ours, theirs_bad, theirs_bad).is_ok(),
+            "merge 술어가 takeover 소실을 잡기 시작 — 항진성 전제 붕괴"
+        );
     }
 }

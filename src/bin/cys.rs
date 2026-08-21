@@ -410,6 +410,13 @@ enum Command {
         /// 를 vendor 본으로 강제 교체 — 승격 파괴를 승인하는 명시 플래그(기본 거부)
         #[arg(long)]
         force_vendor: bool,
+        /// 해소를 적용하지 않고 검증·위험 요약·예정 판정까지만 수행(쓰기 0 — --take-new/--keep-mine 전용)
+        #[arg(long)]
+        dry_run: bool,
+        /// (G3-축3 안전핵 게이트 override) 헌법 파일 take-new 가 안전핵 소실을 검출해도 강제 진행 —
+        /// 소실 승인 명시 플래그(기본 거부 rc=7 · 검사·감사 원장 기록은 계속 수행)
+        #[arg(long)]
+        force_unsafe_core: bool,
     },
     /// 팩 상대경로의 소유권 등급(system|user|seed-once) 판정 — pack-guard hook·스크립트용 결정론 조회
     #[command(name = "pack-ownership")]
@@ -433,6 +440,10 @@ enum Command {
         /// 를 보존본으로 강제 후진 — 승격 파괴를 승인하는 명시 플래그(기본 거부)
         #[arg(long)]
         force_vendor: bool,
+        /// (G3-축3 안전핵 게이트 override · take-new 대칭) 헌법 파일 복원이 현재본 대비 안전핵
+        /// 소실을 검출해도 강제 진행 — 소실 승인 명시 플래그(기본 거부 rc=7)
+        #[arg(long)]
+        force_unsafe_core: bool,
     },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
@@ -2154,8 +2165,14 @@ fn run(command: Command) -> i32 {
             return run_pack_update(from, manifest_url, dry_run);
         }
         Command::PackPlan { force } => return run_pack_plan(force),
-        Command::PackMerge { file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor } => {
-            return run_pack_merge(file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor);
+        Command::PackMerge {
+            file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor, dry_run,
+            force_unsafe_core,
+        } => {
+            return run_pack_merge(
+                file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor, dry_run,
+                force_unsafe_core,
+            );
         }
         Command::PackOwnership { rel, quiet } => {
             // 결정론 조회 전용(쓰기 0) — 분류 SOT 는 pack::ownership() 한 곳(pack-guard hook 이 소비).
@@ -2176,8 +2193,8 @@ fn run(command: Command) -> i32 {
             }
             return 0;
         }
-        Command::PackRollback { file, yes, force_vendor } => {
-            return run_pack_rollback(file, yes, force_vendor);
+        Command::PackRollback { file, yes, force_vendor, force_unsafe_core } => {
+            return run_pack_rollback(file, yes, force_vendor, force_unsafe_core);
         }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
@@ -10404,6 +10421,63 @@ fn ceo_vendor_overwrite_rejection(
     ))
 }
 
+/// ★G3-축3 안전핵 게이트 거부 exit — 예약 규약({0,1,2,64} 충돌 금지 · clap 사용오류=2)과
+/// 분리해, 신 팩+구 바이너리 스큐에서 '플래그 부재(clap 2)'와 '게이트 거부'가 소비 스크립트에서
+/// 구분되게 한다. 값 7 = claim-role 정당거부(rc=7) 선례 계열(타입드 거부).
+const EXIT_UNSAFE_CORE_REFUSED: i32 = 7;
+
+/// ★G3-축3 위험 diff 요약(순수) — 소실 키워드와, 교체로 사라질 ours 쪽 조항 줄만 적시한다.
+/// 전체 diff 가 아닌 이유: 게이트 화면의 판단 재료는 "무엇이 사라지는가" 하나이고, 전문 diff 는
+/// 헌법 파일에서 수백 줄이라 오히려 소실 조항을 묻는다.
+fn takeover_risk_summary(ours: &str, lost: &[String]) -> String {
+    let mut s = format!(
+        "⚠ 안전핵 소실 {}건: {}\n  교체로 사라지는 현행 조항:\n",
+        lost.len(),
+        lost.join(", ")
+    );
+    for line in ours.lines() {
+        let ll = line.to_lowercase();
+        let hits: Vec<&str> = lost
+            .iter()
+            .filter(|k| ll.contains(k.as_str()))
+            .map(|k| k.as_str())
+            .collect();
+        if !hits.is_empty() {
+            s.push_str(&format!("  - [{}] {}\n", hits.join(","), line.trim()));
+        }
+    }
+    s
+}
+
+/// ★G3-축3 감사 엔트리 조립(순수 형태 — 시각·env 읽기만). actor 는 os_user 하나만 기록한다:
+/// env 유래(USER/USERNAME)라 자기신고 값이며 인증이 아니라 참고 정보다 — cys_role 등 추가
+/// 자기신고 신원은 신뢰 불가 데이터라 싣지 않는다.
+fn merge_audit_entry(
+    rel: &str,
+    action: &str,
+    before: &str,
+    after: &str,
+    verify_result: &str,
+    flags: &[String],
+) -> serde_json::Value {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let os_user = std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" })
+        .unwrap_or_else(|_| "unknown".into());
+    json!({
+        "ts": ts,
+        "file": rel,
+        "action": action,
+        "actor_os_user": os_user,
+        "before_sha256": cys::pack::content_hash_pub(before),
+        "after_sha256": cys::pack::content_hash_pub(after),
+        "verify_result": verify_result,
+        "flags": flags,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pack_merge(
     file: Option<String>,
@@ -10414,9 +10488,21 @@ fn run_pack_merge(
     propose: bool,
     yes: bool,
     force_vendor: bool,
+    dry_run: bool,
+    force_unsafe_core: bool,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
     let mut pending = cys::pack::load_merge_pending(&dir);
+    // ★G3-축3 플래그 결합 제약 — 파괴 승인·드라이런 플래그의 침묵 무시는 오사용을 감추므로
+    //   해당 동사 밖에서는 fail-closed 로 거절한다(적용된 척 0).
+    if force_unsafe_core && !take_new {
+        eprintln!("--force-unsafe-core 는 --take-new 전용(안전핵 소실 승인 플래그) — 조합을 확인하라");
+        return 1;
+    }
+    if dry_run && !(take_new || keep_mine) {
+        eprintln!("--dry-run 은 --take-new/--keep-mine 과 함께 사용(해소 예정 판정·쓰기 0)");
+        return 1;
+    }
     let Some(rel) = file else {
         // 목록 모드
         if pending.is_empty() {
@@ -10478,6 +10564,29 @@ fn run_pack_merge(
         cys::pack::save_merge_pending(&dir, pending);
         let _ = std::fs::remove_file(dir.join(format!("{rel}{side_suffix}")));
     };
+    // ★G3-축3 감사 원장 — 해소·거부 사실의 append 기록. 기록 실패는 loud 경고 후 계속
+    //   (감사는 관측이지 검증 게이트가 아니다 — 기록 불능이 해소 자체를 봉쇄하면 병합 원장이
+    //   영구 적체된다. save_merge_pending best-effort 전례와 같은 결).
+    let audit = |entry: &serde_json::Value| {
+        if let Err(e) = cys::pack::append_merge_audit(&dir, entry) {
+            eprintln!("⚠ 감사 원장 기록 실패(해소는 계속): {e}");
+        }
+    };
+    // 감사 flags — 판단에 영향을 준 승인 플래그만(추적의 재료).
+    let flag_list = |extra: &[&str]| -> Vec<String> {
+        let mut f: Vec<String> = Vec::new();
+        if yes {
+            f.push("yes".into());
+        }
+        if force_vendor {
+            f.push("force-vendor".into());
+        }
+        if force_unsafe_core {
+            f.push("force-unsafe-core".into());
+        }
+        f.extend(extra.iter().map(|s| s.to_string()));
+        f
+    };
     // user-owned 해소 시 매니페스트 base 전진(같은 vendor 버전으로 .new 재병치 방지).
     let advance_manifest_base = |content: &str| {
         let mpath = dir.join(cys::pack::INSTALL_MANIFEST);
@@ -10513,6 +10622,46 @@ fn run_pack_merge(
                     eprintln!("{msg}");
                     return 1;
                 }
+                // ★G3-축3(결함 5): 헌법 파일 전량 교체는 takeover 술어로 안전핵 소실을 선검증.
+                //   기존 verify_constitution_merge 는 merged==theirs 에서 구조적 항진(⊥ 조건)이라
+                //   이 경로의 가드가 되지 못한다 — ours-only 소실 검출 전용 술어를 fail-closed 배선.
+                let takeover_verify: Result<(), Vec<String>> = if is_const {
+                    cys::overrides::verify_constitution_takeover(&ours, &theirs)
+                } else {
+                    Ok(())
+                };
+                let verify_label = match &takeover_verify {
+                    Ok(()) if is_const => "ok".to_string(),
+                    Ok(()) => "n/a".to_string(),
+                    Err(lost) => format!("unsafe-core-lost:{}", lost.join(",")),
+                };
+                if let Err(lost) = &takeover_verify {
+                    eprint!("{}", takeover_risk_summary(&ours, lost));
+                    if !force_unsafe_core {
+                        if dry_run {
+                            println!(
+                                "(dry-run · 쓰기 0) 판정: 게이트 거부(rc={EXIT_UNSAFE_CORE_REFUSED}) — 적용하려면 --force-unsafe-core 명시"
+                            );
+                        } else {
+                            // 거부도 감사 라인으로 남긴다 — 원장은 시도·거부·실행의 전체 사실.
+                            audit(&merge_audit_entry(
+                                &rel, "take-new", &ours, &ours, &verify_label,
+                                &flag_list(&["refused"]),
+                            ));
+                            eprintln!(
+                                "⛔ 거부(rc={EXIT_UNSAFE_CORE_REFUSED}): 헌법 안전핵 소실 — 소실을 승인하려면 --force-unsafe-core 를 명시하라."
+                            );
+                        }
+                        return EXIT_UNSAFE_CORE_REFUSED;
+                    }
+                    eprintln!("⚠ --force-unsafe-core: 안전핵 소실 승인 상태로 진행(감사 원장 기록).");
+                } else if is_const {
+                    println!("✔ 헌법 안전핵 승계 확인(ours-only 소실 0)");
+                }
+                if dry_run {
+                    println!("(dry-run · 쓰기 0) '{rel}' ← vendor 신버전 채택 예정");
+                    return 0;
+                }
                 if confirm(&format!("'{rel}' 을 vendor 신버전으로 교체(내 수정 폐기)?")) {
                     if let Err(e) = cys::pack::write_atomic(&target, theirs.as_bytes()) {
                         eprintln!("쓰기 실패: {e}");
@@ -10520,13 +10669,21 @@ fn run_pack_merge(
                     }
                     advance_manifest_base(&theirs);
                     resolve(&mut pending, ".new");
+                    audit(&merge_audit_entry(
+                        &rel, "take-new", &ours, &theirs, &verify_label, &flag_list(&[]),
+                    ));
                     println!("✅ {rel} ← vendor 신버전 채택");
                 }
                 return 0;
             }
             if keep_mine {
+                if dry_run {
+                    println!("(dry-run · 쓰기 0) '{rel}' — 내 수정 유지·이번 vendor 신버전 해소 예정");
+                    return 0;
+                }
                 advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
                 resolve(&mut pending, ".new");
+                audit(&merge_audit_entry(&rel, "keep-mine", &ours, &ours, "n/a", &flag_list(&[])));
                 println!("✅ {rel} — 내 수정 유지(이번 vendor 신버전 해소)");
                 return 0;
             }
@@ -10634,8 +10791,18 @@ fn run_pack_merge(
                 }
             } else if keep_mine || take_new {
                 // healed 의 '해소' = 보존본 정리(vendor 본 유지가 이미 디스크 상태).
+                if dry_run {
+                    println!("(dry-run · 쓰기 0) '{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정) 예정");
+                    return 0;
+                }
                 if confirm(&format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")) {
                     resolve(&mut pending, ".user");
+                    // 디스크 본문 무변경 해소 — before==after 로 '정리' 사실만 원장에 남긴다.
+                    let cur = std::fs::read_to_string(&target).unwrap_or_default();
+                    let action = if take_new { "take-new" } else { "keep-mine" };
+                    audit(&merge_audit_entry(
+                        &rel, action, &cur, &cur, "n/a", &flag_list(&["healed-cleanup"]),
+                    ));
                     println!("✅ {rel} — vendor 본 유지 확정, 보존본 정리");
                 }
                 0
@@ -10768,7 +10935,7 @@ fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
 /// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
 /// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원은 다음 부트 스윕이
 /// 재치유함을 정직하게 고지 — 영속 경로(--to-local/--propose)로 안내한다.
-fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool) -> i32 {
+fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_unsafe_core: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let prev = cys::pack::pack_prev_dir(&dir);
     if !prev.is_dir() {
@@ -10848,6 +11015,34 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool) -> i32
             return 1;
         }
     };
+    // ★G3-축3 대칭 지점: 롤백도 '현재본 → 보존본 전량 교체'라 take-new 와 같은 안전핵 소실
+    //   벡터다(롤백 '도구'라서 더 위험 — A12 각주와 동일 취지). 헌법 파일이면 현재본(ours)
+    //   대비 보존본(theirs)의 ours-only 소실을 같은 술어로 선검증한다(fail-closed).
+    //   강제 진행의 실행 감사 라인은 실제 쓰기 성공 **후**에만 남긴다(미실행 사실의 원장 오염 금지).
+    let mut forced_unsafe: Option<(String, String)> = None; // (verify_label, 교체 전 현재본)
+    if cys::pack::is_constitution_file(&rel) {
+        let cur = std::fs::read_to_string(dir.join(&rel)).unwrap_or_default();
+        let prev_s = String::from_utf8_lossy(&content);
+        if let Err(lost) = cys::overrides::verify_constitution_takeover(&cur, &prev_s) {
+            eprint!("{}", takeover_risk_summary(&cur, &lost));
+            let verify_label = format!("unsafe-core-lost:{}", lost.join(","));
+            if !force_unsafe_core {
+                let flags: Vec<String> = vec!["refused".into()];
+                if let Err(e) = cys::pack::append_merge_audit(
+                    &dir,
+                    &merge_audit_entry(&rel, "rollback", &cur, &cur, &verify_label, &flags),
+                ) {
+                    eprintln!("⚠ 감사 원장 기록 실패(거부는 유효): {e}");
+                }
+                eprintln!(
+                    "⛔ 거부(rc={EXIT_UNSAFE_CORE_REFUSED}): 보존본 복원이 현행 안전핵을 소실 — 승인하려면 --force-unsafe-core 를 명시하라."
+                );
+                return EXIT_UNSAFE_CORE_REFUSED;
+            }
+            eprintln!("⚠ --force-unsafe-core: 안전핵 소실 승인 상태로 복원 진행(감사 원장 기록).");
+            forced_unsafe = Some((verify_label, cur));
+        }
+    }
     let confirm = |prompt: &str| -> bool {
         if yes {
             return true;
@@ -10870,6 +11065,17 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool) -> i32
     if let Err(e) = cys::pack::write_atomic(&dest, &content) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
+    }
+    // ★G3-축3: 안전핵 소실 승인 복원만 원장 기록 — 게이트가 발화한 파괴적 교체의 사후 추적.
+    if let Some((label, before)) = &forced_unsafe {
+        let after = String::from_utf8_lossy(&content).to_string();
+        let flags: Vec<String> = vec!["force-unsafe-core".into()];
+        if let Err(e) = cys::pack::append_merge_audit(
+            &dir,
+            &merge_audit_entry(&rel, "rollback", before, &after, label, &flags),
+        ) {
+            eprintln!("⚠ 감사 원장 기록 실패(복원은 완료): {e}");
+        }
     }
     match own {
         "user" => println!("✅ {rel} 복원(user 소유 — 업데이트가 덮지 않으므로 이대로 유지됩니다)"),
@@ -11526,6 +11732,52 @@ mod tests {
             "MASTER 외 파일은 가드 대상이 아니다"
         );
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★G3-축3 게이트 exit 계약 핀: 게이트 거부는 예약 exit({0,1,2,64} — clap 사용오류=2)과
+    /// 충돌 금지. 신 팩+구 바이너리 스큐에서 '플래그 부재(clap 2)'와 '게이트 거부'가 구분돼야
+    /// 소비 스크립트가 오진하지 않는다(claim-role 정당거부 rc=7 선례 계열).
+    #[test]
+    fn unsafe_core_refused_exit_is_unreserved() {
+        for reserved in [0, 1, 2, 64] {
+            assert_ne!(
+                EXIT_UNSAFE_CORE_REFUSED, reserved,
+                "게이트 거부 exit 가 예약 코드와 충돌: {reserved}"
+            );
+        }
+        assert_eq!(EXIT_UNSAFE_CORE_REFUSED, 7, "claim-role 정당거부(7) 계열 고정 — 소비부 파리티");
+    }
+
+    /// ★G3-축3 위험 요약 핀: 소실 키워드 계수와 사라질 ours 조항 줄이 적시되고, 무관 줄은
+    /// 혼입되지 않는다 — 게이트 화면의 판단 재료 최소 완비.
+    #[test]
+    fn takeover_risk_summary_lists_lost_lines_only() {
+        let ours = "- autopilot denylist 준수\n- kill-switch 즉시 정지\n- 무관 조항";
+        let lost = vec!["denylist".to_string(), "kill-switch".to_string()];
+        let s = takeover_risk_summary(ours, &lost);
+        assert!(s.contains("소실 2건"), "소실 계수 누락: {s}");
+        assert!(s.contains("denylist 준수"), "사라질 조항 줄 미적시: {s}");
+        assert!(s.contains("kill-switch 즉시 정지"), "사라질 조항 줄 미적시: {s}");
+        assert!(!s.contains("무관 조항"), "무관 줄 혼입: {s}");
+    }
+
+    /// ★G3-축3 감사 엔트리 스키마 핀: 8필드 계약({ts,file,action,actor_os_user,before_sha256,
+    /// after_sha256,verify_result,flags}) + sha256 은 pack 해시 SOT(content_hash_pub)와 동일.
+    #[test]
+    fn merge_audit_entry_has_contract_fields() {
+        let e = merge_audit_entry("soul.md", "take-new", "A", "B", "ok", &["yes".to_string()]);
+        for k in [
+            "ts", "file", "action", "actor_os_user", "before_sha256", "after_sha256",
+            "verify_result", "flags",
+        ] {
+            assert!(e.get(k).is_some(), "감사 필드 누락: {k}");
+        }
+        assert_eq!(e["before_sha256"], json!(cys::pack::content_hash_pub("A")));
+        assert_eq!(e["after_sha256"], json!(cys::pack::content_hash_pub("B")));
+        assert_eq!(e["flags"], json!(["yes"]));
+        // 직렬화 1줄 보장(원장 라인 규율) — 개행이 이스케이프돼 물리 개행 0.
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(!line.contains('\n'), "엔트리 직렬화에 물리 개행 혼입");
     }
 
     /// ★(W4 · D5 관측) alt_screen_notice 진리표 — 필드 부재(None)=판정 불가·무발화(FAIL 금지),
