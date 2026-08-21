@@ -222,13 +222,14 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
 /// 임시 guard 가 끝나며 락이 풀리고, 그 뒤 대상 큐를 잡는다. 두 leaf 락을 겹쳐 쥐면 반대 방향
 /// 승계와 AB-BA 데드락이 난다(코드 규약 '락 순서: surfaces → roles'의 연장선).
 fn migrate_seat_queue(prev: &Arc<crate::state::Surface>, next: &Arc<crate::state::Surface>) {
-    let drained: Vec<String> = prev.pending_queue.lock().unwrap().drain(..).collect();
+    let drained: Vec<crate::state::QueueEntry> =
+        prev.pending_queue.lock().unwrap().drain(..).collect();
     if drained.is_empty() {
         return;
     }
     let mut nq = next.pending_queue.lock().unwrap();
-    for text in drained {
-        nq.push_back(text);
+    for entry in drained {
+        nq.push_back(entry);
     }
 }
 
@@ -1453,6 +1454,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
+                // ★G1(W2-A): from = 검증된 발신 surface_ref 우선, 부재 시 클라이언트 from 문자열
+                // (관측·폐기 통지용 — 신원 판정은 여전히 커널 peer 기반 verified_from이 한다).
+                let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
+                    params.get("from").and_then(|v| v.as_str()).map(str::to_string)
+                });
                 let depth = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
@@ -1462,7 +1468,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(text.clone());
+                    q.push_back(daemon.next_queue_entry(text.clone(), entry_from, "send"));
                     q.len()
                 };
                 daemon.bus.publish(
@@ -1665,6 +1671,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "--queued supports only Return/Enter (other keys cannot ride the text queue)",
                     ));
                 }
+                // ★G1(W2-A): enqueue 3경로 중 send-key — 동일 규약(text="", origin="send-key").
+                // 한 경로라도 빠지면 무ID 항목이 섞여 pop-by-id·WAL 계약이 깨진다.
+                let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
+                    params.get("from").and_then(|v| v.as_str()).map(str::to_string)
+                });
                 let depth = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
@@ -1674,7 +1685,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(String::new());
+                    q.push_back(daemon.next_queue_entry(String::new(), entry_from, "send-key"));
                     q.len()
                 };
                 daemon.bus.publish(
@@ -4266,11 +4277,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let q = s.pending_queue.lock().unwrap();
-                for (i, text) in q.iter().enumerate() {
+                for (i, e) in q.iter().enumerate() {
                     out.push(json!({
                         "surface_id": s.id, "surface_ref": surface_ref(s.id),
-                        "index": i, "bytes": text.len(),
-                        "preview": text.chars().take(80).collect::<String>(),
+                        "index": i, "bytes": e.text.len(),
+                        "preview": e.text.chars().take(80).collect::<String>(),
                     }));
                 }
             }
@@ -4330,14 +4341,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            let dropped: Vec<String> = surface.pending_queue.lock().unwrap().drain(..).collect();
+            let dropped: Vec<crate::state::QueueEntry> =
+                surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
                     Some(sid),
                     json!({"reason": "cleared", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
+                           "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
                 );
             }
             // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
@@ -7072,9 +7084,11 @@ mod tests {
         // 피해 노드에 제3자가 보낸 인플라이트 큐 메시지 2건.
         {
             let victim_surface = daemon.surfaces.lock().unwrap()[&victim].clone();
+            let e1 = daemon.next_queue_entry("진짜 메시지 1".into(), None, "test");
+            let e2 = daemon.next_queue_entry("진짜 메시지 2".into(), None, "test");
             let mut q = victim_surface.pending_queue.lock().unwrap();
-            q.push_back("진짜 메시지 1".into());
-            q.push_back("진짜 메시지 2".into());
+            q.push_back(e1);
+            q.push_back(e2);
         }
 
         // 공격: attacker pane이 victim의 큐를 인멸 시도.
@@ -7099,9 +7113,10 @@ mod tests {
         let own = make_surface(&daemon, Some("worker-1"));
         let own_pid = 994_201_u32;
         bind_caller(&daemon, own_pid, own);
+        let mine = daemon.next_queue_entry("내 큐".into(), None, "test");
         daemon.surfaces.lock().unwrap()[&own]
             .pending_queue.lock().unwrap()
-            .push_back("내 큐".into());
+            .push_back(mine);
 
         let resp = queue_clear_rpc(&daemon, own, Some(own_pid));
         assert_eq!(resp["ok"], json!(true), "자기 큐 비우기가 막혔다 (응답: {resp})");
@@ -7118,9 +7133,10 @@ mod tests {
     fn queue_clear_allows_anonymous() {
         let daemon = claim_daemon();
         let node = make_surface(&daemon, Some("worker-3"));
+        let e = daemon.next_queue_entry("큐".into(), None, "test");
         daemon.surfaces.lock().unwrap()[&node]
             .pending_queue.lock().unwrap()
-            .push_back("큐".into());
+            .push_back(e);
 
         let resp = queue_clear_rpc(&daemon, node, None);
         assert_eq!(

@@ -77,6 +77,32 @@ pub(crate) mod winjob {
     }
 }
 
+/// ★G1(W2-A): 인플라이트 큐 원소 — 텍스트만 담던 큐(String)를 안정 ID·단조 seq·시각으로 승격.
+/// 텍스트만 저장하면 기아 측정·순서 검증·강제배달 지목이 전부 불가능하다(governance의
+/// 'anchor 미보존' 주석이 자인한 한계). 병렬 메타맵이 아니라 원소 타입 치환인 이유:
+/// 컴파일러가 전 접점 누락을 강제 검출한다. serde 파생은 WAL(queue-state.json) 직렬화 겸용.
+///
+/// id 조립 = `q{daemon.started_at as u64:x}.{seq}` — boot 식별자(started_at)로 재기동 간
+/// 충돌을 차단하고 seq로 boot 내 단조를 보장한다(발급 단일 지점 = Daemon::next_queue_entry).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueEntry {
+    /// 안정 항목 ID — enqueue→WAL→rehome→이관→배달 원장·이벤트를 관통하는 조준점.
+    pub id: String,
+    /// boot 내 단조 시퀀스(Daemon.queue_seq 발급). WAL 복원 시 max(seq)+1로 재시드.
+    pub seq: u64,
+    /// 배달 본문(주입 바이트) — send-key Return 항목은 빈 문자열.
+    pub text: String,
+    /// enqueue 시각(epoch초). 레거시 WAL 항목은 **복원 시각**으로 합성(0.0 금지 —
+    /// 부트 직후 wait≈수십억 초 오측정으로 stale 백로그가 즉시 최전선 배달되는 병리 차단).
+    pub enqueued_at: f64,
+    /// 발신자(있으면 surface_ref, 아니면 클라이언트 from 문자열) — 관측·폐기 통지용.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// enqueue 경로 태그: "send" | "send-key" | "governance-approval" (+ WAL 복원 합성값).
+    #[serde(default)]
+    pub origin: String,
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -126,8 +152,9 @@ pub struct Surface {
     pub idle_notified: AtomicBool,
     /// recall 영속용 직전 라인 (연속 중복 스킵 — TUI 리드로우 노이즈 억제)
     last_recall_line: Mutex<String>,
-    /// 인플라이트 큐: --queued 전송분 — 대상이 조용해질 때(followup) 순서대로 배달
-    pub pending_queue: Mutex<std::collections::VecDeque<String>>,
+    /// 인플라이트 큐: --queued 전송분 — 대상이 조용해질 때(followup) 순서대로 배달.
+    /// ★G1(W2-A): 원소 = QueueEntry(id·seq·enqueued_at 관통) — String에서 승격.
+    pub pending_queue: Mutex<std::collections::VecDeque<QueueEntry>>,
     /// T1-1 자기보고 상태 (`status.set` RPC)
     pub agent_status: Mutex<Option<AgentStatus>>,
     /// T2-5 에이전트 메타: launch-agent가 등록한 (agent 이름, 실행 바이너리)
@@ -862,8 +889,17 @@ pub struct Daemon {
     pub feed_persist_lock: Mutex<()>,
     /// 큐 WAL(P7): 미배달 `--queued` 메시지의 데몬 재기동 생존분(queue-state.json replay).
     /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
-    /// queue.list가 라이브 큐와 함께 노출한다. mid(안정 해시)로 이중 replay를 dedup한다.
+    /// queue.list가 라이브 큐와 함께 노출한다. id 우선(레거시는 mid)으로 이중 replay를 dedup한다.
     pub restored_queue: Mutex<Vec<serde_json::Value>>,
+    /// ★G1(W2-A): QueueEntry.seq 발급 카운터 — boot 내 단조. 시드 = WAL(load_queue_state)
+    /// 복원 항목들의 max(seq)+1(WAL 부재 시 1). 발급 단일 지점 = next_queue_entry.
+    /// EventBus seq와 분리 — 이벤트 발행과 enqueue는 1:1이 아니고, '살아있는 항목 대비 단조'는
+    /// WAL max 시드만으로 성립해 별도 영속 파일이 불필요(최소 침습).
+    pub queue_seq: AtomicU64,
+    /// ★G1(W2-A): persist_queue_state 직렬화 락(feed_persist_lock 관례 동형). watchdog 스레드와
+    /// tokio 핸들러가 동시에 호출할 수 있는데 write_json_atomic의 tmp 이름이 고정이라 동시 쓰기가
+    /// 파일을 파손할 수 있다 — G1 이후 WAL은 queue_seq 시드·entry id의 근거라 손상 대가가 크다.
+    pub queue_persist_lock: Mutex<()>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -1306,20 +1342,58 @@ fn queue_mid(sid: u64, text: &str) -> String {
     format!("q{h:016x}")
 }
 
-/// queue-state.json replay: {mid, surface_id, text} 배열을 mid로 dedup해 복원한다.
+/// queue-state.json replay: 엔트리 배열을 **파일 등장순 보존**으로 dedup 복원한다.
+///
+/// ★G1(W2-A) 재작성: 종전 HashMap.into_values()는 해시-랜덤 순서라 '레거시 seq=파일 등장순
+/// 재발급' 합성 규칙과 WAL 라운드트립이 성립 불가였다 — Vec(순서) + HashSet(dedup)으로 교체.
+/// dedup 키 = id 우선·부재 시 mid(레거시). 둘 다 없으면 폐기(신원 불능 — fail-safe).
+///
+/// 레거시(구 WAL: {mid, surface_id, text, role}만) 항목의 신 필드 합성 규칙:
+/// - id = mid 재사용 — 레거시 항목도 재기동 간 동일 ID를 갖는다(안정성 유지).
+/// - seq = 파일 등장순 재발급(1-기반) — 병합·정렬의 타이브레이커 근거.
+/// - enqueued_at = **복원 시각**(0.0 금지 · BLOCKER) — 0.0 합성 시 업그레이드 재기동 직후 전
+///   레거시 항목이 wait≈수십억 초로 즉시 overdue 최전선 배달되고 typing 가드가 무방비인
+///   부트체인 최취약 창에서 stale 백로그가 폭주한다.
+/// from/origin은 합성하지 않는다(없는 정보를 지어내지 않는다 — 소비측 unwrap_or 폴백).
+///
 /// 파일 부재/파손이면 빈 벡터(fail-safe — 큐 없음이 기본).
 fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let mut by_mid: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let restored_at = now_epoch();
     if let Ok(content) = std::fs::read_to_string(dir.join("queue-state.json")) {
         if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-            for it in arr {
-                if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
-                    by_mid.entry(mid.to_string()).or_insert(it); // 이중 replay dedup
+            for (pos, mut it) in arr.into_iter().enumerate() {
+                let mid = it.get("mid").and_then(|v| v.as_str()).map(str::to_string);
+                let key = it
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| mid.clone());
+                let Some(key) = key else {
+                    continue; // id·mid 둘 다 없음 — 신원 불능 항목은 복원하지 않는다
+                };
+                if !seen.insert(key) {
+                    continue; // 이중 replay dedup — 파일 첫 등장 항목 승
                 }
+                if let Some(obj) = it.as_object_mut() {
+                    if !obj.contains_key("id") {
+                        if let Some(m) = &mid {
+                            obj.insert("id".into(), json!(m)); // 레거시: id=mid 재사용
+                        }
+                    }
+                    if !obj.contains_key("seq") {
+                        obj.insert("seq".into(), json!((pos as u64) + 1)); // 파일 등장순 재발급
+                    }
+                    if !obj.contains_key("enqueued_at") {
+                        obj.insert("enqueued_at".into(), json!(restored_at)); // 복원 시각(0.0 금지)
+                    }
+                }
+                out.push(it);
             }
         }
     }
-    by_mid.into_values().collect()
+    out
 }
 
 impl Daemon {
@@ -1406,6 +1480,17 @@ impl Daemon {
                 None
             }
         };
+        // 큐 WAL 복원: queue-state.json을 파일 등장순 보존·id(레거시=mid) dedup으로 replay
+        // (미배달 큐 재기동 생존·P7). ★G1(W2-A): queue_seq 시드 계산이 이 복원분을 근거로
+        // 하므로 struct init 전에 먼저 로드한다 — 시드 = max(seq)+1(WAL 부재 시 1)로
+        // 재기동 후 발급 seq가 살아있는 복원 항목과 절대 겹치지 않는다.
+        let restored_qentries = load_queue_state(&dir);
+        let queue_seq_seed = restored_qentries
+            .iter()
+            .filter_map(|it| it.get("seq").and_then(|v| v.as_u64()))
+            .max()
+            .map(|m| m.saturating_add(1))
+            .unwrap_or(1);
         // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
@@ -1451,8 +1536,9 @@ impl Daemon {
             feed_waiters: Mutex::new(HashMap::new()),
             operator_token,
             feed_persist_lock: Mutex::new(()),
-            // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
-            restored_queue: Mutex::new(load_queue_state(&dir)),
+            restored_queue: Mutex::new(restored_qentries),
+            queue_seq: AtomicU64::new(queue_seq_seed),
+            queue_persist_lock: Mutex::new(()),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -1671,11 +1757,32 @@ impl Daemon {
         }
     }
 
+    /// ★G1(W2-A): QueueEntry 발급 단일 지점 — seq는 boot 내 단조(fetch_add), id는
+    /// boot 식별자(started_at)+seq 조합이라 재기동 간에도 충돌하지 않는다.
+    pub fn next_queue_entry(&self, text: String, from: Option<String>, origin: &str) -> QueueEntry {
+        let seq = self.queue_seq.fetch_add(1, Ordering::SeqCst);
+        QueueEntry {
+            id: format!("q{:x}.{}", self.started_at as u64, seq),
+            seq,
+            text,
+            enqueued_at: now_epoch(),
+            from,
+            origin: origin.to_string(),
+        }
+    }
+
     /// 큐 WAL 스냅샷을 원자적으로 영속(P7·§9.1-1). enqueue/pop/clear 뒤 호출한다.
-    /// 라이브 surface 큐 + 아직 미소비 restored_queue를 합쳐 mid로 dedup해 쓴다 —
+    /// 라이브 surface 큐 + 아직 미소비 restored_queue를 합쳐 id(레거시=mid)로 dedup해 쓴다 —
     /// 미배달 `--queued` 메시지가 데몬 재기동을 생존한다(HARNESS 4-a VOLATILE 수리).
+    /// ★G1(W2-A) 스키마 확장: {mid(현행 산식 유지), id, seq, surface_id, role, text,
+    /// enqueued_at, from, origin}. mid 병기는 구 데몬 롤백 시에도 파일이 읽히게 하는
+    /// 하위호환(구 코드는 mid/surface_id/text/role만 읽고 미지 키 무시).
     /// ★락 순서 주의: 호출자는 어떤 pending_queue 락도 쥐지 않은 상태여야 한다(재진입 데드락 방지).
     pub fn persist_queue_state(&self) {
+        // ★G1(W2-A): 전용 직렬화 락(feed_persist_lock 관례 동형) — watchdog 스레드·tokio
+        // 핸들러 동시 호출 시 고정 tmp명(.queue-state.json.tmp) 공유로 인한 파손 차단.
+        // 이 락은 여기서만 잡히므로 pending_queue·surfaces 락과의 역순 획득자가 없다(데드락 무관).
+        let _guard = self.queue_persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = state_dir(&self.socket_path);
         let mut entries: Vec<serde_json::Value> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1687,17 +1794,25 @@ impl Daemon {
                 // 배달하려면 role 앵커가 필요하다.
                 let role = s.role.lock().unwrap().clone();
                 let q = s.pending_queue.lock().unwrap();
-                for text in q.iter() {
-                    let mid = queue_mid(s.id, text);
-                    if seen.insert(mid.clone()) {
-                        entries.push(json!({"mid": mid, "surface_id": s.id, "text": text, "role": role}));
+                for e in q.iter() {
+                    if seen.insert(e.id.clone()) {
+                        entries.push(json!({
+                            "mid": queue_mid(s.id, &e.text), "id": e.id, "seq": e.seq,
+                            "surface_id": s.id, "role": role, "text": e.text,
+                            "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
+                        }));
                     }
                 }
             }
         }
         for it in self.restored_queue.lock().unwrap().iter() {
-            if let Some(mid) = it.get("mid").and_then(|v| v.as_str()) {
-                if seen.insert(mid.to_string()) {
+            // dedup 키 = id 우선(load가 전 항목에 합성)·방어적 mid 폴백.
+            let key = it
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| it.get("mid").and_then(|v| v.as_str()));
+            if let Some(k) = key {
+                if seen.insert(k.to_string()) {
                     entries.push(it.clone());
                 }
             }
@@ -1733,7 +1848,31 @@ impl Daemon {
             let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(r) = role {
                 if let Some(surf) = role_surface.get(r) {
-                    surf.pending_queue.lock().unwrap().push_back(text.to_string());
+                    // ★G1(W2-A): WAL 원값(id/seq/enqueued_at/from/origin)을 보존해 QueueEntry로
+                    // 되살린다 — id는 load_queue_state가 전 항목에 합성 보장(방어적 mid 폴백).
+                    // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
+                    // 복원 경유 사실은 관측 가능하게 남긴다.
+                    let entry = QueueEntry {
+                        id: it
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| it.get("mid").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .to_string(),
+                        seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+                        text: text.to_string(),
+                        enqueued_at: it
+                            .get("enqueued_at")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or_else(now_epoch),
+                        from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
+                        origin: it
+                            .get("origin")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("wal-legacy")
+                            .to_string(),
+                    };
+                    surf.pending_queue.lock().unwrap().push_back(entry);
                     rehomed += 1;
                     return false; // restored_queue에서 제거(pending_queue로 이관)
                 }
@@ -2210,14 +2349,14 @@ impl Daemon {
                 }
             }
             // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-            let dropped: Vec<String> = surf.pending_queue.lock().unwrap().drain(..).collect();
+            let dropped: Vec<QueueEntry> = surf.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
                     Some(surf.id),
                     json!({"reason": "process_exited", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
+                           "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
                 );
             }
             daemon.bus.publish(
@@ -4946,5 +5085,191 @@ mod tests {
             );
         }
         assert_eq!(line_count.load(Ordering::Relaxed), 3);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★G1(W2-A) — 큐 WAL: 파일 등장순 보존·레거시 합성·queue_seq 시드·라운드트립 핀
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// WAL 테스트 전용 격리 dir — 단조 카운터로 같은 초 병렬 실행 간 공유를 차단
+    /// (handlers::isolated_daemon 관례 동형).
+    fn queue_wal_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cys-qwal-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 레거시(구 WAL: mid/surface_id/text/role만) 합성 핀 — id=mid 재사용·seq=파일 등장순
+    /// 재발급·enqueued_at=**복원 시각**(0.0 금지 · BLOCKER: 0.0이면 업그레이드 재기동 직후
+    /// 전 항목이 wait≈수십억 초로 즉시 overdue 최전선 배달되는 stale 백로그 폭주). dedup은
+    /// 파일 첫 등장 승.
+    #[test]
+    fn load_queue_state_legacy_synthesizes_id_seq_and_restore_time() {
+        let dir = queue_wal_dir("legacy");
+        let before = now_epoch();
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"mid":"qaaa","surface_id":3,"text":"첫 메시지","role":"master"},
+                {"mid":"qbbb","surface_id":3,"text":"둘째","role":"master"},
+                {"mid":"qaaa","surface_id":3,"text":"첫 메시지","role":"master"}]"#,
+        )
+        .unwrap();
+        let out = load_queue_state(&dir);
+        assert_eq!(out.len(), 2, "mid dedup — 파일 첫 등장 승");
+        assert_eq!(out[0]["id"], json!("qaaa"), "id=mid 재사용(재기동 간 안정)");
+        assert_eq!(out[1]["id"], json!("qbbb"));
+        assert_eq!(out[0]["seq"].as_u64(), Some(1), "seq=파일 등장순 재발급");
+        assert_eq!(out[1]["seq"].as_u64(), Some(2));
+        for it in &out {
+            let ea = it["enqueued_at"].as_f64().expect("enqueued_at 합성 필수");
+            assert!(
+                ea >= before && ea <= now_epoch() + 1.0,
+                "enqueued_at은 복원 시각이어야 한다(0.0 금지 · BLOCKER): {ea}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 순서 보존 회귀 핀 — 종전 HashMap.into_values()는 해시-랜덤 순서라 12건 규모에서
+    /// 확률적으로 반드시 뒤섞였다(Vec+HashSet 재작성의 존재 이유). 신-포맷 필드
+    /// (id/seq/enqueued_at/from/origin)는 재합성 없이 원값 보존.
+    #[test]
+    fn load_queue_state_preserves_file_order_and_new_fields() {
+        let dir = queue_wal_dir("order");
+        let arr: Vec<serde_json::Value> = (0..12)
+            .map(|i| {
+                json!({
+                    "mid": format!("qm{i}"), "id": format!("qid.{i}"), "seq": i + 100,
+                    "surface_id": 7, "role": "worker", "text": format!("m{i}"),
+                    "enqueued_at": 1000.0 + i as f64, "from": "surface:9", "origin": "send",
+                })
+            })
+            .collect();
+        std::fs::write(dir.join("queue-state.json"), serde_json::to_string(&arr).unwrap())
+            .unwrap();
+        let out = load_queue_state(&dir);
+        assert_eq!(out.len(), 12);
+        for (i, it) in out.iter().enumerate() {
+            assert_eq!(
+                it["id"],
+                json!(format!("qid.{i}")),
+                "파일 등장순 보존(해시-랜덤 순서 회귀 핀)"
+            );
+            assert_eq!(it["seq"].as_u64(), Some(i as u64 + 100), "seq 원값 보존(재발급 금지)");
+            assert_eq!(it["enqueued_at"].as_f64(), Some(1000.0 + i as f64), "원값 보존(재합성 금지)");
+            assert_eq!(it["from"], json!("surface:9"));
+            assert_eq!(it["origin"], json!("send"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// id·mid 둘 다 없는 항목은 신원 불능 — 복원하지 않는다(fail-safe · 종전 mid-필수와 동일 방향).
+    #[test]
+    fn load_queue_state_drops_identityless_entries() {
+        let dir = queue_wal_dir("noid");
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"surface_id":3,"text":"신원 없음"},{"mid":"qok","surface_id":3,"text":"정상"}]"#,
+        )
+        .unwrap();
+        let out = load_queue_state(&dir);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], json!("qok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [WAL 왕복 + queue_seq 시드] persist→load 라운드트립: id/seq/enqueued_at/from/origin·
+    /// role·mid(구 데몬 롤백 하위호환 병기) 보존 + 시드 = 복원 항목 max(seq)+1(재기동 후 발급
+    /// seq가 살아있는 복원 항목과 절대 불충돌) + id 조립 = boot 식별자(started_at) + seq.
+    #[test]
+    fn queue_seq_seeds_from_wal_max_and_persist_load_roundtrip() {
+        let dir = queue_wal_dir("seed");
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"mid":"qzz","id":"qzz","seq":7,"surface_id":3,"role":"ghost-role",
+                 "text":"복원 대기","enqueued_at":1234.5,"from":"surface:3","origin":"send"}]"#,
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        assert_eq!(daemon.queue_seq.load(Ordering::SeqCst), 8, "시드 = max(seq)+1");
+        let e = daemon.next_queue_entry("본문".into(), Some("surface:1".into()), "send");
+        assert_eq!(e.seq, 8);
+        assert_eq!(
+            e.id,
+            format!("q{:x}.8", daemon.started_at as u64),
+            "id = boot 식별자(started_at) + seq — 재기동 간 충돌 차단"
+        );
+        assert!(e.enqueued_at > 0.0);
+        // 라이브 surface 큐 + 미소비 restored 병존 → persist → load 필드 보존
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w2a-role".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.pending_queue.lock().unwrap().push_back(e.clone());
+        daemon.persist_queue_state();
+        let out = load_queue_state(&dir);
+        assert_eq!(out.len(), 2, "라이브 1 + restored 1");
+        let live = out
+            .iter()
+            .find(|it| it["id"] == json!(e.id))
+            .expect("라이브 항목이 WAL에 있어야 한다");
+        assert_eq!(live["seq"].as_u64(), Some(8));
+        assert_eq!(live["text"], json!("본문"));
+        assert_eq!(live["enqueued_at"].as_f64(), Some(e.enqueued_at), "f64 왕복 보존");
+        assert_eq!(live["from"], json!("surface:1"));
+        assert_eq!(live["origin"], json!("send"));
+        assert_eq!(live["role"], json!("w2a-role"));
+        assert_eq!(
+            live["mid"],
+            json!(queue_mid(s.id, "본문")),
+            "mid 병기 = 구 데몬 롤백 하위호환(구 코드는 mid/surface_id/text/role만 읽음)"
+        );
+        let restored = out
+            .iter()
+            .find(|it| it["id"] == json!("qzz"))
+            .expect("미소비 restored 항목 보존");
+        assert_eq!(restored["seq"].as_u64(), Some(7));
+        assert_eq!(restored["enqueued_at"].as_f64(), Some(1234.5));
+        // 정리 — 스폰 자식 회수 + 임시 dir 제거
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// rehome(기계 이식분) 핀 — WAL 원값(id/seq/enqueued_at/from/origin)이 QueueEntry로
+    /// 보존 승계되는지 확인(정렬 병합은 W2-C 별도 티켓 — 여기서는 필드 관통만 고정).
+    #[test]
+    fn rehome_restores_queue_entry_with_original_metadata() {
+        let dir = queue_wal_dir("rehome");
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"mid":"qrr","surface_id":3,"role":"w2a-rehome","text":"레거시 복원"}]"#,
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w2a-rehome".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        assert_eq!(daemon.rehome_restored_queue(), 1);
+        let q = s.pending_queue.lock().unwrap();
+        let e = q.front().expect("rehome된 항목");
+        assert_eq!(e.id, "qrr", "레거시 id=mid 승계(재기동 간 안정 ID)");
+        assert_eq!(e.seq, 1, "load가 합성한 파일 등장순 seq 승계");
+        assert!(e.enqueued_at > 0.0, "복원 시각 합성 승계(0.0 금지)");
+        assert_eq!(e.text, "레거시 복원");
+        assert_eq!(e.origin, "wal-legacy", "레거시 origin 표기");
+        drop(q);
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

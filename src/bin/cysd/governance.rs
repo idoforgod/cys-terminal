@@ -961,7 +961,7 @@ fn approval_wakeup_hash(text: &str) -> u64 {
 ///   ② 창 안에 같은 문구를 이미 적재했다 = 배달돼 사라졌더라도 master 는 방금 그것을 봤다.
 /// `window_secs <= 0.0` 이면 항상 false — 노브 비활성 시 **종전 무억제 동작**으로 정확히 되돌린다.
 fn approval_wakeup_suppressed(
-    queue: &std::collections::VecDeque<String>,
+    queue: &std::collections::VecDeque<crate::state::QueueEntry>,
     recent: &HashMap<u64, f64>,
     text: &str,
     now: f64,
@@ -970,7 +970,9 @@ fn approval_wakeup_suppressed(
     if window_secs <= 0.0 {
         return false;
     }
-    if queue.iter().any(|q| q == text) {
+    // ★G1(W2-A): 원소가 QueueEntry로 승격돼도 dedupe는 **문구 단위** 의미 불변 —
+    // id가 달라도 같은 문구는 억제된다(층1 I4 계약 유지).
+    if queue.iter().any(|e| e.text == text) {
         return true;
     }
     recent
@@ -1017,7 +1019,8 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
         } else if q.len() >= 100 {
             None // 큐 포화 — 종전대로 조용히 무시
         } else {
-            q.push_back(text.to_string());
+            // ★G1(W2-A): enqueue 3경로 중 governance 경로 — origin 태그로 관통 추적.
+            q.push_back(daemon.next_queue_entry(text.to_string(), None, "governance-approval"));
             recent.insert(approval_wakeup_hash(text), now);
             Some(q.len())
         }
@@ -2606,14 +2609,15 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         id,
     );
     // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-    let dropped: Vec<String> = surface.pending_queue.lock().unwrap().drain(..).collect();
+    let dropped: Vec<crate::state::QueueEntry> =
+        surface.pending_queue.lock().unwrap().drain(..).collect();
     if !dropped.is_empty() {
         daemon.bus.publish(
             "queue.dropped",
             "queue",
             Some(id),
             json!({"reason": "surface_closed", "count": dropped.len(),
-                   "bytes": dropped.iter().map(|t| t.len()).sum::<usize>()}),
+                   "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
         );
     }
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
@@ -2641,10 +2645,12 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
 
 /// try_send로 writer 채널에 인계한 머리 메시지를 큐에서 제거한다.
 /// deliver_queued가 front 읽기·인계·이 호출을 한 락 임계영역으로 묶으므로 호출 시점에
-/// 머리는 항상 방금 보낸 text다. 그래도 머리 일치를 확인하고 제거하는 belt-and-suspenders
+/// 머리는 항상 방금 보낸 항목이다. 그래도 머리 일치를 확인하고 제거하는 belt-and-suspenders
 /// 가드 — 무조건 pop_front이 미배달 새 머리를 삼키는 일을 구조적으로 차단한다.
-fn pop_delivered_head(q: &mut std::collections::VecDeque<String>, delivered: &str) {
-    if q.front().map(String::as_str) == Some(delivered) {
+/// ★G1(W2-A): 판정을 텍스트에서 **id**로 승격 — 텍스트 비교는 동일 문구 중복 항목
+/// (빈 문자열 Return 큐가 대표례)에서 원리상 모호했다. id는 유일하므로 가드가 완전해진다.
+fn pop_delivered_head(q: &mut std::collections::VecDeque<crate::state::QueueEntry>, delivered_id: &str) {
+    if q.front().map(|e| e.id.as_str()) == Some(delivered_id) {
         q.pop_front();
     }
 }
@@ -2856,7 +2862,7 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
         // 순간이고 watchdog은 멈추지 않는다.
         let delivered = {
             let mut q = s.pending_queue.lock().unwrap();
-            let Some(text) = q.front().cloned() else {
+            let Some(entry) = q.front().cloned() else {
                 continue;
             };
             // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 사고 경로
@@ -2868,22 +2874,23 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             crate::delivery::record_audited(
                 daemon,
                 s.id,
-                &text,
+                &entry.text,
                 crate::delivery::Origin::Queue,
                 None,
             );
             let req = crate::state::WriteReq::Inject {
-                text: text.clone(),
+                text: entry.text.clone(),
                 cr_delay_ms: 400,
                 clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
             };
             if s.write_tx.try_send(req).is_err() {
                 continue; // 인계 실패 — 메시지 보존, 다음 틱 재시도
             }
-            pop_delivered_head(&mut q, &text);
-            Some((text, q.len()))
+            // ★G1(W2-A): pop 판정은 방금 인계한 항목의 **id** — 동일 텍스트 중복 항목 오삼킴 차단.
+            pop_delivered_head(&mut q, &entry.id);
+            Some((entry, q.len()))
         };
-        if let Some((text, remaining)) = delivered {
+        if let Some((entry, remaining)) = delivered {
             // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
             *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
@@ -2892,12 +2899,13 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             // 하나라도 빠지면 그 사건은 seen-store 에 inflight 로 남아 TTL 마다 영구 재enqueue 된다
             // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
             // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
-            let entry_ids = wakeup_entry_ids(&text);
+            // (entry_ids = W-id 에코 계약 — 큐 항목 id(queue_entry_id)와 별개 체계·키명 불변.)
+            let entry_ids = wakeup_entry_ids(&entry.text);
             daemon.bus.publish(
                 "queue.delivered",
                 "queue",
                 Some(s.id),
-                serde_json::json!({"bytes": text.len(), "remaining": remaining,
+                serde_json::json!({"bytes": entry.text.len(), "remaining": remaining,
                                    "entry_ids": entry_ids,
                                    "surface_ref": cys::surface_ref(s.id)}),
             );
@@ -2975,8 +2983,9 @@ mod tests {
     /// 직전 큐에 동일 문구가 배달 대기 중이면 억제 — 같은 사실로 master 를 두 번 깨우지 않는다.
     #[test]
     fn approval_wakeup_suppressed_when_same_text_still_queued() {
+        // ★G1(W2-A): 원소가 QueueEntry로 승격돼도 dedupe는 문구 단위(id 무관) — 의미 불변 핀.
         let mut q = std::collections::VecDeque::new();
-        q.push_back("[승인감지] claude surface:7 …".to_string());
+        q.push_back(qe("aw-1", "[승인감지] claude surface:7 …"));
         let recent = std::collections::HashMap::new();
         assert!(approval_wakeup_suppressed(
             &q,
@@ -3018,7 +3027,7 @@ mod tests {
     fn approval_wakeup_dedupe_disabled_when_window_zero() {
         let mut q = std::collections::VecDeque::new();
         let text = "[승인감지] claude surface:7 …";
-        q.push_back(text.to_string());
+        q.push_back(qe("aw-0", text));
         let mut recent = std::collections::HashMap::new();
         recent.insert(super::approval_wakeup_hash(text), 1000.0);
         assert!(!approval_wakeup_suppressed(&q, &recent, text, 1000.0, 0.0));
@@ -4132,8 +4141,22 @@ mod tests {
         assert!(collect_scoped_for_shutdown(&HashMap::new()).is_empty());
     }
 
-    fn q(items: &[&str]) -> VecDeque<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    /// ★G1(W2-A): 테스트 큐 원소 — (id, text) 쌍으로 QueueEntry를 합성한다.
+    /// seq·enqueued_at은 pop-by-id 판정과 무관하므로 고정값(판정 재료는 id 하나).
+    fn qe(id: &str, text: &str) -> crate::state::QueueEntry {
+        crate::state::QueueEntry {
+            id: id.to_string(),
+            seq: 0,
+            text: text.to_string(),
+            enqueued_at: 0.0,
+            from: None,
+            origin: "test".to_string(),
+        }
+    }
+
+    /// id를 텍스트에서 파생("id-<text>")한 QueueEntry 큐 — 기존 텍스트 기반 테스트의 최소 이식.
+    fn q(items: &[&str]) -> VecDeque<crate::state::QueueEntry> {
+        items.iter().map(|s| qe(&format!("id-{s}"), s)).collect()
     }
 
     // ── CYS_TODO_DIRS 파싱 회귀 가드 ──
@@ -4161,9 +4184,9 @@ mod tests {
 
     #[test]
     fn pop_delivered_head_removes_matching_head() {
-        // 정상 경로: 보낸 메시지가 여전히 머리 → 제거. 뒤 메시지는 보존.
+        // 정상 경로: 보낸 항목이 여전히 머리 → 제거(판정 = id). 뒤 항목은 보존.
         let mut deque = q(&["msg1", "msg2"]);
-        pop_delivered_head(&mut deque, "msg1");
+        pop_delivered_head(&mut deque, "id-msg1");
         assert_eq!(deque, q(&["msg2"]));
     }
 
@@ -4173,7 +4196,7 @@ mod tests {
         // 빈 큐. 핵심은 '빈 큐를 건드리지 않고' 손상 없이 빠져나오는 것.
         // (이미 PTY로 간 메시지는 회수 불가 — 아키텍처 한계)
         let mut deque = q(&[]);
-        pop_delivered_head(&mut deque, "msg1");
+        pop_delivered_head(&mut deque, "id-msg1");
         assert!(deque.is_empty());
     }
 
@@ -4182,9 +4205,9 @@ mod tests {
         // 유해 변종(이 수정의 핵심 회귀 가드): front("msgA") 읽고 락 해제 →
         // 그 창에서 clear가 drain([]) 후 새 메시지 "msgB" enqueue → 큐=["msgB"].
         // 무조건 pop_front이면 미배달 "msgB"를 삼켜 조용히 유실시킨다.
-        // 머리가 보낸 "msgA"가 아니므로 제거하지 않아야 한다 — "msgB"는 다음 틱에 배달.
+        // 머리가 보낸 "msgA"(id)가 아니므로 제거하지 않아야 한다 — "msgB"는 다음 틱에 배달.
         let mut deque = q(&["msgB"]);
-        pop_delivered_head(&mut deque, "msgA");
+        pop_delivered_head(&mut deque, "id-msgA");
         assert_eq!(deque, q(&["msgB"]), "미배달 새 메시지가 유실되면 안 된다");
     }
 
@@ -4192,8 +4215,25 @@ mod tests {
     fn pop_delivered_head_preserves_replacement_head() {
         // clear→enqueue가 여러 건이어도 머리 불일치면 한 건도 삼키지 않는다.
         let mut deque = q(&["msgB", "msgC"]);
-        pop_delivered_head(&mut deque, "msgA");
+        pop_delivered_head(&mut deque, "id-msgA");
         assert_eq!(deque, q(&["msgB", "msgC"]));
+    }
+
+    /// ★G1(W2-A) 신규 핀 — 텍스트 비교 시절 모호성의 봉인: **동일 텍스트**(빈 문자열 Return
+    /// 2건 — send-key --queued의 실경로)라도 id가 다르면 절대 pop하지 않는다.
+    /// 텍스트 비교였다면 배달된 1번 항목의 ack가 미배달 2번 항목을 오삼킴할 수 있었다.
+    #[test]
+    fn pop_delivered_head_same_text_different_id_never_pops() {
+        // 시나리오: front(id=ret-1) 읽고 락 해제 → 그 창에서 clear+재enqueue로 머리가
+        // 같은 텍스트("")의 다른 항목(id=ret-2)으로 교체 → ret-1 ack가 ret-2를 삼키면 안 된다.
+        let mut deque: VecDeque<crate::state::QueueEntry> =
+            [qe("ret-2", ""), qe("ret-3", "")].into_iter().collect();
+        pop_delivered_head(&mut deque, "ret-1");
+        assert_eq!(deque.len(), 2, "동일 텍스트라도 id 불일치면 pop 금지(오삼킴 차단)");
+        // 대조군: 머리 id 일치 시에만 정확히 그 항목 하나를 제거.
+        pop_delivered_head(&mut deque, "ret-2");
+        assert_eq!(deque.len(), 1);
+        assert_eq!(deque.front().map(|e| e.id.as_str()), Some("ret-3"));
     }
 
     // ── TOCTOU 회귀 가드: read-handoff-pop 단일 임계영역 ──
@@ -4205,20 +4245,20 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex};
 
-    // production deliver_queued의 임계영역과 동일한 순서:
-    // 락 획득 → front().cloned() → try_send(writer) → pop_delivered_head → 락 해제.
+    // production deliver_queued의 임계영역과 동일한 순서(★G1 W2-A: QueueEntry·pop-by-id 이식):
+    // 락 획득 → front().cloned() → try_send(writer) → pop_delivered_head(id) → 락 해제.
     fn deliver_one_atomic(
-        queue: &Mutex<VecDeque<String>>,
+        queue: &Mutex<VecDeque<crate::state::QueueEntry>>,
         writer: &std::sync::mpsc::SyncSender<String>,
     ) -> Option<String> {
         let mut q = queue.lock().unwrap();
-        let text = q.front().cloned()?;
+        let entry = q.front().cloned()?;
         // 논블로킹 인계. 실패 시 메시지 보존(pop 안 함).
-        if writer.try_send(text.clone()).is_err() {
+        if writer.try_send(entry.text.clone()).is_err() {
             return None;
         }
-        pop_delivered_head(&mut q, &text);
-        Some(text)
+        pop_delivered_head(&mut q, &entry.id);
+        Some(entry.text)
     }
 
     #[test]
@@ -4234,7 +4274,7 @@ mod tests {
             let qc = Arc::clone(&queue);
             let clearer = std::thread::spawn(move || {
                 // queue.clear / close_surface의 drain과 동일.
-                let _: Vec<String> = qc.lock().unwrap().drain(..).collect();
+                let _: Vec<crate::state::QueueEntry> = qc.lock().unwrap().drain(..).collect();
             });
 
             let delivered = deliver_one_atomic(&queue, &tx);
