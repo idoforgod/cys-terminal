@@ -2652,6 +2652,14 @@ mod auto_restore_tests {
     /// ★B1③: 추출된 실 phoenix 가 --selftest 를 통과한다(python3 가용 시). self-test 게이트 실증.
     #[test]
     fn b1_self_test_passes_on_real_embed() {
+        // ★플레이키 봉인(W4 감사): 이 테스트도 extract_phoenix_embed 를 호출하므로 시임이
+        //   **없는** 상태를 전제한다 — 형제(b1_extract_mid_failure...)의 CYS_PHOENIX_EXTRACT_FAIL
+        //   set/remove 윈도와 병렬로 겹치면 "injected mid-extraction failure" 로 죽는다.
+        //   b1_extract_writes_phoenix_and_deps 와 동형으로 락 직렬화 + 상속 누출 명시 제거.
+        let _serial = EXTRACT_FAIL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clean = cys::pack::EnvGuard::remove("CYS_PHOENIX_EXTRACT_FAIL");
         let py = match std::process::Command::new("python3").arg("--version").output() {
             Ok(o) if o.status.success() => "python3".to_string(),
             _ => {

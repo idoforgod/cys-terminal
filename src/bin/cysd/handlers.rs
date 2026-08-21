@@ -7570,6 +7570,32 @@ mod tests {
         *s.exited_at.lock().unwrap() = Some(std::time::Instant::now());
     }
 
+    /// [플레이키 봉인] mark_surface_dead 가 자식을 kill 하면 create_surface 의 reader 스레드가
+    /// **비동기로** EOF 정리 경로(state.rs — pending_queue drain(reason=process_exited) 후
+    /// `surface.exited` 최종 발행)를 완주한다. 죽은 좌석의 pending_queue 를 테스트가 직접
+    /// 채우려면 그 drain 과 경합하지 않도록 **push 전에** 해당 sid 의 surface.exited 수신을
+    /// 기다려야 한다 — 이 이벤트는 drain 완료 **이후** 발행되므로, 도착했다면 reader 는 큐를
+    /// 다시 만질 수 없고 push 는 결정론적으로 보존된다. bus ring(tail) 사후 조회라 구독
+    /// 시점 유실도 없다.
+    fn wait_surface_exited_event(daemon: &Arc<Daemon>, sid: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let seen = daemon
+                .bus
+                .tail(200)
+                .iter()
+                .any(|ev| ev["name"] == json!("surface.exited") && ev["surface_id"] == json!(sid));
+            if seen {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "surface.exited(sid={sid}) 10초 내 미도착 — reader EOF 경로 미완주"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn count_bus(daemon: &Arc<Daemon>, name: &str) -> usize {
         daemon.bus.tail(60).iter().filter(|ev| ev["name"] == name).count()
     }
@@ -7827,6 +7853,9 @@ mod tests {
         let dead = make_surface(&daemon, Some("worker-q"));
         let live = make_surface(&daemon, Some("worker-live"));
         mark_surface_dead(&daemon, dead);
+        // ★결정론화: reader 스레드의 EOF drain(process_exited)이 아래 push 와 경합하지 않도록
+        //   drain 완료 이후 발행되는 surface.exited 를 먼저 기다린다(헬퍼 주석 참조).
+        wait_surface_exited_event(&daemon, dead);
         let cso_pid = 995_401_u32;
         bind_caller(&daemon, cso_pid, cso);
         let entry = daemon.next_queue_entry("미배달 보고".into(), None, "test");
@@ -9103,6 +9132,67 @@ mod tests {
             let it = items.iter().find(|i| i.request_id == "an1").unwrap();
             assert_eq!(it.status, "pending", "무명 발행 항목은 사람 결재 대기로 남아야");
             assert!(!it.auto_route, "영속 스냅샷에도 auto_route=false 각인");
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [W4 방어심화 핀] handlers층: kind="cycle-verify" 로 feed.push 해도 auto_route 는
+    /// 성립하지 않는다 — cycle-verify 는 비가역 컨텍스트 clear 의 사전 게이트라 CEO 자동결재로
+    /// 새면 방어선 자체가 무력화된다. risk층 핀(approval_risk::cycle_markers_never_auto)과
+    /// **별개의 배선층 박제**: derive_risk 가 kind 를 입력으로 되돌아가거나, feed.push 라우팅이
+    /// kind 기반 분기를 얻거나, cycle 마커가 allowlist 에 재등재되면 이 테스트가 반드시 깨진다.
+    /// ★최강 조건으로 고정: flag ON + 발행자 pane 귀속 + CEO 좌석 점유(=배달을 막는 잔여
+    /// 조건이 risk 판정 하나뿐인 상태)에서도 risk=high·auto_route=false·CEO 배달 0건·
+    /// escalation 0건·pending 유지(사람 결재 경로).
+    #[test]
+    fn w3_cycle_verify_not_auto_routed() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w4-cycle", true);
+        // CEO 좌석 점유 — auto 로 새면 실제 배달(feed.auto_routed)이 일어나는 환경을 구성한다.
+        let ceo = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed); // Occupied
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+        // 발행자 pane 귀속 — 무명 제외 게이트(결함7-e)가 아니라 risk 판정이 차단자임을 증명.
+        seed_caller(&daemon, 900_010, 70);
+        let mut rx = daemon.bus.subscribe();
+        // 실물 주입문(cys.rs cycle-agent) 표본 + kind="cycle-verify" 자기신고 그대로.
+        let req = Request {
+            id: json!(1),
+            method: "feed.push".into(),
+            params: json!({"kind": "cycle-verify",
+                           "title": "[CYCLE-VERIFY] role 'master'(surface:3)의 컨텍스트 순환 전 저장 검증 요청",
+                           "body": "SESSION_STATE/TODO 확인",
+                           "request_id": "cv1", "wait": false}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(900_010)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "cv1").expect("created");
+        assert_eq!(p["payload"]["risk_class"], json!("high"), "cycle-verify 가 high 로 안 떨어짐");
+        assert_eq!(
+            p["payload"]["auto_route"],
+            json!(false),
+            "cycle-verify 가 auto_route 로 샘 — 비가역 clear 사전 게이트 무력화"
+        );
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "cycle-verify 가 CEO 로 배달됨");
+        assert_eq!(
+            count_named(&evs, "approval.stalled"),
+            0,
+            "HighRisk 는 현행 CC 경로(무 escalation)여야 한다"
+        );
+        // 항목은 pending 유지 — 사람 결재 경로(영속 스냅샷에도 auto_route=false 각인).
+        {
+            let items = daemon.feed_items.lock().unwrap();
+            let it = items.iter().find(|i| i.request_id == "cv1").unwrap();
+            assert_eq!(it.status, "pending", "cycle-verify 항목은 사람 결재 대기로 남아야");
+            assert!(!it.auto_route, "영속 스냅샷에 auto_route=true 각인됨");
         }
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
