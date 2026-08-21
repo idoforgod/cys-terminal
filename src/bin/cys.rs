@@ -683,9 +683,102 @@ enum QueueAction {
     List {
         #[arg(long)]
         surface: Option<String>,
+        /// RPC entries 원문(JSON 배열) 그대로 출력 — 텍스트 열 파싱 없이 기계 소비
+        #[arg(long)]
+        json: bool,
     },
     /// Drop all undelivered queued messages for a surface
     Clear { surface: String },
+}
+
+/// ★G1(W2-B): `cys queue list` 텍스트 행 렌더 — 열 계약의 단일 소유자.
+///
+/// **열 위치 계약(절대 불변)**: 탭 구분 `surface_ref \t [index] \t <bytes>B \t preview`
+/// 4열의 위치는 고정이다 — javis_boot_node.classify_delivery 가 cols[3]=preview 파싱으로
+/// '재전송 금지'(wakeup 홍수 방어 게이트)를 판정한다(javis_boot_node.py:645-675). 신규 열
+/// (id·age)은 반드시 preview **뒤** 말미에만 추가한다(중간 삽입 = pending 을
+/// delivered_no_ack 로 오판 → 멱등 재주입 발동).
+///
+/// **preview 탭 미포함 불변식**: preview 본문의 탭·개행은 공백으로 치환한다 — 본문에 탭이
+/// 실리면 열 파서가 뒤 열을 preview 로 오독해 위 계약이 무너진다(개행은 행 자체를 쪼갠다).
+///
+/// 신규 열 결손(restored 항목 등 id/age 부재)은 "-" 자리표시 — 열 개수는 항상 6으로 일정.
+fn queue_list_row(e: &Value) -> String {
+    let preview: String = e["preview"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let id = e["id"].as_str().unwrap_or("-");
+    let age = e["age_secs"]
+        .as_u64()
+        .map(|a| format!("{a}s"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{}\t[{}]\t{}B\t{}\t{}\t{}",
+        e["surface_ref"].as_str().unwrap_or("?"),
+        e["index"],
+        e["bytes"],
+        preview,
+        id,
+        age,
+    )
+}
+
+#[cfg(test)]
+mod queue_list_row_tests {
+    use super::*;
+
+    /// 열 위치 회귀 핀 — cols[3]=preview 는 javis_boot_node 파싱 계약(위 doc comment).
+    /// 신규 열(id·age)은 말미(cols[4]·cols[5])에만 있다.
+    #[test]
+    fn queue_list_row_pins_column_positions() {
+        let e = serde_json::json!({
+            "surface_ref": "surface:7", "index": 2, "bytes": 12, "preview": "보고 본문",
+            "id": "q1a2b.3", "seq": 3, "age_secs": 45
+        });
+        let row = queue_list_row(&e);
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 6, "열 개수 고정(4 기존 + id·age 말미 2)");
+        assert_eq!(cols[0], "surface:7");
+        assert_eq!(cols[1], "[2]");
+        assert_eq!(cols[2], "12B");
+        assert_eq!(cols[3], "보고 본문", "cols[3]=preview — javis_boot_node 파싱 계약");
+        assert_eq!(cols[4], "q1a2b.3", "신규 id 열은 preview 뒤 말미");
+        assert_eq!(cols[5], "45s", "신규 age 열은 최말미");
+    }
+
+    /// preview 탭·개행 미포함 불변식 — 본문에 탭이 실려도 열 경계를 침범하지 않는다.
+    #[test]
+    fn queue_list_row_preview_never_contains_tab_or_newline() {
+        let e = serde_json::json!({
+            "surface_ref": "surface:1", "index": 0, "bytes": 5, "preview": "a\tb\nc\rd",
+            "id": "qx.1", "age_secs": 0
+        });
+        let row = queue_list_row(&e);
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 6, "본문 탭이 열을 쪼개면 안 된다");
+        assert_eq!(cols[3], "a b c d", "탭·개행·CR 은 공백 치환");
+        assert_eq!(cols[4], "qx.1", "id 열 위치가 본문 탭에 밀리지 않는다");
+        assert!(!row.contains('\n'), "행은 항상 한 줄");
+    }
+
+    /// 구형(restored 등) id/age 결손 항목 — "-" 자리표시로 열 개수 불변(파서 보호).
+    #[test]
+    fn queue_list_row_missing_new_fields_use_placeholder() {
+        let e = serde_json::json!({
+            "surface_id": 3, "restored": true, "mid": "qmm", "bytes": 4, "preview": "복원"
+        });
+        let row = queue_list_row(&e);
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 6);
+        assert_eq!(cols[0], "?", "surface_ref 부재 = 기존 '?' 동작 유지");
+        assert_eq!(cols[1], "[null]", "index 부재 = 기존 null 표기 유지(무회귀)");
+        assert_eq!(cols[3], "복원", "cols[3]=preview 는 결손 항목에서도 불변");
+        assert_eq!(cols[4], "-");
+        assert_eq!(cols[5], "-");
+    }
 }
 
 #[derive(Subcommand)]
@@ -1942,21 +2035,22 @@ fn run(command: Command) -> i32 {
 
         Command::Queue { action } => {
             return match action {
-                QueueAction::List { surface } => parse_explicit_surface(&surface)
+                QueueAction::List { surface, json: as_json } => parse_explicit_surface(&surface)
                     .and_then(|sid| request("queue.list", json!({"surface_id": sid})))
                     .map(|r| {
                         let entries = r["entries"].as_array().cloned().unwrap_or_default();
+                        // --json: RPC entries 원문 — 텍스트 열 계약과 무관한 기계 소비 경로.
+                        if as_json {
+                            println!("{}", Value::Array(entries));
+                            return 0;
+                        }
                         if entries.is_empty() {
                             println!("(queue empty)");
                         }
                         for e in entries {
-                            println!(
-                                "{}\t[{}]\t{}B\t{}",
-                                e["surface_ref"].as_str().unwrap_or("?"),
-                                e["index"],
-                                e["bytes"],
-                                e["preview"].as_str().unwrap_or(""),
-                            );
+                            // ★G1(W2-B): 행 렌더는 queue_list_row 단일 소유 — 열 위치
+                            // 계약(cols[3]=preview)과 회귀 핀은 그 정의부에 있다.
+                            println!("{}", queue_list_row(&e));
                         }
                         0
                     })

@@ -103,6 +103,74 @@ pub struct QueueEntry {
     pub origin: String,
 }
 
+// ─── ★G1(W2-B): 큐 이벤트 payload 단일 빌더 3종 ───────────────────────────────
+// json! 페이로드는 컴파일러 강제 밖이다 — 발행처마다 손으로 쓰면 나중 수정이 한 곳만
+// 고쳐 조용한 계약 파손이 난다(G1·G4 수렴 지적). 발행처는 반드시 이 빌더를 공유하고,
+// 스키마는 아래 테스트 핀이 고정한다.
+//
+// ★명명 계약(성찰 BLOCKER): 큐 항목 id 필드는 단수 `queue_entry_id`·복수 `queue_entry_ids`.
+// 기존 `entry_ids`는 **W-id 에코**(배달 원문 text 스캔 결과)로 javis_report_gate
+// critical-tier disarm의 유일 조인 키(javis_report_gate.py:1658-1669)다 — 한 이벤트
+// 패밀리에 두 id 체계가 같은 키명으로 공존하면 disarm 조인이 오염돼 TTL마다 재enqueue
+// (= wakeup 홍수, governance 주석 명시 병리)되므로 `entry_ids` 키명 재사용 절대 금지.
+
+/// queue.dropped payload — 폐기 3발행처(state 자력종료 drain·governance close_surface
+/// drain·handlers queue.clear)가 공유한다. 기존 키(reason/count/bytes) 의미 불변,
+/// `queue_entry_ids`는 additive(발신자가 자기 항목 유실을 결정론 확인하는 조준점).
+/// reason 어휘(현행 3종): "process_exited" | "surface_closed" | "cleared".
+pub fn queue_dropped_payload(reason: &str, dropped: &[QueueEntry]) -> Value {
+    json!({
+        "reason": reason,
+        "count": dropped.len(),
+        "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>(),
+        "queue_entry_ids": dropped.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+    })
+}
+
+/// queue.enqueued payload — enqueue 3경로(handlers send/send-key·governance
+/// enqueue_master_wakeup)가 공유한다. 기존 키(bytes/depth/from · send-key는 key) 의미
+/// 불변, `queue_entry_id`/`seq`/`enqueued_at`은 additive — 수락 증거에 항목 조준점을
+/// 동봉해 발신자가 이후 배달·폐기 통지를 결정론으로 조인한다.
+pub fn queue_enqueued_payload(entry: &QueueEntry, depth: usize, from: Value, key: Option<&str>) -> Value {
+    let mut p = json!({
+        "bytes": entry.text.len(),
+        "depth": depth,
+        "from": from,
+        "queue_entry_id": entry.id,
+        "seq": entry.seq,
+        "enqueued_at": entry.enqueued_at,
+    });
+    if let Some(k) = key {
+        p["key"] = json!(k);
+    }
+    p
+}
+
+/// queue.delivered payload — 배달 영수증. 기존 키(bytes/remaining/entry_ids/surface_ref)
+/// 의미 완전 불변: `entry_ids`는 W-id 에코(원문 text 기준)이며 큐 항목 자신의 id는 별도 키
+/// `queue_entry_id`로만 실린다(위 명명 계약). additive: queue_entry_id/seq/enqueued_at/
+/// delivered_at/wait_secs. wait_secs는 음수 클램프 0 — 시계 스큐·NTP 점프의 역행 방어이며
+/// 기아(결함 1) 실측 분포·단계형 임계(G1 2단 롤아웃)의 근거 필드다.
+pub fn queue_delivered_payload(
+    entry: &QueueEntry,
+    remaining: usize,
+    wakeup_ids: &[String],
+    surface_ref: &str,
+    delivered_at: f64,
+) -> Value {
+    json!({
+        "bytes": entry.text.len(),
+        "remaining": remaining,
+        "entry_ids": wakeup_ids,
+        "surface_ref": surface_ref,
+        "queue_entry_id": entry.id,
+        "seq": entry.seq,
+        "enqueued_at": entry.enqueued_at,
+        "delivered_at": delivered_at,
+        "wait_secs": (delivered_at - entry.enqueued_at).max(0.0) as u64,
+    })
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -2349,14 +2417,14 @@ impl Daemon {
                 }
             }
             // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
+            // (★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유).
             let dropped: Vec<QueueEntry> = surf.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
                     Some(surf.id),
-                    json!({"reason": "process_exited", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
+                    queue_dropped_payload("process_exited", &dropped),
                 );
             }
             daemon.bus.publish(
@@ -5271,5 +5339,108 @@ mod tests {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── ★G1(W2-B): 큐 이벤트 payload 빌더 스키마 핀 ─────────────────────────
+    // json! 페이로드는 컴파일러 강제 밖 — 기존 키(소비자 계약)와 additive 키를 여기서 고정.
+
+    fn w2b_entry(id: &str, seq: u64, text: &str, enqueued_at: f64) -> QueueEntry {
+        QueueEntry {
+            id: id.to_string(),
+            seq,
+            text: text.to_string(),
+            enqueued_at,
+            from: Some("surface:1".to_string()),
+            origin: "send".to_string(),
+        }
+    }
+
+    /// 폐기 3발행처 공용 스키마 핀 — reason 어휘 3종 전부에서 기존 키(reason/count/bytes)
+    /// 값 불변 + queue_entry_ids 순서 보존. `entry_ids` 키(W-id 에코 계약)는 절대 부재.
+    #[test]
+    fn queue_dropped_payload_pins_existing_keys_and_adds_queue_entry_ids() {
+        let dropped = vec![w2b_entry("qa.1", 1, "첫", 10.0), w2b_entry("qa.2", 2, "둘째", 20.0)];
+        for reason in ["process_exited", "surface_closed", "cleared"] {
+            let p = queue_dropped_payload(reason, &dropped);
+            assert_eq!(p["reason"], json!(reason), "기존 키 reason 불변");
+            assert_eq!(p["count"], json!(2), "기존 키 count 불변");
+            assert_eq!(
+                p["bytes"],
+                json!("첫".len() + "둘째".len()),
+                "기존 키 bytes = 본문 바이트 합 불변"
+            );
+            assert_eq!(
+                p["queue_entry_ids"],
+                json!(["qa.1", "qa.2"]),
+                "additive queue_entry_ids — 큐 순서 보존"
+            );
+            assert!(
+                p.get("entry_ids").is_none(),
+                "entry_ids 키명은 W-id 에코 전용(javis_report_gate disarm 조인 키) — 재사용 금지"
+            );
+        }
+        // 빈 drain 은 발행처가 발행 자체를 생략하지만, 빌더 자체도 안전해야 한다.
+        let empty = queue_dropped_payload("cleared", &[]);
+        assert_eq!(empty["count"], json!(0));
+        assert_eq!(empty["queue_entry_ids"], json!([] as [&str; 0]));
+    }
+
+    /// enqueue 3경로 공용 스키마 핀 — 기존 키(bytes/depth/from · send-key 만 key) 불변 +
+    /// queue_entry_id/seq/enqueued_at additive. key 는 send-key 경로에서만 존재한다.
+    #[test]
+    fn queue_enqueued_payload_pins_existing_keys_and_additive_ids() {
+        // send 경로꼴: from = 클라이언트 문자열 or null, key 없음.
+        let e = w2b_entry("qb.5", 5, "안녕", 111.5);
+        let p = queue_enqueued_payload(&e, 3, json!("w1"), None);
+        assert_eq!(p["bytes"], json!("안녕".len()), "기존 키 bytes 불변(UTF-8 바이트)");
+        assert_eq!(p["depth"], json!(3), "기존 키 depth 불변");
+        assert_eq!(p["from"], json!("w1"), "기존 키 from 불변(호출자 전달값 그대로)");
+        assert!(p.get("key").is_none(), "send 경로에 key 키 없음(무회귀)");
+        assert_eq!(p["queue_entry_id"], json!("qb.5"), "additive 조준점");
+        assert_eq!(p["seq"], json!(5));
+        assert_eq!(p["enqueued_at"], json!(111.5));
+
+        // send-key 경로꼴: text="" → bytes 0, key="Return" 유지.
+        let ek = w2b_entry("qb.6", 6, "", 112.0);
+        let pk = queue_enqueued_payload(&ek, 1, json!(null), Some("Return"));
+        assert_eq!(pk["bytes"], json!(0), "send-key 는 bytes 0(무회귀)");
+        assert_eq!(pk["key"], json!("Return"), "기존 키 key 불변");
+        assert_eq!(pk["from"], json!(null), "from 부재 = null(무회귀)");
+        assert_eq!(pk["queue_entry_id"], json!("qb.6"));
+
+        // governance 경로꼴: from = "governance-approval" 고정 문자열.
+        let pg = queue_enqueued_payload(&e, 2, json!("governance-approval"), None);
+        assert_eq!(pg["from"], json!("governance-approval"));
+    }
+
+    /// 배달 영수증 스키마 핀 — 기존 4키(bytes/remaining/entry_ids/surface_ref) 의미 불변:
+    /// entry_ids 는 전달된 W-id 에코 그대로(큐 항목 id 와 절대 별개 체계). additive 5키 +
+    /// wait_secs 음수 클램프 0(시계 스큐 방어).
+    #[test]
+    fn queue_delivered_payload_pins_wid_echo_and_wait_clamp() {
+        let e = w2b_entry("qc.9", 9, "[wakeup W-a1b2] 보고", 100.0);
+        let wids = vec!["W-a1b2".to_string()];
+        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9);
+        assert_eq!(p["bytes"], json!(e.text.len()), "기존 키 bytes 불변");
+        assert_eq!(p["remaining"], json!(4), "기존 키 remaining 불변");
+        assert_eq!(
+            p["entry_ids"],
+            json!(["W-a1b2"]),
+            "entry_ids = W-id 에코(원문 기준) 그대로 — critical disarm 조인 키 불변"
+        );
+        assert_eq!(p["surface_ref"], json!("surface:12"), "기존 키 surface_ref 불변");
+        assert_eq!(p["queue_entry_id"], json!("qc.9"), "큐 항목 id 는 별도 키로만");
+        assert_ne!(
+            p["queue_entry_id"], p["entry_ids"][0],
+            "두 id 체계는 같은 값·같은 키로 섞이지 않는다"
+        );
+        assert_eq!(p["seq"], json!(9));
+        assert_eq!(p["enqueued_at"], json!(100.0));
+        assert_eq!(p["delivered_at"], json!(107.9));
+        assert_eq!(p["wait_secs"], json!(7), "wait = delivered - enqueued 내림(u64)");
+        // W-id 봉입 없는 일반 배달 = 빈 배열(키는 항상 존재 — 에코 계약).
+        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0);
+        assert_eq!(p0["entry_ids"], json!([] as [&str; 0]));
+        assert_eq!(p0["wait_secs"], json!(0), "시계 역행(delivered < enqueued)은 0 클램프");
     }
 }

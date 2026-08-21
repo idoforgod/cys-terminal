@@ -1002,7 +1002,7 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
     let window = env_u64("CYS_APPROVAL_WAKEUP_DEDUPE_SECS", 300) as f64;
     let now = now_epoch();
     let mut suppressed = false;
-    let depth = {
+    let enqueued = {
         let mut q = s.pending_queue.lock().unwrap();
         // 락 순서: pending_queue → APPROVAL_WAKEUP_RECENT. 이 static 은 여기서만 잡히므로
         // 역순 획득자가 존재할 수 없다(데드락 무관).
@@ -1020,9 +1020,12 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
             None // 큐 포화 — 종전대로 조용히 무시
         } else {
             // ★G1(W2-A): enqueue 3경로 중 governance 경로 — origin 태그로 관통 추적.
-            q.push_back(daemon.next_queue_entry(text.to_string(), None, "governance-approval"));
+            // ★G1(W2-B): 이벤트에 항목 조준점(queue_entry_id/seq/enqueued_at)을 동봉하려
+            // entry를 밖으로 넘긴다(발급-적재-발행의 항목 동일성 보장).
+            let entry = daemon.next_queue_entry(text.to_string(), None, "governance-approval");
+            q.push_back(entry.clone());
             recent.insert(approval_wakeup_hash(text), now);
-            Some(q.len())
+            Some((entry, q.len()))
         }
     };
     if suppressed {
@@ -1038,14 +1041,15 @@ fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
         return;
     }
     // 적재 성공 시에만 queue.enqueued — 기존 발행 경로 무회귀(수락 증거의 의미 불변).
-    let Some(depth) = depth else {
+    // ★G1(W2-B): payload는 enqueue 3경로 공용 빌더(기존 키 bytes/depth/from 불변 + additive).
+    let Some((entry, depth)) = enqueued else {
         return;
     };
     daemon.bus.publish(
         "queue.enqueued",
         "queue",
         Some(master_sid),
-        json!({"bytes": text.len(), "depth": depth, "from": "governance-approval"}),
+        crate::state::queue_enqueued_payload(&entry, depth, json!("governance-approval"), None),
     );
     daemon.persist_queue_state();
 }
@@ -2609,6 +2613,7 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         id,
     );
     // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
+    // (★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유).
     let dropped: Vec<crate::state::QueueEntry> =
         surface.pending_queue.lock().unwrap().drain(..).collect();
     if !dropped.is_empty() {
@@ -2616,8 +2621,7 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
             "queue.dropped",
             "queue",
             Some(id),
-            json!({"reason": "surface_closed", "count": dropped.len(),
-                   "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
+            crate::state::queue_dropped_payload("surface_closed", &dropped),
         );
     }
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
@@ -2900,14 +2904,20 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
             // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
             // (entry_ids = W-id 에코 계약 — 큐 항목 id(queue_entry_id)와 별개 체계·키명 불변.)
+            // ★G1(W2-B): payload는 공용 빌더 — 기존 4키 불변 + queue_entry_id/seq/enqueued_at/
+            // delivered_at/wait_secs additive. W-id 에코는 **원문 text 스캔** 그대로다.
             let entry_ids = wakeup_entry_ids(&entry.text);
             daemon.bus.publish(
                 "queue.delivered",
                 "queue",
                 Some(s.id),
-                serde_json::json!({"bytes": entry.text.len(), "remaining": remaining,
-                                   "entry_ids": entry_ids,
-                                   "surface_ref": cys::surface_ref(s.id)}),
+                crate::state::queue_delivered_payload(
+                    &entry,
+                    remaining,
+                    &entry_ids,
+                    &cys::surface_ref(s.id),
+                    now_epoch(),
+                ),
             );
             // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
             daemon.persist_queue_state();

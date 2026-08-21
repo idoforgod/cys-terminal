@@ -1459,7 +1459,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
                     params.get("from").and_then(|v| v.as_str()).map(str::to_string)
                 });
-                let depth = {
+                let (entry, depth) = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
                         return Reply::Single(err_response(
@@ -1468,21 +1468,31 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(daemon.next_queue_entry(text.clone(), entry_from, "send"));
-                    q.len()
+                    let entry = daemon.next_queue_entry(text.clone(), entry_from, "send");
+                    q.push_back(entry.clone());
+                    (entry, q.len())
                 };
+                // ★G1(W2-B): payload는 enqueue 3경로 공용 빌더(기존 키 bytes/depth/from 불변
+                // + queue_entry_id/seq/enqueued_at additive).
                 daemon.bus.publish(
                     "queue.enqueued",
                     "queue",
                     Some(sid),
-                    json!({"bytes": text.len(), "depth": depth,
-                           "from": params.get("from").cloned().unwrap_or(Value::Null)}),
+                    crate::state::queue_enqueued_payload(
+                        &entry,
+                        depth,
+                        params.get("from").cloned().unwrap_or(Value::Null),
+                        None,
+                    ),
                 );
                 // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
                 daemon.persist_queue_state();
+                // ★G1(W2-B): 응답에 queue_entry_id 가산(queued/depth 불변) — 발신자가
+                // 이후 queue.list·배달/폐기 이벤트를 조인하는 조준점.
                 return Reply::Single(ok_response(
                     &id,
-                    json!({"surface_id": sid, "queued": true, "depth": depth}),
+                    json!({"surface_id": sid, "queued": true, "depth": depth,
+                           "queue_entry_id": entry.id}),
                 ));
             }
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
@@ -1676,7 +1686,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
                     params.get("from").and_then(|v| v.as_str()).map(str::to_string)
                 });
-                let depth = {
+                let (entry, depth) = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
                         return Reply::Single(err_response(
@@ -1685,21 +1695,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    q.push_back(daemon.next_queue_entry(String::new(), entry_from, "send-key"));
-                    q.len()
+                    let entry = daemon.next_queue_entry(String::new(), entry_from, "send-key");
+                    q.push_back(entry.clone());
+                    (entry, q.len())
                 };
+                // ★G1(W2-B): payload는 enqueue 3경로 공용 빌더 — send-key 는 key 키 유지
+                // (bytes/depth/key/from 불변 + queue_entry_id/seq/enqueued_at additive).
                 daemon.bus.publish(
                     "queue.enqueued",
                     "queue",
                     Some(sid),
-                    json!({"bytes": 0, "depth": depth, "key": "Return",
-                           "from": params.get("from").cloned().unwrap_or(Value::Null)}),
+                    crate::state::queue_enqueued_payload(
+                        &entry,
+                        depth,
+                        params.get("from").cloned().unwrap_or(Value::Null),
+                        Some("Return"),
+                    ),
                 );
                 // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
                 daemon.persist_queue_state();
                 return Reply::Single(ok_response(
                     &id,
-                    json!({"surface_id": sid, "key": key, "queued": true, "depth": depth}),
+                    json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
+                           "queue_entry_id": entry.id}),
                 ));
             }
             // 권위 주입(send_text와 동일 근거)은 타이핑 가드를 면제 — launch-agent/reinject가
@@ -4276,12 +4294,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         continue;
                     }
                 }
+                let now = crate::state::now_epoch();
                 let q = s.pending_queue.lock().unwrap();
                 for (i, e) in q.iter().enumerate() {
+                    // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
+                    // 조준 id 와 기아 나이(age_secs)를 여기서 얻는다. age 는 음수 클램프 0
+                    // (시계 스큐 방어 — wait_secs 계약과 동형).
                     out.push(json!({
                         "surface_id": s.id, "surface_ref": surface_ref(s.id),
                         "index": i, "bytes": e.text.len(),
                         "preview": e.text.chars().take(80).collect::<String>(),
+                        "id": e.id, "seq": e.seq, "enqueued_at": e.enqueued_at,
+                        "age_secs": (now - e.enqueued_at).max(0.0) as u64,
+                        "from": e.from, "origin": e.origin,
                     }));
                 }
             }
@@ -4341,6 +4366,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // ★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유.
             let dropped: Vec<crate::state::QueueEntry> =
                 surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
@@ -4348,8 +4374,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "queue.dropped",
                     "queue",
                     Some(sid),
-                    json!({"reason": "cleared", "count": dropped.len(),
-                           "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>()}),
+                    crate::state::queue_dropped_payload("cleared", &dropped),
                 );
             }
             // P7 큐 WAL: clear로 비워진 큐를 디스크에 반영(스냅샷 최신화).
