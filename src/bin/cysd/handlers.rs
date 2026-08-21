@@ -2615,8 +2615,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // "agent 미상 — 건너뜀"으로 영구 제외한다(재부팅마다 역할 소실). 역할을 쥔 이 순간
             // 좌석 자손에서 기지 에이전트가 '정확히 하나' 관측될 때만 관측값을 기록한다(추정 0 ·
             // 모호/무관측=무기록 fail-closed). 프로세스 표 refresh 는 임계영역 밖(위 락 규약과
-            // 동일 — seat_claimable_now 의 근거). unix 한정: Windows 는 래퍼(cmd/node) 계층이
-            // 관측을 흐려 오식별→오살 위험(2026-07-29 교훈)이라 현행(None) 유지.
+            // 동일 — seat_claimable_now 의 근거). unix=즉시 등록 / Windows=아래 2단계 확정
+            // 절차(★G5-③ W5-A): 래퍼(cmd/node) 계층이 관측을 흐려 순간 스냅샷 1회는
+            // 오식별→오살 위험(2026-07-29 교훈)이므로, '관측 포기'가 아니라 '확정 지연'으로
+            // 존중한다 — claim 시점 pending 기록 → 다음 governance 틱의 동일 단일 에이전트
+            // 재관측(2-표본 시간 안정성)에서만 meta 확정(governance::confirm_pending_obs).
             // agent_seen=true 는 추정이 아니라 방금의 관측 파생이다 — 사망감지 상태머신을 허위
             // DEAD 과도기 없이 정직하게 무장한다(set_meta RPC 의 false 리셋은 '재등록' 대비책이고
             // 여기는 최초 등록 + 실관측이라 의미가 다르다).
@@ -2660,6 +2663,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                    "via": if dead_reobserve { "claim_role_reprobe" }
                                           else { "claim_role_probe" }}),
                         );
+                    }
+                }
+            }
+            // ★G5-③(W5-A) Windows 1표본째: 관측이 Some 이어도 meta 를 즉시 쓰지 않고
+            // pending_agent_obs 에만 스테이징한다(이벤트 발행·agent_seen 설정 없음 — 확정은
+            // governance 틱의 confirm_pending_obs 가 2표본째 일치에서만). launch-agent 좌석은
+            // 이미 Windows 에서 set_meta+사망감지가 살아있으므로, claim-role 좌석의 이 등록은
+            // 기존 기계에 대한 '동급화'일 뿐 새 위험 부류가 아니다. meta 보유 좌석(재용도화
+            // 재관측 포함)은 대상 외 — 2-표본 개방은 최초 등록에 한정한다(cfg 분기 최소화).
+            #[cfg(windows)]
+            if let Some(s) = daemon.get_surface(sid) {
+                if s.agent_meta.lock().unwrap().is_none() {
+                    if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
+                        *s.pending_agent_obs.lock().unwrap() =
+                            Some((agent, bin, crate::state::now_epoch()));
                     }
                 }
             }

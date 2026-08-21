@@ -378,6 +378,18 @@ pub struct Surface {
     /// 원시 Occupied(아무 자손)로 armed 하면 vim/less/빌드 좌석의 프롬프트 복귀가 사망 후보가
     /// 된다(결함 8 동형) — armed 경계는 반드시 이 엄격 관측이다.
     pub seat_agent_cache: AtomicBool,
+    /// ★G5-③(W5-A) Windows claim_role 관측 등록의 **2-표본 확정 스테이징** — (agent, bin, 관측
+    /// epoch초). 쓰기 = claim_role 핸들러 `#[cfg(windows)]` arm(1표본째) · 소거/확정 =
+    /// `governance::check_agent_death` 선두의 confirm_pending_obs 훅(2표본째) 단독.
+    /// 순간 스냅샷 1회로 meta 를 확정하면 래퍼(cmd/node) 계층·도구 호출로 잠깐 뜬 타 에이전트가
+    /// 오식별→오살(2026-07-29 교훈)로 이어지므로, 시간차 재관측 일치까지 확정을 지연한다.
+    /// **W3-A `seat_agent_cache` 와의 관계(판정 이원화 아님)**: seat_agent_cache 는 무meta 좌석의
+    /// '기지 에이전트 관측 여부' bool 캐시(매 틱 refresh_seat_cache 단일 writer · 데드맨 보조축
+    /// arming 소비)고, 이 필드는 **정체(identity)까지 담은 등록 대기열**(claim 시점에만 기록 ·
+    /// 확정 시 agent_meta 로 승격 후 소멸)이다 — 수명·소비자·의미가 달라 통합하지 않는다.
+    /// topology 영속(persist_topology) **비대상**: 재기동 시 자연 소멸 = 미확정 관측이 부활
+    /// 재료가 되는 경로 원천 차단. unix 에서는 항상 None(현행 즉시 등록 경로 유지).
+    pub pending_agent_obs: Mutex<Option<(String, String, f64)>>,
     /// T5 사용량 관측 스냅샷 (usage.rs 수집기가 갱신 — 자기보고 agent_status와 별개 층위)
     pub observed_usage: Mutex<Option<crate::usage::ObservedUsage>>,
     /// T5 세션 트랜스크립트 등록 (`usage.register` — SessionStart hook의 결정론 매핑)
@@ -415,6 +427,11 @@ pub struct Surface {
     /// (W4) 이 surface의 reader 스레드가 vt100 파서 패닉을 격리·재초기화한 누적 횟수.
     /// process_chunk_isolated가 패닉을 잡을 때마다 증가 — status(org.status)에 노출한다.
     pub parser_panics: AtomicU64,
+    /// ★G5-④(W5-A) DSR(CPR) 응답이 write 채널 포화로 유계 대기(250ms) 후에도 송신되지 못하고
+    /// 드롭된 누적 횟수 — 내부 관측 카운터(wire 비노출 · status 노출은 별도 결정). try_send
+    /// 즉시 드롭은 '고부하에서만 ConPTY 스톨'이라는 최악 재현 조건을 만들므로 유계 블로킹으로
+    /// 바꾸되, 그래도 실패하면 침묵하지 않고 여기 남긴다(발생률 관측 후 구조 격상 판단 재료).
+    pub dsr_dropped: AtomicU64,
     /// (W4) 마지막 파서 패닉 발생 epoch초(없으면 None) — 상습 트리거 포렌식용 health 신호.
     pub last_parser_panic: Mutex<Option<f64>>,
     /// ★(T-0147-7 W2 · B6) **각성 래치** — 이 surface 가 처음 `status.set`(=cys set-status)을 보낸
@@ -827,6 +844,58 @@ pub fn live_worker_count(roles: &HashMap<String, u64>, is_alive: impl Fn(u64) ->
         .count()
 }
 
+/// ★G5-④(W5-A) DSR 응답 송신 유계 대기 한도 — reader 스레드가 write 채널(128) 포화 시
+/// 이만큼만 재시도 후 드롭한다(무한 블로킹 = 배수 정지 금지 계약 위반 · 즉시 드롭 = 고부하
+/// ConPTY 스톨 재현 조건). 250ms 는 ConPTY 핸드셰이크 상시 경로가 아닌 드문 이벤트에만 지불.
+pub const DSR_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+/// 유계 대기 재시도 슬라이스 — deadline 안에서 이 간격으로 try_send 를 반복한다.
+const DSR_SEND_RETRY_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// ★G5-④(W5-A) 청크 내 DSR(CPR) 질의 수 + 다음 carry 꼬리 — 순수 함수(경계 분할·다중 질의
+/// 핀 테스트 대상). `tail`(직전 청크 꼬리 최대 3바이트)과 `chunk` 를 이어붙인 창에서
+/// `\x1b[6n` 매치 수를 세고, 다음 청크로 넘길 꼬리(마지막 3바이트)를 함께 반환한다.
+///
+/// 이중 계상 없음 증명: 완성 매치(4바이트)는 3바이트 꼬리 안에 온전히 들어갈 수 없으므로,
+/// 직전 청크에서 이미 센 매치가 다음 창에서 다시 세어지는 경로는 구조적으로 없다.
+/// 종전 bool(`needs_dsr`) 판정은 한 청크에 질의가 N개 와도 응답을 1건만 보내 나머지 N-1건을
+/// 침묵 누락시켰다(ConPTY 가 미응답 질의를 기다리며 펌프 정지) — 질의 수만큼 응답한다.
+pub fn count_dsr_queries(tail: &[u8], chunk: &[u8]) -> (usize, Vec<u8>) {
+    let mut probe = tail.to_vec();
+    probe.extend_from_slice(chunk);
+    let count = probe.windows(4).filter(|w| *w == b"\x1b[6n").count();
+    let new_tail = probe[probe.len().saturating_sub(3)..].to_vec();
+    (count, new_tail)
+}
+
+/// ★G5-④(W5-A) WriteReq 유계 블로킹 송신 — `std::sync::mpsc::SyncSender` 에는 send_timeout
+/// 이 없으므로(타임아웃은 수신측 recv_timeout 뿐) try_send + 짧은 슬라이스 재시도로 등가
+/// 의미를 구현한다. 반환 true=송신 성공 / false=deadline 소진 또는 수신자 소멸(드롭 — 호출자가
+/// 카운터·로그로 가시화할 책임). **유계 보증**: 최악에도 deadline + 슬라이스 1회분 안에 반환
+/// 한다 — reader 스레드의 '배수 절대 정지 금지' 계약을 깨지 않는다.
+pub fn send_write_req_bounded(
+    tx: &std::sync::mpsc::SyncSender<WriteReq>,
+    req: WriteReq,
+    deadline: std::time::Duration,
+) -> bool {
+    use std::sync::mpsc::TrySendError;
+    let start = Instant::now();
+    let mut req = req;
+    loop {
+        match tx.try_send(req) {
+            Ok(()) => return true,
+            // 수신자 소멸(writer 스레드 종료) — 재시도 무의미, 즉시 드롭.
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(r)) => {
+                if start.elapsed() >= deadline {
+                    return false;
+                }
+                req = r;
+                std::thread::sleep(DSR_SEND_RETRY_SLICE);
+            }
+        }
+    }
+}
+
 /// (W4) PTY 청크를 vt100 파서에 반영하되, 파서 내부 인덱스 패닉을 격리한다.
 ///
 /// vt100 0.15.2는 와이드(CJK·이모지) 문자의 선두 셀이 마지막 열에 놓인 상태에서 그 셀을
@@ -847,15 +916,17 @@ pub fn live_worker_count(roles: &HashMap<String, u64>, is_alive: impl Fn(u64) ->
 fn process_chunk_isolated(
     parser: &mut vt100::Parser,
     chunk: &[u8],
-    needs_dsr: bool,
+    dsr_count: usize,
 ) -> (Option<String>, bool) {
     // rows/cols를 process '이전'에 포착 — 패닉 후 파서를 재접근하지 않고 fresh 재초기화에 쓴다.
     let (rows, cols) = parser.screen().size();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         parser.process(chunk);
-        needs_dsr.then(|| {
+        // ★G5-④: 질의 수만큼 CPR 응답 — 좌표는 청크 반영 '후' 커서 위치로 동일하다(실단말도
+        // 미처리 큐를 소진한 시점에 응답하므로 등가 · ConPTY 목적은 '응답 수 일치'가 본질).
+        (dsr_count > 0).then(|| {
             let (r, c) = parser.screen().cursor_position();
-            format!("\x1b[{};{}R", r + 1, c + 1)
+            format!("\x1b[{};{}R", r + 1, c + 1).repeat(dsr_count)
         })
     }));
     match res {
@@ -951,17 +1022,17 @@ mod panic_isolation_tests {
     /// vt100 0.15.2가 `cells[col+1]`=cells[25]를 경계 밖 인덱싱해 패닉한다(프로덕션 "len 25 index 25").
     /// 좁은 pane으로의 resize + 한국어 CLI 출력이라는 실제 경로를 그대로 박제한다.
     fn drive_row89_panic(parser: &mut vt100::Parser) -> bool {
-        process_chunk_isolated(parser, b"\x1b[1;25H", false);
-        process_chunk_isolated(parser, "\u{ac00}".as_bytes(), false); // '가'(wide)
+        process_chunk_isolated(parser, b"\x1b[1;25H", 0);
+        process_chunk_isolated(parser, "\u{ac00}".as_bytes(), 0); // '가'(wide)
         parser.set_size(10, 25); // 축소 → 선두 와이드 셀이 마지막 열로
-        let (_, panicked) = process_chunk_isolated(parser, b"\x1b[1;25Ha", false);
+        let (_, panicked) = process_chunk_isolated(parser, b"\x1b[1;25Ha", 0);
         panicked
     }
 
     #[test]
     fn normal_chunk_does_not_report_panic() {
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        let (_, panicked) = process_chunk_isolated(&mut p, b"hello world", false);
+        let (_, panicked) = process_chunk_isolated(&mut p, b"hello world", 0);
         assert!(!panicked, "정상 입력은 패닉을 발동하지 않는다");
         assert!(p.screen().contents().contains("hello world"));
     }
@@ -987,7 +1058,7 @@ mod panic_isolation_tests {
         // 격리 후 파서는 계속 동작 — 후속 청크가 정상 반영돼야 한다(reader 배수 지속의 파서측 보증).
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
         assert!(drive_row89_panic(&mut p));
-        let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[2J\x1b[1;1Halive", false);
+        let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[2J\x1b[1;1Halive", 0);
         assert!(!panicked, "재초기화된 파서는 후속 청크를 패닉 없이 반영해야 한다");
         assert!(
             p.screen().contents().contains("alive"),
@@ -997,11 +1068,127 @@ mod panic_isolation_tests {
 
     #[test]
     fn dsr_response_survives_isolation() {
-        // needs_dsr 경로도 격리 헬퍼를 통과 — 정상 시 커서 위치 응답을 반환한다.
+        // dsr_count 경로도 격리 헬퍼를 통과 — 정상 시 커서 위치 응답을 반환한다(질의 1=응답 1).
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        let (resp, panicked) = process_chunk_isolated(&mut p, b"\x1b[3;5H", true);
+        let (resp, panicked) = process_chunk_isolated(&mut p, b"\x1b[3;5H", 1);
         assert!(!panicked);
         assert_eq!(resp.as_deref(), Some("\x1b[3;5R"));
+    }
+}
+
+// ── ★G5-④(W5-A) DSR 다중 질의·경계 carry·유계 송신 회귀 핀 ──
+#[cfg(test)]
+mod dsr_tests {
+    use super::{
+        count_dsr_queries, process_chunk_isolated, send_write_req_bounded, WriteReq,
+        DSR_SEND_DEADLINE, SCROLLBACK_LINES,
+    };
+    use std::time::{Duration, Instant};
+
+    /// 한 청크에 질의 3건 → 응답 3건(좌표 동일 CPR 연쇄) — 종전 bool 판정은 1건만 응답해
+    /// 나머지 2건을 침묵 누락시켰다(ConPTY 미응답 대기 스톨의 재료). 회귀 핀.
+    #[test]
+    fn multi_dsr_queries_get_one_response_each() {
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let chunk = b"\x1b[4;7H\x1b[6n\x1b[6n\x1b[6n";
+        let (count, _) = count_dsr_queries(&[], chunk);
+        assert_eq!(count, 3, "질의 수 계상: \\x1b[6n x3");
+        let (resp, panicked) = process_chunk_isolated(&mut p, chunk, count);
+        assert!(!panicked);
+        assert_eq!(
+            resp.as_deref(),
+            Some("\x1b[4;7R\x1b[4;7R\x1b[4;7R"),
+            "질의 수만큼 CPR 응답(좌표 동일)"
+        );
+    }
+
+    /// 청크 경계 분할(\x1b[6 + n) carry 매치 유지 — 기존 3바이트 꼬리 의미 봉인.
+    #[test]
+    fn split_query_across_chunks_is_carried() {
+        let (c1, tail1) = count_dsr_queries(&[], b"hello\x1b[6");
+        assert_eq!(c1, 0, "미완성 질의는 아직 계상하지 않는다");
+        assert_eq!(tail1, b"\x1b[6".to_vec(), "꼬리 3바이트 carry");
+        let (c2, _) = count_dsr_queries(&tail1, b"nworld");
+        assert_eq!(c2, 1, "다음 청크에서 완성된 질의를 정확히 1건 계상");
+    }
+
+    /// 이중 계상 금지 — 직전 청크에서 이미 완성·계상된 질의가 다음 창에서 재계상되지 않는다
+    /// (완성 4바이트 매치는 3바이트 꼬리에 온전히 들어갈 수 없다는 구조 보증의 기계 확인).
+    #[test]
+    fn completed_query_is_not_double_counted() {
+        let (c1, tail1) = count_dsr_queries(&[], b"ab\x1b[6n");
+        assert_eq!(c1, 1);
+        let (c2, _) = count_dsr_queries(&tail1, b"plain output");
+        assert_eq!(c2, 0, "직전 계상분이 꼬리를 타고 재계상되면 응답 과잉(프로토콜 오염)");
+    }
+
+    /// 질의 0 → 응답 None (기존 무질의 경로 의미 불변 핀).
+    #[test]
+    fn zero_queries_yield_no_response() {
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let (count, _) = count_dsr_queries(&[], b"plain");
+        assert_eq!(count, 0);
+        let (resp, _) = process_chunk_isolated(&mut p, b"plain", count);
+        assert_eq!(resp, None);
+    }
+
+    /// 채널 포화 시 유계 실패 — 무한 블로킹(배수 정지)도, 즉시 침묵 드롭도 아니다.
+    /// capacity-1 채널을 가득 채운 채 송신 → deadline 안팎의 유계 시간 내 false 반환.
+    #[test]
+    fn bounded_send_fails_bounded_on_full_channel() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<WriteReq>(1);
+        tx.try_send(WriteReq::Data(b"occupy".to_vec())).unwrap();
+        let deadline = Duration::from_millis(60);
+        let start = Instant::now();
+        let ok = send_write_req_bounded(&tx, WriteReq::Data(b"dsr".to_vec()), deadline);
+        let elapsed = start.elapsed();
+        assert!(!ok, "포화 지속 시 드롭(false) — 침묵이 아니라 호출자가 카운터로 가시화");
+        assert!(elapsed >= deadline, "deadline 이전 조기 포기 금지: {elapsed:?}");
+        assert!(
+            elapsed < deadline + Duration::from_millis(500),
+            "유계 보증 위반(배수 정지 위험): {elapsed:?}"
+        );
+    }
+
+    /// 여유 채널 → 즉시 성공 · 수신자 소멸 → 즉시 false (재시도 낭비 금지).
+    #[test]
+    fn bounded_send_success_and_disconnect() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(1);
+        assert!(send_write_req_bounded(
+            &tx,
+            WriteReq::Data(b"a".to_vec()),
+            DSR_SEND_DEADLINE
+        ));
+        drop(rx);
+        let start = Instant::now();
+        assert!(!send_write_req_bounded(
+            &tx,
+            WriteReq::Data(b"b".to_vec()),
+            DSR_SEND_DEADLINE
+        ));
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "수신자 소멸은 deadline 대기 없이 즉시 실패해야 한다"
+        );
+    }
+
+    /// 포화가 풀리면 deadline 내 재시도가 성공한다 — 드롭 방지의 본체(수리 목적 핀).
+    #[test]
+    fn bounded_send_succeeds_when_drained_within_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(1);
+        tx.try_send(WriteReq::Data(b"occupy".to_vec())).unwrap();
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = rx.recv(); // 자리 1개 해방
+            rx
+        });
+        let ok = send_write_req_bounded(
+            &tx,
+            WriteReq::Data(b"dsr".to_vec()),
+            Duration::from_millis(250),
+        );
+        assert!(ok, "포화 해소 시 deadline 내 송신 성공(종전 try_send 는 즉시 드롭)");
+        drop(drainer.join().unwrap());
     }
 }
 
@@ -2415,6 +2602,8 @@ impl Daemon {
             seat_cache: AtomicU8::new(0),
             // 신생 좌석은 미관측(false) — 첫 watchdog 틱의 엄격 관측이 확정한다(fail-closed).
             seat_agent_cache: AtomicBool::new(false),
+            // ★G5-③: 확정 대기 관측은 항상 빈 채로 출발 — claim_role(windows)만이 기록한다.
+            pending_agent_obs: Mutex::new(None),
             agent_meta: Mutex::new(None),
             agent_seen: AtomicBool::new(false),
             agent_exit_notified: AtomicBool::new(false),
@@ -2440,6 +2629,7 @@ impl Daemon {
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
             osc_carry: Mutex::new(Vec::new()),
             parser_panics: AtomicU64::new(0),
+            dsr_dropped: AtomicU64::new(0),
             last_parser_panic: Mutex::new(None),
             // ★W2 B6: 래치는 항상 None 으로 시작한다 — 생성 시점엔 아직 어떤 각성 증거도 없다.
             // restore 경로의 하이드레이션은 surface.create 핸들러가 topology 값으로 명시 주입한다
@@ -2540,9 +2730,9 @@ impl Daemon {
                         let chunk = &buf[..n];
                         // DSR cursor-position query: a real terminal must answer, or
                         // ConPTY(Windows)가 응답을 기다리며 입출력 펌프를 멈춘다.
-                        let mut probe = dsr_tail.clone();
-                        probe.extend_from_slice(chunk);
-                        let needs_dsr = probe.windows(4).any(|w| w == b"\x1b[6n");
+                        // ★G5-④: 경계 분할 carry + 질의 '수' 계상은 순수 함수 단일 정의처
+                        // (count_dsr_queries — 다중 질의 각각 응답·carry 의미 봉인 테스트 대상).
+                        let (dsr_count, new_tail) = count_dsr_queries(&dsr_tail, chunk);
                         // attach 브로드캐스트 페이로드는 락 '밖'에서 복사한다 — send 자체는 아래
                         // 불변식상 parser 락 안이어야 하지만, chunk 복사(최대 16KB)까지 락 안에서
                         // 하면 대량출력 시 락 보유 시간이 memcpy만큼 늘어 read-screen·status·attach의
@@ -2562,7 +2752,7 @@ impl Daemon {
                             // reader 스레드는 죽지 않고, 아래 out_tx.send(원시 바이트 broadcast)와
                             // 후속 ingest 경로는 계속 태워 PTY 배수를 절대 멈추지 않는다.
                             let (resp, panicked) =
-                                process_chunk_isolated(&mut parser, chunk, needs_dsr);
+                                process_chunk_isolated(&mut parser, chunk, dsr_count);
                             if panicked {
                                 // 재발 관측: surface별·데몬 전체 카운터 + 마지막 발생 시각(status 노출).
                                 surf.parser_panics.fetch_add(1, Ordering::Relaxed);
@@ -2586,12 +2776,35 @@ impl Daemon {
                             resp
                         };
                         if let Some(resp) = dsr_resp {
-                            let _ = surf.write_tx.try_send(WriteReq::Data(resp.into_bytes()));
-                            if debug {
-                                eprintln!("[debug] surface {} answered DSR", surf.id);
+                            // ★G5-④ 락 범위 검증 완료(W5-A 확정 결정의 선행 조건): 이 송신은
+                            // 위 parser 락 블록이 닫힌 '뒤'다 — 유계 대기(250ms)가 블록하는 것은
+                            // reader 스레드 자신뿐이며 read-screen/status/attach(parser 락
+                            // 소비자)는 정지하지 않는다. 종전 try_send 는 채널(128) 포화 시
+                            // 응답을 조용히 버려 '고부하에서만 ConPTY 스톨'을 만들었다.
+                            if send_write_req_bounded(
+                                &surf.write_tx,
+                                WriteReq::Data(resp.into_bytes()),
+                                DSR_SEND_DEADLINE,
+                            ) {
+                                if debug {
+                                    eprintln!(
+                                        "[debug] surface {} answered DSR x{dsr_count}",
+                                        surf.id
+                                    );
+                                }
+                            } else {
+                                // 드롭 침묵 금지 — 카운터 + loud 로그(발생률 관측 후 격상 판단 재료).
+                                let dropped =
+                                    surf.dsr_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!(
+                                    "[cysd] surface {} DSR 응답 드롭 — write 채널 포화 {}ms 지속 \
+                                     (누적 {dropped}회). PTY 배수는 계속.",
+                                    surf.id,
+                                    DSR_SEND_DEADLINE.as_millis()
+                                );
                             }
                         }
-                        dsr_tail = probe[probe.len().saturating_sub(3)..].to_vec();
+                        dsr_tail = new_tail;
                         *surf.last_output.lock().unwrap() = Instant::now();
                         surf.idle_notified.store(false, Ordering::Relaxed);
                         // (B2-c) OSC 9/99/777 알림 스캔 — strip 전 raw chunk 사용. parser 락

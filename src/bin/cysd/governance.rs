@@ -302,6 +302,70 @@ fn check_agent_death(
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
+        // ★G5-③(W5-A) claim_role 관측 등록의 2-표본째 확정 훅 — Windows arm 이 스테이징한
+        // pending_agent_obs 를, 프로세스 표가 이미 refresh 된 이 자리(추가 스냅샷 비용 0)에서
+        // 재관측해 확정/포기/유보를 판정한다(판정은 순수 함수 confirm_pending_obs 단독).
+        // unix 에서는 pending 이 구조적으로 항상 None(claim_role 이 즉시 등록)이라 no-op —
+        // 훅 자체는 무cfg 로 두어 순수 판정자·소거 규약을 전 OS 테스트가 봉인한다.
+        // strict ⊆ broad 부분집합 보증(select_observed_agent 주석)이 그대로 성립하므로
+        // "등록됐는데 사망감지(broad)가 못 보는" 오살 비대칭은 신설되지 않는다.
+        let pending = s.pending_agent_obs.lock().unwrap().clone();
+        if let Some(pending) = pending {
+            // 가드 재확인: meta 미확정·역할 보유일 때만 확정 자격. 그 외(set_meta 선점·역할
+            // 해제)는 pending 이 무의미해진 것 — 확정 실패가 아니라 승계/해제이므로 조용히 소거.
+            let guard_ok =
+                s.agent_meta.lock().unwrap().is_none() && s.role.lock().unwrap().is_some();
+            if !guard_ok {
+                *s.pending_agent_obs.lock().unwrap() = None;
+            } else {
+                let candidates = known_agent_candidates();
+                let cmds: Vec<String> = collect_descendants(sys, s.pid)
+                    .into_iter()
+                    .map(|(_, cmd)| cmd)
+                    .collect();
+                let current = select_observed_agent(&cmds, &candidates);
+                match confirm_pending_obs(&pending, current.as_ref(), now, PENDING_OBS_TTL_SECS) {
+                    PendingVerdict::Commit => {
+                        // Commit ⇒ current=Some(동일 에이전트) — 신선한 2표본째를 기록한다
+                        // (bin 은 같은 후보표 파생이라 통상 동일 · 표 갱신 시 신선한 쪽이 진실).
+                        if let Some((agent, bin)) = current {
+                            *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
+                            // 실관측 파생 arming — unix 즉시 등록 경로(claim_role 핸들러)와 동일
+                            // 의미론: 허위 DEAD 과도기 없이 사망감지 상태머신을 정직하게 무장.
+                            s.agent_seen.store(true, Ordering::Relaxed);
+                            s.agent_exit_notified.store(false, Ordering::Relaxed);
+                            *s.pending_agent_obs.lock().unwrap() = None;
+                            let role = s.role.lock().unwrap().clone();
+                            daemon.bus.publish(
+                                "agent.observed",
+                                "system",
+                                Some(s.id),
+                                json!({"role": role, "agent": agent, "agent_bin": bin,
+                                       "via": "claim_role_probe_win_confirmed"}),
+                            );
+                            // 확정 meta 는 콜드부트 부활 재료 — topology 에 즉시 영속
+                            // (claim_role 핸들러의 persist 와 동일 의무).
+                            persist_topology(daemon);
+                        }
+                    }
+                    PendingVerdict::Drop { reason } => {
+                        *s.pending_agent_obs.lock().unwrap() = None;
+                        // 확정 실패 침묵 방지(W5-A [MAJOR]) — 관측·감사가 '등록이 왜 안 됐나'를
+                        // 이벤트로 본다(fail-closed 는 유지하되 fail-silent 는 금지).
+                        let role = s.role.lock().unwrap().clone();
+                        daemon.bus.publish(
+                            "agent.observe_dropped",
+                            "system",
+                            Some(s.id),
+                            json!({"role": role, "agent": pending.0, "agent_bin": pending.1,
+                                   "reason": reason,
+                                   "surface_ref": cys::surface_ref(s.id)}),
+                        );
+                    }
+                    PendingVerdict::Keep => {}
+                }
+            }
+        }
         let Some((agent, bin)) = s.agent_meta.lock().unwrap().clone() else {
             continue;
         };
@@ -2369,6 +2433,47 @@ pub fn observe_agent_on_surface(s: &crate::state::Surface) -> Option<(String, St
         .map(|(_, cmd)| cmd)
         .collect();
     select_observed_agent(&cmds, &candidates)
+}
+
+/// ★G5-③(W5-A) 2-표본 확정 대기(pending_agent_obs)의 TTL — 이 시간 안에 2표본째가 일치하지
+/// 않으면 확정을 포기한다(Drop). watchdog 틱(5초) 대비 넉넉한 값: 정상 경로는 다음 틱(≤5초)에
+/// 확정되므로, TTL 도달 = governance 정체·관측 플래핑이며 오래된 1표본은 부활 재료로 못 쓴다.
+pub(crate) const PENDING_OBS_TTL_SECS: f64 = 120.0;
+
+/// ★G5-③(W5-A) 2-표본 확정 판정 — 순수 함수(진리표 테스트 핀 대상 · judge_holder/
+/// plan_duplicate_kills 관례와 동형). 상태 변경·이벤트 발행은 호출부(check_agent_death 훅)에
+/// 잔류한다. `Drop` 은 사유를 담는다(호출부가 TTL 비교를 재유도하면 판정 두 벌=드리프트).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingVerdict {
+    /// 동일 단일 에이전트 재관측 — meta 확정 자격.
+    Commit,
+    /// 확정 포기(pending 소거) — reason: "ttl_expired" | "agent_mismatch".
+    Drop { reason: &'static str },
+    /// 판단 유보(무관측·모호) — 다음 틱 재시도(TTL 이 상한).
+    Keep,
+}
+
+/// 진리표(설계 원문 G5-③ · 회귀 핀 pending_verdict_truth_table):
+///   동일 단일 에이전트 재관측=Commit / 상이 에이전트=Drop / 무관측=Keep / TTL 초과=Drop /
+///   모호(select_observed_agent None)=Keep→TTL Drop.
+/// TTL 검사가 최우선이다 — TTL 을 넘긴 1표본은 같은 에이전트가 재관측돼도 신뢰하지 않는다
+/// (그 사이 좌석 재용도화·플래핑 가능성 — fail-closed·claim 재시도가 정도).
+pub(crate) fn confirm_pending_obs(
+    pending: &(String, String, f64),
+    current: Option<&(String, String)>,
+    now: f64,
+    ttl_secs: f64,
+) -> PendingVerdict {
+    if now - pending.2 > ttl_secs {
+        return PendingVerdict::Drop { reason: "ttl_expired" };
+    }
+    match current {
+        // 무관측·모호(둘 다 select_observed_agent None) — 순간 혼선일 수 있어 유보.
+        None => PendingVerdict::Keep,
+        Some((agent, _)) if *agent == pending.0 => PendingVerdict::Commit,
+        // 상이 에이전트 관측 = 1표본이 순간 혼선이었다는 반증 — 즉시 포기.
+        Some(_) => PendingVerdict::Drop { reason: "agent_mismatch" },
+    }
 }
 
 /// 중복 프로세스 kill 정책 — 순수 판정(테스트 핀). check_surfaces가 sys·daemon에서
@@ -4718,6 +4823,140 @@ mod tests {
         }
         // .js 로 끝나지 않는 경로의 세그먼트 매칭은 등록에서 무효(broad 전용).
         assert!(!cmdline_matches_agent_exec("node /home/u/claude-code/helper.py", "claude"));
+    }
+
+    /// ★G5-③(W5-A) strict 매처 Windows 픽스처 — 기존 픽스처군의 백슬래시 계열 증설.
+    /// Windows 개방(2-표본 확정)의 1·2표본 모두 이 매처를 타므로, 실전 cmdline 형태
+    /// (npm 래퍼 백슬래시 경로 · cmd 셔틀 · 데이터 파일 인자)의 판정을 전 OS 에서 봉인한다.
+    #[test]
+    fn registration_matcher_windows_fixtures() {
+        use super::select_observed_agent as sel;
+        use super::cmdline_matches_agent_exec;
+        let cands: Vec<(String, String)> = vec![
+            ("claude".into(), "claude".into()),
+            ("codex".into(), "codex".into()),
+        ];
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // npm 래퍼(백슬래시 경로·패키지 세그먼트 claude-code) — 매치.
+        let npm = r"node C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
+        assert!(cmdline_matches_agent_exec(npm, "claude"));
+        assert_eq!(sel(&s(&[npm]), &cands), Some(("claude".into(), "claude".into())));
+        // cmd 셔틀(.cmd 확장자 정규화·대소문자 무구분) — 매치.
+        let shim = r"cmd /C claude.cmd";
+        assert!(cmdline_matches_agent_exec(shim, "claude"));
+        assert_eq!(sel(&s(&[shim]), &cands), Some(("claude".into(), "claude".into())));
+        // 데이터 파일 인자(claude.log — 비실행 확장자) — 무매치(등록 오염 금지).
+        let tailer = r"powershell Get-Content claude.log -Wait";
+        assert!(!cmdline_matches_agent_exec(tailer, "claude"));
+        assert_eq!(sel(&s(&[tailer]), &cands), None);
+        // 이종 2 에이전트 동시(백슬래시 계열) = 모호 — None(2-표본이어도 등록 불가 재료).
+        assert_eq!(sel(&s(&[npm, r"C:\Tools\codex.exe --y"]), &cands), None);
+    }
+
+    /// ★G5-③(W5-A) 2-표본 확정 진리표 — 순수 판정자 confirm_pending_obs 회귀 핀
+    /// (설계 원문 G5-③ 명세 그대로: Commit/Drop/Keep + TTL 우선).
+    #[test]
+    fn pending_verdict_truth_table() {
+        use super::{confirm_pending_obs as judge, PendingVerdict as V};
+        let pending = ("claude".to_string(), "claude".to_string(), 1000.0);
+        let cur = |a: &str| (a.to_string(), a.to_string());
+        // ① 동일 단일 에이전트 재관측 = Commit.
+        assert_eq!(judge(&pending, Some(&cur("claude")), 1005.0, 120.0), V::Commit);
+        // ② 상이 에이전트 = Drop(agent_mismatch) — 1표본 순간 혼선의 반증.
+        assert_eq!(
+            judge(&pending, Some(&cur("codex")), 1005.0, 120.0),
+            V::Drop { reason: "agent_mismatch" }
+        );
+        // ③ 무관측(None) = Keep — 다음 틱 유보.
+        assert_eq!(judge(&pending, None, 1005.0, 120.0), V::Keep);
+        // ④ TTL 초과 = Drop(ttl_expired) — 동일 에이전트 재관측이어도 오래된 1표본은 불신.
+        assert_eq!(
+            judge(&pending, Some(&cur("claude")), 1000.0 + 120.1, 120.0),
+            V::Drop { reason: "ttl_expired" }
+        );
+        // ⑤ 모호(select_observed_agent None 귀결) = Keep → TTL 도달 시 Drop.
+        assert_eq!(judge(&pending, None, 1000.0 + 119.9, 120.0), V::Keep);
+        assert_eq!(
+            judge(&pending, None, 1000.0 + 120.1, 120.0),
+            V::Drop { reason: "ttl_expired" }
+        );
+        // 경계: TTL 정확히 도달(now-obs == ttl)은 아직 유효(초과 조건은 strict >).
+        assert_eq!(judge(&pending, Some(&cur("claude")), 1120.0, 120.0), V::Commit);
+    }
+
+    /// ★G5-③(W5-A) Drop 이벤트 배선 핀 — TTL 초과 pending 은 check_agent_death 훅이 소거하고
+    /// agent.observe_dropped(reason=ttl_expired) 를 발행한다(확정 실패 침묵 방지 [MAJOR]).
+    /// meta 는 확정 없이 기록되지 않는다(fail-closed — 무기록이 오기록보다 낫다).
+    #[test]
+    fn pending_obs_ttl_drop_emits_observe_dropped() {
+        let daemon = drill_daemon("pending-ttl-drop");
+        let id = spawn_role_surface(&daemon, "worker");
+        let s = daemon.surfaces.lock().unwrap().get(&id).cloned().unwrap();
+        *s.pending_agent_obs.lock().unwrap() = Some((
+            "claude".into(),
+            "claude".into(),
+            now_epoch() - super::PENDING_OBS_TTL_SECS - 1.0,
+        ));
+        let sys = sysinfo::System::new(); // 빈 프로세스 표 = 재관측 None(모호/무관측 대역)
+        let mut rc: HashMap<u64, u32> = HashMap::new();
+        super::check_agent_death(&daemon, &sys, &mut rc);
+        assert!(
+            s.pending_agent_obs.lock().unwrap().is_none(),
+            "TTL 초과 pending 은 소거돼야 한다"
+        );
+        assert!(
+            s.agent_meta.lock().unwrap().is_none(),
+            "확정 없는 meta 기록 금지(fail-closed)"
+        );
+        let dropped: Vec<serde_json::Value> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"].as_str() == Some("agent.observe_dropped"))
+            .collect();
+        assert_eq!(dropped.len(), 1, "Drop 은 침묵하지 않는다 — 이벤트 정확히 1건");
+        assert_eq!(dropped[0]["payload"]["reason"].as_str(), Some("ttl_expired"));
+        assert_eq!(dropped[0]["payload"]["agent"].as_str(), Some("claude"));
+        assert_eq!(dropped[0]["payload"]["role"].as_str(), Some("worker"));
+    }
+
+    /// ★G5-③(W5-A) Keep·가드 소거 의미 핀 — ① 신선 pending + 무관측 = Keep(소거·이벤트 0)
+    /// ② set_meta 선점(가드 실패) = 조용한 소거(확정 실패가 아니라 승계 — Drop 이벤트 아님).
+    #[test]
+    fn pending_obs_keep_then_superseded_clears_silently() {
+        let daemon = drill_daemon("pending-keep-guard");
+        let id = spawn_role_surface(&daemon, "worker");
+        let s = daemon.surfaces.lock().unwrap().get(&id).cloned().unwrap();
+        let sys = sysinfo::System::new();
+        let mut rc: HashMap<u64, u32> = HashMap::new();
+        // ① 무관측 = Keep — pending 유지·이벤트 없음(다음 틱 유보).
+        *s.pending_agent_obs.lock().unwrap() =
+            Some(("claude".into(), "claude".into(), now_epoch()));
+        super::check_agent_death(&daemon, &sys, &mut rc);
+        assert!(
+            s.pending_agent_obs.lock().unwrap().is_some(),
+            "무관측은 Keep — TTL 내 재시도 유보"
+        );
+        // ② 다른 경로(set_meta)가 meta 를 선점 — pending 은 무의미해져 조용히 소거된다.
+        *s.agent_meta.lock().unwrap() = Some(("codex".into(), "codex".into()));
+        super::check_agent_death(&daemon, &sys, &mut rc);
+        assert!(
+            s.pending_agent_obs.lock().unwrap().is_none(),
+            "meta 선점 시 pending 소거(스테이징 잔존 금지)"
+        );
+        assert_eq!(
+            s.agent_meta.lock().unwrap().clone(),
+            Some(("codex".into(), "codex".into())),
+            "선점 meta 는 pending 이 덮지 않는다"
+        );
+        assert!(
+            daemon
+                .bus
+                .replay_after(0)
+                .iter()
+                .all(|e| e["name"].as_str() != Some("agent.observe_dropped")),
+            "Keep·승계 소거는 Drop 이벤트를 발행하지 않는다"
+        );
     }
 
     use super::{
