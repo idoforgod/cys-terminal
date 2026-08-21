@@ -118,6 +118,7 @@ NOISE_NAMES = set()
 ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s)
     "health.alert": 30.0,
     "master.deadman": 60.0,
+    "master.idle": 120.0,     # G2 W3-B: 정보성 침묵 신호 — pane.idle 과 동률(120s) 코얼레스
     "pane.idle": 120.0,
     "schedule.fired": 10.0,
     "schedule.error": 30.0,
@@ -916,6 +917,14 @@ def route_event(ev, world, coal, slug="main", now=None):
         if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "idle", "key": key,
                            "idle_secs": p.get("idle_seconds")})
+    elif name == "master.idle":
+        # G2 W3-B: v2 데몬의 master 침묵(정보성·category=info) — fx kind 는 pane.idle 과 같은
+        # "idle" 을 공유한다(겹침은 확인된 의도 — 같은 유휴 연출·확정 결정 MINOR). role 을
+        # additive 로 실어 구분하고, 코얼레스 키는 (name,surface)라 pane.idle 과 상호 억제 없음.
+        # payload 필드명 주의: 데몬은 idle_secs 를 싣는다(pane.idle 의 idle_seconds 와 다름).
+        if coal.allow(name, key):
+            frames.append({"t": "fx", "kind": "idle", "key": key,
+                           "role": p.get("role"), "idle_secs": p.get("idle_secs")})
     if backlog:  # 과거 이벤트: 상태 반영은 위에서 완료, 연출만 억제
         frames = [fr for fr in frames if fr.get("t") != "fx"]
     return frames, poke

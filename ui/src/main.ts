@@ -5918,6 +5918,28 @@ function onDaemonEvent(event: Record<string, unknown>) {
     refreshSidebarStatus();
     return;
   }
+  if (name === "master.idle") {
+    // ★G2 결함 8(W3-B): v2 데몬의 정보성 침묵 신호 — idle 은 alert 가 아니다.
+    //   ① OS 배너 없음·화면 전환 없음(id 접두 "master-idle:"은 BANNER_ON_EXPIRY_PREFIXES
+    //      비매칭 = 만료 시에도 배너 0 — toastttl.ts).
+    //   ② 무한 토스트 금지: stickyToast(role별 안정 id)로 dedupe — 데몬측 디바운스
+    //      (기본 300s)와 무관하게 화면에는 role당 1장만 갱신되고 TTL 로 유한 소멸한다.
+    //      (BLOCKER 실측: category 폴백 레인의 무dedupe 토스트가 5분마다 영구 적층 —
+    //       category="info"는 아래 폴백 3종(health/watchdog/feed) 어디에도 없어 낙하하지
+    //       않지만, name-first 핸들러가 없으면 운영자 가시성이 0이 된다. 이 핸들러가
+    //       '조용한 배지+알람 기록' 층위로 가시성을 보존한다 — 설계 rationale.)
+    //   ③ 알람 이력: stickyToast→recordAlarm(id) — 같은 id는 최신 1건으로 합쳐져
+    //      이력 링버퍼를 잠식하지 않는다(pushAlarm coalesce).
+    const role = String(payload.role ?? "master");
+    stickyToast(
+      `master-idle:${event.socket_slug ?? ""}:${role}`,
+      "idle",
+      "💤 master 유휴",
+      `surface:${sid} ${role} — ${payload.idle_secs}s 무출력(임계 ${payload.threshold_secs}s)`,
+    );
+    refreshSidebarStatus();
+    return;
+  }
   if (name === "agent.exited") {
     toast("alert", "❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`);
     osBanner("❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`); // B4 OS 배너(고우선)
@@ -5945,7 +5967,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
     return;
   }
   if (name === "master.deadman") {
-    // 페이로드는 {reason,idle_secs}만 — role 키 없음(governance.rs). payload.role 폴백 안전.
+    // v2(G2)는 role·axis 등 additive 필드를 싣고, v1 은 {reason,idle_secs}뿐 — payload.role
+    // 폴백이 양 버전을 모두 흡수한다(governance.rs). reason 은 verbatim 표시라 신규값
+    // ("shell process dead"/"agent process dead" 등)도 자연 수용 — 핸들러 무변경(W3-B).
     toast("alert", "🚨 master 무응답(deadman)", `surface:${sid} ${payload.role ?? ""} ${payload.reason ?? ""}`);
     osBanner("🚨 master 무응답(deadman)", `surface:${sid} ${payload.reason ?? ""}`); // B4 OS 배너(고우선)
     return;
