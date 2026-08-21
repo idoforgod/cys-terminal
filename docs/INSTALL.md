@@ -250,4 +250,10 @@ rm -rf ~/.cys ~/.local/state/cys             # pack·트랜스크립트·상태 
 | `CYS_ROLE_DEADMAN_GRACE_SECS` | 60 | 역할 데드맨 v2 — 부트/승계 직후 무카운트 창(오살 방지) |
 | `CYS_ROLE_DEADMAN_DEBOUNCE_SECS` | 300 | 역할 데드맨 v2 — `master.deadman`(사망 축) 디바운스 |
 | `CYS_ROLE_DEADMAN_IDLE_DEBOUNCE_SECS` | =DEBOUNCE(300) | `master.idle`(생존 확정+침묵 정보 신호) 전용 디바운스 — 미설정 시 `CYS_ROLE_DEADMAN_DEBOUNCE_SECS`를 따른다 |
-| `CYS_ROLE_DEADMAN_ROLES` | `master` | 역할 데드맨 감시 대상 role CSV(일반화 opt-in) |
+| `CYS_ROLE_DEADMAN_ROLES` | `master` | 역할 데드맨 감시 대상 role CSV(일반화 opt-in). 빈 값은 기본 `master`로 되돌아간다(사망 감시 전면 off 노브는 일부러 없음) |
+
+**★기존 노브 1건의 의미가 바뀌었습니다 — `CYS_MASTER_DEADMAN_SECS`** (이번 판의 유일한
+비-additive 변경). `0`은 v0.14.21까지 "무반응 감지 **전체** 끄기"였으나, 이제는 **침묵(idle)
+감지만** 끕니다 — 사망 축(`master.deadman`)은 `0`에서도 계속 발화합니다. v1의 침묵-오경보를
+끄려고 `0`을 설정해 둔 설치는 업그레이드 후 사망 축 경보를 다시 받게 됩니다(오경보가 아니라
+구조 증거 기반). 발화 간격은 `CYS_ROLE_DEADMAN_DEBOUNCE_SECS`로 조정하십시오.

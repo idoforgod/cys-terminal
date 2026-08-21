@@ -754,7 +754,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_QUEUE_OVERDUE_QUIET_SECS` | 1 | overdue 단계의 quiet 임계 — 1 미만 설정은 1로 승격(0초 강제주입 봉인) |
 | `CYS_QUEUE_STARVE_ALERT_SECS` | 0 (=비활성) | 큐 머리 기아 경보 임계 — 이 값 이상 배달이 막혀 있으면 `queue.starved` 발행(쿨다운 5분·depth_high와 별도 축·발행뿐 자동 조치 없음. 활성 권장 600) |
 | `CYS_FEED_REMIND_SECS` | 300 (0=off) | 승인 적체 재알림 |
-| `CYS_MASTER_DEADMAN_SECS` | 900 (0=off) | 오케스트레이터 무반응 감지 |
+| `CYS_MASTER_DEADMAN_SECS` | 900 | 오케스트레이터 **침묵(idle) 감지** 임계 — 이 시간 이상 출력이 없으면 `master.idle`(생존 확정 + 침묵) 정보 신호. **★v0.14.22 의미 변경: `0`은 이제 '전체 off'가 아니라 '침묵 감지만 off'다.** 사망 판정(`master.deadman` — 좌석 소멸·exited 등 커널 사실 축)은 0에서도 계속 발화한다(fail-closed). v0.14.21 이하에서 오경보를 끄려고 `0`을 설정해 둔 설치는 업그레이드 후 사망 축 경보를 다시 받게 된다 |
 | `CYS_ROLE_DEADMAN_CONFIRM_TICKS` | 3 (최소 1) | 역할 데드맨 v2 — 사망 후보(DeadCandidate) 연속 관측 확증 틱 수 |
 | `CYS_ROLE_DEADMAN_GRACE_SECS` | 60 | 역할 데드맨 v2 — 부트/승계 직후 무카운트 창(오살 방지) |
 | `CYS_ROLE_DEADMAN_DEBOUNCE_SECS` | 300 | 역할 데드맨 v2 — `master.deadman` 디바운스 |

@@ -43,8 +43,19 @@ const LOOP_WINDOW_SECS: f64 = 60.0;
 const LOOP_LIMIT: u64 = 20;
 /// inbox un-acked 재배달 TTL(초) — injected 후 10분 미-ack면 재주입(§2.2).
 const INBOX_REDELIVER_TTL_SECS: f64 = 600.0;
-/// 브리지 사망 후 재스폰 백오프(초) — 크래시 루프 폭주 차단.
+/// 브리지 사망 후 재스폰 기본 백오프(초) — 1회성 사망의 즉시 회생 속도.
 const RESPAWN_BACKOFF_SECS: f64 = 5.0;
+/// ★재스폰 최소 생존 임계(초) — 스폰 **성공** 후 이 시간을 못 채우고 죽은 브리지는 '성공'이
+/// 아니라 크래시 루프의 1회전으로 계수한다. 종전에는 spawn_bridge 가 Ok 를 내면 무조건
+/// reset_respawn_failure 였고 bump 는 Err arm 에만 있어서, '스폰은 되는데 즉시 죽는' 브리지
+/// (파이썬 import 실패·경로 파손 = Windows 고유 파손의 전형)는 백오프 간격마다 영구히
+/// 재스폰되면서 health.alert 가 **단 한 번도** 뜨지 않았다(무경보 폭주 = 이 판이 없애려는
+/// '조용한 고장'). G5-① 로 Windows pid_alive 가 실측이 되면서 그 문이 실제로 열렸다.
+const RESPAWN_MIN_SURVIVAL_SECS: f64 = 90.0;
+/// ★재스폰 백오프 상한(초) — 연속 실패 수에 따라 5→10→20→30(상한)으로 올린다. 상한을
+/// RESPAWN_MIN_SURVIVAL_SECS 보다 **낮게** 두는 것이 계약이다: 상한이 최소 생존 임계를 넘으면
+/// 재스폰 간격 자체가 '생존'으로 오독돼 실패 계수가 리셋되고 경보가 영원히 안 뜬다.
+const RESPAWN_BACKOFF_MAX_SECS: f64 = 30.0;
 /// 연속 재스폰 실패 임계(M12) — 초과 시 health.alert 1회 발행·status에 down 표시(무한 재시도는 유지).
 const RESPAWN_FAIL_ALERT_THRESHOLD: u64 = 5;
 /// 주기 sweep 간격(초) — 재배달·타임아웃·브리지 사망 재조정.
@@ -2023,10 +2034,26 @@ fn bump_respawn_failure(conn: &Connection, channel: &str, threshold: u64) -> Opt
     }
 }
 
-/// M12: 재스폰 성공 시 실패 카운터·경보 플래그 리셋(다음 사망 시 다시 임계까지 카운트).
+/// M12: 재스폰 실패 카운터·경보 플래그 리셋(다음 사망 시 다시 임계까지 카운트).
+/// ★리셋 기준은 '스폰 성공'이 아니라 '스폰 후 RESPAWN_MIN_SURVIVAL_SECS 이상 생존 관측'이다
+/// — 스폰 성공은 브리지가 일을 한다는 증거가 아니다(즉사 루프가 정확히 그 모양).
 fn reset_respawn_failure(conn: &Connection, channel: &str) {
     meta_set(conn, &format!("respawn_fails:{channel}"), "0");
     meta_set(conn, &format!("respawn_alerted:{channel}"), "0");
+}
+
+/// 현재 연속 재스폰 실패 수(관측용 · 백오프 산정 입력).
+fn respawn_failure_count(conn: &Connection, channel: &str) -> u64 {
+    meta_get(conn, &format!("respawn_fails:{channel}"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 연속 실패 수 → 재스폰 백오프(초). 5초 × 2^fails, RESPAWN_BACKOFF_MAX_SECS 상한.
+/// fails=0(정상 1회 사망)은 종전과 동일한 5초 — 회생 속도 회귀 없음.
+fn respawn_backoff_secs(fails: u64) -> f64 {
+    let mult = 2f64.powi(fails.min(16) as i32);
+    (RESPAWN_BACKOFF_SECS * mult).min(RESPAWN_BACKOFF_MAX_SECS)
 }
 
 /// enabled=1이지만 브리지 pid가 죽은 채널을 백오프 후 재스폰(§2.1-5).
@@ -2044,13 +2071,30 @@ fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
         .unwrap_or_default();
     for (channel, bridge_cmd, pid, last_spawn) in rows {
         let dead = pid.map(|p| !pid_alive(p as u32)).unwrap_or(true);
+        let fails = respawn_failure_count(conn, &channel);
         if !dead {
+            // ★생존 확정 리셋: 스폰 후 최소 생존 임계를 넘겨 아직 살아 있으면 그때가 '회복'이다
+            // (스폰 성공 시점이 아니라). 카운터가 이미 0이면 write 하지 않는다(sweep 15초마다
+            // 무의미한 meta write 방지).
+            let survived = last_spawn
+                .map(|t| now - t >= RESPAWN_MIN_SURVIVAL_SECS)
+                .unwrap_or(true);
+            if fails > 0 && survived {
+                reset_respawn_failure(conn, &channel);
+            }
             continue;
         }
-        // 백오프: 직전 스폰 후 RESPAWN_BACKOFF_SECS 미만이면 대기(크래시 루프 폭주 차단).
-        if last_spawn.map(|t| now - t < RESPAWN_BACKOFF_SECS).unwrap_or(false) {
+        // 백오프: 직전 스폰 후 (연속 실패에 따라 상승하는) 백오프 미만이면 대기 — 크래시 루프
+        // 폭주 차단. fails=0 이면 종전과 같은 5초.
+        let backoff = respawn_backoff_secs(fails);
+        if last_spawn.map(|t| now - t < backoff).unwrap_or(false) {
             continue;
         }
+        // 직전 스폰이 최소 생존 임계를 못 채우고 죽었는가 = '스폰 성공 후 즉사' 1회전 증거.
+        // (백오프 상한 < 최소 생존 임계이므로 이 판정이 백오프 대기 자체로 뒤집히지 않는다.)
+        let short_lived = last_spawn
+            .map(|t| now - t < RESPAWN_MIN_SURVIVAL_SECS)
+            .unwrap_or(false);
         let Some(cmd) = bridge_cmd else {
             continue;
         };
@@ -2064,7 +2108,26 @@ fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
         let token_hash = hex_sha256(token.as_bytes());
         match spawn_bridge(daemon, &channel, &cmd, &token) {
             Ok((npid, npgid)) => {
-                reset_respawn_failure(conn, &channel); // M12: 성공 → 실패 카운터·경보 리셋.
+                // ★M12 보정: 스폰 성공은 리셋 사유가 아니다. 직전 스폰이 즉사했다면 이번 스폰이
+                // 성공했어도 크래시 루프 1회전으로 계수해 임계에서 health.alert 를 낸다 —
+                // 종전에는 여기서 무조건 리셋했기 때문에 즉사 루프가 영구 무경보였다.
+                // 리셋은 위 `!dead` 분기(생존 임계 통과 관측)에서만 일어난다.
+                if short_lived {
+                    if let Some(n) =
+                        bump_respawn_failure(conn, &channel, RESPAWN_FAIL_ALERT_THRESHOLD)
+                    {
+                        daemon.bus.publish(
+                            "health.alert",
+                            "health",
+                            None,
+                            json!({"rule": "channel_bridge_crashloop", "channel": channel,
+                                   "fails": n,
+                                   "detail": format!(
+                                       "스폰은 성공하나 {RESPAWN_MIN_SURVIVAL_SECS:.0}초 내 반복 사망 — \
+                                        브리지 명령·의존성 점검 필요(재스폰은 계속·백오프 상승)")}),
+                        );
+                    }
+                }
                 let _ = conn.execute(
                     "UPDATE channels SET scoped_pid=?2, scoped_pgid=?3, token_hash=?4, registered=0, last_spawn_ts=?5, updated_ts=?5 WHERE channel=?1",
                     params![channel, npid as i64, npgid as i64, token_hash, now],
@@ -2419,6 +2482,43 @@ mod tests {
         assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
         assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
         assert_eq!(bump_respawn_failure(conn, "slack", 3), Some(3), "리셋 후 다시 임계서 경보");
+    }
+
+    /// ★[크래시 루프 무경보 회귀 핀] '스폰은 성공하지만 즉시 죽는' 브리지가 영구 무경보로
+    /// 재스폰되던 구멍 — G5-① 로 Windows pid_alive 가 실측이 되면서 실제로 열린 문.
+    /// 종전에는 spawn_bridge 가 Ok 를 내면 무조건 reset 이었고 bump 는 Err arm 에만 있었다.
+    #[test]
+    fn respawn_backoff_escalates_and_stays_below_survival_threshold() {
+        // fails=0(정상 1회 사망) = 종전 5초 그대로 — 회생 속도 회귀 없음.
+        assert_eq!(respawn_backoff_secs(0), RESPAWN_BACKOFF_SECS);
+        assert_eq!(respawn_backoff_secs(1), 10.0);
+        assert_eq!(respawn_backoff_secs(2), 20.0);
+        // 상한 고정(폭주 완화) + 오버플로 안전.
+        assert_eq!(respawn_backoff_secs(3), RESPAWN_BACKOFF_MAX_SECS);
+        assert_eq!(respawn_backoff_secs(u64::MAX), RESPAWN_BACKOFF_MAX_SECS);
+        // ★핵심 계약: 백오프 상한 < 최소 생존 임계. 이게 깨지면 재스폰 간격 자체가 '생존'으로
+        // 오독돼 실패 계수가 매번 리셋되고 크래시 루프 경보가 영원히 안 뜬다.
+        assert!(
+            RESPAWN_BACKOFF_MAX_SECS < RESPAWN_MIN_SURVIVAL_SECS,
+            "백오프 상한이 최소 생존 임계 이상이면 즉사 루프가 다시 무경보가 된다"
+        );
+        // 배선 핀: 스폰 성공 arm 이 무조건 리셋으로 되돌아가지 않았는가.
+        let src = include_str!("channels.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let at = prod
+            .find("fn respawn_dead_bridges")
+            .expect("respawn_dead_bridges 소실");
+        let body = &prod[at..];
+        let end = body.find("\n/// sweep 1틱").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("if short_lived {"),
+            "스폰 성공 후 즉사 계수(short_lived)가 사라졌다 — 무경보 폭주 재개방"
+        );
+        assert!(
+            !body.contains("Ok((npid, npgid)) => {\n                reset_respawn_failure"),
+            "스폰 성공만으로 실패 카운터를 리셋한다 — 즉사 루프가 영구 무경보가 된다"
+        );
     }
 
     // M5: 종결 원장 보존기간 프룬 — 오래된 종결행 삭제·pending/최근/미소각 approval/accepted 보존.

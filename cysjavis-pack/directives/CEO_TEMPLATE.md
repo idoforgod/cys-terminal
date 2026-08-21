@@ -463,8 +463,13 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
 - 죽은(`exited=true`) 좌석의 pane 잔재 회수는 `cys reap-surface <surface>`다(★G4 전용 RPC
   `surface.reap` — master/cso pane 전용·7조건 게이트·exit 7=게이트 거부). 상설 집행 주체는
   CSO이며, CEO(role=master)는 CSO 부재 시 직접 집행할 수 있다. `close-surface`(자기/생성자
-  한정·산 노드 폐쇄)·`cys-dept reap`(부서 격리분 TTL 소거)과는 전부 별개 계약 — **산 노드는
-  어떤 조합에서도 reap 불가**다.
+  한정·산 노드 폐쇄)·**cys-dept 의 reap 서브커맨드**(부서 격리분 TTL 소거)와는 전부 별개
+  계약 — **산 노드는 어떤 조합에서도 reap 불가**다.
+- ★위 셋 중 부서 격리분 TTL 소거만은 CEO가 **직접 호출하지 않는다** — 부서 lifecycle 동사라
+  단일소유 가드가 role 보유 비-CSO 노드를 exit 7로 거부한다(§0 ③과 동일 계약·버그 아님).
+  대안 경로는 둘: **GUI 부서 버튼**, 또는 **CSO에 위임**(`cys send --to cso "부서 격리분 정리
+  요청: <부서명>"` → CSO가 집행 후 회신). `cys reap-surface`(좌석 회수)는 이 가드와 무관하며
+  CEO 직접 집행이 계약대로 허용된다 — 두 동사를 혼동하지 말 것.
 
 ## 9. 복원 체크포인트 + todo 영속 (전 노드 의무)
 > ★경로 규약(G5 동류 · 레인 격리): 아래 상태·복원 파일은 모두 **자기 레인의 팩**

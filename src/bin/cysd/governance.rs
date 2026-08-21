@@ -1977,6 +1977,26 @@ pub fn seat_state(sys: &System, s: &crate::state::Surface) -> SeatState {
     }
 }
 
+/// ★G2(W3-A BLOCK 교정)의 **생산자측 판정 하나**를 순수 함수로 노출한다 — 좌석 자손 cmdline
+/// 목록이 '기지 에이전트 관측'으로 셈해지는가.
+///
+/// 왜 별도 함수인가(테스트 가능성 계약): refresh_seat_cache 는 `&System`(실 프로세스 표)을
+/// 받으므로 단위 테스트가 구동할 수 없고, 데드맨 테스트는 전부 `seat_agent_cache` 를 직접
+/// store 해 **소비측**만 고정한다. 그 결과 '생산자가 그 값을 무엇으로 만드는가'가 무핀이었고,
+/// 실제로 이 자리를 `true` 로 치환하는 mutation(= BLOCK 교정 이전의 원시 Occupied armed)이
+/// 전체 테스트를 통과했다. 판정을 여기로 끌어내 행위 테스트로 못박는다.
+///
+/// 계약: **엄격 매칭**(cmdline_matches_agent_exec 계열 select_observed_agent)만 관측으로
+/// 인정한다. vim/less/tail/빌드 등 비에이전트 자손은 관측이 아니다 — 그것을 관측으로 치면
+/// 자손 1틱 관측 후 프롬프트 복귀(Empty)가 살아있는 맨 셸 좌석을 사망 후보로 오라벨한다
+/// (결함 8 동형). 후보 목록이 비면 false(보조축 조용히 off · fail-closed).
+pub(crate) fn seat_agent_observed(cmds: &[String], candidates: &[(String, String)]) -> bool {
+    if candidates.is_empty() {
+        return false;
+    }
+    select_observed_agent(cmds, candidates).is_some()
+}
+
 /// ★SEAT 캐시 갱신 — **단일 writer**(watchdog 틱). 판정 재료(전 프로세스 표)를 이미 refresh 한
 /// 지점에서 한 번만 계산해 캐시에 싣는다. RPC 읽기 경로(surface.list·status·deliver_queued)는
 /// 재조회 없이 이 값을 소비한다(비용 중복 0).
@@ -2007,7 +2027,7 @@ pub fn refresh_seat_cache(daemon: &Arc<Daemon>, sys: &System) {
                         .into_iter()
                         .map(|(_, cmd)| cmd)
                         .collect();
-                    select_observed_agent(&cmds, cands).is_some()
+                    seat_agent_observed(&cmds, cands)
                 }
             };
         s.seat_agent_cache.store(observed, Ordering::Relaxed);
@@ -4789,6 +4809,57 @@ mod tests {
         assert_eq!(sel(&s(&["-zsh", "vim notes.md"]), &cands), None);
         // 빈 후보(agents.json 파싱 불가) → None (관측 등록이 조용히 꺼진다)
         assert_eq!(sel(&s(&["claude --x"]), &[]), None);
+    }
+
+    /// ★[생산자측 핀] seat_agent_cache 를 **만드는 쪽**의 경계 — W3-A BLOCK 교정의 핵심.
+    ///
+    /// 배경(mutation 실증): 데드맨 테스트는 전부 `seat_agent_cache` 를 직접 store 해
+    /// **소비측**(트래커가 armed 값을 어떻게 쓰는가)만 고정한다. 그래서 생산자
+    /// (refresh_seat_cache)의 엄격 매칭을 `true` 로 치환해 **원시 Occupied 로 armed** 하는
+    /// mutation(= BLOCK 교정 이전 거동)이 전체 테스트를 통과했다. 그 거동은 vim/less/빌드 등
+    /// 비에이전트 자손 1틱 관측 → 프롬프트 복귀(Empty) → **살아있는 맨 셸 master 를 사망으로
+    /// 오라벨**한다(결함 8 동형 오살 경보). 이 테스트가 그 mutation 을 적색으로 만든다.
+    #[test]
+    fn seat_agent_observed_pins_strict_matcher_not_raw_occupied() {
+        use super::seat_agent_observed as obs;
+        let cands: Vec<(String, String)> = vec![
+            ("claude".into(), "claude".into()),
+            ("gemini".into(), "agy".into()),
+        ];
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // ① 비에이전트 자손만 있는 좌석 = 관측 아님. ★`true` 치환 mutation 이 여기서 죽는다.
+        for non_agent in [
+            vec!["vim notes.md"],
+            vec!["less /var/log/x"],
+            vec!["tail -f build.log"],
+            vec!["cargo build --release"],
+            vec!["-zsh", "git status"],
+        ] {
+            assert!(
+                !obs(&s(&non_agent), &cands),
+                "비에이전트 자손({non_agent:?})을 관측으로 셈하면 맨 셸 좌석이 사망 오라벨된다"
+            );
+        }
+        // ② 자손 0개(프롬프트 복귀)도 관측 아님 — 원시 Occupied 판정과의 분리 확인.
+        assert!(!obs(&[], &cands));
+        // ③ 기지 에이전트 자손 = 관측. (엄격 매처를 항상-false 로 만드는 역방향 mutation 차단)
+        assert!(obs(&s(&["claude --dangerously-skip-permissions"]), &cands));
+        assert!(obs(&s(&["-zsh", "agy --x"]), &cands));
+        // ④ 후보 목록 부재(agents.json 파싱 불가) = 보조축 off(fail-closed).
+        assert!(!obs(&s(&["claude --x"]), &[]));
+        // ⑤ 배선 핀: refresh_seat_cache 가 이 판정을 실제로 소비한다(생산자 경계 우회 금지).
+        //    순수 함수만 있고 호출부가 상수면 ①~④가 전부 무의미해지므로 호출 자체를 못박는다.
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let at = prod
+            .find("pub fn refresh_seat_cache")
+            .expect("refresh_seat_cache 소실");
+        let body = &prod[at..];
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("seat_agent_observed(&cmds, cands)"),
+            "refresh_seat_cache 가 엄격 매처 판정을 우회했다 — 원시 Occupied armed 회귀 위험"
+        );
     }
 
     /// ★등록 매처 FP 회귀 핀(2026-08-12 R2 확정 · governance.rs 경로 세그먼트 FP):

@@ -2119,14 +2119,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             let live_descendants = governance::collect_descendants(&sys, surface.pid).len();
             // 큐 깊이 = 라이브 pending + 아직 미소비 restored(WAL 복원분) 중 이 surface 몫.
-            let queue_depth = surface.pending_queue.lock().unwrap().len()
-                + daemon
-                    .restored_queue
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|it| it.get("surface_id").and_then(|v| v.as_u64()) == Some(sid))
-                    .count();
+            // ★락 순서 계약(큐 계열) — **restored_queue → pending_queue** 단방향만 허용한다.
+            //   Daemon::rehome_restored_queue 가 restored 가드를 쥔 채 surf.pending_queue 를 잡으므로
+            //   (state.rs), 여기서 pending 을 쥔 채 restored 를 잡으면 고전적 AB-BA 가 성립한다.
+            //   Rust 는 `let x = a.lock()…len() + b.lock()…;` 의 첫 임시 가드를 **세미콜론까지** 살려
+            //   두므로 한 문장에 두 락을 쓰면 그 자체가 동시 보유다 — 그래서 문장을 쪼갠다.
+            //   교착이 나면 워치독 태스크가 영구 정지하고(큐 배달·데드맨·좌석 캐시·자원 거버넌스가
+            //   데몬 수명 내내 침묵) 아무 이벤트도 남지 않는다 = 이 릴리스가 없애려는 '조용한 고장'의
+            //   최악형. 동일 규율 선례: governance.rs todo_progress→todo_verdict 역순 획득 금지.
+            let restored_depth = daemon
+                .restored_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|it| it.get("surface_id").and_then(|v| v.as_u64()) == Some(sid))
+                .count();
+            let pending_depth = surface.pending_queue.lock().unwrap().len();
+            let queue_depth = pending_depth + restored_depth;
             // 데몬 조상 판정: 데몬 자신의 부모 체인 32홉 안에 surface.pid 가 있으면 회수 =
             // 자기 조상 트리 kill(동반사망). 루프 가드는 resolve_caller_surface 관례 복제.
             // fail-closed: 데몬 자기 프로세스가 관측 불능이면(측정 불능은 통과가 아니다)
@@ -4605,9 +4614,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
         "queue.list" => {
             let filter_sid = resolve_surface_id(&params);
-            let surfaces = daemon.surfaces.lock().unwrap();
+            // ★락 순서 계약(큐 계열): 전역 순서는 **restored_queue → surfaces → pending_queue** 다
+            //   (Daemon::rehome_restored_queue 가 이 순서로 잡는다 — state.rs). 종전 이 핸들러는
+            //   surfaces 가드를 **쥔 채** 아래에서 restored_queue 를 잡아 rehome 과 정면 역전(AB-BA)
+            //   이었다. 스냅샷을 뜨고 가드를 즉시 떨어뜨려 두 락의 동시 보유 자체를 없앤다
+            //   (surfaces 는 Arc 맵이라 clone 이 값 복제가 아니다 · 목록 조회는 원자 스냅샷 불요).
+            let snapshot: Vec<std::sync::Arc<crate::state::Surface>> =
+                daemon.surfaces.lock().unwrap().values().cloned().collect();
             let mut out: Vec<Value> = Vec::new();
-            for s in surfaces.values() {
+            for s in &snapshot {
                 if let Some(f) = filter_sid {
                     if s.id != f {
                         continue;
@@ -7724,12 +7739,76 @@ mod tests {
         let recheck_at = arm_body.find("manual_reap_recheck(").expect(
             "surface.reap arm 이 close 직전 재검증(manual_reap_recheck)을 잃었다 — TOCTOU 유실 창 재개방",
         );
+        // ★인자 배선 핀(mutation 실증 대응): 종전 소스핀은 `manual_reap_recheck(` 문자열 존재만
+        //   봐서, 두 번째 인자를 상수 0 으로 치환해 abort 를 사실상 제거하는 mutation
+        //   (`manual_reap_recheck(still_exited, 0)`)을 전체 테스트가 놓쳤다. 호출 형태와, 그
+        //   인자가 **살아있는 pending_queue 실측**에서 나온다는 사실을 함께 못박는다.
+        //   (판정~close 사이 실제 경합 주입을 단일 스레드로 결정론 재현할 seam 이 없어 —
+        //    두 락 사이 임의 지점에 개입할 수 없다 — 행위 테스트 대신 인자 출처를 고정한다.
+        //    한계 정직 표기: 여기서 막는 것은 '상수 치환·인자 소실' 클래스다.)
+        assert!(
+            arm_body.contains("manual_reap_recheck(still_exited, queue_depth_now)"),
+            "재검증 인자가 실측이 아니다 — 상수 치환이면 abort 가 영원히 발화하지 않는다"
+        );
+        let src_at = arm_body
+            .find("let queue_depth_now = surface.pending_queue.lock().unwrap().len();")
+            .expect("queue_depth_now 가 pending_queue 실측에서 오지 않는다(재검증 무력화)");
+        assert!(
+            src_at < recheck_at,
+            "queue_depth_now 실측이 재검증보다 뒤에 있다"
+        );
         let close_at = arm_body
             .find("governance::close_surface(daemon, sid, governance::CloseCause::Reap)")
             .expect("surface.reap 의 단일 파괴 경로(close_surface Reap) 위임 소실");
         assert!(
             recheck_at < close_at,
             "재검증이 close_surface 뒤에 있다 — abort 가 파괴를 막지 못한다"
+        );
+    }
+
+    /// ★[락 순서 계약·큐 계열] 전역 순서는 **restored_queue → surfaces → pending_queue** 다
+    /// (Daemon::rehome_restored_queue 가 이 순서로 잡는 유일한 배치 경로 — state.rs).
+    ///
+    /// 왜 소스핀인가: 역전이 나면 증상이 '무한 대기'라 테스트가 초록으로 끝나는 대신 **영구
+    /// 정지**한다(관측 불가·타임아웃 하네스 필요). 그래서 역전의 문법적 원인 두 가지를 문면에서
+    /// 금지한다. ①한 `let` 문에서 두 락을 이어 잡는 형태 — Rust 는 첫 임시 MutexGuard 를
+    /// **세미콜론까지** 살려 두므로 그 자체가 동시 보유다(W4-C 가 정확히 이 형태로 AB-BA 를
+    /// 신설했다) ②surfaces 가드를 이름 있는 변수로 붙들고 restored_queue 를 잡는 형태
+    /// (queue.list 의 선재 역전 — 스냅샷 후 즉시 해제로 교정).
+    ///
+    /// 교착의 대가: 워치독 태스크가 죽으면 큐 배달·데드맨·좌석 캐시·reap·자원 거버넌스가 데몬
+    /// 수명 내내 전부 침묵하고 아무 이벤트도 남지 않는다 — 이 판이 없애려는 '조용한 고장'의
+    /// 최악형. 동일 규율 선례: governance.rs todo_progress → todo_verdict 역순 획득 금지.
+    #[test]
+    fn queue_lock_order_contract_no_ab_ba() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        // ① surface.reap: pending 을 쥔 채 restored 를 잡는 한 문장 형태 금지.
+        let arm_at = prod.find("\"surface.reap\" =>").expect("surface.reap arm 소실");
+        let arm_body = &prod[arm_at..];
+        assert!(
+            !arm_body.contains("surface.pending_queue.lock().unwrap().len()\n                + daemon"),
+            "surface.reap 이 pending 가드를 쥔 채 restored 를 잡는다 — rehome 과 AB-BA 교착"
+        );
+        assert!(
+            arm_body.contains("let restored_depth = daemon")
+                && arm_body.contains("let pending_depth = surface.pending_queue.lock().unwrap().len();"),
+            "큐 깊이 산출이 두 문장(restored 먼저)으로 분리돼 있지 않다 — 락 순서 계약 위반"
+        );
+        // ② queue.list: surfaces 가드를 붙든 채 restored 를 잡지 않는다(스냅샷 후 즉시 해제).
+        let list_at = prod.find("\"queue.list\" =>").expect("queue.list arm 소실");
+        let list_body = &prod[list_at..];
+        let list_end = list_body
+            .find("\"queue.clear\" =>")
+            .unwrap_or(list_body.len());
+        let list_body = &list_body[..list_end];
+        assert!(
+            !list_body.contains("let surfaces = daemon.surfaces.lock().unwrap();"),
+            "queue.list 가 surfaces 가드를 붙든 채 restored_queue 를 잡는다 — rehome 과 역전"
+        );
+        assert!(
+            list_body.contains("daemon.surfaces.lock().unwrap().values().cloned().collect()"),
+            "queue.list 의 surfaces 스냅샷·즉시 해제 형태가 사라졌다"
         );
     }
 

@@ -13,8 +13,10 @@ CSO_DIRECTIVE [절대규칙 — exited surface 자동 reap](제품 기본 절차
      (사후 부검 증거 보존. 실패 시 사유만 기록하고 reap은 계속 — 잔재 회수가 1목적.)
   3. `cys reap-surface <ref>` (★G4 W4-C: 전용 RPC surface.reap — 권위 role(master/cso)
      게이트·7조건 판정·감사 이벤트 3종·묘비 미생성=부활 대상 유지).
-     구 바이너리 폴백: reap-surface 명령 부재(clap 사용오류 + unrecognized subcommand)가
-     명시 관측될 때만 기존 `cys close-surface <ref> --reap` 경로를 유지한다(팩 무중단 적용).
+     구 경로 폴백(양방향 스큐): ①구 CLI = reap-surface 명령 부재(clap 사용오류 +
+     unrecognized subcommand) ②구 데몬 = surface.reap RPC 미지(method_not_found, CLI rc=1).
+     둘 중 하나가 **명시 관측**될 때만 기존 `cys close-surface <ref> --reap` 경로를 유지한다
+     (팩 무중단 적용). 그 외 비-0 은 폴백하지 않는다(게이트 우회 금지 · fail-closed).
 
 ★거부 사유별 처리(rc=7 = 게이트 거부 · stderr 사유 코드가 사실):
   - grace_not_elapsed / state_changed → 실패 아님(deferred). grace(기본 60s)는 포렌식·
@@ -139,10 +141,25 @@ def parse_deny_reason(stderr):
 
 
 def _legacy_unavailable(rc, err):
-    """구 바이너리 판정: reap-surface 서브커맨드 **부재의 명시 증거**(clap 사용오류 rc=2 +
-    unrecognized subcommand)가 있을 때만 True. 그 외 비-0 은 절대 폴백하지 않는다(fail-closed
-    — 게이트 거부를 구버전 close-surface 경로로 우회하면 신설 7조건·감사가 무력화된다)."""
-    return rc == 2 and "unrecognized subcommand" in (err or "")
+    """구 경로 판정: reap 능력 **부재의 명시 증거**가 있을 때만 True. 그 외 비-0 은 절대
+    폴백하지 않는다(fail-closed — 게이트 거부를 구버전 close-surface 경로로 우회하면 신설
+    7조건·감사가 무력화된다).
+
+    증거는 두 방향이다 — 스큐가 양쪽으로 나기 때문:
+      ① **구 CLI**: reap-surface 서브커맨드 자체가 없다 → clap 사용오류 rc=2 +
+         "unrecognized subcommand".
+      ② **구 데몬**(★실제로 흔한 방향): 팩·바이너리는 갱신됐는데 cysd 가 아직 구 프로세스라
+         surface.reap RPC 를 모른다 → 데몬이 method_not_found 를 돌려주고 CLI 는
+         'reap_denied:' 접두가 아니므로 rc=1 로 환원한다(cys.rs reap_surface_exit_code).
+         팩은 바이너리에 임베드되어 함께 전개되므로 ①보다 ②가 정상 업그레이드 경로다.
+         이 증거를 인정하지 않으면 CSO [절대규칙] 자동 reap 루틴이 cysd 재시작 전까지 매
+         사이클 'close-failed' 허위 부분실패를 보고한다(경보 채널 신뢰 붕괴 클래스).
+    ②는 rc=1 전체가 아니라 method_not_found 코드 문자열이 실린 경우로만 좁힌다 — 통신 오류·
+    not_found·invalid_params 는 여전히 폴백하지 않는다."""
+    e = err or ""
+    if rc == 2 and "unrecognized subcommand" in e:
+        return True
+    return rc == 1 and "method_not_found" in e
 
 
 def _reap_one(ref, runner):
@@ -295,6 +312,27 @@ def self_test():
         if _legacy_unavailable(1, "some other error") or _legacy_unavailable(7, "reap_denied"):
             fails.append("⑨c 명시 증거 없는 비-0 이 폴백으로 오판됨(fail-closed 위반)")
 
+        # ⑨d ★구 데몬 스큐(신 CLI + 구 cysd): surface.reap 미지 메서드 → method_not_found →
+        #    CLI rc=1. 이 방향도 폴백 증거로 인정해야 CSO 절대규칙 루틴의 매 사이클 허위
+        #    부분실패가 사라진다. (팩은 바이너리 임베드 동반 전개라 ②가 정상 업그레이드 경로.)
+        daemon_skew_calls = []
+        def stub_daemon_skew(cmd, timeout=TIMEOUT):
+            daemon_skew_calls.append(cmd)
+            if cmd[:2] == ["cys", "reap-surface"]:
+                return 1, "", "error: method_not_found: unknown method: surface.reap"
+            if cmd[:2] == ["cys", "read-screen"]:
+                return 0, "x", ""
+            return 0, "", ""
+        r5b = reap(t, runner=stub_daemon_skew, log_dir=td)
+        if not (r5b[0]["ok"] and r5b[0]["action"] == "reaped-legacy"):
+            fails.append("⑨d 구 데몬 스큐(method_not_found) 폴백 실패: %s" % r5b)
+        if [c for c in daemon_skew_calls if c[:2] == ["cys", "close-surface"]] != \
+                [["cys", "close-surface", "surface:2", "--reap"]]:
+            fails.append("⑨e 구 데몬 폴백 close-surface 호출 불일치: %s" % daemon_skew_calls)
+        if _legacy_unavailable(1, "error: not_found: surface 9 not found") or \
+                _legacy_unavailable(1, "error: connect failed"):
+            fails.append("⑨f rc=1 일반 오류가 폴백으로 오판됨(fail-closed 위반)")
+
         # ⑩ grace 미경과 = deferred(실패 아님) — 데몬 자동 레인·다음 사이클이 수렴.
         def stub_grace(cmd, timeout=TIMEOUT):
             if cmd[:2] == ["cys", "reap-surface"]:
@@ -343,10 +381,11 @@ def self_test():
     if fails:
         sys.stderr.write("\n".join(fails) + "\n")
         return 1
-    print(json.dumps({"self_test": "ok", "cases": 14,
+    print(json.dumps({"self_test": "ok", "cases": 15,
                       "covers": "불변식(bool엄격·ref검증)·빈입력·정상reap(신RPC)·스냅샷·"
                                 "degrade·reap실패보고·선회수race·조회불가미집행·dry-run·"
-                                "구바이너리폴백(명시증거한정)·grace-deferred·queue2단계·게이트거부",
+                                "구바이너리폴백(명시증거한정)·구데몬스큐폴백(method_not_found)·"
+                                "grace-deferred·queue2단계·게이트거부",
                      },
                      ensure_ascii=False))
     return 0
