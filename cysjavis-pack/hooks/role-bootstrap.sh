@@ -146,6 +146,28 @@ INPUT=$(cat 2>/dev/null)
 _static_ctx() {
   printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$1"
 }
+
+# ── ★W-F2 note 인코딩 가드 — 단일 소스(사본 드리프트 금지) ──
+# 이 훅의 모든 `"$CYS_PY" -c` note 발행 블록(기계유래·판정불가·BOOT 부재·발화 실패·발화 성공
+# — 현재 5곳)은 반드시 이 변수를 인접 문자열 연결(POSIX)로 앞세워 시작한다:
+#     "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'…개행…본문…'
+# 왜 변수 1곳인가: 340653d 가 같은 결함 클래스를 팩 3파일에서 고칠 때 이 훅은 2블록만
+# 가드를 얻고 3블록(BOOT 부재·발화 실패·발화 성공)이 무가드로 남았다(사본이 낡는
+# 형태 그 자체). PYTHONUTF8 미주입 스큐(구 데몬)의 비UTF8 Windows(cp949)에서 문안의
+# U+2014(—) 인코딩 실패로 **선언마다 모델에 가는 통보가 통째로 소실**됐다(훅은 exit 0
+# = 완전 침묵 · 성공/실패 경로 동일 실측) — 수동 재실행 금지 경고문까지 함께 사라져
+# "선언했는데 무반응"으로 보인다. 가드 자구는 종전 인라인 가드와 동일하며(선례
+# javis_detect.py 가드), 발화 조건은 어느 블록에서도 바뀌지 않는다(순수 출력 생존 수리).
+# 회귀 핀: tests/test_role_bootstrap_hook.py — cp949 생존(성공·실패 양쪽) + 가드 제거
+# 음성 대조(계측기 타당성) + 5/5 배선 정합(우회 금지).
+CYS_NOTE_IO_GUARD='import json,sys
+# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
+# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass'
 # 프롬프트가 마스터 선언일 **가능성**이 있는가(cannot-judge ↔ judged-no 분리용 보수 선별).
 # 선언은 '마스터' 또는 'master' 토큰 없이 성립하지 않는다(javis_detect.MASTER) — 토큰이 없으면
 # 판정기가 없어도 '선언 아님'이 확정이므로 침묵이 정당하다. 토큰이 있으면 판정 불가 =시끄럽게.
@@ -316,14 +338,7 @@ if [ "$MO_TOKEN" = "machine" ]; then
   # 기계 유래 확정 — 무스폰. 주입문은 정직하게: 무엇을 감지했고 왜 발화하지 않았는지 + 근거
   # 확인 명령 + 오너 우연 일치(거짓 양성 수용 — 비대칭 원칙) 시의 복구 경로.
   echo "[cys-hook] role-bootstrap: 기계 유래 선언(machine-origin 토큰=machine · 보조 rc=$MO_RC) — 무스폰(부트 미발화)" >&2
-  "$CYS_PY" -c 'import json,sys
-# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
-# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[기계 유래 선언 감지 — 부트 미발화] 이 문단을 넣은 것은 모델이 아니라 이 컴퓨터에 설치된 "
       "프로그램의 훅(%s/hooks/role-bootstrap.sh)이다. 원문을 열어 대조해도 된다. "
       "방금 입력에서 마스터 선언 패턴이 감지됐지만, 기계유래 판별(bin/javis_mission.py machine-origin — "
@@ -350,14 +365,7 @@ elif [ "$MO_TOKEN" != "human" ]; then
   echo "[cys-hook] role-bootstrap: 기계유래 판정 불가(machine-origin $MO_WHY) — 무스폰(fail-closed)" >&2
   _notify_bg "부트스트랩 판정 불가(기계유래 판별 실패)" \
     "마스터 선언은 감지됐지만 javis_mission.py machine-origin 이 오너 타이핑/기계 배달 여부를 판정하지 못했습니다($MO_WHY). 팀 기동이 발화되지 않았습니다."
-  "$CYS_PY" -c 'import json,sys
-# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
-# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 판정 불가 - 기계유래 판별 실패] 마스터 선언 패턴은 감지됐지만, 그 선언이 "
       "오너 타이핑인지 기계 배달인지 판별하는 도구(bin/javis_mission.py machine-origin)가 판정하지 "
       "못했다(%s — 판정 근거는 stdout 토큰이고 rc 는 보조 진단이다). "
@@ -388,7 +396,7 @@ BOOT="$PACK/bin/javis_bootstrap.py"
 if [ ! -f "$BOOT" ]; then
   MSG="[부트스트랩 불가] 이 레인의 팩($PACK)에 bin/javis_bootstrap.py가 없어 마스터 팀을 기동할 수 없습니다. 팩 배포(preflight --fix·pack-heal)를 확인하거나 CYS_PACK_DIR이 올바른 레인을 가리키는지 점검하세요."
   _notify_bg "부트스트랩 불가(BOOT 부재)" "$MSG"
-  "$CYS_PY" -c 'import json,sys
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":sys.argv[1]}}, ensure_ascii=False))' \
     "[결정론 부트스트랩 불가 — 명시 실패] 이 레인의 팩에 bin/javis_bootstrap.py가 없어 마스터 팀 기동을 발화할 수 없습니다(조용한 무산 아님). 조치: 팩 배포 상태(preflight --fix·pack-heal)와 CYS_PACK_DIR 레인 정합을 확인하세요. 승인 Feed에도 알림을 시도했습니다."
   exit 0
@@ -555,7 +563,7 @@ if [ -n "$FIRE_FAIL" ]; then
   #   형태가 되지만 정보량($FIRE_FAIL·$LOG)은 그대로다.
   _notify_bg "부트스트랩 발화 실패" \
     "role-bootstrap 훅이 javis_bootstrap.py 발화에 실패했습니다($FIRE_FAIL). 로그: $LOG"
-  "$CYS_PY" -c 'import json,sys
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 발화 실패 — 상태 파생 보고] \"너는 마스터다\" 선언은 감지했으나 "
       "javis_bootstrap.py 발화가 실패했다(사유: %s). 팀은 뜨지 않았다 — 부트가 시작됐다고 "
       "보고하지 마라(성공 문구 인용 금지). "
@@ -589,7 +597,7 @@ CHECK_WINDOW_S="$("$CYS_PY" "$PACK/bin/javis_budget.py" --note-check-window 2>/d
 #   master 를 추가해 숫자를 맞추는 것은 금지 방향 ②(레거시 master 부트 사망).
 TEAM_ROSTER="$("$CYS_PY" "$PACK/bin/javis_orchestra.py" --note-team-roster 2>/dev/null)"
 [ -n "$TEAM_ROSTER" ] || TEAM_ROSTER="필수 역할 전원+master(로스터 모듈 미소비 — javis_orchestra 확인)"
-"$CYS_PY" -c 'import json,sys
+"$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 발화됨 — 하네스 강제] 실행 상태 통보 — 이미 일어난 일이다. "
       "이 문단을 넣은 것은 모델이 아니라 이 컴퓨터에 설치된 프로그램의 훅(%s/hooks/role-bootstrap.sh)이고, "
       "원문을 열어 대조해도 된다. "

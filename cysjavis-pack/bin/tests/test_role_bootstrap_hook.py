@@ -11,7 +11,7 @@
        (P3-A-NEGA)·filler 15/16 경계(P3-A-FILLER)·감지창 200 **문자** 경계(G25).
     ② **훅 통합 검증**(프로세스 경계가 필요한 것만) — 기존 발화/무시 행렬 전량 보존 + role
        allowlist 반전(A3)·surface-role 판정불가 fail-closed(A5)·LC_ALL=C 파리티(G9)·
-       A2 surface 게이트.
+       A2 surface 게이트·★W-F2 cp949 note 생존(+가드 제거 음성 대조).
   ①의 케이스를 ②로 중복 실행하지 않는 이유는 비용이다(훅 1회 ≈ 프로세스 3개). 대표 케이스만
   훅으로 교차 확인해 '함수는 맞는데 배선이 틀린' 구멍을 막는다.
 
@@ -25,6 +25,8 @@
 """
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -124,19 +126,27 @@ def fn_matrix(fails):
 # ══════════════════════════════════════════════════════════════════════════════
 # ② 훅 통합 검증
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None):
-    """훅을 격리 실행. surface_role = 목 cys surface-role 반환값(빈=미claim). 반환: (발화 bool, stdout).
+_MOCK_BOOT = "#!/usr/bin/env python3\nprint('MOCK')\n"   # 발화 성공 경로용 목 부트(존재+즉시 exit 0)
 
-    surface_env=False 는 **cys 밖**(VS Code 등 임의 claude 세션)을 재현한다 — A2 게이트 핀.
-    role_rc≠0 은 surface-role **판정 불가**(데몬 미응답·hang 등)를 재현한다 — A5 fail-closed 핀.
+
+def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None,
+                   hook_path=None, boot_py=_MOCK_BOOT):
+    """훅을 격리 실행하고 CompletedProcess 를 그대로 돌려준다(stdout/stderr **분리** 관측).
+
+    ★W-F2 가 요구한 분리다: note 생존 판정은 stdout 의 JSON 완주가 근거고, 소실 원인 판정은
+    stderr 의 UnicodeEncodeError 가 근거다 — 합쳐 보면 두 사실이 융합된다.
+    hook_path — 기본 None=실제 훅(HOOK). W-F2 음성 대조가 가드를 뗀 변형 사본 경로를 넘긴다.
+    boot_py   — 목 javis_bootstrap.py 소스(기본 _MOCK_BOOT=발화 성공). None 이면 **만들지
+                않아** BOOT 부재 경로가 된다(notify_pipe_release 와 같은 방향).
     """
     home = tempfile.mkdtemp()
     pack = tempfile.mkdtemp()
     mockbin = tempfile.mkdtemp()
     os.makedirs(os.path.join(pack, "bin"), exist_ok=True)
-    # 목 javis_bootstrap.py (부트 안 함 — 존재만)
-    with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
-        f.write("#!/usr/bin/env python3\nprint('MOCK')\n")
+    # 목 javis_bootstrap.py (부트 안 함 — 존재만. boot_py=None 은 BOOT 부재 경로)
+    if boot_py is not None:
+        with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
+            f.write(boot_py)
     # 목 cys — surface-role만 주입, 나머지 no-op
     cysp = os.path.join(mockbin, "cys")
     with open(cysp, "w") as f:
@@ -175,9 +185,19 @@ def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=No
         env.pop("CYS_SURFACE_ID", None)
     if extra_env:
         env.update(extra_env)
+    return subprocess.run(["bash", hook_path or HOOK], input=json.dumps({"prompt": prompt}),
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None):
+    """훅을 격리 실행. surface_role = 목 cys surface-role 반환값(빈=미claim). 반환: (발화 bool, stdout).
+
+    surface_env=False 는 **cys 밖**(VS Code 등 임의 claude 세션)을 재현한다 — A2 게이트 핀.
+    role_rc≠0 은 surface-role **판정 불가**(데몬 미응답·hang 등)를 재현한다 — A5 fail-closed 핀.
+    (기존 소비면 유지 — 원시 관측이 필요하면 _run_hook_proc 를 직접 쓴다.)
+    """
     try:
-        r = subprocess.run(["bash", HOOK], input=json.dumps({"prompt": prompt}),
-                           capture_output=True, text=True, timeout=30, env=env)
+        r = _run_hook_proc(prompt, surface_role, surface_env, role_rc, extra_env)
     except Exception as e:
         return False, "exec 실패: %s" % e
     return ("발화됨" in r.stdout), r.stdout + r.stderr
@@ -267,6 +287,122 @@ def notify_pipe_release(fails):
     elif "send --queued" not in seen:
         fails.append("W-A0 회귀: feed hang 후 12s 안에 send 폴백이 없다(cys_timeout_run "
                      "데드라인 소실 — 서브셸이 60s 잔존): %r" % seen[:300])
+
+
+def _note_ctx(stdout):
+    """stdout 의 hookSpecificOutput JSON 줄에서 additionalContext 를 회수한다(없으면 "").
+
+    json.loads 가 줄 전체를 검증하므로 '부분 출력 후 사망'도 소실로 판정된다 — substring 검사보다
+    강한 계측이다(주입 계약의 실소비자가 JSON 파서라는 사실과 정렬).
+    """
+    for line in stdout.splitlines():
+        if line.startswith('{"hookSpecificOutput"'):
+            try:
+                return json.loads(line)["hookSpecificOutput"]["additionalContext"]
+            except (ValueError, KeyError, TypeError):
+                return ""
+    return ""
+
+
+_BOOT_FAIL_PY = "#!/usr/bin/env python3\nimport sys\nsys.exit(7)\n"   # 즉사 rc7 = '발화 실패' 경로
+# (경로명, boot_py, note 마커) — ★W-F2 가 무가드로 남겼던 3블록 전부(발화 성공·발화 실패·BOOT 부재).
+_CP949_PATHS = (
+    ("발화 성공", _MOCK_BOOT, "발화됨"),
+    ("발화 실패", _BOOT_FAIL_PY, "발화 실패"),
+    ("BOOT 부재", None, "부트스트랩 불가"),
+)
+
+
+def note_cp949_survival(fails):
+    """★W-F2 note 인코딩 가드 회귀 핀 — cp949 stdio 스큐에서도 통보(note)가 생존해야 한다.
+
+    결함(수리 전 실측): 훅의 `python -c` note 블록 5개 중 3개(BOOT 부재·발화 실패·발화 성공)가
+    stdio 재구성 가드 없이 남아, PYTHONUTF8 미주입 스큐(구 데몬)의 비UTF8 Windows(cp949)에서
+    문안의 U+2014(—) 인코딩 실패로 **선언마다 모델에 가는 통보가 통째로 소실**됐다(훅은 exit 0
+    = 완전 침묵). 부트는 실제로 발화됐는데 모델은 아무것도 못 봐 "선언했는데 무반응"이 됐고,
+    수동 재실행 금지 경고문도 함께 사라졌다. 수리는 훅의 가드 단일 소스 변수(CYS_NOTE_IO_GUARD)다.
+
+    3속성:
+      ① 배선 정합(정적) — 5블록 전부가 단일 소스 변수를 쓰고 우회 인라인이 0이어야 한다
+         (인라인 사본 5벌이 반드시 낡는 것이 이번 결함의 형태 그 자체였다).
+      ② cp949 생존(양성) — 성공·발화 실패·BOOT 부재 세 경로 모두 cp949 에서 note JSON 이
+         완주 파싱되고 마커가 남는다(+UnicodeEncodeError 부재·훅 exit 0 계약).
+      ③ 음성 대조(계측기 타당성) — 가드 값을 뗀 변형 훅에서는 같은 케이스가 실제로 note 를
+         잃고(UnicodeEncodeError 동반) 그래야만 이 계측기가 무언가를 재고 있는 것이다.
+    ※발화 조건은 관측만 한다(앵커 ①폭주 — 이 핀은 순수 '출력 생존' 계약이다).
+    """
+    with open(HOOK, encoding="utf-8") as f:
+        hook_src = f.read()
+
+    # ① 배선 정합(정적)
+    n_sites = hook_src.count('-c "$CYS_NOTE_IO_GUARD"' + "'\n")
+    if n_sites != 5:
+        fails.append("W-F2 배선: 가드 변수 call site %d≠5 — note 블록을 추가/제거했다면 이 핀과 "
+                     "훅 정의부 주석을 함께 갱신하라" % n_sites)
+    if "-c 'import json,sys" in hook_src:
+        fails.append("W-F2 배선: 가드 변수를 우회하는 인라인 `-c 'import json,sys` 블록 잔존"
+                     "(사본 드리프트 재발 경로)")
+    m = re.search(r"CYS_NOTE_IO_GUARD='[^']*'", hook_src)
+    guard_defined = bool(m and "_s.reconfigure" in m.group(0))
+    if not guard_defined:
+        # 정의 붕괴라도 ② 실측은 돌린다 — 소실을 정적 소견이 아니라 실행 출력으로 보인다
+        # (측정 가능한 것을 정적 FAIL 뒤에 숨기지 않는다). ③ 뮤테이션만 정의 부재로 불능.
+        fails.append("W-F2 배선: CYS_NOTE_IO_GUARD 정의에 stdio 재구성 가드가 없다")
+
+    def _proc(name, hook_path=None, boot_py=_MOCK_BOOT):
+        try:
+            return _run_hook_proc("너는 마스터다", extra_env={"PYTHONIOENCODING": "cp949"},
+                                  hook_path=hook_path, boot_py=boot_py)
+        except Exception as e:
+            fails.append("W-F2(%s): 훅 실행 실패(계측 불능은 통과가 아니다): %s" % (name, e))
+            return None
+
+    # ② cp949 생존(양성) — 실제 훅
+    for name, boot_py, marker in _CP949_PATHS:
+        r = _proc(name, boot_py=boot_py)
+        if r is None:
+            continue
+        ctx = _note_ctx(r.stdout)
+        if marker not in ctx:
+            fails.append("W-F2 회귀(%s): cp949 에서 note 소실 — additionalContext=%r stderr=%r"
+                         % (name, ctx[:120], r.stderr[:200]))
+        if "UnicodeEncodeError" in r.stderr:
+            fails.append("W-F2 회귀(%s): cp949 에서 UnicodeEncodeError 잔존(무가드 블록 재발)" % name)
+        if r.returncode != 0:
+            fails.append("W-F2(%s): 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % (name, r.returncode))
+
+    if not guard_defined:
+        return   # ③ 은 정의 텍스트를 뮤테이션 대상으로 요구한다(위 ①이 이미 FAIL을 남겼다)
+
+    # ③ 음성 대조 — 가드 값을 뗀 변형(수리 전 상태 재현). 변형 사본은 격리 디렉터리에 두고
+    #    _lib.sh 사본 + bin 링크로 훅의 형제 해소(`$(dirname $0)/../bin`)만 재현한다 —
+    #    실 저장소 파일은 건드리지 않는다(관측=개입 금지).
+    mut_root = tempfile.mkdtemp()
+    mut_hooks = os.path.join(mut_root, "hooks")
+    os.makedirs(mut_hooks)
+    mut_src = hook_src[:m.start()] + "CYS_NOTE_IO_GUARD='import json,sys'" + hook_src[m.end():]
+    if "_s.reconfigure" in mut_src:
+        fails.append("W-F2 음성 대조 무효: 변형본에 재구성 가드 잔존(뮤테이션 미적중)")
+        return
+    mut_hook = os.path.join(mut_hooks, "role-bootstrap.sh")
+    with open(mut_hook, "w", encoding="utf-8") as f:
+        f.write(mut_src)
+    shutil.copy(os.path.join(os.path.dirname(HOOK), "_lib.sh"), os.path.join(mut_hooks, "_lib.sh"))
+    try:
+        os.symlink(BIN, os.path.join(mut_root, "bin"))
+    except OSError:                     # Windows 비대칭(무권한 심링크) — 사본 폴백
+        shutil.copytree(BIN, os.path.join(mut_root, "bin"))
+    for name, boot_py, marker in _CP949_PATHS[:2]:      # 성공·실패 양쪽(티켓 요구 범위)
+        r = _proc("음성 " + name, hook_path=mut_hook, boot_py=boot_py)
+        if r is None:
+            continue
+        ctx = _note_ctx(r.stdout)
+        if marker in ctx:
+            fails.append("W-F2 계측기 무효(%s): 가드를 뗐는데 note 생존 — 이 핀은 아무것도 재지 "
+                         "않는다(양성 케이스의 증명력 0)" % name)
+        if "UnicodeEncodeError" not in r.stderr:
+            fails.append("W-F2 계측기 의심(%s): 변형본의 note 소실이 인코딩 경로가 아니다"
+                         "(다른 사망 원인 — 검체 무효): %r" % (name, (r.stdout + r.stderr)[:200]))
 
 
 # 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
@@ -360,6 +496,9 @@ def main():
     # 9. ★W-A0 알림 파이프 점유 해제 — wedge 데몬에서도 훅 exit ≈ stdout EOF(프롬프트 먹통 차단)
     notify_pipe_release(fails)
 
+    # 10. ★W-F2 note 인코딩 가드 — cp949 스큐에서도 통보 생존(+가드 제거 음성 대조)
+    note_cp949_survival(fails)
+
     if fails:
         print("FAIL (%d):" % len(fails))
         for f in fails:
@@ -367,7 +506,7 @@ def main():
         sys.exit(1)
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
-          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1"
+          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))
