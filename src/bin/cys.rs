@@ -5199,7 +5199,25 @@ fn seat_liveness(s: &Value) -> (SeatLiveness, &'static str) {
         return (SeatLiveness::Absent, "exited");
     }
     // ① awakened_at 래치 — 데몬 SOT·영속·단방향. 존재=각성 확정.
+    //    ★(W-B1 래치 부정) 단, 래치는 영속·단방향이라 한 번 각성한 좌석이 그 안의 에이전트가
+    //    죽은 뒤에도 영원히 AwakeConfirmed 로 읽히면 — boot 스킵("이미 가동 중") → 죽은 좌석
+    //    위에서 거짓 성공이 된다(감사 blocker). 그래서 `seat_death_confirmed`(3중 AND:
+    //    seat=="empty" ∧ agent_alive==Some(false) ∧ 좌석 나이>readiness 예산)가 죽음을
+    //    **확정**한 좌석에서만 래치를 불신임하고 Absent 로 낸다 — 같은 계약의 재사용이다
+    //    (새 술어 발명 금지: null(관측 미도달·Windows master meta 부재)·unknown·기동 중
+    //    좌석은 그 게이트가 전부 Err 로 거부해 래치가 유지된다 = 보류 우선·치명위험 ④ 불변).
+    //    python 미러 `javis_boot_node.node_liveness`/`latch_death_confirmed` 와 같은 사실·
+    //    같은 등급을 내야 한다(tests/test_seat_latch_negation.py 파리티 검체가 기계 대조).
+    //    이후 run_boot 흐름과의 정합: Absent + 좌석 존재 → 아래 회수 체인이 **같은**
+    //    seat_death_confirmed 를 다시 물어 Ok 일 때만 node-recover(비파괴) → reclaim 순으로
+    //    되살린다 — 래치를 부정한 근거와 침습 복구를 인가한 근거가 한 술어라 어긋날 수 없다.
     if s["awakened_at"].as_f64().unwrap_or(0.0) > 0.0 {
+        if seat_death_confirmed(s).is_ok() {
+            return (
+                SeatLiveness::Absent,
+                "awakened_at 래치 부정(죽음 3중 확정: seat=empty ∧ agent_alive=false ∧ 나이>readiness 예산)",
+            );
+        }
         return (SeatLiveness::AwakeConfirmed, "awakened_at 래치");
     }
     // ② agent_alive — 프로세스 생존. **각성은 아니다**(B6) 그러나 재스폰 금지 대상이다.
@@ -5265,6 +5283,112 @@ fn seat_death_confirmed(s: &Value) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// ★(W-B1) 래치 부정 파리티 검체 — python `javis_boot_node.latch_death_confirmed`/`node_liveness`
+/// 의 래치 배터리(tests/test_seat_latch_negation.py)와 **같은 4상 표**를 Rust 정본에서 실행한다.
+/// 두 언어가 같은 좌석을 반대로 판정하면(한쪽 생존·한쪽 사망) A1·B3 클래스 재발이다 —
+/// 표의 케이스 태그(CASE-ALL/CASE-A/CASE-B/CASE-C)는 python 검체와 1:1 이고, python 쪽
+/// 텍스트 핀이 이 모듈의 존재·태그를 기계 대조한다(짝 소실 = 파리티 검체 붕괴로 검출).
+/// ★경계(age == floor) 케이스는 python 에만 있다: Rust `seat_death_confirmed` 는 벽시계를
+/// 내부에서 읽어 정확 경계 픽스처가 본질적으로 flaky 다(python 은 now 주입 가능) —
+/// 경계 규약(엄격 초과)은 python 검체가, 여유 마진 케이스(young)는 양쪽이 잰다.
+#[cfg(test)]
+mod seat_latch_negation_tests {
+    use super::*;
+
+    /// 픽스처 — 죽음 3중 확정(전부 참) 좌석. 개별 케이스는 여기서 한 항씩만 부정한다
+    /// (한 번에 한 항: 실패 시 어느 항의 회귀인지 즉시 귀속되게).
+    fn dead_seat() -> Value {
+        let now = chrono::Local::now().timestamp() as f64;
+        serde_json::json!({
+            "role": "cso", "exited": false, "awakened_at": 1000.0,
+            "seat": "empty", "agent_alive": false,
+            "created_at": now - 3600.0,   // readiness 예산(60s) 대비 60배 마진 — 벽시계 틱 무관
+        })
+    }
+
+    #[test]
+    fn case_all_true_latch_negated_to_absent() {
+        // CASE-ALL: 3중 AND 전부 참 → 래치 부정 → Absent(회수 체인 인계 — 거짓 already_alive 소멸).
+        let s = dead_seat();
+        assert!(seat_death_confirmed(&s).is_ok(), "3중 확정 좌석이 죽음 미확정으로 접힘");
+        let (grade, why) = seat_liveness(&s);
+        assert_eq!(grade, SeatLiveness::Absent, "래치가 죽음 확정 좌석을 계속 각성확정으로 유지: {why}");
+        assert!(why.contains("래치 부정"), "부정 사유가 판정 이유에 남지 않음: {why}");
+    }
+
+    #[test]
+    fn case_a_seat_not_empty_holds_latch() {
+        // CASE-A: ⓐ 부정 — seat="unknown"(프로브 실패)·필드 부재(구 데몬)는 절대 트리거 금지.
+        for a in [serde_json::json!("unknown"), serde_json::json!("occupied"), Value::Null] {
+            let mut s = dead_seat();
+            if a.is_null() {
+                s.as_object_mut().unwrap().remove("seat");
+            } else {
+                s["seat"] = a;
+            }
+            assert!(seat_death_confirmed(&s).is_err(), "seat!=empty 인데 죽음 확정");
+            assert_eq!(seat_liveness(&s).0, SeatLiveness::AwakeConfirmed,
+                       "seat!=empty 에서 래치가 무효화됨(콜드스타트 전 팀 결손 오판 경로)");
+        }
+    }
+
+    #[test]
+    fn case_b_agent_alive_not_explicit_false_holds_latch() {
+        // CASE-B: ⓑ 부정 — **null(관측 미도달·meta 부재)이 핵심**이다: claim-role 관측 등록이
+        // #[cfg(unix)] 라 Windows master 좌석은 agent_alive 가 영구 null — 여기서 래치가 무효화되면
+        // 매 check 결손 오판 → node-recover 가 살아있는 master 입력창에 주입 → 치명 앵커 ④.
+        for b in [Value::Null, serde_json::json!(true)] {
+            let mut s = dead_seat();
+            if b.is_null() {
+                s["agent_alive"] = Value::Null; // JSON null = 3상의 '관측 미도달'
+            } else {
+                s["agent_alive"] = b;
+            }
+            assert!(seat_death_confirmed(&s).is_err(), "agent_alive!=false 인데 죽음 확정(Windows master 오살 경로)");
+            assert_eq!(seat_liveness(&s).0, SeatLiveness::AwakeConfirmed,
+                       "agent_alive 명시적 false 아님(null/true)에서 래치가 무효화됨");
+        }
+    }
+
+    #[test]
+    fn case_c_young_or_unknown_age_holds_latch() {
+        // CASE-C: ⓒ 부정 — 갓 만든 좌석(기동 중 레이스)·created_at 미상은 래치 유지(보류 우선).
+        let now = chrono::Local::now().timestamp() as f64;
+        let mut young = dead_seat();
+        young["created_at"] = serde_json::json!(now - 1.0); // 예산 60s 대비 59s 마진 — 틱 무관
+        assert!(seat_death_confirmed(&young).is_err(), "기동 중 좌석(나이<예산)인데 죽음 확정(레이스)");
+        assert_eq!(seat_liveness(&young).0, SeatLiveness::AwakeConfirmed,
+                   "기동 중 좌석에서 래치가 무효화됨");
+        let mut unknown_age = dead_seat();
+        unknown_age.as_object_mut().unwrap().remove("created_at");
+        assert!(seat_death_confirmed(&unknown_age).is_err(), "created_at 미상인데 죽음 확정(보류 우선 위반)");
+        assert_eq!(seat_liveness(&unknown_age).0, SeatLiveness::AwakeConfirmed,
+                   "나이 측정 불가 좌석에서 래치가 무효화됨");
+    }
+
+    #[test]
+    fn latch_only_seat_stays_awake_and_no_latch_flow_unchanged() {
+        // 무회귀 핀 2종: ①래치 단독(seat·agent_alive·created_at 무신호 — H-PRED-3 ⓐ 픽스처)은
+        // 여전히 각성 확정. ②래치 없는 죽은 좌석의 기존 결론(Absent)은 부정 로직과 무관하게 불변.
+        let latched_only = serde_json::json!({"role": "cso", "exited": false, "awakened_at": 1.0});
+        assert_eq!(seat_liveness(&latched_only).0, SeatLiveness::AwakeConfirmed,
+                   "래치 단독 좌석이 각성확정을 잃음(legacy 계약 회귀)");
+        let mut no_latch = dead_seat();
+        no_latch.as_object_mut().unwrap().remove("awakened_at");
+        assert_eq!(seat_liveness(&no_latch).0, SeatLiveness::Absent,
+                   "래치 없는 빈 좌석의 기존 Absent 결론이 변형됨");
+    }
+
+    #[test]
+    fn readiness_budget_parity_pin() {
+        // ⓒ항 임계의 언어 간 파리티 핀 — python `javis_budget.launch_readiness_max_s()` 기본값과
+        // 같은 수(60s)여야 한다. 이 수가 갈리면 같은 좌석 나이를 한쪽은 '기동 중', 한쪽은
+        // '죽음 확정'으로 읽는다(python 검체 test_seat_latch_negation.py 가 같은 60 을 단언).
+        assert_eq!(budget_readiness_max(0, false).as_secs(), 60,
+                   "readiness 예산 기본 산식(max(0,30)×2)이 움직임 — python leaf 와 동시 이동 필요");
+    }
 }
 
 /// role → 그 role 을 쥔 비종료 surface 행(없으면 None). worker 는 접두 수용(데몬 dedup: worker-N).

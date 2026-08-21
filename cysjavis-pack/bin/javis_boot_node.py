@@ -192,7 +192,11 @@ GRACEFUL_KILL_NOOP_REASON = (
 
 
 def cys_status():
-    rc, out, _ = run(["cys", "status", "--json"], timeout=12)
+    # ★W-B1 ④(W-A4b 후속): `timeout=12` 하드코딩 → 예산 leaf `CYS_STATUS_TIMEOUT_S` 배선.
+    #   leaf 하한이 12 라 기본값은 동일하되, 이제 orchestra._cys_status_timeout_s 와 이 사본이
+    #   '값이 우연히 같은' 게 아니라 **같은 leaf 를 본다** — leaf 가 움직이면 함께 움직인다
+    #   (사본 드리프트 차단). import 실패 시 leaf 하한 12 명시 폴백(budget() 계약).
+    rc, out, _ = run(["cys", "status", "--json"], timeout=budget("CYS_STATUS_TIMEOUT_S", 12))
     if rc != 0:
         return None
     try:
@@ -329,6 +333,15 @@ def awake_ready(status, role):
         return False, "surface 없음"
     latch = awakened_latch(status, role)
     if latch is not None:
+        # ★W-B1 래치 부정 — node_liveness 와 **같은 3중 AND**(latch_death_confirmed 단일 정의)를
+        #   소비한다. 이 게이트가 여기 없으면 boot_node PRE-CHECK 가 죽은 좌석을 already_up 으로
+        #   보고해(거짓 성공 exit 0) node_liveness 수리를 우회한다 — 같은 blocker 의 다른 얼굴.
+        #   부정 시 즉시 False 인 이유는 node_liveness 의 absent 즉시 반환과 동일(3중 확정은
+        #   커널 사실이라 잔여 소프트 신호보다 권위가 높다). 이후 흐름은 비파괴다: 입양→주입
+        #   (--queued 는 empty 좌석에 배달 보류) → ack 없으면 injected_unverified(정직한 exit 1).
+        dead, dwhy = latch_death_confirmed(s)
+        if dead:
+            return False, "awakened_at 래치 부정(%s)" % dwhy
         return True, "awakened_at 래치(%d — 각성 확정)" % int(latch)
     if s.get("agent_alive"):
         return True, "agent_alive(래치 부재=legacy-presumed 폴백)"
@@ -400,11 +413,86 @@ def seat_state(status, role):
     return None
 
 
+def _readiness_budget_s():
+    """readiness 최대 예산(초) — 래치 부정 ⓒ항(좌석 나이 가드)의 임계.
+
+    ★Rust 정본과 동일 산식이어야 한다(파리티 계약): cys.rs `budget_readiness_max(0, false)`
+      = max(0, BUDGET_READINESS_FLOOR_SECS=30) × BUDGET_READINESS_MULT=2 = 60s.
+      python 측 SOT 는 `javis_budget.launch_readiness_max_s()`(같은 산식·같은 leaf —
+      cys.rs BUDGET_* 블록과 기계 대조되는 그 leaf 들이다). 여기서 별도 상수를 만들면
+      임계가 두 언어에서 갈라져 '한쪽은 기동 중, 한쪽은 죽음 확정'이 된다.
+    ★import 실패(부서 팩 결손·팩 스큐) 시 명시 폴백 60.0 — Rust 기본 산식과 동치 값이라
+      폴백에서도 파리티가 유지된다(조용한 접힘 금지·예산 모듈 부재가 새 크래시 지점 금지)."""
+    if _budget is not None:
+        try:
+            return float(_budget.launch_readiness_max_s())
+        except Exception:
+            pass
+    return 60.0
+
+
+def latch_death_confirmed(s, now=None):
+    """★래치 부정 3중 AND(W-B1 blocker 수리) — (confirmed, reason). **순수 판정**(부작용 0).
+
+    ★이 계약은 새로 발명한 것이 아니다 — cys.rs `seat_death_confirmed`(파괴적 복구의 유일
+      허용 조건·치명위험 ④ 차단 게이트)가 이미 구현한 **정확히 같은 3중 AND** 의 python
+      미러다. 두 언어가 같은 좌석을 반대로 판정하면(한쪽은 살았다, 한쪽은 죽었다) 판정
+      이원화 결함 클래스(A1·B3)가 재발한다 — 조건 하나라도 여기서 고치면 Rust 쪽도 함께
+      고쳐야 한다(tests/test_seat_latch_negation.py 파리티 검체가 기계 대조).
+
+    왜 필요한가(감사 blocker): `awakened_at` 래치는 영속·단방향이라, 한 번 각성한 좌석은
+    그 안의 에이전트가 죽어도 영원히 awake_confirmed 로 읽혔다 → 결손 0 → `cys boot` 생략
+    → ⑤check 도 같은 술어라 통과 → 죽은 좌석 위에서 "기동 완료" 거짓 성공. 래치를 지우는
+    것이 아니라(단방향 불변식 유지 — 금지 방향 ⑦), **죽음이 3중으로 확정된 좌석에서만**
+    이번 판정에서 래치를 불신임한다.
+
+    3중 AND — 전부 참일 때만 confirmed(하나라도 불명이면 래치 유지 = 보류 우선):
+      ⓐ seat == "empty"          커널 확정 사실(자손 프로세스 0). "unknown"(프로브 실패)·
+                                  필드 부재(구 데몬 무신호)는 **절대 트리거 금지** — 판정불가에
+                                  래치를 불신임하면 콜드스타트 창(전 좌석 unknown)에서 건강한
+                                  전 팀이 결손으로 보인다.
+      ⓑ agent_alive is False     **명시적 false 만**. None/키 부재는 '관측 미도달'이다 —
+                                  daemon 의 agent_alive 는 3상(true/false/null)이고
+                                  (handlers.rs: meta 부재 → null), claim-role 관측 등록이
+                                  #[cfg(unix)] 라 **Windows 의 master 좌석은 null 이 영구**다.
+                                  낙관적 falsy(`not s.get("agent_alive")`)로 구현하면 Windows
+                                  master 래치가 매 check 마다 무효화 → 결손 오판 → node-recover
+                                  가 살아있는 claude 입력창에 기동 커맨드 주입 → 치명 앵커 ④
+                                  (전 pane 사망). Rust 정본의 `as_bool() != Some(false)` 거부와
+                                  자구 동등한 `is False` 로만 통과시킨다.
+      ⓒ 좌석 나이 > readiness 예산  방금 만들어진 pane 은 기동 중일 수 있다(create → send →
+                                  set_meta → watchdog 관측 사이 창). created_at 미상(부재·0)은
+                                  나이를 못 재므로 불신임 금지(Rust `created <= 0.0` 거부 미러).
+                                  경계는 엄격 초과(age > floor) — Rust `!(age > floor)` 거부와
+                                  동일(age == floor 는 유지측).
+
+    now 인자는 밀폐 테스트용 주입(기본 wall clock) — 판정 로직은 순수함수로 유지한다."""
+    seat = s.get("seat")
+    if seat != "empty":
+        return False, ("seat=%r — 명시적 empty 아님(판정불가·구데몬 무신호에 래치 불신임 금지)"
+                       % (seat,))
+    if s.get("agent_alive") is not False:
+        return False, ("agent_alive=%r — 명시적 false 아님(관측 미도달/meta 부재 — Windows "
+                       "master 포함 — 래치 유지)" % (s.get("agent_alive"),))
+    created = s.get("created_at")
+    if not isinstance(created, (int, float)) or created <= 0:
+        return False, "created_at 미상 — 좌석 나이 측정 불가(래치 유지·보류 우선)"
+    t = time.time() if now is None else now
+    age = t - float(created)
+    floor = _readiness_budget_s()
+    if not (age > floor):
+        return False, ("좌석 나이 %.0fs ≤ readiness 예산 %.0fs — 기동 중일 수 있다"
+                       "(레이스 방지·래치 유지)" % (age, floor))
+    return True, ("죽음 3중 확정: seat=empty ∧ agent_alive=False ∧ 좌석 나이 %.0fs > "
+                  "readiness 예산 %.0fs" % (age, floor))
+
+
 def node_liveness(status, role):
     """★공유 술어 ① — (grade, reason). 등급 정의·불변식은 모듈 docstring 참조.
 
     판정 순서가 곧 신호의 권위 순서다:
-      ① awakened_at 래치      → awake_confirmed  (데몬 SOT·영속·단방향)
+      ① awakened_at 래치      → awake_confirmed  (데몬 SOT·영속·단방향 · ★래치 부정 3중 AND
+                                 이 죽음을 확정한 좌석만 예외로 absent — latch_death_confirmed)
       ② 신선 set-status ack   → awake_confirmed  (부트 성공의 계약)
       ③ agent_alive 단독      → alive_presumed   (★B6: 각성 아님 — 빈 CLI 도 프로세스는 산다)
       ④ 좌석 occupied         → alive_presumed   (커널 사실: 자손 프로세스 존재)
@@ -420,6 +508,17 @@ def node_liveness(status, role):
         return LIVENESS_ABSENT, "좌석 없음(role 보유 비종료 surface 부재)"
     latch = awakened_latch(status, role)
     if latch is not None:
+        # ★W-B1 래치 부정: 래치는 지우지 않는다(단방향 불변식·legacy-presumed 계약 보존).
+        #   죽음이 3중 확정(seat=empty ∧ agent_alive is False ∧ 나이>readiness 예산)된 좌석만
+        #   이번 판정에서 래치를 불신임하고 absent 로 낸다 — Rust seat_liveness 의 래치 부정과
+        #   같은 사실·같은 등급(파리티: Rust 도 부정 후 seat=="empty" 로 흘러 Absent 다).
+        #   absent 즉시 반환인 이유: 3중 확정은 커널 사실 기반이라 잔여 소프트 신호(≤600s
+        #   신선 set-status = 죽기 직전 마지막 자기보고)보다 권위가 높고, 폴백 순회를 계속하면
+        #   그 마지막 자기보고가 최대 10분간 죽은 좌석을 awake 로 되살려 Rust 판정(즉시 Absent)
+        #   과 어긋난다(한쪽은 살았다 하고 한쪽은 죽었다 하는 바로 그 결함).
+        dead, dwhy = latch_death_confirmed(s)
+        if dead:
+            return LIVENESS_ABSENT, "awakened_at 래치 부정 — %s" % dwhy
         return LIVENESS_AWAKE, "awakened_at 래치(%d)" % int(latch)
     st = s.get("status") or {}
     age = st.get("age_secs")
