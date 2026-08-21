@@ -2050,24 +2050,43 @@ fn no_console(cmd: &mut std::process::Command) {
 
 /// RC-5: GUI 직스폰(bash/python3)에 동봉 runtime PATH 주입. GUI(Explorer/Finder) 프로세스 PATH엔
 /// runtime이 없어 순정 Windows서 bash/python3 lookup 실패 → ＋부서·티켓 무반응이었다(cysd PTY 자식만
-/// 주입 수혜). cysd와 동일한 공용 로직(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.
-/// 타 OS는 exe_dir만 얹혀 사실상 무영향(제거 없음).
+/// 주입 수혜). 타 OS는 exe_dir만 얹혀 사실상 무영향(제거 없음).
 ///
-/// ★SEAL-1(2026-08-01 실사고): 여기에 PYTHONDONTWRITEBYTECODE 도 함께 얹는다. **이 함수가
+/// ★SEAL-1(2026-08-01 실사고): PYTHONDONTWRITEBYTECODE 도 함께 얹는다. **이 함수가
 /// 하는 일이 곧 "자식이 번들 python 을 쓰게 만드는 것"**이므로, 번들 python 이 자기 번들에
 /// `__pycache__/*.pyc` 를 써서 코드서명 봉인을 깨는 경로와 호출부 집합이 정확히 같다
-/// (직스폰 python3 3곳 + bash 경유로 python 을 부르는 곳 전부). 호출부마다 한 줄씩 더하면
+/// (직스폰 python3 + bash 경유로 python 을 부르는 곳 전부). 호출부마다 한 줄씩 더하면
 /// 새 스폰이 생길 때 또 빠진다 — 배선의 단일 지점에 둔다. 근거·대안 비교는 lib.rs
 /// `ENV_PY_NO_BYTECODE` 주석. python 이 아닌 자식(cys/bash)에게는 무해한 무시 변수다.
+///
+/// ★W-B2(감사 blocker #4 의 GUI 절반): 손수 PATH·SEAL-1 두 키만 얹던 이 함수를 pane 스폰
+/// (state.rs)·스케줄 발화(schedule.rs)와 **같은 공용 규약**(`cys::spawn_env_pairs_from_process`)
+/// 소비로 교체한다 — GUI 직스폰 env 키 집합이 pane 스폰 runtime 규약 키 집합의 **상위집합**이
+/// 된다(회귀 핀 `gui_spawn_env_matches_pane_spawn_env`). 종전 누락 2종이 이걸로 닫힌다:
+///   · PYTHONUTF8=1 — 한국어 Windows(cp949)에서 GUI 직스폰 부트 체인(`javis_orchestra.py
+///     check`)이 '✓' 한 글자에 UnicodeEncodeError 로 즉사하던 무보호 경로. pane 경로는
+///     state.rs literal(RC-6)로 이미 막혀 있었고, **훅이 죽은 사용자가 정확히 이 GUI 직스폰
+///     경로로 몰리므로** 두 결함이 같은 사람에게 겹쳤다.
+///   · HOME←USERPROFILE backfill — Windows 비로그인 bash.exe 자식의
+///     `${CYS_PACK_DIR:-$HOME/.cys/pack}` 이 `/.cys/pack` 으로 붕괴하던 경로(W1a 와 동일
+///     기제의 GUI 절반 · HOME 이 이미 있으면 무접촉이라 mac/unix 는 무변경).
+///
+/// 순서 계약: 무조건 쌍 2종(SEAL-1·UTF-8)을 규약 **앞에** 상수로 한 번 더 얹는다 —
+/// current_exe 실패(이론상)에도 이 둘만은 잃지 않는 방어선이다. `spawn_env_pairs` 가 같은
+/// 키를 다시 얹지만 std `Command` env 는 맵이라 나중 주입이 이기고 값이 동일("1")해 무해하다.
+/// 호출부들이 이 함수 **뒤에** 거는 CYS_SOCKET/CYS_ROLE 등 명시 env(env/env_remove)는 규약과
+/// 키가 겹치지 않아 종전 순서 의미가 그대로 보존된다.
 fn inject_runtime_path(cmd: &mut std::process::Command) {
     cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);
+    cmd.env(cys::ENV_PY_UTF8, cys::PY_UTF8_ON);
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     {
-        let cur = std::env::var("PATH").unwrap_or_default();
-        if let Some(newp) = cys::runtime_prefixed_path(&exe_dir, &cur) {
-            cmd.env("PATH", newp);
+        // pane(state.rs)·스케줄(schedule.rs)과 동일 SOT — PATH 선두주입·HOME backfill·
+        // SEAL-1·UTF-8 이 한 규약에서 나온다(사본 금지 · 검체 H-WIN-8 의 GUI 확장).
+        for (k, v) in cys::spawn_env_pairs_from_process(&exe_dir) {
+            cmd.env(k, v);
         }
     }
 }
@@ -4762,5 +4781,73 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             Some(cys::PY_NO_BYTECODE_ON),
             "inject_runtime_path 가 바이트코드 쓰기 차단 쌍을 잃었다 — GUI 직스폰 python 이 번들을 오염시킨다"
         );
+    }
+    /// ★W-B2 회귀 핀(감사 blocker #4 의 GUI 절반): GUI 직스폰 env 키 집합 ⊇ pane 스폰
+    /// **runtime 규약** env 키 집합(PATH·HOME backfill·PYTHONDONTWRITEBYTECODE·PYTHONUTF8).
+    /// 종전 누락 2종(PYTHONUTF8·HOME backfill) 탓에 한국어 Windows(cp949) GUI 직스폰
+    /// 부트 체인이 UnicodeEncodeError 로 즉사했다 — 목표는 누락 0 이고 이 핀이 그걸 박제한다.
+    ///
+    /// ★범위 한계(정직 고지): pane 스폰(state.rs `create_surface_with_env`)은 위 규약에 더해
+    /// pane **정체성** env(TERM·LANG·CYS_SURFACE_ID/REF·CYS_SOCKET·CYS_PACK_DIR 등)를 얹지만,
+    /// 그것들은 PTY/surface 소속 표식이라 "직스폰 CLI 자식"인 GUI 경로의 대칭 대상이 아니다 —
+    /// 이 핀의 pane 측 기준은 **공용 규약(cys::spawn_env_pairs)** 이다. state.rs 는 bin
+    /// 크레이트라 여기서 심볼 참조가 불가능하고(W-B2 는 state.rs 무접촉 제약) pane literal
+    /// ("PYTHONUTF8","1")은 아래 ③에서 literal 거울로 핀한다.
+    #[test]
+    fn gui_spawn_env_matches_pane_spawn_env() {
+        // ① 규약 완전집합 핀: 조건을 강제(PATH 변경 유발·HOME 부재·USERPROFILE 실재)하면
+        //    4키 전부 나와야 한다 — 여기서 키가 빠지면 "규약 소비" 자체가 반쪽이 된다.
+        let full = cys::spawn_env_pairs(
+            std::path::Path::new("/nonexistent-exe-dir-for-pin"),
+            "/usr/bin:/bin",
+            None,
+            Some("C:\\Users\\me"),
+        );
+        let full_keys: std::collections::BTreeSet<&str> =
+            full.iter().map(|(k, _)| k.as_str()).collect();
+        for want in ["PATH", "HOME", cys::ENV_PY_NO_BYTECODE, cys::ENV_PY_UTF8] {
+            assert!(
+                full_keys.contains(want),
+                "공용 규약(spawn_env_pairs)에서 {want} 키가 사라졌다 — GUI/pane 대칭의 기반 소실"
+            );
+        }
+
+        // ② 상위집합 핀: **같은 프로세스 env** 아래에서 GUI 직스폰(inject_runtime_path)이
+        //    pane 규약 키를 하나도 빠뜨리지 않는다(W-B2 이전: PYTHONUTF8·HOME 2종 누락).
+        let mut cmd = std::process::Command::new("true");
+        inject_runtime_path(&mut cmd);
+        let gui_keys: std::collections::BTreeSet<String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|_| k.to_string_lossy().into_owned()))
+            .collect();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .expect("테스트 바이너리 exe_dir 조회 실패");
+        let pane_pairs = cys::spawn_env_pairs_from_process(&exe_dir);
+        let missing: Vec<&str> = pane_pairs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !gui_keys.contains(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "GUI 직스폰 env 가 pane 규약 키를 누락했다: {missing:?} — cp949 즉사/HOME 붕괴 재발"
+        );
+
+        // ③ 무조건 쌍 2종은 값까지 literal 로 핀 — pane 측 state.rs literal("PYTHONUTF8","1")
+        //    주입과의 파리티(중복 주입 무해 근거 = 값 동일)를 상수 우회 없이 못박는다.
+        for (k, want) in [("PYTHONDONTWRITEBYTECODE", "1"), ("PYTHONUTF8", "1")] {
+            let got = cmd
+                .get_envs()
+                .find(|(ek, _)| *ek == std::ffi::OsStr::new(k))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned());
+            assert_eq!(
+                got.as_deref(),
+                Some(want),
+                "GUI 직스폰 무조건 쌍 {k}={want} 소실 — 값이 다르면 pane literal 과의 무해 중복 근거도 무너진다"
+            );
+        }
     }
 }
