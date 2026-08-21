@@ -240,6 +240,28 @@ pub fn queue_migrated_payload(
     })
 }
 
+/// queue.reordered payload — 운영자 강제 배달(queue.deliver·G1 W2-E)이 비머리 항목을
+/// `allow_reorder`로 머리에 끌어올릴 때 발행(신규 이벤트). 재정렬 발생 지점의 무음 금지
+/// (결함 3 순서 역전 봉인)와 짝 — 배달 성패와 무관하게 재정렬 사실 자체를 기록한다.
+/// cause 어휘(현행 1종): "force_deliver" (supersede 는 이번 릴리스 제외 — 브리프 확정).
+/// 단수 큐 항목 id 키는 명명 계약대로 `queue_entry_id`(`entry_id` 키명 금지 — W-id 에코
+/// 계열 `entry_ids`와 한 이벤트 패밀리에서 체계 혼동을 만들지 않는다).
+pub fn queue_reordered_payload(
+    surface_ref: &str,
+    entry: &QueueEntry,
+    from_index: usize,
+    cause: &str,
+) -> Value {
+    json!({
+        "surface_ref": surface_ref,
+        "queue_entry_id": entry.id,
+        "seq": entry.seq,
+        "from_index": from_index,
+        "to_index": 0,
+        "cause": cause,
+    })
+}
+
 /// (enqueued_at, seq) 기준 stable merge 삽입 위치 — 대상 큐에서 새 항목 `(at, seq)`보다
 /// **뒤(더 신규)인 첫 인덱스**를 반환한다(순수 판정자·G1 W2-C).
 /// - 동률은 기존/선삽입 항목 승(= stable — 같은 키의 복원 항목은 파일·seq 순서를 유지).
@@ -5642,6 +5664,23 @@ mod tests {
         assert_eq!(m["queue_entry_ids"], json!(["qr.1", "qr.2"]), "append 순서 보존");
         assert_eq!(m["role"], json!("master"));
         assert!(m.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
+    }
+
+    /// ★G1(W2-E) queue.reordered payload 스키마 핀 — 강제 배달의 비머리 끌어올림 기록.
+    /// 단수 키는 명명 계약대로 `queue_entry_id`(`entry_id` 키명 절대 부재 — 성찰 BLOCKER),
+    /// to_index 는 항상 0(머리), cause 어휘는 "force_deliver" 하나(supersede 릴리스 제외).
+    #[test]
+    fn queue_reordered_payload_pins_schema() {
+        let e = w2c_entry("qx.4", 4, 40.0);
+        let p = queue_reordered_payload("surface:9", &e, 2, "force_deliver");
+        assert_eq!(p["surface_ref"], json!("surface:9"));
+        assert_eq!(p["queue_entry_id"], json!("qx.4"), "단수 키 = queue_entry_id(명명 계약)");
+        assert_eq!(p["seq"], json!(4));
+        assert_eq!(p["from_index"], json!(2));
+        assert_eq!(p["to_index"], json!(0), "끌어올림 목적지는 항상 머리(0)");
+        assert_eq!(p["cause"], json!("force_deliver"));
+        assert!(p.get("entry_id").is_none(), "entry_id 키명 금지(W-id 에코 체계와 혼동 차단)");
+        assert!(p.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
     }
 
     // ─── ★G1(W2-B): 큐 이벤트 payload 빌더 스키마 핀 ─────────────────────────

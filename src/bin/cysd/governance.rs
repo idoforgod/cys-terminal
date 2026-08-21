@@ -2931,6 +2931,7 @@ fn wakeup_entry_ids(text: &str) -> Vec<String> {
 
 /// ★G1(W2-D): 배달 성과 — deliver_head_locked 의 반환값. queue.deliver RPC(W2-E)가
 /// 응답({queue_entry_id, seq, remaining})을 조립하는 재료를 겸한다.
+#[derive(Debug)]
 pub(crate) struct Delivered {
     pub entry: crate::state::QueueEntry,
     pub remaining: usize,
@@ -2955,15 +2956,23 @@ pub(crate) struct Delivered {
 /// - try_send 실패 = None(메시지 보존 — 다음 틱 재시도). 락이 배달자 2원화(틱+RPC)를
 ///   직렬화하고 pop-by-id 가 상대가 이미 배달한 머리의 오삼킴을 구조 차단한다.
 /// - forced/overdue 는 이벤트 층 구분일 뿐 임계영역 동작·원장 스키마는 동일하다(불변).
+/// - ★G1(W2-E) `expect_head_id`: Some(id)이고 락 획득 시점 머리가 그 id 가 아니면 **아무것도
+///   하지 않고** None — RPC 강제 배달이 게이트 통과·조준 해석과 실배달 사이 창에서 틱·clear 와
+///   경합해도 '조준한 항목이 아닌 다음 항목'을 forced 로 오배달하지 않는다(pop-by-id 와 같은
+///   belt-and-suspenders 층). watchdog 틱은 None 을 넘긴다('그 시점 머리'가 곧 조준 — 현행 동일).
 pub(crate) fn deliver_head_locked(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     forced: bool,
     overdue: bool,
+    expect_head_id: Option<&str>,
 ) -> Option<Delivered> {
     let delivered = {
         let mut q = s.pending_queue.lock().unwrap();
         let entry = q.front().cloned()?;
+        if expect_head_id.is_some_and(|want| want != entry.id) {
+            return None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
+        }
         crate::delivery::record_audited(
             daemon,
             s.id,
@@ -3013,6 +3022,179 @@ pub(crate) fn deliver_head_locked(
     // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
     daemon.persist_queue_state();
     Some(delivered)
+}
+
+/// ★G1(W2-E): queue.deliver(운영자 강제 배달) 거부 사유 — RPC err 코드와 1:1(결정론 소비
+/// 계약 · CLI 는 code 접두로 '게이트 거부 exit'를 가른다). 강제(forced)는 'quiet **대기**
+/// 생략'만이며 안전 게이트는 전부 유지한다 — 2026-07-17 빈 좌석 zsh 오타이핑 사고·R1 MED-2
+/// 를 운영자 경로에서도 재개방하지 않는다(절대 불변).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForceDeliverDenied {
+    /// 헬스 조치(pause-queue)가 이 surface 배달을 보류 중.
+    QueuePaused,
+    /// 사람 입력 흔적 신선(기본 30s) — 미완성 입력 이어붙기/제출 차단(R1 MED-2 · 면제 불가).
+    TypingGuard,
+    /// role 좌석인데 에이전트 미연결 — 빈 셸 zsh 에 문자 타이핑되는 사고 경로 차단.
+    EmptySeat,
+    /// ★성찰 BLOCKER: forced 에도 overdue_quiet(기본 1s) 하한 — 출력 한복판 주입 금지.
+    OutputBusy { quiet_for: u64, need: u64 },
+    /// 배달할 항목 없음.
+    QueueEmpty,
+    /// 조준 entry_id 가 머리가 아님 — 순서 변경은 allow_reorder 명시로만(무음 재정렬 금지).
+    NotHead { index: usize },
+    /// 조준 entry_id 가 큐에 없음(이미 배달·폐기됐거나 오타).
+    NotFound,
+    /// 게이트·조준 통과 후 실배달 직전 경합(틱이 먼저 배달·clear drain·writer busy) — 재시도 대상.
+    Raced,
+}
+
+impl ForceDeliverDenied {
+    /// RPC err code — cys CLI `queue_deliver_exit_code` 의 게이트 판정 접두와 1:1.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            ForceDeliverDenied::QueuePaused => "queue_paused",
+            ForceDeliverDenied::TypingGuard => "typing_guard",
+            ForceDeliverDenied::EmptySeat => "empty_seat",
+            ForceDeliverDenied::OutputBusy { .. } => "output_busy",
+            ForceDeliverDenied::QueueEmpty => "queue_empty",
+            ForceDeliverDenied::NotHead { .. } => "not_head_requires_allow_reorder",
+            ForceDeliverDenied::NotFound => "not_found",
+            ForceDeliverDenied::Raced => "delivery_failed",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            ForceDeliverDenied::QueuePaused => {
+                "queue paused by health action (pause-queue) — 해제 후 재시도".into()
+            }
+            ForceDeliverDenied::TypingGuard => {
+                "human typed recently — 사람 입력 보호(R1 MED-2)는 강제 배달로도 면제 불가".into()
+            }
+            ForceDeliverDenied::EmptySeat => {
+                "role seat has no agent — 좌석을 채우면 보류분이 순서대로 배달된다(유실 아님)".into()
+            }
+            ForceDeliverDenied::OutputBusy { quiet_for, need } => format!(
+                "output streaming (quiet {quiet_for}s < {need}s) — 강제 배달도 출력 중 주입은 \
+                 금지(overdue_quiet 하한)"
+            ),
+            ForceDeliverDenied::QueueEmpty => "pending queue is empty".into(),
+            ForceDeliverDenied::NotHead { index } => format!(
+                "entry is at index {index}, not head — 순서를 바꾸려면 allow_reorder 를 명시하라"
+            ),
+            ForceDeliverDenied::NotFound => {
+                "entry_id not in pending queue (already delivered/dropped? — queue.delivered/\
+                 queue.dropped 이벤트 확인)"
+                    .into()
+            }
+            ForceDeliverDenied::Raced => {
+                "delivery raced (watchdog delivered first, queue cleared, or writer busy) — \
+                 queue list 재확인 후 재시도"
+                    .into()
+            }
+        }
+    }
+}
+
+/// ★G1(W2-E): 운영자 강제 배달 — queue.deliver RPC 의 본체(단건 전용 · --all 드레인 금지
+/// [성찰 BLOCKER] — 드레인이 필요하면 매 호출마다 데몬 게이트가 재평가되는 단건 반복이
+/// 유일 경로이며, 그마저 v1 CLI 는 제공하지 않는다: 틱당 1건 페이싱을 뚫는 유일 경로 차단).
+///
+/// 강제의 의미 = 'quiet **대기**(기본 3s·틱 스케줄) 생략'만이다. 안전 게이트는 전부 유지:
+/// - kill-switch pause(daemon.paused)·발신 ACL 은 호출부(handlers "queue.deliver")가 이
+///   함수 **앞**에서 집행한다(설계 게이트 순서 ①②).
+/// - 이 함수는 ③empty_seat → ④human typing → ⑤queue_paused → ⑥output quiet 하한
+///   [성찰 BLOCKER: forced 게이트 목록에 출력 quiet 가 없으면 출력 한복판 주입 허용] 순서로
+///   집행 — watchdog 틱(deliver_queued)과 동일 판정 재료·동일 면제 불가(절대 불변).
+/// - 배달 자체는 단일 헬퍼 deliver_head_locked 공유(두 경로 갈라짐 금지 관례) +
+///   expect_head_id 로 경합 시 오배달을 구조 차단.
+///
+/// 비머리 조준(entry_id ≠ 머리)은 allow_reorder 명시 시에만 머리로 끌어올린 뒤 배달하며,
+/// 재정렬은 배달 성패와 무관하게 queue.reordered 로 발행·WAL 반영한다(무음 재정렬 금지 —
+/// 재정렬이 이미 일어난 사실 자체가 순서 사건이다).
+pub(crate) fn force_deliver_entry(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    entry_id: Option<&str>,
+    allow_reorder: bool,
+) -> Result<Delivered, ForceDeliverDenied> {
+    // 게이트 ③ empty_seat — watchdog 틱과 동일 판정(Unknown 은 통과 = 현행 동작 강등).
+    if s.role.lock().unwrap().is_some()
+        && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
+    {
+        return Err(ForceDeliverDenied::EmptySeat);
+    }
+    // 게이트 ④ human typing — 어떤 경로(overdue·forced)에서도 면제 금지(절대 불변).
+    let human_recent = s
+        .last_human_input
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
+        .unwrap_or(false);
+    if human_recent {
+        return Err(ForceDeliverDenied::TypingGuard);
+    }
+    // 게이트 ⑤ queue_paused(헬스 조치) — 강제 배달로 우회 불가.
+    if s.queue_paused_until
+        .lock()
+        .unwrap()
+        .map(|t| t > std::time::Instant::now())
+        .unwrap_or(false)
+    {
+        return Err(ForceDeliverDenied::QueuePaused);
+    }
+    // 게이트 ⑥ [성찰 BLOCKER] forced 에도 overdue_quiet(기본 1s·하한 1s) — '출력 중 주입
+    // 금지' 의미론은 운영자 강제로도 불변이다(queue_quiet_verdict 의 overdue 하한과 동일 값).
+    let need = queue_overdue_quiet_secs().max(1);
+    let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
+    if quiet_for < need {
+        return Err(ForceDeliverDenied::OutputBusy { quiet_for, need });
+    }
+    // 조준 해석(+ 필요 시 머리 끌어올림) — pending_queue 락 한 임계영역에서 원자 수행.
+    let (target, reordered_from) = {
+        let mut q = s.pending_queue.lock().unwrap();
+        if q.is_empty() {
+            return Err(ForceDeliverDenied::QueueEmpty);
+        }
+        match entry_id {
+            None => (q.front().expect("non-empty").clone(), None),
+            Some(tid) => {
+                let Some(pos) = q.iter().position(|e| e.id == tid) else {
+                    return Err(ForceDeliverDenied::NotFound);
+                };
+                if pos == 0 {
+                    (q.front().expect("non-empty").clone(), None)
+                } else if !allow_reorder {
+                    return Err(ForceDeliverDenied::NotHead { index: pos });
+                } else {
+                    let entry = q.remove(pos).expect("position checked");
+                    q.push_front(entry.clone());
+                    (entry, Some(pos))
+                }
+            }
+        }
+    };
+    if let Some(from_index) = reordered_from {
+        // 재정렬은 그 자체가 순서 사건 — 이후 배달이 실패(경합)해도 발행·WAL 반영은 유지된다
+        // (큐 순서가 실제로 바뀌었으므로 침묵이 오히려 계약 위반).
+        daemon.bus.publish(
+            "queue.reordered",
+            "queue",
+            Some(s.id),
+            crate::state::queue_reordered_payload(
+                &cys::surface_ref(s.id),
+                &target,
+                from_index,
+                "force_deliver",
+            ),
+        );
+        daemon.persist_queue_state();
+    }
+    // 배달 = 단일 헬퍼 공유(forced=true·overdue=false — 이벤트 층 구분만, 임계영역 동일).
+    // expect_head_id: 게이트·조준과 실배달 사이 창에서 틱이 먼저 배달했거나 clear 가 drain
+    // 했으면 무부작용 None → Raced(조준 아닌 다음 항목을 forced 로 오배달하지 않는다).
+    deliver_head_locked(daemon, s, true, false, Some(&target.id))
+        .ok_or(ForceDeliverDenied::Raced)
 }
 
 /// 인플라이트 큐 배달자: 대상 surface가 quiet 임계(기본 3초) 이상 조용하면 큐에서 한 건 주입.
@@ -3141,7 +3323,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
-        if deliver_head_locked(daemon, &s, false, overdue).is_some() {
+        if deliver_head_locked(daemon, &s, false, overdue, None).is_some() {
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
         }
@@ -4830,7 +5012,7 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         // 빈 큐 = None + 이벤트 0(부작용 없음).
-        assert!(deliver_head_locked(&daemon, &s, false, false).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None).is_none());
         assert_eq!(
             daemon
                 .bus
@@ -4848,7 +5030,7 @@ mod tests {
             q.push_back(e1);
             q.push_back(e2);
         }
-        let d = deliver_head_locked(&daemon, &s, true, false).expect("머리 배달");
+        let d = deliver_head_locked(&daemon, &s, true, false, None).expect("머리 배달");
         assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
         assert_eq!(d.remaining, 1);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
@@ -4863,6 +5045,271 @@ mod tests {
             ev["payload"]["forced"],
             serde_json::json!(true),
             "forced 플래그는 이벤트 층에 그대로 실린다(RPC 감사 근거)"
+        );
+    }
+
+    // ─────────── ★G1(W2-E): queue.deliver(운영자 강제 배달) — 게이트·경합·공유 핀 ───────────
+
+    use super::{force_deliver_entry, ForceDeliverDenied, SeatState};
+
+    /// W2-E 테스트 공용 준비물: 격리 데몬 + surface 1개(+원장 스레드 격리) — 초기 셸 출력이
+    /// 판정 재료(last_output)를 덮지 않게 안정화한 뒤 돌려준다.
+    fn force_deliver_rig(tag: &str, role: Option<&str>) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let daemon = drill_daemon(tag);
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        std::thread::sleep(std::time::Duration::from_millis(700)); // 초기 셸 출력 안정화
+        (daemon, s)
+    }
+
+    /// [★W2-E 신규 핀] deliver_head_locked expect_head_id — 조준 항목이 더는 머리가 아니면
+    /// (틱 선배달·clear 경합) **무부작용** None: pop 0·원장 0·이벤트 0. RPC 강제 배달이
+    /// '조준 아닌 다음 항목'을 forced 로 오배달하는 경로의 구조 봉인(pop-by-id 와 같은 층).
+    #[test]
+    fn deliver_head_locked_expect_id_mismatch_is_noop() {
+        let (daemon, s) = force_deliver_rig("w2e-expect", None);
+        let e1 = daemon.next_queue_entry("현재 머리".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e1.clone());
+        // 조준(다른 id)과 머리 불일치 → 배달·pop·이벤트 전무.
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999")).is_none());
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "불일치 시 pop 금지");
+        assert_eq!(
+            daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.delivered").count(),
+            0,
+            "불일치 시 배달 영수증도 없다(무부작용)"
+        );
+        // 대조군: 일치하면 정상 배달.
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id)).is_some());
+        assert!(s.pending_queue.lock().unwrap().is_empty());
+    }
+
+    /// [W2-E 본계약] 강제 = 'quiet 대기 생략'만: 정상 quiet(3s) 미달(2s)이라 watchdog 은
+    /// 보류할 조건에서도 배달되고, 영수증은 forced:true·overdue:false. 조준 생략 = 머리.
+    #[test]
+    fn force_deliver_skips_quiet_wait_and_marks_forced() {
+        let (daemon, s) = force_deliver_rig("w2e-happy", None);
+        let e1 = daemon.next_queue_entry("첫째".into(), None, "test");
+        let e2 = daemon.next_queue_entry("둘째".into(), None, "test");
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(e1.clone());
+            q.push_back(e2.clone());
+        }
+        // quiet 2s: 현행 3s 규칙으로는 보류 조건 — 강제는 대기를 생략한다(하한 1s 는 충족).
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        *s.last_human_input.lock().unwrap() = None;
+        let d = force_deliver_entry(&daemon, &s, None, false).expect("강제 배달");
+        assert_eq!(d.entry.id, e1.id, "조준 생략 = 머리 항목");
+        assert_eq!(d.remaining, 1);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()),
+            Some(e2.id.clone()),
+            "단건 전용 — 다음 항목은 남는다(드레인 아님)"
+        );
+        let ev = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.delivered")
+            .unwrap();
+        assert_eq!(ev["payload"]["forced"], serde_json::json!(true));
+        assert_eq!(
+            ev["payload"]["overdue"],
+            serde_json::json!(false),
+            "forced 는 overdue 와 별개 축(운영자 강제 ≠ 단계형 완화)"
+        );
+    }
+
+    /// [게이트 독립 핀 ④] human typing 신선 → 강제로도 배달 0건(R1 MED-2 면제 절대 불가).
+    #[test]
+    fn force_deliver_typing_guard_never_exempt() {
+        let (daemon, s) = force_deliver_rig("w2e-typing", None);
+        let e = daemon.next_queue_entry("보류 대상".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let denied = force_deliver_entry(&daemon, &s, None, false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::TypingGuard);
+        assert_eq!(denied.code(), "typing_guard");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "배달 0건 — 큐 보존");
+    }
+
+    /// [게이트 독립 핀 ⑤] queue_paused(헬스 조치) → 강제 배달도 거부(우회 불가).
+    #[test]
+    fn force_deliver_queue_paused_refused() {
+        let (daemon, s) = force_deliver_rig("w2e-qpause", None);
+        let e = daemon.next_queue_entry("보류 대상".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *s.queue_paused_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let denied = force_deliver_entry(&daemon, &s, None, false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::QueuePaused);
+        assert_eq!(denied.code(), "queue_paused");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+    }
+
+    /// [게이트 독립 핀 ③] role 좌석 + 좌석 Empty → 거부(2026-07-17 빈 좌석 zsh 오타이핑
+    /// 사고를 운영자 경로에서 재개방하지 않는다). Unknown 은 통과(현행 동작 강등 — 대조군).
+    #[test]
+    fn force_deliver_empty_seat_refused_unknown_passes() {
+        let (daemon, s) = force_deliver_rig("w2e-seat", Some("worker-w2e"));
+        let e = daemon.next_queue_entry("보류 대상".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *s.last_human_input.lock().unwrap() = None;
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        let denied = force_deliver_entry(&daemon, &s, None, false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::EmptySeat);
+        assert_eq!(denied.code(), "empty_seat");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        // 대조군: Unknown(프로브 미도달) = 통과 — 판정 실패가 강제 경로를 막는 새 장애 금지.
+        s.seat_cache.store(SeatState::Unknown.as_u8(), AtomicOrdering::Relaxed);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        assert!(force_deliver_entry(&daemon, &s, None, false).is_ok());
+    }
+
+    /// [★성찰 BLOCKER 핀 ⑥] forced 에도 overdue_quiet(기본 1s) 하한 — 출력 한복판 주입
+    /// 금지는 운영자 강제로도 불변. 오설정(0)도 하한 1s 로 승격된다(queue_quiet_verdict 동형).
+    #[test]
+    fn force_deliver_output_busy_floor_holds_even_forced() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[("CYS_QUEUE_OVERDUE_QUIET_SECS", "0")]);
+        let (daemon, s) = force_deliver_rig("w2e-busy", None);
+        let e = daemon.next_queue_entry("보류 대상".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.last_human_input.lock().unwrap() = None;
+        // 지금 출력 중(quiet_for=0) — env 0 오설정도 하한 1s 를 뚫지 못한다.
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        let denied = force_deliver_entry(&daemon, &s, None, false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::OutputBusy { quiet_for: 0, need: 1 });
+        assert_eq!(denied.code(), "output_busy");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "출력 중 강제 주입 0건");
+        // 하한 충족(1s+) 시 배달 — 하한이 '영구 차단'이 아님도 함께 핀.
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(force_deliver_entry(&daemon, &s, None, false).is_ok());
+    }
+
+    /// [조준 핀] 빈 큐 = queue_empty · 미지 entry_id = not_found — 게이트 통과 후의 조준
+    /// 실패는 안전 게이트 거부와 구분되는 별도 코드(CLI exit 1 계열)다.
+    #[test]
+    fn force_deliver_empty_queue_and_unknown_id() {
+        let (daemon, s) = force_deliver_rig("w2e-aim", None);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *s.last_human_input.lock().unwrap() = None;
+        assert_eq!(
+            force_deliver_entry(&daemon, &s, None, false).unwrap_err(),
+            ForceDeliverDenied::QueueEmpty
+        );
+        let e = daemon.next_queue_entry("실존 항목".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let denied = force_deliver_entry(&daemon, &s, Some("q0.404"), false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::NotFound);
+        assert_eq!(denied.code(), "not_found");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미지 조준은 무부작용");
+    }
+
+    /// [재정렬 핀] 비머리 조준: allow_reorder 미지정 → not_head 거부(순서 불변·무이벤트),
+    /// 지정 → queue.reordered {queue_entry_id, from_index, to_index:0, cause:force_deliver}
+    /// 발행 후 그 항목이 forced 배달되고, 종전 머리는 순서대로 남는다.
+    #[test]
+    fn force_deliver_not_head_requires_allow_reorder_then_reorders_with_event() {
+        let (daemon, s) = force_deliver_rig("w2e-reorder", None);
+        let e1 = daemon.next_queue_entry("머리".into(), None, "test");
+        let e2 = daemon.next_queue_entry("가운데".into(), None, "test");
+        let e3 = daemon.next_queue_entry("꼬리".into(), None, "test");
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(e1.clone());
+            q.push_back(e2.clone());
+            q.push_back(e3.clone());
+        }
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *s.last_human_input.lock().unwrap() = None;
+        // ① allow_reorder 미지정 → 거부 + 순서 완전 불변 + 재정렬 이벤트 없음(무음 재정렬 금지의 역핀).
+        let denied = force_deliver_entry(&daemon, &s, Some(&e3.id), false).unwrap_err();
+        assert_eq!(denied, ForceDeliverDenied::NotHead { index: 2 });
+        assert_eq!(denied.code(), "not_head_requires_allow_reorder");
+        {
+            let q = s.pending_queue.lock().unwrap();
+            let order: Vec<&str> = q.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(order, vec![e1.id.as_str(), e2.id.as_str(), e3.id.as_str()]);
+        }
+        assert_eq!(
+            daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.reordered").count(),
+            0
+        );
+        // ② allow_reorder 지정 → 재정렬 이벤트 + 조준 항목 forced 배달 + 나머지 순서 보존.
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let d = force_deliver_entry(&daemon, &s, Some(&e3.id), true).expect("재정렬 강제 배달");
+        assert_eq!(d.entry.id, e3.id, "배달 = 조준 항목(끌어올린 머리)");
+        assert_eq!(d.remaining, 2);
+        {
+            let q = s.pending_queue.lock().unwrap();
+            let order: Vec<&str> = q.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(order, vec![e1.id.as_str(), e2.id.as_str()], "잔여는 원 순서 그대로");
+        }
+        let rev = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.reordered")
+            .expect("재정렬은 명시 이벤트로 발행(무음 금지)");
+        assert_eq!(rev["payload"]["queue_entry_id"], serde_json::json!(e3.id));
+        assert_eq!(rev["payload"]["from_index"], serde_json::json!(2));
+        assert_eq!(rev["payload"]["to_index"], serde_json::json!(0));
+        assert_eq!(rev["payload"]["cause"], serde_json::json!("force_deliver"));
+        let dev = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.delivered")
+            .unwrap();
+        assert_eq!(dev["payload"]["queue_entry_id"], serde_json::json!(e3.id));
+        assert_eq!(dev["payload"]["forced"], serde_json::json!(true));
+    }
+
+    /// [★W2-E 공유 확인 핀 — 소스핀] watchdog 틱(deliver_queued)과 queue.deliver RPC
+    /// (force_deliver_entry)는 배달 임계영역 **단일 헬퍼** deliver_head_locked 를 공유한다:
+    /// ① 큐 배달의 원장 기록 지점(crate::delivery::record_audited 호출)은 프로덕션 코드에
+    ///    정확히 1곳 — 배달 구현이 두 벌로 갈라지는 순간(한쪽만 고쳐지는 관례 위반) 깨진다.
+    /// ② 두 경로 함수 몸통이 각각 그 헬퍼를 호출한다.
+    /// (main.rs·state.rs 소스핀 관례 동형 — 로직 무변경 검증 전용.)
+    #[test]
+    fn queue_delivery_single_helper_shared_by_tick_and_rpc() {
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        assert_eq!(
+            prod.matches("crate::delivery::record_audited").count(),
+            1,
+            "큐 배달 원장 기록 지점은 deliver_head_locked 안 정확히 1곳이어야 한다 — \
+             늘었다면 배달 구현이 갈라졌다(단일 헬퍼 관례 위반)"
+        );
+        let tick_at = prod.find("fn deliver_queued").expect("watchdog 틱 배달자 소실");
+        let rpc_at = prod.find("fn force_deliver_entry").expect("RPC 강제 배달 본체 소실");
+        let tick_body = &prod[tick_at..];
+        let rpc_body = &prod[rpc_at..tick_at];
+        assert!(
+            tick_body.contains("deliver_head_locked("),
+            "watchdog 틱이 단일 헬퍼 호출을 잃었다"
+        );
+        assert!(
+            rpc_body.contains("deliver_head_locked("),
+            "queue.deliver RPC 경로가 단일 헬퍼 호출을 잃었다"
         );
     }
 

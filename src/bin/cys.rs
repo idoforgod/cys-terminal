@@ -689,6 +689,47 @@ enum QueueAction {
     },
     /// Drop all undelivered queued messages for a surface
     Clear { surface: String },
+    /// ★G1(W2-E) 운영자 강제 배달 — **단건 전용**(--all 드레인 없음: 반복 강제는 틱당 1건
+    /// 페이싱을 뚫는 유일 경로라 v1 제외 — 성찰 BLOCKER). 강제 = quiet 대기 생략만이며
+    /// 안전 게이트(kill-switch pause·ACL·빈 좌석·사람 입력·헬스 pause·출력 quiet 1s 하한)는
+    /// 전부 유지된다. exit: 0=배달 · 7=게이트 거부(사유 stderr · claim-role rc=7 선례 계열,
+    /// 예약 {0,1,2,64} 비충돌) · 1=오류(대상/항목 없음·경합·통신 오류).
+    Deliver {
+        surface: String,
+        /// 조준할 큐 항목 id (`cys queue list` 의 id 열) — 생략 시 머리 항목
+        #[arg(long)]
+        id: Option<String>,
+        /// 조준 항목이 머리가 아닐 때 머리로 끌어올려 배달(순서 변경 명시 — queue.reordered 발행)
+        #[arg(long)]
+        allow_reorder: bool,
+    },
+}
+
+/// ★G1(W2-E) queue.deliver 게이트 거부 exit — 예약 규약({0,1,2,64} 충돌 금지 · clap
+/// 사용오류=2)과 분리해, 신 팩+구 바이너리 스큐에서 '명령/플래그 부재(clap 2)'와 '게이트
+/// 거부'가 소비 스크립트에서 구분되게 한다. 값 7 = claim-role 정당거부(rc=7)·
+/// EXIT_UNSAFE_CORE_REFUSED 선례 계열(타입드 거부 — 브리프 확정).
+const EXIT_QUEUE_GATE_REFUSED: i32 = 7;
+
+/// queue.deliver 거부 exit 판정(순수) — request() 에러 문자열("code: message")의 code 접두로
+/// '안전 게이트 거부'(exit 7)와 '오류'(exit 1)를 가른다. 게이트 코드 목록은 데몬
+/// governance::ForceDeliverDenied::code() + handlers "queue.deliver" 게이트 ①②와 1:1 계약 —
+/// 목록 밖(대상/항목 없음·경합·통신 오류)은 전부 일반 오류(1)다(fail-closed 아님: 거부는
+/// 데몬이 이미 확정했고 여기는 표기 층 분류만 한다).
+fn queue_deliver_exit_code(err: &str) -> i32 {
+    const GATE_CODES: [&str; 6] = [
+        "paused",
+        "acl_denied",
+        "empty_seat",
+        "typing_guard",
+        "queue_paused",
+        "output_busy",
+    ];
+    if GATE_CODES.iter().any(|c| err.starts_with(&format!("{c}:"))) {
+        EXIT_QUEUE_GATE_REFUSED
+    } else {
+        1
+    }
 }
 
 /// ★G1(W2-B): `cys queue list` 텍스트 행 렌더 — 열 계약의 단일 소유자.
@@ -2069,6 +2110,35 @@ fn run(command: Command) -> i32 {
                         eprintln!("error: {e}");
                         1
                     }),
+                // ★G1(W2-E): 단건 강제 배달 — 게이트 거부는 exit 7(사유 stderr), 오류는 1.
+                // 드레인 루프는 CLI 에도 없다(단건만 — 반복 강제로 페이싱을 뚫지 않는다).
+                QueueAction::Deliver { surface, id: entry_id, allow_reorder } => {
+                    parse_surface_ref(&surface)
+                        .ok_or_else(|| format!("invalid surface ref: {surface}"))
+                        .and_then(|sid| {
+                            let mut p = json!({"surface_id": sid});
+                            if let Some(eid) = entry_id {
+                                p["entry_id"] = json!(eid);
+                            }
+                            if allow_reorder {
+                                p["allow_reorder"] = json!(true);
+                            }
+                            request("queue.deliver", p)
+                        })
+                        .map(|r| {
+                            println!(
+                                "delivered {} (seq {}, forced, remaining {})",
+                                r["queue_entry_id"].as_str().unwrap_or("?"),
+                                r["seq"],
+                                r["remaining"]
+                            );
+                            0
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: {e}");
+                            queue_deliver_exit_code(&e)
+                        })
+                }
             };
         }
 
@@ -11840,6 +11910,49 @@ mod tests {
             );
         }
         assert_eq!(EXIT_UNSAFE_CORE_REFUSED, 7, "claim-role 정당거부(7) 계열 고정 — 소비부 파리티");
+    }
+
+    /// ★G1(W2-E) queue.deliver 게이트 exit 계약 핀 — [성찰 BLOCKER: 설계 원문의 exit 2 는
+    /// clap 사용오류(2)와 충돌 → 7 계열로 확정] 게이트 거부 6코드 = exit 7(예약 {0,1,2,64}
+    /// 비충돌 · claim-role rc=7 선례 계열), 조준 실패·경합·통신 오류 = 일반 오류 1.
+    /// 판정은 request() 에러 문면("code: message")의 code **접두** — 데몬
+    /// ForceDeliverDenied::code() + handlers 게이트 ①②와 1:1 계약이다.
+    #[test]
+    fn queue_deliver_gate_exit_is_seven_and_unreserved() {
+        for reserved in [0, 1, 2, 64] {
+            assert_ne!(
+                EXIT_QUEUE_GATE_REFUSED, reserved,
+                "게이트 거부 exit 가 예약 코드와 충돌: {reserved}"
+            );
+        }
+        assert_eq!(EXIT_QUEUE_GATE_REFUSED, 7, "claim-role 정당거부(7) 선례 계열 고정");
+        // 안전 게이트 거부 6종 → 7 (kill-switch·ACL·좌석·사람·헬스 pause·출력 quiet 하한).
+        for gate in [
+            "paused: daemon paused (kill-switch)",
+            "acl_denied: reviewer-* → worker*",
+            "empty_seat: role seat has no agent",
+            "typing_guard: human typed recently",
+            "queue_paused: health action",
+            "output_busy: output streaming",
+        ] {
+            assert_eq!(queue_deliver_exit_code(gate), EXIT_QUEUE_GATE_REFUSED, "{gate}");
+        }
+        // 조준 실패·경합·통신 오류 → 1 (게이트 거부와 구분 — 소비 스크립트 오진 방지).
+        for err in [
+            "not_found: entry_id not in pending queue",
+            "queue_empty: pending queue is empty",
+            "not_head_requires_allow_reorder: entry is at index 2",
+            "delivery_failed: delivery raced",
+            "process_exited: surface process has exited",
+            "invalid_params: missing surface_id",
+            "abi: LenMismatch",
+            "connect: no daemon",
+        ] {
+            assert_eq!(queue_deliver_exit_code(err), 1, "{err}");
+        }
+        // 접두 판정 핀: 게이트 코드가 문자열 중간·유사 접두에 있어도 오분류하지 않는다.
+        assert_eq!(queue_deliver_exit_code("paused_x: y"), 1, "유사 접두는 게이트 아님");
+        assert_eq!(queue_deliver_exit_code("error: paused: nested"), 1, "중간 등장은 게이트 아님");
     }
 
     /// ★G3-축3 위험 요약 핀: 소실 키워드 계수와 사라질 ours 조항 줄이 적시되고, 무관 줄은

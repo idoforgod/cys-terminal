@@ -4421,6 +4421,63 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── ★G1(W2-E): 운영자 강제 배달 — 단건 전용(드레인 상태머신 없음 · --all 금지) ───
+        // 강제 = 'quiet 대기(기본 3s·틱 스케줄) 생략'만. 안전 게이트는 전부 유지 — 게이트
+        // 순서(설계 확정): ①daemon.paused(kill-switch fail-closed) ②check_send_acl(발신 =
+        // send 와 동일 권한 모델 — 신규 권한 0, 이미 send 가능한 대상만) ③empty_seat
+        // ④typing_guard ⑤queue_paused ⑥output quiet 하한[성찰 BLOCKER] — ③~⑥과 조준·
+        // 배달은 governance::force_deliver_entry(단일 헬퍼 deliver_head_locked 공유)가 집행.
+        "queue.deliver" => {
+            // 게이트 ① T4-15 kill-switch: pause 중 강제 배달도 동결(fail-closed — 자율주행
+            // denylist 의미론 불변: watchdog 배달 동결과 짝, 운영자 경로도 재개방하지 않는다).
+            if daemon.paused.load(Ordering::Relaxed) {
+                return Reply::Single(err_response(
+                    &id,
+                    "paused",
+                    "daemon paused (kill-switch) — queue.deliver refused; resume 후 재시도",
+                ));
+            }
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            if surface.exited.load(Ordering::Relaxed) {
+                return Reply::Single(err_response(
+                    &id,
+                    "process_exited",
+                    "surface process has exited",
+                ));
+            }
+            // 게이트 ② 발신 ACL — send_text 와 동형(check_send_acl · 커널 peer pid 신원).
+            if let Err(e) = check_send_acl(daemon, caller_pid, &surface) {
+                return Reply::Single(err_response(&id, "acl_denied", &e));
+            }
+            let entry_id = params.get("entry_id").and_then(|v| v.as_str());
+            let allow_reorder = params
+                .get("allow_reorder")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match crate::governance::force_deliver_entry(daemon, &surface, entry_id, allow_reorder)
+            {
+                // 응답 조준점 키는 명명 계약대로 queue_entry_id(send --queued 응답과 동형).
+                Ok(d) => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "queue_entry_id": d.entry.id,
+                           "seq": d.entry.seq, "delivered": true, "forced": true,
+                           "remaining": d.remaining}),
+                )),
+                Err(denied) => {
+                    Reply::Single(err_response(&id, denied.code(), &denied.message()))
+                }
+            }
+        }
+
         // ─── T2-6 토폴로지: 영속 스냅샷 + 현재 라이브 역할 (cys restore의 데이터 소스) ───
         "system.topology" => {
             let saved = crate::governance::load_topology(daemon);
@@ -7186,6 +7243,136 @@ mod tests {
             daemon.surfaces.lock().unwrap()[&own].pending_queue.lock().unwrap().is_empty(),
             "자기 clear가 통과했는데 큐가 남아 있다"
         );
+    }
+
+    // ─────────── ★G1(W2-E): queue.deliver RPC — 게이트 ①②·응답 계약 핀 ───────────
+
+    fn queue_deliver_rpc(daemon: &Arc<Daemon>, params: Value, caller_pid: Option<u32>) -> Value {
+        let req = Request { id: json!(1), method: "queue.deliver".into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// [게이트 ① 독립 핀] T4-15 kill-switch pause 중에는 운영자 강제 배달도 동결(fail-closed)
+    /// — 자율주행 denylist 의미론 불변: watchdog 배달 동결과 짝이며, queue.deliver 가 pause
+    /// 우회 경로가 되면 kill-switch 가 뚫린다. 거부 즉시 반환이라 ACL·큐 접근 전에 끊긴다.
+    #[test]
+    fn queue_deliver_refused_while_daemon_paused() {
+        let daemon = claim_daemon();
+        let sid = make_surface(&daemon, None);
+        let s = daemon.surfaces.lock().unwrap()[&sid].clone();
+        let e = daemon.next_queue_entry("동결 확인".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        daemon.paused.store(true, Ordering::Relaxed);
+        let resp = queue_deliver_rpc(&daemon, json!({"surface_id": sid}), None);
+        assert_eq!(resp["ok"], json!(false), "pause 중 강제 배달이 통과했다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("paused"));
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "동결 중 배달 0건 — 큐 보존");
+    }
+
+    /// [게이트 ② 독립 핀] 발신 ACL = send 와 동일 권한 모델(check_send_acl 재사용 · 신규
+    /// 권한 0) — reviewer→worker deny 규칙이면 reviewer pane 은 워커 큐를 조기 배달시켜
+    /// 페이싱을 교란할 수 없다(설계 risks 명시 완화책의 실행 경로 핀).
+    #[test]
+    fn queue_deliver_denied_by_send_acl() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let acl = r#"{
+            "default": "allow",
+            "rules": [
+                { "from": "reviewer-*", "to": "worker*", "allow": false }
+            ]
+        }"#;
+        let (daemon, dir) = daemon_with_acl("w2e-deliver-acl", acl);
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon.surfaces.lock().unwrap().insert(worker.id, worker.clone());
+        let reviewer = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("reviewer-gemini".into()), 24, 80)
+            .expect("create reviewer surface");
+        daemon.surfaces.lock().unwrap().insert(reviewer.id, reviewer.clone());
+        let reviewer_pid = 995_101_u32;
+        bind_caller(&daemon, reviewer_pid, reviewer.id);
+        let e = daemon.next_queue_entry("워커 페이싱 보호 대상".into(), None, "test");
+        worker.pending_queue.lock().unwrap().push_back(e);
+
+        let resp =
+            queue_deliver_rpc(&daemon, json!({"surface_id": worker.id}), Some(reviewer_pid));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "reviewer→worker deny 인데 강제 배달이 통과했다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("acl_denied"));
+        assert_eq!(worker.pending_queue.lock().unwrap().len(), 1, "거부 시 배달 0건");
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [응답 계약 핀] 성공 응답 {surface_id, queue_entry_id, seq, delivered, forced, remaining}
+    /// — 조준점 키는 명명 계약대로 queue_entry_id(send --queued 응답과 동형 · entry_id 키명
+    /// 부재). ① 기본(조준 생략) = 머리 단건 ② entry_id+allow_reorder 파라미터 관통까지
+    /// dispatch 경유로 검증(단건 전용 — 한 호출 = 한 건).
+    #[test]
+    fn queue_deliver_rpc_delivers_single_and_plumbs_params() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("w2e-deliver-ok", r#"{"default":"allow","rules":[]}"#);
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let e1 = daemon.next_queue_entry("첫째".into(), None, "test");
+        let e2 = daemon.next_queue_entry("둘째".into(), None, "test");
+        let e3 = daemon.next_queue_entry("셋째".into(), None, "test");
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(e1.clone());
+            q.push_back(e2.clone());
+            q.push_back(e3.clone());
+        }
+        // 초기 셸 출력 안정화 후 quiet 스탬프(출력 quiet 1s 하한 게이트 통과용).
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        *s.last_human_input.lock().unwrap() = None;
+
+        // ① 기본 조준 = 머리 단건.
+        let resp = queue_deliver_rpc(&daemon, json!({"surface_id": s.id}), None);
+        assert_eq!(resp["ok"], json!(true), "강제 배달 실패 (응답: {resp})");
+        let r = &resp["result"];
+        assert_eq!(r["surface_id"], json!(s.id));
+        assert_eq!(r["queue_entry_id"], json!(e1.id), "조준점 키 = queue_entry_id(명명 계약)");
+        assert_eq!(r["seq"], json!(e1.seq));
+        assert_eq!(r["delivered"], json!(true));
+        assert_eq!(r["forced"], json!(true));
+        assert_eq!(r["remaining"], json!(2));
+        assert!(r.get("entry_id").is_none(), "entry_id 키명 금지(W-id 에코 체계와 혼동 차단)");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 2, "단건 전용 — 드레인 아님");
+
+        // ② entry_id + allow_reorder 관통: 비머리(e3) 조준 — 주입 에코가 last_output 을
+        // 덮을 수 있어 재안정화 후 스탬프(출력 quiet 게이트는 별도 핀에서 검증).
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let resp2 = queue_deliver_rpc(
+            &daemon,
+            json!({"surface_id": s.id, "entry_id": e3.id, "allow_reorder": true}),
+            None,
+        );
+        assert_eq!(resp2["ok"], json!(true), "재정렬 강제 배달 실패 (응답: {resp2})");
+        assert_eq!(resp2["result"]["queue_entry_id"], json!(e3.id), "배달 = 조준 항목");
+        assert_eq!(resp2["result"]["remaining"], json!(1));
+        {
+            let q = s.pending_queue.lock().unwrap();
+            assert_eq!(q.len(), 1);
+            assert_eq!(q.front().map(|e| e.id.clone()), Some(e2.id.clone()), "잔여 순서 보존");
+        }
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★G1(W2-C) 좌석 승계 이관 핀 — ①병합 정책은 현행 그대로 '신 좌석 큐 **뒤에** append'
