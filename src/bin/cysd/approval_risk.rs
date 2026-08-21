@@ -53,12 +53,12 @@ const DENY_KO: &[&str] = &[
 ];
 
 /// 저위험·가역 allowlist(정규화형). denylist·human-only에 걸리지 않은 요청 중
-/// 이 마커를 포함하면 AutoEligible. 실물 표본 기반: cycle-verify(저장 검증)·RSI 학습 추천.
+/// 이 마커를 포함하면 AutoEligible. 실물 표본 기반: RSI 학습 추천.
+///
+/// cycle 계열("cycle-verify"·"cycleverify"·"저장검증"·"순환전저장")은 여기 넣지 않는다:
+/// 저장 검증은 **비가역 컨텍스트 clear의 사전 게이트**라 CEO 자동결재를 허용하면 방어선
+/// 자체가 무력화된다 — 미지=HighRisk(fail-closed)로 떨어뜨려 사람 결재를 강제한다.
 const AUTO_MARKERS: &[&str] = &[
-    "cycle-verify",
-    "cycleverify",
-    "저장검증",
-    "순환전저장",
     "rsi학습",
     "학습추천",
     "학습제안",
@@ -166,9 +166,10 @@ mod tests {
         );
         assert_eq!(derive_risk("백업본 정리", ""), RiskClass::HighRisk);
         assert_eq!(derive_risk("[RSI 학습 추천]", ""), RiskClass::AutoEligible);
+        // cycle-verify는 비가역 clear의 사전 게이트 — 자동결재 금지(미지=HighRisk fail-closed).
         assert_eq!(
             derive_risk("[CYCLE-VERIFY] 저장 검증", "SESSION_STATE/TODO 확인"),
-            RiskClass::AutoEligible
+            RiskClass::HighRisk
         );
     }
 
@@ -231,9 +232,30 @@ mod tests {
         // confirm·format·warm 은 rm 부분일치지만 어절 단독이 아니라 auto 마커 유무로 판정된다.
         // (auto 마커 없으면 미지=HighRisk이므로 여기선 auto 마커를 붙여 rm 오탐 부재를 증명한다.)
         assert_eq!(
-            derive_risk("[CYCLE-VERIFY] confirm 저장 검증", ""),
+            derive_risk("[RSI 학습 추천] confirm", ""),
             RiskClass::AutoEligible
         );
+    }
+
+    /// 회귀 핀: cycle 계열 4마커는 어떤 표기 변형으로도 AutoEligible로 되돌아오면 안 된다.
+    /// 저장 검증은 비가역 clear의 사전 게이트라 자동결재 금지 — allowlist 재등재가 곧 결함이다.
+    #[test]
+    fn cycle_markers_never_auto() {
+        for (title, body) in [
+            ("[CYCLE-VERIFY] 저장 검증", "SESSION_STATE/TODO 확인"),
+            ("cycle-verify 요청", ""),
+            ("cycleverify", ""),
+            ("저장 검증 요청", ""),   // normalize → "저장검증"
+            ("순환 전 저장 요청", ""), // normalize → "순환전저장"
+            // 실물 주입문(cys.rs cycle-agent) 표본 — 실전 서술 그대로도 auto로 새지 않는다.
+            ("[CYCLE-VERIFY] role 'master'(surface:3)의 컨텍스트 순환 전 저장 검증 요청", ""),
+        ] {
+            assert_eq!(
+                derive_risk(title, body),
+                RiskClass::HighRisk,
+                "cycle 계열이 자동결재로 되돌아옴: {title}"
+            );
+        }
     }
 
     #[test]

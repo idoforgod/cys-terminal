@@ -7776,7 +7776,7 @@ mod tests {
         let (daemon, dir) = daemon_auto("w3-off", false);
         let mut rx = daemon.bus.subscribe();
         let Reply::Single(resp) =
-            dispatch(&daemon, w3_push(1, "off1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None)
+            dispatch(&daemon, w3_push(1, "off1", "[RSI 학습 추천]", "확인", None), None)
         else {
             panic!("single");
         };
@@ -7864,7 +7864,7 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         let (daemon, dir) = daemon_auto("w3-empty", true);
         let mut rx = daemon.bus.subscribe();
-        let _ = dispatch(&daemon, w3_push(1, "e1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "e1", "[RSI 학습 추천]", "확인", None), None);
         let evs = drain(&mut rx);
         let p = created_payload(&evs, "e1").expect("created");
         assert_eq!(p["payload"]["auto_route"], json!(true), "ON+auto인데 auto_route=false");
@@ -7924,8 +7924,8 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         let (daemon, dir) = daemon_auto("w3-idem", true);
         let mut rx = daemon.bus.subscribe();
-        let _ = dispatch(&daemon, w3_push(1, "r1", "[CYCLE-VERIFY] 저장 검증", "동일본문", None), None);
-        let _ = dispatch(&daemon, w3_push(2, "r2", "[CYCLE-VERIFY] 저장 검증", "동일본문", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "r1", "[RSI 학습 추천]", "동일본문", None), None);
+        let _ = dispatch(&daemon, w3_push(2, "r2", "[RSI 학습 추천]", "동일본문", None), None);
         let evs = drain(&mut rx);
         // 두 항목 모두 생성(pending)되지만 escalation은 의미 키로 1회만.
         assert_eq!(count_named(&evs, "feed.item.created"), 2, "두 push 다 created 돼야");
@@ -7974,7 +7974,7 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         // 감사는 flag ON일 때만 기록된다(C-4 게이트). 따라서 ON으로 데몬 생성.
         let (daemon, dir) = daemon_auto("w3-audit", true);
-        let _ = dispatch(&daemon, w3_push(1, "a1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None);
+        let _ = dispatch(&daemon, w3_push(1, "a1", "[RSI 학습 추천]", "확인", None), None);
         let rr = Request {
             id: json!(2),
             method: "feed.reply".into(),
