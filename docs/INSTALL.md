@@ -237,4 +237,17 @@ rm -rf ~/.cys ~/.local/state/cys             # pack·트랜스크립트·상태 
 `CYS_SOCKET` · `CYS_NO_AUTOSTART`(1=CLI 자동기동 끔) · `CYS_PACK_DIR` ·
 거버넌스: `CYS_LOAD_THRESHOLD`·`CYS_PROC_THRESHOLD`·`CYS_DUP_THRESHOLD`·`CYS_AUTOKILL_DUP`·`CYS_IDLE_SECONDS` ·
 자비스: `CYS_TYPING_GUARD_SECS`·`CYS_FEED_REMIND_SECS`·`CYS_MASTER_DEADMAN_SECS`·`CYS_AGENT_AUTORESTART`·`CYS_RECALL_RETAIN_DAYS`·`CYS_TODO_DIRS`
-(상세는 README.md)
+(상세는 USER-MANUAL.md §16)
+
+### v0.14.22 신설 노브 (기본값 = 현행 거동 유지 · 전부 opt-in)
+
+| 변수 | 기본 | 뜻 |
+|---|---|---|
+| `CYS_QUEUE_MAX_WAIT_SECS` | 0 (=비활성) | 큐 머리 최대 대기(초) — 이 값 이상 기다린 머리는 quiet 임계를 낮춘 '제한 배달(overdue)' 자격을 얻는다. **0=현행 quiet 3s 규칙 그대로**(활성 권장 120). human_typing·pause·빈 좌석 게이트는 어떤 단계에서도 면제되지 않는다 |
+| `CYS_QUEUE_OVERDUE_QUIET_SECS` | 1 | overdue(제한 배달) 단계의 quiet 임계(초) — '출력 중 주입 금지'의 하한이라 1 미만 설정은 1로 승격된다 |
+| `CYS_QUEUE_STARVE_ALERT_SECS` | 0 (=비활성) | 기아 경보 임계(초) — 큐 머리가 이 값 이상 배달이 막혀 있으면 `queue.starved` 발행(쿨다운 5분 · `queue.depth_high`와 별도 축). **발행뿐, 자동 조치 없음**(활성 권장 600) |
+| `CYS_ROLE_DEADMAN_CONFIRM_TICKS` | 3 (최소 1) | 역할(role) 데드맨 v2 — 사망 후보 연속 관측 확증 틱 수 |
+| `CYS_ROLE_DEADMAN_GRACE_SECS` | 60 | 역할 데드맨 v2 — 부트/승계 직후 무카운트 창(오살 방지) |
+| `CYS_ROLE_DEADMAN_DEBOUNCE_SECS` | 300 | 역할 데드맨 v2 — `master.deadman`(사망 축) 디바운스 |
+| `CYS_ROLE_DEADMAN_IDLE_DEBOUNCE_SECS` | =DEBOUNCE(300) | `master.idle`(생존 확정+침묵 정보 신호) 전용 디바운스 — 미설정 시 `CYS_ROLE_DEADMAN_DEBOUNCE_SECS`를 따른다 |
+| `CYS_ROLE_DEADMAN_ROLES` | `master` | 역할 데드맨 감시 대상 role CSV(일반화 opt-in) |

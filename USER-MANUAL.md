@@ -440,6 +440,10 @@ cys pause        # 큐 배달·스케줄 발화 동결 (직접 send는 통과 �
 cys resume
 cys gate-check   # exit 0=running, 4=paused (자율주행이 매 action 전 확인)
 cys queue list / clear   # 미배달 큐 검사·철회
+cys queue deliver <surface> [--id <entry>] [--allow-reorder]
+                 # ★사람 운영자 전용 단건 강제 배달 (exit 7=게이트 거부) —
+                 # LLM 에이전트의 자동 강제배달 금지(안전 게이트는 강제여도 전부 유지)
+cys reap-surface <surface>   # 죽은(exited) 좌석 수동 회수 — master/cso 전용·7조건 게이트
 ```
 
 pause 상태는 재부팅에도 유지됩니다.
@@ -713,7 +717,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 |---|---|---|
 | 기본 | `ping` `identify` `actions` `doctor` | 데몬 확인·자기 주소·명령 카탈로그·자기진단(`--fix`) |
 | 초기화 | `factory-reset` | 완전 초기화 — 사용 흔적 전량 격리 후 설치 초기 상태로(`--plan` 미리보기·`--verbose` 전량 목록·`--yes` 확인 생략·`--purge-license`·`--purge-local`·`--purge-round`). 되돌리기 `--undo <격리폴더>`. **오너 전용**(에이전트 pane 안 실행 거부) |
-| surface | `new-surface` `list` `attach` `read-screen` `resize` `close-surface` `quiesce` `tombstone` | 세션 생성·목록·미러링·화면 읽기·크기·닫기(자식 트리 전멸)·주입 보류·묘비 |
+| surface | `new-surface` `list` `attach` `read-screen` `resize` `close-surface` `reap-surface` `quiesce` `tombstone` | 세션 생성·목록·미러링·화면 읽기·크기·닫기(자식 트리 전멸)·죽은 좌석 수동 회수(master/cso 전용·exit 7=게이트 거부)·주입 보류·묘비 |
 | 통신 | `send` `send-key` `events` `watch` | stdin 주입·키 주입·이벤트 구독·regex 완료 대기 |
 | 역할·함대 | `launch-agent` `boot` `claim-role` `surface-role` `status` `fleet` `set-status` `todo-path` | 역할 노드 기동·일괄 부트·역할 등록/조회·관제 보드·자기보고·역할별 TODO 경로 |
 | 사이클·복구 | `cycle-agent` `node-recover` `restore` `reinject` `drain` | 컨텍스트 사이클·재기동·조직 복원·지침 재주입·업데이트 전 저장 신호(`drain --verify`=노드별 체크포인트 저장을 nonce 마커로 결정론 검증 후 JSON+exit code) |
@@ -746,8 +750,16 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보 |
+| `CYS_QUEUE_MAX_WAIT_SECS` | 0 (=비활성) | 단계형 quiet — 큐 머리가 이 값 이상 대기하면 quiet 임계를 낮춘 '제한 배달(overdue)' 자격. 0=현행 quiet 3s 그대로(활성 권장 120) |
+| `CYS_QUEUE_OVERDUE_QUIET_SECS` | 1 | overdue 단계의 quiet 임계 — 1 미만 설정은 1로 승격(0초 강제주입 봉인) |
+| `CYS_QUEUE_STARVE_ALERT_SECS` | 0 (=비활성) | 큐 머리 기아 경보 임계 — 이 값 이상 배달이 막혀 있으면 `queue.starved` 발행(쿨다운 5분·depth_high와 별도 축·발행뿐 자동 조치 없음. 활성 권장 600) |
 | `CYS_FEED_REMIND_SECS` | 300 (0=off) | 승인 적체 재알림 |
 | `CYS_MASTER_DEADMAN_SECS` | 900 (0=off) | 오케스트레이터 무반응 감지 |
+| `CYS_ROLE_DEADMAN_CONFIRM_TICKS` | 3 (최소 1) | 역할 데드맨 v2 — 사망 후보(DeadCandidate) 연속 관측 확증 틱 수 |
+| `CYS_ROLE_DEADMAN_GRACE_SECS` | 60 | 역할 데드맨 v2 — 부트/승계 직후 무카운트 창(오살 방지) |
+| `CYS_ROLE_DEADMAN_DEBOUNCE_SECS` | 300 | 역할 데드맨 v2 — `master.deadman` 디바운스 |
+| `CYS_ROLE_DEADMAN_IDLE_DEBOUNCE_SECS` | =DEBOUNCE(300) | `master.idle`(생존+침묵 정보 신호) 전용 디바운스 — 미설정 시 위 값을 따름 |
+| `CYS_ROLE_DEADMAN_ROLES` | `master` | 역할 데드맨 감시 role CSV(일반화 opt-in) |
 | `CYS_AGENT_AUTORESTART` | 0 | 죽은 에이전트 자동 재기동 (3회 상한) |
 | `CYS_RECALL_RETAIN_DAYS` | 30 (0=무제한) | 전사 보존 |
 | `CYS_CONTROL_REDACT` | 0 | Control Center 세션 PII 가림 |
@@ -814,17 +826,17 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 NDJSON — 한 줄 = JSON 하나. 요청 `{"id","method","params"}` → 응답
 `{"id","ok",result|error}`. 서버 push는 `events.stream` 구독.
 
-### RPC 메서드 (v0.12.28 기준 전수)
+### RPC 메서드 (v0.14.22 기준 전수)
 
 ```
 system.ping / identify / claim_role / resolve_role / pause / resume / gate_check / topology
 surface.create / list / send_text / send_key / read_text / resize / rename / close /
-        attach / set_meta / quiesce / wait_for
+        attach / set_meta / quiesce / wait_for / reap
 tombstone.set   events.stream   reinject.mark   status.set
 ledger.register / deregister / list / kill
 health.add_rule / list_rules
 feed.push / reply / list
-queue.list / clear
+queue.list / clear / deliver
 recall.search   attest.pin / verify   approval.check / sign
 learn.propose / status / history
 schedule.status / run_now
@@ -840,10 +852,11 @@ channel.start / stop / register / inbound / outbound / receipt / ack / allow /
 ### 이벤트 (계열별)
 
 ```
-surface.created/exited/crashed/closed/reaped/zombie_reaped/close_denied/quiescing/input_injected
+surface.created/exited/crashed/closed/reaped/reap_requested/reap_denied/zombie_reaped/
+        close_denied/quiescing/input_injected
 agent.exited/recovered/restart_blocked/exit_unrecoverable
 watchdog.load_high/proc_count_high/duplicate_procs/tick_panic   pane.idle
-queue.enqueued/delivered/dropped/depth_high/clear_denied
+queue.enqueued/delivered/dropped/depth_high/clear_denied/rehomed/migrated/starved/reordered
 ledger.registered/killed
 feed.item.created/resolved/aging/timeout   feed.backlog_high
 health.alert/action
@@ -855,8 +868,25 @@ role.claimed/claim_denied   worker.limit_denied
 usage.session_registered/updated/register_denied/report_denied/tick_panic
 channel.* (bridge.exited·auth.denied·registered·message·outbound.<ch>·lockdown·… 15종)
 daemon.started/stopping   acl.denied   context.threshold   status.changed   task.changed
-todo.updated   approval.request   approval.stalled   master.deadman   osc.notify
+todo.updated   approval.request   approval.stalled   master.deadman   master.idle   osc.notify
 ```
+
+v0.14.22 가산분(전부 additive — 기존 소비자 무해):
+- `queue.rehomed` {role, count, queue_entry_ids, reordered} — WAL 복원 항목의 같은 role 생존
+  surface 큐 (enqueued_at, seq) 정렬 병합. `reordered=true`=기존 항목이 뒤로 밀림(무음 재정렬 금지)
+- `queue.migrated` {from_surface, to_surface, queue_entry_ids, role} — 좌석 승계 시 큐 이관
+- `queue.starved` {surface_ref, role, head_entry_id, waited_secs, depth, blocked_by, hint} —
+  큐 머리 기아 경보(`CYS_QUEUE_STARVE_ALERT_SECS`, 기본 0=비활성 · 발행뿐, 자동 조치 없음)
+- `queue.reordered` {queue_entry_id, from_index, to_index, cause} — `queue deliver --allow-reorder`
+  명시 재정렬
+- `master.idle` (category=info) {role, surface_ref, axis:"silence", idle_secs, …} — 생존 확정 +
+  침묵의 정보성 신호. 사망(`master.deadman`)과 축 분리 — idle은 alert가 아니다
+- `surface.reap_requested` / `surface.reap_denied`(사유 코드) — `surface.reap` 감사 쌍(성패 무관
+  요청 1건 + 거부 시 사유). 실행 성공은 기존 `surface.reaped`에 {reason:"manual_reclaim",
+  by_surface, by_role} additive
+- 기존 이벤트 가산 필드: queue 계열에 `queue_entry_id`/`queue_entry_ids`·`seq`·`enqueued_at`,
+  `queue.dropped`(exited 예외 경유 시) `cleared_by`/`via:"exited_reclaim"`,
+  `feed.item.resolved`에 `resolver_surface`(해소자 각인 — cycle 영수증 검증이 소비)
 
 ---
 

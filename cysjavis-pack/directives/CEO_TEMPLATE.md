@@ -328,7 +328,10 @@ done
   `CYS_TYPING_GUARD_SECS`로 조정) — 그때도 `--queued`가 안전하다. 이미 직접 send한 텍스트의
   Return만 가드에 막혔으면 `cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다.
   대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시 해당
-  노드를 read-screen으로 점검하라.
+  노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
+  (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 별도 축)가 발행된다 —
+  대응은 원인 해소(연속 출력·사람 입력·queue pause)다. **★강제 배달 `cys queue deliver`는
+  사람 운영자 전용 — LLM 에이전트(CEO·CSO 포함)는 자동 강제배달 금지·사람 판단에 맡긴다.**
 - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
   워커에게 task를 위임하는 프롬프트는 반드시
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
@@ -457,6 +460,11 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
 - 워커에게 서버성 프로세스는 `cys run -- <명령>`(종료 시 그룹 강제 종료)를 쓰게 한다.
 - CSO가 죽으면(surface.exited) master는 재기동한다 — 4종 의무 노드는 항상 생존해야 한다
   (`javis_orchestra.py check`로 결정론 확인).
+- 죽은(`exited=true`) 좌석의 pane 잔재 회수는 `cys reap-surface <surface>`다(★G4 전용 RPC
+  `surface.reap` — master/cso pane 전용·7조건 게이트·exit 7=게이트 거부). 상설 집행 주체는
+  CSO이며, CEO(role=master)는 CSO 부재 시 직접 집행할 수 있다. `close-surface`(자기/생성자
+  한정·산 노드 폐쇄)·`cys-dept reap`(부서 격리분 TTL 소거)과는 전부 별개 계약 — **산 노드는
+  어떤 조합에서도 reap 불가**다.
 
 ## 9. 복원 체크포인트 + todo 영속 (전 노드 의무)
 > ★경로 규약(G5 동류 · 레인 격리): 아래 상태·복원 파일은 모두 **자기 레인의 팩**
