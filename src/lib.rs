@@ -74,6 +74,30 @@ pub const ENV_PY_NO_BYTECODE: &str = "PYTHONDONTWRITEBYTECODE";
 /// 빈 문자열은 "끔"이므로 반드시 이 상수를 쓴다(빈 값 주입 = 봉인 파손 복귀).
 pub const PY_NO_BYTECODE_ON: &str = "1";
 
+/// ★UTF-8 모드 강제(감사 blocker #4 · W-B2): 한국어 Windows 는 콘솔·ANSI 코드페이지가 cp949 라
+/// 파이썬 stdio 인코딩·`open()` 기본 인코딩이 cp949 로 잡히고, 부트 체인(`javis_orchestra.py
+/// check` 등)이 '✓' 같은 비-cp949 문자를 찍는 순간 UnicodeEncodeError 로 즉사한다(UTF-8 팩
+/// 파일을 ANSI 코드페이지로 읽다 UnicodeDecodeError 로 죽는 RC-6 도 같은 뿌리). PYTHONUTF8=1 은
+/// PEP 540 UTF-8 모드를 강제해 stdio·open() 두 경로를 함께 봉인한다(mac 실측 재현:
+/// `LC_ALL=ko_KR.eucKR python3 -c 'print("✓")'` 즉사 → PYTHONUTF8=1 로 치유 · unix 는 이미
+/// UTF-8 로케일이라 무해 no-op). 팩 쪽도 R3(D-IMPL-3)로 orchestra·bootstrap 이 자기 stdio 를
+/// `reconfigure(encoding="utf-8")` 보강했지만 그 방패는 **자기 stdio 한정**이다 — 팩 채널
+/// 스큐(구팩+신앱)·비보강 스크립트(훅·기타 javis_*)·`open()` 기본 인코딩까지 덮는 이 env 층과는
+/// 대체가 아니라 심층방어 관계다.
+///
+/// pane 스폰(state.rs · RC-6)은 같은 쌍을 literal("PYTHONUTF8","1")로 이미 주입한다 — 이 상수의
+/// `spawn_env_pairs` 편입으로 pane 경로엔 **중복 주입**이 생기지만, 두 빌더(portable-pty
+/// `CommandBuilder`·std `Command`) 모두 env 를 맵으로 들어 **나중 주입이 이기고**(vendor
+/// cmdbuilder.rs `envs: BTreeMap` insert 실측), 양쪽 값이 동일한 "1" 이라 어느 쪽이 이겨도
+/// 결과가 같다(무해). literal→상수 단일화는 state.rs 접촉이 필요해 후속 티켓 소관이다
+/// (W-B2 는 state.rs 무접촉 제약).
+pub const ENV_PY_UTF8: &str = "PYTHONUTF8";
+/// `ENV_PY_UTF8` 의 켜짐 값. ★`PY_NO_BYTECODE_ON`("비어 있지 않으면 참")과 값 규약이 다르다 —
+/// CPython 은 PYTHONUTF8 을 "1"/"0" 만 유효로 읽고 그 외 비어 있지 않은 값은
+/// "Fatal Python error: preconfig_init_utf8_mode: invalid PYTHONUTF8 environment variable value"
+/// 로 **파이썬 기동 자체가 죽는다**(실측). 빈 문자열은 미설정 취급(끔). 반드시 이 상수만 쓴다.
+pub const PY_UTF8_ON: &str = "1";
+
 /// 동봉 Python 을 **직접** 스폰하는 모든 지점의 단일 팩토리(SEAL-1 · 중복 구현 금지).
 /// `std::process::Command::new(python)` 을 이걸로 바꾸기만 하면 `.pyc` 번들 오염이 봉쇄된다.
 ///
@@ -313,12 +337,20 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
 ///    pane·스케줄 잡·훅은 셸을 거치므로 `python_command` 팩토리를 못 탄다 → **상속**으로 덮는
 ///    유일한 지점이 여기다. 항상 얹는다(무조건 쌍 1개 추가 — PATH 무변경이어도 이건 나간다).
 ///    근거·대안 비교는 `ENV_PY_NO_BYTECODE` 상수 주석.
+/// ④ PYTHONUTF8(감사 blocker #4 · W-B2): 한국어 Windows(cp949)에서 이 규약으로 스폰되는 python 의
+///    stdio·open() 기본 인코딩이 ANSI 코드페이지로 붕괴해 부트 체인(`javis_orchestra.py check`)이
+///    UnicodeEncodeError 로 즉사한다. pane 스폰은 state.rs literal(RC-6)로 이미 막았지만 스케줄
+///    발화·GUI 직스폰은 무보호였다 → 공용 규약에 편입해 세 소비 경로가 같이 덮인다. ③과 같이
+///    **항상** 얹는다(무조건 쌍 — PATH 무변경이어도 나간다). state.rs literal 과의 중복 주입이
+///    무해한 근거(같은 값 "1"·later-wins)는 `ENV_PY_UTF8` 상수 주석.
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
 ///   발화 무산됐다(감사 A17: "state.rs pane 스폰에 backfill 부재 — schedule.rs:882 에는 있음").
 ///   사본을 늘리는 대신 lib 공용 함수로 승격해 **두 스폰 경로가 같은 규약을 소비**하게 한다
-///   (RC4 '규약 산재' 소멸 · 검체 H-WIN-8). GUI 직스폰(src-tauri)의 편입은 W4 소속이다.
+///   (RC4 '규약 산재' 소멸 · 검체 H-WIN-8). GUI 직스폰(src-tauri `inject_runtime_path`)의
+///   편입은 W-B2 에서 완료 — 세 스폰 경로(pane·스케줄 발화·GUI 직스폰)가 이 규약 하나를
+///   소비한다(회귀 핀: src-tauri `gui_spawn_env_matches_pane_spawn_env`).
 pub fn spawn_env_pairs(
     exe_dir: &Path,
     current_path: &str,
@@ -339,6 +371,9 @@ pub fn spawn_env_pairs(
         ENV_PY_NO_BYTECODE.to_string(),
         PY_NO_BYTECODE_ON.to_string(),
     ));
+    // ④ 감사 blocker #4(W-B2): cp949 콘솔 상속 python 의 UnicodeEncodeError 즉사 봉인 — UTF-8
+    //    모드 강제(③처럼 무조건 쌍). 값 규약("1"만 유효·그 외 기동 fatal)은 ENV_PY_UTF8 주석.
+    env.push((ENV_PY_UTF8.to_string(), PY_UTF8_ON.to_string()));
     env
 }
 
@@ -1157,6 +1192,40 @@ mod tests {
                     .map(|(_, v)| v.as_str()),
                 Some(PY_NO_BYTECODE_ON),
                 "셸 경유 python 은 상속으로만 막을 수 있다 — 쌍이 빠지면 pane/훅이 번들을 오염시킨다"
+            );
+        }
+    }
+
+    /// ★W-B2 회귀 핀(감사 blocker #4 · cp949 즉사): `spawn_env_pairs` 는 PYTHONUTF8=1 을
+    /// **항상** 실어야 한다 — PATH 무변경·HOME 유무와 무관한 무조건 쌍이다(③ SEAL-1 과 동형).
+    /// 이 쌍이 빠지면 한국어 Windows(cp949)에서 스케줄 발화·GUI 직스폰 python(부트 체인
+    /// `javis_orchestra.py check`)이 '✓' 한 글자에 UnicodeEncodeError 로 즉사한다(pane 은
+    /// state.rs literal 이 이중으로 막지만 나머지 두 경로는 이 규약이 유일한 방어다).
+    #[test]
+    fn spawn_env_pairs_always_carry_python_utf8() {
+        // 값 규약 핀: PYTHONUTF8 은 "1"/"0" 만 유효 — 그 외 비어 있지 않은 값은
+        // "Fatal Python error: preconfig_init_utf8_mode" 로 파이썬 기동 자체가 죽고(실측),
+        // 빈 문자열은 미설정 취급(끔)이다. 값이 "1" 에서 벗어나는 순간 봉인 해제 또는 전멸이다.
+        assert_eq!(ENV_PY_UTF8, "PYTHONUTF8");
+        // state.rs pane 스폰 literal("PYTHONUTF8","1" · RC-6)과의 값 파리티 — 중복 주입이
+        // 무해하다는 근거가 "양쪽 값 동일"이므로, 이 값이 갈라지면 그 근거가 무너진다.
+        // (state.rs 는 bin 크레이트라 lib 테스트가 심볼로 참조할 수 없어 literal 로 핀한다.)
+        assert_eq!(PY_UTF8_ON, "1");
+
+        let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
+        for pairs in [
+            // PATH 무변경에 가깝고 HOME 이 이미 있는 unix 꼴 — 그래도 쌍은 나가야 한다.
+            spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None),
+            // HOME 부재 Windows 꼴(backfill 발동) — 조건 조합과 무관하게 쌍은 나가야 한다.
+            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\me")),
+        ] {
+            assert_eq!(
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == ENV_PY_UTF8)
+                    .map(|(_, v)| v.as_str()),
+                Some(PY_UTF8_ON),
+                "PYTHONUTF8=1 무조건 쌍이 빠졌다 — cp949 Windows 에서 부트 체인 python 이 즉사한다"
             );
         }
     }

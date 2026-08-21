@@ -534,5 +534,87 @@ check("8a 삭제 후 assert-ready=5(게이트=순수 추가 제약)", run(env, "
 check("8b 재부트로 재생성", run(env)[0] == 0 and os.path.exists(marker_path(home)))
 shutil.rmtree(tmp)
 
+# ── 10. ★W-A3 ②ping 유계 재시도: 일시 실패 후 성공 → 체인 계속(단발 ping 시대 회귀 핀) ──
+# 구 계약(단발 15s 1회)은 데몬 콜드스타트·Defender 첫 스캔 창의 첫 실패 하나로 선언 전체를
+# EXIT_PING(3)으로 폐기했다 — 몇 초 뒤 살아날 데몬인데 체인이 통째로 접혔다. 신 계약은 벽시계
+# 총예산(CYS_BOOT_PING_RETRY_TOTAL_S) 창 안에서 간격(CYS_BOOT_PING_RETRY_INTERVAL_S) 재시도한다.
+# 스텁: 카운터 파일 기반 — 첫 2회 exit 1(무응답) → 3회째부터 0(콜드스타트 회복 모사).
+tmp = tempfile.mkdtemp(prefix="boot-t10-")
+env, home = make_env(tmp)
+_cys_stub = os.path.join(tmp, "stubbin", "cys")
+with open(_cys_stub, "w", encoding="utf-8", newline="\n") as f:
+    f.write("#!/bin/sh\n"
+            "echo \"cys $@\" >> \"%(t)s/calls.log\"\n"
+            "case \"$1\" in\n"
+            "  ping)\n"
+            "    n=$(cat \"%(t)s/ping.count\" 2>/dev/null || echo 0)\n"
+            "    n=$((n+1)); printf %%s \"$n\" > \"%(t)s/ping.count\"\n"
+            "    [ \"$n\" -le 2 ] && exit 1\n"
+            "    exit 0;;\n"
+            "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
+            "esac\nexit 0\n" % {"t": tmp})
+os.chmod(_cys_stub, 0o755)
+# 하네스 전용 창 오버라이드(CHECK_* 와 동일 규약) — 재시도 2회에 넉넉한 창 + 짧은 간격.
+env["CYS_BOOT_PING_RETRY_TOTAL_S"] = "30"
+env["CYS_BOOT_PING_RETRY_INTERVAL_S"] = "0.1"
+code, out, err = run(env)
+check("10a ②ping 일시 실패(2회) 후 성공 — 체인 계속 exit 0", code == 0,
+      "exit=%d err=%s" % (code, err[-300:]))
+check("10b 부트 완주(마커 생성)", os.path.exists(marker_path(home)))
+_pings = int(open(os.path.join(tmp, "ping.count"), encoding="utf-8").read() or "0")
+check("10c ping 실측 3회(실패 2 + 성공 1 — 성공 즉시 진행·과재시도 없음)", _pings == 3,
+      "pings=%d" % _pings)
+bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
+_steps10 = [s["step"] for s in bl.get("steps", [])]
+check("10d 재시도가 boot-last 에 실측 기록(②ping + ②ping#2 + ②ping#3)",
+      "②ping" in _steps10 and "②ping#2" in _steps10 and "②ping#3" in _steps10,
+      "steps=%r" % _steps10[:8])
+shutil.rmtree(tmp)
+
+# ── 11. ★W-A3 ⑤ exit 2 정밀 분기(축약판 — t1/t2/t3 3분기 전체 핀은 run_bootstrap_health
+# H-EXIT-7 소유·여기는 t2 만): exit 2 + `cys ping` 생존이면 '데몬 소실'이 아니다 — 별도 상한
+# (CHECK_UNJUDGEABLE_RETRIES·budget 키 부재 시 3)으로 유계 재시도 후 '팩 결손 가능성' 진단으로
+# 실패한다. 구 계약(무조건 즉시 이탈)은 orchestra 스크립트 부재(python 자신이 rc 2)까지 '데몬
+# 소실'로 오진해 처방(`cys ping`·데몬 기동)을 뒤집었다. ──
+tmp = tempfile.mkdtemp(prefix="boot-t11-")
+env, home = make_env(tmp, check_fail_times=0, check_final=2)   # check 항상 exit 2 · ping 은 0
+code, out, err = run(env)
+check("11a exit 2 반복 + 데몬 생존 → 최종 exit 6", code == 6, "exit=%d" % code)
+try:
+    _cap = max(1, int(_BU.leaf("CHECK_UNJUDGEABLE_RETRIES")))   # bootstrap 과 동일 산식
+except Exception:
+    _cap = 3                                                    # budget 키 부재 폴백(현행 실효값)
+_attempts11 = int(open(os.path.join(tmp, "check.count"), encoding="utf-8").read())
+check("11b 시도수=별도 상한(유계 — 1 초과·창 상한 4 미소진)",
+      1 < _attempts11 <= _cap and _attempts11 < 4,
+      "attempts=%d cap=%d" % (_attempts11, _cap))
+bl = json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"), encoding="utf-8"))
+_unj11 = [s for s in bl.get("steps", []) if s.get("step") == "⑤check-unjudgeable"]
+check("11c 진단='팩 결손 가능성'(데몬 소실 처방으로의 반전 금지)",
+      bool(_unj11) and "팩 결손 가능성" in _unj11[-1].get("detail", "")
+      and "데몬을 확인·기동하라" not in _unj11[-1].get("detail", ""),
+      (_unj11[-1].get("detail", "")[:200] if _unj11 else "unjudgeable 단계 없음"))
+shutil.rmtree(tmp)
+
+# ── 12. ★W-A3 ③ _Log 쓰기 best-effort: boot-last 기록 실패가 부트 본체를 죽이지 않는다 ──
+# 유도: boot-last.json 자리에 **디렉터리**를 만들어 _atomic_write_json 의 os.replace 를 전량
+# 실패시킨다(Windows 공유 위반 실사고의 POSIX 결정론 재현). 구 계약은 _atomic_write_json
+# 직호출이라 ⓐ step()/result() 경유 즉사 ⓑ finally→finish() 재예외가 정상 완주 exit 까지
+# 삼켰다(exit 0 완주가 uncaught 크래시로 뒤집힘). 신 계약: 비크래시 + stderr 1줄(침묵 금지).
+tmp = tempfile.mkdtemp(prefix="boot-t12-")
+env, home = make_env(tmp)
+os.makedirs(os.path.join(home, ".cys", "state", "boot-last.json"))   # 파일 자리의 디렉터리
+code, out, err = run(env)
+check("12a 계측 쓰기 전량 실패에도 부트 비크래시(체인 완주 exit 0)", code == 0,
+      "exit=%d err=%s" % (code, err[-300:]))
+check("12b 실패 사실 stderr 1줄+(조용한 삼킴 금지)", "boot-last 기록 실패" in err, err[-300:])
+try:
+    _summary12 = json.loads(out.strip().splitlines()[-1])
+except Exception:
+    _summary12 = {}
+check("12c 완주 계약 보존(stdout 최종 JSON ok:true)", _summary12.get("ok") is True, out[-200:])
+check("12d 본체 산출물 무손상(마커 생성)", os.path.exists(marker_path(home)))
+shutil.rmtree(tmp)
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

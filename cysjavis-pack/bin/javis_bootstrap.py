@@ -6,11 +6,16 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
 
 단계 체인 (실패 시 즉시 중단·단계명+원인을 stderr와 boot-last.json에 기록):
   ① preflight --fix (**비치명** — FAIL은 경고로 강등하고 계속. 팀 부팅의 진짜 게이트는 ⑤)
-  ② cys ping                     ③ cys claim-role master
+  ② cys ping (**유계 재시도** — 벽시계 총예산 창 안에서 간격 재시도. 데몬 콜드스타트·
+  Defender 첫 스캔 내성 · 창 소진 시 종전대로 EXIT_PING + '몇 회·총 몇 초' 진단. 값의
+  진실원천은 javis_budget leaf CYS_PING_RETRY_TOTAL_S·CYS_PING_RETRY_INTERVAL_S — W-A3)
+                                 ③ cys claim-role master
   ④ cys boot (결손>0에서만 — 결손 0=구성 충족이면 호출 생략·스폰 없음)
   ⑤ orchestra check (bounded retry **24회×5s ≈ 120s 상한** — 노드 스폰은 비동기·check는 무대기
   스냅샷이므로 레이스 봉쇄. 값의 진실원천은 CHECK_RETRIES·CHECK_INTERVAL_S 상수이고 env
-  CYS_BOOT_CHECK_RETRIES·CYS_BOOT_CHECK_INTERVAL_S로만 덮인다 — 테스트 하네스 전용)
+  CYS_BOOT_CHECK_RETRIES·CYS_BOOT_CHECK_INTERVAL_S로만 덮인다 — 테스트 하네스 전용.
+  ★exit 2 는 `cys ping` 1회 재확인으로 '데몬 소실'(즉시 이탈)과 '일시 실패/팩 결손 가능성'
+  (창 내 계속·별도 상한)을 실측 분리한다 — W-A3)
                                                           ⑥ 완료 마커 write
   ⑦ cys-dept promote-if-pending --request-only (비대기 — 부트와 승격 동의의 분리)
   ⑧ 기계 요약 JSON 출력 (master는 이것을 인용해 보고한다)
@@ -22,7 +27,9 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
 
 exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 상수):
       0=부트 완료(또는 부서장 단독 각성=CEO 티켓 부재) / 3=ping / 4=boot
-      6=check 최종 실패(CHECK_RETRIES 소진) / 7=claim 정당거부(이 surface는 master 아님 — 지휘 중단·인계)
+      6=check 최종 실패(CHECK_RETRIES 소진 **또는** 판정 불가 확정 — 데몬 소실(ping 재확인
+         실패)·인터프리터 소실·exit 2 반복+데몬 생존(팩 결손 가능성) · 값은 하나, 진단이 갈린다)
+      7=claim 정당거부(이 surface는 master 아님 — 지휘 중단·인계)
       8=레인↔팩 정합 실패 또는 불량 레인(빈 부서명) — 교차 오염 차단·팀 기동 전 중단
       9=자원 hard_block(결손 기준 자원 사전 게이트 — 팀 기동 전 착수 거부·CEO escalation)
       10=세션 컨텍스트 오류(claim 왕복이 정당거부가 **아닌** 사유로 실패 — CYS_SURFACE_ID 부재·
@@ -199,6 +206,27 @@ CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES",
                                           str(_budget_leaf("CHECK_RETRIES", 24)))))
 CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S",
                                         str(_budget_leaf("CHECK_INTERVAL_S", 5))))
+
+# ── ② ping 유계 재시도 예산(W-A3 — 소비자 · leaf 는 W-A4 가 javis_budget 에 선등재) ──
+# ★왜 재시도인가: 단발 ping(15s 1회)은 데몬 콜드스타트(자동기동+소켓 바인드)·Windows Defender
+#   첫 스캔(바이너리 첫 실행 지연) 창에서 첫 응답만 늦어도 **선언 전체를 EXIT_PING 으로 폐기**
+#   했다 — 몇 초 뒤 살아날 데몬인데 체인이 통째로 접혔다.
+# ★유계의 형태(치명 앵커 ③ 자가치유): 이 창 동안 싱글플라이트 락을 쥔다 — 무계 재시도('뜰 때까지')
+#   는 이후 모든 재선언을 exit 11 로 접는 자가치유 봉쇄라 기각. **벽시계 총예산**(B17 카운트 회계
+#   금지 — javis_budget 교리)으로 창을 닫고, 소진 시 종전대로 EXIT_PING 이다.
+# ★값의 진실원천: javis_budget leaf(CYS_PING_RETRY_TOTAL_S=45·CYS_PING_RETRY_INTERVAL_S=3·
+#   CYS_PING_TIMEOUT_S=15)가 SOT. fallback 인자는 팩 스큐(구 javis_budget — 키 부재) 대비이며
+#   **leaf 하한과 같은 값**으로 박아 SOT/폴백 거동 차를 0 으로 한다(예산 모듈은 타 티켓 소유·
+#   수정 금지 계약 — 키가 그쪽에 있으면 자동으로 그쪽이 이긴다).
+# env 오버라이드(CYS_BOOT_PING_*)는 CHECK_* 와 동일 규약 — 테스트 하네스 전용(budget 의
+# CYS_BUDGET_* 는 하한 clamp 라 축소 불가·하네스가 창을 줄일 유일 경로가 이것이다).
+PING_TIMEOUT_S = float(_budget_leaf("CYS_PING_TIMEOUT_S", 15))
+PING_RETRY_TOTAL_S = max(0.0, float(os.environ.get(
+    "CYS_BOOT_PING_RETRY_TOTAL_S", str(_budget_leaf("CYS_PING_RETRY_TOTAL_S", 45)))))
+# 간격 하한 0.05: 벽시계 창 + 0 간격은 fail-fast 데몬 부재에서 서브프로세스 스폰 폭주가 된다
+# (창이 시간으로만 닫히므로 횟수는 간격이 유일하게 유계화한다 — 앵커 ① 폭주 방지).
+PING_RETRY_INTERVAL_S = max(0.05, float(os.environ.get(
+    "CYS_BOOT_PING_RETRY_INTERVAL_S", str(_budget_leaf("CYS_PING_RETRY_INTERVAL_S", 3)))))
 
 # ── exit 코드 단일 소스(A7·A14·A20 — 헤더 exit 표의 진실원천) ──
 # ★타입드 종료: '성공'·'정당거부'·'세션 컨텍스트 오류'·'정상 skip'·'사용오류'가 각자 코드를 갖는다.
@@ -548,6 +576,11 @@ STEP_INDEX = {label: i for i, label in enumerate(STEP_ORDER)}
 class _Log:
     """단계 결과를 (레인) boot-last 에 누적(진단 가시성 — 각 retry 시도 포함).
 
+    ★디스크 반영은 전부 `_persist()`(best-effort — W-A3 ③) 를 경유한다: 계측 쓰기 실패
+      (Windows 공유 위반 등)가 부트를 죽이지 않되, 실패 사실은 stderr + log_write_failures
+      필드로 남는다(보고=실측 비약화). 새 쓰기 지점을 추가하면 반드시 `_persist` 를 쓰라 —
+      `_atomic_write_json(self.path, …)` 직호출은 finally 재예외 크래시 경로의 부활이다.
+
     ★A19 런 정체성: 레코드는 이제 **누가/언제/어디서** 돈 런인지 스스로 말한다.
       run_id(started+pid)·pid·surface·role 이 없던 종전에는 (ⓐ)한 레인의 두 pane 중 누구의 런인지,
       (ⓑ)진행 중인지 크래시했는지 구분이 불가능했다(둘 다 'result 키 없음'으로 보였다).
@@ -576,7 +609,7 @@ class _Log:
                      "result": {"ok": None, "state": "running", "run_id": self.run_id,
                                 "surface": self.surface}}
         self._last_step_order = -1
-        _atomic_write_json(self.path, self.data)
+        self._persist()
 
     def _attributed(self, res):
         """result 딕트에 런 귀속을 못박는다 — §0 소비 술어('자기 surface의 최신 완주 런')의 전제."""
@@ -584,6 +617,38 @@ class _Log:
         res.setdefault("surface", self.surface)
         res.setdefault("pid", self.pid)
         return res
+
+    def _persist(self):
+        """boot-last 디스크 반영 — **best-effort 예외 흡수**(W-A3 ③ · _Log 쓰기 유일 경로).
+
+        ★왜 흡수하는가: 진단 계측(_Log)의 쓰기 실패가 부트 본체를 죽이면 안 된다. 실재 경로 —
+          Windows 공유 위반: 뷰어·백업·인덱서가 boot-last.json 을 연 동안 os.replace 가
+          PermissionError 를 던진다. 종전엔 그 예외가 ⓐ step()/result() 를 타고 체인을 즉사시켰고
+          ⓑ cmd_run 의 finally→finish() 가 **같은 파일에 다시 쓰다 같은 예외를 재발생**시켜,
+          체인이 EXIT_OK 로 완주한 경우조차 uncaught 크래시(exit 1)로 뒤집었다(finally 발 예외가
+          정상 return 을 삼킨다).
+        ★조용히 삼키지 않는다(보고=실측 계약 유지): 실패마다 ⓐstderr 1줄 ⓑself.data 에
+          log_write_failures(누적 횟수·마지막 원인)를 남긴다 — data 는 누적 구조라 **다음 성공
+          write 가 실패 사실까지 파일에 박제**한다. 전 write 가 실패하면 stderr 줄들이 최종
+          증거다(쓰기 실패의 기록 자체를 잃지 않는다).
+        ★대안 기각 — 쓰기 재시도 루프: 공유 위반은 수 초 지속될 수 있고 부트 경로의 동기 재시도는
+          싱글플라이트 락 보유 연장(치명 앵커 ③)이다. 어차피 다음 단계의 write 가 곧 같은 내용을
+          다시 시도한다(유실 없음) — 여기서 기다릴 이유가 없다.
+        """
+        try:
+            _atomic_write_json(self.path, self.data)
+            return True
+        except Exception as e:
+            info = self.data.setdefault("log_write_failures", {"count": 0, "last": ""})
+            info["count"] = int(info.get("count", 0) or 0) + 1
+            info["last"] = ("%s: %s" % (type(e).__name__, e))[:300]
+            try:
+                sys.stderr.write("[bootstrap] ⚠ boot-last 기록 실패 %d회(best-effort 계속·부트 비중단): %s\n"
+                                 % (info["count"], info["last"]))
+                sys.stderr.flush()
+            except Exception:
+                pass  # stderr 자체 불능 — 계측의 계측은 여기서 끝낸다(부트 본체가 우선)
+            return False
 
     def step(self, name, code, detail="", suffix=""):
         """단계 기록. `name` 은 **STEP.* 상수**여야 한다(P3-A-STEP-NAME).
@@ -607,12 +672,12 @@ class _Log:
                                  % (name, idx, self._last_step_order))
             self._last_step_order = max(self._last_step_order, idx)
         self.data["steps"].append(rec)
-        _atomic_write_json(self.path, self.data)
+        self._persist()
 
     def result(self, **kw):
         """단계 성공/강등 경로의 result 기록(귀속 자동 첨부)."""
         self.data["result"] = self._attributed(dict(kw))
-        _atomic_write_json(self.path, self.data)
+        self._persist()
 
     def finish(self, exit_code, exc=None):
         """★A19 종결 기록 — cmd_run 의 finally 가 유일 호출자. 어떤 경로로 끝나도 도달한다.
@@ -633,7 +698,9 @@ class _Log:
         else:
             res.setdefault("exit", exit_code)
             self._attributed(res)
-        _atomic_write_json(self.path, self.data)
+        # ★W-A3 ③: 종결 기록도 best-effort — finally 발 재예외가 체인의 정상 exit 를 삼키는
+        #   경로(위 docstring ⓑ)의 봉인 지점이 바로 여기다.
+        self._persist()
 
     def fail(self, name, code, detail, exit_code, ok=False, state="failed"):
         """실패·거부 경로의 공통 종결(단계 기록 → result → stderr → loud 알림).
@@ -681,7 +748,7 @@ class _Log:
                 }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
         channel = _notify_loud("부트스트랩 미완(%s)" % name, hint)
         self.data["result"]["notify"] = {"attempted": True, "channel": channel}
-        _atomic_write_json(self.path, self.data)
+        self._persist()
         return exit_code
 
 
@@ -1338,18 +1405,50 @@ def _cys_status_json():
         return None
 
 
-def _shared_verdict_deficit(status):
-    """★A1 클래스 소멸: 결손 판정이 **⑤check 와 문자 그대로 같은 함수**를 소비한다.
+def _shared_verdict_deficit(status, requery=None, tick_s=None):
+    """★부트 ④ 결손 산출 — `javis_orchestra._shared_verdict_deficit`(정본) **위임 소비**(W-B3 배선).
 
-    `javis_orchestra.check_verdicts(status)` 는 cmd_check 가 화면 출력에 쓰는 그 판정 코어다
-    (공유 술어 `javis_boot_node.node_liveness`·`slot_satisfied` 소비). 결손 판정이 이 함수를
-    소비하면 '결손 0인데 check 실패'(=④ 생략 → ⑤ 실패 → exit 6 → 재선언 동일의 라이브락)가
-    **구조적으로 불가능**해진다 — 종전에는 이름공간(W0에서 정합)과 생존 신호(여기)가 갈려 있었다.
+    정본(orchestra 판)은 check_verdicts(⑤check 판정 코어) 소비에 더해 **unknown 등급을
+    시한부 해소 후 잔존 시 결손**으로 계상한다(`javis_boot_node.resolve_unknown_for_spawn`
+    — `cys boot` 스폰 경로가 이미 쓰는 규약: 워치독 1주기 대기 → 재조회 1회·전 역할 공유 1회).
+    죽었는데 프로브만 실패한 좌석이 '충족'으로 접혀 ④ boot 가 영영 생략되는 잔여 B3 를
+    닫는다. 중복 스폰은 boot 락 + `cys boot` 자체의 Unknown 시한부 해소 +
+    seat_death_confirmed 죽음확정 게이트가 방어한다.
 
-    ★역방향 회귀 차단: node_liveness 는 `absent` 만 미충족으로 본다. agent_alive 단독·좌석 점유·
-      quiet_but_alive·**좌석 판정불가(unknown)** 는 전부 충족측이라, 건강한 quiet 노드를 결손>0
-      으로 오판해 자원 hard-block 을 되살리는 경로가 없다(W0 handoff 가 명시한 그 경계 유지).
-    반환 (결손 bool, 사유) | (None, 실패사유)."""
+    ★역방향 회귀 차단(경계 갱신 — W-B3): agent_alive 단독·좌석 점유·quiet_but_alive 는 종전대로
+      충족측이고, **unknown 만** 시한부 해소(생존 확인 시 충족 복귀) 후 잔존할 때 결손이다 —
+      건강한 quiet 노드를 결손>0 으로 오판하는 경로는 여전히 없다(W0 handoff 경계 유지).
+    ★⑤check 의 satisfied 는 불변이다(unknown=충족측 fail-open 유지 — 결손 산출만 갈린다).
+      같은 함수에 넣으면 데몬 콜드스타트 창에서 ⑤check 실패 → exit 6 라이브락(감사 확정).
+      불변 핀: tests/test_seat_latch_negation.py BootDeficitUnknown · H-PRED-1 신계약 절.
+    ★스큐 폴백: orchestra import 실패·구 팩(함수 부재)·위임 호출 예외 시 종전 로컬 산출
+      (`_shared_verdict_deficit_fallback` — unknown=충족측 구 계약)로 되돌아간다. 신팩
+      bootstrap + 구팩 orchestra 혼재에서 부트가 죽으면 안 된다. 폴백 발동은 stderr 1줄
+      고지(조용한 강등 금지 — 어느 계약으로 판정했는지가 진단의 절반이다).
+    requery/tick_s 는 밀폐 테스트 주입(기본: cys status 재조회·워치독 1주기) — 정본에 그대로
+    전달된다. 반환 계약 (결손 bool, 사유) | (None, 실패사유)는 정본·폴백 동일(drop-in —
+    양판 반환문 직접 대조로 확인 2026-08-21)."""
+    try:
+        import javis_orchestra as _orch
+        _fn = getattr(_orch, "_shared_verdict_deficit", None)
+        if _fn is not None:
+            return _fn(status, requery=requery, tick_s=tick_s)
+        skew_why = "구 팩 스큐(javis_orchestra 에 _shared_verdict_deficit 부재)"
+    except Exception as e:
+        skew_why = "orchestra 위임 불가(%s: %s)" % (type(e).__name__, e)
+    print("[bootstrap] 결손 산출 폴백 발동: %s — 로컬 구 계약(unknown=충족측) 시도" % skew_why,
+          file=sys.stderr)
+    return _shared_verdict_deficit_fallback(status)
+
+
+def _shared_verdict_deficit_fallback(status):
+    """★폴백 전용(정본 아님) — 구 팩 스큐에서만 호출되는 종전 W2 로컬 산출.
+
+    orchestra 에 부트 경로 산출기(`_shared_verdict_deficit`)가 없는 구 팩과 혼재할 때만
+    위 위임 래퍼가 여기로 강등한다(동명 쌍둥이 드리프트 함정 제거 — W-B3). 구 계약
+    그대로: check_verdicts 소비 · **unknown=충족측**(시한부 해소 없음 — 잔여 B3 는 이
+    폴백에선 열려 있고, 그래서 폴백 발동이 stderr 로 고지된다). 정본 경로가 살아 있으면
+    절대 호출되지 않는다. 반환 (결손 bool, 사유) | (None, 실패사유) — 래퍼와 동일 계약."""
     try:
         import javis_orchestra as _orch
         verdicts, _roster = _orch.check_verdicts(status)
@@ -1361,19 +1460,21 @@ def _shared_verdict_deficit(status):
     presumed = [r for r, v in verdicts.items()
                 if v.get("satisfied") and v.get("grade") == "alive_presumed"]
     if missing:
-        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일·폴백]"
                       % (", ".join(verdicts), ", ".join(missing)))
     note = ("" if not presumed
             else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
-    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일·폴백]"
                    % (", ".join(verdicts), note))
 
 
 def _team_has_deficit():
     """팀 결손 여부 산출 → (결손 bool, 사유). 신호 원천 실패 → 보수적으로 결손 가정(게이트 진행).
 
-    ★W2 술어 단일화(A1 클래스·CS-1②): 1차 경로는 `javis_orchestra.check_verdicts` — ⑤check 가
-      쓰는 **같은 함수**다. 2차는 W0 의 로스터 판정(cys list `role=`+`!exited` — 이름공간만 정합),
+    ★W2 술어 단일화(A1 클래스·CS-1②) + W-B3 위임: 1차 경로는 orchestra 정본
+      `_shared_verdict_deficit` — ⑤check 판정 코어(check_verdicts)를 소비하고 unknown 은
+      시한부 해소 후 잔존 시 결손이다(⑤ satisfied 는 불변 — 위 래퍼 docstring).
+      2차는 W0 의 로스터 판정(cys list `role=`+`!exited` — 이름공간만 정합),
       3차는 구 가족 접두 계수(G26 한계 포함). 강등할 때마다 **사유를 사유 문자열에 남긴다**
       (조용한 접힘 금지 — 어떤 신호로 판정했는지가 진단의 절반이다).
     ★orchestra check **서브프로세스**는 여전히 쓰지 않는다: ④-b→⑤ 호출 순서·검증 계약에
@@ -1759,11 +1860,46 @@ def _cmd_run_chain(log):
         log.step(STEP.PREFLIGHT, 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)
-    _progress("② 데몬 생존 확인…")
-    code, out = _run(["cys", "ping"], timeout=15)
-    log.step(STEP.PING, code, out)
+    # ★유계 재시도(W-A3 — 상수 블록 PING_* 의 설계 근거 주석 참조): 종전 단발 15s ping 은 데몬
+    #   콜드스타트·Defender 첫 스캔 창의 첫 실패 하나로 선언 전체를 폐기했다. 벽시계 데드라인
+    #   (PING_RETRY_TOTAL_S) 안에서 간격(PING_RETRY_INTERVAL_S) 재시도한다.
+    #   ⓐ 진입 게이트 = 데드라인(잔여 창 < 간격이면 재진입 금지) · **진입한 시도는 자기 상한
+    #     (PING_TIMEOUT_S)을 다 쓴다** — javis_budget.ping_retry_worst_s() 가 계상하는
+    #     'TOTAL + 마지막 시도 granularity' 유계화 패턴과 1:1(계상=실최악 · 역전 0).
+    #   ⓑ 하트비트는 벽시계 스로틀(HEARTBEAT_INTERVAL_S) — 시도당 발화는 fail-fast(즉시 거절)
+    #     에서 최대 ~15줄 소음이 된다(간격 3s × 창 45s). 침묵 창 상쇄와 폭주 방지의 균형.
+    #   ⓒ ping 은 관측 전용(스폰 0·큐/feed 발화 0) — 재시도가 무엇도 반복 유발하지 않는다(앵커 ①).
+    _progress("② 데몬 생존 확인(유계 재시도 — 총예산 %.0fs 창·간격 %.1fs)…"
+              % (PING_RETRY_TOTAL_S, PING_RETRY_INTERVAL_S))
+    _ping_t0 = time.monotonic()
+    _ping_deadline = _ping_t0 + PING_RETRY_TOTAL_S
+    _ping_hb_at = _ping_t0 + _budget_leaf("HEARTBEAT_INTERVAL_S", 20)
+    ping_attempts = 0
+    while True:
+        ping_attempts += 1
+        code, out = _run(["cys", "ping"], timeout=PING_TIMEOUT_S)
+        # 첫 시도는 종전과 동일하게 무suffix(happy path 의 boot-last 형태 불변) — 재시도만 #N.
+        log.step(STEP.PING, code, out,
+                 suffix="" if ping_attempts == 1 else "#%d" % ping_attempts)
+        if code == 0:
+            break
+        now = time.monotonic()
+        if now + PING_RETRY_INTERVAL_S >= _ping_deadline:
+            break                      # 잔여 창 < 간격 — 유계: 더 기다리지 않는다(EXIT_PING 로)
+        if now >= _ping_hb_at:
+            _progress("② ping 무응답(rc=%s) — 재시도 중 %d회째·%.0fs 경과(창 %.0fs · "
+                      "데몬 콜드스타트/Defender 첫 스캔 내성 대기)"
+                      % (code, ping_attempts, now - _ping_t0, PING_RETRY_TOTAL_S))
+            _ping_hb_at = now + _budget_leaf("HEARTBEAT_INTERVAL_S", 20)
+        time.sleep(PING_RETRY_INTERVAL_S)
     if code != 0:
-        return log.fail(STEP.PING, code, out, EXIT_PING)
+        _ping_waited = time.monotonic() - _ping_t0
+        # ★진단 계약(W-A3): '몇 회 시도·총 몇 초 대기'를 명시한다 — 재시도까지 소진한 무응답은
+        #   일시 지연이 아니라 데몬 부재·기동 실패 쪽이므로 관찰자에게 그 판별 근거를 준다.
+        return log.fail(STEP.PING, code,
+                        "cys ping 유계 재시도 소진 — %d회 시도·총 %.1fs 대기(창 상한 %.0fs)에도 "
+                        "데몬 무응답(마지막 rc=%s).\n%s"
+                        % (ping_attempts, _ping_waited, PING_RETRY_TOTAL_S, code, out), EXIT_PING)
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
     # ★SEAT(2026-07-17 실사고): 보유자가 '빈 좌석'(role 만 쥔 agent 없는 셸 — cys-dept 가 부서 생성 시
@@ -1888,9 +2024,9 @@ def _cmd_run_chain(log):
         log.step(STEP.CEO_TICKET, 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
-    # 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 — 의무 역할 목록은 ⑤check와 동일 소스
-    # (javis_orchestra.effective_required_roles)를 소비한다(W0 P0 지혈 · G26/A1). R1-MED-1의 '총수
-    # 비교 폐기'는 그대로 유지되고, 그 위에서 역할 이름공간까지 check와 일치시킨 것이다.
+    # 결손 산출 1차 경로는 orchestra 정본 _shared_verdict_deficit 위임(⑤check 판정 코어 소비
+    # + unknown 시한부 해소 — W-B3)이고, cys list 로스터 판정(W0 · effective_required_roles
+    # 소비)은 강등 폴백이다(_team_has_deficit docstring). R1-MED-1의 '총수 비교 폐기'는 그대로.
     # 결손 0(재선언·의무 좌석 전원 생존) → 게이트와 ④ cys boot 호출 자체를 생략("결손 0=스폰 없음").
     orchestra = os.path.join(PACK, "bin", "javis_orchestra.py")
     has_deficit, deficit_why = _team_has_deficit()
@@ -1972,21 +2108,54 @@ def _cmd_run_chain(log):
               % (CHECK_RETRIES, CHECK_INTERVAL_S, _budget_derived("check_window_s", 120)))
     check_timeout = _budget_leaf("CHECK_SUBPROC_TIMEOUT_S", 60)
     hb_every = max(1, int(_budget_leaf("HEARTBEAT_INTERVAL_S", 20) // max(1, CHECK_INTERVAL_S)))
+    # exit 2 '계속' 분기 전용 상한(W-A3 — 키는 아직 javis_budget 에 없어 fallback 실효·키가
+    # 생기면 자동으로 그쪽이 SOT) — 상한의 존재 이유는 아래 분기 주석 ⓑ.
+    unjudgeable_cap = max(1, int(_budget_leaf("CHECK_UNJUDGEABLE_RETRIES", 3)))
     code, out = 1, "orchestra 부재"
-    daemon_gone = False
+    unjudgeable = None      # 'daemon_gone' | 'interpreter_gone' | None — 즉시 이탈 확정 사유
+    unjudgeable_seen = 0    # exit 2 를 '계속'으로 접은 횟수(ping 생존 재확인 성공 시에만 증가)
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=check_timeout)
         log.step(STEP.CHECK, code, out, suffix="#%d" % attempt)
         if code == 0:
             break
-        # ★G32/H-EXIT-7 — check exit 2 는 '노드 미기동'이 **아니다**: 데몬 소실·cys 부재·status 파손
-        #   (판정 불가)이다. 두 갈래를 뭉개면 처방이 뒤집힌다(2는 `cys ping`·데몬 기동, 1은 `cys boot`).
-        #   판정 불가에서는 재시도가 의미 없으므로 즉시 이탈해 정확한 처방으로 실패한다(A12 영구 분류).
+        # ★G32/H-EXIT-7 + W-A3 정밀 분기 — check exit 2 는 '노드 미기동'이 아니라 **판정 불가**다.
+        #   그런데 exit 2 하나에 성질이 다른 사건들이 겹친다:
+        #     ⓐ cysd 데몬 소실·cys 미설치 (orchestra 가 status 수집 실패 → return 2) — 영구.
+        #     ⓑ 일시적 status 수집 실패(데몬 바쁨·RPC 순간 실패) **또는 팩/스크립트 문제** —
+        #       `_run([py, orchestra, …])` 는 cmd[0] 이 sys.executable 이라 **orchestra 스크립트
+        #       부재에도 python 이 rc 2** 를 낸다(127 이 아니다).
+        #   종전 '무조건 즉시 이탈'은 ⓑ 전부를 '데몬 소실'로 오진해 처방(`cys ping`·데몬 기동)을
+        #   뒤집었다. 원래 제안 'break 만 제거'는 **기각** — 진짜 데몬 소실(ⓐ)에서 락을 쥔 채
+        #   수 분 헛돌면 그동안의 모든 재선언이 exit 11 로 접힌다(치명 앵커 ③ 자가치유 봉쇄).
+        #   ★채택 설계: `cys ping` **1회 재확인**으로 ⓐ/ⓑ 를 실측 분리한다(관측 전용·스폰 0 —
+        #     check 도 ping 도 아무것도 기동하지 않으므로 재시도가 스폰을 반복 유발하지 않는다·앵커 ①).
+        #     - ping 실패 → ⓐ 데몬 소실 확정 → 종전대로 즉시 이탈(정확한 처방으로 실패).
+        #     - ping 성공 → ⓑ 데몬 생존 → 재시도 창 안에서 계속하되 이 분기 소모 횟수에 **별도
+        #       상한**(unjudgeable_cap)을 둔다 — 상한 없이는 영구 팩 결손이 CHECK_RETRIES 전량
+        #       (24회 × 회당 재확인 ping 최대 15s)을 태우며 헛돈다(같은 앵커 ③의 반대쪽 함정).
         if code == 2:
-            daemon_gone = True
-            break
-        if code == 127:
-            daemon_gone = True    # orchestra 스크립트/인터프리터 부재 — 영구, 처방이 다르다
+            ping_rc, ping_out = _run(["cys", "ping"], timeout=PING_TIMEOUT_S)
+            if ping_rc != 0:
+                unjudgeable = "daemon_gone"
+                log.step(STEP.CHECK, ping_rc,
+                         "exit 2 → `cys ping` 재확인 실패(rc=%s) — 데몬 소실 확정·즉시 이탈.\n%s"
+                         % (ping_rc, ping_out), suffix="#%d-ping" % attempt)
+                break
+            unjudgeable_seen += 1
+            log.step(STEP.CHECK, 0,
+                     "exit 2 → `cys ping` 재확인 생존(rc 0) — 일시 status 수집 실패 또는 "
+                     "팩/스크립트 문제로 보고 재시도 계속(%d/%d)"
+                     % (unjudgeable_seen, unjudgeable_cap), suffix="#%d-ping" % attempt)
+            if unjudgeable_seen >= unjudgeable_cap:
+                break       # exit 2 반복 + 데몬 생존 — 루프 밖 code==2 분기가 '팩 결손 가능성' 진단
+        elif code == 127:
+            # ★사실상 도달 불가 방어선(W-A3 사문 정정): `_run` 이 127 을 내는 유일 경로는
+            #   cmd[0]=sys.executable 의 FileNotFoundError — 즉 **파이썬 인터프리터 자체 소실**
+            #   이라는 극단뿐이다. 'orchestra 스크립트 부재=127' 이라던 구 문안은 오진이었다
+            #   (스크립트 부재는 python rc 2 — 위 exit 2 분기가 실소유자다). 인터프리터 소실은
+            #   영구 조건이므로 즉시 이탈은 유지한다.
+            unjudgeable = "interpreter_gone"
             break
         if attempt < CHECK_RETRIES:
             if attempt % hb_every == 0:
@@ -1996,13 +2165,32 @@ def _cmd_run_chain(log):
                 sys.stderr.flush()
             time.sleep(CHECK_INTERVAL_S)
     if code != 0:
-        if daemon_gone:
+        if unjudgeable == "daemon_gone":
             return log.fail(STEP.CHECK_UNJUDGEABLE, code,
-                            "check 가 **판정 불가**를 반환했다(exit %s) — '노드 미기동'이 아니다. "
-                            "exit 2=cysd 데몬 소실·cys 미설치·status 파손 / exit 127=orchestra "
-                            "스크립트·인터프리터 부재. 처방: `cys ping` 으로 데몬을, CYS_PACK_DIR·"
-                            "python 해소로 팩 배선을 확인하라(`cys boot` 는 이 상황의 처방이 아니다).\n%s"
-                            % (code, out), EXIT_CHECK)
+                            "check 가 **판정 불가**(exit %s)를 반환했고 `cys ping` 재확인도 "
+                            "실패했다 — cysd 데몬 소실·cys 미설치가 확정적이다('노드 미기동'이 "
+                            "아니다). 처방: `cys ping` 으로 데몬을 확인·기동하라(`cys boot` 는 "
+                            "이 상황의 처방이 아니다).\n%s" % (code, out), EXIT_CHECK)
+        if unjudgeable == "interpreter_gone":
+            return log.fail(STEP.CHECK_UNJUDGEABLE, code,
+                            "check 호출 자체가 불가(exit 127 — 파이썬 인터프리터 %r 소실). "
+                            "재시도는 무의미하다 — python 설치·PATH 해소를 복구하라.\n%s"
+                            % (py, out), EXIT_CHECK)
+        if code == 2:
+            # ping 생존인데 exit 2 잔존(별도 상한 도달 또는 창 소진) — 데몬 소실이 아니라
+            # **팩 결손 가능성**이다. 근거는 실측으로 붙인다(os.path.isfile — 스크립트 실재
+            # 여부가 처방을 가른다 · 결정론 환원: 추론이 아니라 파일계 사실).
+            orch_exists = os.path.isfile(orchestra)
+            return log.fail(STEP.CHECK_UNJUDGEABLE, code,
+                            "check 가 exit 2 를 반복하는데 `cys ping` 은 생존(rc 0)이다 — 데몬 "
+                            "소실이 아니라 **팩 결손 가능성**이다. orchestra 스크립트 실재: "
+                            "%s(%s). 처방: %s\n%s"
+                            % ("있음" if orch_exists else "없음", orchestra,
+                               ("스크립트는 실재 — orchestra 내부 status 수집 실패·팩↔바이너리 "
+                                "스큐를 점검하라(`cys status --json`·CYS_PACK_DIR)." if orch_exists
+                                else "팩 결손 확정적 — CYS_PACK_DIR 배선·팩 재설치로 복구하라"
+                                     "(`cys boot`·데몬 재기동은 이 상황의 처방이 아니다)."),
+                               out), EXIT_CHECK)
         return log.fail(STEP.CHECK, code,
                         "%d회 재시도 후에도 의무 노드 미기동:\n%s" % (CHECK_RETRIES, out), EXIT_CHECK)
 

@@ -58,6 +58,18 @@ SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if SELF_DIR not in sys.path:
     sys.path.insert(0, SELF_DIR)
 
+# ★로케일 비의존 I/O(W-A4 · 선례 javis_bootstrap.py R3/D-IMPL-3 · javis_detect.py G9): ANSI
+#   코드페이지가 UTF-8 이 아닌 Windows(한국어 cp949·서구 cp1252·일본 cp932)에서 stdout 이
+#   파이프로 캡처되면 `✓`·`—`·`↳` 류 특수문자나 한글 출력이 UnicodeEncodeError 로 즉사한다 —
+#   편성은 멀쩡한데 ensure/classify 의 상태 **보고**가 크래시가 되는 허위 실패("graceful 비0
+#   exit·명시 메시지" 계약 자체가 출력 단계에서 깨진다). 출력 인코딩만 고정 — 상태 기계·판정
+#   무접촉. try/except 는 reconfigure 부재(구형 파이썬·비 TextIOWrapper) 허용 — 선례와 자구 동일.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 PACK_DIR = os.environ.get("CYS_PACK_DIR") or os.path.join(
     os.path.expanduser("~"), ".cys", "pack")
 

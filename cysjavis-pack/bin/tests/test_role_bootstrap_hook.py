@@ -11,18 +11,26 @@
        (P3-A-NEGA)·filler 15/16 경계(P3-A-FILLER)·감지창 200 **문자** 경계(G25).
     ② **훅 통합 검증**(프로세스 경계가 필요한 것만) — 기존 발화/무시 행렬 전량 보존 + role
        allowlist 반전(A3)·surface-role 판정불가 fail-closed(A5)·LC_ALL=C 파리티(G9)·
-       A2 surface 게이트.
+       A2 surface 게이트·★W-F2 cp949 note 생존(+가드 제거 음성 대조).
   ①의 케이스를 ②로 중복 실행하지 않는 이유는 비용이다(훅 1회 ≈ 프로세스 3개). 대표 케이스만
   훅으로 교차 확인해 '함수는 맞는데 배선이 틀린' 구멍을 막는다.
+
+★corpus 원본(W-A1b 사본 수렴): ① 의 FIRE/SKIP 정의처는 `fixtures/detect-corpus.json`
+  하나다 — 이 파일은 더 이상 리터럴 사본을 갖지 않고 원본을 읽으며, ② 훅 행렬은 원본에서의
+  **대표 선정**(소속·극성을 원본과 대조)이다. 사본이 원본과 어긋난 채 주석까지 낡는 드리프트가
+  실제로 있었다(아래 '역수리 경고' 참조).
 
 관측 기법(②): 격리 HOME + 빈 팩(목 javis_bootstrap.py) + PATH 앞 목 cys(surface-role 반환값·rc 주입)로
 훅을 실행하고, stdout에 "발화됨" NOTE가 있으면 발화, 없으면 무시로 판정.
 """
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # cysjavis-pack/bin
 HOOK = os.path.join(os.path.dirname(BIN), "hooks", "role-bootstrap.sh")
@@ -33,48 +41,37 @@ import javis_detect  # noqa: E402  (형제 모듈 — 감지기 단일 소유)
 # ══════════════════════════════════════════════════════════════════════════════
 # ① 감지기 함수 직접 검증 — corpus 본진
 # ══════════════════════════════════════════════════════════════════════════════
-# 기존 훅 시대의 회귀 corpus(전량 보존 — W1a가 결정론화한 그 목록).
-LEGACY_FIRE = [
-    "너는 마스터다", "너는 이제 마스터다", "너는 지금부터 마스터다", "너가 마스터야",
-    "당신은 우리의 마스터입니다", "너는 마스터로 각성하라", "you are the master",
-    "지금부터 너는 마스터가 된다",
-]
-LEGACY_SKIP = [
-    "너는 마스터가 아니다", "'너는 마스터다'가 무슨 뜻이야?", "너는 마스터다라고 말하지 마",
-    "오늘 작업 지시해줘", "너는 워커다", "마스터 브랜치를 확인해줘", "너는 오늘 마스터 브랜치 봐",
-]
-# W1b 신규 — 재감사가 실측으로 확정한 결함 재현 케이스.
-NEW_FIRE = [
-    # A4 혼합 의도: 선언 뒤 후속 질문이 붙어도 발화(구 코드는 '?' 하나로 전량 억제 — 실측 미발화)
-    "너는 마스터다. 오늘 뭐부터 할까?",
-    "너는 이제 마스터다! 무슨 일부터 시작할까?",
-    "너는 마스터다.\n오늘 작업 목록은 뭐로 잡을까?",
-    "너는 마스터다; 첫 작업은 뭐로 할까?",          # 세미콜론도 절 경계다
-    # ※경계 명시(스펙 그대로): 절 경계 **없이** 이어붙인 의문("너는 마스터다 뭐부터 할까?")은
-    #   억제가 정답이다 — 재감사 A4의 처방은 "거리 튜닝"이 아니라 "절 경계 판정"이므로, 문장을
-    #   끊지 않은 입력에서 선언과 질문은 같은 절이다. 이 방향의 보수성이 오발화보다 안전하다.
-    # P3-A-NEGA 표준 정서법·구어 주어(구 어휘엔 없어 전부 미발화 실측)
-    "네가 마스터다", "니가 마스터다", "당신이 마스터다", "네가 이제 마스터야",
-    "지금부터 네가 마스터가 된다",
-    # 억제 마커가 **다른 절**에 있으면 발화(절 경계 스코프의 대칭 확인)
-    "'설계 문서'를 예시로 보여줘. 그리고 너는 마스터다.",
-]
-NEW_SKIP = [
-    # A4 반대편: 같은 절 안의 의문·인용은 여전히 억제(과교정 방지)
-    "'네가 마스터다'가 무슨 뜻?", "\"당신이 마스터다\"라고 입력하면 어떻게 되나요?",
-    "'니가 마스터다'가 무슨 의미인지 설명해줘",
-    "너는 마스터다 처럼 들리는 문장을 만들어줘",
-    # P3-A-NEGA 과확장 금지: 주어가 아닌 `네`·`당신` 단독은 발화하지 않는다
-    "네 마스터 브랜치를 봐줘", "당신 마스터키 어디 뒀어",
-]
+# ★corpus 단일 원본(W-A1b 사본 수렴): FIRE/SKIP 의 정의처는 fixtures/detect-corpus.json
+#   하나다. 종전 이 파일의 리터럴 사본(LEGACY_*/NEW_*)은 원본과 이미 어긋나 있었고(문구 드리프트
+#   1건 + 아래 구 스펙 주석 박제), 어긋난 사본·주석을 좇은 역수리가 곧 사고 경로였다 — 그래서
+#   사본을 지우고 원본을 읽는다. 구 훅 시대 회귀 목록(W1a 결정론화분)은 원본의 부분집합으로
+#   전량 보존된다(적재기의 "fixture ⊇ 내장 리터럴" 불변식이 그 보존을 기계로 지킨다).
+#   적재는 javis_detect._load_corpus() 재사용 — 스키마 검증·상위집합 불변식 동승(로더 사본 금지).
+#
+# ※경계 명시(신 스펙 — W-A2 4축 재설계 이후): 절 경계 **없이** 이어붙인 후속 의문
+#   ("너는 마스터다 뭐부터 할까?")은 이제 **발화**가 정답이다(실측 fire). 한국어 채팅체는
+#   문장부호 생략이 기본값이라, 절 꼬리의 '?'·'무엇' 같은 원거리 의문 표지를 선언의 억제
+#   마커로 읽던 구 규칙이 무발화 최빈 사고의 원인이었다. 억제는 이제 부정(neg)과 **구조
+#   신호** 3축으로만 성립한다 — pre(절 안에서 선언보다 **앞**의 마커) / quote(인용부호가
+#   선언을 **감쌈**) / quotative(선언 종료 **직후** 인접창의 인용 전달 조사·에코 '?').
+# ★역수리 경고: 이 자리에 있던 구 주석("무구두점 후속 의문은 억제가 정답")을 좇아 감지기를
+#   되돌리면 무발화 최빈 사고가 그대로 재발한다 — 정답의 정의처는 위 corpus 원본이다.
+_CORPUS_SOURCE, _CORPUS_FIRE_ITEMS, _CORPUS_SKIP_ITEMS, _CORPUS_ERR = javis_detect._load_corpus()
+if _CORPUS_ERR or "fixture" not in (_CORPUS_SOURCE or ""):
+    # 이 테스트는 fixtures/ 와 같은 트리에 산다 — 원본 부재·불량이면 내장 리터럴 폴백으로
+    # 조용히 좁혀 돌지 않고 검체 무효로 죽는다(측정 불능은 통과가 아니다).
+    sys.exit("detect-corpus 원본 적재 실패(검체 무효): %s"
+             % (_CORPUS_ERR or ("source=%r — fixture 미적재" % (_CORPUS_SOURCE,))))
+CORPUS_FIRE = [it["text"] for it in _CORPUS_FIRE_ITEMS]
+CORPUS_SKIP = [it["text"] for it in _CORPUS_SKIP_ITEMS]
 
 
 def fn_matrix(fails):
-    for p in LEGACY_FIRE + NEW_FIRE:
+    for p in CORPUS_FIRE:
         v = javis_detect.detect(p)
         if not v["fire"]:
             fails.append("fn FALSE-NEGATIVE %r → %s" % (p, v["reason"]))
-    for p in LEGACY_SKIP + NEW_SKIP:
+    for p in CORPUS_SKIP:
         v = javis_detect.detect(p)
         if v["fire"]:
             fails.append("fn FALSE-POSITIVE %r → %s" % (p, v["reason"]))
@@ -129,19 +126,27 @@ def fn_matrix(fails):
 # ══════════════════════════════════════════════════════════════════════════════
 # ② 훅 통합 검증
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None):
-    """훅을 격리 실행. surface_role = 목 cys surface-role 반환값(빈=미claim). 반환: (발화 bool, stdout).
+_MOCK_BOOT = "#!/usr/bin/env python3\nprint('MOCK')\n"   # 발화 성공 경로용 목 부트(존재+즉시 exit 0)
 
-    surface_env=False 는 **cys 밖**(VS Code 등 임의 claude 세션)을 재현한다 — A2 게이트 핀.
-    role_rc≠0 은 surface-role **판정 불가**(데몬 미응답·hang 등)를 재현한다 — A5 fail-closed 핀.
+
+def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None,
+                   hook_path=None, boot_py=_MOCK_BOOT):
+    """훅을 격리 실행하고 CompletedProcess 를 그대로 돌려준다(stdout/stderr **분리** 관측).
+
+    ★W-F2 가 요구한 분리다: note 생존 판정은 stdout 의 JSON 완주가 근거고, 소실 원인 판정은
+    stderr 의 UnicodeEncodeError 가 근거다 — 합쳐 보면 두 사실이 융합된다.
+    hook_path — 기본 None=실제 훅(HOOK). W-F2 음성 대조가 가드를 뗀 변형 사본 경로를 넘긴다.
+    boot_py   — 목 javis_bootstrap.py 소스(기본 _MOCK_BOOT=발화 성공). None 이면 **만들지
+                않아** BOOT 부재 경로가 된다(notify_pipe_release 와 같은 방향).
     """
     home = tempfile.mkdtemp()
     pack = tempfile.mkdtemp()
     mockbin = tempfile.mkdtemp()
     os.makedirs(os.path.join(pack, "bin"), exist_ok=True)
-    # 목 javis_bootstrap.py (부트 안 함 — 존재만)
-    with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
-        f.write("#!/usr/bin/env python3\nprint('MOCK')\n")
+    # 목 javis_bootstrap.py (부트 안 함 — 존재만. boot_py=None 은 BOOT 부재 경로)
+    if boot_py is not None:
+        with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
+            f.write(boot_py)
     # 목 cys — surface-role만 주입, 나머지 no-op
     cysp = os.path.join(mockbin, "cys")
     with open(cysp, "w") as f:
@@ -180,19 +185,243 @@ def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=No
         env.pop("CYS_SURFACE_ID", None)
     if extra_env:
         env.update(extra_env)
+    return subprocess.run(["bash", hook_path or HOOK], input=json.dumps({"prompt": prompt}),
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+def _run_hook(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None):
+    """훅을 격리 실행. surface_role = 목 cys surface-role 반환값(빈=미claim). 반환: (발화 bool, stdout).
+
+    surface_env=False 는 **cys 밖**(VS Code 등 임의 claude 세션)을 재현한다 — A2 게이트 핀.
+    role_rc≠0 은 surface-role **판정 불가**(데몬 미응답·hang 등)를 재현한다 — A5 fail-closed 핀.
+    (기존 소비면 유지 — 원시 관측이 필요하면 _run_hook_proc 를 직접 쓴다.)
+    """
     try:
-        r = subprocess.run(["bash", HOOK], input=json.dumps({"prompt": prompt}),
-                           capture_output=True, text=True, timeout=30, env=env)
+        r = _run_hook_proc(prompt, surface_role, surface_env, role_rc, extra_env)
     except Exception as e:
         return False, "exec 실패: %s" % e
     return ("발화됨" in r.stdout), r.stdout + r.stderr
 
 
-# 훅 통합 행렬 — 기존 목록 전량 보존(회귀 계약).
-FIRE = LEGACY_FIRE
-SKIP = LEGACY_SKIP
-# 훅으로 교차 확인하는 W1b 대표 케이스(함수 검증과 이중화하지 않되 배선은 확인).
-HOOK_NEW_FIRE = ["너는 마스터다. 오늘 뭐부터 할까?", "네가 마스터다", "당신이 마스터다"]
+def notify_pipe_release(fails):
+    """★W-A0 알림 파이프 점유 해제 계측 — 훅 exit 후 stdout EOF 까지의 벽시계가 짧아야 한다.
+
+    결함(수리 전 실측): `_notify_bg` 류 백그라운드 서브셸이 훅의 stdout/stderr 를 상속한 채 남아,
+    데몬 wedge 로 `cys feed push` 가 hang 이면 하네스(UserPromptSubmit stdout 파이프 리더)가 EOF 를
+    영영 못 받았다 — 사용자 프롬프트 제출 먹통. `subprocess.run(timeout=…)` 은 프로세스 종료가
+    아니라 **파이프 EOF** 를 기다리므로 이 하네스 자체가 계측기다(POSIX 는 TimeoutExpired 시
+    kill 후 직접 자식만 wait 하므로 손자 hang 에 재차 붙잡히지 않는다 — 20s 에 깨끗이 FAIL).
+
+    검체 경로: BOOT 부재(pack/bin 에 javis_bootstrap.py 를 **만들지 않는다**) — 성공 spawn 없이
+    알림이 결정론으로 발화하는 경로. 목 cys 는 판정 채널(surface-role)엔 즉답하고 알림 채널
+    (feed·send)만 60s hang 해 wedge 데몬을 재현한다(전 채널 hang 이면 role 게이트 데드라인이
+    먼저 fail-closed 로 꺼져 검체가 알림 경로에 못 간다).
+
+    검증 3속성(전부 W-A0 계약 핀):
+      ① EOF 빠름 — 서브셸 진입 즉시 exec fd 분리. 경계 8s 는 '수리 전=hang 자식 종료까지 60s
+         (하네스 20s 초과)' 와 'exec 소실+데드라인 잔존 부분회귀=5s+5s≈10s+' 를 모두 잡되
+         정상(≈2s)에 4배 여유를 준 값이다.
+      ② 데드라인 실효 — feed hang 이 5s 에 잘려야 send 폴백이 로그에 나타난다(cys_timeout_run
+         소실이면 feed 가 60s 를 다 자므로 창 안에 send 가 없다).
+      ③ 알림 시도는 여전히 발생(feed push 로그) — 발화 조건을 줄이지도 늘리지도 않았다는 앵커 핀.
+    """
+    home = tempfile.mkdtemp()
+    pack = tempfile.mkdtemp()
+    mockbin = tempfile.mkdtemp()
+    os.makedirs(os.path.join(pack, "bin"), exist_ok=True)   # ★javis_bootstrap.py 없음 = BOOT 부재 경로
+    calls = os.path.join(mockbin, "cys-calls.log")
+    cysp = os.path.join(mockbin, "cys")
+    with open(cysp, "w") as f:
+        f.write("#!/bin/bash\n"
+                "printf '%%s\\n' \"$*\" >> '%s'\n"
+                "case \"$1\" in\n"
+                "  feed|send) sleep 60 ;;\n"
+                "  surface-role) echo ''; exit 0 ;;\n"
+                "esac\n"
+                "exit 0\n" % calls)
+    os.chmod(cysp, 0o755)
+    env = dict(os.environ)
+    env["HOME"] = home
+    env["CYS_PACK_DIR"] = pack
+    env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
+    env.pop("CYS_SOCKET", None)
+    env.pop("CYS_STATE_DIR", None)          # _run_hook 과 같은 격리 규율(실사용 원장 누수 차단)
+    env.pop("AITERM_SURFACE_ID", None)
+    env["CYS_MISSION"] = "W-A0 파이프 계측 검체 임무(오너 지정 가정)"
+    env["CYS_SURFACE_ID"] = "7"
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(["bash", HOOK], input=json.dumps({"prompt": "너는 마스터다"}),
+                           capture_output=True, text=True, timeout=20, env=env)
+    except subprocess.TimeoutExpired:
+        fails.append("W-A0 회귀: 훅 stdout EOF 미도달(20s) — 알림 서브셸이 하네스 파이프를 "
+                     "점유 중(서브셸 exec fd 분리 소실)")
+        return
+    elapsed = time.monotonic() - t0
+    if elapsed >= 8.0:
+        fails.append("W-A0 회귀: EOF 까지 %.1fs ≥ 8s — 서브셸이 파이프를 데드라인만큼 붙잡았다"
+                     "(exec fd 분리 소실 · cys_timeout_run 만 잔존 형태)" % elapsed)
+    if r.returncode != 0:
+        fails.append("W-A0: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    if "부트스트랩 불가" not in r.stdout:
+        fails.append("W-A0 검체 무효: BOOT 부재 경로 미도달(additionalContext 부재): %r"
+                     % (r.stdout + r.stderr)[:300])
+    # ②·③ 알림 채널 관측 — 목 cys 는 hang **전에** 로그부터 남기므로 폴링으로 충분하다.
+    #    feed push = 알림 발화 자체(③) / send --queued = feed 가 데드라인(5s)에 잘린 뒤의
+    #    폴백(②). 폴백 대기 상한 12s: notify fork(≈2s)+데드라인 5s+스폰 여유. 이 창 안에
+    #    send 가 없으면 feed 가 60s 를 다 자고 있다는 뜻 = 데드라인 소실.
+    seen = ""
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        try:
+            with open(calls, encoding="utf-8") as f:
+                seen = f.read()
+        except OSError:
+            seen = ""
+        if "send --queued" in seen:
+            break
+        time.sleep(0.2)
+    if "feed push" not in seen:
+        fails.append("W-A0 회귀: BOOT 부재인데 cys feed push 시도가 없다(알림 발화 조건이 "
+                     "변경됐다 — 줄이기 금지): %r" % seen[:300])
+    elif "send --queued" not in seen:
+        fails.append("W-A0 회귀: feed hang 후 12s 안에 send 폴백이 없다(cys_timeout_run "
+                     "데드라인 소실 — 서브셸이 60s 잔존): %r" % seen[:300])
+
+
+def _note_ctx(stdout):
+    """stdout 의 hookSpecificOutput JSON 줄에서 additionalContext 를 회수한다(없으면 "").
+
+    json.loads 가 줄 전체를 검증하므로 '부분 출력 후 사망'도 소실로 판정된다 — substring 검사보다
+    강한 계측이다(주입 계약의 실소비자가 JSON 파서라는 사실과 정렬).
+    """
+    for line in stdout.splitlines():
+        if line.startswith('{"hookSpecificOutput"'):
+            try:
+                return json.loads(line)["hookSpecificOutput"]["additionalContext"]
+            except (ValueError, KeyError, TypeError):
+                return ""
+    return ""
+
+
+_BOOT_FAIL_PY = "#!/usr/bin/env python3\nimport sys\nsys.exit(7)\n"   # 즉사 rc7 = '발화 실패' 경로
+# (경로명, boot_py, note 마커) — ★W-F2 가 무가드로 남겼던 3블록 전부(발화 성공·발화 실패·BOOT 부재).
+_CP949_PATHS = (
+    ("발화 성공", _MOCK_BOOT, "발화됨"),
+    ("발화 실패", _BOOT_FAIL_PY, "발화 실패"),
+    ("BOOT 부재", None, "부트스트랩 불가"),
+)
+
+
+def note_cp949_survival(fails):
+    """★W-F2 note 인코딩 가드 회귀 핀 — cp949 stdio 스큐에서도 통보(note)가 생존해야 한다.
+
+    결함(수리 전 실측): 훅의 `python -c` note 블록 5개 중 3개(BOOT 부재·발화 실패·발화 성공)가
+    stdio 재구성 가드 없이 남아, PYTHONUTF8 미주입 스큐(구 데몬)의 비UTF8 Windows(cp949)에서
+    문안의 U+2014(—) 인코딩 실패로 **선언마다 모델에 가는 통보가 통째로 소실**됐다(훅은 exit 0
+    = 완전 침묵). 부트는 실제로 발화됐는데 모델은 아무것도 못 봐 "선언했는데 무반응"이 됐고,
+    수동 재실행 금지 경고문도 함께 사라졌다. 수리는 훅의 가드 단일 소스 변수(CYS_NOTE_IO_GUARD)다.
+
+    3속성:
+      ① 배선 정합(정적) — 5블록 전부가 단일 소스 변수를 쓰고 우회 인라인이 0이어야 한다
+         (인라인 사본 5벌이 반드시 낡는 것이 이번 결함의 형태 그 자체였다).
+      ② cp949 생존(양성) — 성공·발화 실패·BOOT 부재 세 경로 모두 cp949 에서 note JSON 이
+         완주 파싱되고 마커가 남는다(+UnicodeEncodeError 부재·훅 exit 0 계약).
+      ③ 음성 대조(계측기 타당성) — 가드 값을 뗀 변형 훅에서는 같은 케이스가 실제로 note 를
+         잃고(UnicodeEncodeError 동반) 그래야만 이 계측기가 무언가를 재고 있는 것이다.
+    ※발화 조건은 관측만 한다(앵커 ①폭주 — 이 핀은 순수 '출력 생존' 계약이다).
+    """
+    with open(HOOK, encoding="utf-8") as f:
+        hook_src = f.read()
+
+    # ① 배선 정합(정적)
+    n_sites = hook_src.count('-c "$CYS_NOTE_IO_GUARD"' + "'\n")
+    if n_sites != 5:
+        fails.append("W-F2 배선: 가드 변수 call site %d≠5 — note 블록을 추가/제거했다면 이 핀과 "
+                     "훅 정의부 주석을 함께 갱신하라" % n_sites)
+    if "-c 'import json,sys" in hook_src:
+        fails.append("W-F2 배선: 가드 변수를 우회하는 인라인 `-c 'import json,sys` 블록 잔존"
+                     "(사본 드리프트 재발 경로)")
+    m = re.search(r"CYS_NOTE_IO_GUARD='[^']*'", hook_src)
+    guard_defined = bool(m and "_s.reconfigure" in m.group(0))
+    if not guard_defined:
+        # 정의 붕괴라도 ② 실측은 돌린다 — 소실을 정적 소견이 아니라 실행 출력으로 보인다
+        # (측정 가능한 것을 정적 FAIL 뒤에 숨기지 않는다). ③ 뮤테이션만 정의 부재로 불능.
+        fails.append("W-F2 배선: CYS_NOTE_IO_GUARD 정의에 stdio 재구성 가드가 없다")
+
+    def _proc(name, hook_path=None, boot_py=_MOCK_BOOT):
+        try:
+            return _run_hook_proc("너는 마스터다", extra_env={"PYTHONIOENCODING": "cp949"},
+                                  hook_path=hook_path, boot_py=boot_py)
+        except Exception as e:
+            fails.append("W-F2(%s): 훅 실행 실패(계측 불능은 통과가 아니다): %s" % (name, e))
+            return None
+
+    # ② cp949 생존(양성) — 실제 훅
+    for name, boot_py, marker in _CP949_PATHS:
+        r = _proc(name, boot_py=boot_py)
+        if r is None:
+            continue
+        ctx = _note_ctx(r.stdout)
+        if marker not in ctx:
+            fails.append("W-F2 회귀(%s): cp949 에서 note 소실 — additionalContext=%r stderr=%r"
+                         % (name, ctx[:120], r.stderr[:200]))
+        if "UnicodeEncodeError" in r.stderr:
+            fails.append("W-F2 회귀(%s): cp949 에서 UnicodeEncodeError 잔존(무가드 블록 재발)" % name)
+        if r.returncode != 0:
+            fails.append("W-F2(%s): 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % (name, r.returncode))
+
+    if not guard_defined:
+        return   # ③ 은 정의 텍스트를 뮤테이션 대상으로 요구한다(위 ①이 이미 FAIL을 남겼다)
+
+    # ③ 음성 대조 — 가드 값을 뗀 변형(수리 전 상태 재현). 변형 사본은 격리 디렉터리에 두고
+    #    _lib.sh 사본 + bin 링크로 훅의 형제 해소(`$(dirname $0)/../bin`)만 재현한다 —
+    #    실 저장소 파일은 건드리지 않는다(관측=개입 금지).
+    mut_root = tempfile.mkdtemp()
+    mut_hooks = os.path.join(mut_root, "hooks")
+    os.makedirs(mut_hooks)
+    mut_src = hook_src[:m.start()] + "CYS_NOTE_IO_GUARD='import json,sys'" + hook_src[m.end():]
+    if "_s.reconfigure" in mut_src:
+        fails.append("W-F2 음성 대조 무효: 변형본에 재구성 가드 잔존(뮤테이션 미적중)")
+        return
+    mut_hook = os.path.join(mut_hooks, "role-bootstrap.sh")
+    with open(mut_hook, "w", encoding="utf-8") as f:
+        f.write(mut_src)
+    shutil.copy(os.path.join(os.path.dirname(HOOK), "_lib.sh"), os.path.join(mut_hooks, "_lib.sh"))
+    try:
+        os.symlink(BIN, os.path.join(mut_root, "bin"))
+    except OSError:                     # Windows 비대칭(무권한 심링크) — 사본 폴백
+        shutil.copytree(BIN, os.path.join(mut_root, "bin"))
+    for name, boot_py, marker in _CP949_PATHS[:2]:      # 성공·실패 양쪽(티켓 요구 범위)
+        r = _proc("음성 " + name, hook_path=mut_hook, boot_py=boot_py)
+        if r is None:
+            continue
+        ctx = _note_ctx(r.stdout)
+        if marker in ctx:
+            fails.append("W-F2 계측기 무효(%s): 가드를 뗐는데 note 생존 — 이 핀은 아무것도 재지 "
+                         "않는다(양성 케이스의 증명력 0)" % name)
+        if "UnicodeEncodeError" not in r.stderr:
+            fails.append("W-F2 계측기 의심(%s): 변형본의 note 소실이 인코딩 경로가 아니다"
+                         "(다른 사망 원인 — 검체 무효): %r" % (name, (r.stdout + r.stderr)[:200]))
+
+
+# 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
+# 대조한다). 구 훅 시대 회귀 목록(W1a 결정론화분) 전량 보존(회귀 계약). 전 corpus 를 ②로
+# 재실행하지 않는 이유는 비용이다(훅 1회 ≈ 프로세스 3개 — ① 이 전량을 커버한다).
+FIRE = [
+    "너는 마스터다", "너는 이제 마스터다", "너는 지금부터 마스터다", "너가 마스터야",
+    "당신은 우리의 마스터입니다", "너는 마스터로 각성하라", "you are the master",
+    "지금부터 너는 마스터가 된다",
+]
+SKIP = [
+    "너는 마스터가 아니다", "'너는 마스터다'가 무슨 뜻이야?", "너는 마스터다라고 말하지 마",
+    "오늘 작업 지시해줘", "너는 워커다", "마스터 브랜치를 확인해줘", "너는 오늘 마스터 브랜치 봐",
+]
+# 훅으로 교차 확인하는 W1b/W-A2 대표 케이스(함수 검증과 이중화하지 않되 배선은 확인).
+# ★"너는 마스터다 오늘 뭐부터 할까?"(무구두점 후속 의문 = **발화**)를 반드시 포함한다 — 신
+#   스펙에서 극성이 뒤집힌 대표 케이스의 훅 배선 핀(구 주석을 좇은 역수리의 조기 검출 장치).
+HOOK_NEW_FIRE = ["너는 마스터다. 오늘 뭐부터 할까?", "너는 마스터다 오늘 뭐부터 할까?",
+                 "네가 마스터다", "당신이 마스터다"]
 HOOK_NEW_SKIP = ["'네가 마스터다'가 무슨 뜻?"]
 # A3 allowlist 반전 — 구 denylist가 통과시켰던 좌석들이 전부 차단돼야 한다.
 NON_MASTER_ROLES = ["worker", "cso", "reviewer-gemini", "reviewer-codex",
@@ -203,6 +432,15 @@ NON_MASTER_ROLES = ["worker", "cso", "reviewer-gemini", "reviewer-codex",
 def main():
     fails = []
     fn_matrix(fails)
+
+    # 0. 훅 대표 선정 ↔ corpus 원본 대조 — 선정이 사본으로 퇴화(원본과 극성·문구가 어긋난 채
+    #    잔존)하는 드리프트를 기계로 잡는다(이 파일이 리터럴을 갖는 유일한 이유가 '선정'이다).
+    for t in FIRE + HOOK_NEW_FIRE:
+        if t not in CORPUS_FIRE:
+            fails.append("훅 대표 FIRE 케이스가 corpus 원본에 없다(선정≠사본 계약 위반): %r" % t)
+    for t in SKIP + HOOK_NEW_SKIP:
+        if t not in CORPUS_SKIP:
+            fails.append("훅 대표 SKIP 케이스가 corpus 원본에 없다(선정≠사본 계약 위반): %r" % t)
 
     # 1. 감지 행렬 — 발화해야 함
     for p in FIRE + HOOK_NEW_FIRE:
@@ -255,14 +493,21 @@ def main():
     if fired:
         fails.append("G25 회귀: 감지창 밖 선언이 훅에서 발화")
 
+    # 9. ★W-A0 알림 파이프 점유 해제 — wedge 데몬에서도 훅 exit ≈ stdout EOF(프롬프트 먹통 차단)
+    notify_pipe_release(fails)
+
+    # 10. ★W-F2 note 인코딩 가드 — cp949 스큐에서도 통보 생존(+가드 제거 음성 대조)
+    note_cp949_survival(fails)
+
     if fails:
         print("FAIL (%d):" % len(fails))
         for f in fails:
             print("  -", f)
         sys.exit(1)
-    print("PASS: 함수 corpus %d발화/%d무시(+filler·창 경계·CLI exit 계약) + 훅 %d발화/%d무시 + "
-          "A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + G9 파리티 3 + G25 경계 2"
-          % (len(LEGACY_FIRE) + len(NEW_FIRE), len(LEGACY_SKIP) + len(NEW_SKIP),
+    print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
+          "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
+          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2"
+          % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))
 

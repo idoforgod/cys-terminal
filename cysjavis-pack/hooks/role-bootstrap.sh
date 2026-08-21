@@ -79,6 +79,12 @@
 #    타이핑 간주 → 종전 D4-a′ 경로 그대로 spawn / 그 외(토큰 부재·unknown·타임아웃·실행 실패·
 #    모듈 부재)=판정 불가 → **fail-closed 무스폰**+loud(A5·A22 와 같은 방향 — 무단 스폰이
 #    판정 보류보다 나쁘다). rc(0/1/2 계약 무변경)는 보조 로그로만 남긴다.
+#  - **★W-A0 알림 파이프 점유 해제(2026-08-21)**: `_notify_bg`(+동일 패턴 인라인 사본 2곳 → 호출
+#    통일)의 백그라운드 서브셸이 훅의 stdout/stderr 를 상속한 채 남아, 데몬 wedge 로 `cys feed
+#    push` 가 응답하지 않으면 하네스가 훅 stdout 의 EOF 를 영영 못 받았다(프롬프트 제출 먹통).
+#    서브셸 진입 즉시 exec 로 fd 를 끊고 cys_timeout_run 데드라인(CYS_NOTIFY_TIMEOUT_S)을
+#    씌운다(+정렬 창 ≤0.3s — 건강 경로에선 '알림 시도'가 훅 종료 전에 관측면에 닿는 종전 순서를
+#    보존하고, wedge 면 포기하고 배경 진행). 발화 조건·알림 개수는 불변이다(줄이지도 늘리지도 않는다).
 #
 # 안전: 모든 단계 graceful, 반드시 exit 0 (훅 실패가 세션을 깨지 않게).
 set +e
@@ -140,6 +146,28 @@ INPUT=$(cat 2>/dev/null)
 _static_ctx() {
   printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$1"
 }
+
+# ── ★W-F2 note 인코딩 가드 — 단일 소스(사본 드리프트 금지) ──
+# 이 훅의 모든 `"$CYS_PY" -c` note 발행 블록(기계유래·판정불가·BOOT 부재·발화 실패·발화 성공
+# — 현재 5곳)은 반드시 이 변수를 인접 문자열 연결(POSIX)로 앞세워 시작한다:
+#     "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'…개행…본문…'
+# 왜 변수 1곳인가: 340653d 가 같은 결함 클래스를 팩 3파일에서 고칠 때 이 훅은 2블록만
+# 가드를 얻고 3블록(BOOT 부재·발화 실패·발화 성공)이 무가드로 남았다(사본이 낡는
+# 형태 그 자체). PYTHONUTF8 미주입 스큐(구 데몬)의 비UTF8 Windows(cp949)에서 문안의
+# U+2014(—) 인코딩 실패로 **선언마다 모델에 가는 통보가 통째로 소실**됐다(훅은 exit 0
+# = 완전 침묵 · 성공/실패 경로 동일 실측) — 수동 재실행 금지 경고문까지 함께 사라져
+# "선언했는데 무반응"으로 보인다. 가드 자구는 종전 인라인 가드와 동일하며(선례
+# javis_detect.py 가드), 발화 조건은 어느 블록에서도 바뀌지 않는다(순수 출력 생존 수리).
+# 회귀 핀: tests/test_role_bootstrap_hook.py — cp949 생존(성공·실패 양쪽) + 가드 제거
+# 음성 대조(계측기 타당성) + 5/5 배선 정합(우회 금지).
+CYS_NOTE_IO_GUARD='import json,sys
+# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
+# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass'
 # 프롬프트가 마스터 선언일 **가능성**이 있는가(cannot-judge ↔ judged-no 분리용 보수 선별).
 # 선언은 '마스터' 또는 'master' 토큰 없이 성립하지 않는다(javis_detect.MASTER) — 토큰이 없으면
 # 판정기가 없어도 '선언 아님'이 확정이므로 침묵이 정당하다. 토큰이 있으면 판정 불가 =시끄럽게.
@@ -155,9 +183,46 @@ _maybe_declaration() {
     *) return 1 ;;
   esac
 }
+# ★W-A0 알림 데드라인(초): 알림은 best-effort 다 — 데몬이 wedge 면 짧게 포기하는 것이 맞다
+#   (주 통보는 어차피 additionalContext·stderr 가 하고, 여기서 잃는 것은 보조 알림 1건뿐이다).
+#   명명·배치는 파일 관례(CYS_ROLE_GATE_TIMEOUT_S·CYS_CLAIM_TIMEOUT_S — 소비처 직전) 그대로.
+CYS_NOTIFY_TIMEOUT_S=5
 _notify_bg() {   # 승인 채널 best-effort(백그라운드·graceful — 훅을 죽이거나 행 걸지 않게)
-  ( cys feed push --kind bootstrap-fail --title "$1" --body "$2" >/dev/null 2>&1 \
-    || cys send --queued --to master "[$1] $2" >/dev/null 2>&1 ) &
+  # ★W-A0 파이프 점유 해제(2026-08-21): 종전 `( cys … >/dev/null 2>&1 || … ) &` 는 리다이렉션이
+  #   **명령별**이라 서브셸 프로세스 자신은 훅의 stdout/stderr(fd1·2)를 상속한 채 남았다.
+  #   UserPromptSubmit 훅의 stdout 은 하네스가 파이프로 읽으므로, 훅 본체가 exit 0 해도 이 자식이
+  #   파이프 쓰기 끝을 쥐고 있으면 하네스는 EOF 를 못 받는다 — 데몬 wedge 로 `cys feed push` 가
+  #   응답하지 않으면 사용자의 프롬프트 제출이 영영 안 끝났다(입력 먹통). 수리 2속성:
+  #   ⓐ 서브셸 진입 즉시 exec 로 fd0·1·2 를 훅에서 끊는다 — 자손(cys·timeout 랩퍼) 전체가
+  #      /dev/null 을 상속하므로 종전의 명령별 `>/dev/null 2>&1` 은 이 한 줄로 대체된다. stdin 도
+  #      끊는다: 호출 시점엔 훅 stdin 이 이미 소진(INPUT=$(cat))이지만 자식이 상속 fd 를 쥐는
+  #      표면 자체를 없앤다(위 role 게이트 `</dev/null` 과 같은 규율).
+  #   ⓑ cys_timeout_run(_lib.sh 프리루드) 데드라인 — 파이프는 ⓐ가 이미 끊었으니 hang 이 먹통은
+  #      아니지만, wedge 데몬에서 60s+ 잔존하는 서브셸이 발화마다 누적되는 것은 자원 낭비다.
+  #      타임아웃(124)도 rc≠0 이므로 send 폴백으로 넘어가는 `||` 의미는 종전 그대로다.
+  #   ⓒ 정렬 창(≤0.3s): ⓐ로 EOF 가 훅 종료 즉시가 되면서, 종전 파이프 점유가 **부수적으로**
+  #      보장하던 순서 — "훅이 끝났으면 알림 시도는 이미 관측면(데몬·호출 로그)에 도달했다" —
+  #      가 사라졌다. 실측: run_bootstrap_health H-DETECT-9 가 훅 종료 직후 목 cys 호출 로그를
+  #      읽는데, 분리 직후엔 8/8 로 로그가 아직 비어 있었다(레이스 상시 패배). 그래서 서브셸
+  #      종료를 6×0.05s 만 폴링한다: 건강한 데몬/목은 수십 ms 에 끝나 순서가 보장되고, wedge 면
+  #      0.3s 후 포기해 배경 진행한다(파이프는 이미 분리 — 프롬프트 먹통은 재발하지 않는다).
+  #      ★kill -0 은 미회수 좀비에도 참이므로 조기 break 는 최적화일 뿐이다 — 폴링이 창을 다
+  #      기다려도 손해는 0.3s 하나고, '죽어 있음'을 늦게 알아도 순서는 이미 보장된 뒤다(죽음=
+  #      작업 완료). 정확성이 셸의 reap 타이밍에 의존하지 않는다.
+  #   ★발화 조건·호출부는 불변 — 알림을 줄이지도 늘리지도 않는다. 대안 기각: ①setsid 재부모화만
+  #     으로는 fd 상속이 그대로라 파이프가 안 끊긴다(끊을 대상은 세션이 아니라 fd 다) ②훅이
+  #     서브셸을 무제한 wait 하면 wedge 에서 프롬프트가 데드라인 합(~10s)만큼 걸린다(정렬 창은
+  #     그래서 상한이 데드라인이 아니라 0.3s 다) ③완료 마커 파일은 wedge 지각 완료가 고아
+  #     마커를 흘린다(무잔재인 폴링 채택).
+  ( exec >/dev/null 2>&1 </dev/null
+    cys_timeout_run "$CYS_NOTIFY_TIMEOUT_S" cys feed push --kind bootstrap-fail --title "$1" --body "$2" \
+      || cys_timeout_run "$CYS_NOTIFY_TIMEOUT_S" cys send --queued --to master "[$1] $2" ) &
+  _NB_PID=$!
+  _NB_I=0
+  while [ "$_NB_I" -lt 6 ] && kill -0 "$_NB_PID" 2>/dev/null; do
+    _NB_I=$((_NB_I + 1))
+    sleep 0.05 2>/dev/null || { sleep 1; break; }   # 소수 sleep 미지원 셸은 1s 단창 후 포기(부트 생존확인 폴백과 같은 관례)
+  done
 }
 
 # ── A22: 인터프리터 미해소(python 전무) — cannot-judge 를 시끄럽게 ──
@@ -273,14 +338,7 @@ if [ "$MO_TOKEN" = "machine" ]; then
   # 기계 유래 확정 — 무스폰. 주입문은 정직하게: 무엇을 감지했고 왜 발화하지 않았는지 + 근거
   # 확인 명령 + 오너 우연 일치(거짓 양성 수용 — 비대칭 원칙) 시의 복구 경로.
   echo "[cys-hook] role-bootstrap: 기계 유래 선언(machine-origin 토큰=machine · 보조 rc=$MO_RC) — 무스폰(부트 미발화)" >&2
-  "$CYS_PY" -c 'import json,sys
-# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
-# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[기계 유래 선언 감지 — 부트 미발화] 이 문단을 넣은 것은 모델이 아니라 이 컴퓨터에 설치된 "
       "프로그램의 훅(%s/hooks/role-bootstrap.sh)이다. 원문을 열어 대조해도 된다. "
       "방금 입력에서 마스터 선언 패턴이 감지됐지만, 기계유래 판별(bin/javis_mission.py machine-origin — "
@@ -307,14 +365,7 @@ elif [ "$MO_TOKEN" != "human" ]; then
   echo "[cys-hook] role-bootstrap: 기계유래 판정 불가(machine-origin $MO_WHY) — 무스폰(fail-closed)" >&2
   _notify_bg "부트스트랩 판정 불가(기계유래 판별 실패)" \
     "마스터 선언은 감지됐지만 javis_mission.py machine-origin 이 오너 타이핑/기계 배달 여부를 판정하지 못했습니다($MO_WHY). 팀 기동이 발화되지 않았습니다."
-  "$CYS_PY" -c 'import json,sys
-# 로케일 비의존 I/O(선례 javis_detect.py:50) — 비UTF8 Windows 코드페이지(cp949)에서
-# UnicodeEncodeError 로 note 가 통째로 소실되지 않게 한다.
-for _s in (sys.stdout, sys.stderr):
-    try:
-        _s.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 판정 불가 - 기계유래 판별 실패] 마스터 선언 패턴은 감지됐지만, 그 선언이 "
       "오너 타이핑인지 기계 배달인지 판별하는 도구(bin/javis_mission.py machine-origin)가 판정하지 "
       "못했다(%s — 판정 근거는 stdout 토큰이고 rc 는 보조 진단이다). "
@@ -339,12 +390,13 @@ export CYS_DECL_ORIGIN="hook-human"
 BOOT="$PACK/bin/javis_bootstrap.py"
 # ★BOOT 부재 명시 실패(증분1): 부서 팩에 javis_bootstrap.py가 없는 레인은 종전엔 조용한 무산이라
 # "팀이 뜬다"는 기대와 달리 아무 일도 없었다. 원인·조치를 additionalContext로 명시하고 승인 채널로도
-# 시끄럽게 알린다. 알림은 백그라운드+graceful(데몬 부재 등 실패가 훅을 죽이거나 행 걸지 않게). 훅은 exit 0.
+# 시끄럽게 알린다. 알림은 _notify_bg 단일 구현이다(★W-A0 사본 3벌→1벌 통일: 파이프 분리·데드라인이
+# 전 호출부에 동일 적용된다. send 폴백 문안만 시그니처 통일로 "[제목] 본문" 형태가 되는데, 그 형태는
+# javis_mission 층2 라벨 판별이 기계 유래로 접는 문서화된 규약이라 안전하다). 훅은 exit 0.
 if [ ! -f "$BOOT" ]; then
   MSG="[부트스트랩 불가] 이 레인의 팩($PACK)에 bin/javis_bootstrap.py가 없어 마스터 팀을 기동할 수 없습니다. 팩 배포(preflight --fix·pack-heal)를 확인하거나 CYS_PACK_DIR이 올바른 레인을 가리키는지 점검하세요."
-  ( cys feed push --kind bootstrap-fail --title "부트스트랩 불가(BOOT 부재)" --body "$MSG" >/dev/null 2>&1 \
-    || cys send --queued --to master "$MSG" >/dev/null 2>&1 ) &
-  "$CYS_PY" -c 'import json,sys
+  _notify_bg "부트스트랩 불가(BOOT 부재)" "$MSG"
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":sys.argv[1]}}, ensure_ascii=False))' \
     "[결정론 부트스트랩 불가 — 명시 실패] 이 레인의 팩에 bin/javis_bootstrap.py가 없어 마스터 팀 기동을 발화할 수 없습니다(조용한 무산 아님). 조치: 팩 배포 상태(preflight --fix·pack-heal)와 CYS_PACK_DIR 레인 정합을 확인하세요. 승인 Feed에도 알림을 시도했습니다."
   exit 0
@@ -507,10 +559,11 @@ fi
 # ★상태 파생(CS-3①): 성공/실패 문안이 관측 결과에서 갈린다. 실패 경로는 '발화됨'을 절대 말하지 않고
 #   런 로그 경로를 안내한다.
 if [ -n "$FIRE_FAIL" ]; then
-  ( cys feed push --kind bootstrap-fail --title "부트스트랩 발화 실패" \
-      --body "role-bootstrap 훅이 javis_bootstrap.py 발화에 실패했습니다($FIRE_FAIL). 로그: $LOG" >/dev/null 2>&1 \
-    || cys send --queued --to master "[부트 발화 실패] $FIRE_FAIL — 로그: $LOG" >/dev/null 2>&1 ) &
-  "$CYS_PY" -c 'import json,sys
+  # ★W-A0: 인라인 사본 → _notify_bg 통일(파이프 분리·데드라인 동승). send 폴백은 "[제목] 본문"
+  #   형태가 되지만 정보량($FIRE_FAIL·$LOG)은 그대로다.
+  _notify_bg "부트스트랩 발화 실패" \
+    "role-bootstrap 훅이 javis_bootstrap.py 발화에 실패했습니다($FIRE_FAIL). 로그: $LOG"
+  "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 발화 실패 — 상태 파생 보고] \"너는 마스터다\" 선언은 감지했으나 "
       "javis_bootstrap.py 발화가 실패했다(사유: %s). 팀은 뜨지 않았다 — 부트가 시작됐다고 "
       "보고하지 마라(성공 문구 인용 금지). "
@@ -544,7 +597,7 @@ CHECK_WINDOW_S="$("$CYS_PY" "$PACK/bin/javis_budget.py" --note-check-window 2>/d
 #   master 를 추가해 숫자를 맞추는 것은 금지 방향 ②(레거시 master 부트 사망).
 TEAM_ROSTER="$("$CYS_PY" "$PACK/bin/javis_orchestra.py" --note-team-roster 2>/dev/null)"
 [ -n "$TEAM_ROSTER" ] || TEAM_ROSTER="필수 역할 전원+master(로스터 모듈 미소비 — javis_orchestra 확인)"
-"$CYS_PY" -c 'import json,sys
+"$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
 note=("[결정론 부트스트랩 발화됨 — 하네스 강제] 실행 상태 통보 — 이미 일어난 일이다. "
       "이 문단을 넣은 것은 모델이 아니라 이 컴퓨터에 설치된 프로그램의 훅(%s/hooks/role-bootstrap.sh)이고, "
       "원문을 열어 대조해도 된다. "

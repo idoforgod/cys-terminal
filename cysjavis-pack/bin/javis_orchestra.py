@@ -86,6 +86,21 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
+# ★로케일 비의존 I/O(W-A4 · 선례 javis_bootstrap.py R3/D-IMPL-3 · javis_detect.py G9 · javis_mission.py):
+#   ANSI 코드페이지가 UTF-8 이 아닌 Windows(한국어 cp949·서구 cp1252·일본 cp932)에서 stdout 이
+#   파이프로 캡처되면(부트 체인 ⑤ 가 check 출력을 캡처하는 경로가 정확히 그것) `✓`/`✗`/`⚠`/`↳`·`—`
+#   또는 첫 한글 출력에서 UnicodeEncodeError 로 즉사한다 — 실측: PYTHONIOENCODING=cp949 에서
+#   `--note-team-roster` 가 U+2014(—) position 66 크래시. 팀이 실제로 5개 다 떠 있어도 ⑤ 의
+#   24회 재시도가 전부 같은 크래시로 죽어 부트 exit 6·완료 마커 미기록(허위 실패)이 됐다.
+#   출력 인코딩만 고정한다 — 판정 로직·exit code 무접촉. errors="replace" 라 최악에도 '깨진
+#   글자'일 뿐 크래시가 아니다. try/except 는 reconfigure 부재(구형 파이썬·비 TextIOWrapper
+#   스트림) 허용 — 형태는 선례와 자구 동일(사본 드리프트 방지).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
 # ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
 # 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
@@ -328,12 +343,38 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def _cys_status_timeout_s():
+    """cys_status 서브프로세스 상한 — javis_budget leaf `CYS_STATUS_TIMEOUT_S` 파생(W-A4).
+
+    종전 하드코딩 10 은 예산 위반이었다: LEAF_FLOORS 의 냉시작 실측 하한이 12 고, 그 주석이
+    이미 'orchestra.cys_status' 를 소비자로 명기하는데 실물만 10 으로 더 작았다(장부↔실물
+    사본 드리프트). 데몬 냉시작·프로세스 표 refresh 로 status 가 10~12s 걸리는 창에서 정상
+    데몬이 None(판정 불가)으로 접혀 check exit 2 오귀속을 만든다.
+    ★짝 사본 배선 완료(W-B1 ④ · W-A4b 후속 · 2026-08-21): javis_boot_node.cys_status 도
+    이제 같은 leaf 를 소비한다 — `timeout=budget("CYS_STATUS_TIMEOUT_S", 12)` (그 파일의
+    budget() 헬퍼 경유 · import 실패 시 leaf 하한 12 명시 폴백). 두 사본이 '값이 우연히
+    같은' 상태에서 '**같은 leaf 를 보는**' 상태로 승격됐다 — leaf 가 12 에서 움직이면
+    이제 양쪽이 함께 움직인다(사본 드리프트 소멸 · tests/test_seat_latch_negation.py 가
+    배선 사실을 기계 대조). cys_list_rows 등 나머지 cys RPC 하드코딩은 W-B1 범위 밖이다
+    (티켓이 지정한 leaf 는 status 하나 — CYS_LIST_TIMEOUT_S 는 leaf 15 로 현행 12 와 값이
+    달라, 배선이 곧 동작 변경이라 별도 티켓 소유).
+    import 실패(부서 팩 결손·팩 스큐)는 leaf 하한 12 명시 폴백 — 예산 모듈 부재가 새 크래시
+    지점이 되면 안 된다(선례: 같은 파일 _boot_node_outer_timeout · javis_bootstrap._budget_leaf).
+    """
+    try:
+        import javis_budget as _b
+        return float(_b.leaf("CYS_STATUS_TIMEOUT_S"))
+    except Exception:
+        return 12.0
+
+
 def cys_status():
     cys = shutil.which("cys")
     if not cys:
         return None
     try:
-        r = subprocess.run([cys, "status", "--json"], capture_output=True, timeout=10)
+        r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                           timeout=_cys_status_timeout_s())
         if r.returncode != 0:
             return None
         return json.loads(r.stdout.decode("utf-8", "replace"))
@@ -439,6 +480,81 @@ def check_verdicts(status):
         verdicts[r] = {"satisfied": satisfied, "grade": grade, "filler": filler,
                        "native": native, "why": "%s · %s" % (why, greason)}
     return verdicts, roster
+
+
+def _shared_verdict_deficit(status, requery=None, tick_s=None):
+    """★부트 경로 전용 결손 산출(W-B1 ③) — (결손 bool, 사유) | (None, 소비불가 사유).
+
+    check_verdicts(⑤check 의 판정 코어)를 **소비만** 하고 그 satisfied 를 재정의하지 않는다.
+    ⑤check 와의 유일한 의도적 차이 = **unknown 등급의 계상 방향**:
+      · ⑤check: unknown = 충족측(fail-open — check 는 파괴 행위가 없고, 콜드스타트 창
+        (watchdog 첫 틱 전 = 전 좌석 unknown)에서 적색을 내면 위경보·exit 6 라이브락이다)
+      · 결손 산출(여기): unknown = **시한부 해소 후 잔존 시 결손**(스폰측 fail-open —
+        `cys boot` 호출을 유도한다. 죽었는데 프로브만 실패한 좌석이 '충족'으로 접혀 boot 가
+        영영 생략되는 잔여 B3 를 닫는다. 중복 스폰은 boot 락 + `cys boot` 자체의 Unknown
+        시한부 해소 + seat_death_confirmed 죽음확정 게이트가 3중으로 방어한다).
+    ★check_verdicts 본체에 넣지 않는 이유(감사 확정): 결손 판정과 ⑤check 가 같은 함수라
+      **동시에** 뒤집혀, 데몬 콜드스타트 창에서 노드가 다 살아 있는데도 ⑤check 실패 →
+      exit 6 라이브락이 된다. 그래서 갈래는 여기(결손 산출 전용 함수)다 — ⑤ satisfied 불변.
+
+    시한부 해소는 `javis_boot_node.resolve_unknown_for_spawn`(워치독 1주기 대기 → 재조회 1회
+    → 잔존 불명 = 결손 취급)을 **그대로 소비**한다 — `cys boot` 스폰 경로가 이미 쓰는 규약과
+    동일(신술어 발명 금지). 대기 1주기는 **역할 수와 무관하게 1회**다(재조회 status 공유 —
+    unknown 좌석이 N 개라고 5s×N 을 태우면 부트 경로 예산이 계약 없이 부푼다).
+
+    ★소비 배선 현황(정직 표기 · 2026-08-21 배선 완료 · W-B3): 이 함수가 **정본**이고
+      소비자는 `javis_bootstrap._shared_verdict_deficit` 위임 래퍼다(④ boot 호출 생략 판정).
+      bootstrap 의 로컬 구현은 `_shared_verdict_deficit_fallback` 으로 개명돼 **구 팩 스큐
+      (이 함수 부재·import 실패·위임 예외) 전용 폴백**으로만 남았고, 폴백 발동은 stderr 1줄로
+      고지된다(조용한 강등 금지). 배선 시 주의 2건은 **둘 다 이행 완료**다:
+      ①반환 계약 (bool|None, 사유) 3자(정본·래퍼·폴백) 동일 — 실측 대조 완료.
+      ②run_bootstrap_health H-PRED-1 의 '결손↔check 차분 0' 계약은 seat_unknown corpus 의
+      **의도된 차분**(check 충족 vs 결손>0)을 예외로 두도록 개정됐고, 배선 실재·폴백 실재·
+      ⑤check satisfied 불변을 그 검체가 함께 핀한다(소비자 0 재발 시 적색).
+
+    requery/tick_s 는 밀폐 테스트 주입(기본: cys_status 재조회 · 워치독 1주기 대기)."""
+    bn = _boot_node()
+    try:
+        verdicts, _roster = check_verdicts(status)
+    except Exception as e:
+        return None, "check_verdicts 소비 불가(%s: %s)" % (type(e).__name__, e)
+    if not verdicts:
+        return None, "check_verdicts 빈 판정(로스터 산출 실패)"
+    missing = [r for r, v in verdicts.items() if not v.get("satisfied")]
+    if missing:
+        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+                      % (", ".join(verdicts), ", ".join(missing)))
+    unknowns = [(r, v.get("filler") or r) for r, v in verdicts.items()
+                if v.get("grade") == (bn.LIVENESS_UNKNOWN if bn is not None else "unknown")]
+    if unknowns and bn is not None:
+        # 워치독 1주기 대기·재조회는 **전 역할 공유 1회**(첫 역할만 tick 대기, 이후 0) —
+        # 재조회 결과를 메모해 같은 status 로 전 unknown 을 재판정한다.
+        fresh = {}
+
+        def _requery():
+            if "st" not in fresh:
+                fresh["st"] = requery() if requery is not None else cys_status()
+            return fresh["st"]
+
+        residual = []
+        for i, (req_role, seat_role) in enumerate(unknowns):
+            grade, why = bn.resolve_unknown_for_spawn(
+                seat_role, _requery, tick_s=(tick_s if i == 0 else 0))
+            if grade == bn.LIVENESS_ABSENT:
+                residual.append("%s(%s)" % (req_role, why))
+        if residual:
+            return True, ("부트 경로 unknown 결손(판정불가 잔존: %s) — 결손 존재 "
+                          "[⑤check satisfied 는 불변·시한부 해소=resolve_unknown_for_spawn]"
+                          % "; ".join(residual))
+        return False, ("공유 판정 충족(의무 %s 전원 — unknown %d건 전부 시한부 해소로 생존 확인)"
+                       " — 결손 0(재선언) [신호=check_verdicts+unknown 시한부 해소]"
+                       % (", ".join(verdicts), len(unknowns)))
+    presumed = [r for r, v in verdicts.items()
+                if v.get("satisfied") and v.get("grade") == "alive_presumed"]
+    note = ("" if not presumed
+            else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
+    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+                   % (", ".join(verdicts), note))
 
 
 # ── check: 4종 의무 노드 생존 판정 ──

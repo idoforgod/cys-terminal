@@ -478,12 +478,41 @@ jobs:
           #   HOME/목 바이너리 하네스라 러너 자기완결(라이브 무접촉) — 3완전 레인 동시 등재(대칭).
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
-                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
+                   test_role_bootstrap_hook test_seat_latch_negation; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
             CYS_PACK_DIR="$(mktemp -d)" python3 "$f"
           done
+          # ★W-CI(2026-08-21): Wave 1 부트 결정론 회귀 핀 2종 편입 — "안 도는 검체는 게이트가
+          #   아니다"(리뷰어 2기 독립 적발: 두 핀 모두 어느 CI 레인에서도 0회 실행이던 격차 봉합).
+          #   ① test_role_bootstrap_hook(위 루프 말미 · 실측 약 45s): 훅 _notify_bg 백그라운드
+          #      파이프 해제(exec fd 분리 + cys_timeout_run 유계·send 폴백)와 ≤0.3s 정렬 창,
+          #      감지기 함수+훅 통합 발화/무시 행렬의 회귀 핀. 격리 HOME·목 cys 하네스라 러너
+          #      자기완결(라이브 무접촉) · 소요의 대부분은 hang 주입 케이스의 유계 대기다
+          #      (내부 subprocess timeout 20~30s 가 상한 — 무한 hang 불가).
+          #   ② javis_detect --self-test(아래 · 실측 0.03s): 감지기 4축 억제(neg·pre·quote·
+          #      quotative)와 무구두점 후속 의문=발화 판정을 corpus 로 핀. corpus 단일 원본
+          #      (tests/fixtures/detect-corpus.json) 로딩 검증 포함 — fixture 가 있는데 불량이면
+          #      폴백 없이 hard fail(조용한 축소 실행 금지).
+          #   3완전 레인(ci-branch·release·pack-release) 동시·대칭 등재. test_role_bootstrap_hook
+          #   은 위 '팩 스위트 레인 대조' 게이트가 레인 이탈을 기계로 잡는다. self-test 는 `test_`
+          #   토큰이 아니라 그 게이트의 시야 밖이다 — 대칭 유지는 3레인 동시 수정 + 이 주석이 지킨다.
+          g="cysjavis-pack/bin/javis_detect.py"
+          [ -f "$g" ] || { echo "감지기 누락: $g (git add 누락 의심)" >&2; exit 1; }
+          echo "== javis_detect --self-test (mac) =="
+          CYS_PACK_DIR="$(mktemp -d)" python3 "$g" --self-test
+          # ★W-CI2(2026-08-21): Wave 2 좌석 래치 회귀 핀 test_seat_latch_negation 편입(위 루프
+          #   말미 · 실측 0.007s·19케이스 · 순수 픽스처·서브프로세스 0·라이브 무접촉) — 리뷰어
+          #   2기 공통 지적: 이 핀이 어느 CI 레인에서도 0회 실행이었다. 봉인 대상은 awakened_at
+          #   래치 부정의 3중 AND(ⓐseat=="empty" ∧ ⓑagent_alive **명시적 false 만** ∧ ⓒ좌석
+          #   나이>readiness 예산 초과)와 ★agent_alive:null(Windows master — claim-role 관측
+          #   등록이 #[cfg(unix)] 라 null 영구)에서의 래치 **유지** 단언 + python↔Rust 파리티
+          #   소스 핀. 낙관적 falsy 역수리가 들어오면 Windows master 래치가 매 check 무효화 →
+          #   결손 오판 → node-recover 가 살아있는 입력창에 주입 → 전 pane 사망(치명 앵커 ④)
+          #   재발 — 그 회귀를 여기서 잡는다. 3완전 레인 동시·대칭 등재 · `test_` 토큰이라 위
+          #   '팩 스위트 레인 대조' 게이트가 레인 이탈을 기계로 잡는다.
 
       # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
       #   그쪽은 "같은 파일을 같게 판정하는가", 여기는 "**애초에 같은 파일을 보는가**"를 묻는다.
@@ -529,3 +558,34 @@ jobs:
         run: |
           set -euo pipefail
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
+
+      # ★W-CI2(2026-08-21 · Wave 2): `cargo test -p cys-app --bins` — GUI env 대칭 핀 편입.
+      #   전수 실측(cargo test grep): cys-app(src-tauri) 크레이트 테스트를 돌리는 CI 레인이
+      #   **0곳**이었다 — release.yml 은 루트 크레이트만(--bin cysd·--lib·--bin cys ×2잡),
+      #   windows-health 도 루트만, pack-release 는 cargo test 자체가 없다. 그래서 f524e92 의
+      #   회귀 핀 gui_spawn_env_matches_pane_spawn_env(GUI 직스폰 env 키집합 ⊇ pane 공용 규약
+      #   cys::spawn_env_pairs — cp949 Windows 부트 즉사·HOME 붕괴 재발 차단)를 포함한 bin
+      #   테스트 43종 전부가 CI 밖이었다. 크레이트명 cys-app 은 src-tauri/Cargo.toml 실측값.
+      #   위 리허설과 같은 A10 순서를 따라 릴리스 레인 직행은 하지 않는다 — 이 스텝 1사이클
+      #   green 후 release.yml 승격 검토. pack-release(ubuntu) 편입은 부적격: tauri 스택이
+      #   시스템 webkit 계 의존을 요구하고 그 레인은 manifest emit 용 `cys` 만 빌드한다.
+      # ⚠스텁 스테이징 근거(실측 2026-08-21): tauri-build 2.6.2 는 bundle 자원(externalBin
+      #   사이드카·resources·frontendDist)의 **실존만** 검사하고 이 잡은 번들·webview 를 만들지
+      #   않는다. ui/dist·binaries·resources·runtime 은 전부 .gitignore 라 신선 체크아웃에 없고,
+      #   없으면 빌드 스크립트가 "resource path … doesn't exist" 로 즉사한다(실측). bundle-prep
+      #   전체 실행(UI bun 빌드+release 빌드)은 이 레인 범위 밖(파일 머리 주석)이라 빈 스텁으로
+      #   존재 계약만 충족한다 — 스텁 환경 신선 체크아웃에서 43/43 통과 실측(자원 내용 무의존).
+      #   touch 는 기존 파일을 절단하지 않아 실물 스테이징이 있는 로컬 재현과도 공존한다.
+      # 예산: 콜드 시 tauri 의존 그래프 추가 빌드 수 분(위 Rust cache 가 흡수) · 웜 실측 1s 미만.
+      - name: cargo test -p cys-app --bins (GUI env 대칭 핀 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 핀 실존 단언(이 리포 관례) — cargo test 필터는 0매치도 초록이라 존재를 먼저 못박는다.
+          grep -q "fn gui_spawn_env_matches_pane_spawn_env" src-tauri/src/main.rs \
+            || { echo "GUI env 대칭 핀 부재: src-tauri/src/main.rs (f524e92 회귀·git add 누락 의심)" >&2; exit 1; }
+          mkdir -p ui/dist src-tauri/binaries src-tauri/resources src-tauri/runtime
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          touch "src-tauri/binaries/cys-$triple" "src-tauri/binaries/cysd-$triple" \
+                src-tauri/resources/pack.tar.gz src-tauri/resources/pack-manifest.json
+          CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app --bins -- --test-threads=1

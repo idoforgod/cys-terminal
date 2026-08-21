@@ -657,7 +657,8 @@ jobs:
           # ★test_bootstrap_chain 등재(2026-08-12 R3 확정 — 위 build 레그와 동일 사유).
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
-                   test_bootstrap_chain test_snapshot; do
+                   test_bootstrap_chain test_snapshot \
+                   test_role_bootstrap_hook test_seat_latch_negation; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="
@@ -666,6 +667,28 @@ jobs:
               exit 1
             fi
           done
+          # ★W-CI(2026-08-21): Wave 1 부트 결정론 회귀 핀 2종 편입(3완전 레인 동시·대칭 —
+          #   ci-branch·pack-release 와 같은 커밋). 훅 role-bootstrap.sh 와 감지기 javis_detect.py
+          #   는 이 잡이 tar·서명해 배송하는 팩 내용물이라 서명 전 차단이 정위치다.
+          #   ① test_role_bootstrap_hook(위 루프 말미): _notify_bg 파이프 해제·≤0.3s 정렬 창·발화
+          #      행렬 핀 — 실측 약 45s(hang 주입 케이스의 내부 subprocess timeout 20~30s 유계가
+          #      상한). 분 단위 cargo 빌드가 지배하는 이 잡에서 지연 부담 없음 판단.
+          #   ② 감지기 self-test(실측 0.03s): 4축 억제(neg·pre·quote·quotative) corpus +
+          #      단일 원본 fixture(detect-corpus.json) 로딩 검증 — fixture 불량 시 hard fail.
+          echo "== [pack] javis_detect 4축 감지기 self-test(corpus 단일 원본) =="
+          g="cysjavis-pack/bin/javis_detect.py"
+          [ -f "$g" ] || { echo "감지기 누락: $g (git add 누락 의심)" >&2; exit 1; }
+          if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$g" --self-test; then
+            echo "::error::[pack] javis_detect self-test 실패 — 감지기 4축 억제 회귀. 서명 전 차단." >&2
+            exit 1
+          fi
+          # ★W-CI2(2026-08-21): Wave 2 좌석 래치 회귀 핀 test_seat_latch_negation 편입(위 루프
+          #   말미 · 실측 0.007s·19케이스 · 순수 픽스처·라이브 무접촉 — ci-branch·pack-release
+          #   와 같은 커밋·3완전 레인 동시 대칭). 판정 원본 javis_orchestra.py·javis_boot_node.py
+          #   가 이 잡이 tar·서명해 배송하는 팩 내용물이라 서명 전 차단이 정위치다. 봉인:
+          #   awakened_at 래치 부정 3중 AND + ★agent_alive:null(Windows master) 래치 유지 +
+          #   python↔Rust 파리티 소스 핀 — 낙관적 falsy 역수리 = Windows 전 pane 사망(치명 앵커
+          #   ④) 재발 경로를 서명 전에 차단한다.
           # ★todo 스캔 집합 파리티(S18) — 파서 파리티와 다른 표면("같은 파일을 보는가").
           echo "== [pack] todo 스캔 집합 2언어 파리티(C1·C2 동일 파일 집합) =="
           hs="cysjavis-pack/bin/tests/parity_todo_scan.py"
