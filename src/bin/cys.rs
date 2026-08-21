@@ -12653,10 +12653,10 @@ mod tests {
         // Windows 훅 명령(역슬래시·quote) 정규화 — 백슬래시 base 와 명령 모두
         assert_eq!(
             dept_pack_of_command(
-                "bash \"C:/Users/u/.cys/pack-dept-sales/hooks/a.sh\"",
-                std::path::Path::new("C:\\Users\\u\\.cys")
+                "bash \"C:/Users/user/.cys/pack-dept-sales/hooks/a.sh\"",
+                std::path::Path::new("C:\\Users\\user\\.cys")
             ),
-            Some(std::path::PathBuf::from("C:\\Users\\u\\.cys").join("pack-dept-sales"))
+            Some(std::path::PathBuf::from("C:\\Users\\user\\.cys").join("pack-dept-sales"))
         );
         assert_eq!(dept_pack_of_command("sh /h/.cys/pack/hooks/a.sh", base), None, "base 팩 무탐지");
         assert_eq!(dept_pack_of_command("sh /h/.cys/pack-dept-", base), None, "빈 부서명");
