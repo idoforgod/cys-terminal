@@ -5867,6 +5867,66 @@ def h_w5_p2():
     return "deadman 1건 → push 1 · 이후 5주기 재발화 0 · 독자 판정 경로 부재"
 
 
+# ── P2b v1 침묵 오라벨 강등(결함 8) ──────────────────────────────────────
+@specimen("H-W5-P2b", "W5", "v1 오라벨 — reason='master silent' 는 push 승격 0 · 대장 기록만", ["D6"])
+def h_w5_p2b():
+    #   v1 데몬은 "출력 없음"(오너 입력 대기 포함)을 master.deadman reason="master silent" 로
+    #   발행한다 — 사망이 아닌 침묵 라벨. 게이트가 이를 critical 사망으로 승격하면 흔한 대기
+    #   상태마다 기상이 울린다. 가드는 skip 하되 관측(대장)은 남겨야 한다 — 무해화≠침묵.
+    G = _w5_mod()
+    rep = _w5_report(live=[{"role": "master", "idle": 10, "status_age": 10, "tokens": 1}])
+    dead = {"name": "master.deadman", "seq": 41,
+            "payload": {"reason": "master silent", "idle_secs": 912}}   # v1 실제 wire 형태(role 無)
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd, r, clk).run()                     # baseline
+        clk.tick()
+        r.events.append(dead)
+        for _ in range(6):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(len(r.master_pushes) == 0,
+             "silent 오라벨이 push 로 승격됨(%d건 — 오너 대기마다 기상)" % len(r.master_pushes))
+        need(not [e for e in r.enqueues if (e[1] or "").startswith("gate-death")],
+             "silent 오라벨이 사망 wake 경로를 탐: %r" % (r.enqueues,))
+        need(not [k for k in _w5_badges(sd) if "gate-death" in k], "silent 오라벨이 badge 승격됨")
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(not any(x.startswith("death:") for x in reasons),
+             "silent 오라벨이 사망 대장으로 기록됨: %r" % reasons)
+        need(any(x.startswith("death_skip:") for x in reasons),
+             "skip 정보 기록 부재(무해화가 관측 침묵이 됨): %r" % reasons)
+    return "silent 오라벨 1건 → push 0 · badge 0 · 대장 death_skip 기록만"
+
+
+# ── P2c 구조 증거 사유는 여전히 사망 — 가드가 reason 키 존재로 과잉 강등하지 않는다 ──
+@specimen("H-W5-P2c", "W5", "reason='master surface gone' 은 여전히 push 1 — 과잉 강등 금지", ["D6"])
+def h_w5_p2c():
+    #   가드의 계약은 "master silent" 정확 일치 한정이다. reason 키가 있다는 이유만으로
+    #   구조 증거 사유(surface gone/exited)까지 강등하면 진짜 사망에서 기상 채널이 소멸한다.
+    G = _w5_mod()
+    rep = _w5_report(live=[{"role": "master", "idle": 10, "status_age": 10, "tokens": 1}])
+    dead = {"name": "master.deadman", "seq": 41,
+            "payload": {"role": "worker", "reason": "master surface gone"}}
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd, r, clk).run()                     # baseline
+        clk.tick()
+        r.events.append(dead)
+        for _ in range(6):
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(len(r.master_pushes) == 1,
+             "구조 증거 사망 push 가 정확히 1건이 아니다(%d건)" % len(r.master_pushes))
+        need(r.master_pushes[0][4] == "critical", r.master_pushes[0])
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(any("death:worker" in x for x in reasons), "사망 대장 기록 없음: %r" % reasons)
+        need(not any(x.startswith("death_skip:") for x in reasons),
+             "구조 증거 사유가 skip 됨(과잉 강등): %r" % reasons)
+    return "surface-gone 1건 → push 1(critical) · skip 0 — 가드는 silent 정확 일치 한정"
+
+
 # ── P3 시스템 데드락 ─────────────────────────────────────────────────────
 @specimen("H-W5-P3", "W5", "시스템 데드락 — 티켓 원장+자기보고만으로 판정(last_output 배제)", ["R2-C4"])
 def h_w5_p3():

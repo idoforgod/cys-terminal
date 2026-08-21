@@ -1185,13 +1185,25 @@ def build_death_warnings(events):
     게이트가 스냅샷 diff 로 사망을 독자 판정하던 갈래(idle-standby-v5 D6)는 W5에서 **폐기**한다.
     같은 사실에 두 개의 판정자를 두면 두 배로 울리고, 두 판정이 갈리면 어느 쪽도 못 믿는다.
     데몬 `master.deadman` 이 유일 판정자이고 게이트는 그것을 소비해 채널(push/badge)로 옮긴다.
+
+    반환 = (warns, info_reasons). info_reasons 는 push 로 승격하지 않은 이벤트의 대장 기록용
+    사유다 — 오라벨 무해화가 침묵이 되지 않도록 관측은 남긴다(대장=상태 파일 층).
     """
-    out = []
+    out, info = [], []
     for ev in events or []:
         if ev.get("name") != "master.deadman":
             continue
         payload = ev.get("payload") or {}
         role = (payload.get("role") or "master")
+        #   ★v1 오라벨 가드(결함 8) — reason=="master silent" 는 사망이 아니라 "출력이 없다"
+        #     (오너 입력 대기 포함)까지 뭉뚱그린 침묵 라벨이다. 침묵을 critical 사망 push 로
+        #     승격하면 흔한 대기 상태마다 CSO 가 기상해 채널 신뢰가 무너진다. 사망으로 믿는
+        #     것은 구조 증거 사유("master surface gone"/"exited")뿐이고, 이 라벨은 대장 기록
+        #     (정보)으로만 남긴다. 배포 스큐 양방향(구 데몬·신 게이트/신 데몬·구 게이트)에서
+        #     안전한 방향은 미발화다 — 침묵 판정의 승계는 데몬 v2 의 master.idle 채널 몫.
+        if payload.get("reason") == "master silent":
+            info.append("death_skip:v1_silent_mislabel(%s)" % role)
+            continue
         out.append(apply_policy({
             "trigger": "death",
             "task": "gate-death-%s" % role,
@@ -1208,7 +1220,7 @@ def build_death_warnings(events):
             #     사망 당사자의 유일한 권위 판정은 deadman 이벤트의 role 이다.
             "avoid_role": role,
         }))
-    return out
+    return out, info
 
 
 # ─────────────────────────── 외부 명령 Runner(주입 가능) ───────────────────────────
@@ -1756,7 +1768,9 @@ class Gate:
         track_usage(counters, report)
         #   노드 사망 = 데몬 deadman 이벤트 소비(중복 채널 제거 · 설계 층2)
         if self._ack_ok:
-            warns += build_death_warnings(self._events)
+            death_warns, death_info = build_death_warnings(self._events)
+            warns += death_warns
+            reasons += death_info
         else:
             reasons.append("deadman_poll_unavailable")
         #   P3 시스템 데드락(last_output 완전 배제)
