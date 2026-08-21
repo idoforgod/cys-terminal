@@ -12,6 +12,7 @@ import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
+import { classifyPendingFeed, CYCLE_VERIFY_NOTE, CYCLE_VERIFY_DISMISS_TITLE } from "./feedclass";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import {
@@ -3800,11 +3801,14 @@ interface FeedItem {
 //   있을 수 있다) — `daemon_issued === undefined` 면 **fail-closed** 로 접두를 본다.
 //   오판 방향이 안전한 쪽이기 때문이다: true 로 잘못 보면 그 항목은 Allow 버튼 대신 점프·치우기
 //   경로로 가고(승인 위조 0), false 로 잘못 보면 팔레트가 아무 효과 없는 승인을 시도한다(W-4 결함
-//   재현). ∴ 모르면 데몬 항목으로 취급한다. 이 한 줄이 저장소에 남은 마지막 접두 리터럴이다.
+//   재현). ∴ 모르면 데몬 항목으로 취급한다. 그 폴백 한 줄(feedclass.ts)이 저장소에 남은
+//   마지막 접두 리터럴이다.
 // ※ 특례 보존: ceo-promote-request 는 kind 가 달라 이 술어에 걸리지 않는다(Allow 경로 그대로).
+// ★W4-B: 판정 본체는 feedclass.ts(classifyPendingFeed)로 이동했다 — cycle-verify 부류
+//   신설과 함께 패널·팔레트 공용 술어를 **테스트 가능한 순수 모듈**로 격상(bun test 핀).
+//   이 함수는 기존 호출처를 위한 얇은 위임이다(의미 무변경).
 function isDaemonDetectedApproval(i: FeedItem): boolean {
-  if (i.kind !== "approval") return false;
-  return i.daemon_issued ?? i.request_id.startsWith("daemon-");
+  return classifyPendingFeed(i) === "daemon-detected";
 }
 
 // 승인 Feed는 Control Center의 '승인 Feed' 탭으로 편입됨(독립 패널 폐기).
@@ -4176,6 +4180,29 @@ function feedReplyErrorText(e: unknown): string {
   return `전송 오류: ${s}`;
 }
 
+// '알림 치우기' 공용 배선(W4-B에서 단일 헬퍼로 추출 — 소비자 둘: daemon-detected ·
+// cycle-verify). decision="dismissed"(판정 어휘 아님 — deny 카운터 비오염 근거는
+// refreshFeed 의 daemon-detected 분기 주석)로 항목만 resolved 로 바꾼다.
+// in-flight 이중클릭 차단 → finally 에서 재활성. ★재렌더는 여기서 부르지 않는다 —
+// feed.item.resolved 이벤트가 refreshFeed 를 이미 부르므로(이벤트 핸들러의 feed 분기)
+// 여기서 또 부르면 클릭 1회당 전체 재렌더가 2회 난다(N 건 정리 = O(N²) DOM 재구성).
+// 배지 갱신은 이벤트 경로에도 있으나(refreshSidebarStatus) 데몬 이벤트 유실 대비로 남긴다
+// — 그것은 목록 DOM 을 만들지 않아 비용이 다르다.
+function wireFeedDismiss(dismiss: HTMLButtonElement, requestId: string) {
+  dismiss.addEventListener("click", async () => {
+    dismiss.disabled = true;
+    try {
+      await invoke("feed_reply", { requestId, decision: "dismissed" });
+    } catch (e) {
+      toast("health", "알림 치우기 실패", feedReplyErrorText(e));
+      refreshFeed(); // 실패 시엔 이벤트가 오지 않으므로 여기서 되돌린다(버튼 상태 복구)
+    } finally {
+      dismiss.disabled = false;
+      refreshSidebarStatus(); // 해소 직후 집계 배지 즉시 갱신
+    }
+  });
+}
+
 // 대기 렌더 상한을 사용자가 명시적으로 푼 상태인가(아래 '더 보기' 버튼) — 되돌리는 경로는
 // **정확히 둘**이다: ①feed 탭에 **진입**할 때(setCcTab 의 feed 분기) ②CC 패널을 **닫을 때**
 // (setCcOpen 의 close 분기). 그 밖의 탭 이동은 되돌리지 않는다 — feed 탭이 아니면 refreshFeed
@@ -4361,24 +4388,29 @@ async function refreshFeed() {
         "이 알림 항목만 목록에서 지웁니다 — 앱에는 아무것도 전달되지 않습니다(pane 종료 등으로 데몬 자동 정리가 닿지 않는 항목의 수동 해소 경로).\n" +
         "⚠ 해당 pane에 승인 프롬프트가 아직 떠 있으면 데몬이 잠시 뒤(최대 1분) 다시 감지해 항목이 재등장합니다 — 정상 동작입니다.\n" +
         "⚠ 치울 때마다 '사람 개입 필요' 방치 경보(approval.stalled)의 대기시간이 처음부터 다시 시작됩니다.";
-      dismiss.addEventListener("click", async () => {
-        // in-flight 이중클릭 차단 → finally 에서 재활성. ★재렌더는 여기서 부르지 않는다 —
-        // feed.item.resolved 이벤트가 refreshFeed 를 이미 부르므로(이벤트 핸들러의 feed 분기)
-        // 여기서 또 부르면 클릭 1회당 전체 재렌더가 2회 난다(N 건 정리 = O(N²) DOM 재구성).
-        // 배지 갱신은 이벤트 경로에도 있으나(refreshSidebarStatus) 데몬 이벤트 유실 대비로 남긴다
-        // — 그것은 목록 DOM 을 만들지 않아 비용이 다르다.
-        dismiss.disabled = true;
-        try {
-          await invoke("feed_reply", { requestId: item.request_id, decision: "dismissed" });
-        } catch (e) {
-          toast("health", "알림 치우기 실패", feedReplyErrorText(e));
-          refreshFeed(); // 실패 시엔 이벤트가 오지 않으므로 여기서 되돌린다(버튼 상태 복구)
-        } finally {
-          dismiss.disabled = false;
-          refreshSidebarStatus(); // 해소 직후 집계 배지 즉시 갱신
-        }
-      });
+      wireFeedDismiss(dismiss, item.request_id); // 클릭 배선 = 공용 헬퍼(주석·근거는 그쪽)
       actions.append(jump, dismiss);
+      el.append(note, actions);
+    } else if (item.status === "pending" && classifyPendingFeed(item) === "cycle-verify") {
+      // ★[W4-B · 결함 7] cycle-verify 는 GUI 에서 판정할 수 없다 — Allow/Deny 를 내린다
+      //  (W-4 기만 버튼 재도입 금지). 근거·분류 우선순위는 feedclass.ts(classifyPendingFeed)
+      //  주석 참조: GUI Allow 는 operator 토큰 경로(pane 미귀속·resolver_surface=None)라
+      //  cycle-agent 의 영수증 검증(cys.rs cycle_receipt_ok — resolver==지정 검증자 대조)이
+      //  거부한다 — 항목만 소모되고 clear 는 실행되지 않으며, 검증자의 정상 reply 기회도
+      //  사라진다. ∴ '지정 검증자 pane 에서만 판정 가능' 안내 + 목록 정리 전용 치우기만
+      //  남긴다(무동작 pending 금지 — daemon-detected 부류와 동일 처방).
+      //  ※ 점프 버튼은 두지 않는다: item.surface_id 는 **cycle 대상** surface 지 판정
+      //  주체(지정 검증자 pane)가 아니다 — 거기로 점프시키면 또 다른 오도가 된다.
+      const note = document.createElement("div");
+      note.className = "fi-meta";
+      note.textContent = CYCLE_VERIFY_NOTE;
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const dismiss = document.createElement("button");
+      dismiss.textContent = "알림 치우기";
+      dismiss.title = CYCLE_VERIFY_DISMISS_TITLE;
+      wireFeedDismiss(dismiss, item.request_id);
+      actions.append(dismiss);
       el.append(note, actions);
     } else if (item.status === "pending") {
       const actions = document.createElement("div");
@@ -5160,12 +5192,17 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   //   조회~실행 사이에 새 항목이 끼어들어도 승인 대상은 여기서 고른 그 항목 하나다.
   // ★데몬 감지 항목은 제외한다 — Allow 가 앱에 닿지 않아(waiter 없음) 사용자를 속이는 버튼이
   //   되기 때문이고, CC 패널이 같은 이유로 이미 Allow 를 없앴다(술어 공유 =
-  //   isDaemonDetectedApproval). 그 항목의 처리 경로는 패널의 '점프 / 알림 치우기'다.
+  //   classifyPendingFeed · feedclass.ts). 그 항목의 처리 경로는 패널의 '점프 / 알림 치우기'다.
+  // ★W4-B(결함 7): cycle-verify 도 제외한다 — 판정자는 지정 검증자 pane 뿐이고, GUI/팔레트
+  //   Allow 는 영수증(resolver) 없는 소모가 되어 cycle 을 안전 중단시킨다(기만 버튼 동일 계급 —
+  //   근거는 feedclass.ts 주석). "standard" 만 승인 가능하다.
   const feedPending = ((await invoke("feed_list", { status: "pending" }).catch(() => null)) as
     | { items: FeedItem[] }
     | null)?.items ?? [];
   // feed.list 는 삽입순(handlers.rs items.iter()) → [0] = 가장 오래된.
-  const approvable = feedPending.filter((i) => i.status === "pending" && !isDaemonDetectedApproval(i));
+  const approvable = feedPending.filter(
+    (i) => i.status === "pending" && classifyPendingFeed(i) === "standard",
+  );
   const oldestApprovable = approvable[0];
   if (oldestApprovable) {
     const rid = oldestApprovable.request_id;

@@ -8881,6 +8881,69 @@ fn handshake_file_line(path: &str, hash: Option<String>) -> String {
     }
 }
 
+/// ★W4-B(결함 7): 검증자 승인 **영수증** 판정 — 순수 함수(데몬 불요·full RPC 없이 테스트).
+///
+/// 승인 영수증 = (request_id 일치는 호출측 폴링이 보장, decision=allow 계열,
+/// `resolver_surface` == **지정 검증자** surface). 종전 코드는 timeout 에는 안전했지만
+/// "누가 allow 했나"를 검증하지 않아 CEO 자동결재·제3자 reply·GUI 버튼이 전부 '검증자
+/// 승인'으로 통용됐다 — resolver 대조가 이를 봉인한다(무검증 clear 차단 · producer≠evaluator).
+///
+/// resolver_surface 의 정의처는 데몬 feed.reply 단일 해소 경로(state.rs
+/// `resolve_feed_item_audited` · W4-A 각인)다. **비-pane 해소 경로는 전부 여기서 거부**되며,
+/// 오진 처방(불필요한 데몬 재시작 등)을 막기 위해 사유를 3분류로 구분한다:
+///   · 키 자체 부재            = 구 데몬(feed.list 가 resolver 를 직렬화하지 않음 — 재시작 필요)
+///   · null + resolver_pid 有  = GUI operator 토큰 등 pane 미귀속 해소(지정 검증자 아님)
+///   · null + resolver_pid 無  = 데몬 내부(stale-clear)·채널 경유 해소(지정 검증자 아님)
+/// Err 는 전부 clear 미실행 안전 중단으로 수렴한다 — 기존 'timeout→clear 미실행' 경로
+/// (호출측 receipt=None 분기)와 같은 방향이다. 거부(deny·dismissed)는 안전 방향이므로
+/// resolver 없이도 즉시 중단한다(allow 한정 검증 — is_self_approval 과 동일 원칙).
+///
+/// ★검증자 워처 상호참조(성찰 MAJOR): javis_cycle_autopilot 이 기동하는 검증자 워처
+/// (javis_cycle_verifier)는 검증자 pane 의 포그라운드 자식이라 `cys feed reply` 시 커널
+/// peer pid 조상 추적(handlers.rs resolve_caller_surface)으로 resolver_surface 가 그 pane
+/// 에 귀속된다(mac 실측 가능). Windows 는 조상 체인 단절이 빈발해(CI windows-health
+/// H-IDENT-1) 귀속 실패 = 영수증 부재 = 안전 중단이 될 수 있다 — 실기 핀은 CI 이관,
+/// 여기선 한계만 명기한다(커밋 Not-tested 참조).
+/// ★위장 한계 정직 표기(3R-A): resolver 는 pane 귀속까지만 증명한다 — 같은 pane 안의 다른
+/// 프로세스가 reply 하면 구분하지 못한다(pane 침해는 별도 위협 등급 · 감사 원장이 사후 추적).
+fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
+    if item["status"].as_str() != Some("resolved") {
+        return Err("영수증 아님(미해소 항목) — clear 중단".into());
+    }
+    let decision = item["decision"].as_str().unwrap_or("(없음)");
+    if !matches!(decision, "allow" | "yes" | "approve") {
+        // deny 계열·dismissed(GUI 목록 치우기) 전부 — 거부는 영수증 불요·즉시 안전 중단.
+        return Err(format!("검증자 거부({decision}) — cycle 중단"));
+    }
+    match item.get("resolver_surface") {
+        None => Err(
+            "allow 영수증에 resolver 없음 — 구 데몬(feed.list 가 resolver_surface 를 \
+             직렬화하지 않음). 팩/바이너리 갱신 후 첫 cycle 전 cysd 재시작 필요 · \
+             비상시 --force-no-verify(위험). clear 중단"
+                .into(),
+        ),
+        Some(v) if v.is_null() => {
+            let via = if item["resolver_pid"].as_u64().is_some() {
+                "GUI operator 토큰 등 pane 미귀속 해소"
+            } else {
+                "데몬 내부(stale)·채널 경유 해소"
+            };
+            Err(format!(
+                "allow 해소 주체가 지정 검증자가 아님({via}) — 판정은 지정 검증자 pane \
+                 에서 `cys feed reply` 로만 유효하다. clear 중단"
+            ))
+        }
+        Some(v) => match v.as_u64() {
+            Some(s) if s == vsid => Ok(()),
+            Some(s) => Err(format!(
+                "resolver=surface:{s} ≠ 지정 검증자 surface:{vsid} — 제3자 해소는 \
+                 영수증이 아니다. clear 중단"
+            )),
+            None => Err(format!("resolver_surface 형식 이상({v}) — clear 중단")),
+        },
+    }
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -9045,7 +9108,10 @@ fn run_cycle_agent(
             let req_id = push["request_id"].as_str().unwrap_or("").to_string();
             inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-            let decision = loop {
+            // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
+            // 검증(cycle_receipt_ok — resolver==지정 검증자 대조)에 넘긴다. Err 는 전부 clear
+            // 미실행 안전 중단(아래 match)이고, timeout(None)의 안전 중단은 종전 그대로다.
+            let receipt = loop {
                 if std::time::Instant::now() >= deadline {
                     break None;
                 }
@@ -9060,15 +9126,17 @@ fn run_cycle_agent(
                     });
                 if let Some(item) = found {
                     if item["status"].as_str() == Some("resolved") {
-                        break item["decision"].as_str().map(String::from);
+                        break Some(cycle_receipt_ok(&item, vsid));
                     }
                 }
             };
-            match decision.as_deref() {
-                Some("allow") | Some("yes") | Some("approve") => {
-                    eprintln!("[cycle] 검증자 승인 — clear 진행")
-                }
-                Some(d) => return Err(format!("검증자 거부({d}) — cycle 중단")),
+            match receipt {
+                Some(Ok(())) => eprintln!(
+                    "[cycle] 검증자 승인 — 영수증 확인(resolver=surface:{vsid}) → clear 진행"
+                ),
+                // 영수증 불충족(거부·구 데몬·비-pane 해소·제3자 스탬프) — 사유는 stderr 로
+                // 그대로 전파되고(run_cycle_agent 말미 eprintln) clear 는 실행되지 않는다.
+                Some(Err(e)) => return Err(e),
                 None => return Err("검증자 응답 없음 (timeout) — clear 중단".into()),
             }
         } else {
@@ -15801,5 +15869,77 @@ mod tests {
             "/r/SESSION_STATE.md (sha256: abc123)",
             "존재 파일의 표기는 종전 계약 그대로여야 한다"
         );
+    }
+
+    // ── W4-B(결함 7): 검증자 승인 영수증 검증 ────────────────────────────────
+
+    /// ★회귀 핀: allow 는 **지정 검증자 pane 의 영수증**(resolver_surface==vsid)일 때만
+    /// 통과한다. 종전 코드는 decision 문자열만 봤다 — CEO 자동결재·GUI Allow 버튼·제3자
+    /// reply 가 전부 '검증자 승인'으로 통용되던 결함 7의 봉인이다. Err 는 전부 clear 미실행
+    /// 중단으로 수렴하며, 기존 'timeout→clear 미실행' 경로는 run_cycle_agent 의
+    /// receipt=None 분기가 그대로 유지한다(이 함수 밖 계약 — 주석 핀).
+    #[test]
+    fn cycle_receipt_requires_designated_verifier() {
+        // 정상 영수증: resolved + allow + resolver==지정 검증자.
+        let ok = json!({"status":"resolved","decision":"allow",
+                        "resolver_surface":7,"resolver_pid":4242});
+        assert!(cycle_receipt_ok(&ok, 7).is_ok());
+        // allow 동의어(yes·approve)도 영수증만 맞으면 통과 — 종전 어휘 계약 보존.
+        for d in ["yes", "approve"] {
+            let it = json!({"status":"resolved","decision":d,"resolver_surface":7});
+            assert!(cycle_receipt_ok(&it, 7).is_ok(), "'{d}' 어휘 계약 소실");
+        }
+        // 제3자 pane 스탬프 → 불일치 거부(두 surface 를 모두 사유에 명시).
+        let third = json!({"status":"resolved","decision":"allow","resolver_surface":9});
+        let e = cycle_receipt_ok(&third, 7).unwrap_err();
+        assert!(
+            e.contains("surface:9") && e.contains("surface:7"),
+            "불일치 사유에 양측 surface 부재: {e}"
+        );
+    }
+
+    /// 오진 3분류 핀(성찰 BLOCKER ③): 키 부재=구 데몬 / null+pid=pane 미귀속(GUI 토큰) /
+    /// null+null=데몬 내부(stale)·채널 — 세 문구가 서로 구분돼야 운영자가 잘못된 처방
+    /// (불필요한 데몬 재시작 등)을 받지 않는다.
+    #[test]
+    fn cycle_receipt_diagnoses_non_pane_resolutions_distinctly() {
+        // ① 구 데몬: resolver_surface 키 자체가 없다(구 feed.list 직렬화).
+        let old = json!({"status":"resolved","decision":"allow"});
+        let e_old = cycle_receipt_ok(&old, 7).unwrap_err();
+        assert!(
+            e_old.contains("구 데몬") && e_old.contains("--force-no-verify"),
+            "구 데몬 안내(재시작·비상 탈출구) 소실: {e_old}"
+        );
+        // ② pane 미귀속 해소: resolver_surface=null 이지만 resolver_pid 는 남는다
+        //    (GUI operator 토큰 — state.rs '사실 그대로' 각인).
+        let token = json!({"status":"resolved","decision":"allow",
+                           "resolver_surface":null,"resolver_pid":4242});
+        let e_token = cycle_receipt_ok(&token, 7).unwrap_err();
+        assert!(e_token.contains("pane 미귀속"), "GUI 토큰 분류 소실: {e_token}");
+        // ③ 데몬 내부·채널: 두 필드 모두 null(stale-clear·채널 미러 — 얇은 래퍼 경로).
+        let internal = json!({"status":"resolved","decision":"allow",
+                              "resolver_surface":null,"resolver_pid":null});
+        let e_int = cycle_receipt_ok(&internal, 7).unwrap_err();
+        assert!(
+            e_int.contains("stale") || e_int.contains("채널"),
+            "데몬 내부·채널 분류 소실: {e_int}"
+        );
+        // 세 문구는 서로 달라야 '3분류'다 — 하나로 뭉개지면 오진 재발.
+        assert!(e_old != e_token && e_token != e_int && e_old != e_int);
+    }
+
+    /// 거부는 영수증 불요·즉시 안전 중단(allow 한정 검증 — is_self_approval 동일 원칙).
+    /// GUI '알림 치우기'(dismissed)도 같은 경로로 수렴한다. 미해소 항목은 영수증이 아니다.
+    #[test]
+    fn cycle_receipt_rejects_deny_and_unresolved() {
+        let deny = json!({"status":"resolved","decision":"deny","resolver_surface":7});
+        assert!(cycle_receipt_ok(&deny, 7).unwrap_err().contains("거부"));
+        let dismissed = json!({"status":"resolved","decision":"dismissed"});
+        assert!(cycle_receipt_ok(&dismissed, 7).unwrap_err().contains("dismissed"));
+        let pending = json!({"status":"pending","decision":null});
+        assert!(cycle_receipt_ok(&pending, 7).is_err(), "미해소 항목이 영수증으로 통용됨");
+        // decision null(형식 이상 해소)도 통과가 아니다 — 측정 불능은 통과가 아니다.
+        let no_decision = json!({"status":"resolved","resolver_surface":7});
+        assert!(cycle_receipt_ok(&no_decision, 7).is_err());
     }
 }
