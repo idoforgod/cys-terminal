@@ -25,7 +25,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         // ★G1(W2-D): 기아 경보(queue.starved) 전용 쿨다운 — depth_high 맵과 별도 축.
         let mut queue_starve_alerted: HashMap<u64, f64> = HashMap::new();
-        let mut deadman_last_alert: f64 = 0.0;
+        // ★G2(W3-A): role 데드맨 상태 — watchdog 태스크 로컬(단일 writer). 구 단일 f64
+        // 디바운스에서 role별 {misses·last_ok·death/idle 디바운스·좌석 점유 관측} 맵으로 승격.
+        let mut deadman = DeadmanTracker::default();
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
         // (learn gaps C12②) 재시작에도 디바운스 창 유지 — state 파일에서 복원.
         let mut learn_stuck_debounce: HashMap<u64, f64> =
@@ -45,10 +47,13 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             let tick = std::panic::AssertUnwindSafe(|| {
                 sys.refresh_processes(ProcessesToUpdate::All, true);
                 // ★watchdog 틱 순서 불변식 — 유일 명문화 지점(앵커는 라인번호가 아니라 함수명):
-                //   refresh_seat_cache → deliver_queued → check_agent_death → check_master_deadman
+                //   refresh_seat_cache → deliver_queued → check_agent_death → check_role_deadman
                 // ★SEAT: 프로세스 표를 갓 refresh 한 이 지점이 좌석 판정의 유일한 write 시점이다.
                 // deliver_queued 보다 **먼저** 갱신해야 같은 틱의 배달이 최신 좌석 사실을 보고,
                 // 사망·데드맨 계열 검사는 그 좌석·프로세스 사실의 소비자라 write 시점 뒤에 온다.
+                // check_role_deadman 은 같은 틱의 신선한 seat_cache 와 check_agent_death 가 갓
+                // 갱신한 agent_seen/agent_exit_notified 상태머신을 읽는다 — 이 순서가 깨지면
+                // 데드맨이 stale 재료로 판정한다(미래 리팩터 시 이 4단 순서를 유지하라).
                 refresh_seat_cache(&daemon, &sys);
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
@@ -62,7 +67,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_feed_backlog(&daemon, &mut feed_backlog_alerted);
                 check_approval_stall(&daemon, &mut approval_stall_fired);
-                check_master_deadman(&daemon, &mut deadman_last_alert);
+                check_role_deadman(&daemon, &mut deadman);
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
@@ -92,6 +97,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
                 zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
                 launch_flag_warned.retain(|sid| live_surface_ids.contains(sid));
+                // role 데드맨 트래커도 현재 감시 role 집합으로 솎는다(24/365 누수 차단 관례).
+                deadman.retain_roles(&deadman_watched_roles());
             });
             if std::panic::catch_unwind(tick).is_err() {
                 daemon.bus.publish(
@@ -541,38 +548,241 @@ fn check_feed_aging(daemon: &Arc<Daemon>, reminded: &mut HashMap<String, f64>) {
     }
 }
 
-/// T2-8 master dead-man: 조직의 단일 장애점인 master 자신의 사망·장기 무출력 감시.
-fn check_master_deadman(daemon: &Arc<Daemon>, last_alert: &mut f64) {
-    let secs = env_u64("CYS_MASTER_DEADMAN_SECS", 900);
-    if secs == 0 {
-        return;
+// ─────────────────────────────────────────────────────────────────────────────
+// ★G2(W3-A) role dead-man v2 — idle 과 death 의 판정 축 분리 (결함 8 봉합)
+//
+// v1은 침묵(last_output 경과) 단독으로 master.deadman(alert)을 발화해 살아있는 zsh를
+// 사망으로 오라벨했다. v2에서 침묵은 정보성 master.idle 로 강등되고, master.deadman 은
+// [surface 소멸 / EOF / 셸 pid 부재 / 에이전트 사망(좌석 빈사)] 프로세스 생존 실패가
+// grace(기본 60s) + 연속 miss 확증(기본 3틱=15s)을 소진했을 때만 발화한다.
+//
+// env 노브(★CYS_ROLE_DEADMAN_* — 이 역할(role) 데드맨 전용. startup-lock 데드맨
+// (deadman.rs)과는 **무관한 별개 서브시스템**이다 — 이름공간 혼동 금지):
+//   CYS_MASTER_DEADMAN_SECS       존치·기본 900 — 의미가 '침묵(idle) 임계'로 정련.
+//                                 0 = idle 신호만 비활성(사망 판정은 fail-closed 로 상시 유지 —
+//                                 v1의 '전체 비활성'에서 의도적으로 축소된 유일한 행동 변경).
+//   CYS_ROLE_DEADMAN_CONFIRM_TICKS 신설·기본 3(최소 1) — DeadCandidate 연속 관측 확증 틱 수.
+//   CYS_ROLE_DEADMAN_GRACE_SECS    신설·기본 60 — 부트/승계 직후 무카운트 창(오살 방지).
+//   CYS_ROLE_DEADMAN_DEBOUNCE_SECS 신설·기본 300 — 현행 하드코딩 5분 디바운스의 승격(기본 불변).
+//   CYS_ROLE_DEADMAN_ROLES         신설·기본 "master" — 감시 role CSV(일반화 opt-in).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 감시 대상 role 집합 — CSV env 의 단일 해석처(check_role_deadman·prune 공유. 이원화 금지).
+fn deadman_watched_roles() -> Vec<String> {
+    let csv = std::env::var("CYS_ROLE_DEADMAN_ROLES").unwrap_or_default();
+    let v: Vec<String> = csv
+        .split(',')
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if v.is_empty() {
+        vec!["master".to_string()]
+    } else {
+        v
     }
-    let Some(sid) = daemon.roles.lock().unwrap().get("master").copied() else {
-        return; // master 역할 미등록 — 데몬 단독 가동 등 정상 상황
-    };
+}
+
+/// ★G2 role 데드맨 트래커 — watchdog 태스크 로컬(단일 writer) role별 상태.
+/// 연속 miss 카운터는 reap_zombie_surfaces 의 zombie_miss 관용구와 동형: 슬립/웨이크의
+/// timestamp 점프에도 N회 **실관측**을 요구해 위양성이 없다.
+#[derive(Default)]
+pub struct DeadmanTracker {
+    /// role → 연속 DeadCandidate 관측 수(Alive/Idle 에서 리셋 · Unknown 은 무증감).
+    misses: HashMap<String, u32>,
+    /// role → 마지막 생존(Alive/Idle) 확정 관측 epoch — 발화 payload 의 last_ok_epoch.
+    last_ok: HashMap<String, f64>,
+    /// role → 마지막 master.deadman 발화 epoch(디바운스).
+    last_death_alert: HashMap<String, f64>,
+    /// role → 마지막 master.idle 발화 epoch(디바운스 — death 와 별도 축).
+    last_idle_alert: HashMap<String, f64>,
+    /// role → 그 role 좌석(surface id)에서 Occupied(자손 존재)를 관측한 적 있는 sid.
+    /// meta 부재 보조축(SeatVacantNoMeta)의 armed 조건 — agent_seen 상태머신의 무meta 판.
+    /// sid 를 저장해 role 이 다른 surface 로 재바인딩되면 자동 해제된다(새 좌석 재관측 요구).
+    seat_seen: HashMap<String, u64>,
+}
+
+impl DeadmanTracker {
+    /// 24/365 누수 차단: 감시 role 집합 밖의 키를 전 맵에서 솎는다(watchdog prune 블록 호출).
+    fn retain_roles(&mut self, roles: &[String]) {
+        self.misses.retain(|r, _| roles.contains(r));
+        self.last_ok.retain(|r, _| roles.contains(r));
+        self.last_death_alert.retain(|r, _| roles.contains(r));
+        self.last_idle_alert.retain(|r, _| roles.contains(r));
+        self.seat_seen.retain(|r, _| roles.contains(r));
+    }
+}
+
+/// ★G2 role dead-man v2: idle(침묵)과 death(프로세스 생존 실패)를 분리 판정한다.
+/// 판정은 순수함수 liveness_verdict(SeatState 인접 정의) — 이 함수는 그 판정의 집행자다.
+/// 절차: role 해소 → grace → 판정 → (Idle=master.idle / DeadCandidate=miss 누적 →
+/// confirm 소진 시 master.deadman). 이벤트명·category("alert")·reason 구값
+/// ("… surface gone"/"… surface exited")은 보존, payload 는 additive 확장.
+/// ★침묵(idle) 단독으로 death 를 발화하는 경로는 존재하지 않는다 — 절대 불변(결함 8).
+fn check_role_deadman(daemon: &Arc<Daemon>, tracker: &mut DeadmanTracker) {
+    let idle_threshold = env_u64("CYS_MASTER_DEADMAN_SECS", 900);
+    let confirm_ticks = env_u64("CYS_ROLE_DEADMAN_CONFIRM_TICKS", 3).max(1) as u32;
+    let grace_secs = env_u64("CYS_ROLE_DEADMAN_GRACE_SECS", 60);
+    let debounce_secs = env_u64("CYS_ROLE_DEADMAN_DEBOUNCE_SECS", 300);
     let now = now_epoch();
-    if now - *last_alert < 300.0 {
-        return; // 5분 디바운스
-    }
-    let problem = match daemon.get_surface(sid) {
-        None => Some(json!({"reason": "master surface gone"})),
-        Some(s) if s.exited.load(Ordering::Relaxed) => {
-            Some(json!({"reason": "master surface exited"}))
+    for role in deadman_watched_roles() {
+        let Some(sid) = daemon.roles.lock().unwrap().get(&role).copied() else {
+            // 역할 미등록 — 데몬 단독 가동 등 정상 상황(v1 의미 유지). 스테일 카운터 청소.
+            tracker.misses.remove(&role);
+            tracker.seat_seen.remove(&role);
+            continue;
+        };
+        let surface = daemon.get_surface(sid);
+        // ② grace: 부트·승계 직후는 판정 자체를 쉰다(무증감 — 오살 방지). 앵커는
+        // max(master_claimed_at(master 한정), created_at). surface 소멸 시 created_at 부재 →
+        // 데몬 내부 사실(gone)이라 즉시 카운트 대상.
+        let claimed = if role == "master" {
+            daemon.master_claimed_at.lock().unwrap().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let created = surface.as_ref().map(|s| s.created_at).unwrap_or(0.0);
+        if now - claimed.max(created) < grace_secs as f64 {
+            continue;
         }
-        Some(s) => {
-            let idle = s.last_output.lock().unwrap().elapsed().as_secs();
-            if idle >= secs {
-                Some(json!({"reason": "master silent", "idle_secs": idle}))
+        // meta 부재 보조축 arming: 이 role 좌석(sid)에서 Occupied 를 한 번이라도 관측했는가.
+        let seat = surface
+            .as_ref()
+            .map(|s| SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)))
+            .unwrap_or(SeatState::Unknown);
+        if seat == SeatState::Occupied {
+            tracker.seat_seen.insert(role.clone(), sid);
+        }
+        let seat_occupied_seen = tracker.seat_seen.get(&role) == Some(&sid);
+        // 셸 생존 입력은 state::pid_alive 단일 정의처(liveness_verdict doc 의 권위 규정).
+        let shell_alive = surface
+            .as_ref()
+            .map(|s| crate::state::pid_alive(s.pid))
+            .unwrap_or(false);
+        let verdict = liveness_verdict(
+            surface.as_deref(),
+            seat,
+            shell_alive,
+            seat_occupied_seen,
+            idle_threshold,
+        );
+        // 발화 payload 공통 재료(inputs) — 판정 축·입력값을 전부 기록(관측 가능성 요구 b).
+        let agent_name: Option<String> = surface
+            .as_ref()
+            .and_then(|s| s.agent_meta.lock().unwrap().as_ref().map(|(a, _)| a.clone()));
+        let agent_alive: Option<bool> = surface.as_ref().and_then(|s| {
+            if agent_name.is_some() && s.agent_seen.load(Ordering::Relaxed) {
+                Some(!s.agent_exit_notified.load(Ordering::Relaxed))
             } else {
-                None
+                None // meta 부재 또는 미기동(관측 이전) = 미측정(null) — 측정 불능 ≠ 사망
+            }
+        });
+        let status_age_secs: Option<f64> = surface.as_ref().and_then(|s| {
+            s.agent_status
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|st| (now - st.updated_at).max(0.0))
+        });
+        let idle_secs: u64 = surface
+            .as_ref()
+            .map(|s| s.last_output.lock().unwrap().elapsed().as_secs())
+            .unwrap_or(0);
+        match verdict {
+            LivenessVerdict::Alive => {
+                tracker.last_ok.insert(role.clone(), now);
+                tracker.misses.remove(&role);
+            }
+            LivenessVerdict::Unknown => {
+                // ③ 측정 불능 ≠ 사망 ≠ 생존: misses 증가도 last_ok 갱신도 하지 않는다.
+                // (Unknown 이 카운터를 리셋하면 간헐 프로브 실패가 진짜 사망 확증을 세탁한다.)
+            }
+            LivenessVerdict::Idle { idle_secs } => {
+                // 생존 확정 + 침묵 — 정보성 master.idle 만. death 카운터는 생존으로 리셋.
+                tracker.last_ok.insert(role.clone(), now);
+                tracker.misses.remove(&role);
+                let last = tracker.last_idle_alert.get(&role).copied().unwrap_or(0.0);
+                if now - last >= debounce_secs as f64 {
+                    tracker.last_idle_alert.insert(role.clone(), now);
+                    // category 는 GUI onDaemonEvent 폴백 토스트 레인("watchdog"/"health"/"feed")
+                    // 부재 값 "info" — idle 은 alert 가 아니다(무한 토스트 차단 · G2 BLOCKER 결정).
+                    daemon.bus.publish(
+                        "master.idle",
+                        "info",
+                        Some(sid),
+                        json!({
+                            "role": role, "surface_ref": cys::surface_ref(sid),
+                            "axis": "silence", "idle_secs": idle_secs,
+                            "threshold_secs": idle_threshold, "debounce_secs": debounce_secs,
+                            "process_alive": true, "agent_alive": agent_alive,
+                            "last_output_epoch": now - idle_secs as f64,
+                            "severity": "info",
+                        }),
+                    );
+                }
+            }
+            LivenessVerdict::DeadCandidate { axis } => {
+                // ④ 에이전트 계열 축 한정 소켓측 반증: confirm 창 내 status.set 자기보고가
+                // 있으면 생존 증거로 인정(Alive 취급). 부재는 증거가 아니다 — fail-safe 방향.
+                let confirm_window = (confirm_ticks as u64 * WATCHDOG_INTERVAL_SECS) as f64;
+                let socket_rebuts = matches!(
+                    axis,
+                    DeadmanAxis::AgentDead | DeadmanAxis::SeatVacantNoMeta
+                ) && status_age_secs.is_some_and(|age| age <= confirm_window);
+                if socket_rebuts {
+                    tracker.last_ok.insert(role.clone(), now);
+                    tracker.misses.remove(&role);
+                    continue;
+                }
+                let misses = tracker.misses.entry(role.clone()).or_insert(0);
+                *misses += 1;
+                let misses = *misses;
+                if misses < confirm_ticks {
+                    continue; // ⑤ 확증 미소진 — 발화 금지(연속 실관측 N회 요구)
+                }
+                let last = tracker.last_death_alert.get(&role).copied().unwrap_or(0.0);
+                if now - last < debounce_secs as f64 {
+                    continue; // role별 디바운스(기본 300s — v1 하드코딩 승격)
+                }
+                tracker.last_death_alert.insert(role.clone(), now);
+                // reason: 진짜 사망 2계열 구값 보존(role=master 에서 v1 문자열과 동일).
+                // "master silent" reason 은 소멸 — 그 소멸이 결함 8 수정의 본질.
+                let reason = match axis {
+                    DeadmanAxis::SurfaceGone => format!("{role} surface gone"),
+                    DeadmanAxis::SurfaceExited => format!("{role} surface exited"),
+                    DeadmanAxis::ShellProcDead => "shell process dead".to_string(),
+                    DeadmanAxis::AgentDead => "agent process dead".to_string(),
+                    DeadmanAxis::SeatVacantNoMeta => "agent seat empty (no meta)".to_string(),
+                };
+                daemon.bus.publish(
+                    "master.deadman",
+                    "alert",
+                    Some(sid),
+                    json!({
+                        "reason": reason,
+                        "axis": axis.as_str(),
+                        "role": role,
+                        "surface_ref": cys::surface_ref(sid),
+                        // 전 축 공통 top-level(HUD p.get("idle_secs") 소비 연속성)
+                        "idle_secs": idle_secs,
+                        "inputs": {
+                            "pid": surface.as_ref().map(|s| s.pid),
+                            "seat_state": surface.as_ref().map(|_| seat.as_str()),
+                            "agent_meta": agent_name,
+                            "agent_alive": agent_alive,
+                            "status_age_secs": status_age_secs,
+                        },
+                        "thresholds": {
+                            "confirm_ticks": confirm_ticks,
+                            "tick_secs": WATCHDOG_INTERVAL_SECS,
+                            "grace_secs": grace_secs,
+                            "debounce_secs": debounce_secs,
+                        },
+                        "misses": misses,
+                        "last_ok_epoch": tracker.last_ok.get(&role).copied().unwrap_or(0.0),
+                    }),
+                );
             }
         }
-    };
-    if let Some(payload) = problem {
-        *last_alert = now;
-        daemon
-            .bus
-            .publish("master.deadman", "alert", Some(sid), payload);
     }
 }
 
@@ -1490,6 +1700,122 @@ impl SeatState {
             SeatState::Unknown => "unknown",
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★G2(W3-A) 생존 판정 순수함수 — idle(침묵)과 death(프로세스 생존 실패)의 축 분리
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// master.deadman v2 의 사망 판정 축. **침묵(silence)은 이 enum 에 없다** — 침묵이
+/// 사망 사유가 될 수 없음을 타입으로 봉인한다(결함 8: 살아있는 zsh 침묵 → 사망 오라벨).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadmanAxis {
+    /// roles 매핑은 있는데 surface 가 테이블에서 소멸(데몬 내부 사실 — Unknown 없음).
+    SurfaceGone,
+    /// surface 의 셸이 EOF 로 자력종료(exited 플래그 — 데몬 내부 사실).
+    SurfaceExited,
+    /// 셸 pid 커널 프로브 사망(exited 미설정 half-open — reap_zombie 와 같은 층의 관측).
+    ShellProcDead,
+    /// 좌석 빈사: 셸은 생존인데 에이전트만 죽음 — check_agent_death 의
+    /// agent_seen/agent_exit_notified 상태머신(같은 틱 sysinfo 관측) 재사용.
+    AgentDead,
+    /// meta 부재 보조축(수동 기동 master 사각 봉인): role 좌석에서 Occupied(자손 존재)를
+    /// 관측한 적 있는데 지금 Empty ∧ agent_meta 부재 — 상태머신이 못 보는 에이전트 사망 후보.
+    SeatVacantNoMeta,
+}
+
+impl DeadmanAxis {
+    /// payload.axis 노출용 문자열(소비자는 name 키잉 — axis 는 additive 관측 필드).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadmanAxis::SurfaceGone => "surface_gone",
+            DeadmanAxis::SurfaceExited => "surface_exited",
+            DeadmanAxis::ShellProcDead => "shell_proc_dead",
+            DeadmanAxis::AgentDead => "agent_dead",
+            DeadmanAxis::SeatVacantNoMeta => "seat_vacant_no_meta",
+        }
+    }
+}
+
+/// role 좌석 생존 판정 결과 — 순수(부작용 0). Idle 은 Alive 의 하위 상태(생존 확정 + 침묵)라
+/// death 카운터를 리셋하며, Unknown(프로브 미도달)은 '측정 불능 ≠ 사망 ≠ 생존'으로
+/// 소비처가 무증감(카운트도 리셋도 없음)을 집행한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessVerdict {
+    Alive,
+    Unknown,
+    Idle { idle_secs: u64 },
+    DeadCandidate { axis: DeadmanAxis },
+}
+
+/// ★순수 판정자(이 파일의 기존 관례: T5-2 무음 크래시 술어·alerts::evaluate 와 동형) —
+/// 부작용 0·테스트 핀 가능. 생존 권위는 데몬 내부 사실(exited)·커널 프로브·check_agent_death
+/// 상태머신·seat_cache 재사용 — pgrep 금지 제약을 원천 충족.
+///
+/// 입력 계약:
+/// - `shell_pid_alive`: **state::pid_alive 단일 정의처**(kill-0/OpenProcess 커널 프로브)로
+///   호출자가 계산한다. ★도구 출력 충돌 시 권위: sysinfo 표(seat)와 이 값이 어긋나면
+///   셸 생존은 pid_alive 가 이긴다(seat 는 meta 부재 보조축 판정에만 쓰인다).
+/// - `seat_occupied_seen`: 이 role 좌석(동일 sid)에서 Occupied 를 관측한 적 있는가 —
+///   DeadmanTracker 가 기억(무meta 좌석의 agent_seen 판). false 면 '한 번도 에이전트가
+///   없던 맨 셸'이라 Empty 여도 사망 후보가 아니다(결함 8 재발 차단의 핵심 경계).
+///
+/// 진리표(위에서 아래로 첫 매치):
+///   surface 부재                            → DeadCandidate(SurfaceGone)
+///   exited                                  → DeadCandidate(SurfaceExited)
+///   !shell_pid_alive                        → DeadCandidate(ShellProcDead)
+///   meta ∧ agent_seen ∧ agent_exit_notified → DeadCandidate(AgentDead)
+///   무meta ∧ armed ∧ seat=Empty             → DeadCandidate(SeatVacantNoMeta)
+///   무meta ∧ armed ∧ seat=Unknown           → Unknown (프로브 미도달 — 무증감)
+///   idle_secs ≥ threshold(>0)               → Idle    (침묵은 여기서 끝 — death 불가)
+///   그 외                                   → Alive
+pub fn liveness_verdict(
+    surface: Option<&crate::state::Surface>,
+    seat: SeatState,
+    shell_pid_alive: bool,
+    seat_occupied_seen: bool,
+    idle_threshold_secs: u64,
+) -> LivenessVerdict {
+    let Some(s) = surface else {
+        return LivenessVerdict::DeadCandidate {
+            axis: DeadmanAxis::SurfaceGone,
+        };
+    };
+    if s.exited.load(Ordering::Relaxed) {
+        return LivenessVerdict::DeadCandidate {
+            axis: DeadmanAxis::SurfaceExited,
+        };
+    }
+    if !shell_pid_alive {
+        return LivenessVerdict::DeadCandidate {
+            axis: DeadmanAxis::ShellProcDead,
+        };
+    }
+    let has_meta = s.agent_meta.lock().unwrap().is_some();
+    if has_meta {
+        // check_agent_death 가 같은 틱에 sysinfo 로 갱신한 상태머신 재사용(판정 이원화 금지).
+        if s.agent_seen.load(Ordering::Relaxed) && s.agent_exit_notified.load(Ordering::Relaxed) {
+            return LivenessVerdict::DeadCandidate {
+                axis: DeadmanAxis::AgentDead,
+            };
+        }
+    } else if seat_occupied_seen {
+        match seat {
+            SeatState::Empty => {
+                return LivenessVerdict::DeadCandidate {
+                    axis: DeadmanAxis::SeatVacantNoMeta,
+                }
+            }
+            SeatState::Unknown => return LivenessVerdict::Unknown,
+            SeatState::Occupied => {}
+        }
+    }
+    // ★침묵은 Idle 로만 사상된다 — DeadCandidate 사유가 될 수 없음이 이 함수의 존재 이유.
+    let idle_secs = s.last_output.lock().unwrap().elapsed().as_secs();
+    if idle_threshold_secs > 0 && idle_secs >= idle_threshold_secs {
+        return LivenessVerdict::Idle { idle_secs };
+    }
+    LivenessVerdict::Alive
 }
 
 /// ★SEAT 1차(커널 사실): 이 좌석에 셸 이외의 자손 프로세스가 있는가.
@@ -5556,6 +5882,459 @@ mod tests {
             load_tombstones_from_disk(&daemon.socket_path).is_empty(),
             "topology.json에 reap 묘비가 영속돼 재부팅 후 4역할 부활이 막힌다"
         );
+    }
+
+    // ─────────── ★G2(W3-A): role dead-man v2 — idle/death 축 분리 회귀 핀 ───────────
+    //
+    // 결함 8의 박제: 살아있는 zsh 의 침묵(임계 20s·침묵 21s)이 master.deadman(alert)으로
+    // 오라벨되던 v1 경로를 타입(LivenessVerdict — 침묵은 Idle 로만 사상)과 절차(grace +
+    // 연속 confirm 소진에서만 death)로 봉인했음을 실측 시나리오 그대로 핀한다.
+    // env 를 만지는 통합 핀은 전부 REAP_ENV_LOCK 직렬화(기본값 의존 테스트 포함 — 경합 차단).
+
+    use super::{check_role_deadman, liveness_verdict, DeadmanAxis, DeadmanTracker, LivenessVerdict};
+
+    /// master role 좌석 하나를 가진 격리 데몬 — (daemon, sid).
+    fn deadman_daemon(tag: &str) -> (Arc<Daemon>, u64) {
+        let daemon = drill_daemon(tag);
+        let sid = spawn_role_surface(&daemon, "master");
+        (daemon, sid)
+    }
+
+    fn events_named(daemon: &Arc<Daemon>, name: &str) -> Vec<serde_json::Value> {
+        daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"] == name)
+            .collect()
+    }
+
+    fn backdate_output(s: &crate::state::Surface, secs: u64) {
+        *s.last_output.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("clock too young for backdate");
+    }
+
+    /// [핀1·결함 8 박제 — 순수 판정자 진리표] 침묵은 어떤 좌석 상태에서도 Idle 로만 사상되고
+    /// DeadCandidate 가 될 수 없다. 실측 시나리오(임계 20s·침묵 21s의 살아있는 zsh) 그대로.
+    #[test]
+    fn liveness_verdict_silence_maps_to_idle_never_death() {
+        let (daemon, sid) = deadman_daemon("lv-idle");
+        let s = daemon.get_surface(sid).unwrap();
+        backdate_output(&s, 21);
+        // 맨 셸(무meta·미arm) — seat=Empty 여도 침묵은 Idle 이다(한 번도 에이전트가 없던 좌석).
+        for seat in [SeatState::Empty, SeatState::Occupied, SeatState::Unknown] {
+            match liveness_verdict(Some(&s), seat, true, false, 20) {
+                LivenessVerdict::Idle { idle_secs } => {
+                    assert!(idle_secs >= 21, "실측 침묵 21s 이상이어야: {idle_secs}")
+                }
+                v => panic!("침묵 단독은 Idle 이어야 한다(결함 8) — got {v:?} (seat={seat:?})"),
+            }
+        }
+        // armed + Occupied 도 침묵이면 Idle(자손 존재 = 생존).
+        assert!(matches!(
+            liveness_verdict(Some(&s), SeatState::Occupied, true, true, 20),
+            LivenessVerdict::Idle { .. }
+        ));
+        // 에이전트 생존(meta·seen·미notified) + 침묵 = Idle — 에이전트 '생각 중' 오살 금지.
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        s.agent_seen.store(true, AtomicOrdering::Relaxed);
+        s.agent_exit_notified.store(false, AtomicOrdering::Relaxed);
+        assert!(matches!(
+            liveness_verdict(Some(&s), SeatState::Empty, true, true, 20),
+            LivenessVerdict::Idle { .. }
+        ));
+        // 임계 0 = idle 신호만 비활성(Alive) — 사망 축 판정은 별개(아래 진리표).
+        *s.agent_meta.lock().unwrap() = None;
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Occupied, true, false, 0),
+            LivenessVerdict::Alive
+        );
+    }
+
+    /// [핀1보강 — 순수 판정자 사망 축 진리표] 4축 + meta 부재 보조축 + Unknown 무증감 값.
+    #[test]
+    fn liveness_verdict_death_axes_truth_table() {
+        let (daemon, sid) = deadman_daemon("lv-axes");
+        let s = daemon.get_surface(sid).unwrap();
+        // surface 소멸(데몬 내부 사실)
+        assert_eq!(
+            liveness_verdict(None, SeatState::Unknown, false, false, 900),
+            LivenessVerdict::DeadCandidate { axis: DeadmanAxis::SurfaceGone }
+        );
+        // 셸 pid 커널 프로브 사망(half-open) — state::pid_alive 입력이 권위
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Occupied, false, false, 900),
+            LivenessVerdict::DeadCandidate { axis: DeadmanAxis::ShellProcDead }
+        );
+        // 좌석 빈사: meta ∧ seen ∧ exit_notified(check_agent_death 상태머신 재사용)
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        s.agent_seen.store(true, AtomicOrdering::Relaxed);
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Empty, true, true, 900),
+            LivenessVerdict::DeadCandidate { axis: DeadmanAxis::AgentDead }
+        );
+        // meta 부재 보조축: armed(Occupied 관측 이력) ∧ 지금 Empty → 후보 / Unknown → 무증감
+        *s.agent_meta.lock().unwrap() = None;
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Empty, true, true, 900),
+            LivenessVerdict::DeadCandidate { axis: DeadmanAxis::SeatVacantNoMeta }
+        );
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Unknown, true, true, 900),
+            LivenessVerdict::Unknown,
+            "armed 좌석의 프로브 미도달은 Unknown(측정 불능 ≠ 사망 ≠ 생존)"
+        );
+        // EOF 자력종료(exited) — 최우선 축(surface 가 있으면)
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        assert_eq!(
+            liveness_verdict(Some(&s), SeatState::Occupied, true, false, 900),
+            LivenessVerdict::DeadCandidate { axis: DeadmanAxis::SurfaceExited }
+        );
+    }
+
+    /// [핀1 통합·결함 8 종결] 살아있는 셸이 임계 20s·침묵 21s 로 몇 틱을 돌아도
+    /// master.deadman 0건 — master.idle(category=info·GUI 폴백 토스트 레인 부재)만 1건(디바운스).
+    #[test]
+    fn deadman_silence_alone_is_idle_not_death() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_MASTER_DEADMAN_SECS", "20"),
+            ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
+        ]);
+        let (daemon, sid) = deadman_daemon("silence");
+        let s = daemon.get_surface(sid).unwrap();
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..5 {
+            backdate_output(&s, 21);
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(
+            events_named(&daemon, "master.deadman").len(),
+            0,
+            "침묵 단독으로 death 발화 — 결함 8 재발"
+        );
+        let idles = events_named(&daemon, "master.idle");
+        assert_eq!(idles.len(), 1, "idle 은 정보성 1건(300s 디바운스)이어야");
+        let e = &idles[0];
+        assert_eq!(e["category"], "info", "GUI category 폴백 토스트 레인(watchdog) 낙하 금지");
+        let p = &e["payload"];
+        assert_eq!(p["axis"], "silence");
+        assert_eq!(p["role"], "master");
+        assert_eq!(p["threshold_secs"], 20);
+        assert_eq!(p["process_alive"], true);
+        assert_eq!(p["severity"], "info");
+        assert!(p["idle_secs"].as_u64().unwrap() >= 21);
+        // 디바운스 해제 후 재발화(정보 신호의 재상기 — death 와 별도 디바운스 축)
+        tracker
+            .last_idle_alert
+            .insert("master".into(), now_epoch() - 301.0);
+        backdate_output(&s, 21);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(events_named(&daemon, "master.idle").len(), 2);
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+    }
+
+    /// [핀2] DeadCandidate 연속 1·2회는 무발화, 3회째(기본 CONFIRM_TICKS)에 1회 발화 + misses==3.
+    #[test]
+    fn deadman_fires_only_after_confirm_ticks() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("confirm");
+        let s = daemon.get_surface(sid).unwrap();
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        check_role_deadman(&daemon, &mut tracker);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(
+            events_named(&daemon, "master.deadman").len(),
+            0,
+            "확증 미소진(2/3) 발화 금지"
+        );
+        check_role_deadman(&daemon, &mut tracker);
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1, "3틱째 확증 소진 발화");
+        assert_eq!(deaths[0]["payload"]["misses"], 3);
+    }
+
+    /// [핀3] Unknown(프로브 미도달) 틱은 misses 증가도 last_ok 갱신도 없다 —
+    /// 간헐 프로브 실패가 사망 확증 카운터를 세탁하지 못한다.
+    #[test]
+    fn deadman_unknown_probe_neither_counts_nor_resets() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("unknown");
+        let s = daemon.get_surface(sid).unwrap();
+        let mut tracker = DeadmanTracker::default();
+        // arm: Occupied 관측(meta 부재 보조축의 무기화) — 생존 틱
+        s.seat_cache.store(SeatState::Occupied.as_u8(), AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        let ok_after_arm = tracker.last_ok.get("master").copied().expect("생존 관측 기록");
+        // Empty 지속 2틱 → miss 2
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(tracker.misses.get("master"), Some(&2));
+        // Unknown 틱 — 증가도 리셋도 없음
+        s.seat_cache.store(SeatState::Unknown.as_u8(), AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(tracker.misses.get("master"), Some(&2), "Unknown 이 카운트하면 안 됨");
+        assert_eq!(
+            tracker.last_ok.get("master").copied(),
+            Some(ok_after_arm),
+            "Unknown 이 last_ok 를 전진시키면 안 됨(측정 불능 ≠ 생존)"
+        );
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+        // Empty 재관측 → miss 3 = 확증 소진 발화(연속 실관측 3회 요구가 세탁되지 않았음의 증명)
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1);
+        assert_eq!(deaths[0]["payload"]["axis"], "seat_vacant_no_meta");
+        assert_eq!(deaths[0]["payload"]["misses"], 3);
+    }
+
+    /// [핀4] miss 누적 중 에이전트 복귀(agent.recovered 경로 = exit_notified 리셋)가
+    /// misses 를 0으로 되돌린다 — 이후 재실패도 3회를 새로 요구.
+    #[test]
+    fn deadman_agent_recovery_resets_misses() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("recovery");
+        let s = daemon.get_surface(sid).unwrap();
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        s.agent_seen.store(true, AtomicOrdering::Relaxed);
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        check_role_deadman(&daemon, &mut tracker);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(tracker.misses.get("master"), Some(&2));
+        // 복귀(check_agent_death 의 agent.recovered 와 동일 상태 전이)
+        s.agent_exit_notified.store(false, AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(tracker.misses.get("master"), None, "복귀 = misses 리셋");
+        // 재사망 2틱 — 새로 세므로 여전히 무발화
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        check_role_deadman(&daemon, &mut tracker);
+        check_role_deadman(&daemon, &mut tracker);
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+    }
+
+    /// [핀5·요구 e] 좌석 빈사(셸 생존·에이전트 사망)는 axis=agent_dead 로 셸 사망과 구분 노출.
+    #[test]
+    fn deadman_agent_dead_axis_when_shell_alive() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("agent-dead");
+        let s = daemon.get_surface(sid).unwrap();
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        s.agent_seen.store(true, AtomicOrdering::Relaxed);
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1);
+        let p = &deaths[0]["payload"];
+        assert_eq!(p["axis"], "agent_dead");
+        assert_eq!(p["reason"], "agent process dead");
+        assert_eq!(p["inputs"]["seat_state"], "empty");
+        assert_eq!(p["inputs"]["agent_alive"], false);
+        assert_eq!(p["inputs"]["agent_meta"], "claude");
+        assert_eq!(p["role"], "master");
+    }
+
+    /// [핀6] v2 payload 계약 전 필드 + surface_exited 의 reason 구값 그대로(하위호환 핀).
+    #[test]
+    fn deadman_payload_contract_v2() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("payload");
+        let s = daemon.get_surface(sid).unwrap();
+        let mut tracker = DeadmanTracker::default();
+        // 생존 1틱 → last_ok 기록(발화 payload 의 last_ok_epoch 실측)
+        check_role_deadman(&daemon, &mut tracker);
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1);
+        let e = &deaths[0];
+        assert_eq!(e["category"], "alert", "이벤트 category 불변(소비자 계약)");
+        let p = &e["payload"];
+        // 하위호환: reason 구값 verbatim (v1 "master surface exited")
+        assert_eq!(p["reason"], "master surface exited");
+        assert_eq!(p["axis"], "surface_exited");
+        assert_eq!(p["role"], "master");
+        assert!(p["surface_ref"].as_str().is_some());
+        assert!(p["idle_secs"].as_u64().is_some(), "top-level idle_secs — HUD 연속성");
+        for key in ["pid", "seat_state", "agent_meta", "agent_alive", "status_age_secs"] {
+            assert!(
+                p["inputs"].as_object().unwrap().contains_key(key),
+                "inputs.{key} 부재"
+            );
+        }
+        assert_eq!(p["thresholds"]["confirm_ticks"], 3);
+        assert_eq!(p["thresholds"]["tick_secs"], 5);
+        assert_eq!(p["thresholds"]["grace_secs"], 0);
+        assert_eq!(p["thresholds"]["debounce_secs"], 300);
+        assert_eq!(p["misses"], 3);
+        assert!(
+            p["last_ok_epoch"].as_f64().unwrap() > 0.0,
+            "생존 관측이 있었으므로 last_ok_epoch 실측값"
+        );
+    }
+
+    /// [핀7·의도적 변경 박제] CYS_MASTER_DEADMAN_SECS=0 은 idle 신호만 끈다 —
+    /// 사망 판정(fail-closed)은 상시 유지(v1 전체 비활성에서 축소된 유일한 행동 변경).
+    #[test]
+    fn deadman_secs_zero_disables_idle_only() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_MASTER_DEADMAN_SECS", "0"),
+            ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
+        ]);
+        let (daemon, sid) = deadman_daemon("secs-zero");
+        let s = daemon.get_surface(sid).unwrap();
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..4 {
+            backdate_output(&s, 1000);
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(events_named(&daemon, "master.idle").len(), 0, "0 = idle 비활성");
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(
+            events_named(&daemon, "master.deadman").len(),
+            1,
+            "0 이어도 진짜 사망(surface exited)은 발화해야(fail-closed)"
+        );
+    }
+
+    /// [핀8] 발화 후 디바운스(기본 300s) 내 동일 role 재발화 억제, 경과 후 재발화.
+    #[test]
+    fn deadman_debounce() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("debounce");
+        let s = daemon.get_surface(sid).unwrap();
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..5 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 1, "디바운스 내 재발화 억제");
+        // 디바운스 경과 시뮬레이션 → 재발화(계속 죽어있는 role 의 재상기)
+        tracker
+            .last_death_alert
+            .insert("master".into(), now_epoch() - 301.0);
+        check_role_deadman(&daemon, &mut tracker);
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 2, "디바운스 경과 후 재발화");
+        assert_eq!(deaths[1]["payload"]["misses"], 6, "연속 miss 누적 관측치 보존");
+    }
+
+    /// [핀10] grace 창(부트·승계 직후) 내에는 DeadCandidate 도 무카운트 — 오살 방지.
+    #[test]
+    fn deadman_grace_window() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "3600")]);
+        let (daemon, sid) = deadman_daemon("grace");
+        let s = daemon.get_surface(sid).unwrap();
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0, "grace 내 발화 금지");
+        assert_eq!(tracker.misses.get("master"), None, "grace 내 카운트 자체 금지");
+    }
+
+    /// [핀11·소켓 반증] 에이전트 계열 축은 confirm 창 내 status.set 자기보고(소켓 활동)로
+    /// 반증된다 — 활동=생존 증거, 부재는 증거 아님(fail-safe 방향).
+    #[test]
+    fn deadman_socket_activity_rebuts_agent_death() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let (daemon, sid) = deadman_daemon("socket-rebut");
+        let s = daemon.get_surface(sid).unwrap();
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        s.agent_seen.store(true, AtomicOrdering::Relaxed);
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        let fresh = crate::state::AgentStatus {
+            state: "working".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch(),
+        };
+        *s.agent_status.lock().unwrap() = Some(fresh.clone());
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..5 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        assert_eq!(events_named(&daemon, "master.deadman").len(), 0, "신선한 소켓 활동 = 생존");
+        assert_eq!(tracker.misses.get("master"), None, "반증 시 misses 리셋");
+        // 소켓 활동이 낡으면(confirm 창 밖) 반증 소멸 → 정상 확증 경로
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            updated_at: now_epoch() - 1000.0,
+            ..fresh
+        });
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1);
+        assert!(
+            deaths[0]["payload"]["inputs"]["status_age_secs"].as_f64().unwrap() >= 999.0,
+            "발화 payload 에 소켓 나이 실측 기록"
+        );
+    }
+
+    /// [핀12] surface 소멸(roles 매핑만 잔존) — axis=surface_gone·reason 구값 보존.
+    #[test]
+    fn deadman_surface_gone_axis() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
+        let daemon = drill_daemon("gone");
+        daemon.roles.lock().unwrap().insert("master".into(), 424_242);
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1);
+        assert_eq!(deaths[0]["payload"]["axis"], "surface_gone");
+        assert_eq!(deaths[0]["payload"]["reason"], "master surface gone", "reason 구값 보존");
+        assert!(deaths[0]["payload"]["inputs"]["pid"].is_null(), "소멸 surface 입력은 null");
+    }
+
+    /// [핀13·요구 f] CYS_ROLE_DEADMAN_ROLES CSV 로 role 일반화 — worker 좌석도 동일 절차.
+    #[test]
+    fn deadman_role_generalization_csv() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_ROLE_DEADMAN_ROLES", "master, worker"),
+            ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
+        ]);
+        let daemon = drill_daemon("roles-csv");
+        let wid = spawn_role_surface(&daemon, "worker");
+        let w = daemon.get_surface(wid).unwrap();
+        w.exited.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        for _ in 0..3 {
+            check_role_deadman(&daemon, &mut tracker);
+        }
+        let deaths = events_named(&daemon, "master.deadman");
+        assert_eq!(deaths.len(), 1, "worker 좌석 사망도 동일 이벤트명으로 발화(role 키는 payload)");
+        assert_eq!(deaths[0]["payload"]["role"], "worker");
+        assert_eq!(deaths[0]["payload"]["reason"], "worker surface exited");
     }
 }
 

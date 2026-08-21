@@ -2425,7 +2425,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 생존성 게이트: roles 매핑은 surface가 자력 종료(셸 EOF)하면 close_surface를
             // 거치지 않아 dead_sid가 그대로 잔존한다(state.rs:619는 exited만 세우고 roles를
             // 비우지 않음). 검증 없이 반환하면 --to <role> 주소가 이미 죽은 surface를 정상으로
-            // 해석해 발신자가 '역할 생존'으로 오인한다. fire_push(schedule.rs)·check_master_deadman과
+            // 해석해 발신자가 '역할 생존'으로 오인한다. fire_push(schedule.rs)·check_role_deadman과
             // 동일하게 부재(미존재/exited)면 not_found로 강등 — 비대칭 보정.
             let resolved = {
                 let roles = daemon.roles.lock().unwrap();
@@ -6301,7 +6301,7 @@ mod tests {
     /// 발견(roles dangling — 자력 종료 surface): roles 매핑은 surface가 셸 EOF로 자력 종료하면
     /// close_surface를 거치지 않아(state.rs는 exited만 세움) dead_sid가 그대로 남는다.
     /// resolve_role이 생존성을 검증하지 않으면 --to <role> 주소가 죽은 surface를 정상 반환해
-    /// 발신자가 '역할 생존'으로 오인한다. fire_push·check_master_deadman과 동일한 부재 보정을 박제.
+    /// 발신자가 '역할 생존'으로 오인한다. fire_push·check_role_deadman과 동일한 부재 보정을 박제.
     #[test]
     fn resolve_role_rejects_dead_surface() {
         let daemon = claim_daemon();
