@@ -95,7 +95,13 @@ DEADLOCK_IDLE_SECS = 1800            # P3: 미배정 티켓 미checkout·set-sta
 SETSTATUS_STALE_SECS = 900           # §2-C 2차 증거 ②: set-status age > 15분
 SEEN_TTL_SECS = 1800                 # A6′ seen-store TTL(=critical 재enqueue 상한 = TTL당 1)
 BADGE_SCHEMA_VERSION = 1             # badges.json — 데몬 alerts.rs `node_liveness` 가 소비
-EVENT_POLL_TIMEOUT = 1.5             # queue.delivered/master.deadman 회수 상한(초)
+EVENT_POLL_TIMEOUT = 1.5             # queue.delivered/master.deadman/master.idle 회수 상한(초)
+# ── G2 W3-C: master.idle 소비(데몬 v2 침묵/사망 축 분리의 게이트측 짝) ─────────
+#   데몬 v2 는 침묵을 master.deadman(사망)이 아니라 정보성 master.idle 로 발행한다(결함 8).
+#   hung master(컨텍스트 정지 등 위험② 전형)의 CSO 기상 채널이 0 이 되지 않도록, 장기 침묵
+#   (idle ≥ 배수×임계)만 alert 층위로 격상한다 — G2 성찰 BLOCKER ②의 동일 릴리스 의무.
+MASTER_IDLE_STUCK_MULT = 3           # 격상 배수: idle_secs >= 3×threshold_secs → critical push
+MASTER_IDLE_ALERT_COOLDOWN_SECS = 7200  # 격상 push 쿨다운(엣지+쿨다운 2h — deadlock 상한과 동형)
 
 # 정규화 블랙리스트 — 타임스탬프·수집시각·순서 비결정 항목만 제거한다. 화이트리스트 금지
 # (신호 유실 단일 실패점). 미지의 새 필드는 자동으로 diff 대상 = 변화로 감지된다(fail-noisy).
@@ -117,10 +123,14 @@ SEV_INFO, SEV_WARN, SEV_CRIT = "info", "warn", "critical"
 CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH = "ledger", "evt", "badge", "push"
 
 #   trigger → (severity, channels). `_route_warn` 은 이 필드만 집행한다.
-#   push 는 **예외적 승격**이고, 승격 자격은 아래 세 갈래뿐이다:
+#   push 는 **예외적 승격**이고, 승격 자격은 아래 네 갈래뿐이다:
 #     · stall_confirmed  §2-C fail-closed 확증(2차 증거 3종 전부 성립)
 #     · deadlock         §2 층2 P3 술어(last_output 완전 배제)
 #     · death            데몬 deadman 이벤트 소비(게이트 자체 중복 채널 제거)
+#     · master_idle      데몬 master.idle 소비의 **격상층만**(idle≥3×임계 — hung 의심 · G2 W3-C).
+#                        격상 미달 정보층은 warn 자체를 만들지 않으므로 이 표를 타지 않는다.
+#   ★트리거명 master_idle 은 기존 `idle`(게이트 자체 idle-edge 판정 · idle_edge 카운터 결박)과
+#     **별도 도메인**이다 — idem 키·쿨다운·배지 키 혼입 금지(G2 성찰 MAJOR).
 CHANNEL_POLICY = {
     "idle":            (SEV_WARN, (CH_LEDGER, CH_EVT, CH_BADGE)),
     "stall":           (SEV_WARN, (CH_LEDGER, CH_EVT, CH_BADGE)),
@@ -132,6 +142,7 @@ CHANNEL_POLICY = {
     "measure":         (SEV_WARN, (CH_LEDGER, CH_BADGE)),
     "deadlock":        (SEV_CRIT, (CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH)),
     "death":           (SEV_CRIT, (CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH)),
+    "master_idle":     (SEV_CRIT, (CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH)),
 }
 
 # 수신 계층(설계 §2 층2): push 1차 수신자는 CSO다. "critical만 master 직송"은 **허가**이지
@@ -147,6 +158,10 @@ CHANNEL_POLICY = {
 #     표 층위에서 사라진다 — 다만 그것은 결과이지 이 표의 목적이 아니므로, 자기참조 차단은
 #     `_push_target(avoid=...)` 에 **독립 장치**로 남긴다(death:cso 를 막는 것이 그쪽 몫이다).
 #   CSO 부재 시에는 전부 master 폴백(M3: "CSO(부재 시 master)").
+#   ★master_idle(G2 W3-C)은 표에 **등재하지 않는다** — `_push_target` 의 기본값이 이미 cso 이고
+#     (무등재=기본 cso 가 계약), 이 표 자체는 회귀 핀(test_report_gate PushTargetRouting ⓐ)이
+#     정확 일치로 동결한다. 장기 침묵 role 은 생존 확정이므로 avoid(사망 당사자 회피) 대상도
+#     아니다 — 자기수신이 곧 처방인 stall·deadlock 과 같은 계열이다.
 PUSH_TARGET = {"deadlock": "cso", "stall_confirmed": "cso", "death": "cso"}
 
 # 전달 티어(설계 §2 층3 A3′ 상태머신):
@@ -789,6 +804,7 @@ def apply_policy(w):
 #   idle    → agent.silent {agent, silent_minutes, level=critical}
 #   feed    → approval.needed {agent, task, summary}
 #   stall   → agent.silent {agent, silent_minutes, level=critical}
+#   master_idle → agent.silent {agent, silent_minutes, level=critical} (격상층만 — 정보층은 EVT 0)
 #   context → EVT 매핑 없음(계약에 ctx 타입 부재) → 대장 전용
 #   collect → EVT 매핑 없음 → 대장+badge
 #   DELTA   → task_progress {task, stage, [pct]}
@@ -1223,6 +1239,73 @@ def build_death_warnings(events):
     return out, info
 
 
+def build_master_idle_signals(events):
+    """master.idle 소비 — 정보 기록 + 장기 침묵 격상(G2 W3-C · 성찰 BLOCKER ② 동일 릴리스 의무).
+
+    데몬 v2 는 침묵을 master.deadman(사망)이 아니라 정보성 master.idle 로 발행한다(결함 8 분리).
+    그 분리로 hung master(컨텍스트 100% 정지·입력 대기 장기화)의 CSO 기상 채널이 0 이 되지
+    않도록(v1 은 900s 후 silent 로라도 울렸다), 게이트가 이 이벤트를 **두 층**으로 소비한다:
+      · 정보층(idle < 배수×임계): **warn 을 만들지 않는다** — verdict 를 WARN 으로 오염시키면
+        QUIET 연속 카운터가 리셋돼 세션 주차(quiet-park) 신호가 영구히 죽는다(master 침묵은
+        곧 주차 후보 상태이기도 하다). 대장 reasons + info 배지만 남긴다(무해화 ≠ 관측 침묵).
+      · 격상층(idle >= MASTER_IDLE_STUCK_MULT×임계): trigger `master_idle` 로 critical push
+        (수신자는 표 무등재=기본 cso). 프로세스 생존은 데몬이 확정한 사실이므로 death 도메인
+        (reason·idem `gate-death-*`)과 섞지 않는다.
+    ★트리거명 `master_idle` 은 기존 `idle`(게이트 자체 idle-edge 판정 · idle_edge 카운터·
+      EDGE_COOLDOWN_SECS·`gate-idle-*` 키 결박)과 **도메인을 분리**한다 — 재사용하면 idem 키·
+      edge_cooldown·배지 도메인이 혼입돼 한쪽 억제가 다른 쪽 발화를 삼킨다(G2 성찰 MAJOR).
+    임계 미측정(threshold_secs 비수치·0 이하)은 격상하지 않는다 — 측정 불능은 push 근거가
+    아니다(deadlock 술어의 unmeasured 관례와 동형). 관측은 정보층으로 남는다.
+
+    반환 = (warns, info_reasons, info_badges).
+    info_badges 항목: {key, severity, message, detail} — 호출부가 `_badge` 로 옮긴다.
+    """
+    latest = {}
+    for ev in events or []:
+        if ev.get("name") != "master.idle":
+            continue
+        payload = ev.get("payload") or {}
+        latest[payload.get("role") or "master"] = ev   # 커서 폴링은 순서 보존 — 마지막이 최신
+    warns, info, badges = [], [], []
+    for role in sorted(latest):
+        ev = latest[role]
+        payload = ev.get("payload") or {}
+        idle = payload.get("idle_secs")
+        thr = payload.get("threshold_secs")
+        idle_num = isinstance(idle, (int, float)) and not isinstance(idle, bool)
+        thr_num = (isinstance(thr, (int, float)) and not isinstance(thr, bool) and thr > 0)
+        if idle_num and thr_num and idle >= MASTER_IDLE_STUCK_MULT * thr:
+            warns.append(apply_policy({
+                "trigger": "master_idle",
+                "task": "gate-master-idle-%s" % role,
+                "reason": "master_idle_stuck:%s(idle=%ds>=%dx%ds)"
+                          % (role, idle, MASTER_IDLE_STUCK_MULT, thr),
+                "wake_body": "[gate] ⚠ master-idle 장기화: %s 침묵 %d분 — 임계(%d분)의 %d배 "
+                             "이상. 프로세스는 생존(사망 아님) — hung/정지 의심, read-screen "
+                             "확인·재지시 판단 필요. 기상절차: cys status --json 1콜."
+                             % (role, int(idle // 60), int(thr // 60), MASTER_IDLE_STUCK_MULT),
+                "evt_type": "agent.silent",
+                "evt_fields": {"agent": role, "silent_minutes": int(idle // 60),
+                               "level": "critical", "measure_source": "daemon.master.idle"},
+                "idem": "gate-master-idle-%s" % role,
+                "badge_detail": {"role": role, "seq": ev.get("seq"), "payload": payload},
+                "cooldown": MASTER_IDLE_ALERT_COOLDOWN_SECS,
+                "stamp": {"measure_source": "daemon.master.idle",
+                          "measured_idle_secs": idle},
+            }))
+            continue
+        info.append("master_idle:%s(idle=%s/thr=%s)"
+                    % (role,
+                       ("%ds" % idle) if idle_num else "unmeasured",
+                       ("%ds" % thr) if thr_num else "unmeasured"))
+        badges.append({"key": "gate-master-idle-%s" % role, "severity": SEV_INFO,
+                       "message": "master-idle: %s 침묵(생존 확정·사망 아님) — 정보 기록" % role,
+                       "detail": {"trigger": "master_idle", "role": role,
+                                  "idle_secs": idle, "threshold_secs": thr,
+                                  "seq": ev.get("seq")}})
+    return warns, info, badges
+
+
 # ─────────────────────────── 외부 명령 Runner(주입 가능) ───────────────────────────
 
 class Runner:
@@ -1631,7 +1714,9 @@ class Gate:
 
     # ── A3′ 전달 상태머신: 1회 폴링 + crash 복구 + 영수증 대조 ─────────────────
     def _poll_once(self):
-        """데몬 이벤트 1회 회수(`queue.delivered` 영수증 + `master.deadman` 사망 확증).
+        """데몬 이벤트 1회 회수(`queue.delivered` 영수증 + `master.deadman` 사망 확증 +
+        `master.idle` 침묵 정보 — G2 W3-C 회수 lane. 구 데몬은 master.idle 을 발행하지 않으므로
+        스큐에서 이 이름은 단순 무회수=무해다).
         러너가 이 표면을 갖지 않으면(구형 대역) 조용히 비활성 — 판정은 그만큼 보수적이 된다."""
         self._events, self._ack_ok = [], False
         fn = getattr(self.runner, "poll_events", None)
@@ -1639,7 +1724,7 @@ class Gate:
             return
         try:
             ok, events, latest = fn(self._load_cursor(),
-                                    ["queue.delivered", "master.deadman"])
+                                    ["queue.delivered", "master.deadman", "master.idle"])
         except Exception:                       # noqa: BLE001 — 관측 실패가 판정을 죽이지 않는다
             return
         self._ack_ok = bool(ok)
@@ -1771,6 +1856,13 @@ class Gate:
             death_warns, death_info = build_death_warnings(self._events)
             warns += death_warns
             reasons += death_info
+            #   master.idle 소비(G2 W3-C) — 정보층은 warn 이 아니다(verdict·quiet-park 비오염),
+            #   격상층(idle≥3×임계)만 critical push 로 승격된다. 배지는 배달이 아니라 상태 파일.
+            mi_warns, mi_info, mi_badges = build_master_idle_signals(self._events)
+            warns += mi_warns
+            reasons += mi_info
+            for b in mi_badges:
+                self._badge(b["key"], b["severity"], b["message"], b["detail"])
         else:
             reasons.append("deadman_poll_unavailable")
         #   P3 시스템 데드락(last_output 완전 배제)

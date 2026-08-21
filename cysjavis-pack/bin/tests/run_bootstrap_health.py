@@ -5973,6 +5973,111 @@ def h_w5_p3():
     return "성립=CSO 1건 · 자기보고 신선=0 · 원장 미측정=0 · 술어에 idle 미사용"
 
 
+# ── P4 master.idle 소비 — 정보층(격상 미달)·도메인 분리 (G2 W3-C · 결함 8 짝) ──
+#   ※ 브리프의 검체 계열명 'H-W5-P3'은 이미 시스템 데드락 검체가 점유 — P4 로 재명명 배치.
+@specimen("H-W5-P4", "W5",
+          "master.idle 소비 — 정보 기록만(push 0·verdict 비오염·idle 도메인 분리)", ["D6"])
+def h_w5_p4():
+    #   데몬 v2 는 침묵을 master.idle(정보)로 발행한다(결함 8 축 분리). 격상 미달(idle<3×임계)은
+    #   **warn 이 아니어야 한다**: verdict 가 WARN 이 되면 QUIET 연속 카운터가 리셋돼 세션
+    #   주차(quiet-park) 신호가 죽는다 — master 침묵은 곧 주차 후보 상태이기도 하다.
+    #   트리거 도메인은 기존 idle(idle_edge 카운터·gate-idle-* 키)과 분리돼야 한다(G2 성찰 MAJOR).
+    G = _w5_mod()
+    rep = _w5_report(live=[{"role": "master", "idle": 10, "status_age": 10, "tokens": 1}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        sd = os.path.join(tmp, "state")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd, r, clk).run()                     # baseline
+        clk.tick()
+        r.events.append({"name": "master.idle", "seq": 51,
+                         "payload": {"role": "master", "axis": "silence",
+                                     "idle_secs": 912, "threshold_secs": 900}})
+        #   임계 미측정(threshold 부재) 이벤트도 격상 없이 정보층 — 측정 불능은 push 근거가 아니다.
+        r.events.append({"name": "master.idle", "seq": 52,
+                         "payload": {"role": "cso", "idle_secs": 5000}})
+        _w5_gate(G, sd, r, clk).run()                     # 이벤트 소비 주기
+        clk.tick()
+        need(any(k == "gate-master-idle-master" for k in _w5_badges(sd)),
+             "master-idle info 배지 부재: %r" % list(_w5_badges(sd)))
+        for _ in range(2):                                # 이후 정상 주기(재발화·잔류 확인)
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        need(len(r.enqueues) == 0, "정보층 master.idle 이 push 를 탔다: %r" % (r.enqueues,))
+        entries = _w5_ledger(sd)
+        reasons = [x for e in entries for x in (e.get("reasons") or [])]
+        need(any(x.startswith("master_idle:master") for x in reasons),
+             "master.idle 정보 대장 기록 부재: %r" % reasons)
+        need(any(x.startswith("master_idle:cso") and "unmeasured" in x for x in reasons),
+             "임계 미측정 이벤트의 정보 기록 부재: %r" % reasons)
+        need(not any(x.startswith("master_idle_stuck:") for x in reasons),
+             "격상 미달인데 격상 기록: %r" % reasons)
+        #   verdict 비오염 — master.idle 만으로는 WARN 이 되지 않는다(quiet-park 생존).
+        need(not any(e.get("verdict") == "WARN" for e in entries),
+             "정보층이 verdict 를 WARN 으로 오염: %r" % [e.get("verdict") for e in entries])
+        #   도메인 분리 — 기존 idle 도메인(idle_5min/idle_edge·gate-idle-*)에 흔적 0.
+        need(not any(x.startswith("idle_5min:") or x.startswith("idle_edge:") for x in reasons),
+             "master.idle 이 기존 idle 도메인으로 새었다: %r" % reasons)
+        need(not any("gate-idle-" in k for k in _w5_badges(sd)),
+             "master.idle 이 기존 idle 배지 키를 점유: %r" % list(_w5_badges(sd)))
+        #   회수 lane 등재 — 폴링 이름 목록에 master.idle 이 실제로 실린다(G2 BLOCKER ② 배선).
+        need(r.polls and "master.idle" in r.polls[-1][1],
+             "폴링 이름 목록에 master.idle 미등재: %r" % (r.polls[-1:],))
+    return "정보층: push 0 · WARN 0 · 대장 master_idle 기록 · info 배지 · idle 도메인 무혼입"
+
+
+# ── P4b master.idle 장기화 격상 — 3×임계에서만 critical push(CSO) ─────────────
+@specimen("H-W5-P4b", "W5",
+          "master.idle 장기화(≥3×임계) — critical push 1건(CSO)·경계 미만 0", ["D6"])
+def h_w5_p4b():
+    #   hung master(v1 은 900s 후 'master silent' 사망 오라벨로라도 울렸다)의 CSO 기상 채널을
+    #   축 분리 후에도 보존하는 격상층이다. 단 사망이 아니므로 death 도메인과 섞지 않는다.
+    G = _w5_mod()
+    rep = _w5_report(live=[{"role": "master", "idle": 10, "status_age": 10, "tokens": 1},
+                           {"role": "cso", "idle": 10, "status_age": 10, "tokens": 2}])
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+        #   ⓐ 3×임계 도달 — 지속 스트림(매 주기 이벤트)에도 push 정확히 1(엣지+쿨다운 2h)
+        sd = os.path.join(tmp, "yes")
+        clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd, r, clk).run()                     # baseline
+        clk.tick()
+        for i in range(5):
+            r.events.append({"name": "master.idle", "seq": 60 + i,
+                             "payload": {"role": "master", "axis": "silence",
+                                         "idle_secs": 2700 + 300 * i,
+                                         "threshold_secs": 900}})
+            _w5_gate(G, sd, r, clk).run()
+            clk.tick()
+        stuck = [e for e in r.enqueues if e[1] == "gate-master-idle-master"]
+        need(len(stuck) == 1, "격상 push 가 %d건(기대 1 — 엣지+쿨다운)" % len(stuck))
+        need(stuck[0][0] == "cso", "격상 push 수신자가 CSO 가 아니다: %r" % (stuck[0],))
+        need(stuck[0][4] == "critical", stuck[0])
+        need(len(r.enqueues) == 1, "격상 외 잉여 push: %r" % (r.enqueues,))
+        reasons = [x for e in _w5_ledger(sd) for x in (e.get("reasons") or [])]
+        need(any(x.startswith("master_idle_stuck:master") for x in reasons),
+             "격상 대장 기록 부재: %r" % reasons)
+        #   death 도메인 무혼입 — 생존 확정 침묵이 사망 대장·wake 경로를 타면 결함 8 재발이다.
+        need(not any(x.startswith("death:") for x in reasons),
+             "master.idle 격상이 death 대장으로 새었다: %r" % reasons)
+        need(not [e for e in r.enqueues if (e[1] or "").startswith("gate-death")],
+             "master.idle 격상이 death wake 경로를 탔다: %r" % (r.enqueues,))
+        #   ⓑ 경계 미만(2699 < 3×900=2700) → push 0(정보층으로만)
+        sd2 = os.path.join(tmp, "no")
+        clk2, r2 = _W5Clock(), _W5Fake(rep=rep, tasks=[])
+        _w5_gate(G, sd2, r2, clk2).run()                  # baseline
+        clk2.tick()
+        r2.events.append({"name": "master.idle", "seq": 61,
+                          "payload": {"role": "master", "axis": "silence",
+                                      "idle_secs": 2699, "threshold_secs": 900}})
+        for _ in range(3):
+            _w5_gate(G, sd2, r2, clk2).run()
+            clk2.tick()
+        need(len(r2.enqueues) == 0, "경계 미만에서 격상 오발화: %r" % (r2.enqueues,))
+        reasons2 = [x for e in _w5_ledger(sd2) for x in (e.get("reasons") or [])]
+        need(any(x.startswith("master_idle:master") for x in reasons2),
+             "경계 미만 정보 기록 부재: %r" % reasons2)
+    return "3×임계: push 1(cso·critical) · 지속 5주기 재발화 0 · 경계 2699s 미발화 · death 무혼입"
+
+
 # ── C1 crash 후 재실행 중복 상한 ─────────────────────────────────────────
 @specimen("H-W5-C1", "W5", "seen mark 직전 crash — 총 delivery 1..2 · duplicate 0..1", ["C2", "R2-C3"])
 def h_w5_c1():
