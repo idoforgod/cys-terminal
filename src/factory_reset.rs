@@ -1918,6 +1918,10 @@ enum StripBackup<'a> {
 /// 잔존 훅)는 canonicalize 가 원문으로 접히고, 산 경로는 심링크 차이를 흡수한다.
 /// 경계 일치는 `command_points_into_pack` 과 동일 규약(뒤가 '/'·따옴표·공백·끝) — 부분 문자열
 /// 오판(`pack-dept-d1` 이 `pack-dept-d10` 을 잡는 것)을 차단한다.
+/// Windows 한계(감수 범위 · 리뷰 MINOR): 비교는 대소문자 민감 — NTFS 무구분 경로로 케이스만 다른
+/// 잔존 훅은 미탐지/미제거(fail-safe: 오삭제 없음). unix 케이스 민감 파일계에서 무구분 비교는
+/// 역으로 오삭제 표면이라 전 OS 폴딩은 금지 — Windows 부서 churn 표면이 생기는 릴리스에서
+/// cfg(windows) 케이스 폴딩으로 승격한다(cys.rs acquire_settings_lock 의 감수 범위와 같은 트랙).
 pub(crate) fn command_points_into_pack_root(command: &str, pack_root: &Path) -> bool {
     let cmd = command.replace('\\', "/");
     let raw = pack_root.to_string_lossy().replace('\\', "/");
@@ -1989,11 +1993,18 @@ pub fn strip_hooks_pointing_into_pack(
 
 /// 읽기 전용 판정판(--dry-run·doctor 탐지용) — 제거 대상 라벨만 산출하고 아무것도 쓰지 않는다.
 /// 파일 부재 = 빈 벡터(대상 없음) / 파싱 실패 = Err(측정 불능 ≠ 통과 — fail-closed 보고).
+/// symlink 규약은 제거판과 **동일 판정**(`resolve_symlinked_settings`)이다[리뷰 MINOR 봉인] —
+/// 종전엔 여기가 링크를 그냥 따라 읽어 dry-run 이 '제거 예정'을 약속하고 실제 실행이 거부(exit 1)
+/// 하는 관측 불일치가 있었다(둘 다 fail-closed 방향이라 오삭제는 없었으나 약속≠실행).
 pub fn hooks_pointing_into_pack(
     settings_path: &Path,
     pack_root: &Path,
 ) -> Result<Vec<String>, String> {
-    let raw = match std::fs::read_to_string(settings_path) {
+    let cys_base = pack_root
+        .parent()
+        .ok_or_else(|| format!("pack root has no parent: {}", pack_root.display()))?;
+    let target = resolve_symlinked_settings(settings_path, cys_base)?;
+    let raw = match std::fs::read_to_string(&target) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(format!("read error: {e}")),
@@ -2024,6 +2035,43 @@ pub fn hooks_pointing_into_pack(
     Ok(out)
 }
 
+/// settings 경로의 심링크 해소 — 탐지판(`hooks_pointing_into_pack`)·제거판
+/// (`strip_settings_matching`) **공용 단일 판정**[리뷰 MINOR: dry-run↔실행 관측 일치].
+///
+/// ★P1-1 ①: 도트파일 저장소로 settings.json 을 **심링크**해 쓰는 구성은 흔하다. 종전엔
+/// 그냥 거부해서, 리셋 후 그 사용자는 매 Claude Code 세션마다 사라진 팩을 가리키는 훅이
+/// 전부 "No such file" 로 실패하는 걸 봐야 했다(조치 안내도 없이).
+/// → 링크 자체는 절대 건드리지 않되(계약 보존), 링크가 가리키는 **홈 아래 일반 파일**이면
+///   그 실파일을 대상으로 이어간다. 홈 밖·파일 아님은 기존대로 거부(클로버 금지).
+///
+/// 홈 경계는 **cys_base 의 부모**에서 파생한다(cys_base = <home>/.cys 규약) — 전역
+/// dirs::home_dir() 을 쓰면 루트가 주입된 환경(테스트 샌드박스)에서 판정이 어긋난다.
+/// 양쪽 다 canonicalize 해서 /var ↔ /private/var 같은 심링크 접두 차이를 흡수한다.
+fn resolve_symlinked_settings(settings_path: &Path, cys_base: &Path) -> Result<PathBuf, String> {
+    if !std::fs::symlink_metadata(settings_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(settings_path.to_path_buf());
+    }
+    let real = std::fs::canonicalize(settings_path)
+        .map_err(|e| format!("{} is a symlink and unresolvable: {e}", settings_path.display()))?;
+    let home_ok = cys_base
+        .parent()
+        .and_then(|h| std::fs::canonicalize(h).ok())
+        .map(|h| real.starts_with(&h))
+        .unwrap_or(false);
+    if !home_ok || !real.is_file() {
+        return Err(format!(
+            "{} is a symlink to {} (홈 밖이거나 일반 파일이 아님) — 건드리지 않는다. \
+             그 파일에서 `.cys/pack` 를 가리키는 훅을 직접 지우세요",
+            settings_path.display(),
+            real.display()
+        ));
+    }
+    Ok(real)
+}
+
 fn strip_settings_matching(
     settings_path: &Path,
     cys_base: &Path,
@@ -2031,36 +2079,8 @@ fn strip_settings_matching(
     strip_statusline: bool,
     backup: StripBackup,
 ) -> Result<Vec<String>, String> {
-    // ★P1-1 ①: 도트파일 저장소로 settings.json 을 **심링크**해 쓰는 구성은 흔하다. 종전엔
-    // 그냥 거부해서, 리셋 후 그 사용자는 매 Claude Code 세션마다 사라진 팩을 가리키는 훅이
-    // 전부 "No such file" 로 실패하는 걸 봐야 했다(조치 안내도 없이).
-    // → 링크 자체는 절대 건드리지 않되(계약 보존), 링크가 가리키는 **홈 아래 일반 파일**이면
-    //   그 실파일을 대상으로 이어간다. 홈 밖·파일 아님은 기존대로 거부(클로버 금지).
-    let mut target = settings_path.to_path_buf();
-    if std::fs::symlink_metadata(&target)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        let real = std::fs::canonicalize(&target)
-            .map_err(|e| format!("{} is a symlink and unresolvable: {e}", target.display()))?;
-        // 홈 경계는 **cys_base 의 부모**에서 파생한다(cys_base = <home>/.cys 규약) — 전역
-        // dirs::home_dir() 을 쓰면 루트가 주입된 환경(테스트 샌드박스)에서 판정이 어긋난다.
-        // 양쪽 다 canonicalize 해서 /var ↔ /private/var 같은 심링크 접두 차이를 흡수한다.
-        let home_ok = cys_base
-            .parent()
-            .and_then(|h| std::fs::canonicalize(h).ok())
-            .map(|h| real.starts_with(&h))
-            .unwrap_or(false);
-        if !home_ok || !real.is_file() {
-            return Err(format!(
-                "{} is a symlink to {} (홈 밖이거나 일반 파일이 아님) — 건드리지 않는다. \
-                 그 파일에서 `.cys/pack` 를 가리키는 훅을 직접 지우세요",
-                target.display(),
-                real.display()
-            ));
-        }
-        target = real;
-    }
+    // 심링크 규약은 탐지판과 공용 단일 판정(resolve_symlinked_settings doc 참조).
+    let target = resolve_symlinked_settings(settings_path, cys_base)?;
     let settings_path = target.as_path();
     let raw = match std::fs::read_to_string(settings_path) {
         Ok(s) => s,
@@ -3125,6 +3145,60 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★리뷰 MINOR(관측 일치) 핀: 탐지판(dry-run·프로브)과 제거판의 symlink 정책이 **한 판정**
+    /// (`resolve_symlinked_settings`)이다 — dry-run 이 '제거 예정'을 약속해 놓고 실행이 거부
+    /// (exit 1)하던 불일치 봉인. 홈 밖 링크=둘 다 거부 · 홈 안 일반 파일 링크=둘 다 실파일 대상
+    /// (라벨 일치·링크 불가침).
+    #[cfg(unix)]
+    #[test]
+    fn probe_and_strip_agree_on_symlink_policy() {
+        let root = std::env::temp_dir().join(format!("cys-fr-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let dept = home.join(".cys").join("pack-dept-s1");
+        std::fs::create_dir_all(&dept).unwrap();
+        let hook_body = serde_json::json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command",
+                            "command": format!("sh {}/hooks/session-start.sh", dept.display())}]}
+            ]}
+        });
+
+        // ① 홈 밖 실파일을 가리키는 링크: 탐지판·제거판 동일 거부 + 실파일 무변조.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let out_file = outside.join("settings.json");
+        std::fs::write(&out_file, serde_json::to_string(&hook_body).unwrap()).unwrap();
+        let link = home.join("settings-out.json");
+        std::os::unix::fs::symlink(&out_file, &link).unwrap();
+        let before = std::fs::read_to_string(&out_file).unwrap();
+        assert!(
+            hooks_pointing_into_pack(&link, &dept).is_err(),
+            "탐지판이 홈 밖 링크의 제거를 약속했다(제거판은 거부 — 관측 불일치)"
+        );
+        assert!(strip_hooks_pointing_into_pack(&link, &dept, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&out_file).unwrap(),
+            before,
+            "거부 경로가 홈 밖 실파일을 썼다"
+        );
+
+        // ② 홈 안 일반 파일을 가리키는 링크: 둘 다 실파일 대상 — 탐지 라벨 == 제거 라벨.
+        let inner = home.join("real-settings.json");
+        std::fs::write(&inner, serde_json::to_string(&hook_body).unwrap()).unwrap();
+        let link2 = home.join("settings-in.json");
+        std::os::unix::fs::symlink(&inner, &link2).unwrap();
+        let probe = hooks_pointing_into_pack(&link2, &dept).unwrap();
+        assert_eq!(probe, vec!["SessionStart×1".to_string()]);
+        let removed = strip_hooks_pointing_into_pack(&link2, &dept, None).unwrap();
+        assert_eq!(removed, probe, "dry-run 약속과 실행 결과 불일치");
+        assert!(
+            std::fs::symlink_metadata(&link2).unwrap().file_type().is_symlink(),
+            "링크 자체를 건드렸다(계약 위반)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// ★P1-1 ③⑤: 백업은 격리 폴더 안으로, 원본 권한(0444 잠금)은 보존된다.

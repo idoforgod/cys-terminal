@@ -660,10 +660,11 @@ fn setup_isolated_config_dir() {
         //   훅이 공용 프로필에 병합됐다(결함2 — 공용 프로필 무변조 기본 계약 위반). 레거시 폴백
         //   dir(claude-dept-<name>)은 판독자 전무라 만들지 않는다("아무도 안 읽는 dir에 쓰지
         //   않는다"). 정상 부서 부트(cys-dept launch/rotate/create/allocate)는 CYS_ACCOUNT_DIR 을
-        //   주입하므로 이 분기는 이상 기동 신호다 — loud WARN + doctor(dept-hook-residue) 가시화.
+        //   주입하므로 이 분기는 이상 기동 신호다 — loud WARN + doctor 가시화(부서 레인=hook 진단
+        //   부서 arm · base 레인=dept-awakening-seed anomaly — 포인터 정합: 리뷰 BLOCK-2).
         eprintln!(
             "[pack] ⚠ 부서 팩({}) 컨텍스트인데 CYS_ACCOUNT_DIR 미설정 — 격리 config 시드 생략(fail-closed). \
-             부서 재기동(cys-dept launch/rotate)이 계정 dir 주입 후 재시드한다 · 진단: cys doctor",
+             부서 재기동(cys-dept launch/rotate)이 계정 dir 주입 후 재시드한다 · 진단: cys doctor(hook·dept-awakening-seed)",
             pack_dir().display()
         );
         return;

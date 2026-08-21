@@ -3828,6 +3828,13 @@ fn hooks_prune_targets(pack: &std::path::Path) -> Vec<std::path::PathBuf> {
     targets
 }
 
+/// 산 부서 훅 무조건 제거와 절대 불변 '산 훅 제거는 실측 조건부만'의 관계[리뷰 MINOR 명문화]:
+/// 그 조건부 계약의 주어는 **자가치유 판단 주체**(doctor --fix — 시스템이 스스로 판단해 지우는
+/// 경로 = `diag_dept_hook_residue` 의 acctdir 실측 조건부)다. hooks-prune 의 표면은
+/// ①teardown 배선(cys-dept down/down-sock — 부서 소멸 중이라 잔존 훅이 곧 죽은 경로가 된다)
+/// ②운영자 명시 호출(의도 선언 + --dry-run + per-run 백업 + 부서 전용 기본 게이트) 둘뿐이므로
+/// 무조건 제거가 계약 위반이 아니다 — 산 부서를 보존하는 자가치유가 필요하면 doctor --fix 를 쓰라.
+///
 /// exit: 0=제거 완료·대상 없음 / 1=IO·파싱 거부(fail-closed) / 7=게이트 거부(base 팩 + --allow-base 부재).
 fn run_hooks_prune(pack_dir_arg: &str, dry_run: bool, allow_base: bool) -> i32 {
     let pack = std::path::PathBuf::from(shellexpand_home(pack_dir_arg));
@@ -3881,6 +3888,9 @@ fn run_hooks_prune(pack_dir_arg: &str, dry_run: bool, allow_base: bool) -> i32 {
 
 /// 훅 명령 문자열에서 부서 팩 루트(`<base>/pack-dept-<name>`)를 추출한다(순수 —
 /// dept-hook-residue 탐지). 경로경계 앵커: base 접두 + `/pack-dept-` + 비구분자 이름.
+/// Windows 한계(감수 범위 · 리뷰 MINOR): 비교는 대소문자 민감 — NTFS 무구분 경로로 케이스만 다른
+/// 잔존 훅은 미탐지(fail-safe: 오삭제 없음). Windows 부서 churn 표면이 생기는 릴리스에서 케이스
+/// 폴딩 승격(`acquire_settings_lock` 의 Windows 감수 범위와 같은 트랙 · command_points_into_pack_root 동일).
 fn dept_pack_of_command(command: &str, cys_base: &std::path::Path) -> Option<std::path::PathBuf> {
     let base = cys_base.to_string_lossy().replace('\\', "/");
     let cmd = command.replace('\\', "/");
@@ -4102,6 +4112,17 @@ fn diag_install_manifest(ctx: &DoctorCtx) -> DiagItem {
 }
 
 fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    // ★G3 축1(리뷰 BLOCK-1 봉인 — 3층째 dept 게이트): 부서 팩(pack-dept-*) 스코프의 대조 표면은
+    //   개인 프로필(~/.claude*)이 아니라 그 부서의 실소비 acctdir(CYS_ACCOUNT_DIR)다. 이 게이트가
+    //   없으면 부서 컨텍스트(cys-dept <name> -- cys doctor · 부서 데몬이 띄운 pane 셸 전부)에서
+    //   (a) '개인 프로필에 부서 훅 없음'을 미등록으로 오보하고(신계약상 없는 게 정상),
+    //   (b) --fix 가 부서 훅을 ~/.claude* 전부에 재기록해 이 릴리스가 봉인한 결함2를 doctor 가
+    //   재생산한다 — 같은 run 바로 뒤의 dept-hook-residue 가 그것을 '산 부서 오염'으로 재탐지하는
+    //   자기모순(한 doctor 실행이 쓰고 지운다). 데몬 경로(merge_awakening_hooks_into_personal_profiles
+    //   base-전용 게이트)·init-pack CLI 게이트와 동형이다.
+    if cys::pack::dept_scope_of(&ctx.pack_dir).is_some() {
+        return diag_hook_dept(ctx, fix, std::env::var("CYS_ACCOUNT_DIR").ok().as_deref());
+    }
     // ★W3(A9): 진단 대상 = **소망 훅 집합 전체**(SessionStart + UserPromptSubmit). 종전엔 SessionStart
     //   하나만 봐서, 각성 훅(role-bootstrap)이 빠진 기계를 doctor 가 "OK"로 보고했다(보고≠실측).
     let missing_in = |path: &str| -> Vec<&'static str> {
@@ -4176,6 +4197,79 @@ fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             missing.join(" | ")
         ),
         action: "cys doctor --fix 또는 cys init-pack 로 등록".into(),
+    }
+}
+
+/// hook 진단의 **부서 스코프 arm**(acct env 주입형 — 전 OS 단위 테스트 가능 · 비어있지 않음
+/// 필터는 `pack::config_dir_for` 와 동일 규약). 대조·--fix 기록 표면은 **acctdir 하나**다 —
+/// 개인 프로필(~/.claude*)은 읽지도 쓰지도 않는다(공용 프로필 무변조 기본 계약).
+fn diag_hook_dept(ctx: &DoctorCtx, fix: bool, acct_env: Option<&str>) -> DiagItem {
+    let Some(acct) = acct_env.filter(|s| !s.is_empty()) else {
+        // 시드 생략 상태(setup_isolated_config_dir 의 loud WARN 과 같은 셀) — 시드 표적이 없으므로
+        // --fix 도 아무 것도 쓰지 않는다(fail-closed · 개인 프로필/공용 claude 폴백 금지).
+        return DiagItem {
+            name: "hook",
+            status: DiagStatus::Warn,
+            detail: format!(
+                "부서 팩({}) 스코프인데 CYS_ACCOUNT_DIR 미설정 — 시드 표적 없음(시드 생략 상태·\
+                 이상 기동 신호). 개인 프로필(~/.claude*)은 신계약상 무접촉이라 대조하지 않는다",
+                ctx.pack_dir.display()
+            ),
+            action: "cys-dept <name> launch/rotate 로 계정 dir 주입 후 재진단 — 이 상태의 --fix 는 \
+                     아무 것도 쓰지 않는다(fail-closed)"
+                .into(),
+        };
+    };
+    let settings = std::path::Path::new(acct).join("settings.json");
+    let missing = cys::pack::verify_desired_hooks_registered(
+        &settings,
+        &ctx.pack_dir,
+        &cys::pack::AWAKENING_HOOKS,
+    );
+    if missing.is_empty() {
+        return DiagItem {
+            name: "hook",
+            status: DiagStatus::Ok,
+            detail: format!(
+                "부서 acctdir({acct}) 각성 hook 집합 등록됨(SessionStart+UserPromptSubmit)"
+            ),
+            action: String::new(),
+        };
+    }
+    if fix {
+        if let Some(parent) = settings.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // G16 3-writer 직렬화 — preflight C28·hooks-prune 과 같은 락 파일(<settings>.cys-lock).
+        let _lock = acquire_settings_lock(&settings);
+        return match install_claude_hook(&settings.to_string_lossy(), &ctx.pack_dir) {
+            Ok(_) => DiagItem {
+                name: "hook",
+                status: DiagStatus::Ok,
+                detail: format!("부서 acctdir 각성 hook 미등록({}) — 재등록", missing.join("+")),
+                action: format!("등록: {}", settings.display()),
+            },
+            Err(e) => DiagItem {
+                name: "hook",
+                status: DiagStatus::Fail,
+                detail: format!(
+                    "부서 acctdir 각성 hook 재등록 실패: {}: {e}",
+                    settings.display()
+                ),
+                action: "부서 재기동(cys-dept launch/rotate)이 부트 자동설치로 재시드한다".into(),
+            },
+        };
+    }
+    DiagItem {
+        name: "hook",
+        status: DiagStatus::Warn,
+        detail: format!(
+            "부서 acctdir({}) 각성 hook 미등록 — {}",
+            settings.display(),
+            missing.join("+")
+        ),
+        action: "cys doctor --fix(부서 acctdir 에만 기록) 또는 부서 재기동(cys-dept launch/rotate)"
+            .into(),
     }
 }
 
@@ -4325,6 +4419,82 @@ fn diag_dept_hook_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         } else {
             "보존된 산 부서 훅은 부서 rotate(acctdir 재시드) 후 doctor --fix 재실행".into()
         },
+    }
+}
+
+/// dept-awakening-seed(G3 축1 확정 결정 3종 세트의 doctor anomaly 항목 · 리뷰 BLOCK-2) —
+/// 등록된 부서 팩(pack-dept-*) 각각의 **acctdir 각성 훅 시드를 실측**한다. 시드 생략 loud WARN
+/// (pack.rs setup_isolated_config_dir)의 '진단: cys doctor' 포인터가 실제로 보여주는 항목.
+///
+///  · dept-hook-residue(공용/개인 settings 의 '잔존 훅' 탐지)와 **별개 축**: 잔존이 0인 신규/
+///    레거시 부서가 CYS_ACCOUNT_DIR 없이 무각성 부팅한 상태('계속 실수·실패 보고' 셀 — 치명위험
+///    앵커 ③ 인접)는 잔존 탐지로는 영원히 보이지 않는다 — 여기서만 잡힌다.
+///  · 읽기 전용(--fix 없음): 시드는 부서 부트 자동설치(cys-dept launch/rotate →
+///    setup_isolated_config_dir) 소관 — base 레인 doctor 가 타 레인 acctdir 에 쓰기 시작하면 새
+///    교차-레인 쓰기 표면이 열린다. 부서 레인 안에서의 시드 수리는 `cys-dept <name> -- cys doctor
+///    --fix`(= hook 진단 부서 arm) 소관.
+///  · 판정 소스 = agents.json 시드값(`dept_seeded_acct_dir` — cys-dept 3순위 유도의 영속 정본)
+///    이며, residue --fix 의 조건부 제거와 **같은 술어**(`verify_desired_hooks_registered`)를
+///    쓴다(두 항목의 보고가 갈리지 않는다). 부서 판정은 `dept_scope_of` 단일 술어.
+fn diag_dept_awakening_seed(ctx: &DoctorCtx) -> DiagItem {
+    let mut packs: Vec<std::path::PathBuf> = std::fs::read_dir(&ctx.state_base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && cys::pack::dept_scope_of(p).is_some())
+        .collect();
+    packs.sort();
+    if packs.is_empty() {
+        return DiagItem {
+            name: "dept-awakening-seed",
+            status: DiagStatus::Ok,
+            detail: "부서 팩 0 — 해당 없음".into(),
+            action: String::new(),
+        };
+    }
+    let mut anomalies: Vec<String> = Vec::new();
+    for pack in &packs {
+        let name = pack
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match dept_seeded_acct_dir(pack) {
+            None => anomalies.push(format!(
+                "{name}: 계정 dir 미시드(agents.json CLAUDE_CONFIG_DIR 부재·판독 불가) — \
+                 CYS_ACCOUNT_DIR 미주입 부팅은 시드 생략=무각성"
+            )),
+            Some(acct) => {
+                let missing = cys::pack::verify_desired_hooks_registered(
+                    &acct.join("settings.json"),
+                    pack,
+                    &cys::pack::AWAKENING_HOOKS,
+                );
+                if !missing.is_empty() {
+                    anomalies.push(format!(
+                        "{name}: acctdir({}) 각성 훅 미시드 — {}",
+                        acct.display(),
+                        missing.join("+")
+                    ));
+                }
+            }
+        }
+    }
+    if anomalies.is_empty() {
+        return DiagItem {
+            name: "dept-awakening-seed",
+            status: DiagStatus::Ok,
+            detail: format!("부서 팩 {}개 acctdir 각성 훅 실측 — anomaly 0", packs.len()),
+            action: String::new(),
+        };
+    }
+    DiagItem {
+        name: "dept-awakening-seed",
+        status: DiagStatus::Warn,
+        detail: format!("부서 각성 시드 anomaly: {}", anomalies.join(" | ")),
+        action: "해당 부서 재기동(cys-dept <name> launch/rotate)이 acctdir 에 재시드한다 · \
+                 부서 레인 수리: cys-dept <name> -- cys doctor --fix"
+            .into(),
     }
 }
 
@@ -4985,6 +5155,7 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_install_manifest(ctx),
         diag_hook(ctx, fix),
         diag_dept_hook_residue(ctx, fix),
+        diag_dept_awakening_seed(ctx),
         diag_orphan_socket(ctx, fix),
         diag_stale_lock(ctx, fix),
         diag_staging_residue(ctx, fix),
@@ -15212,6 +15383,114 @@ mod tests {
         // --fix → 등록 → OK, 재진단 OK
         assert_eq!(diag_hook(&ctx, true).status, DiagStatus::Ok);
         assert_eq!(diag_hook(&ctx, false).status, DiagStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★G3 축1(리뷰 BLOCK-1 봉인 핀): 부서 스코프 hook 진단은 개인 프로필(~/.claude*)을
+    /// 대조·기록 표면으로 삼지 않는다 — 무acct=Warn·무쓰기(fail-closed), acct 존재 시 대조와
+    /// --fix 기록은 **acctdir 에만**. 게이트 부재 시 --fix 가 결함2(부서 훅 공용/개인 오염)를
+    /// doctor 스스로 재생산하던 경로의 회귀 핀.
+    #[test]
+    fn diag_hook_dept_scope_never_touches_personal_profiles() {
+        let base = std::env::temp_dir().join(format!("cys-doc-hook-dept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dept = base.join("pack-dept-t1");
+        std::fs::create_dir_all(&dept).unwrap();
+        let personal = base.join("personal-settings.json");
+        std::fs::write(&personal, "{}").unwrap();
+        let mut ctx = doctor_ctx_at(&base);
+        ctx.pack_dir = dept.clone();
+        ctx.settings_paths = vec![personal.to_string_lossy().into_owned()];
+
+        // ① acct 부재: fix 유무 무관 Warn + 개인 프로필 byte-identical(재오염 0).
+        assert_eq!(diag_hook_dept(&ctx, false, None).status, DiagStatus::Warn);
+        assert_eq!(diag_hook_dept(&ctx, true, None).status, DiagStatus::Warn);
+        assert_eq!(
+            std::fs::read_to_string(&personal).unwrap(),
+            "{}",
+            "dept+무acct 의 --fix 가 개인 프로필을 썼다(결함2 재생산)"
+        );
+        // 빈 문자열 acct 는 미설정과 동일(config_dir_for 비어있지 않음 규약).
+        assert_eq!(diag_hook_dept(&ctx, true, Some("")).status, DiagStatus::Warn);
+
+        // ② acct 존재: 미등록 Warn → --fix 는 acctdir 에만 기록 → 재진단 Ok · 개인 프로필 불변.
+        let acct = base.join("acct");
+        let acct_s = acct.to_string_lossy().into_owned();
+        assert_eq!(diag_hook_dept(&ctx, false, Some(&acct_s)).status, DiagStatus::Warn);
+        assert_eq!(diag_hook_dept(&ctx, true, Some(&acct_s)).status, DiagStatus::Ok);
+        assert!(
+            cys::pack::verify_desired_hooks_registered(
+                &acct.join("settings.json"),
+                &dept,
+                &cys::pack::AWAKENING_HOOKS
+            )
+            .is_empty(),
+            "--fix 가 acctdir 에 각성 훅 집합을 시드해야 한다"
+        );
+        assert_eq!(diag_hook_dept(&ctx, false, Some(&acct_s)).status, DiagStatus::Ok);
+        assert_eq!(
+            std::fs::read_to_string(&personal).unwrap(),
+            "{}",
+            "개인 프로필 무접촉 계약 위반"
+        );
+
+        // ③ 배선 핀: diag_hook 진입점이 dept 스코프에서 env(CYS_ACCOUNT_DIR)를 읽어 부서 arm 으로
+        //   라우팅한다(base ctx 의 기존 arm 은 doctor_hook_missing_then_fix 가 그대로 핀).
+        {
+            let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _e = cys::pack::EnvGuard::remove("CYS_ACCOUNT_DIR");
+            assert_eq!(diag_hook(&ctx, true).status, DiagStatus::Warn);
+            assert_eq!(
+                std::fs::read_to_string(&personal).unwrap(),
+                "{}",
+                "배선 경유 dept+무acct --fix 무쓰기 위반"
+            );
+            let _e2 = cys::pack::EnvGuard::set("CYS_ACCOUNT_DIR", &acct);
+            assert_eq!(diag_hook(&ctx, false).status, DiagStatus::Ok);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★G3 축1(리뷰 BLOCK-2 핀): 시드 생략 상태(잔존 훅 0)의 부서를 doctor 가 침묵하지 않는다 —
+    /// 등록 부서(pack-dept-*)의 acctdir 각성 훅 **실측** anomaly 항목(확정 결정 3종 세트의 셋째).
+    #[test]
+    fn diag_dept_awakening_seed_flags_unseeded_dept() {
+        let base = std::env::temp_dir().join(format!("cys-doc-awseed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+
+        // ① 부서 팩 0 → Ok(해당 없음).
+        assert_eq!(diag_dept_awakening_seed(&ctx).status, DiagStatus::Ok);
+
+        // ② agents.json 부재(계정 dir 미시드) 부서 → anomaly Warn.
+        let dept = base.join("pack-dept-a");
+        std::fs::create_dir_all(&dept).unwrap();
+        let it = diag_dept_awakening_seed(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("pack-dept-a"), "{}", it.detail);
+        assert!(it.detail.contains("계정 dir 미시드"), "{}", it.detail);
+
+        // ③ acct 시드는 됐지만 acctdir 훅 미시드(잔존 0 무각성 부팅 셀 — residue 로는 안 보인다).
+        let acct = base.join("acct-a");
+        std::fs::write(
+            dept.join("agents.json"),
+            serde_json::to_string(
+                &json!({"claude": {"env": {"CLAUDE_CONFIG_DIR": acct.to_string_lossy()}}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let it = diag_dept_awakening_seed(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("각성 훅 미시드"), "{}", it.detail);
+
+        // ④ acctdir 각성 훅 실측 등록 → anomaly 0(Ok) — residue --fix 조건부와 같은 술어.
+        std::fs::create_dir_all(&acct).unwrap();
+        install_claude_hook(&acct.join("settings.json").to_string_lossy(), &dept).unwrap();
+        let it = diag_dept_awakening_seed(&ctx);
+        assert_eq!(it.status, DiagStatus::Ok, "{}", it.detail);
         let _ = std::fs::remove_dir_all(&base);
     }
 
