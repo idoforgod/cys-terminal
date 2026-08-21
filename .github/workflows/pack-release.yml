@@ -136,7 +136,7 @@ jobs:
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
-                   test_role_bootstrap_hook; do
+                   test_role_bootstrap_hook test_seat_latch_negation; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="
@@ -158,6 +158,13 @@ jobs:
             echo "::error::[pack-only] javis_detect self-test 실패 — 감지기 4축 억제 회귀. 서명 전 차단." >&2
             exit 1
           fi
+          # ★W-CI2(2026-08-21): Wave 2 좌석 래치 회귀 핀 test_seat_latch_negation 편입(위 루프
+          #   말미 · 실측 0.007s·19케이스 · 순수 픽스처·라이브 무접촉 — ci-branch·release 와
+          #   같은 커밋·3완전 레인 동시 대칭). 판정 원본 javis_orchestra.py·javis_boot_node.py
+          #   는 이 레인이 서명·배송하는 팩 내용물 — W8·W-CI 와 같은 사유로 서명 전 차단이
+          #   정위치다(레인 하나 빼먹기가 이 리포의 반복 사고 형태). 봉인: awakened_at 래치
+          #   부정 3중 AND + ★agent_alive:null(Windows master) 래치 유지 — 낙관적 falsy 역수리 =
+          #   Windows 전 pane 사망(치명 앵커 ④) 재발 경로를 서명 전에 차단한다.
           # ★todo 스캔 집합 파리티(S18) — 파서 파리티와 다른 표면("같은 파일을 보는가").
           echo "== [pack-only] todo 스캔 집합 2언어 파리티(C1·C2 동일 파일 집합) =="
           hs="cysjavis-pack/bin/tests/parity_todo_scan.py"
