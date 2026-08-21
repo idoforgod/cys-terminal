@@ -2405,16 +2405,27 @@ fn run(command: Command) -> i32 {
             // 결정론 조회 전용(쓰기 0) — 분류 SOT 는 pack::ownership() 한 곳(pack-guard hook 이 소비).
             // ★effective 등급: 치유·prune 은 임베드/매니페스트 파일에만 작용하므로, 임베드에 없는
             // 자작 신규 파일은 등급과 무관하게 불가침 — "custom" 으로 구분해 hook 오탐을 차단한다.
+            // ★G3 축2: 스코프 인지 분류 — dept 팩(pack-dept-*)의 soul.md 는 seed-once(base 헌장
+            // 승계 후 불가침). --quiet 어휘 4종({system,user,seed-once,custom})은 그대로이며
+            // pack-guard.sh 는 `= "system"` 비교만 하므로 user→seed-once 전이는 훅 거동 무변.
+            let dir = cys::pack::pack_dir();
             let embedded = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == rel.as_str());
-            let name = if embedded { cys::pack::ownership_name(&rel) } else { "custom" };
+            let name =
+                if embedded { cys::pack::ownership_name_scoped(&rel, &dir) } else { "custom" };
             if quiet {
                 println!("{name}");
             } else {
-                let meaning = match name {
-                    "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
-                    "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
-                    "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
-                    _ => "vendor 소유 — 수정본은 다음 설치 스윕에 치유(수정 전 .user 보존). 자작은 새 파일로",
+                let dept_soul = cys::pack::dept_scope_of(&dir).is_some()
+                    && (rel == "soul.md" || rel.ends_with("/soul.md"));
+                let meaning = if dept_soul && name == "seed-once" {
+                    "부서 soul — base 헌장 승계(최초 1회 시드), 존재하면 force 여도 불가침"
+                } else {
+                    match name {
+                        "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
+                        "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
+                        "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
+                        _ => "vendor 소유 — 수정본은 다음 설치 스윕에 치유(수정 전 .user 보존). 자작은 새 파일로",
+                    }
                 };
                 println!("{rel}: {name} — {meaning}");
             }
@@ -3608,7 +3619,13 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     // §3.1 팩 atomic swap: 파일별 in-place write(중단 시 반쯤 쓰인 팩) 대신 staging 전개→검증→
     // 원자 rename 교체(pack_dir.prev 1세대 보존). 중단은 기존 팩을 건드리지 않는다.
     // W0-d: cys init-pack CLI 핸들러는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
-    let (written, kept) = match cys::pack::install_staged(force, Some(cys::pack::PackWriteAuth::production())) {
+    // ★G3(--no-install-hook 일관성): 훅 억제는 개인 프로필(~/.claude*)뿐 아니라 격리 config dir
+    // 훅 병합까지 일관 적용된다(install_hooks = !no_install_hook — 모든 계급의 훅 등록 억제).
+    let (written, kept) = match cys::pack::install_staged(
+        force,
+        Some(cys::pack::PackWriteAuth::production()),
+        !no_install_hook,
+    ) {
         Ok(wk) => wk,
         Err(e) => {
             eprintln!("error: {e}");
@@ -11770,7 +11787,9 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
                 let prev_bytes = std::fs::read(&p).unwrap_or_default();
                 let cur_bytes = std::fs::read(dir.join(rel_path)).unwrap_or_default();
                 if prev_bytes != cur_bytes {
-                    let own = cys::pack::ownership_name(&rel_s);
+                    // ★G3 축2: 스코프 인지 라벨 — dept 팩의 soul.md 는 seed-once 로 표시(분류
+                    // SOT 단일 통과 — 설치가 seed-once 로 다루는 파일을 목록이 user 로 말하면 안 된다).
+                    let own = cys::pack::ownership_name_scoped(&rel_s, &dir);
                     println!("  [{own}] {rel_s}");
                     count += 1;
                     if count >= 200 {
@@ -11796,12 +11815,23 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
         eprintln!("{msg}");
         return 1;
     }
-    let own = cys::pack::ownership_name(&rel);
+    // ★G3 축2: 스코프 인지 등급 — dept 팩의 soul.md 는 seed-once(승계 후 불가침)라 rollback
+    // 덮어쓰기도 함께 거부된다(base 레인 거동·기존 메시지는 불변, dept soul 분기만 additive).
+    let own = cys::pack::ownership_name_scoped(&rel, &dir);
     if own == "seed-once" {
-        eprintln!(
-            "⛔ '{rel}' 은 런타임 상태(seed-once) — 롤백이 업데이트 후 쌓인 기억·상태를 지우는 \
-             역방향 소실을 만들므로 파일 단위 복원 대상에서 제외합니다."
-        );
+        let dept_soul = cys::pack::dept_scope_of(&dir).is_some()
+            && (rel == "soul.md" || rel.ends_with("/soul.md"));
+        if dept_soul {
+            eprintln!(
+                "⛔ '{rel}' 은 부서 soul(seed-once) — base 헌장 승계 후 불가침이라 파일 단위 복원 \
+                 대상에서 제외합니다(의도적 재시드는 파일 삭제 후 init-pack)."
+            );
+        } else {
+            eprintln!(
+                "⛔ '{rel}' 은 런타임 상태(seed-once) — 롤백이 업데이트 후 쌓인 기억·상태를 지우는 \
+                 역방향 소실을 만들므로 파일 단위 복원 대상에서 제외합니다."
+            );
+        }
         return 1;
     }
     let src = prev.join(&rel);

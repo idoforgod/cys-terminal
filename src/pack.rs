@@ -653,7 +653,9 @@ pub fn config_dir_for(
 /// 격리 config dir 셋업: cys 라우터(CLAUDE.md)와 SessionStart hook(settings.json)을 설치한다.
 /// ★보존 모드 — 기존 파일은 덮지 않는다(사용자 커스터마이즈 불가침). best-effort(실패해도
 /// pack 설치 자체는 유효). 사용자 ~/.claude 는 절대 건드리지 않는다(격리의 핵심).
-fn setup_isolated_config_dir() {
+/// ★G3: `install_hooks=false` 면 라우터(CLAUDE.md — 훅이 아님) 시드는 유지하되 훅 병합·검증·
+/// 개인 프로필 병합을 전부 생략한다(--no-install-hook 의미론 통일 — 모든 계급의 훅 등록 억제).
+fn setup_isolated_config_dir(install_hooks: bool) {
     let Some(cfg) = config_dir() else {
         // ★G3 축1(확정 재설계): 부서 팩 스코프 + CYS_ACCOUNT_DIR 부재 = 실소비 SOT 없음 →
         //   **시드 생략**(fail-closed). 종전엔 config_dir 가 공용 ~/.cys/claude 로 접혀 부서 경로
@@ -682,6 +684,13 @@ fn setup_isolated_config_dir() {
             // 고치지 않는다(보존 모드가 덮지 않으므로). 원자 교체는 '옛 완본 또는 새 완본'만 남긴다.
             let _ = write_atomic(&claude_md, tmpl.as_bytes());
         }
+    }
+    if !install_hooks {
+        // ★G3(--no-install-hook 일관성): 종전엔 이 플래그가 ~/.claude 대상만 막고 격리 config dir
+        // 훅 병합(아래)은 그대로 돌았다 — 훅 억제를 요청한 운영자에게 훅이 몰래 등록되는 비일관.
+        // 라우터는 훅이 아니므로 위에서 시드 유지, 훅 계열(병합·검증·개인 프로필)은 전부 생략.
+        println!("[pack] 훅 미설치(--no-install-hook) — 격리 config·개인 프로필 훅 등록 생략");
+        return;
     }
     // hook: <cfg>/settings.json 에 **소망 훅 집합(AWAKENING_HOOKS)** 을 이벤트 단위 멱등 병합.
     //
@@ -911,6 +920,9 @@ pub fn content_hash_pub(content: &str) -> String {
 ///   system(update)  = bin/*.py·hooks/*·skills·schemas·templates 등 그 외 전부(cysd 소유·스큐 금지).
 /// P0-4 수리: 과거 `_ =>` catch-all 이 매니페스트 부재·읽기 실패까지 'user 수정'으로 오판해 phoenix(system)를
 /// 영구 동결시켜 배포 스큐를 냈다 — 이 분류가 그 근원을 대체한다(CLAUDE.md.template 은 .template 이라 system).
+/// ★G3 축2 이후: 런타임 소비처는 전부 스코프 인지판(ownership_scoped != System 등)으로 이동했고,
+/// 이 술어 래퍼 2종은 Base 등급표 회귀 핀(테스트)의 소비 대상으로 남는다 — 삭제 금지(핀 약화).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_user_owned(rel: &str) -> bool {
     ownership(rel) == Ownership::User
 }
@@ -922,6 +934,7 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
 /// vendor 골격으로 원복돼 기억·상태가 주기 소실된다(실측: 로컬 원장 healed 0.12.46~47 3건 + 배포
 /// 사용자 기계 동일 사고 4회차). round/ 의 정적 계약(TOOL_RESULT_VOCAB·catalog·video-archetypes)은
 /// 상태가 아니므로 system 유지 — 상태 파일만 좁게 열거한다. 의도적 초기화 = 파일 삭제 후 init-pack.
+#[cfg_attr(not(test), allow(dead_code))] // 위 is_user_owned 와 동일 사유(Base 등급표 핀 소비).
 pub(crate) fn is_seed_once(rel: &str) -> bool {
     ownership(rel) == Ownership::SeedOnce
 }
@@ -996,6 +1009,54 @@ pub fn ownership_name(rel: &str) -> &'static str {
     }
 }
 
+/// ★G3 축2(2026-08-21 확정): 팩 스코프 — 같은 rel 이라도 base 팩과 부서 팩(`pack-dept-*`)에서
+/// 소유권 등급이 다를 수 있다(현행 차등은 soul.md 하나). 스코프는 **데이터**로 주입한다 —
+/// decide_file_action 의 순수성(부수효과 0·env 무참조)을 유지하고, install_staged 의 staging
+/// (`.pack-staging-init-*` — basename 에 부서 정보가 없다)에서도 논리 대상의 스코프가 흐르게 한다.
+/// pub 인 이유: install_into(pub) 시그니처에 흐르는 타입은 private 일 수 없다(E0446).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackScope {
+    /// 공용 base 팩(~/.cys/pack) — 기존 등급표 그대로(byte-identical 거동 보증).
+    Base,
+    /// 부서 팩(pack-dept-*) — soul.md 만 SeedOnce 로 승격(base 헌장 승계 후 불가침).
+    Dept,
+}
+
+/// 디렉터리 → 스코프. 부서 판정 규칙의 등재소는 `dept_scope_of` 한 곳이다(이 함수는 래퍼 —
+/// RC1 사본 드리프트 금지). 빈 부서명(`pack-dept-`)은 dept_scope_of 가 None 이라 Base 취급.
+pub fn pack_scope_of(dir: &Path) -> PackScope {
+    if dept_scope_of(dir).is_some() {
+        PackScope::Dept
+    } else {
+        PackScope::Base
+    }
+}
+
+/// 스코프 인지 소유권 — Base 는 기존 `ownership()` 그대로(`ownership(rel) ==
+/// ownership_scoped(rel, Base)` 항등이 계약이며 ownership_scoped_matrix 가 PACK_ALL 전량으로
+/// 봉인한다). Dept 는 soul.md(및 */soul.md)만 SeedOnce 로 승격 — 부서 soul 은 최초 1회 base
+/// 헌장을 승계해 시드되고(설치 코어 seed-from-base), 존재하면 force 여도 불가침이며, vendor
+/// 전진 시 `.new` 병치 노이즈가 구조적으로 소멸한다(결함4 해소 — decide_file_action 의
+/// seed-once 조기 반환이 병치 판정보다 먼저다).
+pub(crate) fn ownership_scoped(rel: &str, scope: PackScope) -> Ownership {
+    if scope == PackScope::Dept && (rel == "soul.md" || rel.ends_with("/soul.md")) {
+        return Ownership::SeedOnce;
+    }
+    ownership(rel)
+}
+
+/// `ownership_name` 의 스코프 인지판 — CLI(pack-ownership·pack-rollback 가드)가 팩 경로로
+/// 스코프를 산출해 소비한다. 출력 어휘는 기존 3종({system,user,seed-once}) 그대로다 — dept
+/// 스코프에서 soul.md 가 "seed-once" 로 나오는 것은 정당한 신규 값이며, pack-guard.sh 는
+/// `= "system"` 정확 비교만 하므로 user→seed-once 전이는 훅 거동 무변(하위호환 계약).
+pub fn ownership_name_scoped(rel: &str, pack: &Path) -> &'static str {
+    match ownership_scoped(rel, pack_scope_of(pack)) {
+        Ownership::System => "system",
+        Ownership::User => "user",
+        Ownership::SeedOnce => "seed-once",
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ★사용자 커스터마이즈 절충 계층 (2026-07-07 오너 승인 6층 로드맵의 ②③④ 코어)
 //   문제: system 파일은 매 install 강제 치유(P0-4)로 사용자 수정이 소실, user-owned 는
@@ -1044,6 +1105,8 @@ pub(crate) enum FileAction {
 
 /// 현행 install_into 분기(★B2 user-owned 영구 보존 · P0-4 system 강제 치유 · 비수정 자동 갱신)를
 /// 글자 그대로 보존한 순수 판정 + 신규 부수효과 플래그(heal_user_copy·new_pending)만 추가한다.
+/// ★G3 축2: `scope` 는 데이터 파라미터(순수성 유지) — Base 면 종전 등급표와 byte-identical 이고
+/// (기존 핀 전량이 Base 셈으로 무수정 초록 = 하위호환의 기계 증거), Dept 면 soul.md 만 SeedOnce.
 pub(crate) fn decide_file_action(
     rel: &str,
     embed: &str,
@@ -1051,13 +1114,15 @@ pub(crate) fn decide_file_action(
     disk: Option<&str>, // None = 부재 또는 읽기 실패(비UTF-8 등)
     manifest_hash: Option<&str>,
     force: bool,
+    scope: PackScope,
 ) -> FileAction {
     // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도) — 부재 시에만 아래 시드 설치.
-    if exists && is_seed_once(rel) {
+    // (dept 스코프의 soul.md 도 이 조기 반환을 탄다 — 병치 판정보다 먼저라 결함4 가 구조 소멸.)
+    if exists && ownership_scoped(rel, scope) == Ownership::SeedOnce {
         return FileAction::Keep { adopt_hash: false, new_pending: false };
     }
     // ★B2 user-owned 영구 보존 (force 여도) — 읽기 성공 + 내용 상이일 때.
-    if exists && is_user_owned(rel) {
+    if exists && ownership_scoped(rel, scope) == Ownership::User {
         if let Some(d) = disk {
             if d != embed {
                 // 임베드가 마지막 적용본(매니페스트 해시)에서 전진했으면 신버전 병치(병합 대기).
@@ -1091,7 +1156,7 @@ pub(crate) fn decide_file_action(
             }
             _ => {
                 // 사용자 수정본·매니페스트 부재·읽기 실패.
-                if is_user_owned(rel) {
+                if ownership_scoped(rel, scope) == Ownership::User {
                     // ★W-1 이후 이 가지는 도달 불가다(읽기 실패는 위 else 가 force 무관하게 먼저
                     // 잡고, 내용 상이는 첫 블록이 잡는다). 다중 방어로 남겨둔다 — 위 분기가 훗날
                     // 리팩터링으로 흔들려도 force=false 경로의 보존은 여기서 한 번 더 성립한다.
@@ -1169,6 +1234,8 @@ pub fn plan_install(
     target_version: &str,
 ) -> InstallPlan {
     let mut plan = InstallPlan::default();
+    // ★G3 축2: 스코프 1회 산출(plan 의 dir 는 실 팩 경로 — staging 우회 없음) → 전 판정에 데이터로 주입.
+    let scope = pack_scope_of(dir);
     // 다운그레이드 차단 미러(install_into 와 동일 판정).
     if !force {
         if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
@@ -1199,6 +1266,7 @@ pub fn plan_install(
             disk.as_deref(),
             manifest.get(rel).map(String::as_str),
             force,
+            scope,
         ) {
             FileAction::Write { heal_user_copy: true } => plan.heal.push(rel.to_string()),
             FileAction::Write { heal_user_copy: false } => {
@@ -1210,7 +1278,10 @@ pub fn plan_install(
             }
             FileAction::Keep { new_pending: true, .. } => plan.merge_new.push(rel.to_string()),
             FileAction::Keep { .. } => {
-                if (is_user_owned(rel) || is_seed_once(rel)) && disk.as_deref() != Some(content) {
+                // 비-System(user·seed-once) — 스코프 인지 판정(dept soul 은 SeedOnce 라도 동일 분류).
+                if ownership_scoped(rel, scope) != Ownership::System
+                    && disk.as_deref() != Some(content)
+                {
                     plan.keep_user.push(rel.to_string());
                 } else {
                     plan.unchanged += 1;
@@ -1222,7 +1293,9 @@ pub fn plan_install(
     let embedded: std::collections::HashSet<&str> = items.iter().map(|(rel, _)| *rel).collect();
     if !embedded.is_empty() {
         for (rel, mh) in manifest.iter() {
-            if embedded.contains(rel.as_str()) || is_user_owned(rel) || is_seed_once(rel) {
+            if embedded.contains(rel.as_str())
+                || ownership_scoped(rel, scope) != Ownership::System
+            {
                 continue;
             }
             match std::fs::read_to_string(dir.join(rel)) {
@@ -1364,6 +1437,77 @@ pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize
     )
 }
 
+/// ★G3 축2(seed-from-base): 부서 soul.md 최초 시드 본문 산출. base 팩 위치는 **형제 규약**
+/// `<dir 부모>/pack`(프로덕션 ~/.cys/pack 과 동일) — install_staged 의 staging(`.pack-staging-init-*`)
+/// 도 pack_dir 형제라 같은 부모를 공유해 동일하게 성립한다(경로 규약 등재소는 이 함수 한 곳).
+/// 판독 실패·공백이면 임베드 템플릿 폴백 + stderr 강등 고지 — fail-open 이 아니라 "부서가 soul
+/// 없이 뜨는" 더 큰 결함의 방지다(시드 자체는 항상 진행·성찰 위험③ 확정). 승계본이 안전핵
+/// 키워드(overrides::SAFETY_KEYWORDS)를 하나도 포함하지 않으면 WARN(시드는 진행 — base 가
+/// 과도 상태일 수 있음을 감사 가능하게). 승계/강등 사실은 `.merge-audit.jsonl` 에
+/// action="seed-from-base" 라인으로 영속한다(Wave1 원장 기계 재사용 — 필드명은 cys.rs
+/// merge_audit_entry 스키마 정합: ts/file/action/actor_os_user/before·after_sha256/verify_result/
+/// flags + additive "source". 기록 실패는 loud 후 불차단 — 감사는 관측이지 게이트가 아니다).
+fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
+    let base_soul = dir.parent().map(|p| p.join("pack").join("soul.md"));
+    let inherited = base_soul
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|s| !s.trim().is_empty());
+    let (content, source, verify) = match inherited {
+        Some(s) => {
+            let lower = s.to_lowercase();
+            let has_core = crate::overrides::SAFETY_KEYWORDS
+                .iter()
+                .any(|kw| lower.contains(kw));
+            if !has_core {
+                eprintln!(
+                    "[pack] ⚠ 부서 soul 시드: base 헌장 승계본에 안전핵 키워드 0건 — base soul 이 \
+                     과도 상태일 수 있음(시드는 진행 · 감사 원장에 기록)"
+                );
+            }
+            let src = base_soul
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            (s, src, if has_core { "pass" } else { "warn-no-safety-core" })
+        }
+        None => {
+            eprintln!(
+                "[pack] ⚠ 부서 soul 시드: base 헌장({}) 승계 실패(부재·판독 불가·공백) — 임베드 \
+                 템플릿 시드로 강등",
+                base_soul
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<부모 없음>".into())
+            );
+            (embed.to_string(), "embed-template".to_string(), "degraded-template-fallback")
+        }
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let os_user = std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" })
+        .unwrap_or_else(|_| "unknown".into());
+    let entry = serde_json::json!({
+        "ts": ts,
+        "file": rel,
+        "action": "seed-from-base",
+        "actor_os_user": os_user,
+        "before_sha256": null, // 시드 전 부재(!exists 게이트) — 전신 없음
+        "after_sha256": content_hash(&content),
+        "verify_result": verify,
+        "flags": [],
+        "source": source,
+    });
+    // 신설 팩 첫 시드는 파일 쓰기(부모 생성)보다 먼저 돈다 — 원장 append 가 dir 부재로 죽지 않게.
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = append_merge_audit(dir, &entry) {
+        eprintln!("⚠ 감사 원장 기록 실패(시드는 계속): {e}");
+    }
+    content
+}
+
 /// install의 **파일 반영 코어**(§7-⑤): `(rel, content)` 이터레이터를 입력원으로 받아 preserve-gate·
 /// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
 /// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
@@ -1380,6 +1524,9 @@ pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize
 /// Err 반환해 apply_pack_transactional이 rollback_journal를 타게 한다 — 매니페스트가 손상/구상태로
 /// 남으면 다음 update preserve-gate가 새 파일을 사용자 수정본으로 오판(자동갱신·prune 차단)하는
 /// 부분커밋을 차단(R2CODE2 HIGH #1).
+/// ★G3 축2: `scope` 는 **호출자가 논리 대상에서 산출**해 넘긴다(install_from_iter=pack_dir,
+/// install_staged=pack_dir — staging 의 basename `.pack-staging-init-*` 에는 부서 정보가 없어
+/// 여기서 dir 재판정하면 부서 팩이 Base 로 오판된다). Base 스코프 거동은 byte-identical.
 pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     dir: PathBuf,
     items: I,
@@ -1387,6 +1534,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     target_version: &str,
     transactional: bool,
     setup_config: bool,
+    scope: PackScope,
     auth: Option<PackWriteAuth>,
 ) -> Result<(usize, usize), String> {
     // ★W0-d 양성 인가 게이트(최후 방어) — 어떤 부수효과보다 먼저. 대상이 라이브 기본 경로면
@@ -1468,7 +1616,21 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
         let unreadable = exists && disk.is_none();
         let mhash: Option<String> = manifest.get(rel).cloned();
-        match decide_file_action(rel, content, exists, disk.as_deref(), mhash.as_deref(), force) {
+        // ★G3 축2(seed-from-base): 부서 soul.md 의 최초 시드는 임베드 템플릿이 아니라 **base 팩의
+        // 현행 soul.md 승계**다(부서는 base 헌장 아래에서 태어난다 — 2026-08-21 확정). `!exists`
+        // 에만 발동하므로 이후 SeedOnce 불가침과 정합하고, 치환된 content 가 아래 판정·write·
+        // 매니페스트 해시·pristine 까지 한 흐름으로 흘러 스큐가 없다.
+        let seed_override: Option<String> = if scope == PackScope::Dept
+            && !exists
+            && (rel == "soul.md" || rel.ends_with("/soul.md"))
+        {
+            Some(seed_dept_soul_content(&dir, rel, content))
+        } else {
+            None
+        };
+        let content: &str = seed_override.as_deref().unwrap_or(content);
+        match decide_file_action(rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope)
+        {
             FileAction::Keep { adopt_hash, new_pending } => {
                 if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
@@ -1585,8 +1747,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 .collect();
             let mut pruned = 0;
             for rel in stale {
-                if is_user_owned(&rel) || is_seed_once(&rel) {
-                    continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외
+                if ownership_scoped(&rel, scope) != Ownership::System {
+                    continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외(스코프 인지)
                 }
                 let path = dir.join(&rel);
                 match std::fs::read_to_string(&path) {
@@ -1665,7 +1827,9 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // ★staging 경로(install_staged)는 setup_config=false로 여기서 건너뛰고, atomic swap 후 실
     // pack_dir에 대해 한 번 셋업한다(격리 config는 pack_dir 형제라 staging 대상이 아님).
     if setup_config {
-        setup_isolated_config_dir();
+        // 훅 등록 억제(--no-install-hook)는 staged 경로(install_staged)만의 관심사 — 이 인라인
+        // 경로(cysd 자동설치·install_from_iter)는 항상 완전 시드다(거동 불변·설계 확정).
+        setup_isolated_config_dir(true);
     }
     #[cfg(unix)]
     {
@@ -1696,7 +1860,10 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     transactional: bool,
     auth: Option<PackWriteAuth>,
 ) -> Result<(usize, usize), String> {
-    install_into(pack_dir(), items, force, target_version, transactional, true, auth)
+    let dir = pack_dir();
+    // ★G3 축2: 스코프는 실 pack_dir 에서 산출(부서 데몬 자동설치가 이 경로 — dept soul 승계·불가침).
+    let scope = pack_scope_of(&dir);
+    install_into(dir, items, force, target_version, transactional, true, scope, auth)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1807,8 +1974,19 @@ pub fn verify_staging(staging: &Path, items: &[(&str, &str)]) -> Result<(), Stri
 /// 원자 교체 기반 init-pack 설치(§3.1). 현재 pack_dir을 staging에 전량 복사→install_into로 임베드
 /// 반영(preserve-gate·prune·.pack-version)→검증→원자 rename 교체→실 pack_dir에 config 격리 셋업.
 /// 중단(카피·반영·검증 중 abort)은 기존 pack_dir을 건드리지 않는다(원자성). 반환: (written, kept).
-pub fn install_staged(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
+/// ★G3: `install_hooks=false`(init-pack --no-install-hook)면 마지막 config 격리 셋업에서 훅
+/// 병합·검증·개인 프로필 병합을 생략한다(라우터 시드는 유지) — 훅 억제의 의미론을 '모든 계급의
+/// 훅 등록 억제'로 통일(종전엔 ~/.claude 만 막고 격리 config dir 병합은 못 막던 비일관 해소).
+pub fn install_staged(
+    force: bool,
+    auth: Option<PackWriteAuth>,
+    install_hooks: bool,
+) -> Result<(usize, usize), String> {
     let dir = pack_dir();
+    // ★G3 축2: 스코프는 staging basename(`.pack-staging-init-*` — 부서 정보 없음)이 아니라
+    // **논리 대상**(pack_dir)에서 산출해 데이터로 주입한다 — 부서 팩의 init-pack 도 staged 경로를
+    // 타므로, 여기서 산출하지 않으면 dept soul 이 Base(User) 로 오판돼 결함4(.new 병치)가 재발한다.
+    let scope = pack_scope_of(&dir);
     // ★W0-d: 최종 commit/rename(atomic_swap)이 라이브 기본 경로를 원자 교체하므로, 어떤 staging
     // 작업보다 먼저 인가를 검사한다(비라이브 대상·인가 보유는 통과 — 테스트는 temp 대상이라 무영향).
     authorize_pack_write(&dir, auth)?;
@@ -1832,6 +2010,7 @@ pub fn install_staged(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize
         env!("CARGO_PKG_VERSION"),
         false,
         false,
+        scope, // 논리 대상(pack_dir)의 스코프 — staging basename 재판정 금지(위 주석).
         None, // staging은 비라이브 형제 경로 — 여기 쓰기는 인가 불요(라이브 인가는 위 swap 게이트가 담당).
     ) {
         Ok(v) => v,
@@ -1851,7 +2030,7 @@ pub fn install_staged(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize
         return Err(e);
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
-    setup_isolated_config_dir();
+    setup_isolated_config_dir(install_hooks);
     Ok((written, kept))
 }
 
@@ -2169,6 +2348,28 @@ mod tests {
     fn dir_file(role: &str) -> Option<String> {
         role_directive_path(role)
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    }
+
+    /// [G3 축2 회귀 핀 셈] 기존 판정 핀 전량을 **무수정 초록**으로 유지하는 Base 스코프 셈 —
+    /// 로컬 fn 이 glob import(super::decide_file_action)를 가리므로 기존 6-인자 호출이 전부 이
+    /// 셈을 통해 Base 등급표로 돈다 = `ownership(rel)==ownership_scoped(rel, Base)` 항등과
+    /// "base 레인 거동 byte-identical" 의 기계 증거. dept 스코프 검증은 super:: 경로로 명시 호출.
+    fn decide_file_action(
+        rel: &str,
+        embed: &str,
+        exists: bool,
+        disk: Option<&str>,
+        manifest_hash: Option<&str>,
+        force: bool,
+    ) -> FileAction {
+        super::decide_file_action(rel, embed, exists, disk, manifest_hash, force, PackScope::Base)
+    }
+
+    /// [G3 회귀 핀 셈] 기존 install_staged 핀 전량을 무수정 초록으로 유지 — install_hooks=true
+    /// 가 종전 거동(훅 병합 포함)의 박제다. --no-install-hook 경로는 no_install_hook_consistency
+    /// 가 super:: 경로로 명시 검증.
+    fn install_staged(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
+        super::install_staged(force, auth, true)
     }
 
     /// ★T-0147-1 실증 검체(W3) — **목 개인 프로필**에 각성 훅을 병합해 3단 단언한다:
@@ -3089,6 +3290,100 @@ mod tests {
         }
     }
 
+    /// [회귀 핀·G3 축2] 스코프 인지 소유권 매트릭스 — ① dept 차등은 soul.md 하나(SeedOnce 승격)
+    /// ② `ownership(rel)==ownership_scoped(rel, Base)` 항등을 PACK_ALL 전량 스냅샷으로 봉인(Base
+    /// 등급표 불변 = base 레인 거동 byte-identical 보증) ③ dept 도 soul 외 전 rel 은 base 와 동일
+    /// (차등 최소 원칙 — 조용한 광역 회귀 금지).
+    #[test]
+    fn ownership_scoped_matrix() {
+        // dept soul = SeedOnce(승계 후 불가침) · base soul = User(기존 핀).
+        assert_eq!(ownership_scoped("soul.md", PackScope::Dept), Ownership::SeedOnce);
+        assert_eq!(ownership_scoped("soul.md", PackScope::Base), Ownership::User);
+        assert_eq!(ownership_scoped("sub/soul.md", PackScope::Dept), Ownership::SeedOnce);
+        // 상태 경로는 양 스코프 SeedOnce(기존 등급 유지).
+        assert_eq!(ownership_scoped("memory/MEMORY.md", PackScope::Base), Ownership::SeedOnce);
+        assert_eq!(ownership_scoped("memory/MEMORY.md", PackScope::Dept), Ownership::SeedOnce);
+        // ② Base 항등: PACK_ALL 전 rel 전량 대조.
+        for (rel, _) in PACK_ALL.iter() {
+            assert_eq!(
+                ownership(rel),
+                ownership_scoped(rel, PackScope::Base),
+                "Base 항등 위반: {rel}"
+            );
+        }
+        // ③ dept 는 soul.md 외 전 rel 에서 base 와 동일.
+        for (rel, _) in PACK_ALL.iter() {
+            if *rel == "soul.md" || rel.ends_with("/soul.md") {
+                continue;
+            }
+            assert_eq!(
+                ownership(rel),
+                ownership_scoped(rel, PackScope::Dept),
+                "dept 차등 과잉(soul 외 등급 변조 금지): {rel}"
+            );
+        }
+        // pack_scope_of: 부서 판정 규칙 등재소(dept_scope_of) 재사용 핀.
+        assert_eq!(pack_scope_of(Path::new("/h/.cys/pack")), PackScope::Base);
+        assert_eq!(pack_scope_of(Path::new("/h/.cys/pack-dept-sales")), PackScope::Dept);
+        assert_eq!(
+            pack_scope_of(Path::new("/h/.cys/pack-dept-")),
+            PackScope::Base,
+            "빈 부서명 = 불량 레인 = base 취급(dept_scope_of None 정합)"
+        );
+        // CLI 노출 어휘: dept soul 은 "seed-once"(정당한 신규 값), base soul 은 "user"(불변).
+        assert_eq!(ownership_name_scoped("soul.md", Path::new("/h/.cys/pack-dept-2")), "seed-once");
+        assert_eq!(ownership_name_scoped("soul.md", Path::new("/h/.cys/pack")), "user");
+        assert_eq!(
+            ownership_name_scoped("bin/javis_phoenix.py", Path::new("/h/.cys/pack-dept-2")),
+            "system"
+        );
+    }
+
+    /// [회귀 핀·G3 축2] decide_file_action 의 dept 스코프 4조합(dept×soul 유/무 + base 대조) —
+    /// dept soul 은 존재 시 force·vendor 전진 불문 불가침이고 `.new` 병치가 구조 소멸한다(결함4).
+    #[test]
+    fn decide_file_action_dept_soul_seed_once() {
+        use super::FileAction::*;
+        let embed = "EMBED-V2";
+        let d = PackScope::Dept;
+        // dept × soul 유: vendor 전진(매니페스트 구해시)이어도 병치 없이 불가침.
+        assert_eq!(
+            super::decide_file_action("soul.md", embed, true, Some("DEPT-SOUL"),
+                Some(content_hash("EMBED-V1").as_str()), false, d),
+            Keep { adopt_hash: false, new_pending: false },
+            "dept soul 전진에도 .new 병치 없음(결함4 구조 소멸)"
+        );
+        // dept × soul 유 + force: 여전히 불가침(SeedOnce 조기 반환).
+        assert_eq!(
+            super::decide_file_action("soul.md", embed, true, Some("DEPT-SOUL"), None, true, d),
+            Keep { adopt_hash: false, new_pending: false },
+            "dept soul 은 force 여도 불가침"
+        );
+        // dept × soul 무: 시드 설치(Write) — 승계 본문 치환은 install_into 의 seed-from-base 소관.
+        assert_eq!(
+            super::decide_file_action("soul.md", embed, false, None, None, false, d),
+            Write { heal_user_copy: false }
+        );
+        // base × soul 유(수정+전진): 기존 계약 그대로 .new 병치(대조 핀 — 기존 threeway 매트릭스와 동일).
+        assert_eq!(
+            super::decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
+                Some(content_hash("EMBED-V1").as_str()), false, PackScope::Base),
+            Keep { adopt_hash: false, new_pending: true },
+            "base soul 은 종전대로 병치(base 레인 불변)"
+        );
+        // base × soul 무: 신규 생성(기존 계약).
+        assert_eq!(
+            super::decide_file_action("soul.md", embed, false, None, None, false, PackScope::Base),
+            Write { heal_user_copy: false }
+        );
+        // dept 에서 soul 외 파일은 base 등급표 그대로(system 강제 치유 불변).
+        assert_eq!(
+            super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false, d),
+            Write { heal_user_copy: true },
+            "dept 스코프가 system 치유를 흔들면 안 된다"
+        );
+    }
+
     #[test]
     fn pack_dir_env_precedence_and_legacy_fallbacks() {
         // ★불변식 박제: pack_dir의 4단 폴백 우선순위.
@@ -3270,8 +3565,17 @@ mod tests {
             let _g1 = EnvGuard::set(ENV_PACK_DIR, &dpack);
             let _g2 = EnvGuard::remove(ENV_CONFIG_DIR);
             let _g3 = EnvGuard::set("CYS_ACCOUNT_DIR", &acct);
-            install_into(dpack.clone(), items.iter().copied(), false, "1.0.0", false, true, None)
-                .unwrap();
+            install_into(
+                dpack.clone(),
+                items.iter().copied(),
+                false,
+                "1.0.0",
+                false,
+                true,
+                pack_scope_of(&dpack),
+                None,
+            )
+            .unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(&shared_settings).unwrap(),
@@ -3295,8 +3599,17 @@ mod tests {
             let _g1 = EnvGuard::set(ENV_PACK_DIR, &dpack3);
             let _g2 = EnvGuard::remove(ENV_CONFIG_DIR);
             let _g3 = EnvGuard::remove("CYS_ACCOUNT_DIR");
-            install_into(dpack3.clone(), items.iter().copied(), false, "1.0.0", false, true, None)
-                .unwrap();
+            install_into(
+                dpack3.clone(),
+                items.iter().copied(),
+                false,
+                "1.0.0",
+                false,
+                true,
+                pack_scope_of(&dpack3),
+                None,
+            )
+            .unwrap();
         }
         assert_eq!(
             std::fs::read_to_string(&shared_settings).unwrap(),
@@ -3308,6 +3621,145 @@ mod tests {
             !td.join(format!("{}-{}", "claude-dept", 3)).exists(),
             "레거시 폴백 dir 가 생성됐다(아무도 안 읽는 사각 디렉터리 금지 — BLOCKER 확정 위반)"
         );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [회귀 핀·G3 축2] 부서 soul seed-from-base 전 수명주기 — ① 최초 시드는 임베드 템플릿이
+    /// 아니라 **base 팩(형제 `pack`)의 현행 soul.md 승계**이고 매니페스트 해시·pristine 이 승계본과
+    /// 일관 ② vendor 전진(임베드 변경) 재설치에도 불가침 + `soul.md.new` 미생성(결함4 병치 소멸)
+    /// ③ base soul 부재 시 임베드 폴백 + 원장 강등 라인 ④ 구버전이 남긴 `.new`·pending 잔재는
+    /// 다음 설치가 정리(마이그레이션 계약) — 승계/강등 사실은 `.merge-audit.jsonl` 이 영속 증언.
+    #[test]
+    fn dept_soul_seeds_from_base() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-dept-soulseed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let base_pack = td.join("pack");
+        std::fs::create_dir_all(&base_pack).unwrap();
+        let base_soul = "# CEO-앵커-헌장\n안전핵 denylist 불변 · kill-switch 즉시 정지\n";
+        std::fs::write(base_pack.join("soul.md"), base_soul).unwrap();
+        let dpack = td.join("pack-dept-2");
+        std::fs::create_dir_all(&dpack).unwrap();
+        let _env = set_pack_env(&dpack, td.join("cfg"));
+        let items = [("soul.md", "TEMPLATE-SOUL-V1"), ("README.md", "R1")];
+
+        // ① 최초 설치: 부서 soul == base 승계본(템플릿 아님) + 매니페스트·pristine 일관 + 원장 pass.
+        install_into(
+            dpack.clone(),
+            items.iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&dpack),
+            None,
+        )
+        .unwrap();
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        assert_eq!(read(&dpack.join("soul.md")), base_soul, "부서 soul 은 base 헌장 승계본");
+        let manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&read(&dpack.join(INSTALL_MANIFEST))).unwrap();
+        assert_eq!(
+            manifest.get("soul.md"),
+            Some(&content_hash(base_soul)),
+            "매니페스트 해시는 승계본 기준(치환 content 일관 흐름)"
+        );
+        assert_eq!(
+            read(&dpack.join(PRISTINE_DIR).join("soul.md")),
+            base_soul,
+            "pristine 도 승계본(3-way 조상 일관)"
+        );
+        let audit = read(&dpack.join(MERGE_AUDIT_FILE));
+        assert!(
+            audit.contains("\"action\":\"seed-from-base\""),
+            "원장에 seed-from-base 라인: {audit}"
+        );
+        assert!(audit.contains("\"verify_result\":\"pass\""), "안전핵 포함 승계 = pass: {audit}");
+        assert!(
+            audit.contains(&content_hash(base_soul)),
+            "after_sha256 = 승계본 해시"
+        );
+
+        // ② vendor 전진 가장(임베드 변경) 재설치: 불가침 + .new 미생성(결함4 핀) + 원장 재발화 없음.
+        let items2 = [("soul.md", "TEMPLATE-SOUL-V2"), ("README.md", "R2")];
+        install_into(
+            dpack.clone(),
+            items2.iter().copied(),
+            false,
+            "1.0.1",
+            false,
+            false,
+            pack_scope_of(&dpack),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(&dpack.join("soul.md")), base_soul, "vendor 전진에도 부서 soul 불가침");
+        assert!(!dpack.join("soul.md.new").exists(), "결함4: dept soul 의 .new 병치 구조 소멸");
+        assert!(load_merge_pending(&dpack).get("soul.md").is_none(), "병합 대기 미생성");
+        let audit2 = read(&dpack.join(MERGE_AUDIT_FILE));
+        assert_eq!(
+            audit2.matches("seed-from-base").count(),
+            1,
+            "시드는 최초 1회만(존재 시 재발화 금지)"
+        );
+
+        // ③ base soul 부재: 임베드 템플릿 폴백 + 원장 강등 라인(fail-open 아님 — soul 없는 부팅 방지).
+        std::fs::remove_file(base_pack.join("soul.md")).unwrap();
+        let dpack3 = td.join("pack-dept-3");
+        std::fs::create_dir_all(&dpack3).unwrap();
+        install_into(
+            dpack3.clone(),
+            items.iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&dpack3),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read(&dpack3.join("soul.md")),
+            "TEMPLATE-SOUL-V1",
+            "base 부재 시 임베드 폴백(부서가 soul 없이 뜨지 않는다)"
+        );
+        assert!(
+            read(&dpack3.join(MERGE_AUDIT_FILE)).contains("degraded-template-fallback"),
+            "강등 사실 원장 기록"
+        );
+
+        // ④ 마이그레이션: 구버전이 남긴 dept soul 의 .new 병치·pending 잔재를 다음 설치가 정리.
+        let dpack4 = td.join("pack-dept-4");
+        std::fs::create_dir_all(&dpack4).unwrap();
+        std::fs::write(dpack4.join("soul.md"), "OLD-DEPT-SOUL").unwrap();
+        std::fs::write(dpack4.join("soul.md.new"), "STALE-VENDOR").unwrap();
+        std::fs::write(
+            dpack4.join(MERGE_PENDING_FILE),
+            serde_json::json!({
+                "soul.md": {"kind": "new-pending", "side": "soul.md.new", "version": "0.9.0", "ts": 1}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        install_into(
+            dpack4.clone(),
+            items.iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&dpack4),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(&dpack4.join("soul.md")), "OLD-DEPT-SOUL", "기존 부서 soul 소급 교체 금지");
+        assert!(!dpack4.join("soul.md.new").exists(), "구 병치본 정리(compat 계약)");
+        assert!(load_merge_pending(&dpack4).get("soul.md").is_none(), "구 pending 정리");
+
         let _ = std::fs::remove_dir_all(&td);
     }
 
@@ -3355,7 +3807,16 @@ mod tests {
         let items = vec![("probe.txt", "hello")];
 
         // 인가(None) 없이 라이브 기본 경로 쓰기 → Err, 아무것도 쓰이지 않음.
-        let res = install_into(live.clone(), items.iter().copied(), false, "2.0.0", false, false, None);
+        let res = install_into(
+            live.clone(),
+            items.iter().copied(),
+            false,
+            "2.0.0",
+            false,
+            false,
+            pack_scope_of(&live),
+            None,
+        );
         assert!(res.is_err(), "인가 없는 라이브 쓰기는 Err여야 한다: {res:?}");
         assert!(!live.join("probe.txt").exists(), "거부 후 파일이 쓰이면 안 된다");
 
@@ -3367,6 +3828,7 @@ mod tests {
             "2.0.0",
             false,
             false,
+            pack_scope_of(&live),
             Some(PackWriteAuth::for_test()),
         );
         assert!(ok.is_ok(), "인가 부여 시 라이브 쓰기는 성공해야 한다: {ok:?}");
@@ -3400,8 +3862,16 @@ mod tests {
         );
 
         let items = vec![("probe.txt", "hello")];
-        let res =
-            install_into(via_symlink.clone(), items.iter().copied(), false, "2.0.0", false, false, None);
+        let res = install_into(
+            via_symlink.clone(),
+            items.iter().copied(),
+            false,
+            "2.0.0",
+            false,
+            false,
+            pack_scope_of(&via_symlink),
+            None,
+        );
         assert!(res.is_err(), "심링크 경유 라이브 쓰기는 거부돼야 한다: {res:?}");
         assert!(!live.join("probe.txt").exists(), "거부 후 라이브에 파일이 쓰이면 안 된다");
 
@@ -4173,6 +4643,42 @@ mod tests {
             std::fs::read_to_string(pd.join(sys_target)).unwrap(),
             sys_embed,
             "★B2: system 파일 편집은 임베드로 강제 갱신(스큐 동결 금지)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// [회귀 핀·G3] --no-install-hook 일관성 — ① install_hooks=false 는 격리 config 의 라우터
+    /// (CLAUDE.md — 훅 아님)는 시드하되 **훅 계열은 0**(settings.json 자체 미생성 = hooks 키 부재)
+    /// ② install_hooks=true 는 종전 거동 그대로 소망 훅 집합 완비(기존 계약 핀). 종전엔 이
+    /// 플래그가 ~/.claude 대상만 막고 격리 config dir 병합은 못 막았다(비일관 — 설계 원문 (b)).
+    #[test]
+    fn no_install_hook_consistency() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "cys-staged-nohook-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        let cfg = base.join("cysclaude");
+        let _env = set_pack_env(&pd, &cfg);
+
+        // ① 훅 억제 설치: 라우터 시드는 유지, 훅은 어느 계급에도 0.
+        super::install_staged(false, None, false).unwrap();
+        assert!(cfg.join("CLAUDE.md").is_file(), "라우터(CLAUDE.md)는 훅이 아니므로 시드 유지");
+        assert!(
+            !cfg.join("settings.json").exists(),
+            "--no-install-hook 인데 격리 config 에 훅이 병합됐다(비일관 재발)"
+        );
+
+        // ② 기존 거동 핀: install_hooks=true 면 소망 훅 집합(AWAKENING_HOOKS) 등록 완비.
+        super::install_staged(false, None, true).unwrap();
+        assert!(
+            verify_desired_hooks_registered(&cfg.join("settings.json"), &pd, &AWAKENING_HOOKS)
+                .is_empty(),
+            "install_hooks=true 종전 거동(소망 훅 완비) 회귀"
         );
 
         let _ = std::fs::remove_dir_all(&base);

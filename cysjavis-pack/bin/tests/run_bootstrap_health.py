@@ -4790,7 +4790,7 @@ def h_seed_1():
     notes.append("개인 프로필 병합 동일 집합")
     # ⓔ ★W3 게이트: 설치 직후 '등록 집합 ⊇ 소망 집합' **실측 검증**이 배선돼 있다(주장 금지)
     need("pub fn verify_desired_hooks_registered(" in pk, "설치 후 ⊇ 검증 함수가 없다")
-    si = pk.find("fn setup_isolated_config_dir()")
+    si = pk.find("fn setup_isolated_config_dir(")  # W5-C: install_hooks 파라미터화 — 개폐괄호 무pin(시그니처 확장 허용·본문 검사는 동일)
     sbody = pk[si:pk.find("\n}\n", si)]
     need("verify_desired_hooks_registered(&settings" in sbody,
          "설치 경로가 '등록 집합 ⊇ 소망 집합' 을 검증하지 않는다(시드했다는 주장만 남는다)")
@@ -5087,7 +5087,7 @@ def h_seed_6():
     need("claude-dept-" not in pk_code,
          "레거시 폴백 dir(claude-dept-<name>)이 pack.rs 코드에 생겼다 — 판독자 전무 사각 디렉터리 금지"
          "(G3 축1 BLOCKER 확정 위반)")
-    si = pk.find("fn setup_isolated_config_dir()")
+    si = pk.find("fn setup_isolated_config_dir(")  # W5-C: install_hooks 파라미터화 — 개폐괄호 무pin(시그니처 확장 허용·본문 검사는 동일)
     need(si > 0, "setup_isolated_config_dir 을 못 찾았다")
     sbody = pk[si:pk.find("\n}\n", si)]
     need("CYS_ACCOUNT_DIR 미설정" in sbody and "시드 생략" in sbody,
