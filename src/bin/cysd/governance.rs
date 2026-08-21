@@ -23,6 +23,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut feed_reminded: HashMap<String, f64> = HashMap::new();
         let mut approval_debounce: HashMap<(u64, String), f64> = HashMap::new();
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
+        // ★G1(W2-D): 기아 경보(queue.starved) 전용 쿨다운 — depth_high 맵과 별도 축.
+        let mut queue_starve_alerted: HashMap<u64, f64> = HashMap::new();
         let mut deadman_last_alert: f64 = 0.0;
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
         // (learn gaps C12②) 재시작에도 디바운스 창 유지 — state 파일에서 복원.
@@ -51,7 +53,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
-                deliver_queued(&daemon, &mut queue_depth_alerted);
+                deliver_queued(&daemon, &mut queue_depth_alerted, &mut queue_starve_alerted);
                 reap_orphan_ledger(&daemon, &sys);
                 reap_exited_surfaces(&daemon);
                 reap_zombie_surfaces(&daemon, &sys, &mut zombie_miss);
@@ -86,6 +88,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                     now_epoch(),
                 );
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
+                queue_starve_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
                 zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
                 launch_flag_warned.retain(|sid| live_surface_ids.contains(sid));
@@ -2691,6 +2694,105 @@ fn queue_human_quiet_secs() -> u64 {
         .unwrap_or(30)
 }
 
+// ─── ★G1(W2-D): 단계형 quiet(기아·결함 1 봉인) 노브 3종 — 기본값 잠금 배포 ───────────
+// 활성화 절차(2단 롤아웃 · 브리프 확정): 1단(관측 배치 = **현재 기본값**) MAX_WAIT=0·
+// STARVE=0 — 배달 동작·주입 바이트 완전 현행 동일, queue.delivered 의 wait_secs 분포만
+// 관측된다. 2단(활성) 실측 분포 확인 후 데몬 env 에 CYS_QUEUE_MAX_WAIT_SECS=120 ·
+// CYS_QUEUE_STARVE_ALERT_SECS=600 권장값을 설정한다. 각 노브는 즉시 현행 복원 스위치를
+// 겸한다(0 재설정 = 구동작 — 무회귀 절대 불변).
+
+/// 단계형 배달의 머리 최대 대기(초) — 머리 항목의 (uptime 클램프) 대기가 이 값 이상이면
+/// quiet 임계를 `queue_overdue_quiet_secs()`(기본 1s)로 낮춘 '제한 배달(overdue)' 자격을
+/// 얻는다. **기본 0 = 단계형 비활성 = 현행 quiet 3s 규칙 그대로**(활성 권장값 120 — 위
+/// 롤아웃 주석). human_typing·pause·queue_paused·empty_seat 게이트는 이 노브와 무관하게
+/// 어떤 단계에서도 절대 면제되지 않는다(절대 불변).
+fn queue_max_wait_secs() -> u64 {
+    std::env::var("CYS_QUEUE_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// overdue(제한 배달) 단계의 quiet 임계(초) — 기본 1. '출력 중 주입 금지' 의미론의
+/// 하한이라 판정(queue_quiet_verdict)이 1 미만 설정을 1로 승격한다(0초 강제주입 봉인 —
+/// 회귀 핀 테스트 대상).
+fn queue_overdue_quiet_secs() -> u64 {
+    std::env::var("CYS_QUEUE_OVERDUE_QUIET_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// 기아 경보 임계(초) — 머리 대기(uptime 클램프)가 이 값 이상인 채 배달이 막혀 있으면
+/// `queue.starved` 발행(전용 쿨다운 5분 · depth_high 와 별도 축). **기본 0 = 비활성**
+/// (활성 권장값 600). 경보는 발행뿐 — 자동 조치 없음(hint 문구 계약 = state.rs).
+fn queue_starve_alert_secs() -> u64 {
+    std::env::var("CYS_QUEUE_STARVE_ALERT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// ★G1(W2-D): 단계형 quiet 판정 결과 — 순수 판정자(queue_quiet_verdict)의 어휘.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuietVerdict {
+    /// 배달 허용. `overdue=true` = max-wait 초과 머리의 '제한 배달'(완화 quiet 1s 로 통과).
+    /// 정상 quiet(기본 3s)를 채운 배달은 단계와 무관하게 `overdue=false`.
+    Deliver { overdue: bool },
+    /// 아직 바쁨(출력 중) — 이번 틱 배달 보류.
+    WaitBusy,
+}
+
+/// ★G1(W2-D): 단계형 quiet 순수 판정자 — 기아(결함 1) 봉인의 본체. 부작용·시계·env 없이
+/// 입력만으로 판정한다(approval_wakeup_suppressed 순수 술어 관례와 동형 — 테스트 핀 대상).
+///
+/// 규칙(우선순위 순):
+/// 1. `quiet_for >= quiet`(현행 3s 규칙 충족) → 정상 배달(overdue=false) — 현행 의미론 불변.
+/// 2. `max_wait == 0`(단계형 비활성) 또는 `head_wait_secs < max_wait` → WaitBusy(현행 그대로).
+/// 3. overdue 단계: `quiet_for >= max(overdue_quiet, 1)` → 제한 배달(overdue=true).
+///    `quiet_for == 0`(지금 출력 중)은 **어떤 단계에서도 배달 금지** — '출력 중 주입 금지'
+///    의미론은 overdue 에도 불변이다(0초 강제주입 아님 · 하한 1s 구조 봉인).
+///
+/// human_typing·pause·queue_paused·empty_seat 는 이 판정의 **입력이 아니다** — 그 게이트들은
+/// 호출부(deliver_queued)에서 이 판정과 무관하게 항상 별도 적용된다(면제 불가 · 절대 불변).
+pub(crate) fn queue_quiet_verdict(
+    head_wait_secs: u64,
+    quiet_for: u64,
+    quiet: u64,
+    max_wait: u64,
+    overdue_quiet: u64,
+) -> QuietVerdict {
+    if quiet_for >= quiet {
+        return QuietVerdict::Deliver { overdue: false };
+    }
+    if max_wait == 0 || head_wait_secs < max_wait {
+        return QuietVerdict::WaitBusy;
+    }
+    if quiet_for >= overdue_quiet.max(1) {
+        QuietVerdict::Deliver { overdue: true }
+    } else {
+        QuietVerdict::WaitBusy
+    }
+}
+
+/// ★G1(W2-D BLOCKER): overdue·기아 자격의 머리 대기 측정 — daemon/surface **uptime 클램프**.
+///
+/// 왜 enqueued_at 원값으로 재지 않는가: 재기동 직후엔 last_human_input(휘발·메모리)이 비어
+/// typing 가드가 무방비다. WAL 생존 항목의 원 enqueued_at 로 재면 부트 즉시 overdue 자격이
+/// 되어 stale 백로그가 부트체인 최취약 창(phoenix 부활·디렉티브 주입이 겹치는 구간)에 몰려
+/// 배달된다. 대기는 '이 부트의 이 surface 가 실제로 기다리게 한 시간'만 센다:
+/// 기준점 = max(enqueued_at, daemon.started_at, surface.created_at).
+/// 역행(시계 스큐·NTP 점프·미상 시각)은 0 클램프 — 측정 불능은 overdue 부적격(fail-closed).
+pub(crate) fn queue_head_wait_secs(
+    now: f64,
+    enqueued_at: f64,
+    daemon_started_at: f64,
+    surface_created_at: f64,
+) -> u64 {
+    let anchor = enqueued_at.max(daemon_started_at).max(surface_created_at);
+    (now - anchor).max(0.0) as u64
+}
+
 /// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
 /// 모든 '막힘' 분기에서 공통 호출한다(한 분기라도 빠지면 그 사유의 적체가 침묵한다).
 fn alert_queue_depth_if_high(
@@ -2735,6 +2837,47 @@ fn alert_queue_depth_if_high(
                "surface_ref": cys::surface_ref(s.id),
                "hint": format!("queued 배달이 막힌 채 적체 중 — read-screen으로 상태 점검, \
                                 급한 보고는 직접 send(steer). {knob}")}),
+    );
+}
+
+/// ★G1(W2-D): 기아 경보 — 머리 대기(uptime 클램프)가 임계 이상인 채 배달이 막혀 있으면
+/// `queue.starved` 를 전용 쿨다운(5분 · depth_high 의 depth_alerted 맵과 **별도**)으로
+/// 발행한다. depth_high 는 적체 **양**의 경보, starved 는 머리 **나이**의 경보 — depth 1
+/// 이라도 오래 막히면 기아다(10분+ 무간극 출력 노드는 병리 상태 — 침묵 대신 경보).
+/// 모든 '막힘' 분기에서 depth 경보와 나란히 호출한다(한 분기라도 빠지면 그 사유의 기아가
+/// 침묵한다). 발행뿐 — 자동 조치 없음: 강제 배달(queue.deliver·W2-E)은 운영자(사람) 판단의
+/// 몫이다(hint 문구 계약 = state.rs::QUEUE_STARVED_HINT · LLM 자동 반응 유도 금지).
+fn alert_queue_starved_if_stalled(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    starve_alerted: &mut HashMap<u64, f64>,
+    blocked_by: &str,
+    head: &crate::state::QueueEntry,
+    head_wait_secs: u64,
+    depth: usize,
+) {
+    let threshold = queue_starve_alert_secs();
+    if threshold == 0 || head_wait_secs < threshold {
+        return;
+    }
+    let now = now_epoch();
+    let last = starve_alerted.get(&s.id).copied().unwrap_or(0.0);
+    if now - last < QUEUE_ALERT_COOLDOWN_SECS {
+        return;
+    }
+    starve_alerted.insert(s.id, now);
+    daemon.bus.publish(
+        "queue.starved",
+        "queue",
+        Some(s.id),
+        crate::state::queue_starved_payload(
+            &cys::surface_ref(s.id),
+            s.role.lock().unwrap().clone(),
+            head,
+            head_wait_secs,
+            depth,
+            blocked_by,
+        ),
     );
 }
 
@@ -2786,10 +2929,104 @@ fn wakeup_entry_ids(text: &str) -> Vec<String> {
     out
 }
 
+/// ★G1(W2-D): 배달 성과 — deliver_head_locked 의 반환값. queue.deliver RPC(W2-E)가
+/// 응답({queue_entry_id, seq, remaining})을 조립하는 재료를 겸한다.
+pub(crate) struct Delivered {
+    pub entry: crate::state::QueueEntry,
+    pub remaining: usize,
+}
+
+/// ★G1(W2-D): 배달 임계영역 **단일 헬퍼** — watchdog 틱(deliver_queued)과 queue.deliver
+/// RPC(운영자 강제 배달·W2-E)가 공유한다. 두 경로가 각자 구현하면 한쪽만 고쳐진다
+/// (migrate_seat_queue 주석의 관례) — 큐 배달 구현은 이 함수 하나뿐이어야 한다.
+/// **호출 전제**: 안전 게이트(kill-switch pause·queue_paused·human_typing·empty_seat +
+/// quiet 판정)는 호출부 책임 — 이 헬퍼는 게이트를 통과한 뒤의 원자 배달만 담당한다.
+///
+/// 임계영역(현행 순서·원자성 그대로 — 절대 불변): pending_queue 락 획득 → front →
+/// record_audited → try_send → pop_delivered_head(id) → 락 해제.
+///
+/// - ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). `cys send --queued` 는 enqueue
+///   시점에 조기 반환하므로 **여기가 유일한 주입 지점**이다. 임계영역(pending_queue 락)
+///   안인 이유: 락 밖에서 미리 기록하면 "A 를 기록하고 B 를 배달"하는 창이 열려 배달분이
+///   원장에 없을 수 있다(= 게이트 개방 = 치명). 레코드는 수백 바이트 append 라 락 보유는
+///   순간이고, 블로킹 PTY write 는 여전히 writer 스레드가 한다(watchdog 무정지).
+/// - TOCTOU 차단: front 읽기·writer 인계·pop 을 한 임계영역으로 묶는다. queue.clear·
+///   close_surface 는 같은 락으로 drain 하므로 '읽고서 인계하는' 사이에 끼어들 수 없다.
+/// - try_send 실패 = None(메시지 보존 — 다음 틱 재시도). 락이 배달자 2원화(틱+RPC)를
+///   직렬화하고 pop-by-id 가 상대가 이미 배달한 머리의 오삼킴을 구조 차단한다.
+/// - forced/overdue 는 이벤트 층 구분일 뿐 임계영역 동작·원장 스키마는 동일하다(불변).
+pub(crate) fn deliver_head_locked(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    forced: bool,
+    overdue: bool,
+) -> Option<Delivered> {
+    let delivered = {
+        let mut q = s.pending_queue.lock().unwrap();
+        let entry = q.front().cloned()?;
+        crate::delivery::record_audited(
+            daemon,
+            s.id,
+            &entry.text,
+            crate::delivery::Origin::Queue,
+            None,
+        );
+        let req = crate::state::WriteReq::Inject {
+            text: entry.text.clone(),
+            cr_delay_ms: 400,
+            clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
+        };
+        if s.write_tx.try_send(req).is_err() {
+            return None; // 인계 실패 — 메시지 보존, 다음 틱 재시도
+        }
+        // ★G1(W2-A): pop 판정은 방금 인계한 항목의 **id** — 동일 텍스트 중복 항목 오삼킴 차단.
+        pop_delivered_head(&mut q, &entry.id);
+        Delivered { entry, remaining: q.len() }
+    };
+    // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
+    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+    // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
+    // 배열인 이유 — javis_wakeup 의 digest 모드(층1 I6)가 같은 target 의 N건을 1회
+    // Inject 로 병합하므로, 병합된 **전** W-id 가 ack 돼야 critical-tier 가 disarm 된다.
+    // 하나라도 빠지면 그 사건은 seen-store 에 inflight 로 남아 TTL 마다 영구 재enqueue 된다
+    // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
+    // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
+    // (entry_ids = W-id 에코 계약 — 큐 항목 id(queue_entry_id)와 별개 체계·키명 불변.)
+    // ★G1(W2-B): payload는 공용 빌더 — 기존 4키 불변 + queue_entry_id/seq/enqueued_at/
+    // delivered_at/wait_secs additive. W-id 에코는 **원문 text 스캔** 그대로다.
+    // ★G1(W2-D): overdue/forced 는 이벤트 층 additive — 원장(delivery.rs)은 무변경.
+    let entry_ids = wakeup_entry_ids(&delivered.entry.text);
+    daemon.bus.publish(
+        "queue.delivered",
+        "queue",
+        Some(s.id),
+        crate::state::queue_delivered_payload(
+            &delivered.entry,
+            delivered.remaining,
+            &entry_ids,
+            &cys::surface_ref(s.id),
+            now_epoch(),
+            overdue,
+            forced,
+        ),
+    );
+    // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
+    daemon.persist_queue_state();
+    Some(delivered)
+}
+
 /// 인플라이트 큐 배달자: 대상 surface가 quiet 임계(기본 3초) 이상 조용하면 큐에서 한 건 주입.
 /// 연속 배달은 다음 틱 — 메시지 사이 자연 간격이 생겨 에이전트가 한 건씩 소화한다.
 /// 배달이 막힌 채 적체되면(depth ≥ 임계) `queue.depth_high`를 쿨다운(5분)으로 발행한다.
-fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
+/// ★G1(W2-D): busy 판정만 단계형(queue_quiet_verdict — 기본 노브 0 잠금 = 현행 동일)으로
+/// 치환하고, 막힘 분기마다 기아 경보(queue.starved — 기본 비활성)를 나란히 점검한다.
+/// human_typing·pause·queue_paused·empty_seat 게이트는 코드·순서 완전 불변 — overdue 라도
+/// 절대 면제 없음(절대 불변).
+fn deliver_queued(
+    daemon: &Arc<Daemon>,
+    depth_alerted: &mut HashMap<u64, f64>,
+    starve_alerted: &mut HashMap<u64, f64>,
+) {
     // T4-15 kill-switch: pause 중에는 큐 배달 동결 (메시지는 보존 — resume 시 재개)
     if daemon.paused.load(Ordering::Relaxed) {
         return;
@@ -2800,12 +3037,31 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
     if daemon.rehome_restored_queue() > 0 {
         daemon.persist_queue_state();
     }
+    // ★G1(W2-D): 노브는 틱당 1회 로드 — surface 루프 안 env 재조회 방지(판정 재료 고정).
+    let quiet = queue_quiet_secs();
+    let max_wait = queue_max_wait_secs();
+    let overdue_quiet = queue_overdue_quiet_secs();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     for s in surfaces {
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
+        // ★G1(W2-D): 머리 스냅샷 — 빈 큐는 어느 분기에서도 할 일이 없다(depth 경보는
+        // depth≥임계≥1, 기아 경보는 머리 존재가 전제 — 관측 동등·무회귀). 락은 순간 보유.
+        // 스냅샷과 실제 배달(deliver_head_locked) 사이 머리가 바뀌는 창은 clear(drain·
+        // 배달 0건으로 안전)뿐이고, 배달 자체는 헬퍼 임계영역이 그 시점 머리로 원자 수행한다.
+        let (head, depth) = {
+            let q = s.pending_queue.lock().unwrap();
+            match q.front().cloned() {
+                Some(h) => (h, q.len()),
+                None => continue,
+            }
+        };
+        // ★G1(W2-D BLOCKER): overdue·기아 자격의 대기 = uptime 클램프 측정(부트 직후
+        // typing 가드 공백 창 봉인 — queue_head_wait_secs doc 참조).
+        let head_wait =
+            queue_head_wait_secs(now_epoch(), head.enqueued_at, daemon.started_at, s.created_at);
         // T4-17 헬스 조치: pause-queue 발동 중인 surface는 배달 보류 — 적체는 침묵 금지
         if s.queue_paused_until
             .lock()
@@ -2814,15 +3070,29 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             .unwrap_or(false)
         {
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "queue_paused(헬스 조치)");
+            alert_queue_starved_if_stalled(
+                daemon, &s, starve_alerted, "queue_paused(헬스 조치)", &head, head_wait, depth,
+            );
             continue;
         }
         // 아직 바쁨(출력 중) — steer는 즉시 전송이 담당, 큐는 기다린다.
+        // ★G1(W2-D): busy 판정만 단계형 순수 판정자로 치환 — 기본 노브(max_wait=0)에서는
+        // 현행 quiet 3s 규칙과 바이트 동일하게 동작한다(무회귀 절대 불변).
         let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
-        if quiet_for < queue_quiet_secs() {
-            alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
-            continue;
-        }
+        let overdue = match queue_quiet_verdict(head_wait, quiet_for, quiet, max_wait, overdue_quiet)
+        {
+            QuietVerdict::WaitBusy => {
+                alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
+                alert_queue_starved_if_stalled(
+                    daemon, &s, starve_alerted, "busy(출력 중)", &head, head_wait, depth,
+                );
+                continue;
+            }
+            QuietVerdict::Deliver { overdue } => overdue,
+        };
         // 사람 입력 흔적이 식기 전 배달 금지 — 미완성 입력에 이어붙기/제출 차단(R1 MED-2).
+        // ★G1(W2-D): 이 게이트는 단계형 완화(overdue)의 면제 대상이 **절대 아니다** —
+        // verdict 가 Deliver{overdue:true}여도 사람 흔적이 신선하면 배달 0건(회귀 핀 테스트).
         let human_recent = s
             .last_human_input
             .lock()
@@ -2831,6 +3101,9 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             .unwrap_or(false);
         if human_recent {
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "human_typing(사람 입력 직후)");
+            alert_queue_starved_if_stalled(
+                daemon, &s, starve_alerted, "human_typing(사람 입력 직후)", &head, head_wait, depth,
+            );
             continue;
         }
         // ★SEAT 게이트(2026-07-17 실사고 수리): **role 좌석**인데 좌석이 비었으면(에이전트 없음)
@@ -2854,73 +3127,23 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
                 depth_alerted,
                 "empty_seat(좌석에 에이전트 미연결)",
             );
+            alert_queue_starved_if_stalled(
+                daemon,
+                &s,
+                starve_alerted,
+                "empty_seat(좌석에 에이전트 미연결)",
+                &head,
+                head_wait,
+                depth,
+            );
             continue;
         }
+        // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
-        //
-        // TOCTOU 차단: front 읽기·writer 인계·pop_front를 pending_queue 락 한 임계영역으로
-        // 묶는다. queue.clear(handlers.rs)·close_surface는 같은 락으로 drain하므로, '읽고서
-        // 인계하는' 사이에 끼어들 수 없다 — 사용자가 clear한 메시지가 그래도 PTY에 주입되는
-        // 경합 창이 사라진다. try_send는 논블로킹(블로킹 write는 writer 스레드)이라 락 보유는
-        // 순간이고 watchdog은 멈추지 않는다.
-        let delivered = {
-            let mut q = s.pending_queue.lock().unwrap();
-            let Some(entry) = q.front().cloned() else {
-                continue;
-            };
-            // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 사고 경로
-            //   `cys send --queued --to master "…"` 는 enqueue 시점에 조기 반환하므로 **여기가
-            //   유일한 주입 지점**이다. 임계영역(pending_queue 락) 안인 이유: 락 밖에서 미리
-            //   기록하면 "A 를 기록하고 B 를 배달"하는 창이 열려 배달분이 원장에 없을 수 있다
-            //   (= 게이트 개방 = 치명). 레코드는 수백 바이트 append 라 락 보유는 순간이고,
-            //   블로킹 PTY write 는 여전히 writer 스레드가 한다(watchdog 무정지).
-            crate::delivery::record_audited(
-                daemon,
-                s.id,
-                &entry.text,
-                crate::delivery::Origin::Queue,
-                None,
-            );
-            let req = crate::state::WriteReq::Inject {
-                text: entry.text.clone(),
-                cr_delay_ms: 400,
-                clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
-            };
-            if s.write_tx.try_send(req).is_err() {
-                continue; // 인계 실패 — 메시지 보존, 다음 틱 재시도
-            }
-            // ★G1(W2-A): pop 판정은 방금 인계한 항목의 **id** — 동일 텍스트 중복 항목 오삼킴 차단.
-            pop_delivered_head(&mut q, &entry.id);
-            Some((entry, q.len()))
-        };
-        if let Some((entry, remaining)) = delivered {
-            // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
-            *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
-            // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
-            // 배열인 이유 — javis_wakeup 의 digest 모드(층1 I6)가 같은 target 의 N건을 1회
-            // Inject 로 병합하므로, 병합된 **전** W-id 가 ack 돼야 critical-tier 가 disarm 된다.
-            // 하나라도 빠지면 그 사건은 seen-store 에 inflight 로 남아 TTL 마다 영구 재enqueue 된다
-            // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
-            // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
-            // (entry_ids = W-id 에코 계약 — 큐 항목 id(queue_entry_id)와 별개 체계·키명 불변.)
-            // ★G1(W2-B): payload는 공용 빌더 — 기존 4키 불변 + queue_entry_id/seq/enqueued_at/
-            // delivered_at/wait_secs additive. W-id 에코는 **원문 text 스캔** 그대로다.
-            let entry_ids = wakeup_entry_ids(&entry.text);
-            daemon.bus.publish(
-                "queue.delivered",
-                "queue",
-                Some(s.id),
-                crate::state::queue_delivered_payload(
-                    &entry,
-                    remaining,
-                    &entry_ids,
-                    &cys::surface_ref(s.id),
-                    now_epoch(),
-                ),
-            );
-            // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
-            daemon.persist_queue_state();
+        if deliver_head_locked(daemon, &s, false, overdue).is_some() {
+            // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
+            starve_alerted.remove(&s.id);
         }
     }
 }
@@ -4309,6 +4532,338 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // ─────────── ★G1(W2-D): 단계형 quiet(기아 봉인) — 순수 판정자·uptime 클램프 핀 ───────────
+
+    use super::{
+        deliver_head_locked, deliver_queued, queue_head_wait_secs, queue_quiet_verdict,
+        QuietVerdict,
+    };
+
+    /// [회귀 핀·기아 ①] wait < max_wait → 현행 quiet 3s 규칙 그대로(현행 의미론 핀).
+    #[test]
+    fn queue_quiet_verdict_pins_current_rule_below_max_wait() {
+        assert_eq!(queue_quiet_verdict(30, 2, 3, 120, 1), QuietVerdict::WaitBusy);
+        assert_eq!(
+            queue_quiet_verdict(30, 3, 3, 120, 1),
+            QuietVerdict::Deliver { overdue: false }
+        );
+    }
+
+    /// [회귀 핀·기아 ②] wait ≥ max_wait && quiet_for ≥ 1 → 제한 배달(overdue:true).
+    /// 정상 quiet(3s)를 채운 배달은 단계와 무관하게 정상 배달(overdue:false)로 분류된다.
+    #[test]
+    fn queue_quiet_verdict_overdue_lowers_quiet_to_one_second() {
+        assert_eq!(
+            queue_quiet_verdict(120, 1, 3, 120, 1),
+            QuietVerdict::Deliver { overdue: true }
+        );
+        assert_eq!(
+            queue_quiet_verdict(500, 2, 3, 120, 1),
+            QuietVerdict::Deliver { overdue: true }
+        );
+        assert_eq!(
+            queue_quiet_verdict(500, 3, 3, 120, 1),
+            QuietVerdict::Deliver { overdue: false },
+            "정상 quiet 충족은 overdue 표기 없이 나간다"
+        );
+    }
+
+    /// [회귀 핀·기아 ③ — 핵심 안전 핀] '출력 중 주입 금지'는 overdue 에도 불변:
+    /// quiet_for=0 은 어떤 단계에서도 배달 금지(0초 강제주입 아님). overdue_quiet=0
+    /// 오설정도 하한 1s 로 승격된다(구조 봉인).
+    #[test]
+    fn queue_quiet_verdict_never_injects_while_output_streaming() {
+        assert_eq!(queue_quiet_verdict(10_000, 0, 3, 120, 1), QuietVerdict::WaitBusy);
+        assert_eq!(
+            queue_quiet_verdict(10_000, 0, 3, 120, 0),
+            QuietVerdict::WaitBusy,
+            "overdue_quiet=0 오설정도 0초 주입 경로를 열지 못한다(하한 1s 승격)"
+        );
+        assert_eq!(
+            queue_quiet_verdict(10_000, 1, 3, 120, 0),
+            QuietVerdict::Deliver { overdue: true }
+        );
+    }
+
+    /// [회귀 핀·기아 ④] max_wait=0(기본값·단계형 비활성) → 항상 현행 3s 규칙
+    /// (비활성 = 구동작 복원 핀 — 기본값 상태 전 기존 동작 바이트 동일의 근거).
+    #[test]
+    fn queue_quiet_verdict_disabled_restores_current_behavior() {
+        assert_eq!(queue_quiet_verdict(u64::MAX, 2, 3, 0, 1), QuietVerdict::WaitBusy);
+        assert_eq!(
+            queue_quiet_verdict(u64::MAX, 3, 3, 0, 1),
+            QuietVerdict::Deliver { overdue: false }
+        );
+    }
+
+    /// [★BLOCKER 핀] overdue·기아 자격의 대기 측정 = daemon/surface uptime 클램프 —
+    /// WAL 생존 항목(enqueued_at 과거)도 부트 시각 이전 대기는 세지 않는다. 재기동 직후
+    /// last_human_input(휘발)이 비어 typing 가드가 무방비인 창에 stale 백로그가 즉시
+    /// overdue 최전선 배달되는 병리(성찰 R4 — GUI Update→rotate 플로우 실발화)의 봉인.
+    #[test]
+    fn queue_head_wait_clamps_to_boot_and_surface_uptime() {
+        // 정상: 부트·생성 후 enqueue → 대기 = now - enqueued_at.
+        assert_eq!(queue_head_wait_secs(1000.0, 990.0, 900.0, 910.0), 10);
+        // 부트 클램프: enqueued_at 이 부트보다 과거면 부트 시각부터 센다.
+        assert_eq!(queue_head_wait_secs(1000.0, 100.0, 995.0, 910.0), 5);
+        // surface 클램프: surface 가 데몬보다 늦게 생겼으면 생성 시각부터(이관·rehome 수신분).
+        assert_eq!(queue_head_wait_secs(1000.0, 100.0, 900.0, 998.0), 2);
+        // 역행(시계 스큐·미래 enqueued_at)은 0 클램프 — 측정 불능은 overdue 부적격(fail-closed).
+        assert_eq!(queue_head_wait_secs(1000.0, 2000.0, 900.0, 910.0), 0);
+    }
+
+    /// 큐 게이트 통합 테스트는 CYS_QUEUE_* env 를 만지므로 직렬화(REAP_ENV_LOCK 관례 동형).
+    static QUEUE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// CYS_QUEUE_* env 를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
+    /// 없던 값은 remove, 있던 값은 원복(ReapEnvGuard 관례 동형 · 프로세스 전역 env 누수 차단).
+    struct QueueEnvGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+    impl QueueEnvGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let prev = vars
+                .iter()
+                .map(|(k, v)| {
+                    let old = std::env::var(k).ok();
+                    std::env::set_var(k, v);
+                    (*k, old)
+                })
+                .collect();
+            QueueEnvGuard { prev }
+        }
+    }
+    impl Drop for QueueEnvGuard {
+        fn drop(&mut self) {
+            for (k, old) in &self.prev {
+                match old {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// [무회귀 핀·절대 불변] 기본 노브(max_wait=0 잠금)에서 배달 동작은 현행과 완전 동일:
+    /// enqueued_at 이 아무리 과거라도 quiet 3s 미달이면 보류, 충족이면 배달.
+    #[test]
+    fn deliver_queued_default_knobs_keep_current_quiet_rule() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_QUEUE_MAX_WAIT_SECS", "0"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let daemon = drill_daemon("w2d-default");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let mut e = daemon.next_queue_entry("w2d 기본값 무회귀 핀".into(), None, "test");
+        e.enqueued_at = 1.0; // 아무리 과거라도 비활성(0)에서는 단계 승격 없음
+        s.pending_queue.lock().unwrap().push_back(e);
+        // 초기 셸 출력(로그인 프로파일)이 last_output 을 덮지 않게 안정화 후 스탬프.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        *s.last_human_input.lock().unwrap() = None;
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "비활성(0) = 현행 3s 규칙 그대로 — quiet 2s 는 보류(구동작 복원 핀)"
+        );
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(4);
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "quiet 3s+ 는 현행대로 배달"
+        );
+        let delivered: Vec<_> = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.delivered")
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0]["payload"]["overdue"],
+            serde_json::json!(false),
+            "기본값 배달은 overdue 표기 없음(무회귀)"
+        );
+    }
+
+    /// [회귀 핀·R1 MED-2] human_typing 가드는 단계형 완화(overdue)의 면제 대상이 절대
+    /// 아니다 — verdict 가 제한 배달을 허용해도 사람 흔적이 신선하면 배달 0건. 흔적 소거
+    /// 후에야 overdue 제한 배달(quiet 2s < 3s 인데도)이 나가고 영수증에 overdue:true 가
+    /// 남는다(2단 롤아웃 실측 근거). deliver_head_locked 경유 실행 경로 통합 검증.
+    #[test]
+    fn deliver_queued_human_guard_blocks_even_overdue_then_limited_delivery_flows() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_QUEUE_MAX_WAIT_SECS", "1"),
+            ("CYS_QUEUE_OVERDUE_QUIET_SECS", "1"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let daemon = drill_daemon("w2d-overdue");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let e = daemon.next_queue_entry("w2d overdue 핀".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        // uptime 클램프 기준(부트·생성 시각)으로 max_wait(1s)를 **실제로** 넘긴다
+        // (+ 초기 셸 출력 안정화 겸용 — enqueued_at 만 과거로 꾸며서는 클램프 때문에 안 넘는다).
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        // quiet 2s: 현행 3s 규칙으로는 보류지만 overdue(1s)로는 배달 자격.
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        // ★사람 흔적 신선 → overdue 대기라도 배달 0건(면제 절대 없음).
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "human_typing 가드는 overdue 완화의 면제 대상이 아니다(R1 MED-2)"
+        );
+        // 사람 흔적 소거 → 같은 quiet(2s < 3s) 조건에서 overdue 제한 배달이 나간다.
+        *s.last_human_input.lock().unwrap() = None;
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(2);
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "overdue 단계: 완화 quiet(1s)로 제한 배달"
+        );
+        let delivered: Vec<_> = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.delivered")
+            .collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["payload"]["overdue"], serde_json::json!(true));
+        assert_eq!(
+            delivered[0]["payload"]["forced"],
+            serde_json::json!(false),
+            "watchdog 배달은 forced 아님 — forced 는 queue.deliver RPC(W2-E) 전용"
+        );
+    }
+
+    /// [starved 경보] 머리 대기 ≥ 임계 && 배달 막힘 지속 → queue.starved 정확히 1회 +
+    /// 쿨다운(5분) 내 재발행 억제 + 배달 성공 시 쿨다운 리셋. 기아 경보는 단계형
+    /// (max_wait)과 독립 축 — 비활성(0) 상태에서도 경보만 작동한다.
+    #[test]
+    fn queue_starved_alert_fires_once_with_cooldown_and_resets_on_delivery() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_QUEUE_MAX_WAIT_SECS", "0"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "1"),
+        ]);
+        let daemon = drill_daemon("w2d-starve");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let e = daemon.next_queue_entry("기아 경보 핀".into(), None, "test");
+        let head_id = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e);
+        std::thread::sleep(std::time::Duration::from_millis(1300)); // uptime 클램프 대기 ≥ 1s
+        let starved_count = |daemon: &Arc<Daemon>| {
+            daemon
+                .bus
+                .tail(50)
+                .iter()
+                .filter(|ev| ev["name"] == "queue.starved")
+                .count()
+        };
+        // busy(출력 직후·quiet_for=0)로 막는다 → 기아 경보 1회.
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(starved_count(&daemon), 1, "임계 도달 막힘 → queue.starved 1회");
+        let ev = daemon
+            .bus
+            .tail(50)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.starved")
+            .unwrap();
+        assert_eq!(ev["payload"]["head_entry_id"], serde_json::json!(head_id));
+        assert_eq!(ev["payload"]["blocked_by"], serde_json::json!("busy(출력 중)"));
+        assert_eq!(
+            ev["payload"]["hint"],
+            serde_json::json!(crate::state::QUEUE_STARVED_HINT),
+            "hint 문구 = 운영자(사람) 판단 계약 그대로(자동 반응 유도 금지)"
+        );
+        // 막힘 지속 → 쿨다운 내 재발행 억제.
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(starved_count(&daemon), 1, "쿨다운(5분) 내 재발행 억제");
+        assert!(starve.contains_key(&s.id));
+        // 막힘 해제 → 배달 → 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보 가능).
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(4);
+        *s.last_human_input.lock().unwrap() = None;
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "막힘 해제 후 정상 배달");
+        assert!(
+            !starve.contains_key(&s.id),
+            "배달 성공 = 기아 해소 — 쿨다운 리셋"
+        );
+    }
+
+    /// deliver_head_locked 단독 계약: 머리를 id 로 pop 하고 remaining 을 보고하며,
+    /// 빈 큐는 None(부작용 0 — queue.delivered 미발행). watchdog 틱·queue.deliver RPC
+    /// (W2-E)가 이 단일 헬퍼를 공유한다는 전제의 기초 핀.
+    #[test]
+    fn deliver_head_locked_pops_by_id_and_reports_remaining() {
+        let daemon = drill_daemon("w2d-headlock");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        // 빈 큐 = None + 이벤트 0(부작용 없음).
+        assert!(deliver_head_locked(&daemon, &s, false, false).is_none());
+        assert_eq!(
+            daemon
+                .bus
+                .tail(30)
+                .iter()
+                .filter(|ev| ev["name"] == "queue.delivered")
+                .count(),
+            0
+        );
+        let e1 = daemon.next_queue_entry("첫째".into(), None, "test");
+        let e2 = daemon.next_queue_entry("둘째".into(), None, "test");
+        let id1 = e1.id.clone();
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(e1);
+            q.push_back(e2);
+        }
+        let d = deliver_head_locked(&daemon, &s, true, false).expect("머리 배달");
+        assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
+        assert_eq!(d.remaining, 1);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
+        let ev = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.delivered")
+            .unwrap();
+        assert_eq!(ev["payload"]["queue_entry_id"], serde_json::json!(id1));
+        assert_eq!(
+            ev["payload"]["forced"],
+            serde_json::json!(true),
+            "forced 플래그는 이벤트 층에 그대로 실린다(RPC 감사 근거)"
+        );
     }
 
     /// reap 경계: exited 후 grace 미만이면 보존(포렌식·복구 윈도우), 이상이면 회수.

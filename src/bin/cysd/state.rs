@@ -149,14 +149,18 @@ pub fn queue_enqueued_payload(entry: &QueueEntry, depth: usize, from: Value, key
 /// queue.delivered payload — 배달 영수증. 기존 키(bytes/remaining/entry_ids/surface_ref)
 /// 의미 완전 불변: `entry_ids`는 W-id 에코(원문 text 기준)이며 큐 항목 자신의 id는 별도 키
 /// `queue_entry_id`로만 실린다(위 명명 계약). additive: queue_entry_id/seq/enqueued_at/
-/// delivered_at/wait_secs. wait_secs는 음수 클램프 0 — 시계 스큐·NTP 점프의 역행 방어이며
-/// 기아(결함 1) 실측 분포·단계형 임계(G1 2단 롤아웃)의 근거 필드다.
+/// delivered_at/wait_secs/overdue/forced. wait_secs는 음수 클램프 0 — 시계 스큐·NTP 점프의
+/// 역행 방어이며 기아(결함 1) 실측 분포·단계형 임계(G1 2단 롤아웃)의 근거 필드다.
+/// ★G1(W2-D): overdue=단계형 완화(제한 배달)로 나간 건, forced=운영자 강제(queue.deliver·
+/// W2-E)로 나간 건 — 구분은 이벤트 층에서만 하고 배달 원장(delivery.rs) 스키마는 불변이다.
 pub fn queue_delivered_payload(
     entry: &QueueEntry,
     remaining: usize,
     wakeup_ids: &[String],
     surface_ref: &str,
     delivered_at: f64,
+    overdue: bool,
+    forced: bool,
 ) -> Value {
     json!({
         "bytes": entry.text.len(),
@@ -168,6 +172,39 @@ pub fn queue_delivered_payload(
         "enqueued_at": entry.enqueued_at,
         "delivered_at": delivered_at,
         "wait_secs": (delivered_at - entry.enqueued_at).max(0.0) as u64,
+        "overdue": overdue,
+        "forced": forced,
+    })
+}
+
+/// queue.starved hint 문구 계약(성찰 BLOCKER) — 이 시스템의 이벤트 실소비자는 LLM
+/// 에이전트다: hint 가 강제 배달 명령을 직접 지시하면 '경보 → 반사적 강제 드레인' 폭주
+/// 회로가 열린다. 문구는 **운영자(사람) 판단 전제**를 명시하고 자동 반응을 금지해야 하며,
+/// 이 상수의 문면은 아래 payload 핀 테스트가 고정한다(임의 수정 = 계약 변경).
+pub const QUEUE_STARVED_HINT: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) \
+     판단 하에 cys queue deliver 로 강제 배달 가능. LLM 에이전트는 이 경보에 자동 반응(강제 \
+     배달·드레인) 금지";
+
+/// queue.starved payload — 기아 경보(신규 이벤트·G1 W2-D). depth_high(적체 **양** 경보)와
+/// 별도 축: depth 1이라도 머리가 오래 막혀 있으면 기아다. waited_secs 는 uptime 클램프
+/// (governance::queue_head_wait_secs) 값 — 부트 전 대기는 세지 않는다. 발행 전용
+/// 쿨다운(5분)은 governance 발행처가 관리한다.
+pub fn queue_starved_payload(
+    surface_ref: &str,
+    role: Option<String>,
+    head: &QueueEntry,
+    waited_secs: u64,
+    depth: usize,
+    blocked_by: &str,
+) -> Value {
+    json!({
+        "surface_ref": surface_ref,
+        "role": role,
+        "head_entry_id": head.id,
+        "waited_secs": waited_secs,
+        "depth": depth,
+        "blocked_by": blocked_by,
+        "hint": QUEUE_STARVED_HINT,
     })
 }
 
@@ -5681,12 +5718,12 @@ mod tests {
 
     /// 배달 영수증 스키마 핀 — 기존 4키(bytes/remaining/entry_ids/surface_ref) 의미 불변:
     /// entry_ids 는 전달된 W-id 에코 그대로(큐 항목 id 와 절대 별개 체계). additive 5키 +
-    /// wait_secs 음수 클램프 0(시계 스큐 방어).
+    /// wait_secs 음수 클램프 0(시계 스큐 방어). ★G1(W2-D): overdue/forced additive 추가.
     #[test]
     fn queue_delivered_payload_pins_wid_echo_and_wait_clamp() {
         let e = w2b_entry("qc.9", 9, "[wakeup W-a1b2] 보고", 100.0);
         let wids = vec!["W-a1b2".to_string()];
-        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9);
+        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9, false, false);
         assert_eq!(p["bytes"], json!(e.text.len()), "기존 키 bytes 불변");
         assert_eq!(p["remaining"], json!(4), "기존 키 remaining 불변");
         assert_eq!(
@@ -5704,9 +5741,52 @@ mod tests {
         assert_eq!(p["enqueued_at"], json!(100.0));
         assert_eq!(p["delivered_at"], json!(107.9));
         assert_eq!(p["wait_secs"], json!(7), "wait = delivered - enqueued 내림(u64)");
+        // ★G1(W2-D): 정상(watchdog·비완화) 배달의 additive 기본값 — 둘 다 false.
+        assert_eq!(p["overdue"], json!(false), "additive overdue — 정상 배달은 false");
+        assert_eq!(p["forced"], json!(false), "additive forced — watchdog 배달은 false");
         // W-id 봉입 없는 일반 배달 = 빈 배열(키는 항상 존재 — 에코 계약).
-        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0);
+        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0, false, false);
         assert_eq!(p0["entry_ids"], json!([] as [&str; 0]));
         assert_eq!(p0["wait_secs"], json!(0), "시계 역행(delivered < enqueued)은 0 클램프");
+        // overdue(단계형 제한 배달)·forced(운영자 강제) 표기는 이벤트 층에서만 구분된다.
+        let po = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, true, false);
+        assert_eq!(po["overdue"], json!(true));
+        assert_eq!(po["forced"], json!(false));
+        let pf = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, false, true);
+        assert_eq!(pf["forced"], json!(true));
+        // W-id 에코·기존 키는 overdue/forced 와 무관하게 동일(계약 불변).
+        assert_eq!(po["bytes"], p["bytes"]);
+        assert_eq!(po["surface_ref"], p["surface_ref"]);
+    }
+
+    /// ★G1(W2-D) queue.starved payload 핀 — 스키마 7키 + hint 문구 계약(성찰 BLOCKER):
+    /// hint 는 운영자(사람) 판단 전제를 명시하고 LLM 에이전트 자동 반응을 금지해야 한다.
+    /// 이벤트 실소비자가 LLM 에이전트인 시스템에서 hint 가 강제 배달을 직접 지시하면
+    /// '경보 → 반사적 강제 드레인' 폭주 회로가 열린다 — 문면 자체를 핀으로 고정.
+    #[test]
+    fn queue_starved_payload_pins_schema_and_operator_only_hint() {
+        let head = w2b_entry("qs.3", 3, "오래 기다린 머리", 50.0);
+        let p = queue_starved_payload(
+            "surface:7",
+            Some("worker".into()),
+            &head,
+            700,
+            2,
+            "busy(출력 중)",
+        );
+        assert_eq!(p["surface_ref"], json!("surface:7"));
+        assert_eq!(p["role"], json!("worker"));
+        assert_eq!(p["head_entry_id"], json!("qs.3"), "머리 항목 조준점 = 큐 entry id");
+        assert_eq!(p["waited_secs"], json!(700));
+        assert_eq!(p["depth"], json!(2));
+        assert_eq!(p["blocked_by"], json!("busy(출력 중)"));
+        assert_eq!(p["hint"], json!(QUEUE_STARVED_HINT), "hint 문구 = 상수 계약 그대로");
+        // 문구 계약의 핵심 2요소: ①운영자(사람) 판단 명시 ②자동 반응 금지 명시.
+        assert!(QUEUE_STARVED_HINT.contains("운영자(사람) 판단"), "사람 판단 전제 명시");
+        assert!(QUEUE_STARVED_HINT.contains("자동 반응"), "자동 반응 금지 명시");
+        assert!(QUEUE_STARVED_HINT.contains("금지"), "금지 문면 존재");
+        // role 없는 맨 셸 = null (depth_high 의 role 직렬화 관례와 동형).
+        let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)");
+        assert_eq!(p2["role"], json!(null));
     }
 }
