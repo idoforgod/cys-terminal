@@ -56,9 +56,13 @@ async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
     // 표준 패턴). 재시도 없는 1회 open 은 앱 기동 fan-out(daemon_status + pane별 attach +
     // event forwarder 동시 연결)에서 상시 "startup failed … os error 231"이 됐다(2026-07-10
     // Windows 실사고 — 워크스페이스/pane 렌더 전체 불능). 그 외 오류(파이프 부재 = 데몬
-    // 다운 등)는 즉시 반환한다. 정책 상수는 CLI(cys)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*).
+    // 다운 등)는 즉시 반환한다. 정책(상수·jitter)은 CLI(cys)와 공용 단일 진실인
+    // lib(cys::PIPE_BUSY_* · next_busy_delay). WaitNamedPipeW 커널 대기는 blocking이라
+    // async 레인에선 쓰지 않는다(tokio named pipe 표준 = sleep 재시도) — 간격만 jitter 로
+    // 분산해 fan-out 동시 재시도의 위상 충돌을 깬다.
     let name = socket.to_string_lossy().into_owned();
     let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
+    let mut delay = cys::PIPE_BUSY_RETRY_INTERVAL;
     loop {
         match ClientOptions::new().open(&name) {
             Ok(s) => return Ok(Box::new(s) as Stream),
@@ -66,7 +70,8 @@ async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
                 if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
                     && std::time::Instant::now() < deadline =>
             {
-                tokio::time::sleep(cys::PIPE_BUSY_RETRY_INTERVAL).await;
+                delay = cys::next_busy_delay(delay, cys::rand01_cheap());
+                tokio::time::sleep(delay).await;
             }
             Err(e) => return Err(format!("cannot connect to cysd pipe: {e}")),
         }

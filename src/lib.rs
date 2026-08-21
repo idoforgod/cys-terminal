@@ -194,11 +194,70 @@ pub fn socket_path() -> PathBuf {
 /// 서버(cysd 리스너 풀)는 accept 직후 인스턴스를 재생성하므로 잠깐 기다리면 열린다.
 /// Microsoft 파이프 클라이언트 계약상 busy 는 대기·재시도가 필수(WaitNamedPipe 관례)이며,
 /// 재시도 없는 1회 open 은 멀티 노드 동시 RPC 에서 상시 실패한다(2026-07-10 Windows 실사고).
-/// 그 외 오류(파이프 부재 = 데몬 다운 등)는 즉시 반환이 계약이다(autostart 판단은 호출부 몫).
-/// 전 OS에서 컴파일되는 pub 상수라 비-Windows 테스트가 정책 불변을 박제할 수 있다.
+/// 그 외 오류(파이프 부재 ERROR_FILE_NOT_FOUND = 데몬 다운 등)는 **즉시 반환**이 계약이다
+/// (autostart 판단은 호출부 몫 — 다운을 대기로 오처리하면 autostart 가 데드라인만큼 늦는다).
+///
+/// 재시도 리듬: 고정 간격 폴링은 fan-out(앱 기동 daemon_status+pane별 attach+event forwarder
+/// 동시 연결)에서 전 클라이언트가 같은 위상으로 충돌한다 — busy 시 ① `wait_named_pipe`
+/// (WaitNamedPipeW 커널 대기, `PIPE_BUSY_WAIT_SLICE` 슬라이스)로 인스턴스 가용을 기다리고
+/// ② 타임아웃이면 `next_busy_delay`(decorrelated jitter, `PIPE_BUSY_RETRY_INTERVAL` 하한 ·
+/// `PIPE_BUSY_BACKOFF_CAP` 상한)로 재개 시점을 분산한다. 총 데드라인(5s)은 유지 — 상향은
+/// wedge 감지를 늦춘다. 전 OS에서 컴파일되는 pub 상수·순수 함수라 비-Windows 테스트가
+/// 정책 불변을 박제할 수 있다.
 pub const PIPE_BUSY_ERROR: i32 = 231;
 pub const PIPE_BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 pub const PIPE_BUSY_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// busy 1회당 WaitNamedPipeW 커널 대기 슬라이스 — 데드라인(5s)보다 충분히 짧아 슬라이스
+/// 사이마다 open 재판정(비-busy 오류 즉시 반환 계약)이 돈다.
+pub const PIPE_BUSY_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+/// jitter 백오프 상한 — 상한 없는 지수 증가는 데드라인 내 재시도 횟수를 고갈시킨다.
+pub const PIPE_BUSY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// busy 백오프의 다음 대기 시간(순수 · decorrelated jitter): `[RETRY_INTERVAL, min(prev*3, CAP)]`
+/// 구간을 rand01(∈[0,1])로 샘플한다. 이전 대기와 탈상관돼 fan-out 동시 재시도의 위상 충돌을
+/// 깬다. 어떤 입력(0·NaN·범위 밖 rand01 포함)에도 결과는 [RETRY_INTERVAL, BACKOFF_CAP] 안 —
+/// 0 반환은 busy spin, 과대 반환은 데드라인 낭비라 양쪽 다 클램프가 계약이다.
+pub fn next_busy_delay(prev: std::time::Duration, rand01: f64) -> std::time::Duration {
+    let r = if rand01.is_finite() {
+        rand01.clamp(0.0, 1.0)
+    } else {
+        0.0 // 오염 난수는 하한(즉시 재시도 리듬)으로 — 대기 자체는 항상 성립.
+    };
+    let hi = prev
+        .saturating_mul(3)
+        .clamp(PIPE_BUSY_RETRY_INTERVAL, PIPE_BUSY_BACKOFF_CAP);
+    let span = hi - PIPE_BUSY_RETRY_INTERVAL; // hi ≥ 하한이 클램프로 보장됨.
+    PIPE_BUSY_RETRY_INTERVAL + std::time::Duration::from_secs_f64(span.as_secs_f64() * r)
+}
+
+/// jitter 전용 저비용 난수(∈[0,1)) — 암호학적 품질 불요(토큰 생성 금지, 위상 분산 전용).
+/// 시계 나노초 + pid 해시라 프로세스·호출 간 위상이 갈린다.
+pub fn rand01_cheap() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let mixed = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(std::process::id() as u64);
+    (mixed % 1_000_000) as f64 / 1_000_000.0
+}
+
+/// WaitNamedPipeW 래퍼 — busy 파이프의 인스턴스 가용을 커널에서 기다린다(폴링 아님).
+/// true = 인스턴스 가용(즉시 open 재시도 가치), false = 타임아웃·오류(파이프 소멸 포함).
+/// 최종 판정자는 언제나 다음 open 이다 — 여기 false 를 다운 판정으로 쓰지 않는다.
+#[cfg(windows)]
+pub fn wait_named_pipe(path: &Path, timeout: std::time::Duration) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // 0 은 NMPWAIT_USE_DEFAULT_WAIT(서버 기본값) 의미라 최소 1ms 로 못박는다.
+    let ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+    unsafe { windows_sys::Win32::System::Pipes::WaitNamedPipeW(wide.as_ptr(), ms) != 0 }
+}
 
 /// 타이핑 가드 거부의 **에러 코드·메시지 단일 소스**(T-0147-6).
 ///
@@ -1154,6 +1213,50 @@ mod tests {
         assert_eq!(parse_surface_ref("surface:31"), Some(31));
         assert_eq!(parse_surface_ref("31"), Some(31));
         assert_eq!(parse_surface_ref("x"), None);
+    }
+
+    /// ★busy 백오프 정책 핀(decorrelated jitter): 어떤 입력에도 결과는
+    /// [RETRY_INTERVAL, BACKOFF_CAP] 안이어야 한다 — 0 은 busy spin, 과대는 5s 데드라인 내
+    /// 재시도 횟수 고갈. 순수 함수라 비-Windows 에서 정책 전체를 박제한다.
+    #[test]
+    fn next_busy_delay_stays_within_policy_bounds() {
+        use std::time::Duration;
+        // 결정 경계: rand01=0 → 하한, rand01=1 → min(prev*3, cap).
+        assert_eq!(
+            next_busy_delay(PIPE_BUSY_RETRY_INTERVAL, 0.0),
+            PIPE_BUSY_RETRY_INTERVAL,
+            "rand=0 은 하한(즉시 리듬) — 하한이 무너지면 busy spin"
+        );
+        assert_eq!(
+            next_busy_delay(PIPE_BUSY_RETRY_INTERVAL, 1.0),
+            PIPE_BUSY_RETRY_INTERVAL * 3,
+            "rand=1 은 prev*3 (decorrelated jitter 상단)"
+        );
+        assert_eq!(
+            next_busy_delay(PIPE_BUSY_BACKOFF_CAP, 1.0),
+            PIPE_BUSY_BACKOFF_CAP,
+            "prev*3 이 cap 을 넘으면 cap 클램프 — 상한 없는 증가는 재시도 고갈"
+        );
+        // prev=0(오염)·rand 오염(NaN·음수·>1)도 전부 구간 안 — fail-closed 클램프.
+        for prev in [Duration::ZERO, Duration::from_secs(3600)] {
+            for r in [f64::NAN, f64::INFINITY, -1.0, 0.5, 2.0] {
+                let d = next_busy_delay(prev, r);
+                assert!(
+                    (PIPE_BUSY_RETRY_INTERVAL..=PIPE_BUSY_BACKOFF_CAP).contains(&d),
+                    "구간 이탈: prev={prev:?} rand={r} → {d:?}"
+                );
+            }
+        }
+        // 최악 대기(wait slice + cap)로도 데드라인 안에 재시도가 여러 번 돈다(무재시도 회귀 방지).
+        assert!(
+            (PIPE_BUSY_WAIT_SLICE + PIPE_BUSY_BACKOFF_CAP) * 4 < PIPE_BUSY_RETRY_DEADLINE,
+            "슬라이스+캡이 데드라인을 잠식하면 사실상 1회 open 으로 회귀한다"
+        );
+        // jitter 난수원은 항상 [0,1) — next_busy_delay 클램프와 이중 방어지만 계약은 박제.
+        for _ in 0..64 {
+            let r = rand01_cheap();
+            assert!((0.0..1.0).contains(&r), "rand01_cheap 구간 이탈: {r}");
+        }
     }
 
     /// ★SEAL-1 회귀 핀(2026-08-01 실사고): 번들 python 이 번들 안에 `.pyc` 를 쓰면 코드서명

@@ -1111,6 +1111,43 @@ pub fn pgid_of(_pid: u32) -> Option<u32> {
     None
 }
 
+/// pid 생존 프로브 — **생존 판정의 단일 정의처**(channels 브리지 자가치유·이중 스폰 게이트와
+/// deadman 홀더 회수가 전부 여기로 위임한다). 판정 관용구가 여러 벌 병존하면 결정론 환원
+/// 원칙(단일 정의처)이 깨진다 — 프로브 출력과 캐시·원장 기억이 충돌하면 항상 프로브가 이긴다.
+/// unix: kill(pid, 0)==0. windows: OpenProcess(PROCESS_SYNCHRONIZE)+WaitForSingleObject(0ms) —
+/// 프로세스 핸들이 시그널드(종료 확정)일 때만 dead. 오판 비용이 비대칭이다: 산 프로세스를
+/// 죽었다고 보면 재스폰·kill 개입이 나가므로, 확정 못 하면 alive 쪽(개입 금지 방향 fail-closed).
+/// 그래서 ERROR_ACCESS_DENIED(존재하나 접근 불가 보호 프로세스)=alive, WAIT_FAILED=alive.
+/// channel.status 의 alive·respawn_dead_bridges 의 dead 판정은 전 OS에서 이 실측 하나를
+/// 소비한다(payload 형태 불변 — alive 키 의미가 Windows에서도 실측).
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    if pid == 0 {
+        return false;
+    }
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        // 핸들 실패: ACCESS_DENIED 만 '존재 확실'(보호 프로세스) → alive. 그 외
+        // (ERROR_INVALID_PARAMETER = pid 부재 등)는 dead.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+    // 0ms 폴: WAIT_OBJECT_0(시그널드)만 종료 확정 → dead. WAIT_TIMEOUT(실행 중)·WAIT_FAILED
+    // (판정 불능)는 alive — 위 doc comment 의 개입 금지 방향.
+    let signaled = unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0;
+    unsafe { CloseHandle(h) };
+    !signaled
+}
+
 /// 자기승인 판정(순수·MED-2 surface 격상) — decision="allow"일 때 아래 중 하나면 자기승인이다:
 ///  1. pid 동일 OR pgid 동일(M4 기존) — push/reply가 별개 CLI라도 같은 노드면 pgid로 잡는다.
 ///  2. pub_sid가 Some일 때:
@@ -2937,6 +2974,27 @@ fn default_health_rules() -> Vec<HealthRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── pid_alive: 생존 판정 단일 정의처(channels·deadman 위임 대상)의 unix 계약 핀 ──
+    // windows arm(OpenProcess+WaitForSingleObject)은 이 호스트에서 컴파일 불가 — 정책 계약은
+    // doc comment(ACCESS_DENIED=alive·WAIT_FAILED=alive 개입 금지 방향)이 정본.
+    #[test]
+    fn pid_alive_self_and_zero() {
+        assert!(pid_alive(std::process::id()), "자기 프로세스는 alive");
+        assert!(!pid_alive(0), "pid 0 은 프로브 대상이 아님 — 항상 dead");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_detects_reaped_child() {
+        // kill 후 wait(회수)까지 해야 zombie 가 아니다 — zombie 는 kill(pid,0)==0 이라 alive 로 보인다.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        assert!(pid_alive(pid), "스폰 직후 생존");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!pid_alive(pid), "회수된 자식은 dead — false 면 자가치유·재스폰 게이트가 전부 침묵");
+    }
 
     // ★SEAL-1 pane 층 회귀 핀(2026-08-01 실사고): pane 자식(훅·CLI 가 셸 경유로 부르는 python)의
     // 바이트코드 쓰기는 spawn_env_pairs 상속으로만 끈다(직스폰 팩토리 python_command 를 못 타는 경로).

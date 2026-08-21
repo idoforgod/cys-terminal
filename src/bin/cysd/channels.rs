@@ -417,19 +417,11 @@ fn pgid_of(_pid: u32) -> Option<i32> {
     None // Windows pid-핀은 C1 WINFIX에서 대칭화 — C0은 토큰 단독(문서화).
 }
 
-/// pid 생존 프로브(unix=kill(pid,0)). windows는 best-effort(C1 WINFIX 전까지).
-#[cfg(unix)]
+/// pid 생존 프로브 — 단일 정의처 state::pid_alive 위임(전 OS 실측 · unix=kill(pid,0),
+/// windows=OpenProcess+WaitForSingleObject). 자가치유(respawn_dead_bridges)·이중 스폰 게이트·
+/// channel.status alive 가 전부 이 실측 하나를 소비한다 — 판정 두 벌은 드리프트 원천.
 fn pid_alive(pid: u32) -> bool {
-    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-#[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    // L3 한계 명문화: windows는 pid 생존 프로브가 없어 **항상 alive로 보고**한다 — 그 결과
-    // ①respawn_dead_bridges의 자가치유(죽은 브리지 재스폰)가 발현 안 하고(dead 판정 불가)
-    // ②channel.status의 alive가 항상 true다. 재스폰 감지는 reaper 스레드 신호(on_bridge_exit)에만
-    // 의존한다. 실제 프로브(OpenProcess/GetExitCodeProcess) 편입은 WINFIX 트랙. doctor도 이 한계를
-    // 경고한다(diag_channels_db).
-    pid != 0
+    crate::state::pid_alive(pid)
 }
 
 // ── 브리지 스폰(cysd 스폰 자식·scoped 원장 등록·reaper 스레드로 zombie 회수) ────

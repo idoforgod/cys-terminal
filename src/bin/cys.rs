@@ -1263,18 +1263,27 @@ fn connect_raw() -> Result<std::os::unix::net::UnixStream, String> {
 /// ERROR_PIPE_BUSY(231) 한정 bounded 재시도로 named pipe 를 연다. 그 외 오류(파이프 부재
 /// ERROR_FILE_NOT_FOUND = 데몬 다운 등)는 즉시 반환 — autostart 판단은 호출부 몫.
 /// 231을 데몬 다운으로 오판하면 connect()의 sibling cysd autostart 까지 헛발동한다
-/// (2026-07-10 Windows 실사고). 정책 상수는 GUI(cys-app)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*)
-/// — 근거·계약은 그 정의부 주석 참조. 비-Windows 테스트가 정책 불변을 박제한다.
+/// (2026-07-10 Windows 실사고). 정책(상수·jitter·커널 대기)은 GUI(cys-app)와 공용 단일 진실인
+/// lib(cys::PIPE_BUSY_* · next_busy_delay · wait_named_pipe) — 근거·계약은 그 정의부 주석 참조.
+/// 비-Windows 테스트가 정책 불변을 박제한다.
 #[cfg(windows)]
 fn open_pipe_busy_retry(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
+    let mut delay = cys::PIPE_BUSY_RETRY_INTERVAL;
     loop {
         match std::fs::OpenOptions::new().read(true).write(true).open(path) {
             Err(e)
                 if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
                     && std::time::Instant::now() < deadline =>
             {
-                std::thread::sleep(cys::PIPE_BUSY_RETRY_INTERVAL);
+                // busy 한정 분기(비-busy 오류는 위 가드에 안 걸려 즉시 반환 유지). 커널 대기가
+                // 인스턴스 가용을 알리면 즉시 재-open(창을 놓치면 남이 채간다), 타임아웃이면
+                // jitter 백오프로 재시도 위상을 분산한다. wait 의 false(파이프 소멸 포함)는
+                // 판정이 아니다 — 최종 판정은 다음 open 이 내린다.
+                if !cys::wait_named_pipe(path, cys::PIPE_BUSY_WAIT_SLICE) {
+                    delay = cys::next_busy_delay(delay, cys::rand01_cheap());
+                    std::thread::sleep(delay);
+                }
             }
             other => return other,
         }
@@ -4173,16 +4182,9 @@ fn diag_channels_db(ctx: &DoctorCtx) -> DiagItem {
                 |r| r.get(0),
             );
             match sv {
-                // L3: windows는 브리지 pid 생존 프로브가 없어 status alive 항상 true·자가치유 미발현
-                // (재스폰은 reaper 신호 의존) — doctor가 이 한계를 경고한다(WINFIX 트랙). unix는 정상.
-                #[cfg(windows)]
-                Ok(v) => DiagItem {
-                    name: "channels-db",
-                    status: DiagStatus::Warn,
-                    detail: format!("채널 DB 정상·schema_version={v} · [WINFIX] windows는 pid 생존 프로브 부재로 status alive 항상 true·자가치유(죽은 브리지 재스폰) 미발현"),
-                    action: "windows 채널 자가치유는 WINFIX 트랙 — 브리지 이상 시 수동 재기동".into(),
-                },
-                #[cfg(not(windows))]
+                // pid 생존 프로브는 전 OS 실측(cysd state::pid_alive — windows 는 OpenProcess+
+                // WaitForSingleObject)이라 status alive·자가치유(죽은 브리지 재스폰)가 OS 무관
+                // 동일 계약이다 — windows 별도 경고 없음.
                 Ok(v) => DiagItem {
                     name: "channels-db",
                     status: DiagStatus::Ok,
@@ -12614,6 +12616,26 @@ mod tests {
             cys::PIPE_BUSY_RETRY_DEADLINE > cys::PIPE_BUSY_RETRY_INTERVAL,
             "마감({:?}) ≤ 간격({:?})이면 사실상 재시도 없는 1회 open 으로 회귀한다",
             cys::PIPE_BUSY_RETRY_DEADLINE,
+            cys::PIPE_BUSY_RETRY_INTERVAL
+        );
+        // 커널 대기 슬라이스·jitter 캡 정책 핀: 슬라이스가 0이면 WaitNamedPipeW 가
+        // NMPWAIT_USE_DEFAULT_WAIT(서버 기본값) 의미로 표변하고, 슬라이스·캡이 데드라인을
+        // 잠식하면 open 재판정(비-busy 오류 즉시 반환 계약) 기회가 사라진다.
+        assert!(
+            !cys::PIPE_BUSY_WAIT_SLICE.is_zero(),
+            "0ms 슬라이스는 서버 기본 타임아웃 의미(NMPWAIT_USE_DEFAULT_WAIT)로 오발"
+        );
+        assert!(
+            cys::PIPE_BUSY_WAIT_SLICE + cys::PIPE_BUSY_BACKOFF_CAP < cys::PIPE_BUSY_RETRY_DEADLINE,
+            "슬라이스({:?})+캡({:?})이 데드라인({:?})을 잠식 — 데몬 다운 재판정 기회 소멸",
+            cys::PIPE_BUSY_WAIT_SLICE,
+            cys::PIPE_BUSY_BACKOFF_CAP,
+            cys::PIPE_BUSY_RETRY_DEADLINE
+        );
+        assert!(
+            cys::PIPE_BUSY_BACKOFF_CAP >= cys::PIPE_BUSY_RETRY_INTERVAL,
+            "캡({:?}) < 하한({:?})이면 next_busy_delay 클램프 구간이 성립하지 않는다",
+            cys::PIPE_BUSY_BACKOFF_CAP,
             cys::PIPE_BUSY_RETRY_INTERVAL
         );
     }

@@ -42,8 +42,11 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             // 자원 거버넌스가 데몬 수명 내내 조용히 사라지는 것을 막는다.
             let tick = std::panic::AssertUnwindSafe(|| {
                 sys.refresh_processes(ProcessesToUpdate::All, true);
+                // ★watchdog 틱 순서 불변식 — 유일 명문화 지점(앵커는 라인번호가 아니라 함수명):
+                //   refresh_seat_cache → deliver_queued → check_agent_death → check_master_deadman
                 // ★SEAT: 프로세스 표를 갓 refresh 한 이 지점이 좌석 판정의 유일한 write 시점이다.
-                // deliver_queued 보다 **먼저** 갱신해야 같은 틱의 배달이 최신 좌석 사실을 본다.
+                // deliver_queued 보다 **먼저** 갱신해야 같은 틱의 배달이 최신 좌석 사실을 보고,
+                // 사망·데드맨 계열 검사는 그 좌석·프로세스 사실의 소비자라 write 시점 뒤에 온다.
                 refresh_seat_cache(&daemon, &sys);
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);

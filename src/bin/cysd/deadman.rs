@@ -91,9 +91,10 @@ pub fn probe_holder(socket_path: &Path, timeout: Duration) -> bool {
     matches!(stream.read(&mut buf), Ok(n) if n > 0)
 }
 
-/// pid 생존 프로브(unix=kill(pid,0)).
+/// pid 생존 프로브 — 단일 정의처 state::pid_alive 위임(생존 판정 소스 단일화 · 도구 출력과
+/// 기억이 충돌하면 프로브가 이긴다). 이 모듈은 #![cfg(unix)]라 unix arm(kill(pid,0))을 탄다.
 pub fn pid_alive(pid: u32) -> bool {
-    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    crate::state::pid_alive(pid)
 }
 
 /// pid의 프로세스명이 정확히 cysd인가(kill 오살상 차단 — pid 재사용 방어).
