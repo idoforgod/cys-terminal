@@ -171,6 +171,58 @@ pub fn queue_delivered_payload(
     })
 }
 
+/// queue.rehomed payload — WAL 복원(restored_queue) 항목이 같은 role의 살아있는 surface
+/// pending_queue로 (enqueued_at, seq) 정렬 병합될 때 발행(신규 이벤트·G1 W2-C).
+/// `reordered=true`는 병합이 복원 항목을 대상 큐 기존 항목 **앞자리**에 넣어 기존 항목이
+/// 뒤로 밀렸음을 뜻한다 — 재정렬 발생 지점의 무음 금지(결함 3 순서 역전 봉인).
+/// `queue_entry_ids`는 병합 삽입 순서(= (enqueued_at, seq) 오름차순) 그대로다.
+pub fn queue_rehomed_payload(role: &str, rehomed: &[QueueEntry], reordered: bool) -> Value {
+    json!({
+        "count": rehomed.len(),
+        "queue_entry_ids": rehomed.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "role": role,
+        "reordered": reordered,
+    })
+}
+
+/// queue.migrated payload — 좌석 승계 시 구 좌석 pending_queue가 신 좌석 큐 **뒤에**
+/// append 이관될 때 발행(신규 이벤트·G1 W2-C). 병합 정책은 현행 append 유지 —
+/// 대상 큐 기존 항목이 앞서는 재정렬 가능 지점을 이벤트로 명시할 뿐이다(무음 승계 금지).
+/// `queue_entry_ids`는 구 좌석 큐 순서(= append 순서) 그대로다.
+pub fn queue_migrated_payload(
+    from_surface: u64,
+    to_surface: u64,
+    role: &str,
+    migrated: &[QueueEntry],
+) -> Value {
+    json!({
+        "from_surface": from_surface,
+        "to_surface": to_surface,
+        "queue_entry_ids": migrated.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "role": role,
+    })
+}
+
+/// (enqueued_at, seq) 기준 stable merge 삽입 위치 — 대상 큐에서 새 항목 `(at, seq)`보다
+/// **뒤(더 신규)인 첫 인덱스**를 반환한다(순수 판정자·G1 W2-C).
+/// - 동률은 기존/선삽입 항목 승(= stable — 같은 키의 복원 항목은 파일·seq 순서를 유지).
+/// - enqueued_at 동률·역행(시계 스큐·NTP 점프)은 seq가 타이브레이커(boot 내 단조).
+/// - NaN 비교 불능은 기존 항목 승(보수적 — 순서의 1차 진실은 deque 위치).
+/// 반환값 == q.len()이면 순수 append(재정렬 없음), < q.len()이면 기존 항목이 뒤로 밀린다.
+pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64) -> usize {
+    for (i, e) in q.iter().enumerate() {
+        let existing_is_newer = match e.enqueued_at.partial_cmp(&at) {
+            Some(std::cmp::Ordering::Greater) => true,
+            Some(std::cmp::Ordering::Equal) => e.seq > seq,
+            _ => false, // Less 또는 NaN — 기존 항목이 앞선다(보수적)
+        };
+        if existing_is_newer {
+            return i;
+        }
+    }
+    q.len()
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -958,6 +1010,14 @@ pub struct Daemon {
     /// 큐 WAL(P7): 미배달 `--queued` 메시지의 데몬 재기동 생존분(queue-state.json replay).
     /// 라이브 큐는 surface.pending_queue(휘발)이고, 이건 재시작을 넘긴 스냅샷이다 —
     /// queue.list가 라이브 큐와 함께 노출한다. id 우선(레거시는 mid)으로 이중 replay를 dedup한다.
+    ///
+    /// ★G1(W2-C) 비타입 경로 수동 감사 4지점: 원소가 serde_json::Value라 QueueEntry 필드
+    /// 추가·변경이 **컴파일러 강제 밖**이다 — QueueEntry 스키마를 만질 때 아래 4곳을 손으로
+    /// 감사하라(한 곳이라도 빠지면 신 필드가 조용히 결손된다):
+    ///   ① 초기화 — load_queue_state(레거시 합성: id/seq/enqueued_at 전 항목 보장)
+    ///   ② persist 병합 — persist_queue_state의 restored 잔존분 append(Value 통짜 복제)
+    ///   ③ rehome — rehome_restored_queue의 Value→QueueEntry 되살림(필드 관통)
+    ///   ④ queue.list restored 노출 — handlers.rs "queue.list"의 restored 행(신규 열 결손 방지)
     pub restored_queue: Mutex<Vec<serde_json::Value>>,
     /// ★G1(W2-A): QueueEntry.seq 발급 카운터 — boot 내 단조. 시드 = WAL(load_queue_state)
     /// 복원 항목들의 max(seq)+1(WAL 부재 시 1). 발급 단일 지점 = next_queue_entry.
@@ -1425,6 +1485,9 @@ fn queue_mid(sid: u64, text: &str) -> String {
 /// from/origin은 합성하지 않는다(없는 정보를 지어내지 않는다 — 소비측 unwrap_or 폴백).
 ///
 /// 파일 부재/파손이면 빈 벡터(fail-safe — 큐 없음이 기본).
+///
+/// ★비타입 감사 지점 ①(§Daemon::restored_queue) — QueueEntry 스키마 변경 시 여기의
+/// 레거시 합성이 전 항목에 신 필드를 보장해야 하류(rehome·queue.list)가 결손 없이 읽는다.
 fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1874,6 +1937,8 @@ impl Daemon {
             }
         }
         for it in self.restored_queue.lock().unwrap().iter() {
+            // ★비타입 감사 지점 ②(§restored_queue): 잔존 복원분은 Value 통짜 복제라 신 필드가
+            // 자동 보존된다 — 필드별 재조립로 바꾸면 결손 위험이 생기니 통짜 복제를 유지하라.
             // dedup 키 = id 우선(load가 전 항목에 합성)·방어적 mid 폴백.
             let key = it
                 .get("id")
@@ -1894,59 +1959,106 @@ impl Daemon {
     /// surface**의 pending_queue로 옮겨, deliver_queued가 그 surface가 idle일 때 배달하게 한다.
     /// restored_queue는 queue.list에 보이기만 하고 배달 경로(surface.pending_queue)에 없었다(Phase 3 갭).
     /// surface_id는 재기동 시 소멸하므로 role을 앵커로 재타겟한다. role 미기록/무매칭 항목은 보존(정직).
+    ///
+    /// ★G1(W2-C) 정렬 병합: 종전 무조건 push_back은 재기동 직후 몇 초 사이 enqueue된 신규
+    /// 메시지가 재기동 전 구 메시지보다 먼저 배달되는 순서 역전(결함 3의 실경로)을 만들었다 —
+    /// 복원 항목을 (enqueued_at, seq) 기준 stable merge로 삽입하고(queue_merge_insert_pos),
+    /// 재정렬 발생 여부를 queue.rehomed {count, queue_entry_ids, role, reordered}로 명시 발행한다
+    /// (재정렬 지점 무음 금지). 발행은 전 락 해제 후 — publish는 seq 영속 write를 겸한다.
     /// 반환: 재홈된 항목 수(>0이면 호출자가 persist_queue_state로 스냅샷 최신화).
     pub fn rehome_restored_queue(&self) -> usize {
-        let mut restored = self.restored_queue.lock().unwrap();
-        if restored.is_empty() {
-            return 0;
-        }
-        // role → 살아있는(미exit) surface 매핑
-        let mut role_surface: HashMap<String, Arc<Surface>> = HashMap::new();
-        for s in self.surfaces.lock().unwrap().values() {
-            if s.exited.load(Ordering::Relaxed) {
-                continue;
-            }
-            if let Some(role) = s.role.lock().unwrap().clone() {
-                role_surface.entry(role).or_insert_with(|| s.clone());
-            }
-        }
+        // (target_sid, role, 병합 삽입 순서의 항목들, reordered) — 락 밖 발행용 수집.
+        let mut rehomed_events: Vec<(u64, String, Vec<QueueEntry>, bool)> = Vec::new();
         let mut rehomed = 0usize;
-        restored.retain(|it| {
-            let role = it.get("role").and_then(|v| v.as_str());
-            let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(r) = role {
-                if let Some(surf) = role_surface.get(r) {
-                    // ★G1(W2-A): WAL 원값(id/seq/enqueued_at/from/origin)을 보존해 QueueEntry로
-                    // 되살린다 — id는 load_queue_state가 전 항목에 합성 보장(방어적 mid 폴백).
-                    // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
-                    // 복원 경유 사실은 관측 가능하게 남긴다.
-                    let entry = QueueEntry {
-                        id: it
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| it.get("mid").and_then(|v| v.as_str()))
-                            .unwrap_or("")
-                            .to_string(),
-                        seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-                        text: text.to_string(),
-                        enqueued_at: it
-                            .get("enqueued_at")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or_else(now_epoch),
-                        from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
-                        origin: it
-                            .get("origin")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("wal-legacy")
-                            .to_string(),
-                    };
-                    surf.pending_queue.lock().unwrap().push_back(entry);
-                    rehomed += 1;
-                    return false; // restored_queue에서 제거(pending_queue로 이관)
+        {
+            let mut restored = self.restored_queue.lock().unwrap();
+            if restored.is_empty() {
+                return 0;
+            }
+            // role → 살아있는(미exit) surface 매핑
+            let mut role_surface: HashMap<String, Arc<Surface>> = HashMap::new();
+            for s in self.surfaces.lock().unwrap().values() {
+                if s.exited.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if let Some(role) = s.role.lock().unwrap().clone() {
+                    role_surface.entry(role).or_insert_with(|| s.clone());
                 }
             }
-            true // role 무매칭/미기록 — 보존(재기동 더 기다림·정직)
-        });
+            // 1단: 이관 대상 분리 — role 매칭 항목을 QueueEntry로 되살려 role별 배치로 모은다.
+            // ★비타입 감사 지점 ③(§restored_queue): WAL 원값(id/seq/enqueued_at/from/origin)을
+            // 보존 승계한다 — id는 load_queue_state가 전 항목에 합성 보장(방어적 mid 폴백).
+            // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
+            // 복원 경유 사실은 관측 가능하게 남긴다.
+            let mut batches: Vec<(String, Vec<QueueEntry>)> = Vec::new();
+            restored.retain(|it| {
+                let Some(role) = it.get("role").and_then(|v| v.as_str()) else {
+                    return true; // role 미기록 — 보존(정직)
+                };
+                if !role_surface.contains_key(role) {
+                    return true; // role 무매칭 — 보존(재기동 더 기다림)
+                }
+                let entry = QueueEntry {
+                    id: it
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| it.get("mid").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string(),
+                    seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+                    text: it.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    enqueued_at: it
+                        .get("enqueued_at")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or_else(now_epoch),
+                    from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
+                    origin: it
+                        .get("origin")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("wal-legacy")
+                        .to_string(),
+                };
+                match batches.iter_mut().find(|(r, _)| r == role) {
+                    Some((_, v)) => v.push(entry),
+                    None => batches.push((role.to_string(), vec![entry])),
+                }
+                rehomed += 1;
+                false // restored_queue에서 제거(pending_queue로 이관)
+            });
+            // 2단: 배치를 (enqueued_at, seq) 오름차순 정렬 후 대상 큐에 stable merge 삽입.
+            // 배치 내 정렬은 stable — 동률 키는 WAL 파일 등장순(=push 순서)을 유지한다.
+            for (role, mut batch) in batches {
+                batch.sort_by(|a, b| {
+                    a.enqueued_at
+                        .partial_cmp(&b.enqueued_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.seq.cmp(&b.seq))
+                });
+                let surf = &role_surface[&role];
+                let mut reordered = false;
+                {
+                    let mut q = surf.pending_queue.lock().unwrap();
+                    for entry in &batch {
+                        let pos = queue_merge_insert_pos(&q, entry.enqueued_at, entry.seq);
+                        if pos < q.len() {
+                            reordered = true; // 기존 항목이 복원 항목 뒤로 밀림
+                        }
+                        q.insert(pos, entry.clone());
+                    }
+                }
+                rehomed_events.push((surf.id, role, batch, reordered));
+            }
+        }
+        // 발행은 restored_queue·pending_queue 락 전부 해제 후(락 밖 I/O 관례 — bus는 leaf지만
+        // 256 seq 경계에서 event.seq 파일 write를 겸한다).
+        for (sid, role, batch, reordered) in rehomed_events {
+            self.bus.publish(
+                "queue.rehomed",
+                "queue",
+                Some(sid),
+                queue_rehomed_payload(&role, &batch, reordered),
+            );
+        }
         rehomed
     }
 
@@ -5339,6 +5451,160 @@ mod tests {
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── ★G1(W2-C): rehome 정렬 병합 + queue_merge_insert_pos 순수 핀 ─────────
+
+    fn w2c_entry(id: &str, seq: u64, enqueued_at: f64) -> QueueEntry {
+        QueueEntry {
+            id: id.to_string(),
+            seq,
+            text: format!("본문 {id}"),
+            enqueued_at,
+            from: None,
+            origin: "send".to_string(),
+        }
+    }
+
+    /// 순수 판정자 핀 — (enqueued_at, seq) 삽입 위치: 동률은 기존/선삽입 승(stable),
+    /// enqueued_at 동률·역행은 seq 타이브레이커, NaN은 기존 승(보수적), 빈 큐는 0(=append).
+    #[test]
+    fn queue_merge_insert_pos_orders_by_enqueued_at_then_seq() {
+        let empty: VecDeque<QueueEntry> = VecDeque::new();
+        assert_eq!(queue_merge_insert_pos(&empty, 10.0, 1), 0, "빈 큐 = append 위치 0");
+        let q: VecDeque<QueueEntry> =
+            vec![w2c_entry("a", 1, 10.0), w2c_entry("b", 2, 20.0)].into();
+        assert_eq!(queue_merge_insert_pos(&q, 5.0, 9), 0, "전원보다 과거 → 최전선");
+        assert_eq!(queue_merge_insert_pos(&q, 15.0, 9), 1, "사이 시각 → 중간 삽입");
+        assert_eq!(queue_merge_insert_pos(&q, 30.0, 9), 2, "전원보다 신규 → append");
+        // 동률 enqueued_at: seq 타이브레이커(boot 내 단조 — 시계 스큐 방어).
+        assert_eq!(queue_merge_insert_pos(&q, 10.0, 0), 0, "동시각·더 작은 seq → 앞");
+        assert_eq!(queue_merge_insert_pos(&q, 10.0, 1), 1, "동시각·동일 seq → 기존 승(stable)");
+        assert_eq!(queue_merge_insert_pos(&q, 10.0, 5), 1, "동시각·더 큰 seq → 뒤");
+        // NaN(비교 불능): 기존 항목 승 — 순서의 1차 진실은 deque 위치.
+        let nan_q: VecDeque<QueueEntry> = vec![w2c_entry("n", 3, f64::NAN)].into();
+        assert_eq!(queue_merge_insert_pos(&nan_q, 10.0, 1), 1, "NaN 기존 항목 → append");
+    }
+
+    /// ★결함 3(순서 역전) 봉인 핀 — 재기동 전 구 항목(enqueued_at 과거)이 재기동 직후
+    /// enqueue된 신규 라이브 항목보다 **앞**에 병합된다. 종전 무조건 push_back이면
+    /// [라이브, (파일순) 구2, 구1]이 되어 이 테스트가 실패한다. WAL 파일은 일부러
+    /// (enqueued_at, seq) 역순으로 적어 배치 정렬까지 함께 핀한다.
+    /// + queue.rehomed 이벤트: queue_entry_ids 병합 순서·reordered=true·role·
+    ///   `entry_ids` 키(W-id 에코 계약) 절대 부재.
+    #[test]
+    fn rehome_sorted_merge_places_restored_before_newer_live_entries() {
+        let dir = queue_wal_dir("w2c-merge");
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"id":"qold.2","seq":2,"surface_id":9,"role":"w2c-merge","text":"재기동 전 2","enqueued_at":200.0,"origin":"send"},
+                {"id":"qold.1","seq":1,"surface_id":9,"role":"w2c-merge","text":"재기동 전 1","enqueued_at":100.0,"origin":"send"}]"#,
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w2c-merge".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        // 재기동 직후 도착한 신규 라이브 메시지(enqueued_at=now ≫ 200.0).
+        let live = daemon.next_queue_entry("재기동 후 신규".into(), None, "send");
+        s.pending_queue.lock().unwrap().push_back(live.clone());
+        assert_eq!(daemon.rehome_restored_queue(), 2);
+        {
+            let q = s.pending_queue.lock().unwrap();
+            let order: Vec<&str> = q.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                order,
+                vec!["qold.1", "qold.2", live.id.as_str()],
+                "구 항목이 (enqueued_at, seq) 순으로 신규 라이브 앞에 병합돼야 한다(결함 3 봉인)"
+            );
+        }
+        let rehomed: Vec<serde_json::Value> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"] == json!("queue.rehomed"))
+            .collect();
+        assert_eq!(rehomed.len(), 1, "role 배치당 1회 발행");
+        let ev = &rehomed[0];
+        assert_eq!(ev["category"], json!("queue"));
+        assert_eq!(ev["surface_id"], json!(s.id));
+        assert_eq!(ev["payload"]["count"], json!(2));
+        assert_eq!(
+            ev["payload"]["queue_entry_ids"],
+            json!(["qold.1", "qold.2"]),
+            "queue_entry_ids = 병합 삽입 순서"
+        );
+        assert_eq!(ev["payload"]["role"], json!("w2c-merge"));
+        assert_eq!(ev["payload"]["reordered"], json!(true), "기존 라이브 항목이 뒤로 밀림");
+        assert!(
+            ev["payload"].get("entry_ids").is_none(),
+            "entry_ids 키명은 W-id 에코 전용 — 재사용 금지(성찰 BLOCKER)"
+        );
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 대조군 — 대상 큐가 비어 있으면 순수 append(기존 항목 밀림 없음) → reordered=false.
+    /// 배치 정렬(파일 역순 → (enqueued_at, seq) 오름차순)은 여기서도 유지된다.
+    #[test]
+    fn rehome_into_empty_queue_reports_reordered_false() {
+        let dir = queue_wal_dir("w2c-empty");
+        std::fs::write(
+            dir.join("queue-state.json"),
+            r#"[{"id":"qe.2","seq":2,"surface_id":9,"role":"w2c-empty","text":"둘","enqueued_at":200.0,"origin":"send"},
+                {"id":"qe.1","seq":1,"surface_id":9,"role":"w2c-empty","text":"하나","enqueued_at":100.0,"origin":"send"}]"#,
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w2c-empty".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        assert_eq!(daemon.rehome_restored_queue(), 2);
+        {
+            let q = s.pending_queue.lock().unwrap();
+            let order: Vec<&str> = q.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(order, vec!["qe.1", "qe.2"], "빈 큐에도 배치 정렬 순서 유지");
+        }
+        let ev = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .find(|e| e["name"] == json!("queue.rehomed"))
+            .expect("queue.rehomed 발행");
+        assert_eq!(ev["payload"]["reordered"], json!(false), "밀린 기존 항목 없음");
+        assert_eq!(ev["payload"]["queue_entry_ids"], json!(["qe.1", "qe.2"]));
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W2-C 신규 이벤트 payload 빌더 스키마 핀 — queue.rehomed / queue.migrated.
+    /// json! payload는 컴파일러 강제 밖 — 키 존재·순서 보존·`entry_ids` 부재를 고정한다.
+    #[test]
+    fn queue_rehomed_and_migrated_payloads_pin_schema() {
+        let batch = vec![w2c_entry("qr.1", 1, 10.0), w2c_entry("qr.2", 2, 20.0)];
+        let p = queue_rehomed_payload("worker", &batch, true);
+        assert_eq!(p["count"], json!(2));
+        assert_eq!(p["queue_entry_ids"], json!(["qr.1", "qr.2"]), "병합 삽입 순서 보존");
+        assert_eq!(p["role"], json!("worker"));
+        assert_eq!(p["reordered"], json!(true));
+        assert!(p.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
+
+        let m = queue_migrated_payload(3, 7, "master", &batch);
+        assert_eq!(m["from_surface"], json!(3));
+        assert_eq!(m["to_surface"], json!(7));
+        assert_eq!(m["queue_entry_ids"], json!(["qr.1", "qr.2"]), "append 순서 보존");
+        assert_eq!(m["role"], json!("master"));
+        assert!(m.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
     }
 
     // ─── ★G1(W2-B): 큐 이벤트 payload 빌더 스키마 핀 ─────────────────────────

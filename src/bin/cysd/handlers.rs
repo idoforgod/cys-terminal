@@ -221,16 +221,36 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
 /// 동시성: 두 surface 의 pending_queue 를 **동시에 잡지 않는다** — drain 은 한 문장 안에서
 /// 임시 guard 가 끝나며 락이 풀리고, 그 뒤 대상 큐를 잡는다. 두 leaf 락을 겹쳐 쥐면 반대 방향
 /// 승계와 AB-BA 데드락이 난다(코드 규약 '락 순서: surfaces → roles'의 연장선).
-fn migrate_seat_queue(prev: &Arc<crate::state::Surface>, next: &Arc<crate::state::Surface>) {
+///
+/// ★G1(W2-C) 무음 재정렬 금지: 좌석 승계 이관은 대상 큐 기존 항목이 앞서는 재정렬 가능
+/// 지점인데 종전엔 완전 무음이었다 — 병합 정책(신 좌석 큐 **뒤에** append)은 현행 그대로
+/// 유지하되, queue.migrated {from_surface, to_surface, queue_entry_ids, role} 이벤트로
+/// 명시한다. role 은 호출자가 전달한다(claim_role 경로는 surface.role 락 guard 를 쥔 채
+/// 호출하므로 여기서 next.role 을 다시 잠그면 재진입 데드락 — 읽지 말고 받아라).
+/// bus.publish 는 leaf 락이라 호출자의 surfaces·roles 락 아래에서도 안전하다.
+fn migrate_seat_queue(
+    daemon: &Arc<Daemon>,
+    prev: &Arc<crate::state::Surface>,
+    next: &Arc<crate::state::Surface>,
+    role: &str,
+) {
     let drained: Vec<crate::state::QueueEntry> =
         prev.pending_queue.lock().unwrap().drain(..).collect();
     if drained.is_empty() {
-        return;
+        return; // 이관 0건 — 이벤트도 없다(발행은 사실의 파생)
     }
-    let mut nq = next.pending_queue.lock().unwrap();
-    for entry in drained {
-        nq.push_back(entry);
+    {
+        let mut nq = next.pending_queue.lock().unwrap();
+        for entry in drained.iter().cloned() {
+            nq.push_back(entry);
+        }
     }
+    daemon.bus.publish(
+        "queue.migrated",
+        "queue",
+        Some(next.id),
+        crate::state::queue_migrated_payload(prev.id, next.id, role, &drained),
+    );
 }
 
 /// ★SEAT 승계 고지 — **무음 승계 금지**.
@@ -1247,7 +1267,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         if let Some(prev_s) = prev_s {
                             *prev_s.role.lock().unwrap() = None;
                             *prev_s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
-                            migrate_seat_queue(&prev_s, &s);
+                            migrate_seat_queue(daemon, &prev_s, &s, &role_for_announce);
                             daemon.persist_queue_state(); // 이관 결과를 WAL 에 확정(재기동 생존)
                             crate::governance::persist_topology(daemon);
                             // ★(W2 · G13/G14) announce 는 전이 확정 후 — spawn_failed 로 끝난 시도가
@@ -2297,7 +2317,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     if let Some(prev_s) = surfaces.get(&prev) {
                         *prev_s.role.lock().unwrap() = None;
                         *prev_s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
-                        migrate_seat_queue(prev_s, surface);
+                        migrate_seat_queue(daemon, prev_s, surface, &final_role);
                     }
                 }
                 // 전이 관찰: insert/remove 반영 후의 master 보유자.
@@ -4311,6 +4331,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
+            // ★G1(W2-C) 비타입 감사 지점 ④(§state::restored_queue): 라이브 행과 동일한 신규 열
+            // (id/seq/enqueued_at/age_secs/from/origin)을 restored 행에도 노출한다 — 여기가
+            // 빠지면 운영자가 복원 항목을 id 로 조준(강제 배달)할 수 없다(신규 열 결손 방지).
+            // 기존 키(surface_id/restored/mid/bytes/preview)는 불변. 결손 필드는 null —
+            // CLI 행 렌더(queue_list_row)가 "-" 자리표시로 열 개수를 지킨다.
+            let now = crate::state::now_epoch();
             for it in daemon.restored_queue.lock().unwrap().iter() {
                 let sid_v = it.get("surface_id").cloned().unwrap_or(Value::Null);
                 if let Some(f) = filter_sid {
@@ -4324,6 +4350,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "mid": it.get("mid").cloned().unwrap_or(Value::Null),
                     "bytes": text.len(),
                     "preview": text.chars().take(80).collect::<String>(),
+                    "id": it.get("id").cloned().unwrap_or(Value::Null),
+                    "seq": it.get("seq").cloned().unwrap_or(Value::Null),
+                    "enqueued_at": it.get("enqueued_at").cloned().unwrap_or(Value::Null),
+                    "age_secs": it
+                        .get("enqueued_at")
+                        .and_then(|v| v.as_f64())
+                        .map(|at| json!((now - at).max(0.0) as u64))
+                        .unwrap_or(Value::Null),
+                    "from": it.get("from").cloned().unwrap_or(Value::Null),
+                    "origin": it.get("origin").cloned().unwrap_or(Value::Null),
                 }));
             }
             Reply::Single(ok_response(&id, json!({"entries": out})))
@@ -7150,6 +7186,125 @@ mod tests {
             daemon.surfaces.lock().unwrap()[&own].pending_queue.lock().unwrap().is_empty(),
             "자기 clear가 통과했는데 큐가 남아 있다"
         );
+    }
+
+    /// ★G1(W2-C) 좌석 승계 이관 핀 — ①병합 정책은 현행 그대로 '신 좌석 큐 **뒤에** append'
+    /// (대상 큐 기존 항목이 앞서는 재정렬 가능 지점 — 정책 변경이 아니라 명시가 이번 범위)
+    /// ②queue.migrated {from_surface, to_surface, queue_entry_ids, role} 발행(무음 승계 금지)
+    /// ③`entry_ids` 키(W-id 에코 계약) 절대 부재 ④drain 0건이면 이벤트도 없다(발행은 사실의 파생).
+    #[test]
+    fn migrate_seat_queue_appends_and_publishes_queue_migrated() {
+        let daemon = claim_daemon();
+        let prev_id = make_surface(&daemon, Some("master"));
+        let next_id = make_surface(&daemon, None);
+        let (prev_s, next_s) = {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            (surfaces[&prev_id].clone(), surfaces[&next_id].clone())
+        };
+        // 신 좌석 큐에 기존 항목 1 + 구 좌석 큐에 보류 항목 2.
+        let existing = daemon.next_queue_entry("신 좌석 기존".into(), None, "test");
+        next_s.pending_queue.lock().unwrap().push_back(existing.clone());
+        let held1 = daemon.next_queue_entry("보류 보고 1".into(), None, "test");
+        let held2 = daemon.next_queue_entry("보류 보고 2".into(), None, "test");
+        {
+            let mut pq = prev_s.pending_queue.lock().unwrap();
+            pq.push_back(held1.clone());
+            pq.push_back(held2.clone());
+        }
+        migrate_seat_queue(&daemon, &prev_s, &next_s, "master");
+        assert!(prev_s.pending_queue.lock().unwrap().is_empty(), "구 좌석 큐는 전량 drain");
+        {
+            let q = next_s.pending_queue.lock().unwrap();
+            let order: Vec<&str> = q.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                order,
+                vec![existing.id.as_str(), held1.id.as_str(), held2.id.as_str()],
+                "이관분은 신 좌석 큐 뒤에 순서 보존 append(현행 정책 핀)"
+            );
+        }
+        let migrated: Vec<Value> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"] == json!("queue.migrated"))
+            .collect();
+        assert_eq!(migrated.len(), 1, "이관 1회 = 발행 1회");
+        let ev = &migrated[0];
+        assert_eq!(ev["category"], json!("queue"));
+        assert_eq!(ev["payload"]["from_surface"], json!(prev_id));
+        assert_eq!(ev["payload"]["to_surface"], json!(next_id));
+        assert_eq!(
+            ev["payload"]["queue_entry_ids"],
+            json!([held1.id, held2.id]),
+            "queue_entry_ids = 이관(append) 순서"
+        );
+        assert_eq!(ev["payload"]["role"], json!("master"));
+        assert!(
+            ev["payload"].get("entry_ids").is_none(),
+            "entry_ids 키명은 W-id 에코 전용 — 재사용 금지(성찰 BLOCKER)"
+        );
+        // drain 0건(이미 비운 구 좌석) 재호출 — 추가 발행 없음.
+        migrate_seat_queue(&daemon, &prev_s, &next_s, "master");
+        let after: usize = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"] == json!("queue.migrated"))
+            .count();
+        assert_eq!(after, 1, "이관 0건이면 이벤트도 없다");
+    }
+
+    /// ★G1(W2-C) 비타입 감사 지점 ④ 핀 — queue.list의 restored 행도 라이브 행과 동일한
+    /// 신규 열(id/seq/enqueued_at/age_secs/from/origin)을 노출한다. restored_queue는
+    /// serde_json::Value 경로라 **컴파일러가 결손을 못 잡는다** — 이 핀이 유일한 강제다.
+    /// 기존 키(surface_id/restored/mid/bytes/preview)는 불변.
+    #[test]
+    fn queue_list_exposes_new_columns_on_restored_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-w2c-qlist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let old_at = crate::state::now_epoch() - 50.0;
+        std::fs::write(
+            dir.join("queue-state.json"),
+            format!(
+                r#"[{{"id":"qx.1","seq":4,"surface_id":12,"role":"w2c-qlist","text":"복원 본문","enqueued_at":{old_at},"from":"surface:2","origin":"send"}}]"#
+            ),
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let req = Request {
+            id: json!(1),
+            method: "queue.list".into(),
+            params: json!({}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "queue.list 실패 (응답: {resp})");
+        let entries = resp["result"]["entries"].as_array().expect("entries 배열");
+        let row = entries
+            .iter()
+            .find(|e| e["restored"] == json!(true))
+            .expect("restored 행이 노출돼야 한다");
+        // 기존 키 불변.
+        assert_eq!(row["surface_id"], json!(12));
+        assert_eq!(row["bytes"], json!("복원 본문".len()));
+        assert_eq!(row["preview"], json!("복원 본문"));
+        // 신규 열 — 결손 시 운영자가 복원 항목을 id로 조준(강제 배달)할 수 없다.
+        assert_eq!(row["id"], json!("qx.1"), "restored 행 id 열 결손");
+        assert_eq!(row["seq"], json!(4), "restored 행 seq 열 결손");
+        assert_eq!(row["enqueued_at"].as_f64(), Some(old_at), "restored 행 enqueued_at 결손");
+        let age = row["age_secs"].as_u64().expect("restored 행 age_secs 결손");
+        assert!((49..=120).contains(&age), "age_secs ≈ 50 (실측 {age})");
+        assert_eq!(row["from"], json!("surface:2"));
+        assert_eq!(row["origin"], json!("send"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 대조군 ②: 익명 발신(caller_pid None = 데몬 내부 경로)은 통과해야 한다.
