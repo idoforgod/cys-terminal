@@ -197,6 +197,24 @@ fn record_create_owner(daemon: &Daemon, new_sid: u64, creator_sid: u64) {
     owners.insert(new_sid, (creator_sid, now));
 }
 
+/// ★결함8 창작자 원장 기록 + 만료분 lazy GC (`surface.create` 성공 아크 전용).
+///
+/// `record_create_owner`(pane surface_id 축·close 롤백용)와 **다른 축**이다 — 이쪽은 커널
+/// peer **pid** 축이며 pane 밖 고아 프로세스(setsid·launchd 재부모화)를 정확히 겨냥한다.
+/// pane 안에서 도는 호출도 함께 기록되지만, `check_send_acl` 의 creator 분기는
+/// `from_sid.is_none()` 을 요구하므로 pane 발신자의 판정 경로는 종전과 바이트 동일하다.
+///
+/// `peer_start_time` 은 단일 pid refresh(수 ms)라 성공 아크에서만 돈다. 관측 실패(None)도
+/// 그대로 기록해 둔다 — 판정부가 `None` 을 **거부**로 읽는다(fail-closed · A6 규율).
+/// GC 를 insert 시점에 함께 도는 이유는 `create_idem`·`create_owner` 와 동일(별도 타이머 없이 유계).
+fn record_create_caller(daemon: &Daemon, new_sid: u64, caller_pid: u32) {
+    let now = crate::state::now_epoch();
+    let start = crate::state::peer_start_time(caller_pid);
+    let mut g = daemon.create_caller.lock().unwrap();
+    g.retain(|_, (_, _, ts)| now - *ts < crate::state::CREATE_CALLER_TTL_SECS);
+    g.insert(new_sid, (caller_pid, start, now));
+}
+
 /// ★G4(W4-C) 권위 role 집합의 **단일 정의처** — authoritative_caller_ok(타이핑 가드 면제)·
 /// surface.reap(수동 좌석 회수)·queue.clear exited 예외(죽은 좌석 큐 정리)가 공유한다.
 /// 집합 변경 시 세 게이트가 갈라지지 않게 여기 한 곳만 고친다.
@@ -520,6 +538,96 @@ fn caller_is_owner(daemon: &Daemon, params: &Value, from_sid: Option<u64>) -> bo
             || daemon_token_matches(daemon, params, PARAM_OPERATOR_TOKEN))
 }
 
+/// ★결함8(2026-08-22 부트 실사고) — ACL `from` 신원 등급 **`creator`** 의 단일 정의처.
+///
+/// **왜 이 등급이 있는가**: 훅이 부트를 `setsid` 로 백그라운드 발화하면 그 python 과 자식
+/// `cys launch-agent` 는 launchd(pid 1)로 재부모화돼 **어느 pane 의 자손도 아니게 된다**
+/// → `resolve_caller_surface` = `None` → 등급 `external`. 부서 ACL 의
+/// `{"from":"external","to":"worker*","allow":false}` 는 CEO·타 부서가 부서장을 건너뛰고
+/// 워커를 직접 조향하는 것을 막으려는 **의도된** 규칙인데, 그 그물에 **부트 자신이 방금 만든
+/// 워커 좌석에 기동 명령을 주입하는 것**까지 걸렸다(실측 로그: `[launch-agent] surface:3
+/// created (role=worker)` → `error: acl_denied: acl denied: external → worker` →
+/// `failed surface surface:3 closed`). 규칙을 없애면 부서 자율성 보호가 함께 죽으므로, 수리는
+/// **창작자를 external 과 구별하는 것**이다. `owner` 등급(토큰 기반)으로는 해소되지 않는다 —
+/// 그 토큰은 GUI/Tauri 만 첨부하고 명령줄 `cys launch-agent` 는 어느 경로에서도 붙이지 않는다.
+///
+/// **경계(이것만 연다)**: ①**같은 프로세스**(pid 일치) ∧ ②**그 프로세스가 만든 바로 그 surface**
+/// ∧ ③그 프로세스가 **여전히 살아있고 같은 incarnation**(start_time `Some(a) == Some(b)`)
+/// ∧ ④생성 후 `CREATE_CALLER_TTL_SECS`(30분) 이내. 넷 중 하나라도 어긋나면 종전 `external`
+/// 판정 그대로다(판정부 `creator_matches` — start_time 관측 실패 `None` 은 **거부**).
+///
+/// 예약어다 — pane 이 자칭(`claim_role`·`surface.create --role`)할 수 없다(`owner` 와 대칭).
+///
+/// ★이 등급의 규칙 의미론은 `owner` 와 **같다**(다른 역할과 다르다 · `check_send_acl` 본문 정본):
+///   · `from` 매칭은 **문자열 정확 일치**만 인정한다(글롭 미적용 — `{"from":"*"}` 같은 창작자를
+///     겨냥하지 않은 와일드카드가 부트를 잠그지 못하게).
+///   · 매칭되는 규칙이 없으면 `acl["default"]` 가 아니라 **허용**이다.
+///   ∴ 창작자를 막는 유일한 방법은 `{"from":"creator", …, "allow":false}` 를 **명시**하는 것이다.
+///
+/// ★★정직 고지 — **이 등급도 보안 경계가 아니라 거버넌스 구분이다**(`owner` 와 같은 계열).
+///   같은 UID 의 임의 프로세스가 `surface.create` 를 직접 호출하면 그 프로세스는 **진짜로**
+///   그 좌석의 창작자가 되고, 그 좌석에 한해 이 등급을 얻는다. 이 함수가 막지 못하는 것이
+///   바로 그 경로다. 이 등급이 실제로 닫는 것은 **남이 만든 좌석**에 대한 조향이며(원장 키가
+///   surface_id 라 구조적으로 불가), 승격이 판정을 뒤집은 경우는 `acl.creator_granted` 로
+///   **감사**된다. 좌석 생성 자체의 권한은 이 층위가 아니라 `surface.create` 게이트의 몫이다.
+const ACL_ROLE_CREATOR: &str = "creator";
+
+/// ★결함8 창작자 판정 **순수 함수** — `caller_in_restore_root` 와 같은 방식으로
+/// `start_time_lookup` 을 주입받아 pid 재사용(A5)·관측실패(A6)·TTL 만료 경로를 결정론으로
+/// 테스트한다(합성 시계 `now`).
+///
+/// deny-by-default — **부재는 무증명이다**: 원장 항목 없음·pid 불일치·기록 시점 start_time
+/// 부재(`None`)·현재 start_time 관측실패(`None`)·불일치·TTL 경과는 전부 `false`.
+/// `Some(a) == Some(b)` 만이 허용이다.
+fn creator_matches(
+    entry: Option<crate::state::CreateCallerEntry>,
+    caller_pid: u32,
+    now: f64,
+    start_time_lookup: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let Some((pid, recorded_start, ts)) = entry else {
+        return false; // 원장 부재 = 창작 사실 없음
+    };
+    if pid != caller_pid {
+        return false; // 남이 만든 좌석
+    }
+    if now - ts >= crate::state::CREATE_CALLER_TTL_SECS {
+        return false; // 창 만료 — 창작자 등급은 영구 권한으로 자라지 않는다
+    }
+    // A5(pid 재사용)·A6(관측실패) fail-closed: 기록값과 현재값이 Some==Some 로 일치할 때만.
+    match recorded_start {
+        Some(rs) => start_time_lookup(caller_pid) == Some(rs),
+        None => false,
+    }
+}
+
+/// 데몬 상태(`create_caller` 원장)를 읽어 `creator_matches` 에 위임한다.
+///
+/// **hot path 규율**: 값싼 반증을 먼저 본다 — ①pane 귀속 발신자(`from_sid.is_some()`)는 즉시
+/// false(그쪽은 종전 role 기반 판정이 그대로 산다) ②pid 미해석도 즉시 false ③원장 해시 조회
+/// 1회로 pid 가 안 맞으면 거기서 끝난다. `peer_start_time`(sysinfo 단일 pid refresh)은 **원장에
+/// 자기 항목이 있는 발신자에게만** 든다 — 워커 push·큐 배달·타이핑 등 평시 send 에는 조회가
+/// 얹히지 않는다.
+///
+/// 락 규약: `create_caller` 는 **리프 락** — surfaces/roles 를 쥔 채 잡지 않는다(AB-BA 차단).
+/// `check_send_acl` 은 다른 락 없이 이 함수를 호출한다.
+fn caller_is_creator(
+    daemon: &Daemon,
+    from_sid: Option<u64>,
+    caller_pid: Option<u32>,
+    target_sid: u64,
+) -> bool {
+    if from_sid.is_some() {
+        return false;
+    }
+    let Some(pid) = caller_pid else { return false };
+    let entry = daemon.create_caller.lock().unwrap().get(&target_sid).copied();
+    if !entry.is_some_and(|(p, _, _)| p == pid) {
+        return false; // 원장 부재·타인 창작 — sysinfo 조회 없이 종결
+    }
+    creator_matches(entry, pid, crate::state::now_epoch(), crate::state::peer_start_time)
+}
+
 /// ACL 규칙 배열의 순수 평가부 — 첫 매칭 승리, 매칭 없음 = `None`(호출부가 default 적용).
 /// 매칭했으나 `allow` 가 bool 이 아니면 종전대로 그 자리에서 멈춰 `None` 을 돌린다
 /// (뒤 규칙으로 진행하지 않는다 — 종전 `break` 의미 보존).
@@ -667,6 +775,68 @@ fn check_send_acl(
             }
         }
         effective_role = ACL_ROLE_OWNER.to_string();
+        Some(allow)
+    } else if caller_is_creator(daemon, from_sid, caller_pid, target.id) {
+        // ── 창작자 경로(★결함8) ────────────────────────────────────────────────────────
+        //   의미론은 오너와 **동형**이다(from 문자열 정확 일치 · 무매칭=허용 · `acl["default"]`
+        //   로 내려가지 않음). 여는 범위만 훨씬 좁다: **자기가 방금 만든 그 좌석 하나**.
+        //
+        //   ★왜 여기(오너 다음·비-오너 앞)인가: 오너 판정이 먼저여야 오너 GUI 가 자기가 만든
+        //   pane 에 쓸 때도 표기 등급이 종전 `owner` 로 남는다(감사·소비 스크립트 호환).
+        //   비-오너 경로보다는 앞이어야 `external → worker*` deny 를 통과할 수 있다.
+        //
+        //   ★왜 기본이 허용인가: 이 그물에 걸린 것은 **부트 자신의 워커 기동 주입**이고
+        //   (`external → worker` 실측 거부 → 좌석 롤백 → 의무 노드 미기동), 부서 `acl.json` 은
+        //   pack.rs 에서 **User 등급**이라 팩 업데이트가 덮지 않는다 — 규칙 존재를 전제로 하면
+        //   **이미 돌고 있는 부서**는 업데이트 후에도 계속 막힌다(오너 등급이 같은 이유로
+        //   기본 허용을 택한 것과 동일 논거 ⓒ). 창작자를 막으려면 명시 규칙을 쓴다.
+        //
+        //   ★비-오너·비-창작자 경로는 여기서도 **바이트 동일**이다 — 원장에 자기 항목이 없는
+        //   발신자는 `caller_is_creator` 의 값싼 반증에서 즉시 탈락한다
+        //   (회귀 핀 non_owner_acl_verdict_and_payload_are_byte_identical).
+        let creator_rule = eval_acl_rules(&acl, ACL_ROLE_CREATOR, &to_role, true);
+        let allow = creator_rule.unwrap_or(true);
+        if allow {
+            // 승격 감사 — 오너와 같은 규율: **판정을 뒤집은 승격만** 남긴다(원래도 허용될
+            // 발신은 감사가치 0인데 키 조각마다 발생해 버스를 덮는다). 억제창·영속 원장은
+            // 오너 승격과 공유한다(같은 (pid, 대상) 축 · 이벤트명만 다르다).
+            let would_be = eval_acl_rules(&acl, &effective_role, &to_role, false)
+                .unwrap_or_else(|| acl["default"].as_str() != Some("deny"));
+            let now = crate::state::now_epoch();
+            if !would_be && !owner_grant_audit_seen(caller_pid, target.id, now) {
+                let created_at = daemon
+                    .create_caller
+                    .lock()
+                    .unwrap()
+                    .get(&target.id)
+                    .map(|&(_, _, ts)| ts);
+                let payload = json!({
+                    "to_role": to_role, "denied_as_role": effective_role,
+                    "caller_pid": caller_pid, "created_at": created_at,
+                    "explicit_creator_rule": creator_rule.is_some(),
+                    "note": "creator 등급 승격이 ACL 판정을 뒤집었다. 이 발신자는 대상 좌석을 \
+                             직접 만든 프로세스다(pid·start_time·TTL 30분 일치). 이 등급은 보안 \
+                             경계가 아니라 거버넌스 구분이다 — 같은 UID 프로세스가 surface.create \
+                             를 직접 호출해 창작자가 되는 것은 막지 못한다. 정상 경로는 \
+                             cys launch-agent 의 기동 주입 하나다. 예상 밖 caller_pid 면 그 \
+                             프로세스를 확인하라.",
+                });
+                daemon.bus.publish(
+                    "acl.creator_granted",
+                    "system",
+                    Some(target.id),
+                    payload.clone(),
+                );
+                // 버스는 인메모리 링(4096)이라 재시작·폭주로 증발한다 — 사후추적이 목적이므로
+                // 오너 승격과 **같은 파일**에 append 한다(event 필드로 구분).
+                append_owner_grant_audit(
+                    daemon,
+                    &json!({"ts": now, "event": "acl.creator_granted",
+                            "to_surface": target.id, "payload": payload}),
+                );
+            }
+        }
+        effective_role = ACL_ROLE_CREATOR.to_string();
         Some(allow)
     } else {
         eval_acl_rules(&acl, &effective_role, &to_role, false)
@@ -1478,14 +1648,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 통째로 하이재킹할 수 있다. claim_role(handlers.rs)이 막는 바로 그 공격이 create
             // 경로로 우회되므로 동일 게이트를 RPC 입구에 둔다 — 살아있는 보유자가 있으면 거부.
             // PTY를 띄우기 전(create_surface 호출 전)에 차단해 좀비 셸도 남기지 않는다.
-            // ★#6-b 예약어 — `owner` 는 데몬 도출 신원 등급이라 create 로도 자칭 불가
-            // (claim_role 게이트와 대칭 · 근거는 ACL_ROLE_OWNER 주석). PTY 스폰 전에 막는다.
-            if param_str(&params, "role").as_deref() == Some(ACL_ROLE_OWNER) {
-                return Reply::Single(err_response(
-                    &id,
-                    "invalid_params",
-                    "role 'owner' is reserved (daemon-derived identity grade — not claimable)",
-                ));
+            // ★#6-b/결함8 예약어 — `owner`·`creator` 는 데몬 도출 신원 등급이라 create 로도
+            // 자칭 불가(claim_role 게이트와 대칭 · 근거는 ACL_ROLE_OWNER·ACL_ROLE_CREATOR
+            // 주석). PTY 스폰 전에 막는다.
+            if let Some(r) = param_str(&params, "role") {
+                if r == ACL_ROLE_OWNER || r == ACL_ROLE_CREATOR {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        &format!(
+                            "role '{r}' is reserved (daemon-derived identity grade — not claimable)"
+                        ),
+                    ));
+                }
             }
             // ★SEAT: 승계 대상(구 좌석)을 생성 성공 후 마무리(role 해제·큐 이관)하기 위해 상위 스코프에 둔다.
             let mut seat_takeover_from: Option<u64> = None;
@@ -1688,6 +1863,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     // 미스 시 프로세스 표를 훑으므로 성공 아크(락 미보유)에서만 호출한다.
                     if let Some(cs) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) {
                         record_create_owner(daemon, s.id, cs);
+                    }
+                    // ★결함8 창작자 기록 — pane 귀속과 **무관하게** caller_pid 가 있으면 항상.
+                    // 위 create_owner 와 달리 pane 밖 고아 프로세스(setsid·launchd 재부모화)가
+                    // 정확히 이 원장의 대상이다: 그 프로세스는 resolve_caller_surface 가 None 을
+                    // 돌려 external 로 분류되고, 자기가 방금 만든 좌석에조차 기동 명령을 넣지
+                    // 못했다(§state::create_caller · §ACL_ROLE_CREATOR).
+                    if let Some(p) = caller_pid {
+                        record_create_caller(daemon, s.id, p);
                     }
                     // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.
                     if let Some(key) = idem_key {
@@ -2369,10 +2552,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             match governance::close_surface(daemon, sid, cause) {
-                Ok(()) => Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
-                )),
+                Ok(()) => {
+                    // ★결함8 위생: 닫힌 좌석의 창작자 항목은 TTL 전이라도 즉시 버린다.
+                    // surface_id 는 재발급되지 않지만(next_id 단조), 원장을 필요 이상으로
+                    // 살려 두지 않는 것이 창작자 등급의 '창' 의미론과 맞다.
+                    daemon.create_caller.lock().unwrap().remove(&sid);
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
+                    ))
+                }
                 Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
             }
         }
@@ -2637,11 +2826,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // operator.token)이지 pane 이 자칭할 수 있는 역할이 아니다. 자칭을 허용하면 부서
             // ACL 첫 줄 `{"from":"owner","to":"*","allow":true}` 가 그 pane 에게 그대로 열려
             // '워커 직접 조향 차단'(부서 자율성)이 무력화된다. surface.create 게이트와 대칭.
-            if role == ACL_ROLE_OWNER {
+            // ★결함8: `creator` 도 같은 부류다 — 자칭이 열리면 `{"from":"creator",…}` 규칙이
+            // 그 pane 에게 그대로 걸리고, 규칙이 없는 팩에서는 **기본 허용**이 열린다.
+            if role == ACL_ROLE_OWNER || role == ACL_ROLE_CREATOR {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "role 'owner' is reserved (daemon-derived identity grade — not claimable)",
+                    &format!(
+                        "role '{role}' is reserved (daemon-derived identity grade — not claimable)"
+                    ),
                 ));
             }
             let Some(sid) = resolve_surface_id(&params) else {
@@ -6969,6 +7162,562 @@ mod tests {
             panic!("expected single reply");
         };
         assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // ★결함8 — launch-agent 창작자(creator) ACL 면제
+    //
+    // 실사고(2026-08-22 부트 로그):
+    //   [launch-agent] surface:3 created (role=worker)
+    //   error: acl_denied: acl denied: external → worker (pack/acl.json)
+    //   [launch-agent] failed surface surface:3 closed
+    // 훅이 `setsid python3 javis_bootstrap.py --detach-session` 으로 부트를 백그라운드
+    // 발화하면 그 프로세스는 launchd(pid 1)로 재부모화돼 **어느 pane 의 자손도 아니다** →
+    // `external` 등급 → 부서 ACL 의 `external→worker*` deny 에 **부트 자신의 워커 기동
+    // 주입**이 걸린다. 아래 테스트들이 수리의 경계를 전부 고정한다.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// (a) 창작자는 **자기가 방금 만든 좌석**에 기동 명령을 넣을 수 있다.
+    /// external→worker* deny 가 살아있는 부서 ACL 그대로에서, 실제 pid(= 이 테스트 프로세스,
+    /// `peer_start_time` 관측 가능)로 `surface.create` → 같은 pid 로 `send_text`+`send_key
+    /// Return`(launch-agent 의 실제 주입 쌍)이 통과해야 한다.
+    #[test]
+    fn creator_can_inject_into_the_seat_it_just_created() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // cysjavis-pack/bin/cys-dept seed_acl() 시드와 동형 — 결함이 재현되던 그 규칙표.
+        let dept_acl = r#"{
+            "default": "allow",
+            "rules": [
+                { "from": "owner", "to": "*", "allow": true },
+                { "from": "external", "to": "worker*", "allow": false },
+                { "from": "reviewer-*", "to": "worker*", "allow": false },
+                { "from": "external", "to": "master", "allow": true }
+            ]
+        }"#;
+        let (daemon, dir) = daemon_with_acl("creator-boot", dept_acl);
+
+        // 창작자 = **이 테스트 프로세스 자신**. 합성 pid 로는 start_time 이 None 이라
+        // fail-closed 로 거부된다(설계상 의도) — 실제 pid 여야 판정이 성립한다.
+        // 캐시에 None 을 심어 "어느 pane 에도 귀속되지 않는 고아 프로세스"(= 부트의 신원
+        // 모양)를 조상 추적 없이 결정론으로 만든다.
+        let boot_pid = std::process::id();
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+
+        // ① 부트가 워커 좌석을 만든다(launch-agent 의 surface.create — 이 RPC 에는 ACL 이 없다).
+        let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
+        assert_eq!(created["ok"], json!(true), "전제: 좌석 생성이 실패했다 ({created})");
+        let worker_sid = created["result"]["surface_id"].as_u64().expect("surface_id");
+        assert!(
+            daemon.create_caller.lock().unwrap().contains_key(&worker_sid),
+            "창작자 원장에 기록되지 않았다 — 승격 판정의 유일한 증명이 없다"
+        );
+
+        // ② 기동 명령 주입 — 종전에는 여기서 `acl denied: external → worker` 로 거부됐다.
+        //    (authoritative 는 타이핑 가드 면제 신호일 뿐 ACL 과 무관 — 실제 주입 모양을 따른다.)
+        let Reply::Single(txt) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": worker_sid, "text": "/directive\n",
+                                "authoritative": true }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            txt["ok"],
+            json!(true),
+            "부트가 **자기가 방금 만든** 좌석에조차 지침을 넣지 못한다 — 결함8 미수리 ({txt})"
+        );
+
+        // ③ send 와 send-key 는 항상 한 쌍이다 — Return 도 같은 등급으로 통과해야 한다.
+        let Reply::Single(key) = dispatch(
+            &daemon,
+            Request {
+                id: json!(3),
+                method: "surface.send_key".into(),
+                params: json!({ "surface_id": worker_sid, "key": "Return",
+                                "authoritative": true }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            key["ok"],
+            json!(true),
+            "주입은 됐는데 제출 Return 이 막혔다 — 워커는 여전히 각성하지 못한다 ({key})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) 창작자 등급은 **자기가 만들지 않은 좌석**으로 새지 않는다.
+    /// 같은 프로세스가 다른 워커 좌석(직접 생성 — 원장 미기록)에 보내면 종전대로
+    /// `acl_denied` + 문면 `external → worker-…` 다. 이것이 부서 자율성 보호의 본체다.
+    #[test]
+    fn creator_grade_does_not_leak_to_seats_it_did_not_create() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let dept_acl = r#"{
+            "default": "allow",
+            "rules": [
+                { "from": "external", "to": "worker*", "allow": false }
+            ]
+        }"#;
+        let (daemon, dir) = daemon_with_acl("creator-scope", dept_acl);
+        let boot_pid = std::process::id();
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+
+        // 자기가 만든 좌석(대조군 — 통과해야 한다).
+        let mine = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
+        assert_eq!(mine["ok"], json!(true), "전제: 좌석 생성 ({mine})");
+        let mine_sid = mine["result"]["surface_id"].as_u64().expect("surface_id");
+
+        // 남의 좌석 — 원장에 항목이 없다(create RPC 를 타지 않은 생성).
+        let theirs = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-2".into()), 24, 80)
+            .expect("create other worker surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(theirs.id, theirs.clone());
+        assert!(
+            !daemon.create_caller.lock().unwrap().contains_key(&theirs.id),
+            "전제: 남의 좌석은 창작자 원장에 없어야 한다"
+        );
+
+        let Reply::Single(ok) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": mine_sid, "text": "x\n" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(ok["ok"], json!(true), "대조군: 자기 좌석 주입이 막혔다 ({ok})");
+
+        let Reply::Single(denied) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": theirs.id, "text": "x\n" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            denied["error"]["code"],
+            json!("acl_denied"),
+            "★창작자 등급이 남의 좌석까지 열었다 — 워커 직접 조향 차단이 무력화된다 ({denied})"
+        );
+        assert!(
+            denied["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("external → worker-2"),
+            "거부 문면이 종전 등급 표기를 잃었다 ({denied})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) 순수 판정부 `creator_matches` 의 **fail-closed 계약**을 합성 시계로 고정한다.
+    /// A5(pid 재사용 = start_time 불일치)·A6(관측실패 None, 기록 시점/판정 시점 양쪽)·
+    /// 원장 부재·pid 불일치·TTL 경과가 전부 거부여야 한다. `Some(a) == Some(b)` 만 허용이다.
+    #[test]
+    fn creator_matches_is_fail_closed_on_reuse_missing_start_time_and_ttl() {
+        let self_pid = std::process::id();
+        let real_start =
+            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        let now = 1_000_000.0_f64;
+        let fresh = Some((self_pid, Some(real_start), now - 10.0));
+
+        // allow: 같은 pid · start_time 일치 · TTL 이내 (면제 메커니즘이 실제로 성립한다)
+        assert!(
+            creator_matches(fresh, self_pid, now, crate::state::peer_start_time),
+            "정상 창작자가 거부됐다 — 면제가 성립하지 않는다"
+        );
+        // 원장 부재 = 창작 사실 없음(부재는 무증명)
+        assert!(
+            !creator_matches(None, self_pid, now, crate::state::peer_start_time),
+            "원장 부재가 통과했다"
+        );
+        // pid 불일치 = 남이 만든 좌석
+        assert!(
+            !creator_matches(fresh, self_pid + 1, now, crate::state::peer_start_time),
+            "다른 pid 가 창작자로 통과했다"
+        );
+        // A5: 현재 start_time 이 기록값과 다르다(OS 가 같은 pid 를 재할당)
+        assert!(
+            !creator_matches(fresh, self_pid, now, |_| Some(real_start.wrapping_add(1))),
+            "start_time 불일치(pid 재사용) 가 통과했다 (A5 fail-closed)"
+        );
+        // A6: 판정 시점 관측실패
+        assert!(
+            !creator_matches(fresh, self_pid, now, |_| None),
+            "start_time 관측실패가 통과했다 (A6 fail-closed)"
+        );
+        // A6': 기록 시점 관측실패(None 기록) — 이후 관측이 성공해도 거부
+        assert!(
+            !creator_matches(
+                Some((self_pid, None, now - 10.0)),
+                self_pid,
+                now,
+                crate::state::peer_start_time
+            ),
+            "기록 시점 start_time 부재가 통과했다 (A6' fail-closed)"
+        );
+        // TTL 경과 — 창작자 등급은 영구 권한으로 자라지 않는다
+        assert!(
+            !creator_matches(
+                Some((self_pid, Some(real_start), now - crate::state::CREATE_CALLER_TTL_SECS)),
+                self_pid,
+                now,
+                crate::state::peer_start_time
+            ),
+            "TTL 만료 항목이 통과했다"
+        );
+        // 경계 대조: TTL 직전은 허용(창이 실수로 좁혀지지 않았음을 함께 고정)
+        assert!(
+            creator_matches(
+                Some((
+                    self_pid,
+                    Some(real_start),
+                    now - crate::state::CREATE_CALLER_TTL_SECS + 1.0
+                )),
+                self_pid,
+                now,
+                crate::state::peer_start_time
+            ),
+            "TTL 직전인데 거부됐다 — launch-agent 의 readiness 대기(수 분)를 못 버틴다"
+        );
+    }
+
+    /// (d) 명시 deny 는 존중된다 — `{"from":"creator","to":"worker*","allow":false}` 가 있으면
+    /// 창작자도 막히고, 거부 문면은 판정을 낸 등급인 `creator → worker-1` 이어야 한다.
+    /// (ACL default 는 allow 라 external 이었다면 통과했을 상황 = 창작자 분기가 실제로 판정했다.)
+    #[test]
+    fn explicit_creator_deny_rule_blocks_the_creator() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let acl = r#"{
+            "default": "allow",
+            "rules": [
+                { "from": "creator", "to": "worker*", "allow": false }
+            ]
+        }"#;
+        let (daemon, dir) = daemon_with_acl("creator-deny", acl);
+        let boot_pid = std::process::id();
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+
+        let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
+        assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
+        let worker_sid = created["result"]["surface_id"].as_u64().expect("surface_id");
+
+        let Reply::Single(denied) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": worker_sid, "text": "x\n" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            denied["error"]["code"],
+            json!("acl_denied"),
+            "명시 creator deny 가 무시됐다 — 등급을 막을 방법이 없어진다 ({denied})"
+        );
+        assert!(
+            denied["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("creator → worker-1"),
+            "거부 문면이 판정 등급(creator)을 표기하지 않는다 ({denied})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (e) **판정을 뒤집은 승격만** 감사된다 — `acl.creator_granted` 버스 이벤트 + 영속 원장.
+    ///
+    /// 이 등급은 보안 경계가 아니라 거버넌스 구분이므로(같은 UID 프로세스가 surface.create 를
+    /// 직접 호출해 창작자가 되는 것은 막지 못한다), 막을 수 없는 것은 **보이게** 둔다.
+    ///
+    /// ★`next_id` 를 미리 밀어 두는 이유: 승격 감사 억제창은 `(caller_pid, 대상 surface_id)`
+    /// 키의 **프로세스 전역** 맵이고 창작자 pid 는 어느 테스트에서나 `std::process::id()` 로
+    /// 같다. 각 테스트의 데몬은 격리 디렉터리라 surface_id 가 모두 1 부터 시작하므로, 밀어
+    /// 두지 않으면 (a)/(b)/(d) 와 키가 겹쳐 실행 순서에 따라 이 테스트의 이벤트가 억제된다.
+    #[test]
+    fn creator_promotion_that_flips_verdict_is_audited() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let acl = r#"{
+            "default": "allow",
+            "rules": [
+                { "from": "external", "to": "worker*", "allow": false }
+            ]
+        }"#;
+        let (daemon, dir) = daemon_with_acl("creator-audit", acl);
+        daemon
+            .next_id
+            .store(4_200, std::sync::atomic::Ordering::SeqCst);
+        let boot_pid = std::process::id();
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+
+        let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
+        assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
+        let worker_sid = created["result"]["surface_id"].as_u64().expect("surface_id");
+        assert_eq!(worker_sid, 4_200, "전제: 억제창 키 분리를 위한 surface_id 고정");
+
+        let before = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        let Reply::Single(ok) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": worker_sid, "text": "x\n" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(ok["ok"], json!(true), "전제: 승격으로 허용돼야 한다 ({ok})");
+
+        let evs: Vec<Value> = daemon
+            .bus
+            .replay_after(before)
+            .into_iter()
+            .filter(|e| e["name"] == json!("acl.creator_granted"))
+            .collect();
+        assert_eq!(
+            evs.len(),
+            1,
+            "★판정을 뒤집은 승격이 감사되지 않았다 — 막을 수 없는 것이 보이지도 않는다 ({evs:?})"
+        );
+        assert_eq!(evs[0]["payload"]["to_role"], json!("worker-1"), "{}", evs[0]);
+        assert_eq!(
+            evs[0]["payload"]["denied_as_role"],
+            json!("external"),
+            "승격이 없었다면 어떤 등급으로 거부됐는지가 빠졌다 ({})",
+            evs[0]
+        );
+        assert_eq!(evs[0]["payload"]["caller_pid"], json!(boot_pid), "{}", evs[0]);
+        assert_eq!(
+            evs[0]["payload"]["explicit_creator_rule"],
+            json!(false),
+            "명시 규칙 없이 기본 허용으로 열린 승격인데 그렇게 기록되지 않았다 ({})",
+            evs[0]
+        );
+        assert!(
+            evs[0]["payload"]["created_at"].as_f64().is_some(),
+            "창작 시각(원장 recorded_at)이 빠졌다 — 사후 추적이 성립하지 않는다 ({})",
+            evs[0]
+        );
+
+        // 버스는 인메모리 링이라 증발한다 — 같은 건이 영속 원장에도 남아야 한다.
+        let audit = std::fs::read_to_string(owner_grant_audit_path(&daemon))
+            .expect("감사 원장 파일 부재");
+        assert_eq!(
+            audit
+                .lines()
+                .filter(|l| l.contains("acl.creator_granted"))
+                .count(),
+            1,
+            "영속 원장에 승격 1건이 없다 — {audit}"
+        );
+
+        // 대조: 원래도 허용될 발신(default allow 대상 role)은 감사하지 않는다.
+        let plain = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("scribe".into()), 24, 80)
+            .expect("create plain surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(plain.id, plain.clone());
+        record_create_caller(&daemon, plain.id, boot_pid);
+        let before2 = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        let Reply::Single(ok2) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": plain.id, "text": "y\n" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(ok2["ok"], json!(true), "대조 전제: 원래도 허용이어야 한다 ({ok2})");
+        assert_eq!(
+            daemon
+                .bus
+                .replay_after(before2)
+                .into_iter()
+                .filter(|e| e["name"] == json!("acl.creator_granted"))
+                .count(),
+            0,
+            "판정을 뒤집지 않은 승격까지 감사했다 — 버스가 무가치 이벤트로 덮인다"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (f) 예약어 핀 — `creator` 는 데몬이 **도출**하는 신원 등급이지 pane 이 자칭할 수 있는
+    /// 역할이 아니다. 자칭이 열리면 규칙 없는 팩에서 **기본 허용**이 그 pane 에게 그대로
+    /// 열린다(owner 예약어 핀과 대칭 · claim_role·surface.create 두 입구 모두 봉인).
+    #[test]
+    fn role_creator_is_reserved_on_claim_and_create() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("creator-reserved", r#"{"default":"allow","rules":[]}"#);
+
+        let pane = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create pane");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(pane.id, pane.clone());
+        let pane_pid = 999_151_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(pane_pid, (Some(pane.id), crate::state::now_epoch(), None));
+
+        // ① claim_role: 자기 surface 라도 예약 등급은 못 가져간다.
+        let Reply::Single(claim) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "system.claim_role".into(),
+                params: json!({ "surface_id": pane.id, "role": "creator" }),
+            },
+            Some(pane_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(claim["ok"], json!(false), "pane 이 role='creator' 를 자칭했다 ({claim})");
+        assert_eq!(claim["error"]["code"], json!("invalid_params"));
+        assert_eq!(
+            pane.role.lock().unwrap().as_deref(),
+            Some("worker-1"),
+            "거부됐는데도 역할이 바뀌었다"
+        );
+
+        // ② surface.create: PTY 스폰 전에 같은 게이트로 막는다(우회 경로 봉인).
+        let Reply::Single(create) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "surface.create".into(),
+                params: json!({ "role": "creator", "cmd": "sleep 30" }),
+            },
+            Some(pane_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(create["ok"], json!(false), "create 경로로 creator 자칭이 통과했다 ({create})");
+        assert_eq!(create["error"]["code"], json!("invalid_params"));
+
+        // ③ 대조군: 예약어가 아닌 역할은 종전대로 통과한다(과도차단 금지 · owner 핀과 대칭).
+        let Reply::Single(ok) = dispatch(
+            &daemon,
+            Request {
+                id: json!(3),
+                method: "system.claim_role".into(),
+                params: json!({ "surface_id": pane.id, "role": "worker-9" }),
+            },
+            Some(pane_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (g) 위생 — `surface.close` 성공 시 창작자 원장 항목이 즉시 사라진다(TTL 전이라도).
+    /// 창작자 등급의 '창' 의미론은 좌석의 생애를 넘지 않는다.
+    #[test]
+    fn closing_a_seat_drops_its_creator_ledger_entry() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("creator-close", r#"{"default":"allow","rules":[]}"#);
+        let boot_pid = std::process::id();
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+
+        let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
+        assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
+        let sid = created["result"]["surface_id"].as_u64().expect("surface_id");
+        assert!(
+            daemon.create_caller.lock().unwrap().contains_key(&sid),
+            "전제: 창작자 원장에 기록돼 있어야 한다"
+        );
+
+        let Reply::Single(closed) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.close".into(),
+                params: json!({ "surface_id": sid, "cause": "reap" }),
+            },
+            Some(boot_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(closed["ok"], json!(true), "전제: 좌석 닫기 ({closed})");
+        assert!(
+            !daemon.create_caller.lock().unwrap().contains_key(&sid),
+            "닫힌 좌석의 창작자 항목이 남았다 — 원장 위생이 깨졌다"
+        );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
