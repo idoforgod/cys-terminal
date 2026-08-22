@@ -1843,7 +1843,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 시퀀스의 연접일 때만** 갱신을 생략한다(판정 SOT = cys::mousereport —
             // ui/src/mousefilter.ts classifyMouseReport 동형·\x1b[200~ 접두는 무조건 비면제).
             // 혼합·절단 청크는 갱신 유지: 사람 텍스트가 섞였을 가능성을 보호하는 쪽이 안전.
-            if human && !cys::mousereport::is_pure_mouse_report(&text) {
+            //
+            // ★B1(0.14.24 결함3 주범 — 술어를 마우스 보고에서 **터미널 자동 응답 전반**으로
+            //   넓힌다): 위 A9 문단이 말한 '사람 타이핑으로 위장되는 기계 바이트'는 마우스
+            //   보고만이 아니었다. GUI 는 `term.onData` 의 **모든** 바이트를 human=true 로
+            //   올리는데, Claude Code 는 기동 시 포커스 보고(`ESC[?1004h`)를 켜므로 pane 을
+            //   클릭·이탈할 때마다 `ESC[I`/`ESC[O` 가 흐르고(ui/src/trackfilter.ts 가 1004 를
+            //   보존한다), 커서위치 질의(`ESC[6n`·`ESC[?6n`)·DA·XTVERSION·DECRPM·kitty 플래그·
+            //   OSC 색 질의의 **응답**도 같은 경로로 올라온다.
+            //   결과(실측 증상): 오너가 master pane 을 클릭해 보고를 읽는 순간 last_human_input
+            //   이 찍히고, 이후 typing_guard_secs(기본 3초) 동안 다른 노드의 `send-key Return`
+            //   이 `typing_guard` 로 거부된다 → 본문은 타이핑됐는데 **Enter 만 안 먹는다**.
+            //   자동 응답은 정의상 사람 입력이 아니므로 가드를 찍지 않는다. 판정 SOT 는 그대로
+            //   cys::mousereport 하나이고(단일 정의처), 새 술어는 is_pure_mouse_report 의
+            //   **상위 집합**이라 A9 면제는 축소되지 않는다(lib 상위집합 핀이 고정).
+            if human && !cys::mousereport::is_pure_terminal_autoreply(&text) {
                 *surface.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
             }
             // T3-13 권위 전달(clear_first): 잔존 미제출 텍스트를 Ctrl-U로 지운 깨끗한 라인에
@@ -7283,6 +7297,107 @@ mod tests {
         assert!(
             worker.last_human_input.lock().unwrap().is_some(),
             "일반 텍스트 human:true 는 종전대로 갱신해야 한다"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B1 회귀 핀(0.14.24 결함3 주범 — "보고가 타이핑은 되는데 Enter 가 가끔 안 먹는다").
+    ///
+    /// GUI 는 `term.onData` 의 모든 바이트를 human=true 로 올린다. Claude Code 는 기동 시
+    /// 포커스 보고(`ESC[?1004h`)를 켜므로 오너가 master pane 을 **클릭만 해도** `ESC[I` 가
+    /// human 입력으로 데몬에 도착했고, 그 순간부터 typing_guard_secs(3초) 동안 다른 노드의
+    /// `send-key Return` 이 typing_guard 로 거부됐다 — 본문(send)은 이미 들어간 뒤라 사용자
+    /// 눈에는 '타이핑은 됐는데 제출만 안 된' 상태로 보인다.
+    ///
+    /// 계약: **자동 응답 = 가드 미갱신 → 직후 제출 Return 허용** ·
+    ///       **사람 글자 = 가드 갱신 → 직후 제출 Return 거부**(대조군이 있어야 계약이 성립).
+    #[test]
+    fn terminal_autoreply_does_not_block_node_submit_return() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("autoreply-guard", r#"{ "default": "allow", "rules": [] }"#);
+
+        // 피해자: master pane (다른 노드의 보고를 받는 쪽)
+        let master = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create master surface");
+        daemon.surfaces.lock().unwrap().insert(master.id, master.clone());
+        // GUI 역할(자동 응답을 human=true 로 올리는 쪽)
+        let gui_pid = 999_410_u32;
+        bind_caller(&daemon, gui_pid, master.id);
+        // 보고를 밀어 넣는 노드(워커) — 비-권위 발신자
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon.surfaces.lock().unwrap().insert(worker.id, worker.clone());
+        let worker_pid = 999_411_u32;
+        bind_caller(&daemon, worker_pid, worker.id);
+
+        let send_human = |text: &str| {
+            let req = Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": master.id, "text": text, "quiet": true, "human": true }),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(gui_pid)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "전제: 전송 자체는 성공해야 한다 (응답: {resp})");
+        };
+        // 노드의 제출 Return — 권위(authoritative) 없음 = 타이핑 가드 적용 대상.
+        let submit_return = || {
+            let req = Request {
+                id: json!(2),
+                method: "surface.send_key".into(),
+                params: json!({ "surface_id": master.id, "key": "Return" }),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(worker_pid)) else {
+                panic!("expected single reply");
+            };
+            resp
+        };
+
+        // ① 자동 응답 전 종류 — 가드 미갱신이고, 직후 제출 Return 이 통과해야 한다.
+        for auto in [
+            "\u{1b}[I",                              // 포커스 획득(클릭) ← 실측 최다 발생원
+            "\u{1b}[O",                              // 포커스 상실(이탈)
+            "\u{1b}[24;80R",                         // CPR(ESC[6n 응답)
+            "\u{1b}[?24;80R",                        // DECXCPR(ESC[?6n 응답)
+            "\u{1b}[?62;1;6c",                       // DA1
+            "\u{1b}[>0;276;0c",                      // DA2
+            "\u{1b}P>|XTerm(370)\u{1b}\\",           // XTVERSION
+            "\u{1b}[?2004;1$y",                      // DECRPM
+            "\u{1b}[?1u",                            // kitty 키보드 플래그
+            "\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{7}",     // OSC 11 배경색 응답
+            "\u{1b}[<64;10;20M",                     // 마우스 보고(A9 면제 — 상위집합 확인)
+        ] {
+            *master.last_human_input.lock().unwrap() = None;
+            send_human(auto);
+            assert!(
+                master.last_human_input.lock().unwrap().is_none(),
+                "자동 응답 {auto:?} 이 타이핑 가드를 켰다 — 3초간 노드 보고의 Enter 가 거부된다"
+            );
+            let resp = submit_return();
+            assert_eq!(
+                resp["ok"], json!(true),
+                "자동 응답 {auto:?} 직후 제출 Return 이 거부됐다 (응답: {resp})"
+            );
+        }
+
+        // ② 대조군 — 사람 글자는 종전대로 가드를 켜고, 직후 제출 Return 은 거부돼야 한다.
+        //    (이 대조가 없으면 B1 이 가드를 통째로 무력화해도 ① 만으로는 드러나지 않는다.)
+        *master.last_human_input.lock().unwrap() = None;
+        send_human("a");
+        assert!(
+            master.last_human_input.lock().unwrap().is_some(),
+            "사람 글자가 가드를 켜지 않았다 — 타이핑 가드가 통째로 무력화됐다"
+        );
+        let resp = submit_return();
+        assert_eq!(
+            resp["error"]["code"], json!(cys::ERR_TYPING_GUARD),
+            "사람 타이핑 중 비-권위 Return 은 종전대로 거부돼야 한다 (응답: {resp})"
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);

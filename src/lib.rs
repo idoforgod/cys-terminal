@@ -1050,6 +1050,11 @@ pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
 /// 위장**된다 — 오너가 pane 을 스크롤해 읽는 동안 `--queued` 배달이 무기 연기되고(큐 적체
 /// 앵커 위반) seat 판정이 오염된다(R2 SIM 발견 8). 데몬은 '수신 텍스트 **전체**가 마우스
 /// 보고의 연접'일 때만 last_human_input 갱신을 생략한다(`is_pure_mouse_report`).
+///
+/// ★B1(0.14.24) 범위 확장 고지: 이 모듈은 이제 마우스 보고 **바깥**의 터미널 자동 응답까지
+/// 판별한다(`is_pure_terminal_autoreply`). 그 추가분은 **TS 쌍둥이가 없다** — GUI 는 자동
+/// 응답을 그대로 forward 할 뿐이고 판정은 데몬 단독이다(단일 정의처). 위의 '양쪽+코퍼스를
+/// 함께 고쳐라' 계약은 **마우스 규칙에만** 적용된다(코퍼스도 마우스만 고정한다).
 pub mod mousereport {
     /// mousefilter.ts:21-24 `MouseVerdict` 동형. `Wheel.dir`: -1=위로, +1=아래로(scrollLines 규약).
     #[derive(Debug, PartialEq, Eq)]
@@ -1201,6 +1206,176 @@ pub mod mousereport {
             return false; // 무조건 비면제(스펙 §D4+A9 명문)
         }
         classify_mouse_report(text) != MouseVerdict::Pass
+    }
+
+    /// `u[i]` 를 ASCII 바이트로 — 비-ASCII 코드유닛·범위 밖은 None.
+    /// (자동 응답 문법은 전부 ASCII 다 — 비-ASCII 가 섞였다는 건 사람 글자라는 뜻이다.)
+    fn ascii_at(u: &[u16], i: usize) -> Option<u8> {
+        match u.get(i).copied() {
+            Some(c) if c < 0x80 => Some(c as u8),
+            _ => None,
+        }
+    }
+
+    /// `u[i..]` 가 ASCII 리터럴 `lit` 로 시작하는가(경계 초과는 거짓 — 절단 방어).
+    fn starts_with_ascii(u: &[u16], i: usize, lit: &[u8]) -> bool {
+        lit.iter().enumerate().all(|(k, &b)| ascii_at(u, i + k) == Some(b))
+    }
+
+    /// CSI 응답의 파라미터 열 `d+(;d+)*` 를 읽는다 → (파라미터 **개수**, 다음 인덱스).
+    /// 값은 판별에 쓰지 않으므로 버린다. 숫자를 하나도 못 읽거나 `;` 뒤가 숫자가 아니면
+    /// None — 빈 파라미터(`ESC[?;c` 같은 형태)는 **미인식**으로 접어 사람 입력 쪽에 둔다.
+    fn read_params(u: &[u16], from: usize) -> Option<(usize, usize)> {
+        let (_, mut i) = read_digits(u, from)?;
+        let mut n = 1usize;
+        while ascii_at(u, i) == Some(b';') {
+            let (_, j) = read_digits(u, i + 1)?;
+            i = j;
+            n += 1;
+        }
+        Some((n, i))
+    }
+
+    /// 터미널 자동 응답 **하나**를 `u[from]` 에서 매칭 → 성공 시 끝 인덱스(다음 스캔 시작점).
+    /// `match_report`(마우스)와 같은 계약이다 — 부분 일치·의심스러운 형태는 전부 None 이다.
+    fn match_terminal_autoreply(u: &[u16], from: usize) -> Option<usize> {
+        const ESC: u8 = 0x1b;
+        const BEL: u8 = 0x07;
+        if ascii_at(u, from) != Some(ESC) {
+            return None; // 자동 응답은 예외 없이 ESC 로 시작한다
+        }
+        // ① 마우스 보고 — 정본 매처에 위임(SGR·X10·urxvt 전 인코딩·좌표 하한 검증 포함).
+        //    이 위임이 `is_pure_terminal_autoreply` 를 `is_pure_mouse_report` 의 상위 집합으로
+        //    만든다(A9 면제는 그대로 살아 있고, 그 위에 자동 응답이 얹힌다).
+        if let Some(hit) = match_report(u, from) {
+            return Some(hit.end);
+        }
+        match ascii_at(u, from + 1)? {
+            // ② CSI 계열 — ESC [
+            b'[' => match ascii_at(u, from + 2) {
+                // 포커스 보고(DECSET 1004). Claude Code 가 기동 시 1004h 를 켜므로 pane 을
+                // 클릭·이탈할 때마다 흐른다 = 결함3 최다 발생원.
+                Some(b'I') | Some(b'O') => Some(from + 3),
+                // private 파라미터 응답 — DA1 / DECXCPR / kitty 플래그 / DECRPM 이 여기 모인다.
+                Some(b'?') => {
+                    let (n, i) = read_params(u, from + 3)?;
+                    match ascii_at(u, i)? {
+                        // DA1 `ESC[?<n>(;<n>)*c` — 파라미터 개수는 터미널마다 달라 제한 없음.
+                        b'c' => Some(i + 1),
+                        // DECXCPR `ESC[?<row>;<col>[;<page>]R` — `ESC[?6n` 의 응답.
+                        b'R' if (2..=3).contains(&n) => Some(i + 1),
+                        // kitty 키보드 프로토콜 플래그 `ESC[?<flags>u` — 파라미터 1개.
+                        b'u' if n == 1 => Some(i + 1),
+                        // DECRPM `ESC[?<mode>;<value>$y` — DECRQM(모드 질의)의 응답.
+                        b'$' if n == 2 && ascii_at(u, i + 1) == Some(b'y') => Some(i + 2),
+                        _ => None,
+                    }
+                }
+                // DA2 `ESC[><n>(;<n>)*c` — 2차 장치 속성.
+                Some(b'>') => {
+                    let (_, i) = read_params(u, from + 3)?;
+                    (ascii_at(u, i) == Some(b'c')).then_some(i + 1)
+                }
+                // CPR `ESC[<row>;<col>R` — `ESC[6n` 의 응답(파라미터 정확히 2개).
+                // 숫자로 시작하는 다른 CSI(urxvt 마우스 `…M` 등)는 위 ① 이 이미 걸렀고,
+                // 걸리지 않은 것은 종결자 불일치로 여기서 None 이 된다(보수적).
+                _ => {
+                    let (n, i) = read_params(u, from + 2)?;
+                    (n == 2 && ascii_at(u, i) == Some(b'R')).then_some(i + 1)
+                }
+            },
+            // ③ DCS 계열 — ESC P … ESC \  (DA3 / XTVERSION)
+            b'P' => {
+                let hex_only = if starts_with_ascii(u, from + 2, b"!|") {
+                    true // DA3 `ESC P!|<hex>ESC\` — 16진 단말 유닛 ID.
+                } else if starts_with_ascii(u, from + 2, b">|") {
+                    false // XTVERSION `ESC P>|<이름/버전>ESC\`.
+                } else {
+                    return None;
+                };
+                let mut i = from + 4;
+                loop {
+                    match ascii_at(u, i) {
+                        // 본문은 좁게 받는다 — DA3 는 16진만, XTVERSION 은 인쇄가능 ASCII 만.
+                        // 임의 바이트를 삼키면 사람 입력이 DCS 뒤에 숨어 면제받을 수 있다.
+                        Some(c) if (hex_only && c.is_ascii_hexdigit())
+                            || (!hex_only && (0x20..=0x7e).contains(&c)) =>
+                        {
+                            i += 1
+                        }
+                        _ => break,
+                    }
+                }
+                if i == from + 4 {
+                    return None; // 빈 본문 = 미인식(절단 방어)
+                }
+                starts_with_ascii(u, i, b"\x1b\\").then_some(i + 2)
+            }
+            // ④ OSC 색 질의 응답 — ESC ] 1[012] ; <본문> (BEL | ESC \)
+            //    10=전경 11=배경 12=커서. 종결자 두 형태를 모두 받는다(터미널마다 다름).
+            b']' => {
+                if ascii_at(u, from + 2) != Some(b'1')
+                    || !matches!(ascii_at(u, from + 3), Some(b'0') | Some(b'1') | Some(b'2'))
+                    || ascii_at(u, from + 4) != Some(b';')
+                {
+                    return None;
+                }
+                let mut i = from + 5;
+                while let Some(c) = ascii_at(u, i) {
+                    if !(0x20..=0x7e).contains(&c) {
+                        break; // 제어문자(BEL·ESC 포함) = 본문 끝
+                    }
+                    i += 1;
+                }
+                if i == from + 5 {
+                    return None; // 빈 본문 = 미인식
+                }
+                match ascii_at(u, i) {
+                    Some(BEL) => Some(i + 1),
+                    Some(ESC) => starts_with_ascii(u, i, b"\x1b\\").then_some(i + 2),
+                    _ => None, // 종결자 없음 = 절단
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// ★B1(0.14.24) 터미널 **자동 응답** 술어 — cysd `surface.send_text` human 경로가 소비한다.
+    /// `is_pure_mouse_report` 의 **상위 집합**이다(순수 마우스 보고면 이 술어도 참).
+    ///
+    /// 왜 필요한가(결함3 주범): GUI 는 `term.onData` 로 나오는 **모든** 바이트를
+    /// `send_input(human=true)` 로 데몬에 올린다(`ui/src/main.ts`). 그런데 onData 에는 사람이
+    /// 친 글자만 오지 않는다 — Claude Code 는 기동 시 포커스 보고(`ESC[?1004h`)를 켜므로 pane 을
+    /// 클릭·이탈할 때마다 `ESC[I`/`ESC[O` 가 흐르고(`ui/src/trackfilter.ts` 가 1004 를 보존한다),
+    /// 커서위치 질의(`ESC[6n`·`ESC[?6n`)·DA·XTVERSION·DECRPM·kitty 플래그·OSC 색 질의의
+    /// **응답**도 같은 경로로 올라온다. 이것들이 `last_human_input` 을 찍으면 이후 3초
+    /// (`typing_guard_secs`) 동안 다른 노드의 `send-key Return` 이 `typing_guard` 로 거부된다 —
+    /// **오너가 master pane 을 클릭해 보고를 읽는 순간부터 노드 보고의 제출 Enter 가 먹지 않는다.**
+    ///
+    /// 판정 규약(A9 와 같은 보수성): 청크 **전체**가 아래 시퀀스의 연접일 때만 참이다. 사람
+    /// 글자가 하나라도 섞이면(혼합)·시퀀스가 잘렸으면(절단)·빈 문자열이면 거짓이고,
+    /// `ESC[200~`(bracketed paste) 접두는 **무조건 거짓**이다(A9 규약 유지). 위험한 방향은
+    /// 오폐기가 아니라 **오면제**(사람 입력을 기계로 오인해 가드를 안 켜는 것)이므로 애매하면
+    /// 전부 거짓으로 접는다.
+    ///
+    /// 인식 목록: 마우스 보고(기존 매처 위임) · 포커스 `ESC[I`/`ESC[O` · CPR `ESC[<n>;<n>R` ·
+    /// DECXCPR `ESC[?<n>;<n>[;<n>]R` · DA1 `ESC[?<n>(;<n>)*c` · DA2 `ESC[><n>(;<n>)*c` ·
+    /// DA3 `ESC P!|<hex>ESC\` · XTVERSION `ESC P>|<텍스트>ESC\` · DECRPM `ESC[?<n>;<n>$y` ·
+    /// kitty 키보드 플래그 `ESC[?<n>u` · OSC 10/11/12 색 응답 `ESC]1[012];<본문>(BEL|ESC\)`.
+    pub fn is_pure_terminal_autoreply(text: &str) -> bool {
+        if text.is_empty() || text.starts_with(BRACKETED_PASTE_PREFIX) {
+            return false;
+        }
+        let u: Vec<u16> = text.encode_utf16().collect();
+        let mut i = 0usize;
+        while i < u.len() {
+            match match_terminal_autoreply(&u, i) {
+                // end > i 는 무한 루프 방어 — 매처가 진전 없이 성공하는 일은 없어야 한다.
+                Some(end) if end > i => i = end,
+                _ => return false, // 자동 응답 아닌 유닛이 하나라도 있으면 통째로 거짓
+            }
+        }
+        true
     }
 }
 
@@ -1844,6 +2019,106 @@ mod tests {
             MouseVerdict::Pass
         );
         assert!(!mousereport::is_pure_mouse_report("\u{1b}[200~\u{1b}[<64;10;20M\u{1b}[201~"));
+    }
+
+    /// ★B1 인식 표 박제 — 브리프가 열거한 자동 응답 **전 종류**가 단독으로도, 서로 연접해도
+    /// 참이어야 한다. 하나라도 빠지면 그 시퀀스가 흐르는 순간 타이핑 가드가 3초 오염되어
+    /// 노드 보고의 제출 Enter 가 거부된다(결함3 재발). 값은 실기에서 나오는 형태로 적었다.
+    #[test]
+    fn terminal_autoreply_recognizes_every_documented_response_shape() {
+        use mousereport::is_pure_terminal_autoreply as pure;
+        let shapes: [(&str, &str); 13] = [
+            ("포커스 획득(1004)", "\u{1b}[I"),
+            ("포커스 상실(1004)", "\u{1b}[O"),
+            ("CPR(ESC[6n 응답)", "\u{1b}[24;80R"),
+            ("DECXCPR 2파라미터", "\u{1b}[?24;80R"),
+            ("DECXCPR 3파라미터(page)", "\u{1b}[?24;80;1R"),
+            ("DA1", "\u{1b}[?62;1;6c"),
+            ("DA2", "\u{1b}[>0;276;0c"),
+            ("DA3", "\u{1b}P!|00000000\u{1b}\\"),
+            ("XTVERSION", "\u{1b}P>|XTerm(370)\u{1b}\\"),
+            ("DECRPM(모드 질의 응답)", "\u{1b}[?2004;1$y"),
+            ("kitty 키보드 플래그", "\u{1b}[?1u"),
+            ("OSC 11 배경색(BEL 종결)", "\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{7}"),
+            ("OSC 10 전경색(ST 종결)", "\u{1b}]10;rgb:ffff/ffff/ffff\u{1b}\\"),
+        ];
+        for (name, seq) in shapes {
+            assert!(pure(seq), "{name} 미인식: {seq:?} — 이 시퀀스가 타이핑 가드를 오염시킨다");
+        }
+        // 연접(실기에서는 한 청크에 여러 응답이 함께 온다 — 클릭 직후 포커스+CPR 등).
+        let joined: String = shapes.iter().map(|(_, s)| *s).collect();
+        assert!(pure(&joined), "자동 응답 연접이 거짓 — 실기 청크는 대개 연접이다");
+        assert!(
+            pure("\u{1b}[I\u{1b}[24;80R\u{1b}[O"),
+            "포커스+CPR+포커스 연접(가장 흔한 실기 조합)이 거짓"
+        );
+        // OSC 12(커서색)도 코드 표에 있다 — 10/11 만 통과하는 반쪽 구현 방지.
+        assert!(pure("\u{1b}]12;rgb:8888/8888/8888\u{7}"));
+    }
+
+    /// ★B1 오면제 방어 박제 — 위험한 방향은 오폐기가 아니라 **오면제**다(사람 입력을 기계로
+    /// 오인해 가드를 안 켜면, 사람의 미완성 입력에 원격 Return 이 꽂힌다). 혼합·절단·paste
+    /// 래퍼·빈 문자열·평문은 전부 거짓이어야 한다.
+    #[test]
+    fn terminal_autoreply_rejects_mixed_truncated_paste_and_plain_text() {
+        use mousereport::is_pure_terminal_autoreply as pure;
+        for (why, bad) in [
+            ("빈 문자열", ""),
+            ("평문", "hello"),
+            ("자동응답+사람글자 혼합(뒤)", "\u{1b}[Ix"),
+            ("사람글자+자동응답 혼합(앞)", "x\u{1b}[I"),
+            ("연접 사이에 사람글자", "\u{1b}[I q \u{1b}[O"),
+            ("절단 CSI", "\u{1b}[24;80"),
+            ("절단 포커스(ESC[ 만)", "\u{1b}["),
+            ("ESC 단독", "\u{1b}"),
+            ("절단 DCS(ST 없음)", "\u{1b}P>|XTerm(370)"),
+            ("절단 OSC(종결자 없음)", "\u{1b}]11;rgb:1e1e/1e1e/1e1e"),
+            ("빈 본문 OSC", "\u{1b}]11;\u{7}"),
+            ("빈 본문 DCS", "\u{1b}P>|\u{1b}\\"),
+            ("DA3 본문이 16진이 아님", "\u{1b}P!|zz\u{1b}\\"),
+            ("허용 밖 OSC 코드(4=팔레트)", "\u{1b}]4;1;rgb:0/0/0\u{7}"),
+            ("CPR 파라미터 1개", "\u{1b}[24R"),
+            ("DECRPM 파라미터 1개", "\u{1b}[?2004$y"),
+            ("kitty 플래그 파라미터 2개", "\u{1b}[?1;2u"),
+            ("빈 파라미터", "\u{1b}[?;c"),
+            ("종결자 오염(CSI m)", "\u{1b}[24;80m"),
+            ("paste 래퍼 안의 자동 응답", "\u{1b}[200~\u{1b}[I\u{1b}[201~"),
+            ("paste 개시 접두 단독", "\u{1b}[200~"),
+        ] {
+            assert!(!pure(bad), "{why} 가 자동 응답으로 오면제됐다: {bad:?}");
+        }
+        // 개행·CR 은 절대 자동 응답이 아니다 — 이게 참이 되면 제출 Enter 자체가 면제된다.
+        for cr in ["\r", "\n", "\r\n", "\u{1b}[I\r"] {
+            assert!(!pure(cr), "개행/CR 이 자동 응답으로 판정됐다: {cr:?}");
+        }
+    }
+
+    /// ★B1 상위 집합 계약 박제 — 새 술어는 A9(마우스 면제)를 **줄이지 않는다**. 공유 코퍼스의
+    /// `pure=true` 케이스는 전부 자동 응답으로도 참이어야 하고, `pure=false` 인 paste 래퍼는
+    /// 양쪽 다 거짓이어야 한다(A9 규약 유지). 이 핀이 없으면 B1 이 A9 면제를 조용히 좁힐 수 있다.
+    #[test]
+    fn terminal_autoreply_is_superset_of_pure_mouse_report() {
+        let raw = include_str!("testdata/mouse_report_corpus.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).expect("코퍼스는 유효 JSON");
+        let cases = doc["cases"].as_array().expect("cases 배열");
+        let mut pure_seen = 0usize;
+        for c in cases {
+            let name = c["name"].as_str().unwrap_or("?");
+            let bytes = c["bytes"].as_str().expect("bytes 문자열");
+            if c["pure"].as_bool().expect("pure 불리언") {
+                pure_seen += 1;
+                assert!(
+                    mousereport::is_pure_terminal_autoreply(bytes),
+                    "코퍼스 '{name}' 는 순수 마우스 보고인데 자동 응답 술어가 거짓이다 \
+                     (A9 면제 축소 — bytes={bytes:?})"
+                );
+            }
+        }
+        assert!(pure_seen >= 10, "코퍼스의 pure 케이스가 너무 적다({pure_seen}) — 상위집합 검증이 공허해진다");
+        // paste 래퍼는 두 술어 모두 거짓(A9 명문 규약).
+        let wrapped = "\u{1b}[200~\u{1b}[<64;10;20M\u{1b}[201~";
+        assert!(!mousereport::is_pure_mouse_report(wrapped));
+        assert!(!mousereport::is_pure_terminal_autoreply(wrapped));
     }
 
     /// ★D5 회귀 핀(--lib 상주 — cys.rs 테스트 모듈은 CI 0회 실행이라 여기 둔다):
