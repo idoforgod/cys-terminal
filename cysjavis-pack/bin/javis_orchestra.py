@@ -490,7 +490,7 @@ def check_verdicts(status, detect=None, agents=None):
     return verdicts, roster
 
 
-def _shared_verdict_deficit(status, requery=None, tick_s=None):
+def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agents=None):
     """★부트 경로 전용 결손 산출(W-B1 ③) — (결손 bool, 사유) | (None, 소비불가 사유).
 
     check_verdicts(⑤check 의 판정 코어)를 **소비만** 하고 그 satisfied 를 재정의하지 않는다.
@@ -520,10 +520,16 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None):
       **의도된 차분**(check 충족 vs 결손>0)을 예외로 두도록 개정됐고, 배선 실재·폴백 실재·
       ⑤check satisfied 불변을 그 검체가 함께 핀한다(소비자 0 재발 시 적색).
 
-    requery/tick_s 는 밀폐 테스트 주입(기본: cys_status 재조회 · 워치독 1주기 대기)."""
+    requery/tick_s 는 밀폐 테스트 주입(기본: cys_status 재조회 · 워치독 1주기 대기).
+    ★detect/agents 주입(2026-08-22 적대검증 중대④): `check_verdicts` 가 이미 갖고 있던 밀폐
+      주입 규약을 **형제 소비자에게도 뚫는다**. 이 경로만 주입이 막혀 있어서, 형제 소비자
+      `javis_bootstrap._shared_verdict_deficit` 을 쓰는 `javis_bootstrap.py --self-test` 가
+      **agy·codex 가 없는 깨끗한 기계에서 항상 FAIL** 했다(실측: 빈 HOME → exit 1). 그 FAIL 이
+      뒤따르는 단언들보다 앞이라 신규 커버리지가 통째로 실행조차 되지 않았다.
+      미주입=None 이면 종전과 완전히 같은 실감지 경로다 — **프로덕션 거동 불변**."""
     bn = _boot_node()
     try:
-        verdicts, _roster = check_verdicts(status)
+        verdicts, _roster = check_verdicts(status, detect=detect, agents=agents)
     except Exception as e:
         return None, "check_verdicts 소비 불가(%s: %s)" % (type(e).__name__, e)
     if not verdicts:

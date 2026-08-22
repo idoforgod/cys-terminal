@@ -212,5 +212,80 @@ check("7b 폴백 적용 사실이 사유에 남는다(감사 가능성)",
       "미종결" in ((rec or {}).get("reason") or ""), "reason=%r" % (rec or {}).get("reason"))
 shutil.rmtree(tmp)
 
+# ── 8. ★적대검증 치명① — 미종결 폴백이 오너 지시를 삼키는가 (리뷰어 재현 입력 그대로) ──
+#    초판 폴백은 여는 태그부터 **문자열 끝까지** 잘라 '왜'·'##'·'>' 만 남기고 오너 지시를
+#    통째로 삼켰다. record 훅 e2e 로도 record-exit=1(임무 미기록·게이트 폐쇄)이 확인됐다.
+for i, (prompt, why) in enumerate((
+    ("왜 <summary> 때문에 임무가 안 잡혀? 원인 찾아서 고쳐라", "접두 1자 + 미종결 summary"),
+    ("이 <summary> 태그 버그 전부 고치고 배포해라", "접두 1자 + 미종결 summary"),
+    ("## <command-name> 처리 로직 전면 재작성해라", "접두 2자(구두점) + 미종결 알림 마커"),
+    ("> <task-id> 필드 추가하고 릴리스해라", "접두 1자(구두점) + 미종결 컨텍스트 마커"),
+), start=1):
+    tmp = tempfile.mkdtemp(prefix="mission-h8-%d-" % i)
+    env = make_env(tmp)
+    rc, _err = record(env, prompt)
+    rec, _ = ledger(env)
+    got = (rec or {}).get("mission")
+    check("8%d ★오너 지시 무삼킴(%s)" % (i, why), got is not None,
+          "mission=%r record-exit=%d — 치명① 재발" % (got, rc))
+    shutil.rmtree(tmp)
+
+# ── 9. ★적대검증 치명② — 슬래시 명령 합성 turn 이 그대로 통과하는가 ──
+#    `local-command-caveat` 는 있는데 같은 가족의 `local-command-stdout` 이 없어, `/cost` 형태가
+#    "source":"prompt" 로 기록되고 게이트가 열렸다(2026-08-22 사고 원문과 동형 재현).
+COST = ("<command-name>/cost</command-name>\n<command-message>cost</command-message>\n"
+        "<command-args></command-args>\n<local-command-stdout>Total cost: $12.34\n"
+        "Total duration (API): 4m 5.6s\nTotal duration (wall): 12m 3.4s\n"
+        "Total code changes: 120 lines added, 8 lines removed\n"
+        "Usage by model:\n    claude-opus: 1.2k input, 3.4k output\n</local-command-stdout>")
+# 목록에 **없는** 태그 — 이름 축으로는 못 잡고 이름 독립 구조 축이 잡아야 한다.
+UNKNOWN_TAG = ("<command-name>/newthing</command-name>\n"
+               "<brand-new-harness-tag>목록에 없는 미래 harness 태그 출력</brand-new-harness-tag>")
+for i, (prompt, why) in enumerate(((COST, "★/cost 실측 형태"),
+                                   (UNKNOWN_TAG, "★목록에 없는 새 태그(구조 축)")), start=1):
+    tmp = tempfile.mkdtemp(prefix="mission-h9-%d-" % i)
+    env = make_env(tmp)
+    record(env, prompt)
+    rec, _ = ledger(env)
+    check("9%d-a ★기계로 접힘(%s)" % (i, why), (rec or {}).get("mission") is None,
+          "mission=%r — 층0 을 넣고도 사고가 살아 있다" % str((rec or {}).get("mission"))[:60])
+    check("9%d-b 게이트 무개방" % i, status(env) != 0)
+    shutil.rmtree(tmp)
+
+# ── 10. ★구조 축이 오너를 삼키지 않는가 (master 지적 함정 1·2) ──
+for i, (prompt, why) in enumerate((
+    ("이 컴포넌트 고쳐줘\n```jsx\n<div><span>hi</span></div>\n```", "코드펜스 + 지시"),
+    ("```html\n<html><body><h1>Hi</h1></body></html>\n```", "★펜스만 — 보호 구간"),
+    ("이 XML 파싱 버그 고쳐줘: <root><item>1</item></root>", "XML 붙여넣기 + 지시"),
+    ("<details><summary>접기</summary></details> 이 마크다운 렌더링 고쳐줘", "일반 HTML + 지시"),
+), start=1):
+    tmp = tempfile.mkdtemp(prefix="mission-h10-%d-" % i)
+    env = make_env(tmp)
+    record(env, prompt)
+    rec, _ = ledger(env)
+    check("10%d 오너 통과(%s)" % (i, why), (rec or {}).get("mission") is not None,
+          "mission=%r — 구조 축 과잉 차단" % (rec or {}).get("mission"))
+    shutil.rmtree(tmp)
+
+# ── 11. ★적대검증 ⑤ — 훅 지연(성능). 매 프롬프트가 이만큼 느려진다. ──
+import time as _time
+PERF = [("미종결 마커 10,000개", "<summary>" * 10000),
+        ("미종결 일반 태그 10,000개", "<x-tag>" * 10000),
+        ("짝맞는 블록 5,000개", "<x-tag>a</x-tag>" * 5000)]
+r = subprocess.run(
+    [PY, "-c",
+     "import sys,time,json; sys.path.insert(0,%r); import javis_mission as m;\n"
+     "cases=json.load(sys.stdin)\n"
+     "print(json.dumps([[n, round(( (lambda t0: (m.harness_origin(s), time.time()-t0)[1])(time.time()) ),4)] for n,s in cases]))"
+     % os.path.abspath(os.path.join(SELF, "..")),
+    ], input=json.dumps(PERF), capture_output=True, text=True, encoding="utf-8", timeout=120)
+try:
+    timings = json.loads(r.stdout)
+except Exception:
+    timings = []
+check("11a 성능 측정 성공", bool(timings), r.stderr[-200:])
+for name, secs in timings:
+    check("11b %s < 0.5s" % name, secs < 0.5, "%.4fs" % secs)
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

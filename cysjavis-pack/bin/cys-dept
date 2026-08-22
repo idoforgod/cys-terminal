@@ -335,15 +335,27 @@ PY
 #   external 정의("pane 밖 프로세스(오너 셸·Tauri 등)")다 — **오너의 GUI가 external 등급**이라
 #   자기 부서 워커에게 입력을 못 넣었다. 오너 절대규칙: "cys-terminal의 모든 노드 프롬프트 창을
 #   오너가 컨트롤할 수 있어야 한다".
-# ★수정: `owner` 신원 등급을 규칙 배열 **맨 앞**에 둔다. 순서가 계약이다 — cysd
-#   `eval_acl_rules`(handlers.rs)는 `return rule["allow"]`로 **첫 매칭에서 확정**한다.
+# ★수정: `owner` 신원 등급을 규칙 배열 **맨 앞**에 둔다 — cysd `eval_acl_rules`(handlers.rs)는
+#   `return rule["allow"]` 로 **첫 매칭에서 확정**하기 때문이다. 다만 오너 순회는 `from` 을
+#   **exact 비교**(`from_exact=true`)하고 명시 owner 규칙이 없으면 **허용이 기본**(`unwrap_or(true)`)
+#   이므로, 우리 규칙을 실제로 가릴 수 있는 것은 오너가 직접 쓴 또 다른 `from:"owner"` 규칙뿐이다
+#   (`{"from":"*"}` 류 와일드카드는 오너를 잠그지 못한다).
 # ★보존: CEO·타 부서 노드가 부서장을 건너뛰고 워커를 직접 조향하는 것은 계속 막는다(부서 자율성)
 #   — external→worker* deny·reviewer-*→worker* deny·external→master allow 는 불변이다.
 # ★데몬측 판정(실측 — handlers.rs `caller_is_owner`/`operator_token_ok`): 경로 검사가 아니라
 #   **operator_token** 이다. 데몬이 기동 시 발급해 `state_dir/operator.token`(unix 0600)에 쓴
-#   값을 요청에 실은 발신자만 owner 이며, 추가로 **어느 pane 에도 귀속되지 않아야** 한다
-#   (`from_sid.is_none()` — pane 이 토큰 파일을 읽어 붙여도 승격되지 않는다). 붙이는 지점은
-#   Tauri 백엔드 단 한 곳이고 공용 `cys` CLI 는 어느 경로에서도 붙이지 않는다.
+#   값을 요청에 실은 발신자만 owner 이며, 추가로 **그 데몬의** 어느 pane 에도 귀속되지 않아야
+#   한다(`from_sid.is_none()`). 붙이는 지점은 Tauri 백엔드 단 한 곳이고 공용 `cys` CLI 는 어느
+#   경로에서도 붙이지 않는다.
+# ★★사정거리(치명 F1 정정 · 과대선전 금지): `from_sid.is_none()` 은 **그 데몬의 pane 만** 배제한다
+#   — 이는 사실상 `external` 의 정의 그 자체다. 따라서 `external→worker* deny` 가 겨냥한 적대자
+#   (본부 데몬의 CEO·master, 타 부서 노드)는 **애초에 그 부서 데몬의 pane 이 아니므로 이 조건을
+#   자동으로 만족**한다. 토큰 파일은 같은 UID 면 읽히므로 그들이 raw RPC 로 붙이면 우회가 성립한다.
+#   즉 **이 등급은 보안 경계가 아니라 거버넌스 구분**이다(강화 후보 3종은 데몬 담당 축에서 조사 후
+#   전부 기각 — 부서 데몬은 앱 번들이 아니라 PATH/homebrew 로 해소돼 실행경로 판정이 이 레인에서
+#   성립하지 않고, 메모리 nonce 는 데몬 재시작 시 오너 자신을 잠근다). 성립하지 않는 방어를
+#   성립한다고 쓰지 않는다 — 실제로 닫히는 것은 "지침을 따르는 정상 노드가 오너 입력으로 승격되는
+#   경로"뿐이고, 승격 판정은 `acl.owner_granted` 이벤트로 감사된다.
 # ★하위호환: owner 규칙이 없는 기존 ACL 은 데몬이 2단 평가의 2차(종전 신원)로 그대로 흘리고,
 #   구 데몬(토큰 미지원)에서는 발신 role 이 "owner" 가 될 수 없어 이 규칙이 영영 미매칭이다 —
 #   양방향 모두 거동 변화 0이다. 이 파일은 ACL 시드(데이터)만 담당한다.
@@ -365,7 +377,7 @@ seed_acl(){
   fi
   cat > "$pk/acl.json" <<'JSON'
 {
-  "_doc": "부서 데몬 ACL — CEO·타 부서 노드는 워커 직접 조향 불가(부서장 master 경유), 오너 GUI는 전 노드 허용. 규칙은 위에서부터 첫 매칭 승리. cys-dept 시드(파일 부재 시 전체 시드 · 이미 있으면 owner 규칙만 맨 앞에 추가하고 나머지는 보존한다 — 오너 정책 무손실). from 신원 등급: 'owner'=오너 GUI(Tauri) 세션 — 데몬이 기동 시 발급한 operator_token(state_dir/operator.token·0600)을 요청에 실은 발신자만 이 등급이며, 어느 pane 에도 귀속되지 않아야 한다(pane 이 토큰을 읽어 붙여도 승격되지 않는다). CLI·워커 push·큐 배달·schedule 발화는 토큰을 붙이지 않으므로 external·역할명 그대로다. ★정직한 한계: 암호학적 방어가 아니다 — 동일 UID 프로세스는 토큰 파일을 읽어 사칭할 수 있다. 이 등급이 실제로 닫는 것은 평시 정상 동작이 사람 입력을 사칭하는 경로다. 'external'=pane 밖 프로세스(오너 셸 등). '(pane)'=역할 없는 pane.",
+  "_doc": "부서 데몬 ACL — CEO·타 부서 노드는 워커 직접 조향 불가(부서장 master 경유), 오너 GUI는 전 노드 허용. 규칙은 위에서부터 첫 매칭 승리. cys-dept 시드(파일 부재 시 전체 시드 · 이미 있으면 owner 규칙만 맨 앞에 추가하고 나머지는 보존한다 — 오너 정책 무손실). from 신원 등급 'owner' = 오너 GUI(Tauri) 세션. 데몬이 기동 시 발급한 토큰(state_dir/operator.token·0600)을 요청에 실은 발신자이며, 그 데몬의 어느 pane 에도 귀속되지 않아야 한다. 매칭은 from 문자열 정확 일치만 인정하고(글롭 미적용), 매칭되는 owner 규칙이 없으면 허용이 기본이다 — 오너를 막는 유일한 방법은 {\"from\":\"owner\", …, \"allow\":false} 명시다. ★이 등급은 보안 경계가 아니라 거버넌스 구분이다: 같은 UID 로 토큰 파일을 읽을 수 있는 프로세스는 — 다른 데몬의 노드를 포함해 — raw RPC 로 참칭할 수 있다(단일 UID 신뢰 모델의 알려진 한계). 공용 cys CLI 는 토큰을 붙이지 않으므로 지침을 따르는 정상 노드는 이 등급에 오지 않는다. 판정을 뒤집은 승격은 acl.owner_granted 이벤트로 감사된다. 'external'=pane 밖 프로세스(오너 셸 등). '(pane)'=역할 없는 pane.",
   "default": "allow",
   "rules": [
     { "from": "owner", "to": "*", "allow": true,
@@ -403,7 +415,14 @@ except Exception as e:
 if not isinstance(d,dict): sys.stderr.write("루트가 객체 아님"); sys.exit(3)
 rules=d.get("rules")
 if not isinstance(rules,list): sys.stderr.write("rules 배열 부재/형식오류"); sys.exit(3)
-if any(isinstance(r,dict) and r.get("from")=="owner" for r in rules): sys.exit(10)  # 멱등
+# 멱등 판정 — ★적대검증 ⑥: '존재하냐'가 아니라 '**첫 번째냐**'로 나눈다.
+#   idx==0  → 정상(무동작·무음)  ·  idx>0 → 무동작이되 **가시화**(exit 11 → stderr 경고).
+#   재배열하지 않는 근거는 아래 shell 의 exit 11 분기 주석에 있다 — 오너 정책 무손실.
+#   ※이 heredoc 은 $( ) 안에 있다 — 본문에 짝 없는 닫는 괄호를 쓰면 bash 파서가 깨진다(실측).
+_own=[i for i,r in enumerate(rules) if isinstance(r,dict) and r.get("from")=="owner"]
+if _own:
+    if _own[0]==0: sys.exit(10)
+    sys.stderr.write("owner 규칙이 %d번째(0-based, 총 %d규칙)"%(_own[0],len(rules))); sys.exit(11)
 m=re.search(r'"rules"\s*:\s*\[', text)
 if not m: sys.stderr.write("rules 배열 여는 위치 탐색 실패"); sys.exit(3)
 ins=('\n    { "from": "owner", "to": "*", "allow": true,'
@@ -432,7 +451,15 @@ PY
 )" || rc=$?
   case "$rc" in
     0)  echo "[cys-dept] ACL 마이그레이션: owner 규칙 추가(맨 앞) — 기존 규칙·필드 보존: $f" >&2 ;;
-    10) : ;;   # 이미 owner 규칙 존재 — 무동작·무출력(멱등·로그 소음 금지)
+    10) : ;;   # owner 규칙이 이미 **맨 앞** — 무동작·무출력(멱등·로그 소음 금지)
+    # ★적대검증 ⑥: owner 규칙이 존재하되 첫 번째가 아님 → **무동작 + 경고**(재배열 금지).
+    #   재배열하지 않는 근거(실측): 데몬은 오너 순회에서 `from` 을 **exact 비교**하고
+    #   (`eval_acl_rules(..., from_exact=true)`), 명시 owner 규칙이 하나도 매칭 안 되면
+    #   **허용이 기본**이다(`.unwrap_or(true)`). 따라서 `{"from":"*"}` 류 와일드카드는 오너를
+    #   잠그지 못하고, 우리 규칙을 실제로 가릴 수 있는 것은 **오너가 직접 쓴 또 다른
+    #   `from:"owner"` 규칙뿐**이다 — 그건 오너의 명시적 의사표시이므로 조용히 순서를 바꾸면
+    #   오너 정책을 덮어쓰는 꼴이 된다(이 함수의 '무손실' 원칙과 정면 충돌). 침묵만 없앤다.
+    11) echo "[cys-dept] WARN: ACL owner 규칙이 맨 앞이 아니다($f · $out) — 앞선 명시 from=\"owner\" 규칙이 있으면 그쪽이 먼저 확정된다(첫 매칭 승리). 오너 정책 보존을 위해 자동 재배열은 하지 않는다 — 오너 GUI 입력이 막히면 순서를 직접 확인하라." >&2 ;;
     *)  echo "[cys-dept] WARN: ACL owner 규칙 추가 실패 — **원본 무변경**으로 진행($f). 오너 GUI의 워커 pane 입력이 막히면 이 파일 rules 맨 앞에 { \"from\": \"owner\", \"to\": \"*\", \"allow\": true } 를 수동 추가하라. (사유: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200))" >&2 ;;
   esac
   return 0
@@ -814,8 +841,16 @@ PY
 #   실패 시 stderr 경고 1줄 + 수동 발급 안내만 남기고 진행한다.
 # ★소비 금지: 티켓은 24h TTL·1회성이며 소비(.used rename)는 **부서장 부트**가 한다
 #   (javis_bootstrap.py ④ boot 성공 직후 `_consume_dept_ticket` — "1회성 티켓 ⟺ 실스폰" 불변식).
+# $2(선택): 이번 호출에서 데몬을 **실제로 스폰했는가** — 1=신규 스폰 · 0=이미 가동 중이라 재사용.
+#   ★적대검증 ⑦(의도적 설계 · 되돌리지 마라): 재사용 경로(`이미 가동 중 — 재사용`)에서도 발급한다.
+#   javis_bootstrap.py 의 "1회성 티켓 ⟺ 실스폰" 불변식은 **소비 측**(부트가 ④ cys boot 성공 직후에만
+#   태운다) 계약이고, 여기 발급 측까지 확장하면 오너 절대규칙이 깨진다: 데몬만 살아 있고 팀은 없는
+#   부서(부서장 세션 재시작·/clear·이전 단독 각성)가 **영구히 팀 0으로 고착**된다 — rotate 를 막지
+#   않기로 한 것과 정확히 같은 논리다. 재사용 발급의 대가는 "24h 창 안의 부서장 부트 1회가 팀 스폰
+#   권한을 얻는다"인데, 그 부트 주체는 오너가 띄운 그 부서의 부서장이므로 오너 동의 범위 안이다.
+#   대신 **침묵하지 않는다** — 재사용 경로 발급은 로그 문면으로 구분한다(아래 spawned=0 분기).
 dept_issue_ceo_ticket(){
-  local name="$1" bs="$PACK_DEFAULT/bin/javis_bootstrap.py" out why
+  local name="$1" spawned="${2:-1}" bs="$PACK_DEFAULT/bin/javis_bootstrap.py" out why
   local manual="수동 발급: base(본부) 레인에서 \`python3 \"$bs\" issue-ticket --dept $name\`"
   if [ ! -f "$bs" ]; then
     echo "[cys-dept] WARN: $name CEO 티켓 자동 발급 생략 — $bs 부재(팩 미설치·스큐). 부서장이 '단독 각성'(팀 0)으로 뜬다. $manual" >&2
@@ -826,7 +861,12 @@ dept_issue_ceo_ticket(){
     return 0
   fi
   if out="$(env -u CYS_SOCKET python3 "$bs" issue-ticket --dept "$name" 2>&1)"; then
-    echo "[cys-dept] $name CEO 티켓 발급 완료 — 부서장이 뜨면 팀(cso·워커·리뷰어)이 자동 기동된다(24h TTL·1회성·소비는 부서장 부트)" >&2
+    if [ "$spawned" = "1" ]; then
+      echo "[cys-dept] $name CEO 티켓 발급 완료 — 부서장이 뜨면 팀(cso·워커·리뷰어)이 자동 기동된다(24h TTL·1회성·소비는 부서장 부트)" >&2
+    else
+      # ★적대검증 ⑦ 가시화: 신규 스폰이 없었는데 발급했다는 사실을 문면에 드러낸다(위 함수 주석의 근거).
+      echo "[cys-dept] $name CEO 티켓 발급 완료 ★데몬 재사용 경로(신규 스폰 없음) — 팀 0 고착 방지를 위한 의도적 발급이다. 24h 창 안의 부서장 부트 1회가 팀을 기동한다(1회성·소비는 부서장 부트)" >&2
+    fi
   else
     # 사유는 1줄로 접어 붙인다(다줄 stderr가 로그를 흩지 않게). 대표 사유: 부서명이 발급 정규식
     # ([a-z0-9][a-z0-9-]*) 불일치(대문자·'_' 포함) · python3 부재 · base 레인 판정 실패.
@@ -880,8 +920,10 @@ case "$cmd" in
       mkdir -p "$acctdir" 2>/dev/null || true
       [ -d "$acctdir" ] || { echo "[cys-dept] ERROR: $name account dir 사용 불가($acctdir) — fail-closed(비격리 기동 금지)" >&2; exit 5; }
     fi
+    _spawned=1   # ★⑦: 이번 호출에서 데몬을 실제로 스폰했는가(0=재사용) — 티켓 발급 로그 문면 구분용
     if ready "$sock"; then
       echo "[cys-dept] $name 이미 가동 중 — 재사용"
+      _spawned=0
     else
       if [ -n "$acctdir" ]; then
         CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
@@ -905,7 +947,8 @@ case "$cmd" in
     #   rotate(=이 경로 재귀)도 통과시킨다: rotate 는 데몬을 새로 띄우므로 팀(cso·워커·리뷰어
     #   surface)이 함께 사라진다 — 여기서 막으면 rotate 한 번에 '팀 0인 부서'가 영구 고착된다.
     #   유효 티켓이 남아 있으면 멱등 판정이 재발급을 막으므로 TTL 리셋도 없다(묘비 불변 계약 무관).
-    dept_issue_ceo_ticket "$name"
+    #   ★⑦: 재사용 분기(_spawned=0)에서도 발급한다 — 근거는 dept_issue_ceo_ticket 함수 주석.
+    dept_issue_ceo_ticket "$name" "$_spawned"
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none}). 부서 수=$(reg_count)"
     ;;
@@ -984,7 +1027,8 @@ PY
     reg_set_field "$name" account_dir "$acctdir" || true
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
-    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2
+    _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용) — 티켓 발급 로그 문면 구분용
+    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
@@ -1004,7 +1048,8 @@ PY
     # ★결함#1: CEO 승격·계정격리 확정 이후 티켓 자동 발급(fail-open). 빈 셸 생성 **이전**에 둔다 —
     #   오너가 그 셸에서 즉시 claude 를 띄워 선언해도 티켓이 이미 있어야 팀이 기동된다.
     #   trap 해제 이후 지점이라 발급 실패가 teardown 을 유발할 여지도 없다(fail-open 이중 보증).
-    dept_issue_ceo_ticket "$name"
+    #   ★⑦: 재사용 분기(_spawned=0)에서도 발급 — 근거는 dept_issue_ceo_ticket 함수 주석.
+    dept_issue_ceo_ticket "$name" "$_spawned"
     # ★제품 기본 정책(2026-06-29 결정): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
     #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
     #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
@@ -1136,7 +1181,8 @@ PY
     if [ "$verb" = "NEW" ]; then trap 'reg_remove "$name" 2>/dev/null || true' EXIT; fi  # NEW만 실패 시 예약회수(REUSE는 기존 보존)
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
-    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2
+    _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용·REUSE_DEAD 재기동 포함) — 티켓 발급 로그 문면 구분용
+    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
@@ -1158,7 +1204,8 @@ PY
     trap - EXIT   # 격리 확정 — 이후 빈 셸 생성
     # ★결함#1: allocate 와 동형 — CEO 승격·계정격리 확정 후, 빈 셸 생성 이전에 티켓 자동 발급(fail-open).
     #   REUSE_UP/REUSE_BOOTING 은 위에서 이미 exit 0 으로 빠졌다(신규 생성 아님 — 기존 부서 재사용).
-    dept_issue_ceo_ticket "$name"
+    #   ★⑦: 여기 도달하는 REUSE_DEAD·기가동 재사용(_spawned=0)에서도 발급 — 근거는 함수 주석.
+    dept_issue_ceo_ticket "$name" "$_spawned"
     # ★WP-11(2026-06-29 결정 일원화): create도 allocate와 동일하게 role=master '빈 셸'만 띄운다.
     #   자동 각성(부트 노드)+미션 자동주입(send --to master)을 폐지 — 사용자가 그 셸에서 직접 claude 를
     #   실행해 부서장으로 연결하고, 부서장이 미션 파일($MISS/$key.md)을 스스로 읽는다. 빈 셸(agent=None)엔

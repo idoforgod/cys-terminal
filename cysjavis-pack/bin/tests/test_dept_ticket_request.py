@@ -67,10 +67,11 @@ exit 0
 """
 
 
-def make_env(tmp, *, ceo_alive=True, send_exit=0, ticket_on_send=0, wait_s=6):
-    """임시 HOME + 가짜 부서 팩 + 스텁 → (env, home). 부서 레인(CYS_SOCKET=부서 소켓)."""
+def make_env(tmp, *, ceo_alive=True, send_exit=0, ticket_on_send=0, wait_s=6, dept=DEPT):
+    """임시 HOME + 가짜 부서 팩 + 스텁 → (env, home). 부서 레인(CYS_SOCKET=부서 소켓).
+    ★dept 는 소켓과 팩 이름을 **함께** 정한다 — 어긋나면 레인↔팩 가드(exit 8)가 ③″ 앞에서 끊는다."""
     home = os.path.join(tmp, "home")
-    pack = os.path.join(home, ".cys", "pack-dept-%s" % DEPT)
+    pack = os.path.join(home, ".cys", "pack-dept-%s" % dept)
     bindir = os.path.join(tmp, "stubbin")
     tickets = os.path.join(home, ".cys", "state", "dept-boot-tickets")
     for d in (os.path.join(pack, "bin"), bindir):
@@ -85,7 +86,7 @@ def make_env(tmp, *, ceo_alive=True, send_exit=0, ticket_on_send=0, wait_s=6):
     w(os.path.join(bindir, "cys"), _CYS % {"t": tmp, "ceo": 1 if ceo_alive else 0,
                                            "send_exit": send_exit,
                                            "ticket_on_send": ticket_on_send,
-                                           "tickets": tickets, "dept": DEPT,
+                                           "tickets": tickets, "dept": dept,
                                            "now": repr(_t.time())})
     w(os.path.join(pack, "bin", "javis_preflight.py"), "import sys; sys.exit(0)\n", 0o644)
     w(os.path.join(pack, "bin", "javis_orchestra.py"),
@@ -95,7 +96,7 @@ def make_env(tmp, *, ceo_alive=True, send_exit=0, ticket_on_send=0, wait_s=6):
     env = dict(os.environ)
     env.update({"HOME": home, "PATH": bindir + os.pathsep + env.get("PATH", ""),
                 "CYS_PACK_DIR": pack,
-                "CYS_SOCKET": os.path.join(tmp, "state", "cys-dept-%s" % DEPT, "cys.sock"),
+                "CYS_SOCKET": os.path.join(tmp, "state", "cys-dept-%s" % dept, "cys.sock"),
                 "CYS_SURFACE_ID": "7",
                 "CYS_BOOT_CHECK_RETRIES": "2", "CYS_BOOT_CHECK_INTERVAL_S": "0.05",
                 # 유계 대기를 테스트 예산으로 좁힌다(상수는 env 로 노출돼 있다)
@@ -207,6 +208,40 @@ check("5c 단독 각성이 아니다", summary_of(out).get("solo_awakening") is 
 check("5d 티켓 1회성 소비(.used)",
       os.path.exists(os.path.join(home, ".cys", "state", "dept-boot-tickets",
                                   "%s.ticket.used" % DEPT)))
+shutil.rmtree(tmp)
+
+# ── 6. ★적대검증 중대③ — 부서명 규약 비대칭(대문자·`_` 부서가 티켓을 영영 못 받는다) ──
+#    생성기 `cys-dept::dept_name_ok` = ^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$ 인데 발급기는
+#    `[a-z0-9][a-z0-9-]*` 였다. 오너가 `Sales`·`dept_1` 로 부서를 만들면 결함 #1 이 그대로 남는다.
+tmp = tempfile.mkdtemp(prefix="tq-t6-")
+env, home = make_env(tmp)
+env_base = dict(env)
+env_base.pop("CYS_SOCKET", None)
+for name in ("Sales", "dept_1", "A9_x-y"):
+    r = subprocess.run([PY, SCRIPT, "issue-ticket", "--dept", name],
+                       capture_output=True, text=True, encoding="utf-8", env=env_base, timeout=60)
+    check("6a ★생성기가 허용하는 이름 %r 을 발급기도 허용" % name, r.returncode == 0,
+          "exit=%d %s" % (r.returncode, (r.stderr or "")[-160:]))
+    check("6b 티켓 파일 생성 %r" % name,
+          os.path.exists(os.path.join(home, ".cys", "state", "dept-boot-tickets",
+                                      "%s.ticket" % name)))
+for name in ("Bad/Name", "-lead", "a.b"):
+    r = subprocess.run([PY, SCRIPT, "issue-ticket", "--dept", name],
+                       capture_output=True, text=True, encoding="utf-8", env=env_base, timeout=60)
+    check("6c 경로 위험 이름 %r 은 여전히 거부" % name, r.returncode == 2, "exit=%d" % r.returncode)
+shutil.rmtree(tmp)
+
+# ── 7. ★중대③ 후반 — 발급기가 거부할 이름이면 CEO 큐에 요청을 넣지 않는다 ──
+#    종전 배치는 요청이 정규식 경고보다 **먼저** 나가, "실행하면 exit 2 가 나오는 명령"이
+#    억제 TTL 주기로 CEO 큐에 쌓였다(수신자가 할 수 있는 일이 없는 요청 = 소음).
+tmp = tempfile.mkdtemp(prefix="tq-t7-")
+BAD = "Bad.Name"
+env, home = make_env(tmp, dept=BAD)
+code, out, err = run(env)
+check("7a 불량 부서명이어도 부트 exit 0(fail-open)", code == 0, "exit=%d" % code)
+check("7b ★요청 push 미발사(실패할 명령을 큐에 넣지 않는다)", not send_lines(tmp),
+      "sends=%r" % send_lines(tmp))
+check("7c 단독 각성 보고에 재생성 안내", "재생성" in err, err[-300:])
 shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")

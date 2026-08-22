@@ -1,5 +1,5 @@
 {
-  "_doc": "T1-3 송신 ACL — role→role stdin 주입 정책. 데몬이 발신자 신원을 커널 peer pid로 직접 도출해 평가한다 (클라이언트 자기신고 from은 검증으로 대체). 규칙은 위에서부터 첫 매칭 승리, 글롭(*)은 역할명 패턴. from 특수값: 'external'=pane 밖 프로세스(오너 셸·Tauri 등), '(pane)'=역할 없는 pane. default: allow | deny.",
+  "_doc": "T1-3 송신 ACL — role→role stdin 주입 정책. 데몬이 발신자 신원을 커널 peer pid로 직접 도출해 평가한다 (클라이언트 자기신고 from은 검증으로 대체). 규칙은 위에서부터 첫 매칭 승리, 글롭(*)은 역할명 패턴. from 특수값: 'owner'=오너 GUI(Tauri) 세션 · 'external'=그 밖의 pane 밖 프로세스(오너 셸 등) · '(pane)'=역할 없는 pane. default: allow | deny. ★'owner' 등급의 계약(v0.14.23): 데몬이 기동 시 발급한 토큰(state_dir/operator.token·0600)을 요청에 실은 발신자이며, **그 데몬**의 어느 pane에도 귀속되지 않아야 한다. 매칭은 from **문자열 정확 일치**만 인정하고(글롭 미적용 — 와일드카드 규칙은 오너를 잠그지 못한다), 매칭되는 owner 규칙이 없으면 이 파일의 default를 타지 않고 **허용**이 기본이다(시스템이 주인을 자기 시스템에서 잠그지 않기 위해서다). 오너를 막는 유일한 방법은 {\"from\":\"owner\", ..., \"allow\": false} 명시다. ★**이 등급은 보안 경계가 아니라 거버넌스 구분이다**: 같은 UID로 토큰 파일을 읽을 수 있는 프로세스는 — 다른 데몬의 노드를 포함해 — raw RPC로 참칭할 수 있다(단일 UID 신뢰 모델의 알려진 한계). 공용 cys CLI는 어떤 경로에서도 토큰을 붙이지 않으므로 지침을 따르는 정상 노드는 이 등급에 오지 않는다. 판정을 뒤집은 승격은 acl.owner_granted 이벤트로 감사된다.",
   "default": "allow",
   "rules": [
     { "from": "reviewer-*", "to": "worker*", "allow": false,

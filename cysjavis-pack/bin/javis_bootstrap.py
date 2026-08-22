@@ -269,6 +269,22 @@ _CLAIM_DENIED_MARKERS = ("claim_denied", "privileged role held")
 TICKET_DIR = os.path.join(STATE_DIR, "dept-boot-tickets")
 TICKET_TTL_SECS = float(os.environ.get("CYS_DEPT_TICKET_TTL_SECS", str(24 * 3600)))
 
+# ── 부서명 규약 — **단일 출처**(2026-08-22 적대검증 중대③ 비대칭 봉합) ──────────────
+# ★결함: 생성기(`cys-dept:185 dept_name_ok` = `^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$`)는 대문자·`_`
+#   를 허용하는데 발급기(issue-ticket)는 `[a-z0-9][a-z0-9-]*` 만 받았다. 오너가 `Sales`·`dept_1`
+#   로 부서를 만들면 **티켓을 영영 못 받아** 결함 #1(팀 미기동)이 그대로 남는다.
+# ★master 결정: **발급기를 생성기에 맞춰 넓힌다**. 부서가 이미 그 이름으로 존재하는데 티켓을
+#   거부해 봐야 아무도 이롭지 않다. 경로 안전성은 문자 집합이 `[A-Za-z0-9_-]` 뿐이라 유지된다
+#   (경로 구분자·`.`·공백 불가 → 디렉터리 탈출 없음). 길이 상한 40자도 생성기와 동일하다.
+# ★생성기가 이 규약의 정의처다 — 여기를 고칠 때는 `cys-dept::dept_name_ok` 와 함께 고친다
+#   (self-test 가 두 소스의 정규식 문자열을 실제로 대조해 드리프트를 잡는다).
+DEPT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
+
+
+def dept_name_ok(name):
+    """부서명 규약 판정 — `cys-dept::dept_name_ok` 와 **같은 집합**(단일 출처·사본 금지)."""
+    return bool(DEPT_NAME_RE.fullmatch(name or ""))
+
 # ── 부서 레인 CEO 티켓 **자동 요청**(2026-08-22 현장 결함 #2) ────────────────────
 # ★결함: ③″ 티켓 게이트가 티켓 부재를 감지하고도 **안내문만 출력하고 끝났다**. 그래서 부서장은
 #   팀 없이 대기했고, 오너가 추가 명령을 쳐야만 CEO 에게 티켓을 요청했다 —
@@ -1096,6 +1112,13 @@ def _request_dept_ticket(dept):
     ★멱등: 같은 부트에서 이 함수는 1회만 불린다(호출 지점이 하나다). 재부팅 반복은 요청 마커
       + TTL 이 억제하고, TTL 경과 후에는 다시 요청한다.
     """
+    # ★이름 유효성 **선검사**(중대③ · master 지시): 발급기가 거부할 이름이면 요청 자체를 보내지
+    #   않는다. 종전 배치는 요청이 먼저 나가고 정규식 경고는 뒤에 찍혀, "실행하면 exit 2 가 나는
+    #   명령"이 억제 TTL 주기로 CEO 큐에 쌓였다(수신자가 할 수 있는 일이 없는 요청 = 소음).
+    if not dept_name_ok(dept):
+        return False, ("부서명 %r 이 발급 규약(%s) 불일치 — 실행해도 exit 2 가 나는 명령이라 "
+                       "CEO 큐에 넣지 않는다. 부서를 정규 이름으로 재생성해야 해소된다"
+                       % (dept, DEPT_NAME_RE.pattern))
     suppressed, swhy = _dept_ticket_request_suppressed(dept)
     if suppressed:
         return False, swhy
@@ -1360,7 +1383,7 @@ def _dept_fallback(log, claim_out):
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         name = lines[-1] if lines else ""
         log.step(STEP.DEPT_FB_ALLOC, code, "allocate → %r\n%s%s" % (name, out[-1500:], err[-1500:]))
-        if code != 0 or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""):
+        if code != 0 or not dept_name_ok(name):
             # ★ok=None(CS-2⑩ 동형 — 2026-08-12 R2 확정): 폴백 실패는 'base 부트가 깨졌다'가
             #   아니다(base master 는 건강해서 정당거부가 난 것). 기본값(ok=False·state=failed)로
             #   공유 boot-last 를 덮으면 다음 세션의 §0 이 '최신 완주 런 실패'로 읽고 재부트를
@@ -1568,7 +1591,7 @@ def _cys_status_json():
         return None
 
 
-def _shared_verdict_deficit(status, requery=None, tick_s=None):
+def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agents=None):
     """★부트 ④ 결손 산출 — `javis_orchestra._shared_verdict_deficit`(정본) **위임 소비**(W-B3 배선).
 
     정본(orchestra 판)은 check_verdicts(⑤check 판정 코어) 소비에 더해 **unknown 등급을
@@ -1590,12 +1613,24 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None):
       고지(조용한 강등 금지 — 어느 계약으로 판정했는지가 진단의 절반이다).
     requery/tick_s 는 밀폐 테스트 주입(기본: cys status 재조회·워치독 1주기) — 정본에 그대로
     전달된다. 반환 계약 (결손 bool, 사유) | (None, 실패사유)는 정본·폴백 동일(drop-in —
-    양판 반환문 직접 대조로 확인 2026-08-21)."""
+    양판 반환문 직접 대조로 확인 2026-08-21).
+    ★detect/agents(2026-08-22 적대검증 중대④): 리뷰어 로스터 밀폐 주입을 정본까지 전달한다.
+      막혀 있던 탓에 **깨끗한 기계(agy·codex 미설치 = 신규 사용자 대다수)에서 이 파일의
+      `--self-test` 가 항상 exit 1** 이었다. 미주입=None 이면 실감지 — 프로덕션 거동 불변.
+      ★구 팩 스큐 방어: 정본이 이 키워드를 모르는 구버전이면 `TypeError` 가 난다. 그때는
+      **주입 없이 1회 재시도**한 뒤 그래도 실패해야 폴백으로 내려간다(신팩 bootstrap + 구팩
+      orchestra 혼재에서 부트가 죽으면 안 된다는 기존 계약 유지)."""
     try:
         import javis_orchestra as _orch
         _fn = getattr(_orch, "_shared_verdict_deficit", None)
         if _fn is not None:
-            return _fn(status, requery=requery, tick_s=tick_s)
+            try:
+                return _fn(status, requery=requery, tick_s=tick_s,
+                           detect=detect, agents=agents)
+            except TypeError:
+                if detect is None and agents is None:
+                    raise
+                return _fn(status, requery=requery, tick_s=tick_s)
         skew_why = "구 팩 스큐(javis_orchestra 에 _shared_verdict_deficit 부재)"
     except Exception as e:
         skew_why = "orchestra 위임 불가(%s: %s)" % (type(e).__name__, e)
@@ -1900,8 +1935,11 @@ def cmd_issue_ticket(argv):
             dept = argv[i + 1]
         elif a.startswith("--dept="):
             dept = a.split("=", 1)[1]
-    if not dept or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", dept):
-        sys.stderr.write("[issue-ticket] --dept <name>(kebab-case a-z0-9-) 필수: %r\n" % dept)
+    if not dept or not dept_name_ok(dept):
+        # ★중대③ 봉합: 생성기(cys-dept::dept_name_ok)와 **같은 집합**으로 넓혔다. 종전
+        #   `[a-z0-9][a-z0-9-]*` 은 `Sales`·`dept_1` 로 만든 부서의 티켓을 영영 거부했다.
+        sys.stderr.write("[issue-ticket] --dept <name>(%s · cys-dept 생성 규약과 동일) 필수: %r\n"
+                         % (DEPT_NAME_RE.pattern, dept))
         return 2
     if not _is_base_socket():
         sys.stderr.write("[issue-ticket] base 레인에서만 티켓 발급 허용 — 현재 소켓은 부서 레인(%s). "
@@ -2201,9 +2239,10 @@ def _cmd_run_chain(log):
                         "팀이 기동됩니다. 사유: %s" % (req_why, dept, why))
             # R1-LOW-3 검증 비대칭 경고: 발급(issue-ticket)은 정규식을 강제하나 소켓 쪽 부서명은
             # 자유 형식이라, 불일치 부서는 티켓을 영영 못 받는 비대칭이 침묵으로 남는다 — 명시.
-            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", dept):
-                note += (" ★주의: 부서명 %r 은 발급 정규식([a-z0-9][a-z0-9-]*) 불일치 — "
-                         "이 부서명은 티켓 발급 불가 형식이다(부서 재생성 필요)." % dept)
+            if not dept_name_ok(dept):
+                note += (" ★주의: 부서명 %r 은 발급 규약(%s) 불일치 — 이 부서명으로는 티켓을 "
+                         "발급할 수 없다(부서 재생성 필요). 그래서 CEO 요청도 보내지 않았다."
+                         % (dept, DEPT_NAME_RE.pattern))
             _progress(note)
             log.step(STEP.CEO_TICKET_SOLO, 0, note)
             summary = {"ok": True, "marker": "부서장 단독 각성(CEO 티켓 부재)",
@@ -2634,13 +2673,34 @@ def cmd_self_test():
             {"role": "worker-2", "exited": False, "status": {"age_secs": 3, "state": "working"}},
             {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
             {"role": "reviewer-codex", "exited": False, "agent_alive": True}]}
-        _has, _why = _shared_verdict_deficit(_healthy)
+        # ★밀폐 주입(2026-08-22 적대검증 중대④): 로스터를 **감지 결과가 아니라 테스트 상수**로
+        #   고정한다. 종전엔 실감지를 타서 agy·codex 미설치 기계(신규 사용자 대다수)에서
+        #   reviewer-claude-* 대체 좌석이 required 에 들어오고 합성 status 에는 그 좌석이 없어
+        #   **항상 결손>0** → 이 단언이 FAIL → 뒤따르는 t9b(티켓 자동 요청 커버리지)가 통째로
+        #   실행되지 않았다. `javis_orchestra.check_verdicts`/`_shared_verdict_deficit` 이
+        #   이미 갖고 있는 주입 규약을 그대로 쓴다(미주입=실감지 — 프로덕션 거동 불변).
+        _yes = lambda ag, agents=None: (True, "테스트 주입")   # noqa: E731
+        _synth = {"gemini": {"cmd": "/x/agy"}, "codex": {"cmd": "/x/codex"},
+                  "claude": {"cmd": "claude"}}
+        _has, _why = _shared_verdict_deficit(_healthy, detect=_yes, agents=_synth)
         assert _has is False, "건강한 팀(생존추정 포함)을 결손>0 으로 오판: %s" % _why
         _grok_only = {"surfaces": [
             {"role": "reviewer-grok", "exited": False, "agent_alive": True},
             {"role": "cso-1", "exited": False, "agent_alive": True}]}
-        _has2, _why2 = _shared_verdict_deficit(_grok_only)
+        _has2, _why2 = _shared_verdict_deficit(_grok_only, detect=_yes, agents=_synth)
         assert _has2 is True, "grok·cso-1 좌석이 의무 슬롯을 채운 것으로 계상(G26 재발): %s" % _why2
+        # ★중대④ 회귀 핀: 주입 경로가 정본까지 **실제로 뚫려 있는가**. 막히면 깨끗한 기계에서
+        #   이 self-test 가 통째로 red 가 되고(위 단언이 먼저 죽는다) 뒤 커버리지가 안 돈다.
+        import inspect as _insp
+        try:
+            import javis_orchestra as _orch_pin
+            _sig = _insp.signature(_orch_pin._shared_verdict_deficit).parameters
+            assert "detect" in _sig and "agents" in _sig, \
+                "orchestra 정본이 detect/agents 주입을 받지 않는다 — 형제 소비자 밀폐 붕괴(중대④ 재발)"
+        except ImportError:
+            pass                                  # 구 팩 스큐 — 위임 래퍼가 폴백으로 흡수한다
+        assert "detect" in _insp.signature(_shared_verdict_deficit).parameters, \
+            "위임 래퍼가 주입을 전달하지 않는다(중대④ 재발)"
 
         # ── t6: 결손 구성 판정(R1-MED-1 순수 로직 — 총수 비교 폐기) ──
         full = {"cso": 1, "worker": 1, "reviewer": 2}
@@ -2832,6 +2892,26 @@ def cmd_self_test():
             "요청 push 명령 계약 이탈(--queued/--to master): %r" % (_tq_cmd,)
         assert "issue-ticket --dept %s" % _tq_dept in _tq_cmd[5], \
             "요청 문안에 발급 명령이 없다(수신자가 무엇을 해야 하는지 모른다): %r" % _tq_cmd[5]
+        # ⓐ′ ★부서명 규약 비대칭(2026-08-22 적대검증 중대③) — 생성기와 **같은 집합**인가.
+        #     리뷰어 재현 입력 그대로: 오너가 `Sales`·`dept_1` 로 만든 부서는 종전 발급 정규식
+        #     (`[a-z0-9][a-z0-9-]*`)이 거부해 **티켓을 영영 못 받았다**(결함 #1 잔존).
+        for _n in ("Sales", "dept_1", "dept-3", "a", "A9_x-y"):
+            assert dept_name_ok(_n), "생성기가 만드는 이름 %r 을 발급기가 거부한다(중대③ 재발)" % _n
+        for _n in ("", "-lead", "_x", "a/b", "a.b", "a b", "a" * 41):
+            assert not dept_name_ok(_n), "경로·형식 위험 이름 %r 을 발급기가 수용한다" % _n
+        # 생성기(cys-dept)와 문자 집합이 실제로 같은지 **소스 대조**(사본 드리프트 차단)
+        _cd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cys-dept")
+        if os.path.isfile(_cd):
+            with open(_cd, encoding="utf-8", errors="replace") as _f:
+                _cdsrc = _f.read()
+            assert "[A-Za-z0-9][A-Za-z0-9_-]{0,39}" in _cdsrc, \
+                "cys-dept::dept_name_ok 의 집합이 바뀌었다 — DEPT_NAME_RE 를 함께 고쳐라"
+            assert DEPT_NAME_RE.pattern == "[A-Za-z0-9][A-Za-z0-9_-]{0,39}", \
+                "DEPT_NAME_RE 가 생성기와 갈렸다(비대칭 재발): %r" % DEPT_NAME_RE.pattern
+        # ⓐ″ ★실패할 명령을 CEO 큐에 넣지 않는다(중대③ 후반) — 불량 이름은 요청 **미발사**
+        _bad_req, _bad_why = _request_dept_ticket("Bad/Name")
+        assert _bad_req is False and "발급 규약" in _bad_why, \
+            "발급기가 거부할 이름인데 CEO 큐에 요청을 넣었다(600s 주기 소음): %s" % _bad_why
         # ⓑ base 레인 env — 부서 소켓 상속 제거(`env -u CYS_SOCKET` 동형)
         _tq_env_backup = {k: os.environ.get(k) for k in
                           ("CYS_SOCKET", "CYS_SURFACE_ID", "CYS_SURFACE_REF")}
@@ -2896,7 +2976,12 @@ def cmd_self_test():
         if sys.platform == "darwin":
             _paths = [p for p, _ in _t]
             assert _paths, "darwin 에서 TCC 탐침 대상이 비었다(탐침 소멸)"
-            assert os.path.realpath(PACK) in _paths, "팩(실자원)이 탐침 대상에 없다"
+            # ★부재 팩 예외(2026-08-22): 이 단언은 "부재 경로는 탐침 대상에서 제외한다"는
+            #   `_tcc_probe_targets` 계약(및 바로 아래 isdir 단언)과 **정면으로 모순**이었다 —
+            #   팩이 아직 없는 격리 HOME(빈 HOME self-test·신규 설치 직전)에서 무조건 FAIL 했다.
+            #   실재할 때만 대상 포함을 요구한다(계약 위반 탐지력은 그대로).
+            if os.path.isdir(PACK):
+                assert os.path.realpath(PACK) in _paths, "팩(실자원)이 탐침 대상에 없다"
             assert all(os.path.isdir(p) for p in _paths), "부재 경로가 탐침 대상에 남았다"
             # 하드코딩된 Desktop 이 아니다 — Desktop 이 cwd·PACK 일 때만 우연히 포함될 수 있다
             _desk = os.path.realpath(os.path.join(HOME, "Desktop"))
@@ -2911,6 +2996,8 @@ def cmd_self_test():
         return 1
     print("javis_bootstrap self-test OK (★결함#2: CEO 티켓 자동 요청(명령 조립·base env 소켓 "
           "격리·멱등 TTL 4종·유계 대기 2종·단계 서수) · "
+          "★중대③ 부서명 규약 단일화(수용 5·거부 7·cys-dept 소스 대조·불량명 요청 미발사) · "
+          "★중대④ 로스터 밀폐 주입 관통(정본·래퍼 시그니처 핀 — 깨끗한 HOME green) · "
           "W6: 폴백 전제 판정 8종(부서 자동 생성 게이트) · "
           "W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
           "레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "

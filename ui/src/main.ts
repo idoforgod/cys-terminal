@@ -13,7 +13,7 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { classifyPendingFeed, CYCLE_VERIFY_NOTE, CYCLE_VERIFY_DISMISS_TITLE } from "./feedclass";
-import { deptPlaceholderLabel } from "./deptlabel";
+import { deptPlaceholderLabel, deptSlugOfSocket } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import {
   RESET_PHRASE,
@@ -1613,15 +1613,21 @@ const DEFAULT_SOCKET_KEY = ""; // Workspace.socket === undefined(기본 데몬)�
 // ★종전 otherSocketPending(기본 소켓을 뺀 **합계 하나**)을 이 함수가 흡수했다 — 합계는
 //   `deptPendingRows().reduce(...)` 로 그대로 나오고, 이제 **어느 부서인지**까지 함께 나온다.
 //   합계 성질(파생 아닌 직접 합 · 음수 불가 · 기본 데몬 목록 길이·갱신 시점과 무관)은 불변이다.
+// 부서 슬러그 표기(★F5)는 `deptlabel.ts` 의 순수 함수 `deptSlugOfSocket` 에 있다 — 이 파일
+// 관례대로 순수 계산은 사이드 모듈에 두고 여기서는 배선만 한다(deptlabel.test.ts 가 회귀 핀).
 type DeptPending = { socket: string; label: string; count: number };
 const deptPendingRows = (): DeptPending[] => {
   const rows: DeptPending[] = [];
   for (const [sock, cnt] of pendingBySocket) {
     if (sock === DEFAULT_SOCKET_KEY || cnt <= 0) continue;
-    // 라벨은 탭 이름(오너가 화면에서 부르는 이름). 탭이 없으면(레지스트리 잔재) socket 경로로 폴백 —
-    // 이름을 못 찾았다고 건수를 숨기면 '보이지 않는 대기'가 다시 생긴다.
-    const ws = workspaces.find((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === sock);
-    rows.push({ socket: sock, label: ws?.name ?? sock, count: cnt });
+    // 라벨은 탭 이름(오너가 화면에서 부르는 이름). 탭이 없으면(레지스트리 잔재) 부서 슬러그로
+    // 폴백 — 이름을 못 찾았다고 건수를 숨기면 '보이지 않는 대기'가 다시 생긴다.
+    // ★F6②: `pending`(부서 데몬 기동 중) 탭도 이름을 갖고 있다 — 제외하면 기동 중인 부서만
+    //   부제·라벨이 경로로 떨어져 식별이 나빠진다. 정상 탭을 우선하고 없으면 pending 을 쓴다.
+    const ws =
+      workspaces.find((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === sock) ??
+      workspaces.find((w) => (w.socket ?? DEFAULT_SOCKET_KEY) === sock);
+    rows.push({ socket: sock, label: ws?.name ?? deptSlugOfSocket(sock), count: cnt });
   }
   return rows.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 };
@@ -4250,19 +4256,38 @@ function renderOtherWorkspacePending(box: HTMLElement): number {
     title.textContent = `${r.label} — 대기 ${r.count}건`;
     const meta = document.createElement("div");
     meta.className = "fi-meta";
-    // 소켓 **전체 경로**는 길어 줄을 넘긴다(.fi-meta 에 word-break 없음) — 데몬 state
-    // 디렉터리명(= 부서 슬러그)만 보이고 전체 경로는 title 로 남긴다. 식별은 되게, 레이아웃은
-    // 안 깨지게. 구분자는 win/unix 둘 다 받는다(부서 소켓은 windows 에서 named pipe 경로).
-    meta.textContent = r.socket.split(/[\\/]/).filter(Boolean).slice(-2, -1)[0] ?? r.socket;
+    // 소켓 **전체 경로**는 길어 줄을 넘긴다(.fi-meta 에 word-break 없음) — 부서 슬러그만
+    // 보이고 전체 경로는 title 로 남긴다. 식별은 되게, 레이아웃은 안 깨지게.
+    meta.textContent = deptSlugOfSocket(r.socket);
     meta.title = r.socket;
+    // ★F6①: 이미 그 워크스페이스에 있으면 '이동'이 아니다 — 라벨이 실제 동작과 어긋나면
+    //   사용자는 눌러 보고 나서야 안다. 상태에 맞춰 문구를 바꾼다(동작은 둘 다 '패널 닫기'로
+    //   그 부서 pane 을 드러내는 것 — 이미 그 부서면 그게 유일하게 유용한 동작이다).
+    const activeSock = workspaces[activeWs] ? workspaces[activeWs].socket ?? DEFAULT_SOCKET_KEY : null;
+    const here = activeSock === r.socket;
     const go = document.createElement("button");
-    go.textContent = "이 부서로 이동";
-    go.title = "해당 워크스페이스로 전환합니다 — 승인은 그 pane 에서 직접 처리하세요.";
+    go.textContent = here ? "지금 이 부서 — 패널 닫기" : "이 부서로 이동";
+    go.title = here
+      ? "이미 이 부서 워크스페이스입니다 — 패널을 닫아 pane 을 봅니다(승인은 그 pane 에서 직접)."
+      : "해당 워크스페이스로 전환합니다 — 승인은 그 pane 에서 직접 처리하세요.";
     go.addEventListener("click", () => {
       // 전환에 성공하면 패널을 닫아 그 부서 pane 이 바로 보이게 한다(목록은 기본 데몬 것이라
       // 열어 둬도 내용이 바뀌지 않는다 — 열린 채면 '이동했는데 화면이 그대로'로 읽힌다).
-      if (switchToWorkspaceBySocket(r.socket)) setCcOpen(false);
-      else toast("feed", "이동 불가", `${r.label} 탭이 이미 닫혔습니다 — 부서를 다시 열어 주세요.`);
+      switch (switchToWorkspaceBySocket(r.socket)) {
+        case "switched":
+          setCcOpen(false);
+          break;
+        // ★F6②: **연결 중**(pending placeholder) 워크스페이스는 '닫힌 탭'이 아니다 —
+        //   종전엔 `!w.pending` 조건 때문에 "탭이 이미 닫혔습니다"로 오안내했다. 전환은
+        //   해 주되(그 탭이 준비 스피너를 보여준다) 상태를 사실대로 알린다.
+        case "pending":
+          setCcOpen(false);
+          toast("feed", "부서 데몬 준비 중", `${r.label} 워크스페이스로 이동했습니다 — 기동이 끝나면 pane 이 나타납니다.`);
+          break;
+        case "missing":
+          toast("feed", "이동 불가", `${r.label} 탭이 이미 닫혔습니다 — 부서를 다시 열어 주세요.`);
+          break;
+      }
     });
     row.append(title, meta, go);
     box.appendChild(row);
@@ -5130,18 +5155,26 @@ function jumpToSurface(sid: number, socket?: string) {
 }
 
 // ★#4-b: 부서 워크스페이스(socket)로 전환한다 — surface 를 특정하지 않는 판(jumpToSurface 형제).
-// 승인 Feed 의 '이 부서로 이동'이 쓴다. 대상 탭이 이미 닫혔으면(레지스트리 잔재) false 를 돌려
-// 호출부가 사실대로 알리게 한다 — 조용히 아무 일도 안 하면 '눌러도 안 되는 버튼'이 된다.
-function switchToWorkspaceBySocket(socket: string): boolean {
-  const i = workspaces.findIndex((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
-  if (i < 0) return false;
+// 승인 Feed 의 '이 부서로 이동'이 쓴다. 결과를 **세 갈래로 사실대로** 돌려 호출부가 오안내하지
+// 않게 한다 — 조용히 아무 일도 안 하거나 틀린 사유를 말하면 '눌러도 안 되는 버튼'이 된다.
+//   "switched" = 그 워크스페이스가 활성이다(이미 활성이었던 경우 포함 — 결과 상태가 같다)
+//   "pending"  = 부서 데몬 기동 중인 placeholder 로 전환했다(★F6② — '닫힌 탭'이 **아니다**)
+//   "missing"  = 그 socket 의 탭이 실제로 없다(레지스트리 잔재)
+function switchToWorkspaceBySocket(socket: string): "switched" | "pending" | "missing" {
+  // pending 도 후보에 넣는다 — 종전의 `!w.pending` 은 **연결 중** 부서를 '닫힌 탭'으로
+  // 오분류했다. 비-pending 을 우선 채택하고(정상 탭이 있으면 그쪽), 없으면 pending 을 쓴다.
+  let i = workspaces.findIndex((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
+  const pending = i < 0;
+  if (pending) i = workspaces.findIndex((w) => (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
+  if (i < 0) return "missing";
   if (i !== activeWs) {
     activeWs = i;
     render();
+    // pending placeholder 에는 pane 이 없다(collectSids=[]) — setFocus 는 자연히 생략된다.
     const first = collectSids(current().tree)[0];
     if (first != null) setFocus(first); // ws-tab mousedown 과 동일 2단계(전환 후 포커스)
   }
-  return true;
+  return pending ? "pending" : "switched";
 }
 
 // 60% cycle: hot 노드를 순차 점프(모듈 전역 cursor로 라운드로빈).

@@ -473,12 +473,30 @@ const ACL_ROLE_OWNER: &str = "owner";
 ///      토큰은 **그 데몬이 방금 발급한 비밀**이라 그런 변이가 없다. R4 가 이미 같은 신뢰
 ///      수준으로 배달 원장 면제를 걸고 있어 신뢰 모델도 추가되지 않는다.
 ///
-/// **fail-closed 2중 조건**:
+/// **판정 2조건**:
 ///   (a) 토큰 일치(부재·불일치·데몬 미발급 전부 false)
-///   (b) 발신자가 **어느 pane 에도 귀속되지 않을 것**(`from_sid.is_none()`). pane 이 토큰
-///       파일을 읽어 붙이더라도 등급은 오르지 않는다(R4 가 이 경우를 이미
-///       `delivery.operator_token_from_pane` 으로 감사한다).
-/// 판정 실패·불확실은 전부 external 강등이다 — 오탐으로 권한을 열지 않는다.
+///   (b) 발신자가 **이 데몬의 어느 pane 에도 귀속되지 않을 것**(`from_sid.is_none()`).
+///
+/// ★★(b)의 실제 의미를 정직하게 적는다 — 이것은 **방어가 아니다**(적대검증 F1, 2026-08-22).
+///   `from_sid` 는 `resolve_caller_surface` 가 **이 데몬 자신의 `surfaces` 표**로만 만든다.
+///   따라서 `from_sid.is_none()` 은 곧 `external` 의 정의 그 자체이며, `external→worker* deny`
+///   가 겨냥한 상대(base 데몬의 CEO·master, **타 부서 노드**)는 구조적으로 이 부서 데몬의
+///   pane 이 아니므로 (b)를 **자동으로 만족**한다. 그 노드가 `state_dir/operator.token` 을
+///   읽어(같은 UID면 읽힌다 — `state.rs::write_operator_token` doc 이 스스로 명시) raw RPC 로
+///   붙이면 이 함수는 true 를 돌려준다. (b)가 실제로 배제하는 것은 **이 데몬 자신의 pane** 뿐이다.
+///   ⇒ 종전 이 자리에 있던 "pane 이 토큰을 읽어 붙여도 승격되지 않는다"는 문장은 **거짓**이었다.
+///     그 데몬의 pane 에만 참이고 함대의 다른 모든 노드에는 거짓이다. 삭제했다.
+///
+/// ★★그래서 이 등급은 **보안 경계가 아니라 거버넌스 구분이다.**
+///   같은 UID 로 토큰 파일을 읽을 수 있는 프로세스는 — **다른 데몬의 노드를 포함해** — 이 등급을
+///   참칭할 수 있다. 이 등급이 실제로 닫는 것은 **지침을 따르는 정상 노드가 평시 동작으로 오너
+///   입력을 사칭하는 경로**다: 공용 `cys` CLI 는 어떤 경로에서도 두 토큰 키를 붙이지 않으므로
+///   (`grep -c 'owner_token\|operator_token' src/bin/cys.rs` = 0), 참칭에는 **의도적인 raw RPC
+///   작성**이 필요하다. 그 지점을 넘은 노드는 이미 ACL 이 아니라 다른 층위의 문제다.
+///   ⇒ 대신 승격은 **감사 가능**해야 한다: 판정을 뒤집은 승격은 `acl.owner_granted` 로 남는다
+///     (`check_send_acl` 본문 · 회귀 핀 `owner_promotion_that_flips_verdict_is_audited`).
+///
+/// 토큰 판정 실패·불확실은 전부 external 강등이다 — 오탐으로 권한을 열지 않는다.
 ///
 /// ★★키 분리(#6-b 잔여분 · 2026-08-22): 받는 키는 **둘**이고 의미가 다르다.
 ///   · `owner_token`(PARAM_OWNER_TOKEN) = **ACL 등급 전용** 신호. GUI 의 모든 pane 쓰기에
@@ -494,10 +512,8 @@ const ACL_ROLE_OWNER: &str = "owner";
 /// 논리곱에 의존한 안전**이다. 키를 분리하면 그 의존이 사라진다: 새 `operator_token` 소비자가
 /// 생겨도 machine_origin 주입은 그 키를 아예 갖고 있지 않다. (결함 7 재발 방지.)
 ///
-/// ★정직한 한계(OUT OF SCOPE · R4 와 동일): 암호학적 방어가 아니다. 동일 UID 프로세스는
-/// 토큰 파일을 읽어 raw RPC 로 붙일 수 있다(키를 나눠도 같은 비밀이라 방어 수준은 동일하다 —
-/// 키 분리의 목적은 위조 방어가 아니라 **면제 범위의 격리**다). 이 등급이 실제로 닫는 것은
-/// **평시 정상 동작**(CLI·워커 push·큐 배달·schedule 발화)이 오너 입력으로 승격되는 경로다.
+/// ★키를 나눠도 **위조 방어 수준은 동일하다**(같은 비밀이다) — 키 분리의 목적은 위조 방어가
+/// 아니라 오직 **면제 범위의 격리**다. 위 '거버넌스 구분' 문단이 이 등급의 유일한 정직한 경계다.
 fn caller_is_owner(daemon: &Daemon, params: &Value, from_sid: Option<u64>) -> bool {
     from_sid.is_none()
         && (daemon_token_matches(daemon, params, PARAM_OWNER_TOKEN)
@@ -602,9 +618,38 @@ fn check_send_acl(
     // "external → worker" 로 남아야 소비 스크립트·회귀 핀이 깨지지 않는다.
     let mut effective_role = from_role;
     let decision: Option<bool> = if caller_is_owner(daemon, params, from_sid) {
-        effective_role = ACL_ROLE_OWNER.to_string();
+        let owner_rule = eval_acl_rules(&acl, ACL_ROLE_OWNER, &to_role, true);
         // 오너의 default 는 `acl["default"]` 가 아니라 **허용**이다(위 ③).
-        Some(eval_acl_rules(&acl, ACL_ROLE_OWNER, &to_role, true).unwrap_or(true))
+        let allow = owner_rule.unwrap_or(true);
+        // ★F4(적대검증 2026-08-22) 승격 감사 — owner 등급은 **보안 경계가 아니라 거버넌스
+        //   구분**이라(caller_is_owner doc), 같은 UID 로 토큰을 읽은 타 데몬 노드도 이 등급을
+        //   참칭할 수 있다. 막을 수 없는 것은 **보이게** 한다 — 같은 파일이 더 약한 위협
+        //   (`delivery.operator_token_from_pane`)에 이미 세운 규율과 대칭을 맞춘다.
+        //   ★**판정을 뒤집은 승격만** 남긴다: 승격이 없었어도 허용됐을 발신(본부 레인의 평범한
+        //   타이핑 등)은 감사 가치가 0인데 키 조각마다 발생해 버스를 덮는다. 반대로 참칭 노드의
+        //   호출은 정의상 '원래 거부됐을 것'이라 반드시 걸린다. 반복은 조합별 60초 창으로 억제.
+        if allow {
+            let would_be = eval_acl_rules(&acl, &effective_role, &to_role, false)
+                .unwrap_or_else(|| acl["default"].as_str() != Some("deny"));
+            if !would_be
+                && !owner_grant_audit_seen(caller_pid, target.id, crate::state::now_epoch())
+            {
+                daemon.bus.publish(
+                    "acl.owner_granted",
+                    "system",
+                    Some(target.id),
+                    json!({"to_role": to_role, "denied_as_role": effective_role,
+                           "caller_pid": caller_pid, "explicit_owner_rule": owner_rule.is_some(),
+                           "note": "owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 \
+                                    아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 \
+                                    있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. \
+                                    공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 \
+                                    않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라."}),
+                );
+            }
+        }
+        effective_role = ACL_ROLE_OWNER.to_string();
+        Some(allow)
     } else {
         eval_acl_rules(&acl, &effective_role, &to_role, false)
     };
@@ -707,8 +752,54 @@ const PARAM_OWNER_TOKEN: &str = "owner_token";
 fn daemon_token_matches(daemon: &Daemon, params: &Value, key: &str) -> bool {
     param_str(params, key)
         .zip(daemon.operator_token.as_deref())
-        .map(|(t, d)| !d.is_empty() && t == d)
+        .map(|(t, d)| !d.is_empty() && ct_eq(&t, d))
         .unwrap_or(false)
+}
+
+/// ★F9(적대검증 2026-08-22) — 조기반환 없는 바이트 비교.
+/// 종전 `t == d` 는 첫 불일치에서 즉시 끊겨, ACL 응답 지연이 "토큰이 몇 바이트까지 맞았는가"의
+/// 오라클이 될 수 있었다. 길이는 비밀이 아니므로(발급값은 항상 32바이트 hex = 64자) 길이 불일치는
+/// 즉시 false 로 끊고, 길이가 같을 때만 전 바이트를 XOR 누적한다.
+///
+/// ★정직한 한계: 이것은 **하드닝된 상수시간 프리미티브가 아니다**(컴파일러·CPU 최적화를 막는
+/// 장치가 없다). 애초에 같은 UID 면 토큰 파일을 그냥 읽으면 되므로(`caller_is_owner` doc 참조)
+/// 타이밍 추출은 현실적 공격 경로가 아니다 — 값싼 비용으로 자명한 오라클만 없앤 것이다.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// ★F4(적대검증 2026-08-22) owner 승격 감사 억제창(초) — 같은 `(발신 pid, 대상 surface)` 조합의
+/// 반복 발행을 억제한다. 오너의 실제 타이핑은 키 조각마다 `send_text` 를 만들므로(`term.onData`)
+/// 억제가 없으면 이벤트 버스가 사람 타이핑으로 가득 차 **다른 감사 이벤트를 밀어낸다**
+/// (broadcast 용량 1024 · ring 유한). 참칭 노드의 **첫 호출**은 새 조합이라 언제나 즉시 남는다.
+const OWNER_GRANT_AUDIT_WINDOW_SECS: f64 = 60.0;
+
+/// 위 창 안에서 이미 남긴 조합인가(그리고 아니면 지금 것으로 등록한다).
+/// 프로세스 전역 1개 — 데몬은 프로세스당 하나다(테스트는 조합이 겹치지 않게 pid 를 나눠 쓴다).
+/// 매 호출 만료 회수로 무한 성장을 막는다(`caller_cache` 관례 동형).
+fn owner_grant_audit_seen(caller_pid: Option<u32>, target: u64, now: f64) -> bool {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, u64), f64>>,
+    > = std::sync::OnceLock::new();
+    let mut g = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    g.retain(|_, ts| now - *ts < OWNER_GRANT_AUDIT_WINDOW_SECS);
+    let key = (caller_pid.unwrap_or(0), target);
+    if g.contains_key(&key) {
+        return true;
+    }
+    g.insert(key, now);
+    false
 }
 
 /// T3-13 타이핑 가드 창 (초). 0 = 비활성.
@@ -5701,9 +5792,15 @@ mod tests {
 
     /// ★결함#6-b(2026-08-22 오너 실측) — `owner` 신원 등급 판정 매트릭스(순수부).
     ///
-    /// 판정 근거는 `operator_token`(데몬이 기동 시 발급·0600·Tauri 백엔드 단독 첨부)이며
-    /// **2중 fail-closed**다: 토큰 일치 ∧ 발신자가 어느 pane 에도 귀속되지 않을 것.
-    /// 어느 한쪽이라도 불확실하면 external 로 강등한다 — 오탐으로 권한을 열지 않는다.
+    /// 판정 2조건: 토큰 일치 ∧ `from_sid.is_none()`(= **이 데몬**의 어느 pane 에도 미귀속).
+    /// 토큰 판정이 불확실하면 external 로 강등한다 — 오탐으로 권한을 열지 않는다.
+    ///
+    /// ★두 번째 조건의 사정거리를 오해하지 말 것(적대검증 F1): 이것은 **방어가 아니다**.
+    /// `from_sid` 는 이 데몬 자신의 surfaces 표로만 만들어지므로, 배제되는 것은 **이 데몬의
+    /// pane** 뿐이다. 타 데몬(base·다른 부서)의 노드는 구조적으로 이 조건을 자동 통과하며,
+    /// 같은 UID 로 `operator.token` 을 읽어 raw RPC 로 붙이면 승격된다. 아래 ⑤⑧이 박제하는
+    /// 것은 **그 사정거리 안의 동작**이지 참칭 불가 주장이 아니다(정직한 경계는
+    /// `caller_is_owner` doc · 참칭의 가시화는 `acl.owner_granted` 감사 이벤트).
     #[test]
     fn owner_grade_needs_matching_token_and_no_pane_binding() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
@@ -5728,11 +5825,12 @@ mod tests {
         assert!(!caller_is_owner(&daemon, &json!({}), None));
         // ④ 빈 토큰 → 강등
         assert!(!caller_is_owner(&daemon, &json!({ "operator_token": "" }), None));
-        // ⑤ ★토큰이 맞아도 **pane 에 귀속된** 발신자는 승격 불가 — pane 이 0600 토큰 파일을
-        //    읽어 붙이더라도 등급은 오르지 않는다(R4 가 이 경우를 감사로 다루는 그 경계).
+        // ⑤ **이 데몬의** pane 에 귀속된 발신자는 토큰이 맞아도 승격되지 않는다.
+        //    ★사정거리 주의: 타 데몬 노드는 애초에 from_sid=None 이라 이 조건에 걸리지 않는다
+        //    (F1 — 이 조건은 방어가 아니라 자기 pane 한정 구분이다).
         assert!(
             !caller_is_owner(&daemon, &json!({ "operator_token": tok }), Some(7)),
-            "pane 귀속 발신자가 토큰만으로 owner 로 승격됐다 — 권한 상승"
+            "이 데몬의 pane 귀속 발신자가 owner 로 승격됐다"
         );
 
         // ── 키 분리(#6-b 잔여분): ACL 등급 전용 키 `owner_token` 도 같은 매트릭스를 따른다 ──
@@ -5743,10 +5841,10 @@ mod tests {
         );
         // ⑦ owner_token 불일치 → 강등
         assert!(!caller_is_owner(&daemon, &json!({ "owner_token": "nope" }), None));
-        // ⑧ owner_token 이 맞아도 pane 귀속이면 승격 금지(2중 조건은 키와 무관하게 유지)
+        // ⑧ owner_token 이 맞아도 **이 데몬의** pane 귀속이면 승격 금지(조건이 키마다 갈라지지 않음)
         assert!(
             !caller_is_owner(&daemon, &json!({ "owner_token": tok }), Some(7)),
-            "owner_token 으로 pane 이 승격됐다 — 2중 조건이 키마다 갈라졌다"
+            "owner_token 으로 이 데몬의 pane 이 승격됐다 — 판정 2조건이 키마다 갈라졌다"
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
@@ -5941,9 +6039,9 @@ mod tests {
             .lock()
             .unwrap()
             .insert(ext_pid, (None, crate::state::now_epoch(), None));
-        // pane 에 귀속된 발신자(리뷰어) — ⓒ 용. **토큰을 제대로 들고 있어도** 승격되면 안 된다:
-        // reviewer-*→worker* deny 는 리뷰어가 워커를 직접 조향하지 못하게 하는 규칙이고,
-        // 토큰 파일은 같은 UID 면 읽을 수 있으므로 여기가 실제 권한 상승 경로다.
+        // pane 에 귀속된 발신자(리뷰어) — ⓒ 용. **이 데몬의** pane 이므로 토큰을 제대로 들고
+        // 있어도 승격되지 않는다(reviewer-*→worker* deny 유지). ★이것이 참칭 전반을 막는다는
+        // 뜻은 아니다 — 타 데몬 노드는 from_sid=None 이라 이 경로에 오지 않는다(F1).
         let reviewer = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("reviewer-gemini".into()), 24, 80)
             .expect("create reviewer surface");
@@ -6173,6 +6271,142 @@ mod tests {
             json!("acl_denied"),
             "오너 기본 허용이 비-오너에게 새어 나갔다 ({r4})"
         );
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★F4 회귀 핀(적대검증 2026-08-22) — **판정을 뒤집은 owner 승격은 감사 이벤트로 남는다.**
+    ///
+    /// owner 등급은 보안 경계가 아니라 거버넌스 구분이라(`caller_is_owner` doc), 같은 UID 로
+    /// `operator.token` 을 읽은 **타 데몬 노드**도 참칭할 수 있다. 막을 수 없는 것은 보이게 한다 —
+    /// 승격이 없었다면 거부됐을 발신은 `acl.owner_granted` 로 남아야 하고, 남지 않으면 참칭은
+    /// **사후 추적이 불가능**해진다(허용 경로라 `acl.denied` 도 없고 원장 레코드도 평범한
+    /// external send 와 구별되지 않는다).
+    #[test]
+    fn owner_promotion_that_flips_verdict_is_audited() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // owner 규칙이 **없는** ACL — 기본 허용으로 승격되며, 승격이 없었다면 external→worker deny.
+        let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
+        let (daemon, dir) = daemon_with_acl("owner-audit", acl);
+        let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
+
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(worker.id, worker.clone());
+        // 본부 master 대역 — 이 데몬 입장에서 '자기 pane 이 아닌 발신자'(= 참칭 노드와 동형).
+        let usurper_pid = 999_131_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(usurper_pid, (None, crate::state::now_epoch(), None));
+
+        let before = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": worker.id, "text": "x\n", "owner_token": tok }),
+            },
+            Some(usurper_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "전제: 승격으로 허용돼야 한다 ({resp})");
+
+        let ev = daemon
+            .bus
+            .replay_after(before)
+            .into_iter()
+            .find(|e| e["name"] == json!("acl.owner_granted"))
+            .expect("★판정을 뒤집은 owner 승격이 감사에 남지 않았다 — 참칭 사후추적 불가");
+        assert_eq!(ev["payload"]["caller_pid"], json!(usurper_pid), "{ev}");
+        assert_eq!(ev["payload"]["to_role"], json!("worker-1"), "{ev}");
+        assert_eq!(ev["payload"]["denied_as_role"], json!("external"), "{ev}");
+        assert_eq!(
+            ev["payload"]["explicit_owner_rule"],
+            json!(false),
+            "명시 owner 규칙 없이 기본 허용으로 승격됐음이 페이로드에 드러나야 한다 ({ev})"
+        );
+
+        // ★억제창: 같은 (pid, surface) 반복은 버스를 덮지 않는다(오너 타이핑은 키 조각마다 온다).
+        let before2 = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        for n in 2..=4 {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(n),
+                    method: "surface.send_text".into(),
+                    params: json!({ "surface_id": worker.id, "text": "y\n", "owner_token": tok }),
+                },
+                Some(usurper_pid),
+            ) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(r["ok"], json!(true));
+        }
+        assert!(
+            !daemon
+                .bus
+                .replay_after(before2)
+                .iter()
+                .any(|e| e["name"] == json!("acl.owner_granted")),
+            "억제창이 동작하지 않는다 — 오너 타이핑이 감사 버스를 덮어 다른 이벤트를 밀어낸다"
+        );
+
+        // 대조군: 승격이 **판정을 바꾸지 않는** 발신(대상이 master — external→master 규칙 없음
+        // → 원래도 default allow)은 감사를 남기지 않는다(감사 가치 0 · 노이즈 차단).
+        let master = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create master surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(master.id, master.clone());
+        let before3 = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        let Reply::Single(rm) = dispatch(
+            &daemon,
+            Request {
+                id: json!(9),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": master.id, "text": "z\n", "owner_token": tok }),
+            },
+            Some(usurper_pid),
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(rm["ok"], json!(true));
+        assert!(
+            !daemon
+                .bus
+                .replay_after(before3)
+                .iter()
+                .any(|e| e["name"] == json!("acl.owner_granted")),
+            "판정을 바꾸지 않은 승격까지 감사에 남는다 — 노이즈로 실제 참칭 신호가 묻힌다"
+        );
+
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
