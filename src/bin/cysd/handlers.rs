@@ -8328,7 +8328,13 @@ mod tests {
     /// ★B2 무블로킹 계약 박제(0.14.24): 최소 간격은 **writer 스레드**가 자면서 확보한다 —
     /// 핸들러(tokio 워커)는 절대 자면 안 된다. 핸들러가 자면 간격 하나가 데몬 전체의 RPC
     /// 처리량을 갉고, 동시에 여러 pane 이 제출되면 워커 풀이 통째로 멈춘다.
-    /// 검사: 3초 간격을 걸고 주입 직후 Return 을 쏴도 **응답은 즉시** 와야 한다(＜0.5초).
+    /// 검사: 3초 간격을 걸고 Return 을 쏴도 **응답은 즉시** 와야 한다(＜0.5초 — 블로킹이면
+    /// 3000ms 가 걸리므로 상한과 6배 벌어져 있다. agy R2-③ 상한 점검 기준 충족).
+    ///
+    /// ★B2″ 분기 축 정정: 종전 이 테스트는 `last_injected` 를 심어 두 경로를 가르는 것처럼
+    /// 적혀 있었지만, B2′ 이후 **핸들러는 `last_injected` 를 읽지 않는다**(잔여 계산이
+    /// writer 로 갔다 — `submit_gap_for_key` 시그니처에 그 인자가 없다). 그래서 실제로 존재
+    /// 하는 두 경로인 **간격 무장(3000) / 비활성(0)** 으로 축을 바로잡았다.
     #[test]
     fn send_key_return_delegates_the_gap_to_the_writer_not_the_handler() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
@@ -8358,8 +8364,7 @@ mod tests {
         let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
         std::env::set_var("CYS_CR_MIN_GAP_MS", "3000"); // 과장된 간격 — 블로킹이면 즉시 드러난다
 
-        // ① 프로그램 주입 직후 = 지연 대상. 응답은 그래도 즉시 와야 한다.
-        *target.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+        // ① 간격 무장(SubmitAfterGap 경로). 잠자는 것은 writer 이므로 응답은 즉시 와야 한다.
         let (resp, took) = send_return();
         assert_eq!(resp["ok"], json!(true), "지연 경로에서 send_key 가 실패했다 (응답: {resp})");
         assert!(
@@ -8367,8 +8372,8 @@ mod tests {
             "핸들러가 최소 간격만큼 블로킹했다 ({took:?}) — 지연은 writer 스레드 몫이다"
         );
 
-        // ② 주입 관측값 없음 = 종전 경로(무지연). 역시 즉시 성공해야 한다(무회귀).
-        *target.last_injected.lock().unwrap() = None;
+        // ② 비활성(Data 경로 · 종전 동작). 역시 즉시 성공해야 한다(무회귀).
+        std::env::set_var("CYS_CR_MIN_GAP_MS", "0");
         let (resp, took) = send_return();
         assert_eq!(resp["ok"], json!(true), "무지연 경로가 깨졌다 (응답: {resp})");
         assert!(took < std::time::Duration::from_millis(500), "무지연 경로가 느리다 ({took:?})");

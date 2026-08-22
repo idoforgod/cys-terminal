@@ -3290,7 +3290,15 @@ pub(crate) fn run_writer_loop<W: Write>(
                 {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                 }
-                writer.write_all(&bytes).and_then(|_| writer.flush())
+                let r = writer.write_all(&bytes).and_then(|_| writer.flush());
+                // ★B2″(agy 감사 R2-②): 쓴 CR **자신도** 기준점이 된다. 그러지 않으면 연속
+                // 제출 Return 이 서로 0ms 간격으로 뭉쳐 나가 두 번째 이후가 붙여넣기 처리
+                // 창에 다시 삼켜진다(CR→CR 간격도 min_gap 보장). 실패한 write 는 갱신하지
+                // 않는다 — Program arm 과 같은 규율(화면에 없는 바이트를 기준 삼지 않는다).
+                if r.is_ok() {
+                    last_program_write = Some(std::time::Instant::now());
+                }
+                r
             }
             WriteReq::Inject {
                 text,
@@ -3311,10 +3319,13 @@ pub(crate) fn run_writer_loop<W: Write>(
             .and_then(|_| writer.flush())
             .map(|_| std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms)))
             .and_then(|_| writer.write_all(b"\r"))
-            .and_then(|_| writer.flush())
-            // ★B2′: Inject 는 본문+CR 을 이미 한 단위로 넣었다. 기준점을 찍어 두면 뒤이어 온
-            // 제출 Return(중복 Enter)이 최소 간격만큼 떨어져 들어가 빈 줄 폭주를 막는다.
-            .inspect(|_| last_program_write = Some(std::time::Instant::now())),
+            .and_then(|_| writer.flush()),
+            // ★B2″(agy 감사 R2-①): Inject 는 기준점을 **찍지 않는다**. 이 arm 은 자체
+            // cr_delay_ms(기본 400)를 두고 본문→CR 까지 원자로 보내므로, 뒤따라 오는 제출
+            // Return 은 이미 ≥400ms 떨어져 있다 = 최소 간격(150ms)이 보호할 것이 없다.
+            // 그런데도 앵커를 찍으면 큐 배달 직후의 중복 Enter 만 최대 150ms 늦어진다 —
+            // 종전에 없던 지연을 아무 이득 없이 새로 만드는 것이다(B2′ 에서 잘못 넣었다).
+            // 기준점은 `Program` 본문과 `SubmitAfterGap` 이 쓴 CR 에만 찍힌다.
         };
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다
@@ -4402,16 +4413,41 @@ mod tests {
         assert_eq!(buf0.lock().unwrap().clone(), b"\r".to_vec());
     }
 
+    type WriteLog = Arc<Mutex<Vec<(std::time::Instant, Vec<u8>)>>>;
+
     /// ★B2′ 테스트 보조 — 각 write 의 **시각과 바이트**를 함께 기록한다. 종전 SharedBuf 는
     /// 바이트만 모아서 '순서'는 볼 수 있어도 두 write 사이의 **시간**은 볼 수 없었다. codex
     /// 감사 R1 이 짚은 결함이 바로 그 시간 축에 있었으므로, 그 축을 관측 가능하게 만든다.
-    struct TimedBuf(Arc<Mutex<Vec<(std::time::Instant, Vec<u8>)>>>);
+    ///
+    /// ★B2″(agy 감사 R2-③): 여기에 **신호**를 얹었다. 특정 바이트열이 써지는 **순간** 테스트
+    /// 스레드를 깨워, 종전처럼 `sleep(200)` 으로 "그쯤이면 써졌겠지" 를 추측하지 않게 한다.
+    /// 추측한 대기는 부하가 걸린 CI 에서 그대로 flaky 가 된다 — 사건을 기다려야 한다.
+    struct TimedBuf {
+        log: WriteLog,
+        /// (기다릴 바이트열, 그 write 시각을 흘려보낼 채널) — try_send 라 writer 는 막히지 않는다.
+        notify: Option<(Vec<u8>, std::sync::mpsc::SyncSender<std::time::Instant>)>,
+    }
+    impl TimedBuf {
+        fn new(log: &WriteLog) -> Self {
+            Self { log: Arc::clone(log), notify: None }
+        }
+        fn notifying(
+            log: &WriteLog,
+            needle: &[u8],
+            tx: std::sync::mpsc::SyncSender<std::time::Instant>,
+        ) -> Self {
+            Self { log: Arc::clone(log), notify: Some((needle.to_vec(), tx)) }
+        }
+    }
     impl std::io::Write for TimedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((std::time::Instant::now(), buf.to_vec()));
+            let now = std::time::Instant::now();
+            self.log.lock().unwrap().push((now, buf.to_vec()));
+            if let Some((needle, tx)) = &self.notify {
+                if needle.as_slice() == buf {
+                    let _ = tx.try_send(now); // 수신자가 없거나 이미 찼으면 조용히 버린다
+                }
+            }
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -4419,16 +4455,18 @@ mod tests {
         }
     }
 
-    /// 기록에서 특정 바이트열이 처음 써진 시각을 찾는다(없으면 패닉 — 테스트 전제 위반).
-    fn write_time(
+    /// 기록에서 특정 바이트열이 **n 번째**로 써진 시각(0-기반). 없으면 패닉 — 테스트 전제 위반.
+    fn nth_write_time(
         log: &[(std::time::Instant, Vec<u8>)],
         needle: &[u8],
+        n: usize,
     ) -> std::time::Instant {
         log.iter()
-            .find(|(_, b)| b.as_slice() == needle)
+            .filter(|(_, b)| b.as_slice() == needle)
+            .nth(n)
             .unwrap_or_else(|| {
                 panic!(
-                    "기대한 write 가 없다: {:?} (기록: {:?})",
+                    "기대한 write 가 없다: {:?} #{n} (기록: {:?})",
                     String::from_utf8_lossy(needle),
                     log.iter()
                         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
@@ -4436,6 +4474,14 @@ mod tests {
                 )
             })
             .0
+    }
+
+    /// 기록에서 특정 바이트열이 **처음** 써진 시각.
+    fn write_time(
+        log: &[(std::time::Instant, Vec<u8>)],
+        needle: &[u8],
+    ) -> std::time::Instant {
+        nth_write_time(log, needle, 0)
     }
 
     /// ★B2′ 핵심 회귀 핀(codex 감사 R1 — 적체 경로 붕괴).
@@ -4457,10 +4503,10 @@ mod tests {
         const GAP_MS: u64 = 150;
 
         // ── 신 구현: SubmitAfterGap(writer 실기록 시각 기준) ──────────────
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = sync_channel::<WriteReq>(8);
         let stop = Arc::new(AtomicBool::new(false));
-        let w = TimedBuf(Arc::clone(&log));
+        let w = TimedBuf::new(&log);
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         // ① 적체 — writer 가 300ms 동안 이 요청에 붙들린다(선행 큐 시뮬레이션).
         tx.send(WriteReq::DataAfter { bytes: b"X".to_vec(), delay_ms: 300 })
@@ -4490,45 +4536,148 @@ mod tests {
         );
 
         // ── 부정 대조: 구 구현이 같은 상황에서 만들어내던 산출물 ───────────
-        //    종전 B2 의 핸들러는 '본문 enqueue 후 200ms 경과 ≥ 150ms' 로 보고 **무지연
-        //    Data** 를 냈다. 그 요청열을 그대로 흘려 보내면 간격이 실제로 무너짐을 남긴다 —
-        //    이 대조가 있어야 위 단정이 '우연한 통과'가 아님이 기계로 증명된다.
-        let log_old = Arc::new(Mutex::new(Vec::new()));
+        //    종전 B2 의 핸들러는 '본문 enqueue 후 150ms 경과' 로 보고 **무지연 Data** 를 냈다.
+        //    그 요청열을 그대로 흘려 보내면 간격이 실제로 무너짐을 남긴다 — 이 대조가 있어야
+        //    위 단정이 '우연한 통과'가 아님이 드러난다.
+        //
+        //    ★B2″(agy 감사 R2-③) flaky 제거: 종전엔 `sleep(200)` 으로 "그쯤이면 BODY 가
+        //    써졌겠지" 를 **추측**했다. 부하가 걸리면 그 추측이 틀어져 대조가 거짓 실패한다.
+        //    이제 TimedBuf 가 BODY 를 쓰는 **순간** 신호를 보내고, 그 신호를 받자마자 투입한다.
+        //    그리고 이 대조는 **CI 의 필수 게이트가 아니다** — 기계가 한가할 때의 재현이다.
+        //    스케줄러 기아로 반응이 늦었으면(>100ms) 단정하지 않고 건너뛴다(양성 단정은
+        //    sleep 하한이라 결정론이므로 그대로 게이트로 남는다).
+        const REACT_BUDGET_MS: u64 = 100;
+        let log_old: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let (sig_tx, sig_rx) = sync_channel::<std::time::Instant>(1);
         let (tx2, rx2) = sync_channel::<WriteReq>(8);
         let stop2 = Arc::new(AtomicBool::new(false));
-        let w2 = TimedBuf(Arc::clone(&log_old));
+        let w2 = TimedBuf::notifying(&log_old, b"BODY", sig_tx);
         let h2 = std::thread::spawn(move || run_writer_loop(w2, rx2, stop2));
         tx2.send(WriteReq::DataAfter { bytes: b"X".to_vec(), delay_ms: 300 })
             .unwrap();
         tx2.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // BODY 가 **실제로 써질 때까지** 블로킹 대기 — 추측 sleep 을 사건 대기로 바꾼다.
+        let t_body_signal = sig_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("BODY write 신호가 오지 않았다 — 적체 시뮬레이션 전제 붕괴");
         tx2.send(WriteReq::Data(b"\r".to_vec())).unwrap(); // ← 구 구현의 산출물
+        let t_inject = std::time::Instant::now();
         drop(tx2);
         h2.join().ok();
 
         let log_old = log_old.lock().unwrap().clone();
         let gap_old = write_time(&log_old, b"\r").duration_since(write_time(&log_old, b"BODY"));
+        let react = t_inject.duration_since(t_body_signal);
+        if react >= std::time::Duration::from_millis(REACT_BUDGET_MS)
+            || gap_old >= std::time::Duration::from_millis(REACT_BUDGET_MS)
+        {
+            eprintln!(
+                "[skip] 부정 대조 건너뜀 — 스케줄러 기아(신호→투입 {react:?}, 본문↔CR {gap_old:?} \
+                 > {REACT_BUDGET_MS}ms). 대조는 한가할 때의 재현이지 게이트가 아니다."
+            );
+        } else {
+            assert!(
+                gap_old < std::time::Duration::from_millis(GAP_MS),
+                "부정 대조가 성립하지 않는다 — 무지연 Data 인데 간격이 {gap_old:?} 나왔다. \
+                 적체 시뮬레이션이 의도대로 동작하지 않았다는 뜻이므로 위 단정도 신뢰할 수 없다"
+            );
+        }
+    }
+
+    /// ★B2″(agy 감사 R2-①) `Inject` 는 기준점을 찍지 **않는다**.
+    ///
+    /// Inject 는 자체 cr_delay_ms 뒤 본문→CR 까지 원자로 보낸다. 뒤따르는 제출 Return 은
+    /// 이미 그만큼(기본 400ms) 떨어져 있으므로 최소 간격이 보호할 것이 없다. 그런데도 앵커를
+    /// 찍으면 큐 배달 직후의 **중복 Enter 만** 아무 이득 없이 늦어진다(B2′ 에서 잘못 넣었다).
+    /// 상한 단정은 R2-③ 기준을 따른다 — 간격 2000ms 를 걸고 상한 1000ms 로 '수면 없음'만 본다.
+    #[test]
+    fn inject_does_not_become_a_submit_gap_anchor() {
+        use std::sync::mpsc::sync_channel;
+        const GAP_MS: u64 = 2000;
+        const CEILING_MS: u64 = 1000;
+        let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = TimedBuf::new(&log);
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false })
+            .unwrap();
+        let t_enqueue = std::time::Instant::now();
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            .unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let log = log.lock().unwrap().clone();
+        // CR 이 둘이다: #0 = Inject 가 넣은 제출 CR, #1 = 뒤이은 SubmitAfterGap 의 CR.
+        let took = nth_write_time(&log, b"\r", 1).duration_since(t_enqueue);
         assert!(
-            gap_old < std::time::Duration::from_millis(GAP_MS),
-            "부정 대조가 성립하지 않는다 — 무지연 Data 인데 간격이 {gap_old:?} 나왔다. \
-             적체 시뮬레이션이 의도대로 동작하지 않았다는 뜻이므로 위 단정도 신뢰할 수 없다"
+            took < std::time::Duration::from_millis(CEILING_MS),
+            "Inject 뒤 제출 Return 이 {took:?} 늦춰졌다(≥{GAP_MS}ms 수면 발생) — Inject 가 \
+             기준점을 찍고 있다. 큐 배달 직후 중복 Enter 만 이유 없이 느려진다"
+        );
+    }
+
+    /// ★B2″(agy 감사 R2-④) 연속 제출 Return 간격 — CR 자신도 기준점이므로 두 번째 Return 이
+    /// 첫 번째와 붙어 나가지 않는다. 붙어 나가면 두 번째가 붙여넣기 처리 창에 다시 삼켜진다.
+    /// 하한 단정이라 결정론이다(sleep 은 "적어도" 를 보장한다).
+    #[test]
+    fn consecutive_submits_keep_the_gap_between_returns() {
+        use std::sync::mpsc::sync_channel;
+        const GAP_MS: u64 = 150;
+        let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = TimedBuf::new(&log);
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+        for _ in 0..2 {
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+                .unwrap();
+        }
+        drop(tx);
+        handle.join().ok();
+
+        let log = log.lock().unwrap().clone();
+        let flat: Vec<u8> = log.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(flat, b"BODY\r\r".to_vec(), "순서/개수가 어긋났다");
+        let t_body = write_time(&log, b"BODY");
+        let t_cr1 = nth_write_time(&log, b"\r", 0);
+        let t_cr2 = nth_write_time(&log, b"\r", 1);
+        let gap1 = t_cr1.duration_since(t_body);
+        let gap2 = t_cr2.duration_since(t_cr1);
+        assert!(
+            gap1 >= std::time::Duration::from_millis(GAP_MS),
+            "본문↔첫 CR 간격 {gap1:?} < {GAP_MS}ms"
+        );
+        assert!(
+            gap2 >= std::time::Duration::from_millis(GAP_MS),
+            "CR↔CR 간격 {gap2:?} < {GAP_MS}ms — 연속 제출 Return 이 뭉쳐 나간다(쓴 CR 이 \
+             기준점을 갱신하지 않는다는 뜻)"
         );
     }
 
     /// ★B2′: 이 writer 가 프로그램 본문을 쓴 적이 없으면 늦출 근거가 없다 → 즉시 쓴다.
     /// (사람만 타이핑하던 pane 에 온 Return 이 공연히 늦어지면 대화가 굼떠진다.)
+    ///
+    /// ★B2″(agy 감사 R2-③) 상한 단정 robust 화: 종전은 `min_gap 150 · 상한 100ms` 라 여유가
+    /// 50ms 뿐이었다 — 부하가 걸린 CI 에서 스케줄링 잡음만으로 거짓 실패한다. 이제 간격을
+    /// **2000ms** 로 키우고 상한을 **1000ms** 로 둔다. 증명하려는 명제는 "빠르다"가 아니라
+    /// **"2초 수면이 일어나지 않았다"** 이고, 그 명제에는 1초의 잡음 여유가 붙는다.
     #[test]
     fn submit_after_gap_is_immediate_without_a_preceding_program_write() {
         use std::sync::mpsc::sync_channel;
-        let log = Arc::new(Mutex::new(Vec::new()));
+        const GAP_MS: u64 = 2000; // 수면이 일어났다면 반드시 이만큼 걸린다
+        const CEILING_MS: u64 = 1000; // 수면이 없었음을 판정하는 상한(잡음 여유 1초)
+        let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = sync_channel::<WriteReq>(4);
         let stop = Arc::new(AtomicBool::new(false));
-        let w = TimedBuf(Arc::clone(&log));
+        let w = TimedBuf::new(&log);
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         // 사람 키(Data)는 기준점을 찍지 않는다 — Program 이 아니므로 여전히 '본문 없음'이다.
         tx.send(WriteReq::Data(b"typed".to_vec())).unwrap();
         let t0 = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 150 })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -4536,9 +4685,9 @@ mod tests {
         let log = log.lock().unwrap().clone();
         let took = write_time(&log, b"\r").duration_since(t0);
         assert!(
-            took < std::time::Duration::from_millis(100),
-            "프로그램 본문이 선행하지 않았는데 CR 이 늦춰졌다({took:?}) — 사람 키(Data)가 \
-             기준점을 찍고 있다는 뜻이다(Program 과 Data 의 분리 붕괴)"
+            took < std::time::Duration::from_millis(CEILING_MS),
+            "프로그램 본문이 선행하지 않았는데 CR 이 {took:?} 늦춰졌다(≥{GAP_MS}ms 수면 발생) — \
+             사람 키(Data)가 기준점을 찍고 있다는 뜻이다(Program 과 Data 의 분리 붕괴)"
         );
     }
 
@@ -4551,10 +4700,10 @@ mod tests {
         const GAP_MS: u64 = 150;
         // (테스트 이름, 본문 write 뒤 CR 을 넣기까지 테스트 스레드가 기다릴 시간)
         for (why, wait_ms) in [("갓 쓴 직후", 0u64), ("부분 경과(50ms)", 50)] {
-            let log = Arc::new(Mutex::new(Vec::new()));
+            let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
             let (tx, rx) = sync_channel::<WriteReq>(4);
             let stop = Arc::new(AtomicBool::new(false));
-            let w = TimedBuf(Arc::clone(&log));
+            let w = TimedBuf::new(&log);
             let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
             tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
@@ -4572,25 +4721,35 @@ mod tests {
         }
 
         // 이미 min_gap 을 넘긴 뒤 → 추가 대기 없이 즉시(과잉 지연 금지).
-        let log = Arc::new(Mutex::new(Vec::new()));
+        // ★B2″(agy 감사 R2-③) 상한 단정 robust 화: 상한이 min_gap 보다 **충분히 작아야**
+        //   '수면 없음'이 증명된다. 종전 `min_gap 150 · sleep 200 · 상한 100ms` 는 여유가
+        //   50ms 뿐이었다. 이제 `min_gap 400 · 선행 sleep 500 · 상한 300ms` — 잘못 잤다면
+        //   최대 400ms 가 걸리므로 300ms 상한에 반드시 걸리고, 정상 경로에는 300ms 의
+        //   스케줄링 잡음 여유가 생긴다.
+        const OVERWAIT_GAP_MS: u64 = 400;
+        const OVERWAIT_CEILING_MS: u64 = 300;
+        let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = sync_channel::<WriteReq>(4);
         let stop = Arc::new(AtomicBool::new(false));
-        let w = TimedBuf(Arc::clone(&log));
+        let w = TimedBuf::new(&log);
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200)); // > GAP_MS
+        std::thread::sleep(std::time::Duration::from_millis(500)); // > OVERWAIT_GAP_MS
         let t_enqueue = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
-            .unwrap();
+        tx.send(WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: OVERWAIT_GAP_MS,
+        })
+        .unwrap();
         drop(tx);
         handle.join().ok();
 
         let log = log.lock().unwrap().clone();
         let took = write_time(&log, b"\r").duration_since(t_enqueue);
         assert!(
-            took < std::time::Duration::from_millis(100),
-            "이미 {GAP_MS}ms 가 지났는데 CR 이 또 {took:?} 늦춰졌다 — 하한이어야 할 간격이 \
-             상한처럼 동작한다(모든 제출이 매번 느려진다)"
+            took < std::time::Duration::from_millis(OVERWAIT_CEILING_MS),
+            "이미 {OVERWAIT_GAP_MS}ms 가 지났는데 CR 이 또 {took:?} 늦춰졌다 — 하한이어야 할 \
+             간격이 상한처럼 동작한다(모든 제출이 매번 느려진다)"
         );
     }
 
