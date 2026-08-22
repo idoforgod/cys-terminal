@@ -8212,6 +8212,10 @@ mod tests {
     /// 넓게 늦추면 대화형 응답이 갉이고, 좁게 늦추면 붙여넣기 창에 CR 이 다시 삼켜진다.
     #[test]
     fn cr_gap_delay_only_delays_submit_keys_inside_the_window() {
+        // ★master 병합 수정: 이 테스트는 CYS_CR_MIN_GAP_MS 환경변수를 바꾼다 — 같은 변수를
+        //   읽는 send_key_return_delegates_the_gap_to_the_writer_not_the_handler 와 cargo 병렬
+        //   러너에서 경합하면 기본값 단정(150)이 간헐 실패한다. env 창을 ACL_ENV_LOCK 으로 직렬화.
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::time::Duration;
         let ms = Duration::from_millis;
 
