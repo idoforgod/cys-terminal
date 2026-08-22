@@ -1244,6 +1244,31 @@ pub struct Daemon {
     /// 되살릴 의미가 없고, topology 스키마를 넓히면 조작 표면만 늘어난다. TTL은 create 재시도
     /// 창과 동일한 CREATE_IDEM_TTL_SECS를 재사용하고 만료분은 insert 시 lazy GC 한다.
     pub create_owner: Mutex<HashMap<u64, (u64, f64)>>,
+    /// ★결함8(2026-08-22 부트 실사고) **창작자 원장** — 새 surface_id →
+    /// (`surface.create` 를 호출한 **프로세스** pid, 그 시점 pid 의 start_time, 기록 epoch초).
+    ///
+    /// **왜 필요한가**: 훅이 `setsid python3 javis_bootstrap.py --detach-session` 으로 부트를
+    /// 백그라운드 발화하면(`cysjavis-pack/hooks/role-bootstrap.sh`) 훅 셸이 끝나는 순간 그
+    /// python 과 그 자식 `cys launch-agent` 는 launchd(pid 1)로 **재부모화**된다 — 어느 pane 의
+    /// 자손도 아니게 되므로 `resolve_caller_surface` 가 `None` 을 돌리고 ACL 등급이 `external`
+    /// 이 된다. 부서 ACL 의 `{"from":"external","to":"worker*","allow":false}`(CEO·타 부서가
+    /// 부서장을 건너뛰고 워커를 직접 조향하는 것을 막는 **의도된** 규칙)에 걸려, **부트 자신이
+    /// 방금 만든 워커 좌석에 기동 명령을 주입하는 것**까지 거부됐다(실측: `acl denied:
+    /// external → worker` → 생성한 surface 를 `close{cause:"reap"}` 로 롤백 → 워커 기동 실패).
+    ///
+    /// 이 원장이 여는 것은 딱 하나다 — **"자기가 방금 만든 좌석에 자기 지침을 넣는 것"**.
+    /// 판정은 `handlers::creator_matches` 가 하고(같은 pid ∧ start_time 일치 ∧ TTL 이내),
+    /// 등급 의미론은 `handlers::ACL_ROLE_CREATOR` 주석이 정본이다.
+    ///
+    /// **`create_owner` 와 별개다**(재사용하지 않는다): 저쪽은 **pane surface_id** 를 키로 한
+    /// 롤백(close) 전용 원장이고 pane 안에서 도는 호출만 기록한다. 이번 결함의 발신자는
+    /// 정의상 **pane 밖 고아 프로세스**라 저 원장에는 애초에 들어가지 않는다. 두 원장은 축이
+    /// 다르다(pane 귀속 ↔ 프로세스 신원 · close ↔ send).
+    ///
+    /// **영속하지 않는다**: 데몬이 재시작되면 창작자 프로세스도 함께 죽으므로 되살릴 의미가
+    /// 없고, topology 스키마를 넓히면 조작 표면만 늘어난다. TTL 은 `CREATE_CALLER_TTL_SECS`
+    /// 이며 만료분은 insert 시 lazy GC 한다(`create_owner` 와 동형).
+    pub create_caller: Mutex<HashMap<u64, CreateCallerEntry>>,
     pub ledger: Mutex<HashMap<u32, LedgerEntry>>,
     /// 역할 레지스트리: role → surface_id (launch-agent가 등록, --to <role> 주소 해석에 사용)
     pub roles: Mutex<HashMap<String, u64>>,
@@ -1486,6 +1511,29 @@ impl Consumption {
 
 /// (E-c) create_idem 캐시 엔트리 TTL — 클라이언트 재시도 창. 만료분은 조회 시 lazy GC.
 pub const CREATE_IDEM_TTL_SECS: f64 = 120.0;
+
+/// ★결함8 창작자 원장 항목의 **단일 형태 정의처** —
+/// (`surface.create` 를 호출한 프로세스 pid, 그 시점 그 pid 의 start_time, 기록 epoch초).
+///
+/// 별칭으로 뽑은 이유는 두 가지다: ①`Mutex<HashMap<u64, (u32, Option<u64>, f64)>>` 는
+/// clippy `type_complexity` 대상이고 ②판정부(`handlers::creator_matches`)와 기록부
+/// (`handlers::record_create_caller`)가 **같은 튜플 순서**를 전제하므로 형태가 한 곳에
+/// 적혀 있어야 순서가 갈리지 않는다. `start_time` 이 `Option` 인 것은 관측 실패를 값으로
+/// 보존하기 위함이며, 판정부는 그 `None` 을 **거부**로 읽는다(fail-closed).
+pub type CreateCallerEntry = (u32, Option<u64>, f64);
+
+/// ★결함8 창작자 원장(`create_caller`) TTL(초) — **창작자 등급이 유효한 창**.
+///
+/// **왜 `CREATE_IDEM_TTL_SECS`(120초)를 재사용하지 않는가**: `cys launch-agent` 는
+/// `surface.create` 성공 **직후**에 지침을 넣지 않는다 — 에이전트 프로세스 readiness 폴링과
+/// 각성 ack 대기를 거쳐 **수 분** 뒤에 `send_text`(authoritative)+`send_key Return` 을 넣는다.
+/// 120초 창이면 정작 주입 시점에 원장이 만료돼 결함이 그대로 남는다(창을 재사용했다면 수리가
+/// 무증상으로 실패했을 것이다).
+///
+/// **왜 무한이 아닌가**: 창작자 등급이 "한 번 만들었으면 영원히 그 좌석의 주인"으로 자라면
+/// 안 된다. 30분은 '기동 1회 분량'의 상한이며, 이 시한이 지나면 그 프로세스도 평범한
+/// `external` 로 돌아간다(`surface.close` 성공 시에는 TTL 전이라도 즉시 제거한다).
+pub const CREATE_CALLER_TTL_SECS: f64 = 1800.0;
 
 /// **데몬 발행 feed 항목의 예약 request_id 접두** — 이 네임스페이스의 단일 정의처다.
 ///
@@ -1931,6 +1979,7 @@ impl Daemon {
             caller_cache: Mutex::new(HashMap::new()),
             create_idem: Mutex::new(HashMap::new()),
             create_owner: Mutex::new(HashMap::new()),
+            create_caller: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
             // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).
