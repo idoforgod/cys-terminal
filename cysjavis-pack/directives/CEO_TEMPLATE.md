@@ -53,6 +53,7 @@ done
   cys send-key --to cso Return
   ```
 - **CEO가 직접 쓰는 `cys-dept`는 읽기 전용 동사뿐이다**: `cys-dept list`·`cys-dept sock <name>`(그리고 무변조인 `promote-if-pending --request-only`). 이 셋은 가드 면제이며 인벤토리·주소 해석에 쓴다.
+- **★이름이 닮은 두 reap 은 계약이 정반대다 — 혼동 금지.** ⓐ **좌석 회수** `cys reap-surface <surface>`(본문 §8 · 죽은 `exited=true` pane 잔재 회수)는 단일소유 가드와 **무관**하며 CEO 직접 집행이 계약대로 허용된다. ⓑ **부서 격리분 TTL 소거**(위 lifecycle 동사 목록의 `reap` — 폐역 부서 대화기억 trash 의 만료분 소거)는 부서 lifecycle 동사라 CEO가 직접 호출하면 가드가 `exit 7`로 거부한다(이 절 첫 항과 동일 계약 — 버그 아님). ⓑ의 정당한 경로도 위와 같이 둘뿐이다 — **GUI 부서 버튼**, 또는 **CSO 위임**: `cys send --to cso "[부서요청] 부서 격리분 정리 요청: <부서명>"` + `cys send-key --to cso Return`(상설 소관·TTL 규약은 CSO_DIRECTIVE §3-1). 격리분은 오너 데이터라 TTL 이전 임의 삭제는 어느 경로로도 금지다.
 - 새 부서가 뜰 때 **기존 부서의 데몬·surface·작업은 절대 건드리지 않는다** — 새 (socket 디렉토리, pack_dir) 쌍이 신규 생성될 뿐이다(집행 주체가 CSO·GUI여도 이 불변식은 동일).
 - 파괴적·비가역 행동(부서 데몬 kill·close-surface·디렉토리 삭제) 전에는 오너 의도를 명시 확인. 추측 비가역 실행 금지.
 
@@ -331,7 +332,8 @@ done
   노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
   (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 별도 축)가 발행된다 —
   대응은 원인 해소(연속 출력·사람 입력·queue pause)다. **★강제 배달 `cys queue deliver`는
-  사람 운영자 전용 — LLM 에이전트(CEO·CSO 포함)는 자동 강제배달 금지·사람 판단에 맡긴다.**
+  사람 운영자 전용 — LLM 에이전트(master·CEO·CSO 포함)는 자동 강제배달 금지·사람 판단에
+  맡긴다.**
 - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
   워커에게 task를 위임하는 프롬프트는 반드시
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
@@ -462,14 +464,9 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   (`javis_orchestra.py check`로 결정론 확인).
 - 죽은(`exited=true`) 좌석의 pane 잔재 회수는 `cys reap-surface <surface>`다(★G4 전용 RPC
   `surface.reap` — master/cso pane 전용·7조건 게이트·exit 7=게이트 거부). 상설 집행 주체는
-  CSO이며, CEO(role=master)는 CSO 부재 시 직접 집행할 수 있다. `close-surface`(자기/생성자
-  한정·산 노드 폐쇄)·**cys-dept 의 reap 서브커맨드**(부서 격리분 TTL 소거)와는 전부 별개
-  계약 — **산 노드는 어떤 조합에서도 reap 불가**다.
-- ★위 셋 중 부서 격리분 TTL 소거만은 CEO가 **직접 호출하지 않는다** — 부서 lifecycle 동사라
-  단일소유 가드가 role 보유 비-CSO 노드를 exit 7로 거부한다(§0 ③과 동일 계약·버그 아님).
-  대안 경로는 둘: **GUI 부서 버튼**, 또는 **CSO에 위임**(`cys send --to cso "부서 격리분 정리
-  요청: <부서명>"` → CSO가 집행 후 회신). `cys reap-surface`(좌석 회수)는 이 가드와 무관하며
-  CEO 직접 집행이 계약대로 허용된다 — 두 동사를 혼동하지 말 것.
+  CSO(CSO_DIRECTIVE 절대규칙)이며, master는 CSO 부재 시 직접 집행할 수 있다.
+  `close-surface`(자기/생성자 한정·산 노드 폐쇄)와 별개 계약 — **산 노드는 어떤 조합에서도
+  reap 불가**다.
 
 ## 9. 복원 체크포인트 + todo 영속 (전 노드 의무)
 > ★경로 규약(G5 동류 · 레인 격리): 아래 상태·복원 파일은 모두 **자기 레인의 팩**

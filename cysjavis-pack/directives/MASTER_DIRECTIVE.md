@@ -251,7 +251,8 @@
   노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
   (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 별도 축)가 발행된다 —
   대응은 원인 해소(연속 출력·사람 입력·queue pause)다. **★강제 배달 `cys queue deliver`는
-  사람 운영자 전용 — LLM 에이전트(master·CSO 포함)는 자동 강제배달 금지·사람 판단에 맡긴다.**
+  사람 운영자 전용 — LLM 에이전트(master·CEO·CSO 포함)는 자동 강제배달 금지·사람 판단에
+  맡긴다.**
 - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
   워커에게 task를 위임하는 프롬프트는 반드시
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
