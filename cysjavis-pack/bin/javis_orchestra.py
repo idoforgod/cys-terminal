@@ -434,8 +434,16 @@ def live_role_names(status):
             if s.get("role") and not s.get("exited")}
 
 
-def check_verdicts(status):
+def check_verdicts(status, detect=None, agents=None):
     """★check 판정의 순수 함수 코어 — (verdicts, roster). 데몬 왕복 0(status 주입).
+
+    ★detect/agents 주입 (2026-08-22): `reviewer_roster` 와 **동일한 밀폐 규약**이다(그 함수는
+      이미 "detect/agents 주입 가능(self-test 밀폐)"를 계약으로 갖고 있었는데, 이 함수만 그
+      경로를 막고 있었다). 미주입=None 이면 종전과 완전히 같은 실감지 경로다 — 프로덕션 거동 불변.
+      ☞ 왜 필요했나: `--self-test` 가 합성 status 로 `reviewer-gemini` 등급을 단언하는데, 로스터는
+      **기계에 실제로 설치된 리뷰어 CLI 감지 결과**로 정해진다. agy·codex 가 없는 깨끗한 기계
+      (=신규 사용자 대다수)에서는 required 에 reviewer-gemini 가 없어 `KeyError` 트레이스백으로
+      self-test 가 죽었다. 밀폐 주입으로 테스트가 환경에 의존하지 않게 한다.
 
     verdicts: required role → {"satisfied","grade","filler","native","why"}
       grade ∈ awake_confirmed | alive_presumed | absent | unknown  (javis_boot_node.node_liveness)
@@ -447,7 +455,7 @@ def check_verdicts(status):
     ★결손 판정(javis_bootstrap)·wakeup zombie 가드·reclaim 이 같은 함수를 소비한다(A1 클래스).
     """
     bn = _boot_node()
-    roster = reviewer_roster()
+    roster = reviewer_roster(detect, agents)
     required = ["cso", "worker"] + [e["role"] for e in roster]
     live = live_role_names(status)
     # 등급 우선순위(높을수록 건강) — 동족 좌석이 여러 개일 때 **가장 건강한 좌석**이 요건을 대표한다.
@@ -2549,7 +2557,10 @@ def cmd_self_test(args):
                  {"role": "worker-2", "exited": False, "status": {"age_secs": 3, "state": "working"}},
                  {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
                  {"role": "reviewer-codex", "exited": False, "seat": "empty", "agent_alive": False}]
-        _v, _ = check_verdicts(_st(_base))
+        # ★밀폐 주입(2026-08-22): 로스터를 감지 결과가 아니라 테스트 상수로 고정한다. 종전엔
+        #   실감지를 타서 agy·codex 미설치 기계(신규 사용자 대다수)에서 required 에
+        #   reviewer-gemini 가 없어 아래 단언이 KeyError 트레이스백으로 죽었다.
+        _v, _ = check_verdicts(_st(_base), detect=_yes, agents=_synth)
         assert _v["cso"]["grade"] == "awake_confirmed", "래치 좌석이 각성확정 아님"
         assert _v["worker"]["satisfied"] and _v["worker"]["filler"] == "worker-2", \
             "worker-2 dedup 좌석이 worker 요건을 못 채움"
@@ -2563,7 +2574,7 @@ def cmd_self_test(args):
                 {"role": "worker", "exited": False, "awakened_at": 1.0},
                 {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
                 {"role": "reviewer-claude-2", "exited": False, "awakened_at": 1.0}]
-        _v2, _ = check_verdicts(_st(_sub))
+        _v2, _ = check_verdicts(_st(_sub), detect=_yes, agents=_synth)   # ★밀폐 주입(위와 동일 사유)
         assert _v2["reviewer-codex"]["satisfied"] is True, "대체 좌석 재해소 실패(B2)"
         assert _v2["reviewer-codex"]["native"] is False, "실충전자 라벨(native=False) 누락"
         # A12 exit 분류

@@ -1437,6 +1437,133 @@ pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize
     )
 }
 
+/// ★결함3(2026-08-22 실측 사고) **승계 금지 가드 마커 규약** — 부서 soul 승계본에서 이 토큰 중
+/// 하나가 **절의 직속 본문**(heading 줄 포함 · 하위 절 제외)에 있으면 그 절을 **하위 절까지 통째로
+/// 드롭**한다. 마커 어휘의 등재소는 이 상수 하나다(base soul 이 쓰는 문구와 여기 목록이 유일한
+/// 2자 합의 — 소비처마다 다시 쓰면 RC1 사본 드리프트).
+///   ① `cys:no-inherit` — 기계 토큰(언어 중립 · 신규 문안 권장 · 주석/HTML 코멘트로도 무해)
+///   ② `승계 금지` — 오너 기계의 base soul 실사용 문구(`> ★**본부(base) 레인 전용 절 — 승계 금지 가드**:`)
+///   ③ `본부(base) 레인 전용` — 같은 줄의 다른 절반(둘 중 하나만 남아도 인식)
+/// 판정은 **보수적**이다: 마커가 없으면 한 줄도 드롭하지 않고 승계본이 바이트 그대로 흐른다
+/// (오탐 삭제 > 미탐 승계 라는 역전이 일어나지 않도록 — 드롭은 항상 감사 원장·stderr 에 남는다).
+const SOUL_NO_INHERIT_MARKERS: &[&str] = &["cys:no-inherit", "승계 금지", "본부(base) 레인 전용"];
+
+/// ATX heading 레벨(1..=6) — `#` 1~6개 + 공백(또는 줄 끝). setext(`===`·`---`)는 **보수적으로
+/// 무시**한다(절 경계 오판이 곧 오삭제라 인식 범위를 좁게 잡는다).
+fn atx_heading_level(line: &str) -> Option<usize> {
+    let t = line.trim_start();
+    let hashes = t.len() - t.trim_start_matches('#').len();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &t[hashes..];
+    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+/// ★결함3(b): 승계 금지 가드 마커가 붙은 절을 **heading 단위**로 제거한다.
+/// 반환: (남은 본문, 드롭된 절의 heading 줄 목록 — 감사용).
+///
+/// 규칙(전부 보수적 방향):
+///   · 마커 탐색 범위 = 그 절의 **직속 본문**(heading ~ 다음 heading 직전, 레벨 무관) —
+///     하위 절의 마커가 상위 절을 끌어내리는 과삭제를 막는다.
+///   · 드롭 범위 = 그 절 + **하위 절 전체**(같거나 얕은 레벨의 다음 heading 직전까지) —
+///     본부 전용 절의 하위 설명만 남아 문맥이 깨지는 반쪽 삭제를 막는다.
+///   · 코드펜스(``` · ~~~) 내부의 `#` 는 heading 이 아니다.
+///   · 첫 heading 이전(문서 서두·제목 앞 preamble)은 절이 아니므로 **절대 드롭하지 않는다**.
+///   · 드롭 0건이면 입력 문자열을 **그대로** 돌려준다(개행 정규화조차 하지 않음 — 승계 바이트 보존).
+fn strip_no_inherit_sections(src: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = src.lines().collect();
+    // (줄 index, heading level) — 코드펜스 밖의 ATX heading 만.
+    let mut heads: Vec<(usize, usize)> = Vec::new();
+    let mut fenced = false;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some(lv) = atx_heading_level(l) {
+            heads.push((i, lv));
+        }
+    }
+    let mut drop_line = vec![false; lines.len()];
+    let mut dropped: Vec<String> = Vec::new();
+    for (k, &(start, level)) in heads.iter().enumerate() {
+        let own_end = heads.get(k + 1).map(|&(i, _)| i).unwrap_or(lines.len());
+        let marked = lines[start..own_end]
+            .iter()
+            .any(|l| SOUL_NO_INHERIT_MARKERS.iter().any(|m| l.contains(m)));
+        if !marked {
+            continue;
+        }
+        let end = heads[k + 1..]
+            .iter()
+            .find(|&&(_, lv)| lv <= level)
+            .map(|&(i, _)| i)
+            .unwrap_or(lines.len());
+        drop_line[start..end].iter_mut().for_each(|d| *d = true);
+        dropped.push(lines[start].trim().to_string());
+    }
+    if dropped.is_empty() {
+        return (src.to_string(), dropped);
+    }
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(drop_line.iter())
+        .filter(|(_, d)| !**d)
+        .map(|(l, _)| *l)
+        .collect();
+    let mut out = kept.join("\n");
+    if src.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    (out, dropped)
+}
+
+/// 시드 대상 **부서명** 산출 — 판정 규칙의 등재소는 `dept_scope_of` 하나다(사본 드리프트 금지).
+///   ① `dir` 이 부서 팩(`pack-dept-<name>`)이면 그대로 — cysd 자동설치·install_from_iter 경로.
+///   ② `dir` 이 staging(`.pack-staging-init-*` — basename 에 부서 정보가 없다)이면 **논리 대상**
+///      에서 같은 규칙으로 다시 뽑는다. install_staged 가 스코프를 Dept 로 판정한 근거가 바로 그
+///      `pack_dir()` 이므로 **같은 SOT** 를 보는 셈이고 스코프 판정과 어긋날 수 없다.
+///      순수 env 층(`pack_dir_from_env`)을 쓰므로 W0-a 테스트 빌드 panic 을 유발하지 않는다.
+/// 둘 다 실패하면 None — 호출처가 '(부서명 미상)' 스탬프 + loud 고지로 강등한다(정체 없는 부팅 방지).
+fn dept_name_for_seed(dir: &Path) -> Option<String> {
+    dept_scope_of(dir).or_else(|| pack_dir_from_env().as_deref().and_then(dept_scope_of))
+}
+
+/// ★결함3(a) **부서장 정체 스탬프** — 부서 soul 최초 시드 본문 맨 앞에 박히는 정체 정의처.
+///
+/// 실측 사고(2026-08-22): 오너가 GUI 로 부서를 만들고 그 창에서 "너는 마스터다"라고 선언했을 때
+/// 부서 마스터가 **자신을 부서장으로 인식·호칭하지 못했다** — 표준 디렉티브에도, 빈 soul 템플릿
+/// 에도 "너는 <부서명> 부서장 마스터다"라고 말해 주는 정의처가 없었기 때문이다. 승계본이든
+/// 폴백 템플릿이든 **이 스탬프는 항상 앞에 붙는다**(정체 없이 뜨는 부서장 0).
+fn dept_identity_stamp(dept: Option<&str>) -> String {
+    let name = dept.unwrap_or("(부서명 미상)");
+    format!(
+        "# 부서 정체 — {name} 부서장 마스터 (부서 팩 최초 시드 자동 스탬프)\n\
+         \n\
+         > 이 절은 부서 팩 시드가 박은 **부서장 정체의 정의처**다. 아래 본문은 본부(base) 헌장\n\
+         > 승계본이며, 정체에 관해서는 이 절이 우선한다 — 이 데몬은 본부가 아니라 부서 레인이다.\n\
+         \n\
+         - 이 데몬은 부서 **`{name}`** 이고, 이 데몬의 master 는 **\"{name} 부서장 마스터\"** 다 —\n\
+         \u{20}\u{20}자신을 그렇게 인식하고 그렇게 호칭한다.\n\
+         - **각성 보고 첫 문장에 부서장 정체를 명시하라** — 예: \"저는 {name} 부서장 마스터입니다.\"\n\
+         - 본부(base) 데몬의 master 는 **CEO** 다. 부서장은 CEO 에게 보고하고 CEO 의 지시를 받는다 —\n\
+         \u{20}\u{20}단 **오너의 직접 지시가 항상 최우선**이며, CEO 지시와 충돌하면 오너 지시가 이긴다.\n\
+         - 이 데몬의 워커·CSO·리뷰어는 {name} 부서장 마스터가 지휘한다.\n\
+         \n\
+         ---\n\
+         \n"
+    )
+}
+
 /// ★G3 축2(seed-from-base): 부서 soul.md 최초 시드 본문 산출. base 팩 위치는 **형제 규약**
 /// `<dir 부모>/pack`(프로덕션 ~/.cys/pack 과 동일) — install_staged 의 staging(`.pack-staging-init-*`)
 /// 도 pack_dir 형제라 같은 부모를 공유해 동일하게 성립한다(경로 규약 등재소는 이 함수 한 곳).
@@ -1447,29 +1574,74 @@ pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize
 /// action="seed-from-base" 라인으로 영속한다(Wave1 원장 기계 재사용 — 필드명은 cys.rs
 /// merge_audit_entry 스키마 정합: ts/file/action/actor_os_user/before·after_sha256/verify_result/
 /// flags + additive "source". 기록 실패는 loud 후 불차단 — 감사는 관측이지 게이트가 아니다).
+///
+/// ★결함3(2026-08-22 실측 사고) 두 겹이 여기 얹힌다 — 둘 다 **부서 스코프 시드 경로 전용**이라
+/// base 레인 거동은 byte-identical 이다(호출 자체가 `scope == Dept && !exists` 에서만 난다):
+///   (a) **부서장 정체 스탬프**(`dept_identity_stamp`)를 승계본·폴백 템플릿 **양쪽 모두** 앞에 삽입 —
+///       부서장이 자신을 "부서장"으로 인식할 정의처를 팩이 직접 제공한다.
+///   (b) **본부 전용 절 승계 차단**(`strip_no_inherit_sections`) — seed-from-base 는 base soul 을
+///       통째로 물려주므로, 가드 마커가 붙은 본부 전용 절(예: "이 데몬의 master 는 CEO 다")이
+///       그대로 승계되면 부서장이 자신을 **CEO 로 오인**한다. 마커 규약은 `SOUL_NO_INHERIT_MARKERS`.
+/// 안전핵 키워드 판정은 **드롭 이후 본문** 기준이다(드롭된 절에만 안전핵이 있었다면 WARN 이 떠야
+/// 정직하다). 드롭·부서명 미판정·드롭 후 공백은 전부 stderr + 원장 flags 로 감사 가능하게 남긴다.
 fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
     let base_soul = dir.parent().map(|p| p.join("pack").join("soul.md"));
     let inherited = base_soul
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .filter(|s| !s.trim().is_empty());
-    let (content, source, verify) = match inherited {
+    // (a) 부서명 — 등재소 `dept_scope_of` 재사용(사본 드리프트 금지). 미판정도 시드는 진행한다.
+    let dept = dept_name_for_seed(dir);
+    if dept.is_none() {
+        eprintln!(
+            "[pack] ⚠ 부서 soul 시드: 부서명 판정 실패({} · staging 이면 pack env 도 미설정) — \
+             정체 스탬프를 '(부서명 미상)'으로 박는다(정체 없이 뜨는 부서장 방지)",
+            dir.display()
+        );
+    }
+    let mut flags: Vec<&'static str> = Vec::new();
+    if dept.is_none() {
+        flags.push("dept-name-unresolved");
+    }
+    let mut dropped_sections: Vec<String> = Vec::new();
+    let (body, source, verify) = match inherited {
         Some(s) => {
-            let lower = s.to_lowercase();
-            let has_core = crate::overrides::SAFETY_KEYWORDS
-                .iter()
-                .any(|kw| lower.contains(kw));
-            if !has_core {
+            // (b) 본부 전용 절 승계 차단 — 마커가 명확한 절만, heading 단위로 통째로 드롭.
+            let (stripped, dropped) = strip_no_inherit_sections(&s);
+            if !dropped.is_empty() {
                 eprintln!(
-                    "[pack] ⚠ 부서 soul 시드: base 헌장 승계본에 안전핵 키워드 0건 — base soul 이 \
-                     과도 상태일 수 있음(시드는 진행 · 감사 원장에 기록)"
+                    "[pack] 부서 soul 시드: 본부(base) 전용 절 {}건 승계 차단 — {}",
+                    dropped.len(),
+                    dropped.join(" | ")
                 );
+                flags.push("guard-dropped");
             }
+            dropped_sections = dropped;
             let src = base_soul
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
-            (s, src, if has_core { "pass" } else { "warn-no-safety-core" })
+            if stripped.trim().is_empty() {
+                // 드롭 후 본문이 통째로 비었다 = 승계할 알맹이 없음 — 승계 실패와 같은 등급으로 강등.
+                eprintln!(
+                    "[pack] ⚠ 부서 soul 시드: 가드 절 드롭 후 승계 본문이 공백 — 임베드 템플릿 \
+                     시드로 강등(정체 스탬프는 유지)"
+                );
+                flags.push("guard-stripped-empty");
+                (embed.to_string(), "embed-template".to_string(), "degraded-template-fallback")
+            } else {
+                let lower = stripped.to_lowercase();
+                let has_core = crate::overrides::SAFETY_KEYWORDS
+                    .iter()
+                    .any(|kw| lower.contains(kw));
+                if !has_core {
+                    eprintln!(
+                        "[pack] ⚠ 부서 soul 시드: base 헌장 승계본에 안전핵 키워드 0건 — base soul 이 \
+                         과도 상태일 수 있음(시드는 진행 · 감사 원장에 기록)"
+                    );
+                }
+                (stripped, src, if has_core { "pass" } else { "warn-no-safety-core" })
+            }
         }
         None => {
             eprintln!(
@@ -1483,6 +1655,8 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
             (embed.to_string(), "embed-template".to_string(), "degraded-template-fallback")
         }
     };
+    // 정체 스탬프는 **어느 분기에서도** 앞에 붙는다(승계 성공·강등 폴백 무관 — 결함3 (a)의 목적).
+    let content = format!("{}{}", dept_identity_stamp(dept.as_deref()), body);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1497,7 +1671,10 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
         "before_sha256": null, // 시드 전 부재(!exists 게이트) — 전신 없음
         "after_sha256": content_hash(&content),
         "verify_result": verify,
-        "flags": [],
+        "flags": flags,
+        // ★결함3 additive 필드 — 정체 스탬프의 부서명과 승계 차단된 절 목록(사후 추적 가능성).
+        "dept": dept,
+        "dropped_sections": dropped_sections,
         "source": source,
     });
     // 신설 팩 첫 시드는 파일 쓰기(부모 생성)보다 먼저 돈다 — 원장 append 가 dir 부재로 죽지 않게.
@@ -1587,7 +1764,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // 병합 대기 항목 upsert — kind·side·version 이 이미 같으면 no-op(매 기동 install 의 원장 rewrite 방지).
-    let mut upsert_pending = |pending: &mut serde_json::Map<String, serde_json::Value>,
+    let upsert_pending = |pending: &mut serde_json::Map<String, serde_json::Value>,
                               dirty: &mut bool,
                               rel: &str,
                               kind: &str,
@@ -3625,10 +3802,12 @@ mod tests {
     }
 
     /// [회귀 핀·G3 축2] 부서 soul seed-from-base 전 수명주기 — ① 최초 시드는 임베드 템플릿이
-    /// 아니라 **base 팩(형제 `pack`)의 현행 soul.md 승계**이고 매니페스트 해시·pristine 이 승계본과
+    /// 아니라 **base 팩(형제 `pack`)의 현행 soul.md 승계**이고 매니페스트 해시·pristine 이 시드본과
     /// 일관 ② vendor 전진(임베드 변경) 재설치에도 불가침 + `soul.md.new` 미생성(결함4 병치 소멸)
     /// ③ base soul 부재 시 임베드 폴백 + 원장 강등 라인 ④ 구버전이 남긴 `.new`·pending 잔재는
     /// 다음 설치가 정리(마이그레이션 계약) — 승계/강등 사실은 `.merge-audit.jsonl` 이 영속 증언.
+    /// ★결함3(2026-08-22) 이후: 시드본은 `정체 스탬프 + 승계본`이다 — 등가 비교는 "승계본을 꼬리로
+    /// 그대로 담는가"로 바뀌었을 뿐, 해시 일관(매니페스트·pristine·원장)의 불변식은 그대로다.
     #[test]
     fn dept_soul_seeds_from_base() {
         let _lock = PACK_ENV_LOCK.lock().unwrap();
@@ -3660,18 +3839,26 @@ mod tests {
         )
         .unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
-        assert_eq!(read(&dpack.join("soul.md")), base_soul, "부서 soul 은 base 헌장 승계본");
+        let seeded = read(&dpack.join("soul.md"));
+        assert!(
+            seeded.ends_with(base_soul),
+            "부서 soul 은 base 헌장 승계본을 꼬리로 그대로 담는다: {seeded}"
+        );
+        assert!(
+            seeded.starts_with("# 부서 정체 — 2 부서장 마스터"),
+            "결함3(a): 승계본 **앞**에 부서장 정체 스탬프가 박힌다: {seeded}"
+        );
         let manifest: std::collections::BTreeMap<String, String> =
             serde_json::from_str(&read(&dpack.join(INSTALL_MANIFEST))).unwrap();
         assert_eq!(
             manifest.get("soul.md"),
-            Some(&content_hash(base_soul)),
-            "매니페스트 해시는 승계본 기준(치환 content 일관 흐름)"
+            Some(&content_hash(&seeded)),
+            "매니페스트 해시는 시드본 기준(치환 content 일관 흐름)"
         );
         assert_eq!(
             read(&dpack.join(PRISTINE_DIR).join("soul.md")),
-            base_soul,
-            "pristine 도 승계본(3-way 조상 일관)"
+            seeded,
+            "pristine 도 시드본(3-way 조상 일관)"
         );
         let audit = read(&dpack.join(MERGE_AUDIT_FILE));
         assert!(
@@ -3680,8 +3867,8 @@ mod tests {
         );
         assert!(audit.contains("\"verify_result\":\"pass\""), "안전핵 포함 승계 = pass: {audit}");
         assert!(
-            audit.contains(&content_hash(base_soul)),
-            "after_sha256 = 승계본 해시"
+            audit.contains(&content_hash(&seeded)),
+            "after_sha256 = 시드본 해시"
         );
 
         // ② vendor 전진 가장(임베드 변경) 재설치: 불가침 + .new 미생성(결함4 핀) + 원장 재발화 없음.
@@ -3697,7 +3884,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(read(&dpack.join("soul.md")), base_soul, "vendor 전진에도 부서 soul 불가침");
+        assert_eq!(read(&dpack.join("soul.md")), seeded, "vendor 전진에도 부서 soul 불가침");
         assert!(!dpack.join("soul.md.new").exists(), "결함4: dept soul 의 .new 병치 구조 소멸");
         assert!(load_merge_pending(&dpack).get("soul.md").is_none(), "병합 대기 미생성");
         let audit2 = read(&dpack.join(MERGE_AUDIT_FILE));
@@ -3722,10 +3909,14 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            read(&dpack3.join("soul.md")),
-            "TEMPLATE-SOUL-V1",
-            "base 부재 시 임베드 폴백(부서가 soul 없이 뜨지 않는다)"
+        let seeded3 = read(&dpack3.join("soul.md"));
+        assert!(
+            seeded3.ends_with("TEMPLATE-SOUL-V1"),
+            "base 부재 시 임베드 폴백(부서가 soul 없이 뜨지 않는다): {seeded3}"
+        );
+        assert!(
+            seeded3.starts_with("# 부서 정체 — 3 부서장 마스터"),
+            "결함3(a): 폴백 경로에도 정체 스탬프가 붙는다(정체 없이 뜨는 부서장 0): {seeded3}"
         );
         assert!(
             read(&dpack3.join(MERGE_AUDIT_FILE)).contains("degraded-template-fallback"),
@@ -3761,6 +3952,200 @@ mod tests {
         assert!(load_merge_pending(&dpack4).get("soul.md").is_none(), "구 pending 정리");
 
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [회귀 핀·결함3 · 2026-08-22 오너 기계 실측 사고] 부서장이 자신을 '부서장'으로 인식할
+    /// **정의처**가 없어 부서 마스터가 정체 없이 깨어난 사고 + seed-from-base 가 본부 전용 절을
+    /// 통째로 물려줘 부서장이 자신을 CEO 로 오인할 수 있는 결함의 회귀 핀.
+    ///   ① 부서 스코프 시드 결과에 **부서명 + "부서장"** 문자열과 각성 보고 지시가 실재
+    ///   ② 가드 마커 절(오너 기계 base soul 의 실제 문안)이 승계본에서 **하위 절까지 통째로** 제거
+    ///      되고, 마커 없는 이웃 절은 온전(보수적 드롭)
+    ///   ③ base 스코프는 스탬프 0·시드 원장 0 — 임베드 그대로(byte-identical 계약)
+    ///   ④ 드롭·부서명이 `.merge-audit.jsonl` 에 감사 가능하게 남는다
+    ///   ⑤ staging(`.pack-staging-init-*`) 대상에서도 부서명이 논리 대상 env 로 복원된다
+    #[test]
+    fn dept_soul_stamps_identity_and_drops_base_only_sections() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-dept-soulstamp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let base_pack = td.join("pack");
+        std::fs::create_dir_all(&base_pack).unwrap();
+        // 오너 기계의 실제 base soul 형태(가드 블록 문안 그대로) — 인식 가능해야 한다.
+        let base_soul = "# soul.md — 운영 헌장 (최소 골격)\n\
+                         \n\
+                         ## 정체\n\
+                         \n\
+                         - 이 시스템의 주인(이하 \"오너\"): 홍길동\n\
+                         - 안전핵 denylist 불변 · kill-switch 즉시 정지\n\
+                         \n\
+                         ## CEO 정체·부서 티켓 (오너 명령 집행 2026-08-22)\n\
+                         \n\
+                         > ★**본부(base) 레인 전용 절 — 승계 금지 가드**: 부서 팩의 soul.md 는 이\n\
+                         > 파일을 승계해 시드된다. 이 절이 부서에 복사되면 부서장이 자신을 CEO 로 오인한다.\n\
+                         \n\
+                         - 이 데몬의 master 는 **CEO(master of master)** 다.\n\
+                         \n\
+                         ### 부서장 티켓 자동 발급\n\
+                         \n\
+                         - 부서장 요청을 받으면 즉시 발급한다.\n\
+                         \n\
+                         ## 금지선 (denylist)\n\
+                         \n\
+                         - 외부 발행 — 비가역\n";
+        std::fs::write(base_pack.join("soul.md"), base_soul).unwrap();
+        let dpack = td.join("pack-dept-영업");
+        std::fs::create_dir_all(&dpack).unwrap();
+        let _env = set_pack_env(&dpack, td.join("cfg"));
+        let items = [("soul.md", "TEMPLATE-SOUL-V1"), ("README.md", "R1")];
+        install_into(
+            dpack.clone(),
+            items.iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&dpack),
+            None,
+        )
+        .unwrap();
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        let seeded = read(&dpack.join("soul.md"));
+
+        // ① 정체 스탬프 — 부서명이 박힌 구체 문장 + 각성 보고 지시 + CEO 보고선.
+        assert!(seeded.contains("영업 부서장 마스터"), "부서명+부서장 정체 문장 부재: {seeded}");
+        assert!(seeded.contains("부서장"), "'부서장' 문자열 부재");
+        assert!(
+            seeded.contains("각성 보고 첫 문장에 부서장 정체를 명시하라"),
+            "각성 보고 첫 문장 지시 부재: {seeded}"
+        );
+        assert!(
+            seeded.contains("본부(base) 데몬의 master 는 **CEO** 다"),
+            "CEO 보고선(본부=CEO · 부서장→CEO) 부재: {seeded}"
+        );
+        assert!(
+            seeded.contains("오너의 직접 지시가 항상 최우선"),
+            "오너 직접 지시 최우선 조항 부재: {seeded}"
+        );
+
+        // ② 본부 전용 절 승계 차단 — 가드 절 + 하위 절까지 통째로, 이웃 절은 온전.
+        assert!(!seeded.contains("승계 금지 가드"), "가드 마커 줄이 승계됐다: {seeded}");
+        assert!(
+            !seeded.contains("CEO(master of master)"),
+            "본부 전용 CEO 정체 절이 부서로 승계됐다(부서장이 CEO 로 오인): {seeded}"
+        );
+        assert!(
+            !seeded.contains("부서장 티켓 자동 발급"),
+            "가드 절의 **하위 절**이 남았다(반쪽 삭제): {seeded}"
+        );
+        assert!(seeded.contains("## 금지선 (denylist)"), "마커 없는 이웃 절은 온전해야 한다");
+        assert!(seeded.contains("홍길동"), "마커 없는 상위 절(정체)도 온전해야 한다");
+        assert!(
+            seeded.contains("- 외부 발행 — 비가역"),
+            "가드 절 뒤 이웃 절 본문이 잘렸다: {seeded}"
+        );
+
+        // ④ 감사 원장 — 드롭 flag·부서명·드롭된 heading.
+        let audit = read(&dpack.join(MERGE_AUDIT_FILE));
+        assert!(audit.contains("\"guard-dropped\""), "드롭 flag 원장 기록 부재: {audit}");
+        assert!(audit.contains("\"dept\":\"영업\""), "부서명 원장 기록 부재: {audit}");
+        assert!(
+            audit.contains("## CEO 정체·부서 티켓"),
+            "드롭된 절 heading 이 원장에 없다(감사 불가): {audit}"
+        );
+
+        // ③ base 스코프 불변 — 스탬프 0·시드 원장 0(임베드 그대로).
+        let bpack = td.join("pack-base");
+        std::fs::create_dir_all(&bpack).unwrap();
+        assert_eq!(pack_scope_of(&bpack), PackScope::Base, "계측 타당성: base 스코프여야 한다");
+        install_into(
+            bpack.clone(),
+            items.iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&bpack),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            read(&bpack.join("soul.md")),
+            "TEMPLATE-SOUL-V1",
+            "base 레인 거동 불변 — 정체 스탬프·승계 없음(byte-identical 계약)"
+        );
+        assert!(
+            !bpack.join(MERGE_AUDIT_FILE).exists(),
+            "base 레인에서 seed-from-base 원장이 생겼다(부서 전용 경로 누수)"
+        );
+
+        // ⑤ staging 대상(부서명이 basename 에 없음) — 논리 대상(pack env)에서 부서명 복원.
+        let staging = init_staging_dir(&dpack);
+        assert_eq!(dept_scope_of(&staging), None, "계측 타당성: staging basename 엔 부서 정보가 없다");
+        assert_eq!(
+            dept_name_for_seed(&staging).as_deref(),
+            Some("영업"),
+            "staging 경로에서 부서명이 유실되면 정체 스탬프가 '(부서명 미상)'으로 강등된다"
+        );
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [회귀 핀·결함3(b)] 승계 금지 가드 마커 파서는 **보수적**이다 — 마커가 명확할 때만, 그
+    /// 절(+하위 절)만 드롭한다. 오탐 삭제가 미탐 승계보다 위험하므로 부정 케이스를 함께 못 박는다.
+    #[test]
+    fn strip_no_inherit_sections_drops_only_marked_sections() {
+        // ⓐ 마커 0건 = 입력 바이트 그대로(개행 정규화조차 없음).
+        let plain = "# T\r\n\r\n## A\r\n본문\r\n## B\r\n끝";
+        let (kept, dropped) = strip_no_inherit_sections(plain);
+        assert_eq!(kept, plain, "마커 없으면 승계본은 바이트 불변(CRLF 포함)");
+        assert!(dropped.is_empty());
+
+        // ⓑ 마커 절 + 하위 절 드롭 · 이웃 절 온전 · 기계 토큰(cys:no-inherit)도 인식.
+        let src = "# 제목\n\n## 유지\nU\n\n## 본부 전용\n<!-- cys:no-inherit -->\nX\n\n### 하위\nY\n\n## 뒤\nZ\n";
+        let (kept, dropped) = strip_no_inherit_sections(src);
+        assert_eq!(kept, "# 제목\n\n## 유지\nU\n\n## 뒤\nZ\n", "드롭 결과: {kept}");
+        assert_eq!(dropped, vec!["## 본부 전용".to_string()]);
+
+        // ⓒ 하위 절의 마커는 **하위 절만** 드롭(상위 절을 끌어내리지 않는다).
+        let src = "## 상위\nP\n\n### 하위\n승계 금지\nQ\n\n## 다음\nR\n";
+        let (kept, dropped) = strip_no_inherit_sections(src);
+        assert_eq!(kept, "## 상위\nP\n\n## 다음\nR\n", "상위 절 과삭제: {kept}");
+        assert_eq!(dropped, vec!["### 하위".to_string()]);
+
+        // ⓓ 코드펜스 안의 '#' 는 heading 이 아니다 — 절 경계 오판으로 반쪽 삭제되지 않는다.
+        let src = "## 본부 전용 절 — 승계 금지\n```md\n## 가짜 heading\n```\n꼬리\n\n## 유지\nK\n";
+        let (kept, dropped) = strip_no_inherit_sections(src);
+        assert_eq!(kept, "## 유지\nK\n", "펜스 안 '#' 를 heading 으로 오판했다: {kept}");
+        assert_eq!(dropped.len(), 1);
+
+        // ⓔ 첫 heading 이전(preamble)의 마커는 절이 아니므로 아무것도 드롭하지 않는다.
+        let src = "승계 금지 라고만 적힌 서두\n\n## 유지\nK\n";
+        let (kept, dropped) = strip_no_inherit_sections(src);
+        assert_eq!(kept, src, "preamble 마커로 문서가 잘렸다");
+        assert!(dropped.is_empty());
+
+        // ⓕ 계측 타당성: 오너 기계 base soul 의 실제 가드 문안이 마커 목록에 인식된다.
+        let real = "> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: …";
+        assert!(
+            SOUL_NO_INHERIT_MARKERS.iter().any(|m| real.contains(m)),
+            "실사용 가드 문안이 마커 목록에 안 잡힌다(규약 드리프트)"
+        );
+    }
+
+    /// [회귀 핀·결함3(a)] 부서명 판정 실패에서도 정체 스탬프는 붙는다 — '정체 없이 뜨는 부서장 0'
+    /// 이 목적이므로 강등은 **부서명 자리**에서만 일어나고 정체 선언 자체는 사라지지 않는다.
+    #[test]
+    fn dept_identity_stamp_degrades_name_but_never_identity() {
+        let s = dept_identity_stamp(None);
+        assert!(s.contains("(부서명 미상) 부서장 마스터"), "부서명 미상 강등 문안 부재: {s}");
+        assert!(s.contains("각성 보고 첫 문장에 부서장 정체를 명시하라"), "정체 지시가 사라졌다: {s}");
+        let s = dept_identity_stamp(Some("영업"));
+        assert!(s.starts_with("# 부서 정체 — 영업 부서장 마스터"), "스탬프 제목 문안: {s}");
+        assert!(!s.contains("(부서명 미상)"), "정상 판정에 강등 문구가 섞였다");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

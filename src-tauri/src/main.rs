@@ -514,11 +514,34 @@ async fn send_input(
     let sock = resolve_socket(&socket);
     let mut params = json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q,
                             "queued": q, "clear_first": cf, "machine_origin": mo});
-    // 표식이 붙은 자동 주입에는 토큰을 아예 붙이지 않는다(데몬도 표식으로 무시하지만, 첨부 자체를
-    // 하지 않는 편이 "토큰은 사람 키 전용"이라는 계약을 코드 한 곳에서 더 분명히 만든다).
+    let tok = read_operator_token_for(&sock);
+    // ★★결함#6-b 잔여분(2026-08-22 · 오너 실사고 후속) — `owner_token` = **ACL 등급 전용** 키.
+    //
+    // 무엇이 남아 있었나: #6-b 1차 수리는 데몬 ACL 에 `owner` 등급을 신설해 오너 GUI 를 external
+    // 과 구별했지만, 등급 판정 근거가 `operator_token` 이었다. 그 키는 아래 `!q && !mo` 분기에서만
+    // 붙으므로 **UI 가 조립한 주입**(전출 지시 전문·`launchCmd`·`restartNode`·`injectRawToPane`·
+    // queued 후속 지시)은 여전히 external 로 남아 **부서 워커 pane 에서만 차단**됐다. 오너 절대
+    // 규칙("모든 노드의 프롬프트 창을 오너가 컨트롤")에 비추면 같은 결함의 잔여분이다.
+    //
+    // 왜 `operator_token` 을 그대로 넓히지 않았나(중요): 그 키에는 **면제**가 매달려 있다 —
+    // 배달 원장 무기록(R4/R5)과 `feed.reply` §3.2 자기승인 우회. 첨부 범위를 넓히면 그 면제들이
+    // 함께 넓어질 위험이 생긴다(= v0.14.22 가 고친 '통과하면 안 되는 승인' 부류의 재발 경로).
+    // 데몬 전수 조사 결과 오늘은 `human_verified = human && !machine_origin && …` 의 `!machine_origin`
+    // 곱 덕분에 실제 동작이 안 바뀌지만, 그건 **한 줄의 논리곱에 기댄 안전**이다. 키를 나누면
+    // 그 의존이 사라진다 — 아래 두 블록은 **서로 다른 조건**을 갖고, 아래 블록은 종전 그대로다.
+    //   · `owner_token`  : 모든 GUI pane 쓰기(실키·machine_origin·queued) — 소비자는 ACL 등급 하나.
+    //   · `operator_token`: `!queued && !machine_origin` 일 때만 — 원장·승인 면제의 근거(불변).
+    // 값이 같은 비밀인 이유는 별도 비밀의 발급·회전·배포 경로를 새로 만드는 것 자체가 새 실패
+    // 모드이기 때문이다. 분리한 것은 비밀이 아니라 **면제 범위**다.
+    if let Some(t) = &tok {
+        params["owner_token"] = json!(t);
+    }
+    // 표식이 붙은 자동 주입에는 `operator_token` 을 아예 붙이지 않는다(데몬도 표식으로 무시하지만,
+    // 첨부 자체를 하지 않는 편이 "이 키는 사람 실키 전용"이라는 계약을 코드 한 곳에서 더 분명히
+    // 만든다). ★이 조건을 넓히지 마라 — 넓히면 원장 무기록·자기승인 면제가 함께 넓어진다.
     if !q && !mo {
-        if let Some(tok) = read_operator_token_for(&sock) {
-            params["operator_token"] = json!(tok);
+        if let Some(t) = &tok {
+            params["operator_token"] = json!(t);
         }
     }
     rpc_on(&sock, "surface.send_text", params).await.map(|_| ())

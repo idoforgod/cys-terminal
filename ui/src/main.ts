@@ -1603,13 +1603,27 @@ let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 �
 // 키 = Workspace.socket ?? DEFAULT_SOCKET_KEY(=기본 데몬). 값 = 마지막으로 **성공 조회한** 대기 수.
 const pendingBySocket = new Map<string, number>();
 const DEFAULT_SOCKET_KEY = ""; // Workspace.socket === undefined(기본 데몬)의 맵 키
-// 기본 데몬이 **아닌** 소켓들의 대기 합 — 승인 Feed 목록(기본 데몬 전용)이 원리적으로 닿지
-// 못하는 건수다. 파생이 아니라 직접 합이므로 음수가 될 수 없고, 기본 데몬 목록의 길이·갱신
-// 시점과 무관하다(두 조회 사이 스큐가 문구를 오염시키지 않는다).
-const otherSocketPending = (): number => {
-  let n = 0;
-  for (const [sock, cnt] of pendingBySocket) if (sock !== DEFAULT_SOCKET_KEY) n += cnt;
-  return n;
+// ★결함#4-b(2026-08-22 오너 실사고) — 부서 데몬 대기의 **가시성**.
+// 종전 승인 Feed 에는 "다른 워크스페이스(부서 데몬)의 대기 N건은 이 목록에 나오지 않습니다"
+// 라는 경고문 한 줄뿐이었다. **어느 부서인지·어디로 가야 하는지**가 없어 부서에서 벌어지는
+// 상태(단독 각성·티켓 대기·승인 대기)가 오너 화면에서 통째로 사라졌고, 오너는 "그냥 멈췄다"고
+// 체감했다. 수리는 부서별 건수 + 그 부서로 가는 클릭 동선이다.
+// ★새 조회를 만들지 않는다: refreshSidebarStatus 가 **이미 같은 순회에서** 소켓별 대기 수를
+//   pendingBySocket 에 채워 둔다(추가 RPC 0 · 스큐 0 — 배너 값과 같은 스냅샷).
+// ★종전 otherSocketPending(기본 소켓을 뺀 **합계 하나**)을 이 함수가 흡수했다 — 합계는
+//   `deptPendingRows().reduce(...)` 로 그대로 나오고, 이제 **어느 부서인지**까지 함께 나온다.
+//   합계 성질(파생 아닌 직접 합 · 음수 불가 · 기본 데몬 목록 길이·갱신 시점과 무관)은 불변이다.
+type DeptPending = { socket: string; label: string; count: number };
+const deptPendingRows = (): DeptPending[] => {
+  const rows: DeptPending[] = [];
+  for (const [sock, cnt] of pendingBySocket) {
+    if (sock === DEFAULT_SOCKET_KEY || cnt <= 0) continue;
+    // 라벨은 탭 이름(오너가 화면에서 부르는 이름). 탭이 없으면(레지스트리 잔재) socket 경로로 폴백 —
+    // 이름을 못 찾았다고 건수를 숨기면 '보이지 않는 대기'가 다시 생긴다.
+    const ws = workspaces.find((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === sock);
+    rows.push({ socket: sock, label: ws?.name ?? sock, count: cnt });
+  }
+  return rows.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 };
 const root = document.getElementById("root")!;
 
@@ -4211,6 +4225,51 @@ function wireFeedDismiss(dismiss: HTMLButtonElement, requestId: string) {
 //    코드가 없어 거짓 계약이었다(성찰3 설계렌즈 minor — 주석=계약 규약 위반).
 let feedPendingExpanded = false;
 
+// ★#4-b — '이 목록이 원리적으로 닿지 못하는 대기'를 **부서별 건수 + 이동 버튼**으로 그린다.
+// 반환 = 그렇게 노출한 총 대기 수(0이면 아무것도 그리지 않는다).
+//
+// ★정직 유지(W-4 기만 버튼 금지와 같은 규율): 이 목록의 Allow/Deny 는 여전히 **기본 데몬 전용**
+//   이다(feed_list·feed_reply 둘 다 default_socket 고정). 그래서 여기서 제공하는 것은 '처리'가
+//   아니라 '이동'뿐이다 — 남의 데몬 항목을 처리하는 척하는 버튼을 만들면 W-4 가 없앤 기만 버튼을
+//   되살리는 셈이다. 근본 수리는 feed_list/feed_reply 의 소켓 인지화이며 그 범위는 여전히 별건이다.
+function renderOtherWorkspacePending(box: HTMLElement): number {
+  const rows = deptPendingRows();
+  const total = rows.reduce((n, r) => n + r.count, 0);
+  if (total === 0) return 0;
+  const warn = document.createElement("div");
+  warn.className = "cc-empty";
+  warn.textContent =
+    `⚠ 다른 워크스페이스(부서 데몬)의 대기 ${total}건은 이 목록에서 처리할 수 없습니다 — ` +
+    `아래에서 해당 부서로 이동해 그 pane 에서 처리하세요. (이 목록의 Allow/Deny 는 기본 데몬 전용입니다.)`;
+  box.appendChild(warn);
+  for (const r of rows) {
+    const row = document.createElement("div");
+    row.className = "feed-item pending";
+    const title = document.createElement("div");
+    title.className = "fi-title";
+    title.textContent = `${r.label} — 대기 ${r.count}건`;
+    const meta = document.createElement("div");
+    meta.className = "fi-meta";
+    // 소켓 **전체 경로**는 길어 줄을 넘긴다(.fi-meta 에 word-break 없음) — 데몬 state
+    // 디렉터리명(= 부서 슬러그)만 보이고 전체 경로는 title 로 남긴다. 식별은 되게, 레이아웃은
+    // 안 깨지게. 구분자는 win/unix 둘 다 받는다(부서 소켓은 windows 에서 named pipe 경로).
+    meta.textContent = r.socket.split(/[\\/]/).filter(Boolean).slice(-2, -1)[0] ?? r.socket;
+    meta.title = r.socket;
+    const go = document.createElement("button");
+    go.textContent = "이 부서로 이동";
+    go.title = "해당 워크스페이스로 전환합니다 — 승인은 그 pane 에서 직접 처리하세요.";
+    go.addEventListener("click", () => {
+      // 전환에 성공하면 패널을 닫아 그 부서 pane 이 바로 보이게 한다(목록은 기본 데몬 것이라
+      // 열어 둬도 내용이 바뀌지 않는다 — 열린 채면 '이동했는데 화면이 그대로'로 읽힌다).
+      if (switchToWorkspaceBySocket(r.socket)) setCcOpen(false);
+      else toast("feed", "이동 불가", `${r.label} 탭이 이미 닫혔습니다 — 부서를 다시 열어 주세요.`);
+    });
+    row.append(title, meta, go);
+    box.appendChild(row);
+  }
+  return total;
+}
+
 async function refreshFeed() {
   const r = (await invoke("feed_list", { status: null }).catch(() => null)) as
     | { items: FeedItem[] }
@@ -4226,13 +4285,19 @@ async function refreshFeed() {
   if (items.length === 0) {
     // ★'비어 있음'만 적으면 거짓말이 될 수 있다 — 이 목록은 기본 데몬 1개만 보므로 부서 데몬에
     //  대기가 남아 있어도 비기 때문이다. 그 경우 사유를 함께 적는다.
-    //  ※ 수치는 **타 소켓 직접 합**(otherSocketPending)이다 — 전 소켓 합산(pendingApprovals)을
+    //  ※ 수치는 **타 소켓 직접 합**(pendingBySocket 소켓별 값)이다 — 전 소켓 합산(pendingApprovals)을
     //    쓰면 기본 데몬 자신의 대기까지 '다른 워크스페이스'로 오안내한다(두 조회 사이 스큐).
-    const elsewhere = otherSocketPending();
-    box.textContent =
-      elsewhere > 0
-        ? `(기본 데몬에는 항목이 없습니다 — 대기 ${elsewhere}건은 다른 워크스페이스(부서 데몬)에 있습니다. 해당 워크스페이스로 전환하세요.)`
-        : "(비어 있음)";
+    //  ★#4-b: 종전엔 여기서도 문장 한 줄로 끝나 '어느 부서'가 없었다 — 부서별 행+이동 버튼을
+    //    그린다(빈 목록일 때야말로 오너가 '멈췄다'고 오해하는 화면이다).
+    if (deptPendingRows().length === 0) {
+      box.textContent = "(비어 있음)";
+      return;
+    }
+    const empty = document.createElement("div");
+    empty.className = "cc-empty";
+    empty.textContent = "(기본 데몬에는 항목이 없습니다)";
+    box.appendChild(empty);
+    renderOtherWorkspacePending(box);
     return;
   }
   // ★대기 항목을 **먼저·많이** 렌더한다. 종전엔 최신순 50건만 잘랐는데, 데몬의 보존 한도가
@@ -4272,17 +4337,12 @@ async function refreshFeed() {
   //       결과가 과소·음수가 되어 배너가 사라지고, ⓑ두 조회 사이 스큐로는 과대가 되어
   //       "다른 워크스페이스에 N건" 이 사실이 아닌 수를 단정했다.
   //     이제 refreshSidebarStatus 가 같은 순회에서 소켓별로 보관한 값을 직접 합산한다
-  //     (otherSocketPending = 기본 소켓을 뺀 합) — 뺄셈이 없으니 음수가 불가능하고, 이 목록의
-  //     길이·갱신 시점과 무관하다.
-  const outOfScope = otherSocketPending();
-  if (outOfScope > 0) {
-    const warn = document.createElement("div");
-    warn.className = "cc-empty";
-    warn.textContent =
-      `⚠ 다른 워크스페이스(부서 데몬)의 대기 ${outOfScope}건은 이 목록에 나오지 않습니다 — ` +
-      `해당 워크스페이스로 전환한 뒤 그 pane 에서 처리하세요. (이 목록·버튼은 기본 데몬 전용입니다.)`;
-    box.appendChild(warn);
-  }
+  //     (deptPendingRows = 기본 소켓을 뺀 부서별 행, 그 합이 총계) — 뺄셈이 없으니 음수가
+  //     불가능하고, 이 목록의 길이·갱신 시점과 무관하다.
+  //     ★#4-b(2026-08-22): 그 값을 문장 한 줄로만 쓰던 것을 **부서별 행 + 이동 버튼**으로 바꾼다.
+  //     "N건이 어딘가에 있다"는 고지는 사각을 아는 데까지만 데려다줄 뿐, 오너를 그 부서로
+  //     데려가지 못했다(그래서 부서 상태가 '멈춤'으로 체감됐다).
+  renderOtherWorkspacePending(box);
   // (b) 상한 초과분은 '나머지 보기'로 연다 — 지울 수 없는 pending 을 만들지 않기 위함이다.
   if (pendingHidden > 0) {
     const more = document.createElement("button");
@@ -5067,6 +5127,21 @@ function jumpToSurface(sid: number, socket?: string) {
     render();
   }
   setFocus(sid); // 현재 활성 ws의 pane만 잡으므로 전환 후 호출
+}
+
+// ★#4-b: 부서 워크스페이스(socket)로 전환한다 — surface 를 특정하지 않는 판(jumpToSurface 형제).
+// 승인 Feed 의 '이 부서로 이동'이 쓴다. 대상 탭이 이미 닫혔으면(레지스트리 잔재) false 를 돌려
+// 호출부가 사실대로 알리게 한다 — 조용히 아무 일도 안 하면 '눌러도 안 되는 버튼'이 된다.
+function switchToWorkspaceBySocket(socket: string): boolean {
+  const i = workspaces.findIndex((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
+  if (i < 0) return false;
+  if (i !== activeWs) {
+    activeWs = i;
+    render();
+    const first = collectSids(current().tree)[0];
+    if (first != null) setFocus(first); // ws-tab mousedown 과 동일 2단계(전환 후 포커스)
+  }
+  return true;
 }
 
 // 60% cycle: hot 노드를 순차 점프(모듈 전역 cursor로 라운드로빈).

@@ -102,6 +102,18 @@
 `hooks/role-bootstrap.sh` `_notify_bg` · `CLAUDE.md.template:44` · 프로젝트 CLAUDE.md §7.
 심층 방어로 데몬이 schedule push 발화 시 라벨을 **강제 부착**한다(schedule.rs::ensure_machine_label).
 
+### 층0 — harness·도구 내부 알림 (병렬 축 · 2026-08-22 부서 임무 대장 오염 실사고)
+층1·층2 는 **데몬이 pane stdin 에 주입한 것**만 본다. 그런데 에이전트 harness 는 프롬프트를
+**프로세스 안에서** 합성한다 — 백그라운드 작업 완료 알림(`<task-notification>`)·슬래시 명령
+캐비앳(`<local-command-caveat>`)·시스템 리마인더(`<system-reminder>`) 등은 배달 원장에 아예
+없고 `[` 라벨도 없다. 실측으로 `<task-notification>…exit code 0…</task-notification>` 전문이
+`source":"prompt"` 로 대장에 박혀 **오너의 진짜 임무를 덮었다**. 그래서 원장 축과 **병렬로**
+판정을 하나 더 둔다(층1/층2 판정·이상징후 리포팅은 무접촉 — 상세는 `harness_origin` 위 섹션).
+판정 기준은 **잔여문 하나**다: 마커 블록(본문 포함)을 걷어낸 뒤 남는 글자가
+MISSION_MIN_CHARS 미만이면 기계 산출이다. 마커가 오너 문장 **앞에** 붙는 것은 평시 동작이라
+(선행 `<system-reminder>`·슬래시 명령 `<command-name>` 뒤에 오는 "계속하라") 위치 기반 판정은
+쓰지 않는다 — 쓰면 이 사고의 **거울상**(기계가 오너 임무를 못 들어오게 막음)이 생긴다.
+
 오탐 비대칭은 그대로다 — **거짓 양성(기계→임무)이 치명**이므로 걸린 프롬프트는
 **본문에 오너 문장이 섞여 있어도 통째로** 임무에서 제외한다(부분 추출 금지). 오너가 push 안에
 새 임무를 실어 보냈다면 그 임무는 **오너 채널로 다시 들어와야** 대장을 연다.
@@ -808,6 +820,156 @@ def has_machine_label(prompt):
     return _label_head(prompt) in ("[", _FULLWIDTH_BRACKET)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 층0(병렬 축) — harness·도구 **내부 알림** 필터 : 배달 원장을 **거치지 않는** 기계 산출
+# ══════════════════════════════════════════════════════════════════════════════
+# ★왜 축을 하나 더 다는가 (2026-08-22 실사고 · 부서 임무 대장 오염)
+#   06:30:06 에 부서 레인 임무 대장이 이렇게 덮였다 —
+#     {"mission": "<task-notification> <task-id>…</task-id> <tool-use-id>…</tool-use-id>
+#                  <output-file>…</output-file> <status>completed</status>
+#                  <summary>Background command … completed (exit code 0)</summary>
+#                  </task-notification>",
+#      "source": "prompt", "reason": "잔여문 395자 — 오너 임무로 인정"}
+#   즉 **오너의 진짜 임무를 기계 산출물이 덮었다**. 층1(배달 원장 대조)은 데몬이 pane stdin 에
+#   주입한 것만 원장에 남기므로, 에이전트 harness 가 **프로세스 내부에서** 프롬프트에 합성해
+#   넣는 알림(백그라운드 작업 완료·슬래시 명령 캐비앳·시스템 리마인더)은 원장에 아예 없다.
+#   층2(라벨)도 `[` 로 시작하지 않으므로 못 잡는다. 두 층 모두 **구조적으로 볼 수 없는** 경로라
+#   층을 깎는 대신 **병렬 축**을 하나 더 단다(층1/층2 판정·이상징후 리포팅은 무접촉).
+#
+# ★판정 규칙 — **잔여문 지배 하나뿐이다**(2026-08-22 master 판정으로 규칙 축소).
+#   마커 블록(여는 태그~닫는 태그 · **본문 포함**)을 제거한 잔여문이 MISSION_MIN_CHARS
+#   미만이면 기계 산출이다. 위 실측 문자열이 정확히 이 경우다(잔여문 0자).
+#
+# ★기각된 규칙 — "시작부 지배"(초안에 있었다 · master 반려 2026-08-22)
+#   초안은 "선행 공백을 벗긴 첫 글자부터 마커 태그가 시작하면 기계"라는 규칙을 **OR** 로 함께
+#   걸었다. 이것은 **우리가 고치려던 결함의 거울상**을 새로 만든다 — harness 는 마커를 오너
+#   프롬프트 **앞에** 덧붙이는 일이 일상적이기 때문이다(실측):
+#     · `<system-reminder>…</system-reminder>` 는 오너 메시지에 선행 첨부된다.
+#     · 오너가 슬래시 명령을 쓰면 `<command-name>/model</command-name>
+#       <command-message>…</command-message>` 가 **앞에** 붙고 **뒤에 오너의 진짜 지시**
+#       ("계속하라")가 온다 — 실제로 있었던 입력이다.
+#   시작부 규칙이면 그 "계속하라"가 임무로 등록되지 않는다. 오너가 부재중 자율 진행을
+#   지시한 상황에서는 **임무 미등록 = 작업 정지**이므로 "한 번 더 물어보면 된다"로 넘길 수
+#   있는 피해가 아니다. 그리고 시작부 규칙이 잡아 주던 검체는 **전부 잔여문 규칙이 이미
+#   잡는다**(순수 알림은 잔여 0자다) — 즉 그 규칙은 위험만 추가하고 능력은 더하지 않았다.
+#   **되살리지 마라.** 되살리면 아래 self-test ⑪ 의 '선행 첨부' 통과 corpus 가 즉시 FAIL 한다.
+#
+# ★과잉 차단 금지(오너가 이 단어를 **인용하며** 진짜 임무를 줄 수 있으므로 근거를 좁힌다):
+#     · 마커는 **XML 태그 형태**(`<name …>`·`</name>`)일 때만 인정한다. 본문 중 단순 언급
+#       ("system-reminder 훅이 왜 붙는지 조사해줘")은 `<`·`>` 가 없어 매치되지 않는다.
+#     · 이름 경계를 `(?![\w-])` 로 못박아 `<summary-of-changes>` 같은 **다른 태그**는 안 잡는다.
+#     · 마커가 오너 문장 **앞이든 뒤든 양쪽이든** 잔여문이 살아 있으면 통과한다 — 오너 임무가
+#       죽지 않는다. 판정은 위치가 아니라 **남은 내용**이 정한다.
+#
+# ★이상징후 코드를 새로 만들지 않는 이유: 이것은 **판정 그 자체**이지 보고 전용 흔적이 아니다
+#   (ANOMALY_CODES 등재소 주석의 '이것이 아닌 것' 절 참조). 근거는 대장의 `source`/`reason`
+#   으로 남는다 — `ledger_status`/`reason` 이 fail-closed 사유를 나르는 것과 같은 층위다.
+HARNESS_MARKERS = (
+    "task-notification",
+    "system-reminder",
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    # ★`command-args` 추가(2026-08-22): 슬래시 명령 알림은 name·message·args **세 블록이 한
+    #   덩어리**로 붙는다. args 만 빠뜨리면 오너가 슬래시 명령 뒤에 지시를 붙였을 때 잔여문에
+    #   `<command-args></command-args>` 찌꺼기가 남아, 잔여문이 오너 문장과 정확히 일치하지
+    #   않는다(판정은 같아도 대장 기록·감사 대조가 흐려진다). 지시된 목록은 **최소 집합**이다.
+    "command-args",
+    "tool-use-id",
+    "output-file",
+    "summary",
+    "task-id",
+)
+
+# 마커 **태그** 1개(여는·닫는·자기닫힘 전부). 이름 뒤 `(?![\w-])` = 이름 경계 못박기.
+_HARNESS_TAG = re.compile(
+    r"<\s*/?\s*(?:%s)(?![\w-])[^<>]*>"
+    % "|".join(re.escape(m) for m in HARNESS_MARKERS), re.IGNORECASE)
+
+# 마커 **블록**(여는 태그 ~ 같은 이름 닫는 태그 · 본문 포함). 본문까지 지워야 잔여문이 0 이 된다 —
+# 태그만 지우면 위 실측 문자열의 잔여문이 여전히 수백 자라 판정이 발화하지 못한다.
+_HARNESS_BLOCKS = tuple(
+    re.compile(r"<\s*%s(?![\w-])[^<>]*>.*?<\s*/\s*%s(?![\w-])\s*>"
+               % (re.escape(m), re.escape(m)), re.IGNORECASE | re.DOTALL)
+    for m in HARNESS_MARKERS)
+
+# 마커별 (이름, 여는 태그, 닫는 태그) — **미종결 폴백** 전용(아래 `_harness_strip` ② 참조).
+_HARNESS_OPEN_CLOSE = tuple(
+    (m,
+     re.compile(r"<\s*%s(?![\w-])[^<>]*>" % re.escape(m), re.IGNORECASE),
+     re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE))
+    for m in HARNESS_MARKERS)
+
+
+def _harness_strip(text):
+    """(잔여문, 미종결 마커 목록) — 마커 블록·잔여 태그를 제거한다. **순수 함수**.
+
+    ① 짝이 맞는 블록을 수렴할 때까지 제거(본문 포함).
+    ② ★미종결 폴백(2026-08-22 master 지시 2): 여는 태그는 있는데 **닫는 태그가 없으면**
+       그 지점부터 **문자열 끝까지**를 블록으로 간주해 잘라낸다.
+         · 왜 필요한가: '시작부 지배' 규칙을 걷어내면서 유일하게 약해지는 지점이 여기다.
+           잘린 알림(전송 중 절단·중첩 이상)은 ① 로 안 지워져 잔여문이 통째로 남고, 그러면
+           순수 기계 산출이 그대로 통과한다.
+         · **닫는 태그가 없을 때만** 적용한다(짝이 맞는 블록은 ① 이 이미 정확히 지웠다).
+         · 적용 사실은 호출자에게 목록으로 돌려 **사유 문자열에 남긴다**(감사 가능성 —
+           "왜 이만큼이 잘렸는가"가 대장에서 읽혀야 한다).
+         · 종료성: 매 회 `out` 이 **엄격히 짧아진다**(여는 태그 시작 위치로 절단).
+    ③ 짝 없이 남은 단독 태그(닫는 태그만 있는 경우 등)를 마지막으로 제거.
+    """
+    out = text or ""
+    for rx in _HARNESS_BLOCKS:
+        prev = None
+        while prev != out:                       # 중첩·반복 블록까지 수렴할 때까지
+            prev = out
+            out = rx.sub(" ", out)
+    unclosed = []
+    while True:
+        best = None                              # (시작 위치, 마커명) — 가장 앞선 미종결 여는 태그
+        for name, open_rx, close_rx in _HARNESS_OPEN_CLOSE:
+            mo = open_rx.search(out)
+            if mo is None or close_rx.search(out, mo.end()) is not None:
+                continue                         # 없거나, 뒤에 닫는 태그가 있다 = 폴백 대상 아님
+            if best is None or mo.start() < best[0]:
+                best = (mo.start(), name)
+        if best is None:
+            break
+        out = out[:best[0]]
+        unclosed.append(best[1])
+    out = _HARNESS_TAG.sub(" ", out)             # 짝이 없는 단독 태그 잔여분
+    return _WS.sub(" ", out).strip(), unclosed
+
+
+def strip_harness_blocks(text):
+    """마커 블록·잔여 마커 태그를 제거한 잔여문(공백 접음). `_harness_strip` 의 문자열판."""
+    return _harness_strip(text)[0]
+
+
+def harness_origin(prompt):
+    """(bool, 사유) — 이 프롬프트가 harness·도구가 **프로세스 내부에서** 합성한 알림인가.
+
+    층1(배달 원장)·층2(라벨)과 **병렬**이며 서로를 대체하지 않는다. 어느 축이든 걸리면 기계다.
+    부작용 0(대장·원장 무접촉) — 기록 판단은 호출자(`cmd_record`)가 한다.
+
+    ★판정은 **잔여문 하나**다(위 섹션 주석 '기각된 규칙' 참조). 마커가 프롬프트 앞·뒤·양쪽
+      어디에 붙어 있든, 걷어낸 뒤 오너 문장이 남아 있으면 **오너 임무다**.
+    """
+    p = prompt or ""
+    if not p.strip():
+        return False, ""
+    if _HARNESS_TAG.search(p) is None:
+        return False, ""                          # 태그 형태가 아예 없다 = 단순 언급·무관
+    residual, unclosed = _harness_strip(p)
+    if len(residual) < MISSION_MIN_CHARS:
+        tail = ""
+        if unclosed:
+            tail = (" · ★미종결 마커 폴백 적용(%s — 닫는 태그가 없어 여는 태그부터 문자열 "
+                    "끝까지를 블록으로 간주해 잘라냈다)" % ", ".join(sorted(set(unclosed))))
+        return True, ("harness 내부 알림 마커 블록을 제거한 **잔여문 %d자 < 최소 %d자** — "
+                      "프롬프트가 기계 산출로 채워져 있다(잔여 %r)%s"
+                      % (len(residual), MISSION_MIN_CHARS, residual[:40], tail))
+    return False, ""
+
+
 def _delivery_spans(norm, delivery):
     """(spans, capped) — 정규화 프롬프트 안에서 원장 레코드와 **정확히 일치**하는 구간 전부.
 
@@ -1499,6 +1661,24 @@ def _persist_anomalies(ledger_status=None):
     return rec
 
 
+def _record_harness_verdict(reason, prompt, ledger_status):
+    """층0(harness) 판정을 대장에 **mission=null 로** 남긴다 — 근거는 `source`/`reason`.
+
+    ★왜 굳이 쓰는가: 실사고의 증거가 임무 대장 그 자체였다(기계 산출이 `source":"prompt"` 로
+      박혀 있었다). 같은 자리에 **판정 근거**가 남아야 다음 사고에서 오너가 1초 만에 읽는다.
+    ★왜 진행 중 오너 임무는 덮지 않는가: 기계가 오너 임무를 **취소**하는 것은 이 사고의
+      **반대 방향 사고**이며 `_persist_anomalies` docstring ⓑ 가 명시한 불변식이다. 대장에
+      살아 있는 임무가 있으면 판정만 stderr 로 알리고 흔적(anomalies)만 병합한다 —
+      만료·세션 불일치는 `gate()` 가 별도로 판정하므로 여기서 손댈 이유가 없다.
+    """
+    rec, _bad = read_ledger()
+    if isinstance(rec, dict) and rec.get("mission"):
+        _persist_anomalies(ledger_status)
+        return None
+    return write_ledger(None, "harness_notification", reason, prompt,
+                        ledger_status=ledger_status)
+
+
 def cmd_record(argv):
     """stdin(UserPromptSubmit hook JSON) → 대장 갱신. 훅 전용(1왕복).
 
@@ -1541,6 +1721,15 @@ def cmd_record(argv):
         #   판정 필드를 건드리지 않고 `anomalies` 만 대장에 병합해 영속한다.
         _stderr_anomalies()
         _persist_anomalies(lstatus)
+        return gate()[0]
+    # ── ★층0(병렬 축) harness·도구 내부 알림 배제 (2026-08-22 부서 임무 대장 오염 실사고) ──
+    # 층1/층2 가 **구조적으로 볼 수 없는** 경로다(원장 미경유·무라벨). 위 두 층의 판정·이상징후
+    # 리포팅은 한 글자도 건드리지 않고, 통과분만 여기서 한 번 더 거른다.
+    is_harness, hwhy = harness_origin(prompt)
+    if is_harness:
+        sys.stderr.write("[mission] harness 내부 알림 — 임무 아님(대장 오염 차단): %s\n" % hwhy)
+        _stderr_anomalies()
+        _record_harness_verdict(hwhy, prompt, lstatus)
         return gate()[0]
     v = detect.detect(prompt)
     mission, reason = extract_mission(prompt, detect)
@@ -1898,6 +2087,72 @@ def cmd_self_test():
         ok, _r = label_only(p)
         if ok:
             fails.append("오너 문장을 기계로 오탐 %r (라벨 판별 과확장)" % p)
+    # ── ⑪층0(병렬 축) harness·도구 내부 알림 배제 — 2026-08-22 부서 임무 대장 오염 실사고 ──
+    #    ★corpus 는 실측 문자열 그대로다(요약·재작성 금지 — 재현 검체의 가치는 원문에 있다).
+    _hn_real = ("<task-notification> <task-id>bacbyhtv8</task-id> "
+                "<tool-use-id>toolu_01ABCdefGHIjklMNOpqrs</tool-use-id> "
+                "<output-file>/tmp/claude-501/bg-out.txt</output-file> "
+                "<status>completed</status> "
+                "<summary>Background command `python3 javis_orchestra.py check` completed "
+                "(exit code 0)</summary> </task-notification>")
+    #    ★잘린 알림(닫는 태그 없음) — 미종결 폴백 검체. 시작부 규칙을 걷어내면서 유일하게
+    #      약해지는 지점이라 여기서 못박는다.
+    _hn_trunc = ("<task-notification> <task-id>bacbyhtv8</task-id> "
+                 "<tool-use-id>toolu_01ABCdefGHIjklMNOpqrs</tool-use-id> "
+                 "<summary>Background command")
+    for p, why in (
+        (_hn_real, "실측 사고 문자열(2026-08-22 06:30:06)"),
+        ("<system-reminder>Codebase instructions …</system-reminder>", "시스템 리마인더 단독"),
+        ("<local-command-caveat>Caveat: 아래는 슬래시 명령 출력입니다</local-command-caveat>",
+         "슬래시 명령 캐비앳"),
+        ("<command-name>/clear</command-name><command-message>clear</command-message>",
+         "명령 알림 연쇄"),
+        (_hn_trunc, "닫는 태그 없는 잘린 알림 — 미종결 폴백"),
+    ):
+        ok, r = harness_origin(p)
+        if not ok:
+            fails.append("harness 내부 알림 미탐 %r (%s · %s) — 기계 산출이 오너 임무를 "
+                         "덮는다(2026-08-22 사고 재현)" % (p[:60], why, r))
+    #    미종결 폴백은 **사유에 흔적을 남긴다**(왜 이만큼 잘렸는지 대장에서 읽혀야 한다)
+    _tr_ok, _tr_why = harness_origin(_hn_trunc)
+    if _tr_ok and "미종결" not in _tr_why:
+        fails.append("미종결 폴백을 적용하고도 사유에 그 사실이 없다(%r) — 감사 불가" % _tr_why)
+    #    ★오너 문장은 접지 않는다 — 마커가 **앞**이든 뒤든 양쪽이든 잔여문이 살아 있으면 임무다.
+    #      (앞에 붙는 형태가 평시 동작이라, 여기서 접히면 이 사고의 거울상이 된다 — master 반려
+    #       사유 그대로다. '시작부 지배' 규칙을 되살리면 이 corpus 가 즉시 FAIL 한다.)
+    for p, why, want_residual in (
+        ("task-notification 이 왜 임무로 기록되는지 조사해줘", "태그 아닌 단순 언급", None),
+        ("system-reminder 훅 동작을 정리해서 보고해라", "태그 아닌 단순 언급", None),
+        ("이 로그에서 <summary> 태그를 파싱하는 코드를 짜줘", "본문 중 마커 태그 1개", None),
+        ("릴리스 노트 초안을 만들어줘\n<system-reminder>Memory contents …</system-reminder>",
+         "오너 임무 **뒤** 리마인더(평시 경로)", "릴리스 노트 초안을 만들어줘"),
+        ("<system-reminder>Codebase instructions …</system-reminder>"
+         "부서 플로우 6결함을 고치고 배포하라.",
+         "★오너 임무 **앞** 리마인더(평시 경로 · 거울상 차단)",
+         "부서 플로우 6결함을 고치고 배포하라."),
+        ("<command-name>/model</command-name>\n<command-message>model</command-message>\n"
+         "<command-args></command-args>\n계속하라",
+         "★슬래시 명령 블록 뒤의 오너 지시(실측 형태)", "계속하라"),
+        ("<system-reminder>Memory …</system-reminder>\n부서 플로우 6결함을 고치고 배포하라.\n"
+         "<task-notification><status>completed</status></task-notification>",
+         "★선행 + 후행 동시", "부서 플로우 6결함을 고치고 배포하라."),
+        ("<summary-of-changes> 형식으로 정리해줘", "이름 경계 — 다른 태그를 삼키지 않는다", None),
+    ):
+        ok, r = harness_origin(p)
+        if ok:
+            fails.append("오너 문장을 harness 알림으로 오탐 %r (%s · %s) — 과잉 차단으로 "
+                         "오너 임무가 죽는다(사고의 거울상)" % (p[:60], why, r))
+        if want_residual is not None and strip_harness_blocks(p) != want_residual:
+            fails.append("잔여문이 오너 문장과 다르다 %r (%s): got=%r want=%r"
+                         % (p[:40], why, strip_harness_blocks(p), want_residual))
+    #    잔여문 계산이 **블록 본문까지** 지우는가(태그만 지우면 판정이 영영 발화하지 않는다)
+    if strip_harness_blocks(_hn_real) != "":
+        fails.append("harness 블록 제거가 본문을 남겼다(%r) — 태그만 지우면 잔여문 지배 판정이 "
+                     "죽는다" % strip_harness_blocks(_hn_real)[:60])
+    #    미종결 폴백은 **닫는 태그가 있을 때는 적용되지 않는다**(과잉 절단 차단)
+    if _harness_strip("<system-reminder>x</system-reminder>오너 문장")[1]:
+        fails.append("짝이 맞는 블록에도 미종결 폴백이 적용됐다 — 뒤따르는 오너 문장이 통째로 "
+                     "잘려 나간다(과잉 절단)")
     # ── ⑩정규화 규칙이 생산자(delivery.rs::normalize)와 같은가 — 교차언어 앵커 ──
     if _normalize_delivery("  a \t\n b  ") != "a b":
         fails.append("정규화 규칙 이탈(공백 접기) — Rust delivery.rs::normalize 와 갈렸다")
@@ -2834,6 +3089,56 @@ def cmd_self_test():
                     fails.append("machine-origin CLI 가 임무 대장을 만들었다 — 판정 전용 계약 "
                                  "위반(무기록·무부작용)")
 
+                # ══════════════════════════════════════════════════════════════
+                # ★층0 harness 내부 알림 — `record` 소비면 end-to-end (2026-08-22 사고)
+                #   순수 함수 corpus(⑪)와 별개로, **훅이 실제로 부르는 경로**가 대장을
+                #   오염시키지 않는지 못박는다. 사고의 증거가 대장 파일 그 자체였다.
+                # ══════════════════════════════════════════════════════════════
+                def _rec_run(payload):
+                    _old_in = sys.stdin
+                    try:
+                        sys.stdin = io.StringIO(payload)   # .buffer 없음 → 텍스트 분기
+                        return cmd_record([])
+                    finally:
+                        sys.stdin = _old_in
+
+                _reset_ledgers()
+                _hp = ledger_path()
+                if os.path.exists(_hp):
+                    os.remove(_hp)
+                _rec_run(json.dumps({"prompt": _hn_real}, ensure_ascii=False))
+                _hrec, _hbad = read_ledger()
+                if not isinstance(_hrec, dict):
+                    fails.append("harness 알림 record 후 대장을 읽지 못했다(%s)" % _hbad)
+                else:
+                    if _hrec.get("mission") is not None:
+                        fails.append("★harness 내부 알림이 임무로 기록됐다(%r) — 2026-08-22 "
+                                     "실사고 그대로 재현(치명)" % str(_hrec.get("mission"))[:60])
+                    if _hrec.get("source") != "harness_notification":
+                        fails.append("harness 판정 근거가 대장에 남지 않았다(source=%r) — "
+                                     "다음 사고에서 원인을 읽을 자리가 없다"
+                                     % _hrec.get("source"))
+                    if not (_hrec.get("reason") or ""):
+                        fails.append("harness 판정 사유가 비었다(reason 결손)")
+                if gate()[0] != EXIT_NONE:
+                    fails.append("harness 알림 기록 후 게이트가 열렸다 — 기계 산출이 자율 착수 "
+                                 "권한을 발급한다(치명)")
+                # 진행 중 오너 임무는 harness 알림이 **덮지도 지우지도** 않는다(반대 방향 사고)
+                write_ledger("Wave2 릴리스 노트 초안 만들어줘", "prompt", "test", None)
+                _rec_run(json.dumps({"prompt": _hn_real}, ensure_ascii=False))
+                _hrec2, _ = read_ledger()
+                if (_hrec2 or {}).get("mission") != "Wave2 릴리스 노트 초안 만들어줘":
+                    fails.append("harness 내부 알림이 진행 중 오너 임무를 덮었다(mission=%r) — "
+                                 "2026-08-22 사고의 본체" % (_hrec2 or {}).get("mission"))
+                # 오너 문장은 종전대로 임무가 된다(층0 이 정상 경로를 막지 않는다)
+                if os.path.exists(_hp):
+                    os.remove(_hp)
+                _rec_run(json.dumps({"prompt": "부서 문서 정리 착수해줘"}, ensure_ascii=False))
+                _hrec3, _ = read_ledger()
+                if (_hrec3 or {}).get("mission") != "부서 문서 정리 착수해줘":
+                    fails.append("층0 추가 후 오너 평문 임무가 기록되지 않는다(mission=%r) — "
+                                 "과잉 차단 회귀" % (_hrec3 or {}).get("mission"))
+
                 _reset_ledgers()
                 _mp2 = ledger_path()
                 if os.path.exists(_mp2):
@@ -2878,7 +3183,13 @@ def cmd_self_test():
           "비정수 parts_capped 도 접기 · 초과 없으면 무발행 · "
           "★machine-origin CLI: 라벨=0 · 원장일치=0 · 오너=1 · 파싱실패/빈입력=2 · "
           "판정본문 크래시=2(fail-open 봉합) · 대장 무기록 · "
-          "stdout 판정 토큰 핀(machine/human/unknown — 소비자 1차 근거))"
+          "stdout 판정 토큰 핀(machine/human/unknown — 소비자 1차 근거) · "
+          "★층0(2026-08-22 harness 내부 알림 · 판정=잔여문 하나): 실측 사고 문자열 포함 "
+          "corpus 5종 접기(잘린 알림 미종결 폴백 포함·사유 흔적) · 오너 문장 무차단 8종"
+          "(★선행 리마인더·슬래시 명령 블록 뒤 지시·선후행 동시 — '시작부 지배' 거울상 차단) · "
+          "잔여문 정확일치 3종 · 블록 본문 제거 · 짝맞는 블록 무절단 · record e2e(mission=null · "
+          "source=harness_notification · 게이트 무개방 · 진행 중 오너 임무 무덮어쓰기 · "
+          "오너 평문 임무 정상 기록))"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 

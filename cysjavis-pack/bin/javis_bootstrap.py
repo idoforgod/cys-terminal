@@ -67,6 +67,12 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
   ⓐ CEO 티켓 권한 게이트(P7): 부서 레인(CYS_SOCKET=부서 소켓)의 팀 기동은 CEO 발급 티켓 필수.
      티켓 부재/만료 → 실패가 아니라 '부서장 단독 각성'으로 강등(팀 기동만 생략·역할 등록/프리플라이트는
      정상·exit 0). 발급은 base 레인에서 `issue-ticket --dept <name>` 로만.
+     ★2026-08-22 결함 #2 봉합: 티켓 부재를 감지하면 **스크립트가 결정론으로** base CEO 에
+       `cys send --queued --to master` 로 발급을 요청하고(`env -u CYS_SOCKET` 동형 · 요청 마커
+       + DEPT_TICKET_REQUEST_TTL_S 로 스팸 억제), 짧은 유계 대기(DEPT_TICKET_WAIT_BUDGET_S ·
+       DEPT_TICKET_WAIT_INTERVAL_S 간격) 뒤 도착하면 그대로 팀 기동으로 이어간다. 종전엔
+       안내문만 출력해 **오너가 추가 명령을 쳐야** 요청이 나갔다(실측 06:20→06:26→06:29→06:30).
+       요청·대기 실패는 전부 fail-open(단독 각성 exit 0) — base 레인 영향 0.
   ⓑ 결손 기준 자원 게이트: 팀 기동 직전 결손을 cys list 라이브 노드의 **로스터 판정**으로 산출 —
      의무 역할 목록은 `javis_orchestra.effective_required_roles()`(=⑤check가 검증하는 그 목록,
      감지 폴백 적용)을 그대로 소비하고 좌석 이름은 정확일치(worker만 worker-N 접두 수용 — check와
@@ -262,6 +268,25 @@ _CLAIM_DENIED_MARKERS = ("claim_denied", "privileged role held")
 # CEO 티켓 저장소(base 레인이 발급·부서 레인이 소비) + 24h TTL + 1회성(소비 시 .used rename).
 TICKET_DIR = os.path.join(STATE_DIR, "dept-boot-tickets")
 TICKET_TTL_SECS = float(os.environ.get("CYS_DEPT_TICKET_TTL_SECS", str(24 * 3600)))
+
+# ── 부서 레인 CEO 티켓 **자동 요청**(2026-08-22 현장 결함 #2) ────────────────────
+# ★결함: ③″ 티켓 게이트가 티켓 부재를 감지하고도 **안내문만 출력하고 끝났다**. 그래서 부서장은
+#   팀 없이 대기했고, 오너가 추가 명령을 쳐야만 CEO 에게 티켓을 요청했다 —
+#   실측 2026-08-22: 06:20 단독각성 → 06:26 **오너 추가입력** → 06:29 요청 → 06:30 발급 → 팀 기동.
+#   오너 절대규칙(아래 _dept_fallback 상단 주석)은 "선언자는 새 부서장이 되며 팀이 **기동돼야
+#   한다**"이므로, 요청은 오너 타이핑이 아니라 **스크립트가 결정론으로** 발사한다.
+# ★계약(fail-open 불변): 요청·대기의 어떤 실패도 부트를 실패시키지 않는다. 미도착이면 종전과
+#   똑같이 단독 각성(exit 0) — 이 경로는 부서 레인 전용이라 base 레인 영향은 0 이다.
+DEPT_TICKET_REQ_DIR = os.path.join(STATE_DIR, "dept-ticket-requests")
+# 요청 억제 TTL(초) — 재부팅 반복 시 CEO 큐 스팸 차단. ★TTL 경과 후에는 **다시 요청한다**
+#   (영구 침묵 금지: 한 번 실패한 부서가 영영 팀을 못 받는 상태가 더 나쁘다).
+DEPT_TICKET_REQUEST_TTL_S = float(os.environ.get("CYS_DEPT_TICKET_REQUEST_TTL_S", "600"))
+# 요청 후 티켓 도착을 기다리는 **유계** 예산(초)·폴링 간격(초). 부트 총시간에 얹히는 값이라
+# 짧게 잡는다 — 못 받아도 단독 각성으로 진행하므로 길게 기다릴 이유가 없다.
+DEPT_TICKET_WAIT_BUDGET_S = float(os.environ.get("CYS_DEPT_TICKET_WAIT_S", "90"))
+DEPT_TICKET_WAIT_INTERVAL_S = float(os.environ.get("CYS_DEPT_TICKET_WAIT_INTERVAL_S", "3"))
+# 요청 push 1회의 상한(초) — 데몬 부재 시 부트가 매달리지 않게.
+DEPT_TICKET_PUSH_TIMEOUT_S = 15
 
 def _atomic_write_json(path, obj):
     """CRLF 함정 회피(newline='\\n')·원자 교체 — Windows 재직렬화 원복 교훈.
@@ -540,6 +565,12 @@ _STEP_DEFS = (
     ("DEPT_FB_CHECK", "③-d dept-check"),
     ("DEPT_FB_NOTIFY", "③-d dept-notify"),
     ("CEO_TICKET", "③″ceo-ticket"),
+    # ★2026-08-22 결함 #2: 티켓 부재를 감지만 하고 끝내지 않는다 — base CEO 에 발급을 요청하고
+    #   유계 대기한 뒤, 그래도 없으면 단독 각성으로 강등한다. 선언 순서 = 실행 순서 계약대로
+    #   감지(CEO_TICKET) → 요청 → 대기 → 단독각성 고지 순으로 선언한다.
+    ("CEO_TICKET_REQUEST", "③″ceo-ticket-request"),
+    ("CEO_TICKET_WAIT", "③″ceo-ticket-wait"),
+    ("CEO_TICKET_SOLO", "③″ceo-ticket-solo"),
     ("RESOURCE_GATE_ABSENT", "④′resource-gate-absent"),
     ("RESOURCE_GATE", "④′resource-gate"),
     ("RESOURCE_GATE_NOTIFY", "④′resource-gate-notify"),
@@ -974,6 +1005,138 @@ def _consume_dept_ticket(path):
         return "소비(.used)"
     except OSError as e:
         return "소비 실패(%s — 이미 rename됐거나 권한): 계속" % e
+
+
+# ── 증분3 ⓐ: 티켓 부재 → base CEO 에 **결정론 발급 요청**(2026-08-22 현장 결함 #2) ──
+def _dept_ticket_request_path(dept):
+    return os.path.join(DEPT_TICKET_REQ_DIR, "%s.request" % dept)
+
+
+def _dept_ticket_request_message(dept):
+    """CEO 에게 보낼 요청 문안 — **단일 출처**(테스트가 이 함수를 대조한다).
+    수신자가 그대로 복사해 실행할 수 있게 발급 명령을 문안에 넣는다."""
+    return ("[부서장→CEO 요청] %s 부서장입니다. 팀 기동용 CEO 티켓 발급을 요청합니다"
+            "(javis_bootstrap.py issue-ticket --dept %s)." % (dept, dept))
+
+
+def _dept_ticket_request_cmd(dept):
+    """요청 push 명령 — **단일 출처**. `--queued` 는 대상이 조용해질 때 데몬이 주입하고 Return 도
+    데몬이 넣는다(send-key 불필요). 역할 주소 master = base 레인의 CEO 다."""
+    return ["cys", "send", "--queued", "--to", "master", _dept_ticket_request_message(dept)]
+
+
+def _base_lane_env():
+    """base 레인 대상 명령의 env — 부서 소켓 상속 제거(`env -u CYS_SOCKET` 과 동형).
+
+    ★surface 변수도 함께 벗긴다: 부서 데몬의 surface id 공간과 base 데몬의 id 공간은 다르므로,
+      그대로 물려주면 base 쪽에서 **동번호 남의 pane** 으로 오배선될 여지가 생긴다
+      (`_dept_lane_env` 가 반대 방향에서 같은 이유로 pop 하는 것과 대칭이다).
+    """
+    e = dict(os.environ)
+    e.pop("CYS_SOCKET", None)
+    e.pop("CYS_SURFACE_ID", None)
+    e.pop("CYS_SURFACE_REF", None)
+    return e
+
+
+def _base_ceo_alive():
+    """base 레인에 살아있는 CEO(master 좌석 · agent 실재)가 있는가 — `cys status --json` 실측.
+
+    ★술어를 새로 쓰지 않고 `_dept_master_alive` 를 **재사용**한다: '살아있는 master' 판정이
+      레인마다 갈리면 두 판정이 따로 낡는다(P0 교정에서 이미 한 번 태운 값이다).
+    ★판독 불가(비0·JSON 아님·빈 로스터)는 **없음**으로 접는다 — 이 경로에서 '없음'은 종전
+      동작(요청 없이 단독 각성)이므로 안전 방향이다.
+    """
+    return _dept_master_alive(_base_lane_env())
+
+
+def _dept_ticket_request_suppressed(dept, now=None):
+    """(억제 bool, 사유) — 같은 부서의 최근 요청이 TTL 안이면 재요청하지 않는다(스팸 차단).
+
+    마커 판독 실패(부재·손상)는 **억제하지 않는다**(요청이 나가는 방향 = 팀이 서는 방향).
+    """
+    now = time.time() if now is None else now
+    rec = _read_json(_dept_ticket_request_path(dept))
+    if not isinstance(rec, dict):
+        return False, "요청 마커 없음(첫 요청)"
+    ts = rec.get("requested_at")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return False, "요청 마커 형식 오류 — 억제하지 않는다"
+    age = now - ts
+    if age < 0:
+        return False, "요청 마커 시각이 미래(시계 이상 %ds) — 억제하지 않는다" % int(-age)
+    if age > DEPT_TICKET_REQUEST_TTL_S:
+        return False, ("직전 요청 %dm 전 > 억제 TTL %dm — **다시 요청한다**(영구 침묵 금지)"
+                       % (age / 60, DEPT_TICKET_REQUEST_TTL_S / 60))
+    return True, ("직전 요청 %ds 전(억제 TTL %ds 이내) — 중복 push 생략(CEO 큐 스팸 차단)"
+                  % (age, DEPT_TICKET_REQUEST_TTL_S))
+
+
+def _mark_dept_ticket_requested(dept, now=None):
+    """요청 발사 흔적 기록(멱등 억제의 근거). 쓰기 실패는 부트를 죽이지 않는다 — 최악은 재요청."""
+    now = time.time() if now is None else now
+    try:
+        _atomic_write_json(_dept_ticket_request_path(dept),
+                           {"dept": dept, "requested_at": now,
+                            "requested_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                              time.localtime(now)),
+                            "requester": my_surface_id() or "dept-master",
+                            "ttl_secs": DEPT_TICKET_REQUEST_TTL_S})
+        return True, "요청 마커 기록"
+    except Exception as e:
+        return False, "요청 마커 기록 실패(%s: %s) — 다음 부트가 재요청할 수 있다" % (
+            type(e).__name__, e)
+
+
+def _request_dept_ticket(dept):
+    """티켓 부재 → base CEO 에게 발급 요청 push. → (요청됨 bool, 사유).
+
+    ★fail-open 절대: CEO 노드 부재·데몬 다운·push 실패 전부 (False, 사유) 로 **조용히가 아니라
+      시끄럽게** 돌아온다. 호출자는 그래도 부트를 계속한다(단독 각성 exit 0).
+    ★멱등: 같은 부트에서 이 함수는 1회만 불린다(호출 지점이 하나다). 재부팅 반복은 요청 마커
+      + TTL 이 억제하고, TTL 경과 후에는 다시 요청한다.
+    """
+    suppressed, swhy = _dept_ticket_request_suppressed(dept)
+    if suppressed:
+        return False, swhy
+    if not _base_ceo_alive():
+        # ★수신자 확인 선행(계약: "CEO 노드가 없으면 fail-open"). 없는 수신자에게 던지고
+        #   유계 대기까지 도는 것은 부트 시간만 태운다 — 종전 동작(단독 각성)으로 그대로 간다.
+        return False, ("base 레인에 살아있는 CEO(master 좌석·agent 실재)를 확인하지 못했다 — "
+                       "요청 push 를 보류하고 단독 각성으로 진행한다(fail-open)")
+    code, out, err = _run_env(_dept_ticket_request_cmd(dept), _base_lane_env(),
+                              timeout=DEPT_TICKET_PUSH_TIMEOUT_S)
+    if code != 0:
+        return False, ("요청 push 실패(exit %s) — 부트는 계속한다(fail-open): %s"
+                       % (code, (err or out or "").strip()[:200]))
+    _marked, mwhy = _mark_dept_ticket_requested(dept)
+    return True, ("base 레인 master(CEO)에 티켓 발급 요청 push(--queued 배달 — Return 은 데몬이 "
+                  "넣는다). %s" % mwhy)
+
+
+def _await_dept_ticket(dept, budget_s=None, interval_s=None, sleeper=None, clock=None):
+    """요청 후 티켓 도착을 **유계** 폴링. → (유효 bool, 사유, path).
+
+    ★유계인 이유: 무기한 대기는 싱글플라이트 락 보유 연장(치명 앵커 ③)이고, 미도착이어도
+      단독 각성으로 진행하는 것이 계약이다. 첫 조회는 **자지 않고** 즉시 한다(이미 도착했을 수 있다).
+    ★sleeper/clock 주입: 테스트가 실시간을 소모하지 않고 예산 소진을 결정론으로 검증한다.
+    """
+    budget = DEPT_TICKET_WAIT_BUDGET_S if budget_s is None else budget_s
+    interval = DEPT_TICKET_WAIT_INTERVAL_S if interval_s is None else interval_s
+    sleeper = time.sleep if sleeper is None else sleeper
+    clock = time.time if clock is None else clock
+    deadline = clock() + max(0.0, budget)
+    polls = 0
+    while True:
+        polls += 1
+        ok, why, path = _peek_dept_ticket(dept)
+        if ok:
+            return True, "티켓 도착(폴링 %d회) — %s" % (polls, why), path
+        remain = deadline - clock()
+        if remain <= 0:
+            return False, ("유계 대기 %ds(간격 %ds · 폴링 %d회) 안에 티켓이 오지 않았다 — %s"
+                           % (budget, interval, polls, why)), path
+        sleeper(min(interval, remain))
 
 
 # ---------------- 위계 폴백: 2번째 마스터 선언 → 부서 자동 생성 (현장 결함 3호) ----------------
@@ -2000,28 +2163,62 @@ def _cmd_run_chain(log):
     if dept is not None:
         _progress("③″ CEO 티켓 권한 게이트(부서 레인=%s)…" % dept)
         ok, why, ticket_path = _peek_dept_ticket(dept)
+        requested, req_why = False, None
+        log.step(STEP.CEO_TICKET, 0,
+                 ("CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why) if ok else
+                 ("CEO 티켓 부재/만료 — base CEO 에 발급을 **요청**하고 유계 대기한다. 사유: %s"
+                  % why))
         if not ok:
-            note = ("CEO 티켓 부재 — 부서장 단독 각성(팀 기동은 CEO 티켓 발급 후). "
-                    "발급: base master에서 `javis_bootstrap.py issue-ticket --dept %s`. 사유: %s"
-                    % (dept, why))
+            # ★2026-08-22 결함 #2 봉합: 종전엔 여기서 안내문만 출력하고 끝나 부서장이 팀 없이
+            #   대기했고, **오너가 추가 명령을 쳐야** CEO 에게 요청이 갔다(실측 06:20→06:26→06:29).
+            #   오너 절대규칙은 "선언자는 새 부서장이 되며 팀이 기동돼야 한다"이므로 요청은
+            #   스크립트가 결정론으로 발사한다. 실패는 전부 fail-open(부트 무중단).
+            requested, req_why = _request_dept_ticket(dept)
+            log.step(STEP.CEO_TICKET_REQUEST, 0 if requested else 1, req_why)
+            _progress(("③″ CEO 티켓 발급 요청 push 발사 — %s" if requested
+                       else "⚠ ③″ CEO 티켓 발급 요청 미발사 — %s") % req_why)
+            if requested:
+                _progress("③″ CEO 티켓 도착 대기(최대 %ds · %ds 간격 폴링)…"
+                          % (DEPT_TICKET_WAIT_BUDGET_S, DEPT_TICKET_WAIT_INTERVAL_S))
+                ok, wait_why, ticket_path = _await_dept_ticket(dept)
+                log.step(STEP.CEO_TICKET_WAIT, 0 if ok else 1, wait_why)
+                _progress(("③″ CEO 티켓 수령 — 팀 기동으로 진행. %s" if ok
+                           else "③″ CEO 티켓 미도착 — 단독 각성 유지. %s") % wait_why)
+                why = wait_why
+        if not ok:
+            # ── #4-a: 단독 각성 보고는 **원인·현재 상태·다음 단계**를 한 문장 안에 다 말한다 ──
+            #   종전 문안은 "발급하라"는 명령형뿐이라, 오너가 ⓐ요청이 이미 나갔는지 ⓑ기다리면
+            #   되는지 ⓒ자기가 뭘 해야 하는지를 알 수 없었다.
+            if requested:
+                note = ("CEO 티켓 부재 — CEO에 티켓 발급을 **요청했습니다**(대기 중). "
+                        "도착하면 팀이 자동 기동되고, 미도착이면 부서장 단독 각성을 유지합니다. "
+                        "지금은 단독 각성 상태입니다(팀 미기동). 요청: %s / 대기 결과: %s"
+                        % (req_why, why))
+            else:
+                note = ("CEO 티켓 부재 — 발급 요청을 **보내지 못했습니다**(%s). "
+                        "부서장 단독 각성으로 계속합니다(팀 미기동). 수동 발급: base master 에서 "
+                        "`javis_bootstrap.py issue-ticket --dept %s` — 발급되면 다음 부트에서 "
+                        "팀이 기동됩니다. 사유: %s" % (req_why, dept, why))
             # R1-LOW-3 검증 비대칭 경고: 발급(issue-ticket)은 정규식을 강제하나 소켓 쪽 부서명은
             # 자유 형식이라, 불일치 부서는 티켓을 영영 못 받는 비대칭이 침묵으로 남는다 — 명시.
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", dept):
                 note += (" ★주의: 부서명 %r 은 발급 정규식([a-z0-9][a-z0-9-]*) 불일치 — "
                          "이 부서명은 티켓 발급 불가 형식이다(부서 재생성 필요)." % dept)
             _progress(note)
-            log.step(STEP.CEO_TICKET, 0, note)
+            log.step(STEP.CEO_TICKET_SOLO, 0, note)
             summary = {"ok": True, "marker": "부서장 단독 각성(CEO 티켓 부재)",
                        "solo_awakening": True, "dept": dept,
+                       # ★요청 축을 기계 필드로도 노출한다 — 산문만 있으면 소비자(GUI·상위 보고)가
+                       #   "요청이 나갔는가"를 문자열 파싱으로 알아내야 한다.
+                       "ticket_requested": requested, "ticket_request_detail": req_why,
                        "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
                        "lane": log.lane, "boot_last": log.path}
             # ★A7 채널 보존: solo_awakening 은 **성공** 경로이므로 stdout 최종 JSON 을 유지한다
             #   (session-start 산문 계약 "완료 선언은 최종 JSON 인용 시에만"의 소비 대상).
             log.result(ok=True, state="solo_awakening", solo_awakening=True, reason=why,
-                       exit=EXIT_OK)
+                       ticket_requested=requested, exit=EXIT_OK)
             print(json.dumps(summary, ensure_ascii=False))
             return EXIT_OK
-        log.step(STEP.CEO_TICKET, 0, "CEO 티켓 유효 — 부서 팀 기동 진행. %s" % why)
 
     # ── 증분2 ⓑ 결손 기준 자원 사전 게이트 — 팀 기동(④) 직전 ──
     # 결손 산출 1차 경로는 orchestra 정본 _shared_verdict_deficit 위임(⑤check 판정 코어 소비
@@ -2621,6 +2818,78 @@ def cmd_self_test():
                        (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_SKIP),
                        (STEP.RESOURCE_GATE, STEP.RESOURCE_GATE_ABSENT)):
             assert _a != _b, "동명이의 잔존: %r" % (_a,)
+        # ⓓ ★티켓 자동 요청(2026-08-22 결함 #2): 감지 → 요청 → 대기 → 단독각성 고지 순서.
+        #    역순으로 선언하면 boot-last 가 매 부트마다 order_violation 을 남긴다(계측 자기파손).
+        assert STEP_INDEX[STEP.CEO_TICKET] < STEP_INDEX[STEP.CEO_TICKET_REQUEST] \
+            < STEP_INDEX[STEP.CEO_TICKET_WAIT] < STEP_INDEX[STEP.CEO_TICKET_SOLO] \
+            < STEP_INDEX[STEP.BOOT], "③″ 티켓 요청·대기 서수가 감지~④boot 사이가 아니다"
+
+        # ── t9b: 부서 CEO 티켓 자동 요청(2026-08-22 결함 #2 · fail-open 불변) ──
+        _tq_dept = "selftest-dept"
+        # ⓐ 요청 명령 조립 — `--queued`(데몬이 Return 주입) · 역할 주소 master · 발급 명령 동봉
+        _tq_cmd = _dept_ticket_request_cmd(_tq_dept)
+        assert _tq_cmd[:5] == ["cys", "send", "--queued", "--to", "master"], \
+            "요청 push 명령 계약 이탈(--queued/--to master): %r" % (_tq_cmd,)
+        assert "issue-ticket --dept %s" % _tq_dept in _tq_cmd[5], \
+            "요청 문안에 발급 명령이 없다(수신자가 무엇을 해야 하는지 모른다): %r" % _tq_cmd[5]
+        # ⓑ base 레인 env — 부서 소켓 상속 제거(`env -u CYS_SOCKET` 동형)
+        _tq_env_backup = {k: os.environ.get(k) for k in
+                          ("CYS_SOCKET", "CYS_SURFACE_ID", "CYS_SURFACE_REF")}
+        try:
+            os.environ["CYS_SOCKET"] = "/x/cys-dept-%s/cys.sock" % _tq_dept
+            os.environ["CYS_SURFACE_ID"] = "77"
+            _tq_env = _base_lane_env()
+            assert "CYS_SOCKET" not in _tq_env, "요청 push 가 부서 소켓을 물고 나간다(base 미도달)"
+            assert "CYS_SURFACE_ID" not in _tq_env, "부서 surface id 가 base 레인으로 새어 나간다"
+        finally:
+            for _k, _v in _tq_env_backup.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+        # ⓒ 멱등 억제 — TTL 안 = 억제 / TTL 밖 = **재요청**(영구 침묵 금지) / 마커 없음 = 요청
+        #    ★밀폐: 요청 마커 디렉터리를 임시 경로로 갈아 끼운다(사용자 실 상태 무접촉).
+        _tq_now = 1_700_000_000.0
+        _tq_dir_backup = DEPT_TICKET_REQ_DIR
+        _tq_tmp = tempfile.mkdtemp(prefix="boot-tq-")
+        try:
+            globals()["DEPT_TICKET_REQ_DIR"] = _tq_tmp
+            _tq_path = _dept_ticket_request_path(_tq_dept)
+            assert _tq_path.startswith(_tq_tmp), "밀폐 붕괴: 요청 마커 경로가 임시 밖이다"
+            assert _dept_ticket_request_suppressed(_tq_dept, now=_tq_now)[0] is False, \
+                "마커가 없는데 요청이 억제됐다(첫 요청이 영영 안 나간다)"
+            _atomic_write_json(_tq_path, {"dept": _tq_dept, "requested_at": _tq_now})
+            assert _dept_ticket_request_suppressed(_tq_dept, now=_tq_now + 1)[0] is True, \
+                "TTL 안 재요청이 억제되지 않는다(CEO 큐 스팸)"
+            assert _dept_ticket_request_suppressed(
+                _tq_dept, now=_tq_now + DEPT_TICKET_REQUEST_TTL_S + 1)[0] is False, \
+                "TTL 경과 후에도 억제된다(영구 침묵 — 부서가 팀을 영영 못 받는다)"
+            _atomic_write_json(_tq_path, {"dept": _tq_dept, "requested_at": "망가진 값"})
+            assert _dept_ticket_request_suppressed(_tq_dept, now=_tq_now)[0] is False, \
+                "손상 마커가 요청을 억제한다(값을 망가뜨리면 침묵시킬 수 있다)"
+        finally:
+            globals()["DEPT_TICKET_REQ_DIR"] = _tq_dir_backup
+            import shutil as _shutil
+            _shutil.rmtree(_tq_tmp, ignore_errors=True)
+        # ⓓ 유계 대기 — 티켓 없음이면 예산 안에서 끝난다(무기한 대기 = 락 보유 연장·치명)
+        _tq_slept = []
+        _tq_clock = [0.0]
+
+        def _tq_sleep(sec):
+            _tq_slept.append(sec)
+            _tq_clock[0] += sec
+
+        _tq_ok, _tq_why, _ = _await_dept_ticket(
+            _tq_dept, budget_s=9, interval_s=3,
+            sleeper=_tq_sleep, clock=lambda: _tq_clock[0])
+        assert _tq_ok is False, "없는 티켓을 도착으로 판정했다: %s" % _tq_why
+        assert sum(_tq_slept) <= 9 + 1e-6, "유계 대기가 예산을 넘겼다(합 %s)" % sum(_tq_slept)
+        assert len(_tq_slept) >= 1, "폴링 없이 즉시 포기했다(요청 직후 도착을 못 받는다)"
+        # 예산 0 이어도 **첫 조회는 한다**(이미 도착한 티켓을 놓치지 않는다)
+        _tq_slept2 = []
+        _await_dept_ticket(_tq_dept, budget_s=0, interval_s=3,
+                           sleeper=lambda s: _tq_slept2.append(s), clock=lambda: 0.0)
+        assert not _tq_slept2, "예산 0 인데 잠들었다(부트 시간 낭비)"
 
         # ── t10: TCC 탐침 대상이 실자원 파생인가(P3-A-TCC · H-PRED-10) ──
         _t = _tcc_probe_targets()
@@ -2640,7 +2909,9 @@ def cmd_self_test():
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (W6: 폴백 전제 판정 8종(부서 자동 생성 게이트) · "
+    print("javis_bootstrap self-test OK (★결함#2: CEO 티켓 자동 요청(명령 조립·base env 소켓 "
+          "격리·멱등 TTL 4종·유계 대기 2종·단계 서수) · "
+          "W6: 폴백 전제 판정 8종(부서 자동 생성 게이트) · "
           "W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "
           "레인 격리 3종 + 부서 교리 게이트 2종 + 결손 구성 판정 + "
           "로스터 결손 신구 차분 9종 + W2(A13 타입드 게이트 exit·_run_split 채널분리·B1 PLAN 정책 "

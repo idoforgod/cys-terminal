@@ -328,20 +328,114 @@ finally: _ulk(lf)
 PY
 }
 
-# 부서 데몬 ACL 시드 — external(CEO·오너셸)→worker 차단. fail-closed: 없으면 격리 붕괴이므로 항상 시드.
+# 부서 데몬 ACL 시드 — external(CEO·타 부서 노드)→worker 차단. fail-closed: 없으면 격리 붕괴이므로 항상 시드.
+#
+# ★결함#6-a(오너 실측): GUI에서 부서 워커 pane에 타이핑하면 `acl denied: external → worker
+#   (pack/acl.json)`로 막혔다. 원인은 아래 `external→worker* deny`와 팩 acl.json `_doc`의
+#   external 정의("pane 밖 프로세스(오너 셸·Tauri 등)")다 — **오너의 GUI가 external 등급**이라
+#   자기 부서 워커에게 입력을 못 넣었다. 오너 절대규칙: "cys-terminal의 모든 노드 프롬프트 창을
+#   오너가 컨트롤할 수 있어야 한다".
+# ★수정: `owner` 신원 등급을 규칙 배열 **맨 앞**에 둔다. 순서가 계약이다 — cysd
+#   `eval_acl_rules`(handlers.rs)는 `return rule["allow"]`로 **첫 매칭에서 확정**한다.
+# ★보존: CEO·타 부서 노드가 부서장을 건너뛰고 워커를 직접 조향하는 것은 계속 막는다(부서 자율성)
+#   — external→worker* deny·reviewer-*→worker* deny·external→master allow 는 불변이다.
+# ★데몬측 판정(실측 — handlers.rs `caller_is_owner`/`operator_token_ok`): 경로 검사가 아니라
+#   **operator_token** 이다. 데몬이 기동 시 발급해 `state_dir/operator.token`(unix 0600)에 쓴
+#   값을 요청에 실은 발신자만 owner 이며, 추가로 **어느 pane 에도 귀속되지 않아야** 한다
+#   (`from_sid.is_none()` — pane 이 토큰 파일을 읽어 붙여도 승격되지 않는다). 붙이는 지점은
+#   Tauri 백엔드 단 한 곳이고 공용 `cys` CLI 는 어느 경로에서도 붙이지 않는다.
+# ★하위호환: owner 규칙이 없는 기존 ACL 은 데몬이 2단 평가의 2차(종전 신원)로 그대로 흘리고,
+#   구 데몬(토큰 미지원)에서는 발신 role 이 "owner" 가 될 수 없어 이 규칙이 영영 미매칭이다 —
+#   양방향 모두 거동 변화 0이다. 이 파일은 ACL 시드(데이터)만 담당한다.
+#
+# ★seed-once + additive 마이그레이션(2026-08-22 master 지시 — 오너 정책 보존):
+#   종전엔 무조건 `cat >` 로 덮어써, `src/pack.rs` W-ACL(2026-08-01 오너 승인)이 acl.json 을
+#   **User 등급**으로 승격해 오너 정책을 보존하는 계약을 이 함수가 우회하고 있었다(부서 팩
+#   acl.json 손편집이 다음 lifecycle 호출마다 소실). 이제:
+#     · 파일 **부재** → 전체 시드(현행 동작 보존).
+#     · 파일 **존재** → 덮어쓰지 않는다. owner 규칙이 없을 때만 **맨 앞에 추가**하고 나머지
+#       규칙·필드는 텍스트 그대로 보존한다(재직렬화하지 않는다 = 오너의 서식·주석성 필드 무손실).
+#       이미 있으면 무동작(멱등).
+#   기존 부서도 다음 lifecycle 호출(launch·allocate·create·rotate)에서 owner 규칙을 받는다.
 seed_acl(){
   local pk="$1"; mkdir -p "$pk"
+  if [ -f "$pk/acl.json" ]; then
+    acl_migrate_owner "$pk/acl.json"
+    return 0
+  fi
   cat > "$pk/acl.json" <<'JSON'
 {
-  "_doc": "부서 데몬 ACL — CEO·외부는 워커 직접 조향 불가(부서장 master 경유). cys-dept 시드.",
+  "_doc": "부서 데몬 ACL — CEO·타 부서 노드는 워커 직접 조향 불가(부서장 master 경유), 오너 GUI는 전 노드 허용. 규칙은 위에서부터 첫 매칭 승리. cys-dept 시드(파일 부재 시 전체 시드 · 이미 있으면 owner 규칙만 맨 앞에 추가하고 나머지는 보존한다 — 오너 정책 무손실). from 신원 등급: 'owner'=오너 GUI(Tauri) 세션 — 데몬이 기동 시 발급한 operator_token(state_dir/operator.token·0600)을 요청에 실은 발신자만 이 등급이며, 어느 pane 에도 귀속되지 않아야 한다(pane 이 토큰을 읽어 붙여도 승격되지 않는다). CLI·워커 push·큐 배달·schedule 발화는 토큰을 붙이지 않으므로 external·역할명 그대로다. ★정직한 한계: 암호학적 방어가 아니다 — 동일 UID 프로세스는 토큰 파일을 읽어 사칭할 수 있다. 이 등급이 실제로 닫는 것은 평시 정상 동작이 사람 입력을 사칭하는 경로다. 'external'=pane 밖 프로세스(오너 셸 등). '(pane)'=역할 없는 pane.",
   "default": "allow",
   "rules": [
+    { "from": "owner", "to": "*", "allow": true,
+      "_why": "오너 직접 입력(GUI)은 전 노드 허용 — 오너는 external 이 아니다" },
     { "from": "external", "to": "worker*", "allow": false },
     { "from": "reviewer-*", "to": "worker*", "allow": false },
     { "from": "external", "to": "master", "allow": true }
   ]
 }
 JSON
+}
+
+# 기존 acl.json 에 owner 규칙만 **추가**한다(덮어쓰기 금지 · 멱등 · fail-open).
+# ★무손실 근거: json.loads 로 **판정만** 하고 쓰기는 원문 텍스트에 `"rules": [` 직후 삽입이다 —
+#   재직렬화하지 않으므로 오너의 들여쓰기·키 순서·추가 필드가 바이트 그대로 남는다.
+# ★안전: 삽입 결과를 다시 파싱해 (a)유효 JSON (b)rules[0]=owner (c)**나머지 규칙이 원본과 완전
+#   동일** 인지 검증한 뒤에야 임시파일→`os.replace` 원자 교체한다(반쪽 쓰기 0·원본 모드 승계).
+# ★fail-open: python3 부재·JSON 손상·구조 예외·쓰기 실패 등 **어떤 실패에서도 원본을 건드리지
+#   않고** stderr 경고 1줄만 남긴 뒤 계속한다(부서 생성 불파괴 — 티켓 발급과 동일 규약).
+#   ACL 평가는 데몬에서 파일 부재·파싱 실패 시 fail-OPEN 이라 동결 리스크도 없다.
+# exit 규약(내부): 0=추가함 · 10=이미 있음(무동작) · 그 외=미변경(경고).
+acl_migrate_owner(){
+  local f="$1" rc=0 out
+  # heredoc 관례는 이 파일 기존 형태(resolve_default_base)와 동일 — 닫는 `)` 는 PY 종단 뒤에 온다.
+  out="$(python3 - "$f" 2>&1 <<'PY'
+import json,os,re,stat,sys,tempfile
+p=sys.argv[1]
+try:
+    with open(p,encoding="utf-8") as fh: text=fh.read()
+except OSError as e:
+    sys.stderr.write("읽기 실패(%s)"%e); sys.exit(3)
+try: d=json.loads(text)
+except Exception as e:
+    sys.stderr.write("JSON 손상(%s)"%e); sys.exit(3)          # 원본 불변
+if not isinstance(d,dict): sys.stderr.write("루트가 객체 아님"); sys.exit(3)
+rules=d.get("rules")
+if not isinstance(rules,list): sys.stderr.write("rules 배열 부재/형식오류"); sys.exit(3)
+if any(isinstance(r,dict) and r.get("from")=="owner" for r in rules): sys.exit(10)  # 멱등
+m=re.search(r'"rules"\s*:\s*\[', text)
+if not m: sys.stderr.write("rules 배열 여는 위치 탐색 실패"); sys.exit(3)
+ins=('\n    { "from": "owner", "to": "*", "allow": true,'
+     '\n      "_why": "오너 직접 입력(GUI)은 전 노드 허용 — 오너는 external 이 아니다" }')
+new=text[:m.end()]+ins+("," if rules else "")+text[m.end():]   # 빈 배열이면 트레일링 콤마 금지
+try: nd=json.loads(new)
+except Exception as e:
+    sys.stderr.write("삽입 결과가 무효 JSON(%s)"%e); sys.exit(4)   # 원본 불변
+nr=nd.get("rules")
+if not isinstance(nr,list) or len(nr)!=len(rules)+1 or nr[0].get("from")!="owner" or nr[1:]!=rules:
+    sys.stderr.write("사후 검증 실패(기존 규칙 보존 불확정)"); sys.exit(4)   # 원본 불변
+dirn=os.path.dirname(p) or "."
+fd,tmp=tempfile.mkstemp(dir=dirn,prefix=".acl.",suffix=".tmp")
+try:
+    with os.fdopen(fd,"w",encoding="utf-8",newline="") as fh:
+        fh.write(new); fh.flush(); os.fsync(fh.fileno())
+    try: os.chmod(tmp, stat.S_IMODE(os.stat(p).st_mode))       # 원본 퍼미션 승계
+    except OSError: pass
+    os.replace(tmp,p)                                          # 원자 교체
+except Exception as e:
+    try: os.unlink(tmp)
+    except OSError: pass
+    sys.stderr.write("원자 교체 실패(%s)"%e); sys.exit(5)      # 원본 불변
+sys.exit(0)
+PY
+)" || rc=$?
+  case "$rc" in
+    0)  echo "[cys-dept] ACL 마이그레이션: owner 규칙 추가(맨 앞) — 기존 규칙·필드 보존: $f" >&2 ;;
+    10) : ;;   # 이미 owner 규칙 존재 — 무동작·무출력(멱등·로그 소음 금지)
+    *)  echo "[cys-dept] WARN: ACL owner 규칙 추가 실패 — **원본 무변경**으로 진행($f). 오너 GUI의 워커 pane 입력이 막히면 이 파일 rules 맨 앞에 { \"from\": \"owner\", \"to\": \"*\", \"allow\": true } 를 수동 추가하라. (사유: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200))" >&2 ;;
+  esac
+  return 0
 }
 
 # F1(codex#1·verdict-D): 부서 pack 에 agents.json 을 명시 시드 — claude.cmd 의 CLAUDE_CONFIG_DIR 을
@@ -674,6 +768,74 @@ ceo_demote(){
   ceo_reinject_master "표준 master 복귀"
 }
 
+# ── ★결함#1: 부서 생성 = CEO 티켓 자동 발급 (오너 절대규칙) ────────────────────────
+# ★결함(실측): 이 도구 전체에 `issue-ticket` 호출이 **0건**이었다 — GUI(또는 CLI)로 만든 부서는
+#   티켓이 없어 부서장이 '단독 각성'(solo_awakening)으로 팀 없이 대기했다(javis_bootstrap.py
+#   ③″ CEO 티켓 권한 게이트 = 티켓 부재 시 팀 기동 생략·exit 0).
+# ★대조: base 레인 폴백 경로("2번째 마스터 선언 → 부서 자동 창설")에는 티켓 자동 발급이 이미
+#   있다(javis_bootstrap.py D3 — `_ticket_path`·`_peek_dept_ticket` 와 동일 스키마·경로).
+#   즉 **같은 오너 규칙이 한쪽 경로에만 배선**돼 있었다.
+# ★오너 절대규칙: 부서를 만들고 선언하면 팀이 기동돼야 한다. 오너의 부서 생성 행위 자체가 발급
+#   동의다(D3 "오너 타이핑 선언=발급 동의"와 동일 규약).
+#
+# 티켓 저장소 — javis_bootstrap.py `TICKET_DIR`(STATE_DIR/dept-boot-tickets) 규약 미러.
+# STATE_DIR = CYS_STATE_DIR ‖ $HOME/.cys/state (bootstrap `state_dir()` 와 동일 우선순위).
+# ★미러인 근거: 이 파일은 이미 소켓 경로(dept_sock↔_dept_sk/_sk_named)를 같은 방식으로 미러한다.
+TICKET_DIR="${CYS_STATE_DIR:-$HOME/.cys/state}/dept-boot-tickets"
+
+# 유효 티켓 존재 여부(멱등 판정 · **소비하지 않는다**). exit 0=유효(발급 생략) / 비0=발급 진행.
+# javis_bootstrap.py `_parse_ticket_json` 계약 미러: JSON 객체 · dept 일치 · issued_at(epoch 숫자)
+# · 0<=경과<=TTL(CYS_DEPT_TICKET_TTL_SECS ‖ 24h).
+# ★판정 불가(python3 부재·파싱 실패·읽기 실패)는 전부 비0 = **발급 쪽으로 보수적**이다 —
+#   오판의 대가가 비대칭이기 때문이다(과발급=TTL 리셋뿐, 미발급=팀 0인 부서 방치).
+dept_ticket_valid(){
+  python3 - "$TICKET_DIR/$1.ticket" "$1" <<'PY' >/dev/null 2>&1
+import json,os,sys,time
+p,dept=sys.argv[1:3]
+TTL=float(os.environ.get("CYS_DEPT_TICKET_TTL_SECS", 24*3600))
+try:
+    d=json.load(open(p,encoding="utf-8"))
+except Exception:
+    sys.exit(1)                                   # 부재·손상 → 발급
+if not isinstance(d,dict) or d.get("dept")!=dept: sys.exit(1)
+ts=d.get("issued_at")
+if not isinstance(ts,(int,float)) or isinstance(ts,bool): sys.exit(1)
+age=time.time()-ts
+sys.exit(0 if 0<=age<=TTL else 1)                 # 미래(시계 이상)·만료 → 발급
+PY
+}
+
+# CEO 티켓 자동 발급 — 부서 생성 경로(launch/create/allocate)가 **ceo_promote 이후**에 호출한다
+# (CEO가 존재해야 발급이 의미를 갖는다).
+# ★base 레인 전용: `issue-ticket` 은 부서 소켓이면 exit 2로 거부한다("base 레인에서만 티켓 발급
+#   허용") → 상속된 CYS_SOCKET 을 반드시 지운다(이 파일의 tombstone·feed push 관례와 동일).
+# ★fail-open(필수): 발급 실패(스크립트 부재·python3 없음·비정상 exit·부서명 정규식 불일치)가
+#   **부서 생성을 무너뜨리면 안 된다** — 항상 return 0 이고 teardown trap 은 건드리지 않는다.
+#   실패 시 stderr 경고 1줄 + 수동 발급 안내만 남기고 진행한다.
+# ★소비 금지: 티켓은 24h TTL·1회성이며 소비(.used rename)는 **부서장 부트**가 한다
+#   (javis_bootstrap.py ④ boot 성공 직후 `_consume_dept_ticket` — "1회성 티켓 ⟺ 실스폰" 불변식).
+dept_issue_ceo_ticket(){
+  local name="$1" bs="$PACK_DEFAULT/bin/javis_bootstrap.py" out why
+  local manual="수동 발급: base(본부) 레인에서 \`python3 \"$bs\" issue-ticket --dept $name\`"
+  if [ ! -f "$bs" ]; then
+    echo "[cys-dept] WARN: $name CEO 티켓 자동 발급 생략 — $bs 부재(팩 미설치·스큐). 부서장이 '단독 각성'(팀 0)으로 뜬다. $manual" >&2
+    return 0
+  fi
+  if dept_ticket_valid "$name"; then
+    echo "[cys-dept] $name 유효 CEO 티켓 기존재 — 재발급 생략(멱등·TTL 리셋 방지)" >&2
+    return 0
+  fi
+  if out="$(env -u CYS_SOCKET python3 "$bs" issue-ticket --dept "$name" 2>&1)"; then
+    echo "[cys-dept] $name CEO 티켓 발급 완료 — 부서장이 뜨면 팀(cso·워커·리뷰어)이 자동 기동된다(24h TTL·1회성·소비는 부서장 부트)" >&2
+  else
+    # 사유는 1줄로 접어 붙인다(다줄 stderr가 로그를 흩지 않게). 대표 사유: 부서명이 발급 정규식
+    # ([a-z0-9][a-z0-9-]*) 불일치(대문자·'_' 포함) · python3 부재 · base 레인 판정 실패.
+    why="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+    echo "[cys-dept] WARN: $name CEO 티켓 자동 발급 실패 — 부서 생성은 정상, 다만 부서장이 '단독 각성'(팀 0)으로 뜬다. $manual (사유: ${why:-불명})" >&2
+  fi
+  return 0
+}
+
 cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|list|sock <name> | <name> -- <cmd>}"
 # ★D3(i): cmd 위치 --help/-h만 usage(stdout·exit 0) — 읽기 전용이라 단일소유 가드(exit 7)보다 앞·역할
 #   무관. ★name 위치의 --help/-h는 usage가 아니라 검증 거부 exit 2다(`launch --help`가 '--help' 부서를
@@ -739,6 +901,11 @@ case "$cmd" in
       exit 6
     fi
     ceo_promote
+    # ★결함#1: CEO 승격 이후 티켓 자동 발급(fail-open — 실패해도 부서 생성은 성공).
+    #   rotate(=이 경로 재귀)도 통과시킨다: rotate 는 데몬을 새로 띄우므로 팀(cso·워커·리뷰어
+    #   surface)이 함께 사라진다 — 여기서 막으면 rotate 한 번에 '팀 0인 부서'가 영구 고착된다.
+    #   유효 티켓이 남아 있으면 멱등 판정이 재발급을 막으므로 TTL 리셋도 없다(묘비 불변 계약 무관).
+    dept_issue_ceo_ticket "$name"
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none}). 부서 수=$(reg_count)"
     ;;
@@ -834,6 +1001,10 @@ PY
       "$0" down "$name" >/dev/null 2>&1 || true; trap - EXIT; exit 6
     fi
     trap - EXIT   # 격리 확정 — 회수 취소
+    # ★결함#1: CEO 승격·계정격리 확정 이후 티켓 자동 발급(fail-open). 빈 셸 생성 **이전**에 둔다 —
+    #   오너가 그 셸에서 즉시 claude 를 띄워 선언해도 티켓이 이미 있어야 팀이 기동된다.
+    #   trap 해제 이후 지점이라 발급 실패가 teardown 을 유발할 여지도 없다(fail-open 이중 보증).
+    dept_issue_ceo_ticket "$name"
     # ★제품 기본 정책(2026-06-29 결정): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
     #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
     #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
@@ -985,6 +1156,9 @@ PY
       exit 6
     fi
     trap - EXIT   # 격리 확정 — 이후 빈 셸 생성
+    # ★결함#1: allocate 와 동형 — CEO 승격·계정격리 확정 후, 빈 셸 생성 이전에 티켓 자동 발급(fail-open).
+    #   REUSE_UP/REUSE_BOOTING 은 위에서 이미 exit 0 으로 빠졌다(신규 생성 아님 — 기존 부서 재사용).
+    dept_issue_ceo_ticket "$name"
     # ★WP-11(2026-06-29 결정 일원화): create도 allocate와 동일하게 role=master '빈 셸'만 띄운다.
     #   자동 각성(부트 노드)+미션 자동주입(send --to master)을 폐지 — 사용자가 그 셸에서 직접 claude 를
     #   실행해 부서장으로 연결하고, 부서장이 미션 파일($MISS/$key.md)을 스스로 읽는다. 빈 셸(agent=None)엔
