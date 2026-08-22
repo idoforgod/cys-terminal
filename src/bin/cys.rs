@@ -1343,6 +1343,45 @@ fn is_typing_guard_err(e: &str) -> bool {
     e.contains(cys::MSG_TYPING_GUARD) || e.contains(cys::ERR_TYPING_GUARD)
 }
 
+/// ★B3(0.14.24) `cys send-key` 가 타이핑 가드 거부를 **큐로 1회 전환**해야 하는가(순수 판정).
+///
+/// 왜 필요한가: 노드 보고 경로는 `cys send --to master "<본문>"` + `cys send-key --to master
+/// Return` 두 프로세스다. 그런데 `Command::SendKey` 는 `request(...)?` 로 에러를 그대로
+/// 올려보냈다 — 타이핑 가드에 걸리면 **Return 이 그냥 소실**된다(본문만 남고 미제출).
+/// 같은 저장소의 `inject_text` 는 이미 T-0147-6 으로 `--queued` 1회 전환을 갖고 있었는데,
+/// CLI 표면에만 그 폴백이 없던 비대칭이 결함3 의 마지막 층이다.
+///
+/// 조건: 이미 `--queued` 면 전환할 것이 없고, Return/Enter 가 아니면 텍스트 큐에 실을 수
+/// 없으며(데몬 계약), 타이핑 가드가 아닌 거부(ACL·종료·큐 만석…)는 **절대** 큐로 바꾸지
+/// 않는다 — 오폴백은 거부를 성공으로 위장한다.
+fn should_queue_fallback_send_key(queued: bool, key: &str, err: &str) -> bool {
+    !queued && matches!(key, "Return" | "Enter") && is_typing_guard_err(err)
+}
+
+/// ★B3 `cys send` 본문의 큐 1회 전환 판정(순수) — send-key 와 같은 근거·같은 보수성.
+///
+/// `clear_first` 를 제외하는 이유: 원자 clear+paste+submit 은 **직접 전달 전용**이고 데몬이
+/// `--queued` 와의 결합을 invalid_params 로 거부한다(handlers send_text). 그 조합을 폴백으로
+/// 만들면 안내 대신 두 번째 오류를 낳는다.
+fn should_queue_fallback_send(queued: bool, clear_first: bool, err: &str) -> bool {
+    !queued && !clear_first && is_typing_guard_err(err)
+}
+
+/// ★B3 보조 — 큐 전환 직후 데몬이 pause 중이면 한 줄 경고한다.
+///
+/// pause 중에는 큐 배달이 동결되므로(kill-switch 의미론 — 이 코드는 그 의미론을 **바꾸지
+/// 않는다**) 전환은 성공했어도 실제 제출은 resume 후다. 그 사실을 말해주지 않으면 호출자가
+/// "보냈는데 왜 조용하지"로 오해한다. `cys status` 와 같은 RPC(org.status)를 쓴다.
+/// best-effort: 조회 실패는 침묵한다 — 폴백 자체는 이미 성공했고 여기서 exit 코드를 바꾸지
+/// 않는다(경고 채널이 주 경로를 망치면 안 된다).
+fn warn_if_daemon_paused() {
+    if let Ok(r) = request("org.status", json!({})) {
+        if r["paused"].as_bool() == Some(true) {
+            eprintln!("[queue] 데몬 pause 중 — 큐는 resume 후 배달됩니다");
+        }
+    }
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
 ///
 /// ★T-0147-6(사람 입력 경합 · W4): `authoritative:true` 는 타이핑 가드를 면제하지만 **무조건이
@@ -1945,15 +1984,40 @@ fn run(command: Command) -> i32 {
             resolve_targets(&surface, &to).and_then(|sids| {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 let multi = sids.len() > 1;
+                let body = text.join(" ");
                 for sid in sids {
+                    let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
                     // 집행한다. 클라측 C-u·150ms sleep·게이트는 제거 — 비원자 split·race를 없앤다.
                     // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
-                    let r = request(
+                    let r = match request(
                         "surface.send_text",
-                        json!({"surface_id": sid, "text": text.join(" "), "from": from, "queued": queued, "clear_first": clear_first}),
-                    )?;
-                    let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
+                        json!({"surface_id": sid, "text": body, "from": from, "queued": queued, "clear_first": clear_first}),
+                    ) {
+                        Ok(r) => r,
+                        // ★B3: 타이핑 가드 거부 → `--queued` 1회 전환(inject_text T-0147-6 동형).
+                        //   종전엔 여기서 에러가 그대로 올라가 **본문이 소실**됐다. 큐 배달은
+                        //   출력 조용 + 사람 입력 냉각 후 `Inject{cr_delay}` 로 넣으므로 사람의
+                        //   미완성 입력에 이어붙는 최악 경로가 구조적으로 불가능하다.
+                        //   ★큐 배달은 CR 을 **포함**한다 — 이 명령 뒤에 오는 관례적
+                        //     `cys send-key Return` 은 빈 프롬프트의 Enter 라 무해하다.
+                        //   재시도는 정확히 1회다(반복하면 중복 주입).
+                        Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {
+                            let r2 = request(
+                                "surface.send_text",
+                                json!({"surface_id": sid, "text": body, "from": from, "queued": true}),
+                            )?;
+                            let depth = r2["depth"].as_u64().unwrap_or(0);
+                            eprintln!(
+                                "[send] 사람 입력 감지 — 본문을 큐로 전환(QUEUED depth {depth}) surface={}",
+                                surface_ref(sid)
+                            );
+                            warn_if_daemon_paused();
+                            println!("QUEUED (depth {depth}){tag}");
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if queued {
                         println!("QUEUED (depth {}){tag}", r["depth"]);
                     } else {
@@ -1978,12 +2042,39 @@ fn run(command: Command) -> i32 {
                     }
                 }
                 let multi = sids.len() > 1;
+                // ★B3: 큐로 전환된 키가 하나라도 있으면 이 실행의 결론은 "QUEUED" 다 —
+                //   뒤에 "OK" 를 덧붙이면 첫 줄만 읽는 소비 스크립트가 직접 제출로 오독한다.
+                let mut any_fallback = false;
                 for sid in sids {
+                    let mut sid_fallback = false;
                     for key in &keys {
-                        let r = request(
+                        let r = match request(
                             "surface.send_key",
                             json!({"surface_id": sid, "key": key, "queued": queued}),
-                        )?;
+                        ) {
+                            Ok(r) => r,
+                            // ★B3: 제출 Return 이 타이핑 가드에 막히면 소실시키지 않고 큐로
+                            //   1회 전환한다(inject_text T-0147-6 동형 · 데몬 계약상
+                            //   send_key --queued 는 Return/Enter 전용이라 안전).
+                            //   이것이 없어서 노드 보고의 Enter 가 조용히 사라졌다.
+                            Err(e) if should_queue_fallback_send_key(queued, key, &e) => {
+                                let r2 = request(
+                                    "surface.send_key",
+                                    json!({"surface_id": sid, "key": key, "queued": true}),
+                                )?;
+                                let depth = r2["depth"].as_u64().unwrap_or(0);
+                                eprintln!(
+                                    "[send-key] 사람 입력 감지 — Return 을 큐로 전환(QUEUED depth {depth}) surface={}",
+                                    surface_ref(sid)
+                                );
+                                warn_if_daemon_paused();
+                                println!("QUEUED (depth {depth})");
+                                sid_fallback = true;
+                                any_fallback = true;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         if queued {
                             match r["depth"].as_u64() {
                                 Some(d) => println!("QUEUED (depth {d})"),
@@ -1996,11 +2087,11 @@ fn run(command: Command) -> i32 {
                             }
                         }
                     }
-                    if multi {
+                    if multi && !sid_fallback {
                         println!("OK → surface:{sid}");
                     }
                 }
-                if !multi && !queued {
+                if !multi && !queued && !any_fallback {
                     println!("OK");
                 }
                 Ok(())
@@ -14647,6 +14738,73 @@ mod tests {
             "clear_first_unsupported",
         ] {
             assert!(!is_typing_guard_err(other), "무관 오류가 큐 전환을 유발: {other}");
+        }
+    }
+
+    /// ★B3 회귀 핀(0.14.24): `cys send-key Return` 이 타이핑 가드에 막혔을 때 **소실되지 않고**
+    /// 큐로 1회 전환되는가의 판정 표. 이 폴백이 없어서 노드 보고의 제출 Enter 가 조용히
+    /// 사라졌다(본문만 프롬프트에 남고 미제출 — 결함3 의 마지막 층).
+    /// 반대 방향도 같은 무게로 박는다: **타이핑 가드가 아닌 거부는 절대 큐로 바꾸지 않는다**
+    /// (오폴백은 정당한 거부를 성공으로 위장한다).
+    #[test]
+    fn send_key_queue_fallback_fires_only_for_typing_guard_on_submit_keys() {
+        let guard = cys::MSG_TYPING_GUARD;
+        // ① 전환 대상 — 비-queued 제출 키 + 타이핑 가드.
+        assert!(should_queue_fallback_send_key(false, "Return", guard));
+        assert!(should_queue_fallback_send_key(false, "Enter", guard));
+        assert!(should_queue_fallback_send_key(
+            false,
+            "Return",
+            "human is typing in this pane; retry later or use --queued"
+        ));
+        // ② 이미 --queued 면 전환할 것이 없다(이중 적재 금지).
+        assert!(!should_queue_fallback_send_key(true, "Return", guard));
+        // ③ 제출 키가 아니면 전환 불가 — 데몬 계약상 텍스트 큐에는 Return/Enter 만 실린다.
+        for k in ["Tab", "Escape", "Up", "BTab", "F5", "Space", "a"] {
+            assert!(
+                !should_queue_fallback_send_key(false, k, guard),
+                "{k} 가 큐로 전환됐다 — 데몬이 invalid_params 로 되받는다"
+            );
+        }
+        // ④ 타이핑 가드가 아닌 거부는 전부 그대로 실패해야 한다.
+        for other in [
+            "acl_denied: external→worker deny",
+            "surface process has exited",
+            "queue_full: pending queue cap (100) reached",
+            "write_stalled: surface input channel full (pane not consuming input)",
+            "not_found: surface 31 not found",
+            "invalid_params: unknown key: Retrun",
+        ] {
+            assert!(
+                !should_queue_fallback_send_key(false, "Return", other),
+                "무관 거부가 큐 전환을 유발: {other}"
+            );
+        }
+    }
+
+    /// ★B3 회귀 핀(0.14.24): `cys send` 본문도 같은 규칙으로 1회 전환된다 — 단
+    /// `--clear-first` 는 제외한다. 원자 clear+paste+submit 은 **직접 전달 전용**이고 데몬이
+    /// `--queued` 와의 결합을 invalid_params 로 거부하므로(handlers send_text), 폴백으로
+    /// 만들면 안내 대신 두 번째 오류가 난다.
+    #[test]
+    fn send_queue_fallback_excludes_already_queued_and_clear_first() {
+        let guard = cys::MSG_TYPING_GUARD;
+        assert!(should_queue_fallback_send(false, false, guard), "본문 큐 전환이 죽었다");
+        assert!(!should_queue_fallback_send(true, false, guard), "이미 큐인데 또 전환");
+        assert!(
+            !should_queue_fallback_send(false, true, guard),
+            "clear_first + queued 는 데몬이 거부하는 조합이다 — 폴백 금지"
+        );
+        assert!(!should_queue_fallback_send(false, true, "clear_first_unsupported"));
+        for other in [
+            "acl_denied: external→worker deny",
+            "clear_first_unsupported: clear_first requires a launch-agent-registered pane",
+            "queue_full: pending queue cap (100) reached",
+        ] {
+            assert!(
+                !should_queue_fallback_send(false, false, other),
+                "무관 거부가 큐 전환을 유발: {other}"
+            );
         }
     }
 
