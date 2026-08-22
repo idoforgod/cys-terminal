@@ -308,6 +308,21 @@ pub enum WriteReq {
         cr_delay_ms: u64,
         clear_first: bool,
     },
+    /// ★B2(0.14.24) delay_ms 만큼 **먼저 기다렸다가** 그대로 쓰기 — 프로그램이 본문을 꽂은
+    /// 직후 곧바로 도착한 제출 CR 을 최소 간격 뒤로 밀어내는 전용 변형이다.
+    ///
+    /// 왜 필요한가: 직접 경로(`cys send`)는 원시 `Data` 로 본문을 쓰고 제출 Return 은 **별도
+    /// RPC**(수십 ms 뒤)로 온다. 그런데 Claude Code 2.1.239 입력 훅은 800자 초과 키런을
+    /// 붙여넣기로 처리하고(s_r=800), 붙여넣기 처리 중 도착한 Return 은 보류 후 재생하지만
+    /// 이미지 경로 분기에서는 **폐기**한다. 저장소 e2e 실측도 같은 결론이다("raw `\r` 동봉은
+    /// Claude CLI 가 paste 로 삼켜 미제출" — src-tauri/src/main.rs:489). Anthropic 자체 주입
+    /// 코드는 bracketed paste 뒤 `\r` 을 10ms 지연 별도 전송하고, 이 저장소의 큐 경로
+    /// (`Inject`)는 이미 cr_delay_ms(400)를 둔다 — 직접 경로에만 간격이 없었다.
+    ///
+    /// 왜 writer 에서 자는가: writer 는 **단일 소비자**라 여기서 sleep 하면 뒤따르는 WriteReq
+    /// 는 그동안 채널에 머문다 = 순서가 구조적으로 보존된다(Inject 의 cr_delay_ms 와 같은
+    /// 규약). 호출자(핸들러) 쪽에서 자면 tokio 워커를 막고 순서 보장도 사라진다.
+    DataAfter { bytes: Vec<u8>, delay_ms: u64 },
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -3202,6 +3217,13 @@ pub(crate) fn run_writer_loop<W: Write>(
         };
         let res = match req {
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
+            // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
+            // 머물고, 따라서 '지연된 CR 뒤에 온 바이트'가 CR 을 추월하는 일이 없다(순서 보존).
+            // delay_ms=0 이면 sleep 은 즉시 반환하므로 Data 와 동일 동작이다.
+            WriteReq::DataAfter { bytes, delay_ms } => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                writer.write_all(&bytes).and_then(|_| writer.flush())
+            }
             WriteReq::Inject {
                 text,
                 cr_delay_ms,
@@ -4253,6 +4275,97 @@ mod tests {
         assert!(
             !out.contains(&0x15),
             "clear_first=false인데 Ctrl-U가 새어나왔다 — 현행 동작 회귀"
+        );
+    }
+
+    /// ★B2 계약 박제 ①(0.14.24): DataAfter 는 요청한 최소 간격을 **실제로** 기다린 뒤 쓴다.
+    /// 이 지연이 사라지면 본문 직후 도착한 제출 CR 이 다시 붙여넣기 처리에 삼켜진다
+    /// (Claude Code 2.1.239 입력 훅 · src-tauri e2e 실측 · Anthropic 자체 주입의 10ms 지연).
+    /// 지연 0 은 Data 와 동일 동작이어야 한다(비활성 스위치가 살아 있음을 함께 고정).
+    #[test]
+    fn data_after_waits_the_requested_gap_before_writing() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        const GAP_MS: u64 = 150;
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        let t0 = std::time::Instant::now();
+        tx.send(WriteReq::DataAfter { bytes: b"\r".to_vec(), delay_ms: GAP_MS })
+            .unwrap();
+        drop(tx); // Disconnected → 지연 쓰기를 마친 뒤 루프 종료
+        handle.join().ok();
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            buf.lock().unwrap().clone(),
+            b"\r".to_vec(),
+            "DataAfter 가 바이트를 그대로 쓰지 않았다 — 지연만 하고 내용은 Data 와 같아야 한다"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(GAP_MS),
+            "DataAfter 가 지연 없이 즉시 썼다 ({elapsed:?} < {GAP_MS}ms) — 최소 간격 계약 붕괴"
+        );
+
+        // 대조: delay_ms=0 은 Data 동형(비활성 스위치 CYS_CR_MIN_GAP_MS=0 경로의 밑바닥).
+        let buf0 = Arc::new(Mutex::new(Vec::new()));
+        let (tx0, rx0) = sync_channel::<WriteReq>(2);
+        let stop0 = Arc::new(AtomicBool::new(false));
+        let w0 = SharedBuf(Arc::clone(&buf0));
+        let h0 = std::thread::spawn(move || run_writer_loop(w0, rx0, stop0));
+        tx0.send(WriteReq::DataAfter { bytes: b"\r".to_vec(), delay_ms: 0 })
+            .unwrap();
+        drop(tx0);
+        h0.join().ok();
+        assert_eq!(buf0.lock().unwrap().clone(), b"\r".to_vec());
+    }
+
+    /// ★B2 계약 박제 ②(0.14.24): writer 는 **단일 소비자**라 DataAfter 가 자는 동안 뒤따라
+    /// 적재된 쓰기가 앞지를 수 없다. 이 순서 보존이 B2 의 안전 근거 전체다 — 지연이 순서를
+    /// 뒤집는다면 제출 CR 이 다음 명령 뒤에 떨어져 엉뚱한 것을 실행시킨다.
+    #[test]
+    fn data_after_preserves_order_against_following_write() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        // 지연 CR 을 먼저 적재하고, 자는 동안 곧바로 후속 Data 를 적재한다.
+        tx.send(WriteReq::DataAfter { bytes: b"\r".to_vec(), delay_ms: 120 })
+            .unwrap();
+        tx.send(WriteReq::Data(b"X".to_vec())).unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let out = buf.lock().unwrap().clone();
+        assert_eq!(
+            out,
+            b"\rX".to_vec(),
+            "지연 CR 뒤에 적재한 바이트가 CR 을 추월했다 — 단일 소비자 순서 보존 위반 \
+             (출력: {:?})",
+            String::from_utf8_lossy(&out)
         );
     }
 

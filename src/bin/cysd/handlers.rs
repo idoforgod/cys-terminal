@@ -1070,6 +1070,50 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// ★B2(0.14.24) 프로그램 주입 직후 제출 CR 의 **최소 간격**(ms). 0 = 비활성
+/// (`typing_guard_secs` 와 같은 꼴 — env 로 끌 수 있어야 실기에서 되돌릴 수 있다).
+///
+/// 왜 150 인가 — 근거 넷을 모두 넘는 가장 작은 값 계열로 잡았다:
+///   ① Claude Code 2.1.239 입력 훅(`dln`): 800자 초과 키런은 붙여넣기로 처리하고(s_r=800),
+///      붙여넣기 처리 중 도착한 Return 은 보류 후 재생하지만 이미지 경로 분기에서는 **폐기**한다.
+///   ② 이 저장소 자체 e2e 실측: "raw `\r` 동봉은 Claude CLI 가 paste 로 삼켜 미제출"
+///      (src-tauri/src/main.rs:489).
+///   ③ Anthropic 자체 주입 코드는 bracketed paste 뒤 `\r` 을 **10ms 지연** 별도 전송한다.
+///   ④ 이 저장소의 큐 경로(`WriteReq::Inject`)는 이미 cr_delay_ms=**400** 을 둔다.
+/// ③(10ms)은 너무 얕고 ④(400ms)는 대화형 체감을 해친다 — 직접 경로용으로 그 사이,
+/// clear_first 의 settle(150ms)과 같은 자릿수를 택했다. 이 값은 **상한이 아니라 하한**이다:
+/// 이미 그만큼 지난 뒤 온 Return 은 손대지 않는다(무지연).
+fn cr_min_gap_ms() -> u64 {
+    std::env::var("CYS_CR_MIN_GAP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150)
+}
+
+/// ★B2 순수 판정 — 제출 CR 을 얼마나 늦춰야 하는가. Some(잔여 ms) = `WriteReq::DataAfter`,
+/// None = 종전대로 즉시 `WriteReq::Data`.
+///
+/// 조건 셋을 모두 만족할 때만 늦춘다:
+///   · key 가 Return/Enter (제출 키에만 적용 — 다른 키는 붙여넣기 삼킴과 무관하다)
+///   · min_gap_ms > 0 (env 비활성 스위치)
+///   · 직전 **프로그램 주입**(`surface.last_injected`)으로부터 min_gap_ms 가 아직 안 지남
+/// `last_injected` 는 human_verified 가 아닐 때만 찍히므로(handlers send_text), 사람이 직접
+/// 친 글자 뒤의 Return 은 여기서 늦춰지지 않는다 — 늦추는 대상은 오직 '프로그램이 방금 꽂은
+/// 본문에 뒤따르는 제출'이다. 관측값이 없으면(None) 늦추지 않는다(fail-open: 이 기능이
+/// 못 하는 일은 지연뿐이고, 과잉 지연이 오히려 대화형 응답을 갉는다).
+fn cr_gap_delay_ms(
+    key: &str,
+    since_last_inject: Option<std::time::Duration>,
+    min_gap_ms: u64,
+) -> Option<u64> {
+    if min_gap_ms == 0 || !matches!(key, "Return" | "Enter") {
+        return None;
+    }
+    let elapsed_ms = since_last_inject?.as_millis();
+    let gap = u128::from(min_gap_ms);
+    (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
+}
+
 /// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
 /// 등록된 pid 가 있고 그 pid 의 현재 start_time 이 등록값과 일치할 때만 true. resolve_caller_surface·
 /// caller_cache 와 완전 독립이다(별도 sysinfo 새로고침·캐시 미사용 — 공유 자료구조 오염 0). start_time
@@ -2026,7 +2070,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 시퀀스의 연접일 때만** 갱신을 생략한다(판정 SOT = cys::mousereport —
             // ui/src/mousefilter.ts classifyMouseReport 동형·\x1b[200~ 접두는 무조건 비면제).
             // 혼합·절단 청크는 갱신 유지: 사람 텍스트가 섞였을 가능성을 보호하는 쪽이 안전.
-            if human && !cys::mousereport::is_pure_mouse_report(&text) {
+            //
+            // ★B1(0.14.24 결함3 주범 — 술어를 마우스 보고에서 **터미널 자동 응답 전반**으로
+            //   넓힌다): 위 A9 문단이 말한 '사람 타이핑으로 위장되는 기계 바이트'는 마우스
+            //   보고만이 아니었다. GUI 는 `term.onData` 의 **모든** 바이트를 human=true 로
+            //   올리는데, Claude Code 는 기동 시 포커스 보고(`ESC[?1004h`)를 켜므로 pane 을
+            //   클릭·이탈할 때마다 `ESC[I`/`ESC[O` 가 흐르고(ui/src/trackfilter.ts 가 1004 를
+            //   보존한다), 커서위치 질의(`ESC[6n`·`ESC[?6n`)·DA·XTVERSION·DECRPM·kitty 플래그·
+            //   OSC 색 질의의 **응답**도 같은 경로로 올라온다.
+            //   결과(실측 증상): 오너가 master pane 을 클릭해 보고를 읽는 순간 last_human_input
+            //   이 찍히고, 이후 typing_guard_secs(기본 3초) 동안 다른 노드의 `send-key Return`
+            //   이 `typing_guard` 로 거부된다 → 본문은 타이핑됐는데 **Enter 만 안 먹는다**.
+            //   자동 응답은 정의상 사람 입력이 아니므로 가드를 찍지 않는다. 판정 SOT 는 그대로
+            //   cys::mousereport 하나이고(단일 정의처), 새 술어는 is_pure_mouse_report 의
+            //   **상위 집합**이라 A9 면제는 축소되지 않는다(lib 상위집합 핀이 고정).
+            if human && !cys::mousereport::is_pure_terminal_autoreply(&text) {
                 *surface.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
             }
             // T3-13 권위 전달(clear_first): 잔존 미제출 텍스트를 Ctrl-U로 지운 깨끗한 라인에
@@ -2355,7 +2413,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            if let Some(err) = try_write(&surface, crate::state::WriteReq::Data(bytes), &id) {
+            // ★B2(0.14.24 결함3 세 번째 층): 프로그램이 방금 본문을 꽂았고(last_injected)
+            //   그 직후 제출 Return 이 도착했다면, 최소 간격만큼 **잔여 시간만** 늦춰 쓴다.
+            //   근거는 cr_min_gap_ms doc 의 ①~④ — 붙여넣기 처리 창 안에 떨어진 CR 은 TUI 가
+            //   삼켜 미제출로 끝난다(본문은 들어갔는데 Enter 만 안 먹는 증상의 나머지 절반).
+            //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
+            let since_last_inject = surface.last_injected.lock().unwrap().map(|t| t.elapsed());
+            let write_req = match cr_gap_delay_ms(&key, since_last_inject, cr_min_gap_ms()) {
+                Some(delay_ms) => crate::state::WriteReq::DataAfter { bytes, delay_ms },
+                None => crate::state::WriteReq::Data(bytes),
+            };
+            if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
             Reply::Single(ok_response(
@@ -8034,6 +8102,202 @@ mod tests {
             "일반 텍스트 human:true 는 종전대로 갱신해야 한다"
         );
 
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B1 회귀 핀(0.14.24 결함3 주범 — "보고가 타이핑은 되는데 Enter 가 가끔 안 먹는다").
+    ///
+    /// GUI 는 `term.onData` 의 모든 바이트를 human=true 로 올린다. Claude Code 는 기동 시
+    /// 포커스 보고(`ESC[?1004h`)를 켜므로 오너가 master pane 을 **클릭만 해도** `ESC[I` 가
+    /// human 입력으로 데몬에 도착했고, 그 순간부터 typing_guard_secs(3초) 동안 다른 노드의
+    /// `send-key Return` 이 typing_guard 로 거부됐다 — 본문(send)은 이미 들어간 뒤라 사용자
+    /// 눈에는 '타이핑은 됐는데 제출만 안 된' 상태로 보인다.
+    ///
+    /// 계약: **자동 응답 = 가드 미갱신 → 직후 제출 Return 허용** ·
+    ///       **사람 글자 = 가드 갱신 → 직후 제출 Return 거부**(대조군이 있어야 계약이 성립).
+    #[test]
+    fn terminal_autoreply_does_not_block_node_submit_return() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("autoreply-guard", r#"{ "default": "allow", "rules": [] }"#);
+
+        // 피해자: master pane (다른 노드의 보고를 받는 쪽)
+        let master = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create master surface");
+        daemon.surfaces.lock().unwrap().insert(master.id, master.clone());
+        // GUI 역할(자동 응답을 human=true 로 올리는 쪽)
+        let gui_pid = 999_410_u32;
+        bind_caller(&daemon, gui_pid, master.id);
+        // 보고를 밀어 넣는 노드(워커) — 비-권위 발신자
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon.surfaces.lock().unwrap().insert(worker.id, worker.clone());
+        let worker_pid = 999_411_u32;
+        bind_caller(&daemon, worker_pid, worker.id);
+
+        let send_human = |text: &str| {
+            let req = Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({ "surface_id": master.id, "text": text, "quiet": true, "human": true }),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(gui_pid)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "전제: 전송 자체는 성공해야 한다 (응답: {resp})");
+        };
+        // 노드의 제출 Return — 권위(authoritative) 없음 = 타이핑 가드 적용 대상.
+        let submit_return = || {
+            let req = Request {
+                id: json!(2),
+                method: "surface.send_key".into(),
+                params: json!({ "surface_id": master.id, "key": "Return" }),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(worker_pid)) else {
+                panic!("expected single reply");
+            };
+            resp
+        };
+
+        // ① 자동 응답 전 종류 — 가드 미갱신이고, 직후 제출 Return 이 통과해야 한다.
+        for auto in [
+            "\u{1b}[I",                              // 포커스 획득(클릭) ← 실측 최다 발생원
+            "\u{1b}[O",                              // 포커스 상실(이탈)
+            "\u{1b}[24;80R",                         // CPR(ESC[6n 응답)
+            "\u{1b}[?24;80R",                        // DECXCPR(ESC[?6n 응답)
+            "\u{1b}[?62;1;6c",                       // DA1
+            "\u{1b}[>0;276;0c",                      // DA2
+            "\u{1b}P>|XTerm(370)\u{1b}\\",           // XTVERSION
+            "\u{1b}[?2004;1$y",                      // DECRPM
+            "\u{1b}[?1u",                            // kitty 키보드 플래그
+            "\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{7}",     // OSC 11 배경색 응답
+            "\u{1b}[<64;10;20M",                     // 마우스 보고(A9 면제 — 상위집합 확인)
+        ] {
+            *master.last_human_input.lock().unwrap() = None;
+            send_human(auto);
+            assert!(
+                master.last_human_input.lock().unwrap().is_none(),
+                "자동 응답 {auto:?} 이 타이핑 가드를 켰다 — 3초간 노드 보고의 Enter 가 거부된다"
+            );
+            let resp = submit_return();
+            assert_eq!(
+                resp["ok"], json!(true),
+                "자동 응답 {auto:?} 직후 제출 Return 이 거부됐다 (응답: {resp})"
+            );
+        }
+
+        // ② 대조군 — 사람 글자는 종전대로 가드를 켜고, 직후 제출 Return 은 거부돼야 한다.
+        //    (이 대조가 없으면 B1 이 가드를 통째로 무력화해도 ① 만으로는 드러나지 않는다.)
+        *master.last_human_input.lock().unwrap() = None;
+        send_human("a");
+        assert!(
+            master.last_human_input.lock().unwrap().is_some(),
+            "사람 글자가 가드를 켜지 않았다 — 타이핑 가드가 통째로 무력화됐다"
+        );
+        let resp = submit_return();
+        assert_eq!(
+            resp["error"]["code"], json!(cys::ERR_TYPING_GUARD),
+            "사람 타이핑 중 비-권위 Return 은 종전대로 거부돼야 한다 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B2 판정 표 박제(0.14.24): 제출 CR 을 늦출지·얼마나 늦출지의 **전 경우**를 고정한다.
+    /// 순수 함수라 시계·스레드 없이 경계(정확히 min_gap 지난 순간)까지 결정론으로 박는다.
+    /// 넓게 늦추면 대화형 응답이 갉이고, 좁게 늦추면 붙여넣기 창에 CR 이 다시 삼켜진다.
+    #[test]
+    fn cr_gap_delay_only_delays_submit_keys_inside_the_window() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // ① 주입 직후(경과 0) 제출 키 → 전액 지연.
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(0)), 150), Some(150));
+        assert_eq!(cr_gap_delay_ms("Enter", Some(ms(0)), 150), Some(150));
+        // ② 창 안 부분 경과 → **잔여만** 지연(이미 흐른 시간을 두 번 세지 않는다).
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(50)), 150), Some(100));
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(149)), 150), Some(1));
+        // ③ 경계 — 정확히 min_gap 이 지났으면 무지연(하한 계약: 미만일 때만 늦춘다).
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(150)), 150), None);
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(5_000)), 150), None);
+        // ④ 제출 키가 아니면 절대 늦추지 않는다(붙여넣기 삼킴은 CR 고유 문제다).
+        for k in ["Tab", "Escape", "Up", "a", "BTab", "F5"] {
+            assert_eq!(cr_gap_delay_ms(k, Some(ms(0)), 150), None, "제출 키가 아닌 {k} 가 지연됐다");
+        }
+        // ⑤ 프로그램 주입 관측값 없음 → 무지연(fail-open · 사람 타이핑 뒤 Return 도 여기 해당).
+        assert_eq!(cr_gap_delay_ms("Return", None, 150), None);
+        // ⑥ min_gap=0 = 비활성 스위치(CYS_CR_MIN_GAP_MS=0 으로 즉시 되돌릴 수 있어야 한다).
+        assert_eq!(cr_gap_delay_ms("Return", Some(ms(0)), 0), None);
+        // ⑦ 기본값 계약 — env 미설정이면 150ms.
+        let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
+        std::env::remove_var("CYS_CR_MIN_GAP_MS");
+        assert_eq!(cr_min_gap_ms(), 150, "기본 최소 간격이 바뀌면 실기 체감이 달라진다");
+        std::env::set_var("CYS_CR_MIN_GAP_MS", "0");
+        assert_eq!(cr_min_gap_ms(), 0, "비활성 스위치가 죽었다");
+        std::env::set_var("CYS_CR_MIN_GAP_MS", "쓰레기");
+        assert_eq!(cr_min_gap_ms(), 150, "오염 값은 기본으로 접혀야 한다(fail-safe)");
+        match prev {
+            Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
+            None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
+        }
+    }
+
+    /// ★B2 무블로킹 계약 박제(0.14.24): 최소 간격은 **writer 스레드**가 자면서 확보한다 —
+    /// 핸들러(tokio 워커)는 절대 자면 안 된다. 핸들러가 자면 간격 하나가 데몬 전체의 RPC
+    /// 처리량을 갉고, 동시에 여러 pane 이 제출되면 워커 풀이 통째로 멈춘다.
+    /// 검사: 3초 간격을 걸고 주입 직후 Return 을 쏴도 **응답은 즉시** 와야 한다(＜0.5초).
+    #[test]
+    fn send_key_return_delegates_the_gap_to_the_writer_not_the_handler() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("cr-gap-nonblocking", r#"{ "default": "allow", "rules": [] }"#);
+
+        let target = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create target surface");
+        daemon.surfaces.lock().unwrap().insert(target.id, target.clone());
+        let sender_pid = 999_420_u32;
+        bind_caller(&daemon, sender_pid, target.id);
+
+        let send_return = || {
+            let req = Request {
+                id: json!(7),
+                method: "surface.send_key".into(),
+                params: json!({ "surface_id": target.id, "key": "Return" }),
+            };
+            let t0 = std::time::Instant::now();
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(sender_pid)) else {
+                panic!("expected single reply");
+            };
+            (resp, t0.elapsed())
+        };
+
+        let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
+        std::env::set_var("CYS_CR_MIN_GAP_MS", "3000"); // 과장된 간격 — 블로킹이면 즉시 드러난다
+
+        // ① 프로그램 주입 직후 = 지연 대상. 응답은 그래도 즉시 와야 한다.
+        *target.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+        let (resp, took) = send_return();
+        assert_eq!(resp["ok"], json!(true), "지연 경로에서 send_key 가 실패했다 (응답: {resp})");
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "핸들러가 최소 간격만큼 블로킹했다 ({took:?}) — 지연은 writer 스레드 몫이다"
+        );
+
+        // ② 주입 관측값 없음 = 종전 경로(무지연). 역시 즉시 성공해야 한다(무회귀).
+        *target.last_injected.lock().unwrap() = None;
+        let (resp, took) = send_return();
+        assert_eq!(resp["ok"], json!(true), "무지연 경로가 깨졌다 (응답: {resp})");
+        assert!(took < std::time::Duration::from_millis(500), "무지연 경로가 느리다 ({took:?})");
+
+        match prev {
+            Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
+            None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
+        }
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
