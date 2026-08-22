@@ -1445,28 +1445,36 @@ pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize
 /// → 조용히 벤더 스켈레톤으로 강등). 오너가 헌장을 채워 넣는 가장 자연스러운 형태에서
 /// seed-from-base 가 결정론적으로 무력화되는 치명 결함이었다.
 ///
-/// v2 는 마커를 **줄 앵커 기계 토큰**으로 좁힌다 — 자연문으로는 발화될 수 없는 형태만 인정한다.
-/// 인정 범위는 앞으로도 **좁히는 방향으로만** 바꾼다(과삭제가 이 결함의 본질이다).
-///   · 정본 : 줄 전체(앞뒤 공백 허용)가 `<!-- cys:no-inherit -->`
-///   · 동치 : 줄 전체가 `cys:no-inherit`(주석 래퍼 없는 맨 토큰)
-///   · 레거시(하위호환 · 아주 좁게): **인용문 줄**(`>` 시작)이 `본부(base) 레인 전용` **과**
-///     `승계 금지` **를 한 줄에 모두** 담은 경우 — 오너 기계 base soul 의 실사용 문안
-///     (`> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: …`) 한 형태만 살린다. 둘 중 하나만
-///     있는 줄·인용문이 아닌 줄은 마커가 **아니다**(`>` 로 시작하는 줄은 ATX heading 이 될 수
-///     없으므로 "heading 은 마커가 아니다" 조건은 이 형태에서 자동 충족된다).
+/// v3(2026-08-22 2차 BLOCK 시정 — 오너 결정: **레거시 평문 쌍 규칙 삭제**)은 마커를 **줄 전체가
+/// 기계 토큰**인 경우로만 좁힌다. v2 가 하위호환으로 남겼던 "인용문 줄에 `본부(base) 레인 전용`
+/// 과 `승계 금지` 가 함께 있으면 마커" 규칙은 **자연문 문서를 계속 삭제**했다(리뷰어 실측 4종:
+/// 규약을 설명하는 인용문·중첩 인용·들여쓴 인용이 전부 마커로 인정 → 그 절과 하위 절 소실).
+/// 평문 한국어를 마커로 인정하는 한 이 오탐은 구조적으로 막을 수 없으므로 규칙 자체를 없앴다.
+///
+/// **삭제의 결과(정직 고지)**: 옛 평문 표기(`> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: …`)
+/// 만 붙어 있는 절은 이제 **부서로 그대로 승계된다**(차단되지 않는다). 그런 절이 있는 base soul
+/// 은 정본 마커 한 줄을 절 안에 넣어 주어야 한다. 이것은 **과삭제보다 안전한 실패 방향**이며
+/// (승계된 문안은 사람이 지울 수 있지만 삭제된 헌장은 되살릴 수 없다), 미탐은 아래 '인식 실패
+/// 감사 흔적'(`unrecognized`)이 조용하지 않게 만든다.
+///
+///   · 정본 : 줄 전체가 `<!-- cys:no-inherit -->` — 주석 안쪽 공백 유무·대소문자 무관
+///            (`<!--cys:no-inherit-->` · `<!-- CYS:NO-INHERIT -->` 모두 인정 · 기계 토큰이므로)
+///   · 동치 : 줄 전체가 `cys:no-inherit`(주석 래퍼 없는 맨 토큰 · 대소문자 무관)
+///   · 그 외 **어떤 자연문도 마커가 아니다**. 인정 범위는 앞으로도 **좁히는 방향으로만** 바꾼다.
 const SOUL_NO_INHERIT_MARKER_LINE: &str = "<!-- cys:no-inherit -->";
-/// 위 정본 마커의 주석 래퍼를 벗긴 맨 토큰(줄 전체 일치일 때만 마커).
+/// 위 정본 마커의 주석 래퍼를 벗긴 맨 토큰(줄 전체 일치일 때만 마커 · 대소문자 무관).
 const SOUL_NO_INHERIT_TOKEN: &str = "cys:no-inherit";
-/// 레거시 인용문 형태에서 **둘 다** 있어야 마커로 인정하는 문구 쌍(하나만으로는 자연문 오탐).
-const SOUL_NO_INHERIT_LEGACY_PAIR: [&str; 2] = ["본부(base) 레인 전용", "승계 금지"];
 
-/// 한 줄이 승계 금지 가드 마커인가 — 규약 v2(위 상수 doc). `contains` 자연문 오탐(F3-a) 차단.
+/// 한 줄이 승계 금지 가드 마커인가 — 규약 v3(위 상수 doc). 줄 전체 일치만 인정한다.
+/// HTML 주석 래퍼(`<!--` … `-->`)는 벗겨서 안쪽을 보고, 안쪽 공백과 대소문자는 무시한다.
 fn is_no_inherit_marker(line: &str) -> bool {
     let t = line.trim();
-    if t == SOUL_NO_INHERIT_MARKER_LINE || t == SOUL_NO_INHERIT_TOKEN {
-        return true;
-    }
-    t.starts_with('>') && SOUL_NO_INHERIT_LEGACY_PAIR.iter().all(|m| t.contains(m))
+    // `<!--x-->` 최소 길이 7 — 접두·접미가 겹치지 않을 때만 래퍼로 인정(`<!---->` 는 빈 본문).
+    let inner = match (t.starts_with("<!--"), t.ends_with("-->"), t.len() >= 7) {
+        (true, true, true) => &t[4..t.len() - 3],
+        _ => t,
+    };
+    inner.trim().eq_ignore_ascii_case(SOUL_NO_INHERIT_TOKEN)
 }
 
 /// ATX heading 레벨(1..=6) — `#` 1~6개 + 공백(또는 줄 끝). setext(`===`·`---`)는 **보수적으로
@@ -1539,31 +1547,47 @@ fn lines_with_endings(src: &str) -> Vec<(&str, &str)> {
 }
 
 /// 가드 절 제거 결과 — 남은 본문 · 드롭된 절 heading · **거부 사유**(드롭하려다 안전 규칙에
-/// 걸려 취소한 건). 거부는 조용히 삼키지 않고 호출처가 loud 고지 + 원장 flag 로 남긴다.
+/// 걸려 취소한 건) · **인식 실패 흔적**(마커 토큰이 있는데 효력이 없던 줄). 둘 다 조용히 삼키지
+/// 않는다 — 호출처가 loud 고지 + 원장 flag 로 남긴다(조용한 미탐이 가장 나쁘다).
 struct GuardStrip {
     kept: String,
     dropped: Vec<String>,
     refused: Vec<String>,
+    unrecognized: Vec<String>,
 }
 
 /// ★결함3(b): 승계 금지 가드 마커가 붙은 절을 **heading 단위**로 제거한다.
 ///
 /// 규칙(전부 보수적 방향 — 과삭제 0 이 최우선):
-///   · 마커 = `is_no_inherit_marker`(줄 앵커 기계 토큰 · 규약 v2). 평문 어휘는 마커가 아니다.
+///   · 마커 = `is_no_inherit_marker`(줄 전체가 기계 토큰 · 규약 v3). 평문 어휘는 마커가 아니다.
+///   · **코드펜스 안의 마커는 마커가 아니다** — 마커 표기법을 코드블록으로 문서화한 절이
+///     통째로 삭제되던 결함 시정(리뷰어 실측). heading 판정과 **같은 마스크**를 쓴다.
 ///   · 마커 탐색 범위 = 그 절의 **직속 본문**(heading ~ 다음 heading 직전, 레벨 무관) —
 ///     하위 절의 마커가 상위 절을 끌어내리는 과삭제를 막는다.
 ///   · 드롭 범위 = 그 절 + **하위 절 전체**(같거나 얕은 레벨의 다음 heading 직전까지).
-///   · **문서 루트 불가침(F2)**: 첫 heading 에서 EOF 까지 = 문서 전체가 되는 드롭은 **거부**한다.
-///     H1 하나로 시작하는 평범한 문서(=출하 soul.md·오너 헌장의 표준 형태)가 통째로 사라지는
-///     것을 구조적으로 막는다 — 본부 전용 절은 하위 절로 표시하는 것이 규약이다.
+///   · **문서의 첫 최상위 절 불가침(F2)**: 문서 최소 heading 레벨의 **첫 절**은 뒤에 무엇이
+///     오든 드롭하지 않는다. (구 조건 `k==0 && end==EOF` 는 뒤에 H1 이 하나만 더 있으면
+///     우회돼 헌장 본문이 통째로 날아갔다 — 리뷰어 실측.) 본부 전용 문안은 하위 절로 표시하는
+///     것이 규약이며, 이 규칙이 USER-MANUAL 의 "문서 전체는 어떤 경우에도 제외되지 않는다"를
+///     참으로 만든다.
 ///   · **빈 결과 거부(F2 2선)**: 드롭 결과가 공백이면 전량 취소하고 원문을 유지한다.
 ///   · 닫힌 코드펜스 내부의 `#` 는 heading 이 아니다(미닫힘은 펜스 아님 · 종류 구분).
 ///   · 첫 heading 이전(preamble)은 절이 아니므로 **절대 드롭하지 않는다**.
 ///   · 드롭 0건이면 입력을 **바이트 그대로** 돌려준다(개행 정규화조차 없음).
+///   · **인식 실패는 감사에 남긴다**: 펜스 밖에 마커 토큰이 있는데 그 줄이 실제 드롭으로
+///     이어지지 않았으면(표기 불일치·preamble 위치·BOM 선행으로 heading 미인식·CR-only
+///     개행으로 줄 분리 실패·setext heading 문서 등) `unrecognized` 에 적는다. 인정 범위를
+///     넓히는 대신 **왜 안 먹었는지 보이게** 하는 선택이다(조용한 무동작 금지).
 fn strip_no_inherit_sections(src: &str) -> GuardStrip {
     let rows = lines_with_endings(src);
     let contents: Vec<&str> = rows.iter().map(|(c, _)| *c).collect();
     let fenced = fenced_line_mask(&contents);
+    // 마커는 **펜스 밖**에서만 유효하다(문서화용 코드블록 안의 예시는 마커가 아니다).
+    let marker_line: Vec<bool> = contents
+        .iter()
+        .enumerate()
+        .map(|(i, l)| !fenced[i] && is_no_inherit_marker(l))
+        .collect();
     // (줄 index, heading level) — 닫힌 코드펜스 밖의 ATX heading 만.
     let heads: Vec<(usize, usize)> = contents
         .iter()
@@ -1571,12 +1595,26 @@ fn strip_no_inherit_sections(src: &str) -> GuardStrip {
         .filter(|(i, _)| !fenced[*i])
         .filter_map(|(i, l)| atx_heading_level(l).map(|lv| (i, lv)))
         .collect();
+    // 문서의 첫 최상위 절(= 최소 레벨 heading 중 첫 번째)의 인덱스 — 불가침 대상.
+    let root_k = heads
+        .iter()
+        .map(|&(_, lv)| lv)
+        .min()
+        .and_then(|min_lv| heads.iter().position(|&(_, lv)| lv == min_lv));
     let mut drop_line = vec![false; rows.len()];
     let mut dropped: Vec<String> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     for (k, &(start, level)) in heads.iter().enumerate() {
         let own_end = heads.get(k + 1).map(|&(i, _)| i).unwrap_or(rows.len());
-        if !contents[start..own_end].iter().any(|l| is_no_inherit_marker(l)) {
+        if !marker_line[start..own_end].iter().any(|m| *m) {
+            continue;
+        }
+        if root_k == Some(k) {
+            // 문서의 첫 최상위 절 = 문서의 몸통. 마커가 있어도 드롭하지 않는다(F2 재발 차단).
+            refused.push(format!(
+                "문서의 첫 최상위 절 드롭 거부(문서 몸통 보호): {}",
+                contents[start].trim()
+            ));
             continue;
         }
         let end = heads[k + 1..]
@@ -1584,36 +1622,75 @@ fn strip_no_inherit_sections(src: &str) -> GuardStrip {
             .find(|&&(_, lv)| lv <= level)
             .map(|&(i, _)| i)
             .unwrap_or(rows.len());
-        if k == 0 && end == rows.len() {
-            // 문서 루트 = 문서 전체. 마커가 있어도 드롭하지 않는다(F2 치명 재발 차단).
-            refused.push(format!(
-                "문서 루트 절(첫 heading~EOF = 문서 전체) 드롭 거부: {}",
-                contents[start].trim()
-            ));
-            continue;
-        }
         drop_line[start..end].iter_mut().for_each(|d| *d = true);
         dropped.push(contents[start].trim().to_string());
     }
-    if dropped.is_empty() {
-        return GuardStrip { kept: src.to_string(), dropped, refused };
-    }
-    let kept: String = rows
-        .iter()
-        .zip(drop_line.iter())
-        .filter(|(_, d)| !**d)
-        .map(|((_, raw), _)| *raw)
-        .collect();
-    if kept.trim().is_empty() {
+    let kept: String = if dropped.is_empty() {
+        src.to_string()
+    } else {
+        rows.iter()
+            .zip(drop_line.iter())
+            .filter(|(_, d)| !**d)
+            .map(|((_, raw), _)| *raw)
+            .collect()
+    };
+    if !dropped.is_empty() && kept.trim().is_empty() {
         // 남는 게 없다 = 승계 의도가 아니라 파서 과삭제로 봐야 한다 — 전량 취소하고 원문 유지.
         refused.push(format!(
             "드롭 결과가 빈 문서 — 전량 취소(원문 유지) · 취소된 드롭 {}건: {}",
             dropped.len(),
             dropped.join(" | ")
         ));
-        return GuardStrip { kept: src.to_string(), dropped: Vec::new(), refused };
+        let unrecognized = unrecognized_marker_notes(&contents, &fenced, &vec![false; rows.len()]);
+        return GuardStrip {
+            kept: src.to_string(),
+            dropped: Vec::new(),
+            refused,
+            unrecognized,
+        };
     }
-    GuardStrip { kept, dropped, refused }
+    let unrecognized = unrecognized_marker_notes(&contents, &fenced, &drop_line);
+    GuardStrip { kept, dropped, refused, unrecognized }
+}
+
+/// 인식 실패 탐지용 **느슨한** 바늘 — 마커 의도를 알아보되 인정은 하지 않는 신호.
+/// (`<!-- cys : no-inherit -->` 처럼 정본 토큰조차 깨진 표기를 잡아야 하므로 토큰보다 짧다.
+///  이 바늘은 **경고에만** 쓰이며 어떤 줄도 삭제하지 않는다 — 넓혀도 안전한 유일한 자리다.)
+const SOUL_NO_INHERIT_NEAR_MISS: &str = "no-inherit";
+
+/// 옛 평문 표기(v2 가 마커로 인정하던 쌍) — v3 에서 **더 이상 마커가 아니다**. 삭제 판정에는
+/// 절대 쓰지 않고 **경고 전용 바늘**로만 남긴다: 이 표기만 붙은 절은 이제 그대로 승계되므로,
+/// 거동 변화가 조용히 지나가지 않도록(오너의 base soul 이 실제로 이 상태다) 흔적을 남긴다.
+/// 둘을 **한 줄에 모두** 담은 줄만 본다 — 경고조차 자연문에 남발하지 않기 위해서다.
+const SOUL_NO_INHERIT_LEGACY_HINT: [&str; 2] = ["본부(base) 레인 전용", "승계 금지"];
+
+/// 마커 의도가 **펜스 밖에** 있는데 실제 드롭으로 이어지지 않은 줄을 감사 흔적으로 모은다.
+/// 인정 범위를 넓히지 않고 **보이게** 하는 장치다 — 표기 오류(`<!-- cys : no-inherit -->` 류)·
+/// 절 밖 위치(preamble)·BOM 선행으로 heading 미인식·CR-only 개행(문서 전체가 한 줄)·setext
+/// heading 문서가 전부 여기 걸린다. 정상 동작한 마커(드롭된 줄 안의 마커)는 잡히지 않는다.
+fn unrecognized_marker_notes(contents: &[&str], fenced: &[bool], dropped_line: &[bool]) -> Vec<String> {
+    let needle = SOUL_NO_INHERIT_NEAR_MISS.to_ascii_lowercase();
+    contents
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !fenced[*i] && !dropped_line[*i])
+        .filter_map(|(i, l)| {
+            let head = l.chars().take(60).collect::<String>();
+            if l.to_ascii_lowercase().contains(&needle) {
+                Some(format!(
+                    "{}행: 마커 토큰이 있으나 효력 없음(줄 전체 표기 아님·절 밖·구조 미인식): {head}",
+                    i + 1
+                ))
+            } else if SOUL_NO_INHERIT_LEGACY_HINT.iter().all(|h| l.contains(h)) {
+                Some(format!(
+                    "{}행: 옛 평문 표기는 v0.14.23부터 마커가 아니다(이 절은 그대로 승계된다): {head}",
+                    i + 1
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// 시드 대상 **부서명** 산출 — 판정 규칙의 등재소는 `dept_scope_of` 하나다(사본 드리프트 금지).
@@ -1716,6 +1793,17 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
             }
             if !strip.refused.is_empty() {
                 flags.push("guard-drop-refused");
+            }
+            // 조용한 무동작 금지 — 마커를 붙였는데 안 먹은 줄은 반드시 보이게 한다.
+            for u in &strip.unrecognized {
+                eprintln!(
+                    "[pack] ⚠ 부서 soul 시드: 승계 금지 마커가 **인식되지 않았다** — {u} \
+                     · 정본 표기는 줄 전체가 `{SOUL_NO_INHERIT_MARKER_LINE}` 이며 제외하려는 \
+                     절(heading) 안에 넣어야 한다"
+                );
+            }
+            if !strip.unrecognized.is_empty() {
+                flags.push("guard-marker-unrecognized");
             }
             dropped_sections = strip.dropped;
             let src = base_soul
@@ -4065,7 +4153,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
         let base_pack = td.join("pack");
         std::fs::create_dir_all(&base_pack).unwrap();
-        // 오너 기계의 실제 base soul 형태(가드 블록 문안 그대로) — 인식 가능해야 한다.
+        // 오너 기계의 실제 base soul 형태 — 가드 절은 **정본 마커 한 줄**(규약 v3)로 표시하고,
+        // 옛 평문 안내(인용문)는 그대로 둔다: 평문은 더 이상 마커가 아니지만 그 절에 정본 마커가
+        // 있으므로 드롭돼야 한다(평문만으로 드롭되지 않는 것은 legacy_plaintext 핀이 따로 못박음).
         let base_soul = "# soul.md — 운영 헌장 (최소 골격)\n\
                          \n\
                          ## 정체\n\
@@ -4074,6 +4164,8 @@ mod tests {
                          - 안전핵 denylist 불변 · kill-switch 즉시 정지\n\
                          \n\
                          ## CEO 정체·부서 티켓 (오너 명령 집행 2026-08-22)\n\
+                         \n\
+                         <!-- cys:no-inherit -->\n\
                          \n\
                          > ★**본부(base) 레인 전용 절 — 승계 금지 가드**: 부서 팩의 soul.md 는 이\n\
                          > 파일을 승계해 시드된다. 이 절이 부서에 복사되면 부서장이 자신을 CEO 로 오인한다.\n\
@@ -4185,6 +4277,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// [회귀 핀·★2차 BLOCK 부수3 · **조용한 미탐 차단**] v3 가 레거시 평문 규칙을 삭제한 결과
+    /// **옛 표기만 가진 base soul 은 본부 전용 문안까지 그대로 승계된다**. 이것은 과삭제보다 안전한
+    /// 실패 방향이라는 오너 결정이지만, **조용하면 안 된다** — 판정(드롭)은 그대로 두고 **관측만**
+    /// 얹는 것이 계약이다. 이 핀은 그 관측이 실제 시드 경로에서 stderr 뿐 아니라 **원장 flag**
+    /// (`guard-marker-unrecognized`)까지 도달하는지를 못 박는다. 단위 테스트는 `GuardStrip.unrecognized`
+    /// 필드까지만 보므로, 이 핀이 없으면 flags 배선을 지워도 전부 green 이다(무증거 green 재발).
+    #[test]
+    fn legacy_only_base_soul_inherits_loudly_not_silently() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-dept-legacyonly-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let base_pack = td.join("pack");
+        std::fs::create_dir_all(&base_pack).unwrap();
+        // 정본 마커가 **하나도 없는** base soul — 옛 평문 표기만 붙어 있다(이주 전 오너 기계 상태).
+        let base_soul = "# soul.md — 운영 헌장 (최소 골격)\n\
+                         \n\
+                         ## 정체\n\
+                         \n\
+                         - 이 시스템의 주인(이하 \"오너\"): 홍길동\n\
+                         - 안전핵 denylist 불변 · kill-switch 즉시 정지\n\
+                         \n\
+                         ## CEO 정체·부서 티켓\n\
+                         \n\
+                         > ★**본부(base) 레인 전용 절 — 승계 금지 가드**: 이 절이 부서에 복사되면\n\
+                         > 부서장이 자신을 CEO 로 오인한다.\n\
+                         \n\
+                         - 이 데몬의 master 는 **CEO(master of master)** 다.\n\
+                         \n\
+                         ## 금지선 (denylist)\n\
+                         \n\
+                         - 외부 발행 — 비가역\n";
+        std::fs::write(base_pack.join("soul.md"), base_soul).unwrap();
+        let dpack = td.join("pack-dept-총무");
+        std::fs::create_dir_all(&dpack).unwrap();
+        let _env = set_pack_env(&dpack, td.join("cfg"));
+        install_into(
+            dpack.clone(),
+            [("soul.md", "TEMPLATE-SOUL-V1")].iter().copied(),
+            false,
+            "1.0.0",
+            false,
+            false,
+            pack_scope_of(&dpack),
+            None,
+        )
+        .unwrap();
+        let seeded = std::fs::read_to_string(dpack.join("soul.md")).unwrap();
+
+        // ① 판정은 바뀌지 않는다 — 평문만으로는 드롭하지 않는다(과삭제 0 원칙 유지).
+        assert!(
+            seeded.contains("CEO(master of master)"),
+            "평문 표기를 마커로 되살려 절을 삭제했다(2차 BLOCK 재발): {seeded}"
+        );
+        // ② 그래도 정체 스탬프는 앞에 붙어 부서장이 자기 정체를 먼저 읽는다(미탐의 실피해 완충).
+        assert!(seeded.contains("총무 부서장 마스터"), "정체 스탬프가 빠졌다: {seeded}");
+
+        // ③ ★관측 — 원장에 미탐 flag 가 남아야 한다(조용한 승계 금지).
+        let audit = std::fs::read_to_string(dpack.join(MERGE_AUDIT_FILE)).unwrap();
+        assert!(
+            audit.contains("\"guard-marker-unrecognized\""),
+            "옛 표기만 가진 base soul 의 미탐이 **원장에 남지 않았다**(조용한 미탐): {audit}"
+        );
+        assert!(
+            !audit.contains("\"guard-dropped\""),
+            "드롭이 없는데 드롭 flag 가 찍혔다(원장 오보): {audit}"
+        );
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// [회귀 핀·결함3(b)] 승계 금지 가드 마커 파서는 **보수적**이다 — 마커가 명확할 때만, 그
     /// 절(+하위 절)만 드롭한다. 오탐 삭제가 미탐 승계보다 위험하므로 부정 케이스를 함께 못 박는다.
     #[test]
@@ -4209,20 +4375,31 @@ mod tests {
         assert_eq!(r.dropped, vec!["### 하위".to_string()]);
 
         // ⓓ 닫힌 코드펜스 안의 '#' 는 heading 이 아니다 — 절 경계 오판으로 반쪽 삭제되지 않는다.
-        let src = "## 본부 전용\ncys:no-inherit\n```md\n## 가짜 heading\n```\n꼬리\n\n## 유지\nK\n";
+        //   (문서 몸통 보호 규칙에 걸리지 않도록 H1 아래의 하위 절을 대상으로 잡는다 — 실제 규약
+        //    "본부 전용 문안은 하위 절로 표시한다"와 같은 형태다.)
+        let src = "# T\n\n## 본부 전용\ncys:no-inherit\n```md\n## 가짜 heading\n```\n꼬리\n\n## 유지\nK\n";
         let r = strip_no_inherit_sections(src);
-        assert_eq!(r.kept, "## 유지\nK\n", "펜스 안 '#' 를 heading 으로 오판했다: {}", r.kept);
+        assert_eq!(r.kept, "# T\n\n## 유지\nK\n", "펜스 안 '#' 를 heading 으로 오판했다: {}", r.kept);
         assert_eq!(r.dropped.len(), 1);
 
         // ⓔ 첫 heading 이전(preamble)의 마커는 절이 아니므로 아무것도 드롭하지 않는다.
+        //    단 **조용하지 않다** — 인식 실패 흔적이 남는다(마커를 붙였는데 무동작 금지).
         let src = "<!-- cys:no-inherit -->\n\n## 유지\nK\n";
         let r = strip_no_inherit_sections(src);
         assert_eq!(r.kept, src, "preamble 마커로 문서가 잘렸다");
         assert!(r.dropped.is_empty());
+        assert_eq!(r.unrecognized.len(), 1, "preamble 마커 무동작이 조용히 지나갔다");
 
-        // ⓕ 계측 타당성: 오너 기계 base soul 의 실제 가드 문안(레거시 인용문 형태)이 인식된다.
-        let real = "> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: …";
-        assert!(is_no_inherit_marker(real), "실사용 가드 문안이 마커로 안 잡힌다(규약 드리프트)");
+        // ⓕ 계측 타당성: 마커 표기법을 **코드블록으로 문서화한** 절은 삭제되지 않는다(리뷰어 실측).
+        let src = "# T\n\n## 마커 사용법\n다음처럼 적는다:\n```md\n<!-- cys:no-inherit -->\n```\n설명 계속\n\n## 유지\nK\n";
+        let r = strip_no_inherit_sections(src);
+        assert!(
+            r.dropped.is_empty(),
+            "코드펜스 안의 마커 예시로 문서화 절이 삭제됐다: {:?}",
+            r.dropped
+        );
+        assert_eq!(r.kept, src, "바이트 불변");
+        assert!(r.unrecognized.is_empty(), "펜스 안 예시는 인식 실패로도 시끄럽지 않아야 한다");
     }
 
     /// [회귀 핀·★F2 치명 · 2026-08-22 적대 리뷰 BLOCK] **실제 배포본**(`PACK_ALL` 임베드
@@ -4244,8 +4421,63 @@ mod tests {
             r.dropped
         );
         assert!(r.refused.is_empty(), "출하 soul.md 에서 드롭 거부가 발생했다: {:?}", r.refused);
+        assert!(
+            r.unrecognized.is_empty(),
+            "출하 soul.md 에 효력 없는 마커 토큰이 있다(표기 오류): {:?}",
+            r.unrecognized
+        );
         assert_eq!(r.kept, shipped, "출하 soul.md 승계본은 바이트 불변이어야 한다");
         assert!(!r.kept.trim().is_empty(), "승계본이 공백(강등 분기 유발)");
+    }
+
+    /// [회귀 핀·★2차 BLOCK · **픽스처 회피 재발 방지**] 위 출하본 핀이 통과하는 이유가 "규칙이
+    /// 좁아서"임을 증명하는 핀 — 옛 **평문 표기**(`본부(base) 레인 전용` · `승계 금지`)를 인용문·
+    /// 중첩 인용·들여쓴 인용·규약 설명문으로 **가득 채운** 합성 base soul 을 넣어도 드롭 0 이어야
+    /// 한다. v2 의 레거시 쌍 규칙은 이 입력에서 절을 통째로 삭제했다(리뷰어 실측 4종).
+    /// ※ 규칙 삭제의 결과: 평문만 붙은 절은 이제 **승계된다**(차단 안 됨). 과삭제보다 안전한
+    ///    실패 방향이라는 오너 결정이며, 정본 마커 한 줄을 넣는 것이 차단 방법이다.
+    #[test]
+    fn legacy_plaintext_wording_is_never_a_marker() {
+        let base_soul = "# 헌장\n\
+                         \n\
+                         > 절 본문에 `cys:no-inherit`(권장) 또는 `승계 금지` / `본부(base) 레인 전용` 중 하나가\n\
+                         > 있으면 제외된다고 설명하는 문장\n\
+                         \n\
+                         ## 정체\n\
+                         오너는 주인님\n\
+                         \n\
+                         # 부록\n\
+                         > 본부(base) 레인 전용 절은 승계 금지 대상이다\n\
+                         >> 중첩 인용: 본부(base) 레인 전용 절은 승계 금지 대상\n\
+                         \u{20} > 들여쓴 인용: 본부(base) 레인 전용 · 승계 금지\n\
+                         \n\
+                         ## 세부\n\
+                         안전핵: 비가역 금지\n";
+        let r = strip_no_inherit_sections(base_soul);
+        assert!(
+            r.dropped.is_empty(),
+            "옛 평문 표기가 아직도 절을 삭제한다(2차 BLOCK 재발): {:?}",
+            r.dropped
+        );
+        assert_eq!(r.kept, base_soul, "평문 문서는 바이트 불변으로 승계된다");
+        assert!(
+            r.kept.contains("안전핵: 비가역 금지"),
+            "리뷰어 실측에서 소실됐던 줄이 또 사라졌다"
+        );
+        // 거동 변화(옛 표기 절이 이제 승계됨)는 **조용하지 않다** — 감사 흔적이 남는다.
+        assert!(
+            !r.unrecognized.is_empty(),
+            "옛 평문 표기의 무력화가 조용히 지나갔다(마이그레이션 미고지)"
+        );
+        // 리뷰어가 마커로 인정된다고 실측한 4줄 — 이제 전부 마커가 아니어야 한다.
+        for line in [
+            "> 절 본문에 `cys:no-inherit`(권장) 또는 `승계 금지` / `본부(base) 레인 전용` 중 하나가",
+            "> 본부(base) 레인 전용 절에는 승계 금지 마커를 붙여라",
+            ">> 중첩 인용: 본부(base) 레인 전용 절은 승계 금지 대상",
+            "  > 들여쓴 인용: 본부(base) 레인 전용 · 승계 금지",
+        ] {
+            assert!(!is_no_inherit_marker(line), "레거시 평문 규칙이 살아 있다: {line}");
+        }
     }
 
     /// [회귀 핀·★F2/F3 · 리뷰어 실측 입력 3종을 그대로] 파서가 "보수적"이라는 주장의 반례들.
@@ -4255,21 +4487,32 @@ mod tests {
     ///   ⓓ 문서 루트 드롭 거부 + 빈 결과 취소(F2 두 방어선)
     #[test]
     fn guard_strip_survives_adversarial_inputs() {
-        // ⓐ 리뷰어 실측 입력 그대로(마커만 정본 표기) — after1·after2 가 살아남아야 한다.
-        let src = "## marked\ncys:no-inherit\n```\ncode\n\n## after1\nA\n\n## after2\nB\n";
+        // ⓐ-0 리뷰어 실측 입력 **그대로** — `## marked` 가 문서의 첫 최상위 절이므로 이제는
+        //     문서 몸통 보호에 걸려 아무것도 드롭되지 않는다(과삭제 벡터 자체가 닫힌다).
+        let raw = "## marked\ncys:no-inherit\n```\ncode\n\n## after1\nA\n\n## after2\nB\n";
+        let r = strip_no_inherit_sections(raw);
+        assert!(r.dropped.is_empty(), "문서 첫 최상위 절이 드롭됐다: {:?}", r.dropped);
+        assert_eq!(r.kept, raw, "바이트 불변");
+        assert_eq!(r.refused.len(), 1, "보호 사유 미기록");
+        // ⓐ 같은 구조를 H1 아래 하위 절로 옮겨 **미닫힌 펜스**만 검증 — after1·after2 생존.
+        let src = "# 문서\n\n## marked\ncys:no-inherit\n```\ncode\n\n## after1\nA\n\n## after2\nB\n";
         let r = strip_no_inherit_sections(src);
         assert_eq!(r.dropped, vec!["## marked".to_string()]);
         assert_eq!(
-            r.kept, "## after1\nA\n\n## after2\nB\n",
+            r.kept, "# 문서\n\n## after1\nA\n\n## after2\nB\n",
             "미닫힌 펜스가 뒤 절까지 삼켰다(F3-b 재발): {:?}",
             r.kept
         );
 
         // ⓑ 펜스 종류 구분 — ``` 블록 안의 `~~~` 줄은 닫는 펜스가 아니다.
-        let src = "## marked\ncys:no-inherit\n```\n~~~\n## 펜스 안 가짜\n```\n\n## after\nA\n";
+        let src = "# 문서\n\n## marked\ncys:no-inherit\n```\n~~~\n## 펜스 안 가짜\n```\n\n## after\nA\n";
         let r = strip_no_inherit_sections(src);
         assert_eq!(r.dropped, vec!["## marked".to_string()]);
-        assert_eq!(r.kept, "## after\nA\n", "펜스 종류 미구분으로 경계가 깨졌다(F3-c): {:?}", r.kept);
+        assert_eq!(
+            r.kept, "# 문서\n\n## after\nA\n",
+            "펜스 종류 미구분으로 경계가 깨졌다(F3-c): {:?}",
+            r.kept
+        );
 
         // ⓒ-1 리뷰어 실측 CRLF 입력 **그대로** — 평문 "승계 금지"는 v2 에서 마커가 아니다(F3-a).
         let crlf = "# T\r\n\r\n## A\r\n승계 금지\r\n## B\r\nkeep\r\n";
@@ -4292,12 +4535,63 @@ mod tests {
         assert!(r.dropped.is_empty(), "문서 루트를 드롭했다(F2 재발): {:?}", r.dropped);
         assert_eq!(r.kept, src, "루트 드롭 거부 시 원문 유지");
         assert_eq!(r.refused.len(), 1, "거부는 조용히 삼키지 않는다: {:?}", r.refused);
+        // ⓓ-1′ **루트 거부 우회**(리뷰어 실측): 뒤에 H1 이 하나만 더 있으면 몸통이 통째로 날아갔다.
+        //      → '문서의 첫 최상위 절'은 뒤에 무엇이 오든 불가침이어야 한다.
+        let src = "# 헌장\n<!-- cys:no-inherit -->\n…\n## 정체\n…\n# 부록\nx\n";
+        let r = strip_no_inherit_sections(src);
+        assert!(r.dropped.is_empty(), "루트 거부가 후속 H1 로 우회됐다(F2 재발): {:?}", r.dropped);
+        assert_eq!(r.kept, src, "문서 몸통이 소실됐다");
+        assert_eq!(r.refused.len(), 1, "거부 사유 미기록");
         // ⓓ-2 빈 결과 취소 — 마커 절이 문서의 전부일 때 벤더 스켈레톤 강등 대신 원문 유지.
         let src = "## 전부\n<!-- cys:no-inherit -->\n본문\n";
         let r = strip_no_inherit_sections(src);
         assert!(r.dropped.is_empty(), "빈 결과 드롭이 통과했다: {:?}", r.dropped);
         assert_eq!(r.kept, src, "빈 결과면 전량 취소하고 원문 유지");
-        assert_eq!(r.refused.len(), 1, "취소 사유가 기록되지 않았다");
+        assert!(!r.refused.is_empty(), "취소 사유가 기록되지 않았다");
+    }
+
+    /// [회귀 핀·★2차 BLOCK 부수3] 반대 방향 — **마커를 붙였는데 무동작**. 표기 흔들림(공백·대소
+    /// 문자)은 인정하고, 구조적 미인식(BOM 선행·CR-only 개행·setext heading)은 **인정 범위를
+    /// 넓히는 대신 감사 흔적(`unrecognized`)으로 남긴다**(조용한 미탐이 가장 나쁘다).
+    #[test]
+    fn guard_marker_variants_are_honored_or_audited() {
+        // ⓐ 공백 유무·대소문자는 인정한다(기계 토큰).
+        for m in ["<!--cys:no-inherit-->", "<!-- CYS:NO-INHERIT -->", "<!--   cys:no-inherit   -->", "CYS:NO-INHERIT"] {
+            assert!(is_no_inherit_marker(m), "표기 흔들림을 못 받았다: {m}");
+            let src = format!("# T\n\n## 유지\nK\n\n## 대상\n{m}\nX\n");
+            let r = strip_no_inherit_sections(&src);
+            assert_eq!(r.dropped, vec!["## 대상".to_string()], "드롭 안 됨: {m}");
+            assert_eq!(r.kept, "# T\n\n## 유지\nK\n\n", "잔여 본문: {}", r.kept);
+            assert!(r.unrecognized.is_empty(), "정상 마커가 인식 실패로 잡혔다: {m}");
+        }
+
+        // ⓑ BOM 선행 — 첫 줄이 heading 으로 인식되지 않아 마커가 절 밖(preamble)에 놓인다.
+        //    드롭 0 이되 **감사 흔적**이 남아야 한다.
+        let src = "\u{feff}# T\n<!-- cys:no-inherit -->\n본문\n";
+        let r = strip_no_inherit_sections(src);
+        assert!(r.dropped.is_empty(), "BOM 문서에서 드롭이 났다: {:?}", r.dropped);
+        assert_eq!(r.kept, src, "바이트 불변");
+        assert_eq!(r.unrecognized.len(), 1, "BOM 미인식이 조용히 지나갔다: {:?}", r.unrecognized);
+
+        // ⓒ CR-only 개행 — 문서 전체가 한 줄이라 줄 앵커가 성립하지 않는다.
+        let src = "# T\r<!-- cys:no-inherit -->\r본문\r";
+        let r = strip_no_inherit_sections(src);
+        assert!(r.dropped.is_empty(), "CR-only 문서에서 드롭이 났다: {:?}", r.dropped);
+        assert_eq!(r.kept, src, "바이트 불변");
+        assert_eq!(r.unrecognized.len(), 1, "CR-only 미인식이 조용히 지나갔다: {:?}", r.unrecognized);
+
+        // ⓓ setext heading 문서 — ATX 가 없어 절 경계가 없다(마커는 preamble 취급).
+        let src = "제목\n====\n<!-- cys:no-inherit -->\n본문\n";
+        let r = strip_no_inherit_sections(src);
+        assert!(r.dropped.is_empty(), "setext 문서에서 드롭이 났다: {:?}", r.dropped);
+        assert_eq!(r.kept, src, "바이트 불변");
+        assert_eq!(r.unrecognized.len(), 1, "setext 미인식이 조용히 지나갔다: {:?}", r.unrecognized);
+
+        // ⓔ 표기 오류(토큰 주위에 다른 글자) — 마커가 아니고, 흔적은 남는다.
+        let src = "# T\n\n## 대상\n<!-- cys : no-inherit -->\nX\n";
+        let r = strip_no_inherit_sections(src);
+        assert!(r.dropped.is_empty(), "깨진 표기를 마커로 받았다: {:?}", r.dropped);
+        assert_eq!(r.unrecognized.len(), 1, "표기 오류가 조용히 지나갔다: {:?}", r.unrecognized);
     }
 
     /// [회귀 핀·F3-a] 마커 인정 범위 — 줄 앵커 기계 토큰만. 자연문 어휘는 마커가 아니다.
@@ -4306,20 +4600,28 @@ mod tests {
         for yes in [
             "<!-- cys:no-inherit -->",
             "   <!-- cys:no-inherit -->  ",
+            "<!--cys:no-inherit-->",
+            "<!-- CYS:NO-INHERIT -->",
             "cys:no-inherit",
-            "> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: v0.14.22부터 …",
         ] {
-            assert!(is_no_inherit_marker(yes), "정본/레거시 마커를 놓쳤다: {yes}");
+            assert!(is_no_inherit_marker(yes), "정본 마커를 놓쳤다: {yes}");
         }
         for no in [
             // 출하 soul.md 의 안내 문장류 — v1 이 여기 걸려 문서 전량을 지웠다.
             "> 부서장이 그것을 물려받아 자기 정체를 오인한다. 그런 절에는 **승계 금지 마커 주석**을",
             "- 승계 금지 절은 이렇게 표시한다",
             "본부(base) 레인 전용 절이라는 개념을 설명하는 평문",
-            "> 본부(base) 레인 전용 이라고만 적힌 인용문",     // 쌍의 한쪽만
-            "> 승계 금지 라고만 적힌 인용문",                   // 쌍의 다른 한쪽만
+            "> 본부(base) 레인 전용 이라고만 적힌 인용문",
+            "> 승계 금지 라고만 적힌 인용문",
+            // v2 레거시 쌍 규칙이 마커로 인정하던 4종(리뷰어 실측) — v3 에서 전부 마커 아님.
+            "> ★**본부(base) 레인 전용 절 — 승계 금지 가드**: v0.14.22부터 …",
+            "> 절 본문에 `cys:no-inherit`(권장) 또는 `승계 금지` / `본부(base) 레인 전용` 중 하나가",
+            ">> 중첩 인용: 본부(base) 레인 전용 절은 승계 금지 대상",
+            "  > 들여쓴 인용: 본부(base) 레인 전용 · 승계 금지",
             "코드 안 문자열 \"cys:no-inherit\" 언급",           // 줄 전체가 아님
             "## cys:no-inherit",                                 // heading 은 마커가 아니다
+            "<!-- cys:no-inherit --> 뒤에 설명이 붙은 줄",       // 줄 전체가 아님
+            "<!---->",                                           // 빈 주석
         ] {
             assert!(!is_no_inherit_marker(no), "자연문을 마커로 오인했다(F3-a 재발): {no}");
         }

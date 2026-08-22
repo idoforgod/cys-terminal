@@ -13,7 +13,14 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { classifyPendingFeed, CYCLE_VERIFY_NOTE, CYCLE_VERIFY_DISMISS_TITLE } from "./feedclass";
-import { deptPlaceholderLabel, deptSlugOfSocket } from "./deptlabel";
+import {
+  deptPlaceholderLabel,
+  deptSlugOfSocket,
+  pickDeptWorkspace,
+  isActiveDeptSocket,
+  DEFAULT_SOCKET_KEY,
+  type DeptSwitchOutcome,
+} from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import {
   RESET_PHRASE,
@@ -1602,7 +1609,8 @@ let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 �
 //   났다. 소켓별로 갖고 있으면 뺄셈이 사라지고 '기본 소켓이 아닌 것들의 합'을 직접 읽는다.
 // 키 = Workspace.socket ?? DEFAULT_SOCKET_KEY(=기본 데몬). 값 = 마지막으로 **성공 조회한** 대기 수.
 const pendingBySocket = new Map<string, number>();
-const DEFAULT_SOCKET_KEY = ""; // Workspace.socket === undefined(기본 데몬)의 맵 키
+// DEFAULT_SOCKET_KEY 의 정의처는 `deptlabel.ts` 다(부서 소켓 비교의 단일 정규화 지점) —
+// 이 맵의 키와 이동 버튼 판정이 같은 값을 써야 행이 서로 어긋나지 않으므로 한 곳에서만 선언한다.
 // ★결함#4-b(2026-08-22 오너 실사고) — 부서 데몬 대기의 **가시성**.
 // 종전 승인 Feed 에는 "다른 워크스페이스(부서 데몬)의 대기 N건은 이 목록에 나오지 않습니다"
 // 라는 경고문 한 줄뿐이었다. **어느 부서인지·어디로 가야 하는지**가 없어 부서에서 벌어지는
@@ -4263,8 +4271,7 @@ function renderOtherWorkspacePending(box: HTMLElement): number {
     // ★F6①: 이미 그 워크스페이스에 있으면 '이동'이 아니다 — 라벨이 실제 동작과 어긋나면
     //   사용자는 눌러 보고 나서야 안다. 상태에 맞춰 문구를 바꾼다(동작은 둘 다 '패널 닫기'로
     //   그 부서 pane 을 드러내는 것 — 이미 그 부서면 그게 유일하게 유용한 동작이다).
-    const activeSock = workspaces[activeWs] ? workspaces[activeWs].socket ?? DEFAULT_SOCKET_KEY : null;
-    const here = activeSock === r.socket;
+    const here = isActiveDeptSocket(workspaces, activeWs, r.socket);
     const go = document.createElement("button");
     go.textContent = here ? "지금 이 부서 — 패널 닫기" : "이 부서로 이동";
     go.title = here
@@ -5160,21 +5167,20 @@ function jumpToSurface(sid: number, socket?: string) {
 //   "switched" = 그 워크스페이스가 활성이다(이미 활성이었던 경우 포함 — 결과 상태가 같다)
 //   "pending"  = 부서 데몬 기동 중인 placeholder 로 전환했다(★F6② — '닫힌 탭'이 **아니다**)
 //   "missing"  = 그 socket 의 탭이 실제로 없다(레지스트리 잔재)
-function switchToWorkspaceBySocket(socket: string): "switched" | "pending" | "missing" {
-  // pending 도 후보에 넣는다 — 종전의 `!w.pending` 은 **연결 중** 부서를 '닫힌 탭'으로
-  // 오분류했다. 비-pending 을 우선 채택하고(정상 탭이 있으면 그쪽), 없으면 pending 을 쓴다.
-  let i = workspaces.findIndex((w) => !w.pending && (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
-  const pending = i < 0;
-  if (pending) i = workspaces.findIndex((w) => (w.socket ?? DEFAULT_SOCKET_KEY) === socket);
-  if (i < 0) return "missing";
-  if (i !== activeWs) {
-    activeWs = i;
+function switchToWorkspaceBySocket(socket: string): DeptSwitchOutcome {
+  // 판정(어느 탭이며 세 갈래 중 무엇인가)은 `deptlabel.ts` 의 순수 `pickDeptWorkspace` 가
+  // 한다 — 여기 남는 것은 **부작용**(활성 전환·재그림·포커스)뿐이다. 판정을 순수부로 뺀
+  // 이유는 이 함수가 모듈-private 이라 핀이 닿지 못했기 때문이다(deptlabel.test.ts 가 박제).
+  const { outcome, index } = pickDeptWorkspace(workspaces, socket);
+  if (outcome === "missing") return outcome;
+  if (index !== activeWs) {
+    activeWs = index;
     render();
     // pending placeholder 에는 pane 이 없다(collectSids=[]) — setFocus 는 자연히 생략된다.
     const first = collectSids(current().tree)[0];
     if (first != null) setFocus(first); // ws-tab mousedown 과 동일 2단계(전환 후 포커스)
   }
-  return pending ? "pending" : "switched";
+  return outcome;
 }
 
 // 60% cycle: hot 노드를 순차 점프(모듈 전역 cursor로 라운드로빈).

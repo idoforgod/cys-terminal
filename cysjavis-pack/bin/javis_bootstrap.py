@@ -1925,6 +1925,180 @@ def _run_resource_gate(py, log):
     return None
 
 
+# ── 부서명 규약 동작 대조 (2026-08-22 적대검증 2회차 중대6) ──────────────────────
+# 두 구현이 갈려 있는 입력의 허용 목록 — **지금은 비어 있다(= 완전 일치)**.
+# 이력: 종전 `cys-dept::dept_name_ok` 는 `grep -Eq` 라 **줄 단위**로 판정해 `$'abc\nrm -rf /'`
+# 같은 개행 포함 이름을 통과시켰다(python `fullmatch` 는 거부). 2026-08-22 그 파일이 bash
+# `[[ =~ ]]` 로 교체되면서 해소됐고, 아래 대조로 16종 전건 일치를 실측 확인했다.
+# ★목록에 항목을 추가하는 것은 "불일치를 알고 남긴다"는 선언이다 — 반드시 사유·소유자를 함께 적어라.
+_DEPT_NAME_KNOWN_DIVERGENCE = ()
+
+
+def _extract_dept_name_ok_def(src):
+    """`cys-dept` 원문에서 `dept_name_ok` **함수 정의 전체**를 잘라낸다. → str | None.
+
+    ★다중 줄 정의를 견딘다(2026-08-22 master 지시): 종전은 "한 줄이고 `}` 로 끝난다"만
+      인정해서, 그 파일이 여러 줄 정의로 바뀌는 순간 추출이 실패했다. 두 형태를 받는다 —
+        ⓐ 한 줄:   `dept_name_ok(){ …; }`
+        ⓑ 여러 줄: `dept_name_ok(){` … 단독 `}` 줄까지
+    ★그래도 이 추출은 **언젠가 깨진다**(셸 문법을 전부 파싱하지는 않는다). 그래서 견고화보다
+      중요한 것이 호출자의 **loud 실패**다 — 추출 실패를 조용히 넘기면 대조가 사라진다.
+    """
+    lines = src.splitlines(True)
+    for idx, ln in enumerate(lines):
+        if not ln.lstrip().startswith("dept_name_ok()"):
+            continue
+        if ln.rstrip().endswith("}"):
+            return ln                                   # ⓐ 한 줄 정의
+        buf = [ln]
+        for ln2 in lines[idx + 1:]:                     # ⓑ 다중 줄 — 단독 `}` 줄까지
+            buf.append(ln2)
+            if ln2.strip() == "}":
+                return "".join(buf)
+        return None                                     # 닫히지 않았다 = 추출 실패
+    return None
+
+
+def _cys_dept_name_ok_batch(names):
+    """`cys-dept` 의 `dept_name_ok` 를 **실제로 실행**해 판정 목록을 받는다.
+
+    → `(판정목록, None)` 성공 / `(None, ("absent"|"drift", 사유))` 실패.
+
+    ★사본을 만들지 않는다: 함수 정의를 파일에서 그대로 뽑아 실행하므로, 대조 대상은 **그 파일의
+      실제 코드**다(정규식을 여기 옮겨 적으면 그 순간 대조가 무의미해진다).
+    ★스크립트 전체를 source 하지 않는 이유: 최상위 인자 파싱·부작용이 돌 수 있다. 필요한 것은
+      순수 판정 함수 하나뿐이다.
+
+    ## ★실패를 두 갈래로 가르는 이유 (2026-08-22 master 결정 — 무성 강등 제거)
+    종전은 모든 실패를 `None` 하나로 뭉쳐 호출자가 전부 NOTE 로 강등했다. 그러면 `cys-dept` 가
+    다중 줄 정의로 바뀌는 순간 **부서명 규약 대조가 소리 없이 사라지고 self-test 는 초록**이다 —
+    "대조가 죽었는데 초록이 뜬다"는 우리가 3라운드 내내 제거해 온 결함 부류 그 자체다.
+      · `absent` = **정당한 부재**(파일 자체가 없다 · bash 가 없다). 팩 밖에서 돌리는 경우가
+        있으므로 NOTE 로 강등한다. 대조할 대상이 애초에 없는 것은 드리프트가 아니다.
+      · `drift`  = **파일은 있는데 못 읽었다/못 뽑았다/못 돌렸다**. 이건 부재가 아니라 신호다 —
+        호출자가 **hard fail** 시킨다.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cys-dept")
+    if not os.path.isfile(path):
+        return None, ("absent", "cys-dept 파일이 없다(%s) — 팩 밖 실행으로 본다" % path)
+    import shutil as _sh
+    bash = _sh.which("bash")
+    if not bash:
+        # bash 부재는 드리프트가 아니라 **환경 능력 부재**다(해석기가 없으면 무엇도 못 돌린다).
+        return None, ("absent", "bash 실행기가 PATH 에 없다 — 셸 구현을 실행할 수단이 없다")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except OSError as e:
+        return None, ("drift", "cys-dept 를 읽지 못했다(%s: %s)" % (type(e).__name__, e))
+    fndef = _extract_dept_name_ok_def(src)
+    if not fndef:
+        return None, ("drift",
+                      "cys-dept 에서 `dept_name_ok` 정의를 뽑지 못했다 — 함수가 사라졌거나 "
+                      "추출기가 모르는 형태로 바뀌었다(한 줄 정의·단독 `}` 로 닫는 다중 줄 정의만 "
+                      "인식한다). `_extract_dept_name_ok_def` 를 그 형태에 맞춰 고쳐라")
+    script = fndef + '\nfor n in "$@"; do dept_name_ok "$n" && echo Y || echo N; done\n'
+    try:
+        r = subprocess.run([bash, "-c", script, "_"] + list(names),
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return None, ("drift", "추출한 dept_name_ok 실행에 실패했다(%s: %s)"
+                      % (type(e).__name__, e))
+    out = (r.stdout or "").split()
+    if len(out) != len(names):
+        return None, ("drift",
+                      "판정 개수가 입력과 다르다(입력 %d · 출력 %d) — 추출한 정의가 문법 오류이거나 "
+                      "함수가 여분의 출력을 낸다. stderr=%r"
+                      % (len(names), len(out), (r.stderr or "")[:200]))
+    return [tok == "Y" for tok in out], None
+
+
+# 부서명 대조 코퍼스 — (이름, 수용되어야 하는가, 축 설명).
+# ★두 축을 **동시에** 본다(둘 중 하나만으로는 무증거다):
+#     ⓐ 비대칭 0 — 두 구현의 판정이 전건 일치하는가(생성기는 만들고 발급기는 거부하는 부서 0)
+#     ⓑ 절대 기대값 — 그 일치가 **옳은 값**인가. 비대칭 0 만 보면 두 구현이 **함께 틀린** 경우
+#        (예: 양쪽 다 `a;b` 를 수용)가 만점을 받는다. 이름은 경로·소켓 이름에 들어가므로
+#        "둘이 사이좋게 위험한" 상태를 green 으로 넘기면 안 된다.
+_DEPT_NAME_CORPUS = (
+    # ── 수용되어야 하는 정상 이름 ──
+    ("Sales", True, "영문 대문자 시작"),
+    ("dept-1", True, "kebab + 숫자"),
+    ("dept_1", True, "underscore + 숫자"),
+    ("dept-3", True, "kebab"),
+    ("Sales_Team", True, "대문자 + underscore 혼합"),
+    ("a", True, "1자 하한"),
+    ("A9_x-y", True, "허용 문자 전종 혼합"),
+    ("a" * 40, True, "40자 상한 경계(수용)"),
+    # ── 거부되어야 하는 이름 ──
+    ("", False, "빈 문자열"),
+    ("a" * 41, False, "41자 — 상한 초과(소켓 104B 여유)"),
+    ("-abc", False, "하이픈 시작"),
+    ("-lead", False, "하이픈 시작"),
+    ("_x", False, "underscore 시작"),
+    ("a/b", False, "경로 구분자 — 디렉터리 탈출"),
+    ("a.b", False, "점 — 경로 성분"),
+    ("a b", False, "공백"),
+    ("a;b", False, "세미콜론 — 셸 명령 구분자"),
+    ("부서", False, "비ASCII(한글) — 소켓·경로 결정론 밖"),
+    # ── ★개행 축(중대6 재현 입력 그대로) — 리터럴 대조로는 원리적으로 못 잡던 검체 ──
+    #   구 `grep -Eq` 는 **줄 단위**라 여러 줄 중 **한 줄만** 맞아도 성립했다.
+    ("abc\nrm -rf /", False, "★첫 줄이 정상 — 구 grep 통과(명령 주입)"),
+    ("\nabc", False, "★둘째 줄이 정상 — 구 grep 통과"),
+    ("abc\n", False, "★후행 개행 — 구 grep 통과($ 가 줄 끝을 앵커)"),
+    ("x\nAAAA", False, "★두 줄 다 정상 — 구 grep 통과"),
+    ("a\n\nb", False, "★빈 줄 낀 다줄"),
+)
+
+
+def _selftest_dept_name_parity():
+    """부서명 판정의 **동작** 대조 — 리터럴 대조로는 못 잡는 의미론 차이를 잡는다."""
+    corpus = [n for n, _want, _why in _DEPT_NAME_CORPUS]
+    shell, err = _cys_dept_name_ok_batch(corpus)
+    if err is not None:
+        kind, detail = err
+        # ★drift = hard fail(2026-08-22 master 결정). 파일이 **있는데** 대조를 못 돌렸다면
+        #   그것은 부재가 아니라 신호다 — 조용히 넘기면 개행 결함이 재발해도 아무도 모른다.
+        assert kind == "absent", (
+            "★부서명 규약 **동작 대조가 무력화됐다** — %s\n"
+            "  이건 '대조 대상 부재'가 아니라 **드리프트 신호**다(cys-dept 파일은 존재한다).\n"
+            "  이 상태로 초록을 내면 `dept_name_ok` 가 다시 줄 단위 판정으로 돌아가도 "
+            "self-test 가 잡지 못한다(중대6 재발 · 개행 이름이 경로·소켓에 들어간다).\n"
+            "  조치: 추출기(`_extract_dept_name_ok_def`)를 현재 정의 형태에 맞추거나, "
+            "cys-dept 소유 워커에게 정의 형태 변경을 확인하라." % detail)
+        # 정당한 부재만 여기 온다 — 대조할 대상이 애초에 없다.
+        print("javis_bootstrap self-test NOTE: 부서명 동작 대조를 건너뛴다(%s) — "
+              "리터럴 대조로 대체하지 않는다" % detail, file=sys.stderr)
+        return
+    known = set(_DEPT_NAME_KNOWN_DIVERGENCE)
+    asym = []
+    for (name, want, why), sh in zip(_DEPT_NAME_CORPUS, shell):
+        py = dept_name_ok(name)
+        # ⓑ 절대 기대값 — 두 구현이 **함께 틀리는** 것을 비대칭 0 이 가려 주지 못하게 한다.
+        assert py == want, (
+            "발급기 dept_name_ok(%r) = %s, 기대 %s (%s). 이름은 경로·소켓 이름에 들어간다 — "
+            "관대한 쪽이 위험하다." % (name, py, want, why))
+        assert sh == want, (
+            "생성기 cys-dept::dept_name_ok(%r) = %s, 기대 %s (%s). ★`cys-dept` 는 다른 워커 "
+            "소유다 — 이 단언이 깨지면 고치지 말고 보고하라." % (name, sh, want, why))
+        # ⓐ 비대칭 0
+        if sh != py:
+            asym.append((name, sh, py))
+            assert name in known, (
+                "부서명 판정 불일치(신규): %r → cys-dept=%s / javis_bootstrap=%s. "
+                "이름은 경로에 들어간다(<dept>.ticket·cys-dept-<name>) — 관대한 쪽이 위험하다. "
+                "두 구현을 같은 의미론으로 맞춰라(리터럴이 아니라 동작이 계약이다)."
+                % (name, sh, py))
+        elif name in known:
+            print("javis_bootstrap self-test NOTE: 부서명 %r 의 알려진 불일치가 해소됐다 — "
+                  "`_DEPT_NAME_KNOWN_DIVERGENCE` 에서 지워라(cys-dept 수리 반영)"
+                  % name, file=sys.stderr)
+    # ★비대칭 0 을 **명시적으로** 단언한다(허용 목록이 비어 있으므로 전건 일치가 계약이다).
+    assert not asym, "부서명 판정 비대칭이 남아 있다: %r" % (asym,)
+    # 내 쪽 보증: 개행이 든 이름은 **무조건 거부**한다(경로 안전 — 이건 갈릴 수 없다)
+    for name in ("abc\nrm -rf /", "\nabc", "abc\n", "x\nAAAA", "a\n\nb"):
+        assert not dept_name_ok(name), "개행이 든 부서명을 수용한다(경로 안전 붕괴): %r" % name
+
+
 def cmd_issue_ticket(argv):
     """CEO 티켓 발급 — base 레인 전용. 사용: issue-ticket --dept <name>.
     exit: 0=발급(경로 stdout) / 2=base 레인 아님 또는 --dept 형식 위반.
@@ -2899,15 +3073,14 @@ def cmd_self_test():
             assert dept_name_ok(_n), "생성기가 만드는 이름 %r 을 발급기가 거부한다(중대③ 재발)" % _n
         for _n in ("", "-lead", "_x", "a/b", "a.b", "a b", "a" * 41):
             assert not dept_name_ok(_n), "경로·형식 위험 이름 %r 을 발급기가 수용한다" % _n
-        # 생성기(cys-dept)와 문자 집합이 실제로 같은지 **소스 대조**(사본 드리프트 차단)
-        _cd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cys-dept")
-        if os.path.isfile(_cd):
-            with open(_cd, encoding="utf-8", errors="replace") as _f:
-                _cdsrc = _f.read()
-            assert "[A-Za-z0-9][A-Za-z0-9_-]{0,39}" in _cdsrc, \
-                "cys-dept::dept_name_ok 의 집합이 바뀌었다 — DEPT_NAME_RE 를 함께 고쳐라"
-            assert DEPT_NAME_RE.pattern == "[A-Za-z0-9][A-Za-z0-9_-]{0,39}", \
-                "DEPT_NAME_RE 가 생성기와 갈렸다(비대칭 재발): %r" % DEPT_NAME_RE.pattern
+        # ★생성기(cys-dept)와의 **동작 대조**(2026-08-22 적대검증 2회차 중대6).
+        #   종전은 정규식 **문자열 리터럴 대조**였다 — 그건 원리적으로 의미론 차이를 못 잡는다.
+        #   실제로 두 구현은 문자 집합이 같은데도 **개행 축에서 갈렸다**: shell 쪽 `grep -Eq` 는
+        #   **줄 단위**라 `$'abc\nrm -rf /'` 처럼 **어느 한 줄만** 맞으면 성립하고, python 쪽
+        #   `fullmatch` 는 문자열 전체를 요구한다. 이름은 경로에 들어간다(`<dept>.ticket`·
+        #   `cys-dept-$name`)므로 관대한 쪽이 위험하다.
+        #   → 그래서 `cys-dept` 의 `dept_name_ok` 를 **실제로 실행**해 같은 코퍼스로 대조한다.
+        _selftest_dept_name_parity()
         # ⓐ″ ★실패할 명령을 CEO 큐에 넣지 않는다(중대③ 후반) — 불량 이름은 요청 **미발사**
         _bad_req, _bad_why = _request_dept_ticket("Bad/Name")
         assert _bad_req is False and "발급 규약" in _bad_why, \
@@ -2996,7 +3169,10 @@ def cmd_self_test():
         return 1
     print("javis_bootstrap self-test OK (★결함#2: CEO 티켓 자동 요청(명령 조립·base env 소켓 "
           "격리·멱등 TTL 4종·유계 대기 2종·단계 서수) · "
-          "★중대③ 부서명 규약 단일화(수용 5·거부 7·cys-dept 소스 대조·불량명 요청 미발사) · "
+          "★중대③ 부서명 규약 단일화(수용 5·거부 7·불량명 요청 미발사) + ★중대⑥ cys-dept "
+          "**동작 대조** 23종(수용 8·거부 10·★개행 축 5종 — 리터럴 대조 폐기 · "
+          "비대칭 0 + 절대 기대값 양축 · ★대조 무력화=hard fail(파일 부재만 NOTE 강등 — "
+          "무성 강등 제거)) · "
           "★중대④ 로스터 밀폐 주입 관통(정본·래퍼 시그니처 핀 — 깨끗한 HOME green) · "
           "W6: 폴백 전제 판정 8종(부서 자동 생성 게이트) · "
           "W4: TCC 탐침 실자원 파생 · W3: 레인 상태 경로 12종 + 단계 레지스트리 9종 · "

@@ -631,20 +631,38 @@ fn check_send_acl(
         if allow {
             let would_be = eval_acl_rules(&acl, &effective_role, &to_role, false)
                 .unwrap_or_else(|| acl["default"].as_str() != Some("deny"));
-            if !would_be
-                && !owner_grant_audit_seen(caller_pid, target.id, crate::state::now_epoch())
-            {
-                daemon.bus.publish(
-                    "acl.owner_granted",
-                    "system",
-                    Some(target.id),
-                    json!({"to_role": to_role, "denied_as_role": effective_role,
-                           "caller_pid": caller_pid, "explicit_owner_rule": owner_rule.is_some(),
-                           "note": "owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 \
-                                    아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 \
-                                    있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. \
-                                    공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 \
-                                    않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라."}),
+            let now = crate::state::now_epoch();
+            if !would_be && !owner_grant_audit_seen(caller_pid, target.id, now) {
+                // ★F4-②: pid 미해석(커널 peer 조회 실패)은 억제 예외이자 **더 높은 감사가치**다 —
+                //   `caller_pid: null` 만 남기면 아래 안내("그 프로세스를 확인하라")가 성립하지
+                //   않으므로, 해석 여부를 별도 필드로 명시하고 안내도 그 경우로 갈라 적는다.
+                let resolved = caller_pid.is_some();
+                let payload = json!({
+                    "to_role": to_role, "denied_as_role": effective_role,
+                    "caller_pid": caller_pid, "caller_pid_resolved": resolved,
+                    "explicit_owner_rule": owner_rule.is_some(),
+                    "note": if resolved {
+                        "owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 \
+                         거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 \
+                         프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 \
+                         토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid \
+                         면 그 프로세스를 확인하라."
+                    } else {
+                        "owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 \
+                         못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 \
+                         기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 \
+                         배달 원장·부서 소켓 접속을 함께 보라."
+                    },
+                });
+                daemon
+                    .bus
+                    .publish("acl.owner_granted", "system", Some(target.id), payload.clone());
+                // ★F4-①: 버스는 인메모리 링(4096)이라 재시작·폭주로 증발한다 — 사후추적이 목적인
+                //   이 이벤트만 파일로도 남긴다(best-effort · 실패해도 배달을 막지 않는다).
+                append_owner_grant_audit(
+                    daemon,
+                    &json!({"ts": now, "event": "acl.owner_granted",
+                            "to_surface": target.id, "payload": payload}),
                 );
             }
         }
@@ -782,10 +800,40 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// (broadcast 용량 1024 · ring 유한). 참칭 노드의 **첫 호출**은 새 조합이라 언제나 즉시 남는다.
 const OWNER_GRANT_AUDIT_WINDOW_SECS: f64 = 60.0;
 
+/// ★F4-③ 만료 회수 **전수 스캔**(`retain`)이 돈 횟수 — `suppression_hot_path_does_not_scan_the_whole_map`
+/// 회귀 핀의 관측점.
+///
+/// 스캔이 hot path 로 되돌아가는 회귀는 **동작이 아니라 비용만** 바꾼다. 실제로 매 호출 전수
+/// 스캔으로 되돌려 전량 돌렸을 때 649건이 **전부 green** 이었다 — 그 수리에는 핀이 없었고
+/// green 은 무증거였다. 그래서 횟수 자체를 관측 가능하게 만들어 못박는다.
+///
+/// ★테스트 전용 cfg 속성으로 감싸지 **않는다**(주석에도 그 속성 문자열을 적지 않는다):
+/// 이 파일에는 `include_str!("handlers.rs")` 로 자기 소스를 읽고 **테스트 모듈 cfg 속성의 첫
+/// 출현**을 앵커로 삼아 그 앞을 '프로덕션 구간'으로 자르는 소스핀들이 있다
+/// (`manual_reap_recheck_pins_state_changed_abort` · `queue_lock_order_contract_no_ab_ba`).
+/// 그 문자열이 프로덕션 구간에 **주석으로라도** 먼저 나오면 슬라이스가 거기서 잘려 소스핀이
+/// 통째로 무력화된다(실측: 잘린 구간에서 `surface.reap` arm 을 못 찾아 두 핀이 red 였다).
+/// 증가 연산은 실제로 발행하는 드문 경로(≈억제창당 1회 · 이미 파일 append 와 버스 publish 를
+/// 하는 곳)에만 있어 relaxed fetch_add 1회의 비용은 무시할 수 있다.
+static OWNER_GRANT_AUDIT_SWEEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// 위 창 안에서 이미 남긴 조합인가(그리고 아니면 지금 것으로 등록한다).
 /// 프로세스 전역 1개 — 데몬은 프로세스당 하나다(테스트는 조합이 겹치지 않게 pid 를 나눠 쓴다).
-/// 매 호출 만료 회수로 무한 성장을 막는다(`caller_cache` 관례 동형).
+///
+/// ★F4-② `caller_pid == None` 은 **억제하지 않는다**(항상 발행). 커널 peer pid 조회가 실패하면
+///   (macOS `getsockopt` · Windows `GetNamedPipeClientProcessId` 실패) `caller_pid` 가 None 이
+///   되는데, 그때 `caller_is_owner` 의 `from_sid.is_none()` 은 **자동 충족**되므로 승격은 그대로
+///   난다. 종전처럼 `unwrap_or(0)` 으로 키를 뭉개면 **신원 미해석 발신자 전부가 60초에 한 건만**
+///   기록돼, 정작 감사가치가 가장 높은 부류가 가장 적게 남는다. 미해석은 억제 예외로 둔다.
+///
+/// ★F4-③ 만료 회수(`retain` 전수 스캔)는 **발행 경로에서만** 돈다. 오너가 부서 워커 pane 에
+///   타이핑하면 키 조각마다(`term.onData`→`send_text`) 이 함수를 타는데, 그 hot path 는
+///   해시 조회 1회로 끝나야 한다(창 안 = 즉시 true). 스캔은 실제로 남기는 ~분당 1회에만 든다.
+///   (`caller_cache` 가 캐시-미스 경로에서만 회수하는 관례와 동형.)
 fn owner_grant_audit_seen(caller_pid: Option<u32>, target: u64, now: f64) -> bool {
+    // 신원 미해석 — 억제 예외(항상 발행). 등록도 하지 않는다(키가 없으므로).
+    let Some(pid) = caller_pid else { return false };
     static SEEN: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<(u32, u64), f64>>,
     > = std::sync::OnceLock::new();
@@ -793,13 +841,55 @@ fn owner_grant_audit_seen(caller_pid: Option<u32>, target: u64, now: f64) -> boo
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    g.retain(|_, ts| now - *ts < OWNER_GRANT_AUDIT_WINDOW_SECS);
-    let key = (caller_pid.unwrap_or(0), target);
-    if g.contains_key(&key) {
-        return true;
+    let key = (pid, target);
+    if let Some(ts) = g.get(&key) {
+        if now - *ts < OWNER_GRANT_AUDIT_WINDOW_SECS {
+            return true; // hot path — 스캔 없음
+        }
     }
+    // 여기부터는 실제로 발행하는 드문 경로다. 이때만 만료 항목을 일괄 회수한다.
+    OWNER_GRANT_AUDIT_SWEEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    g.retain(|_, ts| now - *ts < OWNER_GRANT_AUDIT_WINDOW_SECS);
     g.insert(key, now);
     false
+}
+
+/// ★F4-① owner 승격 감사의 **영속 원장** 경로 — 레인별(`state_dir` = 그 데몬의 상태 디렉터리,
+/// 부서 데몬은 자기 디렉터리를 갖는다). 이벤트 버스는 `RING_CAPACITY=4096` **인메모리 링**이고
+/// 디스크에 남는 것은 seq 상한뿐이라(`events.rs`), 버스만으로는 이 이벤트의 선언된 목적인
+/// **참칭 사후추적**이 성립하지 않는다 — 참칭자가 이후 4096건을 만들거나 데몬이 재시작하면
+/// 증거가 사라진다(실시간 구독자가 붙어 있을 때만 관측되는 셈). 그래서 파일로도 남긴다.
+///
+/// ★정직한 한계(배달 원장과 동일 계열): 같은 UID 프로세스는 이 파일을 지우거나 덮어쓸 수 있다.
+/// 이것은 위조 방지 감사가 아니라 **사고·오작동의 사후 재구성**을 가능하게 하는 기록이다.
+fn owner_grant_audit_path(daemon: &Daemon) -> std::path::PathBuf {
+    crate::state::state_dir(&daemon.socket_path).join("acl-owner-granted.jsonl")
+}
+
+/// 승격 1건을 원장에 append 한다(1세대 회전 · unix 0600 · **best-effort**).
+/// 실패해도 이벤트 발행은 이미 끝났으므로 조용히 포기한다 — 기록 실패가 승격 판정이나 배달을
+/// 막아선 안 된다(감사는 관측이지 게이트가 아니다). 파일 부재·회전 실패도 같은 이유로 무시한다.
+fn append_owner_grant_audit(daemon: &Daemon, rec: &Value) {
+    use std::io::Write;
+    const MAX_BYTES: u64 = 1 << 20; // 1MiB — 레코드 ~400B 라 수천 건. 초과 시 1세대만 회전.
+    let p = owner_grant_audit_path(daemon);
+    if std::fs::metadata(&p).is_ok_and(|m| m.len() > MAX_BYTES) {
+        let _ = std::fs::rename(&p, p.with_extension("jsonl.1"));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // 생성 시에만 적용 — operator.token 과 같은 소유자 전용 등급.
+    }
+    // O_APPEND 단일 write — 여러 스레드가 붙어도 줄이 섞이지 않는다(레코드는 수백 바이트,
+    // PIPE_BUF 이하). delivery.rs `append_lines` 와 같은 규약이다.
+    if let Ok(mut f) = opts.open(&p) {
+        let mut line = rec.to_string();
+        line.push('\n');
+        let _ = f.write_all(line.as_bytes()).and_then(|_| f.flush());
+    }
 }
 
 /// T3-13 타이핑 가드 창 (초). 0 = 비활성.
@@ -6008,9 +6098,10 @@ mod tests {
     /// 페이로드가 종전과 **바이트 동일**해야 한다. 오너 기본 허용(위)이 다른 발신자에게
     /// 새어 나가지 않는다는 것이 이 결함 수리의 안전 조건이다.
     ///
-    /// 커버: ⓐ토큰 없는 external ⓑ틀린 토큰 ⓒ**토큰은 맞지만 pane 에 귀속된** 발신자
-    /// (= 2중 조건의 두 번째가 무너지면 워커가 오너로 승격되는 그 경로) ⓓ와일드카드 `from:"*"`
-    /// 규칙이 비-오너에게는 종전대로 글롭 매칭된다는 것.
+    /// 커버: ⓐ토큰 없는 external ⓑ틀린 토큰 ⓒ**토큰은 맞지만 이 데몬의 pane 에 귀속된** 발신자
+    /// (판정 2조건 중 `from_sid.is_none()` 이 걸러 내는 **유일한** 부류 — 타 데몬 노드는 애초에
+    /// 이 조건을 자동 충족하므로 여기서 걸리지 않는다) ⓓ와일드카드 `from:"*"` 규칙이 비-오너에게는
+    /// 종전대로 글롭 매칭된다는 것.
     #[test]
     fn non_owner_acl_verdict_and_payload_are_byte_identical() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
@@ -6407,8 +6498,263 @@ mod tests {
             "판정을 바꾸지 않은 승격까지 감사에 남는다 — 노이즈로 실제 참칭 신호가 묻힌다"
         );
 
+        // ★F4-① 영속: 버스는 인메모리 링(4096)이라 재시작·폭주로 증발한다. '사후추적'이
+        //   목적이면 파일에 남아야 한다 — 남지 않으면 실시간 구독자가 붙어 있을 때만 성립하는
+        //   감사이고, 그건 이 이벤트의 선언된 목적과 어긋난다.
+        let audit = std::fs::read_to_string(owner_grant_audit_path(&daemon))
+            .expect("★owner 승격 감사 원장 파일이 없다 — 데몬 재시작 후 참칭 추적 불가");
+        let lines: Vec<&str> = audit.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "원장 줄 수가 발행 건수와 다르다(억제·노이즈 규칙이 파일에도 동일 적용돼야) — {audit}"
+        );
+        let rec: Value = serde_json::from_str(lines[0]).expect("원장 줄이 JSON 이 아니다");
+        assert_eq!(rec["event"], json!("acl.owner_granted"), "{rec}");
+        assert_eq!(rec["to_surface"], json!(worker.id), "{rec}");
+        assert_eq!(rec["payload"]["caller_pid"], json!(usurper_pid), "{rec}");
+        assert_eq!(rec["payload"]["denied_as_role"], json!("external"), "{rec}");
+        assert!(rec["ts"].as_f64().is_some_and(|t| t > 0.0), "타임스탬프 부재 — {rec}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(owner_grant_audit_path(&daemon))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "감사 원장이 소유자 전용(0600)이 아니다");
+        }
+
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★F4-② 회귀 핀(적대검증 2026-08-22) — **커널 peer pid 미해석 발신자는 억제하지 않는다.**
+    ///
+    /// `peer_pid` 는 실패 시 `None` 이다(macOS `getsockopt` · Windows
+    /// `GetNamedPipeClientProcessId` 실패). 그런데 `caller_is_owner` 의 `from_sid.is_none()` 은
+    /// `caller_pid=None` 에서 **자동 충족**되므로 승격은 그대로 난다. 종전 억제키
+    /// `caller_pid.unwrap_or(0)` 은 그 부류 전체를 `(0, surface)` 하나로 뭉개, **신원을 특정할 수
+    /// 없는 승격**(= 감사가치가 가장 높은 부류)이 60초에 한 건만 남게 했다.
+    #[test]
+    fn unresolved_caller_pid_owner_grants_are_never_suppressed() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
+        let (daemon, dir) = daemon_with_acl("owner-audit-nopid", acl);
+        let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(worker.id, worker.clone());
+
+        // caller_pid = None (커널 peer 조회 실패 재현) 으로 **연속 3회** 승격시킨다.
+        let before = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        for n in 1..=3 {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(n),
+                    method: "surface.send_text".into(),
+                    params: json!({ "surface_id": worker.id, "text": "x\n", "owner_token": tok }),
+                },
+                None,
+            ) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(r["ok"], json!(true), "전제: 승격으로 허용돼야 한다 ({r})");
+        }
+
+        let evs: Vec<Value> = daemon
+            .bus
+            .replay_after(before)
+            .into_iter()
+            .filter(|e| e["name"] == json!("acl.owner_granted"))
+            .collect();
+        assert_eq!(
+            evs.len(),
+            3,
+            "★pid 미해석 승격이 억제됐다 — 신원 미상 승격이 60초에 한 건만 남는다 ({evs:?})"
+        );
+        // 페이로드가 '미해석'임을 명시해야 한다 — caller_pid:null 만으로는 안내가 성립하지 않는다.
+        for e in &evs {
+            assert_eq!(e["payload"]["caller_pid"], json!(null), "{e}");
+            assert_eq!(e["payload"]["caller_pid_resolved"], json!(false), "{e}");
+            assert!(
+                e["payload"]["note"].as_str().unwrap_or_default().contains("해석하지 못했다"),
+                "안내 문면이 '그 프로세스를 확인하라'로 남아 성립하지 않는다 ({e})"
+            );
+        }
+        // 영속 원장에도 3건 그대로.
+        let audit = std::fs::read_to_string(owner_grant_audit_path(&daemon))
+            .expect("감사 원장 파일 부재");
+        assert_eq!(
+            audit.lines().filter(|l| !l.trim().is_empty()).count(),
+            3,
+            "원장에도 3건이 남아야 한다 — {audit}"
+        );
+
+        // 대조군: **해석된** pid 는 종전대로 억제된다(억제 자체가 죽지 않았음을 박제).
+        let resolved_pid = 999_141_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(resolved_pid, (None, crate::state::now_epoch(), None));
+        let before2 = daemon
+            .bus
+            .replay_after(0)
+            .last()
+            .and_then(|e| e["seq"].as_u64())
+            .unwrap_or(0);
+        for n in 10..=12 {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(n),
+                    method: "surface.send_text".into(),
+                    params: json!({ "surface_id": worker.id, "text": "y\n", "owner_token": tok }),
+                },
+                Some(resolved_pid),
+            ) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(r["ok"], json!(true));
+        }
+        assert_eq!(
+            daemon
+                .bus
+                .replay_after(before2)
+                .into_iter()
+                .filter(|e| e["name"] == json!("acl.owner_granted"))
+                .count(),
+            1,
+            "해석된 pid 의 억제창이 동작하지 않는다 — 오너 타이핑이 버스를 덮는다"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★F4-① 회귀 핀(적대검증 2026-08-22) — 감사 원장의 **회전**이 실제로 돈다.
+    ///
+    /// `append_owner_grant_audit` doc 은 경로·회전(1MiB 초과 시 1세대)·권한(0600) 셋을 계약으로
+    /// 적어 놨는데, 종전 핀은 경로·권한·내용만 봤고 **회전은 주석에만 있었다**. 주장에 증거가
+    /// 없으면 그건 이번 라운드에서 반복 지적된 바로 그 계열이다 — 여기서 닫는다.
+    ///
+    /// 회전이 없으면 원장이 무한 성장한다: 이 이벤트는 저빈도지만 참칭자가 새 pid 로 계속
+    /// 두드리면 매 건이 새 조합이라 억제창을 타지 않고 전부 append 된다(F4-② 의 미해석 경로도
+    /// 억제 예외다). 그 상황이 정확히 '원장이 필요한 상황'이므로 상한이 있어야 한다.
+    #[test]
+    fn owner_grant_audit_ledger_rotates_one_generation_over_cap() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("owner-audit-rotate", r#"{"default":"allow"}"#);
+        let p = owner_grant_audit_path(&daemon);
+        let rotated = p.with_extension("jsonl.1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+
+        // 상한(1MiB) 을 넘긴 원장을 만들어 둔다 — 내용은 회전 여부만 보면 되므로 채움 문자.
+        let bulk = "x".repeat((1 << 20) + 1);
+        std::fs::write(&p, &bulk).unwrap();
+        assert!(!rotated.exists(), "전제: 회전본이 아직 없어야 한다");
+
+        append_owner_grant_audit(&daemon, &json!({"ts": 1.0, "event": "acl.owner_granted"}));
+
+        assert!(rotated.exists(), "★원장이 상한을 넘겼는데 회전하지 않았다 — 무한 성장한다");
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len() as usize,
+            bulk.len(),
+            "회전본이 종전 원장 전체를 보존해야 한다(잘라내기가 아니라 이름 바꾸기)"
+        );
+        let fresh = std::fs::read_to_string(&p).expect("회전 후 새 원장이 생겨야 한다");
+        assert_eq!(
+            fresh.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "회전 직후 새 원장에는 방금 그 1건만 있어야 한다 — {fresh}"
+        );
+        assert!(fresh.contains("acl.owner_granted"), "{fresh}");
+
+        // 1세대만 유지한다 — 다시 넘겨도 `.jsonl.2` 로 늘지 않고 `.jsonl.1` 이 덮인다.
+        std::fs::write(&p, &bulk).unwrap();
+        append_owner_grant_audit(&daemon, &json!({"ts": 2.0, "event": "acl.owner_granted"}));
+        assert!(
+            !p.with_extension("jsonl.2").exists(),
+            "세대가 늘었다 — 계약은 1세대 회전이다(디스크 무한 점유 차단)"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★F4-③ 회귀 핀(적대검증 2026-08-22) — **억제 hot path 는 맵 전수 스캔을 돌지 않는다.**
+    ///
+    /// 오너가 부서 워커 pane 에 타이핑하면 키 조각마다(`term.onData`→`surface.send_text`)
+    /// `owner_grant_audit_seen` 을 탄다. 종전 구현은 그 **매 호출**마다 전역 Mutex 를 잡고
+    /// `HashMap::retain` 으로 전 항목을 훑었다 — 사람 입력 지연 경로에 O(n) 스캔이 얹힌 것이다.
+    /// 수리는 스캔을 **실제로 발행하는 드문 경로**(≈창당 1회)로 옮겼다.
+    ///
+    /// 이 핀이 왜 필요한가: 그 회귀는 **동작이 아니라 비용만** 바꾼다. 실제로 스캔을 매 호출로
+    /// 되돌려 놓고 전량 돌렸을 때 649건이 **전부 green** 이었다 — 즉 이 수리에는 핀이 없었고
+    /// green 은 무증거였다. 그래서 스캔 횟수 자체를 관측해 박제한다.
+    ///
+    /// `now` 를 인자로 받는 순수 함수라 합성 시계로 결정론적이다. `ACL_ENV_LOCK` 을 잡는 이유는
+    /// 카운터가 프로세스 전역이라서다 — 이 함수에 닿는 다른 테스트는 모두 같은 락을 잡는다.
+    #[test]
+    fn suppression_hot_path_does_not_scan_the_whole_map() {
+        use std::sync::atomic::Ordering;
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // 다른 테스트와 겹치지 않는 조합 + 합성 시계(실시간 아님).
+        let (pid, target) = (991_303_u32, 991_303_u64);
+        let t0 = 1_000_000.0_f64;
+
+        let base = OWNER_GRANT_AUDIT_SWEEPS.load(Ordering::Relaxed);
+        // 1회차 = 새 조합 → 발행 경로 → 스캔 1회.
+        assert!(!owner_grant_audit_seen(Some(pid), target, t0), "첫 조합은 발행돼야 한다");
+        assert_eq!(
+            OWNER_GRANT_AUDIT_SWEEPS.load(Ordering::Relaxed) - base,
+            1,
+            "발행 경로에서는 만료 회수가 정확히 1회 돌아야 한다"
+        );
+
+        // 창 안 재호출 200회 = 타이핑 hot path. 전부 억제되고 스캔은 **한 번도** 더 돌지 않는다.
+        for i in 0..200 {
+            assert!(
+                owner_grant_audit_seen(Some(pid), target, t0 + (i as f64) * 0.01),
+                "창 안 재호출이 억제되지 않았다(i={i})"
+            );
+        }
+        assert_eq!(
+            OWNER_GRANT_AUDIT_SWEEPS.load(Ordering::Relaxed) - base,
+            1,
+            "★타이핑 hot path 가 맵 전수 스캔을 돌았다 — 키 조각마다 O(n) 스캔이 얹힌다"
+        );
+
+        // 창이 지나면 다시 발행 경로이고, 그때는 회수가 돌아야 한다(무한 성장 방지가 죽지 않았음).
+        assert!(
+            !owner_grant_audit_seen(Some(pid), target, t0 + OWNER_GRANT_AUDIT_WINDOW_SECS + 1.0),
+            "창이 지난 조합은 다시 발행돼야 한다"
+        );
+        assert_eq!(
+            OWNER_GRANT_AUDIT_SWEEPS.load(Ordering::Relaxed) - base,
+            2,
+            "창 만료 후 발행에서 회수가 돌지 않았다 — 억제 맵이 무한 성장한다"
+        );
+
+        // pid 미해석(F4-②)은 맵을 아예 건드리지 않으므로 스캔도 늘지 않는다.
+        assert!(!owner_grant_audit_seen(None, target, t0), "미해석은 억제 예외(항상 발행)");
+        assert_eq!(
+            OWNER_GRANT_AUDIT_SWEEPS.load(Ordering::Relaxed) - base,
+            2,
+            "미해석 경로가 맵 스캔을 유발했다 — 억제 예외는 조회·삽입 없이 즉시 발행이어야 한다"
+        );
     }
 
     /// ★결함#6-b 잔여분(machine_origin 갭) — GUI 가 **조립한** 주입(`launchCmd`·`restartNode`·

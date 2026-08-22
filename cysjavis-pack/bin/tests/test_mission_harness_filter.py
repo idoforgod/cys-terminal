@@ -28,7 +28,15 @@
   4) 진행 중 오너 임무를 harness 알림이 **덮지 않는다**(반대 방향 사고 차단)
   5) 다른 harness 알림 형태(리마인더·캐비앳·명령 연쇄) → 접힘
   6) ★마커가 오너 문장 **앞**·**앞뒤 동시**여도 → 통과 + 잔여문이 정확히 오너 문장
-  7) ★닫는 태그 없는 **잘린 알림** → 접힘(미종결 폴백) · 짝 맞는 블록은 과잉 절단 없음
+  7) ★닫는 태그 없는 **잘린 알림** → **통과**(절단 폴백 부재의 박제 · 기대값 반전 — 7번 주석)
+  8~11) 오너 지시 무삼킴 / 슬래시 합성 turn 접힘 / 구조 축 과잉차단 0 / 훅 지연 상한
+  12) ★리뷰어 실측 검체 10종 문자 그대로(접힘 6 + 통과 4) — record 훅 e2e + status exit code
+  13) ★반대 방향 corpus 7종 — "접히면 안 되는 것"만 모은 표 + 오너 글자 보존 확인
+
+## 양방향 의무 (2026-08-22 master 지시 — 이 라운드의 반복 실패 원인)
+접힘 corpus 만 늘리면 "전부 접는 구현"이, 통과 corpus 만 늘리면 "아무것도 안 접는 구현"이
+만점을 받는다. **12·13 두 표가 동시에 green 일 때만** 이 파일의 green 이 증거가 된다.
+한쪽 표만 보고 판정을 늘리거나 줄이지 마라.
 """
 import json
 import os
@@ -198,7 +206,19 @@ for i, (prompt, want, why) in enumerate((
           "residual=%r want=%r" % (r.stdout, want))
     shutil.rmtree(tmp)
 
-# ── 7. ★닫는 태그 없는 잘린 알림 → 접힘(미종결 폴백) + 사유 흔적 ──
+# ── 7. ★닫는 태그 없는 잘린 알림 → **통과가 현재 계약이다**(절단 폴백 제거의 박제) ──
+#    ★기대값 반전(2026-08-22 적대검증 2회차 · master 결정 — 이 핀은 지우지 않고 **의미를 바꿨다**):
+#      초판 이 핀은 "잘린 알림도 접힌다(미종결 폴백)"를 요구했다. 그 폴백은 "여는 태그부터
+#      **문자열 끝까지** 잘라낸다"는 수단이었고, 프로덕션 형태에서 **오너 지시를 실측으로
+#      삼켰다**(아래 8·12번 corpus 가 그 재현 입력이다). '맨 앞에서만'이라는 좁힘을 넣어도
+#      선행 `<system-reminder>` 가 공백으로 치환된 뒤라 match 가 search 로 퇴화해 무효였다.
+#      → 절단 수단 자체를 제거했고, 그 대가로 **잘린 알림은 이 축을 통과한다**.
+#      근거 전문은 `javis_mission._harness_strip` docstring '포기한 것과 그 근거'.
+#      요지: 잘린 알림은 한 번도 관측된 적 없는 **가설적** 경로이고, 오너 삼킴은 **실측된
+#      평시** 경로다 — 가설적 거짓 음성을 막으려 실측된 거짓 양성을 만드는 거래는 성립하지 않는다.
+#    ★이 핀의 역할도 뒤집혔다: 이제 이것이 FAIL 하면 **누군가 절단 폴백을 되살린 것**이고,
+#      그때는 8·12번 오너 삼킴 corpus 가 함께 깨진다. 되살리려면 잘린 알림이 실제로 관측된
+#      로그를 먼저 가져와야 한다(관측 없이 넣으면 같은 사고 3회차다).
 TRUNC = ("<task-notification> <task-id>bacbyhtv8</task-id> "
          "<tool-use-id>toolu_01ABCdefGHIjklMNOpqrs</tool-use-id> "
          "<summary>Background command")
@@ -206,10 +226,12 @@ tmp = tempfile.mkdtemp(prefix="mission-h7-")
 env = make_env(tmp)
 record(env, TRUNC)
 rec, _ = ledger(env)
-check("7a ★잘린 알림도 접힘(미종결 폴백)", (rec or {}).get("mission") is None,
+check("7a ★잘린 알림 통과 = 절단 폴백 부재(기대값 반전 — 위 주석)",
+      (rec or {}).get("mission") is not None,
+      "mission=%r — 접혔다면 절단 폴백이 부활했다는 뜻이다" % (rec or {}).get("mission"))
+check("7b 잘린 태그 **뒤 본문**이 살아 있다(절단이 아니라 태그만 제거)",
+      "Background command" in ((rec or {}).get("mission") or ""),
       "mission=%r" % (rec or {}).get("mission"))
-check("7b 폴백 적용 사실이 사유에 남는다(감사 가능성)",
-      "미종결" in ((rec or {}).get("reason") or ""), "reason=%r" % (rec or {}).get("reason"))
 shutil.rmtree(tmp)
 
 # ── 8. ★적대검증 치명① — 미종결 폴백이 오너 지시를 삼키는가 (리뷰어 재현 입력 그대로) ──
@@ -286,6 +308,103 @@ except Exception:
 check("11a 성능 측정 성공", bool(timings), r.stderr[-200:])
 for name, secs in timings:
     check("11b %s < 0.5s" % name, secs < 0.5, "%.4fs" % secs)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12. ★리뷰어 실측 검체 10종 — **문자 그대로** 회귀 핀 (2026-08-22 적대검증 2회차 종결 검체)
+# ══════════════════════════════════════════════════════════════════════════════
+#  master 가 이 10종을 직접 돌려 전부 정답임을 확인하고 라운드를 닫았다. 그 판정을 여기 박제한다.
+#  ★판정면이 `record` 훅 subprocess + `status` **exit code** 인 이유: 리뷰어가 결함을 잡은
+#    층이 바로 거기다. 내부 함수(`harness_origin`)만 호출하면 훅 배선·대장 기록·게이트 개방이
+#    통째로 검증 범위 밖으로 빠진다 — 순수 함수는 맞는데 게이트는 열려 있던 것이 실사고였다.
+#    그래서 `status` exit 0(=자율 착수 인가)을 **기계 판정의 최종 소비면**으로 삼는다.
+#  ★덮는 방향: 검체 6종이 '접힘'(거짓 음성 방어), 4종이 '통과'(거짓 양성 방어) — 한 방향만
+#    덮으면 green 이 무증거라는 것이 이 라운드의 반복 교훈이므로 양방향을 한 표에 둔다.
+BIG_NOTIFY = ("<task-notification><task-id>abcdefgh</task-id><status>completed</status>"
+              "<summary>done</summary></task-notification>\n") * 2000
+REVIEWER_10 = (
+    # (라벨, 프롬프트, 오너임무로_통과해야_하는가)
+    ("12-1 선행 리마인더 + <command-name> 지시",
+     "<system-reminder>Memory contents …</system-reminder>\n"
+     "<command-name> 파싱 로직을 전면 재작성하고 릴리스해라", True),
+    ("12-2 선행 리마인더 + <bash-input> 지시",
+     "<system-reminder>Memory contents …</system-reminder>\n"
+     "<bash-input> 처리에서 개행이 삼켜지는 버그 고쳐라", True),
+    ("12-3 <command-name> 으로 시작하는 오너 지시",
+     "<command-name> 파싱하는 코드를 전면 재작성하고 배포해라", True),
+    ("12-4 백틱 낀 미지 태그(펜스 마스킹)",
+     "<newtag>Total cost: `$12.34`\nDuration: 4m\nchanges: 120 lines</newtag>", False),
+    ("12-5 자기닫힘 <newtag a=\"1\"/> 3연",
+     '<newtag a="1"/>\n<newtag b="2"/>\n<newtag c="3"/>', False),
+    ("12-6 200k 초과 정형 알림(2000회 반복)", BIG_NOTIFY, False),
+    ("12-7 <div><p>x</p></div> 고쳐", "<div><p>x</p></div> 고쳐", True),
+    ("12-8 <a>1</a> 이모지 지시", "<a>1</a> \U0001F449\U0001F525⚡️", True),
+    ("12-9 일반 지시", "부서 문서 정리 착수해줘", True),
+    ("12-10 /cost 슬래시 출력",
+     "<command-name>/cost</command-name>\n<command-message>cost</command-message>\n"
+     "<command-args></command-args>\n<local-command-stdout>Total cost: $12.34\n"
+     "Total duration (API): 4m 5.6s\nTotal duration (wall): 12m 3.4s\n"
+     "Total code changes: 120 lines added, 8 lines removed\n"
+     "Usage by model:\n    claude-opus: 1.2k input, 3.4k output\n</local-command-stdout>", False),
+)
+for label, prompt, want_pass in REVIEWER_10:
+    tmp = tempfile.mkdtemp(prefix="mission-h12-")
+    env = make_env(tmp)
+    record(env, prompt)
+    rec, _ = ledger(env)
+    got, st = (rec or {}).get("mission"), status(env)
+    if want_pass:
+        check("%s → 통과" % label, got is not None and st == 0,
+              "mission=%r status-exit=%d(0이어야 함) — 오너 지시가 기계로 접혔다(사고의 거울상)"
+              % (got, st))
+        check("%s · source=prompt" % label, (rec or {}).get("source") == "prompt",
+              "source=%r" % (rec or {}).get("source"))
+    else:
+        check("%s → 접힘" % label, got is None and st != 0,
+              "mission=%r status-exit=%d(비0이어야 함) — 기계 산출이 임무가 되고 게이트가 열렸다"
+              % (str(got)[:60], st))
+        check("%s · source=harness_notification" % label,
+              (rec or {}).get("source") == "harness_notification",
+              "source=%r" % (rec or {}).get("source"))
+    shutil.rmtree(tmp)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13. ★반대 방향 corpus — "접히면 안 되는 것"만 모은 표 (master 지정 · 무증거 green 차단)
+# ══════════════════════════════════════════════════════════════════════════════
+#  ★왜 별도 표인가: 이 라운드는 **두 번 연속** 한쪽 방향만 덮어서 green 이 무증거였다. 접힘
+#    corpus 만 늘리면 "전부 접는 구현"이 만점을 받고, 통과 corpus 만 늘리면 "아무것도 안 접는
+#    구현"이 만점을 받는다. 두 표가 **동시에** green 이어야 판정이 의미를 갖는다.
+#  ★각 항은 통과 여부(status exit 0)뿐 아니라 **오너가 쓴 글자가 임무에 살아남았는지**까지
+#    본다 — 통과시켜 놓고 오너 문장을 잘라 먹으면 그것도 삼킴이다(치명① 의 잔불).
+REVERSE_CORPUS = (
+    # (라벨, 프롬프트, 임무에 반드시 남아야 하는 오너 글자)
+    ("13-1 선행 블록 뒤 오너 지시",
+     "<system-reminder>Codebase instructions …</system-reminder>\n이 버그 원인 찾아서 고쳐라",
+     "이 버그 원인 찾아서 고쳐라"),
+    ("13-2 태그로 시작하는 오너 지시",
+     "<task-notification> 이 알림 처리 로직 고쳐라", "이 알림 처리 로직 고쳐라"),
+    ("13-3 짧은 지시(2자) + 붙여넣기",
+     "고쳐\n<root><item>1</item></root>", "고쳐"),
+    ("13-4 이모지·기호만 있는 지시",
+     "<a>1</a> ❗❗ \U0001F6A8", "\U0001F6A8"),
+    ("13-5 코드펜스 **안** 마커 + 펜스 **밖** 지시",
+     "이 출력 파싱 고쳐줘\n```\n<task-notification><status>completed</status>"
+     "</task-notification>\n```", "이 출력 파싱 고쳐줘"),
+    # ★비라틴·비한글 문자만으로 쓴 지시 — `_meaningful_chars` 가 문자 종류를 재단하면 여기서
+    #   0자로 계산돼 접힌다(중대4 의 이모지 검체와 같은 결함 부류의 다른 문자권).
+    ("13-6 한자만 있는 지시", "<summary> 部署文書整理着手", "部署文書整理着手"),
+    ("13-7 일본어 지시", "<bash-input> の処理を直してください", "の処理を直してください"),
+)
+for label, prompt, must_keep in REVERSE_CORPUS:
+    tmp = tempfile.mkdtemp(prefix="mission-h13-")
+    env = make_env(tmp)
+    record(env, prompt)
+    rec, _ = ledger(env)
+    got, st = (rec or {}).get("mission"), status(env)
+    check("%s → 통과(게이트 개방)" % label, got is not None and st == 0,
+          "mission=%r status-exit=%d(0이어야 함) — 오너 지시가 접혔다" % (got, st))
+    check("%s · 오너 글자 보존" % label, isinstance(got, str) and must_keep in got,
+          "mission=%r 에 %r 이 없다 — 통과는 시켰으나 오너 문장을 잘라 먹었다" % (got, must_keep))
+    shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

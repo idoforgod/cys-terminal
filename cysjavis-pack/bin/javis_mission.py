@@ -870,9 +870,14 @@ def has_machine_label(prompt):
 #     "왜 <summary> 때문에 임무가 안 잡혀? 원인 찾아서 고쳐라"  → 잔여 '왜'  → 기계 판정
 #     "## <command-name> 처리 로직 전면 재작성해라"             → 잔여 '##'  → 기계 판정
 #   이 마커들은 `task-notification` 같은 **알림 블록 안에서만** 의미를 갖는 컨텍스트 마커이므로,
-#   **짝 맞는 블록 제거에만** 쓰고 절단 폴백 대상에서는 뺀다.
+#   **짝 맞는 블록 제거에만** 쓰고 절단 폴백 대상에서는 뺐다.
 #
-# 알림 전용 마커 — harness 가 turn 자체를 합성할 때만 나온다(미종결 폴백 대상).
+# ★현재 상태(2026-08-22 2회차 이후): 절단 폴백 자체가 제거되어 두 계층은 **판정상 구분이 없다** —
+#   `HARNESS_MARKERS = NOTIFY + CONTEXT` 로 합쳐져 짝 맞는 블록 제거에만 함께 쓰인다. 그럼에도
+#   튜플을 합치지 않고 남겨 두는 이유는 둘이다: ⓐ 위 결함의 근거(어떤 어휘가 왜 위험했는가)가
+#   목록 형태로 보존된다 ⓑ self-test 가 `HARNESS_NOTIFY_MARKERS` 의 실측 마커 3종 실재를
+#   확인한다. **절단 수단을 다시 넣는다면** 이 2계층이 그 최소 안전장치의 출발점이다.
+# 알림 전용 마커 — harness 가 turn 자체를 합성할 때만 나온다.
 HARNESS_NOTIFY_MARKERS = (
     "task-notification",
     "system-reminder",
@@ -899,8 +904,15 @@ HARNESS_CONTEXT_MARKERS = (
 )
 HARNESS_MARKERS = HARNESS_NOTIFY_MARKERS + HARNESS_CONTEXT_MARKERS
 
-# 판정 비용 상한(문자). 초과분은 **판정을 생략하고 오너로 통과**시킨다 — 아래 `harness_origin` ⓪.
-HARNESS_SCAN_MAX_CHARS = 200000
+# 판정 비용 상한(문자) — **도달 불가에 가까운 값**이다(적대검증 치명3 봉합).
+# ★초판은 200,000 이었고 초과분을 **무조건 오너 통과**시켰다. 그래서 정형 알림을 2,000회 반복한
+#   308,000자 프롬프트가 `source=prompt` 로 기록되고 게이트가 열렸다 = **기계 알림 무제한 통과
+#   게이트**. 게다가 그 상한에는 성능상 근거가 없었다(200k 실측 0.02s — 선형 스캐너라 안전).
+# ★그래서 ⓐ상한을 5MB 로 올리고 ⓑ초과해도 **통과시키지 않는다** — 앞부분
+#   `HARNESS_SCAN_PREFIX_CHARS` 로 값싼 판정을 한다(잘린 프리픽스는 태그 짝이 깨져 오너 통과
+#   방향으로 기우므로, 삼킴 위험을 늘리지 않으면서 무제한 통과만 닫는다).
+HARNESS_SCAN_MAX_CHARS = 5000000
+HARNESS_SCAN_PREFIX_CHARS = 200000
 
 # 마커 **태그** 1개(여는·닫는·자기닫힘 전부). 이름 뒤 `(?![\w-])` = 이름 경계 못박기.
 # 교대(alternation)는 **긴 이름 우선**으로 정렬한다(접두 관계가 생겨도 짧은 쪽이 먼저 먹지 않게).
@@ -916,21 +928,11 @@ _HARNESS_BLOCKS = tuple(
                % (re.escape(m), re.escape(m)), re.IGNORECASE | re.DOTALL)
     for m in HARNESS_MARKERS)
 
-# **알림 전용** 마커의 (이름, 여는 태그, 닫는 태그) — 미종결 폴백 전용(`_harness_strip` ②).
-_HARNESS_NOTIFY_OPEN_CLOSE = tuple(
-    (m,
-     re.compile(r"<\s*%s(?![\w-])[^<>]*>" % re.escape(m), re.IGNORECASE),
-     re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE))
-    for m in HARNESS_NOTIFY_MARKERS)
-
-# 컨텍스트 마커의 (이름, 여는, 닫는) — 폴백 대상은 **아니고**, ① 의 비용 가드에만 쓴다.
-# ★두 튜플을 이어 붙인 순서가 `_HARNESS_BLOCKS`(=HARNESS_MARKERS 순서)와 **정확히 같아야**
-#   `zip` 짝이 맞는다. HARNESS_MARKERS = NOTIFY + CONTEXT 이므로 성립한다(self-test 로 박제).
-_HARNESS_CTX_OPEN_CLOSE = tuple(
-    (m,
-     re.compile(r"<\s*%s(?![\w-])[^<>]*>" % re.escape(m), re.IGNORECASE),
-     re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE))
-    for m in HARNESS_CONTEXT_MARKERS)
+# 마커별 닫는 태그 — **비용 가드 전용**(`_harness_strip` ①). 순서는 `_HARNESS_BLOCKS`
+# (=HARNESS_MARKERS 순서)와 정확히 같아야 zip 짝이 맞는다(self-test 로 박제).
+_HARNESS_CLOSE = tuple(
+    re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE)
+    for m in HARNESS_MARKERS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 층0-b — **이름 독립 신호**: "프롬프트가 태그 블록만으로 이루어졌는가" (master 제안 채택)
@@ -962,8 +964,38 @@ _FENCE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
 
 
 def _meaningful_chars(text):
-    """자유 텍스트 글자 수 — 공백·구두점·기호를 **빼고** 센다(한글·한자·라틴·숫자 계수)."""
-    return sum(1 for ch in text or "" if ch.isalnum())
+    """자유 텍스트 글자 수 — **공백이 아닌 문자 전부**를 센다.
+
+    ★계수 기준 교체(적대검증 2회차 중대4): 종전엔 `isalnum()` 만 셌다. 그래서 이모지·기호로만
+      쓴 지시("<a>1</a> 👉🔥⚡️")가 0자로 계산돼 **오너 프롬프트가 기계로 접혔다**. 사람이 쓴
+      글자인지 아닌지를 유니코드 카테고리로 재단하는 것 자체가 틀린 접근이다 — 이 축이 묻는
+      것은 "태그 밖에 사람이 쓴 것이 **전혀 없는가**"뿐이므로, 공백만 빼고 전부 센다.
+      (`/cost` 처럼 블록 사이에 개행만 남는 경우는 공백이라 여전히 0 이다.)
+    """
+    return sum(1 for ch in text or "" if not ch.isspace())
+
+
+def _mask_fences(src):
+    """코드펜스·인라인 코드 구간을 **같은 길이**의 자리표시자로 치환한다. (마스킹 문자열, 원본길이 동일)
+
+    ★split 이 아니라 mask 인 이유(적대검증 2회차 치명2): 종전 구현은 펜스로 문자열을 **쪼갠 뒤
+      조각별로** 짝을 맞췄다. 그래서 여는 태그와 닫는 태그가 펜스 양쪽으로 갈리면 짝이 성립하지
+      않아 `nblocks=0` → **구조 축이 통째로 미발화**했다. 백틱 한 쌍만 넣으면 이 축을 끄는
+      스위치가 되는 셈이었다(실측: `<newtag>Total cost: \\`$12.34\\`…</newtag>` → 게이트 개방).
+      마스킹은 길이를 보존하므로 인덱스가 그대로 유효하고, 짝 맞추기가 **구간을 가로질러** 성립한다.
+    ★자리표시자는 `\\x00` 이다 — `_ANY_TAG` 가 태그로 보지 않고(펜스 내부 태그는 태그로 세지
+      않는다), `_meaningful_chars` 는 공백이 아니므로 **자유 텍스트로 센다**(오너가 붙여넣은
+      코드는 지시의 일부다 — 펜스만 있는 프롬프트가 통과하는 근거).
+    """
+    if "`" not in src and "~" not in src:
+        return src                               # 값싼 선검사(대부분의 프롬프트가 여기서 끝난다)
+    out, pos = [], 0
+    for mo in _FENCE.finditer(src):
+        out.append(src[pos:mo.start()])
+        out.append("\x00" * (mo.end() - mo.start()))
+        pos = mo.end()
+    out.append(src[pos:])
+    return "".join(out)
 
 
 def _strip_generic_blocks(seg):
@@ -971,9 +1003,12 @@ def _strip_generic_blocks(seg):
 
     · 여는 태그는 스택에 쌓고, 닫는 태그는 스택에서 **같은 이름을 뒤에서부터** 찾아 짝짓는다
       (그 사이에 낀 미종결 태그는 버린다 — 실제 harness 출력에 흔한 형태다).
-    · 자기닫힘(`<br/>`)은 블록이 아니므로 쌓지 않는다.
+    · ★**자기닫힘(`<x/>`)도 블록으로 센다**(적대검증 2회차 치명2): 그 자체로 완결된 합성 요소다.
+      종전엔 스택에 쌓지도 세지도 않아 `<newtag a="1"/><newtag b="2"/>…` 가 통째로 통과했고,
+      게다가 태그 이름 글자가 자유 텍스트로 계수됐다(이중 오류).
     · 짝지어진 구간을 모아 **병합**한 뒤 한 번에 잘라낸다(중첩 구간은 바깥에 흡수된다).
-    · 짝이 없는 태그는 **건드리지 않는다** — 오너 문장 속 `<summary>` 가 살아남는 근거다.
+    · 짝이 없는 태그는 여기서 **건드리지 않는다** — 오너 문장 속 `<summary>` 가 살아남는 근거다.
+      (대신 자유 텍스트 계산 직전에 `_ANY_TAG` 로 마크업만 지운다 — `generic_block_free_text` ③.)
     """
     stack, spans = [], []
     for mo in _ANY_TAG.finditer(seg):
@@ -984,7 +1019,9 @@ def _strip_generic_blocks(seg):
                     spans.append((stack[i][1], mo.end()))
                     del stack[i:]
                     break
-        elif not selfclose:
+        elif selfclose:
+            spans.append((mo.start(), mo.end()))     # 자기닫힘 = 그 자체로 완결된 블록
+        else:
             stack.append((name, mo.start()))
     if not spans:
         return seg, 0
@@ -1005,47 +1042,57 @@ def _strip_generic_blocks(seg):
 
 
 def generic_block_free_text(text):
-    """(자유 텍스트, 제거된 블록 수) — 코드펜스를 보호하고 짝 맞는 태그 블록만 걷어낸다."""
-    src = text or ""
-    chunks, removed, pos = [], 0, 0
-    for mo in _FENCE.finditer(src):
-        seg, n = _strip_generic_blocks(src[pos:mo.start()])
-        chunks.append(seg)
-        chunks.append(mo.group(0))        # ★펜스 안은 오너가 붙여넣은 코드 — 자유 텍스트다
-        removed += n
-        pos = mo.end()
-    seg, n = _strip_generic_blocks(src[pos:])
-    chunks.append(seg)
-    removed += n
-    return _WS.sub(" ", " ".join(chunks)).strip(), removed
+    """(자유 텍스트, 제거된 블록 수) — 태그 밖에 사람이 쓴 것이 남는가.
+
+    ① 코드펜스를 **마스킹**(길이 보존 · 내부 태그는 태그로 세지 않는다)
+    ② 짝 맞는 블록·자기닫힘 블록 제거(선형 스캐너)
+    ③ ★남은 **태그 마크업 자체**를 제거한 뒤 센다(적대검증 2회차 치명2-③): 종전엔 짝이 안 맞아
+      남은 `<newtag>`·`</newtag2>` 의 글자가 그대로 '자유 텍스트'로 계수돼, 자유 텍스트의
+      정의("태그 밖에 사람이 쓴 글자")와 코드가 어긋나 있었다.
+    """
+    src = _mask_fences(text or "")
+    seg, removed = _strip_generic_blocks(src)
+    seg = _ANY_TAG.sub(" ", seg)                # ③ 짝 없이 남은 마크업은 자유 텍스트가 아니다
+    return _WS.sub(" ", seg).strip(), removed
 
 
 def _harness_strip(text):
-    """(잔여문, 미종결 마커 목록) — 마커 블록·잔여 태그를 제거한다. **순수 함수**.
+    """잔여문(str) — 마커 블록·잔여 태그를 제거한다. **순수 함수**.
+
+    ★서명 정정(2026-08-22): 종전 이 줄은 `(잔여문, 미종결 마커 목록)` 튜플을 반환한다고 적혀
+      있었으나, 절단 폴백을 없애면서 두 번째 원소가 사라졌다(아래 '포기한 것과 그 근거').
+      문서가 코드보다 관대하면 호출자가 `[0]` 으로 첫 글자를 집는 사고가 난다 — 실제 반환은
+      **문자열 하나**다.
 
     ① 짝이 맞는 블록을 수렴할 때까지 제거(본문 포함).
-    ② ★미종결 폴백 — **프롬프트 맨 앞의 알림 전용 마커에만** 적용한다(2026-08-22 적대검증
-       치명① 봉합). 여는 태그는 있는데 닫는 태그가 없으면 그 지점부터 문자열 끝까지를
-       블록으로 간주해 잘라낸다.
-         · 왜 필요한가: 잘린 알림(전송 중 절단·중첩 이상)은 ① 로 안 지워져 잔여문이 통째로
-           남고, 그러면 순수 기계 산출이 그대로 통과한다.
-         · ★**두 겹의 좁힘**(둘 다 오너 문장 삼킴을 막는다 — 초판은 둘 다 없어서 관통했다):
-             ⓐ **맨 앞에서 시작할 때만**. 앞에 오너 텍스트가 한 글자라도 있으면 폴백 금지 —
-               그 경우엔 태그 자체만 ③ 에서 제거된다. 초판은 위치를 안 봐서
-               "왜 <summary> 때문에…" 의 '왜'만 남기고 오너 지시를 통째로 삼켰다.
-             ⓑ **알림 전용 마커만**(`HARNESS_NOTIFY_MARKERS`). `summary`·`status` 같은
-               범용 어휘는 절단 대상이 아니다(위 마커 2계층 주석 참조).
-           ※ ⓐ 는 기각된 '시작부 지배' 규칙과 **다르다**: 저것은 짝이 맞는 블록으로 시작해도
-             접었고, 이것은 **짝이 없을 때만**(즉 ① 이 못 지운 잔해일 때만) 발동한다.
-         · 선행 공백은 오너 텍스트가 아니므로 벗기고 본다. 투명문자(ZWSP)는 벗기지 않는다 —
-           그쪽은 통과(오너) 방향이라 안전하다.
-         · 적용 사실은 호출자에게 목록으로 돌려 **사유 문자열에 남긴다**(감사 가능성).
-         · 비용: 위치 고정이라 **1회 판정**이다(초판의 반복 절단 루프 = ⑤ O(n²) 원인 제거).
-    ③ 짝 없이 남은 단독 태그(닫는 태그만 있는 경우 등)를 마지막으로 제거.
+    ② 짝이 없는 태그는 **태그 자체만** 제거하고 뒤 본문은 **남긴다**(절단 금지).
+
+    ## ★포기한 것과 그 근거 — 미종결 절단 폴백 **제거**(2026-08-22 적대검증 2회차 · master 결정)
+    초판은 "여는 태그는 있는데 닫는 태그가 없으면 그 지점부터 **문자열 끝까지** 잘라낸다"는
+    폴백을 뒀다. 목적은 **잘린 기계 알림**(전송 중 절단)이 통과하는 것을 막는 것이었다.
+    1차 좁힘("프롬프트 맨 앞에서만")까지 넣었지만 **프로덕션 형태에서 무효**였다 —
+    ① 이 선행 `<system-reminder>…</system-reminder>` 를 공백으로 치환한 **뒤의** 문자열에서
+    맨 앞을 재는 바람에 `lstrip` 이 그 공백을 넘어가 `match` 가 사실상 `search` 로 퇴화했다.
+    실측 관통(record 훅 e2e · status exit 1 = 게이트 폐쇄):
+        "<system-reminder>…</system-reminder>\\n<command-name> 파싱 로직을 전면 재작성하고 릴리스해라"
+        "<system-reminder>…</system-reminder>\\n<bash-input> 처리에서 개행이 삼켜지는 버그 고쳐라"
+        "<command-name> 파싱하는 코드를 전면 재작성하고 배포해라"
+    셋째 줄은 위치 계산을 원문 기준으로 고쳐도 **안 풀린다**(프롬프트가 진짜로 태그로 시작하고
+    뒤에 오너 지시가 온다). 즉 "EOF 까지 절단"이라는 **수단 자체가 과했다.**
+
+    **그래서 절단을 없앤다. 대가는 다음과 같고, 알고 받아들인다:**
+      · 포기: **잘린(짝 없는) 기계 알림은 이 축을 통과할 수 있다.** 구조 축(층0-b)도 짝이
+        맞아야 세므로 마찬가지다. 즉 잘린 알림에 대한 방어는 **없다.**
+      · 근거: 잘린 알림은 **한 번도 관측된 적 없는 가설적 경로**다(harness 는 정형 블록을
+        만든다 — 실사고 검체·`/cost` 검체 모두 짝이 맞았다). 반면 오너 지시 삼킴은
+        **실측된 평시 경로**다(위 3줄 + 앞 라운드의 "왜 <summary> …" 4줄).
+      · 이 모듈이 스스로 적은 비대칭이 판정한다: 거짓 양성(오너 삼킴)이 가장 비싼 실패다.
+        가설적 거짓 음성을 막으려고 실측된 거짓 양성을 만드는 것은 거래가 성립하지 않는다.
+      · ★되살리려면: 잘린 알림이 **실제로 관측된 로그**를 먼저 가져와라. 관측 없이 절단
+        수단을 다시 넣는 것은 같은 사고를 세 번째로 만드는 것이다.
     """
     out = text or ""
-    for (name, _open_rx, close_rx), rx in zip(_HARNESS_NOTIFY_OPEN_CLOSE + _HARNESS_CTX_OPEN_CLOSE,
-                                              _HARNESS_BLOCKS):
+    for close_rx, rx in zip(_HARNESS_CLOSE, _HARNESS_BLOCKS):
         # ★비용 가드(적대검증 ⑤): 닫는 태그가 **하나도 없으면** 짝 블록도 있을 수 없다.
         #   그런데 `.*?` 는 그 사실을 모른 채 여는 태그마다 문자열 끝까지 훑는다 = O(n²)
         #   (실측: 미종결 마커 10,000개 → 2.37s). 값싼 선검사로 그 경로를 통째로 건너뛴다.
@@ -1055,22 +1102,13 @@ def _harness_strip(text):
         while prev != out:                       # 중첩·반복 블록까지 수렴할 때까지
             prev = out
             out = rx.sub(" ", out)
-    unclosed = []
-    lead = len(out) - len(out.lstrip())          # 선행 공백만 벗긴다(오너 텍스트가 아니다)
-    for name, open_rx, close_rx in _HARNESS_NOTIFY_OPEN_CLOSE:
-        mo = open_rx.match(out, lead)            # ★match = 맨 앞이어야 한다(search 아님)
-        if mo is None or close_rx.search(out, mo.end()) is not None:
-            continue                             # 앞이 아니거나, 뒤에 닫는 태그가 있다 = 대상 아님
-        out = out[:lead]
-        unclosed.append(name)
-        break                                    # 같은 위치에서 둘 이상 매치될 수 없다
-    out = _HARNESS_TAG.sub(" ", out)             # 짝이 없는 단독 태그 잔여분
-    return _WS.sub(" ", out).strip(), unclosed
+    out = _HARNESS_TAG.sub(" ", out)             # ② 짝 없는 단독 태그 — **태그만** 제거
+    return _WS.sub(" ", out).strip()
 
 
 def strip_harness_blocks(text):
-    """마커 블록·잔여 마커 태그를 제거한 잔여문(공백 접음). `_harness_strip` 의 문자열판."""
-    return _harness_strip(text)[0]
+    """마커 블록·잔여 마커 태그를 제거한 잔여문(공백 접음). `_harness_strip` 의 공개 이름."""
+    return _harness_strip(text)
 
 
 def harness_origin(prompt):
@@ -1092,32 +1130,32 @@ def harness_origin(prompt):
     p = prompt or ""
     if not p.strip():
         return False, ""
-    # ⓪ 비용 상한(적대검증 ⑤): 이 함수는 **UserPromptSubmit 훅**이라 오너의 매 프롬프트가
-    #   여기서 지연된다. 상한 초과는 **판정 생략 = 오너 통과**로 접는다(기계 판정 아님 —
-    #   ① 의 교훈대로 삼키는 방향으로 기울지 않는다). 침묵하지 않도록 사유는 돌려준다.
+    # ⓪ 비용 상한(적대검증 ⑤ · 치명3 재설계): 초판은 상한 초과를 **무조건 오너 통과**시켜
+    #   "길게 만들면 뚫린다"는 무제한 통과 게이트였다(실측: 정형 알림 2,000회 = 308,000자 →
+    #   게이트 개방). 이제 상한은 5MB 이고, 넘더라도 **통과시키지 않고 앞부분으로 판정한다**.
+    #   프리픽스는 태그 짝이 잘려 오너 통과 방향으로 기우므로 삼킴 위험을 늘리지 않는다.
+    note = ""
     if len(p) > HARNESS_SCAN_MAX_CHARS:
-        return False, ("★층0 판정 생략 — 프롬프트 %d자 > 상한 %d자(훅 지연 방지). 이 프롬프트는 "
-                       "harness 판정 없이 통과했다(오너 통과 방향 · 은폐 금지 고지)"
-                       % (len(p), HARNESS_SCAN_MAX_CHARS))
+        note = (" · ★프리픽스 판정(프롬프트 %d자 > 상한 %d자 — 앞 %d자만 보았다)"
+                % (len(p), HARNESS_SCAN_MAX_CHARS, HARNESS_SCAN_PREFIX_CHARS))
+        p = p[:HARNESS_SCAN_PREFIX_CHARS]
     # ⓐ 이름 축 — 알려진 마커 블록을 걷어낸 잔여문
     if _HARNESS_TAG.search(p) is not None:
-        residual, unclosed = _harness_strip(p)
+        residual = _harness_strip(p)
         if len(residual) < MISSION_MIN_CHARS:
-            tail = ""
-            if unclosed:
-                tail = (" · ★미종결 마커 폴백 적용(%s — 프롬프트 맨 앞의 알림 마커에 닫는 태그가 "
-                        "없어 여는 태그부터 문자열 끝까지를 블록으로 간주해 잘라냈다)"
-                        % ", ".join(sorted(set(unclosed))))
             return True, ("harness 내부 알림 마커 블록을 제거한 **잔여문 %d자 < 최소 %d자** — "
                           "프롬프트가 기계 산출로 채워져 있다(잔여 %r)%s"
-                          % (len(residual), MISSION_MIN_CHARS, residual[:40], tail))
+                          % (len(residual), MISSION_MIN_CHARS, residual[:40], note))
     # ⓑ 구조 축(이름 독립) — 짝 맞는 태그 블록을 전부 걷고 **자유 텍스트**가 남는가
+    #   ★발화 조건은 `== 0` 이다(적대검증 2회차 중대4): 종전 `< MISSION_MIN_CHARS(3)` 은
+    #     "<div><p>x</p></div> 고쳐"(자유 2자) 같은 **오너 프롬프트를 새로 접었다**. 이 축의
+    #     취지는 "태그 밖에 사람이 쓴 것이 **전혀** 없다"이므로 0 이 정직한 구현이다.
+    #     `fe65ef7` 이전에는 마커 태그가 없으면 조기반환해 평문+일반 HTML 이 이 층에 닿지도
+    #     않았다 — 구조 축이 그 보호막을 걷어냈으니 조건을 그만큼 좁혀야 균형이 맞는다.
     free, nblocks = generic_block_free_text(p)
-    if nblocks and _meaningful_chars(free) < MISSION_MIN_CHARS:
-        return True, ("짝 맞는 태그 블록 %d개를 걷어내니 **자유 텍스트 %d자 < 최소 %d자** — "
-                      "프롬프트가 태그 블록만으로 이루어졌다(마커 이름과 무관한 구조 신호 · "
-                      "잔여 %r)" % (nblocks, _meaningful_chars(free), MISSION_MIN_CHARS,
-                                    free[:40]))
+    if nblocks and _meaningful_chars(free) == 0:
+        return True, ("태그 블록 %d개를 걷어내니 **태그 밖 자유 텍스트가 0자** — 프롬프트가 태그 "
+                      "블록만으로 이루어졌다(마커 이름과 무관한 구조 신호)%s" % (nblocks, note))
     return False, ""
 
 
@@ -2249,8 +2287,10 @@ def cmd_self_test():
                 "<status>completed</status> "
                 "<summary>Background command `python3 javis_orchestra.py check` completed "
                 "(exit code 0)</summary> </task-notification>")
-    #    ★잘린 알림(닫는 태그 없음) — 미종결 폴백 검체. 시작부 규칙을 걷어내면서 유일하게
-    #      약해지는 지점이라 여기서 못박는다.
+    #    ★잘린 알림(닫는 태그 없음)은 **통과가 계약이다**(2026-08-22 2회차 · 절단 폴백 제거).
+    #      절단 수단이 오너 지시를 실측으로 삼켜서 없앴다 — 근거는 `_harness_strip` docstring
+    #      '포기한 것과 그 근거'. 여기서는 그 결정을 **박제**한다: 이게 FAIL 로 바뀌면 누군가
+    #      절단을 되살린 것이고, 그때는 오너 삼킴 corpus 가 함께 깨진다.
     _hn_trunc = ("<task-notification> <task-id>bacbyhtv8</task-id> "
                  "<tool-use-id>toolu_01ABCdefGHIjklMNOpqrs</tool-use-id> "
                  "<summary>Background command")
@@ -2261,16 +2301,15 @@ def cmd_self_test():
          "슬래시 명령 캐비앳"),
         ("<command-name>/clear</command-name><command-message>clear</command-message>",
          "명령 알림 연쇄"),
-        (_hn_trunc, "닫는 태그 없는 잘린 알림 — 미종결 폴백"),
     ):
         ok, r = harness_origin(p)
         if not ok:
             fails.append("harness 내부 알림 미탐 %r (%s · %s) — 기계 산출이 오너 임무를 "
                          "덮는다(2026-08-22 사고 재현)" % (p[:60], why, r))
-    #    미종결 폴백은 **사유에 흔적을 남긴다**(왜 이만큼 잘렸는지 대장에서 읽혀야 한다)
-    _tr_ok, _tr_why = harness_origin(_hn_trunc)
-    if _tr_ok and "미종결" not in _tr_why:
-        fails.append("미종결 폴백을 적용하고도 사유에 그 사실이 없다(%r) — 감사 불가" % _tr_why)
+    if harness_origin(_hn_trunc)[0]:
+        fails.append("잘린 알림을 접었다 — 절단 폴백이 되살아났다는 뜻이다. 그 수단은 오너 지시를 "
+                     "실측으로 삼켜서 제거됐다(`_harness_strip` 의 '포기한 것과 그 근거'). "
+                     "되살리려면 잘린 알림이 **실제로 관측된 로그**를 먼저 가져와라")
     #    ★2026-08-22 적대검증 치명② — 마커 목록 실측 확대 + **이름 독립 구조 축**.
     #      `/cost` 실측 형태가 층0 을 넣고도 그대로 오너 임무로 기록됐다(사고 원문과 동형).
     _hn_cost = ("<command-name>/cost</command-name>\n<command-message>cost</command-message>\n"
@@ -2301,6 +2340,18 @@ def cmd_self_test():
         ("이 <summary> 태그 버그 전부 고치고 배포해라", "접두 1자 + 미종결 summary"),
         ("## <command-name> 처리 로직 전면 재작성해라", "접두 2자(구두점) + 미종결 알림 마커"),
         ("> <task-id> 필드 추가하고 릴리스해라", "접두 1자(구두점) + 미종결 컨텍스트 마커"),
+        # ★2회차 재현 입력 그대로 — '맨 앞 좁힘'이 프로덕션 형태에서 무효였던 4종.
+        #   ① 이 선행 블록을 공백으로 치환한 **뒤** 맨 앞을 재는 바람에 match 가 search 로 퇴화했다.
+        ("<system-reminder>Memory contents …</system-reminder>\n"
+         "<command-name> 파싱 로직을 전면 재작성하고 릴리스해라",
+         "★선행 리마인더 + 태그로 시작하는 오너 지시(평시 경로)"),
+        ("<system-reminder>Memory contents …</system-reminder>\n"
+         "<bash-input> 처리에서 개행이 삼켜지는 버그 고쳐라",
+         "★선행 리마인더 + <bash-input> 언급 오너 지시"),
+        ("<command-name> 파싱하는 코드를 전면 재작성하고 배포해라",
+         "★프롬프트가 진짜로 태그로 시작 + 뒤에 오너 지시(위치 고침으로는 안 풀리던 형태)"),
+        ("\xa0<task-notification> 이 알림 처리 고쳐라",
+         "★NBSP 선행 + 오너 지시(투명·비ASCII 공백 우회)"),
     ):
         ok, r = harness_origin(p)
         if ok:
@@ -2344,40 +2395,61 @@ def cmd_self_test():
     if strip_harness_blocks(_hn_real) != "":
         fails.append("harness 블록 제거가 본문을 남겼다(%r) — 태그만 지우면 잔여문 지배 판정이 "
                      "죽는다" % strip_harness_blocks(_hn_real)[:60])
-    #    미종결 폴백은 **닫는 태그가 있을 때는 적용되지 않는다**(과잉 절단 차단)
-    if _harness_strip("<system-reminder>x</system-reminder>오너 문장")[1]:
-        fails.append("짝이 맞는 블록에도 미종결 폴백이 적용됐다 — 뒤따르는 오너 문장이 통째로 "
-                     "잘려 나간다(과잉 절단)")
-    #    미종결 폴백은 **맨 앞**에서만 · **알림 전용 마커**만(치명① 봉합의 두 겹 좁힘)
-    if _harness_strip("오너 문장 <task-notification> 잘린 알림")[1]:
-        fails.append("앞에 오너 텍스트가 있는데 미종결 폴백이 적용됐다 — 오너 지시가 잘린다")
-    if _harness_strip("<summary> 잘린 컨텍스트 마커")[1]:
-        fails.append("컨텍스트 마커(범용 어휘)에 미종결 폴백이 적용됐다 — `summary` 는 일상 "
-                     "단어이자 HTML 태그라 절단 대상이 아니다(치명① 재발)")
-    if not _harness_strip("<task-notification> 잘린 알림")[1]:
-        fails.append("맨 앞 알림 마커의 미종결 폴백이 발동하지 않았다(잘린 알림 통과)")
-    #    마커 2계층 ↔ `_HARNESS_BLOCKS` zip 짝 정합(어긋나면 비용 가드가 엉뚱한 마커를 본다)
-    _oc_names = [n for n, _o, _c in _HARNESS_NOTIFY_OPEN_CLOSE + _HARNESS_CTX_OPEN_CLOSE]
-    if _oc_names != list(HARNESS_MARKERS):
-        fails.append("마커 순서 정합 붕괴: OPEN_CLOSE %r ≠ HARNESS_MARKERS %r — `_harness_strip` "
-                     "의 zip 짝이 어긋나 비용 가드가 다른 마커의 닫는 태그를 본다"
-                     % (_oc_names[:4], list(HARNESS_MARKERS)[:4]))
-    if set(HARNESS_NOTIFY_MARKERS) & set(HARNESS_CONTEXT_MARKERS):
-        fails.append("알림/컨텍스트 마커가 겹친다 — 강등한 범용 어휘가 폴백 대상으로 되살아난다")
-    for _m in ("summary", "status", "task-id", "output-file", "tool-use-id"):
-        if _m in HARNESS_NOTIFY_MARKERS:
-            fails.append("범용 어휘 %r 이 알림 전용(폴백 대상) 계층에 있다 — 치명① 재발" % _m)
+    #    ★절단 폴백이 없다는 것을 **동작으로** 못박는다(치명① 2회차 봉합): 짝 없는 태그는
+    #      태그만 지우고 뒤 본문은 남는다.
+    if strip_harness_blocks("오너 문장 <task-notification> 뒤 본문") != "오너 문장 뒤 본문":
+        fails.append("짝 없는 태그 뒤 본문이 사라졌다(%r) — 절단 폴백 부활"
+                     % strip_harness_blocks("오너 문장 <task-notification> 뒤 본문"))
+    if strip_harness_blocks("<task-notification> 뒤 본문") != "뒤 본문":
+        fails.append("맨 앞 짝 없는 태그가 뒤 본문까지 삼켰다(%r) — 절단 폴백 부활(실측 관통 형태)"
+                     % strip_harness_blocks("<task-notification> 뒤 본문"))
+    #    마커 ↔ `_HARNESS_BLOCKS` zip 짝 정합(어긋나면 비용 가드가 엉뚱한 마커의 닫는 태그를 본다)
+    if len(_HARNESS_CLOSE) != len(_HARNESS_BLOCKS) != len(HARNESS_MARKERS):
+        fails.append("마커 정규식 3종의 길이가 어긋난다 — zip 짝이 밀린다")
+    for _i, _m in enumerate(HARNESS_MARKERS):
+        if not _HARNESS_CLOSE[_i].search("</%s>" % _m):
+            fails.append("비용 가드 닫는 태그 정규식이 마커 %r 과 짝이 밀렸다(zip 정합 붕괴)" % _m)
     for _m in ("local-command-stdout", "bash-stdout", "ide_selection"):
         if _m not in HARNESS_MARKERS:
             fails.append("실측 harness 마커 %r 이 목록에서 빠졌다(치명② 재발)" % _m)
-    #    ⓪ 비용 상한 — 초과는 **판정 생략 = 오너 통과**(기계 판정으로 접지 않는다)
-    _big = "<task-notification>x</task-notification>" * 10 + "가" * HARNESS_SCAN_MAX_CHARS
-    _bok, _bwhy = harness_origin(_big)
-    if _bok:
-        fails.append("상한 초과 프롬프트를 **기계로 판정**했다 — 상한 초과는 오너 통과여야 한다"
-                     "(삼키는 방향으로 기울면 안 된다)")
-    if not _bwhy:
-        fails.append("상한 초과 판정 생략이 침묵했다 — 측정 실패는 고지 대상이다")
+    #    ★구조 축 3봉합(치명2 2회차): 인라인 백틱·자기닫힘·잔여 마크업 계수
+    for p, why in (
+        ("<newtag>Total cost: `$12.34`\nDuration: 4m\nchanges: 120 lines</newtag>",
+         "인라인 백틱이 구조 축을 끄는 스위치가 됐다(펜스를 split 하면 재발)"),
+        ('<newtag a="1"/>\n<newtag b="2"/>\n<newtag c="3"/>',
+         "자기닫힘 태그가 블록으로 계상되지 않고 이름 글자가 자유 텍스트로 계수됐다"),
+    ):
+        if not harness_origin(p)[0]:
+            fails.append("★구조 축 미발화 %r — %s" % (p[:60], why))
+    #      (마크업 글자는 안 세고, 태그 **사이의 내용**은 세야 한다 — 둘 다 확인)
+    _mk = generic_block_free_text("<newtag>x</newtag2>")[0]
+    if "newtag" in _mk:
+        fails.append("짝 없이 남은 태그의 **마크업 글자**가 자유 텍스트로 계수된다(%r) — 자유 "
+                     "텍스트의 정의(태그 밖에 사람이 쓴 글자)와 코드가 어긋난다" % _mk)
+    if _meaningful_chars(_mk) != 1:
+        fails.append("태그 사이의 내용이 자유 텍스트에서 사라졌다(%r) — 마크업만 지워야 한다" % _mk)
+    #    ★구조 축은 오너를 접지 않는다 — 발화 조건은 `== 0`(중대4 2회차)
+    for p, why in (("<div><p>x</p></div> 고쳐", "자유 텍스트 2자 오너 지시"),
+                   ("<a>1</a> 👉🔥⚡️", "이모지·기호만 있는 오너 지시")):
+        if harness_origin(p)[0]:
+            fails.append("★구조 축이 오너 프롬프트를 접었다 %r (%s) — 발화 조건이 0 보다 "
+                         "느슨하거나 계수 기준이 문자 종류를 재단하고 있다" % (p, why))
+    #    ⓪ 상한 — 초과해도 **통과시키지 않는다**(치명3 2회차: 무제한 통과 게이트 봉합)
+    _big = ("<task-notification><task-id>abcdefgh</task-id><status>completed</status>"
+            "<summary>done</summary></task-notification>\n") * 2000
+    if not harness_origin(_big)[0]:
+        fails.append("정형 알림 %d자를 통과시켰다 — 길게 만들면 뚫리는 무제한 통과 게이트"
+                     "(치명3 재발)" % len(_big))
+    _huge = "<task-notification>a</task-notification>" * 200000
+    _hok, _hwhy = harness_origin(_huge)
+    if len(_huge) <= HARNESS_SCAN_MAX_CHARS:
+        fails.append("상한 검체가 상한을 넘지 못한다(핀 무력) — len=%d ≤ %d"
+                     % (len(_huge), HARNESS_SCAN_MAX_CHARS))
+    elif not _hok:
+        fails.append("상한 초과 정형 알림이 통과했다 — 프리픽스 판정이 동작하지 않는다")
+    elif "프리픽스" not in _hwhy:
+        fails.append("프리픽스 판정 사실이 사유에 없다(%r) — 무엇을 보고 판정했는지 남아야 한다"
+                     % _hwhy[:80])
     # ── ⑩정규화 규칙이 생산자(delivery.rs::normalize)와 같은가 — 교차언어 앵커 ──
     if _normalize_delivery("  a \t\n b  ") != "a b":
         fails.append("정규화 규칙 이탈(공백 접기) — Rust delivery.rs::normalize 와 갈렸다")
@@ -3411,10 +3483,12 @@ def cmd_self_test():
           "stdout 판정 토큰 핀(machine/human/unknown — 소비자 1차 근거) · "
           "★층0(2026-08-22 harness 내부 알림 · 판정=잔여문/자유텍스트 · 위치 무관): 실측 사고 "
           "문자열 포함 corpus 5종 + ★/cost 슬래시 실측 + ★목록에 없는 새 태그(구조 축) 접기 · "
-          "오너 문장 무차단 12종(선행 리마인더·슬래시 뒤 지시·선후행 동시·★접두 1~2자 4종·"
-          "코드펜스 보호·XML 붙여넣기·일반 HTML 블록) · 잔여문 정확일치 3종 · "
-          "미종결 폴백 3좁힘(맨앞·알림전용·짝맞으면 무적용) · 마커 2계층 zip 정합 · "
-          "비용 상한 초과=오너 통과+고지 · record e2e(mission=null · "
+          "오너 문장 무차단 16종(선행 리마인더·슬래시 뒤 지시·선후행 동시·★접두 1~2자 4종·"
+          "★선행블록+태그시작 지시 4종·코드펜스 보호·XML 붙여넣기·일반 HTML·이모지 지시) · "
+          "잔여문 정확일치 3종 · ★절단 폴백 부재 동작핀 2종(잘린 알림 통과=계약) · "
+          "★구조 축 3봉합(인라인 백틱 마스킹·자기닫힘 계상·잔여 마크업 무계수) · "
+          "★구조 축 발화조건 ==0(오너 무차단) · 마커 zip 정합 · "
+          "★상한 초과도 프리픽스로 판정(무제한 통과 게이트 봉합) · record e2e(mission=null · "
           "source=harness_notification · 게이트 무개방 · 진행 중 오너 임무 무덮어쓰기 · "
           "오너 평문 임무 정상 기록))"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
