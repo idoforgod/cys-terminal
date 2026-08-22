@@ -322,7 +322,33 @@ pub enum WriteReq {
     /// 왜 writer 에서 자는가: writer 는 **단일 소비자**라 여기서 sleep 하면 뒤따르는 WriteReq
     /// 는 그동안 채널에 머문다 = 순서가 구조적으로 보존된다(Inject 의 cr_delay_ms 와 같은
     /// 규약). 호출자(핸들러) 쪽에서 자면 tokio 워커를 막고 순서 보장도 사라진다.
+    ///
+    /// ★B2′ 이후 이 변형은 **일반 지연 쓰기 원시연산**으로만 남는다(제출 CR 전용 경로는
+    /// `SubmitAfterGap` 으로 옮겼다). 프로덕션 생산자는 없고 writer 테스트가 적체를
+    /// 시뮬레이션할 때 쓴다 — 의도적으로 `last_program_write` 를 **찍지 않는다**(적체를
+    /// 만드는 채움 바이트가 측정 기준점을 오염시키면 테스트가 거짓 통과한다).
+    #[allow(dead_code)] // 테스트 전용 생산자 — 위 문단 참조(변형 자체는 계약의 일부다)
     DataAfter { bytes: Vec<u8>, delay_ms: u64 },
+    /// ★B2′(codex 감사 R1) **프로그램이 꽂는 본문** 쓰기 — write+flush 뒤 writer 로컬
+    /// `last_program_write` 를 찍는다. `Data` 와 바이트·flush 동작은 완전히 같고, 다른 점은
+    /// '이 write 가 최소 간격의 기준점이 된다'는 것 하나뿐이다.
+    ///
+    /// 왜 `Data` 와 갈랐나: 사람이 친 키(GUI human 경로)까지 기준점을 갱신하면 사람 타이핑
+    /// 뒤의 Enter 가 최소 간격에 걸려 대화가 굼떠진다. 기준점은 **프로그램 주입**에만 찍는다
+    /// (handlers send_text 가 `human_verified` 로 가른다 — `last_injected` 갱신 조건과 동일).
+    Program(Vec<u8>),
+    /// ★B2′(codex 감사 R1) 제출 CR 쓰기 — **writer 가 실제로 본문을 쓴 시각**(`last_program_write`)
+    /// 으로부터 `min_gap_ms` 가 지나도록 잔여만큼 자고 나서 쓴다.
+    ///
+    /// 왜 핸들러가 아니라 여기서 재나(이 변형의 존재 이유 전체): 종전 B2 는 핸들러가
+    /// `surface.last_injected`(= **enqueue 한 시각**)와 Return 처리 시각의 차로 잔여를 계산해
+    /// `DataAfter` 를 만들었다. 그런데 writer 큐에 선행 요청이 밀려 있으면
+    /// `본문 enqueue → 150ms 경과 → Return enqueue(무지연 판정) → writer 가 뒤늦게 본문 write
+    /// → 곧바로 CR write` 가 성립한다. 단일 writer 가 보존하는 것은 **순서**이지 두 실제 write
+    /// 사이의 **시간**이 아니다. 그래서 적체 경로에서 최소 간격 보장이 통째로 붕괴했다.
+    /// 기준을 enqueue 시각이 아니라 **writer 실기록 시각**으로 옮겨야 그 경로가 닫힌다.
+    /// `last_program_write` 가 None(이 writer 가 아직 프로그램 본문을 쓴 적 없음)이면 즉시 쓴다.
+    SubmitAfterGap { bytes: Vec<u8>, min_gap_ms: u64 },
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -3196,14 +3222,37 @@ fn clear_settle_ms() -> u64 {
         .unwrap_or(150)
 }
 
+/// ★B2′(codex 감사 R1) 제출 CR 을 얼마나 더 재워야 하는가(순수) — Some(잔여 ms) / None=즉시.
+///
+/// 인자 `since_last_program` 은 **writer 가 실제로 프로그램 본문을 쓴 뒤 흐른 시간**이다
+/// (핸들러가 enqueue 한 뒤 흐른 시간이 아니다 — 그 착각이 B2 의 적체 결함이었다).
+/// None = 이 writer 가 아직 프로그램 본문을 쓴 적 없음 → 늦출 근거가 없다(즉시).
+/// min_gap_ms = 0 = 기능 끔. 이 값은 **하한**이라 이미 지난 뒤면 손대지 않는다.
+pub(crate) fn cr_gap_delay_ms(
+    since_last_program: Option<std::time::Duration>,
+    min_gap_ms: u64,
+) -> Option<u64> {
+    if min_gap_ms == 0 {
+        return None;
+    }
+    let elapsed_ms = since_last_program?.as_millis();
+    let gap = u128::from(min_gap_ms);
+    (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
+}
+
 /// (테스트 가시성) `delivery` 모듈의 race 봉쇄 실증이 이 루프를 직접 구동한다 —
 /// "원장 기록이 PTY write 보다 앞선다"는 불변식은 **실제 writer 루프**로만 증명된다.
+///
+/// ★B2′ writer 로컬 상태 `last_program_write`: 이 루프가 **실제로** 프로그램 본문을 PTY 에
+/// 쓴 마지막 시각. 최소 간격의 기준점은 반드시 이 값이어야 한다(핸들러의 enqueue 시각이
+/// 기준이면 writer 적체 구간에서 간격이 0 으로 붕괴한다 — codex 감사 R1).
 pub(crate) fn run_writer_loop<W: Write>(
     mut writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
     stop: Arc<AtomicBool>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+    let mut last_program_write: Option<std::time::Instant> = None;
     loop {
         let req = match write_rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(req) => req,
@@ -3222,6 +3271,25 @@ pub(crate) fn run_writer_loop<W: Write>(
             // delay_ms=0 이면 sleep 은 즉시 반환하므로 Data 와 동일 동작이다.
             WriteReq::DataAfter { bytes, delay_ms } => {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                writer.write_all(&bytes).and_then(|_| writer.flush())
+            }
+            // ★B2′: 프로그램 본문 — 쓰기에 **성공했을 때만** 기준점을 찍는다(실패한 write 를
+            // 기준으로 삼으면 실제로 화면에 없는 본문 때문에 다음 CR 이 늦춰진다).
+            WriteReq::Program(bytes) => {
+                let r = writer.write_all(&bytes).and_then(|_| writer.flush());
+                if r.is_ok() {
+                    last_program_write = Some(std::time::Instant::now());
+                }
+                r
+            }
+            // ★B2′: 제출 CR — 잔여를 **여기서, 소비 시점에** 계산한다. 이 계산이 핸들러에
+            // 있으면 적체 구간에서 간격이 붕괴한다(codex 감사 R1 · SubmitAfterGap doc 참조).
+            WriteReq::SubmitAfterGap { bytes, min_gap_ms } => {
+                if let Some(delay) =
+                    cr_gap_delay_ms(last_program_write.map(|t| t.elapsed()), min_gap_ms)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
                 writer.write_all(&bytes).and_then(|_| writer.flush())
             }
             WriteReq::Inject {
@@ -3243,7 +3311,10 @@ pub(crate) fn run_writer_loop<W: Write>(
             .and_then(|_| writer.flush())
             .map(|_| std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms)))
             .and_then(|_| writer.write_all(b"\r"))
-            .and_then(|_| writer.flush()),
+            .and_then(|_| writer.flush())
+            // ★B2′: Inject 는 본문+CR 을 이미 한 단위로 넣었다. 기준점을 찍어 두면 뒤이어 온
+            // 제출 Return(중복 Enter)이 최소 간격만큼 떨어져 들어가 빈 줄 폭주를 막는다.
+            .inspect(|_| last_program_write = Some(std::time::Instant::now())),
         };
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다
@@ -4329,6 +4400,198 @@ mod tests {
         drop(tx0);
         h0.join().ok();
         assert_eq!(buf0.lock().unwrap().clone(), b"\r".to_vec());
+    }
+
+    /// ★B2′ 테스트 보조 — 각 write 의 **시각과 바이트**를 함께 기록한다. 종전 SharedBuf 는
+    /// 바이트만 모아서 '순서'는 볼 수 있어도 두 write 사이의 **시간**은 볼 수 없었다. codex
+    /// 감사 R1 이 짚은 결함이 바로 그 시간 축에 있었으므로, 그 축을 관측 가능하게 만든다.
+    struct TimedBuf(Arc<Mutex<Vec<(std::time::Instant, Vec<u8>)>>>);
+    impl std::io::Write for TimedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), buf.to_vec()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 기록에서 특정 바이트열이 처음 써진 시각을 찾는다(없으면 패닉 — 테스트 전제 위반).
+    fn write_time(
+        log: &[(std::time::Instant, Vec<u8>)],
+        needle: &[u8],
+    ) -> std::time::Instant {
+        log.iter()
+            .find(|(_, b)| b.as_slice() == needle)
+            .unwrap_or_else(|| {
+                panic!(
+                    "기대한 write 가 없다: {:?} (기록: {:?})",
+                    String::from_utf8_lossy(needle),
+                    log.iter()
+                        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+                        .collect::<Vec<_>>()
+                )
+            })
+            .0
+    }
+
+    /// ★B2′ 핵심 회귀 핀(codex 감사 R1 — 적체 경로 붕괴).
+    ///
+    /// 종전 B2 는 핸들러가 `last_injected`(= **enqueue 한 시각**)로 잔여를 계산했다. writer 큐에
+    /// 선행 요청이 밀려 있으면 이 순서가 성립한다:
+    ///   본문 enqueue → (핸들러 시계로) 150ms 경과 → Return enqueue = **무지연 판정** →
+    ///   writer 가 그제서야 본문 write → **곧바로** CR write.
+    /// 단일 writer 가 보존하는 것은 순서이지 두 실제 write 사이의 시간이 아니다. 그래서
+    /// 적체 구간에서 최소 간격이 통째로 0 이 됐다 — 정확히 우리가 막으려던 상황(붙여넣기
+    /// 처리 창 안의 CR)이 적체일수록 더 잘 일어난다.
+    ///
+    /// 이 테스트는 그 상황을 재현한다: 300ms 짜리 선행 요청으로 writer 를 붙들어 두고, 본문을
+    /// 큐에 넣은 뒤, **핸들러 기준으로는 이미 150ms 를 넘긴** 200ms 뒤에 제출 CR 을 넣는다.
+    /// 계약이 살아 있으면 CR 은 여전히 본문 write 로부터 150ms 이상 떨어져야 한다.
+    #[test]
+    fn submit_after_gap_measures_from_actual_write_not_handler_enqueue() {
+        use std::sync::mpsc::sync_channel;
+        const GAP_MS: u64 = 150;
+
+        // ── 신 구현: SubmitAfterGap(writer 실기록 시각 기준) ──────────────
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = TimedBuf(Arc::clone(&log));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        // ① 적체 — writer 가 300ms 동안 이 요청에 붙들린다(선행 큐 시뮬레이션).
+        tx.send(WriteReq::DataAfter { bytes: b"X".to_vec(), delay_ms: 300 })
+            .unwrap();
+        // ② 본문 — 채널에서 대기하다가 t≈300ms 에야 **실제로** 써진다.
+        tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+        // ③ 200ms 뒤 제출 CR — 핸들러 시계로는 본문 enqueue 후 이미 150ms 초과다.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            .unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let log = log.lock().unwrap().clone();
+        let flat: Vec<u8> = log.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(
+            flat,
+            b"XBODY\r".to_vec(),
+            "순서가 깨졌다 (출력: {:?})",
+            String::from_utf8_lossy(&flat)
+        );
+        let gap = write_time(&log, b"\r").duration_since(write_time(&log, b"BODY"));
+        assert!(
+            gap >= std::time::Duration::from_millis(GAP_MS),
+            "적체 경로에서 본문↔CR 간격이 붕괴했다: {gap:?} < {GAP_MS}ms — 기준이 writer 실기록 \
+             시각이 아니라 핸들러 enqueue 시각으로 되돌아갔다(codex 감사 R1 재발)"
+        );
+
+        // ── 부정 대조: 구 구현이 같은 상황에서 만들어내던 산출물 ───────────
+        //    종전 B2 의 핸들러는 '본문 enqueue 후 200ms 경과 ≥ 150ms' 로 보고 **무지연
+        //    Data** 를 냈다. 그 요청열을 그대로 흘려 보내면 간격이 실제로 무너짐을 남긴다 —
+        //    이 대조가 있어야 위 단정이 '우연한 통과'가 아님이 기계로 증명된다.
+        let log_old = Arc::new(Mutex::new(Vec::new()));
+        let (tx2, rx2) = sync_channel::<WriteReq>(8);
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let w2 = TimedBuf(Arc::clone(&log_old));
+        let h2 = std::thread::spawn(move || run_writer_loop(w2, rx2, stop2));
+        tx2.send(WriteReq::DataAfter { bytes: b"X".to_vec(), delay_ms: 300 })
+            .unwrap();
+        tx2.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tx2.send(WriteReq::Data(b"\r".to_vec())).unwrap(); // ← 구 구현의 산출물
+        drop(tx2);
+        h2.join().ok();
+
+        let log_old = log_old.lock().unwrap().clone();
+        let gap_old = write_time(&log_old, b"\r").duration_since(write_time(&log_old, b"BODY"));
+        assert!(
+            gap_old < std::time::Duration::from_millis(GAP_MS),
+            "부정 대조가 성립하지 않는다 — 무지연 Data 인데 간격이 {gap_old:?} 나왔다. \
+             적체 시뮬레이션이 의도대로 동작하지 않았다는 뜻이므로 위 단정도 신뢰할 수 없다"
+        );
+    }
+
+    /// ★B2′: 이 writer 가 프로그램 본문을 쓴 적이 없으면 늦출 근거가 없다 → 즉시 쓴다.
+    /// (사람만 타이핑하던 pane 에 온 Return 이 공연히 늦어지면 대화가 굼떠진다.)
+    #[test]
+    fn submit_after_gap_is_immediate_without_a_preceding_program_write() {
+        use std::sync::mpsc::sync_channel;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = TimedBuf(Arc::clone(&log));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        // 사람 키(Data)는 기준점을 찍지 않는다 — Program 이 아니므로 여전히 '본문 없음'이다.
+        tx.send(WriteReq::Data(b"typed".to_vec())).unwrap();
+        let t0 = std::time::Instant::now();
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 150 })
+            .unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let log = log.lock().unwrap().clone();
+        let took = write_time(&log, b"\r").duration_since(t0);
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "프로그램 본문이 선행하지 않았는데 CR 이 늦춰졌다({took:?}) — 사람 키(Data)가 \
+             기준점을 찍고 있다는 뜻이다(Program 과 Data 의 분리 붕괴)"
+        );
+    }
+
+    /// ★B2′: 기준점이 있을 때의 잔여 계산 — 갓 쓴 직후·부분 경과·이미 초과 세 경우.
+    /// 계약은 언제나 하나다: **본문 write 와 CR write 사이가 min_gap 이상**. 이미 지난
+    /// 뒤라면 더 자지 않는다(하한이지 상한이 아니다).
+    #[test]
+    fn submit_after_gap_enforces_gap_from_program_write_and_never_overwaits() {
+        use std::sync::mpsc::sync_channel;
+        const GAP_MS: u64 = 150;
+        // (테스트 이름, 본문 write 뒤 CR 을 넣기까지 테스트 스레드가 기다릴 시간)
+        for (why, wait_ms) in [("갓 쓴 직후", 0u64), ("부분 경과(50ms)", 50)] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = sync_channel::<WriteReq>(4);
+            let stop = Arc::new(AtomicBool::new(false));
+            let w = TimedBuf(Arc::clone(&log));
+            let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+            tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+                .unwrap();
+            drop(tx);
+            handle.join().ok();
+
+            let log = log.lock().unwrap().clone();
+            let gap = write_time(&log, b"\r").duration_since(write_time(&log, b"BODY"));
+            assert!(
+                gap >= std::time::Duration::from_millis(GAP_MS),
+                "{why}: 본문↔CR 간격 {gap:?} < {GAP_MS}ms"
+            );
+        }
+
+        // 이미 min_gap 을 넘긴 뒤 → 추가 대기 없이 즉시(과잉 지연 금지).
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = TimedBuf(Arc::clone(&log));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200)); // > GAP_MS
+        let t_enqueue = std::time::Instant::now();
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            .unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let log = log.lock().unwrap().clone();
+        let took = write_time(&log, b"\r").duration_since(t_enqueue);
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "이미 {GAP_MS}ms 가 지났는데 CR 이 또 {took:?} 늦춰졌다 — 하한이어야 할 간격이 \
+             상한처럼 동작한다(모든 제출이 매번 느려진다)"
+        );
     }
 
     /// ★B2 계약 박제 ②(0.14.24): writer 는 **단일 소비자**라 DataAfter 가 자는 동안 뒤따라

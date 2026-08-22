@@ -1090,28 +1090,47 @@ fn cr_min_gap_ms() -> u64 {
         .unwrap_or(150)
 }
 
-/// ★B2 순수 판정 — 제출 CR 을 얼마나 늦춰야 하는가. Some(잔여 ms) = `WriteReq::DataAfter`,
-/// None = 종전대로 즉시 `WriteReq::Data`.
+/// ★B2′ 핸들러측 순수 판정 — 이 키에 최소 간격을 **걸어야 하는가**. Some(min_gap_ms) 면
+/// `WriteReq::SubmitAfterGap` 으로, None 이면 종전대로 즉시 `WriteReq::Data` 로 보낸다.
 ///
-/// 조건 셋을 모두 만족할 때만 늦춘다:
-///   · key 가 Return/Enter (제출 키에만 적용 — 다른 키는 붙여넣기 삼킴과 무관하다)
-///   · min_gap_ms > 0 (env 비활성 스위치)
-///   · 직전 **프로그램 주입**(`surface.last_injected`)으로부터 min_gap_ms 가 아직 안 지남
-/// `last_injected` 는 human_verified 가 아닐 때만 찍히므로(handlers send_text), 사람이 직접
-/// 친 글자 뒤의 Return 은 여기서 늦춰지지 않는다 — 늦추는 대상은 오직 '프로그램이 방금 꽂은
-/// 본문에 뒤따르는 제출'이다. 관측값이 없으면(None) 늦추지 않는다(fail-open: 이 기능이
-/// 못 하는 일은 지연뿐이고, 과잉 지연이 오히려 대화형 응답을 갉는다).
-fn cr_gap_delay_ms(
-    key: &str,
-    since_last_inject: Option<std::time::Duration>,
-    min_gap_ms: u64,
-) -> Option<u64> {
-    if min_gap_ms == 0 || !matches!(key, "Return" | "Enter") {
-        return None;
+/// ★codex 감사 R1 이후 핸들러는 **잔여 시간을 계산하지 않는다**. 종전 B2 는 여기서
+/// `surface.last_injected`(= enqueue 시각) 경과로 잔여를 구했는데, writer 큐에 선행 요청이
+/// 밀려 있으면 `본문 enqueue → 150ms 경과 → Return 무지연 판정 → writer 가 뒤늦게 본문 write
+/// → 곧바로 CR write` 가 되어 간격이 0 으로 붕괴했다. 이제 핸들러는 '얼마나'가 아니라
+/// '거는가/마는가'만 정하고, 잔여는 writer 가 **실기록 시각** 기준으로 소비 시점에 잰다.
+///
+/// 조건 둘: key 가 제출 키(Return/Enter — 붙여넣기 삼킴은 CR 고유 문제다) · min_gap_ms > 0
+/// (env 비활성 스위치). 프로그램 주입이 선행했는지는 writer 가 판단하므로 여기서 보지 않는다.
+fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
+    (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
+}
+
+/// ★B2′ `surface.send_text` 의 쓰기 변형 선택(순수) — 세 갈래를 한 곳에 모아 테스트 가능하게.
+///
+///   · clear_first  → `Inject`(Ctrl-U 선정리 → paste → CR, 원자)
+///   · human_verified → `Data` (**사람이 친 키** — 바이트·flush 는 Program 과 완전히 같고,
+///     다른 점은 writer 의 최소 간격 기준점을 **찍지 않는다**는 것뿐이다. 사람 타이핑 뒤의
+///     Enter 까지 늦추면 대화가 굼떠진다.)
+///   · 그 외 → `Program` (프로그램이 꽂는 본문 = 최소 간격의 기준점)
+///
+/// 갈림 조건이 `last_injected` 갱신 조건(`!human_verified`)과 **같은 술어**라는 점이 중요하다 —
+/// 두 기준이 갈리면 '에코 제외 창'과 '최소 간격'이 서로 다른 사건을 가리키게 된다.
+fn send_text_write_req(
+    text: &str,
+    clear_first: bool,
+    human_verified: bool,
+) -> crate::state::WriteReq {
+    if clear_first {
+        crate::state::WriteReq::Inject {
+            text: text.to_string(),
+            cr_delay_ms: 400,
+            clear_first: true,
+        }
+    } else if human_verified {
+        crate::state::WriteReq::Data(text.as_bytes().to_vec())
+    } else {
+        crate::state::WriteReq::Program(text.as_bytes().to_vec())
     }
-    let elapsed_ms = since_last_inject?.as_millis();
-    let gap = u128::from(min_gap_ms);
-    (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
 }
 
 /// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
@@ -2257,15 +2276,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // clear_first면 원자 Inject(Ctrl-U 선정리 → paste → CR 제출)로, 아니면 현행 Data(원시
             // 바이트, 제출은 별도 send_key Return)로. 단일 try_send이라 부분 전달(clear만 들어가고
             // text 유실)이 구조적으로 불가능하다.
-            let write_req = if clear_first {
-                crate::state::WriteReq::Inject {
-                    text: text.clone(),
-                    cr_delay_ms: 400,
-                    clear_first: true,
-                }
-            } else {
-                crate::state::WriteReq::Data(text.as_bytes().to_vec())
-            };
+            // ★B2′: 비-clear_first 본문은 human_verified 여부로 Data/Program 이 갈린다 —
+            //   Program 만 writer 의 최소 간격 기준점을 찍는다(send_text_write_req doc 참조).
+            let write_req = send_text_write_req(&text, clear_first, human_verified);
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
@@ -2413,14 +2426,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            // ★B2(0.14.24 결함3 세 번째 층): 프로그램이 방금 본문을 꽂았고(last_injected)
-            //   그 직후 제출 Return 이 도착했다면, 최소 간격만큼 **잔여 시간만** 늦춰 쓴다.
-            //   근거는 cr_min_gap_ms doc 의 ①~④ — 붙여넣기 처리 창 안에 떨어진 CR 은 TUI 가
+            // ★B2′(codex 감사 R1 · 0.14.24 결함3 세 번째 층): 제출 Return 은 프로그램이 꽂은
+            //   본문과 최소 간격만큼 떨어져야 한다 — 붙여넣기 처리 창 안에 떨어진 CR 은 TUI 가
             //   삼켜 미제출로 끝난다(본문은 들어갔는데 Enter 만 안 먹는 증상의 나머지 절반).
+            //   ★핸들러는 '거는가'만 정하고 **잔여는 재지 않는다**: 여기서 재면 기준이
+            //     enqueue 시각이 되어 writer 적체 구간에서 간격이 0 으로 붕괴한다. 기준은
+            //     writer 가 **실제로 본문을 쓴 시각**이어야 하고, 그 판단은 writer 몫이다.
             //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
-            let since_last_inject = surface.last_injected.lock().unwrap().map(|t| t.elapsed());
-            let write_req = match cr_gap_delay_ms(&key, since_last_inject, cr_min_gap_ms()) {
-                Some(delay_ms) => crate::state::WriteReq::DataAfter { bytes, delay_ms },
+            let write_req = match submit_gap_for_key(&key, cr_min_gap_ms()) {
+                Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
             };
             if let Some(err) = try_write(&surface, write_req, &id) {
@@ -8207,7 +8221,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★B2 판정 표 박제(0.14.24): 제출 CR 을 늦출지·얼마나 늦출지의 **전 경우**를 고정한다.
+    /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
+    /// **전 경우**를 고정한다. 판정이 두 층으로 갈렸으므로 두 층을 함께 박는다 —
+    ///   · 핸들러층 `submit_gap_for_key`: '이 키에 간격을 거는가' (잔여는 재지 않는다)
+    ///   · writer층 `state::cr_gap_delay_ms`: 실기록 시각 기준 '얼마나 더 자는가'
     /// 순수 함수라 시계·스레드 없이 경계(정확히 min_gap 지난 순간)까지 결정론으로 박는다.
     /// 넓게 늦추면 대화형 응답이 갉이고, 좁게 늦추면 붙여넣기 창에 CR 이 다시 삼켜진다.
     #[test]
@@ -8216,26 +8233,35 @@ mod tests {
         //   읽는 send_key_return_delegates_the_gap_to_the_writer_not_the_handler 와 cargo 병렬
         //   러너에서 경합하면 기본값 단정(150)이 간헐 실패한다. env 창을 ACL_ENV_LOCK 으로 직렬화.
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::state::cr_gap_delay_ms;
         use std::time::Duration;
         let ms = Duration::from_millis;
 
-        // ① 주입 직후(경과 0) 제출 키 → 전액 지연.
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(0)), 150), Some(150));
-        assert_eq!(cr_gap_delay_ms("Enter", Some(ms(0)), 150), Some(150));
+        // ── writer층: 실기록 시각 경과 → 잔여 ──────────────────────────────
+        // ① 본문을 막 쓴 직후(경과 0) → 전액 지연.
+        assert_eq!(cr_gap_delay_ms(Some(ms(0)), 150), Some(150));
         // ② 창 안 부분 경과 → **잔여만** 지연(이미 흐른 시간을 두 번 세지 않는다).
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(50)), 150), Some(100));
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(149)), 150), Some(1));
+        assert_eq!(cr_gap_delay_ms(Some(ms(50)), 150), Some(100));
+        assert_eq!(cr_gap_delay_ms(Some(ms(149)), 150), Some(1));
         // ③ 경계 — 정확히 min_gap 이 지났으면 무지연(하한 계약: 미만일 때만 늦춘다).
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(150)), 150), None);
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(5_000)), 150), None);
-        // ④ 제출 키가 아니면 절대 늦추지 않는다(붙여넣기 삼킴은 CR 고유 문제다).
+        assert_eq!(cr_gap_delay_ms(Some(ms(150)), 150), None);
+        assert_eq!(cr_gap_delay_ms(Some(ms(5_000)), 150), None);
+        // ④ 이 writer 가 프로그램 본문을 쓴 적 없음 → 늦출 근거 없음(즉시).
+        assert_eq!(cr_gap_delay_ms(None, 150), None);
+        // ⑤ min_gap=0 = 비활성 스위치(CYS_CR_MIN_GAP_MS=0 으로 즉시 되돌릴 수 있어야 한다).
+        assert_eq!(cr_gap_delay_ms(Some(ms(0)), 0), None);
+
+        // ── 핸들러층: 이 키에 간격을 거는가 ────────────────────────────────
+        // ⑥ 제출 키만 건다. 값은 '잔여'가 아니라 **min_gap 그대로** 실려 나간다
+        //    (핸들러가 잔여를 재던 것이 R1 결함의 본체 — 그 계산은 여기 없어야 한다).
+        assert_eq!(submit_gap_for_key("Return", 150), Some(150));
+        assert_eq!(submit_gap_for_key("Enter", 150), Some(150));
+        // ⑦ 제출 키가 아니면 절대 걸지 않는다(붙여넣기 삼킴은 CR 고유 문제다).
         for k in ["Tab", "Escape", "Up", "a", "BTab", "F5"] {
-            assert_eq!(cr_gap_delay_ms(k, Some(ms(0)), 150), None, "제출 키가 아닌 {k} 가 지연됐다");
+            assert_eq!(submit_gap_for_key(k, 150), None, "제출 키가 아닌 {k} 에 간격이 걸렸다");
         }
-        // ⑤ 프로그램 주입 관측값 없음 → 무지연(fail-open · 사람 타이핑 뒤 Return 도 여기 해당).
-        assert_eq!(cr_gap_delay_ms("Return", None, 150), None);
-        // ⑥ min_gap=0 = 비활성 스위치(CYS_CR_MIN_GAP_MS=0 으로 즉시 되돌릴 수 있어야 한다).
-        assert_eq!(cr_gap_delay_ms("Return", Some(ms(0)), 0), None);
+        // ⑧ 비활성 스위치는 핸들러층에서도 즉시 통한다(요청 자체가 안 만들어진다).
+        assert_eq!(submit_gap_for_key("Return", 0), None);
         // ⑦ 기본값 계약 — env 미설정이면 150ms.
         let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
         std::env::remove_var("CYS_CR_MIN_GAP_MS");
@@ -8247,6 +8273,55 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
             None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
+        }
+    }
+
+    /// ★B2′ 사람 경로 불변 박제(codex 감사 R1 수리의 부작용 방지).
+    ///
+    /// `Program` 은 `Data` 와 바이트·flush 가 완전히 같고 오직 writer 의 최소 간격 **기준점을
+    /// 찍는다**는 점만 다르다. 그래서 갈림 조건이 틀리면 증상이 조용하다 — 바이트는 멀쩡히
+    /// 들어가는데 사람이 친 글자 뒤의 Enter 까지 150ms 늦어지거나(사람 경로 오염), 반대로
+    /// 프로그램 본문이 기준점을 못 찍어 간격 보장이 통째로 사라진다.
+    /// 계약: clear_first → Inject · human_verified → **Data**(사람 키) · 그 외 → **Program**.
+    /// 그리고 `SubmitAfterGap` 은 send_text 가 **절대** 만들지 않는다(제출 키 경로 전용).
+    #[test]
+    fn send_text_write_req_marks_only_program_injections_as_the_gap_anchor() {
+        use crate::state::WriteReq;
+
+        // ① 사람이 친 키(operator token 검증 통과) → Data. 기준점을 찍지 않는다.
+        match send_text_write_req("hello", false, true) {
+            WriteReq::Data(b) => assert_eq!(b, b"hello".to_vec(), "사람 경로 바이트가 변형됐다"),
+            other => panic!(
+                "human_verified 인데 Data 가 아니다 — 사람 타이핑 뒤 Enter 까지 늦어진다 ({})",
+                write_req_name(&other)
+            ),
+        }
+        // ② 프로그램 주입 → Program. 바이트는 ① 과 동일해야 한다(변형 금지).
+        match send_text_write_req("hello", false, false) {
+            WriteReq::Program(b) => assert_eq!(b, b"hello".to_vec(), "프로그램 경로 바이트가 변형됐다"),
+            other => panic!(
+                "프로그램 주입인데 Program 이 아니다 — 최소 간격 기준점이 안 찍힌다 ({})",
+                write_req_name(&other)
+            ),
+        }
+        // ③ clear_first 는 human 여부와 무관하게 원자 Inject(종전 동작 불변 · cr_delay 400).
+        for human_verified in [false, true] {
+            match send_text_write_req("hi", true, human_verified) {
+                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                    assert_eq!(text, "hi");
+                    assert_eq!(cr_delay_ms, 400, "큐/원자 주입의 CR 지연 규약이 바뀌었다");
+                    assert!(clear_first);
+                }
+                other => panic!("clear_first 인데 Inject 가 아니다 ({})", write_req_name(&other)),
+            }
+        }
+        // ④ send_text 는 어떤 조합에서도 SubmitAfterGap 을 만들지 않는다(제출 키 전용 변형).
+        for (cf, hv) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                !matches!(send_text_write_req("x", cf, hv), WriteReq::SubmitAfterGap { .. }),
+                "send_text 가 SubmitAfterGap 을 만들었다(clear_first={cf}, human_verified={hv}) — \
+                 본문에 제출 간격이 붙으면 본문 자체가 늦게 들어간다"
+            );
         }
     }
 
@@ -8511,6 +8586,17 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         s.id
+    }
+
+    /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
+    fn write_req_name(r: &crate::state::WriteReq) -> &'static str {
+        match r {
+            crate::state::WriteReq::Data(_) => "Data",
+            crate::state::WriteReq::Program(_) => "Program",
+            crate::state::WriteReq::DataAfter { .. } => "DataAfter",
+            crate::state::WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap",
+            crate::state::WriteReq::Inject { .. } => "Inject",
+        }
     }
 
     fn bind_caller(daemon: &Arc<Daemon>, pid: u32, sid: u64) {
