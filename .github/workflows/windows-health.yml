@@ -87,7 +87,12 @@ jobs:
           #   count_cycle_agent os_name 분기표(nt=PowerShell CIM fail-closed) · pid_alive
           #   비파괴(OpenProcess 계열 · os.kill 0회) · self-test os.fork 케이스 한정 SKIP.
           #   판정은 주입식(전 플랫폼 결정론)이지만 Windows 실기 트리에 실려 있음을 이 레인이 확증한다.
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1"
+          # ★H-PACK-CRLF 편입(2026-08-23 U-1): CRLF 결함은 **Windows 체크아웃에서만 발현**한다
+          #   (Git for Windows 설치 기본값 core.autocrlf=true). 다른 OS 에서 아무리 초록이어도
+          #   그것은 결함이 존재할 수 없는 환경에서의 초록이라 증거가치가 0이다 — 정확히
+          #   이 파일 머리말이 말하는 "돌지 않는 초록". `.gitattributes` 봉인이 Windows 러너의
+          #   실제 체크아웃 바이트를 LF 로 만드는지는 이 레인만이 실측할 수 있다.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           python "$R" --only "$WIN_SPECIMENS"
           python "$R" --only "$WIN_SPECIMENS" --json > win-health.json

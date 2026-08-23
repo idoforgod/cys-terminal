@@ -1,0 +1,79 @@
+# ── CRLF 봉인 (U-1 · 2026-08-23) ─────────────────────────────────────────────
+# 왜 필요한가 — `build.rs` 는 `include_str!` 로 **빌드 머신 작업 트리의 바이트를 그대로** 팩에
+# 임베드한다. Git for Windows 의 설치 기본값은 `core.autocrlf=true` 라, 이 파일이 없으면 Windows
+# 러너 체크아웃에서 텍스트가 CRLF 로 펼쳐지고 그대로 출하된다. 귀결 두 가지:
+#   ① `cysjavis-pack/hooks/*.sh` 가 `#!/bin/bash\r` 로 임베드돼 **훅이 통째로 죽는다**.
+#   ② 같은 버전인데 Windows 임베드 팩과 ubuntu `pack.tar.gz` 의 **바이트가 갈려** 매니페스트
+#      해시가 흔들린다(빌드 결정론 붕괴).
+# ∴ 저장소 전역을 LF 로 못박는다.
+#
+# ★정직 고지(F5 · 2026-08-23) — "런타임 거동 변화 없음"은 **단언하지 않는다.** 이 봉인은
+#   Windows 러너의 **체크아웃 바이트**를 바꾼다(구: core.autocrlf=true 로 CRLF · 신: LF).
+#   `build.rs` 는 그 바이트를 `include_str!` 로 그대로 임베드하므로, 바뀌는 것은 곧
+#   **임베드 팩 내용과 팩 매니페스트 해시**다. 그것이 바로 이 봉인의 목적(3러너 동일화)이지만,
+#   "ubuntu·macOS·windows 3러너의 팩 해시가 실제로 동일해진다"는 **여기서 증명되지 않았다 —
+#   미증명이다.** 확인 경로는 하나뿐이다: `feat/**` push 시 `windows-health` 잡의 실측
+#   (H-PACK-CRLF 가 Windows 실기 검체 목록에 편입돼 있다). 실측 전까지 이 문단을
+#   "영향 없음"으로 고쳐 적지 말 것.
+#
+# ★이 파일의 추가는 **인덱스 바이트를 바꾸지 않는다.** 도입 시점(2026-08-23)에 추적 파일
+#   전량이 이미 `i/lf` 임을 `git ls-files --eol` 로 확인했다(유일 예외 = 아래 픽스처 pin).
+#   따라서 재정규화 커밋이 발생하지 않는다 — 개행 변환으로 diff 를 오염시키지 말 것.
+# ★기계 감시: `run_bootstrap_health.py` 의 검체 `H-PACK-CRLF` 가 임베드 대상 전량의 `\r\n`
+#   0 을 단언하고, `build.rs` 의 가드③이 빌드 시점에 같은 조건을 강제한다(조용한 출하 불가).
+
+* text=auto eol=lf
+
+# ── 팩 실행 파일: 자동 판정에 맡기지 않고 LF 를 명시 강제 ───────────────────
+# 훅(.sh)은 shebang 에 CR 이 한 글자만 섞여도 인터프리터 해소가 실패한다 = 전면 사망.
+cysjavis-pack/hooks/** text eol=lf
+*.sh                   text eol=lf
+
+# ★`cysjavis-pack/bin/**` 은 **강제 `text` 가 아니라 `text=auto`** 다(F4-a · 2026-08-23).
+#   강제 `text` 는 "이 경로 아래 모든 파일은 텍스트다"라고 git 에게 단언하는 것이라, 확장자 pin
+#   목록(아래 바이너리 절) 밖의 **새 바이너리**가 pack bin 아래 들어오는 순간(예: 동봉 런타임
+#   조각·서명 blob·확장자 없는 실행체) 개행 변환이 그 바이트를 **조용히 손상**시킨다.
+#   `text=auto` 는 git 이 NUL 휴리스틱으로 바이너리를 판별해 변환에서 제외하고, 텍스트로
+#   판별된 것에는 동일하게 `eol=lf` 를 적용한다 — 훅·스크립트 LF 보장은 그대로 유지하면서
+#   미지의 바이너리만 살린다. (팩 bin 아래 셸 스크립트는 위 `*.sh` 규칙이 이중으로 못박는다.)
+cysjavis-pack/bin/**   text=auto eol=lf
+
+# ── Windows 인스톨러 입력: 개행을 이 캠페인에서 **건드리지 않는다** ─────────
+# `src-tauri/nsis-hooks.nsh` 는 장식 파일이 아니라 `src-tauri/tauri.windows.conf.json` 의
+# `nsis.installerHooks` 로 지정된 **실제 Windows 인스톨러 빌드 입력**이다(makensis 가 읽는다).
+# 전역 `* text=auto eol=lf` 를 그대로 두면, 지금까지 Windows 러너가 `core.autocrlf=true` 로
+# CRLF 체크아웃해 빌드해 온 이 파일이 이번 봉인부터 LF 로 바뀐다 = **인스톨러 생성 입력의 변경**.
+# 주인님 지시(Windows 설치본은 신중에 신중)에 따라, 이 캠페인에서는 인스톨러 입력의 개행을
+# 바꾸지 않고 **기존 Windows 상태(CRLF)를 보존**한다. 봉인 범위는 팩 임베드 대상이지 인스톨러가
+# 아니다(`build.rs` 임베드 대상은 `cysjavis-pack/**` + `revoked-licenses.json` 뿐 — 이 파일은 무관).
+#
+# ★정직 고지: "개행이 바뀌면 NSIS 거동이 바뀐다"는 **실측이 아니라 보수적 추정**이다(makensis 는
+#   보통 두 개행을 모두 먹는다). 근거 없이 안전한 쪽을 택한 것이며, `feat/**` push 시
+#   `windows-health` 레인과 Windows 인스톨러 빌드로 실측해 확정한다. 실측 전에는 이 pin 을
+#   "불필요"로 단정해 제거하지 말 것.
+*.nsh   text eol=crlf
+
+# ── 바이너리: 어떤 변환도 금지 ──────────────────────────────────────────────
+*.png   -text
+*.ico   -text
+*.icns  -text
+*.jpg   -text
+*.jpeg  -text
+*.gif   -text
+*.pdf   -text
+*.zip   -text
+*.gz    -text
+*.tar   -text
+*.dmg   -text
+*.msi   -text
+*.exe   -text
+*.dll   -text
+*.node  -text
+
+# ── 개행이 유의미한 테스트 픽스처: 바이트 고정 ──────────────────────────────
+# `bin/tests/fixtures/todo-decl/11-crlf.md` 는 **의도적으로 CRLF** 인 파서 픽스처다(`i/crlf`).
+# `text=auto` 아래 두면 재정규화가 픽스처 자체를 파괴한다(= 검체가 검사하려던 입력의 소멸).
+# `29-control-char.md`(제어문자)·`10-bom.md`(BOM)·`24/33/34/36-*`(비-UTF8) 도 같은 성격이라
+# 디렉터리 단위로 못박는다 — 새 픽스처가 추가돼도 자동으로 보호된다.
+# ★이 경로는 `build.rs` 임베드 제외 대상(`tests` 컴포넌트)이므로 팩 출하에 영향이 없다.
+cysjavis-pack/bin/tests/fixtures/** -text

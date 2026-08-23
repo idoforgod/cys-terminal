@@ -72,6 +72,69 @@ fn main() {
         );
     }
 
+    // ★가드③(U-1 · CRLF 봉인 · 2026-08-23): 임베드 대상 텍스트에 CRLF 가 섞이면 **빌드를 죽인다**.
+    //   `include_str!` 은 빌드 머신 작업 트리의 바이트를 **그대로** 팩에 넣는다. Git for Windows 의
+    //   설치 기본값 `core.autocrlf=true` 아래에서 체크아웃이 CRLF 가 되면
+    //     ① `cysjavis-pack/hooks/*.sh` 가 `#!/bin/bash\r` 로 출하돼 훅이 통째로 죽고,
+    //     ② 같은 버전인데 Windows 임베드 팩과 ubuntu `pack.tar.gz` 의 바이트가 갈려
+    //        매니페스트 해시가 흔들린다.
+    //   레포 `.gitattributes`(`* text=auto eol=lf`)가 1차 방어이고, 이 가드는 그것이 없거나
+    //   무시된 채로(개인 git 설정·zip 다운로드·아카이브 복원) **조용히 출하되는 것**을 막는다.
+    //   검체 파리티: `cysjavis-pack/bin/tests/run_bootstrap_health.py` 의 `H-PACK-CRLF` 가 같은
+    //   대상 집합에 같은 조건을 건다(빌드 게이트 ↔ 검체 게이트 2중).
+    //   ★롤백 스위치는 이 env 1지점이다 — `CYS_ALLOW_CRLF_EMBED=1` 이면 중단하지 않고 경고만 낸다.
+    const CRLF_ALLOW_ENV: &str = "CYS_ALLOW_CRLF_EMBED";
+    println!("cargo:rerun-if-env-changed={CRLF_ALLOW_ENV}");
+    println!("cargo:rerun-if-changed=.gitattributes");
+    let crlf_allowed = env::var(CRLF_ALLOW_ENV).ok().as_deref() == Some("1");
+    let mut crlf_hits: Vec<String> = Vec::new();
+    let pack_root = Path::new(&manifest_dir).join("cysjavis-pack");
+    // 팩 트리(= PACK_ALL 임베드 전량) + 팩 트리 밖에서 문자열로 임베드되는 레포 루트 파일.
+    // `trusted-keys.json` 은 팩 트리 안이라 rels 에 이미 포함된다.
+    let mut embed_targets: Vec<(String, std::path::PathBuf)> = rels
+        .iter()
+        .map(|rel| (format!("cysjavis-pack/{rel}"), pack_root.join(rel)))
+        .collect();
+    embed_targets.push((
+        "revoked-licenses.json".to_string(),
+        Path::new(&manifest_dir).join("revoked-licenses.json"),
+    ));
+    for (label, path) in &embed_targets {
+        let Ok(bytes) = fs::read(path) else { continue };
+        // NUL 을 품은 파일은 바이너리로 보고 제외한다(임베드 대상은 UTF-8 텍스트지만 방어적으로).
+        if bytes.contains(&0u8) {
+            continue;
+        }
+        if bytes.windows(2).any(|w| w == b"\r\n") {
+            crlf_hits.push(label.clone());
+        }
+    }
+    if !crlf_hits.is_empty() {
+        let shown: Vec<&str> = crlf_hits.iter().take(20).map(|s| s.as_str()).collect();
+        let more = crlf_hits.len().saturating_sub(shown.len());
+        let msg = format!(
+            "CRLF 임베드 차단(U-1) — 아래 {}개 파일이 CRLF 개행을 갖고 있다. 이대로 빌드하면 \
+             `include_str!` 이 CRLF 를 그대로 팩에 넣어 훅 shebang(`#!/bin/bash\\r`)이 죽고 \
+             플랫폼 간 팩 해시가 갈린다.\n  {}{}\n조치: ① 레포 루트 `.gitattributes`(`* text=auto eol=lf`)가 \
+             있는지 확인 ② `git config core.autocrlf false` ③ `git rm --cached -r . && git reset --hard` \
+             로 LF 재체크아웃(또는 해당 파일만 `dos2unix`). 의도적으로 우회하려면 \
+             `{}=1` 로 빌드하라(경고로 강등).",
+            crlf_hits.len(),
+            shown.join("\n  "),
+            if more > 0 {
+                format!("\n  … 외 {more}개")
+            } else {
+                String::new()
+            },
+            CRLF_ALLOW_ENV
+        );
+        if crlf_allowed {
+            println!("cargo:warning={}", msg.replace('\n', " | "));
+        } else {
+            panic!("{msg}");
+        }
+    }
+
     let mut code = String::from(
         "/// build.rs 자동 생성 — cysjavis-pack git-추적 전체 트리 임베드 (수동 목록 드리프트 차단).\n\
          pub const PACK_ALL: &[(&str, &str)] = &[\n",

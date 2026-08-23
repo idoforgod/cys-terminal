@@ -63,6 +63,24 @@ D4A_REF = os.environ.get("CYS_HEALTH_D4A_REF", "58337fb")
 # 함께 움직인다).
 PRE_WA3_REF = os.environ.get("CYS_HEALTH_PRE_WA3_REF", "8def22a")
 
+# ★U-0(2026-08-23 · 계측 타당성 복원) — `_read` 의 읽기 상한(문자 수).
+#   구 값 400,000자는 검체가 읽는 실제 파일보다 **작았다**. `f.read(limit)` 은 초과분을 말없이
+#   버리므로, 검체는 절반만 본 텍스트에 `in`/`find()` 를 걸고 "없다"고 단언했다 —
+#   실측(2026-08-23):
+#     · src/bin/cys.rs            = 715,231자 (구 상한에서 315,231자 = 44% 미가시)
+#     · src/bin/cysd/handlers.rs  = 552,867자 (구 상한에서 152,867자 = 28% 미가시)
+#   그 직접 피해가 H-CONC-4 의 **거짓 적색**이다: T-0147-4 회귀 앵커
+#   `close_rejects_foreign_surface` 는 실재하는데(src/bin/cysd/handlers.rs:9852 · 문자
+#   오프셋 438,079) 절단 범위 밖이라 검체가 "사라졌다"고 판정했다.
+#   ★값 선정: 실측 최대(715,231자)의 약 11배. 대상 파일이 두 배로 자라도 여유가 있고,
+#     그럼에도 상한이 남아 있어 병리적 대용량 파일에서 메모리가 무한 팽창하지 않는다.
+#   ★롤백 스위치는 이 1지점이다 — 상수 또는 env `CYS_HEALTH_READ_LIMIT`.
+#   ★상한 도달은 '판정'이 아니라 '측정 실패'로 취급한다(아래 `_read` 가드 · H-META-READ).
+READ_LIMIT_CHARS = int(os.environ.get("CYS_HEALTH_READ_LIMIT") or 8000000)
+
+# `_read` 가 실제로 읽은 경로 → 문자 수. 계측기 자기감시(H-META-READ)가 소비한다.
+_READ_OBSERVED = {}
+
 # ★발효 웨이브 — 착지한 웨이브만 넣는다. 미발효 검체는 pending(게이트 비산입).
 LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5", "W6")
 
@@ -111,12 +129,28 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 
-def _read(path, limit=400000):
+def _read(path, limit=None):
+    """파일 전문을 읽는다. **절단은 판정이 아니라 측정 실패다.**
+
+    U-0(2026-08-23): 구 판은 `f.read(400000)` 으로 초과분을 조용히 버렸다. 검체는 잘린 텍스트에
+    `in`/`find()` 를 걸어 '없다'고 단언했고, 실재하는 회귀 앵커가 사라졌다는 거짓 적색을 냈다
+    (H-CONC-4 · handlers.rs 문자 오프셋 438,079 > 400,000). 계측기가 대상의 절반만 보면서
+    '없음'을 단언하는 것은 계측 무효다 — MEMORY '디버깅 계측 타당성 게이트' 3칙 ①.
+    ∴ 상한에 **도달하면** 잘라서 돌려주지 않고 `Fail` 을 던진다. 조용한 절단은 불가능하다.
+    (읽기 자체가 불가능한 경우(OSError)는 종전대로 빈 문자열 — 부재는 검체가 판정할 사실이다.)
+    """
+    lim = READ_LIMIT_CHARS if limit is None else limit
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read(limit)
+            body = f.read(lim + 1)      # ★상한+1 — '도달했는가'를 관측 가능하게 만드는 1자
     except OSError:
         return ""
+    if len(body) > lim:
+        raise Fail("읽기 상한 도달 = 파일 절단 = 계측 무효(U-0 가드): %s (>%d자). "
+                   "READ_LIMIT_CHARS 를 올리거나 env CYS_HEALTH_READ_LIMIT 로 조정하라 — "
+                   "잘린 텍스트로 '부재'를 판정해선 안 된다." % (path, lim))
+    _READ_OBSERVED[path] = len(body)
+    return body
 
 
 def _hook(name):
@@ -6292,6 +6326,238 @@ def h_w5_c3():
              "영수증 확정 뒤에도 TTL 마다 재발화한다(엣지 disarm 무동작): %d→%d"
              % (after_ack, len(dl())))
     return "미영수증=inflight 유지 · TTL당 재시도 1 · 영수증 수신=delivered 확정 후 쿨다운 발효"
+
+
+# ── 팩 바이트 결정론 ─────────────────────────────────────────────────────
+@specimen("H-PACK-CRLF", "W6",
+          "임베드 대상 텍스트 전량 CRLF 0 · `.gitattributes` LF 봉인 · build.rs 가드 실재",
+          ["U-1", "B-14"])
+def h_pack_crlf():
+    """U-1(2026-08-23 · CRLF 봉인): `build.rs` 는 `include_str!` 로 **빌드 머신 작업 트리의 바이트를
+    그대로** 팩에 임베드한다. Git for Windows 의 설치 기본값 `core.autocrlf=true` 아래에서 Windows
+    러너 체크아웃이 CRLF 가 되면 두 가지가 동시에 깨진다 —
+      ① `cysjavis-pack/hooks/*.sh` 가 `#!/bin/bash\\r` 로 출하돼 인터프리터 해소가 실패한다(훅 전멸).
+      ② 같은 버전인데 Windows 임베드 팩과 ubuntu `pack.tar.gz` 의 바이트가 갈려 매니페스트 해시가 흔들린다.
+    이 검체는 그 상태를 즉시 적색으로 만든다 — 세 축:
+      ⓐ **바이트 사실**: build.rs 와 **같은 대상 집합**(`git ls-files cysjavis-pack` − dot/tests/
+        `__pycache__` 컴포넌트 + 레포 루트 `revoked-licenses.json`)에서 `\\r\\n` 이 0 인가.
+        ★대상 집합을 검체가 스스로 재계산한다 — build.rs 의 판정을 믿고 옮겨 적지 않는다.
+      ⓑ **봉인 실재**: 레포 루트 `.gitattributes` 가 있고 `* text=auto eol=lf` + 팩 훅/bin LF 못박음이
+        살아 있는가(파일을 지우면 적색).
+      ⓒ **빌드 게이트 실재**: `build.rs` 의 CRLF 가드(패닉 경로)가 남아 있는가(가드를 지우면 적색).
+    ⓐ 만 두면 '검체는 초록인데 다음 체크아웃이 CRLF' 가 가능하고, ⓑⓒ 만 두면 '규칙은 있는데 바이트는
+    이미 오염' 이 가능하다. 셋이 함께여야 봉인이다.
+    """
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")) and not os.path.isfile(
+            os.path.join(REPO_DIR, "build.rs")):
+        raise Skip("레포 체크아웃 아님(배포 팩 실행) — 임베드 소스 트리 부재")
+
+    # ⓐ 대상 집합 재계산 — build.rs 의 제외 규칙(dot 컴포넌트·tests·__pycache__)과 동형.
+    r = _run(["git", "ls-files", "cysjavis-pack"], cwd=REPO_DIR)
+    need(r.returncode == 0 and r.stdout.strip(),
+         "git ls-files cysjavis-pack 실패/공집합 — 대상 집합을 산출할 수 없다(측정 실패): %s"
+         % (r.stderr or "")[:200])
+    targets = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("cysjavis-pack/"):
+            continue
+        rel = line[len("cysjavis-pack/"):]
+        if any(c.startswith(".") or c in ("tests", "__pycache__") for c in rel.split("/")):
+            continue
+        targets.append(line)
+    need(len(targets) >= 250,
+         "임베드 대상 %d개 < 250 — build.rs 가드②와 같은 하한 미달(측정 이상)" % len(targets))
+    # 팩 트리 밖에서 문자열로 임베드되는 레포 루트 파일(build.rs `REVOKED_LICENSES_JSON`).
+    targets.append("revoked-licenses.json")
+
+    hits, scanned, skipped_bin = [], 0, 0
+    for rel in targets:
+        p = os.path.join(REPO_DIR, rel)
+        try:
+            with open(p, "rb") as f:
+                b = f.read()
+        except OSError:
+            continue
+        if b"\x00" in b:                     # 바이너리 제외(build.rs 가드와 동일 판정)
+            skipped_bin += 1
+            continue
+        scanned += 1
+        n = b.count(b"\r\n")
+        if n:
+            hits.append("%s(\\r\\n %d개)" % (rel, n))
+    need(not hits,
+         "임베드 대상에 CRLF 가 있다 = 그대로 출하되면 훅 shebang 사망 + 플랫폼 간 팩 해시 분기: %s"
+         % hits[:20])
+
+    # ⓑ `.gitattributes` 봉인 실재
+    ga_path = os.path.join(REPO_DIR, ".gitattributes")
+    need(os.path.isfile(ga_path),
+         ".gitattributes 부재 — 개행이 체크아웃 환경(core.autocrlf)에 좌우된다(U-1 회귀)")
+    ga = _read(ga_path)
+    ga_lines = [ln.split("#", 1)[0].strip() for ln in ga.splitlines()]
+    ga_lines = [ln for ln in ga_lines if ln]
+    def _rule(pattern, must):
+        for ln in ga_lines:
+            parts = ln.split()
+            if parts and parts[0] == pattern and all(m in parts[1:] for m in must):
+                return True
+        return False
+    need(_rule("*", ["text=auto", "eol=lf"]),
+         ".gitattributes 에 전역 `* text=auto eol=lf` 규칙이 없다 — LF 봉인 해제됨")
+    need(_rule("cysjavis-pack/hooks/**", ["text", "eol=lf"]),
+         ".gitattributes 에 `cysjavis-pack/hooks/** text eol=lf` 가 없다 — 훅 LF 명시 강제 해제됨")
+    # ★`bin/**` 은 강제 `text` 가 아니라 `text=auto` 를 요구한다(F4-a · 2026-08-23): 강제 `text` 는
+    #   확장자 pin 밖의 **새 바이너리**가 pack bin 아래 들어오면 개행 변환으로 조용히 손상시킨다.
+    #   `text=auto` 는 텍스트에만 `eol=lf` 를 적용하므로 LF 보장은 유지하면서 바이너리를 살린다.
+    need(_rule("cysjavis-pack/bin/**", ["text=auto", "eol=lf"]),
+         ".gitattributes 에 `cysjavis-pack/bin/** text=auto eol=lf` 가 없다 — 팩 bin LF 강제 해제됨")
+    # 의도적 CRLF 픽스처가 재정규화로 파괴되지 않도록 못박혀 있는가(검체가 검사할 입력의 보존).
+    need(_rule("cysjavis-pack/bin/tests/fixtures/**", ["-text"]),
+         ".gitattributes 에 `cysjavis-pack/bin/tests/fixtures/** -text` 가 없다 — "
+         "의도적 CRLF/BOM/제어문자 픽스처가 재정규화로 파괴된다")
+
+    # ⓑ' 기계 확인: git 이 실제로 그 속성을 해소하는가(문면이 아니라 도구 출력)
+    probe = ["cysjavis-pack/hooks/_lib.sh",
+             "cysjavis-pack/bin/tests/fixtures/todo-decl/11-crlf.md"]
+    ca = _run(["git", "check-attr", "text", "eol", "--"] + probe, cwd=REPO_DIR)
+    need(ca.returncode == 0, "git check-attr 실패(측정 실패): %s" % (ca.stderr or "")[:200])
+    need("cysjavis-pack/hooks/_lib.sh: eol: lf" in ca.stdout,
+         "git 이 훅에 eol=lf 를 해소하지 않는다: %s" % ca.stdout[:300])
+    need("11-crlf.md: text: unset" in ca.stdout,
+         "의도적 CRLF 픽스처가 -text 로 해소되지 않는다(재정규화 위험): %s" % ca.stdout[:300])
+
+    # ⓒ build.rs 빌드 게이트 실재
+    # ★`os.path.join` 경유로 부른다 — H-META-READ 의 대상 수확 정규식이 리터럴 호출만 잡으므로,
+    #   이 형식을 지켜야 build.rs 가 읽기-상한 자기감시 대장에 함께 오른다.
+    br = _repo_file(os.path.join("build.rs"))
+    need("CYS_ALLOW_CRLF_EMBED" in br,
+         "build.rs 에 CRLF 가드 롤백 스위치(CYS_ALLOW_CRLF_EMBED)가 없다 — 가드 소실")
+
+    # ★거짓 초록 제거(F1 · 2026-08-23) — **가드③ 블록만 잘라서** 판정한다.
+    #   구 판은 build.rs **파일 전체**에 `"crlf_hits" in br and "panic!" in br` 을 걸었다. 그런데
+    #   build.rs 에는 가드①(pack 소스 공집합)·가드②(엔트리 <250)·revoked 형태검증 등 **다른
+    #   `panic!` 이 함께 산다**. 즉 가드③의 `panic!("{msg}")` 를 `println!("cargo:warning=…")` 로
+    #   바꿔 **CRLF 차단을 완전히 무력화해도** 파일 어딘가의 다른 panic! 이 이 조건을 만족시켜
+    #   검체가 초록이었다 = 거짓 초록(계측 무효). 판정 대상은 파일이 아니라 **그 가드 블록**이다.
+    #   블록 경계는 소스에서 직접 찾는다 — 롤백 스위치 이름이 처음 등장하는 지점(가드③ 머리말)부터
+    #   `if !crlf_hits.is_empty() { … }` 의 닫는 중괄호(fn 본문 최상위 = 4칸 들여쓰기 `}`)까지.
+    g0 = br.find("CYS_ALLOW_CRLF_EMBED")
+    m_if = re.search(r"if !crlf_hits\.is_empty\(\)\s*\{", br[g0:])
+    need(m_if,
+         "build.rs 에서 CRLF 가드의 판정 분기(`if !crlf_hits.is_empty()`)를 찾지 못했다 — "
+         "가드 소실이거나 블록 경계 규약 이탈(측정 실패)")
+    tail = br[g0 + m_if.end():]
+    m_close = re.search(r"^    \}[ \t]*$", tail, re.M)
+    need(m_close,
+         "build.rs CRLF 가드 블록의 끝(최상위 4칸 들여쓰기 `}`)을 찾지 못했다 — "
+         "블록 경계를 확정할 수 없다(측정 실패)")
+    guard = br[g0:g0 + m_if.end() + m_close.end()]
+
+    # 슬라이스 안에 ①검출 ②우회 env 분기 ③패닉 — 셋이 **함께** 있어야 차단이 성립한다.
+    need('w == b"\\r\\n"' in guard,
+         "가드③ 블록에 CRLF 검출식(`w == b\"\\\\r\\\\n\"`)이 없다 — 조용한 CRLF 출하가 다시 가능하다")
+    need("crlf_allowed" in guard and "CRLF_ALLOW_ENV" in guard,
+         "가드③ 블록에 우회 env 분기(`crlf_allowed`/`CRLF_ALLOW_ENV`)가 없다 — "
+         "롤백 스위치가 가드와 분리됐다(가드 밖 우회 가능)")
+    need("panic!" in guard,
+         "가드③ 블록 안에 `panic!` 이 없다 = CRLF 를 검출하고도 빌드가 죽지 않는다. "
+         "(파일 다른 곳의 panic! 은 근거가 되지 못한다 — 그것이 구 판의 거짓 초록이었다.)")
+
+    return ("임베드 대상 %d개 스캔(바이너리 %d 제외) · CRLF 0 · .gitattributes 4규칙 실재 · "
+            "check-attr 해소 확인 · build.rs 가드③ 블록(%d자) 안에 검출·우회분기·panic 3축 실재"
+            % (scanned, skipped_bin, len(guard)))
+
+
+# ── 메타(계측기 자기감시) ────────────────────────────────────────────────
+# ★등록 위치가 곧 실행 순서다 — 이 검체는 **맨 마지막**에 두어, 앞선 모든 검체가 실제로 읽은
+#   경로 관측(`_READ_OBSERVED`)까지 함께 본다. 단독 실행(`--only H-META-READ`) 에서도
+#   정적 대상 목록만으로 자립 판정한다.
+@specimen("H-META-READ", "W6",
+          "계측기 자기감시 — `_read` 조용한 절단 불가(가드 실재) · `_repo_file` 대상 전량 상한 미만",
+          ["U-0"])
+def h_meta_read():
+    """U-0(2026-08-23): `_read(path, limit=400000)` 의 조용한 절단이 22종 검체를 눈멀게 했다.
+    잘린 텍스트에 `in`/`find()` 를 걸어 '없다'고 단언하면, **결함이 아니라 계측기가** 적색을
+    만든다(H-CONC-4 거짓 적색 · 앵커는 handlers.rs:9852 에 실재). 이 검체는 그 상태로
+    되돌아가는 것을 즉시 적색으로 만든다 — 세 축으로 본다:
+      ⓐ `_read` 의 절단 실패 가드가 코드에 실재하는가(가드를 지우면 적색).
+      ⓑ `_repo_file` 이 읽는 **모든** 레포 파일의 실제 문자 수가 상한 미만인가(파일이 자라
+         상한에 접근하면 적색 — 여유 4배를 요구한다).
+      ⓒ `_repo_file` 대상 목록이 러너 소스와 동기화돼 있는가(새 동적 호출이 생기면 적색).
+    """
+    import inspect
+    notes = []
+    # ⓐ 가드 실재 — '상한+1 읽기 → 초과면 Fail' 형태를 유지하는가
+    rsrc = inspect.getsource(_read)
+    need("lim + 1" in rsrc,
+         "_read 가 '상한+1' 을 읽지 않는다 — 상한 도달을 관측할 수 없다(조용한 절단 부활)")
+    need("len(body) > lim" in rsrc and "raise Fail" in rsrc,
+         "_read 에 절단 실패 가드가 없다 — 조용한 절단이 다시 가능하다(U-0 회귀)")
+    need("f.read(lim + 1)" in rsrc, "_read 가 상한+1 을 read() 인자로 쓰지 않는다(가드 우회)")
+    notes.append("_read 절단=Fail 가드 실재")
+
+    # ⓒ 대상 목록 동기화 — 러너 소스에서 `_repo_file` 호출을 직접 수확한다
+    runner = _read(os.path.abspath(__file__))
+    lits = re.findall(r"_repo_file\(os\.path\.join\(([^)]*)\)\)", runner)
+    need(lits, "_repo_file 리터럴 호출을 하나도 수확하지 못했다(수확 정규식 파손)")
+    targets = set()
+    for arg in lits:
+        parts = re.findall(r'"([^"]*)"', arg)
+        need(parts, "_repo_file 인자 파싱 실패: %s" % arg)
+        targets.add(os.path.join(*parts))
+    # 변수 경유 호출(`_repo_file(rel)` 등)은 정규식이 못 잡는다 → 알려진 인자 이름만 허용하고,
+    # 그 대상 경로를 명시 편입한다. 새 변수 이름이 등장하면 여기서 적색이 난다.
+    dyn = set(re.findall(r"_repo_file\((?!os\.path\.join)([A-Za-z_][A-Za-z_0-9]*)\)", runner))
+    unknown = sorted(dyn - {"rel", "tmpl_rel"})
+    need(not unknown,
+         "미지의 _repo_file 동적 인자 %s — H-META-READ 대상 목록이 낡았다(목록 갱신 필요)" % unknown)
+    targets |= set(_CLAUDE_MD_COPIES)                       # `for rel in _CLAUDE_MD_COPIES`
+    targets.add(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))   # rel
+    targets.add(os.path.join("cysjavis-pack", "directives", "CEO_TEMPLATE.md"))       # tmpl_rel
+    notes.append("대상 %d경로 수확(리터럴 %d·변수 %d)" % (len(targets), len(lits), len(dyn)))
+
+    # ⓑ 실제 크기 < 상한 (그리고 여유 4배)
+    sizes = {}
+    for rel in sorted(targets):
+        p = os.path.join(REPO_DIR, rel)
+        if not os.path.isfile(p):
+            continue                    # 배포 팩 실행 — 해당 검체들은 _repo_file 이 Skip 한다
+        with open(p, encoding="utf-8", errors="replace") as f:
+            sizes[rel] = len(f.read())
+    if not sizes:
+        raise Skip("레포 파일 부재(배포 팩 실행) — 대상 0건")
+    over = ["%s=%d자" % (r, n) for r, n in sorted(sizes.items()) if n >= READ_LIMIT_CHARS]
+    need(not over,
+         "_repo_file 대상이 읽기 상한(%d자)에 도달한다 = 조용한 절단 재발: %s"
+         % (READ_LIMIT_CHARS, over))
+    big_rel, big_n = max(sizes.items(), key=lambda kv: kv[1])
+    margin = READ_LIMIT_CHARS / float(big_n) if big_n else float("inf")
+    notes.append("최대 %s=%d자 · 상한 %d자(여유 %.1f배)"
+                 % (big_rel, big_n, READ_LIMIT_CHARS, margin))
+    # ★판정 축 재분류(F2 · 2026-08-23) — **이것은 완화가 아니다.**
+    #   구 판은 `need(READ_LIMIT_CHARS >= big_n * 4)` 로 여유배수 미달을 hard fail 로 삼았다.
+    #   그러나 여유가 4배 미만이어도 그 시점의 측정은 **완벽히 유효하다**(절단 0 — 바로 위
+    #   `over` 판정이 그것을 단언한다). 즉 구 판은 **파일이 자랐다는 사실만으로** 게이트를
+    #   적색으로 만든다 = "결함이 아니라 계측기가 적색을 만든다" 이고, 이는 U-0 가 제거하려던
+    #   실패 유형과 정확히 같은 계열이다(H-CONC-4 거짓 적색).
+    #   ∴ hard fail 은 **실제 상한 도달(= 절단 = 계측 무효)** 에만 남기고, 여유 감소는
+    #   **조기경보**로 내려 notes 에 기재한다. 절단은 fail, 여유는 경보 — 축이 다르다.
+    if margin < 4.0:
+        notes.append("⚠여유 %.1f배 — 상한 상향 검토(READ_LIMIT_CHARS/CYS_HEALTH_READ_LIMIT)"
+                     % margin)
+
+    # ⓓ 관측 원장 — 앞선 검체들이 실제로 읽은 경로 중 최대(단독 실행이면 이 검체 자신뿐)
+    if _READ_OBSERVED:
+        op, on = max(_READ_OBSERVED.items(), key=lambda kv: kv[1])
+        notes.append("관측 최대 %d자(%s · %d경로)"
+                     % (on, os.path.basename(op), len(_READ_OBSERVED)))
+
+    # 계측 타당성(구 상한 대조): 구 값 400,000자에서 몇 개가 잘렸는지 명시한다 —
+    # 이 수가 0이 아니라는 것이 곧 "U-0 는 실재했다"의 기계 증거다.
+    cut_old = ["%s(%d자)" % (r, n) for r, n in sorted(sizes.items()) if n >= 400000]
+    notes.append("계측대조 구상한400000 절단대상 %d건: %s" % (len(cut_old), ", ".join(cut_old) or "없음"))
+    return " · ".join(notes)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
