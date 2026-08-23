@@ -270,6 +270,136 @@ class StatusTimeoutLeafWiring(unittest.TestCase):
         self.assertIn("배선 완료", doc, "배선 완료 사실이 문서에 갱신되지 않음")
 
 
+class GatePendingFourthGrade(unittest.TestCase):
+    """★(U-10) 좌석 **제4 등급** `gate_pending` — python 행동 배터리(4상 표).
+
+    무엇을 봉인하는가:
+      ⓐ 살아 있는 관문 좌석이 `alive_presumed` 로 접혀 '이미 가동 중'이 되지 않는다.
+      ⓑ `null`·키 부재·비 dict 는 **무신호**로 접혀 종전 판정 그대로다(구 데몬 혼재 안전).
+      ⓒ ★★충족이 아니라고 해서 **죽은 것이 아니다** — 파괴 게이트(`node_alive` → reclaim
+        kill)는 이 등급을 반드시 **생존측**으로 읽는다. 이 축이 뒤집히면 첫기동 관문에 갇힌
+        신규 프로필의 4종 노드가 전부 kill 대상이 되어 **전 pane 사망(글자 0)** 이다.
+      ⓓ 래치 단방향 계약은 **무접촉**이다(금지 방향 ⑦).
+      ⓔ 롤백 킬스위치(`CYS_GATE_PENDING=0`) 1지점으로 축 전체가 종전 판정으로 복귀한다.
+    """
+    maxDiff = None
+
+    @staticmethod
+    def gated(**over):
+        row = {"role": "cso", "exited": False, "agent_alive": True, "seat": "occupied",
+               "gate_pending": {"gate": "disclaimer", "since": 1.0}}
+        row.update(over)
+        return fx([row])
+
+    def test_case_gate_all_gated_seat_is_its_own_grade(self):
+        grade, why = BN.node_liveness(self.gated(), "cso")
+        self.assertEqual(grade, BN.LIVENESS_GATED,
+                         "관문 보류 좌석이 제4 등급을 받지 못함(허위 already_alive 경로): %s" % why)
+
+    def test_case_gate_a_null_or_missing_is_no_signal(self):
+        # 구 데몬(키 부재) + 신 팩 혼재: 종전 등급 그대로여야 한다(부재 ≠ 부정).
+        self.assertEqual(BN.node_liveness(self.gated(gate_pending=None), "cso")[0],
+                         BN.LIVENESS_PRESUMED, "null 이 종전 등급을 바꿨다(항 생략 규약 위반)")
+        row = {"role": "cso", "exited": False, "agent_alive": True, "seat": "occupied"}
+        self.assertEqual(BN.node_liveness(fx([row]), "cso")[0], BN.LIVENESS_PRESUMED,
+                         "키 부재(구 데몬)에서 종전 등급이 변형됐다(혼재 안전 붕괴)")
+
+    def test_case_gate_b_non_dict_folds_to_prior_grade(self):
+        # 스큐·손상 값을 'gated' 로 접으면 판정불가가 미충족을 만들어 부트 재시도 라이브락(A1)이 된다.
+        for bad in (True, "gated", 1, [], 0.5):
+            self.assertEqual(BN.node_liveness(self.gated(gate_pending=bad), "cso")[0],
+                             BN.LIVENESS_PRESUMED,
+                             "손상 gate_pending(%r)이 등급을 움직였다(fail-open 방향 위반)" % (bad,))
+
+    def test_case_gate_c_destruction_gate_reads_it_as_alive(self):
+        # ★치명 앵커 ④ — 이 검체가 적색이면 절대 출하하지 않는다.
+        st = self.gated()
+        self.assertTrue(BN.node_alive(st, "cso"),
+                        "관문 보류 좌석을 죽음으로 판정(오살 — 전 pane 사망 경로 신설)")
+        self.assertEqual(BN._reclaim_verdict(st, "cso", 100, 100), "hold-alive",
+                         "관문 보류 좌석에 kill 허용(파괴 경로 보류 우선 위반)")
+        # 래치 부정 3중 AND(파괴 경로)는 이 등급을 보지 않는다 — 무접촉 계약.
+        dead, _ = BN.latch_death_confirmed(self.gated()["surfaces"][0])
+        self.assertFalse(dead, "살아 있는 관문 좌석이 죽음 3중 확정으로 읽힘")
+
+    def test_case_gate_d_latch_contract_untouched(self):
+        self.assertEqual(BN.node_liveness(self.gated(awakened_at=1_700_000_000.0), "cso")[0],
+                         BN.LIVENESS_AWAKE,
+                         "래치 단방향 계약이 관문 신호로 뒤집혔다(금지 방향 ⑦ 위반)")
+
+    def test_case_gate_e_kill_switch_reverts_axis(self):
+        prev = os.environ.get(BN.GATE_PENDING_ENV)
+        try:
+            os.environ[BN.GATE_PENDING_ENV] = "0"
+            self.assertFalse(BN.gate_pending_axis_enabled(), "'0' 이 축을 끄지 못한다")
+            self.assertEqual(BN.node_liveness(self.gated(), "cso")[0], BN.LIVENESS_PRESUMED,
+                             "킬스위치 off 인데 제4 등급이 살아 있다(롤백 1지점 계약 붕괴)")
+            for loose in ("", "false", "off", "1"):
+                os.environ[BN.GATE_PENDING_ENV] = loose
+                self.assertTrue(BN.gate_pending_axis_enabled(),
+                                "느슨한 값 %r 이 축을 껐다(오타로 안전장치 소실)" % loose)
+        finally:
+            if prev is None:
+                os.environ.pop(BN.GATE_PENDING_ENV, None)
+            else:
+                os.environ[BN.GATE_PENDING_ENV] = prev
+
+
+@unittest.skipUnless(os.path.isfile(CYS_RS),
+                     "레포 소스 부재(배포 팩 단독) — Rust 파리티 핀은 체크아웃에서만")
+class GatePendingRustParityPins(unittest.TestCase):
+    """★(U-10) 제4 등급의 python ↔ Rust **짝 소실 검출**.
+
+    행동 실행은 각 언어의 배터리가 한다(python=위 클래스 · Rust=cys.rs
+    `mod seat_latch_negation_tests` 의 `gate_case_*` 4종, `cargo test --bin cys gate_case`).
+    여기 핀은 한쪽만 고치고 다른 쪽을 잊는 사본 드리프트를 기계로 잡는다."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(CYS_RS, encoding="utf-8") as f:
+            cls.src = f.read()
+        i = cls.src.find("fn seat_liveness(")
+        cls.liveness_body = cls.src[i:cls.src.find("\n}\n", i)] if i >= 0 else ""
+
+    def test_rust_has_the_fourth_grade(self):
+        self.assertIn("GatePending", self.src, "Rust 측 제4 등급 변형 부재(파리티 붕괴)")
+        self.assertIn("gate_pending_from_wire", self.liveness_body,
+                      "Rust seat_liveness 가 관문 축을 읽지 않는다(python 만 제4 등급)")
+
+    def test_rust_gate_branch_precedes_agent_alive(self):
+        """★순서가 계약이다 — 관문 분기가 `agent_alive` 분기보다 **앞**이어야 한다.
+        뒤에 있으면 관문 좌석도 프로세스는 살아 있으므로 그 분기가 영원히 도달 불가(죽은 코드)
+        이고 보류 좌석이 다시 AlivePresumed → already_alive 로 접힌다. python 도 같은 순서다."""
+        gi = self.liveness_body.find("gate_pending_from_wire")
+        ai = self.liveness_body.find('s["agent_alive"].as_bool()')
+        self.assertTrue(gi >= 0 and ai >= 0, "Rust 순서 판정 재료를 못 찾았다")
+        self.assertLess(gi, ai, "Rust 관문 분기가 agent_alive 분기보다 뒤다(제4 등급 도달 불가)")
+        # python 미러도 같은 순서인가 — 소스 오프셋으로 잰다(양쪽 같은 규약).
+        bn_src = open(os.path.join(BIN_DIR, "javis_boot_node.py"), encoding="utf-8").read()
+        li = bn_src.find("def node_liveness(")
+        body = bn_src[li:bn_src.find("\ndef ", li + 10)]
+        self.assertLess(body.find("gate_pending_info(s)"), body.find('s.get("agent_alive")'),
+                        "python 관문 분기가 agent_alive 분기보다 뒤다(제4 등급 도달 불가)")
+
+    def test_rust_battery_exists_with_same_case_table(self):
+        for fn in ("gate_case_all_gated_seat_is_not_already_alive",
+                   "gate_case_a_null_or_missing_is_no_signal_not_negation",
+                   "gate_case_b_non_object_folds_to_prior_grade",
+                   "gate_case_c_destruction_path_is_frozen"):
+            self.assertIn(fn, self.src, "Rust 배터리에 4상 표 케이스 %s 부재(짝 소실)" % fn)
+
+    def test_wire_key_and_env_name_parity(self):
+        """키·env 이름이 언어 간에 갈리면 축이 조용히 사라진다(한쪽은 쓰고 한쪽은 못 읽는다)."""
+        self.assertIn('pub const GATE_PENDING_KEY: &str = "gate_pending";',
+                      open(os.path.join(REPO_DIR, "src", "lib.rs"), encoding="utf-8").read(),
+                      "Rust wire 키 상수가 python 미러(GATE_PENDING_KEY)와 다르다")
+        self.assertEqual(BN.GATE_PENDING_KEY, "gate_pending")
+        self.assertEqual(BN.GATE_PENDING_ENV, "CYS_GATE_PENDING")
+        self.assertIn('pub const ENV_GATE_PENDING: &str = "CYS_GATE_PENDING";',
+                      open(os.path.join(REPO_DIR, "src", "lib.rs"), encoding="utf-8").read(),
+                      "Rust 킬스위치 env 이름이 python 미러와 다르다(한쪽만 롤백되는 사고)")
+
+
 @unittest.skipUnless(os.path.isfile(CYS_RS),
                      "레포 소스 부재(배포 팩 단독) — Rust 파리티 핀은 체크아웃에서만")
 class RustParityPins(unittest.TestCase):

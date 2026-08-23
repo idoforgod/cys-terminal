@@ -20,6 +20,11 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut last_dup_alert: HashMap<String, f64> = HashMap::new();
         let mut last_proc_alert: HashMap<u64, f64> = HashMap::new();
         let mut restart_counts: HashMap<u64, u32> = HashMap::new();
+        // ★P3-6 좌석별 '엄격 관측 증명' 래치 (sid → (증명된 bin_base, 연속 엄격 관측 틱)).
+        // watchdog 태스크 로컬 = 단일 writer. 아래 누수 차단 블록이 살아있는 surface 로 솎는다.
+        // 데몬 재시작 후에는 비어 있고, 에이전트가 살아 있으면 몇 틱 안에 다시 증명된다
+        // (미증명 구간의 거동 = 종전과 동일이므로 재시작이 회귀를 만들지 않는다).
+        let mut agent_strict_proof: HashMap<u64, Option<(String, u32)>> = HashMap::new();
         let mut feed_reminded: HashMap<String, f64> = HashMap::new();
         let mut approval_debounce: HashMap<(u64, String), f64> = HashMap::new();
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
@@ -35,6 +40,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
         let mut launch_flag_warned: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
+        // ★P3-4 좌석별 (연속 관측실패 틱 수, 마지막 진단 발행 시각) — watchdog 태스크 로컬
+        // (단일 writer). 아래 누수 차단 블록이 살아있는 surface 집합으로 솎는다.
+        let mut launch_flag_blind: HashMap<u64, (u32, f64)> = HashMap::new();
         let mut feed_backlog_alerted: bool = false;
         let mut approval_stall_fired: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -63,7 +71,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 reap_orphan_ledger(&daemon, &sys);
                 reap_exited_surfaces(&daemon);
                 reap_zombie_surfaces(&daemon, &sys, &mut zombie_miss);
-                check_agent_death(&daemon, &sys, &mut restart_counts);
+                check_agent_death(&daemon, &sys, &mut restart_counts, &mut agent_strict_proof);
                 check_surface_crash(&daemon);
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_feed_backlog(&daemon, &mut feed_backlog_alerted);
@@ -73,7 +81,12 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
                     check_approvals(&daemon, &mut approval_debounce);
-                    check_launch_flags(&daemon, &sys, &mut launch_flag_warned);
+                    check_launch_flags(
+                        &daemon,
+                        &sys,
+                        &mut launch_flag_warned,
+                        &mut launch_flag_blind,
+                    );
                 }
                 // T7 E6 경보(30초): rate·주간예산·반복실패 — analytics SQL 동반이라 저빈도
                 if tick_no.is_multiple_of(6) {
@@ -97,7 +110,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 queue_starve_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
                 zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
+                agent_strict_proof.retain(|sid, _| live_surface_ids.contains(sid));
                 launch_flag_warned.retain(|sid| live_surface_ids.contains(sid));
+                launch_flag_blind.retain(|sid, _| live_surface_ids.contains(sid));
                 // role 데드맨 트래커도 현재 감시 role 집합으로 솎는다(24/365 누수 차단 관례).
                 deadman.retain_roles(&deadman_watched_roles());
             });
@@ -284,6 +299,113 @@ fn poison_surface_ledger(daemon: &Arc<Daemon>, surface_id: u64) {
     }
 }
 
+/// 【P3-6】 좌석 자손 관측 → **생존 증거의 등급**(순수). 판정이 아니라 *증거 등급*이다 —
+/// 등급을 생존/사망으로 접는 것은 `agent_alive_from_liveness` 의 몫이다(관측과 정책의 분리).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentLiveness {
+    /// ① **엄격 증거** — 실행 증거(토큰 basename 일치·`.js` 번들·패키지 세그먼트 위의 `.js`).
+    ///    `cmdline_matches_agent_exec` 가 인정하는 등급이며, 이것이 곧 '이 좌석의 에이전트를
+    ///    엄격 매처로 볼 수 있다'는 증명 재료다.
+    AliveStrict,
+    /// ② **광의 증거만** — 생존 매처(`cmdline_matches_agent`)에만 걸린다. 실제로는 경로
+    ///    세그먼트(`…/claude/…`) 하나로 잡힌 **비에이전트 자손**일 수 있다
+    ///    (`tail -f ~/.cys/claude/x.log` · `less ~/dev/claude/NOTES.md` · `grep -r … claude-code/`).
+    AliveBroadOnly,
+    /// ③ 어떤 매치도 없다 — 종전대로 사망 상태머신으로 넘어간다.
+    NoEvidence,
+}
+
+impl AgentLiveness {
+    /// 이벤트 payload 에 싣는 증거 등급 표기(사후 감사가 '왜 죽었다고 했나'를 읽는다).
+    fn as_str(self) -> &'static str {
+        match self {
+            AgentLiveness::AliveStrict => "strict",
+            AgentLiveness::AliveBroadOnly => "broad_only",
+            AgentLiveness::NoEvidence => "none",
+        }
+    }
+}
+
+/// 좌석 자손 cmdline 목록에서 생존 증거 등급을 뽑는다(순수 · ∃ 의미라 **순서 무관**).
+/// strict ⊆ broad 이므로 등급은 전순서다: 엄격 매치가 하나라도 있으면 `AliveStrict`.
+pub fn decide_agent_liveness(cmdlines: &[String], bin_base: &str) -> AgentLiveness {
+    if cmdlines
+        .iter()
+        .any(|c| cmdline_matches_agent_exec(c, bin_base))
+    {
+        return AgentLiveness::AliveStrict;
+    }
+    if cmdlines.iter().any(|c| cmdline_matches_agent(c, bin_base)) {
+        return AgentLiveness::AliveBroadOnly;
+    }
+    AgentLiveness::NoEvidence
+}
+
+/// 【P3-6】 이 좌석이 '엄격 매처로 자기 에이전트를 볼 수 있다'는 것이 **이미 증명**되었는가를
+/// 갱신하고 반환한다(순수 · 상태는 호출자 = watchdog 태스크 로컬이 소유).
+///
+/// 【왜 증명을 요구하는가 — 오살 0칸 논증】 P3-6 수리의 핵심은 "광의 증거만 있는 좌석을
+/// 사망으로 판정할 수 있는가"이고, 무조건 그렇게 하면 *광의로만 보이는 형태로 뜨는 에이전트*
+/// 를 오살한다. 그래서 **그 좌석에서 엄격 매처가 실제로 그 에이전트를 본 적이 있을 때만**
+/// 좁힌다. 증명된 좌석이라면 "에이전트가 살아 있다 ⇒ 엄격 매치가 있다"가 관측으로 성립하므로,
+/// 엄격 매치가 사라졌는데 광의 매치만 남은 상태는 **그 광의 매치가 에이전트가 아니라는 뜻**
+/// 이다. 미증명 좌석에서는 좁히지 않고 종전 거동(광의=생존)을 그대로 둔다 — 이 설계는
+/// 자기보호적이다: 좁힘은 자기가 안전함을 스스로 입증한 좌석에서만 켜진다.
+///
+/// 【히스테리시스】 증명은 **연속 `arm_ticks` 틱**의 엄격 관측을 요구한다. 한 틱만 스치는
+/// 엄격 매치(사용자가 손으로 돌린 `node …/claude-code/cli.js --version` 같은 도우미)로
+/// 증명이 서는 것을 막는다. 한 번 선 증명은 내리지 않는다 — 에이전트가 죽어 엄격 증거가
+/// 사라지는 것이 정확히 우리가 잡으려는 상태이기 때문이다.
+/// `arm_ticks == 0` 은 **좁힘 전면 비활성**(킬스위치 — 종전 거동 복귀).
+/// bin_base 가 바뀌면(좌석의 에이전트 교체) 증명은 처음부터 다시 쌓는다.
+pub fn update_strict_proof(
+    proof: &mut Option<(String, u32)>,
+    bin_base: &str,
+    strict_now: bool,
+    arm_ticks: u32,
+) -> bool {
+    if arm_ticks == 0 {
+        return false;
+    }
+    match proof {
+        Some((seen_bin, streak)) if seen_bin == bin_base => {
+            if strict_now {
+                *streak = streak.saturating_add(1);
+            } else if *streak < arm_ticks {
+                *streak = 0; // 아직 증명 전 — 연속이 끊기면 처음부터
+            }
+        }
+        _ => *proof = Some((bin_base.to_string(), u32::from(strict_now))),
+    }
+    proof
+        .as_ref()
+        .is_some_and(|(seen_bin, streak)| seen_bin == bin_base && *streak >= arm_ticks)
+}
+
+/// 【P3-6】 증거 등급 + 증명 여부 → 생존 판정(순수).
+///
+/// 【고친 결함】 U-5 의 argv 승격은 `cmdline_matches_agent` 의 관측 대상을 `name()` 한 토큰에서
+/// **명령줄 전체**로 넓혔다. 라운드 1 은 같은 넓힘의 *다른 소비자*(readiness 안전 밸브 —
+/// `refresh_seat_cache` 의 `seat_agent_cache`)만 보고 거기에만 엄격 매처 AND 를 걸었고,
+/// **사망감지의 `alive` 에는 보정이 없었다**. 그래서 에이전트가 죽은 뒤에도 자손 중 아무거나
+/// argv 에 `…/claude/…` 경로 세그먼트를 가진 채 살아 있으면(`tail -f ~/.cys/claude/x.log`,
+/// 백그라운드 툴 자식) `alive=true` → `agent.exited` 미발행 → node-recover 미발동 →
+/// **고아 좌석**. 개정 전에는 관측이 `name()` 한 토큰(경로 구분자가 없다)이라 세그먼트 매칭이
+/// 원리상 발화할 수 없었다 — 승격이 만든 **새 오탐 축**이다.
+///
+/// 【판정표】
+///   AliveStrict                → 생존 (종전과 동일 · strict ⊆ broad 라 새 오살 경로 없음)
+///   AliveBroadOnly ∧ 미증명    → 생존 (종전 거동 보존 — 좁히지 않는다)
+///   AliveBroadOnly ∧ 증명됨    → **사망 후보** (새 오탐 축을 여기서만 닫는다)
+///   NoEvidence                 → 사망 후보 (종전과 동일)
+pub fn agent_alive_from_liveness(liveness: AgentLiveness, strict_proven: bool) -> bool {
+    match liveness {
+        AgentLiveness::AliveStrict => true,
+        AgentLiveness::AliveBroadOnly => !strict_proven,
+        AgentLiveness::NoEvidence => false,
+    }
+}
+
 /// T2-5 에이전트 사망 감지: 셸은 살았는데 그 위의 에이전트 프로세스만 죽은 상태를
 /// 즉시 잡는다 (기존엔 pane.idle 300초가 최초 신호 — '생각 중'과 구분 불가).
 /// 판정: 자식 트리에서 agents.json 등록 바이너리가 '한 번 보였다가 사라짐' 전이.
@@ -291,7 +413,11 @@ fn check_agent_death(
     daemon: &Arc<Daemon>,
     sys: &System,
     restart_counts: &mut HashMap<u64, u32>,
+    strict_proof: &mut HashMap<u64, Option<(String, u32)>>,
 ) {
+    // ★P3-6 좁힘 무장 임계(연속 틱). 0 = 좁힘 비활성(종전 거동). 기본 2 — watchdog 5초 주기라
+    // 10초 연속 엄격 관측이면 증명이 선다(스치는 도우미 프로세스는 통과하지 못한다).
+    let strict_arm_ticks = env_u64("CYS_AGENT_STRICT_PROOF_TICKS", 2) as u32;
     let auto_restart = std::env::var("CYS_AGENT_AUTORESTART")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -375,10 +501,23 @@ fn check_agent_death(
         // ★argv 승격(U-5): 생존 매칭은 cmdline 토큰 단위이므로 이름 폴백으로는 래퍼 기동
         // (`node.exe <…>/claude`)을 오사망으로 읽는다 → 허위 agent.exited → node-recover 재기동
         // 스폰(자원 관점에서 비용이 가장 비싼 오판). 승격 범위는 이 좌석의 자손 pid 만.
-        let descendants = collect_descendants_with_cmd(sys, s.pid);
-        let alive = descendants
-            .iter()
-            .any(|(_, cmdline)| cmdline_matches_agent(cmdline, &bin_base));
+        // ★P3-6: 생존 판정은 **증거 등급 + 좌석별 증명**의 두 단계다(근거 전문은
+        // `agent_alive_from_liveness` 주석). 광의 매치 하나로 생존을 선언하던 종전 한 줄은
+        // U-5 argv 승격 뒤 `tail -f ~/.cys/claude/x.log` 같은 비에이전트 자손을 생존 증거로
+        // 승격시켜 고아 좌석을 만들었다. 좁힘은 '엄격 매처가 이 좌석의 에이전트를 본 적 있다'가
+        // 증명된 좌석에서만 켜지므로 오살 경로를 새로 열지 않는다.
+        let cmdlines: Vec<String> = collect_descendants_with_cmd(sys, s.pid)
+            .into_iter()
+            .map(|(_, cmdline)| cmdline)
+            .collect();
+        let liveness = decide_agent_liveness(&cmdlines, &bin_base);
+        let strict_proven = update_strict_proof(
+            strict_proof.entry(s.id).or_default(),
+            &bin_base,
+            liveness == AgentLiveness::AliveStrict,
+            strict_arm_ticks,
+        );
+        let alive = agent_alive_from_liveness(liveness, strict_proven);
         if alive {
             s.agent_seen.store(true, Ordering::Relaxed);
             if s.agent_exit_notified.swap(false, Ordering::Relaxed) {
@@ -405,6 +544,10 @@ fn check_agent_death(
             Some(s.id),
             json!({"agent": agent, "role": role, "surface_ref": cys::surface_ref(s.id),
                    "severity": crate::severity::Severity::Recoverable.as_str(),
+                   // ★P3-6 사후 감사용 증거 등급 — "왜 죽었다고 판정했나"를 이벤트가 답한다.
+                   // broad_only = 광의 매치는 있었으나 증명된 좌석이라 에이전트로 인정하지 않음.
+                   "evidence": liveness.as_str(),
+                   "strict_proven": strict_proven,
                    "restart_count": restart_counts.get(&s.id).copied().unwrap_or(0)}),
         );
         if !auto_restart {
@@ -450,6 +593,7 @@ fn check_agent_death(
         let attempts = *count;
         tokio::spawn(async move {
             use crate::state::HideConsole;
+            use cys::SpawnPolicy as _;
             let cli = crate::state::sibling_cli_path();
             let _ = tokio::time::timeout(
                 Duration::from_secs(180),
@@ -457,6 +601,16 @@ fn check_agent_death(
                     .arg("node-recover")
                     .arg("--surface")
                     .arg(cys::surface_ref(sid))
+                    // ★P3-2(봉인 구멍) 데몬이 낳는 CLI 는 **전부** autostart 를 봉인한다.
+                    // 근거는 U-7 이 `schedule.rs::launch_via_cli` 에 같은 호출을 넣은 것과
+                    // 동일하다: 이 자식 cys 가 소켓 연결에 실패하면 `spawn_detached_daemon`
+                    // 으로 **라이벌 데몬을 낳는다**(데몬 종료 중·소켓 교체 중에 정확히 그 창이
+                    // 열린다). 자기 데몬이 자기 경쟁자를 스폰하는 재귀 기동은 폭주 경로다.
+                    // main.rs 의 office-bridge·auto-restore·phoenix self-test 는 셋 다 이미
+                    // 걸어 두었고, 트리에서 빠진 마지막 한 곳이 여기였다.
+                    // (등급은 `Attached` 의미 — 아래 `.output()` 으로 끝까지 기다리는 유계
+                    //  자식이라 분리하지 않는다. hide_console 은 종전 그대로.)
+                    .no_autostart()
                     .hide_console()
                     .output(),
             )
@@ -1474,7 +1628,8 @@ fn check_feed_backlog(daemon: &Arc<Daemon>, alerted: &mut bool) {
 }
 
 /// `check_launch_flags` 의 **3상 판정** — 순수 함수(관측 결과 → 행동).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (`Hash` 는 검체가 순열별 판정을 집합으로 접어 **순서 불변성**을 단언하기 위한 것 — P3-1.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaunchFlagAction {
     /// ① 관측 성공 ∧ 플래그 있음 — 정규 복귀. 1회 래치를 **재무장**한다.
     Rearm,
@@ -1502,25 +1657,121 @@ pub enum LaunchFlagAction {
 /// 【매칭 선택 규약】 자손 중 매처에 걸리는 것이 여럿일 수 있다. **argv 관측된 매치를 우선**
 /// 채택하고, 그런 매치가 하나도 없을 때만 폴백 매치 유무를 본다 — 한 자손의 argv 조회 실패가
 /// 다른 자손의 성공 관측을 덮지 않게 하기 위함이다.
+///
+/// 【고친 결함 P3-1(치명·폭주 채널 2호)】 그 규약을 구현이 지키지 않았다. 종전 코드는
+/// `.find(|(_, c, src)| src == Argv && matches(c))` — 조건에 걸리는 **첫 하나**로 Rearm/Warn 이
+/// 갈렸다. 그 "첫"의 순서는 `descendant_pids` 의 children 인덱스에서 나오고, 그 인덱스는
+/// `sys.processes()` **HashMap 순회**로 채워진다 — 매 refresh 의 삽입·삭제로 순서가 바뀔 수
+/// 있는, **우리가 통제하지 못하는 입력**이다. 한편 매처는 오살 방지를 위해 의도적으로 넓어
+/// (토큰 basename + 경로 세그먼트) 좌석 자손에 매치가 **여럿** 생긴다:
+///   Windows `powershell → cmd.exe(…\claude-2.cmd) → claude-2.exe` — 래퍼와 실물이 둘 다 매치
+///   Unix    에이전트가 부른 `less ~/dev/claude/NOTES.md`·`which claude` 가 실물과 함께 매치
+/// 두 프로세스의 argv 조회는 각각 독립적으로 성공/실패하므로 목록의 순서·가독성이 틱마다
+/// 갈아탄다: 래퍼 먼저·무플래그 → Warn(발행) → 실물 먼저·플래그 → Rearm(래치 해제) → 다시
+/// Warn(**재발행**) = 좌석당 15~30초마다 영구 발행. P1-2 가 막은 축(한 프로세스의 가독성
+/// 진동)과 **다른 축**(여러 프로세스 사이의 순서)이라 P1-2 수리로는 닫히지 않았다.
+///
+/// 【수리의 축】 판정을 **∃ 의미(순서 무관)** 로 바꾼다 — 아래 세 줄이 곧 계약이다.
+/// 우선순위는 `Rearm > Warn > Skip`: 플래그를 **가진** argv 매치가 하나라도 있으면 그 좌석은
+/// 정규로 떠 있는 것이고(래퍼가 플래그를 재조립해 잃었는지는 좌석의 정규성과 무관하다),
+/// 부정 판정(Warn=발행)은 **argv 로 읽은 매치가 전부 무플래그일 때만** 낸다.
+/// 발행 방향으로 기우는 판정은 이 자리에서 곧 폭주이므로, 모호성은 침묵 쪽으로 접는다
+/// (경고는 강제력 없는 조언이고 폭주는 재난이다 — 비용이 대칭이 아니다).
 pub fn decide_launch_flag_action(
     descendants: &[(u32, String, CmdSource)],
     bin_base: &str,
 ) -> LaunchFlagAction {
-    let matches_agent = |c: &String| cmdline_matches_agent(c, bin_base);
-    // ①② argv 로 실제 관측된 매치가 있으면 그것만이 판정 근거다.
-    if let Some((_, cmdline, _)) = descendants
-        .iter()
-        .find(|(_, c, src)| *src == CmdSource::Argv && matches_agent(c))
-    {
-        return if cmdline.contains("--dangerously-skip-permissions") {
-            LaunchFlagAction::Rearm
-        } else {
-            LaunchFlagAction::Warn
-        };
+    // argv 로 **실제 관측된** 매치만이 판정 근거다(폴백 문자열의 "플래그 없음"은 부정이
+    // 아니라 미관측 — P1-2). 아래 두 술어는 모두 ∃ 이라 목록 순서에 의존하지 않는다.
+    let mut saw_argv_match = false;
+    for (_, cmdline, src) in descendants {
+        if *src != CmdSource::Argv || !cmdline_matches_agent(cmdline, bin_base) {
+            continue;
+        }
+        saw_argv_match = true;
+        // ① ∃ argv매치 ∧ 플래그보유 — 정규 기동 확인. (조기 반환해도 ∃ 이므로 순서 무관)
+        if cmdline.contains("--dangerously-skip-permissions") {
+            return LaunchFlagAction::Rearm;
+        }
+    }
+    if saw_argv_match {
+        // ② ∃ argv매치 ∧ 전부 무플래그 — 관측된 부정. 여기서만 1회 발행한다.
+        return LaunchFlagAction::Warn;
     }
     // ③ 폴백 매치만 있거나(관측 실패) 매치 자체가 없다(에이전트 자손 무관측) — 무행동.
     //    후자는 종전에도 `continue` 였으므로 거동 무변이다.
+    //    ★전자(관측 실패)의 **연속 지속**은 P3-4 가 `launch_flag_unobservable` 로 따로 본다.
     LaunchFlagAction::Skip
+}
+
+/// 【P3-4】 이 관측이 **판정 불능**인가 — 매처에 걸리는 자손은 있는데 argv 를 하나도 읽지
+/// 못했다(= `Skip` 중 '관측 실패' 쪽).
+///
+/// 【왜 필요한가】 `Skip` 은 P1-2 가 폭주를 막으려고 만든 **영구 침묵**이다. argv 조회가
+/// *간헐* 실패하는 환경에서는 그 침묵이 정확히 옳다. 그러나 argv 조회가 **항상** 실패하는
+/// 환경(Windows EDR 이 PEB `ReadProcessMemory` 를 전면 차단)에서는 `check_launch_flags` 가
+/// 영원히 `Skip` 만 낸다 — 개정 전에는 (틀린 이유로) 경고가 떴고 지금은 아무 말도 안 한다.
+/// 즉 **"감시자가 못 보고 있다"는 사실 자체가 관측되지 않는다**. 형태가 자가치유 전멸
+/// (재난③)과 같다: 장치는 살아 있는데 신호가 0이라 죽은 것과 구별되지 않는다.
+///
+/// 【계약】 이 술어는 **판정을 바꾸지 않는다**(Skip 은 그대로 Skip). 오직 진단 이벤트의
+/// 게이트일 뿐이며, 발행 유계성은 `decide_unobservable_report` 가 별도로 책임진다.
+/// "매치가 아예 없는" 경우(에이전트 자손 무관측)는 **불능이 아니다** — 볼 것이 없는 것과
+/// 못 보는 것은 다르고, 전자를 진단하면 빈 좌석마다 잡음이 난다.
+pub fn launch_flag_unobservable(descendants: &[(u32, String, CmdSource)], bin_base: &str) -> bool {
+    let mut saw_fallback_match = false;
+    for (_, cmdline, src) in descendants {
+        if !cmdline_matches_agent(cmdline, bin_base) {
+            continue;
+        }
+        match src {
+            // argv 를 하나라도 읽었으면 판정이 가능했다는 뜻 — 불능이 아니다.
+            CmdSource::Argv => return false,
+            CmdSource::NameFallback => saw_fallback_match = true,
+        }
+    }
+    saw_fallback_match
+}
+
+/// 【P3-4】 연속 관측 실패 진단의 **유계 발행 판정**(순수). 반환 true = 지금 1회 발행.
+/// 상태(`streak`·`last_emit`)는 호출자(watchdog 태스크 로컬)가 소유한다.
+///
+/// ★새 폭주를 만들지 않는 것이 이 함수의 존재 이유다. 유계성은 두 겹이다:
+///   ① **연속** 임계 — 한 번이라도 관측에 성공하면(Rearm|Warn) streak 이 0으로 접힌다.
+///      ∴ argv 조회가 *간헐* 실패하는 환경(P1-2 의 진동)은 임계에 도달하지 못한다.
+///   ② **쿨다운** — 임계를 넘긴 뒤에도 좌석당 `cooldown` 초에 1건이 상한이다.
+///      ∴ 영구 불능 환경에서도 발행률은 `1/cooldown` 으로 유계다(무한 루프 없음).
+/// `threshold == 0` 은 비활성(킬스위치).
+pub fn decide_unobservable_report(
+    observed_now: bool,
+    unobservable_now: bool,
+    streak: &mut u32,
+    last_emit: &mut f64,
+    now: f64,
+    threshold: u32,
+    cooldown: f64,
+) -> bool {
+    if observed_now {
+        // 관측 성공 = 감시자가 보고 있다. streak 과 쿨다운을 **함께** 재무장한다
+        // (다음 실명 구간이 오면 임계를 새로 채워야 하고, 그때는 즉시 보고할 수 있어야 한다).
+        *streak = 0;
+        *last_emit = f64::NEG_INFINITY;
+        return false;
+    }
+    if !unobservable_now {
+        // 볼 대상이 없다(에이전트 자손 무관측) — 실명이 아니므로 streak 을 늘리지 않는다.
+        *streak = 0;
+        return false;
+    }
+    *streak = streak.saturating_add(1);
+    if threshold == 0 || *streak < threshold {
+        return false;
+    }
+    if now - *last_emit < cooldown {
+        return false;
+    }
+    *last_emit = now;
+    true
 }
 
 /// L1 비정규 기동 감시(2026-07-07 feed 폭주 재발방지): claude 에이전트 노드가
@@ -1532,7 +1783,13 @@ fn check_launch_flags(
     daemon: &Arc<Daemon>,
     sys: &System,
     warned: &mut std::collections::HashSet<u64>,
+    blind: &mut HashMap<u64, (u32, f64)>,
 ) {
+    // ★P3-4 진단 계측 파라미터. 기본 40틱 = 이 검사의 15초 주기로 **10분 연속 실명**,
+    // 쿨다운 3600초 = 좌석당 시간당 1건 상한. 임계 0 = 킬스위치(비활성).
+    let blind_ticks = env_u64("CYS_LAUNCH_FLAG_BLIND_TICKS", 40) as u32;
+    let blind_cooldown = env_u64("CYS_LAUNCH_FLAG_BLIND_COOLDOWN_SECS", 3600) as f64;
+    let now = now_epoch();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     for s in surfaces {
@@ -1553,7 +1810,43 @@ fn check_launch_flags(
         // ★P1-2: 판정은 3상이다(근거 전문은 `decide_launch_flag_action` 주석). 관측 실패를
         //   '플래그 없음'으로 읽으면 argv 조회 진동이 15초마다 이벤트를 재발행한다.
         let observed = collect_descendants_with_cmd_src(sys, s.pid);
-        match decide_launch_flag_action(&observed, &bin_base) {
+        let action = decide_launch_flag_action(&observed, &bin_base);
+        // ★P3-4: `Skip` 의 영구 침묵을 진단한다 — **판정은 건드리지 않는다**(아래 match 그대로).
+        // 관측 실패가 N틱 연속이면 저빈도로 1회 알린다: "감시자가 못 보고 있다"는 사실 자체가
+        // 관측되지 않는 상태(재난③ 형태)를 깨는 것이 목적이고, 유계성은
+        // `decide_unobservable_report` 의 연속 임계 + 쿨다운 두 겹이 책임진다.
+        {
+            let entry = blind.entry(s.id).or_insert((0, f64::NEG_INFINITY));
+            let observed_now = matches!(
+                action,
+                LaunchFlagAction::Rearm | LaunchFlagAction::Warn
+            );
+            let unobservable_now =
+                !observed_now && launch_flag_unobservable(&observed, &bin_base);
+            if decide_unobservable_report(
+                observed_now,
+                unobservable_now,
+                &mut entry.0,
+                &mut entry.1,
+                now,
+                blind_ticks,
+                blind_cooldown,
+            ) {
+                let role = s.role.lock().unwrap().clone();
+                daemon.bus.publish(
+                    "node.launch_flag_unobservable",
+                    "watchdog",
+                    Some(s.id),
+                    json!({"agent": agent, "role": role, "surface_ref": cys::surface_ref(s.id),
+                           "blind_ticks": entry.0, "check_interval_secs":
+                               WATCHDOG_INTERVAL_SECS * 3,
+                           "note": "에이전트 자손의 argv 를 연속으로 읽지 못해 기동 플래그를 \
+                                    판정할 수 없다(권한·EDR 차단 가능) — 이 좌석의 비정규 기동 \
+                                    감시는 현재 무력 상태다"}),
+                );
+            }
+        }
+        match action {
             LaunchFlagAction::Rearm => {
                 warned.remove(&s.id); // 정규 복귀 — 재무장
                 continue;
@@ -1601,7 +1894,14 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                        // '각성 확정'을 영영 못 본다(legacy-presumed 로 영구 강등 = 신호 무력화).
                        // restore 가 이 값을 surface.create 의 awakened_at 파라미터로 되돌린다.
                        // 구 topology(키 부재)는 로드 시 null → None(하위호환·단방향 계약 유지).
-                       "awakened_at": *s.awakened_at.lock().unwrap()})
+                       "awakened_at": *s.awakened_at.lock().unwrap(),
+                       // ★(U-10) 관문 보류 **관측 슬롯** — 좌석 제4 등급을 재기동을 넘겨 사람이
+                       // 읽을 수 있게 남긴다(치명위험 ③: '미완성 좌석을 정상으로 센다' 의 가시화).
+                       // ★일부러 **하이드레이션하지 않는다**: restore 가 이 값을 되돌리면 stale
+                       // 보류가 영속해 좌석이 영원히 미충족 → 부트 재시도 라이브락(A1 클래스)이다.
+                       // 만료 규약과 함께 U-11 이 정할 사안이고, 이 단위는 슬롯만 만든다.
+                       // 구 topology(키 부재)·킬스위치 off 는 null — 소비자는 항을 생략한다.
+                       (cys::GATE_PENDING_KEY): s.gate_pending_wire()})
             })
         })
         .collect();
@@ -4413,6 +4713,587 @@ mod tests {
         );
     }
 
+    /// 【P3-1 · 폭주 채널 2호】 `decide_launch_flag_action` 이 **자손 순서에 지배**되던 결함.
+    ///
+    /// 【결함의 기계】 종전 판정은 `.find(|(_, c, src)| src == Argv && matches(c))` — 조건에
+    /// 걸리는 **첫 하나**로 Rearm/Warn 이 갈렸다. 그 "첫"의 순서는 `descendant_pids` 의
+    /// children 인덱스에서 나오고, 그 인덱스는 `sys.processes()` **HashMap 순회**로 채워진다
+    /// — 매 refresh 의 삽입·삭제로 순서가 바뀔 수 있다. 한편 매처(`cmdline_matches_agent`)는
+    /// 오살 방지를 위해 **의도적으로 넓어**(토큰 basename + 경로 세그먼트) 좌석 자손에 매치가
+    /// **여럿** 생긴다:
+    ///   Windows  `powershell → cmd.exe(…\claude.cmd) → claude.exe` — 래퍼와 실물이 둘 다 매치
+    ///   Unix     에이전트가 부른 `less ~/dev/claude/NOTES.md` 가 실물과 함께 매치
+    /// 두 프로세스의 argv 조회(`OpenProcess`+PEB)는 **각각 독립적으로** 성공/실패하므로,
+    /// 관측 목록의 순서와 가독성이 틱마다 갈아탄다:
+    ///   틱 A 래퍼 먼저·무플래그 → Warn → `node.nonstandard_launch` 발행
+    ///   틱 B 실물 먼저·플래그   → Rearm → 래치 해제
+    ///   틱 C 다시 A            → **재발행**
+    /// = 좌석당 15~30초마다 영구 발행. `check_launch_flags` 주석 자신이 "2026-07-07 feed
+    /// 폭주 재발방지"라 적은 바로 그 채널이다(P1-2 가 막은 축과 **다른 축** — P1-2 는 한
+    /// 프로세스의 가독성 진동, 여기는 **여러 프로세스 사이의 순서**).
+    ///
+    /// 【수리의 축】 판정을 **∃ 의미(순서 무관)** 로 바꾼다:
+    ///   ∃ argv매치 ∧ 플래그보유 → Rearm / ∃ argv매치(전부 무플래그) → Warn / 그 외 → Skip.
+    /// 주석은 이미 "argv 관측된 매치를 **우선 채택**"이라 적혀 있었고 구현만 "**첫** 매치"였다.
+    ///
+    /// 【적색 증명(in-band)】 `first_match_reference` 는 **수정 전 구현 그대로**다. 같은 입력을
+    /// 두 판정에 먹여 (a) 순열 불변성 (b) 틱열 발행 수를 비교한다 — 수리를 되돌리면 이 검체가
+    /// 그대로 적색이 된다(계측기 자신을 먼저 시험하는 이 파일의 관례).
+    #[test]
+    fn launch_flag_verdict_is_order_independent_across_contending_descendants() {
+        use super::{decide_launch_flag_action, CmdSource, LaunchFlagAction};
+        const SID: u64 = 11;
+        const BIN: &str = "claude";
+        const FLAG: &str = "--dangerously-skip-permissions";
+
+        // ── 현장 형태 픽스처 ────────────────────────────────────────────────────
+        // Windows 래퍼: `.cmd` 는 WIN_EXEC_EXTS 라 basename 정규화 후 `claude` 로 매치된다.
+        // 래퍼 프로세스의 argv 에는 플래그가 **전달 표기로 남지 않는 경우가 있다**(cmd.exe 가
+        // 인자를 재조립) — 이 검체의 전제는 "래퍼와 실물이 플래그에서 다툰다" 이다.
+        let wrapper_noflag = (
+            101u32,
+            "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude.cmd".to_string(),
+            CmdSource::Argv,
+        );
+        let real_flag = (
+            102u32,
+            format!("C:\\Users\\x\\.local\\bin\\claude.exe {FLAG}"),
+            CmdSource::Argv,
+        );
+        // Unix 등가: 에이전트가 띄운 무관 프로세스가 경로 세그먼트로 매처에 걸린다.
+        let decoy_unix = (
+            103u32,
+            "less /home/u/dev/claude/NOTES.md".to_string(),
+            CmdSource::Argv,
+        );
+        let real_unix_flag = (
+            104u32,
+            format!("/home/u/.local/bin/claude {FLAG}"),
+            CmdSource::Argv,
+        );
+        // 실물의 argv 만 읽히지 않은 틱(래퍼는 읽힘) — 가독성 교대의 다른 반쪽.
+        let real_fallback = (105u32, "claude.exe".to_string(), CmdSource::NameFallback);
+
+        // 수정 전(첫 매치 채택) 판정의 참조 구현 — 순서에 지배된다.
+        let first_match_reference = |obs: &[(u32, String, CmdSource)]| match obs
+            .iter()
+            .find(|(_, c, src)| *src == CmdSource::Argv && super::cmdline_matches_agent(c, BIN))
+        {
+            Some((_, cmdline, _)) => {
+                if cmdline.contains(FLAG) {
+                    LaunchFlagAction::Rearm
+                } else {
+                    LaunchFlagAction::Warn
+                }
+            }
+            None => LaunchFlagAction::Skip,
+        };
+
+        // ── ① 순열 불변성 — 같은 집합이면 순서와 무관하게 같은 판정 ─────────────
+        // (프로세스 표 순회 순서는 우리가 통제할 수 없는 입력이다. 판정이 그것에 의존하면
+        //  그 자체로 결함이다 — 여기서 성질로 못박는다.)
+        let permutations = |set: &[(u32, String, CmdSource)]| -> Vec<Vec<(u32, String, CmdSource)>> {
+            // 3! 까지만 필요 — 재귀 없이 전개.
+            let mut out = Vec::new();
+            let n = set.len();
+            let mut idx: Vec<usize> = (0..n).collect();
+            // Heap's algorithm (반복형)
+            let mut c = vec![0usize; n];
+            out.push(idx.iter().map(|&i| set[i].clone()).collect::<Vec<_>>());
+            let mut i = 0;
+            while i < n {
+                if c[i] < i {
+                    if i % 2 == 0 {
+                        idx.swap(0, i);
+                    } else {
+                        idx.swap(c[i], i);
+                    }
+                    out.push(idx.iter().map(|&k| set[k].clone()).collect::<Vec<_>>());
+                    c[i] += 1;
+                    i = 0;
+                } else {
+                    c[i] = 0;
+                    i += 1;
+                }
+            }
+            out
+        };
+
+        for set in [
+            vec![wrapper_noflag.clone(), real_flag.clone()],
+            vec![decoy_unix.clone(), real_unix_flag.clone()],
+            vec![
+                wrapper_noflag.clone(),
+                decoy_unix.clone(),
+                real_flag.clone(),
+            ],
+            vec![
+                real_fallback.clone(),
+                wrapper_noflag.clone(),
+                real_flag.clone(),
+            ],
+        ] {
+            let perms = permutations(&set);
+            assert!(perms.len() >= 2, "순열 전개 실패(드릴 전제 붕괴)");
+            let verdicts: std::collections::HashSet<LaunchFlagAction> = perms
+                .iter()
+                .map(|p| decide_launch_flag_action(p, BIN))
+                .collect();
+            assert_eq!(
+                verdicts.len(),
+                1,
+                "판정이 자손 **순서**에 따라 갈렸다({verdicts:?}) — sys.processes() HashMap \
+                 순회 순서가 이벤트 발행을 지배한다 = 폭주 채널"
+            );
+            assert_eq!(
+                verdicts.into_iter().next().unwrap(),
+                LaunchFlagAction::Rearm,
+                "플래그를 가진 argv 매치가 존재하는데 Rearm 이 아니다(∃ 의미 위반)"
+            );
+            // 드릴 전제: 수정 전 판정은 같은 집합에서 순서에 따라 갈렸다.
+            let before: std::collections::HashSet<LaunchFlagAction> = perms
+                .iter()
+                .map(|p| first_match_reference(p))
+                .collect();
+            assert!(
+                before.len() > 1,
+                "드릴 전제 붕괴: 수정 전 판정이 순서에 지배되지 않았다 — 이 픽스처가 P3-1 을 \
+                 시험하지 못한다(집합: {set:?})"
+            );
+        }
+
+        // ── ② 틱 시뮬레이션 — 순서 교대 + 가독성 교대가 동시에 일어나는 좌석 ────
+        // watchdog 래치를 그대로 흉내 낸다(발행 카운터).
+        let run = |ticks: &[Vec<(u32, String, CmdSource)>],
+                   decide: &dyn Fn(&[(u32, String, CmdSource)]) -> LaunchFlagAction|
+         -> usize {
+            let mut warned: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut published = 0usize;
+            for obs in ticks {
+                match decide(obs) {
+                    LaunchFlagAction::Rearm => {
+                        warned.remove(&SID);
+                    }
+                    LaunchFlagAction::Warn => {
+                        if warned.insert(SID) {
+                            published += 1;
+                        }
+                    }
+                    LaunchFlagAction::Skip => {}
+                }
+            }
+            published
+        };
+        // 4주기 틱열: (래퍼 먼저) → (실물 먼저) → (실물 argv 실패·래퍼 먼저) → (실물 먼저)
+        // — 순서와 가독성이 동시에 갈아탄다. 실물은 정규 플래그로 떠 있으므로 **경고 0** 이 정답.
+        let cycle = [
+            vec![wrapper_noflag.clone(), real_flag.clone()],
+            vec![real_flag.clone(), wrapper_noflag.clone()],
+            vec![wrapper_noflag.clone(), real_flag.clone()],
+            vec![real_flag.clone(), wrapper_noflag.clone()],
+        ];
+        let ticks: Vec<Vec<(u32, String, CmdSource)>> =
+            (0..40).map(|i| cycle[i % cycle.len()].clone()).collect();
+        let before = run(&ticks, &first_match_reference);
+        assert!(
+            before > 1,
+            "드릴 전제 붕괴: 수정 전 판정이 순서 교대로 재발행하지 않았다({before}건)"
+        );
+        assert_eq!(before, 20, "수정 전 순서 진동 발행 수가 예상과 다르다: {before}");
+        let after = run(&ticks, &|o| decide_launch_flag_action(o, BIN));
+        assert_eq!(
+            after, 0,
+            "정규 플래그로 떠 있는 좌석인데 자손 순서가 바뀐다고 경고를 발행했다({after}건) \
+             — feed 폭주 채널"
+        );
+
+        // ── ③ 조건 약화 없음: 진짜 비정규 좌석은 여전히 정확히 1회 경고한다 ─────
+        // (argv 매치가 **전부** 무플래그 = 관측된 부정 → Warn)
+        let noflag_only = [
+            vec![wrapper_noflag.clone(), decoy_unix.clone()],
+            vec![decoy_unix.clone(), wrapper_noflag.clone()],
+        ];
+        let noflag_ticks: Vec<Vec<(u32, String, CmdSource)>> = (0..40)
+            .map(|i| noflag_only[i % noflag_only.len()].clone())
+            .collect();
+        assert_eq!(
+            run(&noflag_ticks, &|o| decide_launch_flag_action(o, BIN)),
+            1,
+            "비정규 좌석 경고가 1회 계약을 벗어났다(약화 또는 폭주)"
+        );
+        assert_eq!(
+            decide_launch_flag_action(&[wrapper_noflag.clone()], BIN),
+            LaunchFlagAction::Warn
+        );
+
+        // ── ④ 폴백은 여전히 판정 근거가 아니다(P1-2 계약 유지) ──────────────────
+        assert_eq!(
+            decide_launch_flag_action(&[real_fallback.clone()], BIN),
+            LaunchFlagAction::Skip,
+            "관측 실패(name 폴백)를 판정 근거로 썼다 — P1-2 회귀"
+        );
+        // 폴백 + argv 무플래그 매치 → argv 쪽만 근거가 된다(Warn).
+        assert_eq!(
+            decide_launch_flag_action(&[real_fallback, wrapper_noflag], BIN),
+            LaunchFlagAction::Warn
+        );
+    }
+
+    /// 【P3-4 · 영구 침묵】 `Skip` 이 "관측 실패"와 "볼 것 없음"을 함께 삼키던 결함.
+    ///
+    /// 【결함의 기계】 P1-2 는 폭주를 막으려고 관측 실패를 `Skip`(무행동)으로 접었다. argv 조회가
+    /// *간헐* 실패하는 환경에서는 그것이 정확히 옳다. 그러나 **항상** 실패하는 환경(Windows EDR
+    /// 이 PEB `ReadProcessMemory` 를 전면 차단)에서는 `check_launch_flags` 가 영원히 `Skip` 만
+    /// 낸다 — 개정 전에는 (틀린 이유로) 경고가 떴고 지금은 아무 말도 안 한다. 즉 **"감시자가
+    /// 못 보고 있다"는 사실 자체가 관측되지 않는다**. 형태가 자가치유 전멸(재난③)과 같다:
+    /// 장치는 살아 있는데 신호가 0이라 죽은 것과 구별되지 않는다.
+    ///
+    /// 【수리와 그 대가】 진단 이벤트를 새로 내되 **새 폭주를 만들지 않는 것**이 조건이다.
+    /// 유계성은 두 겹으로 강제하고 이 검체가 그 유계성을 단언한다:
+    ///   ① 연속 임계 — 한 번이라도 관측에 성공하면 streak 이 0으로 접힌다(진동은 임계 미달).
+    ///   ② 쿨다운   — 임계를 넘긴 뒤에도 좌석당 `cooldown` 초에 1건이 상한.
+    #[test]
+    fn launch_flag_permanent_blindness_reports_once_and_stays_bounded() {
+        use super::{
+            decide_launch_flag_action, decide_unobservable_report, launch_flag_unobservable,
+            CmdSource, LaunchFlagAction,
+        };
+        const BIN: &str = "claude";
+        // 이 검사는 watchdog 3틱마다(=15초) 돈다 — 실측 주기를 그대로 쓴다.
+        const INTERVAL: f64 = (super::WATCHDOG_INTERVAL_SECS * 3) as f64;
+        const THRESHOLD: u32 = 40; // 40 × 15초 = 10분 연속 실명
+        const COOLDOWN: f64 = 3600.0;
+
+        // 틱열을 (관측성공?, 불능?) 로 주고 발행 수를 센다 — watchdog 상태를 그대로 흉내.
+        let run = |ticks: &[(bool, bool)], threshold: u32| -> usize {
+            let mut streak = 0u32;
+            let mut last = f64::NEG_INFINITY;
+            let mut emitted = 0usize;
+            for (i, (obs, unobs)) in ticks.iter().enumerate() {
+                if decide_unobservable_report(
+                    *obs,
+                    *unobs,
+                    &mut streak,
+                    &mut last,
+                    i as f64 * INTERVAL,
+                    threshold,
+                    COOLDOWN,
+                ) {
+                    emitted += 1;
+                }
+            }
+            emitted
+        };
+
+        // ── ① 영구 실명(12시간) — 침묵하지 않는다 ∧ 유계다 ─────────────────────
+        let hours12: Vec<(bool, bool)> = vec![(false, true); (12.0 * 3600.0 / INTERVAL) as usize];
+        let total_secs = hours12.len() as f64 * INTERVAL;
+        let emitted = run(&hours12, THRESHOLD);
+        assert!(
+            emitted >= 1,
+            "12시간 연속 관측 불능인데 한 번도 알리지 않았다 — 영구 침묵(재난③ 형태) 미수리"
+        );
+        let bound = (total_secs / COOLDOWN).ceil() as usize + 1;
+        assert!(
+            emitted <= bound,
+            "진단 발행이 쿨다운 상한을 넘었다({emitted}건 > {bound}건) — 새 폭주를 만들었다"
+        );
+        // 첫 발행은 임계 **직후**여야 한다(더 일찍 = 진동에 반응, 더 늦음 = 무의미한 지연).
+        let head: Vec<(bool, bool)> = vec![(false, true); THRESHOLD as usize - 1];
+        assert_eq!(run(&head, THRESHOLD), 0, "임계 미달인데 발행했다");
+        let head_exact: Vec<(bool, bool)> = vec![(false, true); THRESHOLD as usize];
+        assert_eq!(run(&head_exact, THRESHOLD), 1, "임계 도달에서 정확히 1회여야 한다");
+
+        // ── ② 간헐 실패(P1-2 진동)는 **절대** 발행하지 않는다 ──────────────────
+        // 관측 성공이 streak 을 접으므로, 성공/실패가 갈아타는 한 임계에 닿지 못한다.
+        let flapping: Vec<(bool, bool)> = (0..10_000)
+            .map(|i| if i % 2 == 0 { (true, false) } else { (false, true) })
+            .collect();
+        assert_eq!(
+            run(&flapping, THRESHOLD),
+            0,
+            "간헐 argv 실패(P1-2 진동)에 진단이 반응했다 — 폭주 채널을 새로 열었다"
+        );
+        // 임계 직전까지 갔다가 한 번 성공해도 재무장된다(연속의 의미).
+        let mut near: Vec<(bool, bool)> = vec![(false, true); THRESHOLD as usize - 1];
+        near.push((true, false));
+        near.extend(vec![(false, true); THRESHOLD as usize - 1]);
+        assert_eq!(run(&near, THRESHOLD), 0, "성공 1틱이 연속 카운터를 접지 못했다");
+
+        // ── ③ '볼 것이 없는' 좌석은 진단 대상이 아니다(빈 좌석 잡음 금지) ───────
+        let nothing: Vec<(bool, bool)> = vec![(false, false); 10_000];
+        assert_eq!(
+            run(&nothing, THRESHOLD),
+            0,
+            "에이전트 자손이 아예 없는 좌석에 실명 진단을 냈다"
+        );
+
+        // ── ④ 킬스위치(threshold=0)는 완전 비활성 ───────────────────────────────
+        assert_eq!(run(&hours12, 0), 0, "threshold=0 킬스위치가 동작하지 않았다");
+
+        // ── ⑤ `launch_flag_unobservable` 진리표 — 진단 게이트가 정확히 `Skip` 의 \
+        //      '관측 실패' 쪽만 덮는가 ────────────────────────────────────────────
+        let argv_flag = (
+            201u32,
+            "/home/u/.local/bin/claude --dangerously-skip-permissions".to_string(),
+            CmdSource::Argv,
+        );
+        let argv_noflag = (202u32, "/home/u/.local/bin/claude".to_string(), CmdSource::Argv);
+        let fb_match = (203u32, "claude".to_string(), CmdSource::NameFallback);
+        let fb_other = (204u32, "zsh".to_string(), CmdSource::NameFallback);
+        let argv_other = (205u32, "zsh -il".to_string(), CmdSource::Argv);
+
+        assert!(
+            launch_flag_unobservable(&[fb_match.clone()], BIN),
+            "매처에 걸리는 자손의 argv 를 못 읽었는데 불능이 아니라고 했다"
+        );
+        assert_eq!(
+            decide_launch_flag_action(&[fb_match.clone()], BIN),
+            LaunchFlagAction::Skip,
+            "진단 게이트와 판정 분기가 어긋났다(불능인데 Skip 이 아니다)"
+        );
+        // argv 를 하나라도 읽었으면 불능이 아니다 — 판정이 가능했다.
+        assert!(!launch_flag_unobservable(&[argv_flag.clone()], BIN));
+        assert!(!launch_flag_unobservable(&[argv_noflag.clone()], BIN));
+        assert!(!launch_flag_unobservable(
+            &[fb_match.clone(), argv_flag.clone()],
+            BIN
+        ));
+        // 매치가 아예 없으면 불능이 아니다(볼 것이 없는 것 ≠ 못 보는 것).
+        assert!(!launch_flag_unobservable(&[], BIN));
+        assert!(!launch_flag_unobservable(&[fb_other, argv_other], BIN));
+        // 발행 분기(Rearm|Warn)와 진단은 상호 배타 — 이중 신호 금지.
+        for obs in [vec![argv_flag], vec![argv_noflag]] {
+            let act = decide_launch_flag_action(&obs, BIN);
+            assert!(matches!(
+                act,
+                LaunchFlagAction::Rearm | LaunchFlagAction::Warn
+            ));
+            assert!(
+                !launch_flag_unobservable(&obs, BIN),
+                "관측 성공 틱에 실명 진단이 함께 켜졌다(이중 신호)"
+            );
+        }
+    }
+
+    /// 【P3-6 · 고아 좌석】 `check_agent_death` 의 `alive` 가 U-5 argv 승격으로 넓어졌는데
+    /// **보정이 없던** 결함. 라운드 1 은 같은 넓힘의 *다른 소비자*(readiness 안전 밸브 —
+    /// `refresh_seat_cache` 의 `seat_agent_cache`)만 보고 거기에만 엄격 매처 AND 를 걸었다.
+    ///
+    /// 【결함의 기계】 U-5 이전의 관측 문자열은 `name()` **한 토큰**이라 경로 구분자가 없었고,
+    /// 그래서 `cmdline_matches_agent` 의 경로 세그먼트 규칙은 원리상 발화할 수 없었다. 승격 후
+    /// 관측이 명령줄 전체가 되면서, 좌석 자손 중 **아무거나** argv 에 `…/claude/…` 세그먼트를
+    /// 가진 채 살아 있으면 `alive=true` 가 된다:
+    ///   `tail -f ~/.cys/claude/session.log` · `less ~/dev/claude/NOTES.md`
+    ///   `grep -rn foo ~/dev/claude-code/src`
+    /// 에이전트가 죽어도 이런 자손 하나가 남아 있으면 `agent.exited` 미발행 → node-recover
+    /// 미발동 → **고아 좌석**(좌석은 점유된 것처럼 보이는데 그 위에 에이전트가 없다).
+    ///
+    /// 【수리와 그 정당화 — 오살 0칸】 좁힘은 **그 좌석에서 엄격 매처가 자기 에이전트를 실제로
+    /// 본 적이 있을 때만** 켠다(`update_strict_proof`). 증명된 좌석에서는 "에이전트가 살아
+    /// 있다 ⇒ 엄격 매치가 있다"가 관측으로 성립하므로, 엄격 매치가 사라지고 광의 매치만
+    /// 남은 상태는 **그 광의 매치가 에이전트가 아니라는 뜻**이다. 미증명 좌석(엄격 매처로는
+    /// 보이지 않는 형태로 뜨는 가상의 에이전트)에서는 좁히지 않고 종전 거동을 그대로 둔다 —
+    /// 좁힘이 자기 안전성을 스스로 입증한 좌석에서만 켜지는 자기보호적 설계다.
+    ///
+    /// 【적색 증명(in-band)】 `broad_any_reference` 는 **수정 전 한 줄 그대로**다. 고아 시나리오
+    /// 틱열을 두 판정에 먹여 (a) 수정 전은 영구 alive(=고아) (b) 수정 후는 사망 판정으로
+    /// 넘어감을 대조한다.
+    #[test]
+    fn agent_liveness_ignores_broad_only_evidence_once_strict_is_proven() {
+        use super::{
+            agent_alive_from_liveness, cmdline_matches_agent, cmdline_matches_agent_exec,
+            decide_agent_liveness, update_strict_proof, AgentLiveness,
+        };
+        const BIN: &str = "claude";
+        const ARM: u32 = 2;
+
+        // ── 실물 에이전트 형태(전부 **엄격** 증거) — 기존 검체들이 쓰는 실측 코퍼스 ──
+        let real_forms: [&str; 6] = [
+            "/Users/x/.local/bin/claude --dangerously-skip-permissions",
+            "node /Users/x/.npm-global/bin/claude",
+            "node /n/m/@anthropic-ai/claude-code/cli.js",
+            "node --enable-source-maps /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude.cmd",
+            "C:\\Users\\x\\.local\\bin\\claude.exe --dangerously-skip-permissions",
+        ];
+        // ── U-5 가 새로 만든 오탐 축(광의로만 걸린다 = 실행 증거 아님) ──────────────
+        let broad_only_decoys: [&str; 4] = [
+            "tail -f /Users/x/.cys/claude/session.log",
+            "less /home/u/dev/claude/NOTES.md",
+            "grep -rn foo /home/u/dev/claude-code/src",
+            "python3 /opt/claude/tools/report.py",
+        ];
+        // ── 아무 관계 없는 자손 ────────────────────────────────────────────────────
+        let unrelated: [&str; 3] = ["zsh -il", "vim notes.md", "node /x/y.js"];
+
+        // ── ① 증거 등급 분류 + strict ⊆ broad 포함관계 ──────────────────────────
+        for f in real_forms {
+            assert!(
+                cmdline_matches_agent_exec(f, BIN) && cmdline_matches_agent(f, BIN),
+                "실물 형태가 엄격 증거로 잡히지 않는다(좁힘의 안전 전제 붕괴): {f}"
+            );
+            assert_eq!(
+                decide_agent_liveness(&[f.to_string()], BIN),
+                AgentLiveness::AliveStrict,
+                "실물 형태 등급 오분류: {f}"
+            );
+        }
+        for d in broad_only_decoys {
+            assert!(
+                cmdline_matches_agent(d, BIN) && !cmdline_matches_agent_exec(d, BIN),
+                "이 픽스처가 '광의만' 축을 시험하지 못한다: {d}"
+            );
+            assert_eq!(
+                decide_agent_liveness(&[d.to_string()], BIN),
+                AgentLiveness::AliveBroadOnly,
+                "광의 전용 오탐 등급 오분류: {d}"
+            );
+        }
+        for u in unrelated {
+            assert_eq!(
+                decide_agent_liveness(&[u.to_string()], BIN),
+                AgentLiveness::NoEvidence,
+                "무관 자손을 증거로 셌다: {u}"
+            );
+        }
+        // 등급은 ∃ 이라 **순서 무관**이다(P3-1 과 동일한 성질 — 프로세스 표 순회 순서 비의존).
+        let mixed = vec![
+            broad_only_decoys[0].to_string(),
+            real_forms[2].to_string(),
+            unrelated[0].to_string(),
+        ];
+        let mut rev = mixed.clone();
+        rev.reverse();
+        assert_eq!(decide_agent_liveness(&mixed, BIN), AgentLiveness::AliveStrict);
+        assert_eq!(decide_agent_liveness(&rev, BIN), AgentLiveness::AliveStrict);
+
+        // ── ② 오살 0칸(제1 계약) — 실물이 살아 있으면 증명 여부와 무관하게 항상 생존 ──
+        for f in real_forms {
+            for d in broad_only_decoys {
+                let cmds = vec![d.to_string(), f.to_string()];
+                for proven in [false, true] {
+                    assert!(
+                        agent_alive_from_liveness(decide_agent_liveness(&cmds, BIN), proven),
+                        "살아있는 에이전트를 죽었다고 판정했다(오살) — proven={proven} \
+                         real={f} decoy={d}"
+                    );
+                }
+            }
+        }
+        // 미증명 좌석은 광의 증거만으로도 종전대로 생존이다(좁힘을 켜지 않는다).
+        for d in broad_only_decoys {
+            assert!(
+                agent_alive_from_liveness(
+                    decide_agent_liveness(&[d.to_string()], BIN),
+                    false
+                ),
+                "미증명 좌석에서 좁힘이 켜졌다 — 종전 거동 보존 위반: {d}"
+            );
+        }
+
+        // ── ③ 고아 수리: 증명된 좌석에서는 광의 전용 증거가 생존이 아니다 ─────────
+        for d in broad_only_decoys {
+            assert!(
+                !agent_alive_from_liveness(decide_agent_liveness(&[d.to_string()], BIN), true),
+                "증명된 좌석인데 비에이전트 자손을 생존 증거로 승격했다(고아 좌석): {d}"
+            );
+        }
+        // 증거가 아예 없으면 종전과 동일하게 사망 후보(거동 무변).
+        assert!(!agent_alive_from_liveness(AgentLiveness::NoEvidence, false));
+        assert!(!agent_alive_from_liveness(AgentLiveness::NoEvidence, true));
+
+        // ── ④ 증명 래치 히스테리시스 ────────────────────────────────────────────
+        let mut proof: Option<(String, u32)> = None;
+        assert!(
+            !update_strict_proof(&mut proof, BIN, true, ARM),
+            "1틱 엄격 관측으로 증명이 섰다 — 스치는 도우미 프로세스에 좁힘이 켜진다"
+        );
+        assert!(update_strict_proof(&mut proof, BIN, true, ARM), "연속 2틱이면 증명");
+        // 한 번 선 증명은 내리지 않는다(에이전트 사망으로 엄격 증거가 사라지는 것이 표적).
+        assert!(update_strict_proof(&mut proof, BIN, false, ARM));
+        assert!(update_strict_proof(&mut proof, BIN, false, ARM));
+        // 증명 전 연속이 끊기면 처음부터.
+        let mut p2: Option<(String, u32)> = None;
+        assert!(!update_strict_proof(&mut p2, BIN, true, ARM));
+        assert!(!update_strict_proof(&mut p2, BIN, false, ARM));
+        assert!(!update_strict_proof(&mut p2, BIN, true, ARM), "끊긴 연속이 이어졌다");
+        assert!(update_strict_proof(&mut p2, BIN, true, ARM));
+        // 좌석의 에이전트가 바뀌면(bin_base 변경) 증명은 처음부터 다시 쌓는다.
+        assert!(!update_strict_proof(&mut p2, "codex", true, ARM));
+        assert!(update_strict_proof(&mut p2, "codex", true, ARM));
+        // 킬스위치: arm_ticks=0 이면 절대 증명되지 않는다(= 좁힘 전면 비활성·종전 거동).
+        let mut p3: Option<(String, u32)> = None;
+        for _ in 0..100 {
+            assert!(
+                !update_strict_proof(&mut p3, BIN, true, 0),
+                "arm_ticks=0 킬스위치가 동작하지 않았다"
+            );
+        }
+
+        // ── ⑤ 고아 시나리오 틱 시뮬레이션(수리 전/후 대조) ──────────────────────
+        // 틱 1..=4  실물 + decoy 공존(정상 가동)
+        // 틱 5..=40 실물 사망, decoy 만 잔존 → 여기서 사망 판정이 나와야 한다.
+        let broad_any_reference =
+            |cmds: &[String]| cmds.iter().any(|c| cmdline_matches_agent(c, BIN));
+        let ticks: Vec<Vec<String>> = (0..40)
+            .map(|i| {
+                if i < 4 {
+                    vec![broad_only_decoys[0].to_string(), real_forms[0].to_string()]
+                } else {
+                    vec![broad_only_decoys[0].to_string()]
+                }
+            })
+            .collect();
+        let mut proof: Option<(String, u32)> = None;
+        let mut alive_after: Vec<bool> = Vec::new();
+        for cmds in &ticks {
+            let liveness = decide_agent_liveness(cmds, BIN);
+            let proven = update_strict_proof(
+                &mut proof,
+                BIN,
+                liveness == AgentLiveness::AliveStrict,
+                ARM,
+            );
+            alive_after.push(agent_alive_from_liveness(liveness, proven));
+        }
+        let alive_before: Vec<bool> = ticks.iter().map(|c| broad_any_reference(c)).collect();
+        assert!(
+            alive_before.iter().all(|&a| a),
+            "드릴 전제 붕괴: 수정 전 판정이 이 틱열에서 사망을 냈다 — 고아를 시험하지 못한다"
+        );
+        assert!(
+            alive_after[..4].iter().all(|&a| a),
+            "에이전트가 살아 있는 구간에서 사망 판정이 났다(오살)"
+        );
+        assert!(
+            alive_after[4..].iter().all(|&a| !a),
+            "에이전트 사망 후에도 잔존 자손 때문에 생존으로 읽혔다 — 고아 좌석 미수리"
+        );
+
+        // ⑥ 증명이 서기 전에 에이전트가 죽으면(엄격 관측 1틱뿐) 좁히지 않는다 —
+        //    안전 쪽(종전 거동)으로 접힌다. 증명은 안전의 전제이지 편의가 아니다.
+        let short: Vec<Vec<String>> = vec![
+            vec![broad_only_decoys[1].to_string(), real_forms[0].to_string()],
+            vec![broad_only_decoys[1].to_string()],
+            vec![broad_only_decoys[1].to_string()],
+        ];
+        let mut p4: Option<(String, u32)> = None;
+        let verdicts: Vec<bool> = short
+            .iter()
+            .map(|cmds| {
+                let l = decide_agent_liveness(cmds, BIN);
+                let pr = update_strict_proof(&mut p4, BIN, l == AgentLiveness::AliveStrict, ARM);
+                agent_alive_from_liveness(l, pr)
+            })
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![true, true, true],
+            "증명 미성립 좌석에서 좁힘이 켜졌다 — 히스테리시스 무력"
+        );
+    }
+
     /// `collect_descendants_with_cmd_src` 가 출처를 정직하게 싣는가 — 얇은 래퍼가 종전 반환값과
     /// 완전히 동형인지도 함께 확인한다(기존 소비자 거동 무변 증명).
     #[cfg(unix)]
@@ -5557,7 +6438,9 @@ mod tests {
         ));
         let sys = sysinfo::System::new(); // 빈 프로세스 표 = 재관측 None(모호/무관측 대역)
         let mut rc: HashMap<u64, u32> = HashMap::new();
-        super::check_agent_death(&daemon, &sys, &mut rc);
+        // (P3-6) 엄격 관측 증명 래치 — 이 드릴들은 pending 확정·소거 경로만 보므로 빈 채로 둔다.
+        let mut sp: HashMap<u64, Option<(String, u32)>> = HashMap::new();
+        super::check_agent_death(&daemon, &sys, &mut rc, &mut sp);
         assert!(
             s.pending_agent_obs.lock().unwrap().is_none(),
             "TTL 초과 pending 은 소거돼야 한다"
@@ -5587,17 +6470,19 @@ mod tests {
         let s = daemon.surfaces.lock().unwrap().get(&id).cloned().unwrap();
         let sys = sysinfo::System::new();
         let mut rc: HashMap<u64, u32> = HashMap::new();
+        // (P3-6) 엄격 관측 증명 래치 — 이 드릴들은 pending 확정·소거 경로만 보므로 빈 채로 둔다.
+        let mut sp: HashMap<u64, Option<(String, u32)>> = HashMap::new();
         // ① 무관측 = Keep — pending 유지·이벤트 없음(다음 틱 유보).
         *s.pending_agent_obs.lock().unwrap() =
             Some(("claude".into(), "claude".into(), now_epoch()));
-        super::check_agent_death(&daemon, &sys, &mut rc);
+        super::check_agent_death(&daemon, &sys, &mut rc, &mut sp);
         assert!(
             s.pending_agent_obs.lock().unwrap().is_some(),
             "무관측은 Keep — TTL 내 재시도 유보"
         );
         // ② 다른 경로(set_meta)가 meta 를 선점 — pending 은 무의미해져 조용히 소거된다.
         *s.agent_meta.lock().unwrap() = Some(("codex".into(), "codex".into()));
-        super::check_agent_death(&daemon, &sys, &mut rc);
+        super::check_agent_death(&daemon, &sys, &mut rc, &mut sp);
         assert!(
             s.pending_agent_obs.lock().unwrap().is_none(),
             "meta 선점 시 pending 소거(스테이징 잔존 금지)"

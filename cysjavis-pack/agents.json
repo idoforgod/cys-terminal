@@ -1,6 +1,6 @@
 {
-  "_schema": 2,
-  "_doc": "에이전트 어댑터 정의. launch-agent가 사용: 기동 명령 → inject_delay_secs 대기 → 역할 디렉티브를 stdin push. clear_cmd=cycle-agent의 컨텍스트 초기화 명령, resume_arg=restore/node-recover의 대화 기억 복원 플래그, approval_patterns=데몬 승인 격상 스캔(자동 응답 절대 없음 — 감지·feed 격상만). ★예외 1건: approval_patterns 의 name=\"trust-prompt\" 항목만 launch-agent 의 폴더신뢰 자동확인이 소비한다(Return 1발·멱등 래치·전송 상한 — 사람 판단이 필요한 tool-permission 류는 절대 자동응답하지 않는다). _schema=agents.json 구조 버전(현재 2 — ready_marker·approval_patterns 는 코드 기본값(내장 vendor)+user override 필드 계층 적용). 사용자 환경에 맞게 수정 가능(~/.cys/pack/agents.json).",
+  "_schema": 3,
+  "_doc": "에이전트 어댑터 정의. launch-agent가 사용: 기동 명령 → inject_delay_secs 대기 → 역할 디렉티브를 stdin push. clear_cmd=cycle-agent의 컨텍스트 초기화 명령, resume_arg=restore/node-recover의 대화 기억 복원 플래그, approval_patterns=데몬 승인 격상 스캔(자동 응답 절대 없음 — 감지·feed 격상만). ★예외 1건: approval_patterns 의 name=\"trust-prompt\" 항목만 launch-agent 의 폴더신뢰 자동확인이 소비한다(Return 1발·멱등 래치·전송 상한 — 사람 판단이 필요한 tool-permission 류는 절대 자동응답하지 않는다). _schema=agents.json 구조 버전(현재 3 — ready_marker·approval_patterns·first_run_gates 는 코드 기본값(내장 vendor)+user override 필드 계층 적용. 3에서 first_run_gates 봉투가 추가됐다). 사용자 환경에 맞게 수정 가능(~/.cys/pack/agents.json).",
   "claude": {
     "cmd": "claude --dangerously-skip-permissions",
     "env": { "CLAUDE_CONFIG_DIR": "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}" },
@@ -21,7 +21,13 @@
         "name": "trust-prompt",
         "pattern": "Do you trust the files in this folder"
       }
-    ]
+    ],
+    "first_run_gates": {
+      "_doc": "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·신기능안내) 코퍼스의 **override 봉투**다. 코퍼스 정본은 코드에 임베드돼 있고(src/first_run_gates.rs) 이 파일에는 사본을 두지 않는다 — 사본이 늘면 문면이 갈린다. 여기서 할 수 있는 것: source=\"builtin\"(기본, 정본에 gates[]를 id로 병합) 또는 \"replace\"(gates[]만 사용), measured_on=이 선언을 실측한 claude 버전(정본과 다르면 그 관문의 통과 액션은 보류되고 감지만 한다), gates[]=관문 선언(id·title·needles·widget·confirm_echo·default_index·action{select_index,label,literal}·passability·human_reason). ★로그인·OAuth는 기계가 통과시킬 수 없어(자격증명이 config dir 경로해시로 봉인되고 OAuth 재시도는 무한 루프) human_only로 고정돼 있고 선언으로 승격되지 않는다. ★needles에는 질문형 문면만 넣는다 — 확인 에코·버튼 라벨(예: \"Yes, I trust this folder ✔\")을 넣으면 통과 직후 화면이 다시 관문으로 읽혀 다음 Return이 면책창의 \"No, exit\"를 누른다(2026-07-29 실사고 형태). ★이 봉투를 디스크로 병합(pack-merge)하지 마라: 병합하는 순간 사용자 소유 파일이 되어 이후 벤더 갱신이 도달하지 않는다 — 비워 두면 코드 정본이 자동으로 따라온다. 관문 감지는 감지·격상 전용이며 자동응답 계약은 approval_patterns의 trust-prompt 1건 그대로다.",
+      "source": "builtin",
+      "measured_on": "2.1.241",
+      "gates": []
+    }
   },
   "gemini": {
     "cmd": "~/.local/bin/agy --dangerously-skip-permissions",

@@ -1531,17 +1531,33 @@ const MAX_REQUEST_LINE: usize = 10 * 1024 * 1024; // 지침 주입(수백 KB)에
 /// 여유가 3자릿수 배다. 생존 프로브(connect 후 즉시 drop)는 EOF 로 먼저 빠져나가 무관하다.
 const FIRST_LINE_IDLE_SECS: u64 = 60;
 
+/// 노브가 받아들이는 **상한**(초 · 1일). 이보다 큰 선언은 여기로 접는다.
+///
+/// ★왜 상한이 필요한가(실사고 클래스): 아래 판정부의 결과는 곧바로
+/// `tokio::time::Instant::now() + cap` 이 된다. std `Instant::add` 는 오버플로에서
+/// **패닉**하므로, `CYS_CONN_FIRST_LINE_SECS` 에 대략 9.2e18 이상이 들어오면 **모든 연결
+/// 핸들러 태스크가 패닉**한다 — 데몬은 accept 만 하고 전 RPC 가 불통이 된다(살아 있는 척하는
+/// 데몬이 가장 나쁜 상태다). 음수·비숫자는 이미 안전하다(parse 실패 → 기본값 · 진리표가 박제).
+/// 뚫린 것은 **거대 양수** 한 축뿐이었다.
+/// 값 1일: "첫 줄을 하루 동안 안 보내는 클라이언트"는 어떤 운용에서도 정상이 아니고,
+/// 상한 해제를 원하면 계약대로 `0`(= 무한 대기)을 쓰면 된다 — 노브의 표현력이 줄지 않는다.
+const FIRST_LINE_IDLE_MAX_SECS: u64 = 86_400;
+
 /// 롤백 스위치 — `CYS_CONN_FIRST_LINE_SECS=0` 이면 첫 줄 상한 해제(개정 전 무한 대기 거동),
-/// 양수면 그 값(초). 코드 revert 없이 무력화 가능해야 한다는 단위 계약의 집행부다.
+/// 양수면 그 값(초 · [`FIRST_LINE_IDLE_MAX_SECS`] 로 클램프). 코드 revert 없이 무력화 가능해야
+/// 한다는 단위 계약의 집행부다.
 fn first_line_idle_timeout() -> Option<std::time::Duration> {
     parse_first_line_cap(cys::env_compat("CYS_CONN_FIRST_LINE_SECS").as_deref())
 }
 
 /// 순수 판정부 — env 를 인자로 받아 테스트가 프로세스 전역 env 를 흔들지 않게 한다.
+///
+/// **불변식**: 반환값은 언제나 `Instant` 에 더할 수 있다(오버플로 패닉 도달 불가).
+/// 진리표가 그 불변식을 전 축에서 실측한다.
 fn parse_first_line_cap(raw: Option<&str>) -> Option<std::time::Duration> {
     match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(0) => None,
-        Some(v) => Some(std::time::Duration::from_secs(v)),
+        Some(v) => Some(std::time::Duration::from_secs(v.min(FIRST_LINE_IDLE_MAX_SECS))),
         None => Some(std::time::Duration::from_secs(FIRST_LINE_IDLE_SECS)),
     }
 }
@@ -2996,7 +3012,10 @@ mod auto_restore_tests {
 
 #[cfg(test)]
 mod first_line_idle_tests {
-    use super::{handle_connection_capped, parse_first_line_cap, Stream, FIRST_LINE_IDLE_SECS};
+    use super::{
+        handle_connection_capped, parse_first_line_cap, Stream, FIRST_LINE_IDLE_MAX_SECS,
+        FIRST_LINE_IDLE_SECS,
+    };
     use crate::state::Daemon;
     use std::sync::Arc;
     use std::time::Duration;
@@ -3030,6 +3049,48 @@ mod first_line_idle_tests {
             Some(Duration::from_secs(FIRST_LINE_IDLE_SECS)),
             "오타가 상한을 조용히 없애면 안 된다"
         );
+        // ── ★거대값 축(2026-08-24) — 종전엔 이 축이 통째로 없었고, 그래서 뚫려 있었다 ──
+        // 음수·비숫자는 이미 안전하다(parse 실패 → 기본값 · 바로 위 두 줄이 박제). 위험은
+        // **거대 양수** 하나였다: 판정 결과가 그대로 `Instant::now() + cap` 이 되는데
+        // std `Instant::add` 는 오버플로에서 **패닉**하므로, 그 값이 들어오면 **모든 연결
+        // 핸들러 태스크가 패닉**하고 데몬은 accept 만 하는 전 RPC 불통 상태가 된다.
+        assert_eq!(
+            parse_first_line_cap(Some("-5")),
+            Some(Duration::from_secs(FIRST_LINE_IDLE_SECS)),
+            "음수는 종전대로 파싱 실패 → 기본값(이 축은 이미 안전했다)"
+        );
+        for giant in ["9223372036854775807", "18446744073709551615", "9300000000000000000"] {
+            assert_eq!(
+                parse_first_line_cap(Some(giant)),
+                Some(Duration::from_secs(FIRST_LINE_IDLE_MAX_SECS)),
+                "거대값 {giant} 이 클램프되지 않았다 — 연결 핸들러 전면 패닉 경로"
+            );
+        }
+        // ★불변식 실측: 어떤 입력에서도 결과는 `Instant` 에 더할 수 있다(패닉 도달 불가).
+        //   `checked_add` 가 `None` 이면 그것이 곧 프로덕션의 패닉 지점이다.
+        for raw in [
+            None,
+            Some("0"),
+            Some(" 7 "),
+            Some("nope"),
+            Some("-5"),
+            Some("86400"),
+            Some("86401"),
+            Some("9223372036854775807"),
+            Some("18446744073709551615"),
+        ] {
+            if let Some(cap) = parse_first_line_cap(raw) {
+                assert!(
+                    std::time::Instant::now().checked_add(cap).is_some(),
+                    "raw={raw:?} → cap={cap:?} 이 Instant 오버플로를 만든다 \
+                     (프로덕션의 `Instant::now() + cap` 이 패닉한다)"
+                );
+                assert!(
+                    tokio::time::Instant::now().checked_add(cap).is_some(),
+                    "raw={raw:?} → tokio Instant 오버플로(실제 사용 지점)"
+                );
+            }
+        }
     }
 
     /// ★U-6(서버측) 회귀 박제: **연결만 잡고 한 줄도 보내지 않는 클라이언트**에서 연결 태스크가

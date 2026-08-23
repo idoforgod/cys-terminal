@@ -256,6 +256,16 @@ EXIT_USAGE = 64              # EX_USAGE(sysexits.h) — 미지 서브커맨드·
 #   이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
 CYS_BOOT_EXIT_BUSY = 75
 
+# ★(U-11) `cys launch-agent` 의 **관문 보류 전용 종료코드**(sysexits EX_CONFIG) — Rust 정본
+#   `cys::EXIT_GATE_PENDING`. 의미: "pane 은 만들어졌고 에이전트 프로세스는 살아 있으나 첫기동
+#   관문(테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)에 갇혀 입력을 받지 못한다.
+#   좌석은 **닫지 않았다**."
+#   0 도 1 도 아닌 값을 쓰는 이유: 0 이면 소비부가 '노드를 세웠다'로 읽어 지침·티켓을 태우고
+#   (그 주입의 Return 이 실측상 면책 창의 `No, exit` 을 누른다 = 노드 사망), 1 이면 '깨졌다'로
+#   읽어 **살아 있는 좌석을 회수·파괴**하려 든다. `H-EXIT-11` 이 3자 파리티를 기계 대조한다.
+#   구 바이너리는 78 을 내지 않으므로(0/1 만) 이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
+CYS_LAUNCH_EXIT_GATE_PENDING = 78
+
 # claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — hooks/session-start.sh 의 self-demote
 # 대조 지점과 동일 어휘. 종전 주석은 `session-start.sh:101` 을 가리켰으나 실제 대조는 그 아래
 # `$CLAIM_OUT` grep 이다 — 낡은 라인 참조를 지운다).
@@ -1445,6 +1455,18 @@ def _dept_fallback(log, claim_out):
         sref = m.group(0) if m else None
         log.step(STEP.DEPT_FB_MASTER, code, "launch-agent master → %s\n%s%s"
                  % (sref, out[-1200:], err[-1200:]))
+        # ★(U-11) 보류는 '기동 실패' 가 아니다 — pane 도 프로세스도 살아 있고, 사람이 관문을
+        #   1회 통과시키면 그 좌석을 그대로 쓴다. 처방이 갈리므로 문안도 갈라야 한다(종전 문안은
+        #   "claude CLI 설치를 확인하라" 였다 — 설치는 멀쩡한데 엉뚱한 곳을 보게 만든다).
+        #   판정은 여전히 실패다: 부서장이 아직 지휘할 수 없기 때문이다(거짓 성공 금지).
+        if code == CYS_LAUNCH_EXIT_GATE_PENDING:
+            return log.fail(STEP.DEPT_FB_MASTER, code,
+                            "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있다"
+                            "(%s · 좌석은 닫지 않았다). 그 pane 에서 관문을 1회 통과시킨 뒤 재시도하라 —"
+                            " ★면책 창의 기본 포커스는 `No, exit` 이므로 그대로 Return 하면 노드가"
+                            " 종료된다(아래 방향키 1회 뒤 Return).\n%s%s"
+                            % (name, out[-800:], err[-800:]),
+                            EXIT_BOOT, ok=None, state="dept_fallback_gate_pending")
         if code != 0:
             return log.fail(STEP.DEPT_FB_MASTER, code,
                             "부서장 기동 실패(%s). claude CLI 설치·부서 데몬 상태를 확인하라.\n%s%s"

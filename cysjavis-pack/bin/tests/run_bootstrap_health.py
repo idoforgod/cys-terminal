@@ -2024,6 +2024,103 @@ def h_exit_9():
     return "exit 11 · stdout 무접촉 · 비-master 명시 · waited=false · 별도 기록 · 계측검증=%s" % calib
 
 
+@specimen("H-EXIT-11", "W6",
+          "launch-agent 관문 보류 exit(78) 3자 파리티 + 보류≠성공≠실패 소비 계약",
+          ["U-11", "S-3", "④ 전 pane 사망"])
+def h_exit_11():
+    """U-11: `cys launch-agent` 의 종전 계약은 **성공 0 / 그 밖 전부 1** 이었다. 그 1비트에는
+    "pane 은 만들어졌고 에이전트 프로세스도 살아 있는데, 첫기동 관문에 갇혀 아직 못 쓴다" 가
+    담기지 않는다. 두 오독이 각각 사고다:
+      · 0 으로 접으면 → 소비부가 '노드를 세웠다'로 읽어 지침·티켓을 태운다. 그 주입의 Return 이
+        **실측상 면책 창의 `No, exit`** 을 눌러 노드를 종료시킨다(rc 1).
+      · 1 로 접으면 → '기동이 깨졌다'로 읽어 **살아 있는 좌석을 회수·파괴**하려 든다
+        (치명위험 ④ — 오살이 오탐보다 훨씬 비싸다).
+    그래서 전용 값을 쓰고, `EXIT_BOOT_BUSY=75` 가 세운 **exit 이름공간 4단 절차**를 그대로 따른다:
+    lib 정본 → CLI 소비 → python 상수 → GUI 분기. 이 검체가 그 4단을 기계 대조한다.
+    """
+    notes = []
+    lib = _read(os.path.join(REPO_DIR, "src", "lib.rs"))
+    cli = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
+    boot_src = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+
+    # ① lib 정본 + 이름공간: 게이트 exit 공간(2~11)을 침범하지 않는다.
+    need("pub const EXIT_GATE_PENDING: i32 = 78;" in lib, "lib 정본 상수 부재/값 이탈")
+    need(not (2 <= 78 <= 11), "게이트 exit 공간 판정식 오류(계측기 파손)")
+    # ② CLI 소비: 세 호출부 중 **보류를 낼 수 있는 둘**이 이 값을 쓴다(launch·node-recover).
+    # 접미 확장(`..._DISABLED`)이 계수에 섞이지 않게 **정확한 심볼 경계**로 센다.
+    cli_uses = len(re.findall(r"cys::EXIT_GATE_PENDING(?![A-Z_])", cli))
+    need(cli_uses >= 3,
+         "CLI 소비 지점이 부족하다(%d) — 생산(launch·node-recover)과 소비(run_boot·restore)가 "
+         "모두 같은 값을 통과해야 한다" % cli_uses)
+    # ★계수만으로는 **어느 지점이 빠졌는지**를 못 잡는다(테스트 assert 만 남아도 수가 찬다).
+    #   생산 2곳·소비 3곳을 각각 구조로 못박는다 — 하나라도 1/0 으로 되돌아가면 그 지점이 곧
+    #   '살아 있는 좌석을 회수·파괴' 또는 '지침을 관문 창에 주입' 경로다.
+    for producer, why in (
+        ("Ok(BootVerdict::GatePending { .. }) => cys::EXIT_GATE_PENDING,",
+         "node-recover 가 보류를 전용 exit 로 내지 않는다 — rc 1 이면 run_boot 이 reclaim(kill)로 "
+         "에스컬레이션해 살아 있는 에이전트를 죽인다"),
+        ("            cys::EXIT_GATE_PENDING\n        }",
+         "launch-agent 의 보류 분기가 전용 exit 를 반환하지 않는다 — 0 이면 소비부가 지침·티켓을 "
+         "태우고(그 Return 이 면책 창을 누른다), 1 이면 좌석 회수 처방이 나간다"),
+    ):
+        need(producer in cli, why)
+    for consumer, why in (
+        ("if rc == cys::EXIT_GATE_PENDING {", "run_boot·restore 의 보류 수신 분기 결손"),
+        ("if launch_rc == cys::EXIT_GATE_PENDING {", "run_boot 의 launch 보류 수신 분기 결손"),
+    ):
+        need(consumer in cli, why)
+    # ③ python 미러 — 값 파리티.
+    need("CYS_LAUNCH_EXIT_GATE_PENDING = 78" in boot_src, "python 소비부 상수 이탈(파리티 붕괴)")
+    need("CYS_LAUNCH_EXIT_GATE_PENDING" in boot_src.split("def ", 1)[-1] or
+         boot_src.count("CYS_LAUNCH_EXIT_GATE_PENDING") >= 2,
+         "python 이 상수를 **선언만** 하고 소비하지 않는다(유령 상수)")
+    # ④ GUI 분기 — 보류에서 팀 부트를 이어 붙이지 않는다(그 주입이 관문 창의 Return 이 된다).
+    gui_path = os.path.join(REPO_DIR, "src-tauri", "src", "main.rs")
+    if os.path.isfile(gui_path):
+        gui = _read(gui_path)
+        need(gui.count("cys::EXIT_GATE_PENDING") >= 2,
+             "GUI 가 보류를 별도 분기하지 않는다(마스터·부서장 두 경로 — 실패 토스트로 뭉개짐)")
+        for m in re.finditer(r"cys::EXIT_GATE_PENDING", gui):
+            seg = gui[m.end():m.end() + 900]
+            need("spawn_orchestra_boot" not in seg.split("if out.status.success()")[0],
+                 "GUI 보류 분기가 팀 부트를 이어간다 — 관문 창에 주입하면 그 Return 이 노드를 죽인다")
+    notes.append("4단 파리티(lib 78 ↔ CLI ↔ python ↔ GUI)")
+
+    # ⑤ H-DOC-4 와의 비충돌: 78 은 bootstrap **자기** exit 공간이 아니므로 헤더 표에 없어야 한다
+    #    (있으면 '유령 exit' 로 잡힌다 — 그 검체가 코드 도달성으로 판정하기 때문).
+    head = boot_src[:boot_src.index('"""', boot_src.index('"""') + 3)]
+    need(not re.search(r"(?<![\w.])78=", head),
+         "78 이 bootstrap 헤더 exit 표에 등재됐다 — 그 표는 bootstrap 자기 exit 공간이고, "
+         "78 은 launch-agent 의 값이라 H-DOC-4 가 유령 계약으로 잡는다")
+    notes.append("헤더 exit 표 비침범(H-DOC-4 무충돌)")
+
+    # ⑥ 소비 계약 실측: 보류는 `cys boot` 의 Fatal 판정을 오염시키지 않는다(살아 있는 노드다).
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_bootstrap as B
+    gated = json.dumps({"roles": [{"role": "cso", "agent": "claude",
+                                   "outcome": "gate_pending", "mandatory": True}]})
+    need(B._boot_fatal_verdict(0, gated) is None,
+         "관문 보류가 Fatal 실패로 오분류 — 살아 있는 좌석에 회수·파괴 처방이 나간다")
+    need(B._boot_was_busy(0, gated) is False, "보류가 busy(무스폰)로 오분류 — 티켓 회계 오염")
+    # 진짜 실패는 여전히 Fatal 이다(완화 금지 대조군).
+    failed = json.dumps({"roles": [{"role": "cso", "agent": "claude",
+                                    "outcome": "failed", "mandatory": True}]})
+    need(B._boot_fatal_verdict(1, failed) is not None,
+         "의무 역할 failed 가 Fatal 로 승격되지 않음(보류 도입이 실패 판정을 삼켰다)")
+    notes.append("소비 실측: 보류≠Fatal·≠busy · 진짜 실패=Fatal 불변")
+
+    # ⑦ 계측 타당성 — 구 트리에는 이 값도 타입도 없다(탐지기가 진짜 부재를 잡는지 확인).
+    calib = "skip(no-git)"
+    old_lib = _git_show(os.path.join("src", "lib.rs"))
+    old_cli = _git_show(os.path.join("src", "bin", "cys.rs"))
+    if old_lib is not None and old_cli is not None:
+        need("EXIT_GATE_PENDING" not in old_lib, "계측 타당성 실패: 구 lib 에 이미 상수가 있다")
+        need("BootVerdict" not in old_cli, "계측 타당성 실패: 구 CLI 에 이미 타입드 판정이 있다")
+        calib = "구 트리=상수·타입 양쪽 부재 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
 @specimen("H-EXIT-10", "W1a", "②ping 실패에도 알림 시도 발생(카브아웃 제거·notifier 단일화)", ["A15", "R2"])
 def h_exit_10():
     with tempfile.TemporaryDirectory() as tmp:
@@ -2416,27 +2513,53 @@ def h_safe_2():
     """
     src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     notes = []
-    bi = src.find("fn boot_agent_on_surface(")
-    body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
+    # ★핀 이사(U-13): 밸브의 **판정**은 `src/readiness.rs` 의 증거 사다리 첫 항으로 옮겼고,
+    #   cys.rs 에는 관측(`agent_alive` 조회)과 귀결(ready/break) 배선만 남는다. 세 계약을
+    #   그대로 옮긴다 — ⓐ커널 사실 근거 ⓑ화면 무의존 ⓒ마커보다 선행. 판정 조건은 하나도
+    #   완화하지 않았고, 관문 문면 AND 항 하나가 **추가**됐다(그 축은 H-READY-13 이 본다).
+    body = _slice_between(src, "fn boot_agent_on_surface(",
+                          "\n/// 에이전트 기동 + 역할 지침", "H-SAFE-2 부트 본문")
+    judge = _slice_between(src, "pub fn judge(",
+                           "// ── 판정부 끝(핀 슬라이스 경계) ──", "H-SAFE-2 판정부")
     # ① 안전 밸브 — agent_alive 커널 사실 기반, 델타 실패와 독립
     need("안전 밸브" in body and 's["agent_alive"].as_bool()' in body,
          "readiness 안전 밸브가 없다 — 델타 가정이 깨지면 건강 pane 전부 close(④)")
-    vi = body.find("★★안전 밸브")
-    need(vi > 0, "안전 밸브 블록 앵커를 못 찾았다")
-    # 밸브 코드 구간 = 앵커부터 마커 분기 직전까지(주석 길이에 의존하지 않는 경계).
-    mi_tmp = body.find("match &ready_marker {", vi)
-    need(mi_tmp > vi, "안전 밸브 뒤에 마커 분기가 없다")
-    valve = body[vi:mi_tmp]
-    need("ready = true" in valve, "안전 밸브가 ready 를 세우지 않는다")
-    need("if alive {" in valve, "안전 밸브가 agent_alive 조건 분기를 갖지 않는다")
-    need("break;" in valve, "안전 밸브가 폴링 루프를 벗어나지 않는다")
-    # 밸브는 마커 판정보다 **앞**에 있어야 실효가 있다(마커 실패로 루프가 끝나기 전에 발화)
-    mi = body.find("match &ready_marker {")
-    need(0 < vi < mi, "안전 밸브가 마커 분기 뒤에 있다(델타 실패 시 도달 못 함)")
-    notes.append("안전 밸브: agent_alive 커널 사실·마커 분기 선행")
+    # 밸브 **배선** 구간 = 앵커부터 판정 배선 끝까지. ready 를 세우고 루프를 벗어나는 귀결이
+    # 여기 있어야 한다(귀결이 사라지면 밸브가 판정만 하고 아무 일도 하지 않는다).
+    wire = _slice_between(body, "★★안전 밸브", "// ── readiness 판정 배선 끝 ──",
+                          "H-SAFE-2 밸브 배선")
+    need("ready = true" in wire, "안전 밸브가 ready 를 세우지 않는다")
+    need("break;" in wire, "안전 밸브가 폴링 루프를 벗어나지 않는다")
+    need("cys::readiness::judge(&obs)" in wire,
+         "배선이 판정부를 타지 않는다 — ready 선언이 다시 여러 자리로 흩어졌다")
+    # 밸브 **판정** — 커널 사실 조건 분기 + 마커 항보다 앞(사다리 순서 계약).
+    vi = judge.find("★★안전 밸브")
+    need(vi > 0, "판정부에서 안전 밸브 항 앵커를 못 찾았다")
+    mi = judge.find("★마커 델타 우선")
+    need(0 < vi < mi, "안전 밸브가 마커 항 뒤에 있다(델타 실패 시 도달 못 함 — 사다리 순서 역전)")
+    valve = judge[vi:mi]
+    need("o.agent_alive == Some(true)" in valve, "안전 밸브가 agent_alive 조건 분기를 갖지 않는다")
+    need("Evidence::Valve" in valve, "안전 밸브가 ready 근거를 산출하지 않는다")
+    # ★핀 이사(P3-0 · 2026-08-24): 밸브의 **두 번째 근거**는 '꼬리 술어' 가 아니라 **맨 셸 판별**
+    #   이다. 종전 AND 항(`tail_ok`)의 판정기는 이름과 달리 "마지막 비공백 줄의 끝문자가
+    #   `%` `$` `#` `❯` 인가" 를 보는 검사인데, `❯` 는 **살아있는 Claude Code TUI 의 입력
+    #   프롬프트 그 자체**다 — 그래서 건강한 pane 에서 밸브가 **상시 차단**됐고, 밸브의 존재
+    #   이유(영구 오부정 차단)가 사문화됐다. 항을 지운 것이 아니라 **비용 부호가 맞는 술어로
+    #   교체**한 것이므로 핀도 함께 이사한다(단언 수는 1 → 4 로 늘었다).
+    need("bare_shell_ok" in valve,
+         "밸브가 두 번째 근거(맨 셸 판별)와의 AND 를 잃었다 — alive 단독은 래퍼 생존을 사망 은폐로 "
+         "허용한다(P1-1 회귀)")
+    need("o.agent_alive == Some(true) && tail_ok" not in valve,
+         "밸브가 다시 꼬리 술어와 AND 를 걸었다 — 살아있는 TUI 의 꼬리는 `❯` 라 건강 pane 이 상시 "
+         "차단된다(P3-0 회귀: 밸브 사문화)")
+    need("fn screen_is_bare_shell_on(" in src,
+         "밸브 전용 술어(맨 셸 판별)가 없다 — 판정 축이 다시 꼬리 술어 하나로 겸직한다")
+    need("bare_shell: Some(screen_is_bare_shell(text))" in body,
+         "밸브 전용 축의 관측이 판정 입력으로 실리지 않는다 — 밸브가 미관측으로 영구 차단된다")
+    notes.append("안전 밸브: agent_alive 커널 사실 + 맨 셸 판별 AND(P3-0) · 마커 항 선행 · 배선 귀결 보존")
     # B4 오탐 방향 불변: 밸브의 **판정 근거**(주석 제외 실코드)에 화면/델타 텍스트가 없다.
     valve_code = "\n".join(ln for ln in valve.splitlines() if not ln.strip().startswith("//"))
-    for banned in ("delta_text", "delta_flat", "text.contains"):
+    for banned in ("o.delta", "o.screen", "delta_text", "delta_flat", "text.contains"):
         need(banned not in valve_code,
              "안전 밸브가 화면/델타 텍스트를 근거로 쓴다(%s) — 커널 사실 독립성 상실" % banned)
     notes.append("밸브 근거=화면 무의존(B4 오탐 방향 불변)")
@@ -3613,6 +3736,370 @@ def h_pred_1():
             "(스큐 시뮬·stderr 고지) · 계측검증=%s" % (len(_SEAT_CORPUS), calib))
 
 
+@specimen("H-SEAT-4AXIS", "W6",
+          "좌석 제4 등급 gate_pending 4자 파리티(Rust seat ∥ python node_liveness ∥ "
+          "orchestra check ∥ 결손 산출) 차분 0",
+          ["U-10", "B3", "A1", "S-4"])
+def h_seat_4axis():
+    """U-10(2026-08-23): 좌석 생존 판정은 이 저장소의 **샷건 서저리 지점 S-4** 다 —
+    같은 규칙이 Rust `seat_liveness` · python `node_liveness` · `orchestra check_verdicts` ·
+    `boot_agent_on_surface` readiness 네 곳에 흩어져 있고, 그중 **3벌만 결박**돼 있었다.
+
+    제4 등급 `gate_pending`("프로세스는 살아 있으나 첫기동 관문에 갇혀 입력 불가")을 더하면서
+    네 축이 같은 좌석을 반대로 읽으면, 그것이 곧 A1·B3 클래스(판정 이원화)의 새 인스턴스다.
+    그래서 **차분 0** 을 기계로 단언한다.
+
+    ★이 검체가 지키는 **두 축의 분리**가 이 단위에서 가장 위험한 계약이다:
+      · '충족(satisfied)인가' → 관문 보류는 **아니다**(그래야 관문에 갇힌 팀이 "정상 가동 중"
+        으로 집계되지 않는다).
+      · '살아 있는가(= 파괴 금지인가)' → 관문 보류는 **그렇다**(`node_alive` → reclaim kill
+        게이트). 이 축이 뒤집히면 첫기동 관문에 갇힌 신규 프로필의 4종 노드가 전부 kill 대상이
+        되어 **전 pane 사망(글자 0)** 이다. 두 축을 섞는 것이 이 단위의 유일한 치명 실수다.
+
+    ★additive 계약: 이 단계에는 **생산자가 없다**(데몬 wire 값 항상 null). 그래서 구 데몬 ↔ 신
+      CLI 혼재 스모크가 '종전 판정 그대로'를 내야 한다 — 그것도 함께 잰다.
+    """
+    BN, O, B = _shared_pred()
+    notes = []
+
+    # ── 계측 타당성 먼저: 구 트리에 이 축이 이미 있으면 탐지기가 무엇도 잡지 못한다 ──
+    calib = "skip(no-git)"
+    old_bn = _git_show(os.path.join("cysjavis-pack", "bin", "javis_boot_node.py"))
+    old_rs = _git_show(os.path.join("src", "bin", "cys.rs"))
+    if old_bn is not None and old_rs is not None:
+        need("LIVENESS_GATED" not in old_bn,
+             "계측 타당성 실패: 구 팩에 이미 제4 등급이 있다(탐지기 무효)")
+        need("GatePending" not in old_rs,
+             "계측 타당성 실패: 구 Rust 에 이미 제4 등급이 있다(탐지기 무효)")
+        calib = "구 트리=제4 등급 부재(python·Rust 양쪽) 확인"
+
+    # ── 축① Rust `seat_liveness`(boot 스킵 술어) — 소스 배선 핀 ──
+    #   경로 소유는 SCAN_TARGETS("readiness") — 핀 이사 계약(U-2) 준수.
+    src = _scan_source("readiness")
+    need("GatePending" in src, "Rust 측 제4 등급 변형이 없다(python 만 등급 — 파리티 붕괴)")
+    li = src.find("fn seat_liveness(")
+    need(li > 0, "Rust seat_liveness 본문을 못 찾았다")
+    lbody = src[li:src.find("\n}\n", li)]
+    need("gate_pending_from_wire" in lbody,
+         "Rust seat_liveness 가 관문 축을 읽지 않는다(축 미배선)")
+    gi, ai = lbody.find("gate_pending_from_wire"), lbody.find('s["agent_alive"].as_bool()')
+    need(0 <= gi < ai,
+         "Rust 관문 분기가 agent_alive 분기보다 뒤다 — 관문 좌석도 프로세스는 살아 있으므로 "
+         "그 분기는 영원히 도달 불가(죽은 코드)이고 보류가 다시 already_alive 로 접힌다")
+    # already_alive 집합에서 **제외**돼야 한다(이 등급의 존재 이유).
+    ri = src.find("if matches!(grade, SeatLiveness::AwakeConfirmed")
+    need(ri > 0, "run_boot 의 already_alive 술어를 못 찾았다")
+    need("GatePending" not in src[ri:ri + 300],
+         "제4 등급이 already_alive 집합에 들어갔다 — 관문에 갇힌 팀이 '정상 가동 중'으로 집계된다")
+    # 파괴 체인(node-recover 주입 → reclaim kill)보다 **앞에서** 빠져나가야 한다.
+    bi = src.find("if grade == SeatLiveness::GatePending {")
+    di = src.find("match seat_death_confirmed(row)")
+    need(0 < bi < di,
+         "관문 보류 분기가 파괴 체인보다 뒤다 — 살아 있는 입력창에 기동 커맨드 주입·kill 경로 노출")
+    # 파괴 술어 3중 AND 는 **동결**이다(stale 보류가 reclaim 을 영구 마비시키는 A1 역방향 차단).
+    ji = src.find("fn seat_death_confirmed(")
+    need(ji > 0, "seat_death_confirmed 본문을 못 찾았다")
+    need("gate_pending" not in src[ji:src.find("\n}\n", ji)],
+         "파괴 경로 3중 AND 가 관문 축을 소비한다 — 동결 계약 위반(stale 보류 = 회수 영구 마비)")
+    notes.append("축① Rust: 등급 실재·순서(관문<agent_alive)·already_alive 제외·파괴체인 이전 이탈·"
+                 "3중 AND 동결")
+
+    # ── 축②③④ 실행 차분 — 같은 fixture 를 python·orchestra·결손 산출이 어떻게 읽는가 ──
+    req = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster()]
+
+    def _team(first_row):
+        return _fx([first_row] + [{"role": r, "exited": False, "awakened_at": 1.0}
+                                  for r in req[1:]])
+
+    gated_row = {"role": req[0], "exited": False, "agent_alive": True, "seat": "occupied",
+                 "gate_pending": {"gate": "disclaimer", "since": 1.0}}
+    gated = _team(gated_row)
+    # 대조군 = 같은 좌석에서 관문 축만 뺀 것(구 데몬 = 키 부재 · 신 데몬 무보류 = null)
+    plain = _team({k: v for k, v in gated_row.items() if k != "gate_pending"})
+    nulled = _team(dict(gated_row, gate_pending=None))
+
+    # 축② python node_liveness
+    need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_GATED,
+         "python 이 관문 좌석을 제4 등급으로 읽지 않는다")
+    # 축③ orchestra check_verdicts — **충족 아님**
+    v_gate, _ = O.check_verdicts(gated)
+    need(v_gate[req[0]]["grade"] == BN.LIVENESS_GATED, "check 가 제4 등급을 전달하지 않는다")
+    need(v_gate[req[0]]["satisfied"] is False,
+         "관문 보류가 충족으로 접혔다 — 관문에 갇힌 팀이 READY 로 집계된다(이 단위의 존재 이유 소멸)")
+    # 축④ 결손 산출(부트 경로) — 충족 아님이므로 결손>0
+    has, why = B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)
+    need(has is True, "관문 보류인데 결손 0(부트가 영영 호출되지 않는다): %s" % why)
+    # ★차분 0 계약: 세 축이 같은 결론(미충족 ⟺ 결손>0)이고, 대조군에서 셋 다 뒤집힌다.
+    for name, st in (("구 데몬(키 부재)", plain), ("신 데몬 무보류(null)", nulled)):
+        need(BN.node_liveness(st, req[0])[0] == BN.LIVENESS_PRESUMED,
+             "%s 에서 종전 등급이 변형됐다(혼재 안전 붕괴 — 부재 ≠ 부정)" % name)
+        vv, _ = O.check_verdicts(st)
+        need(vv[req[0]]["satisfied"] is True, "%s 에서 충족이 뒤집혔다(위경보)" % name)
+        need(B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0)[0] is False,
+             "%s 에서 결손이 발생했다(불필요 boot churn)" % name)
+    notes.append("축②③④ 차분 0(관문=미충족∧결손>0 · 대조군 2종=충족∧결손0)")
+
+    # ── ★★두 축의 분리(치명 앵커 ④) — 충족 아님이 곧 죽음이 되면 안 된다 ──
+    need(BN.node_alive(gated, req[0]) is True,
+         "관문 보류 좌석을 죽음으로 판정 — reclaim kill 게이트가 열린다(전 pane 사망 경로 신설)")
+    need(BN._reclaim_verdict(gated, req[0], 100, 100) == "hold-alive",
+         "관문 보류 좌석에 kill 허용(오살) — 파괴 경로 보류 우선 위반")
+    need(BN.latch_death_confirmed(gated_row)[0] is False,
+         "살아 있는 관문 좌석이 죽음 3중 확정으로 읽힌다")
+    notes.append("두 축 분리: 미충족 ∧ 생존(파괴 금지)")
+
+    # ── 롤백 킬스위치 1지점 — env 하나로 축 전체가 종전 판정으로 복귀한다 ──
+    _prev = os.environ.get(BN.GATE_PENDING_ENV)
+    try:
+        os.environ[BN.GATE_PENDING_ENV] = "0"
+        need(BN.gate_pending_axis_enabled() is False, "킬스위치 '0' 이 축을 끄지 못한다")
+        need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_PRESUMED,
+             "킬스위치 off 인데 python 축이 살아 있다")
+        vv, _ = O.check_verdicts(gated)
+        need(vv[req[0]]["satisfied"] is True, "킬스위치 off 인데 check 가 여전히 미충족")
+        need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)[0] is False,
+             "킬스위치 off 인데 결손이 남는다(롤백 1지점 계약 붕괴)")
+    finally:
+        if _prev is None:
+            os.environ.pop(BN.GATE_PENDING_ENV, None)
+        else:
+            os.environ[BN.GATE_PENDING_ENV] = _prev
+    need(BN.gate_pending_axis_enabled() is True, "킬스위치 복원 실패(검체 오염)")
+    # ── ★(BLOCK-3 잔여분 · 2026-08-24) 마스터·강등 스위치도 **데몬 축까지** 닿는다 ──
+    #   종전엔 축 술어(Rust `gate_pending_axis_enabled` · python 미러)가 `CYS_GATE_PENDING`
+    #   **하나만** 읽었다. 그래서 마스터(`CYS_BOOT_GATES=0`)를 눌러도 데몬은 이미 실린 표식을
+    #   **TTL 30분까지 계속 직렬화**했다 — CLI 는 종전 판정인데 데몬은 여전히 보류로 좌석을
+    #   내보내는 **반쪽 롤백**이고, 그 상태가 정확히 BLOCK-4 가 없앤 "관측은 있는데 귀결이
+    #   없는" 조합이다. 문서화된 손잡이 하나가 **전 소비자**에 닿아야 '되돌렸다'가 참이 된다.
+    for _env, _on, _loose, _label in (
+            (BN.BOOT_GATES_ENV, "0", ("", "false", "off", "1", " 0"), "마스터"),
+            (BN.GATE_PENDING_CLOSE_ENV, "1", ("", "true", "yes", "on", " 1"), "강등")):
+        _p = os.environ.get(_env)
+        try:
+            os.environ[_env] = _on
+            need(BN.gate_pending_axis_enabled() is False,
+                 "%s 스위치(%s=%s)가 축을 끄지 못한다 — 데몬 직렬화에 닿지 않는 손잡이다"
+                 % (_label, _env, _on))
+            need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_PRESUMED,
+                 "%s 스위치 off 인데 python 축이 살아 있다" % _label)
+            need(O.check_verdicts(gated)[0][req[0]]["satisfied"] is True,
+                 "%s 스위치 off 인데 check 가 여전히 미충족" % _label)
+            need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)[0] is False,
+                 "%s 스위치 off 인데 결손이 남는다(불필요 boot churn)" % _label)
+            for _l in _loose:
+                os.environ[_env] = _l
+                need(BN.gate_pending_axis_enabled() is True,
+                     "%s 스위치가 느슨한 값 %r 을 받았다(오타로 안전장치가 조용히 뒤집힌다)"
+                     % (_label, _l))
+        finally:
+            if _p is None:
+                os.environ.pop(_env, None)
+            else:
+                os.environ[_env] = _p
+    need(BN.gate_pending_axis_enabled() is True, "3스위치 복원 실패(검체 오염)")
+    # Rust 정본이 같은 3스위치를 **한 지점에서** 접는지 소스로 대조한다(2언어 동형성).
+    _lib_axis = _repo_file(os.path.join("src", "lib.rs"))
+    _ax_head = _lib_axis.find("pub fn gate_pending_axis_enabled() -> bool {")
+    need(_ax_head > 0, "Rust 축 술어 래퍼가 사라졌다")
+    _ax_body = _lib_axis[_ax_head:_lib_axis.find("\n}\n", _ax_head)]
+    for _v in ("std::env::var(ENV_BOOT_GATES)", "std::env::var(ENV_GATE_PENDING_CLOSE)",
+               "std::env::var(ENV_GATE_PENDING)"):
+        need(_v in _ax_body,
+             "Rust 축 술어가 `%s` 를 읽지 않는다 — python 미러와 접기가 갈렸다(한쪽만 롤백)" % _v)
+    need("pub fn gate_pending_axis_effective_from(" in _lib_axis,
+         "축 노출 판정의 순수 코어가 없다(진리표 대상 소실)")
+    need("fn master_switch_reaches_the_daemon_serialization_axis(" in _lib_axis,
+         "마스터→데몬 도달 진리표 배터리 결손")
+    notes.append("롤백 3스위치(마스터 CYS_BOOT_GATES=0 · 강등 CYS_GATE_PENDING_CLOSE=1 · "
+                 "축 CYS_GATE_PENDING=0) 각각 단독으로 데몬 축까지 도달 · 2언어 접기 동형")
+
+    # ── 데몬 wire 동형성: surface.list ∥ org.status ∥ topology 가 **한 직렬화 지점**을 쓴다 ──
+    hsrc = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    need(hsrc.count("(cys::GATE_PENDING_KEY): s.gate_pending_wire()") == 2,
+         "surface.list·org.status 두 메서드가 같은 키·같은 직렬화를 노출하지 않는다(동형성 붕괴 — "
+         "한쪽만 있으면 python 미러가 축을 영영 못 본다)")
+    need('("alt_screen", json!(true), json!(false))' in hsrc
+         and "cys::GATE_PENDING_KEY," in hsrc,
+         "동형성 핀이 축 **표**로 일반화되지 않았다(축 추가마다 assert 복제 = 한쪽 누락)")
+    ssrc = _repo_file(os.path.join("src", "bin", "cysd", "state.rs"))
+    need("pub gate_pending: Mutex<Option<GatePending>>" in ssrc, "데몬 스키마에 제4 등급 자리가 없다")
+    need("pub fn gate_pending_wire(" in ssrc,
+         "직렬화 단일 지점이 없다 — 세 소비처가 각자 json! 하면 키·형·킬스위치가 갈린다")
+    gsrc = _repo_file(os.path.join("src", "bin", "cysd", "governance.rs"))
+    need("s.gate_pending_wire()" in gsrc, "topology 영속에 관측 슬롯이 없다(재기동 후 사람이 못 읽는다)")
+    lib = _repo_file(os.path.join("src", "lib.rs"))
+    for pin in ('pub const ENV_GATE_PENDING: &str = "CYS_GATE_PENDING";',
+                'pub const GATE_PENDING_KEY: &str = "gate_pending";',
+                "pub fn gate_pending_from_wire_with("):
+        need(pin in lib, "lib 정본 상수/순수코어 부재: %s" % pin)
+    need(BN.GATE_PENDING_ENV == "CYS_GATE_PENDING" and BN.GATE_PENDING_KEY == "gate_pending",
+         "python 미러의 키·env 이름이 Rust 정본과 갈렸다(한쪽만 롤백되는 사고)")
+    need(BN.BOOT_GATES_ENV == "CYS_BOOT_GATES"
+         and BN.GATE_PENDING_CLOSE_ENV == "CYS_GATE_PENDING_CLOSE",
+         "python 미러의 마스터·강등 스위치 이름이 Rust 정본과 갈렸다(한쪽만 롤백되는 사고)")
+    need('pub const ENV_BOOT_GATES: &str = "CYS_BOOT_GATES";' in lib
+         and 'pub const ENV_GATE_PENDING_CLOSE: &str = "CYS_GATE_PENDING_CLOSE";' in lib,
+         "Rust 정본의 스위치 이름 상수가 사라졌다")
+    notes.append("데몬 wire 동형성(2메서드+topology 단일 직렬화)·이름 3자 파리티")
+
+    # ── 치명위험 ③: phoenix 부활 대상 판정 — 관문 보류 좌석은 **부활 target 이 아니다** ──
+    #   현행 `_alive` 는 seat=="empty" 만 비생존으로 읽는다 → occupied 인 관문 좌석은 생존 =
+    #   target 제외. 그것이 **옳다**: 살아 있는 pane 을 부활시키면 중복 좌석·claim_denied·관문
+    #   재진입 루프(치명위험 ① 폭주)가 된다. 이 술어가 바뀌면 여기가 적색이 되어 재검토를 강제한다.
+    ph = _repo_file(os.path.join("cysjavis-pack", "bin", "javis_phoenix.py"))
+    need('if s.get("seat") == "empty":' in ph,
+         "phoenix 생존 술어가 좌석 사실 기반이 아니다 — 관문 보류 좌석이 부활 target 에 섞일 수 있다")
+    notes.append("phoenix: 관문 보류(seat=occupied)는 부활 target 제외(현행 술어로 성립)")
+
+    # ── ★축④(readiness) — **핀 이사 완료(U-11)** ──
+    #   U-10 시점의 이 자리는 "readiness 는 아직 생산하지 않는다"는 **미결박 고지 핀**이었고,
+    #   생산자가 붙는 순간 적색이 되어 확장을 강제하도록 설계돼 있었다. U-11 이 생산자를 붙였으니
+    #   그 핀을 **지우지 않고 이사**시킨다 — '생산하지 않는다' → '생산하되 이 계약을 지킨다'.
+    #   완화가 아닌 이유: 단언 수가 1 → 8 로 늘고, 지키는 대상이 '부재'에서 **파괴 금지 배선**으로
+    #   올라간다. 축④의 진리표 자체는 언어 경계 때문에 Rust 배터리가 실측한다(아래 ⑧에서 대조).
+    bi2 = src.find("fn boot_agent_on_surface(")
+    need(bi2 > 0, "boot_agent_on_surface 본문을 못 찾았다")
+    # ① 타입드 3분기가 실재한다(Result<(),String> 1비트 붕괴로의 회귀 차단).
+    need("enum BootVerdict {" in src, "readiness 결과가 타입화되지 않았다(1비트로 회귀)")
+    for variant in ("Ready,", "GatePending { gate: String, tail: String }",
+                    "LaunchFailed { evidence: String }"):
+        need(variant in src, "BootVerdict 변형 결손: %s" % variant)
+    need("-> Result<BootVerdict, String>" in src[bi2:bi2 + 2000],
+         "boot_agent_on_surface 가 타입드 판정을 반환하지 않는다")
+    # ② 생산 근거 = **커널 사실**이다. 화면 문자열로 파괴를 결정하면 렌더 방식·벤더 문면 한 번의
+    #    변화가 곧 좌석 파괴다(H-SAFE-2 밸브와 같은 규율을 판정기에도 건다).
+    ti = src.find("fn readiness_timeout_verdict(")
+    need(ti > 0, "타임아웃 분류 순수함수가 없다(진리표 테스트 불가·판정이 흩어짐)")
+    tbody = src[ti:src.find("\n}\n", ti)]
+    tcode = "\n".join(ln for ln in tbody.splitlines() if not ln.strip().startswith("//"))
+    need("alive == Some(false)" in tcode,
+         "파괴 허용 조건이 '커널이 부재를 확정' 이 아니다 — 판정 불가·생존이 파괴로 접힐 수 있다")
+    for banned in ("delta_text", "delta_flat", "text.contains", "screen["):
+        need(banned not in tcode,
+             "판정기가 화면 텍스트를 근거로 쓴다(%s) — 커널 사실 독립성 상실" % banned)
+    # ★U-13 트립와이어(이사된 감시): 판정 근거가 '관문 코퍼스' 로 바뀌는 날 이 핀이 적색이 되어
+    #   4축 파리티를 **관문 판정 기준으로** 다시 재도록 강제한다.
+    need(tcode.count("BootVerdict::") == 2,
+         "판정기의 결과 집합이 2종(LaunchFailed·GatePending)을 벗어났다 — 판정 근거가 바뀌었다면 "
+         "H-SEAT-4AXIS 를 그 기준으로 다시 세워라(U-13)")
+    # ③ launch 호출부: 보류에서 close 에 **도달할 수 없다**(치명위험 ④ 차단의 본체).
+    li2 = src.find("fn run_launch_agent_opts(")
+    need(li2 > 0, "run_launch_agent_opts 를 못 찾았다")
+    lbody2 = src[li2:src.find("\n/// 온보딩③", li2) if src.find("\n/// 온보딩③", li2) > 0
+                 else li2 + 12000]
+    gi2 = lbody2.find("Ok(BootVerdict::GatePending")
+    # 실패 합류 지점 = `LaunchFailed | Err` or-패턴(롤백 close 를 한 벌로 유지하는 구조).
+    ei2 = lbody2.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {",
+                      gi2 if gi2 > 0 else 0)
+    need(0 < gi2 < ei2, "launch 호출부에 보류 분기가 없거나 실패 분기보다 뒤다")
+    need('"surface.close"' not in lbody2[gi2:ei2],
+         "보류 분기가 좌석을 닫는다 — 살아 있는 에이전트를 파괴(치명위험 ④ 재발)")
+    need('"surface.close"' in lbody2[ei2:],
+         "실패 분기의 롤백 close 가 사라졌다 — 진짜 실패 좌석이 역할을 쥔 채 쌓인다(완화 금지)")
+    # ④ stdout 계약: 보류에서도 surface ref 가 나간다(GUI·bootstrap 의 claim 귀속 재료).
+    #    ★**무조건** 출력이어야 한다 — `if ready { println!… }` 같은 조건부로 바뀌면 보류 pane 은
+    #    살아 있는데 소비부(GUI start_master·bootstrap ③claim)가 그 ref 를 못 받아 '유령 pane'
+    #    이 된다. 그래서 존재만 보지 않고 **판정 반환과의 인접**(들여쓰기 포함)을 구조로 고정한다.
+    need('        println!("{}", surface_ref(sid));\n        Ok(verdict)' in lbody2,
+         "stdout surface ref 계약이 무조건 출력이 아니다 — 보류 pane 이 소비부에서 사라진다"
+         "(조건부로 감싸는 변경이면 그 조건이 곧 유령 pane 이다)")
+    need(0 < lbody2.find('println!("{}", surface_ref(sid));') < gi2,
+         "stdout 출력이 보류 분기보다 뒤다(보류에서 ref 가 나가지 않는다)")
+    # ⑤ node-recover → run_boot: **kill 체인 차단**. 보류가 escalate_reclaim 앞에서 빠져나가야 한다.
+    ri2 = src.find("fn run_boot(")
+    rbody2 = src[ri2:src.find("\n/// `cys boot` bare exit", ri2)]
+    # ★접미 확장(`..._DISABLED` 같은 이름 바꿔치기)으로 핀을 비껴가지 못하게 **여는 중괄호까지**
+    #   묶어 찾는다 — 부분문자열 핀은 이 저장소가 반복해서 뚫린 구멍이다(계측 자기감시).
+    ci2, ki2 = (rbody2.find("rc == cys::EXIT_GATE_PENDING {"),
+                rbody2.find("escalate_reclaim(role)"))
+    need(0 < ci2 < ki2,
+         "node-recover 보류가 reclaim(kill)보다 뒤다 — 관문에 갇힌 살아있는 에이전트를 죽인다")
+    need("outcome\": \"gate_pending" in rbody2,
+         "run_boot 이 보류를 typed outcome 으로 내지 않는다(실패로 뭉개짐)")
+    need(rbody2.count("fatal_failed += 1;") >= 3,
+         "Fatal 계상 지점이 줄었다(%d) — 보류 도입이 진짜 실패를 exit 0 으로 접었다"
+         % rbody2.count("fatal_failed += 1;"))
+    # ⑥ restore in-seat: **fresh 폴백 금지**(좌석 증식·관문 재진입 루프 차단).
+    si2 = src.find("fn run_restore(")
+    sbody2 = src[si2:src.find("\n/// T2-7", si2)]
+    gj = sbody2.find("Ok(BootVerdict::GatePending")
+    fj = sbody2.find("run_launch_agent_opts(")
+    need(0 < gj < fj, "restore 보류 분기가 없거나 fresh 폴백보다 뒤다")
+    need("continue;" in sbody2[gj:fj],
+         "restore 보류가 fresh 로 폴백한다 — 살아있는 역할에 좌석을 하나 더 만들고 같은 관문에 "
+         "재진입한다(폭주 씨앗)")
+    # ⑦ 롤백 1지점 + write path 3자 파리티 + 만료 규약.
+    need(src.count("cys::gate_pending_close_override()") == 1,
+         "롤백 킬스위치 판독이 1지점이 아니다(%d) — 한 곳만 빠져도 '되돌렸다'가 거짓말이 된다"
+         % src.count("cys::gate_pending_close_override()"))
+    # ★두 스위치가 **합류**해야 한다 — 축 스위치(`CYS_GATE_PENDING=0`)만 눌렀을 때 CLI 가 계속
+    #   보류하면 'pane 은 남는데 좌석은 already_alive' 인 반쪽 롤백(관측 없는 보류 = 허위 READY)이다.
+    need("pub fn gate_pending_close_override_from(" in lib and
+         "!gate_pending_axis_enabled_from(axis_env)" in lib,
+         "롤백 합류(두 스위치 OR)가 없다 — 반쪽 롤백 상태가 열린다")
+    # ── ★(BLOCK-3 · BLOCK-4 · 2026-08-24) 마스터 스위치 + '엄격 판정 + 즉시 close' 불변식 ──
+    #
+    # BLOCK-4(재난④ 실증): `CYS_GATE_PENDING=0` **단독**이 "엄격 판정 + 즉시 close" 를 만들었다 —
+    #   `gate_pending_close_override_from(None, Some("0")) == True`(합류 OR) 인데
+    #   `readiness::legacy_v1_from(None) == False`(엄격 유지) → 관문 화면이 `GateHeld` 로 영원히
+    #   ready 가 아니고 → readiness 타임아웃 → `LaunchFailed` 강등 → 호출부 `surface.close`.
+    #   **문서화된 롤백 스위치 하나로 전 pane 사망**이다. 불변식은 "보류 장치를 끄면 판정도 함께
+    #   종전(느슨)으로 돌아간다" 이고, 그 소유자는 `gate_axes_from` **하나**여야 한다.
+    # BLOCK-3: 축 노브 단독으로는 종전 동작이 돌아오지 않았다(리뷰어 4칸 진리표) — 사고 순간에
+    #   사람이 쥐는 손잡이는 **마스터 스위치 하나**여야 한다.
+    for pin in ('pub const ENV_BOOT_GATES: &str = "CYS_BOOT_GATES";',
+                "pub fn boot_gates_master_off_from(", "pub struct GateAxes {",
+                "pub fn gate_axes_from(", "pub fn gate_axes_forced_legacy()"):
+        need(pin in lib, "BLOCK-3/BLOCK-4 정본 결손: %s" % pin)
+    need('env_val == Some("0")' in lib,
+         "마스터 스위치가 느슨한 truthy 를 받는다 — 오타로 안전장치가 조용히 뒤집힌다")
+    ax = _slice_between(lib, "pub fn gate_axes_from(", "\n}\n", "H-SEAT-4AXIS 판정 축 접기")
+    need("holding_off" in ax and "gate_pending_close_override_from(close_env, axis_env)" in ax,
+         "판정 축 접기가 보류 장치 상태를 합류시키지 않는다 — BLOCK-4 조합이 되살아난다")
+    for axis in ("readiness_legacy: holding_off", "inject_guard_off: holding_off",
+                 "trust_legacy: holding_off"):
+        need(axis in ax,
+             "축 '%s' 이 보류 꺼짐과 함께 풀리지 않는다 — 그 축만 엄격하게 남아 관문 화면이 "
+             "곧 close 가 된다(재난④)" % axis)
+    # ★경로는 레지스트리 경유로만 얻는다(핀 이사 계약 ⓒ — 직접 `_repo_file` 은 우회다).
+    need(src.count("|| crate::gate_axes_forced_legacy()") == 1,
+         "readiness 축이 상위 접기값을 소비하지 않는다 — 마스터 스위치가 거짓말이 된다")
+    need(_scan_source("inject_guard").count("|| crate::gate_axes_forced_legacy()") == 2,
+         "inject_guard 의 두 축(가드·신뢰) 중 하나가 상위 접기값을 소비하지 않는다")
+    need("cys::ENV_BOOT_GATES" in src,
+         "보류 처방·진단 문안이 **실제로 듣는** 스위치를 알려주지 않는다 — 사람이 축 노브만 끄고 "
+         "여전히 보류되어 원인을 못 찾는다(BLOCK-3)")
+    for battery in ("fn strict_judgment_and_immediate_close_is_unreachable_in_every_env_combination(",
+                    "fn master_switch_alone_restores_the_previous_behavior_on_every_axis(",
+                    "fn pre_fix_composition_reproduced_strict_judgment_with_immediate_close(",
+                    "fn every_axis_knob_folds_in_the_master_switch_source_pin("):
+        need(battery in lib, "BLOCK-3/BLOCK-4 진리표 배터리 결손: %s" % battery)
+    need("fn gate_hold_prescription_names_the_switch_that_actually_works(" in src,
+         "처방 문안 검체 결손 — 듣지 않는 손잡이만 안내하는 회귀를 아무 데서도 못 잡는다")
+    notes.append("마스터 스위치 1개 · 축 3종 합류 · '엄격+즉시close' 불변식 단일 소유 · 배터리 4종")
+    need('"surface.gate_pending"' in src, "CLI 가 표식을 기록하는 write path 가 없다")
+    need('"surface.gate_pending" =>' in hsrc, "데몬에 표식 write path RPC 가 없다(생산자 미착지)")
+    need("gate_denied" in hsrc, "자칭 선언 차단(산출자=평가자) 게이트가 없다")
+    need("gate_pending_fresh" in ssrc,
+         "직렬화 지점이 만료(TTL)를 상의하지 않는다 — 사람이 관문을 통과해도 좌석이 영구 미충족"
+         "(부트 라이브락 A1)")
+    for pin in ("pub const GATE_PENDING_TTL_SECS", "pub fn gate_pending_fresh(",
+                'pub const ENV_GATE_PENDING_CLOSE: &str = "CYS_GATE_PENDING_CLOSE";',
+                "pub const EXIT_GATE_PENDING: i32 = 78;"):
+        need(pin in lib, "lib 정본 결손: %s" % pin)
+    # ⑧ 축④ **실측**은 Rust 배터리가 한다(순수 판정기 진리표) — python 은 그 실재를 대조한다.
+    #    언어 경계 때문에 검체가 직접 호출할 수 없다: 그래서 '재는 곳'을 옮기되 '재는 사실'은
+    #    옮기지 않는다(계측 위치의 이동이지 판정의 완화가 아니다).
+    for battery in ("fn gate_verdict_truth_table_is_decided_by_the_kernel_fact(",
+                    "fn gate_verdict_rollback_switch_demotes_at_exactly_one_point(",
+                    "fn gate_verdict_exit_code_is_neither_success_nor_failure("):
+        need(battery in src, "축④ 진리표 배터리 결손: %s" % battery)
+    notes.append("축④ readiness=생산(커널 사실) · close 도달불가 · kill 체인 차단 · fresh 폴백 0 · "
+                 "stdout 계약 보존 · 롤백 1지점 · TTL 실재 · 진리표 배터리 3종")
+
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
 @specimen("H-PRED-2", "W2", "생존 술어 parity(boot 스킵·wakeup zombie·reclaim)", ["B3", "B13", "G27"])
 def h_pred_2():
     """B3·B13·G27: 같은 좌석 상태를 세 소비처가 반대로 해석했다. 하나의 `node_liveness` 를
@@ -3955,9 +4442,14 @@ def h_pred_8():
       그 오부정은 **건강한 surface 를 실제로 닫는다**."""
     src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     notes = []
-    bi = src.find("fn boot_agent_on_surface(")
-    need(bi > 0, "boot_agent_on_surface 를 못 찾았다")
-    body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
+    # ★핀 이사(U-13): 마커 판정은 `src/readiness.rs` 의 순수 술어로 옮겼고 cys.rs 에는 관측·배선이
+    #   남는다. **세 계약(①델타 우선 ②셸 프롬프트 가드 ③개수 비교 0)은 그대로 옮긴다** — 다만
+    #   ③은 이제 **양쪽**(배선·판정부)에서 본다. 판정이 한 자리로 모였다고 금지 범위가 줄면
+    #   그것은 이사가 아니라 완화다.
+    body = _slice_between(src, "fn boot_agent_on_surface(",
+                          "\n/// 에이전트 기동 + 역할 지침", "H-PRED-8 부트 본문")
+    judge = _slice_between(src, "pub fn judge(",
+                           "// ── 판정부 끝(핀 슬라이스 경계) ──", "H-PRED-8 판정부")
     # ⓐ 기동 send **직전** 커서 스냅샷
     si = body.find("let since_line: u64")
     ti = body.find('"surface.send_text"')
@@ -3967,20 +4459,26 @@ def h_pred_8():
     need('"since_line": since_line' in body, "readiness 폴링이 델타를 읽지 않는다")
     need("screen_shows_launch_failure(&delta_flat)" in body,
          "기동 실패 판정이 화면 전체를 본다(잔존 에러로 새 기동 사망)")
-    need("delta_text.contains(m.as_str())" in body, "마커 판정이 델타 우선이 아니다")
+    need("delta: &delta_text" in body,
+         "판정 입력에 델타가 실리지 않는다 — 마커 판정이 델타 우선일 수 없다(배선 절단)")
+    need("o.delta.contains(m)" in judge, "마커 판정이 델타 우선이 아니다")
     need('"since_line": inject_cursor' in body, "주입 검증이 델타를 쓰지 않는다(잔존 화면 오통과)")
     notes.append("3소비자(마커·실패·주입검증) 델타 결박")
-    # ⓒ 마커 분기에도 셸 프롬프트 가드
-    mi = body.find("delta_text.contains(m.as_str())")
-    seg = body[mi:mi + 1500]
-    need("screen_tail_is_shell_prompt(text)" in seg,
-         "마커 분기에 screen_tail_is_shell_prompt 가드가 없다(브리프 명문)")
+    # ⓒ 마커 분기에도 셸 프롬프트 가드 — 판정부의 화면 폴백 항 + 그 재료의 배선
+    mi = judge.find("o.delta.contains(m)")
+    seg = judge[mi:mi + 1500]
+    need("tail_ok" in seg,
+         "마커 화면 폴백에 꼬리 술어 가드가 없다(브리프 명문 — 잔존 마커에 오통과)")
+    need("tail_is_shell_prompt: Some(screen_tail_is_shell_prompt(text))" in body,
+         "꼬리 술어 관측이 판정 입력으로 실리지 않는다 — 가드가 이름만 남는다")
     notes.append("마커 분기 셸 프롬프트 가드")
-    # ⓓ **개수 비교 금지** — 마커 카운트 산술이 없다
+    # ⓓ **개수 비교 금지** — 마커 카운트 산술이 없다(배선·판정부 **양쪽**)
     for banned in (".matches(m", "count()", "marker_count", "prev_count"):
         need(banned not in body,
              "개수 비교 구현 흔적(%s) — 영구 오부정 회귀·건강 surface 실제 close 위험" % banned)
-    notes.append("개수 비교 구현 0")
+        need(banned not in judge,
+             "판정부에 개수 비교 구현 흔적(%s) — 이사한 자리에서 금지가 풀렸다" % banned)
+    notes.append("개수 비교 구현 0(배선·판정부)")
     # ⓔ 잔존 ❯ 시나리오 순수 판정: 꼬리가 셸 프롬프트면 폴백이 발화하지 않는다
     need("t.ends_with('❯')" in src, "셸 프롬프트 가드가 ❯ 를 인식하지 않는다")
     # ⓕ line_count 가 surface.list 에 노출됨(커서 원천)
@@ -4017,8 +4515,19 @@ def h_pred_9():
     seg = seg[:seg.index("\n}\n") + 2]
     for k in ("ready_marker", "approval_patterns"):
         need('"%s"' % k in seg, "계층 대상에 %s 누락" % k)
+    # ★U-12 계층 확장(축 이동이지 완화가 아니다): 계층 대상이 2키 → 3키가 됐다. 신규 키는
+    #   문자열 리터럴이 아니라 lib 상수를 참조하므로(사본 금지) 키 이름이 아니라 **상수 참조**
+    #   와 **개수**를 잰다. 종전 2키 조건은 위에서 그대로 유지된다(항 삭제 0).
+    need("cys::first_run_gates::ADAPTER_KEY" in seg,
+         "계층 대상에 first_run_gates 신규 키 미편입 — 관문 코퍼스가 기존 기계에 도달하지 않는다(K-1)")
+    need("LAYERED_KEYS: [&str; 3]" in seg, "계층 대상 개수가 3이 아니다")
     need("resolved.get(k).is_some()" in seg,
          "디스크 선언(명시 null 포함) 존중 규칙 부재 — 사용자 주권 침해")
+    # 고지 규율: 신규 키는 **조용히** 채운다. 매 기존 기계에서 매번 결손이라 안내가 소음이 되고,
+    # 안내 문안이 권하는 pack-merge 는 이 키에서 해로운 조치다(디스크로 병합되는 순간 사용자
+    # 소유가 되어 이후 벤더 갱신이 도달하지 않는다 = 배달 경로 자해).
+    need("NOTIFY_KEYS: [&str; 2]" in seg,
+         "고지 대상이 2키가 아니다 — 신규 키 고지는 소음이고 pack-merge 권유는 배달 자해다")
     need("embedded_agents_json(" in body, "vendor 임베드 소스 부재(코드 기본값 계층 없음)")
     # ② trust 패턴은 선언에서 읽고 **trust-prompt 항목만** 소비한다
     need("fn trust_prompt_regex(" in body, "trust 패턴 선언 소비 함수 부재(하드코딩 잔존)")
@@ -4028,7 +4537,10 @@ def h_pred_9():
     need("approval_patterns" in tseg, "패턴 소스가 approval_patterns 가 아니다")
     # ③ agents.json 스키마 버전 + trust-prompt 선언 실재 + 자동응답 금지 계약 문구
     aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
-    need(aj.get("_schema") == 2, "agents.json _schema 가 2 가 아니다(계층 계약 미표기): %r"
+    # ★핀 이사(U-2 ②) — 값이 2 → 3 으로 **이동**했다(U-12 가 first_run_gates 봉투를 넣으며 범프).
+    #   완화가 아닌 이유: 조건의 형태(정확히 한 값과 일치)는 그대로이고 비교 대상만 현행 스키마로
+    #   옮겼다. 범위(`in (2,3)`)로 넓히지 않는 것이 핵심이다 — 넓히면 다음 범프가 조용히 통과한다.
+    need(aj.get("_schema") == 3, "agents.json _schema 가 3 이 아니다(계층 계약 미표기): %r"
          % aj.get("_schema"))
     doc = aj.get("_doc", "")
     need("trust-prompt" in doc and "자동응답" in doc,
@@ -4038,15 +4550,29 @@ def h_pred_9():
     need("trust-prompt" in names, "claude 어댑터에 trust-prompt 선언이 없다(자동확인 불발)")
     need(len([n for n in names if n != "trust-prompt"]) > 0,
          "trust-prompt 외 패턴이 0건 — 'trust-prompt 만 소비' 계약의 대조군이 사라졌다")
-    # ④ 하드코딩 needle 은 **폴백으로만** 남는다 — 선언 패턴이 **먼저** 판정한다.
-    #    (needle 제거가 아니라 병존이 정답이다: 패턴 부재·컴파일 실패 시의 유일한 경로이고,
-    #     구 문면에 더 강건하다. 그래서 검체는 '제거'가 아니라 **순서**를 못박는다.)
+    # ④ 폴백 축은 **선언 패턴 뒤**에 온다 — 순서를 못박는다(제거가 아니라 순서가 계약이다).
+    #    ★핀 이사(U-15): 폴백의 **대상**이 하드코딩 needle → **관문 코퍼스(U-12 정본) 소비**로
+    #      옮겨 갔다. 구 needle 이 킬체인의 방아쇠였기 때문이다(확인 에코 `Yes, I trust this
+    #      folder ✔` 에 재매칭 → 2발째 Return 이 면책창의 `No, exit` 를 누름). 그래서
+    #      "선언 패턴이 먼저" 라는 **축은 그대로 두고 대상만 이사**시키고, 코퍼스 소비 자체를
+    #      새 `need` 로 **추가**한다(항 삭제 0 · 완화 0).
+    #    ★`.index()` → `.find()`: 앵커가 사라지면 `.index()` 는 `ValueError` 를 던져 검체가
+    #      '판정 실패'가 아니라 **예외로 죽는다** — 측정 불능이 적색으로 보고되지 않는 선재
+    #      결함이다(U-2 §ⓒ 와 같은 형태). `.find()` 는 -1 → 비교 False → FAIL 로 흐른다.
     need("fn trust_prompt_hit(" in body, "trust 판정 합성 함수 부재(순서 계약을 확인할 자리 없음)")
     hseg = body[body.index("fn trust_prompt_hit("):]
     hseg = hseg[:hseg.index("\n}\n") + 2]
     need("re.is_match(" in hseg, "선언 패턴이 판정에 쓰이지 않는다(하드코딩 1차 잔존)")
-    need(hseg.index("re.is_match(") < hseg.index("trustthisfolder"),
-         "하드코딩 needle 이 선언 패턴보다 먼저 판정한다(선언 무력화)")
+    ri = hseg.find("re.is_match(")
+    ci = hseg.find("inject_guard::folder_trust_needle_hit(")
+    need(ci > 0,
+         "폴백 축이 관문 코퍼스(U-12 정본)를 소비하지 않는다 — 하드코딩 needle 이 그대로거나 "
+         "새 사본이 생겼다(U-15 미착지)")
+    need(0 <= ri < ci, "코퍼스 폴백이 선언 패턴보다 먼저 판정한다(선언 무력화)")
+    li = hseg.find("trustthisfolder")
+    need(li < 0 or ri < li, "구 하드코딩 needle 이 선언 패턴보다 먼저 판정한다(선언 무력화)")
+    need(li < 0 or "legacy_v1 &&" in hseg[:li],
+         "구 결함 needle 이 롤백 스위치 없이 상시 판정에 남아 있다 — 확인 에코 재매칭 킬체인 재발")
     need("split_whitespace()" in hseg,
          "정규식을 flat 텍스트에 돌린다 — 선언 패턴의 공백 의미가 깨져 자동확인이 불발한다")
     calib = "skip(no-git)"
@@ -4056,8 +4582,285 @@ def h_pred_9():
              "계측 타당성 실패: 구 코드에 이미 선언 소비가 있다면 B19 는 결함이 아니다")
         need("fn fill_missing_fields(" not in old,
              "계측 타당성 실패: 구 코드에 이미 필드 계층이 있다면 C-1 은 결함이 아니다")
-        calib = "구 코드 하드코딩·whole-object 폴백 확인"
-    return "필드 계층 2키·디스크 존중 · trust-prompt 한정 소비 · _schema=2 · 계약 문구 · 계측검증=%s" % calib
+        need("first_run_gates" not in old,
+             "계측 타당성 실패: 구 코드에 이미 관문 신규 키가 있다면 K-1 은 결함이 아니다")
+        calib = "구 코드 하드코딩·whole-object 폴백·신규 키 부재 확인"
+    return "필드 계층 3키·디스크 존중 · trust-prompt 한정 소비 · _schema=3 · 계약 문구 · 계측검증=%s" % calib
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# U-12 · 관문 코퍼스 배달 경로 (K-1 해소)
+#
+# S-1 사본 대장 — **SOT 는 `src/first_run_gates.rs` 하나**이고 나머지는 전부 읽기 소비다.
+# 아래 두 표는 "정본에 없는데 살아 있는 문면"의 **명시 면제 목록**이다: 새 사본이 생기면
+# 표에 없으므로 적색이 되고, 면제를 넣으려면 사유를 함께 적어야 한다(조용한 확산 차단).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# `javis_phoenix_harness.py MODAL_MARKERS` 중 claude 관문 코퍼스가 덮지 **않는** 항목.
+GATE_MARKER_EXEMPT = {
+    "❯": "관문 6화면 **전부**에 있는 리스트 커서(= agents.json ready_marker 와 같은 문자). "
+         "단독으로는 아무 관문도 식별하지 못하므로 정본은 이것을 needle 이 아니라 위젯 서명으로만 쓴다.",
+    "keep browser": "claude 첫기동 관문이 아니라 리뷰어 CLI(agy) 의 브라우저 선택 프롬프트 — "
+                    "claude 코퍼스 범위 밖(어댑터가 다르다).",
+    "use my browser": "위와 같음(agy 브라우저 프롬프트).",
+}
+
+# `src/bin/cys.rs trust_prompt_hit` 의 내장 폴백 needle — 정본에 **의도적으로 담지 않는다**.
+# ★U-15 착지 후의 지위: 이 둘은 **상시 판정에서 내려와 롤백 분기**(`CYS_TRUST_RETURN_V1=1`)
+#   전용이 됐다. 삭제가 아니라 격하인 이유는 `trust_send`/`trust_prompt_hit` 의 doc 에 있다
+#   (감지 폭이 예상 밖으로 좁아졌을 때의 손잡이 · 되돌려도 1발 래치와 화면 재확인이 킬체인을
+#   따로 막는다). '롤백 밖에 있으면 적색' 은 H-PRED-9 ④ 와 H-KILLCHAIN-1 ⓖ 가 집행한다.
+GATE_LEGACY_CODE_NEEDLE = {
+    "trustthisfolder": "★결함 needle. 확인 에코 'Yes, I trust this folder ✔' 에 재매칭돼 2발째 "
+                       "Return 이 면책창의 'No, exit' 를 눌렀다(2026-07-29 실사고). 정본은 질문형 "
+                       "문면만 담아 이 형태를 구조적으로 금지한다. U-15 에서 롤백 분기로 격하됨.",
+    "Doyoutrust": "구 문면 폴백(공백 제거형). 정본의 'Do you trust this folder' needle 이 같은 "
+                  "화면을 덮는다. U-15 에서 롤백 분기로 격하됨.",
+}
+
+
+@specimen("H-DELIVER-1", "W6",
+          "★관문 코퍼스 배달 경로 — 신규 키가 구 agents.json 기계에 도달한다(K-1)", ["K-1"])
+def h_deliver_1():
+    """K-1(master 직접 확인 · 2026-08-23): `agents.json` 은 `Ownership::User` 다. **기존 설치
+    기계에는 `ready_marker`·`approval_patterns` 가 값으로 이미 있으므로**, `fill_missing_fields`
+    의 "키가 아예 없을 때만 보강" 규칙(= 사용자 주권)에 막혀 **벤더가 그 값을 고쳐 출하해도
+    결함이 있는 바로 그 기계들에는 영영 도달하지 않는다**. 따라서 관문 판정 데이터를
+    `agents.json` **값 수정**으로 배달하는 설계는 무효다.
+
+    이 단위의 답은 둘이다 — ⓐ 코퍼스 정본을 **코드에 임베드**(새 바이너리 = 새 코퍼스)
+    ⓑ `agents.json` 에는 **신규 키**(`first_run_gates`) 봉투만 둔다. 신규 키는 구 디스크
+    파일에 **부재**하므로 계층이 채우고, 그 순간 배달이 성립한다.
+
+    ★판정 분담(정직 고지): **행동 증명은 Rust 검체**
+    `h_deliver_1_old_agents_json_receives_new_key_from_embed` 가 한다 — 구 `agents.json`
+    픽스처를 실제로 디스크에 쓰고 `load_agent_spec` 을 돌려 신규 키가 채워지는지 본다
+    (`cargo test --bins`). 러너는 컴파일러가 아니므로 여기서는 **그 검체의 실재와 배선**을
+    핀한다: 검체 이름이 사라지거나 계층 배선이 끊기면 즉시 적색이다."""
+    frg_rel = os.path.join("src", "first_run_gates.rs")
+    if not os.path.isfile(os.path.join(REPO_DIR, frg_rel)):
+        if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+            raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        raise Fail("코드 임베드 정본 %s 이 없다 — 관문 데이터의 진실원천 부재(K-1 미해소)" % frg_rel)
+    sot = _repo_file(os.path.join("src", "first_run_gates.rs"))
+    cli = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
+
+    # ⓐ 코드 임베드 정본이 실측 관문 6종을 담고 있다.
+    need("const DEFS:" in sot, "관문 정본 표(DEFS) 부재 — 코퍼스가 코드에 없다")
+    for gid in ("theme", "login-method", "oauth-code", "folder-trust",
+                "bypass-disclaimer", "feature-announce-fullscreen"):
+        need('id: "%s"' % gid in sot, "정본에 관문 %s 누락(실측 6종 미달)" % gid)
+    # 로그인·OAuth 는 **기계가 통과시킬 수 없다** — 액션을 정의하지 않는다.
+    for gid in ("login-method", "oauth-code"):
+        seg = sot[sot.index('id: "%s"' % gid):]
+        seg = seg[:seg.index("},\n    Def {")] if "},\n    Def {" in seg else seg
+        need("Passability::HumanOnly" in seg, "%s 이 사람 전용으로 선언되지 않았다" % gid)
+        need("action: None" in seg, "%s 에 기계 액션이 선언됐다(통과 불가 관문에 키를 쏜다)" % gid)
+    # 버전 핀 — measured_on 드리프트 시 액션 보류(관측만)
+    need("MEASURED_ON" in sot and "HeldVersionDrift" in sot and "HeldVersionUnknown" in sot,
+         "버전 핀 게이트 부재 — 벤더 신기능마다 관문이 늘어나는데 무방비다")
+    need("fn action_policy(" in sot, "액션 집행 판정기 부재")
+
+    # ⓑ 배달 배선 — 계층 대상에 신규 키가 편입돼 있다(값 수정 경로가 아니라 **신규 키** 경로).
+    need("cys::first_run_gates::ADAPTER_KEY" in cli,
+         "LAYERED_KEYS 에 신규 키가 없다 — 봉투가 구 기계에 도달하지 않는다")
+    need("LAYERED_KEYS: [&str; 3]" in cli, "계층 대상이 3키가 아니다")
+
+    # ⓒ 봉투가 임베드 팩에 실재하고 **코퍼스 사본이 아니다**(S-1 재발 차단).
+    aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
+    env = (aj.get("claude") or {}).get("first_run_gates")
+    need(isinstance(env, dict), "agents.json claude 어댑터에 first_run_gates 봉투 부재: %r" % env)
+    need(env.get("source") == "builtin", "봉투 source 가 builtin 이 아니다: %r" % env.get("source"))
+    need(env.get("gates") == [],
+         "봉투가 코퍼스 사본을 들고 있다(gates=%r) — 정본은 코드 하나여야 한다" % (env.get("gates"),))
+    m = re.search(r'MEASURED_ON:\s*&str\s*=\s*"([^"]+)"', sot)
+    need(m, "정본에 MEASURED_ON 상수가 없다")
+    need(env.get("measured_on") == m.group(1),
+         "봉투 measured_on(%r) ↔ 코드 정본(%r) 파리티 파손 — 버전 핀이 갈렸다"
+         % (env.get("measured_on"), m.group(1)))
+    doc = env.get("_doc", "")
+    need("pack-merge" in doc,
+         "봉투 _doc 에 'pack-merge 하지 마라' 경고가 없다 — 병합하는 순간 사용자 소유가 되어 "
+         "이후 벤더 갱신이 도달하지 않는다(배달 경로 자해)")
+
+    # ⓓ **행동 증명 검체**의 실재 — 이름이 사라지면 배달성이 아무 데서도 실행되지 않는다.
+    need("fn h_deliver_1_old_agents_json_receives_new_key_from_embed(" in cli,
+         "배달성 행동 검체가 없다 — 정적 핀만으로는 '실제로 채워진다'를 증명하지 못한다")
+    tseg = cli[cli.index("fn h_deliver_1_old_agents_json_receives_new_key_from_embed("):]
+    tseg = tseg[:tseg.index("\n    }\n") + 6]
+    need("load_agent_spec(" in tseg, "행동 검체가 실경로(load_agent_spec)를 돌리지 않는다")
+    need("resolve_from_spec(" in tseg, "행동 검체가 배달된 봉투를 실제로 소비하지 않는다")
+    need("VENDOR-NEW-MARKER" in tseg,
+         "행동 검체에 K-1 대조군(디스크 값은 vendor 신값으로 덮이지 않는다)이 없다 — "
+         "대조가 없으면 '원래 되는 일'을 확인한 공허한 초록일 수 있다")
+    need("emb_without" in tseg,
+         "행동 검체에 기전 A/B 차분(임베드가 그 키를 들고 있을 때만 채워진다)이 없다 — "
+         "배달이 우연이 아님을 보이는 축이 빠졌다")
+
+    # ★계측 타당성: 기준 트리에는 정본도 신규 키도 없다(탐지기가 구 결함에서 FIRE 한다).
+    calib = "skip(no-git)"
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        need(_git_show(frg_rel) is None,
+             "계측 타당성 실패: 기준 트리에 이미 관문 정본이 있다면 K-1 은 결함이 아니다")
+        old_aj = _git_show(os.path.join("cysjavis-pack", "agents.json"))
+        need(old_aj is not None and "first_run_gates" not in old_aj,
+             "계측 타당성 실패: 기준 agents.json 에 이미 신규 키가 있다")
+        calib = "기준 트리에 정본·신규 키 부재 확인"
+    return ("정본 6관문(사람전용 2) · 버전 핀 · 계층 3키 배달 · 봉투=override 전용(사본 0) · "
+            "행동검체 배선 · 계측검증=%s" % calib)
+
+
+@specimen("H-GATE-SOT-1", "W6",
+          "관문 문면 SOT 1벌 — 나머지 사본은 읽기 소비이거나 명시 면제(S-1)", ["S-1"])
+def h_gate_sot_1():
+    """S-1(샷건 서저리): 관문 문면·마커가 **4벌**로 흩어져 있었고 어떤 파리티 검체도 그것을
+    지키지 않았다 — `agents.json` · `cys.rs` 내장 needle · `javis_phoenix_harness.py
+    MODAL_MARKERS` · (설계가 지목한) `javis_preflight.py`.
+    ★실측 정정: 현행 트리의 `javis_preflight.py` 에는 관문 **문면**이 없다(어댑터 선택 키
+      이름과 스키마 버전만 있고 그쪽은 H-DOC-7 이 지킨다). 즉 실제 사본은 3벌이다.
+      이 검체는 그 사실을 확인하고, **네 번째 사본이 새로 생기는 것**을 적색으로 만든다.
+
+    계약: SOT 는 `src/first_run_gates.rs` 하나다. 나머지는 ①정본이 덮거나 ②표에 사유와 함께
+    면제되어야 한다. 표에 없는 문면은 적색 — 사본은 조용히 늘고, 늘어난 사본은 갈린다."""
+    frg_rel = os.path.join("src", "first_run_gates.rs")
+    if not os.path.isfile(os.path.join(REPO_DIR, frg_rel)):
+        if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+            raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        raise Fail("관문 정본 %s 부재" % frg_rel)
+    sot = _repo_file(os.path.join("src", "first_run_gates.rs"))
+    cli = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
+    notes = []
+    # ★스캔 범위는 **코퍼스 표(DEFS)** 다 — 파일 전문이 아니다. 전문을 훑으면 결함 서사를
+    #   설명한 주석·킬체인 대조군 픽스처·구 needle 을 인용한 테스트까지 '선언'으로 오독한다
+    #   (실측: 첫 판이 정확히 그 이유로 거짓 적색을 냈다 — 결함이 아니라 계측기가 만든 적색).
+    #   판정 축은 처음부터 "**정본이 선언한 문면 집합**" 이었고, 그 집합은 이 표 안에만 있다.
+    need("const DEFS:" in sot, "관문 정본 표(DEFS) 부재 — 문면 집합을 특정할 수 없다")
+    _d0 = sot.index("const DEFS:")
+    defs = sot[_d0:sot.index("\n];", _d0) + 3]
+    def _lits(field):
+        out = []
+        for blk in re.findall(r"%s:\s*&\[(.*?)\]" % field, defs, re.S):
+            out += re.findall(r'"((?:[^"\\]|\\.)*)"', blk)
+        return out
+    sot_needles = _lits("needles")
+    sot_widgets = _lits("widget")
+    need(len(sot_needles) >= 6,
+         "정본 표에서 needle 을 %d건만 수확했다(수확기 파손 — fail-closed)" % len(sot_needles))
+    flat_decl = "".join("".join(x.split()) for x in sot_needles + sot_widgets)
+    flat_needles = {"".join(x.split()) for x in sot_needles}
+
+    # ── ★코퍼스 자기규칙(BLOCK-1 · BLOCK-2 · 2026-08-24) ─────────────────────────
+    #
+    # **대원칙**: 관문은 "그 관문이 화면에 떠 있을 때만 나타나는 것" 으로만 식별해야 한다.
+    # 인사 배너·상태 메시지·에러 문자열은 정상 화면에도 나타나므로 그 조건을 만족하지 않는다.
+    # 리뷰어 e2e 실증 — ⓐ theme 관문이 `"Welcome to Claude Code"`(배너) + `❯`(모든 정상 claude
+    # 프롬프트에 있는 문자) 단독 위젯으로 성립해 **건강한 노드**를 잡았다(rc 78 · 디렉티브 미주입 ·
+    # 사람도 통과시킬 관문이 화면에 없어 **영구 부트 라이브락**). ⓑ `oauth-code` 는 `widget: &[]`
+    # 로 AND 가드가 0이라 다른 CLI 의 브라우저 로그인 화면·로그 한 줄·`grep` 출력까지 전부
+    # `human_only` 관문으로 식별했다.
+    #
+    # 판정 자체(진리표·화면 대조)는 Rust 검체가 실행으로 증명한다 — 러너는 컴파일러가 아니므로
+    # 여기서는 ①규칙 장치의 실재 ②검체 이름 ③**표에서 직접 잴 수 있는 규칙 ⓑⓒ** 를 핀한다.
+    for pin in ("pub const UNIVERSAL_WIDGET_TOKENS:", "pub const NEEDLE_EXEMPTIONS:",
+                "pub fn is_universal_widget_token(", "pub fn widget_rule_violations("):
+        need(pin in sot, "코퍼스 자기규칙 장치 결손: %s — 규칙이 검체 본문에만 있으면 구 선언을 "
+                         "재현해 적색을 증명할 수 없다" % pin)
+    for t in ("corpus_self_rule_a_every_needle_is_question_form_or_justified",
+              "corpus_self_rule_bc_widget_and_guard_is_present_and_not_universal",
+              "no_needle_alone_matches_a_non_gate_screen",
+              "no_gate_matches_a_non_gate_screen",
+              "self_rules_are_red_on_the_pre_fix_declarations"):
+        need(t in sot, "코퍼스 자기규칙 검체 %s 가 사라졌다" % t)
+    need("NON_GATE_SCREENS:" in sot,
+         "오탐 대조군(관문이 **아닌** 화면) 표가 없다 — 규칙이 '정상 화면에 안 걸린다' 를 "
+         "아무 데서도 재지 못한다")
+    # 보편 토큰 집합을 정본에서 수확한다(사본 금지 — 값은 코드가 소유한다).
+    um = re.search(r"UNIVERSAL_WIDGET_TOKENS:\s*&\[&str\]\s*=\s*&\[(.*?)\];", sot, re.S)
+    need(um, "보편 토큰 집합을 수확하지 못했다(수확기 파손 — fail-closed)")
+    universal = {"".join(x.split())
+                 for x in re.findall(r'"((?:[^"\\]|\\.)*)"', um.group(1))}
+    need("❯" in universal,
+         "보편 토큰 집합에 `❯` 가 없다 — 관문 6화면과 정상 화면에 **모두** 있는 문자이므로 "
+         "위젯 단독 선언 금지의 1순위 대상이다")
+    # 관문별로 직접 잰다 — ⓑ위젯 비어있지 않음 ⓒ보편 토큰 단독 아님.
+    blocks = defs.split("    Def {")[1:]
+    need(len(blocks) == 6, "정본 Def 블록 수확 실패(%d건 — fail-closed)" % len(blocks))
+    for blk in blocks:
+        gm = re.search(r'id:\s*"([^"]+)"', blk)
+        need(gm, "Def 블록에서 id 를 못 읽었다(수확기 파손)")
+        gid = gm.group(1)
+        wm = re.search(r"widget:\s*&\[(.*?)\]", blk, re.S)
+        need(wm, "%s: widget 선언을 못 읽었다(수확기 파손)" % gid)
+        ws = [w for w in re.findall(r'"((?:[^"\\]|\\.)*)"', wm.group(1))]
+        need(ws, "%s: widget AND 가드가 0 — needle 이 화면 전문에 그대로 걸린다(BLOCK-2 형태)" % gid)
+        need([w for w in ws if "".join(w.split()) not in universal],
+             "%s: widget 이 보편 토큰 단독(%r) — 모든 정상 화면에 있는 문자를 위젯으로 쓰면 AND 가 "
+             "무의미해지고 관문이 needle 하나로 성립한다(BLOCK-1 형태 · 영구 부트 라이브락)"
+             % (gid, ws))
+    notes.append("자기규칙: 위젯 AND 6/6 실재·보편토큰 단독 0 · 검체 5종 실재")
+
+    # ── 사본 ① agents.json trust-prompt 선언 → 정본 needle 에 실재해야 한다
+    aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
+    pats = {p.get("name"): p.get("pattern")
+            for p in ((aj.get("claude") or {}).get("approval_patterns") or [])}
+    trust_pat = pats.get("trust-prompt")
+    need(trust_pat, "agents.json 에 trust-prompt 선언이 없다(자동확인 소스 소실)")
+    need('"%s"' % trust_pat in sot,
+         "agents.json trust-prompt 문면 %r 이 정본에 없다 — 사본이 갈렸다" % trust_pat)
+    notes.append("agents.json 문면 정본 포함")
+
+    # ── 사본 ② cys.rs 내장 폴백 needle → 정본에 **담지 않는다**(면제표에 사유 필수)
+    hseg = cli[cli.index("fn trust_prompt_hit("):]
+    hseg = hseg[:hseg.index("\n}\n") + 2]
+    builtin_needles = re.findall(r'delta_flat\.contains\("([^"]+)"\)', hseg)
+    need(builtin_needles, "trust_prompt_hit 에서 내장 needle 을 수확하지 못했다(수확기 파손)")
+    for nd in builtin_needles:
+        need(nd in GATE_LEGACY_CODE_NEEDLE,
+             "코드 내장 needle %r 이 면제표에 없다 — 새 사본은 사유와 함께 등재하라(조용한 확산 금지)"
+             % nd)
+    # ★결함 needle 은 정본의 **선언 집합**에 다시 들어오면 안 된다: 그것이 킬체인의 형태다.
+    for nd, why in GATE_LEGACY_CODE_NEEDLE.items():
+        if "결함 needle" in why:
+            need(nd not in flat_needles,
+                 "정본이 결함 needle %r 을 선언 집합에 들여왔다 — 확인 에코 재매칭 킬체인 재발" % nd)
+    notes.append("코드 내장 needle %d건 면제표 일치" % len(builtin_needles))
+
+    # ── 사본 ③ phoenix harness MODAL_MARKERS → 정본이 덮거나 면제표에 있어야 한다
+    ph = _read(os.path.join(BIN_DIR, "javis_phoenix_harness.py"))
+    mm = re.search(r"MODAL_MARKERS\s*=\s*\[([^\]]*)\]", ph)
+    need(mm, "javis_phoenix_harness.py 에서 MODAL_MARKERS 를 찾지 못했다(수확기 파손)")
+    markers = re.findall(r"'([^']*)'|\"([^\"]*)\"", mm.group(1))
+    markers = [a or b for a, b in markers]
+    need(markers, "MODAL_MARKERS 항목 0건 — 수확기 파손(fail-closed)")
+    uncovered = [mk for mk in markers
+                 if mk not in GATE_MARKER_EXEMPT and "".join(mk.split()) not in flat_decl]
+    need(not uncovered,
+         "MODAL_MARKERS 항목 %s 가 정본에도 면제표에도 없다 — 4번째 사본이 생겼다" % uncovered)
+    notes.append("MODAL_MARKERS %d항(면제 %d) 정합"
+                 % (len(markers), len([m for m in markers if m in GATE_MARKER_EXEMPT])))
+
+    # ── 네 번째 사본 금지: 팩 python 어디에도 관문 **질문형 문면**이 복제되지 않는다.
+    #    (설계가 지목한 javis_preflight.py 를 포함한 전수 검사. phoenix 는 위에서 이미 판정했다.)
+    dupes = []
+    for fn in sorted(os.listdir(BIN_DIR)):
+        if not fn.endswith(".py") or fn == "javis_phoenix_harness.py":
+            continue
+        body = _read(os.path.join(BIN_DIR, fn))
+        for nd in sot_needles:
+            if nd in body:
+                dupes.append("%s:%r" % (fn, nd))
+    need(not dupes,
+         "팩 python 에 관문 문면 사본이 생겼다: %s — 문면의 진실원천은 %s 하나다(읽기 소비만 허용)"
+         % (dupes[:5], frg_rel))
+    notes.append("팩 python 사본 0건(문면 %d종 대조)" % len(sot_needles))
+
+    calib = "skip(no-git)"
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        need(_git_show(frg_rel) is None,
+             "계측 타당성 실패: 기준 트리에 이미 SOT 가 있다면 S-1 은 결함이 아니다")
+        calib = "기준 트리 SOT 부재 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 @specimen("H-PRED-10", "W4", "TCC 탐침 대상이 실자원(cwd+PACK)에서 파생", ["P3-A-TCC"])
@@ -4221,14 +5024,25 @@ def h_time_3():
     """B17: readiness 루프가 `waited += 2` 로 시간을 **셌다** — 틱당 실비용(RPC 왕복 + 2.5s sleep +
     trust 분기의 미집계 sleep)이 가정치와 어긋나 실효 대기가 25%+α 오차났다. 벽시계만 쓴다."""
     src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
-    bi = src.find("fn boot_agent_on_surface(")
-    body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
+    body = _slice_between(src, "fn boot_agent_on_surface(",
+                          "\n/// 에이전트 기동 + 역할 지침", "H-TIME-3 부트 본문")
+    # ★핀 이사(U-13): 판정이 순수 술어로 옮겨 갔으므로 **시간 축의 금지도 함께 옮긴다**.
+    #   판정부는 시계를 아예 읽지 않는다(시간 사실은 호출부가 계산해 `Observed` 로 넘긴다) —
+    #   그것이 '숨은 입력 금지'의 기계 집행이다.
+    judge = _slice_between(src, "pub fn judge(",
+                           "// ── 판정부 끝(핀 슬라이스 경계) ──", "H-TIME-3 판정부")
     notes = []
     # ⓐ 카운트 회계 전폐 — **주석 제외 실코드**에서 잔존 0(주석은 결함 이력 서술이다).
     code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
+    jcode = "\n".join(ln for ln in judge.splitlines() if not ln.strip().startswith("//"))
     for banned in ("waited +=", "let mut waited", "waited < max_wait_secs"):
         need(banned not in code, "카운트 기반 시간 회계 잔존(실코드): %s" % banned)
-    notes.append("카운트 회계 0(실코드)")
+        need(banned not in jcode, "판정부에 카운트 기반 시간 회계 잔존: %s" % banned)
+    need("Instant::now()" not in jcode,
+         "판정부가 시계를 직접 읽는다 — `Observed` 밖의 숨은 입력(진리표가 실기 없이 돌지 못한다)")
+    need("time_fallback_reached: std::time::Instant::now() >= time_fallback_at" in body,
+         "시간 폴백 사실이 벽시계로 계산돼 판정 입력에 실리지 않는다")
+    notes.append("카운트 회계 0(실코드·판정부) · 판정부 시계 무접촉")
     # ⓑ Instant 데드라인 단언
     need("let deadline = std::time::Instant::now() + max_wait" in body,
          "readiness 루프에 Instant 데드라인이 없다")
@@ -4280,11 +5094,38 @@ SCAN_TARGETS = {
     # readiness 판정부 — 기동 준비 완료 판정 · 안전 밸브 · 데드라인 회계 · 주입 검증 배선.
     # 지금은 전부 `src/bin/cys.rs` 안에 있다. 캠페인이 판정을 순수함수(`src/readiness.rs`)로
     # 추출하면 **여기에 그 경로를 추가**한다(cys.rs 에는 호출 배선이 남으므로 함께 유지).
-    "readiness": (os.path.join("src", "bin", "cys.rs"),),
+    "readiness": (
+        os.path.join("src", "bin", "cys.rs"),
+        # ★(U-13) ready 술어가 순수함수로 이사한 자리. cys.rs 에는 관측·귀결 배선이 남으므로
+        #   **둘 다** 등재한다 — 한쪽만 두면 이사한 핀이나 남은 핀 중 한쪽이 조용히 죽는다.
+        os.path.join("src", "readiness.rs"),
+    ),
+    # ★(U-14/U-15) 주입·제출 관문 가드의 판정부. `readiness` 와 **별도 이름**인 이유 둘 —
+    #   ⓐ 한 경로를 두 논리 이름이 소유하면 이사 때 한쪽이 누락된다(H-META-PIN ⓐ 가 금지).
+    #   ⓑ `readiness` 합본의 **마지막 조각**은 판정부 파일이라는 계약을 H-READY-13 ⓓ 가 쓰고
+    #      있다(`split(_SCAN_JOIN)[-1]`). 여기에 파일을 덧붙이면 그 계약이 조용히 깨진다.
+    #   cys.rs 쪽 **호출 배선**은 `readiness` 가 이미 소유하므로 여기 등재하지 않는다
+    #   (H-KILLCHAIN-1 은 두 이름을 모두 경유해 읽는다).
+    "inject_guard": (os.path.join("src", "inject_guard.rs"),),
 }
 
 # 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.
 SCAN_TARGET_CONSUMERS = {
+    # ★(U-10) 제4 등급 파리티 검체 — cys.rs 의 `seat_liveness`·`run_boot`·`boot_agent_on_surface`
+    #   본문을 핀한다. 경로를 직접 들지 않고 레지스트리로 묻는다(핀 이사 계약 ⓒ).
+    "H-SEAT-4AXIS": "readiness",
+    # ★(U-11) 보류 exit 4단 파리티 검체 — cys.rs 의 소비 지점을 센다. 경로를 직접 들지 않고
+    #   레지스트리로 묻는다(핀 이사 계약 ⓒ — 소유 경로의 직접 독자를 늘리지 않는다).
+    "H-EXIT-11": "readiness",
+    # ★(U-12) 배달 경로·문면 SOT 검체 — cys.rs 의 계층 배선(LAYERED_KEYS)과 내장 needle 을
+    #   핀한다. 경로를 직접 들지 않고 레지스트리로 묻는다(핀 이사 계약 ⓒ).
+    "H-DELIVER-1": "readiness",
+    "H-GATE-SOT-1": "readiness",
+    # ★(U-13) ready 술어 단일화 검체 — cys.rs 배선과 readiness.rs 판정부를 함께 핀한다.
+    "H-READY-13": "readiness",
+    # ★(U-14/U-15) 주입 봉인·킬체인 검체 — cys.rs 의 **호출 배선**을 `readiness` 로 묻고
+    #   판정부는 `inject_guard` 로 묻는다(두 이름 모두 경유 · 직접 경로 0).
+    "H-KILLCHAIN-1": "readiness",
     "H-PRED-8": "readiness",
     "H-SAFE-2": "readiness",
     "H-TIME-3": "readiness",
@@ -4321,6 +5162,31 @@ def _scan_source(name):
         raise Fail("SCAN_TARGETS 에 논리 이름 %r 이 없다 — 핀 이사 계약: 레지스트리를 먼저 갱신하라"
                    % name)
     return _SCAN_JOIN.join(_repo_file(rel) for rel in rels)
+
+
+def _slice_between(src, start, end, where):
+    """`src` 에서 `start` 앵커부터 `end` 앵커까지를 자른다 — **앵커 부재는 적색**이다.
+
+    ★선재 결함(U-2 규약 ⓒ · U-13 에서 발견·수리): 종전 관용구는
+      `body = src[bi:src.find("…", bi)]` 였다. `find` 가 -1 이면 파이썬은 예외 없이
+      `src[bi:-1]`(끝 한 글자만 뺀 전량)을 돌려주고, 그 위에서 `in`/`not in` 을 판정하면
+      **계측기가 결함을 승인하거나 없는 결함을 만들어낸다**(잘린/부푼 텍스트에 대고 단언).
+      게다가 `SCAN_TARGETS` 에 경로가 둘 이상이 된 지금은 그 슬라이스가 **파일 경계를 넘는다**
+      (`_SCAN_JOIN` 구분선은 가시화일 뿐 자동 차단이 아니다).
+      그래서 ①앵커 부재 ②경계 침범 둘 다 즉시 적색으로 만든다 — 측정 불능은 통과가 아니다.
+    """
+    bi = src.find(start)
+    need(bi >= 0,
+         "%s: 시작 앵커 부재 %r — 코드가 이사했다면 SCAN_TARGETS 와 앵커를 함께 옮겨라"
+         % (where, start))
+    ei = src.find(end, bi)
+    need(ei > bi,
+         "%s: 끝 앵커 부재 %r — 슬라이스가 조용히 잘린다(계측 무효 · 핀 이사 계약 ⓒ)"
+         % (where, end))
+    seg = src[bi:ei]
+    need(_SCAN_JOIN not in seg,
+         "%s: 슬라이스가 SCAN_TARGETS 파일 경계를 넘었다 — 핀 대상이 뒤섞인다" % where)
+    return seg
 
 
 def _no_wait_for_owner(text, where):
@@ -4676,10 +5542,14 @@ def h_doc_7():
     need(warn_keys == ["resume_arg"], "WARN 티어가 resume_arg 단독이 아니다: %s" % warn_keys)
     # 스키마 버전 계층 인지: 알려진 버전 목록 + 미지 버전은 WARN(하위호환 유지)
     need("KNOWN_AGENTS_SCHEMA" in pf, "알려진 스키마 버전 목록 부재")
-    need(re.search(r"KNOWN_AGENTS_SCHEMA\s*=\s*\(1,\s*2\)", pf),
-         "스키마 버전 목록이 (1, 2) 가 아니다 — agents.json _schema 와 파리티 확인 필요")
+    # ★핀 이사(U-2 ②) — U-12 의 `_schema` 3 범프에 맞춰 목록이 (1,2,3) 으로 **누적**됐다.
+    #   완화가 아닌 이유: 이 핀의 판정축은 "preflight 목록 ↔ agents.json 실값의 파리티"이고,
+    #   그 축은 아래 두 줄이 그대로 집행한다(현행 _schema 가 목록 안에 있어야 한다 + 목록이
+    #   정확히 이 튜플이어야 한다). 구 버전 1·2 를 남기는 것은 사용자 디스크본 하위호환이다.
+    need(re.search(r"KNOWN_AGENTS_SCHEMA\s*=\s*\(1,\s*2,\s*3\)", pf),
+         "스키마 버전 목록이 (1, 2, 3) 이 아니다 — agents.json _schema 와 파리티 확인 필요")
     aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
-    need(aj.get("_schema") in (1, 2), "agents.json _schema 가 알려진 버전이 아니다")
+    need(aj.get("_schema") in (1, 2, 3), "agents.json _schema 가 알려진 버전이 아니다")
     need("cmd" in pf and "기동 불가" in pf, "필수 키(cmd) 결손이 FAIL 로 분리되지 않는다")
     # vendor/user 계층 구분이 문서에 있다(★W-B 동결 정합 — 사용자 파일을 코드가 고치지 않는다)
     need("_schema" in aj.get("_doc", "") and "vendor" in aj.get("_doc", ""),
@@ -4690,7 +5560,7 @@ def h_doc_7():
         need("C71" not in old,
              "계측 타당성 실패: 구 preflight 에 이미 C71 이 있다면 B20 은 결함이 아니다")
         calib = "구 preflight C71 부재 확인"
-    return "C71 실재·의미표 4키·WARN=resume_arg 단독·스키마(1,2) 파리티 · 계측검증=%s" % calib
+    return "C71 실재·의미표 4키·WARN=resume_arg 단독·스키마(1,2,3) 파리티 · 계측검증=%s" % calib
 
 
 @specimen("H-DOC-8", "W4", "팀 부트 진입점 전수가 단일 계약(폴백 포함 typed 소비 + 강등 신호)", ["B5"])
@@ -5465,8 +6335,9 @@ def h_obs_2():
          "노드 pane 의 자칭 검증을 막는 신원 게이트가 없다")
     notes.append("자칭 검증 차단(신원 게이트)")
     # ⓒ launch-agent 검증 신호가 ack(래치)이고, 화면 문자열은 **보조 증거**로 강등됐다
-    bi = csrc.find("fn boot_agent_on_surface(")
-    body = csrc[bi:csrc.find("\n/// 에이전트 기동 + 역할 지침", bi)]
+    # ★(U-13) 슬라이스만 안전화 — 앵커 부재가 조용한 절단으로 흐르지 않게 한다(판정 무변경).
+    body = _slice_between(csrc, "fn boot_agent_on_surface(",
+                          "\n/// 에이전트 기동 + 역할 지침", "H-OBS-2 부트 본문")
     need('row["awakened_at"].as_f64()' in body, "주입 검증이 ack 래치를 신호로 쓰지 않는다")
     need("보조 증거(주 신호가 아니다)" in body, "화면 에코가 보조 증거로 강등되지 않았다")
     need('"directive.verify"' in body, "검증 결과가 상태로 기록되지 않는다")
@@ -6542,6 +7413,316 @@ def h_pack_crlf():
     return ("임베드 대상 %d개 스캔(바이너리 %d 제외) · CRLF 0 · .gitattributes 4규칙 실재 · "
             "check-attr 해소 확인 · build.rs 가드③ 블록(%d자) 안에 검출·우회분기·panic 3축 실재"
             % (scanned, skipped_bin, len(guard)))
+
+
+@specimen("H-READY-13", "W6",
+          "★ready 술어 단일화 — 관문 문면 AND 항 · 두 소비처 경유 · 보류 귀결 선행(U-11)",
+          ["U-13"])
+def h_ready_13():
+    """U-13(2026-08-23 실측): 관문 6화면 **전부**에 `❯` 가 있고 그 화면들은 기동 직후 **신규
+    출력**으로 그려진다. 그래서 델타 우선 규칙도, 그보다 먼저 평가되는 안전 밸브도 관문 화면을
+    ready 로 선언했고, 디렉티브가 선택기에 붙여넣어졌다 — 그 붙여넣기의 Return 이 면책 창의
+    기본 포커스(`No, exit`)를 눌러 **좌석을 rc 1 로 죽인다**(실측 킬체인).
+
+    수리는 판정을 순수 술어 하나로 모으고(`ready = 입력활성 증거 ∧ 관문 문면 부재`) **두**
+    소비처(부트 폴링 · `adapter_ready`)를 그 술어로 통과시키는 것이다. 이 검체가 지키는 것:
+      ⓐ 판정의 단일 소유 + 숨은 입력 0(판정부가 파일·시계·env·RPC 를 읽지 않는다).
+      ⓑ 관문 축이 **문면 SOT 를 소비**한다(사본을 새로 만들지 않는다 — S-1 재발 차단).
+      ⓒ 두 소비처 모두 경유(두 번째 소비처가 눈먼 채 남으면 실사고 경로가 그대로 열려 있다).
+      ⓓ 롤백 스위치 1지점·엄격 비교.
+      ⓔ ★순서 — 엄격화의 귀결이 close 가 아니라 보류(U-11 `GatePending`)여야 한다.
+         이 항이 적색이면 **이 단위는 착지해서는 안 된다**(치명위험 ④: 전 pane 사망).
+    """
+    rel = os.path.join("src", "readiness.rs")
+    if not os.path.isfile(os.path.join(REPO_DIR, rel)):
+        if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+            raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        raise Fail("ready 술어 정본 %s 부재 — 판정이 다시 흩어져 있다" % rel)
+    src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
+    # 판정부 파일 본문은 **합본의 경계 뒤 조각**으로 취한다. 소유 경로를 `_repo_file` 로 직접
+    # 읽으면 H-META-PIN ⓒ(소비 검체의 경유 배선 우회)가 적색이고, 변수 경유로 읽으면
+    # H-META-READ ⓒ(미지의 동적 인자)가 적색이다 — 두 계약을 동시에 만족하는 경로가 이것뿐이다.
+    # 파일 실재·읽기 상한은 H-META-PIN ⓑ 가 등재 경로 전량에 대해 이미 본다(사각 없음).
+    need(_SCAN_JOIN in src,
+         "SCAN_TARGETS['readiness'] 에 판정부 경로가 없다 — 이사한 핀이 cys.rs 만 보게 된다")
+    rsrc = src.split(_SCAN_JOIN)[-1]
+    notes = []
+
+    # ⓐ 판정 단일 소유 + 숨은 입력 0
+    judge = _slice_between(src, "pub fn judge(",
+                           "// ── 판정부 끝(핀 슬라이스 경계) ──", "H-READY-13 판정부")
+    need("pub struct Observed<" in rsrc, "판정 입력 구조체(Observed)가 없다 — 입력 전량 선언 부재")
+    for banned in ("std::env", "std::fs", "request(", "fetch_surfaces", "Instant::now"):
+        need(banned not in judge,
+             "판정부가 %s 를 읽는다 — `Observed` 밖의 숨은 입력(순수성 상실 · 진리표 무력화)" % banned)
+    notes.append("판정 단일 소유 · 숨은 입력 0")
+
+    # ⓑ 관문 축이 문면 SOT 를 소비한다(사본 신설 0)
+    need("first_run_gates::identify(o.gates, o.screen)" in judge,
+         "관문 AND 항이 코퍼스를 소비하지 않는다 — ready 가 관문 화면에서 참이 된다(실사고 경로)")
+    sot_rel = os.path.join("src", "first_run_gates.rs")
+    sot = _repo_file(os.path.join("src", "first_run_gates.rs"))
+    _d0 = sot.index("const DEFS:")
+    defs = sot[_d0:sot.index("\n];", _d0) + 3]
+    sot_needles = []
+    for blk in re.findall(r"needles:\s*&\[(.*?)\]", defs, re.S):
+        sot_needles += re.findall(r'"((?:[^"\\]|\\.)*)"', blk)
+    need(len(sot_needles) >= 6, "정본 needle 수확 실패(%d건) — fail-closed" % len(sot_needles))
+    dupes = [nd for nd in sot_needles if nd in rsrc]
+    need(not dupes,
+         "판정부 파일에 관문 문면 사본이 생겼다: %s — 문면의 진실원천은 %s 하나다(읽기 소비만)"
+         % (dupes[:3], sot_rel))
+    notes.append("관문 축=SOT 소비 · 문면 사본 0(%d종 대조)" % len(sot_needles))
+
+    # ⓒ 두 소비처 모두 판정부를 경유한다
+    body = _slice_between(src, "fn boot_agent_on_surface(",
+                          "\n/// 에이전트 기동 + 역할 지침", "H-READY-13 부트 본문")
+    need("cys::readiness::judge(&obs)" in body, "부트 폴링이 판정부를 경유하지 않는다")
+    need("gates: &gate_corpus.gates" in body, "부트 판정 입력에 관문 코퍼스가 실리지 않는다")
+    ar = _slice_between(src, "fn adapter_ready(", "\n/// ", "H-READY-13 adapter_ready")
+    need("cys::readiness::judge(" in ar,
+         "adapter_ready 가 판정부를 경유하지 않는다 — 두 번째 소비처가 눈먼 채 남았다"
+         "(`scrollback_tail.contains(marker)` 한 줄로 되돌아갔는가)")
+    need("gates: &gates" in ar, "adapter_ready 판정 입력에 관문 코퍼스가 실리지 않는다")
+    notes.append("소비처 2종 경유(부트·재주입)")
+
+    # ⓓ 롤백 스위치 1지점 · 엄격 비교
+    need('pub const ENV_V1: &str = "CYS_READINESS_V1"' in rsrc, "롤백 스위치 이름 상수가 없다")
+    need('raw == Some("1")' in rsrc,
+         "롤백 스위치가 느슨한 truthy 를 받는다 — 오타로 안전장치가 조용히 뒤집힌다")
+    readers = [ln for ln in rsrc.splitlines() if "std::env::var(ENV_V1)" in ln]
+    need(len(readers) == 1, "env 읽기 지점이 %d곳이다 — 롤백은 1지점이어야 한다" % len(readers))
+    need('std::env::var("CYS_READINESS_V1")' not in src,
+         "롤백 스위치를 상수 밖에서 문자열로 직접 읽는 곳이 있다(1지점 규약 이탈)")
+    notes.append("롤백 1지점·엄격 비교")
+
+    # ⓔ ★순서 핀 — 엄격화의 귀결은 close 가 아니라 보류(U-11)여야 한다
+    need("enum BootVerdict" in src and "GatePending" in src,
+         "U-11(보류 귀결)이 없다 — 엄격해진 판정의 미충족이 그대로 close 로 흘러 살아있는 좌석을 "
+         "죽인다(치명위험 ④). 이 단위는 U-11 뒤에만 착지할 수 있다")
+    gi = src.find("Ok(BootVerdict::GatePending { gate, tail }) => {")
+    need(gi > 0, "launch 호출부의 보류 분기를 못 찾았다")
+    need('"surface.close"' not in src[gi:gi + 400],
+         "보류 분기가 좌석을 닫는다 — 관문에 갇힌 **살아있는** 노드를 파괴하는 방향")
+    notes.append("보류 귀결 선행 확인(close 0)")
+
+    # ⓕ 진리표가 실측 픽스처를 소비한다(손으로 지어낸 화면으로 판정하지 않는다)
+    need("first_run_gates::fixtures" in rsrc,
+         "진리표가 실측 캡처 픽스처를 쓰지 않는다 — 지어낸 화면은 결함을 재현하지 못한다")
+    for t in ("truth_table_gate_screens_never_ready",
+              "legacy_v1_reproduces_the_defect_on_every_gate_screen",
+              "healthy_screen_stays_ready_and_matches_no_gate"):
+        need(t in rsrc, "진리표 검체 %s 가 사라졌다" % t)
+    notes.append("진리표: 관문 6화면 × 밸브 × 델타 + 오탐 대조군")
+
+    # 계측 타당성 — 기준 트리에는 이 판정부가 없었다(있었다면 U-13 은 결함이 아니다)
+    calib = "skip(no-git)"
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        need(_git_show(rel) is None, "계측 타당성 실패: 기준 트리에 이미 판정부가 있다")
+        old_cli = _git_show(os.path.join("src", "bin", "cys.rs"))
+        if old_cli is not None:
+            need("readiness::judge" not in old_cli,
+                 "계측 타당성 실패: 구 CLI 가 이미 판정부를 경유한다")
+            need("scrollback_tail.contains(&m)" in old_cli,
+                 "계측 타당성 실패: 구 adapter_ready 의 눈먼 한 줄을 못 찾았다")
+        calib = "기준 트리 판정부 부재 · 구 adapter_ready 눈먼 매칭 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-KILLCHAIN-1", "W6",
+          "★주입 봉인 + 신뢰 Return 경화 — 킬체인(신뢰→면책) Return 1발·면책 미접촉",
+          ["U-14", "U-15"])
+def h_killchain_1():
+    """U-14/U-15(2026-08-23 실측 · claude 2.1.241): 좌석을 실제로 죽인 것은 **키 한 발**이었다.
+
+      ① `inject_text` 는 bracketed paste 뒤 **800ms 후 무조건** `send_key Return
+         {authoritative:true}` 를 보낸다. ready 가 관문 화면에서 잘못 선언되면(U-13 이 그 판정을
+         고쳤다) 그 Return 이 면책 창의 기본 포커스 `No, exit` 를 눌러 **rc 1 로 좌석이 죽는다**.
+         그리고 `inject_text` 를 부르는 경로는 하나가 아니다(부트 주입·`[RECOVER]`·`[DRAIN]`·
+         cycle 재주입·pack-update 재주입·복원 디렉티브·각성 확인 핑 …) — 대부분 화면을 보지 않는다.
+      ② 폴더신뢰 자동확인의 **2발째**. 종전 needle 은 하드코딩 `trustthisfolder` 였고 그것은
+         통과 직후 화면에 남는 확인 에코 `Yes, I trust this folder ✔` 에 재매칭된다. 거기에
+         재전송 상한 2발 + `persisted` 조건이 겹쳐 2발째가 나갔고, 그때 화면은 이미 면책 창이었다.
+
+    수리는 ⓐ 전송 직전에 화면을 다시 보고 관문이면 **보내지 않기**(그물은 호출부 11곳이 아니라
+    `inject_text` 안쪽 1지점) ⓑ 그 스캔의 **생애 창을 첫 각성 ack 이전으로 상한**(치명위험 ①)
+    ⓒ 걸렸을 때의 귀결을 close 가 아니라 **보류**(U-11 `GatePending`)로 ⓓ 신뢰 needle 을
+    **질문형 문면만**(코퍼스 정본 소비)으로 좁히고 전송을 **1발**로 줄이기다.
+
+    ★이 검체가 지키는 것은 위 넷의 **배선**이다. 판정 자체(진리표·킬체인 e2e)는 Rust 검체가
+      실행으로 증명한다(`cargo test --bins --lib`) — 러너는 컴파일러가 아니므로 그 검체의
+      **실재와 이름**을 핀한다. 이름이 사라지면 즉시 적색이다."""
+    rel = os.path.join("src", "inject_guard.rs")
+    if not os.path.isfile(os.path.join(REPO_DIR, rel)):
+        if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+            raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        raise Fail("주입 가드 판정부 %s 부재 — 관문 화면에 Return 이 그대로 나간다(U-14 미착지)" % rel)
+    gsrc = _scan_source("inject_guard")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
+    cli = _scan_source("readiness")       # cys.rs 호출 배선(경로 소유는 readiness)
+    notes = []
+
+    # ⓐ 판정 단일 소유 + 숨은 입력 0 — 진리표가 실기 없이 돌아야 한다
+    judge = _slice_between(gsrc, "pub fn decide(o: &Observed) -> Decision {",
+                           "// ── 판정부 끝(핀 슬라이스 경계 · U-14/U-15) ──",
+                           "H-KILLCHAIN-1 판정부")
+    for banned in ("std::env", "std::fs", "request(", "fetch_surfaces", "Instant::now"):
+        need(banned not in judge,
+             "판정부가 %s 를 읽는다 — `Observed` 밖의 숨은 입력(순수성 상실 · 진리표 무력화)"
+             % banned)
+    notes.append("판정 단일 소유 · 숨은 입력 0")
+
+    # ⓑ 관문 문면의 SOT 소비(사본 신설 0 — S-1 재발 차단)
+    need("first_run_gates::identify(o.gates, o.screen)" in judge,
+         "가드가 관문 코퍼스를 소비하지 않는다 — 문면 사본을 새로 만들었거나 축이 통째로 없다")
+    sot = _repo_file(os.path.join("src", "first_run_gates.rs"))
+    _d0 = sot.index("const DEFS:")
+    defs = sot[_d0:sot.index("\n];", _d0) + 3]
+    sot_needles = []
+    for blk in re.findall(r"needles:\s*&\[(.*?)\]", defs, re.S):
+        sot_needles += re.findall(r'"((?:[^"\\]|\\.)*)"', blk)
+    need(len(sot_needles) >= 6, "정본 needle 수확 실패(%d건) — fail-closed" % len(sot_needles))
+    dupes = [nd for nd in sot_needles if nd in gsrc]
+    need(not dupes,
+         "가드 파일에 관문 문면 사본이 생겼다: %s — 문면의 진실원천은 first_run_gates.rs 하나다"
+         % dupes[:3])
+    notes.append("문면 SOT 소비 · 사본 0(%d종 대조)" % len(sot_needles))
+
+    # ⓒ 그물이 **1지점**이다 — 두 전송 지점(붙여넣기·제출 Return) 앞에 각각 걸린다
+    ibody = _slice_between(cli, "fn inject_text(sid: u64", '\n/// "90s"',
+                           "H-KILLCHAIN-1 inject_text")
+    need(ibody.count("gate_guard_check(sid, ") == 2,
+         "inject_text 의 가드 지점이 2곳(붙여넣기·제출 Return)이 아니다 — 800ms 사이에 뜬 관문이 "
+         "제출 Return 으로 눌린다(실측 킬 스텝)")
+    obody = _slice_between(cli, "fn inject_text_on(", "\n/// `gate_guard_check`",
+                           "H-KILLCHAIN-1 inject_text_on")
+    need(obody.count("gate_guard_check_on(socket, sid, timeout, ") == 2,
+         "부서 소켓 주입 경로가 가드를 우회한다 — 그물에 구멍이 남았다")
+    # 호출부는 늘어나도 좋다(그물이 안쪽에 있으므로 자동으로 덮인다). 다만 **가드 없는 새 주입
+    # 헬퍼**가 생기면 그물 밖이므로 적색으로 만든다: paste 래핑을 스스로 하는 함수 전수 검사.
+    wrappers = re.findall(r'let wrapped = format!\("\\x1b\[200~', cli)
+    need(len(wrappers) == 2,
+         "bracketed paste 를 스스로 씌우는 주입 헬퍼가 %d개다(기대 2 = inject_text·inject_text_on) "
+         "— 새 헬퍼는 그물 밖이다. 가드를 붙이고 이 수를 함께 갱신하라" % len(wrappers))
+    notes.append("그물 1지점(주입 헬퍼 2종 × 전송 2지점)")
+
+    # ⓓ ★생애 창 상한 — 치명위험 ①(작업 중 노드 영구 차단·오탐 폭주) 차단
+    need("fn surface_awakened(sid: u64) -> Option<bool>" in cli, "생애 창 관측 함수가 없다")
+    aw = _slice_between(cli, "fn surface_awakened(sid: u64) -> Option<bool> {", "\n}\n",
+                        "H-KILLCHAIN-1 생애 창")
+    need('row.get("awakened_at")?' in aw,
+         "`awakened_at` **키 부재**(구 데몬)를 '아직 각성 안 함' 으로 접는다 — 살아서 일하는 노드 "
+         "전부가 스캔 대상이 되고, 그중 하나가 관문 문면을 출력하는 순간 주입이 영구 거부된다")
+    need("if awakened != Some(false) {" in cli,
+         "창이 닫힌 좌석에서 스캔을 건너뛰는 조기 반환이 없다(오탐·비용 양쪽)")
+    need("awakened: Some(false), // 부트 창은 상수다" in cli,
+         "부트 경로가 창 여부를 데몬에 묻는다 — 구 데몬에서 가드가 가장 필요한 자리에 꺼진다")
+    notes.append("생애 창 상한(키 부재=판정 불가) · 부트 창 상수")
+
+    # ⓔ ★귀결은 close 가 아니라 보류다 — 이 항이 적색이면 치명위험 ④(전 pane 사망)가 성립한다
+    hi = cli.find("if let cys::inject_guard::Decision::Hold(hit) =")
+    need(hi > 0, "부트 경로의 typed 관문 가드를 못 찾았다")
+    hseg = cli[hi:hi + 1400]
+    need("settle_gate_pending(sid, &hit.id" in hseg,
+         "주입 직전 관문 감지의 귀결이 보류(U-11)가 아니다")
+    need('"surface.close"' not in hseg and "escalate_reclaim" not in hseg,
+         "가드 보류 분기가 좌석을 파괴한다 — 살아 있는 노드를 죽이는 방향(오살 > 오탐)")
+    # ★보류 확정은 **단일 경로**다. 보류가 나는 자리가 셋으로 늘었는데(타임아웃 · 주입 직전 ·
+    #   주입 도중) 각자 강등·표식을 직접 부르면 롤백 킬스위치 판독이 3지점이 된다 —
+    #   H-SEAT-4AXIS ⑦ 이 그 계약을 이미 소유하고, 여기서는 **경로의 실재**만 대조한다.
+    sseg = _slice_between(cli, "fn settle_gate_pending(", "\n}\n", "H-KILLCHAIN-1 보류 확정 경로")
+    for anchor in ("boot_verdict_effective(", "BootVerdict::GatePending", "mark_gate_pending("):
+        need(anchor in sseg, "보류 확정 단일 경로 결손: %s" % anchor)
+    need("if !cys::inject_guard::is_hold_error(&e) {" in cli,
+         "가드 에러가 일반 실패와 구분되지 않는다 — `?` 로 흘러 호출부가 close 로 번역한다")
+    need("enum BootVerdict" in cli and "GatePending" in cli,
+         "U-11(보류 귀결)이 없다 — 이 단위는 그 뒤에만 착지할 수 있다")
+    notes.append("보류 귀결(close 0 · kill 0) · 보류 에러 분류")
+
+    # ⓕ 롤백 2축 · env 1지점 · 엄격 비교
+    for env_name, const_name, reader, strict in (
+        ("CYS_INJECT_GATE_GUARD", "ENV_GUARD_OFF", "std::env::var(ENV_GUARD_OFF)", 'raw == Some("0")'),
+        ("CYS_TRUST_RETURN_V1", "ENV_TRUST_V1", "std::env::var(ENV_TRUST_V1)", 'raw == Some("1")'),
+    ):
+        need('pub const %s: &str = "%s"' % (const_name, env_name) in gsrc,
+             "롤백 스위치 이름 상수 %s 가 없다" % const_name)
+        need(strict in gsrc,
+             "%s 가 느슨한 truthy 를 받는다 — 오타로 안전장치가 조용히 뒤집힌다" % env_name)
+        readers = [ln for ln in gsrc.splitlines() if reader in ln]
+        need(len(readers) == 1,
+             "%s 의 env 읽기 지점이 %d곳이다 — 롤백은 축마다 1지점이어야 한다"
+             % (env_name, len(readers)))
+        need('std::env::var("%s")' % env_name not in cli + gsrc,
+             "%s 를 상수 밖에서 문자열로 직접 읽는 곳이 있다(1지점 규약 이탈)" % env_name)
+    notes.append("롤백 2축 · env 1지점 · 엄격 비교")
+
+    # ⓖ ★U-15 — 상한 '상수' 가 아니라 '조건' 을 줄였다 + 예산 leaf 값 무접촉
+    ts = _slice_between(gsrc, "pub fn trust_send(o: &TrustObserved) -> bool {", "\n}\n",
+                        "H-KILLCHAIN-1 신뢰 전송 정책")
+    need("if o.other_gate {" in ts,
+         "전송 판정에 화면 재확인 항이 없다 — 누적 델타의 잔상으로 면책 창에 Return 을 쏜다")
+    need("if o.legacy_v1 {" in ts, "롤백 분기가 없다 — 스위치가 아무것도 되돌리지 못한다")
+    # 기본 정책의 마지막 말은 `o.first` 단독이어야 한다(재전송 기구 폐지).
+    need(ts.rstrip().rstrip("}").rstrip().endswith("o.first"),
+         "기본 전송 조건이 `first` 단독이 아니다 — 재전송 기구가 살아 있다(2발째 = 킬 스텝)")
+    # 예산 leaf 는 값도 이름도 건드리지 않았다(S-5 · 상한은 롤백 분기에서 그대로 집행된다).
+    m = re.search(r"const BUDGET_TRUST_MAX_SENDS: u32 = (\d+);", cli)
+    need(m and m.group(1) == "2",
+         "BUDGET_TRUST_MAX_SENDS 값이 바뀌었다 — 상수를 내리면 persisted·trust_seen_at·"
+         "SETTLE 이 죽은 코드가 되고 다음 감사자가 '재전송 기구가 있다' 고 오독한다")
+    need("max_sends: BUDGET_TRUST_MAX_SENDS" in cli,
+         "예산 상수가 고아가 됐다 — 소비 없는 BUDGET_* 는 파리티 표면을 흔든다(S-5)")
+    need("Some(cys::inject_guard::GATE_FOLDER_TRUST)" in cli,
+         "신뢰 자동확인의 예외 구멍이 id 하나로 좁혀지지 않았다(관문 전체가 열리면 킬체인 그대로)")
+    notes.append("1발 정책 · 화면 재확인 · 예산 leaf 무접촉(=2)")
+
+    # ⓗ 킬체인 e2e Rust 검체의 실재(러너는 컴파일러가 아니다 — 이름과 배선을 핀한다)
+    for t in ("killchain_trust_then_disclaimer_sends_exactly_one_return_and_never_touches_the_disclaimer",
+              "after_awakening_ack_the_scan_is_off_even_on_gate_text",
+              "allow_hole_is_exactly_one_gate_and_never_the_disclaimer",
+              "confirm_echo_is_not_a_trust_detection"):
+        need(t in gsrc, "킬체인 진리표 검체 %s 가 사라졌다" % t)
+    for t in ("killchain_trust_then_disclaimer_sends_exactly_one_return_at_the_call_site_composition",
+              "inject_gate_guard_is_wired_inside_the_single_choke_point_source_pin",
+              "inject_guard_does_not_block_normal_screens"):
+        need(t in cli, "호출부 조립 검체 %s 가 사라졌다" % t)
+    need("first_run_gates::fixtures" in gsrc,
+         "진리표가 실측 캡처 픽스처를 쓰지 않는다 — 지어낸 화면은 결함을 재현하지 못한다")
+    notes.append("e2e·진리표 검체 7종 실재")
+
+    # 계측 타당성 — 기준 트리(CALIBRATION_REF)에는 이 그물이 없었고, 신뢰 Return 축이 정확히
+    # 킬체인의 형태를 갖고 있었다. 기준 트리에서 결함이 재현되지 않으면 이 검체는 '원래 안 나는
+    # 일을 안 난다고 확인' 하는 공허한 검사이므로, 재현 실패는 **적색**이다.
+    calib = "skip(no-git)"
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        need(_git_show(rel) is None, "계측 타당성 실패: 기준 트리에 이미 가드 판정부가 있다")
+        old_cli = _git_show(os.path.join("src", "bin", "cys.rs"))
+        if old_cli is not None:
+            need("gate_guard_check(" not in old_cli,
+                 "계측 타당성 실패: 구 CLI 에 이미 주입 가드가 있다면 U-14 는 결함 수리가 아니다")
+            need("inject_guard" not in old_cli,
+                 "계측 타당성 실패: 구 CLI 가 이미 가드 판정부를 경유한다")
+            # ① 신뢰 needle 이 **하드코딩**이었다(선언 소비도, 코퍼스 소비도 없다).
+            need('contains("trustthisfolder")' in old_cli,
+                 "계측 타당성 실패: 구 코드의 하드코딩 신뢰 needle 을 못 찾았다 — 킬체인 서사가 "
+                 "틀렸다면 이 단위는 결함 수리가 아니다")
+            need("folder_trust_needle_hit" not in old_cli,
+                 "계측 타당성 실패: 구 코드가 이미 코퍼스를 소비한다")
+            # ② 그 needle 은 **확인 에코에 실제로 걸린다** — 결함의 작동 원리 자체를 재현한다.
+            echo_flat = "".join("Yes, I trust this folder ✔".split())
+            need("trustthisfolder" in echo_flat,
+                 "계측 타당성 실패: 구 needle 이 확인 에코에 안 걸리면 킬체인 서사가 틀린 것")
+            # ③ 그리고 감지된 뒤 Return 이 나간다(전송 지점이 실재).
+            ti = old_cli.find("trustthisfolder")
+            need('"key": "Return"' in old_cli[ti:ti + 900],
+                 "계측 타당성 실패: 구 코드의 신뢰 Return 전송 지점을 못 찾았다")
+            # ④ 주입의 제출 Return 은 무조건이었다(가드 0) — 실측 킬 스텝의 자리.
+            ii = old_cli.find("fn inject_text(")
+            need(ii > 0, "계측 타당성 실패: 구 코드의 inject_text 를 못 찾았다")
+            iseg = old_cli[ii:ii + 2000]
+            need('"key": "Return", "authoritative": true' in iseg,
+                 "계측 타당성 실패: 구 inject_text 의 무조건 제출 Return 을 못 찾았다")
+        calib = "기준 트리 가드 부재 · 구 코드=하드코딩 needle(확인 에코 재매칭) + 무가드 제출 Return"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 # ── 메타(계측기 자기감시) ────────────────────────────────────────────────

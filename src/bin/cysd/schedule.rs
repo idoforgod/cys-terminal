@@ -1002,6 +1002,22 @@ async fn launch_via_cli(daemon: &Arc<Daemon>, spec: &LaunchSpec) -> Result<u64, 
         .await
         .map_err(|_| "launch-agent timed out (180s)".to_string())?
         .map_err(|e| format!("launch-agent spawn failed: {e}"))?;
+    // ★(U-11) 종전엔 `success()` 1비트였다 — '깨졌다'와 '떴는데 사람이 관문을 통과시켜야
+    //   한다'가 같은 값이었고, 그래서 진단 문안이 늘 "기동 실패"였다. 이제 세 갈래로 읽는다:
+    //   성공 / **사람 필요**(surface 는 살아 있다) / 그 밖 실패.
+    //   ★보류는 여전히 `Err` 다 — 그것이 이 함수의 계약에서 옳다. 호출부는 반환된 sid 에
+    //   **곧바로 텍스트를 주입**하는데(`inject(daemon, sid, text)`), 관문 창에 주입하면 그
+    //   붙여넣기의 Return 이 실측상 면책 창의 `No, exit` 을 눌러 노드를 종료시킨다.
+    //   즉 여기서 Ok 를 내는 것은 '스케줄 job 한 건 성공' 이 아니라 '노드 1개 사망' 이다.
+    if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
+        return Err(format!(
+            "launch-agent gate-pending: pane 은 떴고 프로세스도 살아 있으나 첫기동 관문(테마·\
+             로그인방식·OAuth·폴더신뢰·면책·새기능안내)에 갇혀 입력을 받지 못한다 — 좌석은 \
+             닫지 않았다. 사람이 그 pane 에서 관문을 1회 통과시킨 뒤 재시도하라(`cys list` 로 \
+             해당 pane 확인).\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     if !out.status.success() {
         return Err(format!(
             "launch-agent failed: {}",

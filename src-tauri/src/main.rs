@@ -2472,6 +2472,20 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+    // ★(U-11) 3분기: 성공 / **관문 보류**(pane 은 살아 있다) / 실패.
+    //   보류에서 팀 부트를 이어가면 안 된다 — 체인이 그 pane 에 claim-role 을 귀속시키고 지침을
+    //   주입하는데, 관문 창에 붙여넣는 순간 그 Return 이 실측상 면책 창의 `No, exit` 을 눌러
+    //   마스터를 종료시킨다. 좌석은 이미 보존됐으니(닫지 않았다) 사람이 그 pane 에서 관문을
+    //   통과시키면 그대로 쓴다 — 사용자에게는 그 처방만 올린다.
+    if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
+        return Err(format!(
+            "마스터 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
+             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — 순서는 \
+             테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★면책 창의 기본 \
+             선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     if out.status.success() {
         // ★(W4 · B5) launch-agent 는 생성한 surface ref 를 stdout 으로 낸다 — 팀 부트 1차 경로
         //   (javis_bootstrap.py)가 ③claim-role 을 **이 pane 에 귀속**시키려면 그 값이 필요하다.
@@ -2899,6 +2913,16 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+    // ★(U-11) 부서장도 같은 3분기 — 보류 pane 에 팀 부트를 이어 붙이면 그 주입이 관문 창의
+    //   Return 이 된다(= 부서장 사망). 좌석은 보존돼 있으니 처방만 올린다.
+    if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
+        return Err(format!(
+            "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
+             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★면책 창의 \
+             기본 선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     if out.status.success() {
         // ★절대규칙: 부서장도 팀 결정론 스폰(환각 무관). 부서 레인은 ④-c CEO 티켓 게이트를 타므로
         //   티켓이 없으면 체인이 '단독 각성'(exit 0·solo_awakening)으로 강등되고, GUI 는 그 사실을

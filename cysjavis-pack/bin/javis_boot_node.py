@@ -37,6 +37,9 @@ javis_boot_node.py — 결정론 단일 노드 부트 헬퍼 (부트스트랩 �
     "alive_presumed"   생존 **추정**. agent_alive 단독 / 좌석 점유(자손 프로세스) / quiet_but_alive.
                        ★agent_alive 단독은 '각성'이 아니다(B6): 빈 CLI 도 프로세스는 산다.
                        그래도 재스폰·재주입은 금지다(있는 노드를 두 번 띄우면 A1 역방향 결함).
+    "gate_pending"     ★(U-10) 살아 있으나 **첫기동 관문에 갇힘**(입력 불가). 충족 아님 ·
+                       재스폰 아님 · 파괴 아님 — 관측·보고 후 사람 1회 조치. 데몬 wire 키
+                       `gate_pending`(null=축 미도입/무신호). 생산자는 U-11/U-13.
     "absent"           좌석 없음/exited/좌석 비었음(자손 0). 스폰 대상.
     "unknown"          **판정 불가**(좌석 프로브 실패). 3등급 중 하나가 아니라 '타입으로 구분되는
                        판정불가'다(CS-2 원칙: 판정과 판정불가는 절대 융합하지 않는다).
@@ -120,8 +123,31 @@ def budget(name, fallback):
 # ── 공유 술어: liveness 등급 상수(전 소비처가 문자열 리터럴 대신 이 상수를 쓴다) ──
 LIVENESS_AWAKE = "awake_confirmed"
 LIVENESS_PRESUMED = "alive_presumed"
+# ★(U-10) 좌석 **제4 등급** — 프로세스는 살아 있으나 첫기동 관문(테마 → 로그인방식 → OAuth →
+#   폴더신뢰 → 면책 → 새기능안내)에 갇혀 **입력을 받을 수 없는** 좌석. Rust 정본
+#   `cys.rs SeatLiveness::GatePending` 의 python 미러이고, wire 키 이름도 같다(`gate_pending`).
+#   ★충족(satisfied)이 **아니다**: 살아 있지만 쓸 수 없으므로 팀이 선 것이 아니다.
+#   ★재스폰 대상도 **아니다**: pane 도 프로세스도 살아 있다 — 새 좌석을 만들면 claim_denied·
+#     litter 만 남고, 기존 pane 에 주입하면 살아 있는 입력창을 파괴한다(치명 앵커 ④).
+#     정답은 관측·보고이고 조치는 사람 1회다.
+#   ★이 팩에는 **생산자가 없다**(U-10 = additive 착지): 데몬 wire 값이 항상 null 이라 이 등급은
+#     도달 불가이고 거동은 종전과 같다. 생산은 U-11/U-13 이 한다.
+LIVENESS_GATED = "gate_pending"
 LIVENESS_ABSENT = "absent"
 LIVENESS_UNKNOWN = "unknown"
+
+# ★(U-10) 롤백 킬스위치 — Rust `cys::ENV_GATE_PENDING` 과 **같은 이름·같은 극성**의 미러.
+#   `CYS_GATE_PENDING=0` 이면 이 축을 통째로 무시하고 종전 3등급 판정으로 즉시 복귀한다.
+GATE_PENDING_ENV = "CYS_GATE_PENDING"
+# ★(BLOCK-3 · 2026-08-24) 마스터 롤백 스위치 — Rust `cys::ENV_BOOT_GATES` 미러.
+#   `CYS_BOOT_GATES=0` 하나면 이 캠페인이 추가한 판정 축이 **전부** 종전으로 돌아간다.
+#   축 노브를 따로 기억해야 복귀하는 구조는 사고 순간에 사람이 쓸 수 없다는 것이 그 근거다.
+BOOT_GATES_ENV = "CYS_BOOT_GATES"
+# ★(U-11) 보류 귀결 강등 스위치 — Rust `cys::ENV_GATE_PENDING_CLOSE` 미러.
+#   `CYS_GATE_PENDING_CLOSE=1` 이면 보류가 즉시 close 로 강등된다(= 보류 장치가 꺼진 상태).
+GATE_PENDING_CLOSE_ENV = "CYS_GATE_PENDING_CLOSE"
+# wire 키 이름 정본 — surface.list · org.status · topology.json · Rust `cys::GATE_PENDING_KEY`.
+GATE_PENDING_KEY = "gate_pending"
 # 좌석 캐시의 유일 writer = cysd watchdog 틱(governance.rs:13,:47 — 5초). Unknown 의 시한부
 # 해소는 '1주기 대기'가 상한이다(그 이상 기다리는 것은 가용성 손해이고, 중복 스폰은 boot 락이 막는다).
 SEAT_WATCHDOG_TICK_S = 5
@@ -377,9 +403,19 @@ def node_alive(status, role):
 
     ★W2 이후 이 함수는 `node_liveness` 의 **얇은 래퍼**다(bool 소비처 하위호환) — 등급이 필요한
       소비처는 node_liveness 를 직접 쓴다. unknown 은 여기서 True(=보류측)로 접힌다:
-      이 함수의 유일한 파괴 소비처가 reclaim 이고, 파괴 경로의 Unknown 은 무조건 hold 다."""
+      이 함수의 유일한 파괴 소비처가 reclaim 이고, 파괴 경로의 Unknown 은 무조건 hold 다.
+
+    ★★(U-10 · 치명 앵커 ④) `gate_pending` 도 **True(생존)** 다 — 여기가 이 단위에서 가장
+      위험한 한 줄이다. 이 함수의 소비처는 `reclaim`/`_reclaim_verdict` 의 **kill 게이트**이고,
+      "충족(satisfied)인가" 와 "살아 있는가(=파괴 금지인가)" 는 **다른 축**이다.
+      관문에 갇힌 좌석은 **충족은 아니지만 명백히 살아 있다**(프로세스·pane 존재). 이 등급을
+      node_liveness 에 추가하면서 여기 목록에 넣지 않으면, 그 순간 `node_alive` 가 False 로
+      뒤집혀 **살아 있는 관문 좌석이 kill 대상**이 된다 — 4종 노드가 모두 첫기동 관문에 갇히는
+      신규 프로필에서는 그것이 곧 **전 pane 사망(글자 0)** 이다.
+      즉 이 항목은 '새 완화'가 아니라 **종전 안전 계약(살아 있으면 죽이지 않는다)의 보존**이다.
+      제거 금지 — 제거하면 U-10 이 스스로 치명위험 ④를 신설한다."""
     grade, _ = node_liveness(status, role)
-    return grade in (LIVENESS_AWAKE, LIVENESS_PRESUMED, LIVENESS_UNKNOWN)
+    return grade in (LIVENESS_AWAKE, LIVENESS_PRESUMED, LIVENESS_GATED, LIVENESS_UNKNOWN)
 
 
 # ─────────────── 공유 술어 ①: node_liveness (단일 정의 · 전 소비처 import) ───────────────
@@ -411,6 +447,44 @@ def seat_state(status, role):
     if v in ("occupied", "empty", LIVENESS_UNKNOWN):
         return v
     return None
+
+
+def gate_pending_axis_enabled():
+    """★(U-10) 관문 보류 축 노출 판독 — Rust `cys::gate_pending_axis_enabled` 미러.
+
+    계약: **축 노출 ⟺ 보류 장치가 켜져 있다.** 세 스위치 중 **어느 하나**라도 누르면 축이
+    통째로 꺼지고 전 소비자가 종전 3등급 판정으로 즉시 복귀한다.
+      ① 마스터 `CYS_BOOT_GATES=0` ② 강등 `CYS_GATE_PENDING_CLOSE=1` ③ 축 `CYS_GATE_PENDING=0`
+
+    ★(BLOCK-3 잔여분 · 2026-08-24) 종전엔 ③만 읽었다. Rust 쪽도 같은 결손이라, 마스터를
+    눌러도 데몬은 이미 실린 표식을 TTL(30분)까지 계속 직렬화했다 — CLI 는 종전 판정인데
+    데몬은 여전히 보류인 **반쪽 롤백**이다. 두 언어가 같은 이름·같은 극성·같은 접기여야
+    하고(헬스 검체가 기계 대조한다), 여기서 조건 하나를 고치면 Rust 쪽도 함께 고쳐야 한다.
+
+    극성은 셋 다 **엄격 비교**다(느슨한 truthy/falsy 불가 — 오타 한 글자로 안전장치가 조용히
+    뒤집히는 사고 방지). 기본이 '켜짐'인 이유: 잊어서 위험해지는 방향이 아니라 **잊으면 새
+    안전장치가 켜져 있는** 방향으로 배치한다."""
+    if os.environ.get(BOOT_GATES_ENV) == "0":
+        return False
+    if os.environ.get(GATE_PENDING_CLOSE_ENV) == "1":
+        return False
+    return os.environ.get(GATE_PENDING_ENV) != "0"
+
+
+def gate_pending_info(s):
+    """surface row → 관문 보류 근거 dict, 또는 None(무신호).
+
+    ★계약(Rust `cys::gate_pending_from_wire_with` 와 자구 동등): **dict 만** 보류다.
+      null·키 부재 = '이 축에 대해 말할 것이 없음'(구 데몬 = 축 미도입)이지 'NOT-gated' 가
+      아니다 — 소비자는 그 경우 이 항을 **통째로 생략**하고 종전 판정으로 흐른다
+      (awakened_at 래치의 '부재 ≠ 부정' 규약과 동형).
+      dict 가 아닌 non-null(스큐·손상)도 **무신호로 접는다**(fail-open → 종전 동작):
+      판정불가를 미충족으로 만들면 부트가 영원히 재시도하는 라이브락(A1 클래스)이 된다.
+      이 축의 fail-open 방향은 "오늘보다 나빠지지 않는다" 로 고정한다."""
+    if not isinstance(s, dict) or not gate_pending_axis_enabled():
+        return None
+    v = s.get(GATE_PENDING_KEY)
+    return v if isinstance(v, dict) else None
 
 
 def _readiness_budget_s():
@@ -494,14 +568,23 @@ def node_liveness(status, role):
       ① awakened_at 래치      → awake_confirmed  (데몬 SOT·영속·단방향 · ★래치 부정 3중 AND
                                  이 죽음을 확정한 좌석만 예외로 absent — latch_death_confirmed)
       ② 신선 set-status ack   → awake_confirmed  (부트 성공의 계약)
-      ③ agent_alive 단독      → alive_presumed   (★B6: 각성 아님 — 빈 CLI 도 프로세스는 산다)
-      ④ 좌석 occupied         → alive_presumed   (커널 사실: 자손 프로세스 존재)
-      ⑤ quiet_but_alive       → alive_presumed   (각성이력 + pid 결박 프로세스)
-      ⑥ 좌석 unknown          → unknown          (판정 불가 — 이원 규칙 소비)
-      ⑦ 그 밖                 → absent           (좌석 없음/exited/좌석 비었음/구 데몬 무신호)
+      ③ gate_pending          → gate_pending     (★U-10: 살아 있으나 관문에 갇힘 — 충족 아님)
+      ④ agent_alive 단독      → alive_presumed   (★B6: 각성 아님 — 빈 CLI 도 프로세스는 산다)
+      ⑤ 좌석 occupied         → alive_presumed   (커널 사실: 자손 프로세스 존재)
+      ⑥ quiet_but_alive       → alive_presumed   (각성이력 + pid 결박 프로세스)
+      ⑦ 좌석 unknown          → unknown          (판정 불가 — 이원 규칙 소비)
+      ⑧ 그 밖                 → absent           (좌석 없음/exited/좌석 비었음/구 데몬 무신호)
 
-    ★구 데몬(seat 필드 부재)은 ⑥을 건너뛰고 ⑦로 흐른다 — W2 이전 균형 술어와 동일 결론이다
+    ★구 데몬(seat 필드 부재)은 ⑦을 건너뛰고 ⑧로 흐른다 — W2 이전 균형 술어와 동일 결론이다
       (부재 ≠ 판정불가. 융합하면 구 데몬에서 reclaim 이 영구 마비된다 — seat_state 주석 참조).
+
+    ★③의 자리가 왜 여기인가(Rust `seat_liveness` 와 **같은 순서**여야 한다 — 파리티):
+      · `agent_alive`(④) **앞**: 관문에 갇힌 에이전트도 프로세스는 살아 있다. 뒤에 두면 이
+        분기는 영원히 도달 불가(죽은 코드)이고 보류 좌석이 다시 alive_presumed → "이미 가동 중"
+        으로 접힌다 — 이 등급의 존재 이유가 사라진다.
+      · 래치(①) **뒤**: 래치 단방향 계약(존재 = 각성 확정)은 이 단위에서 건드리지 않는다
+        (금지 방향 ⑦). 각성 이력이 있는 좌석의 후발 관문은 **오늘과 같은 결과**(awake_confirmed)
+        로 남는다 — 새 사망 경로가 아니고, 그 잔여는 U-11 이 다룬다.
     """
     s = status_surface(status, role)
     if s is None:
@@ -524,6 +607,13 @@ def node_liveness(status, role):
     age = st.get("age_secs")
     if isinstance(age, (int, float)) and age <= STATUS_FRESH_SECS and st.get("state"):
         return LIVENESS_AWAKE, "set-status(%s·age%ss)" % (st.get("state"), int(age))
+    # ★(U-10) ③ 관문 보류 — 프로세스는 살아 있으나 첫기동 관문에 갇혀 **입력 불가**.
+    #   반드시 agent_alive 분기 **앞**(위 docstring ③ 사유). 파괴·스폰 어느 것도 유도하지
+    #   않는다 — `latch_death_confirmed` 3중 AND(파괴 경로)는 이 등급을 보지 않는다(동결).
+    gp = gate_pending_info(s)
+    if gp is not None:
+        return LIVENESS_GATED, ("첫기동 관문 보류(gate=%s · 프로세스 생존·입력 불가)"
+                                % (gp.get("gate") or "unknown"))
     if s.get("agent_alive"):
         # ★B6: 종전엔 이 신호가 곧 'awake' 였다(self-test 가 그 오답을 박제 중이었다).
         #   프로세스 생존은 '각성'의 증거가 아니다 — 강등해 정직하게 라벨링한다.
@@ -926,6 +1016,83 @@ def self_test():
     chk(g4 == LIVENESS_ABSENT, "잔존 불명이 스폰(가용성 우선)으로 해소되지 않음")
     chk(g4 != LIVENESS_UNKNOWN, "스폰 경로가 unknown 을 반환(시한부 해소 계약 위반)")
 
+    # ─────────── ★(U-10) 좌석 제4 등급 gate_pending — 4상 표(Rust 배터리와 1:1) ───────────
+    #   CASE-GATE-ALL/A/B/C 태그는 cys.rs `mod seat_latch_negation_tests` 의 gate_case_* 와 짝이다
+    #   (짝 소실 = 파리티 붕괴이고, tests/test_seat_latch_negation.py 가 그 짝을 기계 대조한다).
+    gated = surf(agent_alive=True, status=None, seat="occupied",
+                 gate_pending={"gate": "disclaimer", "since": 1.0})
+    # CASE-GATE-ALL: 살아 있는 관문 좌석은 제4 등급이다(종전엔 alive_presumed → '이미 가동 중').
+    chk(node_liveness(gated, "cso")[0] == LIVENESS_GATED,
+        "관문 보류 좌석이 제4 등급을 받지 못함(허위 already_alive 경로 잔존)")
+    chk(node_liveness(gated, "cso")[0] != LIVENESS_PRESUMED,
+        "관문 보류가 생존추정으로 접힘 — 충족 집합에 새어 들어간다")
+    # ★★치명 앵커 ④: 충족이 아니라고 해서 **죽은 것이 아니다**. 파괴 게이트(node_alive →
+    #   reclaim kill)는 반드시 생존측이어야 한다 — 여기가 뒤집히면 신규 프로필에서 관문에
+    #   갇힌 4종 노드가 전부 kill 대상이 되어 '전 pane 사망(글자 0)'이 된다.
+    chk(node_alive(gated, "cso") is True,
+        "관문 보류 좌석을 죽음으로 판정(오살 — 치명 앵커 ④ 전 pane 사망 경로 신설)")
+    chk(_reclaim_verdict(gated, "cso", 100, 100) == "hold-alive",
+        "관문 보류 좌석에 kill 허용(오살) — 파괴 경로 보류 우선 위반")
+    # CASE-GATE-A: null·키 부재 = 무신호(축 미도입). NOT-gated 가 아니라 **항 생략**이다 —
+    #   구 데몬(키 없음) + 신 팩 혼재에서 종전 등급이 그대로 나와야 한다.
+    chk(node_liveness(surf(agent_alive=True, status=None, seat="occupied"), "cso")[0]
+        == LIVENESS_PRESUMED, "구 데몬(gate_pending 키 부재)에서 종전 등급이 변형됨")
+    chk(node_liveness(surf(agent_alive=True, status=None, seat="occupied",
+                           gate_pending=None), "cso")[0]
+        == LIVENESS_PRESUMED, "null 이 종전 등급을 바꿈(항 생략 규약 위반)")
+    # CASE-GATE-B: dict 가 아닌 non-null(스큐·손상)은 무신호로 접는다(fail-open → 종전 동작).
+    #   'gated' 로 접으면 판정불가가 미충족을 만들어 부트 재시도 라이브락(A1)이 된다.
+    for _bad in (True, "gated", 1, [], 0.5):
+        chk(node_liveness(surf(agent_alive=True, status=None, seat="occupied",
+                               gate_pending=_bad), "cso")[0] == LIVENESS_PRESUMED,
+            "손상 gate_pending(%r)이 등급을 움직임(fail-open 방향 위반)" % (_bad,))
+    # CASE-GATE-C: 래치 단방향 계약 무접촉(금지 방향 ⑦) — 각성 이력 좌석은 관문 신호가 있어도
+    #   awake_confirmed 다. **오늘과 같은 결과**이고, 그 잔여는 U-11 이 다룬다.
+    chk(node_liveness(surf(agent_alive=True, status=None, seat="occupied",
+                           awakened_at=1_700_000_000.0,
+                           gate_pending={"gate": "trust", "since": 1.0}), "cso")[0]
+        == LIVENESS_AWAKE, "래치 단방향 계약이 관문 신호로 뒤집힘(금지 방향 ⑦ 위반)")
+    # 롤백 킬스위치 — env 1지점으로 축 전체가 종전 판정으로 복귀한다.
+    _prev_gp = os.environ.get(GATE_PENDING_ENV)
+    try:
+        os.environ[GATE_PENDING_ENV] = "0"
+        chk(gate_pending_axis_enabled() is False, "킬스위치 '0' 이 축을 끄지 못함")
+        chk(node_liveness(gated, "cso")[0] == LIVENESS_PRESUMED,
+            "킬스위치 off 인데 제4 등급이 살아 있음(롤백 1지점 계약 붕괴)")
+        for _loose in ("", "false", "off", "1"):
+            os.environ[GATE_PENDING_ENV] = _loose
+            chk(gate_pending_axis_enabled() is True,
+                "느슨한 값 %r 이 축을 끔(엄격 비교 회귀 — 오타로 안전장치 소실)" % _loose)
+    finally:
+        if _prev_gp is None:
+            os.environ.pop(GATE_PENDING_ENV, None)
+        else:
+            os.environ[GATE_PENDING_ENV] = _prev_gp
+    chk(gate_pending_axis_enabled() is True, "킬스위치 복원 실패(테스트 오염)")
+    # ★(BLOCK-3 잔여분) 마스터·강등 스위치도 **각각 단독으로** 축을 끈다 — 종전엔 축 노브만
+    #   읽어서, 마스터를 눌러도 데몬이 표식을 TTL 까지 계속 내보내는 반쪽 롤백이었다.
+    for _env, _on, _off, _label in (
+        (BOOT_GATES_ENV, "0", ("", "false", "off", "1", " 0"), "마스터"),
+        (GATE_PENDING_CLOSE_ENV, "1", ("", "true", "yes", "on", " 1"), "강등"),
+    ):
+        _prev = os.environ.get(_env)
+        try:
+            os.environ[_env] = _on
+            chk(gate_pending_axis_enabled() is False,
+                "%s 스위치(%s=%s)가 데몬 직렬화 축에 닿지 않음(반쪽 롤백)" % (_label, _env, _on))
+            chk(node_liveness(gated, "cso")[0] == LIVENESS_PRESUMED,
+                "%s 스위치 off 인데 제4 등급이 살아 있음" % _label)
+            for _loose in _off:
+                os.environ[_env] = _loose
+                chk(gate_pending_axis_enabled() is True,
+                    "%s 스위치가 느슨한 값 %r 을 받음(엄격 비교 회귀)" % (_label, _loose))
+        finally:
+            if _prev is None:
+                os.environ.pop(_env, None)
+            else:
+                os.environ[_env] = _prev
+    chk(gate_pending_axis_enabled() is True, "3스위치 복원 실패(테스트 오염)")
+
     # role_family — pack.rs:1674-1684 접두 의미 미러(master 정확일치·그 밖 접두)
     chk(role_family("master") == "master", "master 가족 판정 실패")
     chk(role_family("master-2") is None, "master 접두 관용(발권 불가 이름)")
@@ -978,7 +1145,9 @@ def self_test():
         return 1
     print("self-test OK — %d 케이스 통과(상태계약 분리·basename매칭·확장자정규화·회수판정4분기·"
           "claim-role·엄격ack·F4·무구독폴백슬롯 + W2: 래치 단방향·liveness 3등급+판정불가·"
-          "Unknown 이원·role_family·배달 3분기 + W4: G24 그레이스풀 유효성 3)" % (7 + 10 + 6 + 4 + 4 + 4 + 4 + 41 + 3))
+          "Unknown 이원·role_family·배달 3분기 + W4: G24 그레이스풀 유효성 3"
+          " + U-10: gate_pending 제4 등급 4상표·파괴게이트 생존측·롤백 킬스위치 19)"
+          % (7 + 10 + 6 + 4 + 4 + 4 + 4 + 41 + 3 + 19))
     return 0
 
 

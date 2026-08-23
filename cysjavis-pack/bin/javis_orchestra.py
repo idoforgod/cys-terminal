@@ -461,7 +461,14 @@ def check_verdicts(status, detect=None, agents=None):
     # 등급 우선순위(높을수록 건강) — 동족 좌석이 여러 개일 때 **가장 건강한 좌석**이 요건을 대표한다.
     # ★왜: worker 가 3개 있고 그중 하나만 죽었을 때 죽은 좌석을 대표로 뽑으면 '미기동' 오판이 나고,
     #   그 오판이 결손>0 → 불필요한 스폰·재선언 churn(자가치유가 아니라 자가교란)으로 번진다.
-    _RANK = {"awake_confirmed": 3, "alive_presumed": 2, "unknown": 1, "absent": 0}
+    # ★(U-10) `gate_pending`(제4 등급) 자리 = **unknown 아래·absent 위**. 정수 재번호 없이 0.5.
+    #   · unknown 아래인 이유: unknown 은 '판정 불가'라 충족측으로 접히지만(콜드스타트 fail-open),
+    #     gate_pending 은 **확정적으로 미충족**이다. 동족 좌석 중 unknown 이 하나라도 있으면
+    #     그쪽이 대표가 돼 종전대로 충족(위경보 0)이고, 관문 좌석이 단독이면 정직하게 미충족이다.
+    #   · absent 위인 이유: 관문 보류는 '좌석이 있고 살아 있다'는 **신호가 있는** 상태다.
+    #     absent(무신호)를 대표로 뽑으면 스폰을 유도해 살아 있는 pane 위에 중복 좌석이 생긴다.
+    _RANK = {"awake_confirmed": 3, "alive_presumed": 2, "unknown": 1,
+             "gate_pending": 0.5, "absent": 0}
     verdicts = {}
     for r in required:
         sat, filler, native, why = slot_satisfied(r, live)
@@ -484,7 +491,16 @@ def check_verdicts(status, detect=None, agents=None):
         # 좌석은 있는데 각성/생존 신호가 전부 없으면(absent) 충족이 아니다 — 이름공간과 생존을
         # 함께 본다. 단 unknown(판정불가)은 좌석 존재 시 충족측으로 접는다(fail-open은 여기가
         # 정당하다: check 는 파괴 행위를 하지 않고, unknown 에서 적색을 내면 콜드스타트마다 위경보).
-        satisfied = bool(sat) and grade != bn.LIVENESS_ABSENT if bn is not None else bool(sat)
+        # ★(U-10) `gate_pending`(제4 등급)도 **충족이 아니다** — 프로세스는 살아 있지만 첫기동
+        #   관문에 갇혀 입력을 받지 못하는 좌석이다. 이걸 충족으로 접으면 관문에 갇힌 팀 전체가
+        #   "정상 가동 중"으로 집계돼 지금보다 나빠진다(이 등급의 존재 이유).
+        #   ★충족 아님 ≠ 죽음: 파괴 게이트(`javis_boot_node.node_alive` → reclaim kill)는 이
+        #     등급을 **생존측**으로 읽는다. 두 축을 섞으면 살아 있는 pane 을 죽인다(치명 앵커 ④).
+        #   ★구 팩 스큐 안전: 상수 부재(구 javis_boot_node)면 리터럴 폴백 — 그 경우 등급 자체가
+        #     생산되지 않으므로 이 항은 무동작이다.
+        _gated = getattr(bn, "LIVENESS_GATED", "gate_pending") if bn is not None else "gate_pending"
+        satisfied = (bool(sat) and grade not in (bn.LIVENESS_ABSENT, _gated)
+                     if bn is not None else bool(sat))
         verdicts[r] = {"satisfied": satisfied, "grade": grade, "filler": filler,
                        "native": native, "why": "%s · %s" % (why, greason)}
     return verdicts, roster
@@ -590,10 +606,20 @@ def cmd_check(args):
                   "페르소나/렌즈/익명화로 보완(REVIEWER_DIRECTIVE §6)"
                   % (e["substituted_for"], e["reason"], e["role"]))
     missing = []
+    gated = []          # ★(U-10) 관문 보류 — 미기동과 **처방이 다르다**(기동이 아니라 사람 1회)
     for r in required:
         v = verdicts[r]
         if not v["satisfied"]:
-            print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
+            # ★(U-10) 제4 등급은 '미기동'이 아니다: 좌석도 프로세스도 살아 있는데 첫기동 관문
+            #   (테마·로그인방식·OAuth·폴더신뢰·면책·새기능안내)에 갇혀 입력을 못 받는 상태다.
+            #   여기서 "→ `cys boot` 로 기동하라"고 적으면 **거짓 처방**이다(boot 은 이 좌석을
+            #   스폰도 회수도 하지 않는다 — 그게 옳은 동작이다). 사람이 관문을 한 번 통과시켜야
+            #   한다. 미충족 계상·exit 계약은 **그대로**(1) 두고 라벨과 처방만 정확하게 만든다.
+            if v["grade"] == getattr(_boot_node(), "LIVENESS_GATED", "gate_pending"):
+                print("  ✗ %s — 첫기동 관문 보류 (%s)" % (r, v["why"]))
+                gated.append(r)
+            else:
+                print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
             missing.append(r)
             continue
         # ★B2 실충전자 라벨링 — 대체 좌석이 슬롯을 채웠으면 그 사실을 숨기지 않는다.
@@ -616,6 +642,11 @@ def cmd_check(args):
                  else "cys boot")
         print("종합: 필수 %d/%d 생존 — 부재: %s → `%s`로 기동하라"
               % (len(required) - len(missing), len(required), ", ".join(missing), howto))
+        if gated:
+            # ★(U-10) 관문 보류는 기동 명령으로 풀리지 않는다 — 정직한 처방을 한 줄 더 얹는다.
+            print("  ※ 관문 보류(%s): 기동 명령으로 풀리지 않는다. 해당 pane 에서 첫기동 관문을 "
+                  "사람이 1회 통과시킨 뒤 재부트하라 — 좌석·프로세스는 살아 있다"
+                  "(`cys read-screen --surface <ref>` 로 화면 확인)." % ", ".join(gated))
         return 1
     print("종합: %d종 의무 노드 전부 생존 — LLM orchestrating READY" % len(required))
     return 0

@@ -12,8 +12,19 @@ pub mod factory_reset;
 pub mod app_bundle;
 pub mod directive_compose;
 pub mod edit_kinds;
+/// 첫기동 관문 코퍼스 — **코드 임베드 정본**(U-12 · K-1). `agents.json` 값 수정은 사용자 소유
+/// 파일 계층에 막혀 기존 설치 기계에 도달하지 못하므로, 관문 데이터의 진실원천은 코드다.
+pub mod first_run_gates;
+/// 주입·제출 관문 가드(U-14) + 폴더신뢰 Return 정책(U-15) — "지금 이 pane 에 키를 보내도 되는가".
+/// ready 를 잘못 선언했을 때 실제로 좌석을 죽이는 것은 **제출 Return** 이므로, 판정(U-13)과 별개로
+/// 전송 직전에 한 번 더 화면을 본다. 생애 창은 첫 각성 ack 이전으로 상한이 걸려 있다.
+pub mod inject_guard;
 pub mod license;
 pub mod pack;
+/// ready 술어 단일화(U-13) — `ready = 입력활성 증거 ∧ 관문 문면 부재`. 판정은 순수함수 하나가
+/// 소유하고(`readiness::judge`), 부트 폴링과 `adapter_ready` 두 소비처가 같은 술어를 경유한다.
+/// 종전엔 네 자리가 각자 ready 를 선언해 "마커 축만 고치면 아무것도 안 바뀌는" 상태였다.
+pub mod readiness;
 pub mod packsig;
 pub mod overrides;
 pub mod todo_decl;
@@ -150,7 +161,15 @@ pub const ENV_NO_AUTOSTART: &str = "CYS_NO_AUTOSTART";
 pub const NO_AUTOSTART_ON: &str = "1";
 
 /// Windows `CREATE_NEW_PROCESS_GROUP` — 자식을 **새 콘솔 프로세스 그룹**의 루트로 만든다.
-/// 부모 콘솔의 Ctrl-C/Ctrl-Break 가 자식에게 전파되지 않는다(unix `setsid` 의 대응물).
+/// 부모 콘솔의 Ctrl-C/Ctrl-Break 가 자식에게 전파되지 않는다.
+///
+/// ★효력 범위(과장 금지 · 2026-08-24 정정): 이 flag 가 막는 것은 **콘솔 컨트롤 이벤트 전파**
+/// 하나다. Windows 의 **트리 종료**는 job object(부모가 쥔 job 이 끝나면 자식도 끝난다)와
+/// `taskkill /T`(스냅샷의 부모-자식 링크를 따라 내려간다)로 일어나며 **둘 다 프로세스 그룹과
+/// 무관**하다 — 즉 "훅이 트리를 죽여도 살아남는다"를 이 flag 로 얻지는 못한다.
+/// unix `setsid` 의 **부분** 대응물이라고 읽어야 정확하다(setsid 는 세션·그룹을 실제로 갈라
+/// 시그널 전파를 끊는다). 이 비대칭을 지운 채 두 플랫폼을 같은 문장으로 적으면, Windows 에서
+/// 보호받고 있다고 **잘못 믿는** 상태가 된다.
 #[cfg(windows)]
 const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// Windows `CREATE_NO_WINDOW` — 콘솔 자식에게 새 콘솔 창을 할당하지 않는다.
@@ -172,6 +191,17 @@ const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// | `GroupScoped`  | 시그널로는 안 죽는다 | **원장(ledger)의 명시적 그룹 kill** |
 /// | `ConsoleScoped`| unix=시그널 면역 / **Windows=콘솔 Ctrl-C 로 함께 죽는다** | 부모의 `kill_group`(정상 종료 경로) + Windows 콘솔 전파(비정상 종료 경로) |
 /// | `Attached`     | **같이 죽어야 한다** | 부모(`wait`/`kill_on_drop`/트리 kill) |
+///
+/// ★U-7 이동의 정직한 손익(2026-08-24 정정 — 종전 주석의 "값·행동 무변경, 정의처만 이동"은
+/// 이 지점에서 **거짓**이었다):
+/// · `spawn_detached_daemon`(cys.rs · `Survivor`)의 Windows arm 은 종전 `CREATE_NO_WINDOW`
+///   **단독**이었고, 지금은 `CREATE_NEW_PROCESS_GROUP` 이 **새로 걸린다**. 무해한 방향이지만
+///   무변경은 아니다.
+/// · `state.rs::HideConsole::hide_console`(`Attached` 별칭)은 값·행동 모두 무변경이다
+///   (`CREATE_NO_WINDOW` 단독 · unix 무동작).
+/// · 그리고 위 `WIN_CREATE_NEW_PROCESS_GROUP` 주석대로, Windows 에서 그 flag 는 **트리 종료
+///   (job object · `taskkill /T`)로부터 보호해 주지 않는다.** 등급표의 "부모 사망 시 자식"
+///   열은 **unix 기준**으로 읽고, Windows 는 콘솔 Ctrl-C 축만 이 flag 가 다룬다고 읽어라.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildLifetime {
     /// 부모(CLI)가 죽어도 살아남아야 하는 자식. **유일 사례 = `cys` → `cysd` 기동.**
@@ -190,15 +220,23 @@ pub enum ChildLifetime {
     ConsoleScoped,
     /// 부모가 `wait`/`kill_on_drop` 으로 붙들고 있는 유계 자식(auto-restore·브리지 재기동·
     /// launch-agent 호출·스케줄 명령). **분리 금지** — 트리 kill 로 함께 죽는 것이 정상 동작이다.
-    /// Windows 콘솔 창만 숨긴다(= 기존 `HideConsole` 트레이트와 동일한 flag).
+    /// Windows 콘솔 창만 숨긴다. `cysd/state.rs::HideConsole::hide_console` 은 **이 등급의
+    /// 별칭**이다(같은 flag · 같은 행동 — 정의처가 둘이던 것을 하나로 접었다).
     Attached,
 }
 
 impl ChildLifetime {
-    /// 이 등급의 Windows `creation_flags` **완성값**. 등급 하나가 flag word 전체를 결정한다 —
-    /// `creation_flags` 는 누적이 아니라 **덮어쓰기**라, 호출부가 `hide_console()` 을 따로 부르면
-    /// 앞서 얹은 그룹 flag 가 조용히 사라진다(channels.rs 원주석이 지적한 함정). 등급 단일값이
-    /// 그 함정을 구조적으로 없앤다.
+    /// 이 등급의 Windows `creation_flags` **완성값** — flag word 의 **유일한 정의처**다.
+    ///
+    /// `creation_flags` 는 누적이 아니라 **덮어쓰기**라, 한 빌더 체인에서 두 번 얹으면 뒤엣것이
+    /// 앞엣것을 통째로 지운다(channels.rs 원주석이 지적한 함정). 등급 하나가 flag word 전체를
+    /// 결정하므로 **"등급끼리 섞여 반쪽 flag 가 되는" 조합은 표현할 수 없다.**
+    ///
+    /// ★남은 위험은 정직하게 적는다: `hide_console()`(= `Attached` 별칭)을 다른 등급 뒤에
+    /// 이어 붙이는 **병용**은 타입으로는 여전히 가능하고, 그 순간 앞 등급의 flag 가 조용히
+    /// 사라진다(mac/Linux 무증상 · CI 전부 초록). 그 조합은 타입이 아니라 소스 핀
+    /// (`spawn_policy_tests::lifetime_grade_and_hide_console_are_never_mixed`)이 막는다 —
+    /// "구조적으로 불가능"이 아니라 "기계가 막는다"가 사실이다.
     #[cfg(windows)]
     const fn win_creation_flags(self) -> u32 {
         match self {
@@ -412,7 +450,7 @@ pub fn wait_named_pipe(path: &Path, timeout: std::time::Duration) -> bool {
 /// 타이핑 가드 거부의 **에러 코드·메시지 단일 소스**(T-0147-6).
 ///
 /// 생산자 = `cysd` handlers(`surface.send_text`·`surface.send_key`), 소비자 = `cys` 클라이언트의
-/// 주입 경로. 클라이언트는 와이어에서 `error.message` 만 받으므로(rpc_over) 이 문구가 곧 판정
+/// 주입 경로. 클라이언트는 와이어에서 `error.message` 를 받으므로(`rpc_roundtrip`) 이 문구가 곧 판정
 /// 근거다 — **양쪽이 리터럴을 따로 들고 있으면** 문구를 다듬는 순간 소비자의 `--queued` 폴백이
 /// 조용히 죽는다(RC1 문자열 계약 드리프트). 그래서 상수로 못박고 양쪽이 이것만 쓴다.
 pub const ERR_TYPING_GUARD: &str = "typing_guard";
@@ -432,6 +470,318 @@ pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or
 /// 파이썬 소비자(`javis_bootstrap.CYS_BOOT_EXIT_BUSY`)까지 셋이다. 값을 세 곳에 적으면 그것이
 /// RC1(다중 구현) 의 새 인스턴스다 — 검체 `H-EXIT-2` 가 3자 파리티를 기계 대조한다.
 pub const EXIT_BOOT_BUSY: i32 = 75;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(U-10) 좌석 **제4 등급** `gate_pending` 축 — 스키마 자리 + 롤백 킬스위치(단일 지점)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// **무엇인가**: "프로세스는 살아 있으나 첫기동 관문(테마·로그인방식·OAuth·폴더신뢰·면책·
+// 새기능안내)에 갇혀 입력을 받을 수 없는 좌석". 종전 3등급(AwakeConfirmed / AlivePresumed /
+// Absent + 판정불가 Unknown)에는 이 사실을 담을 자리가 없어서, 관문에 갇힌 좌석이
+// `agent_alive == true` 하나로 `AlivePresumed` 가 되고 `run_boot` 이 그것을
+// **"이미 가동 중 — 건너뜀"(already_alive)** 으로 접었다. 그 상태로 U-11(readiness 실패 시
+// close 대신 보류)을 착지시키면 **관문에 갇힌 팀 전체가 "정상 가동 중" 으로 집계**된다.
+//
+// **이 단위(U-10)의 범위 — additive 만**: 자리(스키마 키·등급 변형·미러 상수)를 만들고,
+// 그 등급을 '충족' 에서 제외해야 하는 소비처를 **전수 동시 정합**시킨다.
+// **생산자는 이 단위에 없다** — 값은 항상 `null`(미도입) 이고, 생산은 U-11/U-13 이 한다.
+// 그래서 구 데몬 ↔ 신 CLI, 신 데몬 ↔ 구 CLI 어느 혼재에서도 거동이 오늘과 같다.
+//
+// **`null` 규약(래치 '부재≠부정' 과 동형)**: 키 부재·`null` 은 "관문에 갇히지 **않았다**" 가
+// 아니라 **'이 축에 대해 말할 것이 없음'**(구 데몬 = 축 미도입)이다. 소비자는 그 경우
+// 이 항을 **통째로 생략**하고 종전 판정으로 흘러야 한다. 반대로 읽으면(= null 을 부정으로)
+// 새 사망 경로가 열린다.
+//
+// **형(型) 규약**: 값은 `null` 또는 **object**(`{"gate": …, "since": …}`) 둘 중 하나다.
+// object 가 아닌 non-null(스큐·손상)은 **무신호로 접는다**(fail-open → 종전 동작). 여기서
+// 'gated' 로 접으면 판정불가가 미충족을 만들어 부트 재시도 라이브락(A1 클래스)이 된다 —
+// 이 축의 fail-open 방향은 "오늘보다 나빠지지 않는다" 로 고정한다.
+
+/// `gate_pending` 축 **롤백 킬스위치**의 env 이름(단일 지점 · 기본 = 축 노출).
+///
+/// `CYS_GATE_PENDING=0` 이면 데몬은 이 키를 항상 `null` 로 직렬화하고 CLI·팩은 이 축을
+/// 읽지 않는다 → 전 소비자가 **종전 3등급 판정으로 즉시 복귀**한다. 생산자가 붙는
+/// U-11/U-13 이후에도 이 스위치 하나로 축 전체를 무장해제할 수 있어야 한다(그것이 이
+/// 스위치의 존재 이유다 — 관문 문면 오탐 1건이 팀 전체를 미충족으로 만드는 사고의 탈출구).
+/// python 미러: `javis_boot_node.gate_pending_axis_enabled()`(같은 이름·같은 극성 ·
+/// **같은 3스위치 접기** — 마스터 `CYS_BOOT_GATES=0` · 강등 `CYS_GATE_PENDING_CLOSE=1` ·
+/// 축 `CYS_GATE_PENDING=0` 어느 하나로도 꺼진다. 두 언어의 동형성은 헬스 검체가 기계 대조).
+pub const ENV_GATE_PENDING: &str = "CYS_GATE_PENDING";
+
+/// `gate_pending` 축의 **wire 키 이름 정본** — `surface.list` · `org.status` · `topology.json`
+/// · python 미러가 **같은 키·같은 의미**로 쓴다(동형성 핀이 기계 대조).
+pub const GATE_PENDING_KEY: &str = "gate_pending";
+
+/// 축이 **실제로 노출되는가** — 데몬 직렬화 지점(`state.rs::gate_pending_wire`)과 전 Rust
+/// 소비처의 단일 술어(**부작용 있음** — env 3회 판독). 규약은 순수 코어
+/// [`gate_pending_axis_effective_from`].
+///
+/// ★(BLOCK-3 잔여분 수리 · 2026-08-24) 종전 이 함수는 `CYS_GATE_PENDING` **하나만** 읽었다.
+/// 그래서 마스터 스위치(`CYS_BOOT_GATES=0`)를 눌러도 **데몬에는 닿지 않아** 이미 실린
+/// gate_pending 표식이 TTL(30분)까지 계속 직렬화됐다 — CLI 는 종전 판정으로 돌아갔는데
+/// 데몬은 여전히 좌석을 보류로 내보내는 **반쪽 롤백**이고, 그 조합이 정확히 BLOCK-4 가
+/// 없앤 "관측은 하는데 귀결은 없는" 상태다. 사고 순간에 쥐는 손잡이 하나가 데몬까지 닿아야
+/// '되돌렸다'가 참이 된다.
+pub fn gate_pending_axis_enabled() -> bool {
+    gate_pending_axis_effective_from(
+        std::env::var(ENV_BOOT_GATES).ok().as_deref(),
+        std::env::var(ENV_GATE_PENDING_CLOSE).ok().as_deref(),
+        std::env::var(ENV_GATE_PENDING).ok().as_deref(),
+    )
+}
+
+/// 축 노출 판정의 **순수 코어** — 세 스위치의 접기.
+///
+/// 규약: **축 노출 ⟺ 보류 장치가 켜져 있다.** 마스터(`CYS_BOOT_GATES=0`)·강등
+/// (`CYS_GATE_PENDING_CLOSE=1`)·축(`CYS_GATE_PENDING=0`) 어느 하나를 눌러도 **동시에** 꺼진다.
+/// ★불변식은 여기서 다시 쓰지 않고 [`gate_axes_from`] 의 산출값을 뒤집어 쓴다 — 조건을 두 벌로
+/// 적는 순간 한 벌만 고쳐지고, 그 갈라짐이 이 저장소가 반복해서 맞은 사본 드리프트다.
+/// (판정 축 노브 셋은 이 축과 무관하므로 `None` 을 먹인다 — `gate_pending_close` 는 그 셋에
+/// 의존하지 않는다.)
+pub fn gate_pending_axis_effective_from(
+    master_env: Option<&str>,
+    close_env: Option<&str>,
+    axis_env: Option<&str>,
+) -> bool {
+    !gate_axes_from(master_env, None, None, None, close_env, axis_env).gate_pending_close
+}
+
+/// **축 노브 하나만** 보는 순수 코어 — `"0"` 만 끈다.
+///
+/// ★이것은 축 술어가 아니다(그것은 [`gate_pending_axis_effective_from`]). 여기는 노브 한 개의
+/// 판독 규약이고, 마스터·강등 스위치와의 합류는 [`gate_axes_from`] 이 소유한다.
+///
+/// ★극성이 왜 '기본 켜짐 · "0" 만 끔' 인가: 이 단위에서 축이 켜져 있어도 **생산자가 없어
+/// 값은 항상 null** 이므로 기본값이 곧 종전 동작이다. 반대로 '기본 꺼짐 + "1" 로 켬' 으로
+/// 두면 U-11 착지 시 켜는 것을 잊는 순간 보류 좌석이 다시 `already_alive` 로 접힌다 —
+/// 잊어서 위험해지는 방향이 아니라 **잊어도 오늘과 같은** 방향으로 배치한다.
+/// `"false"`·`"off"`·빈 값 같은 느슨한 falsy 는 끄지 않는다(형제 게이트와 같은 엄격 비교 —
+/// 오타로 안전장치가 조용히 꺼지는 사고 방지).
+pub fn gate_pending_axis_enabled_from(env_val: Option<&str>) -> bool {
+    env_val != Some("0")
+}
+
+/// wire 값(`null` | object) → **관문 보류인가**. 전 Rust 소비처의 단일 술어(**부작용 있음** —
+/// 킬스위치 env 판독). 판정 규약 자체는 순수 코어 `gate_pending_from_wire_with` 에 있다.
+pub fn gate_pending_from_wire(v: &Value) -> bool {
+    gate_pending_from_wire_with(gate_pending_axis_enabled(), v)
+}
+
+/// 관문 보류 술어의 **순수 코어** — 킬스위치 상태와 wire 값만 받아 판정한다.
+///
+/// 계약: `enabled ∧ object` → 보류(true) · 그 밖(off · null · 키 부재 · 비 object) →
+/// **무신호**(false = 종전 판정으로 흐름).
+/// ★비 object non-null(스큐·손상)을 'gated' 로 접지 않는 이유: 판정불가를 미충족으로 만들면
+/// 부트가 영원히 재시도하는 라이브락(A1 클래스)이 된다. 이 축의 fail-open 방향은
+/// **"오늘보다 나빠지지 않는다"** 로 고정한다.
+pub fn gate_pending_from_wire_with(enabled: bool, v: &Value) -> bool {
+    enabled && v.is_object()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(U-11) readiness 실패 귀결의 재정의 — 만료 규약 · 롤백 킬스위치 · 종료코드
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// U-10 이 좌석 **자리**(제4 등급)를 만들었고, 여기서 그 자리에 값이 실린다. 값이 실리는 순간
+// 세 가지가 **동시에** 정해져야 한다 — 그렇지 않으면 새 사망 경로·라이브락이 열린다:
+//   ① **만료**: 보류 표식은 사람이 관문을 통과시켜도 저절로 사라지지 않는다. 지우는 계약이
+//      없으면 좌석이 영원히 미충족 → `check` 영구 실패 → 부트 라이브락(A1 클래스)이다.
+//      U-10 이 이 규약을 **명시적으로 U-11 에 인계**했다(state.rs `gate_pending` 필드 doc).
+//   ② **롤백**: 보류는 '닫지 않는다' 는 결정이다. 그 결정이 틀린 기계에서 좌석이 고이면
+//      env 하나로 **종전(무조건 close)** 으로 돌아갈 수 있어야 한다.
+//   ③ **종료코드**: 보류는 성공(0)도 실패(1)도 아니다. 둘 중 하나로 접으면 소비부가
+//      '팀을 세웠다' 또는 '기동이 깨졌다' 로 오독한다(G11 계열의 의미 융합).
+
+/// 관문 보류 표식의 **수명 상한**(초). 이 나이를 넘긴 표식은 데몬의 단일 직렬화 지점
+/// (`Surface::gate_pending_wire`)에서 **null 로 접힌다** = 전 소비자가 종전 판정으로 복귀한다.
+///
+/// ★왜 만료가 **필수**인가: 표식을 지우는 유일한 능동 경로는 "그 좌석에서 readiness 가 다시
+/// 확정될 때"인데, 보류 좌석은 `run_boot` 이 **관측만 하고 건너뛰므로**(U-10) 재확정 기회가
+/// 오지 않는다. 사람이 화면에서 관문을 통과시켜도 표식만 남아 좌석이 영구 미충족이 된다 —
+/// 그 자체가 부트 라이브락이다. 만료는 그 라이브락의 **상한**이다.
+///
+/// ★왜 이 방향이 안전한가: 만료의 귀결은 "축이 없던 것처럼 = **정확히 오늘의 동작**" 이다
+/// (관문 좌석이 다시 `AlivePresumed` → `already_alive`). 즉 만료는 새 위험을 만들지 않고
+/// 관측을 잃을 뿐이다. 반대 방향(무기한 보류)만이 새 고장을 만든다.
+///
+/// ★값 30분: 사람이 pane 을 보고 관문 한 번을 통과시키는 현실적 창. 짧으면 관측이 일찍
+/// 사라지고(=오늘로 복귀), 길면 라이브락 상한이 길어진다. **새 leaf 다** — 기존 예산 leaf
+/// (`BUDGET_*` · `javis_budget.LEAF_FLOORS`)는 어느 것도 건드리지 않는다.
+pub const GATE_PENDING_TTL_SECS: f64 = 1800.0;
+
+/// 표식이 아직 유효한가 — **순수 코어**(시계·env 비의존, 진리표 테스트 대상).
+///
+/// 계약: `since` 가 미래거나(시계 되돌림·스큐) NaN 이면 **유효**로 본다. 판정불가를 만료로
+/// 접으면 관측이 조용히 사라지고, 그 방향의 실수는 "보류를 already_alive 로 되돌리는" 것 —
+/// 이 단위가 없애려는 바로 그 상태다. 반대로 유효로 두면 최악이 TTL 만큼의 지연이다.
+pub fn gate_pending_fresh(since: f64, now: f64, ttl: f64) -> bool {
+    let age = now - since;
+    !(age.is_finite() && age > ttl)
+}
+
+/// 보류 귀결의 **롤백 킬스위치** env 이름(단일 지점).
+///
+/// `CYS_GATE_PENDING_CLOSE=1` 이면 `GatePending` 판정을 **`LaunchFailed` 로 강등**한다 →
+/// 좌석은 종전처럼 즉시 close 되고, 표식도 실리지 않는다(= 이 단위 착지 이전과 동일).
+/// 강등은 CLI 의 **판정 반환 지점 한 곳**에서만 일어난다(호출부 3곳이 각자 분기하면 그 순간
+/// 롤백이 3지점이 되고, 한 곳이라도 빠지면 롤백이 거짓말이 된다).
+pub const ENV_GATE_PENDING_CLOSE: &str = "CYS_GATE_PENDING_CLOSE";
+
+/// 롤백 판정의 **단일 진입점**(부작용 있음 — env 2회). 규약은 순수 코어
+/// `gate_pending_close_override_from`.
+///
+/// ★두 스위치를 **여기서 합류**시키는 이유(반쪽 롤백 차단): U-10 의 축 스위치
+/// (`CYS_GATE_PENDING=0`)는 "데몬이 이 축을 직렬화하지 않는다" 는 뜻이다. 그 상태에서 CLI 만
+/// 보류를 계속하면 **pane 은 남는데 좌석은 여전히 `already_alive` 로 읽히는** 반쪽 상태가 된다
+/// (관측 없는 보류 = 허위 READY). 롤백은 '반쯤 되돌아가는' 것이 가장 위험하다 — 어느 스위치를
+/// 눌러도 기능 **전체**가 꺼지게 한다.
+pub fn gate_pending_close_override() -> bool {
+    gate_axes().gate_pending_close
+}
+
+/// 롤백 합류의 **순수 코어** — 두 스위치 중 하나라도 켜지면 종전(즉시 close)으로 돌아간다.
+///
+/// ★(BLOCK-4 · 2026-08-24) 이 함수는 **축 스위치 둘만** 본다. 마스터 스위치와의 합류,
+/// 그리고 "엄격 판정 + 즉시 close 는 성립 불가" 불변식은 [`gate_axes_from`] 이 소유한다.
+pub fn gate_pending_close_override_from(close_env: Option<&str>, axis_env: Option<&str>) -> bool {
+    gate_pending_close_from(close_env) || !gate_pending_axis_enabled_from(axis_env)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(BLOCK-3 · BLOCK-4 · 2026-08-24) 부트 관문 판정 축의 **단일 접기 지점**
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ## BLOCK-3 — 문서화된 탈출구가 작동하지 않았다
+//
+// U-13 은 "문제 생기면 `CYS_READINESS_V1=1` 로 되돌려라" 라고 보고했지만 **단독으로는
+// 무효**였다(리뷰어 4칸 진리표 전수): V1=1 로 ready 가 나도 부트 사전 가드와 `inject_text`
+// 가드가 다시 잡아 여전히 rc 78 · 미주입이었고, 종전 동작 복귀의 유일한 조합은
+// `CYS_READINESS_V1=1` **AND** `CYS_INJECT_GATE_GUARD=0` 이었다. 축마다 노브가 따로 있고
+// 조합해야 복귀하는 구조는 **사고 순간에 사람이 쓸 수 없다**. 그래서 상위
+// **마스터 스위치**([`ENV_BOOT_GATES`]`=0`)를 둔다 — 하나를 끄면 이 캠페인이 추가한 판정 축이
+// **전부 동시에** 종전 동작으로 복귀한다. 개별 노브는 축 단위 조정용으로 남는다.
+//
+// ## BLOCK-4 — 롤백 스위치 하나가 기저보다 파괴적인 상태를 만들었다
+//
+// `CYS_GATE_PENDING=0` **단독**이 "**엄격 판정 + 즉시 close**" 를 만들었다:
+// `gate_pending_close_override_from(None, Some("0")) == true`(합류 OR) 인데
+// `readiness::legacy_v1_from(None) == false`(엄격 유지) → 관문 화면이 `GateHeld` 로 잡혀
+// 영원히 ready 가 아니고 → readiness 타임아웃 → `boot_verdict_effective(_, true)` 가
+// **LaunchFailed 로 강등** → 호출부가 `surface.close`. 문서화된 스위치 하나로 전 pane 사망이다.
+//
+// **불변식**: `보류 장치가 꺼졌다(close 강등) ⇒ 이 캠페인이 추가한 판정 축은 전부 종전(느슨)`.
+// 엄격화와 보류는 한 몸이다 — 보류라는 안전한 귀결이 없는 상태에서 엄격해질 권리는 없다.
+// 이 불변식은 [`gate_axes_from`] **한 곳**에서만 성립하고, 진리표
+// `strict_judgment_and_immediate_close_is_unreachable_in_every_env_combination` 이
+// 관련 env 전 조합으로 전수 집행한다.
+
+/// ★마스터 롤백 스위치의 env 이름. `0` → 이 캠페인이 추가한 판정 축 **전부** 종전 복귀.
+///
+/// 개별 노브(`CYS_READINESS_V1`·`CYS_INJECT_GATE_GUARD`·`CYS_TRUST_RETURN_V1`·
+/// `CYS_GATE_PENDING_CLOSE`·`CYS_GATE_PENDING`)는 축 단위 조정용으로 남지만, **사고 순간에
+/// 사람이 쥐는 손잡이는 이것 하나**다.
+pub const ENV_BOOT_GATES: &str = "CYS_BOOT_GATES";
+
+/// 마스터 스위치 판정의 **순수 코어** — `"0"` 만 끈다.
+///
+/// 형제 게이트(`gate_pending_axis_enabled_from`)와 같은 엄격 비교다. 기본(미설정)이 신동작인
+/// 이유도 같다: 잊어서 위험해지는 방향이 아니라 **잊으면 새 안전장치가 켜져 있는** 방향.
+pub fn boot_gates_master_off_from(env_val: Option<&str>) -> bool {
+    env_val == Some("0")
+}
+
+/// 이 캠페인이 추가한 판정 축의 **최종 유효값**. 축이 넷이라 bool 넷을 따로 들고 다니면
+/// 어느 호출부가 하나를 빠뜨렸는지 알 수 없다 — 한 타입으로 묶어 **동시에** 결정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateAxes {
+    /// readiness 관문 AND 항이 꺼졌는가(= U-13 이전 판정).
+    pub readiness_legacy: bool,
+    /// 주입·제출 가드가 **관측 전용**으로 강등됐는가(= U-14 이전 전송).
+    pub inject_guard_off: bool,
+    /// 폴더신뢰 Return 정책이 종전(재전송 상한 · 하드코딩 needle)인가(= U-15 이전).
+    pub trust_legacy: bool,
+    /// 보류 판정을 즉시 close 로 강등하는가(= U-11 이전 귀결).
+    pub gate_pending_close: bool,
+}
+
+/// ★판정 축의 **순수 접기 함수**(진리표 대상). env 는 하나도 읽지 않는다.
+///
+/// 규약:
+///   ① 마스터(`CYS_BOOT_GATES=0`)는 네 축을 **전부** 종전으로 되돌린다(BLOCK-3).
+///   ② 보류 장치가 꺼지면(`gate_pending_close`) 판정 축도 **전부** 종전으로 되돌아간다
+///      — 엄격 판정 + 즉시 close 조합을 구조적으로 불가능하게 한다(BLOCK-4).
+///   ③ 개별 노브는 **자기 축만** 끈다(교차 오염 금지 — 신뢰 노브가 킬체인 가드를 열면 안 된다).
+pub fn gate_axes_from(
+    master_env: Option<&str>,
+    readiness_v1_env: Option<&str>,
+    guard_env: Option<&str>,
+    trust_v1_env: Option<&str>,
+    close_env: Option<&str>,
+    axis_env: Option<&str>,
+) -> GateAxes {
+    // 보류 장치가 꺼졌는가 = 마스터 ∨ 강등 스위치 ∨ 축 스위치.
+    let holding_off = boot_gates_master_off_from(master_env)
+        || gate_pending_close_override_from(close_env, axis_env);
+    GateAxes {
+        readiness_legacy: holding_off || readiness::legacy_v1_from(readiness_v1_env),
+        inject_guard_off: holding_off || inject_guard::guard_off_from(guard_env),
+        trust_legacy: holding_off || inject_guard::trust_v1_from(trust_v1_env),
+        gate_pending_close: holding_off,
+    }
+}
+
+/// 위의 **단일 진입점**(부작용 있음 — env 6회 판독). 규약은 순수 코어 [`gate_axes_from`].
+pub fn gate_axes() -> GateAxes {
+    gate_axes_from(
+        std::env::var(ENV_BOOT_GATES).ok().as_deref(),
+        std::env::var(readiness::ENV_V1).ok().as_deref(),
+        std::env::var(inject_guard::ENV_GUARD_OFF).ok().as_deref(),
+        std::env::var(inject_guard::ENV_TRUST_V1).ok().as_deref(),
+        std::env::var(ENV_GATE_PENDING_CLOSE).ok().as_deref(),
+        std::env::var(ENV_GATE_PENDING).ok().as_deref(),
+    )
+}
+
+/// "이 캠페인이 추가한 판정 축을 **전부** 종전으로 되돌려야 하는가" — 마스터·보류 축의 합류.
+///
+/// 각 축 모듈(`readiness`·`inject_guard`)이 자기 env 를 1지점에서 읽되 이 합류값과 OR 하도록
+/// 나눠 둔 이유: 롤백 스위치의 **축별 1지점 규약**(검체가 판독 지점 수를 센다)을 지키면서도
+/// 불변식은 이 파일 하나가 소유하기 위해서다.
+pub fn gate_axes_forced_legacy() -> bool {
+    boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref())
+        || gate_pending_close_override_from(
+            std::env::var(ENV_GATE_PENDING_CLOSE).ok().as_deref(),
+            std::env::var(ENV_GATE_PENDING).ok().as_deref(),
+        )
+}
+
+/// 롤백 판정의 **순수 코어** — `"1"` 만 켠다.
+///
+/// 형제 게이트(`gate_pending_axis_enabled_from` 의 `"0"` 만 끔)와 **같은 엄격 비교**다:
+/// `"true"`·`"yes"`·빈 값 같은 느슨한 truthy 를 받아주면 오타 하나로 안전장치가 조용히
+/// 뒤집힌다. 기본(미설정) = 신동작(보류) 이고, 되돌림은 명시 `1` 하나뿐이다.
+pub fn gate_pending_close_from(env_val: Option<&str>) -> bool {
+    env_val == Some("1")
+}
+
+/// `cys launch-agent` 의 **관문 보류 전용 종료코드**(sysexits `EX_CONFIG`).
+///
+/// 종전 계약은 성공 0 / 그 밖 전부 1 이었다. 보류는 그 1비트에 담기지 않는다 —
+/// **surface 는 만들어졌고 에이전트 프로세스는 살아 있으며 stdout 에 ref 도 나갔지만, 사람이
+/// 관문을 한 번 통과시키기 전까지는 쓸 수 없다.** 0 을 주면 소비부가 '노드를 세웠다'로 읽어
+/// 디렉티브·티켓을 태우고(그 주입이 관문 창의 Return 이 된다 = 실측 킬 스텝), 1 을 주면
+/// '기동이 깨졌다'로 읽어 **살아 있는 좌석을 회수·파괴**하려 든다. 둘 다 이 단위가 막으려는
+/// 사고다.
+///
+/// ★왜 2~11 이 아니라 78 인가: 게이트 exit 공간 2~11 은 `javis_bootstrap` 헤더 표가 소유한
+/// 만원 공간이다(H-DOC-4 가 유령·결손 양방향 대조). 형제 선례 `EXIT_BOOT_BUSY = 75`
+/// (EX_TEMPFAIL)와 같은 sysexits 공간을 쓴다. 78 = `EX_CONFIG`("설정이 완결되지 않았다")가
+/// 첫기동 관문의 성격에 정확히 대응한다.
+///
+/// ★소비 3자 파리티(H-EXIT-11 이 기계 대조): 이 상수(정본) ↔ `javis_bootstrap.py`
+/// `CYS_LAUNCH_EXIT_GATE_PENDING` ↔ GUI `src-tauri` 분기. 구 바이너리는 78 을 내지 않으므로
+/// (0/1 만) 이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
+pub const EXIT_GATE_PENDING: i32 = 78;
 
 /// 동봉 runtime PATH 선두 주입(RC-5 · 공용 — cysd PTY 자식·GUI 직스폰이 공유, 중복 구현 금지).
 /// `exe_dir`(바이너리 폴더) + Windows 자기완결 설치의 `<install>\runtime\{python, git\cmd, git\usr\bin}`
@@ -1531,6 +1881,292 @@ pub mod mousereport {
 
 #[cfg(test)]
 mod tests {
+
+    // ── ★(U-10) 좌석 제4 등급 `gate_pending` 축: 롤백 킬스위치 + wire 술어 순수 코어 ──
+    //   env 를 만지는 래퍼가 아니라 **순수 코어**를 잰다(cargo test 는 스레드 병렬이라
+    //   env 변조 테스트는 형제 테스트를 오염시킨다 — d5 판독기 핀과 같은 분리 이유).
+    #[test]
+    fn gate_pending_kill_switch_only_zero_disables() {
+        // 기본(미설정) = 축 노출. 이 단위엔 생산자가 없어 기본값이 곧 종전 동작이다.
+        assert!(super::gate_pending_axis_enabled_from(None), "미설정에서 축이 꺼졌다");
+        assert!(!super::gate_pending_axis_enabled_from(Some("0")), "\"0\" 이 축을 끄지 못한다(롤백 불능)");
+        // 느슨한 falsy 로는 꺼지지 않는다 — 오타 한 글자로 안전장치가 조용히 꺼지는 사고 방지.
+        for loose in ["", "false", "off", "no", "1", "00", " 0"] {
+            assert!(
+                super::gate_pending_axis_enabled_from(Some(loose)),
+                "느슨한 값 {loose:?} 가 축을 껐다(엄격 비교 회귀)"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_pending_wire_predicate_folds_unknown_shapes_to_no_signal() {
+        use serde_json::json;
+        let obj = json!({"gate": "disclaimer", "since": 1.0});
+        assert!(super::gate_pending_from_wire_with(true, &obj), "object 가 보류로 읽히지 않는다");
+        // ★null·키 부재 = '이 축에 대해 말할 것이 없음'(구 데몬). 부정이 아니다 — 종전 판정으로 흐른다.
+        for v in [json!(null), json!(true), json!(false), json!(0), json!("gated"), json!([])] {
+            assert!(
+                !super::gate_pending_from_wire_with(true, &v),
+                "비 object 값 {v} 이 보류로 접혔다(판정불가→미충족 = 부트 라이브락 경로)"
+            );
+        }
+        // 킬스위치 off 면 값과 무관하게 무신호(축 통째 생략) — 단일 지점 롤백의 계약.
+        assert!(!super::gate_pending_from_wire_with(false, &obj),
+                "킬스위치 off 인데 축이 살아 있다(롤백 1지점 계약 붕괴)");
+    }
+
+    #[test]
+    fn gate_pending_wire_key_is_the_single_name() {
+        // 데몬 2메서드·topology·python 미러가 공유하는 키 이름. 바뀌면 축이 조용히 사라진다.
+        assert_eq!(super::GATE_PENDING_KEY, "gate_pending");
+        assert_eq!(super::ENV_GATE_PENDING, "CYS_GATE_PENDING");
+    }
+
+    // ── ★(U-11) 보류 귀결: 만료 규약 · 롤백 킬스위치 · 종료코드 ──
+    #[test]
+    fn gate_pending_ttl_expires_only_past_the_bound_and_folds_unknown_time_to_fresh() {
+        let ttl = super::GATE_PENDING_TTL_SECS;
+        assert!(super::gate_pending_fresh(1000.0, 1000.0, ttl), "갓 찍은 표식이 만료로 읽힌다");
+        assert!(super::gate_pending_fresh(1000.0, 1000.0 + ttl, ttl), "경계값이 만료로 접혔다");
+        assert!(!super::gate_pending_fresh(1000.0, 1000.0 + ttl + 1.0, ttl),
+                "TTL 초과 표식이 살아남는다 — 부트 라이브락 상한 붕괴");
+        // 시계 되돌림·스큐·NaN = 판정 불가 → **유효**(관측 유지). 만료로 접으면 보류가 조용히
+        // already_alive 로 되돌아간다 — 이 단위가 없애려는 바로 그 상태다.
+        assert!(super::gate_pending_fresh(2000.0, 1000.0, ttl), "미래 since 가 만료로 접혔다");
+        assert!(super::gate_pending_fresh(f64::NAN, 1000.0, ttl), "NaN since 가 만료로 접혔다");
+        assert!(super::gate_pending_fresh(1000.0, f64::NAN, ttl), "NaN now 가 만료로 접혔다");
+    }
+
+    #[test]
+    fn gate_pending_close_override_folds_both_switches_so_rollback_is_never_half() {
+        // 기본(둘 다 미설정) = 신동작(보류).
+        assert!(!super::gate_pending_close_override_from(None, None),
+                "기본값이 종전 close 다(신동작 소실)");
+        // 어느 하나만 눌러도 기능 **전체**가 꺼진다 — 반쪽 롤백(pane 은 남는데 좌석은
+        // already_alive)이 가장 위험한 상태다.
+        assert!(super::gate_pending_close_override_from(Some("1"), None),
+                "보류 롤백 스위치가 듣지 않는다");
+        assert!(super::gate_pending_close_override_from(None, Some("0")),
+                "축 스위치를 껐는데 CLI 가 계속 보류한다 — 관측 없는 보류(허위 READY)");
+        assert!(super::gate_pending_close_override_from(Some("1"), Some("0")),
+                "두 스위치 동시 사용이 서로를 상쇄했다");
+    }
+
+    #[test]
+    fn gate_pending_close_switch_only_literal_one_reverts() {
+        assert!(!super::gate_pending_close_from(None), "미설정이 종전 close 로 접혔다(신동작 소실)");
+        assert!(super::gate_pending_close_from(Some("1")), "\"1\" 이 롤백을 켜지 못한다");
+        for loose in ["true", "yes", "on", "", "0", "01", " 1"] {
+            assert!(!super::gate_pending_close_from(Some(loose)),
+                    "느슨한 값 {loose:?} 이 롤백을 켰다(오타로 안전장치가 뒤집힘)");
+        }
+    }
+
+    // ── ★(BLOCK-3 · BLOCK-4 · 2026-08-24) 마스터 롤백 스위치 · '엄격+즉시close' 불변식 ──
+
+    /// ★BLOCK-4 전수 진리표 — 관련 env **전 조합**(5값 × 6축 = 15,625)에서
+    /// "엄격 판정 + 즉시 close" 가 **성립하지 않음**을 단언한다.
+    ///
+    /// 이 조합이 성립하면 관문 화면이 영원히 ready 가 아니고 → readiness 타임아웃 →
+    /// `LaunchFailed` 강등 → 호출부 `surface.close` 로 **전 pane 이 죽는다**. 문서화된 롤백
+    /// 스위치가 기저보다 파괴적인 상태를 만드는 것이 재난④의 정체다.
+    #[test]
+    fn strict_judgment_and_immediate_close_is_unreachable_in_every_env_combination() {
+        const VALS: [Option<&str>; 5] = [None, Some(""), Some("0"), Some("1"), Some("true")];
+        let (mut close_seen, mut master_seen) = (0usize, 0usize);
+        for m in VALS {
+            for r in VALS {
+                for g in VALS {
+                    for t in VALS {
+                        for c in VALS {
+                            for a in VALS {
+                                let ax = super::gate_axes_from(m, r, g, t, c, a);
+                                if ax.gate_pending_close {
+                                    close_seen += 1;
+                                    assert!(
+                                        ax.readiness_legacy
+                                            && ax.inject_guard_off
+                                            && ax.trust_legacy,
+                                        "★재난④ 조합: 보류가 close 로 강등됐는데 판정 축이 \
+                                         엄격하게 남았다 — master={m:?} readiness={r:?} \
+                                         guard={g:?} trust={t:?} close={c:?} axis={a:?} → {ax:?}"
+                                    );
+                                }
+                                if super::boot_gates_master_off_from(m) {
+                                    master_seen += 1;
+                                    assert!(
+                                        ax.readiness_legacy
+                                            && ax.inject_guard_off
+                                            && ax.trust_legacy
+                                            && ax.gate_pending_close,
+                                        "마스터 스위치가 전 축을 되돌리지 못했다 → {ax:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 진리표가 **공허하지 않다**(해당 조합이 실제로 존재한다)는 것까지 확인한다.
+        assert!(close_seen > 0 && master_seen > 0,
+                "진리표가 대상 조합을 하나도 밟지 않았다(close={close_seen} master={master_seen})");
+    }
+
+    /// ★계측 타당성(in-band) — **수리 전 조립**에서는 그 조합이 실제로 성립했다.
+    #[test]
+    fn pre_fix_composition_reproduced_strict_judgment_with_immediate_close() {
+        // 구 조립: close 강등은 두 축 스위치의 OR 였고(`CYS_GATE_PENDING=0` 단독으로 참),
+        // readiness 는 **자기 노브만** 봤다(미설정 = 엄격).
+        let close = super::gate_pending_close_override_from(None, Some("0"));
+        let strict = !crate::readiness::legacy_v1_from(None);
+        assert!(
+            close && strict,
+            "계측 무효: 구 조립에서 '엄격 + 즉시 close' 가 성립하지 않는다면 BLOCK-4 서사가 틀린 것"
+        );
+        // 지금 조립은 같은 입력에서 판정도 함께 종전으로 푼다.
+        let ax = super::gate_axes_from(None, None, None, None, None, Some("0"));
+        assert!(ax.gate_pending_close && ax.readiness_legacy && ax.inject_guard_off,
+                "축 스위치 단독이 여전히 엄격 판정을 남긴다 → {ax:?}");
+    }
+
+    /// ★BLOCK-3 — 개별 노브는 **자기 축만** 끄고(리뷰어 4칸 진리표의 사실), 종전 동작 전체
+    /// 복귀는 **마스터 스위치 하나**로 된다.
+    #[test]
+    fn master_switch_alone_restores_the_previous_behavior_on_every_axis() {
+        // ① `CYS_READINESS_V1=1` 단독 — ready 는 나지만 주입 가드가 그대로다(= 여전히 rc 78).
+        let only_v1 = super::gate_axes_from(None, Some("1"), None, None, None, None);
+        assert!(only_v1.readiness_legacy);
+        assert!(
+            !only_v1.inject_guard_off,
+            "V1 단독이 주입 가드까지 껐다면 리뷰어 4칸 진리표(종전 복귀 조합은 둘)가 틀린 것 — \
+             이 대조군이 마스터 스위치의 존재 이유다"
+        );
+        // ② `CYS_INJECT_GATE_GUARD=0` 단독 — 가드만 열리고 판정은 엄격(관문 화면은 보류).
+        let only_guard = super::gate_axes_from(None, None, Some("0"), None, None, None);
+        assert!(only_guard.inject_guard_off && !only_guard.readiness_legacy);
+        // ③ 리뷰어가 찾은 '종전 복귀의 유일한 조합' — 사람이 둘을 동시에 기억해야 했다.
+        let both = super::gate_axes_from(None, Some("1"), Some("0"), None, None, None);
+        assert!(both.readiness_legacy && both.inject_guard_off);
+        assert!(!both.gate_pending_close, "노브 둘이 보류 귀결까지 바꾸면 축 경계가 무너진다");
+        // ④ ★마스터 하나 = 네 축 전부 종전.
+        let master = super::gate_axes_from(Some("0"), None, None, None, None, None);
+        assert_eq!(
+            master,
+            super::GateAxes {
+                readiness_legacy: true,
+                inject_guard_off: true,
+                trust_legacy: true,
+                gate_pending_close: true,
+            },
+            "마스터 스위치가 '하나를 끄면 전부 복귀' 계약을 지키지 못한다"
+        );
+        // ⑤ 엄격 비교 — 오타로 안전장치가 조용히 뒤집히지 않는다(형제 게이트와 같은 규율).
+        for loose in [None, Some(""), Some("off"), Some("false"), Some("no"), Some(" 0"), Some("1")] {
+            assert!(!super::boot_gates_master_off_from(loose),
+                    "마스터 스위치가 느슨한 값 {loose:?} 을 받아들였다");
+        }
+        assert!(super::boot_gates_master_off_from(Some("0")));
+        assert_eq!(super::ENV_BOOT_GATES, "CYS_BOOT_GATES");
+    }
+
+    /// ★소스 핀 — 축 노브 셋이 **전부** 상위 접기값을 OR 한다. 하나라도 빠지면 마스터
+    /// 스위치가 거짓말이 되고, 그 축만 엄격하게 남아 BLOCK-4 경로가 되살아난다.
+    #[test]
+    fn every_axis_knob_folds_in_the_master_switch_source_pin() {
+        const FOLD: &str = "|| crate::gate_axes_forced_legacy()";
+        let r = include_str!("readiness.rs");
+        let g = include_str!("inject_guard.rs");
+        assert_eq!(r.matches(FOLD).count(), 1, "readiness 축이 상위 접기값을 소비하지 않는다");
+        assert_eq!(
+            g.matches(FOLD).count(),
+            2,
+            "inject_guard 의 두 축(가드·신뢰) 중 하나가 상위 접기값을 소비하지 않는다"
+        );
+        // 그리고 축별 env 판독은 여전히 1지점이다(형제 검체가 세는 계약을 깨지 않았다).
+        assert_eq!(r.matches("std::env::var(ENV_V1)").count(), 1);
+        assert_eq!(g.matches("std::env::var(ENV_GUARD_OFF)").count(), 1);
+        assert_eq!(g.matches("std::env::var(ENV_TRUST_V1)").count(), 1);
+    }
+
+    /// ★(BLOCK-3 잔여분 · 2026-08-24) **마스터 스위치가 데몬까지 닿는다.**
+    ///
+    /// 데몬의 유일한 직렬화 지점(`cysd/state.rs::gate_pending_wire`)은 술어 하나
+    /// (`gate_pending_axis_enabled`)를 본다. 종전엔 그 술어가 `CYS_GATE_PENDING` **만** 읽어,
+    /// 마스터(`CYS_BOOT_GATES=0`)를 눌러도 이미 실린 표식이 **TTL 30분까지 계속 직렬화**됐다 —
+    /// CLI 는 종전 판정으로 돌아갔는데 데몬은 여전히 좌석을 보류로 내보내는 **반쪽 롤백**이다.
+    #[test]
+    fn master_switch_reaches_the_daemon_serialization_axis() {
+        fn on(m: Option<&str>, c: Option<&str>, a: Option<&str>) -> bool {
+            super::gate_pending_axis_effective_from(m, c, a)
+        }
+        // ① 기본(전 스위치 미설정) = 축 노출(신동작). 여기가 뒤집히면 기능이 통째로 사라진다.
+        assert!(on(None, None, None), "기본에서 축이 꺼졌다");
+        // ② 세 스위치 **각각 단독**으로 축을 끈다 — 어느 손잡이를 눌러도 기능 전체가 꺼진다.
+        assert!(
+            !on(Some("0"), None, None),
+            "★마스터 스위치가 데몬 직렬화 축에 닿지 않는다 — 눌러도 표식이 TTL 까지 계속 나간다"
+        );
+        assert!(!on(None, Some("1"), None), "강등 스위치가 축을 끄지 못한다(반쪽 롤백)");
+        assert!(!on(None, None, Some("0")), "축 스위치가 축을 끄지 못한다");
+        // ③ 엄격 비교 — 오타 하나로 안전장치가 조용히 뒤집히지 않는다(형제 게이트와 같은 규율).
+        for loose in [Some(""), Some("false"), Some("off"), Some("no"), Some(" 0"), Some("1")] {
+            assert!(on(loose, None, None), "마스터가 느슨한 값 {loose:?} 을 받았다");
+        }
+        for loose in [Some(""), Some("true"), Some("yes"), Some("on"), Some(" 1")] {
+            assert!(on(None, loose, None), "강등 스위치가 느슨한 값 {loose:?} 을 받았다");
+            assert!(on(None, None, loose), "축 스위치가 느슨한 값 {loose:?} 을 받았다");
+        }
+        // ④ **불변식 단일 소유** — 축 노출은 언제나 보류 귀결의 부정이다(전 조합 대조).
+        //   갈리는 순간 둘 중 하나다: 관측 없는 보류(허위 READY) 또는 귀결 없는 관측(영구 미충족).
+        const VALS: [Option<&str>; 5] = [None, Some(""), Some("0"), Some("1"), Some("true")];
+        for m in VALS {
+            for c in VALS {
+                for a in VALS {
+                    let ax = super::gate_axes_from(m, None, None, None, c, a);
+                    assert_eq!(
+                        on(m, c, a),
+                        !ax.gate_pending_close,
+                        "축 노출과 보류 귀결이 갈렸다: master={m:?} close={c:?} axis={a:?}"
+                    );
+                }
+            }
+        }
+        // ⑤ 소스 핀 — 데몬 직렬화 지점이 자기 판정을 복제하지 않고 이 술어를 경유한다.
+        let st = include_str!("bin/cysd/state.rs");
+        assert!(
+            st.contains("if !cys::gate_pending_axis_enabled() {"),
+            "데몬 직렬화 지점이 축 술어를 경유하지 않는다 — 롤백이 다시 두 갈래가 된다"
+        );
+        // ⑥ 그리고 래퍼는 세 env 를 **전부** 읽는다 — 하나라도 빠지면 그 손잡이가 데몬에
+        //   닿지 않는다(그것이 이 결함의 정체였다: 마스터를 눌러도 데몬은 못 들었다).
+        let lib = include_str!("lib.rs");
+        let head = &lib[lib
+            .find("pub fn gate_pending_axis_enabled() -> bool {")
+            .expect("축 술어 래퍼 소실")..];
+        let body = &head[..head.find("\n}\n").expect("래퍼 본문 경계 소실")];
+        for env in [
+            "std::env::var(ENV_BOOT_GATES)",
+            "std::env::var(ENV_GATE_PENDING_CLOSE)",
+            "std::env::var(ENV_GATE_PENDING)",
+        ] {
+            assert!(
+                body.contains(env),
+                "축 술어가 `{env}` 를 읽지 않는다 — 그 손잡이는 데몬에 닿지 않는다"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_pending_exit_code_stays_outside_the_gate_exit_space() {
+        // 2~11 은 javis_bootstrap 헤더 표가 소유한 만원 공간이다(H-DOC-4 유령·결손 대조).
+        assert_eq!(super::EXIT_GATE_PENDING, 78);
+        assert!(!(2..=11).contains(&super::EXIT_GATE_PENDING),
+                "게이트 exit 공간을 침범했다 — 헤더 표와 충돌");
+        assert_ne!(super::EXIT_GATE_PENDING, super::EXIT_BOOT_BUSY, "형제 sysexits 값과 충돌");
+        assert_eq!(super::ENV_GATE_PENDING_CLOSE, "CYS_GATE_PENDING_CLOSE");
+    }
     use super::*;
 
     #[test]
@@ -2498,26 +3134,89 @@ mod tests {
 mod spawn_policy_tests {
     use super::{ChildLifetime, SpawnPolicy, ENV_NO_AUTOSTART, NO_AUTOSTART_ON};
 
-    /// `#[cfg(test)]` 로 시작해 열 0 의 `}` 로 끝나는 블록(= 이 저장소의 테스트 모듈 관례)을
-    /// 통째로 걷어낸 **프로덕션 슬라이스**를 만든다. cys.rs 처럼 파일 중간에 인라인 테스트
-    /// 모듈이 끼어 있는 파일이 있어서 "첫 `#[cfg(test)]` 앞까지" 방식은 쓸 수 없다
-    /// (그 방식이면 cys.rs 의 프로덕션 12,000줄이 스캔에서 통째로 빠진다 — 핀이 무력화된다).
+    /// `#[cfg(test)]` 가 붙은 **항목만** 걷어낸 프로덕션 슬라이스. cys.rs 처럼 파일 중간에
+    /// 인라인 테스트 모듈이 끼어 있는 파일이 있어서 "첫 `#[cfg(test)]` 앞까지" 방식은 쓸 수
+    /// 없다(그 방식이면 cys.rs 의 프로덕션 12,000줄이 스캔에서 통째로 빠진다).
+    ///
+    /// ★[D 수리 · 2026-08-24] 종전 구현은 `#[cfg(test)]` 를 만나면 **열 0 의 `}`** 가 나올
+    /// 때까지 무조건 버렸다. 그 항목이 블록이 **아니면**(단일 줄 `static`/`const`/`use`)
+    /// 다음 col-0 `}` 는 한참 아래 다른 항목의 것이고, 그 사이 프로덕션이 **임의 분량 통째로**
+    /// 사라진 채 핀은 조용히 초록이 된다(계측기 무효화). 실측 절단량: cys.rs 18,113→12,955줄 ·
+    /// governance.rs 8,152→4,096줄. 지금은 **항목 단위로 분류**한다 —
+    /// 블록(`… {`)이면 col-0 `}` 까지, 비블록(`… ;`)이면 그 항목만, 분류 불가면 **hard fail**.
+    /// 조용한 소실은 구조적으로 불가능해졌고, 남은 실패는 전부 큰 소리로 난다.
     fn production_slice(src: &str) -> String {
-        let mut out = String::new();
-        let mut it = src.lines().peekable();
-        while let Some(line) = it.next() {
-            if line == "#[cfg(test)]" {
-                for l in it.by_ref() {
-                    if l == "}" {
-                        break;
-                    }
-                }
+        production_slice_checked(src).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// `production_slice` 의 판정부 — 실패를 `Err` 로 돌려준다(자기검증 테스트가 hard fail
+    /// 축을 **직접 겨눌 수 있게**. 패닉만 있으면 검체가 그 경로를 재현할 수 없다).
+    fn production_slice_checked(src: &str) -> Result<String, String> {
+        /// `#[cfg(test)]` 항목 머리를 몇 줄까지 따라갈 것인가(다중 줄 시그니처 대비).
+        const HEAD_SCAN_LIMIT: usize = 40;
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] != "#[cfg(test)]" {
+                out.push_str(lines[i]);
+                out.push('\n');
+                i += 1;
                 continue;
             }
-            out.push_str(line);
-            out.push('\n');
+            // `#[cfg(test)]` 와 항목 머리 사이의 속성·주석·빈 줄은 그 항목의 일부다.
+            let mut j = i + 1;
+            while j < lines.len() {
+                let t = lines[j].trim_start();
+                if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j >= lines.len() {
+                return Err("`#[cfg(test)]` 뒤에 항목이 없다(파일 절단 · 핀 무력화)".into());
+            }
+            // 항목 머리는 여러 줄일 수 있다(다중 줄 fn 시그니처). 먼저 만나는 종결이
+            // `{` 면 블록 항목, `;` 면 비블록 항목이다.
+            let mut h = j;
+            let limit = (j + HEAD_SCAN_LIMIT).min(lines.len());
+            while h < limit {
+                let t = lines[h].trim_end();
+                if t.ends_with('{') {
+                    // 블록 항목 — 이 저장소 관례상 열 0 의 `}` 가 닫는다.
+                    let mut k = h + 1;
+                    while k < lines.len() && lines[k] != "}" {
+                        k += 1;
+                    }
+                    if k >= lines.len() {
+                        return Err(format!(
+                            "`#[cfg(test)]` 블록(`{}`)을 닫는 열 0 의 `}}` 가 없다 — \
+                             파일 끝까지 삼켰다",
+                            lines[j].trim()
+                        ));
+                    }
+                    j = k + 1;
+                    break;
+                }
+                if t.ends_with(';') {
+                    // 블록이 **아닌** 단일 항목(static/const/use/type) — 그 항목만 버린다.
+                    j = h + 1;
+                    break;
+                }
+                h += 1;
+            }
+            if h >= limit {
+                return Err(format!(
+                    "분류 불가한 `#[cfg(test)]` 항목 머리(`{}`) — 블록(`{{`)도 단일 항목(`;`)도 \
+                     아니다. 종전처럼 열 0 의 `}}` 까지 통째로 버리면 그 사이 프로덕션이 \
+                     **조용히** 사라지므로, 분류 불가는 통과가 아니라 실패다.",
+                    lines[j].trim()
+                ));
+            }
+            i = j;
         }
-        out
+        Ok(out)
     }
 
     /// production_slice 자기 검증(계측 타당성 ①) — 이 도구가 실제로 테스트만 걷어내고
@@ -2530,6 +3229,22 @@ mod spawn_policy_tests {
         assert!(p.contains("keep_me"), "프로덕션이 삭제됐다: {p}");
         assert!(p.contains("keep2"), "테스트 모듈 뒤 프로덕션이 삭제됐다: {p}");
         assert!(!p.contains("drop_me"), "테스트 모듈이 남았다: {p}");
+        // ★[D 축] **블록이 아닌** `#[cfg(test)]` 항목(단일 줄 `static`/`const`/`use`).
+        //   종전 구현은 `#[cfg(test)]` 를 보면 무조건 열 0 의 `}` 까지 버렸다 — 그 항목이
+        //   블록이 아니면 다음 col-0 `}` 는 **저 아래 다른 항목**의 것이고, 그 사이 프로덕션이
+        //   임의 분량 통째로 사라진다(핀이 빈 슬라이스를 보고 조용히 초록 = 계측기 무효화).
+        //   실측 절단량: cys.rs 18,113→12,955줄 · governance.rs 8,152→4,096줄 규모.
+        let nonblock = "fn keep_me() {}\n#[cfg(test)]\nstatic DROP_ME: u32 = 1;\n\
+                        fn keep_after() {}\nmod z {\n    fn inner() {}\n}\nfn keep_last() {}\n";
+        let np = production_slice(nonblock);
+        assert!(!np.contains("DROP_ME"), "테스트 전용 단일 항목이 남았다: {np}");
+        assert!(
+            np.contains("keep_after"),
+            "블록이 아닌 `#[cfg(test)]` 항목 뒤의 프로덕션이 통째로 사라졌다 — \
+             이 절단은 무음이라 핀 전체가 헛돈다: {np}"
+        );
+        assert!(np.contains("fn inner"), "절단이 다음 블록까지 삼켰다: {np}");
+        assert!(np.contains("keep_last"), "절단이 파일 끝까지 번졌다: {np}");
         // 실물에도 걸어 둔다 — 이 파일들의 프로덕션 앵커가 사라지면 핀이 헛도는 것이다.
         let cys = production_slice(include_str!("bin/cys.rs"));
         assert!(
@@ -2546,6 +3261,40 @@ mod spawn_policy_tests {
         assert!(sc.contains("fn launch_via_cli"), "schedule.rs 프로덕션 앵커 소실");
     }
 
+    /// 스폰 규약 스캔 대상 = **CLI·데몬 프로덕션 전량**.
+    ///
+    /// ★(U-7 결손 · 2026-08-24) 종전엔 6파일 화이트리스트였다. 그래서 `state.rs` 의
+    /// **두 번째 정의처**(`HideConsole::hide_console` = `creation_flags` 직접 호출)와 그
+    /// 호출부 `usage.rs` 가 통째로 핀 **밖**에 있었고, U-7 이 주장한 "단일 정의처"는
+    /// 검체로는 거짓이었다. 목록을 좁게 유지하면 **다음 결손도 같은 방식으로 목록 밖에**
+    /// 생긴다 — 스캔 비용이 0 이므로 전량으로 잠근다(화이트리스트 관리 자체가 결함원이다).
+    const SPAWN_SCAN: &[(&str, &str)] = &[
+        ("src/bin/cys.rs", include_str!("bin/cys.rs")),
+        ("src/bin/cysd/accounts.rs", include_str!("bin/cysd/accounts.rs")),
+        ("src/bin/cysd/alerts.rs", include_str!("bin/cysd/alerts.rs")),
+        ("src/bin/cysd/analytics.rs", include_str!("bin/cysd/analytics.rs")),
+        ("src/bin/cysd/approval.rs", include_str!("bin/cysd/approval.rs")),
+        ("src/bin/cysd/approval_risk.rs", include_str!("bin/cysd/approval_risk.rs")),
+        ("src/bin/cysd/caps.rs", include_str!("bin/cysd/caps.rs")),
+        ("src/bin/cysd/channels.rs", include_str!("bin/cysd/channels.rs")),
+        ("src/bin/cysd/classifier.rs", include_str!("bin/cysd/classifier.rs")),
+        ("src/bin/cysd/cost.rs", include_str!("bin/cysd/cost.rs")),
+        ("src/bin/cysd/deadman.rs", include_str!("bin/cysd/deadman.rs")),
+        ("src/bin/cysd/delivery.rs", include_str!("bin/cysd/delivery.rs")),
+        ("src/bin/cysd/events.rs", include_str!("bin/cysd/events.rs")),
+        ("src/bin/cysd/governance.rs", include_str!("bin/cysd/governance.rs")),
+        ("src/bin/cysd/handlers.rs", include_str!("bin/cysd/handlers.rs")),
+        ("src/bin/cysd/hwmon.rs", include_str!("bin/cysd/hwmon.rs")),
+        ("src/bin/cysd/main.rs", include_str!("bin/cysd/main.rs")),
+        ("src/bin/cysd/recall.rs", include_str!("bin/cysd/recall.rs")),
+        ("src/bin/cysd/schedule.rs", include_str!("bin/cysd/schedule.rs")),
+        ("src/bin/cysd/severity.rs", include_str!("bin/cysd/severity.rs")),
+        ("src/bin/cysd/skillrun.rs", include_str!("bin/cysd/skillrun.rs")),
+        ("src/bin/cysd/state.rs", include_str!("bin/cysd/state.rs")),
+        ("src/bin/cysd/undo.rs", include_str!("bin/cysd/undo.rs")),
+        ("src/bin/cysd/usage.rs", include_str!("bin/cysd/usage.rs")),
+    ];
+
     /// ★핵심 핀: 프로덕션의 자식 분리는 **전부 `spawn_policy` 를 경유**한다.
     ///
     /// 우회 스폰(`pre_exec`/`creation_flags` 직접 호출)이 하나라도 생기면 적색이다.
@@ -2555,16 +3304,7 @@ mod spawn_policy_tests {
     /// 그 순간을 재현하기 어려우므로 **소스 층에서** 규약 이탈을 잡는다.
     #[test]
     fn no_bypass_child_separation_in_production() {
-        let files: [(&str, &str); 6] = [
-            ("src/bin/cys.rs", include_str!("bin/cys.rs")),
-            ("src/bin/cysd/channels.rs", include_str!("bin/cysd/channels.rs")),
-            ("src/bin/cysd/schedule.rs", include_str!("bin/cysd/schedule.rs")),
-            ("src/bin/cysd/main.rs", include_str!("bin/cysd/main.rs")),
-            // 데몬이 CLI·셸 자식을 낳는 나머지 두 파일 — 지금 0건이라 **비용 0 으로 잠근다**.
-            ("src/bin/cysd/governance.rs", include_str!("bin/cysd/governance.rs")),
-            ("src/bin/cysd/accounts.rs", include_str!("bin/cysd/accounts.rs")),
-        ];
-        for (name, src) in files {
+        for (name, src) in SPAWN_SCAN.iter().copied() {
             let prod = production_slice(src);
             // 문자열 조립으로 찾는다 — 이 테스트 소스 자체가 자기 검색어를 리터럴로
             // 담고 있어도 무해하지만(스캔 대상은 bin/*.rs 뿐), 의도를 분명히 한다.
@@ -2577,6 +3317,104 @@ mod spawn_policy_tests {
                      새 스폰 지점이면 ChildLifetime 등급을 먼저 정하고 헬퍼를 써라."
                 );
             }
+        }
+    }
+
+    /// 한 문장 안에서 등급 선언(`spawn_policy(`)과 콘솔 은폐 별칭(`hide_console(`)이
+    /// **함께** 쓰였는가 — 그 문장을 돌려준다(빈 벡터 = 병용 없음).
+    ///
+    /// 왜 문장 단위인가: `creation_flags` 는 누적이 아니라 **덮어쓰기**다. 한 빌더 체인에서
+    /// 뒤에 오는 호출이 앞의 flag word 를 통째로 지우므로,
+    /// `.spawn_policy(ChildLifetime::GroupScoped).hide_console()` 은
+    /// `CREATE_NEW_PROCESS_GROUP` 을 **조용히 지운다**(mac/Linux 무증상 · CI 전부 초록 ·
+    /// Windows 에서만 원장 pgid 회수가 무력화되고 부모 콘솔 Ctrl-C 로 자식이 동반 사망).
+    /// 두 호출이 별개 문장이면 이 위험이 없으므로 파일 단위가 아니라 문장 단위로 잰다.
+    ///
+    /// 문장 경계 = `;` `{` `}`. 중괄호까지 끊는 이유는 함수 경계를 넘어 두 호출이 한 조각에
+    /// 섞여 **오탐**하는 것을 막기 위해서다(오탐은 반경 밖 파일을 볼모로 잡는다).
+    /// 별칭의 **정의처**(`fn hide_console(`)는 호출이 아니므로 제외한다 — 정의는 등급
+    /// `Attached` 로의 위임 그 자체이고, 그것이 이 수리의 내용이다.
+    /// 알려진 판별력 한계(정직): 두 호출 사이에 중괄호 블록(클로저 등)이 끼면 놓친다.
+    fn statements_mixing_lifetime_and_hide_console(prod: &str) -> Vec<String> {
+        strip_line_comments(prod)
+            .split([';', '{', '}'])
+            .filter(|s| {
+                s.contains("spawn_policy(")
+                    && s.contains("hide_console(")
+                    && !s.contains("fn hide_console(")
+            })
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// ★계측기 자기검증(계측 타당성) — 두 탐지기가 **실제로 탐지하는지**를 합성 표본으로
+    /// 확인한다. 이 저장소의 현 트리에는 병용도 봉인 결손도 없어서(= 두 핀이 초록) 탐지기가
+    /// 통째로 고장 나 있어도 아무 데서도 드러나지 않는다. 그 침묵을 여기서 깬다.
+    #[test]
+    fn spawn_pin_detectors_actually_detect() {
+        // ① 병용 탐지: 같은 문장이면 잡고, 문장이 갈리면 안 잡는다.
+        let mixed = "    cmd.spawn_policy(cys::ChildLifetime::GroupScoped).hide_console();\n";
+        assert_eq!(
+            statements_mixing_lifetime_and_hide_console(mixed).len(),
+            1,
+            "병용을 못 잡는다 — 이 핀은 아무것도 지키지 않는다"
+        );
+        let apart = "    cmd.spawn_policy(cys::ChildLifetime::Attached);\n    other.hide_console();\n";
+        assert!(
+            statements_mixing_lifetime_and_hide_console(apart).is_empty(),
+            "별개 문장을 병용으로 오탐한다 — 오탐은 반경 밖 파일을 볼모로 잡는다"
+        );
+        // 주석 속 언급은 코드가 아니다(실제로 schedule.rs 가 그 형태다 — 오탐 시 적색이 된다).
+        let commented = "    cmd\n        // 종전 `hide_console()` 과 동일한 flag\n        \
+                         .spawn_policy(cys::ChildLifetime::Attached);\n";
+        assert!(
+            statements_mixing_lifetime_and_hide_console(commented).is_empty(),
+            "주석을 코드로 읽는다"
+        );
+        // ② 형제 CLI 스폰 탐지: 봉인이 없는 합성 스폰을 실제로 찾아낸다.
+        let unsealed = "let cli = crate::state::sibling_cli_path();\n\
+                        let _ = Command::new(cli).arg(\"node-recover\").output();\n";
+        let found = cli_spawn_sites("<합성>", unsealed);
+        assert_eq!(found.len(), 1, "형제 CLI 스폰을 못 찾는다 — 봉인 핀이 눈이 멀었다");
+        assert!(
+            !found[0].contains(".no_autostart()"),
+            "봉인 결손 표본에서 봉인을 봤다고 한다(탐지기 오작동)"
+        );
+        // 정의처는 스폰이 아니다 — 이 제외가 깨지면 state.rs 가 매번 오탐된다.
+        assert!(
+            cli_spawn_sites("<합성>", "pub fn sibling_cli_path() -> PathBuf {\n").is_empty(),
+            "정의처를 스폰으로 오탐한다"
+        );
+        // ③ production_slice hard fail 축 — 분류 불가는 '통과'가 아니라 '실패'다.
+        let unclassifiable = "fn keep() {}\n#[cfg(test)]\npub static X: u32 = compute(\n";
+        assert!(
+            production_slice_checked(unclassifiable).is_err(),
+            "분류 불가한 `#[cfg(test)]` 항목을 조용히 통과시킨다 — 무음 절단이 되살아난다"
+        );
+        assert!(
+            production_slice_checked("fn keep() {}\n#[cfg(test)]\nmod t {\n    fn d() {}\n")
+                .is_err(),
+            "닫히지 않은 테스트 블록이 파일 끝까지 삼켜도 통과한다"
+        );
+    }
+
+    /// ★등급을 선언한 자식에 콘솔 은폐 별칭을 **이어 붙이지 않는다**(병용 금지).
+    ///
+    /// `hide_console()` 은 이제 `ChildLifetime::Attached` 의 별칭이므로, 다른 등급 뒤에 오면
+    /// 그 등급의 flag word 를 통째로 덮어쓴다 — `GroupScoped` 의 `CREATE_NEW_PROCESS_GROUP` 이
+    /// 사라지는 것이 정확히 그 사고다. **현 트리에는 병용이 0 건이고**, 이 핀은 그 0 을 잠근다
+    /// (탐지기가 실제로 병용을 잡는다는 증명은 `spawn_pin_detectors_actually_detect` ①).
+    #[test]
+    fn lifetime_grade_and_hide_console_are_never_mixed() {
+        for (name, src) in SPAWN_SCAN.iter().copied() {
+            let prod = production_slice(src);
+            let mixed = statements_mixing_lifetime_and_hide_console(&prod);
+            assert!(
+                mixed.is_empty(),
+                "{name}: 등급 선언과 `hide_console()` 이 한 문장에 함께 있다 — \
+                 `creation_flags` 는 덮어쓰기라 뒤에 오는 쪽이 앞 등급의 flag word 를 \
+                 **조용히 지운다**(mac/Linux 무증상). 등급 하나로만 선언하라.\n{mixed:?}"
+            );
         }
     }
 
@@ -2629,19 +3467,85 @@ mod spawn_policy_tests {
         );
     }
 
+    /// 줄 주석(`//` 이후)을 지운 **코드만의 사본**. 구조를 재는 핀은 주석을 코드로 오인하면
+    /// 안 된다 — 실제로 `governance.rs` 의 스폰은 주석 안의 `.output(` 때문에 스폰식이
+    /// 엉뚱한 곳에서 잘렸다(주석 한 줄이 검체의 시야를 자른다).
+    /// ★needle **개수**를 세는 핀(`no_bypass_child_separation_in_production`)에는 쓰지 않는다:
+    /// 거기서는 주석 속 언급까지 세는 쪽이 안전측(과탐)이다.
+    fn strip_line_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            match line.find("//") {
+                Some(p) => out.push_str(&line[..p]),
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 프로덕션 슬라이스에서 **형제 CLI(`sibling_cli_path()`)를 program 으로 쓰는 스폰**을
+    /// 전부 찾아 그 스폰식 본문을 돌려준다. 정의처(`fn sibling_cli_path`)는 스폰이 아니므로 제외.
+    ///
+    /// 본문의 끝 = 첫 실행 종결자(`.output(` / `.spawn(` / `.status(`). 종결자를 못 찾으면
+    /// **패닉**한다 — 검체가 볼 수 없는 형태로 바뀐 것을 조용히 통과시키면 그 순간 눈이 먼다.
+    fn cli_spawn_sites(name: &str, prod: &str) -> Vec<String> {
+        const NEEDLE: &str = "sibling_cli_path()";
+        const TERMINATORS: [&str; 3] = [".output(", ".spawn(", ".status("];
+        let code = strip_line_comments(prod);
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = code[from..].find(NEEDLE) {
+            let at = from + rel;
+            from = at + NEEDLE.len();
+            // 정의처(`pub fn sibling_cli_path() -> PathBuf {`)는 호출이 아니다.
+            let line_start = code[..at].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            if code[line_start..at].contains("fn ") {
+                continue;
+            }
+            let end = TERMINATORS
+                .iter()
+                .filter_map(|t| code[at..].find(t).map(|p| at + p + t.len()))
+                .min()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}: sibling_cli_path() 스폰의 실행 종결자\
+                         (.output()/.spawn()/.status())를 못 찾았다 — 검체가 이 스폰을 볼 수 \
+                         없다(핀 무력화). 형태가 바뀌었으면 종결자 목록을 먼저 늘려라."
+                    )
+                });
+            out.push(code[at..end].to_string());
+        }
+        out
+    }
+
     /// 데몬이 낳는 CLI 자식은 **전부** autostart 를 봉인한다(재귀 기동 = 데몬 폭주 ①).
-    /// `launch_via_cli` 는 이 결손이 실재하던 지점이다(U-7 과제 ③).
+    ///
+    /// ★(P3-2 짝 · 2026-08-24) 종전 이 핀은 `schedule.rs::launch_via_cli` **함수 본문 한 곳만**
+    /// 스캔했다. 그래서 `governance.rs` 의 `node-recover` 스폰(형제 CLI 를 그대로 띄운다)에
+    /// `.no_autostart()` 가 빠진 것을 **보지 못했다** — "전부 봉인한다"는 주장이 검체로는
+    /// 한 지점짜리였다. 판정 대상을 "`sibling_cli_path()` 를 program 으로 쓰는 프로덕션 스폰
+    /// **전량**"으로 넓힌다(핀 이사 — 단언 수가 1 → 지점 수만큼으로 는다).
     #[test]
     fn daemon_spawned_cli_children_seal_autostart() {
-        let sc = production_slice(include_str!("bin/cysd/schedule.rs"));
-        let at = sc.find("async fn launch_via_cli").expect("launch_via_cli 소실");
-        let body = &sc[at..];
-        let end = body.find("\nfn aiterm_parse").unwrap_or(body.len());
-        let body = &body[..end];
+        let mut sites = 0usize;
+        for (name, src) in SPAWN_SCAN.iter().copied() {
+            let prod = production_slice(src);
+            for body in cli_spawn_sites(name, &prod) {
+                sites += 1;
+                assert!(
+                    body.contains(".no_autostart()"),
+                    "{name}: 형제 CLI 스폰에 CYS_NO_AUTOSTART 봉인이 없다 — 데몬이 낳은 cys 가 \
+                     소켓 실패(데몬 종료 중·소켓 교체 중)를 만나면 `spawn_detached_daemon` 으로 \
+                     **라이벌 데몬을 낳는다**(재귀 기동 · 폭주 ①).\n스폰식:\n{body}"
+                );
+            }
+        }
+        // 검체가 **아무것도 못 찾고** 초록이 되는 경로 차단(계측 타당성).
+        // 현재 실재 지점: schedule.rs::launch_via_cli · governance.rs::node-recover.
         assert!(
-            body.contains(".no_autostart()"),
-            "launch_via_cli 가 CYS_NO_AUTOSTART 를 걸지 않는다 — 데몬이 낳은 cys 가 \
-             소켓 실패 시 라이벌 데몬을 스폰한다(재귀 기동)"
+            sites >= 2,
+            "형제 CLI 스폰을 {sites}곳밖에 못 찾았다 — 탐지가 눈이 멀었다(needle·슬라이스 확인)"
         );
     }
 

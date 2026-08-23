@@ -4487,7 +4487,10 @@ class Preflight:
         ("resume_arg", "resume_arg 없음→session resume 미지원(restore는 fresh 기동)", True),
         ("approval_patterns", "approval_patterns 없음→승인 프롬프트 자동감지 없음", False),
     )
-    KNOWN_AGENTS_SCHEMA = (1, 2)
+    # ★U-12(2026-08-23): 3 = `first_run_gates` 봉투 추가분. 목록은 **누적**이다 — 구 스키마
+    #   기계(사용자가 수정해 둔 _schema=2 디스크본)를 미지 버전으로 오경보하지 않기 위해
+    #   1·2 를 남긴다. 판정 자체는 종전과 동일(알려진 값이면 무경고 · 미지면 WARN).
+    KNOWN_AGENTS_SCHEMA = (1, 2, 3)
 
     def c71_agents_schema(self):
         cid = "C71.agents-schema"

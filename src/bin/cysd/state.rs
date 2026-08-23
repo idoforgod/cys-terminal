@@ -507,6 +507,76 @@ pub struct Surface {
     /// org.status **양쪽 동일 키**(`alt_screen` — 동형성 핀 handlers.rs) + launch-agent 의
     /// mac claude fullscreen WARN(D5 env 방어층 우회 관측). additive bool — 구 소비자 무영향.
     pub alt_screen: AtomicBool,
+    /// ★(U-10) **좌석 제4 등급** `gate_pending` — 프로세스는 살아 있으나 **첫기동 관문**
+    /// (테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)에 갇혀 **입력을 받을 수
+    /// 없는** 좌석. `None` = 이 축에 대해 말할 것이 없음(= 종전 판정) · `Some(_)` = 보류.
+    ///
+    /// **왜 필요한가**: 관문에 갇힌 좌석도 `agent_alive == true` 다. 그래서 종전 등급 체계에서
+    /// 그 좌석은 `AlivePresumed` 가 되고 `cys boot` 이 **"이미 가동 중 — 건너뜀"**(already_alive)
+    /// 으로 접었다. readiness 실패를 close 대신 **보류**로 바꾸는 U-11 을 그 위에 올리면
+    /// 관문에 갇힌 팀 전체가 "정상 가동 중" 으로 집계된다 — 지금보다 나빠진다. 그 보류가
+    /// 착지할 **자리**가 이 필드다.
+    ///
+    /// **이 단위(U-10)에는 writer 가 없다** — 값은 항상 `None` 이고 생산은 U-11/U-13 이 한다.
+    /// 스키마 additive 라 구/신 데몬·CLI 혼재에서 거동이 오늘과 같다(미지 값은 종전 등급으로 접힘).
+    /// 소비 = `surface.list` · `org.status` **양쪽 동일 키**(동형성 핀 handlers.rs) +
+    /// `persist_topology` 관측 슬롯. 하이드레이션(restore 시 복원)은 **일부러 하지 않는다**:
+    /// stale 보류가 재기동을 넘겨 영속되면 좌석이 영원히 미충족으로 남는 A1 라이브락이 된다 —
+    /// 만료 규약과 함께 U-11 이 정해야 할 사안이다.
+    ///
+    /// ★파괴 경로 **무접촉**: `seat_death_confirmed` 3중 AND(seat=="empty" ∧
+    /// agent_alive==Some(false) ∧ 나이>readiness 예산)는 이 필드를 보지 않는다. 관문 보류 좌석은
+    /// 정의상 프로세스가 살아 있어 그 게이트를 통과할 수 없고(=파괴 대상이 될 수 없고),
+    /// 반대로 여기에 새 hold 항을 더하면 stale 보류가 reclaim 을 영구 마비시킨다.
+    pub gate_pending: Mutex<Option<GatePending>>,
+}
+
+/// ★(U-10) 관문 보류 좌석의 근거. `surface.list`·`org.status`·`topology.json` 에 **object**
+/// 로 직렬화되고, 전 소비자의 술어는 **"object 인가"** 하나다(필드 해석은 진단·표시 전용).
+///
+/// 필드를 늘리는 것은 additive 이지만, **술어를 필드 값에 의존시키지는 말 것** — 그러면
+/// python 미러·CLI·데몬 셋이 각자 해석하는 판정 이원화(A1·B3 클래스)가 재발한다.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GatePending {
+    /// 어느 관문인가(진단 라벨 — 예: `theme` `login` `oauth` `trust` `disclaimer` `whatsnew`
+    /// `unknown`). 값 집합은 U-12 의 관문 코퍼스가 정본이 된다.
+    pub gate: String,
+    /// 최초 관측 epoch(초). 보류 지속시간·재고지 주기의 근거(소비는 U-11).
+    pub since: f64,
+    /// 화면 꼬리 근거 발췌(사람이 읽는 진단 전용 — **판정에 쓰지 않는다**).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+impl Surface {
+    /// ★(U-10) `gate_pending` 축의 **유일한 직렬화 지점**. `surface.list`·`org.status`·
+    /// `persist_topology` 셋이 이 함수만 부른다 — 세 곳이 각자 `json!` 하면 그 순간
+    /// 키·형·킬스위치가 갈린다(이 저장소가 반복해서 맞은 사본 드리프트).
+    ///
+    /// 롤백 킬스위치(`CYS_GATE_PENDING=0`)가 **여기 한 곳에서** 축을 통째로 null 로 만든다.
+    /// ★(U-11) **만료(TTL)도 여기 한 곳에서 집행한다** — U-10 이 이 함수 doc 에 남긴 인계
+    /// 사항의 이행이다. 표식을 지우는 유일한 능동 경로는 "그 좌석에서 readiness 가 다시
+    /// 확정될 때"인데, 보류 좌석은 `run_boot` 이 **관측만 하고 건너뛰므로**(U-10) 그 기회가
+    /// 오지 않는다. 사람이 화면에서 관문을 통과시켜도 표식만 남으면 좌석은 영구 미충족이고
+    /// 그것이 곧 부트 라이브락(A1)이다. 만료가 그 라이브락의 **상한**이다.
+    ///
+    /// 만료를 **여기서** 거는 이유: 이 함수가 축의 유일한 직렬화 지점이므로, Rust·python·
+    /// topology 세 소비자가 판정을 각자 구현하지 않고도 **동시에** 같은 사실을 본다
+    /// (소비 측에 나이 계산을 넣으면 그 순간 3벌 사본이고, 한 벌만 고쳐지면 축이 갈린다).
+    /// 만료의 귀결은 "축이 없던 것처럼 = 정확히 오늘의 동작"이라 새 위험을 만들지 않는다.
+    pub fn gate_pending_wire(&self) -> serde_json::Value {
+        if !cys::gate_pending_axis_enabled() {
+            return serde_json::Value::Null;
+        }
+        let now = now_epoch();
+        self.gate_pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|g| cys::gate_pending_fresh(g.since, now, cys::GATE_PENDING_TTL_SECS))
+            .and_then(|g| serde_json::to_value(g).ok())
+            .unwrap_or(serde_json::Value::Null)
+    }
 }
 
 pub struct HealthRule {
@@ -1800,26 +1870,31 @@ fn write_operator_token(path: &std::path::Path, token: &str) -> std::io::Result<
 /// Windows: 데몬(cysd)이 스폰하는 콘솔 자식(CLI·셸·taskkill 등)이 콘솔 창을 띄우지 않게
 /// CREATE_NO_WINDOW 를 건다(Win11 기본터미널=Windows Terminal 일 때 매 스폰마다 검은 창이
 /// 순간 떠오르는 flash 차단). 타 OS 무동작. std·tokio Command 모두 지원.
+///
+/// ★(U-7 결손 수리 · 2026-08-24) **이 트레이트는 더 이상 flag 를 스스로 정하지 않는다.**
+/// 종전엔 `CREATE_NO_WINDOW`(0x0800_0000) flag 를 직접 얹어 `cys::ChildLifetime` 과 나란한
+/// **두 번째 정의처**였고, U-7 이 주장한 "단일 정의처"는 그래서 거짓이었다. 실패 시나리오는
+/// 조용하다: `creation_flags` 는 누적이 아니라 **덮어쓰기**라
+/// `.spawn_policy(ChildLifetime::GroupScoped).hide_console()` 로 쓰면 `CREATE_NEW_PROCESS_GROUP`
+/// 이 **소리 없이 사라져** 프로세스 원장의 pgid 회수 계약이 무력화되고 부모 콘솔의 Ctrl-C 로
+/// 자식이 동반 사망한다 — mac/Linux 는 무증상이라 CI 는 전부 초록이다.
+///
+/// 지금은 등급 `Attached`(= 분리 없음 + Windows 콘솔 창 은폐)의 **별칭**이다. flag word 는
+/// `cys::ChildLifetime::win_creation_flags` 한 곳이 정한다. 값·행동은 종전과 동일하고
+/// (`Attached` → `CREATE_NO_WINDOW` 단독 · unix 무동작), 바뀐 것은 정의처 수뿐이다.
+/// ★남은 위험은 **병용**이다(등급을 선언한 자식에 이 별칭을 이어 붙이는 것) — 그 조합은
+/// `spawn_policy_tests::lifetime_grade_and_hide_console_are_never_mixed` 가 기계로 막는다.
 pub trait HideConsole {
     fn hide_console(&mut self) -> &mut Self;
 }
 impl HideConsole for std::process::Command {
     fn hide_console(&mut self) -> &mut Self {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            self.creation_flags(0x0800_0000);
-        }
-        self
+        cys::SpawnPolicy::spawn_policy(self, cys::ChildLifetime::Attached)
     }
 }
 impl HideConsole for tokio::process::Command {
     fn hide_console(&mut self) -> &mut Self {
-        #[cfg(windows)]
-        {
-            self.creation_flags(0x0800_0000);
-        }
-        self
+        cys::SpawnPolicy::spawn_policy(self, cys::ChildLifetime::Attached)
     }
 }
 
@@ -2728,6 +2803,9 @@ impl Daemon {
             directive_verified: Mutex::new(None),
             // (W4 · D5) 신생 pane 은 primary screen 에서 출발 — 첫 청크 반영 시 reader 가 갱신.
             alt_screen: AtomicBool::new(false),
+            // ★(U-10) 관문 보류는 항상 None 으로 시작한다 — 생성 시점엔 관문 관측 자체가 없다.
+            //   restore 하이드레이션도 하지 않는다(필드 doc 의 A1 라이브락 사유).
+            gate_pending: Mutex::new(None),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.

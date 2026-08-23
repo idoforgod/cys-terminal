@@ -2023,6 +2023,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // ★(W4 · D5) alternate screen 관측 — org.status 와 **같은 키·같은 의미**
                         // (동형성 핀). launch-agent 가 mac claude fullscreen WARN 판정에 소비한다.
                         "alt_screen": s.alt_screen.load(Ordering::Relaxed),
+                        // ★(U-10) 좌석 제4 등급 — org.status 와 **같은 키·같은 의미**(동형성 핀).
+                        // null = '이 축에 대해 말할 것이 없음'(구 데몬·킬스위치 off·미보류)이고
+                        // "관문에 안 갇혔음" 이 아니다 — 소비자는 null 에서 이 항을 통째로 생략한다.
+                        // 이 단위에는 writer 가 없어 실제 값은 항상 null 이다(생산은 U-11/U-13).
+                        (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
                         // ★(W2 · B4) 단조 라인 커서 — launch-agent 가 기동 send **직전** 스냅샷을 떠
                         // readiness/실패/주입검증 매칭을 '커서 이후 신규 출현분'으로 한정한다(잔존 ❯
                         // 오탐 차단). org.status 가 이미 같은 키를 노출하며, 여기 추가는 순수 additive.
@@ -4376,6 +4381,99 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── ★(U-11) 좌석 제4 등급 `gate_pending` 의 **유일한 write path** ───
+        //
+        // U-10 이 필드·직렬화·소비 4자를 만들었고 **생산자는 없었다**. 여기가 그 생산자다.
+        // 유일한 정당 발신자는 `cys` CLI 의 readiness 판정(`boot_agent_on_surface`)이다 —
+        // "프로세스는 살아 있는데 준비 확정이 안 됐다" 는 사실을 **관측한 쪽**이 기록한다.
+        //
+        // ★이 RPC 는 **파괴를 열지 않는다**: 표식은 '충족 아님' 축만 움직이고 '살아있음' 축은
+        //   건드리지 않는다(H-SEAT-4AXIS 가 두 축의 분리를 박제). 그래서 최악의 오작동도
+        //   "READY 선언이 늦어진다" 이지 "좌석이 죽는다" 가 아니다.
+        // ★만료는 여기서 걸지 않는다 — 읽기 지점(`Surface::gate_pending_wire`) 하나가 TTL 을
+        //   집행한다. 쓰기·읽기 양쪽에 나이 계산을 두면 그 순간 사본 2벌이다.
+        "surface.gate_pending" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            // 자칭 금지(directive.verify 와 동형): pane 은 **자기 자신**을 보류로 선언할 수 없다.
+            // 자기 화면의 준비 여부를 자기가 판정하는 것은 산출자=평가자이고, 그 자칭 하나로
+            // 좌석이 조직 판정에서 빠질 수 있다. 남의 좌석을 관측해 기록하는 것은 허용한다 —
+            // launch-agent·node-recover·restore 는 모두 **타 pane** 을 띄우는 발신자다.
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if caller_sid == Some(sid) {
+                daemon.bus.publish(
+                    "surface.gate_pending_denied",
+                    "system",
+                    Some(sid),
+                    json!({"requested_surface": sid, "caller_pid": caller_pid}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "gate_denied",
+                    "surface.gate_pending denied: a pane may not declare itself gate-pending",
+                ));
+            }
+            let role = surface.role.lock().unwrap().clone();
+            if params.get("clear").and_then(|v| v.as_bool()) == Some(true) {
+                // 해제 = readiness 재확정. 표식이 없었으면 무동작(멱등).
+                let had = surface.gate_pending.lock().unwrap().take().is_some();
+                if had {
+                    daemon.bus.publish(
+                        "surface.gate_cleared",
+                        "status",
+                        Some(sid),
+                        json!({"role": role}),
+                    );
+                }
+                return Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "cleared": had}),
+                ));
+            }
+            let gate = param_str(&params, "gate").unwrap_or_else(|| "unknown".to_string());
+            let evidence = param_str(&params, "evidence");
+            let now = crate::state::now_epoch();
+            let first = {
+                let mut slot = surface.gate_pending.lock().unwrap();
+                // ★`since` 는 **최초 관측 시점**이다 — 재기록이 시계를 밀면 TTL 상한이 사라져
+                //   무기한 보류가 된다(부트 라이브락). 단 이미 만료된 표식은 되살리지 않고
+                //   새 관측으로 다시 시작한다(만료된 since 를 물려받으면 태어나자마자 invisible).
+                let since = slot
+                    .as_ref()
+                    .map(|g: &crate::state::GatePending| g.since)
+                    .filter(|s| cys::gate_pending_fresh(*s, now, cys::GATE_PENDING_TTL_SECS))
+                    .unwrap_or(now);
+                let first = slot.is_none();
+                *slot = Some(crate::state::GatePending {
+                    gate: gate.clone(),
+                    since,
+                    evidence: evidence.clone(),
+                });
+                first
+            };
+            // 최초 1회만 이벤트 — 재부트마다 같은 좌석으로 feed 를 채우면 그 자체가 소음이다.
+            if first {
+                daemon.bus.publish(
+                    "surface.gate_pending",
+                    "status",
+                    Some(sid),
+                    json!({"role": role, "gate": gate, "evidence": evidence}),
+                );
+            }
+            Reply::Single(ok_response(
+                &id,
+                json!({"surface_id": sid, "gate": gate, "first": first}),
+            ))
+        }
+
         // ─── T5 사용량 관측: 세션 트랜스크립트 경로 등록 (SessionStart hook의 결정론 매핑) ───
         "usage.register" => {
             let Some(sid) = resolve_surface_id(&params) else {
@@ -4686,6 +4784,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // ★(W4 · D5) alternate screen 관측 — surface.list 와 **같은 키·같은 의미**
                         // (동형성 핀). status --json(launch-agent·preflight·fleet digest)이 소비.
                         "alt_screen": s.alt_screen.load(Ordering::Relaxed),
+                        // ★(U-10) 좌석 제4 등급 — surface.list 와 **같은 키·같은 의미**(동형성 핀).
+                        // 팩 부트 체인(javis_boot_node.cys_status → `cys status --json`)이 소비하는
+                        // 정본 status 채널이라, 이 키가 여기 빠지면 python 미러가 축을 영영 못 본다.
+                        (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),
@@ -10841,6 +10943,7 @@ mod tests {
         // 메타 등록된 살아있는 surface 1개 + 메타 없는 surface 1개.
         let live = make_surface(&daemon, Some("worker-1"));
         let bare = make_surface(&daemon, Some("worker-2"));
+        let gate_since = crate::state::now_epoch();
         {
             let surfaces = daemon.surfaces.lock().unwrap();
             *surfaces[&live].agent_meta.lock().unwrap() =
@@ -10849,6 +10952,19 @@ mod tests {
             surfaces[&live].agent_exit_notified.store(false, Ordering::Relaxed);
             // ★(W4 · D5) alt_screen 동형성 재료 — live 는 alt(true), bare 는 primary(false).
             surfaces[&live].alt_screen.store(true, Ordering::Relaxed);
+            // ★(U-10) gate_pending 동형성 재료 — live 는 관문 보류(object), bare 는 무신호(null).
+            //   두 메서드가 같은 키·같은 값을 내는지 고정한다 — 한쪽만 노출되면 python 미러가
+            //   축을 못 본다.
+            //   ★(U-11) `since` 를 **고정 상수에서 현재 시각으로** 바꿨다. 생산자와 함께 만료
+            //   (TTL)가 착지했고, 2023년 상수는 태어날 때부터 만료라 이 검사가 동형성 대신
+            //   만료를 재게 된다. 판정 강도는 그대로이고 **재료만 유효 범위로 옮긴 것**이다 —
+            //   만료 자체는 아래 `gate_pending_wire_expires_at_the_single_serialization_point`
+            //   가 전담해서 잰다(핀을 지우지 않고 나눠 세웠다).
+            *surfaces[&live].gate_pending.lock().unwrap() = Some(crate::state::GatePending {
+                gate: "disclaimer".into(),
+                since: gate_since,
+                evidence: None,
+            });
         }
 
         for (method, key) in [("surface.list", "surfaces"), ("org.status", "surfaces")] {
@@ -10880,18 +10996,213 @@ mod tests {
                 "{method}: 메타 없는 surface인데 agent/agent_alive가 null이 아니다: {bare_e}"
             );
 
-            // ★(W4 · D5) alt_screen 동형성 — 두 메서드가 **같은 키·같은 값**(불리언)을 노출한다.
-            // 한쪽에만 있거나 값이 갈리면 launch-agent(WARN)·preflight(status --json) 소비가
-            // 판정 이원화된다 — 여기서 기계 고정.
-            assert_eq!(
-                surface_entry(&resp, key, live)["alt_screen"], json!(true),
-                "{method}: alt 진입 surface 의 alt_screen 이 true 가 아니다"
-            );
-            assert_eq!(
-                bare_e["alt_screen"], json!(false),
-                "{method}: primary surface 의 alt_screen 이 false 가 아니다: {bare_e}"
-            );
+            // ★관측 축 동형성 **표**(W4 · D5 alt_screen + U-10 gate_pending) — 두 메서드가
+            // **같은 키·같은 값**을 노출한다. 한쪽에만 있거나 값이 갈리면 소비가 판정 이원화된다
+            // (launch-agent WARN·preflight status --json·python node_liveness 미러).
+            // ★표로 일반화한 이유: 축이 늘 때마다 assert 쌍을 손으로 복제하면 한쪽을 빠뜨린다 —
+            //   축 추가 = 이 표에 한 행 추가로 끝나야 한다(U-10 규약).
+            for (axis_key, want_live, want_bare) in [
+                ("alt_screen", json!(true), json!(false)),
+                (
+                    cys::GATE_PENDING_KEY,
+                    json!({"gate": "disclaimer", "since": gate_since}),
+                    Value::Null,
+                ),
+            ] {
+                assert_eq!(
+                    surface_entry(&resp, key, live)[axis_key], want_live,
+                    "{method}: 관측 축 {axis_key} 의 live 값이 다르다(동형성 붕괴)"
+                );
+                assert_eq!(
+                    bare_e[axis_key], want_bare,
+                    "{method}: 관측 축 {axis_key} 의 대조군 값이 다르다(동형성 붕괴): {bare_e}"
+                );
+            }
         }
+    }
+
+    /// ★(U-11) 만료(TTL)는 **읽기 지점 하나**가 집행한다 — U-10 이 이 함수 doc 에 남긴 인계
+    /// 사항의 이행. 표식을 지우는 능동 경로는 "그 좌석에서 readiness 재확정" 뿐인데, 보류 좌석은
+    /// `cys boot` 이 관측만 하고 건너뛰므로 그 기회가 오지 않는다 — 만료가 없으면 사람이 관문을
+    /// 통과시켜도 좌석이 영구 미충족으로 남는 부트 라이브락(A1)이다.
+    ///
+    /// 만료를 **직렬화 지점**에 두는 이유: Rust·python·topology 세 소비자가 나이 계산을 각자
+    /// 구현하지 않고도 동시에 같은 사실을 본다. 만료의 귀결은 "축이 없던 것처럼 = 오늘의 동작"이라
+    /// 새 위험을 만들지 않는다.
+    #[test]
+    fn gate_pending_wire_expires_at_the_single_serialization_point() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("cso"));
+        let surfaces = daemon.surfaces.lock().unwrap();
+        let s = &surfaces[&sid];
+        let now = crate::state::now_epoch();
+
+        *s.gate_pending.lock().unwrap() = Some(crate::state::GatePending {
+            gate: "disclaimer".into(),
+            since: now,
+            evidence: Some("tail".into()),
+        });
+        assert!(s.gate_pending_wire().is_object(), "갓 찍은 표식이 보이지 않는다");
+
+        // TTL 을 넘긴 표식 = 무신호(null) → 전 소비자가 종전 판정으로 복귀(라이브락 상한).
+        s.gate_pending.lock().unwrap().as_mut().unwrap().since =
+            now - cys::GATE_PENDING_TTL_SECS - 1.0;
+        assert!(s.gate_pending_wire().is_null(),
+                "TTL 초과 표식이 살아남는다 — 좌석이 영구 미충족(부트 라이브락)");
+        // TTL 안쪽은 살아 있다(조기 소실 방지). ★정확한 경계(age == TTL)는 여기서 재지 않는다 —
+        // 이 함수는 벽시계(`now_epoch`)를 스스로 읽으므로 테스트가 잡은 `now` 와 마이크로초
+        // 단위로 어긋나 경계 판정이 시계 경쟁이 된다. 경계 규약 자체는 순수 코어
+        // `cys::gate_pending_fresh` 의 진리표(lib.rs)가 결정론으로 잰다. 여기서 재는 사실은
+        // "직렬화 지점이 TTL 을 **실제로 상의한다**" 하나다.
+        s.gate_pending.lock().unwrap().as_mut().unwrap().since =
+            now - cys::GATE_PENDING_TTL_SECS + 60.0;
+        assert!(s.gate_pending_wire().is_object(), "TTL 안쪽 표식이 조기 소실됐다");
+    }
+
+    /// ★(U-11) 표식의 **유일한 write path** 계약: 자칭 금지 · 기록 · 해제 · `since` 멱등.
+    #[test]
+    fn gate_pending_rpc_is_the_single_write_path_and_refuses_self_declaration() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("cso"));
+
+        let call = |params: serde_json::Value| -> serde_json::Value {
+            let req = Request { id: json!(1), method: "surface.gate_pending".into(), params };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            resp
+        };
+
+        // ① 기록 — first=true, 좌석 wire 가 object 가 된다.
+        let r = call(json!({"surface_id": sid, "gate": "unknown", "evidence": "tail"}));
+        assert_eq!(r["ok"], json!(true), "기록 실패: {r}");
+        assert_eq!(r["result"]["first"], json!(true), "최초 기록이 first 로 보고되지 않음");
+        let since_first = {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            let w = surfaces[&sid].gate_pending_wire();
+            assert!(w.is_object(), "기록 후에도 축이 무신호다: {w}");
+            w["since"].as_f64().unwrap()
+        };
+
+        // ② 재기록 — `since` 는 **최초 관측 시점**을 유지한다. 재기록이 시계를 밀면 TTL 상한이
+        //    사라져 무기한 보류(라이브락)가 된다.
+        let r2 = call(json!({"surface_id": sid, "gate": "unknown"}));
+        assert_eq!(r2["result"]["first"], json!(false), "재기록이 최초로 보고됨(이벤트 소음)");
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            assert_eq!(surfaces[&sid].gate_pending_wire()["since"].as_f64().unwrap(), since_first,
+                       "재기록이 나이를 리셋했다 — TTL 상한 소멸(무기한 보류)");
+        }
+
+        // ③ 해제 — readiness 재확정의 능동 경로.
+        let r3 = call(json!({"surface_id": sid, "clear": true}));
+        assert_eq!(r3["result"]["cleared"], json!(true), "해제가 보고되지 않음");
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            assert!(surfaces[&sid].gate_pending_wire().is_null(), "해제 후에도 표식이 남았다");
+        }
+        // 멱등: 없는 표식을 지워도 에러가 아니다(부트 경로가 매번 부르는 호출이다).
+        assert_eq!(call(json!({"surface_id": sid, "clear": true}))["result"]["cleared"], json!(false));
+
+        // ④ 자칭 금지 — 발신 pane 이 곧 대상이면 거부(산출자=평가자 차단).
+        let req = Request {
+            id: json!(1),
+            method: "surface.gate_pending".into(),
+            params: json!({"surface_id": sid, "gate": "unknown"}),
+        };
+        // caller_cache 에 synthetic pid→자기 sid 를 심어 프로세스 트리 워크 없이 발신자
+        // 신원이 '그 pane 자신'으로 해석되게 한다(커널 경로 대역 — 형제 ACL 테스트와 같은 관례).
+        let self_pid = 999_411_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(self_pid, (Some(sid), crate::state::now_epoch(), None));
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(self_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(false), "자기 자신을 보류로 선언하는 것이 통과됐다: {resp}");
+        assert!(resp["error"].to_string().contains("gate_denied"),
+                "자칭 거부가 전용 코드로 나오지 않는다: {resp}");
+        // 그래도 **남의 좌석** 관측은 허용된다 — launch-agent·node-recover·restore 는 전부
+        // 타 pane 을 띄우는 발신자다. 이 문이 닫히면 생산자 자체가 사라진다.
+        let other = make_surface(&daemon, Some("worker-9"));
+        let req2 = Request {
+            id: json!(1),
+            method: "surface.gate_pending".into(),
+            params: json!({"surface_id": other, "gate": "unknown"}),
+        };
+        let Reply::Single(resp2) = dispatch(&daemon, req2, Some(self_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp2["ok"], json!(true), "타 좌석 관측 기록이 막혔다(생산자 소멸): {resp2}");
+    }
+
+    /// ★(U-11) **치명위험 ③(자가치유 전멸)·①(폭주) 실증** — 보류 좌석이 phoenix 부활 대상이
+    /// 되는가.
+    ///
+    /// `javis_phoenix.run_restore._alive(role)` 은 **라이브 surface 중 `seat == "empty"` 인 것만**
+    /// 비생존으로 읽는다(그 술어는 H-SEAT-4AXIS 가 소스 핀으로 동결). 따라서 부활 대상 여부는
+    /// **좌석 사실 하나**로 결정된다 — 이 테스트는 그 입력을 실측한다.
+    ///
+    /// 두 방향을 다 잰다:
+    ///   ⓐ **미부활(정답)**: 보류 좌석은 role 을 쥔 채 `occupied`·`exited=false` 로 남는다 →
+    ///      `_alive` = true → 부활 target 제외. 부활시키면 이미 claim 된 role 에 중복 좌석
+    ///      (`claim_denied`·litter)이 생기고, 새 에이전트가 **같은 관문에 재진입**해 무한 스폰
+    ///      루프(치명위험 ① 폭주)가 된다.
+    ///   ⓑ **폭주(오답 대조군)**: 만약 보류가 role 을 해제했다면 그 역할은 라이브 목록에서
+    ///      사라져 `_alive` = false → 부활 target 승격 → 새 pane → 같은 관문 → 다시 해제 …
+    ///      그래서 이 단위는 **role 을 해제하지 않는다**(설계서 §6①ⓒ 의 '즉시 해제' 권고와
+    ///      다른 선택이고, 그 근거가 이 대조군이다).
+    #[test]
+    fn gate_pending_seat_stays_a_live_role_seat_so_phoenix_never_resurrects_it() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("cso"));
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            // 관문 좌석의 실제 모습: 프로세스 생존 + 좌석 점유 + 보류 표식.
+            surfaces[&sid].agent_seen.store(true, Ordering::Relaxed);
+            surfaces[&sid].agent_exit_notified.store(false, Ordering::Relaxed);
+            *surfaces[&sid].agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            surfaces[&sid]
+                .seat_cache
+                .store(crate::governance::SeatState::Occupied as u8, Ordering::Relaxed);
+            *surfaces[&sid].gate_pending.lock().unwrap() = Some(crate::state::GatePending {
+                gate: "unknown".into(),
+                since: crate::state::now_epoch(),
+                evidence: None,
+            });
+        }
+        let req = Request { id: json!(1), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        let row = surface_entry(&resp, "surfaces", sid);
+
+        // ⓐ phoenix 가 읽는 세 재료 — 역할 보유 · 좌석 점유 · 미종료.
+        assert_eq!(row["role"], json!("cso"),
+                   "보류가 role 을 해제했다 — phoenix 가 그 역할을 결손으로 읽어 부활시키고, 새 \
+                    에이전트가 같은 관문에 재진입한다(무한 스폰 = 치명위험 ① 폭주)");
+        assert_ne!(row["seat"], json!("empty"),
+                   "보류 좌석이 빈 좌석으로 보고된다 — phoenix `_alive`=false → 부활 target 승격");
+        assert_eq!(row["exited"], json!(false), "살아 있는 pane 이 종료로 보고된다");
+        assert!(row[cys::GATE_PENDING_KEY].is_object(),
+                "보류 표식이 관측되지 않는다 — 좌석이 'already_alive' 로 접힌다: {row}");
+
+        // ⓑ 대조군: 좌석이 실제로 비면(=에이전트가 떠난 자리) phoenix 는 그때 비로소 부활시킨다.
+        //    보류 축이 그 정상 판정을 가리지 않는다는 것까지 확인한다(두 축의 분리).
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            surfaces[&sid]
+                .seat_cache
+                .store(crate::governance::SeatState::Empty as u8, Ordering::Relaxed);
+        }
+        let req2 = Request { id: json!(2), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(resp2) = dispatch(&daemon, req2, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(surface_entry(&resp2, "surfaces", sid)["seat"], json!("empty"),
+                   "빈 좌석 사실이 보류 표식에 가려졌다 — 진짜 결손이 부활되지 않는다(자가치유 마비)");
     }
 
     /// 발견(AB-BA 데드락 — 락 순서 역전): surface.create의 master/cso 특권역할 게이트가
