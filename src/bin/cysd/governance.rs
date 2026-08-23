@@ -319,7 +319,9 @@ fn check_agent_death(
                 *s.pending_agent_obs.lock().unwrap() = None;
             } else {
                 let candidates = known_agent_candidates();
-                let cmds: Vec<String> = collect_descendants(sys, s.pid)
+                // ★argv 승격(U-5): 에이전트 식별은 명령줄 토큰 매칭이다 — 이름 한 토큰
+                // (`node.exe` 래퍼)으로는 참/거짓을 낼 수 없다. 범위는 이 좌석의 자손만.
+                let cmds: Vec<String> = collect_descendants_with_cmd(sys, s.pid)
                     .into_iter()
                     .map(|(_, cmd)| cmd)
                     .collect();
@@ -370,7 +372,10 @@ fn check_agent_death(
             continue;
         };
         let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(&bin).to_string();
-        let descendants = collect_descendants(sys, s.pid);
+        // ★argv 승격(U-5): 생존 매칭은 cmdline 토큰 단위이므로 이름 폴백으로는 래퍼 기동
+        // (`node.exe <…>/claude`)을 오사망으로 읽는다 → 허위 agent.exited → node-recover 재기동
+        // 스폰(자원 관점에서 비용이 가장 비싼 오판). 승격 범위는 이 좌석의 자손 pid 만.
+        let descendants = collect_descendants_with_cmd(sys, s.pid);
         let alive = descendants
             .iter()
             .any(|(_, cmdline)| cmdline_matches_agent(cmdline, &bin_base));
@@ -1468,6 +1473,56 @@ fn check_feed_backlog(daemon: &Arc<Daemon>, alerted: &mut bool) {
     }
 }
 
+/// `check_launch_flags` 의 **3상 판정** — 순수 함수(관측 결과 → 행동).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchFlagAction {
+    /// ① 관측 성공 ∧ 플래그 있음 — 정규 복귀. 1회 래치를 **재무장**한다.
+    Rearm,
+    /// ② 관측 성공 ∧ 플래그 없음 — 비정규 기동. 래치가 비어 있으면 **1회 발행**한다.
+    Warn,
+    /// ③ 관측 실패(`name()` 폴백) 또는 에이전트 자손 무관측 — **재무장도 발행도 하지 않는다**.
+    Skip,
+}
+
+/// 좌석 자손 관측 → 기동 플래그 판정(순수).
+///
+/// 【고친 결함 P1-2(치명·폭주 채널)】 종전 판정은 2상이었다: 플래그가 보이면 `warned.remove`
+/// (재무장), 안 보이면 발행. U-5 이전에는 관측 문자열이 **항상** `name()` 한 토큰이라
+/// `cmdline.contains("--dangerously-skip-permissions")` 가 원리상 참이 될 수 없었고, 그래서
+/// 재무장 가지가 죽어 있어 좌석당 1회로 끝났다. U-5 argv 승격 이후 그 값은 **argv 조회 성공
+/// 여부에 따라 진동**한다(Windows `argv_snapshot` = `OpenProcess` + PEB `ReadProcessMemory`,
+/// EDR·권한·종료 경주로 간헐 실패 → `name()` 폴백). 진동의 귀결:
+///   성공 틱 → 재무장 → 실패 틱 → 플래그 미관측 → **이벤트 발행** → 성공 틱 → 재무장 → …
+/// = watchdog 15초 주기(tick_no % 3) × 좌석 수만큼 **영구 발행**. 이 검사 주석 자신이
+/// "2026-07-07 feed 폭주 재발방지"라고 적힌 자리에서 같은 폭주가 되살아났다.
+///
+/// 【수리의 축】 "플래그 부재"와 "관측 실패"를 **분리**한다. 부정 판정(=발행)은 argv 를 실제로
+/// 읽은 관측에서만 내린다. 폴백 관측은 아무 상태도 바꾸지 않으므로(③) 진동이 래치에 닿지 못한다.
+///
+/// 【매칭 선택 규약】 자손 중 매처에 걸리는 것이 여럿일 수 있다. **argv 관측된 매치를 우선**
+/// 채택하고, 그런 매치가 하나도 없을 때만 폴백 매치 유무를 본다 — 한 자손의 argv 조회 실패가
+/// 다른 자손의 성공 관측을 덮지 않게 하기 위함이다.
+pub fn decide_launch_flag_action(
+    descendants: &[(u32, String, CmdSource)],
+    bin_base: &str,
+) -> LaunchFlagAction {
+    let matches_agent = |c: &String| cmdline_matches_agent(c, bin_base);
+    // ①② argv 로 실제 관측된 매치가 있으면 그것만이 판정 근거다.
+    if let Some((_, cmdline, _)) = descendants
+        .iter()
+        .find(|(_, c, src)| *src == CmdSource::Argv && matches_agent(c))
+    {
+        return if cmdline.contains("--dangerously-skip-permissions") {
+            LaunchFlagAction::Rearm
+        } else {
+            LaunchFlagAction::Warn
+        };
+    }
+    // ③ 폴백 매치만 있거나(관측 실패) 매치 자체가 없다(에이전트 자손 무관측) — 무행동.
+    //    후자는 종전에도 `continue` 였으므로 거동 무변이다.
+    LaunchFlagAction::Skip
+}
+
 /// L1 비정규 기동 감시(2026-07-07 feed 폭주 재발방지): claude 에이전트 노드가
 /// --dangerously-skip-permissions 없이 떠 있으면 권한 프롬프트가 발생해 승인 감지·방치
 /// 폭주의 씨앗이 된다(오늘 사고의 Why-1). 강제 없이 surface당 1회 경고 이벤트만 발행한다
@@ -1491,15 +1546,21 @@ fn check_launch_flags(
             continue;
         }
         let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(&bin).to_string();
-        let Some((_, cmdline)) = collect_descendants(sys, s.pid)
-            .into_iter()
-            .find(|(_, c)| cmdline_matches_agent(c, &bin_base))
-        else {
-            continue;
-        };
-        if cmdline.contains("--dangerously-skip-permissions") {
-            warned.remove(&s.id); // 정규 복귀 — 재무장
-            continue;
+        // ★argv 승격(U-5): 이 검사는 정의상 **플래그 문자열**을 읽는다 — argv 갱신 없이는
+        // `cmdline.contains("--dangerously-skip-permissions")` 가 원리상 참이 될 수 없어
+        // 살아있는 모든 claude 노드에 node.nonstandard_launch 를 1회씩 발행했다.
+        // 15초 주기(tick_no % 3) × claude meta 좌석 한정 — 승격 비용의 상한이 여기서 닫힌다.
+        // ★P1-2: 판정은 3상이다(근거 전문은 `decide_launch_flag_action` 주석). 관측 실패를
+        //   '플래그 없음'으로 읽으면 argv 조회 진동이 15초마다 이벤트를 재발행한다.
+        let observed = collect_descendants_with_cmd_src(sys, s.pid);
+        match decide_launch_flag_action(&observed, &bin_base) {
+            LaunchFlagAction::Rearm => {
+                warned.remove(&s.id); // 정규 복귀 — 재무장
+                continue;
+            }
+            // 관측 실패·에이전트 자손 무관측 — 래치를 건드리지 않는다(진동 차단).
+            LaunchFlagAction::Skip => continue,
+            LaunchFlagAction::Warn => {}
         }
         if !warned.insert(s.id) {
             continue; // 이미 경고함
@@ -2023,7 +2084,11 @@ pub fn refresh_seat_cache(daemon: &Arc<Daemon>, sys: &System) {
             && {
                 let cands = candidates.get_or_insert_with(known_agent_candidates);
                 !cands.is_empty() && {
-                    let cmds: Vec<String> = collect_descendants(sys, s.pid)
+                    // ★argv 승격(U-5): 이 자리의 계약이 명시적으로
+                    // "cmdline_matches_agent_exec 엄격 매칭"이다(위 주석) — 이름 한 토큰으로는
+                    // 그 계약이 성립하지 않는다. 범위는 meta 부재·Occupied 좌석의 자손만이라
+                    // 틱당 승격 대상이 구조적으로 소수다.
+                    let cmds: Vec<String> = collect_descendants_with_cmd(sys, s.pid)
                         .into_iter()
                         .map(|(_, cmd)| cmd)
                         .collect();
@@ -2294,7 +2359,10 @@ pub fn cmdline_matches_agent_exec(cmdline: &str, bin_base: &str) -> bool {
     })
 }
 
-pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
+/// 자손 pid 트리만 수집한다(문자열 미조회) — collect_descendants 계열의 공통 골격.
+/// pid 재사용으로 부모 링크에 사이클이 생겨도 무한루프하지 않게 방문 집합을 유지한다.
+/// 반환 순서는 종전 collect_descendants 의 DFS 순서와 동일하다(소비자 순서 의존 무변경).
+fn descendant_pids(sys: &System, root: u32) -> Vec<u32> {
     // parent → children index
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, proc_) in sys.processes() {
@@ -2307,7 +2375,6 @@ pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
     }
     let mut out = Vec::new();
     let mut stack = vec![root];
-    // pid 재사용으로 부모 링크에 사이클이 생겨도 무한루프하지 않게 방문 집합 유지
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     seen.insert(root);
     while let Some(p) = stack.pop() {
@@ -2316,25 +2383,145 @@ pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
                 if !seen.insert(kid) {
                     continue;
                 }
-                let cmdline = sys
-                    .process(Pid::from_u32(kid))
-                    .map(|pr| {
-                        let parts: Vec<String> = pr
-                            .cmd()
-                            .iter()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .collect();
-                        if parts.is_empty() {
-                            pr.name().to_string_lossy().into_owned()
-                        } else {
-                            parts.join(" ")
-                        }
-                    })
-                    .unwrap_or_default();
-                out.push((kid, cmdline));
+                out.push(kid);
                 stack.push(kid);
             }
         }
+    }
+    out
+}
+
+/// 프로세스 표에 **이미 실린 사실만으로** 만드는 관측 문자열.
+/// argv 가 비면 종전대로 `name()` 한 토큰으로 접힌다.
+fn observed_cmdline(sys: &System, pid: u32) -> String {
+    sys.process(Pid::from_u32(pid))
+        .map(|pr| {
+            let parts: Vec<String> = pr
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            if parts.is_empty() {
+                pr.name().to_string_lossy().into_owned()
+            } else {
+                parts.join(" ")
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// 자손 프로세스 (pid, 관측문자열) 목록 — **argv 미승격판**.
+///
+/// ★계측 사실(sysinfo 0.33.1 `src/common/system.rs:291-305`): `System::refresh_processes`
+/// 는 `ProcessRefreshKind::nothing().with_memory().with_cpu().with_disk_usage()
+/// .with_exe(OnlyIfNotSet)` 로 위임하며 **`cmd`(argv) 를 갱신하지 않는다**. 그래서 그렇게
+/// 갱신된 표에서 `Process::cmd()` 는 항상 비고, 이 함수의 반환값은 사실상 "명령줄"이
+/// 아니라 **실행 파일 이름 한 토큰**이다(예: Windows 래퍼 기동 시 `node.exe`).
+/// ∴ argv 를 실제로 **판정에 쓰는** 지점은 `collect_descendants_with_cmd` 를 써야 한다.
+/// 개수·존재 여부만 보는 소비자(seat_state·reap 계열)는 이 함수가 맞다(추가 비용 0).
+pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
+    descendant_pids(sys, root)
+        .into_iter()
+        .map(|kid| {
+            let cmdline = observed_cmdline(sys, kid);
+            (kid, cmdline)
+        })
+        .collect()
+}
+
+/// 자손 프로세스 (pid, **명령줄**) 목록 — argv 승격판.
+///
+/// **왜 전역 refresh 를 승격하지 않고 별도 함수인가**
+///
+/// ① **의미(결정적 이유)** — 전역 표의 `cmd` 를 채우면 같은 표를 읽는 **모든** 소비자의 관측
+///    문자열이 동시에 바뀐다. 그중 `check_surfaces` 의 cmdline 은 무엇인가를 판별하는
+///    식별자가 아니라 동일물을 세는 **그룹핑 키**이고, 그 그룹이 자동 kill 대상 집합을 정한다
+///    (plan_duplicate_alerts → `auto_kill`). 즉 전역 승격은 관측 정확도 수리가 아니라
+///    **자동 kill 폭발 반경의 재정의**를 겸하게 된다 — 이 단위는 거기에 손대지 않는다.
+///    트리 구성은 호출자가 이미 가진 `sys`(전역 refresh 결과)에서 하고 argv 만 **격리
+///    스냅샷**으로 조회하므로, 같은 틱의 다른 소비자의 관측 의미는 그대로다.
+///
+/// ② **비용(실측 2026-08-23 · macOS · 프로세스 1,074개 · bench_argv_promotion_* 재현 가능)** —
+///    전역 refresh 현행 kind 3.3~3.9 ms/회, 거기에 `with_cmd(OnlyIfNotSet)` 를 얹어도
+///    3.4~3.5 ms/회로 **macOS 에서는 유의 증가가 관측되지 않았다**(macOS 는 `with_exe` 때문에
+///    이미 `KERN_PROCARGS2` 를 읽고 있어 argv 파싱이 덤이다). ∴ "전역 승격은 비싸다"는
+///    macOS 실측으로 지지되지 않으므로 근거로 쓰지 않는다 — 근거는 ①이다.
+///    Linux(`/proc/<pid>/cmdline` 별도 open)·Windows(프로세스별 PEB 원격 읽기)는 미측정.
+///
+/// ③ **이 함수 자신의 비용** — 좌석 5개 기준 틱당 +1.2 ms(전역 refresh 대비 ~35%,
+///    틱 주기 5,000 ms 의 0.024%). macOS 의 `refresh_processes_specifics(Some(..))` 는 내부에서
+///    `proc_listallpids` 전수 열거를 먼저 하므로(sysinfo 0.33.1 `unix/apple/system.rs:250-278`)
+///    **호출 1회당 열거 1회**다 — 좌석 수에 선형이다. 좌석이 수십 개로 커지면 좌석별 호출을
+///    틱당 배치 스냅샷 1회로 접는 것이 다음 개선점이다(현재 편성 규모에서는 불요).
+///
+/// **폴백 규약(fail-same)**: argv 조회 실패(권한 부족·경주로 종료)이면 종전과 동일하게
+/// `name()` 을 돌려준다. 승격 실패가 판정을 완화하지 않고 종전 동작으로 떨어질 뿐이다.
+pub fn collect_descendants_with_cmd(sys: &System, root: u32) -> Vec<(u32, String)> {
+    collect_descendants_with_cmd_src(sys, root)
+        .into_iter()
+        .map(|(pid, cmd, _)| (pid, cmd))
+        .collect()
+}
+
+/// 관측 문자열의 **출처** — "argv 를 실제로 읽었는가, `name()` 폴백인가".
+///
+/// 【왜 필요한가 · P1-2】 `collect_descendants_with_cmd` 의 fail-same 폴백은 *관측 정확도* 관점에선
+/// 옳지만, 소비자가 그 문자열을 **부정 판정의 근거**로 쓰면 곧바로 틀린다: 폴백 문자열에
+/// 플래그가 없는 것은 "플래그가 없다"가 아니라 "**관측하지 못했다**" 이기 때문이다. 그 구분이
+/// 없으면 argv 조회가 간헐 실패하는 환경(Windows `OpenProcess`+PEB `ReadProcessMemory` 가
+/// EDR·권한·종료 경주로 실패)에서 판정이 **진동**하고, 진동은 곧 이벤트 폭주가 된다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmdSource {
+    /// `argv_snapshot` 이 실제 argv 를 돌려줬다 — 문자열이 명령줄 전체다.
+    Argv,
+    /// argv 미관측 → `name()` 한 토큰으로 접혔다 — **부정 판정의 근거로 쓸 수 없다**.
+    NameFallback,
+}
+
+/// `collect_descendants_with_cmd` 와 동일하되 **출처를 함께** 돌려준다.
+/// 기존 소비자는 얇은 래퍼(`collect_descendants_with_cmd`)를 그대로 쓰므로 거동 무변이고,
+/// 관측 실패를 구분해야 하는 소비자만 이 함수를 쓴다.
+pub fn collect_descendants_with_cmd_src(sys: &System, root: u32) -> Vec<(u32, String, CmdSource)> {
+    let kids = descendant_pids(sys, root);
+    if kids.is_empty() {
+        return Vec::new();
+    }
+    let argv = argv_snapshot(&kids);
+    kids.into_iter()
+        .map(|kid| match argv.get(&kid) {
+            Some(cmd) => (kid, cmd.clone(), CmdSource::Argv),
+            None => (kid, observed_cmdline(sys, kid), CmdSource::NameFallback),
+        })
+        .collect()
+}
+
+/// 지정 pid 집합의 argv 만 담은 **격리 스냅샷**. 전역 프로세스 표를 건드리지 않는다.
+/// `remove_dead_processes=false` — 이 스냅샷은 생존 판정의 근거가 아니라 문자열 재료다
+/// (생존 판정은 종전대로 호출자의 `sys` 가 단독 소유).
+/// `UpdateKind::Always` 인 이유: 매 호출 새 `System` 이라 `cmd` 가 항상 비어 있어
+/// `OnlyIfNotSet` 과 결과가 동일하고, 의도(=지금 읽어온다)가 명시적이다.
+fn argv_snapshot(pids: &[u32]) -> HashMap<u32, String> {
+    let targets: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&targets),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let mut out: HashMap<u32, String> = HashMap::new();
+    for &pid in pids {
+        let Some(pr) = sys.process(Pid::from_u32(pid)) else {
+            continue;
+        };
+        let parts: Vec<String> = pr
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if parts.is_empty() {
+            continue; // argv 미관측 — 호출부가 name() 폴백
+        }
+        out.insert(pid, parts.join(" "));
     }
     out
 }
@@ -2448,7 +2635,8 @@ pub fn observe_agent_on_surface(s: &crate::state::Surface) -> Option<(String, St
     }
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
-    let cmds: Vec<String> = collect_descendants(&sys, s.pid)
+    // ★argv 승격(U-5): claim_role 관측 등록의 재료도 명령줄 토큰 매칭이다.
+    let cmds: Vec<String> = collect_descendants_with_cmd(&sys, s.pid)
         .into_iter()
         .map(|(_, cmd)| cmd)
         .collect();
@@ -2766,6 +2954,11 @@ fn check_surfaces(
 
     let mut obs: Vec<ProcObs> = Vec::new();
     for (sid, root_pid) in &surfaces {
+        // ★U-5 범위 외(의도적 비승격): 여기의 cmdline 은 무엇인가를 판별하는 **식별자**가
+        // 아니라 동일물 둘을 세는 **그룹핑 키**다(plan_duplicate_alerts → auto_kill 대상 집합).
+        // 이름 → 전체 argv 로 바꾸면 그룹 경계가 재정의되어 **자동 kill 의 폭발 반경이 이동**하고
+        // 그것은 이 단위(관측 정확도)가 아니라 별도 단위의 판정이다. 안전측 기본값으로
+        // 종전 관측(이름)을 유지한다 — 완화가 아니라 **무변경**이다.
         let descendants = collect_descendants(sys, *root_pid);
         if descendants.len() > daemon.config.proc_count_threshold {
             // 디바운스 — 임계 초과 상태가 지속돼도 5초마다 영구 발행하지 않는다
@@ -3933,6 +4126,400 @@ mod tests {
         is_node_owned, kill_pid, learn_stuck_candidates, merged_approval_patterns,
         plan_duplicate_alerts, plan_duplicate_kills, wakeup_entry_ids, ProcObs,
     };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★U-5 · sysinfo 프로세스 정보 갱신 승격(argv) — 계측 타당성 + 비용
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 드릴 자식: **이름에는 에이전트 식별자가 없고 argv 에만 있는** 프로세스를 띄운다.
+    /// `sh -c '<script>' <argv0> <arg1>` 형식이라 name 은 `sh`, argv 는 5토큰이 된다.
+    /// 스크립트 끝의 `; :` 는 셸의 exec 최적화(자기 자신을 sleep 으로 치환)를 막는 관례다
+    /// (같은 파일 live_normal_formation_* 드릴의 선례와 동일한 이유).
+    #[cfg(unix)]
+    fn spawn_argv_masked_child() -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 ; :")
+            .arg("/opt/cys-u5-drill/claude")
+            .arg("--dangerously-skip-permissions")
+            .spawn()
+            .expect("드릴 자식 spawn 실패")
+    }
+
+    /// 드릴 자식의 손자(`sleep 30`)를 **지금 다시 읽은** 프로세스 표에서 수집한다.
+    ///
+    /// ★P2-4: 손자는 `sh` 가 fork 한 뒤에야 표에 실리므로, 자식이 처음 보인 순간의 스냅샷으로는
+    /// 거의 항상 빈 목록이 나온다(→ 자식만 죽고 `sleep 30` 이 ppid=1 고아로 잔존). 그래서 회수
+    /// 직전에 새 표를 뜬다. 손자 생성이 늦어질 수 있으므로 최대 ~2초 짧게 폴링하되, 끝내 못
+    /// 보면 빈 목록을 돌려준다(정리 실패로 테스트를 적색으로 만들지는 않는다 — 판정 축 아님).
+    #[cfg(unix)]
+    fn collect_grandkids_fresh(kid: u32) -> Vec<u32> {
+        let mut fresh = sysinfo::System::new();
+        for _ in 0..20 {
+            fresh.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            let g = super::descendant_pids(&fresh, kid);
+            if !g.is_empty() {
+                return g;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Vec::new()
+    }
+
+    /// 지정 pid 가 프로세스 표에 자손으로 보일 때까지 최대 ~5초 기다린다.
+    #[cfg(unix)]
+    fn wait_until_visible(sys: &mut sysinfo::System, root: u32, want: u32) -> bool {
+        for _ in 0..50 {
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if super::descendant_pids(sys, root).contains(&want) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// ★계측 타당성 검체(U-5) — argv 승격이 **실제로 참/거짓을 뒤집는가**.
+    ///
+    /// 재현하는 실측 결함: 노드가 래퍼로 뜨면(Windows 실측의 `node.exe … claude …`) 프로세스
+    /// **이름**에는 에이전트 식별자가 없다. sysinfo 0.33.1 의 `refresh_processes` 는 argv 를
+    /// 갱신하지 않으므로(common/system.rs:291-305) 미승격 수집기는 이름 한 토큰만 돌려주고,
+    /// 그 위에서 도는 두 판정이 **원리상 거짓**이 된다:
+    ///   ① `cmdline_matches_agent` (check_agent_death 의 생존 매칭 → agent_alive)
+    ///   ② `--dangerously-skip-permissions` 플래그 검사 (check_launch_flags)
+    ///
+    /// ★적색 증명(in-band): 아래 ①' ②' 단언이 **미승격 수집기의 결과가 거짓임**을 같은
+    /// 검체 안에서 박제한다. 즉 승격을 되돌리면(=with_cmd 를 미승격판으로 치환하면)
+    /// ① ② 단언이 그대로 적색이 된다. 판정 축을 옮긴 것이 아니라 **같은 술어에 옳은 입력을
+    /// 먹인 것**임이 이 대칭 단언으로 드러난다.
+    #[cfg(unix)]
+    #[test]
+    fn live_argv_promotion_flips_agent_predicates_name_fallback_cannot_decide() {
+        let mut child = spawn_argv_masked_child();
+        let kid = child.id();
+        let me = std::process::id();
+        let mut sys = sysinfo::System::new();
+        let visible = wait_until_visible(&mut sys, me, kid);
+
+        let plain = super::collect_descendants(&sys, me);
+        let promoted = super::collect_descendants_with_cmd(&sys, me);
+
+        let plain_cmd = plain
+            .iter()
+            .find(|(p, _)| *p == kid)
+            .map(|(_, c)| c.clone());
+        let promoted_cmd = promoted
+            .iter()
+            .find(|(p, _)| *p == kid)
+            .map(|(_, c)| c.clone());
+
+        // 정리는 단언보다 먼저 — 실패해도 드릴 자식(과 그 sleep 손자)을 남기지 않는다.
+        // ★P2-4: 손자 수집을 **재refresh 후**에 한다. 종전에는 `wait_until_visible` 이 남긴
+        //   스냅샷(=자식이 처음 보인 순간)에서 손자를 찾았는데, 그 시점엔 `sh` 가 아직
+        //   `sleep 30` 을 fork 하기 전인 경우가 대부분이라 목록이 비었고 → 자식만 kill 되어
+        //   `sleep 30` 이 **ppid=1 고아**로 남았다(실측: 3회 실행 = 고아 3개).
+        //   이 저장소는 자원 거버넌스가 엄격하다 — 테스트가 프로세스를 남기면 안 된다.
+        let grandkids = collect_grandkids_fresh(kid);
+        let _ = child.kill();
+        let _ = child.wait();
+        for g in grandkids {
+            super::kill_pid(g);
+        }
+
+        assert!(visible, "전제 실패: 드릴 자식이 프로세스 표에 나타나지 않음");
+        let plain_cmd = plain_cmd.expect("전제 실패: 미승격 수집기가 드릴 자식을 못 봄");
+        let promoted_cmd = promoted_cmd.expect("전제 실패: 승격 수집기가 드릴 자식을 못 봄");
+
+        // ①' 미승격 = 이름 한 토큰 — 에이전트 식별 불가(적색 증명의 좌변)
+        assert!(
+            !super::cmdline_matches_agent(&plain_cmd, "claude"),
+            "미승격 관측이 에이전트를 식별해 버렸다(드릴 전제 붕괴): {plain_cmd:?}"
+        );
+        // ②' 미승격 = 기동 플래그 관측 불가
+        assert!(
+            !plain_cmd.contains("--dangerously-skip-permissions"),
+            "미승격 관측에 기동 플래그가 보였다(드릴 전제 붕괴): {plain_cmd:?}"
+        );
+
+        // ① 승격 = 생존 매칭 참
+        assert!(
+            super::cmdline_matches_agent(&promoted_cmd, "claude"),
+            "argv 승격 후에도 생존 매칭이 거짓: {promoted_cmd:?}"
+        );
+        // ② 승격 = 기동 플래그 관측 참
+        assert!(
+            promoted_cmd.contains("--dangerously-skip-permissions"),
+            "argv 승격 후에도 기동 플래그가 안 보임: {promoted_cmd:?}"
+        );
+    }
+
+    /// ★P1-2(치명·폭주 채널) 회귀 박제 — **관측 실패가 섞여도 이벤트는 1회를 넘지 않는다.**
+    ///
+    /// 【재현하는 결함】 U-5 argv 승격 이후 `check_launch_flags` 의 관측 문자열은 argv 조회
+    /// 성공 여부에 따라 진동한다(Windows `argv_snapshot` = `OpenProcess` + PEB
+    /// `ReadProcessMemory` — EDR·권한·종료 경주로 간헐 실패 → `name()` 폴백). 종전 2상 판정은
+    /// 폴백 문자열의 "플래그 없음"을 **관측된 부정**으로 읽어, 정규 플래그로 뜬 좌석에서
+    ///   성공 틱 → `warned.remove`(재무장) → 실패 틱 → 발행 → 성공 틱 → 재무장 → …
+    /// 를 **watchdog 15초 주기마다 영구 반복**했다.
+    ///
+    /// 【적색 증명(in-band)】 아래 `two_state_reference` 는 **수정 전 판정 그대로**다(폴백을
+    /// 관측으로 취급하는 2상). 같은 틱열을 두 판정에 먹여 발행 수를 비교하므로, 수리를 되돌려
+    /// 3상을 2상으로 되돌리면 이 검체가 그대로 적색이 된다 — 계측기 자신을 먼저 시험한다.
+    #[test]
+    fn launch_flag_observation_failure_does_not_republish_the_once_only_warning() {
+        use super::{decide_launch_flag_action, CmdSource, LaunchFlagAction};
+        const SID: u64 = 7;
+        // 현장 실제 형태 — Windows 개명 래퍼 기동의 등록 bin_base 는 확장자 없는 `claude-2` 다
+        // (`cmdline_matches_agent_normalizes_windows_exec_extensions` 픽스처와 동일 지평).
+        const BIN: &str = "claude-2";
+        // argv 관측 성공 — 정규 플래그로 뜬 좌석.
+        let ok_flag = vec![(
+            101u32,
+            "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude-2.cmd --dangerously-skip-permissions"
+                .to_string(),
+            CmdSource::Argv,
+        )];
+        // argv 관측 성공 — 플래그 없이 수동 기동한 좌석(진짜 경고 대상).
+        let ok_noflag = vec![(
+            101u32,
+            "cmd.exe /c C:\\Users\\x\\.local\\bin\\claude-2.cmd".to_string(),
+            CmdSource::Argv,
+        )];
+        // argv 조회 실패(`OpenProcess`/PEB 읽기 실패) → `name()` 한 토큰으로 접힘. 매처에는
+        // 걸리므로(확장자 정규화 후 basename `claude-2`) 종전 판정은 이것을 '플래그 없는 정상
+        // 관측'으로 오해했다 — 그 오해가 곧 진동이고 폭주다.
+        let fallback = vec![(
+            101u32,
+            "claude-2.exe".to_string(),
+            CmdSource::NameFallback,
+        )];
+
+        // 수정 전(2상) 판정의 참조 구현 — 폴백을 관측으로 취급한다.
+        let two_state_reference = |obs: &Vec<(u32, String, CmdSource)>| {
+            match obs
+                .iter()
+                .find(|(_, c, _)| super::cmdline_matches_agent(c, BIN))
+            {
+                Some((_, cmdline, _)) => {
+                    if cmdline.contains("--dangerously-skip-permissions") {
+                        LaunchFlagAction::Rearm
+                    } else {
+                        LaunchFlagAction::Warn
+                    }
+                }
+                None => LaunchFlagAction::Skip,
+            }
+        };
+
+        // watchdog 틱을 그대로 흉내 낸다 — `warned` 래치 + 발행 카운터.
+        let run = |ticks: &[&Vec<(u32, String, CmdSource)>],
+                   decide: &dyn Fn(&Vec<(u32, String, CmdSource)>) -> LaunchFlagAction|
+         -> usize {
+            let mut warned: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut published = 0usize;
+            for obs in ticks {
+                match decide(obs) {
+                    LaunchFlagAction::Rearm => {
+                        warned.remove(&SID);
+                    }
+                    LaunchFlagAction::Warn => {
+                        if warned.insert(SID) {
+                            published += 1;
+                        }
+                    }
+                    LaunchFlagAction::Skip => {}
+                }
+            }
+            published
+        };
+
+        // ── ① 정규 플래그 좌석 + 관측 진동(성공/실패 교대) 40틱 = 실측 10분 ──────────
+        let flapping: Vec<&Vec<_>> = (0..40)
+            .map(|i| if i % 2 == 0 { &ok_flag } else { &fallback })
+            .collect();
+        // 적색 증명의 좌변: 수정 전 판정은 좌석당 **틱 절반만큼** 발행한다.
+        let before = run(&flapping, &two_state_reference);
+        assert!(
+            before > 1,
+            "드릴 전제 붕괴: 수정 전 판정이 진동으로 재발행하지 않았다({before}건) — \
+             이 검체가 P1-2 를 시험하지 못한다"
+        );
+        assert_eq!(before, 20, "수정 전 진동 발행 수가 예상과 다르다: {before}");
+        // 수리 후: 정규 플래그 좌석이므로 경고 자체가 **0건**이어야 한다.
+        let after = run(&flapping, &|o| decide_launch_flag_action(o, BIN));
+        assert_eq!(
+            after, 0,
+            "정규 플래그 좌석인데 관측 실패가 섞였다고 경고를 발행했다({after}건) — feed 폭주 채널"
+        );
+
+        // ── ② 진짜 비정규 좌석 + 관측 진동 40틱 → 정확히 **1회**(1회 경고 계약 유지) ──
+        let flapping_noflag: Vec<&Vec<_>> = (0..40)
+            .map(|i| if i % 2 == 0 { &ok_noflag } else { &fallback })
+            .collect();
+        let after_noflag = run(&flapping_noflag, &|o| decide_launch_flag_action(o, BIN));
+        assert_eq!(
+            after_noflag, 1,
+            "비정규 좌석 경고가 1회를 넘었다({after_noflag}건)"
+        );
+
+        // ── ③ 정규 복귀는 여전히 재무장한다(경고→복귀→재이탈 = 다시 1회) ────────────
+        let cycle: Vec<&Vec<_>> = vec![&ok_noflag, &ok_noflag, &ok_flag, &ok_noflag, &ok_noflag];
+        assert_eq!(
+            run(&cycle, &|o| decide_launch_flag_action(o, BIN)),
+            2,
+            "정규 복귀 후 재이탈에서 재무장이 동작하지 않았다(1회 경고 계약 소실)"
+        );
+
+        // ── ④ 3상 진리표 직접 확인 ──────────────────────────────────────────────
+        assert_eq!(
+            decide_launch_flag_action(&ok_flag, BIN),
+            LaunchFlagAction::Rearm
+        );
+        assert_eq!(
+            decide_launch_flag_action(&ok_noflag, BIN),
+            LaunchFlagAction::Warn
+        );
+        assert_eq!(
+            decide_launch_flag_action(&fallback, BIN),
+            LaunchFlagAction::Skip,
+            "관측 실패(name 폴백)를 '플래그 없음'으로 판정했다 — 진동 → 폭주 재발"
+        );
+        // 에이전트 자손이 아예 없으면 종전대로 무행동(거동 무변).
+        assert_eq!(
+            decide_launch_flag_action(&[], BIN),
+            LaunchFlagAction::Skip
+        );
+        assert_eq!(
+            decide_launch_flag_action(
+                &[(9u32, "zsh -il".to_string(), CmdSource::Argv)],
+                BIN
+            ),
+            LaunchFlagAction::Skip
+        );
+        // ⑤ 한 자손의 argv 실패가 다른 자손의 성공 관측을 덮지 않는다(매칭 선택 규약).
+        let mixed = vec![
+            (101u32, "claude-2.exe".to_string(), CmdSource::NameFallback),
+            (
+                102u32,
+                "C:\\Users\\x\\.local\\bin\\claude-2.exe --dangerously-skip-permissions"
+                    .to_string(),
+                CmdSource::Argv,
+            ),
+        ];
+        assert_eq!(
+            decide_launch_flag_action(&mixed, BIN),
+            LaunchFlagAction::Rearm,
+            "폴백 매치가 앞선다는 이유로 argv 관측 매치를 덮었다"
+        );
+    }
+
+    /// `collect_descendants_with_cmd_src` 가 출처를 정직하게 싣는가 — 얇은 래퍼가 종전 반환값과
+    /// 완전히 동형인지도 함께 확인한다(기존 소비자 거동 무변 증명).
+    #[cfg(unix)]
+    #[test]
+    fn cmd_source_is_reported_and_wrapper_stays_identical() {
+        use super::CmdSource;
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let me = std::process::id();
+        let with_src = super::collect_descendants_with_cmd_src(&sys, me);
+        let plain = super::collect_descendants_with_cmd(&sys, me);
+        let folded: Vec<(u32, String)> = with_src
+            .iter()
+            .map(|(p, c, _)| (*p, c.clone()))
+            .collect();
+        assert_eq!(folded, plain, "얇은 래퍼가 종전 반환값과 달라졌다(소비자 거동 변경)");
+        for (pid, cmd, src) in &with_src {
+            match src {
+                // argv 로 읽었다면 문자열이 비지 않는다(argv_snapshot 은 빈 argv 를 넣지 않는다).
+                CmdSource::Argv => assert!(!cmd.is_empty(), "argv 출처인데 문자열이 비었다: {pid}"),
+                // 폴백은 name() 한 토큰 — 공백이 없거나(단일 토큰) 표에서 사라져 빈 문자열이다.
+                CmdSource::NameFallback => {}
+            }
+        }
+    }
+
+    /// 승격판이 argv 를 못 읽는 프로세스에서 **종전 동작으로 떨어지는가**(fail-same).
+    /// pid 1(init/launchd)은 통상 argv 조회가 막히거나 비므로 폴백 경로를 밟는다 —
+    /// 어느 쪽이든 "빈 문자열이 아니다"가 계약이다(관측 소실 금지).
+    #[cfg(unix)]
+    #[test]
+    fn argv_promotion_falls_back_to_name_when_argv_unreadable() {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let me = std::process::id();
+        let plain = super::collect_descendants(&sys, me);
+        let promoted = super::collect_descendants_with_cmd(&sys, me);
+        // 같은 표·같은 순간이므로 pid 집합과 순서가 동일해야 한다(트리 골격 공유 증명).
+        let a: Vec<u32> = plain.iter().map(|(p, _)| *p).collect();
+        let b: Vec<u32> = promoted.iter().map(|(p, _)| *p).collect();
+        assert_eq!(a, b, "승격판이 자손 트리 골격을 바꿨다");
+        for (i, (_, cmd)) in promoted.iter().enumerate() {
+            if plain[i].1.is_empty() {
+                continue; // 표에서 사라진 pid — 양쪽 모두 빈 문자열
+            }
+            assert!(
+                !cmd.is_empty(),
+                "승격판이 관측을 잃었다(폴백 미작동): pid={}",
+                plain[i].0
+            );
+        }
+    }
+
+    /// ★비용 계측(U-5 게이트 ③) — 승격 전/후 '틱 1회분' 소요 시간.
+    /// CI 게이트가 아니라 **측정 전용**이다(머신 부하에 좌우되는 수치를 초록/적색으로 바꾸면
+    /// 그것이 곧 완화의 통로가 된다). `cargo test --bins -- --ignored --nocapture` 로 재현한다.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "측정 전용 — 수치는 보고서에 박제, CI 판정 축 아님"]
+    fn bench_argv_promotion_cost_versus_watchdog_tick() {
+        const SEATS: usize = 5;
+        let mut kids: Vec<std::process::Child> = (0..SEATS).map(|_| spawn_argv_masked_child()).collect();
+        let roots: Vec<u32> = kids.iter().map(|c| c.id()).collect();
+        let me = std::process::id();
+        let mut sys = sysinfo::System::new();
+        for r in &roots {
+            wait_until_visible(&mut sys, me, *r);
+        }
+        let bench = |label: &str, f: &mut dyn FnMut()| {
+            let n = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!("[U-5 bench] {label}: {per:.3} ms/회");
+            per
+        };
+        let mut s2 = sysinfo::System::new();
+        let t_refresh = bench("전역 refresh_processes(All) — 틱의 기존 고정비", &mut || {
+            s2.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        });
+        let t_plain = bench("승격 전: collect_descendants × 5좌석", &mut || {
+            for r in &roots {
+                std::hint::black_box(super::collect_descendants(&sys, *r));
+            }
+        });
+        let t_prom = bench("승격 후: collect_descendants_with_cmd × 5좌석", &mut || {
+            for r in &roots {
+                std::hint::black_box(super::collect_descendants_with_cmd(&sys, *r));
+            }
+        });
+        println!(
+            "[U-5 bench] 틱 증분 = {:.3} ms (전역 refresh 대비 {:.1}%)",
+            t_prom - t_plain,
+            (t_prom - t_plain) / t_refresh * 100.0
+        );
+        // ★P2-4 와 같은 이유로 손자는 **재refresh 후** 수집한다(고아 `sleep 30` 잔존 차단).
+        for c in kids.iter_mut() {
+            let g = collect_grandkids_fresh(c.id());
+            let _ = c.kill();
+            let _ = c.wait();
+            for p in g {
+                super::kill_pid(p);
+            }
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // ★T-0147-2 §2 층3 A3′(R2-C3) — queue.delivered 의 W-id 에코

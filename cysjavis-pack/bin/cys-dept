@@ -1105,7 +1105,14 @@ PY
 ) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
     # 부서별 config dir 분리(제품 기본 절차): primary(공유) 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
     # primary 계정 키는 env CYS_PRIMARY_ACCOUNT로 외부화(기본 'owner')·오너는 자기 primary 핸들 값으로 설정하면 동일 동작 유지.
-    # Max 계정 토큰은 macOS Keychain(계정단위)으로 공유 유지·dir만 분리. 단독 계정(부서 1개)은 이미 단독이라 불변.
+    # ★정정(2026-08-23 실측 · 종전 서술 "Max 계정 토큰은 macOS Keychain(계정단위)으로 공유 유지·dir만 분리" 는 반증됨):
+    #   macOS Keychain 항목은 계정 단위가 아니라 **config dir 경로 단위**다 —
+    #   서비스명 `Claude Code-credentials-<sha256(CLAUDE_CONFIG_DIR 절대경로)[:8]>`.
+    #   측정: `security dump-keychain` 서비스명 9개 열거 → 경로 sha256 앞 8자리와 7개 정확 일치
+    #   (`~/.claude`=bdf68cc2 · `~/.cys/claude`=c45eaec5 · `~/.cys/claude-default-dept-1`=55f9f695).
+    #   ∴ dir 를 분리하는 이 줄의 동작(`-<key>` 접미)은 **토큰 공유를 깨뜨린다** — 새로 만든 부서 dir 는
+    #   macOS 에서 자체 `/login` 1회가 필요하다(복사·이동으로 브리지 불가). Windows 는 토큰이 config dir 안의
+    #   `.credentials.json` 파일이라 복사가 성립한다. 단독 계정(부서 1개)은 이미 단독이라 불변.
     if [ "$acctkey" = "${CYS_PRIMARY_ACCOUNT:-owner}" ]; then acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"; fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·

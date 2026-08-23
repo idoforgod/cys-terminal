@@ -446,6 +446,7 @@ fn spawn_bridge(
     bridge_cmd: &str,
     token: &str,
 ) -> Result<(u32, i32), String> {
+    use cys::SpawnPolicy;
     #[cfg(unix)]
     let mut cmd = {
         let mut c = std::process::Command::new("sh");
@@ -461,25 +462,14 @@ fn spawn_bridge(
     cmd.env("CYS_CHANNEL_TOKEN", token)
         .env("CYS_CHANNEL", channel)
         .env(cys::ENV_SOCKET, daemon.socket_path.to_string_lossy().as_ref());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid(); // 새 세션/그룹 → pgid == pid, 그룹 단위 회수 가능.
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        // CREATE_NO_WINDOW 동시 지정 — creation_flags 는 덮어쓰기라 hide_console() 별도 호출과
-        // 병용 불가. 없으면 콘솔 없는 cysd가 띄우는 장수 브리지(cmd /C)마다 콘솔 창이 뜬다.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
+    // ★U-7: 등급 `GroupScoped` — unix `setsid`(새 세션/그룹 → pgid == pid, 그룹 단위 회수 가능)
+    // + Windows `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`. flag 두 개를 **한 등급값이**
+    // 결정하므로, 종전 주석이 경고하던 함정(`creation_flags` 는 덮어쓰기라 `hide_console()` 을
+    // 따로 부르면 그룹 flag 가 조용히 사라진다)이 구조적으로 재발하지 않는다.
+    // 콘솔 창 은폐가 필요한 이유는 그대로다 — 콘솔 없는 cysd 가 띄우는 장수 브리지(cmd /C)마다
+    // 검은 창이 뜬다. 이 자식은 시그널로는 안 죽고 **원장(scoped)의 pgid kill 로만** 회수된다.
+    // 값 자체는 종전과 동일 — 이 커밋의 변화는 정의처 이동뿐이다(행동 무변경).
+    cmd.spawn_policy(cys::ChildLifetime::GroupScoped);
     let child = cmd.spawn().map_err(|e| format!("bridge spawn failed: {e}"))?;
     let pid = child.id();
     let pgid = pid as i32; // setsid → pgid == pid(unix); windows는 pid 사용.

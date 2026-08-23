@@ -971,6 +971,7 @@ fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
 
 /// 부재 역할 자동 기동: 데몬이 형제 CLI의 launch-agent를 호출 (준비 폴링·지침 주입 재사용)
 async fn launch_via_cli(daemon: &Arc<Daemon>, spec: &LaunchSpec) -> Result<u64, String> {
+    use cys::SpawnPolicy;
     let cli = crate::state::sibling_cli_path();
     let mut cmd = tokio::process::Command::new(cli);
     cmd.arg("launch-agent")
@@ -981,12 +982,23 @@ async fn launch_via_cli(daemon: &Arc<Daemon>, spec: &LaunchSpec) -> Result<u64, 
         .env(
             cys::ENV_SOCKET,
             daemon.socket_path.to_string_lossy().as_ref(),
-        );
+        )
+        // ★U-7 결손 보강: 데몬이 낳는 **다른 CLI 자식은 전부** 이걸 걸고 있었는데
+        // (main.rs 의 office-bridge·auto-restore·phoenix self-test) 여기만 빠져 있었다.
+        // 없으면 이 자식 cys 가 소켓 연결에 실패했을 때 `spawn_detached_daemon` 으로
+        // **라이벌 데몬을 낳는다** — 데몬 종료 중·소켓 교체 중에 정확히 그 창이 열린다.
+        // 자기 데몬이 자기 경쟁자를 스폰하는 재귀 기동은 폭주(치명위험 ①) 경로다.
+        .no_autostart()
+        // ★U-7 등급 `Attached` — 아래에서 `.output()` 으로 **끝까지 기다리는** 유계 자식이다.
+        // 분리하면 안 된다: 부모가 죽으면 함께 죽는 것이 정상 동작이고, 떼는 순간
+        // 180초 상한이 걸린 이 호출이 남긴 자식이 고아로 잔존한다.
+        // (flag 는 종전 `hide_console()` 과 동일한 CREATE_NO_WINDOW — 행동 무변경.)
+        .spawn_policy(cys::ChildLifetime::Attached);
     if let Some(cwd) = &spec.cwd {
         cmd.arg("--cwd").arg(cwd);
     }
     // hang된 launch-agent가 fire 태스크를 영구 점유하지 않게 상한
-    let out = tokio::time::timeout(Duration::from_secs(180), cmd.hide_console().output())
+    let out = tokio::time::timeout(Duration::from_secs(180), cmd.output())
         .await
         .map_err(|_| "launch-agent timed out (180s)".to_string())?
         .map_err(|e| format!("launch-agent spawn failed: {e}"))?;

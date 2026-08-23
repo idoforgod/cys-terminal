@@ -1755,30 +1755,23 @@ fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<(
 }
 
 /// 데몬을 분리 세션으로 기동 — CLI가 Ctrl-C로 죽어도 데몬은 살아남는다.
+///
+/// ★U-7: 분리 규약은 `cys::SpawnPolicy`(단일 정의처) 경유. 등급 `Survivor` 가
+/// ①unix `setsid` ②Windows `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`
+/// ③stdin/stdout/stderr 무점유를 **한 값으로** 결정한다.
+///
+/// 종전 Windows arm 은 `CREATE_NO_WINDOW` 만 걸어 **프로세스 그룹을 떼지 않았다** —
+/// `channels.rs::spawn_bridge`(둘 다 건다)와 비대칭이었고, 실측(PROBE_RESULTS.md V-c ·
+/// PROBE_RESULTS_WINDOWS.md WIN-3 H4)으로 훅/부모가 잘릴 때 **그룹에 남은 자식이 함께
+/// 죽는 것**이 mac·Windows 양쪽에서 확인됐다. 즉 그 결손은 "살아남아야 할 데몬이
+/// 부모와 함께 죽는" 경로였다. `setsid`(mac 부재)·`setsid.exe`(동봉 PortableGit 부재)로는
+/// 우회할 수 없어 **스폰 flag 가 유일한 수단**이다.
 fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
+    use cys::SpawnPolicy;
     let mut cmd = std::process::Command::new(path);
     // ★G34: 스폰 전 (소켓,팩) 쌍 보증 — 거부 시 스폰 자체를 하지 않는다.
     ensure_daemon_lane_pack(&mut cmd)?;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        // CREATE_NO_WINDOW: 데몬에 콘솔 창을 붙이지 않는다(검은 빈 창·ConPTY 오염 방지).
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.spawn_policy(cys::ChildLifetime::Survivor);
     cmd.spawn().map(|_| ())
 }
 
@@ -1855,20 +1848,410 @@ type ConnStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type ConnStream = std::fs::File;
 
-fn request(method: &str, params: Value) -> Result<Value, String> {
-    let mut stream = connect()?;
+// ═══════════════ U-6 · RPC 왕복 상한(양방향 · Windows arm 실동작) ═══════════════
+//
+// 【고친 결함】 `request()` 에는 read/write 타임아웃이 **없었다**. 데몬이 accept 한 뒤 응답하지
+// 못하는 상태(동기 `handlers::dispatch` 가 락에 걸림·핸들러 교착)가 되면 CLI 는 **영구 대기**한다.
+// 그 CLI 가 훅 자식이면 훅 timeout 이 프로세스 트리를 kill 할 때까지 pane 이 멈춘다.
+// 타임아웃판(`request_on_timeout`)이 이미 있었으나 (a) `drain --verify` fan-out 전용이고
+// (b) **Windows arm 이 `request_on` 위임 = no-op** 이었다(주석이 "범위 한정"으로 자인).
+//
+// 【상한의 축】 총 소요가 아니라 **무진행(한 바이트도 오지 않는) 구간**이다.
+// 총 데드라인으로 자르면 정상 전송 중인 큰 응답(수 MB scrollback · 수백 KB 지침 에코)이 잘린다 —
+// 그건 hang 보다 나쁜 실패다(멀쩡한 왕복을 죽인다). 1바이트라도 진행하면 상한을 재장전한다.
+// 대가: 데몬이 무한히 찔끔거리면 유계가 아니다. 그러나 cysd 는 응답을 `write_line` 한 번으로
+// 쓰므로(cysd/main.rs) 그 상태는 만들 수 없고, 종전(무타임아웃)보다 나빠지는 방향도 아니다.
+//
+// 【장기 경로 제외】 응답이 아니라 **스트림**이 흐르는 연결 승격 경로에는 어떤 상한도 걸지 않는다.
+// 판별 근거는 데몬의 `Reply` enum(cysd/handlers.rs) 이다 — `Reply::EventStream`(`events.stream`)
+// 과 `Reply::Attach`(`surface.attach`)가 연결을 승격하고, `Reply::FeedWait`(`feed.push` wait=true)
+// 와 `Reply::WaitFor`(`surface.wait_for`)는 **응답 전에 서버가 의도적으로 대기**한다. 앞 둘은
+// 상한 면제, 뒤 둘은 그 대기값에서 상한을 파생한다(아래 `rpc_server_wait_secs`).
+//
+// 【롤백】 `CYS_RPC_TIMEOUT_SECS=0` = 상한 전면 해제(개정 전 무한 대기 거동). 양수면 그 값(초)이
+// 기본 상한을 대체한다. 코드 revert 없이 무력화 가능해야 한다는 단위 계약(§3-2 U-6)의 집행부다.
+
+/// 기본 무진행 상한(초).
+///
+/// ★값 근거(넉넉한 쪽으로 고른다 — 짧으면 정상 부트 왕복이 잘려 팀이 깨진다):
+/// ① 살아있는 데몬 실측 왕복 = `cys ping` 0.007s · `cys status --json` 0.029s
+///    (2026-08-23 mac, 3회 중앙값). 정상 왕복은 상한의 1/1000 규모다.
+/// ② 냉시작(데몬 자동기동 + 소켓 바인드 + 프로세스 표 refresh)을 포함한 **최악 왕복의 실측 하한**은
+///    팩 예산이 12~15초로 박제한다 — `javis_budget.LEAF_FLOORS`: `CYS_STATUS_TIMEOUT_S=12`,
+///    `CYS_PING_TIMEOUT_S`/`CYS_LIST_TIMEOUT_S`/`CYS_CLAIM_TIMEOUT_S=15`.
+/// ③ 그 최악치(15)의 2배 + 여유 = **40초**. 부트 사슬의 상위 호출자는 자기 서브프로세스
+///    timeout(12~15초)으로 **언제나 먼저** 자르므로, 이 상한이 정상 부트 왕복을 자르는 경로는 없다.
+/// ④ 이 상수는 부트 readiness 예산(`BUDGET_*` ↔ `LEAF_FLOORS`) 과 **다른 축**이라 그 이름공간에
+///    넣지 않는다(H-TIME-1 파리티 대상 아님 — 예산 leaf 무변경 계약 준수).
+const RPC_IDLE_TIMEOUT_SECS: u64 = 40;
+
+/// 서버가 스스로 붙잡는 메서드에 얹는 여유(초) — 서버 자신의 timeout 이 먼저 만료해 응답이
+/// 오는 것이 정상 귀결이고, 이 마진은 그 응답이 도착하는 데 드는 왕복분이다.
+const RPC_SERVER_WAIT_MARGIN_SECS: u64 = 30;
+
+/// 서버측 하드 캡(cysd/handlers.rs: `feed.push` `.min(3600)` · `surface.wait_for` `.min(600)`).
+/// 클라이언트가 params 에서 큰 값을 읽어도 이 이상은 기다리지 않는다.
+const RPC_SERVER_WAIT_CAP_SECS: u64 = 3600;
+
+/// 롤백 스위치 env 이름(0 = 상한 해제).
+const ENV_RPC_TIMEOUT: &str = "CYS_RPC_TIMEOUT_SECS";
+
+/// 연결을 **스트림으로 승격**하는 메서드 — 상한 면제(구독이 끊긴다).
+/// 지금 이 둘은 `request()` 를 타지 않고 각자 `connect()` 를 쓰지만(`stream_events`·`attach`),
+/// 목록을 한 곳에 둬 훗날 `request()` 로 합쳐져도 상한이 따라붙지 않게 한다.
+const RPC_STREAMING_METHODS: [&str; 2] = ["events.stream", "surface.attach"];
+
+/// 서버가 **응답 전에 의도적으로 대기**하는 메서드의 선언 대기값(초). None = 즉답 메서드.
+fn rpc_server_wait_secs(method: &str, params: &Value) -> Option<u64> {
+    // 둘 다 서버 기본값이 120(handlers.rs `param_u64(...).unwrap_or(120)`)이라 여기서도 120으로
+    // 맞춘다 — 클라이언트가 값을 안 실어도 서버 대기보다 짧게 자르지 않기 위함.
+    let declared = || {
+        params
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+    };
+    match method {
+        "surface.wait_for" => Some(declared()),
+        // `wait` 가 참일 때만 블로킹(거짓이면 즉시 pending 응답 — 즉답 메서드다).
+        "feed.push"
+            if params
+                .get("wait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false) =>
+        {
+            Some(declared())
+        }
+        _ => None,
+    }
+}
+
+/// 이 왕복에 걸 무진행 상한(None = 무제한).
+fn rpc_idle_timeout(method: &str, params: &Value) -> Option<std::time::Duration> {
+    rpc_idle_timeout_with(
+        method,
+        params,
+        cys::env_compat(ENV_RPC_TIMEOUT).as_deref(),
+    )
+}
+
+/// `rpc_idle_timeout` 의 순수 판정부 — env 를 인자로 받아 테스트가 프로세스 전역 env 를 흔들지
+/// 않게 한다(병렬 테스트 간 env 경합 = 계측기 자체가 불안정해지는 경로).
+fn rpc_idle_timeout_with(
+    method: &str,
+    params: &Value,
+    env_raw: Option<&str>,
+) -> Option<std::time::Duration> {
+    if RPC_STREAMING_METHODS.contains(&method) {
+        return None;
+    }
+    let base = match env_raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => return None, // 롤백: 상한 해제
+        Some(v) => v,
+        None => RPC_IDLE_TIMEOUT_SECS,
+    };
+    // 블로킹 메서드는 '서버 대기 + 마진'과 기본 상한 중 **큰 쪽**. env 로 기본을 낮춰도
+    // 정상 대기를 잘라 먹지 않는다(롤백 노브가 새 사망 경로를 열지 않게).
+    let secs = match rpc_server_wait_secs(method, params) {
+        Some(w) => w
+            .min(RPC_SERVER_WAIT_CAP_SECS)
+            .saturating_add(RPC_SERVER_WAIT_MARGIN_SECS)
+            .max(base),
+        None => base,
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// Windows `CancelIoEx` 로 취소된 동기 I/O 가 돌려주는 코드. unix errno 공간에 없는 값이라
+/// 플랫폼 게이트 없이 검사해도 오탐이 없다(이 판정을 mac 에서 시험할 수 있게 하는 이유).
+const WIN_ERROR_OPERATION_ABORTED: i32 = 995;
+
+/// 이 I/O 오류가 '상한 만료'인가 — unix 는 `SO_RCVTIMEO`/`SO_SNDTIMEO` 의 WouldBlock/TimedOut,
+/// Windows 는 워치독 `CancelIoEx` 가 만드는 ERROR_OPERATION_ABORTED(995).
+fn is_rpc_timeout_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) || e.raw_os_error() == Some(WIN_ERROR_OPERATION_ABORTED)
+}
+
+/// 상한 만료의 귀결 문안 — **조용한 실패 금지**. 무엇이 왜 끊겼는지와 다음 손동작까지 적는다.
+fn rpc_timeout_message(method: &str, waited: std::time::Duration) -> String {
+    format!(
+        "rpc_timeout: cysd 에 연결은 됐지만 '{method}' 응답이 {}초 동안 한 바이트도 오지 않았다(데몬 wedge 의심).\n\
+         처방 ① `cys ping` 으로 데몬 응답성을 확인한다.\n\
+         처방 ② `cys status --json` 으로 좌석 표가 나오는지 확인한다.\n\
+         처방 ③ 여전히 무응답이면 데몬을 재기동한다(macOS: `launchctl kickstart -k gui/$UID/com.cysjavis.cysd`,\n\
+         그 외: cysd 프로세스를 종료하면 다음 cys 명령이 자동 기동한다).\n\
+         처방 ④ 이 상한 자체가 문제라면 `{ENV_RPC_TIMEOUT}=<초>` 로 늘리거나 `0` 으로 해제한다(0 = 개정 전 무한 대기).",
+        waited.as_secs()
+    )
+}
+
+/// 무진행 워치독 — `timeout` 동안 `touch()` 가 없으면 `on_expire` 를 호출하고, **재장전해
+/// 감시를 계속한다**(1회 발화가 아니다 — `Drop` 까지 반복 가능하다).
+///
+/// ★문서-구현 정합(P2-2): 종전 문안은 "**한 번** 호출한다"였으나 구현은 `F: Fn()` 을 받아
+/// 만료마다 재장전한다(`RpcWatchdog::new` 루프의 `g.deadline = now + g.timeout` → `continue`).
+/// 그 재장전이 의도적 설계이고 이유는 `new` 의 주석에 있다 — 문서를 구현에 맞춘다.
+/// 호출 횟수 계약: **무진행 상한 1회분당 최대 1회**, `Drop`(=`stop`) 이후 0회.
+///
+/// Windows 전용 기구다(unix 는 커널 소켓 타임아웃이 같은 일을 한다). 다만 `cfg(test)` 에서도
+/// 컴파일해 **로직 자체는 mac CI 에서 검증**한다 — Windows 크로스 타입체크가 이 저장소에서
+/// 불가능(libsqlite3-sys 의 C 빌드가 호스트 툴체인으로 크로스되지 않음)하므로, 검증 불가한 부분을
+/// 취소 FFI 호출부(`CancelIoEx`/`CancelSynchronousIo`)로 최소화하는 것이 설계 의도다.
+#[cfg(any(windows, test))]
+struct RpcWatchdog {
+    state: std::sync::Arc<(std::sync::Mutex<WatchdogState>, std::sync::Condvar)>,
+    joiner: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(windows, test))]
+struct WatchdogState {
+    timeout: std::time::Duration,
+    deadline: std::time::Instant,
+    stop: bool,
+}
+
+#[cfg(any(windows, test))]
+impl RpcWatchdog {
+    /// `on_expire` 가 `FnOnce` 가 아니라 `Fn` 인 이유: 만료 후에도 **감시를 계속**한다.
+    /// 1회 발화 후 감시자가 죽으면, `touch()` 와 만료 판정이 미세하게 경합해 헛발화한 경우
+    /// (만료 직후 마이크로초 단위로 데이터가 도착) 그 뒤 왕복이 **무보호**로 남는다 —
+    /// 상한이 있는 척하는 상태가 상한이 없는 것보다 나쁘다. 재장전하며 계속 지키는 쪽을 택한다.
+    /// 대가는 그 헛발화 창(무진행 상한 1회분당 최대 1회)이며, 귀결은 명시적 rpc_timeout 오류다.
+    fn new<F: Fn() + Send + 'static>(timeout: std::time::Duration, on_expire: F) -> Self {
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new(WatchdogState {
+                timeout,
+                deadline: std::time::Instant::now() + timeout,
+                stop: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let shared = std::sync::Arc::clone(&state);
+        let joiner = std::thread::spawn(move || {
+            let (m, cv) = &*shared;
+            // 락 poison 관용(into_inner) — 이 저장소의 명시 정책. 감시자가 poison 으로 죽으면
+            // 상한이 조용히 사라진다(= 개정 전 무한 대기 부활)이라 관용이 안전측이다.
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if g.stop {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                if now >= g.deadline {
+                    // 재장전하고(다음 창을 계속 지킨다) 락을 놓은 뒤 발화한다 —
+                    // on_expire 안에서 touch() 가 불려도 교착하지 않는다.
+                    g.deadline = now + g.timeout;
+                    drop(g);
+                    on_expire();
+                    g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+                let wait = g.deadline - now;
+                let (next, _) = cv
+                    .wait_timeout(g, wait)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = next;
+            }
+        });
+        Self {
+            state,
+            joiner: Some(joiner),
+        }
+    }
+
+    /// 진행이 있었다 — 상한을 재장전한다.
+    fn touch(&self) {
+        let (m, cv) = &*self.state;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        g.deadline = std::time::Instant::now() + g.timeout;
+        drop(g);
+        cv.notify_all();
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for RpcWatchdog {
+    fn drop(&mut self) {
+        {
+            let (m, cv) = &*self.state;
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            g.stop = true;
+            drop(g);
+            cv.notify_all();
+        }
+        // ★join 필수: 감시자가 살아있는 채로 스트림이 닫히면 `CancelIoEx` 가 이미 닫힌(혹은
+        // 재사용된) 핸들에 나간다. 호출부는 스트림보다 **먼저** 이 값을 drop 해야 한다.
+        if let Some(j) = self.joiner.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// 한 왕복 동안 상한을 쥐고 있는 값 — drop 되면 상한이 풀린다(unix 는 소켓 옵션 원복 불요,
+/// Windows 는 감시 스레드 정지·join).
+struct RpcDeadline {
+    idle: Option<std::time::Duration>,
+    #[cfg(windows)]
+    watchdog: Option<RpcWatchdog>,
+}
+
+impl RpcDeadline {
+    /// unix: 커널 소켓 타임아웃이 곧 무진행 상한이다(매 read/write 마다 타이머가 새로 돈다 =
+    /// 진행 재장전이 커널에서 공짜로 된다).
+    #[cfg(unix)]
+    fn arm(stream: &ConnStream, idle: Option<std::time::Duration>) -> Result<Self, String> {
+        stream
+            .set_read_timeout(idle)
+            .map_err(|e| format!("set_read_timeout: {e}"))?;
+        stream
+            .set_write_timeout(idle)
+            .map_err(|e| format!("set_write_timeout: {e}"))?;
+        Ok(Self { idle })
+    }
+
+    /// Windows: named pipe 에는 `SO_RCVTIMEO` 대응물이 **없다**(`SetCommTimeouts` 는 통신 리소스=
+    /// 직렬포트 전용이라 파이프 핸들에 걸리지 않는다). 그래서 블록된 동기 `ReadFile`/`WriteFile` 을
+    /// **다른 스레드에서 깨우는** 두 API 를 함께 쏜다 — 이 저장소는 Windows 크로스 타입체크·실행이
+    /// 불가능하므로(호스트 툴체인이 libsqlite3-sys 의 C 를 크로스 빌드하지 못한다) "한쪽이 안 먹으면
+    /// 상한이 통째로 no-op" 인 배치를 피하는 것이 설계 의도다:
+    ///   ① `CancelIoEx(hFile, NULL)` — 그 **핸들**의 미처리 I/O 를 프로세스 내 어느 스레드가
+    ///      발행했든 취소한다(Vista+).
+    ///   ② `CancelSynchronousIo(hThread)` — **동기** I/O 취소의 정식 API. 대상 스레드는 이 왕복을
+    ///      실행 중인 호출 스레드다(arm 시점의 `GetCurrentThreadId`). 필요 권한은 THREAD_TERMINATE.
+    /// 취소된 호출은 ERROR_OPERATION_ABORTED(995)로 즉시 반환하고, 그 코드를
+    /// `is_rpc_timeout_error` 가 만료로 판정한다. 둘 다 '취소할 것이 없으면' ERROR_NOT_FOUND 로
+    /// 실패할 뿐 부작용이 없다.
+    ///
+    /// ★역할 분담(문서 근거 — Microsoft "Canceling Pending I/O Operations"): **동기** I/O 는
+    /// `CancelSynchronousIo`, **비동기(overlapped)** I/O 는 `CancelIoEx` 가 지목된 API 다. 여기서
+    /// 블록되는 것은 동기 `ReadFile`/`WriteFile` 이므로 ②가 정공법이고, ①은 그 파이프 핸들에
+    /// 걸린 미처리 I/O 를 함께 훑는 **헤지**다. "동기 I/O 를 밖에서 깨우는 수단이 `CancelIoEx`
+    /// 하나뿐" 이라는 단정은 사실이 아니며(그 단정은 이 코드가 ②를 함께 쏘는 이유도 설명하지
+    /// 못한다), 둘을 병행하는 이유는 "한쪽이 안 먹는 환경에서 상한이 통째로 no-op 이 되는 것"의
+    /// 회피다.
+    ///
+    /// ★★**Windows 실기 미검증**: 이 arm 은 이 저장소의 CI(mac/ubuntu)에서 **컴파일조차 되지
+    /// 않는다**. `windows_arm_is_not_a_noop_source_pin` 은 소스에 두 호출이 **문자열로 존재하는지**만
+    /// 확인할 뿐 동작을 확인하지 않는다 — 취소가 실제로 블록된 호출을 깨우는지, 995 가 실제로
+    /// 올라오는지는 Windows 실기 검증 전까지 **미확인**이다. 과장하지 않는다.
+    /// ★이 arm 은 no-op 이 아니다 — 구 `request_on_timeout` 의 Windows arm 이 바로 그 결함이었다.
+    #[cfg(windows)]
+    fn arm(stream: &ConnStream, idle: Option<std::time::Duration>) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThreadId, OpenThread, THREAD_TERMINATE,
+        };
+        use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo};
+        let Some(d) = idle else {
+            return Ok(Self {
+                idle,
+                watchdog: None,
+            });
+        };
+        // 원시 핸들·스레드 id 만 넘긴다(스트림 소유권과 무관한 정수). 감시자는 Drop 에서 join 되고,
+        // 호출부는 스트림보다 먼저 RpcDeadline 을 drop 하므로 닫힌 핸들에 호출되지 않는다.
+        let raw = stream.as_raw_handle() as isize;
+        // SAFETY: 인자 없는 순수 조회.
+        let tid = unsafe { GetCurrentThreadId() };
+        let watchdog = RpcWatchdog::new(d, move || unsafe {
+            // SAFETY: raw 는 살아있는 파이프 핸들(위 수명 논증). 반환값(BOOL)은 의도적으로 무시한다 —
+            // '취소할 I/O 없음'(ERROR_NOT_FOUND)은 정상 귀결이지 오류가 아니다.
+            CancelIoEx(raw as HANDLE, std::ptr::null());
+            let th = OpenThread(THREAD_TERMINATE, 0, tid);
+            if !th.is_null() {
+                CancelSynchronousIo(th);
+                CloseHandle(th);
+            }
+        });
+        Ok(Self {
+            idle,
+            watchdog: Some(watchdog),
+        })
+    }
+
+    /// 진행 재장전(Windows 만 실동작 — unix 는 커널이 알아서 한다).
+    fn touch(&self) {
+        #[cfg(windows)]
+        if let Some(w) = &self.watchdog {
+            w.touch();
+        }
+    }
+
+    fn idle(&self) -> std::time::Duration {
+        self.idle.unwrap_or_default()
+    }
+}
+
+/// 왕복 I/O 실패의 3분류 — 상한 만료는 처방 문안이 다르므로 다른 오류와 섞지 않는다.
+#[derive(Debug, PartialEq)]
+enum RpcIoFail {
+    Timeout,
+    Eof,
+    Io(String),
+}
+
+/// 개행까지 한 줄을 읽되 **진행이 있을 때마다 상한을 재장전**한다.
+/// `request()` 는 연결당 요청 1건이라 개행 뒤 잔여 바이트가 존재하지 않는다(단발 왕복 계약) —
+/// 그래서 개행 뒤를 버려도 손실이 없다. 줄 길이 상한은 두지 않는다(개정 전 `read_line` 과 동일:
+/// 새 실패 유형을 만들지 않는다).
+fn read_frame_line<R: Read>(reader: &mut R, dl: &RpcDeadline) -> Result<String, RpcIoFail> {
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Err(RpcIoFail::Eof),
+            Ok(n) => {
+                dl.touch(); // 진행 있음 → 재장전
+                if let Some(p) = buf[..n].iter().position(|&b| b == b'\n') {
+                    out.extend_from_slice(&buf[..p]);
+                    return Ok(String::from_utf8_lossy(&out).into_owned());
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            // ★순서 주의: 만료 판정이 Interrupted 재시도보다 **먼저** 와야 한다.
+            // Windows 의 ERROR_OPERATION_ABORTED(995)를 std 가 어떤 ErrorKind 로 접든(현행
+            // rustc 는 TimedOut 그룹) 여기서 먼저 걸린다. 뒤에 두면 995 가 Interrupted 로 접히는
+            // 순간 **무한 재시도**가 된다 — 워치독은 재장전돼도 이미 취소를 보냈고 읽기는 다시
+            // 블록되므로, 상한이 있는데도 영구 대기하는 최악의 형태가 된다.
+            Err(e) if is_rpc_timeout_error(&e) => return Err(RpcIoFail::Timeout),
+            // unix EINTR(errno 4)는 위 판정에 걸리지 않으므로 여기서 정상 재시도된다.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(RpcIoFail::Io(e.to_string())),
+        }
+    }
+}
+
+/// 상한이 장전된 스트림 위의 단발 왕복 본체 — `request()`·`request_on_timeout` 공용.
+fn rpc_roundtrip<S: Read + Write>(
+    stream: &mut S,
+    dl: &RpcDeadline,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_string(&req).unwrap();
     line.push('\n');
-    stream
-        .write_all(line.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
-    reader
-        .read_line(&mut resp_line)
-        .map_err(|e| e.to_string())?;
+    let write_err = |e: std::io::Error| -> String {
+        if is_rpc_timeout_error(&e) {
+            rpc_timeout_message(method, dl.idle())
+        } else {
+            e.to_string()
+        }
+    };
+    stream.write_all(line.as_bytes()).map_err(write_err)?;
+    stream.flush().map_err(write_err)?;
+    dl.touch(); // 요청 전송 완료 = 진행 → 응답 대기 상한을 새로 장전
+    let resp_line = read_frame_line(stream, dl).map_err(|f| match f {
+        RpcIoFail::Timeout => rpc_timeout_message(method, dl.idle()),
+        RpcIoFail::Eof => format!(
+            "cysd 가 '{method}' 응답 없이 연결을 끊었다(요청은 전달됐을 수 있다 — 비멱등 명령은 재시도 전 상태를 먼저 확인하라)."
+        ),
+        RpcIoFail::Io(m) => format!("{method}: {m}"),
+    })?;
     // T1-6: 디코더 대칭검증 — declared `_flen`/`_pv` 형제 메타가 있으면 트렁케이션/버전스큐를
     // 검출한다. additive 계약이라 반환은 top-level 응답 객체 그대로(아래 resp["ok"] 호환 유지).
     // 메타 없는 legacy peer 프레임은 graceful 수용. LenMismatch는 트렁케이션이므로 거부.
@@ -1882,6 +2265,20 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
             resp["error"]["message"].as_str().unwrap_or("unknown error")
         ))
     }
+}
+
+fn request(method: &str, params: Value) -> Result<Value, String> {
+    // ★선언 순서 = drop 순서의 역순. `deadline` 을 `stream` 뒤에 선언해야 감시자가 스트림보다
+    //   먼저 정지·join 된다(닫힌 핸들에 CancelIoEx 금지). 아래 명시 drop 은 그 계약의 이중 보증.
+    // ★상한은 **연결 성립 이후**의 왕복에만 건다. connect() 자체는 이미 자기 유계 경로다
+    //   (autostart 시 socket-ready 폴링 최대 4초 — `poll_socket_ready`). 최악 총소요는 그 4초 +
+    //   본 상한이며, 두 축을 하나로 합치지 않는 이유는 실패 원인이 다르기 때문이다
+    //   ('데몬이 없다' vs '데몬이 응답하지 않는다' — 처방이 갈린다).
+    let mut stream = connect()?;
+    let deadline = RpcDeadline::arm(&stream, rpc_idle_timeout(method, &params))?;
+    let out = rpc_roundtrip(&mut stream, &deadline, method, params);
+    drop(deadline);
+    out
 }
 
 // ---------- commands ----------
@@ -7087,17 +7484,108 @@ fn compose_directive(role: &str) -> Result<String, String> {
     Ok(directive)
 }
 
+/// 꼬리 줄이 **Windows 셸 프롬프트의 형태**인가 — `>` 종결자 전용 보강 판정.
+///
+/// 왜 `t.ends_with('>')` 하나로 끝내지 않는가: `>` 는 Unix 종결자 4종(`% $ # ❯`)과 달리
+/// 일반 본문에 흔하다(다이어그램 `-->`·화살표 함수 `=>`·태그 `<div>`·autolink `<https://…>`
+/// ·리다이렉션 `2>&1 >`). 무조건 종결자로 넣으면 **오탐이 늘고**, 오탐이 늘면 ready 선언이
+/// 줄어 `Err` → 롤백 close 가 늘어난다 = 건강한 pane 이 닫히는 방향. 그래서 `>` 는
+/// **프롬프트 형태(PS 접두 또는 드라이브 경로)와 AND** 로만 참이 된다.
+/// 형태 근거는 실측 캡처다: `PS C:\Users\cys-macbook>`(docs/plans/2026-07-29-win-two-defects-plan.md:319-323)
+/// · `PS C:\WINDOWS\system32\WindowsPowerShell\v1.0>`(Parallels VM master pane 실화면).
+///
+/// ★이 술어 자신에는 `cfg(windows)` 를 두지 않는다 — 순수 형태 판정이라 진리표를 전 OS 에서
+/// 돌릴 수 있어야 한다. **OS 게이트는 호출부**(`screen_tail_is_shell_prompt_on`)에 있다:
+/// mac/Linux pane 의 워커가 Windows 안내문(`PS C:\Users\x>`)을 마지막 비공백 줄로 출력하면
+/// 건강한 pane 이 '죽은 셸' 로 오판돼 롤백 close 대상이 되기 때문이다(U-9 × 호출부 상호작용).
+fn windows_shell_prompt_shape(t: &str) -> bool {
+    let Some(body) = t.strip_suffix('>') else {
+        return false;
+    };
+    // ① PowerShell: `PS <위치>>` — 파일시스템/레지스트리/Env 공급자 공통, 축약 `PS>` 포함.
+    //    연속행 프롬프트 `PS C:\x>>` 도 body 가 `PS …>` 라 여기서 참이 된다(프롬프트 맞다).
+    if body == "PS" || body.starts_with("PS ") {
+        return true;
+    }
+    // ② cmd.exe: `<드라이브문자>:\<경로>>` — `C:\>` · `C:\Users\x>` · `D:\work\cys>`.
+    //    콜론+역슬래시까지 요구해 "3 > 2 이므로 a > b>" 류 산문을 배제한다.
+    let mut it = body.chars();
+    matches!(
+        (it.next(), it.next(), it.next()),
+        (Some(d), Some(':'), Some('\\')) if d.is_ascii_alphabetic()
+    )
+}
+
 /// 화면 마지막 비공백 줄이 셸 프롬프트로 끝나는지 판정 — marker 없는 에이전트의 시간 폴백
 /// 직전 검사다. TUI가 떴다면 끝줄이 셸 프롬프트일 수 없다; 셸 프롬프트가 남아 있으면
 /// 에이전트가 조용히 즉시 종료(에러 문구 없이)한 것이므로 주입하면 zsh로 들어간다.
+///
+/// 실행 플랫폼은 `cfg!(windows)` 로 정해지며, 실동작은 전부 `_on` 에 있다(진리표가 전 OS 에서
+/// 두 축을 모두 돌릴 수 있게 — 테스트 가능성 손실 0).
 fn screen_tail_is_shell_prompt(text: &str) -> bool {
+    screen_tail_is_shell_prompt_on(text, cfg!(windows))
+}
+
+/// `screen_tail_is_shell_prompt` 의 순수 본체 — `windows` 는 "이 pane 이 Windows 셸 위에서
+/// 도는가"다.
+///
+/// ★왜 Windows 축을 OS 로 가두는가(P1-5): `windows_shell_prompt_shape` 는 화면 **텍스트**만
+/// 본다. mac/Linux pane 에서 워커가 Windows 안내문(`PS C:\Users\x>` · `C:\Users\x>`)을 출력하고
+/// 그게 마지막 비공백 줄이 되면, 살아있는 TUI 가 없는 것도 아닌데 '죽은 셸' 로 판정돼
+/// **건강한 pane 이 close 대상**이 된다. 형태 요건이 Windows 고유라 해도 그건 *프롬프트의*
+/// 고유성이지 *화면 텍스트의* 고유성이 아니다 — 유닉스 pane 은 남의 프롬프트 문자열을
+/// 얼마든지 그릴 수 있다. 그래서 판정은 "형태 ∧ 실제 Windows" 로만 참이 된다.
+/// Unix 종결자 4종(`% $ # ❯`)은 게이트하지 않는다: Windows 콘솔에도 git-bash·WSL 프롬프트가
+/// 뜰 수 있어 가두면 그쪽에서 오부정(죽은 셸에 주입)이 생긴다 — 위험 방향이 반대다.
+fn screen_tail_is_shell_prompt_on(text: &str, windows: bool) -> bool {
     let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
         return false; // 화면 비어 있음 — 판단 보류(시간 폴백 유지)
     };
     let t = last.trim_end();
     // zsh "...%" / bash·sh "...$" / root "#" / powerlevel10k·starship "❯" —
     // 끝문자 기준(프롬프트 커스텀의 공통 꼬리). 오탐 효과는 '대기 후 명시 Err'(안전측).
-    t.ends_with('%') || t.ends_with('$') || t.ends_with('#') || t.ends_with('❯')
+    // Windows(PowerShell `PS C:\…>` · cmd `C:\>`)는 `>` 로 끝나므로 형태 요건과 함께 추가한다
+    // (T-D4 / F4-cys-boot-launch-06 — 이게 빠져 Windows 에서 marker 없는 어댑터의 시간 폴백이
+    // 죽은 PowerShell 을 ready 로 선언하고 54KB 디렉티브를 셸 명령으로 제출했다).
+    // 판정 축은 그대로다 — '마지막 비공백 줄의 끝문자' 규칙을 유지한 채 종결자만 늘렸다.
+    t.ends_with('%')
+        || t.ends_with('$')
+        || t.ends_with('#')
+        || t.ends_with('❯')
+        || (windows && windows_shell_prompt_shape(t))
+}
+
+/// readiness **안전 밸브**의 순수 판정부 — "화면 검사를 건너뛰고 ready 를 선언해도 되는가".
+///
+/// 【고친 결함 P1-1(치명) — U-5 × U-9 상호작용】 종전 조건은 `agent_alive` **단독**이었다.
+/// U-5 가 `cmdline_matches_agent` 의 입력을 `name()` 한 토큰에서 **자손 전체 argv** 로 승격시키자,
+/// 그 매처의 의도적 넓이(governance.rs `cmdline_matches_agent` 주석 — "false-negative(오살)가
+/// false-positive 보다 훨씬 위험하므로 매칭을 넓힌다")가 비로소 **발현**됐다. 그 결과:
+///   · Windows 트리 `powershell → cmd.exe(…\claude-2.cmd) → claude.exe` 에서 claude.exe 가 즉사하고
+///     래퍼 `cmd.exe /c …\claude-2.cmd` 만 남은 틱 → 래퍼 argv 의 `claude-2.cmd` 토큰이 basename
+///     일치 → `agent_alive=true` → agent_meta 는 기동 send 직후 이미 등록(①a) → 안전 밸브 발화 →
+///     **54KB 디렉티브가 맨 PowerShell 에 제출된다.**
+///   · 유닉스 등가: 좌석 자손에 `sh -c 'claude …'` 래퍼나 `vim ~/dev/claude/x.md` 가 있으면
+///     에이전트 사망이 그대로 은폐된다.
+/// 즉 U-5 는 `alive` 의 **참을 늘리는** 동시에 **거짓도 늘렸고**, 안전 밸브는 그 거짓을 걸러낼
+/// 두 번째 근거가 없었다.
+///
+/// 【수리】 `alive ∧ ¬화면꼬리가_셸프롬프트`. U-9 술어를 재사용해 두 단위가 서로를 무너뜨리는
+/// 대신 서로를 보강하게 만든다 — 래퍼가 에이전트보다 오래 살아 `alive` 가 참이어도, 그 순간
+/// 화면 꼬리는 셸 프롬프트이므로(에이전트 TUI 가 없다) 밸브가 닫힌다.
+///
+/// 【이 AND 가 안전 밸브의 존재 이유를 훼손하지 않는가】 훼손하지 않는다. 밸브의 목적은
+/// "델타에 `❯` 가 안 실리는 TUI 에서 readiness 가 **영구 오부정**이 되는 것"의 차단인데,
+/// 그런 TUI 는 정의상 화면을 그리고 있어 꼬리가 셸 프롬프트가 **아니다**(진리표 ⑤ 마지막 항이
+/// 그 사실을 박제한다). 밸브가 닫히는 유일한 경우는 "에이전트 프로세스는 관측되는데 화면은
+/// 맨 셸" — 그건 정확히 오주입해서는 안 되는 상태다.
+fn readiness_safety_valve(agent_alive: bool, screen: &str) -> bool {
+    readiness_safety_valve_on(agent_alive, screen, cfg!(windows))
+}
+
+/// `readiness_safety_valve` 의 순수 본체(플랫폼을 인자로 — 진리표가 Windows 축도 mac 에서 돈다).
+fn readiness_safety_valve_on(agent_alive: bool, screen: &str, windows: bool) -> bool {
+    agent_alive && !screen_tail_is_shell_prompt_on(screen, windows)
 }
 
 /// 기동 화면(공백 제거 평탄화 문자열)에 "명령을 못 찾았다"는 셸 오류가 떴는지 판정.
@@ -7501,26 +7989,50 @@ fn boot_agent_on_surface(
         //   ★B4 를 되돌리지 않는다: 기동에 **실패한** 에이전트는 자손 프로세스가 없어 agent_alive 가
         //   참이 되지 않는다 → 잔존 ❯ 만으로는 절대 ready 가 되지 않는다(오탐 방향 무변).
         //   agent_meta 는 기동 send 직후 등록되므로(①a) watchdog 첫 틱(≤5s) 뒤부터 참이 될 수 있다.
+        //   ★P1-1(치명·U-5 × U-9): `alive` **단독**으로는 부족하다. argv 승격 이후 넓은 생존 매처가
+        //   래퍼(`cmd.exe /c …\claude-2.cmd`·`sh -c 'claude …'`)까지 생존 증거로 세므로, 에이전트가
+        //   즉사하고 래퍼만 남은 틱에 밸브가 잘못 발화해 디렉티브를 맨 셸에 제출한다. 그래서
+        //   `readiness_safety_valve` 가 U-9 화면 꼬리 술어와 AND 를 건다(판정부 주석에 근거 전문).
         if !ready {
             let alive = fetch_surfaces()
                 .into_iter()
                 .find(|s| s["surface_id"].as_u64() == Some(sid))
                 .map(|s| s["agent_alive"].as_bool().unwrap_or(false))
                 .unwrap_or(false);
-            if alive {
+            if readiness_safety_valve(alive, text) {
                 eprintln!(
-                    "[launch-agent] ready(안전 밸브): 데몬이 agent 프로세스 생존을 관측 — \
-                     화면 텍스트와 무관한 커널 사실이므로 주입 안전"
+                    "[launch-agent] ready(안전 밸브): 데몬이 agent 프로세스 생존을 관측 + \
+                     화면 꼬리가 셸 프롬프트 아님 — 주입 안전"
                 );
                 ready = true;
                 break;
             }
+            if alive {
+                eprintln!(
+                    "[launch-agent] 안전 밸브 보류: agent 생존은 관측되나 화면 꼬리가 셸 프롬프트 \
+                     — 래퍼만 살아있는 사망 은폐 의심(주입 금지)"
+                );
+            }
         }
         // ③ ready 판정 — **마커 분기도 델타 우선 + screen_tail_is_shell_prompt 가드**를 받는다.
+        //
+        // ★정정(2026-08-23 실측 · 종전 서술 "신규 출현분에 마커 = 잔존 ❯ 오탐이 원리상 불가능한
+        //   유일한 판정" 은 반증됐다): 델타 우선이 배제하는 것은 **잔존** ❯ 뿐이다. 기동 직후에
+        //   *새로* 그려지는 ❯ 는 그대로 델타에 실린다.
+        //   측정(macOS · Claude Code 2.1.241 · 격리 CLAUDE_CONFIG_DIR PTY 캡처 · Windows 는
+        //   Parallels 실기 화면): 첫기동 관문 화면 전부가 선택지 커서로 `❯` 를 그린다 —
+        //   테마 선택 / 로그인 방식 선택 / 폴더 신뢰 / Bypass 면책 / "Try the new fullscreen
+        //   renderer?"(벤더 신기능 안내). 이 화면들은 기동 직후 첫 출력이므로 델타에 실리고,
+        //   그래서 `.claude.json` 이 없는 프로필에서는 이 분기가 **관문 화면을 ready 로 선언**해
+        //   디렉티브가 선택기에 붙여넣어진다(현재 이 맥의 `~/.cys/claude` 가 그 상태 —
+        //   `.claude.json` 부재 → 테마 마법사부터 뜬다).
+        //   델타 우선 규칙은 유지한다(잔존 오탐 차단분은 여전히 유효하고, 개수 비교로 되돌리면
+        //   영구 오부정 회귀다). 관문 화면 배제는 이 축이 아니라 관문 코퍼스 축의 수리다.
         match &ready_marker {
             Some(m) => {
                 if delta_text.contains(m.as_str()) {
-                    // 신규 출현분에 마커 — 잔존 ❯ 오탐이 원리상 불가능한 유일한 판정.
+                    // 신규 출현분에 마커 — **잔존** 화면의 ❯ 는 배제된다(위 ★정정 참조:
+                    // 배제되는 것은 잔존 ❯ 뿐이고, 관문 화면이 새로 그리는 ❯ 는 통과한다).
                     ready = true;
                     break;
                 }
@@ -7793,10 +8305,13 @@ fn run_surface_role() -> i32 {
     // (role-capability-gate·role-bootstrap)은 빈 줄을 '미claim'으로 읽어, **데몬이 죽은 상황을
     // '빈 좌석'으로 오독**하고 부트 발화를 통과시켰다. 이제 ⓒ는 **exit 2 + stderr 진단**이다.
     //
-    // ★request() 전역 기본 데드라인은 **바꾸지 않는다**(금지 방향 ④): request()는 93개 호출부의
-    //   공용 경로이고, 그중 `feed push --wait` 는 오너 승인을 데몬 응답 보류로 구현한다 —
-    //   전역 데드라인은 CEO 승격 동의 채널을 끊는다. 그래서 **이 경로 한정**으로 기존 유틸
-    //   `request_on_timeout` 을 쓴다(신규 데드라인 메커니즘 도입 0).
+    // ★[U-6 로 개정된 서술] 종전 이 주석은 "request() 전역 데드라인은 바꾸지 않는다 — `feed push
+    //   --wait` 가 오너 승인을 데몬 응답 보류로 구현하므로 전역 데드라인이 CEO 승격 동의 채널을
+    //   끊는다"였다. 그 위험 자체는 참이었고, U-6 은 전역 상한을 넣되 **블로킹 메서드를 상한에서
+    //   파생 처리**해 그 채널을 보존한다(`rpc_server_wait_secs`: `feed.push` wait=true ·
+    //   `surface.wait_for` 는 선언 `timeout_secs` + 마진). 그래도 이 경로는 계속
+    //   `request_on_timeout` 을 쓴다 — 훅이 사람의 프롬프트 앞에서 기다릴 수 있는 시간은
+    //   전역 기본(40s)보다 훨씬 짧아야 하고(아래 10s), 그 짧음은 **이 경로 고유의 요건**이다.
     let Some(my_sid) = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)) else {
         // surface env 부재 = pane 밖 실행. 판정 불가가 아니라 '이 프로세스에 surface 가 없다'는
         // 확정 사실이므로 종전대로 빈 줄 + exit 0(훅이 deny 측 안전 판정을 하게 둔다).
@@ -8605,35 +9120,30 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
     rpc_over(stream, method, params)
 }
 
-/// request_on의 타임아웃판 — connect 후 read/write 타임아웃을 강제한다. drain --verify fan-out은
+/// request_on의 타임아웃판 — connect 후 read/write 상한을 강제한다. drain --verify fan-out은
 /// hung 소켓(데몬이 accept 후 무응답)에서 request_on의 무타임아웃 read가 영구 정지[A1-F2]하므로 필수.
-#[cfg(unix)]
+///
+/// ★U-6: 종전 Windows arm 은 `request_on` 위임 = **no-op** 이었다(파이프에는 상한이 아예 없었다).
+/// 지금은 두 플랫폼이 같은 기구(`RpcDeadline` — unix 는 소켓 타임아웃, Windows 는 `CancelIoEx`
+/// 워치독)를 쓰므로 cfg 분기 자체가 사라졌다. 상한 의미는 `request()` 와 동일한 **무진행 구간**이다.
 fn request_on_timeout(
     socket: &std::path::Path,
     method: &str,
     params: Value,
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
-    let stream = std::os::unix::net::UnixStream::connect(socket)
+    // 연결 자체는 종전 경로 유지(unix=UnixStream::connect · windows=busy-retry open).
+    #[cfg(unix)]
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
         .map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    rpc_over(stream, method, params)
-}
-#[cfg(windows)]
-fn request_on_timeout(
-    socket: &std::path::Path,
-    method: &str,
-    params: Value,
-    _timeout: std::time::Duration,
-) -> Result<Value, String> {
-    // Windows named pipe read 타임아웃은 별도 API(SetCommTimeouts/OVERLAPPED)라 현 1차 플랫폼(darwin/unix)
-    // 밖. busy-retry 경로(request_on)로 위임한다 — hung 방어는 unix에서 완전(범위 한정).
-    request_on(socket, method, params)
+    #[cfg(windows)]
+    let mut stream =
+        open_pipe_busy_retry(socket).map_err(|e| format!("open {}: {e}", socket.display()))?;
+    // 선언 순서 주의 — deadline 이 stream 보다 먼저 drop 돼야 한다(request() 와 동일 계약).
+    let deadline = RpcDeadline::arm(&stream, Some(timeout))?;
+    let out = rpc_roundtrip(&mut stream, &deadline, method, params);
+    drop(deadline);
+    out
 }
 
 // ============================ drain --verify (기능 1) ============================
@@ -12487,6 +12997,7 @@ fn fetch_remote_pack(manifest_url: &str, base: &std::path::Path) -> Result<std::
 /// 종료 시 그룹 전체를 강제 종료하여 서버가 절대 누적되지 않게 한다.
 /// 자식의 종료 코드를 그대로 반환한다 (시그널 사망 = 128+signo).
 fn run_scoped(surface: Option<String>, command: Vec<String>) -> Result<i32, String> {
+    use cys::SpawnPolicy;
     if command.is_empty() {
         return Err("no command given".into());
     }
@@ -12500,16 +13011,15 @@ fn run_scoped(surface: Option<String>, command: Vec<String>) -> Result<i32, Stri
     // 팩토리를 못 쓰므로 같은 상수를 직접 소비한다(규약 산재 아님 · 정본 = lib.rs
     // ENV_PY_NO_BYTECODE). python 이 아닌 자식에겐 무해한 무시 변수다.
     cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    // ★U-7: 등급 `ConsoleScoped` — unix 는 setsid 로 떼고(아래 SIGINT/SIGTERM/SIGHUP 핸들러가
+    // killpg 로 회수한다), **Windows 는 일부러 떼지 않는다**. 근거는 회수 수단의 비대칭이다:
+    // 이 함수의 kill_group 은 `child.wait()` 이 돌아온 **뒤에만** 실행되는데, Windows 에는
+    // 대응하는 콘솔 컨트롤 핸들러가 없어 CLI 가 Ctrl-C 로 죽으면 그 지점에 영영 도달하지
+    // 못한다. 지금은 자식이 같은 콘솔 그룹에 있어 Ctrl-C 가 자식에게도 전파되는 것이 유일한
+    // 안전망이다 — 회수 수단 없는 분리는 개선이 아니라 **영구 고아**(자원 누적)다.
+    // `CREATE_NO_WINDOW` 도 금지: 사용자가 실행을 요청한 명령의 출력을 가린다.
+    // (Windows 콘솔 핸들러가 생기면 이 등급을 GroupScoped 로 올린다 — 그 전엔 아니다.)
+    cmd.spawn_policy(cys::ChildLifetime::ConsoleScoped);
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let pid = child.id();
     let pgid = pid as i64; // setsid → pgid == pid (unix); ignored on windows
@@ -14904,6 +15414,245 @@ mod tests {
         assert!(!screen_shows_launch_failure(&flatten_ws("")));
     }
 
+    /// U-9 · `screen_tail_is_shell_prompt` 진리표 (T-D4 / F4-cys-boot-launch-06)
+    ///
+    /// 이 술어는 "화면 꼬리가 셸 프롬프트인가"를 판정해, 에이전트 TUI가 안 떴는데
+    /// 54KB 역할 디렉티브를 맨 셸에 오주입하는 것을 막는다(marker 없는 어댑터의
+    /// 시간 폴백 직전 검사 · `:7547`). Windows 프롬프트(`PS C:\…>` · `C:\>`)가 `>`로
+    /// 끝나는데 종결자 집합에 `>`가 없어 Windows에서 이 가드가 무력화됐다.
+    ///
+    /// **왜 진리표인가**: `>`를 무조건 종결자로 넣으면 본문 오탐(다이어그램 화살표
+    /// `-->` · 화살표 함수 `=>` · 태그 `<div>` · autolink `<https://…>`)이 늘고,
+    /// 오탐이 늘면 ready 선언이 줄어 `Err` → 롤백 close 가 늘어난다(U-11 미착지 상태에서는
+    /// 건강한 pane 이 닫히는 방향 = 치명위험 ④). 그래서 `>` 는 **Windows 프롬프트 형태
+    /// 요구와 AND** 로만 참이 되며, 아래 음성 축이 그 사실을 기계로 박제한다.
+    #[test]
+    fn screen_tail_truth_table() {
+        // ── ① Unix 양성: 기존 4종 종결자 계약 박제(제로 회귀) ──────────────────
+        // bash·sh
+        assert!(screen_tail_is_shell_prompt("user@host:~/dev$"));
+        assert!(screen_tail_is_shell_prompt("user@host:~/dev$ ")); // trim_end 후 판정
+        // zsh
+        assert!(screen_tail_is_shell_prompt("cys-macbook@Mac cys-terminal-rel %"));
+        // root
+        assert!(screen_tail_is_shell_prompt("root@box:/#"));
+        // powerlevel10k · starship (H-PRED-8 ⓔ 핀 — 이 항이 사라지면 claude 잔존 ❯ 오탐 차단이 뚫린다)
+        assert!(screen_tail_is_shell_prompt("❯"));
+        assert!(screen_tail_is_shell_prompt("~/dev/cys-terminal-rel ❯ "));
+
+        // ── ② Unix 음성: 본문에 종결자 문자가 있어도 '끝문자'가 아니면 거짓 ─────
+        // '마지막 비공백 줄의 끝문자' 규칙이 본문 오탐을 막는 유일한 장치다.
+        assert!(!screen_tail_is_shell_prompt("export PATH=$HOME/.cargo/bin:$PATH 적용됨"));
+        assert!(!screen_tail_is_shell_prompt("비용은 $12 이고 점유율은 40% 였다"));
+        assert!(!screen_tail_is_shell_prompt("# 제목입니다"));
+        assert!(!screen_tail_is_shell_prompt("Welcome to Claude Code"));
+
+        // ── ③ Windows 양성: 이번 수정으로 새로 잡혀야 하는 축 ──────────────────
+        // ★P1-5 핀 이사: Windows 축은 이제 **`windows=true` 인자**로 돈다(술어 자체는 무cfg 라
+        //   진리표 전항이 mac CI 에서 그대로 돌아간다 — 항 하나도 지우지 않았고 값도 그대로다).
+        //   `win(t)` = "Windows pane 이라면 셸 프롬프트로 판정하는가".
+        let win = |t: &str| screen_tail_is_shell_prompt_on(t, true);
+        // PowerShell 기본 프롬프트(실측 화면 · docs/plans/2026-07-29-win-two-defects-plan.md:319-323)
+        assert!(
+            win("PS C:\\Users\\cys-macbook> "),
+            "PowerShell 기본 프롬프트를 셸 프롬프트로 인식하지 못함(F4-cys-boot-launch-06)"
+        );
+        // 실측 캡처 — Parallels VM master pane(PROBE_RESULTS_WINDOWS.md WIN-2)
+        assert!(win("PS C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0>"));
+        // PowerShell 비파일시스템 공급자(레지스트리·Env 드라이브)
+        assert!(win("PS HKLM:\\SOFTWARE>"));
+        // 극단 축약 프롬프트(`function prompt { \"PS>\" }`)
+        assert!(win("PS>"));
+        // PowerShell 연속행 프롬프트도 프롬프트다
+        assert!(win("PS C:\\Users\\x>>"));
+        // cmd.exe — 드라이브 루트 / 하위 경로
+        assert!(win("C:\\>"), "cmd.exe 드라이브 루트 프롬프트를 인식하지 못함");
+        assert!(win("C:\\Users\\cys-macbook>"));
+        assert!(win("D:\\work\\cys>"));
+
+        // ── ③′ ★P1-5 신설 축: **유닉스 pane 에서는 같은 텍스트가 프롬프트가 아니다** ─────
+        // mac/Linux 워커가 Windows 안내문을 마지막 줄로 출력하는 것만으로 건강한 pane 이
+        // 롤백 close 대상이 되던 결함(호출부 OS 게이트 부재)의 회귀 박제다.
+        // 수정 전 코드에서는 아래 전항이 **참**이었다 → 이 축이 곧 적색 증명이다.
+        let nix = |t: &str| screen_tail_is_shell_prompt_on(t, false);
+        for t in [
+            "PS C:\\Users\\cys-macbook> ",
+            "PS C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0>",
+            "PS HKLM:\\SOFTWARE>",
+            "PS>",
+            "PS C:\\Users\\x>>",
+            "C:\\>",
+            "C:\\Users\\cys-macbook>",
+            "D:\\work\\cys>",
+        ] {
+            assert!(
+                !nix(t),
+                "유닉스 pane 의 Windows 안내문이 셸 프롬프트로 오판됐다(건강 pane close 방향): {t}"
+            );
+        }
+        // 반대로 Unix 종결자 4종은 **게이트하지 않는다** — Windows 콘솔의 git-bash·WSL 프롬프트에
+        // 주입하는 오부정을 만들지 않기 위함(위험 방향이 반대라 대칭으로 가두지 않는다).
+        assert!(win("user@host:~/dev$"));
+        assert!(win("~/dev ❯"));
+
+        // ── ④ Windows 음성(★핵심 증명): `>` 로 끝나도 프롬프트 형태가 아니면 거짓 ──
+        // 이 축이 전부 거짓이어야 "`>` 추가가 오탐을 늘리지 않는다"가 성립한다.
+        // ★`win(…)`(=windows 축이 켜진 상태)으로 시험한다 — `false` 로 돌리면 게이트가 먼저
+        //   잘라 전항이 공허하게 통과하고 이 증명이 죽는다(핀 약화 금지).
+        // mermaid·ASCII 다이어그램 화살표
+        assert!(!win("graph TD; A --> B; B -->"));
+        assert!(!win("입력 -> 판정 ->"));
+        // JS 화살표 함수 · 제네릭 · JSX 태그
+        assert!(!win("const handler = () =>"));
+        assert!(!win("let v: Vec<Box<dyn Fn()>>"));
+        assert!(!win("return <div>"));
+        // 마크다운 autolink · HTML 조각
+        assert!(!win("자세히는 <https://example.com/docs>"));
+        // 리다이렉션만 남은 조각 / 맨 꺾쇠 — 형태 요건(경로·PS 접두) 미충족
+        assert!(!win(">"));
+        assert!(!win(">>"));
+        assert!(!win("cargo build 2>&1 >"));
+        // 마크다운 인용문 — `>` 는 **선두**라 끝문자 규칙에 애초에 걸리지 않는다
+        assert!(!win("> 인용문 한 줄"));
+        assert!(!win("> 관문 목록은 5종이 아니라 6종이다"));
+        // 드라이브 문자 형태를 흉내 낸 산문(콜론 뒤가 역슬래시가 아니다)
+        assert!(!win("Note: 1 < 2 이고 3 > 2 이므로 a > b>"));
+        // 프롬프트 뒤에 명령이 타이핑된 줄 — 꼬리가 `>` 가 아니므로 거짓(끝문자 규칙 유지)
+        assert!(!win("PS C:\\Users\\x> claude --dangerously-skip-permissions"));
+
+        // ── ⑤ 경계: 빈 화면 · 공백만 · 여러 줄 꼬리 ────────────────────────────
+        // 화면이 비면 '판단 보류'(false) — 시간 폴백을 유지한다. 이 기본값을 바꾸면
+        // 폴링 첫 틱에서 전 좌석이 보류로 떨어진다.
+        assert!(!screen_tail_is_shell_prompt(""));
+        assert!(!screen_tail_is_shell_prompt("   \n\t\n  \n"));
+        // 여러 줄: 마지막 '비공백' 줄이 판정 대상이다(뒤따르는 공백 줄 무시)
+        assert!(win(
+            "Microsoft Windows [Version 10.0.26100]\n(c) Microsoft Corporation.\n\nC:\\Users\\x>\n\n   \n"
+        ));
+        assert!(win(
+            "PS C:\\Users\\x> codex --dangerously-bypass-approvals-and-sandbox\n\
+             codex : 용어 'codex'이(가) cmdlet, 함수, 스크립트 파일 이름으로 인식되지 않습니다.\n\
+             PS C:\\Users\\x>"
+        ));
+        // 살아있는 TUI 화면의 꼬리는 프롬프트가 아니다(주입 허용 방향 — 오부정 방지 핀).
+        // ★P1-1 이 안전 밸브를 이 술어와 AND 로 묶었으므로 이 항은 "밸브가 살아있는 TUI 를
+        //   막지 않는다"의 근거이기도 하다 — 양 축(win/nix) 모두에서 거짓이어야 한다.
+        let live_tui = "PS C:\\Users\\x> claude --dangerously-skip-permissions\n\
+             ─ Claude Code ─\n\
+             Try the new fullscreen renderer?\n\
+             Enter to confirm · Esc to cancel";
+        assert!(!win(live_tui));
+        assert!(!nix(live_tui));
+
+        // ── ⑥ 알려진 미탐(의도적 보수) — 넓히지 않았음을 박제한다 ──────────────
+        // 아래는 '진짜 Windows 프롬프트인데 거짓' 인 축이다. 잡으려면 형태 요건을
+        // 느슨히 해야 하고, 그러면 ④ 의 본문 오탐이 되살아난다. 실패 귀결이
+        // '롤백 close' 인 현 상태(U-11 미착지)에서 오탐 비용 > 미탐 비용이므로
+        // **의도적으로 미탐을 남긴다**. U-11 착지 후 재평가 대상.
+        // ⓐ oh-my-posh 등 커스텀 테마: `PS` 접두도 드라이브 경로도 없이 `>` 로 끝난다
+        assert!(!win("~\\dev\\cys [main] >"));
+        // ⓑ PowerShell 연속행 프롬프트가 단독 줄로 남은 경우
+        assert!(!win(">>"));
+        // ⓒ cmd 연속행 프롬프트 `More? ` — `>` 로 끝나지도 않는다
+        assert!(!win("More? "));
+        // 이 미탐들은 '보류 실패' 가 아니라 '종전과 동일'(개정 전에도 전부 거짓)이라
+        // 회귀가 아니다 — 개정이 오직 참을 **늘리기만** 했음을 뜻한다.
+    }
+
+    /// ★P1-1(치명) 회귀 박제 — **U-5 argv 승격이 '거짓'도 늘렸다**는 사실의 검체.
+    ///
+    /// 【기존 검체가 증명하지 못한 것】 `live_argv_promotion_flips_agent_predicates_*`
+    /// (governance.rs)는 "승격이 **참**을 늘린다"만 증명한다. 넓은 생존 매처
+    /// (`cmdline_matches_agent` — "오살이 오탐보다 훨씬 위험하므로 매칭을 넓힌다")에 자손 전체
+    /// argv 를 먹이면 **에이전트가 아닌 프로세스**도 생존 증거가 된다는 반대 방향은 무검체였다.
+    ///
+    /// 【재현 시나리오(리뷰어 A)】 Windows 트리 `powershell → cmd.exe(…\claude-2.cmd) → claude.exe`
+    /// 에서 claude.exe 가 즉사하고 래퍼만 남은 틱. 래퍼 argv 가 생존 매처에 걸린다는 사실은
+    /// governance.rs `cmdline_matches_agent_normalizes_windows_exec_extensions` 가 이미 박제하고
+    /// 있다(`cmd.exe /c …\claude-2.cmd …` × `claude-2` → true). 그래서 `agent_alive=true` 이고,
+    /// agent_meta 는 기동 send 직후 등록되므로(①a) 종전 조건(`alive` 단독)이면 **밸브가 발화해
+    /// 54KB 디렉티브가 맨 PowerShell 에 제출된다.**
+    ///
+    /// 【적색 증명(in-band)】 아래 ①' 가 `alive == true` 임을 같은 검체에서 못 박는다. 즉
+    /// 종전 조건(`alive` 단독)을 되돌리면 ① 단언이 그대로 적색이 된다 — 판정 축을 옮긴 것이
+    /// 아니라 **같은 밸브에 두 번째 근거를 AND 로 붙인 것**임이 이 대칭 단언으로 드러난다.
+    #[test]
+    fn safety_valve_does_not_fire_when_only_a_wrapper_outlives_the_agent() {
+        // 죽은 에이전트 + 살아있는 래퍼 → 데몬이 관측하는 agent_alive 는 참이다.
+        let alive = true;
+        // ①' 적색 증명의 좌변: 종전 조건은 이 값 하나였다.
+        assert!(alive, "드릴 전제 붕괴: 래퍼 생존으로 alive 가 참이어야 한다");
+
+        // ① Windows — 에이전트 즉사 후 화면에 남은 것은 PowerShell 프롬프트뿐.
+        let win_dead = "PS C:\\Users\\x> claude-2.cmd --dangerously-skip-permissions\n\
+                        PS C:\\Users\\x>";
+        assert!(
+            !readiness_safety_valve_on(alive, win_dead, true),
+            "래퍼만 살아있고 화면은 맨 PowerShell 인데 ready 를 선언했다 — 54KB 디렉티브 오주입 경로"
+        );
+        // cmd.exe 계열도 같다
+        assert!(!readiness_safety_valve_on(
+            alive,
+            "Microsoft Windows [Version 10.0.26100]\nC:\\Users\\x>",
+            true
+        ));
+
+        // ② 유닉스 등가 — 좌석 자손의 `sh -c 'claude …'` 래퍼·`vim ~/dev/claude/x.md` 가
+        //    사망을 은폐하는 경우. 종결자 4종은 OS 게이트 밖이라 양 축 모두에서 막혀야 한다.
+        for shell_tail in [
+            "cys-macbook@Mac cys-terminal-rel %",
+            "user@host:~/dev$",
+            "root@box:/#",
+            "~/dev/cys-terminal-rel ❯ ",
+        ] {
+            assert!(
+                !readiness_safety_valve_on(alive, shell_tail, false),
+                "유닉스 셸 프롬프트 화면인데 밸브가 발화했다: {shell_tail}"
+            );
+            assert!(!readiness_safety_valve_on(alive, shell_tail, true));
+        }
+
+        // ③ ★밸브의 존재 이유는 살아있다(오부정 방지 축 — 이 항이 깨지면 수리가 과잉이다):
+        //    델타에 `❯` 가 안 실리는 TUI 는 화면을 그리고 있으므로 꼬리가 셸 프롬프트가 아니다.
+        let live_tui = "PS C:\\Users\\x> claude --dangerously-skip-permissions\n\
+                        ─ Claude Code ─\n\
+                        Try the new fullscreen renderer?\n\
+                        Enter to confirm · Esc to cancel";
+        assert!(
+            readiness_safety_valve_on(alive, live_tui, true),
+            "살아있는 TUI 에서 밸브가 닫혔다 — readiness 영구 오부정 → 건강 pane 롤백 close 재발"
+        );
+        assert!(readiness_safety_valve_on(alive, live_tui, false));
+        // 화면이 아직 비어 있어도(폴링 첫 틱) 밸브는 열린다 — 종전 구제 경로 무변.
+        assert!(readiness_safety_valve_on(alive, "", true));
+
+        // ④ 기동 실패(자손 없음)는 종전대로 절대 ready 가 아니다 — B4 무회귀.
+        assert!(!readiness_safety_valve_on(false, live_tui, true));
+        assert!(!readiness_safety_valve_on(false, "", false));
+    }
+
+    /// ★소스 핀: 안전 밸브 **호출부**가 두 번째 근거를 우회하지 않는다.
+    /// 판정부를 고쳐도 호출부가 `if alive {` 로 되돌아가면 P1-1 이 그대로 되살아나므로,
+    /// readiness 루프가 `readiness_safety_valve(` 를 통과하는지 소스로 못 박는다.
+    /// (핀 이사 규약: 이 핀은 판정부 검체를 대체하지 않고 **호출 경로**만 지킨다.)
+    #[test]
+    fn readiness_safety_valve_is_wired_at_the_call_site_source_pin() {
+        let src = include_str!("cys.rs");
+        assert!(
+            src.contains("if readiness_safety_valve(alive, text)"),
+            "readiness 루프가 안전 밸브 판정부를 타지 않는다 — `alive` 단독 조건 부활(P1-1)"
+        );
+        // 판정부 본체가 AND 를 유지하는지도 함께 — 한쪽만 남으면 밸브가 무의미해진다.
+        let h = src
+            .find("fn readiness_safety_valve_on(")
+            .expect("readiness_safety_valve_on 이 사라졌다");
+        let end = src[h..].find("\nfn ").map(|e| h + e).unwrap_or(src.len());
+        assert!(
+            src[h..end].contains("agent_alive && !screen_tail_is_shell_prompt_on"),
+            "안전 밸브가 화면 꼬리 술어와의 AND 를 잃었다(P1-1 회귀)"
+        );
+    }
+
     #[test]
     fn fmt_secs_buckets() {
         // < 60: 초만
@@ -17005,5 +17754,360 @@ mod tests {
         // decision null(형식 이상 해소)도 통과가 아니다 — 측정 불능은 통과가 아니다.
         let no_decision = json!({"status":"resolved","resolver_surface":7});
         assert!(cycle_receipt_ok(&no_decision, 7).is_err());
+    }
+
+    // ═══════════════ U-6 · RPC 왕복 상한 ═══════════════
+
+    /// 상한 정책 진리표 — 즉답/장기/블로킹 3분류가 각자 다른 값을 받는다.
+    /// ★개정 전 코드에서는 `rpc_idle_timeout` 자체가 없어 이 테스트가 컴파일되지 않는다
+    /// (= 계측기 타당성: 결함 있는 코드에서 초록일 수 없다).
+    #[test]
+    fn rpc_idle_timeout_truth_table() {
+        let secs = |m: &str, p: Value, env: Option<&str>| {
+            rpc_idle_timeout_with(m, &p, env).map(|d| d.as_secs())
+        };
+        // ① 즉답 메서드 = 기본 상한
+        assert_eq!(secs("system.ping", json!({}), None), Some(RPC_IDLE_TIMEOUT_SECS));
+        assert_eq!(secs("surface.list", json!({}), None), Some(RPC_IDLE_TIMEOUT_SECS));
+        // ② 연결 승격(장기 지속) = 면제. 여기 값이 Some 이 되면 구독이 끊긴다.
+        assert_eq!(secs("events.stream", json!({}), None), None);
+        assert_eq!(secs("surface.attach", json!({"surface_id": 1}), None), None);
+        // ③ 서버 블로킹 = 선언 대기 + 마진
+        assert_eq!(
+            secs("surface.wait_for", json!({"timeout_secs": 600}), None),
+            Some(600 + RPC_SERVER_WAIT_MARGIN_SECS)
+        );
+        assert_eq!(
+            secs("feed.push", json!({"wait": true, "timeout_secs": 3600}), None),
+            Some(3600 + RPC_SERVER_WAIT_MARGIN_SECS)
+        );
+        // ③-b 서버 기본값(120)을 클라이언트가 안 실어도 서버 대기보다 짧게 자르지 않는다
+        assert_eq!(
+            secs("feed.push", json!({"wait": true}), None),
+            Some(120 + RPC_SERVER_WAIT_MARGIN_SECS)
+        );
+        // ③-c 서버 캡(3600) 초과 선언은 캡으로 접힌다 — 무한 대기 부활 금지
+        assert_eq!(
+            secs("feed.push", json!({"wait": true, "timeout_secs": 99999}), None),
+            Some(RPC_SERVER_WAIT_CAP_SECS + RPC_SERVER_WAIT_MARGIN_SECS)
+        );
+        // ④ wait=false 의 feed.push 는 즉답(pending 응답) — 블로킹 취급하면 상한이 헐거워진다
+        assert_eq!(
+            secs("feed.push", json!({"wait": false, "timeout_secs": 3600}), None),
+            Some(RPC_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(secs("feed.push", json!({}), None), Some(RPC_IDLE_TIMEOUT_SECS));
+    }
+
+    /// 롤백 스위치 — `0` 은 상한 해제(개정 전 거동), 양수는 기본값 대체.
+    /// 단 롤백 노브가 **블로킹 대기를 잘라먹지는 않는다**(새 사망 경로를 열지 않는다).
+    #[test]
+    fn rpc_idle_timeout_env_rollback() {
+        let secs = |m: &str, p: Value, env: Option<&str>| {
+            rpc_idle_timeout_with(m, &p, env).map(|d| d.as_secs())
+        };
+        assert_eq!(secs("system.ping", json!({}), Some("0")), None, "0 = 상한 해제");
+        assert_eq!(secs("system.ping", json!({}), Some(" 5 ")), Some(5), "양수 = 기본 대체");
+        assert_eq!(
+            secs("system.ping", json!({}), Some("garbage")),
+            Some(RPC_IDLE_TIMEOUT_SECS),
+            "파싱 불가는 기본값 — 오타가 상한을 조용히 없애면 안 된다"
+        );
+        assert_eq!(
+            secs("feed.push", json!({"wait": true, "timeout_secs": 600}), Some("5")),
+            Some(600 + RPC_SERVER_WAIT_MARGIN_SECS),
+            "env 로 기본을 낮춰도 서버 블로킹 대기는 잘리지 않는다"
+        );
+    }
+
+    /// 상한 만료 판정 — unix errno 계열과 Windows CancelIoEx 코드(995) 둘 다 잡는다.
+    #[test]
+    fn rpc_timeout_error_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_rpc_timeout_error(&Error::new(ErrorKind::WouldBlock, "x")));
+        assert!(is_rpc_timeout_error(&Error::new(ErrorKind::TimedOut, "x")));
+        // ERROR_OPERATION_ABORTED — Windows 워치독 경로. mac 에서도 판정만은 시험된다.
+        assert!(is_rpc_timeout_error(&Error::from_raw_os_error(
+            WIN_ERROR_OPERATION_ABORTED
+        )));
+        // 일반 I/O 오류는 상한 만료가 아니다(처방 문안이 달라야 한다)
+        assert!(!is_rpc_timeout_error(&Error::new(ErrorKind::BrokenPipe, "x")));
+        assert!(!is_rpc_timeout_error(&Error::new(ErrorKind::NotFound, "x")));
+    }
+
+    /// 조용한 실패 금지 — 만료 문안에 원인·대기시간·처방 4단·롤백 env 가 모두 들어간다.
+    #[test]
+    fn rpc_timeout_message_carries_prescription() {
+        let m = rpc_timeout_message("system.ping", std::time::Duration::from_secs(40));
+        assert!(m.starts_with("rpc_timeout:"), "기계 판독 가능한 접두가 없다: {m}");
+        assert!(m.contains("system.ping"), "어떤 메서드인지 없다");
+        assert!(m.contains("40초"), "얼마를 기다렸는지 없다");
+        for step in ["처방 ①", "처방 ②", "처방 ③", "처방 ④"] {
+            assert!(m.contains(step), "{step} 가 없다: {m}");
+        }
+        assert!(m.contains(ENV_RPC_TIMEOUT), "롤백 노브 안내가 없다");
+    }
+
+    /// 워치독 로직 — Windows arm 의 심장이지만 이 저장소에서 Windows 크로스 타입체크가
+    /// 불가능(libsqlite3-sys 의 C 크로스 빌드 실패)하므로 로직만은 mac CI 에서 박제한다.
+    /// 검증 불가로 남는 것은 취소 FFI 호출부(`CancelIoEx` + `CancelSynchronousIo`)이며,
+    /// 그 부분은 **Windows 실기 미검증**이다(소스 핀은 문자열 존재만 확인한다).
+    #[test]
+    fn rpc_watchdog_fires_defers_and_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // ① 무진행이면 상한 **전에는 침묵**하고 상한 **뒤에는 발화**한다.
+        //    (발화 후에도 감시를 계속하므로 횟수는 1 고정이 아니라 '창 수' 규모다.)
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let wd = RpcWatchdog::new(Duration::from_millis(200), move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "상한 전에 발화했다 — 정상 왕복을 자르는 방향"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let fired = hits.load(Ordering::SeqCst);
+        assert!(fired >= 1, "무진행인데 발화하지 않았다(= 무한 대기 부활)");
+        assert!(fired <= 10, "발화가 폭주했다({fired}회) — 감시자가 스핀한다");
+        drop(wd);
+
+        // ② touch(진행)가 상한을 재장전한다 — 정상 전송 중인 큰 응답이 잘리지 않는 근거
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let wd = RpcWatchdog::new(Duration::from_millis(200), move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(60));
+            wd.touch();
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "진행이 계속됐는데 발화했다(정상 왕복을 자르는 방향 = 팀 파괴)"
+        );
+        drop(wd);
+
+        // ③ drop 이후에는 절대 발화하지 않는다 — 닫힌 핸들에 CancelIoEx 가 나가면 안 된다
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let wd = RpcWatchdog::new(Duration::from_millis(150), move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(wd); // Drop 이 stop 신호 + join 까지 한다
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "drop 후 발화 = use-after-close 경로");
+    }
+
+    /// read_frame_line: 개행까지 한 줄 · EOF/상한 만료를 3분류로 구분.
+    #[test]
+    fn read_frame_line_classifies_outcomes() {
+        struct Src(Vec<Result<Vec<u8>, std::io::Error>>);
+        impl Read for Src {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop() {
+                    None => Ok(0),
+                    Some(Err(e)) => Err(e),
+                    Some(Ok(b)) => {
+                        buf[..b.len()].copy_from_slice(&b);
+                        Ok(b.len())
+                    }
+                }
+            }
+        }
+        let dl = RpcDeadline {
+            idle: Some(std::time::Duration::from_secs(1)),
+            #[cfg(windows)]
+            watchdog: None,
+        };
+        // 여러 조각에 걸친 한 줄 — 조립돼야 한다(pop 이라 역순으로 넣는다)
+        let mut s = Src(vec![
+            Ok(b"\"ok\":true}\n".to_vec()),
+            Ok(b"{".to_vec()),
+        ]);
+        assert_eq!(read_frame_line(&mut s, &dl).unwrap(), "{\"ok\":true}");
+        // EOF
+        let mut s = Src(vec![]);
+        assert_eq!(read_frame_line(&mut s, &dl), Err(RpcIoFail::Eof));
+        // 상한 만료
+        let mut s = Src(vec![Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "timed out",
+        ))]);
+        assert_eq!(read_frame_line(&mut s, &dl), Err(RpcIoFail::Timeout));
+        // 그 외 I/O 오류는 만료로 뭉개지 않는다
+        let mut s = Src(vec![Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "gone",
+        ))]);
+        assert!(matches!(read_frame_line(&mut s, &dl), Err(RpcIoFail::Io(_))));
+    }
+
+    /// ★e2e: **응답하지 않는 소켓 목**에서 유계 종료한다.
+    /// 개정 전 `request_on_timeout` 의 unix arm 은 이미 통과하지만, 이 테스트의 값은
+    /// (a) 회귀 박제와 (b) 만료 귀결이 '조용한 실패'가 아니라 처방 문안이라는 계약에 있다.
+    #[cfg(unix)]
+    #[test]
+    fn request_on_timeout_terminates_on_hung_socket() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!(
+            "cys-u6-hung-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hung.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // accept 는 하되 한 바이트도 쓰지 않는다 = 데몬 wedge 모사.
+        let keep = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).filter_map(|s| s.ok()).collect();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+        let t0 = Instant::now();
+        let r = request_on_timeout(&sock, "system.ping", json!({}), Duration::from_millis(400));
+        let elapsed = t0.elapsed();
+        let err = r.expect_err("무응답 소켓에서 Ok 가 나왔다");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "유계 종료 실패 — {elapsed:?} 걸렸다(개정 전 무타임아웃 거동 부활)"
+        );
+        assert!(
+            err.starts_with("rpc_timeout:"),
+            "만료가 조용한/모호한 실패로 새어나갔다: {err}"
+        );
+        assert!(err.contains("처방 ①"), "처방 문안이 없다: {err}");
+        let _ = keep.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★계측 타당성(negation): **상한을 끄면 같은 목에서 유계 종료하지 않는다.**
+    /// 위 테스트의 400ms 종료가 '소켓이 원래 빨리 끊겨서'가 아니라 **상한이 일한 결과**임을
+    /// 증명한다(계측기 검증 3칙 — 계측기 자신을 먼저 시험한다). 롤백 노브(`=0`)의 실효 확인이기도 하다.
+    #[cfg(unix)]
+    #[test]
+    fn no_deadline_means_no_bound_instrument_validity() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!(
+            "cys-u6-nobound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hung.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // 1.2초 동안 무응답으로 붙잡았다가 끊는다(끊김이 유일한 탈출구 = 상한 부재의 실체).
+        let keep = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).filter_map(|s| s.ok()).collect();
+            std::thread::sleep(Duration::from_millis(1200));
+            drop(held);
+        });
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let deadline = RpcDeadline::arm(&stream, None).unwrap(); // 상한 해제 = 개정 전 거동
+        let t0 = Instant::now();
+        let r = rpc_roundtrip(&mut stream, &deadline, "system.ping", json!({}));
+        let elapsed = t0.elapsed();
+        drop(deadline);
+        assert!(r.is_err(), "무응답 소켓인데 Ok 가 나왔다");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "상한이 없는데도 {elapsed:?} 에 끊겼다 — 위 유계 종료 테스트가 상한을 시험하지 못한다"
+        );
+        let _ = keep.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 소스 핀 공용 절단기 — `marker` 로 시작하는 항목의 본문을 **문자 경계 안전**하게 돌려준다.
+    ///
+    /// 【고친 결함 P2-1】 종전 핀은 `&src[head..head + 1200]` 처럼 **바이트 오프셋 산술**로
+    /// 잘랐다. 지금은 우연히 경계에 맞지만, 그 구간의 한글 주석을 **한 글자만 고쳐도** 오프셋이
+    /// 멀티바이트 문자 한가운데로 밀려 `byte index is not a char boundary` **패닉**으로 CI 가
+    /// 적색이 된다 — 결함이 아니라 편집으로. 상한을 **다음 항목 경계**(`\nfn `)로 잡으면 그
+    /// 실패 양식 자체가 사라지고, 창이 함수 전체를 덮으므로 **검사 내용은 오히려 넓어진다**
+    /// (핀 약화 아님 — `streaming_paths_bypass_the_deadline_source_pin` 과 같은 방식).
+    fn item_body<'a>(src: &'a str, marker: &str) -> &'a str {
+        let h = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} 가 사라졌다"));
+        // 자기 자신의 `fn` 줄을 경계로 세지 않도록 marker 길이만큼 지나서 찾는다.
+        let from = h + marker.len();
+        let end = src[from..]
+            .find("\nfn ")
+            .map(|e| from + e)
+            .unwrap_or(src.len());
+        &src[h..end]
+    }
+
+    /// ★소스 핀: Windows arm 이 **no-op 이 아니다**.
+    /// 이 저장소는 Windows 크로스 타입체크가 불가능해 CI 가 mac/ubuntu 에서만 돈다 — 그래서
+    /// "Windows 에서는 상한이 없다"는 종전 결함이 리팩터로 되살아나도 아무도 모른다.
+    /// 이 핀이 그 회귀를 잡는다. ★개정 전 소스에서는 적색이다(당시 Windows arm 은
+    /// `request_on(socket, method, params)` 위임 = 상한 0).
+    #[test]
+    fn windows_arm_is_not_a_noop_source_pin() {
+        let src = include_str!("cys.rs");
+        // ① Windows RpcDeadline::arm 이 실제로 취소 API 를 **둘 다** 부른다
+        //    (한쪽만 남으면 그 한쪽이 안 먹는 환경에서 상한이 통째로 no-op 이 된다)
+        assert!(
+            src.contains("CancelIoEx(raw as HANDLE"),
+            "Windows arm 에 CancelIoEx 호출이 없다 — 상한이 no-op 으로 되돌아갔다"
+        );
+        assert!(
+            src.contains("CancelSynchronousIo(th)"),
+            "동기 I/O 취소의 정식 API(CancelSynchronousIo) 호출이 없다"
+        );
+        // ② request_on_timeout 에 '위임으로 상한을 버리는' 구 형태가 남아있지 않다
+        let body = item_body(src, "fn request_on_timeout(");
+        assert!(
+            !body.contains("request_on(socket, method, params)"),
+            "request_on_timeout 이 다시 무타임아웃 request_on 으로 위임한다(Windows no-op 부활)"
+        );
+        assert!(
+            body.contains("RpcDeadline::arm"),
+            "request_on_timeout 이 공용 상한 기구를 쓰지 않는다"
+        );
+        // ③ request() 가 상한을 장전한다
+        let rbody = item_body(src, "\nfn request(method: &str");
+        assert!(
+            rbody.contains("RpcDeadline::arm") && rbody.contains("rpc_idle_timeout"),
+            "request() 에 상한 장전이 없다 — 데몬 wedge 시 CLI 영구 대기가 부활한다"
+        );
+    }
+
+    /// 장기 경로가 상한 기구에 **닿지 않는다**는 것을 소스로 못 박는다(구독 절단 방지).
+    /// `stream_events`·`attach` 는 각자 `connect()` 를 쓰며 `request()` 를 타지 않는다.
+    #[test]
+    fn streaming_paths_bypass_the_deadline_source_pin() {
+        let src = include_str!("cys.rs");
+        for (marker, name) in [
+            ("fn stream_events(", "events.stream"),
+            ("fn attach(sid: u64)", "surface.attach"),
+        ] {
+            let h = src.find(marker).unwrap_or_else(|| panic!("{marker} 가 사라졌다"));
+            let end = src[h..].find("\nfn ").map(|e| h + e).unwrap_or(src.len());
+            let body = &src[h..end];
+            assert!(
+                !body.contains("RpcDeadline::arm"),
+                "{name} 경로에 상한이 걸렸다 — 장기 구독이 잘린다"
+            );
+            assert!(
+                !body.contains("request("),
+                "{name} 경로가 request() 를 타면 전역 상한이 따라붙는다"
+            );
+        }
+        // 목록 자체도 핀 — 면제 집합이 조용히 비지 않게
+        assert_eq!(RPC_STREAMING_METHODS, ["events.stream", "surface.attach"]);
     }
 }

@@ -12,9 +12,25 @@
 #   `build.rs` 는 그 바이트를 `include_str!` 로 그대로 임베드하므로, 바뀌는 것은 곧
 #   **임베드 팩 내용과 팩 매니페스트 해시**다. 그것이 바로 이 봉인의 목적(3러너 동일화)이지만,
 #   "ubuntu·macOS·windows 3러너의 팩 해시가 실제로 동일해진다"는 **여기서 증명되지 않았다 —
-#   미증명이다.** 확인 경로는 하나뿐이다: `feat/**` push 시 `windows-health` 잡의 실측
-#   (H-PACK-CRLF 가 Windows 실기 검체 목록에 편입돼 있다). 실측 전까지 이 문단을
-#   "영향 없음"으로 고쳐 적지 말 것.
+#   미증명이다.**
+#   ★무엇이 있고 무엇이 없는지(2026-08-23 실측 · 과장·축소 금지):
+#     · **없다** — 러너 A 의 팩 해시와 러너 B 의 팩 해시를 맞대어 보는 장치는 저장소에 없다.
+#       기존 sha256 게이트는 전부 **단일 러너 안에서 닫힌 대조**다: `release.yml` job `pack-artifacts`
+#       (ubuntu-latest) 와 `pack-release.yml` job `pack-only`(ubuntu-latest) 의 임베드 매니페스트
+#       ⇔ 온디스크 트리 ⇔ tar 재추출 3자 폐포, `windows-build.yml` 의 설치 팩 CEO_TEMPLATE.md
+#       ⇔ 리포 커밋본 sha256 대조(windows-latest 안). 어느 것도 러너를 가로지르지 않는다.
+#     · **있다** — 해시 동일성의 **필요조건**(개행 통일)을 러너마다 따로 실측하는 장치 둘:
+#       ① `build.rs` 가드③ — 임베드 대상에 CRLF 가 있으면 빌드를 죽인다. 모든 빌드 머신에서
+#          발동하므로 release.yml 빌드 매트릭스의 windows-latest·macos-latest 도 포함한다
+#          (단 `CYS_ALLOW_CRLF_EMBED=1` 로 빌드하면 경고로 강등된다).
+#       ② 검체 `H-PACK-CRLF`(`cysjavis-pack/bin/tests/run_bootstrap_health.py`) — 임베드 대상
+#          전량 `\r\n` 0 + 이 파일의 봉인 실재 + 가드③ 실재. CI 에서 이 러너를 도는 잡은
+#          `windows-health`(`feat/**` push · WIN_SPECIMENS 에 편입) **하나뿐**이므로,
+#          Windows 체크아웃 바이트가 실제로 LF 인지를 CI 에서 확인하는 경로도 그 잡 하나다.
+#     · 즉 windows-health 가 초록이어도 그것이 증명하는 것은 "Windows 체크아웃에 CRLF 0" 이지
+#       "3러너 팩 해시 동일" 이 아니다. 후자를 주장하려면 러너별 팩 해시를 아티팩트로 올려
+#       맞대는 장치를 **새로 만들어야** 한다.
+#   실측 전까지 이 문단을 "영향 없음"으로 고쳐 적지 말 것.
 #
 # ★이 파일의 추가는 **인덱스 바이트를 바꾸지 않는다.** 도입 시점(2026-08-23)에 추적 파일
 #   전량이 이미 `i/lf` 임을 `git ls-files --eol` 로 확인했다(유일 예외 = 아래 픽스처 pin).

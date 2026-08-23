@@ -20,6 +20,25 @@
     `git show <기준커밋>:<파일>` 에 같은 탐지기를 돌려 **구 코드에서 FIRE 하는지** 확인한다.
     탐지기가 구 결함을 못 잡으면 신 코드의 PASS 는 아무 의미가 없다.
 
+핀 이사 계약(U-2 · 2026-08-23 · 기계 집행자 = 검체 `H-META-PIN`):
+  이 러너의 다수 검체는 **Rust 소스의 문자열 자체를 핀**한다(예: `boot_agent_on_surface` 본문에
+  어떤 리터럴이 있다/없다). 그래서 그 코드가 리팩터로 **다른 파일·다른 함수로 이사**하면 검체가
+  적색이 된다. 그 순간의 규율을 여기 상주시킨다 — 이 네 줄이 이 파일의 최상위 계약이다.
+    ① **핀을 지우지 말고 이사시킨다.** 검체가 소스 문자열을 핀하는 곳에서 리팩터가 필요하면,
+       `need(...)` 를 지우는 것이 아니라 **스캔 대상 경로만** 옮긴다. 이사 = 아래 `SCAN_TARGETS`
+       레지스트리의 해당 논리 이름에 새 경로를 **추가**하는 것이며, 그 한 줄은 diff 에 반드시
+       드러난다(조용한 핀 삭제가 구조적으로 불가능해진다).
+    ② **판정 조건은 하나도 완화하지 않는다.** 이 개정에서 바뀔 수 있는 것은 *스캔 대상 경로*
+       뿐이다 — `need()` 조건의 삭제·약화, 검체 삭제, 웨이브 재배치는 전부 계약 위반이다.
+       판정 축 자체를 옮겨야만 하는 경우에는 **그것이 완화가 아닌 이유를 코드 주석으로 남긴다**
+       (선례: H-META-READ ⓑ 의 '여유배수 → 조기경보' 재분류 주석).
+    ③ **기능 변경과 검체 개정은 같은 커밋**에 넣는다. 기능을 먼저 착지시키고 검체를 나중에
+       초록으로 만들면 **계측기가 결함을 승인하는** 순서가 된다(MEMORY '디버깅 계측 타당성
+       게이트' 3칙 ①).
+    ④ **적색이 났을 때 첫 행동은 검체 수정이 아니라 원인 규명이다.** "빨개서 고쳐 초록으로
+       만들었다"는 정당한 작업이 아니다 — 먼저 *왜* 빨간지(기능 결함인가 · 코드 이사인가 ·
+       계측기 자신의 결함인가)를 규명하고, 그 답이 '이사'일 때에만 ①을 적용한다.
+
 stdlib만 사용. 네트워크 0. 어떤 검체도 사용자 HOME·실 데몬을 건드리지 않는다(전부 격리 tmp).
 """
 import argparse
@@ -2395,7 +2414,7 @@ def h_safe_2():
        계약이 전진한다 — 0=Fatal 없음 / 1=Fatal / 75=busy. 단언의 방향은 그대로다: exit 의 의미는
        한 곳(`boot_exit_code`)이 소유하고, 소비부가 그 세 값을 **분기해서** 읽어야 한다.
     """
-    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     notes = []
     bi = src.find("fn boot_agent_on_surface(")
     body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
@@ -3934,7 +3953,7 @@ def h_pred_8():
     매칭돼 디렉티브가 맨 셸로 들어갔다. 판정은 **기동 send 직전 커서 이후 신규 출현분**에서만.
     ★개수 비교 구현 금지: 영구 오부정 회귀이고, T-0147-4 이후 롤백 close 가 실제로 성공하므로
       그 오부정은 **건강한 surface 를 실제로 닫는다**."""
-    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     notes = []
     bi = src.find("fn boot_agent_on_surface(")
     need(bi > 0, "boot_agent_on_surface 를 못 찾았다")
@@ -4201,7 +4220,7 @@ def h_time_2():
 def h_time_3():
     """B17: readiness 루프가 `waited += 2` 로 시간을 **셌다** — 틱당 실비용(RPC 왕복 + 2.5s sleep +
     trust 분기의 미집계 sleep)이 가정치와 어긋나 실효 대기가 25%+α 오차났다. 벽시계만 쓴다."""
-    src = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    src = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     bi = src.find("fn boot_agent_on_surface(")
     body = src[bi:src.find("\n/// 에이전트 기동 + 역할 지침", bi)]
     notes = []
@@ -4246,6 +4265,62 @@ def _repo_file(rel):
     if not os.path.isfile(p):
         raise Skip("레포 파일 부재(배포 팩 실행): %s" % rel)
     return _read(p)
+
+
+# ── 스캔 대상 레지스트리 (핀 이사 계약 U-2) ─────────────────────────────────
+# 소스 문자열을 핀하는 검체가 **파일 경로를 각자 들고 있으면**, 그 코드가 다른 파일로 이사할 때
+# 흩어진 경로를 검체마다 고쳐야 한다 — 그리고 실제로는 고치는 대신 **조용히 지워진다**.
+# 그래서 '논리 이름 → 경로 목록'을 한 곳에 모은다. 이사할 때 고칠 곳은 **여기 한 줄**이고,
+# 그 한 줄은 diff 에 명시적으로 드러난다.
+#
+# ★이 레지스트리는 *어디를 읽을지*만 정한다 — *무엇을 단언할지*(각 검체의 `need`)는 소유하지
+#   않는다. 즉 레지스트리 경유화는 **표현의 변경이며 판정의 변경이 아니다**.
+# ★값은 **추가**한다. 기존 경로 제거는 "그 파일에 판정 대상이 더는 없다"를 증명했을 때만.
+SCAN_TARGETS = {
+    # readiness 판정부 — 기동 준비 완료 판정 · 안전 밸브 · 데드라인 회계 · 주입 검증 배선.
+    # 지금은 전부 `src/bin/cys.rs` 안에 있다. 캠페인이 판정을 순수함수(`src/readiness.rs`)로
+    # 추출하면 **여기에 그 경로를 추가**한다(cys.rs 에는 호출 배선이 남으므로 함께 유지).
+    "readiness": (os.path.join("src", "bin", "cys.rs"),),
+}
+
+# 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.
+SCAN_TARGET_CONSUMERS = {
+    "H-PRED-8": "readiness",
+    "H-SAFE-2": "readiness",
+    "H-TIME-3": "readiness",
+    "H-OBS-2": "readiness",
+}
+
+# 레지스트리 소유 경로를 **직접** 읽는 기존 검체(동결 목록 · 2026-08-23 U-2 시점 실측 15종).
+# 이들이 그 파일에서 핀하는 것은 readiness 판정부가 아니라 다른 계약(exit 어휘·시드·동시성·
+# 프롬프트 술어 …)이라 이번 단위의 이사 대상이 아니다. 그러나 **새로 늘리지는 않는다** —
+# 새 직접 독자는 이사 때 함께 옮겨지지 않아 조용히 죽기 때문이다(H-META-PIN ⓓ 가 적색).
+SCAN_TARGET_DIRECT_LEGACY = frozenset({
+    "H-CONC-2", "H-CONC-3", "H-EXIT-2", "H-EXIT-3", "H-EXIT-4", "H-IDENT-1",
+    "H-PRED-2", "H-PRED-6", "H-PRED-7", "H-SAFE-1", "H-SAFE-W",
+    "H-SEED-1", "H-SEED-3", "H-SEED-6", "H-TIME-1",
+})
+
+# 등재 경로가 여럿일 때의 이음매. Rust 주석 형태라 어떤 핀 리터럴과도 겹치지 않고, 검체가
+# 파일 경계를 넘어 슬라이스하면 이 문자열이 결과에 섞여 **눈에 띄게** 만든다.
+_SCAN_JOIN = "\n// ── SCAN_TARGETS 경계(run_bootstrap_health) ──\n"
+
+
+def _scan_source(name):
+    """레지스트리 논리 이름 → 등재 경로 전량의 소스 텍스트(등재 순서대로 이어 붙임).
+
+    핀 이사 계약(헤더 ①)의 실행 지점이다. 검체는 파일 경로를 스스로 들지 않고 **논리 이름**으로
+    묻는다 → 코드가 이사해도 고칠 곳은 `SCAN_TARGETS` 한 줄뿐이다.
+    ★현재 모든 항목이 단일 경로이므로 반환 텍스트는 종전 `_repo_file(...)` 과 **바이트 동일**
+      하다(= 이 개정은 어떤 검체의 판정도 바꾸지 않는다. H-META-PIN 이 아니라 개정 전후
+      PASS/FAIL 집합 동일성이 그 증거다).
+    ★부재는 종전과 같이 `Skip` 으로 흐른다(배포 팩 실행에서 레포 소스 검체가 접히는 규약 유지).
+    """
+    rels = SCAN_TARGETS.get(name)
+    if not rels:
+        raise Fail("SCAN_TARGETS 에 논리 이름 %r 이 없다 — 핀 이사 계약: 레지스트리를 먼저 갱신하라"
+                   % name)
+    return _SCAN_JOIN.join(_repo_file(rel) for rel in rels)
 
 
 def _no_wait_for_owner(text, where):
@@ -5373,7 +5448,7 @@ def h_obs_2():
     """B14: 검증 신호가 '화면 문자열'이라 약했고 실패는 stderr 경고 1줄로 삼켜졌다(RC3).
     신호를 **ack 계약**으로 교체하고 판정을 **상태로 남긴다**.
     ★치명 격상 금지(금지 방향 ③): 미확인은 부트를 죽이지 않는다 — 위경고 모드 회귀 차단."""
-    csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    csrc = _scan_source("readiness")   # ★핀 이사(U-2) — 경로 소유는 SCAN_TARGETS
     stt = _repo_file(os.path.join("src", "bin", "cysd", "state.rs"))
     hnd = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
     notes = []
@@ -6470,6 +6545,122 @@ def h_pack_crlf():
 
 
 # ── 메타(계측기 자기감시) ────────────────────────────────────────────────
+@specimen("H-META-PIN", "W6",
+          "핀 이사 계약 집행 — SCAN_TARGETS 실재·소비 배선·우회 직접 호출 동결",
+          ["U-2"])
+def h_meta_pin():
+    """U-2(2026-08-23): 이 러너의 검체 다수는 **Rust 소스 문자열 자체**를 핀한다. 캠페인이
+    readiness 판정부를 순수함수로 추출하면 그 핀들이 적색이 되는데, 그때 "빨개서 고쳤다"가
+    정당한 작업으로 통하면 **계측기가 결함을 승인**한다(MEMORY '디버깅 계측 타당성 게이트').
+    헤더의 '핀 이사 계약'이 그 규율이고, 이 검체가 그 계약의 **기계 집행자**다 — 네 축이다:
+      ⓐ 레지스트리 형태(논리 이름 ≥1 · 이름마다 경로 ≥1 · 경로 중복 소유 0).
+      ⓑ 등재 경로 전량 실재 + 읽기 상한 미만(레포 실행 시 · 배포 팩이면 Skip).
+      ⓒ 소비 선언(`SCAN_TARGET_CONSUMERS`)과 실제 배선 일치 — 선언한 검체가 실제로
+         `_scan_source("<이름>")` 을 부르고, 소유 경로를 직접 읽지 않는다.
+      ⓓ 레지스트리를 **우회**해 소유 경로를 직접 읽는 검체 집합 == 동결 화이트리스트.
+         새 직접 독자(적색)는 이사 때 함께 옮겨지지 않아 조용히 죽고, 사라진 직접 독자(적색)는
+         핀이 소리 없이 삭제됐다는 뜻이다 — 양방향으로 동결한다.
+    ★이 검체는 어떤 판정도 완화하지 않는다. 기존 `need` 를 대체하지 않고, '경로를 어디서
+      얻는가'라는 **새 축**만 추가한다.
+    """
+    notes = []
+
+    # ⓐ 레지스트리 형태
+    need(SCAN_TARGETS, "SCAN_TARGETS 가 비었다 — 핀 이사 계약의 앵커가 사라졌다")
+    owner = {}
+    for name in sorted(SCAN_TARGETS):
+        rels = SCAN_TARGETS[name]
+        need(isinstance(rels, tuple) and len(rels) >= 1,
+             "SCAN_TARGETS[%r] 은 경로 1개 이상의 튜플이어야 한다(현재 %r)" % (name, rels))
+        for rel in rels:
+            need(isinstance(rel, str) and rel, "SCAN_TARGETS[%r] 에 빈 경로" % name)
+            need(rel not in owner,
+                 "경로 %s 를 논리 이름 %r 과 %r 이 동시에 소유한다 — 소유가 갈리면 이사 시 "
+                 "한쪽이 누락된다" % (rel, owner.get(rel), name))
+            owner[rel] = name
+    owned = set(owner)
+    notes.append("레지스트리 %d이름/%d경로" % (len(SCAN_TARGETS), len(owned)))
+
+    # ⓑ 등재 경로 실재 + 읽기 상한 미만
+    # ★'배포 팩'과 '레지스트리 오타'를 파일 부재로 구분하면 안 된다 — 등재 경로가 하나뿐일 때
+    #   오타는 '전량 부재'와 구별되지 않아 **Skip(초록)** 으로 접힌다. 실제로 그렇게 접혔다
+    #   (계측 타당성 실험 N3 · 2026-08-23). 측정 불능을 통과로 접는 것은 이 저장소의 게이트
+    #   규약 위반이므로, 판별자를 **레포 체크아웃 자체의 표지**(`Cargo.toml`)로 옮긴다.
+    #   ★이것은 완화가 아니라 강화다: 종전 축(파일 부재→Skip)에서는 오타가 초록이었고,
+    #     새 축에서는 레포 안의 모든 부재가 적색이며 Skip 은 '레포가 아닌 곳'에만 남는다.
+    if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+        raise Skip("레포 체크아웃이 아니다(배포 팩 실행) — 레지스트리 경로 판정 불가")
+    missing, sizes = [], {}
+    for rel in sorted(owned):
+        p = os.path.join(REPO_DIR, rel)
+        if not os.path.isfile(p):
+            missing.append(rel)
+            continue
+        with open(p, encoding="utf-8", errors="replace") as f:
+            sizes[rel] = len(f.read())
+    need(not missing,
+         "SCAN_TARGETS 등재 경로가 실재하지 않는다: %s — 이사가 절반만 반영됐거나 오타다 "
+         "(핀 이사 계약 ①: 경로만 옮기되 **옮긴 곳은 반드시 실재해야** 한다)" % missing)
+    over = ["%s=%d자" % (r, n) for r, n in sorted(sizes.items()) if n >= READ_LIMIT_CHARS]
+    need(not over,
+         "등재 경로가 읽기 상한(%d자)에 도달 = 조용한 절단 = 계측 무효: %s" % (READ_LIMIT_CHARS, over))
+    notes.append("등재 경로 %d건 실재·상한 미만(최대 %d자)" % (len(sizes), max(sizes.values())))
+
+    # ⓒⓓ 러너 소스를 검체 블록으로 잘라 '직접 호출'을 수확한다
+    runner = _read(os.path.abspath(__file__))
+    marks = [(m.start(), m.group(1))
+             for m in re.finditer(r'^@(?:specimen|pending)\(\s*"([A-Za-z0-9\-]+)"', runner, re.M)]
+    need(len(marks) >= 50,
+         "검체 블록 수확 실패(정규식 파손) — %d건만 잡혔다" % len(marks))
+    blocks = [("<module>", runner[:marks[0][0]])]
+    for i, (pos, sid) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(runner)
+        blocks.append((sid, runner[pos:end]))
+    bodies = dict(blocks)
+
+    def _direct_owned(body):
+        hit = set()
+        for m in re.finditer(r'_repo_file\(os\.path\.join\(([^)]*)\)\)', body):
+            parts = re.findall(r'"([^"]*)"', m.group(1))
+            if parts and os.path.join(*parts) in owned:
+                hit.add(os.path.join(*parts))
+        return hit
+
+    direct = {}
+    for sid, body in blocks:
+        hit = _direct_owned(body)
+        if hit:
+            direct[sid] = sorted(hit)
+
+    # ⓒ 소비 선언 ↔ 실제 배선
+    for sid in sorted(SCAN_TARGET_CONSUMERS):
+        name = SCAN_TARGET_CONSUMERS[sid]
+        need(name in SCAN_TARGETS,
+             "SCAN_TARGET_CONSUMERS[%s] 가 미등재 논리 이름 %r 을 가리킨다" % (sid, name))
+        need(sid in bodies,
+             "소비 선언된 검체 %s 를 러너에서 찾지 못했다(이름 변경·삭제 — 핀이 사라졌는가?)" % sid)
+        need(('_scan_source("%s")' % name) in bodies[sid],
+             "%s 가 _scan_source(%r) 를 부르지 않는다 — 레지스트리 경유 배선이 끊겼다 "
+             "(이 검체의 핀은 이사 때 함께 옮겨지지 않는다)" % (sid, name))
+        need(sid not in direct,
+             "%s 가 레지스트리를 두고 %s 를 직접 읽는다 — 경유 배선 우회" % (sid, direct.get(sid)))
+    notes.append("소비 검체 %d종 경유 확인" % len(SCAN_TARGET_CONSUMERS))
+
+    # ⓓ 우회 직접 독자 동결(양방향)
+    extra = sorted(set(direct) - set(SCAN_TARGET_DIRECT_LEGACY))
+    need(not extra,
+         "레지스트리 소유 경로를 직접 읽는 **새** 검체 %s — 새 핀은 _scan_source 경유로 만들어라. "
+         "정당한 예외라면 SCAN_TARGET_DIRECT_LEGACY 에 사유와 함께 명시할 것(조용한 확산 금지)"
+         % extra)
+    gone = sorted(set(SCAN_TARGET_DIRECT_LEGACY) - set(direct))
+    need(not gone,
+         "동결 목록에 있으나 직접 호출이 사라진 검체 %s — 핀이 이사했다면 SCAN_TARGET_CONSUMERS "
+         "로 옮기고, 검체가 삭제됐다면 그 사유를 커밋에 남긴 뒤 목록에서 빼라(조용한 핀 소멸 차단)"
+         % gone)
+    notes.append("우회 직접 독자 %d종 동결 일치" % len(direct))
+    return " · ".join(notes)
+
+
 # ★등록 위치가 곧 실행 순서다 — 이 검체는 **맨 마지막**에 두어, 앞선 모든 검체가 실제로 읽은
 #   경로 관측(`_READ_OBSERVED`)까지 함께 본다. 단독 실행(`--only H-META-READ`) 에서도
 #   정적 대상 목록만으로 자립 판정한다.
@@ -6482,8 +6673,9 @@ def h_meta_read():
     만든다(H-CONC-4 거짓 적색 · 앵커는 handlers.rs:9852 에 실재). 이 검체는 그 상태로
     되돌아가는 것을 즉시 적색으로 만든다 — 세 축으로 본다:
       ⓐ `_read` 의 절단 실패 가드가 코드에 실재하는가(가드를 지우면 적색).
-      ⓑ `_repo_file` 이 읽는 **모든** 레포 파일의 실제 문자 수가 상한 미만인가(파일이 자라
-         상한에 접근하면 적색 — 여유 4배를 요구한다).
+      ⓑ `_repo_file` 이 읽는 **모든** 레포 파일의 실제 문자 수가 상한 미만인가(상한에 **도달**하면
+         적색 = 절단 = 계측 무효). 여유 배수는 판정 조건이 아니다 — 4배 미만이면 notes 에 ⚠
+         조기경보만 남기고 통과시킨다(F2 축 재분류 · 아래 주석 참조).
       ⓒ `_repo_file` 대상 목록이 러너 소스와 동기화돼 있는가(새 동적 호출이 생기면 적색).
     """
     import inspect
@@ -6517,7 +6709,7 @@ def h_meta_read():
     targets.add(os.path.join("cysjavis-pack", "directives", "CEO_TEMPLATE.md"))       # tmpl_rel
     notes.append("대상 %d경로 수확(리터럴 %d·변수 %d)" % (len(targets), len(lits), len(dyn)))
 
-    # ⓑ 실제 크기 < 상한 (그리고 여유 4배)
+    # ⓑ 실제 크기 < 상한 = hard fail · 여유 배수는 판정 조건이 아니라 아래의 ⚠조기경보뿐
     sizes = {}
     for rel in sorted(targets):
         p = os.path.join(REPO_DIR, rel)

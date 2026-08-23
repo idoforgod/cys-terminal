@@ -69,6 +69,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",   # ★D3(W5): OpenProcess(자식 pid → Job 편입)
     "Win32_Security_Cryptography",  # R-CLI-1: BCryptGenRandom(CNG CSPRNG) — 브리지 토큰 예측가능 폴백 제거
     "Win32_System_Registry",    # ★stale PATH: RegGetValueW(HKLM/HKCU Environment\Path 신선 재합성)
+    "Win32_System_IO",          # ★U-6: CancelIoEx — named pipe 동기 ReadFile 을 밖에서 깨우는 유일 수단
 ] }
 
 # Windows 전용(호스트 게이트): cys.exe·cysd.exe(순수 Rust CLI)에 PE 버전리소스·매니페스트·아이콘을

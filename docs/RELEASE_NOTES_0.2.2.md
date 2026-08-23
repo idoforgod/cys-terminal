@@ -15,7 +15,14 @@
   디렉티브 라우팅)와 SessionStart hook(`settings.json`)을 보존 모드로 설치.
 - **오염 환경 / 깨끗한 환경 동시 안전**: 오염돼 있으면 무시(안 읽음), 깨끗하면 새 디렉터리만
   추가(회귀 0). 사용자 프로필 **불가침** — 자동 삭제·덮어쓰기 없음.
-- **인증 보존**: macOS 인증은 계정 단위 Keychain이라 격리해도 로그인이 유지됩니다.
+- **인증 보존**: ~~macOS 인증은 계정 단위 Keychain이라 격리해도 로그인이 유지됩니다.~~
+  **★정정(2026-08-23 실측)** — 이 서술은 사실이 아닙니다. macOS Keychain 항목은 계정 단위가 아니라
+  **config dir 경로 단위**로 갈립니다(서비스명 `Claude Code-credentials-<sha256(config dir 절대경로)[:8]>`).
+  측정: `security dump-keychain` 의 서비스명 9개를 열거해 경로 sha256 앞 8자리와 대조 → 7개 정확 일치
+  (`~/.claude`=bdf68cc2 · `~/.cys/claude`=c45eaec5 · `~/.claude-3`=8e88d2ce).
+  따라서 격리 config dir 는 **자체 `/login` 1회**가 필요하며, 프로필을 다른 경로로 복사·이동해도
+  인증이 따라가지 않습니다. (Windows 는 반대로 config dir 안의 `.credentials.json` **파일**이라 복사가 됩니다.)
+  현행 안내는 `README.md` 의 **F2** 항목입니다.
 - **preflight C31**: 격리 라우터 설치 확인 + 사용자 프로필의 외부 체계·구지침을 **감지·경고**
   (삭제는 사용자 선택).
 

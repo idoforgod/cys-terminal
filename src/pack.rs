@@ -607,8 +607,18 @@ pub fn role_bootstrap_hook_command(pack_dir: &Path) -> String {
 
 /// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
 /// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
-/// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
-/// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). base 팩은 pack_dir 형제(~/.cys/claude).
+/// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. base 팩은 pack_dir 형제(~/.cys/claude).
+///
+/// ★정정(2026-08-23 실측 · 종전 서술 "macOS 인증은 계정 단위 Keychain이라 격리해도 로그인이
+/// 유지된다" 는 반증됐다): macOS Keychain 항목은 **계정 단위가 아니라 config dir 경로 단위**로
+/// 갈린다 — 서비스명이 `Claude Code-credentials-<sha256(CLAUDE_CONFIG_DIR 절대경로)[..8]>` 다.
+/// 측정: 이 맥의 `security dump-keychain` 서비스명 9개를 열거해 경로 sha256 앞 8자리와 대조,
+/// `~/.claude`=bdf68cc2 · `~/.cys/claude`=c45eaec5 · `~/.claude-3`=8e88d2ce 등 7개가 정확 일치.
+/// 파급: ① 격리 config dir 는 **자체 `/login` 1회**가 필요하다(사용자 ~/.claude 의 로그인이
+/// 따라오지 않는다) ② 프로필을 다른 경로로 복사·이동하면 인증이 따라가지 않는다 ③ 새 부서
+/// dir(`~/.cys/claude-<key>`)마다 재발한다. 우회 수단 없음 — 사람 1회 로그인이 필요하다.
+/// Windows 는 반대다: 토큰이 config dir 안의 `.credentials.json` **파일**이라 복사가 성립한다
+/// (Windows 11 실기 확인 — `~/.cys/claude/.credentials.json` 509B · `cmdkey /list` 에 항목 없음).
 ///
 /// ★G3 축1(부서 인식 · 확정 재설계): 부서 팩(`pack-dept-*`) 스코프에서는 공용 ~/.cys/claude 가
 /// **아니라** 그 부서 claude 가 실제로 읽는 dir 를 표적한다 — 실소비 SOT 는

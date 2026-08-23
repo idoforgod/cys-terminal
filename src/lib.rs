@@ -137,6 +137,156 @@ pub fn seal_python_bytecode_in_process() {
     std::env::set_var(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ★U-7 · 자식 스폰 분리 규약 단일 정의처 (detached spawn convention)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 데몬 autostart 옵트아웃 env 키. **데몬이 낳은 자식 CLI** 는 반드시 이걸 켜야 한다 —
+/// 켜지 않으면 그 CLI 가 소켓 연결 실패(데몬 종료 중·소켓 교체 중)를 만났을 때
+/// `spawn_detached_daemon` 으로 **라이벌 데몬을 낳는다**(재귀 기동 · 폭주 ①).
+pub const ENV_NO_AUTOSTART: &str = "CYS_NO_AUTOSTART";
+/// `ENV_NO_AUTOSTART` 의 켜짐 값. 소비측(`cys.rs` autostart 게이트)이 `== "1"` 로 읽으므로
+/// 이 상수만 쓴다("true"·"yes" 는 통하지 않는다 — 실측 계약).
+pub const NO_AUTOSTART_ON: &str = "1";
+
+/// Windows `CREATE_NEW_PROCESS_GROUP` — 자식을 **새 콘솔 프로세스 그룹**의 루트로 만든다.
+/// 부모 콘솔의 Ctrl-C/Ctrl-Break 가 자식에게 전파되지 않는다(unix `setsid` 의 대응물).
+#[cfg(windows)]
+const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Windows `CREATE_NO_WINDOW` — 콘솔 자식에게 새 콘솔 창을 할당하지 않는다.
+/// 콘솔 없는 프로세스(cysd·cys-app)가 콘솔 자식을 낳을 때 빈 검은 창이 뜨는 실사고(2026-07-10) 차단.
+#[cfg(windows)]
+const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// **자식 생사 등급** — "이 자식은 부모가 죽을 때 같이 죽어야 하는가"를 스폰 지점마다 명시한다.
+///
+/// 이 분류가 필요한 이유(실측 · PROBE_RESULTS.md V-c): Claude Code 훅은 잘릴 때
+/// **프로세스 그룹/트리 단위로 자식까지 죽인다**. 그리고 `setsid(1)` 은 이 맥에도,
+/// Windows 동봉 PortableGit 에도 **없다**(PROBE_RESULTS_WINDOWS.md WIN-6). 즉 분리는
+/// 외부 유틸리티가 아니라 **스폰 시점의 flag/pre_exec 로만** 얻을 수 있고,
+/// 잘못 분리하면 정반대의 사고(고아 잔존 = 자원 누적)가 난다. 그래서 등급을 강제한다.
+///
+/// | 등급 | 부모 사망 시 자식 | 회수 책임 |
+/// |---|---|---|
+/// | `Survivor`     | **살아남아야 한다** | 자기 자신(데몬 flock·수명주기) |
+/// | `GroupScoped`  | 시그널로는 안 죽는다 | **원장(ledger)의 명시적 그룹 kill** |
+/// | `ConsoleScoped`| unix=시그널 면역 / **Windows=콘솔 Ctrl-C 로 함께 죽는다** | 부모의 `kill_group`(정상 종료 경로) + Windows 콘솔 전파(비정상 종료 경로) |
+/// | `Attached`     | **같이 죽어야 한다** | 부모(`wait`/`kill_on_drop`/트리 kill) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildLifetime {
+    /// 부모(CLI)가 죽어도 살아남아야 하는 자식. **유일 사례 = `cys` → `cysd` 기동.**
+    /// 새 세션(unix)·새 프로세스 그룹(Windows) + 콘솔 없음 + **부모 파이프 무점유**.
+    Survivor,
+    /// 시그널 그룹에서는 떼되 **원장이 pgid 로 회수**하는 장수 자식(채널 브리지).
+    /// 부모 콘솔이 없다는 전제라 Windows 콘솔 창도 숨긴다.
+    GroupScoped,
+    /// 사용자 콘솔을 **그대로 물려받는** 전경 자식(`cys run -- <명령>`).
+    /// unix 는 `setsid` + 부모의 SIGINT/SIGTERM/SIGHUP 핸들러가 `killpg` 로 회수한다.
+    /// ★Windows 는 **일부러 분리하지 않는다**: 대응 콘솔 컨트롤 핸들러가 없어서,
+    ///   분리하면 CLI 가 Ctrl-C 로 죽는 순간 `kill_group`(= `child.wait()` 이후에만 도달)이
+    ///   영영 실행되지 않아 자식이 **영구 고아**로 남는다. 회수 수단을 얻기 전의 분리는
+    ///   개선이 아니라 자원 누적이다. `CREATE_NO_WINDOW` 도 금지 — 사용자가 실행을 요청한
+    ///   명령의 출력을 가리게 된다.
+    ConsoleScoped,
+    /// 부모가 `wait`/`kill_on_drop` 으로 붙들고 있는 유계 자식(auto-restore·브리지 재기동·
+    /// launch-agent 호출·스케줄 명령). **분리 금지** — 트리 kill 로 함께 죽는 것이 정상 동작이다.
+    /// Windows 콘솔 창만 숨긴다(= 기존 `HideConsole` 트레이트와 동일한 flag).
+    Attached,
+}
+
+impl ChildLifetime {
+    /// 이 등급의 Windows `creation_flags` **완성값**. 등급 하나가 flag word 전체를 결정한다 —
+    /// `creation_flags` 는 누적이 아니라 **덮어쓰기**라, 호출부가 `hide_console()` 을 따로 부르면
+    /// 앞서 얹은 그룹 flag 가 조용히 사라진다(channels.rs 원주석이 지적한 함정). 등급 단일값이
+    /// 그 함정을 구조적으로 없앤다.
+    #[cfg(windows)]
+    const fn win_creation_flags(self) -> u32 {
+        match self {
+            ChildLifetime::Survivor => WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW,
+            ChildLifetime::GroupScoped => WIN_CREATE_NEW_PROCESS_GROUP | WIN_CREATE_NO_WINDOW,
+            ChildLifetime::ConsoleScoped => 0,
+            ChildLifetime::Attached => WIN_CREATE_NO_WINDOW,
+        }
+    }
+
+    /// unix 에서 새 세션(`setsid`)으로 떼어낼 등급인가.
+    const fn unix_setsid(self) -> bool {
+        matches!(
+            self,
+            ChildLifetime::Survivor | ChildLifetime::GroupScoped | ChildLifetime::ConsoleScoped
+        )
+    }
+
+    /// 부모의 stdin/stdout/stderr 를 **물려받지 않게** 할 등급인가.
+    /// 분리 자식이 부모 파이프를 쥐고 있으면, 부모가 먼저 끝나도 그 파이프를 읽는 쪽
+    /// (`$(cys …)`·CI 러너)이 자식이 죽을 때까지 EOF 를 못 받아 **부모 종료가 지연**된다.
+    /// `Survivor` 만 해당 — 나머지는 로그/캡처가 유일한 진단 채널이라 호출부가 정한다
+    /// (침묵 고장 클래스를 새로 만들지 않는다).
+    const fn detach_stdio(self) -> bool {
+        matches!(self, ChildLifetime::Survivor)
+    }
+}
+
+/// 자식 스폰 규약을 **한 곳에서** 얹는 확장 트레이트. `std::process::Command` 와
+/// `tokio::process::Command` 양쪽에 같은 의미로 구현된다(빌더 종류가 규약을 갈라놓지 않는다).
+///
+/// ★규약: 프로덕션의 모든 자식 스폰은 `pre_exec`/`creation_flags` 를 **직접 부르지 않고**
+/// 이 트레이트를 경유한다. 소스 핀 테스트가 우회 스폰을 적색으로 잡는다.
+pub trait SpawnPolicy {
+    /// 생사 등급에 맞는 세션/그룹 분리 + Windows 콘솔 정책 + (해당 등급이면) 파이프 무점유.
+    fn spawn_policy(&mut self, class: ChildLifetime) -> &mut Self;
+    /// 이 자식(및 그 자손)이 라이벌 데몬을 autostart 하지 못하게 봉인한다.
+    fn no_autostart(&mut self) -> &mut Self;
+}
+
+macro_rules! impl_spawn_policy {
+    ($t:ty) => {
+        impl SpawnPolicy for $t {
+            fn spawn_policy(&mut self, class: ChildLifetime) -> &mut Self {
+                if class.detach_stdio() {
+                    self.stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                }
+                #[cfg(unix)]
+                {
+                    if class.unix_setsid() {
+                        // SAFETY: 클로저는 fork 후 exec 전에 돈다 — async-signal-safe 호출만 한다
+                        // (`setsid` 는 async-signal-safe). 할당·락·I/O 금지 계약을 지킨다.
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            self.pre_exec(|| {
+                                libc::setsid();
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let f = class.win_creation_flags();
+                    if f != 0 {
+                        self.creation_flags(f);
+                    }
+                }
+                self
+            }
+
+            fn no_autostart(&mut self) -> &mut Self {
+                self.env(ENV_NO_AUTOSTART, NO_AUTOSTART_ON)
+            }
+        }
+    };
+}
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+impl_spawn_policy!(std::process::Command);
+impl_spawn_policy!(tokio::process::Command);
+
 /// 이행기 호환: CYS_* 우선 → 구 JAVIS_* → 구 AITERM_* 순 폴백.
 pub fn env_compat(primary: &str) -> Option<String> {
     let javis = primary.replacen("CYS_", "JAVIS_", 1);
@@ -2337,6 +2487,238 @@ mod tests {
             d5_win_opt_in_from(env_now.as_deref(), file_now),
             "d5_win_opt_in 은 (env {D5_WIN_OPT_IN_ENV}, ~/{D5_WIN_OPT_IN_FILE} 존재)를 \
              d5_win_opt_in_from 에 먹이는 얇은 래퍼여야 한다"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ★U-7 · 자식 스폰 규약 소스 핀 + 실동작 검증
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod spawn_policy_tests {
+    use super::{ChildLifetime, SpawnPolicy, ENV_NO_AUTOSTART, NO_AUTOSTART_ON};
+
+    /// `#[cfg(test)]` 로 시작해 열 0 의 `}` 로 끝나는 블록(= 이 저장소의 테스트 모듈 관례)을
+    /// 통째로 걷어낸 **프로덕션 슬라이스**를 만든다. cys.rs 처럼 파일 중간에 인라인 테스트
+    /// 모듈이 끼어 있는 파일이 있어서 "첫 `#[cfg(test)]` 앞까지" 방식은 쓸 수 없다
+    /// (그 방식이면 cys.rs 의 프로덕션 12,000줄이 스캔에서 통째로 빠진다 — 핀이 무력화된다).
+    fn production_slice(src: &str) -> String {
+        let mut out = String::new();
+        let mut it = src.lines().peekable();
+        while let Some(line) = it.next() {
+            if line == "#[cfg(test)]" {
+                for l in it.by_ref() {
+                    if l == "}" {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// production_slice 자기 검증(계측 타당성 ①) — 이 도구가 실제로 테스트만 걷어내고
+    /// 프로덕션은 남기는지 확인한다. 걷어내기가 과하면(=프로덕션까지 삭제) 아래 핀이
+    /// **아무것도 안 보고 초록**이 되어 버린다. 그래서 도구부터 검체를 건다.
+    #[test]
+    fn production_slice_keeps_production_drops_tests() {
+        let sample = "fn keep_me() {}\n#[cfg(test)]\nmod t {\n    fn drop_me() {}\n}\nfn keep2() {}\n";
+        let p = production_slice(sample);
+        assert!(p.contains("keep_me"), "프로덕션이 삭제됐다: {p}");
+        assert!(p.contains("keep2"), "테스트 모듈 뒤 프로덕션이 삭제됐다: {p}");
+        assert!(!p.contains("drop_me"), "테스트 모듈이 남았다: {p}");
+        // 실물에도 걸어 둔다 — 이 파일들의 프로덕션 앵커가 사라지면 핀이 헛도는 것이다.
+        let cys = production_slice(include_str!("bin/cys.rs"));
+        assert!(
+            cys.contains("fn spawn_detached_daemon"),
+            "cys.rs 프로덕션 앵커(spawn_detached_daemon) 소실 — 핀이 빈 문자열을 보고 있다"
+        );
+        assert!(
+            cys.contains("fn run_scoped"),
+            "cys.rs 프로덕션 앵커(run_scoped) 소실"
+        );
+        let ch = production_slice(include_str!("bin/cysd/channels.rs"));
+        assert!(ch.contains("fn spawn_bridge"), "channels.rs 프로덕션 앵커 소실");
+        let sc = production_slice(include_str!("bin/cysd/schedule.rs"));
+        assert!(sc.contains("fn launch_via_cli"), "schedule.rs 프로덕션 앵커 소실");
+    }
+
+    /// ★핵심 핀: 프로덕션의 자식 분리는 **전부 `spawn_policy` 를 경유**한다.
+    ///
+    /// 우회 스폰(`pre_exec`/`creation_flags` 직접 호출)이 하나라도 생기면 적색이다.
+    /// 왜 이 핀인가: 이 규약은 "빠뜨리면 조용히 잘못 동작"하는 종류다 —
+    /// Windows 에서 `CREATE_NEW_PROCESS_GROUP` 이 빠져도 스폰은 성공하고, 훅/콘솔이
+    /// 잘리는 순간에만 자식이 동반 사망한다(PROBE V-c·WIN-3 H4). 런타임 검체로는
+    /// 그 순간을 재현하기 어려우므로 **소스 층에서** 규약 이탈을 잡는다.
+    #[test]
+    fn no_bypass_child_separation_in_production() {
+        let files: [(&str, &str); 6] = [
+            ("src/bin/cys.rs", include_str!("bin/cys.rs")),
+            ("src/bin/cysd/channels.rs", include_str!("bin/cysd/channels.rs")),
+            ("src/bin/cysd/schedule.rs", include_str!("bin/cysd/schedule.rs")),
+            ("src/bin/cysd/main.rs", include_str!("bin/cysd/main.rs")),
+            // 데몬이 CLI·셸 자식을 낳는 나머지 두 파일 — 지금 0건이라 **비용 0 으로 잠근다**.
+            ("src/bin/cysd/governance.rs", include_str!("bin/cysd/governance.rs")),
+            ("src/bin/cysd/accounts.rs", include_str!("bin/cysd/accounts.rs")),
+        ];
+        for (name, src) in files {
+            let prod = production_slice(src);
+            // 문자열 조립으로 찾는다 — 이 테스트 소스 자체가 자기 검색어를 리터럴로
+            // 담고 있어도 무해하지만(스캔 대상은 bin/*.rs 뿐), 의도를 분명히 한다.
+            for needle in ["pre_exec(", "creation_flags("] {
+                let n = prod.matches(needle).count();
+                assert_eq!(
+                    n, 0,
+                    "{name} 프로덕션에 `{needle}` 직접 호출 {n}건 — 자식 분리는 \
+                     cys::SpawnPolicy::spawn_policy 하나만 경유해야 한다(U-7). \
+                     새 스폰 지점이면 ChildLifetime 등급을 먼저 정하고 헬퍼를 써라."
+                );
+            }
+        }
+    }
+
+    /// ★알려진 미편입 1건의 **동결 카운트**(범위 밖이라 빼는 게 아니라, 늘어나면 적색이 되게 건다).
+    ///
+    /// `src/factory_reset.rs::no_console_win` 은 `CREATE_NO_WINDOW` 한 줄짜리 로컬 헬퍼로,
+    /// 등급표상 `Attached` 와 같은 flag 다(분리 없음 — 규약 위반이 아니라 **정의처 미통합**).
+    /// U-7 의 대상 파일이 아니라 이번에 옮기지 않았다. 판정 축을 넓히는 대신 **현재값을 동결**해,
+    /// 이 파일에 분리 flag 가 새로 생기거나 우회 스폰이 늘어나면 즉시 적색이 되게 한다.
+    /// 이것은 완화가 아니다 — 종전에는 이 파일을 아무도 안 봤고, 지금은 1건 초과가 금지된다.
+    #[test]
+    fn known_unmigrated_separation_sites_are_frozen() {
+        let fr = production_slice(include_str!("factory_reset.rs"));
+        assert_eq!(
+            fr.matches("creation_flags(").count(),
+            1,
+            "factory_reset.rs 의 창 은폐 flag 는 no_console_win 1건으로 동결돼 있다 —              늘었다면 새 스폰이 규약 밖에서 생긴 것이다(cys::SpawnPolicy 로 편입하라)"
+        );
+        assert_eq!(
+            fr.matches("pre_exec(").count(),
+            0,
+            "factory_reset.rs 에 세션 분리가 새로 생겼다 — 회수 책임자가 없는 자식이다"
+        );
+    }
+
+    /// 각 스폰 지점이 **자기 생사 등급을 이름으로 선언**했는지 핀. 등급이 사라지거나
+    /// 다른 등급으로 슬쩍 바뀌면 적색 — 특히 `Survivor` 가 `Attached` 로 바뀌면
+    /// CLI 가 죽을 때 데몬이 동반 사망하는 회귀다(부팅 전멸).
+    #[test]
+    fn every_detached_spawn_declares_its_lifetime_class() {
+        let cys = production_slice(include_str!("bin/cys.rs"));
+        assert!(
+            cys.contains("ChildLifetime::Survivor"),
+            "cys.rs 의 데몬 기동(spawn_detached_daemon)이 Survivor 등급을 잃었다 — \
+             CLI 사망 시 데몬 동반 사망(부팅 전멸) 회귀"
+        );
+        assert!(
+            cys.contains("ChildLifetime::ConsoleScoped"),
+            "cys.rs 의 `cys run --` scoped 실행이 ConsoleScoped 등급을 잃었다"
+        );
+        let ch = production_slice(include_str!("bin/cysd/channels.rs"));
+        assert!(
+            ch.contains("ChildLifetime::GroupScoped"),
+            "channels.rs 브리지가 GroupScoped 등급을 잃었다 — 원장 pgid 회수가 무력화된다"
+        );
+        let sc = production_slice(include_str!("bin/cysd/schedule.rs"));
+        assert!(
+            sc.contains("ChildLifetime::Attached"),
+            "schedule.rs launch_via_cli 가 Attached 등급을 잃었다"
+        );
+    }
+
+    /// 데몬이 낳는 CLI 자식은 **전부** autostart 를 봉인한다(재귀 기동 = 데몬 폭주 ①).
+    /// `launch_via_cli` 는 이 결손이 실재하던 지점이다(U-7 과제 ③).
+    #[test]
+    fn daemon_spawned_cli_children_seal_autostart() {
+        let sc = production_slice(include_str!("bin/cysd/schedule.rs"));
+        let at = sc.find("async fn launch_via_cli").expect("launch_via_cli 소실");
+        let body = &sc[at..];
+        let end = body.find("\nfn aiterm_parse").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(".no_autostart()"),
+            "launch_via_cli 가 CYS_NO_AUTOSTART 를 걸지 않는다 — 데몬이 낳은 cys 가 \
+             소켓 실패 시 라이벌 데몬을 스폰한다(재귀 기동)"
+        );
+    }
+
+    /// 등급표 자체의 핀 — 값 규약이 조용히 바뀌면 소비측(`cys.rs` autostart 게이트가
+    /// `== \"1\"` 로 읽는다)이 무음으로 통과한다.
+    #[test]
+    fn no_autostart_contract_values() {
+        assert_eq!(ENV_NO_AUTOSTART, "CYS_NO_AUTOSTART");
+        assert_eq!(NO_AUTOSTART_ON, "1");
+        let mut c = std::process::Command::new("true");
+        c.no_autostart();
+        let got: Vec<_> = c
+            .get_envs()
+            .filter(|(k, _)| *k == std::ffi::OsStr::new(ENV_NO_AUTOSTART))
+            .collect();
+        assert_eq!(got.len(), 1, "no_autostart 가 env 를 얹지 않았다");
+        assert_eq!(
+            got[0].1,
+            Some(std::ffi::OsStr::new(NO_AUTOSTART_ON)),
+            "값이 계약값이 아니다"
+        );
+    }
+
+    /// ★실동작 검증(unix): 등급이 실제로 프로세스 그룹을 가르는가.
+    /// 소스 핀만으로는 "헬퍼가 no-op 이어도 초록"이 되므로, 진짜 자식을 띄워
+    /// `getpgid` 를 재본다 — 분리 등급은 부모와 다른 pgid, `Attached` 는 같은 pgid.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_policy_actually_separates_process_group_on_unix() {
+        fn pgid(pid: u32) -> i32 {
+            unsafe { libc::getpgid(pid as libc::pid_t) }
+        }
+        let mine = pgid(std::process::id());
+        assert!(mine > 0, "자기 pgid 관측 실패 — 계측기 무효");
+
+        let mut detached = std::process::Command::new("sleep");
+        detached.arg("5").spawn_policy(ChildLifetime::GroupScoped);
+        let mut d = detached.spawn().expect("분리 자식 spawn 실패");
+        let dp = pgid(d.id());
+
+        let mut attached = std::process::Command::new("sleep");
+        attached
+            .arg("5")
+            .spawn_policy(ChildLifetime::Attached)
+            .stdout(std::process::Stdio::null());
+        let mut a = attached.spawn().expect("동반 자식 spawn 실패");
+        let ap = pgid(a.id());
+
+        let _ = d.kill();
+        let _ = d.wait(); // 좀비 0
+        let _ = a.kill();
+        let _ = a.wait();
+
+        assert_eq!(
+            dp,
+            d.id() as i32,
+            "GroupScoped 자식의 pgid 가 자기 pid 와 다르다 — setsid 가 안 걸렸다"
+        );
+        assert_ne!(dp, mine, "GroupScoped 자식이 부모 그룹에 남았다(분리 무효)");
+        assert_eq!(ap, mine, "Attached 자식이 부모 그룹을 벗어났다(동반 사망 계약 파손)");
+    }
+
+    /// `Survivor` 만 부모 파이프를 놓는다 — 실제로 stdout 이 상속되지 않는지 자식의
+    /// 출력이 부모 캡처에 안 잡히는 것으로 확인한다(파이프 무점유 규약).
+    #[cfg(unix)]
+    #[test]
+    fn survivor_does_not_hold_parent_pipes() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo LEAKED")
+            .spawn_policy(ChildLifetime::Survivor)
+            .output()
+            .expect("spawn 실패");
+        assert!(
+            out.stdout.is_empty(),
+            "Survivor 자식이 stdout 을 물려받았다 — 부모 파이프를 쥐면 부모 종료가 지연된다: {:?}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 }

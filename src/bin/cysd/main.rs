@@ -1497,15 +1497,105 @@ async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
 
 const MAX_REQUEST_LINE: usize = 10 * 1024 * 1024; // 지침 주입(수백 KB)에 충분한 10MB
 
+/// ★U-6(서버측) 연결 후 **첫 요청 줄**이 도착하기까지의 상한(초).
+///
+/// 고친 것: `next_line_capped` 는 줄 길이만 유계이고 **시간은 무계**였다. 연결만 잡고 한 줄도
+/// 보내지 않는 클라이언트가 연결 태스크를 영구 점유한다 — 태스크·소켓 핸들·버퍼가 회수되지
+/// 않는 누수이고, 이것은 클라이언트측 상한(cys.rs `RpcDeadline`)이 막을 수 없는 반대 방향의
+/// wedge다.
+///
+/// ★근거 정정(P1-4 · 리뷰어 2인 독립 반박 · 코드 재확인 완료): 종전 주석은 "Windows 는 named
+/// pipe 인스턴스 풀이 8(`PIPE_LISTENER_POOL`)이라 그런 클라이언트 8개면 데몬이 전원에게
+/// 무응답"이라고 적었다. **틀렸다.** `pipe_listener` 는 accept 직후 클라이언트를
+/// `tokio::spawn` 으로 떼어내고 **곧바로** listening 인스턴스를 재생성한다
+/// (`server = recreate_pipe_instance(&pipe_name).await` — 이 파일의 `pipe_listener`).
+/// 그러므로 침묵 클라이언트는 listening 슬롯을 점유하지 않고, `PIPE_LISTENER_POOL` 은
+/// "accept→재생성 창의 동시 접속 흡수량"이지 동시 연결 수용량이 아니다.
+/// 실제 상한은 **파이프 인스턴스 총수**다: `create_pipe_instance` 는 `ServerOptions::new()` 기본값을
+/// 쓰고 그 기본 `max_instances` 는 `PIPE_UNLIMITED_INSTANCES` = **255**
+/// (tokio 1.52.3 `net/windows/named_pipe.rs` `ServerOptions::new` · windows-sys
+/// `PIPE_UNLIMITED_INSTANCES: u32 = 255`). 즉 무응답까지 필요한 침묵 클라이언트 수는 8이 아니라
+/// **연결분 + listening 8이 255에 닿을 때**로, 종전 주석의 약 30배다.
+/// ∴ 이 상한의 실효는 "인스턴스 8개 고갈 방지"가 아니라 **누수 태스크·핸들의 회수**이며,
+/// 그 회수가 255 고갈이라는 먼 한계선까지의 거리를 유지시킨다. 값 60초는 그대로 둔다 —
+/// 근거 문장만 실제 구조로 바꾼 것이고 판정 축·거동은 무변이다.
+///
+/// ★상한을 **첫 줄에만** 거는 이유(확립된 연결은 건드리지 않는다): GUI(src-tauri `RPC_POOL`)는
+/// 소켓별 **영속 연결**을 재사용한다. 유휴 중 서버가 끊으면 다음 RPC 가 `rpc_full` 의
+/// `AfterSend`(= 재시도 금지 분기)로 떨어져 사용자에게 오류로 보인다. 유휴 끊기는 그래서 금지다.
+/// 첫 줄 상한은 그 경로에 닿지 않는다 — 풀은 연결 직후 곧바로 요청을 쓴다.
+/// 판정 축을 옮긴 것이 아니라(줄 길이 상한 그대로), 시간 축을 **없던 곳에 새로** 둔 것이다.
+///
+/// 값 60초: 연결 후 60초 동안 한 줄도 못 보내는 클라이언트는 정상 상태가 아니다. 정상 클라이언트는
+/// connect 직후 write 하므로(cys `rpc_roundtrip` · GUI `rpc_once` · deadman `probe_holder`) 실측
+/// 여유가 3자릿수 배다. 생존 프로브(connect 후 즉시 drop)는 EOF 로 먼저 빠져나가 무관하다.
+const FIRST_LINE_IDLE_SECS: u64 = 60;
+
+/// 롤백 스위치 — `CYS_CONN_FIRST_LINE_SECS=0` 이면 첫 줄 상한 해제(개정 전 무한 대기 거동),
+/// 양수면 그 값(초). 코드 revert 없이 무력화 가능해야 한다는 단위 계약의 집행부다.
+fn first_line_idle_timeout() -> Option<std::time::Duration> {
+    parse_first_line_cap(cys::env_compat("CYS_CONN_FIRST_LINE_SECS").as_deref())
+}
+
+/// 순수 판정부 — env 를 인자로 받아 테스트가 프로세스 전역 env 를 흔들지 않게 한다.
+fn parse_first_line_cap(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(v) => Some(std::time::Duration::from_secs(v)),
+        None => Some(std::time::Duration::from_secs(FIRST_LINE_IDLE_SECS)),
+    }
+}
+
 async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Option<u32>) {
+    handle_connection_capped(daemon, stream, caller_pid, first_line_idle_timeout()).await
+}
+
+/// `handle_connection` 의 본체 — 첫 줄 상한을 인자로 받는다(테스트가 짧은 상한으로 실제 경로를
+/// 그대로 돌릴 수 있게. env 를 흔들면 병렬 테스트가 서로를 오염시킨다).
+async fn handle_connection_capped(
+    daemon: Arc<Daemon>,
+    stream: Stream,
+    caller_pid: Option<u32>,
+    first_line_cap: Option<std::time::Duration>,
+) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
+    let mut awaiting_first_line = true;
+    // ★P1-3: 첫 줄 상한은 **절대 데드라인**이다(매 반복 재장전하는 상대 상한이 아니다).
+    //   상대 상한이면 빈 줄을 상한보다 짧은 주기로 흘리는 것만으로 상한이 무한히 밀린다
+    //   — 그건 이 상한이 막으려던 바로 그 wedge 다. 한 번만 계산해 `timeout_at` 에 넘긴다.
+    let first_line_deadline = first_line_cap.map(|cap| tokio::time::Instant::now() + cap);
 
-    while let Ok(Some(line)) = next_line_capped(&mut reader, MAX_REQUEST_LINE).await {
+    loop {
+        // 첫 줄만 시간 유계(위 상수 주석의 근거). 그 뒤 줄들은 종전대로 무계 — 영속 연결을
+        // 쥔 정상 클라이언트를 유휴만으로 끊지 않는다.
+        let read = match (awaiting_first_line, first_line_deadline) {
+            (true, Some(at)) => {
+                match tokio::time::timeout_at(at, next_line_capped(&mut reader, MAX_REQUEST_LINE))
+                    .await
+                {
+                    Ok(r) => r,
+                    // 무언의 클라이언트 — 연결을 회수한다(조용히: 요청이 없었으므로 돌려줄
+                    // 응답 프레임도 없다. 상대는 소켓 EOF 로 알게 된다).
+                    Err(_) => return,
+                }
+            }
+            _ => next_line_capped(&mut reader, MAX_REQUEST_LINE).await,
+        };
+        let Ok(Some(line)) = read else {
+            return; // 종전 `while let Ok(Some(line))` 과 동일 종료 조건(EOF·과대 줄·I/O 오류)
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
+            // ★P1-3(순서가 판정이다): **빈 줄은 첫 줄로 계상하지 않는다.**
+            //   종전에는 `awaiting_first_line = false` 가 이 검사보다 **앞**에 있어, 클라이언트가
+            //   개행 1바이트(`"\n"`)만 보내고 침묵하면 상한이 통째로 풀린 채 연결이 영구
+            //   잔존했다 — 1바이트로 무장 해제되는 상한은 없는 것과 같다. 빈 줄은 요청이
+            //   아니므로(파싱조차 하지 않는다) '첫 요청 줄이 도착했다'의 근거가 될 수 없다.
             continue;
         }
+        // 여기까지 온 줄만이 **요청**이다 — 이 시점에 상한을 놓는다.
+        awaiting_first_line = false;
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -2900,6 +2990,246 @@ mod auto_restore_tests {
             "run_auto_restore_once 종료 후 guard drop 으로 restore_roots 가 비어야 한다 (L1)"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod first_line_idle_tests {
+    use super::{handle_connection_capped, parse_first_line_cap, Stream, FIRST_LINE_IDLE_SECS};
+    use crate::state::Daemon;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    fn temp_daemon(tag: &str) -> (std::path::PathBuf, Arc<Daemon>) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-u6-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = Daemon::new(dir.join("cysd.sock"));
+        (dir, d)
+    }
+
+    /// 롤백 노브 진리표 — 순수 판정부만 시험한다(프로세스 env 무접촉).
+    #[test]
+    fn first_line_cap_rollback_knob() {
+        assert_eq!(
+            parse_first_line_cap(None),
+            Some(Duration::from_secs(FIRST_LINE_IDLE_SECS))
+        );
+        assert_eq!(parse_first_line_cap(Some("0")), None, "0 = 상한 해제(개정 전 거동)");
+        assert_eq!(parse_first_line_cap(Some(" 7 ")), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_first_line_cap(Some("nope")),
+            Some(Duration::from_secs(FIRST_LINE_IDLE_SECS)),
+            "오타가 상한을 조용히 없애면 안 된다"
+        );
+    }
+
+    /// ★U-6(서버측) 회귀 박제: **연결만 잡고 한 줄도 보내지 않는 클라이언트**에서 연결 태스크가
+    /// 유계 종료한다. 개정 전에는 `next_line_capped` 가 시간 무계라 이 태스크가 영구 잔존했다
+    /// (태스크·핸들 누수. Windows 파이프 인스턴스 총 상한 255 에 대한 잔여 거리도 함께 갉는다 —
+    /// 근거는 `FIRST_LINE_IDLE_SECS` 주석의 P1-4 정정문).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_client_connection_is_reclaimed() {
+        let (dir, daemon) = temp_daemon("silent");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            Some(Duration::from_millis(300)),
+        ));
+        // 클라이언트를 살려 둔 채(= EOF 를 주지 않는다) 아무것도 쓰지 않는다.
+        let finished = tokio::time::timeout(Duration::from_secs(5), conn).await;
+        assert!(
+            finished.is_ok(),
+            "첫 줄을 보내지 않는 연결이 회수되지 않았다(연결 태스크 영구 잔존)"
+        );
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★계측 타당성(negation): **상한을 끄면(=개정 전 코드) 같은 연결이 회수되지 않는다.**
+    /// 위 테스트의 종료가 '무언의 클라이언트라 어차피 끝나서'가 아니라 **상한이 일한 결과**임을
+    /// 증명한다. 롤백 노브(`CYS_CONN_FIRST_LINE_SECS=0`)의 실효 확인이기도 하다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_client_persists_without_the_cap_instrument_validity() {
+        let (dir, daemon) = temp_daemon("silent-nocap");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None, // 상한 해제 = 개정 전 거동
+        ));
+        let still_running = tokio::time::timeout(Duration::from_millis(700), conn).await;
+        assert!(
+            still_running.is_err(),
+            "상한이 없는데도 연결이 스스로 회수됐다 — 위 회수 테스트가 상한을 시험하지 못한다"
+        );
+        drop(client); // EOF 로 태스크를 정리한다(테스트 누수 방지)
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★비회귀 박제(더 중요): **첫 줄을 보낸 뒤의 유휴는 끊지 않는다.**
+    /// GUI(src-tauri `RPC_POOL`)는 소켓별 영속 연결을 재사용하고, 서버가 유휴 중 끊으면 다음
+    /// RPC 가 `rpc_full` 의 AfterSend(재시도 금지) 분기로 떨어져 사용자에게 오류로 보인다.
+    /// 상한을 '연결 유휴 전체'로 넓히면 이 테스트가 적색이 된다 — 판정 축의 경계선이다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_connection_survives_idle_beyond_the_cap() {
+        let (dir, daemon) = temp_daemon("established");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let _conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            Some(Duration::from_millis(200)),
+        ));
+        let mut client = BufReader::new(client);
+        let ping = b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n";
+
+        client.get_mut().write_all(ping).await.unwrap();
+        client.get_mut().flush().await.unwrap();
+        let mut first = String::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut first))
+            .await
+            .expect("첫 응답이 오지 않았다")
+            .unwrap();
+        assert!(first.contains("\"ok\":true"), "첫 응답이 성공이 아니다: {first}");
+
+        // 상한의 5배를 유휴로 보낸다 — 확립된 연결은 살아 있어야 한다.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        client.get_mut().write_all(ping).await.unwrap();
+        client.get_mut().flush().await.unwrap();
+        let mut second = String::new();
+        let got = tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut second))
+            .await
+            .expect("두 번째 응답이 오지 않았다(유휴 끊김 = GUI 영속 풀 파괴)")
+            .unwrap();
+        assert!(got > 0 && second.contains("\"ok\":true"), "유휴 뒤 왕복 실패: {second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★P1-3 회귀 박제: **개행 1바이트로 첫 줄 상한을 무장 해제할 수 없다.**
+    ///
+    /// 【고친 결함】 `awaiting_first_line = false;` 가 `if line.is_empty() { continue; }` **앞**에
+    /// 있었다. 그래서 클라이언트가 `"\n"` 하나만 보내고 침묵하면 그 빈 줄이 '첫 요청 줄'로
+    /// 계상돼 상한이 통째로 풀렸고, 연결 태스크가 **영구 잔존**했다. 요청으로 파싱조차 되지
+    /// 않는 줄이 상한을 해제한다는 것이 결함의 핵심이다.
+    ///
+    /// 【적색 증명】 수정 전 코드에서 이 검체는 `finished` 가 `Err`(=회수 안 됨)로 적색이다 —
+    /// 위 `silent_client_persists_without_the_cap_instrument_validity` 가 "상한이 없으면 회수되지
+    /// 않는다"를 이미 박제하므로, 빈 줄이 상한을 없앤다는 것이 곧 이 검체의 적색이다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blank_line_does_not_disarm_the_first_line_cap() {
+        let (dir, daemon) = temp_daemon("blankline");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            Some(Duration::from_millis(300)),
+        ));
+        let mut client = client;
+        // 개행 1바이트만 보내고 침묵한다(EOF 도 주지 않는다).
+        client.write_all(b"\n").await.unwrap();
+        client.flush().await.unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(5), conn).await;
+        assert!(
+            finished.is_ok(),
+            "빈 줄 하나로 첫 줄 상한이 풀려 연결이 영구 잔존했다(개행 1바이트 무장 해제)"
+        );
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★P1-3 (두 번째 축): **빈 줄을 계속 흘려도** 상한을 밀어낼 수 없다.
+    /// 상한이 반복마다 재장전되는 상대 상한이면 빈 줄 드립(상한보다 짧은 주기)으로 연결을
+    /// 무한히 붙잡을 수 있다 — 그건 상한이 막으려던 wedge 그 자체다. 절대 데드라인
+    /// (`timeout_at`)이 그 경로를 닫는다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blank_line_drip_cannot_push_the_first_line_deadline() {
+        let (dir, daemon) = temp_daemon("blankdrip");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            Some(Duration::from_millis(400)),
+        ));
+        let mut client = client;
+        // 상한(400ms)보다 짧은 주기로 빈 줄을 흘린다 — 상대 상한이면 영원히 살아남는다.
+        // ★드립은 관측창(3초)보다 **오래** 돌아야 한다. 드립이 먼저 끝나면 그 뒤 한 번의 상한
+        //   만료로 연결이 회수돼, 상대 상한에서도 이 검체가 초록이 된다(계측 무효).
+        let drip = tokio::spawn(async move {
+            for _ in 0..300 {
+                // 30초분
+                if client.write_all(b"\n").await.is_err() {
+                    break; // 서버가 회수했다 — 여기서 끝난다
+                }
+                let _ = client.flush().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            client // EOF 를 주지 않기 위해 소유권을 유지한 채 반환
+        });
+        let finished = tokio::time::timeout(Duration::from_secs(3), conn).await;
+        assert!(
+            finished.is_ok(),
+            "빈 줄 드립이 첫 줄 데드라인을 무한히 밀어냈다(상대 상한 부활)"
+        );
+        drip.abort();
+        let _ = drip.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★비회귀: 빈 줄 뒤에 **진짜 요청**이 오면 종전대로 처리되고, 그 뒤 유휴는 끊지 않는다.
+    /// (P1-3 이 빈 줄을 '계상하지 않는다'로 바꿨을 뿐 '거부한다'로 바꾸지 않았음을 박제한다.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blank_lines_before_a_real_request_are_still_tolerated() {
+        let (dir, daemon) = temp_daemon("blankthenreq");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server: Stream = Box::new(server);
+        let _conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            Some(Duration::from_millis(600)),
+        ));
+        let mut client = BufReader::new(client);
+        let ping = b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n";
+        client.get_mut().write_all(b"\n\n  \n").await.unwrap();
+        client.get_mut().write_all(ping).await.unwrap();
+        client.get_mut().flush().await.unwrap();
+        let mut first = String::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut first))
+            .await
+            .expect("빈 줄 뒤 요청의 응답이 오지 않았다")
+            .unwrap();
+        assert!(first.contains("\"ok\":true"), "빈 줄 뒤 요청이 처리되지 않았다: {first}");
+
+        // 상한의 5배 유휴 후에도 확립된 연결은 살아 있어야 한다(첫 줄 상한이 놓였다).
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        client.get_mut().write_all(ping).await.unwrap();
+        client.get_mut().flush().await.unwrap();
+        let mut second = String::new();
+        let got = tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut second))
+            .await
+            .expect("두 번째 응답이 오지 않았다 — 첫 줄 상한이 확립 연결까지 끊었다")
+            .unwrap();
+        assert!(got > 0 && second.contains("\"ok\":true"), "유휴 뒤 왕복 실패: {second}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
