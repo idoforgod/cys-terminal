@@ -157,19 +157,32 @@ codesign --verify --strict --verbose /Applications/cys.app
 1. **권장 — GUI 1클릭(1회 관리자 승인):** Control Center 헤더 → **"셸에 cys 설치"** 클릭 →
    macOS 비밀번호 1회 입력. `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생깁니다.
    버튼은 macOS에서만 나타납니다(Windows·Linux에서는 표시되지 않습니다).
-   - 클릭 뒤 결과 알림이 **성공/경고 두 등급**으로 옵니다. 다음 두 경우는 **아직 끝난 게 아닙니다**:
-     - **"다른 cys가 앞을 가립니다"** — 심링크는 생겼지만 PATH 앞쪽의 다른 cys(예: 다른 도구가
-       설치한 사본)가 먼저 잡힙니다. 알림에 적힌 그 경로를 지우거나 `/usr/local/bin`을 PATH 앞으로
-       옮긴 뒤, 새 터미널에서 `which -a cys` 로 1순위를 확인하세요.
-     - **"확인 불가"** — 심링크는 생겼지만 어떤 cys가 잡히는지 확인하지 못했습니다(검증 명령 실패·응답 없음).
-       새 터미널에서 `which -a cys` 를 직접 확인하세요.
+   - 클릭 뒤 결과 알림이 **성공/경고 두 등급**으로 옵니다. 다음 세 경우는 **아직 끝난 게 아닙니다**
+     (경고 알림은 60초 동안 떠 있고, 그 뒤에도 Control Center의 **알람 탭**에서 다시 볼 수 있습니다):
+     - **"다른 cys가 앞을 가립니다"** — 심링크는 생겼지만 로그인 셸 기준으로 PATH 앞쪽의 다른
+       cys(예: 다른 도구가 설치한 사본)가 먼저 잡힙니다. 알림에 적힌 그 경로를 지우거나
+       `/usr/local/bin`을 PATH 앞으로 옮긴 뒤, 새 터미널에서 `which -a cys` 로 1순위를 확인하세요.
+     - **"PATH에서 cys를 찾지 못했습니다"** — 확인은 정상적으로 끝났는데 로그인 셸의 PATH에
+       `cys`가 없는 경우입니다. 대개 PATH에 `/usr/local/bin`이 들어 있지 않아서입니다(설치 자체가
+       실패한 것이 아닙니다). 셸 설정 파일(zsh면 `~/.zshrc`)에 `/usr/local/bin`을 PATH로 추가하세요.
+     - **"확인 불가"** — 확인 명령(`which -a cys`)이 실패했거나 응답하지 않아 **무엇이 잡히는지
+       모르는** 경우입니다. 새 터미널에서 `which -a cys` 를 직접 실행해 확인하세요.
+       (이 둘은 서로 다른 상황입니다 — 알림 문구가 어느 쪽인지 알려 줍니다.)
+   - 확인에 쓰는 셸은 **로그인 셸**(`$SHELL`, macOS 기본은 zsh)입니다. 즉 "PATH 1순위"라는 판정은
+     *그 셸 기준*이며, 다른 셸이나 다른 프로필에서는 결과가 다를 수 있습니다.
+   - **같은 이름의 파일이 이미 있을 때**: `/usr/local/bin/cys`(또는 `cysd`) 자리에 심볼릭 링크가
+     아닌 **실제 파일**(다른 도구가 설치한 바이너리)이 있으면, 설치는 그 파일을 **지우지 않고**
+     같은 폴더에 `<경로>.cys-backup-<시각>` 으로 옮겨 보관한 뒤 링크를 만듭니다. 백업된 경로는
+     결과 알림에 나오며, 되돌리려면 그 파일을 원래 이름으로 다시 옮기면 됩니다.
+     (다른 앱을 가리키던 **링크**는 백업 없이 새 링크로 바뀝니다 — 링크 자체에는 내용이 없습니다.)
+     그런 파일이 있으면 버튼을 누르기 전에 Control Center에 미리 고지가 뜹니다.
    - 앱이 `/Applications` 밖(예: `~/Downloads`, DMG 안)에서 실행 중이면 버튼은 **거부**합니다.
      Finder로 응용 프로그램 폴더에 옮긴 뒤 다시 시도하세요.
 2. **폴백 — 수동 sudo:** GUI를 못 쓰는 환경에서만.
 ```sh
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-02] sudo 심링크 — 사람이 직접
-sudo ln -sf /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
-sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
+sudo ln -sfn /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
+sudo ln -sfn /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 ```
 `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생기고 새 터미널에서 `cys`가 바로
 동작합니다. (앱 업데이트에도 경로 유지 — 심볼릭이라 자동 추종. pane *안*에서는 PATH가 자동
@@ -179,6 +192,10 @@ sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 승인하면 `/usr/local/bin/cys`·`cysd` **심볼릭 링크만** 제거합니다(관리자 승인 1회). 같은 이름의
 일반 파일이나 다른 앱을 가리키는 링크는 건드리지 않고 사유와 함께 건너뜁니다. 수동 폴백은
 `sudo rm /usr/local/bin/cys /usr/local/bin/cysd` (🧑 [HUMAN] — 지우기 전 `ls -l` 로 심링크인지 확인).
+
+건너뛴 항목이 있거나 지운 뒤에도 남은 파일이 있으면 알림이 **"부분 완료"** 로 뜨고(60초 유지 ·
+이후 알람 탭), **어떤 경로를 왜 건너뛰었는지**와 남은 경로의 복구 명령(`sudo rm <경로>`)을 그대로
+보여줍니다. 즉 일부만 정리된 상태가 성공 알림으로 덮이지 않습니다.
 
 ### 🧑 C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영) [HUMAN]
 재부팅 후에도 데몬이 자동으로 살아 있게 launchd에 등록:
@@ -194,16 +211,32 @@ cys daemon uninstall          # 해제
 
 ## Windows
 
-> 코어(named pipe·ConPTY·DSR)는 검증 완료(docs/WINDOWS_VALIDATION.md). GUI 앱(Tauri)의 Windows
-> 빌드는 별도 트랙입니다. 현재 Windows 배포는 **CLI+데몬(MSI/ZIP)** 중심입니다.
+> 코어(named pipe·ConPTY·DSR)는 검증 완료(docs/WINDOWS_VALIDATION.md). 소비자 Windows 배포본은
+> **NSIS 자기완결 설치본** `cys_<버전>_x64-setup.exe` **하나**이며, GUI 앱·데몬(cysd)·CLI(cys)와
+> 런타임(PortableGit + Python embeddable)이 모두 그 안에 들어 있습니다.
+> 근거: `src-tauri/tauri.windows.conf.json` 의 `"targets": ["nsis"]` · `.github/workflows/release.yml`
+> 의 `bundle/nsis/cys_*_x64-setup.exe` 수집.
+>
+> ⚠ **예전 MSI(WiX)는 폐기됐습니다.** `dist-win/*.wxs` 는 참고용 레거시 잔재로, 어떤 릴리스
+> 워크플로에서도 빌드·배포되지 않습니다(`dist-win/README.md`). 그 MSI는 PATH를 등록했지만
+> **지금 배포되는 setup.exe 는 등록하지 않습니다** — 아래 A의 경고를 보세요.
 
-### 🧑 A. MSI 설치파일 [HUMAN]
-1. 아키텍처에 맞는 파일 실행: `cys-0.2.0-windows-x64.msi` 또는 `...-arm64.msi`.
-2. 설치 시 `cys.exe`·`cysd.exe`가 PATH에 등록됩니다.
+### 🧑 A. setup.exe 설치 [HUMAN]
+1. `cys_<버전>_x64-setup.exe` 실행. 미서명 빌드라 SmartScreen 경고가 뜨면 "추가 정보 → 실행".
+2. **현재 사용자** 설치입니다(`installMode: currentUser`) — 관리자 권한 없이 `%LOCALAPPDATA%\cys`
+   에 설치됩니다.
 3. `cys list` — 데몬이 없으면 자동 기동됩니다.
 
-### 🧑 B. ZIP (수동) [HUMAN]
-`cys-0.2.0-windows-x64.zip`을 풀고 폴더를 PATH에 추가하거나, 그 폴더에서 직접 `cys.exe` 실행.
+> ⚠ **설치기는 PATH를 건드리지 않습니다(시스템·사용자 어느 쪽도).** 앱 pane 안에서는 데몬이
+> PATH를 자동 주입하므로 `cys`가 바로 동작하지만, **앱 밖 터미널**(PowerShell·cmd)에서 쓰려면
+> `%LOCALAPPDATA%\cys` 를 직접 PATH에 추가하거나 전체 경로로 실행하세요. 자동 PATH 편집을 넣지
+> 않은 것은 의도입니다 — Windows PATH 자동 편집은 값 잘림·확장 변수 손상 사고가 알려져 있습니다.
+> (USER-MANUAL.md §2.4 와 같은 내용입니다.)
+
+### 🧑 B. ZIP (`.exe` 직다운이 막힐 때) [HUMAN]
+`cys_<버전>_x64-setup.zip` 은 **위 setup.exe 한 개를 그대로 담은 포장**입니다(기업 프록시·구형
+브라우저 대응 · `scripts/make-win-zip.py`). 압축을 풀어 그 안의 `setup.exe` 를 실행하면 A와
+같습니다 — 풀어놓은 폴더를 PATH에 넣는 용도가 아닙니다.
 
 ### 🧑 C. 상시 가동 (선택) [HUMAN]
 ```
@@ -247,7 +280,7 @@ cys boot                                     # 설치된 CLI 자동 감지 → w
 cys daemon uninstall                         # 상시 가동 해제(설치했다면)
 # 🧑 [HUMAN] macOS: 앱을 지우기 전에 Control Center 헤더의 "셸 cys 해제"를 먼저 누르면 심링크가 정리됩니다(§B).
 # 🧑 [HUMAN] macOS: Applications에서 cys.app 삭제 + /usr/local/bin/cys{,d} 심링크 제거
-# 🧑 [HUMAN] Windows: 제어판에서 MSI 제거
+# 🧑 [HUMAN] Windows: 설정 → 앱 → 'cys' 제거(setup.exe가 등록한 언인스톨러 · PATH는 애초에 건드리지 않았으므로 정리할 것이 없습니다)
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-03] ⚠ 비가역 완전 삭제 — 워커 자율 실행 금지·정지·오너 보고
 rm -rf ~/.cys ~/.local/state/cys             # pack·트랜스크립트·상태 완전 삭제(선택)
 ```

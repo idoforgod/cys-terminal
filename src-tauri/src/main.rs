@@ -1088,29 +1088,133 @@ fn bundle_integrity() -> Option<String> {
     None
 }
 
-/// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
+/// (BLOCK-1) 설치 시 백업 파일명에 박을 타임스탬프(순수). **셸에서 `date` 를 부르지 않는다** —
+/// 승격 스크립트가 만드는 이름이 실행 환경(로케일·TZ·PATH 상의 date 구현)에 따라 달라지면
+/// "무엇을 어디로 백업했는지"를 Rust 가 사용자에게 정확히 보고할 수 없다. Rust 가 이름을 먼저
+/// 확정해 스크립트에 박아 넣어야 보고 문구와 실제 파일명이 **하나의 진실**이 된다.
+/// 사람이 읽는 값이 아니라 충돌 회피용 접미사이므로 epoch 초로 충분하다(외부 크레이트 의존 없음).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn backup_stamp(now: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+/// (BLOCK-1) 대상 경로 → 백업 경로(순수). 스크립트가 만드는 이름과 사용자에게 보고하는 이름이
+/// 갈라지지 않도록 **생성처를 하나로** 둔다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn backup_path_for(target: &str, stamp: &str) -> String {
+    format!("{target}.cys-backup-{stamp}")
+}
+
+/// (BLOCK-1) 설치 전 관측 → **백업이 발생할** (원본, 백업본) 경로 쌍(순수).
+/// `build_install_script` 의 셸 조건(`-e && ! -L`)과 **같은 판정**을 Rust 쪽에서 한 번 더 계산한다 —
+/// 사용자에게 "무엇을 어디로 옮겼는지" 보고하려면 스크립트가 무엇을 할지 미리 알아야 하기 때문이다.
+/// 두 판정이 어긋나면 보고가 거짓이 되므로 조건을 바꿀 때는 반드시 함께 바꾼다.
+/// dangling 심볼릭(present=true·is_symlink=true)은 셸 `-e` 가 거짓이라 백업되지 않는다 — 여기서도
+/// `!is_symlink` 로 같이 제외된다(죽은 링크는 보존할 값이 없다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plan_install_backups(probes: &[LinkProbe], stamp: &str) -> Vec<(String, String)> {
+    probes
+        .iter()
+        .filter(|p| p.present && !p.is_symlink)
+        .map(|p| (p.path.clone(), backup_path_for(&p.path, stamp)))
+        .collect()
+}
+
+/// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 생성.
+///
+/// ★BLOCK-1(2026-08-25) **파괴 금지 → 백업**: 예전 본문은 `ln -sf` 하나였다. `ln -sf` 는 대상이
+/// **일반 파일이어도** unlink 후 심볼릭으로 갈아 끼운다 — 즉 Homebrew·수동 빌드가 깔아 둔 실체
+/// `/usr/local/bin/cys` 를 아무 말 없이 파괴했다. 해제 경로는 정확히 같은 파일을 "남의 설치본
+/// 파괴이고 되돌릴 수 없다"며 지켰는데(`decide_cli_uninstall` 의 SkipNotSymlink) 설치 경로만
+/// 정반대 가드였다. 그래서 **지우지 않고 옮긴다**: 심볼릭이 아닌 무언가가 있으면
+/// `<경로>.cys-backup-<stamp>` 로 mv 한 뒤에 링크를 만든다. 확인 모달을 두지 않는 근거가 바로
+/// 이것이다 — **잃는 것이 없어야 1클릭이 정당하다**.
+///
+/// 조건이 `[ -e X ] && [ ! -L X ]` 인 이유: 이미 심볼릭이면(우리 것이든 남의 것이든) mv 분기가 돌지
+/// 않으므로 **반복 설치가 멱등이고 백업이 쌓이지 않는다**. dangling 심볼릭은 `-e` 가 거짓이라 역시
+/// 백업 없이 그대로 갈아 끼워진다. mv 가 실패하면 `fi` 가 실패 상태를 물려주고 `&&` 가 끊겨 링크를
+/// 만들지 않는다 — 백업에 실패한 채 원본을 덮는 일은 없다.
+///
+/// `ln -sfn` 인 이유: BSD ln 에서 대상이 **디렉터리를 가리키는 심볼릭**이면 `-f` 만으로는 그 링크를
+/// 갈아 끼우지 않고 그 디렉터리 **안에** 새 링크를 만든다. 그러면 root 권한 쓰기가 target_dir 밖으로
+/// 새어 나간다(예: `/usr/local/bin/cys` 가 `/etc` 심볼릭이면 `/etc/cys` 가 생긴다).
+/// `-n`(대상 심볼릭을 따라가지 않음)이 그 누출을 구조적으로 막는다.
 fn build_install_script(
     cys: &std::path::Path,
     cysd: &std::path::Path,
     target_dir: &str,
+    stamp: &str,
 ) -> String {
+    let link = |src: &std::path::Path, name: &str| -> String {
+        let dst = format!("{target_dir}/{name}");
+        let bak = backup_path_for(&dst, stamp);
+        format!(
+            "if [ -e {d} ] && [ ! -L {d} ]; then mv {d} {b}; fi && ln -sfn {s} {d}",
+            d = sh_squote(&dst),
+            b = sh_squote(&bak),
+            s = sh_squote(&src.to_string_lossy()),
+        )
+    };
     format!(
-        "mkdir -p {td} && ln -sf {c} {tc} && ln -sf {d} {tdd}",
+        "mkdir -p {td} && {c} && {d}",
         td = sh_squote(target_dir),
-        c = sh_squote(&cys.to_string_lossy()),
-        tc = sh_squote(&format!("{target_dir}/cys")),
-        d = sh_squote(&cysd.to_string_lossy()),
-        tdd = sh_squote(&format!("{target_dir}/cysd")),
+        c = link(cys, "cys"),
+        d = link(cysd, "cysd"),
     )
 }
 
-/// `which -a cys` 출력 → precedence 순 경로 리스트(공백줄 제거).
+/// `which -a cys` 출력 → precedence 순 **절대경로** 리스트.
+///
+/// ★MINOR-7(2026-08-25): 절대경로(`/` 로 시작)만 받는다. 예전에는 "빈 줄이 아니면 경로"였다.
+/// `-lc` 로 로그인 셸을 태우면 rc 파일 배너·경고나 셸마다 다른 which 구현의 비-경로 출력이
+/// stdout 에 섞인다(zsh: `cys: aliased to ...`, `cys: shell built-in command`, bash: `cys not found`).
+/// 그 잡음을 경로로 격상하면 목록 1순위가 잡음이 되어 **installed 여야 할 설치가
+/// installed_shadowed 로 오판**되고, 존재하지도 않는 "앞을 가리는 cys" 를 지우라고 안내하게 된다.
 fn parse_which_a(stdout: &str) -> Vec<String> {
     stdout
         .lines()
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| l.starts_with('/'))
         .collect()
+}
+
+/// (MINOR-6) `plan_cli_install` **전용** 엄격 판정(순수): 번들이 정확히 `/Applications/cys.app`
+/// 또는 `<홈>/Applications/cys.app` 인가.
+///
+/// `classify_bundle_dir` 은 `parent.ends_with("/Applications")` 로 판정한다 — 그래서
+/// `/tmp/Applications/cys.app` · `~/Downloads/Applications/cys.app` 처럼 **사용자가 아무 때나 만들 수
+/// 있는** 디렉터리도 Canonical 로 통과시킨다. 그 상태로 설치하면 root 소유
+/// `/usr/local/bin/cys` 가 사용자 쓰기 가능한 경로를 가리키게 되어, D5 가 막으려던 바로 그 구멍
+/// (파일을 바꿔 끼우면 다음 `sudo cys` 가 남의 코드를 돌린다)이 그대로 열린다.
+///
+/// ★그런데 `classify_bundle_dir` 자체는 건드리지 않는다 — `autoregister_allowed`·`boot_path_verdict`
+/// 가 같은 함수를 쓰므로 고치면 부트 전면 게이트까지 함께 좁아지는 산탄총 수술이 된다.
+/// 비가역·root 권한이 걸린 **설치만** 이 엄격 판정을 추가로 통과해야 한다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn strict_install_bundle_ok(macos_dir: &std::path::Path, home: &std::path::Path) -> bool {
+    if macos_dir.file_name().map(|n| n != "MacOS").unwrap_or(true) {
+        return false;
+    }
+    let Some(contents) = macos_dir.parent() else {
+        return false;
+    };
+    if contents.file_name().map(|n| n != "Contents").unwrap_or(true) {
+        return false;
+    }
+    let Some(bundle) = contents.parent() else {
+        return false;
+    };
+    if bundle.file_name().map(|n| n != "cys.app").unwrap_or(true) {
+        return false;
+    }
+    let Some(parent) = bundle.parent() else {
+        return false;
+    };
+    parent == std::path::Path::new("/Applications") || parent == home.join("Applications")
 }
 
 /// 설치 계획(순수): 가드 판정 + 소스 경로 + osascript 인자 + 경고. osascript 실행은 포함하지 않는다.
@@ -1124,6 +1228,7 @@ struct CliInstallPlan {
 fn plan_cli_install(
     macos_dir: &std::path::Path,
     target_dir: &str,
+    stamp: &str,
 ) -> Result<CliInstallPlan, String> {
     match classify_bundle_dir(macos_dir) {
         BundleKind::Translocated => {
@@ -1154,11 +1259,27 @@ Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도�
         }
         BundleKind::Canonical => {}
     }
+    // ★MINOR-6(2026-08-25): Canonical 이어도 여기서 한 번 더 좁힌다. classify_bundle_dir 의
+    // ends_with("/Applications") 판정은 /tmp/Applications·~/Downloads/Applications 처럼 사용자가
+    // 직접 만든 디렉터리를 통과시키므로, D5 의 거부 근거(root 링크가 사용자 쓰기 가능 경로를
+    // 가리키면 안 된다)가 실제로는 성립하지 않았다. 설치 경로에만 엄격 판정을 덧댄다.
+    if !strict_install_bundle_ok(macos_dir, &cys::home_dir()) {
+        let bundle = macos_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| macos_dir.to_string_lossy().to_string());
+        return Err(format!(
+            "cys.app이 표준 Applications 폴더가 아닌 곳에서 실행 중입니다: {bundle}\n\
+정확히 /Applications 또는 홈 폴더의 Applications 안에 있는 cys.app에서만 설치할 수 있습니다. \
+Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도하세요."
+        ));
+    }
     // 가드를 모두 통과한 Canonical 경로만 여기까지 온다 — 위치 경고는 더 이상 존재하지 않는다.
     let warnings: Vec<String> = vec![];
     let cys_src = macos_dir.join("cys");
     let cysd_src = macos_dir.join("cysd");
-    let script = build_install_script(&cys_src, &cysd_src, target_dir);
+    let script = build_install_script(&cys_src, &cysd_src, target_dir, stamp);
     // AppleScript `do shell script`는 큰따옴표 문자열 리터럴을 요구한다 — 작은따옴표로 감싸면
     // 실행 전 파스 단계에서 syntax error -2741로 거부된다(내부 셸 경로 인용은 build_install_script의
     // sh_squote가 담당). 따라서 바깥 래핑은 반드시 applescript_str(큰따옴표)여야 한다.
@@ -1175,12 +1296,21 @@ Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도�
 }
 
 /// (D6) 자식 프로세스 실행에 기한을 건다. std 에는 프로세스 타임아웃이 없어 spawn + try_wait 폴링 +
-/// 기한 초과 kill 로 직접 만든다 — `bash -lc` 는 로그인 rc(nvm·conda·사내 프로필)가 매달리면 **무기한**
+/// 기한 초과 kill 로 직접 만든다 — 로그인 셸은 rc(nvm·conda·사내 프로필)가 매달리면 **무기한**
 /// 블록하고, 동기 tauri 커맨드가 그대로 굳어 버튼이 영영 돌아오지 않는다(사용자에겐 '앱이 멈춤').
 ///
-/// stdout 은 반드시 별도 스레드로 동시 드레인한다: 파이프 버퍼(64KB)가 차면 자식은 write 에서 블록하고
-/// 부모는 try_wait 에서 대기하는 **상호 데드락**이 된다 — 기한이 있어도 출력이 큰 자식에서 실측된 함정
-/// (cys.rs 헤드리스 호출부 주석). kill 뒤 wait 으로 좀비도 수거한다.
+/// ★MAJOR-3(2026-08-25) **파이프 제거**: 예전 구현은 stdout 을 파이프로 받아 별도 스레드에서
+/// `read_to_string` 으로 드레인하고 마지막에 그 스레드를 **기한 없이** join 했다. `read_to_string` 은
+/// 파이프의 write-end 가 **전부** 닫혀야 EOF 를 본다 — 로그인 셸이 띄운 손자(ssh-agent·gpg-agent·
+/// 백그라운드 잡 등)가 stdout 을 물고 있으면 부모를 kill 해도 EOF 가 오지 않아 join 이 무기한
+/// 블록한다. 즉 **타임아웃이 있는데도 커맨드가 굳었다**. 기존 테스트가 초록이던 이유는
+/// `sh -c "sleep 30"` 이 exec 대체되어 손자가 아예 없는 유일한 형태였기 때문이다.
+///
+/// 그래서 파이프와 드레인 스레드를 없애고 자식 stdout 을 **임시 파일**로 리다이렉트한다
+/// (`Stdio::from(File)`). wait 또는 kill 이 끝난 뒤 그 파일을 읽으므로 EOF 의존이 사라지고 손자
+/// 문제와 무관해진다. 파이프 버퍼(64KB) 포화 데드락도 같이 사라진다 — 파일은 차지 않는다.
+/// 임시 파일 이름은 pid + 나노초 + 프로세스 내 시퀀스로 충돌을 피하고, 어느 경로로 빠져나가든
+/// 반드시 지운다.
 ///
 /// 반환은 `Ok((정상종료 여부, stdout))` / `Err(사유)` — **실패를 빈 출력으로 접지 않는다**. 이 구분이
 /// 없으면 '측정 실패'와 '결과 없음'이 같은 값이 되어 D3 의 unverified 판정이 불가능해진다.
@@ -1190,21 +1320,46 @@ fn run_capture_with_timeout(
     args: &[&str],
     limit: std::time::Duration,
 ) -> Result<(bool, String), String> {
-    use std::io::Read;
-    let mut child = std::process::Command::new(program)
+    run_capture_with_timeout_in(&std::env::temp_dir(), program, args, limit)
+}
+
+/// 위 함수의 본체. 임시 파일을 놓을 디렉터리를 인자로 받는 이유는 **정리 검증을 결정론으로 만들기
+/// 위해서**다 — 공유 TMPDIR 을 세면 병렬 테스트끼리 같은 pid 아래 파일을 만들어 카운트가 흔들린다.
+/// 프로덕션은 언제나 `std::env::temp_dir()` 하나로 들어온다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn run_capture_with_timeout_in(
+    tmp_dir: &std::path::Path,
+    program: &str,
+    args: &[&str],
+    limit: std::time::Duration,
+) -> Result<(bool, String), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out_path = tmp_dir.join(format!(
+        "cys-probe-{}-{}-{}.out",
+        std::process::id(),
+        nanos,
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let sink = std::fs::File::create(&out_path)
+        .map_err(|e| format!("{program} 출력 임시파일 생성 실패({}): {e}", out_path.display()))?;
+    let spawned = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(sink))
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{program} 실행 실패: {e}"))?;
-    let drain = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = out.read_to_string(&mut s);
-            s
-        })
-    });
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(format!("{program} 실행 실패: {e}"));
+        }
+    };
     let deadline = std::time::Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
@@ -1212,7 +1367,7 @@ fn run_capture_with_timeout(
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
-                    let _ = child.wait(); // 좀비 수거(드레인 스레드도 EOF 로 종료)
+                    let _ = child.wait(); // 좀비 수거
                     break Err(format!("{program} 타임아웃({}초 초과)", limit.as_secs_f32()));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1220,7 +1375,10 @@ fn run_capture_with_timeout(
             Err(e) => break Err(format!("{program} 상태 확인 실패: {e}")),
         }
     };
-    let stdout = drain.and_then(|h| h.join().ok()).unwrap_or_default();
+    // 자식이 끝났거나(kill 포함) 상태 확인이 실패한 **그 시점까지 쓰인 것**이 관측값이다.
+    // 손자가 아직 물고 있어도 기다리지 않는다 — 기다리는 순간 타임아웃이 무의미해진다.
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
     status.map(|ok| (ok, stdout))
 }
 
@@ -1245,14 +1403,29 @@ struct InstallVerdict {
 }
 
 /// (D3) 설치 등급 판정(순수). 헌장 원칙 "측정 불능은 어떤 게이트에서도 통과가 아니다" 를 타입으로
-/// 강제한다 — 심볼릭 생성이 성공해도 **PATH 1순위가 우리 링크임을 실제로 확인했을 때만** installed 다.
+/// 강제한다 — 심볼릭 생성이 성공해도 **측정한 셸의 PATH 1순위가 우리 링크임을 확인했을 때만**
+/// installed 다.
+///
+/// ★MAJOR-4(2026-08-25) 문구 정직화: 예전 주석·경고문은 "PATH 1순위"·"로그인 셸 PATH" 라는 **전칭**
+/// 주장을 했지만 실제로 잰 것은 `bash -lc` 하나였다(macOS 10.15+ 기본 로그인 셸은 zsh 다). 이제
+/// 무엇으로 쟀는지를 `shell_name` 으로 받아 문구에 밝힌다 — 잰 적 없는 것을 잰 척하지 않는다.
+///
+/// ★MINOR-9(2026-08-25) **unverified 두 분기의 신호**: `unverified` 는 원인이 둘인데 예전에는
+/// UI 가 그것을 구분할 방법이 없어 "검증 명령 실패 또는 응답 없음" 으로 단정 오안내했다.
+/// status 는 계약(3값)이라 늘리지 않고 **경고문 첫 구절을 안정된 판별자로** 고정한다:
+/// - `"PATH 확인 결과: …"` → 측정은 **정상**이었고 그 셸 PATH 에서 cys 를 못 찾았다(원인=PATH 구성).
+/// - `"PATH 확인 실패: …"`  → 검증 명령 자체를 못 돌렸다(실행 실패·타임아웃. 사유 동봉).
+///   UI·문서는 이 두 접두로 문구를 갈라야 한다.
+///
 /// - `installed`          : which -a cys 1순위 == target_cys
 /// - `installed_shadowed` : 링크는 생겼으나 앞을 가리는 다른 cys 가 있다(사용자가 치는 cys 는 그쪽)
-/// - `unverified`         : 측정을 못 했거나(실행 실패·타임아웃), 측정은 됐지만 PATH 에서 우리 링크를
-///                          확인하지 못했다(로그인 PATH 에 /usr/local/bin 이 없는 경우) — 어느 쪽도
-///                          '설치 완료'로 올리지 않는다.
+/// - `unverified`         : 위 두 분기 — 어느 쪽도 '설치 완료'로 올리지 않는다.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn classify_install_status(probe: &WhichProbe, target_cys: &str) -> InstallVerdict {
+fn classify_install_status(
+    probe: &WhichProbe,
+    target_cys: &str,
+    shell_name: &str,
+) -> InstallVerdict {
     match probe {
         WhichProbe::Completed(entries) => match entries.first() {
             Some(first) if first == target_cys => InstallVerdict {
@@ -1266,9 +1439,9 @@ fn classify_install_status(probe: &WhichProbe, target_cys: &str) -> InstallVerdi
                 effective_cys: Some(first.clone()),
                 shadowed_by: Some(first.clone()),
                 warnings: vec![format!(
-                    "심볼릭은 만들었지만 PATH 앞쪽의 다른 cys가 우선합니다: {first}. \
-새 터미널에서 'cys'를 치면 {target_cys}가 아니라 그쪽이 실행됩니다 — 그 파일을 지우거나 \
-PATH에서 /usr/local/bin을 앞으로 옮긴 뒤 다시 확인하세요."
+                    "PATH 확인 결과: 심볼릭은 만들었지만 로그인 셸({shell_name}) PATH 앞쪽의 다른 cys가 \
+우선합니다: {first}. 새 터미널에서 'cys'를 치면 {target_cys}가 아니라 그쪽이 실행됩니다 — \
+그 파일을 지우거나 PATH에서 /usr/local/bin을 앞으로 옮긴 뒤 다시 확인하세요."
                 )],
             },
             None => InstallVerdict {
@@ -1276,8 +1449,9 @@ PATH에서 /usr/local/bin을 앞으로 옮긴 뒤 다시 확인하세요."
                 effective_cys: None,
                 shadowed_by: None,
                 warnings: vec![format!(
-                    "심볼릭은 만들었지만 로그인 셸 PATH에서 cys를 찾지 못했습니다 \
-(PATH에 {target_cys}의 폴더가 없을 수 있습니다). 새 터미널을 열어 'which -a cys'로 확인하세요."
+                    "PATH 확인 결과: 검증 명령은 정상 실행됐지만 로그인 셸({shell_name}) PATH에서 cys를 \
+찾지 못했습니다(PATH에 {target_cys}의 폴더가 없을 수 있습니다). 새 터미널을 열어 \
+'which -a cys'로 확인하세요."
                 )],
             },
         },
@@ -1286,8 +1460,8 @@ PATH에서 /usr/local/bin을 앞으로 옮긴 뒤 다시 확인하세요."
             effective_cys: None,
             shadowed_by: None,
             warnings: vec![format!(
-                "심볼릭은 만들었지만 설치 확인(which -a cys)을 하지 못했습니다: {reason}. \
-새 터미널에서 'which -a cys'로 직접 확인하세요."
+                "PATH 확인 실패: 심볼릭은 만들었지만 로그인 셸({shell_name})로 'which -a cys'를 \
+실행하지 못했습니다: {reason}. 새 터미널에서 'which -a cys'로 직접 확인하세요."
             )],
         },
     }
@@ -1326,10 +1500,21 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             .ok_or("번들 디렉토리 해석 실패")?
             .to_path_buf();
 
-        let plan = plan_cli_install(&macos_dir, target_dir)?;
+        // (BLOCK-1) 백업 이름은 Rust 가 먼저 확정한다 — 셸에서 date 를 부르면 실제 파일명과
+        // 사용자에게 보고하는 이름이 갈라질 수 있다.
+        let stamp = backup_stamp(std::time::SystemTime::now());
+        let plan = plan_cli_install(&macos_dir, target_dir, &stamp)?;
         if !plan.cys_src.exists() || !plan.cysd_src.exists() {
             return Err("번들 내 cys/cysd 바이너리를 찾지 못했습니다.".into());
         }
+
+        // (BLOCK-1c) 승격 **전** 관측. 사후에 보면 이미 심볼릭으로 바뀐 뒤라 "원래 무엇이 있었는지"를
+        // 알 수 없다. 여기서 잡은 것만이 스크립트가 백업으로 옮길 대상이다.
+        let pre_probes: Vec<LinkProbe> = ["cys", "cysd"]
+            .iter()
+            .map(|n| probe_link(&format!("{target_dir}/{n}")))
+            .collect();
+        let expected_backups = plan_install_backups(&pre_probes, &stamp);
 
         // osascript 1회 승격(cys·cysd 동시 → 단일 프롬프트).
         let out = std::process::Command::new("osascript")
@@ -1345,13 +1530,26 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             return Err(format!("심볼릭 생성 실패: {}", err.trim()));
         }
 
-        // 검증: 로그인 PATH 기준 which -a cys. **측정 실패를 성공으로 접지 않는다**(D3) —
+        // 검증: **사용자의 로그인 셸($SHELL, 없으면 bash) 기준** which -a cys — 전 시스템 PATH 가
+        // 아니라 "그 셸에서 무엇이 잡히는가" 하나만 잰다(MAJOR-4). **측정 실패를 성공으로 접지 않는다**(D3) —
         // 예전 코드는 `.ok()` + `unwrap_or_default()` 로 실행 실패를 빈 목록으로 삼켜 '그림자 없음'과
         // 구분이 불가능했고, 그 상태로 ok:true "설치 완료" 토스트가 나갔다. 기한 5초(D6):
         // 로그인 셸 rc 가 매달려도 버튼은 반드시 돌아온다.
         let target_cys = format!("{target_dir}/cys");
+        // (MAJOR-4) 사용자가 **실제로 쓰는** 셸로 잰다. macOS 10.15+ 기본 로그인 셸은 zsh 이므로
+        // bash 로 재면 사용자의 PATH 가 아니라 '설치돼 있지도 않을 수 있는 다른 셸'의 PATH 를 재게
+        // 되고, 그 결과로 나온 판정을 "PATH 1순위" 라고 부르는 것은 거짓이 된다.
+        let login_shell = std::env::var("SHELL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string());
+        let shell_name = std::path::Path::new(&login_shell)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| login_shell.clone());
         let probe = match run_capture_with_timeout(
-            "bash",
+            &login_shell,
             &["-lc", "which -a cys"],
             std::time::Duration::from_secs(5),
         ) {
@@ -1360,9 +1558,24 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             Ok((_, stdout)) => WhichProbe::Completed(parse_which_a(&stdout)),
             Err(reason) => WhichProbe::Unmeasured(reason),
         };
-        let verdict = classify_install_status(&probe, &target_cys);
+        let verdict = classify_install_status(&probe, &target_cys, &shell_name);
 
         let mut warnings = plan.warnings;
+        // (BLOCK-1c) 백업이 정말로 생겼는지 **재관측**해서 보고한다 — 스크립트의 자기신고를 믿지 않는다.
+        // 사용자는 자기 파일이 어디로 갔고 어떻게 되돌리는지를 반드시 알아야 한다.
+        for (orig, bak) in &expected_backups {
+            if std::path::Path::new(bak).exists() {
+                warnings.push(format!(
+                    "{orig}에 심볼릭이 아닌 파일이 있어 지우지 않고 {bak}로 백업한 뒤 링크를 만들었습니다. \
+되돌리려면 'sudo mv {bak} {orig}', 필요 없으면 'sudo rm {bak}' 를 실행하세요."
+                ));
+            } else {
+                warnings.push(format!(
+                    "{orig}의 기존 파일을 {bak}로 백업하려 했으나 백업본을 확인하지 못했습니다 — \
+'ls -l {orig}'로 현재 상태를 직접 확인하세요."
+                ));
+            }
+        }
         warnings.extend(verdict.warnings);
 
         Ok(InstallCliReport {
@@ -1384,6 +1597,7 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
 /// 다시 조회하면(`exists()`·`canonicalize()`) 대상이 사라진 **dangling 심볼릭**에서 판정이 실패한다.
 /// 그런데 그게 바로 청소가 가장 필요한 경우다(앱을 이미 지웠고 root 소유 링크만 남은 상태). 그래서
 /// 관측(symlink_metadata·read_link)과 판정을 갈라 두고, 판정은 문자열/불리언만 본다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct LinkProbe {
     path: String,
@@ -1395,6 +1609,7 @@ struct LinkProbe {
 }
 
 /// 해제 판정 결과(순수). **비가역 삭제**이므로 '지운다'는 결론은 두 가드를 모두 통과할 때만 나온다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(PartialEq, Debug)]
 enum UninstallAction {
     /// 심볼릭 + 대상이 cys.app 번들 안의 cys/cysd → 제거해도 되는 우리 링크.
@@ -1411,6 +1626,7 @@ enum UninstallAction {
 /// 심볼릭 대상이 **cys.app 번들 안의 cys/cysd** 인가(순수). 문자열만 본다 — 대상이 이미 삭제된
 /// dangling 링크에서도 판정이 서야 하기 때문이다. `cys.app.bak-*`·`*.prev*` 나 타 앱 번들
 /// (`Other.app/Contents/MacOS/cys`)은 마커가 어긋나 자동으로 거부된다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn links_into_cys_bundle(target: &str) -> bool {
     const MARK: &str = "/cys.app/Contents/MacOS/";
     match target.split_once(MARK) {
@@ -1421,6 +1637,7 @@ fn links_into_cys_bundle(target: &str) -> bool {
 
 /// 한 경로의 해제 판정(순수). 가드는 둘이고 순서가 곧 안전성이다: ①심볼릭이 아니면 즉시 포기
 /// ②심볼릭이어도 대상이 우리 번들이 아니면 포기.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decide_cli_uninstall(p: &LinkProbe) -> UninstallAction {
     if !p.present {
         return UninstallAction::SkipAbsent;
@@ -1434,22 +1651,44 @@ fn decide_cli_uninstall(p: &LinkProbe) -> UninstallAction {
     }
 }
 
-/// `do shell script` 본문: 확인된 심볼릭만 **경로를 하나씩 박아** 제거한다. 와일드카드·`rm -r` 없음
-/// (경로 전개로 범위가 새는 사고를 구조적으로 막는다). 인용은 설치와 같은 sh_squote 재사용.
+/// `do shell script` 본문: 확인된 심볼릭만 **경로를 하나씩 박아** 제거한다. 경로 전개(와일드카드)·
+/// `rm -r` 없음 — 삭제 범위가 새는 사고를 구조적으로 막는다. 인용은 설치와 같은 sh_squote 재사용.
+///
+/// ★MAJOR-2(2026-08-25) **TOCTOU 봉합**: `probe_link` → `decide_cli_uninstall` 은 비특권 **사전
+/// 관측**이고 실제 집행은 root 다. 그 사이에는 사용자가 관리자 비밀번호를 치는 **시간 제한 없는
+/// 창**이 있다 — 그 창에서 링크가 실체 파일로 바뀌거나 대상이 남의 경로로 바뀌면 예전 본문
+/// (`rm -f <경로>`)은 그것을 그대로 root 권한으로 지웠다. 비특권 관측은 특권 집행의 가드가 될 수
+/// 없다. 그래서 **스크립트 자신이 집행 직전에 다시 검사한다**:
+///   ① `[ -L ]` — 심볼릭이 아니면 지우지 않는다(남의 실체 파일 보호. SkipNotSymlink 와 같은 규칙)
+///   ② `readlink` 결과가 `*/cys.app/Contents/MacOS/{cys,cysd}` 가 아니면 지우지 않는다
+/// 두 조건은 Rust 순수 판정 `links_into_cys_bundle` 과 **같은 마커**를 본다 — 한쪽만 고치면 안 된다.
+/// `case` 안의 `*` 는 파일명 전개가 아니라 **문자열 패턴 대조**다(rm 인자는 여전히 리터럴 인용 경로).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn build_uninstall_script(paths: &[String]) -> String {
-    let args: Vec<String> = paths.iter().map(|p| sh_squote(p)).collect();
-    format!("rm -f {}", args.join(" "))
+    paths
+        .iter()
+        .map(|p| {
+            let q = sh_squote(p);
+            format!(
+                "if [ -L {q} ]; then case \"$(readlink {q})\" in \
+*/cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd) rm -f {q};; esac; fi"
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("; ")
 }
 
 /// 해제 계획(순수): 관측 목록 → 제거 대상 + 건너뛴 사유(사용자 고지용) + osascript 인자.
 /// 제거 대상이 하나도 없으면 `osascript_arg` 는 None 이다 — 지울 것도 없는데 관리자 프롬프트를
 /// 띄우는 '헛 승격'을 막는다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct CliUninstallPlan {
     remove: Vec<String>,
     skipped: Vec<String>,
     osascript_arg: Option<String>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn plan_cli_uninstall(probes: &[LinkProbe]) -> CliUninstallPlan {
     let mut remove: Vec<String> = vec![];
     let mut skipped: Vec<String> = vec![];
@@ -1493,6 +1732,7 @@ fn plan_cli_uninstall(probes: &[LinkProbe]) -> CliUninstallPlan {
 
 /// 설치 상태(순수): 두 링크 관측 → UI 버튼 라벨을 가르는 상태 하나. 판정은 해제 판정을 그대로
 /// 재사용한다 — '해제' 라벨은 **실제로 지울 것이 있을 때만** 떠야 하기 때문이다(라벨과 행동 일치).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(PartialEq, Debug)]
 enum CliLinkState {
     /// 우리 링크가 하나도 없다 → "셸에 cys 설치"
@@ -1505,6 +1745,7 @@ enum CliLinkState {
     Foreign,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn classify_cli_links(probes: &[LinkProbe]) -> CliLinkState {
     let ours = probes
         .iter()
@@ -1530,6 +1771,7 @@ fn classify_cli_links(probes: &[LinkProbe]) -> CliLinkState {
 /// 파일시스템 관측(얇은 래퍼 — 판정 없음). symlink_metadata 는 링크 자체를 보므로 대상이 사라진
 /// dangling 링크도 present=true 로 잡힌다. `/usr/local/bin` 자체가 없는 기계(클린 macOS)에서도
 /// Err 가 아니라 present=false 로 매끄럽게 떨어진다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn probe_link(path: &str) -> LinkProbe {
     let p = std::path::Path::new(path);
     let md = std::fs::symlink_metadata(p).ok();
@@ -4785,17 +5027,120 @@ mod tests {
         assert_eq!(sh_squote("a'b"), "'a'\\''b'");
     }
 
+    // ★BLOCK-1(2026-08-25): 예전 본문은 `ln -sf` 하나였고, 그것은 대상이 일반 파일이어도 unlink 후
+    // 심볼릭으로 갈아 끼운다 = 남의 실체 설치본을 말없이 파괴했다. 이제 백업(mv) 뒤에 링크를 만든다.
     #[test]
-    fn build_install_script_emits_idempotent_symlinks() {
+    fn build_install_script_backs_up_real_files_and_uses_ln_sfn() {
         let cys = std::path::Path::new("/Applications/cys.app/Contents/MacOS/cys");
         let cysd = std::path::Path::new("/Applications/cys.app/Contents/MacOS/cysd");
-        let s = build_install_script(cys, cysd, "/usr/local/bin");
+        let s = build_install_script(cys, cysd, "/usr/local/bin", "1700000000");
         assert_eq!(
             s,
             "mkdir -p '/usr/local/bin' && \
-ln -sf '/Applications/cys.app/Contents/MacOS/cys' '/usr/local/bin/cys' && \
-ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
+if [ -e '/usr/local/bin/cys' ] && [ ! -L '/usr/local/bin/cys' ]; \
+then mv '/usr/local/bin/cys' '/usr/local/bin/cys.cys-backup-1700000000'; fi && \
+ln -sfn '/Applications/cys.app/Contents/MacOS/cys' '/usr/local/bin/cys' && \
+if [ -e '/usr/local/bin/cysd' ] && [ ! -L '/usr/local/bin/cysd' ]; \
+then mv '/usr/local/bin/cysd' '/usr/local/bin/cysd.cys-backup-1700000000'; fi && \
+ln -sfn '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
+        // 백업(mv)이 링크 생성보다 **먼저** 와야 한다 — 순서가 뒤집히면 이미 파괴된 뒤다.
+        assert!(
+            s.find("mv '/usr/local/bin/cys'").unwrap()
+                < s.find("ln -sfn '/Applications/cys.app/Contents/MacOS/cys'").unwrap(),
+            "백업이 링크 생성보다 뒤에 있다: {s}"
+        );
+        // ★BSD ln: -n 이 없으면 대상이 '디렉터리를 가리키는 심볼릭'일 때 그 디렉터리 안에 링크를
+        // 만든다 = root 권한 쓰기가 target_dir 밖으로 샌다.
+        assert!(!s.contains("ln -sf '"), "ln -sf(-n 없음) 회귀: {s}");
+        assert!(s.contains("ln -sfn "), "ln -sfn 이어야 한다: {s}");
+        // 셸에서 date 를 부르지 않는다(스크립트 이름과 보고 문구가 갈라지면 안 된다).
+        assert!(!s.contains("date"), "타임스탬프는 Rust 가 박는다: {s}");
+    }
+
+    // ★BLOCK-1 **실행** 검증: 문자열 단언만으로는 셸 의미론(ln -sf 가 일반 파일을 unlink 한다)을
+    // 잡을 수 없다. 임시 디렉터리를 target_dir 로 삼아 실제 /bin/sh 로 돌려 결과를 관측한다.
+    // (root 불필요 — 승격은 osascript 의 몫이고 스크립트 본문 의미론만 검사한다.)
+    #[cfg(unix)]
+    #[test]
+    fn install_script_backs_up_foreign_file_instead_of_destroying_it() {
+        let base = std::env::temp_dir().join(format!("cys-install-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bin = base.join("bin");
+        let src = base.join("src");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("cys"), "OURS").unwrap();
+        std::fs::write(src.join("cysd"), "OURSD").unwrap();
+        // 남의 설치본(Homebrew·수동 빌드)이 이미 **실체 파일**로 있다.
+        std::fs::write(bin.join("cys"), "FOREIGN-BINARY").unwrap();
+
+        let td = bin.to_string_lossy().to_string();
+        let script = build_install_script(&src.join("cys"), &src.join("cysd"), &td, "T1");
+        let st = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "설치 스크립트 실패: {script}");
+
+        // ① 남의 파일은 사라지지 않고 백업으로 살아 있다(예전 `ln -sf` 는 여기서 파괴했다).
+        let bak = bin.join("cys.cys-backup-T1");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap_or_default(),
+            "FOREIGN-BINARY",
+            "남의 실체 파일이 백업되지 않고 파괴됐다"
+        );
+        // ② 우리 링크가 생겼다.
+        assert!(
+            std::fs::symlink_metadata(bin.join("cys"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "심볼릭이 만들어지지 않았다"
+        );
+        // ③ 반복 설치는 멱등 — 이미 심볼릭이면 mv 분기가 돌지 않아 백업이 쌓이지 않는다.
+        let script2 = build_install_script(&src.join("cys"), &src.join("cysd"), &td, "T2");
+        assert!(std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script2)
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            !bin.join("cys.cys-backup-T2").exists(),
+            "심볼릭 재설치가 백업을 쌓았다(멱등성 깨짐)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // (BLOCK-1c) 사용자에게 무엇이 백업될지 보고하려면 Rust 가 스크립트와 **같은 판정**을 해야 한다.
+    #[test]
+    fn plan_install_backups_matches_shell_condition() {
+        let ours = "/Applications/cys.app/Contents/MacOS/cys";
+        let b = plan_install_backups(
+            &[
+                probe("/usr/local/bin/cys", true, false, None), // 실체 파일 → 백업
+                probe("/usr/local/bin/cysd", true, true, Some(ours)), // 심볼릭 → 백업 없음(멱등)
+            ],
+            "S",
+        );
+        assert_eq!(
+            b,
+            vec![(
+                "/usr/local/bin/cys".to_string(),
+                "/usr/local/bin/cys.cys-backup-S".to_string()
+            )]
+        );
+        // 부재 + dangling 심볼릭은 둘 다 백업 대상이 아니다(셸 `-e` 가 거짓인 경우와 일치).
+        assert!(plan_install_backups(
+            &[
+                probe("/usr/local/bin/cys", false, false, None),
+                probe("/usr/local/bin/cysd", true, true, None),
+            ],
+            "S"
+        )
+        .is_empty());
     }
 
     #[test]
@@ -4865,6 +5210,28 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
     }
 
+    // ★MINOR-7: stdout 잡음을 경로로 격상하면 목록 1순위가 잡음이 되어 installed 가
+    // installed_shadowed 로 오판되고, 존재하지도 않는 "앞을 가리는 cys" 를 지우라고 안내하게 된다.
+    #[test]
+    fn parse_which_a_rejects_non_absolute_path_noise() {
+        let out = "cys: aliased to /Applications/cys.app/Contents/MacOS/cys\n\
+zsh: no such file or directory: cys\n\
+/usr/local/bin/cys\n\
+cys is a shell builtin\n\
+\x20 /opt/homebrew/bin/cys  \n\
+\n";
+        assert_eq!(
+            parse_which_a(out),
+            vec![
+                "/usr/local/bin/cys".to_string(),
+                "/opt/homebrew/bin/cys".to_string(),
+            ],
+            "절대경로가 아닌 줄은 경로가 아니다"
+        );
+        // 잡음만 있는 출력은 빈 목록 → classify_install_status 가 unverified 로 떨어뜨린다.
+        assert!(parse_which_a("cys not found\nsome rc banner\n").is_empty());
+    }
+
     #[test]
     fn parse_which_a_returns_precedence_ordered_paths() {
         let out = "/Users/x/.local/bin/cys\n/opt/homebrew/bin/cys\n\n/usr/local/bin/cys\n";
@@ -4883,12 +5250,14 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // translocated → Err
         assert!(plan_cli_install(
             std::path::Path::new("/private/var/folders/x/AppTranslocation/Y/d/cys.app/Contents/MacOS"),
-            "/usr/local/bin"
+            "/usr/local/bin",
+            "S"
         ).is_err());
         // backup → Err
         assert!(plan_cli_install(
             std::path::Path::new("/Applications/cys.app.bak-044/Contents/MacOS"),
-            "/usr/local/bin"
+            "/usr/local/bin",
+            "S"
         ).is_err());
     }
 
@@ -5054,7 +5423,8 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // CliInstallPlan 은 Debug 를 파생하지 않으므로(경로만 담는 내부 계획) match 로 받는다.
         let err = match plan_cli_install(
             std::path::Path::new("/Users/x/Downloads/cys.app/Contents/MacOS"),
-            "/usr/local/bin"
+            "/usr/local/bin",
+            "S"
         ) {
             Ok(_) => panic!("nonstandard 는 거부되어야 한다 — 경고 후 진행으로 되돌아갔다"),
             Err(e) => e,
@@ -5064,11 +5434,84 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(err.contains("Applications"), "다음 조치(Applications로 이동) 안내가 있어야 한다: {err}");
     }
 
+    // ★MINOR-6(2026-08-25): D5 의 거부 근거("root 링크가 사용자 쓰기 가능 경로를 가리키면 안 된다")는
+    // classify_bundle_dir 의 ends_with("/Applications") 판정 때문에 실제로는 성립하지 않았다 —
+    // /tmp/Applications · ~/Downloads/Applications 같은 **사용자가 직접 만드는** 디렉터리가 Canonical
+    // 로 통과했다. classify_bundle_dir 은 autoregister·boot 게이트가 공유하므로 건드리지 않고,
+    // 설치 전용 엄격 판정을 덧댄다.
+    #[test]
+    fn strict_install_bundle_ok_accepts_only_the_two_real_applications_dirs() {
+        use std::path::Path;
+        let home = Path::new("/Users/tester");
+        assert!(strict_install_bundle_ok(
+            Path::new("/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        assert!(strict_install_bundle_ok(
+            Path::new("/Users/tester/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        // ★반례: classify_bundle_dir 은 이 셋을 전부 Canonical 로 본다(그게 결함이었다).
+        for bad in [
+            "/tmp/Applications/cys.app/Contents/MacOS",
+            "/Users/x/Downloads/Applications/cys.app/Contents/MacOS",
+            "/Applications/Utilities/Applications/cys.app/Contents/MacOS",
+            "/Users/other/Applications/cys.app/Contents/MacOS",
+        ] {
+            assert_eq!(
+                classify_bundle_dir(Path::new(bad)),
+                BundleKind::Canonical,
+                "전제 확인: 이 경로는 classify_bundle_dir 상 Canonical 이다 — {bad}"
+            );
+            assert!(
+                !strict_install_bundle_ok(Path::new(bad), home),
+                "사용자가 만들 수 있는 Applications 유사 경로는 거부되어야 한다: {bad}"
+            );
+        }
+        // 번들 구조가 어긋난 입력도 거부(cys.app 이 아니거나 Contents/MacOS 가 아님).
+        assert!(!strict_install_bundle_ok(
+            Path::new("/Applications/Other.app/Contents/MacOS"),
+            home
+        ));
+        assert!(!strict_install_bundle_ok(Path::new("/Applications/cys.app"), home));
+    }
+
+    #[test]
+    fn plan_cli_install_refuses_applications_lookalike_directories() {
+        for bad in [
+            "/tmp/Applications/cys.app/Contents/MacOS",
+            "/Users/x/Downloads/Applications/cys.app/Contents/MacOS",
+            "/Applications/Utilities/Applications/cys.app/Contents/MacOS",
+        ] {
+            let r = plan_cli_install(std::path::Path::new(bad), "/usr/local/bin", "S");
+            let err = match r {
+                Ok(_) => panic!("Applications 유사 경로가 설치를 통과했다: {bad}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("Applications"), "다음 조치 안내가 있어야 한다: {err}");
+        }
+        // 진짜 /Applications 는 그대로 통과(회귀 핀).
+        assert!(plan_cli_install(
+            std::path::Path::new("/Applications/cys.app/Contents/MacOS"),
+            "/usr/local/bin",
+            "S"
+        )
+        .is_ok());
+        // 이 기계의 실제 홈 Applications 도 통과해야 한다(엄격 판정이 과하게 잠기지 않았는가).
+        let home_bundle = cys::home_dir().join("Applications/cys.app/Contents/MacOS");
+        assert!(
+            plan_cli_install(&home_bundle, "/usr/local/bin", "S").is_ok(),
+            "~/Applications 설치가 막혔다: {}",
+            home_bundle.display()
+        );
+    }
+
     #[test]
     fn plan_cli_install_canonical_has_no_location_warning() {
         let plan = plan_cli_install(
             std::path::Path::new("/Applications/cys.app/Contents/MacOS"),
-            "/usr/local/bin"
+            "/usr/local/bin",
+            "S"
         ).expect("정규 번들은 진행");
         assert!(plan.warnings.iter().all(|w| !w.contains("표준 위치")));
         // osascript 인자는 do shell script + 승격 + 멱등 스크립트를 감싼다(AppleScript 큰따옴표 리터럴)
@@ -5090,13 +5533,14 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         let plan = plan_cli_install(
             std::path::Path::new("/Applications/cys.app/Contents/MacOS"),
             "/usr/local/bin",
+            "S",
         )
         .unwrap();
         assert!(plan.osascript_arg.starts_with("do shell script \""));
         assert!(plan.osascript_arg.ends_with("\" with administrator privileges"));
         assert!(!plan.osascript_arg.starts_with("do shell script '"));
         assert!(plan.osascript_arg.contains("'/usr/local/bin/cys'"));
-        assert!(plan.osascript_arg.contains("ln -sf"));
+        assert!(plan.osascript_arg.contains("ln -sfn"));
     }
 
     // ── D3: 설치 등급(installed / installed_shadowed / unverified) ────────
@@ -5105,6 +5549,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         let v = classify_install_status(
             &WhichProbe::Completed(vec!["/usr/local/bin/cys".into()]),
             "/usr/local/bin/cys",
+            "zsh",
         );
         assert_eq!(v.status, "installed");
         assert_eq!(v.shadowed_by, None);
@@ -5120,11 +5565,14 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
                 "/usr/local/bin/cys".into(),
             ]),
             "/usr/local/bin/cys",
+            "zsh",
         );
         assert_eq!(v.status, "installed_shadowed");
         assert_eq!(v.shadowed_by.as_deref(), Some("/opt/homebrew/bin/cys"));
         assert!(v.warnings.iter().any(|w| w.contains("/opt/homebrew/bin/cys")),
             "무엇이 가리는지 경로를 알려야 한다");
+        // ★MAJOR-4: 잰 셸을 밝힌다(예전 문구는 'PATH 앞쪽'이라는 전칭 주장이었다).
+        assert!(v.warnings[0].contains("zsh"), "어느 셸 기준인지 밝혀야 한다: {}", v.warnings[0]);
     }
 
     // ★헌장: "측정 불능은 어떤 게이트에서도 통과가 아니다". which 가 죽거나 매달려도 '설치 완료'로
@@ -5132,17 +5580,44 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     #[test]
     fn classify_install_status_unverified_on_measurement_failure_or_empty() {
         let failed = classify_install_status(
-            &WhichProbe::Unmeasured("bash 5초 타임아웃".into()),
+            &WhichProbe::Unmeasured("zsh 5초 타임아웃".into()),
             "/usr/local/bin/cys",
+            "zsh",
         );
         assert_eq!(failed.status, "unverified");
         assert_eq!(failed.shadowed_by, None);
         assert!(failed.warnings.iter().any(|w| w.contains("타임아웃")), "사유를 사용자에게 전달");
 
         // 측정은 됐지만 PATH 에서 cys 를 못 찾은 경우도 '확인됨'이 아니다.
-        let empty = classify_install_status(&WhichProbe::Completed(vec![]), "/usr/local/bin/cys");
+        let empty = classify_install_status(&WhichProbe::Completed(vec![]), "/usr/local/bin/cys", "zsh");
         assert_eq!(empty.status, "unverified");
         assert_eq!(empty.effective_cys, None);
+
+        // ★MINOR-9: 같은 unverified 라도 원인이 둘이다. UI·문서가 "검증 명령 실패 또는 응답 없음"
+        // 으로 **단정**했던 오안내의 뿌리 — 경고문 접두를 안정된 판별자로 고정해 분기를 노출한다.
+        assert!(
+            failed.warnings[0].starts_with("PATH 확인 실패:"),
+            "측정 실패 분기의 신호가 없다: {}",
+            failed.warnings[0]
+        );
+        assert!(
+            empty.warnings[0].starts_with("PATH 확인 결과:"),
+            "측정 성공 + 미발견 분기의 신호가 없다: {}",
+            empty.warnings[0]
+        );
+        assert!(
+            empty.warnings[0].contains("정상 실행됐지만"),
+            "검증 명령이 실패했다고 오단정하면 안 된다: {}",
+            empty.warnings[0]
+        );
+        // ★MAJOR-4: 무엇으로 쟀는지(로그인 셸 이름)를 밝힌다 — 전칭 'PATH 1순위' 주장 금지.
+        for v in [&failed, &empty] {
+            assert!(
+                v.warnings[0].contains("zsh"),
+                "어느 셸로 쟀는지 밝혀야 한다: {}",
+                v.warnings[0]
+            );
+        }
     }
 
     // ── D6: which 검증 타임아웃(무기한 hang 차단) ──────────────────────
@@ -5174,6 +5649,82 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             std::time::Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    // ★MAJOR-3(2026-08-25) 회귀 트립와이어 — **실제로 손자를 띄운다**.
+    // 예전 구현(파이프 + 드레인 스레드 무기한 join)은 이 두 시나리오에서 무기한 블록했다:
+    // read_to_string 은 write-end 가 **전부** 닫혀야 EOF 를 보는데, 자식을 kill 해도 stdout 을 물고
+    // 있는 손자가 살아 있으면 EOF 가 오지 않는다. 기존 D6 테스트가 초록이던 이유는
+    // `sh -c "sleep 30"` 이 exec 대체되어 손자가 아예 없는 유일한 형태였기 때문이다.
+    #[cfg(unix)]
+    #[test]
+    fn run_capture_with_timeout_returns_even_when_grandchild_holds_stdout() {
+        // ① 자식은 즉시 끝나지만 손자가 stdout 을 계속 물고 있다.
+        let started = std::time::Instant::now();
+        let (ok, out) = run_capture_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 12 & echo alive"],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("자식이 정상 종료했으므로 Ok");
+        assert!(ok, "자식은 0으로 끝났다");
+        assert_eq!(out.trim(), "alive", "자식이 남긴 출력은 그대로 읽혀야 한다");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "손자가 stdout 을 물고 있어도 즉시 돌아와야 한다(경과 {:?})",
+            started.elapsed()
+        );
+
+        // ② 자식도 매달리고 손자도 stdout 을 물고 있다 — kill 뒤에도 EOF 는 오지 않는다.
+        let started = std::time::Instant::now();
+        let hung = run_capture_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 12 & sleep 12"],
+            std::time::Duration::from_secs(1),
+        );
+        assert!(hung.is_err(), "기한 초과는 Err(측정 실패)여야 한다");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "kill 뒤 손자 EOF 를 기다리면 안 된다(경과 {:?})",
+            started.elapsed()
+        );
+    }
+
+    // 임시 파일 누수 금지 — 프로브는 어느 경로로 빠져나가든(정상·타임아웃·spawn 실패) 자기 흔적을
+    // 남기지 않는다. 수천 번 호출돼도 TMPDIR 이 차면 안 된다. 격리 디렉터리로 재서 병렬 테스트와
+    // 경합하지 않게 한다.
+    #[cfg(unix)]
+    #[test]
+    fn run_capture_with_timeout_cleans_up_its_temp_file() {
+        let dir = std::env::temp_dir().join(format!("cys-probe-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = run_capture_with_timeout_in(&dir, "/bin/sh", &["-c", "echo x"], std::time::Duration::from_secs(5));
+        assert_eq!(a.expect("정상 종료").1.trim(), "x");
+        // 타임아웃 + 손자가 stdout 을 물고 있는 경로에서도 파일은 지워져야 한다.
+        assert!(run_capture_with_timeout_in(
+            &dir,
+            "/bin/sh",
+            &["-c", "sleep 12 & sleep 12"],
+            std::time::Duration::from_millis(300)
+        )
+        .is_err());
+        assert!(run_capture_with_timeout_in(
+            &dir,
+            "/nonexistent/cys-probe",
+            &[],
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
+
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(left.is_empty(), "프로브 임시 파일이 남았다: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── D4a: 해제 가드(비가역) ────────────────────────────────────────
@@ -5240,14 +5791,80 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
     }
 
+    // ★MAJOR-2: 비특권 사전 관측(probe_link)은 root 집행의 가드가 될 수 없다 — 그 사이에 사용자가
+    // 비밀번호를 치는 시간 제한 없는 창이 있다. 승격 스크립트 **자신이** 재검증해야 한다.
     #[test]
-    fn build_uninstall_script_names_each_path_without_wildcards() {
+    fn build_uninstall_script_reverifies_symlink_and_target_before_rm() {
         let s = build_uninstall_script(&[
             "/usr/local/bin/cys".to_string(),
             "/usr/local/bin/cysd".to_string(),
         ]);
-        assert_eq!(s, "rm -f '/usr/local/bin/cys' '/usr/local/bin/cysd'");
-        assert!(!s.contains('*') && !s.contains("rm -r"), "와일드카드·재귀 삭제 금지");
+        // ① 심볼릭 재검사 ② readlink 대조 — 둘 다 스크립트 문자열 안에 있어야 한다.
+        assert!(s.contains("[ -L '/usr/local/bin/cys' ]"), "-L 재검사 누락: {s}");
+        assert!(s.contains("[ -L '/usr/local/bin/cysd' ]"), "-L 재검사 누락: {s}");
+        assert!(s.contains("readlink '/usr/local/bin/cys'"), "readlink 대조 누락: {s}");
+        assert!(s.contains("readlink '/usr/local/bin/cysd'"), "readlink 대조 누락: {s}");
+        assert!(
+            s.contains("*/cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd"),
+            "번들 마커 대조 누락(links_into_cys_bundle 과 같은 마커여야 한다): {s}"
+        );
+        // 가드 없는 일괄 rm(예전 본문)이 남아 있으면 회귀다.
+        assert!(
+            !s.contains("rm -f '/usr/local/bin/cys' '/usr/local/bin/cysd'"),
+            "가드 없는 일괄 rm 회귀: {s}"
+        );
+        assert!(!s.contains("rm -r"), "재귀 삭제 금지: {s}");
+        // 지우는 대상은 여전히 리터럴 인용 경로 하나씩(경로 전개 없음).
+        assert!(s.contains("rm -f '/usr/local/bin/cys'"));
+        assert!(s.contains("rm -f '/usr/local/bin/cysd'"));
+    }
+
+    // ★MAJOR-2 **실행** 검증: 관측 이후 대상이 바뀐 상황(TOCTOU 창이 닫힌 뒤의 세계)을 만들어 놓고
+    // 스크립트를 돌린다. 예전 본문(`rm -f <경로들>`)은 셋을 전부 지웠다.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_script_refuses_non_symlink_and_foreign_target_at_execution_time() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("cys-uninstall-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // ① 사전 관측 뒤 실체 파일로 바뀐 경로(남의 설치본) — 살아남아야 한다.
+        let real = base.join("real");
+        std::fs::write(&real, "FOREIGN-BINARY").unwrap();
+        // ② 남의 번들을 가리키게 바뀐 심볼릭 — 살아남아야 한다.
+        let foreign = base.join("foreign");
+        symlink("/opt/homebrew/Cellar/cys/1.0/bin/cys", &foreign).unwrap();
+        // ③ 진짜 우리 링크(대상이 이미 없는 dangling) — 지워져야 한다. 이게 기능의 존재 이유다.
+        let ours = base.join("ours");
+        symlink("/Applications/cys.app/Contents/MacOS/cys", &ours).unwrap();
+
+        let paths: Vec<String> = [&real, &foreign, &ours]
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let script = build_uninstall_script(&paths);
+        let st = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "해제 스크립트 실패: {script}");
+
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap_or_default(),
+            "FOREIGN-BINARY",
+            "심볼릭이 아닌 실체 파일을 root 권한으로 지웠다"
+        );
+        assert!(
+            std::fs::symlink_metadata(&foreign).is_ok(),
+            "남의 번들을 가리키는 링크를 지웠다"
+        );
+        assert!(
+            std::fs::symlink_metadata(&ours).is_err(),
+            "우리 링크(dangling)는 지워져야 한다 — 가드가 과하게 잠겼다"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

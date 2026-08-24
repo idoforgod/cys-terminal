@@ -77,10 +77,15 @@ cys daemon uninstall
 ### 2.4 외부 터미널에서 `cys` 쓰기 (셸 설치)
 
 - macOS(권장): Control Center 헤더 → **"셸에 cys 설치"** 1클릭(관리자 승인 1회) — `/usr/local/bin/cys`·`cysd` 심볼릭 링크가 생기고, 앱 업데이트에도 자동 추종합니다. 이 버튼은 macOS에서만 나타납니다.
-  - 결과 알림이 "다른 cys가 앞을 가립니다" 또는 "확인 불가"로 오면 **아직 끝난 게 아닙니다** — 새 터미널에서 `which -a cys` 로 1순위가 `/usr/local/bin/cys` 인지 확인하세요(조치 안내는 docs/INSTALL.md §B).
-  - 해제: 같은 버튼이 설치된 상태에서는 **"셸 cys 해제"** 로 바뀝니다(확인 창 → 관리자 승인 1회 → 심볼릭 링크만 제거).
-- macOS(폴백 · GUI를 못 쓸 때): 터미널에서 `sudo ln -sf /Applications/cys.app/Contents/MacOS/cys /usr/local/bin/cys && sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd` (1회 · 상세 docs/INSTALL.md §B)
-- Windows: 앱 pane 안에서는 PATH가 자동 주입되어 cys를 바로 쓸 수 있습니다(설치기는 외부 PATH를 등록하지 않음). 외부 터미널에서 쓰려면 %LOCALAPPDATA%\cys 를 PATH에 추가하거나 전체 경로로 실행하세요. (자동 PATH 편집은 제공하지 않습니다 — Windows PATH 자동 편집은 값 잘림·확장 변수 손상 사고가 알려져 있어 의도적으로 넣지 않았습니다.)
+  - 결과 알림이 다음 셋 중 하나로 오면 **아직 끝난 게 아닙니다**(경고 알림은 60초 유지 · 이후 Control Center **알람 탭**에서 다시 볼 수 있습니다):
+    - **"다른 cys가 앞을 가립니다"** — 링크는 생겼지만 PATH 앞쪽의 다른 cys가 먼저 잡힙니다.
+    - **"PATH에서 cys를 찾지 못했습니다"** — 확인은 정상이었고, 로그인 셸 PATH에 `/usr/local/bin`이 없는 경우입니다(설치 실패가 아닙니다).
+    - **"확인 불가"** — 확인 명령 자체가 실패·무응답이라 무엇이 잡히는지 모르는 경우입니다.
+    어느 쪽이든 새 터미널에서 `which -a cys` 로 1순위가 `/usr/local/bin/cys` 인지 확인하세요(조치 안내는 docs/INSTALL.md §B). 판정은 **로그인 셸(`$SHELL`, 기본 zsh) 기준**입니다.
+  - 그 자리에 심볼릭이 아닌 **실제 파일**(다른 도구 설치본)이 있으면 버튼을 누르기 전에 고지가 뜨고, 설치는 그 파일을 지우지 않고 `<경로>.cys-backup-<시각>` 으로 옮겨 보관한 뒤 링크를 만듭니다(백업 경로는 결과 알림에 표시).
+  - 해제: 같은 버튼이 설치된 상태에서는 **"셸 cys 해제"** 로 바뀝니다(확인 창 → 관리자 승인 1회 → 심볼릭 링크만 제거). 건너뛴 항목·남은 파일이 있으면 **"부분 완료"** 알림이 사유와 복구 명령(`sudo rm <경로>`)을 그대로 보여줍니다.
+- macOS(폴백 · GUI를 못 쓸 때): 터미널에서 `sudo ln -sfn /Applications/cys.app/Contents/MacOS/cys /usr/local/bin/cys && sudo ln -sfn /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd` (1회 · 상세 docs/INSTALL.md §B)
+- Windows: 앱 pane 안에서는 PATH가 자동 주입되어 cys를 바로 쓸 수 있습니다. **설치기(setup.exe)는 외부 PATH를 등록하지 않습니다** — 현재 사용자 설치(`installMode: currentUser` · `%LOCALAPPDATA%\cys`)이고 PATH 항목을 쓰지 않습니다. 외부 터미널에서 쓰려면 `%LOCALAPPDATA%\cys` 를 PATH에 추가하거나 전체 경로로 실행하세요. (자동 PATH 편집은 제공하지 않습니다 — Windows PATH 자동 편집은 값 잘림·확장 변수 손상 사고가 알려져 있어 의도적으로 넣지 않았습니다. 참고: 폐기된 구 MSI는 PATH를 등록했으나 더 이상 배포되지 않습니다 — docs/INSTALL.md §Windows.)
 
 ### 2.5 설치 확인
 
@@ -94,7 +99,7 @@ cys doctor          # 자기진단 (문제 시 --fix)
 ### 2.6 제거
 
 1. `cys daemon uninstall`
-2. 앱 삭제(macOS: 앱을 지우기 전에 §2.4의 **"셸 cys 해제"** 로 심링크를 먼저 정리 → Applications에서 제거 / Windows: 제어판 제거)
+2. 앱 삭제(macOS: 앱을 지우기 전에 §2.4의 **"셸 cys 해제"** 로 심링크를 먼저 정리 → Applications에서 제거 / Windows: 설정 → 앱 → 'cys' 제거 · PATH는 애초에 등록하지 않으므로 정리할 것이 없습니다)
 3. 선택 — 데이터까지 완전 삭제(비가역): `~/.cys`(팩·설정)와 `~/.local/state/cys`(소켓·
    관제 DB) 삭제. 장기기억·soul.md도 함께 사라지므로 백업 후 진행하세요.
 
