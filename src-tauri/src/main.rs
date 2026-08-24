@@ -811,8 +811,10 @@ fn classify_bundle_dir(macos_dir: &std::path::Path) -> BundleKind {
 /// autostart(GUI 시작 시 plist 무음 기록)는 명시 사용자설치(plan_cli_install: 사용자 액션+가시 경고)와
 /// 위험 프로파일이 다르다 — NonStandard(~/Downloads·/Volumes/USB 등 휘발/이동 경로)가 plist
 /// ProgramArguments 에 각인되면 언마운트·삭제 시 죽은 경로 데몬을 무한 스폰한다(Translocated·Backup 도
-/// 동류). 그래서 plan_cli_install 이 NonStandard 를 경고만 하고 허용하는 것과 **의도적으로 divergence**해,
-/// 자동등록은 Canonical 로 한정한다(비-Canonical 은 ensure_daemon 런타임 폴백=휘발성 데몬으로 안전).
+/// 동류). 예전에는 plan_cli_install 이 NonStandard 를 경고만 하고 허용해 의도적 divergence 가 있었으나,
+/// **D5(2026-08-23)로 plan_cli_install 도 NonStandard 를 거부하면서 두 판정은 Canonical 만 허용으로 수렴했다**.
+/// 게이트는 여전히 둘이다 — 가리는 행위가 다르기 때문이다(이쪽은 무음 plist 기록, 저쪽은 명시 심볼릭 생성).
+/// 비-Canonical 은 자동등록만 skip 하고 ensure_daemon 런타임 폴백(휘발성 데몬)으로 안전하게 흐른다.
 fn autoregister_allowed(kind: &BundleKind) -> bool {
     matches!(kind, BundleKind::Canonical)
 }
@@ -1134,16 +1136,26 @@ Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도�
 정규 cys.app(Applications)에서 실행한 뒤 시도하세요."
                 .into());
         }
-        BundleKind::Canonical | BundleKind::NonStandard => {}
+        // ★D5(2026-08-23) NonStandard 경고 → **거부** 승격. 예전에는 경고만 달고 진행했으나,
+        // 그 결과는 root 소유 심볼릭(/usr/local/bin/cys)이 **사용자가 쓸 수 있는 임의 경로**
+        // (~/Downloads·USB 등)를 가리키는 상태다 — 그 경로의 파일을 바꿔 끼우는 것만으로 다음
+        // sudo cys 실행이 남의 코드를 돌린다. 게다가 앱을 옮기면 즉시 죽은 링크가 되고 자가치유도
+        // 불가능하다. 경고는 읽히지 않고 지나가므로 게이트로 올린다(autoregister_allowed 와 판정 수렴).
+        BundleKind::NonStandard => {
+            let bundle = macos_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| macos_dir.to_string_lossy().to_string());
+            return Err(format!(
+                "cys.app이 표준 위치(Applications)가 아닌 곳에서 실행 중입니다: {bundle}\n\
+Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도하세요."
+            ));
+        }
+        BundleKind::Canonical => {}
     }
-    let mut warnings = vec![];
-    if classify_bundle_dir(macos_dir) == BundleKind::NonStandard {
-        warnings.push(
-            "cys.app이 표준 위치(Applications)가 아닌 곳에서 실행 중입니다. \
-앱을 옮기면 심볼릭이 깨지니 Applications로 이동을 권장합니다."
-                .into(),
-        );
-    }
+    // 가드를 모두 통과한 Canonical 경로만 여기까지 온다 — 위치 경고는 더 이상 존재하지 않는다.
+    let warnings: Vec<String> = vec![];
     let cys_src = macos_dir.join("cys");
     let cysd_src = macos_dir.join("cysd");
     let script = build_install_script(&cys_src, &cysd_src, target_dir);
@@ -1162,9 +1174,133 @@ Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도�
     })
 }
 
+/// (D6) 자식 프로세스 실행에 기한을 건다. std 에는 프로세스 타임아웃이 없어 spawn + try_wait 폴링 +
+/// 기한 초과 kill 로 직접 만든다 — `bash -lc` 는 로그인 rc(nvm·conda·사내 프로필)가 매달리면 **무기한**
+/// 블록하고, 동기 tauri 커맨드가 그대로 굳어 버튼이 영영 돌아오지 않는다(사용자에겐 '앱이 멈춤').
+///
+/// stdout 은 반드시 별도 스레드로 동시 드레인한다: 파이프 버퍼(64KB)가 차면 자식은 write 에서 블록하고
+/// 부모는 try_wait 에서 대기하는 **상호 데드락**이 된다 — 기한이 있어도 출력이 큰 자식에서 실측된 함정
+/// (cys.rs 헤드리스 호출부 주석). kill 뒤 wait 으로 좀비도 수거한다.
+///
+/// 반환은 `Ok((정상종료 여부, stdout))` / `Err(사유)` — **실패를 빈 출력으로 접지 않는다**. 이 구분이
+/// 없으면 '측정 실패'와 '결과 없음'이 같은 값이 되어 D3 의 unverified 판정이 불가능해진다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn run_capture_with_timeout(
+    program: &str,
+    args: &[&str],
+    limit: std::time::Duration,
+) -> Result<(bool, String), String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{program} 실행 실패: {e}"))?;
+    let drain = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        })
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st.success()),
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // 좀비 수거(드레인 스레드도 EOF 로 종료)
+                    break Err(format!("{program} 타임아웃({}초 초과)", limit.as_secs_f32()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => break Err(format!("{program} 상태 확인 실패: {e}")),
+        }
+    };
+    let stdout = drain.and_then(|h| h.join().ok()).unwrap_or_default();
+    status.map(|ok| (ok, stdout))
+}
+
+/// (D3) which 프로브의 관측 결과. 실행 실패·타임아웃을 '빈 목록'으로 접으면 측정불능이 통과로
+/// 둔갑하므로 성공/실패를 **타입으로** 갈라 둔다(예전 `.ok()` + `unwrap_or_default()` 가 정확히
+/// 그 사고였다 — which 가 죽어도 shadowed_by=None + "설치 완료" 토스트가 나갔다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum WhichProbe {
+    /// which -a 가 끝까지 돌았고 precedence 순 경로 목록을 얻었다(비어 있을 수 있다).
+    Completed(Vec<String>),
+    /// 실행 실패·타임아웃 — 측정 자체를 못 했다(사유 동봉).
+    Unmeasured(String),
+}
+
+/// (D3) 설치 등급 판정 결과. status 는 정확히 셋뿐이다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct InstallVerdict {
+    status: &'static str,
+    effective_cys: Option<String>,
+    shadowed_by: Option<String>,
+    warnings: Vec<String>,
+}
+
+/// (D3) 설치 등급 판정(순수). 헌장 원칙 "측정 불능은 어떤 게이트에서도 통과가 아니다" 를 타입으로
+/// 강제한다 — 심볼릭 생성이 성공해도 **PATH 1순위가 우리 링크임을 실제로 확인했을 때만** installed 다.
+/// - `installed`          : which -a cys 1순위 == target_cys
+/// - `installed_shadowed` : 링크는 생겼으나 앞을 가리는 다른 cys 가 있다(사용자가 치는 cys 는 그쪽)
+/// - `unverified`         : 측정을 못 했거나(실행 실패·타임아웃), 측정은 됐지만 PATH 에서 우리 링크를
+///                          확인하지 못했다(로그인 PATH 에 /usr/local/bin 이 없는 경우) — 어느 쪽도
+///                          '설치 완료'로 올리지 않는다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn classify_install_status(probe: &WhichProbe, target_cys: &str) -> InstallVerdict {
+    match probe {
+        WhichProbe::Completed(entries) => match entries.first() {
+            Some(first) if first == target_cys => InstallVerdict {
+                status: "installed",
+                effective_cys: Some(first.clone()),
+                shadowed_by: None,
+                warnings: vec![],
+            },
+            Some(first) => InstallVerdict {
+                status: "installed_shadowed",
+                effective_cys: Some(first.clone()),
+                shadowed_by: Some(first.clone()),
+                warnings: vec![format!(
+                    "심볼릭은 만들었지만 PATH 앞쪽의 다른 cys가 우선합니다: {first}. \
+새 터미널에서 'cys'를 치면 {target_cys}가 아니라 그쪽이 실행됩니다 — 그 파일을 지우거나 \
+PATH에서 /usr/local/bin을 앞으로 옮긴 뒤 다시 확인하세요."
+                )],
+            },
+            None => InstallVerdict {
+                status: "unverified",
+                effective_cys: None,
+                shadowed_by: None,
+                warnings: vec![format!(
+                    "심볼릭은 만들었지만 로그인 셸 PATH에서 cys를 찾지 못했습니다 \
+(PATH에 {target_cys}의 폴더가 없을 수 있습니다). 새 터미널을 열어 'which -a cys'로 확인하세요."
+                )],
+            },
+        },
+        WhichProbe::Unmeasured(reason) => InstallVerdict {
+            status: "unverified",
+            effective_cys: None,
+            shadowed_by: None,
+            warnings: vec![format!(
+                "심볼릭은 만들었지만 설치 확인(which -a cys)을 하지 못했습니다: {reason}. \
+새 터미널에서 'which -a cys'로 직접 확인하세요."
+            )],
+        },
+    }
+}
+
 #[derive(serde::Serialize)]
 struct InstallCliReport {
+    /// status 파생값이다 — **두 개의 진실을 만들지 않는다**. 부분 성공(그림자·측정불능)은 false.
     ok: bool,
+    /// (D3) 등급. 정확히 "installed" | "installed_shadowed" | "unverified" 셋 중 하나.
+    /// UI 는 이 값으로 토스트 등급을 나눈다 — installed 만 성공이고 나머지 둘은 경고다.
+    /// serde rename 없음 = JS 에서 `r.status`(snake_case 그대로).
+    status: String,
     target_dir: String,
     cys_link: String,
     cysd_link: String,
@@ -1209,40 +1345,350 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             return Err(format!("심볼릭 생성 실패: {}", err.trim()));
         }
 
-        // 검증: 로그인 PATH 기준 which -a cys.
-        let which = std::process::Command::new("bash")
-            .arg("-lc")
-            .arg("which -a cys")
-            .output()
-            .ok();
-        let entries = which
-            .as_ref()
-            .map(|o| parse_which_a(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default();
-        let effective_cys = entries.first().cloned();
+        // 검증: 로그인 PATH 기준 which -a cys. **측정 실패를 성공으로 접지 않는다**(D3) —
+        // 예전 코드는 `.ok()` + `unwrap_or_default()` 로 실행 실패를 빈 목록으로 삼켜 '그림자 없음'과
+        // 구분이 불가능했고, 그 상태로 ok:true "설치 완료" 토스트가 나갔다. 기한 5초(D6):
+        // 로그인 셸 rc 가 매달려도 버튼은 반드시 돌아온다.
         let target_cys = format!("{target_dir}/cys");
-        let shadowed_by = match &effective_cys {
-            Some(p) if *p != target_cys => Some(p.clone()),
-            _ => None,
+        let probe = match run_capture_with_timeout(
+            "bash",
+            &["-lc", "which -a cys"],
+            std::time::Duration::from_secs(5),
+        ) {
+            // which 는 못 찾으면 비정상 종료하고 아무것도 출력하지 않는다 — 그건 '측정 실패'가 아니라
+            // '측정 결과 없음'이므로 Completed(빈 목록)으로 넘겨 unverified 로 떨어지게 한다.
+            Ok((_, stdout)) => WhichProbe::Completed(parse_which_a(&stdout)),
+            Err(reason) => WhichProbe::Unmeasured(reason),
         };
+        let verdict = classify_install_status(&probe, &target_cys);
 
         let mut warnings = plan.warnings;
-        if let Some(sh) = &shadowed_by {
-            warnings.push(format!(
-                "PATH 선행 위치의 다른 cys가 우선합니다: {sh} \
-(예: dev deploy_gate의 /opt/homebrew/bin). 새로 설치한 {target_cys}는 그 뒤에 있습니다."
-            ));
-        }
+        warnings.extend(verdict.warnings);
 
         Ok(InstallCliReport {
-            ok: true,
+            ok: verdict.status == "installed",
+            status: verdict.status.to_string(),
             target_dir: target_dir.to_string(),
             cys_link: target_cys,
             cysd_link: format!("{target_dir}/cysd"),
             source_cys: plan.cys_src.to_string_lossy().to_string(),
-            effective_cys,
-            shadowed_by,
+            effective_cys: verdict.effective_cys,
+            shadowed_by: verdict.shadowed_by,
             warnings,
+        })
+    }
+}
+
+// ── CLI PATH 해제(비가역) — 관측/판정 순수 헬퍼 ─────────────────
+/// 링크 한 경로의 파일시스템 관측값. **순수 판정부는 이 값만 본다** — 판정 안에서 파일시스템을
+/// 다시 조회하면(`exists()`·`canonicalize()`) 대상이 사라진 **dangling 심볼릭**에서 판정이 실패한다.
+/// 그런데 그게 바로 청소가 가장 필요한 경우다(앱을 이미 지웠고 root 소유 링크만 남은 상태). 그래서
+/// 관측(symlink_metadata·read_link)과 판정을 갈라 두고, 판정은 문자열/불리언만 본다.
+#[derive(Debug, Clone)]
+struct LinkProbe {
+    path: String,
+    /// symlink_metadata 성공 여부 — 링크 자체를 보므로 dangling 링크도 true 다.
+    present: bool,
+    is_symlink: bool,
+    /// read_link 결과. 대상 파일이 없어도 경로 문자열은 읽힌다.
+    link_target: Option<String>,
+}
+
+/// 해제 판정 결과(순수). **비가역 삭제**이므로 '지운다'는 결론은 두 가드를 모두 통과할 때만 나온다.
+#[derive(PartialEq, Debug)]
+enum UninstallAction {
+    /// 심볼릭 + 대상이 cys.app 번들 안의 cys/cysd → 제거해도 되는 우리 링크.
+    Remove,
+    /// 경로가 없다 — 이미 해제된 상태(할 일 없음).
+    SkipAbsent,
+    /// ★일반 파일·디렉터리 — 절대 건드리지 않는다. 다른 도구(Homebrew·수동 빌드)가 설치한 실체
+    /// 바이너리를 지우는 것은 남의 설치본 파괴이고 되돌릴 수 없다.
+    SkipNotSymlink,
+    /// 심볼릭이지만 대상이 cys.app 번들 밖 — 우리가 만든 링크가 아니므로 남긴다.
+    SkipForeignTarget,
+}
+
+/// 심볼릭 대상이 **cys.app 번들 안의 cys/cysd** 인가(순수). 문자열만 본다 — 대상이 이미 삭제된
+/// dangling 링크에서도 판정이 서야 하기 때문이다. `cys.app.bak-*`·`*.prev*` 나 타 앱 번들
+/// (`Other.app/Contents/MacOS/cys`)은 마커가 어긋나 자동으로 거부된다.
+fn links_into_cys_bundle(target: &str) -> bool {
+    const MARK: &str = "/cys.app/Contents/MacOS/";
+    match target.split_once(MARK) {
+        Some((_, tail)) => tail == "cys" || tail == "cysd",
+        None => false,
+    }
+}
+
+/// 한 경로의 해제 판정(순수). 가드는 둘이고 순서가 곧 안전성이다: ①심볼릭이 아니면 즉시 포기
+/// ②심볼릭이어도 대상이 우리 번들이 아니면 포기.
+fn decide_cli_uninstall(p: &LinkProbe) -> UninstallAction {
+    if !p.present {
+        return UninstallAction::SkipAbsent;
+    }
+    if !p.is_symlink {
+        return UninstallAction::SkipNotSymlink;
+    }
+    match p.link_target.as_deref() {
+        Some(t) if links_into_cys_bundle(t) => UninstallAction::Remove,
+        _ => UninstallAction::SkipForeignTarget,
+    }
+}
+
+/// `do shell script` 본문: 확인된 심볼릭만 **경로를 하나씩 박아** 제거한다. 와일드카드·`rm -r` 없음
+/// (경로 전개로 범위가 새는 사고를 구조적으로 막는다). 인용은 설치와 같은 sh_squote 재사용.
+fn build_uninstall_script(paths: &[String]) -> String {
+    let args: Vec<String> = paths.iter().map(|p| sh_squote(p)).collect();
+    format!("rm -f {}", args.join(" "))
+}
+
+/// 해제 계획(순수): 관측 목록 → 제거 대상 + 건너뛴 사유(사용자 고지용) + osascript 인자.
+/// 제거 대상이 하나도 없으면 `osascript_arg` 는 None 이다 — 지울 것도 없는데 관리자 프롬프트를
+/// 띄우는 '헛 승격'을 막는다.
+struct CliUninstallPlan {
+    remove: Vec<String>,
+    skipped: Vec<String>,
+    osascript_arg: Option<String>,
+}
+
+fn plan_cli_uninstall(probes: &[LinkProbe]) -> CliUninstallPlan {
+    let mut remove: Vec<String> = vec![];
+    let mut skipped: Vec<String> = vec![];
+    for p in probes {
+        match decide_cli_uninstall(p) {
+            UninstallAction::Remove => remove.push(p.path.clone()),
+            UninstallAction::SkipAbsent => {
+                skipped.push(format!("{} — 없음(이미 해제된 상태)", p.path));
+            }
+            UninstallAction::SkipNotSymlink => {
+                skipped.push(format!(
+                    "{} — 심볼릭이 아니라 실제 파일입니다. 다른 도구가 설치한 것일 수 있어 건드리지 않았습니다.",
+                    p.path
+                ));
+            }
+            UninstallAction::SkipForeignTarget => {
+                skipped.push(format!(
+                    "{} — cys.app 번들이 아닌 곳({})을 가리키는 링크라 건드리지 않았습니다.",
+                    p.path,
+                    p.link_target.as_deref().unwrap_or("대상 읽기 실패")
+                ));
+            }
+        }
+    }
+    // AppleScript `do shell script` 는 큰따옴표 리터럴을 요구한다(작은따옴표면 파스 단계 -2741).
+    // 설치 경로와 동일한 규약 — 바깥은 applescript_str, 내부 경로는 sh_squote.
+    let osascript_arg = if remove.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "do shell script {} with administrator privileges",
+            applescript_str(&build_uninstall_script(&remove))
+        ))
+    };
+    CliUninstallPlan {
+        remove,
+        skipped,
+        osascript_arg,
+    }
+}
+
+/// 설치 상태(순수): 두 링크 관측 → UI 버튼 라벨을 가르는 상태 하나. 판정은 해제 판정을 그대로
+/// 재사용한다 — '해제' 라벨은 **실제로 지울 것이 있을 때만** 떠야 하기 때문이다(라벨과 행동 일치).
+#[derive(PartialEq, Debug)]
+enum CliLinkState {
+    /// 우리 링크가 하나도 없다 → "셸에 cys 설치"
+    Absent,
+    /// cys·cysd 둘 다 우리 번들 심볼릭 → "셸 cys 해제"
+    Ours,
+    /// 한쪽만 우리 것(중단된 설치·부분 삭제 잔재) → 해제로 청소 가능
+    Partial,
+    /// 파일은 있으나 우리 것이 아니다(실체 파일·타 대상 링크) → 설치 라벨 유지 + 고지
+    Foreign,
+}
+
+fn classify_cli_links(probes: &[LinkProbe]) -> CliLinkState {
+    let ours = probes
+        .iter()
+        .filter(|p| decide_cli_uninstall(p) == UninstallAction::Remove)
+        .count();
+    let foreign = probes
+        .iter()
+        .filter(|p| {
+            matches!(
+                decide_cli_uninstall(p),
+                UninstallAction::SkipNotSymlink | UninstallAction::SkipForeignTarget
+            )
+        })
+        .count();
+    match (ours, foreign) {
+        (0, 0) => CliLinkState::Absent,
+        (0, _) => CliLinkState::Foreign,
+        (n, _) if n == probes.len() => CliLinkState::Ours,
+        _ => CliLinkState::Partial,
+    }
+}
+
+/// 파일시스템 관측(얇은 래퍼 — 판정 없음). symlink_metadata 는 링크 자체를 보므로 대상이 사라진
+/// dangling 링크도 present=true 로 잡힌다. `/usr/local/bin` 자체가 없는 기계(클린 macOS)에서도
+/// Err 가 아니라 present=false 로 매끄럽게 떨어진다.
+fn probe_link(path: &str) -> LinkProbe {
+    let p = std::path::Path::new(path);
+    let md = std::fs::symlink_metadata(p).ok();
+    let is_symlink = md
+        .as_ref()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    LinkProbe {
+        path: path.to_string(),
+        present: md.is_some(),
+        is_symlink,
+        link_target: if is_symlink {
+            std::fs::read_link(p)
+                .ok()
+                .map(|t| t.to_string_lossy().to_string())
+        } else {
+            None
+        },
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UninstallCliReport {
+    /// 계획한 제거가 전부 실측으로 확인됐는가(지울 것이 없었던 경우도 true).
+    ok: bool,
+    removed: Vec<String>,
+    /// "경로 — 사유" 형식. 왜 안 지웠는지를 사용자가 읽을 수 있어야 한다.
+    skipped: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// (D4a) 명시 메뉴 트리거. `/usr/local/bin` 의 cys·cysd 심볼릭을 osascript 1회 승격으로 제거한다.
+/// **비가역**이므로 순수 판정(plan_cli_uninstall)이 Remove 로 결론낸 경로만, 이름을 박아 지운다.
+/// 앱만 지우고 root 소유 링크가 남아 죽은 명령이 PATH 에 눌러앉던 결함(설치는 있는데 해제가 없었다)
+/// 의 수리다.
+#[tauri::command]
+fn uninstall_cli_from_path() -> Result<UninstallCliReport, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("이 기능은 macOS 전용입니다.".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target_dir = "/usr/local/bin";
+        let probes: Vec<LinkProbe> = ["cys", "cysd"]
+            .iter()
+            .map(|n| probe_link(&format!("{target_dir}/{n}")))
+            .collect();
+        let plan = plan_cli_uninstall(&probes);
+        let Some(arg) = plan.osascript_arg.clone() else {
+            // 지울 것이 없다 = 이미 해제됐거나 우리 링크가 아니다. 승격 프롬프트를 띄우지 않는다.
+            return Ok(UninstallCliReport {
+                ok: true,
+                removed: vec![],
+                skipped: plan.skipped,
+                warnings: vec![],
+            });
+        };
+
+        let out = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&arg)
+            .output()
+            .map_err(|e| format!("osascript 실행 실패: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("-128") || err.contains("User canceled") {
+                return Err("해제가 취소되었습니다.".into());
+            }
+            return Err(format!("심볼릭 제거 실패: {}", err.trim()));
+        }
+
+        // 사후 재관측 — 산출자의 자기신고를 믿지 않는다. 정말 사라졌을 때만 removed 로 보고한다.
+        let mut removed: Vec<String> = vec![];
+        let mut warnings: Vec<String> = vec![];
+        for path in &plan.remove {
+            if probe_link(path).present {
+                warnings.push(format!(
+                    "{path} 가 아직 남아 있습니다 — 터미널에서 'sudo rm {path}' 로 지우세요."
+                ));
+            } else {
+                removed.push(path.clone());
+            }
+        }
+        Ok(UninstallCliReport {
+            ok: warnings.is_empty(),
+            removed,
+            skipped: plan.skipped,
+            warnings,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CliInstallStatusReport {
+    /// macOS 전용 기능이다. UI 는 이 값 하나로 버튼 노출 여부를 정할 수 있다(false 면 숨김).
+    platform_supported: bool,
+    /// true 면 UI 라벨은 '해제', false 면 '설치'.
+    installed: bool,
+    /// "absent" | "ours" | "partial" | "foreign" | "unsupported".
+    state: String,
+    cys_link: String,
+    cysd_link: String,
+    /// 설치도 해제도 아닌 상태(실체 파일·타 대상 링크)의 사유 — 사용자 고지용.
+    notes: Vec<String>,
+}
+
+/// (D4b) 읽기전용 상태 조회. **승격하지 않는다** — 심볼릭 메타데이터만 본다. UI 는 Control Center
+/// 를 열 때 1회, 설치·해제 직후 1회만 호출한다(폴링 금지 — 타이머 증식 차단 원칙).
+/// non-macOS 에서 Err 를 던지지 않는 이유: CC 를 열 때마다 실패 토스트가 뜨기 때문이다. 대신
+/// platform_supported=false 로 답한다(install/uninstall 쪽 non-macOS Err 는 심층방어로 존치).
+#[tauri::command]
+fn cli_install_status() -> Result<CliInstallStatusReport, String> {
+    let target_dir = "/usr/local/bin";
+    let cys_link = format!("{target_dir}/cys");
+    let cysd_link = format!("{target_dir}/cysd");
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Ok(CliInstallStatusReport {
+            platform_supported: false,
+            installed: false,
+            state: "unsupported".into(),
+            cys_link,
+            cysd_link,
+            notes: vec![],
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let probes: Vec<LinkProbe> = vec![probe_link(&cys_link), probe_link(&cysd_link)];
+        let state = classify_cli_links(&probes);
+        let notes: Vec<String> = probes
+            .iter()
+            .filter_map(|p| match decide_cli_uninstall(p) {
+                UninstallAction::SkipNotSymlink => Some(format!(
+                    "{} — 심볼릭이 아닌 실제 파일이 이미 있습니다(다른 도구 설치본일 수 있어 자동으로 제거하지 않습니다).",
+                    p.path
+                )),
+                UninstallAction::SkipForeignTarget => Some(format!(
+                    "{} — cys.app 번들 밖({})을 가리키는 링크입니다.",
+                    p.path,
+                    p.link_target.as_deref().unwrap_or("대상 읽기 실패")
+                )),
+                _ => None,
+            })
+            .collect();
+        Ok(CliInstallStatusReport {
+            platform_supported: true,
+            installed: matches!(state, CliLinkState::Ours | CliLinkState::Partial),
+            state: match state {
+                CliLinkState::Absent => "absent",
+                CliLinkState::Ours => "ours",
+                CliLinkState::Partial => "partial",
+                CliLinkState::Foreign => "foreign",
+            }
+            .to_string(),
+            cys_link,
+            cysd_link,
+            notes,
         })
     }
 }
@@ -1967,8 +2413,8 @@ async fn maybe_autoregister_launchd() -> bool {
         None => return false,
     };
     // ★번들 위치 가드: plist 를 쓰기 **전에** 실행 번들 위치를 분류해 **Canonical(/Applications·
-    // ~/Applications)만** 자동등록한다. 무음 autostart 는 명시 사용자설치(plan_cli_install)와 위험
-    // 프로파일이 달라(GUI 시작 시 plist 무음 기록) 더 엄격하다: 휘발/이동 경로 — Translocated
+    // ~/Applications)만** 자동등록한다. 명시 사용자설치(plan_cli_install)와 **같은 기준**이다
+    // — D5(2026-08-23)로 저쪽도 NonStandard 를 거부하면서 판정이 수렴했다: 휘발/이동 경로 — Translocated
     // (/AppTranslocation/…)·Backup(cys.app.bak*/prev*)·NonStandard(~/Downloads·/Volumes/USB 등) — 가
     // plist ProgramArguments 에 각인되면 언마운트·삭제·앱 이동 시 죽은 경로 데몬을 무한 스폰한다(사용자
     // "손상됨"·앱 반복소실의 근본원인). 비-Canonical 은 자동등록만 skip 하고 ensure_daemon 런타임 폴백
@@ -3837,6 +4283,8 @@ fn main() {
             list_depts,
             read_dept_catalog,
             install_cli_to_path,
+            uninstall_cli_from_path,
+            cli_install_status,
             app_version,
             boot_verdict,
             // ATOMIC-1 짝: 설치본이 '반쪽 번들'인지 기동 시 스스로 확인해 복구 절차를 준다.
@@ -4446,7 +4894,8 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
 
     #[test]
     fn autoregister_allowed_only_canonical() {
-        // 무음 launchd 자동등록은 plan_cli_install 보다 엄격하다(의도적 divergence): Canonical 만 허용.
+        // 무음 launchd 자동등록은 Canonical 만 허용한다. 예전에는 plan_cli_install 이 NonStandard 를
+        // 경고만 하고 허용해 의도적 divergence 였으나, D5(2026-08-23)로 저쪽도 거부하면서 판정이 수렴했다.
         // NonStandard(~/Downloads·/Volumes 등)도 거부 — 휘발/이동 경로가 plist 에 각인되면 언마운트·삭제
         // 시 죽은 경로 데몬 무한 스폰(리뷰어1 F1). 비-Canonical 은 ensure_daemon 런타임 폴백으로 안전.
         assert!(autoregister_allowed(&BundleKind::Canonical), "정규 번들(/Applications·~/Applications)만 자동등록 허용");
@@ -4598,15 +5047,21 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ★D5(2026-08-23): NonStandard 는 '경고 후 진행'에서 **거부**로 승격됐다. root 소유 심볼릭이
+    // 사용자 쓰기 가능한 임의 경로를 가리키는 상태를 만들지 않는다. 이 테스트는 그 승격을 못박는다.
     #[test]
-    fn plan_cli_install_warns_on_nonstandard_but_proceeds() {
-        let plan = plan_cli_install(
+    fn plan_cli_install_refuses_nonstandard_and_names_actual_path() {
+        // CliInstallPlan 은 Debug 를 파생하지 않으므로(경로만 담는 내부 계획) match 로 받는다.
+        let err = match plan_cli_install(
             std::path::Path::new("/Users/x/Downloads/cys.app/Contents/MacOS"),
             "/usr/local/bin"
-        ).expect("nonstandard는 경고와 함께 진행");
-        assert!(plan.osascript_arg.contains("with administrator privileges"));
-        assert!(plan.warnings.iter().any(|w| w.contains("표준 위치")));
-        assert_eq!(plan.cys_src, std::path::PathBuf::from("/Users/x/Downloads/cys.app/Contents/MacOS/cys"));
+        ) {
+            Ok(_) => panic!("nonstandard 는 거부되어야 한다 — 경고 후 진행으로 되돌아갔다"),
+            Err(e) => e,
+        };
+        // 사용자가 원인을 알 수 있게 **실제 현재 경로**와 다음 조치를 함께 준다.
+        assert!(err.contains("/Users/x/Downloads/cys.app"), "실제 번들 경로를 알려야 한다: {err}");
+        assert!(err.contains("Applications"), "다음 조치(Applications로 이동) 안내가 있어야 한다: {err}");
     }
 
     #[test]
@@ -4642,6 +5097,248 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(!plan.osascript_arg.starts_with("do shell script '"));
         assert!(plan.osascript_arg.contains("'/usr/local/bin/cys'"));
         assert!(plan.osascript_arg.contains("ln -sf"));
+    }
+
+    // ── D3: 설치 등급(installed / installed_shadowed / unverified) ────────
+    #[test]
+    fn classify_install_status_installed_only_when_target_is_first() {
+        let v = classify_install_status(
+            &WhichProbe::Completed(vec!["/usr/local/bin/cys".into()]),
+            "/usr/local/bin/cys",
+        );
+        assert_eq!(v.status, "installed");
+        assert_eq!(v.shadowed_by, None);
+        assert!(v.warnings.is_empty(), "성공에는 경고가 붙지 않는다");
+        assert_eq!(v.effective_cys.as_deref(), Some("/usr/local/bin/cys"));
+    }
+
+    #[test]
+    fn classify_install_status_shadowed_when_other_cys_precedes() {
+        let v = classify_install_status(
+            &WhichProbe::Completed(vec![
+                "/opt/homebrew/bin/cys".into(),
+                "/usr/local/bin/cys".into(),
+            ]),
+            "/usr/local/bin/cys",
+        );
+        assert_eq!(v.status, "installed_shadowed");
+        assert_eq!(v.shadowed_by.as_deref(), Some("/opt/homebrew/bin/cys"));
+        assert!(v.warnings.iter().any(|w| w.contains("/opt/homebrew/bin/cys")),
+            "무엇이 가리는지 경로를 알려야 한다");
+    }
+
+    // ★헌장: "측정 불능은 어떤 게이트에서도 통과가 아니다". which 가 죽거나 매달려도 '설치 완료'로
+    // 올라가면 안 된다 — 예전 `.ok()`+`unwrap_or_default()` 경로가 정확히 그 사고였다.
+    #[test]
+    fn classify_install_status_unverified_on_measurement_failure_or_empty() {
+        let failed = classify_install_status(
+            &WhichProbe::Unmeasured("bash 5초 타임아웃".into()),
+            "/usr/local/bin/cys",
+        );
+        assert_eq!(failed.status, "unverified");
+        assert_eq!(failed.shadowed_by, None);
+        assert!(failed.warnings.iter().any(|w| w.contains("타임아웃")), "사유를 사용자에게 전달");
+
+        // 측정은 됐지만 PATH 에서 cys 를 못 찾은 경우도 '확인됨'이 아니다.
+        let empty = classify_install_status(&WhichProbe::Completed(vec![]), "/usr/local/bin/cys");
+        assert_eq!(empty.status, "unverified");
+        assert_eq!(empty.effective_cys, None);
+    }
+
+    // ── D6: which 검증 타임아웃(무기한 hang 차단) ──────────────────────
+    #[test]
+    fn run_capture_with_timeout_returns_stdout_and_kills_hung_child() {
+        let (ok, out) = run_capture_with_timeout(
+            "/bin/sh",
+            &["-c", "echo hi"],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("정상 종료는 Ok");
+        assert!(ok);
+        assert_eq!(out.trim(), "hi");
+
+        // 매달린 자식은 기한 초과로 kill 되고, 호출자는 반드시 돌아온다(빈 성공으로 접히지 않는다).
+        let started = std::time::Instant::now();
+        let hung = run_capture_with_timeout(
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            std::time::Duration::from_millis(300),
+        );
+        assert!(hung.is_err(), "기한 초과는 Err(측정 실패)여야 한다");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "기한 안에 돌아와야 한다");
+
+        // 실행 자체가 불가능한 경우도 Err — 조용한 빈 결과가 아니다.
+        assert!(run_capture_with_timeout(
+            "/nonexistent/cys-probe",
+            &[],
+            std::time::Duration::from_secs(1)
+        )
+        .is_err());
+    }
+
+    // ── D4a: 해제 가드(비가역) ────────────────────────────────────────
+    #[test]
+    fn links_into_cys_bundle_matches_only_bundle_binaries() {
+        assert!(links_into_cys_bundle("/Applications/cys.app/Contents/MacOS/cys"));
+        assert!(links_into_cys_bundle("/Users/x/Applications/cys.app/Contents/MacOS/cysd"));
+        // 백업 번들·타 앱·임의 경로는 우리 링크가 아니다.
+        assert!(!links_into_cys_bundle("/Applications/cys.app.bak-044/Contents/MacOS/cys"));
+        assert!(!links_into_cys_bundle("/Applications/Other.app/Contents/MacOS/cys"));
+        assert!(!links_into_cys_bundle("/opt/homebrew/bin/cys"));
+        // 번들 안이어도 cys/cysd 가 아닌 파일은 대상이 아니다.
+        assert!(!links_into_cys_bundle("/Applications/cys.app/Contents/MacOS/cys-app"));
+    }
+
+    fn probe(path: &str, present: bool, is_symlink: bool, target: Option<&str>) -> LinkProbe {
+        LinkProbe {
+            path: path.into(),
+            present,
+            is_symlink,
+            link_target: target.map(|t| t.to_string()),
+        }
+    }
+
+    // ★반례 4종: 일반 파일 / 타 앱 번들 지시 링크 / 부재 / dangling 링크.
+    // dangling(대상 파일이 이미 없는 링크)은 **반드시 제거 대상**이다 — 앱을 지운 뒤 남은 죽은
+    // 명령이 정확히 그 상태이고, 그게 이 기능이 존재하는 이유다.
+    #[test]
+    fn decide_cli_uninstall_removes_only_our_symlink() {
+        // ① 일반 파일(다른 도구가 설치한 실체 바이너리) — 절대 지우지 않는다
+        assert_eq!(
+            decide_cli_uninstall(&probe("/usr/local/bin/cys", true, false, None)),
+            UninstallAction::SkipNotSymlink
+        );
+        // ② 심볼릭이지만 대상이 우리 번들 밖
+        assert_eq!(
+            decide_cli_uninstall(&probe(
+                "/usr/local/bin/cys",
+                true,
+                true,
+                Some("/opt/homebrew/Cellar/cys/1.0/bin/cys")
+            )),
+            UninstallAction::SkipForeignTarget
+        );
+        // ③ 부재 — 할 일 없음
+        assert_eq!(
+            decide_cli_uninstall(&probe("/usr/local/bin/cysd", false, false, None)),
+            UninstallAction::SkipAbsent
+        );
+        // ④ dangling(앱 삭제 후 남은 잔재) — 제거 대상
+        assert_eq!(
+            decide_cli_uninstall(&probe(
+                "/usr/local/bin/cys",
+                true,
+                true,
+                Some("/Applications/cys.app/Contents/MacOS/cys")
+            )),
+            UninstallAction::Remove
+        );
+        // 대상 경로를 읽지 못한 링크도 지우지 않는다(모르면 손대지 않는다)
+        assert_eq!(
+            decide_cli_uninstall(&probe("/usr/local/bin/cys", true, true, None)),
+            UninstallAction::SkipForeignTarget
+        );
+    }
+
+    #[test]
+    fn build_uninstall_script_names_each_path_without_wildcards() {
+        let s = build_uninstall_script(&[
+            "/usr/local/bin/cys".to_string(),
+            "/usr/local/bin/cysd".to_string(),
+        ]);
+        assert_eq!(s, "rm -f '/usr/local/bin/cys' '/usr/local/bin/cysd'");
+        assert!(!s.contains('*') && !s.contains("rm -r"), "와일드카드·재귀 삭제 금지");
+    }
+
+    #[test]
+    fn plan_cli_uninstall_removes_ours_and_explains_skips() {
+        let plan = plan_cli_uninstall(&[
+            probe("/usr/local/bin/cys", true, true, Some("/Applications/cys.app/Contents/MacOS/cys")),
+            probe("/usr/local/bin/cysd", true, false, None),
+        ]);
+        assert_eq!(plan.remove, vec!["/usr/local/bin/cys".to_string()]);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].contains("/usr/local/bin/cysd"));
+        assert!(plan.skipped[0].contains("심볼릭이 아니라"), "왜 안 지웠는지 읽을 수 있어야 한다");
+        let arg = plan.osascript_arg.expect("제거 대상이 있으면 승격 인자 생성");
+        // 설치와 동일 규약: 바깥은 AppleScript 큰따옴표(작은따옴표면 -2741), 내부 경로는 sh_squote.
+        assert!(arg.starts_with("do shell script \""));
+        assert!(arg.ends_with("\" with administrator privileges"));
+        assert!(arg.contains("'/usr/local/bin/cys'"));
+        assert!(!arg.contains("'/usr/local/bin/cysd'"), "건드리지 않기로 한 경로가 스크립트에 새면 안 된다");
+    }
+
+    #[test]
+    fn plan_cli_uninstall_never_elevates_when_nothing_to_remove() {
+        let plan = plan_cli_uninstall(&[
+            probe("/usr/local/bin/cys", false, false, None),
+            probe("/usr/local/bin/cysd", false, false, None),
+        ]);
+        assert!(plan.remove.is_empty());
+        assert!(plan.osascript_arg.is_none(), "지울 것이 없으면 관리자 프롬프트를 띄우지 않는다");
+        assert_eq!(plan.skipped.len(), 2);
+    }
+
+    // ── D4b: 버튼 라벨을 가르는 상태 판정 ─────────────────────────────
+    #[test]
+    fn classify_cli_links_maps_absent_ours_partial_foreign() {
+        let ours = "/Applications/cys.app/Contents/MacOS/cys";
+        assert_eq!(
+            classify_cli_links(&[
+                probe("/usr/local/bin/cys", false, false, None),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ]),
+            CliLinkState::Absent
+        );
+        assert_eq!(
+            classify_cli_links(&[
+                probe("/usr/local/bin/cys", true, true, Some(ours)),
+                probe("/usr/local/bin/cysd", true, true, Some("/Applications/cys.app/Contents/MacOS/cysd")),
+            ]),
+            CliLinkState::Ours
+        );
+        assert_eq!(
+            classify_cli_links(&[
+                probe("/usr/local/bin/cys", true, true, Some(ours)),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ]),
+            CliLinkState::Partial
+        );
+        assert_eq!(
+            classify_cli_links(&[
+                probe("/usr/local/bin/cys", true, false, None),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ]),
+            CliLinkState::Foreign
+        );
+    }
+
+    // 라벨과 행동의 일치 가드: '해제' 라벨(installed=true)은 실제로 지울 것이 있을 때만 뜬다.
+    #[test]
+    fn install_label_state_agrees_with_uninstall_plan() {
+        for probes in [
+            vec![
+                probe("/usr/local/bin/cys", true, false, None),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ],
+            vec![
+                probe("/usr/local/bin/cys", true, true, Some("/opt/homebrew/bin/cys")),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ],
+            vec![
+                probe("/usr/local/bin/cys", true, true, Some("/Applications/cys.app/Contents/MacOS/cys")),
+                probe("/usr/local/bin/cysd", false, false, None),
+            ],
+        ] {
+            let state = classify_cli_links(&probes);
+            let installed = matches!(state, CliLinkState::Ours | CliLinkState::Partial);
+            let plan = plan_cli_uninstall(&probes);
+            assert_eq!(
+                installed,
+                !plan.remove.is_empty(),
+                "'해제' 라벨과 실제 제거 대상이 어긋났다: {state:?}"
+            );
+        }
     }
 
     /// ★D2a(purge-safety 2026-07-16) 회귀 트립와이어: GUI purge 는 --purge-workdir 를 절대

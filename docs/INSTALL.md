@@ -39,7 +39,7 @@
 | ID | 위험 명령 | 왜 경계인가 | 워커 처리 |
 |---|---|---|---|
 | INST-DENY-01 | `cys daemon install --takeover` | **가동 중인 세션이 소멸**합니다(비가역 — 아래 "C. 상시 가동" line 참조). | 자율 실행 금지 → 정지·오너 보고 |
-| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. |
+| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. **GUI "셸에 cys 설치"/"셸 cys 해제" 버튼은 사용자 명시 클릭 + osascript 1회 승격이라 이 경계를 위반하지 않지만, 에이전트가 그 버튼을 자율로 클릭하는 것은 여전히 금지**(사람의 클릭이 곧 동의다 — 대리 클릭은 동의가 아님). |
 | INST-DENY-03 | `rm -rf ~/.cys ~/.local/state/cys` | pack·트랜스크립트·상태 **완전 삭제**(비가역). | 자율 실행 금지 → 정지·오너 보고 |
 | INST-DENY-04 | DMG 우클릭·Gatekeeper "열기"·코드사이닝 | 사람 GUI/보안 결정 단계. | 사람(🧑)이 직접 → 워커는 위임 |
 
@@ -150,8 +150,22 @@ codesign --verify --strict --verbose /Applications/cys.app
 > 그래도 열리지 않으면 터미널에 `xattr -d com.apple.quarantine /Applications/cys.app` 을 한 번
 > 입력한 뒤 다시 열어 보세요.
 
-### 🧑 B. CLI도 외부 터미널에서 쓰려면 (선택)
-앱 번들 안의 cys·cysd를 PATH(`/usr/local/bin`)에 노출합니다. **수동 sudo 심링크 1회(에이전트 자율 금지 — 사람이 직접).**
+### 🧑 B. CLI도 외부 터미널에서 쓰려면 (선택 · macOS)
+앱 번들 안의 cys·cysd를 PATH(`/usr/local/bin`)에 노출합니다. **어느 방법이든 사람이 직접 —
+에이전트 자율 실행·자율 클릭 금지.**
+
+1. **권장 — GUI 1클릭(1회 관리자 승인):** Control Center 헤더 → **"셸에 cys 설치"** 클릭 →
+   macOS 비밀번호 1회 입력. `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생깁니다.
+   버튼은 macOS에서만 나타납니다(Windows·Linux에서는 표시되지 않습니다).
+   - 클릭 뒤 결과 알림이 **성공/경고 두 등급**으로 옵니다. 다음 두 경우는 **아직 끝난 게 아닙니다**:
+     - **"다른 cys가 앞을 가립니다"** — 심링크는 생겼지만 PATH 앞쪽의 다른 cys(예: 다른 도구가
+       설치한 사본)가 먼저 잡힙니다. 알림에 적힌 그 경로를 지우거나 `/usr/local/bin`을 PATH 앞으로
+       옮긴 뒤, 새 터미널에서 `which -a cys` 로 1순위를 확인하세요.
+     - **"확인 불가"** — 심링크는 생겼지만 어떤 cys가 잡히는지 확인하지 못했습니다(검증 명령 실패·응답 없음).
+       새 터미널에서 `which -a cys` 를 직접 확인하세요.
+   - 앱이 `/Applications` 밖(예: `~/Downloads`, DMG 안)에서 실행 중이면 버튼은 **거부**합니다.
+     Finder로 응용 프로그램 폴더에 옮긴 뒤 다시 시도하세요.
+2. **폴백 — 수동 sudo:** GUI를 못 쓰는 환경에서만.
 ```sh
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-02] sudo 심링크 — 사람이 직접
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
@@ -160,6 +174,11 @@ sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생기고 새 터미널에서 `cys`가 바로
 동작합니다. (앱 업데이트에도 경로 유지 — 심볼릭이라 자동 추종. pane *안*에서는 PATH가 자동
 주입되므로 이 단계는 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
+
+**해제 방법** — 같은 버튼이 상태에 따라 **"셸 cys 해제"** 로 바뀝니다. 누르면 확인 창이 먼저 뜨고,
+승인하면 `/usr/local/bin/cys`·`cysd` **심볼릭 링크만** 제거합니다(관리자 승인 1회). 같은 이름의
+일반 파일이나 다른 앱을 가리키는 링크는 건드리지 않고 사유와 함께 건너뜁니다. 수동 폴백은
+`sudo rm /usr/local/bin/cys /usr/local/bin/cysd` (🧑 [HUMAN] — 지우기 전 `ls -l` 로 심링크인지 확인).
 
 ### 🧑 C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영) [HUMAN]
 재부팅 후에도 데몬이 자동으로 살아 있게 launchd에 등록:
@@ -226,6 +245,7 @@ cys boot                                     # 설치된 CLI 자동 감지 → w
 ```sh
 # 🧑 [HUMAN] 상시 가동 해제 (가역)
 cys daemon uninstall                         # 상시 가동 해제(설치했다면)
+# 🧑 [HUMAN] macOS: 앱을 지우기 전에 Control Center 헤더의 "셸 cys 해제"를 먼저 누르면 심링크가 정리됩니다(§B).
 # 🧑 [HUMAN] macOS: Applications에서 cys.app 삭제 + /usr/local/bin/cys{,d} 심링크 제거
 # 🧑 [HUMAN] Windows: 제어판에서 MSI 제거
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-03] ⚠ 비가역 완전 삭제 — 워커 자율 실행 금지·정지·오너 보고

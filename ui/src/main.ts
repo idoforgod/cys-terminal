@@ -46,6 +46,17 @@ import {
 } from "./wheelgate";
 import { ceoPaletteEntries } from "./selfdiag";
 import {
+  isMacUserAgent,
+  installResultToast,
+  readInstallState,
+  cliButtonView,
+  uninstallConfirmText,
+  uninstallResultToast,
+  type CliButtonState,
+  type InstallCliReport,
+  type UninstallCliReport,
+} from "./clipath";
+import {
   toastTtl,
   toastTimerPlan,
   needsExpiryBanner,
@@ -70,6 +81,9 @@ declare global {
 }
 // 플랫폼 판별은 세션·페인마다 다시 할 이유가 없다 — 모듈 로드 시 1회만 읽는다(마우스 보고 필터가 소비).
 const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
+// 셸 설치/해제 버튼은 macOS 전용(Rust install_cli_to_path 가 그 밖에서는 즉시 Err). 부정 판정
+// (!IS_WINDOWS)이면 Linux가 통과해 "보이는데 안 되는 버튼" 결함이 그대로 재현되므로 양성 판정을 쓴다.
+const IS_MACOS = isMacUserAgent(navigator.userAgent);
 
 const invoke = (cmd: string, args?: Record<string, unknown>) => window.__TAURI__.core.invoke(cmd, args);
 const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
@@ -356,6 +370,32 @@ function applyGlanceFace(face: "live" | "tasks") {
   if (ccDensity === "glance") setCcTab(face);
 }
 
+// ── 셸 cys 설치/해제 버튼(macOS 전용) ─────────────────
+// 버튼 하나가 상태 2종을 겸한다(미설치=설치 / 설치됨=해제). 라벨·툴팁·클릭 분기의 진실은 이 모듈
+// 변수 하나이고, 판정은 clipath.ts 순수 함수가 한다(main.ts는 배선만 — clipath.test.ts가 잠근다).
+let cliInstallState: CliButtonState = "unknown";
+
+function applyCliButtonView() {
+  const b = document.getElementById("btn-install-cli");
+  if (!b) return;
+  const v = cliButtonView(cliInstallState);
+  b.textContent = v.label;
+  b.title = v.title;
+}
+
+// 읽기 전용 상태 조회(관리자 승격 없음). ★폴링 금지(WINAUDIT 타이머 증식) — CC 열 때 1회 +
+// 설치/해제 직후 1회뿐이다. 실패해도 기능이 죽지 않는 부수 조회라 조용히 unknown으로 두고,
+// unknown의 라벨은 '설치'다(멱등한 ln -sf 쪽 — 비가역 해제로 기울지 않는다).
+async function refreshCliInstallState() {
+  if (!IS_MACOS) return;
+  try {
+    cliInstallState = readInstallState(await invoke("cli_install_status"));
+  } catch {
+    cliInstallState = "unknown";
+  }
+  applyCliButtonView();
+}
+
 function setCcOpen(open: boolean) {
   ccOpen = open;
   document.getElementById("cc-panel")!.hidden = !open;
@@ -367,6 +407,9 @@ function setCcOpen(open: boolean) {
     refreshControlCenter();
     refreshHw();
     tickCc();
+    // 셸 설치 상태는 CC를 열 때 1회만 확인한다(주기 조회 없음). ★반드시 fire-and-forget —
+    // 여기서 await 하면 아래 타이머 생성이 응답을 기다리며 막힌다(e2e shim의 invoke는 영구 pending).
+    void refreshCliInstallState();
     if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
     if (ccHwTimer == null) ccHwTimer = setInterval(refreshHw, 2000) as unknown as number;
     if (ccClockTimer == null) ccClockTimer = setInterval(tickCc, 1000) as unknown as number;
@@ -6659,6 +6702,37 @@ document.getElementById("btn-cc-density")!.addEventListener("click", () =>
 document.getElementById("btn-cc-glance-face")!.addEventListener("click", () =>
   applyGlanceFace(ccGlanceFace === "tasks" ? "live" : "tasks"),
 );
+// 셸 cys 설치/해제 — index.html에서 hidden으로 시작하고 macOS에서만 연다(D2 플랫폼 게이팅).
+// Rust의 non-macOS Err 는 심층방어로 남아 있고, 이 줄은 "보이는데 안 되는 버튼"을 없애는 앞단이다.
+// 요소 참조는 `?.`로 둔다 — 버튼이 다시 삭제되더라도(가역 계약) 모듈 로드가 통째로 죽지 않게.
+if (IS_MACOS) {
+  const cliBtn = document.getElementById("btn-install-cli");
+  if (cliBtn) cliBtn.hidden = false;
+  applyCliButtonView(); // 조회 전 기본 라벨(=HTML 초기값과 동일) 확정 — 상태는 CC 열 때 채운다
+}
+document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
+  const b = document.getElementById("btn-install-cli") as HTMLButtonElement | null;
+  if (!b || b.disabled) return;
+  const wantUninstall = cliInstallState === "installed";
+  // 해제는 root 소유 심링크를 지우는 비가역에 가까운 행위 — 클릭 즉시 집행하지 않고 확인을 먼저 받는다.
+  // alert()/confirm()은 이 WKWebView에서 억제된다는 실측(B-11)이 있어 순수 DOM confirmModal을 쓴다.
+  if (wantUninstall) {
+    const c = uninstallConfirmText();
+    if (!(await confirmModal(c.title, c.body, c.yes, c.no))) return;
+  }
+  b.disabled = true; // in-flight 이중 클릭 차단(승격 프롬프트가 떠 있는 동안)
+  try {
+    const t = wantUninstall
+      ? uninstallResultToast(((await invoke("uninstall_cli_from_path")) as UninstallCliReport) ?? {})
+      : installResultToast(((await invoke("install_cli_to_path")) as InstallCliReport) ?? {});
+    toast(t.category, t.title, t.body);
+  } catch (e) {
+    toast("watchdog", wantUninstall ? "셸 cys 해제 실패" : "셸 설치 실패", String(e));
+  } finally {
+    b.disabled = false;
+    void refreshCliInstallState(); // 액션 직후 1회 재조회로 라벨 갱신(폴링 아님)
+  }
+});
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
@@ -6723,8 +6797,13 @@ document.getElementById("btn-ws-new")!.addEventListener("click", () => {
   void addWorkspace();
 });
 
-// (2026-08-20 P2) ▶CEO/▶부서장/셸설치 버튼 제거 — 기동 경로는 pane 마스터 선언(role-bootstrap 훅 체인)·cys launch-agent·phoenix 복원으로 잔존.
+// (2026-08-20 P2) ▶CEO/▶부서장/셸설치 버튼 3종 제거 — 기동 경로는 pane 마스터 선언(role-bootstrap 훅 체인)·cys launch-agent·phoenix 복원으로 잔존.
 // Rust 커맨드(start_master 등)는 존치(git log 참조). 버튼 복원은 HTML 2줄+핸들러 재추가로 가역.
+// (2026-08-25) ★셸설치 버튼만 복원 — 제거 사유였던 결함 4종을 함께 고쳤다: ①플랫폼 게이팅 없음
+// (macOS 양성 판정 시에만 hidden 해제) ②그림자화·검증실패를 "설치 완료"로 오보고(status 3분류 →
+// 등급 분리) ③해제 경로 부재(같은 버튼이 상태 2종을 겸함 + confirmModal 확인) ④검증 무기한 대기.
+// 배선은 #btn-cc-glance-face 리스너 직후, 판정은 clipath.ts(순수·clipath.test.ts). ▶CEO/▶부서장
+// 두 버튼은 **복원 대상이 아니다** — 위 이원 경로가 정본이다.
 
 // ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
 // "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).
