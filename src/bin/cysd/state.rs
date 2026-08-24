@@ -564,6 +564,24 @@ impl Surface {
     /// topology 세 소비자가 판정을 각자 구현하지 않고도 **동시에** 같은 사실을 본다
     /// (소비 측에 나이 계산을 넣으면 그 순간 3벌 사본이고, 한 벌만 고쳐지면 축이 갈린다).
     /// 만료의 귀결은 "축이 없던 것처럼 = 정확히 오늘의 동작"이라 새 위험을 만들지 않는다.
+    /// ★★(M2 · 2026-08-24) **만료는 침묵 복귀가 아니라 별도 사유**다.
+    ///
+    /// 종전 구현은 만료 표식을 `filter` 로 떨어뜨려 **null** 을 냈다(= 축이 없던 것처럼).
+    /// 그 귀결이 실측으로 확인된 결함이다: 좌석 등급이 `alive_presumed` 로 떨어지고
+    /// `javis_orchestra.py check` 가 그것을 **충족으로 세어 exit 0 = READY** 를 낸다 —
+    /// 절대지침이 한 번도 주입되지 않은 좌석이 30분 뒤 초록으로 집계된다(R1 의 타이머 재발).
+    ///
+    /// 이제 만료는 `gate` 라벨만 [`cys::GATE_PENDING_STALE_GATE`] 로 바꾼다. wire 술어
+    /// (`gate_pending_from_wire` = "object 인가")는 그대로 참이라 소비부는 계속 **미충족**으로
+    /// 읽고, 진단은 "오래된 보류(사람 조치가 30분 넘게 없었다)" 를 구별할 수 있다.
+    /// `since`·`evidence` 는 **원본을 보존**한다(언제부터 갇혔는지가 진단의 본체다).
+    ///
+    /// 라이브락 상한을 잃지 않는가? — 잃지 않는다. 해소의 **능동 경로**가 M2 에서 생겼다:
+    /// `cys boot` 이 스폰 0 의 재관측(`cys.rs::gate_pending_reobserve`)으로 관문 통과를
+    /// 확인하면 `clear_gate_pending` 이 표식을 지운다. TTL 이 침묵으로 풀어 줄 이유가 없다.
+    ///
+    /// 롤백 킬스위치(`CYS_GATE_PENDING=0`)는 종전대로 **여기 한 곳에서** 축을 통째로 null 로
+    /// 만든다 — 만료 라벨링도 그 아래에 있다.
     pub fn gate_pending_wire(&self) -> serde_json::Value {
         if !cys::gate_pending_axis_enabled() {
             return serde_json::Value::Null;
@@ -573,8 +591,17 @@ impl Surface {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|g| cys::gate_pending_fresh(g.since, now, cys::GATE_PENDING_TTL_SECS))
-            .and_then(|g| serde_json::to_value(g).ok())
+            .map(|g| {
+                if cys::gate_pending_fresh(g.since, now, cys::GATE_PENDING_TTL_SECS) {
+                    g.clone()
+                } else {
+                    GatePending {
+                        gate: cys::GATE_PENDING_STALE_GATE.to_string(),
+                        ..g.clone()
+                    }
+                }
+            })
+            .and_then(|g| serde_json::to_value(&g).ok())
             .unwrap_or(serde_json::Value::Null)
     }
 }

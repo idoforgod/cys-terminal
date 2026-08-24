@@ -5,7 +5,7 @@
     "cmd": "claude --dangerously-skip-permissions",
     "env": { "CLAUDE_CONFIG_DIR": "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}" },
     "inject_delay_secs": 10,
-    "notes": "Claude Code. cys 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 기동 — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 격리(읽지도 지우지도 않음). RC-3(B′): cmd=순수 명령·env=맵 구조. unix launch-agent는 `KEY=\"val\" cmd` 인라인으로 재조립(셸이 ${:-}·$HOME 전개·기존과 byte-identical), Windows는 순수 cmd send + surface.create가 해소된 env를 builder.env 주입(powershell이 POSIX env-assign 미해석 회귀 차단). macOS 인증은 계정 단위 Keychain이라 격리해도 로그인 유지. ready_marker(❯) 감지 후 주입. 폴더 신뢰 프롬프트는 launch-agent가 자동 확인한다.",
+    "notes": "Claude Code. cys 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 기동 — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 격리(읽지도 지우지도 않음). RC-3(B′): cmd=순수 명령·env=맵 구조. unix launch-agent는 `KEY=\"val\" cmd` 인라인으로 재조립(셸이 ${:-}·$HOME 전개·기존과 byte-identical), Windows는 순수 cmd send + surface.create가 해소된 env를 builder.env 주입(powershell이 POSIX env-assign 미해석 회귀 차단). ★정정(2026-08-23 실측 · 종전 서술 '계정 단위 Keychain이라 격리해도 로그인 유지'는 반증됐다): macOS Keychain 항목은 계정 단위가 아니라 config dir 경로 단위로 갈린다 — 서비스명이 `Claude Code-credentials-<sha256(CLAUDE_CONFIG_DIR 절대경로)[:8]>` 다. ∴ 격리 config dir 는 자체 `/login` 1회가 필요하고(사용자 ~/.claude 의 로그인이 따라오지 않는다), 프로필을 다른 경로로 복사·이동해도 인증이 따라가지 않으며, 새 부서 dir(~/.cys/claude-<key>)마다 재발한다. Windows 는 반대다 — 토큰이 config dir 안의 `.credentials.json` 파일이라 복사가 성립한다. ready_marker(❯) 감지 후 주입. 폴더 신뢰 프롬프트는 launch-agent가 자동 확인한다.",
     "ready_marker": "❯",
     "clear_cmd": "/clear",
     "resume_arg": "--resume {session_id}",

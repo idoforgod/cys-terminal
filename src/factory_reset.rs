@@ -823,8 +823,36 @@ fn interrupted_prior_resets(trash_root: &Path) -> Vec<PathBuf> {
 /// 센티널 TTL — 리셋 1회(정지 폴링 12s + 격리)의 상한을 넉넉히 덮되, 사고 시 자동 해제되는 값.
 const SENTINEL_TTL_SECS: u64 = 900;
 
+/// 센티널 경로 오버라이드 env — **테스트·진단 전용**.
+///
+/// ★왜 존재하는가(2026-08-24 · CI 전량 배선의 선행 조건): 센티널 회귀 테스트는 판정을
+/// 시험하려고 센티널을 **쓰고 지운다**. 경로가 `$HOME/.local/state/…` 로 고정돼 있으면 그
+/// 테스트가 두 가지를 동시에 깨뜨린다 —
+///   ① 같은 기계에서 러너가 둘 이상 돌면(로컬 cargo test ⇄ CI 잡 ⇄ 다른 워커) **같은 파일**을
+///      서로 쓰고 지워 무작위 적색이 난다. 결정론 게이트가 비결정론의 원천이 되는 형태다.
+///   ② 진짜 완전 초기화가 진행 중이면 테스트가 **살아 있는 가드를 지운다**. 그 가드의 존재
+///      이유가 "리셋 중 데몬 부활 = 전 pane 사망 등급" 차단이므로, 이건 테스트가 제품의
+///      최고 위험 등급 안전장치를 무력화하는 것이다.
+/// ∴ 경로를 주입 가능하게 만들고 테스트는 임시 디렉터리만 쓴다(사용자 홈 무접촉).
+///
+/// ⚠**프로덕션은 설정하지 않는다.** 쓰는 쪽(`ResetSentinel::arm` = 리셋 실행 프로세스)과 읽는
+/// 쪽(`reset_in_progress` = CLI autostart·GUI ensure_daemon)이 **서로 다른 프로세스**라,
+/// 한쪽에만 이 값이 있으면 두 프로세스가 다른 파일을 보고 가드가 조용히 무력해진다. 그래서
+/// ⓐ 상대경로·빈 값은 **무시**하고 기본 경로로 되돌아가며(오타로 가드를 잃지 않는다)
+/// ⓑ 이 스위치는 어떤 제품 경로에서도 설정되지 않는다(설정 지점은 테스트뿐).
+pub const ENV_RESET_SENTINEL: &str = "CYS_FACTORY_RESET_SENTINEL";
+
 /// 센티널 경로(홈 파생 — 데몬 상태 루트와 같은 부모라 리셋 대상과 함께 사라지지 않는다).
+/// `CYS_FACTORY_RESET_SENTINEL`(절대경로)이 있으면 그쪽을 쓴다 — 위 상수 문서 참조.
 pub fn sentinel_path() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os(ENV_RESET_SENTINEL) {
+        let p = PathBuf::from(v);
+        // 절대경로만 인정한다 — 상대경로는 프로세스 cwd 에 따라 갈려서 쓰는 쪽과 읽는 쪽이
+        // 다른 파일을 보게 된다(가드 무력화). 빈 값·상대경로는 조용히 기본 경로로 되돌린다.
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
     Some(
         dirs::home_dir()?
             .join(".local/state")
@@ -2703,8 +2731,20 @@ mod tests {
     /// 데몬 기동을 영구히 막으면 '전 pane 사망' 등급 사고가 된다. 신선+생존일 때만 차단한다.
     #[test]
     fn sentinel_is_fail_open_and_self_cleaning() {
-        let Some(path) = sentinel_path() else { return };
-        let restore = std::fs::read_to_string(&path).ok(); // 라이브 잔재 보존(테스트 격리).
+        // ★격리(2026-08-24): 종전 이 테스트는 **라이브 `$HOME/.local/state/…` 센티널**을 쓰고
+        //   지웠다. 그래서 ⓐ러너가 둘 이상 돌면 무작위 적색이고 ⓑ진짜 리셋이 진행 중이면
+        //   테스트가 그 가드를 삭제했다(= 전 pane 사망 등급 안전장치 무력화). 지금은 프로세스
+        //   고유 임시 경로만 쓴다 — 사용자 홈 무접촉·동시 실행 안전.
+        let td = test_home("sentinel");
+        let sp = td.join("sentinel-marker");
+        let _env = crate::pack::EnvGuard::set(ENV_RESET_SENTINEL, &sp);
+        let path = sentinel_path().expect("오버라이드가 있으면 경로는 항상 산출된다");
+        assert_eq!(path, sp, "env 오버라이드가 센티널 경로에 반영되지 않았다(격리 실패)");
+        assert!(
+            !path.starts_with(dirs::home_dir().unwrap_or_default().join(".local/state")),
+            "테스트가 여전히 라이브 상태 루트를 쓴다: {}",
+            path.display()
+        );
         let write = |body: &str| {
             if let Some(p) = path.parent() {
                 std::fs::create_dir_all(p).unwrap();
@@ -2758,9 +2798,21 @@ mod tests {
         }
         assert!(!reset_in_progress_with(&alive), "가드 Drop 후 센티널이 남으면 안 된다");
 
-        if let Some(body) = restore {
-            std::fs::write(&path, body).unwrap();
+        // ⑦ 오버라이드 계약 자신 — 상대경로·빈 값은 **무시**하고 기본(홈 파생)으로 되돌아간다.
+        //    (오타 하나로 쓰는 쪽과 읽는 쪽이 다른 파일을 보는 것 = 가드 조용한 무력화.)
+        {
+            let _rel = crate::pack::EnvGuard::set(ENV_RESET_SENTINEL, "relative/path");
+            let d = sentinel_path().expect("홈이 있으면 기본 경로 산출");
+            assert!(d.is_absolute() && d.ends_with(".cys-factory-reset-in-progress"),
+                    "상대경로 오버라이드가 채택됐다: {}", d.display());
         }
+        {
+            let _empty = crate::pack::EnvGuard::set(ENV_RESET_SENTINEL, "");
+            let d = sentinel_path().expect("홈이 있으면 기본 경로 산출");
+            assert!(d.ends_with(".cys-factory-reset-in-progress"),
+                    "빈 값 오버라이드가 채택됐다: {}", d.display());
+        }
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     /// ★P0-3 회귀: `--purge-round` opt-in 이면 프로젝트 _round 도 격리 대상이 된다(대칭 계약).

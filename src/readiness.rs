@@ -187,7 +187,10 @@ pub struct Observed<'a> {
     ///
     /// 【★렌더 증거 축의 실측 정의 — P4-2 · 2026-08-24】 '렌더 증거'는 **박스 문자 1개**가
     /// 아니라 ① 한 줄 안의 **연속 길이 ≥ `TUI_FRAME_RUN_MIN`**(=8 · '프레임 자') 또는
-    /// ② 대화형 위젯 문면(`TUI_RENDER_MARKS` — `Enter to confirm` 등)이다. 종전 정의에서는
+    /// ② 대화형 위젯 문면(`TUI_RENDER_MARKS` — 현재 코퍼스는 `for shortcuts` 하나이며 claude
+    /// TUI 의 `? for shortcuts` 줄이 그것이다. ★M6 에서 관문 위젯 서명 `Enter to confirm`·
+    /// `Esc to cancel` 두 개를 **뺐다** — 그 둘은 "관문이다"와 "살아있다"를 동시에 뜻해
+    /// 코퍼스에 없는 새 관문일수록 주입이 더 잘 나가는 역방향 성질의 출처였다)이다. 종전 정의에서는
     /// p10k 프롬프트(`╭─`/`╰─❯`)·`git log --graph` 괘선·`tree` 잔상 **한 조각**이 렌더 증거로
     /// 세어져 밸브의 AND 항이 영구 무장해제됐다(밸브가 `agent_alive` 단독으로 퇴화).
     /// 축이 좁아졌으므로 `bare_shell` 은 **참이 더 자주** 되고 밸브는 **더 자주 닫힌다** —
@@ -620,8 +623,8 @@ mod tests {
         //
         //   **뒷문장이 거짓이 됐다.** P4-2 가 렌더 증거를 '박스 문자 1개' 에서 **한 줄 안의
         //   연속 길이 ≥ `TUI_FRAME_RUN_MIN`(=8)** 로 좁혔는데, 이 실측 배너의 `─ Claude Code ─`
-        //   는 연속 런이 **1** 이다(프레임 자가 아니라 장식이다). 위젯 문면(`for shortcuts` ·
-        //   `Enter to confirm` …)도 이 화면에는 없다. 그래서 CLI `screen_is_bare_shell_on` 의
+        //   는 연속 런이 **1** 이다(프레임 자가 아니라 장식이다). 위젯 문면(★M6 이후 코퍼스는
+        //   `for shortcuts` 하나뿐이다)도 이 화면에는 없다. 그래서 CLI `screen_is_bare_shell_on` 의
         //   새 산출은 이 화면에서 **`true`** 다(격리 실행 실측 · unix·windows 두 축 동일).
         //
         //   → 픽스처 문자열은 **Windows 실기 캡처 전사본이라 한 글자도 바꾸지 않는다**(고쳐
@@ -831,6 +834,14 @@ mod tests {
     /// 연속 프레임 런 · 위젯 문면 유무)이지 *판정*이 아니므로 술어의 사본이 아니다.
     /// CLI 가 축을 다시 넓히면(예: 하한을 1 로 되돌리면) 이 핀이 먼저 적색이 난다.
     ///
+    /// 【★M6 판별력 보강 — 2026-08-24】 M6 이 `TUI_RENDER_MARKS` 를 `["for shortcuts"]` 로
+    /// 줄이자 이 표에서 **축 ②(위젯 문면)를 태우는 픽스처가 `LIVE_TUI_AT_PROMPT` 하나**만
+    /// 남았고, 그것은 남은 코퍼스 항(`for shortcuts`)을 쓴다. 즉 누군가 관문 위젯 서명
+    /// (`Enter to confirm`·`Esc to cancel`)을 코퍼스에 **되돌려도 이 검체는 적색이 나지 않았다**
+    /// — M6 의 회귀 방어가 CLI 쪽 검체 한 곳에만 걸린 단일 방어선이었다. 그래서 "꼬리 `❯` +
+    /// 관문 위젯 푸터" 행을 더하고, 그 행이 실제로 적색을 낼 수 있는지를 루프 뒤에서 **직접
+    /// 측정**한다(주장 아님). 있다고 믿는 방어가 없는 것은 없는 것보다 위험하다.
+    ///
     /// ★대상 한정: 아래 픽스처는 전부 **꼬리가 셸 프롬프트이고 꼬리에 사망 문면이 없다**
     /// (그 두 전제도 아래에서 함께 잰다). 그 구간에서 `bare_shell` = `¬렌더 증거` 로 환원되고,
     /// 재유도가 성립하는 것도 그 구간뿐이다 — 전제 밖 화면을 여기서 판정하지 않는다.
@@ -888,6 +899,11 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        // ★M6 회귀 방어 픽스처 — **관문 화면인데 꼬리가 입력 캐럿**인 부류.
+        //   실기 관문 화면(문면 SOT 소유)에 꼬리 `❯` 만 이어 붙인다. 관문 needle 을 여기에
+        //   문자열로 복사하면 그 순간 문면의 진실원천이 둘이 된다(H-READY-13 ⓑ 적색).
+        let gate_screen_at_caret = format!("{}❯ ", fixtures::FEATURE_FULLSCREEN);
+
         // 【진리표】 이 모듈이 손으로 박는 값 ↔ CLI 축에서 재유도한 값.
         for (label, screen, stamped) in [
             ("잔상 한 조각(P4-2 이사원 · ②′)", "─ Claude Code ─\n bye\nuser@mac ~ %", true),
@@ -898,6 +914,19 @@ mod tests {
             ),
             ("실측 정상 배너(Windows WIN-2)", HEALTHY_BANNER, true),
             ("살아있는 TUI(위젯 문면)", fixtures::LIVE_TUI_AT_PROMPT, false),
+            // ★M6 회귀 방어 행(2026-08-24) — **관문 위젯 푸터는 렌더 증거가 아니다.**
+            //   M6 이 `TUI_RENDER_MARKS` 를 `["for shortcuts"]` 로 줄이면서 이 표에서 축 ②를
+            //   태우는 픽스처가 `LIVE_TUI_AT_PROMPT`(=`? for shortcuts`) 하나만 남았고,
+            //   그 결과 **누가 관문 위젯 서명을 코퍼스에 되돌려도 이 검체는 적색이 나지 않았다**
+            //   (M6 의 회귀 방어가 CLI 쪽 `bare_shell_predicate_separates_a_live_tui_from_a_dead_shell`
+            //   의 관문 푸터 항 하나에만 걸린 **단일 방어선**이었다).
+            //   ★화면은 문면 SOT 픽스처에 꼬리 캐럿만 이어 붙여 만든다 — 관문 needle 을 이
+            //   파일에 **사본으로 박지 않는다**(그 사본 금지는 H-READY-13 ⓑ 가 집행한다).
+            (
+                "관문 화면 + 꼬리 `❯`(M6 회귀 방어)",
+                gate_screen_at_caret.as_str(),
+                true,
+            ),
         ] {
             // 전제 ⓐ — 꼬리가 셸 프롬프트다(아니면 `bare_shell` 은 무조건 false 라 잴 것이 없다).
             let tail = screen
@@ -937,6 +966,34 @@ mod tests {
                 "{label}: 검체가 손으로 박은 bare_shell={stamped} 인데 CLI 축에서 재유도하면 \
                  {rederived} 다(최대 연속 런 {run} vs 하한 {run_min} · 위젯 문면 {marked}) — \
                  검체가 낡았거나 CLI 술어의 축이 바뀌었다"
+            );
+        }
+
+        // ── ★계측 타당성(in-band) — M6 회귀 방어 행이 **실제로 적색을 낼 수 있는가** ──
+        //   위 표의 마지막 행은 "코퍼스에 관문 위젯 서명이 되돌아오면 적색"일 때만 방어선이다.
+        //   그 경계가 살아 있다는 것을 여기서 직접 잰다(주장이 아니라 측정):
+        //     ⓐ 그 행의 판정을 가르는 축이 **위젯 문면 하나뿐**이다(프레임 축은 개입하지 않는다).
+        //     ⓑ 지금 코퍼스로는 어떤 마크도 걸리지 않는다 → 재유도 `true` = 손으로 박은 값.
+        //     ⓒ 되돌림 후보 두 문면은 그 화면에 **실재한다** → 코퍼스에 하나라도 되돌아오면
+        //        `marked=true` → 재유도 `false` → 위 `assert_eq!` 가 즉시 적색.
+        //   ⓒ 가 없으면 "되돌려도 안 걸리는" 무력한 핀을 세운 것이고, 그것이 곧 이 캠페인이
+        //   반복해서 밟은 함정(있다고 믿는 방어가 없는 것보다 위험하다)이다.
+        let gate_flat = first_run_gates::flatten(&gate_screen_at_caret);
+        assert!(
+            max_frame_run(&gate_screen_at_caret) < run_min,
+            "M6 회귀 방어 행이 프레임 축으로 먼저 걸린다 — 위젯 문면 축을 재지 못한다(핀 무효)"
+        );
+        assert!(
+            !marks
+                .iter()
+                .any(|m| gate_flat.contains(&first_run_gates::flatten(m))),
+            "관문 위젯 서명이 이미 코퍼스에 있다 — M6 이 되돌아간 상태다(marks={marks:?})"
+        );
+        for restored in ["Enter to confirm", "Esc to cancel"] {
+            assert!(
+                gate_flat.contains(&first_run_gates::flatten(restored)),
+                "계측 무효: 되돌림 후보({restored})가 이 화면에 없다 — 코퍼스가 되돌아와도 \
+                 이 핀은 적색을 내지 못한다"
             );
         }
     }

@@ -286,6 +286,52 @@ fn manual_reap_recheck(still_exited: bool, queue_depth_now: usize) -> Option<&'s
     None
 }
 
+/// ★★M1(2026-08-24 자기성찰 3회전) — `agent_alive` 의 **3값 산출**(순수 · 진리표 대상).
+///
+/// ## 무엇이 틀렸었는가 — "아직 못 봤다" 를 "없다" 로 내보냈다
+///
+/// 종전 산출은 `agent_meta.map(|_| agent_seen && !agent_exit_notified)` 한 줄이었다. 즉 meta 가
+/// 등록된 좌석은 **항상 `Some(bool)`** 이었고, `agent_seen` 은 watchdog 의 자손 argv 매칭이
+/// 성공해야만 켜지므로 **한 번도 관측되지 않은 좌석이 `Some(false)`** 로 나갔다.
+///
+/// 그 값을 소비하는 CLI 의 파괴 판정(`cys.rs::readiness_timeout_verdict`)은 진리표에
+/// `Some(false) = 커널이 부재를 **확정**했다 → LaunchFailed → close` 라고 적혀 있다. 그래서
+/// argv 를 못 읽는 환경(Windows·EDR·래퍼 기동·벤더 실행 형태 변경)에서는 **살아 있는 좌석 전량이
+/// close** 로 흘렀다 — 회전2 격리 실주행 1차에서 의무 4좌석 전량 close 가 실제로 재현됐다
+/// (치명위험 앵커 ④ 전 pane 사망 그 자체).
+///
+/// 같은 저장소의 **수동 회수** 판정([`manual_reap_denial`] ④)은 같은 상황에서
+/// `agent_alive || live_owned > 0 || live_descendants > 0` 3중 OR 로 막는다 — 사람이 명시 요청한
+/// 파괴는 3중으로 막고, 자동으로 일어나는 파괴는 가장 좁은 축 하나로 결정하고 있었다.
+///
+/// ## 무엇을 하는가 — 관측의 3상을 그대로 내보낸다
+///
+/// | meta | agent_seen | exit_notified | 산출 | 뜻 |
+/// |---|---|---|---|---|
+/// | 없음 | — | — | `None` | 등록된 agent 없음(수동 new-surface 빈 셸) — 종전과 동일 |
+/// | 있음 | **false** | — | **`None`** | ★**한 번도 관측하지 않았다**(이름 매칭 미성립 포함) — 부재 확정이 아니다 |
+/// | 있음 | true | true | `Some(false)` | 사망감지가 '보였다가 사라짐' 전이를 **확정**했다 |
+/// | 있음 | true | false | `Some(true)` | 지금 관측된다 |
+///
+/// ★`Some(false)` 의 의미는 **좁아지기만 한다**(관측된 사망 확정만 남는다). 파괴 판정의 입력이
+///   줄어드는 방향이므로 새 오살 경로가 열리지 않는다. 반대로 미관측은 `None` = **판정 불가**로
+///   나가고, CLI 진리표가 이미 `None → GatePending`(좌석 보존)으로 문서화해 둔 가지가 이 수리로
+///   **처음 도달 가능**해진다(종전에는 meta 가 항상 등록돼 있어 null 이 나올 수 없었다).
+///
+/// ★소비부 정합: python 미러 `javis_boot_node` 는 이미 "daemon 의 agent_alive 는 3상
+///   (true/false/null)" 을 계약으로 적고 `is False` 엄격 비교로 소비한다(`_reclaim_verdict` ⓑ ·
+///   `awake_ready`). UI(`ui/src/main.ts`)도 `agent_alive !== false`(null=미상은 살아있다고 본다)
+///   로 이미 3상을 전제한다. 즉 이 수리는 **소비부가 이미 기대하던 값**을 데몬이 처음 내는 것이다.
+pub fn agent_alive_tri(has_meta: bool, seen: bool, exit_notified: bool) -> Option<bool> {
+    if !has_meta {
+        return None; // 등록된 agent 없음 — 이 축에 대해 말할 것이 없다(종전과 동일).
+    }
+    if !seen {
+        return None; // ★미관측 — '부재 ≠ 부정'. 이것을 false 로 접는 것이 M1 의 결함이었다.
+    }
+    Some(!exit_notified)
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -2483,14 +2529,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .and_then(|p| p.cwd())
                         .map(|p| p.display().to_string());
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
+                    // ★M1: 산출은 3값 순수 술어 `agent_alive_tri` 하나가 소유한다(사본 금지 —
+                    //   surface.list 와 org.status 가 갈리면 소비부가 좌석마다 다른 사실을 본다).
                     let (agent, agent_alive) = {
                         let meta = s.agent_meta.lock().unwrap();
                         (
                             meta.as_ref().map(|(name, _)| name.clone()),
-                            meta.as_ref().map(|_| {
-                                s.agent_seen.load(Ordering::Relaxed)
-                                    && !s.agent_exit_notified.load(Ordering::Relaxed)
-                            }),
+                            agent_alive_tri(
+                                meta.is_some(),
+                                s.agent_seen.load(Ordering::Relaxed),
+                                s.agent_exit_notified.load(Ordering::Relaxed),
+                            ),
                         )
                     };
                     json!({
@@ -5246,14 +5295,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .map(|t| t > std::time::Instant::now())
                         .unwrap_or(false);
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
+                    // ★M1: surface.list 와 **같은 3값 술어**(`agent_alive_tri`)를 경유한다.
                     let (agent, agent_alive) = {
                         let meta = s.agent_meta.lock().unwrap();
                         (
                             meta.as_ref().map(|(n, _)| n.clone()),
-                            meta.as_ref().map(|_| {
-                                s.agent_seen.load(Ordering::Relaxed)
-                                    && !s.agent_exit_notified.load(Ordering::Relaxed)
-                            }),
+                            agent_alive_tri(
+                                meta.is_some(),
+                                s.agent_seen.load(Ordering::Relaxed),
+                                s.agent_exit_notified.load(Ordering::Relaxed),
+                            ),
                         )
                     };
                     json!({
@@ -11556,14 +11607,143 @@ mod tests {
         }
     }
 
+    /// ★★M1 검체(2026-08-24) — **"아직 못 봤다" 가 "없다" 로 나가지 않는다.**
+    ///
+    /// 【고치는 결함】 종전 산출 `agent_meta.map(|_| agent_seen && !exit_notified)` 는 meta 가
+    /// 등록된 좌석을 **항상** `Some(bool)` 로 냈고, `agent_seen` 은 watchdog 의 자손 argv 매칭이
+    /// 성공해야만 켜지므로 **한 번도 관측되지 않은 좌석이 `Some(false)`** 였다. CLI 의 파괴 판정
+    /// (`readiness_timeout_verdict`)은 그 값을 "커널이 부재를 확정" 으로 읽어 `LaunchFailed →
+    /// close` 로 흘린다 — argv 미가독 환경에서 좌석 보존 배선 전체가 이 술어 하나로 무력화됐다
+    /// (회전2 격리 실주행: 의무 4좌석 전량 close 재현 · 치명위험 앵커 ④).
+    ///
+    /// 【적색 증명(in-band)】 ⓐ 가 **종전 산출식을 그대로 재현**해 같은 입력에서 `false` 가
+    /// 나왔음을 같은 실행에서 못 박는다 — 그러지 않으면 "고쳤다" 가 아니라 "원래 통과했다" 다.
+    ///
+    /// 【약화 없음】 `Some(false)`(= 파괴 판정의 입력)는 **관측된 사망 확정에서만** 나온다는
+    /// 것을 ⓒ 가 그대로 지킨다. 이 수리는 파괴 입력을 **줄이기만** 한다.
+    #[test]
+    fn agent_alive_is_tri_state_so_never_observed_is_not_absence() {
+        // ⓐ ★핵심 — meta 있음 ∧ 미관측(agent_seen=false).
+        let (has_meta, seen, notified) = (true, false, false);
+        // 적색 증명: 종전 산출식(= `meta.map(|_| seen && !notified)`)은 여기서 `Some(false)` 였다.
+        let legacy = has_meta.then(|| seen && !notified);
+        assert_eq!(
+            legacy,
+            Some(false),
+            "계측 무효: 종전 산출식이 미관측에서 false 를 내지 않았다면 M1 은 결함이 아니다"
+        );
+        assert_eq!(
+            agent_alive_tri(has_meta, seen, notified),
+            None,
+            "미관측이 여전히 '부재 확정'(Some(false))으로 나간다 — CLI 진리표가 그것을 \
+             LaunchFailed → close 로 흘린다(재난 ④)"
+        );
+
+        // ⓑ 관측 중 — 종전과 동일.
+        assert_eq!(agent_alive_tri(true, true, false), Some(true));
+        // ⓒ ★관측된 사망 확정 — `Some(false)` 는 **여기서만** 나온다(판정 약화 0).
+        assert_eq!(
+            agent_alive_tri(true, true, true),
+            Some(false),
+            "사망 확정이 판정 불가로 접혔다 — 진짜 실패 좌석이 영원히 보류로 쌓인다"
+        );
+        // ⓓ meta 없음(수동 new-surface 빈 셸) — 종전과 동일한 null.
+        for notified in [false, true] {
+            assert_eq!(agent_alive_tri(false, false, notified), None);
+            assert_eq!(agent_alive_tri(false, true, notified), None);
+        }
+
+        // ⓔ **전수 대조** — 새 술어가 `Some(false)` 를 내는 조합은 종전의 진부분집합이다
+        //    (= 파괴 판정의 입력이 늘어나는 방향으로는 한 칸도 열리지 않았다).
+        let mut narrowed = 0;
+        for has_meta in [false, true] {
+            for seen in [false, true] {
+                for notified in [false, true] {
+                    let legacy = has_meta.then(|| seen && !notified);
+                    let now = agent_alive_tri(has_meta, seen, notified);
+                    if now == Some(false) {
+                        assert_eq!(
+                            legacy,
+                            Some(false),
+                            "새 술어가 종전 밖에서 '부재 확정'을 냈다(오살 방향 신설): \
+                             meta={has_meta} seen={seen} notified={notified}"
+                        );
+                    }
+                    if legacy == Some(false) && now != Some(false) {
+                        narrowed += 1;
+                    }
+                }
+            }
+        }
+        assert!(narrowed > 0, "좁혀진 조합이 0 — 이 수리는 아무것도 바꾸지 않았다");
+    }
+
+    /// ★★M1 검체 ② — **wire 로 실제로 null 이 나간다.** 순수 술어만 고치고 직렬화 지점이
+    /// 종전 인라인 식을 그대로 쓰면 소비부는 아무것도 달라지지 않는다(사본 드리프트).
+    /// `surface.list` · `org.status` **양쪽**을 같은 좌석으로 관통한다.
+    #[test]
+    fn never_observed_agent_serializes_as_null_on_both_wire_methods() {
+        let daemon = claim_daemon();
+        let never = make_surface(&daemon, Some("worker-1"));
+        let dead = make_surface(&daemon, Some("worker-2"));
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            // ① meta 는 등록됐다(launch-agent 가 기동 send 직후 등록 — Phase 5 ①a).
+            //    그러나 watchdog 이 argv 로 이 좌석의 에이전트를 **한 번도 못 봤다**.
+            *surfaces[&never].agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            surfaces[&never].agent_seen.store(false, Ordering::Relaxed);
+            surfaces[&never].agent_exit_notified.store(false, Ordering::Relaxed);
+            // ② 대조군 — 보였다가 사라진 좌석(진짜 사망 확정).
+            *surfaces[&dead].agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            surfaces[&dead].agent_seen.store(true, Ordering::Relaxed);
+            surfaces[&dead].agent_exit_notified.store(true, Ordering::Relaxed);
+        }
+        for (method, key) in [("surface.list", "surfaces"), ("org.status", "surfaces")] {
+            let req = Request { id: json!(1), method: method.into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply for {method}");
+            };
+            let e = surface_entry(&resp, key, never);
+            assert!(
+                e["agent"].is_string(),
+                "{method}: 드릴 전제 붕괴 — meta 가 등록된 좌석이어야 한다: {e}"
+            );
+            assert!(
+                e["agent_alive"].is_null(),
+                "{method}: 미관측 좌석이 agent_alive={} 로 나간다 — CLI 가 이것을 '부재 확정' 으로 \
+                 읽어 좌석을 close 한다(재난 ④): {e}",
+                e["agent_alive"]
+            );
+            let d = surface_entry(&resp, key, dead);
+            assert_eq!(
+                d["agent_alive"],
+                json!(false),
+                "{method}: 관측된 사망 확정이 판정 불가로 접혔다 — 진짜 실패 좌석이 쌓인다: {d}"
+            );
+        }
+    }
+
     /// ★(U-11) 만료(TTL)는 **읽기 지점 하나**가 집행한다 — U-10 이 이 함수 doc 에 남긴 인계
     /// 사항의 이행. 표식을 지우는 능동 경로는 "그 좌석에서 readiness 재확정" 뿐인데, 보류 좌석은
     /// `cys boot` 이 관측만 하고 건너뛰므로 그 기회가 오지 않는다 — 만료가 없으면 사람이 관문을
     /// 통과시켜도 좌석이 영구 미충족으로 남는 부트 라이브락(A1)이다.
     ///
     /// 만료를 **직렬화 지점**에 두는 이유: Rust·python·topology 세 소비자가 나이 계산을 각자
-    /// 구현하지 않고도 동시에 같은 사실을 본다. 만료의 귀결은 "축이 없던 것처럼 = 오늘의 동작"이라
-    /// 새 위험을 만들지 않는다.
+    /// 구현하지 않고도 동시에 같은 사실을 본다.
+    ///
+    /// ## ★핀 이사(M2 · 2026-08-24) — 만료의 **귀결**이 바뀌었다
+    ///
+    /// 종전 이 검체는 "TTL 초과 표식 = **null**(무신호)" 을 박았고 그 근거는 "만료의 귀결은
+    /// 축이 없던 것처럼 = 오늘의 동작이라 새 위험을 만들지 않는다" 였다. **그 근거가 거짓이다.**
+    /// 표식이 null 로 접히면 좌석 등급이 `alive_presumed` 로 떨어지고 `javis_orchestra.py check`
+    /// 가 그것을 **충족으로 세어 exit 0 = READY** 를 낸다 — 절대지침이 한 번도 주입되지 않은
+    /// 좌석이 30분 뒤 초록으로 집계된다(근본원인 R1 의 타이머 재발).
+    ///
+    /// 이제 만료는 **사유를 바꾼다**: wire 는 계속 object(= 소비부는 계속 미충족)이고 `gate` 만
+    /// [`cys::GATE_PENDING_STALE_GATE`] 가 된다. 라이브락 상한은 M2 의 재관측 경로
+    /// (`cys.rs::gate_pending_reobserve` → `clear_gate_pending`)가 대신 진다.
+    /// 판정 조건은 **약해지지 않았다** — TTL 을 상의한다는 사실은 그대로 재고, 만료가 축을
+    /// 무신호로 되돌리지 **않는다**는 더 강한 단언이 추가됐다.
     #[test]
     fn gate_pending_wire_expires_at_the_single_serialization_point() {
         let daemon = isolated_daemon();
@@ -11579,11 +11759,31 @@ mod tests {
         });
         assert!(s.gate_pending_wire().is_object(), "갓 찍은 표식이 보이지 않는다");
 
-        // TTL 을 넘긴 표식 = 무신호(null) → 전 소비자가 종전 판정으로 복귀(라이브락 상한).
+        // ★TTL 을 넘긴 표식 = **별도 사유**(`gate_pending_stale`). 침묵 복귀(null)가 아니다.
         s.gate_pending.lock().unwrap().as_mut().unwrap().since =
             now - cys::GATE_PENDING_TTL_SECS - 1.0;
-        assert!(s.gate_pending_wire().is_null(),
-                "TTL 초과 표식이 살아남는다 — 좌석이 영구 미충족(부트 라이브락)");
+        let stale = s.gate_pending_wire();
+        assert!(
+            stale.is_object(),
+            "만료가 축을 무신호(null)로 되돌렸다 — 주입 0 좌석이 alive_presumed 로 떨어져 \
+             orchestra check 가 exit 0 = READY 를 낸다(R1 의 타이머 재발): {stale}"
+        );
+        assert_eq!(
+            stale["gate"].as_str(),
+            Some(cys::GATE_PENDING_STALE_GATE),
+            "만료 사유가 표식에 남지 않았다 — '오래된 보류' 를 진단이 구별하지 못한다: {stale}"
+        );
+        // 소비부의 유일한 술어("object 인가")가 **계속 참**이다 = 좌석은 계속 미충족이다.
+        assert!(
+            cys::gate_pending_from_wire_with(true, &stale),
+            "만료 표식이 wire 술어에서 떨어졌다 — 미충족이 조용히 충족으로 바뀐다"
+        );
+        // `since` 는 원본 보존(언제부터 갇혔는지가 진단의 본체다 — 재기록 멱등 계약과 동형).
+        assert_eq!(
+            stale["since"].as_f64(),
+            Some(now - cys::GATE_PENDING_TTL_SECS - 1.0),
+            "만료 라벨링이 나이를 리셋했다"
+        );
         // TTL 안쪽은 살아 있다(조기 소실 방지). ★정확한 경계(age == TTL)는 여기서 재지 않는다 —
         // 이 함수는 벽시계(`now_epoch`)를 스스로 읽으므로 테스트가 잡은 `now` 와 마이크로초
         // 단위로 어긋나 경계 판정이 시계 경쟁이 된다. 경계 규약 자체는 순수 코어

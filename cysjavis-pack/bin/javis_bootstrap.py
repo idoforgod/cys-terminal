@@ -302,6 +302,42 @@ CYS_BOOT_EXIT_BUSY = 75
 #   구 바이너리는 78 을 내지 않으므로(0/1 만) 이 분기는 신 바이너리에서만 발동한다 — 스큐 안전.
 CYS_LAUNCH_EXIT_GATE_PENDING = 78
 
+# ★(M3-짝 · 2026-08-24) `cys boot` 도 **같은 사실**(관문 보류)에 대해 같은 값을 낸다.
+#   Rust 쪽 `boot_exit_code` 가 summary 의 `gate_pending` 버킷이 비지 않았을 때 이 값을 내고,
+#   여기가 그 유일한 파이썬 소비 상수다. **별도 숫자를 만들지 않는 것이 이 두 줄의 전부다** —
+#   같은 사실에 값이 둘이면 한쪽만 고쳐지는 날이 오고, 그날의 증상은 "관문 보류인데 부트가
+#   성공으로 읽힌다"(=거짓 성공)다. 별칭이므로 드리프트가 구조적으로 불가능하다.
+CYS_BOOT_EXIT_GATE_PENDING = CYS_LAUNCH_EXIT_GATE_PENDING
+
+# ★`cys boot --json` 의 role 별 `outcome` 중 **Fatal 로 판정하는 값 집합**(단일 등재소).
+#   여기 없는 outcome 은 Fatal 이 아니다 — 그래서 새 outcome 이 생기면 **이 한 줄**을 고치게
+#   된다(종전엔 집합이 `_boot_fatal_verdict` 본문 안 튜플 리터럴이라, 새 outcome 이 어디에도
+#   안 걸리는 것이 diff 에 드러나지 않았다 · 실제 사고 형태 = `gate_pending` 무처리).
+#   · failed  = 기동 시도했고 실패했다      · missing = 그 에이전트가 이 기계에 없다
+# ★★`gate_pending` 은 **일부러 여기 없다.** U-11 이 명시적으로 결박한 계약이다(집행자 = 검체
+#   `H-EXIT-11` ⑥): 관문 보류는 pane 도 에이전트 프로세스도 **살아 있는** 상태라, Fatal 로
+#   접으면 소비부가 '기동이 깨졌다'로 읽어 **살아 있는 좌석을 회수·파괴**하려 든다
+#   (치명위험 ④ — 오살이 오탐보다 훨씬 비싸다). 그렇다고 Degrade 로 흘려보내면 종전처럼
+#   "비0 이지만 Fatal 역할은 전원 확보" 라는 **거짓 문장**이 기록된다(관문에 갇힌 의무 역할이
+#   있는데 전원 확보라고 적는 것).
+#   ∴ 제3 분기다 — `_boot_gate_pending_verdict` 가 잡고, 처방은 회수·재기동이 아니라
+#     '사람이 그 pane 에서 관문 1회 통과' 이며, 최종 게이트는 종전대로 ⑤check 다
+#     (⑤ 의 결손 산출은 U-10 이 gate_pending 좌석을 이미 '못 쓰는 좌석'으로 센다 — 4자 파리티).
+BOOT_FATAL_OUTCOMES = ("failed", "missing")
+
+# 제3 상태의 outcome 값(정본 = Rust `cys::GATE_PENDING_KEY`).
+BOOT_GATE_PENDING_OUTCOME = "gate_pending"
+
+# 관문 보류 처방 문안(단일 출처) — launch-agent 소비부(U-11)와 **같은 사실을 같은 말로** 낸다.
+# ★면책 창 경고를 반드시 동봉한다: 실측상 기본 포커스가 `No, exit` 이라 그대로 Return 하면
+#   좌석이 죽는다(2026-07-29 실사고 형태 · e2e 오라클 H-FAKE-2 가 rc 1 로 박제한 그 축).
+_GATE_PENDING_PRESCRIPTION = (
+    "→ 그 pane 에서 첫기동 관문(테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)을 "
+    "1회 통과시켜라. ★면책 창의 기본 포커스는 `No, exit` 이므로 그대로 Return 하면 노드가 "
+    "종료된다(아래 방향키 1회 뒤 Return). 좌석과 프로세스는 살아 있으므로 **회수·재기동·kill 은 "
+    "하지 마라** — 재부트가 스폰 없이 그 좌석을 채택한다."
+)
+
 # claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — hooks/session-start.sh 의 self-demote
 # 대조 지점과 동일 어휘. 종전 주석은 `session-start.sh:101` 을 가리켰으나 실제 대조는 그 아래
 # `$CLAIM_OUT` grep 이다 — 낡은 라인 참조를 지운다).
@@ -654,6 +690,10 @@ _STEP_DEFS = (
     ("BOOT_SKEW", "④boot-skew"),
     ("BOOT", "④boot"),
     ("BOOT_BUSY", "④boot-busy"),
+    # ★(M3-짝) 제3 상태 — 성공도 실패도 busy 도 아닌 '관문 보류'. busy 판정 **뒤**, Degrade
+    #   **앞**에 선언한다(선언 순서 = 실행 순서 계약). 종전엔 이 사실이 Degrade 로 접혀
+    #   "Fatal 역할은 전원 확보" 라는 거짓 문장으로 기록됐다.
+    ("BOOT_GATE_PENDING", "④boot-gate-pending"),
     ("BOOT_DEGRADE", "④boot-degrade"),
     ("BOOT_TICKET_CONSUME", "④boot-ticket-consume"),
     ("BOOT_REVIEWERS", "④b-boot-reviewers"),
@@ -1931,23 +1971,31 @@ def _boot_fatal_verdict(code, out):
     """★B1 정책 열 소비 — `cys boot` 결과가 **Fatal 실패**인가. Fatal 이면 사유 문자열, 아니면 None.
 
     판정 재료는 `cys boot --json` 의 role 별 `{outcome, mandatory}`:
-      Fatal 실패 = mandatory:true 인 role 의 outcome ∈ {failed, missing}.
+      Fatal 실패 = mandatory:true 인 role 의 outcome ∈ `BOOT_FATAL_OUTCOMES`(= failed · missing).
       busy(다른 boot 진행 중)·already_alive·launched 는 실패가 아니다(G11 — busy 를 성공으로
       오인하지도, 실패로 오인하지도 않는다).
+      **gate_pending 도 Fatal 이 아니다**(U-11 · 위 `BOOT_FATAL_OUTCOMES` 주석) — 제3 분기
+      `_boot_gate_pending_verdict` 가 잡는다. 그쪽이 더 **구체적인** 판정이라 여기서 빠지는 것은
+      감시의 축소가 아니라 이관이다.
     ★--json 소비 불가(구 바이너리·파싱 실패)면 **종전 계약으로 보수 폴백**: 비0 = Fatal.
       새 계약을 못 읽는 상태에서 Degrade 로 접으면 진짜 실패를 은닉한다(fail-open 금지).
     ★(W4) 단 **exit 75(busy)** 는 그 보수 폴백에서 제외한다 — busy 는 실패가 아니라 '무스폰'이고,
       75 는 신 계약 전용 값이라(구 바이너리는 0/1/2만) 오해석 위험이 없다. 이걸 Fatal 로 접으면
-      훅↔GUI 중첩 부트마다 exit 4 위경보가 난다(P3-B16 부류의 반복성 오경보)."""
+      훅↔GUI 중첩 부트마다 exit 4 위경보가 난다(P3-B16 부류의 반복성 오경보).
+    ★(M3-짝) **exit 78(관문 보류)** 도 같은 이유로 제외한다 — 다만 근거가 다르다. 75 는 '실패가
+      아니라서' 빼고, 78 은 '**다른 분기가 반드시 잡아서**' 뺀다(`_boot_gate_pending_verdict` 의
+      축 ⓐ 가 exit 78 이므로 파싱이 깨져도 놓치지 않는다). 여기서 Fatal 로 접으면 소비부가 살아
+      있는 좌석에 회수·파괴 처방을 낸다(치명위험 ④). 78 역시 신 계약 전용 값이라(구 바이너리는
+      0/1/2만) 파싱 불가 상태에서도 의미가 모호하지 않다."""
     v = _parse_boot_json(out)
     if v is None or not isinstance(v.get("roles"), list):
-        if code == CYS_BOOT_EXIT_BUSY:
+        if code in (CYS_BOOT_EXIT_BUSY, CYS_BOOT_EXIT_GATE_PENDING):
             return None
         return (None if code == 0
                 else "cys boot 실패(exit %s) — --json 계약 소비 불가로 종전 계약(비0=Fatal) 적용:\n%s"
                      % (code, out))
     bad = [r for r in v["roles"]
-           if r.get("mandatory") and r.get("outcome") in ("failed", "missing")]
+           if r.get("mandatory") and r.get("outcome") in BOOT_FATAL_OUTCOMES]
     if not bad:
         return None
     return _fatal_detail(bad, out)
@@ -1967,10 +2015,52 @@ def _boot_was_busy(code, out):
     return summary.get("lock") == "busy"
 
 
+def _boot_gate_pending_verdict(code, out):
+    """★(M3-짝) `cys boot` 결과가 **관문 보류**인가 — 보류면 사유 문자열, 아니면 None.
+
+    ★왜 전용 분기인가(종전 결함): `gate_pending` 은 Fatal 집합에도 busy 판정에도 없어서
+      **어디에도 걸리지 않았다.** 그 결과 `elif code != 0` 의 Degrade 가지로 흘러
+      "비0 이지만 **Fatal 역할은 전원 확보**" 라는 문장이 기록됐다 — 의무 역할이 관문에 갇혀
+      팀이 서지 않았는데 전원 확보라고 적는 것이라, 로그를 읽는 사람과 기계 모두를 속인다.
+      Fatal 로 승격하는 수리는 반대편 벽에 부딪힌다(U-11: 살아 있는 좌석 회수·파괴 = 치명위험 ④).
+      ∴ 성공도 실패도 busy 도 아닌 **제3 상태**로 이름 붙여 잡는다.
+
+    판정은 두 축의 **OR** 이다(`_boot_was_busy` 와 같은 형태·같은 이유):
+      ⓐ exit == 78(`CYS_BOOT_EXIT_GATE_PENDING` · 신 계약 전용 값)
+      ⓑ --json 의 mandatory role 중 outcome == "gate_pending"
+    한쪽만 보면 스큐를 놓친다 — exit 만 보면 종료코드가 구 바이너리로 스큐된 조합을 놓치고,
+    JSON 만 보면 파싱 실패에서 보류를 통째로 놓친다.
+
+    ★귀결은 **중단이 아니라 큰 소리 + 계속**이다. 좌석이 살아 있으므로 여기서 exit 4 를 내면
+      U-11 이 막으려는 회수·파괴 처방이 나간다. 최종 게이트는 종전대로 ⑤check 이고, ⑤ 의 결손
+      산출은 U-10 이 gate_pending 좌석을 이미 '못 쓰는 좌석' 으로 센다(4자 파리티) — 즉 보류
+      상태에서 부트가 조용히 성공으로 끝나지 않는다."""
+    v = _parse_boot_json(out) or {}
+    gated = [r for r in (v.get("roles") or [])
+             if isinstance(r, dict) and r.get("mandatory")
+             and r.get("outcome") == BOOT_GATE_PENDING_OUTCOME]
+    if not gated and code != CYS_BOOT_EXIT_GATE_PENDING:
+        return None
+    who = ", ".join("%s=%s%s" % (r.get("role"), r.get("outcome"),
+                                 (" [" + r["reason"] + "]") if r.get("reason") else "")
+                    for r in gated) or "(--json 소비 불가 — exit %s 로 판정)" % code
+    return ("의무 역할 첫기동 관문 보류(exit %s): %s\n"
+            "  ★좌석과 에이전트 프로세스는 **살아 있다** — 실패가 아니므로 회수·파괴하지 않는다.\n"
+            "  %s\n%s" % (code, who, _GATE_PENDING_PRESCRIPTION, out))
+
+
 def _fatal_detail(bad, out):
-    """Fatal 사유 1줄 조립 — install_hint 는 **그대로** 인용한다(플랫폼 분기는 생산자 몫·B15)."""
+    """Fatal 사유 1줄 조립 — install_hint 는 **그대로** 인용한다(플랫폼 분기는 생산자 몫·B15).
+
+    ★(M3-짝) 생산자가 붙여 준 처방 필드를 넓게 인용한다 — 종전엔 `install_hint` 만 봤는데,
+      `cys.rs` 는 outcome 에 따라 `hint`·`reason` 도 싣는다. 그 문장들이 소비부에서 버려지면
+      사람이 로그만 보고는 무엇을 해야 할지 알 수 없다(플랫폼·상황 분기는 생산자 몫·B15)."""
+    # 생산자(cys.rs)가 붙여 준 처방을 **그대로** 인용한다 — 우선순위는 구체적인 것부터:
+    #   install_hint(설치 처방) → hint(관문 보류 처방 · gate_pending 이 싣는다) → reason(사유).
+    def _hint(r):
+        return r.get("install_hint") or r.get("hint") or r.get("reason")
     detail = ", ".join("%s=%s%s" % (r.get("role"), r.get("outcome"),
-                                    (" [" + r["install_hint"] + "]") if r.get("install_hint") else "")
+                                    (" [" + _hint(r) + "]") if _hint(r) else "")
                        for r in bad)
     return "의무(Fatal) 역할 기동 실패: %s\n%s" % (detail, out)
 
@@ -2570,11 +2660,20 @@ def _cmd_run_chain(log):
         #   ⓑDegrade 경고도 내지 않는다(정상적인 훅↔GUI 중첩 부트에서 매번 뜨는 위경보 차단).
         #   팀은 락을 쥔 그 런이 세우고, 이 런의 최종 게이트는 ⑤check 다(재시도 창 내장).
         boot_busy = _boot_was_busy(code, out)
+        gate_why = _boot_gate_pending_verdict(code, out)
         if boot_busy:
             log.step(STEP.BOOT_BUSY, code,
                      "다른 boot 가 락 보유 — 이 런은 무스폰 skip(exit %s). 티켓 미소비·Degrade 아님. "
                      "팀 기동 확인은 ⑤check 가 담당한다." % code)
             _progress("④ 다른 boot 진행 중(무스폰 skip) — 티켓 보존·⑤ 생존 확인으로 진행")
+        # ★(M3-짝) 제3 상태: 관문 보류. Fatal 로 접으면 살아 있는 좌석에 회수·파괴 처방이
+        #   나가고(U-11 치명위험 ④), Degrade 로 접으면 "Fatal 역할은 전원 확보" 라는 거짓
+        #   문장이 남는다. 큰 소리로 이름 붙여 기록하고 ⑤check 로 넘긴다 — ⑤ 의 결손 산출은
+        #   gate_pending 좌석을 '못 쓰는 좌석' 으로 세므로(U-10 4자 파리티) 조용한 성공은 없다.
+        elif gate_why is not None:
+            log.step(STEP.BOOT_GATE_PENDING, code, gate_why)
+            _progress("⚠ ④ 의무 노드가 첫기동 관문 보류 — 좌석은 살아 있다(회수·파괴 없음) · "
+                      "사람이 관문 1회 통과 후 재부트 · ⑤ 생존 확인으로 계속")
         elif code != 0:
             log.step(STEP.BOOT_DEGRADE, code,
                      "비0 이지만 Fatal 역할은 전원 확보 — 경고 강등 후 ④-b·⑤ 계속(B1 정책 열)")
@@ -2938,6 +3037,48 @@ def cmd_self_test():
             "exit 75(busy)가 보수 폴백에서 Fatal 로 접힘(중첩 부트 위경보)"
         assert _boot_fatal_verdict(2, "파싱 불가 산문") is not None, \
             "busy 예외가 다른 비0 까지 열어줌(fail-open)"
+        # ★(M3-짝 2026-08-24) 관문 보류(gate_pending · exit 78) = **제3 상태**.
+        #   성공도 실패(Fatal)도 busy 도 아니다 — 종전엔 어디에도 안 걸려 Degrade 로 흘렀고,
+        #   그 가지의 문안이 "Fatal 역할은 전원 확보"(거짓)였다.
+        assert CYS_BOOT_EXIT_GATE_PENDING == 78, \
+            "관문 보류 exit 상수 이탈(Rust boot_exit_code 78 과 파리티 깨짐)"
+        assert CYS_BOOT_EXIT_GATE_PENDING == CYS_LAUNCH_EXIT_GATE_PENDING, \
+            "같은 사실(관문 보류)에 값이 둘 — boot/launch-agent 파리티 붕괴"
+        assert "gate_pending" not in BOOT_FATAL_OUTCOMES, \
+            "gate_pending 이 Fatal 집합에 들어갔다 — 살아 있는 좌석에 회수·파괴 처방(U-11 치명위험 ④)"
+        _gp = json.dumps({"roles": [
+            {"role": "cso", "agent": "claude", "outcome": "gate_pending", "mandatory": True,
+             "reason": "면책 창 상주"}],
+            "summary": {"gate_pending": 1}})
+        # ⓐ Fatal 도 busy 도 아니다(U-11 계약 · 검체 H-EXIT-11 ⑥ 과 같은 축).
+        assert _boot_fatal_verdict(1, _gp) is None, "관문 보류가 Fatal 로 오분류(좌석 회수 처방)"
+        assert _boot_was_busy(1, _gp) is False, "관문 보류가 busy 로 오분류(티켓 회계 오염)"
+        # ⓑ 그러나 **반드시 잡힌다** — 이것이 M3-짝 의 수리 지점이다.
+        _gp_why = _boot_gate_pending_verdict(1, _gp)
+        assert _gp_why is not None, "관문 보류가 어디에도 걸리지 않는다(Degrade 로 흘러 거짓 문장)"
+        assert "관문" in _gp_why and "No, exit" in _gp_why and "회수" in _gp_why, \
+            "보류 사유에 관문 통과 처방·면책 창 경고·비파괴 지시가 없다"
+        assert "면책 창 상주" in _gp_why, "생산자 reason 이 소비부에서 버려진다(처방 소실)"
+        # ⓒ 두 축 OR — exit 만 있어도(JSON 파싱 불가) 놓치지 않는다.
+        assert _boot_gate_pending_verdict(CYS_BOOT_EXIT_GATE_PENDING, "파싱 불가 산문") is not None, \
+            "exit 78 단독(파싱 불가)에서 보류를 놓친다"
+        assert _boot_fatal_verdict(CYS_BOOT_EXIT_GATE_PENDING, "파싱 불가 산문") is None, \
+            "exit 78 이 보수 폴백에서 Fatal 로 접힌다 — 살아 있는 좌석 회수 처방(U-11 위반)"
+        assert _boot_was_busy(CYS_BOOT_EXIT_GATE_PENDING, "파싱 불가 산문") is False, \
+            "exit 78 을 busy(무스폰)로 오판 — 티켓이 무스폰 소각되거나 보류가 은닉된다"
+        # ⓓ 과잉 발화 금지 — 선택 역할 보류·정상 성공·진짜 실패는 이 분기가 아니다.
+        _gp_opt = json.dumps({"roles": [
+            {"role": "reviewer-codex", "agent": "codex", "outcome": "gate_pending",
+             "mandatory": False}]})
+        assert _boot_gate_pending_verdict(1, _gp_opt) is None, \
+            "선택 역할 보류까지 제3 상태로 승격(Degrade 가 옳다)"
+        assert _boot_gate_pending_verdict(0, _degraded) is None, "정상 Degrade 를 보류로 오판"
+        assert _boot_gate_pending_verdict(1, _fatal) is None, "진짜 실패를 보류로 오판(실패 은닉)"
+        assert _boot_gate_pending_verdict(CYS_BOOT_EXIT_BUSY, _busy) is None, \
+            "busy 를 보류로 오판(무스폰 회계 오염)"
+        # ⓔ 선언 순서 = 실행 순서: 보류 단계는 busy 뒤·Degrade 앞이다.
+        assert (STEP_INDEX[STEP.BOOT_BUSY] < STEP_INDEX[STEP.BOOT_GATE_PENDING]
+                < STEP_INDEX[STEP.BOOT_DEGRADE]), "④ 보류 단계 선언 순서 이탈"
         # ★결손 판정 ↔ check verdict 공유(H-PRED-1): 같은 status fixture 에서 판정이 갈리지 않는다.
         _healthy = {"surfaces": [
             {"role": "cso", "exited": False, "awakened_at": 1.0},

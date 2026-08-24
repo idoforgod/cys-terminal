@@ -613,6 +613,28 @@ pub fn gate_pending_from_wire_with(enabled: bool, v: &Value) -> bool {
 /// (`BUDGET_*` · `javis_budget.LEAF_FLOORS`)는 어느 것도 건드리지 않는다.
 pub const GATE_PENDING_TTL_SECS: f64 = 1800.0;
 
+/// ★★M2 수리(2026-08-24 자기성찰 3회전) — TTL 만료 좌석의 **`gate` 라벨 정본**.
+///
+/// ## 무엇이 틀렸었는가 — 만료가 '침묵 복귀' 였다
+///
+/// 위 doc 이 만료를 정당화한 근거는 "보류 좌석은 `run_boot` 이 관측만 하고 건너뛰므로 재확정
+/// 기회가 오지 않는다 → 무기한 보류는 부트 라이브락" 이었다. 그 전제는 참이었지만, 만료의 귀결
+/// ("축이 없던 것처럼 = 정확히 오늘의 동작")이 **안전하지 않다**는 것이 실측으로 드러났다:
+/// 표식이 null 로 접히면 그 좌석은 `alive_presumed` 로 떨어지고 `javis_orchestra.py check` 가
+/// 그것을 **충족으로 세어 exit 0 = READY** 를 낸다. 즉 **절대지침이 한 번도 주입되지 않은
+/// 좌석이 30분 뒤 초록으로 집계된다** — 근본원인 R1 이 타이머로 재발한다.
+///
+/// ## 무엇을 하는가
+///
+/// 만료는 표식을 지우지 않고 **사유를 바꾼다**. wire 술어(`gate_pending_from_wire` = "object 인가")
+/// 는 그대로 참이므로 소비부는 계속 **미충족**으로 읽고, `gate` 라벨이 `gate_pending_stale` 로
+/// 바뀌어 "오래된 보류다(사람 조치가 30분 넘게 없었다)" 를 진단이 구별할 수 있다.
+///
+/// 라이브락 우려는 M2 의 **재관측 경로**(`cys.rs::gate_pending_reobserve`)가 받는다 —
+/// `cys boot` 이 스폰 0 으로 관문 통과를 확인하면 `clear_gate_pending` 이 표식을 지운다.
+/// 즉 해소의 능동 경로가 실재하므로, 만료가 침묵으로 풀어 줄 이유가 사라졌다.
+pub const GATE_PENDING_STALE_GATE: &str = "gate_pending_stale";
+
 /// 표식이 아직 유효한가 — **순수 코어**(시계·env 비의존, 진리표 테스트 대상).
 ///
 /// 계약: `since` 가 미래거나(시계 되돌림·스큐) NaN 이면 **유효**로 본다. 판정불가를 만료로

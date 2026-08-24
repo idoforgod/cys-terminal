@@ -589,3 +589,104 @@ jobs:
           touch "src-tauri/binaries/cys-$triple" "src-tauri/binaries/cysd-$triple" \
                 src-tauri/resources/pack.tar.gz src-tauri/resources/pack-manifest.json
           CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app --bins -- --test-threads=1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡2 — 부트스트랩 건강성 러너 **전량**(macos-latest · 2026-08-24 M4)
+  #
+  # ★무엇이 결함이었나(이 잡이 메우는 구멍): 러너에는 검체가 140종 등재돼 있는데 **CI 에서
+  #   도는 것은 19종뿐**이었다(`grep -rn run_bootstrap_health .github/` 히트는 windows-health.yml
+  #   하나이고 그 잡은 `--only "$WIN_SPECIMENS"` = 19종). 즉 121종이 **어느 레인에서도 돌지
+  #   않았다** — H-META-READ·H-META-PIN·H-EVID-1·H-FAKE-1/2/3·H-BOOT-SUP-1/2·H-CI-TAG-1·
+  #   H-SECRET-1 전부 포함이다.
+  #   ★자기모순의 정점: H-CI-TAG-1 은 "windows-health 트리거가 태그에서 도는가" 를 판정하는
+  #     검체인데 **그 검체 자신이 CI 에서 안 돌았다.**
+  #   이 저장소의 교리가 "안 도는 검체는 게이트가 아니다" 인데(windows-health.yml 머리말·
+  #   `if:` 금지 주석) 캠페인이 그 병을 자기 산출물에서 재생산한 것이다. 배선 없이 태그하면
+  #   이번에 고친 것들이 다음 커밋에 조용히 되돌아가도 아무도 모른다.
+  #
+  # ★왜 별도 잡인가(잡1 의 마지막 스텝이 아니라):
+  #   ⓐ 잡1 의 앞 스텝이 하나라도 죽으면(`set -euo pipefail`) 뒤 스텝은 **실행되지 않는다**.
+  #      건강성 전량이 거기 있으면 "다른 게 빨간 날에는 건강성을 아예 재지 않는" 레인이 된다
+  #      — 정확히 이 잡이 없애려는 형태다. 별도 잡은 잡1 의 성패와 무관하게 돈다.
+  #   ⓑ 러너 exit 를 **잡 판정으로 그대로** 쓸 수 있다(0=GREEN·1=RED·2=UNMEASURED).
+  #   ⓒ 잡1 의 checkout 깊이를 건드리지 않는다(아래 fetch-depth 0 은 이 잡만의 요구다).
+  #
+  # ★fetch-depth: 0 이 **필수**인 이유: 다수 검체가 계측기 자기검증으로 `git show <기준커밋>:<파일>`
+  #   을 돌려 "구 코드에서 탐지기가 FIRE 하는가" 를 확인한다(CALIBRATION_REF·PRE_W0_REF·
+  #   D4A_REF·PRE_WA3_REF·PRE_U24_REF). 기본 shallow checkout 은 그 ref 를 해소하지 못해
+  #   계측 대조가 `skip(no-git)` 로 **조용히 강등**된다 — 검체는 그대로 PASS 라 아무도 모른다.
+  #   windows-health.yml 이 같은 이유로 이미 fetch-depth: 0 을 쓴다.
+  #
+  # ★예산(정직한 수치): 러너는 stdlib 전용·네트워크 0 이고 cargo·bun·node 를 부르지 않는다
+  #   (실측: 러너 소스에 cargo 호출 0건 — 주석 언급뿐). **로컬 실측 381.6s**(macOS · 139 PASS /
+  #   0 FAIL / 1 SKIP). 러너 하나만 도는 잡이라 툴체인 설치가 없고, 잡1 과 **병렬**로 돌아
+  #   레인 전체 wall-clock 을 늘리지 않는다.
+  # ⚠비용 경계 — 이 잡은 macos-latest 1대·6~8분이다. 여기에 Windows 러너(138MB 빌드)를
+  #   덧붙이지 마라. 태그 레인의 Windows 실기는 windows-health.yml 소관이고, 그 트리거를
+  #   넓히는 것은 H-CI-TAG-1 이 명시적으로 금지한다.
+  boot-health-full:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # ★계측기 자기검증(git show 기준커밋)의 전제 — 위 머리말 참조
+
+      # 러너는 stdlib 전용이라 의존성 설치가 없다. 3.12 = windows-health 잡과 같은 마이너.
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ★러너 exit 를 잡 판정으로 **그대로** 쓴다. 코드 3값의 의미가 서로 다르므로 문안도 가른다:
+      #   0=GREEN(다 재고 다 통과) · 1=RED(재서 틀렸다) · 2=UNMEASURED(재지 않았다).
+      #   ★2 도 실패다 — '측정하지 않았다' 를 통과로 접는 것이 이 저장소가 반복해 낸 사고의 형태다.
+      # ★1회만 돌린다(`--json` → 렌더). windows-health 처럼 두 번 돌리면 예산이 두 배가 되는데,
+      #   `--json` 산출물에 검체별 status·reason 이 전부 들어 있어 사람 읽을 표를 여기서 만들 수 있다.
+      - name: 부트스트랩 건강성 — 전 검체 (macos-latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "::error::건강성 러너 누락: $R (git add 누락 의심)"; exit 1; }
+          echo "== 전 검체 실행(--only 없음 = 등재 전량) =="
+          rc=0
+          python3 "$R" --json > health-full.json || rc=$?
+          python3 - "$rc" <<'PY'
+          import json, sys
+          rc = int(sys.argv[1])
+          try:
+              d = json.load(open("health-full.json", encoding="utf-8"))
+          except Exception as e:                      # noqa: BLE001 — 파싱 실패도 관측 실패다
+              print("::error::건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. "
+                    "이 상태의 '문제 없음' 은 근거가 아니다(fail-closed)." % e, file=sys.stderr)
+              sys.exit(1)
+          s = d["summary"]
+          for r in d["specimens"]:
+              print("  %-5s %-14s %-4s %s" % (r["status"].upper(), r["id"], r["wave"],
+                                              (r.get("detail") or r.get("reason") or "")[:150]))
+          print("[boot-health] verdict=%s pass=%s fail=%s skip=%s disabled=%s pending=%s total=%s %.1fs"
+                % (s["verdict"], s["pass"], s["fail"], s["skip"], s["disabled"],
+                   s["pending"], s["total"], s["elapsed_secs"]))
+          if s["fail"]:
+              for r in d["specimens"]:
+                  if r["status"] == "fail":
+                      print("::error title=%s::%s" % (r["id"], (r.get("reason") or "")[:600]))
+          if s["off_switches_engaged"]:
+              for e in s["off_switches_engaged"]:
+                  print("::error::측정 축이 꺼져 있다 — [%s] %s=%s → %s"
+                        % (e["kind"], e["env"], e["value"], e["scope"]))
+          if rc == 0 and s["verdict"] == "GREEN":
+              sys.exit(0)
+          if rc == 1:
+              print("::error::건강성 RED — 발효 검체 %d건 실패. **검체를 고쳐 초록으로 만들지 마라** "
+                    "(러너 헤더 핀 이사 계약 ④: 첫 행동은 원인 규명이다)." % s["fail"], file=sys.stderr)
+              sys.exit(1)
+          if rc == 2:
+              print("::error::건강성 UNMEASURED — 재지 않은 축이 있다. 이것은 통과가 아니다.",
+                    file=sys.stderr)
+              sys.exit(1)
+          print("::error::러너 종료코드 %s 는 계약(0/1/2) 밖이다 — 판정 불가로 중단(fail-closed)." % rc,
+                file=sys.stderr)
+          sys.exit(1)
+          PY

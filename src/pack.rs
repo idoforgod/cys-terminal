@@ -852,6 +852,67 @@ pub fn config_dir_for(
     )
 }
 
+/// ★★M5(2026-08-24 자기성찰 3회전) — **설치 표적 ≠ 실소비 SOT** 진단(순수).
+///
+/// ## 무엇이 어긋나는가
+///
+/// base 레인의 설치 표적은 [`config_dir_for`] ③ = `pack.parent()/claude` 로 **팩 위치에서
+/// 파생**된다. 그런데 에이전트가 실제로 읽는 값은 `agents.json` 의
+/// `${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}` = [`crate::resolve_claude_config_dir`] 이고, 그쪽은
+/// **팩 위치를 보지 않는다**. 두 값은 팩이 `~/.cys/pack` 일 때만 **우연히** 일치한다.
+///
+/// 그래서 팩이 다른 곳에 있으면(개발 트리 · 임시 팩 · 이주 중 · `CYS_PACK_DIR` 지정) 각성 훅은
+/// 아무도 읽지 않는 폴더에 설치되고, 노드는 정상 기동하지만 `/clear` 후 지침 재주입(SessionStart)
+/// 과 마스터 선언 부트 발화(UserPromptSubmit)가 **영구히 발동하지 않는다**(팀 미기동).
+/// 회전2 격리 주행에서 "각성 훅 미등록" 경고가 났고, 처방된 `cys init-pack` 과
+/// `javis_preflight.py --fix` 를 **완주시켰는데도 같은 경고가 재현**됐다 — 둘 다 어긋난 표적에
+/// 쓰기 때문이다(BLOCK-2 와 같은 부류: "사고 순간에 사람이 읽는 유일한 문서가 듣지 않는 손잡이를
+/// 안내한다").
+///
+/// ## 왜 여기서는 **진단만** 하는가
+///
+/// 표적 통일(설치처를 실소비 SOT 로 옮기는 것)은 부서 레인·마이그레이션·기존 설치본의 훅
+/// 잔존까지 건드리는 부작용 반경이 크다. 태그 전에는 **어긋남을 보이게** 만들고(기동 시 loud
+/// WARN + `cys doctor` 항목), 어긋난 상태에서 안내되는 명령이 듣지 않는다는 사실을 문안에
+/// 정직하게 적는다.
+///
+/// ## 왜 검체가 스스로는 절대 못 잡는가
+///
+/// **기본 경로에서는 두 값이 우연히 일치하므로 검체가 영원히 초록**이다. 그래서 이 함수의
+/// 진리표는 경로를 **주입**받아 어긋난 조합을 직접 만든다(실기 의존 0).
+///
+/// 반환: `None` = 일치(또는 판정 대상 아님) · `Some((설치표적, 실소비))` = 어긋남.
+pub fn config_target_mismatch(
+    install_target: Option<&Path>,
+    consumed: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let target = install_target?;
+    // 경로 비교는 **정규화 후**에 한다 — `~/.cys/pack/../claude` 와 `~/.cys/claude` 가 다른
+    // 문자열이라는 이유로 거짓 경보를 내면, 진짜 어긋남이 소음에 묻힌다.
+    let norm = |p: &Path| -> PathBuf {
+        p.canonicalize().unwrap_or_else(|_| lexical_normalize(p))
+    };
+    let (a, b) = (norm(target), norm(consumed));
+    (a != b).then(|| (target.to_path_buf(), consumed.to_path_buf()))
+}
+
+/// `canonicalize` 가 실패할 때(아직 만들어지지 않은 dir — 정확히 이 결함의 상태다)의 폴백:
+/// `.`/`..` 만 어휘적으로 접는다. 심볼릭 링크는 풀지 않는다(그건 canonicalize 의 몫이고,
+/// 없는 경로에는 애초에 링크가 없다).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// 격리 config dir 셋업: cys 라우터(CLAUDE.md)와 SessionStart hook(settings.json)을 설치한다.
 /// ★보존 모드 — 기존 파일은 덮지 않는다(사용자 커스터마이즈 불가침). best-effort(실패해도
 /// pack 설치 자체는 유효). 사용자 ~/.claude 는 절대 건드리지 않는다(격리의 핵심).
@@ -4688,6 +4749,77 @@ mod tests {
             None,
             "부서+무acct = 시드 생략(공용 claude 폴백 금지 — 결함2 재발 방지)"
         );
+    }
+
+    /// ★★M5 검체(2026-08-24 자기성찰 3회전) — **설치 표적 ≠ 실소비 SOT** 를 잡는다.
+    ///
+    /// 【고치는 결함】 base 레인 설치 표적은 `pack.parent()/claude`(팩 위치 파생)이고 에이전트의
+    /// 실소비는 `${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}`(팩 위치 무관)다. 두 값은 팩이
+    /// `~/.cys/pack` 일 때만 **우연히** 일치한다. 어긋나면 각성 훅이 아무도 읽지 않는 폴더에
+    /// 설치되고, 노드는 떠도 `/clear` 후 지침 재주입·마스터 선언 부트 발화가 영구히 죽는다.
+    /// 회전2 격리 주행에서 처방된 `cys init-pack`·`javis_preflight.py --fix` 를 **완주시켰는데도
+    /// 같은 경고가 재현**된 원인이 이것이다(BLOCK-2 와 같은 부류의 재발).
+    ///
+    /// 【왜 이 검체가 필요한가 — 스스로는 절대 발견되지 않는다】 **기본 경로에서는 두 값이
+    /// 우연히 일치하므로 어떤 통합 검체도 영원히 초록**이다. 그래서 여기서는 경로를 주입해
+    /// 어긋난 조합을 **직접 만든다**(실기·env 의존 0).
+    #[test]
+    fn config_target_mismatch_detects_the_accidentally_aligned_default() {
+        let home = Path::new("/h");
+        let consumed = home.join(".cys").join("claude"); // ${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}
+
+        // ⓐ ★기본 경로 — 팩이 `~/.cys/pack` 이라 **우연히** 일치한다(그래서 검체가 안 잡힌다).
+        let default_pack = home.join(".cys").join("pack");
+        let target = config_dir_for(None, dept_scope_of(&default_pack).as_deref(), None, &default_pack);
+        assert_eq!(target.as_deref(), Some(consumed.as_path()), "드릴 전제: 기본은 일치한다");
+        assert_eq!(
+            config_target_mismatch(target.as_deref(), &consumed),
+            None,
+            "정상 기계에서 거짓 경보 — 소음이 진짜 신호를 묻는다"
+        );
+
+        // ⓑ ★핵심 — 팩이 다른 곳에 있으면(개발 트리·임시 팩·CYS_PACK_DIR 지정·이주 중)
+        //    설치 표적만 따라 움직이고 실소비는 그대로다. 이때 훅은 아무도 안 읽는 곳에 앉는다.
+        for pack in [
+            Path::new("/h/dev/cys-terminal-rel/pack"),
+            Path::new("/tmp/cys-pack-XXXX/pack"),
+            Path::new("/h/.cys-alt/pack"),
+        ] {
+            let t = config_dir_for(None, dept_scope_of(pack).as_deref(), None, pack);
+            let hit = config_target_mismatch(t.as_deref(), &consumed);
+            assert!(
+                hit.is_some(),
+                "어긋난 팩({})에서 표적 불일치를 놓쳤다 — 각성 훅이 침묵으로 죽는다",
+                pack.display()
+            );
+            let (install, consume) = hit.unwrap();
+            assert_ne!(install, consume, "불일치 보고가 같은 경로를 낸다");
+        }
+
+        // ⓒ `.`/`..` 만 다른 같은 경로는 **거짓 경보가 아니다**(정규화 후 비교).
+        assert_eq!(
+            config_target_mismatch(Some(Path::new("/h/.cys/pack/../claude")), &consumed),
+            None,
+            "어휘적 차이 하나로 거짓 경보 — 소음"
+        );
+        assert_eq!(
+            config_target_mismatch(Some(Path::new("/h/./.cys/claude")), &consumed),
+            None
+        );
+
+        // ⓓ 설치 표적 자체가 없으면(부서 스코프 + CYS_ACCOUNT_DIR 부재) **대조 불가**다 —
+        //    없는 것을 불일치로 보고하면 그 좌석의 진짜 진단(dept-awakening-seed)이 묻힌다.
+        let dept = Path::new("/h/.cys/pack-dept-sales");
+        let t = config_dir_for(None, dept_scope_of(dept).as_deref(), None, dept);
+        assert_eq!(t, None, "드릴 전제: 부서+무acct 는 시드 표적이 없다");
+        assert_eq!(config_target_mismatch(t.as_deref(), &consumed), None);
+
+        // ⓔ 부서 레인에서 CYS_ACCOUNT_DIR 이 주입되면 표적 = 실소비 = 그 dir 다(일치).
+        let acct = Path::new("/h/.cys/claude-sales");
+        let t = config_dir_for(None, dept_scope_of(dept).as_deref(), acct.to_str(), dept);
+        assert_eq!(config_target_mismatch(t.as_deref(), acct), None);
+        // 그런데 실소비가 그 값을 **안 물려받으면**(부서 부트 밖 기동) 다시 어긋난다.
+        assert!(config_target_mismatch(t.as_deref(), &consumed).is_some());
     }
 
     /// [무변조 계약 핀·G3 축1] 부서 팩 설치는 ①공용 <base>/claude 를 **byte-identical** 로 두고

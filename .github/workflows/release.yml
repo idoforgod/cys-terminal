@@ -23,6 +23,80 @@ env:
   SRC_REPO: idoforgod/cys-terminal              # 공개 소스 repo = 공개 배포 원본 (updater 대상)
 
 jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡0 — windows-health 결박(설계 D-6 "릴리스 게이트 결박" · 2026-08-24 M4-3)
+  #
+  # ★무엇이 결함이었나: windows-health.yml 은 U-26 ① 로 태그(`v*`)에서 **돌게** 됐지만,
+  #   그 파일 머리말이 스스로 적어 놓았듯 "이 잡은 release.yml 을 막지 않는다". GitHub Actions
+  #   에는 워크플로 간 `needs` 가 없어서, 같은 태그 SHA 의 체크가 **나란히 빨갛게 뜰 뿐**
+  #   릴리스 자산 생산은 그대로 진행됐다. 즉 Windows 부트스트랩 계약이 깨진 채로도 배포 자산이
+  #   완성됐고, 발행을 막는 것은 오직 "사람이 적색을 봤기를 바라는 것" 뿐이었다.
+  #
+  # ★어떻게 막는가(차단이 실재하는 경로): 이 잡이 실패하면 `pack-artifacts` 가 돌지 않는다
+  #   → 드래프트 릴리스에 `pack.tar.gz` · `pack-manifest.json` · `pack-manifest.json.minisig`
+  #   **3종이 올라가지 않는다** → 공개 발행 레인(release-publish.yml)이 부르는
+  #   `scripts/release-verify.py` 의 `REQUIRED_ASSETS` 에 그 셋이 등재돼 있어 검증이 실패한다
+  #   (`release-verify.py:99-107`). 발행은 그 레인 하나뿐이므로 **공개 발행이 실제로 차단된다.**
+  #   ⚠`build` 잡에는 걸지 않는다 — 걸면 20분짜리 빌드가 windows-health 완주 뒤로 직렬화된다.
+  #     이 잡은 build 와 **병렬**로 폴링하므로 정상 경로의 추가 지연이 사실상 0 이다.
+  #
+  # ★fail-closed: 런이 없거나·미완주거나·성공이 아니면 전부 실패다. "재지 않았다" 를 통과로
+  #   접는 것이 이 저장소가 반복해 낸 사고의 형태다(러너 '미측정 축 계약'과 같은 교리).
+  #   수동 실행(workflow_dispatch)은 태그 push 가 아니라 windows-health 런이 자동 생성되지
+  #   않는다 — 그 경우 **그 커밋으로 windows-health 를 먼저 돌리라고 지목하고 죽는다**
+  #   (자동 dispatch 를 하지 않는 이유: `actions: write` 권한 확대는 별도 승인 사안이다).
+  #
+  # ★예산: ubuntu-latest 1대에서 API 폴링만 한다(빌드 0·체크아웃 0). 태그당 1회.
+  windows-health-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read           # ★워크플로 런 조회에 필요(워크플로 기본 permissions 는 contents 뿐)
+    steps:
+      - name: windows-health 결과 결박 (같은 커밋 SHA · fail-closed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WF="windows-health.yml"
+          DEADLINE=$(( $(date +%s) + 2700 ))      # 45분 — Windows 콜드 cargo 빌드를 덮는 상한
+          echo "대상: $GITHUB_REPOSITORY · workflow=$WF · head_sha=$SHA · event=$EVENT"
+          while :; do
+            RUNS="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/runs?head_sha=$SHA&per_page=30" \
+                      --jq '[.workflow_runs[] | {id, status, conclusion, url: .html_url}]')"
+            N="$(jq 'length' <<<"$RUNS")"
+            DONE="$(jq '[.[] | select(.status == "completed")]' <<<"$RUNS")"
+            NDONE="$(jq 'length' <<<"$DONE")"
+            if [ "$NDONE" -gt 0 ]; then
+              BAD="$(jq '[.[] | select(.conclusion != "success")]' <<<"$DONE")"
+              if [ "$(jq 'length' <<<"$BAD")" -gt 0 ]; then
+                echo "::error::windows-health 가 이 커밋에서 성공하지 않았다 — 릴리스 자산 생산을 중단한다."
+                jq -r '.[] | "  - conclusion=\(.conclusion) \(.url)"' <<<"$BAD"
+                exit 1
+              fi
+              echo "✅ windows-health 성공 확인($NDONE 런) — pack-artifacts 진행 허용"
+              jq -r '.[] | "  - \(.url)"' <<<"$DONE"
+              exit 0
+            fi
+            if [ "$N" -eq 0 ] && [ "$EVENT" != "push" ]; then
+              echo "::error::이 커밋($SHA)에 windows-health 런이 없다. 수동 릴리스 경로에서는 자동 생성되지"
+              echo "::error::않는다 — 먼저 'gh workflow run windows-health.yml --ref <이 커밋의 ref>' 로 돌려라."
+              echo "::error::(측정하지 않은 것을 통과로 접지 않는다 — fail-closed.)"
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::windows-health 결과를 45분 안에 얻지 못했다(발견 런 $N · 완주 0)."
+              echo "::error::측정 불능은 통과가 아니다 — 릴리스 자산 생산을 중단한다(fail-closed)."
+              exit 1
+            fi
+            echo "  … 대기(발견 $N · 완주 $NDONE) — 30s 후 재조회"
+            sleep 30
+          done
+
   build:
     strategy:
       fail-fast: false     # 한 타깃이 실패해도 나머지는 계속
@@ -569,7 +643,10 @@ jobs:
   # → pack-manifest.json을 minisign 서명(서명 대상=manifest, tar 아님) → 비공개 릴리스에 업로드.
   # relocate가 이 자산까지 공개 repo로 옮긴다(dist/* 일괄).
   pack-artifacts:
-    needs: build
+    # ★windows-health 결박(M4-3): 게이트가 빨가면 이 잡이 돌지 않아 팩 3종 자산이
+    #   드래프트에 오르지 않고, release-publish 의 release-verify.py REQUIRED_ASSETS
+    #   검증이 실패한다 = 공개 발행 차단. 위 windows-health-gate 잡 머리말 참조.
+    needs: [build, windows-health-gate]
     runs-on: ubuntu-latest
     env:
       KEY_ID: '39E60A702949D6C3'    # 임베드 키링(cysjavis-pack/trusted-keys.json) key_id — manifest.key_id

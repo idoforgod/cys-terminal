@@ -1620,7 +1620,7 @@ def h_exit_2():
     busy_arm = src[i:i + 2000]
     need('"outcome": "busy"' in busy_arm,
          "Busy 분기가 --json 에 outcome:busy 를 내지 않는다(성공과 구분 불가 — G11 재발)")
-    need("boot_exit_code(0, true)" in busy_arm,
+    need("boot_exit_code(0, 0, true)" in busy_arm,
          "Busy 의 bare exit 가 단일 판정 함수를 통과하지 않는다(의미가 코드 두 곳으로 흩어짐)")
     need("return 0;" not in busy_arm,
          "Busy 가 여전히 exit 0(성공)을 낸다 — 무스폰을 성공으로 보고(G11 재발)")
@@ -1844,8 +1844,14 @@ def h_exit_4():
     # ★의무 CLI 미설치 ≠ exit 0 성공: missing + mandatory 는 fatal_failed 로 계상된다.
     mi = src.find("outcome\": \"missing\"")
     need(mi > 0, "missing outcome 생성 지점을 못 찾았다")
-    window = src[max(0, mi - 800):mi]
-    need("fatal_failed += 1" in window,
+    # ★핀 이사(M3 · 2026-08-24) — 손 계상이 **파생**으로 옮겼다. 종전 핀은 missing 생성 지점
+    #   앞 800자 창에서 `fatal_failed += 1` 을 찾았고, 그 손 계상은 이제 존재하지 않는다
+    #   (분기마다 세던 것을 `boot_summary_buckets` 가 typed outcome 에서 파생한다).
+    #   축은 한 톨도 안 바뀐다 — "의무 역할의 missing 이 fatal 로 계상되는가". 다만 창(window)
+    #   위치가 아니라 **술어 그 자체**를 박으므로, 분기가 늘어도 빠뜨릴 자리가 없다(강화).
+    bs = _slice_between(src, "fn boot_summary_buckets(",
+                        "\nconst BOOT_SUMMARY_BUCKETS", "H-EXIT-4 버킷 파생")
+    need('"failed" | "missing" => fatal_failed += 1,' in bs,
          "의무 역할 미설치가 fatal 로 계상되지 않는다(exit 0 성공으로 위장 — G29 재발)")
     # PLAN 정책 열 ↔ python 정본 파리티(H-PRED-7 과 짝).
     sys.path.insert(0, BIN_DIR)
@@ -2799,16 +2805,25 @@ def h_safe_2():
     # ② bare exit 구계약
     ri = src.find("fn run_boot(")
     rbody = src[ri:src.find("\n/// 죽음 확정 좌석의 reclaim", ri)]
-    need("boot_exit_code(fatal_failed, false)" in rbody,
+    # ★핀 이사(M3 · 2026-08-24) — 아래 셋은 **완화가 아니라 이사**다. 종전 세 핀은 run_boot 이
+    #   분기마다 `fatal_failed` 를 손으로 세던 시절의 형태(인자 1개 · json 리터럴 필드 · 계상
+    #   지점 개수)를 박고 있었다. 그 손 계상이 곧 W4 의 fail-open 원인이었으므로 M3 이 집계를
+    #   typed outcome 파생(`boot_summary_buckets`)으로 옮겼다 — 이제 '빠뜨릴 자리' 자체가 없다.
+    #   그래서 핀도 **개수에서 술어로** 옮긴다(같은 축 · 더 강함).
+    need("boot_exit_code(fatal_failed as usize, fatal_gate_pending as usize, false)" in rbody,
          "run_boot 종료가 단일 판정 함수를 통과하지 않는다(의미가 흩어져 두 채널이 갈린다)")
     need("if failed > 0" not in rbody,
          "구계약(launch 실패>0)이 잔존한다 — 리뷰어 1종 실패가 팀 실패로 번지는 B1 데드엔드 재발")
-    need('"fatal_failed": fatal_failed' in rbody,
+    need("let summary = boot_summary_buckets(&outcomes);" in rbody
+         and 'json!({"roles": outcomes, "summary": summary})' in rbody,
          "fatal_failed 가 --json 요약에 없다(typed 채널로 전달되지 않음)")
-    # exit 와 --json 이 **같은 사실**을 내는지: Fatal 계상 지점이 mandatory 분기 전건에 있어야 한다.
-    need(rbody.count("fatal_failed += 1;") >= 3,
-         "mandatory 실패 계상 지점이 부족하다(%d) — 어떤 Fatal 경로가 exit 0 으로 접힌다"
-         % rbody.count("fatal_failed += 1;"))
+    need('("fatal_failed", fatal_failed),' in rbody and '("fatal_gate_pending", fatal_gate_pending),' in rbody,
+         "요약 맵이 fatal_failed·fatal_gate_pending 교차 집계를 싣지 않는다(소비부가 두 의미를 못 읽는다)")
+    # exit 와 --json 이 **같은 사실**을 내는지: Fatal 계상이 mandatory 분기 전건에 있어야 한다.
+    # 종전에는 계상 **지점 개수**(>=3)를 셌다 — 파생 이후에는 지점이 하나이므로 그 술어를 직접 박는다.
+    need('"failed" | "missing" => fatal_failed += 1,' in rbody,
+         "Fatal 계상이 사라졌다 — mandatory ∧ outcome ∈ {failed,missing} 술어가 없으면 "
+         "어떤 Fatal 경로가 exit 0 으로 접힌다")
     need("fn boot_exit_code(" in src, "bare exit 판정 순수 함수 부재(테스트 가능성·단일 소유 상실)")
     notes.append("bare exit=신계약(0/1/75 · boot_exit_code 단일 소유)")
     # ③ 팩↔바이너리 스큐 폴백(온보딩 전멸 차단)
@@ -4419,9 +4434,31 @@ def h_seat_4axis():
          "node-recover 보류가 reclaim(kill)보다 뒤다 — 관문에 갇힌 살아있는 에이전트를 죽인다")
     need("outcome\": \"gate_pending" in rbody2,
          "run_boot 이 보류를 typed outcome 으로 내지 않는다(실패로 뭉개짐)")
-    need(rbody2.count("fatal_failed += 1;") >= 3,
-         "Fatal 계상 지점이 줄었다(%d) — 보류 도입이 진짜 실패를 exit 0 으로 접었다"
-         % rbody2.count("fatal_failed += 1;"))
+    # ★핀 이사(M3 · 2026-08-24) — 종전 핀은 **손 계상 지점의 개수**(`count(...) >= 3`)를 셌다.
+    #   그 축이 재던 것은 "어떤 분기가 계상을 빼먹을 수 있다"였고, 그 빼먹음이 실제로 W4 에서
+    #   났다. M3 은 손 계상을 없애고 집계를 typed outcome 에서 **파생**시켜 "버킷 합 = roles
+    #   길이"를 구조적 불변식으로 만들었다. 그래서 개수가 아니라 **술어 그 자체**를 박는다.
+    #   ★계상 술어는 이제 `boot_summary_buckets` 에 있고 그 함수는 rbody2(=run_boot 본문)
+    #     **밖**이다 — 제안된 rbody2 핀은 앵커 부재로 조용히 죽는다. 그래서 파생부를 따로 자른다.
+    #   축은 넷으로 **늘었다**: ⓐ run_boot 이 파생을 통과하는가 ⓑ Fatal 술어가 살아있는가
+    #   ⓒ 관문 보류가 Fatal 과 **분리** 계상되는가 ⓓ exit 우선순위에서 Fatal 이 보류를 이기는가.
+    need("let summary = boot_summary_buckets(&outcomes);" in rbody2
+         and "boot_exit_code(fatal_failed as usize, fatal_gate_pending as usize, false)" in rbody2,
+         "run_boot 의 집계·종료가 typed outcome 파생을 통과하지 않는다 — 손 계상이 되살아나면 "
+         "보류 도입이 진짜 실패를 exit 0 으로 접는다")
+    bs2 = _slice_between(src, "fn boot_summary_buckets(",
+                         "\nconst BOOT_SUMMARY_BUCKETS", "H-SEAT-4AXIS 버킷 파생")
+    need('"failed" | "missing" => fatal_failed += 1,' in bs2,
+         "Fatal 계상이 사라졌다 — 보류 도입이 진짜 실패를 exit 0 으로 접었다")
+    need('"gate_pending" => fatal_gate_pending += 1,' in bs2,
+         "관문 보류가 Fatal 과 분리 계상되지 않는다")
+    ec = _slice_between(src, "fn boot_exit_code(", "\n\n", "H-SEAT-4AXIS exit 우선순위")
+    need("fatal_gate_pending > 0" in ec and "cys::EXIT_GATE_PENDING" in ec,
+         "의무 관문 보류 전용 78 이 없다")
+    # ★부재를 통과로 접지 않는다: `find` 는 -1 을 돌려주므로 순서 비교 전에 **둘 다 실재**를 먼저 잰다.
+    need("fatal_failed > 0" in ec, "exit 판정에 Fatal 분기가 없다(보류만 남으면 실패가 78 로 위장된다)")
+    need(ec.find("fatal_failed > 0") < ec.find("fatal_gate_pending > 0"),
+         "Fatal 이 보류에 가려진다")
     # ⑥ restore in-seat: **fresh 폴백 금지**(좌석 증식·관문 재진입 루프 차단).
     si2 = src.find("fn run_restore(")
     sbody2 = src[si2:src.find("\n/// T2-7", si2)]
@@ -10782,6 +10819,391 @@ def h_fake_3():
     need("bypass-return" in caught["return-accepts"],
          "'Return 은 안전하다' 변조를 `bypass-return` 이 잡지 못했다")
     return "변조 4종 전건 적발 · " + " · ".join("%s→%s" % (k, ",".join(v)) for k, v in caught.items())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# U-28 · 배선 결박 (M4 · M7 · M3-짝) — 2026-08-24
+#
+# ★이 절이 메우는 구멍은 앞 절들과 **층위가 다르다**. U-26 까지가 "검체를 제대로 만들었는가"
+#   였다면 여기는 **"그 검체가 실제로 도는가"** 다. 자기성찰 3회전이 확인한 사실:
+#   러너에 140종이 등재돼 있는데 CI 에서 도는 것은 19종뿐이었고, 그 121종에는
+#   H-META-READ·H-META-PIN·H-EVID-1·H-FAKE-1/2/3·H-BOOT-SUP-1/2·H-SECRET-1 이 전부 들어 있었다.
+#   ★자기모순의 정점 — H-CI-TAG-1 은 "windows-health 가 태그에서 도는가" 를 판정하는 검체인데
+#     **그 검체 자신이 어느 CI 레인에서도 돌지 않았다.** 이 저장소의 교리("안 도는 검체는
+#     게이트가 아니다")를 캠페인이 자기 산출물에서 재생산한 것이다.
+#   배선 없이 태그하면 이번에 고친 것들이 다음 커밋에 조용히 되돌아가도 아무도 모른다.
+# ═══════════════════════════════════════════════════════════════════════════
+_U28_WF_DIR = os.path.join(REPO_DIR, ".github", "workflows")
+_RUNNER_BASENAME = "run_bootstrap_health.py"
+_U28_VAR_ASSIGN = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"\s*$')
+
+
+def _u28_workflow_texts():
+    """`.github/workflows/*.yml` 전량 → {파일명: 텍스트}."""
+    if not os.path.isdir(_U28_WF_DIR):
+        raise Skip("레포 체크아웃이 아니다(배포 팩) — CI 배선 검체 적용 불가")
+    out = {}
+    for f in sorted(os.listdir(_U28_WF_DIR)):
+        if f.endswith((".yml", ".yaml")):
+            out[f] = _read(os.path.join(_U28_WF_DIR, f))
+    need(out, "워크플로 파일을 0건 읽었다 — 추출기 파손(측정 불능은 통과가 아니다)")
+    return out
+
+
+def _u28_runner_lanes(files):
+    """{워크플로명: 텍스트} → 러너 호출 레인 목록 `[(파일, kind, ids)]`.
+
+    kind: `full`(--only·--wave 없음 = 등재 전량) · `only`(명시 목록) · `wave`(웨이브 태그).
+    ★셸 변수를 **해소**한다 — 실측 형태가 `R="…run_bootstrap_health.py"` + `python "$R" --only
+      "$WIN_SPECIMENS"` 라서, 변수를 안 푸는 파서는 windows-health 레인을 통째로 못 본다.
+    ★해소 불가한 `--only` 인자는 **적색**이다(빈 집합으로 접지 않는다). 못 읽은 것을 '커버리지
+      0' 으로 접으면 차집합이 커져 오히려 요란해질 것 같지만, 반대 방향의 사고도 대칭으로
+      가능하다(변수명이 바뀌었는데 조용히 넘어가는 것). 측정 불능은 판정하지 않는다.
+    """
+    lanes = []
+    for fname in sorted(files):
+        text = files[fname]
+        varmap = {}
+        for line in text.splitlines():
+            m = _U28_VAR_ASSIGN.match(line)
+            if m:
+                varmap[m.group(1)] = m.group(2)
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("#") or not re.search(r"\bpython3?\b", s):
+                continue
+            hit = _RUNNER_BASENAME in s
+            if not hit:
+                for v in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", s):
+                    if _RUNNER_BASENAME in varmap.get(v, ""):
+                        hit = True
+                        break
+            if not hit or "--list" in s:      # `--list` 는 대장 출력이지 실행이 아니다
+                continue
+
+            def _arg(flag):
+                m = re.search(r"%s\s+(\S+)" % re.escape(flag), s)
+                if not m:
+                    return None
+                tok = m.group(1).strip("\"'")
+                if tok.startswith("$"):
+                    name = tok[1:].strip("{}").strip("\"'")
+                    need(name in varmap,
+                         "%s: `%s` 인자 변수 $%s 를 해소하지 못했다 — 커버리지를 측정할 수 없다"
+                         % (fname, flag, name))
+                    tok = varmap[name]
+                return tok
+
+            only, wave = _arg("--only"), _arg("--wave")
+            if only:
+                ids = {x.strip() for x in only.split(",") if x.strip()}
+                lanes.append((fname, "only", frozenset(ids)))
+            elif wave:
+                lanes.append((fname, "wave",
+                              frozenset(sid for sid, w, _t, _d, _f in _REG if w == wave)))
+            else:
+                lanes.append((fname, "full", None))
+    return lanes
+
+
+def _u28_uncovered(files):
+    """(레인 목록, 어느 레인에서도 돌지 않는 검체 집합, full 레인 파일 목록)."""
+    all_ids = {sid for sid, _w, _t, _d, _f in _REG}
+    lanes = _u28_runner_lanes(files)
+    covered, fulls = set(), []
+    for fname, kind, ids in lanes:
+        if kind == "full":
+            covered |= all_ids
+            fulls.append(fname)
+        else:
+            covered |= set(ids)
+    return lanes, all_ids - covered, fulls
+
+
+@specimen("H-CI-COVER-1", "W6",
+          "★M4 전 검체가 어느 CI 레인에서든 1회는 돈다 — `--only` 목록 ↔ 등재 전량 차집합 = 0",
+          ["CI-게이트-부재", "M4", "자기모순-H-CI-TAG-1"])
+def h_ci_cover_1():
+    """★무엇이 결함이었나: 검체 140종 중 CI 에서 도는 것이 19종뿐이었다. 나머지 121종은
+    "쓰여 있으나 아무도 실행하지 않는 문서" 였고, 그 상태에서 나온 초록은 게이트가 아니다.
+
+    ★왜 이 형태(차집합)인가: '전량을 도는 레인이 있다' 만 보면 나중에 그 레인이 `--only` 로
+    좁혀져도 검체는 초록이다. 반대로 각 검체가 자기 실행을 주장하게 하면 등재소가 두 곳이
+    된다. 그래서 **CI yml 을 파싱해 실제 실행 집합을 계산**하고 등재 전량과의 차집합을 잰다 —
+    러너의 `_REG` 가 유일한 등재소로 남고, 새 검체를 등재하는 순간 이 검체가 그것의 배선까지
+    책임진다.
+
+    ★`full` 레인(= `--only` 없는 호출)이 **하나 이상** 있어야 한다는 조건을 함께 건다.
+      부분 목록을 여러 개 이어 붙여 차집합을 0으로 만들 수도 있지만, 그 상태에서는 **새 검체를
+      등재해도 자동으로 돌지 않는다**(누군가 목록에 손으로 추가해야 하고, 그 누락이 바로 이
+      결함의 발생 경로였다). 자동 편입되는 구조를 계약으로 못박는다.
+
+    ⚠비용 경계도 함께 판정한다: 전량 레인이 windows-latest 로 옮겨 가면 매 push 마다 138MB
+      윈도우 빌드가 도는 트리거 확대가 된다. 전량은 mac/ubuntu 레인의 몫이다."""
+    files = _u28_workflow_texts()
+    lanes, uncovered, fulls = _u28_uncovered(files)
+    need(lanes, "CI 에서 건강성 러너 호출을 0건 찾았다 — 추출기 파손이거나 배선이 통째로 사라졌다")
+    need(fulls,
+         "전량(`--only` 없는) 러너 호출이 어느 레인에도 없다 — 새로 등재한 검체가 자동으로 "
+         "돌지 않는 구조다(이 결함의 발생 경로 그 자체)")
+    need(not uncovered,
+         "어느 CI 레인에서도 돌지 않는 검체 %d건: %s%s — '안 도는 검체는 게이트가 아니다'"
+         % (len(uncovered), ", ".join(sorted(uncovered)[:12]),
+            " …" if len(uncovered) > 12 else ""))
+    # ★비용 경계 — 전량 레인은 Windows 러너가 아니어야 한다(트리거 확대 = 예산 폭발).
+    need("windows-health.yml" not in fulls,
+         "전량 실행이 Windows 실기 레인에 붙었다 — 매 push 마다 windows 러너가 전량을 돈다(예산 위반)")
+    # ★ci-branch 예산 규율(H-CI-TAG-1 이 windows-health 에 거는 것과 같은 축).
+    cb = files.get("ci-branch.yml")
+    if cb:
+        on = cb[cb.index("\non:"):cb.index("\npermissions:")]
+        need("pull_request" not in on,
+             "예산 위반: ci-branch 에 `pull_request` 트리거 — 매 PR 갱신마다 전량이 돈다")
+        for bad in ("branches: ['**']", 'branches: ["**"]', "branches: ['*']"):
+            need(bad not in on, "예산 위반: ci-branch 전 브랜치 트리거(%s)" % bad)
+    # ★계측 타당성 — 트리에 위반이 0이므로 **합성 변조본**으로 탐지력을 시험한다.
+    #   (지금 초록인 것이 '탐지기가 살아 있어서' 인지 '아무것도 안 보고 있어서' 인지 가른다.)
+    def _blind(label, mutated):
+        try:
+            _lanes, unc, ful = _u28_uncovered(mutated)
+        except Fail:
+            return None                     # 적발(해소 불가를 적색으로 낸 경우)
+        return None if (unc or not ful) else label
+
+    full_file = fulls[0]
+    mutants = [
+        ("전량 스텝 삭제",
+         dict(files, **{full_file: "\n".join(
+             l for l in files[full_file].splitlines()
+             if not (re.search(r"\bpython3?\b", l.strip()) and "$R" in l and "--json" in l))})),
+        ("전량을 --only 1건으로 축소",
+         dict(files, **{full_file: files[full_file].replace(
+             'python3 "$R" --json', 'python3 "$R" --only H-WIN-1 --json')})),
+        ("windows 레인 목록 변수 개명(해소 불가)",
+         dict(files, **{"windows-health.yml":
+                        files.get("windows-health.yml", "").replace(
+                            'WIN_SPECIMENS="', 'WIN_SPECIMENS_X="')})),
+    ]
+    blind = [b for b in (_blind(lbl, mut) for lbl, mut in mutants) if b]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return ("등재 %d종 · CI 레인 %d개(전량 %s · 부분 %s) · 미실행 0 · 합성 변조 %d종 전건 적발"
+            % (len(_REG), len(lanes), ",".join(fulls),
+               ",".join("%s:%d종" % (f, len(i)) for f, k, i in lanes if k != "full") or "없음",
+               len(mutants)))
+
+
+# ── M7 · 인증 서술 4벌 정합 ────────────────────────────────────────────────
+_U28_DOC_SITES = (
+    (os.path.join("cysjavis-pack", "agents.json"),
+     "agents.json — 제품이 '사용자 환경에 맞게 수정 가능' 하다고 안내하는 파일이라 읽힐 확률이 가장 높다"),
+    (os.path.join("src", "pack.rs"), "pack.rs — 격리 config dir 계약의 정본 주석"),
+    (os.path.join("cysjavis-pack", "bin", "cys-dept"), "cys-dept — 부서별 config dir 분리 지점"),
+    (os.path.join("docs", "RELEASE_NOTES_0.2.2.md"), "0.2.2 릴리스 노트 — 이미 외부에 나간 문면"),
+)
+_ACCOUNT_UNIT_RE = re.compile(r"계정\s?단위")
+_CORRECTION_MARKERS = ("아니라", "반증", "정정", "~~", "사실이 아닙니다", "틀렸다", "종전 서술")
+_CORRECTED_FACTS = ("config dir 경로 단위", "Claude Code-credentials-")
+
+
+def _keychain_violations(where, text):
+    """한 파일의 위반 목록. 규칙 둘 —
+       ① **정정 문면 존재**: 실측 사실(경로 단위 · 서비스명 형태)이 그 파일에 있어야 한다.
+       ② **거짓 서술 부재(형태 규칙)**: '계정 단위' 출현마다 근처에 부정·정정 마커가 있어야 한다.
+    ★왜 단순 문자열 부재로 판정하지 않는가: 정정문 자체가 구 서술을 **인용**하므로("종전 서술
+      …는 반증됐다"), 부재 규칙으로 두면 정정을 쓰는 것이 불가능해진다. 그래서 `_no_wait_for_owner`
+      가 이미 쓰는 하우스 관용(출현 ± 창 안의 마커 요구)을 그대로 따른다."""
+    v = []
+    for tok in _CORRECTED_FACTS:
+        if tok not in text:
+            v.append("%s: 정정 문면 부재 %r" % (where, tok))
+    for m in _ACCOUNT_UNIT_RE.finditer(text):
+        w = text[max(0, m.start() - 120):m.end() + 120]
+        if not any(k in w for k in _CORRECTION_MARKERS):
+            v.append("%s: 무표식 '계정 단위' 서술 — …%s…"
+                     % (where, w.replace("\n", " ")[:160]))
+    return v
+
+
+@specimen("H-DOC-KEYCHAIN-1", "W6",
+          "★M7 인증 서술 4벌 정합 — '계정 단위 Keychain' 거짓 부재 + 정정 문면 존재(설계 U-8 게이트)",
+          ["M7", "U-8", "비가역-창"])
+def h_doc_keychain_1():
+    """★왜 이 거짓말이 특별한가: `agents.json` 은 `Ownership::User` 다. 이미 디스크 사본이 있는
+    기계에는 vendor 갱신이 **자동으로 도달하지 않는다**(`pack.rs::decide_file_action` 의 user
+    분기 = Keep + `.new` 병치). 즉 잘못된 문장을 이번 태그에 고치지 못하면 그 기계에서는
+    영영 남는다. 그리고 그 문장을 믿고 부서를 분리하면 **조용히 로그인이 깨진다** —
+    macOS Keychain 항목은 계정 단위가 아니라 `Claude Code-credentials-<sha256(config dir)[:8]>`
+    로 **경로 단위** 봉인이기 때문이다(2026-08-23 실측: 서비스명 9개 열거 → 7개 정확 일치).
+
+    ★설계 U-8 이 이 게이트를 요구했으나 만들어지지 않았고, 그래서 정정판이 세 곳에만 착지하고
+      네 번째(agents.json)가 남았다. 문서 정합은 사람 눈으로 세 번 실패한 축이다(레인 대조
+      게이트의 교훈과 같은 계급) — 네 벌을 **동시에** 단언하는 기계만이 막는다."""
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        raise Skip("레포 체크아웃이 아니다(배포 팩) — 문서 4벌 정합 검체 적용 불가")
+    texts, v = {}, []
+    for rel, why in _U28_DOC_SITES:
+        p = os.path.join(REPO_DIR, rel)
+        need(os.path.isfile(p),
+             "정합 대상 파일이 없다: %s (%s) — 레포 안에서의 부재는 삭제다" % (rel, why))
+        texts[rel] = _read(p)
+        v += _keychain_violations(rel, texts[rel])
+    need(not v, "인증 서술 정합 위반 %d건: %s" % (len(v), " / ".join(v)))
+    # ★계측 타당성 — 정상 트리엔 위반이 0이므로 합성 변조로 탐지력을 시험한다.
+    agents = os.path.join("cysjavis-pack", "agents.json")
+    prs = os.path.join("src", "pack.rs")
+    pad = "." * 200
+    mutants = [
+        ("정정 사실(경로 단위) 삭제",
+         agents, texts[agents].replace("config dir 경로 단위", "계정 단위")),
+        ("정정 사실(서비스명) 삭제",
+         agents, texts[agents].replace("Claude Code-credentials-", "X-")),
+        ("거짓 서술 무표식 재삽입",
+         agents, texts[agents] + "\n" + pad
+         + "macOS 인증은 계정 단위 Keychain이라 격리해도 로그인 유지." + pad),
+        ("정정 마커만 제거(문장은 유지)",
+         prs, texts[prs].replace("아니라", "이고").replace("정정", "안내")
+         .replace("반증", "확인").replace("종전 서술", "구 서술").replace("틀렸다", "맞다")),
+    ]
+    blind = [lbl for lbl, rel, mut in mutants if not _keychain_violations(rel, mut)]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return ("4벌 정합(%s) · 위반 0 · 합성 변조 %d종 전건 적발"
+            % (" · ".join(os.path.basename(r) for r, _w in _U28_DOC_SITES), len(mutants)))
+
+
+# ── M3-짝 · 관문 보류(gate_pending · exit 78) 소비 ────────────────────────
+@specimen("H-BOOT-GATE-78", "W6",
+          "★M3-짝 boot 관문 보류 = 제3 상태 — Fatal·busy·Degrade 어디로도 접히지 않는다(exit 78 파리티)",
+          ["M3-짝", "U-11", "관문-보류-무처리"])
+def h_boot_gate_78():
+    """★무엇이 결함이었나: `cys.rs` 가 좌석 **제4 등급** `gate_pending`(pane·프로세스는 살아
+    있으나 첫기동 관문에 갇혀 입력을 못 받는다)을 내고 `boot_exit_code` 가 78 을 내는데,
+    파이썬 소비부에는 그 값을 받는 자리가 **없었다** — Fatal 집합은 `{failed, missing}` 뿐이고
+    busy 판정도 아니어서, `elif code != 0` 의 Degrade 가지로 흘러
+    **"비0 이지만 Fatal 역할은 전원 확보"** 라는 거짓 문장이 기록됐다(의무 역할이 관문에 갇혀
+    팀이 서지 않았는데 전원 확보라고 적는 것).
+
+    ★그렇다고 Fatal 로 올리는 수리는 반대편 벽에 부딪힌다 — U-11 이 이미 결박한 계약이다
+      (검체 `H-EXIT-11` ⑥): 보류를 실패로 접으면 소비부가 '기동이 깨졌다'로 읽어 **살아 있는
+      좌석을 회수·파괴**하려 든다(치명위험 ④ · 오살이 오탐보다 훨씬 비싸다).
+      ∴ 옳은 형태는 **제3 상태**다 — 큰 소리로 이름 붙여 기록하되 중단하지 않고, 최종 게이트는
+      종전대로 ⑤check 다(U-10 의 결손 산출이 gate_pending 좌석을 '못 쓰는 좌석'으로 세므로
+      보류 상태에서 부트가 조용히 성공으로 끝나지 않는다).
+
+    ★이 검체는 그 세 벽을 **동시에** 세운다: ⓐFatal 로 접히지 않는가 ⓑbusy 로 접히지 않는가
+      ⓒ**그럼에도 반드시 잡히는가**. 셋 중 하나만 검사하면 나머지 방향으로 조용히 무너진다."""
+    bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    notes = []
+    # ⓐ 값 파리티 — 관문 보류 전용 종료코드는 **78 하나**다(같은 사실에 값이 둘이면 드리프트).
+    need("CYS_LAUNCH_EXIT_GATE_PENDING = 78" in bsrc, "python 소비부 관문 보류 exit 상수 이탈")
+    need("CYS_BOOT_EXIT_GATE_PENDING = CYS_LAUNCH_EXIT_GATE_PENDING" in bsrc,
+         "boot 쪽 관문 보류 상수가 별도 숫자로 갈라졌다 — 같은 사실에 값이 둘이면 한쪽만 고쳐진다")
+    lib = os.path.join(REPO_DIR, "src", "lib.rs")
+    if os.path.isfile(lib):
+        need("pub const EXIT_GATE_PENDING: i32 = 78;" in _read(lib),
+             "Rust 정본 관문 보류 exit 상수 이탈(3자 파리티 붕괴)")
+        notes.append("exit 78 파리티(rust lib ↔ python boot/launch)")
+    else:
+        notes.append("exit 78 파리티(python 측만 — 배포 팩)")
+    # ⓑ Fatal 집합은 **단일 등재소**이고, gate_pending 은 거기 없어야 한다(U-11 계약).
+    need('BOOT_FATAL_OUTCOMES = ("failed", "missing")' in bsrc,
+         "Fatal outcome 등재소가 없거나 집합이 바뀌었다")
+    need('r.get("outcome") in BOOT_FATAL_OUTCOMES' in bsrc,
+         "_boot_fatal_verdict 가 등재소를 쓰지 않는다(본문 리터럴 회귀 — 새 outcome 이 조용히 샌다)")
+    # ⓒ 제3 분기가 **실재하고 소비 배선까지 되어 있는가**(선언만 하고 안 부르면 유령이다).
+    need("def _boot_gate_pending_verdict(" in bsrc, "관문 보류 전용 판정 함수가 없다")
+    need(bsrc.count("_boot_gate_pending_verdict(") >= 2,
+         "관문 보류 판정 함수를 선언만 하고 소비하지 않는다(유령 분기)")
+    need("STEP.BOOT_GATE_PENDING" in bsrc, "보류 전용 단계 라벨이 없다 — Degrade 로 뭉개진다")
+    ci = bsrc.find("gate_why = _boot_gate_pending_verdict(")
+    need(ci > 0, "④ 소비부에서 보류 판정을 계산하지 않는다")
+    tail = bsrc[ci:ci + 2500]
+    need(tail.find("elif gate_why is not None:") < tail.find("elif code != 0:"),
+         "보류 분기가 Degrade(`elif code != 0`) 뒤에 있다 — 먼저 걸리는 쪽이 이겨 거짓 문장이 남는다")
+    # ⓓ 행위 실측(순수 판정 8축) — 소스 문자열이 아니라 **판정 결과**를 잰다.
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_bootstrap as B
+    need(B.CYS_BOOT_EXIT_GATE_PENDING == 78, "boot 관문 보류 상수가 78 이 아니다")
+    gp = json.dumps({"roles": [{"role": "cso", "agent": "claude", "outcome": "gate_pending",
+                                "mandatory": True, "reason": "면책 창 상주"}],
+                     "summary": {"gate_pending": 1}})
+    need(B._boot_fatal_verdict(1, gp) is None,
+         "관문 보류가 Fatal 로 오분류 — 살아 있는 좌석에 회수·파괴 처방이 나간다(U-11 치명위험 ④)")
+    need(B._boot_was_busy(1, gp) is False, "관문 보류가 busy(무스폰)로 오분류 — 티켓 회계 오염")
+    why = B._boot_gate_pending_verdict(1, gp)
+    need(why is not None,
+         "관문 보류가 어디에도 걸리지 않는다 — Degrade 로 흘러 'Fatal 역할은 전원 확보'(거짓)가 기록된다")
+    for tok, miss in (("관문", "관문 통과 처방"), ("No, exit", "면책 창 기본 포커스 경고"),
+                      ("회수", "비파괴 지시"), ("면책 창 상주", "생산자 reason 인용")):
+        need(tok in why, "보류 사유에 %s 가 없다" % miss)
+    need(B._boot_gate_pending_verdict(B.CYS_BOOT_EXIT_GATE_PENDING, "파싱 불가 산문") is not None,
+         "exit 78 단독(--json 소비 불가)에서 보류를 놓친다 — 두 축 OR 이 아니다")
+    need(B._boot_fatal_verdict(B.CYS_BOOT_EXIT_GATE_PENDING, "파싱 불가 산문") is None,
+         "exit 78 이 보수 폴백에서 Fatal 로 접힌다 — 살아 있는 좌석 회수 처방(U-11 위반)")
+    opt = json.dumps({"roles": [{"role": "reviewer-codex", "agent": "codex",
+                                 "outcome": "gate_pending", "mandatory": False}]})
+    need(B._boot_gate_pending_verdict(1, opt) is None,
+         "선택 역할 보류까지 제3 상태로 승격(Degrade 가 옳다 — 과잉 발화)")
+    failed = json.dumps({"roles": [{"role": "cso", "agent": "claude",
+                                    "outcome": "failed", "mandatory": True}]})
+    need(B._boot_gate_pending_verdict(1, failed) is None, "진짜 실패를 보류로 오판(실패 은닉)")
+    need(B._boot_fatal_verdict(1, failed) is not None,
+         "의무 역할 failed 가 Fatal 로 승격되지 않음(보류 도입이 실패 판정을 삼켰다)")
+    notes.append("행위 8축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0)")
+    # ⓔ 계측 타당성 — 캠페인 베이스(PRE_U24_REF)에는 제3 분기가 없었다(진짜 변화를 보고 있다).
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"), PRE_U24_REF)
+    calib = "skip(no-git)"
+    if old is not None:
+        need("_boot_gate_pending_verdict" not in old,
+             "계측 타당성 실패: 구 소비부에 이미 제3 분기가 있다(기준 선택 오류 의심)")
+        need('in ("failed", "missing")' in old,
+             "계측 타당성 실패: 구 소비부에서 Fatal 집합 리터럴을 찾지 못했다")
+        calib = "구 소비부=제3 분기 부재(보류가 Degrade 로 흐름) 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-RESET-SENT-1", "W6",
+          "★완전 초기화 센티널 격리 — 경로 주입 가능·상대경로 거부·테스트가 라이브 가드를 지우지 않는다",
+          ["M4-선행조건", "전-pane-사망", "테스트-비결정론"])
+def h_reset_sent_1():
+    """★왜 M4 의 **선행 조건**인가: 센티널 회귀 테스트는 판정을 시험하려고 센티널을 쓰고
+    지운다. 경로가 `$HOME/.local/state/…` 로 고정돼 있으면 그 테스트가 두 가지를 동시에
+    깨뜨린다 — ⓐ러너가 둘 이상 돌면 같은 파일을 서로 쓰고 지워 **무작위 적색**이 나고(결정론
+    게이트가 비결정론의 원천이 된다) ⓑ진짜 완전 초기화가 진행 중이면 **살아 있는 가드를
+    지운다.** 그 가드의 존재 이유가 "리셋 중 데몬 부활 = 전 pane 사망 등급" 차단이므로,
+    이건 테스트가 제품의 최고 위험 등급 안전장치를 무력화하는 것이다.
+    선재 결함이지만 CI 전량 배선(M4)을 넣는 순간 즉시 표면화된다.
+
+    ★오버라이드에 **절대경로 조건**을 거는 이유: 쓰는 쪽(리셋 실행 프로세스)과 읽는 쪽
+      (CLI autostart·GUI ensure_daemon)이 서로 다른 프로세스다. 상대경로를 허용하면 두
+      프로세스의 cwd 가 다를 때 서로 다른 파일을 보고 가드가 **조용히** 무력해진다."""
+    src = _repo_file(os.path.join("src", "factory_reset.rs"))
+    need('pub const ENV_RESET_SENTINEL: &str = "CYS_FACTORY_RESET_SENTINEL";' in src,
+         "센티널 경로 오버라이드 상수가 없다 — 테스트가 라이브 홈을 쓸 수밖에 없다")
+    seg = _slice_between(src, "pub fn sentinel_path()", "\nfn now_unix()",
+                         "factory_reset::sentinel_path")
+    need("ENV_RESET_SENTINEL" in seg, "sentinel_path 가 오버라이드를 읽지 않는다(상수만 있고 배선 0)")
+    need("is_absolute()" in seg,
+         "상대경로 오버라이드를 거르지 않는다 — 쓰는 쪽과 읽는 쪽이 다른 파일을 볼 수 있다")
+    need("dirs::home_dir()" in seg, "기본 경로(홈 파생)가 사라졌다 — 오버라이드 부재 시 가드가 죽는다")
+    ti = src.find("fn sentinel_is_fail_open_and_self_cleaning()")
+    need(ti > 0, "센티널 회귀 테스트를 찾지 못했다(삭제됐는가?)")
+    tbody = src[ti:ti + 5000]
+    need("EnvGuard::set(ENV_RESET_SENTINEL" in tbody,
+         "테스트가 센티널 경로를 격리하지 않는다 — 라이브 가드 삭제·동시 실행 적색 경로 잔존")
+    need("let restore = std::fs::read_to_string" not in tbody,
+         "라이브 센티널 백업·복원 관용구가 남아 있다(그 사이 창에서 실 리셋 가드가 지워진다)")
+    # 계측 타당성 — 캠페인 베이스에는 오버라이드가 없었다(탐지기가 진짜 변화를 보고 있다).
+    old = _git_show(os.path.join("src", "factory_reset.rs"), PRE_U24_REF)
+    calib = "skip(no-git)"
+    if old is not None:
+        need("ENV_RESET_SENTINEL" not in old,
+             "계측 타당성 실패: 구 트리에 이미 오버라이드가 있다(기준 선택 오류 의심)")
+        need("let restore = std::fs::read_to_string" in old,
+             "계측 타당성 실패: 구 트리에서 라이브 백업·복원 관용구를 찾지 못했다")
+        calib = "구 트리=고정 홈 경로 + 라이브 백업·복원 확인"
+    return "경로 주입·절대경로 강제·기본 경로 보존 · 테스트 격리 · 계측검증=%s" % calib
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
