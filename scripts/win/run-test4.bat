@@ -9,7 +9,7 @@ copy /y "%SRC%aiterm.exe" "%DST%" >nul
 cd /d "%DST%"
 echo === round4: diagnostics %DATE% %TIME% === > "%LOG%"
 taskkill /im aitermd.exe /f >nul 2>&1
-del /q C:\Users\cys\aiterm-proof.txt 2>nul
+del /q %USERPROFILE%\aiterm-proof.txt 2>nul
 set AITERM_DEBUG=1
 set AITERM_SHELL=cmd.exe
 rem visible daemon console so debug lines can be screenshotted
@@ -20,12 +20,12 @@ timeout /t 6 /nobreak >nul
 echo --- is shell child alive --- >> "%LOG%"
 tasklist | findstr /i "cmd.exe aitermd" >> "%LOG%"
 echo --- stdin proof: write file via injected command --- >> "%LOG%"
-aiterm.exe send --surface surface:1 "echo PROOF_VIA_STDIN > C:\Users\cys\aiterm-proof.txt" >> "%LOG%" 2>&1
+aiterm.exe send --surface surface:1 "echo PROOF_VIA_STDIN > %USERPROFILE%\aiterm-proof.txt" >> "%LOG%" 2>&1
 aiterm.exe send-key --surface surface:1 Return >> "%LOG%" 2>&1
 timeout /t 5 /nobreak >nul
-if exist C:\Users\cys\aiterm-proof.txt (
+if exist %USERPROFILE%\aiterm-proof.txt (
   echo PROOF FILE EXISTS: >> "%LOG%"
-  type C:\Users\cys\aiterm-proof.txt >> "%LOG%"
+  type %USERPROFILE%\aiterm-proof.txt >> "%LOG%"
 ) else (
   echo PROOF FILE MISSING >> "%LOG%"
 )

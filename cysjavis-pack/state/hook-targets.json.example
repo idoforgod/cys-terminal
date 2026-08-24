@@ -43,7 +43,7 @@
  "schema_version": 1,
  "measured_at": "2026-07-31 (T0-BASELINE §1 hook-census 실측 · ps -E CLAUDE_CONFIG_DIR 대조)",
  "evidence": [
-  "T0 hook-census §0-1: ls -d ~/.claude* → .claude · .claude-2 · .claude-2-dept-pub · .claude-3 · .claude-worker(작성 기기의 워커 프로필 · 발행 제네릭화)",
+  "T0 hook-census §0-1: ls -d ~/.claude* → .claude · .claude-2 · .claude-dept · .claude-3 · .claude-worker(작성 기기의 워커·dept 프로필명은 발행 제네릭화 — 실기 이름은 다르다)",
   "T0 hook-census §0-2: ps -E CLAUDE_CONFIG_DIR → 6번째 프로필 ~/.cys/claude (agents.json env 주입 · 함대 공용)",
   "T0 hook-census §0-3: .zshrc — master 별칭=~/.claude · 워커 수동 별칭=~/.claude-worker · claude-3()=~/.claude-3",
   "T0 hook-census §2: 6프로필 Stop 체인 전수 — completion-guard.sh 등록 0건(현재)",
@@ -98,8 +98,8 @@
    "measured": "hook-census §0-3 충돌 · §1-4"
   },
   {
-   "basename": ".claude-2-dept-pub",
-   "path": "~/.claude-2-dept-pub",
+   "basename": ".claude-dept",
+   "path": "~/.claude-dept",
    "role": "dept 발행 전용",
    "eligibility": {"guard_stop": "deny", "brief_warn": "deny"},
    "why": "Phase 1 범위(워커 검증·위임 경고) 밖. statusLine 이 다른 팩(pack-dept-dept-1)을 가리키는 특수 프로필이라 부작용 표면이 다르다.",

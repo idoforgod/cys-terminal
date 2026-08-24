@@ -138,7 +138,7 @@ def norm_base(s):
     return s
 
 # ★G18(T-0147-7 W1a): 경로 판정을 **정규화 경로** 기반으로 — 백슬래시 무음 우회 차단.
-# 종전 `t.rsplit("/",1)[-1]` 은 Windows 경로 `C:\Users\me\.claude\soul.md` 에 '/' 가 없어
+# 종전 `t.rsplit("/",1)[-1]` 은 Windows 경로 `C:\Users\x\.claude\soul.md` 에 '/' 가 없어
 # **전체 문자열을 basename 으로 돌려주었다** → protected()·guard_infra() 가 전부 미스 →
 # 헌법파일 쓰기·guard 자기보호가 Windows에서 무음 통과였다(실측 정적 판독 · 검체 H-WIN-1).
 def norm_path(t):
@@ -773,7 +773,7 @@ def norm_loose(s):
 def norm_loose_slash(s):
     """G18 보조 변형 — 백슬래시를 '삭제'가 아니라 '/'로 바꾼다. 보호파일 basename 스캔에만 쓴다.
     norm_loose 의 백슬래시 **삭제**는 `s\\oul.md` 류 이스케이프 회피를 무력화하는 장치인데, 같은
-    삭제가 Windows 경로 `C:\\Users\\me\\soul.md` 의 basename 경계도 지워 보호 판정을 미스한다.
+    삭제가 Windows 경로 `C:\\Users\\x\\soul.md` 의 basename 경계도 지워 보호 판정을 미스한다.
     두 변형을 **모두** 스캔하면 양쪽이 다 막힌다 — 추가 deny만 발생하고 기존 통과 경로는 불변."""
     s = norm_base(s)
     s = s.replace('"', "").replace("'", "").replace("\\", "/")

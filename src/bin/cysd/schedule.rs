@@ -1834,10 +1834,10 @@ mod tests {
             "HOME 이 이미 있으면 무접촉(unix 무변경 보장)"
         );
         // HOME 부재(Windows bash -c 비로그인 셸) → USERPROFILE 로 보정.
-        let win = cys::spawn_env_pairs(&exe_dir, "/usr/bin", None, Some("C:\\Users\\me"));
+        let win = cys::spawn_env_pairs(&exe_dir, "/usr/bin", None, Some("C:\\Users\\x"));
         assert_eq!(
             win.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str()),
-            Some("C:\\Users\\me"),
+            Some("C:\\Users\\x"),
             "HOME 미설정이면 ${{HOME}} 전개가 붕괴한다 — USERPROFILE 로 채워야 한다"
         );
         // 빈 문자열 USERPROFILE 은 보정 근거가 못 된다(빈 HOME 을 심으면 경로가 더 나빠진다).

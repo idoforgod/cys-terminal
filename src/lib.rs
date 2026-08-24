@@ -2392,7 +2392,7 @@ mod tests {
         let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
         for pairs in [
             spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None),
-            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\me")),
+            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\x")),
         ] {
             assert_eq!(
                 pairs
@@ -2426,7 +2426,7 @@ mod tests {
             // PATH 무변경에 가깝고 HOME 이 이미 있는 unix 꼴 — 그래도 쌍은 나가야 한다.
             spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None),
             // HOME 부재 Windows 꼴(backfill 발동) — 조건 조합과 무관하게 쌍은 나가야 한다.
-            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\me")),
+            spawn_env_pairs(exe_dir, "", None, Some("C:\\Users\\x")),
         ] {
             assert_eq!(
                 pairs
@@ -2740,14 +2740,14 @@ mod tests {
     fn expand_windows_env_cases() {
         // %VAR% 전개(mac 에서 Windows 로직 검증 — 순수 fn 직접 호출).
         let lk = |k: &str| match k {
-            "USERPROFILE" => Some(r"C:\Users\cys".to_string()),
-            "APPDATA" => Some(r"C:\Users\cys\AppData\Roaming".to_string()),
+            "USERPROFILE" => Some(r"C:\Users\x".to_string()),
+            "APPDATA" => Some(r"C:\Users\x\AppData\Roaming".to_string()),
             _ => None,
         };
         // 전개.
         assert_eq!(
             expand_windows_env(r"%USERPROFILE%\.local\bin", lk),
-            r"C:\Users\cys\.local\bin"
+            r"C:\Users\x\.local\bin"
         );
         // 미지 변수는 원문 유지.
         assert_eq!(expand_windows_env(r"%NOPE%\bin", lk), r"%NOPE%\bin");
@@ -2756,7 +2756,7 @@ mod tests {
         // 연속 변수(경계 인접).
         assert_eq!(
             expand_windows_env(r"%USERPROFILE%%APPDATA%", lk),
-            r"C:\Users\cysC:\Users\cys\AppData\Roaming"
+            r"C:\Users\xC:\Users\x\AppData\Roaming"
         );
         // 빈 이름(%%)·미종결 %는 원문 보존(안전 폴백).
         assert_eq!(expand_windows_env(r"50%%off", lk), r"50%%off");
@@ -2767,8 +2767,8 @@ mod tests {
 
     #[test]
     fn windows_user_bin_dirs_composition() {
-        let home = Path::new(r"C:\Users\cys");
-        let appdata = PathBuf::from(r"C:\Users\cys\AppData\Roaming");
+        let home = Path::new(r"C:\Users\x");
+        let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
         let with = windows_user_bin_dirs(home, Some(&appdata));
         let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
@@ -2784,21 +2784,21 @@ mod tests {
     fn compose_pane_path_rules() {
         let sep = ';';
         let prefixes = vec![r"C:\app\bin".to_string(), r"C:\app\runtime\python".to_string()];
-        let user_bins = vec![r"C:\Users\cys\.local\bin".to_string(), r"C:\Users\cys\AppData\Roaming\npm".to_string()];
+        let user_bins = vec![r"C:\Users\x\.local\bin".to_string(), r"C:\Users\x\AppData\Roaming\npm".to_string()];
         // ① 낡은 프로세스 PATH(.local\bin 없음) + 신선 레지스트리(.local\bin 있음) →
         //    새 순서: prefixes ; process ; fresh 신규분 ; user_bins 신규분. .local\bin 정확히 1회.
-        let fresh = r"C:\Windows\System32;C:\Users\cys\.local\bin";
+        let fresh = r"C:\Windows\System32;C:\Users\x\.local\bin";
         let process = r"C:\Windows\System32;C:\stale";
         let out = compose_pane_path(&prefixes, Some(fresh), &user_bins, process, sep);
         let parts: Vec<&str> = out.split(sep).collect();
         assert_eq!(parts[0], r"C:\app\bin", "prefix 선두: {out}");
         assert_eq!(parts[1], r"C:\app\runtime\python", "runtime 2순위: {out}");
-        let local_count = parts.iter().filter(|&&p| p == r"C:\Users\cys\.local\bin").count();
+        let local_count = parts.iter().filter(|&&p| p == r"C:\Users\x\.local\bin").count();
         assert_eq!(local_count, 1, "user bin 정확히 1회(레지스트리·user_bins 중복 dedup): {out}");
         assert!(parts.contains(&r"C:\stale"), "세션 유래 항목 보존: {out}");
         // 세션 유래(process) 항목이 fresh 신규분(.local\bin)보다 앞 — precedence 보존(MAJ#1).
         let stale_idx = parts.iter().position(|&p| p == r"C:\stale").unwrap();
-        let local_idx = parts.iter().position(|&p| p == r"C:\Users\cys\.local\bin").unwrap();
+        let local_idx = parts.iter().position(|&p| p == r"C:\Users\x\.local\bin").unwrap();
         assert!(stale_idx < local_idx, "process 항목이 레지스트리 신규분보다 앞: {out}");
         // System32 도 dedup(레지스트리·프로세스 중복) — 1회.
         assert_eq!(parts.iter().filter(|&&p| p == r"C:\Windows\System32").count(), 1, "전체 dedup: {out}");
@@ -2809,7 +2809,7 @@ mod tests {
         assert_eq!(parts2[0], r"C:\app\bin");
         assert!(parts2.contains(&r"C:\stale") && parts2.contains(&r"C:\Windows\System32"));
         // user_bins 는 여전히 포함(fresh 에 없어도 belt-and-braces).
-        assert!(parts2.contains(&r"C:\Users\cys\.local\bin"));
+        assert!(parts2.contains(&r"C:\Users\x\.local\bin"));
 
         // ④ 빈 항목 제거·중복 전면 dedup.
         let out3 = compose_pane_path(&prefixes, Some(";;C:\\dup"), &[], "C:\\dup;C:\\app\\bin;", sep);

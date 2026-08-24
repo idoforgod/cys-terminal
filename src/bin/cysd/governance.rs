@@ -6913,7 +6913,7 @@ mod tests {
         ];
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // npm 래퍼(백슬래시 경로·패키지 세그먼트 claude-code) — 매치.
-        let npm = r"node C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
+        let npm = r"node C:\Users\x\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
         assert!(cmdline_matches_agent_exec(npm, "claude"));
         assert_eq!(sel(&s(&[npm]), &cands), Some(("claude".into(), "claude".into())));
         // cmd 셔틀(.cmd 확장자 정규화·대소문자 무구분) — 매치.

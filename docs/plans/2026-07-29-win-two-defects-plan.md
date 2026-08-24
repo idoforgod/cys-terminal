@@ -100,7 +100,7 @@ Windows 신규 설치에서 **claude 노드를 하나도 띄울 수 없다.** �
 - User 등급: `soul.md`, `directives/*.md`, `CLAUDE.md`, `schedule.json`, `agents.json`.
 
 ### 2.5 master 좌석 — "반쪽 등록"의 정확한 정의
-- 스크린샷의 master pane 제목은 **`C:\Users\cys-macbook\`(자동 경로 제목)**. 다른 노드는 `cso-claude · cys-macbook` 형식 = `launch-agent` 산물. → **master는 launch-agent가 만든 노드가 아니다.**
+- 스크린샷의 master pane 제목은 **`C:\Users\x\`(자동 경로 제목)**. 다른 노드는 `cso-claude · x` 형식 = `launch-agent` 산물. → **master는 launch-agent가 만든 노드가 아니다.**
 - 부트스트랩 설계상 그렇게 된다: `javis_bootstrap.py:7-8` 단계 = **① preflight --fix ② cys ping ③ `cys claim-role master` ④ `cys boot`**. ③은 **새 노드를 만드는 게 아니라 "지금 이 pane"에 역할을 선언**한다.
 - 발동 조건도 그렇다: `hooks/role-bootstrap.sh:38-42`는 `cys surface-role`이 `worker|cso|reviewer-*`면 즉시 종료 → **미claim(빈) pane 또는 master pane에서만 발동**.
 - `claim-role`이 남기지 **않는** 두 흔적:
@@ -164,7 +164,7 @@ Windows 신규 설치에서 **claude 노드를 하나도 띄울 수 없다.** �
 ```
 > & "<install>\runtime\python\python3.exe" "%USERPROFILE%\.cys\pack\bin\javis_event.py" --help
 Traceback (most recent call last):
-  File "C:\Users\cys-macbook\.cys\pack\bin\javis_event.py", line 19, in <module>
+  File "C:\Users\x\.cys\pack\bin\javis_event.py", line 19, in <module>
     import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
 ModuleNotFoundError: No module named 'javis_scrub'
 ```
@@ -216,7 +216,7 @@ title       : surface 33 ← 자동 번호 제목 = launch-agent 산물 아님
 [launch-agent] folder-trust prompt detected → confirming     ← claude 기동 성공·프롬프트 감지 성공
 error: agent 'claude' readiness not confirmed in 60s — directive injection aborted (셸 오주입 차단).
 마지막 화면 꼬리:
-PS C:\Users\cys-macbook>                                      ← claude 소멸·셸 복귀
+PS C:\Users\x>                                      ← claude 소멸·셸 복귀
 ```
 
 **해당 코드** (`src/bin/cys.rs:4648-4655`):
@@ -322,9 +322,9 @@ fn screen_tail_is_shell_prompt(text: &str) -> bool {
 
 **최초 사고 화면의 잔해와 정합**:
 ```
-PS C:\Users\cys-macbook> ─────
-PS C:\Users\cys-macbook> TX 7%…
-PS C:\Users\cys-macbook> n · …
+PS C:\Users\x> ─────
+PS C:\Users\x> TX 7%…
+PS C:\Users\x> n · …
 ```
 지침·상태줄 조각이 PowerShell에 제출된 형태다.
 
@@ -348,12 +348,12 @@ PS C:\Users\cys-macbook> n · …
 
 **실측**: `▶CEO`(= `cys launch-agent --role master --agent claude`, `--cwd` 미지정)로 생성된 pane의 셸 위치가
 ```
-PS C:\Users\cys-macbook\AppData\Local\cys>      ← 설치 폴더
+PS C:\Users\x\AppData\Local\cys>      ← 설치 폴더
 ```
 `--cwd`를 명시하면 정상:
 ```
 cys launch-agent --role master --agent claude --cwd "$env:USERPROFILE"
-→ [launch-agent] surface:45 created (role=master) · pane 위치 = C:\Users\cys-macbook   ✅
+→ [launch-agent] surface:45 created (role=master) · pane 위치 = C:\Users\x   ✅
 ```
 
 **기대 동작과의 괴리**: `state.rs`의 pane 생성은 `cwd.unwrap_or_else(|| dirs::home_dir()…)`로
@@ -565,7 +565,7 @@ windows → (순수 cmd, env맵)     (env는 surface.create 시점에만 주입 
 #### D안(버튼 제거)을 기각한 근거 — 설계 시 재론 방지용
 
 1. **버튼은 5개 좌석 중 1개만 담당한다.** "너는 마스터다" → `role-bootstrap.sh` 훅 → `javis_bootstrap.py` ④ → **`cys boot`가 CSO·워커·리뷰어2를 `launch-agent`로 기동**한다.
-   실측 증거: 생존 노드 제목이 `cso-claude · cys-macbook`·`worker-claude · cys-macbook` = `workflow_title(role,agent,cwd)` 형식 = **launch-agent 산물**.
+   실측 증거: 생존 노드 제목이 `cso-claude · x`·`worker-claude · x` = `workflow_title(role,agent,cwd)` 형식 = **launch-agent 산물**.
    → 버튼을 없애도 **나머지 4명은 그대로 D2 경로를 탄다.**
 2. **부활(phoenix)이 죽는다.** `cys restore`·`node-recover`도 동일하게 `launch-agent`를 쓴다.
    D2 미수리 시 **Windows에서 자동 부활이 영구 불능**이며, 이는 **조용히** 실패한다(§2.6).
@@ -1335,3 +1335,11 @@ import sys, os; _a = sys.argv[0] if sys.argv else ""; _d = os.path.dirname(os.pa
    **구문검사 수단이 없다**. 실행 경로는 ①`feat/windows-x64-dist` push ②`workflow_dispatch` 수동 트리거.
    첫 실행 로그를 반드시 확인하라 — 그전까지 이 스텝은 **미검증**이다.
 4. 나머지 티켓: **T-D6 → T-D3 → T-D2a → T-D5**(§6.5·§6.7).
+
+---
+
+> **전사 표기(발행 제네릭화 · 2026-08-24)**: 본문의 모든 실측 캡처에서 Windows 사용자명은
+> `x` 로 치환돼 있다(`C:\Users\x` · pane 제목 꼬리 `· x`). 이 문서를 인용하는 코드가 재는 축은
+> **경로의 형태**(`PS ` 접두 · 드라이브 콜론·역슬래시 · `>` 종결)이지 사용자명이 아니므로 증거가치는
+> 불변이다. ★이 주석은 **문서 끝**에 둔다 — 앞에 넣으면 이 문서를 `파일:행` 으로 인용하는
+> `docs/plans/2026-07-29-implementation-inventory.md`·`src/bin/cys.rs` 의 행번호가 전부 밀린다.

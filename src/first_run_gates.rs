@@ -1341,7 +1341,7 @@ pub mod fixtures {
     /// 이 부류가 **안전 밸브의 시험 대상**이다: 꼬리가 `❯` 라 '끝문자 4종' 술어로는 셸
     /// 프롬프트로 읽히지만, 화면은 명백히 TUI 를 그리고 있다.
     pub const LIVE_TUI_AT_PROMPT: &str = "─ Claude Code ─\n\
-        \x20 Welcome back 미래학자!   Opus 5 (1M context) · Claude Max\n\
+        \x20 Welcome back user!   Opus 5 (1M context) · Claude Max\n\
         \x20 /Users/x/work\n\
         ? for shortcuts\n\
         \x20 …43% context left\n\

@@ -825,7 +825,7 @@ def self_test():
                        ent("claude", "allow", "allow", "worker(함대 공용)",
                            path=os.path.join(td, "claude")),
                        ent(".claude-2", "deny", "deny", "unclear"),
-                       ent(".claude-2-dept-pub", "deny", "deny", "dept 발행 전용"),
+                       ent(".claude-dept", "deny", "deny", "dept 발행 전용"),
                    ]}
 
         # ⑫ 최종 안전망(운영 표·배포 예시표 **둘 다** 부재 = 코드 하드코딩 폴백) — 이때만

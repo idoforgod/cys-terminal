@@ -29,15 +29,24 @@ esac
 # 스캐너 자신과 형제 스캐너(scan-pack-secrets.sh)는 제외 — 둘 다 자기 패턴/정책 정의에 /Users/cys·
 # 토큰 형식·개인 핸들(ysfuture)이 리터럴로 들어 자기-오탐을 만든다(린터 관례)
 skip_re='\.(lock|png|jpe?g|gif|ico|svg|woff2?|ttf|wasm|pdf|zip|dmg|msi|exe)$|(^|/)Cargo\.lock$|(^|/)LICENSE$|(^|/)secret-scan\.sh$|(^|/)scan-pack-secrets\.sh$'
-# 더미 username(제네릭화된 테스트 픽스처) — 그 외 /Users/<name>은 개인경로로 차단
-dummy_user_re='/Users/(user|x|youruser|USERNAME|runner|home)(/|"|$)'
+# 더미 username(제네릭화된 테스트 픽스처) — 그 외 /Users/<name>은 개인경로로 차단.
+# ★이름 목록은 **한 벌**이다(`dummy_names`). POSIX 판과 Windows 판이 각자 목록을 들면
+#   한쪽만 늘어나 같은 이름이 한 OS 에서만 통과하는 비대칭이 생긴다.
+dummy_names='user|x|youruser|USERNAME|runner|home'
+dummy_user_re='/Users/('"$dummy_names"')(/|"|$)'
+# Windows 홈의 더미 판 — `C:\Users\x\…`·`C:\Users\x>`. 경계는 '이름 문자가 아닌 것'으로 본다
+# (뒤에 `\`·`>`·공백·따옴표 등 무엇이 오든 이름 자체가 더미면 통과).
+win_dummy_user_re='[A-Za-z]:\\+Users\\+('"$dummy_names"')([^A-Za-z0-9._-]|$)'
 # 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함)
 email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md)$'
 email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@'
 # 개인 계정 핸들 denylist(맨몸) — /Users·.claude- 접두 없이 계정키·설정값으로 박힌 개인 핸들도 차단한다.
 # 넓은 패턴 대신 '알려진 개인 핸들'만 명시 등재해 제네릭 영어단어 오탐을 배제한다(deny-by-default 유지).
 # ysfuture = 오너 개인 alias·이메일 prefix. 부분일치라 'claude-ysfuture'·'ysfuture@…'도 함께 걸린다.
-handle_deny_re='ysfuture'
+# cys-macbook = 오너 macOS/Windows 기계 계정명(2026-08-24 실측 누출 3파일 22곳). 경로 접두 없이
+#   pane 제목 꼬리(`cso-claude · cys-macbook`)·프롬프트 검체로도 박혀 있어 규칙 1·1′만으로는 안 걸린다.
+# ★브랜드 `cysinsight` 는 여기 넣지 않는다 — LICENSE·README·홈페이지 URL 에 실린 공개 식별자다.
+handle_deny_re='ysfuture|cys-macbook'
 
 findings="$(mktemp)"; trap 'rm -f "$findings"' EXIT
 
@@ -48,8 +57,15 @@ for f in "${files[@]}"; do
   # 1) 개인 절대경로 (/Users/<실명>) — 더미 제외
   grep -nE '/Users/[A-Za-z0-9._-]+' "$f" 2>/dev/null | grep -vE "$dummy_user_re" \
     | sed "s|^|PATH\t$f:|" >> "$findings" || true
-  # 2) 개인 프로필/홈 디렉터리명 (제네릭화 대상)
-  grep -nE '\.claude-(ysfuture|cysinsight|cysfuturist)|/Users/cys' "$f" 2>/dev/null \
+  # 1') 개인 절대경로 Windows 판 (`C:\Users\<실명>`) — 규칙 1의 역슬래시 거울. 더미 제외.
+  #     사각이었다: 규칙 1의 `/Users/` 는 정슬래시 전용이라 `C:\Users\<실명>` 을 **한 건도** 못 봤다
+  #     (2026-08-24 실측 — 오너 계정명이 Windows 경로 형태로 문서·검체에 살아 있었다).
+  #     이름 첫 글자를 영숫자로 못박아 문서의 생략 표기(`C:\Users\...`)를 오탐하지 않는다.
+  grep -nE '[A-Za-z]:\\+Users\\+[A-Za-z0-9][A-Za-z0-9._-]*' "$f" 2>/dev/null | grep -vE "$win_dummy_user_re" \
+    | sed "s|^|WIN-PATH\t$f:|" >> "$findings" || true
+  # 2) 개인 프로필/홈 디렉터리명 (제네릭화 대상) — ★구분자 무관(`/Users/cys`·`C:\Users\cys` 둘 다).
+  #    종전 `/Users/cys` 는 정슬래시 전용이라 Windows 표기의 같은 계정을 통과시켰다(사각 ②).
+  grep -nE '\.claude-(ysfuture|cysinsight|cysfuturist)|[/\\]Users[/\\]+cys' "$f" 2>/dev/null \
     | sed "s|^|PROFILE\t$f:|" >> "$findings" || true
   # 3) 이메일 (허용 문서·오탐 제외)
   if ! printf '%s' "$f" | grep -qE "$email_allow_re"; then

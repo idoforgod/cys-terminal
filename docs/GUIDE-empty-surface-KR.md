@@ -11,7 +11,7 @@
 cys를 쓰다 보면 — 특히 **업데이트를 하고 나면** — 화면에 이런 창이 하나 남습니다.
 
 ```
-cys-macbook@cys-macbookui-MacBookPro ~ %
+user@MacBook-Pro ~ %
 ```
 
 AI 직원(마스터·워커·감사 등)이 앉아 있지 않은, **그냥 검은 화면에 프롬프트만 있는 창**입니다.

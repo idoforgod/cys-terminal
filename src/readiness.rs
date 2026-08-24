@@ -518,7 +518,7 @@ mod tests {
     /// 이것이 오탐 대조군이다: 관문 코퍼스가 이 화면에 걸리면 **건강한 부트 전량이 보류**로 접힌다.
     const HEALTHY_BANNER: &str = "PS C:\\WINDOWS\\system32> claude --dangerously-skip-permissions\n\
         ─ Claude Code ─\n\
-        \x20 Welcome back 미래학자!   Opus 5 (1M context) · Claude Max\n\
+        \x20 Welcome back user!   Opus 5 (1M context) · Claude Max\n\
         \x20 C:\\WINDOWS\\system32\n\
         ❯ \n";
 

@@ -26,7 +26,7 @@ except Exception:
 
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 # ── G23: 팩 접두 판정 정규화 (Windows 백슬래시 미매칭 → vendor 수정 경고 무음) ──
-# 종전 `case "$FP" in "$PACK"/*)` 는 tool_input.file_path 가 `C:\Users\me\.cys\pack\hooks\x.sh`
+# 종전 `case "$FP" in "$PACK"/*)` 는 tool_input.file_path 가 `C:\Users\x\.cys\pack\hooks\x.sh`
 # 인데 PACK 이 `C:/Users/x/.cys/pack` (또는 반대)면 문자열이 안 맞아 **경고 자체가 안 났다**.
 # 정규화 후 접두 비교(프리루드 cys_path_has_prefix)로 양쪽 표기를 흡수한다.
 cys_path_has_prefix "$FP" "$PACK" || exit 0

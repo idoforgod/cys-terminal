@@ -4859,7 +4859,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             std::path::Path::new("/nonexistent-exe-dir-for-pin"),
             "/usr/bin:/bin",
             None,
-            Some("C:\\Users\\me"),
+            Some("C:\\Users\\x"),
         );
         let full_keys: std::collections::BTreeSet<&str> =
             full.iter().map(|(k, _)| k.as_str()).collect();

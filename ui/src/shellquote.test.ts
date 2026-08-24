@@ -24,7 +24,7 @@ describe("shellQuotePosix — 작은따옴표 감싸기", () => {
 
 describe("shellQuoteWindows — 큰따옴표 감싸기", () => {
   it("공백 경로", () => {
-    expect(shellQuoteWindows("C:\\Users\\a b\\img.png")).toBe('"C:\\Users\\a b\\img.png"');
+    expect(shellQuoteWindows("C:\\Users\\x y\\img.png")).toBe('"C:\\Users\\x y\\img.png"');
   });
   it("큰따옴표 포함은 \"\" 로 이스케이프", () => {
     expect(shellQuoteWindows('C:\\x"y.png')).toBe('"C:\\x""y.png"');

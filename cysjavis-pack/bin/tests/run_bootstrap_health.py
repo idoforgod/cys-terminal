@@ -450,6 +450,131 @@ def _run_ledgers(state, timeout=8.0):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 0-a. 발행 차단 게이트 (시크릿·개인정보) — ★등록 순서상 **첫 검체**
+# ═══════════════════════════════════════════════════════════════════════════
+# ★W0 배치 근거(2026-08-24):
+#   ① **fail-fast 자리.** 개인정보가 트리에 살아 있으면 그 트리는 어떤 검체가 초록이든
+#      발행할 수 없다. 그 사실을 나머지 139건보다 **먼저** 드러내는 것이 옳은 순서다.
+#   ② **싸다.** `--all` 은 추적 853파일 전수를 14초 안에 훑는다(실측 2026-08-24 · macOS).
+#      W0(베이스라인) 예산 안에서 매 런 돌 수 있다.
+#   ③ **CI 만으로는 늦다.** 이 게이트는 지금까지 CI 잡에서만 돌아 **태그를 찍은 뒤에야**
+#      적색이 됐다(#81 이 그 실증이다). `.git/hooks/pre-commit` 은 per-clone 이라 추적
+#      파일로 강제할 수 없다 — 그래서 **상시 1커맨드 게이트 안**으로 들여온다.
+#
+# ★합성 표본을 **조각으로 이어 붙이는** 이유: 이 러너 자신이 `git ls-files` 대상이다.
+#   양성 표본을 리터럴로 적으면 스캐너가 이 파일을 잡아 ⓐ가 영구 적색이 된다. 그때의
+#   유혹은 "러너를 스캐너 제외 목록에 넣는 것"인데 그것은 **판정 완화**다(러너 헤더 계약 ②).
+#   조각 이어붙이기는 그 유혹 자체를 없앤다 — ⓒ가 그 상태를 동결한다.
+_SECRET_PROBES = (
+    # (표본 id, 기대 라벨, 본문) — 라벨은 `scripts/secret-scan.sh` 의 규칙 이름 그대로다.
+    ("path", "PATH", "log: wrote /Users/%s/work/notes.md" % ("jd" + "oe")),
+    ("win-path", "WIN-PATH", "install dir = C:\\Users\\%s\\AppData\\Local\\cys" % ("jd" + "oe")),
+    # ★사각 ②의 직격 표본 — 구 PROFILE 규칙은 정슬래시 전용이라 이 줄을 통과시켰다.
+    ("profile-win", "PROFILE", "USERPROFILE=C:\\Users\\%s" % ("c" + "ys")),
+    ("profile-dot", "PROFILE", "config = ~/.claude-%s/settings.json" % ("ysfut" + "ure")),
+    ("email", "EMAIL", "contact: %s" % ("probe" + "@" + "acme-corp.dev")),
+    ("secret", "SECRET", "AWS_ACCESS_KEY_ID=%s" % ("AKIA" + "1234567890ABCDEF")),
+    # ★사각 ③의 직격 표본 — 경로 접두 없이 pane 제목 꼬리로 박힌 오너 기계 계정명.
+    ("handle", "HANDLE", "node title = cso-claude · %s" % ("cys-mac" + "book")),
+)
+
+# 음성 대조 — **승인된 더미만** 담긴 파일은 0건이어야 한다. 이 축이 없으면 "무엇에나 FIRE 하는
+# 고장난 스캐너"도 위 7건을 전부 통과시킨다(탐지력 증명이 아니라 소음 측정이 된다).
+# ★POSIX 더미도 조각으로 만든다: 형제 스캐너(`scan-pack-secrets.sh`)의 placeholder 목록은
+#   `x|you|NAME` 로 더 좁다. 더미 `user` 를 홈경로 리터럴로 적으면 **팩 발행 게이트**가 이 파일을
+#   잡는다(실측 — 이 주석의 초안이 그렇게 걸렸다). 두 게이트의 허용집합 차이도 조각화가 흡수한다.
+_SECRET_CLEAN = (
+    "posix   /Users/%s/work/notes.md\n" % "x" +
+    "posix   /Users/%s/.cys/pack\n" % "user" +
+    "win     C:\\Users\\x\\AppData\\Local\\cys\n"
+    "win     PS C:\\Users\\x> claude --dangerously-skip-permissions\n"
+    "docs    C:\\Users\\...\\AppData (문서의 생략 표기)\n"
+    "brand   cysinsight — LICENSE·README·홈페이지 URL 의 공개 브랜드다(개인정보 아님)\n"
+    "prompt  user@host:~/dev$\n"
+)
+
+
+@specimen("H-SECRET-1", "W0",
+          "발행 차단 게이트 상시화 — 산 트리 clean(853파일) + 규칙 6종 합성 변조 FIRE + 음성 대조",
+          ["#81", "개인정보-누출", "CI-only-게이트"])
+def h_secret_1():
+    """`scripts/secret-scan.sh` 를 **CI 밖으로** 꺼내 상시 게이트에 태운다.
+
+    ⓐ **산 트리** — 추적 전수(`--all`)가 exit 0 인가. 개인 홈경로(POSIX·Windows) · 개인
+       프로필 · 이메일 · 토큰 · 개인 계정 핸들이 트리에 하나도 없다는 뜻이다.
+    ⓑ **★합성 변조(계측 타당성)** — ⓐ 하나만으로는 아무것도 증명하지 못한다. 스캐너가
+       죽어 있어도(정규식 파손 · 조기 exit 0 · 파일 목록 0건) clean 트리는 똑같이 초록이다.
+       MEMORY '디버깅 계측 타당성 게이트' 3칙 ①이 금지하는 바로 그 형태다. 그래서 임시
+       파일에 **규칙별 양성 표본**을 하나씩 넣고 **그 규칙 라벨로** 잡히는지 확인한다.
+       라벨까지 보는 이유: 아무 규칙이나 걸려도 exit 1 이므로, 종료코드만 보면 규칙 6종 중
+       5종이 죽어 있어도 전건 초록이다.
+    ⓒ **자기 면제 동결** — 이 러너를 스캐너 제외 목록에 넣지 않았는가. ⓑ의 표본이 리터럴로
+       적히면 ⓐ가 적색이 되고, 그 적색을 지우는 가장 쉬운 길이 '러너를 제외 목록에 추가'다.
+       그것은 계측기가 자기 판정 대상을 줄이는 것 = 완화다(러너 헤더 계약 ②).
+
+    ★임시 파일은 **저장소 밖**(`tempfile`)에만 만들고 반드시 지운다. 사용자 HOME 무접촉."""
+    if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+        raise Skip("레포 체크아웃이 아니다(배포 팩 실행) — 발행 게이트 스캐너 부재")
+    scan = os.path.join(REPO_DIR, "scripts", "secret-scan.sh")
+    need(os.path.isfile(scan), "발행 게이트 스캐너 부재: %s" % scan)
+
+    def _scan(*args):
+        return _run([BASH, scan] + list(args), cwd=REPO_DIR, timeout=300)
+
+    def _labels(out):
+        return {ln.split("\t", 1)[0] for ln in out.splitlines() if "\t" in ln}
+
+    # ⓐ 산 트리
+    r = _scan("--all")
+    need(r.returncode == 0,
+         "산 트리에 시크릿·개인정보가 남아 있다(발행 차단) — exit=%d\n%s"
+         % (r.returncode, (r.stdout + r.stderr)[-2000:]))
+    m = re.search(r"clean \(mode=--all, (\d+) 파일\)", r.stdout)
+    need(m, "스캐너 clean 요약을 읽지 못했다(출력 계약 변경?): %r" % r.stdout[-400:])
+    scanned = int(m.group(1))
+    need(scanned >= 500,
+         "스캔 대상이 %d 파일뿐 — `git ls-files` 가 비었거나 목록이 끊겼다. '0건 발견'이 "
+         "'아무것도 안 봤다'와 구별되지 않는다(측정 실패를 통과로 접지 않는다)" % scanned)
+
+    # ⓑ 합성 변조 — 규칙별 양성 표본 + 음성 대조
+    tmp = tempfile.mkdtemp(prefix="cys-secret-probe-")   # ★저장소 밖 · HOME 무접촉
+    try:
+        fired = []
+        for pid, label, body in _SECRET_PROBES:
+            f = os.path.join(tmp, "probe-%s.txt" % pid)
+            with open(f, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(body + "\n")
+            pr = _scan(f)
+            got = _labels(pr.stdout)
+            need(pr.returncode == 1,
+                 "합성 표본 %s 가 차단되지 않았다(exit=%d) — 스캐너가 이 규칙을 못 본다: %r"
+                 % (pid, pr.returncode, body))
+            need(label in got,
+                 "합성 표본 %s 가 %s 규칙으로 잡히지 않았다(잡힌 라벨=%s) — 그 규칙이 죽었다"
+                 % (pid, label, sorted(got) or "없음"))
+            fired.append("%s→%s" % (pid, label))
+
+        clean = os.path.join(tmp, "negative-control.txt")
+        with open(clean, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_SECRET_CLEAN)
+        cr = _scan(clean)
+        need(cr.returncode == 0,
+             "음성 대조가 차단됐다 — 승인된 더미·공개 브랜드까지 잡는 스캐너는 곧 꺼진다:\n%s"
+             % (cr.stdout + cr.stderr)[-1200:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    need(not os.path.isdir(tmp), "합성 표본 임시 디렉터리가 남았다: %s" % tmp)
+
+    # ⓒ 자기 면제 동결
+    stext = _read(scan)
+    need("run_bootstrap_health" not in stext,
+         "스캐너 제외 목록에 이 러너가 등재됐다 — 계측기가 자기 판정 대상을 줄인 것이다(완화 금지)")
+
+    return ("산 트리 %d파일 clean · 합성 변조 %d/%d FIRE(%s) · 음성 대조 0건"
+            % (scanned, len(fired), len(_SECRET_PROBES), " ".join(fired)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 0. 베이스라인 (결정론 회귀 — 재감사 부채 V3)
 # ═══════════════════════════════════════════════════════════════════════════
 def _baseline(cmd, label):

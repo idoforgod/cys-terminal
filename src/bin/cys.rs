@@ -8081,7 +8081,7 @@ fn compose_directive(role: &str) -> Result<String, String> {
 /// ·리다이렉션 `2>&1 >`). 무조건 종결자로 넣으면 **오탐이 늘고**, 오탐이 늘면 ready 선언이
 /// 줄어 `Err` → 롤백 close 가 늘어난다 = 건강한 pane 이 닫히는 방향. 그래서 `>` 는
 /// **프롬프트 형태(PS 접두 또는 드라이브 경로)와 AND** 로만 참이 된다.
-/// 형태 근거는 실측 캡처다: `PS C:\Users\cys-macbook>`(docs/plans/2026-07-29-win-two-defects-plan.md:319-323)
+/// 형태 근거는 실측 캡처다: `PS C:\Users\x>`(사용자명 발행 제네릭화 — 재는 축은 이름이 아니라 `PS `·드라이브·`>` 형태다 · docs/plans/2026-07-29-win-two-defects-plan.md:319-323)
 /// · `PS C:\WINDOWS\system32\WindowsPowerShell\v1.0>`(Parallels VM master pane 실화면).
 ///
 /// ★이 술어 자신에는 `cfg(windows)` 를 두지 않는다 — 순수 형태 판정이라 진리표를 전 OS 에서
@@ -16969,7 +16969,7 @@ mod tests {
         assert!(screen_tail_is_shell_prompt("user@host:~/dev$"));
         assert!(screen_tail_is_shell_prompt("user@host:~/dev$ ")); // trim_end 후 판정
         // zsh
-        assert!(screen_tail_is_shell_prompt("cys-macbook@Mac cys-terminal-rel %"));
+        assert!(screen_tail_is_shell_prompt("user@Mac cys-terminal-rel %"));
         // root
         assert!(screen_tail_is_shell_prompt("root@box:/#"));
         // powerlevel10k · starship (H-PRED-8 ⓔ 핀 — 이 항이 사라지면 claude 잔존 ❯ 오탐 차단이 뚫린다)
@@ -16990,7 +16990,7 @@ mod tests {
         let win = |t: &str| screen_tail_is_shell_prompt_on(t, true);
         // PowerShell 기본 프롬프트(실측 화면 · docs/plans/2026-07-29-win-two-defects-plan.md:319-323)
         assert!(
-            win("PS C:\\Users\\cys-macbook> "),
+            win("PS C:\\Users\\x> "),
             "PowerShell 기본 프롬프트를 셸 프롬프트로 인식하지 못함(F4-cys-boot-launch-06)"
         );
         // 실측 캡처 — Parallels VM master pane(PROBE_RESULTS_WINDOWS.md WIN-2)
@@ -17003,7 +17003,7 @@ mod tests {
         assert!(win("PS C:\\Users\\x>>"));
         // cmd.exe — 드라이브 루트 / 하위 경로
         assert!(win("C:\\>"), "cmd.exe 드라이브 루트 프롬프트를 인식하지 못함");
-        assert!(win("C:\\Users\\cys-macbook>"));
+        assert!(win("C:\\Users\\x>"));
         assert!(win("D:\\work\\cys>"));
 
         // ── ③′ ★P1-5 신설 축: **유닉스 pane 에서는 같은 텍스트가 프롬프트가 아니다** ─────
@@ -17012,13 +17012,13 @@ mod tests {
         // 수정 전 코드에서는 아래 전항이 **참**이었다 → 이 축이 곧 적색 증명이다.
         let nix = |t: &str| screen_tail_is_shell_prompt_on(t, false);
         for t in [
-            "PS C:\\Users\\cys-macbook> ",
+            "PS C:\\Users\\x> ",
             "PS C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0>",
             "PS HKLM:\\SOFTWARE>",
             "PS>",
             "PS C:\\Users\\x>>",
             "C:\\>",
-            "C:\\Users\\cys-macbook>",
+            "C:\\Users\\x>",
             "D:\\work\\cys>",
         ] {
             assert!(
@@ -17122,7 +17122,7 @@ mod tests {
 
         // ⓑ 진짜 맨 셸 — 종전과 똑같이 참이다(오살 방지 축 무변).
         for (t, win) in [
-            ("cys-macbook@Mac cys-terminal-rel %", false),
+            ("user@Mac cys-terminal-rel %", false),
             ("user@host:~/dev$", false),
             ("root@box:/#", false),
             ("~/dev/cys-terminal-rel ❯ ", false),
@@ -17140,7 +17140,7 @@ mod tests {
             f,
             "",
             "   \n\t\n",
-            "cys-macbook@Mac cys-terminal-rel %",
+            "user@Mac cys-terminal-rel %",
             "~/dev ❯",
             "PS C:\\Users\\x>",
             "─ Claude Code ─\n❯ ",
@@ -17549,7 +17549,7 @@ mod tests {
         // ② 유닉스 등가 — 좌석 자손의 `sh -c 'claude …'` 래퍼·`vim ~/dev/claude/x.md` 가
         //    사망을 은폐하는 경우. 종결자 4종은 OS 게이트 밖이라 양 축 모두에서 막혀야 한다.
         for shell_tail in [
-            "cys-macbook@Mac cys-terminal-rel %",
+            "user@Mac cys-terminal-rel %",
             "user@host:~/dev$",
             "root@box:/#",
             "~/dev/cys-terminal-rel ❯ ",

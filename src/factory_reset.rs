@@ -3030,8 +3030,8 @@ mod tests {
         ));
         // Windows 훅 명령(역슬래시) 정규화
         assert!(command_points_into_pack_root(
-            "bash \"C:\\Users\\u\\.cys\\pack-dept-d1\\hooks\\a.sh\"",
-            Path::new("C:\\Users\\u\\.cys\\pack-dept-d1")
+            "bash \"C:\\Users\\x\\.cys\\pack-dept-d1\\hooks\\a.sh\"",
+            Path::new("C:\\Users\\x\\.cys\\pack-dept-d1")
         ));
         // 형제 팩 오판 금지: d1 판정이 d10 을 잡으면 사용자/타 부서 훅 오삭제다
         assert!(!command_points_into_pack_root("sh /home/u/.cys/pack-dept-d10/hooks/a.sh", root));

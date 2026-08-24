@@ -35,7 +35,7 @@
 | 8 | `close-surface` (자식 트리 종료) | PASS | round1~3: `closed surface:1 (descendants killed)` |
 | 9 | `AITERM_SHELL=cmd.exe` 셸 교체 | PASS | `win-test3-result.txt` surface list: `cmd-shell` / `pid=14196` / `exited=false` |
 | 10 | 셸 자식 프로세스 생존 확인 | PASS | `win-test4-result.txt` tasklist: `cmd.exe`·`aitermd.exe` 목록 |
-| 11 | `aiterm list` (surface 목록) | PASS | `win-test3-result.txt`: `surface:1 pid=14196 exited=false cmd-shell C:\Users\cys` |
+| 11 | `aiterm list` (surface 목록) | PASS | `win-test3-result.txt`: `surface:1 pid=14196 exited=false cmd-shell C:\Users\x` |
 
 추가로 커밋 `6ae8d66`는 같은 변경에서 **Feed 영속화**(`feed.jsonl` append + 기동 시 복원,
 Windows는 `%LOCALAPPDATA%\aiterm` 하위 — `state.rs::state_dir`)와 `event.seq` 단조 유지를

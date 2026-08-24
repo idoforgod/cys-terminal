@@ -783,7 +783,7 @@ pub fn merge_awakening_hooks_into_personal_profiles() -> Vec<(String, Vec<String
 /// ★W3(A9): 구현은 `hook_command_for` 단일 규약에 위임한다 — 종전엔 이 함수와
 /// `role_bootstrap_hook_command` 가 같은 OS 분기를 **두 벌** 갖고 있었다(RC1 사본).
 pub fn session_start_hook_command(pack_dir: &Path) -> String {
-    // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\John Doe\.cys\pack\...) 대응 — Windows만
+    // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\x y\.cys\pack\...) 대응 — Windows만
     // quote로 감싼다. unix는 **무변경**(기존 install에 등록된 미quote 문자열과 already-매칭 유지 —
     // quote 추가 시 불일치→매 기동 중복 append 회귀). 역슬래시→정슬래시 정규화(RC-3)도 그 함수 소관.
     hook_command_for(pack_dir, "session-start.sh")
