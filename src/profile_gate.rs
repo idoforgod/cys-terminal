@@ -104,7 +104,7 @@ pub fn observe_only_from(raw: Option<&str>) -> bool {
 /// 프로필 dir 이 사는 **뿌리 두 곳**. 뿌리마다 이름 규칙이 다르다(홈은 점 접두, `~/.cys` 는 아님).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileRoot {
-    /// `$HOME` 직하 — `~/.claude`, `~/.claude-2`, `~/.claude-cysinsight` …
+    /// `$HOME` 직하 — `~/.claude`, `~/.claude-2`, `~/.claude-work` …
     Home,
     /// `$HOME/.cys` 직하 — `~/.cys/claude`, `~/.cys/claude-default-dept-1` …
     CysHome,
@@ -976,9 +976,17 @@ mod tests {
     // ⑥ 열거 규칙 — 정본 하나(재구현 금지)
     // ─────────────────────────────────────────────────────────────────────
 
+    /// ★검체 이름은 **일반화된 예시**다(2026-08-24 · PUBLIC 발행 게이트).
+    ///   이 규칙은 접두 기반(`.claude` 정확일치 ∨ `.claude-` 접두)이라 접미 문자열의 *내용*을
+    ///   전혀 보지 않는다. 그래서 검체가 재는 것은 이름 그 자체가 아니라 **접미 모양 다섯 종**
+    ///   이고, 다섯이 그대로 남아 있는 한 시험 대상은 한 톨도 줄지 않는다:
+    ///   ① 접미 없음(정확일치) ② 숫자 ③ 낱말 ④ 하이픈 다단(`-2-dept-a`) ⑤ **빈 접미**(`.claude-`).
+    ///   ⑤ 는 `starts_with(".claude-")` 가 `.claude` 정확일치 가지 없이도 성립하는 경계라
+    ///   **판별력이므로 절대 빼지 않는다**. 실제 개인 프로필 이름으로 되돌리지 마라 —
+    ///   판별력은 늘지 않고 개인 설정만 공개된다.
     #[test]
     fn profile_dir_name_rule_matches_the_seed_known_behavior() {
-        for n in [".claude", ".claude-2", ".claude-cysinsight", ".claude-2-dept-pub", ".claude-"] {
+        for n in [".claude", ".claude-2", ".claude-work", ".claude-2-dept-a", ".claude-"] {
             assert!(is_profile_dir_name(ProfileRoot::Home, n), "홈 프로필 누락: {n}");
         }
         for n in [".claude.json", ".claudia", ".cys", "claude", "", ".clau"] {

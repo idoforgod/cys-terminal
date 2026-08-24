@@ -1264,6 +1264,18 @@ fn apply_patch(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// 실측 캡처 전사본. 소비자: 아래 테스트 · 뒤 단위(U-13 진리표)의 공유 사료.
+///
+/// ★작업경로 자리표시자 규약(2026-08-24 · PUBLIC 발행 게이트 `scripts/secret-scan.sh`).
+///   화면에 실제로 찍히는 것은 **그 기계의 홈 경로**다. 원측정 대장은 그것을 이미
+///   `<cwd>` 로 봉해 두었다(`docs/evidence/probe-2026-08-23-first-run-gates.json` §screens
+///   `folder-trust.text` = `"Accessing workspace: <cwd>\n…"`). 그러므로 여기서 경로 자리를
+///   `<cwd>` 로 두는 것은 전사를 **고치는** 것이 아니라 대장 문면으로 **되돌리는** 것이다.
+///   관문이 아닌 대조군 화면은 대장에 항목이 없는 합성 픽스처이므로, "절대경로가 한 줄
+///   찍혀 있다" 는 화면 모양만 지키면 된다 — 스캐너가 등재한 더미 username 을 쓴다
+///   (`secret-scan.sh` `dummy_user_re` · 리포 관례 `/Users/x/` — `ui/src/deptlabel.test.ts:33`).
+///   ★어느 쪽이든 경로 문자열은 **판정에 쓰이지 않는다**: 관문 성립은 `needles`(질문형 문면)
+///   ∧ `widget`(위젯 서명)뿐이고, 어느 관문의 어느 항목에도 경로가 없다. 실경로로 되돌려도
+///   식별력은 한 톨도 늘지 않고 발행만 막힌다.
 pub mod fixtures {
     pub const THEME: &str = "Welcome to Claude Code v2.1.241\n\
         Let's get started.\n\n\
@@ -1282,7 +1294,7 @@ pub mod fixtures {
         https://claude.com/cai/oauth/authorize?x=1\n\
         Paste code here if prompted >\n";
 
-    pub const FOLDER_TRUST: &str = "Accessing workspace: /Users/me/work\n\
+    pub const FOLDER_TRUST: &str = "Accessing workspace: <cwd>\n\
         Quick safety check: Is this a project you created or one you trust?\n\
         ❯ 1. Yes, I trust this folder\n\
         \x20 2. No, exit\n\
@@ -1319,7 +1331,7 @@ pub mod fixtures {
     /// 화면을 `관문 보류: 온보딩 · 테마 선택(id=theme)` 으로 잡아 rc 78 을 냈다.
     pub const HEALTHY_WELCOME_BOX: &str = "✻ Welcome to Claude Code!\n\
         \x20 /help for help, /status for your current setup\n\
-        \x20 cwd: /Users/me/work\n\
+        \x20 cwd: /Users/x/work\n\
         ❯ \n";
 
     /// ★P3-0 픽스처 — **살아 있는** Claude Code TUI. 꼬리가 `❯`(입력 프롬프트 그 자체)이고
@@ -1330,7 +1342,7 @@ pub mod fixtures {
     /// 프롬프트로 읽히지만, 화면은 명백히 TUI 를 그리고 있다.
     pub const LIVE_TUI_AT_PROMPT: &str = "─ Claude Code ─\n\
         \x20 Welcome back 미래학자!   Opus 5 (1M context) · Claude Max\n\
-        \x20 /Users/me/work\n\
+        \x20 /Users/x/work\n\
         ? for shortcuts\n\
         \x20 …43% context left\n\
         ❯ \n";

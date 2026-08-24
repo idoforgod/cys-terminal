@@ -164,6 +164,20 @@ def _check_file(evdir, name):
 
 
 # ── 자기검증(합성 표본) ──────────────────────────────────────────────────────
+
+# ★검체용 **가짜** 자격증명 — 조각으로 두고 런타임에 조립한다(2026-08-24).
+#
+#   왜 리터럴로 두지 않는가: 발행 게이트 `scripts/secret-scan.sh` 는 *정적 패턴 매칭*이라
+#   소스에 통짜로 박힌 `sk-ant-…` 를 진짜 유출과 구별할 수 없다. 그리고 그것이 옳다 —
+#   형태로 막지 않으면 진짜가 새는 날 구별할 방법이 없다. 그래서 **스캐너가 보는 형태**만
+#   피하고 **검체가 보는 값**은 종전과 한 글자도 다르지 않게 둔다.
+#
+#   왜 지우면 안 되는가: 이 값은 아래 `_mutants()` 의 "자격증명 유출" 변형이 쓰는 **양성
+#   표본**이다. `SECRET_PATS` 가 이것을 못 잡으면 `--self-test` 가 그 라벨을 blind 로 올린다.
+#   지우면 자격증명 탐지기가 **한 번도 시험되지 않은 채** 초록이 된다(계측기의 자살).
+#   조립이 깨져도 같은 검체가 즉시 적색이므로, 이 상수는 자기 자신의 파수꾼이기도 하다.
+_FAKE_API_KEY = "sk-" + "ant-" + "api03-AAAAAAAABBBBBBBB"
+
 _GOOD = {
     "schema": SCHEMA, "id": "probe-2026-01-02-sample", "title": "합성 표본",
     "measured_on": "2026-01-02", "tool": "self-test", "platform": "tmp",
@@ -203,13 +217,22 @@ def _mutants():
         ("파일명 규약 위반", lambda: ({"aaa.json": _GOOD}, _README + "| `aaa.json` | x | y |\n")),
         ("자격증명 유출",
          lambda: ({"probe-2026-01-02-sample.json":
-                   wr(_GOOD, tool="sk-ant-api03-AAAAAAAABBBBBBBB")}, _README)),
+                   wr(_GOOD, tool=_FAKE_API_KEY)}, _README)),
+        # ★자리표시자 선택 근거(2026-08-24) — 두 검체 모두 `secret-scan.sh` 가 **자기 소스에서**
+        #   오탐하지 않는 형태를 쓰되, 여기서 시험하는 검사 축(HOME_PATS·EMAIL_RE)은 그대로다.
+        #   · `/Users/x/…` = 스캐너가 `dummy_user_re` 에 등재한 더미 username(리포 관례 ·
+        #     `ui/src/deptlabel.test.ts:33`). 이쪽 HOME_PATS 에는 더미 예외가 없으므로
+        #     (`(?!<)` 뿐) 종전과 **똑같이** 잡힌다.
+        #   · `example.invalid` = RFC 2606 예약 TLD(영원히 해석되지 않는다). 스캐너의 TLD 목록
+        #     (com|net|org|io|dev) 밖이고, 이쪽 허용목록(@example.com·@anthropic.com·@claude.com)
+        #     안에는 **없다** — 그래서 여전히 위반으로 잡혀야 한다.
+        #   실주소·실경로로 되돌리지 마라. 검사 능력은 한 톨도 늘지 않고 발행만 막힌다.
         ("홈 절대경로",
          lambda: ({"probe-2026-01-02-sample.json":
-                   wr(_GOOD, repro="cd /Users/someone/dev && run")}, _README)),
+                   wr(_GOOD, repro="cd /Users/x/dev && run")}, _README)),
         ("개인 이메일",
          lambda: ({"probe-2026-01-02-sample.json":
-                   wr(_GOOD, provenance="측정자 someone@gmail.com")}, _README)),
+                   wr(_GOOD, provenance="측정자 someone@example.invalid")}, _README)),
         ("보존 위반 — 대장에 있는데 파일이 없다", lambda: ({}, _README)),
         ("보존 위반 — 파일이 있는데 대장에 없다",
          lambda: ({"probe-2026-01-02-sample.json": _GOOD,
