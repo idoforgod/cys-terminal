@@ -40,6 +40,19 @@
 //! 그 전제가 실재하지 않으면 이 모듈은 착지해서는 안 된다 — `tests::u11_gate_pending_branch_exists`
 //! 가 그 순서를 **코드로** 강제한다(사람 규율이 아니라).
 //!
+//! ## ★관문 축의 생애 창 — `Site` 마다 비용 부호가 다르다 (P4-7 · 2026-08-24)
+//!
+//! 관문 축은 두 자리에서 같은 코퍼스를 쓰지만 **틀리는 비용이 반대 방향**이다.
+//!
+//! | 자리 | 오탐 | 미탐 | 창 |
+//! |---|---|---|---|
+//! | [`Site::Boot`] | 영구 부트 라이브락(사람도 못 푼다) | 관문 창에 디렉티브 주입(면책 창이면 좌석 사망) | **상수로 열림** — 여기서는 관문을 반드시 잡는다 |
+//! | [`Site::Reinject`] | **영구 미주입** — pack-update 가 그 노드에 영원히 도달하지 않는다 | 이미 통과한 관문(지금 화면은 역사다) | **닫힘** — 단, 관문이 지나갔음이 화면으로 증명될 때만 |
+//!
+//! 종전에는 이 축에 창이 아예 없어서, 살아 있는 노드의 scrollback 꼬리에 부트 때 통과한 관문
+//! 문면이 남아 있기만 하면 재주입이 **영구 거부**됐다(파괴는 아니지만 영구 미주입도 결함이다).
+//! 판정기는 [`gate_axis_window_closed`] 하나이고, 부트 경로는 그 안에서 상수로 열린다.
+//!
 //! ## 롤백 스위치 — **마스터 하나 + 축 노브 하나**
 //!
 //! | 스위치 | 값 | 되돌아가는 범위 |
@@ -167,10 +180,51 @@ pub struct Observed<'a> {
     /// 살아있는 Claude Code TUI 의 **입력 프롬프트 그 자체**다. 즉 건강한 pane 의 꼬리가
     /// 일상적으로 `❯` 이고, 그 AND 는 **건강한 pane 에서 밸브를 상시 차단**했다.
     ///
-    /// 【새 판별자의 방향】 `bare_shell` 은 "꼬리가 셸 프롬프트 **이면서** 화면에 TUI 렌더
-    /// 증거가 없다" 로 계산된다(구현·근거는 CLI 의 `screen_is_bare_shell_on`). 이것은 종전
-    /// 축보다 **참이 덜 되므로** 밸브의 재현율은 오직 올라간다. 남는 미탐(프레임을 그린 뒤
-    /// 즉사한 경우)의 귀결은 마커 축이 따로 막고, 최악이어도 U-11 의 보류(좌석 보존)다.
+    /// 【새 판별자의 방향】 `bare_shell` 은
+    /// `꼬리가 셸 프롬프트 ∧ (꼬리에 사망 문면 ∨ ¬화면에 TUI 렌더 증거)` 로 계산된다
+    /// (구현·근거는 CLI 의 `screen_is_bare_shell_on`). 이것은 종전 축(끝문자 4종 단독)보다
+    /// **참이 덜 되므로** 밸브의 재현율은 오직 올라간다.
+    ///
+    /// 【★렌더 증거 축의 실측 정의 — P4-2 · 2026-08-24】 '렌더 증거'는 **박스 문자 1개**가
+    /// 아니라 ① 한 줄 안의 **연속 길이 ≥ `TUI_FRAME_RUN_MIN`**(=8 · '프레임 자') 또는
+    /// ② 대화형 위젯 문면(`TUI_RENDER_MARKS` — `Enter to confirm` 등)이다. 종전 정의에서는
+    /// p10k 프롬프트(`╭─`/`╰─❯`)·`git log --graph` 괘선·`tree` 잔상 **한 조각**이 렌더 증거로
+    /// 세어져 밸브의 AND 항이 영구 무장해제됐다(밸브가 `agent_alive` 단독으로 퇴화).
+    /// 축이 좁아졌으므로 `bare_shell` 은 **참이 더 자주** 되고 밸브는 **더 자주 닫힌다** —
+    /// 판정이 느슨해지는 방향이 아니라 조여지는 방향이다.
+    ///
+    /// 【★남는 미탐의 실제 귀결 — 2026-08-24 적대 리뷰어 격리 실행으로 정정(P4-1)】
+    /// 이 자리에는 종전에 이렇게 적혀 있었다:
+    ///   "남는 미탐(프레임을 그린 뒤 즉사한 경우)의 귀결은 마커 축이 따로 막고, 최악이어도
+    ///    U-11 의 보류(좌석 보존)다"
+    /// **그 문장은 거짓이다.** [`positive_evidence`] 의 사다리에서 밸브는 **첫 항**이고
+    /// `return` 으로 **조기 종료**한다 —
+    /// `if o.agent_alive == Some(true) && bare_shell_ok { return Some(Evidence::Valve); }`.
+    /// 밸브가 열리는 순간 마커 축은 **한 줄도 평가되지 않으므로**, "마커 축이 따로 막는다" 는
+    /// 성립할 수 없다.
+    ///
+    /// 반례(★P4-2 이후 실측으로 **이사**한 화면): 화면이
+    /// `"╭──────────────╮\n│ Claude Code  │\n╰──────────────╯\n bye\nuser@mac ~ %"` 이고
+    /// `agent_alive=true` 이면 `bare_shell` 은 **프레임 자**(한 줄 연속 런 16 ≥ 8)를 렌더
+    /// 증거로 보고 `false` 를 내므로 **밸브가 열린다**. 그때 이 화면은 마커 축에서 아무 증거도
+    /// 못 내는 화면인데도 판정은 `Verdict::NotYet`(보류)이 아니라 **`Verdict::Ready` = 주입**
+    /// 이다 — 즉 프레임 자를 그린 뒤 즉사한 셸에 디렉티브가 들어간다. 축소하지 않고 그대로
+    /// 적는다: **이 경로의 미탐 비용은 좌석 보존이 아니라 죽은 셸 주입이다.**
+    ///
+    /// ★이 반례는 **지워진 것이 아니라 옮겨졌다.** 종전 반례는
+    /// `"─ Claude Code ─\n bye\nuser@mac ~ %"`(장식 `─` 한 조각)였는데, P4-2 가 렌더 증거 축을
+    /// 연속 길이로 좁힌 뒤 그 화면의 `bare_shell` 은 `false` → **`true`** 로 뒤집혔다(실측 ·
+    /// 최대 연속 런 1 < 8). 즉 그 화면에서 밸브는 이제 **닫힌다**. 미탐의 폭이 그만큼 좁아졌고,
+    /// 새 경계는 검체 ②′ 가 박제한다.
+    ///
+    /// 이 사실을 사람 주석이 아니라 기계로 박제한 것이
+    /// `tests::valve_short_circuits_the_ladder_so_the_marker_axis_is_never_consulted` 다
+    /// (다음 감사자가 주석을 믿고 이 경로를 건너뛰지 못하게 한다). 술어 자체
+    /// (`screen_is_bare_shell` — CLI 소유)의 수리는 **완료됐다**(P4-2 · `TUI_FRAME_RUN_MIN`
+    /// 연속 길이 + `BARE_SHELL_DEATH_TAIL_LINES` 꼬리 사망 문면 OR). 남는 미탐은 **프레임 자를
+    /// 그린 뒤 즉사** 한 부류 하나이고, 손으로 박는 이 필드가 CLI 술어와 다시 갈리지 않도록
+    /// `tests::hand_stamped_bare_shell_is_rederived_from_the_cli_predicate_source` 가 축 상수를
+    /// CLI 소스에서 재유도해 대조한다.
     pub bare_shell: Option<bool>,
     /// 시간 폴백 시점을 지났는가. **벽시계 판정은 호출부가 한다** — 이 모듈은 시계를 읽지 않는다.
     pub time_fallback_reached: bool,
@@ -239,7 +293,104 @@ fn gate_on_screen<'a>(o: &Observed<'a>) -> Option<&'a Gate> {
         // 롤백: U-13 착지 이전 판정 = 관문 축 없음.
         return None;
     }
-    first_run_gates::identify(o.gates, o.screen)
+    let g = first_run_gates::identify(o.gates, o.screen)?;
+    if gate_axis_window_closed(o, g) {
+        return None;
+    }
+    Some(g)
+}
+
+/// ★관문 축의 **생애 창**(P4-7 · 2026-08-24 적대 리뷰어 격리 실행).
+///
+/// 종전에는 이 축에 창이 **없었다** — `gate_on_screen` 이 보는 값은 `legacy_v1` 하나뿐이라,
+/// 화면에 관문 문면이 있기만 하면 그 좌석이 어느 생애 단계에 있든 영원히 보류였다.
+/// 형제 축(`inject_guard::decide`)은 이미 `awakened` 래치로 창을 닫고, 데몬 스캐너
+/// (`governance::gate_scan_open`)도 `!awakened ∧ 나이 상한` 으로 닫는데 이 축만 열려 있었다.
+///
+/// ## 왜 `Site` 마다 다르게 다뤄야 하는가 — **비용 부호가 반대다**
+///
+/// | 자리 | 오탐(관문이 아닌데 잡음) | 미탐(관문인데 놓침) | 결론 |
+/// |---|---|---|---|
+/// | [`Site::Boot`] | **영구 부트 라이브락** — 화면에 통과시킬 관문이 실제로는 없으므로 사람도 못 푼다 | **관문 창에 디렉티브 주입** — 면책 창이면 그 Return 이 좌석을 죽인다 | 둘 다 비싸다 → **창을 상수로 연다** |
+/// | [`Site::Reinject`] (각성 이후) | **영구 미주입** — pack-update 재주입이 그 노드에 영원히 도달하지 않는다 | **이미 지나간 관문** — 그 관문은 벌써 통과됐고 지금 화면은 역사다 | 부호가 기운다 → **창을 닫는다** |
+///
+/// 그래서 부트 경로의 판정은 **한 톨도 약해지지 않는다**(아래 `Site::Boot => false`).
+/// 창이 닫히는 것은 재주입 경로에서, 그것도 **관문이 이미 지나갔음이 화면으로 증명될 때**뿐이다.
+///
+/// ★이상적인 축은 형제 축과 같은 `awakened` 래치다. 그것은 [`Observed`] 에 관측 필드를
+///   하나 더 요구하고, 그 필드를 채우는 곳은 CLI(`cys.rs`)의 두 호출부다 — **이 단위의 반경
+///   밖**이라 배선하지 않았다(인계 위험으로 보고). 여기서는 이미 넘어온 관측값만으로 같은
+///   방향의 창을 세운다.
+fn gate_axis_window_closed(o: &Observed, g: &Gate) -> bool {
+    match o.site {
+        // 부트 창은 **상수로 열려 있다**. 이 자리의 미탐은 '관문에 주입' 이고, 그것이 이
+        // 캠페인이 막으려는 실사고 그 자체다.
+        Site::Boot => false,
+        Site::Reinject => gate_block_left_behind(g, o.screen, marker_of(o)),
+    }
+}
+
+/// 이 관문 블록이 화면에서 **이미 지나갔는가** — 관문 문면이 화면의 **전경이 아님**을 잰다.
+///
+/// ★근거: 관문이 떠 있는 동안 마커(`❯`)는 그 관문의 **선택 커서**이고, 커서 뒤에는 아직 고르지
+///   않은 선택지·확인 줄이 남아 있다. 관문을 통과해 노드가 앞으로 나아가면 그 뒤에 **자기 입력
+///   프롬프트**가 다시 그려지고, 그 프롬프트는 화면의 **맨 끝**에 서서 입력을 기다린다.
+///   즉 "지나갔다"의 실측 서명은 두 가지가 **동시에** 참인 것이다 —
+///     ① 마커 뒤에 아무 문면도 없다(그 프롬프트가 지금 화면의 전경이다), 그리고
+///     ② 관문 블록의 끝이 그 마커보다 앞이다(블록은 그 프롬프트 위쪽의 역사다).
+///
+/// ## ★무엇이 틀렸었는가 — 커서 위치를 '역사'로 오독했다 (P4-11 · 2026-08-24 리뷰어 2인)
+///
+/// 첫 판(P4-7)은 축 ②만 봤다. 그런데 블록의 끝은 "이 화면에서 관측된 needle·위젯 문면 중 가장
+/// 뒤" 이고, `theme` 의 위젯 서명은 선택지 **1·2**(`Auto (match terminal)`·`Dark mode`)뿐이며
+/// `login-method` 도 마찬가지다. 그래서 **사람이 커서를 3번째 이후 항목에 두면**(`3. Light mode`
+/// · `3. 3rd-party platform`) 마커가 위젯 문면보다 뒤에 오고, 술어는 **떠 있는 관문**을
+/// '지나갔다'로 읽었다 → 재주입 창이 열리고 **관문 창에 키가 나간다**(U-13 결함의 부분 재개봉).
+///
+/// 리뷰어가 권한 대안(블록 끝의 기준을 `needles` 만으로)은 이 축에서 **반대로 움직인다**:
+/// needle 은 관문의 질문 줄이라 언제나 선택지보다 **위**에 있고, 그러면 커서가 1번째 항목에만
+/// 있어도 마커가 블록 끝보다 뒤가 되어 관문 6화면 전부가 '지나갔다'로 접힌다. 그래서 채택하지
+/// 않고, 리뷰어가 함께 제시한 둘째 방향 — **관문 문면이 화면 전경인가** — 을 축 ①로 세운다.
+/// 커서가 어디에 있든 그 뒤에 선택지가 남아 있으면 관문은 전경이고, 창은 열리지 않는다.
+///
+/// 판정은 [`first_run_gates::flatten`] 공간 하나에서만 한다 — 정규화 공간의 매칭은 평탄화
+/// 공간의 매칭을 함의하므로(공백만 더 지운다) 평탄화 공간이 상위집합이고, 공간을 둘로 쓰면
+/// 인덱스 비교의 의미가 갈린다. 평탄화 공간에서 "마커 뒤가 비었다" 는 **공백만 남았다**와 같은
+/// 뜻이다(평탄화가 공백을 전부 지운다) — 프롬프트 뒤의 개행·패딩은 전경 판정을 바꾸지 않는다.
+///
+/// **fail-closed**: 마커가 미정의(codex 등)거나 화면에 없거나 관문 문면을 평탄화 공간에서
+/// 찾지 못하면 창을 **닫지 않는다**(= 종전대로 관문 보류). 판정 불가는 통과가 아니다.
+/// 두 축을 AND 로 묶은 것도 같은 방향이다 — 축이 늘수록 창은 덜 열린다.
+fn gate_block_left_behind(g: &Gate, screen: &str, marker: Option<&str>) -> bool {
+    let Some(m) = marker else {
+        return false;
+    };
+    let fm = first_run_gates::flatten(m);
+    if fm.is_empty() {
+        return false;
+    }
+    let fs = first_run_gates::flatten(screen);
+    let Some(marker_last) = fs.rfind(fm.as_str()) else {
+        return false;
+    };
+    // ★축 ① — 마커 뒤에 남은 문면이 있으면 그 마커는 **선택 커서**이지 대기 중인 입력
+    //   프롬프트가 아니다. 관문은 아직 화면의 전경이므로 창을 닫지 않는다(P4-11).
+    if !fs[marker_last + fm.len()..].is_empty() {
+        return false;
+    }
+    // 축 ② — 관문 블록의 끝 = 이 화면에서 관측된 needle·위젯 문면 중 **가장 뒤**의 끝 위치.
+    let mut block_end: Option<usize> = None;
+    for s in g.needles.iter().chain(g.widget.iter()) {
+        let f = first_run_gates::flatten(s);
+        if f.is_empty() {
+            continue;
+        }
+        if let Some(i) = fs.rfind(f.as_str()) {
+            let end = i + f.len();
+            block_end = Some(block_end.map_or(end, |b| b.max(end)));
+        }
+    }
+    block_end.is_some_and(|b| marker_last >= b)
 }
 
 /// 어댑터 마커의 정규화. 빈 문자열은 **미정의와 동일**하게 다룬다.
@@ -297,11 +448,15 @@ fn positive_evidence(o: &Observed) -> Option<Evidence> {
             //   `❯` 는 살아있는 Claude Code TUI 의 **입력 프롬프트 그 자체**다. 그래서 그 AND 는
             //   건강한 pane(꼬리 `❯`)에서 밸브를 **상시 차단**했고, 밸브의 존재 이유(영구 오부정
             //   차단)가 통째로 사문화됐다.
-            //   수리는 **밸브 전용 술어를 분리**하는 것이다(`Observed::bare_shell` — "꼬리가
-            //   프롬프트 **이면서** 화면에 TUI 렌더 증거가 없다"). 축의 비용 부호가 반대이기
-            //   때문이다: ready 판정은 정밀도가, 밸브는 **재현율**이 필요하다. 새 술어는 종전
-            //   축보다 참이 **덜** 되므로 밸브 재현율은 오직 올라가고, 오살 방향으로는 열리지
-            //   않는다(맨 셸이면 여전히 닫힌다).
+            //   수리는 **밸브 전용 술어를 분리**하는 것이다([`Observed::bare_shell`] —
+            //   `꼬리가 프롬프트 ∧ (꼬리에 사망 문면 ∨ ¬화면에 TUI 렌더 증거)`). 축의 비용
+            //   부호가 반대이기 때문이다: ready 판정은 정밀도가, 밸브는 **재현율**이 필요하다.
+            //   새 술어는 종전 축보다 참이 **덜** 되므로 밸브 재현율은 오직 올라가고, 오살
+            //   방향으로는 열리지 않는다(맨 셸이면 여전히 닫힌다).
+            //   ★(P4-2 · 2026-08-24) 그 '렌더 증거' 는 박스 문자 **1개**가 아니라 한 줄 안의
+            //   **연속 길이 ≥ `TUI_FRAME_RUN_MIN`** 또는 위젯 문면이다 — 종전 정의에서는 p10k
+            //   프롬프트 장식 한 조각이 밸브의 AND 를 영구 무장해제했다. 축이 좁아진 방향은
+            //   '주입 억제' 라 여기 판정을 느슨하게 만들지 않는다.
             if o.agent_alive == Some(true) && bare_shell_ok {
                 return Some(Evidence::Valve);
             }
@@ -456,20 +611,47 @@ mod tests {
             "관문 코퍼스가 **정상 화면**에 걸린다 — 이 상태로 AND 항을 켜면 건강한 부트가 전부 \
              보류로 접힌다(코퍼스 needle 이 질문형이 아닌 것이 원인일 수 있다: 정본 소유는 U-12)"
         );
-        // ★P3-0: 이 화면의 꼬리는 `❯` 라 '끝문자 4종' 술어로는 셸 프롬프트로 읽힌다. 그런데
-        //   화면은 명백히 TUI 를 그리고 있으므로(`─ Claude Code ─`) 맨 셸이 아니다 →
-        //   **밸브가 열려야 한다**. 종전에는 이 자리에서 밸브가 상시 차단돼 마커 델타로만
-        //   통과했다(밸브가 사문화된 상태). 두 경로 모두 ready 라는 사실도 함께 박제한다.
+        // ★★P4-2 핀 이사(2026-08-24 · master 지시 밖에서 워커가 실측으로 발견) —
+        //   **이 자리의 밸브 주장은 더 이상 이 화면에서 성립하지 않는다.**
+        //
+        //   종전 서사(P3-0): "이 화면의 꼬리는 `❯` 라 끝문자 4종 술어로는 셸 프롬프트로
+        //   읽힌다. 그런데 화면은 명백히 TUI 를 그리고 있으므로(`─ Claude Code ─`) 맨 셸이
+        //   아니다 → **밸브가 열려야 한다**."
+        //
+        //   **뒷문장이 거짓이 됐다.** P4-2 가 렌더 증거를 '박스 문자 1개' 에서 **한 줄 안의
+        //   연속 길이 ≥ `TUI_FRAME_RUN_MIN`(=8)** 로 좁혔는데, 이 실측 배너의 `─ Claude Code ─`
+        //   는 연속 런이 **1** 이다(프레임 자가 아니라 장식이다). 위젯 문면(`for shortcuts` ·
+        //   `Enter to confirm` …)도 이 화면에는 없다. 그래서 CLI `screen_is_bare_shell_on` 의
+        //   새 산출은 이 화면에서 **`true`** 다(격리 실행 실측 · unix·windows 두 축 동일).
+        //
+        //   → 픽스처 문자열은 **Windows 실기 캡처 전사본이라 한 글자도 바꾸지 않는다**(고쳐
+        //     맞추면 실측이 아니라 창작이다). 손으로 박던 값만 **실제 산출**로 정정하고,
+        //     밸브 주장은 삭제가 아니라 `live_tui_whose_tail_is_the_input_caret_still_opens_the_valve`
+        //     로 **이사**했다 — 그 검체의 픽스처(`fixtures::LIVE_TUI_AT_PROMPT`)는 `? for
+        //     shortcuts` 위젯 문면을 들고 있어 새 축에서도 렌더 증거가 남기 때문이다.
+        //     (재유도 대조는 `hand_stamped_bare_shell_is_rederived_from_the_cli_predicate_source`.)
         let mut o = obs(HEALTHY_BANNER, HEALTHY_BANNER, &gates);
         o.agent_alive = Some(true);
         o.tail_is_shell_prompt = Some(true);
-        o.bare_shell = Some(false);
+        o.bare_shell = Some(true); // ★CLI 새 술어의 실제 산출 — 손으로 고른 값이 아니다
         assert_eq!(
             judge(&o),
             Verdict::Ready {
-                evidence: Evidence::Valve
+                evidence: Evidence::MarkerDelta
             },
-            "살아있는 TUI(꼬리 `❯`)에서 밸브가 닫혔다 — 영구 오부정 차단 장치가 사문화된다"
+            "건강한 부트가 ready 를 잃었다 — 밸브가 닫혀도 마커 델타 경로는 남아야 한다"
+        );
+        // ★그리고 이것이 P4-2 가 **실제로 치른 비용**이다: 이 실측 배너에서 밸브는 닫힌다.
+        //   마커 축을 끄면 통과 경로가 하나도 남지 않는다 — 밸브가 닫혔다는 사실의 in-band
+        //   증명이자, 이 화면에서 밸브가 다시 열리면(잔상 무장해제 복귀) 적색이 나는 경계다.
+        let mut valve_only = o.clone();
+        valve_only.marker = None;
+        valve_only.time_fallback_reached = true;
+        assert_eq!(
+            judge(&valve_only),
+            Verdict::NotYet,
+            "P4-2 의 비용 경계가 바뀌었다 — 이 배너에서 밸브가 다시 열린다면 장식 한 조각으로 \
+             밸브가 무장해제되던 상태로 되돌아간 것이다"
         );
         // 커널 사실이 없을 때의 종전 통과 경로(마커 델타)는 그대로다.
         o.agent_alive = Some(false);
@@ -518,6 +700,415 @@ mod tests {
         // 미관측도 열지 않는다('부재 ≠ 부정').
         o.bare_shell = None;
         assert_eq!(judge(&o), Verdict::NotYet);
+    }
+
+    /// ★P4-1 회귀 박제(2026-08-24 적대 리뷰어 격리 실행) — **밸브가 열리면 마커 축은 평가되지
+    /// 않는다.** 그러므로 "남는 미탐은 마커 축이 따로 막고 최악이어도 보류다" 라는 종전 주석은
+    /// 성립할 수 없고, 실제 귀결은 **`Ready` = 주입**이다.
+    ///
+    /// 이 검체가 없으면 다음 감사자는 주석을 믿고 이 경로를 건너뛴다 — 그것이 이 항목의 본질이다.
+    ///
+    /// ★★이 검체는 **바람직한 동작이 아니라 현행 결함을 있는 그대로 특성화**한다
+    /// (characterization pin).
+    ///
+    /// 【★이사 완료 — P4-2 · 2026-08-24】 이 자리에는 종전에 이렇게 적혀 있었다:
+    ///   "밸브 술어 자체(`screen_is_bare_shell` — CLI 소유)를 고치는 **다음 웨이브**에서는
+    ///    ②의 기대값이 `Ready` 에서 보류로 바뀌어야 하며, 그때 이 핀은 삭제가 아니라 이사다"
+    /// 그 웨이브가 **왔다.** 렌더 증거 축이 '박스 문자 1개' 에서 한 줄 안의 **연속 길이 ≥
+    /// `TUI_FRAME_RUN_MIN`(=8)** 으로 좁혀졌고, 꼬리 사망 문면 OR 축
+    /// (`BARE_SHELL_DEATH_TAIL_LINES`)이 더해졌다. 그래서 **핀을 지우지 않고 옮겼다**:
+    ///   · ②의 화면이 잔상 한 조각(`─ Claude Code ─` · 연속 런 1)에서 **프레임 자**
+    ///     (`╭───…╮` · 연속 런 16)로 이사했다. 기대값 `Ready{Valve}` 는 **그대로 참**이다.
+    ///   · 이사 전 화면은 버리지 않고 **②′** 로 남겨, 같은 화면이 이제 **닫힌다**는 사실
+    ///     (`bare_shell` 이 `false` → `true` 로 뒤집혔다 · 실측)을 박제한다.
+    ///
+    /// 미탐 자체는 남는다 — **프레임 자를 그린 뒤 즉사**한 화면은 여전히 밸브를 연다. 그러나
+    /// 폭이 좁아졌고(프롬프트 장식·`tree` 괘선·`git log --graph` 잔상 한 조각으로는 더 이상
+    /// 열리지 않는다), ②′ 가 그 새 경계를 정확히 박제한다. 사다리 순서 계약 ③④는 무변이다.
+    #[test]
+    fn valve_short_circuits_the_ladder_so_the_marker_axis_is_never_consulted() {
+        let gates: Vec<Gate> = Vec::new();
+        // 리뷰어 격리 실행 화면(★P4-2 이사): TUI **프레임 자**를 그린 **뒤 즉사**했다.
+        //  · P4-2 이후 잔상 한 조각(`─ Claude Code ─`)은 더 이상 렌더 증거가 아니다
+        //    (`TUI_FRAME_RUN_MIN` = 한 줄 안 연속 길이 하한). 밸브가 **여전히 열리는** 화면
+        //    = 프레임 자가 남은 화면으로 이사한다(연속 런 16 ≥ 8).
+        //  · `screen_is_bare_shell_on`(CLI 소유)은 이 화면에서 `false` 를 낸다 = 맨 셸이 아니다
+        //    → 밸브의 AND 항이 열린다. 꼬리 사망 문면 축도 비어 있다(` bye` 는 사망 문면이
+        //    아니다 — `command not found` 류만 그 축에 걸린다).
+        //  · 마커 축은 이 화면에서 **아무 증거도 못 낸다**(델타에도 화면에도 `❯` 가 없다).
+        const FRAME_THEN_DEAD: &str =
+            "╭──────────────╮\n│ Claude Code  │\n╰──────────────╯\n bye\nuser@mac ~ %";
+        let mut o = obs(FRAME_THEN_DEAD, "", &gates);
+        o.agent_alive = Some(true);
+        o.bare_shell = Some(false); // ★CLI 새 술어의 실제 산출(실측) — 손으로 고른 값이 아니다
+        o.tail_is_shell_prompt = Some(true);
+        o.time_fallback_reached = true;
+
+        // 전제 확인 — 마커는 정의돼 있는데 델타·화면 어디에도 없다(마커 축의 결론은 '미충족').
+        let m = o.marker.expect("마커 정의");
+        assert!(
+            !o.delta.contains(m) && !o.screen.contains(m),
+            "드릴 전제 붕괴: 이 화면에 마커가 있으면 '마커 축이 아무 증거도 못 낸다'가 거짓이다"
+        );
+
+        // ① 밸브만 끄면 드러나는 마커 축 단독의 결론 = **미충족**(보류).
+        let mut marker_only = o.clone();
+        marker_only.agent_alive = Some(false);
+        assert_eq!(
+            judge(&marker_only),
+            Verdict::NotYet,
+            "마커 축 단독이 이 화면에서 증거를 낸다면 이 검체의 전제가 틀렸다"
+        );
+
+        // ② 그런데 밸브가 열리면 판정은 **보류가 아니라 Ready = 주입**이다.
+        //    ★이것이 종전 주석이 거짓인 지점이다: 마커 축은 '따로 막는' 위치에 있지 않다.
+        assert_eq!(
+            judge(&o),
+            Verdict::Ready {
+                evidence: Evidence::Valve
+            },
+            "프레임 자를 그린 뒤 즉사한 화면의 귀결은 U-11 보류가 아니라 **주입**이다(P4-1)"
+        );
+
+        // ②′ ★P4-2 이사 박제 — **잔상 한 조각으로 밸브가 열리던 화면은 이제 닫힌다.**
+        //    이 화면(`─ Claude Code ─` 한 조각)이 ②의 원래 픽스처였다. 삭제하지 않고 여기
+        //    남겨, "핀이 사라졌다" 가 아니라 "핀이 옮겨졌고 경계가 좁아졌다" 를 기계로 남긴다.
+        //    `bare_shell` 은 CLI 새 술어의 **실제 산출**이다: 최대 연속 프레임 런 1 < 8 이고
+        //    위젯 문면도 없으므로 렌더 증거 부재 → 꼬리 `%` 와 AND 하여 맨 셸 = `true`.
+        let mut residue = obs("─ Claude Code ─\n bye\nuser@mac ~ %", "", &gates);
+        residue.agent_alive = Some(true);
+        residue.bare_shell = Some(true); // ★`false` → `true` 로 뒤집힌 축(P4-2)
+        residue.tail_is_shell_prompt = Some(true);
+        residue.time_fallback_reached = true;
+        assert_eq!(
+            judge(&residue),
+            Verdict::NotYet,
+            "잔상 프레임이 여전히 밸브를 연다(P4-2 회귀) — 장식 한 조각으로 밸브가 \
+             agent_alive 단독으로 퇴화하던 상태가 되돌아왔다"
+        );
+
+        // ③ 마커 축이 **다른 근거를 낼 수 있는** 화면에서도 밸브가 이긴다(첫 항 계약).
+        let mut both = obs("x\n", "❯", &gates);
+        both.agent_alive = Some(true);
+        both.bare_shell = Some(false);
+        assert_eq!(
+            judge(&both),
+            Verdict::Ready {
+                evidence: Evidence::Valve
+            },
+            "마커 델타가 있는데도 근거가 밸브가 아니면 사다리 순서가 뒤집힌 것이다"
+        );
+
+        // ④ 구조 핀 — 소스에서 **밸브가 마커 축보다 먼저이고 `return` 으로 끊는다**는 사실을
+        //    박제한다. 순서를 바꾸는 리팩터가 조용히 들어오면 여기서 적색이 난다.
+        let src = include_str!("readiness.rs");
+        let ladder = &src[src.find("fn positive_evidence(").expect("사다리 함수")..];
+        let valve = ladder
+            .find("return Some(Evidence::Valve);")
+            .expect("밸브 조기 반환");
+        let marker = ladder.find("Evidence::MarkerDelta").expect("마커 축");
+        assert!(
+            valve < marker,
+            "밸브가 마커 축보다 뒤로 갔다 — 이 검체의 서사(조기 반환)가 무효가 된다"
+        );
+    }
+
+    /// ★판별력 보강(P4-2 · 2026-08-24) — **손으로 박은 `bare_shell` 을 CLI 술어의 소스에서
+    /// 재유도해 대조한다.**
+    ///
+    /// 【고치는 약점】 이 모듈의 검체는 `bare_shell` 을 손으로 박는다([`Observed`] 가 판정
+    /// 입력의 전량이라는 계약상 그래야 한다). 그래서 CLI 쪽 술어가 바뀌어도 여기 진리표는
+    /// **기계적으로 여전히 초록**이다 — 이번 웨이브가 정확히 그 방식으로 낡았다: 잔상 화면의
+    /// `bare_shell` 이 실제로는 `false` → `true` 로 뒤집힌 뒤에도 검체·주석은 초록인 채
+    /// 옛 산출을 서술하고 있었다(이 저장소가 반복해 당한 '낡은 사본' 클래스).
+    ///
+    /// 【왜 술어를 직접 부르지 않는가】 `screen_is_bare_shell_on` 은 **바이너리 크레이트**
+    /// (`src/bin/cys.rs`)의 비공개 함수라 lib 검체에서 링크할 수 없다(bin → lib 는 되지만
+    /// 반대는 안 된다). 여기서 다시 구현하면 사본이 둘이 되고, 사본은 갈린다.
+    ///
+    /// 【그래서 무엇을 하는가】 **판정 축의 상수·코퍼스를 CLI 소스에서 읽어**(값을 여기 복사
+    /// 하지 않는다) 픽스처를 그 축으로 직접 잰다. 재는 것은 *픽스처의 성질*(한 줄 안 최대
+    /// 연속 프레임 런 · 위젯 문면 유무)이지 *판정*이 아니므로 술어의 사본이 아니다.
+    /// CLI 가 축을 다시 넓히면(예: 하한을 1 로 되돌리면) 이 핀이 먼저 적색이 난다.
+    ///
+    /// ★대상 한정: 아래 픽스처는 전부 **꼬리가 셸 프롬프트이고 꼬리에 사망 문면이 없다**
+    /// (그 두 전제도 아래에서 함께 잰다). 그 구간에서 `bare_shell` = `¬렌더 증거` 로 환원되고,
+    /// 재유도가 성립하는 것도 그 구간뿐이다 — 전제 밖 화면을 여기서 판정하지 않는다.
+    #[test]
+    fn hand_stamped_bare_shell_is_rederived_from_the_cli_predicate_source() {
+        const CLI: &str = include_str!("bin/cys.rs");
+
+        // ── 축 ①: 프레임 **연속 길이** 하한을 CLI 소스에서 읽는다.
+        let anchor = "const TUI_FRAME_RUN_MIN: usize = ";
+        let at = CLI
+            .find(anchor)
+            .expect("CLI 의 프레임 연속 길이 상수가 없다 — 축이 사라졌거나 이름이 바뀌었다")
+            + anchor.len();
+        let run_min: usize = CLI[at..]
+            .split(';')
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .expect("TUI_FRAME_RUN_MIN 을 수로 읽지 못했다");
+
+        // ── 축 ②: 대화형 위젯 문면 코퍼스도 CLI 소스에서 읽는다.
+        let anchor = "const TUI_RENDER_MARKS: &[&str] = &[";
+        let at = CLI.find(anchor).expect("CLI 의 위젯 문면 코퍼스가 사라졌다") + anchor.len();
+        let body = &CLI[at..at + CLI[at..].find("];").expect("코퍼스 끝을 찾지 못했다")];
+        let marks: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+
+        // 다리가 조용히 끊기지 않도록 술어 자체의 실재도 함께 못 박는다.
+        assert!(
+            run_min >= 2 && !marks.is_empty(),
+            "축 재유도 실패: run_min={run_min} marks={marks:?}"
+        );
+        assert!(
+            CLI.contains("fn screen_is_bare_shell_on(")
+                && CLI.contains("fn screen_has_frame_rule(")
+                && CLI.contains("fn screen_has_tui_render_evidence("),
+            "밸브 전용 술어가 사라졌다 — 이 핀이 재유도할 대상이 없다"
+        );
+
+        // 한 줄 안 **최대** 연속 프레임 문자 수. 판정이 아니라 픽스처의 성질을 잰다.
+        fn max_frame_run(text: &str) -> usize {
+            text.lines()
+                .map(|line| {
+                    let (mut run, mut max) = (0usize, 0usize);
+                    for c in line.chars() {
+                        // Box Drawing `U+2500..=U+257F` · Block Elements `U+2580..=U+259F`.
+                        if matches!(c as u32, 0x2500..=0x259F) {
+                            run += 1;
+                            max = max.max(run);
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    max
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        // 【진리표】 이 모듈이 손으로 박는 값 ↔ CLI 축에서 재유도한 값.
+        for (label, screen, stamped) in [
+            ("잔상 한 조각(P4-2 이사원 · ②′)", "─ Claude Code ─\n bye\nuser@mac ~ %", true),
+            (
+                "프레임 자 + 즉사(P4-2 이사처 · ②)",
+                "╭──────────────╮\n│ Claude Code  │\n╰──────────────╯\n bye\nuser@mac ~ %",
+                false,
+            ),
+            ("실측 정상 배너(Windows WIN-2)", HEALTHY_BANNER, true),
+            ("살아있는 TUI(위젯 문면)", fixtures::LIVE_TUI_AT_PROMPT, false),
+        ] {
+            // 전제 ⓐ — 꼬리가 셸 프롬프트다(아니면 `bare_shell` 은 무조건 false 라 잴 것이 없다).
+            let tail = screen
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim_end())
+                .unwrap_or("");
+            assert!(
+                tail.ends_with(['%', '$', '#', '❯']),
+                "{label}: 재유도 전제 붕괴 — 꼬리가 셸 프롬프트가 아니다({tail:?})"
+            );
+            // 전제 ⓑ — 사망 문면이 없다(있으면 OR 축이 먼저 참을 낸다). CLI 는 꼬리
+            //   `BARE_SHELL_DEATH_TAIL_LINES` 줄만 보지만 여기서는 **화면 전량**을 본다 —
+            //   상위 집합이라 "전량에 없으면 꼬리에도 없다" 가 항상 성립한다(안전 방향).
+            let flat = first_run_gates::flatten(screen);
+            for phrase in [
+                "commandnotfound",
+                "notfoundinPATH",
+                "Nosuchfileordirectory",
+                "isnotrecognizedasthenameofacmdlet",
+                "isnotrecognizedasaninternalorexternalcommand",
+            ] {
+                assert!(
+                    !flat.contains(phrase),
+                    "{label}: 재유도 전제 붕괴 — 사망 문면 축({phrase})이 개입한다"
+                );
+            }
+
+            let run = max_frame_run(screen);
+            let marked = marks
+                .iter()
+                .any(|m| flat.contains(&first_run_gates::flatten(m)));
+            let rederived = !(run >= run_min || marked);
+            assert_eq!(
+                rederived, stamped,
+                "{label}: 검체가 손으로 박은 bare_shell={stamped} 인데 CLI 축에서 재유도하면 \
+                 {rederived} 다(최대 연속 런 {run} vs 하한 {run_min} · 위젯 문면 {marked}) — \
+                 검체가 낡았거나 CLI 술어의 축이 바뀌었다"
+            );
+        }
+    }
+
+    /// ★P4-7 — 관문 축의 **생애 창**. 재주입 경로에서 *이미 지나간* 관문이 pack-update 재주입을
+    /// 영구 거부하지 못하게 한다. **부트 경로의 관문 판정은 한 톨도 약해지지 않는다.**
+    #[test]
+    fn reinject_gate_axis_has_a_lifetime_window_while_boot_stays_constant_open() {
+        let gates = first_run_gates::builtin();
+        // 살아 있는 노드의 scrollback 꼬리: 부트 때 **통과한** 신기능 안내가 역사로 남아 있고,
+        // 그 뒤에 작업 로그와 **현재 입력 프롬프트**가 있다.
+        let tail = format!(
+            "{}[boot] worker=claude surface=7 rc=0\n작업 로그\n❯ \n",
+            fixtures::FEATURE_FULLSCREEN
+        );
+
+        // ── 재주입: 창이 닫힌다 → 종전의 영구 미주입이 풀린다.
+        let mut r = obs(&tail, "", &gates);
+        r.site = Site::Reinject;
+        r.tail_is_shell_prompt = None;
+        r.bare_shell = None;
+        assert_eq!(
+            judge(&r),
+            Verdict::Ready {
+                evidence: Evidence::MarkerTail
+            },
+            "이미 지나간 관문이 재주입을 영구 거부한다(P4-7)"
+        );
+
+        // ── 부트: 같은 화면이라도 **반드시 잡는다**(창이 상수로 열려 있다).
+        let mut b = obs(&tail, "", &gates);
+        b.agent_alive = Some(true);
+        match judge(&b) {
+            Verdict::GateHeld { ref gate_id, .. } => {
+                assert_eq!(gate_id.as_str(), "feature-announce-fullscreen")
+            }
+            other => panic!("부트 경로의 관문 판정이 약해졌다(P4-7 수리가 반경을 넘었다): {other:?}"),
+        }
+
+        // ── 재주입이라도 **떠 있는** 관문은 여전히 잡는다(창은 증명될 때만 닫힌다).
+        let mut live = obs(fixtures::FEATURE_FULLSCREEN, "", &gates);
+        live.site = Site::Reinject;
+        live.tail_is_shell_prompt = None;
+        live.bare_shell = None;
+        assert!(
+            !judge(&live).is_ready(),
+            "떠 있는 관문에서 창이 닫혔다 — 관문 창에 재주입하는 U-13 결함이 되돌아온다"
+        );
+    }
+
+    /// 실측 관문 화면에서 **커서만** 옮긴 화면을 만든다 — 문면은 한 글자도 바꾸지 않는다.
+    ///
+    /// ★새 픽스처를 손으로 지어내지 않는 이유: 지어낸 화면은 "그 화면이 실재하는가" 를 다시
+    ///   증명해야 한다. 여기서 시험하려는 사실은 **커서 위치 하나**이므로, 실측 전사본에서
+    ///   선택 커서(`❯`)만 옮기면 그 축만 정확히 갈린다(나머지는 전부 동일).
+    fn with_cursor_on(screen: &str, item: u8) -> String {
+        let want = format!("{item}.");
+        let mut out: String = screen
+            .lines()
+            .map(|l| {
+                let bare = l.trim_start_matches(['❯', ' ']);
+                if bare.starts_with(&want) {
+                    format!("❯ {bare}")
+                } else if l.starts_with('❯') {
+                    format!("  {bare}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// ★★P4-11 — 생애 창이 **커서 위치**를 '관문이 지나갔다' 로 오독하지 않는다.
+    ///
+    /// 첫 판(P4-7)의 축은 "마커가 관문 블록 문면의 끝보다 뒤인가" 하나였다. `theme` 의 위젯
+    /// 서명은 선택지 **1·2** 뿐이고 `login-method` 도 그렇다 — 그래서 사람이 커서를 3번째
+    /// 항목에 두면 마커가 위젯 문면 뒤에 오고, **떠 있는 관문**이 '지나갔다'로 읽혀 재주입 창이
+    /// 열렸다(U-13 결함의 부분 재개봉 · 관문 창에 키가 나간다).
+    ///
+    /// ★`Site::Boot` 는 이 검체에서도 **상수로 열려 있어야** 한다(창은 재주입 경로에만 있다).
+    #[test]
+    fn cursor_on_a_later_item_is_not_read_as_a_passed_gate() {
+        let gates = first_run_gates::builtin();
+        // 실측형 관문 화면 — 선택지가 3개 이상이고 위젯 서명은 1·2 번째 항목뿐인 둘.
+        for (gid, base, item) in [
+            ("theme", fixtures::THEME, 3u8),
+            ("login-method", fixtures::LOGIN_METHOD, 3u8),
+        ] {
+            let screen = with_cursor_on(base, item);
+            // ⓐ 커서만 옮겼을 뿐 **같은 관문**이다(계측 타당성 — 화면이 달라졌으면 서사가 무효).
+            let g = first_run_gates::identify(&gates, &screen)
+                .unwrap_or_else(|| panic!("{gid}: 커서를 옮겼더니 관문 식별이 깨졌다 — 이 검체는 \
+                                           커서 축만 갈라야 한다:\n{screen}"));
+            assert_eq!(g.id, gid, "{gid}: 커서 이동이 다른 관문으로 읽혔다");
+            assert!(
+                screen.contains(&format!("❯ {item}.")),
+                "{gid}: 커서가 {item}번째 항목으로 옮겨지지 않았다(도우미 파손):\n{screen}"
+            );
+
+            // ⓑ ★창이 닫히지 않는다 — 관문은 지금 **떠 있다**.
+            assert!(
+                !gate_block_left_behind(g, &screen, Some("❯")),
+                "{gid}: 커서가 {item}번째 항목에 있다는 이유로 '관문이 지나갔다'로 읽혔다 — \
+                 떠 있는 관문에 재주입이 열린다(U-13 부분 재개봉):\n{screen}"
+            );
+
+            // ⓒ 그래서 재주입 경로에서도 ready 가 아니다(판정 경로 전체로 확인).
+            let mut r = obs(&screen, "", &gates);
+            r.site = Site::Reinject;
+            r.tail_is_shell_prompt = None;
+            r.bare_shell = None;
+            assert!(
+                !judge(&r).is_ready(),
+                "{gid}: 떠 있는 관문 화면이 재주입 ready 로 읽혔다"
+            );
+
+            // ⓓ 부트 경로는 한 톨도 약해지지 않았다(창이 상수로 열려 있다).
+            let mut b = obs(&screen, "", &gates);
+            b.agent_alive = Some(true);
+            match judge(&b) {
+                Verdict::GateHeld { ref gate_id, .. } => assert_eq!(gate_id.as_str(), gid),
+                other => panic!("{gid}: 부트 경로의 관문 판정이 약해졌다: {other:?}"),
+            }
+        }
+
+        // ★대조군 — 같은 화면을 **실제로 통과한** 뒤(뒤에 로그 + 대기 프롬프트)에는 창이 닫힌다.
+        //   이 대조가 없으면 위 초록은 "창이 아예 안 열린다" 는 퇴화로도 설명된다.
+        let passed = format!("{}\n작업 로그\n❯ \n", with_cursor_on(fixtures::THEME, 3));
+        let g = gates.iter().find(|g| g.id == "theme").unwrap();
+        assert!(
+            gate_block_left_behind(g, &passed, Some("❯")),
+            "지나간 관문에서도 창이 닫히지 않는다 — 생애 창이 통째로 죽었다(영구 미주입 복귀)"
+        );
+    }
+
+    /// 생애 창 술어 자체의 진리표 — **판정 불가는 창을 닫지 않는다**(fail-closed).
+    #[test]
+    fn gate_lifetime_window_is_fail_closed_on_every_unmeasurable_axis() {
+        let gates = first_run_gates::builtin();
+        let g = gates
+            .iter()
+            .find(|g| g.id == "feature-announce-fullscreen")
+            .unwrap();
+        let passed = format!("{}\n작업 로그\n❯ \n", fixtures::FEATURE_FULLSCREEN);
+
+        // 마커가 관문 블록 **뒤**에 다시 나온다 = 지나갔다.
+        assert!(gate_block_left_behind(g, &passed, Some("❯")));
+        // 관문이 **떠 있는** 화면(마커는 블록 안의 선택 커서다) = 지나가지 않았다.
+        assert!(!gate_block_left_behind(
+            g,
+            fixtures::FEATURE_FULLSCREEN,
+            Some("❯")
+        ));
+        // 마커 미정의(codex 등) · 빈 마커 · 화면에 마커 없음 — 전부 창을 닫지 않는다.
+        assert!(!gate_block_left_behind(g, &passed, None));
+        assert!(!gate_block_left_behind(g, &passed, Some("")));
+        assert!(!gate_block_left_behind(
+            g,
+            fixtures::FEATURE_FULLSCREEN,
+            Some("§없는마커§")
+        ));
+        // 실측 관문 6화면 전부에서 창은 닫히지 않는다(재주입 보호가 통째로 사라지지 않았다).
+        for &(id, screen) in GATE_SCREENS {
+            let gate = first_run_gates::identify(&gates, screen).expect("관문 식별");
+            assert!(
+                !gate_block_left_behind(gate, screen, Some("❯")),
+                "{id}: 떠 있는 관문에서 생애 창이 닫혔다"
+            );
+        }
     }
 
     #[test]

@@ -352,7 +352,37 @@ pub struct DesiredHook {
     pub event: &'static str,
     /// matcher(툴 필터). None = matcher 키 미기록(전체).
     pub matcher: Option<&'static str>,
+    /// ★U-21 · **선언 timeout(초)**. `None` = 키 미기록(하네스 기본값에 맡김).
+    ///
+    /// 필드 위치는 계약이다 — **반드시 `matcher` 뒤**. `bin/tests/run_bootstrap_health.py`
+    /// `_rust_awakening_hooks()` 가 이 리터럴을 `script → event → matcher → timeout` 순서로
+    /// 파싱해 파이썬 매니페스트와 4-튜플 대조한다(순서가 바뀌면 대조가 조용히 짝을 잃는다).
+    pub timeout: Option<u64>,
 }
+
+/// ★Claude Code 훅 계약 실측 — `UserPromptSubmit` 의 **기본 timeout 은 30초**다(다른 이벤트는 600초).
+///
+/// 그리고 timeout 은 지연이 아니라 **취소 + 출력 폐기**다. role-bootstrap 훅의 stdout 은
+/// `additionalContext`(마스터 선언 → 팀 기동 사실 + 착수 규율)라서, 30초를 넘긴 순간 부트 체인은
+/// 에러도 남기지 않고 **조용히 사라진다**.
+///
+/// 그 30초가 얼마나 얇은지는 훅 자신의 데드라인 합으로 계산된다(`cysjavis-pack/hooks/role-bootstrap.sh`):
+/// 역할 게이트 2s + 임무 record 5s + 임무 path 5s + machine-origin 5s + 선행 claim 10s = **27s**.
+/// 여기에 인터프리터 냉시작(Windows python 은 회당 수 초)이 4회 얹히면 상한을 넘는다 —
+/// mac 에서는 멀쩡하고 Windows 설치본에서만 부트가 사라지는 그 계열이다.
+pub const HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S: u64 = 30;
+
+/// `UserPromptSubmit` 각성 훅의 **선언 timeout**.
+///
+/// 값 선정 — 새 숫자를 발명하지 않고 **하네스가 다른 모든 이벤트에 쓰는 기본값(600s)** 에 맞춘다.
+/// "UserPromptSubmit 만 특별히 얇은" 비대칭을 없애는 것이 이 단위의 목적이고, 그보다 큰 값은
+/// 근거가 없고 그보다 작은 값은 위 27s 여유를 다시 깎는다.
+///
+/// ★이 값이 부트 체인 최악치(`javis_budget.bootstrap_chain_worst_s()` ≈ 3020s)보다 **작다**는
+/// 사실은 결함이 아니라 **관측 결과**다 — 훅 자식 안에서 부트를 완주시킬 수 없다는 뜻이고,
+/// 그것이 곧 "부트를 훅 자식에서 떼어내라"(U-23)의 기계적 증명이다. 여기서 값을 3020 으로
+/// 올려 역전을 지우는 것은 수리가 아니라 **증거 인멸**이다.
+pub const HOOK_TIMEOUT_ROLE_BOOTSTRAP_S: u64 = 600;
 
 /// **각성 티어**(awakening) — 없으면 마스터 선언이 부트를 발화하지 못하는(=팀이 영구히 안 뜨는)
 /// 훅 집합. Rust 격리 config 시드·init-pack·개인 프로필 병합(T-0147-1)·preflight C28의 FAIL 티어가
@@ -362,13 +392,57 @@ pub const AWAKENING_HOOKS: [DesiredHook; 2] = [
         script: "session-start.sh",
         event: "SessionStart",
         matcher: None,
+        // SessionStart 의 하네스 기본값은 이미 600s 다 — 선언하지 않는다.
+        // ★무선언은 "아무것도 단언하지 않는다"는 뜻이지 "0 을 강제한다"가 아니다(아래 판정 참조).
+        timeout: None,
     },
     DesiredHook {
         script: "role-bootstrap.sh",
         event: "UserPromptSubmit",
         matcher: None,
+        timeout: Some(HOOK_TIMEOUT_ROLE_BOOTSTRAP_S),
     },
 ];
+
+// ═════════════════════════════════════════════════════════════════════════════
+// U-21 · 선언 timeout 축의 **롤백 스위치**
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 이 축 전용 노브. `"1"` 만 끈다(형제 축과 같은 엄격 비교).
+pub const ENV_HOOK_TIMEOUT_V1: &str = "CYS_HOOK_TIMEOUT_V1";
+
+/// 축 전용 노브의 **순수 코어**.
+pub fn hook_timeout_v1_from(env_val: Option<&str>) -> bool {
+    env_val == Some("1")
+}
+
+/// 축의 **최종 유효값**(순수) — 마스터 `CYS_BOOT_GATES=0` 에 접힌다.
+///
+/// ★새 판정 축은 태어날 때 마스터에 접는다([`crate::gate_axes_from`] 의 규율). 사고 순간에
+/// 사람이 노브 조합을 기억할 수는 없다 — 손잡이는 하나여야 한다.
+pub fn hook_timeout_axis_legacy_from(master_env: Option<&str>, axis_env: Option<&str>) -> bool {
+    crate::boot_gates_master_off_from(master_env) || hook_timeout_v1_from(axis_env)
+}
+
+/// 위의 단일 진입점(env 2회 판독 — 축별 1지점 규약).
+pub fn hook_timeout_axis_legacy() -> bool {
+    hook_timeout_axis_legacy_from(
+        std::env::var(crate::ENV_BOOT_GATES).ok().as_deref(),
+        std::env::var(ENV_HOOK_TIMEOUT_V1).ok().as_deref(),
+    )
+}
+
+/// 소망 훅의 **유효 선언 timeout** — 축이 종전이면 `None`(= 선언 없음).
+///
+/// 롤백이 이 한 지점으로 끝나는 이유: 선언이 `None` 이면 판정은 `command` 만 보고(종전과 동일),
+/// 병합기는 `timeout` 키를 쓰지도 고치지도 않는다. 코드 revert 없이 거동이 종전으로 되돌아간다.
+pub fn declared_timeout_for(h: &DesiredHook) -> Option<u64> {
+    if hook_timeout_axis_legacy() {
+        None
+    } else {
+        h.timeout
+    }
+}
 
 /// hook 등록 명령 문자열(단일 OS 규약) — `session_start_hook_command`·
 /// `role_bootstrap_hook_command`의 일반화. `javis_preflight._cys_hook_cmd(script)`와
@@ -382,8 +456,43 @@ pub fn hook_command_for(pack_dir: &Path, script: &str) -> String {
     }
 }
 
-/// settings.json 의 특정 이벤트에 desired 명령이 등록돼 있는가(순수 판정 · 읽기 전용).
-pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) -> bool {
+/// settings.json hook 객체의 `timeout` 을 수로 읽는다. 수가 아니면 `None`(= 미기록 취급).
+/// 사용자 파일에 `900.0` 같은 실수가 들어 있을 수 있어 정수·실수 둘 다 본다.
+fn hook_entry_timeout(h: &serde_json::Value) -> Option<u64> {
+    let v = h.get("timeout")?;
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)
+}
+
+/// **선언 timeout 충족** 판정(순수 · 진리표 대상).
+///
+/// 규약 — 선언(`declared`)은 **하한**이다.
+///  · `declared == None` → 아무것도 단언하지 않는다(종전 판정과 동일). 우리가 선언하지 않은 축을
+///    "0 이어야 한다"로 읽으면 사용자가 손으로 넣은 값이 전부 불일치가 되어 **우리가 그것을 지운다**.
+///  · `declared == Some(t)` → 엔트리가 **`t` 이상**이어야 충족. `==`(동등)을 기각한 이유를 남긴다:
+///    우리보다 **큰** 값을 우리 값으로 내리는 것은 취소 시각을 앞당기는 **오살 방향**이다
+///    (살아서 완주하던 부트가 우리 손에 잘린다). 이 축은 **한 방향으로만 연다**.
+///    ★이것은 판정 완화가 아니다 — 종전 판정은 timeout 을 **아예 보지 않았고**(무조건 충족),
+///    이 술어는 그보다 **엄격**하다(미기록·저값은 불충족). 완화가 아니라 새 하한의 도입이다.
+///  · 엔트리에 키가 **없으면 불충족**이다. 하네스 기본값(UserPromptSubmit=30s)을 우리가 읽을 길이
+///    없으므로 "없음 = 안전"으로 접으면 원 결함(무음 취소)이 그대로 남는다.
+pub fn hook_timeout_satisfied(entry_timeout: Option<u64>, declared: Option<u64>) -> bool {
+    match declared {
+        None => true,
+        Some(want) => matches!(entry_timeout, Some(v) if v >= want),
+    }
+}
+
+/// settings.json 의 특정 이벤트에 desired 명령이 **선언 timeout 을 충족한 채** 등록돼 있는가
+/// (순수 판정 · 읽기 전용). 판정 = `command 동등 ∧ 선언 timeout 충족`.
+pub fn hook_registered_with_timeout_in(
+    root: &serde_json::Value,
+    event: &str,
+    desired: &str,
+    declared_timeout: Option<u64>,
+) -> bool {
     root.get("hooks")
         .and_then(|h| h.get(event))
         .and_then(|v| v.as_array())
@@ -392,8 +501,10 @@ pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) 
                 m.get("hooks")
                     .and_then(|v| v.as_array())
                     .map(|hs| {
-                        hs.iter()
-                            .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(desired))
+                        hs.iter().any(|h| {
+                            h.get("command").and_then(|c| c.as_str()) == Some(desired)
+                                && hook_timeout_satisfied(hook_entry_timeout(h), declared_timeout)
+                        })
                     })
                     .unwrap_or(false)
             })
@@ -401,11 +512,69 @@ pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) 
         .unwrap_or(false)
 }
 
+/// settings.json 의 특정 이벤트에 desired 명령이 등록돼 있는가(순수 판정 · 읽기 전용).
+///
+/// ★U-21 이후 이 함수는 **command 축 단독** 판정이다(선언 timeout 미고려 = `declared: None`).
+/// 집행 경로(`merge_desired_hooks`·`verify_desired_hooks_registered`)는
+/// [`hook_registered_with_timeout_in`] 을 쓴다. 관측 전용 소비처(`cys doctor`·부트 경고)는
+/// 이 얇은 형태를 유지한다 — timeout 스큐만으로 "훅이 없습니다" 경고를 내는 것은 오탐이고,
+/// 그 오탐이 유도하는 재등록은 **중복 append 폭주** 방향이기 때문이다.
+pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) -> bool {
+    hook_registered_with_timeout_in(root, event, desired, None)
+}
+
+/// **불일치 엔트리 교체 경로**(U-21) — 이미 등록된 우리 hook 객체의 `timeout` 만 선언값으로 올린다.
+///
+/// 안전 계약(오살 금지 — 이 함수가 이 단위에서 가장 위험한 코드다):
+///  · `command` 가 우리 것과 **바이트 동등**인 hook 객체만 만진다. 사용자 항목·타 도구 훅·
+///    같은 이벤트의 다른 엔트리는 읽지도 않는다.
+///  · 건드리는 키는 `timeout` **하나**다. 삭제·재배치·순서 변경 0.
+///  · `max(기존, 선언)` — 사용자가 더 크게 잡아둔 값은 **내리지 않는다**.
+///  · 반환: 실제로 값이 바뀐 객체가 하나라도 있었는가.
+fn raise_hook_timeout_in(
+    root: &mut serde_json::Value,
+    event: &str,
+    desired: &str,
+    want: u64,
+) -> bool {
+    let Some(arr) = root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in arr.iter_mut() {
+        let Some(hs) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for h in hs.iter_mut() {
+            if h.get("command").and_then(|c| c.as_str()) != Some(desired) {
+                continue;
+            }
+            let cur = hook_entry_timeout(h);
+            let next = cur.map(|c| c.max(want)).unwrap_or(want);
+            if cur == Some(next) {
+                continue;
+            }
+            if let Some(obj) = h.as_object_mut() {
+                obj.insert("timeout".into(), serde_json::json!(next));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// 소망 훅을 settings.json 에 **이벤트 단위로 멱등 병합**한다(A9).
 ///
 /// 계약(사용자 불가침 — ★W-B seed-once 교리 정합):
 ///  · **추가만 한다**. 사용자 항목·타 도구 훅·기존 배열 순서를 지우거나 재배치하지 않는다.
 ///  · 이미 같은 명령이 그 이벤트에 있으면 **무동작**(byte-identical 문자열이라 중복 0).
+///  · ★U-21 **불일치 엔트리 교체 경로**: 명령은 같은데 **선언 timeout 만 미달**이면 append 가
+///    아니라 그 hook 객체의 `timeout` 하나만 올린다(`raise_hook_timeout_in`). append 로 처리하면
+///    같은 명령이 두 번 실려 **매 프롬프트마다 훅이 2회 발화**한다 — 큐 폭주 방향이다.
 ///  · 추가할 것이 없으면 파일을 **쓰지 않는다**(백업도 건드리지 않는다 — 정상 백업 클로버 차단).
 ///  · symlink 거부 / 파싱 실패 시 **거부**(빈 객체로 덮어쓰기 금지 — 침묵 데이터 소실 차단).
 ///  · 쓰기는 `write_atomic`(tmp+rename+fsync) — 반쪽 파일이 굳으면 훅 등록부 전체가 사라진다.
@@ -440,10 +609,24 @@ pub fn merge_desired_hooks(
     let mut added: Vec<String> = Vec::new();
     for h in hooks {
         let desired = hook_command_for(pack_dir, h.script);
-        if hook_registered_in(&root, h.event, &desired) {
+        let declared = declared_timeout_for(h);
+        if hook_registered_with_timeout_in(&root, h.event, &desired, declared) {
             continue;
         }
+        // ★교체 경로 — 명령은 이미 있고 선언 timeout 만 미달인 경우. 여기서 append 로 가면
+        //   동일 명령이 중복 등재된다(발화 2배 = 폭주 방향).
+        if let Some(want) = declared {
+            if hook_registered_in(&root, h.event, &desired)
+                && raise_hook_timeout_in(&mut root, h.event, &desired, want)
+            {
+                added.push(format!("{}←{} (timeout={want}s 교정)", h.event, h.script));
+                continue;
+            }
+        }
         let mut entry = serde_json::json!({"hooks": [{"type": "command", "command": desired}]});
+        if let Some(t) = declared {
+            entry["hooks"][0]["timeout"] = serde_json::json!(t);
+        }
         if let Some(m) = h.matcher {
             entry["matcher"] = serde_json::Value::String(m.to_string());
         }
@@ -490,7 +673,16 @@ pub fn verify_desired_hooks_registered(
         .unwrap_or_else(|| serde_json::json!({}));
     hooks
         .iter()
-        .filter(|h| !hook_registered_in(&root, h.event, &hook_command_for(pack_dir, h.script)))
+        .filter(|h| {
+            // ★U-21: ⊇ 게이트는 **집행 축과 같은 판정**을 써야 한다. 병합기가 timeout 을 보고
+            //   ⊇ 검증이 안 보면, timeout 스큐가 남은 디스크를 "충족"으로 보고하게 된다.
+            !hook_registered_with_timeout_in(
+                &root,
+                h.event,
+                &hook_command_for(pack_dir, h.script),
+                declared_timeout_for(h),
+            )
+        })
         .map(|h| format!("{}←{}", h.event, h.script))
         .collect()
 }
@@ -695,6 +887,15 @@ fn setup_isolated_config_dir(install_hooks: bool) {
             let _ = write_atomic(&claude_md, tmpl.as_bytes());
         }
     }
+    // ★U-19 · 첫기동 관문 시드 — **훅 병합과 분리된 별도 단계**이며 `install_hooks` 조기 return
+    //   **위**에 둔다. GUI 인앱 업데이트는 항상 `cys init-pack --no-install-hook` 으로 내려오므로
+    //   (`src-tauri/src/main.rs` `maybe_apply_pending_update`) 아래에 두면 **업데이트로 올라온
+    //   사용자 전원에게 영영 시드되지 않는다**(도달성 결함 — K-1 과 같은 계열).
+    //   시드 자체는 자기 스위치(`CYS_FIRST_RUN_SEED`)로 제어되며 **기본은 꺼짐**이다.
+    match seed_first_run_gates(&cfg, INSTALL_TIME_SEED_WORKSPACES, AuthPremise::Unproven) {
+        SeedOutcome::Disabled | SeedOutcome::NothingToDo => {}
+        other => eprintln!("[pack] 첫기동 관문 시드: {other:?}"),
+    }
     if !install_hooks {
         // ★G3(--no-install-hook 일관성): 종전엔 이 플래그가 ~/.claude 대상만 막고 격리 config dir
         // 훅 병합(아래)은 그대로 돌았다 — 훅 억제를 요청한 운영자에게 훅이 몰래 등록되는 비일관.
@@ -732,6 +933,418 @@ fn setup_isolated_config_dir(install_hooks: bool) {
     }
     // ★T-0147-1: 개인 프로필(~/.claude*)의 레거시 각성 경로 — base 팩에서만·추가만(위 함수 계약).
     let _ = merge_awakening_hooks_into_personal_profiles();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// U-19 · 첫기동 관문 시드 (C-4) — **훅 병합과 분리된 별도 단계**
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ## ★V-h 실측 (2026-08-24 · macOS · Claude Code 2.1.241 · 격리 `CLAUDE_CONFIG_DIR` · PTY 관측)
+//
+// 신규 프로필로 `claude` 를 띄워 화면과 `.claude.json` 을 4조합으로 대조했다.
+//
+// | 시드한 것 | 첫 화면 | 디스크에 남은 키 |
+// |---|---|---|
+// | (없음) | **테마 선택 관문** | `theme` 없음 · `hasCompletedOnboarding` 없음 |
+// | `theme:"dark"` | **테마 선택 관문**(변화 0) | ★`theme` 가 **지워졌다** |
+// | `hasCompletedOnboarding:true` | **폴더신뢰 관문**(테마·로그인 관문이 사라짐) | 키 유지 |
+// | 위 + `projects[<abs cwd>].hasTrustDialogAccepted:true` | **프롬프트**(관문 0) | 둘 다 유지 |
+//
+// 이 측정이 확정한 것 셋 —
+//   ① **효능이 있는 키는 둘뿐이다**: 전역 `hasCompletedOnboarding` 과 워크스페이스별
+//      `projects[<절대경로>].hasTrustDialogAccepted`. 관문 6종이 전부 사라진다.
+//   ② **`theme` 시드는 무효다.** claude 가 기동 시 `.claude.json` 을 자기 스키마로 다시 쓰면서
+//      모르는 키를 **버린다**(실측: 시드한 `theme` 가 소멸). 그래서 "관문마다 키를 하나씩"
+//      같은 모델링은 이 버전에서 거짓이다 — 측정한 두 키만 쓴다.
+//   ③ ★**`hasCompletedOnboarding` 은 로그인 관문까지 지운다.** 자격증명이 하나도 없는
+//      프로필에서도 좌석이 프롬프트에 도달했고 **65초 뒤에도 살아 있었다**(상태줄
+//      `Not logged in · Run /login`). 즉 이 키 하나가 **살아 있지만 아무 일도 못 하는 좌석**을
+//      만든다 — `profile_gate.rs`(U-17) 가 경고한 **허위 READY 영구화**가 바로 이 형태다.
+//
+// ## 그래서 이 단위의 안전 계약 — 로그인 관문은 **인증 증명 없이는 지우지 않는다**
+//
+// [`AuthPremise::Unproven`] 이면 [`SEED_KEY_ONBOARDING`] 을 **넣지 않는다**. 폴더신뢰만 시드하는
+// 것은 안전하다(그 창의 실측 기본 포커스가 이미 `Yes, I trust this folder` 이고, 대상 폴더는
+// 우리가 고른 것이다). 반대로 로그인 관문을 지우는 것은 **오살 방향**이다 — 관문 앞에서 멈춘
+// 좌석은 사람이 한 번 만지면 살아나지만, 관문이 지워진 미인증 좌석은 영원히 READY 로 보인다.
+// 이것은 판정 완화가 아니라 **한 방향으로만 여는 축**을 하나 더 세운 것이다.
+//
+// ## 왜 `install_hooks` 조기 return **위**인가 (도달성)
+//
+// GUI 인앱 업데이트는 항상 `cys init-pack --no-install-hook` 으로 내려온다
+// (`src-tauri/src/main.rs` `maybe_apply_pending_update`). 시드를 그 조기 return **아래**에 두면
+// **업데이트로 올라온 사용자 전원에게 영영 시드되지 않는다** — `agents.json` 값 수정이 기존
+// 기계에 닿지 않는 K-1 과 같은 계열의 도달성 결함이다. 그래서 시드는 훅과 **독립 플래그**로
+// 제어하고 조기 return 위에 둔다.
+//
+// ## 롤백 스위치 — 마스터 하나 + 축 노브 하나
+//
+// | 스위치 | 값 | 되돌아가는 범위 |
+// |---|---|---|
+// | **`CYS_BOOT_GATES`** | `0` | 이 캠페인이 추가한 축 전부(이 시드 포함) |
+// | `CYS_FIRST_RUN_SEED` | 미설정·`1` 이외 | **이 시드만 꺼짐 = 기본값** |
+//
+// ★극성이 형제 게이트(`기본 켜짐 · "0" 만 끔`)와 **반대**인 이유: 형제들은 *판정* 축이라 잊으면
+// 안전장치가 켜져 있는 방향이지만, 이 축은 **사용자 파일에 쓰고 안전 화면을 지우는** 축이다.
+// 잊어서 켜져 있으면 위 ③의 허위 READY 좌석이 생긴다. 두 경우 모두 규율은 같다 —
+// **잊어도 오늘과 같은 방향**으로 배치한다. 그 방향이 여기서는 '꺼짐'이다.
+// env 를 읽는 곳은 [`first_run_seed_enabled`] 하나뿐이고 판정은 순수
+// [`first_run_seed_enabled_from`] 에 있다.
+//
+// ## 롤백 경로(파일)
+// 쓰기 직전 원본을 옆자리 [`FIRST_RUN_SEED_BACKUP`] 로 복사한다. 되돌림은 그 파일을 제자리에
+// 옮기는 것 하나뿐이다.
+
+/// ★롤백 스위치의 env 이름(1지점). **기본은 꺼짐** — 정확히 `"1"` 만 켠다.
+pub const ENV_FIRST_RUN_SEED: &str = "CYS_FIRST_RUN_SEED";
+
+/// 이 시드 키 집합을 실측한 claude 바이너리 버전(V-h · 2026-08-24 · macOS).
+/// 벤더가 관문을 늘리면 이 값과 실기 버전이 갈린다 — 그때 재측정이 필요하다는 표식이다.
+pub const FIRST_RUN_SEED_MEASURED_ON: &str = "2.1.241";
+
+/// claude 프로필 config 파일 이름(격리 config dir 안).
+pub const CLAUDE_CONFIG_FILE: &str = ".claude.json";
+
+/// 시드 직전 원본 보관 이름 — **롤백 경로**(제자리로 옮기면 종전 상태).
+pub const FIRST_RUN_SEED_BACKUP: &str = ".claude.json.cys-seed.bak";
+
+/// 전역 온보딩 완료 키. ★테마 관문과 **로그인 관문**을 동시에 지운다(V-h 실측 ③).
+pub const SEED_KEY_ONBOARDING: &str = "hasCompletedOnboarding";
+
+/// 워크스페이스별 봉투 키(절대경로 → 설정).
+pub const SEED_KEY_PROJECTS: &str = "projects";
+
+/// 워크스페이스별 폴더신뢰 키.
+pub const SEED_KEY_TRUST: &str = "hasTrustDialogAccepted";
+
+/// 설치 시점 호출부가 넘기는 워크스페이스 목록 — **비어 있다**.
+///
+/// 좌석의 cwd 는 `cys launch-agent` 가 호출 폴더로 정한다(`run_launch_agent_opts`) — 팩 설치
+/// 시점에는 알 수 없고, 임의 폴더에 신뢰를 미리 박는 것은 이 저장소가 금지한 '임의 워크스페이스
+/// 접촉'이다. 실 워크스페이스 시드는 **좌석을 만드는 쪽**이 자기가 아는 경로로 이 함수를
+/// 부르는 것이 옳다(그 배선은 이 단위의 파일 반경 밖 — 인계 사항).
+const INSTALL_TIME_SEED_WORKSPACES: &[String] = &[];
+
+/// 이 프로필이 **인증되어 있음이 증명됐는가** — 로그인 관문을 지워도 되는지의 유일한 입력.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPremise {
+    /// 인증 오라클(`claude auth status --json`)이 통과를 냈다 → 로그인 관문 제거 허용.
+    Verified,
+    /// 미측정·미인증 → **로그인 관문을 지우지 않는다**(허위 READY 영구화 차단).
+    Unproven,
+}
+
+/// 시드 한 번의 결과. `Debug` 문자열이 그대로 운영 로그로 나간다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// 스위치가 꺼져 있다(기본값) — 파일을 열지도 않았다.
+    Disabled,
+    /// 넣을 것이 없다(이미 전부 있거나, 대상 키가 하나도 성립하지 않는다).
+    NothingToDo,
+    /// **보존 방향 거부** — 파손·미지 형태·백업 실패. 원본을 건드리지 않았다.
+    Refused(String),
+    /// 썼다. 되읽기까지 확인된 추가분.
+    Seeded(Vec<String>),
+    /// 썼으나 되읽기에서 확인되지 않았다(동시 writer 경합 등) — 주장으로 덮지 않는다.
+    Unverified(Vec<String>),
+    /// 쓰기 자체가 실패했다.
+    Failed(String),
+}
+
+/// 시드 스위치의 **순수 코어**. 마스터 접기값과 축 노브를 함께 받는다.
+///
+/// 마스터(`CYS_BOOT_GATES=0`)가 눌리면 축 노브가 `"1"` 이어도 꺼진다 — 사고 순간에 사람이
+/// 노브를 조합할 수 없다는 규율(BLOCK-3)이 여기에도 그대로 적용된다.
+pub fn first_run_seed_enabled_from(env_val: Option<&str>, master_legacy: bool) -> bool {
+    !master_legacy && env_val == Some("1")
+}
+
+/// 위 판정의 **유일한 env 판독 지점**(부작용 있음).
+pub fn first_run_seed_enabled() -> bool {
+    first_run_seed_enabled_from(
+        std::env::var(ENV_FIRST_RUN_SEED).ok().as_deref(),
+        crate::gate_axes_forced_legacy(),
+    )
+}
+
+// ── 한글 NFC/NFD (macOS 경로 정규화) ────────────────────────────────────────
+//
+// macOS 파일시스템은 경로를 **NFD**로 돌려주고 사람이 손으로 적은 config 는 **NFC**다. 같은
+// 폴더가 두 형태로 갈리면 `projects` 봉투에 **중복 항목**이 생기고 신뢰 시드가 엉뚱한 쪽에
+// 붙는다(= 관문이 그대로 남는다). 한글 음절의 조합·분해는 **표 없이 산술로** 정확히 계산되는
+// 유일한 스크립트라(Unicode Hangul Syllable Composition Algorithm) 외부 크레이트 없이 정본을
+// 구현한다. ★적용 범위는 한글로 한정한다 — 라틴 결합문자 등은 표가 필요하고, 그 경우 조회는
+// **정확 일치로 폴백**한다(모르는 것을 아는 척 접지 않는다).
+
+const HANGUL_S_BASE: u32 = 0xAC00;
+const HANGUL_L_BASE: u32 = 0x1100;
+const HANGUL_V_BASE: u32 = 0x1161;
+const HANGUL_T_BASE: u32 = 0x11A7;
+const HANGUL_L_COUNT: u32 = 19;
+const HANGUL_V_COUNT: u32 = 21;
+const HANGUL_T_COUNT: u32 = 28;
+const HANGUL_N_COUNT: u32 = HANGUL_V_COUNT * HANGUL_T_COUNT;
+const HANGUL_S_COUNT: u32 = HANGUL_L_COUNT * HANGUL_N_COUNT;
+
+/// 조합형 한글 음절 → 자모 분해(NFD). 그 밖의 문자는 그대로 둔다.
+pub fn hangul_nfd(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 2);
+    for ch in s.chars() {
+        let c = ch as u32;
+        if (HANGUL_S_BASE..HANGUL_S_BASE + HANGUL_S_COUNT).contains(&c) {
+            let si = c - HANGUL_S_BASE;
+            let (l, v, t) = (
+                HANGUL_L_BASE + si / HANGUL_N_COUNT,
+                HANGUL_V_BASE + (si % HANGUL_N_COUNT) / HANGUL_T_COUNT,
+                si % HANGUL_T_COUNT,
+            );
+            match (char::from_u32(l), char::from_u32(v)) {
+                (Some(lc), Some(vc)) => {
+                    out.push(lc);
+                    out.push(vc);
+                    if t != 0 {
+                        if let Some(tc) = char::from_u32(HANGUL_T_BASE + t) {
+                            out.push(tc);
+                        }
+                    }
+                }
+                // 산술상 도달 불가 — 도달하면 원문 보존(손실 금지).
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 자모 시퀀스 → 조합형 한글 음절(NFC). 그 밖의 문자는 그대로 둔다.
+pub fn hangul_nfc(s: &str) -> String {
+    let src: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        let l = src[i] as u32;
+        if (HANGUL_L_BASE..HANGUL_L_BASE + HANGUL_L_COUNT).contains(&l) && i + 1 < src.len() {
+            let v = src[i + 1] as u32;
+            if (HANGUL_V_BASE..HANGUL_V_BASE + HANGUL_V_COUNT).contains(&v) {
+                let mut si = (l - HANGUL_L_BASE) * HANGUL_N_COUNT
+                    + (v - HANGUL_V_BASE) * HANGUL_T_COUNT;
+                let mut used = 2usize;
+                if i + 2 < src.len() {
+                    let t = src[i + 2] as u32;
+                    if (HANGUL_T_BASE + 1..HANGUL_T_BASE + HANGUL_T_COUNT).contains(&t) {
+                        si += t - HANGUL_T_BASE;
+                        used = 3;
+                    }
+                }
+                if let Some(sy) = char::from_u32(HANGUL_S_BASE + si) {
+                    out.push(sy);
+                    i += used;
+                    continue;
+                }
+            }
+        }
+        out.push(src[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `projects` 봉투에서 이 워크스페이스가 **이미 어떤 형태로 들어 있는가**를 찾는다.
+///
+/// 규약(설계 U-19): 조회는 **양쪽 형태 모두**, 쓰기는 '이미 존재하는 형태가 있으면 그것,
+/// 없으면 NFC'. 새 항목을 NFD 로 만들면 사람이 손으로 적은 config 와 영원히 갈린다.
+fn resolve_project_key(projects: &serde_json::Map<String, serde_json::Value>, ws: &str) -> String {
+    if projects.contains_key(ws) {
+        return ws.to_string();
+    }
+    let folded = hangul_nfd(ws);
+    for k in projects.keys() {
+        if hangul_nfd(k) == folded {
+            return k.clone();
+        }
+    }
+    hangul_nfc(ws)
+}
+
+/// 시드 계획 — [`plan_first_run_seed`] 의 산출.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedPlan {
+    /// 쓸 값(추가분이 없으면 입력과 같다).
+    pub next: serde_json::Value,
+    /// 추가되는 키 경로의 사람용 라벨.
+    pub added: Vec<String>,
+    /// 보존 방향 거부 사유(있으면 아무것도 쓰지 않는다).
+    pub refused: Option<String>,
+}
+
+/// **순수 계획기** — IO 도 env 도 없다. 판정은 전부 여기 있고 아래 IO 함수는 배선만 한다.
+///
+/// 계약 넷:
+///   ① **부재 키만 채운다.** 이미 있는 값은 `false` 여도 덮지 않는다(사용자 의사 불가침).
+///   ② **다른 키는 전부 보존한다** — `oauthAccount` 포함(회귀 핀이 집행).
+///   ③ **모르는 형태는 거부한다.** 최상위가 객체가 아니거나 `projects` 가 객체가 아니면
+///      한 글자도 쓰지 않는다(파손 파일을 우리 스키마로 덮는 것이 더 위험하다).
+///   ④ [`AuthPremise::Unproven`] 이면 [`SEED_KEY_ONBOARDING`] 을 넣지 않는다(V-h ③).
+pub fn plan_first_run_seed(
+    existing: &serde_json::Value,
+    workspaces: &[String],
+    premise: AuthPremise,
+) -> SeedPlan {
+    let refuse = |why: &str| SeedPlan {
+        next: existing.clone(),
+        added: Vec::new(),
+        refused: Some(why.to_string()),
+    };
+    let Some(root) = existing.as_object() else {
+        return refuse("최상위가 JSON 객체가 아니다 — 덮지 않는다");
+    };
+    let mut next = root.clone();
+    let mut added: Vec<String> = Vec::new();
+
+    // ④ 로그인 관문 제거는 인증 증명이 있을 때만.
+    if premise == AuthPremise::Verified && !next.contains_key(SEED_KEY_ONBOARDING) {
+        next.insert(SEED_KEY_ONBOARDING.to_string(), serde_json::Value::Bool(true));
+        added.push(SEED_KEY_ONBOARDING.to_string());
+    }
+
+    if !workspaces.is_empty() {
+        let mut projects = match next.get(SEED_KEY_PROJECTS) {
+            None => serde_json::Map::new(),
+            Some(serde_json::Value::Object(m)) => m.clone(),
+            Some(_) => return refuse("`projects` 가 객체가 아니다 — 덮지 않는다"),
+        };
+        let mut touched = false;
+        for ws in workspaces {
+            if ws.is_empty() {
+                continue;
+            }
+            let key = resolve_project_key(&projects, ws);
+            let entry = projects
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            // 남이 만든 형태(객체 아님)는 보존하고 건너뛴다 — 관문이 남는 쪽이 안전하다.
+            let Some(obj) = entry.as_object_mut() else {
+                continue;
+            };
+            if !obj.contains_key(SEED_KEY_TRUST) {
+                obj.insert(SEED_KEY_TRUST.to_string(), serde_json::Value::Bool(true));
+                added.push(format!("{SEED_KEY_PROJECTS}[{key}].{SEED_KEY_TRUST}"));
+                touched = true;
+            }
+        }
+        // 추가분이 있을 때만 봉투를 얹는다(빈 `projects` 를 새로 만들어 쓰기를 유발하지 않는다).
+        if touched {
+            next.insert(
+                SEED_KEY_PROJECTS.to_string(),
+                serde_json::Value::Object(projects),
+            );
+        }
+    }
+
+    SeedPlan {
+        next: serde_json::Value::Object(next),
+        added,
+        refused: None,
+    }
+}
+
+/// 첫기동 관문 시드 — **스위치를 읽는 바깥 껍데기**(설치 경로가 부르는 것은 이쪽).
+pub fn seed_first_run_gates(
+    cfg: &Path,
+    workspaces: &[String],
+    premise: AuthPremise,
+) -> SeedOutcome {
+    if !first_run_seed_enabled() {
+        return SeedOutcome::Disabled;
+    }
+    seed_first_run_gates_at(cfg, workspaces, premise)
+}
+
+/// 시드의 IO 부(스위치 무관 — 검체가 env 를 건드리지 않고 거동을 시험할 수 있게 분리).
+///
+/// 쓰는 파일은 **`<cfg>/.claude.json` 과 그 백업 하나뿐**이다. 개인 프로필(`~/.claude*`)·
+/// 임의 워크스페이스는 이 함수의 어떤 경로에서도 열리지 않는다(검체가 단언).
+pub fn seed_first_run_gates_at(
+    cfg: &Path,
+    workspaces: &[String],
+    premise: AuthPremise,
+) -> SeedOutcome {
+    let path = cfg.join(CLAUDE_CONFIG_FILE);
+    let existed = path.exists();
+    let existing = if existed {
+        match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return SeedOutcome::Refused(format!("{} 파싱 불가 — 보존: {e}", path.display()))
+                }
+            },
+            Err(e) => {
+                return SeedOutcome::Refused(format!("{} 읽기 불가 — 보존: {e}", path.display()))
+            }
+        }
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let plan = plan_first_run_seed(&existing, workspaces, premise);
+    if let Some(why) = plan.refused {
+        return SeedOutcome::Refused(why);
+    }
+    if plan.added.is_empty() {
+        return SeedOutcome::NothingToDo;
+    }
+
+    // 롤백 경로 — 원본을 옆자리에 보관한다. 실패하면 **시드하지 않는다**(되돌릴 수 없는 쓰기 금지).
+    // ★파일이 애초에 없었으면 백업도 없다 — 그 경우의 되돌림은 `.claude.json` 삭제 하나다
+    //   (claude 가 다음 기동에 종전과 같은 신규 프로필을 다시 만든다). 백업 부재는 곧
+    //   "시드 이전에는 이 파일이 존재하지 않았다" 의 기록이므로 정보가 사라지지 않는다.
+    if existed {
+        if let Err(e) = std::fs::copy(&path, cfg.join(FIRST_RUN_SEED_BACKUP)) {
+            return SeedOutcome::Refused(format!("백업 실패 — 시드 보류: {e}"));
+        }
+    }
+
+    let body = match serde_json::to_vec_pretty(&plan.next) {
+        Ok(b) => b,
+        Err(e) => return SeedOutcome::Failed(e.to_string()),
+    };
+    // ★권한 보존: `write_atomic` 은 tmp+rename 이라 원본 mode 가 사라진다(factory_reset.rs 의
+    //   같은 관찰). `.claude.json` 은 실측 0600 이다 — 시드가 0644 로 넓히면 안 된다.
+    let mode = existing_file_mode(&path).or(Some(0o600));
+    if let Err(e) = write_atomic_mode(&path, &body, mode) {
+        return SeedOutcome::Failed(format!("{}: {e}", path.display()));
+    }
+
+    // 사후 검증 — '썼다'는 주장이 아니라 **되읽기**로 확인한다. 같은 순수 계획기를 다시 돌려
+    // "이제 추가할 것이 없다" 를 오라클로 쓴다(판정 사본 0).
+    let verified = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .map(|v| {
+            let re = plan_first_run_seed(&v, workspaces, premise);
+            re.refused.is_none() && re.added.is_empty()
+        })
+        .unwrap_or(false);
+    if verified {
+        SeedOutcome::Seeded(plan.added)
+    } else {
+        SeedOutcome::Unverified(plan.added)
+    }
+}
+
+/// 기존 파일의 퍼미션 비트(unix). 파일이 없거나 unix 가 아니면 `None`.
+#[cfg(unix)]
+fn existing_file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn existing_file_mode(_path: &Path) -> Option<u32> {
+    None
 }
 
 /// 설치 매니페스트: rel → 설치 당시 내용의 sha256. "지금 디스크에 있는 파일이 우리가
@@ -1386,6 +1999,16 @@ pub fn pack_current_for(binary_version: &str) -> bool {
 /// 디렉터리 fsync(best-effort). 쓰는 도중 crash 시 부분 파일이 최종 경로에 남지 않는다
 /// (std::fs::write는 비원자라 부분 쓰기 노출). cysd governance의 write_json_atomic과 동형.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, bytes, None)
+}
+
+/// [`write_atomic`] 의 **퍼미션 보존판**. `mode=None` 이면 종전과 완전히 같다(위임 관계라
+/// 사본이 아니다 — 이 저장소가 반복해서 맞은 것이 사본 드리프트다).
+///
+/// 왜 필요한가: tmp+rename 은 **원본 mode 를 버린다**(`factory_reset.rs` 의 같은 관찰).
+/// `.claude.json` 은 실측 0600 이라, 시드가 그것을 0644 로 넓히면 안 된다. 되돌려 chmod 하는
+/// 방식은 넓은 창이 잠깐 열리므로, **처음부터** 목표 mode 로 만든다.
+pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -1395,7 +2018,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })?;
     let tmp = parent.join(format!(".{fname}.tmp.{}", std::process::id()));
     let res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_tmp_with_mode(&tmp, mode)?;
         f.write_all(bytes)?;
         f.sync_all()?; // 파일 본문 fsync (rename 전)
         std::fs::rename(&tmp, path)?; // 원자 교체
@@ -1414,6 +2037,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// tmp 파일 생성 — `mode=Some(m)` 이면 **생성 시점부터** 그 퍼미션이다(사후 chmod 창 0).
+/// `mode=None` 이면 `File::create` 와 동치(종전 경로 무변경).
+#[cfg(unix)]
+fn create_tmp_with_mode(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    let Some(m) = mode else {
+        return std::fs::File::create(tmp);
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    // 잔여 tmp 가 있으면 `.mode()` 는 적용되지 않는다(생성 시에만 유효) — 먼저 치운다.
+    let _ = std::fs::remove_file(tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(m)
+        .open(tmp)
+}
+
+#[cfg(not(unix))]
+fn create_tmp_with_mode(tmp: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(tmp)
 }
 
 /// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
@@ -2833,6 +3479,146 @@ mod tests {
             "부재 파일에 각성 2훅이 생성되지 않았다"
         );
         assert!(verify_desired_hooks_registered(&fresh, &pack, &AWAKENING_HOOKS).is_empty());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★U-21 · 선언 timeout 축의 **순수 진리표**.
+    ///
+    /// 이 표가 지키는 것은 하나다 — "선언은 하한이지 동등이 아니다". 동등으로 읽으면 사용자가
+    /// 더 크게 잡아둔 값을 우리가 **내리고**, 그 순간 살아서 완주하던 부트가 잘린다(오살).
+    #[test]
+    fn hook_timeout_declaration_is_a_floor_not_an_equality() {
+        // 선언 없음 = 아무것도 단언하지 않는다(종전 판정과 동일).
+        assert!(hook_timeout_satisfied(None, None));
+        assert!(hook_timeout_satisfied(Some(1), None));
+        // 선언 있음: 미기록은 **불충족**(하네스 기본 30s 를 우리가 읽을 길이 없다).
+        assert!(!hook_timeout_satisfied(None, Some(600)));
+        // 저값 불충족 · 동값 충족 · **고값도 충족**(내리지 않는다).
+        assert!(!hook_timeout_satisfied(Some(30), Some(600)));
+        assert!(hook_timeout_satisfied(Some(600), Some(600)));
+        assert!(hook_timeout_satisfied(Some(900), Some(600)));
+        // 선언값이 하네스 기본을 실제로 넘는가 — 넘지 못하면 이 단위는 아무것도 고치지 않은 것이다.
+        assert!(
+            HOOK_TIMEOUT_ROLE_BOOTSTRAP_S > HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S,
+            "선언 timeout 이 하네스 기본값 이하다 — 부트 체인 무음 취소가 그대로 남는다"
+        );
+        // 각성 매니페스트가 실제로 그 선언을 싣고 있는가(리터럴 회귀 핀).
+        let ups = AWAKENING_HOOKS
+            .iter()
+            .find(|h| h.event == "UserPromptSubmit")
+            .expect("UserPromptSubmit 각성 훅이 사라졌다");
+        assert_eq!(ups.timeout, Some(HOOK_TIMEOUT_ROLE_BOOTSTRAP_S));
+    }
+
+    /// ★U-21 · 롤백 스위치는 **마스터 한 손잡이**로 닫힌다(사고 순간 조합 금지).
+    #[test]
+    fn hook_timeout_axis_folds_into_master_switch() {
+        // 기본(미설정) = 신동작.
+        assert!(!hook_timeout_axis_legacy_from(None, None));
+        // 축 전용 노브.
+        assert!(hook_timeout_axis_legacy_from(None, Some("1")));
+        assert!(!hook_timeout_axis_legacy_from(None, Some("0")));
+        // ★마스터 하나로 축이 종전으로 돌아간다.
+        assert!(hook_timeout_axis_legacy_from(Some("0"), None));
+        // 엄격 비교 — 형제 축과 같은 규약("false"·"" 같은 값으로 꺼지지 않는다).
+        assert!(!hook_timeout_axis_legacy_from(Some("false"), Some("yes")));
+        assert_eq!(ENV_HOOK_TIMEOUT_V1, "CYS_HOOK_TIMEOUT_V1");
+    }
+
+    /// ★U-21 · **불일치 엔트리 교체 경로** — 명령은 같고 timeout 만 미달일 때.
+    ///
+    /// 이 테스트가 잡는 실패 두 가지가 정확히 이 제품이 낸 사고다:
+    ///   ① append 로 처리 → 같은 명령 2회 등재 → **매 프롬프트 훅 2회 발화**(큐 폭주 방향)
+    ///   ② 엔트리 통째 교체 → 같은 배열의 **사용자 항목 소실**(오살)
+    #[test]
+    fn timeout_mismatch_is_reconciled_in_place_not_appended() {
+        let td = std::env::temp_dir().join(format!("cys-u21-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let pack = td.join("pack");
+        let settings = td.join("settings.json");
+        let ups = AWAKENING_HOOKS
+            .iter()
+            .find(|h| h.event == "UserPromptSubmit")
+            .unwrap();
+        let ours = hook_command_for(&pack, ups.script);
+
+        // 기존 디스크 상태 = 우리 훅이 **timeout 없이** 실려 있고, 옆에 사용자 훅이 있다.
+        std::fs::write(
+            &settings,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]},
+                        {"hooks": [{"type": "command", "command": ours}]}
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let added = merge_desired_hooks(&settings, &pack, &AWAKENING_HOOKS).unwrap();
+        assert!(
+            added.iter().any(|a| a.contains("timeout")),
+            "timeout 미달을 교정하지 않았다: {added:?}"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let arr = after["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        // ① 중복 append 0 — 우리 명령은 여전히 정확히 1회.
+        let n = arr
+            .iter()
+            .filter(|e| {
+                e["hooks"]
+                    .as_array()
+                    .map(|hs| hs.iter().any(|x| x["command"] == ours.as_str()))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(n, 1, "교체가 아니라 중복 append 됐다(훅 2회 발화 = 폭주 방향)");
+        // ② 사용자 항목 보존.
+        assert!(
+            arr.iter().any(|e| {
+                e["hooks"]
+                    .as_array()
+                    .map(|hs| hs.iter().any(|x| x["command"] == "sh /home/u/mine.sh"))
+                    .unwrap_or(false)
+            }),
+            "사용자 훅이 사라졌다(오살)"
+        );
+        // ③ 값이 실제로 선언값으로 올라갔고, 재실행은 멱등이다.
+        assert!(verify_desired_hooks_registered(&settings, &pack, &AWAKENING_HOOKS).is_empty());
+        assert!(
+            merge_desired_hooks(&settings, &pack, &AWAKENING_HOOKS)
+                .unwrap()
+                .is_empty(),
+            "교정 후 재실행이 또 썼다(멱등 위반)"
+        );
+
+        // ④ ★사용자가 **더 크게** 잡아둔 값은 내리지 않는다 — 한 방향으로만 여는 축.
+        let hi = td.join("settings-hi.json");
+        std::fs::write(
+            &hi,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {"UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": ours, "timeout": 900}]}
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let added_hi = merge_desired_hooks(&hi, &pack, &AWAKENING_HOOKS).unwrap();
+        assert!(
+            !added_hi.iter().any(|a| a.contains("UserPromptSubmit")),
+            "더 큰 사용자 값을 우리 값으로 내렸다(오살 방향): {added_hi:?}"
+        );
+        let after_hi: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hi).unwrap()).unwrap();
+        assert_eq!(
+            after_hi["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
+            serde_json::json!(900)
+        );
         let _ = std::fs::remove_dir_all(&td);
     }
 
@@ -5621,5 +6407,414 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // U-19 · 첫기동 관문 시드 (C-4) — V-h 실측을 계약으로 박제한다
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn u19_tmp(tag: &str) -> PathBuf {
+        let td = std::env::temp_dir().join(format!("cys-u19-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        td
+    }
+
+    fn u19_json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    /// 롤백 스위치 진리표 — **기본은 꺼짐**이고 마스터가 축 노브를 이긴다.
+    ///
+    /// 극성이 형제 게이트와 반대인 이유는 모듈 문서에 있다(이 축은 사용자 파일에 쓰고 안전
+    /// 화면을 지운다 → 잊으면 꺼져 있어야 오늘과 같다).
+    #[test]
+    fn u19_seed_switch_defaults_off_and_master_switch_wins() {
+        // 축 노브만 볼 때: "1" 만 켠다(느슨한 truthy 금지 — 형제 게이트와 같은 엄격 비교).
+        for v in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("on"), Some("2")] {
+            assert!(
+                !first_run_seed_enabled_from(v, false),
+                "축 노브 {v:?} 가 시드를 켰다 — 기본 꺼짐 계약 위반"
+            );
+        }
+        assert!(first_run_seed_enabled_from(Some("1"), false), "명시 1 이 켜지 않는다");
+        // 마스터(`CYS_BOOT_GATES=0`)가 눌리면 축 노브가 "1" 이어도 꺼진다.
+        assert!(
+            !first_run_seed_enabled_from(Some("1"), true),
+            "마스터 스위치가 이 축에 닿지 않는다 — BLOCK-3 형태의 반쪽 롤백"
+        );
+    }
+
+    /// ★V-h ③ 박제 — **인증 증명 없이 로그인 관문을 지우지 않는다.**
+    ///
+    /// 실측(2026-08-24 · 2.1.241 · macOS): 자격증명이 하나도 없는 프로필에
+    /// `hasCompletedOnboarding:true` 만 넣으면 테마·로그인 관문이 **둘 다 사라지고** 좌석이
+    /// 프롬프트에 도달해 65초 뒤에도 살아 있었다(상태줄 `Not logged in`). 그 좌석은 영원히
+    /// READY 로 보이지만 아무 일도 못 한다 — 관문 앞에서 멈춘 좌석보다 나쁘다.
+    ///
+    /// ★계측 타당성(in-band): 수리 전 술어("프리미스와 무관하게 온보딩 키를 넣는다")를 아래에
+    /// 재현해, 그 술어라면 미인증 프로필에 키가 들어갔음을 같은 검체 안에서 보인다.
+    #[test]
+    fn u19_plan_refuses_login_gate_erasure_without_auth_premise() {
+        let fresh = u19_json("{}");
+
+        let unproven = plan_first_run_seed(&fresh, &[], AuthPremise::Unproven);
+        assert!(unproven.refused.is_none(), "정상 입력을 거부했다: {unproven:?}");
+        assert!(
+            unproven.added.is_empty(),
+            "미인증 프로필에 무언가를 시드했다 — 허위 READY 좌석 제조: {:?}",
+            unproven.added
+        );
+        assert!(
+            unproven.next.get(SEED_KEY_ONBOARDING).is_none(),
+            "미인증인데 로그인 관문이 지워졌다"
+        );
+
+        let verified = plan_first_run_seed(&fresh, &[], AuthPremise::Verified);
+        assert_eq!(
+            verified.next.get(SEED_KEY_ONBOARDING),
+            Some(&serde_json::Value::Bool(true)),
+            "인증 증명이 있는데도 온보딩 키가 들어가지 않았다"
+        );
+        assert_eq!(verified.added, vec![SEED_KEY_ONBOARDING.to_string()]);
+
+        // ── 계측 타당성: 수리 전 술어 재현 ──
+        let legacy_predicate = |_: AuthPremise| true; // 구 설계: 프리미스 개념 자체가 없었다
+        assert!(
+            legacy_predicate(AuthPremise::Unproven),
+            "구 술어 재현이 실패했다 — 이 검체는 무엇도 증명하지 못한다"
+        );
+        // 구 술어였다면 미인증 프로필에 키가 들어갔을 것이다. 지금 판정과 갈린다는 것이
+        // 이 수리가 실재한다는 증거다.
+        assert_ne!(
+            legacy_predicate(AuthPremise::Unproven),
+            !unproven.added.is_empty(),
+            "신·구 술어가 같은 답을 낸다 — 로그인 관문 보호가 실재하지 않는다"
+        );
+    }
+
+    /// 부재 키만 채운다 · 다른 키는 **전부** 보존한다(`oauthAccount` 포함).
+    ///
+    /// `oauthAccount` 보존은 U-19 게이트 4항 중 하나다. 시드가 신원 봉투를 갈아치우면
+    /// `accounts.rs` 의 신원 판정(=`oauthAccount.accountUuid` 존재)이 통째로 흔들린다.
+    #[test]
+    fn u19_plan_is_additive_and_preserves_every_other_key() {
+        let before = u19_json(
+            r#"{
+                "oauthAccount": {"accountUuid": "c45eaec5-0000-0000-0000-000000000000",
+                                 "emailAddress": "x@example.com"},
+                "userID": "u", "machineID": "m", "migrationVersion": 13,
+                "hasCompletedOnboarding": false,
+                "projects": {"/keep": {"hasTrustDialogAccepted": false, "allowedTools": []}}
+            }"#,
+        );
+        // ★`/keep` 을 **시드 대상에 포함**한다 — 대상이 아닌 항목이 안 바뀌는 것은 자명하고,
+        //   진짜 계약은 "시드하러 간 항목이 이미 값을 갖고 있으면 덮지 않는다" 다.
+        let ws = vec!["/keep".to_string(), "/new".to_string()];
+        let plan = plan_first_run_seed(&before, &ws, AuthPremise::Verified);
+        assert!(plan.refused.is_none(), "정상 입력을 거부했다: {plan:?}");
+
+        // ① 이미 있는 값은 `false` 여도 덮지 않는다.
+        assert_eq!(
+            plan.next.get(SEED_KEY_ONBOARDING),
+            Some(&serde_json::Value::Bool(false)),
+            "사용자가 false 로 둔 키를 덮었다 — 부재 키만 채운다는 계약 위반"
+        );
+        assert_eq!(
+            plan.next
+                .pointer("/projects/~1keep/hasTrustDialogAccepted"),
+            Some(&serde_json::Value::Bool(false)),
+            "기존 워크스페이스의 false 신뢰를 덮었다"
+        );
+
+        // ② oauthAccount 는 비트 단위로 그대로다.
+        assert_eq!(
+            plan.next.get("oauthAccount"),
+            before.get("oauthAccount"),
+            "★oauthAccount 가 변조됐다 — 신원 봉투 보존 계약 위반"
+        );
+        for k in ["userID", "machineID", "migrationVersion"] {
+            assert_eq!(plan.next.get(k), before.get(k), "무관한 키 {k} 가 바뀌었다");
+        }
+        assert_eq!(
+            plan.next.pointer("/projects/~1keep/allowedTools"),
+            before.pointer("/projects/~1keep/allowedTools"),
+            "기존 워크스페이스의 다른 필드가 사라졌다"
+        );
+
+        // ③ 새 워크스페이스에만 신뢰가 붙는다.
+        assert_eq!(
+            plan.next.pointer("/projects/~1new/hasTrustDialogAccepted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            plan.added,
+            vec![format!("{SEED_KEY_PROJECTS}[/new].{SEED_KEY_TRUST}")]
+        );
+    }
+
+    /// 한글 경로 픽스처 — NFC/NFD 어느 형태로 들어와도 **기존 항목을 찾아** 붙고,
+    /// 새로 만들 때는 NFC 로 쓴다(중복 항목 0).
+    #[test]
+    fn u19_project_key_lookup_spans_nfc_and_nfd() {
+        let nfc = "/Users/x/바탕화면/작업"; // 사람이 손으로 적은 형태
+        let nfd = hangul_nfd(nfc); // macOS 파일시스템이 돌려주는 형태
+        assert_ne!(nfc, nfd.as_str(), "픽스처가 두 형태로 갈리지 않는다 — 검체 무효");
+
+        // ⓐ 디스크에 NFD 로 있고 요청이 NFC → **기존 항목**에 붙는다(중복 생성 0).
+        let disk_nfd = serde_json::json!({ "projects": { nfd.clone(): {} } });
+        let p = plan_first_run_seed(&disk_nfd, &[nfc.to_string()], AuthPremise::Unproven);
+        let projects = p.next.get(SEED_KEY_PROJECTS).unwrap().as_object().unwrap();
+        assert_eq!(projects.len(), 1, "NFC/NFD 중복 항목이 생겼다: {:?}", projects.keys());
+        assert_eq!(
+            projects.get(nfd.as_str()).unwrap().get(SEED_KEY_TRUST),
+            Some(&serde_json::Value::Bool(true)),
+            "기존 NFD 항목에 신뢰가 붙지 않았다(엉뚱한 항목에 붙었다 = 관문 그대로)"
+        );
+
+        // ⓑ 디스크에 NFC 로 있고 요청이 NFD → 역방향도 같다.
+        let disk_nfc = serde_json::json!({ "projects": { nfc: {} } });
+        let q = plan_first_run_seed(&disk_nfc, &[nfd.clone()], AuthPremise::Unproven);
+        let qp = q.next.get(SEED_KEY_PROJECTS).unwrap().as_object().unwrap();
+        assert_eq!(qp.len(), 1, "역방향에서 중복 항목이 생겼다");
+        assert!(qp.contains_key(nfc), "역방향에서 기존 NFC 항목을 못 찾았다");
+
+        // ⓒ 아무것도 없으면 **NFC** 로 만든다(사람이 적는 형태와 갈리지 않게).
+        let empty = u19_json("{}");
+        let r = plan_first_run_seed(&empty, &[nfd.clone()], AuthPremise::Unproven);
+        let rp = r.next.get(SEED_KEY_PROJECTS).unwrap().as_object().unwrap();
+        assert!(
+            rp.contains_key(nfc),
+            "새 항목이 NFC 가 아니다: {:?}",
+            rp.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// 한글 조합·분해가 산술적으로 정확한가(외부 크레이트 없이 구현한 정본의 자기검증).
+    #[test]
+    fn u19_hangul_normalization_is_exact_and_scoped() {
+        // 받침 있음/없음 · 비한글 혼재 · 왕복
+        for s in ["한글", "가", "값", "뷁", "/a/한/b-1_c.txt", "ascii only", "日本語", ""] {
+            let d = hangul_nfd(s);
+            assert_eq!(hangul_nfc(&d), s, "왕복이 깨졌다: {s:?} → {d:?}");
+        }
+        // 분해 결과는 자모 영역이다(조합형이 남아 있으면 폴딩이 헛돈다).
+        assert!(
+            hangul_nfd("값").chars().all(|c| (0x1100..0x1200).contains(&(c as u32))),
+            "분해 결과에 조합형이 남았다"
+        );
+        assert_eq!(hangul_nfd("값").chars().count(), 3, "종성이 분리되지 않았다");
+        assert_eq!(hangul_nfd("가").chars().count(), 2, "종성 없는 음절 분해가 틀렸다");
+        // 비한글은 손대지 않는다(범위 한정 — 모르는 것을 아는 척 접지 않는다).
+        for s in ["café", "Ω", "e\u{0301}"] {
+            assert_eq!(hangul_nfd(s), s, "비한글을 건드렸다: {s:?}");
+            assert_eq!(hangul_nfc(s), s, "비한글을 건드렸다: {s:?}");
+        }
+    }
+
+    /// 모르는 형태는 **거부**한다 — 파손 파일을 우리 스키마로 덮는 것이 더 위험하다.
+    #[test]
+    fn u19_plan_refuses_unknown_shapes_without_writing() {
+        for bad in ["[]", "\"str\"", "3", "null"] {
+            let v = u19_json(bad);
+            let p = plan_first_run_seed(&v, &[], AuthPremise::Verified);
+            assert!(p.refused.is_some(), "최상위 {bad} 를 덮으려 했다");
+            assert!(p.added.is_empty());
+            assert_eq!(p.next, v, "거부했는데 값이 바뀌었다");
+        }
+        let bad_projects = u19_json(r#"{"projects": "not-an-object"}"#);
+        let p = plan_first_run_seed(&bad_projects, &["/x".to_string()], AuthPremise::Verified);
+        assert!(p.refused.is_some(), "projects 가 문자열인데 덮으려 했다");
+        assert_eq!(p.next, bad_projects, "거부했는데 값이 바뀌었다");
+
+        // 워크스페이스 항목이 객체가 아니면 **그 항목만** 건너뛰고 보존한다.
+        let odd = u19_json(r#"{"projects": {"/x": 7}}"#);
+        let q = plan_first_run_seed(&odd, &["/x".to_string()], AuthPremise::Unproven);
+        assert!(q.refused.is_none());
+        assert!(q.added.is_empty(), "객체가 아닌 항목에 키를 밀어 넣었다");
+        assert_eq!(q.next, odd, "보존 대상이 바뀌었다");
+    }
+
+    /// IO — 백업 생성 · 원자 교체 · **퍼미션 보존(0600)** · 되읽기 검증.
+    #[test]
+    fn u19_seed_writes_backup_and_keeps_permissions() {
+        let td = u19_tmp("io");
+        let cfg = td.join("iso");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = cfg.join(CLAUDE_CONFIG_FILE);
+        let before = r#"{"userID":"u","oauthAccount":{"accountUuid":"a"}}"#;
+        std::fs::write(&target, before).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let ws = vec![cfg.to_string_lossy().into_owned()];
+        let out = seed_first_run_gates_at(&cfg, &ws, AuthPremise::Verified);
+        match &out {
+            SeedOutcome::Seeded(added) => assert_eq!(added.len(), 2, "추가분 셈이 틀렸다: {added:?}"),
+            other => panic!("시드가 성립하지 않았다: {other:?}"),
+        }
+
+        // 롤백 경로: 원본이 옆자리에 그대로.
+        let bak = std::fs::read_to_string(cfg.join(FIRST_RUN_SEED_BACKUP)).unwrap();
+        assert_eq!(bak, before, "백업이 원본과 다르다 — 롤백 경로가 거짓이다");
+
+        // 결과: 부재 키만 추가 · oauthAccount 보존.
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(after.get("userID"), Some(&serde_json::json!("u")));
+        assert_eq!(
+            after.pointer("/oauthAccount/accountUuid"),
+            Some(&serde_json::json!("a")),
+            "★oauthAccount 가 시드로 변조됐다"
+        );
+        assert_eq!(after.get(SEED_KEY_ONBOARDING), Some(&serde_json::json!(true)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                m, 0o600,
+                "★퍼미션이 넓어졌다(0{m:o}) — tmp+rename 이 mode 를 버렸다"
+            );
+        }
+
+        // 멱등: 다시 돌리면 넣을 것이 없다.
+        assert_eq!(
+            seed_first_run_gates_at(&cfg, &ws, AuthPremise::Verified),
+            SeedOutcome::NothingToDo,
+            "두 번째 시드가 다시 썼다(멱등 아님)"
+        );
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★개인 프로필 무접촉 — 목 HOME 의 `.claude`·`.claude-2` 가 **한 바이트도** 바뀌지 않는다.
+    ///
+    /// `merge_awakening_hooks_into_personal_profiles` 와 이 단계를 **절대 공유하지 않는다**는
+    /// 계약의 기계 집행자다. 시드가 개인 프로필로 번지면 격리의 의미가 사라진다.
+    #[test]
+    fn u19_seed_never_touches_personal_profiles() {
+        let td = u19_tmp("personal");
+        let home = td.join("home");
+        let mut fixtures = Vec::new();
+        for p in [".claude", ".claude-2"] {
+            let d = home.join(p);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = d.join(CLAUDE_CONFIG_FILE);
+            let body = format!("{{\"personal\":\"{p}\",\"hasCompletedOnboarding\":false}}");
+            std::fs::write(&f, &body).unwrap();
+            fixtures.push((f, body));
+        }
+        // 홈 직하 파일도 함께 동결한다(`~/.claude.json` 은 실재하는 경로다).
+        let home_json = home.join(CLAUDE_CONFIG_FILE);
+        std::fs::write(&home_json, "{\"personal\":\"home\"}").unwrap();
+        fixtures.push((home_json, "{\"personal\":\"home\"}".to_string()));
+
+        let cfg = td.join("iso");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let out = seed_first_run_gates_at(
+            &cfg,
+            &[home.to_string_lossy().into_owned()],
+            AuthPremise::Verified,
+        );
+        assert!(matches!(out, SeedOutcome::Seeded(_)), "시드가 성립하지 않았다: {out:?}");
+
+        for (f, want) in &fixtures {
+            assert_eq!(
+                &std::fs::read_to_string(f).unwrap(),
+                want,
+                "★개인 프로필이 변조됐다: {}",
+                f.display()
+            );
+        }
+        // 개인 프로필 dir 에 백업·tmp 같은 부산물도 생기지 않았다.
+        for p in [".claude", ".claude-2"] {
+            let names: Vec<String> = std::fs::read_dir(home.join(p))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                names,
+                vec![CLAUDE_CONFIG_FILE.to_string()],
+                "개인 프로필 dir 에 부산물이 생겼다: {names:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 파손 config 는 **읽고 거부**한다 — 한 바이트도 쓰지 않는다.
+    #[test]
+    fn u19_seed_refuses_corrupt_config_untouched() {
+        let td = u19_tmp("corrupt");
+        let cfg = td.join("iso");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let target = cfg.join(CLAUDE_CONFIG_FILE);
+        let junk = "{ this is not json";
+        std::fs::write(&target, junk).unwrap();
+
+        let out = seed_first_run_gates_at(&cfg, &["/w".to_string()], AuthPremise::Verified);
+        assert!(matches!(out, SeedOutcome::Refused(_)), "파손 파일을 덮으려 했다: {out:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), junk, "파손 파일이 바뀌었다");
+        assert!(
+            !cfg.join(FIRST_RUN_SEED_BACKUP).exists(),
+            "쓰지도 않았는데 백업이 생겼다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// `write_atomic` 의 종전 경로(`mode=None`)는 무변경이고, `Some(m)` 은 **생성 시점부터**
+    /// 그 퍼미션이다(사후 chmod 창 0).
+    #[test]
+    fn u19_write_atomic_mode_applies_at_creation() {
+        let td = u19_tmp("mode");
+        let a = td.join("none.txt");
+        write_atomic(&a, b"x").unwrap();
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "x");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let b = td.join("mode.txt");
+            write_atomic_mode(&b, b"y", Some(0o600)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&b).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            // 잔여 tmp 가 있어도 목표 mode 로 만들어진다(`.mode()` 는 생성 시에만 유효).
+            let c = td.join("stale.txt");
+            let tmp = td.join(format!(".stale.txt.tmp.{}", std::process::id()));
+            std::fs::write(&tmp, b"junk").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+            write_atomic_mode(&c, b"z", Some(0o600)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&c).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "잔여 tmp 때문에 퍼미션이 넓어졌다"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 설치 경로 호출부는 **오늘 아무것도 하지 않는다** — 스위치 기본 꺼짐 ∧ 프리미스 미증명
+    /// ∧ 워크스페이스 0. 세 이유가 **독립적으로** 성립한다(하나가 풀려도 나머지가 막는다).
+    #[test]
+    fn u19_install_time_call_site_is_inert_by_three_independent_reasons() {
+        assert!(
+            INSTALL_TIME_SEED_WORKSPACES.is_empty(),
+            "설치 시점 호출부가 임의 워크스페이스를 신뢰하려 한다"
+        );
+        // 프리미스 미증명 + 워크스페이스 0 → 계획기 산출이 비어 있다(스위치와 무관하게).
+        let p = plan_first_run_seed(
+            &u19_json("{}"),
+            INSTALL_TIME_SEED_WORKSPACES,
+            AuthPremise::Unproven,
+        );
+        assert!(p.refused.is_none());
+        assert!(p.added.is_empty(), "설치 시점 호출부가 무언가를 쓰려 한다: {:?}", p.added);
+        // 스위치 기본값도 꺼짐이다.
+        assert!(!first_run_seed_enabled_from(None, false));
     }
 }

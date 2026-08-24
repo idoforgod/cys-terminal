@@ -349,9 +349,74 @@ SELFCORR_HOOKS = [
 #   등록 주체: session-start.sh=C08(FAIL) · role-bootstrap.sh=C28(★A21로 FAIL 티어 격상).
 #   ※ 이 목록은 '소망상태'이고 SELFCORR_HOOKS 는 'C28 이 등록하는 집합'이다 — 교집합이
 #     role-bootstrap 이며, H-SEED-1 이 그 포함관계까지 단언한다(집행자 누락 방지).
+# ★U-21 · 선언 timeout 표(초) — Rust `src/pack.rs` 상수의 파이썬 사본이며 **H-SEED-1 이
+#   4-튜플로 기계 대조**한다. 키는 (스크립트, 이벤트).
+#
+#   왜 필요한가: Claude Code 훅의 `UserPromptSubmit` **기본 timeout 은 30초**다(다른 이벤트는 600초).
+#   그리고 timeout 은 지연이 아니라 **취소 + 출력 폐기**다 — role-bootstrap 의 stdout 은
+#   additionalContext(팀 기동 사실 + 착수 규율)라서, 30초를 넘긴 순간 부트 체인이 에러도 없이
+#   **조용히 사라진다**. 훅 자신의 데드라인 합만 해도 2+5+5+5+10 = 27초라 여유가 3초뿐이고,
+#   인터프리터 냉시작이 4회 얹히는 Windows 에서는 상한을 넘는다(mac 만 멀쩡한 그 계열).
+#
+#   값은 새로 발명하지 않고 **하네스가 다른 모든 이벤트에 쓰는 기본값(600)** 에 맞춘다.
+#
+# ★상한을 올린 대가와 그 봉인(결함 7 · 2026-08-24 이종 리뷰어): 선언 timeout 을 올리면 훅
+#   절단(오살)은 막히지만, 훅 **안**의 데드라인 없는 블로킹 읽기는 상한이 그대로 20배가 된다
+#   — `role-bootstrap.sh` 의 `INPUT=$(cat)` 이 그 자리였다(사람 프롬프트 먹통의 상한 = 600초).
+#   그래서 그 읽기에 전용 데드라인(`CYS_HOOK_STDIN_TIMEOUT_S`)을 걸었다. **이 표를 올릴 때는
+#   반드시 훅 내부 블로킹 지점에 데드라인이 있는지 함께 확인한다** — 선언 timeout 은 상한을
+#   '늘리는' 노브이지 '지키는' 노브가 아니다.
+HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S = 30
+HOOK_TIMEOUT_S = {
+    ("role-bootstrap.sh", "UserPromptSubmit"): 600,
+}
+
+# ★U-21 롤백 스위치(축 1지점) — Rust `pack::hook_timeout_axis_legacy_from` 의 파이썬 미러.
+#   축 전용 노브 하나 + **마스터 `CYS_BOOT_GATES=0`** 접기. 사고 순간에 사람이 조합을 만들 수는 없다.
+ENV_HOOK_TIMEOUT_V1 = "CYS_HOOK_TIMEOUT_V1"
+
+
+def hook_timeout_axis_legacy_from(master_env, axis_env):
+    """순수 코어(진리표 대상) — `"0"`/`"1"` 엄격 비교(형제 축과 동일 규약)."""
+    return master_env == "0" or axis_env == "1"
+
+
+def hook_timeout_axis_legacy():
+    return hook_timeout_axis_legacy_from(os.environ.get("CYS_BOOT_GATES"),
+                                         os.environ.get(ENV_HOOK_TIMEOUT_V1))
+
+
+def hook_timeout_for(script_name, event):
+    """이 훅의 **유효 선언 timeout**. 축이 종전이면 None(= 선언 없음 → 판정·쓰기 모두 종전)."""
+    if hook_timeout_axis_legacy():
+        return None
+    return HOOK_TIMEOUT_S.get((script_name, event))
+
+
+def hook_timeout_satisfied(entry_timeout, declared):
+    """선언 충족 판정(순수). **선언은 하한이지 동등이 아니다.**
+
+    · declared None → 아무것도 단언하지 않는다(종전 판정과 동일). 선언하지 않은 축을 '0이어야
+      한다'로 읽으면 사용자가 손으로 넣은 값이 전부 불일치가 되어 **우리가 그것을 지운다**.
+    · declared 있음 → 엔트리가 그 값 **이상**이어야 충족. 동등(==)을 기각한 이유: 우리보다 큰
+      값을 우리 값으로 내리는 것은 취소 시각을 앞당기는 **오살 방향**이다.
+    · 키 부재는 **불충족**. 하네스 기본값(30s)을 우리가 읽을 길이 없으므로 '없음=안전'으로 접으면
+      원 결함(무음 취소)이 그대로 남는다.
+    ★완화가 아니다 — 종전 판정은 timeout 을 아예 보지 않았고(무조건 충족) 이 술어는 더 엄격하다.
+    """
+    if declared is None:
+        return True
+    if not isinstance(entry_timeout, (int, float)) or isinstance(entry_timeout, bool):
+        return False
+    return entry_timeout >= declared
+
+
 AWAKENING_HOOKS = [
-    ("session-start.sh", [("SessionStart", None)]),
-    ("role-bootstrap.sh", [("UserPromptSubmit", None)]),
+    # (스크립트, [(event, matcher, timeout)…]) — ★timeout 은 **matcher 뒤**(Rust 필드 순서 계약).
+    ("session-start.sh", [("SessionStart", None, HOOK_TIMEOUT_S.get(
+        ("session-start.sh", "SessionStart")))]),
+    ("role-bootstrap.sh", [("UserPromptSubmit", None, HOOK_TIMEOUT_S.get(
+        ("role-bootstrap.sh", "UserPromptSubmit")))]),
 ]
 AWAKENING_SCRIPTS = {script for script, _ in AWAKENING_HOOKS}
 
@@ -3354,8 +3419,10 @@ class Preflight:
 
     # ── C28 자기교정·영속성 hook 등록 헬퍼 (event 일반화) ──
     @staticmethod
-    def _event_hook_registered(settings_path, event, script_name):
-        """event 에 pack 경로의 script_name 이 등록돼 있나 (구 .config 경로는 미인정)."""
+    def _event_hook_registered(settings_path, event, script_name, declared_timeout=None):
+        """event 에 pack 경로의 script_name 이 **선언 timeout 을 충족한 채** 등록돼 있나
+        (구 .config 경로는 미인정). 판정 = `command 동등 ∧ 선언 timeout 충족`(U-21).
+        `declared_timeout=None`(기본) 이면 종전 판정 그대로 — command 축 단독이다."""
         try:
             data = json.load(open(settings_path, encoding="utf-8"))
         except (OSError, ValueError):
@@ -3365,20 +3432,41 @@ class Preflight:
         desired = _cys_hook_cmd(script_name)
         for entry in data.get("hooks", {}).get(event, []):
             for h in entry.get("hooks", []):
-                if h.get("command", "") == desired:
+                if h.get("command", "") == desired and hook_timeout_satisfied(
+                        h.get("timeout"), declared_timeout):
                     return True
         return False
 
-    def _register_event_hook(self, settings_path, event, script_name, matcher=None):
+    def _register_event_hook(self, settings_path, event, script_name, matcher=None,
+                             timeout=None):
         """event 에 pack/hooks/script_name 등록. 성공=None, 실패=사유. 멱등은 호출부.
-        _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적)."""
+        _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적).
+
+        ★U-21 **불일치 엔트리 교체 경로**: 명령은 이미 있고 **선언 timeout 만 미달**이면 append 가
+        아니라 그 hook 객체의 `timeout` 하나만 올린다. append 로 처리하면 같은 명령이 두 번 실려
+        **매 프롬프트마다 훅이 2회 발화**한다(큐 폭주 방향). 그리고 `max(기존, 선언)` 이라
+        사용자가 더 크게 잡아둔 값은 **내리지 않는다**(오살 금지 — 한 방향으로만 여는 축)."""
         cmd = _cys_hook_cmd(script_name)
 
         def _mutate(data):
             arr = data.setdefault("hooks", {}).setdefault(event, [])
             kept, have = _prune_stale_hook_entries(arr, script_name, cmd)
+            if have and timeout is not None:
+                # 교체 경로 — 우리 명령과 **바이트 동등**인 hook 객체의 timeout 키 하나만 손댄다.
+                for entry in kept:
+                    if not isinstance(entry, dict):
+                        continue
+                    for h in entry.get("hooks", []):
+                        if not isinstance(h, dict) or h.get("command", "") != cmd:
+                            continue
+                        cur = h.get("timeout")
+                        if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+                            cur = None
+                        h["timeout"] = timeout if cur is None else max(cur, timeout)
             if not have:
                 entry = {"hooks": [{"type": "command", "command": cmd}]}
+                if timeout is not None:
+                    entry["hooks"][0]["timeout"] = timeout
                 if matcher is not None:
                     entry["matcher"] = matcher
                 kept.append(entry)
@@ -3504,16 +3592,35 @@ class Preflight:
                     continue
                 tier_fatal = script_name in AWAKENING_SCRIPTS
                 for event, matcher in events:
-                    if self._event_hook_registered(t, event, script_name):
+                    # ★U-21: 판정·쓰기 모두 **같은 선언값**을 본다(둘이 갈리면 매 런 재쓰기).
+                    _to = hook_timeout_for(script_name, event)
+                    # ★판정 2축을 **보고에서 가른다** — 두 사실은 다르다:
+                    #   ① command 미등록 = 훅이 아예 발화하지 않는다 → 종전 티어 유지(각성=FAIL).
+                    #   ② command 는 있는데 선언 timeout 미달 = 훅은 발화하되 **중간에 취소**된다.
+                    #      이걸 "미등록" 이라 부르면 거짓 보고이고, 각성 FAIL 티어에 실으면
+                    #      **위경고**다(H-SEED-2 가 지키는 계약: 등록됐는데 FAIL 금지).
+                    #   ★티어는 보고 크기일 뿐이고, 실제 교정은 --fix 경로가 두 축 모두 동일하게
+                    #     수행한다(WARN 강등이 수리를 미루지 않는다).
+                    _cmd_ok = self._event_hook_registered(t, event, script_name)
+                    if _cmd_ok and self._event_hook_registered(t, event, script_name, _to):
                         continue
                     if self.fix:
-                        err = self._register_event_hook(t, event, script_name, matcher)
+                        err = self._register_event_hook(t, event, script_name, matcher,
+                                                        timeout=_to)
                         if err:
-                            (fails if tier_fatal else warns).append(
-                                "%s/%s 등록 실패: %s" % (os.path.basename(t), event, err))
+                            (fails if (tier_fatal and not _cmd_ok) else warns).append(
+                                "%s/%s %s 실패: %s"
+                                % (os.path.basename(t), event,
+                                   "timeout 교정" if _cmd_ok else "등록", err))
                         else:
-                            fixed.append("%s←%s(%s)"
-                                         % (os.path.basename(t), script_name, event))
+                            fixed.append(
+                                "%s←%s(%s)%s" % (os.path.basename(t), script_name, event,
+                                                 " timeout=%ss" % _to if _cmd_ok else ""))
+                    elif _cmd_ok:
+                        warns.append(
+                            "%s %s(%s) 선언 timeout 미달 — %ss 필요(--fix로 교정). 훅은 발화하되 "
+                            "하네스가 중간에 **취소하고 출력을 폐기**한다"
+                            % (os.path.basename(t), script_name, event, _to))
                     else:
                         (fails if tier_fatal else warns).append(
                             "%s %s(%s) 미등록%s" % (os.path.basename(t), script_name, event,

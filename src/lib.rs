@@ -21,6 +21,10 @@ pub mod first_run_gates;
 pub mod inject_guard;
 pub mod license;
 pub mod pack;
+/// 프로필 인증 전제 판정기(U-17) — "이 프로필로 좌석을 만들면 로그인 관문 앞에 서는가".
+/// 시드(U-19)는 로그인 화면을 **지우므로** 판정이 시드보다 먼저 있어야 한다. 판정은 순수함수
+/// 하나(`profile_gate::classify`)가 소유하고, `auth_class` 8값 중 `unknown` 은 **통과가 아니다**.
+pub mod profile_gate;
 /// ready 술어 단일화(U-13) — `ready = 입력활성 증거 ∧ 관문 문면 부재`. 판정은 순수함수 하나가
 /// 소유하고(`readiness::judge`), 부트 폴링과 `adapter_ready` 두 소비처가 같은 술어를 경유한다.
 /// 종전엔 네 자리가 각자 ready 를 선언해 "마커 축만 고치면 아무것도 안 바뀌는" 상태였다.
@@ -536,14 +540,14 @@ pub fn gate_pending_axis_enabled() -> bool {
 /// (`CYS_GATE_PENDING_CLOSE=1`)·축(`CYS_GATE_PENDING=0`) 어느 하나를 눌러도 **동시에** 꺼진다.
 /// ★불변식은 여기서 다시 쓰지 않고 [`gate_axes_from`] 의 산출값을 뒤집어 쓴다 — 조건을 두 벌로
 /// 적는 순간 한 벌만 고쳐지고, 그 갈라짐이 이 저장소가 반복해서 맞은 사본 드리프트다.
-/// (판정 축 노브 셋은 이 축과 무관하므로 `None` 을 먹인다 — `gate_pending_close` 는 그 셋에
-/// 의존하지 않는다.)
+/// (판정 축 노브들은 이 축과 무관하므로 `None` 을 먹인다 — `gate_pending_close` 는 그것들에
+/// 의존하지 않는다. U-17 이 축을 하나 더 얹었어도 같다: 축 노브는 자기 축만 끈다.)
 pub fn gate_pending_axis_effective_from(
     master_env: Option<&str>,
     close_env: Option<&str>,
     axis_env: Option<&str>,
 ) -> bool {
-    !gate_axes_from(master_env, None, None, None, close_env, axis_env).gate_pending_close
+    !gate_axes_from(master_env, None, None, None, close_env, axis_env, None).gate_pending_close
 }
 
 /// **축 노브 하나만** 보는 순수 코어 — `"0"` 만 끈다.
@@ -678,8 +682,11 @@ pub fn gate_pending_close_override_from(close_env: Option<&str>, axis_env: Optio
 /// ★마스터 롤백 스위치의 env 이름. `0` → 이 캠페인이 추가한 판정 축 **전부** 종전 복귀.
 ///
 /// 개별 노브(`CYS_READINESS_V1`·`CYS_INJECT_GATE_GUARD`·`CYS_TRUST_RETURN_V1`·
-/// `CYS_GATE_PENDING_CLOSE`·`CYS_GATE_PENDING`)는 축 단위 조정용으로 남지만, **사고 순간에
-/// 사람이 쥐는 손잡이는 이것 하나**다.
+/// `CYS_GATE_PENDING_CLOSE`·`CYS_GATE_PENDING`·`CYS_PROFILE_GATE_OBSERVE_ONLY`)는 축 단위
+/// 조정용으로 남지만, **사고 순간에 사람이 쥐는 손잡이는 이것 하나**다.
+///
+/// ★새 판정 축은 **태어날 때 여기에 접는다**(U-17 이 그 규율의 첫 적용). 축마다 노브를 따로
+/// 두고 나중에 합치는 순서는 BLOCK-3 에서 이미 실패했다 — 사고 순간에는 조합을 못 만든다.
 pub const ENV_BOOT_GATES: &str = "CYS_BOOT_GATES";
 
 /// 마스터 스위치 판정의 **순수 코어** — `"0"` 만 끈다.
@@ -690,7 +697,7 @@ pub fn boot_gates_master_off_from(env_val: Option<&str>) -> bool {
     env_val == Some("0")
 }
 
-/// 이 캠페인이 추가한 판정 축의 **최종 유효값**. 축이 넷이라 bool 넷을 따로 들고 다니면
+/// 이 캠페인이 추가한 판정 축의 **최종 유효값**. 축이 여럿이라 bool 을 따로 들고 다니면
 /// 어느 호출부가 하나를 빠뜨렸는지 알 수 없다 — 한 타입으로 묶어 **동시에** 결정한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateAxes {
@@ -702,12 +709,18 @@ pub struct GateAxes {
     pub trust_legacy: bool,
     /// 보류 판정을 즉시 close 로 강등하는가(= U-11 이전 귀결).
     pub gate_pending_close: bool,
+    /// ★(U-17) 프로필 인증 전제 판정기가 **관측·보고 전용**으로 강등됐는가(= 차단 안 함).
+    ///
+    /// 이 축이 여기 있는 이유: 판정 축을 새로 만들 때마다 노브가 따로 생기면 사고 순간에
+    /// 사람이 조합을 기억해야 한다(BLOCK-3 이 그 값을 치렀다). 새 축은 태어날 때 마스터에
+    /// 접는다 — `CYS_BOOT_GATES=0` 하나로 이 판정기도 함께 종전(차단 없음)으로 돌아간다.
+    pub profile_gate_observe_only: bool,
 }
 
 /// ★판정 축의 **순수 접기 함수**(진리표 대상). env 는 하나도 읽지 않는다.
 ///
 /// 규약:
-///   ① 마스터(`CYS_BOOT_GATES=0`)는 네 축을 **전부** 종전으로 되돌린다(BLOCK-3).
+///   ① 마스터(`CYS_BOOT_GATES=0`)는 축을 **전부** 종전으로 되돌린다(BLOCK-3).
 ///   ② 보류 장치가 꺼지면(`gate_pending_close`) 판정 축도 **전부** 종전으로 되돌아간다
 ///      — 엄격 판정 + 즉시 close 조합을 구조적으로 불가능하게 한다(BLOCK-4).
 ///   ③ 개별 노브는 **자기 축만** 끈다(교차 오염 금지 — 신뢰 노브가 킬체인 가드를 열면 안 된다).
@@ -718,6 +731,7 @@ pub fn gate_axes_from(
     trust_v1_env: Option<&str>,
     close_env: Option<&str>,
     axis_env: Option<&str>,
+    profile_gate_env: Option<&str>,
 ) -> GateAxes {
     // 보류 장치가 꺼졌는가 = 마스터 ∨ 강등 스위치 ∨ 축 스위치.
     let holding_off = boot_gates_master_off_from(master_env)
@@ -727,6 +741,8 @@ pub fn gate_axes_from(
         inject_guard_off: holding_off || inject_guard::guard_off_from(guard_env),
         trust_legacy: holding_off || inject_guard::trust_v1_from(trust_v1_env),
         gate_pending_close: holding_off,
+        profile_gate_observe_only: holding_off
+            || profile_gate::observe_only_from(profile_gate_env),
     }
 }
 
@@ -739,6 +755,7 @@ pub fn gate_axes() -> GateAxes {
         std::env::var(inject_guard::ENV_TRUST_V1).ok().as_deref(),
         std::env::var(ENV_GATE_PENDING_CLOSE).ok().as_deref(),
         std::env::var(ENV_GATE_PENDING).ok().as_deref(),
+        std::env::var(profile_gate::ENV_OBSERVE_ONLY).ok().as_deref(),
     )
 }
 
@@ -882,7 +899,97 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
     }
 }
 
-/// 자식 프로세스(pane 스폰·스케줄 발화·GUI 직스폰)에 얹을 env 주입 쌍(순수 — 회귀 핀·OS 무관 컴파일).
+/// Claude Code 가 **Windows 에서 훅·셸 실행에 쓸 bash** 를 지정하는 벤더 env 키(U-20).
+///
+/// 왜 이 키가 부트 안전 문제인가: 시스템 Git 이 없는 Windows 기계에서 이 값이 비어 있으면
+/// Claude Code 는 훅을 **한 번도 실행하지 못한다**. 훅이 죽으면 각성·부트 체인이 통째로
+/// 무음이 되고, 증상은 "아무 일도 안 일어난다" 뿐이라 원인 추적이 극히 어렵다.
+/// 우리는 PortableGit 을 동봉하므로 그 기계에도 bash 는 **실재한다** — 벤더에게 그 자리를
+/// 알려주기만 하면 된다.
+pub const ENV_CLAUDE_CODE_GIT_BASH_PATH: &str = "CLAUDE_CODE_GIT_BASH_PATH";
+
+/// 동봉 PortableGit **런처** bash 의 설치 루트 상대 경로 세그먼트(`runtime\git\bin\bash.exe`).
+///
+/// ★`git\bin` 이지 `git\usr\bin` 이 **아니다**(B-12) — 근거 셋:
+///   ① 릴리스 레인이 이미 이 경로를 하드 단언한다. `.github/workflows/windows-build.yml`:
+///      "Claude Code 는 훅(hook) 실행에 PortableGit 의 **런처** bash(`runtime\git\bin\bash.exe`)
+///      를 쓴다 — MSYS 실 바이너리인 `usr\bin\bash.exe` 와 **다른 파일**" + 부재 시 FATAL 종료.
+///   ② `git\bin\bash.exe` 는 MSYS2 런타임과 Git 환경을 세워 주는 런처다. `usr\bin\bash.exe` 를
+///      직접 부르면 그 준비가 없는 raw MSYS bash 가 뜬다.
+///   ③ 하필 이 구분이 위험한 이유: 데몬 셸 탐지의 기존 후보 순서
+///      (`schedule.rs windows_bash_candidates` = [`runtime_bin_dirs`] + `git\bin` **덧댐**)는
+///      [`runtime_bin_dirs`] 의 Windows 순서(python → git\cmd → **git\usr\bin** → node) 때문에
+///      `usr\bin\bash.exe` 를 **먼저** 집는다. 그 순서는 스케줄 잡의 살아있는 계약이라
+///      건드리지 않고(순서 교정은 별도 티켓), **이 키만 `git\bin` 으로 단일 고정**한다.
+pub const BUNDLED_GIT_BASH_REL: [&str; 4] = ["runtime", "git", "bin", "bash.exe"];
+
+/// 동봉 bash 절대경로 해소(**부작용: 파일 stat 1회** — OS 는 인자로 받는다).
+///
+/// `os` 가 `"windows"` 가 아니면 **무조건 None**: mac/linux 에는 이 키를 얹지 않는다.
+/// 형제 선례 [`d5_gate_for_os`] 와 같은 꼴로 `cfg!` 대신 OS 문자열을 인자로 받는 이유는,
+/// 회귀 핀이 **다른 플랫폼 CI 에서도 Windows 분기를 실제로 밟게** 하기 위해서다
+/// (`std::env::consts::OS` 는 타깃별 컴파일 상수라 실효는 `cfg(windows)` 와 같다).
+///
+/// 실재하지 않으면 None = **fail-open**. 없는 경로를 벤더에게 통보하는 쪽이 미통보보다 나쁘다
+/// (벤더가 그 경로로 spawn 을 시도하다 실패하면 진단이 더 어려워진다).
+pub fn bundled_git_bash_path_for(exe_dir: &Path, os: &str) -> Option<PathBuf> {
+    if os != "windows" {
+        return None;
+    }
+    let mut p = exe_dir.to_path_buf();
+    for seg in BUNDLED_GIT_BASH_REL {
+        p.push(seg);
+    }
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// `CLAUDE_CODE_GIT_BASH_PATH` 기본값 주입의 **순수 코어**(env 도 디스크도 보지 않는다).
+///
+/// 불가침 계약 넷([`inject_claude_alt_screen_default_for`] 의 3계약과 동형 + 롤백 1):
+///   ① `user_env_set` — 사용자가 이미 값을 가졌으면 **절대 덮지 않는다**(프로세스 env 관측은
+///      호출부의 몫이다. 그 값이 우리 것보다 나쁘더라도 사용자 소유물이다).
+///   ② 이미 쌓인 쌍에 같은 키가 있으면 손대지 않는다(later-wins 뒤집기·중복 금지).
+///   ③ `resolved == None` 이면 아무것도 얹지 않는다 — **fail-open**. 이 축의 최악값은
+///      "종전과 동일"이지 "더 나빠짐"이 아니다.
+///   ④ `master_off`(= `CYS_BOOT_GATES=0`)면 주입하지 않는다 = 종전 동작 완전 복귀.
+///      새 판정 축은 태어날 때 마스터에 접는다 — 사고 순간에 사람은 노브를 조합하지 못한다
+///      (BLOCK-3 이 그 값을 이미 치렀다). 이 축 전용 노브는 **만들지 않는다**.
+pub fn inject_claude_code_git_bash_path_for(
+    env_pairs: &mut Vec<(String, String)>,
+    resolved: Option<&Path>,
+    user_env_set: bool,
+    master_off: bool,
+) {
+    if master_off || user_env_set {
+        return;
+    }
+    let Some(p) = resolved else { return };
+    if env_pairs
+        .iter()
+        .any(|(k, _)| k == ENV_CLAUDE_CODE_GIT_BASH_PATH)
+    {
+        return;
+    }
+    env_pairs.push((
+        ENV_CLAUDE_CODE_GIT_BASH_PATH.to_string(),
+        p.to_string_lossy().into_owned(),
+    ));
+}
+
+/// 자식 프로세스(pane 스폰·스케줄 발화·GUI 직스폰)에 얹을 env 주입 쌍(OS 무관 컴파일).
+///
+/// ★'순수' 표기 정정(U-20 · 2026-08-24): 이 자리엔 오래 "(순수 — 회귀 핀·OS 무관 컴파일)"
+/// 이라고 적혀 있었지만 **사실이 아니었다**. ①은 [`runtime_prefixed_path`] 를 거쳐 디렉터리
+/// `is_dir()` stat 을 돌리고, Windows 에서는 레지스트리(HKLM/HKCU `Environment\Path`)까지
+/// 읽는다. ⑤가 여기에 파일 stat 1회와 프로세스 env 판독 2회를 더 얹으므로 지금 정정한다 —
+/// 이 함수는 **인자로 받는 것(exe_dir·PATH·HOME·USERPROFILE)에 대해서만 결정론**이고,
+/// 나머지는 디스크·레지스트리·프로세스 env 를 본다. 회귀 핀이 이 함수를 직접 호출해도 되는
+/// 이유는 '순수해서'가 아니라 **핀이 실재하지 않는 exe_dir 를 넘겨 디스크 축을 고정**하기
+/// 때문이다(`/nonexistent-exe-dir-for-pin`).
 ///
 /// ① PATH: 동봉 runtime 선두 주입. 데몬은 GUI(Explorer/Finder) 기동이라 PATH 가 빈곤해
 ///    python3·printf·tail 을 못 찾는다 — office-bridge/auto-restore 와 **동일 SOT**
@@ -902,6 +1009,14 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
 ///    발화·GUI 직스폰은 무보호였다 → 공용 규약에 편입해 세 소비 경로가 같이 덮인다. ③과 같이
 ///    **항상** 얹는다(무조건 쌍 — PATH 무변경이어도 나간다). state.rs literal 과의 중복 주입이
 ///    무해한 근거(같은 값 "1"·later-wins)는 `ENV_PY_UTF8` 상수 주석.
+/// ⑤ CLAUDE_CODE_GIT_BASH_PATH(U-20 · **Windows 전용**): 시스템 Git 이 없는 Windows 기계에서
+///    Claude Code 는 훅 실행용 bash 를 못 찾아 훅을 **한 번도 실행하지 못한다**(각성·부트
+///    체인이 통째로 무음). 동봉 PortableGit 의 런처 bash 가 실재할 때만, 그리고 **사용자가
+///    이미 값을 갖고 있지 않을 때만** 그 절대경로를 얹는다. ③④와 달리 **조건부 쌍**이다 —
+///    조건 미충족 시 아무것도 얹지 않아 종전과 완전히 동일하다(fail-open).
+///    ★Windows 실기 검증은 이 커밋 범위 밖이다(mac 개발기에서 실기 재현 불가). 여기서
+///    증명된 것은 ⓐ경로 선택 규약 ⓑ불가침 계약 ⓒ타 플랫폼 미주입 셋뿐이고, 실제 훅이 뜨는가는
+///    `feat/**` 브랜치 windows-health 잡과 실기 재현의 몫이다 — 과장하지 않는다.
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
@@ -933,6 +1048,15 @@ pub fn spawn_env_pairs(
     // ④ 감사 blocker #4(W-B2): cp949 콘솔 상속 python 의 UnicodeEncodeError 즉사 봉인 — UTF-8
     //    모드 강제(③처럼 무조건 쌍). 값 규약("1"만 유효·그 외 기동 fatal)은 ENV_PY_UTF8 주석.
     env.push((ENV_PY_UTF8.to_string(), PY_UTF8_ON.to_string()));
+    // ⑤ U-20: Windows 동봉 bash 를 벤더 훅 실행기에 알린다. 판정은 순수 코어 두 개가 소유하고
+    //    여기서는 **관측만** 한다 — OS·디스크(해소기) · 사용자 env(1회 판독) · 마스터 롤백
+    //    스위치(1회 판독). 조건 미충족이면 쌍이 하나도 늘지 않는다(종전 동작 그대로).
+    inject_claude_code_git_bash_path_for(
+        &mut env,
+        bundled_git_bash_path_for(exe_dir, std::env::consts::OS).as_deref(),
+        std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH).is_some(),
+        boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
+    );
     env
 }
 
@@ -1965,12 +2089,16 @@ mod tests {
 
     // ── ★(BLOCK-3 · BLOCK-4 · 2026-08-24) 마스터 롤백 스위치 · '엄격+즉시close' 불변식 ──
 
-    /// ★BLOCK-4 전수 진리표 — 관련 env **전 조합**(5값 × 6축 = 15,625)에서
+    /// ★BLOCK-4 전수 진리표 — 관련 env **전 조합**(5값 × 7축 = 78,125)에서
     /// "엄격 판정 + 즉시 close" 가 **성립하지 않음**을 단언한다.
     ///
     /// 이 조합이 성립하면 관문 화면이 영원히 ready 가 아니고 → readiness 타임아웃 →
     /// `LaunchFailed` 강등 → 호출부 `surface.close` 로 **전 pane 이 죽는다**. 문서화된 롤백
     /// 스위치가 기저보다 파괴적인 상태를 만드는 것이 재난④의 정체다.
+    ///
+    /// ★(U-17) 축이 여섯에서 일곱으로 늘었다 — 핀을 **지우지 않고 이사**시켰다: 기존 세 축
+    /// 단언은 그대로 두고 `profile_gate_observe_only` 를 같은 AND 사슬에 **추가**한다.
+    /// 새 축만 엄격하게 남으면 마스터 스위치가 다시 거짓말이 되기 때문이다(완화가 아니라 강화).
     #[test]
     fn strict_judgment_and_immediate_close_is_unreachable_in_every_env_combination() {
         const VALS: [Option<&str>; 5] = [None, Some(""), Some("0"), Some("1"), Some("true")];
@@ -1981,16 +2109,19 @@ mod tests {
                     for t in VALS {
                         for c in VALS {
                             for a in VALS {
-                                let ax = super::gate_axes_from(m, r, g, t, c, a);
+                                for p in VALS {
+                                let ax = super::gate_axes_from(m, r, g, t, c, a, p);
                                 if ax.gate_pending_close {
                                     close_seen += 1;
                                     assert!(
                                         ax.readiness_legacy
                                             && ax.inject_guard_off
-                                            && ax.trust_legacy,
+                                            && ax.trust_legacy
+                                            && ax.profile_gate_observe_only,
                                         "★재난④ 조합: 보류가 close 로 강등됐는데 판정 축이 \
                                          엄격하게 남았다 — master={m:?} readiness={r:?} \
-                                         guard={g:?} trust={t:?} close={c:?} axis={a:?} → {ax:?}"
+                                         guard={g:?} trust={t:?} close={c:?} axis={a:?} \
+                                         profile={p:?} → {ax:?}"
                                     );
                                 }
                                 if super::boot_gates_master_off_from(m) {
@@ -1999,9 +2130,11 @@ mod tests {
                                         ax.readiness_legacy
                                             && ax.inject_guard_off
                                             && ax.trust_legacy
-                                            && ax.gate_pending_close,
+                                            && ax.gate_pending_close
+                                            && ax.profile_gate_observe_only,
                                         "마스터 스위치가 전 축을 되돌리지 못했다 → {ax:?}"
                                     );
+                                }
                                 }
                             }
                         }
@@ -2026,8 +2159,9 @@ mod tests {
             "계측 무효: 구 조립에서 '엄격 + 즉시 close' 가 성립하지 않는다면 BLOCK-4 서사가 틀린 것"
         );
         // 지금 조립은 같은 입력에서 판정도 함께 종전으로 푼다.
-        let ax = super::gate_axes_from(None, None, None, None, None, Some("0"));
-        assert!(ax.gate_pending_close && ax.readiness_legacy && ax.inject_guard_off,
+        let ax = super::gate_axes_from(None, None, None, None, None, Some("0"), None);
+        assert!(ax.gate_pending_close && ax.readiness_legacy && ax.inject_guard_off
+                    && ax.profile_gate_observe_only,
                 "축 스위치 단독이 여전히 엄격 판정을 남긴다 → {ax:?}");
     }
 
@@ -2036,7 +2170,7 @@ mod tests {
     #[test]
     fn master_switch_alone_restores_the_previous_behavior_on_every_axis() {
         // ① `CYS_READINESS_V1=1` 단독 — ready 는 나지만 주입 가드가 그대로다(= 여전히 rc 78).
-        let only_v1 = super::gate_axes_from(None, Some("1"), None, None, None, None);
+        let only_v1 = super::gate_axes_from(None, Some("1"), None, None, None, None, None);
         assert!(only_v1.readiness_legacy);
         assert!(
             !only_v1.inject_guard_off,
@@ -2044,14 +2178,14 @@ mod tests {
              이 대조군이 마스터 스위치의 존재 이유다"
         );
         // ② `CYS_INJECT_GATE_GUARD=0` 단독 — 가드만 열리고 판정은 엄격(관문 화면은 보류).
-        let only_guard = super::gate_axes_from(None, None, Some("0"), None, None, None);
+        let only_guard = super::gate_axes_from(None, None, Some("0"), None, None, None, None);
         assert!(only_guard.inject_guard_off && !only_guard.readiness_legacy);
         // ③ 리뷰어가 찾은 '종전 복귀의 유일한 조합' — 사람이 둘을 동시에 기억해야 했다.
-        let both = super::gate_axes_from(None, Some("1"), Some("0"), None, None, None);
+        let both = super::gate_axes_from(None, Some("1"), Some("0"), None, None, None, None);
         assert!(both.readiness_legacy && both.inject_guard_off);
         assert!(!both.gate_pending_close, "노브 둘이 보류 귀결까지 바꾸면 축 경계가 무너진다");
         // ④ ★마스터 하나 = 네 축 전부 종전.
-        let master = super::gate_axes_from(Some("0"), None, None, None, None, None);
+        let master = super::gate_axes_from(Some("0"), None, None, None, None, None, None);
         assert_eq!(
             master,
             super::GateAxes {
@@ -2059,6 +2193,7 @@ mod tests {
                 inject_guard_off: true,
                 trust_legacy: true,
                 gate_pending_close: true,
+                profile_gate_observe_only: true,
             },
             "마스터 스위치가 '하나를 끄면 전부 복귀' 계약을 지키지 못한다"
         );
@@ -2078,16 +2213,26 @@ mod tests {
         const FOLD: &str = "|| crate::gate_axes_forced_legacy()";
         let r = include_str!("readiness.rs");
         let g = include_str!("inject_guard.rs");
+        // ★(U-17) 새 축도 같은 계약을 진다 — 핀을 지우지 않고 항목을 **추가**한다.
+        let pg_all = include_str!("profile_gate.rs");
+        let pg = &pg_all[..pg_all.find("#[cfg(test)]").expect("profile_gate 테스트 앵커 부재")];
         assert_eq!(r.matches(FOLD).count(), 1, "readiness 축이 상위 접기값을 소비하지 않는다");
         assert_eq!(
             g.matches(FOLD).count(),
             2,
             "inject_guard 의 두 축(가드·신뢰) 중 하나가 상위 접기값을 소비하지 않는다"
         );
+        assert_eq!(
+            pg.matches(FOLD).count(),
+            1,
+            "profile_gate 축이 상위 접기값을 소비하지 않는다 — 마스터 스위치를 눌러도 인증 \
+             판정기만 엄격하게 남는다"
+        );
         // 그리고 축별 env 판독은 여전히 1지점이다(형제 검체가 세는 계약을 깨지 않았다).
         assert_eq!(r.matches("std::env::var(ENV_V1)").count(), 1);
         assert_eq!(g.matches("std::env::var(ENV_GUARD_OFF)").count(), 1);
         assert_eq!(g.matches("std::env::var(ENV_TRUST_V1)").count(), 1);
+        assert_eq!(pg.matches("std::env::var(ENV_OBSERVE_ONLY)").count(), 1);
     }
 
     /// ★(BLOCK-3 잔여분 · 2026-08-24) **마스터 스위치가 데몬까지 닿는다.**
@@ -2124,7 +2269,7 @@ mod tests {
         for m in VALS {
             for c in VALS {
                 for a in VALS {
-                    let ax = super::gate_axes_from(m, None, None, None, c, a);
+                    let ax = super::gate_axes_from(m, None, None, None, c, a, None);
                     assert_eq!(
                         on(m, c, a),
                         !ax.gate_pending_close,
@@ -2292,6 +2437,159 @@ mod tests {
                 "PYTHONUTF8=1 무조건 쌍이 빠졌다 — cp949 Windows 에서 부트 체인 python 이 즉사한다"
             );
         }
+    }
+
+    /// U-20 픽스처: `<install>\runtime\git\{bin,usr\bin}\bash.exe` 를 **둘 다** 깐 가짜 설치본.
+    /// 둘 다 까는 것이 핵심이다 — B-12 의 위험은 "bash 가 없다"가 아니라 **엉뚱한 bash 가 먼저
+    /// 잡힌다**이므로, 하나만 깔면 오선택을 재현할 수 없다.
+    fn u20_fixture(tag: &str) -> std::path::PathBuf {
+        // tag 는 호출 테스트마다 고유하고 pid 로 동시 실행을 가른다(병렬 테스트 간섭 방지).
+        let base = std::env::temp_dir().join(format!("cys-u20-{}-{}", tag, std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        for rel in [
+            ["runtime", "git", "bin"].join(std::path::MAIN_SEPARATOR_STR),
+            ["runtime", "git", "usr", "bin"].join(std::path::MAIN_SEPARATOR_STR),
+        ] {
+            let d = base.join(rel);
+            std::fs::create_dir_all(&d).expect("픽스처 디렉터리 생성 실패");
+            std::fs::write(d.join("bash.exe"), b"fixture").expect("픽스처 bash 생성 실패");
+        }
+        base
+    }
+
+    /// ★U-20 회귀 핀 ⓐ — 동봉 bash 해소는 **런처**(`git\bin\bash.exe`)를 고른다.
+    ///
+    /// 왜 이 핀이 필요한가(B-12): 데몬 셸 탐지의 후보 순서(`schedule.rs
+    /// windows_bash_candidates` = `runtime_bin_dirs` + `git\bin` 덧댐)는 `runtime_bin_dirs` 의
+    /// Windows 순서(python → git\cmd → **git\usr\bin** → node) 때문에 MSYS 실 바이너리인
+    /// `usr\bin\bash.exe` 를 **먼저** 집는다. Claude Code 훅이 요구하는 것은 런처 쪽이고
+    /// (`.github/workflows/windows-build.yml` 이 그 파일의 실재를 FATAL 로 단언한다), 그 순서를
+    /// 그대로 재사용했다면 이 키는 조용히 틀린 값을 실었을 것이다. 그래서 **이 키만 단일 고정**
+    /// 하고, 그 선택을 여기서 박제한다.
+    #[test]
+    fn claude_code_git_bash_path_picks_git_bin_launcher() {
+        let base = u20_fixture("launcher");
+        let got = bundled_git_bash_path_for(&base, "windows").expect("동봉 bash 를 못 찾았다");
+        assert_eq!(
+            got,
+            base.join("runtime").join("git").join("bin").join("bash.exe"),
+            "런처 bash(git\\bin)가 아닌 경로가 선택됐다"
+        );
+        let s = got.to_string_lossy().into_owned();
+        let usr = format!("{sep}usr{sep}", sep = std::path::MAIN_SEPARATOR);
+        assert!(
+            !s.contains(&usr),
+            "MSYS 실 바이너리(git\\usr\\bin)가 선택됐다 — 훅 실행기가 요구하는 런처가 아니다: {s}"
+        );
+
+        // 런처가 없으면 **폴백하지 않는다**: usr\bin 이 남아 있어도 None.
+        // (틀린 bash 를 통보하는 것보다 미통보가 낫다 — 미통보는 종전과 같은 상태다.)
+        std::fs::remove_file(base.join("runtime").join("git").join("bin").join("bash.exe"))
+            .expect("픽스처 정리 실패");
+        assert_eq!(
+            bundled_git_bash_path_for(&base, "windows"),
+            None,
+            "런처 부재인데 usr\\bin 으로 폴백했다 — 단일 고정 위반"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★U-20 회귀 핀 ⓑ — 이 키는 **Windows 밖으로 새지 않는다**.
+    ///
+    /// mac/linux 에 실리면 존재하지도 않는 `…\bash.exe` 를 벤더에게 통보하는 꼴이 된다.
+    /// 순수 코어는 OS 문자열로 전수 확인하고, 배선(`spawn_env_pairs`)은 **현재 호스트**에서
+    /// 확인한다 — mac CI 에서 이 단언이 곧 '미주입 단언'이다.
+    #[test]
+    fn claude_code_git_bash_path_never_leaves_windows() {
+        let base = u20_fixture("os-gate");
+        for os in ["macos", "linux", "freebsd", "ios", "android", ""] {
+            assert_eq!(
+                bundled_git_bash_path_for(&base, os),
+                None,
+                "OS {os:?} 에 Windows 전용 bash 경로가 해소됐다"
+            );
+        }
+        assert!(
+            bundled_git_bash_path_for(&base, "windows").is_some(),
+            "OS 게이트가 windows 까지 막았다 — 기능 자체가 사문이 된다"
+        );
+
+        // 배선 축: 실제 스폰 규약이 호스트 OS 규칙을 따르는가.
+        let pairs = spawn_env_pairs(&base, "/usr/bin:/bin", Some("/Users/user"), None);
+        let got = pairs
+            .iter()
+            .find(|(k, _)| k == ENV_CLAUDE_CODE_GIT_BASH_PATH);
+        if cfg!(windows) {
+            // 사용자 기설정·마스터 스위치가 눌린 실행에서는 **미주입이 계약**이므로 그 둘을
+            // 배제한 때만 주입을 단언한다(테스트가 계약을 뒤집지 않게).
+            if std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH).is_none()
+                && !boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref())
+            {
+                assert!(
+                    got.is_some(),
+                    "Windows 인데 동봉 bash 가 실재하는 설치본에 키가 실리지 않았다 — 훅 전멸 재발"
+                );
+            }
+        } else {
+            assert_eq!(
+                got, None,
+                "mac/linux 스폰 env 에 Windows 전용 키가 실렸다 — 없는 경로를 벤더에 통보한다"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★U-20 회귀 핀 ⓒ — 불가침 계약 넷(순수 코어 · env 무접촉이라 병렬 테스트에 안전).
+    ///
+    /// ①사용자 값 불가침 ②이미 쌓인 쌍 불가침 ③미해소 시 무주입(fail-open)
+    /// ④마스터 롤백 스위치(`CYS_BOOT_GATES=0`)로 **즉시 종전 복귀**.
+    /// ④가 이 축 전용 노브가 아니라 마스터인 이유: 축마다 노브를 두고 나중에 합치는 순서는
+    /// BLOCK-3 에서 이미 실패했다 — 사고 순간에 사람은 노브 조합을 만들지 못한다.
+    #[test]
+    fn claude_code_git_bash_path_user_value_and_master_switch() {
+        let p = std::path::Path::new(r"C:\app\runtime\git\bin\bash.exe");
+        let want = r"C:\app\runtime\git\bin\bash.exe";
+
+        // 기본 경로: 해소됐고 사용자 값 없고 마스터 안 눌림 → 얹는다.
+        let mut base = Vec::new();
+        inject_claude_code_git_bash_path_for(&mut base, Some(p), false, false);
+        assert_eq!(
+            base.iter()
+                .find(|(k, _)| k == ENV_CLAUDE_CODE_GIT_BASH_PATH)
+                .map(|(_, v)| v.as_str()),
+            Some(want),
+            "정상 조건에서 키가 실리지 않았다"
+        );
+
+        // ① 사용자 프로세스 env 에 값이 있으면 무접촉(사용자 소유물 — 우리 값이 더 좋아도 덮지 않는다).
+        let mut user = Vec::new();
+        inject_claude_code_git_bash_path_for(&mut user, Some(p), true, false);
+        assert!(user.is_empty(), "사용자 기설정을 덮었다: {user:?}");
+
+        // ② 이미 쌓인 쌍이 있으면 값 보존(later-wins 뒤집기·중복 금지).
+        let mut dup = vec![(
+            ENV_CLAUDE_CODE_GIT_BASH_PATH.to_string(),
+            r"D:\mine\bash.exe".to_string(),
+        )];
+        inject_claude_code_git_bash_path_for(&mut dup, Some(p), false, false);
+        assert_eq!(dup.len(), 1, "같은 키를 중복으로 얹었다: {dup:?}");
+        assert_eq!(dup[0].1, r"D:\mine\bash.exe", "먼저 실린 값을 덮었다");
+
+        // ③ 미해소(동봉 bash 부재) → 무주입. 이 축의 최악값은 '종전과 동일'이다.
+        let mut none = Vec::new();
+        inject_claude_code_git_bash_path_for(&mut none, None, false, false);
+        assert!(none.is_empty(), "해소 실패인데 키를 얹었다: {none:?}");
+
+        // ④ 마스터 롤백 스위치 — 눌리면 조건이 전부 충족돼도 얹지 않는다(즉시 종전 복귀).
+        let mut off = Vec::new();
+        inject_claude_code_git_bash_path_for(&mut off, Some(p), false, true);
+        assert!(off.is_empty(), "CYS_BOOT_GATES=0 인데 주입이 살아 있다: {off:?}");
+        // 스위치 이름이 갈리면 사고 순간에 손잡이를 못 찾는다 — 마스터 1지점을 못박는다.
+        assert!(
+            boot_gates_master_off_from(Some("0")),
+            "마스터 스위치 판독 규약이 바뀌었다"
+        );
+        assert_eq!(ENV_BOOT_GATES, "CYS_BOOT_GATES");
     }
 
     /// ★SEAL-1 층3 회귀 핀: 프로세스 env 봉인이 실제로 **상속 가능한 자리**에 심기는가.

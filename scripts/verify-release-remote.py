@@ -18,9 +18,17 @@
      ★낱말 grep(smartscreen/defender/…)은 **제거하지 않고 보조 축으로 AND** 유지한다
        (마커 껍데기만 남고 카피가 비는 사고 + 기존 루트 밴드 감시 축 보존).
   ⑥ SHA256SUMS.txt — 신버전 전수·구버전 0줄 + **실자산 바이트 해시 대조** (오너 지시 ⓑ)
+  ⑦ 메인페이지 macOS(Safari) 안내 삭제 확인 (2026-08-24 오너 지시) — 루트(`/`)에서
+     ⓐ`dl-hero__macnote` 0건 ⓑ`dl-hero__winnote` **정확히 1건**(윈도우 안내 생존)
+     ⓒ`App Translocation` 0건. 셋을 **AND** 로 본다.
+     ★ⓑ가 핵심 안전장치다 — 삭제 대상 macOS 문단이 class 를 `"dl-hero__winnote dl-hero__macnote"`
+       로 **둘 다** 달고 있어(라이브 실측), winnote 로 매칭한 구현은 바로 아래 형제인 진짜 윈도우
+       안내까지 지운다. 그 회귀는 ⓐ·ⓒ만으로는 통과해 버리므로 ⓑ 로 0건을 즉시 잡는다.
+     ★⑤(다운로드 페이지 Defender 섹션)와 **다른 페이지·다른 축**이다 — 어느 쪽도 약화시키지 않는다.
 
 사용: python3 scripts/verify-release-remote.py 0.14.5 [이전버전]
       (이전버전 생략 시 ① 은 건너뛴다)
+      python3 scripts/verify-release-remote.py --self-test   # ⑦ 집계 로직 셀프테스트(무접촉)
 종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완)
 """
 import hashlib
@@ -43,6 +51,37 @@ GUIDANCE_WORDS = r"(?i)smartscreen|defender|추가 정보|알 수 없는 게시�
 #   값이 무엇이든(`…-v2`·`macos-install-guidance-v1`·앞으로 생길 마커) 전부 지운다 — 마커
 #   문자열에 감시 낱말이 섞이는 사고를 이름 규칙에 의존하지 않고 구조적으로 차단한다.
 MARKER_ATTR_RE = re.compile(r'data-cys-release-marker="[^"]*"')
+
+# ⑦ 전용 상수 — 메인페이지 macOS(Safari) 안내 문단 삭제 확인 (2026-08-24 오너 지시).
+# 라이브 실측(2026-08-24 · 읽기 전용 GET, 삭제 **전** 상태):
+#   /  →  dl-hero__macnote 1 · dl-hero__winnote 2 · "App Translocation" 1
+# 삭제 후 기대치는 아래 EXPECT 상수 셋이다(0 / 1 / 0).
+MACNOTE_CLASS = "dl-hero__macnote"
+WINNOTE_CLASS = "dl-hero__winnote"
+TRANSLOCATION_TOKEN = "App Translocation"
+MACNOTE_EXPECT = 0
+WINNOTE_EXPECT = 1          # ★0 도 실패다 — 윈도우 안내 소실 회귀를 여기서 잡는다
+TRANSLOCATION_EXPECT = 0
+
+
+def main_macnote_counts(html):
+    """⑦ 3축 집계 — 순수함수(네트워크 무접촉)라 --self-test 가 합성 표본으로 시험할 수 있다."""
+    return {"macnote": html.count(MACNOTE_CLASS),
+            "winnote": html.count(WINNOTE_CLASS),
+            "translocation": html.count(TRANSLOCATION_TOKEN)}
+
+
+def macnote_verdict(counts):
+    """집계 → (통과여부, 사람이 읽을 상세). 세 축 AND."""
+    ok = (counts["macnote"] == MACNOTE_EXPECT
+          and counts["winnote"] == WINNOTE_EXPECT
+          and counts["translocation"] == TRANSLOCATION_EXPECT)
+    detail = ("macnote %d(기대 %d) · winnote %d(기대 %d·윈도우 안내 생존) · '%s' %d(기대 %d)"
+              % (counts["macnote"], MACNOTE_EXPECT, counts["winnote"], WINNOTE_EXPECT,
+                 TRANSLOCATION_TOKEN, counts["translocation"], TRANSLOCATION_EXPECT))
+    if counts["winnote"] < WINNOTE_EXPECT:
+        detail += " ★윈도우 안내가 사라졌다 — winnote 매칭 회귀 의심"
+    return ok, detail
 
 
 def check(name, ok, detail=""):
@@ -67,7 +106,43 @@ def code(url):
                            "-I", "--max-time", "120", url], capture_output=True).stdout.decode()
 
 
+def self_test():
+    """⑦ 판정 로직을 합성 표본으로 시험한다(라이브 무접촉)."""
+    tally = {"pass": 0, "fail": 0}
+
+    def ok(name, cond, detail=""):
+        tally["pass" if cond else "fail"] += 1
+        print(("PASS " if cond else "FAIL ") + name + (" | " + detail if detail else ""))
+
+    mac_p = ('<p class="dl-hero__winnote dl-hero__macnote">참고 — macOS(Safari) 설치: '
+             'App Translocation 때문에 …</p>\n')
+    win_p = '<p class="dl-hero__winnote">참고 — 윈도우 설치파일: SmartScreen …</p>\n'
+
+    # ⓐ 삭제 완료 상태 = 통과
+    v, d = macnote_verdict(main_macnote_counts("<div>\n" + win_p + "</div>"))
+    ok("⑦ⓐ 삭제 완료 페이지는 통과", v, d)
+
+    # ⓑ 삭제 전(macnote 잔존) = 실패
+    v, d = macnote_verdict(main_macnote_counts("<div>\n" + mac_p + win_p + "</div>"))
+    ok("⑦ⓑ 삭제 안 된 페이지는 실패", not v, d)
+
+    # ⓒ ★회귀: winnote 로 매칭해 둘 다 지운 페이지 = 실패 (macnote 0·translocation 0 이라
+    #    ⓐ·ⓒ축만 보면 통과해버린다 — winnote 축이 유일한 검출기다)
+    v, d = macnote_verdict(main_macnote_counts("<div>\n</div>"))
+    ok("⑦ⓒ 윈도우 안내까지 지운 회귀는 실패", not v, d)
+
+    # ⓓ 윈도우 안내 중복(2건) = 실패
+    v, d = macnote_verdict(main_macnote_counts("<div>\n" + win_p + win_p + "</div>"))
+    ok("⑦ⓓ winnote 2건은 실패", not v, d)
+
+    total = tally["pass"] + tally["fail"]
+    print("\n=== self-test %d/%d PASS (실패 %d건) ===" % (tally["pass"], total, tally["fail"]))
+    return 0 if tally["fail"] == 0 else 1
+
+
 def main(argv):
+    if "--self-test" in argv[1:]:
+        return self_test()
     if len(argv) < 2:
         print(__doc__.strip(), file=sys.stderr)
         return 2
@@ -182,6 +257,11 @@ def main(argv):
         ok6 = not mismatch
         detail += " · 실자산 대조 " + (", ".join(mismatch) if mismatch else "4종 일치")
     check("⑥ SHA256SUMS.txt 전수·실자산 대조", ok6, detail)
+
+    # ⑦ 메인페이지 macOS(Safari) 안내 삭제 확인 (오너 지시 2026-08-24)
+    # 이미 받아둔 main_html 을 재사용한다 — 추가 왕복 없음.
+    ok7, detail7 = macnote_verdict(main_macnote_counts(main_html))
+    check("⑦ 메인 macOS 안내 삭제 · 윈도우 안내 잔존", ok7, detail7)
 
     npass = sum(1 for r in results if r)
     print("\n=== %d/%d PASS ===" % (npass, len(results)))

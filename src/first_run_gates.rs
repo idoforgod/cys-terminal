@@ -42,6 +42,47 @@
 //! ## 롤백 스위치 (env 1지점)
 //! `CYS_FIRST_RUN_GATES_OVERRIDE=0` → `agents.json` 봉투 파싱을 통째로 끄고 코드 정본만 쓴다.
 //! 읽는 곳은 `override_enabled()` 하나뿐이고, 판정은 순수 `override_enabled_from()` 에 있다.
+//!
+//! ## ★부재의 비용 — 왜 '버린다' 가 자기규칙의 집행 수단이 될 수 없는가 (P4-10 · 2026-08-24)
+//!
+//! 자기규칙(아래 ⓐⓑⓒ)이 프로덕션에서 집행되기 시작한 첫 판(P4-3)은 위반 관문을 **버렸다**.
+//! 이종 리뷰어 둘이 동시에 critical 로 지목한 그 판의 두 귀결이 이 절의 근거다.
+//!
+//! **① 사용자 주권 침해** — 사용자가 `agents.json` 에 `source=replace` 로 자기 코퍼스 하나를
+//!   선언하면, 그 선언은 코드 정본에 위젯 AND 가드가 없다는 이유로 버려지고 "집행 후 코퍼스가
+//!   비면 코드 정본으로 되돌린다" 는 폴백이 **코드 6종을 다시 세웠다**. 사용자가 선언한 것이
+//!   조용히 벤더 정본으로 뒤집히는 것은 이 파일이 지키려는 계약(디스크 선언 > 임베드)의 반대다.
+//!
+//! **② 실패 방향의 역전(재난 ④)** — 봉투가 `bypass-disclaimer` 의 위젯을 비우면 종전 귀결은
+//!   "needle 하나로 관문 성립 → **보류**"(안전측 오탐)였다. 버리기 시작한 뒤의 귀결은
+//!   "관문 없음 → **주입**" 이다. 면책 창의 기본 포커스는 `No, exit` 이고 그 Return 은 rc 1 이므로
+//!   **집행이 안전한 오탐을 좌석 사망으로 바꿔 놨다**. 규칙을 지키려다 규칙이 지키려던 것을 죽인다.
+//!
+//! ### 그래서 집행 수단은 '버리기' 가 아니라 **수리(repair)** 다
+//!
+//! | 위반 관문의 정체 | 집행 | 근거 |
+//! |---|---|---|
+//! | 빌트인 대응물이 **있다**(봉투가 정본을 덮은 것) | 위반 축을 **정본 선언으로 복원** | 관문을 잃지 않은 채 AND 구멍이 닫힌다. BLOCK-1 의 봉투 공격이 정확히 이 경로이고, 복원은 그 공격을 무효로 만들면서 관문은 남긴다. |
+//! | 빌트인에 **없다**(사용자 신설 관문) | needle 이 정상 화면에 걸리는 것만 **좁히고**, 관문 자체는 **유지**(사유는 `notes`) | 버리는 것은 "사용자를 조용히 무시" 하는 것이다. 그리고 좁히기가 뒤집는 귀결은 **정상 화면 위에서의 보류**뿐이라 — 그 화면에서는 주입이 애초에 옳다 — 위험 방향이 아니다. |
+//!
+//! 어느 경우에도 **집행은 관문을 코퍼스에서 제거하지 않는다.** 그것이 성질 ②(실패 방향 불역전)를
+//! 구조로 보장하는 유일한 방법이다: 제거가 없으면 `보류 → 주입` 으로 뒤집힐 자리도 없다.
+//!
+//! ### 부재의 비용은 관문마다 다르다 — [`AbsenceCost`]
+//!
+//! 이 파일의 종전 비용표는 "오탐(영구 라이브락) > 미탐" 한 줄이었다. 그 표는 **관문 전체를
+//! 뭉뚱그린다**. 실제로는 면책·신뢰 계열(킬체인 관문)에서 부호가 반대다 —
+//!
+//! | 관문 | 오탐(관문이 아닌데 잡음) | **부재**(관문인데 코퍼스에 없음) |
+//! |---|---|---|
+//! | `theme` | 영구 부트 라이브락 | 주입 Return 이 기본 포커스(= 통과 액션)를 눌러 **그냥 통과**한다 → 가역 |
+//! | `bypass-disclaimer` | 영구 부트 라이브락 | 주입 Return 이 `No, exit` 를 눌러 **rc 1 좌석 사망** → 비가역 |
+//! | `folder-trust` | 영구 부트 라이브락 | 2026-07-29 킬체인의 1발째 자리 — 놓치면 2발째가 면책 창을 누른다 → 비가역 |
+//! | `login-method`·`oauth-code` | 영구 부트 라이브락 | Return 이 브라우저·무한 재시도로 가고 **프로세스는 살아 있다** → 허위 READY 영구화 → 비가역 |
+//! | `feature-announce-fullscreen` | 영구 부트 라이브락 | 기본 포커스 `Yes, try it` 수락 = 대체 화면·마우스 보고 → **화면을 읽는다는 관측 전제 자체가 무너진다** → 비가역 |
+//!
+//! 그래서 관문마다 부재의 비용을 **선언**하고([`Def::absence_cost`]), 집행이 그 비용을 넘지
+//! 않는지 [`resolve_with`] 가 집행 전후를 대조해 확인한다(넘었으면 되살린다).
 
 use serde_json::Value;
 
@@ -76,6 +117,19 @@ pub struct GateAction {
     pub literal: Option<String>,
 }
 
+/// ★관문이 **코퍼스에서 사라졌을 때** 치르는 값(모듈 doc 의 비용표가 근거다).
+///
+/// 오탐(관문이 아닌데 잡음)의 비용은 관문마다 같다 — 영구 부트 라이브락. 그러나 **부재**의
+/// 비용은 관문마다 다르고, 킬체인 관문에서는 그것이 오탐보다 비싸다. 자기규칙 집행처럼
+/// "관문을 줄이는" 조작은 이 값을 넘어설 수 없다([`resolve_with`] 의 대조가 집행한다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsenceCost {
+    /// ★킬체인 — 부재의 귀결이 **비가역**이다(좌석 rc 1 종료 · 허위 READY 영구화 · 관측 전제 파괴).
+    Fatal,
+    /// 부재의 귀결이 **가역**이다 — 그 화면을 한 번 놓치고, 뒤 단위의 다른 축이 한 번 더 본다.
+    Recoverable,
+}
+
 /// 이 관문 선언이 어디서 왔는가.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -106,11 +160,18 @@ pub struct Gate {
     pub action: Option<GateAction>,
     /// `HumanOnly` 인 이유(사람에게 보여줄 처방 근거).
     pub human_reason: Option<String>,
+    /// ★이 관문이 코퍼스에서 사라졌을 때의 비용. 집행이 넘을 수 없는 상한이다.
+    pub absence_cost: AbsenceCost,
     pub measured_on: String,
     pub origin: Origin,
 }
 
 impl Gate {
+    /// 이 관문의 **부재**가 비가역인가(킬체인 관문인가).
+    pub fn absence_is_fatal(&self) -> bool {
+        self.absence_cost == AbsenceCost::Fatal
+    }
+
     /// 기본 포커스에서 목표 항목까지 필요한 **아래키 횟수**.
     /// 위로 올라가야 하거나(음수) 기본 포커스가 미측정이면 `None` = **보류**(fail-closed).
     pub fn down_presses(&self) -> Option<u8> {
@@ -161,6 +222,11 @@ struct Def {
     /// (select_index, label, literal)
     action: Option<(u8, &'static str, Option<&'static str>)>,
     human_reason: Option<&'static str>,
+    /// ★이 관문이 코퍼스에서 **사라졌을 때** 무엇이 일어나는가(모듈 doc 비용표).
+    /// 선언 규율: `Fatal` 은 부재의 귀결이 **비가역**(좌석 종료·허위 READY 영구화·관측 전제
+    /// 파괴)일 때만 쓴다. 그리고 각 Def 에 그 귀결을 한 줄로 적는다 — 근거 없는 `Fatal` 은
+    /// 집행을 무력화하고, 근거 없는 `Recoverable` 은 좌석을 죽인다.
+    absence_cost: AbsenceCost,
 }
 
 /// ★관문 정본 6종(실측 순서).
@@ -194,6 +260,9 @@ const DEFS: &[Def] = &[
         // 기본 포커스를 그대로 확정한다(아래키 0회 + Return) — 종전 동작에서 벗어나지 않는다.
         action: Some((2, "Dark mode", None)),
         human_reason: None,
+        // 부재의 귀결: 주입 Return 이 기본 포커스(2 = Dark mode)를 누르고 그것이 곧 통과
+        // 액션이다 → 관문을 **정상 통과**한다. 남는 결과는 테마 하나이며 사람이 되돌릴 수 있다.
+        absence_cost: AbsenceCost::Recoverable,
     },
     // ── ② 로그인 방식 선택 ────────────────────────────────────────────────
     Def {
@@ -215,6 +284,9 @@ const DEFS: &[Def] = &[
              절대경로의 sha256 로 봉인되므로(mac Keychain `Claude Code-credentials-<8hex>`) \
              다른 프로필에서 복사해 올 수도 없다. 새 기계·새 부서마다 사람이 1회 로그인해야 한다.",
         ),
+        // 부재의 귀결: 주입 Return 이 브라우저를 열고 좌석은 OAuth 대기에 갇힌 채 **살아 있다**
+        // → 생존만 보는 판정이 그 좌석을 영원히 '준비됨'으로 읽는다(허위 READY 영구화 · 비가역).
+        absence_cost: AbsenceCost::Fatal,
     },
     // ── ③ OAuth 코드 붙여넣기 ─────────────────────────────────────────────
     Def {
@@ -242,6 +314,9 @@ const DEFS: &[Def] = &[
              retry' 무한 루프이고 **프로세스는 계속 살아 있다** — 생존만 보는 판정은 이 좌석을 \
              영원히 '준비됨'으로 오탐한다(허위 READY 의 영구화 경로).",
         ),
+        // 부재의 귀결: 빈 Return 이 'Invalid code · Press Enter to retry' 무한 루프에 들어가고
+        // 프로세스는 계속 살아 있다 → 허위 READY 영구화(비가역).
+        absence_cost: AbsenceCost::Fatal,
     },
     // ── ④ 폴더 신뢰 ───────────────────────────────────────────────────────
     Def {
@@ -263,6 +338,10 @@ const DEFS: &[Def] = &[
         default_index: Some(1),
         action: Some((1, "Yes, I trust this folder", None)),
         human_reason: None,
+        // ★부재의 귀결: 이 창은 2026-07-29 킬체인의 **1발째 자리**다. 여기를 관문으로 잡지
+        //   못하면 주입이 계속되고, 확인 에코가 남은 다음 화면(면책)에서 2발째 Return 이
+        //   `No, exit` 를 누른다 — 실사고의 정확한 경로이며 좌석은 rc 1 로 죽는다(비가역).
+        absence_cost: AbsenceCost::Fatal,
     },
     // ── ⑤ Bypass Permissions 면책 ─────────────────────────────────────────
     Def {
@@ -280,6 +359,10 @@ const DEFS: &[Def] = &[
         default_index: Some(1),
         action: Some((2, "Yes, I accept", Some("2"))),
         human_reason: None,
+        // ★★부재의 귀결: 기본 포커스가 `No, exit` 이므로 주입의 **Return 한 발이 rc 1** 이다.
+        //   좌석이 죽으면 되돌릴 것이 없다 — 이 코퍼스에서 부재가 가장 비싼 관문이고, 재난 ④
+        //   (집행이 보류를 주입으로 뒤집는다)가 겨냥하는 자리가 정확히 여기다.
+        absence_cost: AbsenceCost::Fatal,
     },
     // ── ⑥ 신기능 안내(벤더 업그레이드마다 증식) ───────────────────────────
     Def {
@@ -296,6 +379,10 @@ const DEFS: &[Def] = &[
         //   '종전 동작 유지' 쪽인 `2. Not now` 를 고른다(아래 1회 + Return).
         action: Some((2, "Not now", Some("2"))),
         human_reason: None,
+        // 부재의 귀결: 주입 Return 이 기본 포커스 `Yes, try it` 를 눌러 fullscreen renderer 가
+        // 켜진다 = 대체 화면 진입 + 마우스 보고. **화면을 읽어 판정한다**는 이 시스템의 관측
+        // 전제가 그 순간 무너지고, 이후 모든 축(마커·관문·꼬리)이 같이 무효가 된다(비가역).
+        absence_cost: AbsenceCost::Fatal,
     },
 ];
 
@@ -346,6 +433,15 @@ pub const NEEDLE_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "oauth-code",
+        "Browser didn't open? Use the url below to sign in",
+        "OAuth 브라우저 대기 화면의 **지시형 안내 줄**(실측 문면 뒤에 `(c to copy)` 가 붙는다). \
+         물음표가 문장 **중간**에 있어 질문형 판정(`is_question_form`)에 걸리지 않으므로 근거를 \
+         명시한다 — 종전 느슨한 규칙(물음표 포함 여부만 봄)에서는 이 needle 이 심사 없이 \
+         통과했다(P4-9). 이 줄은 브라우저 로그인 대기 화면이 떠 있는 동안에만 렌더되며, 코드 \
+         입력이 끝나면 사라진다.",
+    ),
+    (
+        "oauth-code",
         "Paste code here if prompted",
         "OAuth 코드 **입력 프롬프트 줄 그 자체**다(실측 `Paste code here if prompted >`). \
          상태 보고가 아니라 입력을 기다리는 위젯이므로 떠 있는 동안에만 존재한다.",
@@ -388,6 +484,34 @@ pub const NEEDLE_EXEMPTIONS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// ★관문 ↔ 오탐 대조군 **커버리지 표** (2026-08-24 · 적대 리뷰어 권고 채택).
+///
+/// `(gate_id, non_gate_screen_id)`. **새 관문을 들이는 사람은 이 표에 줄을 더해야 하고**, 그
+/// 줄이 가리키는 대조군 화면은 그 관문의 **위젯 서명을 전부 만족**해야 한다
+/// (집행: `every_gate_has_a_control_screen_that_satisfies_its_widget_signature`).
+///
+/// ★왜 필요한가: 종전에 `NON_GATE_SCREENS` 는 고정 6항목이었고, 새 관문을 들일 때 생기는
+///   유일한 마찰은 헬스 러너의 `need(len(blocks) == 6)` 하나였다 — 손으로 `6 → 7` 만 고치면
+///   **대조군 0으로 통과**한다. 그 상태에서는 관문이 늘수록 오탐 표면만 넓어지고 그것을 재는
+///   자리는 하나도 늘지 않는다(리뷰어 표현: "지금 이빨은 자라지 않는다").
+///
+/// ★왜 '존재'가 아니라 '위젯 서명 만족'을 요구하는가: 아무 화면이나 갖다 붙이면 위젯 AND 가
+///   애초에 불만족이라 관문이 안 잡히는 것이 당연해지고, 그 커버리지는 아무것도 재지 못한다.
+///   서명을 만족시켜 두면 "그 화면에서 관문이 안 잡히는 이유가 **오직 needle 축**" 이라는 사실이
+///   실행으로 증명된다.
+pub const GATE_CONTROL_COVERAGE: &[(&str, &str)] = &[
+    ("theme", "audit-log-line"),
+    ("theme", "config-theme-setting"),
+    ("login-method", "account-status-panel"),
+    ("oauth-code", "doc-mentioning-oauth-url"),
+    ("folder-trust", "live-permission-prompt"),
+    ("folder-trust", "audit-log-line"),
+    ("bypass-disclaimer", "live-permission-prompt"),
+    ("bypass-disclaimer", "audit-log-line"),
+    ("feature-announce-fullscreen", "live-permission-prompt"),
+    ("feature-announce-fullscreen", "audit-log-line"),
+];
+
 /// 이 문자열이 보편 토큰 단독인가(규칙 ⓒ의 판정 핵).
 pub fn is_universal_widget_token(w: &str) -> bool {
     let f = flatten(w);
@@ -415,6 +539,67 @@ pub fn widget_rule_violations(g: &Gate) -> Vec<String> {
     out
 }
 
+/// ★질문형 판정(규칙 ⓐ) — 물음표가 **문장을 끝내는** 구두점일 때만 참이다.
+///
+/// 【무엇이 틀렸었는가 — P4-9 · 2026-08-24 적대 리뷰어】 종전 판정은 검체 본문의
+/// `if n.contains('?') { continue; }` 한 줄이었고 **위치를 보지 않았다**. 그래서 문장 중간에
+/// `?` 가 하나만 있으면 면제 심사를 통째로 건너뛴다. 실증 반례:
+/// `"Do you want to proceed?"` 는 **살아 있는 claude 세션의 권한 프롬프트 문면**인데 근거 없이
+/// 통과했고, 당시 대조군 6종에 그 화면이 없어 대조군도 통과했다.
+///
+/// 수리는 두 겹이다 —
+///   ⓐ 여기: 물음표가 **끝** 구두점일 것(중간 `?` 는 면제표에 근거를 적어야 한다).
+///   ⓑ [`gate_rule_violations`]: **질문형이어도** 관문이 아닌 화면 전량 대조를 여전히 요구한다.
+///     ⓐ 만으로는 "그 관문에서만 나온다" 가 조금도 보장되지 않기 때문이다.
+pub fn is_question_form(needle: &str) -> bool {
+    needle
+        .trim_end()
+        .strip_suffix('?')
+        .is_some_and(|head| head.chars().any(|c| !c.is_whitespace()))
+}
+
+/// ★관문 하나가 자기규칙을 만족하는가 — **프로덕션 집행용** 전량 판정(위반 사유를 돌려준다).
+///
+/// [`widget_rule_violations`](ⓑⓒ) 에 규칙 ⓐ의 **이빨**(어떤 needle 도 관문이 아닌 화면에
+/// 단독으로 걸리지 않는다)을 더한 것이다. 질문형 여부·면제표는 여기서 보지 **않는다** —
+/// 면제표는 코드 정본을 쓰는 사람이 근거를 적는 자리이고(검체 ⓐ가 집행), override 봉투로
+/// 들어온 선언에는 적을 자리가 없기 때문이다. 반면 "정상 화면에 걸리는가" 는 선언의 출처와
+/// 무관하게 **화면으로 잴 수 있는 사실**이라 어디서 온 선언이든 똑같이 집행할 수 있다.
+///
+/// ★단독으로 보는 이유: 감지 경로(`inject_guard::needle_hit`)는 위젯 AND 를 보지 않으므로,
+///   needle 이 스스로 관문 전용이 아니면 그 경로가 통째로 오탐한다.
+pub fn gate_rule_violations(g: &Gate) -> Vec<String> {
+    let mut out = widget_rule_violations(g);
+    for n in &g.needles {
+        for sid in needle_non_gate_hits(n) {
+            out.push(format!(
+                "{}: needle {n:?} 이 **관문이 아닌** 화면 {sid} 에 단독으로 걸린다 — 정상 \
+                 화면에도 나타나는 문면은 관문의 근거가 될 수 없다(오탐의 귀결은 영구 부트 \
+                 라이브락)",
+                g.id
+            ));
+        }
+    }
+    out
+}
+
+/// 이 needle 이 **관문이 아닌 화면**에 단독으로 걸리는가 — 걸린 대조군 화면 id 를 돌려준다.
+///
+/// 규칙 ⓐ의 판정 핵이자 **수리(repair)의 판정 핵**이다: 위반을 아는 것만으로는 무엇을 고쳐야
+/// 하는지 알 수 없으므로, "어느 needle 이 문제인가" 를 사유 문자열이 아니라 값으로 돌려준다
+/// (사유 문자열을 되파싱해 고치는 코드는 다음 판에서 반드시 갈린다).
+pub fn needle_non_gate_hits(needle: &str) -> Vec<&'static str> {
+    let (nn, nf) = (normalize(needle), flatten(needle));
+    if nf.is_empty() {
+        return Vec::new();
+    }
+    fixtures::NON_GATE_SCREENS
+        .iter()
+        .filter(|(_, screen)| normalize(screen).contains(&nn) || flatten(screen).contains(&nf))
+        .map(|&(sid, _)| sid)
+        .collect()
+}
+
 /// 코드 임베드 정본 코퍼스.
 pub fn builtin() -> Vec<Gate> {
     DEFS.iter()
@@ -432,6 +617,7 @@ pub fn builtin() -> Vec<Gate> {
                 literal: lit.map(|s| s.to_string()),
             }),
             human_reason: d.human_reason.map(|s| s.to_string()),
+            absence_cost: d.absence_cost,
             measured_on: MEASURED_ON.to_string(),
             origin: Origin::Builtin,
         })
@@ -593,9 +779,180 @@ pub fn resolve_from_spec(spec: &Value) -> Resolved {
 /// 규칙 — ① 손상된 선언은 **그 항목만** 버리고 코드 정본을 유지한다(부트를 멈추지 않는다).
 /// ② `HumanOnly` 로 실측된 관문은 override 로 **기계 통과로 승격되지 않는다**(로그인은 우회
 /// 불가라는 것이 측정 결과이지 정책이 아니다). 반대 방향(Machine→HumanOnly)은 조이는 쪽이라 허용.
-/// ③ `replace` 인데 결과가 비면 코드 정본으로 되돌린다 — **빈 코퍼스는 '관문 없음'이 아니라
-/// '눈을 감음'** 이고, 뒤 단위가 '관문 0매칭'을 ready 의 AND 항으로 쓰는 순간 허위 ready 가 된다.
+/// ③ `replace` 인데 **파싱 가능한 선언이 0건**이면 코드 정본으로 되돌린다 — 빈 코퍼스는
+/// '관문 없음'이 아니라 '눈을 감음'이고, 뒤 단위가 '관문 0매칭'을 ready 의 AND 항으로 쓰는
+/// 순간 허위 ready 가 된다. ★이 폴백은 **`resolve_raw` 안에서만** 산다: 사용자가 유효하게
+/// 선언한 관문이 하나라도 있으면 그것이 코퍼스이며, 자기규칙 집행이 그 코퍼스를 비워 정본으로
+/// 되돌리는 일은 없다(P4-10 결함 ① — 그 폴백이 사용자 주권 침해의 직접 원인이었다).
+/// ④ ★해소 **직전**에 자기규칙을 집행한다(아래 [`enforce_self_rules`]) — 규칙을 아는 것과
+/// 규칙이 집행되는 것은 다른 사실이다(P4-3). 단 집행 수단은 **수리이지 제거가 아니다**(P4-10).
 pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
+    let Resolved {
+        gates,
+        mut notes,
+        source,
+    } = resolve_raw(envelope, override_on);
+    // ★집행 전 코퍼스를 남긴다 — 아래 [`enforce_absence_cost`] 가 "집행이 부재의 비용을
+    //   넘지 않았는가" 를 **대조로** 판정하려면 전후 두 벌이 있어야 한다.
+    let pre = gates.clone();
+    let mut kept = enforce_self_rules(gates, &mut notes);
+    enforce_absence_cost(&pre, &mut kept, &mut notes);
+    // 출처 회계는 그대로다: 집행은 관문을 제거하지 않으므로 개수·출처가 변하지 않는다
+    // (변했다면 위 게이트가 되살리고 사유를 남긴다 — 조용한 변형은 없다).
+    Resolved {
+        gates: kept,
+        notes,
+        source,
+    }
+}
+
+/// ★자기규칙 집행 — 위반 관문은 **버리고** `notes` 에 사유를 남긴다(P4-3 · 2026-08-24).
+///
+/// 【무엇이 틀렸었는가 — 적대 리뷰어 격리 실행】 [`widget_rule_violations`] 는 정의만 되어 있고
+/// **프로덕션 호출이 0**이었다(`git grep` 결과가 정의 1 + `#[cfg(test)]` 3). 그래서 자기규칙은
+/// 검체 안에서만 살아 있었고, 검체가 도는 코퍼스는 전부 `builtin()` 이었다 — **override 봉투로
+/// 해소된 코퍼스는 규칙 밖**이었다. 그 틈으로 BLOCK-1 이 봉투 한 줄로 그대로 복원된다:
+///
+/// ```json
+/// {"first_run_gates":{"gates":[{"id":"theme","needles":["Welcome to Claude Code"],"widget":[]}]}}
+/// ```
+///
+/// `"widget": []` 는 `Some(vec![])` 이라 [`apply_patch`] 가 빌트인 관문의 **AND 가드를 비운다**.
+/// 그러면 배너 needle 하나로 관문이 성립하고, 건강한 노드 전원이 `gate_pending` 으로 접혀
+/// **영구 부트 라이브락**이 된다. 규칙은 그 위반을 알고 있었지만 **아무도 묻지 않았다.**
+///
+/// 【왜 버리지 **않는가** — P4-10 · 2026-08-24 이종 리뷰어 2인 일치】 첫 판의 집행 수단은
+/// '버리기' 였고, 그것이 두 가지를 부쉈다 —
+///
+///   ① **사용자 주권**: `source=replace` 로 선언한 사용자 코퍼스가 통째로 버려지고, 뒤이은
+///      "비면 정본으로 되돌린다" 폴백이 벤더 6종을 다시 세웠다(디스크 선언 > 임베드의 반대).
+///   ② **실패 방향의 역전(재난 ④)**: 봉투가 `bypass-disclaimer` 의 위젯을 비웠을 때 종전
+///      귀결은 `needle 하나로 관문 성립 → 보류`(안전측 오탐)였는데, 버린 뒤의 귀결은
+///      `관문 없음 → 주입` 이다. 그 창의 기본 포커스는 `No, exit` 이고 Return 은 rc 1 이므로
+///      **집행이 안전한 오탐을 좌석 사망으로 바꿨다.**
+///
+/// 그래서 집행 수단을 [`repair_gate`](수리)로 바꾼다. 관문은 **어떤 경우에도 코퍼스에서
+/// 제거되지 않으며**, 위반한 축만 고쳐진다. 제거가 없으므로 `보류 → 주입` 으로 뒤집힐 자리도
+/// 구조적으로 없다. 조용히 고치지 않는 것이 계약의 나머지 절반이라 사유는 반드시 `notes` 에 남는다.
+fn enforce_self_rules(gates: Vec<Gate>, notes: &mut Vec<String>) -> Vec<Gate> {
+    let canon = builtin();
+    gates
+        .into_iter()
+        .map(|g| repair_gate(g, &canon, notes))
+        .collect()
+}
+
+/// ★자기규칙 위반을 **버리지 않고 고친다**(P4-10). 반환값은 언제나 관문 하나다.
+///
+/// | 위반 축 | 빌트인 대응물이 있다 | 사용자 신설 관문(대응물 없음) |
+/// |---|---|---|
+/// | needle 이 정상 화면에 걸린다 | 정본 needle 로 **복원** | 걸리는 needle 만 **제거**(나머지는 유지) |
+/// | 위젯 AND 가드 0 · 보편 토큰 단독 | 정본 위젯 서명으로 **복원** | **유지** + 사유(아래 근거) |
+///
+/// ★왜 사용자 신설 관문의 위젯 위반은 유지하는가: 규칙 ⓑⓒ는 needle 품질을 위한 **심층 방어**
+///   이고, 실제로 오탐을 재는 축은 "정상 화면에 걸리는가"(규칙 ⓐ의 이빨) 하나다. 그 축을 이미
+///   통과한 사용자 needle 이라면 AND 가드의 부재는 **약한 가드이지 위험한 가드가 아니다**.
+///   반면 관문을 버리는 것은 사용자를 조용히 무시하면서 귀결을 주입 방향으로 뒤집는다.
+///
+/// ★왜 needle 제거는 안전한가: 제거되는 것은 **관문이 아닌 대조군 화면에 걸리는** needle 뿐이고,
+///   그 화면에서 뒤집히는 귀결은 `보류 → 주입` 이지만 **그 화면에서는 주입이 애초에 옳다**
+///   (정상 화면이다). 실측 관문 화면 위에서의 귀결은 한 톨도 바뀌지 않는다(검체가 전수 대조).
+fn repair_gate(mut g: Gate, canon: &[Gate], notes: &mut Vec<String>) -> Gate {
+    if gate_rule_violations(&g).is_empty() {
+        return g;
+    }
+    let builtin_of = canon.iter().find(|b| b.id == g.id);
+
+    // ── ⓐ needle 축 — 정상 화면에 걸리는 문면만 손댄다.
+    let offending: Vec<String> = g
+        .needles
+        .iter()
+        .filter(|n| !needle_non_gate_hits(n).is_empty())
+        .cloned()
+        .collect();
+    if !offending.is_empty() {
+        match builtin_of {
+            Some(b) => {
+                notes.push(format!(
+                    "{}: needle {offending:?} 이 정상 화면에 걸린다 — 버리지 않고 코드 정본의 \
+                     needle 로 **복원**했다(관문은 남고 오탐 경로만 닫힌다)",
+                    g.id
+                ));
+                g.needles = b.needles.clone();
+            }
+            None => {
+                g.needles.retain(|n| needle_non_gate_hits(n).is_empty());
+                notes.push(format!(
+                    "{}: 사용자 신설 관문의 needle {offending:?} 이 정상 화면에 걸려 그 항목만 \
+                     **제거**했다(관문 선언 자체는 유지 — 남은 needle {}건)",
+                    g.id,
+                    g.needles.len()
+                ));
+            }
+        }
+    }
+
+    // ── ⓑⓒ 위젯 축 — AND 가드가 0이거나 보편 토큰 단독이다.
+    if !widget_rule_violations(&g).is_empty() {
+        match builtin_of.filter(|b| widget_rule_violations(b).is_empty()) {
+            Some(b) => {
+                notes.push(format!(
+                    "{}: 위젯 AND 가드 위반({:?}) — 버리지 않고 코드 정본의 위젯 서명 {:?} 으로 \
+                     **복원**했다(BLOCK-1 봉투 공격이 정확히 이 경로다: 관문을 잃지 않은 채 \
+                     AND 구멍이 닫힌다)",
+                    g.id, g.widget, b.widget
+                ));
+                g.widget = b.widget.clone();
+            }
+            None => {
+                notes.push(format!(
+                    "{}: 사용자 신설 관문의 위젯 AND 가드가 없다 — 복원할 정본 서명이 없으므로 \
+                     선언을 **그대로 유지**한다(버리면 사용자를 조용히 무시하면서 귀결을 \
+                     보류 → 주입 으로 뒤집는다). needle 축은 정상 화면 대조를 이미 통과했다",
+                    g.id
+                ));
+            }
+        }
+    }
+    g
+}
+
+/// ★부재의 비용 게이트 — 집행이 [`AbsenceCost::Fatal`] 관문을 사라지게 했는지 **대조로** 본다.
+///
+/// [`repair_gate`] 는 관문을 제거하지 않으므로 평시에 이 게이트는 아무것도 하지 않는다.
+/// 그래도 두는 이유: "제거하지 않는다" 는 지금 코드의 **성질**일 뿐이고, 다음 판의 집행기가
+/// 그 성질을 잃어도 컴파일러는 아무 말도 하지 않는다. 킬체인 관문의 부재는 rc 1 좌석 사망이라
+/// 그 회귀를 사람의 주의력에 맡길 수 없다 — 그래서 계약을 **실행되는 대조**로 남긴다.
+///
+/// 되살릴 때는 **코드 정본**을 우선한다(정본은 규칙을 만족한다). 정본에 없는 사용자 신설
+/// 관문이면 집행 전 선언 그대로 되살린다 — 부재보다 비싼 것은 없다는 것이 이 게이트의 전제다.
+fn enforce_absence_cost(pre: &[Gate], kept: &mut Vec<Gate>, notes: &mut Vec<String>) {
+    let canon = builtin();
+    for g in pre {
+        if kept.iter().any(|k| k.id == g.id) {
+            continue;
+        }
+        if !g.absence_is_fatal() {
+            notes.push(format!(
+                "{}: 집행이 관문을 제거했다(부재의 비용 = 가역) — 그 화면은 뒤 단위의 다른 축이 \
+                 한 번 더 본다",
+                g.id
+            ));
+            continue;
+        }
+        let restored = canon.iter().find(|b| b.id == g.id).unwrap_or(g).clone();
+        notes.push(format!(
+            "{}: ★집행이 **부재의 비용이 비가역인** 관문을 제거했다 — 되살린다. 이 관문의 \
+             부재는 좌석 종료·허위 READY 영구화·관측 전제 파괴 중 하나로 귀결하며, 자기규칙 \
+             위반보다 비싸다(모듈 doc 비용표)",
+            g.id
+        ));
+        kept.push(restored);
+    }
+}
+
+/// 위 [`resolve_with`] 의 해소 본체(자기규칙 집행 **전**의 코퍼스를 만든다).
+fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
     let base = builtin();
     if !override_on {
         return Resolved {
@@ -753,9 +1110,22 @@ fn parse_passability(v: Option<&Value>) -> Option<Passability> {
     }
 }
 
+fn parse_absence_cost(v: Option<&Value>) -> Option<AbsenceCost> {
+    match v?.as_str()? {
+        "fatal" => Some(AbsenceCost::Fatal),
+        "recoverable" => Some(AbsenceCost::Recoverable),
+        _ => None,
+    }
+}
+
 /// 코드 정본에 없는 id 의 신규 관문 선언 → `Gate`. 최소 요건은 id + needle ≥ 1 이다
 /// (needle 없는 관문은 아무것도 식별하지 못하므로 받아도 무의미하고, 무의미한 선언을
 ///  조용히 받아 두면 "선언했는데 왜 안 잡히나"의 진단 비용만 남는다).
+///
+/// ★`absence_cost` 기본값은 [`AbsenceCost::Recoverable`] 이다 — 사용자 신설 관문은 **실측된
+///   킬체인이 아니므로** 그 부재가 비가역이라고 주장할 근거가 없고, 근거 없는 `Fatal` 은
+///   [`enforce_absence_cost`] 가 규칙 위반 선언을 되살리는 구멍이 된다(BLOCK-1 의 형태).
+///   자기 관문이 킬체인임을 아는 사용자는 `"absence_cost": "fatal"` 로 명시 선언한다.
 fn parse_new_gate(v: &Value, default_measured: &str) -> Result<Gate, String> {
     let o = v.as_object().ok_or("항목이 객체가 아니다")?;
     let id = o
@@ -795,6 +1165,7 @@ fn parse_new_gate(v: &Value, default_measured: &str) -> Result<Gate, String> {
             .get("human_reason")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
+        absence_cost: parse_absence_cost(o.get("absence_cost")).unwrap_or(AbsenceCost::Recoverable),
         measured_on: o
             .get("measured_on")
             .and_then(|x| x.as_str())
@@ -866,6 +1237,19 @@ fn apply_patch(
     }
     if let Some(r) = d.get("human_reason").and_then(|v| v.as_str()) {
         g.human_reason = Some(r.to_string());
+    }
+    match parse_absence_cost(d.get("absence_cost")) {
+        // ★조이는 방향만 허용(passability 와 같은 비대칭). 부재의 비용은 **실측된 귀결**이지
+        //   정책이 아니다 — 면책 창의 Return 이 rc 1 이라는 사실은 선언으로 바뀌지 않는다.
+        //   낮추기를 허용하면 봉투 한 줄로 킬체인 관문의 보호가 꺼진다.
+        Some(AbsenceCost::Recoverable) if g.absence_cost == AbsenceCost::Fatal => {
+            notes.push(format!(
+                "{}: fatal → recoverable 완화 선언 거부(부재의 귀결은 실측 사실이다)",
+                g.id
+            ));
+        }
+        Some(c) => g.absence_cost = c,
+        None => {}
     }
     g.measured_on = d
         .get("measured_on")
@@ -966,14 +1350,72 @@ pub mod fixtures {
         logs/boot-2026-08-23.log:412: OAuth error: Invalid code. Please make sure …\n\
         $ \n";
 
-    /// 관문 문면이 **본문으로** 출력된 화면(감사 문서·소스 열람). 생애 창 상한이 없으면
-    /// 작업 중 노드가 자기 화면 때문에 영구 차단된다(U-14 치명위험 ①과 같은 계열).
-    pub const AUDIT_LOG_LINE: &str =
-        "[launch-agent] ready(신규 출현분에 마커) — 주입 안전\n\
-        [boot] worker=claude surface=7 rc=0\n\
+    /// 관문 문면이 **본문으로** 출력된 화면(감사 문서·소스 열람) 중 코퍼스가 **닫을 수 있는** 쪽.
+    ///
+    /// ★P4-8 수리(2026-08-24 적대 리뷰어): 종전 내용은 `[launch-agent] ready(…)` ·
+    ///   `[boot] worker=claude` · 셸 프롬프트 세 줄뿐이라 **이름이 약속한 관문 문면을 한 글자도
+    ///   담지 않았다**. 어떤 코퍼스를 넣어도 통과하는 화면은 아무것도 재지 못한다(공허한 대조군).
+    ///   지금 내용은 관문 **넷의 위젯 서명을 전부 만족**한다(`Auto (match terminal)` ·
+    ///   `Dark mode` · `Enter to confirm` · `Esc to cancel`). 그런데도 관문으로 잡히면 안 된다 —
+    ///   즉 이 화면에서 일하는 것은 오직 **needle 축**이고, 이 대조군이 그 사실을 실행으로 증명한다.
+    ///
+    /// ★needle 까지 본문에 실린 화면은 이 표에 **넣을 수 없다**. 원리와 실제 방어선은
+    ///   [`BODY_TEXT_SCREENS`] 의 doc 에 있다(잔여 위험 명시).
+    pub const AUDIT_LOG_LINE: &str = "❯ cat _round/handoffs/boot-gate-audit.md\n\
+        \x20 ## 관문 코퍼스 감사 — 위젯 서명 전사(2026-08-24)\n\
+        \x20 | id | 제목 | 위젯 서명 | 기본 포커스 |\n\
+        \x20 | theme | 온보딩 · 테마 선택 | Auto (match terminal) / Dark mode | 2 |\n\
+        \x20 | folder-trust | 작업 폴더 신뢰 확인 | Enter to confirm · Esc to cancel | 1 |\n\
+        \x20 | bypass-disclaimer | 면책 확인 | Enter to confirm · Esc to cancel | 1 = No, exit |\n\
+        \x20 | feature-announce-fullscreen | 신기능 안내 | Enter to confirm · Esc to cancel | 1 |\n\
+        \x20 실측 기본 포커스 행 전사: `❯ 2. Dark mode ✔`\n\
+        user@mac cys-terminal-rel %\n";
+
+    /// ★살아 있는 claude 세션의 **권한 프롬프트**(관문이 **아니다**).
+    ///
+    /// 첫기동 관문이 아니라 작업 중 수시로 뜨는 화면인데, 관문 3종(폴더신뢰·면책·신기능)의
+    /// **위젯 서명을 그대로** 갖고 있고 질문형 문면까지 있다.
+    ///
+    /// ★P4-9 의 이빨: `"Do you want to proceed?"` 를 needle 로 들이면 물음표가 **끝 구두점**이라
+    ///   질문형 심사를 통과한다. 질문형이라는 사실만으로는 "그 관문에서만 나온다" 가 보장되지
+    ///   않는다는 증거가 이 화면이고, [`super::gate_rule_violations`] 가 이 표를 전수 대조한다.
+    pub const LIVE_PERMISSION_PROMPT: &str = "● Bash(cargo test --lib)\n\
+        \x20 ⎿ Running…\n\
+        Do you want to proceed?\n\
+        ❯ 1. Yes\n\
+        \x20 2. Yes, and don't ask again for cargo commands\n\
+        \x20 3. No, tell Claude what to do differently\n\
+        Enter to confirm · Esc to cancel\n";
+
+    /// ★`/config` 화면 — **테마 관문의 위젯 서명이 전부** 실려 있지만 관문은 아니다.
+    /// 선택지 라벨은 설정·문서 화면 어디에나 실리므로 식별의 근거가 될 수 없다.
+    pub const CONFIG_THEME_SETTING: &str = "❯ /config\n\
+        \x20 Settings\n\
+        \x20 Theme          Dark mode\n\
+        \x20 Available      Auto (match terminal), Dark mode, Light mode\n\
+        \x20 Notifications  off\n\
+        ❯ \n";
+
+    /// ★`/status` 화면 — **로그인 관문의 위젯 서명이 전부** 실려 있지만 관문은 아니다.
+    pub const ACCOUNT_STATUS_PANEL: &str = "❯ /status\n\
+        \x20 Account        Claude account with subscription · Max\n\
+        \x20 Alternative    Anthropic Console account · API usage billing\n\
+        \x20 Model          Opus 5 (1M context)\n\
+        ❯ \n";
+
+    /// ★인가 URL 이 본문에 실린 문서 열람 — **OAuth 관문의 위젯 서명(URL)이 그대로** 있지만
+    /// 관문은 아니다.
+    pub const DOC_MENTIONING_OAUTH_URL: &str = "❯ cat docs/login.md\n\
+        \x20 로그인은 브라우저에서 https://claude.com/cai/oauth/authorize 로 진행한다.\n\
+        \x20 코드는 사람이 1회 붙여넣는다(기계 대행 불가).\n\
         user@mac cys-terminal-rel %\n";
 
     /// ★관문이 **아닌** 화면 전량(id, 화면). 코퍼스 자기규칙 검체가 이 표를 전수로 돈다.
+    ///
+    /// 이 표의 **계약**: 어떤 관문도 이 화면들을 식별하지 않고(`no_gate_matches_a_non_gate_screen`),
+    /// 어떤 needle 도 이 화면들에 **단독으로** 걸리지 않는다(`no_needle_alone_matches_a_non_gate_screen`).
+    /// 뒤 조항 때문에 **needle 문면을 본문에 담은 화면은 이 표에 들어올 수 없다** — 그런 화면은
+    /// [`BODY_TEXT_SCREENS`] 가 따로 받는다.
     pub const NON_GATE_SCREENS: &[(&str, &str)] = &[
         ("ready-shell", READY_SHELL),
         ("healthy-welcome-box", HEALTHY_WELCOME_BOX),
@@ -981,7 +1423,50 @@ pub mod fixtures {
         ("foreign-cli-browser-login", FOREIGN_CLI_BROWSER_LOGIN),
         ("grep-output", GREP_OUTPUT_MENTIONING_OAUTH_ERROR),
         ("audit-log-line", AUDIT_LOG_LINE),
+        ("live-permission-prompt", LIVE_PERMISSION_PROMPT),
+        ("config-theme-setting", CONFIG_THEME_SETTING),
+        ("account-status-panel", ACCOUNT_STATUS_PANEL),
+        ("doc-mentioning-oauth-url", DOC_MENTIONING_OAUTH_URL),
     ];
+
+    /// ★정본 소스 열람 — needle 이 **본문으로** 실린 화면(`cat src/first_run_gates.rs`).
+    pub const CAT_GATE_CORPUS_SOURCE: &str = "❯ cat src/first_run_gates.rs\n\
+        \x20 …\n\
+        \x20     Def {\n\
+        \x20         id: \"theme\",\n\
+        \x20         title: \"온보딩 · 테마 선택\",\n\
+        \x20         needles: &[\"Choose the text style that looks best with your terminal\"],\n\
+        \x20         widget: &[\"Auto (match terminal)\", \"Dark mode\"],\n\
+        \x20     },\n\
+        \x20 …\n\
+        user@mac cys-terminal-rel %\n";
+
+    /// ★관문 문면이 **needle 까지 본문으로** 실린 화면 — 코퍼스가 **원리상 닫을 수 없는** 쪽.
+    ///
+    /// ## 왜 [`NON_GATE_SCREENS`] 에 넣을 수 없는가 (P4-8 · 2026-08-24)
+    ///
+    /// 저 표의 계약은 "어떤 needle 도 이 화면에 걸리지 않는다" 이고, 관문 식별기는 화면 텍스트에
+    /// 대한 **부분문자열 검사**다. 그런데 이 코퍼스의 정본은 **이 소스 파일 자신**이므로, 소스를
+    /// 화면에 출력한 화면은 정의상 **모든 needle 을 글자 그대로 포함**한다(자기참조). 즉 그
+    /// 계약은 이 화면에 대해 **만족 불가능**이며, 통과시키려고 needle 을 바꾸면 다음 판의 소스가
+    /// 다시 그 새 needle 을 담는다. 이 불가능성은 주장이 아니라 검체
+    /// `body_text_screens_are_unclosable_at_the_corpus_layer` 가 소스 자신(`include_str!`)을 읽어
+    /// **기계로 증명**한다.
+    ///
+    /// ## 그래서 무엇이 이 화면을 막는가 — **생애 창**(코퍼스가 아니다)
+    ///
+    /// 주입 가드(`inject_guard::decide`)의 `awakened` 래치와 데몬 스캐너
+    /// (`governance::gate_scan_open`)의 창이 그것이다: 첫 각성 ack 이후에는 스캔 자체를 하지
+    /// 않는다. `readiness::judge` 의 관문 축에도 같은 방향의 창이 P4-7 에서 들어왔다.
+    ///
+    /// ## ★잔여 위험 (명시)
+    ///
+    /// **첫 각성 ack 이전**(부트 창 안)에 좌석이 이 화면을 그리면 관문으로 식별된다 →
+    /// `GatePending`(보류 · 좌석 보존 · 키 0 · 주입 0)으로 접히고, 사람이 화면을 넘기면 풀린다.
+    /// 부트 창 안에서 감사 문서·소스를 여는 좌석은 정상 시나리오가 아니므로 이 잔여 위험은
+    /// 받아들인다 — 그리고 그 귀결이 **보류이지 파괴가 아니라는 것**이 받아들이는 근거다.
+    pub const BODY_TEXT_SCREENS: &[(&str, &str)] =
+        &[("cat-gate-corpus-source", CAT_GATE_CORPUS_SOURCE)];
 }
 
 #[cfg(test)]
@@ -1019,7 +1504,35 @@ mod tests {
                     );
                 }
             }
+            // ★부재의 비용 선언이 **화면 실측과 어긋나지 않는가**(P4-10).
+            //
+            //   ⓐ 사람 전용 관문의 부재는 언제나 비가역이다 — 기계가 통과시킬 수 없는 화면에
+            //     키가 나가면 좌석은 살아 있는 채로 갇히고(OAuth 무한 재시도) 생존만 보는
+            //     판정이 그것을 영원히 '준비됨'으로 읽는다.
+            //   ⓑ 기계 통과 가능이어도 **기본 포커스가 통과 액션이 아니면**(아래키 ≥ 1) 부재는
+            //     비가역이다 — 주입의 Return 한 발이 기본 포커스를 확정해 버리고, 면책 창에서
+            //     그것은 곧 `No, exit`(rc 1)다.
+            //   선언이 이 둘보다 느슨하면(= Recoverable) 집행이 그 관문을 지우도록 허가한
+            //   것이므로 적색이다. 반대로 이 둘에 걸리지 않는 관문을 Fatal 로 **조여** 선언하는
+            //   것은 허용한다(folder-trust 가 그 사례 — 킬체인의 1발째 자리라는 사고 근거).
+            let return_commits_a_non_pass = g.down_presses().map(|d| d > 0).unwrap_or(true);
+            if g.passability == Passability::HumanOnly || return_commits_a_non_pass {
+                assert_eq!(
+                    g.absence_cost,
+                    AbsenceCost::Fatal,
+                    "{}: 부재의 비용이 Recoverable 로 선언됐지만 이 관문은 부재 시 주입의 \
+                     Return 이 비가역 결과(좌석 종료·허위 READY 영구화)를 낸다 — 선언이 실측과 \
+                     어긋나면 집행이 이 관문을 지워도 아무도 막지 않는다",
+                    g.id
+                );
+            }
         }
+        // 실측 6종 중 **부재가 비가역인 것**이 다수다 — 이 사실이 뒤집히면(전부 가역) 위
+        // 판정기가 고장난 것이므로 계측이 무효다(공허한 초록 방지).
+        assert!(
+            gs.iter().filter(|g| g.absence_is_fatal()).count() >= 5,
+            "킬체인 관문이 5건 미만 — 부재의 비용 판정기가 고장났거나 코퍼스 서사가 바뀌었다"
+        );
     }
 
     /// ★2026-07-29 킬체인의 형태를 **구조적으로** 금지한다.
@@ -1051,8 +1564,14 @@ mod tests {
         let gs = builtin();
         let mut used: Vec<(&str, &str)> = Vec::new();
         for g in &gs {
+            // ★규칙 ⓐ의 둘째 절반(P4-9): **질문형이어도** 대조군 통과는 여전히 요구된다.
+            //   질문형이라는 사실은 "그 관문에서만 나온다" 를 조금도 보장하지 않는다.
+            let v = gate_rule_violations(g);
+            assert!(v.is_empty(), "{}", v.join(" · "));
             for n in &g.needles {
-                if n.contains('?') {
+                // ★P4-9: 물음표가 **끝 구두점**일 때만 질문형이다. 종전 `n.contains('?')` 는
+                //   위치를 보지 않아 문장 중간의 `?` 하나로 면제 심사를 통째로 건너뛰었다.
+                if is_question_form(n) {
                     continue;
                 }
                 let hit = NEEDLE_EXEMPTIONS
@@ -1144,6 +1663,7 @@ mod tests {
             default_index: Some(1),
             action: None,
             human_reason: None,
+            absence_cost: AbsenceCost::Recoverable,
             measured_on: MEASURED_ON.to_string(),
             origin: Origin::Builtin,
         };
@@ -1200,6 +1720,500 @@ mod tests {
             ("grep", fixtures::GREP_OUTPUT_MENTIONING_OAUTH_ERROR),
         ] {
             assert!(identify(&gs, screen).is_none(), "{sid} 오탐 잔존");
+        }
+    }
+
+    /// ★P4-3 — **자기규칙이 프로덕션 경로에서 집행된다.**
+    ///
+    /// 리뷰어 격리 실행이 재현한 BLOCK-1 복원 경로를 그대로 먹인다: override 봉투 한 줄
+    /// (`"widget": []`)이 빌트인 관문의 AND 가드를 비우고, 배너 needle 하나로 관문이 성립해
+    /// 건강한 노드 전원이 `gate_pending` 으로 접힌다(영구 부트 라이브락).
+    ///
+    /// ★P4-10 정정: 집행 수단은 '버리기' 가 아니라 **수리**다. 판정 넷을 한 자리에서 본다 —
+    /// ⓐ그 관문이 **코퍼스에 남는다**(버려지지 않는다) ⓑ`notes` 에 **사유가 남는다**
+    /// ⓒ`identify` 가 **정상 화면을 잡지 않는다**(성질 ③ — BLOCK-1 재발 차단)
+    /// ⓓ출처 회계가 실제 코퍼스를 말한다.
+    #[test]
+    fn production_resolve_repairs_the_violating_gate_instead_of_dropping_it() {
+        // 리뷰어 격리 harness 가 쓴 봉투 그대로.
+        let env = json!({"gates": [
+            {"id": "theme", "needles": ["Welcome to Claude Code"], "widget": []}
+        ]});
+
+        // ★계측 타당성(in-band): 집행이 없었다면 이 봉투가 무엇을 만들었는지 먼저 못 박는다.
+        //   `resolve_raw` = 자기규칙 집행 **전**의 코퍼스다.
+        let raw = resolve_raw(Some(&env), true);
+        let raw_theme = raw.gates.iter().find(|g| g.id == "theme").expect("집행 전 theme");
+        assert!(raw_theme.widget.is_empty(), "봉투가 AND 가드를 비우지 못한다면 서사가 틀렸다");
+        assert!(
+            !gate_rule_violations(raw_theme).is_empty(),
+            "규칙이 이 선언의 위반을 알지 못한다 — 계측 무효"
+        );
+        assert_eq!(
+            identify(&raw.gates, fixtures::HEALTHY_WELCOME_BOX).map(|g| g.id.clone()),
+            Some("theme".to_string()),
+            "집행 전 코퍼스가 건강한 노드를 잡지 않는다면 BLOCK-1 복원 서사가 틀린 것"
+        );
+
+        // ── 집행 후 ──
+        let r = resolve_with(Some(&env), true);
+        // ⓐ ★위반 관문은 **버려지지 않는다** — 위반한 축만 정본으로 복원된다(P4-10).
+        //   버리면 그 관문의 귀결이 `보류 → 주입` 으로 뒤집히고, 그것이 재난 ④의 기전이다.
+        let theme = r
+            .gates
+            .iter()
+            .find(|g| g.id == "theme")
+            .expect("자기규칙 위반을 이유로 관문이 코퍼스에서 사라졌다(P4-10 결함 ②의 형태)");
+        assert_eq!(r.gates.len(), 6, "집행이 코퍼스의 관문 수를 바꿨다");
+        assert_eq!(
+            theme.widget,
+            builtin().iter().find(|b| b.id == "theme").unwrap().widget,
+            "위젯 AND 가드가 정본 서명으로 복원되지 않았다"
+        );
+        assert_eq!(
+            theme.needles,
+            builtin().iter().find(|b| b.id == "theme").unwrap().needles,
+            "정상 화면에 걸리는 배너 needle 이 정본 needle 로 복원되지 않았다"
+        );
+        // ⓑ 사유가 남는다(조용히 고치지 않는다).
+        assert!(
+            r.notes.iter().any(|n| n.contains("복원") && n.contains("theme")),
+            "복원 사유가 notes 에 없다: {:?}",
+            r.notes
+        );
+        // ⓒ 그래서 건강한 노드가 관문으로 잡히지 않는다 = 영구 부트 라이브락이 닫힌다.
+        assert_eq!(identify(&r.gates, fixtures::HEALTHY_WELCOME_BOX), None);
+        for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+            assert_eq!(identify(&r.gates, screen), None, "{sid} 오탐 잔존");
+        }
+        // ⓓ 출처 회계는 실제 코퍼스를 말한다 — 봉투가 theme 를 덮은 것은 사실이므로 그렇게 센다
+        //   (관문을 지우지 않았으니 '버렸는데 overridden 1' 같은 거짓말이 생길 자리도 없다).
+        assert_eq!(r.source, Source::Merged { overridden: 1, added: 0 });
+        // ⓔ ★그리고 실측 관문 화면에서의 귀결은 한 톨도 바뀌지 않았다(수리가 관문을 죽이지 않는다).
+        assert_eq!(
+            identify(&r.gates, fixtures::THEME).map(|g| g.id.clone()),
+            Some("theme".to_string()),
+            "수리 후 정작 진짜 테마 관문을 못 잡는다 — 관문을 잃지 않는 것이 수리의 목적이다"
+        );
+    }
+
+    /// 실측 관문 화면(등장 순서) — 아래 **방향 불역전** 검체가 이 표를 전수로 돈다.
+    /// 문면은 픽스처를 **참조**한다(사본 0).
+    const MEASURED_GATE_SCREENS: &[(&str, &str)] = &[
+        ("theme", fixtures::THEME),
+        ("login-method", fixtures::LOGIN_METHOD),
+        ("oauth-code", fixtures::OAUTH_CODE),
+        ("folder-trust", fixtures::FOLDER_TRUST),
+        ("bypass-disclaimer", fixtures::TRUST_ECHO_THEN_DISCLAIMER),
+        ("feature-announce-fullscreen", fixtures::FEATURE_FULLSCREEN),
+    ];
+
+    /// ★★P4-10 성질 ① **사용자 주권** — 디스크 선언이 임베드·코드 정본에 덮이지 않는다.
+    ///
+    /// 【수리 전에는 왜 적색인가】 첫 판의 집행은 위젯 AND 가드가 없는 이 선언을 **버렸고**,
+    /// 뒤이은 "집행 후 코퍼스가 비면 코드 정본으로 되돌린다" 폴백이 벤더 6종을 다시 세웠다.
+    /// 사용자가 하나를 선언했는데 결과가 여섯이면 그것은 override 가 아니라 **무시**다.
+    /// 같은 형태가 프로덕션 경로에도 핀으로 있다 —
+    /// `cys.rs::h_deliver_1_old_agents_json_receives_new_key_from_embed` ⑥(디스크 선언이 이긴다).
+    #[test]
+    fn user_replace_declaration_survives_the_self_rule_enforcement() {
+        // `cys.rs` 핀이 쓰는 봉투와 같은 모양 — 위젯 없이 needle 하나.
+        let env = json!({"source": "replace",
+                         "gates": [{"id": "mine", "needles": ["Proceed with the migration?"]}]});
+
+        // ★계측 타당성(in-band): 집행 전 코퍼스가 무엇인지 먼저 못 박는다.
+        let raw = resolve_raw(Some(&env), true);
+        assert_eq!(raw.gates.len(), 1, "봉투가 코퍼스를 교체하지 못한다면 서사가 틀렸다");
+        assert!(
+            !gate_rule_violations(&raw.gates[0]).is_empty(),
+            "이 선언이 자기규칙 위반이 아니라면 이 검체는 아무것도 재지 못한다(계측 무효)"
+        );
+
+        // ── 집행 후: 그대로 살아 있다.
+        let r = resolve_with(Some(&env), true);
+        assert_eq!(
+            r.gates.len(),
+            1,
+            "디스크 선언이 코드 정본에 덮였다(사용자 주권 침해) — notes: {:?}",
+            r.notes
+        );
+        assert_eq!(r.gates[0].id, "mine");
+        assert_eq!(r.gates[0].needles, vec!["Proceed with the migration?".to_string()]);
+        assert!(matches!(r.source, Source::Replaced { count: 1 }));
+        // 유지의 사유는 남는다(조용한 통과가 아니다).
+        assert!(
+            r.notes.iter().any(|n| n.contains("mine")),
+            "유지 사유가 notes 에 없다: {:?}",
+            r.notes
+        );
+    }
+
+    /// ★★P4-10 성질 ② **실패 방향 불역전** — 이번 수리의 핵심 핀(재난 ④).
+    ///
+    /// 봉투가 `bypass-disclaimer` 의 위젯을 비우면 AND 가드가 0이 되어 needle 하나로 관문이
+    /// 성립한다 = **보류**(안전측 오탐). 첫 판의 집행은 그 관문을 버렸고, 관문이 없으면 그
+    /// 화면은 '준비됨'으로 읽혀 **주입**이 열린다. 그 창의 기본 포커스는 `No, exit` 이고
+    /// Return 은 rc 1 이므로 **주입의 Return 이 곧 킬 스텝**이다 — 집행이 안전한 오탐을
+    /// 좌석 사망으로 바꾼 것이다.
+    ///
+    /// 계약: 집행은 어떤 관문의 귀결도 `보류 → 주입` 으로 바꾸지 않는다.
+    #[test]
+    fn enforcement_never_reverses_a_gate_from_hold_to_inject() {
+        let env = json!({"gates": [{"id": "bypass-disclaimer", "widget": []}]});
+
+        // ── 계측 타당성(in-band): 집행 전 귀결이 **보류**임을 먼저 못 박는다.
+        let raw = resolve_raw(Some(&env), true);
+        let raw_disc = raw
+            .gates
+            .iter()
+            .find(|g| g.id == "bypass-disclaimer")
+            .expect("집행 전 면책 관문");
+        assert!(raw_disc.widget.is_empty(), "봉투가 AND 가드를 비우지 못한다면 서사가 틀렸다");
+        assert!(
+            !gate_rule_violations(raw_disc).is_empty(),
+            "규칙이 이 선언의 위반을 알지 못한다 — 계측 무효"
+        );
+        assert_eq!(
+            identify(&raw.gates, fixtures::TRUST_ECHO_THEN_DISCLAIMER).map(|g| g.id.clone()),
+            Some("bypass-disclaimer".to_string()),
+            "집행 전 귀결이 보류가 아니라면 '역전' 서사가 성립하지 않는다"
+        );
+
+        // ── 집행 후: 귀결은 **여전히 보류**다.
+        let r = resolve_with(Some(&env), true);
+        let g = identify(&r.gates, fixtures::TRUST_ECHO_THEN_DISCLAIMER).unwrap_or_else(|| {
+            panic!(
+                "★집행이 면책 관문을 지워 귀결이 보류 → 주입 으로 뒤집혔다 — 그 화면의 기본 \
+                 포커스는 `No, exit` 이고 주입의 Return 이 곧 rc 1 이다(재난 ④). notes: {:?}",
+                r.notes
+            )
+        });
+        assert_eq!(g.id, "bypass-disclaimer");
+        assert_eq!(g.default_index, Some(1), "면책 기본 포커스(No, exit) 소실");
+        assert_eq!(g.down_presses(), Some(1), "면책 통과 시퀀스 소실");
+        assert_eq!(g.absence_cost, AbsenceCost::Fatal, "면책 관문의 부재 비용 선언 소실");
+        // 수리는 정본 위젯 서명으로 AND 구멍도 함께 닫는다(성질 ③과 동시 만족).
+        assert_eq!(
+            g.widget,
+            builtin()
+                .iter()
+                .find(|b| b.id == "bypass-disclaimer")
+                .unwrap()
+                .widget
+        );
+
+        // ── ★전수 대조: 봉투가 **어느 관문의** 위젯을 비우든, 실측 관문 6화면에서
+        //    '집행 전에 잡히던 것이 집행 후에 안 잡히는' 일은 한 건도 없다.
+        for &(gid, _) in MEASURED_GATE_SCREENS {
+            let env = json!({"gates": [{"id": gid, "widget": []}]});
+            let raw = resolve_raw(Some(&env), true);
+            let done = resolve_with(Some(&env), true);
+            for &(sid, screen) in MEASURED_GATE_SCREENS {
+                if identify(&raw.gates, screen).is_some() {
+                    assert!(
+                        identify(&done.gates, screen).is_some(),
+                        "봉투가 {gid} 를 위반시켰을 때 화면 {sid} 의 귀결이 보류 → 주입 으로 \
+                         뒤집혔다(실패 방향 역전 — 재난 ④)"
+                    );
+                }
+            }
+            // 그리고 그 집행이 정상 화면을 새로 잡지도 않는다(성질 ③ 동시 유지).
+            for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+                assert_eq!(identify(&done.gates, screen), None, "{gid}/{sid} 오탐 잔존");
+            }
+        }
+    }
+
+    /// ★★P4-10 성질 ③ **BLOCK-1 재발 차단** — 봉투로 빌트인 관문의 AND 가드를 비워
+    /// **건강한 화면을 관문으로 잡는** 경로는 수리 뒤에도 막혀 있다.
+    ///
+    /// 성질 ①②를 만족시키느라 이 축이 열리면 수리가 아니라 맞바꾸기다. 그래서 같은 봉투
+    /// 공격을 여기서 한 번 더 세운다(needle 을 배너로 바꾸고 widget 을 비운다).
+    #[test]
+    fn enforcement_still_closes_the_block1_envelope_attack() {
+        let env = json!({"gates": [
+            {"id": "theme", "needles": ["Welcome to Claude Code"], "widget": []}
+        ]});
+
+        // 계측 타당성: 집행이 없으면 이 봉투는 건강한 화면을 잡는다.
+        let raw = resolve_raw(Some(&env), true);
+        assert_eq!(
+            identify(&raw.gates, fixtures::HEALTHY_WELCOME_BOX).map(|g| g.id.clone()),
+            Some("theme".to_string()),
+            "집행 전 봉투가 건강한 화면을 잡지 않는다면 BLOCK-1 서사가 틀린 것"
+        );
+
+        let r = resolve_with(Some(&env), true);
+        assert_eq!(
+            identify(&r.gates, fixtures::HEALTHY_WELCOME_BOX),
+            None,
+            "건강한 화면이 관문으로 잡힌다 — 화면에 통과시킬 관문이 없으므로 사람도 못 푼다\
+             (영구 부트 라이브락). notes: {:?}",
+            r.notes
+        );
+        // 그러면서 관문 자체는 살아 있다(성질 ②와 동시 만족 — 맞바꾸기가 아니다).
+        assert_eq!(
+            identify(&r.gates, fixtures::THEME).map(|g| g.id.clone()),
+            Some("theme".to_string())
+        );
+        for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+            assert_eq!(identify(&r.gates, screen), None, "{sid} 오탐 잔존");
+        }
+    }
+
+    /// ★부재의 비용 게이트 — 집행기가 킬체인 관문을 지우면 **되살린다**.
+    ///
+    /// [`repair_gate`] 는 관문을 지우지 않으므로 이 게이트는 평시에 무동작이다. 그래서
+    /// 게이트가 실제로 무는지를 확인하려면 "지워진 상태"를 **지어 넣어** 직접 먹여야 한다
+    /// (그렇지 않으면 이 검체는 아무것도 재지 못하는 공허한 초록이다).
+    #[test]
+    fn absence_cost_gate_restores_a_killed_kill_chain_gate() {
+        let pre = builtin();
+        let mut notes = Vec::new();
+
+        // ⓐ 킬체인 관문(면책)이 사라진 코퍼스를 먹인다 → 되살아난다.
+        let mut kept: Vec<Gate> = pre.iter().filter(|g| g.id != "bypass-disclaimer").cloned().collect();
+        enforce_absence_cost(&pre, &mut kept, &mut notes);
+        let g = kept
+            .iter()
+            .find(|g| g.id == "bypass-disclaimer")
+            .expect("부재의 비용이 비가역인 관문이 되살아나지 않았다");
+        assert_eq!(g.default_index, Some(1), "되살린 관문이 실측 기본 포커스를 잃었다");
+        assert!(notes.iter().any(|n| n.contains("되살린다")), "되살린 사유가 조용하다");
+
+        // ⓑ 부재가 가역인 관문(테마)은 되살리지 않는다 — 게이트가 "전부 되살리기"로 퇴화하면
+        //    규칙 위반 선언까지 무조건 복구되어 BLOCK-1 이 되돌아온다.
+        let mut notes2 = Vec::new();
+        let mut kept2: Vec<Gate> = pre.iter().filter(|g| g.id != "theme").cloned().collect();
+        enforce_absence_cost(&pre, &mut kept2, &mut notes2);
+        assert!(
+            kept2.iter().all(|g| g.id != "theme"),
+            "부재가 가역인 관문까지 되살렸다 — 게이트가 비용 선언을 읽지 않는다"
+        );
+        assert!(notes2.iter().any(|n| n.contains("가역")), "제거 사실이 조용하다");
+
+        // ⓒ 봉투는 부재의 비용을 **조일 수만** 있다(완화 거부).
+        let loosen = json!({"gates": [{"id": "bypass-disclaimer", "absence_cost": "recoverable"}]});
+        let r = resolve_with(Some(&loosen), true);
+        let disc = r.gates.iter().find(|g| g.id == "bypass-disclaimer").unwrap();
+        assert_eq!(disc.absence_cost, AbsenceCost::Fatal, "봉투 한 줄로 킬체인 보호가 꺼졌다");
+        assert!(r.notes.iter().any(|n| n.contains("거부")), "완화 거부가 조용하다");
+        let tighten = json!({"gates": [{"id": "theme", "absence_cost": "fatal"}]});
+        let r = resolve_with(Some(&tighten), true);
+        let th = r.gates.iter().find(|g| g.id == "theme").unwrap();
+        assert_eq!(th.absence_cost, AbsenceCost::Fatal, "조이는 방향이 막혔다");
+    }
+
+    /// ★P4-9 합성 표본 — **탐지 능력 자체**를 시험한다.
+    ///
+    /// 트리에 위반이 0이면 탐지기가 고장나도 규칙 검체는 초록이다. 그래서 규칙이 잡아야 하는
+    /// 선언을 **지어 넣어** 적색을 확인한다.
+    #[test]
+    fn question_form_rule_needs_terminal_punctuation_and_the_control_still_bites() {
+        // ⓐ 질문형 판정: 물음표가 **끝** 구두점일 때만 참이다.
+        assert!(is_question_form("Try the new fullscreen renderer?"));
+        assert!(is_question_form("Do you want to proceed?  "));
+        for loose in [
+            "Browser didn't open? Use the url below to sign in",
+            "Opening browser to sign in? no",
+            "Do you want to proceed? Press y",
+            "?",
+            "   ?  ",
+            "no question mark at all",
+        ] {
+            assert!(
+                !is_question_form(loose),
+                "질문형 판정이 다시 느슨해졌다({loose:?}) — 문장 중간 `?` 하나로 면제 심사가 \
+                 통째로 건너뛰어진다(P4-9)"
+            );
+            // 종전 규칙(`contains('?')`)과의 차분 — 이 표본들이 실제로 규칙을 갈랐음을 못 박는다.
+            if loose.contains('?') {
+                assert!(
+                    !is_question_form(loose),
+                    "종전 규칙에서는 통과했을 표본이 새 규칙에서도 통과한다 — 계측 무효"
+                );
+            }
+        }
+
+        // ⓑ 질문형이어도 대조군 통과는 **여전히** 요구된다. 리뷰어가 든 그 문면을 그대로 쓴다:
+        //    `"Do you want to proceed?"` = 살아 있는 claude 세션의 권한 프롬프트.
+        let planted = Gate {
+            id: "planted-permission".to_string(),
+            title: "(합성 표본)".to_string(),
+            needles: vec!["Do you want to proceed?".to_string()],
+            widget: vec!["Enter to confirm".to_string()],
+            confirm_echo: vec![],
+            passability: Passability::Machine,
+            default_index: Some(1),
+            action: None,
+            human_reason: None,
+            absence_cost: AbsenceCost::Recoverable,
+            measured_on: MEASURED_ON.to_string(),
+            origin: Origin::Added,
+        };
+        assert!(
+            is_question_form(&planted.needles[0]),
+            "이 표본이 질문형이 아니면 ⓑ의 서사(질문형만으로는 부족하다)가 성립하지 않는다"
+        );
+        assert!(
+            widget_rule_violations(&planted).is_empty(),
+            "이 표본이 위젯 규칙에 걸리면 ⓑ가 시험하는 축이 바뀐다"
+        );
+        let v = gate_rule_violations(&planted);
+        assert!(
+            v.iter().any(|m| m.contains("live-permission-prompt")),
+            "질문형 needle 이 대조군(살아 있는 권한 프롬프트)에 걸리는데도 규칙이 침묵한다 — \
+             P4-9 의 이빨이 없다: {v:?}"
+        );
+
+        // ⓒ 그리고 그 표본의 **오탐 경로가 프로덕션 해소에서 실제로 닫힌다**(규칙 → 집행 연결).
+        //   ★P4-10 정정: 닫는 수단은 '관문 버리기' 가 아니라 **걸리는 needle 만 제거**다.
+        //   버리면 사용자 선언이 조용히 사라지고(성질 ①) 그 관문의 귀결이 주입으로 뒤집힌다(성질 ②).
+        //   제거되는 것은 **정상 화면에 걸리는 문면**뿐이라 위험 방향으로 열리지 않는다.
+        let env = json!({"gates": [
+            {"id": "planted-permission", "needles": ["Do you want to proceed?"],
+             "widget": ["Enter to confirm"]}
+        ]});
+        let r = resolve_with(Some(&env), true);
+        assert!(
+            r.gates.iter().any(|g| g.id == "planted-permission"),
+            "사용자 선언이 통째로 사라졌다 — 규칙 집행이 사용자 주권을 침해한다(P4-10 ①)"
+        );
+        assert_eq!(
+            identify(&r.gates, fixtures::LIVE_PERMISSION_PROMPT),
+            None,
+            "규칙은 아는데 집행이 안 된다 — 살아 있는 권한 프롬프트가 관문으로 잡힌다(P4-3 재발)"
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("planted-permission")),
+            "무엇을 왜 고쳤는지가 조용하다: {:?}",
+            r.notes
+        );
+    }
+
+    /// ★리뷰어 권고 채택(2026-08-24) — **새 관문을 들이면 대조군도 들여야 한다.**
+    ///
+    /// 종전 마찰은 헬스 러너의 `need(len(blocks) == 6)` 하나뿐이라, 손으로 `6 → 7` 만 고치면
+    /// **대조군 0으로 통과**했다(리뷰어 표현: "지금 이빨은 자라지 않는다").
+    ///
+    /// 이 표의 계약은 단순한 존재 요구가 아니다 — 커버리지 화면은 그 관문의 **위젯 서명을
+    /// 전부 만족**해야 한다. 그래야 "그 화면에서 관문이 안 잡히는 이유가 오직 needle 축" 이라는
+    /// 사실이 실행으로 증명되고, 아무 화면이나 갖다 붙이는 형식적 통과가 막힌다.
+    #[test]
+    fn every_gate_has_a_control_screen_that_satisfies_its_widget_signature() {
+        let gs = builtin();
+        let hit = |s: &String, screen: &str| {
+            normalize(screen).contains(&normalize(s)) || flatten(screen).contains(&flatten(s))
+        };
+        for g in &gs {
+            let rows: Vec<&(&str, &str)> = GATE_CONTROL_COVERAGE
+                .iter()
+                .filter(|(gid, _)| *gid == g.id)
+                .collect();
+            assert!(
+                !rows.is_empty(),
+                "{}: 대조군 커버리지가 0건이다 — 새 관문을 들일 때 대조군을 함께 들이라는 규율이 \
+                 무력화됐다(관문 id 마다 최소 1개)",
+                g.id
+            );
+            for (_, sid) in rows {
+                let screen = fixtures::NON_GATE_SCREENS
+                    .iter()
+                    .find(|(id, _)| id == sid)
+                    .map(|(_, s)| *s)
+                    .unwrap_or_else(|| {
+                        panic!("커버리지 표가 존재하지 않는 대조군 {sid} 를 가리킨다")
+                    });
+                for w in &g.widget {
+                    assert!(
+                        hit(w, screen),
+                        "{}: 대조군 {sid} 가 위젯 {w:?} 을 담지 않는다 — 위젯 AND 가 애초에 \
+                         불만족이라 needle 축이 시험되지 않는 형식적 커버리지다",
+                        g.id
+                    );
+                }
+                assert!(
+                    !g.matches(screen),
+                    "{}: 대조군 {sid} 를 관문으로 식별했다 — 위젯 서명이 전부 만족된 화면에서 \
+                     needle 축이 일하지 않는다",
+                    g.id
+                );
+            }
+        }
+        // 표가 정본에 없는 관문 id 를 가리키면 적색(쓰레기통 금지 — 면제표와 같은 규율).
+        for (gid, sid) in GATE_CONTROL_COVERAGE {
+            assert!(
+                gs.iter().any(|g| g.id == *gid),
+                "커버리지 표 항목 ({gid}, {sid}) 이 정본에 없는 관문을 가리킨다"
+            );
+        }
+    }
+
+    /// ★P4-8 — **needle 이 본문으로 실린 화면은 코퍼스 계층에서 닫을 수 없다**(원리 증명).
+    ///
+    /// 이 검체는 통과를 위해 대조군을 순화하지 않는다. 대신 ⓐ왜 원리상 불가능한지를 소스
+    /// 자신으로 증명하고, ⓑ그래서 실제로 잡힌다는 **잔여 위험을 기계로 박제**하며,
+    /// ⓒ그것을 닫는 것이 코퍼스가 아니라 **생애 창**이라는 사실을 실행으로 보인다.
+    #[test]
+    fn body_text_screens_are_unclosable_at_the_corpus_layer() {
+        let gs = builtin();
+
+        // ⓐ 자기참조 증명 — 정본 소스는 **모든 needle 과 위젯을 글자 그대로** 담고 있다.
+        //    따라서 그 소스를 출력한 화면은 정의상 전량을 포함하고, `NON_GATE_SCREENS` 의
+        //    계약("어떤 needle 도 걸리지 않는다")은 그 화면에 대해 **만족 불가능**이다.
+        //    needle 을 바꿔도 다음 판의 소스가 그 새 needle 을 다시 담는다.
+        let sot = include_str!("first_run_gates.rs");
+        for g in &gs {
+            for t in g.needles.iter().chain(g.widget.iter()) {
+                assert!(
+                    sot.contains(t.as_str()),
+                    "{}: 정본 소스가 선언 문면 {t:?} 을 담지 않는다 — 자기참조 논거가 무효다",
+                    g.id
+                );
+            }
+        }
+
+        // ⓑ 그래서 실제로 잡힌다 — 잔여 위험을 주석이 아니라 검체로 남긴다.
+        for &(sid, screen) in fixtures::BODY_TEXT_SCREENS {
+            assert!(
+                identify(&gs, screen).is_some(),
+                "{sid}: 이 화면이 안 잡힌다면 잔여 위험 서사가 틀린 것이다 — doc 을 고쳐라"
+            );
+        }
+        assert_eq!(
+            identify(&gs, fixtures::CAT_GATE_CORPUS_SOURCE).map(|g| g.id.clone()),
+            Some("theme".to_string()),
+            "정본 소스 열람 화면이 theme 로 잡히지 않는다 — 리뷰어 실측과 어긋난다"
+        );
+
+        // ⓒ 이것을 닫는 것은 **생애 창**이다(U-14 주입 가드의 각성 래치).
+        for &(sid, screen) in fixtures::BODY_TEXT_SCREENS {
+            let o = |awakened| crate::inject_guard::Observed {
+                screen,
+                gates: &gs,
+                awakened,
+                guard_off: false,
+            };
+            // 부트 창 안(첫 각성 ack 이전)에서는 막는다 — 그 자리에서는 그것이 옳다.
+            assert!(
+                crate::inject_guard::decide(&o(Some(false))).blocks(),
+                "{sid}: 부트 창에서 관문 축이 침묵했다"
+            );
+            // 각성 이후·미관측에서는 창이 닫혀 통과한다 — 작업 중 노드가 자기 화면 때문에
+            // 영구 차단되지 않는다.
+            for awakened in [Some(true), None] {
+                assert!(
+                    !crate::inject_guard::decide(&o(awakened)).blocks(),
+                    "{sid}: 각성 이후에도 주입이 막힌다 — 감사 문서·소스 열람이 그 노드를 영구 \
+                     차단한다(U-14 치명위험 ①)"
+                );
+            }
+        }
+
+        // ★대조 — `NON_GATE_SCREENS` 쪽(needle 부재)은 코퍼스 계층에서 **닫힌다**.
+        //   즉 '닫을 수 있는 것은 닫았고, 닫을 수 없는 것만 창에 맡겼다'.
+        for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+            assert_eq!(identify(&gs, screen), None, "{sid}");
         }
     }
 
@@ -1386,12 +2400,35 @@ mod tests {
 
     #[test]
     fn replace_mode_takes_the_declared_corpus_but_never_an_empty_one() {
+        // ★(P4-3) 선언에 위젯 AND 가드가 있어야 자기규칙 집행을 통과한다 — 아래 두 번째
+        //   블록이 "가드가 없으면 버려진다"를 같은 자리에서 대조한다.
         let env = json!({"source": "replace", "gates": [
-            {"id": "only", "needles": ["Do you want to continue?"]}
+            {"id": "only", "needles": ["Do you want to continue?"],
+             "widget": ["Enter to confirm"]}
         ]});
         let r = resolve_with(Some(&env), true);
         assert!(matches!(r.source, Source::Replaced { count: 1 }));
         assert_eq!(r.gates.len(), 1);
+
+        // ★P4-10 정정 — 자기규칙 위반 선언(위젯 AND 가드 0)이라도 **사용자 선언은 살아남는다**.
+        //   종전 판은 이것을 버리고 "비면 정본으로 되돌린다" 폴백으로 벤더 6종을 세웠다. 그것이
+        //   사용자 주권 침해였다(같은 형태의 프로덕션 핀: `cys.rs h_deliver_1…` 의 ⑥).
+        //   복원할 정본 서명이 없는 신설 관문이므로 선언을 그대로 유지하고 사유만 남긴다.
+        let nowidget = json!({"source": "replace", "gates": [
+            {"id": "only", "needles": ["Do you want to continue?"]}
+        ]});
+        let r = resolve_with(Some(&nowidget), true);
+        assert_eq!(r.gates.len(), 1, "사용자 선언이 코드 정본에 덮였다(사용자 주권 침해)");
+        assert_eq!(r.gates[0].id, "only");
+        assert!(
+            r.notes.iter().any(|n| n.contains("유지") && n.contains("only")),
+            "유지 사유가 조용하다: {:?}",
+            r.notes
+        );
+        // 그리고 그 선언이 정상 화면을 잡지는 않는다(유지가 오탐 면허가 아니다).
+        for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+            assert_eq!(identify(&r.gates, screen), None, "{sid} 오탐");
+        }
 
         // ★빈 코퍼스는 '관문 없음'이 아니라 '눈을 감음' — 코드 정본으로 되돌린다.
         let blind = json!({"source": "replace", "gates": []});

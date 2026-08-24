@@ -27,6 +27,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut agent_strict_proof: HashMap<u64, Option<(String, u32)>> = HashMap::new();
         let mut feed_reminded: HashMap<String, f64> = HashMap::new();
         let mut approval_debounce: HashMap<(u64, String), f64> = HashMap::new();
+        // ★(U-16) 스캔 캐시 — 정규식 선컴파일 · 관문 코퍼스 · 관문 디바운스 · 격상 천장.
+        // watchdog 태스크 로컬 = 단일 writer(형제 맵들과 같은 규약). 무효화 규칙은 ScanCaches doc.
+        let mut scan_caches = ScanCaches::default();
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         // ★G1(W2-D): 기아 경보(queue.starved) 전용 쿨다운 — depth_high 맵과 별도 축.
         let mut queue_starve_alerted: HashMap<u64, f64> = HashMap::new();
@@ -80,7 +83,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
-                    check_approvals(&daemon, &mut approval_debounce);
+                    check_approvals(&daemon, &mut approval_debounce, &mut scan_caches);
                     check_launch_flags(
                         &daemon,
                         &sys,
@@ -108,6 +111,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 );
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 queue_starve_alerted.retain(|sid, _| live_surface_ids.contains(sid));
+                // ★(U-16) 관문 스캔의 좌석 키 맵도 같은 규약으로 솎는다.
+                scan_caches.prune_surfaces(&live_surface_ids);
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
                 zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
                 agent_strict_proof.retain(|sid, _| live_surface_ids.contains(sid));
@@ -133,6 +138,24 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// 【P4-5】 env → **u32 클램프**. `as u32` 는 좁힘이 아니라 **wrap** 이라, 사람이 적어 넣은
+/// 값의 의미와 정반대의 귀결을 낸다:
+///   · `4294967296 → 0`   축이 조용히 **전면 비활성**(킬스위치를 누르지 않았는데 눌린다)
+///   · `4294967297 → 1`   연속 **1틱**만으로 임계 성립 — 이 저장소에서 그 방향은 **오사망**이다.
+///     (`CYS_AGENT_STRICT_PROOF_TICKS` 는 "스치는 도우미 프로세스로 증명이 서지 않게" 하려고
+///      존재하는데, 절단이 정확히 그 도우미에게 증명을 세워 준다.)
+/// 그래서 `cys.rs rpc_idle_timeout_with` 의 `v.min(MAX)` 와 **같은 규율**로 상한에 붙인다 —
+/// 거대값은 언제나 '더 보수적인' 쪽으로만 접힌다. 규율이 커밋 안에서 갈리지 않게 한다.
+fn env_u32(key: &str, default: u32) -> u32 {
+    clamp_env_u32(env_u64(key, u64::from(default)))
+}
+
+/// [`env_u32`] 의 **순수 코어**(진리표 대상) — env 를 만지지 않는다. 프로세스 전역 env 를
+/// 흔드는 검체는 병렬 테스트에서 서로를 오염시켜 **계측기 자체가 불안정**해진다.
+fn clamp_env_u32(raw: u64) -> u32 {
+    u32::try_from(raw).unwrap_or(u32::MAX)
 }
 
 /// T5-2 무음 크래시 윈도우(초): "성공 ack 직후 N초 내 후행 실패 헬스룰" = 크래시.
@@ -417,7 +440,7 @@ fn check_agent_death(
 ) {
     // ★P3-6 좁힘 무장 임계(연속 틱). 0 = 좁힘 비활성(종전 거동). 기본 2 — watchdog 5초 주기라
     // 10초 연속 엄격 관측이면 증명이 선다(스치는 도우미 프로세스는 통과하지 못한다).
-    let strict_arm_ticks = env_u64("CYS_AGENT_STRICT_PROOF_TICKS", 2) as u32;
+    let strict_arm_ticks = env_u32("CYS_AGENT_STRICT_PROOF_TICKS", 2);
     let auto_restart = std::env::var("CYS_AGENT_AUTORESTART")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -690,7 +713,7 @@ fn check_learn_stuck(
     restart_counts: &HashMap<u64, u32>,
     debounce: &mut HashMap<u64, f64>,
 ) {
-    let threshold = env_u64("CYS_RSI_STUCK_RESTARTS", 3) as u32;
+    let threshold = env_u32("CYS_RSI_STUCK_RESTARTS", 3);
     let cooldown = env_u64("CYS_RSI_STUCK_DEBOUNCE_SECS", 3600) as f64;
     let now = now_epoch();
     let cands = learn_stuck_candidates(restart_counts, debounce, threshold, cooldown, now);
@@ -856,7 +879,7 @@ impl DeadmanTracker {
 /// ★침묵(idle) 단독으로 death 를 발화하는 경로는 존재하지 않는다 — 절대 불변(결함 8).
 fn check_role_deadman(daemon: &Arc<Daemon>, tracker: &mut DeadmanTracker) {
     let idle_threshold = env_u64("CYS_MASTER_DEADMAN_SECS", 900);
-    let confirm_ticks = env_u64("CYS_ROLE_DEADMAN_CONFIRM_TICKS", 3).max(1) as u32;
+    let confirm_ticks = env_u32("CYS_ROLE_DEADMAN_CONFIRM_TICKS", 3).max(1);
     let grace_secs = env_u64("CYS_ROLE_DEADMAN_GRACE_SECS", 60);
     let debounce_secs = env_u64("CYS_ROLE_DEADMAN_DEBOUNCE_SECS", 300);
     // idle 전용 디바운스(리뷰 MINOR): 기본은 death 노브 체이닝(현행 동작 불변) — 설정 시 분리.
@@ -1285,9 +1308,20 @@ fn check_todo_with(
 /// 지침이 최우선 방지 대상으로 명시한 '큐 적체'의 정확한 기전).
 ///
 /// 해소 = **합집합**: 디스크(사용자) 패턴 + 임베드(vendor) 패턴을 name 기준 dedup 병합하고,
-/// 충돌 시 **디스크가 이긴다**(사용자 주권 불변). approval_patterns 는 *감지 전용*(자동 응답
-/// 절대 없음 — 판단은 master)이라 추가 패턴은 부작용이 없고 미감지만 위험하다 = 합집합이 안전측.
-/// 순수 함수로 분리해 테스트 가능하게 둔다.
+/// 충돌 시 **디스크가 이긴다**(사용자 주권 불변).
+///
+/// ★(U-16 doc 정정 · 2026-08-24) 종전 이 자리에는 "approval_patterns 는 *감지 전용*(자동 응답
+/// 절대 없음)" 이라고 적혀 있었다. **데몬 안에서는 참이지만 키 전체로는 거짓**이다 — 같은 키를
+/// CLI 도 읽고, 거기에는 폴더신뢰 자동확인(`trust-prompt` 1건)이 붙어 있다(U-15). 그 문장을
+/// 그대로 읽은 다음 감사자가 "감지 전용이니 관문 문면도 여기 넣으면 되겠다" 로 오독하면
+/// **면책 창에 Return 이 가는 킬체인**이 그대로 돌아온다(2026-07-29 실사고). 정정 후 계약:
+///   · 이 키의 소비자는 **둘**이다 — 데몬 격상 스캔(응답 0) · CLI 폴더신뢰 자동확인(응답 1건).
+///   · 그래서 이 키에는 **자동응답이 붙어도 안전한 문면만** 넣는다.
+///   · **첫기동 관문 문면은 이 키에 합치지 않는다.** 별도 키(`first_run_gates`)·별도 스캐너·
+///     별도 feed kind 로 간다(U-16 절 참조). 그 분리를 `approval_patterns_union_*` 검체가
+///     기계로 집행한다.
+/// 합집합이 안전측인 이유는 그대로다: 추가 패턴의 대가는 과잉 감지(사람이 한 번 더 본다)이고
+/// 미감지의 대가는 워커 hang 이다. 순수 함수로 분리해 테스트 가능하게 둔다.
 fn merged_approval_patterns(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
@@ -1314,9 +1348,340 @@ fn merged_approval_patterns(
     out
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ★(U-16) 데몬 첫기동 관문 스캔 — approval 스캔과 **분리된** 두 번째 스캐너
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## 왜 `approval_patterns` 에 합치지 않는가
+//
+// 한 키에 넣으면 성질이 반대인 두 사실이 한 네임스페이스에서 섞인다:
+//   · **approval** = "사람이 예/아니오를 눌러야 할 프롬프트". 이 축에는 **자동응답 계약이
+//     붙어 있다**(CLI 의 폴더신뢰 자동확인 1건이 그 계약의 유일 소비자다).
+//   · **관문**     = "온보딩이 아직 끝나지 않았다". 이 축은 **자동응답이 금지**된 사실이다 —
+//     면책 창의 기본 포커스가 `No, exit` 이라 Return 한 발이 좌석을 rc 1 로 죽인 2026-07-29
+//     실사고가 그 금지의 근거다.
+// 둘이 한 키가 되는 순간 approval 소비자가 관문 문면을 **자기 계약(자동응답)** 으로 읽을 수
+// 있게 되고, 그 오독의 귀결이 정확히 이 저장소가 가장 비싸게 치른 사고다. 그래서 **키도,
+// 스캐너도, feed kind 도, 디바운스 축도** 나눈다(합치는 것은 diff 한 줄이지만 되돌리는 데는
+// 좌석 하나가 든다).
+//
+// ## 문면의 진실원천은 `cys::first_run_gates` 하나다
+//
+// 코퍼스·매칭 규칙(needle OR ∧ 위젯 서명 AND)·자기규칙(보편 토큰 단독 위젯 금지 등)은 전부
+// 그 모듈이 소유한다. 여기서는 **소비만** 한다 — 사본을 만들면 문면이 갈리고(S-1 샷건
+// 서저리), 자기규칙을 우회하면 BLOCK-1/BLOCK-2 오탐이 데몬 층에서 그대로 되살아난다.
+//
+// ## 생애 창 상한 — 치명위험 ①(이벤트·큐 폭주) 차단
+//
+// 스캔은 **첫 각성 ack(`awakened_at` 래치) 이전 · 좌석 나이 상한 이내**에만 열린다. 그렇게
+// 하지 않으면 작업 중인 노드가 화면에 관문 문면을 출력하는 순간(이 캠페인의 감사 문서나
+// `src/first_run_gates.rs` 를 `cat` 하는 순간이 그렇다) master 각성 push 가 반복된다.
+// U-14 의 주입 가드가 **같은 축을 같은 래치로** 닫는다(`inject_guard::decide` 의 `awakened`)
+// — 두 층이 다른 기준으로 창을 재면 한쪽만 열려 오탐이 새어 나온다.
+// 창이 닫힌 귀결은 언제나 '아무 것도 발행하지 않음' = **정확히 종전 동작**이다.
+//
+// ## 자동 응답 절대 금지 — 주석이 아니라 **타입**으로
+//
+// 이 스캐너는 `first_run_gates::action_policy` 를 **호출하지 않는다**. 산출 타입
+// [`GateSighting`] 에는 `select_index`·`literal`·`down` 같은 **키 재료가 하나도 없다** —
+// 없는 값은 보낼 수 없다. 통과 액션의 집행은 자기 게이트를 가진 부트 경로(U-14/U-19) 소관이다.
+//
+// ## 자기발화 차단 — 격상 문안에 **화면 인용을 싣지 않는다**
+//
+// approval 격상은 매칭 줄 `excerpt` 를 문안에 싣는다. 관문에서 같은 짓을 하면 그 문안이
+// master pane 에 렌더되는 순간 **needle 이 화면에 다시 나타나** 스캔·주입 가드가 자기 자신을
+// 잡는다(U-18 이 같은 형태를 인증 처방 문안에서 겪었다). 그래서 관문 격상 문안은 좌석 참조와
+// **관문 id·제목(한국어)** 만 싣는다. 이 불변식은 `gate_escalation_text_is_not_itself_a_gate`
+// 가 코퍼스 전량에 대해 기계로 집행한다.
+
+/// ★U-16 롤백 스위치의 env 이름. `0` → 데몬 관문 스캐너를 통째로 끈다(= 이 단위 착지 이전).
+const ENV_GATE_SCAN: &str = "CYS_GATE_SCAN";
+
+/// 관문 feed 항목의 `kind`. approval 네임스페이스와 **다른 문자열**인 것이 오염 차단의 핵심이다
+/// — `has_pending_daemon_approval`·approval stale-clear 는 `kind == "approval"` 로 거르므로
+/// 두 스캐너의 생명주기가 서로를 종결시키지 않는다.
+const GATE_FEED_KIND: &str = "first_run_gate";
+
+/// 관문 격상 디바운스 창(초). approval 디바운스(60초)와 **같은 값·다른 축**이다.
+const GATE_SCAN_DEBOUNCE_SECS: f64 = 60.0;
+
+/// 생애 창 상한의 기본값(초). 첫기동 관문은 좌석이 태어난 직후에만 뜬다 — 이 창을 넘긴
+/// 좌석은 **관측하지 않는다**. 비대칭이 값을 정한다: 놓치는 대가는 '종전대로 감지 0' 이고,
+/// 오탐의 대가는 master 각성 폭주다.
+const GATE_SCAN_WINDOW_SECS: f64 = 600.0;
+
+/// 창 안에서 한 좌석이 낼 수 있는 격상 수의 **절대 상한**. 실측 관문은 6종이고 좌석 하나가
+/// 그보다 많이 격상할 이유가 없다 — 코퍼스가 커지거나 화면이 요동쳐도 폭주하지 않게 하는
+/// 마지막 천장이다(치명위험 ①). 상한에 닿은 좌석은 창이 **영구히 닫힌다**(카운터를 되돌리는
+/// 경로가 없다 — 되돌리면 천장이 천장이 아니다).
+const GATE_SCAN_MAX_ESCALATIONS: u32 = 8;
+
+/// 데몬 관문 스캐너가 켜져 있는가 — **env 를 읽는 유일한 지점**(롤백 스위치 1지점 규약).
+///
+/// ★마스터 스위치에 접는다(`cys::gate_axes_forced_legacy()`): 사고 순간에 사람이 노브를
+/// 조합할 수 없다는 것이 BLOCK-3 의 교훈이고, 이 캠페인이 추가한 축은 `CYS_BOOT_GATES=0`
+/// 하나로 **전부** 종전 복귀해야 한다. 이 축의 '종전' 은 **스캔 없음**이다.
+///
+/// ★왜 lib 의 [`cys::GateAxes`] 필드로 올리지 않았는가: 그 타입은 **좌석 판정·전송에 참여하는
+/// 축**의 집합이고, BLOCK-4 불변식("보류 장치가 꺼지면 판정도 전부 느슨해진다")이 그 넷
+/// 사이에서만 의미를 갖는다. 관측 전용 노브를 그 타입에 섞으면 불변식의 대상이 흐려진다 —
+/// 대신 **접기값을 소비**해서 마스터 스위치의 도달 범위는 그대로 지킨다.
+fn gate_scan_enabled() -> bool {
+    gate_scan_enabled_with(
+        std::env::var(ENV_GATE_SCAN).ok().as_deref(),
+        cys::gate_axes_forced_legacy(),
+    )
+}
+
+/// 위 판정의 **순수 코어** — 자기 노브와 상위 접기값의 합류(진리표 대상).
+///
+/// `forced_legacy` 는 `cys::gate_axes_forced_legacy()`(마스터 `CYS_BOOT_GATES=0` ∨ 보류 장치
+/// 꺼짐)의 값이다. **어느 한쪽만으로도 꺼진다** — 롤백이 '반쯤 되돌아가는' 것이 가장 위험하다는
+/// 것이 이 캠페인의 BLOCK-3/BLOCK-4 교훈이고, 관측 축도 예외가 아니다.
+fn gate_scan_enabled_with(raw: Option<&str>, forced_legacy: bool) -> bool {
+    gate_scan_enabled_from(raw) && !forced_legacy
+}
+
+/// 자기 노브 **하나만** 보는 순수 술어. 형제 게이트
+/// (`cys::gate_pending_axis_enabled_from`)와 같은 **엄격 비교** — 오타 하나로 안전장치가
+/// 조용히 뒤집히지 않는다.
+fn gate_scan_enabled_from(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
+/// 관문 스캔 개폐 판정 입력의 **전량**. 이 술어는 판정 중에 파일·시계·전역·env 를 읽지 않는다
+/// (숨은 입력 금지 — `inject_guard::Observed` 와 같은 규율).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GateScanWindow {
+    /// 롤백 스위치를 접은 값.
+    enabled: bool,
+    /// 이 **어댑터**가 관문 코퍼스의 적용 대상으로 선언돼 있는가(`first_run_gates` 봉투 실재).
+    ///
+    /// ★코드 정본 코퍼스는 **claude 를 실측한 것**이다(`MEASURED_ON` 도 claude 버전이다).
+    ///   그것을 어댑터 구분 없이 모든 좌석에 들이대면, 예컨대 codex 좌석 화면에
+    ///   `Enter to confirm`·`Esc to cancel` 같은 흔한 위젯 줄과 유사 문면이 함께 뜨는 순간
+    ///   **남의 관문**으로 격상된다. 그래서 적용 대상은 봉투(vendor 임베드 또는 사용자 디스크)가
+    ///   **선언**한 어댑터로 한정한다 — 다른 어댑터를 넣고 싶으면 봉투를 선언하면 된다
+    ///   (코드 수정 없이 넓힐 수 있고, 선언 없이는 넓어지지 않는다).
+    declared: bool,
+    /// 이 좌석이 첫 각성 ack 를 받았는가(`awakened_at` 래치 존재 = 창 닫힘).
+    awakened: bool,
+    /// 좌석 나이(초).
+    age_secs: f64,
+    /// 창 상한(초).
+    window_secs: f64,
+    /// 이 좌석이 창 안에서 이미 낸 격상 수.
+    escalations: u32,
+    /// 격상 수 천장.
+    max_escalations: u32,
+}
+
+/// 지금 이 좌석의 화면을 관문으로 스캔해도 되는가 — **순수**(진리표 대상).
+///
+/// 닫힘의 귀결은 언제나 '아무 것도 발행하지 않음' = 정확히 종전 동작이다. 그래서 이 술어는
+/// **오살 방향으로 열리지 않고**, 판정 불능(나이가 NaN·무한 = 시계 사고)은 **닫는다**.
+fn gate_scan_open(w: &GateScanWindow) -> bool {
+    gate_scan_observe_open(w) && w.escalations < w.max_escalations
+}
+
+/// 이 좌석의 화면을 **관측**해도 되는가 — 순수(진리표 대상). [`gate_scan_open`] 에서
+/// **격상 천장 축만 뺀** 술어다.
+///
+/// ★왜 나눴는가(결함 4): 천장의 목적은 **폭주 방지**이지 **신호 삭제**가 아니다. 종전에는
+/// 천장에 닿는 순간 창이 영구히 닫히면서, 관문이 아직 화면에 떠 있어도 pending feed 항목을
+/// `gate-window-closed` 로 종결했다 — 운영자의 **유일한 배지 신호**가 사라진다. 시나리오는
+/// 평범하다: 좌석이 관문 앞에 멈춘 채 사람이 feed 항목을 8회 확인/해소 → `seat.count` 천장 →
+/// 남은 pending 전량 종결. 그래서 두 축을 분리한다:
+///   · **관측**(이 술어) — 화면에서 관문이 사라졌는지 계속 본다. 발행이 없으므로 폭주가 아니다.
+///     생애 창(`window_secs`)·각성 ack·롤백이 여전히 상한이라 무한 관측이 아니다.
+///   · **발행**([`gate_scan_open`]) — 천장에 닿으면 멈춘다. 천장은 그대로 천장이다.
+fn gate_scan_observe_open(w: &GateScanWindow) -> bool {
+    w.enabled
+        && w.declared
+        && !w.awakened
+        && w.age_secs.is_finite()
+        && w.age_secs <= w.window_secs
+}
+
+/// 이 에이전트의 관문 override 봉투를 고른다 — **디스크 우선 · 부재 시에만 vendor 임베드**.
+///
+/// `cys.rs fill_missing_fields` 와 **같은 규칙**이다. 사본이 아니라 동형 재현인 이유: 데몬은
+/// CLI 의 `load_agent_spec` 을 지나지 않으므로 계층을 여기서 한 번 더 성립시켜야 한다.
+///   · 디스크에 키가 **있으면**(명시 `null` 포함) 디스크가 이긴다 — 사용자 주권 불변.
+///   · 키가 **아예 없을 때만** 임베드 봉투를 쓴다 — 기존 설치 기계 도달 경로(K-1).
+/// 어느 쪽에도 없으면 `None` = 코드 정본만 쓴다(그것이 코퍼스의 SOT 다).
+fn gate_envelope<'a>(
+    disk: &'a serde_json::Value,
+    embed: &'a serde_json::Value,
+    agent: &str,
+) -> Option<&'a serde_json::Value> {
+    let key = cys::first_run_gates::ADAPTER_KEY;
+    if let Some(v) = disk.get(agent).and_then(|a| a.get(key)) {
+        return Some(v);
+    }
+    embed.get(agent).and_then(|a| a.get(key))
+}
+
+/// 화면에서 본 관문의 요약. **키 재료가 하나도 없다** — `select_index`·`literal`·`down` 이
+/// 이 타입에 없는 것이 "데몬은 자동 응답하지 않는다" 계약의 구조적 형태다(주석이 아니라 타입).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateSighting {
+    id: String,
+    title: String,
+    /// 사람이 1회 해야 통과한다(로그인·OAuth) — 처방 문안이 갈린다.
+    human_only: bool,
+}
+
+/// 화면 → 관문 요약. 매칭은 코퍼스가 소유한 `identify`(needle OR ∧ **위젯 서명 AND**) 하나만
+/// 쓴다. 여기서 needle 만 보는 느슨한 술어(`inject_guard::needle_hit`)를 쓰면 안 된다 —
+/// 그 술어의 안전 방향은 '놓치지 않기' 이고, 데몬 격상의 안전 방향은 '깨우지 않기' 다.
+fn gate_sighting(gates: &[cys::first_run_gates::Gate], screen: &str) -> Option<GateSighting> {
+    let g = cys::first_run_gates::identify(gates, screen)?;
+    Some(GateSighting {
+        id: g.id.clone(),
+        title: g.title.clone(),
+        human_only: g.passability == cys::first_run_gates::Passability::HumanOnly,
+    })
+}
+
+/// 관문 격상 문안(feed 본문 · master 각성 큐 · 이벤트가 공유하는 단일 생성처).
+///
+/// ★화면 인용 금지(자기발화 차단 — 위 절 참조). 입력은 좌석 참조와 관문 **식별자**뿐이다.
+fn gate_escalation_text(surface_ref: &str, hit: &GateSighting) -> String {
+    let what = if hit.human_only {
+        "사람이 1회 처리해야 통과한다(로그인·OAuth 는 기계가 통과시킬 수 없다)"
+    } else {
+        "통과 액션은 부트 경로가 자기 게이트 아래에서 집행한다 — 데몬은 응답하지 않는다"
+    };
+    format!(
+        "[관문감지] {surface_ref} 첫기동 관문 보류 (id={} · {}) — {what}. \
+         화면 확인은 cys read-screen 으로 하라(문면은 자기발화 차단을 위해 싣지 않는다).",
+        hit.id, hit.title
+    )
+}
+
+/// 데몬이 발행한 이 좌석의 **관문** feed 항목 id 스냅샷. `kind` 가 approval 과 다르므로
+/// `Daemon::pending_daemon_approvals`(kind=="approval")와 서로 간섭하지 않는다 — 두 스캐너의
+/// 생명주기 분리는 이 한 글자 차이가 집행한다.
+fn pending_gate_items(daemon: &Arc<Daemon>, surface_id: u64) -> Vec<String> {
+    daemon
+        .feed_items
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|i| {
+            i.status == "pending"
+                && i.kind == GATE_FEED_KIND
+                && i.surface_id == Some(surface_id)
+                && crate::state::is_daemon_issued(&i.request_id)
+        })
+        .map(|i| i.request_id.clone())
+        .collect()
+}
+
+/// 좌석별 관문 격상 상태(watchdog 태스크 로컬).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GateSeatState {
+    /// 창 안에서 낸 격상 수. **되돌리지 않는다**(천장이 천장이려면 단조여야 한다).
+    count: u32,
+    /// 창이 닫힌 뒤 pending 항목을 이미 정리했는가 — 매 틱 feed 락을 다시 잡지 않기 위한 래치.
+    cleaned: bool,
+}
+
+/// ★틱마다 재컴파일·재해소하지 않기 위한 스캔 캐시. watchdog 태스크 로컬 = **단일 writer**
+/// (데몬 전역 상태로 올리면 재시작 영속·RPC 노출 계약이 딸려오는데, 여기 필요한 것은
+/// 프로세스 수명의 캐시뿐이다 — `APPROVAL_WAKEUP_RECENT` 와 같은 판단).
+///
+/// ## 무효화 규칙 (명시)
+///
+/// | 맵 | 키 | 왜 stale 이 될 수 없는가 | 성장 차단 |
+/// |---|---|---|---|
+/// | `approval_re` | 패턴 **문자열 그 자체** | `Regex::new` 은 순수·결정론 — 같은 문자열의 산출은 영원히 같다 | 매 pass 관측된 패턴 집합으로 `retain` |
+/// | `gate_corpus` | (override 스위치 값, 봉투 `Value` **전문**) | `first_run_gates::resolve_with` 의 **입력 전량**이 키다 — 하나라도 다르면 재해소 | 매 pass 관측된 agent 집합으로 `retain` |
+/// | `gate_debounce` | (surface, 관문 id) | 시각 비교라 stale 개념 없음 | 살아있는 surface 집합으로 `retain`(watchdog 누수 차단 블록) |
+/// | `gate_escalations` | surface | 좌석 수명과 동일 | 위와 같음 |
+///
+/// ★mtime·해시 같은 **추정 키를 쓰지 않은 이유**: 추정 키는 "같은 나노초에 같은 길이로
+/// 고치면 안 바뀐 것으로 본다" 는 조용한 오답을 남긴다. 봉투는 작은 JSON 서브트리라 전문
+/// 비교가 싸고, 싸면 추정할 이유가 없다. 사람이 `agents.json` 을 고치면 **다음 pass 에 반영**된다.
+#[derive(Default)]
+struct ScanCaches {
+    approval_re: HashMap<String, Option<regex::Regex>>,
+    gate_corpus: HashMap<String, GateCorpusEntry>,
+    gate_debounce: HashMap<(u64, String), f64>,
+    gate_escalations: HashMap<u64, GateSeatState>,
+}
+
+/// 캐시된 관문 코퍼스 한 항목 — 키(입력 전량)와 산출을 함께 들고 있다.
+struct GateCorpusEntry {
+    override_on: bool,
+    envelope: Option<serde_json::Value>,
+    gates: Arc<Vec<cys::first_run_gates::Gate>>,
+}
+
+impl ScanCaches {
+    /// approval 패턴 정규식을 **선컴파일 캐시**에서 얻는다. 컴파일 실패도 `None` 으로 캐시해
+    /// 매 pass 같은 손상 패턴을 다시 컴파일하지 않는다(판정은 종전과 동일 — 실패 = 건너뜀).
+    fn approval_regex(&mut self, pattern: &str) -> Option<&regex::Regex> {
+        self.approval_re
+            .entry(pattern.to_string())
+            .or_insert_with(|| regex::Regex::new(pattern).ok())
+            .as_ref()
+    }
+
+    /// 관문 코퍼스를 캐시에서 얻는다(미스면 `resolve_with` 로 해소해 적재).
+    fn corpus(
+        &mut self,
+        agent: &str,
+        envelope: Option<&serde_json::Value>,
+        override_on: bool,
+    ) -> Arc<Vec<cys::first_run_gates::Gate>> {
+        if let Some(e) = self.gate_corpus.get(agent) {
+            if e.override_on == override_on && e.envelope.as_ref() == envelope {
+                return e.gates.clone();
+            }
+        }
+        let gates = Arc::new(cys::first_run_gates::resolve_with(envelope, override_on).gates);
+        self.gate_corpus.insert(
+            agent.to_string(),
+            GateCorpusEntry {
+                override_on,
+                envelope: envelope.cloned(),
+                gates: gates.clone(),
+            },
+        );
+        gates
+    }
+
+    /// pass 끝 정리 — 이번 pass 에서 관측되지 않은 키를 버린다(24/365 데몬 누수 차단).
+    /// surface 키 맵은 여기서 손대지 않는다(watchdog 틱의 살아있는 surface 집합이 소유).
+    fn prune_pass(
+        &mut self,
+        seen_patterns: &std::collections::HashSet<String>,
+        seen_agents: &std::collections::HashSet<String>,
+    ) {
+        self.approval_re.retain(|k, _| seen_patterns.contains(k));
+        self.gate_corpus.retain(|k, _| seen_agents.contains(k));
+    }
+
+    /// 살아있는 surface 집합으로 좌석 키 맵을 솎는다(watchdog 누수 차단 블록에서 호출).
+    fn prune_surfaces(&mut self, live: &std::collections::HashSet<u64>) {
+        self.gate_debounce.retain(|(sid, _), _| live.contains(sid));
+        self.gate_escalations.retain(|sid, _| live.contains(sid));
+    }
+}
+
 /// T4-16 승인 격상 스캔: agents.json의 approval_patterns를 visible screen에 매칭.
 /// ★자동 응답 절대 금지 — 감지·격상(이벤트+feed 항목)만. 판단은 master의 몫.
-fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f64>) {
+///
+/// ★(U-16) 같은 pass 에서 **두 번째 스캐너**가 돈다 — 첫기동 관문 스캔. 두 스캐너는 화면
+/// 스냅샷 하나를 공유하지만(파서 락 1회) 그 밖의 모든 것(키·코퍼스·디바운스·feed kind·
+/// 롤백 스위치)이 분리돼 있다. 위 U-16 절이 그 분리의 근거를 전부 담고 있다.
+fn check_approvals(
+    daemon: &Arc<Daemon>,
+    debounce: &mut HashMap<(u64, String), f64>,
+    caches: &mut ScanCaches,
+) {
     let agents: serde_json::Value =
         match std::fs::read_to_string(cys::pack::pack_dir().join("agents.json"))
             .ok()
@@ -1332,6 +1697,11 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         .and_then(|(_, c)| serde_json::from_str(c).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let now = now_epoch();
+    // ★env 는 pass 당 한 번만 읽는다(좌석마다 읽으면 같은 pass 안에서 판정이 갈릴 수 있다).
+    let scan_on = gate_scan_enabled();
+    let override_on = cys::first_run_gates::override_enabled();
+    let mut seen_patterns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     for s in surfaces {
@@ -1341,21 +1711,67 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         let Some((agent, _)) = s.agent_meta.lock().unwrap().clone() else {
             continue;
         };
+        seen_agents.insert(agent.clone());
         let patterns = merged_approval_patterns(&agents, &embed_agents, &agent);
-        if patterns.is_empty() {
+        for p in &patterns {
+            if let Some(pat) = p["pattern"].as_str() {
+                seen_patterns.insert(pat.to_string());
+            }
+        }
+        // ★(U-16) 관문 창 개폐 — 화면 스냅샷을 뜨기 **전에** 판정한다(닫힌 좌석에 비용 0).
+        let envelope = gate_envelope(&agents, &embed_agents, &agent);
+        let seat = caches.gate_escalations.get(&s.id).copied().unwrap_or_default();
+        let window = GateScanWindow {
+            enabled: scan_on,
+            declared: envelope.is_some(),
+            awakened: s.awakened_at.lock().unwrap().is_some(),
+            age_secs: now - s.created_at,
+            window_secs: GATE_SCAN_WINDOW_SECS,
+            escalations: seat.count,
+            max_escalations: GATE_SCAN_MAX_ESCALATIONS,
+        };
+        // ★관측 창과 발행 천장은 **다른 축**이다(결함 4). 천장에 닿아도 관측은 계속하고
+        //   발행만 멈춘다 — 그래야 관문이 화면에 실재하는 동안 배지가 살아 있고,
+        //   관문이 사라지는 순간 같은 생명주기 경로(`scan_first_run_gate` 의 stale-clear)로
+        //   종결된다. 천장은 `may_escalate` 로 그대로 남는다.
+        let observe_open = gate_scan_observe_open(&window);
+        let may_escalate = gate_scan_open(&window);
+        if !observe_open && seat.count > 0 && !seat.cleaned {
+            // **관측 자체가 닫힌** 좌석(각성 ack·생애 창 초과·롤백·미선언)만 종결한다. 그
+            // 좌석은 화면을 더 보지 않으므로 배지를 살려 두면 영구 pending 으로 남는다.
+            // 천장으로 닫힌 좌석은 여기 오지 않는다 — 그것이 이 수리의 전부다.
+            for rid in pending_gate_items(daemon, s.id) {
+                daemon.resolve_feed_item(&rid, "gate-window-closed");
+            }
+            caches.gate_escalations.insert(
+                s.id,
+                GateSeatState {
+                    cleaned: true,
+                    ..seat
+                },
+            );
+        }
+        if patterns.is_empty() && !observe_open {
             continue;
         }
         let patterns = &patterns;
-        let screen = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents();
+        // 화면 스냅샷은 pass 당 좌석 1회 — 두 스캐너가 같은 스냅샷을 본다(파서 락 중복 0).
+        let screen = s
+            .parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .contents();
         let mut any_match = false;
         for p in patterns {
             let (Some(name), Some(pattern)) = (p["name"].as_str(), p["pattern"].as_str()) else {
                 continue;
             };
-            let Ok(re) = regex::Regex::new(pattern) else {
+            // ★선컴파일 캐시(무효화 규칙 = ScanCaches doc). 판정 자체는 종전과 동일하다 —
+            //   같은 패턴 문자열의 Regex 는 결정론이므로 캐시 히트는 재컴파일과 등가다.
+            let Some(m) = caches.approval_regex(pattern).and_then(|re| re.find(&screen)) else {
                 continue;
             };
-            let Some(m) = re.find(&screen) else { continue };
             any_match = true;
             // L3 코얼레싱(2026-07-07 feed 189 폭주 재발방지): 이 surface의 감지 항목이
             // 아직 pending이면 같은 프롬프트 에피소드 — 이벤트·항목을 재발행하지 않는다.
@@ -1406,11 +1822,128 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         // 항목은 알림 수명 종료 — 자동 종결한다. 프롬프트가 (사람·master의 pane 응답으로)
         // 해소돼도 feed 항목이 영구 pending으로 남아 배지를 오염시키던 생명주기 부재를
         // 봉인하고, 데몬 재시작 고아 백로그도 같은 경로로 청소된다.
-        if !any_match {
+        if !any_match && !patterns.is_empty() {
             for rid in daemon.pending_daemon_approvals(s.id) {
                 daemon.resolve_feed_item(&rid, "stale-cleared");
             }
         }
+        // ─────────────────────────────────────────────────────────────────────
+        // ★(U-16) 두 번째 스캐너 — 첫기동 관문. 위 approval 블록과 상태를 공유하지 않는다.
+        //   본체를 **별도 함수**로 뽑아 둔 이유: "이 스캐너에는 키를 보내는 코드가 없다"는
+        //   계약이 한 화면 안에서 감사돼야 하기 때문이다(자동응답 금지 · 리뷰 렌즈 분리).
+        // ─────────────────────────────────────────────────────────────────────
+        if observe_open {
+            scan_first_run_gate(
+                &GateScanCtx {
+                    daemon,
+                    surface: &s,
+                    agent: &agent,
+                    screen: &screen,
+                    envelope,
+                    override_on,
+                    may_escalate,
+                    now,
+                },
+                seat,
+                caches,
+            );
+        }
+    }
+    caches.prune_pass(&seen_patterns, &seen_agents);
+}
+
+/// 관문 스캐너 입력의 전량(창 개폐는 호출부가 이미 판정했다 — 여기서 다시 열지 않는다).
+struct GateScanCtx<'a> {
+    daemon: &'a Arc<Daemon>,
+    surface: &'a Arc<crate::state::Surface>,
+    agent: &'a str,
+    screen: &'a str,
+    /// `agents.json` override 봉투(디스크 우선 · 부재 시 임베드) — `gate_envelope` 산출.
+    envelope: Option<&'a serde_json::Value>,
+    /// `first_run_gates` override 롤백 스위치의 pass 값.
+    override_on: bool,
+    /// **새 격상을 발행해도 되는가**(격상 천장 미도달). 관측 창과 다른 축이다 — 결함 4 참조.
+    may_escalate: bool,
+    now: f64,
+}
+
+/// ★(U-16) 첫기동 관문 스캐너 본체 — **감지·격상만 한다**.
+///
+/// ## 이 함수에 없는 것 (계약)
+///
+/// `write_tx`·`send_key`·`inject_text`·`first_run_gates::action_policy` 어느 것도 호출하지
+/// 않는다. 통과 액션의 산출조차 하지 않는다 — [`GateSighting`] 에 키 재료가 없으므로
+/// **없는 값은 보낼 수 없다**. 관문을 통과시키는 것은 자기 게이트를 가진 부트 경로(U-14/U-19)
+/// 소관이고, 데몬 watchdog 틱이 그 일을 하면 면책 창의 `No, exit` 를 누르는 사고(2026-07-29)가
+/// 좌석 전량으로 확대된다.
+///
+/// ## 틱 계약
+///
+/// 이 함수는 `.await` 를 하지 않는다(watchdog 틱의 유일한 await 는 상단 sleep 하나라는 계약).
+/// 잡는 락은 전부 한 문장 안에서 끝난다 — feed·role·큐 락을 겹쳐 잡지 않는다.
+fn scan_first_run_gate(cx: &GateScanCtx, seat: GateSeatState, caches: &mut ScanCaches) {
+    let daemon = cx.daemon;
+    let sid = cx.surface.id;
+    let gates = caches.corpus(cx.agent, cx.envelope, cx.override_on);
+    let Some(hit) = gate_sighting(&gates, cx.screen) else {
+        // 화면에서 관문이 사라졌다 = 사람이 통과시켰다 → pending 항목 종결(생명주기).
+        if seat.count > 0 {
+            for rid in pending_gate_items(daemon, sid) {
+                daemon.resolve_feed_item(&rid, "stale-cleared");
+            }
+        }
+        return;
+    };
+    // ★격상 천장(결함 4) — 여기서 멈추는 것은 **발행**이지 관측이 아니다. 위 종결 분기를
+    //   이미 지나왔으므로, 관문이 화면에 있는 동안 배지는 살아 있고 사라지면 종결된다.
+    //   ★이 return 이 없으면 천장 뒤에도 새 항목이 계속 발행돼 천장이 사문이 된다(폭주 재개).
+    //   그래서 순서가 계약이다: '관문 소실 종결' 이 먼저, '천장' 이 그 다음.
+    if !cx.may_escalate {
+        return;
+    }
+    // L3 코얼레싱 — 이 좌석의 관문 항목이 아직 pending 이면 같은 에피소드다(재발행 금지).
+    if !pending_gate_items(daemon, sid).is_empty() {
+        return;
+    }
+    let key = (sid, hit.id.clone());
+    if caches
+        .gate_debounce
+        .get(&key)
+        .map(|t| cx.now - t < GATE_SCAN_DEBOUNCE_SECS)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    caches.gate_debounce.insert(key, cx.now);
+    caches.gate_escalations.insert(
+        sid,
+        GateSeatState {
+            count: seat.count + 1,
+            cleaned: false,
+        },
+    );
+    let role = cx.surface.role.lock().unwrap().clone();
+    let text = gate_escalation_text(&cys::surface_ref(sid), &hit);
+    let agent = cx.agent;
+    daemon.bus.publish(
+        "boot_gate.detected",
+        "feed",
+        Some(sid),
+        json!({"surface_ref": cys::surface_ref(sid), "role": role, "agent": agent,
+               "gate": hit.id, "title": hit.title, "human_only": hit.human_only}),
+    );
+    daemon.push_feed_notification(
+        GATE_FEED_KIND,
+        &format!("{agent} 첫기동 관문 감지 ({})", cys::surface_ref(sid)),
+        &text,
+        Some(sid),
+    );
+    // master 각성은 approval 과 **같은 큐 경로**를 탄다(문구 dedupe 5분 · 큐 cap 100 ·
+    // 조용시점 배달). ★approval 이 이미 이 좌석으로 master 를 깨웠다면 건너뛴다 —
+    // 같은 pane 을 보라는 요구를 두 번 보내지 않는다(치명위험 ① 억제이며, 진단 자체는
+    // feed 항목에 이미 남아 있으므로 잃는 정보가 없다).
+    if !daemon.has_pending_daemon_approval(sid) {
+        enqueue_master_wakeup(daemon, sid, &text);
     }
 }
 
@@ -1592,7 +2125,10 @@ fn feed_backlog_crossed(total: usize, threshold: u64, alerted: &mut bool) -> boo
     if threshold == 0 {
         return false;
     }
-    if total >= threshold as usize {
+    // ★폭 변환은 **넓히는 쪽**으로 한다. `threshold as usize` 는 32비트 타깃에서 좁힘이라
+    //   `2^32` 가 0 이 되고, 위 `threshold == 0`(비활성) 검사를 이미 지난 뒤이므로
+    //   `total >= 0` = **항상 참** → 백로그 경보가 상시 발화한다(P4-5 형제 결함).
+    if total as u64 >= threshold {
         if *alerted {
             return false;
         }
@@ -1787,7 +2323,7 @@ fn check_launch_flags(
 ) {
     // ★P3-4 진단 계측 파라미터. 기본 40틱 = 이 검사의 15초 주기로 **10분 연속 실명**,
     // 쿨다운 3600초 = 좌석당 시간당 1건 상한. 임계 0 = 킬스위치(비활성).
-    let blind_ticks = env_u64("CYS_LAUNCH_FLAG_BLIND_TICKS", 40) as u32;
+    let blind_ticks = env_u32("CYS_LAUNCH_FLAG_BLIND_TICKS", 40);
     let blind_cooldown = env_u64("CYS_LAUNCH_FLAG_BLIND_COOLDOWN_SECS", 3600) as f64;
     let now = now_epoch();
     let surfaces: Vec<Arc<crate::state::Surface>> =
@@ -7566,6 +8102,136 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★P4-5 절단 캐스트 — `as u32` 는 클램프가 아니다
+    //
+    // 같은 캠페인의 같은 커밋이 `cys.rs rpc_idle_timeout_with` 에서 `v.min(MAX)` 로 고친
+    // 결함의 **새 인스턴스**가 이 파일에 남아 있었다(규율이 커밋 안에서 갈렸다). 아래 셋은
+    // ① 순수 진리표(거대값 축) ② 소비자 방향 확인(오사망 축) ③ 전수 소스핀 이다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// ★거대값 진리표 — 절단은 **단조**가 아니고, 그 비단조 구간이 곧 결함이다.
+    ///
+    /// 두 wrap 귀결의 **방향이 서로 다르다**는 것이 요점이다:
+    ///   · `2^32   → 0` 축이 조용히 전면 비활성(사람은 '아주 큰 임계'를 적었다)
+    ///   · `2^32+1 → 1` 임계가 **가장 느슨해진다** — 이 저장소에서 그 방향은 오사망이다.
+    #[test]
+    fn env_u32_clamps_instead_of_truncating() {
+        use super::clamp_env_u32 as c;
+        assert_eq!(c(0), 0, "0 은 킬스위치 — 의미를 바꾸지 않는다");
+        assert_eq!(c(2), 2);
+        assert_eq!(c(u64::from(u32::MAX)), u32::MAX, "경계값은 그대로 통과");
+        assert_eq!(c(4_294_967_296), u32::MAX, "2^32 가 0 이 되면 축이 조용히 꺼진다");
+        assert_eq!(
+            c(4_294_967_297),
+            u32::MAX,
+            "2^32+1 이 1 이 되면 연속 1틱만으로 증명이 선다 — 주석이 막겠다던 \
+             '스치는 도우미 프로세스'가 그대로 증명을 세운다(오사망)"
+        );
+        assert_eq!(c(u64::MAX), u32::MAX);
+        // ★일반화 — 절단이면 반드시 깨지는 성질. 개별 값 나열은 다음 절단을 못 잡는다.
+        let probes = [
+            0u64,
+            1,
+            2,
+            40,
+            4_294_967_295,
+            4_294_967_296,
+            4_294_967_297,
+            8_589_934_592,
+            u64::MAX,
+        ];
+        for w in probes.windows(2) {
+            assert!(
+                c(w[0]) <= c(w[1]),
+                "단조성 위반: {} → {} 인데 {} → {} (큰 값이 더 느슨해진다)",
+                w[0],
+                c(w[0]),
+                w[1],
+                c(w[1])
+            );
+        }
+    }
+
+    /// ★클램프의 **방향** — 거대값은 "증명이 서지 않는다"(보수) 쪽으로만 접혀야 한다.
+    ///
+    /// ⓐ 절단본에서는 `2^32+1 → 1` 이라 **첫 틱에** 증명이 선다(오사망).
+    /// ⓑ 양성 대조군 — 정상 임계 2 에서는 2틱 연속으로 증명이 서야 한다. ⓑ가 없으면
+    ///    `update_strict_proof` 가 통째로 죽어도 ⓐ가 초록이라 아무것도 증명하지 못한다.
+    #[test]
+    fn giant_strict_proof_ticks_never_arms_the_proof() {
+        use super::{clamp_env_u32, update_strict_proof};
+        let arm = clamp_env_u32(4_294_967_297);
+        let mut proof = None;
+        for tick in 0..1000 {
+            assert!(
+                !update_strict_proof(&mut proof, "claude", true, arm),
+                "거대 임계가 1틱으로 절단돼 {tick}틱에 증명이 섰다 — \
+                 스치는 도우미 프로세스가 살아있는 좌석을 사망 판정시킨다"
+            );
+        }
+        let mut ctrl = None;
+        assert!(!update_strict_proof(&mut ctrl, "claude", true, 2), "1틱째는 미증명");
+        assert!(
+            update_strict_proof(&mut ctrl, "claude", true, 2),
+            "정상 임계에서 증명이 서지 않으면 좁힘 자체가 죽은 것이다(양성 대조군)"
+        );
+    }
+
+    /// ★전수 소스핀 — 프로덕션 슬라이스에 **좁힘 캐스트가 하나도 없다**.
+    ///
+    /// 개별 결함 3건을 고쳐도 다음 사람이 같은 자리에 다시 넣으면 그만이다. 그래서 값이
+    /// 아니라 **규율**을 못박는다: env·길이·카운터의 폭 변환은 `try_from(..).unwrap_or(MAX)`
+    /// 또는 `min(MAX)` 로 쓴다. (`SeatState::as_u8` 의 `self as u8` 는 enum 판별식 캐스트라
+    ///  폭이 줄지 않는다 — 금칙 목록에 넣지 않는다.)
+    ///
+    /// ★계측 타당성: 트리에 위반이 0 이면 탐지기가 고장나도 초록이다. 그래서 합성 변조본으로
+    /// 탐지 능력 자체를 함께 시험한다(코드에 심으면 적발 · 주석에 있으면 무시).
+    #[test]
+    fn production_slice_has_no_narrowing_casts() {
+        /// `//` 줄주석 제거 — 이 핀은 "무엇을 **쓰는가**" 를 보는 장치이고 주석은 설명이다
+        /// (바로 위 검체들의 설명문에 `as u32` 라는 글자가 그대로 들어 있다).
+        fn strip_line_comments(src: &str) -> String {
+            src.lines()
+                .map(|l| match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        const NARROWING: [&str; 3] = ["as u32", "as u16", "as usize"];
+        let src = include_str!("governance.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let code = strip_line_comments(raw);
+        let hits: Vec<&str> = NARROWING
+            .iter()
+            .copied()
+            .filter(|w| code.contains(w))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "프로덕션에 좁힘 캐스트가 남았다: {hits:?} — `as` 는 wrap 이다. \
+             `u32::try_from(v).unwrap_or(u32::MAX)` 또는 `v.min(MAX)` 로 클램프하라"
+        );
+        // 합성 변조본 ① — 코드에 심으면 반드시 적발된다(탐지기 생존 증명).
+        for w in NARROWING {
+            let mutant = format!("{code}\nfn __mutant(v: u64) -> u32 {{ v {w} }}\n");
+            assert!(
+                NARROWING.iter().any(|x| strip_line_comments(&mutant).contains(x)),
+                "합성 변조본에서 {w:?} 를 적발하지 못했다 = 탐지기 고장"
+            );
+        }
+        // 합성 변조본 ② — 주석 안의 같은 문장은 적발하지 않는다(핀이 설명을 죽이지 않는다).
+        let commented = format!("{raw}\n// 여기서 as u32 로 자르면 안 된다\n");
+        assert!(
+            NARROWING
+                .iter()
+                .all(|w| !strip_line_comments(&commented).contains(w)),
+            "주석 문장을 위반으로 읽었다 — 다음 사람이 설명을 지우거나 핀을 완화하게 된다"
+        );
+    }
+
     /// reap 경계: exited 후 grace 미만이면 보존(포렌식·복구 윈도우), 이상이면 회수.
     /// 역할 노드는 60초, 비역할은 10초로 더 빨리 정리 — 자력종료 surface 누수 차단의 핵심 불변식.
     /// ★G4(W4-C): 공유 락 + 기본값 명시 고정 — grace env 를 만지는 테스트(governance·handlers
@@ -8401,6 +9067,699 @@ mod tests {
         assert_eq!(deaths.len(), 1, "worker 좌석 사망도 동일 이벤트명으로 발화(role 키는 payload)");
         assert_eq!(deaths[0]["payload"]["role"], "worker");
         assert_eq!(deaths[0]["payload"]["reason"], "worker surface exited");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // ★(U-16) 데몬 첫기동 관문 스캔 — 분리·생애 창·자기발화·캐시 무효화
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    // ## 계측 타당성 규율 (이 절의 모든 검체)
+    //
+    // 이 단위의 핀 대부분은 **새 심볼**을 겨눈다 — 수리 전 트리에는 그 심볼이 없으므로
+    // "되돌려서 적색을 본다" 를 그대로 할 수 없다. 그래서 검체마다 **양성 대조군**을 함께
+    // 넣는다: 같은 검체 안에서 (ⓐ 탐지되어야 하는 합성 표본이 실제로 탐지되고) (ⓑ 탐지되면
+    // 안 되는 표본이 탐지되지 않는지)를 **둘 다** 단언한다. ⓐ가 없으면 탐지기가 통째로 고장나도
+    // 초록이 되고, 그 초록은 아무것도 증명하지 않는다.
+
+    use super::{
+        gate_envelope, gate_escalation_text, gate_scan_enabled_from, gate_scan_enabled_with,
+        gate_scan_observe_open, gate_scan_open, gate_sighting, pending_gate_items,
+        scan_first_run_gate, GateScanCtx, GateScanWindow, GateSeatState, GateSighting, ScanCaches,
+        GATE_FEED_KIND, GATE_SCAN_MAX_ESCALATIONS, GATE_SCAN_WINDOW_SECS,
+    };
+    use cys::first_run_gates as frg;
+
+    /// 창이 **열린** 기준 상태(각 검체가 축 하나씩만 흔든다).
+    fn open_window() -> GateScanWindow {
+        GateScanWindow {
+            enabled: true,
+            declared: true,
+            awakened: false,
+            age_secs: 1.0,
+            window_secs: GATE_SCAN_WINDOW_SECS,
+            escalations: 0,
+            max_escalations: GATE_SCAN_MAX_ESCALATIONS,
+        }
+    }
+
+    /// ★생애 창 진리표. 닫힘의 귀결은 언제나 '아무 것도 발행하지 않음' = 종전 동작이므로
+    /// 이 술어는 **오살 방향으로 열리지 않는다** — 판정 불능(NaN·무한)도 닫는다.
+    #[test]
+    fn gate_scan_window_truth_table() {
+        assert!(gate_scan_open(&open_window()), "기준 상태는 열려 있어야 한다");
+
+        let closed_by: [(&str, GateScanWindow); 7] = [
+            (
+                "롤백 스위치",
+                GateScanWindow {
+                    enabled: false,
+                    ..open_window()
+                },
+            ),
+            (
+                "봉투 미선언 어댑터(코퍼스는 claude 실측이다)",
+                GateScanWindow {
+                    declared: false,
+                    ..open_window()
+                },
+            ),
+            (
+                "첫 각성 ack 이후",
+                GateScanWindow {
+                    awakened: true,
+                    ..open_window()
+                },
+            ),
+            (
+                "창 상한 초과",
+                GateScanWindow {
+                    age_secs: GATE_SCAN_WINDOW_SECS + 0.001,
+                    ..open_window()
+                },
+            ),
+            (
+                "격상 천장",
+                GateScanWindow {
+                    escalations: GATE_SCAN_MAX_ESCALATIONS,
+                    ..open_window()
+                },
+            ),
+            (
+                "나이 NaN(시계 사고)",
+                GateScanWindow {
+                    age_secs: f64::NAN,
+                    ..open_window()
+                },
+            ),
+            (
+                "나이 무한",
+                GateScanWindow {
+                    age_secs: f64::INFINITY,
+                    ..open_window()
+                },
+            ),
+        ];
+        for (why, w) in closed_by {
+            assert!(!gate_scan_open(&w), "{why}: 창이 닫혀야 한다");
+        }
+        // 경계는 포함(<=): 상한 그 순간까지는 관측한다.
+        assert!(gate_scan_open(&GateScanWindow {
+            age_secs: GATE_SCAN_WINDOW_SECS,
+            ..open_window()
+        }));
+        // 시계 되돌림으로 나이가 음수여도 창 안이다(창은 생애 **앞쪽**에 있다).
+        assert!(gate_scan_open(&GateScanWindow {
+            age_secs: -5.0,
+            ..open_window()
+        }));
+        // 롤백 스위치의 순수 절반 — 형제 게이트와 같은 엄격 비교.
+        assert!(gate_scan_enabled_from(None), "미설정 = 켜짐");
+        assert!(!gate_scan_enabled_from(Some("0")), "0 = 꺼짐");
+        for loose in ["off", "false", "no", "", "1", "00"] {
+            assert!(
+                gate_scan_enabled_from(Some(loose)),
+                "{loose:?}: 느슨한 falsy 로 안전장치가 조용히 꺼지면 안 된다"
+            );
+        }
+        // ★마스터 스위치 접기 — 사고 순간에 사람이 쥐는 손잡이는 하나여야 한다(BLOCK-3).
+        //   자기 노브가 켜져 있어도 상위 접기값(`CYS_BOOT_GATES=0` ∨ 보류 장치 꺼짐)이 참이면
+        //   스캐너는 꺼진다. 이 축의 '종전' 은 **스캔 없음**이므로 꺼짐은 종전 동작이다.
+        assert!(gate_scan_enabled_with(None, false), "기본 = 켜짐");
+        assert!(
+            !gate_scan_enabled_with(None, true),
+            "마스터 스위치를 눌렀는데 데몬 스캐너가 계속 돈다 — 반쪽 롤백(BLOCK-3 의 형태)"
+        );
+        assert!(!gate_scan_enabled_with(Some("0"), false), "자기 노브만으로도 꺼진다");
+        assert!(!gate_scan_enabled_with(Some("0"), true));
+    }
+
+    /// ★N-2 오탐 회귀 — **작업 중 노드가 이 캠페인의 감사 문서·소스를 `cat` 해도 격상 0**.
+    ///
+    /// 합성 표본은 **실제 관문 문면(needle + 위젯 서명 전량)** 을 본문에 그대로 담는다.
+    /// 그래서 이 검체는 두 가지를 동시에 증명한다:
+    ///   ⓐ **탐지기는 살아 있다** — 창이 열려 있으면 이 화면은 관문으로 잡힌다(양성 대조군).
+    ///       ⓐ가 없으면 `identify` 가 통째로 고장나도 ⓑ가 초록이라 아무것도 증명 못 한다.
+    ///   ⓑ **그럼에도 격상은 0** — 각성 ack 를 받은 좌석은 창이 닫혀 스캔 자체를 하지 않는다.
+    /// 즉 오탐을 막는 것은 '문면이 안 걸려서' 가 아니라 **생애 창**이다. 이 구분이 요점이다.
+    #[test]
+    fn audit_doc_cat_is_detectable_but_never_escalates_after_awakening() {
+        let gates = frg::builtin();
+        let audit_screen = format!(
+            "worker@mac cys-terminal-rel % sed -n '40,60p' src/first_run_gates.rs\n\
+             //! 관문 6종의 실제 순서: 테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내.\n\
+             {}\n\
+             worker@mac cys-terminal-rel % \n",
+            frg::fixtures::FOLDER_TRUST
+        );
+
+        // ⓐ 양성 대조군 — 탐지기 자체는 이 화면을 관문으로 본다.
+        let seen = gate_sighting(&gates, &audit_screen);
+        assert_eq!(
+            seen.as_ref().map(|h| h.id.as_str()),
+            Some("folder-trust"),
+            "탐지기가 고장났다 — 이 합성 표본은 관문 문면 전량을 담고 있다"
+        );
+
+        // ⓑ 그럼에도 각성한 좌석에서는 스캔이 열리지 않는다 = 격상 0.
+        assert!(
+            !gate_scan_open(&GateScanWindow {
+                awakened: true,
+                ..open_window()
+            }),
+            "각성 ack 이후에 창이 열리면 감사 문서 cat 이 master 를 반복 각성시킨다"
+        );
+        // 나이만으로도 닫힌다(각성 래치가 없는 좌석의 두 번째 방어선).
+        assert!(!gate_scan_open(&GateScanWindow {
+            age_secs: GATE_SCAN_WINDOW_SECS + 1.0,
+            ..open_window()
+        }));
+    }
+
+    /// 코퍼스 자기규칙 소비 확인 — 관문이 **아닌** 화면 전량에서 목격 0.
+    /// (규칙 자체는 `first_run_gates` 가 소유한다. 여기서 재확인하는 것은 데몬 스캐너가
+    ///  느슨한 술어로 갈아타지 않았다는 사실이다 — needle 단독 매칭이면 아래가 적색이 된다.)
+    #[test]
+    fn gate_sighting_is_silent_on_non_gate_screens() {
+        let gates = frg::builtin();
+        for (id, screen) in frg::fixtures::NON_GATE_SCREENS {
+            assert_eq!(
+                gate_sighting(&gates, screen),
+                None,
+                "{id}: 관문이 아닌 화면을 관문으로 격상하면 작업 중 노드가 폭주한다"
+            );
+        }
+        // ★위젯 서명 AND 가 **실제로 일하고 있는지**를 재는 합성 표본.
+        //
+        //   위 `NON_GATE_SCREENS` 만으로는 이 검체가 아무것도 증명하지 못한다 — 코퍼스의
+        //   needle 은 이미 그 표본들에 단독으로도 걸리지 않도록 자기규칙이 강제하므로,
+        //   데몬 스캐너가 느슨한 needle 단독 술어로 갈아타도 초록이 유지된다(실측: 그 변이를
+        //   넣고 돌렸더니 통과했다). 그래서 **needle 은 있고 위젯 서명은 없는** 화면을 따로
+        //   짓는다. 이 표본에서 목격이 나오면 AND 가 우회된 것이다.
+        let needle_without_widget = "[boot] 좌석 진단 로그\n\
+             관문 대기 여부 확인: Quick safety check: Is this a project you created or one you trust\n\
+             user@mac cys-terminal-rel % \n";
+        assert!(
+            frg::builtin()
+                .iter()
+                .any(|g| cys::inject_guard::needle_hit(g, needle_without_widget)),
+            "표본이 needle 을 잃었다 — 이 표본은 needle 을 담고 위젯만 없어야 의미가 있다"
+        );
+        assert_eq!(
+            gate_sighting(&gates, needle_without_widget),
+            None,
+            "위젯 서명 AND 가 우회됐다 — needle 하나로 관문이 성립하면 로그 한 줄이 격상을 부른다"
+        );
+
+        // 양성 대조군 — 진짜 관문 화면은 전부 잡힌다(탐지기 생존 증명).
+        for (id, screen) in [
+            ("theme", frg::fixtures::THEME),
+            ("login-method", frg::fixtures::LOGIN_METHOD),
+            ("oauth-code", frg::fixtures::OAUTH_CODE),
+            ("folder-trust", frg::fixtures::FOLDER_TRUST),
+            ("bypass-disclaimer", frg::fixtures::TRUST_ECHO_THEN_DISCLAIMER),
+            ("feature-announce-fullscreen", frg::fixtures::FEATURE_FULLSCREEN),
+        ] {
+            assert_eq!(
+                gate_sighting(&gates, screen).map(|h| h.id),
+                Some(id.to_string()),
+                "{id}: 진짜 관문을 못 잡으면 위 침묵은 아무것도 증명하지 않는다"
+            );
+        }
+    }
+
+    /// ★자기발화 차단 — 격상 문안이 **그 자신을 관문으로 만들지 않는다**.
+    ///
+    /// 문안은 master pane 에 렌더된다. 거기에 needle 이 실리면 스캔·주입 가드가 자기 자신을
+    /// 잡아 좌석이 조용히 막힌다(U-18 이 인증 처방 문안에서 겪은 형태와 동형). 그래서
+    /// **위젯 AND 를 요구하지 않는 느슨한 술어**(`needle_hit`)로 검사한다 — 실제 pane 에서는
+    /// 문안 주변에 어떤 위젯 문자가 함께 그려질지 알 수 없기 때문이다.
+    #[test]
+    fn gate_escalation_text_is_not_itself_a_gate() {
+        let gates = frg::builtin();
+        for g in &gates {
+            let hit = GateSighting {
+                id: g.id.clone(),
+                title: g.title.clone(),
+                human_only: g.passability == frg::Passability::HumanOnly,
+            };
+            let text = gate_escalation_text("surface:7", &hit);
+            assert!(
+                gate_sighting(&gates, &text).is_none(),
+                "{}: 격상 문안이 관문으로 재식별된다(자기발화)",
+                g.id
+            );
+            for other in &gates {
+                assert!(
+                    !cys::inject_guard::needle_hit(other, &text),
+                    "{}: 격상 문안에 {} 의 needle 이 실렸다 — pane 렌더 시 자기발화한다",
+                    g.id,
+                    other.id
+                );
+                for echo in &other.confirm_echo {
+                    assert!(
+                        !frg::flatten(&text).contains(&frg::flatten(echo)),
+                        "{}: 격상 문안에 확인 에코가 실렸다(2026-07-29 킬체인의 형태)",
+                        g.id
+                    );
+                }
+            }
+            // 문안은 **키 재료를 담지 않는다** — 데몬은 자동 응답하지 않는다.
+            for forbidden in ["Return", "Enter to confirm", "아래키", "down"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{}: 격상 문안이 키 조작을 지시한다({forbidden}) — 자동응답 금지 계약 위반",
+                    g.id
+                );
+            }
+        }
+        // 양성 대조군 — 같은 술어가 진짜 관문 화면에서는 참이다(술어 생존 증명).
+        let trust = gates.iter().find(|g| g.id == "folder-trust").unwrap();
+        assert!(cys::inject_guard::needle_hit(
+            trust,
+            frg::fixtures::FOLDER_TRUST
+        ));
+    }
+
+    /// 봉투 계층 — **디스크 우선 · 부재 시에만 vendor 임베드**(`fill_missing_fields` 동형).
+    #[test]
+    fn gate_envelope_prefers_disk_then_embed() {
+        let key = frg::ADAPTER_KEY;
+        let embed = serde_json::json!({ "claude": { key: {"source": "builtin", "gates": []} } });
+
+        // ① 디스크에 키가 있으면 디스크가 이긴다.
+        let disk = serde_json::json!({ "claude": { key: {"source": "replace", "gates": []} } });
+        assert_eq!(
+            gate_envelope(&disk, &embed, "claude")
+                .and_then(|v| v.get("source"))
+                .and_then(|v| v.as_str()),
+            Some("replace"),
+            "사용자 주권 — 디스크 선언이 vendor 를 이긴다"
+        );
+        // ② 명시 null 도 '디스크 선언' 이다(의도적으로 비움 → 코드 정본만).
+        let disk_null = serde_json::json!({ "claude": { key: serde_json::Value::Null } });
+        assert_eq!(
+            gate_envelope(&disk_null, &embed, "claude"),
+            Some(&serde_json::Value::Null),
+            "명시 null 을 임베드로 덮으면 사용자 주권이 깨진다"
+        );
+        // ③ 키가 **아예 없을 때만** 임베드가 채운다(기존 설치 기계 도달 경로 K-1).
+        let disk_missing = serde_json::json!({ "claude": { "cmd": "claude" } });
+        assert_eq!(
+            gate_envelope(&disk_missing, &embed, "claude")
+                .and_then(|v| v.get("source"))
+                .and_then(|v| v.as_str()),
+            Some("builtin"),
+            "키 부재 시 vendor 봉투가 도달해야 한다"
+        );
+        // ④ 어느 쪽에도 없으면 None = 코드 정본만.
+        assert_eq!(gate_envelope(&disk_missing, &embed, "codex"), None);
+
+        // ⑤ ★적용 대상 한정 — 봉투를 선언하지 않은 어댑터는 스캔 대상이 아니다.
+        //    코드 정본 코퍼스는 claude 실측이므로(`MEASURED_ON` 도 claude 버전), 어댑터 구분
+        //    없이 들이대면 남의 화면을 남의 관문으로 격상한다. 실제 출하 팩으로 재확인한다.
+        let pack: serde_json::Value = serde_json::from_str(
+            cys::pack::PACK_ALL
+                .iter()
+                .find(|(r, _)| *r == "agents.json")
+                .map(|(_, c)| *c)
+                .expect("임베드 agents.json"),
+        )
+        .expect("임베드 agents.json 파싱");
+        let empty = serde_json::json!({});
+        assert!(
+            gate_envelope(&empty, &pack, "claude").is_some(),
+            "claude 는 선언돼 있어야 한다 — 아니면 아래 침묵이 아무것도 증명하지 않는다"
+        );
+        for other in ["codex", "gemini", "grok"] {
+            assert_eq!(
+                gate_envelope(&empty, &pack, other),
+                None,
+                "{other}: 미선언 어댑터가 claude 실측 코퍼스의 적용 대상이 됐다"
+            );
+        }
+    }
+
+    /// ★캐시 무효화 규칙 — 키가 `resolve_with` 의 **입력 전량**이라 히트는 재해소와 등가다.
+    /// 봉투가 바뀌면 즉시 재해소하고(= mtime 추정으로 놓치는 창이 없다), 관측되지 않은 키는
+    /// pass 끝에서 솎인다.
+    #[test]
+    fn scan_caches_are_keyed_by_full_input_and_pruned() {
+        let mut c = ScanCaches::default();
+
+        // ── 정규식 선컴파일 캐시 ────────────────────────────────────────────
+        assert!(c.approval_regex("Do you want to (proceed|allow)").is_some());
+        assert!(
+            c.approval_regex("(((").is_none(),
+            "손상 패턴은 None — 종전과 같이 건너뛴다"
+        );
+        assert_eq!(c.approval_re.len(), 2, "실패도 캐시해 매 pass 재컴파일 안 한다");
+
+        // ── 관문 코퍼스 캐시 ────────────────────────────────────────────────
+        let base = c.corpus("claude", None, true);
+        let again = c.corpus("claude", None, true);
+        assert!(
+            std::sync::Arc::ptr_eq(&base, &again),
+            "같은 입력인데 재해소했다 — 틱마다 코퍼스를 다시 만들면 캐시가 무의미하다"
+        );
+
+        // 봉투가 바뀌면 재해소(다른 Arc). replace 봉투로 코퍼스를 통째 교체해 산출도 확인.
+        let env = serde_json::json!({
+            "source": "replace",
+            "measured_on": frg::MEASURED_ON,
+            "gates": [{
+                "id": "synthetic-gate",
+                "title": "합성 관문",
+                "needles": ["Synthetic gate question line"],
+                "widget": ["Synthetic option A", "Synthetic option B"],
+                "passability": "human_only",
+                "human_reason": "합성"
+            }]
+        });
+        let replaced = c.corpus("claude", Some(&env), true);
+        assert!(
+            !std::sync::Arc::ptr_eq(&base, &replaced),
+            "봉투가 바뀌었는데 캐시가 stale 을 돌려줬다"
+        );
+        assert_eq!(
+            replaced.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            vec!["synthetic-gate"],
+            "봉투 소비가 실제로 일어나야 한다(양성 대조군)"
+        );
+        // 롤백 스위치(override off)가 바뀌면 역시 재해소 — 코드 정본으로 되돌아온다.
+        let off = c.corpus("claude", Some(&env), false);
+        assert!(
+            off.iter().any(|g| g.id == "folder-trust"),
+            "override 를 끄면 코드 정본이어야 한다"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&replaced, &off));
+
+        // ── pass 끝 정리 ────────────────────────────────────────────────────
+        c.gate_debounce.insert((7, "folder-trust".into()), 1.0);
+        c.gate_escalations.insert(7, GateSeatState::default());
+        c.prune_pass(
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(c.approval_re.is_empty() && c.gate_corpus.is_empty(), "미관측 키 누수");
+        assert_eq!(c.gate_debounce.len(), 1, "좌석 키는 pass 정리 소관이 아니다");
+
+        // ── 좌석 정리(watchdog 누수 차단 블록) ──────────────────────────────
+        c.prune_surfaces(&std::collections::HashSet::new());
+        assert!(c.gate_debounce.is_empty() && c.gate_escalations.is_empty());
+    }
+
+    /// ★오염 차단 핀 — 관문 코퍼스가 `approval_patterns` 로 **흘러들지 않는다**.
+    ///
+    /// approval 키에는 자동응답 계약(CLI 폴더신뢰 자동확인)이 붙어 있다. 거기에 관문 문면이
+    /// 섞이면 면책 창에 Return 이 가는 킬체인이 되살아난다(2026-07-29). 그래서 겹침은
+    /// **문서화된 1건**(`trust-prompt` = folder-trust 의 구 문면 하위호환)만 허용한다.
+    ///
+    /// ★핀을 지우지 않고 이사시킨다: 면제는 상수로 선언하고, 그 면제가 **실재하지 않으면**
+    /// 그것도 적색이다(면제표가 쓰레기통이 되는 것을 막는다 — `NEEDLE_EXEMPTIONS` 와 같은 규율).
+    #[test]
+    fn approval_patterns_union_excludes_first_run_gate_corpus() {
+        /// (approval 패턴 이름, 겹치는 관문 id, 근거) — 이 표 밖의 겹침은 전부 적색.
+        const ALLOWED_OVERLAP: &[(&str, &str, &str)] = &[(
+            "trust-prompt",
+            "folder-trust",
+            "U-15 폴더신뢰 자동확인의 감지 문면. 이 1건만 자동응답 계약을 갖는다.",
+        )];
+
+        let embed: serde_json::Value = serde_json::from_str(
+            cys::pack::PACK_ALL
+                .iter()
+                .find(|(r, _)| *r == "agents.json")
+                .map(|(_, c)| *c)
+                .expect("임베드 agents.json"),
+        )
+        .expect("임베드 agents.json 파싱");
+        let disk = serde_json::json!({});
+        let gates = frg::builtin();
+
+        let violations = |patterns: &[serde_json::Value]| -> Vec<String> {
+            let mut out = Vec::new();
+            for p in patterns {
+                let (Some(name), Some(pat)) = (p["name"].as_str(), p["pattern"].as_str()) else {
+                    continue;
+                };
+                let flat = frg::flatten(pat);
+                for g in &gates {
+                    for n in &g.needles {
+                        if !flat.contains(&frg::flatten(n)) {
+                            continue;
+                        }
+                        if ALLOWED_OVERLAP
+                            .iter()
+                            .any(|(an, ag, _)| *an == name && *ag == g.id)
+                        {
+                            continue;
+                        }
+                        out.push(format!("approval_patterns[{name}] ⊃ gate[{}] needle", g.id));
+                    }
+                }
+            }
+            out
+        };
+
+        for agent in ["claude", "gemini", "codex", "grok"] {
+            let merged = merged_approval_patterns(&disk, &embed, agent);
+            assert!(
+                violations(&merged).is_empty(),
+                "{agent}: 관문 문면이 approval 키로 흘러들었다 — {:?}",
+                violations(&merged)
+            );
+        }
+        // 문서화된 겹침은 **실재해야** 한다(면제가 유령이면 표가 썩는다).
+        let claude = merged_approval_patterns(&disk, &embed, "claude");
+        for (name, gid, _) in ALLOWED_OVERLAP {
+            let p = claude
+                .iter()
+                .find(|p| p["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("면제 {name} 이 approval_patterns 에 없다"));
+            let flat = frg::flatten(p["pattern"].as_str().unwrap_or(""));
+            let g = gates.iter().find(|g| g.id == *gid).expect("면제 관문 id");
+            assert!(
+                g.needles.iter().any(|n| flat.contains(&frg::flatten(n))),
+                "면제 {name}↔{gid} 겹침이 사라졌다 — 면제를 지우거나 근거를 갱신하라"
+            );
+        }
+        // ★양성 대조군 — 오염된 합성 팩은 반드시 적색이어야 한다(탐지기 생존 증명).
+        let contaminated = serde_json::json!({ "claude": { "approval_patterns": [
+            {"name": "gate-theme", "pattern": "Choose the text style that looks best with your terminal"}
+        ]}});
+        let merged = merged_approval_patterns(&contaminated, &embed, "claude");
+        assert!(
+            !violations(&merged).is_empty(),
+            "탐지기가 고장났다 — 관문 needle 을 approval 키에 넣었는데도 초록이다"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★결함 4 — 격상 천장은 **폭주 방지**이지 **신호 삭제**가 아니다
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// ★두 축의 분리 진리표: 천장은 **발행만** 닫고 **관측은 닫지 않는다**.
+    ///
+    /// 나머지 축(롤백·미선언·각성 ack·생애 창·시계 사고)은 관측까지 닫는다 — 그 좌석은
+    /// 화면을 더 보지 않으므로 배지를 살려 두면 영구 pending 이 된다. 이 비대칭이 요점이다.
+    #[test]
+    fn escalation_ceiling_closes_publishing_but_not_observation() {
+        let at_ceiling = GateScanWindow {
+            escalations: GATE_SCAN_MAX_ESCALATIONS,
+            ..open_window()
+        };
+        assert!(
+            !gate_scan_open(&at_ceiling),
+            "천장에 닿았는데 발행이 열려 있다 — 천장이 사문이면 master 각성 폭주가 돌아온다"
+        );
+        assert!(
+            gate_scan_observe_open(&at_ceiling),
+            "천장이 관측까지 닫았다 — 관문이 화면에 떠 있어도 배지가 종결돼 운영자의 \
+             유일한 신호가 사라진다(결함 4)"
+        );
+        // 천장을 훌쩍 넘긴 값에서도 같다(카운터는 단조 증가라 넘어설 수 있다).
+        assert!(gate_scan_observe_open(&GateScanWindow {
+            escalations: GATE_SCAN_MAX_ESCALATIONS + 7,
+            ..open_window()
+        }));
+        // 나머지 축은 **관측까지** 닫는다 — 그래야 배지 생명주기가 끝난다.
+        let closes_observation: [(&str, GateScanWindow); 5] = [
+            ("롤백 스위치", GateScanWindow { enabled: false, ..open_window() }),
+            ("봉투 미선언 어댑터", GateScanWindow { declared: false, ..open_window() }),
+            ("첫 각성 ack 이후", GateScanWindow { awakened: true, ..open_window() }),
+            (
+                "생애 창 초과",
+                GateScanWindow { age_secs: GATE_SCAN_WINDOW_SECS + 0.001, ..open_window() },
+            ),
+            ("나이 NaN(시계 사고)", GateScanWindow { age_secs: f64::NAN, ..open_window() }),
+        ];
+        for (why, w) in closes_observation {
+            assert!(!gate_scan_observe_open(&w), "{why}: 관측이 닫혀야 한다");
+            assert!(!gate_scan_open(&w), "{why}: 발행도 함께 닫혀야 한다");
+        }
+        // 기준 상태는 둘 다 열려 있다(양성 대조군 — 술어가 통째로 false 면 위가 다 무의미).
+        assert!(gate_scan_open(&open_window()) && gate_scan_observe_open(&open_window()));
+    }
+
+    /// ★천장 뒤의 스캐너 행동 — **배지는 유지 · 발행은 0 · 관문이 사라지면 종결**.
+    ///
+    /// 세 축을 한 검체에서 함께 본다. 하나라도 빠지면 수리가 다른 결함으로 바뀐다:
+    ///   ⓐ 배지 유지만 하고 발행을 막지 않으면 → **천장 사문**(폭주 재개).
+    ///   ⓑ 발행만 막고 배지를 종결하면 → 원래 결함 그대로.
+    ///   ⓒ 관문이 사라져도 종결하지 않으면 → 영구 pending(배지 오염).
+    #[test]
+    fn ceiling_keeps_the_badge_and_publishes_nothing_until_the_gate_is_gone() {
+        let (daemon, s) = force_deliver_rig("gate-ceiling", None);
+        let sid = s.id;
+        let gate_screen = frg::fixtures::FOLDER_TRUST;
+        let at_ceiling = GateSeatState {
+            count: GATE_SCAN_MAX_ESCALATIONS,
+            cleaned: false,
+        };
+        let mut caches = ScanCaches::default();
+
+        // ⓐ 천장 · 관문이 화면에 실재 · pending 배지 **없음** → 새 발행 0(천장은 천장이다).
+        let before = daemon.bus.latest_seq();
+        scan_first_run_gate(
+            &GateScanCtx {
+                daemon: &daemon,
+                surface: &s,
+                agent: "claude",
+                screen: gate_screen,
+                envelope: None,
+                override_on: false,
+                may_escalate: false,
+                now: 1000.0,
+            },
+            at_ceiling,
+            &mut caches,
+        );
+        assert!(
+            pending_gate_items(&daemon, sid).is_empty(),
+            "천장 뒤에 새 배지를 발행했다 — 천장이 사문이 되면 master 각성 폭주가 돌아온다"
+        );
+        assert_eq!(
+            daemon.bus.latest_seq(),
+            before,
+            "천장 뒤에 이벤트를 발행했다(폭주 재개)"
+        );
+
+        // ⓑ 이미 떠 있는 배지는 **유지**된다 — 운영자의 유일한 신호다.
+        daemon.push_feed_notification(GATE_FEED_KIND, "관문 감지", "body", Some(sid));
+        scan_first_run_gate(
+            &GateScanCtx {
+                daemon: &daemon,
+                surface: &s,
+                agent: "claude",
+                screen: gate_screen,
+                envelope: None,
+                override_on: false,
+                may_escalate: false,
+                now: 2000.0,
+            },
+            at_ceiling,
+            &mut caches,
+        );
+        assert_eq!(
+            pending_gate_items(&daemon, sid).len(),
+            1,
+            "관문이 화면에 떠 있는데 배지를 종결했다 — 운영자의 유일한 신호가 사라진다(결함 4)"
+        );
+
+        // ⓒ 관문이 화면에서 사라지면 같은 경로로 **종결**된다(생명주기는 계속 돈다).
+        scan_first_run_gate(
+            &GateScanCtx {
+                daemon: &daemon,
+                surface: &s,
+                agent: "claude",
+                screen: "worker@mac cys-terminal-rel % \n",
+                envelope: None,
+                override_on: false,
+                may_escalate: false,
+                now: 3000.0,
+            },
+            at_ceiling,
+            &mut caches,
+        );
+        assert!(
+            pending_gate_items(&daemon, sid).is_empty(),
+            "관문이 사라졌는데 배지가 남았다 — 배지 영구 오염(수리가 다른 결함이 됐다)"
+        );
+    }
+
+    /// ★배선 핀 — 배지 종결은 **관측** 술어가, 발행은 **천장** 술어가 지배한다.
+    ///
+    /// 순수 술어만 갈라 두고 호출부가 여전히 한 축을 쓰면 위 검체는 전부 무의미해진다.
+    #[test]
+    fn badge_lifecycle_is_wired_to_observation_not_to_the_ceiling() {
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let at = prod.find("fn check_approvals").expect("check_approvals 소실");
+        let body = &prod[at..];
+        let close_at = body
+            .find("gate-window-closed")
+            .expect("창 닫힘 종결 사유 문자열 소실");
+        let guard = body[..close_at]
+            .rfind("if !observe_open && seat.count > 0")
+            .expect("배지 종결이 관측 술어로 가드되지 않는다 — 천장이 다시 신호를 지운다");
+        assert!(guard < close_at);
+        assert!(
+            body[..close_at].contains("let observe_open = gate_scan_observe_open(")
+                && body[..close_at].contains("let may_escalate = gate_scan_open("),
+            "두 축이 각자의 술어에서 오지 않는다(한 축으로 되돌아갔다)"
+        );
+        assert!(
+            body.contains("may_escalate,"),
+            "천장 값이 스캐너로 전달되지 않는다 — 천장 뒤에도 발행이 계속된다(폭주 재개)"
+        );
+        let scan_at = prod.find("fn scan_first_run_gate").expect("스캐너 본체 소실");
+        let scan_body = &prod[scan_at..];
+        let gone = scan_body.find("stale-cleared").expect("관문 소실 종결 경로 소실");
+        let ceiling = scan_body
+            .find("if !cx.may_escalate")
+            .expect("스캐너가 천장을 집행하지 않는다");
+        assert!(
+            gone < ceiling,
+            "천장 검사가 '관문이 사라졌다' 종결보다 앞이면, 천장 뒤 좌석의 배지가 영원히 남는다"
+        );
+    }
+
+    /// feed 네임스페이스 분리 — 두 스캐너의 생명주기가 서로를 종결시키지 않는다.
+    #[test]
+    fn gate_feed_kind_is_isolated_from_approval_namespace() {
+        let dir = std::env::temp_dir().join(format!("cys_gate_feed_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = std::sync::Arc::new(crate::state::Daemon::new(dir.join("cysd.sock")));
+
+        daemon.push_feed_notification(GATE_FEED_KIND, "관문 감지 (surface:7)", "body", Some(7));
+        assert_eq!(pending_gate_items(&daemon, 7).len(), 1, "관문 항목 pending");
+        assert!(
+            !daemon.has_pending_daemon_approval(7),
+            "관문 항목이 approval 코얼레싱을 삼키면 승인 감지가 조용히 죽는다(워커 hang)"
+        );
+        assert!(
+            daemon.pending_daemon_approvals(7).is_empty(),
+            "approval stale-clear 가 관문 항목을 종결시키면 진단이 사라진다"
+        );
+
+        daemon.push_feed_notification("approval", "승인 대기 (surface:7)", "body", Some(7));
+        assert!(daemon.has_pending_daemon_approval(7));
+        assert_eq!(
+            pending_gate_items(&daemon, 7).len(),
+            1,
+            "approval 항목이 관문 스냅샷에 섞이면 안 된다"
+        );
+        assert!(pending_gate_items(&daemon, 8).is_empty(), "타 surface 독립");
+
+        let ids = pending_gate_items(&daemon, 7);
+        assert!(daemon.resolve_feed_item(&ids[0], "stale-cleared").is_some());
+        assert!(pending_gate_items(&daemon, 7).is_empty());
+        assert!(
+            daemon.has_pending_daemon_approval(7),
+            "관문 항목 종결이 approval 항목까지 끌고 가면 안 된다"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -236,20 +236,13 @@ pub fn note_rate(
 /// ② analytics 마지막 스냅샷(7d)으로 rate 예열(source:"snapshot"·stale 표시),
 /// ③ ~/.cys/accounts.json 선언 계정 등록(미래 provider — adapter:"none"은 '관측 없음' 상주).
 pub fn seed_known(daemon: &Arc<Daemon>) {
-    let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        for e in std::fs::read_dir(&home).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name == ".claude" || name.starts_with(".claude-") {
-                dirs_to_check.push(e.path());
-            }
-        }
-        for e in std::fs::read_dir(home.join(".cys")).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name == "claude" || name.starts_with("claude-") {
-                dirs_to_check.push(e.path());
-            }
-        }
+        // ★(U-17) 프로필 dir 열거 규칙은 **lib 정본 하나**다(`cys::profile_gate`). 종전엔 이
+        //   함수 안에만 있었고, 인증 판정기가 같은 규칙을 재구현하면 두 벌이 갈린다(한쪽만
+        //   새 부서 접두를 배우는 식) — 같은 목록을 두 소비처가 보게 한다.
+        //   ★판정은 바뀌지 않는다: 정본 함수는 종전 두 루프와 **같은 이름 규칙·같은 순서**이며
+        //   `is_dir()` 검사도 더하지 않는다(동작 동일성 유지 — 완화도 강화도 아니다).
+        let dirs_to_check: Vec<PathBuf> = cys::profile_gate::enumerate_profile_dirs(&home);
         {
             let mut st = daemon.accounts.lock().unwrap();
             for dir in dirs_to_check {

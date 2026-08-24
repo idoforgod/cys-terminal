@@ -43,6 +43,10 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
   ★2는 preflight가 아니다 — ①preflight는 비치명(FAIL이어도 경고 강등·계속)이라 전용 exit가
     없다. 구 헤더의 '2=preflight'는 낡은 계약이었다(G31).
 안전밸브: CYS_BOOT_GATE=warn(assert-ready 실패를 경고로 강등)|off(게이트 무력).
+        CYS_BOOT_LANE_LEGACY=1(U-24 이관 롤백 — 레인 경로 규약을 `javis_lane` 대신 이 파일의
+        레거시 인라인 정의로 되돌린다. 기본값은 정본 소비이며 두 경로의 동치는 검체 H-LANE-1 이
+        전수 대조한다. **판정 축이 아니므로 `CYS_BOOT_GATES` 마스터에 접지 않는다** — 게이트를
+        끄는 사람이 의도하지 않은 경로 변경을 함께 겪으면 안 된다).
 
 ★종료 채널 계약(T-0147-7 W1b · A7 · 재감사 §3 CS-2① — 비평2 C-2 반영):
   · completed / solo_awakening → **stdout 최종 JSON**(배포된 산문 계약 "완료 선언은 이 스크립트의
@@ -119,6 +123,29 @@ try:
     import javis_lock as _lock
 except Exception:  # 팩 스큐·부서 팩 결손 — 지혈이 새 크래시 지점이 되면 안 된다
     _lock = None
+
+# ★U-24 이관 1단: **레인 경로 규약의 소유자를 `javis_lane` 로 옮긴다.** 이 파일은 재수출만 한다.
+#   왜 먼저인가: ③claim·싱글플라이트 집행이 데몬 감독자로 이관되며 이 파일 본문이 얇아지는데,
+#   그 리팩터에 **경로 규약이 딸려 흔들리면** 소비자 6곳(javis_mission·훅 lane-path·디렉티브
+#   2벌·preflight CONTENT_PINS·delivery.rs 파리티)이 조용히 갈린다. 축을 먼저 분리한다.
+#
+# ★롤백 스위치(env 1지점 · 기본값=신 경로): `CYS_BOOT_LANE_LEGACY=1` 이면 이 파일의 **레거시
+#   인라인 정의**로 즉시 되돌아간다(이관은 1릴리스 병존). 두 경로의 동치는 검체 `H-LANE-1` 이
+#   매트릭스로 대조하므로 스위치를 넘겨도 경로가 갈리지 않는다.
+#   ★왜 `CYS_BOOT_GATES` 마스터에 접지 않는가: 저 마스터는 **판정 축**(관문 보류·주입 가드·
+#     신뢰 등급 — `src/lib.rs gate_axes_from`)의 합류점이고, 이것은 판정이 아니라 **같은 값을
+#     내는 구현의 출처**다. 사고 순간에 게이트를 끄면 레인 경로까지 함께 바뀌는 결합은
+#     '노브 조합 불가' 원칙의 반대편 함정이다 — 끄는 사람이 의도하지 않은 축이 따라 움직인다.
+# ★import 실패는 부트를 죽이지 않는다 — 배포된 구 팩·부서 팩에 이 모듈이 아직 없을 수 있다
+#   (`build.rs` 는 **git 추적 파일만** 임베드한다 · 검체 `H-PACK-TRACK-1` 이 그 조건을 감시).
+_LANE_SOURCE = "javis_lane"
+try:
+    if os.environ.get("CYS_BOOT_LANE_LEGACY") == "1":
+        raise ImportError("CYS_BOOT_LANE_LEGACY=1 — 이관 롤백(레거시 인라인 경로 강제)")
+    import javis_lane as _lane_mod
+except Exception as _lane_e:      # 팩 스큐·부서 팩 결손·명시 롤백
+    _lane_mod = None
+    _LANE_SOURCE = "legacy-inline(%s: %s)" % (type(_lane_e).__name__, _lane_e)
 
 # ★R3(D-IMPL-3): Windows 파이프 환경(cp949/cp1252)에서 한글 출력 UnicodeEncodeError 크래시 방어 —
 # PYTHONUTF8 export는 cys-dept 경로에만 있어 이 스크립트의 직접 실행을 보호하지 못한다.
@@ -226,7 +253,16 @@ CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S",
 #   수정 금지 계약 — 키가 그쪽에 있으면 자동으로 그쪽이 이긴다).
 # env 오버라이드(CYS_BOOT_PING_*)는 CHECK_* 와 동일 규약 — 테스트 하네스 전용(budget 의
 # CYS_BUDGET_* 는 하한 clamp 라 축소 불가·하네스가 창을 줄일 유일 경로가 이것이다).
-PING_TIMEOUT_S = float(_budget_leaf("CYS_PING_TIMEOUT_S", 15))
+# ★U-24 개명: `PING_TIMEOUT_S` → `DAEMON_PROBE_TIMEOUT_S`. ②만 쓰던 이름이 아니다 —
+#   ⑤check 의 **exit 2 재확인 경로**(`daemon_gone` / '팩 결손 가능성' 실측 분리)가 같은 값을
+#   소비한다. ②의 재시도 루프가 감독자로 이관되어도 ⑤의 재확인은 이 파일에 남으므로, 이름이
+#   '②ping 전용'으로 읽히면 이관 시 **함께 지워지는** 사고가 난다(그 순간 ⑤는 무상한 ping 을
+#   돌리거나 임의 하드코딩으로 갈린다 = 치명 앵커 ① 폭주/③ 자가치유 봉쇄).
+#   ∴ 이름을 소비 지점 전체를 덮는 '데몬 탐침 상한'으로 승격한다. **값·leaf 키는 무변경**
+#   (`CYS_PING_TIMEOUT_S` 는 javis_budget 소유 · 이 티켓의 수정 대상이 아니다).
+DAEMON_PROBE_TIMEOUT_S = float(_budget_leaf("CYS_PING_TIMEOUT_S", 15))
+# 하위호환 별칭(구 이름 소비자 대비 · 값 동일). 신규 코드는 `DAEMON_PROBE_TIMEOUT_S` 를 쓴다.
+PING_TIMEOUT_S = DAEMON_PROBE_TIMEOUT_S
 PING_RETRY_TOTAL_S = max(0.0, float(os.environ.get(
     "CYS_BOOT_PING_RETRY_TOTAL_S", str(_budget_leaf("CYS_PING_RETRY_TOTAL_S", 45)))))
 # 간격 하한 0.05: 벽시계 창 + 0 간격은 fail-fast 데몬 부재에서 서브프로세스 스폰 폭주가 된다
@@ -416,8 +452,12 @@ def _run_split(cmd, timeout=120):
         return 124, "", "timeout(%ss): %s" % (timeout, " ".join(cmd))
 
 
-def _socket_is_base(sock):
-    """순수 판정: 소켓 경로 문자열 → base 여부(§4.1 소켓 격리). CYS_SOCKET 미설정('')=base.
+def _legacy_socket_is_base(sock):
+    """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.socket_is_base`) — 이 파일에 `javis_lane`
+    이 없는 팩(구 배포·부서 팩 스큐)이나 `CYS_BOOT_LANE_LEGACY=1` 롤백에서만 소비된다.
+    정본과의 동치는 검체 `H-LANE-1` 이 매트릭스로 대조한다(사본 드리프트 차단).
+
+    순수 판정: 소켓 경로 문자열 → base 여부(§4.1 소켓 격리). CYS_SOCKET 미설정('')=base.
     ★보수성(아키텍트 성찰): base = (미설정) 또는 (basename이 cys/cys.sock **AND** cys-dept- 성분
     없음). 커스텀 소켓(/tmp/whatever.sock)은 구코드처럼 **비-base·비-dept**다 — base 마커 무접촉·
     issue-ticket 불허·티켓 게이트 비적용(구동작 보존). "cys-dept- 성분 없으면 전부 base"는 미지
@@ -438,13 +478,18 @@ def _socket_is_base(sock):
     return os.path.basename(norm) in ("cys", "cys.sock")
 
 
+# 재수출(정본=`javis_lane`) — 이름은 불변이고 소비자(자기 `--self-test`·검체·훅)는 무개정이다.
+_socket_is_base = _lane_mod.socket_is_base if _lane_mod is not None else _legacy_socket_is_base
+
+
 def _is_base_socket():
     """CYS_SOCKET env 래퍼(호출부 하위호환)."""
     return _socket_is_base(os.environ.get("CYS_SOCKET", ""))
 
 
-def _sanitize_sock_key(sock):
-    """소켓 전체 경로 → 파일명 안전 락 키(레인마다 유일). 부서 소켓은 basename(cys.sock)이 동일해
+def _legacy_sanitize_sock_key(sock):
+    """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.sanitize_sock_key`).
+    소켓 전체 경로 → 파일명 안전 락 키(레인마다 유일). 부서 소켓은 basename(cys.sock)이 동일해
     basename 키를 쓰면 모든 레인이 같은 락 파일을 공유했다 — 전체 경로 새니타이즈로 레인 유일화.
     경로 구분자(os.sep·'/'·'\\')·':'를 '_'로 치환. 파일명 길이 상한(255) 여유 — 과길면 앞부분+경로
     해시로 유일성 보존(절단만 하면 서로 다른 긴 경로가 같은 키로 충돌)."""
@@ -456,6 +501,10 @@ def _sanitize_sock_key(sock):
         import hashlib
         raw = raw[:120] + "-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return raw
+
+
+_sanitize_sock_key = (_lane_mod.sanitize_sock_key if _lane_mod is not None
+                      else _legacy_sanitize_sock_key)
 
 
 def _socket_dept(sock=None):
@@ -871,21 +920,35 @@ def _emit_skip_verdict():
     return EXIT_SKIPPED_INFLIGHT
 
 
-def _singleflight_key(sock):
-    """순수 판정: 소켓 → 싱글플라이트 락 키(R1-LOW-4). base 레인은 env 미설정·base 경로 명시
+def _legacy_singleflight_key(sock):
+    """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.singleflight_key`).
+    순수 판정: 소켓 → 싱글플라이트 락 키(R1-LOW-4). base 레인은 env 미설정·base 경로 명시
     어느 쪽이든 단일 'base' 키로 정규화한다 — 같은 base 데몬에 서로 다른 락을 주던 선재결함 교정.
-    비-base(부서·커스텀)는 전체 경로 새니타이즈로 레인마다 유일."""
-    return "base" if _socket_is_base(sock) else _sanitize_sock_key(sock)
+    비-base(부서·커스텀)는 전체 경로 새니타이즈로 레인마다 유일.
+    ★레거시 체인은 **레거시 위에서 닫힌다**(재수출된 이름을 부르지 않는다): 정본이 있는 트리에서
+      폴백이 정본 조각을 빌려 쓰면 검체 `H-LANE-1` 의 파리티가 '같은 코드끼리 비교'가 되어
+      동치 증명이 공허해진다. 소켓 판정·키 새니타이즈까지 레거시 것을 명시 호출한다."""
+    return ("base" if _legacy_socket_is_base(sock)
+            else _legacy_sanitize_sock_key(sock))
 
 
-def lane_key(sock=None):
-    """이 부트가 속한 **레인 키** — 'base' 또는 소켓 경로 새니타이즈 값(레인마다 유일).
+def _legacy_lane_key(sock=None):
+    """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.lane_key`).
+    이 부트가 속한 **레인 키** — 'base' 또는 소켓 경로 새니타이즈 값(레인마다 유일).
     락 키와 동일 규약을 쓴다(`_singleflight_key`) — 락은 레인별인데 상태 파일은 공유였던
     비대칭(G15·R3)을 없애려면 두 네임스페이스가 **같은 키 함수**를 써야 한다."""
-    return _singleflight_key(os.environ.get("CYS_SOCKET", "") if sock is None else sock)
+    return _legacy_singleflight_key(
+        os.environ.get("CYS_SOCKET", "") if sock is None else sock)
+
+
+_singleflight_key = (_lane_mod.singleflight_key if _lane_mod is not None
+                     else _legacy_singleflight_key)
+lane_key = _lane_mod.lane_key if _lane_mod is not None else _legacy_lane_key
 
 
 # 레인 스코프 상태의 **경로 규약 단일 소유자**(G15 · P3-A-DEPT-LANE · CS-7②).
+# ★U-24: 소유자가 `javis_lane` 로 이사했다. 아래 표·함수는 **레거시 폴백 전용 사본**이며
+#   실사용 바인딩은 이 절 끝의 재수출이 결정한다(정본 부재·명시 롤백에서만 아래가 산다).
 #
 # ★결함: 락은 레인별(bootstrap-<lane>.lock)인데 상태는 **전 레인 공유 단일 파일**이었다 —
 #   base 와 부서가 동시에 부트하면 서로의 boot-last.json 을 덮어 진단 SOT 가 소실됐고(G15),
@@ -901,7 +964,7 @@ def lane_key(sock=None):
 #   문자열을 넣으면 `CYS_STATE_DIR` 을 나중에 바꾼 격리 실행(self-test·테스트 하네스)에서
 #   경로가 실 HOME 으로 새어 나간다(2026-08-01 T1 밀폐 붕괴의 기제).
 _STATE = "\0state_dir"
-_LANE_STATE_KINDS = {
+_LEGACY_LANE_STATE_KINDS = {
     "marker": (CYS_DIR, ".master-bootstrapped", ""),
     "boot_last": (_STATE, "boot-last", ".json"),
     "skip": (_STATE, "boot-skip", ".json"),
@@ -924,27 +987,39 @@ _LANE_STATE_KINDS = {
 }
 
 # 항상 레인 접미가 붙는 종류(base 예외 없음) — 위 주석의 규약을 코드로 고정한다.
-_ALWAYS_LANE_SUFFIXED = ("skip", "lock", "delivery", "delivery_epoch")
+_LEGACY_ALWAYS_LANE_SUFFIXED = ("skip", "lock", "delivery", "delivery_epoch")
 
 
-def lane_state_path(kind, sock=None):
-    """레인 스코프 상태 파일 경로.
+def _legacy_lane_state_path(kind, sock=None):
+    """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.lane_state_path`).
+    레인 스코프 상태 파일 경로.
     kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch.
     base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
     비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
     ※ skip·lock·delivery* 는 **항상** 레인별이다 — 규약을 이 함수 하나로 모은다(사본 금지)."""
     try:
-        base_dir, stem, ext = _LANE_STATE_KINDS[kind]
+        base_dir, stem, ext = _LEGACY_LANE_STATE_KINDS[kind]
     except KeyError:
         raise ValueError("미지 레인 상태 종류: %r" % kind)
     if base_dir == _STATE:                       # 지연 해소(위 주석) — 호출 시점의 env 를 본다
         base_dir = state_dir()
-    key = lane_key(sock)
-    if kind in _ALWAYS_LANE_SUFFIXED:
+    key = _legacy_lane_key(sock)
+    if kind in _LEGACY_ALWAYS_LANE_SUFFIXED:
         return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))   # 항상 레인별(구 동작 보존)
     if key == "base":
         return os.path.join(base_dir, stem + ext)
     return os.path.join(base_dir, "%s-%s%s" % (stem, key, ext))
+
+
+# ── 재수출(U-24) — 이 세 이름이 **공개 계약**이다. 소비자는 무개정으로 계속 소비한다. ──
+#   `javis_mission.py`(import) · 훅 `lane-path`(cmd_lane_path) · 검체 `H-LIFE-1`(B.lane_state_path)
+#   · 이 파일 `--self-test`. 정본이 있으면 정본 객체 **그 자체**를 바인딩한다(사본 아님).
+_LANE_STATE_KINDS = (_lane_mod.LANE_STATE_KINDS if _lane_mod is not None
+                     else _LEGACY_LANE_STATE_KINDS)
+_ALWAYS_LANE_SUFFIXED = (_lane_mod.ALWAYS_LANE_SUFFIXED if _lane_mod is not None
+                         else _LEGACY_ALWAYS_LANE_SUFFIXED)
+lane_state_path = (_lane_mod.lane_state_path if _lane_mod is not None
+                   else _legacy_lane_state_path)
 
 
 def _singleflight_path():
@@ -2261,7 +2336,7 @@ def _cmd_run_chain(log):
     #   콜드스타트·Defender 첫 스캔 창의 첫 실패 하나로 선언 전체를 폐기했다. 벽시계 데드라인
     #   (PING_RETRY_TOTAL_S) 안에서 간격(PING_RETRY_INTERVAL_S) 재시도한다.
     #   ⓐ 진입 게이트 = 데드라인(잔여 창 < 간격이면 재진입 금지) · **진입한 시도는 자기 상한
-    #     (PING_TIMEOUT_S)을 다 쓴다** — javis_budget.ping_retry_worst_s() 가 계상하는
+    #     (DAEMON_PROBE_TIMEOUT_S)을 다 쓴다** — javis_budget.ping_retry_worst_s() 가 계상하는
     #     'TOTAL + 마지막 시도 granularity' 유계화 패턴과 1:1(계상=실최악 · 역전 0).
     #   ⓑ 하트비트는 벽시계 스로틀(HEARTBEAT_INTERVAL_S) — 시도당 발화는 fail-fast(즉시 거절)
     #     에서 최대 ~15줄 소음이 된다(간격 3s × 창 45s). 침묵 창 상쇄와 폭주 방지의 균형.
@@ -2274,7 +2349,7 @@ def _cmd_run_chain(log):
     ping_attempts = 0
     while True:
         ping_attempts += 1
-        code, out = _run(["cys", "ping"], timeout=PING_TIMEOUT_S)
+        code, out = _run(["cys", "ping"], timeout=DAEMON_PROBE_TIMEOUT_S)
         # 첫 시도는 종전과 동일하게 무suffix(happy path 의 boot-last 형태 불변) — 재시도만 #N.
         log.step(STEP.PING, code, out,
                  suffix="" if ping_attempts == 1 else "#%d" % ping_attempts)
@@ -2567,7 +2642,7 @@ def _cmd_run_chain(log):
         #       상한**(unjudgeable_cap)을 둔다 — 상한 없이는 영구 팩 결손이 CHECK_RETRIES 전량
         #       (24회 × 회당 재확인 ping 최대 15s)을 태우며 헛돈다(같은 앵커 ③의 반대쪽 함정).
         if code == 2:
-            ping_rc, ping_out = _run(["cys", "ping"], timeout=PING_TIMEOUT_S)
+            ping_rc, ping_out = _run(["cys", "ping"], timeout=DAEMON_PROBE_TIMEOUT_S)
             if ping_rc != 0:
                 unjudgeable = "daemon_gone"
                 log.step(STEP.CHECK, ping_rc,
@@ -3216,6 +3291,10 @@ def cmd_lane_path(argv):
     if kind == "all":
         out = {k: lane_state_path(k) for k in sorted(_LANE_STATE_KINDS)}
         out.update({"lane": lane_key(), "base_marker": MARKER})   # dict | 는 3.9+ 전용 — 회피
+        # ★U-24 관측(침묵 폴백 차단): 이 레인이 **정본 `javis_lane`** 을 쓰는가, 아니면
+        #   레거시 인라인으로 접혔는가. 폴백은 값이 같아서 **아무 증상이 없다** — 그래서
+        #   설치본에 팩 파일이 빠졌는지를 사람이 알 방법이 이 한 줄뿐이다(경로는 불변).
+        out["lane_source"] = _LANE_SOURCE
         print(json.dumps(out, ensure_ascii=False))
         return 0
     try:
@@ -3255,6 +3334,20 @@ def detach_session(argv=None, emit=None):
        `os.getsid(0) == os.getpid()` 면 조용히 no-op 한다(이미 목적 달성 상태).
     ③ **플랫폼·실패 내성**: `os.setsid` 부재(Windows)·기타 OSError 는 no-op 로 강등한다.
        세션 분리는 **강건성 보강**이지 부트의 전제조건이 아니다 — 실패가 부트를 죽이면 안 된다.
+
+    ## ★U-24 이관 경계 — 이 플래그를 지우려면 **같은 커밋에서** 아래 두 주석을 함께 고쳐라
+    `--detach-session` 은 이 파일 안에서만 사는 인자가 아니다. 데몬의 **창작자 ACL 원장**
+    (`src/bin/cysd/state.rs` `Daemon::create_caller` · 판정은 `src/bin/cysd/handlers.rs`
+    `creator_matches`/`ACL_ROLE_CREATOR`)이 존재 근거로 **이 문자열을 인용**한다: "훅이
+    `setsid python3 javis_bootstrap.py --detach-session` 으로 부트를 백그라운드 발화하면 그
+    프로세스가 launchd 로 재부모화돼 `external` 등급이 되고, 부트가 **자기가 방금 만든 워커
+    좌석**에 지침을 넣는 것까지 ACL 에 걸린다"(2026-08-22 부트 실사고 결함8).
+    ∴ 여기서 인자를 지우면 저쪽 주석은 **유령 인용**이 되어, 다음 사람이 "근거가 사라졌으니
+    원장도 지워도 되겠다"고 읽는다 — 그 순간 워커 좌석 주입이 다시 `acl denied: external →
+    worker` 로 막히고 **전 pane 이 글자 0 으로 죽는다**(치명 앵커 ④).
+    ★이 결박은 검체 `H-DOC-10` 이 기계 대조한다(플래그와 인용의 동시 존재 ∨ 동시 부재).
+    ★U-24 에서 **제거하지 않은 이유**: 제거는 이 파일 밖 3곳(훅 발화부·state.rs·handlers.rs)의
+      동시 개정을 요구하는데 그 파일들은 이 작업 단위의 반경 밖이다. 반쪽 제거가 곧 위 사고다.
 
     반환: (분리됨 bool, 사유) — 사유는 stderr 진단에만 쓴다(stdout 계약 무오염).
     """

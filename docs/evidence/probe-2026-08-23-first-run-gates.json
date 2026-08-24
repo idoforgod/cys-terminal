@@ -1,0 +1,121 @@
+{
+ "schema": "cys-evidence/1",
+ "id": "probe-2026-08-23-first-run-gates",
+ "title": "첫기동 관문 6화면 — 실측 문면·기본 포커스·키 반응·종료코드",
+ "measured_on": "2026-08-23",
+ "tool": "PTY 하네스(pty_probe.py / seq_probe.py) — 계측 시점 경로: scratchpad/probe/ · 레포 이관은 U-3 소관(scripts/probe/)",
+ "platform": "macOS 25.5.0 (Darwin) · Claude Code 2.1.241(기동 배너 실측) · 격리 CLAUDE_CONFIG_DIR 전용",
+ "repro": "CLAUDE_CONFIG_DIR=\"$(mktemp -d)\" claude --dangerously-skip-permissions   # 파이프가 아닌 실제 터미널(PTY)에서 실행하고 화면을 그대로 읽는다",
+ "repro_notes": [
+  "측정 1 = `.claude.json` 이 없는 완전 신규 격리 프로필",
+  "측정 2 = 같은 프로필에 `hasCompletedOnboarding: true` 만 시드한 상태",
+  "로그인 화면에서 Return 을 누르면 **브라우저가 실제로 열린다**(부작용) — 재현 시 유의",
+  "살아있는 프로필(~/.claude*)·~/.cys/claude·cys 데몬 무접촉 조건에서 측정됐다"
+ ],
+ "provenance": "원측정 = 2026-08-23 master 레인(주인님 승인 하 실행) · 원본 기록 = scratchpad/wf1/PROBE_RESULTS.md §V-b. ★이 파일은 그 원측정의 **전사(轉寫)본**이다 — U-26 레인은 재측정하지 않았고, 화면 문면·기본 포커스·종료코드를 원본에서 그대로 옮겨 기계 판독 형태로 바꿨다. 생략부(`3~7. …` · OAuth URL 꼬리)는 원본이 생략한 그대로 둔다 — 보이지 않은 글자를 지어내지 않는 것이 이 디렉터리의 규율이다.",
+ "observations": [
+  {
+   "id": "B-1",
+   "fact": "면책 대화상자(bypass-disclaimer) 기본 포커스는 `1. No, exit` 이고 Return 한 발이 프로세스를 returncode 1 로 종료시킨다",
+   "evidence": "하네스 기록: 최종 생존=False rc=1 (측정 2 ③단계)",
+   "derived": false
+  },
+  {
+   "id": "B-2",
+   "fact": "통과에 필요한 키는 아래방향 1회 + Return 또는 숫자 `2` 이다. 세로 리스트이므로 `Left` 는 포커스를 움직이지 않는다",
+   "evidence": "화면이 `❯ 1. …` / `  2. …` 세로 번호 리스트 · 위젯줄 `Enter to confirm · Esc to cancel`",
+   "derived": false
+  },
+  {
+   "id": "B-3",
+   "fact": "폴더 신뢰 창(folder-trust) 기본 포커스는 `Yes, I trust this folder` 이라 Return 이 안전하게 통과시킨다",
+   "evidence": "측정 2 ①→② · 통과 후 화면에 확인 에코 `Yes, I trust this folder ✔` 가 남는다",
+   "derived": false
+  },
+  {
+   "id": "B-4",
+   "fact": "신규 프로필의 첫 관문은 면책이 아니라 온보딩 마법사(테마 → 로그인)다",
+   "evidence": "측정 1 ①② · `.claude.json` 부재 프로필",
+   "derived": false
+  },
+  {
+   "id": "B-5",
+   "fact": "온보딩·로그인·폴더신뢰·면책 화면 전부에 `❯` 가 있다 = agents.json 의 ready_marker 와 동일 문자",
+   "evidence": "측정 1·2 전 화면 캡처",
+   "derived": false
+  },
+  {
+   "id": "B-6",
+   "fact": "로그인 화면 Return → 브라우저가 열리고 OAuth 코드 입력 프롬프트에 갇힌다. 이후 Return 은 무한 재시도 루프이며 프로세스는 영원히 살아 있다(rc 없음)",
+   "evidence": "측정 1 ③→④ · `OAuth error: Invalid code… Press Enter to retry.` 반복",
+   "derived": false
+  }
+ ],
+ "screens": {
+  "theme-select": {
+   "text": "Welcome to Claude Code v2.1.241\nLet's get started.\n\nChoose the text style that looks best with your terminal\n  1. Auto (match terminal)\n❯ 2. Dark mode ✔\n  3~7. …\n",
+   "default_index": 2,
+   "options": [
+    "Auto (match terminal)",
+    "Dark mode ✔",
+    "3~7. …(원본 생략)"
+   ],
+   "on_confirm": "advance",
+   "exit_rc": null,
+   "capture": "측정 1 ①"
+  },
+  "login-select": {
+   "text": "Select login method:\n❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise\n  2. Anthropic Console account · API usage billing\n  3. 3rd-party platform …\n",
+   "default_index": 1,
+   "options": [
+    "Claude account with subscription · Pro, Max, Team, or Enterprise",
+    "Anthropic Console account · API usage billing",
+    "3rd-party platform …"
+   ],
+   "on_confirm": "advance-open-browser",
+   "exit_rc": null,
+   "capture": "측정 1 ②"
+  },
+  "oauth-code-prompt": {
+   "text": "Opening browser to sign in…\nBrowser didn't open? Use the url below to sign in (c to copy)\nhttps://claude.com/cai/oauth/authorize?...\nPaste code here if prompted >\n",
+   "default_index": null,
+   "options": [],
+   "on_confirm": "loop",
+   "loop_text": "OAuth error: Invalid code. Please make sure the full code was copied\nPress Enter to retry.\n",
+   "exit_rc": null,
+   "capture": "측정 1 ③→④"
+  },
+  "folder-trust": {
+   "text": "Accessing workspace: <cwd>\nQuick safety check: Is this a project you created or one you trust? …\n❯ 1. Yes, I trust this folder\n  2. No, exit\n\nEnter to confirm · Esc to cancel\n",
+   "default_index": 1,
+   "options": [
+    "Yes, I trust this folder",
+    "No, exit"
+   ],
+   "accept_index": 1,
+   "echo": "Yes, I trust this folder ✔\n",
+   "on_confirm": "advance",
+   "exit_rc": null,
+   "capture": "측정 2 ①→②"
+  },
+  "bypass-disclaimer": {
+   "text": "────────────────────\n WARNING: Claude Code running in Bypass Permissions mode\n In Bypass Permissions mode, Claude Code will not ask for your approval …\n❯ 1. No, exit\n  2. Yes, I accept\n\nEnter to confirm · Esc to cancel\n",
+   "default_index": 1,
+   "options": [
+    "No, exit",
+    "Yes, I accept"
+   ],
+   "accept_index": 2,
+   "reject_index": 1,
+   "on_confirm": "advance",
+   "exit_rc": 1,
+   "capture": "측정 2 ②→③"
+  }
+ },
+ "key_facts": {
+  "vertical_menu": true,
+  "left_right_move_focus": false,
+  "digit_selects_and_confirms": true,
+  "return_confirms_focus": true
+ }
+}

@@ -22,9 +22,22 @@ name: windows-health (H-WIN 실기)
 #   판독되므로 레인 간 사본이 애초에 없다. **이 잡이 나중에 `test_*.py` 를 직접 부르기 시작하면
 #   그때 SUBSET_LANES 에 등재하라**(그 시점부터는 드리프트 표면이 생긴다).
 
+# ★U-26 ①(2026-08-24 · 부트 결정론 캠페인): 종전 트리거는 `feat/**` push + 수동뿐이라
+#   **태그 릴리스(`v*`)에서 Windows 검체가 한 번도 돌지 않았다.** 릴리스 레인(release.yml)은
+#   같은 태그로 windows-latest 빌드를 돌리지만 그건 '컴파일·번들'이지 부트스트랩 계약 검증이
+#   아니다 — 즉 출하 시점의 Windows 검증은 0 이었다(§10 D-6 · CHANGESET C-10).
+#   ⚠ 비용 규율: 늘리는 것은 **태그 push 뿐**이다(`branches` 는 종전 그대로 `feat/**`).
+#     GitHub Actions 의 push 필터는 branches/tags 가 OR 이고, 태그 push 는 branches 필터에
+#     매칭되지 않으므로 일상 push 빈도는 하나도 늘지 않는다. 태그는 릴리스당 1회다.
+#   ⚠ 이 잡은 **release.yml 을 막지 않는다**(GH Actions 는 워크플로 간 needs 가 없다).
+#     같은 태그 SHA 의 체크로 나란히 뜨고, 공개 발행은 어차피 오너 승인(release-publish.yml)
+#     이라 발행 전에 사람이 적색을 본다. '자동 차단'이 필요해지면 release-publish 쪽에
+#     체크 조회를 다는 것이 다음 단계인데, 그건 발행을 막는 힘이라 별도 승인 사안이다.
+#   롤백: 아래 `tags:` 두 줄 삭제 = 종전 동작(파일 1곳·부작용 0).
 on:
   push:
     branches: ['feat/**']
+    tags: ['v*']
   workflow_dispatch: {}
 
 permissions:

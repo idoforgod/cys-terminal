@@ -1379,6 +1379,17 @@ pub struct Daemon {
     /// **영속하지 않는다**: 데몬이 재시작되면 창작자 프로세스도 함께 죽으므로 되살릴 의미가
     /// 없고, topology 스키마를 넓히면 조작 표면만 늘어난다. TTL 은 `CREATE_CALLER_TTL_SECS`
     /// 이며 만료분은 insert 시 lazy GC 한다(`create_owner` 와 동형).
+    ///
+    /// ★U-24 **인용 결박**: 위 근거는 팩 쪽 문자열
+    /// `cysjavis-pack/bin/javis_bootstrap.py` 의 `--detach-session` 을 인용한다. 그 인자가
+    /// 팩에서 사라지면 이 주석은 **유령 인용**이 되고, 다음 사람이 "근거가 없어졌으니 원장도
+    /// 지워도 된다"고 읽는 순간 워커 좌석 주입이 다시 `acl denied: external → worker` 로
+    /// 막힌다(= 전 pane 글자 0). 그래서 **원장의 존재 이유는 인자 이름이 아니라 재부모화라는
+    /// 사실 자체**임을 여기 명시한다 — `--detach-session` 은 그 사실을 만드는 **현재의 한
+    /// 경로**일 뿐이고, 훅이 `nohup`·`&`·`setsid` 중 무엇으로 바꿔 발화해도 재부모화는
+    /// 그대로 일어나므로 이 원장은 계속 필요하다.
+    /// 두 파일의 인용 정합(플래그와 근거 주석의 동시 존재 ∨ 동시 부재)은 팩 검체
+    /// `H-DOC-10`(`cysjavis-pack/bin/tests/run_bootstrap_health.py`)이 기계 대조한다.
     pub create_caller: Mutex<HashMap<u64, CreateCallerEntry>>,
     pub ledger: Mutex<HashMap<u32, LedgerEntry>>,
     /// 역할 레지스트리: role → surface_id (launch-agent가 등록, --to <role> 주소 해석에 사용)

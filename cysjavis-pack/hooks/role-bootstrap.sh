@@ -85,6 +85,26 @@
 #    서브셸 진입 즉시 exec 로 fd 를 끊고 cys_timeout_run 데드라인(CYS_NOTIFY_TIMEOUT_S)을
 #    씌운다(+정렬 창 ≤0.3s — 건강 경로에선 '알림 시도'가 훅 종료 전에 관측면에 닿는 종전 순서를
 #    보존하고, wedge 면 포기하고 배경 진행). 발화 조건·알림 개수는 불변이다(줄이지도 늘리지도 않는다).
+#  - **★U-22 결정 프런트도어 위임(2026-08-24 · 근본원인 R2)**: 좌석·역할 판정이 이 단명 훅
+#    안에서 서브프로세스로 일어나던 것을 데몬 인메모리 1왕복(`cys hook user-prompt-submit`
+#    → RPC `hook.decide`)으로 옮겼다. 세 가지가 동시에 좋아진다:
+#      ⓐ **권위**: 좌석을 클라이언트 자기신고(`CYS_SURFACE_ID`)가 아니라 데몬이 커널 peer pid
+#         조상 체인으로 도출한다(claim_role 과 같은 인가 규약 — 위조 불가).
+#      ⓑ **데드라인**: 훅 전용 짧은 데드라인(2.5s)이 명령 안에 박혀 있다. 훅은 사람의 프롬프트
+#         앞에 서 있으므로 여기서 쓰는 시간이 곧 입력 지연이다.
+#      ⓒ **침묵 제거**: 실패가 rc0+빈출력으로 접히지 않고 typed exit + stderr 사유로 나온다.
+#    ★거동 불변 3점: 판정 **규칙**은 종전 A3 allowlist(master 또는 미claim만 통과) 그대로다 ·
+#    이 훅의 **stdout 계약**(hookSpecificOutput JSON)은 전혀 건드리지 않는다(`cys hook` 은
+#    stdout 에 아무것도 쓰지 않는다) · 위임이 조금이라도 불확실하면 **종전 게이트로 폴백**한다.
+#    ★fail-open: `cys hook` 의 산출 중 '차단'으로 읽는 값은 exit 3(suppress) 하나뿐이다 —
+#    이 위임은 새 차단자를 만들지 않는다(제1 계약: 오살이 오탐보다 훨씬 위험하다).
+#    ★롤백 1지점: `CYS_BOOT_GATES=0`(마스터 스위치) → 위임 즉시 무효 + 종전 게이트 복귀.
+#    ★판정 근거의 순위: **stderr 토큰이 1차**, exit code 는 보조 진단이다(rc 로 통과를 읽으면
+#      exit 0 이 곧 통과가 되어 stub `cys` 하나로 게이트가 증발한다 — 2026-08-24 실측 A3=B7 재발).
+#    ★계약 정합(3중 등재 · 검체 H-HOOK-DECIDE-2 가 기계 대조):
+#         hook.decide contract_version: 1
+#         판정 토큰(1차): [cys-hook] hook-decide: proceed|suppress|undecided|legacy|error
+#         exit 계약(보조): 0=proceed 1=daemon-error 3=suppress 4=undecided 5=legacy
 #
 # 안전: 모든 단계 graceful, 반드시 exit 0 (훅 실패가 세션을 깨지 않게).
 set +e
@@ -114,6 +134,134 @@ cys_require_surface
 #      3상화는 W2), 무한 대기 표면도 있었다. 여기서는 **데드라인(2s)** 을 씌우고 rc≠0을
 #      '판정 불가'로 분리해 **무발화+로그**한다(빈값=미claim 은 정상 통과 — 융합 금지).
 #      ※timeout 단독 적용은 hang을 '오발화'로 바꾸는 악화라 3상화와 **동시** 적용해야 한다.
+# ── ★U-22 구 경로 판정(`javis_reap_exited._legacy_unavailable` 3중 계약의 셸 복제) ──────────
+# `cys hook` 위임이 실패했을 때 그것이 **정상 업그레이드 스큐**인가(조용히 폴백) 아니면
+# **진짜 결함**인가(폴백하되 시끄럽게)를 가른다. 판정 자체는 어느 쪽이든 종전 게이트로
+# 폴백하므로 거동은 같다 — 이 함수가 가르는 것은 **로그의 소리 크기**다. 그것이 중요한 이유:
+# 결함을 스큐로 접어 삼키면 "매번 조용히 폴백"이 정상으로 굳고, 위임이 죽은 사실을 아무도
+# 모른다(이 저장소가 반복해서 치른 '침묵으로 접힘' 클래스 그 자체).
+# 증거는 **명시적인 것만** 인정한다(fail-closed 방향 — 원본 계약과 동일):
+#   ⓪ cys 부재            : `command -v cys` 실패 → rc 127
+#   ① 구 CLI              : `hook` 서브커맨드 자체가 없다 → clap 사용오류 rc=2 + "unrecognized subcommand"
+#   ② 구 데몬(정상 경로)  : 바이너리는 새 것인데 cysd 가 구 프로세스 → `hook.decide` 미지 메서드
+#                           → 데몬이 method_not_found → CLI 가 rc=1 로 환원(cys.rs HOOK_EXIT_DAEMON_ERR)
+# 그 밖의 비-0(연결 실패·타임아웃·파손 응답)은 스큐가 아니다 — 폴백은 하되 조용히 넘기지 않는다.
+_cys_hook_legacy_unavailable() {   # $1=rc  $2=stderr 캡처
+  case "$1" in
+    127) return 0 ;;
+    2) case "$2" in *"unrecognized subcommand"*) return 0 ;; esac ;;
+    1) case "$2" in *method_not_found*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# ── ★U-22 결정 프런트도어 위임(근본원인 R2 — 판정의 *위치* 이동) ─────────────────────────
+# 종전 이 자리의 판정은 `cys surface-role` 서브프로세스 1개 + 셸 문자열 가공이었고, 그 위에
+# 이 훅이 이어서 python 프로세스 여러 개를 더 띄웠다(30초 단명 훅에서 7~14개). 판정의 **권위**도
+# 애매했다 — `cys surface-role` 은 클라이언트가 자기신고한 `CYS_SURFACE_ID` 로 자기 좌석을 찾는다.
+# 이제 좌석·역할 판정은 데몬이 **커널 peer pid 의 조상 체인**으로 도출해 인메모리로 즉답한다
+# (`hook.decide` — claim_role 과 같은 인가 규약, 위조 불가).
+#
+# ★fail-open: `cys hook` 이 내는 값 중 이 훅이 '차단'으로 읽는 것은 **exit 3(suppress) 하나**다.
+#   그 밖의 모든 실패·불확실은 **종전 게이트로 폴백**한다 — 즉 이 위임은 새 차단자를 만들지
+#   않는다(제1 계약: 오살이 오탐보다 훨씬 위험하다). 종전 게이트의 fail-closed 성질은 폴백
+#   경로 안에 그대로 보존된다(아래 블록은 종전 코드 그대로다).
+# ★롤백: `CYS_BOOT_GATES=0` (마스터 스위치 1지점) → `cys hook` 이 즉시 exit 5 를 내고 아래
+#   종전 게이트가 그대로 돈다. 노브를 새로 만들지 않는다.
+# ★바깥 데드라인은 최후 방어다 — `cys hook` 내부 전용 데드라인(2.5s = BUDGET 1틱)보다 크되
+#   최소로 잡는다. 위임이 병리적으로 멈추면 이 훅은 그 시간만큼 사람의 프롬프트를 붙잡고,
+#   그 뒤 종전 게이트(2s)가 한 번 더 돈다 — 최악 합이 종전(2s)보다 커지는 것은 이 축이
+#   지불하는 유일한 비용이므로 상한을 눈에 보이게 둔다(건강 경로에서는 종전 게이트를
+#   건너뛰므로 오히려 왕복이 1회 줄어든다).
+CYS_HOOK_GATE_TIMEOUT_S=4
+CYS_HOOK_GATE="legacy"
+CYS_HOOK_RC=127
+CYS_HOOK_ERR=""
+if command -v cys >/dev/null 2>&1; then
+  # ★`</dev/null`: 이 위임은 훅 stdin(hook JSON)을 읽기 **전**에 돈다 — 자식이 실수로 stdin 을
+  #   삼키면 아래 `cat` 이 굶어 프롬프트 판정이 무음 실패한다(종전 게이트와 같은 규율).
+  # ★`2>&1 >/dev/null`: stderr 만 캡처하고 stdout 은 버린다. `cys hook` 은 stdout 에 아무것도
+  #   쓰지 않지만(계약), 만약 쓴다면 그것이 훅의 stdout 계약(hookSpecificOutput JSON)을 오염시킨다
+  #   — 그 표면 자체를 없앤다. 순서 주의: 이 순서라야 stderr 가 캡처로 간다.
+  CYS_HOOK_ERR="$(cys_timeout_run "$CYS_HOOK_GATE_TIMEOUT_S" cys hook user-prompt-submit </dev/null 2>&1 >/dev/null)"
+  CYS_HOOK_RC=$?
+fi
+# ★판정의 1차 근거는 **stderr 판정 토큰**이고 rc 는 보조다(2026-08-10 W-B 기계유래 게이트와 같은
+#   규약). rc 로 통과를 읽으면 **exit 0** 이 곧 통과가 되는데, 0 은 셸에서 가장 흔한 사고값이다 —
+#   실측(2026-08-24): 목 `cys`(무조건 exit 0)만으로 role 게이트가 통째로 증발해 worker 좌석에서
+#   마스터 부트가 오발화했다(A3=B7 재발 · 검체 H-DETECT-7/8 이 적색으로 잡았다). 토큰은 판정
+#   본문이 완주했을 때만 인쇄되므로 stub·래퍼·rc 충돌에 구조적으로 면역이다.
+# ── ★위조 차단(결함 1 · 2026-08-24 이종 리뷰어) — 판정은 **줄 단위 정확 일치**로만 읽는다 ──
+# 【무엇이 틀렸었는가】 종전 판독은 stderr **전문**에 대한 substring `case` 였고, `cys hook` 의
+# 다음 줄(상세)에는 데몬이 준 role 문자열이 그대로 인쇄된다. claim 경로에 role 문자열 검증이
+# 없으므로 비-master 좌석이 role 을 `[cys-hook] hook-decide: proceed` 로 claim 하면, `cys hook`
+# 이 올바르게 suppress(rc 3)를 내는데도 **상세 줄이 판정을 뒤집었다**(proceed 를 먼저 보므로).
+# 귀결은 A3=B7 그 자체 — 비-master 좌석에서 마스터 부트가 발화한다.
+# 【다중 방어 3층】 ⓐ 산출 측 무해화(`cys.rs sanitize_hook_detail` — 상세 줄은 토큰 접두를 실을
+# 수 없다) ⓑ 판독 측 **정확 일치 + 토큰 줄 개수 1** ⓒ **rc 교차**. 하나가 미래에 다시 넓어져도
+# 나머지가 선다. 토큰이 1차 근거라는 계약(2026-08-10 W-B)은 그대로다 — rc 는 **거부권**으로만
+# 쓰고, rc 단독으로는 어떤 판정도 만들지 않는다(stub `cys` 의 exit 0 은 여전히 무력하다).
+CYS_CR="$(printf '\r')"
+CYS_HOOK_TOKEN=""
+CYS_HOOK_TOKEN_N=0
+while IFS= read -r CYS_HOOK_LINE; do
+  CYS_HOOK_LINE="${CYS_HOOK_LINE%"$CYS_CR"}"   # Windows 파이프의 CR 만 벗긴다
+  case "$CYS_HOOK_LINE" in
+    "[cys-hook] hook-decide: proceed"|\
+    "[cys-hook] hook-decide: suppress"|\
+    "[cys-hook] hook-decide: undecided"|\
+    "[cys-hook] hook-decide: legacy"|\
+    "[cys-hook] hook-decide: error")
+      CYS_HOOK_TOKEN="${CYS_HOOK_LINE#\[cys-hook\] hook-decide: }"
+      CYS_HOOK_TOKEN_N=$((CYS_HOOK_TOKEN_N + 1))
+      ;;
+  esac
+done <<CYS_HOOK_EOF
+$CYS_HOOK_ERR
+CYS_HOOK_EOF
+if [ "$CYS_HOOK_TOKEN_N" -ne 1 ]; then
+  # 토큰 부재(구 CLI·stub·데드라인)나 **복수**(위조 시도·형상 스큐) — 둘 다 판정 불가다.
+  CYS_HOOK_GATE="legacy"
+  if [ "$CYS_HOOK_TOKEN_N" -gt 1 ]; then
+    echo "[cys-hook] role-bootstrap: 판정 토큰 줄이 ${CYS_HOOK_TOKEN_N}개 — 위조 의심, 종전 게이트로 폴백" >&2
+  fi
+else
+  case "$CYS_HOOK_TOKEN" in
+    proceed)   # 데몬 권위 통과(master 또는 미claim). rc 0 과 **함께**여야 한다.
+      if [ "$CYS_HOOK_RC" = "0" ]; then
+        CYS_HOOK_GATE="proceed"
+      else
+        CYS_HOOK_GATE="legacy"
+        echo "[cys-hook] role-bootstrap: 토큰(proceed)과 rc($CYS_HOOK_RC) 불일치 — 판정 불가, 종전 게이트로 폴백" >&2
+      fi ;;
+    suppress)  # 데몬 권위 차단(비-master 좌석). rc 3 과 **함께**여야 한다.
+      if [ "$CYS_HOOK_RC" = "3" ]; then
+        CYS_HOOK_GATE="suppress"
+      else
+        # ★폴백해도 보호는 잃지 않는다 — 종전 게이트(`cys surface-role`)는 비-master 좌석을
+        #   fail-closed 로 막는다. 즉 rc 교차는 **차단을 약화시키지 않는다**.
+        CYS_HOOK_GATE="legacy"
+        echo "[cys-hook] role-bootstrap: 토큰(suppress)과 rc($CYS_HOOK_RC) 불일치 — 판정 불가, 종전 게이트로 폴백" >&2
+      fi ;;
+    *) CYS_HOOK_GATE="legacy" ;;   # undecided·legacy·error 는 종전대로 폴백
+  esac
+fi
+if [ "$CYS_HOOK_GATE" = "legacy" ]; then
+  if [ "$CYS_HOOK_RC" = "4" ] || [ "$CYS_HOOK_RC" = "5" ]; then
+    : # `cys hook` 이 이미 stderr 에 사유를 남겼다(판정 불가·롤백·소켓 부재) — 중복 고지 안 한다
+  elif _cys_hook_legacy_unavailable "$CYS_HOOK_RC" "$CYS_HOOK_ERR"; then
+    : # 정상 업그레이드 스큐(cys 부재·구 CLI·구 데몬) — 조용히 종전 게이트로
+  else
+    echo "[cys-hook] role-bootstrap: cys hook 위임 실패(rc=$CYS_HOOK_RC · 스큐 증거 없음) — 종전 게이트로 폴백. err=$CYS_HOOK_ERR" >&2
+  fi
+fi
+if [ "$CYS_HOOK_GATE" = "suppress" ]; then
+  echo "[cys-hook] role-bootstrap: 비-master role(데몬 권위 판정) — 마스터 부트 발화 금지(allowlist)" >&2
+  exit 0
+fi
+
+# ── 종전 게이트(폴백 전용) — 위임이 성립하지 않았을 때만 돈다. 내용은 U-22 이전과 동일하다. ──
+if [ "$CYS_HOOK_GATE" = "legacy" ]; then
 CYS_ROLE_GATE_TIMEOUT_S=2
 if command -v cys >/dev/null 2>&1; then
   # ★`</dev/null`: 이 게이트는 훅 stdin(hook JSON)을 읽기 **전**에 돈다 — 자식이 실수로
@@ -136,8 +284,27 @@ case "$MYROLE" in
     echo "[cys-hook] role-bootstrap: 비-master role($MYROLE) — 마스터 부트 발화 금지(allowlist)" >&2
     exit 0 ;;
 esac
+fi
 
-INPUT=$(cat 2>/dev/null)
+# ── ★훅 stdin 읽기 데드라인(결함 7 · 2026-08-24 이종 리뷰어) ────────────────────────────
+# 【왜 필요한가】 U-21 이 이 훅의 **선언 timeout 을 30초 → 600초**로 올렸다(javis_preflight.py
+# `HOOK_TIMEOUT_S`). 그 변경은 훅 절단(오살 — 취소 + 출력 폐기로 부트 체인이 조용히 사라지는
+# 것)을 막지만, 훅 **안에** 데드라인 없는 블로킹 읽기가 남아 있으면 상한이 함께 20배가 된다:
+# 하네스가 stdin 을 안 닫거나 파이프가 물리면 `cat` 이 그만큼 사람의 프롬프트를 붙잡는다
+# (2026-08-21 W-A0 이 이미 치른 '프롬프트 제출 먹통' 클래스와 같은 표면).
+# 【정직한 범위】 리뷰어도 wedge 실물 재현은 못 했다 — 이것은 **확인된 결함이 아니라 상한이
+# 없다는 사실**이고, 여기서 하는 일은 값싼 보험이다. 다른 판정 호출에는 이미 4초·2초
+# 데드라인이 있는데 이 읽기만 무한이라는 비대칭을 없앤다(거동은 건강 경로에서 완전 무변).
+# 【초과 시】 부분 입력으로 오판정하지 않는다 — 무발화 + loud(A5·A22 와 같은 fail-closed 방향).
+# 【데드라인 부재 환경】 `cys_timeout_run` 3단 해소가 전부 실패하면 종전대로 무-데드라인
+# 직접 실행이다(정직한 강등 — 조용한 실패보다 낫다 · _lib.sh 계약 ④).
+CYS_HOOK_STDIN_TIMEOUT_S=10
+INPUT="$(cys_timeout_run "$CYS_HOOK_STDIN_TIMEOUT_S" cat 2>/dev/null)"
+CYS_STDIN_RC=$?
+if [ "$CYS_STDIN_RC" = "124" ]; then
+  echo "[cys-hook] role-bootstrap: 훅 stdin 읽기 데드라인(${CYS_HOOK_STDIN_TIMEOUT_S}s) 초과 — 무발화(fail-closed)" >&2
+  exit 0
+fi
 [ -z "$INPUT" ] && exit 0
 
 # ── 정적 additionalContext 발행기(python 없이도 동작) ──

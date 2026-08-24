@@ -7,8 +7,13 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
 그 사실을 산출한다(LLM 자연어 재추론 금지 — 출력만이 사실).
 
 서브커맨드:
-  check                         4종 의무 노드(cso·worker·reviewer-gemini·reviewer-codex)
+  check [--json]                4종 의무 노드(cso·worker·reviewer-gemini·reviewer-codex)
                                 생존을 cys status로 판정.
+                                --json: 완주 2축(ready ∧ awake)을 기계 판독 payload 1줄로
+                                노출(U-25 1단 — **관측 전용**: exit 계약도 사람용 출력도
+                                무변경). `awake`·`awake_pending` 이 null 이면 **미측정**이지
+                                '각성 없음'이 아니다. 롤백은 `CYS_BOOT_GATES=0`(마스터) 또는
+                                `CYS_AWAKE_AXIS=0`(축) — 어느 하나로 종전 1축 복귀.
                                 exit 0=의무 역할 전원 생존 / 1=**노드 미기동**(실측 판정 —
                                 status는 받았고 그중 부재 역할이 있다) /
                                 2=**판정 불가**(cys 미설치·데몬 소실·status --json 비0/파손 —
@@ -434,6 +439,113 @@ def live_role_names(status):
             if s.get("role") and not s.get("exited")}
 
 
+# ─────────────────── (U-25) 완주 정의 2축 — ready ∧ awake ───────────────────
+# ★근본원인 R1: 지금까지 '완주'는 **프로세스가 존재하는가** 한 축이었다. 좌석이 살아 있고
+#   이름공간이 맞으면 READY 로 집계됐고, 그 좌석이 **디렉티브를 읽고 입력을 받을 수 있는가**
+#   (각성)는 라벨(생존추정)로만 남았다. 라벨은 exit 에 실리지 않으므로 소비부는 '팀을 세웠다'
+#   로 읽고 티켓을 태웠다. 그래서 완주를 두 축으로 가른다:
+#     · ready = 좌석이 있고 살아 있다  (= 종전 `satisfied` **그대로**. 값·exit 무변경)
+#     · awake = 그 좌석이 **각성 확정** (fresh set-status ack 또는 awakened_at 래치)
+#
+# ★1단(이 변경)은 **무동작**이다: awake 는 additive 로 **관측만** 되고 exit·사람용 출력·
+#   결손 판정(has)은 한 비트도 바뀌지 않는다. 의미 전환(exit 을 ready 축으로 명시 · 마커
+#   payload 2축 승격 · GUI Warn)은 2단이며 이 커밋에 없다.
+#
+# ★★미측정(None) ≠ 미각성(False): 축이 꺼졌거나 구 팩 스큐로 값이 없으면 awake 는 **None**
+#   이다. None 을 falsy 로 접어 '각성 안 됨'으로 읽는 소비자는 계약 위반이다 — 그 접힘이
+#   정확히 BLOCK-4 형(롤백 스위치가 기저보다 파괴적인 상태를 만드는 것)이다. 축 off 에서
+#   `awake_pending` 을 `[]`(빈 목록)이 아니라 `None` 으로 두는 이유도 같다: 빈 목록은
+#   '재어 보니 전원 각성'이라는 **거짓 초록**이다(측정 불능은 통과가 아니다).
+
+# 축 노브 — 이 축 하나만 끈다.
+AWAKE_AXIS_ENV = "CYS_AWAKE_AXIS"
+# 마스터 롤백 스위치 미러 — `javis_boot_node.BOOT_GATES_ENV` · Rust `cys::ENV_BOOT_GATES`.
+# ★새 판정 축은 **태어날 때 마스터에 접는다**(BLOCK-3: 축마다 노브를 따로 두면 사고 순간에
+#   사람이 조합을 만들지 못한다). 이름 드리프트는 `--self-test` 가 3자 대조로 잡는다.
+BOOT_GATES_ENV = "CYS_BOOT_GATES"
+
+
+def awake_axis_enabled():
+    """★(U-25) awake 축 노출 판독(부작용 있음 — env 2회). ①마스터 `CYS_BOOT_GATES=0`
+    ②축 `CYS_AWAKE_AXIS=0` 중 **어느 하나**라도 누르면 축이 꺼지고 종전 1축(ready) 판정으로
+    즉시 복귀한다(판정 dict 에서 새 키가 아예 사라진다 = '되돌렸다'가 참이 되는 모양).
+
+    극성은 형제 게이트(`javis_boot_node.gate_pending_axis_enabled`)와 같은 **엄격 비교**다 —
+    `"false"`·`"off"`·빈 값 같은 느슨한 falsy 는 끄지 않는다(오타 한 글자로 안전장치가 조용히
+    꺼지는 사고 방지). 기본이 '켜짐'인 이유: 1단에서 이 축은 **관측 전용**이라 켜져 있어도
+    거동이 종전과 같고, 반대로 기본 꺼짐이면 2단 착지 때 켜는 것을 잊는 순간 완주 보고가
+    다시 1축으로 접힌다 — 잊어서 위험해지는 방향이 아니라 **잊어도 오늘과 같은** 방향."""
+    if os.environ.get(BOOT_GATES_ENV) == "0":
+        return False
+    return os.environ.get(AWAKE_AXIS_ENV) != "0"
+
+
+def _awake_grade():
+    """'각성 확정' 등급명 — `javis_boot_node.LIVENESS_AWAKE` 단일 정의를 소비한다.
+
+    ★리터럴 금지 이유(무음 실패): 등급명을 문자열로 박아 두면 정본이 개명될 때 비교가
+      **조용히 항상 False** 가 돼 전원이 '각성 미확인'으로 집계된다 — 적색도 예외도 없이
+      판정만 틀린다. 구 팩 스큐(상수 부재)에서만 리터럴로 폴백한다(값 동일 · 무동작)."""
+    bn = _boot_node()
+    return getattr(bn, "LIVENESS_AWAKE", "awake_confirmed") if bn is not None \
+        else "awake_confirmed"
+
+
+def verdict_awake_from(grade, satisfied, awake_grade="awake_confirmed"):
+    """★awake 축의 **순수 코어** — env·status·모듈 상태 비의존(진리표 대상).
+
+    계약: ready(=satisfied) ∧ 등급이 각성확정 ⟺ awake. `alive_presumed`(agent_alive 단독·
+    좌석 점유·quiet_but_alive)와 `unknown`(프로브 실패)은 **각성 미확인**이라 awake 가 아니다.
+    ★그러나 그 좌석의 ready 는 **그대로 True** 다 — 강등은 라벨이지 실패가 아니라는 B6 계약을
+      이 축이 뒤집으면 래치 배포 이전 기계의 건강한 팀이 전부 적색이 된다(역방향 회귀)."""
+    return bool(satisfied) and grade == awake_grade
+
+
+def verdict_awake(v):
+    """판정 dict → awake(bool) | **None(미측정 — 축 off)**. 순수 코어의 dict 어댑터."""
+    if not awake_axis_enabled():
+        return None
+    return verdict_awake_from(v.get("grade"), v.get("satisfied"), _awake_grade())
+
+
+def verdict_axes(verdicts):
+    """★(U-25) 판정 묶음 → **완주 2축 집계**. 부작용은 축 env 판독뿐(판정은 순수).
+
+    반환 dict:
+      `axis`           축이 켜져 있는가(False = awake 미측정)
+      `ready`          전 의무 역할이 ready 인가 (= 종전 exit 0 조건 · 값 무변경)
+      `ready_missing`  ready 미충족 역할(요건 순서 — 종전 `cmd_check` 의 `missing` 과 동일)
+      `gated`          그중 첫기동 관문 보류(U-10 제4 등급 — 처방이 '기동'이 아니라 '사람 1회')
+      `awake`          전 의무 역할이 각성 확정인가 | **None(미측정)**
+      `awake_pending`  ready 이지만 각성 미확정인 역할 | **None(미측정)**
+
+    ★`ready_missing`·`gated` 는 새 축이 아니다: `cmd_check` 가 종전에 **표현 루프 안에서**
+      만들던 목록을 표현 이전으로 끌어낸 것뿐이다(같은 규칙을 사람용·기계용 두 벌로 적지
+      않기 위해서 — 값·순서 동일 · 사람용 출력 바이트 무변경).
+    ★`awake_pending` 이 ready 미충족 역할을 담지 않는 이유: 그쪽은 이미 `ready_missing` 이
+      말하는 **다른 사실**(좌석이 없다)이고, 이 목록은 '좌석은 섰는데 아직 못 쓴다'는
+      **경고 축**이다(2단에서 GUI 가 이 목록으로 Warn 을 낸다)."""
+    bn = _boot_node()
+    gated_grade = getattr(bn, "LIVENESS_GATED", "gate_pending") if bn is not None \
+        else "gate_pending"
+    awake_grade, on = _awake_grade(), awake_axis_enabled()
+    ready_missing, gated, pending = [], [], []
+    for r, v in verdicts.items():
+        if not v.get("satisfied"):
+            ready_missing.append(r)
+            if v.get("grade") == gated_grade:
+                gated.append(r)
+            continue
+        if not verdict_awake_from(v.get("grade"), True, awake_grade):
+            pending.append(r)
+    return {"axis": on,
+            "ready": not ready_missing,
+            "ready_missing": ready_missing,
+            "gated": gated,
+            "awake": (not ready_missing and not pending) if on else None,
+            "awake_pending": pending if on else None}
+
+
 def check_verdicts(status, detect=None, agents=None):
     """★check 판정의 순수 함수 코어 — (verdicts, roster). 데몬 왕복 0(status 주입).
 
@@ -446,7 +558,14 @@ def check_verdicts(status, detect=None, agents=None):
       self-test 가 죽었다. 밀폐 주입으로 테스트가 환경에 의존하지 않게 한다.
 
     verdicts: required role → {"satisfied","grade","filler","native","why"}
+                              (+ 축 on 이면 "ready","awake" — U-25 1단 additive)
       grade ∈ awake_confirmed | alive_presumed | absent | unknown  (javis_boot_node.node_liveness)
+
+    ★(U-25 1단) 완주 2축 additive — `satisfied` 는 **한 비트도 바뀌지 않는다**. 그것이 곧
+      ready 축이고, 새 키 `ready` 는 그 별칭을 이름으로 드러낸 것이며, 새 축은 `awake` 뿐이다.
+      축이 꺼지면(`CYS_BOOT_GATES=0` ∨ `CYS_AWAKE_AXIS=0`) 두 키는 **생기지 않는다** =
+      종전 dict 모양 그대로다. 소비자는 `v.get("awake")` 로 읽고 **None 을 미측정으로**
+      다뤄야 한다(False 로 접으면 롤백이 기저보다 파괴적이 된다 — BLOCK-4 형).
 
     ★B6 — 1차 통과 기준은 **fresh set-status ack(또는 awakened_at 래치)** 이고, `agent_alive`
       단독은 '생존추정'으로 **강등 라벨링**된다. 강등은 라벨이지 실패가 아니다(exit 는 불변):
@@ -469,6 +588,9 @@ def check_verdicts(status, detect=None, agents=None):
     #     absent(무신호)를 대표로 뽑으면 스폰을 유도해 살아 있는 pane 위에 중복 좌석이 생긴다.
     _RANK = {"awake_confirmed": 3, "alive_presumed": 2, "unknown": 1,
              "gate_pending": 0.5, "absent": 0}
+    # ★(U-25) 축 상태·등급명은 **호출당 1회**만 읽는다 — 같은 호출 안에서 축이 반쯤 켜진
+    #   판정 묶음이 나오면(역할마다 env 재판독) 그 자체가 비결정론이다.
+    _awake_on, _awake_grade_name = awake_axis_enabled(), _awake_grade()
     verdicts = {}
     for r in required:
         sat, filler, native, why = slot_satisfied(r, live)
@@ -503,7 +625,50 @@ def check_verdicts(status, detect=None, agents=None):
                      if bn is not None else bool(sat))
         verdicts[r] = {"satisfied": satisfied, "grade": grade, "filler": filler,
                        "native": native, "why": "%s · %s" % (why, greason)}
+        if _awake_on:
+            # ready = satisfied 의 **별칭**(값 동일 — 새 판정이 아니다) · awake = 새 축.
+            verdicts[r]["ready"] = satisfied
+            verdicts[r]["awake"] = verdict_awake_from(grade, satisfied, _awake_grade_name)
     return verdicts, roster
+
+
+class VerdictDeficit(tuple):
+    """`_shared_verdict_deficit` 의 반환 — **길이 2** 튜플 `(has, why)` + `.axes` 부가(U-25 1단).
+
+    ★왜 3원소 튜플이 아닌가(판정 완화가 아니라 **호환 확장**이다): 이 반환을 그대로 2원소로
+      푸는 소비자가 이 파일 **밖에** 있다 —
+        · `javis_bootstrap._shared_verdict_deficit`(위임 래퍼 — 반환을 그대로 통과시킨다)
+        · `javis_bootstrap.py` `_team_has_deficit` · 같은 파일 `--self-test` 2곳
+        · `tests/test_seat_latch_negation.py` 3곳(정본을 **직접** 2원소로 푼다)
+        · `tests/run_bootstrap_health.py` H-PRED-1 · H-SEAT-4AXIS
+      길이 3 으로 늘리면 `has, why = f(...)` 가 전부 `ValueError` 로 죽는다. 그건 부트 ④ 의
+      결손 산출이 죽는다는 뜻이고, 결손 산출이 죽으면 `cys boot` 호출 여부를 판정할 수 없다 —
+      이 저장소가 실제로 사고를 낸 자리다. 그래서 **길이·동등성·인덱싱은 종전 그대로 두고**
+      (`f(...) == (True, "…")` 도 여전히 참) 새 축은 속성으로만 얹는다.
+      하드 3원소 승격은 위 소비자들을 **같은 커밋에서 함께 옮길 때**(2단)만 가능하다 —
+      핀을 지우는 것이 아니라 이사시키는 조건이다.
+    ★구 팩 스큐: 폴백(`javis_bootstrap._shared_verdict_deficit_fallback`)은 평범한 2원소
+      튜플을 낸다. 그래서 소비자는 `getattr(r, "axes", None)` 로 읽어야 하고, 그 `None` 은
+      **미측정**이지 '각성 없음'이 아니다."""
+
+    # ★`__slots__` 를 쓰지 않는다: 가변길이 불변 내장(tuple)의 서브타입은 비어있지 않은
+    #   `__slots__` 를 지원하지 않아 **import 시점에 TypeError** 로 모듈이 통째로 죽는다.
+    #   (그 실패는 조용하지 않다 — 실측으로 확인하고 `__dict__` 경로로 되돌렸다.)
+
+    def __new__(cls, has, why, axes=None):
+        self = tuple.__new__(cls, (has, why))
+        self.axes = axes
+        return self
+
+    @property
+    def has(self):
+        """결손 존재 여부(bool) | None(판정 불가) — `self[0]` 의 이름 있는 접근자."""
+        return self[0]
+
+    @property
+    def why(self):
+        """판정 사유 문자열 — `self[1]` 의 이름 있는 접근자."""
+        return self[1]
 
 
 def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agents=None):
@@ -542,18 +707,27 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agen
       `javis_bootstrap._shared_verdict_deficit` 을 쓰는 `javis_bootstrap.py --self-test` 가
       **agy·codex 가 없는 깨끗한 기계에서 항상 FAIL** 했다(실측: 빈 HOME → exit 1). 그 FAIL 이
       뒤따르는 단언들보다 앞이라 신규 커버리지가 통째로 실행조차 되지 않았다.
-      미주입=None 이면 종전과 완전히 같은 실감지 경로다 — **프로덕션 거동 불변**."""
+      미주입=None 이면 종전과 완전히 같은 실감지 경로다 — **프로덕션 거동 불변**.
+
+    ★(U-25 1단) 반환은 `VerdictDeficit` — **길이 2 그대로**(`has, why = …` 무접촉)이고
+      `.axes` 로 완주 2축 집계가 따라온다. 결손 값(`has`)은 축 on/off 로 **바뀌지 않는다**:
+      이 단계에서 awake 는 관측일 뿐 결손 판정에 참여하지 않는다(무동작 계약 · `--self-test`
+      가 축 on/off 동치를 핀한다). 판정 자체가 불가능했던 경로는 `.axes` 도 **None(미측정)**
+      이다 — 빈 집계를 내면 '재어 보니 이상 없음'이라는 거짓 초록이 된다."""
     bn = _boot_node()
     try:
         verdicts, _roster = check_verdicts(status, detect=detect, agents=agents)
     except Exception as e:
-        return None, "check_verdicts 소비 불가(%s: %s)" % (type(e).__name__, e)
+        return VerdictDeficit(None, "check_verdicts 소비 불가(%s: %s)"
+                              % (type(e).__name__, e))
     if not verdicts:
-        return None, "check_verdicts 빈 판정(로스터 산출 실패)"
+        return VerdictDeficit(None, "check_verdicts 빈 판정(로스터 산출 실패)")
+    axes = verdict_axes(verdicts)
     missing = [r for r, v in verdicts.items() if not v.get("satisfied")]
     if missing:
-        return True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
-                      % (", ".join(verdicts), ", ".join(missing)))
+        return VerdictDeficit(
+            True, ("공유 판정 결손(의무 %s / 부재 %s) — 결손 존재 [신호=check_verdicts 동일]"
+                   % (", ".join(verdicts), ", ".join(missing))), axes)
     unknowns = [(r, v.get("filler") or r) for r, v in verdicts.items()
                 if v.get("grade") == (bn.LIVENESS_UNKNOWN if bn is not None else "unknown")]
     if unknowns and bn is not None:
@@ -573,31 +747,114 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agen
             if grade == bn.LIVENESS_ABSENT:
                 residual.append("%s(%s)" % (req_role, why))
         if residual:
-            return True, ("부트 경로 unknown 결손(판정불가 잔존: %s) — 결손 존재 "
-                          "[⑤check satisfied 는 불변·시한부 해소=resolve_unknown_for_spawn]"
-                          % "; ".join(residual))
-        return False, ("공유 판정 충족(의무 %s 전원 — unknown %d건 전부 시한부 해소로 생존 확인)"
-                       " — 결손 0(재선언) [신호=check_verdicts+unknown 시한부 해소]"
-                       % (", ".join(verdicts), len(unknowns)))
+            return VerdictDeficit(
+                True, ("부트 경로 unknown 결손(판정불가 잔존: %s) — 결손 존재 "
+                       "[⑤check satisfied 는 불변·시한부 해소=resolve_unknown_for_spawn]"
+                       % "; ".join(residual)), axes)
+        return VerdictDeficit(
+            False, ("공유 판정 충족(의무 %s 전원 — unknown %d건 전부 시한부 해소로 생존 확인)"
+                    " — 결손 0(재선언) [신호=check_verdicts+unknown 시한부 해소]"
+                    % (", ".join(verdicts), len(unknowns))), axes)
+    # ★등급명은 리터럴이 아니라 정본 상수를 쓴다(무음 실패 방지): 정본이 개명되면 리터럴
+    #   비교는 **조용히 항상 False** 가 돼 '생존추정 고지'가 통째로 사라진다 — 적색도 예외도
+    #   없이 진단만 없어진다. 구 팩 스큐(상수 부재)에서만 종전 리터럴로 폴백한다(값 동일).
+    _presumed_grade = getattr(bn, "LIVENESS_PRESUMED", "alive_presumed") if bn is not None \
+        else "alive_presumed"
     presumed = [r for r, v in verdicts.items()
-                if v.get("satisfied") and v.get("grade") == "alive_presumed"]
+                if v.get("satisfied") and v.get("grade") == _presumed_grade]
     note = ("" if not presumed
             else " · 생존추정(각성 미확인) %s — 재각성 권장이나 결손 아님" % ", ".join(presumed))
-    return False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
-                   % (", ".join(verdicts), note))
+    return VerdictDeficit(
+        False, ("공유 판정 충족(의무 %s 전원) — 결손 0(재선언)%s [신호=check_verdicts 동일]"
+                % (", ".join(verdicts), note)), axes)
+
+
+def _check_payload(verdicts, roster, alive_optional, axes):
+    """`check --json` 의 기계 판독 payload(순수 구성 — 부작용 0).
+
+    ★1단 계약: `exit` 은 **ready 축**(종전과 완전히 동일)이고 `awake`·`awake_pending` 은
+      **관측 필드**다. 소비자는 이 둘이 `null` 이면 **미측정**으로 읽어야 한다(축 off·구 팩
+      스큐) — null 을 '각성 없음'으로 접으면 롤백 스위치가 기저보다 파괴적이 된다(BLOCK-4 형).
+    ★사람용 경로의 대체 리뷰어 고지는 여기서 산문으로 다시 내지 않는다(stdout 은 JSON 1줄만
+      이어야 기계 소비가 성립). 대신 `roster` 가 `native`·`substituted_for`·`reason` 을
+      그대로 실어 나른다 — 강등이 조용히 사라지지 않는다."""
+    return {
+        "schema": "orchestra-check/v1",
+        "exit": 1 if axes["ready_missing"] else 0,
+        "axis": axes["axis"],
+        "ready": axes["ready"],
+        "ready_missing": axes["ready_missing"],
+        "gated": axes["gated"],
+        "awake": axes["awake"],
+        "awake_pending": axes["awake_pending"],
+        "required": list(verdicts.keys()),
+        "verdicts": verdicts,
+        "roster": roster,
+        "optional": {r: bool(alive_optional.get(r)) for r in OPTIONAL_ROLES},
+        "why": None,
+    }
+
+
+def _check_unknown_payload(why):
+    """exit 2(**판정 불가**) 의 payload — 전 판정 필드가 `null` 이다.
+
+    ★모듈 docstring 의 계약을 그대로 형상화한 것이다: exit 2 는 **노드에 대해 아무것도 말하지
+      않는다**(데몬 소실을 '노드 미기동'으로 오귀속하면 처방이 뒤집힌다). 그래서 `ready` 를
+      `false` 로 두지 않는다 — false 는 '재어 보니 안 섰다'는 **측정 결과**이고, 여기서는
+      측정 자체가 없었다. 측정 불능은 어떤 게이트에서도 통과가 아니지만 실패 판정도 아니다.
+    ★`--json` 인데 산문만 나가면 소비자의 `json.loads` 가 죽는다 — 그 죽음은 부트 체인이
+      데몬 소실을 진단하지 못하는 순간과 정확히 겹친다. 그래서 이 경로도 JSON 을 낸다(사람용
+      처방 문안은 stderr 로 보내 잃지 않는다)."""
+    return {
+        "schema": "orchestra-check/v1",
+        "exit": 2,
+        "axis": awake_axis_enabled(),
+        "ready": None,
+        "ready_missing": None,
+        "gated": None,
+        "awake": None,
+        "awake_pending": None,
+        "required": None,
+        "verdicts": None,
+        "roster": None,
+        "optional": None,
+        "why": why,
+    }
 
 
 # ── check: 4종 의무 노드 생존 판정 ──
 def cmd_check(args):
     status = cys_status()
     if status is None:
-        print("[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행")
+        _why = "[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행"
+        if getattr(args, "json", False):
+            # ★`--json` 은 **전 exit 경로**에서 stdout 이 JSON 이어야 한다. 여기만 산문을 내면
+            #   소비자의 json.loads 가 데몬 소실 순간에 죽는다 — 진단이 가장 필요한 순간이다.
+            #   사람용 처방(`cys ping`)은 stderr 로 보내 잃지 않는다(조용한 강등 금지).
+            print(json.dumps(_check_unknown_payload(_why), ensure_ascii=False, sort_keys=True))
+            print(_why, file=sys.stderr)
+            return 2
+        print(_why)
         return 2
     # ★판정은 순수 함수(check_verdicts)에 있고 여기는 표현만 한다 — 같은 함수를 bootstrap 결손
     #   판정·wakeup zombie 가드·reclaim 이 소비하므로 판정 이원화가 구조적으로 불가능하다(A1 클래스).
     verdicts, roster = check_verdicts(status)
     required = list(verdicts.keys())
     alive_optional = live_roles(status)
+    # ★(U-25 1단) 분류를 **표현 이전으로** 끌어낸다. 종전엔 missing·gated 를 아래 print 루프
+    #   안에서 만들었다 — 같은 규칙을 사람용·기계용 두 벌로 적지 않기 위한 것이고, 목록의
+    #   값·순서(요건 순서)는 종전과 동일하다(사람용 출력 바이트 무변경).
+    axes = verdict_axes(verdicts)
+    missing, gated = axes["ready_missing"], axes["gated"]
+    if getattr(args, "json", False):
+        # ★기계 소비 전용 경로: 사람용 산문('READY' 토큰 포함)은 **한 줄도 내지 않는다**.
+        #   디렉티브·C03 핀이 인용하는 문안은 아래 기본 경로에 그대로 있다.
+        #   ★`getattr` 기본값이 필요한 이유: `javis_idempotency._spy_cmd_check` 가 속성이 없는
+        #     빈 Args 로 이 함수를 부른다(관찰 멱등 negative assertion). `args.json` 직접
+        #     참조는 그 검체를 AttributeError 로 죽인다.
+        print(json.dumps(_check_payload(verdicts, roster, alive_optional, axes),
+                         ensure_ascii=False, sort_keys=True))
+        return 1 if missing else 0
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
     # 리뷰어 대체 고지(2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
@@ -605,8 +862,7 @@ def cmd_check(args):
             print("  ⚠ %s 미감지(%s) → %s(Claude 대체) — 보편적이나 벤더 다양성 약함, "
                   "페르소나/렌즈/익명화로 보완(REVIEWER_DIRECTIVE §6)"
                   % (e["substituted_for"], e["reason"], e["role"]))
-    missing = []
-    gated = []          # ★(U-10) 관문 보류 — 미기동과 **처방이 다르다**(기동이 아니라 사람 1회)
+    # ★missing·gated 는 위 `verdict_axes` 가 이미 산출했다(값·순서 동일) — 여기서는 표현만 한다.
     for r in required:
         v = verdicts[r]
         if not v["satisfied"]:
@@ -615,17 +871,15 @@ def cmd_check(args):
             #   여기서 "→ `cys boot` 로 기동하라"고 적으면 **거짓 처방**이다(boot 은 이 좌석을
             #   스폰도 회수도 하지 않는다 — 그게 옳은 동작이다). 사람이 관문을 한 번 통과시켜야
             #   한다. 미충족 계상·exit 계약은 **그대로**(1) 두고 라벨과 처방만 정확하게 만든다.
-            if v["grade"] == getattr(_boot_node(), "LIVENESS_GATED", "gate_pending"):
+            if r in gated:
                 print("  ✗ %s — 첫기동 관문 보류 (%s)" % (r, v["why"]))
-                gated.append(r)
             else:
                 print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
-            missing.append(r)
             continue
         # ★B2 실충전자 라벨링 — 대체 좌석이 슬롯을 채웠으면 그 사실을 숨기지 않는다.
         fill = "" if v["native"] in (True, None) or v["filler"] == r else \
                " ← 실충전자 %s(대체)" % v["filler"]
-        if v["grade"] == "awake_confirmed":
+        if v["grade"] == _awake_grade():
             print("  ✓ %s — 각성 확정(%s)%s" % (r, v["why"], fill))
         elif v["grade"] == "unknown":
             print("  ✓ %s — 좌석 판정불가(프로브 실패 — 적색 아님·재확인 권장)%s" % (r, fill))
@@ -2614,6 +2868,194 @@ def cmd_self_test(args):
         _v2, _ = check_verdicts(_st(_sub), detect=_yes, agents=_synth)   # ★밀폐 주입(위와 동일 사유)
         assert _v2["reviewer-codex"]["satisfied"] is True, "대체 좌석 재해소 실패(B2)"
         assert _v2["reviewer-codex"]["native"] is False, "실충전자 라벨(native=False) 누락"
+
+        # ───── (U-25 1단) 완주 정의 2축 — ready ∧ awake · additive·무동작 ─────
+        # ★계측 타당성(수리 전 적색 실측): `awake` 키·`.axes`·`check --json` 은 수리 전 코드에
+        #   **존재하지 않았다** → 아래 단언은 전부 KeyError/AttributeError/SystemExit 로 적색이다.
+        #   트리에 위반이 0 이라 탐지기가 고장나도 초록이 되는 항(반환 호환성 핀)은 **합성
+        #   표본**(하드 3원소·1원소 튜플)으로 탐지 능력 자체를 시험한다.
+        _axis_prev = {k: os.environ.get(k) for k in (AWAKE_AXIS_ENV, BOOT_GATES_ENV)}
+        _globals_prev = {n: globals()[n] for n in ("cys_status", "reviewer_roster")}
+        try:
+            for _k in (AWAKE_AXIS_ENV, BOOT_GATES_ENV):
+                os.environ.pop(_k, None)        # 기본(축 켜짐)을 명시적으로 만든다
+            assert awake_axis_enabled() is True, "기본 상태에서 awake 축이 꺼져 있다"
+            _bn_mod = _boot_node()
+            if _bn_mod is not None:
+                # 이름·등급 드리프트 3자 대조 — 사고 순간에 사람이 쥐는 손잡이가 갈라지면 안 된다.
+                assert BOOT_GATES_ENV == _bn_mod.BOOT_GATES_ENV, \
+                    "마스터 스위치 이름 드리프트(orchestra ↔ javis_boot_node)"
+                assert _awake_grade() == _bn_mod.LIVENESS_AWAKE, \
+                    "각성확정 등급명 드리프트(리터럴 잔존 — 비교가 조용히 항상 False 가 된다)"
+            # ⓐ 판정 dict: ready = satisfied 별칭(값 동일) · awake = 각성확정만
+            _v3, _r3 = check_verdicts(_st(_base), detect=_yes, agents=_synth)
+            for _r, _vv in _v3.items():
+                assert _vv["ready"] is _vv["satisfied"], \
+                    "%s: ready 가 satisfied 별칭이 아니다(새 축이 종전 축을 바꿨다)" % _r
+            assert _v3["cso"]["awake"] is True, "래치 좌석(각성확정)이 awake 가 아니다"
+            assert _v3["reviewer-gemini"]["awake"] is False, \
+                "생존추정(agent_alive 단독)이 awake 로 계상 — 각성 미확인을 완주로 세는 R1 재발"
+            assert _v3["reviewer-gemini"]["satisfied"] is True, \
+                "awake 축 신설이 ready 를 끌어내렸다(무동작 위반 — 래치 이전 기계 전원 적색)"
+            # ⓑ 축 집계: ready_missing 은 종전 missing 과 같은 목록 · awake_pending 은 경고 축
+            _ax = verdict_axes(_v3)
+            assert _ax["ready_missing"] == [r for r, v in _v3.items() if not v["satisfied"]], \
+                "ready_missing 이 종전 missing 목록·순서와 다르다(사람용 출력 파손)"
+            assert _ax["ready"] is False and "reviewer-codex" in _ax["ready_missing"], \
+                "좌석 empty 가 ready 집계에서 빠졌다"
+            assert "reviewer-gemini" in _ax["awake_pending"], \
+                "awake_pending 이 '살아 있으나 각성 미확정' 좌석을 짚지 못한다: %r" % (_ax,)
+            assert "cso" not in _ax["awake_pending"], "각성확정 좌석이 awake_pending 에 섞였다"
+            assert "reviewer-codex" not in _ax["awake_pending"], \
+                "ready 미충족 좌석이 경고 축에 섞였다(ready_missing 과 사실이 겹친다)"
+            assert _ax["awake"] is False, "각성 미확정 좌석이 있는데 awake 축이 참"
+            # ⓒ 결손 산출: 종전 2원소 언팩 유지 + `.axes` 부가
+            _st_ok = _st([{"role": "cso", "exited": False, "awakened_at": 1.0},
+                          {"role": "worker", "exited": False, "awakened_at": 1.0},
+                          {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
+                          {"role": "reviewer-codex", "exited": False, "awakened_at": 1.0}])
+            _d = _shared_verdict_deficit(_st_ok, requery=lambda: _st_ok, tick_s=0,
+                                         detect=_yes, agents=_synth)
+            _has, _why = _d                     # ★밖의 2원소 소비자 계약 그대로
+            assert _has is False, "정상 팀이 결손>0(무동작 위반): %s" % _why
+
+            def _deficit_shape_ok(val):
+                """반환이 **종전 2원소 계약**을 지키는가 — 밖의 소비자 6곳이 이 모양을 푼다."""
+                try:
+                    _a, _b = val
+                except ValueError:
+                    return False
+                return len(val) == 2 and tuple(val) == (_a, _b)
+
+            assert _deficit_shape_ok(_d) is True, \
+                "결손 반환의 길이·동등성이 바뀌었다 — 밖의 2원소 소비자가 ValueError 로 죽는다"
+            # ★합성 표본(탐지 능력 시험): 위 핀은 트리에 위반이 0 이라 탐지기가 고장나도 초록이다.
+            assert _deficit_shape_ok((True, "why", {"awake": True})) is False, \
+                "합성 3원소 표본을 호환 술어가 통과시켰다 — 이 핀은 고장난 계측기다"
+            assert _deficit_shape_ok((True,)) is False, "합성 1원소 표본을 통과시켰다"
+            assert _d.axes is not None and _d.axes["ready"] is True, "결손 반환에 2축이 없다"
+            assert _d.axes["awake"] is True and _d.axes["awake_pending"] == [], \
+                "전원 각성 팀에서 awake 축이 참이 아니다: %r" % (_d.axes,)
+            assert (_d.has, _d.why) == (_has, _why), "이름 있는 접근자가 튜플 원소와 다르다"
+            # ★★무동작의 **핵심 핀** — '관측되지만 결손이 아니다'.
+            #   전원 각성 fixture 로는 이 계약을 잴 수 없다(awake 를 결손에 끌어들여도 결과가
+            #   같아서 변이가 살아남는다 — 실측으로 확인한 계측 구멍). 그래서 **ready 이지만
+            #   각성 미확정인 좌석이 하나 섞인** fixture 로 잰다: awake 축은 그 좌석을 정확히
+            #   짚어야 하고, 그럼에도 결손은 0 이어야 한다(1단에서 awake 는 exit·boot 호출
+            #   판정에 참여하지 않는다).
+            _st_presumed = _st([
+                {"role": "cso", "exited": False, "awakened_at": 1.0},
+                {"role": "worker", "exited": False, "awakened_at": 1.0},
+                {"role": "reviewer-gemini", "exited": False, "agent_alive": True},
+                {"role": "reviewer-codex", "exited": False, "awakened_at": 1.0}])
+            _dp = _shared_verdict_deficit(_st_presumed, requery=lambda: _st_presumed, tick_s=0,
+                                          detect=_yes, agents=_synth)
+            assert _dp[0] is False, \
+                "생존추정(각성 미확정) 좌석이 결손으로 계상됐다 — awake 축이 부트 판정에 " \
+                "새어 들어갔다(1단 무동작 위반 · 불필요 boot churn): %s" % _dp[1]
+            assert _dp.axes["awake"] is False \
+                and _dp.axes["awake_pending"] == ["reviewer-gemini"], \
+                "그 좌석을 awake 축이 짚지 못한다(관측 자체가 죽었다): %r" % (_dp.axes,)
+            assert _dp.axes["ready"] is True and _dp.axes["ready_missing"] == [], \
+                "각성 미확정이 ready 축까지 끌어내렸다(래치 이전 기계 전원 적색 회귀)"
+            # 판정 불가 경로는 `.axes` 도 None(미측정) — 빈 집계는 '재어 보니 이상 없음' 거짓 초록
+
+            def _detect_boom(_agent, _agents=None):
+                raise RuntimeError("로스터 산출 실패 주입")
+
+            _dbad = _shared_verdict_deficit({"surfaces": []}, requery=lambda: {"surfaces": []},
+                                            tick_s=0, detect=_detect_boom, agents=_synth)
+            assert _dbad[0] is None and _dbad.axes is None, \
+                "판정 불가인데 축 집계가 값처럼 나왔다(미측정을 측정으로 위장): %r" % (_dbad,)
+            # ⓓ `check --json` — 축 노출 · 사람용 산문 미출력 · exit 계약 무변경
+            globals()["cys_status"] = lambda: _st_ok
+            globals()["reviewer_roster"] = lambda detect=None, agents=None: [
+                {"role": "reviewer-gemini", "agent": "gemini", "native": True,
+                 "substituted_for": None, "reason": "테스트 주입"},
+                {"role": "reviewer-codex", "agent": "codex", "native": True,
+                 "substituted_for": None, "reason": "테스트 주입"}]
+
+            class _CkJson(object):
+                json = True
+
+            class _CkBare(object):                # 속성 없는 Args(javis_idempotency 스파이 형상)
+                pass
+
+            _jb, _hb = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(_jb):
+                _rc_j = cmd_check(_CkJson())
+            with contextlib.redirect_stdout(_hb):
+                _rc_h = cmd_check(_CkBare())
+            _jout, _hout = _jb.getvalue(), _hb.getvalue()
+            assert _rc_j == 0 and _rc_h == 0, \
+                "정상 팀에서 exit 0 이 아니다(exit 계약 변형): json=%s human=%s" % (_rc_j, _rc_h)
+            assert "READY" not in _jout, "--json stdout 에 사람용 산문이 섞였다(기계 소비 파손)"
+            _pl = json.loads(_jout)               # 1줄 JSON — 산문 혼입이면 여기서 죽는다
+            assert _pl["exit"] == 0 and _pl["ready"] is True and _pl["awake"] is True, \
+                "payload 2축이 정상 팀을 정확히 말하지 않는다: %r" % (_pl,)
+            assert _pl["awake_pending"] == [] and _pl["axis"] is True, \
+                "축 on 인데 awake_pending 이 빈 목록이 아니다: %r" % (_pl,)
+            assert "LLM orchestrating READY" in _hout, \
+                "사람용 경로의 READY 문안이 사라졌다(디렉티브 5곳·preflight C03 핀 파손)"
+            # ★exit 2(판정 불가)도 `--json` 이면 JSON 이어야 한다 — 여기만 산문이면 소비자의
+            #   json.loads 가 **데몬 소실 순간에** 죽는다(진단이 가장 필요한 순간).
+            #   그리고 exit 2 는 노드에 대해 아무것도 말하지 않으므로 전 판정 필드가 null 이다
+            #   (ready=false 로 두면 '재어 보니 안 섰다'는 없는 측정을 지어내는 것이다).
+            globals()["cys_status"] = lambda: None
+            _nb, _neb = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(_nb), contextlib.redirect_stderr(_neb):
+                _rc_n = cmd_check(_CkJson())
+            _npl = json.loads(_nb.getvalue())
+            assert _rc_n == 2, "데몬 소실인데 exit 2 가 아니다(판정 불가↔미기동 오귀속)"
+            assert _npl["exit"] == 2 and _npl["ready"] is None \
+                and _npl["awake"] is None and _npl["verdicts"] is None, \
+                "exit 2 payload 가 없는 측정을 지어냈다: %r" % (_npl,)
+            assert "cys ping" in _neb.getvalue(), \
+                "판정 불가 처방(`cys ping`)이 사라졌다 — 조용한 강등"
+            _nb2 = io.StringIO()
+            with contextlib.redirect_stdout(_nb2):
+                _rc_n2 = cmd_check(_CkBare())
+            assert _rc_n2 == 2 and "cys ping" in _nb2.getvalue(), \
+                "사람용 exit 2 문안이 stdout 에서 사라졌다(종전 계약 파손)"
+            globals()["cys_status"] = lambda: _st_ok
+            # ⓔ 롤백 1지점 — 마스터·축 **각각 하나**로 종전 1축 판정으로 복귀한다
+            for _knob in (BOOT_GATES_ENV, AWAKE_AXIS_ENV):
+                os.environ[_knob] = "0"
+                try:
+                    assert awake_axis_enabled() is False, "%s=0 이 축을 끄지 못한다" % _knob
+                    _voff, _ = check_verdicts(_st(_base), detect=_yes, agents=_synth)
+                    assert _voff == {r: {k: x for k, x in v.items()
+                                         if k not in ("ready", "awake")}
+                                     for r, v in _v3.items()}, \
+                        "%s=0 의 판정 dict 가 종전 모양과 다르다(되돌림이 참이 아니다)" % _knob
+                    _axoff = verdict_axes(_voff)
+                    assert _axoff["awake"] is None and _axoff["awake_pending"] is None, \
+                        "축 off 에서 awake 가 None(미측정)이 아니다 — []·False 는 거짓 초록이다"
+                    assert _axoff["ready_missing"] == _ax["ready_missing"], \
+                        "%s=0 이 ready 축까지 흔들었다(축 노브의 교차 오염)" % _knob
+                    _doff = _shared_verdict_deficit(_st_ok, requery=lambda: _st_ok, tick_s=0,
+                                                    detect=_yes, agents=_synth)
+                    assert tuple(_doff) == tuple(_d), \
+                        "축 on/off 로 결손 판정이 달라졌다(1단 무동작 계약 위반): %r" % (_doff,)
+                    _jb2 = io.StringIO()
+                    with contextlib.redirect_stdout(_jb2):
+                        _rc2 = cmd_check(_CkJson())
+                    _pl2 = json.loads(_jb2.getvalue())
+                    assert _rc2 == _rc_j and _pl2["exit"] == 0, \
+                        "%s=0 이 exit 계약을 흔들었다(롤백이 기저보다 파괴적)" % _knob
+                    assert _pl2["awake"] is None and _pl2["awake_pending"] is None \
+                        and _pl2["axis"] is False, \
+                        "%s=0 인데 payload 가 축을 측정한 것처럼 말한다: %r" % (_knob, _pl2)
+                finally:
+                    os.environ.pop(_knob, None)
+            assert awake_axis_enabled() is True, "킬스위치 복원 실패(검체 오염)"
+        finally:
+            globals().update(_globals_prev)
+            for _k, _v in _axis_prev.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
         # A12 exit 분류
         assert classify_call_exit(0)[0] == EXIT_CLASS_OK, "rc0 이 ok 아님"
         assert classify_call_exit(2)[0] == EXIT_CLASS_PERMANENT, "exit 2 가 영구 실패 아님"
@@ -2626,7 +3068,9 @@ def cmd_self_test(args):
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
     print("javis_orchestra self-test OK (W2: PLAN 정책열·slot_satisfied 3케이스·check_verdicts "
-          "강등라벨·A12 exit 분류 + 4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
+          "강등라벨·A12 exit 분류 + U-25 완주 2축(ready 별칭 불변·awake 관측·축 집계·"
+          "결손 2원소 호환[합성 3원소 표본]·check --json·마스터/축 롤백 2노브) + "
+          "4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
           "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
     return 0
 
@@ -2643,7 +3087,11 @@ def main():
     ap = argparse.ArgumentParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("check", help="4종 의무 노드 생존 판정")
+    ck = sub.add_parser("check", help="4종 의무 노드 생존 판정")
+    ck.add_argument("--json", action="store_true",
+                    help="완주 2축(ready ∧ awake)을 stdout 에 1줄 JSON 으로 출력(U-25 1단 — "
+                         "관측 전용: exit 계약 무변경 · 사람용 산문 미출력). awake·awake_pending "
+                         "이 null 이면 미측정(축 off·구 팩 스큐)이지 '각성 없음'이 아니다")
 
     br = sub.add_parser("boot-reviewers",
                         help="리뷰어(agy·codex) 감지→기동. 미감지/각성실패 시 Claude 대체로 자동 폴백(멈춤 없음)")

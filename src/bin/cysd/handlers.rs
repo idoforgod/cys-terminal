@@ -1670,6 +1670,431 @@ fn escalate_no_ceo(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, reason: 
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★U-18 · `surface.create` 최종 인증 게이트 (데몬 층)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ## 왜 데몬에 또 게이트가 필요한가
+//
+// 좌석 생성의 입구는 다섯이다 — ①`cys launch-agent` ②schedule `if_absent: launch`
+// ③`check_agent_death` node-recover ④phoenix auto-restore ⑤GUI. 그런데 PTY 를 실제로 만드는
+// 함수(`create_surface_with_env`)의 **비-테스트 호출부는 이 파일의 `surface.create` 한 곳뿐**이다.
+// 즉 다섯 경로가 전부 이 RPC 로 합류한다 — 그래서 게이트를 다섯 벌 만들지 않고 여기 하나만 둔다.
+// (그 합류가 깨지면 이 게이트는 조용히 새므로 헬스 검체 `H-AUTH-SELFLOOP` 가 호출부 개수를 센다.)
+//
+// ## ★게이트의 자리 — ④ active-limit 뒤 · `create_surface_with_env` 앞
+//
+// 그보다 **앞**이면 좌석 승계(`takeover_empty_seat`)와 멱등 재사용(`idempotency_key`)까지 막는다.
+// 둘 다 "새 PTY 를 만들지 않는" 경로인데 인증을 이유로 막으면 **살아 있는 좌석의 부활·재수령이
+// 잠긴다**(2026-07-17 실사고의 재현). 그보다 **뒤**면 PTY 가 이미 태어나 관문 화면이 뜨고,
+// 그 화면의 `❯` 가 readiness 오탐을 내고 주입 Return 이 좌석을 죽인다(킬체인).
+//
+// ★그리고 이 지점은 **락 미보유 구간**이다. 위 게이트들(특권 역할 하이재킹·멱등·active-limit)은
+// `surfaces`/`roles` 락을 각자 짧은 스코프에서 잡았다가 **전부 놓고** 나온다. 그래서 여기서
+// 파일 stat 과 `health_rules` 락을 잡아도 데몬 전체가 멈추지 않는다 — 반대로 이 코드를 위쪽
+// 임계영역 안으로 옮기면 수십 ms 짜리 IO 가 전 연산을 정지시킨다(`seat_claimable_now` 주석과
+// 같은 함정).
+//
+// ## 비싼 조회 금지 — 데몬은 오라클을 돌리지 않는다
+//
+// 인증 판정의 오라클은 `claude auth status --json` 인데, 그것은 **서브프로세스**다. 데몬이 동기로
+// 부르면 tokio 워커를 점유하고 `PIPE_LISTENER_POOL=8` 이 포화된다. 게다가 그 명령은 대상 config
+// dir 에 `.claude.json`·`.lock`·`backups/` 를 **만든다**(V-g 실측) — 데몬이 사용자 파일을 만드는
+// 부작용까지 얻는다. ∴ 데몬은 **CLI 가 이미 얻은 verdict 를 검증**만 한다. 검증 비용은
+// `.claude.json` 한 번의 `stat` 이고, 그마저 **거부를 주장하는 verdict 가 실제로 왔을 때만** 든다
+// (통과 verdict·verdict 부재 = IO 0). mtime 메모(TTL)는 부트 버스트에서 그 stat 마저 줄인다.
+//
+// ## ★오살 방어 — 이 게이트가 거부하지 **않는** 것들 (제1 계약: 오살 ≫ 오탐)
+//
+//   · verdict 가 **없으면** 거부하지 않는다. 구 CLI·GUI·스크립트는 이 파라미터를 모른다 —
+//     모른다고 좌석을 못 만들면 그 순간 전 경로가 죽는다(스큐 안전).
+//   · **`evidence_grade == "config_only"`** 면 거부하지 않는다. V-g 실측에서 API키로 인증된
+//     프로필과 아무 인증도 없는 프로필의 `.claude.json` 은 **동일**했다(자격증명은 env·Keychain
+//     에 있다). config 만 보고 막으면 정상 api_key·oauth_token·bedrock 좌석이 **전멸**한다.
+//   · verdict 가 **다른 프로필**의 것이거나(귀속 실패), **낡았거나**(벽시계 상한), 그 사이
+//     `.claude.json` 이 **바뀌었으면** 거부하지 않는다. 셋 다 "증명하지 못했다" 이며,
+//     증명하지 못한 것으로 살아있는 것을 죽이지 않는다.
+//   · payload 가 우리가 아는 계약이 아니면(미지 `auth_class`, `allows_spawn` 과 등급의 모순,
+//     신선도 필드 결손) 거부하지 않는다. **불일치는 다수결로 접지 않고** 측정 실패로 낸다.
+//
+// ★거부해도 **아무것도 죽이지 않는다.** 귀결은 `close` 가 아니라 명시 오류 하나이고, 그 시점엔
+//   PTY 도 surface 도 만들어지지 않았다(치명위험 ④ — 전 pane 사망 경로 차단).
+//
+// ## ★자기 발화 루프 차단
+//
+// 데몬의 watchdog 은 pane **화면 텍스트**를 정규식으로 훑는다(`run_health_rules`). 이 게이트의
+// 처방 문안이 pane 에 렌더되는 순간 그 문장이 `not_logged_in`·`login_required` 같은 룰에 매칭되면
+// → `health.alert` → auth 인터록 300초 차단 + 좌석 오염으로 **우리 경고가 좌석을 죽인다**.
+// 그래서 ⓐ 고정 문안은 어떤 룰에도 매칭되지 않게 쓰고(단위검체가 **생산 룰 집합**으로 박제),
+// ⓑ 변수부(사용자 소유 경로 등)가 룰을 건드리면 고정 문안만 남기며, ⓒ 그마저 매칭되면
+// (사용자가 병적인 룰을 추가한 경우) 마스킹한다. 정보량보다 루프 차단이 우선이다.
+//
+// ## 롤백 스위치 — **새 노브를 만들지 않는다**
+//
+// 이 게이트는 U-17 판정기의 **소비자**일 뿐이라 자기 env 를 갖지 않는다. `profile_gate` 의 축
+// 노브(`CYS_PROFILE_GATE_OBSERVE_ONLY=1`)와 마스터(`CYS_BOOT_GATES=0`) 어느 쪽이든 눌리면 이
+// 게이트도 **경고 전용**으로 강등된다(관측 이벤트만 남기고 통과). 사고 순간에 사람이 노브를
+// 조합할 수는 없으므로, 노브를 늘리는 것 자체가 위험이다.
+
+/// 인증 전제 verdict 의 **유통기한**(초).
+///
+/// mtime 만으로는 신선도를 증명하지 못한다 — V-g 실측에서 `ANTHROPIC_API_KEY` 하나로 인증이
+/// 켜지는데 `.claude.json` 은 한 글자도 바뀌지 않았다. ∴ 벽시계 상한이 반드시 함께 필요하다.
+pub(crate) const AUTH_VERDICT_MAX_AGE_SECS: f64 = 120.0;
+
+/// 미래 시각 허용 폭(초) — 시계 스큐. 이보다 먼 미래는 조작이거나 시계 파손이므로 신선도 불인정.
+pub(crate) const AUTH_VERDICT_FUTURE_SKEW_SECS: f64 = 5.0;
+
+/// `<config dir>/.claude.json` mtime 메모의 TTL(초). 부트 버스트(한 번에 4좌석) 안에서 stat 을
+/// 한 번으로 접되, "방금 로그인하고 재시도" 를 막지 않을 만큼 짧게. ★메모가 낡으면 결과는
+/// 언제나 **불일치 → 통과**(fail-open)라서, 이 캐시는 과잉 차단을 만들 수 없다.
+const AUTH_MTIME_MEMO_TTL_SECS: f64 = 3.0;
+
+/// mtime 메모 상한(엔트리) — 넘으면 만료분 lazy GC(`create_idem`·`tool_duration` 선례).
+const AUTH_MTIME_MEMO_CAP: usize = 64;
+
+/// ★처방 문안의 **고정부**. 이 문자열은 어떤 헬스룰에도 매칭되어선 안 된다
+/// (`auth_gate_prescription_never_matches_a_health_rule` 가 생산 룰 집합으로 박제한다).
+/// 영어 `not logged in`·`/login`·`401`·`expired` 를 쓰지 않는 것이 그 이유이며,
+/// **읽기 쉬움을 위해 그 단어들을 되돌리면 좌석이 죽는다.**
+pub(crate) const AUTH_GATE_PRESCRIPTION: &str =
+    "좌석 생성 거부(인증 전제) — 이 프로필로 노드를 세우면 관문 화면 앞에 선다. \
+     사람이 그 프로필로 노드를 한 번 열어 관문을 통과시킨 뒤 다시 시도하라. \
+     되돌리기: CYS_BOOT_GATES=0 (또는 CYS_PROFILE_GATE_OBSERVE_ONLY=1).";
+
+/// 거부 응답의 오류 코드(계약 — 소비부가 문자열로 분기한다).
+pub(crate) const AUTH_GATE_ERROR_CODE: &str = "profile_auth_denied";
+
+/// CLI 가 `surface.create` 에 실어 보내는 인증 전제 verdict — `profile_gate::report_json` 의
+/// 필드에 **신선도 2필드**(`config_mtime`·`observed_at`)를 더한 형태.
+///
+/// 신선도 2필드가 **필수**인 이유: 없으면 verdict 의 나이를 알 수 없고, 나이를 모르는 판정으로
+/// 좌석을 막으면 "한 시간 전에 미인증이었다" 가 지금의 거부 근거가 된다. 구 CLI 는 이 필드를
+/// 모르므로 결손 → 거부 없음(스큐 안전).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SuppliedAuthVerdict {
+    /// verdict 가 **어느 프로필**을 잰 것인가. 실제 좌석의 config dir 과 다르면 귀속 실패다.
+    pub profile_dir: String,
+    pub class: cys::profile_gate::AuthClass,
+    /// `evidence_grade == "oracle_verified"` 인가. **config only 위에서는 차단하지 않는다.**
+    pub oracle_verified: bool,
+    pub reason: String,
+    /// 판정 시점의 `<profile_dir>/.claude.json` mtime(초). 파일 부재면 `None`.
+    pub config_mtime: Option<f64>,
+    /// 판정 시각(epoch 초).
+    pub observed_at: f64,
+    /// 판정기가 관측 전용 모드였는가 — 그 verdict 는 차단 근거가 아니다.
+    pub observe_only: bool,
+}
+
+/// `auth_class` 문자열 → 등급. **정본 전수 배열을 훑는다**(여기서 8값을 재나열하면 U-17 이 값을
+/// 늘렸을 때 이쪽만 모르는 채로 조용히 통과한다).
+fn auth_class_from_str(s: &str) -> Option<cys::profile_gate::AuthClass> {
+    cys::profile_gate::AuthClass::ALL
+        .into_iter()
+        .find(|c| c.as_str() == s)
+}
+
+/// `params["profile_auth"]` → verdict. **순수**(IO·env 없음).
+///
+/// `Err` 는 전부 "우리가 아는 계약이 아니다" 이며 **차단 근거가 되지 않는다** — 호출부가 통과로
+/// 처리하고 이유를 이벤트로만 남긴다(측정 실패를 차단으로 바꾸지 않는다).
+pub(crate) fn parse_supplied_auth_verdict(
+    params: &Value,
+) -> Result<SuppliedAuthVerdict, &'static str> {
+    let v = params.get("profile_auth").ok_or("absent")?;
+    if v.is_null() {
+        return Err("absent");
+    }
+    let obj = v.as_object().ok_or("not_an_object")?;
+    let profile_dir = obj
+        .get("profile_dir")
+        .and_then(|x| x.as_str())
+        .ok_or("no_profile_dir")?;
+    let class_s = obj
+        .get("auth_class")
+        .and_then(|x| x.as_str())
+        .ok_or("no_auth_class")?;
+    // ★미지 등급 = 신·구 바이너리 스큐. 통과시키고 이벤트로 드러낸다 — 모르는 토큰은 증거가
+    //   아니며, 모르는 토큰으로 전 좌석을 막는 것이 이 저장소가 반복해 낸 사고다.
+    let class = auth_class_from_str(class_s).ok_or("unknown_auth_class")?;
+    let grade = obj
+        .get("evidence_grade")
+        .and_then(|x| x.as_str())
+        .ok_or("no_evidence_grade")?;
+    // ★교차검증 — 보낸 쪽의 boolean 과 등급 열거의 귀결이 갈리면 그 payload 는 계약이 아니다.
+    //   다수결로 접지 않고 측정 실패로 낸다(eval-driven 원칙: 불일치는 독립 재유도).
+    if let Some(b) = obj.get("allows_spawn").and_then(|x| x.as_bool()) {
+        if b != class.allows_spawn() {
+            return Err("allows_spawn_contradicts_class");
+        }
+    }
+    let observed_at = obj
+        .get("observed_at")
+        .and_then(|x| x.as_f64())
+        .ok_or("no_observed_at")?;
+    let config_mtime = match obj.get("config_mtime") {
+        None => return Err("no_config_mtime"),
+        Some(Value::Null) => None,
+        Some(x) => Some(x.as_f64().ok_or("config_mtime_not_a_number")?),
+    };
+    Ok(SuppliedAuthVerdict {
+        profile_dir: profile_dir.to_string(),
+        class,
+        oracle_verified: grade == cys::profile_gate::EvidenceGrade::OracleVerified.as_str(),
+        reason: obj
+            .get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        config_mtime,
+        observed_at,
+        observe_only: obj
+            .get("observe_only")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+/// 게이트의 귀결. `Ignored` 는 "거부 주장은 있었으나 증명되지 않았다" 이며 **통과**다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthGateOutcome {
+    Pass,
+    Deny,
+    Ignored(&'static str),
+}
+
+/// config dir 문자열 비교 — 구분자·후행 슬래시만 정규화한다.
+///
+/// ★일부러 관대하지 않다: 정규화로 못 맞춘 경우의 귀결은 `Ignored`(통과)이므로 **비교 실패의
+/// 대가는 오탐이 아니라 미탐**이고, 그것이 이 저장소가 고른 방향이다. Windows 의 드라이브
+/// 대소문자·UNC 는 실측(V-k) 전까지 손대지 않는다 — 추측으로 넓히면 남의 프로필 verdict 로
+/// 좌석을 막는 길이 열린다.
+fn same_config_dir(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let t = s.replace('\\', "/");
+        let t = t.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            t.to_ascii_lowercase()
+        } else {
+            t
+        }
+    };
+    norm(a) == norm(b)
+}
+
+/// ★게이트 판정의 **유일한 소유자**. 순수함수(IO·env·시계 없음 — 전량 진리표 대상).
+///
+/// 규약 — 거부는 다음 **전부**가 참일 때만이다:
+///   ① 등급이 통과가 아니다(`AuthClass::allows_spawn() == false`)
+///   ② 증거가 **오라클**이다(config only 위에서 차단하면 정상 좌석이 전멸한다)
+///   ③ verdict 가 **이 프로필**의 것이다
+///   ④ verdict 가 **최근**이다(벽시계 상한 · 미래 시각 배제)
+///   ⑤ 그 사이 `.claude.json` 이 **바뀌지 않았다**
+/// 하나라도 못 지키면 `Ignored` 이며, `Ignored` 는 통과다.
+pub(crate) fn auth_gate_decide(
+    v: &SuppliedAuthVerdict,
+    effective_config_dir: &str,
+    observed_config_mtime: Option<f64>,
+    now: f64,
+) -> AuthGateOutcome {
+    if v.class.allows_spawn() {
+        return AuthGateOutcome::Pass;
+    }
+    if v.observe_only {
+        return AuthGateOutcome::Ignored("verdict_observe_only");
+    }
+    if !v.oracle_verified {
+        // ★U-17 의 오살 경보를 그대로 집행한다 — config 만 본 판정은 정상 api_key·oauth_token·
+        //   bedrock 프로필을 전부 비통과로 낸다. 그 위의 차단은 전멸이다.
+        return AuthGateOutcome::Ignored("config_only_evidence");
+    }
+    if !same_config_dir(&v.profile_dir, effective_config_dir) {
+        return AuthGateOutcome::Ignored("profile_mismatch");
+    }
+    if now - v.observed_at > AUTH_VERDICT_MAX_AGE_SECS {
+        return AuthGateOutcome::Ignored("verdict_stale");
+    }
+    if v.observed_at - now > AUTH_VERDICT_FUTURE_SKEW_SECS {
+        return AuthGateOutcome::Ignored("verdict_from_the_future");
+    }
+    if v.config_mtime != observed_config_mtime {
+        return AuthGateOutcome::Ignored("config_changed");
+    }
+    AuthGateOutcome::Deny
+}
+
+/// `<dir>/.claude.json` 의 mtime(초). 부재·권한 실패는 `None`(부재와 측정 실패를 구별하지 않는
+/// 이유: 둘 다 verdict 의 `config_mtime` 과 **일치할 때만** 차단으로 이어지고, 불일치는 통과다).
+fn config_json_mtime(dir: &str) -> Option<f64> {
+    std::fs::metadata(std::path::Path::new(dir).join(".claude.json"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
+/// mtime TTL 메모(`accounts.rs IdentEntry{mtime, ident}` 선례). **stat 은 락 밖에서** 한다.
+fn config_json_mtime_memo(dir: &str, now: f64) -> Option<f64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    /// config dir → (관측된 mtime, 관측 시각). `Option` 바깥이 '파일이 없다', 시각이 TTL 축이다.
+    type MtimeMemo = Mutex<HashMap<String, (Option<f64>, f64)>>;
+    static MEMO: OnceLock<MtimeMemo> = OnceLock::new();
+    let m = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let g = m.lock().unwrap();
+        if let Some((mt, seen)) = g.get(dir) {
+            if now >= *seen && now - *seen < AUTH_MTIME_MEMO_TTL_SECS {
+                return *mt;
+            }
+        }
+    }
+    let mt = config_json_mtime(dir); // ★락 미보유 구간에서 IO
+    let mut g = m.lock().unwrap();
+    if g.len() > AUTH_MTIME_MEMO_CAP {
+        g.retain(|_, (_, seen)| now - *seen < AUTH_MTIME_MEMO_TTL_SECS);
+    }
+    g.insert(dir.to_string(), (mt, now));
+    mt
+}
+
+/// 처방 문안 조립 — ★반환값은 **어떤 헬스룰에도 매칭되지 않는다**(자기 발화 루프 차단).
+///
+/// 고정부는 검체가 박제하고, 변수부(사용자 소유 경로가 섞인다)는 **런타임에 생산 룰로 검사**해
+/// 매칭되면 버린다. 경로 하나 때문에 좌석이 300초 잠기는 것보다 경로를 안 보여주는 편이 낫다.
+pub(crate) fn auth_gate_message(
+    rules: &[HealthRule],
+    class: &str,
+    reason: &str,
+    profile_dir: &str,
+) -> String {
+    let full =
+        format!("{AUTH_GATE_PRESCRIPTION} 등급={class} 근거={reason} 프로필={profile_dir}");
+    let hits = |s: &str| rules.iter().any(|r| r.regex.is_match(s));
+    if !hits(&full) {
+        return full;
+    }
+    if !hits(AUTH_GATE_PRESCRIPTION) {
+        return AUTH_GATE_PRESCRIPTION.to_string();
+    }
+    crate::state::mask_health_line(AUTH_GATE_PRESCRIPTION, rules)
+}
+
+/// ★게이트 본체 — `Some(reply)` 면 좌석을 만들지 않고 그 응답으로 끝낸다.
+///
+/// 호출 자리는 `surface.create` 의 ④ active-limit **뒤**, `create_surface_with_env` **앞**
+/// (이 파일 상단 절의 '게이트의 자리' 참조). 여기서만 호출된다.
+fn surface_create_auth_gate(
+    daemon: &Arc<Daemon>,
+    id: &Value,
+    params: &Value,
+    caller_pid: Option<u32>,
+) -> Option<Reply> {
+    let supplied = match parse_supplied_auth_verdict(params) {
+        Ok(v) => v,
+        // 파라미터 부재 = 종전 동작. 이벤트조차 내지 않는다(구 호출자가 대부분이라 소음이 된다).
+        Err("absent") => return None,
+        Err(why) => {
+            daemon.bus.publish(
+                "surface.auth_ignored",
+                "system",
+                None,
+                json!({"reason": why, "path": "surface.create", "caller_pid": caller_pid}),
+            );
+            return None;
+        }
+    };
+    // 통과 등급이면 아무것도 하지 않는다 — **IO 0**(데몬 핫패스 보호).
+    if supplied.class.allows_spawn() {
+        return None;
+    }
+    // ★롤백 — 판정기가 관측 전용(축 노브 또는 마스터 `CYS_BOOT_GATES=0`)이면 차단하지 않는다.
+    //   env 판독은 `profile_gate::observe_only()` 1지점이며 IO 는 여전히 0이다.
+    if cys::profile_gate::observe_only() {
+        daemon.bus.publish(
+            "surface.auth_warn",
+            "system",
+            None,
+            json!({"auth_class": supplied.class.as_str(), "reason": supplied.reason,
+                   "path": "surface.create", "caller_pid": caller_pid,
+                   "why": "observe_only"}),
+        );
+        return None;
+    }
+    // 여기서부터가 유일한 IO 경로다 — **거부를 주장하는 verdict 가 실제로 왔을 때만** 진입한다.
+    let cfg_dir =
+        param_str(params, "claude_config_dir").unwrap_or_else(cys::resolve_claude_config_dir);
+    let now = crate::state::now_epoch();
+    let observed = config_json_mtime_memo(&cfg_dir, now);
+    match auth_gate_decide(&supplied, &cfg_dir, observed, now) {
+        AuthGateOutcome::Pass => None,
+        AuthGateOutcome::Ignored(why) => {
+            daemon.bus.publish(
+                "surface.auth_ignored",
+                "system",
+                None,
+                json!({"reason": why, "auth_class": supplied.class.as_str(),
+                       "verdict_reason": supplied.reason, "path": "surface.create",
+                       "caller_pid": caller_pid}),
+            );
+            None
+        }
+        AuthGateOutcome::Deny => {
+            let msg = {
+                // 락 스코프 최소화 — 이 지점은 surfaces/roles 락 미보유 구간이고, health_rules 는
+                // 어떤 락도 잡지 않는 잎 뮤텍스라 여기서 잡아도 순서 규약을 건드리지 않는다.
+                let rules = daemon.health_rules.lock().unwrap();
+                auth_gate_message(
+                    &rules,
+                    supplied.class.as_str(),
+                    &supplied.reason,
+                    &supplied.profile_dir,
+                )
+            };
+            daemon.bus.publish(
+                "surface.auth_denied",
+                "system",
+                None,
+                json!({"auth_class": supplied.class.as_str(), "verdict_reason": supplied.reason,
+                       "profile_dir": supplied.profile_dir, "path": "surface.create",
+                       "caller_pid": caller_pid, "message": msg}),
+            );
+            // ★귀결은 close 가 아니라 명시 오류다. 이 시점엔 PTY 도 surface 도 없다(치명위험 ④).
+            Some(Reply::Single(err_response(id, AUTH_GATE_ERROR_CODE, &msg)))
+        }
+    }
+}
+
+/// ★(U-22) `hook.decide` **페이로드** 계약 버전.
+///
+/// 전송 프로토콜(`wire::PROTO_PV`)은 무접촉이다 — 이것은 이 메서드 응답 형상만의 버전이며,
+/// CLI 측 상수(`src/bin/cys.rs HOOK_DECIDE_CONTRACT_V`)와 **같은 값**이어야 한다.
+/// 3중 정합(cys.rs · handlers.rs · hooks/role-bootstrap.sh)은 검체 H-HOOK-DECIDE-2 가 강제한다.
+const HOOK_DECIDE_CONTRACT_V: u64 = 1;
+/// 지원 훅 이벤트 — clap 서브커맨드 `cys hook user-prompt-submit` 과 같은 철자.
+const HOOK_EVENT_USER_PROMPT_SUBMIT: &str = "user-prompt-submit";
+
+/// ★(U-22) `hook.decide` 판정의 **순수 코어**(진리표 대상 — 데몬 상태를 하나도 읽지 않는다).
+///
+/// 입력은 좌석 해석 결과 하나다:
+///   · `Err(why)` = 좌석을 해석하지 못했다 → **판정 불가**. 차단이 아니다 — 셸이 종전 규칙으로
+///     마무리한다(오살이 오탐보다 훨씬 위험하다는 이 저장소의 제1 계약).
+///   · `Ok("")`   = 미claim 좌석 · `Ok("master")` = master 좌석 → 통과.
+///   · `Ok(그 밖)` = 워커·CSO·리뷰어·**미지 role** 전부 차단(A3 denylist→allowlist 반전).
+///
+/// 규칙은 종전 셸 게이트(`hooks/role-bootstrap.sh` 의 `case "$MYROLE" in master|"")`)와 **한 글자도
+/// 다르지 않다**. 이 단위가 옮기는 것은 판정의 *위치*(단명 훅 → 데몬 메모리)와 *권위*(클라이언트
+/// 자기신고 → 커널 peer pid 도출)이지 판정의 *내용*이 아니다.
+fn hook_decide_verdict(seat: Result<&str, &'static str>) -> (&'static str, &'static str) {
+    match seat {
+        Err(why) => ("undecided", why),
+        Ok("") => ("proceed", "unclaimed_seat"),
+        Ok("master") => ("proceed", "master_seat"),
+        Ok(_) => ("suppress", "non_master_role"),
+    }
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
@@ -1679,6 +2104,72 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
     }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),
+
+        // ─── ★(U-22) 훅 결정 프런트도어 — **인메모리 즉답 전용** ──────────────────────────
+        //
+        // 근본원인 R2: 부트 판정이 30초짜리 단명 UserPromptSubmit 훅에서 python 프로세스 7~14 개를
+        // 띄우며 일어났고, 모든 불확실성이 침묵으로 접혔다. 이 arm 은 그 판정 중 **데몬이 이미
+        // 메모리에 들고 있는 사실**(좌석·역할)만 1왕복으로 돌려준다 — 판정의 *위치*를 옮기는 것이
+        // 목적이고, 판정 *규칙*은 종전 셸 게이트(A3 allowlist)와 **한 글자도 다르지 않다**.
+        //
+        // ★핫패스 금지 3종(이 arm 에 절대 들어오면 안 되는 것):
+        //     ① 프로세스 스폰      ② `claude auth status` 등 외부 조회      ③ fsync·디스크 쓰기
+        //   훅은 사람의 프롬프트 **앞**에 서 있다 — 여기서 쓰는 시간이 곧 입력 지연이고,
+        //   여기서 나는 hang 이 곧 "프롬프트 제출 먹통"이다(2026-08-21 W-A0 이 이미 치른 값).
+        //
+        // ★인가 계약: 요청은 `surface_id` 를 **신고할 수 없다**. 좌석은 데몬이 커널 peer pid 의
+        //   조상 체인(`resolve_caller_surface`)으로 도출한다 — `claim_role`·`usage.event` 와 같은
+        //   규약이다. 자기신고 `CYS_SURFACE_ID` 는 위조 가능하므로 신뢰하지 않으며, 신고 필드가
+        //   실려 오면 **조용히 무시하지 않고** invalid_params 로 거절한다(계약 위반을 침묵으로
+        //   접으면 다음 호출자가 그 필드를 믿게 된다).
+        //
+        // ★`contract_version` 은 페이로드 필드다 — `wire::PROTO_PV` 는 무접촉이다.
+        "hook.decide" => {
+            if params.get("surface_id").is_some() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.decide: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다",
+                ));
+            }
+            let event = param_str(&params, "event").unwrap_or_default();
+            if event != HOOK_EVENT_USER_PROMPT_SUBMIT {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    &format!("hook.decide: 미지 event: {event:?}"),
+                ));
+            }
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // 좌석 해석은 여기(상태 조회), 판정은 순수 코어(`hook_decide_verdict`)가 소유한다 —
+            // 규칙을 arm 안에 인라인하면 진리표를 시험할 수 없고, 시험되지 않는 allowlist 는
+            // 반드시 낡는다(A3 가 denylist 였을 때 정확히 그렇게 새어 나갔다).
+            let seat: Result<String, &'static str> = match caller_sid {
+                None => Err("caller_unresolved"),
+                Some(sid) => match daemon.get_surface(sid) {
+                    None => Err("surface_not_found"),
+                    Some(surface) => {
+                        Ok(surface.role.lock().unwrap().clone().unwrap_or_default())
+                    }
+                },
+            };
+            let (verdict, reason) = hook_decide_verdict(match &seat {
+                Ok(s) => Ok(s.as_str()),
+                Err(e) => Err(e),
+            });
+            let role = seat.ok();
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "contract_version": HOOK_DECIDE_CONTRACT_V,
+                    "event": event,
+                    "surface_id": caller_sid,
+                    "role": role,
+                    "verdict": verdict,
+                    "reason": reason,
+                }),
+            ))
+        }
 
         "system.identify" => {
             let caller = params.get("caller").cloned().unwrap_or(Value::Null);
@@ -1862,6 +2353,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 }
+            }
+            // ── 워커 기동 게이트 ⑤ (최종 인증 전제 · U-18) ──
+            // ★자리가 계약이다: ④ active-limit **뒤** · `create_surface_with_env` **앞**.
+            //   앞으로 옮기면 좌석 승계(takeover_empty_seat)와 멱등 재사용까지 막혀 **살아 있는
+            //   좌석의 부활·재수령이 잠긴다**. 뒤로 옮기면 PTY 가 이미 태어나 관문 화면이 뜨고
+            //   그 화면이 킬체인의 첫 칸이 된다. 그리고 이 지점은 **락 미보유 구간**이라
+            //   (위 세 게이트가 surfaces/roles 락을 전부 놓고 나왔다) 여기서 stat 을 해도
+            //   데몬 전체가 멈추지 않는다 — 판정 규약·오살 방어는 `surface_create_auth_gate` doc.
+            if let Some(reply) = surface_create_auth_gate(daemon, &id, &params, caller_pid) {
+                return reply;
             }
             // RC-3(B′): pane env 주입 — Windows launch-agent가 해소된 CLAUDE_CONFIG_DIR 등을 넘긴다
             // (순수 cmd send와 짝). params["env"] 객체(문자열 값만)를 (k,v) 벡터로. 부재 시 빈 벡터.
@@ -5816,6 +6317,40 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(U-22) `hook.decide` 판정 **진리표** — A3 반전 allowlist 를 완전 열거로 못박는다.
+    ///
+    /// 왜 진리표를 따로 두는가: 이 표가 한 칸이라도 틀리면 사고가 두 방향 중 하나로 난다.
+    ///   · 통과해야 할 master·미claim 좌석을 막으면 **마스터 부트가 죽는다**(오살 — 이 저장소가
+    ///     가장 무겁게 보는 방향).
+    ///   · 막아야 할 워커·CSO·리뷰어·**미지 role** 을 통과시키면 남의 pane 에서 팀 기동이 터진다
+    ///     (구 denylist 가 worker-2·cso-1·verifier 를 전부 흘려보낸 A3=B7 실측 결함).
+    /// 그리고 **판정 불가 칸은 차단이 아니다** — 그 칸이 suppress 로 바뀌면 데몬이 좌석을 잠깐
+    /// 못 읽는 순간마다 마스터 부트가 조용히 사라진다(불확실성이 침묵으로 접히는 R2 그 자체).
+    #[test]
+    fn hook_decide_verdict_truth_table() {
+        let table: [(Result<&str, &'static str>, &str, &str); 10] = [
+            (Ok("master"), "proceed", "master_seat"),
+            (Ok(""), "proceed", "unclaimed_seat"),
+            (Ok("worker"), "suppress", "non_master_role"),
+            (Ok("worker-2"), "suppress", "non_master_role"),
+            (Ok("cso-1"), "suppress", "non_master_role"),
+            (Ok("reviewer-gemini"), "suppress", "non_master_role"),
+            // 미지 role — 구 denylist 시대의 구멍. allowlist 반전의 존재 이유 그 자체다.
+            (Ok("verifier"), "suppress", "non_master_role"),
+            // 대소문자가 다르면 **다른 역할**이다(셸 `case master|""` 와 동일 — 관용 금지).
+            (Ok("Master"), "suppress", "non_master_role"),
+            (Err("caller_unresolved"), "undecided", "caller_unresolved"),
+            (Err("surface_not_found"), "undecided", "surface_not_found"),
+        ];
+        for (seat, want_v, want_r) in table {
+            assert_eq!(
+                hook_decide_verdict(seat),
+                (want_v, want_r),
+                "hook.decide 진리표 위반 — seat={seat:?}"
+            );
+        }
+    }
 
     /// CC v2 WS-C: learn.checkpoint 코어 — rounds 병합·discovery 치환·ledger append·
     /// 파손 state.json 내성(fail-open)·learn.status 읽기 스키마와의 정합 핀.
@@ -12754,6 +13289,459 @@ mod tests {
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ★U-18 · `surface.create` 최종 인증 게이트
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 이 게이트의 차단 경로를 만지는 테스트 전용 직렬화 락.
+    ///
+    /// `CYS_PROFILE_GATE_OBSERVE_ONLY` 는 **프로세스 전역**이라, 롤백 테스트가 그것을 켠 순간
+    /// 병렬로 도는 차단 테스트가 조용히 통과해 버린다(= 검체가 사문화된다). 그 창을 이 락 하나로
+    /// 닫는다. 이 env 의 소비자는 `profile_gate::observe_only()` 뿐이라 다른 레인과는 겹치지 않는다.
+    static AUTH_GATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// ★독약 내성 획득 — 한 검체가 적색이면 락이 poison 되고, 뒤이은 검체들이 `PoisonError` 로
+    /// 무너져 **어느 핀이 실제로 발화했는지 읽을 수 없게 된다**(계측 타당성 실험에서 실제로
+    /// 그렇게 가려졌다). 이 락은 상호배제만 하고 상태를 보호하지 않으므로 내성이 안전하다.
+    fn auth_gate_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        AUTH_GATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 격리 config dir + `.claude.json` 을 만들고 `(dir, mtime)` 을 돌려준다.
+    fn auth_profile_fixture(tag: &str) -> (std::path::PathBuf, f64) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-authgate-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            crate::state::now_epoch() as u64,
+            n
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let f = dir.join(".claude.json");
+        std::fs::write(&f, b"{\"hasCompletedOnboarding\":true}").expect("fixture config");
+        let mtime = std::fs::metadata(&f)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .expect("fixture mtime");
+        (dir, mtime)
+    }
+
+    /// `cys profile-auth` 가 보낼 payload 의 형태(= `profile_gate::report_json` + 신선도 2필드).
+    fn auth_payload(dir: &std::path::Path, class: &str, grade: &str, mtime: Option<f64>) -> Value {
+        let cls = cys::profile_gate::AuthClass::ALL
+            .into_iter()
+            .find(|c| c.as_str() == class);
+        json!({
+            "profile_dir": dir.to_string_lossy(),
+            "auth_class": class,
+            "allows_spawn": cls.map(|c| c.allows_spawn()).unwrap_or(false),
+            "evidence_grade": grade,
+            "reason": "oracle_logged_out",
+            "observe_only": false,
+            "config_mtime": mtime,
+            "observed_at": crate::state::now_epoch(),
+        })
+    }
+
+    fn create_rpc(daemon: &Arc<Daemon>, params: Value) -> Value {
+        let req = Request {
+            id: json!(1),
+            method: "surface.create".into(),
+            params,
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(993_001_u32)) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// ★자기 발화 루프 차단(U-18 의 핵심 검체 · 설계서 `H-AUTH-SELFLOOP`).
+    ///
+    /// 처방 문안이 pane 에 렌더되는 순간 그 문장이 auth 계열 헬스룰에 매칭되면 →
+    /// `health.alert` → 인터록 300초 차단 + 좌석 오염으로 **우리 경고가 좌석을 죽인다**.
+    /// 그래서 "생산 룰 집합"으로 직접 잰다(사본 정규식이 아니라 데몬이 실제로 쓰는 것).
+    ///
+    /// ★계측 타당성: 트리에 위반이 0이면 탐지기가 고장나도 초록이 되는 검체다. 그래서 먼저
+    /// **합성 표본**(실제로 룰을 때리는 문장들)이 잡히는지 확인하고, 그 다음에 우리 문안을 잰다.
+    #[test]
+    fn auth_gate_prescription_never_matches_a_health_rule() {
+        let daemon = claim_daemon();
+        // ★사본이 아니라 **데몬이 실제로 쓰는 룰 집합**을 잰다(사본 정규식이면 검체가 사문화된다).
+        let rules = daemon.health_rules.lock().unwrap();
+
+        // ① 탐지기 자체가 살아 있는가 — 합성 표본이 반드시 잡혀야 한다.
+        let hits = |s: &str| rules.iter().any(|r| r.regex.is_match(s));
+        for bad in [
+            "Error: not logged in",
+            "Please run /login to continue",
+            "401 Unauthorized",
+            "your token has expired",
+            "rate limited",
+        ] {
+            assert!(
+                hits(bad),
+                "계측 무효: 합성 표본이 어떤 헬스룰에도 걸리지 않는다 — 룰 집합이 비었거나 \
+                 이 검체가 재는 대상이 프로덕션 룰이 아니다: {bad:?}"
+            );
+        }
+        // 인터록이 보는 네 룰이 실제로 이 집합 안에 있어야 검체가 의미를 갖는다.
+        for r in crate::state::AUTH_INTERLOCK_RULES {
+            assert!(
+                rules.iter().any(|x| &x.name.as_str() == r),
+                "계측 무효: auth 인터록 룰 '{r}' 이 생산 룰 집합에 없다"
+            );
+        }
+
+        // ② 고정 처방 문안 — 어떤 룰에도 매칭되면 안 된다.
+        assert!(
+            !hits(AUTH_GATE_PRESCRIPTION),
+            "★처방 문안이 헬스룰에 매칭된다 — 이 문장이 pane 에 찍히는 순간 그 좌석이 300초 \
+             잠기고 오염된다(자기 발화 루프). 문안: {AUTH_GATE_PRESCRIPTION:?}"
+        );
+
+        // ③ 기계 필드(등급 8값 · 이유 12값)도 문안에 실린다 — 전수로 잰다.
+        for c in cys::profile_gate::AuthClass::ALL {
+            assert!(!hits(c.as_str()), "auth_class 문자열이 헬스룰에 매칭: {}", c.as_str());
+        }
+        for reason in [
+            "oracle_auth_method",
+            "oracle_logged_out",
+            "oracle_unknown_method",
+            "oracle_self_contradiction",
+            "oracle_contradicts_exit",
+            "oracle_unparsable",
+            "config_absent",
+            "config_unreadable",
+            "config_malformed",
+            "config_onboarding_incomplete",
+            "config_onboarding_unreadable",
+            "config_claim_is_not_authentication",
+        ] {
+            assert!(!hits(reason), "reason 문자열이 헬스룰에 매칭: {reason}");
+        }
+
+        // ④ 조립된 실제 문안 — 전 등급 × 전 이유 조합으로.
+        for c in cys::profile_gate::AuthClass::ALL {
+            let msg = auth_gate_message(&rules, c.as_str(), "oracle_logged_out", "/tmp/p/.claude");
+            assert!(
+                !hits(&msg),
+                "조립된 처방 문안이 헬스룰에 매칭({}): {msg:?}",
+                c.as_str()
+            );
+        }
+
+        // ⑤ ★적대 입력 — 사용자 소유 경로가 룰을 때리는 형태여도 반환값은 안전해야 한다.
+        //    (경로를 못 보여주는 대가로 좌석이 잠기지 않는 쪽을 고른 설계의 박제.)
+        let hostile = "/tmp/401 unauthorized/please run /login/.claude";
+        assert!(hits(hostile), "계측 무효: 적대 경로 표본이 룰에 안 걸린다");
+        let msg = auth_gate_message(&rules, "not_logged_in", "oracle_logged_out", hostile);
+        assert!(
+            !hits(&msg),
+            "★적대 경로가 처방 문안을 통해 새어 나갔다 — 이 한 줄이 좌석을 죽인다: {msg:?}"
+        );
+    }
+
+    /// 게이트 판정 순수함수의 진리표 — 거부는 **다섯 조건이 전부** 참일 때만이다.
+    #[test]
+    fn auth_gate_decide_denies_only_on_fresh_oracle_evidence_for_this_profile() {
+        let now = 1_000_000.0_f64;
+        let dir = "/tmp/prof/.claude";
+        let base = SuppliedAuthVerdict {
+            profile_dir: dir.to_string(),
+            class: cys::profile_gate::AuthClass::NotLoggedIn,
+            oracle_verified: true,
+            reason: "oracle_logged_out".into(),
+            config_mtime: Some(500.0),
+            observed_at: now - 1.0,
+            observe_only: false,
+        };
+        // 기준선 — 다섯 조건 전부 충족 → 거부.
+        assert_eq!(
+            auth_gate_decide(&base, dir, Some(500.0), now),
+            AuthGateOutcome::Deny,
+            "확정 미인증 + 오라클 증거 + 귀속 일치 + 신선 + config 무변경인데 통과했다"
+        );
+
+        // ① 통과 등급 5종은 무조건 통과(거부 집합에 절대 들어오지 않는다).
+        for c in cys::profile_gate::AuthClass::ALL {
+            let v = SuppliedAuthVerdict { class: c, ..base.clone() };
+            let got = auth_gate_decide(&v, dir, Some(500.0), now);
+            if c.allows_spawn() {
+                assert_eq!(got, AuthGateOutcome::Pass, "통과 등급이 막혔다: {}", c.as_str());
+            } else {
+                assert_eq!(got, AuthGateOutcome::Deny, "비통과 등급이 안 막혔다: {}", c.as_str());
+            }
+        }
+
+        // ② ★오살 방어 — config only 증거 위에서는 절대 막지 않는다.
+        //    (V-g: api_key 로 인증된 프로필과 미인증 프로필의 `.claude.json` 이 동일했다.)
+        let cfg_only = SuppliedAuthVerdict { oracle_verified: false, ..base.clone() };
+        assert_eq!(
+            auth_gate_decide(&cfg_only, dir, Some(500.0), now),
+            AuthGateOutcome::Ignored("config_only_evidence"),
+            "★config 만 본 판정으로 좌석을 막았다 — 정상 api_key·oauth_token·bedrock 좌석이 전멸한다"
+        );
+
+        // ③ 귀속 실패 / ④ 낡음 / ④' 미래 / ⑤ config 변경 — 전부 통과(증명 실패는 차단이 아니다).
+        let cases: [(SuppliedAuthVerdict, Option<f64>, &str); 5] = [
+            (
+                SuppliedAuthVerdict { profile_dir: "/tmp/other/.claude".into(), ..base.clone() },
+                Some(500.0),
+                "profile_mismatch",
+            ),
+            (
+                SuppliedAuthVerdict { observed_at: now - (AUTH_VERDICT_MAX_AGE_SECS + 1.0), ..base.clone() },
+                Some(500.0),
+                "verdict_stale",
+            ),
+            (
+                SuppliedAuthVerdict { observed_at: now + (AUTH_VERDICT_FUTURE_SKEW_SECS + 1.0), ..base.clone() },
+                Some(500.0),
+                "verdict_from_the_future",
+            ),
+            (base.clone(), Some(900.0), "config_changed"),
+            (
+                SuppliedAuthVerdict { observe_only: true, ..base.clone() },
+                Some(500.0),
+                "verdict_observe_only",
+            ),
+        ];
+        for (v, observed, why) in cases {
+            assert_eq!(
+                auth_gate_decide(&v, dir, observed, now),
+                AuthGateOutcome::Ignored(why),
+                "증명하지 못한 거부 주장이 차단으로 이어졌다(기대 Ignored({why}))"
+            );
+        }
+
+        // ⑥ 경계값 — 상한 '이하'는 여전히 신선하다(부등호 뒤집힘 감지).
+        let edge = SuppliedAuthVerdict { observed_at: now - AUTH_VERDICT_MAX_AGE_SECS, ..base.clone() };
+        assert_eq!(auth_gate_decide(&edge, dir, Some(500.0), now), AuthGateOutcome::Deny);
+        // ⑦ 후행 슬래시·구분자만 다른 같은 경로는 같은 프로필이다.
+        let slashed = SuppliedAuthVerdict { profile_dir: format!("{dir}/"), ..base.clone() };
+        assert_eq!(auth_gate_decide(&slashed, dir, Some(500.0), now), AuthGateOutcome::Deny);
+    }
+
+    /// payload 계약 위반은 **전부 통과**로 끝난다 — 측정 실패를 차단으로 바꾸지 않는다.
+    #[test]
+    fn supplied_auth_verdict_contract_violations_never_become_a_block() {
+        let mk = |pa: Value| json!({ "cmd": "sleep 30", "profile_auth": pa });
+        let cases: [(Value, &str); 7] = [
+            (json!({}), "no_profile_dir"),
+            (json!({"profile_dir": "/p"}), "no_auth_class"),
+            // ★미지 등급 = 신·구 바이너리 스큐. 모르는 토큰은 증거가 아니다.
+            (json!({"profile_dir": "/p", "auth_class": "brand_new_2027"}), "unknown_auth_class"),
+            (json!({"profile_dir": "/p", "auth_class": "not_logged_in"}), "no_evidence_grade"),
+            (
+                json!({"profile_dir": "/p", "auth_class": "not_logged_in",
+                       "evidence_grade": "oracle_verified", "allows_spawn": true}),
+                "allows_spawn_contradicts_class",
+            ),
+            (
+                json!({"profile_dir": "/p", "auth_class": "not_logged_in",
+                       "evidence_grade": "oracle_verified"}),
+                "no_observed_at",
+            ),
+            (
+                json!({"profile_dir": "/p", "auth_class": "not_logged_in",
+                       "evidence_grade": "oracle_verified", "observed_at": 1.0}),
+                "no_config_mtime",
+            ),
+        ];
+        for (pa, want) in cases {
+            assert_eq!(
+                parse_supplied_auth_verdict(&mk(pa.clone())).unwrap_err(),
+                want,
+                "계약 위반 분류가 어긋났다: {pa}"
+            );
+        }
+        // 파라미터 부재·null = 종전 동작(이벤트조차 내지 않는 조용한 통과).
+        assert_eq!(
+            parse_supplied_auth_verdict(&json!({"cmd": "sleep 30"})).unwrap_err(),
+            "absent"
+        );
+        assert_eq!(
+            parse_supplied_auth_verdict(&json!({"profile_auth": null})).unwrap_err(),
+            "absent"
+        );
+    }
+
+    /// ★거부의 귀결은 **close 가 아니라 명시 오류**다 — PTY 도 surface 도 태어나지 않는다.
+    #[test]
+    fn surface_create_denies_unauthenticated_profile_without_spawning_anything() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let (dir, mtime) = auth_profile_fixture("deny");
+        let before_ids = daemon.next_id.load(Ordering::SeqCst);
+        let before_surfaces = daemon.surfaces.lock().unwrap().len();
+
+        let resp = create_rpc(
+            &daemon,
+            json!({"cmd": "sleep 30", "role": "worker",
+                   "claude_config_dir": dir.to_string_lossy(),
+                   "profile_auth": auth_payload(&dir, "not_logged_in", "oracle_verified", Some(mtime))}),
+        );
+
+        assert_eq!(resp["ok"], json!(false), "미인증 프로필이 좌석을 얻었다 (응답: {resp})");
+        assert_eq!(resp.pointer("/error/code"), Some(&json!(AUTH_GATE_ERROR_CODE)));
+        assert_eq!(
+            daemon.next_id.load(Ordering::SeqCst),
+            before_ids,
+            "★거부인데 surface id 가 소비됐다 = PTY 가 태어났다(게이트가 create 뒤로 밀렸다)"
+        );
+        assert_eq!(
+            daemon.surfaces.lock().unwrap().len(),
+            before_surfaces,
+            "★거부인데 surface 가 등록됐다"
+        );
+        // 거부 문안이 그대로 좌석을 죽이는 문장이면 안 된다(자기 발화 루프 · 응답 경로에서 재확인).
+        let rules = daemon.health_rules.lock().unwrap();
+        let msg = resp.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            !msg.is_empty() && !rules.iter().any(|r| r.regex.is_match(msg)),
+            "★거부 응답 문안이 헬스룰에 매칭된다: {msg:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★오살 방어(RPC 층) — `config_only` 증거로는 절대 막지 않는다.
+    /// V-g 실측: api_key 로 인증된 프로필과 미인증 프로필의 `.claude.json` 은 **같았다**.
+    #[test]
+    fn surface_create_never_blocks_on_config_only_evidence() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let (dir, mtime) = auth_profile_fixture("cfgonly");
+        let resp = create_rpc(
+            &daemon,
+            json!({"cmd": "sleep 30",
+                   "claude_config_dir": dir.to_string_lossy(),
+                   "profile_auth": auth_payload(&dir, "unknown", "config_only", Some(mtime))}),
+        );
+        assert_eq!(
+            resp["ok"], json!(true),
+            "★config 만 본 판정으로 좌석을 막았다 — 정상 api_key·oauth_token·bedrock 사용자가 \
+             전멸하는 경로다 (응답: {resp})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 종전 동작 회귀 0 — verdict 를 모르는 호출자(구 CLI·GUI·스크립트)는 아무 영향을 받지 않는다.
+    #[test]
+    fn surface_create_without_a_verdict_is_unchanged() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let resp = create_surface_rpc(&daemon, None, Some(993_002_u32));
+        assert_eq!(resp["ok"], json!(true), "verdict 부재가 좌석 생성을 막았다 (응답: {resp})");
+    }
+
+    /// ★게이트의 **자리** 박제 ① — 멱등 재사용보다 **뒤**에 있다.
+    /// 앞으로 옮기면 이미 만들어 둔 좌석의 재수령까지 인증을 이유로 잠긴다(부활 불가).
+    #[test]
+    fn auth_gate_runs_after_the_idempotency_gate() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let (dir, mtime) = auth_profile_fixture("idem");
+        let key = "u18-idem-1";
+        let first = create_surface_rpc_idem(&daemon, None, key, Some(993_003_u32));
+        assert_eq!(first["ok"], json!(true), "선행 생성 실패 (응답: {first})");
+        let sid = first.pointer("/result/surface_id").and_then(|v| v.as_u64()).expect("surface_id");
+
+        // 같은 키로 재시도 — 이번엔 미인증 verdict 를 동봉한다.
+        let again = create_rpc(
+            &daemon,
+            json!({"cmd": "sleep 30", "idempotency_key": key,
+                   "claude_config_dir": dir.to_string_lossy(),
+                   "profile_auth": auth_payload(&dir, "not_logged_in", "oracle_verified", Some(mtime))}),
+        );
+        assert_eq!(
+            again["ok"], json!(true),
+            "★인증 게이트가 멱등 재사용을 막았다 — 게이트가 ④보다 앞으로 밀렸다 (응답: {again})"
+        );
+        assert_eq!(again.pointer("/result/idempotent_reuse"), Some(&json!(true)));
+        assert_eq!(again.pointer("/result/surface_id"), Some(&json!(sid)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★게이트의 **자리** 박제 ② — 특권 역할 하이재킹 게이트보다 **뒤**에 있다.
+    /// (먼저 발화하는 것은 종전 계약인 `claim_denied` 여야 한다 — 다섯 겹 게이트의 순서 불변.)
+    #[test]
+    fn auth_gate_runs_after_the_privileged_role_gate() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let (dir, mtime) = auth_profile_fixture("priv");
+        let _live_master = make_surface(&daemon, Some("master"));
+        let resp = create_rpc(
+            &daemon,
+            json!({"cmd": "sleep 30", "role": "master",
+                   "claude_config_dir": dir.to_string_lossy(),
+                   "profile_auth": auth_payload(&dir, "not_logged_in", "oracle_verified", Some(mtime))}),
+        );
+        assert_eq!(
+            resp.pointer("/error/code"),
+            Some(&json!("claim_denied")),
+            "★다섯 겹 게이트의 순서가 바뀌었다 — 인증 게이트가 특권 역할 게이트를 앞질렀다 (응답: {resp})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★롤백 — 판정기의 축 노브(그리고 그 노브가 OR 하는 마스터 `CYS_BOOT_GATES=0`) 하나로
+    /// 이 게이트도 경고 전용으로 강등된다. 이 게이트는 **자기 env 를 만들지 않는다**
+    /// (사고 순간에 사람이 노브를 조합할 수는 없다).
+    #[test]
+    fn auth_gate_folds_into_the_profile_gate_rollback_switch() {
+        let _g = auth_gate_env_guard();
+        let daemon = isolated_daemon();
+        let (dir, mtime) = auth_profile_fixture("rollback");
+        let params = json!({"cmd": "sleep 30",
+               "claude_config_dir": dir.to_string_lossy(),
+               "profile_auth": auth_payload(&dir, "not_logged_in", "oracle_verified", Some(mtime))});
+
+        // ① 스위치 없이는 막힌다(이 검체가 무엇을 되돌리는지 먼저 증명한다).
+        let denied = create_rpc(&daemon, params.clone());
+        assert_eq!(
+            denied.pointer("/error/code"),
+            Some(&json!(AUTH_GATE_ERROR_CODE)),
+            "계측 무효: 스위치 이전에 이미 통과하고 있었다 (응답: {denied})"
+        );
+
+        // ② 축 노브를 누르면 통과한다.
+        let prev = std::env::var(cys::profile_gate::ENV_OBSERVE_ONLY).ok();
+        std::env::set_var(cys::profile_gate::ENV_OBSERVE_ONLY, "1");
+        let allowed = create_rpc(&daemon, params);
+        match prev {
+            Some(v) => std::env::set_var(cys::profile_gate::ENV_OBSERVE_ONLY, v),
+            None => std::env::remove_var(cys::profile_gate::ENV_OBSERVE_ONLY),
+        }
+        assert_eq!(
+            allowed["ok"], json!(true),
+            "★롤백 스위치를 눌렀는데 이 게이트만 엄격하게 남았다 (응답: {allowed})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mtime 메모는 **과잉 차단을 만들 수 없다** — 낡은 메모의 귀결은 언제나 불일치→통과다.
+    #[test]
+    fn config_mtime_memo_can_only_fail_open() {
+        let (dir, mtime) = auth_profile_fixture("memo");
+        let d = dir.to_string_lossy().to_string();
+        let now = crate::state::now_epoch();
+        assert_eq!(config_json_mtime_memo(&d, now), Some(mtime), "첫 관측이 실물 mtime 과 다르다");
+        // 캐시 적중(TTL 안) — 같은 값을 다시 준다.
+        assert_eq!(config_json_mtime_memo(&d, now + 0.1), Some(mtime));
+        // 파일을 지워도 TTL 안에서는 옛 값이 남는다. 그 옛 값은 **거부를 넓히지 않는다**:
+        // 거부는 `verdict.config_mtime == observed` 일 때만이고, 사용자가 파일을 바꾼 뒤 새로
+        // 얻은 verdict 는 새 mtime 을 들고 오므로 불일치 → 통과가 된다.
+        let _ = std::fs::remove_file(dir.join(".claude.json"));
+        assert_eq!(config_json_mtime_memo(&d, now + 0.2), Some(mtime));
+        // TTL 을 넘기면 재관측 — 이제 부재다.
+        assert_eq!(config_json_mtime_memo(&d, now + 60.0), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

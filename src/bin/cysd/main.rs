@@ -11,6 +11,7 @@ mod alerts;
 mod analytics;
 mod approval;
 mod approval_risk;
+mod boot_supervisor;
 mod caps;
 mod channels;
 mod classifier;
@@ -266,6 +267,13 @@ async fn async_main() {
     }
 
     governance::spawn_watchdog(Arc::clone(&daemon));
+    // ★(U-23) 부트 감독자 — **watchdog 과 별도 태스크**다. 근본원인 R3(감독자 없는 단발 체인)의
+    //   해소 지점이며, 훅이 잘려도 부트가 살아남게 하는 유일한 층이다.
+    //   ★여기서 `spawn_watchdog` 다음 줄에 두는 것은 순서 의존이 아니라 가독성이다 — 두 태스크는
+    //     서로의 상태를 읽지 않고 cadence 도 다르다(5초 vs 3초). watchdog 틱 본문(동기 클로저)에
+    //     이 일을 얹으면 부트 1회가 큐 배달·승인 격상·데드맨을 수십 초 정지시킨다(치명위험 ②③).
+    //   ★롤백: `CYS_BOOT_GATES=0`(마스터) 또는 `CYS_BOOT_SUPERVISOR=0` → 이 태스크가 뜨지 않는다.
+    boot_supervisor::spawn(Arc::clone(&daemon));
     // ★B2-1(W3): built-in phoenix 잡을 부트 시 idempotent ensure — schedule.json 이 user-owned 로 전환돼
     //   팩 배달로는 built-in 잡을 갱신할 수 없으므로 코드가 upsert 한다(부재 생성·구버전 갱신·중복 0). 스케줄러 기동 전.
     schedule::ensure_builtin_jobs();
@@ -689,7 +697,7 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
 
 /// ★B3: 동봉 runtime python3 절대경로(exe 옆 번들). runtime_bin_dirs(pane 자식과 동일 SOT)에서 python3 실행파일을
 /// 찾는다. 없으면 None(호출측이 "python3" 리터럴로 폴백 — PATH 선두주입이 동봉본을 잡거나 시스템 python3).
-fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
     let names: &[&str] = if cfg!(windows) {
         &["python3.exe", "python.exe"]
     } else {

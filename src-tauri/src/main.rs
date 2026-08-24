@@ -1340,6 +1340,12 @@ fn maybe_apply_pending_update(app: &AppHandle) {
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
     let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+    // ★U-19 도달성 앵커(2026-08-24): 인앱 업데이트는 **항상** `--no-install-hook` 이다. 즉
+    //   `pack.rs setup_isolated_config_dir` 의 `if !install_hooks { return; }` **아래**에 놓인
+    //   시드·치유는 **업데이트로 올라온 사용자 전원에게 영영 도달하지 않는다**(신규 설치에만
+    //   닿는다 = `agents.json` 값 수정이 기존 기계에 안 닿는 K-1 과 같은 계열의 도달성 결함).
+    //   첫기동 관문 시드(`seed_first_run_gates`)는 그래서 훅과 **독립 플래그**로 제어되며 그
+    //   조기 return **위**에 있다 — 순서가 뒤집히면 H-SEED-U19 가 적색이 된다.
     init_cmd.arg("init-pack").arg("--no-install-hook");
     no_console(&mut init_cmd);
     let pack_ok = init_cmd

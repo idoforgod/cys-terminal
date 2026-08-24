@@ -39,6 +39,33 @@
        만들었다"는 정당한 작업이 아니다 — 먼저 *왜* 빨간지(기능 결함인가 · 코드 이사인가 ·
        계측기 자신의 결함인가)를 규명하고, 그 답이 '이사'일 때에만 ①을 적용한다.
 
+출력 스트림 계약(U-27 · 2026-08-24 · 이종 리뷰어 [P0-3] 채택):
+  `--json` 일 때 **stdout 에는 JSON 한 덩어리만** 나간다. 사람용 진행 출력과, 검체가 인프로세스로
+  부르거나 스폰한 코드가 뱉는 출력은 전부 stderr 로 간다(실측 오염원: `javis_report_gate` 의
+  `verdict=… delivered=… reasons=…` 요약 줄이 러너 stdout 으로 새어 12,416자를 JSON 앞에 붙였다).
+  구현은 **fd 층위**다 — 검체 실행 구간 동안 fd 1 을 fd 2 로 덮고 JSON 인쇄 직전에만 되돌린다.
+  `sys.stdout` 치환으로는 부족하다: 자식 프로세스는 fd 를 **상속**하므로 파이썬 층위를 그냥 지나친다.
+  ∴ 소비자는 `json.loads(r.stdout)` 를 그대로 쓴다 — 이 캠페인 내내 워커들이 써 온
+  **"첫 `{` + `"summary"` 위치를 찾아 `raw_decode`" 우회 관용구는 이제 필요하지 않다.**
+  (`--json` 이 아니면 종전과 완전히 동일하다. 집행자 = 검체 `H-META-OFF` ⓔ.)
+
+미측정 축 계약(U-27 · 2026-08-24 · 이종 리뷰어 [major] 채택):
+  Skip 은 한 종류가 아니고, 두 종류는 **서로 다른 사실**이다.
+    · **적용 불가**(`skip`)     = 이 환경에는 적용 대상이 없다(darwin 에서 Windows 실기 · 배포 팩에
+                                  Rust 소스 부재). 잴 것이 애초에 없으므로 게이트 판정에 중립이다.
+    · **사람이 끈 것**(`disabled`) = 대상은 그대로 있는데 **측정을 하지 않기로 사람이 정했다**
+                                  (env 스위치). 이것은 통과가 아니다.
+  종전 판은 둘을 같은 `skip` 축에 담았다. 그래서 `CYS_U26_OFF=1` 한 줄이 검체 5건을 지우고도
+  최종 줄은 `GREEN`, 종료코드는 0 이었다 — Skip 문구는 스스로 "이것은 통과가 아니라 미측정" 이라
+  말하는데 요약과 종료코드는 통과라고 말한 것이다. 이 저장소가 반복해서 낸 사고의 형태
+  ("측정 불능을 통과로 접는다")를 **계측기 자신이** 재현했다.
+  ∴ 지금은 ①`disabled` 가 별도 축이고 ②등재된 스위치가 하나라도 켜져 있으면 판정 라벨이
+  `UNMEASURED` 이며 ③**종료코드가 2** 다. 코드 3값의 의미는 서로 다르다 —
+  **0=GREEN(다 재고 다 통과) · 1=RED(재서 틀렸다) · 2=UNMEASURED(재지 않았다).**
+  등재소는 `MEASUREMENT_OFF_SWITCHES`(끄는 스위치)와 `MEASUREMENT_PIN_OVERRIDES`(핀을 갈아끼우는
+  스위치) 둘뿐이고, 새 스위치를 등재 없이 만들면 검체 `H-META-OFF` ⓑ 가 소스에서 찾아내 적색으로
+  만든다.
+
 stdlib만 사용. 네트워크 0. 어떤 검체도 사용자 HOME·실 데몬을 건드리지 않는다(전부 격리 tmp).
 """
 import argparse
@@ -81,6 +108,11 @@ D4A_REF = os.environ.get("CYS_HEALTH_D4A_REF", "58337fb")
 # 스크립트 부재' 사문 문안). 위 기준들과 같은 이유로 **고정 해시**를 쓴다(HEAD 는 W-A3 착지와
 # 함께 움직인다).
 PRE_WA3_REF = os.environ.get("CYS_HEALTH_PRE_WA3_REF", "8def22a")
+# U-24(레인 규약 `javis_lane` 이관) **이전** 트리 = 부트 결정론 캠페인 베이스. 이 이관의 '구 코드'는
+# W0(a96d8b1)이 아니다 — 그 트리엔 `lane_state_path` 자체가 아직 없어(H-LIFE-1 이 그 부재를 핀한다)
+# "구 코드에 인라인 소유가 있었다"를 잴 수 없다. 잘못된 기준의 '탐지 실패'는 탐지기 파손이 아니라
+# 기준 선택 오류다(러너 헤더 규약) — 그래서 이 축만의 고정 해시를 따로 둔다.
+PRE_U24_REF = os.environ.get("CYS_HEALTH_PRE_U24_REF", "985093d")
 
 # ★U-0(2026-08-23 · 계측 타당성 복원) — `_read` 의 읽기 상한(문자 수).
 #   구 값 400,000자는 검체가 읽는 실제 파일보다 **작았다**. `f.read(limit)` 은 초과분을 말없이
@@ -123,7 +155,75 @@ class Fail(AssertionError):
 
 
 class Skip(Exception):
-    """검체 적용 불가(배포 팩에 Rust 소스 부재 등) — fail 아님."""
+    """검체 **적용 불가** — 이 환경에 잴 대상이 애초에 없다(배포 팩에 Rust 소스 부재 · darwin
+    에서 Windows 실기 · root 라 chmod 재현 불가 등). fail 아니고, 게이트 판정에 중립이다.
+
+    ★사람이 계측기를 **끈** 경우는 이것이 아니라 아래 `Disabled` 다(헤더 '미측정 축 계약')."""
+
+
+class Disabled(Skip):
+    """★**사람이 끈 미측정** — `Skip`(적용 불가)과 다른 사실이다.
+
+    측정 대상은 그대로 있는데 env 스위치로 계측기를 껐을 뿐이므로, 이것은 **통과가 아니다**.
+    `Skip` 의 하위형으로 둔 이유는 기존 `except Skip` 경로(검체 내부의 조기 이탈 관용구)를
+    깨지 않기 위해서다 — 판정 분기는 `main()` 이 `Disabled` 를 **먼저** 잡아 별도 축으로 센다.
+
+    ★왜 축을 갈랐는가(2026-08-24 이종 리뷰어 [major]): 종전 판에서
+    `CYS_U26_OFF=1 … --only H-CI-TAG-1,H-EVID-1,H-FAKE-1,H-FAKE-2,H-FAKE-3` 은 검체 5건을
+    전부 지우고도 `GREEN — 발효 0 PASS / 0 FAIL / 5 SKIP` · exit 0 을 냈다. 요약과 종료코드가
+    "통과" 라고 말한 것이다. 이 파일이 막으려는 실패 유형("측정 불능을 통과로 접는다")을
+    계측기 자신이 재현한 자리이므로, **판정 라벨과 종료코드 양쪽**에서 갈라 놓는다."""
+
+
+# ── ★'사람이 끈 미측정' 축 등재소(U-27 · 2026-08-24) ─────────────────────────
+# ① 측정을 **끄는** 스위치. 켜져 있으면 그 검체는 `disabled`(별도 축)이고, 이 런은 GREEN 을
+#    잃고 exit 2 가 된다. 새 롤백 스위치를 만드는 사람은 `off_switch()` 로 여기에 등재한다.
+MEASUREMENT_OFF_SWITCHES = []          # [(env, scope)] — off_switch() 가 채운다
+
+
+def off_switch(env, scope):
+    """롤백/차단용 env 스위치를 미측정 축 등재소에 올리고 이름을 그대로 돌려준다."""
+    MEASUREMENT_OFF_SWITCHES.append((env, scope))
+    return env
+
+
+# ② 측정을 끄지는 않지만 **핀(측정 기준)을 갈아끼우는** 스위치. 검체는 계속 돌지만 그 초록의
+#    의미가 달라진다 — 계측 대조 기준 커밋을 바꾸면 "구 코드에서 FIRE 한다"가 다른 트리에 대한
+#    주장이 되고, 읽기 상한을 바꾸면 `_read` 의 절단 가드가 다른 자리에서 물린다.
+#    ★같은 규율로 GREEN 을 박탈하는 근거: 이쪽은 `skip` 조차 남기지 않고 **조용히 PASS** 로
+#      접힌다(실측 형태 — 기준 커밋을 해소 불가한 값으로 주면 `_git_show` 가 None 을 돌려
+#      계측 대조가 `계측대조 생략(레포 아님)` 으로 강등되는데, 검체는 그대로 PASS 다).
+#      끈 것보다 조용하므로 더 엄하게 다룬다. 판단이 갈리는 자리에서는 엄격한 쪽을 택한다.
+#    ⚠이름은 **열거**한다. `CYS_HEALTH_` 접두 스캔으로 잡으면 제품 env
+#      `CYS_HEALTH_NARRATION_CJK_MIN`(cysd 헬스 룰)까지 오검출한다 — 그건 러너의 스위치가 아니다.
+MEASUREMENT_PIN_OVERRIDES = (
+    ("CYS_HEALTH_CALIB_REF", "계측 대조 기준 커밋(W0 착지)"),
+    ("CYS_HEALTH_PRE_W0_REF", "계측 대조 기준 커밋(W0 이전)"),
+    ("CYS_HEALTH_D4A_REF", "계측 대조 기준 커밋(D4-a 무스폰 시대)"),
+    ("CYS_HEALTH_PRE_WA3_REF", "계측 대조 기준 커밋(W-A3 이전)"),
+    ("CYS_HEALTH_PRE_U24_REF", "계측 대조 기준 커밋(U-24 이전)"),
+    ("CYS_HEALTH_W5_CALIB_REF", "계측 대조 기준 커밋(W5 축)"),
+    ("CYS_HEALTH_U23_CALIB_REF", "계측 대조 기준 커밋(U-23 축)"),
+    ("CYS_HEALTH_READ_LIMIT", "`_read` 절단 가드 임계(U-0)"),
+)
+
+
+def _off_switch_on(env):
+    """env 스위치가 켜져 있는가. 종전 `_u26_gate` 의 판정을 그대로 옮기고 `on`·대문자만 넓혔다
+    (넓히는 방향 = '꺼진 것으로 볼 값'이 늘어난다 = 더 엄해진다 — 완화가 아니다)."""
+    return (os.environ.get(env) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _off_switches_engaged():
+    """지금 켜져 있는 등재 스위치 — [(kind, env, value, scope)]. kind: off | pin."""
+    out = []
+    for env, scope in MEASUREMENT_OFF_SWITCHES:
+        if _off_switch_on(env):
+            out.append(("off", env, os.environ.get(env), scope))
+    for env, scope in MEASUREMENT_PIN_OVERRIDES:
+        if (os.environ.get(env) or "").strip():
+            out.append(("pin", env, os.environ.get(env), scope))
+    return out
 
 
 def need(cond, msg):
@@ -222,7 +322,15 @@ def _base_env(extra=None, drop=()):
               "CYS_ROLE", "CYS_STATE_DIR", "CYS_LOCK_BACKEND", "CYS_ROOT", "CYS_SOUL",
               # ★임무 게이트 신호는 러너 환경에서 새어 들어오면 안 된다(검체가 자기 조건을
               #   명시적으로 만든다 — `_rb_sandbox(mission=...)`).
-              "CYS_MISSION"):
+              "CYS_MISSION",
+              # ★제품 롤백 스위치 누수 차단(U-27 · 2026-08-24 · 미측정 축 전수 점검의 부산물).
+              #   이것들은 **제품의** 판정 축을 끄는 스위치다(마스터·강등·축·주입 가드). 운영자
+              #   셸에 하나라도 켜져 있으면 검체가 띄우는 훅·부트가 **가드가 꺼진 제품**을 재고,
+              #   러너는 그 사실을 어디에도 적지 않는다 — "환경이 계측을 조용히 바꾼다" 는
+              #   `CYS_U26_OFF` 와 같은 계열의 구멍이다. 검체가 이 축을 시험할 때는 `extra` 로
+              #   **명시 주입**하므로(strip 은 extra 적용 **전**이다) 그 경로는 영향받지 않는다.
+              "CYS_BOOT_GATES", "CYS_GATE_PENDING", "CYS_GATE_PENDING_CLOSE",
+              "CYS_INJECT_GATE_GUARD"):
         env.pop(k, None)
     for k in drop:
         env.pop(k, None)
@@ -3446,6 +3554,176 @@ def h_win_12():
     return "System32 스텁(timeout·gtimeout) 하 save-state exit 0 + BOOT_SNAPSHOT.md 실재"
 
 
+# ── U-20: CLAUDE_CODE_GIT_BASH_PATH 배선 탐지기 ──────────────────────────────
+# 검체 본문에서 **순수 함수로 분리**한 이유: 수리가 착지하면 트리의 위반은 0 이고, 그때부터
+# 이 검체는 탐지기가 통째로 고장나도 초록이다(전형적인 '초록 사각'). 그래서 아래 H-WIN-BASH 는
+# 같은 함수에 **합성 표본**(고의로 망가뜨린 소스)을 먹여 매 실행마다 탐지 능력 자체를 시험한다.
+# MEMORY '디버깅 계측 타당성 게이트 3칙' ①(계측기 검증)의 실행 지점이다.
+_GIT_BASH_KEY = "CLAUDE_CODE_GIT_BASH_PATH"
+_GIT_BASH_SEGS = ["runtime", "git", "bin", "bash.exe"]
+
+
+def _u20_violations(lib_src):
+    """`src/lib.rs` 소스의 U-20 배선 위반 목록(빈 목록 = 배선 정상).
+
+    판정 축 여섯 — ①키 상수 정본 ②경로 세그먼트가 `runtime\\git\\bin\\bash.exe` ③해소기의
+    OS·실재파일 게이트 ④주입기의 불가침 3계약 + 마스터 스위치 ⑤`spawn_env_pairs` 실배선
+    ⑥사용자 프로세스 env 관측. 어느 하나라도 빠지면 Windows 훅이 죽거나(②③⑤) 사용자 설정을
+    덮어쓰거나(④⑥) mac 에 엉뚱한 키가 실린다(③).
+    """
+    v = []
+
+    def _body(sig):
+        i = lib_src.find(sig)
+        if i < 0:
+            return None
+        j = lib_src.find("\n}\n", i)
+        return lib_src[i:j] if j > i else None
+
+    # ① 키 상수 정본(리터럴 산재 금지 — 호출부가 상수를 경유해야 이름이 갈리지 않는다)
+    if 'pub const ENV_CLAUDE_CODE_GIT_BASH_PATH: &str = "%s";' % _GIT_BASH_KEY not in lib_src:
+        v.append("키 상수 정본 부재(ENV_CLAUDE_CODE_GIT_BASH_PATH)")
+
+    # ② 경로 세그먼트 — git\bin(런처) 단일 고정. git\usr\bin(MSYS 실바이너리)은 다른 파일이다.
+    m = re.search(r"pub const BUNDLED_GIT_BASH_REL[^=]*=\s*\[([^\]]*)\]", lib_src)
+    if not m:
+        v.append("동봉 bash 상대경로 상수(BUNDLED_GIT_BASH_REL) 부재")
+    else:
+        segs = re.findall(r'"([^"]*)"', m.group(1))
+        if segs != _GIT_BASH_SEGS:
+            v.append("경로 세그먼트가 %s 가 아니다: %s (B-12 — usr\\bin 오선택)"
+                     % (_GIT_BASH_SEGS, segs))
+
+    # ③ 해소기: OS 게이트(mac 미주입) + 실재 파일 게이트(없는 경로 통보 금지)
+    rb = _body("pub fn bundled_git_bash_path_for(")
+    if rb is None:
+        v.append("해소기 bundled_git_bash_path_for 부재")
+    else:
+        if 'os != "windows"' not in rb:
+            v.append("해소기에 OS 게이트가 없다 — mac/linux 에도 키가 실린다")
+        if ".is_file()" not in rb:
+            v.append("해소기에 실재 파일 게이트가 없다 — 없는 bash 경로를 벤더에 통보한다")
+        if '"usr"' in rb:
+            v.append("해소기가 usr 세그먼트를 만진다 — git\\bin 단일 고정 위반(B-12)")
+
+    # ④ 주입기: 사용자값 불가침 · 마스터 롤백 스위치 · 상수 경유
+    ib = _body("pub fn inject_claude_code_git_bash_path_for(")
+    if ib is None:
+        v.append("주입기 inject_claude_code_git_bash_path_for 부재")
+    else:
+        for tok, why in (("user_env_set", "사용자 기설정 불가침 인자 부재"),
+                         ("master_off", "마스터 롤백 스위치 인자 부재"),
+                         ("ENV_CLAUDE_CODE_GIT_BASH_PATH", "키 상수 경유 부재(리터럴 산재)")):
+            if tok not in ib:
+                v.append("주입기: " + why)
+
+    # ⑤⑥ 실배선: 세 스폰 경로의 공용 규약이 해소기·주입기를 실제로 부르고, 사용자 프로세스 env
+    #     와 마스터 스위치를 읽는가. 배선이 없으면 위 셋이 전부 사문(死文)이다.
+    sb = _body("pub fn spawn_env_pairs(")
+    if sb is None:
+        v.append("spawn_env_pairs 정의를 찾지 못했다(계측 불능)")
+    else:
+        if "bundled_git_bash_path_for(" not in sb:
+            v.append("spawn_env_pairs 가 해소기를 부르지 않는다")
+        if "inject_claude_code_git_bash_path_for(" not in sb:
+            v.append("spawn_env_pairs 가 주입기를 부르지 않는다 — 세 스폰 경로 전부 미배선")
+        if "std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH)" not in sb:
+            v.append("spawn_env_pairs 가 프로세스 env 의 사용자 값을 관측하지 않는다(덮어쓰기 위험)")
+        if "boot_gates_master_off_from(" not in sb:
+            v.append("spawn_env_pairs 가 마스터 롤백 스위치(CYS_BOOT_GATES)를 읽지 않는다")
+    return v
+
+
+@specimen("H-WIN-BASH", "W6",
+          "CLAUDE_CODE_GIT_BASH_PATH 기본값 주입 — git\\bin 런처 단일 고정 · 사용자값 불가침 · "
+          "mac 미주입 · 마스터 스위치 접기",
+          ["U-20", "B-12"])
+def h_win_bash():
+    """U-20(2026-08-24): 시스템 Git 이 없는 Windows 기계에서 Claude Code 는 훅을 **한 번도**
+    실행하지 못한다 — 벤더가 훅 실행에 쓸 bash 를 못 찾기 때문이다(무증상: 각성 훅이 조용히
+    전멸한다). 우리는 PortableGit 을 동봉하므로 그 기계에도 bash 는 **실재한다**. 그 자리를
+    `CLAUDE_CODE_GIT_BASH_PATH` 로 알려주는 것이 이 단위이고, 이 검체가 그 배선을 박제한다.
+
+    지키는 계약 다섯 —
+      ⓐ **`git\\bin` 단일 고정**(B-12). 셸 탐지의 기존 후보 순서(`windows_bash_candidates` =
+         `runtime_bin_dirs` + `git\\bin` 덧댐)는 `runtime_bin_dirs` 의 Windows 순서
+         (python → git\\cmd → **git\\usr\\bin** → node) 때문에 `usr\\bin\\bash.exe` 를 먼저
+         집는다. 그것은 MSYS 실 바이너리이고 벤더가 요구하는 것은 **런처**(`git\\bin`)다 —
+         릴리스 레인이 이미 그렇게 단언한다(`windows-build.yml` 의 FATAL 게이트, 아래 ⓔ).
+         기존 후보 순서는 스케줄 잡의 살아있는 계약이라 **건드리지 않고**, 이 키만 고정한다.
+      ⓑ **사용자값 불가침** — 프로세스 env 에 키가 이미 있으면 덮지 않는다.
+      ⓒ **mac/linux 미주입** — OS 게이트가 없으면 엉뚱한 플랫폼에 죽은 Windows 경로가 실린다.
+      ⓓ **마스터 스위치**(`CYS_BOOT_GATES=0`)에 접힌다. 새 축마다 노브를 따로 두면 사고 순간에
+         사람이 조합을 만들 수 없다(BLOCK-3 이 그 값을 이미 치렀다).
+      ⓔ 동봉물 실재 보증 — 빌드 레인이 `runtime/git/bin/bash.exe` 를 하드 단언한다.
+
+    ★계측 타당성(3칙): ①탐지기를 순수 함수로 분리해 **합성 표본 5종**으로 매 실행 검증하고,
+      ②기준 커밋 트리에 같은 탐지기를 돌려 **수리 전 적색**을 확인한다. 수리 후의 초록은 이 둘이
+      없으면 아무 의미가 없다.
+    ★범위 한계(정직 고지): 이 검체도 Rust 회귀 핀도 **Windows 실기 검증이 아니다**. 실기 확인은
+      `feat/**` 브랜치의 windows-health 잡(H-WIN-11)과 실기 재현의 몫이다.
+    """
+    lib = _repo_file(os.path.join("src", "lib.rs"))
+    notes = []
+
+    # ⓐ~ⓓ 배선 위반 0
+    v = _u20_violations(lib)
+    need(not v, "U-20 배선 위반 %d건: %s" % (len(v), v))
+    notes.append("배선 위반 0")
+
+    # ★탐지기 능력 시험(합성 표본) — 트리가 초록일 때 생기는 사각을 매 실행 제거한다.
+    muts = (
+        ("git\\bin → git\\usr\\bin 오선택(B-12)",
+         lambda s: s.replace('["runtime", "git", "bin", "bash.exe"]',
+                             '["runtime", "git", "usr", "bin", "bash.exe"]')),
+        ("OS 게이트 삭제(mac 오주입)", lambda s: s.replace('os != "windows"', "false")),
+        ("사용자값 불가침 삭제", lambda s: s.replace("user_env_set", "ignored_flag")),
+        ("마스터 스위치 삭제",
+         lambda s: s.replace("boot_gates_master_off_from(", "always_on_no_rollback(")),
+        ("배선 자체 삭제",
+         lambda s: s.replace("inject_claude_code_git_bash_path_for(", "disabled_noop(")),
+    )
+    blind = []
+    for label, mut in muts:
+        sample = mut(lib)
+        need(sample != lib,
+             "합성 표본 %r 이 소스를 바꾸지 못했다 — 표본이 무효라 탐지 능력을 못 잰다" % label)
+        if not _u20_violations(sample):
+            blind.append(label)
+    need(not blind,
+         "탐지기가 다음 위반을 못 본다 = 계측 무효(초록이 무의미): %s" % blind)
+    notes.append("합성 표본 %d종 전부 검출" % len(muts))
+
+    # ★계측 타당성 ② — 수리 전 트리에서 적색인가.
+    calib = "skip(no-git)"
+    old = _git_show("src/lib.rs")
+    if old is not None:
+        need(_u20_violations(old),
+             "계측 타당성 실패: 기준 커밋(%s) 의 lib.rs 에서도 위반이 0 이다 — 탐지기가 수리 전 "
+             "코드를 적색으로 만들지 못하면 지금의 초록은 아무것도 증명하지 않는다"
+             % CALIBRATION_REF)
+        calib = "기준 %s 적색 확인" % CALIBRATION_REF
+    notes.append("계측검증=" + calib)
+
+    # Rust 회귀 핀 실재(행위 단언은 cargo test 소유 — 여기서는 핀이 지워지지 않았음을 본다).
+    for t in ("claude_code_git_bash_path_picks_git_bin_launcher",
+              "claude_code_git_bash_path_never_leaves_windows",
+              "claude_code_git_bash_path_user_value_and_master_switch"):
+        need(("fn %s(" % t) in lib,
+             "Rust 회귀 핀 %s 가 사라졌다 — 행위 단언(mac 미주입·git\\bin 선택)이 무보호다" % t)
+    notes.append("Rust 회귀 핀 3종 실재")
+
+    # ⓔ 동봉물 실재 보증 — 빌드 레인의 하드 단언(이게 없으면 주입 대상이 없어질 수 있다).
+    wb = os.path.join(REPO_DIR, ".github", "workflows", "windows-build.yml")
+    need(os.path.isfile(wb), "windows-build.yml 부재 — 동봉 bash 실재 게이트를 확인할 수 없다")
+    wbs = _read(wb)
+    need("git/bin/bash.exe" in wbs,
+         "windows-build.yml 이 runtime/git/bin/bash.exe 를 단언하지 않는다 — 주입 대상이 "
+         "경량화 스텝에 지워져도 무증상으로 출하된다")
+    notes.append("빌드 레인 동봉 단언 실재")
+    return " · ".join(notes)
+
+
 @specimen("H-CYCLE-1", "W6",
           "cycle-autopilot Windows single-flight — os_name 분기표·pid_alive 비파괴·fork SKIP",
           ["R3-WIN-SF"])
@@ -4056,8 +4334,10 @@ def h_seat_4axis():
     ax = _slice_between(lib, "pub fn gate_axes_from(", "\n}\n", "H-SEAT-4AXIS 판정 축 접기")
     need("holding_off" in ax and "gate_pending_close_override_from(close_env, axis_env)" in ax,
          "판정 축 접기가 보류 장치 상태를 합류시키지 않는다 — BLOCK-4 조합이 되살아난다")
+    # ★(U-17) 축이 하나 늘었다 — 기존 항목을 지우지 않고 **추가**한다. 새 축만 엄격하게 남으면
+    #   마스터 스위치가 다시 거짓말이 되고, 인증 판정기가 마스터를 눌러도 계속 차단한다.
     for axis in ("readiness_legacy: holding_off", "inject_guard_off: holding_off",
-                 "trust_legacy: holding_off"):
+                 "trust_legacy: holding_off", "profile_gate_observe_only: holding_off"):
         need(axis in ax,
              "축 '%s' 이 보류 꺼짐과 함께 풀리지 않는다 — 그 축만 엄격하게 남아 관문 화면이 "
              "곧 close 가 된다(재난④)" % axis)
@@ -4097,6 +4377,330 @@ def h_seat_4axis():
     notes.append("축④ readiness=생산(커널 사실) · close 도달불가 · kill 체인 차단 · fresh 폴백 0 · "
                  "stdout 계약 보존 · 롤백 1지점 · TTL 실재 · 진리표 배터리 3종")
 
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-AUTH-PARSE", "W6",
+          "프로필 인증 전제 판정기 — auth_class 8값 · unknown fail-closed · 위조 신원 금지 · "
+          "열거 규칙 정본 1벌 · 마스터 스위치 접기",
+          ["U-17", "C-3", "E-2"])
+def h_auth_parse():
+    """U-17(2026-08-24): 첫기동 관문 시드(U-19)는 **로그인 화면을 지운다** — 미인증 프로필에
+    시드를 먼저 내면 노드는 관문 없이 태어난 것처럼 보이다가 401 로 죽는다. 그래서 "인증되어
+    있는가" 를 시드보다 **먼저** 판정할 수 있어야 하고, 그 판정기가 `src/profile_gate.rs` 다.
+
+    이 검체가 지키는 계약 다섯 —
+      ⓐ `auth_class` 는 **8값**이고 `unknown` 은 **통과가 아니다**(측정 불능을 통과로 접는 것이
+         이 저장소의 반복 사고 원인이다).
+      ⓑ **위조 신원 금지** — 판정기는 `.claude.json` 에 쓰지 않는다(쓰기 API 0건). V-g 실측:
+         자격증명은 `sha256(configDir)` 로 Keychain 봉인이라 `oauthAccount` 를 써 넣어도 인증되지
+         않는다 — 즉 그 쓰기는 **인증이 아니라 위조**다.
+      ⓒ `oauthAccount` **존재 기반 판정 금지**(E-2 반증) — 주장은 인증이 아니다.
+      ⓓ 프로필 dir **열거 규칙은 정본 한 벌**. `cysd/accounts.rs seed_known` 이 재구현하면
+         두 벌이 갈린다(한쪽만 새 부서 접두를 배우는 식).
+      ⓔ 새 판정 축은 **마스터 스위치**(`CYS_BOOT_GATES=0`)에 접힌다 — 사고 순간에 사람이 노브를
+         조합할 수는 없다(BLOCK-3 이 그 값을 이미 치렀다).
+    ★오살 경보(U-18 이 읽어야 할 것): V-g 실측에서 **API키로 인증된 프로필과 미인증 프로필의
+      `.claude.json` 은 동일**했다(자격증명이 env·Keychain 에 있다). 그래서 config 만 보는
+      경로는 정상 API키·oauth_token·bedrock 좌석을 전부 `unknown` 으로 낸다 — 그 위에 차단을
+      걸면 **살아있는 좌석이 전멸**한다. 등급 축(통과 여부)과 증거 축(무엇으로 알았나)을
+      **분리해서** 내보내는 것이 그 방어이며, 아래 ⓕ가 그 분리를 기계로 확인한다.
+    """
+    notes = []
+    lib = _repo_file(os.path.join("src", "lib.rs"))
+    acc = _repo_file(os.path.join("src", "bin", "cysd", "accounts.rs"))
+
+    # ⓐ lib 정본 배선 — 여기부터 적색이어야 구 트리에서 이 검체가 FIRE 한다.
+    need("pub mod profile_gate;" in lib,
+         "lib 에 인증 전제 판정기 모듈이 없다 — 시드(U-19)가 로그인 화면을 지우기 전에 판정할 "
+         "수단이 없다는 뜻이다")
+    pg = _scan_source("profile_gate")
+    body = pg[:pg.index("#[cfg(test)]")] if "#[cfg(test)]" in pg else pg
+    need(body != pg, "profile_gate.rs 에서 테스트 경계를 찾지 못했다(슬라이스 앵커 파손)")
+
+    # ⓑ auth_class 8값 전수 + unknown fail-closed
+    classes = ("subscription", "oauth_token", "api_key", "api_key_helper", "third_party",
+               "not_logged_in", "onboarding_pending", "unknown")
+    for c in classes:
+        need('=> "%s",' % c in body, "auth_class 8값 결손: %s" % c)
+    need(body.count("pub const ALL: [AuthClass; 8]") == 1, "8값 전수 배열이 없다(값이 늘면 조용히 통과)")
+    allows = _slice_between(body, "pub fn allows_spawn(self) -> bool {", "\n    }\n",
+                            "H-AUTH-PARSE 통과 판정")
+    need("AuthClass::Unknown" not in allows,
+         "★`unknown` 이 통과 목록에 들어갔다 — 측정 불능을 통과로 접는 것이 이 저장소의 반복 "
+         "사고 원인이다(fail-closed 붕괴)")
+    for denied in ("AuthClass::NotLoggedIn", "AuthClass::OnboardingPending"):
+        need(denied not in allows, "비통과 등급이 통과 목록에 들어갔다: %s" % denied)
+    notes.append("auth_class 8값 · 통과 5값 · unknown/미인증/관문 fail-closed")
+
+    # ⓒ 위조 신원 금지 — 쓰기 API 0건. ★합성 표본으로 탐지기 자체를 먼저 시험한다
+    #    (트리에 위반이 0이라 탐지기가 고장나도 초록이 되는 핀이다).
+    write_apis = ("fs::write(", "File::create(", "OpenOptions::new(", "write_all(",
+                  "to_writer(", "create_dir_all(")
+    detect = lambda src: sorted(a for a in write_apis if a in src)
+    need(detect('let f = std::fs::File::create(p)?; f.write_all(b"{}")?;')
+         == ["File::create(", "write_all("],
+         "계측 무효: 쓰기 API 탐지기가 합성 표본을 잡지 못한다")
+    need(not detect(body),
+         "★판정기가 쓰기 API 를 얻었다(%s) — `.claude.json` 에 `oauthAccount` 를 써 넣는 것은 "
+         "인증이 아니라 **위조**다(자격증명은 sha256(configDir) 로 Keychain 봉인 · V-g 실측)"
+         % detect(body))
+    need('"oauthAccount":' not in body, "★`oauthAccount` 를 만드는 리터럴이 생겼다(위조 신원)")
+    notes.append("위조 신원 금지: 쓰기 API 0 · 생성 리터럴 0(합성 표본 선시험)")
+
+    # ⓓ `oauthAccount` 존재 기반 판정 금지(E-2) — 판정 함수 본문이 그 주장을 분기 조건으로
+    #    쓰지 않는다. 파싱·보고는 허용(진단), 판정은 금지.
+    decide = _slice_between(body, "pub fn classify(ev: &ProfileEvidence) -> Verdict {",
+                            "\n}\n", "H-AUTH-PARSE 판정 본문")
+    need("oauth_claim: Tri::Yes" not in decide and "oauth_claim: Tri::Unreadable" not in decide,
+         "★판정이 `oauthAccount` 주장을 분기 조건으로 되돌렸다 — E-2 로 반증된 술어다"
+         "(주장은 인증이 아니다: 복사·이동·시드로는 로그인되지 않는다)")
+    need("ConfigClaimIsNotAuthentication" in decide,
+         "config 주장이 인증이 아니라는 판정 분기가 사라졌다")
+    notes.append("E-2: oauthAccount 주장 = 진단 전용(판정 분기 0)")
+
+    # ⓔ 열거 규칙 정본 1벌 — accounts.rs 가 재구현하지 않는다. 합성 표본 선시험(구 문면).
+    old_rule = 'if name == ".claude" || name.starts_with(".claude-") {'
+    rule_hit = lambda src: '.starts_with(".claude-")' in src or '"claude-"' in src
+    need(rule_hit(old_rule), "계측 무효: 열거 규칙 탐지기가 구 문면을 잡지 못한다")
+    need(not rule_hit(acc),
+         "★accounts.rs 가 프로필 dir 열거 규칙을 재구현했다 — 규칙이 두 벌로 갈리면 한쪽만 새 "
+         "부서 접두를 배우고, 계정 발견과 인증 판정이 서로 다른 프로필 집합을 본다")
+    need("cys::profile_gate::enumerate_profile_dirs(" in acc,
+         "accounts.rs 가 열거 정본을 경유하지 않는다(정본 승격이 절반만 반영됐다)")
+    need("pub fn is_profile_dir_name(" in body and "pub fn enumerate_profile_dirs(" in body,
+         "열거 규칙 정본(순수 술어 + IO 껍데기)이 lib 에 없다")
+    notes.append("열거 규칙 정본 1벌 · accounts.rs 경유")
+
+    # ⓕ 두 축 분리 — 등급(통과 여부) ↔ 증거(무엇으로 알았나). 섞이면 U-18 이 config 만 보고
+    #    차단해 정상 API키·토큰·bedrock 좌석을 오살한다.
+    for pin in ("pub enum EvidenceGrade {", "OracleVerified", "ConfigOnly",
+                '"evidence_grade":', '"allows_spawn":'):
+        need(pin in body, "증거 축 결손: %s — 등급만 내보내면 U-18 이 오살한다" % pin)
+    notes.append("등급 축 ∥ 증거 축 분리(오살 방어)")
+
+    # ⓖ 마스터 스위치 접기 — 축 노브 1지점 + 상위 접기 OR + GateAxes 필드.
+    need('pub const ENV_OBSERVE_ONLY: &str = "CYS_PROFILE_GATE_OBSERVE_ONLY";' in body,
+         "롤백 축 env 상수 결손/이탈")
+    need(body.count("std::env::var(ENV_OBSERVE_ONLY)") == 1,
+         "축 env 판독이 1지점이 아니다 — 한 곳만 빠져도 '되돌렸다'가 거짓말이 된다")
+    need(body.count("|| crate::gate_axes_forced_legacy()") == 1,
+         "★인증 판정 축이 마스터 스위치에 접히지 않았다 — `CYS_BOOT_GATES=0` 을 눌러도 이 축만 "
+         "엄격하게 남아 미인증 판정이 계속 차단한다(BLOCK-3 재발)")
+    need('raw == Some("1")' in body, "축 노브가 느슨한 truthy 를 받는다 — 오타로 안전장치가 뒤집힌다")
+    need("pub profile_gate_observe_only: bool," in lib, "GateAxes 에 인증 판정 축이 없다")
+    notes.append("롤백 축 1지점 · 마스터 접기 · GateAxes 편입")
+
+    # ⓗ Rust 배터리 실재 — 언어 경계 때문에 python 이 직접 호출할 수 없다. '재는 곳'만 옮기고
+    #    '재는 사실'은 옮기지 않는다(계측 위치의 이동이지 판정의 완화가 아니다).
+    for battery in ("fn unknown_is_never_a_pass_and_exactly_five_classes_pass(",
+                    "fn config_only_evidence_never_produces_a_passing_class(",
+                    "fn pre_fix_predicate_accepted_a_forged_identity_and_now_does_not(",
+                    "fn oauth_claim_is_diagnostic_only_and_never_changes_the_verdict(",
+                    "fn this_module_can_never_write_a_claude_json(",
+                    "fn vg_fixtures_parse_into_every_authenticated_class(",
+                    "fn three_profile_gate_subscription_unauthenticated_apikey("):
+        need(battery in pg, "U-17 진리표 배터리 결손: %s" % battery)
+    # V-g 실측 문면이 픽스처로 박제됐는가(스키마 드리프트 탐지의 근거).
+    for method in ('\\"authMethod\\": \\"none\\"', '\\"authMethod\\": \\"api_key\\"',
+                   '\\"authMethod\\":\\"claude.ai\\"'):
+        need(method in pg, "V-g 픽스처 문면 결손: %s" % method)
+    notes.append("Rust 배터리 7종 · V-g 픽스처 문면 박제")
+
+    # ⓘ 계측 타당성 — 구 트리에는 판정기도 정본 승격도 없다(탐지기가 진짜 부재를 잡는가).
+    calib = "skip(no-git)"
+    old_lib = _git_show(os.path.join("src", "lib.rs"))
+    old_acc = _git_show(os.path.join("src", "bin", "cysd", "accounts.rs"))
+    if old_lib is not None and old_acc is not None:
+        need("profile_gate" not in old_lib, "계측 타당성 실패: 구 lib 에 이미 판정기가 있다")
+        need(rule_hit(old_acc),
+             "계측 타당성 실패: 구 accounts.rs 에 열거 규칙이 없다 — 정본 승격 서사가 틀린 것")
+        calib = "구 트리=판정기 부재 + accounts 자체 열거 규칙 실재"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-AUTH-SELFLOOP", "W6",
+          "surface.create 최종 인증 게이트 — 자기 발화 루프 0 · 게이트 자리(④뒤·create앞) · "
+          "다섯 경로 합류 1지점 · 거부=명시 오류(close 아님) · 오살 방어 · 롤백 접기",
+          ["U-18", "C-3", "T3-G2"])
+def h_auth_selfloop():
+    """U-18(2026-08-24): 좌석 생성의 입구는 다섯이다(①`cys launch-agent` ②schedule
+    `if_absent: launch` ③`check_agent_death` node-recover ④phoenix auto-restore ⑤GUI).
+    그런데 PTY 를 실제로 만드는 함수의 **비-테스트 호출부는 `surface.create` 한 곳뿐**이라
+    다섯이 거기로 합류한다 — 인증 게이트를 다섯 벌 만들지 않고 거기 하나만 두는 근거다.
+
+    이 검체가 지키는 계약 —
+      ⓐ **자기 발화 루프 0.** 데몬 watchdog 은 pane **화면 텍스트**를 정규식으로 훑는다. 거부
+         처방 문안이 `not_logged_in`·`login_required` 같은 룰에 매칭되면 → `health.alert` →
+         auth 인터록 300초 차단 + 좌석 오염으로 **우리 경고가 좌석을 죽인다**. 그래서 문안을
+         **생산 룰 정규식**(state.rs `default_health_rules` 본문에서 뽑는다)으로 직접 잰다.
+      ⓑ **게이트의 자리.** ④ worker active-limit **뒤** · `create_surface_with_env` **앞**.
+         앞이면 좌석 승계·멱등 재사용까지 막혀 살아 있는 좌석의 부활이 잠기고, 뒤면 PTY 가
+         이미 태어나 관문 화면이 킬체인의 첫 칸이 된다.
+      ⓒ **합류 1지점.** PTY 스폰 함수의 호출부가 `state.rs`(정의·테스트 래퍼)와 `handlers.rs`
+         밖으로 새면 이 게이트는 조용히 무력화된다.
+      ⓓ **거부의 귀결은 close 가 아니다.** 거부 경로에 좌석을 죽이는 어휘가 없어야 한다(재난④).
+      ⓔ **오살 방어.** `config_only` 증거·귀속 실패·낡음·config 변경은 전부 통과다. V-g 실측에서
+         api_key 로 인증된 프로필과 미인증 프로필의 `.claude.json` 은 **동일**했다 — config 만
+         보고 막으면 정상 api_key·oauth_token·bedrock 좌석이 전멸한다.
+      ⓕ **비싼 조회 금지.** 데몬 핫패스라 서브프로세스 기동 0이고, 파일 stat 조차 '거부를
+         주장하는 verdict 가 실제로 왔을 때' 뒤에만 있다.
+      ⓖ **롤백은 새 노브를 만들지 않는다.** 게이트는 자기 env 를 읽지 않고 판정기의 축 노브를
+         경유한다(그 노브가 마스터 `CYS_BOOT_GATES=0` 를 이미 OR 한다).
+    """
+    notes = []
+    hnd = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    st = _repo_file(os.path.join("src", "bin", "cysd", "state.rs"))
+    pg = _scan_source("profile_gate")
+
+    # 프로덕션 영역만 본다 — 테스트가 프로덕션 계약을 대신 만족시키는 착시를 막는다.
+    hnd_prod = _slice_between(hnd, "pub fn dispatch(", "\n#[cfg(test)]", "H-AUTH-SELFLOOP 배선")
+
+    def _at(hay, needle, what):
+        i = hay.find(needle)
+        need(i >= 0, "%s: 앵커 부재 %r — 코드가 이사했다면 이 검체의 앵커도 함께 옮겨라"
+                     % (what, needle))
+        return i
+
+    # ── ⓑ 게이트의 자리(다섯 겹 순서 전량) ───────────────────────────────────
+    i_reserved = _at(hnd_prod, "is reserved (daemon-derived identity grade", "예약 role 게이트")
+    i_claim = _at(hnd_prod, '"surface.create denied: privileged role', "특권 role 게이트")
+    i_idem = _at(hnd_prod, '"idempotent_reuse": true', "멱등 게이트")
+    i_limit = _at(hnd_prod, '"worker_limit_exceeded",', "active-limit 게이트")
+    i_gate = _at(hnd_prod, "if let Some(reply) = surface_create_auth_gate(", "인증 게이트 호출")
+    i_create = _at(hnd_prod, "match daemon.create_surface_with_env(", "PTY 스폰 호출")
+    need(i_reserved < i_claim < i_idem < i_limit < i_gate < i_create,
+         "★게이트의 자리가 어긋났다(예약=%d 특권=%d 멱등=%d 한도=%d 인증=%d 스폰=%d) — "
+         "인증 게이트가 ④보다 앞이면 좌석 승계·멱등 재사용까지 막혀 살아 있는 좌석의 부활이 "
+         "잠기고, `create_surface_with_env` 보다 뒤면 PTY 가 이미 태어나 관문 화면이 킬체인의 "
+         "첫 칸이 된다" % (i_reserved, i_claim, i_idem, i_limit, i_gate, i_create))
+    need(hnd_prod.count("surface_create_auth_gate(daemon,") == 1,
+         "인증 게이트 호출부가 1지점이 아니다 — 두 벌이면 한쪽만 고쳐진다")
+    notes.append("자리: 예약<특권<멱등<한도<인증<스폰")
+
+    # ── ⓒ PTY 스폰 합류 1지점 ────────────────────────────────────────────────
+    cysd_dir = os.path.join(REPO_DIR, "src", "bin", "cysd")
+    spawners = sorted(f for f in os.listdir(cysd_dir)
+                      if f.endswith(".rs")
+                      and "create_surface_with_env(" in _read(os.path.join(cysd_dir, f)))
+    need(spawners == ["handlers.rs", "state.rs"],
+         "★PTY 스폰 함수의 소비 파일이 늘었다(%s) — 좌석 생성 다섯 경로가 `surface.create` 로 "
+         "합류한다는 전제가 깨지면 이 인증 게이트는 조용히 새고, 미인증 프로필이 그 새 경로로 "
+         "좌석을 얻는다" % spawners)
+    need(hnd_prod.count(".create_surface_with_env(") == 1,
+         "handlers.rs 프로덕션 영역의 PTY 스폰 호출이 1건이 아니다(게이트 우회 경로 발생)")
+    notes.append("스폰 합류 1지점(state.rs 정의 + handlers.rs 호출 1건)")
+
+    # ── ⓐ 자기 발화 루프 0 ───────────────────────────────────────────────────
+    # 생산 룰 정규식을 state.rs 본문에서 뽑는다(사본 정규식이면 검체가 사문화된다).
+    rules_src = _slice_between(st, "fn default_health_rules() -> Vec<HealthRule> {", "\n}\n",
+                               "H-AUTH-SELFLOOP 생산 룰 집합")
+    pairs = re.findall(r'"([a-z0-9_]+)",\s*\n?\s*r"((?:[^"\\]|\\.)*)"', rules_src)
+    need(len(pairs) >= 5,
+         "계측 무효: 생산 헬스룰을 %d건밖에 수확하지 못했다(수확 정규식 파손)" % len(pairs))
+    rules = []
+    for name, pat in pairs:
+        try:
+            rules.append((name, re.compile(pat)))
+        except re.error as e:
+            raise Fail("생산 룰 %s 의 정규식을 파이썬에서 못 읽는다(%s) — 계측 무효" % (name, e))
+    hits = lambda s: [n for n, rx in rules if rx.search(s)]
+    # ★합성 표본 선시험 — 트리에 위반이 0이라 탐지기가 고장나도 초록이 되는 핀이다.
+    for bad, want in (("Error: not logged in", "not_logged_in"),
+                      ("Please run /login to continue", "login_required"),
+                      ("401 Unauthorized", "auth_401"),
+                      ("your token has expired", "token_expired"),
+                      ("rate limited", "rate_limited")):
+        need(want in hits(bad),
+             "계측 무효: 합성 표본 %r 이 룰 %s 에 걸리지 않는다 — 이 검체가 재는 대상이 "
+             "생산 룰이 아니다" % (bad, want))
+    # auth 인터록이 보는 네 룰이 실제로 이 집합 안에 있어야 검체가 의미를 갖는다.
+    interlock = _slice_between(st, "pub const AUTH_INTERLOCK_RULES:", ";", "인터록 룰 목록")
+    for r in re.findall(r'"([a-z0-9_]+)"', interlock):
+        need(any(n == r for n, _ in rules),
+             "계측 무효: auth 인터록 룰 %r 이 생산 룰 집합에 없다" % r)
+
+    # 처방 문안 복원 — Rust 의 `\<개행>` 이음(다음 줄 선행 공백까지 먹는다)을 되돌린다.
+    presc_lit = _slice_between(hnd, 'pub(crate) const AUTH_GATE_PRESCRIPTION: &str =', '";',
+                               "H-AUTH-SELFLOOP 처방 문안")
+    presc = re.sub(r"\\\n\s*", "", presc_lit[presc_lit.index('"') + 1:])
+    need(len(presc) > 40, "처방 문안 복원 실패(길이 %d) — 슬라이스 앵커 파손" % len(presc))
+    need(not hits(presc),
+         "★처방 문안이 헬스룰 %s 에 매칭된다 — 이 문장이 pane 에 찍히는 순간 그 좌석이 300초 "
+         "잠기고 오염된다(자기 발화 루프). 문안: %r" % (hits(presc), presc))
+    # 문안에 실리는 기계 필드(등급·이유·증거 등급) 전수 — 정본에서 뽑아 잰다.
+    tokens = sorted(set(re.findall(r'=> "([a-z0-9_.]+)",', pg)))
+    need(len(tokens) >= 20,
+         "계측 무효: 판정기 안정 문자열을 %d건밖에 수확하지 못했다" % len(tokens))
+    bad_tokens = {t: hits(t) for t in tokens if hits(t)}
+    need(not bad_tokens,
+         "★판정기 안정 문자열이 헬스룰에 매칭된다(%s) — 그 값이 처방 문안에 실리는 순간 "
+         "좌석이 잠긴다" % bad_tokens)
+    notes.append("자기 발화 루프 0: 처방 문안 + 안정 문자열 %d종 × 생산 룰 %d종"
+                 % (len(tokens), len(rules)))
+
+    # ── ⓓⓔⓕⓖ 게이트 본문 계약 ──────────────────────────────────────────────
+    body = _slice_between(hnd, "fn surface_create_auth_gate(", "\n}\n", "H-AUTH-SELFLOOP 게이트 본문")
+    decide = _slice_between(hnd, "pub(crate) fn auth_gate_decide(", "\n}\n",
+                            "H-AUTH-SELFLOOP 판정 본문")
+    # ⓓ 거부의 귀결은 close 가 아니다(재난④ — 전 pane 사망 경로 차단)
+    for killer in ("close_surface", '"surface.close"', "exited.store", "kill(", "reap"):
+        need(killer not in body,
+             "★인증 게이트가 좌석을 죽이는 어휘를 얻었다(%r) — 거부의 귀결은 명시 오류 하나여야 "
+             "한다(치명위험 ④)" % killer)
+    need("err_response(id, AUTH_GATE_ERROR_CODE" in body, "거부가 명시 오류로 나가지 않는다")
+    # ⓔ 오살 방어 — 통과로 접는 다섯 사유가 판정 본문에 실재한다
+    for esc in ("config_only_evidence", "profile_mismatch", "verdict_stale",
+                "verdict_from_the_future", "config_changed", "verdict_observe_only"):
+        need('Ignored("%s")' % esc in decide,
+             "★오살 방어 분기 결손: %s — 증명하지 못한 거부 주장이 차단으로 이어진다" % esc)
+    need("if !v.oracle_verified {" in decide,
+         "★`config_only` 증거 위에서 차단을 막는 가드가 사라졌다 — V-g 실측상 정상 api_key·"
+         "oauth_token·bedrock 프로필이 전부 비통과로 나오므로 그 위의 차단은 좌석 전멸이다")
+    # ⓕ 비싼 조회 금지 — 서브프로세스 0 · stat 은 거부 주장 뒤에만
+    for costly in ("Command::new", "std::process::Command", ".output()", ".status()",
+                   "block_on", "read_to_string("):
+        need(costly not in body,
+             "★데몬 핫패스에 비싼 조회가 들어왔다(%r) — 동기 서브프로세스는 tokio 워커를 "
+             "점유하고 PIPE_LISTENER_POOL 을 포화시킨다" % costly)
+    i_pass = _at(body, "if supplied.class.allows_spawn() {", "통과 등급 조기 반환")
+    i_obs = _at(body, "if cys::profile_gate::observe_only() {", "롤백 조기 반환")
+    i_stat = _at(body, "config_json_mtime_memo(", "mtime 관측")
+    need(i_pass < i_obs < i_stat,
+         "★IO 가 조기 반환보다 앞으로 올라왔다(통과=%d 롤백=%d 관측=%d) — 통과 verdict·롤백 "
+         "상태에서도 매 좌석 생성이 파일을 만지게 된다" % (i_pass, i_obs, i_stat))
+    need(body.count("config_json_mtime_memo(") == 1, "mtime 관측 지점이 1곳이 아니다")
+    # ⓖ 롤백 — 게이트는 자기 env 를 만들지 않는다
+    need("std::env::var(" not in body,
+         "★인증 게이트가 자기 env 노브를 얻었다 — 사고 순간에 사람이 노브를 조합할 수는 없다. "
+         "롤백은 판정기의 축 노브(그것이 마스터 CYS_BOOT_GATES 를 이미 OR 한다) 하나로 족하다")
+    need(body.count("cys::profile_gate::observe_only()") == 1,
+         "게이트가 판정기의 롤백 축을 경유하지 않는다 — 마스터 스위치가 이 축만 못 되돌린다")
+    notes.append("거부=명시 오류(close 어휘 0) · 오살 통과 6사유 · 서브프로세스 0 · 롤백 축 경유")
+
+    # ── Rust 배터리 실재(언어 경계 — python 이 직접 못 부른다) ──────────────
+    for battery in ("fn auth_gate_prescription_never_matches_a_health_rule(",
+                    "fn auth_gate_decide_denies_only_on_fresh_oracle_evidence_for_this_profile(",
+                    "fn supplied_auth_verdict_contract_violations_never_become_a_block(",
+                    "fn surface_create_denies_unauthenticated_profile_without_spawning_anything(",
+                    "fn surface_create_never_blocks_on_config_only_evidence(",
+                    "fn surface_create_without_a_verdict_is_unchanged(",
+                    "fn auth_gate_runs_after_the_idempotency_gate(",
+                    "fn auth_gate_runs_after_the_privileged_role_gate(",
+                    "fn auth_gate_folds_into_the_profile_gate_rollback_switch(",
+                    "fn config_mtime_memo_can_only_fail_open("):
+        need(battery in hnd, "U-18 배터리 결손: %s" % battery)
+    notes.append("Rust 배터리 10종")
+
+    # ── 계측 타당성 — 구 트리에는 게이트가 없다 ─────────────────────────────
+    calib = "skip(no-git)"
+    old_h = _git_show(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    if old_h is not None:
+        need("surface_create_auth_gate" not in old_h,
+             "계측 타당성 실패: 구 handlers.rs 에 이미 인증 게이트가 있다(기준 커밋 오선택)")
+        need("create_surface_with_env(" in old_h,
+             "계측 타당성 실패: 구 handlers.rs 에 PTY 스폰 호출이 없다 — 앵커 서사가 틀린 것")
+        calib = "구 트리=게이트 부재 + 스폰 호출 실재"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
@@ -4711,6 +5315,85 @@ def h_deliver_1():
             "행동검체 배선 · 계측검증=%s" % calib)
 
 
+# ── 관문 ↔ 오탐 대조군 **커버리지 표** 탐지기(2026-08-24 · 이종 리뷰어 [major]) ──────────
+#
+# ★무엇이 결함이었나: 새 관문을 코퍼스에 들일 때 생기는 마찰이 아래 H-GATE-SOT-1 의
+#   `need(len(blocks) == 6)` **하나뿐**이었다. 그 숫자는 손으로 `6 → 7` 만 고치면 통과한다 —
+#   즉 관문은 늘어나는데 그 관문의 오탐 표면을 재는 자리는 **하나도 늘지 않는다**(리뷰어
+#   표현: "지금 이빨은 자라지 않는다"). 관문이 하나 늘 때마다 넓어지는 것은 정확히 "정상 화면을
+#   관문으로 오인할 표면" 이고, 이 저장소는 그 오인으로 **건강한 노드를 영구 부트 라이브락**에
+#   빠뜨린 적이 있다(BLOCK-1 실측).
+#
+# ★수리는 2계층이다. Rust 쪽이 `GATE_CONTROL_COVERAGE` 표와 그 집행 검체
+#   (`every_gate_has_a_control_screen_that_satisfies_its_widget_signature`)를 세워
+#   "대조군 화면이 그 관문의 **위젯 서명을 전부 만족**할 것" 까지 실행으로 증명한다.
+#   러너(이 파일)는 그 표의 **실재·항목 수·관문 전수 커버·지목 대상 실재**를 함께 핀한다.
+#   한 계층만으로는 "표를 지우고 그 표를 보는 검체도 같이 지우면 초록" 이 남는다 —
+#   두 계층이 맞물려야 어느 쪽을 지워도 다른 쪽이 적색이 된다.
+#
+# ★검체 본문이 아니라 **순수 함수**로 두는 이유: 트리가 초록일 때 탐지기가 통째로 고장나도
+#   결과는 똑같이 초록이다(전형적 '초록 사각'). 아래 검체가 합성 변조본을 먹여 매 실행마다
+#   탐지 능력 자체를 시험한다(MEMORY '디버깅 계측 타당성 게이트' 3칙 ①).
+_GATE_COVERAGE_ENFORCER = "fn every_gate_has_a_control_screen_that_satisfies_its_widget_signature("
+
+
+def _gate_coverage_rows(sot):
+    """정본의 `GATE_CONTROL_COVERAGE` 항목 [(gate_id, screen_id)]. 표가 없으면 None."""
+    m = re.search(r"GATE_CONTROL_COVERAGE\s*:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(.*?)\n\];",
+                  sot, re.S)
+    if not m:
+        return None
+    return re.findall(r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)', m.group(1))
+
+
+def _gate_coverage_violations(sot):
+    """`src/first_run_gates.rs` 소스의 커버리지 계약 위반 목록(빈 목록 = 정상)."""
+    v = []
+    d0 = sot.find("const DEFS:")
+    if d0 < 0:
+        return ["정본 관문 표(DEFS)를 못 찾았다 — 관문 집합을 특정할 수 없다(수확기 파손)"]
+    defs = sot[d0:sot.find("\n];", d0) + 3]
+    gate_ids = re.findall(r'id:\s*"([^"]+)"', defs)
+    if not gate_ids:
+        return ["DEFS 에서 관문 id 를 하나도 수확하지 못했다(수확기 파손 — fail-closed)"]
+    cov = _gate_coverage_rows(sot)
+    if cov is None:
+        return ["대조군 커버리지 표(GATE_CONTROL_COVERAGE)가 없다 — 새 관문을 들일 때 대조군을 "
+                "함께 들이라는 규율의 이빨이 사라졌다(러너의 `len(blocks)==N` 은 손으로 숫자만 "
+                "고치면 통과한다)"]
+    if not cov:
+        v.append("커버리지 표 항목 0건 — 표만 남기고 비우는 것은 지우는 것과 같다")
+    sm = re.search(r"NON_GATE_SCREENS\s*:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[(.*?)\n\s*\];",
+                   sot, re.S)
+    if not sm:
+        v.append("오탐 대조군 표(NON_GATE_SCREENS)를 못 찾았다 — 커버리지가 가리키는 대상의 "
+                 "실재를 잴 수 없다")
+        screens = None
+    else:
+        screens = {a for a, _c in re.findall(r'\(\s*"([^"]+)"\s*,\s*([A-Za-z0-9_]+)\s*\)',
+                                             sm.group(1))}
+        if not screens:
+            v.append("NON_GATE_SCREENS 항목 0건(수확기 파손 — fail-closed)")
+    covered = {g for g, _s in cov}
+    for g in gate_ids:
+        if g not in covered:
+            v.append("관문 %s 의 대조군 커버리지가 0건 — 관문만 늘고 그것을 재는 자리는 늘지 않았다"
+                     % g)
+    for g in sorted(covered - set(gate_ids)):
+        v.append("커버리지 표가 정본에 없는 관문 %s 를 가리킨다(쓰레기통 금지 — 면제표와 같은 규율)"
+                 % g)
+    if screens:
+        for s in sorted({s for _g, s in cov} - screens):
+            v.append("커버리지 표가 존재하지 않는 대조군 화면 %s 를 가리킨다" % s)
+    if cov and len(cov) < len(gate_ids):
+        v.append("커버리지 항목 %d < 관문 %d — 산술상 커버리지 0인 관문이 반드시 있다"
+                 % (len(cov), len(gate_ids)))
+    if _GATE_COVERAGE_ENFORCER not in sot:
+        v.append("커버리지 집행 검체(every_gate_has_a_control_screen_that_satisfies_its_widget_"
+                 "signature)가 없다 — 표만 있고 아무도 집행하지 않으면 장식이다")
+    return v
+
+
 @specimen("H-GATE-SOT-1", "W6",
           "관문 문면 SOT 1벌 — 나머지 사본은 읽기 소비이거나 명시 면제(S-1)", ["S-1"])
 def h_gate_sot_1():
@@ -4799,6 +5482,42 @@ def h_gate_sot_1():
              "무의미해지고 관문이 needle 하나로 성립한다(BLOCK-1 형태 · 영구 부트 라이브락)"
              % (gid, ws))
     notes.append("자기규칙: 위젯 AND 6/6 실재·보편토큰 단독 0 · 검체 5종 실재")
+
+    # ── ★대조군 커버리지 표 결박(2026-08-24 · 이종 리뷰어 [major] 채택) ──────────
+    # 위 `len(blocks) == 6` 은 **그대로 둔다**(핀 삭제 금지 — 러너 헤더 ②). 여기서 하는 일은
+    # 판정 축을 **추가**하는 것뿐이다: 관문이 하나 늘면 그 관문의 대조군도 함께 늘어야 한다는
+    # 계약을, Rust 표(`GATE_CONTROL_COVERAGE`)와 **맞물려** 잰다. 이제 그 표를 지우거나 비우는
+    # 것, 그 표가 없는 관문·없는 화면을 가리키는 것, 집행 검체를 지우는 것이 러너에서도 적색이다.
+    cov_v = _gate_coverage_violations(sot)
+    need(not cov_v, "대조군 커버리지 계약 위반 %d건: %s" % (len(cov_v), cov_v))
+    cov_rows = _gate_coverage_rows(sot) or []
+    # ★계측 타당성 — 트리에 위반이 0건이므로 탐지기가 죽어 있어도 결과는 똑같이 초록이다.
+    #   그래서 매 실행 합성 변조본을 먹여 **탐지 능력 자체**를 시험한다. 마지막 변조본이
+    #   리뷰어가 지목한 정확한 시나리오다: 관문만 하나 더 들이고 대조군은 0으로 둔 상태.
+    _planted = ('const DEFS: &[Def] = &[\n    Def {\n        id: "planted-gate",\n'
+                '        needles: &["Planted question?"],\n        widget: &["Planted widget"],\n'
+                '    },')
+    cov_mutants = [
+        ("커버리지 표 삭제",
+         re.sub(r"pub const GATE_CONTROL_COVERAGE[\s\S]*?\n\];", "", sot, count=1)),
+        ("커버리지 표 비움",
+         re.sub(r"(pub const GATE_CONTROL_COVERAGE[^=]*=\s*&\[)[\s\S]*?(\n\];)",
+                r"\1\2", sot, count=1)),
+        ("관문 1종의 대조군 전삭제", re.sub(r'\n\s*\("theme",\s*"[^"]+"\),', "", sot)),
+        ("존재하지 않는 대조군 지목",
+         sot.replace('("theme", "audit-log-line")', '("theme", "no-such-screen")', 1)),
+        ("정본에 없는 관문 지목",
+         sot.replace('("theme", "audit-log-line")', '("no-such-gate", "audit-log-line")', 1)),
+        ("집행 검체 삭제",
+         sot.replace(_GATE_COVERAGE_ENFORCER, "fn coverage_check_disabled(", 1)),
+        ("새 관문만 추가(대조군 0 — 리뷰어 지목 시나리오)",
+         sot.replace("const DEFS: &[Def] = &[", _planted, 1)),
+    ]
+    cov_blind = [lbl for lbl, m in cov_mutants if not _gate_coverage_violations(m)]
+    need(not cov_blind, "커버리지 탐지기가 합성 변조본을 못 잡았다(탐지기 고장): %s"
+         % ", ".join(cov_blind))
+    notes.append("대조군 커버리지 %d행/관문 %d종 전수 커버 · 집행 검체 실재 · 합성 변조 %d종 전건 적발"
+                 % (len(cov_rows), len(blocks), len(cov_mutants)))
 
     # ── 사본 ① agents.json trust-prompt 선언 → 정본 needle 에 실재해야 한다
     aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
@@ -5107,6 +5826,9 @@ SCAN_TARGETS = {
     #   cys.rs 쪽 **호출 배선**은 `readiness` 가 이미 소유하므로 여기 등재하지 않는다
     #   (H-KILLCHAIN-1 은 두 이름을 모두 경유해 읽는다).
     "inject_guard": (os.path.join("src", "inject_guard.rs"),),
+    # ★(U-17) 프로필 인증 전제 판정기. 신설 파일 하나이며 `cys profile-auth` 배선이 CLI 로
+    #   내려가면 **여기에 그 경로를 추가**한다(판정부는 이 파일에 남으므로 둘 다 유지).
+    "profile_gate": (os.path.join("src", "profile_gate.rs"),),
 }
 
 # 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.
@@ -5130,6 +5852,10 @@ SCAN_TARGET_CONSUMERS = {
     "H-SAFE-2": "readiness",
     "H-TIME-3": "readiness",
     "H-OBS-2": "readiness",
+    # ★(U-17) 인증 전제 판정기 검체 — 판정부를 `profile_gate` 로 묻는다(직접 경로 0).
+    "H-AUTH-PARSE": "profile_gate",
+    # ★(U-18) create 게이트 검체 — 문안에 실리는 판정기 안정 문자열을 정본에서 뽑는다.
+    "H-AUTH-SELFLOOP": "profile_gate",
 }
 
 # 레지스트리 소유 경로를 **직접** 읽는 기존 검체(동결 목록 · 2026-08-23 U-2 시점 실측 15종).
@@ -5519,6 +6245,77 @@ def h_doc_9():
     return "기동 계약·착수 규율 마커 2종 핀 · 계측검증=%s" % calib
 
 
+@specimen("H-DOC-10", "W6",
+          "`--detach-session` ↔ 창작자 ACL 근거 주석 인용 결박(유령 인용·반쪽 제거 차단)",
+          ["U-24", "결함8(2026-08-22 부트 실사고)", "④ 전 pane 사망"])
+def h_doc_10():
+    """U-24 이관의 **경계 검체**. `--detach-session` 은 `javis_bootstrap.py` 안에서만 사는
+    인자가 아니다 — 데몬의 창작자 ACL 원장(`state.rs Daemon::create_caller` · 판정
+    `handlers.rs creator_matches`/`ACL_ROLE_CREATOR`)이 **존재 근거로 이 문자열을 인용**한다.
+
+    실사고(2026-08-22): 훅이 `setsid python3 javis_bootstrap.py --detach-session` 으로 부트를
+    백그라운드 발화하면 그 프로세스가 launchd 로 재부모화돼 `external` 등급이 되고, 부서 ACL 의
+    `external→worker*` deny 에 **부트가 자기가 방금 만든 워커 좌석에 지침을 넣는 것**까지 걸렸다
+    (`acl denied: external → worker` → 좌석 롤백 → 워커 기동 실패 = 글자 0).
+
+    ∴ 이관하면서 팩 쪽 인자만 지우면 Rust 쪽 주석은 **유령 인용**이 되고, 다음 사람이
+    "근거가 사라졌으니 원장도 지워도 된다"고 읽는 순간 그 사고가 재발한다. 이 검체는
+    **인자와 인용의 동시 존재 ∨ 동시 부재**를 강제한다 — 반쪽 제거가 구조적으로 불가능해진다.
+    ★U-24 에서 인자를 제거하지 않은 이유도 여기 남긴다: 제거는 훅 발화부·state.rs·handlers.rs
+      3파일 동시 개정을 요구하고, 그 동시성이 깨진 상태가 곧 위 사고다.
+    """
+    FLAG = "--detach-session"
+    boot_src = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    state_src = _repo_file(os.path.join("src", "bin", "cysd", "state.rs"))
+    handlers_src = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
+    notes = []
+
+    def _verdict(pack, state, handlers):
+        """순수 술어 — (팩에 인자 있음, state.rs 인용, handlers.rs 인용) → 위반 목록."""
+        bad = []
+        has_flag = FLAG in pack
+        cites = [("state.rs", FLAG in state), ("handlers.rs", FLAG in handlers)]
+        for nm, cited in cites:
+            if cited and not has_flag:
+                bad.append("%s 가 유령 인용(팩에서 %s 가 사라졌다)" % (nm, FLAG))
+            if has_flag and not cited:
+                bad.append("%s 에 창작자 ACL 근거 인용이 없다(근거 소실)" % nm)
+        return bad
+
+    need(not _verdict(boot_src, state_src, handlers_src),
+         "인용 결박 위반: %r" % _verdict(boot_src, state_src, handlers_src))
+    notes.append("인자↔인용 3자 정합(%s)" % ("존재" if FLAG in boot_src else "부재"))
+
+    # ⓑ 근거의 **강건성**: 원장의 존재 이유가 인자 이름이 아니라 '재부모화라는 사실'임을
+    #    state.rs 가 명시해야 한다. 그렇지 않으면 인자 개명 한 번에 근거가 통째로 흔들린다.
+    need("재부모화" in state_src and "H-DOC-10" in state_src,
+         "state.rs 창작자 원장 주석이 재부모화 근거·이 검체 포인터를 담지 않는다 — "
+         "인용이 인자 이름에만 매달려 있으면 개명 한 번에 근거가 증발한다")
+    need("javis_bootstrap.py" in state_src,
+         "state.rs 주석이 인용 출처 파일을 명시하지 않는다(추적 불가)")
+    notes.append("state.rs 근거 강건성(재부모화·검체 포인터)")
+
+    # ⓒ 팩 쪽도 반대 방향 결박을 문서화하는가(같은 커밋 동시 개정 지시)
+    need("state.rs" in boot_src and "handlers.rs" in boot_src,
+         "javis_bootstrap 의 detach_session 이 Rust 쪽 동시 개정 의무를 명시하지 않는다")
+    need("H-DOC-10" in boot_src, "팩 쪽에 이 검체 포인터가 없다(결박이 사람 기억에만 있다)")
+    notes.append("팩→Rust 동시개정 의무 명문")
+
+    # ⓓ **합성 표본으로 탐지력 시험** — 트리가 정합이라 초록인 핀은 탐지 능력을 따로 증명한다.
+    need(_verdict(boot_src.replace(FLAG, "--gone"), state_src, handlers_src),
+         "계측 타당성 실패: 팩에서 인자를 지운 합성 표본에도 유령 인용 탐지기가 침묵한다")
+    need(_verdict(boot_src, state_src.replace(FLAG, "--gone"), handlers_src),
+         "계측 타당성 실패: state.rs 인용을 지운 합성 표본에서 근거 소실을 못 잡는다")
+    need(_verdict(boot_src, state_src, handlers_src.replace(FLAG, "--gone")),
+         "계측 타당성 실패: handlers.rs 인용을 지운 합성 표본에서 근거 소실을 못 잡는다")
+    need(not _verdict(boot_src.replace(FLAG, "--gone"), state_src.replace(FLAG, "--gone"),
+                      handlers_src.replace(FLAG, "--gone")),
+         "계측 타당성 실패: **동시 부재**(정당한 완전 제거)까지 위반으로 잡는다 = 과탐 "
+         "— 이 결박은 반쪽 제거만 막아야 한다")
+    notes.append("합성 표본 4종(반쪽 3·동시부재 1) 판별")
+    return " · ".join(notes)
+
+
 @specimen("H-DOC-7", "W4", "agents 스키마 완결성(preflight C71 — 결손 의미 고지·vendor/user 계층)",
           ["B20"])
 def h_doc_7():
@@ -5688,19 +6485,40 @@ def _bootstrap_mod():
     return javis_bootstrap
 
 
+def _rust_u64_const(src, name):
+    """`pub const <name>: u64 = <n>;` 해소 — 매니페스트가 상수를 참조할 때 값을 따라간다."""
+    m = re.search(r"pub const %s: u64 = (\d+);" % re.escape(name), src)
+    need(m, "src/pack.rs 에서 상수 %s 를 찾지 못했다" % name)
+    return int(m.group(1))
+
+
 def _rust_awakening_hooks():
-    """src/pack.rs `AWAKENING_HOOKS` 리터럴 → {(script, event, matcher)}. 파싱 실패=hard fail."""
+    """src/pack.rs `AWAKENING_HOOKS` 리터럴 → {(script, event, matcher, timeout)}. 파싱 실패=hard fail.
+
+    ★U-21: 종전 파서는 3-튜플(`script→event→matcher`)이었다. `timeout` 필드를 뒤에 **덧붙이기만**
+    하면 이 정규식은 그대로 통과하면서 timeout 스큐를 못 본다 = **무음**. 그래서 필드 확장과
+    파서 확장은 같은 커밋에서 함께 간다(핀 이사 계약 ③).
+    필드 순서(`matcher` 다음 `timeout`)가 곧 계약이며 아래 정규식이 그 순서를 집행한다."""
     src = _repo_file(os.path.join("src", "pack.rs"))
     m = re.search(r"pub const AWAKENING_HOOKS: \[DesiredHook; (\d+)\] = \[(.*?)\n\];", src, re.S)
     need(m, "src/pack.rs 에서 AWAKENING_HOOKS 를 찾지 못했다(표현이 바뀌면 이 대조를 함께 갱신하라)")
     body = _code_lines(m.group(2).replace("//", "#"))
     out = set()
     for blk in re.finditer(
-            r'script:\s*"([^"]+)"\s*,\s*event:\s*"([^"]+)"\s*,\s*matcher:\s*(None|Some\("([^"]*)"\))',
+            r'script:\s*"([^"]+)"\s*,\s*event:\s*"([^"]+)"\s*,\s*matcher:\s*(None|Some\("([^"]*)"\))'
+            r'\s*,\s*timeout:\s*(None|Some\(([A-Za-z0-9_]+)\))',
             body):
-        out.add((blk.group(1), blk.group(2), blk.group(4)))
+        raw = blk.group(6)
+        if raw is None:
+            timeout = None
+        elif raw.isdigit():
+            timeout = int(raw)
+        else:
+            timeout = _rust_u64_const(src, raw)
+        out.add((blk.group(1), blk.group(2), blk.group(4), timeout))
     need(len(out) == int(m.group(1)),
-         "Rust 매니페스트 파싱 수 불일치(선언 %s ≠ 파싱 %d)" % (m.group(1), len(out)))
+         "Rust 매니페스트 파싱 수 불일치(선언 %s ≠ 파싱 %d) — timeout 필드가 matcher 뒤에 없거나 "
+         "순서 계약이 깨졌다" % (m.group(1), len(out)))
     return out
 
 
@@ -5735,17 +6553,37 @@ def h_seed_1():
     적고(1 데이터 × N 집행자) 집행을 **이벤트 단위 멱등 병합**으로 바꾼다."""
     PF = _preflight_mod()
     rust = _rust_awakening_hooks()
-    py = {(script, ev, matcher) for script, evs in PF.AWAKENING_HOOKS for ev, matcher in evs}
+    py = {(script, ev, matcher, to)
+          for script, evs in PF.AWAKENING_HOOKS for ev, matcher, to in evs}
     need(rust == py, "소망 집합이 2언어에서 갈렸다 — rust=%r / python=%r" % (sorted(rust), sorted(py)))
-    notes = ["집합 %d항 2언어 일치" % len(rust)]
+    notes = ["집합 %d항 2언어 일치(timeout 포함 4-튜플)" % len(rust)]
     # ⓐ 각성 집합은 SessionStart + UserPromptSubmit 을 **둘 다** 갖는다(둘 중 하나만이 원 결함)
-    need({e for _, e, _ in py} == {"SessionStart", "UserPromptSubmit"},
-         "각성 집합이 두 이벤트를 덮지 않는다: %r" % sorted({e for _, e, _ in py}))
+    need({e for _, e, _, _ in py} == {"SessionStart", "UserPromptSubmit"},
+         "각성 집합이 두 이벤트를 덮지 않는다: %r" % sorted({e for _, e, _, _ in py}))
+    # ⓐ′ ★U-21 timeout 선언 — UserPromptSubmit 은 하네스 기본이 30s 뿐이고 timeout 은
+    #     '취소 + 출력 폐기'다. 선언이 없거나 기본 이하면 부트 체인이 **무음으로 사라진다**.
+    _ups = [(sc, to) for sc, ev, _, to in py if ev == "UserPromptSubmit"]
+    need(len(_ups) == 1, "UserPromptSubmit 각성 훅이 1개가 아니다: %r" % _ups)
+    _plat = _rust_u64_const(_repo_file(os.path.join("src", "pack.rs")),
+                            "HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S")
+    need(_plat == PF.HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S,
+         "하네스 기본값 상수가 2언어에서 갈렸다(rust=%s / python=%s)"
+         % (_plat, PF.HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S))
+    need(_ups[0][1] is not None and _ups[0][1] > _plat,
+         "UserPromptSubmit 선언 timeout 이 없거나 하네스 기본(%ss) 이하다: %r — "
+         "부트 체인이 취소되고 stdout(additionalContext)이 폐기된다" % (_plat, _ups[0]))
+    # ⓐ″ 파이썬 안에서 매니페스트와 등록기 표가 갈리지 않았나(등록 경로는 hook_timeout_for 를 쓴다)
+    for _sc, _ev, _m, _to in py:
+        need(PF.hook_timeout_for(_sc, _ev) == _to,
+             "파이썬 내부 스큐 — 매니페스트 %r 과 등록기 표(hook_timeout_for)가 갈렸다: %r"
+             % ((_sc, _ev, _to), PF.hook_timeout_for(_sc, _ev)))
+    notes.append("UserPromptSubmit timeout %ss 선언(하네스 기본 %ss 초과) · 파이썬 내부 스큐 0"
+                 % (_ups[0][1], _plat))
     # ⓑ C28 등록 집합(SELFCORR_HOOKS)이 role-bootstrap 을 포함한다(집행자 누락 방지)
     selfcorr = {(sc, ev) for sc, evs in PF.SELFCORR_HOOKS for ev, _ in evs}
     need(("role-bootstrap.sh", "UserPromptSubmit") in selfcorr,
          "C28 등록 집합에 각성 훅이 없다(등록 주체 부재)")
-    need(PF.AWAKENING_SCRIPTS == {sc for sc, _, _ in py}, "AWAKENING_SCRIPTS 파생 불일치")
+    need(PF.AWAKENING_SCRIPTS == {sc for sc, _, _, _ in py}, "AWAKENING_SCRIPTS 파생 불일치")
     notes.append("C28 등록 주체 확인")
     # ⓒ Rust 두 집행자가 **매니페스트를 소비**한다(사본 재발명 0)
     pk = _repo_file(os.path.join("src", "pack.rs"))
@@ -5786,6 +6624,239 @@ def h_seed_1():
             need('"SessionStart"' in oldc[oi:oi + 3000],
                  "계측 타당성 실패: 구 init-pack 의 SessionStart 단독 등록을 못 찾았다")
         calib = "구 코드=파일 단위 시드 + init-pack SessionStart 단독 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+def _u21_parse_awakening_body(body, declared_n):
+    """`_rust_awakening_hooks` 의 **파싱 코어**만 떼어낸 것 — 합성 표본으로 탐지기 자체를 시험한다.
+    반환: (파싱된 항 수, 선언 수와 일치하는가)."""
+    n = len(re.findall(
+        r'script:\s*"([^"]+)"\s*,\s*event:\s*"([^"]+)"\s*,\s*matcher:\s*(None|Some\("([^"]*)"\))'
+        r'\s*,\s*timeout:\s*(None|Some\(([A-Za-z0-9_]+)\))',
+        body))
+    return n, n == declared_n
+
+
+@specimen("H-SEED-U21", "W6",
+          "훅 등록 reconcile + 선언 timeout — 판정 2축·교체 경로(중복 append 0)·오살 금지·롤백 마스터",
+          ["C-9", "A9"])
+def h_seed_u21():
+    """U-21(2026-08-24): Claude Code 훅의 `UserPromptSubmit` **기본 timeout 은 30초**이고,
+    timeout 은 지연이 아니라 **취소 + 출력 폐기**다. role-bootstrap 의 stdout 이 곧
+    additionalContext(팀 기동 사실 + 착수 규율)라서, 30초를 넘긴 순간 부트 체인은 에러도 없이
+    **조용히 사라진다** — 훅 자신의 데드라인 합만 27초(2+5+5+5+10)라 여유가 3초뿐이고,
+    인터프리터 냉시작이 4회 얹히는 Windows 에서 상한을 넘는다(mac 만 멀쩡한 그 계열).
+
+    그래서 판정을 `command 동등 ∧ 선언 timeout 충족` 2축으로 올리고, 불일치는 **교체**한다.
+    이 검체가 지키는 위험 두 가지가 정확히 이 제품이 낸 사고다:
+      ① 불일치를 append 로 처리 → 같은 명령 2회 등재 → **매 프롬프트 훅 2회 발화**(큐 폭주)
+      ② 엔트리를 통째로 갈아끼움 → 같은 배열의 **사용자 항목 소실**(오살)
+    그리고 선언은 **동등이 아니라 하한**이다 — 사용자가 더 크게 잡아둔 값을 우리 값으로 내리면
+    살아서 완주하던 부트가 우리 손에 잘린다."""
+    PF = _preflight_mod()
+    notes = []
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+
+    # ── ⓐ 직렬화 순서 계약: `timeout` 은 **matcher 뒤** ──────────────────────
+    ds = pk.find("pub struct DesiredHook {")
+    need(ds > 0, "DesiredHook 구조체를 못 찾았다")
+    dbody = pk[ds:pk.find("\n}\n", ds)]
+    _mi, _ti = dbody.find("pub matcher:"), dbody.find("pub timeout:")
+    need(_ti > 0, "DesiredHook 에 timeout 필드가 없다")
+    need(_mi > 0 and _mi < _ti,
+         "필드 순서 계약 위반 — timeout 은 matcher **뒤**여야 한다(파서가 짝을 잃는다)")
+    notes.append("필드 순서 계약(matcher→timeout)")
+
+    # ── ⓑ ★파서 자체를 합성 표본으로 시험한다(트리에 위반 0이라 고장나도 초록인 핀) ──
+    good = ('DesiredHook { script: "a.sh", event: "E", matcher: None, timeout: Some(600) },'
+            'DesiredHook { script: "b.sh", event: "F", matcher: None, timeout: None },')
+    n, ok = _u21_parse_awakening_body(good, 2)
+    need(ok, "★탐지기 파손: 정상 4-튜플 표본을 파싱하지 못했다(파싱 %d/2)" % n)
+    # 표본 ① timeout 을 **앞**에 둔 역순 — 반드시 놓쳐야(=선언 수 불일치로 hard fail) 한다
+    inverted = 'DesiredHook { script: "a.sh", event: "E", timeout: Some(600), matcher: None },'
+    _, ok_inv = _u21_parse_awakening_body(inverted, 1)
+    need(not ok_inv, "★탐지기 파손: 순서를 뒤집은 합성 표본을 통과시켰다(순서 계약 무집행)")
+    # 표본 ② timeout 필드가 아예 없는 **구 3-튜플** — 반드시 놓쳐야 한다
+    legacy = 'DesiredHook { script: "a.sh", event: "E", matcher: None },'
+    _, ok_leg = _u21_parse_awakening_body(legacy, 1)
+    need(not ok_leg, "★탐지기 파손: 구 3-튜플 표본을 통과시켰다(무음 스큐 재발)")
+    notes.append("파서 합성 표본 3종 시험 통과")
+
+    # ── ⓒ Rust 집행 경로가 2축 판정과 교체 경로를 실제로 소비하나 ────────────
+    need("pub fn hook_timeout_satisfied(" in pk, "선언 충족 판정의 순수 코어가 없다")
+    need("pub fn hook_registered_with_timeout_in(" in pk, "2축 판정기가 없다")
+    need("fn raise_hook_timeout_in(" in pk, "불일치 엔트리 교체 경로가 없다")
+    mi = pk.find("pub fn merge_desired_hooks(")
+    need(mi > 0, "merge_desired_hooks 를 못 찾았다")
+    mbody = pk[mi:pk.find("\npub fn ", mi + 10)]
+    need("hook_registered_with_timeout_in(" in mbody, "병합기가 2축 판정을 소비하지 않는다")
+    need("raise_hook_timeout_in(" in mbody, "병합기에 교체 경로가 배선되지 않았다")
+    vi = pk.find("pub fn verify_desired_hooks_registered(")
+    vbody = pk[vi:pk.find("\n}\n", vi)]
+    need("hook_registered_with_timeout_in(" in vbody,
+         "⊇ 게이트가 집행 축과 다른 판정을 쓴다(스큐가 남은 디스크를 '충족'으로 보고한다)")
+    notes.append("Rust 2축 판정 + 교체 경로 + ⊇ 게이트 동축")
+
+    # ── ⓓ 롤백은 **마스터 한 손잡이**로 닫힌다 ───────────────────────────────
+    need("pub const ENV_HOOK_TIMEOUT_V1:" in pk, "축 전용 노브 상수가 없다")
+    need("crate::boot_gates_master_off_from(master_env)" in pk,
+         "축이 마스터(CYS_BOOT_GATES=0)에 접히지 않았다 — 사고 순간 노브 조합 불가")
+    need(PF.hook_timeout_axis_legacy_from(None, None) is False, "기본이 종전 동작이다")
+    need(PF.hook_timeout_axis_legacy_from("0", None) is True, "마스터가 python 축을 끄지 못한다")
+    need(PF.hook_timeout_axis_legacy_from(None, "1") is True, "축 노브가 python 축을 끄지 못한다")
+    need(PF.hook_timeout_axis_legacy_from("false", "yes") is False, "엄격 비교가 아니다")
+    notes.append("롤백 마스터 접기 + 엄격 비교(2언어)")
+
+    # ── ⓔ ★파이썬 등록기 실거동(격리 tmp — 실 HOME 무접촉) ──────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        pack = os.path.join(home, ".cys", "pack")
+        os.makedirs(pack, exist_ok=True)
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                        CLAUDE_CONFIG_DIR=None, CYS_BOOT_GATES=None,
+                        CYS_HOOK_TIMEOUT_V1=None):
+            ours = PF._cys_hook_cmd("role-bootstrap.sh")
+            user = "sh %s/myhooks/role-bootstrap.sh" % home     # 동명 사용자 훅(보존 대상)
+            want = PF.hook_timeout_for("role-bootstrap.sh", "UserPromptSubmit")
+            need(want and want > PF.HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S,
+                 "등록기 표가 하네스 기본 이하다: %r" % want)
+
+            def _mk(entries):
+                sp = os.path.join(tmp, "s-%d.json" % len(os.listdir(tmp)))
+                _w(sp, json.dumps({"hooks": {"UserPromptSubmit": entries}}), 0o644)
+                return sp
+
+            def _load(sp):
+                return json.load(open(sp, encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+
+            def _reg(sp, timeout):
+                err = PF.Preflight._register_event_hook(
+                    None, sp, "UserPromptSubmit", "role-bootstrap.sh", None, timeout)
+                need(err is None, "등록 실패: %s" % err)
+
+            # ① 우리 명령이 **timeout 없이** 실려 있고 옆에 사용자 훅이 있는 현장 상태
+            sp = _mk([{"hooks": [{"type": "command", "command": user}]},
+                      {"hooks": [{"type": "command", "command": ours}]}])
+            need(PF.Preflight._event_hook_registered(sp, "UserPromptSubmit",
+                                                     "role-bootstrap.sh", want) is False,
+                 "2축 판정이 timeout 미기록을 '충족'으로 읽는다(원 결함 그대로)")
+            need(PF.Preflight._event_hook_registered(sp, "UserPromptSubmit",
+                                                     "role-bootstrap.sh") is True,
+                 "command 축 단독 판정(종전)이 깨졌다")
+            _reg(sp, want)
+            arr = _load(sp)
+            cmds = [h.get("command") for e in arr for h in e.get("hooks", [])]
+            need(cmds.count(ours) == 1,
+                 "★교체가 아니라 중복 append 됐다(훅 2회 발화 = 큐 폭주 방향): %r" % cmds)
+            need(user in cmds, "★사용자 동명 훅이 사라졌다(오살)")
+            got = [h.get("timeout") for e in arr for h in e.get("hooks", [])
+                   if h.get("command") == ours]
+            need(got == [want], "선언 timeout 이 실리지 않았다: %r" % got)
+            # 멱등 — 교정 뒤 재실행은 무동작
+            _reg(sp, want)
+            need([h.get("command") for e in _load(sp) for h in e.get("hooks", [])].count(ours) == 1,
+                 "교정 후 재실행이 중복을 만들었다(멱등 위반)")
+            notes.append("교체 경로 실거동: 중복 0 · 사용자 훅 보존 · 값 %ss · 멱등" % want)
+
+            # ② ★사용자가 더 크게 잡아둔 값은 **내리지 않는다**(한 방향으로만 여는 축)
+            hi = _mk([{"hooks": [{"type": "command", "command": ours, "timeout": want + 300}]}])
+            need(PF.Preflight._event_hook_registered(hi, "UserPromptSubmit",
+                                                     "role-bootstrap.sh", want) is True,
+                 "더 큰 값을 불충족으로 읽는다 — 그 판정은 값을 내리는 쓰기를 부른다(오살)")
+            _reg(hi, want)
+            got_hi = [h.get("timeout") for e in _load(hi) for h in e.get("hooks", [])]
+            need(got_hi == [want + 300],
+                 "★더 큰 사용자 값을 우리 값으로 내렸다(오살 방향): %r" % got_hi)
+            notes.append("고값 무하향(%ss 유지)" % (want + 300))
+
+            # ③ ★C28 보고 티어 분리 — "미등록" 과 "timeout 미달" 은 다른 사실이다.
+            #    command 가 실려 있는데 FAIL("각성 훅 미등록")을 내면 **위경고**이고(H-SEED-2 계약),
+            #    그 오보는 현장에서 "훅이 없다"는 잘못된 조치를 부른다. 그러나 교정은 미루지
+            #    않는다 — --fix 경로는 두 축을 동일하게 수리한다.
+            ccd = os.path.join(tmp, "live-config")
+            os.makedirs(ccd, exist_ok=True)
+            _fake_pack_with_hooks(pack)
+            with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                            CLAUDE_CONFIG_DIR=ccd, CYS_BOOT_GATES=None,
+                            CYS_HOOK_TIMEOUT_V1=None), _temp_guard_double(PF, "SNAPMARK"):
+                # C28 이 보는 자기교정 훅을 **전부** 등록해 둔다 — 다른 결손의 경고가 보고를
+                # 채우면 timeout 경고가 잘려 나가 검체가 무의미해진다(보고 상한 warns[:6]).
+                _hooks = {}
+                for _sc, _evs in PF.SELFCORR_HOOKS:
+                    for _ev, _m in _evs:
+                        _e = {"hooks": [{"type": "command", "command": PF._cys_hook_cmd(_sc)}]}
+                        if _m is not None:
+                            _e["matcher"] = _m
+                        _hooks.setdefault(_ev, []).append(_e)
+                _w(os.path.join(ccd, "settings.json"),
+                   json.dumps({"hooks": _hooks}), 0o644)
+                pf = PF.Preflight(False, [])
+                pf.c28_self_correction()
+                row = [r for r in pf.results if r["id"].startswith("C28")][0]
+                need(row["status"] != PF.FAIL,
+                     "★위경고 — timeout 스큐뿐인데 '각성 훅 미등록' FAIL 을 냈다: %r" % row)
+                need("timeout" in row["detail"],
+                     "timeout 스큐를 보고하지 않는다(무음): %r" % row["detail"])
+                need("미등록" not in row["detail"].split("timeout")[0][-40:],
+                     "실려 있는 훅을 '미등록' 으로 서술한다(거짓 보고): %r" % row["detail"])
+                # --fix 는 티어와 무관하게 실제로 교정한다(WARN 강등이 수리를 미루지 않는다)
+                fx = PF.Preflight(True, [])
+                fx.c28_self_correction()
+                got_fx = [h.get("timeout")
+                          for e in json.load(open(os.path.join(ccd, "settings.json"),
+                                                  encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+                          for h in e.get("hooks", []) if h.get("command") == ours]
+                need(got_fx == [want], "--fix 가 timeout 스큐를 교정하지 않았다: %r" % got_fx)
+                notes.append("C28 티어 분리(스큐=非FAIL·보고 실재) + --fix 실교정")
+
+            # ③ 순수 술어 진리표 — 선언은 하한이지 동등이 아니다
+            need(PF.hook_timeout_satisfied(None, None) is True, "무선언이 불충족으로 접혔다")
+            need(PF.hook_timeout_satisfied(None, 600) is False,
+                 "키 부재를 충족으로 읽는다 — 하네스 기본 30s 를 우리가 읽을 길이 없다")
+            need(PF.hook_timeout_satisfied(30, 600) is False, "저값을 충족으로 읽는다")
+            need(PF.hook_timeout_satisfied(900, 600) is True, "고값을 불충족으로 읽는다")
+
+        # ④ 롤백: 마스터 하나로 선언이 사라지고 쓰기도 종전으로 돌아간다
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_ACCOUNT_DIR=None,
+                        CLAUDE_CONFIG_DIR=None, CYS_BOOT_GATES="0",
+                        CYS_HOOK_TIMEOUT_V1=None):
+            need(PF.hook_timeout_for("role-bootstrap.sh", "UserPromptSubmit") is None,
+                 "마스터 스위치를 눌러도 선언이 살아 있다(롤백 불능)")
+            ours2 = PF._cys_hook_cmd("role-bootstrap.sh")
+            sp2 = os.path.join(tmp, "rollback.json")
+            _w(sp2, json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": ours2}]}]}}), 0o644)
+            need(PF.Preflight._event_hook_registered(
+                sp2, "UserPromptSubmit", "role-bootstrap.sh",
+                PF.hook_timeout_for("role-bootstrap.sh", "UserPromptSubmit")) is True,
+                 "롤백 상태인데 판정이 여전히 timeout 을 요구한다")
+            after = json.load(open(sp2, encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+            need("timeout" not in after[0]["hooks"][0], "롤백 상태에서 timeout 키가 실렸다")
+            notes.append("롤백(CYS_BOOT_GATES=0) → 선언 None · 판정·쓰기 종전")
+
+    # ── ⓕ 계측 타당성: 구 트리에는 이 축이 아예 없다 ─────────────────────────
+    old = _git_show(os.path.join("src", "pack.rs"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need("pub timeout: Option<u64>," not in old,
+             "계측 타당성 실패: 구 코드에 이미 timeout 필드가 있다(검체 무의미)")
+        need("hook_registered_with_timeout_in" not in old,
+             "계측 타당성 실패: 구 코드에 이미 2축 판정기가 있다")
+        # ★기준 트리(CALIBRATION_REF)에는 `hook_registered_in` 자체가 아직 없을 수 있다 —
+        #   그 경우 "구 판정기가 timeout 을 안 본다"는 명제는 **더 강하게** 성립한다(판정기 자체가
+        #   없다). 없다고 통과시키는 것이 아니라, 두 경우 모두에서 사실을 확인해 문구로 남긴다.
+        oi = old.find("pub fn hook_registered_in(")
+        if oi > 0:
+            need("timeout" not in old[oi:old.find("\n}\n", oi)],
+                 "계측 타당성 실패: 구 판정기가 이미 timeout 을 본다")
+            calib = "구 트리=판정기 실재하나 timeout 미고려 + 필드·2축 부재 확인"
+        else:
+            calib = "구 트리=판정기 자체 부재 + 필드·2축 부재 확인"
+    oldp = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    if oldp is not None:
+        need('("role-bootstrap.sh", [("UserPromptSubmit", None)]),' in oldp,
+             "계측 타당성 실패: 구 파이썬 3-튜플 매니페스트 원문을 못 찾았다")
+        calib += " · 구 python=3-튜플 매니페스트 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
@@ -6199,6 +7270,274 @@ def h_life_1():
              "계측 타당성 실패: 구 fast path 의 base 전용 가드를 못 찾았다")
         calib = "구 코드=공유 boot-last + base 전용 fast path 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# U-24 — 레인 규약 이관(javis_lane) · 팩 출하 전제 · 인용 결박
+# ═══════════════════════════════════════════════════════════════════════════
+# 이관 대상 매트릭스(정본 ↔ 레거시 폴백 동치 대조에 쓰는 표본 집합).
+# ★소켓 표본은 **판정이 갈리는 축을 전부** 덮는다: 미설정·base(unix)·base(무확장)·부서·
+#   부서(ceo)·빈 부서명(불량 레인)·커스텀(비-base 비-dept)·win base pipe·win 부서 pipe·
+#   길이 상한 초과(해시 분기)·상한 초과 인접 2종(서로 달라야 한다).
+_LANE_SOCK_SAMPLES = (
+    "",
+    "/Users/x/.local/state/cys/cys.sock",
+    "/Users/x/.local/state/cys/cys",
+    "/Users/x/.local/state/cys-dept-dept-1/cys.sock",
+    "/Users/x/.local/state/cys-dept-ceo/cys.sock",
+    "/Users/x/.local/state/cys-dept-/cys.sock",
+    "/tmp/whatever.sock",
+    "\\\\.\\pipe\\cys",
+    "\\\\.\\pipe\\cys-dept-foo",
+    "/" + ("z" * 400) + "/cys-dept-q/cys.sock",
+    "/" + ("y" * 400) + "/cys-dept-q/cys.sock",
+)
+_LANE_KINDS = ("marker", "boot_last", "skip", "lock", "mission", "delivery", "delivery_epoch")
+
+
+def _lane_parity(path_fn_a, path_fn_b, key_fn_a=None, key_fn_b=None):
+    """두 구현의 **전수 차분** — 반환은 불일치 목록(빈 리스트 = 완전 동치).
+
+    ★`CYS_STATE_DIR` 2상(미설정·격리 경로)까지 도는 이유: 지연 해소가 한쪽에서만 깨지면
+      격리 실행이 실 HOME 을 읽는다(2026-08-01 T1 밀폐 붕괴의 기제). 정적 비교로는 안 잡힌다.
+    """
+    diffs = []
+    saved = os.environ.get("CYS_STATE_DIR")
+    try:
+        for state_env in (None, os.path.join(os.sep, "tmp", "lane-parity-state")):
+            if state_env is None:
+                os.environ.pop("CYS_STATE_DIR", None)
+            else:
+                os.environ["CYS_STATE_DIR"] = state_env
+            for sock in _LANE_SOCK_SAMPLES:
+                if key_fn_a is not None and key_fn_b is not None:
+                    ka, kb = key_fn_a(sock), key_fn_b(sock)
+                    if ka != kb:
+                        diffs.append("lane_key(%r)=%r vs %r" % (sock[:40], ka, kb))
+                for kind in _LANE_KINDS:
+                    pa, pb = path_fn_a(kind, sock), path_fn_b(kind, sock)
+                    if pa != pb:
+                        diffs.append("path(%s,%r)=%r vs %r"
+                                     % (kind, sock[:40], pa, pb))
+    finally:
+        if saved is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = saved
+    return diffs
+
+
+@specimen("H-LANE-1", "W6",
+          "레인 규약 소유자 이관(javis_lane) — 재수출 동일객체 + 레거시 폴백 전수 동치 + 롤백 1지점",
+          ["U-24", "G15", "P3-A-DEPT-LANE"])
+def h_lane_1():
+    """U-24: ③claim·싱글플라이트 집행이 데몬 감독자로 이관되며 `javis_bootstrap.py` 본문이
+    얇아진다. 그 리팩터에 **레인 경로 규약이 딸려 흔들리면** 소비자 6곳(javis_mission · 훅
+    `lane-path` · 디렉티브 2벌 · preflight CONTENT_PINS · delivery.rs 파리티)이 **조용히**
+    갈린다 — 조용한 이유는 경로 함수가 예외를 던지지 않고 *다른 파일*을 성공적으로 가리키기
+    때문이다(부서 부트가 base 마커를 오염 → CEO 승격 게이트 오개방 = 금지 방향 ①).
+    ∴ 축을 먼저 `javis_lane.py` 로 분리하고, 이 검체가 **이관이 동치임**을 기계로 못박는다.
+
+    ★이 검체는 '기능 제거마다 동치 계약을 재검증하는 신규 검체를 먼저 작성한다'는 U-24 게이트의
+      첫 이행이다 — 구 검체(H-LIFE-1)는 **삭제하지 않고** 그대로 두며, 이 검체가 그 위에
+      '어느 구현이 실제로 소비되는가'라는 새 축만 얹는다(판정 완화 0).
+    """
+    B = _bootstrap_mod()
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    lane_py = os.path.join(BIN_DIR, "javis_lane.py")
+    notes = []
+
+    # ⓐ 정본 모듈 실재 + 자기 자신의 밀폐 self-test 통과
+    need(os.path.isfile(lane_py), "javis_lane.py 부재 — 레인 규약 소유자가 추출되지 않았다")
+    r = _run([PY, lane_py, "--self-test"])
+    need(r.returncode == 0, "javis_lane --self-test 실패: %d\n%s" % (r.returncode, r.stderr[-400:]))
+    notes.append("정본 self-test 통과")
+
+    # ⓑ 재수출이 **같은 객체**여야 한다(사본이면 드리프트가 시작된다)
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import javis_lane as L
+    need(B._LANE_SOURCE == "javis_lane",
+         "bootstrap 이 정본을 소비하지 않는다(폴백으로 접혔다): %r" % B._LANE_SOURCE)
+    for a, b, nm in ((B.lane_state_path, L.lane_state_path, "lane_state_path"),
+                     (B.lane_key, L.lane_key, "lane_key"),
+                     (B._socket_is_base, L.socket_is_base, "_socket_is_base"),
+                     (B._LANE_STATE_KINDS, L.LANE_STATE_KINDS, "_LANE_STATE_KINDS")):
+        need(a is b, "재수출 %s 가 정본과 **다른 객체**다(사본 드리프트 위험)" % nm)
+    notes.append("재수출 4종 동일객체")
+
+    # ⓒ 레거시 폴백 ≡ 정본 (전수 차분 · 소켓 11종 × kind 7종 × CYS_STATE_DIR 2상 = 154쌍)
+    diffs = _lane_parity(L.lane_state_path, B._legacy_lane_state_path,
+                         L.lane_key, B._legacy_lane_key)
+    need(not diffs,
+         "이관 비동치 — 정본과 레거시 폴백이 다른 경로를 낸다(롤백 시 상태 파일이 갈린다): %r"
+         % diffs[:6])
+    notes.append("폴백 전수 동치 %d쌍" % (len(_LANE_SOCK_SAMPLES) * len(_LANE_KINDS) * 2))
+
+    # ⓒ′ **합성 표본으로 탐지력 자체를 시험한다**(트리에 위반이 0이라 초록인 핀의 계측 타당성).
+    #    일부러 어긋난 스텁을 넣어 위 비교기가 FIRE 하지 않으면, ⓒ 의 초록은 아무 의미가 없다.
+    def _skewed_path(kind, sock=None):
+        p = L.lane_state_path(kind, sock)
+        return p + ".SKEW" if kind == "skip" else p
+    need(_lane_parity(_skewed_path, B._legacy_lane_state_path, L.lane_key, B._legacy_lane_key),
+         "계측 타당성 실패: 일부러 어긋낸 스텁에도 파리티 비교기가 침묵한다(탐지 불능)")
+    def _skewed_key(sock):
+        return L.lane_key(sock) + "X"
+    need(_lane_parity(L.lane_state_path, L.lane_state_path, _skewed_key, B._legacy_lane_key),
+         "계측 타당성 실패: 레인 키 축의 차분을 비교기가 못 잡는다")
+    notes.append("합성 표본 2종 FIRE")
+
+    # ⓓ 롤백 스위치 = env **1지점**(사고 순간에 노브를 조합할 수 없다)
+    src = _read(boot)
+    reads = len(re.findall(r'os\.environ\.get\("CYS_BOOT_LANE_LEGACY"', src))
+    need(reads == 1,
+         "롤백 스위치 판독 지점이 %d 곳이다 — 1지점이어야 한다(축이 갈리면 절반만 롤백된다)" % reads)
+    need('_LANE_SOURCE = "javis_lane"' in src,
+         "기본값이 신 경로(정본 소비)임을 코드에서 확인할 수 없다")
+    notes.append("롤백 env 1지점·기본=정본")
+
+    # ⓔ 스위치 **실행** 대조: 훅이 실제로 쓰는 소비 경로(`lane-path all`)가 두 모드에서 동일
+    for sock, tag in (("", "base"), ("/x/.local/state/cys-dept-d1/cys.sock", "dept")):
+        env_new = _base_env({"CYS_SOCKET": sock} if sock else {},
+                            drop=("CYS_BOOT_LANE_LEGACY",))
+        env_old = _base_env(dict({"CYS_BOOT_LANE_LEGACY": "1"},
+                                 **({"CYS_SOCKET": sock} if sock else {})))
+        a = _run([PY, boot, "lane-path", "all"], env=env_new)
+        b = _run([PY, boot, "lane-path", "all"], env=env_old)
+        need(a.returncode == 0 and b.returncode == 0,
+             "lane-path all 실패(%s): %d/%d\n%s" % (tag, a.returncode, b.returncode, b.stderr[-300:]))
+        ja, jb = json.loads(a.stdout), json.loads(b.stdout)
+        # ★`lane_source` 는 **일부러 갈려야 하는** 관측 필드다(경로가 아니라 출처 표시).
+        #   경로 동치는 그것을 뺀 나머지로 재고, 출처 표시는 반대로 '갈리는지'를 잰다 —
+        #   이 필드가 두 모드에서 같으면 관측이 거짓말을 하고 있다는 뜻이다.
+        sa, sb = ja.pop("lane_source", None), jb.pop("lane_source", None)
+        need(ja == jb,
+             "롤백 전후 lane-path 경로가 갈린다(%s):\n신=%s\n구=%s" % (tag, ja, jb))
+        need(sa == "javis_lane" and isinstance(sb, str) and sb.startswith("legacy-inline"),
+             "lane_source 관측이 두 모드를 구분하지 못한다(침묵 폴백을 못 본다): %r / %r"
+             % (sa, sb))
+    notes.append("lane-path all 경로 동일·출처 관측 분별(base·dept)")
+
+    # ⓕ 어휘 보존 — exit 11 의 증거 파일명·락 파일명은 이관 후에도 불변이어야 한다
+    need(B.lane_state_path("skip", "").endswith("boot-skip-base.json"),
+         "exit 11 증거 파일명(boot-skip-<lane>.json)이 바뀌었다 — 어휘 보존 위반")
+    need(B.lane_state_path("lock", "").endswith("bootstrap-base.lock"), "락 파일명 변경")
+    need(B.EXIT_SKIPPED_INFLIGHT == 11 and B.EXIT_CLAIM_DENIED == 7
+         and B.EXIT_SESSION_CONTEXT == 10,
+         "이관 어휘(exit 7/10/11)가 바뀌었다 — 소비처가 판정을 오독한다")
+    notes.append("어휘 보존(exit 7/10/11 · skip·lock 파일명)")
+
+    # ⓖ ②ping 상수 개명 — ⑤ 재확인 경로가 **계속** 같은 상한을 소비하는가
+    need(hasattr(B, "DAEMON_PROBE_TIMEOUT_S"), "DAEMON_PROBE_TIMEOUT_S 개명이 착지하지 않았다")
+    need(B.PING_TIMEOUT_S == B.DAEMON_PROBE_TIMEOUT_S, "구 이름 별칭의 값이 갈렸다")
+    need(len(re.findall(r'_run\(\["cys", "ping"\], timeout=DAEMON_PROBE_TIMEOUT_S\)', src)) == 2,
+         "데몬 탐침 상한 소비 지점이 2곳(② 재시도 · ⑤ exit 2 재확인)이 아니다 — 이관 중 "
+         "⑤ 재확인이 무상한 ping 이 되거나 하드코딩으로 갈렸다")
+    notes.append("데몬 탐침 상한 소비 2지점")
+
+    # 계측 타당성(구 코드 대조): 기준 트리에는 javis_lane 이 없다
+    calib = "skip(no-git)"
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"), ref=PRE_U24_REF)
+    if old is not None:
+        need("javis_lane" not in old,
+             "계측 타당성 실패: 기준 트리에 이미 javis_lane 이관이 있다(기준 선택 오류)")
+        need("def lane_state_path(" in old,
+             "계측 타당성 실패: 기준 트리에서 인라인 lane_state_path 소유를 못 찾았다 — "
+             "기준(PRE_U24_REF)이 이관보다 앞선 트리가 맞는지 먼저 확인하라")
+        need("DAEMON_PROBE_TIMEOUT_S" not in old,
+             "계측 타당성 실패: 기준 트리에 이미 개명이 있다")
+        calib = "기준 트리(%s)=인라인 소유·javis_lane 부재·구 상수명 확인" % PRE_U24_REF
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-PACK-TRACK-1", "W6",
+          "팩 파일 전량 git-추적(build.rs 임베드 전제) — '개발트리 초록·설치본 결손' 차단",
+          ["U-24", "WIN-설치본 결손"])
+def h_pack_track_1():
+    """`build.rs` 는 팩을 **`git ls-files cysjavis-pack`(추적 파일 전용)** 으로 임베드한다.
+    새 팩 파일을 만들고 `git add` 를 잊으면 개발 트리에서는 형제 import 가 되고(같은 폴더),
+    **빌드된 바이너리가 설치하는 팩에는 그 파일이 없다** — 그 순간 소비자는 조용히 레거시
+    폴백으로 접히거나 ImportError 로 죽는다. "맥은 멀쩡한데 설치본만 깨진다"의 정확한 기제다.
+
+    ★전제 자체를 먼저 검증한다: build.rs 가 `git ls-files` 소싱과 제외규칙(dot·tests·
+      __pycache__)을 유지하는지 확인하고, 그게 바뀌었으면 **이 검체의 판정 근거가 사라진 것**
+      이므로 초록이 아니라 적색으로 알린다(측정 불능을 통과로 접지 않는다).
+    """
+    if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):
+        raise Skip("레포 체크아웃이 아니다(배포 팩 실행) — git 추적 판정 불가")
+    notes = []
+    # ⓐ 전제: build.rs 의 소싱·제외 규칙
+    br = _read(os.path.join(REPO_DIR, "build.rs"))
+    need('"ls-files", "cysjavis-pack"' in br,
+         "build.rs 가 더 이상 `git ls-files` 로 팩을 소싱하지 않는다 — 이 검체의 전제가 "
+         "무너졌으니 판정 근거를 먼저 재수립하라(초록으로 넘기지 않는다)")
+    need("__pycache__" in br and 'c == "tests"' in br,
+         "build.rs 제외규칙(tests·__pycache__)이 바뀌었다 — 아래 디스크 스캔과 규칙이 갈린다")
+    notes.append("build.rs 전제(ls-files·제외규칙) 확인")
+
+    # ⓑ 술어: **추적되지 않았고 gitignore 도 아닌** 팩 파일 = '`git add` 를 잊은 파일'.
+    #    ★gitignore 를 존중하는 것은 완화가 아니라 build.rs 계약의 정확한 미러다 — build.rs 는
+    #      스스로 "추적 집합을 SOT로 삼아 **gitignore 경계를 그대로 따른다**"고 선언한다.
+    #      의도적으로 무시되는 런타임 산출물(`cysjavis-pack/state/*.jsonl` 등)은 임베드 대상이
+    #      아니며, 그것을 적색으로 잡으면 검체가 상시 적색이 되어 **진짜 누락을 가린다**.
+    #    ★build.rs 가 추가로 버리는 경로(dot·tests·__pycache__)도 같은 규칙으로 뺀다 —
+    #      그쪽은 추적돼 있어도 임베드되지 않으므로 '누락' 축이 아니다.
+    def _embed_excluded(rel_in_pack):
+        return any(c.startswith(".") or c in ("tests", "__pycache__")
+                   for c in rel_in_pack.split("/"))
+
+    def _forgotten(repo):
+        """(repo 루트) → build.rs 가 임베드해야 하는데 추적되지 않은 팩 파일 목록."""
+        rr = _run(["git", "-C", repo, "ls-files", "--others", "--exclude-standard",
+                   "cysjavis-pack"], timeout=60)
+        if rr.returncode != 0:
+            raise Fail("git ls-files --others 실패 — 측정 불능(통과 아님): rc=%d" % rr.returncode)
+        out = []
+        for line in rr.stdout.splitlines():
+            rel = line.strip()
+            if rel.startswith("cysjavis-pack/") and not _embed_excluded(
+                    rel[len("cysjavis-pack/"):]):
+                out.append(rel)
+        return sorted(out)
+
+    # ⓒ 실제 트리 판정
+    tracked = _run(["git", "-C", REPO_DIR, "ls-files", "cysjavis-pack"], timeout=60)
+    need(tracked.returncode == 0 and tracked.stdout.strip(),
+         "git ls-files 실패 — 측정 불능(통과 아님): rc=%d" % tracked.returncode)
+    n_tracked = len([l for l in tracked.stdout.splitlines() if l.strip()])
+    forgotten = _forgotten(REPO_DIR)
+    need(not forgotten,
+         "팩 파일이 git 에 추적되지 않는다 = **빌드된 바이너리의 팩에 존재하지 않는다**\n"
+         "  (개발 트리에서는 형제 import 로 초록 · 설치본에서만 결손 = 이 제품이 반복해서 낸 사고)\n"
+         "  누락: %s\n"
+         "  → `git add %s`  (의도적 비배포라면 cysjavis-pack/.gitignore 에 등재하라)"
+         % (forgotten[:8], " ".join(forgotten[:8])))
+    notes.append("추적 %d건 · 누락 0" % n_tracked)
+
+    # ⓓ **합성 표본으로 탐지력 시험** — 트리가 깨끗해도 탐지기가 살아 있는지 별도로 증명한다.
+    #    격리 임시 git 저장소에 4종(추적·미추적·gitignore·tests 제외)을 두고 **같은 술어**를 돌린다
+    #    (사용자 레포 무접촉). 잡아야 할 1건만 정확히 나오는지 = 과탐·미탐 양방향 시험.
+    if not shutil.which("git"):
+        raise Fail("git 부재 — 합성 표본 검증 불가(측정 불능)")
+    with tempfile.TemporaryDirectory() as tmp:
+        _run(["git", "init", "-q", tmp], timeout=60)
+        _run(["git", "-C", tmp, "config", "user.email", "t@t"], timeout=30)
+        _run(["git", "-C", tmp, "config", "user.name", "t"], timeout=30)
+        _w(os.path.join(tmp, "cysjavis-pack", ".gitignore"), "state/spool.jsonl\n", 0o644)
+        _w(os.path.join(tmp, "cysjavis-pack", "bin", "kept.py"), "# tracked\n", 0o644)
+        _w(os.path.join(tmp, "cysjavis-pack", "bin", "lost.py"), "# forgotten\n", 0o644)
+        _w(os.path.join(tmp, "cysjavis-pack", "state", "spool.jsonl"), "{}\n", 0o644)
+        _w(os.path.join(tmp, "cysjavis-pack", "bin", "tests", "t_x.py"), "# excluded\n", 0o644)
+        _run(["git", "-C", tmp, "add", "cysjavis-pack/.gitignore",
+              "cysjavis-pack/bin/kept.py"], timeout=60)
+        synth = _forgotten(tmp)
+        need(synth == ["cysjavis-pack/bin/lost.py"],
+             "계측 타당성 실패: 합성 표본(추적·미추적·ignore·tests 4종)에서 탐지기가 "
+             "'git add 를 잊은 1건'만 정확히 집어내지 못했다 → %r "
+             "(미탐이면 이 검체의 초록은 무의미하고, 과탐이면 상시 적색으로 진짜 누락을 가린다)"
+             % synth)
+    notes.append("합성 표본 4종(미탐·과탐 양방향) 판별")
+    return " · ".join(notes)
 
 
 @specimen("H-LIFE-2", "W3", "step id enum 유일성·리터럴 0·기록 순서=실행 순서",
@@ -7606,9 +8945,24 @@ def h_killchain_1():
     notes.append("그물 1지점(주입 헬퍼 2종 × 전송 2지점)")
 
     # ⓓ ★생애 창 상한 — 치명위험 ①(작업 중 노드 영구 차단·오탐 폭주) 차단
-    need("fn surface_awakened(sid: u64) -> Option<bool>" in cli, "생애 창 관측 함수가 없다")
-    aw = _slice_between(cli, "fn surface_awakened(sid: u64) -> Option<bool> {", "\n}\n",
-                        "H-KILLCHAIN-1 생애 창")
+    # ── ★핀 이사(U-28 · 2026-08-24 · 러너 헤더 '핀 이사 계약' ①④) ────────────────────────
+    # 【원인 규명 먼저】 함수가 사라진 것이 아니라 **입력이 스냅샷으로 바뀌었다**(P4-4).
+    #   종전 `surface_awakened(sid)` 는 자기가 `surface.list` 왕복을 쳤는데, 가드는 각성 창과
+    #   좌석 **어댑터**를 함께 필요로 한다. 둘을 각자 조회하면 왕복이 둘이고 그 사이에 값이 갈리면
+    #   "창은 열렸는데 어댑터는 다른 좌석의 것" 이라는 **찢어진 관측**이 판정에 실린다.
+    #   그래서 `surface_awakened_in(rows, sid)` 로 나뉘고 호출부가 한 왕복 스냅샷을 나눠 쓴다.
+    #   ★Rust 측 동형 핀은 이미 이사했다(cys.rs 킬체인 검체 ⓒ의 '핀 이사(P4-4)' 주석) —
+    #     러너만 낡아 있었다. 즉 이 적색은 기능 결함이 아니라 **계측기 지연**이다.
+    # 【축은 무변】 "생애 창 관측이 실재하고 `awakened_at` **키 부재**(구 데몬)를 판정 불가로 접는다."
+    # 【★추가 강화】 ⓘ 구 형상(자기 왕복판)이 돌아오면 적색 ⓙ 창·어댑터를 **한 왕복 스냅샷**에서
+    #   함께 읽는지 단언한다 — 찢어진 관측이 이 축의 새 실패 양식이고, 그 방어가 이사의 근거다.
+    need("fn surface_awakened_in(rows: &[Value], sid: u64) -> Option<bool>" in cli,
+         "생애 창 관측 함수가 없다")
+    need("fn surface_awakened(sid: u64) -> Option<bool>" not in cli,
+         "생애 창 관측이 **자기 왕복판**으로 되돌아왔다 — 창과 어댑터를 각자 조회하면 그 사이에 "
+         "값이 갈려 찢어진 관측이 판정에 실린다(P4-4 역행)")
+    aw = _slice_between(cli, "fn surface_awakened_in(rows: &[Value], sid: u64) -> Option<bool> {",
+                        "\n}\n", "H-KILLCHAIN-1 생애 창")
     need('row.get("awakened_at")?' in aw,
          "`awakened_at` **키 부재**(구 데몬)를 '아직 각성 안 함' 으로 접는다 — 살아서 일하는 노드 "
          "전부가 스캔 대상이 되고, 그중 하나가 관문 문면을 출력하는 순간 주입이 영구 거부된다")
@@ -7616,7 +8970,17 @@ def h_killchain_1():
          "창이 닫힌 좌석에서 스캔을 건너뛰는 조기 반환이 없다(오탐·비용 양쪽)")
     need("awakened: Some(false), // 부트 창은 상수다" in cli,
          "부트 경로가 창 여부를 데몬에 묻는다 — 구 데몬에서 가드가 가장 필요한 자리에 꺼진다")
-    notes.append("생애 창 상한(키 부재=판정 불가) · 부트 창 상수")
+    # ★한 왕복 스냅샷 공유(P4-4) — 공통 그물이 `surface.list` 를 **한 번만** 치고 창·어댑터를
+    #   같은 `rows` 에서 읽는다. 두 번 치면 그 사이의 변화가 "다른 좌석의 어댑터로 고른 코퍼스"를
+    #   판정에 싣는다(코퍼스가 갈리면 관문 식별이 갈리고, 그 끝은 다시 킬 스텝이다).
+    gseg = _slice_between(cli, "fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {",
+                          "\n}\n", "H-KILLCHAIN-1 공통 그물")
+    need(gseg.count("fetch_surfaces()") == 1
+         and "surface_awakened_in(&rows, sid)" in gseg
+         and "surface_agent_in(&rows, sid)" in gseg,
+         "공통 그물이 창·어댑터를 **한 왕복 스냅샷**에서 함께 읽지 않는다 — 찢어진 관측(왕복 %d회)"
+         % gseg.count("fetch_surfaces()"))
+    notes.append("생애 창 상한(키 부재=판정 불가) · 부트 창 상수 · 한 왕복 스냅샷 공유")
 
     # ⓔ ★귀결은 close 가 아니라 보류다 — 이 항이 적색이면 치명위험 ④(전 pane 사망)가 성립한다
     hi = cli.find("if let cys::inject_guard::Decision::Hold(hit) =")
@@ -7726,6 +9090,126 @@ def h_killchain_1():
 
 
 # ── 메타(계측기 자기감시) ────────────────────────────────────────────────
+def _u19_seed_call_is_above_hook_return(body):
+    """`setup_isolated_config_dir` 본문에서 **시드 호출이 `install_hooks` 조기 return 위**인가.
+
+    ★탐지기 자신이 시험 대상이다 — 아래 검체가 **합성 표본**(순서를 뒤집은 가짜 본문)을 먹여
+      이 함수가 실제로 FIRE 하는지 확인한다. 트리에 위반이 0이라 초록인 핀은, 탐지기가
+      고장나도 초록이다(2026-07-23 '계측 타당성 게이트' 교훈).
+    반환: (판정, 사유). 판정 True = 도달성 정상.
+    """
+    seed = body.find("seed_first_run_gates(")
+    if seed < 0:
+        return False, "시드 호출이 없다"
+    ret = body.find("if !install_hooks {")
+    if ret < 0:
+        return False, "install_hooks 조기 return 을 못 찾았다"
+    if seed > ret:
+        return False, "시드 호출이 조기 return **아래**에 있다(GUI 업데이트 사용자 미도달)"
+    return True, "시드 호출 offset %d < 조기 return offset %d" % (seed, ret)
+
+
+@specimen("H-SEED-U19", "W6",
+          "첫기동 관문 시드 — 도달성(조기 return 위)·개인프로필 무접촉·롤백 마스터 접기",
+          ["C-4", "K-1"])
+def h_seed_u19():
+    """U-19(2026-08-24): 첫기동 관문 시드는 **훅 병합과 다른 축**이다. 훅 억제 플래그
+    (`--no-install-hook`)로 함께 꺼지면, GUI 인앱 업데이트가 항상 그 플래그로 내려오므로
+    **업데이트 사용자 전원에게 영영 시드되지 않는다**(도달성 결함 — `agents.json` 값 수정이
+    기존 기계에 안 닿는 K-1 과 같은 계열).
+
+    ★그리고 V-h 실측(2026-08-24 · 2.1.241 · macOS)이 뒤집은 전제 하나를 함께 못박는다:
+    `hasCompletedOnboarding:true` 는 테마 관문뿐 아니라 **로그인 관문까지** 지운다. 미인증
+    프로필에 그것을 시드하면 좌석이 프롬프트에 도달해 65초 뒤에도 살아 있지만 `Not logged in`
+    이다 = **허위 READY 영구화**. 그래서 시드는 인증 프리미스를 요구한다.
+
+    다섯 축이다 — ⓐ 별도 단계 실재 ⓑ 도달성(합성 표본으로 탐지기 자체 시험)
+    ⓒ 개인 프로필 무접촉 ⓓ 롤백 마스터 접기 + 기본 꺼짐 ⓔ GUI 결합 실측."""
+    notes = []
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+
+    # ⓐ 훅 병합과 **분리된** 별도 단계인가
+    need("pub fn seed_first_run_gates(" in pk, "시드 단계 함수가 없다")
+    need("pub fn plan_first_run_seed(" in pk, "순수 계획기가 없다(판정이 IO 에 섞였다)")
+    si = pk.find("fn setup_isolated_config_dir(")
+    need(si > 0, "setup_isolated_config_dir 을 못 찾았다")
+    sbody = pk[si:pk.find("\n}\n", si)]
+    need("seed_first_run_gates(" in sbody, "설치 경로가 시드 단계를 부르지 않는다")
+    need("merge_desired_hooks(" in sbody, "훅 병합이 사라졌다(검체 대조축 소실)")
+    notes.append("별도 단계 + 순수 계획기 실재")
+
+    # ⓑ ★도달성 — 그리고 **탐지기 자체를 합성 표본으로 시험한다**
+    ok, why = _u19_seed_call_is_above_hook_return(sbody)
+    need(ok, "도달성 위반: %s" % why)
+    # 합성 표본 ①(순서 역전) — 탐지기가 반드시 FIRE 해야 한다
+    inverted = ("    let x = 1;\n    if !install_hooks {\n        return;\n    }\n"
+                "    seed_first_run_gates(&cfg, W, P);\n")
+    fired, _ = _u19_seed_call_is_above_hook_return(inverted)
+    need(not fired, "★탐지기 파손: 순서를 뒤집은 합성 표본을 통과시켰다")
+    # 합성 표본 ②(시드 호출 삭제) — 역시 FIRE
+    removed = "    if !install_hooks {\n        return;\n    }\n"
+    fired2, _ = _u19_seed_call_is_above_hook_return(removed)
+    need(not fired2, "★탐지기 파손: 시드 호출이 없는 합성 표본을 통과시켰다")
+    # 합성 표본 ③(정상 순서) — FIRE 하면 안 된다(거짓 적색 금지)
+    good = ("    seed_first_run_gates(&cfg, W, P);\n"
+            "    if !install_hooks {\n        return;\n    }\n")
+    fired3, _ = _u19_seed_call_is_above_hook_return(good)
+    need(fired3, "★탐지기 파손: 정상 순서를 적색으로 냈다(거짓 적색)")
+    notes.append("도달성 정상(%s) · 합성 표본 3종 탐지기 시험 통과" % why)
+
+    # ⓒ 개인 프로필 무접촉 — 시드 단계가 개인 프로필 병합기와 섞이지 않았다
+    gi = pk.find("pub fn seed_first_run_gates_at(")
+    need(gi > 0, "시드 IO 부를 못 찾았다")
+    gbody = pk[gi:pk.find("\n}\n", gi)]
+    need("merge_awakening_hooks_into_personal_profiles" not in gbody,
+         "시드가 개인 프로필 병합과 얽혔다 — 격리 계약 위반")
+    need("personal_profile_dirs" not in gbody and "home_dir" not in gbody,
+         "시드 IO 부가 홈 디렉터리를 스스로 찾는다(격리 config dir 밖으로 번질 경로)")
+    need("cfg.join(CLAUDE_CONFIG_FILE)" in gbody,
+         "시드 대상이 격리 config dir 안이라는 것이 코드에서 읽히지 않는다")
+    notes.append("개인 프로필 무접촉(시드부에 병합기·홈 탐색 0)")
+
+    # ⓓ 롤백 — 마스터 접기 + 엄격 비교 + **기본 꺼짐**
+    need('pub const ENV_FIRST_RUN_SEED: &str = "CYS_FIRST_RUN_SEED";' in pk,
+         "롤백 스위치 env 이름 상수가 없다")
+    fi = pk.find("pub fn first_run_seed_enabled()")
+    need(fi > 0, "env 판독 지점이 없다")
+    fbody = pk[fi:pk.find("\n}\n", fi)]
+    need("gate_axes_forced_legacy()" in fbody,
+         "★새 축이 마스터 스위치(CYS_BOOT_GATES=0)에 접히지 않았다 — 사고 순간에 노브 조합 요구")
+    need('env_val == Some("1")' in pk,
+         "느슨한 truthy 를 받는다(오타 하나로 시드가 켜진다)")
+    # env 판독 지점은 하나뿐이다(축별 1지점 규약)
+    need(pk.count('std::env::var(ENV_FIRST_RUN_SEED)') == 1,
+         "ENV_FIRST_RUN_SEED 판독 지점이 %d 곳이다(1지점 규약 위반)"
+         % pk.count('std::env::var(ENV_FIRST_RUN_SEED)'))
+    need("FIRST_RUN_SEED_BACKUP" in pk, "파일 롤백 경로(.bak)가 없다")
+    notes.append("롤백 마스터 접기 + 엄격 비교 + env 1지점 + .bak 경로")
+
+    # ⓔ GUI 결합 실측 — 인앱 업데이트가 여전히 --no-install-hook 인가(도달성 논거의 전제)
+    gui = _repo_file(os.path.join("src-tauri", "src", "main.rs"))
+    need('init_cmd.arg("init-pack").arg("--no-install-hook");' in gui,
+         "GUI 인앱 업데이트의 init-pack 호출 형태가 바뀌었다 — U-19 도달성 논거 재검토 필요")
+    need("U-19 도달성 앵커" in gui, "GUI 쪽 결합 앵커 주석이 사라졌다(다음 사람이 순서를 뒤집는다)")
+    notes.append("GUI 업데이트 경로 --no-install-hook 확인")
+
+    # 계측 타당성 — 구 트리에는 시드 단계 자체가 없다
+    old = _git_show(os.path.join("src", "pack.rs"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need("seed_first_run_gates" not in old,
+             "계측 타당성 실패: 기준 커밋에 이미 시드 단계가 있다(기준 선택 오류)")
+        oi = old.find("fn setup_isolated_config_dir(")
+        if oi > 0:
+            obody = old[oi:old.find("\n}\n", oi)]
+            ofired, _ = _u19_seed_call_is_above_hook_return(obody)
+            need(not ofired, "계측 타당성 실패: 구 본문을 탐지기가 통과시켰다")
+            calib = "구 트리=시드 단계 부재 · 탐지기 FIRE 확인"
+        else:
+            calib = "구 트리=시드 단계 부재"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
 @specimen("H-META-PIN", "W6",
           "핀 이사 계약 집행 — SCAN_TARGETS 실재·소비 배선·우회 직접 호출 동결",
           ["U-2"])
@@ -7933,6 +9417,1248 @@ def h_meta_read():
     return " · ".join(notes)
 
 
+
+@specimen("H-META-OFF", "W6",
+          "계측기 자기감시 — '사람이 끈 미측정'≠'적용 불가' · 종료코드 3값 · `--json` stdout 순수",
+          ["U-27"])
+def h_meta_off():
+    """U-27(2026-08-24 · 이종 리뷰어): 계측기 자신이 **측정 불능을 통과로 접었다.**
+    `CYS_U26_OFF=1 … --only H-CI-TAG-1,H-EVID-1,H-FAKE-1,H-FAKE-2,H-FAKE-3` 은 검체 5건을
+    전부 지우고도 `GREEN — 발효 0 PASS / 0 FAIL / 5 SKIP` · **exit 0** 을 냈다. Skip 문구는
+    스스로 "이것은 통과가 아니라 미측정" 이라 말하는데 요약과 종료코드는 통과라고 말한 것이다 —
+    이 저장소가 반복해서 낸 사고의 형태를 계측기가 재현한 자리다.
+    이 검체가 그 수리의 **기계 집행자**이며 다섯 축으로 본다:
+      ⓐ 등재소 형태(두 종류 · 중복 0 · `off_switch()` 경유 등재).
+      ⓑ 모듈 레벨 env 독취 **전수** == 등재 집합 — 등재 없는 새 스위치가 조용히 생기면 적색.
+      ⓒ 판정 배선(소스 핀): `Disabled` 를 `Skip` **보다 먼저** 잡는가 · GREEN 박탈 · exit 2 ·
+         `--json` fd 분리 가드 실재.
+      ⓓ **행동 실증** — 러너를 실제로 재실행해 스위치 켠 런이 `UNMEASURED`·exit 2 인지,
+         끈 런이 `GREEN`·exit 0 인지 잰다(소스 핀만으로는 "쓰여 있다" 밖에 증명하지 못한다).
+      ⓔ `--json` stdout 순수 — 실제 오염원 검체를 태워 stdout 이 JSON 한 덩어리인지,
+         오염분이 stderr 로 갔는지 잰다.
+    ★이 검체는 어떤 판정도 완화하지 않는다. 기존 need 를 대체하지 않고 새 축만 추가한다."""
+    import inspect
+    notes = []
+
+    # ⓐ 등재소 형태
+    need(MEASUREMENT_OFF_SWITCHES,
+         "미측정 축 등재소가 비었다 — `off_switch()` 등재가 사라지면 스위치를 켜도 러너가 "
+         "그 사실을 모른다(GREEN 박탈·exit 2 가 통째로 무력화)")
+    need(MEASUREMENT_PIN_OVERRIDES, "핀 override 등재소가 비었다")
+    names = [e for e, _s in MEASUREMENT_OFF_SWITCHES] + [e for e, _s in MEASUREMENT_PIN_OVERRIDES]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    need(not dup, "등재소 중복 항목: %r — 한 스위치가 두 축에 있으면 판정이 갈린다" % dup)
+    runner = _read(os.path.abspath(__file__))
+    for env, _s in MEASUREMENT_OFF_SWITCHES:
+        need('off_switch("%s"' % env in runner,
+             "%s 가 `off_switch()` 를 경유하지 않고 등재됐다 — 등재 경로가 둘이면 한쪽이 낡는다"
+             % env)
+    notes.append("등재 off %d · pin %d" % (len(MEASUREMENT_OFF_SWITCHES),
+                                           len(MEASUREMENT_PIN_OVERRIDES)))
+
+    # ⓑ 모듈 레벨 env 독취 전수 == 등재 집합
+    # ★접두 스캔이 아니라 **모듈 레벨 대입 전수**로 잰다. `CYS_HEALTH_` 접두로 잡으면 제품 env
+    #   `CYS_HEALTH_NARRATION_CJK_MIN`(cysd 헬스 룰)까지 오검출한다 — 그건 러너의 스위치가 아니다.
+    harvested = set(re.findall(r'^[A-Za-z_][A-Za-z_0-9]*\s*=\s*[^\n]*os\.environ\.get\(\s*"([^"]+)"',
+                               runner, re.M))
+    need(harvested, "모듈 레벨 env 독취를 하나도 수확하지 못했다(수확 정규식 파손 — fail-closed)")
+    declared = {e for e, _s in MEASUREMENT_PIN_OVERRIDES}
+    unregistered = sorted(harvested - declared)
+    need(not unregistered,
+         "등재되지 않은 모듈 레벨 env 스위치 %r — 새 스위치는 MEASUREMENT_PIN_OVERRIDES(또는 "
+         "off_switch)에 등재하라. 등재 없는 스위치는 사람이 켜도 러너가 초록을 그대로 준다"
+         % unregistered)
+    stale = sorted(declared - harvested)
+    need(not stale,
+         "등재는 남았는데 소스에서 사라진 스위치 %r — 등재소가 낡으면 그 다음 사람이 등재소를 "
+         "믿지 않게 된다(양방향 동결)" % stale)
+    notes.append("모듈 env 수확 %d == 등재 %d" % (len(harvested), len(declared)))
+
+    # ⓒ 판정 배선(소스 핀)
+    need(issubclass(Disabled, Skip),
+         "Disabled 가 Skip 의 하위형이 아니다 — 검체 내부의 기존 `except Skip` 관용구가 깨진다")
+    msrc = inspect.getsource(main)
+    di, si = msrc.find("except Disabled as e:"), msrc.find("except Skip as e:")
+    need(di > 0 and si > 0 and di < si,
+         "main 이 Disabled 를 Skip 보다 먼저 잡지 않는다 — 순서가 뒤집히면 '사람이 끈 미측정' 이 "
+         "다시 '적용 불가' 로 접혀 GREEN 이 된다(U-27 수리의 무력화)")
+    need('elif disabled or engaged:' in msrc and '"UNMEASURED"' in msrc,
+         "미측정 런의 GREEN 박탈 분기가 없다")
+    need('return 2 if verdict == "UNMEASURED" else 0' in msrc,
+         "미측정 종료코드(2)가 없다 — 기계 소비자는 종료코드만 본다(라벨만 바꾸면 무력화)")
+    need("os.dup(1)" in msrc and "os.dup2(2, 1)" in msrc and "os.dup2(_out_fd, 1)" in msrc,
+         "`--json` fd 분리 가드가 없다 — 자식 프로세스는 fd 를 상속하므로 sys.stdout 치환으로는 "
+         "stdout 오염을 못 막는다(P0-3 회귀)")
+    notes.append("배선 핀: Disabled 우선·GREEN 박탈·exit 2·fd 분리")
+
+    # ⓓ 행동 실증 — 러너를 실제로 재실행한다.
+    me = os.path.abspath(__file__)
+    allsw = tuple(e for e, _s in MEASUREMENT_OFF_SWITCHES) + tuple(
+        e for e, _s in MEASUREMENT_PIN_OVERRIDES)
+    clean = _base_env(drop=allsw)      # ★부모가 이미 스위치를 켠 상태여도 대조군은 순수해야 한다
+
+    def _self(env, *argv):
+        r = _run([PY, me, "--json"] + list(argv), env=env, timeout=600)
+        try:
+            return r, json.loads(r.stdout)          # ★우회 관용구 없이 그대로 파싱한다
+        except ValueError:
+            raise Fail("`--json` stdout 이 순수 JSON 이 아니다(P0-3 회귀) — 앞 200자=%r · "
+                       "stderr 끝 200자=%r" % (r.stdout[:200], r.stderr[-200:]))
+
+    probe = "H-CI-TAG-1,H-EVID-1"
+    rc, dc = _self(clean, "--only", probe)
+    need(rc.returncode == 0 and dc["summary"]["verdict"] == "GREEN",
+         "대조군(스위치 전부 꺼짐) 이 GREEN·exit 0 이 아니다: rc=%d verdict=%s"
+         % (rc.returncode, dc["summary"]["verdict"]))
+    need(dc["summary"]["disabled"] == 0, "대조군에 disabled 가 있다: %r" % dc["summary"])
+
+    ro, do = _self(dict(clean, **{U26_OFF_ENV: "1"}), "--only", probe)
+    so = do["summary"]
+    need(so["verdict"] == "UNMEASURED",
+         "스위치를 켰는데 판정이 %s 다 — 리뷰어 재현(GREEN) 의 회귀" % so["verdict"])
+    need(ro.returncode == 2,
+         "스위치를 켰는데 종료코드가 %d 다 — 기계 소비자에게는 여전히 '통과' 로 들린다(exit 2 여야 한다)"
+         % ro.returncode)
+    need(so["disabled"] == 2 and so["pass"] == 0,
+         "미측정 축 계수 오류: %r" % {k: so[k] for k in ("pass", "fail", "skip", "disabled")})
+    need(any(x["env"] == U26_OFF_ENV and x["kind"] == "off" for x in so["off_switches_engaged"]),
+         "요약이 켜진 스위치를 이름으로 밝히지 않는다: %r" % so["off_switches_engaged"])
+
+    pin_env, _pin_scope = MEASUREMENT_PIN_OVERRIDES[0]
+    rp, dp = _self(dict(clean, **{pin_env: "0000000-does-not-resolve"}), "--only", "H-CI-TAG-1")
+    need(dp["summary"]["verdict"] == "UNMEASURED" and rp.returncode == 2,
+         "핀 override(%s)를 켰는데 %s·exit %d — 핀을 갈아끼운 런의 초록은 '핀된 계약을 잰 초록' 이 "
+         "아니다(조용히 PASS 로 접히므로 끈 것보다 엄하게 다룬다)"
+         % (pin_env, dp["summary"]["verdict"], rp.returncode))
+    notes.append("행동 실증: off→UNMEASURED/exit2 · pin→UNMEASURED/exit2 · 대조군→GREEN/exit0")
+
+    # ⓔ `--json` stdout 순수 — **실제 오염원**을 태워 잰다.
+    #   H-W5-N1 은 `javis_report_gate` 를 인프로세스로 돌려 `verdict=… delivered=… reasons=…`
+    #   요약 줄을 뱉는다(실측: 전량 실행 시 JSON 앞에 12,416자가 붙어 `json.loads` 가 죽었다).
+    rj, dj = _self(clean, "--only", "H-W5-N1")
+    need(rj.stdout.lstrip().startswith("{") and rj.stdout.rstrip().endswith("}"),
+         "stdout 이 JSON 한 덩어리가 아니다: 앞 120자=%r" % rj.stdout[:120])
+    st = (dj["specimens"] or [{}])[0].get("status")
+    if st == "pass" and "verdict=" in rj.stderr:
+        notes.append("stdout 순수(오염 %d건 stderr 전량 격리 · 우회 관용구 불요)"
+                     % rj.stderr.count("verdict="))
+    else:
+        # ★계측 타당성: 오염이 실제로 일어나지 않았다면 이 축은 공허하다 — 통과로 접지 않고
+        #   그 사실을 그대로 적는다(오염원 검체가 바뀌면 다른 오염원으로 교체하라).
+        notes.append("⚠오염원 검체 H-W5-N1 status=%s · stderr 오염 %d건 — stdout 순수 축은 "
+                     "이번 실행에서 공허했다(오염원 교체 검토)" % (st, rj.stderr.count("verdict=")))
+    return " · ".join(notes)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★U-22 — `cys hook` + `hook.decide` (근본원인 R2: 판정의 위치 이동)
+#
+# 무엇을 지키는가: 부트 판정이 30초짜리 단명 UserPromptSubmit 훅 안에서 서브프로세스를
+# 줄줄이 띄우며 일어나고 모든 불확실성이 침묵(rc0+빈출력)으로 접히던 구조를, 데몬 인메모리
+# 1왕복으로 옮긴 배선. 이 축이 무너지면 되돌아가는 곳은 "구조 개선 이전"이 아니라 **더 나쁜
+# 자리**다 — 위임은 있는데 폴백이 없거나(마스터 부트 전면 사망), 위임이 새 차단자가 되거나
+# (비-master 오판으로 팀 미기동), 데몬 핫패스에 스폰이 들어가(프롬프트 제출 먹통) 셋 다
+# 이 제품이 실제로 낸 사고 계열이다.
+# ═══════════════════════════════════════════════════════════════════════════
+_U22_RS_CLI = "src/bin/cys.rs"
+_U22_RS_DAEMON = "src/bin/cysd/handlers.rs"
+_U22_SH = "cysjavis-pack/hooks/role-bootstrap.sh"
+# exit 계약 정본(3중 등재의 기준값) — cys.rs 상수 · 셸 case · 셸 헤더 표가 전부 이 값이어야 한다.
+_U22_EXITS = {"PROCEED": 0, "DAEMON_ERR": 1, "SUPPRESS": 3, "UNDECIDED": 4, "LEGACY": 5}
+_U22_CONTRACT_V = 1
+_U22_EVENT = "user-prompt-submit"
+# 판정 토큰 정본(접두 + verdict). cys.rs `HOOK_VERDICT_PREFIX` 와 셸 case 가 이 값이어야 한다.
+# ★5종을 **전부** 등재한다 — 종전 검체는 proceed·suppress 둘만 봤고, 그래서 나머지 3종의
+#   철자가 갈려도(= 셸이 그 토큰을 못 읽어 조용히 legacy 로 접혀도) 초록이었다.
+_U22_TOKEN_PREFIX = "[cys-hook] hook-decide: "
+_U22_TOKENS = ("proceed", "suppress", "undecided", "legacy", "error")
+
+
+def _u22_fn_body(src, sig):
+    """`fn ...(` 부터 최상위 닫힘까지(선례 `_u20_violations._body` 와 같은 규약)."""
+    i = src.find(sig)
+    if i < 0:
+        return None
+    j = src.find("\n}\n", i)
+    return src[i:j] if j > i else None
+
+
+def _u22_arm_body(src, arm):
+    """dispatch match arm 본문 — 다음 arm(8칸 들여쓴 따옴표) 직전까지."""
+    i = src.find(arm)
+    if i < 0:
+        return None
+    j = src.find('\n        "', i + len(arm))
+    return src[i:j] if j > i else src[i:]
+
+
+def _u22_violations(cli, daemon, sh):
+    """U-22 배선 위반 목록(빈 목록 = 배선 정상).
+
+    ★세 소스를 **인자로** 받는 이유: 같은 탐지기를 기준 커밋 트리에도 그대로 먹여
+      "수리 전에는 적색"을 기계로 증명하기 위해서다(계측 타당성 게이트 ①).
+    """
+    v = []
+
+    # ── CLI(cys.rs) ────────────────────────────────────────────────────────
+    if "Hook {" not in cli or "enum HookEvent" not in cli:
+        v.append("CLI: `cys hook` 서브커맨드(Command::Hook / enum HookEvent)가 없다")
+    if "Command::Hook { event } => return run_hook(event)" not in cli:
+        v.append("CLI: dispatch 에 Command::Hook 배선이 없다(서브커맨드 사문)")
+    for name, val in sorted(_U22_EXITS.items()):
+        if "const HOOK_EXIT_%s: i32 = %d;" % (name, val) not in cli:
+            v.append("CLI: exit 상수 HOOK_EXIT_%s=%d 정본 부재/불일치" % (name, val))
+    if "const HOOK_DECIDE_CONTRACT_V: u64 = %d;" % _U22_CONTRACT_V not in cli:
+        v.append("CLI: 페이로드 계약 버전 상수(HOOK_DECIDE_CONTRACT_V=%d) 부재" % _U22_CONTRACT_V)
+    if 'const HOOK_EVENT_USER_PROMPT_SUBMIT: &str = "%s";' % _U22_EVENT not in cli:
+        v.append("CLI: 훅 이벤트 와이어 상수 부재/철자 불일치")
+    # 전용 데드라인 — 하드코딩 금지(예산 파생). 값을 손으로 적으면 예산이 바뀌어도 안 따라온다.
+    if "const HOOK_DECIDE_DEADLINE_MS: u64 = BUDGET_TICK_MS;" not in cli:
+        v.append("CLI: 전용 데드라인이 BUDGET 파생 상수가 아니다(하드코딩 의심)")
+
+    rh = _u22_fn_body(cli, "fn run_hook(event: HookEvent)")
+    if rh is None:
+        v.append("CLI: run_hook 정의를 찾지 못했다(계측 불능)")
+    elif "set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON)" not in rh:
+        v.append("CLI: run_hook 이 CYS_NO_AUTOSTART 를 자기 강제하지 않는다 — 단명 훅이 데몬을 낳는다(R2)")
+
+    ru = _u22_fn_body(cli, "fn run_hook_user_prompt_submit()")
+    if ru is None:
+        v.append("CLI: run_hook_user_prompt_submit 정의를 찾지 못했다(계측 불능)")
+    else:
+        if "gate_axes_forced_legacy()" not in ru:
+            v.append("CLI: 롤백 마스터 스위치(CYS_BOOT_GATES)를 읽지 않는다 — 새 축이 마스터에 안 접혔다")
+        if "request_on_timeout(" not in ru:
+            v.append("CLI: 전용 데드라인 왕복(request_on_timeout)을 쓰지 않는다")
+        if re.search(r"[^_.\w]request\(", ru):
+            v.append("CLI: autostart 경로 request() 를 쓴다 — 단명 훅에서 데몬 기동 금지")
+        if "HOOK_DECIDE_DEADLINE_MS" not in ru:
+            v.append("CLI: 전용 데드라인 상수를 소비하지 않는다")
+        # ★`eprintln!` 은 stderr 다 — 접두 e 를 배제하지 않으면 부분문자열로 오탐한다(계측 자기점검).
+        if re.search(r"(?<![A-Za-z_])println!", ru):
+            v.append("CLI: stdout 에 쓴다 — 훅의 stdout 계약(hookSpecificOutput JSON) 오염")
+        if '"surface_id"' in ru:
+            v.append("CLI: 요청 페이로드에 surface_id 를 싣는다 — 자기신고 금지(인가 계약 위반)")
+        # fail-open 불변식: suppress 를 내는 자리가 **정확히 하나**여야 한다.
+        if ru.count("HOOK_EXIT_SUPPRESS") != 1:
+            v.append("CLI: suppress 반환 지점이 1곳이 아니다(%d곳) — 새 차단자 신설 위험"
+                     % ru.count("HOOK_EXIT_SUPPRESS"))
+        # 판정은 전부 단일 출구(hook_verdict)를 거쳐야 한다 — 토큰 누락·자유문구 혼입 방지.
+        if "return HOOK_EXIT_" in ru or re.search(r"^\s+HOOK_EXIT_\w+\s*$", ru, re.M):
+            v.append("CLI: 토큰 단일 출구(hook_verdict)를 우회해 exit 를 직접 반환하는 분기가 있다")
+    hv = _u22_fn_body(cli, "fn hook_verdict(")
+    if hv is None:
+        v.append("CLI: 판정 토큰 단일 출구(hook_verdict)가 없다")
+    else:
+        # ── ★핀 이사(U-28 · 2026-08-24 · 러너 헤더 '핀 이사 계약' ①④) ────────────────
+        # 【원인 규명 먼저】 이 핀이 적색이 된 것은 계약이 무너져서가 아니라 **토큰 줄 조립이
+        #   이사**했기 때문이다: `hook_verdict` 본문의 `eprintln!("{HOOK_VERDICT_PREFIX}{verdict}")`
+        #   가 순수 절반 `hook_verdict_lines(verdict, detail)` 로 나갔다(검체가 stderr 를 가로채지
+        #   않고 **프로덕션 경로 그대로** 같은 문자열을 얻게 하려는 분리 · 목 금지).
+        # 【축은 무변】 "토큰 줄 = 접두 + verdict **단독**(자유 문구 혼입 0) · 출구는 하나."
+        # 【형상만 이동】 조립은 `hook_verdict_lines` 에서, 인쇄는 `hook_verdict` 에서 본다 —
+        #   두 축을 함께 요구하므로 판정은 좁아졌지 넓어지지 않았다.
+        lines = _u22_fn_body(cli, "fn hook_verdict_lines(")
+        if lines is None:
+            v.append("CLI: 토큰 줄 조립의 순수 절반(hook_verdict_lines)이 없다")
+        elif 'format!("{HOOK_VERDICT_PREFIX}{verdict}")' not in lines:
+            v.append("CLI: 토큰 줄이 접두+verdict **단독**이 아니다 — 자유 문구 혼입은 위조 표면")
+        if ("let (token_line, detail_line) = hook_verdict_lines(verdict, detail);" not in hv
+                or 'eprintln!("{token_line}");' not in hv):
+            v.append("CLI: 단일 출구가 조립된 토큰 줄을 **그대로 한 줄로** 내지 않는다")
+        if "println!" in hv.replace("eprintln!", ""):
+            v.append("CLI: 판정 출구가 stdout 에 쓴다 — 훅 stdout 계약 오염")
+    # ★추가 강화(다중 방어 ⓐ층 · 위조 차단) — 상세 줄은 토큰 접두를 실을 수 없다.
+    #   이 층이 없으면 데몬이 준 role/reason 문자열이 상세 줄에 그대로 인쇄되고, 비-master 좌석이
+    #   role 을 토큰 문자열로 claim 하는 것만으로 판정이 뒤집힌다(A3=B7 재발 · 이종 리뷰어 격리
+    #   재현). 셸 측 정확 일치(ⓑ)와 rc 교차(ⓒ)는 아래에서 따로 본다 — 한 층이 넓어져도 나머지가 선다.
+    if "fn sanitize_hook_detail(" not in cli or "HOOK_DETAIL_REDACTED" not in cli:
+        v.append("CLI: 상세 줄 무해화(sanitize_hook_detail)가 없다 — 데몬이 준 role/reason 이 "
+                 "판정 토큰을 위조할 수 있다")
+    if "sanitize_hook_detail(detail)" not in cli:
+        v.append("CLI: 상세 줄이 무해화를 경유하지 않는다 — 단일 출구 밖으로 원문이 샌다")
+    if "flat.replace(HOOK_VERDICT_PREFIX, HOOK_DETAIL_REDACTED)" not in cli:
+        v.append("CLI: 무해화가 **토큰 접두**를 치환하지 않는다 — 제어문자만 접으면 위조는 그대로다")
+    if 'const HOOK_VERDICT_PREFIX: &str = "%s";' % _U22_TOKEN_PREFIX not in cli:
+        v.append("CLI: 판정 토큰 접두 상수 부재/불일치(셸 case 문과 갈림)")
+
+    # ── 데몬(handlers.rs) ──────────────────────────────────────────────────
+    if 'const HOOK_DECIDE_CONTRACT_V: u64 = %d;' % _U22_CONTRACT_V not in daemon:
+        v.append("데몬: 페이로드 계약 버전 상수 부재/불일치")
+    if 'const HOOK_EVENT_USER_PROMPT_SUBMIT: &str = "%s";' % _U22_EVENT not in daemon:
+        v.append("데몬: 훅 이벤트 와이어 상수 부재/철자 불일치")
+    arm = _u22_arm_body(daemon, '"hook.decide" => {')
+    if arm is None:
+        v.append("데몬: hook.decide arm 이 없다")
+    else:
+        if 'params.get("surface_id").is_some()' not in arm or "invalid_params" not in arm:
+            v.append("데몬: surface_id 자기신고를 거절하지 않는다(인가 계약 — 위조 가능 필드)")
+        if "resolve_caller_surface(daemon" not in arm:
+            v.append("데몬: 좌석을 caller_pid 조상 체인으로 도출하지 않는다")
+        if '"contract_version": HOOK_DECIDE_CONTRACT_V' not in arm:
+            v.append("데몬: 응답에 contract_version 페이로드 필드가 없다")
+        if "PROTO_PV" in arm:
+            v.append("데몬: hook.decide 가 wire::PROTO_PV 를 만진다 — 전송 프로토콜 무접촉 위반")
+        # ★핫패스 금지 3종 — 훅은 사람의 프롬프트 앞에 서 있다.
+        for tok, why in (("Command::new", "프로세스 스폰"), (".spawn(", "프로세스 스폰"),
+                         ("auth status", "외부 인증 조회"), ("sync_all", "fsync"),
+                         ("std::fs::write", "디스크 쓰기"), ("thread::sleep", "블로킹 대기")):
+            if tok in arm:
+                v.append("데몬: hook.decide 핫패스에 %s(%s) 가 있다 — 프롬프트 제출 먹통 계열" % (tok, why))
+        # 판정은 **순수 코어**가 소유해야 한다 — arm 안에 인라인하면 진리표를 시험할 수 없고,
+        # 시험되지 않는 allowlist 는 반드시 낡는다(구 denylist 가 그렇게 새어 나갔다).
+        if "hook_decide_verdict(" not in arm:
+            v.append("데몬: arm 이 순수 코어(hook_decide_verdict)를 경유하지 않는다(판정 인라인)")
+    core = _u22_fn_body(daemon, "fn hook_decide_verdict(")
+    if core is None:
+        v.append("데몬: 판정 순수 코어(hook_decide_verdict)가 없다")
+    else:
+        # 판정 규칙은 종전 A3 allowlist 그대로여야 한다(완화도 강화도 금지).
+        for tok, why in (('Err(why) => ("undecided"', "판정 불가는 차단이 아니다"),
+                         ('Ok("") => ("proceed"', "미claim 좌석 통과"),
+                         ('Ok("master") => ("proceed"', "master 좌석 통과"),
+                         ('Ok(_) => ("suppress"', "그 밖 전부 차단(미지 role 포함)")):
+            if tok not in core:
+                v.append("데몬: A3 allowlist 판정 축 누락 — %s" % why)
+    if "fn hook_decide_verdict_truth_table()" not in daemon:
+        v.append("데몬: 판정 진리표 회귀 핀(hook_decide_verdict_truth_table)이 없다")
+
+    # ── 훅(role-bootstrap.sh) ──────────────────────────────────────────────
+    # ★주석 언급이 아니라 **실제 호출 라인**만 본다(헤더 문서가 배선을 대신하지 않는다).
+    inv = [ln for ln in sh.splitlines()
+           if "cys hook user-prompt-submit" in ln and not ln.lstrip().startswith("#")]
+    if not inv:
+        v.append("훅: `cys hook user-prompt-submit` 위임 호출이 없다(주석 언급만)")
+    else:
+        if not any("</dev/null" in ln for ln in inv):
+            v.append("훅: 위임 호출에 `</dev/null` 이 없다 — 자식이 hook stdin 을 삼키면 무음 실패")
+        if not any("2>&1 >/dev/null" in ln for ln in inv):
+            v.append("훅: 위임 호출이 stdout 을 버리지 않는다 — 훅 stdout 계약 오염 표면")
+    if "_cys_hook_legacy_unavailable()" not in sh:
+        v.append("훅: 구 경로 판정기(_cys_hook_legacy_unavailable)가 없다")
+    # ★판정의 1차 근거는 stderr 토큰이어야 한다 — rc 로 통과를 읽으면 **exit 0**(셸에서 가장
+    #   흔한 사고값)이 곧 게이트 통과가 되어, 아무 일도 안 하고 성공한 stub `cys` 하나로 role
+    #   게이트가 증발한다(2026-08-24 실측: worker 좌석 마스터 부트 오발화 = A3=B7 재발).
+    # ── ★핀 이사(U-28 · 2026-08-24 · 러너 헤더 '핀 이사 계약' ①②④) ──────────────────────
+    # 【원인 규명 먼저 — 검체가 요구하던 형상 자체가 결함이었다】 종전 핀은 셸이 stderr **전문**에
+    #   substring glob `*"[cys-hook] hook-decide: proceed"*)` 를 돌 것을 요구했다. 그런데 `cys hook`
+    #   의 상세 줄에는 데몬이 준 role 문자열이 인쇄되고 claim 경로에 role 문자열 검증이 없다 —
+    #   비-master 좌석이 role 을 `[cys-hook] hook-decide: proceed` 로 claim 하면 `cys hook` 이
+    #   올바르게 suppress(rc 3)를 내는데도 **상세 줄이 판정을 뒤집는다**(먼저 매칭되므로).
+    #   귀결은 A3=B7 그 자체다(이종 리뷰어 격리 재현 · 수리 = 결함 1).
+    # 【축은 하나도 완화하지 않는다】 축 = "셸은 판정을 **rc 가 아니라 stderr 판정 토큰**으로 읽는다."
+    #   그 축의 근거(stub `cys` 의 exit 0 이 곧 통과가 되는 사고)는 그대로이고, 아래 ⓔ 가 rc 기반
+    #   회귀를 계속 막는다. 바뀐 것은 **토큰을 읽는 형상**뿐이다.
+    # 【새 형상 — 전부 종전보다 좁다】 ⓐ 줄 단위 **정확 일치** 5종 전수(정확 일치는 substring 의
+    #   진부분집합이고, 종전이 보던 2종에서 5종으로 넓혔다) ⓑ 줄 단위 순회 + CR 제거 ⓒ 토큰 줄
+    #   **개수 == 1**(복수 = 위조 의심 → 폴백) ⓓ rc **거부권** 교차(proceed↔0 · suppress↔3)
+    #   ⓔ rc=0 통과 분기 부재.
+    # 【★추가 강화 ⓕ】 위조 통로(substring glob)가 **다시 들어오면 적색**이다. 그 형상이 정확히
+    #   이번에 수리한 벡터이므로, 부재를 단언하는 것이 이사의 자연스러운 귀결이다(완화 아님 —
+    #   판정 조건이 하나 늘었다).
+    for _tk in _U22_TOKENS:
+        if not re.search(r'^\s*"%s%s"[|)]' % (re.escape(_U22_TOKEN_PREFIX), _tk), sh, re.M):
+            v.append("훅: 판정 토큰 `%s` 를 **줄 단위 정확 일치**로 읽지 않는다 — 판독이 넓으면 "
+                     "상세 줄(데몬이 준 role)이 판정을 뒤집는다(A3=B7 재발)" % _tk)
+        if ('*"%s%s"*)' % (_U22_TOKEN_PREFIX, _tk)) in sh:
+            v.append("훅: ★위조 통로 재유입 — 토큰 `%s` 를 stderr 전문 substring glob 으로 읽는다"
+                     % _tk)
+    if "while IFS= read -r CYS_HOOK_LINE" not in sh:
+        v.append("훅: stderr 를 **줄 단위**로 훑지 않는다 — 전문 매칭은 그 자체가 위조 표면이다")
+    if 'CYS_HOOK_LINE="${CYS_HOOK_LINE%"$CYS_CR"}"' not in sh:
+        v.append("훅: CR 제거가 없다 — Windows 파이프에서 정확 일치가 전건 실패해 위임이 통째로 죽는다")
+    if "CYS_HOOK_TOKEN_N=$((CYS_HOOK_TOKEN_N + 1))" not in sh:
+        v.append("훅: 판정 토큰 줄을 **세지** 않는다 — 복수 토큰(위조 시도·형상 스큐)을 구분 못 한다")
+    if '[ "$CYS_HOOK_TOKEN_N" -ne 1 ]' not in sh:
+        v.append("훅: 토큰 줄 **개수 1** 판정이 없다 — 첫 토큰만 보면 상세 줄 주입이 그대로 통한다")
+    if '[ "$CYS_HOOK_RC" = "0" ]' not in sh or '[ "$CYS_HOOK_RC" = "3" ]' not in sh:
+        v.append("훅: rc 교차(proceed↔0 · suppress↔3)가 없다 — rc 거부권 층 소실")
+    if re.search(r'^\s*0\)\s*CYS_HOOK_GATE="proceed"', sh, re.M):
+        v.append("훅: rc=0 을 통과로 읽는 분기가 남아 있다 — stub cys(exit 0)가 게이트를 증발시킨다")
+    if '*) CYS_HOOK_GATE="legacy"' not in sh:
+        v.append("훅: 토큰 부재·미지 토큰을 레거시 폴백으로 접지 않는다 — 위임 실패가 곧 차단이 된다")
+    # ★폴백 보존: 종전 게이트가 통째로 남아 있어야 한다(cys 부재·구 데몬 레인에서 유일한 판정).
+    if "cys surface-role" not in sh or "무발화(fail-closed)" not in sh:
+        v.append("훅: 종전 role 게이트 폴백이 사라졌다 — cys 부재 레인에서 판정 자체가 소실")
+    if "CYS_BOOT_GATES=0" not in sh:
+        v.append("훅: 롤백 스위치(CYS_BOOT_GATES=0) 문서화가 없다")
+    return v
+
+
+@specimen("H-HOOK-DECIDE-1", "W6",
+          "U-22 `cys hook`+`hook.decide` 배선 — fail-open·전용 데드라인·NO_AUTOSTART 자기강제 · "
+          "데몬 핫패스 금지 3종 · 종전 게이트 폴백 보존",
+          ["R2"])
+def h_hook_decide_1():
+    cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
+    daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
+    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    if not cli or not daemon:
+        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+    need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
+    v = _u22_violations(cli, daemon, sh)
+    need(not v, "U-22 배선 위반 %d건: %s" % (len(v), " / ".join(v)))
+    # ★계측 타당성(구 트리 대조) — 같은 탐지기를 기준 커밋에 먹여 **적색이 나오는지** 확인한다.
+    #   여기서 초록이 나오면 탐지기가 고장난 것이다(트리에 위반이 0이라 초록인 것과 구분).
+    ocli = _git_show(_U22_RS_CLI)
+    odae = _git_show(_U22_RS_DAEMON)
+    osh = _git_show(_U22_SH)
+    if ocli and odae and osh:
+        ov = _u22_violations(ocli, odae, osh)
+        need(ov, "계측 무효: 기준 커밋(%s · U-22 이전)에서 탐지기가 위반을 하나도 못 찾았다"
+             % CALIBRATION_REF)
+        calib = "계측대조 %s 에서 %d건 FIRE" % (CALIBRATION_REF, len(ov))
+    else:
+        calib = "계측대조 생략(레포 아님)"
+    # ★계측 타당성 ② 합성 변조본 — 트리에 위반이 0 이라 초록인 것과 **탐지기 고장**을 가른다.
+    #   ★핀 이사(U-28)의 판별력이 여기서 영속 증명된다: 형상만 바꾸고 판별력이 사라지면
+    #     그것은 이사가 아니라 **삭제**다. 그래서 ⓐ 낡은(취약한) 형상으로의 되돌림과
+    #     ⓑ 축 자체의 파괴를 **둘 다** 적발하는지 매 실행마다 시험한다.
+    old_glob = ('\ncase "$CYS_HOOK_ERR" in\n'
+                '  *"[cys-hook] hook-decide: proceed"*) CYS_HOOK_GATE="proceed" ;;\n'
+                '  *"[cys-hook] hook-decide: suppress"*) CYS_HOOK_GATE="suppress" ;;\n'
+                'esac\n')
+    mutants = [
+        # ⓐ 낡은 형상 복귀 — 위조 통로(stderr 전문 substring glob)가 다시 들어온다.
+        ("구 형상 복귀(전문 substring glob)", cli, daemon, sh + old_glob),
+        # ⓑ 축 파괴 — 줄 단위 정확 일치 case 를 없앤다.
+        ("정확 일치 case 소실", cli, daemon,
+         sh.replace('    "[cys-hook] hook-decide: proceed"|\\', '    "banana"|\\')),
+        ("토큰 줄 개수 판정 제거", cli, daemon,
+         sh.replace('[ "$CYS_HOOK_TOKEN_N" -ne 1 ]', "false")),
+        ("CR 제거 소실(Windows 전건 실패)", cli, daemon,
+         sh.replace('CYS_HOOK_LINE="${CYS_HOOK_LINE%"$CYS_CR"}"', ":")),
+        ("rc 기반 통과 회귀(stub exit 0 = 통과)", cli, daemon,
+         sh + '\ncase "$CYS_HOOK_RC" in\n  0) CYS_HOOK_GATE="proceed" ;;\nesac\n'),
+        ("rc 거부권 소실", cli, daemon, sh.replace('[ "$CYS_HOOK_RC" = "3" ]', "true")),
+        ("산출 측 무해화 제거(상세 줄이 토큰을 실을 수 있다)",
+         cli.replace("sanitize_hook_detail(detail)", "detail"), daemon, sh),
+        ("토큰 줄에 자유 문구 혼입",
+         cli.replace('format!("{HOOK_VERDICT_PREFIX}{verdict}")',
+                     'format!("{HOOK_VERDICT_PREFIX}{verdict} ({detail})")'), daemon, sh),
+    ]
+    blind = [lbl for lbl, c, d, x in mutants if not _u22_violations(c, d, x)]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return "위반 0 · %s · 합성 변조 %d종 전건 적발" % (calib, len(mutants))
+
+
+@specimen("H-HOOK-DECIDE-2", "W6",
+          "U-22 계약 3중 등재 정합 — cys.rs 상수 · handlers.rs 상수 · role-bootstrap.sh 표",
+          ["R2"])
+def h_hook_decide_2():
+    cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
+    daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
+    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    if not cli or not daemon:
+        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+    # ① contract_version 3중 일치
+    def _cv(src):
+        m = re.search(r"const HOOK_DECIDE_CONTRACT_V: u64 = (\d+);", src)
+        return int(m.group(1)) if m else None
+    m = re.search(r"hook\.decide contract_version:\s*(\d+)", sh)
+    sh_cv = int(m.group(1)) if m else None
+    need(_cv(cli) == _cv(daemon) == sh_cv == _U22_CONTRACT_V,
+         "contract_version 3중 불일치: cys.rs=%s handlers.rs=%s role-bootstrap.sh=%s(기준 %d)"
+         % (_cv(cli), _cv(daemon), sh_cv, _U22_CONTRACT_V))
+    # ② event 와이어 문자열 2중 일치(셸은 호출 문자열이 곧 값이다)
+    pat = r'const HOOK_EVENT_USER_PROMPT_SUBMIT: &str = "([^"]+)";'
+    ev_cli = re.search(pat, cli)
+    ev_dae = re.search(pat, daemon)
+    need(ev_cli and ev_dae and ev_cli.group(1) == ev_dae.group(1) == _U22_EVENT,
+         "event 와이어 문자열 불일치: cys.rs=%s handlers.rs=%s (기준 %s)"
+         % (ev_cli and ev_cli.group(1), ev_dae and ev_dae.group(1), _U22_EVENT))
+    need("cys hook %s" % _U22_EVENT in sh, "훅이 부르는 서브커맨드 철자가 와이어 상수와 다르다")
+    # ③ 판정 토큰 접두 2중 일치(cys.rs 상수 ↔ 셸 case) — 여기가 갈리면 위임이 조용히 죽는다.
+    m0 = re.search(r'const HOOK_VERDICT_PREFIX: &str = "([^"]+)";', cli)
+    need(m0, "cys.rs 에 판정 토큰 접두 상수가 없다")
+    # ★핀 이사(U-28) — **접두 일치 축은 보존**하고 비교 대상 형상만 옮긴다.
+    #   종전 비교 대상은 substring glob `*"<접두>proceed"*)` 였는데, 그 형상 자체가 위조 통로였다
+    #   (상세 줄이 판정을 뒤집는다 — `_u22_violations` 의 이사 주석 참조). 이제는 셸의 **줄 단위
+    #   정확 일치 case 패턴**과 대조한다. 축("셸 case 가 cys.rs 접두와 한 글자도 다르지 않다")은
+    #   무변이고, 종전이 2종만 보던 것을 **5종 전수**로 넓혔다(완화 아님 · 강화).
+    _pfx = m0.group(1)
+    need(_pfx == _U22_TOKEN_PREFIX,
+         "cys.rs 토큰 접두(%r)가 러너 정본(%r)과 다르다" % (_pfx, _U22_TOKEN_PREFIX))
+    _miss = [tk for tk in _U22_TOKENS
+             if not re.search(r'^\s*"%s%s"[|)]' % (re.escape(_pfx), tk), sh, re.M)]
+    need(not _miss,
+         "셸 case 가 cys.rs 토큰 접두(%r)와 다르다(정확 일치 누락: %s) — 위임이 조용히 legacy 로 접힌다"
+         % (_pfx, ",".join(_miss)))
+    # ★추가 강화 — 위조 통로(substring glob)의 **부재**를 단언한다.
+    _back = [tk for tk in _U22_TOKENS if ('*"%s%s"*)' % (_pfx, tk)) in sh]
+    need(not _back,
+         "★위조 통로 재유입(stderr 전문 substring glob): %s — 정확 일치로 좁힌 판독이 다시 넓어졌다"
+         % ",".join(_back))
+    need(re.search(r"판정 토큰\(1차\):\s*%s" % re.escape(m0.group(1)), sh),
+         "훅 헤더 계약표에 판정 토큰(1차) 줄이 없다")
+    # ④ exit 계약(보조) — cys.rs 상수 ↔ 셸 헤더 표
+    m = re.search(r"exit 계약\(보조\):\s*([^\n]+)", sh)
+    need(m, "훅 헤더에 exit 계약 표가 없다(3중 등재의 셸 축 부재)")
+    sh_tbl = dict((int(a), b) for a, b in re.findall(r"(\d+)=([a-z\-]+)", m.group(1)))
+    want = {0: "proceed", 1: "daemon-error", 3: "suppress", 4: "undecided", 5: "legacy"}
+    need(sh_tbl == want, "셸 exit 표 불일치: %s (기준 %s)" % (sh_tbl, want))
+    for name, val in sorted(_U22_EXITS.items()):
+        need("const HOOK_EXIT_%s: i32 = %d;" % (name, val) in cli,
+             "cys.rs exit 상수 HOOK_EXIT_%s 가 %d 가 아니다(셸 표와 갈림)" % (name, val))
+    # ⑤ rc 를 1차 근거로 되돌리는 회귀 차단(표만 맞고 코드가 rc 로 읽는 사문 방지)
+    need(not re.search(r'^\s*0\)\s*CYS_HOOK_GATE="proceed"', sh, re.M),
+         "셸이 rc=0 을 통과로 읽는다 — 토큰 1차 계약 회귀(stub cys 하나로 게이트 증발)")
+    return ("contract_version=%d · event=%s · 토큰접두=%r · exit표(보조) %s 3중 일치"
+            % (_U22_CONTRACT_V, _U22_EVENT, m0.group(1), want))
+
+
+@specimen("H-HOOK-DECIDE-3", "W6",
+          "U-22 구 경로 판정기 동적 시험 — 합성 표본 3종 참 · 음성대조 6종 거짓(스큐로 결함 삼킴 방지)",
+          ["R2"])
+def h_hook_decide_3():
+    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
+    m = re.search(r"^_cys_hook_legacy_unavailable\(\)\s*\{.*?^\}", sh, re.S | re.M)
+    need(m, "_cys_hook_legacy_unavailable 정의를 추출하지 못했다 — 판정기 부재")
+    fn = m.group(0)
+    # ★합성 표본: 트리에 실제 위반이 없어도 **탐지 능력 자체**를 시험한다.
+    #   양성 = 구 경로의 명시 증거(조용한 폴백이 정당) · 음성 = 그 밖 전부(시끄러워야 한다).
+    pos = [("127", "", "cys 부재"),
+           ("2", "error: unrecognized subcommand 'hook'", "구 CLI"),
+           ("1", "error: method_not_found: unknown method: hook.decide", "구 데몬")]
+    neg = [("1", "error: connect failed", "연결 실패"),
+           ("1", "error: not_found: surface 9 not found", "일반 not_found"),
+           ("2", "error: invalid value 'x'", "clap 다른 사용오류"),
+           ("7", "reap_denied", "무관한 rc"),
+           ("124", "", "타임아웃"),
+           ("0", "", "성공 rc")]
+    with tempfile.TemporaryDirectory() as td:
+        harness = os.path.join(td, "probe.sh")
+        _w(harness, "#!/bin/bash\n%s\nif _cys_hook_legacy_unavailable \"$1\" \"$2\"; then\n"
+                    "  echo LEGACY\nelse\n  echo LOUD\nfi\n" % fn)
+        bad = []
+        for rc, err, why in pos:
+            r = _run([BASH, harness, rc, err], timeout=30)
+            if r.stdout.strip() != "LEGACY":
+                bad.append("양성 미탐 rc=%s(%s) → %r" % (rc, why, r.stdout.strip()))
+        for rc, err, why in neg:
+            r = _run([BASH, harness, rc, err], timeout=30)
+            if r.stdout.strip() != "LOUD":
+                bad.append("음성 오탐 rc=%s(%s) → %r" % (rc, why, r.stdout.strip()))
+    need(not bad, "구 경로 판정기 오작동 %d건: %s" % (len(bad), " / ".join(bad)))
+    return "합성표본 양성 %d/%d · 음성대조 %d/%d 통과" % (len(pos), len(pos), len(neg), len(neg))
+
+
+@specimen("H-HOOK-DECIDE-4", "W6",
+          "U-22 위임 라우팅 행동 핀 — 토큰 부재(stub cys exit 0)에서 종전 게이트가 살아 있는가 · "
+          "토큰 proceed/suppress 가 실제로 발화/차단을 가르는가",
+          ["R2", "A3=B7"])
+def h_hook_decide_4():
+    """★이 검체가 존재하는 이유(2026-08-24 실사고): 위임 판정을 **exit code** 로 읽는 초안은
+    통과값이 `0` 이었다. 0 은 셸에서 가장 흔한 사고값이라, 아무 일도 안 하고 성공한 stub `cys`
+    (= 목 하네스·구 래퍼·`--help`) 하나로 role 게이트가 통째로 증발했고 worker-2 좌석에서
+    마스터 부트가 오발화했다(A3=B7 재발 — H-DETECT-7 이 적색으로 잡았다). 수리는 **stderr 판정
+    토큰 1차**(rc 는 보조)이고, 이 검체는 그 수리를 **행동**으로 못박는다. 정적 검체
+    (H-HOOK-DECIDE-1/2)만으로는 문자열이 맞는데 라우팅이 틀린 경우를 못 본다."""
+    routes = [
+        # (라벨, cys 스텁 분기, 기대 발화 여부, 왜)
+        ("토큰 부재(stub exit 0)+worker-2",
+         'case "$1" in surface-role) echo "worker-2"; exit 0;; esac',
+         False, "토큰이 없으면 종전 게이트가 살아 worker-2 를 차단해야 한다"),
+        ("토큰 proceed + worker-2",
+         'case "$1" in hook) echo "[cys-hook] hook-decide: proceed" >&2; exit 0;; '
+         'surface-role) echo "worker-2"; exit 0;; esac',
+         True, "데몬 권위 통과 판정이면 종전 게이트를 건너뛴다"),
+        ("토큰 suppress + 미claim",
+         'case "$1" in hook) echo "[cys-hook] hook-decide: suppress" >&2; exit 3;; '
+         'surface-role) echo ""; exit 0;; esac',
+         False, "데몬 권위 차단 판정은 종전 게이트와 무관하게 차단한다"),
+        ("구 데몬 스큐(method_not_found) + 미claim",
+         'case "$1" in hook) echo "error: method_not_found: unknown method: hook.decide" >&2; '
+         'exit 1;; surface-role) echo ""; exit 0;; esac',
+         True, "구 데몬에서는 종전 게이트가 판정한다(미claim 통과)"),
+        ("미지 토큰(형상 스큐) + worker-2",
+         'case "$1" in hook) echo "[cys-hook] hook-decide: banana" >&2; exit 0;; '
+         'surface-role) echo "worker-2"; exit 0;; esac',
+         False, "미지 토큰을 통과로 읽으면 안 된다 — 종전 게이트로 접힌다"),
+        ("롤백 스위치(CYS_BOOT_GATES=0) + worker-2",
+         'case "$1" in hook) echo "[cys-hook] hook-decide: legacy" >&2; exit 5;; '
+         'surface-role) echo "worker-2"; exit 0;; esac',
+         False, "롤백은 종전 동작으로의 완전 복귀다 — 게이트가 살아 있어야 한다"),
+    ]
+    bad = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (label, extra, want_fire, why) in enumerate(routes):
+            sb = os.path.join(tmp, "r%d" % i)
+            env, _h, _p, _b, _s = _rb_sandbox(sb)
+            env.pop("CYS_BOOT_GATES", None)
+            if "CYS_BOOT_GATES=0" in label:
+                env["CYS_BOOT_GATES"] = "0"
+            _mock_cys(os.path.join(sb, "bin"), sb, extra)
+            r = _run_rb(env)
+            fired = "발화됨" in r.stdout
+            if fired != want_fire:
+                bad.append("%s: 발화=%s(기대 %s) — %s | stderr=%r"
+                           % (label, fired, want_fire, why, r.stderr[-300:]))
+    need(not bad, "위임 라우팅 오작동 %d건: %s" % (len(bad), " / ".join(bad)))
+    return "라우팅 %d경로 전건 일치(토큰 부재·proceed·suppress·구 데몬 스큐·미지 토큰·롤백)" % len(routes)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# U-23 · boot_supervisor (감독자) — 별도 태스크 · 유계 재시도 · enum 인텐트
+# ═══════════════════════════════════════════════════════════════════════════
+# ★U-23 계측 대조 기준: 이 단위의 **수리 전 트리**(캠페인 베이스). 전역 `CALIBRATION_REF`
+#   (W0 착지 커밋)에는 `delivery.rs` 자체가 아직 없어 "탐지기가 못 잡았다"가 **기준 선택
+#   오류**로 나온다 — `_git_show` docstring 이 경고하는 바로 그 오보다.
+_U23_CALIB_REF = os.environ.get("CYS_HEALTH_U23_CALIB_REF", "985093d")
+_U23_RS_SUP = "src/bin/cysd/boot_supervisor.rs"
+_U23_RS_MAIN = "src/bin/cysd/main.rs"
+_U23_RS_GOV = "src/bin/cysd/governance.rs"
+_U23_RS_DEL = "src/bin/cysd/delivery.rs"
+
+# 감독자 코드에 **한 글자도** 있으면 안 되는 파괴/재기동 어휘. 이 저장소의 제1 계약
+# ("오살이 오탐보다 훨씬 위험하다")의 기계 집행 지점이며, Rust 단위테스트
+# `supervisor_never_kills_anything` 과 **같은 목록**이다(2벌 · 어느 한쪽만 고쳐지면 갈린다).
+_U23_DESTRUCTIVE = ("close_surface", "kill_on_drop(true)", "check_agent_death",
+                    "launch_via_cli", "restart_counts", "reap_", ".kill(")
+
+
+def _rs_prod(src):
+    """Rust 소스의 **프로덕션 부분만** 남기고 `//` 줄주석을 제거한다.
+
+    두 가지를 동시에 떨어낸다:
+      ① `#[cfg(test)]` 이후 — 테스트 모듈은 금칙 어휘를 **문자열로** 들고 있는 것이 정상이다
+         (검체 자신이 그 목록을 선언한다). 자르지 않으면 검체가 자기 자신을 위반으로 읽는다.
+      ② `//` 줄주석 — 핀은 '무엇을 **부르는가**'를 보는 장치이고 주석은 부르는 것이 아니다.
+         주석 한 줄로 핀이 적색이 되면 다음 사람은 설명을 지우거나 핀을 완화한다(둘 다 나쁘다).
+    (문자열 리터럴 안의 `//` 까지 보는 렉서가 아니다 — 대상 파일들에 그런 리터럴이 없고,
+     생기면 이 핀이 곧바로 적색으로 알려 준다.)"""
+    if src is None:
+        src = ""
+    i = src.find("#[cfg(test)]")
+    if i > 0:
+        src = src[:i]
+    return "\n".join(l.split("//")[0] for l in src.splitlines())
+
+
+def _rs_const_usize(src, name):
+    """`const <name>: usize = <n>;` 의 값. 없으면 None.
+
+    ★상수의 **값**까지 재는 이유: 두 유계 축(판정 상한·GC 상한)이 이름만 둘이고 값이 같아지면
+      그것은 축이 하나로 **다시 합쳐진 것**이고, 그 합침이 정확히 이번에 수리한 GC 기아다."""
+    m = re.search(r"const %s: usize = (\d+);" % re.escape(name), src or "")
+    return int(m.group(1)) if m else None
+
+
+def _rs_inject(src, text):
+    """합성 변조본 제조기 — **프로덕션 영역**(테스트 모듈 앞)에 코드를 심는다.
+    파일 끝에 붙이면 `#[cfg(test)]` 뒤라 판정 대상 밖이고, 그러면 '탐지기가 못 잡았다'는
+    결과가 탐지기 고장이 아니라 변조본 제조 오류가 된다(오보 방지)."""
+    src = src or ""
+    i = src.find("#[cfg(test)]")
+    return (src[:i] + text + "\n" + src[i:]) if i > 0 else (src + "\n" + text + "\n")
+
+
+def _u23_tick_violations(sup, main_rs, gov):
+    """H-TICK-ALIVE 판정기 — '감독자는 watchdog 틱을 절대 막지 않는다'."""
+    sup, main_rs, gov = sup or "", main_rs or "", gov or ""
+    v = []
+    if not sup.strip():
+        v.append("감독자 모듈이 없다(boot_supervisor.rs 부재) — R3 단발 체인 그대로")
+        return v
+    sup_c, gov_c, main_c = _rs_prod(sup), _rs_prod(gov), _rs_prod(main_rs)
+    # ① 감독자는 **별도 tokio 태스크**다.
+    if "tokio::spawn(" not in sup_c:
+        v.append("감독자가 별도 tokio 태스크가 아니다 — 부트가 어느 틱 숙주를 정지시킨다")
+    if "catch_unwind" not in sup_c:
+        v.append("감독자 틱에 패닉 격리가 없다 — 한 번의 패닉이 감독자를 영구 소멸시킨다(치명위험 ③)")
+    # ② 자기 cadence — watchdog 과 같은 값이면 두 태스크가 lockstep 으로 깨어난다.
+    ms = re.search(r"const SUPERVISOR_INTERVAL_SECS: u64 = (\d+);", sup)
+    mw = re.search(r"const WATCHDOG_INTERVAL_SECS: u64 = (\d+);", gov)
+    if not ms:
+        v.append("감독자 자기 cadence 상수(SUPERVISOR_INTERVAL_SECS)가 없다")
+    elif mw and ms.group(1) == mw.group(1):
+        v.append("감독자 cadence 가 watchdog(%s초)과 같다 — lockstep" % mw.group(1))
+    # ③ watchdog 틱 숙주 오염 0 — governance 는 감독자를 알지 못한다.
+    if "boot_supervisor" in gov_c:
+        v.append("governance(watchdog 틱 숙주)가 감독자를 참조한다 — 부트 1회가 틱을 정지시킨다")
+    # ④ watchdog 태스크의 `.await` 는 sleep 하나뿐이라는 계약(틱 본문 = 동기 클로저).
+    wi = gov_c.find("pub fn spawn_watchdog(")
+    if wi < 0:
+        v.append("spawn_watchdog 소실 — watchdog 계약을 확인할 수 없다(계측 무효)")
+    else:
+        body = gov_c[wi:gov_c.find("\nfn env_u64(", wi) if gov_c.find("\nfn env_u64(", wi) > 0
+                     else wi + 12000]
+        n_await = body.count(".await")
+        if n_await != 1:
+            v.append("watchdog 태스크의 .await 가 %d개다 — sleep 하나라는 계약이 깨졌다" % n_await)
+        if "tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await" not in body:
+            v.append("watchdog 의 유일한 .await 가 sleep 이 아니다")
+        # ⑤ 틱 4단 순서 불변식(감독자가 이 순서를 흔들지 않았다).
+        order = ["refresh_seat_cache(&daemon", "deliver_queued(&daemon",
+                 "check_agent_death(&daemon", "check_role_deadman(&daemon"]
+        idx = [body.find(x) for x in order]
+        if any(i < 0 for i in idx) or idx != sorted(idx):
+            v.append("watchdog 틱 4단 순서 불변식이 깨졌다: %s" % list(zip(order, idx)))
+    # ⑥ 기동 지점은 main.rs 정확히 1곳.
+    if main_c.count("boot_supervisor::spawn(") != 1:
+        v.append("main.rs 의 감독자 기동 지점이 정확히 1곳이 아니다(%d곳)"
+                 % main_c.count("boot_supervisor::spawn("))
+    if "mod boot_supervisor;" not in main_c:
+        v.append("main.rs 에 감독자 모듈 선언이 없다")
+    return v
+
+
+def _u23_bound_violations(sup, delivery):
+    """H-BOOT-SUP-1 판정기 — 유계성 3중 · enum 전용 인텐트 · 스풀 봉인 · 롤백 접힘 · 오살 0."""
+    sup, delivery = sup or "", delivery or ""
+    v = []
+    if not sup.strip():
+        v.append("감독자 모듈이 없다(boot_supervisor.rs 부재)")
+        return v
+    c = _rs_prod(sup)
+    # ── 폭주 차단 3중(치명위험 ①) ────────────────────────────────────────────
+    if "pub const MAX_ATTEMPTS: u32" not in c or "attempts >= MAX_ATTEMPTS" not in c:
+        v.append("시도 상한(MAX_ATTEMPTS)이 없거나 판정에 쓰이지 않는다 — 무한 재시도")
+    if "pub const RETRY_COOLDOWN_SECS: f64" not in c or "fn backoff_until(" not in c:
+        v.append("쿨다운/백오프가 없다 — 상한만으로는 순간 폭주를 막지 못한다")
+    if "fn effective_attempts(" not in c or "file_attempts.max(mem_attempts)" not in c:
+        v.append("메모리측 예산 합류가 없다 — 디스크 쓰기가 실패하면 예산이 영원히 0 이다(폭주)")
+    if "const MAX_DISPATCH_PER_TICK" not in c or "dispatched >= MAX_DISPATCH_PER_TICK" not in c:
+        v.append("틱당 디스패치 상한이 없다 — 스풀 홍수가 프로세스 떼를 낳는다")
+    # ── ★핀 이사(U-28 · 2026-08-24 · 러너 헤더 '핀 이사 계약' ①②④) ───────────────────────
+    # 【원인 규명 먼저 — 검체의 니들 두 개가 그 자체로 결함이었다】
+    #   ⓐ 종전 형상 `names.truncate(MAX_SCAN_ENTRIES)` **한 줄**은 판정과 GC 를 **같은 상한으로
+    #      함께** 잘랐다. 정렬 앞쪽 64건이 살아있는(혹은 지워지지 않는) 인텐트로 차 있는 동안
+    #      그 뒤의 쓰레기는 **영원히** 검사되지 않는다 = 스풀 무한 성장(결함 2b · GC 기아).
+    #   ⓑ 종전 형상 `budget.clear()` 는 예산 맵을 통째로 비웠다. 그런데 메모리측 예산을 둔
+    #      **근거 자체**가 '읽기전용 스풀·디스크 만실에서 attempts 가 영원히 0' 인 상황이다 —
+    #      바로 그 상황에서 clear 가 일어나면 두 축이 동시에 무너져 인텐트당 3회 상한이
+    #      무력화된다(매 틱 프로세스 1개 = 폭주 · 결함 2a).
+    # 【축은 하나도 완화하지 않는다】 축 넷 — "틱당 **판정**이 유계 · 틱당 **GC 검사**가 유계 ·
+    #   예산 맵이 유계 · 죽은 항목이 **매 틱** 회수된다" — 는 전부 그대로 요구한다. 종전 두 니들이
+    #   덮던 것을 **네 축으로 쪼개 각각** 핀하므로 판정은 넓어졌지 좁아지지 않았다.
+    # 【형상 이동】 판정 상한 = `intents.len() < MAX_SCAN_ENTRIES` · GC 상한 = `min(MAX_GC_ENTRIES)`
+    #   (신설 독립 축) · 맵 상한 = LRU 축출 + **디스패치 중단**(clear 대체) · 회수 = 매 틱 retain.
+    # 【★추가 강화】 ⓘ 두 상한이 **같은 값으로 다시 합쳐지면 적색**(= GC 기아 재유입) ⓙ 구 병합
+    #   형상(`truncate(MAX_*_ENTRIES)`)이 돌아오면 적색 ⓚ `budget.clear()` 가 돌아오면 적색
+    #   ⓛ 회전 커서·LRU·디스패치 중단의 실재를 요구한다 — 셋은 종전 형상이 하던 일을 **대신**
+    #   하므로, 이것들이 없으면 새 형상은 종전보다 약하다(그때 이사는 삭제가 된다).
+    if "const MAX_SCAN_ENTRIES" not in c or "intents.len() < MAX_SCAN_ENTRIES" not in c:
+        v.append("틱당 **판정** 상한(MAX_SCAN_ENTRIES)이 없다 — 스풀 홍수가 틱 길이를 무한히 늘린다")
+    if "const MAX_GC_ENTRIES" not in c or "min(MAX_GC_ENTRIES)" not in c:
+        v.append("틱당 **GC 검사** 상한(MAX_GC_ENTRIES)이 독립 축으로 없다 — 판정 상한이 GC 를 굶긴다")
+    _scan_cap = _rs_const_usize(c, "MAX_SCAN_ENTRIES")
+    _gc_cap = _rs_const_usize(c, "MAX_GC_ENTRIES")
+    if _scan_cap is None or _gc_cap is None:
+        v.append("유계 상한 상수를 읽지 못했다(계측 불능): MAX_SCAN_ENTRIES=%s MAX_GC_ENTRIES=%s"
+                 % (_scan_cap, _gc_cap))
+    elif _gc_cap <= _scan_cap:
+        v.append("★판정 상한(%d)과 GC 상한(%d)이 다시 합쳐졌다 — 앞쪽이 살아있는 인텐트로 차면 "
+                 "뒤쪽 쓰레기가 영원히 검사되지 않는다(GC 기아 · 결함 2b 재유입)"
+                 % (_scan_cap, _gc_cap))
+    if re.search(r"\.truncate\(MAX_(SCAN|GC)_ENTRIES\)", c):
+        v.append("★구 병합 형상(`truncate(MAX_*_ENTRIES)` 한 줄)이 돌아왔다 — 한 줄이 판정과 GC 를 "
+                 "함께 자른다(결함 2b 그 자체)")
+    if "st.cursor = scan.next_cursor;" not in c or "scan_spool(dir, now, st.cursor)" not in c \
+            or "let start = cursor % total;" not in c:
+        v.append("GC **회전 커서**가 없다 — 고정 시작점이면 상한 뒤쪽은 상한을 키워도 기아로 남는다")
+    if "const MAX_TRACKED" not in c or "st.budget.len() > MAX_TRACKED" not in c:
+        v.append("예산 맵 상한(MAX_TRACKED) 방어가 없다 — 24/365 데몬 누수")
+    if "budget.clear()" in c:
+        v.append("★예산 맵을 통째로 비운다(budget.clear) — 디스크측 예산이 0 인 바로 그 상황에서 "
+                 "메모리측까지 지워 인텐트당 상한이 무력화된다(결함 2a 재유입)")
+    if "!scan.present.contains(*id)" not in c or "evictable.sort_by(" not in c:
+        v.append("상한 집행이 LRU 축출(스풀에 **없는** 항목만·오래된 것부터)이 아니다 — 살아있는 "
+                 "예산을 버려 맵 크기를 지키는 것이 곧 유계 파기다")
+    if "suspend_dispatch" not in c or "if suspend_dispatch {" not in c:
+        v.append("상한을 넘겨도 **낳는 것을 멈추지** 않는다 — clear 없이 유계를 지킬 방법이 사라진다")
+    if not re.search(r"budget\s*\.retain\(", c):
+        v.append("예산 맵 매 틱 retain 이 없다(맵 3종 방어 ③)")
+    if "\"mtime_gc\"" not in c:
+        v.append("디스크 mtime GC 가 없다 — 본문이 깨진 늙은 인텐트가 영원히 남는다")
+    # ── 인텐트는 enum 값만 나른다(명령 문자열 금지) ──────────────────────────
+    if "fn parse(token: &str) -> Option<Self>" not in c:
+        v.append("행위 토큰 파서가 닫힌 enum 이 아니다")
+    if 'Disposition::Retire("unknown_action")' not in c:
+        v.append("미지 토큰이 폐기가 아니라 실행 후보가 된다 — 스풀이 명령 실행 표면이 된다")
+    if c.count("Command::new(") != 1 or "Command::new(&python)" not in c:
+        v.append("프로세스 생성 지점이 1곳(고정 인터프리터)이 아니다 — 인텐트가 명령이 될 수 있다")
+    # ── 스풀 봉인 ─────────────────────────────────────────────────────────────
+    if "state_dir(socket_path).join(SPOOL_DIR_NAME)" not in c:
+        v.append("스풀이 state_dir 하위가 아니다 — 부서 격리를 상속하지 못한다")
+    if "0o700" not in c or "set_permissions" not in c:
+        v.append("unix 0o700 재강제가 없다 — 이전 실행이 남긴 넓은 권한이 그대로다")
+    # ── 롤백은 마스터 스위치 하나에 접힌다(규약 6) ────────────────────────────
+    if "boot_gates_master_off_from" not in c or "ENV_BOOT_GATES" not in c:
+        v.append("롤백이 마스터 스위치(CYS_BOOT_GATES=0)에 접히지 않았다 — 사고 순간 노브 조합 불가")
+    if 'pub const ENV_SUPERVISOR: &str = "CYS_BOOT_SUPERVISOR"' not in c:
+        v.append("축 노브 상수(CYS_BOOT_SUPERVISOR)가 없다")
+    # ── 원장 기록이 행위보다 앞(불변식) ───────────────────────────────────────
+    di = c.find("fn dispatch_one(")
+    if di < 0:
+        v.append("dispatch_one(원장 선행 불변식의 유일 지점) 이 없다")
+    else:
+        body = c[di:]
+        rec, run = body.find("record_audited("), body.find("runner(daemon")
+        if rec < 0 or run < 0 or rec > run:
+            v.append("원장 기록이 행위보다 앞이 아니다 — 임무 게이트가 기계 push 를 오너 임무로 오인")
+    if c.count("crate::delivery::Origin::Supervisor") != 1:
+        v.append("감독자 원장 유래 지정 지점이 정확히 1곳이 아니다")
+    # ── 오살 금지 ─────────────────────────────────────────────────────────────
+    for w in _U23_DESTRUCTIVE:
+        if w in c:
+            v.append("감독자에 파괴/재기동 경로가 들어왔다: %s" % w)
+    # ── delivery.rs 어휘 additive ─────────────────────────────────────────────
+    if delivery.strip():
+        d = _rs_prod(delivery)
+        if "    Supervisor,\n" not in d or 'Origin::Supervisor => "supervisor",' not in d:
+            v.append("delivery.rs 에 Origin::Supervisor 어휘가 없다(원장 유래 미등재)")
+        for keep in ('Origin::Send => "send",', 'Origin::Boot => "boot",',
+                     'Origin::GuiAuto => "gui_auto",'):
+            if keep not in d:
+                v.append("기존 원장 어휘가 사라졌다: %s" % keep)
+    return v
+
+
+@specimen("H-TICK-ALIVE", "W6",
+          "U-23 감독자는 watchdog 틱을 막지 않는다 — 별도 태스크·자기 cadence·틱 4단 순서 보존 · "
+          "watchdog 의 유일한 .await 는 sleep",
+          ["R3"])
+def h_tick_alive():
+    """★이 검체가 지키는 것: 부트 1회(수십 초)를 watchdog 틱 본문(**동기 클로저**)에 얹으면
+    큐 배달·승인 격상·데드맨·회수가 그만큼 통째로 정지한다 — 이 저장소가 실제로 낸 사고
+    ②(무clear 게이트)·③(watchdog 사망)의 기전 그대로다. 그래서 감독자는 별도 태스크여야 한다."""
+    sup = _read(os.path.join(REPO_DIR, _U23_RS_SUP))
+    main_rs = _read(os.path.join(REPO_DIR, _U23_RS_MAIN))
+    gov = _read(os.path.join(REPO_DIR, _U23_RS_GOV))
+    if not main_rs or not gov:
+        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+    v = _u23_tick_violations(sup, main_rs, gov)
+    need(not v, "U-23 틱 계약 위반 %d건: %s" % (len(v), " / ".join(v)))
+    # ★계측 타당성 ① 기준 커밋 대조 — 그 트리엔 감독자가 아예 없다(R3 그 자체).
+    base_gov = _git_show(_U23_RS_GOV, _U23_CALIB_REF)
+    calib = "계측대조 생략(레포 아님)"
+    if base_gov:
+        ov = _u23_tick_violations(_git_show(_U23_RS_SUP, _U23_CALIB_REF),
+                                  _git_show(_U23_RS_MAIN, _U23_CALIB_REF), base_gov)
+        need(ov, "계측 무효: 수리 전 트리(%s)에서 탐지기가 위반을 하나도 못 찾았다" % _U23_CALIB_REF)
+        calib = "수리 전 %s 에서 %d건 FIRE" % (_U23_CALIB_REF, len(ov))
+    # ★계측 타당성 ② 합성 변조본 — 트리에 위반이 0 이라 초록인 것과 탐지기 고장을 가른다.
+    mutants = [
+        ("감독자를 틱 숙주로 이사", sup, main_rs,
+         _rs_inject(gov, "fn m() { let _ = boot_supervisor::spawn; }")),
+        ("main 기동 지점 삭제", sup, main_rs.replace("boot_supervisor::spawn(", "no_spawn("), gov),
+        ("cadence lockstep", sup.replace("const SUPERVISOR_INTERVAL_SECS: u64 = 3;",
+                                         "const SUPERVISOR_INTERVAL_SECS: u64 = 5;"),
+         main_rs, gov),
+        ("감독자 별도 태스크 해제", sup.replace("tokio::spawn(", "inline_call("), main_rs, gov),
+        ("watchdog 4단 순서 뒤집기", sup, main_rs,
+         gov.replace("refresh_seat_cache(&daemon, &sys);", "let _ = 0;", 1)),
+    ]
+    blind = [lbl for lbl, s, m, g in mutants if not _u23_tick_violations(s, m, g)]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return "틱 계약 위반 0 · %s · 합성 변조 %d종 전건 적발" % (calib, len(mutants))
+
+
+@specimen("H-BOOT-SUP-1", "W6",
+          "U-23 감독자 안전 계약 — 유계 재시도 3중·인텐트는 enum 값(명령 문자열 0)·스풀 0o700·"
+          "롤백 마스터 접힘·원장 선행·파괴 호출 0",
+          ["R3"])
+def h_boot_sup_1():
+    """★이 검체가 지키는 것: 감독자는 '없는 것을 낳는' 주체다. 그 힘에 상한이 없으면 곧
+    이벤트/큐 폭주(치명위험 ①)이고, 인텐트가 명령 문자열을 나르면 상태 디렉터리에 쓸 수 있는
+    누구든 데몬 권한을 얻는다. 그리고 감독자가 무언가를 **죽일 수 있게** 되는 순간 전 pane
+    사망(치명위험 ④)의 새 경로가 열린다 — 그래서 파괴 어휘를 소스에서 0 으로 못박는다."""
+    sup = _read(os.path.join(REPO_DIR, _U23_RS_SUP))
+    delivery = _read(os.path.join(REPO_DIR, _U23_RS_DEL))
+    if not delivery:
+        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+    v = _u23_bound_violations(sup, delivery)
+    need(not v, "U-23 안전 계약 위반 %d건: %s" % (len(v), " / ".join(v)))
+    # ★계측 타당성 ① 기준 커밋 대조(감독자 부재 = 위반).
+    base_del = _git_show(_U23_RS_DEL, _U23_CALIB_REF)
+    calib = "계측대조 생략(레포 아님)"
+    if base_del:
+        ov = _u23_bound_violations(_git_show(_U23_RS_SUP, _U23_CALIB_REF), base_del)
+        need(ov, "계측 무효: 수리 전 트리(%s)에서 탐지기가 위반을 하나도 못 찾았다" % _U23_CALIB_REF)
+        calib = "수리 전 %s 에서 %d건 FIRE" % (_U23_CALIB_REF, len(ov))
+    # ★계측 타당성 ② 합성 변조본 — 안전장치를 하나씩 떼면 반드시 적색이어야 한다.
+    mutants = [
+        ("시도 상한 제거", sup.replace("attempts >= MAX_ATTEMPTS", "false"), delivery),
+        ("메모리측 예산 제거",
+         sup.replace("file_attempts.max(mem_attempts)", "file_attempts"), delivery),
+        ("틱당 상한 제거", sup.replace("dispatched >= MAX_DISPATCH_PER_TICK", "false"), delivery),
+        ("미지 토큰 실행 허용",
+         sup.replace('Disposition::Retire("unknown_action")', "Disposition::Wait { until: 0.0 }"),
+         delivery),
+        ("원장 선행 역전",
+         sup.replace("fn dispatch_one(", "fn dispatch_one_moved(")
+            .replace("    crate::delivery::record_audited(", "    let _ = runner(daemon"), delivery),
+        ("파괴 경로 유입", _rs_inject(sup, "fn m(d: &Daemon) { d.close_surface(1); }"), delivery),
+        ("스풀 권한 재강제 제거", sup.replace("0o700", "0o755"), delivery),
+        ("롤백 마스터 접힘 해제",
+         sup.replace("cys::boot_gates_master_off_from(master_env) || ", ""), delivery),
+        ("원장 어휘 미등재", sup, delivery.replace('Origin::Supervisor => "supervisor",', "")),
+        # ★핀 이사(U-28) 판별력 — ⓐ 낡은(취약한) 형상 복귀 ⓑ 새 축 파괴가 **둘 다** 적색이어야
+        #   이사이지 삭제가 아니다. 아래 7종이 그것을 매 실행마다 시험한다.
+        ("판정·GC 상한 재병합(GC 기아 복귀)",
+         sup.replace("const MAX_GC_ENTRIES: usize = 256;",
+                     "const MAX_GC_ENTRIES: usize = 64;"), delivery),
+        ("구 병합 형상 복귀(단일 truncate)",
+         _rs_inject(sup, "fn m(names: &mut Vec<PathBuf>) { names.truncate(MAX_SCAN_ENTRIES); }"),
+         delivery),
+        ("판정 상한 제거", sup.replace("intents.len() < MAX_SCAN_ENTRIES", "true"), delivery),
+        ("GC 회전 커서 제거(뒤쪽 영구 기아)",
+         sup.replace("st.cursor = scan.next_cursor;", "st.cursor = 0;"), delivery),
+        ("예산 맵 통째 비우기 복귀(clear)",
+         _rs_inject(sup, "fn m(st: &mut SupState) { st.budget.clear(); }"), delivery),
+        ("살아있는 예산까지 축출(유계 파기)",
+         sup.replace("!scan.present.contains(*id)", "true"), delivery),
+        ("포화 시 디스패치 중단 해제", sup.replace("if suspend_dispatch {", "if false {"), delivery),
+        ("매 틱 retain 제거", sup.replace(".retain(|id, (_, last)|", ".drain_all(|id, (_, last)|"),
+         delivery),
+    ]
+    blind = [lbl for lbl, s, d in mutants if not _u23_bound_violations(s, d)]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return "안전 계약 위반 0 · %s · 합성 변조 %d종 전건 적발" % (calib, len(mutants))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# U-26 · 검증 인프라 (C-10) — 2026-08-24
+#
+# ★이 단위가 메우는 구멍: 이 캠페인이 확정한 4대 근본원인 중 하나가 **"진짜 e2e 테스트가
+#   0개"** 였다. 이 러너의 검체는 거의 전부 '소스 문자열 핀' 이다 — 그것은 "그렇게 쓰여
+#   있다"를 증명할 뿐 **"그 키를 누르면 실제로 그렇게 된다"** 를 증명하지 못한다.
+#   아래 H-FAKE-* 는 실제 프로세스를 실제 PTY 에 띄우고 실제 이스케이프 바이트를 밀어넣어
+#   실제 종료코드를 잰다.
+#
+# ★롤백 스위치는 **env 1지점**이다 — `CYS_U26_OFF=1` 이면 이 절의 검체 전부가 (통과가 아니라)
+#   큰 소리 **미측정**이 된다. 기본값(미설정)이 신동작이고, 사고 순간에 사람이 조합할 노브는 없다.
+#   ★2026-08-24(이종 리뷰어 [major]) — "큰 소리 Skip" 은 큰 소리가 아니었다. 종전 판은 이 스위치가
+#     켜지면 검체 5건이 `SKIP` 으로 접히고 최종 줄이 `GREEN`, 종료코드가 0 이었다. 즉 **스위치를
+#     켠 사람에게 러너가 통과했다고 답했다.** 지금은 등재소(`off_switch`)를 경유해 `Disabled` 를
+#     던지고, 러너는 그 런의 GREEN 을 박탈하고 exit 2 를 낸다(헤더 '미측정 축 계약').
+#   ⚠이것을 `CYS_BOOT_GATES` 마스터에 접지 **않은** 이유: 그 마스터는 **런타임 판정 축**을
+#     끄는 스위치다(관문 가드·주입 가드). 이 절은 판정 축을 하나도 만들지 않는다 — 검증
+#     인프라다. 검체 스위치를 런타임 마스터에 접으면 "제품 가드를 끄면 그 가드의 검체도
+#     같이 꺼지는" 구조가 되어, 가드를 끈 채 초록을 받는 경로가 생긴다. 그게 정확히 이
+#     파일이 막으려는 것이다.
+U26_OFF_ENV = off_switch("CYS_U26_OFF",
+                         "U-26 검증 인프라 검체(H-CI-TAG-1·H-EVID-1·H-FAKE-1/2/3)")
+_U26_EVIDENCE_DIR = os.path.join(REPO_DIR, "docs", "evidence")
+_U26_EV_JSON = os.path.join(_U26_EVIDENCE_DIR, "probe-2026-08-23-first-run-gates.json")
+_U26_VERIFY = os.path.join(REPO_DIR, "scripts", "verify_evidence.py")
+_U26_STUB = os.path.join(REPO_DIR, "scripts", "fake_agent.py")
+_U26_E2E = os.path.join(REPO_DIR, "scripts", "fake_agent_e2e.py")
+_U26_CORPUS = os.path.join("src", "first_run_gates.rs")
+_U26_WF = os.path.join(".github", "workflows", "windows-health.yml")
+
+
+def _u26_gate(*paths):
+    """롤백 스위치 + 적용 가능성.
+
+    ★Skip 과 Fail 의 경계가 이 함수의 전부다. **레포 체크아웃 안에서 파일이 없는 것은
+      '적용 불가' 가 아니라 '삭제' 다** — 검증 인프라를 지워 초록을 만드는 경로를 열어 두면
+      이 절 전체가 장식이 된다(보존 hard gate 와 같은 교리). 그래서:
+        · 롤백 스위치가 켜져 있다(사람이 껐다)      → **Disabled**(미측정 · GREEN 박탈 · exit 2)
+        · 레포가 아니다(`.git` 없음 = 배포 팩)      → Skip(적용 불가 · 게이트 중립)
+        · 레포인데 파일이 없다                      → **Fail**(삭제로 간주)
+    """
+    if _off_switch_on(U26_OFF_ENV):
+        # ★`Skip` 이 아니라 `Disabled` 다 — 이 둘은 다른 사실이고, 러너는 다른 축으로 센다.
+        #   (종전엔 `Skip` 이라 5건이 지워지고도 GREEN·exit 0 이 나왔다 — 이 함수 docstring 이
+        #    말하는 "삭제로 초록 만들기" 를 스위치 한 줄로 하는 경로였다.)
+        raise Disabled("U-26 롤백 스위치가 켜져 있다(%s=%s) — 검증 인프라 검체를 **측정하지 "
+                       "않는다**. 이것은 통과가 아니라 미측정이므로 이 런은 GREEN 을 잃고 "
+                       "exit 2 가 된다(헤더 '미측정 축 계약')."
+                       % (U26_OFF_ENV, os.environ.get(U26_OFF_ENV)))
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        raise Skip("레포 체크아웃이 아니다(배포 팩) — 검증 인프라 검체 적용 불가")
+    for p in paths:
+        need(os.path.exists(p),
+             "검증 인프라 파일이 없다: %s — 레포 안에서의 부재는 '적용 불가' 가 아니라 "
+             "**삭제**다(지워서 초록을 만드는 경로를 막는다)" % os.path.relpath(p, REPO_DIR))
+
+
+def _u26_py(script, *args, **kw):
+    r = _run([PY, script] + list(args), timeout=kw.pop("timeout", 300))
+    return r
+
+
+@specimen("H-CI-TAG-1", "W6",
+          "U-26 ① windows-health 가 태그 릴리스에서 실제로 돈다 — 트리거 결박 + 예산 규율",
+          ["CI-게이트-부재", "V4"])
+def h_ci_tag_1():
+    """★무엇이 결함이었나: `windows-health.yml` 트리거가 `push: branches:['feat/**']` +
+    수동뿐이라 **태그(`v*`) 릴리스에서 Windows 검체가 한 번도 돌지 않았다.** 릴리스 레인이
+    같은 태그로 windows-latest 빌드를 돌리기는 하지만 그것은 '컴파일·번들' 이지 부트스트랩
+    계약 검증이 아니다 — 즉 출하 시점 Windows 검증은 0 이었다. mac 은 멀쩡한데 Windows
+    설치본만 깨지는 사고가 이 저장소에서 반복된 것과 정확히 같은 층위의 구멍이다.
+
+    ★동시에 **비용 규율**을 못박는다: 늘어나는 것은 태그 push 뿐이어야 한다. `branches` 가
+    `**` 로 넓어지거나 `pull_request` 가 붙으면 매 push 마다 windows 러너(+cargo 빌드)가
+    돌아 예산이 폭발한다. 그래서 '트리거가 있다' 만이 아니라 '넓어지지 않았다' 도 판정한다."""
+    wf = os.path.join(REPO_DIR, _U26_WF)
+    _u26_gate(wf)
+    text = _read(wf)
+    on = text[text.index("\non:"):text.index("\npermissions:")]
+    need(re.search(r"tags:\s*\[?\s*['\"]v\*['\"]", on),
+         "windows-health 트리거에 태그(`v*`)가 없다 — 태그 릴리스에서 Windows 검체가 돌지 않는다")
+    need(re.search(r"branches:\s*\[?\s*['\"]feat/\*\*['\"]", on),
+         "종전 `feat/**` 브랜치 트리거가 사라졌다(무회귀 위반 — 개발 중 조기 검출 경로다)")
+    # ★예산 규율 — 일상 push 빈도를 늘리는 확장은 거부한다.
+    need("pull_request" not in on,
+         "예산 위반: `pull_request` 트리거는 매 PR 갱신마다 windows 러너를 돌린다")
+    for bad in ("branches: ['**']", 'branches: ["**"]', "branches: ['*']"):
+        need(bad not in on, "예산 위반: 전 브랜치 트리거(%s)" % bad)
+    # 잡이 여전히 무조건 실행인지(‘돌지 않는 초록’ 금지 교리 재확인 — 트리거만 넓히고
+    # 잡에 if 를 다는 조합이면 결국 안 도는 것이다).
+    job = text[text.index("jobs:"):]
+    need(not re.search(r"^\s{4}if:", job, re.M), "잡 수준 `if:` 존재 — 조건부 Windows 검증 금지")
+    # ★계측 타당성: 이 검체가 '없어도 초록' 이 아니라는 것을 합성 표본으로 보인다.
+    #   (트리에 위반이 0건이므로 탐지기가 죽어 있어도 결과는 똑같이 초록이다 — 그래서 시험한다.)
+    blind = []
+    for label, mutated in (
+        ("태그 트리거 삭제", on.replace("tags: ['v*']", "")),
+        ("feat 브랜치 삭제", on.replace("branches: ['feat/**']", "")),
+        ("PR 트리거 추가", on + "\n  pull_request: {}\n"),
+    ):
+        hit = (re.search(r"tags:\s*\[?\s*['\"]v\*['\"]", mutated)
+               and re.search(r"branches:\s*\[?\s*['\"]feat/\*\*['\"]", mutated)
+               and "pull_request" not in mutated)
+        if hit:
+            blind.append(label)
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return ("트리거 = feat/** + tags:v* · pull_request 없음 · 전브랜치 확장 없음 · 잡 무조건 실행 · "
+            "합성 변조 3종 전건 적발")
+
+
+@specimen("H-EVID-1", "W6",
+          "U-26 ② `docs/evidence/` 보존 계약 — 집행자 실재 · 대장 1:1(삭제 hard gate) · "
+          "합성 표본으로 탐지력 증명",
+          ["C-10", "실측-부재"])
+def h_evid_1():
+    """★왜 계약을 기계로 세우는가: 이 캠페인의 4대 근본원인 중 하나가 '**실측 없이 값을
+    골랐다**' 이다. 실측 아티팩트가 레포에 남지 않으면 다음 사람은 또 추정으로 값을 고른다.
+    그리고 문서만 있고 집행자가 없는 계약은 계약이 아니라 소원이다.
+
+    ★보존(retention) hard gate 가 왜 필요한가: 측정치가 불편할 때 **파일을 지워 초록을
+    만드는 것**이 이 캠페인이 명시적으로 차단하기로 한 reward-hack 이다. 대장(README §6)과
+    실물의 1:1 을 요구하면 삭제가 조용히 일어날 수 없다 — 지우려면 대장도 고쳐야 하고 그
+    한 줄은 diff 에 드러난다.
+
+    ★'위반 0' 은 검사기가 살아 있다는 증거가 아니다(정상 트리엔 원래 위반이 0이다).
+    그래서 검사기의 `--self-test`(합성 위반 표본 15종 + 정상 표본 1종)를 **여기서 돌린다**."""
+    readme = os.path.join(_U26_EVIDENCE_DIR, "README.md")
+    _u26_gate(_U26_VERIFY, _U26_EVIDENCE_DIR, readme)
+    # ① 계약 문서 필수 조항.
+    rtext = _read(readme)
+    for tok in ("retention", "provenance", "repro", "cys-evidence/1"):
+        need(tok in rtext, "계약 문서에 필수 조항 토큰 부재: %r" % tok)
+    # ② 집행자가 실제 트리를 초록으로 판정하는가.
+    r = _u26_py(_U26_VERIFY, "--json")
+    need(r.returncode == 0, "증거 계약 위반: %s" % (r.stdout[-600:] + r.stderr[-300:]))
+    d = json.loads(r.stdout)
+    need(d["stats"]["files"] >= 1, "증거 아티팩트가 0건 — 실측 없이 값을 고르는 상태로 되돌아갔다")
+    need(d["stats"]["indexed"] == d["stats"]["files"],
+         "대장과 실물이 1:1 이 아니다: 대장 %d행 / 파일 %d건"
+         % (d["stats"]["indexed"], d["stats"]["files"]))
+    # ③ ★탐지력 자체를 합성 표본으로 시험(계측 타당성).
+    st = _u26_py(_U26_VERIFY, "--self-test", "--json")
+    need(st.returncode == 0, "증거 검사기 자기시험 실패(탐지기 고장): %s" % st.stdout[-600:])
+    sd = json.loads(st.stdout)
+    need(not sd["blind"], "합성 위반 표본 미탐지: %s" % sd["blind"])
+    need(sd["cases"] >= 10, "자기시험 표본이 %d건뿐 — 탐지력 증명이 얕다" % sd["cases"])
+    return ("증거 %d건 · 관측 %d건 · 대장 1:1 · 합성 표본 %d건 전건 적발"
+            % (d["stats"]["files"], d["stats"]["observations"], sd["cases"]))
+
+
+def _u26_corpus_violations(src, ev):
+    """관문 코퍼스(Rust) ↔ 실측 캡처(JSON)의 키 방향 파리티. 반환 = 위반 목록.
+
+    ★이 함수가 지키는 단 하나: **면책 창의 통과 액션이 `Left` 계열로 되돌아가지 않는 것.**
+      구 설계는 `Left + Return` 이었고 실측은 그 반대다(세로 리스트라 Left 는 무의미 ·
+      기본 포커스가 `No, exit` 이라 Return 은 rc 1 사망). 코퍼스가 다시 틀린 키를 담으면
+      제품이 좌석을 죽이면서 CI 는 초록이 된다."""
+    v = []
+
+    def block(gate_id):
+        i = src.find('id: "%s"' % gate_id)
+        if i < 0:
+            return ""
+        j = src.find("Def {", i)
+        return src[i:j if j > i else i + 1400]
+
+    byp = block("bypass-disclaimer")
+    if not byp:
+        v.append("코퍼스에 bypass-disclaimer 정의가 없다")
+    else:
+        if "default_index: Some(1)" not in byp:
+            v.append("면책 창 기본 포커스 선언이 1(No, exit)이 아니다 — 실측과 어긋난다")
+        if 'action: Some((2, "Yes, I accept", Some("2")))' not in byp:
+            v.append("면책 창 통과 액션이 실측 형태가 아니다(기대: 인덱스 2 · 리터럴 \"2\")")
+        for wrong in ("Left", "ArrowLeft", "\\x1b[D"):
+            if wrong in byp:
+                v.append("면책 창 선언에 좌방향 키 어휘(%r)가 있다 — 틀린 키 박제 재발" % wrong)
+    tru = block("folder-trust")
+    if not tru:
+        v.append("코퍼스에 folder-trust 정의가 없다")
+    elif "default_index: Some(1)" not in tru or 'action: Some((1, "Yes, I trust this folder"' not in tru:
+        v.append("폴더신뢰 창 선언이 실측(기본 포커스 Yes · 인덱스 1)과 어긋난다")
+
+    # 실측 캡처의 상수와 코퍼스 선언이 같은 값을 말하는가.
+    b = (ev.get("screens") or {}).get("bypass-disclaimer") or {}
+    if (b.get("default_index"), b.get("accept_index"), b.get("exit_rc")) != (1, 2, 1):
+        v.append("실측 캡처의 면책 상수가 (1,2,1)이 아니다: %r" % b)
+    if (ev.get("key_facts") or {}).get("left_right_move_focus") is not False:
+        v.append("실측 캡처가 '좌우는 포커스를 옮기지 않는다'를 말하지 않는다")
+    # 스텁 화면이 코퍼스 needle 로 실제 감지되는가(감지 불가한 화면은 e2e 가치가 없다).
+    for gid, needle in (("bypass-disclaimer", "WARNING: Claude Code running in Bypass Permissions mode"),
+                        ("folder-trust", "Quick safety check")):
+        txt = ((ev.get("screens") or {}).get(gid) or {}).get("text", "")
+        if needle not in txt:
+            v.append("실측 캡처 화면(%s)에 코퍼스 needle 이 없다: %r" % (gid, needle))
+        if needle not in src:
+            v.append("코퍼스에 needle 이 없다: %r" % needle)
+    return v
+
+
+@specimen("H-FAKE-1", "W6",
+          "U-26 ③ 관문 스텁 선언 무결성 — 14 시나리오 · 실측 라벨 도용 차단 · 코퍼스 키 방향 파리티",
+          ["R2-design-02", "C22", "N02", "N03", "N06"])
+def h_fake_1():
+    """★핵심 계약: **재지 않은 것에 '실측' 라벨을 붙일 수 없다.** 스텁의 화면·기본 포커스·
+    종료코드는 `docs/evidence/probe-2026-08-23-first-run-gates.json` 에서 적재되며,
+    `key_oracle == "measured"` 인데 출처가 실측 캡처가 아니면 스텁 자기시험이 적색이다.
+
+    ★그리고 제품 코퍼스(`src/first_run_gates.rs`)와 **같은 값을 말하는지** 대조한다.
+    스텁만 옳고 제품이 틀리면(또는 그 반대면) e2e 초록은 아무것도 증명하지 못한다."""
+    src_path = os.path.join(REPO_DIR, _U26_CORPUS)
+    _u26_gate(_U26_STUB, _U26_EV_JSON, src_path)
+    st = _u26_py(_U26_STUB, "--self-test", "--json")
+    need(st.returncode == 0, "스텁 자기시험 실패: %s" % (st.stdout[-600:] + st.stderr[-300:]))
+    lst = _u26_py(_U26_STUB, "--list", "--json")
+    need(lst.returncode == 0, "스텁 대장 조회 실패: %s" % lst.stderr[-300:])
+    d = json.loads(lst.stdout)
+    need(d["count"] == 14, "시나리오 %d종 (계약 14종)" % d["count"])
+    ids = {s["id"] for s in d["scenarios"]}
+    for must in ("bypass-dialog", "folder-trust", "trust-echo-double-return", "onboarding-chain",
+                 "login-select", "oauth-loop-alive", "seeded-unauthenticated", "api-key-dialog",
+                 "gated-alive-forever"):
+        need(must in ids, "필수 시나리오 부재: %s" % must)
+    # 실측 라벨을 붙인 시나리오는 반드시 실측 캡처를 출처로 댄다.
+    for s in d["scenarios"]:
+        if s["key_oracle"] == "measured":
+            need(s["provenance"] == "measured" and "docs/evidence/" in s["source"],
+                 "실측 라벨 도용: %s (%r / %r)" % (s["id"], s["provenance"], s["source"]))
+    # ── 코퍼스 ↔ 실측 캡처 파리티 ──
+    src = _read(src_path)
+    ev = json.loads(_read(_U26_EV_JSON))
+    v = _u26_corpus_violations(src, ev)
+    need(not v, "코퍼스 파리티 위반 %d건: %s" % (len(v), " / ".join(v)))
+    # ★계측 타당성 — 트리에 위반이 0이므로 **합성 변조본**으로 탐지력을 시험한다.
+    #   (구 코드 대조가 아닌 이유: 베이스 트리(985093d)의 코퍼스는 이미 교정본이라
+    #    '수리 전 적색' 을 잴 대상이 아니다. 잘못된 기준의 탐지 실패는 탐지기 파손이 아니라
+    #    기준 선택 오류다 — 이 러너 헤더의 규약.)
+    mutants = [
+        ("면책 통과 액션을 Left 로 되돌림",
+         src.replace('action: Some((2, "Yes, I accept", Some("2")))',
+                     'action: Some((2, "Yes, I accept", Some("Left")))'), ev),
+        ("면책 기본 포커스를 2로 오기",
+         src.replace('default_index: Some(1),\n        action: Some((2, "Yes, I accept"',
+                     'default_index: Some(2),\n        action: Some((2, "Yes, I accept"'), ev),
+        ("면책 통과 인덱스를 1(No, exit)로 오기",
+         src.replace('action: Some((2, "Yes, I accept", Some("2")))',
+                     'action: Some((1, "Yes, I accept", Some("1")))'), ev),
+        ("폴더신뢰 선언 삭제", src.replace('id: "folder-trust"', 'id: "folder-trust-x"'), ev),
+        ("코퍼스 needle 삭제",
+         src.replace("WARNING: Claude Code running in Bypass Permissions mode", "X"), ev),
+        ("실측 캡처 상수 변조",
+         src, dict(ev, screens=dict(ev["screens"],
+                                    **{"bypass-disclaimer": dict(ev["screens"]["bypass-disclaimer"],
+                                                                 exit_rc=0)}))),
+        ("실측 캡처 키 사실 변조",
+         src, dict(ev, key_facts=dict(ev["key_facts"], left_right_move_focus=True))),
+    ]
+    blind = [lbl for lbl, s, e in mutants if not _u26_corpus_violations(s, e)]
+    need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
+    return ("시나리오 14종(실측 %d · 코퍼스 %d · 합성 %d) · 코퍼스 파리티 위반 0 · 합성 변조 %d종 전건 적발"
+            % (sum(1 for s in d["scenarios"] if s["provenance"] == "measured"),
+               sum(1 for s in d["scenarios"] if s["provenance"] == "product-corpus"),
+               sum(1 for s in d["scenarios"] if s["provenance"] == "synthetic"), len(mutants)))
+
+
+@specimen("H-FAKE-2", "W6",
+          "U-26 ③ ★진짜 e2e — 실제 프로세스를 실제 PTY 에 띄우고 키를 넣어 종료코드를 잰다",
+          ["R4-e2e-0", "B-1", "B-2", "B-3", "B-6"])
+def h_fake_2():
+    """★근본원인 R4 가 '**진짜 e2e 테스트가 0개**' 였다. 이 검체가 그 구멍을 메운다.
+    소스 핀은 "그렇게 쓰여 있다"만 증명한다 — 여기서는 프로세스가 실제로 뜨고, 실제
+    이스케이프 바이트(`\\x1b[D` 등)가 들어가고, 실제 종료코드가 나온다.
+
+    ★가장 중요한 세 줄(오라클):
+      · 면책 창 `Return` 단독      → **rc 1 사망**
+      · 면책 창 `Left+Return`      → **여전히 rc 1**(구 설계가 박제하려던 통과 오라클은 틀렸다)
+      · 면책 창 `Down+Return`/`2`  → 통과(생존)
+    이 축이 무너지면 2026-07-29 형태의 사고가 CI 초록으로 승인된다.
+
+    ★안전: 스텁 자기 자신 외에는 아무것도 뜨지 않고 아무것도 죽지 않는다(데몬·좌석·프로필
+    무접촉 · 전 실행 유계 타임아웃 · 자기 자식만 회수)."""
+    _u26_gate(_U26_E2E, _U26_STUB, _U26_EV_JSON)
+    r = _u26_py(_U26_E2E, "--json", timeout=600)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        raise Fail("e2e 결과 파싱 실패: %s" % ((r.stdout or "")[-500:] + (r.stderr or "")[-300:]))
+    bad = [c for c in d["cases"] if not c["ok"]]
+    need(not bad, "e2e 불일치 %d건: %s" % (len(bad), " / ".join(
+        "%s(%s)" % (c["name"], "; ".join(c["violations"])[:160]) for c in bad)))
+    need(not d["coverage_gaps"], "e2e 커버리지 공백: %s" % d["coverage_gaps"])
+    got = {c["name"]: c for c in d["cases"]}
+    # ★핵심 축은 이름으로 못박는다 — 사례 목록이 조용히 줄어드는 것을 막는다.
+    for name, rc in (("bypass-return", 1), ("bypass-left-return", 1), ("bypass-right-return", 1),
+                     ("bypass-down-return", 0), ("bypass-digit-2", 0),
+                     ("trust-return-safe", 0), ("trust-then-bypass-kills", 1),
+                     ("oauth-loop-never-dies", 0), ("seeded-unauth-query-fails", 0)):
+        need(name in got, "핵심 e2e 사례가 사라졌다: %s" % name)
+        need(got[name]["rc"] == rc, "%s 종료코드 %r (기대 %d)" % (name, got[name]["rc"], rc))
+    need(len(d["cases"]) >= 19, "e2e 사례가 %d건뿐 — 축소 의심" % len(d["cases"]))
+    mode = "실기 PTY" if d["pty"] else "파이프(비 posix)"
+    return ("%s · 사례 %d건 전건 일치 · 시나리오 14종 전수 구동 · "
+            "면책 Return/Left+Return = rc 1 · Down+Return·`2` = 생존"
+            % (mode, len(d["cases"])))
+
+
+@specimen("H-FAKE-3", "W6",
+          "U-26 ③ e2e 오라클 자기검증 — 틀린 의미론 4종을 실제로 적발하는가(합성 변조 실기)",
+          ["R2-design-02", "계측타당성"])
+def h_fake_3():
+    """★'전건 초록' 은 오라클이 살아 있다는 증거가 아니다. 오라클이 아무것도 안 보고 있어도
+    결과는 똑같이 초록이다. 그래서 **틀린 세계를 만들어** 그 안에서 오라클이 적색이 되는지
+    본다 — 그 중 하나가 정확히 구 설계의 세계다:
+
+      · `left-moves-focus` = 좌우가 포커스를 옮기는 세계 → 구 `Left+Return` 오라클이 참이 된다
+      · `return-accepts`   = 'Return 은 안전하다' 가정의 세계
+      · `no-exit`          = rc 1 사망을 감춘 세계
+      · `digit-ignored`    = 코퍼스 리터럴 `2` 통과가 무력화된 세계
+
+    네 세계 중 하나라도 초록으로 통과하면 e2e 전체가 장식이다."""
+    _u26_gate(_U26_E2E, _U26_STUB)
+    caught = {}
+    for m in ("left-moves-focus", "return-accepts", "no-exit", "digit-ignored"):
+        r = _u26_py(_U26_E2E, "--json", "--mutate", m, "--expect-fail", timeout=600)
+        try:
+            d = json.loads(r.stdout)
+        except ValueError:
+            raise Fail("변조 %s 결과 파싱 실패: %s" % (m, (r.stdout or "")[-400:]))
+        hits = [c["name"] for c in d["cases"] if not c["ok"]]
+        need(hits, "변조 %r 를 아무 사례도 적발하지 못했다 = 오라클 고장" % m)
+        caught[m] = hits
+    # 구 설계의 틀린 키가 정확히 그 사례에서 잡혔는지 이름으로 못박는다.
+    need("bypass-left-return" in caught["left-moves-focus"],
+         "좌방향 변조를 `bypass-left-return` 이 아닌 곳에서 잡았다 — 축이 어긋났다")
+    need("bypass-return" in caught["return-accepts"],
+         "'Return 은 안전하다' 변조를 `bypass-return` 이 잡지 못했다")
+    return "변조 4종 전건 적발 · " + " · ".join("%s→%s" % (k, ",".join(v)) for k, v in caught.items())
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 러너
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7965,51 +10691,107 @@ def main(argv=None):
     only = {s.strip() for s in args.only.split(",") if s.strip()}
     rows = []
     t0 = time.time()
-    for sid, wave, title, defects, fn in _REG:
-        if only and sid not in only:
-            continue
-        if args.wave and wave != args.wave:
-            continue
-        row = {"id": sid, "wave": wave, "title": title, "defects": defects}
-        effective = bool(fn) and wave in LANDED_WAVES
-        if not effective:
-            row["status"] = "pending"
-            row["reason"] = ("발효 웨이브 %s 미착지(현재 착지: %s)" % (wave, ",".join(LANDED_WAVES))
-                             if wave not in LANDED_WAVES else "구현 대기(발효 웨이브 착지 — 구현 필요)")
-            if wave in LANDED_WAVES and not fn:
-                row["status"] = "fail"
-                row["reason"] = "발효 웨이브인데 검체 미구현 — 측정 실패는 hard fail"
-            if not (args.include_pending and fn):
-                rows.append(row)
-                continue
-        s = time.time()
+    # ★스위치 상태는 **검체 실행 전에** 스냅샷한다 — 일부 검체가 실행 중 os.environ 을 임시로
+    #   바꿨다가 되돌리므로, 실행 후에 읽으면 그 왕복의 잔재를 판정 근거로 삼을 위험이 있다.
+    engaged = _off_switches_engaged()
+
+    # ★출력 스트림 분리(U-27 · 이종 리뷰어 [P0-3] · 헤더 '출력 스트림 계약').
+    #   `--json` 이면 **검체 실행 구간 동안** fd 1 을 fd 2 로 덮는다. `sys.stdout` 객체 치환으로는
+    #   부족하다 — 검체는 팩 모듈을 인프로세스로 부르기도 하고 자식 프로세스를 띄우기도 하는데,
+    #   자식은 **fd 를 상속**하므로 파이썬 층위 리다이렉트를 그냥 지나친다. 둘을 동시에 덮는
+    #   유일한 층위가 fd 다(실측 오염원: javis_report_gate 의 `verdict=… reasons=…` 요약 줄).
+    #   복원은 finally — 검체가 크래시해도 JSON 은 진짜 stdout 으로 나간다.
+    _out_fd = None
+    if args.json:
         try:
-            detail = fn()
-            row["status"] = "pass"
-            row["detail"] = detail or ""
-        except Skip as e:
-            row["status"] = "skip"
-            row["reason"] = str(e)
-        except Fail as e:
-            row["status"] = "fail"
-            row["reason"] = str(e)
-        except Exception as e:  # 검체 자체 크래시도 fail(측정 실패=hard fail)
-            row["status"] = "fail"
-            row["reason"] = "검체 크래시 %s: %s" % (type(e).__name__, e)
-        row["secs"] = round(time.time() - s, 2)
-        if not effective:
-            row["counted"] = False
-        rows.append(row)
+            sys.stdout.flush()
+            _out_fd = os.dup(1)
+            os.dup2(2, 1)
+        except (OSError, ValueError, AttributeError):
+            # fd 조작 불가 환경 — 종전 동작으로 자연 강등(하드 실패 아님).
+            # ★dup 은 됐는데 dup2 에서 깨진 경우 보존 fd 를 닫는다(누수 방지 · fd 1 은 그대로다).
+            if _out_fd is not None:
+                try:
+                    os.close(_out_fd)
+                except OSError:
+                    pass
+            _out_fd = None
+    try:
+        for sid, wave, title, defects, fn in _REG:
+            if only and sid not in only:
+                continue
+            if args.wave and wave != args.wave:
+                continue
+            row = {"id": sid, "wave": wave, "title": title, "defects": defects}
+            effective = bool(fn) and wave in LANDED_WAVES
+            if not effective:
+                row["status"] = "pending"
+                row["reason"] = ("발효 웨이브 %s 미착지(현재 착지: %s)" % (wave, ",".join(LANDED_WAVES))
+                                 if wave not in LANDED_WAVES
+                                 else "구현 대기(발효 웨이브 착지 — 구현 필요)")
+                if wave in LANDED_WAVES and not fn:
+                    row["status"] = "fail"
+                    row["reason"] = "발효 웨이브인데 검체 미구현 — 측정 실패는 hard fail"
+                if not (args.include_pending and fn):
+                    rows.append(row)
+                    continue
+            s = time.time()
+            try:
+                detail = fn()
+                row["status"] = "pass"
+                row["detail"] = detail or ""
+            except Disabled as e:
+                # ★`Skip` 보다 **먼저** 잡는다(Disabled 는 Skip 의 하위형이다). 순서가 뒤집히면
+                #   '사람이 끈 미측정' 이 다시 '적용 불가' 로 접혀 GREEN 이 된다 = 이 수리의 무력화.
+                row["status"] = "disabled"
+                row["reason"] = str(e)
+            except Skip as e:
+                row["status"] = "skip"
+                row["reason"] = str(e)
+            except Fail as e:
+                row["status"] = "fail"
+                row["reason"] = str(e)
+            except Exception as e:  # 검체 자체 크래시도 fail(측정 실패=hard fail)
+                row["status"] = "fail"
+                row["reason"] = "검체 크래시 %s: %s" % (type(e).__name__, e)
+            row["secs"] = round(time.time() - s, 2)
+            if not effective:
+                row["counted"] = False
+            rows.append(row)
+    finally:
+        if _out_fd is not None:
+            try:
+                sys.stdout.flush()
+            except Exception:       # noqa: BLE001 — 복원이 우선이다
+                pass
+            os.dup2(_out_fd, 1)
+            os.close(_out_fd)
 
     counted = [r for r in rows if r.get("counted", True)]
     failed = [r for r in counted if r["status"] == "fail"]
     passed = [r for r in counted if r["status"] == "pass"]
     skipped = [r for r in counted if r["status"] == "skip"]
+    # ★'사람이 끈 미측정' 은 `skip`(적용 불가)과 **다른 축**이다(헤더 '미측정 축 계약').
+    disabled = [r for r in counted if r["status"] == "disabled"]
     pend = [r for r in counted if r["status"] == "pending"]
-    verdict = "GREEN" if not failed else "RED"
+
+    # ── 판정 3값 ────────────────────────────────────────────────────────────
+    # GREEN 은 "발효분을 **다 재고** 다 통과했다" 일 때에만 붙는다.
+    # ★왜 `engaged` 만으로도 GREEN 을 박탈하는가: 스위치를 켜는 것은 이 **런 전체**에 대한 사람의
+    #   행위다. `--only` 로 그 검체가 이번 선택에 없었다는 사실은 "측정 축이 꺼져 있지 않다"를
+    #   조금도 뜻하지 않는다. 판단이 갈리는 자리에서 엄격한 쪽을 택하는 것은 완화가 아니므로
+    #   러너 헤더 '핀 이사 계약 ②'에 저촉되지 않는다.
+    if failed:
+        verdict = "RED"
+    elif disabled or engaged:
+        verdict = "UNMEASURED"
+    else:
+        verdict = "GREEN"
     summary = {"verdict": verdict, "landed_waves": list(LANDED_WAVES),
                "pass": len(passed), "fail": len(failed), "skip": len(skipped),
-               "pending": len(pend), "total": len(rows),
+               "disabled": len(disabled), "pending": len(pend), "total": len(rows),
+               "off_switches_engaged": [{"kind": k, "env": e, "value": val, "scope": sc}
+                                        for k, e, val, sc in engaged],
                "elapsed_secs": round(time.time() - t0, 1),
                "calibration_ref": CALIBRATION_REF}
 
@@ -8017,21 +10799,34 @@ def main(argv=None):
         print(json.dumps({"summary": summary, "specimens": rows}, ensure_ascii=False, indent=1))
     else:
         for r in rows:
-            mark = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP", "pending": "PEND"}[r["status"]]
+            mark = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP",
+                    "disabled": "OFF!", "pending": "PEND"}[r["status"]]
             line = "%s %-12s %-4s %s" % (mark, r["id"], r["wave"], r["title"])
             if r["status"] == "pass" and r.get("detail"):
                 line += "\n       └ %s" % r["detail"]
-            if r["status"] in ("fail", "skip", "pending") and r.get("reason"):
+            if r["status"] in ("fail", "skip", "disabled", "pending") and r.get("reason"):
                 line += "\n       └ %s" % r["reason"]
             print(line)
-        print("\n%s — 발효 %d PASS / %d FAIL / %d SKIP · 미발효 %d PEND · %.1fs (발효 웨이브 %s)"
-              % (verdict, len(passed), len(failed), len(skipped), len(pend),
+        print("\n%s — 발효 %d PASS / %d FAIL / %d SKIP(적용불가) / %d OFF(사람이 끈 미측정) · "
+              "미발효 %d PEND · %.1fs (발효 웨이브 %s)"
+              % (verdict, len(passed), len(failed), len(skipped), len(disabled), len(pend),
                  summary["elapsed_secs"], ",".join(LANDED_WAVES)))
+        if engaged:
+            print("\n★측정 축이 꺼져 있다 — 이 결과는 통과가 아니다(exit 2):")
+            for kind, env, val, scope in engaged:
+                print("  - [%s] %s=%s → %s" % (kind, env, val, scope))
         if failed:
             print("\n적색 검체 → 원 결함 ID로 역추적:")
             for r in failed:
                 print("  - %s [%s]: %s" % (r["id"], ",".join(r["defects"]), r.get("reason", "")[:400]))
-    return 0 if not failed else 1
+    # ── 종료코드 3값 — 0=GREEN · 1=RED(재서 틀렸다) · 2=UNMEASURED(재지 않았다) ──
+    # ★2 를 새로 내는 근거: 기계 소비자는 종료코드만 본다. 요약 라벨만 바꾸고 코드를 0 으로 두면
+    #   "통과라고 답하는 계측기" 가 그대로 남는다(리뷰어 재현: `CYS_U26_OFF=1` → 5 SKIP · exit 0).
+    #   1 과 섞지 않은 이유는 원인이 다르기 때문이다 — 섞으면 CI 가 '틀렸다' 와 '안 쟀다' 를
+    #   되찾지 못하고, 되찾지 못하는 신호는 결국 무시된다.
+    if failed:
+        return 1
+    return 2 if verdict == "UNMEASURED" else 0
 
 
 if __name__ == "__main__":

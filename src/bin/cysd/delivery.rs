@@ -210,6 +210,14 @@ pub enum Origin {
     /// ★기동 표식(sentinel) — 실제 배달이 아니다. 데몬이 기동 시 1줄 append 해
     /// "정상 원장은 절대 0바이트가 아니다"를 성립시킨다(판독자의 '빈 파일 = 손상' 근거).
     Boot,
+    /// ★(U-23) **부트 감독자**(`boot_supervisor`)가 인텐트를 집행하기 직전에 남기는 표식.
+    ///
+    /// `Boot` 과 같은 성격이다 — pane 에 글자를 밀어 넣는 '배달'이 아니라 **기계 유래 근거**다.
+    /// 왜 필요한가: 감독자가 낳은 부트 체인은 곧 pane 에 지침을 밀어 넣는다. 그 순간 원장에
+    /// 아무 근거가 없으면 임무 게이트는 그 push 를 **오너 임무로 오인**하고 자율 착수 권한을
+    /// 오발급한다. 그래서 감독자는 **행위보다 먼저** 이 유래로 기록한다
+    /// (`boot_supervisor::dispatch_one` · 순서 불변식은 같은 파일의 소스 핀이 지킨다).
+    Supervisor,
 }
 
 impl Origin {
@@ -223,6 +231,7 @@ impl Origin {
             Origin::SeatTakeover => "seat_takeover",
             Origin::Boot => "boot",
             Origin::GuiAuto => "gui_auto",
+            Origin::Supervisor => "supervisor",
         }
     }
 }
