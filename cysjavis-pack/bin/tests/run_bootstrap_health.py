@@ -2989,15 +2989,22 @@ def h_safe_3():
         {"role": "worker-2", "exited": False, "awakened_at": 2.0},
         {"role": "reviewer-gemini", "exited": False, "awakened_at": 1.0},
         {"role": "reviewer-codex", "exited": False, "awakened_at": 1.0}]}
-    v, _ = O.check_verdicts(st)
-    need(v["worker"]["satisfied"] is True,
-         "죽은 worker 좌석이 건강한 worker-2 를 가려 '미기동' 오판(결손 churn): %r" % v["worker"])
-    need(v["worker"]["grade"] == "awake_confirmed" and v["worker"]["filler"] == "worker-2",
-         "동족 대표가 최선 등급 좌석이 아니다: %r" % v["worker"])
+    # ★로스터 밀폐(_roster_pin ⓐ): 주입이 없으면 이 fixture 의 리뷰어 두 행은 리뷰어 CLI 가
+    #   깔리지 않은 기계에서 **의무 역할과 이름이 어긋나** 판정에서 통째로 빠진다. 적색은 안
+    #   나지만 재려던 팀이 조용히 축소된다 — 같은 클래스(환경이 전제를 대신 세움)다.
+    DN = _roster_pin(True)
+    v, _ = O.check_verdicts(st, detect=DN)
+    vw = _vd(v, "worker", "동족 대표 결정론")
+    need(vw["satisfied"] is True,
+         "죽은 worker 좌석이 건강한 worker-2 를 가려 '미기동' 오판(결손 churn): %r" % vw)
+    need(vw["grade"] == "awake_confirmed" and vw["filler"] == "worker-2",
+         "동족 대표가 최선 등급 좌석이 아니다: %r" % vw)
+    need(all(x["satisfied"] for x in v.values()),
+         "동족 대표 fixture 의 나머지 의무 좌석이 판정에서 빠졌다(전제 축소): %r" % v)
     # 결정론: 반복 호출에서 동일 결과(집합 순회 비결정성 제거)
-    reps = {json.dumps(O.check_verdicts(st)[0], sort_keys=True) for _ in range(8)}
+    reps = {json.dumps(O.check_verdicts(st, detect=DN)[0], sort_keys=True) for _ in range(8)}
     need(len(reps) == 1, "check_verdicts 가 비결정적이다(집합 순회 의존 잔존)")
-    notes.append("동족 대표=최선 등급·8회 반복 결정론")
+    notes.append("동족 대표=최선 등급·의무 좌석 전원 충족·8회 반복 결정론")
     return " · ".join(notes)
 
 
@@ -4059,6 +4066,55 @@ _SEAT_CORPUS = {
 }
 
 
+def _roster_pin(native):
+    """★리뷰어 로스터 **밀폐 주입**(격리 구성) — 위 corpus 를 기계 감지에서 떼어낸다.
+
+    ⓐ 왜 필요한가(2026-08-25 CI 적색 3건의 근저원인 · 실측 재현):
+      `check_verdicts` 가 요구하는 의무 역할은 상수가 아니라 **그 기계에 리뷰어 CLI 가 설치돼
+      있는가**로 갈린다(`reviewer_roster` → `detect_reviewer` → 단일 오라클 ∨ agents.json 경로
+      실재). 설치된 개발자 기계에서는 네이티브 슬롯 이름이, 깨끗한 기계(CI macos-latest · 신규
+      사용자 대다수)에서는 대체 슬롯 이름이 required 에 들어간다.
+      그런데 위 `_SEAT_CORPUS` 는 좌석 이름을 네이티브로 적어 두었다 — 즉 이 검체들은
+      **사용자 환경이 전제를 대신 세워 주는 동안만** 초록이었고, 깨끗한 기계에서는 없는 키를
+      색인해 예외로 죽었다. 검체가 죽으면 무엇을 재려 했는지가 통째로 사라진다(전제 부재는
+      **판정**돼야지 크래시가 되면 안 된다).
+      `check_verdicts` · `_shared_verdict_deficit` 는 이미 이 주입 규약(detect/agents)을
+      **계약으로** 갖고 있다 — 같은 이유로 두 `--self-test` 가 2026-08-22 에 먼저 이주했고,
+      건강성 러너의 이 세 검체만 남아 있었다. 이제 여기도 전제를 스스로 세운다.
+
+    ⓑ 왜 완화가 아닌가:
+      · `need()` 를 하나도 지우지 않았고 검체 삭제도 0 이다.
+      · '전제 없음'을 skip 으로 접지 않는다 — 전제를 **구성**해서 잰다(측정 불능을 통과로
+        접지 않는다는 이 저장소의 규율 그대로).
+      · 오히려 로스터 **두 형상 전수**(설치 기계 ∥ 깨끗한 기계)에서 같은 계약을 재게 되어
+        단언 횟수가 늘고, 종전에는 개발자 기계에서 0회 실행이던 대체 로스터 경로가 상시
+        측정된다. 판정은 이제 어느 기계에서 돌려도 같다.
+
+    반환: `reviewer_roster(detect, agents)` 가 호출하는 감지 주입 콜러블.
+    """
+    def detect(agent, agents=None):
+        return bool(native), "밀폐 주입(native=%r · 실감지 우회)" % bool(native)
+    return detect
+
+
+def _vd(verdicts, role, ctx=""):
+    """`verdicts[role]` — 없을 때 **터지지 않고 판정한다**(전제 부재는 진단이지 크래시가 아니다).
+
+    ★왜 이 한 줄이 필요한가: 종전에 이 파일의 검체들은 의무 역할을 리터럴로 색인했다
+      (`v["reviewer-gemini"]`). 로스터가 그 이름을 담지 않는 기계에서는 검체가 `KeyError` 로
+      **크래시**했고, 그 순간 "무엇을 재려 했는가"가 통째로 사라졌다 — 러너가 남긴 것은
+      한 줄짜리 예외 이름뿐이라 원인 규명이 CI 로그에서 시작조차 되지 않았다.
+      이제는 같은 상황에서 **판정된 실패**가 나온다: 어떤 역할을 기대했고 실제 판정에는 무엇이
+      들어 있었는지가 사유에 남는다. 판정 조건은 그대로다(없으면 여전히 실패) — 바뀐 것은
+      실패가 **진단 가능해졌다**는 것뿐이다."""
+    if role not in verdicts:
+        raise Fail("의무 역할 %r 가 check 판정에 없다 — 로스터 전제가 서지 않았다"
+                   "(판정에 있는 역할: %s)%s"
+                   % (role, ", ".join(sorted(verdicts)) or "(없음)",
+                      (" · %s" % ctx) if ctx else ""))
+    return verdicts[role]
+
+
 @specimen("H-PRED-1", "W2", "결손 판정↔check verdict 공유 fixture 기계 차분", ["A1", "G26"])
 def h_pred_1():
     """A1 클래스 소멸의 핵심 단언: **결손 판정과 check 판정이 갈리지 않는다** — 유일한
@@ -4077,47 +4133,64 @@ def h_pred_1():
     need("_shared_verdict_deficit" in _read(os.path.join(BIN_DIR, "javis_bootstrap.py")),
          "결손 판정이 공유 판정 함수를 소비하지 않는다")
     diffs = []
-    for name, rows in _SEAT_CORPUS.items():
-        st = _fx(rows)
-        verdicts, _roster = O.check_verdicts(st)
-        check_missing = sorted(r for r, v in verdicts.items() if not v["satisfied"])
-        unknown_ok = sorted(r for r, v in verdicts.items()
-                            if v["satisfied"] and v["grade"] == "unknown")
-        # 밀폐 주입: 재조회=같은 fixture(잔존 unknown 재현)·tick 0 — 수면 0·라이브 데몬 왕복 0.
-        has, why = B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0)
-        need(has is not None, "%s: 공유 판정 소비 실패 — %s" % (name, why))
-        # 차분 계약: check 부재 ⟺ 결손>0. ★유일 예외 = unknown 잔존(W-B3 신계약 — 의도된 차분).
-        expect = bool(check_missing) or bool(unknown_ok)
-        if bool(has) is not expect:
-            diffs.append("%s: check_missing=%r unknown=%r vs deficit=%r"
-                         % (name, check_missing, unknown_ok, has))
+    # ★차분 0 은 **로스터에 무관한** 계약이다(두 판정이 같은 로스터를 소비하므로) — 그래서
+    #   설치 기계(native)·깨끗한 기계(substitute) 두 형상 전수로 잰다. 종전에는 이 루프가
+    #   기계에 실제로 깔린 리뷰어 CLI 한 형상만 밟았다(`_roster_pin` ⓐ 참조).
+    for pin in (True, False):
+        D = _roster_pin(pin)
+        for name, rows in _SEAT_CORPUS.items():
+            st = _fx(rows)
+            verdicts, _roster = O.check_verdicts(st, detect=D)
+            check_missing = sorted(r for r, v in verdicts.items() if not v["satisfied"])
+            unknown_ok = sorted(r for r, v in verdicts.items()
+                                if v["satisfied"] and v["grade"] == "unknown")
+            # 밀폐 주입: 재조회=같은 fixture(잔존 unknown 재현)·tick 0 — 수면 0·데몬 왕복 0.
+            has, why = B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0,
+                                                 detect=D)
+            need(has is not None, "[native=%r] %s: 공유 판정 소비 실패 — %s" % (pin, name, why))
+            # 차분 계약: check 부재 ⟺ 결손>0. ★유일 예외 = unknown 잔존(W-B3 — 의도된 차분).
+            expect = bool(check_missing) or bool(unknown_ok)
+            if bool(has) is not expect:
+                diffs.append("[native=%r] %s: check_missing=%r unknown=%r vs deficit=%r"
+                             % (pin, name, check_missing, unknown_ok, has))
     need(not diffs, "결손 판정↔check verdict 차분 발생(A1 라이브락 재성립): %r" % diffs)
+    # ↓ 아래는 corpus 의 **좌석 이름**(네이티브 슬롯)을 직접 색인하므로 그 전제를 명시로 세운다.
+    DN = _roster_pin(True)
     # G26 좌석: grok·cso-1 은 의무 슬롯을 채우지 못한다(양쪽 동일 결론).
     st = _fx(_SEAT_CORPUS["g26_variant_seats"])
-    v, _ = O.check_verdicts(st)
-    need(not v["cso"]["satisfied"], "cso-1 변형 좌석이 의무 cso 를 충족(G26 재발)")
-    need(not v["reviewer-gemini"]["satisfied"], "reviewer-grok 이 의무 리뷰어 슬롯을 충족(G26 재발)")
-    need(B._shared_verdict_deficit(st, requery=lambda: st, tick_s=0)[0] is True,
+    v, _ = O.check_verdicts(st, detect=DN)
+    need(not _vd(v, "cso", "G26")["satisfied"], "cso-1 변형 좌석이 의무 cso 를 충족(G26 재발)")
+    need(not _vd(v, "reviewer-gemini", "G26")["satisfied"],
+         "reviewer-grok 이 의무 리뷰어 슬롯을 충족(G26 재발)")
+    need(B._shared_verdict_deficit(st, requery=lambda: st, tick_s=0, detect=DN)[0] is True,
          "G26 좌석에서 결손 0 오판")
     # 대조군: 정상 팀은 양쪽 모두 충족.
     st_ok = _fx(_SEAT_CORPUS["healthy_latched"])
-    need(B._shared_verdict_deficit(st_ok, requery=lambda: st_ok, tick_s=0)[0] is False,
+    need(B._shared_verdict_deficit(st_ok, requery=lambda: st_ok, tick_s=0,
+                                   detect=DN)[0] is False,
          "정상 팀을 결손>0 으로 오판(역방향 회귀)")
-    # ★W-B3 신계약 3단 통제(로스터 적응형 — 이 기계의 리뷰어 감지 결과에 무관하게 성립):
+    # ★W-B3 신계약 3단 통제 — 로스터 **두 형상 전수**(주입으로 전제를 세운다):
     #   ⓐ ⑤check satisfied 불변(unknown=충족측) ⓑ 잔존 unknown ⟹ 결손>0(의도된 차분·배선 발효)
     #   ⓒ 재조회 생존 확인 ⟹ 결손 0 복귀(시한부 — 건강한 콜드스타트 팀 오판·boot churn 금지)
-    req_roles = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster()]
-    unk_st = _fx([{"role": req_roles[0], "exited": False, "seat": "unknown"}] +
-                 [{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles[1:]])
-    ok_st = _fx([{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles])
-    v_unk, _ = O.check_verdicts(unk_st)
-    need(v_unk[req_roles[0]]["grade"] == "unknown", "unknown 통제 fixture 가 unknown 등급이 아님")
-    need(v_unk[req_roles[0]]["satisfied"] is True,
-         "⑤check 가 unknown 을 미충족으로 뒤집음(콜드스타트 exit 6 라이브락 재발)")
-    need(B._shared_verdict_deficit(unk_st, requery=lambda: unk_st, tick_s=0)[0] is True,
-         "잔존 unknown 이 결손으로 계상되지 않음(W-B3 배선 미발효 — BOOT_SKIP 잔존)")
-    need(B._shared_verdict_deficit(unk_st, requery=lambda: ok_st, tick_s=0)[0] is False,
-         "재조회 생존 확인된 unknown 을 결손으로 계상(불필요 boot·churn — 역방향 회귀)")
+    for pin in (True, False):
+        D = _roster_pin(pin)
+        req_roles = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster(D)]
+        unk_st = _fx([{"role": req_roles[0], "exited": False, "seat": "unknown"}] +
+                     [{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles[1:]])
+        ok_st = _fx([{"role": r, "exited": False, "awakened_at": 1.0} for r in req_roles])
+        v_unk, _ = O.check_verdicts(unk_st, detect=D)
+        vu = _vd(v_unk, req_roles[0], "W-B3 unknown 통제(native=%r)" % pin)
+        need(vu["grade"] == "unknown",
+             "[native=%r] unknown 통제 fixture 가 unknown 등급이 아님" % pin)
+        need(vu["satisfied"] is True,
+             "[native=%r] ⑤check 가 unknown 을 미충족으로 뒤집음(콜드스타트 exit 6 라이브락 재발)"
+             % pin)
+        need(B._shared_verdict_deficit(unk_st, requery=lambda: unk_st, tick_s=0,
+                                       detect=D)[0] is True,
+             "[native=%r] 잔존 unknown 이 결손으로 계상되지 않음(W-B3 배선 미발효)" % pin)
+        need(B._shared_verdict_deficit(unk_st, requery=lambda: ok_st, tick_s=0,
+                                       detect=D)[0] is False,
+             "[native=%r] 재조회 생존 확인된 unknown 을 결손으로 계상(불필요 boot·churn)" % pin)
     # ★배선 실재 핀(소비자 0 재발 금지): bootstrap 판은 orchestra 정본으로 위임하고, 로컬
     #   구현은 폴백 전용 이름으로만 남는다(동명 쌍둥이 드리프트 함정 제거).
     bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
@@ -4127,18 +4200,26 @@ def h_pred_1():
          "구 팩 스큐 폴백(로컬 구 계약) 소실 — 신팩+구팩 혼재에서 부트 경로 취약")
     # ★구 팩 스큐 시뮬(orchestra 에 정본 부재): 폴백이 유효 판정을 내고(부트 불사·구 계약
     #   unknown=충족측) stderr 1줄로 고지된다(조용한 강등 금지).
+    #   ★폴백은 주입 통로가 없다(구 계약 그대로 `check_verdicts(status)` 1인자 호출) — 그래서
+    #     전제는 **스텁 쪽에서** 세운다: 구 팩에도 있던 판정 코어를 그대로 쓰되 로스터만 못박은
+    #     형상으로 실어 준다. 프로덕션 서명을 건드리지 않고도 검체가 환경에서 독립한다.
     import types as _types
     import io as _io
     import contextlib as _ctx
+    _sk_req = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster(DN)]
+    sk_unk = _fx([{"role": _sk_req[0], "exited": False, "seat": "unknown"}] +
+                 [{"role": r, "exited": False, "awakened_at": 1.0} for r in _sk_req[1:]])
+    sk_ok = _fx([{"role": r, "exited": False, "awakened_at": 1.0} for r in _sk_req])
     stub = _types.ModuleType("javis_orchestra")
-    stub.check_verdicts = O.check_verdicts      # 구 팩에도 있던 W2 판정 코어만 남긴 형상
+    # 구 팩에도 있던 W2 판정 코어만 남긴 형상 + 로스터 밀폐(전제 구성 · 판정 코어는 정본 그대로)
+    stub.check_verdicts = lambda st, *a, **kw: O.check_verdicts(st, detect=DN)
     real = sys.modules.get("javis_orchestra")
     buf = _io.StringIO()
     try:
         sys.modules["javis_orchestra"] = stub
         with _ctx.redirect_stderr(buf):
-            fb_ok = B._shared_verdict_deficit(ok_st)
-            fb_unk = B._shared_verdict_deficit(unk_st)
+            fb_ok = B._shared_verdict_deficit(sk_ok)
+            fb_unk = B._shared_verdict_deficit(sk_unk)
     finally:
         if real is not None:
             sys.modules["javis_orchestra"] = real
@@ -4148,6 +4229,26 @@ def h_pred_1():
     need(fb_unk[0] is False,
          "구 팩 스큐 폴백이 unknown 을 결손으로 계상(구 계약 이탈 — 폴백은 unknown=충족측)")
     need("폴백" in buf.getvalue(), "폴백 발동이 stderr 1줄로 고지되지 않음(조용한 강등)")
+    # ★★클래스 봉인(2026-08-25) — "환경이 전제를 대신 세우는 검체" 재발 금지.
+    #   이 러너 안의 **모든** 로스터 오라클 호출은 주입을 동반해야 한다. 주입이 없으면 판정
+    #   대상 팀이 그 기계에 깔린 리뷰어 CLI 로 갈리고, 그때의 초록·적색은 코드가 아니라 환경을
+    #   잰 것이다(실측: 같은 커밋이 개발자 기계 GREEN · 깨끗한 기계 3건 적색).
+    #   ※ 결손 산출(`_shared_verdict_deficit`)은 이 오라클을 소비하므로 함께 닫힌다. 단
+    #     구 팩 스큐 폴백만은 주입 통로가 없어(구 계약 1인자) 위에서 스텁으로 전제를 세운다.
+    _rsrc = _read(os.path.abspath(__file__))
+    _ARGS = r"([^()]*(?:\([^()]*\)[^()]*)*)\)"      # 한 단계 중첩까지 무는 인자 구간
+    _bare = []
+    for _name, _pat, _ok in (
+            ("check_verdicts", r"O\.check_verdicts\(" + _ARGS,
+             lambda a: "detect=" in a),
+            ("reviewer_roster", r"O\.reviewer_roster\(" + _ARGS,
+             lambda a: bool(a.strip()))):
+        _hits = re.findall(_pat, _rsrc, re.S)
+        need(_hits, "%s 호출을 하나도 수확하지 못했다(수확 정규식 파손 — fail-closed)" % _name)
+        _bare += ["%s(%s)" % (_name, " ".join(a.split())[:70]) for a in _hits if not _ok(a)]
+    need(not _bare,
+         "로스터 주입 없는 오라클 호출 %d건 — 검체가 '이 기계에 무엇이 깔렸는가'를 재고 있다"
+         "(격리 구성으로 전제를 세워라 · `_roster_pin`): %r" % (len(_bare), _bare))
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"))
     calib = "skip(no-git)"
     if old is not None:
@@ -4156,9 +4257,10 @@ def h_pred_1():
         need("cys list 텍스트" in old or "_live_role_names" in old,
              "계측 타당성 실패: 구 코드의 cys list 기반 결손 판정을 못 찾았다")
         calib = "구 코드=cys list 텍스트 신호(check 와 다른 함수) 확인"
-    return ("공유 fixture %d종 차분 0(unknown 잔존=의도된 차분 1) · G26 좌석 양쪽 결손>0 · "
-            "정상 팀 결손 0 · W-B3: ⑤불변+잔존 unknown 결손+시한부 복귀+위임 배선+구팩 폴백"
-            "(스큐 시뮬·stderr 고지) · 계측검증=%s" % (len(_SEAT_CORPUS), calib))
+    return ("공유 fixture %d종 × 로스터 2형상(설치·깨끗) 차분 0(unknown 잔존=의도된 차분) · "
+            "G26 좌석 양쪽 결손>0 · 정상 팀 결손 0 · W-B3 2형상: ⑤불변+잔존 unknown 결손+"
+            "시한부 복귀 · 위임 배선+구팩 폴백(스큐 시뮬·stderr 고지) · 계측검증=%s"
+            % (len(_SEAT_CORPUS), calib))
 
 
 @specimen("H-SEAT-4AXIS", "W6",
@@ -4230,7 +4332,10 @@ def h_seat_4axis():
                  "3중 AND 동결")
 
     # ── 축②③④ 실행 차분 — 같은 fixture 를 python·orchestra·결손 산출이 어떻게 읽는가 ──
-    req = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster()]
+    # ★로스터 밀폐(_roster_pin ⓐ) — 이 축의 판정은 로스터에 무관하지만, 주입 없이 실감지를 쓰면
+    #   같은 검체가 기계마다 다른 팀을 재게 된다(설치 기계=네이티브 · 깨끗한 기계=대체).
+    D = _roster_pin(True)
+    req = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster(D)]
 
     def _team(first_row):
         return _fx([first_row] + [{"role": r, "exited": False, "awakened_at": 1.0}
@@ -4247,20 +4352,21 @@ def h_seat_4axis():
     need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_GATED,
          "python 이 관문 좌석을 제4 등급으로 읽지 않는다")
     # 축③ orchestra check_verdicts — **충족 아님**
-    v_gate, _ = O.check_verdicts(gated)
+    v_gate, _ = O.check_verdicts(gated, detect=D)
     need(v_gate[req[0]]["grade"] == BN.LIVENESS_GATED, "check 가 제4 등급을 전달하지 않는다")
     need(v_gate[req[0]]["satisfied"] is False,
          "관문 보류가 충족으로 접혔다 — 관문에 갇힌 팀이 READY 로 집계된다(이 단위의 존재 이유 소멸)")
     # 축④ 결손 산출(부트 경로) — 충족 아님이므로 결손>0
-    has, why = B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)
+    has, why = B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0, detect=D)
     need(has is True, "관문 보류인데 결손 0(부트가 영영 호출되지 않는다): %s" % why)
     # ★차분 0 계약: 세 축이 같은 결론(미충족 ⟺ 결손>0)이고, 대조군에서 셋 다 뒤집힌다.
     for name, st in (("구 데몬(키 부재)", plain), ("신 데몬 무보류(null)", nulled)):
         need(BN.node_liveness(st, req[0])[0] == BN.LIVENESS_PRESUMED,
              "%s 에서 종전 등급이 변형됐다(혼재 안전 붕괴 — 부재 ≠ 부정)" % name)
-        vv, _ = O.check_verdicts(st)
+        vv, _ = O.check_verdicts(st, detect=D)
         need(vv[req[0]]["satisfied"] is True, "%s 에서 충족이 뒤집혔다(위경보)" % name)
-        need(B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0)[0] is False,
+        need(B._shared_verdict_deficit(st, requery=lambda st=st: st, tick_s=0,
+                                       detect=D)[0] is False,
              "%s 에서 결손이 발생했다(불필요 boot churn)" % name)
     notes.append("축②③④ 차분 0(관문=미충족∧결손>0 · 대조군 2종=충족∧결손0)")
 
@@ -4280,9 +4386,10 @@ def h_seat_4axis():
         need(BN.gate_pending_axis_enabled() is False, "킬스위치 '0' 이 축을 끄지 못한다")
         need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_PRESUMED,
              "킬스위치 off 인데 python 축이 살아 있다")
-        vv, _ = O.check_verdicts(gated)
+        vv, _ = O.check_verdicts(gated, detect=D)
         need(vv[req[0]]["satisfied"] is True, "킬스위치 off 인데 check 가 여전히 미충족")
-        need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)[0] is False,
+        need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0,
+                                       detect=D)[0] is False,
              "킬스위치 off 인데 결손이 남는다(롤백 1지점 계약 붕괴)")
     finally:
         if _prev is None:
@@ -4307,9 +4414,10 @@ def h_seat_4axis():
                  % (_label, _env, _on))
             need(BN.node_liveness(gated, req[0])[0] == BN.LIVENESS_PRESUMED,
                  "%s 스위치 off 인데 python 축이 살아 있다" % _label)
-            need(O.check_verdicts(gated)[0][req[0]]["satisfied"] is True,
+            need(O.check_verdicts(gated, detect=D)[0][req[0]]["satisfied"] is True,
                  "%s 스위치 off 인데 check 가 여전히 미충족" % _label)
-            need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0)[0] is False,
+            need(B._shared_verdict_deficit(gated, requery=lambda: gated, tick_s=0,
+                                           detect=D)[0] is False,
                  "%s 스위치 off 인데 결손이 남는다(불필요 boot churn)" % _label)
             for _l in _loose:
                 os.environ[_env] = _l
@@ -4953,11 +5061,26 @@ def h_pred_3():
               ("cso", "worker", "reviewer-gemini", "reviewer-codex")}
     need(all(g == BN.LIVENESS_PRESUMED for g in grades.values()),
          "데몬 재시작 fixture 에서 absent 오판: %r" % grades)
-    v, _ = O.check_verdicts(st)
+    # ★로스터 전제를 명시로 세운다(_roster_pin ⓐ): 이 fixture 의 좌석 이름은 네이티브 슬롯이라
+    #   의무 역할이 네이티브인 형상에서만 '같은 팀'이다. 종전에는 그 전제를 **기계가 대신** 세워
+    #   줬고(리뷰어 CLI 설치 여부), 깨끗한 기계에서는 다른 팀을 재면서 '역방향 회귀'라고 외쳤다.
+    DN = _roster_pin(True)
+    v, _ = O.check_verdicts(st, detect=DN)
     need(all(x["satisfied"] for x in v.values()),
          "래치 이전 기계의 건강한 팀이 check 적색(역방향 회귀): %r" % v)
-    need(B._shared_verdict_deficit(st)[0] is False, "래치 이전 기계에서 결손>0 오판")
-    notes.append("재시작·업그레이드 fixture: absent 오판 0 · check 적색 0")
+    need(B._shared_verdict_deficit(st, detect=DN)[0] is False, "래치 이전 기계에서 결손>0 오판")
+    # 대체 슬롯 기계(리뷰어 CLI 미설치)에서도 같은 계약이 성립한다 — 좌석 이름만 그 형상으로.
+    DS = _roster_pin(False)
+    sub_roles = ["cso", "worker"] + [e["role"] for e in O.reviewer_roster(DS)]
+    st_sub = _fx([{"role": r, "exited": False, "agent_alive": True} for r in sub_roles])
+    v_sub, _ = O.check_verdicts(st_sub, detect=DS)
+    need(all(x["grade"] == BN.LIVENESS_PRESUMED for x in v_sub.values()),
+         "대체 슬롯 기계의 래치 없는 팀에서 absent 오판: %r" % v_sub)
+    need(all(x["satisfied"] for x in v_sub.values()),
+         "대체 슬롯 기계의 건강한 팀이 check 적색(역방향 회귀): %r" % v_sub)
+    need(B._shared_verdict_deficit(st_sub, detect=DS)[0] is False,
+         "대체 슬롯 기계의 래치 이전 팀에서 결손>0 오판")
+    notes.append("재시작·업그레이드 fixture(로스터 2형상): absent 오판 0 · check 적색 0")
     # ⓓ **폴백 검체 보존**: 기존 균형 술어(agent_alive OR fresh set-status)가 살아 있다
     fresh = _fx([{"role": "cso", "exited": False, "status": {"age_secs": 5, "state": "working"}}])
     need(BN.awake_ready(fresh, "cso")[0] is True, "fresh set-status 폴백 검체 소실")
@@ -5020,12 +5143,18 @@ def h_pred_4():
     s, f, n, _ = O.slot_satisfied("reviewer-gemini", both)
     need((s, f, n) == (True, "reviewer-gemini", True), "이중충전에서 네이티브 우선 실패: %r" % ((s, f, n),))
     # check 가 대체 좌석으로 슬롯을 재해소하고 실충전자를 남긴다(영구 적색 차단)
+    # ★이 단언은 '의무 역할 = 네이티브 슬롯인데 좌석은 대체가 채웠다'는 **2차 폴백 상황**이
+    #   재현돼야 성립한다. 그 전제(네이티브 로스터)를 주입으로 세운다 — 종전에는 기계에 리뷰어
+    #   CLI 가 깔려 있어야만 우연히 성립했고, 깨끗한 기계에서는 없는 키를 색인해 크래시했다.
+    DN = _roster_pin(True)
     st = _fx(_SEAT_CORPUS["substitute_filled"])
-    v, _ = O.check_verdicts(st)
-    need(v["reviewer-codex"]["satisfied"] is True, "대체 좌석 재해소 실패(B2 영구 적색)")
-    need(v["reviewer-codex"]["native"] is False, "실충전자 라벨(native=False) 누락")
-    need(v["reviewer-codex"]["filler"] == "reviewer-claude-2", "실충전자 이름 오류")
-    need(B._shared_verdict_deficit(st)[0] is False, "대체 충전 팀에서 결손>0(재선언 불회복)")
+    v, _ = O.check_verdicts(st, detect=DN)
+    vc = _vd(v, "reviewer-codex", "B2 대체 충전")
+    need(vc["satisfied"] is True, "대체 좌석 재해소 실패(B2 영구 적색)")
+    need(vc["native"] is False, "실충전자 라벨(native=False) 누락")
+    need(vc["filler"] == "reviewer-claude-2", "실충전자 이름 오류")
+    need(B._shared_verdict_deficit(st, detect=DN)[0] is False,
+         "대체 충전 팀에서 결손>0(재선언 불회복)")
     # boot-reviewers 가 실충전자를 고지한다(은닉 성공 금지)
     osrc = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
     need("슬롯 %s 는 대체 좌석" in osrc, "boot-reviewers 실충전자 고지가 없다")
@@ -5180,9 +5309,11 @@ def h_pred_7():
     # ④ 결손 구성 3자 대조 — Degrade 만 부재면 결손>0 이지만 처방은 boot-reviewers 다
     st = _fx([{"role": "cso", "exited": False, "awakened_at": 1.0},
               {"role": "worker", "exited": False, "awakened_at": 1.0}])
-    has, why = B._shared_verdict_deficit(st)
+    # ★로스터 밀폐: '리뷰어 전원 부재' 라는 전제는 어느 슬롯 형상인지를 못박아야 재현된다.
+    D7 = _roster_pin(True)
+    has, why = B._shared_verdict_deficit(st, detect=D7)
     need(has is True, "리뷰어 전원 부재인데 결손 0")
-    v, _ = O.check_verdicts(st)
+    v, _ = O.check_verdicts(st, detect=D7)
     missing = [r for r, x in v.items() if not x["satisfied"]]
     need(missing and all(O.plan_policy(m) == O.FAIL_DEGRADE for m in missing),
          "부재 역할의 정책이 Degrade 가 아니다: %r" % [(m, O.plan_policy(m)) for m in missing])
