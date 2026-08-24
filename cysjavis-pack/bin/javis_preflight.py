@@ -828,14 +828,31 @@ def resolve_registration_targets():
 
 
 # ── settings.json read-modify-write 의 단일 소유자 (G16 · W3) ────────────────────
-# ★결함(G16): settings.json 은 **3-writer 대상**이다 — python preflight(C08/C27/C28/C32/C33/C41) ·
-#   Rust 시드/init-pack · 부서 마이그레이션. 그런데 preflight 의 네 등록기가 각자
+# ★실측 정정(N13 · 2026-08-24): 이 자리는 "settings.json 은 **3-writer 대상**" 이라고 단언하고
+#   있었다. 그 수는 틀렸다 — 전수로 세면 **5-writer** 다. 거짓 단언을 남기는 것이 가장 싸고
+#   가장 나쁘므로 세어서 적는다(경로·락 여부는 검증 가능해야 하니 `파일:라인`으로 남긴다):
+#     ① cysjavis-pack/bin/javis_preflight.py:_settings_rmw  — 락 O(`<settings>.cys-lock`)
+#        · 등록기 4종(_register_hook/_register_statusline/_register_event_hook/
+#          _register_appbuild_hook = C08/C27/C28/C32/C33/C41)이 전부 이 하나를 경유한다.
+#     ② cysjavis-pack/bin/javis_guard_register.py:_atomic_write(호출 `:502`·`:535`)
+#        — 락 X · mkstemp+replace O(교차 파손은 없고 lost-update 만 남는다)
+#     ③ cysjavis-pack/bin/javis_dept_migrate.py:_register_hook(부서 account settings 백필)
+#        — 락 X · **고정 `.tmp`**(아래가 preflight 에서 걷어낸 바로 그 교차 파손 형태가 그대로 있다)
+#     ④ src/pack.rs:merge_desired_hooks(Rust 시드·init-pack)                — 락 X · write_atomic O
+#     ⑤ src/factory_reset.rs:strip_settings_matching(외과 제거·부서 해제)   — 락 X · write_atomic O
+#   즉 **락으로 직렬화되는 writer 는 5 중 1**이고, 나머지 넷은 원자 교체까지만 한다.
+#   ★남은 위험을 정직하게: 원자 교체는 반쪽 JSON 을 막을 뿐 **lost update** 를 막지 못한다
+#     (동시 RMW 두 벌 중 뒤에 쓰는 쪽이 앞의 등록을 통째로 덮는다). 그 창을 닫으려면 락을
+#     5 writer 전원이 공유해야 하고, Windows 에는 `LockFileEx` 승격이 필요하다 — 반경이 커서
+#     이번 태그에 넣지 않는다(릴리스 노트 항목). 여기서 하는 일은 **수를 사실로 되돌리는 것**뿐이다.
+# ★결함(G16): 그런데 preflight 의 네 등록기가 각자
 #   `open(path + ".tmp")` → `os.replace` 를 재구현했고 tmp 이름이 **고정**이었다: 동시 writer 가
 #   서로의 임시 파일에 써서 **교차 파손**(반쪽 JSON)을 만들고, 그러면 그 뒤 모든 등록기가
 #   "파싱 실패 — 덮어쓰기 거부"로 수리를 영구 포기한다(A8 재검증이 지목한 지배 실패 모드).
 #   Rust 측 원자화는 W2(A8rs)에서 착지했고, python 측 락·mkstemp 유틸은 W1a(javis_lock)에서
 #   신설됐다 — W3 은 그 유틸의 **소비 이관**이다(신설 1회 + 소비 이관 = 원자 단위·비평1 #19).
-# 계약: ①레인 무관 **파일별 락**(`<settings>.cys-lock`)으로 3-writer 직렬화 ②symlink 거부
+# 계약: ①레인 무관 **파일별 락**(`<settings>.cys-lock`) — 이 락을 잡는 writer 끼리만 직렬화된다
+#   (위 실측표의 ①뿐이고 ②~⑤는 아직 이 락을 잡지 않는다) ②symlink 거부
 #   ③파싱 실패 = 거부(빈 dict 로 대체 금지) ④최초 1회 백업 보존 ⑤mkstemp+replace 원자 교체.
 #   락 사용 불가(백엔드 부재)여도 **쓰기는 진행**한다 — 직렬화 상실은 열화이고, 등록 자체를
 #   포기하면 훅이 사라진다(가용성 우선·조용하지 않게 사유를 반환값에 싣지 않고 stderr 로 남긴다).

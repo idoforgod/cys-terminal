@@ -792,6 +792,10 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
         mut notes,
         source,
     } = resolve_raw(envelope, override_on);
+    // ★해소 **직후**에 Fatal 바닥을 세운다(아래 [`restore_fatal_builtin_floor`]). 아래
+    //   [`enforce_absence_cost`] 는 '집행 전후 대조' 라 replace 모드에서는 눈이 멀어 있다 —
+    //   그 모드의 `pre` 는 사용자 목록이라 빌트인 Fatal 관문이 **순회 대상에 애초에 없다**.
+    let gates = restore_fatal_builtin_floor(gates, &mut notes);
     // ★집행 전 코퍼스를 남긴다 — 아래 [`enforce_absence_cost`] 가 "집행이 부재의 비용을
     //   넘지 않았는가" 를 **대조로** 판정하려면 전후 두 벌이 있어야 한다.
     let pre = gates.clone();
@@ -804,6 +808,51 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
         notes,
         source,
     }
+}
+
+/// ★Fatal 바닥 — [`AbsenceCost::Fatal`] 인 빌트인 관문은 **어떤 해소 모드에서도** 코퍼스에서
+/// 사라지지 않는다(N1 · 2026-08-24).
+///
+/// 【무엇이 틀렸었는가】 [`enforce_absence_cost`] 는 "집행이 관문을 없앴는가"를 **집행 전후
+/// 대조**로 본다. 그래서 `source=replace` 에는 눈이 멀어 있었다 — 그 모드의 해소 산출은
+/// 사용자 목록이고, 빌트인 Fatal 관문은 대조의 `pre` 에 **애초에 없어서** 되살리는 코드가
+/// 한 줄도 실행되지 않았다. `{"first_run_gates":{"source":"replace","gates":[…1건…]}}`
+/// 한 줄이면 킬체인 관문 5종이 통째로 사라지고, 그중 면책 창의 부재는 **주입 Return 한 발이
+/// rc 1**(좌석 사망)이다. 발동에 사용자 명시 선언이 필요하다는 사실은 **비용을 낮추지 않는다**.
+///
+/// 【왜 '바닥'인가 — 사용자 주권과 충돌하지 않는다】 이 게이트는 사용자 선언을 **지우거나
+/// 덮지 않는다**. 선언은 그대로 살고, 선언에 없는 Fatal 빌트인만 뒤에 덧붙는다(추가만).
+/// 관문이 하나 더 있어서 생기는 최악은 '그 화면에서 한 번 더 보류' 이고, 없어서 생기는
+/// 최악은 '좌석이 rc 1 로 죽는다' 다 — 비대칭이 방향을 정한다.
+///
+/// 【id 를 가로챈 선언】 사용자가 Fatal 빌트인과 **같은 id** 를 선언했으면 그 선언이 코퍼스에
+/// 남되, 부재의 비용만 실측값(`Fatal`)으로 되돌린다. 부재의 귀결은 선언이 아니라 측정이며,
+/// merge 경로의 [`apply_patch`] 가 이미 같은 완화를 거부한다(두 경로의 대칭).
+fn restore_fatal_builtin_floor(mut gates: Vec<Gate>, notes: &mut Vec<String>) -> Vec<Gate> {
+    for b in builtin().into_iter().filter(|b| b.absence_is_fatal()) {
+        match gates.iter_mut().find(|g| g.id == b.id) {
+            Some(g) => {
+                if g.absence_cost != AbsenceCost::Fatal {
+                    notes.push(format!(
+                        "{}: 선언이 부재의 비용을 낮췄다 — 실측값(fatal)으로 되돌린다(부재의 \
+                         귀결은 선언이 아니라 측정이다)",
+                        g.id
+                    ));
+                    g.absence_cost = AbsenceCost::Fatal;
+                }
+            }
+            None => {
+                notes.push(format!(
+                    "{}: ★해소본에 **부재의 비용이 비가역인** 빌트인 관문이 없다 — 코드 정본을 \
+                     강제 **복원**했다(선언은 그대로 두고 덧붙이기만 한다). 이 관문의 부재는 \
+                     좌석 rc 1 종료·허위 READY 영구화·관측 전제 파괴 중 하나로 귀결한다",
+                    b.id
+                ));
+                gates.push(b);
+            }
+        }
+    }
+    gates
 }
 
 /// ★자기규칙 집행 — 위반 관문은 **버리고** `notes` 에 사유를 남긴다(P4-3 · 2026-08-24).
@@ -1843,13 +1892,29 @@ mod tests {
 
         // ── 집행 후: 그대로 살아 있다.
         let r = resolve_with(Some(&env), true);
+        // ★N1 정정 — 정본은 "선언 1건 + Fatal 바닥"이다. 종전 이 자리의 `len()==1` 은
+        //   "replace 한 줄이 킬체인 관문 5종을 없애는 것이 정상"을 박제하고 있었다.
+        //   주권 침해와 Fatal 바닥을 가르는 **판별자**는 개수가 아니라 `theme` 다:
+        //   종전 실패 모드(폴백이 벤더 6종을 다시 세움)에서는 가역 관문인 `theme` 까지
+        //   되살아났고, 바닥은 그것을 절대 되살리지 않는다.
+        let fatal = fatal_builtin_ids();
         assert_eq!(
             r.gates.len(),
-            1,
-            "디스크 선언이 코드 정본에 덮였다(사용자 주권 침해) — notes: {:?}",
+            1 + fatal.len(),
+            "디스크 선언이 코드 정본에 덮였거나 Fatal 바닥이 사라졌다 — notes: {:?}",
             r.notes
         );
-        assert_eq!(r.gates[0].id, "mine");
+        assert!(
+            !r.gates.iter().any(|g| g.id == "theme"),
+            "가역 관문까지 되살아났다 = 코드 정본 폴백(사용자 주권 침해)의 형태다"
+        );
+        for id in &fatal {
+            assert!(
+                r.gates.iter().any(|g| &g.id == id),
+                "Fatal 관문 {id} 이 replace 선언 한 줄로 사라졌다"
+            );
+        }
+        assert_eq!(r.gates[0].id, "mine", "사용자 선언이 첫 자리에서 밀려났다");
         assert_eq!(r.gates[0].needles, vec!["Proceed with the migration?".to_string()]);
         assert!(matches!(r.source, Source::Replaced { count: 1 }));
         // 유지의 사유는 남는다(조용한 통과가 아니다).
@@ -2410,17 +2475,48 @@ mod tests {
         ));
     }
 
+    /// 빌트인 중 **부재의 비용이 비가역**인 관문 id — 코드 정본에서 파생한다(손으로 세지 않는다).
+    fn fatal_builtin_ids() -> Vec<String> {
+        builtin()
+            .into_iter()
+            .filter(|g| g.absence_is_fatal())
+            .map(|g| g.id)
+            .collect()
+    }
+
+    /// ★정본 = "선언 1건 + **강제 복원된 Fatal 빌트인 5종**"(N1 정정 · 2026-08-24).
+    ///
+    /// 【무엇을 고쳐놓았는가】 종전 이 검체는 `assert_eq!(r.gates.len(), 1)` 로
+    /// **선언 1건이 곧 코퍼스 전량**임을 박제했다. 그것은 완화가 아니라 **구멍을 초록으로
+    /// 고정한 것**이었다 — `source=replace` 한 줄이 Fatal 빌트인을 통째로 없앴고,
+    /// 그중 면책 창의 부재는 **주입 Return 한 발 = rc 1 좌석 사망**이다(모듈 doc 비용표).
+    /// 지금은 그 5종이 살아남는 것이 정본이고, 사용자 선언은 **그대로 함께** 산다(주권 침해 0).
     #[test]
     fn replace_mode_takes_the_declared_corpus_but_never_an_empty_one() {
-        // ★(P4-3) 선언에 위젯 AND 가드가 있어야 자기규칙 집행을 통과한다 — 아래 두 번째
-        //   블록이 "가드가 없으면 버려진다"를 같은 자리에서 대조한다.
+        // ★(P4-10) 자기규칙 위반 선언(위젯 AND 가드 0)이라도 사용자 선언은 살아남는다 —
+        //   아래 두 번째 블록이 그 유지를 같은 자리에서 대조한다.
+        let fatal = fatal_builtin_ids();
         let env = json!({"source": "replace", "gates": [
             {"id": "only", "needles": ["Do you want to continue?"],
              "widget": ["Enter to confirm"]}
         ]});
         let r = resolve_with(Some(&env), true);
+        // 출처 회계는 **선언 수**를 말한다(복원된 바닥은 사용자 선언이 아니다).
         assert!(matches!(r.source, Source::Replaced { count: 1 }));
-        assert_eq!(r.gates.len(), 1);
+        assert_eq!(
+            r.gates.len(),
+            1 + fatal.len(),
+            "정본은 '선언 1건 + 복원된 Fatal {}종' 이다: {:?}",
+            fatal.len(),
+            r.gates.iter().map(|g| g.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(r.gates.iter().any(|g| g.id == "only"), "사용자 선언이 사라졌다");
+        for id in &fatal {
+            assert!(
+                r.gates.iter().any(|g| &g.id == id),
+                "replace 선언 한 줄이 Fatal 관문 {id} 을 없앴다(면책 창 상실 = Return 한 발 rc 1)"
+            );
+        }
 
         // ★P4-10 정정 — 자기규칙 위반 선언(위젯 AND 가드 0)이라도 **사용자 선언은 살아남는다**.
         //   종전 판은 이것을 버리고 "비면 정본으로 되돌린다" 폴백으로 벤더 6종을 세웠다. 그것이
@@ -2430,8 +2526,13 @@ mod tests {
             {"id": "only", "needles": ["Do you want to continue?"]}
         ]});
         let r = resolve_with(Some(&nowidget), true);
-        assert_eq!(r.gates.len(), 1, "사용자 선언이 코드 정본에 덮였다(사용자 주권 침해)");
-        assert_eq!(r.gates[0].id, "only");
+        assert_eq!(
+            r.gates.len(),
+            1 + fatal.len(),
+            "사용자 선언이 덮였거나 Fatal 바닥이 사라졌다: {:?}",
+            r.gates.iter().map(|g| g.id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(r.gates[0].id, "only", "사용자 선언이 코드 정본에 덮였다(사용자 주권 침해)");
         assert!(
             r.notes.iter().any(|n| n.contains("유지") && n.contains("only")),
             "유지 사유가 조용하다: {:?}",
@@ -2447,6 +2548,82 @@ mod tests {
         let r = resolve_with(Some(&blind), true);
         assert_eq!(r.gates.len(), 6, "빈 코퍼스를 그대로 받으면 허위 ready 가 열린다");
         assert!(r.notes.iter().any(|n| n.contains("맹목")));
+    }
+
+    /// ★N1 — `source=replace` 는 **Fatal 관문을 없앨 권한이 없다**(강제 복원 바닥).
+    ///
+    /// 【종전 배선의 실체】 [`enforce_absence_cost`] 는 `pre`(해소 직후 코퍼스)와 `kept` 를
+    /// 대조하는데, replace 모드에서 `pre` 는 **사용자 목록**이라 빌트인 Fatal 관문이 순회
+    /// 대상에 **애초에 없었다** — 되살리는 코드가 한 줄도 실행되지 않았다. 발동 조건이
+    /// "사용자가 `source=replace` 를 명시 선언"이라 기본 경로는 아니지만, 귀결은 면책 창
+    /// 보호 상실 = **주입 Return 한 발이 rc 1**(좌석 사망)이라 재난 ④ 축이다.
+    #[test]
+    fn replace_mode_cannot_drop_a_fatal_builtin_gate() {
+        let canon = builtin();
+        let fatal = fatal_builtin_ids();
+        assert!(
+            fatal.len() >= 5,
+            "Fatal 관문이 5종 미만 — 비용표가 바뀌었다면 이 검체부터 다시 세워라: {fatal:?}"
+        );
+
+        let env = json!({"source": "replace", "gates": [
+            {"id": "only", "needles": ["Do you want to continue?"],
+             "widget": ["Enter to confirm"]}
+        ]});
+        let r = resolve_with(Some(&env), true);
+        for id in &fatal {
+            let g = r
+                .gates
+                .iter()
+                .find(|g| &g.id == id)
+                .unwrap_or_else(|| panic!("Fatal 관문 {id} 이 replace 선언 한 줄로 사라졌다"));
+            let b = canon.iter().find(|b| &b.id == id).expect("코드 정본");
+            assert_eq!(g, b, "{id}: 복원본이 코드 정본과 다르다(반쪽 복원은 복원이 아니다)");
+        }
+        // 면책 창은 이 코퍼스에서 **부재가 가장 비싼** 관문이다 — 실측 사실이 그대로 살아야 한다.
+        let disc = r
+            .gates
+            .iter()
+            .find(|g| g.id == "bypass-disclaimer")
+            .expect("면책 관문");
+        assert_eq!(disc.absence_cost, AbsenceCost::Fatal);
+        assert_eq!(
+            disc.default_index,
+            Some(1),
+            "기본 포커스가 `No, exit` 라는 실측이 소실됐다"
+        );
+        assert_eq!(disc.action.as_ref().map(|a| a.select_index), Some(2));
+        // 복원은 조용하지 않다 — 집행이 사용자 코퍼스를 바꿨다는 사실은 반드시 남는다.
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("bypass-disclaimer") && n.contains("복원")),
+            "복원이 조용하다: {:?}",
+            r.notes
+        );
+        // 사용자 선언도 함께 산다(복원이 주권 침해로 뒤집히지 않는다).
+        assert!(r.gates.iter().any(|g| g.id == "only"));
+
+        // ★선언이 Fatal 빌트인의 id 를 **가로채도** 부재의 비용은 실측 사실이라 낮아지지 않는다
+        //   (merge 경로의 `apply_patch` 가 이미 같은 완화를 거부한다 — 두 경로의 대칭).
+        let hijack = json!({"source": "replace", "gates": [
+            {"id": "bypass-disclaimer", "needles": ["Do you want to continue?"],
+             "widget": ["Enter to confirm"], "absence_cost": "recoverable"}
+        ]});
+        let r = resolve_with(Some(&hijack), true);
+        let g = r
+            .gates
+            .iter()
+            .find(|g| g.id == "bypass-disclaimer")
+            .expect("면책 관문");
+        assert_eq!(
+            g.absence_cost,
+            AbsenceCost::Fatal,
+            "봉투 한 줄로 킬체인 관문의 부재 비용이 낮아졌다(replace 가 merge 보다 헐거워졌다)"
+        );
+        for id in fatal.iter().filter(|i| i.as_str() != "bypass-disclaimer") {
+            assert!(r.gates.iter().any(|g| &g.id == id), "{id} 소실");
+        }
     }
 
     #[test]

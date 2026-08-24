@@ -261,6 +261,11 @@ if [ "$CYS_HOOK_GATE" = "suppress" ]; then
 fi
 
 # ── 종전 게이트(폴백 전용) — 위임이 성립하지 않았을 때만 돈다. 내용은 U-22 이전과 동일하다. ──
+# ★U-29(M-01 · 2026-08-24): 판정 불가의 **귀결**은 종전과 한 글자도 다르지 않다(무발화·exit 0).
+#   바뀌는 것은 그 사실을 **아무에게도 말하지 않던 것**뿐이다 — 아래 UNJUDGED 변수만 세우고,
+#   통보는 프롬프트를 읽은 뒤(선언 가능성 판별 후)로 미룬다. 여기서 바로 인쇄하지 않는 이유는
+#   그 지점에 아직 stdin(프롬프트)이 없어서 **모든 프롬프트에 말하게 되기 때문**이다(폭주).
+CYS_UNJUDGED_RC=""
 if [ "$CYS_HOOK_GATE" = "legacy" ]; then
 CYS_ROLE_GATE_TIMEOUT_S=2
 if command -v cys >/dev/null 2>&1; then
@@ -275,8 +280,8 @@ if [ "$ROLE_RC" -ne 0 ]; then
   # cannot-judge: 데몬 미응답(124=데드라인 초과)·cys 부재(127) 등. 발화하지 않는다 —
   # 남의 pane에서 마스터 부트를 터뜨리는 것이 판정 보류보다 나쁘다(fail-closed).
   echo "[cys-hook] role-bootstrap: surface-role 판정 불가(rc=$ROLE_RC) — 무발화(fail-closed)" >&2
-  exit 0
-fi
+  CYS_UNJUDGED_RC="$ROLE_RC"
+else
 MYROLE="$(printf '%s' "$MYROLE_RAW" | head -1 | tr -d '[:space:]')"
 case "$MYROLE" in
   master|"") : ;;   # 발화 허용: master 좌석 또는 미claim(빈) 좌석만
@@ -284,6 +289,7 @@ case "$MYROLE" in
     echo "[cys-hook] role-bootstrap: 비-master role($MYROLE) — 마스터 부트 발화 금지(allowlist)" >&2
     exit 0 ;;
 esac
+fi
 fi
 
 # ── ★훅 stdin 읽기 데드라인(결함 7 · 2026-08-24 이종 리뷰어) ────────────────────────────
@@ -391,6 +397,80 @@ _notify_bg() {   # 승인 채널 best-effort(백그라운드·graceful — 훅�
     sleep 0.05 2>/dev/null || { sleep 1; break; }   # 소수 sleep 미지원 셸은 1s 단창 후 포기(부트 생존확인 폴백과 같은 관례)
   done
 }
+
+# ── ★U-29(M-01) 통보 래치 — "말하되, 한 번만 말한다" ───────────────────────────────────
+# 【무엇이 결함이었나】 `cys` 실행파일이 PATH 에서 사라지면(Windows Defender 가 cys.exe 를
+#  격리했거나 · 데몬의 pane PATH 주입이 끊겼거나 · 데몬이 2초 안에 응답 못해 rc 124) 이 훅은
+#  **stdout 0바이트로 종료**했다(2026-08-24 격리 실주행 실측: 기준선 v0.14.24 와 현행이 바이트
+#  단위로 동일). 사용자가 보는 것은 "너는 마스터다 를 쳤는데 pane 0개 · 모델은 평범한 답변" 이고,
+#  실패 사유가 모델 컨텍스트에도·승인 Feed 에도·화면에도 남지 않는다 — '무시당했다' 로만 보인다.
+#  같은 클래스의 python 부재(A22)·감지기 부재는 이미 사유를 말해 주는데, 이 경로만 침묵했다.
+# 【무엇을 바꾸지 않는가】 발화 여부는 한 글자도 바뀌지 않는다(fail-closed 무발화 유지 · exit 0
+#  유지 · 사용자의 프롬프트를 막지 않는다). 판정 축이 아니라 **보고 축**이므로 마스터 스위치
+#  (`CYS_BOOT_GATES=0`)에 접지 않는다 — 게이트를 끄는 사람이 의도하지 않은 침묵을 함께 겪으면
+#  안 된다(선례: javis_bootstrap.py `CYS_BOOT_LANE_LEGACY` 주석).
+# 【폭주 금지】 통보가 매 프롬프트마다 반복되면 그것대로 재난이다. 유계성은 2중이다 —
+#   ⓐ `_maybe_declaration` : 마스터 토큰이 없는 평문 프롬프트에는 애초에 말하지 않는다(judged-no).
+#   ⓑ 이 래치           : 말한 시각을 상태파일에 적고 창 안에서는 다시 말하지 않는다.
+#  래치는 창당 **최대 1회**이고, 시각을 못 구하는 셸(`date +%s` 부재)에서는 **통틀어 1회**로
+#  더 보수적으로 강등된다(창 계산 불가를 '창 없음'으로 접지 않는다).
+#  ★기록 실패는 침묵으로 접지 않는다 — 상태 dir 이 못 쓰이면 TMPDIR 로 한 번 더 시도하고, 둘 다
+#  실패하면 **말하되 그 사실을 stderr 로 고지**한다(유계성 상실을 조용히 넘기지 않는다).
+CYS_UNJUDGED_NOTICE_COOLDOWN_S=3600
+_cys_notice_latch_ok() {   # $1=래치 키 · 반환 0=지금 말해도 된다 / 1=창 안이라 억제
+  _CN_NOW=""
+  command -v date >/dev/null 2>&1 && _CN_NOW="$(date +%s 2>/dev/null | head -1 | tr -d '[:space:]')"
+  case "$_CN_NOW" in ''|*[!0-9]*) _CN_NOW="" ;; esac
+  _CN_F=""
+  for _CN_D in "${CYS_STATE_DIR:-}" "${TMPDIR:-/tmp}"; do
+    [ -n "$_CN_D" ] || continue
+    mkdir -p "$_CN_D" 2>/dev/null
+    [ -d "$_CN_D" ] && [ -w "$_CN_D" ] || continue
+    _CN_F="$_CN_D/cys-hook-notice-$1"
+    break
+  done
+  if [ -n "$_CN_F" ] && [ -f "$_CN_F" ]; then
+    _CN_PREV="$(head -1 "$_CN_F" 2>/dev/null | tr -d '[:space:]')"
+    case "$_CN_PREV" in ''|*[!0-9]*) _CN_PREV="" ;; esac
+    if [ -z "$_CN_NOW" ]; then
+      return 1   # 시각 미해소 = 창 계산 불가 → 존재 래치로 강등(통틀어 1회)
+    fi
+    if [ -n "$_CN_PREV" ]; then
+      _CN_AGE=$((_CN_NOW - _CN_PREV))
+      if [ "$_CN_AGE" -ge 0 ] && [ "$_CN_AGE" -lt "$CYS_UNJUDGED_NOTICE_COOLDOWN_S" ]; then
+        return 1
+      fi
+    fi
+  fi
+  if [ -z "$_CN_F" ] || ! printf '%s\n' "${_CN_NOW:-0}" > "$_CN_F" 2>/dev/null; then
+    echo "[cys-hook] role-bootstrap: 통보 래치를 기록할 수 없다(상태 dir·TMPDIR 모두 불가) — 이번 통보는 나가지만 반복 억제를 보장하지 못한다" >&2
+  fi
+  return 0
+}
+
+# ── ★U-29(M-01): 미뤄 둔 '판정 불가'를 모델 컨텍스트로 낸다(침묵 → 통보) ─────────────────
+# 문안 규율: `_static_ctx` 는 셸 printf 라 JSON 특수문자(`"` `\` 개행)를 실을 수 없다 —
+#   Windows 경로도 역슬래시 없이 적는다(사용자가 읽고 따라갈 수 있으면 충분하다).
+# 조치 문안의 출처는 추정이 아니라 이미 배포된 실측 절차다:
+#   docs/RELEASE_NOTES_0.14.21.md:127-135(상설 섹션) · docs/WDSI_SUBMISSION.md:42-47(실측 명령).
+#   **제외 먼저 → 그 다음 복원** 순서가 생명이다(순서를 바꾸면 실시간 보호가 즉시 재격리한다).
+if [ -n "$CYS_UNJUDGED_RC" ]; then
+  case "$CYS_UNJUDGED_RC" in
+    127) CYS_UNJUDGED_WHY="cys 실행파일이 PATH에서 해소되지 않는다(rc=127)" ;;
+    124) CYS_UNJUDGED_WHY="cys 데몬이 게이트 데드라인(${CYS_ROLE_GATE_TIMEOUT_S:-2}초) 안에 응답하지 않았다(rc=124)" ;;
+    *)   CYS_UNJUDGED_WHY="좌석 역할 조회가 실패했다(rc=$CYS_UNJUDGED_RC)" ;;
+  esac
+  if ! _maybe_declaration; then
+    echo "[cys-hook] role-bootstrap: 판정 불가($CYS_UNJUDGED_WHY) — 선언 토큰 없어 침묵 종료(judged-no)" >&2
+  elif _cys_notice_latch_ok "surface-role-unjudged"; then
+    MSG="$CYS_UNJUDGED_WHY. 좌석 역할을 판정할 수 없어 마스터 부트를 발화하지 않았습니다(팀 미기동). 가장 흔한 원인은 Windows Defender의 cys.exe 격리입니다 - 복구는 순서가 생명입니다: 먼저 제외 항목에 LOCALAPPDATA 아래 cys 폴더를 등록하고, 그 다음 보호 기록에서 격리된 cys.exe를 복원하세요."
+    _notify_bg "부트스트랩 판정 불가(좌석 역할 조회 실패)" "$MSG"
+    _static_ctx "[결정론 부트스트랩 판정 불가 - 좌석 역할 조회 실패] $CYS_UNJUDGED_WHY. 이것은 선언 아님이 아니라 판정 불가다 - 팀은 뜨지 않았다. 부트가 시작됐다고 보고하지 마라. 조치: (1) 가장 흔한 원인은 Windows Defender가 cys.exe를 격리한 것이다. 복구는 순서가 생명이다 - 먼저 Windows 보안 > 바이러스 및 위협 방지 > 설정 관리 > 제외 항목 추가로 LOCALAPPDATA 아래 cys 폴더를 등록하고, 그 다음 보호 기록에서 격리된 cys.exe를 복원하라(순서를 바꾸면 실시간 보호가 복원 직후 다시 격리한다). (2) 격리가 아니라면 cys가 PATH에 있는지(command -v cys) 확인하고, 있다면 데몬 응답 상태(cys status)를 확인한 뒤 다시 선언하라. 승인 Feed에도 알림을 시도했다. 이 안내는 반복 폭주를 막기 위해 시간당 1회만 나온다."
+  else
+    echo "[cys-hook] role-bootstrap: 판정 불가($CYS_UNJUDGED_WHY) — 통보 래치 창 안이라 억제(무발화는 종전과 동일)" >&2
+  fi
+  exit 0
+fi
 
 # ── A22: 인터프리터 미해소(python 전무) — cannot-judge 를 시끄럽게 ──
 # 종전엔 `[ -n "$CYS_PY" ] || CYS_PY=python3` 로 채워, 존재하지 않는 인터프리터를 향해

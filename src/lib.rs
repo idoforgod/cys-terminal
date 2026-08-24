@@ -3581,39 +3581,88 @@ mod spawn_policy_tests {
         assert!(sc.contains("fn launch_via_cli"), "schedule.rs 프로덕션 앵커 소실");
     }
 
-    /// 스폰 규약 스캔 대상 = **CLI·데몬 프로덕션 전량**.
+    /// 스폰 규약 스캔 대상 = **`src/**/*.rs` 전량**(테스트 시점 수집 · 화이트리스트 폐기).
     ///
-    /// ★(U-7 결손 · 2026-08-24) 종전엔 6파일 화이트리스트였다. 그래서 `state.rs` 의
-    /// **두 번째 정의처**(`HideConsole::hide_console` = `creation_flags` 직접 호출)와 그
-    /// 호출부 `usage.rs` 가 통째로 핀 **밖**에 있었고, U-7 이 주장한 "단일 정의처"는
-    /// 검체로는 거짓이었다. 목록을 좁게 유지하면 **다음 결손도 같은 방식으로 목록 밖에**
-    /// 생긴다 — 스캔 비용이 0 이므로 전량으로 잠근다(화이트리스트 관리 자체가 결함원이다).
-    const SPAWN_SCAN: &[(&str, &str)] = &[
-        ("src/bin/cys.rs", include_str!("bin/cys.rs")),
-        ("src/bin/cysd/accounts.rs", include_str!("bin/cysd/accounts.rs")),
-        ("src/bin/cysd/alerts.rs", include_str!("bin/cysd/alerts.rs")),
-        ("src/bin/cysd/analytics.rs", include_str!("bin/cysd/analytics.rs")),
-        ("src/bin/cysd/approval.rs", include_str!("bin/cysd/approval.rs")),
-        ("src/bin/cysd/approval_risk.rs", include_str!("bin/cysd/approval_risk.rs")),
-        ("src/bin/cysd/caps.rs", include_str!("bin/cysd/caps.rs")),
-        ("src/bin/cysd/channels.rs", include_str!("bin/cysd/channels.rs")),
-        ("src/bin/cysd/classifier.rs", include_str!("bin/cysd/classifier.rs")),
-        ("src/bin/cysd/cost.rs", include_str!("bin/cysd/cost.rs")),
-        ("src/bin/cysd/deadman.rs", include_str!("bin/cysd/deadman.rs")),
-        ("src/bin/cysd/delivery.rs", include_str!("bin/cysd/delivery.rs")),
-        ("src/bin/cysd/events.rs", include_str!("bin/cysd/events.rs")),
-        ("src/bin/cysd/governance.rs", include_str!("bin/cysd/governance.rs")),
-        ("src/bin/cysd/handlers.rs", include_str!("bin/cysd/handlers.rs")),
-        ("src/bin/cysd/hwmon.rs", include_str!("bin/cysd/hwmon.rs")),
-        ("src/bin/cysd/main.rs", include_str!("bin/cysd/main.rs")),
-        ("src/bin/cysd/recall.rs", include_str!("bin/cysd/recall.rs")),
-        ("src/bin/cysd/schedule.rs", include_str!("bin/cysd/schedule.rs")),
-        ("src/bin/cysd/severity.rs", include_str!("bin/cysd/severity.rs")),
-        ("src/bin/cysd/skillrun.rs", include_str!("bin/cysd/skillrun.rs")),
-        ("src/bin/cysd/state.rs", include_str!("bin/cysd/state.rs")),
-        ("src/bin/cysd/undo.rs", include_str!("bin/cysd/undo.rs")),
-        ("src/bin/cysd/usage.rs", include_str!("bin/cysd/usage.rs")),
-    ];
+    /// ★(N4 · 2026-08-24) 종전엔 24파일 목록이었는데 바로 이 자리의 주석은 "스캔 비용이 0
+    /// 이므로 **전량으로 잠근다**(화이트리스트 관리 자체가 결함원이다)" 라고 적고 있었다 —
+    /// **주석과 코드가 어긋나 있었고**, 그 진단이 옳았음을 트리의 실물이 증명했다:
+    /// `src/factory_reset.rs` 의 창 은폐 헬퍼가 프로덕션이면서 목록 **밖**이라, U-7 이 주장한
+    /// "단일 정의처" 는 그 파일에 대해 검체로 거짓이었다(N4 가 그것을 등급 위임으로 편입했다).
+    /// 목록을 없애면 **다음 결손이 목록 밖에 생길 자리**도 없다.
+    ///
+    /// 수집이 `include_str!` 이 아니라 파일시스템 순회인 이유: `include_str!` 은 경로를
+    /// 리터럴로 요구하므로 어떤 형태로든 손으로 관리하는 목록이 남는다(= 같은 결함원).
+    /// 수집기가 눈이 머는 경로는 [`spawn_scan_collects_the_whole_src_tree`] 가 막는다.
+    fn spawn_scan_files() -> Vec<(String, String)> {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![std::path::Path::new(manifest).join("src")];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("스캔 대상 디렉터리를 읽지 못했다 {}: {e}", dir.display())
+            });
+            for entry in entries {
+                let path = entry.expect("디렉터리 항목 읽기 실패").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("소스를 읽지 못했다 {}: {e}", path.display()));
+                let rel = path
+                    .strip_prefix(manifest)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                out.push((rel, body));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 계측 타당성 — 수집기가 **정말로 전량**을 집는가(빈·반쪽 목록으로 조용히 초록이 되는
+    /// 길을 막는다. 이 저장소가 반복해 맞은 형태다).
+    #[test]
+    fn spawn_scan_collects_the_whole_src_tree() {
+        let files = spawn_scan_files();
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(files.len() >= 40, "수집 {}건 — 전량이 아니다", files.len());
+        for must in [
+            "src/lib.rs",
+            "src/bin/cys.rs",
+            "src/bin/cysd/governance.rs",
+            "src/bin/cysd/state.rs",
+            // ★종전 화이트리스트 **밖**이던 파일들 — 이 셋이 없으면 '전량화' 는 말뿐이다.
+            "src/factory_reset.rs",
+            "src/pack.rs",
+            "src/bin/cysd/boot_supervisor.rs",
+        ] {
+            assert!(names.contains(&must), "{must} 를 수집하지 못했다: {names:?}");
+        }
+        // 수집물이 **실물 소스**다(빈 문자열을 스캔하며 초록이 되는 경로 차단).
+        let (_, lib) = files
+            .iter()
+            .find(|(n, _)| n == "src/lib.rs")
+            .expect("lib.rs 를 못 찾았다");
+        assert!(
+            lib.contains("pub trait SpawnPolicy"),
+            "수집물이 실제 소스가 아니다 — 스캔이 허공을 보고 있다"
+        );
+        // 중복 0 — 같은 파일을 두 번 세면 개수 기반 판정이 흔들린다.
+        let mut uniq = names.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "수집에 중복이 있다");
+    }
+
+    /// 규약의 **유일한 정의처**. `pre_exec`/`creation_flags` 원시 호출이 허용되는 단 하나의
+    /// 파일이고, 그 사실(=한 곳에 모여 있다) 자체가 U-7 규약의 내용이다.
+    /// 면제는 [`no_bypass_child_separation_in_production`] 이 **근거까지 기계로 확인**한다.
+    const SPAWN_DEFINITION_SITE: &str = "src/lib.rs";
 
     /// ★핵심 핀: 프로덕션의 자식 분리는 **전부 `spawn_policy` 를 경유**한다.
     ///
@@ -3624,10 +3673,38 @@ mod spawn_policy_tests {
     /// 그 순간을 재현하기 어려우므로 **소스 층에서** 규약 이탈을 잡는다.
     #[test]
     fn no_bypass_child_separation_in_production() {
-        for (name, src) in SPAWN_SCAN.iter().copied() {
+        let mut definition_sites = 0usize;
+        for (name, src) in &spawn_scan_files() {
             let prod = production_slice(src);
+            // ★규약의 **유일한 정의처**만 면제한다 — 원시 호출이 한 곳에 모여 있다는 것이
+            //   이 규약의 내용 그 자체이므로, 그 한 곳을 스캔하면 규약이 자기 자신을 금지한다.
+            //   면제표가 쓰레기통이 되지 않게 **면제의 근거를 같은 검체가 기계로 확인**하고,
+            //   그 파일의 원시 호출 **개수까지 동결**한다(정의처 안에서 새 호출이 늘어도 적색).
+            if name == SPAWN_DEFINITION_SITE {
+                definition_sites += 1;
+                assert!(
+                    prod.contains("fn spawn_policy(&mut self, class: ChildLifetime)"),
+                    "{name} 이 규약의 정의처가 아니다 — 면제의 근거가 사라졌다"
+                );
+                assert_eq!(
+                    (prod.matches("pre_exec(").count(), prod.matches("creation_flags(").count()),
+                    (1, 3),
+                    "정의처의 원시 호출 개수가 동결값을 벗어났다 — 정의처 안에서 새 분리 지점이 \
+                     늘었거나 헬퍼가 갈라졌다(등급표 `win_creation_flags` 1 + 그 호출 1 + \
+                     실제 적용 1 · `pre_exec` 1)"
+                );
+                continue;
+            }
+            // 정의처는 하나여야 한다 — 두 번째 정의처가 생기면 U-7 의 주장 자체가 거짓이 된다
+            // (`state.rs::HideConsole` 이 정확히 그렇게 생겨났었다).
+            assert!(
+                !prod.contains("fn spawn_policy(&mut self, class: ChildLifetime)"),
+                "{name} 에 두 번째 규약 정의처가 생겼다 — flag word 정의가 갈라진다"
+            );
             // 문자열 조립으로 찾는다 — 이 테스트 소스 자체가 자기 검색어를 리터럴로
-            // 담고 있어도 무해하지만(스캔 대상은 bin/*.rs 뿐), 의도를 분명히 한다.
+            // 담고 있어도 무해하다(테스트 모듈은 production_slice 가 걷어낸다).
+            // ★주석까지 센다: 어떤 축을 설명하는 주석에 그 축의 판독 리터럴을 그대로 적으면
+            //   적색이다(과탐이 안전측 — 규약 밖 호출을 '설명이니까' 로 숨길 수 없다).
             for needle in ["pre_exec(", "creation_flags("] {
                 let n = prod.matches(needle).count();
                 assert_eq!(
@@ -3638,33 +3715,137 @@ mod spawn_policy_tests {
                 );
             }
         }
+        assert_eq!(
+            definition_sites, 1,
+            "정의처 면제가 {definition_sites}건 — 0이면 스캔이 정의처를 못 봤다는 뜻이고 \
+             (수집기 고장) 2 이상이면 면제가 번진 것이다"
+        );
     }
 
-    /// 한 문장 안에서 등급 선언(`spawn_policy(`)과 콘솔 은폐 별칭(`hide_console(`)이
-    /// **함께** 쓰였는가 — 그 문장을 돌려준다(빈 벡터 = 병용 없음).
+    /// 등급 선언(`spawn_policy(`)과 콘솔 은폐 별칭(`hide_console(`)의 **병용**을 찾는다
+    /// (빈 벡터 = 병용 없음).
     ///
-    /// 왜 문장 단위인가: `creation_flags` 는 누적이 아니라 **덮어쓰기**다. 한 빌더 체인에서
-    /// 뒤에 오는 호출이 앞의 flag word 를 통째로 지우므로,
+    /// 왜 위험한가: 등급의 Windows flag word 는 누적이 아니라 **덮어쓰기**다. 한 객체에 두 번
+    /// 얹으면 뒤엣것이 앞엣것을 통째로 지우므로,
     /// `.spawn_policy(ChildLifetime::GroupScoped).hide_console()` 은
     /// `CREATE_NEW_PROCESS_GROUP` 을 **조용히 지운다**(mac/Linux 무증상 · CI 전부 초록 ·
     /// Windows 에서만 원장 pgid 회수가 무력화되고 부모 콘솔 Ctrl-C 로 자식이 동반 사망).
-    /// 두 호출이 별개 문장이면 이 위험이 없으므로 파일 단위가 아니라 문장 단위로 잰다.
     ///
-    /// 문장 경계 = `;` `{` `}`. 중괄호까지 끊는 이유는 함수 경계를 넘어 두 호출이 한 조각에
-    /// 섞여 **오탐**하는 것을 막기 위해서다(오탐은 반경 밖 파일을 볼모로 잡는다).
-    /// 별칭의 **정의처**(`fn hide_console(`)는 호출이 아니므로 제외한다 — 정의는 등급
-    /// `Attached` 로의 위임 그 자체이고, 그것이 이 수리의 내용이다.
-    /// 알려진 판별력 한계(정직): 두 호출 사이에 중괄호 블록(클로저 등)이 끼면 놓친다.
-    fn statements_mixing_lifetime_and_hide_console(prod: &str) -> Vec<String> {
-        strip_line_comments(prod)
-            .split([';', '{', '}'])
-            .filter(|s| {
-                s.contains("spawn_policy(")
-                    && s.contains("hide_console(")
-                    && !s.contains("fn hide_console(")
-            })
-            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect()
+    /// ★N3 승격(2026-08-24) — 종전 판정 단위는 **문장**이었고 그 옆 주석은 "두 호출이 별개
+    /// 문장이면 이 위험이 없다"고 적었다. **그 문장은 거짓이었다**: 그 setter 는 객체에 붙지
+    /// 문장에 붙지 않으므로, 같은 `Command` 를 가리키는 한 문장이 갈려도 그대로 덮인다 —
+    /// `cmd.spawn_policy(GroupScoped); cmd.hide_console();` 이면 그룹 flag 가 사라진다.
+    /// 게다가 자기검증 표본이 `cmd`/`other` 라는 **다른 변수**여서 그 케이스를 "안전"이라
+    /// 단언하며 사각을 가리고 있었다. 그래서 판정을 **수신자 식별자** 단위로 올린다 —
+    ///   ⓐ 한 문장에 둘 다 있다(익명 체인 `Command::new(..).spawn_policy(..).hide_console()`)
+    ///   ⓑ **같은 함수 몸통** 안에서 같은 수신자 식별자에 둘 다 걸린다(문장이 갈려도 잡는다)
+    ///
+    /// 창을 함수 몸통으로 좁히는 이유: 서로 다른 함수의 동명 지역변수(`cmd`)를 병용으로 읽으면
+    /// 오탐이고, 오탐은 반경 밖 파일을 볼모로 잡는다. 별칭의 **정의처**(`fn hide_console(`)는
+    /// 호출이 아니므로 제외한다 — 정의는 등급 `Attached` 로의 위임 그 자체다.
+    ///
+    /// 알려진 판별력 한계(정직):
+    ///   · 수신자가 **익명 임시값**인 형태(`c.arg(x).hide_console();`)는 ⓑ 가 못 본다 — 이름이
+    ///     없으면 다른 문장에서 같은 객체를 다시 가리킬 수 없어 두-문장 위험이 성립하지 않는다.
+    ///   · UFCS 호출(`SpawnPolicy::spawn_policy(cmd, ..)`)은 ⓑ 의 수확 대상이 아니다.
+    ///   · 한 함수 안에서 같은 이름을 **다른 객체로 재바인딩**하면 오탐한다(안전측).
+    ///   · ⓐ 는 여전히 중괄호 블록(클로저 등)이 끼면 그 조각을 끊는다.
+    fn mixes_of_lifetime_and_hide_console(prod: &str) -> Vec<String> {
+        let code = strip_line_comments(prod);
+        let mut out: Vec<String> = Vec::new();
+        // ⓐ 문장 단위 — 익명 체인까지 덮는다(종전 축을 그대로 유지한다).
+        for stmt in code.split([';', '{', '}']) {
+            if stmt.contains("spawn_policy(")
+                && stmt.contains("hide_console(")
+                && !stmt.contains("fn hide_console(")
+            {
+                out.push(stmt.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        // ⓑ 수신자 단위 — 같은 함수 몸통에서 같은 식별자에 둘 다 걸리는가.
+        for body in function_chunks(&code) {
+            let graded = call_receivers(&body, ".spawn_policy(");
+            for r in call_receivers(&body, ".hide_console(") {
+                if graded.contains(&r) {
+                    out.push(format!(
+                        "수신자 `{r}` 에 등급 선언과 hide_console 이 함께 걸린다 — 문장이 \
+                         갈려도 뒤엣것이 앞 등급의 flag word 를 통째로 덮는다"
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// 소스를 **함수 몸통 단위**로 자른다(머리 줄에서 끊는 근사 — 파서를 들이지 않는다).
+    fn function_chunks(code: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for line in code.lines() {
+            if is_fn_header(line) && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(line);
+            cur.push('\n');
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// 이 줄이 함수 머리인가 — 가시성·`const`/`async`/`unsafe`/`extern` 수식어를 벗겨 본다.
+    fn is_fn_header(line: &str) -> bool {
+        const MODIFIERS: &[&str] = &[
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "default ",
+            "const ",
+            "async ",
+            "unsafe ",
+            "extern \"C\" ",
+            "extern ",
+        ];
+        let mut t = line.trim_start();
+        while let Some(rest) = MODIFIERS.iter().find_map(|k| t.strip_prefix(*k)) {
+            t = rest;
+        }
+        t.starts_with("fn ")
+    }
+
+    /// `needle`(`.method(` 형태) 호출의 **수신자 식별자**를 수확한다.
+    /// 익명 임시값(앞이 `)` 등 식별자가 아닌 것)은 수확하지 않는다.
+    fn call_receivers(body: &str, needle: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (at, _) in body.match_indices(needle) {
+            let mut it = body[..at].chars().rev().peekable();
+            let mut end = at;
+            while let Some(c) = it.peek().copied() {
+                if !c.is_whitespace() {
+                    break;
+                }
+                end -= c.len_utf8();
+                it.next();
+            }
+            let mut start = end;
+            while let Some(c) = it.peek().copied() {
+                if !(c.is_alphanumeric() || c == '_' || c == '.') {
+                    break;
+                }
+                start -= c.len_utf8();
+                it.next();
+            }
+            let r = body[start..end].trim_matches('.');
+            if !r.is_empty() {
+                out.push(r.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// ★계측기 자기검증(계측 타당성) — 두 탐지기가 **실제로 탐지하는지**를 합성 표본으로
@@ -3675,20 +3856,46 @@ mod spawn_policy_tests {
         // ① 병용 탐지: 같은 문장이면 잡고, 문장이 갈리면 안 잡는다.
         let mixed = "    cmd.spawn_policy(cys::ChildLifetime::GroupScoped).hide_console();\n";
         assert_eq!(
-            statements_mixing_lifetime_and_hide_console(mixed).len(),
+            mixes_of_lifetime_and_hide_console(mixed).len(),
             1,
             "병용을 못 잡는다 — 이 핀은 아무것도 지키지 않는다"
         );
         let apart = "    cmd.spawn_policy(cys::ChildLifetime::Attached);\n    other.hide_console();\n";
         assert!(
-            statements_mixing_lifetime_and_hide_console(apart).is_empty(),
-            "별개 문장을 병용으로 오탐한다 — 오탐은 반경 밖 파일을 볼모로 잡는다"
+            mixes_of_lifetime_and_hide_console(apart).is_empty(),
+            "**다른** 수신자를 병용으로 오탐한다 — 오탐은 반경 밖 파일을 볼모로 잡는다"
+        );
+        // ★N3 — **같은 수신자**에 대한 두-문장 병용은 실재 위험이다. 종전 주석은 "두 호출이
+        //   별개 문장이면 이 위험이 없다"고 적었지만 그것은 거짓이다: 등급 flag 를 얹는 것은
+        //   누적이 아니라 **setter** 라, 같은 Command 객체면 문장이 갈려도 뒤엣것이 앞의
+        //   flag word 를 통째로 덮는다(GroupScoped 의 그룹 flag 가 조용히 사라진다).
+        //   종전 자기검증은 `cmd`/`other` 라는 **다른 변수** 표본만 써서 이 사각을 가렸다.
+        let same_receiver_two_statements = "fn f() {\n    \
+            cmd.spawn_policy(cys::ChildLifetime::GroupScoped);\n    cmd.hide_console();\n}\n";
+        let found = mixes_of_lifetime_and_hide_console(same_receiver_two_statements);
+        assert_eq!(
+            found.len(),
+            1,
+            "같은 수신자에 대한 두-문장 병용을 못 잡는다 — 이 핀은 실재 위험 앞에서 눈이 \
+             멀었다: {found:?}"
+        );
+        // 판정 **근거**까지 못 박는다 — 개수만 맞고 엉뚱한 축이 잡히면 계측은 여전히 거짓이다.
+        assert!(
+            found[0].contains("수신자 `cmd`"),
+            "판정이 수신자를 지목하지 않는다(문장 축이 우연히 잡은 것일 수 있다): {found:?}"
+        );
+        // 그리고 **다른 함수**의 동명 지역변수는 병용이 아니다(창을 함수 몸통으로 좁힌다).
+        let cross_fn = "fn a() {\n    cmd.spawn_policy(cys::ChildLifetime::Attached);\n}\n\
+                        fn b() {\n    cmd.hide_console();\n}\n";
+        assert!(
+            mixes_of_lifetime_and_hide_console(cross_fn).is_empty(),
+            "다른 함수의 동명 변수를 병용으로 오탐한다 — 오탐은 반경 밖 파일을 볼모로 잡는다"
         );
         // 주석 속 언급은 코드가 아니다(실제로 schedule.rs 가 그 형태다 — 오탐 시 적색이 된다).
         let commented = "    cmd\n        // 종전 `hide_console()` 과 동일한 flag\n        \
                          .spawn_policy(cys::ChildLifetime::Attached);\n";
         assert!(
-            statements_mixing_lifetime_and_hide_console(commented).is_empty(),
+            mixes_of_lifetime_and_hide_console(commented).is_empty(),
             "주석을 코드로 읽는다"
         );
         // ② 형제 CLI 스폰 탐지: 봉인이 없는 합성 스폰을 실제로 찾아낸다.
@@ -3722,41 +3929,53 @@ mod spawn_policy_tests {
     ///
     /// `hide_console()` 은 이제 `ChildLifetime::Attached` 의 별칭이므로, 다른 등급 뒤에 오면
     /// 그 등급의 flag word 를 통째로 덮어쓴다 — `GroupScoped` 의 `CREATE_NEW_PROCESS_GROUP` 이
-    /// 사라지는 것이 정확히 그 사고다. **현 트리에는 병용이 0 건이고**, 이 핀은 그 0 을 잠근다
-    /// (탐지기가 실제로 병용을 잡는다는 증명은 `spawn_pin_detectors_actually_detect` ①).
+    /// 사라지는 것이 정확히 그 사고다. ★N3 이후 판정 단위는 문장이 아니라 **수신자**이므로
+    /// `cmd.spawn_policy(..); cmd.hide_console();` 처럼 문장이 갈린 형태도 잡힌다.
+    /// **현 트리에는 병용이 0 건이고**, 이 핀은 그 0 을 잠근다(탐지기가 실제로 잡는다는 증명은
+    /// `spawn_pin_detectors_actually_detect` ①).
     #[test]
     fn lifetime_grade_and_hide_console_are_never_mixed() {
-        for (name, src) in SPAWN_SCAN.iter().copied() {
+        for (name, src) in &spawn_scan_files() {
             let prod = production_slice(src);
-            let mixed = statements_mixing_lifetime_and_hide_console(&prod);
+            let mixed = mixes_of_lifetime_and_hide_console(&prod);
             assert!(
                 mixed.is_empty(),
-                "{name}: 등급 선언과 `hide_console()` 이 한 문장에 함께 있다 — \
-                 `creation_flags` 는 덮어쓰기라 뒤에 오는 쪽이 앞 등급의 flag word 를 \
-                 **조용히 지운다**(mac/Linux 무증상). 등급 하나로만 선언하라.\n{mixed:?}"
+                "{name}: 등급 선언과 `hide_console()` 이 **같은 수신자**에 함께 걸린다 — \
+                 그 flag word 는 덮어쓰기라 뒤에 오는 쪽이 앞 등급을 **조용히 지운다** \
+                 (문장이 갈려 있어도 마찬가지다 · mac/Linux 무증상). 등급 하나로만 선언하라.\n\
+                 {mixed:?}"
             );
         }
     }
 
-    /// ★알려진 미편입 1건의 **동결 카운트**(범위 밖이라 빼는 게 아니라, 늘어나면 적색이 되게 건다).
+    /// ★핀 이사(N4 · 2026-08-24) — **동결값이 1 → 0 으로 내려간다**(조이는 방향).
     ///
-    /// `src/factory_reset.rs::no_console_win` 은 `CREATE_NO_WINDOW` 한 줄짜리 로컬 헬퍼로,
-    /// 등급표상 `Attached` 와 같은 flag 다(분리 없음 — 규약 위반이 아니라 **정의처 미통합**).
-    /// U-7 의 대상 파일이 아니라 이번에 옮기지 않았다. 판정 축을 넓히는 대신 **현재값을 동결**해,
-    /// 이 파일에 분리 flag 가 새로 생기거나 우회 스폰이 늘어나면 즉시 적색이 되게 한다.
-    /// 이것은 완화가 아니다 — 종전에는 이 파일을 아무도 안 봤고, 지금은 1건 초과가 금지된다.
+    /// 종전 서술: "`src/factory_reset.rs::no_console_win` 은 U-7 대상 파일이 아니라 옮기지
+    /// 않았다 — 현재값 1을 동결한다." 그 동결은 **위반을 초록으로 고정한 것**이었다:
+    /// 그 파일은 프로덕션이고, 바로 위 전량 스캔의 주석이 이미 "화이트리스트 관리 자체가
+    /// 결함원" 이라 적고 있었다. N4 가 그 헬퍼를 `ChildLifetime::Attached` 위임으로 편입했으니
+    /// 이 파일의 원시 호출은 **0** 이 정본이다.
+    ///
+    /// 위 전량 스캔이 같은 사실을 잡지만 이 핀은 지우지 않는다 — **파일 이름을 명시**해 두면
+    /// "그 파일이 스캔 대상에서 빠지는" 회귀까지 잡힌다(스캔이 눈이 멀어도 여기서 걸린다).
     #[test]
     fn known_unmigrated_separation_sites_are_frozen() {
         let fr = production_slice(include_str!("factory_reset.rs"));
         assert_eq!(
             fr.matches("creation_flags(").count(),
-            1,
-            "factory_reset.rs 의 창 은폐 flag 는 no_console_win 1건으로 동결돼 있다 —              늘었다면 새 스폰이 규약 밖에서 생긴 것이다(cys::SpawnPolicy 로 편입하라)"
+            0,
+            "factory_reset.rs 에 창 은폐 flag 직접 호출이 남았다 — 등급 위임(N4)이 되돌려졌거나 \
+             새 스폰이 규약 밖에서 생긴 것이다(cys::SpawnPolicy 로 편입하라)"
         );
         assert_eq!(
             fr.matches("pre_exec(").count(),
             0,
             "factory_reset.rs 에 세션 분리가 새로 생겼다 — 회수 책임자가 없는 자식이다"
+        );
+        // 제거만 하고 기능을 잃지 않았다(위임이 실재한다).
+        assert!(
+            fr.contains("ChildLifetime::Attached"),
+            "창 은폐 등급 선언이 사라졌다 — Windows 리셋 중 검은 콘솔 창이 여러 번 뜬다"
         );
     }
 
@@ -3849,7 +4068,7 @@ mod spawn_policy_tests {
     #[test]
     fn daemon_spawned_cli_children_seal_autostart() {
         let mut sites = 0usize;
-        for (name, src) in SPAWN_SCAN.iter().copied() {
+        for (name, src) in &spawn_scan_files() {
             let prod = production_slice(src);
             for body in cli_spawn_sites(name, &prod) {
                 sites += 1;

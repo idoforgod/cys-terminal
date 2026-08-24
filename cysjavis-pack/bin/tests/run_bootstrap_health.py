@@ -2554,11 +2554,18 @@ sys.exit(0)
 """
 
 
-@specimen("H-CONC-3", "W3", "settings.json 3-writer 경합 — 무파손·무 lost-update(공용 락+mkstemp)",
+@specimen("H-CONC-3", "W3", "settings.json 다중 writer 경합 — 무파손·무 lost-update(공용 락+mkstemp)",
           ["G16", "A8"])
 def h_conc_3():
-    """G16: settings.json 은 python preflight·Rust 시드/init-pack·부서 마이그레이션의 **3-writer**
-    대상인데, preflight 의 네 등록기가 각자 `open(path + ".tmp")` → `os.replace` 를 재구현했고
+    """★실측 정정(N13 · 2026-08-24): 이 검체는 settings.json 을 **3-writer** 대상이라고 적고
+    있었다. 전수로 세면 **5**다 — preflight `_settings_rmw`(락 O) · `javis_guard_register.py`
+    `_atomic_write`(락 X) · `javis_dept_migrate.py` `_register_hook`(락 X · 고정 `.tmp`) ·
+    `src/pack.rs::merge_desired_hooks`(락 X) · `src/factory_reset.rs::strip_settings_matching`
+    (락 X). 근거·잔여 위험은 `javis_preflight.py` 의 `_settings_rmw` 머리 주석이 정본이다.
+    이 검체가 실측하는 것은 그중 **preflight 레인**(등록기 4종 + 공용 락)이며, 아래 ⓑ가
+    Rust 두 writer 의 원자 쓰기를 소스핀으로 대조한다.
+
+    G16: preflight 의 네 등록기가 각자 `open(path + ".tmp")` → `os.replace` 를 재구현했고
     tmp 이름이 **고정**이었다 — 동시 writer 가 서로의 임시 파일에 써서 교차 파손(반쪽 JSON)을 만들고,
     그 뒤 모든 등록기가 "파싱 실패 — 덮어쓰기 거부"로 수리를 영구 포기한다(A8 지배 실패 모드).
     W1a 가 신설한 `javis_lock`(락+mkstemp)의 **소비 이관**이 W3 몫이다."""
@@ -2577,7 +2584,7 @@ def h_conc_3():
         need("_settings_rmw(" in body, "%s 가 단일 RMW 소유자를 경유하지 않는다" % fn)
     need("javis_lock" in code and "FileLock(" in code, "preflight 가 공용 락을 소비하지 않는다")
     notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0")
-    # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 3-writer 의 나머지 두 축
+    # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 실측 5 writer 중 Rust 두 축
     pk = _repo_file(os.path.join("src", "pack.rs"))
     mi = pk.find("pub fn merge_desired_hooks(")
     need(mi > 0, "Rust 병합기를 못 찾았다")
@@ -2587,7 +2594,7 @@ def h_conc_3():
     need("std::fs::write(settings" not in _code_lines(pk), "Rust 비원자 settings write 잔존")
     cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("std::fs::write(settings_path" not in _code_lines(cy),
-         "init-pack 이 비원자 write 로 되돌아갔다(3-writer 파손 축 복귀)")
+         "init-pack 이 비원자 write 로 되돌아갔다(다중 writer 파손 축 복귀)")
     notes.append("Rust 시드 원자 쓰기")
     # ⓒ 실측 경합: 6 writer × 12 iter 동시 실행 → 파손 0 · lost update 0 · 훅 6종 전원 등록
     pairs = [("session-start.sh", "SessionStart"), ("role-bootstrap.sh", "UserPromptSubmit"),
@@ -9369,6 +9376,382 @@ def h_seed_u19():
             calib = "구 트리=시드 단계 부재 · 탐지기 FIRE 확인"
         else:
             calib = "구 트리=시드 단계 부재"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+# ── U-29 · 인앱 업데이트 경로 도달성 탐지기(M-09-a) ──────────────────────────
+def _u29_retune_reaches_update_path(body):
+    """`setup_isolated_config_dir` 본문에서 **timeout 재조정이 훅 억제 조기 return 앞**인가.
+
+    ★탐지기 자신이 시험 대상이다 — 아래 검체가 합성 표본을 먹여 이 함수가 실제로 FIRE 하는지
+      확인한다. 트리에 위반이 0이라 초록인 핀은 탐지기가 고장나도 초록이다(2026-07-23 '계측
+      타당성 게이트' 교훈 · H-SEED-U19 와 같은 규약).
+    반환: (판정, 사유). 판정 True = 인앱 업데이트 사용자에게 도달한다.
+    """
+    ret = body.find("if !install_hooks {")
+    if ret < 0:
+        return False, "훅 억제 조기 return 분기를 못 찾았다"
+    end = body.find("return;", ret)
+    if end < 0:
+        return False, "훅 억제 분기의 return 을 못 찾았다"
+    call = body.find("retune_registered_hook_timeouts(")
+    if call < 0:
+        return False, "timeout 재조정 호출이 없다"
+    if call > end:
+        return False, "재조정 호출이 훅 억제 조기 return **뒤**에 있다(업데이트 사용자 미도달)"
+    return True, "재조정 호출 offset %d ≤ 조기 return offset %d" % (call, end)
+
+
+def _u29_declared_ups_timeout():
+    """소망 매니페스트가 선언한 UserPromptSubmit timeout(초). 리터럴을 검체에 적지 않는다."""
+    ups = [to for _sc, ev, _m, to in _rust_awakening_hooks() if ev == "UserPromptSubmit"]
+    need(len(ups) == 1 and ups[0], "UserPromptSubmit 선언 timeout 을 매니페스트에서 얻지 못했다: %r" % ups)
+    return ups[0]
+
+
+def _u29_ups_entries(settings_path, command):
+    """settings.json 의 UserPromptSubmit 에서 `command` 와 바이트 동등인 hook 객체 전량."""
+    with open(settings_path, encoding="utf-8") as f:
+        root = json.load(f)
+    out = []
+    for entry in (root.get("hooks") or {}).get("UserPromptSubmit") or []:
+        for h in entry.get("hooks") or []:
+            if h.get("command") == command:
+                out.append(h)
+    return root, out
+
+
+@specimen("H-TIMEOUT-U29", "W6",
+          "인앱 업데이트(--no-install-hook) 경로가 등록 timeout 을 재조정 — 설치는 하지 않는다",
+          ["M-09-a", "K-1", "U-21"])
+def h_timeout_u29():
+    """M-09-a(2026-08-24 · 기준선 v0.14.24 ↔ 현재 격리 실주행 대조에서 나온 **유일한 악화 항목**):
+
+    GUI 인앱 업데이트는 항상 `cys init-pack --no-install-hook` 으로 내려온다. 그 플래그는 훅
+    병합을 통째로 건너뛰므로 **팩 파일은 새 훅으로 교체되는데 훅 *등록*(settings.json 의
+    `timeout`)은 갱신되지 않았다.** 그런데 새 훅은 느려졌다(실측: python 기동 14→16회 · `cys`
+    호출 3→4회 · 지연 1초에서 14.83→17.12초) — 즉 옛 하네스 기본 상한이 남은 기계는 **절단
+    확률이 올라간다**. U-21 이 만든 축이 도달하지 못해 생기는 악화이므로 수리는 값이 아니라
+    **도달성**이다(`agents.json` 수정이 기존 기계에 안 닿는 K-1 과 같은 계열).
+
+    ★그리고 `--no-install-hook` 의 존재 이유를 깨면 이 수리는 수리가 아니다. 그 플래그가
+    지키는 것은 ①사용자 프로필 불가침 ②훅을 새로 **설치**하지 않음 둘이고, 아래 실측이
+    그 둘을 **행동으로** 증명한다(프로필 파일 바이트 동일 · 등록부 무생성 · 엔트리 무추가).
+
+    다섯 축 — ⓐ 얇은 집행기 실재 + U-21 교체 경로 **재사용**(새 기구 0) ⓑ 도달성(합성 표본으로
+    탐지기 자체 시험) ⓒ GUI 결합 실측 ⓓ 진짜 바이너리 실주행(재조정·무생성·무추가·프로필 무접촉)
+    ⓔ 계측 타당성(구 트리엔 집행기 자체가 없다)."""
+    notes = []
+    pk = _repo_file(os.path.join("src", "pack.rs"))
+
+    # ⓐ 얇은 집행기가 실재하고, 값을 올리는 **집행은 U-21 이 만든 교체 경로를 재사용**한다.
+    need("pub fn retune_registered_hook_timeouts(" in pk, "timeout 재조정 집행기가 없다")
+    ri = pk.find("pub fn retune_registered_hook_timeouts(")
+    rbody = pk[ri:pk.find("\n}\n", ri)]
+    need("raise_hook_timeout_in(" in rbody,
+         "재조정이 U-21 교체 경로를 쓰지 않는다 — 같은 일을 하는 기구가 둘이 되면 계약이 갈린다")
+    need("declared_timeout_for(h)" in rbody,
+         "재조정이 선언 해소기를 거치지 않는다 — 롤백 스위치(축 노브·마스터)가 이 경로만 비껴간다")
+    need("settings_path.exists()" in rbody,
+         "'등록부가 없으면 만들지 않는다' 가드가 없다 — 파일 생성은 곧 훅 설치다(플래그 위반)")
+    need("write_atomic(" in rbody, "원자 교체를 쓰지 않는다 — 반쪽 파일이 굳으면 등록부 전소")
+    # 엔트리 추가 경로를 **갖지 않는다**(구조적 무설치). 병합기의 append 관용구가 여기 오면 적색.
+    need("arr.push(entry)" not in _code_lines(rbody.replace("//", "#")),
+         "재조정기에 엔트리 append 경로가 있다 — 재조정이 아니라 설치다")
+    notes.append("얇은 집행기 실재 + U-21 교체 경로 재사용(append 경로 0)")
+
+    # ⓑ ★도달성 — 그리고 **탐지기 자체를 합성 표본으로 시험한다**
+    si = pk.find("fn setup_isolated_config_dir(")
+    need(si > 0, "setup_isolated_config_dir 을 못 찾았다")
+    sbody = pk[si:pk.find("\n}\n", si)]
+    ok, why = _u29_retune_reaches_update_path(sbody)
+    need(ok, "도달성 위반: %s" % why)
+    inverted = ("    if !install_hooks {\n        return;\n    }\n"
+                "    retune_registered_hook_timeouts(&s, &p, &H);\n")
+    fired, _ = _u29_retune_reaches_update_path(inverted)
+    need(not fired, "★탐지기 파손: 순서를 뒤집은 합성 표본을 통과시켰다")
+    removed = "    if !install_hooks {\n        return;\n    }\n"
+    fired2, _ = _u29_retune_reaches_update_path(removed)
+    need(not fired2, "★탐지기 파손: 재조정 호출이 없는 합성 표본을 통과시켰다")
+    good = ("    if !install_hooks {\n        retune_registered_hook_timeouts(&s, &p, &H);\n"
+            "        return;\n    }\n")
+    fired3, _ = _u29_retune_reaches_update_path(good)
+    need(fired3, "★탐지기 파손: 정상 배치를 적색으로 냈다(거짓 적색)")
+    # 개인 프로필은 이 경로에서 **여전히 무접촉**이다(플래그의 존재 이유 ①).
+    nohook = sbody[sbody.find("if !install_hooks {"):sbody.find("return;", sbody.find("if !install_hooks {"))]
+    need("merge_awakening_hooks_into_personal_profiles" not in nohook,
+         "훅 억제 분기가 개인 프로필 병합을 부른다 — 사용자 프로필 불가침 계약 파괴")
+    need("merge_desired_hooks(" not in nohook,
+         "훅 억제 분기가 병합기를 부른다 — 재조정이 아니라 설치가 된다")
+    notes.append("도달성 정상(%s) · 합성 표본 3종 통과 · 억제 분기에 병합기·프로필 0" % why)
+
+    # ⓒ GUI 결합 실측 — 인앱 업데이트가 여전히 그 플래그로 내려오는가(도달성 논거의 전제)
+    gui = _repo_file(os.path.join("src-tauri", "src", "main.rs"))
+    need('init_cmd.arg("init-pack").arg("--no-install-hook");' in gui,
+         "GUI 인앱 업데이트의 init-pack 호출 형태가 바뀌었다 — M-09-a 도달성 논거 재검토 필요")
+    notes.append("GUI 업데이트 경로 --no-install-hook 확인")
+
+    # ⓓ ★진짜 바이너리 실주행 — 구조 단언은 '쓰여 있다'까지만 증명한다.
+    want = _u29_declared_ups_timeout()
+    cys = _cys_bin()
+    if cys is None:
+        notes.append("실측 생략(구조 단언만) — 사유: %s" % _CYS_BIN_SKIP_REASON)
+    else:
+        tmp = tempfile.mkdtemp(prefix="cys-h-u29-")
+        try:
+            home = os.path.join(tmp, "home")
+            pack = os.path.join(tmp, "pack")          # ★홈 기본 팩 경로 밖 = 개인 프로필 병합 비대상
+            cfg = os.path.join(tmp, "cfg")
+            personal = os.path.join(tmp, "personal.json")
+            for d in (home, pack, cfg):
+                os.makedirs(d, exist_ok=True)
+            env = _base_env({"HOME": home, "CYS_PACK_DIR": pack, "CYS_CONFIG_DIR": cfg,
+                             "CYS_NO_PERSONAL_HOOK_MERGE": "1", "CYS_NO_AUTOSTART": "1"})
+
+            def _init(extra, cfgdir=None):
+                e = dict(env)
+                if cfgdir:
+                    e["CYS_CONFIG_DIR"] = cfgdir
+                return _run([cys, "init-pack"] + extra, env=e, timeout=300)
+
+            # ① 정상 설치로 **제품이 직접** 등록 문자열을 쓰게 한다(명령 문자열 추정 금지).
+            r0 = _init(["--claude-settings", personal])
+            need(r0.returncode == 0, "init-pack(정상) 실패: %s" % (r0.stdout[-400:] + r0.stderr[-400:]))
+            sfile = os.path.join(cfg, "settings.json")
+            need(os.path.isfile(sfile), "정상 설치가 격리 config 등록부를 만들지 않았다")
+            with open(sfile, encoding="utf-8") as f:
+                root = json.load(f)
+            cmds = [h.get("command")
+                    for e2 in (root.get("hooks") or {}).get("UserPromptSubmit") or []
+                    for h in e2.get("hooks") or []]
+            need(len(cmds) == 1, "정상 설치 후 UserPromptSubmit 등록이 1건이 아니다: %r" % cmds)
+            ours = cmds[0]
+
+            # ② **U-21 이전 기계**를 재현한다 — 우리 훅에서 timeout 키를 걷어내고 남의 훅을 얹는다.
+            for e2 in root["hooks"]["UserPromptSubmit"]:
+                for h in e2["hooks"]:
+                    h.pop("timeout", None)
+            root["hooks"]["UserPromptSubmit"].insert(
+                0, {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]})
+            root["theme"] = "dark"
+            with open(sfile, "w", encoding="utf-8") as f:
+                json.dump(root, f, ensure_ascii=False, indent=2)
+            personal_before = _read(personal)
+            need(personal_before.strip(), "개인 프로필 대조군 파일이 비었다(계측 무효)")
+
+            # ③ ★인앱 업데이트 경로를 그대로 태운다.
+            r1 = _init(["--no-install-hook"])
+            need(r1.returncode == 0,
+                 "init-pack --no-install-hook 실패: %s" % (r1.stdout[-400:] + r1.stderr[-400:]))
+            after, mine = _u29_ups_entries(sfile, ours)
+            need(len(mine) == 1, "재조정이 엔트리를 추가·삭제했다(우리 훅 %d건)" % len(mine))
+            need(mine[0].get("timeout") == want,
+                 "인앱 업데이트 경로가 등록 timeout 을 선언값(%s)으로 올리지 않았다: %r"
+                 % (want, mine[0]))
+            need(len(after["hooks"]["UserPromptSubmit"]) == 2,
+                 "같은 이벤트의 사용자 항목이 사라지거나 늘었다: %r" % after["hooks"]["UserPromptSubmit"])
+            need(after["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "sh /home/u/mine.sh",
+                 "사용자 훅이 사라졌다(오살)")
+            need("timeout" not in after["hooks"]["UserPromptSubmit"][0]["hooks"][0],
+                 "남의 훅에 timeout 을 심었다(계약 위반)")
+            need(after.get("theme") == "dark", "사용자 비-훅 키 소실")
+            # ★플래그의 존재 이유 ① — 개인 프로필은 **바이트 동일**하다.
+            need(_read(personal) == personal_before,
+                 "--no-install-hook 인데 사용자 프로필이 변경됐다(불가침 계약 파괴)")
+
+            # ④ 멱등 — 두 번째 업데이트는 아무것도 쓰지 않는다(정상 백업 무접촉으로 실측).
+            bak = sfile + ".bak-cys"
+            _w(bak, '{"_sentinel":"keep"}', 0o644)
+            r2 = _init(["--no-install-hook"])
+            need(r2.returncode == 0, "init-pack 재실행 실패")
+            need(_read(bak) == '{"_sentinel":"keep"}',
+                 "멱등 재실행이 정상 백업을 덮었다(매 업데이트 재직렬화 — 플래그가 막으려던 바로 그 일)")
+
+            # ⑤ **설치는 하지 않는다** — 등록부가 없는 config dir 에는 파일을 만들지 않는다.
+            fresh = os.path.join(tmp, "cfg-fresh")
+            os.makedirs(fresh, exist_ok=True)
+            r3 = _init(["--no-install-hook"], cfgdir=fresh)
+            need(r3.returncode == 0, "init-pack(신규 config) 실패")
+            need(not os.path.exists(os.path.join(fresh, "settings.json")),
+                 "등록부가 없는데 만들었다 = 훅 설치(--no-install-hook 위반)")
+            need(os.path.isfile(os.path.join(fresh, "CLAUDE.md")),
+                 "라우터 시드(훅 아님)까지 사라졌다 — 종전 거동 회귀")
+
+            # ⑥ 우리 훅이 **없는** 등록부는 무변경(엔트리 추가 0).
+            other = os.path.join(tmp, "cfg-other")
+            os.makedirs(other, exist_ok=True)
+            body = json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]}]}},
+                ensure_ascii=False, indent=2)
+            _w(os.path.join(other, "settings.json"), body, 0o644)
+            r4 = _init(["--no-install-hook"], cfgdir=other)
+            need(r4.returncode == 0, "init-pack(남의 훅만) 실패")
+            need(_read(os.path.join(other, "settings.json")) == body,
+                 "우리 훅이 없는 등록부를 재직렬화·변조했다")
+            notes.append("실주행: 재조정 %ss · 사용자 항목 보존 · 프로필 바이트 동일 · 멱등 · 무생성 · 무추가"
+                         % want)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ⓔ 계측 타당성 — 기준 트리에는 집행기 자체가 없고, 탐지기가 그 본문에서 FIRE 한다.
+    old = _git_show(os.path.join("src", "pack.rs"))
+    calib = "skip(no-git)"
+    if old is not None:
+        need("retune_registered_hook_timeouts" not in old,
+             "계측 타당성 실패: 기준 커밋에 이미 재조정 집행기가 있다(기준 선택 오류)")
+        oi = old.find("fn setup_isolated_config_dir(")
+        if oi > 0:
+            obody = old[oi:old.find("\n}\n", oi)]
+            ofired, _ = _u29_retune_reaches_update_path(obody)
+            need(not ofired, "계측 타당성 실패: 구 본문을 탐지기가 통과시켰다")
+            calib = "구 트리=집행기 부재 · 탐지기 FIRE 확인"
+        else:
+            calib = "구 트리=집행기 부재"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+# ── U-29 · 판정 불가 통보(M-01) 하네스 ──────────────────────────────────────
+_U29_VOICE_TOOLS = ("bash", "sh", "cat", "grep", "printf", "tr", "head", "date", "mkdir",
+                    "rm", "ls", "ln", "sleep", "dirname", "sed", "command", "kill", "wait",
+                    "python3", "env", "timeout", "cygpath", "locale")
+
+
+def _u29_nocys_sandbox(tmp, name):
+    """`cys` 가 **PATH 에 없는** role-bootstrap 실행 환경. 반환 (env, state_dir).
+
+    ★`cys` 부재는 이 저장소에서 가장 빈도 근거가 강한 실패 모드다 — Defender 격리가 릴리스
+      노트의 **상설 섹션**이다(docs/RELEASE_NOTES_0.14.21.md:127-135 ·
+      docs/WDSI_SUBMISSION.md:42-47 에 실측 복구 명령).
+    """
+    sb = os.path.join(tmp, name)
+    env, home, _p, _b, state = _rb_sandbox(sb)
+    binp = os.path.join(sb, "onlybin")
+    os.makedirs(binp, exist_ok=True)
+    for tool in _U29_VOICE_TOOLS:
+        src = shutil.which(tool)
+        if src and not os.path.exists(os.path.join(binp, tool)):
+            os.symlink(src, os.path.join(binp, tool))
+    need(not os.path.exists(os.path.join(binp, "cys")), "샌드박스 PATH 에 cys 가 있다(계측 무효)")
+    env["PATH"] = binp
+    return env, state
+
+
+def _u29_ctx(stdout):
+    """훅 stdout 의 마지막 줄을 JSON 으로 읽어 additionalContext 를 돌려준다."""
+    line = stdout.strip().splitlines()[-1]
+    return json.loads(line)["hookSpecificOutput"]["additionalContext"]
+
+
+@specimen("H-VOICE-U29", "W6",
+          "판정 불가 침묵 종료 → 모델 컨텍스트 통보(사유+조치) · fail-open 불변 · 폭주 유계",
+          ["M-01", "A22", "A5"])
+def h_voice_u29():
+    """M-01(2026-08-24 격리 실주행 실측 — **원 민원의 핵심**):
+
+    `cys` 실행파일이 PATH 에서 해소되지 않으면(Defender 가 cys.exe 를 격리 · 데몬의 pane PATH
+    주입 단절 · 데몬 미응답 rc 124) 이 훅은 **stdout 0바이트로 종료**했다. 기준선 v0.14.24 와
+    현행이 그 경로에서 **바이트 단위로 같았다** — 즉 이 캠페인은 이 결함을 건드리지 않았다.
+    사용자가 보는 것은 "너는 마스터다 를 쳤는데 pane 0개 · 모델은 평범한 답변" 이고, 실패
+    사유가 모델 컨텍스트에도·승인 Feed 에도·화면에도 남지 않는다 — '무시당했다' 로만 보인다.
+
+    ★장치는 이미 있었다: python 부재(A22)·감지기 부재는 같은 형태로 사유를 말해 준다.
+      이 수리는 새 기구를 만들지 않고 **그 경로를 재사용**한다.
+
+    ★무엇을 바꾸지 않는가(fail-open 불변): 발화 여부·exit 0·프롬프트 비차단은 한 글자도
+      바뀌지 않는다. 바뀌는 것은 **침묵 → 통보** 하나다.
+
+    여섯 축 — ⓐ `cys` 부재에서 stdout 비어 있지 않음(원 축) ⓑ 데드라인(rc 124)도 같은 통보
+    ⓒ 문안이 사유와 조치를 담고 복구 **순서**(제외 → 복원)를 지킴 ⓓ 폭주 유계(연속 실행에서
+    통보 1회) ⓔ judged-no 침묵(스팸 금지) + 정상 경로 무회귀 ⓕ 계측 타당성(구 훅 stdout 0바이트)."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # ⓐ ★원 축 — `cys` 부재에서 stdout 이 비어 있지 않다.
+        env, state = _u29_nocys_sandbox(tmp, "nocys")
+        r = _run_rb(env)
+        need(r.returncode == 0, "통보 경로가 훅을 비0 종료시켰다(fail-open 파괴 · exit=%d)" % r.returncode)
+        need(r.stdout.strip(), "cys 부재인데 stdout 이 비었다 — 침묵 종료 그대로(M-01 미수리)")
+        ctx = _u29_ctx(r.stdout)
+        need("발화됨" not in r.stdout, "발화하지 않았는데 발화됨을 보고했다(허위 보고)")
+        need("판정 불가" in ctx, "통보가 판정 불가임을 말하지 않는다: %r" % ctx[:200])
+        need("rc=127" in ctx, "통보에 실패 사유(rc)가 없다: %r" % ctx[:200])
+        notes.append("cys 부재: stdout %d바이트 통보 · exit 0 · 무발화" % len(r.stdout.strip()))
+
+        # ⓒ 문안 — 사유만이 아니라 **조치**를 담고, 복구 순서(제외 먼저 → 그 다음 복원)를 지킨다.
+        need("Defender" in ctx, "가장 흔한 원인(Defender 격리) 안내가 없다: %r" % ctx[:300])
+        i_excl, i_rest = ctx.find("제외 항목"), ctx.find("복원")
+        need(0 <= i_excl < i_rest,
+             "복구 안내의 순서가 뒤집혔다(제외 먼저 → 그 다음 복원) — 순서를 바꾸면 실시간 보호가 "
+             "복원 직후 다시 격리한다: 제외=%d 복원=%d" % (i_excl, i_rest))
+        need("PATH" in ctx, "격리가 아닌 경우의 확인 경로(PATH) 안내가 없다")
+        need("보고하지 마라" in ctx, "'부트가 시작됐다고 보고하지 마라' 규율이 빠졌다(허위 보고 유도)")
+        # 배포된 실측 절차와 같은 말을 하는가(문안의 출처가 추정이 아님을 기계로 결박).
+        rn = _repo_file(os.path.join("docs", "RELEASE_NOTES_0.14.21.md"))
+        need("제외 항목 추가" in rn and "복원" in rn,
+             "릴리스 노트의 상설 복구 섹션이 사라졌다 — 훅 문안의 출처가 없어졌다")
+        notes.append("문안: 사유+조치+복구 순서(제외→복원)+무허위보고 규율")
+
+        # ⓓ ★폭주 유계 — 같은 조건을 연속으로 돌려도 통보는 창당 1회다.
+        spoken = 1
+        for _ in range(3):
+            rn2 = _run_rb(env)
+            need(rn2.returncode == 0, "반복 실행이 비0 종료")
+            if rn2.stdout.strip():
+                spoken += 1
+            else:
+                need("억제" in rn2.stderr, "억제 사실을 stderr 로도 말하지 않는다: %r" % rn2.stderr[-200:])
+        need(spoken == 1,
+             "연속 4회에서 통보가 %d회 나갔다 — 매 프롬프트 반복은 그것대로 재난이다(래치 무력)" % spoken)
+        latch = [f for f in os.listdir(state) if f.startswith("cys-hook-notice-")]
+        need(latch, "통보 래치 파일이 남지 않았다 — 유계성의 근거가 디스크에 없다")
+        notes.append("유계성: 연속 4회 중 통보 1회 · 래치 %r" % latch)
+
+        # ⓔ judged-no — 마스터 토큰 없는 프롬프트는 **첫 실행에서도** 침묵한다(스팸 금지).
+        env2, state2 = _u29_nocys_sandbox(tmp, "nocys-plain")
+        r2 = _run_rb(env2, prompt="오늘 작업 지시해줘")
+        need(r2.stdout.strip() == "",
+             "선언 토큰 없는 프롬프트에 컨텍스트를 주입했다(스팸): %r" % r2.stdout[:200])
+        latch2 = ([f for f in os.listdir(state2) if f.startswith("cys-hook-notice-")]
+                  if os.path.isdir(state2) else [])
+        need(not latch2, "judged-no 인데 래치를 소모했다(%r) — 진짜 선언 때 통보가 억제된다" % latch2)
+        notes.append("judged-no 침묵 · 래치 무소모")
+
+        # ⓑ 데드라인(rc 124) — 데몬이 게이트 안에 응답하지 않는 경우도 같은 통보로 나온다.
+        sb3 = os.path.join(tmp, "hang")
+        env3, _h3, _p3, bind3, _s3 = _rb_sandbox(sb3)
+        _mock_cys(bind3, sb3,
+                  'case "$1" in\n'
+                  '  hook) echo "error: unrecognized subcommand" >&2; exit 2 ;;\n'
+                  '  surface-role) sleep 30; exit 0 ;;\n'
+                  'esac')
+        r3 = _run_rb(env3)
+        need(r3.returncode == 0, "데드라인 경로가 훅을 비0 종료시켰다(exit=%d)" % r3.returncode)
+        need(r3.stdout.strip(), "데드라인(rc 124)에서 stdout 이 비었다 — 침묵 종료 잔존")
+        ctx3 = _u29_ctx(r3.stdout)
+        need("rc=124" in ctx3, "데드라인 사유가 통보에 없다: %r" % ctx3[:200])
+        need("발화됨" not in r3.stdout, "데드라인인데 발화됨을 보고했다")
+        notes.append("데드라인 rc=124 통보")
+
+        # ⓔ′ 정상 경로 무회귀 — 판정이 되는 좌석에서는 종전대로 발화한다(통보가 길을 막지 않는다).
+        env4, _h4, _p4, _b4, _s4 = _rb_sandbox(os.path.join(tmp, "ok"))
+        r4 = _run_rb(env4)
+        need(r4.returncode == 0, "정상 경로가 비0 종료")
+        need("발화됨" in r4.stdout, "정상 경로에서 부트 발화 보고가 사라졌다(회귀): %r" % r4.stdout[:300])
+        need("판정 불가 - 좌석 역할 조회 실패" not in r4.stdout,
+             "정상 경로에 판정 불가 통보가 섞였다(오탐)")
+        notes.append("정상 경로 발화 무회귀")
+
+        # ⓕ 계측 타당성 — 구 훅은 같은 조건에서 stdout 0바이트여야 한다(결함 재현).
+        calib = "skip(no-git)"
+        old = _git_show(os.path.join("cysjavis-pack", "hooks", "role-bootstrap.sh"))
+        if old is not None:
+            oldhook = os.path.join(tmp, "oldhooks", "role-bootstrap.sh")
+            _w(oldhook, old)
+            _w(os.path.join(tmp, "oldhooks", "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            envo, _st = _u29_nocys_sandbox(tmp, "nocys-old")
+            ro = _run([BASH, oldhook], input=json.dumps({"prompt": "너는 마스터다"}), env=envo)
+            need(ro.stdout.strip() == "",
+                 "계측 타당성 실패: 구 훅이 이 조건에서 이미 말한다(결함 재현 불가): %r" % ro.stdout[:200])
+            calib = "구 훅 stdout 0바이트(침묵 종료) 재현"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 

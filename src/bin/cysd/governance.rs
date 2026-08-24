@@ -1617,6 +1617,11 @@ struct GateCorpusEntry {
     override_on: bool,
     envelope: Option<serde_json::Value>,
     gates: Arc<Vec<cys::first_run_gates::Gate>>,
+    /// ★(N9) 해소가 남긴 사유 — 자기규칙 **수리**·Fatal 관문 **강제 복원**·완화 **거부**.
+    /// 종전엔 `.gates` 만 취하고 이것을 버렸다. 그 셋은 전부 "사용자가 선언한 값을 시스템이
+    /// 바꾸는 행위"인데, 데몬에서 그 사실이 어디에도 남지 않으면 사용자는 자기 override 가
+    /// 왜 안 먹는지 알 방법이 없다(CLI 는 같은 정보를 `cys.rs::resolve_gate_corpus` 가 낸다).
+    notes: Vec<String>,
 }
 
 impl ScanCaches {
@@ -1630,27 +1635,58 @@ impl ScanCaches {
     }
 
     /// 관문 코퍼스를 캐시에서 얻는다(미스면 `resolve_with` 로 해소해 적재).
+    ///
+    /// ★(N9) 해소가 남긴 사유는 **여기서 stderr 로 발행**한다. 발행은 아래 판정 절반이
+    /// 돌려주는 값에만 의존하므로, 유계성(캐시 미스 1회)은 그 절반의 검체가 지킨다.
     fn corpus(
         &mut self,
         agent: &str,
         envelope: Option<&serde_json::Value>,
         override_on: bool,
     ) -> Arc<Vec<cys::first_run_gates::Gate>> {
+        let (gates, fresh_notes) = self.corpus_with_notes(agent, envelope, override_on);
+        for n in &fresh_notes {
+            eprintln!("[gate-corpus] {agent}: {n}");
+        }
+        gates
+    }
+
+    /// 위의 **판정 절반** — 반환 `notes` 는 **캐시 미스일 때만** 비어 있지 않다.
+    ///
+    /// ★유계성이 여기에 있다: 캐시 히트는 빈 벡터를 돌려주므로 위 발행 루프가 아무것도 찍지
+    /// 않는다. 히트에서도 채워 돌려주면 watchdog 틱마다 같은 줄이 반복돼 24/365 데몬 로그가
+    /// 덮인다(반복 발행은 재난 ① 방향). 보관은 계속한다 — 버리는 것과 조용한 것은 다르다.
+    fn corpus_with_notes(
+        &mut self,
+        agent: &str,
+        envelope: Option<&serde_json::Value>,
+        override_on: bool,
+    ) -> (Arc<Vec<cys::first_run_gates::Gate>>, Vec<String>) {
         if let Some(e) = self.gate_corpus.get(agent) {
             if e.override_on == override_on && e.envelope.as_ref() == envelope {
-                return e.gates.clone();
+                return (e.gates.clone(), Vec::new());
             }
         }
-        let gates = Arc::new(cys::first_run_gates::resolve_with(envelope, override_on).gates);
+        let resolved = cys::first_run_gates::resolve_with(envelope, override_on);
+        let gates = Arc::new(resolved.gates);
         self.gate_corpus.insert(
             agent.to_string(),
             GateCorpusEntry {
                 override_on,
                 envelope: envelope.cloned(),
                 gates: gates.clone(),
+                notes: resolved.notes,
             },
         );
-        gates
+        // ★발행 재료는 **보관본에서 읽는다** — 보관본과 발행본이 갈라질 자리를 없앤다.
+        //   (그리고 보관이 장식이 아님을 프로덕션이 스스로 증명한다: 이 읽기가 없으면
+        //    `notes` 는 검체만 보는 죽은 필드가 되고, 그것은 '버렸다' 와 구별되지 않는다.)
+        let fresh = self
+            .gate_corpus
+            .get(agent)
+            .map(|e| e.notes.clone())
+            .unwrap_or_default();
+        (gates, fresh)
     }
 
     /// pass 끝 정리 — 이번 pass 에서 관측되지 않은 키를 버린다(24/365 데몬 누수 차단).
@@ -9440,11 +9476,31 @@ mod tests {
             !std::sync::Arc::ptr_eq(&base, &replaced),
             "봉투가 바뀌었는데 캐시가 stale 을 돌려줬다"
         );
+        // ★N1 정정 — replace 봉투 소비는 일어나되(양성 대조군) 킬체인 관문은 **강제 복원**된다.
+        //   종전 이 자리의 `vec!["synthetic-gate"]` 는 "replace 한 줄이 Fatal 관문 5종을
+        //   없애는 것이 정상"을 데몬 쪽에서도 박제하고 있었다.
+        let fatal: Vec<String> = frg::builtin()
+            .into_iter()
+            .filter(|g| g.absence_is_fatal())
+            .map(|g| g.id)
+            .collect();
         assert_eq!(
-            replaced.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
-            vec!["synthetic-gate"],
-            "봉투 소비가 실제로 일어나야 한다(양성 대조군)"
+            replaced.first().map(|g| g.id.as_str()),
+            Some("synthetic-gate"),
+            "봉투 소비가 실제로 일어나야 한다(양성 대조군): {:?}",
+            replaced.iter().map(|g| g.id.as_str()).collect::<Vec<_>>()
         );
+        assert!(
+            !replaced.iter().any(|g| g.id == "theme"),
+            "가역 관문까지 되살아났다 = 코드 정본 폴백(사용자 주권 침해)의 형태다"
+        );
+        for id in &fatal {
+            assert!(
+                replaced.iter().any(|g| &g.id == id),
+                "Fatal 관문 {id} 이 데몬 캐시 경로에서 사라졌다"
+            );
+        }
+        assert_eq!(replaced.len(), 1 + fatal.len());
         // 롤백 스위치(override off)가 바뀌면 역시 재해소 — 코드 정본으로 되돌아온다.
         let off = c.corpus("claude", Some(&env), false);
         assert!(
@@ -9466,6 +9522,68 @@ mod tests {
         // ── 좌석 정리(watchdog 누수 차단 블록) ──────────────────────────────
         c.prune_surfaces(&std::collections::HashSet::new());
         assert!(c.gate_debounce.is_empty() && c.gate_escalations.is_empty());
+    }
+
+    /// ★N9 — 데몬 경로에서 코퍼스 자기규칙 **수리가 침묵하지 않는다**(그러나 **유계**다).
+    ///
+    /// 【무엇이 틀렸었는가】 데몬의 캐시 진입점은 `resolve_with(...).gates` 만 취하고
+    /// `.notes` 를 통째로 버렸다. `repair_gate` 는 **사용자가 선언한 값을 시스템이 바꾸는
+    /// 행위**이고(그리고 N1 이후에는 Fatal 관문의 **강제 복원**까지 한다), 데몬에서 그 사실이
+    /// 어디에도 남지 않으면 사용자는 자기 override 가 왜 안 먹는지 알 방법이 없다.
+    /// CLI 는 같은 정보를 `cys.rs::resolve_gate_corpus` 가 stderr 로 내고 있었다 — 두 경로가
+    /// 갈려 있던 것이다.
+    ///
+    /// 【그러나 반복 발행은 재난 ① 방향】 이 캐시는 watchdog 틱마다 조회된다. 히트에서도
+    /// 찍으면 24/365 데몬 로그가 같은 줄로 덮여 진짜 신호가 묻힌다. 그래서 **캐시 미스 1회**
+    /// 라는 유계성을 이 검체가 단언한다.
+    #[test]
+    fn daemon_gate_corpus_notes_are_published_once_per_resolution() {
+        // ⓐ 계측 타당성 — 이 봉투가 **실제로** 사유를 만든다(사유가 0이면 아무것도 못 잰다).
+        let env = serde_json::json!({
+            "source": "replace",
+            "gates": [{"id": "synthetic-gate", "needles": ["Synthetic gate question line?"]}]
+        });
+        let resolved = frg::resolve_with(Some(&env), true);
+        assert!(
+            !resolved.notes.is_empty(),
+            "이 봉투가 사유를 만들지 않는다면 이 검체는 아무것도 재지 못한다(계측 무효)"
+        );
+
+        // ⓑ ★배선 핀 — 데몬이 그 사유를 버리지 않는다.
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let at = prod.find("    fn corpus(").expect("코퍼스 캐시 진입점 소실");
+        let body = &prod[at..];
+        let end = body.find("\n    }\n").expect("코퍼스 캐시 본문 끝을 못 찾았다");
+        assert!(
+            !body[..end].contains("resolve_with(envelope, override_on).gates"),
+            "데몬이 해소 사유(.notes)를 그 자리에서 통째로 버린다 — 자기규칙 수리·Fatal 복원이 \
+             사용자에게 보이지 않는다"
+        );
+        assert!(
+            body[..end].contains("for n in &fresh_notes"),
+            "사유를 보관만 하고 아무 데도 내지 않는다 — 사용자에겐 그대로 침묵이다"
+        );
+
+        // ⓒ ★유계성 — 발행 재료는 **캐시 미스에서만** 나온다. 히트에서도 나오면 watchdog 틱
+        //    마다 같은 줄이 반복돼 로그가 판정을 덮는다(재난 ① 방향).
+        let mut c = ScanCaches::default();
+        let (_, first) = c.corpus_with_notes("claude", Some(&env), true);
+        assert_eq!(
+            first, resolved.notes,
+            "데몬 경로의 사유가 해소본과 다르다(중간에 갈렸다)"
+        );
+        let (_, again) = c.corpus_with_notes("claude", Some(&env), true);
+        assert!(
+            again.is_empty(),
+            "캐시 히트에서도 사유가 다시 나온다 — 24/365 데몬에서 같은 줄이 무한 반복된다: \
+             {again:?}"
+        );
+        // 그러나 **버린 것은 아니다** — 캐시가 보관하고 있어 다음 소비자가 읽을 수 있다.
+        assert_eq!(
+            c.gate_corpus["claude"].notes, resolved.notes,
+            "사유가 캐시에 보관되지 않았다(발행 1회 뒤 증발)"
+        );
     }
 
     /// ★오염 차단 핀 — 관문 코퍼스가 `approval_patterns` 로 **흘러들지 않는다**.

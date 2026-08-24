@@ -978,11 +978,22 @@ pub fn reset_in_progress_with(owner_alive: &dyn Fn(u32) -> bool) -> bool {
 // 실행 1단계 — 정지·등록 해제 (부수효과 크므로 테스트에서 호출하지 않는다)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Windows GUI 프로세스에서 자식 콘솔 창이 뜨지 않게 하는 플래그(CREATE_NO_WINDOW=0x08000000).
+/// Windows GUI 프로세스에서 자식 콘솔 창이 뜨지 않게 한다(CREATE_NO_WINDOW 상당).
+///
+/// ★N4 편입(2026-08-24) — 종전엔 이 자리에서 그 flag 값(0x0800_0000)을 **직접** 얹었고,
+/// 그래서 U-7 의 규약("프로덕션의 자식 분리·콘솔 정책은 [`crate::SpawnPolicy`] 하나만
+/// 경유한다") **밖**에 있었다. 규약을 지키는 소스 핀의 스캔 목록이 화이트리스트였던 탓에
+/// 이 파일은 목록 밖이었고 — "화이트리스트 관리 자체가 결함원" 이라는 그 핀의 진단이 옳았음을
+/// **트리의 실물 위반이 증명한 자리**가 여기다.
+///
+/// 지금은 등급 [`crate::ChildLifetime::Attached`] 로 위임한다. 값·행동은 종전과 같다
+/// (`Attached` = 분리 없음 + Windows 콘솔 창 은폐). 등급 선택의 근거도 그대로다:
+/// 이 헬퍼의 세 호출부(schtasks · taskkill 2곳)는 전부 바로 뒤에서 `output()` 으로 끝까지
+/// 기다리는 **유계 자식**이라 떼면 안 된다.
 #[cfg(windows)]
 fn no_console_win(cmd: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x0800_0000);
+    use crate::SpawnPolicy as _;
+    cmd.spawn_policy(crate::ChildLifetime::Attached);
 }
 
 /// 이름이 정확히 `cysd` 인 전 프로세스 pid 수집(doctor `pid_is_cysd` 판정 기준 공유 —

@@ -657,6 +657,92 @@ pub fn merge_desired_hooks(
     Ok(added)
 }
 
+/// **이미 등록된 우리 훅의 `timeout` 만 재조정**한다 — 훅을 새로 설치하지 않는다(U-29 · M-09-a).
+///
+/// ## 무엇이 결함이었나 (2026-08-24 · 기준선 v0.14.24 ↔ 현재 격리 실주행 대조)
+///
+/// GUI 인앱 업데이트는 **항상** `cys init-pack --no-install-hook` 으로 내려온다
+/// (`src-tauri/src/main.rs` `maybe_apply_pending_update`). 그 플래그는 [`setup_isolated_config_dir`]
+/// 의 훅 병합을 통째로 건너뛰므로 **팩 파일은 새 훅으로 교체되는데 훅 *등록*(settings.json 의
+/// `timeout` 필드)은 갱신되지 않는다**(격리 실주행 실측: 업데이트 전후 등록부 바이트 동일).
+///
+/// 그런데 새 훅은 종전보다 **느리다**(같은 대조의 실측): python 프로세스 기동 14→16회 ·
+/// `cys` 호출 3→4회 · 응답 지연 1초 환경에서 14.83→17.12초, 2초에서 27.80→32.15초,
+/// 3초에서 40.77→47.15초. 즉 `timeout` 이 [`HOOK_TIMEOUT_ROLE_BOOTSTRAP_S`] 로 등록된 기계는
+/// 무해하지만, **옛 하네스 기본 상한([`HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S`])이 남은 기계는
+/// 절단 확률이 올라간다** — 그리고 인앱 업데이트 사용자가 정확히 그 상태가 된다. U-21 이 만든
+/// 축이 **도달하지 못해서** 나빠지는 자리이므로, 수리는 값이 아니라 **도달성**이다.
+///
+/// ## 왜 이것이 `--no-install-hook` 의 존재 이유를 깨지 않는가
+///
+/// 그 플래그가 지키는 것은 둘이다 — ①사용자 프로필(`~/.claude*`) 불가침 ②훅을 새로 **설치**하지
+/// 않는다(활성 프로필 재직렬화·정상 `.bak-cys` 클로버 방지). 이 함수는 둘 다 지킨다:
+///  · **대상이 격리 config dir 한 곳**이다. 호출부가 개인 프로필 경로를 넘기지 않는다 — 사용자
+///    프로필은 이 경로에서 읽지도 쓰지도 않는다(그쪽은 종전대로 생략된 채 남는다).
+///  · **파일이 없으면 만들지 않고 즉시 반환**한다. 등록이 없다는 뜻이고, 여기서 파일을 만드는
+///    것이 곧 '훅 설치'다(회귀 핀 `no_install_hook_consistency` 가 그 부재를 단언한다).
+///  · **이벤트·엔트리를 추가하지 않는다.** 집행은 U-21 이 이미 만든 교체 경로
+///    [`raise_hook_timeout_in`] 하나이고, 그것은 `command` 가 바이트 동등인 기존 hook 객체의
+///    `timeout` 키만 만지므로 구조적으로 append 가 불가능하다(새 기구를 만들지 않는다).
+///  · **값이 실제로 바뀌지 않으면 쓰지 않는다.** 한 기계에서 이 함수가 디스크를 만지는 것은
+///    스큐가 남아 있던 **1회뿐**이고, 그 뒤의 모든 업데이트는 재직렬화 0·백업 무접촉이다.
+///  · `max(기존, 선언)` — 사용자가 더 크게 잡아둔 값은 **내리지 않는다**(오살 금지 · 그 술어도
+///    [`raise_hook_timeout_in`] 소유다).
+///
+/// ## 롤백
+/// 선언값은 [`declared_timeout_for`] 를 통과한다 — 축 노브(`CYS_HOOK_TIMEOUT_V1=1`)나 마스터
+/// (`CYS_BOOT_GATES=0`)를 누르면 선언이 `None` 이 되고 이 함수는 **아무 파일도 만지지 않는다**.
+///
+/// 반환: 실제로 값이 오른 항목의 사람용 라벨. 빈 벡터 = 만질 것이 없었다(정상·멱등).
+pub fn retune_registered_hook_timeouts(
+    settings_path: &Path,
+    pack_dir: &Path,
+    hooks: &[DesiredHook],
+) -> Result<Vec<String>, String> {
+    // ★'없으면 만들지 않는다' — 이 한 줄이 '재조정'과 '설치'를 가르는 경계다.
+    if !settings_path.exists() {
+        return Ok(vec![]);
+    }
+    if std::fs::symlink_metadata(settings_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} is a symlink — refusing to write",
+            settings_path.display()
+        ));
+    }
+    let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
+        // 빈 파일 = 등록 0 — 만질 것이 없다(빈 객체로 덮어쓰지 않는다).
+        Ok(s) if s.trim().is_empty() => return Ok(vec![]),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("settings parse error: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("settings read error: {e}")),
+    };
+    if !root.is_object() {
+        return Err("settings root is not an object".into());
+    }
+    let mut raised: Vec<String> = Vec::new();
+    for h in hooks {
+        // 선언이 없는 훅(SessionStart)은 축 자체가 없다 — 만지지 않는다.
+        let Some(want) = declared_timeout_for(h) else {
+            continue;
+        };
+        let desired = hook_command_for(pack_dir, h.script);
+        if raise_hook_timeout_in(&mut root, h.event, &desired, want) {
+            raised.push(format!("{}←{} (timeout={want}s 재조정)", h.event, h.script));
+        }
+    }
+    if raised.is_empty() {
+        return Ok(raised);
+    }
+    let backup = format!("{}.bak-cys", settings_path.display());
+    std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
+    let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    write_atomic(settings_path, body.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(raised)
+}
+
 /// 설치 직후 **'등록 집합 ⊇ 소망 집합'** 검증(W3 게이트) — 미충족 항목을 반환한다(빈 벡터=충족).
 ///
 /// 왜 병합 뒤에 다시 읽는가: 병합기는 '내가 쓴 것'을 알지만 **디스크가 실제로 그 상태인지**는
@@ -961,7 +1047,29 @@ fn setup_isolated_config_dir(install_hooks: bool) {
         // ★G3(--no-install-hook 일관성): 종전엔 이 플래그가 ~/.claude 대상만 막고 격리 config dir
         // 훅 병합(아래)은 그대로 돌았다 — 훅 억제를 요청한 운영자에게 훅이 몰래 등록되는 비일관.
         // 라우터는 훅이 아니므로 위에서 시드 유지, 훅 계열(병합·검증·개인 프로필)은 전부 생략.
-        println!("[pack] 훅 미설치(--no-install-hook) — 격리 config·개인 프로필 훅 등록 생략");
+        //
+        // ★U-29(M-09-a · 2026-08-24): 그 억제가 **이미 등록된 우리 훅의 timeout 재조정까지**
+        //   삼키면, GUI 인앱 업데이트로 올라온 기계는 **새(더 느린) 훅을 옛 상한 아래에서** 돌린다
+        //   — U-21 이 고친 것보다 오히려 나빠지는 유일한 축이다. '설치'와 '재조정'은 다른 행위이며,
+        //   아래 함수는 파일을 만들지도·엔트리를 추가하지도·개인 프로필을 만지지도 않는다
+        //   (계약 전문과 실측 근거는 그 함수 문서에 있다). 개인 프로필은 종전대로 무접촉이다.
+        let settings = cfg.join("settings.json");
+        match retune_registered_hook_timeouts(&settings, &pack_dir(), &AWAKENING_HOOKS) {
+            Ok(raised) if !raised.is_empty() => eprintln!(
+                "[pack] 등록된 각성 훅 timeout 재조정: {} ({})",
+                settings.display(),
+                raised.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[pack] ⚠ 각성 훅 timeout 재조정 건너뜀: {} — {e}",
+                settings.display()
+            ),
+        }
+        println!(
+            "[pack] 훅 미설치(--no-install-hook) — 격리 config·개인 프로필 훅 등록 생략\
+             (등록된 우리 훅의 timeout 재조정만 수행 · 신규 설치 0)"
+        );
         return;
     }
     // hook: <cfg>/settings.json 에 **소망 훅 집합(AWAKENING_HOOKS)** 을 이벤트 단위 멱등 병합.
@@ -3680,6 +3788,151 @@ mod tests {
             after_hi["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
             serde_json::json!(900)
         );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★U-29(M-09-a) · **재조정은 설치가 아니다** — `--no-install-hook` 경로가 쓰는 얇은 집행기.
+    ///
+    /// 이 테스트가 잡는 실패 넷이 곧 이 함수가 넘지 말아야 할 선이다:
+    ///   ① 파일이 없는데 **만든다**(= 훅 설치 · 회귀 핀 `no_install_hook_consistency` 파괴)
+    ///   ② 등록이 없는 이벤트에 **엔트리를 추가한다**(= 훅 설치)
+    ///   ③ 사용자가 더 크게 잡은 값을 **내린다**(오살 방향)
+    ///   ④ 만질 것이 없는데 **쓴다**(업데이트마다 재직렬화·정상 백업 클로버)
+    #[test]
+    fn retune_raises_registered_timeouts_without_ever_installing() {
+        let td = std::env::temp_dir().join(format!("cys-u29-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let pack = td.join("pack");
+        let ups = AWAKENING_HOOKS
+            .iter()
+            .find(|h| h.event == "UserPromptSubmit")
+            .unwrap();
+        let ours = hook_command_for(&pack, ups.script);
+        let want = ups.timeout.unwrap();
+
+        // ① 파일 부재 = 무동작·무생성.
+        let absent = td.join("absent.json");
+        assert!(retune_registered_hook_timeouts(&absent, &pack, &AWAKENING_HOOKS)
+            .unwrap()
+            .is_empty());
+        assert!(!absent.exists(), "등록부가 없는데 파일을 만들었다(= 훅 설치)");
+
+        // ② 우리 훅이 **아닌** 것만 있는 등록부 = 무동작·무추가·무쓰기.
+        let foreign = td.join("foreign.json");
+        let foreign_body = serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]}
+            ]}
+        }))
+        .unwrap();
+        std::fs::write(&foreign, &foreign_body).unwrap();
+        assert!(retune_registered_hook_timeouts(&foreign, &pack, &AWAKENING_HOOKS)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            foreign_body,
+            "우리 훅이 없는 등록부를 재직렬화했다(무변경이어야 한다)"
+        );
+        assert!(
+            !td.join("foreign.json.bak-cys").exists(),
+            "만질 것이 없는데 백업을 만들었다(정상 백업 클로버 경로)"
+        );
+
+        // ③ 우리 훅이 timeout 없이 등록된 등록부 = 그 키 하나만 오른다(사용자 항목 보존).
+        let skew = td.join("skew.json");
+        std::fs::write(
+            &skew,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "theme": "dark",
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]},
+                        {"hooks": [{"type": "command", "command": ours}]}
+                    ],
+                    "Stop": [{"hooks": [{"type": "command", "command": "sh /home/u/stop.sh"}]}]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let raised = retune_registered_hook_timeouts(&skew, &pack, &AWAKENING_HOOKS).unwrap();
+        assert_eq!(raised.len(), 1, "재조정 항목이 1건이 아니다: {raised:?}");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&skew).unwrap()).unwrap();
+        let arr = after["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "엔트리를 추가했다(= 훅 설치): {arr:?}");
+        assert_eq!(after["theme"], "dark", "사용자 비-훅 키 소실");
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "sh /home/u/stop.sh",
+            "다른 이벤트의 사용자 훅 소실"
+        );
+        assert_eq!(arr[0]["hooks"][0]["command"], "sh /home/u/mine.sh");
+        assert!(
+            arr[0]["hooks"][0].get("timeout").is_none(),
+            "남의 훅에 timeout 을 심었다(계약 위반)"
+        );
+        assert_eq!(arr[1]["hooks"][0]["timeout"], serde_json::json!(want));
+        // ⓐ 그 훅 **하나**는 이제 집행 축의 판정을 충족한다(같은 술어로 확인).
+        assert!(
+            verify_desired_hooks_registered(&skew, &pack, std::slice::from_ref(ups)).is_empty(),
+            "재조정 후에도 집행 축 판정이 미충족이다"
+        );
+        // ⓐ′ ★그러나 **소망 집합 전체를 충족시키지는 않는다** — 등록이 없던 SessionStart 는
+        //     여전히 없다. 이것이 '재조정'과 '설치'의 경계이며, 여기서 미충족이 사라지면
+        //     이 함수는 몰래 훅을 설치하고 있는 것이다.
+        assert!(
+            after["hooks"].get("SessionStart").is_none(),
+            "등록이 없던 이벤트를 만들었다(= 훅 설치): {after}"
+        );
+        assert_eq!(
+            verify_desired_hooks_registered(&skew, &pack, &AWAKENING_HOOKS).len(),
+            1,
+            "재조정이 소망 집합 전체를 채웠다 — 설치를 하고 있다"
+        );
+        // ⓑ 멱등 — 재실행은 만질 것이 없으므로 쓰지 않는다(백업 sentinel 무접촉으로 실측).
+        let backup = format!("{}.bak-cys", skew.display());
+        std::fs::write(&backup, "{\"_sentinel\":\"keep\"}").unwrap();
+        assert!(retune_registered_hook_timeouts(&skew, &pack, &AWAKENING_HOOKS)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{\"_sentinel\":\"keep\"}",
+            "멱등 재실행이 정상 백업을 덮었다"
+        );
+
+        // ④ 사용자가 더 크게 잡은 값은 내리지 않는다(한 방향으로만 여는 축).
+        let hi = td.join("hi.json");
+        std::fs::write(
+            &hi,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {"UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": ours, "timeout": 900}]}
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(retune_registered_hook_timeouts(&hi, &pack, &AWAKENING_HOOKS)
+            .unwrap()
+            .is_empty());
+        let after_hi: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hi).unwrap()).unwrap();
+        assert_eq!(
+            after_hi["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
+            serde_json::json!(900),
+            "더 큰 사용자 값을 내렸다(오살 방향)"
+        );
+
+        // ⑤ 파손 등록부는 **거부**한다(빈 객체로 덮어쓰기 = 훅 등록부 전소).
+        let broken = td.join("broken.json");
+        std::fs::write(&broken, "{ this is not json").unwrap();
+        assert!(retune_registered_hook_timeouts(&broken, &pack, &AWAKENING_HOOKS).is_err());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ this is not json");
+
         let _ = std::fs::remove_dir_all(&td);
     }
 

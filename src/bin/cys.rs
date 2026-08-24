@@ -2912,7 +2912,15 @@ fn run(command: Command) -> i32 {
                     let Some(role) = e["role"].as_str() else { continue };
                     if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
                         if let Some(sid) = r["surface_id"].as_u64() {
-                            let _ = inject_text(sid, "[DRAIN] 업데이트 재시작이 임박했다. 승인 프롬프트 대기 중이면 이 메시지는 무시하라. 아니면 지금 _round/SESSION_STATE.md와 자기 TODO를 저장하고 작업을 멈춰라. 작업 재개는 복원 후 master 지시를 기다린다.");
+                            // ★(N7) 방향은 그대로 fail-open 이되 **침묵하지 않는다**.
+                            //   여기서 통째로 버려지던 것은 관문 Hold 처방 전문이고, 이 신호를
+                            //   못 받은 노드는 업데이트 재시작 전에 상태를 저장하지 못한다.
+                            if let Err(e) = inject_text(sid, "[DRAIN] 업데이트 재시작이 임박했다. 승인 프롬프트 대기 중이면 이 메시지는 무시하라. 아니면 지금 _round/SESSION_STATE.md와 자기 TODO를 저장하고 작업을 멈춰라. 작업 재개는 복원 후 master 지시를 기다린다.") {
+                                eprintln!(
+                                    "[drain] {role} {} 저장 신호 미전달(계속 진행) — {e}",
+                                    surface_ref(sid)
+                                );
+                            }
                             n += 1;
                         }
                     }
@@ -7202,15 +7210,15 @@ mod seat_latch_negation_tests {
     fn gate_verdict_truth_table_is_decided_by_the_kernel_fact() {
         // 커널 사실 하나가 '파괴 가능'과 '보류'를 가른다 — 화면 문자열은 근거가 아니다.
         let tail = "❯ 2. Yes, I accept";
-        assert!(matches!(readiness_timeout_verdict(Some(true), "claude", 60, tail),
+        assert!(matches!(readiness_timeout_verdict(Some(true), "claude", 60, tail, None),
                          BootVerdict::GatePending { .. }),
                 "생존이 관측된 좌석을 실패로 판정 — 오살 경로(치명위험 ④) 신설");
-        assert!(matches!(readiness_timeout_verdict(Some(false), "claude", 60, tail),
+        assert!(matches!(readiness_timeout_verdict(Some(false), "claude", 60, tail, None),
                          BootVerdict::LaunchFailed { .. }),
                 "커널이 부재를 확정했는데 보류로 접힘 — 진짜 실패 좌석이 역할을 쥔 채 쌓인다");
         // ★'부재 ≠ 부정': 필드 부재(구 데몬)·조회 실패는 **판정 불가**다. 사망으로 접으면
         //   그 자체가 새 파괴 경로다(래치·gate 축의 null 규약과 동형).
-        assert!(matches!(readiness_timeout_verdict(None, "claude", 60, tail),
+        assert!(matches!(readiness_timeout_verdict(None, "claude", 60, tail, None),
                          BootVerdict::GatePending { .. }),
                 "판정 불가를 사망으로 접었다(부재≠부정 규약 위반)");
     }
@@ -7219,7 +7227,7 @@ mod seat_latch_negation_tests {
     fn gate_verdict_carries_the_screen_tail_as_evidence_only() {
         // 화면 꼬리는 **진단 근거**로만 실린다 — 판정은 이미 커널 사실이 끝냈다.
         let tail = "line-a\nline-b";
-        match readiness_timeout_verdict(Some(true), "claude", 60, tail) {
+        match readiness_timeout_verdict(Some(true), "claude", 60, tail, None) {
             BootVerdict::GatePending { gate, tail: t } => {
                 assert_eq!(t, tail, "처방 문안이 근거 없이 나간다");
                 // 어느 관문인지는 이 단위가 알지 못한다(관문 코퍼스는 뒤 단위 소유) —
@@ -7228,6 +7236,52 @@ mod seat_latch_negation_tests {
             }
             other => panic!("생존 좌석이 보류로 읽히지 않음: {other:?}"),
         }
+    }
+
+    /// ★N2 — 관문 id 를 **알면서 버리지 않는다**(`gate=unknown` 자리표시자 회귀 차단).
+    ///
+    /// 【무엇이 틀렸었는가】 이 판정기는 U-11 시절 "어느 관문인지 이 단위는 모른다"는 전제로
+    /// 리터럴 `"unknown"` 을 반환했다. U-12(코퍼스 해소)·U-13(관문 축 ready 판정)이 착지한 뒤
+    /// 그 전제는 깨졌다 — **같은 실행의 폴링 루프가 바로 앞 줄에서 `id=theme` 를 찍고 있었다.**
+    /// 그런데 판정기는 그 사실을 받지 않았고, 좌석 표식(`mark_gate_pending`)·사람 처방
+    /// (`print_gate_pending_prescription`)·상위 관측이 전부 `unknown` 으로 굳었다. 그러면
+    /// 관문별 `AbsenceCost`(theme=가역 vs 면책=비가역)를 **어디에서도 소비할 수 없다**.
+    #[test]
+    fn gate_verdict_carries_the_identified_gate_id_not_a_placeholder() {
+        let tail = "❯ 2. Yes, I accept";
+        // ⓐ 폴링이 관문을 식별했으면 그 id 가 그대로 실린다.
+        match readiness_timeout_verdict(Some(true), "claude", 60, tail, Some("bypass-disclaimer")) {
+            BootVerdict::GatePending { gate, .. } => assert_eq!(
+                gate, "bypass-disclaimer",
+                "알고 있던 관문 id 를 버리고 자리표시자를 실었다 — 좌석 표식·처방·상위 관측이 \
+                 전부 unknown 으로 굳고 부재의 비용(AbsenceCost)을 소비할 수 없다"
+            ),
+            other => panic!("생존 좌석이 보류로 읽히지 않음: {other:?}"),
+        }
+        // ⓑ 식별이 **없었으면** 모르는 것을 아는 척하지 않는다(빈 문자열도 미식별이다).
+        for none_ish in [None, Some("")] {
+            match readiness_timeout_verdict(Some(true), "claude", 60, tail, none_ish) {
+                BootVerdict::GatePending { gate, .. } => assert_eq!(
+                    gate, GATE_ID_UNIDENTIFIED,
+                    "판정하지 않은 관문 이름을 단정했다"
+                ),
+                other => panic!("생존 좌석이 보류로 읽히지 않음: {other:?}"),
+            }
+        }
+        // ⓒ ★배선 핀 — 부트 폴링이 **실제로 관측한 id** 를 넘긴다. 순수 함수만 고치고 호출부가
+        //    상수를 넘기면 ⓐ 는 아무것도 지키지 못한다(이 저장소가 반복해 맞은 형태).
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let ci = prod
+            .find("readiness_timeout_verdict(surface_agent_alive(sid)")
+            .expect("부트 폴링의 판정기 호출부가 사라졌다 — 배선 핀이 눈이 멀었다");
+        // ★char 경계 안전 절단 — 이 파일의 주석은 한글이라 바이트 슬라이스는 패닉한다
+        //   (계측기가 판정 대신 패닉으로 죽으면 그것도 초록이 아니라 고장이다).
+        let call: String = prod[ci..].chars().take(400).collect();
+        assert!(
+            call.contains("gate_logged.as_deref()"),
+            "폴링이 관측한 관문 id 를 판정기에 넘기지 않는다(U-11 자리표시자 회귀):\n{call}"
+        );
     }
 
     #[test]
@@ -7297,6 +7351,7 @@ mod seat_latch_negation_tests {
                 "claude",
                 90,
                 "tail",
+                None,
             )
         };
 
@@ -7316,13 +7371,14 @@ mod seat_latch_negation_tests {
                 surface_agent_alive_in(&[json!({"surface_id": SID})], SID),
                 "claude",
                 90,
-                "tail"
+                "tail",
+                None
             ),
             BootVerdict::GatePending { .. }
         ));
         // 좌석 행 자체가 없어도(조회 실패) 보류다.
         assert!(matches!(
-            readiness_timeout_verdict(surface_agent_alive_in(&[], SID), "claude", 90, "tail"),
+            readiness_timeout_verdict(surface_agent_alive_in(&[], SID), "claude", 90, "tail", None),
             BootVerdict::GatePending { .. }
         ));
         // ⓑ 관측 생존 — 종전대로 보류.
@@ -9177,6 +9233,11 @@ enum BootVerdict {
     LaunchFailed { evidence: String },
 }
 
+/// 관문을 **식별하지 못했을 때**만 쓰는 라벨(N2 · 2026-08-24). 자리표시자는 한 곳에서만
+/// 정의한다 — 리터럴이 여기저기 박히면 "알면서 버린 자리" 와 "정말 모르는 자리" 가 밖에서
+/// 구별되지 않는다. 그 구별이 사라진 것이 이 파일의 `gate=unknown` 결함 본체였다.
+const GATE_ID_UNIDENTIFIED: &str = "unknown";
+
 /// readiness **타임아웃**의 분류 — 순수 함수(진리표 테스트 대상 · 화면 문자열 비의존).
 ///
 /// | `alive`(데몬 관측) | 판정 | 근거 |
@@ -9212,6 +9273,7 @@ fn readiness_timeout_verdict(
     agent: &str,
     max_wait_secs: u64,
     tail: &str,
+    observed_gate: Option<&str>,
 ) -> BootVerdict {
     if alive == Some(false) {
         return BootVerdict::LaunchFailed {
@@ -9233,9 +9295,15 @@ fn readiness_timeout_verdict(
         };
     }
     BootVerdict::GatePending {
-        // 어느 관문인지는 이 단위가 판정하지 않는다(관문 코퍼스는 뒤 단위의 정본이다).
-        // 여기서 아는 사실은 "살아 있는데 준비 미확정" 하나이고, 라벨은 그 사실만 말한다.
-        gate: "unknown".to_string(),
+        // ★(N2) 관문 id 는 이 단위가 **판정하지 않고 전달받는다**. 판정은 여전히 뒤 단위
+        //   (`readiness::judge` → 관문 코퍼스)의 소유이고, 이 자리가 하는 일은 같은 실행이
+        //   이미 관측한 사실을 버리지 않는 것뿐이다. 종전엔 리터럴 자리표시자를 실었고,
+        //   그래서 좌석 표식·사람 처방·상위 관측이 전부 미식별로 굳었다.
+        //   관측이 없었을 때만(폴링이 관문을 한 번도 못 봤다) 자리표시자다.
+        gate: observed_gate
+            .filter(|g| !g.is_empty())
+            .unwrap_or(GATE_ID_UNIDENTIFIED)
+            .to_string(),
         tail: tail.to_string(),
     }
 }
@@ -9737,7 +9805,15 @@ fn boot_agent_on_surface(
         //   '없다(파괴 가능)' 와 '있는데 준비 미확정(보류)' 을 가른다 — 판정식 전문은
         //   `readiness_timeout_verdict` doc 표 참조.
         let verdict = boot_verdict_effective(
-            readiness_timeout_verdict(surface_agent_alive(sid), agent, max_wait_secs, &tail),
+            readiness_timeout_verdict(
+                surface_agent_alive(sid),
+                agent,
+                max_wait_secs,
+                &tail,
+                // ★(N2) 폴링 루프가 관측한 관문 id. 바로 위 루프가 `id=…` 로 stderr 에 찍은
+                //   그 값이며, 여기서 버리면 좌석 표식·처방이 전부 미식별로 굳는다.
+                gate_logged.as_deref(),
+            ),
             gate_close_override,
         );
         if let BootVerdict::GatePending { gate, .. } = &verdict {
@@ -9845,7 +9921,12 @@ fn inject_directive_after_ready(
         let tail = screen_tail_lines(&gate_guard_screen(sid).unwrap_or_default(), 5);
         // 사전 판정을 통과한 뒤 뜬 관문이므로 id 를 특정하지 않는다 — 화면 꼬리가 근거다
         // (`readiness_timeout_verdict` 의 `"unknown"` 과 같은 규약).
-        return Ok(settle_gate_pending(sid, "unknown", tail, gate_close_override));
+        return Ok(settle_gate_pending(
+            sid,
+            GATE_ID_UNIDENTIFIED,
+            tail,
+            gate_close_override,
+        ));
     }
 
     // ── 4) 주입 확인 — ★(W2 · B14/CS-3⑤) **신호의 질을 화면 문자열 → ack 계약으로 교체** ──
@@ -12735,7 +12816,14 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                     Ok(BootVerdict::Ready) => {
                         ok += 1;
                         let directive = restore_directive(role);
-                        let _ = inject_text(sid, directive);
+                        // ★(N7) 좌석 내 재연결은 성공했어도 복원 디렉티브가 유실될 수 있다 —
+                        //   종전엔 그 유실이 조용해서 '재기동 ok' 로만 집계됐다. 방향은 무변.
+                        if let Err(e) = inject_text(sid, directive) {
+                            eprintln!(
+                                "· {role}: 좌석 내 재연결은 됐으나 **복원 디렉티브 미주입** \
+                                 (좌석 보존 · 계속 진행) — {e}"
+                            );
+                        }
                         continue;
                     }
                     // ★(U-11) 이 호출부의 귀결은 앞의 둘과 또 다르다 — **fresh 폴백을 하지 않는다**.
@@ -12784,7 +12872,13 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                                 json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
                             );
                         }
-                        let _ = inject_text(sid, restore_directive(role));
+                        // ★(N7) 재기동 뒤 복원 디렉티브 유실도 조용하지 않다(방향 무변).
+                        if let Err(e) = inject_text(sid, restore_directive(role)) {
+                            eprintln!(
+                                "· {role}: 재기동은 됐으나 **복원 디렉티브 미주입** \
+                                 (좌석 보존 · 계속 진행) — {e}"
+                            );
+                        }
                     }
                 }
             } else {
@@ -15891,7 +15985,27 @@ mod tests {
         );
         fill_missing_fields(&mut mine, embed.get("claude"));
         let r = frg::resolve_from_spec(&mine);
-        assert_eq!(r.gates.len(), 1, "디스크 선언이 임베드에 덮였다(사용자 주권 침해)");
+        // ★N1 정정 — 정본은 "선언 1건 + 강제 복원된 Fatal 빌트인"이다. 종전 `len()==1` 은
+        //   "replace 한 줄이 킬체인 관문을 전부 없애는 것이 정상"을 박제하고 있었다.
+        //   주권 침해와 Fatal 바닥을 가르는 판별자는 개수가 아니라 **가역 관문**(theme)이다.
+        let fatal: Vec<String> = frg::builtin()
+            .into_iter()
+            .filter(|g| g.absence_is_fatal())
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(
+            r.gates.len(),
+            1 + fatal.len(),
+            "디스크 선언이 임베드에 덮였거나 Fatal 바닥이 사라졌다: {:?}",
+            r.gates.iter().map(|g| g.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            !r.gates.iter().any(|g| g.id == "theme"),
+            "가역 관문까지 되살아났다 = 코드 정본 폴백(사용자 주권 침해)의 형태다"
+        );
+        for id in &fatal {
+            assert!(r.gates.iter().any(|g| &g.id == id), "Fatal 관문 {id} 소실");
+        }
         assert_eq!(r.gates[0].id, "mine");
 
         let _ = std::fs::remove_dir_all(&td);
@@ -18158,6 +18272,48 @@ mod tests {
             screen_is_bare_shell_on(framed_then_dead, false),
             "사망 문면 축이 없다 — 프레임 잔상이 죽은 셸을 살아있는 것으로 만든다"
         );
+    }
+
+    /// ★N7 — 주입 Hold 를 **침묵으로 버리지 않는다**(fail-silent 종결 규율의 이빨).
+    ///
+    /// 【무엇이 틀렸었는가】 세 지점이 `inject_text` 의 반환을 통째로 버렸다: `[DRAIN]`
+    /// 브로드캐스트 · restore 의 **좌석 내 재연결** 디렉티브 · restore 의 fresh 재기동 뒤
+    /// **복원 디렉티브**. 좌석은 안전했지만(fail-open 은 이 자리의 옳은 방향이다)
+    /// `gate_hold_message` 가 만든 **처방 문자열이 통째로 폐기**됐다 — `[DRAIN]` 이 안 나간
+    /// 노드는 업데이트 재시작 전에 상태를 저장하지 못하고, restore 경로는 복원 디렉티브가
+    /// 유실돼도 '재기동 ok' 로 집계된다. 같은 캠페인이 P4-6 에서 "fail-open 은 선택일 수
+    /// 있어도 fail-silent 는 아니다" 를 규율로 선언했으므로 규율 위반이기도 하다.
+    ///
+    /// 계약: **방향은 그대로**(실패해도 진행한다) · 그러나 사유는 반드시 stderr 로 나간다.
+    #[test]
+    fn injection_hold_is_never_discarded_silently_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let discarded = prod.matches("let _ = inject_text(").count();
+        assert_eq!(
+            discarded, 0,
+            "주입 결과를 통째로 버리는 지점이 {discarded}곳 남았다 — 관문 Hold 처방이 \
+             밖에서 보이지 않는다(그물이 없는 것과 눈을 감은 것이 구별되지 않는다)"
+        );
+        // ★'지우기' 로 통과하는 경로 차단 — 호출 자체를 없애도 위 0 은 만족되므로,
+        //   사유를 내는 형태의 **실측 개수를 동결**한다. 5 = 이번에 고친 셋 + 종전부터
+        //   옳게 처리하던 둘(부트 주입 직후 · 사이클 재주입).
+        assert_eq!(
+            prod.matches("if let Err(e) = inject_text(").count(),
+            5,
+            "주입 사유를 남기는 지점 수가 동결값(5)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
+        );
+        // 그리고 이번에 고친 **세 지점**이 각자 자기 사유를 낸다(개수만으로는 이사를 못 잡는다).
+        for marker in [
+            "저장 신호 미전달(계속 진행)",
+            "좌석 내 재연결은 됐으나 **복원 디렉티브 미주입**",
+            "재기동은 됐으나 **복원 디렉티브 미주입**",
+        ] {
+            assert!(
+                prod.contains(marker),
+                "Hold 사유 문안이 사라졌다: {marker:?}"
+            );
+        }
     }
 
     /// ★소스 핀(결함 3·4) — 관문 코퍼스의 **단일 소스**와 관측 실패의 **가시성**.
