@@ -9663,7 +9663,7 @@ def h_timeout_u29():
                 for h in e2["hooks"]:
                     h.pop("timeout", None)
             root["hooks"]["UserPromptSubmit"].insert(
-                0, {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]})
+                0, {"hooks": [{"type": "command", "command": "sh /home/x/mine.sh"}]})
             root["theme"] = "dark"
             with open(sfile, "w", encoding="utf-8") as f:
                 json.dump(root, f, ensure_ascii=False, indent=2)
@@ -9681,7 +9681,7 @@ def h_timeout_u29():
                  % (want, mine[0]))
             need(len(after["hooks"]["UserPromptSubmit"]) == 2,
                  "같은 이벤트의 사용자 항목이 사라지거나 늘었다: %r" % after["hooks"]["UserPromptSubmit"])
-            need(after["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "sh /home/u/mine.sh",
+            need(after["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "sh /home/x/mine.sh",
                  "사용자 훅이 사라졌다(오살)")
             need("timeout" not in after["hooks"]["UserPromptSubmit"][0]["hooks"][0],
                  "남의 훅에 timeout 을 심었다(계약 위반)")
@@ -9712,7 +9712,7 @@ def h_timeout_u29():
             other = os.path.join(tmp, "cfg-other")
             os.makedirs(other, exist_ok=True)
             body = json.dumps({"hooks": {"UserPromptSubmit": [
-                {"hooks": [{"type": "command", "command": "sh /home/u/mine.sh"}]}]}},
+                {"hooks": [{"type": "command", "command": "sh /home/x/mine.sh"}]}]}},
                 ensure_ascii=False, indent=2)
             _w(os.path.join(other, "settings.json"), body, 0o644)
             r4 = _init(["--no-install-hook"], cfgdir=other)
