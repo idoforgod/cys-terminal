@@ -936,9 +936,36 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// T1-3 발신자 해석 캐시 항목: (소속 surface, 해석 시각, peer start_time).
-/// start_time(없으면 None)은 pid 재사용 식별자 — 같은 pid라도 incarnation이 다르면 재해석한다.
-type CallerCacheEntry = (Option<u64>, f64, Option<u64>);
+/// T1-3 발신자 해석 캐시 항목. (P0-2에서 3-튜플 → 명명 구조체 전환 — QueueEntry 관례와 동형:
+/// 필드가 늘 때 컴파일러가 전 접점의 누락을 강제 검출한다.)
+/// · `sid`: 해석된 소속 surface — None = 음성(어느 pane에도 귀속 안 됨 → ACL상 external 계열).
+/// · `ts`: 해석 시각(epoch초) — 60초 TTL의 기준(양성·음성 공통, 종전과 동일).
+/// · `start_time`: peer start_time — pid 재사용 식별자. 같은 pid라도 incarnation이 다르면
+///   재해석한다. None = 합성 주입(테스트)·조회 실패 — 캐시를 신뢰한다.
+/// · `gen`: 각인 세대(P0-2 음성 세대 무효화) — resolve_caller_surface가 pid_to_sid 스냅샷
+///   **이전**에 1회 캡처한 `daemon.caller_gen` 값(삽입 시점 재판독 금지 — TOCTOU 계약).
+///   음성 항목은 각인 세대 ≠ 현재 세대이면 TTL 잔여와 무관하게 재해석된다 — surface 등록·
+///   claim 성공이 세대를 올리므로 '등록 직후 음성 60s 고착' 레이스가 세대 단위로 끊긴다.
+///   양성 항목은 세대를 보지 않는다(sid 매핑의 정합은 start_time 가드가 지킨다).
+#[derive(Clone, Copy, Debug)]
+pub struct CallerCacheEntry {
+    pub sid: Option<u64>,
+    pub ts: f64,
+    pub start_time: Option<u64>,
+    pub gen: u64,
+}
+
+impl CallerCacheEntry {
+    /// 유일 생성자 — 필드 순서 = (sid, ts, start_time, gen). 구 3-튜플 리터럴의 기계 치환처.
+    pub fn new(sid: Option<u64>, ts: f64, start_time: Option<u64>, gen: u64) -> Self {
+        Self {
+            sid,
+            ts,
+            start_time,
+            gen,
+        }
+    }
+}
 
 /// 워커 인스턴스 dedup: 복수 워커가 같은 역할명(→같은 todo 파일)을 공유하지 않도록,
 /// "worker" 요청에 충돌 없는 고유 역할명(worker, worker-2, worker-3 …)을 배정한다.
@@ -1364,6 +1391,14 @@ pub struct Daemon {
     pub todo_verdict: Mutex<HashMap<String, (f64, &'static str, Option<String>)>>,
     /// T1-3 발신자 해석 캐시: caller pid → 항목 — 60초 TTL (항목 정의는 CallerCacheEntry).
     pub caller_cache: Mutex<HashMap<u32, CallerCacheEntry>>,
+    /// (P0-2) 발신자 캐시 '음성' 무효화 세대 카운터. surface 등록(create_surface_with_env)과
+    /// claim 성공(handlers claim_role)이 각자의 임계영역 **종료 후 무락 지점**에서
+    /// fetch_add(Relaxed)로 올리고, resolve_caller_surface가 load(Relaxed)로만 읽는다 —
+    /// 락 개입 0. 독립 AtomicU64라 caller_cache Mutex·surfaces Mutex 어느 쪽과도 락쌍을
+    /// 만들지 않는다(락 순서 규율 surfaces→roles→surface.role 무변경 — surfaces 맵 안에
+    /// 두면 히트 경로가 caller_cache를 쥔 채 surfaces를 잡는 신설 락쌍이 생겨 기각됨).
+    /// 재기동 간 혼동 없음(카운터·캐시 모두 데몬 인메모리 동수명). u64 오버플로 비실재.
+    pub caller_gen: AtomicU64,
     /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface
     /// 재반환(추가 spawn 0). TTL(CREATE_IDEM_TTL_SECS) 만료 엔트리는 조회 시 lazy 제거.
     pub create_idem: Mutex<HashMap<String, (u64, f64)>>,
@@ -2131,6 +2166,7 @@ impl Daemon {
             todo_progress: Mutex::new(HashMap::new()),
             todo_verdict: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
+            caller_gen: AtomicU64::new(0),
             create_idem: Mutex::new(HashMap::new()),
             create_owner: Mutex::new(HashMap::new()),
             create_caller: Mutex::new(HashMap::new()),
@@ -2874,6 +2910,11 @@ impl Daemon {
                 registered_role = Some(final_role);
             }
         }
+        // (P0-2 · 세대 증가 ⓐ) surface 등록이 pid→sid 매핑을 바꿨다 — 이 순간 이전에 각인된
+        // 발신자 캐시의 '음성' 판정은 낡았을 수 있으므로 세대를 올려 다음 히트에서 재해석을
+        // 강제한다. surfaces/roles 임계 블록 **종료 직후의 무락 지점**(아래 tombstones 리프
+        // 락과 동일 위치 계열)에서 올린다 — 어떤 락도 쥐지 않아 락 순서 규율 무변경.
+        self.caller_gen.fetch_add(1, Ordering::Relaxed);
         // ★W2a 해제 불변식: 역할이 명시적으로 (재)기동됐다 = 부활 의도. 묘비에서 제거해
         // 이후 이 역할의 비정상 종료는 다시 정상 부활 대상이 되게 한다("살아있는 역할=묘비 아님").
         // tombstones는 리프 락 — surfaces/roles 락 해제 후 획득(락 순서 무변경).

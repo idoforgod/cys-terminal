@@ -436,24 +436,40 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
 fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
     {
         let cache = daemon.caller_cache.lock().unwrap();
-        if let Some((sid, ts, cached_start)) = cache.get(&caller_pid) {
-            if crate::state::now_epoch() - ts < 60.0 {
+        if let Some(entry) = cache.get(&caller_pid) {
+            // (P0-2) 음성 세대 무효화: 음성(sid=None) 항목은 각인 세대 ≠ 현재 세대이면 TTL
+            // 잔여와 무관하게 재해석한다(fall through) — '외부'로 판정된 직후 그 pid의 pane이
+            // 등록되면(등록·claim 성공이 caller_gen을 올림) 음성이 60s 고착되지 않는다.
+            // 양성 항목은 세대를 보지 않는다(매핑 정합은 아래 start_time 가드가 지킨다) —
+            // 장수 음성 peer(Tauri GUI의 키스트로크당 send_input)는 세대가 멈춰 있는 한 계속
+            // 캐시로 흡수된다(의도된 동작: 키스트로크당 전 프로세스 스냅샷 방지).
+            let negative_stale = entry.sid.is_none()
+                && entry.gen != daemon.caller_gen.load(Ordering::Relaxed);
+            if !negative_stale && crate::state::now_epoch() - entry.ts < 60.0 {
                 // pid 재사용 차단: 캐시된 start_time이 있으면 현재 peer pid의 start_time과
                 // 대조한다. 단명 CLI가 죽고 OS가 같은 pid를 다른 pane 프로세스에 재할당하면
                 // incarnation(start_time)이 달라지므로 캐시를 무효화하고 조상 추적을 재실행한다.
                 // start_time이 None(합성 주입)이거나 대상 프로세스를 못 찾으면 캐시를 신뢰한다.
-                match cached_start {
+                match entry.start_time {
                     Some(cs) => {
-                        if crate::state::peer_start_time(caller_pid).is_none_or(|now| now == *cs) {
-                            return *sid;
+                        if crate::state::peer_start_time(caller_pid).is_none_or(|now| now == cs) {
+                            return entry.sid;
                         }
                         // start_time 불일치 → pid 재사용 → 아래로 떨어져 재해석
                     }
-                    None => return *sid,
+                    None => return entry.sid,
                 }
             }
         }
     }
+    // (P0-2 · TOCTOU 계약) 세대는 pid_to_sid 스냅샷 **이전**에 1회 캡처해 그 값으로 캐시
+    // 항목을 각인한다 — 삽입 시점 재판독 금지. 스냅샷 이후 등록된 surface는 이번 워크가 못
+    // 찾으므로(음성), 그 사이 등록이 끼면 각인 세대 < 현재 세대가 되어 다음 조회가 반드시
+    // 재해석한다. 삽입 시점에 다시 읽으면 '워크 도중 등록'이 이미 오른 세대로 각인돼 일치=
+    // 신뢰가 되고, 정확히 이 기제가 닫으려는 레이스(등록 직후 음성 stale 60s)가 되살아난다.
+    // 비용: '워크 중 등록·즉시 재조회'는 재해석 1회를 추가로 태운다(정확성 우선 — 스캔 1회
+    // 유계).
+    let gen_at_snapshot = daemon.caller_gen.load(Ordering::Relaxed);
     let pid_to_sid: std::collections::HashMap<u32, u64> = daemon
         .surfaces
         .lock()
@@ -491,11 +507,14 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
     const CALLER_CACHE_CAP: usize = 4096;
     let now = crate::state::now_epoch();
     let mut cache = daemon.caller_cache.lock().unwrap();
-    cache.retain(|_, (_, ts, _)| now - *ts < 60.0);
-    cache.insert(caller_pid, (found, now, caller_start));
+    cache.retain(|_, e| now - e.ts < 60.0);
+    cache.insert(
+        caller_pid,
+        crate::state::CallerCacheEntry::new(found, now, caller_start, gen_at_snapshot),
+    );
     if cache.len() > CALLER_CACHE_CAP {
         // 만료 회수 후에도 캡 초과(60초 내 대량 유입) — 가장 오래된 항목부터 캡까지 솎아낸다.
-        let mut by_age: Vec<(u32, f64)> = cache.iter().map(|(p, (_, ts, _))| (*p, *ts)).collect();
+        let mut by_age: Vec<(u32, f64)> = cache.iter().map(|(p, e)| (*p, e.ts)).collect();
         by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         for (pid, _) in by_age.into_iter().take(cache.len() - CALLER_CACHE_CAP) {
             cache.remove(&pid);
@@ -3763,6 +3782,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 master_after = roles.get("master").copied();
                 claimed_role = final_role;
             }
+            // (P0-2 · 세대 증가 ⓑ) claim 성공 — 임계영역 종료 후 무락 지점에서 발신자 캐시
+            // 세대를 올린다(위 조기 return 거부 경로들은 여기 도달하지 않는다 = 성공 한정).
+            // 역할 전이 자체는 pid→sid 매핑을 바꾸지 않아 정확성엔 잉여지만 보수적 여분으로
+            // 무해하다(음성 항목 재해석 1회 추가가 전부 — claim은 저빈도라 유계). 주의: 이
+            // 증가가 rc6(재부모화로 조상 체인이 끊긴 claim 실패)을 치유하지는 않는다 — 체인
+            // 단절은 재해석해도 같은 결과다(그 계급의 수리는 P1 소관).
+            daemon.caller_gen.fetch_add(1, Ordering::Relaxed);
             // ★SEAT: 승계로 큐를 옮겼으면 WAL 을 최신화한다(락 해제 후 — persist 는 파일 I/O).
             // 없으면 재기동 시 구 좌석 기준의 스냅샷이 되살아나 이관이 되돌려진다.
             if let Some(prev) = takeover_committed {
@@ -6803,7 +6829,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(reviewer_pid, (Some(reviewer.id), crate::state::now_epoch(), None));
+            .insert(
+                reviewer_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(reviewer.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // reviewer가 human:true로 worker stdin 주입 시도 → ACL deny가 떠야 한다.
         let req = Request {
@@ -6942,7 +6976,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(gui_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                gui_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // ① 토큰 없는 external → 종전대로 deny (부서 자율성 보호 불변)
         let Reply::Single(denied) = dispatch(
@@ -7033,7 +7075,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(gui_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                gui_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let Reply::Single(resp) = dispatch(
             &daemon,
@@ -7092,7 +7142,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(ext_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                ext_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
         // pane 에 귀속된 발신자(리뷰어) — ⓒ 용. **이 데몬의** pane 이므로 토큰을 제대로 들고
         // 있어도 승격되지 않는다(reviewer-*→worker* deny 유지). ★이것이 참칭 전반을 막는다는
         // 뜻은 아니다 — 타 데몬 노드는 from_sid=None 이라 이 경로에 오지 않는다(F1).
@@ -7109,7 +7167,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(reviewer_pid, (Some(reviewer.id), crate::state::now_epoch(), None));
+            .insert(
+                reviewer_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(reviewer.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // (라벨, caller pid, params, 기대 문면, 기대 from_role)
         let cases: [(&str, u32, Value, &str, &str); 3] = [
@@ -7203,7 +7269,15 @@ mod tests {
                 .caller_cache
                 .lock()
                 .unwrap()
-                .insert(gui_pid, (None, crate::state::now_epoch(), None));
+                .insert(
+                    gui_pid,
+                    crate::state::CallerCacheEntry::new(
+                        None,
+                        crate::state::now_epoch(),
+                        None,
+                        daemon.caller_gen.load(Ordering::Relaxed),
+                    ),
+                );
             let Reply::Single(resp) = dispatch(
                 &daemon,
                 Request {
@@ -7264,7 +7338,15 @@ mod tests {
                 .caller_cache
                 .lock()
                 .unwrap()
-                .insert(ext_pid, (None, crate::state::now_epoch(), None));
+                .insert(
+                    ext_pid,
+                    crate::state::CallerCacheEntry::new(
+                        None,
+                        crate::state::now_epoch(),
+                        None,
+                        daemon.caller_gen.load(Ordering::Relaxed),
+                    ),
+                );
             let Reply::Single(r) = dispatch(
                 &daemon,
                 Request {
@@ -7308,7 +7390,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(ext_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                ext_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
         let Reply::Single(r4) = dispatch(
             &daemon,
             Request {
@@ -7358,7 +7448,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(usurper_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                usurper_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let before = daemon
             .bus
@@ -7571,7 +7669,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(resolved_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                resolved_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
         let before2 = daemon
             .bus
             .replay_after(0)
@@ -7752,7 +7858,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(gui_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                gui_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let send = |n: u64, params: Value| -> Value {
             let Reply::Single(r) = dispatch(
@@ -7882,7 +7996,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(pane_pid, (Some(pane.id), crate::state::now_epoch(), None));
+            .insert(
+                pane_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(pane.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // ① claim_role: 자기 surface 라도 예약 등급은 못 가져간다.
         let Reply::Single(claim) = dispatch(
@@ -7978,7 +8100,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                boot_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // ① 부트가 워커 좌석을 만든다(launch-agent 의 surface.create — 이 RPC 에는 ACL 이 없다).
         let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
@@ -8050,7 +8180,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                boot_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // 자기가 만든 좌석(대조군 — 통과해야 한다).
         let mine = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
@@ -8202,7 +8340,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                boot_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
         assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
@@ -8263,7 +8409,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                boot_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
         assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
@@ -8396,7 +8550,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(pane_pid, (Some(pane.id), crate::state::now_epoch(), None));
+            .insert(
+                pane_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(pane.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // ① claim_role: 자기 surface 라도 예약 등급은 못 가져간다.
         let Reply::Single(claim) = dispatch(
@@ -8462,7 +8624,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(boot_pid, (None, crate::state::now_epoch(), None));
+            .insert(
+                boot_pid,
+                crate::state::CallerCacheEntry::new(
+                    None,
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let created = create_surface_rpc(&daemon, Some("worker-1"), Some(boot_pid));
         assert_eq!(created["ok"], json!(true), "전제: 좌석 생성 ({created})");
@@ -8706,7 +8876,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(reviewer_pid, (Some(reviewer.id), crate::state::now_epoch(), None));
+            .insert(
+                reviewer_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(reviewer.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // reviewer가 human:true로 worker stdin 주입 시도 → ACL deny가 떠야 한다.
         let req = Request {
@@ -9109,7 +9287,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(sender_pid, (Some(sender.id), crate::state::now_epoch(), None));
+            .insert(
+                sender_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(sender.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         // 대조: authoritative 없는 send는 타이핑 가드로 차단되어야 한다
         let req_blocked = Request {
@@ -9157,7 +9343,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(wsender_pid, (Some(wsender.id), crate::state::now_epoch(), None));
+            .insert(
+                wsender_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(wsender.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
         let req_w = Request {
             id: json!(3),
             method: "surface.send_text".into(),
@@ -9227,7 +9421,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(reviewer_pid, (Some(reviewer.id), crate::state::now_epoch(), None));
+            .insert(
+                reviewer_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(reviewer.id),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
 
         let req = Request {
             id: json!(1),
@@ -9297,7 +9499,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+            .insert(
+                pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(sid),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
     }
 
     /// 게이트 박제: clear_first(원자 Ctrl-U 선정리)는 launch-agent 등록 pane 한정 —
@@ -9418,7 +9628,12 @@ mod tests {
         // 캐시 히트를 신뢰하지 않고 재해석해야 한다 → stale surface를 반환하면 안 된다.
         daemon.caller_cache.lock().unwrap().insert(
             live_pid,
-            (Some(stale), crate::state::now_epoch(), Some(real_start ^ 0xFFFF)),
+            crate::state::CallerCacheEntry::new(
+                Some(stale),
+                crate::state::now_epoch(),
+                Some(real_start ^ 0xFFFF),
+                daemon.caller_gen.load(Ordering::Relaxed),
+            ),
         );
         let resolved = resolve_caller_surface(&daemon, live_pid);
         assert_ne!(
@@ -9432,7 +9647,12 @@ mod tests {
         let same = make_surface(&daemon, Some("worker-1"));
         daemon.caller_cache.lock().unwrap().insert(
             live_pid,
-            (Some(same), crate::state::now_epoch(), Some(real_start)),
+            crate::state::CallerCacheEntry::new(
+                Some(same),
+                crate::state::now_epoch(),
+                Some(real_start),
+                daemon.caller_gen.load(Ordering::Relaxed),
+            ),
         );
         assert_eq!(
             resolve_caller_surface(&daemon, live_pid),
@@ -9444,7 +9664,12 @@ mod tests {
         let synth = make_surface(&daemon, Some("reviewer-gemini"));
         daemon.caller_cache.lock().unwrap().insert(
             live_pid,
-            (Some(synth), crate::state::now_epoch(), None),
+            crate::state::CallerCacheEntry::new(
+                Some(synth),
+                crate::state::now_epoch(),
+                None,
+                daemon.caller_gen.load(Ordering::Relaxed),
+            ),
         );
         assert_eq!(
             resolve_caller_surface(&daemon, live_pid),
@@ -9469,7 +9694,15 @@ mod tests {
         {
             let mut cache = daemon.caller_cache.lock().unwrap();
             for pid in 1_000u32..6_000u32 {
-                cache.insert(pid, (None, stale_ts, None));
+                cache.insert(
+                    pid,
+                    crate::state::CallerCacheEntry::new(
+                        None,
+                        stale_ts,
+                        None,
+                        daemon.caller_gen.load(Ordering::Relaxed),
+                    ),
+                );
             }
         }
         let before = daemon.caller_cache.lock().unwrap().len();
@@ -9509,7 +9742,15 @@ mod tests {
         {
             let mut cache = daemon.caller_cache.lock().unwrap();
             for pid in 10_000_000u32..10_006_000u32 {
-                cache.insert(pid, (None, fresh_ts, None));
+                cache.insert(
+                    pid,
+                    crate::state::CallerCacheEntry::new(
+                        None,
+                        fresh_ts,
+                        None,
+                        daemon.caller_gen.load(Ordering::Relaxed),
+                    ),
+                );
             }
         }
         assert_eq!(
@@ -9525,6 +9766,115 @@ mod tests {
         assert!(
             after <= 4_096,
             "하드 캡(4096)을 넘어 신선한 항목이 무한 누적됐다 (after={after})"
+        );
+    }
+
+    /// (P0-2) 음성 세대 무효화 — '워크 도중 등록' 레이스의 박제(R3-P02-2 TOCTOU 계약).
+    /// resolve 워크는 세대를 pid_to_sid 스냅샷 **이전**에 캡처해 그 값으로 음성 항목을
+    /// 각인한다. 워크가 도는 사이 pane이 등록되면(create_surface_with_env의 세대 증가 ⓐ)
+    /// 각인 세대 < 현재 세대가 되고, 다음 조회는 TTL 잔여와 무관하게 재해석해 방금 등록된
+    /// pane을 찾아야 한다. 종전(TTL 단독)에는 이 음성이 60s 고착돼 '방금 pane에 귀속된
+    /// peer가 external로 오분류되는 창'이었다.
+    #[test]
+    fn caller_cache_negative_reresolves_after_registration_during_walk() {
+        let daemon = claim_daemon();
+        // 워크 시작 시점의 세대 캡처(프로덕션 계약과 동일 — 스냅샷 이전 1회).
+        let g0 = daemon.caller_gen.load(Ordering::Relaxed);
+        // 워크 '도중' pane 등록 재현 — 등록이 세대를 올린다(증가 지점 ⓐ의 실배선 검증 겸용).
+        let sid = make_surface(&daemon, None);
+        assert!(
+            daemon.caller_gen.load(Ordering::Relaxed) > g0,
+            "surface 등록이 caller_gen을 올리지 않았다 — 증가 지점 ⓐ 소실"
+        );
+        // 그 워크가 낳았을 산출물: 등록 이전 스냅샷 기준의 '음성'을 g0로 각인해 삽입
+        // (TTL은 신선 — 종전 규칙이면 60s 동안 신뢰됐을 항목이다).
+        let pane_pid = daemon.get_surface(sid).expect("방금 만든 surface").pid;
+        daemon.caller_cache.lock().unwrap().insert(
+            pane_pid,
+            crate::state::CallerCacheEntry::new(None, crate::state::now_epoch(), None, g0),
+        );
+        // 다음 조회: 각인 세대(g0) ≠ 현재 세대 → 재해석 → 등록된 pane으로 양성 전환.
+        assert_eq!(
+            resolve_caller_surface(&daemon, pane_pid),
+            Some(sid),
+            "세대 불일치 음성이 재해석되지 않았다 — '등록 직후 음성 60s 고착'(P0-2) 재발"
+        );
+    }
+
+    /// (P0-2) 세대 일치 음성은 TTL 창 안에서 계속 신뢰된다 — 세대 무효화가 장수 음성 peer
+    /// (Tauri GUI의 키스트로크당 send_input)를 전 프로세스 스냅샷 상시 유입으로 되돌리면
+    /// 안 된다(전면 미캐시 기각 사유의 보존). 신뢰 히트는 캐시를 다시 쓰지 않으므로 ts
+    /// 불변으로 '재해석이 일어나지 않았음'을 판별한다.
+    #[test]
+    fn caller_cache_negative_trusted_while_generation_unchanged() {
+        let daemon = claim_daemon();
+        let ext_pid = 10_900_001_u32; // OS pid 상한 밖 — 실존 불가(재해석돼도 결정론 음성)
+        let seeded_ts = crate::state::now_epoch() - 30.0; // TTL(60s) 창 안의 과거 시각
+        daemon.caller_cache.lock().unwrap().insert(
+            ext_pid,
+            crate::state::CallerCacheEntry::new(
+                None,
+                seeded_ts,
+                None,
+                daemon.caller_gen.load(Ordering::Relaxed),
+            ),
+        );
+        assert_eq!(resolve_caller_surface(&daemon, ext_pid), None);
+        let ts_after = daemon.caller_cache.lock().unwrap()[&ext_pid].ts;
+        assert_eq!(
+            ts_after, seeded_ts,
+            "세대가 그대로인데 음성 히트가 재해석됐다(ts 갱신 관측) — GUI 상시 스냅샷 회귀"
+        );
+    }
+
+    /// (P0-2) 양성 항목은 세대를 보지 않는다 — sid 매핑의 정합은 start_time 가드 소관이고,
+    /// 등록·claim 때마다 양성까지 재해석하면 캐시의 존재 이유가 소거된다(성능 회귀 방지 핀).
+    #[test]
+    fn caller_cache_positive_ignores_generation() {
+        let daemon = claim_daemon();
+        let sid = make_surface(&daemon, None); // 세대를 올려 '각인 0'을 불일치로 만든다
+        let pid = 990_777_u32;
+        daemon.caller_cache.lock().unwrap().insert(
+            pid,
+            crate::state::CallerCacheEntry::new(Some(sid), crate::state::now_epoch(), None, 0),
+        );
+        assert_eq!(
+            resolve_caller_surface(&daemon, pid),
+            Some(sid),
+            "양성 항목이 세대 불일치로 무효화됐다 — 양성은 TTL·start_time 가드만 따라야 한다"
+        );
+    }
+
+    /// (P0-2) 세대 증가 ⓑ — claim **성공** 경로가 caller_gen을 올린다(임계영역 종료 후 ·
+    /// 거부 경로는 불변). 주의(오검체 금지 — R3-P02-1): 이 증가는 rc6(재부모화로 조상
+    /// 체인이 끊긴 claim 실패)을 치유한다는 주장의 근거가 아니다 — 체인 단절은 재해석해도
+    /// 같은 결과다. 여기서 박제하는 것은 카운터 배선(성공=+1·거부=불변)뿐이다.
+    #[test]
+    fn claim_role_success_bumps_caller_generation() {
+        let daemon = claim_daemon();
+        let own = make_surface(&daemon, None);
+        let own_pid = 990_401_u32;
+        bind_caller(&daemon, own_pid, own);
+        let g_before = daemon.caller_gen.load(Ordering::Relaxed);
+        let r = claim(&daemon, "worker-31", own, Some(own_pid));
+        assert_eq!(r["ok"], json!(true), "사전 조건: 자기 claim이 성공해야 한다 ({r})");
+        assert_eq!(
+            daemon.caller_gen.load(Ordering::Relaxed),
+            g_before + 1,
+            "claim 성공이 caller_gen을 올리지 않았다 — 증가 지점 ⓑ 소실"
+        );
+        // 거부 경로(발신 신원 미해석)는 세대 불변 — 증가는 성공 한정이다.
+        let g_mid = daemon.caller_gen.load(Ordering::Relaxed);
+        let r2 = claim(&daemon, "worker-32", own, Some(10_900_002));
+        assert_eq!(
+            r2["ok"],
+            json!(false),
+            "사전 조건: 미해석 발신의 claim은 거부돼야 한다 ({r2})"
+        );
+        assert_eq!(
+            daemon.caller_gen.load(Ordering::Relaxed),
+            g_mid,
+            "거부된 claim이 caller_gen을 올렸다 — 성공 한정 계약 위반"
         );
     }
 
@@ -11852,7 +12202,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(self_pid, (Some(sid), crate::state::now_epoch(), None));
+            .insert(
+                self_pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(sid),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
         let Reply::Single(resp) = dispatch(&daemon, req, Some(self_pid)) else {
             panic!("expected single reply");
         };
@@ -12495,7 +12853,15 @@ mod tests {
             .caller_cache
             .lock()
             .unwrap()
-            .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+            .insert(
+                pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(sid),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
     }
 
     /// 구독 rx에서 전체 이벤트를 벡터로 뽑는다(name·payload 매칭 편의).
