@@ -1,0 +1,88 @@
+name: pr-check
+
+# ★왜 이 파일이 필요한가 (2026-08-22)
+#   이 레포에는 `pull_request` 로 트리거되는 워크플로우가 하나도 없었다. main 의 워크플로우
+#   4개는 각각 tags(v*/pack-v*) · workflow_dispatch · 특정 feat 브랜치 push 로만 돈다.
+#   실제 검증 레인인 ci-branch.yml 은 main 에 없고, 있는 브랜치에서도 트리거가
+#   `push: branches: ['feat/**']` 뿐이다. 그 결과 외부 기여 PR 은 자동 검증을 한 줄도
+#   받지 못한 채 사람 손으로만 확인해야 했다(열린 PR 4건 실측).
+#
+# ★왜 ci-branch.yml 을 main 에 올리는 방식이 아닌가
+#   ci-branch.yml(591줄)은 아직 main 에 없는 소스를 검사한다 — src/todo_scan.rs ·
+#   cysjavis-pack/bin/tests/test_todo_decl.py · scripts/gen_ceo_template.py ·
+#   cysjavis-pack/bin/javis_detect.py 등. 그대로 main 에 올리면 첫 실행부터 빨간다.
+#   그래서 이 파일은 그 레인을 대체하지 않는다. **main 트리에서 지금 확실히 통과하는
+#   검사만** 담은 얇은 게이트다. 컴파일·bun·크로스플랫폼 파리티 같은 무거운 레인은
+#   ci-branch.yml 의 몫으로 남긴다 — 그 레인이 main 에 랜딩되면 이 파일은 흡수되어도 된다.
+#
+# ★검증(2026-08-22, main=721bc99): 아래 두 검사를 main 과 열린 PR 4건(#10·#35·#42·#43)
+#   에서 각각 실행해 전부 통과를 확인했다. 셸 14개 · 파이썬 119개.
+
+on:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# fork PR 은 브랜치명이 흔히 겹치므로(main·patch-1) head 저장소까지 키에 넣는다 —
+# 브랜치명만 쓰면 서로 다른 두 PR 이 상대의 실행을 취소한다.
+concurrency:
+  group: pr-check-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax:
+    name: 문법 검사 (셸 · 파이썬)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # shebang 이 bash/sh 인 파일만 고른다 — 목록을 손으로 유지하지 않으므로
+      # 새 스크립트가 추가돼도 이 워크플로우를 고칠 필요가 없다.
+      - name: bash -n — 셸 스크립트 문법
+        run: |
+          set -uo pipefail
+          fail=0
+          found=0
+          while IFS= read -r f; do
+            found=$((found + 1))
+            if err="$(bash -n "$f" 2>&1)"; then
+              echo "  OK   $f"
+            else
+              echo "::error file=$f::셸 문법 오류"
+              printf '%s\n' "$err" | sed 's/^/       /'
+              fail=1
+            fi
+          done < <(find cysjavis-pack/bin scripts -maxdepth 2 -type f \
+                     -exec sh -c 'head -1 "$1" | grep -q "^#!.*\(bash\|sh\)"' _ {} \; -print)
+          echo "검사한 셸 스크립트: ${found}개"
+          # 대상이 0개면 find 패턴이 깨졌다는 뜻 — 조용한 통과(위양성 초록)를 막는다.
+          if [ "$found" -eq 0 ]; then
+            echo "::error::셸 스크립트를 하나도 찾지 못했다 — 경로 패턴 점검 필요"
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: py_compile — 파이썬 문법
+        run: |
+          set -uo pipefail
+          fail=0
+          found=0
+          while IFS= read -r f; do
+            found=$((found + 1))
+            if err="$(python3 -m py_compile "$f" 2>&1)"; then
+              :
+            else
+              echo "::error file=$f::파이썬 문법 오류"
+              printf '%s\n' "$err" | sed 's/^/       /'
+              fail=1
+            fi
+          done < <(find cysjavis-pack -name '*.py' -type f)
+          echo "검사한 파이썬 파일: ${found}개"
+          if [ "$found" -eq 0 ]; then
+            echo "::error::파이썬 파일을 하나도 찾지 못했다 — 경로 패턴 점검 필요"
+            fail=1
+          fi
+          exit "$fail"
