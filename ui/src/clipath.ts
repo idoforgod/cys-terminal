@@ -443,13 +443,20 @@ export function readInstallState(raw: unknown): CliButtonState {
 /// 백업 이름 규칙은 `<원래 경로>.cys-backup-<epoch초>` 다(main.rs `backup_path_for`·`backup_stamp`).
 /// 사람이 읽는 날짜가 아니라 **숫자(초)** 라는 사실을 여기서 말해 둔다 — 문서 예시가 날짜 형식이라
 /// 사용자가 없는 파일을 찾게 만든 전례가 있다(MINOR-N13).
+/// ★MAJOR-2(2026-08-25 7R) 우리가 화면에 내는 **모든 되돌리기 명령**에 함께 붙는 한 문장.
+/// `mv` 는 목적지가 이미 차 있으면 **말없이 덮어쓴다** — 그래서 명령에는 `-n`(덮어쓰기 금지)을
+/// 붙이고, 그 `-n` 이 무슨 뜻인지 사람 말로 함께 적는다. 이 두 가지가 한 쌍이 아니면 사용자는
+/// "왜 아무 일도 안 일어나지?" 로 읽고 `-n` 을 지운 채 다시 실행한다(가드를 스스로 뜯는다).
+export const MV_EMPTY_CAVEAT =
+  "원래 자리가 비어 있어야 옮겨집니다 — 비어 있지 않으면 아무 일도 일어나지 않습니다";
+
 export const FOREIGN_BACKUP_NOTICE =
   "설치를 누르면 이 자리에는 cys 링크가 놓입니다 — 지금 있는 것이 실제 파일·폴더든 다른 곳을 " +
   "가리키던 심볼릭 링크든, 이 앱이 만든 링크가 아니면 지우지 않고 같은 폴더에 " +
   "'<원래 경로>.cys-backup-<숫자>' 로 옮겨 보관합니다(<숫자>는 백업한 시각의 epoch 초). " +
   "옮긴 경로는 결과 알림과 이 버튼 툴팁에 그대로 나오며, 되돌리는 명령은 " +
-  "'sudo mv <백업본> <원래 경로>' 입니다. 해제할 때 그 자리가 우리 링크면 앱이 백업본을 " +
-  "자동으로 제자리에 되돌립니다.";
+  "'sudo mv -n <백업본> <원래 경로>' 입니다(" + MV_EMPTY_CAVEAT + "). " +
+  "해제할 때 그 자리가 우리 링크면 앱이 백업본을 자동으로 제자리에 되돌립니다.";
 
 // ── (I2 · adv8) 버튼이 **직전에 한 일**과 어긋나지 않게 한다 ─────────────────
 /// 결함: 설치를 눌러 `installed_shadowed`·`unverified`(= "설치 미완료" 경고)를 받은 직후,
@@ -556,23 +563,78 @@ export function backupOrigin(backupPath: string): string | null {
   return isEpochStamp(stamp) ? origin : null;
 }
 
-/// 백업본 한 줄의 사용자 문구. 원래 경로를 알 때만 복원 명령을 제시한다.
-export function backupNoticeLine(backupPath: string): string {
+// ── (MAJOR-2 · 2026-08-25 7R) **앱이 스스로 파괴적 명령을 출력하지 않는다** ─────────────────
+/// 결함(실행 재현): 잔존 백업본이 있으면 무조건 "되돌리려면 'sudo mv <백업본> <원래 경로>'" 를 냈다.
+/// `<원래 경로>` 가 지금 비어 있는지 **검사하지 않았고** `mv` 에 `-i`/`-n` 도 없었다. 그래서 같은
+/// 토스트 본문에 '그 자리에 남의 실체 파일이 있습니다'(notes)와 '거기로 mv 하라'가 **동시에** 실렸고,
+/// 지시대로 따른 사용자는 자기 파일을 덮어썼다. 안내가 사고의 원인이 되는 형태다.
+///
+/// 수리는 두 겹이다:
+///   ① 명령 자체를 안전하게 — `mv -n`(덮어쓰기 금지) + `MV_EMPTY_CAVEAT`(그 `-n` 의 뜻).
+///   ② **앱이 자리가 차 있다고 아는 경우에는 명령을 내지 않는다** — 먼저 정리하라고만 말한다.
+///
+/// ②의 판정 근거는 **기계 필드 `state` 하나**다(새 필드 없음 · 산문 파싱 없음). Rust
+/// `classify_cli_links` 실측으로 각 상태가 두 자리(cys·cysd)에 대해 말해 주는 것은 이렇다:
+///   · "absent"  = 두 자리 모두 **없다**(둘 다 SkipAbsent) → 어느 원래 경로든 비어 있다 = free
+///   · "ours"    = 두 자리 모두 **우리 링크가 차지**하고 있다 → 어느 원래 경로든 차 있다 = occupied
+///   · "partial" = 한쪽만 우리 것이고 나머지는 없거나 남의 것 → **이 백업본의 자리가 어느 쪽인지
+///                 기계 필드로 가릴 수 없다** = unknown
+///   · "foreign" = 우리 것은 없고 남의 것이 하나 이상(나머지는 없을 수도) → 같은 이유로 unknown
+/// 모르면 명령을 내지 않는다(측정 불능은 통과가 아니다 — 헌장). 대신 `ls -l` 로 직접 확인하는
+/// 길을 남긴다: 정보를 없애는 것이 아니라 **파괴적 기본값**을 없애는 것이다.
+export type BackupSpot = "free" | "occupied" | "unknown";
+
+/// 백업본을 되돌릴 자리가 비어 있는가 — `state` 하나만 본다(순수).
+export function backupRestoreSpot(linkState: CliLinkState): BackupSpot {
+  if (linkState === "absent") return "free";
+  if (linkState === "ours") return "occupied";
+  return "unknown"; // partial · foreign · unsupported · unknown — 자리를 특정할 수 없다
+}
+
+/// 백업본 한 줄의 사용자 문구. 원래 경로를 알고 **그 자리가 비어 있을 때만** 복원 명령을 제시한다.
+/// `linkState` 를 넘기지 않은 호출부는 "unknown" 으로 접힌다 — 기본값이 안전한 쪽이다(fail-closed).
+export function backupNoticeLine(backupPath: string, linkState: CliLinkState = "unknown"): string {
   const origin = backupOrigin(backupPath);
-  return origin
-    ? `${backupPath} — 설치 때 여기로 옮겨 둔 원본입니다. 되돌리려면 'sudo mv ${backupPath} ${origin}', 필요 없으면 'sudo rm ${backupPath}'.`
-    : `${backupPath} — 설치 때 옮겨 둔 원본으로 보입니다(원래 경로를 이름에서 확정하지 못했습니다). 필요 없으면 'sudo rm ${backupPath}'.`;
+  const head = `${backupPath} — 설치 때 여기로 옮겨 둔 원본입니다.`;
+  const drop = `필요 없으면 'sudo rm ${backupPath}'.`;
+  if (!origin) {
+    // 이름이 우리 규칙이 아니면 원래 경로를 추측하지 않는다(N13) — mv 는 아예 만들지 않는다.
+    return `${backupPath} — 설치 때 옮겨 둔 원본으로 보입니다(원래 경로를 이름에서 확정하지 못했습니다). ${drop}`;
+  }
+  const spot = backupRestoreSpot(linkState);
+  if (spot === "occupied") {
+    // 앱이 **알고 있다**: 그 자리는 우리 링크가 차지하고 있다. 손으로 옮기라고 말하지 않는다 —
+    // 해제 버튼이 링크를 지운 자리에 이 원본을 되돌려 준다(Rust I3③ restored).
+    return (
+      `${head} 지금 ${origin} 자리는 이 앱이 만든 링크가 차지하고 있어 손으로 옮길 수 없습니다 — ` +
+      `'셸 cys 해제' 를 누르면 앱이 그 링크를 지우고 이 원본을 제자리에 되돌립니다. ${drop}`
+    );
+  }
+  if (spot === "unknown") {
+    // 자리 상태를 확정하지 못했다. 명령을 **조건과 함께** 준다: 먼저 확인하고, 비어 있을 때만.
+    return (
+      `${head} ${origin} 자리에 지금 무엇이 있는지 확정하지 못했습니다 — 먼저 'ls -l ${origin}' 로 ` +
+      `비어 있는지 확인한 뒤, 비어 있을 때만 'sudo mv -n ${backupPath} ${origin}' 로 되돌리세요(${MV_EMPTY_CAVEAT}). ${drop}`
+    );
+  }
+  return (
+    `${head} 되돌리려면 'sudo mv -n ${backupPath} ${origin}' (${MV_EMPTY_CAVEAT}). ${drop}`
+  );
 }
 
 /// (I3①) 사용자에게 **상시** 보여줄 고지 줄 — 남의 파일 사유(notes 그대로) + 잔존 백업본(경로에서
 /// 문구 생성). 토스트와 버튼 툴팁이 **같은 함수**를 보게 해서 두 표면이 다른 말을 하지 않게 한다
 /// (토스트는 60초 뒤 사라지고 툴팁은 남는다 — 남는 쪽이 덜 말하면 정보가 소실된다).
+/// ★(MAJOR-2) `linkState` 를 함께 받는다 — 백업 문구가 "그 자리가 지금 비어 있는가" 를 알아야
+/// 파괴적 명령을 내지 않을 수 있기 때문이다. 없이 부르면 "unknown"(안전한 쪽)으로 접힌다.
 export function cliNoticeLines(view: {
   notes: readonly string[];
   backups: readonly string[];
+  linkState?: CliLinkState;
 }): string[] {
   const lines: string[] = view.notes.filter(Boolean).slice();
-  for (const b of view.backups.filter(Boolean)) lines.push(backupNoticeLine(b));
+  const state: CliLinkState = view.linkState ?? "unknown";
+  for (const b of view.backups.filter(Boolean)) lines.push(backupNoticeLine(b, state));
   return lines;
 }
 
@@ -614,11 +676,64 @@ export function withCliNotice(plan: ToastPlan, lines: readonly string[]): ToastP
 export const NOTICE_TITLE_FOREIGN = "⚠ /usr/local/bin 에 이 앱의 것이 아닌 cys 파일이 있습니다";
 export const NOTICE_TITLE_BACKUP = "설치 때 백업해 둔 원본이 남아 있습니다";
 export const NOTICE_TITLE_INFO = "셸 cys 설치 상태 안내";
+/// ★MAJOR-1(2026-08-25 7R) 네 번째 제목. `state=="partial"` = **한쪽만 우리 것**인 반쪽 상태다.
+export const NOTICE_TITLE_PARTIAL =
+  "⚠ 셸 cys 설치가 한쪽만 되어 있습니다 — 아래 내용을 확인하세요";
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-1(7R) — MAJOR-D 수리가 경고 방향을 **반대로 뒤집은** 자리
+// ══════════════════════════════════════════════════════════════════════════════
+// 6R 의 MAJOR-D 는 "notes 가 있으면 무조건 ⚠ 남의 파일" 이라는 거짓 경고를 없앴다. 그러나 그
+// 수리는 경고를 `state=="foreign"` **하나로만** 좁혔고, 그 바람에 **진짜 남의 파일이 있는 다른
+// 종착 상태**가 중립 등급으로 강등됐다:
+//
+//   우리 cys 심볼릭 + 남의 실체 cysd 파일
+//     → decide_cli_uninstall = Remove / SkipNotSymlink
+//     → classify_cli_links(ours=1, foreign=1) = Partial → state="partial", installed=true
+//   이때 Rust 는 notes 에 '심볼릭이 아닌 실제 파일이 이미 있습니다' 를 싣는데, UI 는 ⚠ 도 경고
+//   테두리도 없는 "셸 cys 설치 상태 안내"(category:"system")를 냈다.
+//
+// 가설이 아니다: 설치 스크립트는 `… && {cys링크} && {cysd링크}` 체인이라 cysd 의 백업 mv 가
+// 거부되면 정확히 이 상태로 끝난다.
+//
+// ★그리고 master 가 제안한 판정("partial 은 정의상 한쪽만 우리 것이므로 notes 가 비어 있지
+//   않으면 남의 것이 있다")은 **Rust 실물을 읽어 보니 성립하지 않는다**(main.rs
+//   `cli_install_status` notes 조립부 실측):
+//     · notes 의 첫 출처는 decide_cli_uninstall(SkipNotSymlink|SkipForeignTarget) = 남의 파일 고지
+//     · 그러나 `state` 가 Ours **또는 Partial** 이면 그 뒤에 `probe_path_shadows` 가 돌고,
+//       `path_shadow_note`·`cysd_shadow_warning` 이 **PATH 그림자·프로브 실패** 문장을 같은
+//       배열에 밀어 넣는다.
+//   즉 partial 에는 '한쪽이 그냥 없는(SkipAbsent)' 갈래가 있고, 그 갈래에서도 그림자 문장 때문에
+//   notes 가 비어 있지 않을 수 있다. `notes.length` 로 '남의 것이 있다' 를 추정하면 MAJOR-D 가
+//   없앤 **거짓 경고**를 partial 자리에 다시 심는 셈이다(같은 결함의 재발).
+//
+// ★그래서 판정을 바꾸는 대신 **제목을 바꾼다.** partial 은 남의 파일이 있든 한쪽이 비었든
+// **어느 쪽이든 정상이 아니다**(중단된 설치·부분 삭제 잔재·백업 거부). 그러므로:
+//     · 등급은 경고(watchdog + ⚠)로 올린다 — 강등 결함이 닫힌다.
+//     · 제목은 '남의 파일이 있다' 고 **단정하지 않는다** — 거짓 경고를 만들지 않는다.
+//   두 요구를 동시에 만족하는 유일한 문장이 NOTICE_TITLE_PARTIAL 이고, 무엇이 있는지는 본문에
+//   실린 notes 원문이 그대로 말한다(문장은 한 글자도 줄이지 않는다).
+export type StatusNoticeKind = "silent" | "foreign" | "partial" | "backup" | "info";
+
+/// 상시 고지의 **등급·제목 판정**(순수). 입력은 전부 기계 값이다 — 문구는 한 글자도 읽지 않는다.
+/// 4상태 × notes 유무 × backups 유무 전수표는 clipath.test.ts 가 덮는다.
+export function statusNoticeKind(
+  linkState: CliLinkState,
+  hasNotes: boolean,
+  hasBackups: boolean,
+): StatusNoticeKind {
+  if (!hasNotes && !hasBackups) return "silent"; // 무음 규약 — 정상은 말이 없다
+  if (linkState === "foreign") return "foreign"; // 우리 것이 하나도 없고 남의 것이 있다
+  if (linkState === "partial") return "partial"; // 반쪽 상태 — 남의 파일이든 결손이든 비정상
+  if (hasBackups) return "backup";
+  return "info";
+}
 
 export function statusNoticePlan(view: CliStatusView): ToastPlan | null {
   const notes = view.notes.filter(Boolean);
   const backups = view.backups.filter(Boolean);
-  if (notes.length === 0 && backups.length === 0) return null;
+  const kind = statusNoticeKind(view.linkState, notes.length > 0, backups.length > 0);
+  if (kind === "silent") return null;
   // (I3①) 잔존 백업본은 **기계 필드**로 오고 문구는 UI 가 만든다. 설치 직후의 sticky 는 60초 뒤
   // 사라지고 그 수용처(알람 이력)는 메모리 전용이라, 이 상시 경로가 없으면 사용자는 자기 원본이
   // 어디로 갔는지 다시는 알 수 없다 — BLOCK-1 이 1클릭을 정당화한 근거가 그 지점에서 무너진다.
@@ -637,12 +752,17 @@ export function statusNoticePlan(view: CliStatusView): ToastPlan | null {
   //   · 그 외(notes 만 있음)   → 중립 정보(⚠ 아님 · 테두리색도 중립인 "system")
   //   · 둘 다 없음            → 애초에 null(무음 규약 — 위에서 이미 돌아갔다)
   const body = lines.join("\n");
-  if (view.linkState === "foreign")
-    return { category: "watchdog", title: NOTICE_TITLE_FOREIGN, body, sticky: true, id: CLI_NOTES_TOAST_ID };
-  if (backups.length > 0)
-    return { category: "watchdog", title: NOTICE_TITLE_BACKUP, body, sticky: true, id: CLI_NOTES_TOAST_ID };
+  const rest = { body, sticky: true, id: CLI_NOTES_TOAST_ID };
+  if (kind === "foreign")
+    return { category: "watchdog", title: NOTICE_TITLE_FOREIGN, ...rest };
+  // ★MAJOR-1 남의 것이 실제로 있는 partial 이 중립으로 강등되던 자리. 등급은 경고,
+  // 제목은 단정하지 않는다(무엇이 있는지는 본문의 notes 원문이 말한다).
+  if (kind === "partial")
+    return { category: "watchdog", title: NOTICE_TITLE_PARTIAL, ...rest };
+  if (kind === "backup")
+    return { category: "watchdog", title: NOTICE_TITLE_BACKUP, ...rest };
   // 중립이라도 sticky 는 유지한다 — 그림자 안내는 200자 안팎이라 8초로는 읽히지 않는다(MINOR-10).
-  return { category: "system", title: NOTICE_TITLE_INFO, body, sticky: true, id: CLI_NOTES_TOAST_ID };
+  return { category: "system", title: NOTICE_TITLE_INFO, ...rest };
 }
 
 // ── 해제 확인 ─────────────────
@@ -666,6 +786,10 @@ export function statusNoticePlan(view: CliStatusView): ToastPlan | null {
 export function uninstallConfirmText(
   notes: readonly string[] = [],
   backups: readonly string[] = [],
+  /// ★(MAJOR-2) 백업 문구가 '그 자리가 지금 비어 있는가' 를 알아야 파괴적 mv 를 내지 않는다.
+  /// 이 화면이 뜨는 순간의 state 는 사실상 "ours"|"partial" 이지만, 값을 **넘겨받아** 쓴다 —
+  /// 화면이 자기 맥락을 근거로 상태를 가정하면 그것이 곧 두 번째 진실원이다.
+  linkState: CliLinkState = "unknown",
 ): {
   title: string;
   body: string;
@@ -681,7 +805,7 @@ export function uninstallConfirmText(
       ? [
           "",
           "설치 때 백업해 둔 원본이 남아 있습니다 — 해제하면서 제자리에 되돌립니다(되돌리지 못한 것은 결과 알림에 그대로 남습니다):",
-          ...kept.map((b) => `   • ${backupNoticeLine(b)}`),
+          ...kept.map((b) => `   • ${backupNoticeLine(b, linkState)}`),
         ]
       : [];
   return {
@@ -839,8 +963,17 @@ export function uninstallResultToast(rep: UninstallCliReport, links: readonly st
     // 이 문장이 없으면 사용자는 손으로 정리할 방법을 어디에서도 듣지 못한다.
     const leftovers = uninstallLeftovers(rep, links);
     if (leftovers.length > 0) {
+      // ★(MAJOR-2 계열 전수 점검 · 7R) 예전에는 `'sudo rm <경로>'` 만 줬다. 그러나 해제 스크립트가
+      // 지우지 못하고 남긴 자리는 **심볼릭이 아니어서 못 지운 경우**도 포함한다(스크립트의 `[ -L ]`
+      // 가드). 그 자리에 남의 실체 파일이 와 있다면 이 안내를 그대로 따른 사용자가 그것을 지운다.
+      // docs/INSTALL.md 는 이미 "지우기 전 `ls -l` 로 심링크인지 확인" 이라고 적고 있었는데 화면만
+      // 그 말을 하지 않았다 — 화면과 문서가 갈라진 자리를 화면 쪽으로 맞춘다.
       lines.push(`아직 남아 있는 링크 ${leftovers.length}건 — 직접 지우려면:`);
-      for (const p of leftovers) lines.push(`   • ${p} — 'sudo rm ${p}'`);
+      for (const p of leftovers)
+        lines.push(
+          `   • ${p} — 'ls -l ${p}' 로 cys.app 안을 가리키는 심볼릭 링크인지 먼저 확인한 뒤 'sudo rm ${p}'` +
+            ` (실제 파일이면 다른 도구의 설치본일 수 있으니 지우지 마세요).`,
+        );
     }
     if (warnings.length > 0) {
       lines.push("남은 조치·안내:");

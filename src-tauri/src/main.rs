@@ -1757,7 +1757,7 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 /// 결과는 Windows 컴파일 즉사(`error[E0425]: cannot find function` + `found an item that was
 /// configured out`). 최소재현으로 확인했다. 계약: **플랫폼별 API 를 쓰는 함수는 모든 플랫폼에서
 /// 존재하고, 갈라짐은 반드시 본문 안에 둔다**(같은 파일의 `no_console` 가 원래 이 형태다).
-/// 회귀핀: `blockb_no_new_file_level_cfg_gated_fn_items`.
+/// 회귀핀: `blockb_no_new_file_level_cfg_gated_items`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn same_file_ident(a: &str, b: &str) -> bool {
     #[cfg(unix)]
@@ -2215,8 +2215,12 @@ struct InstallCliReport {
 }
 
 /// 명시 메뉴 트리거. macOS에서 cys·cysd를 /usr/local/bin에 1회 승격으로 심볼릭한다.
+///
+/// ★MAJOR-3(2026-08-25 7R) **`async fn` 이다 — 동기로 되돌리지 마라.** 동기 커맨드는 메인
+/// 스레드에서 그대로 돌기 때문에, 되돌리면 `osascript` 관리자 승인 창이 떠 있는 **내내** UI 전체가
+/// 멎는다(승인 대기에는 기한이 없다). 근거 전문은 `cli_install_status` 위 주석에 있다.
 #[tauri::command]
-fn install_cli_to_path() -> Result<InstallCliReport, String> {
+async fn install_cli_to_path() -> Result<InstallCliReport, String> {
     #[cfg(not(target_os = "macos"))]
     {
         return Err("이 기능은 macOS 전용입니다.".into());
@@ -2830,8 +2834,12 @@ struct UninstallCliReport {
 /// **비가역**이므로 순수 판정(plan_cli_uninstall)이 Remove 로 결론낸 경로만, 이름을 박아 지운다.
 /// 앱만 지우고 root 소유 링크가 남아 죽은 명령이 PATH 에 눌러앉던 결함(설치는 있는데 해제가 없었다)
 /// 의 수리다.
+///
+/// ★MAJOR-3(2026-08-25 7R) **`async fn` 이다 — 동기로 되돌리지 마라.** 동기 커맨드는 메인
+/// 스레드에서 그대로 돌기 때문에, 되돌리면 `osascript` 관리자 승인 창이 떠 있는 **내내** UI 전체가
+/// 멎는다(승인 대기에는 기한이 없다). 근거 전문은 `cli_install_status` 위 주석에 있다.
 #[tauri::command]
-fn uninstall_cli_from_path() -> Result<UninstallCliReport, String> {
+async fn uninstall_cli_from_path() -> Result<UninstallCliReport, String> {
     #[cfg(not(target_os = "macos"))]
     {
         return Err("이 기능은 macOS 전용입니다.".into());
@@ -2987,8 +2995,27 @@ struct CliInstallStatusReport {
 /// 를 열 때 1회, 설치·해제 직후 1회만 호출한다(폴링 금지 — 타이머 증식 차단 원칙).
 /// non-macOS 에서 Err 를 던지지 않는 이유: CC 를 열 때마다 실패 토스트가 뜨기 때문이다. 대신
 /// platform_supported=false 로 답한다(install/uninstall 쪽 non-macOS Err 는 심층방어로 존치).
+///
+/// ★MAJOR-3(2026-08-25 7R) **`async fn` 이다 — 동기로 되돌리지 마라(계열 셋 공통 근거).**
+///
+/// `#[tauri::command]` 는 함수에 `async` 가 없으면 wrapper 를 `ExecutionContext::Blocking` 으로
+/// 만든다(tauri-macros). Blocking 은 별도 스폰 없이 **wry 의 IPC 핸들러 스레드(macOS 에서는 메인
+/// 스레드)에서 본문을 그대로 돌린다**는 뜻이다. 이 계열 셋은 전부 오래 막힌다:
+///   · `cli_install_status` → `probe_path_shadows` 가 로그인 셸 `-lc "which -a …"` 를 띄운다
+///     (기한 5초 · `-lc` 폴백 재시도까지 최대 10초). 게다가 이 호출은 사용자 클릭이 아니라
+///     **Control Center 를 여는 자동 경로**에 걸려 있다 — 아무것도 누르지 않았는데 창이 멎는다.
+///   · `install_cli_to_path` · `uninstall_cli_from_path` → `osascript` 관리자 승인 프롬프트를
+///     **기한 없이** 기다린다. 사용자가 비밀번호 창을 그대로 두면 UI 가 그동안 통째로 죽는다.
+///
+/// `async fn` 이면 wrapper 가 `ExecutionContext::Async` 로 바뀌어 tauri 의 async 런타임에서 돌고
+/// 메인 스레드는 즉시 풀린다. 이 리포의 지배 관례이기도 하다(async 커맨드 48 : 동기 30).
+///
+/// 프런트 계약은 그대로다 — `invoke()` 는 원래 Promise 이고 세 호출부(ui/src/main.ts)는 모두
+/// `await` 한다. 새 동시성도 열리지 않는다: 설치·해제는 버튼 `disabled` 가 in-flight 이중 클릭을
+/// 막고, 상태 조회는 **읽기 전용**(symlink_metadata·read_dir·셸 1회)이라 설치와 겹쳐 읽어도 파일을
+/// 건드리지 않으며 겹친 순간의 값은 액션 직후 재조회가 덮는다.
 #[tauri::command]
-fn cli_install_status() -> Result<CliInstallStatusReport, String> {
+async fn cli_install_status() -> Result<CliInstallStatusReport, String> {
     let target_dir = "/usr/local/bin";
     let cys_link = format!("{target_dir}/cys");
     let cysd_link = format!("{target_dir}/cysd");
@@ -7645,6 +7672,122 @@ echo {PROBE_BEGIN_MARK_D}; which -a cysd-no-such-binary-xyz; echo {PROBE_END_MAR
         );
     }
 
+    /// ★MAJOR-1 전제 판정(2026-08-25 7R) — UI 담당이 이 답에 의존한다. 제안된 동치
+    /// **"state=="partial" 이면서 notes 가 비어 있지 않다 ⟺ 남의 것이 실제로 있다"** 는
+    /// **성립하지 않는다.** 그러므로 경고 등급의 근거로 쓰면 안 된다.
+    ///
+    /// 방향을 나눠서 본다(`cli_install_status` 의 notes 조립부를 읽고 그 구조를 그대로 못박는다):
+    ///
+    /// · (⟹) partial + 남의 것 있음 → notes 비지 않음 : **성립한다.** notes 조립 1단계가
+    ///   `decide_cli_uninstall` 의 `SkipNotSymlink`·`SkipForeignTarget` **마다 한 줄씩 반드시**
+    ///   만들고(둘 다 `Some` 을 돌려주는 분기다), 그 두 값은 `classify_cli_links` 의 `foreign`
+    ///   카운트와 **같은 판정**이다.
+    ///
+    /// · (⟸) partial + notes 비지 않음 → 남의 것 있음 : **성립하지 않는다.** 이유가 둘이고 둘 다
+    ///   독립적으로 치명적이다.
+    ///     ① `Partial` 은 정의상 '우리 것이 한쪽뿐'일 뿐이다 — 나머지 한쪽이 **없어도**
+    ///        (`SkipAbsent`) Partial 이다. 즉 `foreign == 0` 인 partial 이 실재한다.
+    ///     ② notes 는 남의 파일 사유만 담는 채널이 **아니다**. state 가 `Ours|Partial` 이면
+    ///        `path_shadow_note`·`cysd_shadow_warning` 의 PATH 그림자·측정실패 문장이 **같은
+    ///        배열에 합류**한다(G4). 그래서 남의 것이 0인 partial 에서도 notes 는 비지 않는다.
+    ///
+    /// ★그리고 기존 계약 필드만으로는 두 세계를 **가를 수 없다**(개수로도 안 된다). 아래 ③이
+    /// 그 충돌을 못박는다: 남의 실체 cysd 가 있는 partial 과 cysd 가 아예 없는 partial 이
+    /// `state`·`installed`·`notes.len()`·`backups` 가 전부 같은 값으로 관측되는 조합이 있다.
+    /// → 새 필드 없이 성립하는 유일한 판정은 **`state` 하나**다: `"partial"` 과 `"foreign"` 을
+    ///   경고 등급으로 본다. 과경고가 아니다 — ④가 보이듯 `Ours`·`Absent` 는 `foreign == 0` 이
+    ///   **구조적으로 보장**되므로 정상 상태가 경고로 물들지 않는다.
+    #[test]
+    fn major1_premise_partial_with_notes_does_not_imply_foreign_present() {
+        let ours_cys = "/Applications/cys.app/Contents/MacOS/cys";
+        let foreign_count = |ps: &[LinkProbe]| {
+            ps.iter()
+                .filter(|p| {
+                    matches!(
+                        decide_cli_uninstall(p),
+                        UninstallAction::SkipNotSymlink | UninstallAction::SkipForeignTarget
+                    )
+                })
+                .count()
+        };
+
+        // ① 남의 것이 **하나도 없는** partial 이 실재한다(우리 cys 링크 + cysd 부재).
+        let benign = vec![
+            probe("/usr/local/bin/cys", true, true, Some(ours_cys)),
+            probe("/usr/local/bin/cysd", false, false, None),
+        ];
+        assert_eq!(classify_cli_links(&benign), CliLinkState::Partial);
+        assert_eq!(
+            foreign_count(&benign),
+            0,
+            "partial 인데 남의 것이 0인 조합이 없다면 동치가 성립할 수도 있었다 — 실재한다"
+        );
+
+        // ② 그 상태에서 notes 는 **비어 있지 않다**. cys 는 PATH 1순위가 target 이라 조용하지만
+        //    (None), cysd 는 어디에도 없으므로 반드시 말한다(Some). 남의 파일 0 · notes 1.
+        let cys_seen = WhichProbe::Completed(vec!["/usr/local/bin/cys".into()]);
+        let cysd_missing = WhichProbe::Completed(vec![]);
+        assert!(
+            path_shadow_note(&cys_seen, "/usr/local/bin/cys", "cys", "zsh").is_none(),
+            "cys 가 PATH 1순위 target 이면 이 축은 말하지 않는다(그래야 아래 한 줄이 cysd 축의 것임이 확정된다)"
+        );
+        assert!(
+            cysd_shadow_warning(&cys_seen, &cysd_missing, "/usr/local/bin/cysd", "zsh").is_some(),
+            "남의 것이 0인 partial 에서도 notes 는 한 줄이 실린다 — 이것이 (⟸) 방향의 반례다"
+        );
+
+        // ③ **개수로도 가를 수 없다**: 남의 실체 cysd 가 있는 partial 도 같은 관측을 낸다.
+        //    남의 실체 파일은 그 자리에 실재하므로 `which -a cysd` 의 1순위가 곧 target 이고
+        //    (paths_equivalent → None), 그림자 축은 침묵한다. 남는 것은 남의 파일 사유 한 줄뿐.
+        //    → 두 세계 모두 state="partial" · installed=true · notes.len()==1 · backups=[] 이다.
+        let dangerous = vec![
+            probe("/usr/local/bin/cys", true, true, Some(ours_cys)),
+            probe("/usr/local/bin/cysd", true, false, None), // 남의 **실체 파일**
+        ];
+        assert_eq!(classify_cli_links(&dangerous), CliLinkState::Partial);
+        assert_eq!(foreign_count(&dangerous), 1);
+        let cysd_present = WhichProbe::Completed(vec!["/usr/local/bin/cysd".into()]);
+        assert!(
+            cysd_shadow_warning(&cys_seen, &cysd_present, "/usr/local/bin/cysd", "zsh").is_none(),
+            "남의 실체 파일이 그 자리에 있으면 그림자 축은 침묵한다 — 그래서 이쪽도 notes.len()==1 이다"
+        );
+        // 두 세계의 기계 관측이 실제로 같다는 것을 한 줄로 못박는다.
+        let machine_view = |ps: &[LinkProbe], shadow_lines: usize| {
+            let state = classify_cli_links(ps);
+            (
+                matches!(state, CliLinkState::Ours | CliLinkState::Partial), // installed
+                format!("{state:?}"),
+                foreign_count(ps) + shadow_lines, // notes.len()
+            )
+        };
+        assert_eq!(
+            machine_view(&benign, 1),
+            machine_view(&dangerous, 0),
+            "기존 계약 필드(state·installed·notes.len())만으로는 두 세계가 구분되지 않는다 — \
+그래서 UI 는 notes 유무를 경고 근거로 쓸 수 없고, 새 필드 없이 성립하는 판정은 state 하나뿐이다"
+        );
+
+        // ④ 과경고가 아님의 근거: Ours·Absent 는 foreign == 0 이 **구조적으로 보장**된다.
+        //    (Ours = 두 축이 전부 Remove, Absent = 두 축이 전부 SkipAbsent)
+        let ours = vec![
+            probe("/usr/local/bin/cys", true, true, Some(ours_cys)),
+            probe(
+                "/usr/local/bin/cysd",
+                true,
+                true,
+                Some("/Applications/cys.app/Contents/MacOS/cysd"),
+            ),
+        ];
+        let absent = vec![
+            probe("/usr/local/bin/cys", false, false, None),
+            probe("/usr/local/bin/cysd", false, false, None),
+        ];
+        assert_eq!(classify_cli_links(&ours), CliLinkState::Ours);
+        assert_eq!(foreign_count(&ours), 0);
+        assert_eq!(classify_cli_links(&absent), CliLinkState::Absent);
+        assert_eq!(foreign_count(&absent), 0);
+    }
+
     // 라벨과 행동의 일치 가드: '해제' 라벨(installed=true)은 실제로 지울 것이 있을 때만 뜬다.
     #[test]
     fn install_label_state_agrees_with_uninstall_plan() {
@@ -9155,7 +9298,9 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
     }
 
     /// ★BLOCK-B(2026-08-25 6R) **소스 텍스트 불변식**: 아이템을 통째로 지우는 `#[cfg(…)]` 를
-    /// 파일 최상위(열 0) `fn` 앞에 새로 두지 않는다.
+    /// 파일 최상위(열 0) 아이템 앞에 새로 두지 않는다. ★7R(MINOR-4)에서 대상 종류를 `fn` 에서
+    /// `static`·`const`·`struct`·`enum`·`type`·`union`·`trait`·`impl`·`mod`·`use` 까지 넓혔다 —
+    /// 예전에는 `fn` 이 아니면 판정에 **도달조차 하지 않아** 같은 병이 그대로 통과했다.
     ///
     /// 사고: `same_file_ident`·`canonicalize_probe_to_target` 에 `#[cfg(unix)]` 가 붙어 있었는데
     /// 호출부(`probe_path_shadows`)는 `#[cfg_attr(not(target_os = "macos"), allow(dead_code))]` 뿐이라
@@ -9168,7 +9313,7 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
     /// 있고, 이 라운드의 지배 규칙(신규 기능 금지)에 따라 손대지 않는다. 여기에 이름을 **추가하려면**
     /// 그 함수의 모든 호출부가 같은 cfg 안에 있음을 먼저 확인해야 한다.
     #[test]
-    fn blockb_no_new_file_level_cfg_gated_fn_items() {
+    fn blockb_no_new_file_level_cfg_gated_items() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
         // 측정 불능은 통과가 아니다 — 못 읽으면 실패한다.
         let src = std::fs::read_to_string(&path)
@@ -9183,6 +9328,10 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             "bundle_integrity_guidance",
             "seal_selfdiag_marker",
             "seal_selfdiag_skips",
+            // ★MINOR-4(7R) `fn` 이 아니라서 예전 스캐너가 **판정에 도달조차 못 했던** base 아이템.
+            // 등재 근거를 확인했다: 유일한 사용처가 바로 아래 `seal_broken_cache()` 이고 그 함수도
+            // 같은 `#[cfg(target_os = "macos")]` 안이라 짝이 맞는다(main.rs `SEAL_BROKEN_CACHE`).
+            "SEAL_BROKEN_CACHE",
             "seal_broken_cache",
             "seal_cache_payload",
             "spawn_seal_selfdiag",
@@ -9194,7 +9343,23 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             "maybe_windows_onboard",
         ];
 
+        // ★MINOR-4(2026-08-25 7R) **`fn` 만 보던 스캐너를 아이템 전반으로 넓힌다.**
+        //
+        // 예전 스캐너는 선언 줄에서 `strip_prefix("fn ")` 에 실패하면 `continue` 했다 — 그래서
+        // `static`·`const`·`struct`·`enum`·`type`·`impl` 은 offender 판정에 **도달조차 하지
+        // 못했다**(사각이 가설이 아니었다: base 의 `#[cfg(target_os = "macos")] static
+        // SEAL_BROKEN_CACHE` 가 그 자리에 실재했다). 그런데 이 핀이 막으려는 병은 "함수가 사라진다"
+        // 가 아니라 **"아이템이 통째로 사라지는데 그 이름을 쓰는 코드는 살아남는다"** 이고, 그 병은
+        // 종류를 가리지 않는다 — `static` 이 지워져도 `const` 가 지워져도 결과는 똑같은 E0425 다.
+        const ITEM_KINDS: &[&str] = &[
+            "fn ", "static ", "const ", "struct ", "enum ", "type ", "union ", "trait ", "impl ",
+            "mod ", "use ",
+        ];
+        // 선언 앞에 붙을 수 있는 수식어. 겹쳐 붙는다(`pub unsafe async fn`)므로 순서대로 벗긴다.
+        const MODIFIERS: &[&str] = &["pub(crate) ", "pub(super) ", "pub ", "unsafe ", "async "];
+
         let mut offenders: Vec<(usize, String)> = vec![];
+        let mut kinds_seen: Vec<&str> = vec![];
         for (i, line) in lines.iter().enumerate() {
             // 열 0 = 아이템 자체를 지우는 위치. 함수 **안**의 들여쓴 cfg 블록은 대상이 아니다.
             if !line.starts_with("#[cfg(") {
@@ -9203,23 +9368,40 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             if !(line.contains("unix") || line.contains("target_os") || line.contains("windows")) {
                 continue;
             }
-            // 뒤따르는 최상위 속성·주석을 건너뛰고 아이템 선언 줄을 찾는다.
+            // 뒤따르는 최상위 속성·주석·빈 줄을 건너뛰고 아이템 선언 줄을 찾는다.
             let mut j = i + 1;
             while j < lines.len()
-                && (lines[j].starts_with("#[") || lines[j].starts_with("//"))
+                && (lines[j].starts_with("#[")
+                    || lines[j].starts_with("//")
+                    || lines[j].trim().is_empty())
             {
                 j += 1;
             }
             let Some(decl) = lines.get(j) else { continue };
-            let rest = decl.strip_prefix("pub ").unwrap_or(decl);
-            let rest = rest.strip_prefix("async ").unwrap_or(rest);
-            let Some(sig) = rest.strip_prefix("fn ") else {
+            let mut rest = decl.trim_end();
+            for m in MODIFIERS {
+                rest = rest.strip_prefix(m).unwrap_or(rest);
+            }
+            let Some(kind) = ITEM_KINDS.iter().find(|k| rest.starts_with(**k)) else {
+                // 종류를 읽지 못했으면 **통과시키지 않는다** — 측정 불능은 통과가 아니다(헌장).
+                // 예전 스캐너의 `continue` 가 정확히 이 자리에서 사각을 만들었다.
+                offenders.push((i + 1, format!("<종류를 읽지 못함: {}>", rest.trim())));
                 continue;
             };
-            let name: String = sig
+            kinds_seen.push(kind);
+            let after = rest[kind.len()..].trim_start();
+            // `static mut X` 처럼 종류 뒤에 한 번 더 붙는 수식어.
+            let after = after.strip_prefix("mut ").unwrap_or(after);
+            let name: String = after
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
+            // 식별자가 안 잡히는 형태(`impl<T> …`)는 선언 줄 전체를 이름 삼는다 — 조용히 넘기지 않는다.
+            let name = if name.is_empty() {
+                after.trim().to_string()
+            } else {
+                name
+            };
             if !ALLOWED.contains(&name.as_str()) {
                 offenders.push((i + 1, name));
             }
@@ -9233,7 +9415,16 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
 그때만 ALLOWED 에 넣어라: {offenders:?}"
         );
 
-        // 전제 고정: 스캐너가 실제로 무언가를 세고 있다(정규식이 헛돌면 이 핀은 항상 초록이다).
+        // ★전제 고정 A(MINOR-4): 확장이 **살아 있는가**. `fn` 아닌 종류를 한 번도 만나지 못했다면
+        // 스캐너가 예전처럼 `fn` 만 보고 있다는 뜻이고, 그러면 이 핀은 사각을 가진 채 초록이 된다.
+        // base 에 `static SEAL_BROKEN_CACHE` 가 있으므로 정상 상태에서는 반드시 하나 이상 잡힌다.
+        assert!(
+            kinds_seen.iter().any(|k| *k != "fn "),
+            "스캐너가 `fn` 아닌 최상위 cfg 아이템을 하나도 만나지 못했다 — MINOR-4 확장이 되돌려졌거나 \
+선언 줄 파싱이 헛돈다(그 상태의 초록은 '없다'가 아니라 '못 본다'이다): kinds_seen={kinds_seen:?}"
+        );
+
+        // 전제 고정 B: 스캐너가 실제로 무언가를 세고 있다(정규식이 헛돌면 이 핀은 항상 초록이다).
         let counted = lines
             .iter()
             .filter(|l| l.starts_with("#[cfg(") && (l.contains("unix") || l.contains("target_os") || l.contains("windows")))

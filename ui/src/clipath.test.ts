@@ -36,12 +36,16 @@ import {
   CLI_NOTICE_HEADING,
   partitionSkips,
   statusNoticePlan,
+  statusNoticeKind,
+  backupRestoreSpot,
+  MV_EMPTY_CAVEAT,
   uninstallConfirmText,
   uninstallResultToast,
   uninstallLeftovers,
   NOTICE_TITLE_FOREIGN,
   NOTICE_TITLE_BACKUP,
   NOTICE_TITLE_INFO,
+  NOTICE_TITLE_PARTIAL,
   FOREIGN_BACKUP_NOTICE,
   INSTALL_TOAST_ID,
   UNINSTALL_TOAST_ID,
@@ -49,6 +53,7 @@ import {
   type InstallCliReport,
   type UninstallCliReport,
   type CliInstallStatusReport,
+  type CliLinkState,
 } from "./clipath";
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -838,11 +843,12 @@ describe("backupOrigin · backupNoticeLine — 되돌리기 명령을 UI 가 만
   it("스탬프 앞에 마커가 또 들어 있어도 **마지막** 마커에서 자른다(가장 짧은 원래 경로가 아니라)", () => {
     expect(backupOrigin("/a/cys.cys-backup-1.cys-backup-2")).toBe("/a/cys.cys-backup-1");
   });
-  it("원래 경로를 알면 복원 명령을, 모르면 삭제 안내만 준다", () => {
-    const known = backupNoticeLine(BACKUP_PATH);
-    expect(known).toContain(`sudo mv ${BACKUP_PATH} /usr/local/bin/cys`);
+  it("원래 경로를 알고 그 자리가 비어 있으면 복원 명령을, 모르면 삭제 안내만 준다", () => {
+    // (MAJOR-2) 자리 판정이 free 인 상태(= state "absent")에서만 명령을 그대로 제시한다.
+    const known = backupNoticeLine(BACKUP_PATH, "absent");
+    expect(known).toContain(`sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys`);
     expect(known).toContain("sudo rm");
-    const unknown = backupNoticeLine("/usr/local/bin/weird");
+    const unknown = backupNoticeLine("/usr/local/bin/weird", "absent");
     expect(unknown).not.toContain("sudo mv");
     expect(unknown).toContain("sudo rm /usr/local/bin/weird");
   });
@@ -1067,11 +1073,14 @@ describe("withCliNotice — 결과 토스트에 상시 고지를 접어 넣는�
   });
   it("고지 줄이 있으면 같은 토스트 **하나**에 실린다(id 가 늘지 않는다)", () => {
     const base = installResultToast(installReport());
-    const merged = withCliNotice(base, cliNoticeLines({ notes: [], backups: [BACKUP_PATH] }));
+    const merged = withCliNotice(
+      base,
+      cliNoticeLines({ notes: [], backups: [BACKUP_PATH], linkState: "absent" }),
+    );
     expect(merged.id).toBe(base.id);
     expect(merged.body).toContain(base.body);
     expect(merged.body).toContain(BACKUP_PATH);
-    expect(merged.body).toContain(`sudo mv ${BACKUP_PATH} /usr/local/bin/cys`); // UI 조립물
+    expect(merged.body).toContain(`sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys`); // UI 조립물
   });
   it("고지가 붙으면 sticky 로 올린다 — 8초에 사라지면 다음 CC 열기까지 아무도 말해 주지 않는다", () => {
     const base = installResultToast(installReport());
@@ -1126,6 +1135,9 @@ describe("statusNoticePlan — notes 를 토스트로도 낸다(BLOCK-1(d))", ()
     );
     expect(p!.body).toContain(NOTE_NOT_SYMLINK);
     expect(p!.body).not.toContain(FOREIGN_BACKUP_NOTICE);
+    // ★MAJOR-1(7R) 이 자리가 중립 등급으로 강등돼 있었다 — 경고 등급이어야 한다.
+    expect(p!.category).toBe("watchdog");
+    expect(p!.title).toBe(NOTICE_TITLE_PARTIAL);
   });
 
   // ★I3① — 백업 재발견. 설치 직후의 sticky 는 60초 뒤 사라지고 알람 이력은 메모리 전용이라,
@@ -1150,7 +1162,7 @@ describe("statusNoticePlan — notes 를 토스트로도 낸다(BLOCK-1(d))", ()
   });
   it("백업 줄을 두 번 싣지 않는다", () => {
     const p = statusNoticePlan(readCliStatus(statusReport({ backups: [BACKUP_PATH] })));
-    expect(p!.body.split(backupNoticeLine(BACKUP_PATH)).length - 1).toBe(1);
+    expect(p!.body.split(backupNoticeLine(BACKUP_PATH, "absent")).length - 1).toBe(1);
   });
   it("아무것도 없으면 여전히 무음이다", () => {
     expect(statusNoticePlan(readCliStatus(statusReport({ backups: [] })))).toBeNull();
@@ -1252,6 +1264,265 @@ describe("statusNoticePlan 제목 — notes 의 '있음'이 종류를 말해 주
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-1(7R) — MAJOR-D 수리가 경고 방향을 **반대로 뒤집은** 자리
+// ══════════════════════════════════════════════════════════════════════════════
+// 6R 의 MAJOR-D 는 "notes 가 있으면 무조건 ⚠ 남의 파일" 이라는 거짓 경고를 없앴다. 그런데 경고를
+// `state=="foreign"` 하나로만 좁히는 바람에, **진짜 남의 파일이 있는 다른 종착 상태**(partial)가
+// ⚠ 도 경고 테두리도 없는 중립 안내로 강등됐다.
+//
+// 도달 경로는 가설이 아니다: 설치 스크립트가 `… && {cys링크} && {cysd링크}` 체인이라 cysd 의
+// 백업 mv 가 거부되면 "우리 cys 심볼릭 + 남의 실체 cysd 파일" 로 끝난다
+// → decide_cli_uninstall = Remove / SkipNotSymlink → classify_cli_links(ours=1, foreign=1) = Partial.
+//
+// ★master 가 제안한 판정("partial 이면 notes 가 비어 있지 않을 때 남의 것이 있다")은 Rust 실물을
+// 읽어 보니 **성립하지 않는다**(main.rs `cli_install_status` notes 조립부): state 가 Ours 또는
+// **Partial** 이면 `probe_path_shadows` 가 돌고 `path_shadow_note`·`cysd_shadow_warning` 이 PATH
+// 그림자·프로브 실패 문장을 같은 배열에 밀어 넣는다. 그리고 partial 에는 '한쪽이 그냥 없는
+// (SkipAbsent)' 갈래가 있어, 남의 파일이 하나도 없이도 notes 가 찰 수 있다. 그 관계로 판정하면
+// MAJOR-D 가 없앤 거짓 경고를 partial 자리에 그대로 다시 심는다.
+//
+// 그래서 등급만 올리고 **제목은 단정하지 않는다**: partial 은 남의 파일이 있든 한쪽이 비었든
+// 어느 쪽이든 정상이 아니다. 무엇이 있는지는 본문의 notes 원문이 말한다.
+describe("★MAJOR-1 — partial 상태의 등급 강등(제목은 기계 필드가 정한다)", () => {
+  // Rust cli_install_status 가 실제로 만드는 문장의 사본(main.rs).
+  const NOTE_CYSD_REAL_FILE =
+    "/usr/local/bin/cysd — 심볼릭이 아닌 실제 파일이 이미 있습니다(다른 도구 설치본일 수 있어 자동으로 제거하지 않습니다).";
+  const NOTE_SHADOW_ONLY =
+    "cys 확인 결과: 로그인 셸(zsh) PATH 앞쪽의 다른 cys가 우선합니다: /opt/homebrew/bin/cys. " +
+    "새 터미널에서 'cys'를 치면 /usr/local/bin/cys가 아니라 그쪽이 실행됩니다.";
+
+  it("★재현: 우리 cys 심볼릭 + 남의 실체 cysd 파일(partial)이 중립 등급으로 나가지 않는다", () => {
+    const p = statusNoticePlan(
+      readCliStatus(
+        statusReport({ installed: true, state: "partial", notes: [NOTE_CYSD_REAL_FILE] }),
+      ),
+    );
+    expect(p).not.toBeNull();
+    // 강등의 세 표식(제목 ⚠ 없음 · 중립 제목 · 중립 테두리색)이 모두 사라졌는가.
+    expect({
+      등급: p!.category,
+      제목: p!.title,
+      경고글리프: p!.title.startsWith("⚠"),
+    }).toEqual({ 등급: "watchdog", 제목: NOTICE_TITLE_PARTIAL, 경고글리프: true });
+    expect(p!.title).not.toBe(NOTICE_TITLE_INFO);
+    expect(p!.body).toContain(NOTE_CYSD_REAL_FILE); // 문장은 한 글자도 줄이지 않는다
+  });
+
+  it("★그래도 '남의 파일이 있다' 고 단정하지 않는다 — partial 에는 그림자만 있는 갈래가 있다", () => {
+    const p = statusNoticePlan(
+      readCliStatus(statusReport({ installed: true, state: "partial", notes: [NOTE_SHADOW_ONLY] })),
+    );
+    // 등급은 올라가되(반쪽 상태 자체가 확인이 필요한 사실이다) 제목은 거짓을 말하지 않는다.
+    expect(p!.category).toBe("watchdog");
+    expect(p!.title).toBe(NOTICE_TITLE_PARTIAL);
+    expect(p!.title).not.toBe(NOTICE_TITLE_FOREIGN);
+    expect(p!.title).not.toContain("아닌 cys 파일");
+    expect(p!.body).toContain(NOTE_SHADOW_ONLY);
+  });
+
+  it("★정상 설치(ours)는 그대로 중립이다 — MAJOR-D 의 수리를 되돌리지 않았다", () => {
+    const p = statusNoticePlan(
+      readCliStatus(statusReport({ installed: true, state: "ours", notes: [NOTE_SHADOW_ONLY] })),
+    );
+    expect(p!.title).toBe(NOTICE_TITLE_INFO);
+    expect(p!.category).toBe("system");
+  });
+
+  // ★전수표 — 4상태(+판독 실패 2종) × notes 유무 × backups 유무. 판정에 들어가는 것은 기계 값
+  // 셋뿐이고, 표를 여기 통째로 적어 두면 어느 칸이 바뀌든 diff 로 드러난다.
+  it("★statusNoticeKind 전수표: 6상태 × notes 유무 × backups 유무 = 24칸", () => {
+    const STATES: CliLinkState[] = ["absent", "ours", "partial", "foreign", "unsupported", "unknown"];
+    const got: Record<string, string> = {};
+    for (const st of STATES)
+      for (const n of [false, true])
+        for (const b of [false, true]) got[`${st}|notes=${n}|backups=${b}`] = statusNoticeKind(st, n, b);
+    expect(got).toEqual({
+      // 알릴 것이 하나도 없으면 어느 상태에서도 무음이다(정상은 말이 없다).
+      "absent|notes=false|backups=false": "silent",
+      "absent|notes=false|backups=true": "backup",
+      "absent|notes=true|backups=false": "info",
+      "absent|notes=true|backups=true": "backup",
+      "ours|notes=false|backups=false": "silent",
+      "ours|notes=false|backups=true": "backup",
+      "ours|notes=true|backups=false": "info",
+      "ours|notes=true|backups=true": "backup",
+      // ★partial 은 알릴 것이 있으면 **무엇이 있든** 경고 갈래다(강등 결함이 닫힌 칸들).
+      "partial|notes=false|backups=false": "silent",
+      "partial|notes=false|backups=true": "partial",
+      "partial|notes=true|backups=false": "partial",
+      "partial|notes=true|backups=true": "partial",
+      // foreign 은 정의상 우리 것이 하나도 없고 남의 것이 있다 — 단정해도 되는 유일한 칸.
+      "foreign|notes=false|backups=false": "silent",
+      "foreign|notes=false|backups=true": "foreign",
+      "foreign|notes=true|backups=false": "foreign",
+      "foreign|notes=true|backups=true": "foreign",
+      "unsupported|notes=false|backups=false": "silent",
+      "unsupported|notes=false|backups=true": "backup",
+      "unsupported|notes=true|backups=false": "info",
+      "unsupported|notes=true|backups=true": "backup",
+      "unknown|notes=false|backups=false": "silent",
+      "unknown|notes=false|backups=true": "backup",
+      "unknown|notes=true|backups=false": "info",
+      "unknown|notes=true|backups=true": "backup",
+    });
+  });
+
+  it("★등급 판정이 notes **문구**를 읽지 않는다(산문 파싱 금지 가드 — statusNoticeKind)", () => {
+    const body = CLIPATH_CODE.slice(CLIPATH_CODE.indexOf("export function statusNoticeKind"));
+    const upto = body.slice(0, body.indexOf("\n}\n") + 3);
+    expect(upto.length).toBeGreaterThan(120); // 빈 슬라이스를 검사하는 사고 방지
+    for (const banned of [".test(", ".match(", ".includes(", ".search(", ".startsWith(", ".indexOf(", "RegExp"])
+      expect({ 금지연산: banned, 사용됨: upto.includes(banned) }).toEqual({ 금지연산: banned, 사용됨: false });
+  });
+
+  it("제목은 그 자체로 등급을 말한다 — 경고 셋만 ⚠ 를 단다", () => {
+    expect({
+      foreign: NOTICE_TITLE_FOREIGN.startsWith("⚠"),
+      partial: NOTICE_TITLE_PARTIAL.startsWith("⚠"),
+      info: NOTICE_TITLE_INFO.startsWith("⚠"),
+    }).toEqual({ foreign: true, partial: true, info: false });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-2(7R) — 앱이 스스로 **파괴적 명령**을 출력하지 않는다
+// ══════════════════════════════════════════════════════════════════════════════
+// 실행 재현: 잔존 백업본이 있으면 backupNoticeLine 이 무조건 "되돌리려면 'sudo mv <백업본>
+// <원래 경로>'" 를 냈다. `<원래 경로>` 가 비어 있는지 검사하지 않았고 `-i`/`-n` 도 없었다.
+// 그래서 같은 토스트 본문에 '그 자리에 남의 실체 파일이 있습니다'(notes)와 '거기로 mv 하라'가
+// 동시에 실렸고, 지시대로 따른 사용자는 자기 파일을 덮어썼다.
+//
+// 수리는 두 겹이다: ①명령을 `mv -n` + 뜻풀이로 바꾸고 ②앱이 자리가 차 있다고 **아는** 경우에는
+// 명령을 아예 내지 않는다(먼저 정리하라고만 말한다).
+/// 어떤 문자열에서든 'sudo mv' 를 찾아 `-n`(덮어쓰기 금지) 없이 나온 자리를 돌려준다.
+/// 화면 문구와 문서 예시가 **같은 규칙**으로 검사되도록 모듈 스코프에 둔다.
+function unguardedMv(text: string): string[] {
+  const bad: string[] = [];
+  let i = text.indexOf("sudo mv");
+  while (i >= 0) {
+    if (!text.startsWith("sudo mv -n ", i)) bad.push(text.slice(i, i + 70));
+    i = text.indexOf("sudo mv", i + 1);
+  }
+  return bad;
+}
+
+describe("★MAJOR-2 — 되돌리기 명령이 남의 파일을 덮어쓰게 하지 않는다", () => {
+  it("★backupRestoreSpot 전수표 — 자리 판정은 state 하나로만 정해진다", () => {
+    const STATES: CliLinkState[] = ["absent", "ours", "partial", "foreign", "unsupported", "unknown"];
+    const got: Record<string, string> = {};
+    for (const st of STATES) got[st] = backupRestoreSpot(st);
+    expect(got).toEqual({
+      // Rust classify_cli_links 실측: 두 자리가 모두 없을 때만 Absent, 모두 우리 링크일 때만 Ours.
+      absent: "free",
+      ours: "occupied",
+      // partial·foreign 은 '어느 자리가 비었는지' 를 기계 필드로 가릴 수 없다 — 모르면 모른다고 한다.
+      partial: "unknown",
+      foreign: "unknown",
+      unsupported: "unknown",
+      unknown: "unknown",
+    });
+  });
+
+  it("자리가 비어 있을 때(absent)만 명령을 그대로 제시하고, 그 mv 는 반드시 -n 이다", () => {
+    const line = backupNoticeLine(BACKUP_PATH, "absent");
+    expect(line).toContain(`sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys`);
+    expect(line).toContain(MV_EMPTY_CAVEAT);
+    expect(unguardedMv(line)).toEqual([]);
+  });
+
+  it("★우리 링크가 자리를 차지한 상태(ours)에서는 mv 를 **아예 내지 않는다**", () => {
+    const line = backupNoticeLine(BACKUP_PATH, "ours");
+    expect(line).not.toContain("sudo mv");
+    expect(line).toContain("해제"); // 대신 앱이 되돌린다는 사실을 말한다(Rust I3③ restored)
+    expect(line).toContain("sudo rm"); // 버리는 선택지는 남는다(정보 소실 금지)
+  });
+
+  it("★자리를 확정 못 하면(partial·foreign) 먼저 확인하라고 말한다 — 명령은 조건부이고 -n 이다", () => {
+    for (const st of ["partial", "foreign", "unknown"] as CliLinkState[]) {
+      const line = backupNoticeLine(BACKUP_PATH, st);
+      expect({ 상태: st, ls확인: line.includes(`ls -l /usr/local/bin/cys`) }).toEqual({
+        상태: st,
+        ls확인: true,
+      });
+      expect({ 상태: st, 무방비mv: unguardedMv(line) }).toEqual({ 상태: st, 무방비mv: [] });
+      expect(line).toContain(MV_EMPTY_CAVEAT);
+    }
+  });
+
+  it("★기본값(인자 없음)은 unknown 이다 — 옛 호출부가 파괴적 기본값을 얻지 않는다(fail-closed)", () => {
+    expect(backupNoticeLine(BACKUP_PATH)).toBe(backupNoticeLine(BACKUP_PATH, "unknown"));
+    expect(unguardedMv(backupNoticeLine(BACKUP_PATH))).toEqual([]);
+  });
+
+  it("★재현: '남의 실체 파일이 있습니다' 와 '거기로 mv 하라' 가 한 본문에 공존하지 않는다", () => {
+    // 우리 cys 심볼릭 + 남의 실체 cysd 파일 + cysd 자리의 백업본 — MAJOR-1 과 같은 종착 상태.
+    const NOTE_CYSD =
+      "/usr/local/bin/cysd — 심볼릭이 아닌 실제 파일이 이미 있습니다(다른 도구 설치본일 수 있어 자동으로 제거하지 않습니다).";
+    const CYSD_BACKUP = "/usr/local/bin/cysd.cys-backup-1756089600";
+    const p = statusNoticePlan(
+      readCliStatus(
+        statusReport({
+          installed: true,
+          state: "partial",
+          notes: [NOTE_CYSD],
+          backups: [CYSD_BACKUP],
+        }),
+      ),
+    );
+    expect(p!.body).toContain(NOTE_CYSD); // 사실은 그대로 남고
+    expect(p!.body).toContain(CYSD_BACKUP); // 백업 경로도 그대로 남지만
+    expect(unguardedMv(p!.body)).toEqual([]); // 무방비 mv 는 없다
+    expect(p!.body).toContain("ls -l /usr/local/bin/cysd"); // 먼저 확인하라고 말한다
+  });
+
+  it("★전수: UI 가 만드는 어떤 화면 문자열에도 -n 없는 'sudo mv' 가 없다", () => {
+    const STATES: CliLinkState[] = ["absent", "ours", "partial", "foreign", "unsupported", "unknown"];
+    const texts: string[] = [FOREIGN_BACKUP_NOTICE];
+    for (const st of STATES)
+      for (const notes of [[] as string[], [NOTE_NOT_SYMLINK]])
+        for (const backups of [[] as string[], [BACKUP_PATH], ["/usr/local/bin/weird"]]) {
+          const view = readCliStatus(
+            statusReport({ state: st, installed: st === "ours" || st === "partial", notes, backups }),
+          );
+          const lines = cliNoticeLines(view);
+          texts.push(...lines);
+          texts.push(cliButtonView(view.button, lines).title);
+          texts.push(uninstallConfirmText(notes, backups, st).body);
+          const plan = statusNoticePlan(view);
+          if (plan) texts.push(plan.title, plan.body);
+          texts.push(withCliNotice(installResultToast(installReport()), lines).body);
+        }
+    texts.push(
+      uninstallResultToast(
+        uninstallReport({ ok: false, removed: [], warnings: [WARN_RESTORED] }),
+        CLI_LINKS,
+      ).body,
+    );
+    const offenders = texts.flatMap(unguardedMv);
+    expect({ 무방비_mv_건수: offenders.length, 예시: offenders.slice(0, 3) }).toEqual({
+      무방비_mv_건수: 0,
+      예시: [],
+    });
+  });
+
+  it("★해제 잔존 안내의 'sudo rm' 에도 확인 절차가 함께 붙는다(계열 점검)", () => {
+    const t = uninstallResultToast(
+      uninstallReport({ ok: false, removed: ["/usr/local/bin/cysd"] }),
+      CLI_LINKS,
+    );
+    expect(t.body).toContain("'sudo rm /usr/local/bin/cys'");
+    // 지우기 전에 무엇인지 확인하라는 절차가 화면에도 있다(문서에만 있으면 화면이 갈라진다).
+    expect(t.body).toContain("ls -l /usr/local/bin/cys");
+    expect(t.body).toContain("심볼릭 링크인지");
+  });
+
+  it("설치 동의 문구도 같은 안전 명령을 말한다(누르기 전과 누른 뒤가 같은 말)", () => {
+    expect(FOREIGN_BACKUP_NOTICE).toContain("sudo mv -n");
+    expect(FOREIGN_BACKUP_NOTICE).toContain(MV_EMPTY_CAVEAT);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ★R1(6R) — 해제 복구 명령('sudo rm')은 **UI 가 조립한다**(백엔드는 사실만 보낸다)
 // ══════════════════════════════════════════════════════════════════════════════
 // 5R 에서 Rust 가 복구 명령 산문을 뺐는데 UI 는 조립하지 않아, 해제가 부분 실패했을 때 사용자가
@@ -1342,9 +1613,9 @@ describe("uninstallConfirmText — 집행 전 확인 문구", () => {
     expect(uninstallConfirmText([], []).body).toBe(b);
   });
   it("★잔존 백업이 있으면 경로와 되돌리는 명령이 확인 창에 나온다(60초 뒤 사라지지 않는 경로)", () => {
-    const b = uninstallConfirmText([], [BACKUP_PATH]).body;
+    const b = uninstallConfirmText([], [BACKUP_PATH], "absent").body;
     expect(b).toContain(BACKUP_PATH);
-    expect(b).toContain(`sudo mv ${BACKUP_PATH} /usr/local/bin/cys`);
+    expect(b).toContain(`sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys`);
     expect(b).toContain("제자리에 되돌립니다");
   });
   it("남의 실체 파일 고지(notes)는 그대로 옮겨 실린다(문장을 가르지 않는다)", () => {
@@ -1663,6 +1934,99 @@ describe("shadowTarget — 경로로 읽히는 값일 때만 파괴적 지시에
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ★MINOR-5(7R) — 문서가 **존재하지 않는 테스트**를 보증으로 내세우고 있었다
+// ══════════════════════════════════════════════════════════════════════════════
+// docs/INSTALL.md 는 "화면과 문서가 같은 말을 하는지 자동 테스트가 지킵니다" 라고 적어 두었는데,
+// 리포 전체에 docs 를 **읽는** 테스트가 ts·rs·py 어디에도 없었다(grep 0건). 문서의 합격선은
+// '코드와 일치'가 아니라 **'지시대로 하면 문제가 해결된다'** 이고, 화면과 문서가 갈라지는 것이
+// 이 라운드들이 반복해 온 결함이다 — 그래서 문장을 지우는 (a) 대신 약속한 테스트를 실제로
+// 만드는 (b) 를 택했다. 이제 그 문장은 이 절을 가리킨다.
+//
+// 대조는 **낱말 단위**로 한다(문장 전체 일치가 아니라): 문서는 사람이 읽는 산문이라 줄바꿈·강조
+// 표기가 자유롭게 바뀌어야 하고, 그때마다 게이트가 빨개지면 아무도 문서를 손보지 않게 된다.
+// 대신 "같은 말인지"를 결정하는 **핵심 주장**과 **알림 제목 원문**은 반드시 양쪽에 있어야 한다.
+describe("★MINOR-5 — 화면과 docs/INSTALL.md 가 같은 말을 하는지 실제로 대조한다", () => {
+  const DOC_URL = new URL("../../docs/INSTALL.md", import.meta.url);
+  const DOC = readFileSync(DOC_URL, "utf8");
+  // 문서는 줄바꿈·들여쓰기로 접히므로 공백을 하나로 눌러 비교한다(제목이 두 줄에 걸쳐도 잡힌다).
+  // 인용문(`> `) 안에서 접힌 문장도 같은 문장이다 — 줄머리 인용 표식을 먼저 걷어 낸다.
+  const flat = (t: string) => t.replace(/^[ \t]*>[ \t]?/gm, "").replace(/\s+/g, " ").trim();
+  const DOC_FLAT = flat(DOC);
+  const docHas = (t: string) => DOC_FLAT.includes(flat(t));
+
+  it("문서 파일이 실재한다 — 없으면 건너뛰지 않고 실패한다(측정 불능은 통과가 아니다)", () => {
+    expect({ 문서: "docs/INSTALL.md", 읽힘: DOC.length > 2000 }).toEqual({
+      문서: "docs/INSTALL.md",
+      읽힘: true,
+    });
+  });
+
+  it("★상시 고지 제목 네 개가 화면 문자열 그대로 문서에도 적혀 있다", () => {
+    const titles: [string, string][] = [
+      ["foreign", NOTICE_TITLE_FOREIGN],
+      ["partial", NOTICE_TITLE_PARTIAL],
+      ["backup", NOTICE_TITLE_BACKUP],
+      ["info", NOTICE_TITLE_INFO],
+    ];
+    for (const [kind, t] of titles)
+      expect({ 갈래: kind, 제목: t, 문서에_있음: docHas(t) }).toEqual({
+        갈래: kind,
+        제목: t,
+        문서에_있음: true,
+      });
+  });
+
+  it("★설치 동의 문구(FOREIGN_BACKUP_NOTICE)의 핵심 주장이 문서에도 있다", () => {
+    // [무엇을 약속하는가, 그 약속을 담은 낱말]. 낱말은 화면·문서 **양쪽**에 있어야 한다.
+    const claims: [string, string][] = [
+      ["남의 실체 파일도 백업한다", "실제 파일"],
+      ["남의 심볼릭 링크도 백업한다", "심볼릭 링크"],
+      ["지우지 않고 옮긴다", "지우지 않고"],
+      ["백업 이름 규칙을 밝힌다", "cys-backup"],
+      ["스탬프는 epoch 초다", "epoch"],
+      ["되돌리는 명령은 덮어쓰기 금지형이다", "sudo mv -n"],
+      ["해제가 자동으로 되돌린다", "되돌립니다"],
+    ];
+    for (const [why, token] of claims)
+      expect({
+        주장: why,
+        낱말: token,
+        화면: FOREIGN_BACKUP_NOTICE.includes(token),
+        문서: docHas(token),
+      }).toEqual({ 주장: why, 낱말: token, 화면: true, 문서: true });
+  });
+
+  it("★`-n` 의 뜻풀이가 화면과 문서 양쪽에 있다(가드를 사용자가 스스로 뜯지 않게)", () => {
+    expect({
+      화면: FOREIGN_BACKUP_NOTICE.includes(MV_EMPTY_CAVEAT),
+      문서: docHas(MV_EMPTY_CAVEAT),
+    }).toEqual({ 화면: true, 문서: true });
+  });
+
+  it("★문서의 실행 예시(코드블록)에 -n 없는 'sudo mv' 가 없다", () => {
+    // 산문에는 "예전에는 `-n` 없는 sudo mv 를 안내했다" 는 과거 서술이 남아 있어야 하므로,
+    // 검사 대상은 **따라 치게 되어 있는 코드블록**뿐이다.
+    const blocks = DOC.split("```").filter((_, i) => i % 2 === 1);
+    expect(blocks.length).toBeGreaterThan(3); // 코드블록을 하나도 못 찾는 사고 방지
+    const offenders = blocks.flatMap(unguardedMv);
+    expect({ 무방비_mv: offenders }).toEqual({ 무방비_mv: [] });
+  });
+
+  it("★문서가 화면의 '언제 명령을 내고 언제 내지 않는가' 규칙을 그대로 적고 있다", () => {
+    // 화면 쪽 실제 동작(backupRestoreSpot)의 세 갈래가 문서에도 그대로 있어야 한다.
+    expect({
+      비었을때: docHas("sudo mv -n"),
+      차있을때: docHas("옮기는 명령을 **내지 않습니다.**"),
+      모를때: docHas("ls -l <원래 경로>"),
+    }).toEqual({ 비었을때: true, 차있을때: true, 모를때: true });
+    // 그리고 화면이 정말 그렇게 동작한다(문서만 맞고 화면이 다르면 이 대조는 무의미하다).
+    expect(backupNoticeLine(BACKUP_PATH, "absent")).toContain("sudo mv -n");
+    expect(backupNoticeLine(BACKUP_PATH, "ours")).not.toContain("sudo mv");
+    expect(backupNoticeLine(BACKUP_PATH, "partial")).toContain("ls -l /usr/local/bin/cys");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ★I7 / N4 — main.ts 배선 핀: 등급색을 **낼 때마다** 다시 못박는가
 // ══════════════════════════════════════════════════════════════════════════════
 // N4 의 수리 본체는 순수 함수가 아니라 main.ts 의 한 줄이다(재사용 엘리먼트에 className 재적용).
@@ -1714,7 +2078,11 @@ describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => 
     pinHas("setCcOpen", mainFnBody("setCcOpen"), "cliLastInstall = null");
   });
   it("(I3②) 해제 확인 문구에 현재 상태(notes)와 잔존 백업(backups)을 함께 넘긴다", () => {
-    pinHas("main.ts", MAIN_SRC, "uninstallConfirmText(cliStatus.notes, cliStatus.backups)");
+    pinHas(
+      "main.ts",
+      MAIN_SRC,
+      "uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState)",
+    );
   });
 
   // ★G2 — 한 액션에 한 알림. 배선이 본체라 여기에 핀을 박는다(순수 함수만으로는 못 지킨다).

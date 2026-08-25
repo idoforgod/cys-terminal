@@ -6785,7 +6785,10 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
   // 문구를 읽어 분류하지 않는다: 분기의 근거는 두 배열의 길이뿐이고, 내용은 옮기거나(notes)
   // 경로에서 만든다(backups — 백엔드는 사실만, 표현은 UI 소유).
   if (wantUninstall) {
-    const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups);
+    // ★(MAJOR-2 · 7R) linkState 도 함께 넘긴다 — 확인 창에 실리는 백업본 줄이 '그 자리가 지금
+    // 비어 있는가' 를 알아야 파괴적인 'sudo mv' 를 내지 않는다(자리가 차 있으면 명령 대신
+    // "해제하면 앱이 되돌립니다" 라고 말한다).
+    const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState);
     if (!(await confirmModal(c.title, c.body, c.yes, c.no))) return;
   }
   b.disabled = true; // in-flight 이중 클릭 차단(승격 프롬프트가 떠 있는 동안)
