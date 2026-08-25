@@ -39,7 +39,7 @@
 | ID | 위험 명령 | 왜 경계인가 | 워커 처리 |
 |---|---|---|---|
 | INST-DENY-01 | `cys daemon install --takeover` | **가동 중인 세션이 소멸**합니다(비가역 — 아래 "C. 상시 가동" line 참조). | 자율 실행 금지 → 정지·오너 보고 |
-| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. **GUI "셸에 cys 설치"/"셸 cys 해제" 버튼은 사용자 명시 클릭 + osascript 1회 승격이라 이 경계를 위반하지 않지만, 에이전트가 그 버튼을 자율로 클릭하는 것은 여전히 금지**(사람의 클릭이 곧 동의다 — 대리 클릭은 동의가 아님). |
+| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀 — 그 자리에 실제 파일이 있으면 **백업 없이 소멸**한다. 맨 `ln -sf`/`ln -sfn` 한 줄은 이 문서 어디에도 더 이상 두지 않는다. 수동 설치가 필요하면 §B "폴백 — 수동 sudo" 의 **백업 선행 블록**을 쓴다(있으면 `<원래 경로>.cys-backup-<epoch초>` 로 옮긴 뒤 링크). | 사람(🧑)이 직접 실행 → 워커는 위임. **GUI "셸에 cys 설치"/"셸 cys 해제" 버튼은 사용자 명시 클릭 + osascript 1회 승격이라 이 경계를 위반하지 않지만, 에이전트가 그 버튼을 자율로 클릭하는 것은 여전히 금지**(사람의 클릭이 곧 동의다 — 대리 클릭은 동의가 아님). |
 | INST-DENY-03 | `rm -rf ~/.cys ~/.local/state/cys` | pack·트랜스크립트·상태 **완전 삭제**(비가역). | 자율 실행 금지 → 정지·오너 보고 |
 | INST-DENY-04 | DMG 우클릭·Gatekeeper "열기"·코드사이닝 | 사람 GUI/보안 결정 단계. | 사람(🧑)이 직접 → 워커는 위임 |
 
@@ -269,20 +269,95 @@ codesign --verify --strict --verbose /Applications/cys.app
      안내를 읽은 분이 같은 자리를 누르면 **재시도가 아니라 해제**가 실행됐습니다. 지금은 라벨과
      실제 동작이 항상 같습니다. 해제하고 싶다면 Control Center를 닫았다 다시 열면 현재 상태에
      맞는 라벨("셸 cys 해제")로 돌아옵니다.
-2. **폴백 — 수동 sudo:** GUI를 못 쓰는 환경에서만.
+2. **폴백 — 수동 sudo:** GUI를 못 쓰는 환경(SSH·헤드리스)에서만.
+
+   ⚠ **`sudo ln -sfn …` 를 단독으로 치지 마세요.** `ln -f` 는 그 자리에 **실제 파일**이 있어도 묻지
+   않고 지우고 링크로 갈아 끼웁니다 — Homebrew나 직접 빌드로 깔아 둔 `/usr/local/bin/cys` 가
+   **백업 없이 사라집니다**(복구 불가). 버튼(위 1)은 2026-08-25부터 지우지 않고 옮겨 두는데, 이
+   문서의 수동 절차만 옛 형태로 남아 있었습니다. 아래 블록이 **버튼과 같은 순서**로 도는
+   대체본입니다 — 통째로 복사해 붙여 넣으세요.
+
 ```sh
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-02] sudo 심링크 — 사람이 직접
-sudo ln -sfn /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
-sudo ln -sfn /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
+# 버튼과 같은 규칙: ①자리가 비었으면 그냥 링크 ②남의 파일·남의 링크면 먼저
+# <원래 경로>.cys-backup-<epoch초> 로 옮긴 뒤 링크 ③이미 이 앱의 링크면 백업하지 않음(멱등)
+sudo sh -c '
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+SRC=/Applications/cys.app/Contents/MacOS
+DST=/usr/local/bin
+STAMP=$(date +%s)
+mkdir -p "$DST" || exit 1
+for f in cys cysd; do
+  d=$DST/$f
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    ours=no
+    if [ -L "$d" ]; then
+      case "$(readlink "$d")" in
+        */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd) ours=yes ;;
+      esac
+    fi
+    if [ "$ours" = no ]; then
+      b=$d.cys-backup-$STAMP
+      if [ -e "$b" ] || [ -L "$b" ]; then
+        echo "중단: 백업 이름이 이미 있습니다 — $b (1초 뒤 다시 실행하세요)"; exit 1
+      fi
+      mv "$d" "$b" || exit 1
+      echo "백업했습니다: $d -> $b"
+    else
+      echo "이미 이 앱의 링크입니다(백업하지 않습니다): $d"
+    fi
+  fi
+  ln -sfn "$SRC/$f" "$d" || exit 1
+  echo "링크를 만들었습니다: $d -> $SRC/$f"
+done
+'
 ```
+
 `/usr/local/bin/cys`·`/usr/local/bin/cysd` 심볼릭이 생기고 새 터미널에서 `cys`가 바로
 동작합니다. (앱 업데이트에도 경로 유지 — 심볼릭이라 자동 추종. pane *안*에서는 PATH가 자동
 주입되므로 이 단계는 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
 
+- 백업이 일어났다면 그 경로(`<원래 경로>.cys-backup-<epoch초>`)가 블록 실행 중에 화면에
+  찍힙니다. 이름 규칙과 되돌리는 절차는 아래 **"백업본을 손으로 되돌리기"** 에 있습니다.
+  버튼이 만드는 이름과 **같은 규칙**이라, 나중에 앱을 쓰게 되면 앱이 그 백업본을 찾아내
+  고지하고 해제할 때 자동으로 되돌립니다.
+- 같은 블록을 두 번 돌려도 백업이 쌓이지 않습니다 — 이미 이 앱을 가리키는 링크는 백업하지 않고
+  링크만 다시 겁니다(멱등).
+- 이 블록은 `readlink` 가 돌려주는 **문자 그대로**의 경로가 `…/cys.app/Contents/MacOS/cys`(또는
+  `cysd`)로 끝날 때만 "이 앱의 링크"로 봅니다. 손으로 만든 `…/MacOS//cys` 같은 변칙 표기는
+  남의 것으로 보아 **백업**합니다 — 안전한 쪽으로 틀립니다(잃는 것은 없고 백업본이 하나 늘 뿐).
+
 **해제 방법** — 같은 버튼이 상태에 따라 **"셸 cys 해제"** 로 바뀝니다. 누르면 확인 창이 먼저 뜨고,
 승인하면 `/usr/local/bin/cys`·`cysd` **심볼릭 링크만** 제거합니다(관리자 승인 1회). 같은 이름의
-일반 파일이나 다른 앱을 가리키는 링크는 건드리지 않고 사유와 함께 건너뜁니다. 수동 폴백은
-`sudo rm /usr/local/bin/cys /usr/local/bin/cysd` (🧑 [HUMAN] — 지우기 전 `ls -l` 로 심링크인지 확인).
+일반 파일이나 다른 앱을 가리키는 링크는 건드리지 않고 사유와 함께 건너뜁니다.
+
+⚠ **수동 폴백으로 `sudo rm <두 경로>` 를 그냥 치지 마세요**(2026-08-25 이전 이 자리가 그랬습니다). `rm` 은
+그 자리에 있는 것이 우리 링크인지 **남의 실제 파일**인지 보지 않습니다. 버튼은 ①심볼릭 링크인가
+②그 링크가 `cys.app` 안을 가리키는가 **둘 다** 통과할 때만 지우는데, 2026-08-25 이전 이 자리에는
+그 두 검사가 `ls -l` 로 눈으로 보라는 **말**로만 붙어 있었습니다. 아래 블록은 같은 두 검사를
+**명령 안에서** 합니다(GUI를 못 쓸 때만 · 통째로 복사).
+
+```sh
+# 🧑 [HUMAN] 수동 해제 — 심볼릭 링크이고 그 대상이 cys.app 안일 때만 지웁니다(버튼과 같은 규칙)
+sudo sh -c '
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+for d in /usr/local/bin/cys /usr/local/bin/cysd; do
+  if [ ! -L "$d" ]; then
+    if [ -e "$d" ]; then echo "건너뜁니다(심볼릭 링크가 아닙니다 — 남의 파일일 수 있습니다): $d"
+    else echo "없습니다: $d"; fi
+    continue
+  fi
+  case "$(readlink "$d")" in
+    */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd)
+      rm -f "$d" && echo "지웠습니다: $d" ;;
+    *) echo "건너뜁니다(다른 곳을 가리키는 링크입니다): $d" ;;
+  esac
+done
+'
+```
+
+설치할 때 백업본이 생겼다면 링크를 지운 **그 자리**에 원본을 되돌려야 합니다 — 절차는 바로 아래
+**"백업본을 손으로 되돌리기"** 3) 블록을 그대로 쓰세요(버튼은 이 되돌리기까지 자동으로 합니다).
 
 **설치할 때 백업해 둔 원본이 있으면** 그 경로가 해제 확인 창에 함께 나옵니다 — 예:
 `/usr/local/bin/cys.cys-backup-1756089600`. 그리고 **해제는 그 원본을 제자리에 되돌립니다**
@@ -311,28 +386,58 @@ sudo ln -sfn /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 **손으로 찾는 법 · 되돌리는 법**
 
 ```sh
-# 🧑 [HUMAN] 1) 남아 있는 백업본을 전부 본다 (숫자가 큰 쪽이 최신)
+# 🧑 [HUMAN] 1) 남아 있는 백업본을 전부 본다 (숫자가 큰 쪽이 최신) — 읽기만 합니다
 ls -l /usr/local/bin/cys.cys-backup-* /usr/local/bin/cysd.cys-backup-* 2>/dev/null
 
-# 🧑 [HUMAN] 2) 숫자를 사람이 읽는 시각으로 바꿔 언제 백업된 것인지 확인한다
+# 🧑 [HUMAN] 2) 숫자를 사람이 읽는 시각으로 바꿔 언제 백업된 것인지 확인한다 — 읽기만 합니다
 date -r 1756089600
+```
 
-# 🧑 [HUMAN] 3) 되돌리기 — 지금 그 자리에 있는 것(우리 링크)을 먼저 치우고 원본을 제자리로
-ls -l /usr/local/bin/cys                      # 먼저 확인: cys.app 안을 가리키는 심볼릭 링크인가
-sudo rm /usr/local/bin/cys
-sudo mv -n /usr/local/bin/cys.cys-backup-1756089600 /usr/local/bin/cys
+**3) 되돌리기** — 아래 블록은 자리가 **정말 비었을 때만** 옮깁니다(버튼이 하는 것과 같은 검사).
+`D`(되돌릴 자리)와 `B`(1)에서 고른 백업본) 두 줄만 여러분 것으로 바꾸고 **통째로** 복사하세요.
 
-# 🧑 [HUMAN] 4) 필요 없으면 버리기
+```sh
+# 🧑 [HUMAN] 3) 되돌리기 — ①우리 링크일 때만 지우고 ②자리가 완전히 빈 것을 확인한 뒤 옮깁니다
+sudo sh -c '
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+D=/usr/local/bin/cys
+B=/usr/local/bin/cys.cys-backup-1756089600
+if [ ! -e "$B" ] && [ ! -L "$B" ]; then echo "중단: 백업본이 없습니다 — $B"; exit 1; fi
+if [ -L "$D" ]; then
+  case "$(readlink "$D")" in
+    */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd)
+      rm -f "$D" && echo "이 앱의 링크를 지웠습니다: $D" ;;
+    *) echo "중단: 그 자리는 다른 곳을 가리키는 링크입니다 — 직접 확인하세요: $D"; exit 1 ;;
+  esac
+elif [ -e "$D" ]; then
+  echo "중단: 그 자리에 실제 파일이 있습니다(남의 파일일 수 있습니다) — 덮지 않습니다: $D"; exit 1
+fi
+if [ -e "$D" ] || [ -L "$D" ]; then echo "중단: 자리가 비지 않았습니다: $D"; exit 1; fi
+mv "$B" "$D" && echo "되돌렸습니다: $B -> $D"
+'
+```
+
+```sh
+# 🧑 [HUMAN] 4) 필요 없으면 버리기 — 지우기 전에 무엇인지 한 번 봅니다(되돌릴 마지막 사본입니다)
+ls -l /usr/local/bin/cys.cys-backup-1756089600
 sudo rm /usr/local/bin/cys.cys-backup-1756089600
 ```
 
-> ⚠ 3)의 `sudo rm` 은 **우리 링크**를 지우는 것입니다. 지우기 전에 `ls -l /usr/local/bin/cys` 로
-> 그것이 `cys.app` 안을 가리키는 심볼릭 링크인지 확인하세요. 실제 파일이면 그건 백업 대상이었던
-> 남의 파일일 수 있습니다.
+> ⚠ 3) 블록이 하는 검사가 **버튼과 같은 것**입니다 — 그 자리가 ①심볼릭 링크이고 ②그 링크가
+> `cys.app` 안을 가리킬 때만 지웁니다. 실제 파일이면 그것은 백업 대상이었던 **남의 파일**일 수
+> 있으므로 지우지 않고 멈춥니다.
+> (2026-08-25 이전 이 자리는 `sudo rm /usr/local/bin/cys` 한 줄만 주고 "지우기 전에 `ls -l` 로
+> 심볼릭 링크인지 확인하세요" 라는 **말**을 옆에 붙였습니다. 확인이 사람 눈에만 맡겨져 있어서,
+> 눈이 미끄러지면 남의 실체 바이너리가 그대로 사라졌습니다. 지금은 명령 자신이 확인합니다.)
 
-> ⚠ `mv` 에 붙은 **`-n` 은 덮어쓰기 금지**입니다. 원래 자리가 비어 있어야 옮겨집니다 — 비어 있지
-> 않으면 아무 일도 일어나지 않습니다. `-n` 을 빼면 그 자리에 있던 파일이 **말없이 사라집니다**.
-> 아무 일도 일어나지 않았다면 그 자리가 아직 비지 않은 것이니, 3)의 첫 줄부터 다시 하세요.
+> ⚠ **`mv -n` 하나에 기대지 마세요 — 한 형태에서 그 보증이 깨집니다.** 앱 화면이 내주는 되돌리기
+> 명령 `sudo mv -n <백업본> <원래 경로>` 에는 이런 뜻풀이가 붙습니다: "원래 자리가 비어 있어야
+> 옮겨집니다 — 비어 있지 않으면 아무 일도 일어나지 않습니다". 실제 파일과 살아 있는 링크에
+> 대해서는 그 말이 맞습니다. 그러나 macOS(BSD) `mv` 의 `-n` 은 대상을 **따라가서** 있는지 보기
+> 때문에, 그 자리에 **대상이 이미 사라진 심볼릭 링크**(dangling)가 있으면 "비어 있다"로 읽고 그
+> 링크를 조용히 덮어씁니다(실측 2026-08-25). 위 3) 블록이 `-n` 에 기대는 대신 `[ -e ]` 와 `[ -L ]`
+> **둘 다**로 자리가 빈 것을 먼저 확인하는 이유가 이것입니다 — 앱 자신의 자동 되돌리기도 같은 두
+> 검사를 씁니다.
 >
 > (2026-08-25 이전에는 앱 화면이 잔존 백업본을 볼 때마다 `-n` 없는 `sudo mv <백업본> <원래 경로>`
 > 를 무조건 안내했습니다. 그 자리가 비어 있는지 검사하지 않아서, "그 자리에 남의 실제 파일이
@@ -463,8 +568,11 @@ cys boot                                     # 설치된 CLI 자동 감지 → w
 cys daemon uninstall                         # 상시 가동 해제(설치했다면)
 # 🧑 [HUMAN] macOS: 앱을 지우기 전에 Control Center 헤더의 "셸 cys 해제"를 먼저 누르면 심링크가 정리됩니다(§B).
 # 🧑 [HUMAN] macOS: Applications에서 cys.app 삭제 + /usr/local/bin/cys{,d} 심링크 제거
+#            ↑ 손으로 지울 때는 §B "수동 해제" 블록을 쓰세요 — 맨 `rm <두 경로>` 는
+#              그 자리에 온 **남의 실제 파일**도 함께 지웁니다(그 블록은 우리 링크만 지웁니다)
 # 🧑 [HUMAN] Windows: 설정 → 앱 → 'cys' 제거(setup.exe가 등록한 언인스톨러 · PATH는 애초에 건드리지 않았으므로 정리할 것이 없습니다)
 # 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-03] ⚠ 비가역 완전 삭제 — 워커 자율 실행 금지·정지·오너 보고
+#   되돌릴 수 없습니다. 장기기억·soul.md·설정도 함께 사라지므로 **먼저 백업**하세요.
 rm -rf ~/.cys ~/.local/state/cys             # pack·트랜스크립트·상태 완전 삭제(선택)
 ```
 

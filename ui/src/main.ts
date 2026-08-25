@@ -432,6 +432,28 @@ function showCliToast(plan: ToastPlan) {
   else toast(plan.category, plan.title, plan.body);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-3(2026-08-25 8R) 상태 조회의 **동시성 가드** — 진행 중 억제 + 세대 카운터
+// ══════════════════════════════════════════════════════════════════════════════
+// 7R 이 Rust `cli_install_status` 를 async 로 내리면서(#[tauri::command] 는 함수의 asyncness 로
+// ExecutionContext 를 정한다) IPC 핸들러의 **직렬화가 사라졌다**. 그 전에는 Blocking 컨텍스트라
+// 조회가 도는 동안 다음 조회가 시작조차 못 했는데, 지금은 Control Center 를 빠르게 여닫는 만큼
+// `$SHELL -lc 'which -a …'` **로그인 셸이 동시에 뜬다**(Rust probe_path_shadows: 기한 5초 +
+// -lc 미지원 셸 폴백 재시도 1회 = 최대 10초/회). 7R 주석은 "새 동시성도 열리지 않는다"고 단정하며
+// 근거로 '버튼 disabled' 를 들었지만, 상태 조회의 실제 호출부는 버튼이 아니라 setCcOpen 안의
+// `void refreshCliInstallState()` 다 — 그 경로에는 가드가 없었다.
+//
+// 둘째 결함은 **last-writer-wins** 였다. `cliStatus = readCliStatus(await invoke(...))` 에 요청
+// 구분이 없어, 늦게 끝난 옛 프로브가 액션 직후의 재조회 결과를 덮을 수 있다. 그러면 결과 토스트에
+// 접어 넣는 고지 줄(withCliNotice)과 버튼 라벨이 **낡은 사실**로 되돌아간다 — I2 가 닫은 '라벨과
+// 실제가 어긋나는 창'과 같은 계열이다.
+//
+// 관례는 이 파일에 이미 있다. 재진입 억제는 `boardBusy`(runSkillButton), 늦은 응답의 덮어쓰기
+// 차단은 **세대 카운터**(trackFilter.generation / clearLedgerIfGeneration) 다. 그 둘을 그대로
+// 쓴다 — 새 타이머·폴링은 만들지 않는다(이 코드베이스의 상시 원칙).
+let cliStatusGen = 0; // 최신 요청 세대. 응답은 자기 세대가 아직 최신일 때만 상태를 쓴다.
+let cliStatusBusy = false; // 프로브가 떠 있는가(= 로그인 셸이 아직 살아 있는가).
+
 // 읽기 전용 상태 조회(관리자 승격 없음). ★폴링 금지(WINAUDIT 타이머 증식) — CC 열 때 1회 +
 // 설치/해제 직후 1회뿐이다. 실패해도 기능이 죽지 않는 부수 조회라 조용히 unknown으로 두고,
 // unknown의 라벨은 '설치'다(멱등한 설치 쪽 — 비가역 해제로 기울지 않는다).
@@ -440,13 +462,33 @@ function showCliToast(plan: ToastPlan) {
 // 설치·해제 **직후**의 재조회에서는 false 다 — 같은 사실(옮겨 둔 원본·남의 파일)이 결과 토스트에
 // 이미 실려 있어서, 그대로 두면 서로 다른 문장의 sticky 가 둘 뜬다(한 사건, 두 알림). 그 경로에서는
 // 호출측이 withCliNotice 로 결과 토스트 **하나**에 접어 넣는다. 정보는 줄지 않는다(툴팁에도 상주).
-async function refreshCliInstallState(opts: { notice?: boolean } = {}) {
+//
+// ★(MAJOR-3) `force`: 액션(설치·해제) **직후**의 재조회인가. 이 한 갈래만 중복 억제를 건너뛴다.
+async function refreshCliInstallState(opts: { notice?: boolean; force?: boolean } = {}) {
   if (!IS_MACOS) return;
+  // (MAJOR-3) 진행 중이면 **새 로그인 셸을 띄우지 않는다.** 관측만 하는 재진입(CC 토글·팔레트
+  // act:cc·부팅 경로)은 버려도 잃는 것이 없다 — 이미 떠 있는 프로브가 곧 같은 답을 낸다.
+  // 예외는 액션 직후 재조회(force)뿐이다: 그것은 **설치·해제가 일어난 뒤의 사실**을 읽어야 하므로
+  // 액션 이전에 시작된 프로브의 답으로 대신할 수 없다(버리면 라벨과 고지 줄이 낡은 채 남는다 —
+  // MINOR-11 이 닫은 창의 재개방). 그래서 동시 프로브 수의 상한은 '사용자가 누른 액션 수'로 묶인다.
+  if (cliStatusBusy && !opts.force) return;
+  const gen = ++cliStatusGen;
+  cliStatusBusy = true;
+  // 응답은 **지역 변수로 받는다.** await 뒤에 곧바로 cliStatus 에 대입하면 세대 검사를 할 자리가
+  // 없어져(대입이 이미 끝난 뒤다) 가드가 장식이 된다.
+  let view: CliStatusView;
   try {
-    cliStatus = readCliStatus(await invoke("cli_install_status"));
+    view = readCliStatus(await invoke("cli_install_status"));
   } catch {
-    cliStatus = { ...CLI_STATUS_UNKNOWN };
+    view = { ...CLI_STATUS_UNKNOWN };
   }
+  // 늦게 도착한 낡은 응답은 최신 상태를 **덮지 않는다**(last-writer-wins 차단). busy 도 최신
+  // 세대만 내린다 — 옛 응답이 내리면 아직 살아 있는 프로브를 '없다'고 말하게 되어 억제가 뚫린다.
+  // (프로브가 영영 돌아오지 않는 환경에서는 busy 가 남아 관측 재조회가 멎지만, 그때는 애초에 읽을
+  //  수 있는 상태가 없다 — 라벨은 안전한 쪽('설치')에 머물고, 다음 액션의 force 가 그 자물쇠를 푼다.)
+  if (gen !== cliStatusGen) return;
+  cliStatusBusy = false;
+  cliStatus = view;
   applyCliButtonView();
   if (opts.notice === false) return;
   const notice = statusNoticePlan(cliStatus); // 고지할 것(notes·잔존 백업)이 없으면 null — 정상은 무음
@@ -6779,6 +6821,16 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
   // ★(I2) 클릭 분기는 **라벨을 만든 그 판정**을 그대로 쓴다. cliStatus.button 만 보면
   // '다시 설치'라고 적힌 버튼이 해제를 집행하는 창이 열린다(사용자가 본 것과 다른 행동).
   const wantUninstall = cliButtonIntent(cliStatus.button, cliLastInstall) === "uninstall";
+  // ★(MAJOR-3 · 8R) 재진입 차단을 **첫 await 앞**으로 올린다.
+  //
+  // 예전에는 이 줄이 확인 모달 뒤에 있었다. 그래서 해제 경로만, 모달을 await 하는 동안 버튼이
+  // 살아 있었다 — 오버레이(.modal-overlay · position:fixed·inset:0)가 **마우스**는 가리지만
+  // 포커스는 방금 누른 이 버튼에 그대로 남고, 전역 키 핸들러는 수식키 없는 입력을 그냥 흘려보낸다
+  // (이 파일 말미 `if (!mod) return`). 그래서 Enter/Space 한 번이면 핸들러에 다시 들어와 확인 창이
+  // 둘 뜨고, 둘 다 승인하면 `uninstall_cli_from_path` 가 **동시에 두 번** 나간다(승격 프롬프트도 둘).
+  // 설치 경로는 첫 await 가 invoke 라 원래도 막혀 있었지만, **같은 가드를 경로마다 다른 자리에
+  // 두는 것** 자체가 이 어긋남의 원인이었다 — 자리를 하나로 통일한다.
+  b.disabled = true; // in-flight 이중 진입 차단(확인 모달·승격 프롬프트가 떠 있는 동안)
   // 해제는 root 소유 심링크를 지우는 비가역에 가까운 행위 — 클릭 즉시 집행하지 않고 확인을 먼저 받는다.
   // alert()/confirm()은 이 WKWebView에서 억제된다는 실측(B-11)이 있어 순수 DOM confirmModal을 쓴다.
   // (I3②) 확인 창에 **현재 상태**를 함께 실어 준다 — 남의 파일 고지(notes)와 잔존 백업본(backups).
@@ -6789,9 +6841,12 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     // 비어 있는가' 를 알아야 파괴적인 'sudo mv' 를 내지 않는다(자리가 차 있으면 명령 대신
     // "해제하면 앱이 되돌립니다" 라고 말한다).
     const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState);
-    if (!(await confirmModal(c.title, c.body, c.yes, c.no))) return;
+    if (!(await confirmModal(c.title, c.body, c.yes, c.no))) {
+      // 취소 — 집행한 것이 없으니 재조회도 하지 않는다(쓸데없이 로그인 셸을 띄우지 않는다).
+      b.disabled = false;
+      return;
+    }
   }
-  b.disabled = true; // in-flight 이중 클릭 차단(승격 프롬프트가 떠 있는 동안)
   // ★(G2) 결과 알림은 **이 액션당 정확히 하나**다. 예전에는 여기서 결과 토스트를 내고, finally 의
   // 재조회가 곧바로 상시 고지 토스트를 또 냈다 — 백업이 일어난 설치 1클릭이 서로 다른 문장의
   // sticky 두 개(cli-install + cli-status-notes)로 같은 사실을 말했다. 계획을 들고 있다가
@@ -6835,7 +6890,9 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     await Promise.race([
       // 액션 직후 1회 재조회로 라벨 갱신(폴링 아님). 상시 고지 토스트는 여기서 내지 않는다 —
       // 아래에서 결과 토스트 하나로 접어 넣는다(G2).
-      refreshCliInstallState({ notice: false }),
+      // ★(MAJOR-3) force: 이 재조회만은 중복 억제를 건너뛴다 — CC 를 열 때 시작된 프로브가 아직
+      // 떠 있으면 그 답은 **액션 이전의 사실**이라, 그것으로 대신하면 라벨·고지 줄이 낡는다.
+      refreshCliInstallState({ notice: false, force: true }),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
     if (plan) showCliToast(withCliNotice(plan, cliNoticeLines(cliStatus)));

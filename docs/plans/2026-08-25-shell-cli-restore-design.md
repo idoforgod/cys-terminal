@@ -17,9 +17,16 @@
 > 어긋나면 이 문서가 아니라 **실물 코드**가 이긴다 — 다만 어긋났다는 사실 자체가 결함이므로,
 > 실물이 바뀌면 이 절을 같은 커밋에서 갱신한다.
 
+> **이 문서의 독자는 둘이다** — ①오너(개발자가 아니어도 무슨 일이 있었는지 읽을 수 있어야 한다)
+> ②이 레인을 이어받는 사람. 그래서 전문용어는 풀어 쓰되 **수치·근거·`파일:줄번호` 는 전부
+> 보존한다.** 요약하거나 압축하지 않는다.
+
 - **레인**: `<WORKTREE>` @ `fix/shell-cli-install-restore`
 - **기준점(base)**: `c54c3b2` = v0.14.24 (2026-08-22 릴리스)
-- **작성 시점 HEAD**: `9f47148` (3라운드 수리 완료 · 4라운드 착수 직전)
+- **현재 HEAD(= 8라운드 freeze)**: `0b6cb24` (7라운드 수리 완료 · 8라운드 판정 대상)
+- **갱신 시점**: 2026-08-25 · 8라운드 MAJOR-4 수리(§3 실물 재유도 · §4 8차까지 · §7 CI 공백 ·
+  §8 레인 상태 파일 위치 · §9 인수인계)
+- **이 문서 안의 모든 `main.rs:NNN` 은 `0b6cb24` 기준이다.**
 
 ---
 
@@ -53,8 +60,10 @@ cys 앱은 macOS의 `/Applications` 안에 들어 있는 GUI 프로그램이다.
 | 2026-08-25 | `0adc45d` | `docs(state)`: SESSION_STATE 정본 — Scope B·C 이미 구현 실측 확정. |
 | 2026-08-25 | `0e60b79` | 1차 구현 — 버튼 복원 + 수리 5건 (반증 이전). |
 | 2026-08-25 | `6159778` | 2차 — 적대적 반증 12건 수리(파괴→백업 전환·TOCTOU 봉합·hang 실제 차단·계약 드리프트 해소). |
-| 2026-08-25 | `9f47148` | 3차 — 산문 계약 폐기(`unverified_reason` 기계 판별자)·부분실패 백업 통보·셸 종료상태 존중·펌링크 별칭. |
-| 2026-08-25 | (진행 중) | 4차 — **계열(class) 수리**. 지점이 아니라 결함의 계열을 닫는다. |
+| 2026-08-25 | `9f47148` | 3차 — 산문 계약 폐기(`unverified_reason` 기계 판별자)·부분실패 백업 통보·셸 종료상태 존중·펌링크 별칭 |
+| 2026-08-25 | `7f8b505` | 4~6차 — 계열 수리(C1~C5·I1~I7) · 5차 `do shell script` **CR 구분자** BLOCK 폐쇄 · 6차 Windows E0425 컴파일 즉사 폐쇄 · '판정≠집행' 통일. ★이 커밋이 레포 루트의 `MASTER_TODO.md`·`SESSION_STATE.md` 를 삭제했다(→ §8) |
+| 2026-08-25 | `0b6cb24` | 7차 — 등급 회귀 폐쇄 · 커맨드 3종 **비동기화** · 앱이 내던 파괴적 명령 제거 · 재발방지 핀의 사각 폐쇄. **현재 HEAD = 8차 freeze** |
+| 2026-08-25 | (진행 중) | 8차 — 이종 판정자 2인의 최종 판정 **12건**. 이 문서의 §3·§4·§7·§8·§9 갱신이 그중 MAJOR-4 의 산출물이다(→ 4.11) |
 
 ### 1.3 2026-08-20 제거 당시 남아 있던 것
 
@@ -181,50 +190,71 @@ UI 순수 로직(상태→라벨 매핑, status→토스트 등급 매핑)은 `u
 
 ## 3. IPC 계약 정본
 
-> **작성 근거**: `src-tauri/src/main.rs` @ `9f47148` 실물. 아래 line 번호는 그 리비전 기준이다.
+> **작성 근거**: `src-tauri/src/main.rs` 와 `ui/src/__contract__.json` **실물** @ `0b6cb24`(= 8라운드
+> freeze 리비전). 아래 line 번호는 전부 그 리비전 기준이다.
+>
+> ★**이 절은 실물에서 유도했다.** 4라운드까지 이 절은 `9f47148` 기준으로 적혀 있었고, 그 뒤
+> 4·5·7라운드가 필드를 넷 더 만드는 동안 갱신되지 않았다 — `skipped_reasons`·`skipped_benign`·
+> `restored`·`backups` 가 표에서 통째로 빠져 있었고, 275행은 `skipped_benign` 을 "아직 실물에 없다"
+> 고 적고 있었다(실물에는 있다). **머리말이 스스로 "실물이 바뀌면 같은 커밋에서 갱신한다"고
+> 선언해 놓고 그 규칙을 자기가 어긴 것**이며, 8라운드 MAJOR-4(a)가 그 수리다.
+>
 > **serde rename 없음** — Rust 필드명이 그대로 snake_case 로 JavaScript 에 노출된다.
-> 세 커맨드 모두 Rust 시그니처는 `-> Result<T, String>` 이며, Tauri `invoke` 에서 `Err` 는
+> 세 커맨드 모두 Rust 시그니처는 `async fn … -> Result<T, String>` 이며, Tauri `invoke` 에서 `Err` 는
 > **Promise reject** 로 도착한다(TS 는 반드시 try/catch 로 감싼다).
 
 ### 3.0 커맨드 3종 요약
 
-| 커맨드 | 선언 위치 | 승격 | 호출 시점 |
-|---|---|---|---|
-| `install_cli_to_path()` | `main.rs:1649` | osascript 1회 | 버튼 클릭(설치 라벨) |
-| `uninstall_cli_from_path()` | `main.rs:2009` | osascript 1회 (지울 것 있을 때만) | 버튼 클릭(해제 라벨) |
-| `cli_install_status()` | `main.rs:2085` | **없음** (읽기 전용) | CC 열림 1회 + 액션 직후 1회 |
+| 커맨드 | 선언 위치 | 비동기 | 승격(관리자 비밀번호) | 호출 시점 |
+|---|---|---|---|---|
+| `install_cli_to_path()` | `main.rs:2223` | **`async fn`** | osascript 1회 | 버튼 클릭(설치 라벨) |
+| `uninstall_cli_from_path()` | `main.rs:2842` | **`async fn`** | osascript 1회 (지울 것 있을 때만) | 버튼 클릭(해제 라벨) |
+| `cli_install_status()` | `main.rs:3018` | **`async fn`** | **없음** (읽기 전용) | CC 열림 1회 + 액션 직후 1회 |
+
+> **`async fn` 이 계약의 일부인 이유**(7라운드 MAJOR-3 · 주석 원문 `main.rs:2999-3016`)
+> `#[tauri::command]` 매크로는 함수에 `async` 가 **없으면** wrapper 를 `ExecutionContext::Blocking`
+> 으로 만든다. Blocking 은 "별도 스레드를 띄우지 않고 IPC 핸들러 스레드(macOS 에서는 메인
+> 스레드)에서 본문을 그대로 돌린다"는 뜻이고, 이 셋은 전부 오래 막힌다 — 상태 조회는 로그인 셸
+> `which -a`(기한 5초, `-lc` 폴백 재시도까지 최대 10초), 설치·해제는 **기한이 아예 없는** 관리자
+> 승인 창 대기. 즉 동기로 되돌리면 사용자가 비밀번호 창을 그대로 두는 동안 **앱 전체가 멎는다.**
+> 그래서 세 함수의 `async` 는 취향이 아니라 계약이다 — 되돌리지 마라.
+> ★단, `async` 는 **동시 진입을 허용한다**는 뜻이기도 하다. 그 대가와 그것을 막는 장치는 §3.6.
 
 ### 3.1 `install_cli_to_path()` → `InstallCliReport`
 
-정의: `main.rs:1626-1647` (`#[derive(serde::Serialize)] struct InstallCliReport`)
+정의: `main.rs:2196-2215` (`#[derive(serde::Serialize)] struct InstallCliReport`) · 필드 **10개**
 
-| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 |
-|---|---|---|---|---|
-| `ok` | `bool` | boolean | 불가 | `status == "installed"` 의 **파생값**(`main.rs:1779`). 두 개의 진실을 만들지 않는다. 부분 성공(그림자·측정불능)은 `false`. |
-| `status` | `String` | string | 불가 | **enum 3값** — 아래 3.1.1 |
-| `target_dir` | `String` | string | 불가 | 항상 `"/usr/local/bin"` |
-| `cys_link` | `String` | string | 불가 | `"/usr/local/bin/cys"` |
-| `cysd_link` | `String` | string | 불가 | `"/usr/local/bin/cysd"` |
-| `source_cys` | `String` | string | 불가 | 링크가 가리키는 번들 안 실행파일 절대경로 |
-| `effective_cys` | `Option<String>` | string \| null | **허용** | `which -a cys` 1순위. `unverified` 두 분기에서는 `null`. |
-| `shadowed_by` | `Option<String>` | string \| null | **허용** | `/usr/local/bin/cys` 앞을 가리는 다른 cys. `installed_shadowed` 에서만 `Some`. |
-| `unverified_reason` | `Option<String>` | string \| null | **허용** | **enum 2값 + null** — 아래 3.1.2. 계약 v2(2026-08-25) 확장. |
-| `warnings` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사람용 설명 문장. **계약이 아니다** — 정규식 파싱 금지. |
+| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 | TS 판독기(`readInstallReport`, `clipath.ts:160`)가 접는 방식 |
+|---|---|---|---|---|---|
+| `ok` | `bool` | boolean | 불가 | `status == "installed"` 의 **파생값**(`main.rs:2340`). 두 개의 진실을 만들지 않는다. 부분 성공(그림자·측정불능)은 `false`. | `r.ok === true` — 아니면 전부 `false` |
+| `status` | `String` | string | 불가 | **enum 3값** — 아래 3.1.1 | `normalizeInstallStatus`(`clipath.ts:183`) — 계약 밖 값·누락은 전부 `"unverified"` |
+| `target_dir` | `String` | string | 불가 | 항상 `"/usr/local/bin"` | `str()` — 문자열 아니면 `""` |
+| `cys_link` | `String` | string | 불가 | `"/usr/local/bin/cys"` | `str()` |
+| `cysd_link` | `String` | string | 불가 | `"/usr/local/bin/cysd"` | `str()` |
+| `source_cys` | `String` | string | 불가 | 링크가 가리키는 번들 안 실행파일 절대경로 | `str()` |
+| `effective_cys` | `Option<String>` | string \| null | **허용** | `which -a cys` 1순위. `unverified` 두 분기에서는 `null`. | `strOrNull()` |
+| `shadowed_by` | `Option<String>` | string \| null | **허용** | `/usr/local/bin/cys` 앞을 가리는 다른 cys. `installed_shadowed` 에서만 `Some`. | `strOrNull()` |
+| `unverified_reason` | `Option<String>` | string \| null | **허용** | **enum 2값 + null** — 아래 3.1.2. 계약 v2(3라운드). | `strOrNull()` → `unverifiedCause`(`clipath.ts:210`)가 계약 밖·null 을 `"unknown"` 으로 |
+| `warnings` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사람용 설명 문장. **계약이 아니다** — 정규식 파싱 금지. | `strList()` — 문자열 아닌 원소는 버린다 |
 
 #### 3.1.1 `status` enum 전체 값 (정확히 3개)
 
+판정처: `classify_install_status`(`main.rs:2066-2119`)
+
 ```
-"installed"           심링크 생성 + 로그인 셸 기준 `which -a cys` 1순위 == /usr/local/bin/cys
+"installed"           심링크 생성 + 로그인 셸 기준 `which -a cys` 1순위가 /usr/local/bin/cys 와 같다
+                      (★4라운드 I1 이후 '문자열 완전일치'가 아니라 paths_equivalent 정규화 비교다)
 "installed_shadowed"  심링크는 생겼으나 PATH 앞을 가리는 다른 cys 가 있다
 "unverified"          확인을 못 했다(probe_failed) 또는 로그인 셸 PATH 에서 cys 를 못 찾았다(not_on_path)
 ```
 
 계약 밖의 값·필드 누락은 TS 판독기가 전부 `"unverified"` 로 접는다
-(`ui/src/clipath.ts` `normalizeInstallStatus`) — 구버전 백엔드와 붙어도 성공으로 둔갑하지 않게 하는 장치.
+(`ui/src/clipath.ts:183` `normalizeInstallStatus`) — 구버전 백엔드와 붙어도 성공으로 둔갑하지
+않게 하는 장치다.
 
 #### 3.1.2 `unverified_reason` enum 전체 값 (정확히 2개 + null)
 
-Rust 상수 정의: `main.rs:1539` / `main.rs:1542`
+Rust 상수 정의: `main.rs:2030` / `main.rs:2033`
 
 ```
 "not_on_path"    검증 명령이 정상 종료했고 로그인 셸 PATH 에서 cys 를 못 찾았다 (원인 = PATH 구성)
@@ -232,119 +262,278 @@ Rust 상수 정의: `main.rs:1539` / `main.rs:1542`
 null             status 가 "unverified" 가 아니다
 ```
 
-TS 는 값이 없거나 계약 밖이면 `"unknown"` 으로 접는다(`unverifiedCause`) — **모르면 모른다고 말한다.**
+TS 는 값이 없거나 계약 밖이면 `"unknown"` 으로 접는다(`clipath.ts:210` `unverifiedCause`) —
+**모르면 모른다고 말한다.**
 
-#### 3.1.3 상태 불변식 (`classify_install_status`, `main.rs:1575-1621`)
+#### 3.1.3 상태 불변식 (`classify_install_status`, `main.rs:2066-2119`)
 
-| `status` | `unverified_reason` | `effective_cys` | `shadowed_by` | `warnings` |
+| `status` | `unverified_reason` | `effective_cys` | `shadowed_by` | 판정이 내는 `warnings` |
 |---|---|---|---|---|
-| `installed` | `null` | `Some(target)` | `null` | 빈 배열(설치 경로에서 백업 통보문이 합류할 수 있음) |
-| `installed_shadowed` | `null` | `Some(first)` | `Some(first)` | 1건 이상 |
-| `unverified` | `"not_on_path"` | `null` | `null` | 1건 이상 |
-| `unverified` | `"probe_failed"` | `null` | `null` | 1건 이상 |
+| `installed` | `null` | `Some(first)` | `null` | 빈 배열 |
+| `installed_shadowed` | `null` | `Some(first)` | `Some(first)` | 1건 |
+| `unverified` | `"not_on_path"` | `null` | `null` | 1건 |
+| `unverified` | `"probe_failed"` | `null` | `null` | 1건 |
 
 ★`unverified_reason` 은 `status == "unverified"` 일 때만 `Some` 이고, 그 외에는 **반드시** `None`.
 
-#### 3.1.4 Err 반환값 (Promise reject)
+★위 표는 **판정 함수가 내는 것**이고, 커맨드는 그 위에 다음 세 종류를 더 얹는다
+(`main.rs:2306-2337`) — 그래서 `installed` 인데도 `warnings` 가 비어 있지 않을 수 있다:
+① 백업 사실 통보(`{원본}에 우리 것이 아닌 파일/링크가 있어 … {백업본}로 백업한 뒤 링크를 만들었습니다`)
+② 백업을 계획했는데 사실로도 관측으로도 확인하지 못했다는 **모른다** 고지
+③ cysd 그림자 경고(`cysd_shadow_warning`, `main.rs:2137`).
 
-- `"이 기능은 macOS 전용입니다."` — non-macOS 심층방어
-- `"번들 디렉토리 해석 실패"` — `current_exe().parent()` 실패
-- translocation·백업 번들·비표준 위치 거부 메시지 (D5 — `plan_cli_install`, `main.rs:1368`)
-- `"심볼릭 생성 실패: …"` — 승격 스크립트 rc != 0 (3라운드 이후 **잔존 백업 경로와 복구 명령을 동봉**)
-- 사용자 취소
+#### 3.1.4 `Err` 반환값 전체 (Promise reject) — 정확히 9종
+
+| 문자열 | 발생 위치 | 언제 |
+|---|---|---|
+| `"이 기능은 macOS 전용입니다."` | `main.rs:2226` | non-macOS 심층방어 |
+| (OS 오류 문자열 그대로) | `main.rs:2231` | `current_exe()` 실패 |
+| `"번들 디렉토리 해석 실패"` | `main.rs:2234` | `current_exe().parent()` 실패 |
+| `"cys.app이 Gatekeeper에 의해 임시 위치에서 실행 중입니다. …"` | `main.rs:1866` | translocation |
+| `"백업 번들에서 실행 중입니다. …"` | `main.rs:1871` | 백업 번들 |
+| `"cys.app이 표준 위치(Applications)가 아닌 곳에서 실행 중입니다: {bundle}\n…"` | `main.rs:1887` | D5 1차 거부 |
+| `"cys.app이 표준 Applications 폴더가 아닌 곳에서 실행 중입니다: {bundle}\n…"` | `main.rs:1904` | D5 엄격 판정(`strict_install_bundle_ok`) 거부 |
+| `"번들 내 cys/cysd 바이너리를 찾지 못했습니다."` | `main.rs:2242` | 번들 안 실행파일 부재 |
+| `"osascript 실행 실패: {e}"` | `main.rs:2258` | 승격 프로세스 기동 자체 실패 |
+| `install_failure_message("설치가 취소되었습니다.", …)` | `main.rs:2285` | 사용자가 비밀번호 창을 취소(`-128`·`User canceled`) |
+| `install_failure_message("심볼릭 생성 실패: {stderr}", …)` | `main.rs:2290` | 승격 스크립트 rc != 0 |
+
+> 마지막 두 줄의 `install_failure_message`(`main.rs:1674`)는 **실패하기 전에 이미 옮겨진 파일**이
+> 있으면 그 목록(`원본 → 백업본`)을 에러 문구 뒤에 붙인다. 3라운드 MAJOR-N1 수리다 — 그전에는
+> 남의 실체 바이너리가 `.cys-backup-<epoch초>` 라는 추측 불가능한 이름으로 옮겨졌는데 그 사실이
+> 어디에도 남지 않았다.
 
 ### 3.2 `uninstall_cli_from_path()` → `UninstallCliReport`
 
-정의: `main.rs:1994-2003`
+정의: `main.rs:2812-2831` · 필드 **7개** (4라운드에 3개 늘었다 — 이 절이 4라운드에서 멈춰 있던 부분)
 
-| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 |
-|---|---|---|---|---|
-| `ok` | `bool` | boolean | 불가 | 계획한 제거가 **전부 실측으로 확인**됐는가. 지울 것이 없었던 경우도 `true`. |
-| `removed` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사후 재관측으로 **정말 사라진** 경로만 담는다(산출자의 자기신고를 믿지 않는다). |
-| `skipped` | `Vec<String>` | string[] | 불가(빈 배열 가능) | ★**문자열 배열이다.** `"경로 — 사유"` 형식. **객체 배열이 아니다.** |
-| `warnings` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 남아 있는 경로 + 유일한 복구 명령 `sudo rm <경로>` |
+| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 | TS 판독기(`readUninstallReport`, `clipath.ts:876`) |
+|---|---|---|---|---|---|
+| `ok` | `bool` | boolean | 불가 | 계획한 제거가 **전부 실측으로 확인**됐는가(`removed.len() == plan.remove.len()`, `main.rs:2958`). 지울 것이 없었던 경우도 `true`. | `r.ok === true` |
+| `removed` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사후 재관측으로 **정말 사라진** 경로만 담는다(산출자의 자기신고를 믿지 않는다). 원본이 복원된 자리는 '사라짐'으로 센다(`main.rs:2925`). | `strList()` |
+| `skipped` | `Vec<String>` | string[] | 불가(빈 배열 가능) | ★**문자열 배열이다.** `"경로 — 사유"` 형식. **객체 배열이 아니다.** 사람용 설명이며 **등급 판정에 쓰지 않는다.** | `strList()` |
+| `skipped_reasons` | `Vec<String>` | string[] | 불가(빈 배열 가능) | ★C3(4라운드 신설) `skipped` 와 **인덱스 1:1 대응**하는 기계 태그. enum 3값 — 아래 3.2.1 | `strList()` |
+| `skipped_benign` | `bool` | boolean | 불가 | ★C3(4라운드 신설) **해제 등급의 유일 계약**: 건너뛴 것이 전부 `absent`(= 지울 게 없었다) 인가. skip 이 하나도 없으면 `true`. 판정: `all_skips_benign`(`main.rs:2575`) | `r.skipped_benign === true` |
+| `restored` | `Vec<String>` | string[] | 불가(빈 배열 가능) | ★I3③(4라운드 신설) 해제하면서 **되돌린 원본**의 경로(설치 때 백업해 둔 것). 없으면 빈 배열. | `strList()` |
+| `warnings` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사람용. 성격이 다른 셋이 섞인다 — ①아직 남아 있는 경로 ②복원 통보 ③잔존 백업 고지. **그래서 `warnings.length > 0` 을 실패 신호로 읽으면 안 된다**(`clipath.ts:895-903`). | `strList()` |
 
 > **`skipped` 가 문자열인 이유와, 이 한 줄이 만든 사고**
-> 이전 TS 는 이것을 `{path, reason}[]` 로 읽고 `.filter(s => s && s.path)` 로 걸렀다
-> (당시 `clipath.ts:157,168`). 객체가 아니므로 `s.path` 는 항상 `undefined` → **모든 skip 이
-> 소멸**했고, 부분 실패가 성공 토스트로 둔갑했다. `warnings`·`ok` 는 TS 타입에 아예 없었고
-> (당시 `clipath.ts:158-162`), 그 결과 유일한 복구 명령이 사용자에게 **도달하지 못했다.**
-> 단위테스트가 초록이었던 이유는 픽스처가 Rust 실물이 아니라 **잘못된 TS 모양**을 먹였기 때문이다.
-> 지금은 `clipath.test.ts` 의 계약-드리프트 가드가 재발을 막는다.
+> 1차 구현의 TS 는 이것을 `{path, reason}[]` 로 읽고 `.filter(s => s && s.path)` 로 걸렀다.
+> 객체가 아니므로 `s.path` 는 항상 `undefined` → **모든 skip 이 소멸**했고, 부분 실패가 성공
+> 토스트로 둔갑했다. `warnings`·`ok` 는 TS 타입에 아예 없었고, 그 결과 유일한 복구 명령이
+> 사용자에게 **도달하지 못했다.** 단위테스트가 초록이었던 이유는 픽스처가 Rust 실물이 아니라
+> **잘못된 TS 모양**을 먹였기 때문이다(→ 규약 ③·⑨).
 
-> **⚠ 4라운드 예정 확장 (아직 실물에 없다)**
-> C3(제4.4절)이 `UninstallCliReport` 에 **기계 판별자** 1개를 추가한다 —
-> `skipped_benign: bool`(건너뛴 것이 전부 '지울 게 없었다' 류인가) 또는 그보다 나은 형태.
-> 목적은 TS 의 `isBenignSkip` 이 Rust 산문('이미 해제')을 정규식으로 파싱하지 않게 하는 것이다
-> (설치 경로의 `unverified_reason` 과 같은 원리 — 제5절 ⑪조). **4차가 끝나면 이 절의 표에
-> 그 필드를 정식 행으로 올린다.**
+> **왜 `skipped_benign` 이 따로 있는가**(C3 · 4라운드)
+> 그전 TS 는 "이미 해제" 라는 **Rust 산문을 정규식으로 파싱**해 등급을 정했다. Rust 가 문구를 한
+> 단어만 다듬으면 정상 해제가 조용히 '⚠부분 완료'로 오보고된다. 설치 경로의 `unverified_reason`
+> 과 정확히 같은 원리로 기계 필드로 올렸다(→ 규약 ⑪).
 
-#### 3.2.1 Err 반환값
+#### 3.2.1 `skipped_reasons` enum 전체 값 (정확히 3개)
 
-- `"이 기능은 macOS 전용입니다."`
-- `"osascript 실행 실패: {e}"` — 프로세스 기동 자체가 실패
-- `"해제가 취소되었습니다."` — stderr 에 `-128` 또는 `User canceled`
-- `"심볼릭 제거 실패: {stderr}"`
+Rust 상수: `main.rs:2555` / `:2557` / `:2559` · 판정: `skip_reason_tag`(`main.rs:2563`)
 
-#### 3.2.2 승격을 띄우지 않는 경로
+```
+"absent"          그 자리에 아무것도 없다 = 지울 게 없었다 (무해)
+"not_symlink"     심볼릭이 아닌 실체 파일이 있다 — 남의 설치본일 수 있어 건드리지 않는다
+"foreign_target"  심볼릭이지만 cys.app 번들 밖을 가리킨다 — 남의 링크다
+```
 
-`plan_cli_uninstall` 이 `osascript_arg = None` 을 내면(지울 것이 하나도 없음) **비밀번호 창을
-띄우지 않고** `ok:true, removed:[], skipped:plan.skipped, warnings:[]` 로 즉시 반환한다
-(`main.rs:2019-2027`).
+`Remove`(우리 것이니 지운다)는 skip 이 아니므로 이 배열에 들어가지 않는다. 따라서
+`skipped_reasons.length == skipped.length` 이고 인덱스가 1:1로 맞는다.
+
+#### 3.2.2 `Err` 반환값 전체 (정확히 4종)
+
+| 문자열 | 발생 위치 | 언제 |
+|---|---|---|
+| `"이 기능은 macOS 전용입니다."` | `main.rs:2845` | non-macOS 심층방어 |
+| `"osascript 실행 실패: {e}"` | `main.rs:2875` | 승격 프로세스 기동 자체 실패 |
+| `uninstall_failure_message("해제가 취소되었습니다.", …)` | `main.rs:2905` | 사용자 취소(`-128`·`User canceled`) |
+| `uninstall_failure_message("심볼릭 제거 실패: {stderr}", …)` | `main.rs:2912` | 승격 스크립트 rc != 0 |
+
+`uninstall_failure_message`(`main.rs:2650`)는 실패 문구 뒤에 세 목록을 붙인다 — **이미 제거된
+것 / 이미 되돌린 것 / 아직 남아 있는 것**. C2(4라운드) 수리이며, 설치 쪽 MAJOR-N1 수리와
+**같은 형태**다(계열 — 규약 ⑬).
+
+#### 3.2.3 승격을 띄우지 않는 경로
+
+`plan_cli_uninstall`(`main.rs:2582`)이 `osascript_arg = None` 을 내면(지울 것이 하나도 없음)
+**비밀번호 창을 띄우지 않고** 즉시 반환한다(`main.rs:2858-2869`):
+`ok:true, removed:[], skipped:plan.skipped, skipped_reasons:plan.skipped_reasons,
+skipped_benign, restored:[], warnings:[]`.
 
 ### 3.3 `cli_install_status()` → `CliInstallStatusReport`
 
-정의: `main.rs:2066-2080`
+정의: `main.rs:2969-2992` · 필드 **7개** (4라운드에 `backups` 가 늘었다)
 
-| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 |
-|---|---|---|---|---|
-| `platform_supported` | `bool` | boolean | 불가 | macOS 전용 기능. UI 는 이 값 하나로 버튼 노출 여부를 정할 수 있다(`false` 면 숨김). |
-| `installed` | `bool` | boolean | 불가 | `true` 면 라벨 '해제', `false` 면 '설치'. `state ∈ {ours, partial}` 의 파생값. |
-| `state` | `String` | string | 불가 | **enum 5값** — 아래 3.3.1 |
-| `cys_link` | `String` | string | 불가 | `"/usr/local/bin/cys"` |
-| `cysd_link` | `String` | string | 불가 | `"/usr/local/bin/cysd"` |
-| `notes` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 설치도 해제도 아닌 상태(실체 파일·타 대상 링크)의 사유 — **사용자 고지용** |
+| 필드 | Rust 타입 | JSON 타입 | null 허용 | 설명 | TS 판독기(`readCliStatus`, `clipath.ts:410`) |
+|---|---|---|---|---|---|
+| `platform_supported` | `bool` | boolean | 불가 | macOS 전용 기능. UI 는 이 값 하나로 버튼 노출 여부를 정할 수 있다(`false` 면 숨김). | `r.platform_supported !== false` (모르면 지원한다고 본다 — 버튼을 잃지 않기 위해) |
+| `installed` | `bool` | boolean | 불가 | `true` 면 라벨 '해제', `false` 면 '설치'. `state ∈ {ours, partial}` 의 파생값(`main.rs:3073`). | boolean 이 아니면 `"unknown"` 상태로 접는다 |
+| `state` | `String` | string | 불가 | **enum 5값** — 아래 3.3.1 | `LINK_STATES`(`clipath.ts:405`)에 없으면 `"unknown"` |
+| `cys_link` | `String` | string | 불가 | `"/usr/local/bin/cys"` | `str()` |
+| `cysd_link` | `String` | string | 불가 | `"/usr/local/bin/cysd"` | `str()` |
+| `notes` | `Vec<String>` | string[] | 불가(빈 배열 가능) | 사용자 고지용 **사람용 문구**. 아래 3.3.2 — 5라운드에 그림자 관측이 합류해 종류가 늘었다. | `strList()` |
+| `backups` | `Vec<String>` | string[] | 불가(빈 배열 가능) | ★I3①(4라운드 신설) `/usr/local/bin` 에 남아 있는 **우리 백업본 전체 경로**(기계 필드). 아래 3.3.3 | `strList()` |
 
 #### 3.3.1 `state` enum 전체 값 (정확히 5개)
 
-`CliLinkState` 열거 + non-macOS 전용 문자열 하나:
+`CliLinkState`(`main.rs:2742`) 네 갈래 + non-macOS 전용 문자열 하나. 문자열 변환은 `main.rs:3074-3080`.
 
 ```
-"absent"       우리 링크가 하나도 없다            → 라벨 "셸에 cys 설치"
-"ours"         cys·cysd 둘 다 우리 번들 심볼릭     → 라벨 "셸 cys 해제"
-"partial"      한쪽만 우리 것(중단된 설치·부분 삭제 잔재) → 해제로 청소 가능
+"absent"       우리 링크가 하나도 없다              → 라벨 "셸에 cys 설치"
+"ours"         cys·cysd 둘 다 우리 번들 심볼릭       → 라벨 "셸 cys 해제"
+"partial"      한쪽만 우리 것(중단된 설치·부분 삭제 잔재) → 해제로 청소 가능. installed=true
 "foreign"      파일은 있으나 우리 것이 아니다(실체 파일·타 대상 링크) → 설치 라벨 유지 + notes 고지
-"unsupported"  non-macOS. Rust 가 Err 를 던지지 않고 이 값으로 답한다.
+"unsupported"  non-macOS. Rust 가 Err 를 던지지 않고 이 값으로 답한다(main.rs:3027).
 ```
 
-> **non-macOS 에서 `Err` 를 던지지 않는 이유**(주석 `main.rs:2081-2084`)
+> **non-macOS 에서 `Err` 를 던지지 않는 이유**(주석 `main.rs:2994-2997`)
 > Control Center 를 열 때마다 실패 토스트가 뜨기 때문이다. 대신 `platform_supported=false`
 > 로 답한다. `install`/`uninstall` 쪽 non-macOS `Err` 는 심층방어로 **존치**한다.
 
-#### 3.3.2 `notes` 문장 형식 (`main.rs:2104-2119`)
+> **★`cli_install_status` 는 `Err` 를 한 번도 반환하지 않는다.** 시그니처는
+> `Result<CliInstallStatusReport, String>` 이지만 본문의 모든 반환 경로가 `Ok` 다
+> (`main.rs:3018-3086` 전수 확인). 반환 타입은 Tauri 커맨드 관례를 따른 것이다.
+
+#### 3.3.2 `notes` 문장 형식 (정확히 4종)
+
+앞의 둘은 링크 자체를 보고 낸다(`main.rs:3038-3052`):
 
 - 실체 파일: `"{경로} — 심볼릭이 아닌 실제 파일이 이미 있습니다(다른 도구 설치본일 수 있어 자동으로 제거하지 않습니다)."`
 - 타 대상 링크: `"{경로} — cys.app 번들 밖({대상})을 가리키는 링크입니다."` (대상을 못 읽으면 `대상 읽기 실패`)
 
-★이 문장들은 **사람용**이다. UI 는 이것을 그대로 표시하되 **파싱해서 분기하지 않는다**(제5절 ⑪조).
+뒤의 둘은 ★G4(5라운드) 신설 — **상태 조회에도 PATH 그림자 관측을 넣었다**(`main.rs:3058-3069`).
+4라운드까지 그림자 관측은 설치 경로에만 있어서, "cysd 가 다른 곳에서 가려진다"는 사실은 설치
+직후 토스트 한 번뿐이었고 그것을 놓친 사용자는 데몬 버전이 어긋나는 이유를 다시는 알 수 없었다.
 
-### 3.4 계약을 지키는 장치 (드리프트 방지)
+- `path_shadow_note`(`main.rs:2172`)가 내는 cys 축 고지
+- `cysd_shadow_warning`(`main.rs:2137`)이 내는 cysd 축 고지
 
-| 층위 | 장치 | 위치 |
-|---|---|---|
-| Rust → JSON | `serde_json::to_value` 스냅샷 단언 | `main.rs` `mod tests` (`:5839-5854` 등) |
-| TS 판독기 | `readInstallReport` — 모르는 값은 **안전한 쪽으로** 접는다 | `ui/src/clipath.ts` |
-| TS 테스트 | 계약-드리프트 가드 + "정규식 재도입 차단" 테스트 | `ui/src/clipath.test.ts` |
-| **(4라운드 예정)** | Rust 테스트가 키 집합 + 타입 태그를 `ui/src/__contract__.json` 으로 덤프하고 TS 게이트가 그것을 읽는다 | I6 — 아래 4.5 |
+★비용 통제: 링크가 하나도 없으면(`absent`·`foreign`) 잴 대상 자체가 없으므로 **셸을 띄우지
+않는다**(`main.rs:3058` `matches!(state, Ours | Partial)`). 읽기전용 조회에 로그인 셸 1회(기한
+5초)를 무는 비용은 잴 것이 있을 때만 낸다.
 
----
+★이 문장들은 **사람용**이다. UI 는 그대로 표시하되 **파싱해서 분기하지 않는다**(규약 ⑪).
+
+#### 3.3.3 `backups` 이름 규칙과 그 존재 이유
+
+- 생성: `backup_path_for`(`main.rs:1108`) = `format!("{target}.cys-backup-{stamp}")`
+- 스탬프: `backup_stamp`(`main.rs:1097`) = **UNIX epoch 초**(정수). Rust 가 생성해 스크립트에 박는다
+  — 셸에서 `date` 를 부르면 실제 파일명과 사용자에게 보고하는 이름이 갈라진다.
+- 인정 판정: `is_our_backup_name`(`main.rs:2467`) — `"{base}.cys-backup-"` 접두를 떼고 남은 것이
+  **비어 있지 않고 전부 ASCII 숫자**여야 우리 것이다.
+- 관측: `observe_leftover_backups`(`main.rs:2512`) — `/usr/local/bin` 을 훑어 `cys`·`cysd` 두
+  base 이름에 대해 위 규칙에 맞는 파일만 전체 경로로 담는다.
+- 복원 후보 선택: `pick_restore_backup`(`main.rs:2479`) — 여러 개면 **스탬프가 가장 큰(최신)** 것.
+
+> **왜 기계 필드인가**: BLOCK-1 이 "확인 모달 없는 1클릭"을 정당화한 근거는 **"잃는 것이 없다"**
+> 였다. 그런데 백업본을 알리는 유일한 통로가 60초짜리 sticky 토스트뿐이었고(수용처
+> `alarmHistory` 는 메모리 전용), 상태 조회는 `*.cys-backup-*` 를 보지도 않았다 — 토스트를 놓치면
+> 사용자는 자기 파일이 어디로 갔는지 **다시는** 알 수 없었다. 이제 상태 조회가 상시로 들고 온다.
+> 되돌리기 명령 **문장**은 표현이므로 UI 소유다(I7 의 '백엔드는 사실만').
+
+### 3.4 계약을 지키는 장치 (드리프트 방지) — 그리고 그 장치의 한계
+
+| 층위 | 장치 | 위치 | 상태 |
+|---|---|---|---|
+| Rust → JSON | 세 리포트를 실제로 직렬화해 **키 집합 + 타입 태그**를 `ui/src/__contract__.json` 으로 덤프 | `main.rs:8731` `dump_report_contract_for_the_ui_gate` | 4라운드 I6 로 **완료** |
+| TS 판독기 | `readInstallReport`·`readUninstallReport`·`readCliStatus` — 모르는 값은 **안전한 쪽으로** 접는다 | `clipath.ts:160·876·410` | 완료 |
+| TS 게이트 | `expectShape` 가 손으로 쓴 표가 아니라 **덤프 파일**을 기준으로 삼는다 | `clipath.test.ts` | 완료 |
+| TS 테스트 | '정규식 재도입 차단' — TS 가 `warnings` 문구를 파싱하지 않는다는 것을 못박는다 | `clipath.test.ts` | 완료 |
+
+**I6 검수 실험 결과(4라운드에 실제로 수행)**: 아무 필드에 `#[serde(rename=…)]` 를 붙이면 덤프
+파일의 키가 바뀌고 TS 게이트가 빨개진다 — 단, **덤프(쓰기)가 자기 단언(assert)보다 먼저 와야
+한다.** 실측으로 확인한 함정을 코드 주석(`main.rs:8829-8832`)에 남겼다:
+
+> 단언을 쓰기 **앞**에 두면 rename 사고가 Rust 층에서 멈춰 파일이 낡은 채로 남고, **TS 게이트는
+> 초록으로 통과한다** — 거울이 아니라 필터가 된다.
+
+★**그러나 이 장치는 두 층이 같은 트리에서 이어서 돌 때만 작동한다.** Rust 가 파일을 다시 쓰고
+TS 가 그 파일을 읽어야 비로소 드리프트가 드러나는데, **어떤 CI 레인에서도 그 두 층이 함께 돌지
+않는다.** 이 공백의 전모와 닫는 방법은 **§7(CI 레인 지도와 공백)** 에 적었다 — 8라운드
+MAJOR-4(c)의 산출물이다.
+
+### 3.5 `ui/src/__contract__.json` 실물 전문 (`0b6cb24`)
+
+이 파일은 **손으로 고치지 않는다** — `cargo test -p cys-app` 이 덮어쓴다.
+
+```json
+{
+  "CliInstallStatusReport": {
+    "backups": "string[]",
+    "cys_link": "string",
+    "cysd_link": "string",
+    "installed": "boolean",
+    "notes": "string[]",
+    "platform_supported": "boolean",
+    "state": "string"
+  },
+  "InstallCliReport": {
+    "cys_link": "string",
+    "cysd_link": "string",
+    "effective_cys": "string|null",
+    "ok": "boolean",
+    "shadowed_by": "string|null",
+    "source_cys": "string",
+    "status": "string",
+    "target_dir": "string",
+    "unverified_reason": "string|null",
+    "warnings": "string[]"
+  },
+  "UninstallCliReport": {
+    "ok": "boolean",
+    "removed": "string[]",
+    "restored": "string[]",
+    "skipped": "string[]",
+    "skipped_benign": "boolean",
+    "skipped_reasons": "string[]",
+    "warnings": "string[]"
+  },
+  "_contract": "키 집합 + 타입 태그. TS 게이트(ui/src/clipath.test.ts)의 expectShape 기준. 손으로 고치지 말 것 — cargo test 가 덮어쓴다.",
+  "_generated_by": "src-tauri/src/main.rs :: dump_report_contract_for_the_ui_gate"
+}
+```
+
+> **`"string|null"` 이 나오려면 표본이 둘 필요하다.** `Option` 필드는 `Some` 표본 하나만 직렬화하면
+> `"string"` 으로, `None` 표본 하나만 하면 `"null"` 로 굳어 **계약이 좁아진다.** 그래서 덤프
+> 테스트는 `InstallCliReport` 표본을 두 개(`Some`/`None`) 만들어 합집합한다(`main.rs:8772-8799`).
+
+### 3.6 `async` 가 연 문 — 동시성 계약 (7라운드 MAJOR-3 의 대가)
+
+`async fn` 전환은 "관리자 승인 창이 떠 있는 동안 앱이 멎는" 결함을 닫았다. 그 대가로 **같은
+커맨드가 동시에 여러 번 진행될 수 있는 문**이 열렸다. 7라운드는 주석에 "새 동시성도 실질적으로
+열리지 않는다"고 적었는데, 8라운드 판정자가 그 단정을 **반증**했다(finding MAJOR, `main.rs:3014`):
+
+- 설치·해제는 버튼 `disabled` 로 이중 클릭이 막힌다 — 이 근거는 맞다.
+- 그러나 **상태 조회의 실제 호출부는 버튼이 아니다.** `main.ts` 의 `setCcOpen(open=true)` 안
+  `void refreshCliInstallState()` 이고, Control Center 를 여닫는 진입점이 여럿이며(토글 버튼·
+  명령 팔레트 등) **in-flight 가드가 없다.**
+- 동기였을 때는 IPC 핸들러 스레드가 직렬화하고 그동안 UI 가 멎어 재클릭 자체가 불가능했다.
+  `async` 이후에는 CC 를 빠르게 여닫는 만큼 로그인 셸(`$SHELL -lc 'which -a …'`, 기한 5초·폴백
+  재시도까지 최대 10초)이 **동시에 뜬다.**
+- `cliStatus = readCliStatus(await invoke(...))` 에 요청 세대 구분이 없어 **last-writer-wins** 다.
+  늦게 도착한 낡은 프로브가 액션 직후 재조회 결과를 덮으면 결과 토스트에 **낡은 고지 줄**이
+  접혀 들어가고 버튼 라벨도 낡은 상태로 되돌아간다.
+
+★**계약**: 이 세 커맨드는 `async` 를 유지하되, **중복 진입 억제는 호출부(UI)의 책임**이다.
+8라운드가 그 배선을 닫는다(별도 담당). 타이머·폴링을 새로 만드는 방식은 이 코드베이스의 상시
+원칙(타이머 증식 차단)에 어긋나므로 채택하지 않는다.
+
 
 ## 4. 라운드 이력
 
 각 라운드는 이렇게 돌았다: **구현/수리 → 게이트(cargo test · bun test · tsc · 번들) → 독립
-반증 3렌즈 → master 판정 → 다음 라운드**. 반증자는 "이 구현은 틀렸다"를 기본 자세로 두고,
+반증 → master 판정 → 다음 라운드**. 반증자는 "이 구현은 틀렸다"를 기본 자세로 두고,
 틀렸음을 입증하지 못할 때만 물러선다. 근거는 `file:line` 으로 대며, 실행 가능한 반증
 (테스트 실행·코드 추적)을 우선한다.
+
+★**반증자 구성은 라운드마다 달랐다** — 1~3차는 아래 **3렌즈**(같은 질문지를 나눠 든 세 반증자),
+4차 이후는 **이종(異種) 판정자**(서로 다른 모델·서로 다른 접근)로 옮겼다. 8차는 이종 판정자
+2인이 정지한 리비전 `0b6cb24` 를 봤다. 이 변화의 이유는 4.12 ②에 적었다.
+
+★**게이트 초록은 착수 조건이지 합격 기준이 아니다**(규약 ⑧). 1차가 그것을 증명했다 —
+모든 게이트가 초록인 상태에서 BLOCK 2건이 나왔다.
 
 **1차 반증 3렌즈**(1라운드 워크플로우 `LENSES` 상수):
 
@@ -455,7 +644,7 @@ root 쓰기 누출). **확인 모달은 두지 않는다 — 백업이므로 잃
 
 그래서 4라운드의 지배 원리가 정해졌다. → **규약 ⑬**
 
-### 4.4 4차 — 지배 원리: 지점이 아니라 계열을 닫는다
+### 4.4 4차 — 지배 원리: 지점이 아니라 계열을 닫는다 (**설계** · 결과는 4.7)
 
 **수리할 때마다 반드시 이 4쌍을 묻는다 — "이 수리를 대칭 위치에도 적용했는가?"**
 
@@ -514,7 +703,7 @@ Rust 산문 '이미 해제' 를 정규식으로 파싱해 등급(성공 volatile
 ★수리: cysd 도 같은 프로브로 재고 결과를 `warnings` 에 담는다. **status 3값 계약은 건드리지 않고
 (cys 기준 유지) cysd 문제는 경고로 낸다.** 이 결정의 이유를 주석에 남긴다.
 
-### 4.5 4차 개별 수리 (계열과 별도)
+### 4.5 4차 개별 수리 (계열과 별도 · **설계** · 결과는 4.7)
 
 | 번호 | 결함 | 수리 |
 |---|---|---|
@@ -526,7 +715,7 @@ Rust 산문 '이미 해제' 를 정규식으로 파싱해 등급(성공 volatile
 | **I6** [계약 기계화 — 최우선 구조 수리] | `clipath.test.ts` 의 `RUST_*_REPORT` 표는 **손으로 쓴 사본**이다. 실물이 바뀌어도 안 빨개진다 | Rust `mod tests` 에 `serde_json::to_value(...)` 로 세 리포트의 **키 집합 + 타입 태그**를 `ui/src/__contract__.json` 으로 덤프하는 테스트를 두고, `clipath.test.ts` 가 그 파일을 읽어 `expectShape` 의 기준으로 삼는다(손으로 쓴 표를 **대체**). **검수 기준 하나: 아무 필드에 `#[serde(rename=...)]` 를 붙였을 때 TS 게이트가 빨개지는가.** 그 실험을 실제로 해 보고 결과를 보고(실험 후 원복) |
 | **I7** [잡동사니] | ① `#[cfg_attr(not(target_os="macos"), allow(dead_code))]` 누락 3곳: `plan_cli_install`·`build_install_script`·`struct CliInstallPlan` ② 부트 회귀핀 추가: `classify_bundle_dir("/System/Volumes/Data/Applications/cys.app/Contents/MacOS") == Canonical` 과 `~/Applications` 데이터볼륨 형태(지금 핀은 `strict_install_bundle_ok` 쪽에만 있다) ③ `ToastEmit.className` 이 실제로 소비되지 않는 **죽은 필드** — 소비하게 고치거나 필드와 그 테스트를 삭제 ④ 중복 문구: `not_on_path` 경고의 '비대화형 로그인 셸 기준' 문장이 Rust 산문과 TS 양쪽에 있어 토스트에 **두 번** 나온다 → ★master 결정: **Rust 에서 뺀다**(백엔드는 사실만, 표현은 UI 소유) ⑤ `#cc-header` 오버플로 가드(닫기 버튼이 밀려날 수 있다) — `ui/src/style.css` 수정을 이번 라운드에 한해 허용, **`#cc-header` 규칙에만** 손댄다 | |
 
-### 4.6 4차 인수 기준 (라운드 시작 전 선언·동결)
+### 4.6 4차 인수 기준 (라운드 시작 전 선언·동결 · **판정 결과는 4.7**)
 
 `ADVERSARIAL_TESTS_R2.rs` 의 `adv1`~`adv9` 를 `src-tauri/src/main.rs` 의 `mod tests` 말미에
 편입하고 **전부 초록**이 되어야 한다. 다만 그대로 붙이지 말고 **헤르메틱하게 재작성**한다:
@@ -540,11 +729,173 @@ Rust 산문 '이미 해제' 를 정규식으로 파싱해 등급(성공 volatile
 
 ---
 
-## 5. ★설계 규약 13조
+### 4.7 4차 결과 — 무엇이 실제로 닫혔나 (커밋 `7f8b505` 의 앞부분)
 
-> 이번 성찰(설계 감사 · 적대적 감사 · 아키텍트 감사 3라운드)이 도출한 **재발 방지 조문**이다.
-> 이 조문들은 이 작업에만 적용되는 것이 아니라, 앞으로 이 레포에서 설계서를 쓰는 모든 라운드의
-> 최소 요건이다. 각 조문 뒤의 괄호는 그 조문을 낳은 실제 사고다.
+계열 수리 C1~C5 와 개별 수리 I1~I7 은 **전부 구현됐다.** 4.6 의 인수 기준(`adv1`~`adv9` 전부
+초록)도 충족됐다 — 다만 그냥 초록이 된 것이 아니라, **테스트 이름 자체가 결함 재현에서 결함
+부재 회귀핀으로 바뀌었다.** 이것이 이 라운드가 실제로 무엇을 했는지 가장 정직하게 보여 준다:
+
+| 4차 이전 이름(결함을 재현한다) | 현재 이름(`main.rs`) | line |
+|---|---|---|
+| `adv1_zsh_function_wrapper_becomes_a_fake_shadow` | `adv1_shell_function_wrapper_never_becomes_a_fake_shadow` | 8116 |
+| `adv2_trailing_slash_path_shadows_our_own_link` | `adv2_trailing_slash_path_never_shadows_our_own_link` | 8151 |
+| `adv3_install_destroys_foreign_symlink_silently_while_uninstall_protects_it` | `adv3_install_no_longer_destroys_a_foreign_symlink_silently` | 8171 |
+| `adv4_uninstall_leaves_the_user_without_their_original_binary` | `adv4_uninstall_restores_the_users_original_binary` | 8226 |
+| `adv5_uninstall_partial_failure_has_no_report_path` | `adv5_uninstall_partial_failure_reports_what_already_happened` | 8277 |
+| `adv6_ln_sfn_does_not_leak_into_a_directory_symlink` | (동일 — 2라운드 수리의 회귀핀) | 8328 |
+| `adv7_rc_stdout_noise_outranks_the_real_measurement` | `adv7_rc_stdout_noise_never_outranks_the_real_measurement` | 8353 |
+| `adv8_shadowed_install_flips_the_button_to_uninstall` | `adv8_shadowed_install_keeps_the_retry_path` | 8379 |
+| `adv9_cysd_shadowing_is_never_measured` | `adv9_cysd_shadowing_is_measured_and_reported` | 8412 |
+
+**I6 검수 실험(4.6 이 요구한 것)은 실제로 수행됐다.** 결과는 §3.4 에 적었다 — 핵심은 "덤프
+쓰기가 자기 단언보다 **먼저** 와야 한다"는 함정을 실측으로 확인했다는 것이다. 단언을 앞에 두면
+rename 사고가 Rust 층에서 멈추고 파일이 낡은 채로 남아 **TS 게이트가 초록으로 통과한다.**
+
+**I3③(해제 시 원본 복원)은 '복잡하면 미수리로 보고' 선택지였는데 채택됐다.** 이것은 정직하게
+적어 둘 필요가 있다 — 8라운드 판정자가 지적한 대로, 이는 **오너의 원 요구 3건(복원·수리1~3)이
+요구하지 않은 새 특권 쓰기 경로**다. root 승격 스크립트가 `mv` 로 백업본을 원위치로 되돌린다
+(`build_uninstall_script`, `main.rs:2440`). 가드는 있다 — 자리가 비어 있을 때만 옮기고, 이름
+규칙(`<이름>.cys-backup-<epoch초>`)에 정확히 맞는 것만 후보다. 그럼에도 **요구 범위를 넘은
+확장**이라는 사실은 남는다. 정당화는 규약 ⑦이다: 백업만 하고 복원이 없으면 "잃는 것이 없다"는
+1클릭의 정당화가 성립하지 않는다.
+
+**이 라운드가 만든 IPC 필드**: `skipped_reasons`·`skipped_benign`(C3) · `restored`(I3③) ·
+`backups`(I3①). 3라운드의 `unverified_reason` 까지 합해 이 작업이 신설한 IPC 필드는 **총 5개**다.
+
+### 4.8 5차 — `do shell script` 의 반환값은 CR 로 구분된다 (BLOCK)
+
+| 대표 결함 | 그것이 드러낸 **설계 결함** |
+|---|---|
+| **BLOCK — 줄 나누기를 LF 로 했다.** AppleScript `do shell script` 가 돌려주는 문자열은 줄을 **CR(`\r`)** 로 구분한다(실측: `AAA\rBBB\rCCC\n`). I5 가 넣은 자기보고 마커(`CYS-BACKED-UP:`·`CYS-RESTORED:`)가 2건 이상이면 LF 파서는 그것을 **한 줄로** 읽는다. 결과: 정상 해제가 '⚠부분 완료'로 오보고되고, **방금 복원해 놓은 사용자 원본을 지우라고 안내**했다. 수리는 `split_osascript_lines`(`main.rs:1289`) + `osascript_text_to_lf`(`main.rs:1317`) 로 계열 폐쇄. 실패 경로는 마커가 줄 첫머리에 오지 않고 종료 상태가 뒤에 붙으므로 **부분 문자열 스캔**으로 전환했다. | 설계서가 I5 를 "스크립트가 stdout 으로 자기보고하게 한다"는 HOW 로만 적고, **그 stdout 이 어떤 형식으로 도착하는지**(구분자·인코딩·실패 시 어느 스트림) 를 적지 않았다. 규약 ④(HOW 를 무효화하는 조건을 함께 적어라)의 재발이며, 무효화 조건은 이번에도 **플랫폼의 오래된 관례**였다. → **규약 ④** |
+| **테스트 픽스처가 손글씨였다.** 마커 파싱 테스트는 사람이 타이핑한 `"CYS-BACKED-UP:a:b\nCYS-BACKED-UP:c:d"` 를 먹였고 — 그 픽스처에는 CR 이 없으므로 **결함이 초록으로 봉인**됐다. 5라운드는 픽스처를 **실물 `osascript` 호출로 유도**하도록 바꿨다. | 규약 ⑨("픽스처는 상대 구현의 실물에서 유도한다")가 이미 있었는데도 **경계 하나를 빠뜨렸다**: 이 작업은 그동안 '상대 구현'을 Rust↔TS 로만 생각했고, **Rust↔osascript(운영체제)** 도 같은 경계라는 것을 보지 못했다. → **규약 ⑨ 확장** |
+| **MAJOR-6 — 판정과 집행이 서로 다른 규칙을 썼다.** I1 이 Rust 쪽에 경로 정규화(`normalize_path_str`)를 넣었는데, 실제로 파일을 옮기고 지우는 **셸 스크립트는 정규화하지 않았다.** 셸에도 `sed` 정규화(`SHELL_PATH_NORMALIZER`, `main.rs:1263`)를 넣어 설치·해제 양쪽을 맞췄다. | **"순수 함수로 판정한다"가 안전을 보장하지 않는다** — 판정이 아무리 정확해도 집행자가 다른 규칙을 쓰면 판정은 장식이다. 판정과 집행이 갈라진 모든 지점을 목록으로 요구하는 조문이 없었다. → **규약 ⑭ 신설(아래)** |
+
+### 4.9 6차 — Windows 컴파일 즉사(E0425)와 '판정≠집행'의 두 번째 재발
+
+| 대표 결함 | 그것이 드러낸 **설계 결함** |
+|---|---|
+| **★Windows E0425 — 이 브랜치는 Windows 에서 컴파일되지 않았다.** `#[cfg_attr(not(target_os="macos"), allow(dead_code))]` 는 **경고만 끄지 코드를 지우지 않는다.** 그런데 그 본문이 `#[cfg(unix)]` 로 **사라지는** 함수를 호출하고 있었다 → Windows 타깃에서 "cannot find function" 즉사. 최소 재현(`rustc --target x86_64-pc-windows-msvc`)으로 확인한 뒤, 아이템 레벨 `cfg` 를 제거하고 **본문 안에서 분기**하는 형태로 바꿨다(리포의 기존 `no_console` 과 같은 형태). 재발 방지로 소스 텍스트 불변식 핀을 넣고 **변이시험으로 실효를 입증**했다. | 이 레인은 macOS 기능을 만들면서 **Windows 컴파일을 한 번도 검증하지 않았다.** 그리고 그 사실이 어디에도 적혀 있지 않았다 — 1차 반증의 `windows-boot` 렌즈가 "Windows 빌드에서 컴파일되는가"를 물었는데, 답은 "물어보기만 하고 재지 않았다"였다. **묻기만 하고 계측하지 않은 질문은 게이트가 아니다.** → **규약 ⑤** |
+| **MAJOR-C — '판정≠집행'이 존재 술어 축에 재발.** Rust 는 `Path::exists()` 로 "그 자리에 무언가 있는가"를 물었는데 이 함수는 **심볼릭을 따라간다** — 대상이 사라진 링크(dangling)를 "없다"로 읽는다. 반면 셸 스크립트는 `[ -e X ] || [ -L X ]` 로 물었다. 같은 질문에 두 답이 나온다. `symlink_metadata()` 로 통일했고, **dangling 심볼릭을 실제로 만들어** 회귀핀을 걸고 변이시험 2회로 확인했다. | 5차의 MAJOR-6 과 **정확히 같은 병의 다른 축**이다. 한 라운드 안에서 같은 계열이 두 번 나왔다는 것은, 그 계열을 **목록으로 만들어 전수 점검하지 않았다**는 뜻이다. → **규약 ⑭ 신설(아래)** |
+
+이 라운드에는 명시 제약이 하나 더 있었다: **신규 기능 금지.** 결함만 닫고, 개선 아이디어는
+코드가 아니라 미수리 목록으로 보냈다(커밋 `7f8b505` 의 `Rejected:` 트레일러에 3건이 남아 있다 —
+더미경로 `/tmp/*` 채택 / cysd 경고의 등급 강등 / 공용 존재술어 헬퍼 추출).
+
+### 4.10 7차 — 등급 회귀·커맨드 비동기화·파괴적 안내 제거 (커밋 `0b6cb24` = 현재 freeze)
+
+| 대표 결함 | 그것이 드러낸 **설계 결함** |
+|---|---|
+| **MAJOR-1 [등급 회귀] — 6차 수리가 경고 방향을 뒤집었다.** `state=partial` 에 있는 **진짜 남의 파일**이 중립으로 강등됐다. ★그리고 여기서 **master 가 제시한 판정 근거를 워커가 반증했다** — 4.12 ② 참조. | 수리가 **다음 라운드에 회귀를 만든다**는 사실 자체가 이 라운드의 교훈이다. 6차는 '과경고를 줄인다'는 옳은 방향으로 움직이면서 **줄이면 안 되는 것까지 줄였다.** 등급을 바꾸는 수리에는 "무엇이 새로 조용해지는가"를 전수 열거하는 절차가 필요하다 — 규약 ⑩("경고를 거부로 올리는 변경은 새로 거부되는 집합을 전수 열거한다")의 **반대 방향 쌍**이 빠져 있었다. → **규약 ⑮ 신설(아래)** |
+| **MAJOR-2 [앱이 파괴적 명령을 출력] — UI 가 사용자에게 `sudo mv` 를 그대로 내밀었다.** 대상 자리가 차 있으면 그 파일이 말없이 사라진다. `sudo mv -n` + "자리가 비어 있어야 옮겨집니다" 뜻풀이로 바꾸고, **앱이 자리가 찼다고 아는 경우엔 복원 명령을 아예 내지 않는다.** UI 가 만드는 명령 문자열 **5종 전수 점검**을 함께 수행했고, Rust 는 명령 문장을 하나도 만들지 않는다는 원칙(G2)을 재확인했다. | ★**점검 범위가 `ui/src` 에서 멈췄다.** 같은 파괴적 명령이 `docs/INSTALL.md`·`USER-MANUAL.md` 에도 있는데 그쪽은 보지 않았다 — 8차 BLOCK-1 이 정확히 그것이다(4.11). 계열(규약 ⑬)을 "코드 안의 거울쌍"으로만 좁게 읽은 것이 원인이다. → **규약 ⑯ 신설(아래)** |
+| **MAJOR-3 [메인 스레드 블로킹]** — CLI 커맨드 3종을 `async fn` 으로 내렸다(리포 지배 관례 async 48 : 동기 30). 설치·해제가 더 심각했다: `osascript` 승인 대기를 **기한 없이** 동기로 기다려, 사용자가 비밀번호 창을 두는 동안 UI 전체가 무기한 멎었다. | 그러나 **주석이 "새 동시성도 열리지 않는다"고 단정했고 그 단정이 틀렸다** — 8차 MAJOR-3 이 반증한다(§3.6). 비동기화는 **막힘을 푸는 동시에 문을 여는** 변경인데, 설계서가 그 두 면을 함께 요구하지 않았다. → **규약 ⑮** |
+| **MINOR-4 [핀의 사각] — 재발 방지 핀이 `fn` 만 보고 있었다.** `cfg` 불변식 스캐너를 11종 아이템(fn·static·const·struct·enum·type·union·trait·impl·mod·use)으로 확장하고, ★**종류를 못 읽으면 `continue` 가 아니라 offender 로 올린다**(측정 불능은 통과가 아니다 — 그 `continue` 가 정확히 사각이었다). 변이시험 8종 전부 검출 · 대조군(수리 전 스캐너)은 1종만 검출 = **사각 실재 확정**. | 헌장 원칙("측정 불능은 통과가 아니다")이 **테스트 도구 자신에게는 적용되지 않고 있었다.** 도구가 조용히 건너뛰는 자리는 영원히 보이지 않는다. |
+| **MINOR-5 [거짓 보증] — "자동 테스트가 지킵니다"가 가리키는 테스트가 없었다.** 실제로 제작했다: `clipath.test.ts` 가 `docs/INSTALL.md` 를 `readFileSync` 로 직접 읽어 화면 문자열과 대조한다. | ★그런데 **`USER-MANUAL.md` 를 읽는 테스트는 만들지 않았다** — 8차 판정자가 리포 전체 `grep` 으로 0건임을 확인했고, 실제로 그 파일에 불일치가 남아 있었다(4.11). 문서 축에서도 거울쌍이 반쪽만 지켜졌다. → **규약 ⑯** |
+
+7차 검증값(커밋 기록): `cargo 102 passed / 0 failed · 경고 0` · `bun 631 pass / 0 fail` ·
+`tsc 0` · `secret-scan clean(844파일)`. 타 레인 v0.14.25 태그와의 3-way 병합 시뮬 rc=0(충돌 0).
+
+### 4.11 8차 — 최종 판정 12건 (현재 라운드 · 이 문서가 그중 하나의 산출물)
+
+이종 판정자 2인이 freeze 리비전 `0b6cb24` 를 대상으로 낸 12건이다. `reproduced: true` 는
+판정자가 **실제로 재현했다**는 뜻이다(주장만 한 것이 아니다).
+
+| # | 등급 | 위치 | 결함 | 이번 라운드 처리 |
+|---|---|---|---|---|
+| 1 | **MAJOR** | `docs/INSTALL.md:275` · `USER-MANUAL.md:98` | ★**문서가 시키는 수동 폴백이 사용자 파일을 말없이 파괴한다.** `sudo ln -sfn … /usr/local/bin/cys` — 그 자리에 Homebrew·수동빌드 실체 바이너리가 있으면 `-f` 가 unlink 후 갈아 끼워 **복구 불가로 소멸**(exit=0, 출력 없음, 백업 0개). GUI 버튼은 2라운드에 백업으로 고쳤는데 **문서를 따른 사용자만 파일을 잃는다.** 도달 인구는 정확히 BLOCK-1 이 지키려던 집단(GUI 를 못 쓰는 SSH·헤드리스 + 기존 `/usr/local/bin/cys` 보유자). | 문서 레인이 수리 — 문서 절차가 **버튼과 같은 안전성**을 갖도록(백업 선행·멱등·같은 백업 이름 규칙·복붙 실행 가능) + `docs` 전체 명령 문자열 전수 점검 |
+| 2 | MINOR | `ui/src/clipath.ts:450` | `mv -n` 의 보증이 한 형태에서 거짓 — BSD `mv -n` 의 판정은 `access(to, F_OK)`(심볼릭 추종)라 **대상이 사라진 심볼릭(dangling)은 '없다'로 읽고 그대로 덮는다**(실측 exit=0). 앱 **자신의** 복원 스크립트는 `[ ! -e O ] && [ ! -L O ]` 로 dangling 까지 막는데, 사용자에게 주는 안내만 느슨한 비대칭. | 문서·문구 레인 |
+| 3 | MINOR | `src-tauri/src/main.rs:1220` | 설치 스크립트가 root 로 부르는 `/bin/mv {d} {b}` 가 **백업 목적지가 이미 있는지 검사하지 않는다.** 도달성 극히 낮음(같은 epoch 초에 두 번 설치 + 그때 두 번 다 남의 파일이 자리에 있어야 성립). ★**기록해 둘 함정: 여기에 `mv -n` 을 붙이는 것은 오답이다** — `-n` 은 거부해도 exit 0 이라 `&&` 체인이 이어져 `ln -sfn` 이 백업 없이 원본을 덮는, 지금보다 나쁜 경로가 열린다. | **이번 라운드 미수리**(사유 = 도달성 + 오답 함정). §9 미결에 등재 |
+| 4 | **MAJOR** | `.github/workflows/release.yml:147` | ★**이 diff 의 Rust 테스트가 어떤 CI 레인에서도 돌지 않는다.** I6 계약 게이트의 절반(Rust 덤프)이 태그 레인 밖이고, 그 사실이 설계문서·주석·`Not-tested` 어디에도 없었다. | **이 문서 §7 신설**(MAJOR-4(c)) · `.github/` 무접촉이므로 문서가 산출물 |
+| 5 | **MAJOR** | `ui/src/clipath.test.ts:370` | 판독기 테스트 부재 — `unverified_reason` 을 `null` 로, `restored` 를 `[]` 로 망가뜨려도 **201 pass / 0 fail**. 즉 3라운드·4라운드가 "닫았다"고 선언한 결함이 회귀로부터 보호되지 않는다. 원인: 모든 토스트 테스트가 픽스처 빌더로 판독기를 **우회**한다. | 테스트 레인이 수리 + 기계 필드 전수 표 |
+| 6 | **MAJOR** | `USER-MANUAL.md:92` | 문서가 코드와 다른 사실을 말한다 — "제목은 **세 갈래**"인데 실제는 넷(`silent`\|`foreign`\|**`partial`**\|`backup`\|`info`). 7차가 `docs/INSTALL.md:242` 는 '네 갈래'로 고쳤는데 `USER-MANUAL` 만 빠졌다. 잡히지 않은 이유가 계열 결함: doc-sync 테스트가 `docs/INSTALL.md` **하나만** 읽는다. | 문서 레인 |
+| 7 | **MAJOR** | `src-tauri/src/main.rs:3014` | 7차 `async` 주석의 "새 동시성도 열리지 않는다"가 **사실이 아니다** — 상태 조회의 실제 호출부는 버튼이 아니라 `setCcOpen` 의 `void refreshCliInstallState()` 이고 in-flight 가드가 없다. `cliStatus` 는 last-writer-wins. | 코드 레인 + **이 문서 §3.6** |
+| 8 | **MAJOR** | `docs/plans/2026-08-25-shell-cli-restore-design.md:275` | **설계 정본이 4차에 멈춰 인수가 불가능하다.** §3 표가 실물과 어긋나 문서 스스로의 규칙(③ 필드 단위 스키마로 못박는다)을 위반. 5~7차는 흔적 0. | **이 문서 전체가 그 수리**(MAJOR-4 (a)(b)(c)(d)(e)) |
+| 9 | MINOR | `ui/src/clipath.test.ts:2064` | 장식 테스트 1건 — `toast()` 등급색 핀이 "함수 본문에 그 문자열이 있는가"만 봐서, 등급색을 완전히 파괴해도 초록. 형제 핀(`stickyToast`)은 정상 작동하므로 계열 자체는 유효. | 테스트 레인 |
+| 10 | MINOR | `ui/src/clipath.test.ts:2089` | 전체 소스 문자열 검색형 핀이 **주석을 걸러내지 않아 우회된다** — `// was: …` 형태로 남기면 배선을 실제로 깨도 초록. 같은 파일이 다른 곳(`CLIPATH_CODE`)에서는 주석을 걷어내는데 `MAIN_SRC` 계열 7개 핀에는 적용하지 않은 비대칭. | 테스트 레인 |
+| 11 | MINOR | `USER-MANUAL.md:76` | 오너 원 요구 충족 판정 — 복원·수리1·수리2·수리3 **전부 충족**(코드 근거 첨부). 초과: D5·D6(원안 '선택') + **I3③ 원본 복원**(원안에 없던 새 특권 쓰기 경로) · IPC 필드 5개 신설. 미달은 **문서 축뿐**. | 4.7·§9 에 기록 |
+| 12 | MINOR | 같은 문서 `:1` | 인수 경로 단절 — freeze 커밋 `7f8b505` 가 이 레인의 `SESSION_STATE.md`(39줄)·`MASTER_TODO.md`(33줄)를 **삭제**했는데 커밋 메시지가 그것을 한 글자도 언급하지 않았고 대체물도 없었다. | **§8 신설**(MAJOR-4(d)). 두 파일은 레포 밖으로 이전됐고 그 이유를 §8 에 적었다. ★7차 미커밋 지적은 **해소됨** — `0b6cb24` 로 커밋되어 이 라운드의 freeze 가 됐다 |
+
+### 4.12 ★master 의 판단 오류 3건 (정직 기록)
+
+> 이 절이 이 문서에서 가장 값진 부분이다. 여덟 라운드에서 나온 결함의 상당수는 워커의 실수가
+> 아니라 **master 가 내린 판단의 결과**였다. 다음 사람이 같은 함정을 밟지 않게 하려면 그것을
+> 감추지 않고 적어야 한다.
+
+#### 오류 ① 반환 계약을 못박지 않은 채 병렬로 발진시켰다 (계약 드리프트의 근인)
+
+1라운드 설계서(D4)는 새 커맨드 두 개(`uninstall_cli_from_path`·`cli_install_status`)의 **이름과
+역할**만 정하고 **반환 형태를 정하지 않았다.** 그 상태로 Rust 쪽과 TS 쪽을 **병렬로** 보냈다.
+
+결과는 예정된 것이었다 — Rust 는 `skipped: Vec<String>` 을 만들었고 TS 는 `{path, reason}[]` 로
+상상했다. TS 의 `.filter(s => s && s.path)` 가 **모든 skip 을 소멸**시켰고 부분 실패가 성공
+토스트로 둔갑했다. `warnings`·`ok` 는 TS 타입에 아예 없어서 **유일한 복구 명령이 사용자에게
+도달하지 못했다.** 단위테스트는 초록이었다 — 픽스처가 상대의 실물이 아니라 자기 상상이었기
+때문이다. **테스트가 드리프트를 봉인했다.**
+
+> **이름 3개와 enum 1개는 계약이 아니라 추측 허가다.** 병렬 작업의 경계에서 설계자가 필드를
+> 못박지 않으면, 두 사람은 각자 다르게 상상하고 각자 자기 상상에 맞는 테스트를 쓴다.
+> → 규약 ③ 이 이 오류에서 나왔다. 그리고 §3 이 존재하는 이유가 이것이다.
+
+#### 오류 ② 쓰는 에이전트와 읽는 감사자를 **같은 트리에 동시에** 배치했다 (거짓 RED 관측 오염)
+
+어느 라운드에서 master 는 속도를 위해 **구현 워커와 검증 감사자를 병렬로** 돌렸다. 둘은 같은
+작업 트리를 봤다. 그 결과 감사자가 관측한 실패(RED)가 **자기가 감사하는 코드 때문인지, 옆에서
+워커가 파일을 고치는 중이라서인지 구분되지 않았다.** 테스트가 빨간 이유가 두 가지가 되면 그
+관측은 증거가 아니다 — 감사 결과 일부를 폐기하고 다시 돌려야 했다.
+
+이것은 헌장이 이미 말하고 있던 것을 어긴 것이다: **"산출자는 자기 산출물의 통과를 판정하지
+않는다"** 는 산출자와 판정자를 **분리**하라는 뜻이지, 둘을 **동시에** 돌리라는 뜻이 아니다.
+분리는 인적 분리(누가)와 시간적 분리(언제) 둘 다여야 한다. 읽는 쪽은 **정지한 리비전**을 봐야
+한다 — 그래서 이 프로젝트의 라운드 규약에 `freeze`(로컬 커밋으로 리뷰 대상 리비전을 확정하고
+verdict 도착 전에는 수정하지 않는다)가 있는 것이다. master 는 그 규약을 알고 있으면서 병렬
+효율을 이유로 건너뛰었다.
+
+> **교훈**: 병렬화는 **쓰기끼리** 겹치지 않게 하는 기술이 아니라, **읽기와 쓰기**가 겹치지 않게
+> 하는 기술이다. 같은 산출물에 대해 쓰기는 단일 스레드이고, 감사는 그 스레드가 멈춘 뒤에 시작한다.
+> (이번 8라운드는 이 교훈을 적용했다 — 판정 12건은 freeze `0b6cb24` 라는 **정지한 리비전**에서
+> 나왔고, 수리 레인들은 **서로 다른 파일**로 갈라 배치했다. 이 문서 레인이 만지는 파일은
+> `docs/plans/2026-08-25-shell-cli-restore-design.md` 하나뿐이다.)
+
+#### 오류 ③ `partial && notes 비어있지 않음 ⟹ 남의 것 존재` 라는 판정 규칙을 제시했다
+
+7라운드 MAJOR-1(등급 회귀)을 고칠 때, master 는 워커에게 판정 근거를 직접 제시했다 —
+"`state == partial` 이고 `notes` 가 비어 있지 않으면 남의 파일이 있는 것이다."
+
+**워커가 이것을 반증했다.** 두 세계가 기존 계약 필드로 **완전히 동일하게 관측**된다:
+
+| | 안전한 세계 | 위험한 세계 |
+|---|---|---|
+| 상황 | 우리 cys 링크 있음 + cysd **부재** | 우리 cys 링크 있음 + **남의 실체 cysd 파일** |
+| `state` | `partial` | `partial` |
+| `installed` | `true` | `true` |
+| `notes.len()` | 1 | 1 |
+| `backups` | `[]` | `[]` |
+
+이유는 구조적이다 — 남의 실체 파일이 그 자리에 있으면 `which` 1순위가 곧 target 이라 **그림자
+축이 침묵한다.** 따라서 `notes` 의 유무·개수는 경고 근거가 될 수 없다. 워커가 제시한 대체
+규칙은 **`state` 단독**(`partial`\|`foreign` = 경고)이었고, 과경고가 아님도 구조로 보장된다
+(`classify_cli_links` 상 `Ours` 는 두 축 전부 `Remove`, `Absent` 는 전부 `SkipAbsent` 이므로
+`foreign == 0`). master 는 이 반박을 **수용**했고, 4단 증명을 순수 테스트로 못박게 했다
+(`major1_premise_partial_with_notes_does_not_imply_foreign_present`).
+
+> **교훈 셋**:
+> ① master 가 판정 **규칙**까지 지정하는 것은 위험하다 — 요구(무엇을 보장해야 하는가)는 master 가
+>   정하고, 그것을 어떤 관측으로 판정할지는 실물을 만지는 쪽이 검증해야 한다.
+> ② **"두 세계가 같은 관측값을 낸다"는 반박은 가장 강한 형태의 반박이다.** 근거 없이 기각해서는
+>   안 되고, 이번에는 그러지 않았다(수용 + 테스트로 못박음)는 사실도 함께 기록한다.
+> ③ 커밋 트레일러의 `Rejected:` 칸에 **master 자신의 안이 기각된 기록**이 남아야 한다. 실제로
+>   `0b6cb24` 의 `Rejected:` 첫 항목이 그것이다 —
+>   `master 의 partial&&notes 판정 규칙(워커가 관측 동일성으로 반증 — 수용)`.
+
+
+---
+
+## 5. ★설계 규약 16조
+
+> **재발 방지 조문**이다. 이 조문들은 이 작업에만 적용되는 것이 아니라, 앞으로 이 레포에서
+> 설계서를 쓰는 모든 라운드의 최소 요건이다. 각 조문 뒤의 괄호는 그 조문을 낳은 **실제 사고**다.
+>
+> - **①~⑬**: 1~4라운드 성찰(설계 감사 · 적대적 감사 · 아키텍트 감사 3라운드)이 도출.
+> - **⑭~⑯**: 5~8라운드가 새로 낳았다(§4.8~§4.11). 같은 지위이며 번호를 이어 붙인다.
 
 ### ① '무손상 존치'는 감사 면제가 아니다
 
@@ -669,84 +1020,533 @@ red→green 을 확인하지 않은 테스트는 **무엇을 지키는지 모르
 
 ---
 
+> **아래 세 조문은 5~8라운드가 새로 낳은 것이다.** 위 13조와 같은 지위이며, 번호를 이어 붙인다.
+
+### ⑭ 판정과 집행이 갈라지는 지점을 목록으로 만들어 전수 점검한다
+
+순수 함수로 정확히 판정해도, **실제로 파일을 옮기고 지우는 쪽이 다른 규칙을 쓰면 판정은
+장식이다.** 이 작업에는 판정↔집행 경계가 셋 있다 — ①Rust 순수 판정 ↔ ②승격 셸 스크립트
+↔ ③문서가 사용자에게 시키는 명령. 한 축을 고칠 때마다 **나머지 둘에 같은 규칙이 서 있는지**
+확인한다.
+
+> (5차 MAJOR-6: Rust 는 경로를 정규화하는데 셸은 안 했다. 6차 MAJOR-C: Rust 는 `Path::exists()`
+> — 심볼릭을 따라간다 — 로 물었는데 셸은 `[ -e ] || [ -L ]` 로 물었다. **한 라운드 건너 같은 병이
+> 다른 축에서 재발했다** = 목록이 없었다는 증거다. 8차 BLOCK-1: 코드는 백업하는데 문서는 파괴한다
+> = 세 번째 축이 통째로 빠져 있었다.)
+
+### ⑮ 경고를 **줄이는** 변경, 막힘을 **푸는** 변경도 새로 열리는 집합을 전수 열거한다
+
+규약 ⑩은 "경고 → 거부"만 다뤘다. 반대 방향도 같은 크기의 계약 변경이다:
+
+- **경고를 줄이는 변경**은 "무엇이 새로 **조용해지는가**"를 열거해야 한다.
+- **막힘을 푸는 변경**(동기 → 비동기, 락 제거, 캐시 도입)은 "무엇이 새로 **동시에 일어날 수
+  있는가**"를 열거해야 한다. 막힘은 그 자체로 직렬화 장치였고, 그것을 없애면 그 장치가 대신
+  하던 일을 누군가 다시 해야 한다.
+
+> (7차 MAJOR-1: 6차가 과경고를 줄이면서 **진짜 남의 파일 경고까지** 조용해졌다. 7차 MAJOR-3:
+> `async fn` 전환이 "메인 스레드가 멎는" 결함을 닫으면서 **중복 진입의 문을 열었고**, 주석은
+> 오히려 "새 동시성도 열리지 않는다"고 단정했다 — 8차가 그것을 반증했다.)
+
+### ⑯ 계열은 코드 밖까지 간다 — 사용자에게 도달하는 모든 경로를 같은 기준으로 본다
+
+규약 ⑬의 4쌍(설치↔해제 · cys↔cysd · 실체파일↔심볼릭 · 시작표식↔끝표식)은 전부 **코드 안의
+거울쌍**이다. 그러나 결함이 사용자에게 닿는 경로는 코드만이 아니다:
+
+```
+①GUI 버튼   ②앱이 화면에 띄우는 명령 문자열   ③문서가 복사해 실행하라고 주는 명령
+④문서가 서술하는 동작 설명   ⑤에러 메시지가 제안하는 복구 절차
+```
+
+**한 결함을 고쳤으면 다섯 경로 전부에서 같은 결함을 찾는다.** 그리고 문서 축에는 **문서를 읽는
+자동 테스트**를 건다 — 사람의 눈으로 대조하는 방식은 이 리포에서 이미 여러 번 실패했다.
+
+> (7차 MAJOR-2 는 UI 가 만드는 명령 문자열 5종을 전수 점검했는데 **`ui/src` 에서 멈췄다** — 같은
+> 파괴적 명령이 `docs/INSTALL.md:275`·`USER-MANUAL.md:98` 에 그대로 남아 8차 BLOCK-1 이 됐다.
+> 7차 MINOR-5 는 `docs/INSTALL.md` 를 읽는 doc-sync 테스트를 만들었는데 **`USER-MANUAL.md` 를
+> 읽는 테스트는 만들지 않았고**, 정확히 그 파일에 불일치가 남아 8차 MAJOR 가 됐다.)
+
+---
+
 ## 6. 미결 · 오너 결정 대기 항목
 
-### 6.1 이번 라운드 안에서 판정될 것 (4차 진행 중)
+### 6.1 4차 안에서 판정하기로 했던 것 — **전부 판정됐다**
 
-| 항목 | 내용 | 상태 |
+| 항목 | 내용 | 결과 |
 |---|---|---|
-| I3-③ 원본 복원 | 해제 시 '원본 복원'(우리 이름 규칙에 정확히 일치하는 백업만 `mv`) 선택지. 비가역이 아니라 복원이므로 안전하나 구현이 복잡하다 | 구현이 복잡하면 ①②만 하고 ③은 사유를 적어 미수리로 보고 — 4차 산출물에서 확인 |
-| I6 검수 실험 | 아무 필드에 `#[serde(rename=...)]` 를 붙였을 때 **TS 게이트가 빨개지는가** — 실제로 실험하고 결과를 보고(실험 후 원복) | 4차 산출물에서 확인 |
-| `adv1`~`adv9` 전부 초록 | 4차 인수 기준. 초록이 안 되는 항목은 지우지도 `#[ignore]` 하지도 않고 사유를 적는다 | 4차 산출물에서 확인 |
-| C3 판별자 형태 | `skipped_benign: bool` 로 갈지 "더 나은 형태"로 갈지 | 워커 재량 — 단 **TS 가 산문을 파싱하지 않을 것** 이 절대 조건 |
+| I3-③ 원본 복원 | 해제 시 '원본 복원'(우리 이름 규칙에 정확히 일치하는 백업만 `mv`) — 구현이 복잡하면 미수리로 보고해도 되는 선택지였다 | ✅ **채택·구현됨**. `build_uninstall_script`(`main.rs:2440`)에 root `mv` 되돌리기 경로 추가 + 새 IPC 필드 `restored`. 가드: 자리가 비었을 때(`[ ! -e ] && [ ! -L ]`)만 옮기고, `is_our_backup_name` 에 정확히 맞는 것만 후보. ★8차 판정: **오너 원 요구 3건이 요구하지 않은 새 특권 쓰기 경로**라는 사실은 기록한다(4.7) |
+| I6 검수 실험 | 아무 필드에 `#[serde(rename=…)]` 를 붙였을 때 TS 게이트가 빨개지는가 | ✅ **실험 수행·빨개짐 확인**. 단 **덤프 쓰기가 자기 단언보다 먼저 와야** 한다는 함정을 실측으로 발견해 코드 주석에 남겼다(§3.4). ★그러나 이 게이트는 **어떤 CI 레인에서도 두 반쪽이 함께 돌지 않는다** → §7 |
+| `adv1`~`adv9` 전부 초록 | 4차 인수 기준 | ✅ **9/9 초록.** 이름이 '결함 재현'에서 '결함 부재 회귀핀'으로 바뀌었다(4.7 표) |
+| C3 판별자 형태 | `skipped_benign: bool` 로 갈지 더 나은 형태로 갈지 | ✅ **둘 다.** 등급용 `skipped_benign: bool` + 줄별 분류용 `skipped_reasons: string[]`(enum 3값). TS 는 산문을 파싱하지 않는다(§3.2) |
 
 ### 6.2 오너 결정이 필요한 것
 
-| 항목 | 쟁점 | 현재 잠정 결정 |
+| 항목 | 쟁점 | 현재 상태 |
 |---|---|---|
 | **Windows PATH 등록** | D2 는 Windows 자동 PATH 편집을 **구현하지 않기로** 했다(`setx` 1024자 잘림 · `REG_EXPAND_SZ→REG_SZ` 변환으로 `%USERPROFILE%` 류 파손). Windows 사용자는 터미널에서 `cys` 를 쓰려면 수동으로 PATH 를 넣어야 한다 | **미구현 유지 + 문서 안내만.** 오너 절대지침(윈도우 신중) 준수. 다시 열려면 오너 결정 필요 |
-| **MINOR-12(b) Windows MSI PATH 문장 충돌** | `docs/INSTALL.md:183`("설치 시 PATH에 등록됩니다") ↔ `USER-MANUAL.md:80`("설치기는 외부 PATH를 등록하지 않음")이 정면 충돌. 실측(`tauri.conf.json` 번들 타겟 nsis/msi · `dist-win/` · `scripts/` 설치기 설정)으로 판정하되 **실측으로 판정이 안 되면 고치지 말고 '판정 불가'로 보고 — 추측 정정 금지** | 실측 결과가 아직 이 문서에 반영되지 않았다. 2차 산출물에서 확인 필요 |
-| **릴리스 번호** | v0.14.25 는 타 레인이 선점. 이 레인은 **v0.14.26 예약** | 버전 SOT(`Cargo.toml`·`src-tauri/Cargo.toml`·`src-tauri/tauri.conf.json`)는 이번 라운드에서 **건드리지 않는다** |
-| **라운드 종료 판정** | 헌장상 라운드 종료 = 미달 항목 0 또는 10라운드. 현재 4라운드 | 4차 결과에 따라 5차 필요 여부를 오너께 보고 |
+| **MINOR-12(b) Windows MSI PATH 문장 충돌** | `docs/INSTALL.md` ↔ `USER-MANUAL.md` 가 정면 충돌했다 | ✅ **실측으로 판정·정정 완료**(2·3차). 사실은 "설치기(setup.exe)는 PATH 를 건드리지 않는다 — `installMode: currentUser` · `%LOCALAPPDATA%\cys`". 폐기된 구 MSI 는 PATH 를 등록했으나 더 이상 배포되지 않는다는 단서까지 양쪽 문서에 명시(`docs/INSTALL.md:509·518·521` · `USER-MANUAL.md:99`) |
+| **릴리스 번호** | v0.14.25 는 타 레인이 선점했고 **이미 태그됨** | 이 레인은 **v0.14.26 예약**. 버전 SOT(`Cargo.toml`·`src-tauri/Cargo.toml`·`src-tauri/tauri.conf.json` 등 6곳)는 이 라운드들에서 **한 번도 건드리지 않았다** — 범프는 master 가 릴리스 시점에 한다 |
+| **CI 배선(§7)** | 이 diff 의 Rust 테스트 102종이 태그 레인 밖이다. 닫으려면 `.github/workflows/release.yml` 수정이 필요한데 **이 레인은 `.github/**` 무접촉**이 절대 경계다 | ★**오너·master 결정 대기.** §7 에 추가할 스텝의 **정확한 형태**를 적어 두었다 — 그대로 붙이면 된다 |
+| **라운드 종료 판정** | 헌장상 종료 = 미달 항목 0 또는 10라운드. 현재 **8라운드** | 8차 판정 12건 중 MINOR 1건(4.11 #3)은 사유를 적어 미수리로 남긴다. 나머지 처리 후 **서면 종료 보고**가 필요하다 — §6.2 의 이 줄이 4차부터 열려 있고 아직 닫히지 않았다 |
 
-### 6.3 이 레인이 건드리지 않는 것 (경계)
+### 6.3 이 레인이 건드리지 않는 것 (경계 · 절대)
 
 - **수정 절대 금지**: `src/bin/**` · `src/lib.rs` · `src/pack.rs` · `cysjavis-pack/**` ·
-  `.github/**` · `ui/e2e/**`
-- **`/usr/local/bin` 절대 금지** — 실행 중인 데몬이 그 심볼릭에 의존한다. 스크립트 실행 검증은
-  반드시 임시 디렉터리 사본에서만.
-- `<OTHER-LANE-WORKTREE>` 은 타 세션 작업 중 — **읽지도 않는다.**
+  `.github/**` · `scripts/**` · `ui/e2e/**`
+- **`/usr/local/bin` 절대 무접촉** — 실행 중인 데몬이 그 심볼릭에 의존한다. 스크립트 실행
+  검증은 반드시 임시 디렉터리 사본에서만.
+- **버전 SOT 무접촉** — 릴리스 범프는 master 가 한다.
+- `<OTHER-LANE-WORKTREE>` 는 타 세션 작업 중 — **읽지도 않는다.**
 - `git commit`/`checkout`/`reset`/`stash` 금지(커밋은 master). 데몬·서버 기동 금지.
   `cargo` 병렬 실행 금지(타 세션과 CPU 공유).
-- `ui/src/style.css` 는 4라운드에 한해 **`#cc-header` 규칙에만** 수정 허용.
+- `ui/src/style.css` 는 4라운드에 한해 **`#cc-header` 규칙에만** 수정 허용(실제 변경 +7줄).
+- ★**문서에 실제 홈 경로 금지** — `<WORKTREE>`·`<HOME>`·`<SESSION-DIR>` 플레이스홀더를 쓴다.
+  이유는 §8.
 
 ### 6.4 이 레인 밖으로 이관된 발견
 
 부수 발견: cys 노드 부트 사슬에서 **fresh 프로필 로그인 선택지 → 디렉티브 주입 Return 이
 'No, exit' 에 꽂혀 agent 를 죽이는 경로**를 실측했다. 타 세션(부트 결정론 캠페인) 소관이라
-증거만 이관했다 — 증거 파일은 스크래치의
-`boot-chain-evidence-for-determinism-campaign.md`, 레인 커밋 `3080315` 에 함께 담겼다.
+증거만 이관했다 — `_round/handoffs/boot-chain-evidence-for-determinism-campaign.md`,
+레인 커밋 `3080315` 에 함께 담겼다.
 
 ---
 
-## 부록 A. 관련 파일 지도
+## 7. ★CI 레인 지도와 공백 (8라운드 MAJOR-4(c) 신설)
 
-| 파일 | 역할 |
+> **왜 이 절이 필요한가 (일반 독자용 풀이)**
+> 테스트는 "돌아야" 보증이 된다. 사람이 자기 컴퓨터에서 돌리는 것과, GitHub 이 자동으로 돌리는
+> 것은 전혀 다른 보증이다 — 사람은 잊어버리고, 자동은 잊지 않는다. 이 절이 밝히는 사실은
+> 이것이다: **이 여덟 라운드가 만든 Rust 테스트 102개는, 실제 사용자에게 앱이 전달되는 경로
+> (= 태그를 붙여 릴리스를 만드는 경로)에서 단 한 번도 실행되지 않는다.**
+
+### 7.1 이 리포의 워크플로 6종과 기동 조건 (실측 `0b6cb24`)
+
+| 워크플로 | 기동 조건 | 이 레인(`fix/shell-cli-install-restore`)에서 도는가 |
+|---|---|---|
+| `release.yml` | `push: tags: ['v*']` + `workflow_dispatch` | ❌ 태그 push 로만 자동 기동(수동 실행은 가능) |
+| `ci-branch.yml` | `push: branches: ['feat/**']` + `workflow_dispatch` | ❌ **`fix/**` 는 해당 없음** |
+| `windows-health.yml` | `push: branches: ['feat/**']` + `workflow_dispatch` | ❌ 같은 이유 |
+| `windows-build.yml` | `push: branches: ['feat/windows-x64-dist']` + `workflow_dispatch` | ❌ |
+| `pack-release.yml` | `push: tags: ['pack-v*']` | ❌ (팩 전용 레인) |
+| `release-publish.yml` | `workflow_dispatch` 전용 | ❌ (이미 만들어진 draft 를 공개 발행하는 레인) |
+
+★즉 **이 브랜치에 코드를 push 해도 자동으로 도는 CI 는 0개다.** 이 레인의 검증은 전부 로컬에서
+사람이 돌린 것이다(각 커밋 메시지의 `검증:` 줄이 그 기록이다).
+
+### 7.2 어느 스텝이 어느 크레이트를 도는가 (실측)
+
+이 리포에는 Rust 크레이트가 둘이다 — **루트 크레이트**(`cys`·`cysd` 바이너리 + `lib`)와
+**`cys-app` 크레이트**(`src-tauri/` · GUI 본체 · **이 작업의 코드가 전부 여기 있다**).
+
+| 워크플로 : 잡 : 스텝 | 명령 | 어느 크레이트 | 어느 레그 |
+|---|---|---|---|
+| `release.yml` : `build` : `UI 회귀 테스트 (bun test)` (`:145-147`) | `cd ui && bun test` | (TypeScript) | 매트릭스 **3레그 전부** |
+| `release.yml` : `build` : `phoenix host-level 로직 게이트` (`:167-189`) | `cargo test --bin cysd -- --skip hwmon::` / `cargo test --lib` / `cargo test --bin cys` | **루트 크레이트만** | `aarch64-apple-darwin` 1레그 |
+| `release.yml` : `build` : `cargo test --lib factory_reset + D5` (`:488-494`) | `cargo test --lib factory_reset::` / `cargo test --lib claude_alt_screen` | **루트 크레이트만** | Windows 레그 |
+| `ci-branch.yml` : `macos-rust-pack` : `cargo test --bin cys 리허설` (`:556-560`) | `cargo test --bin cys` | **루트 크레이트만** | macOS |
+| `ci-branch.yml` : `macos-rust-pack` : `cargo test -p cys-app --bins` (`:580-591`) | `cargo test -p cys-app --bins` | ★**`cys-app` — 유일한 레인** | macOS |
+| `windows-health.yml` | `cargo test --lib factory_reset::` / `cargo test --bin cys d5_env_injection` | **루트 크레이트만** | Windows 실기 |
+| `pack-release.yml` | (`cargo test` 자체가 없다) | — | — |
+
+**결론 두 줄:**
+
+1. `cys-app` 크레이트 테스트를 돌리는 CI 스텝은 **`ci-branch.yml:580` 단 하나**이고, 그
+   워크플로는 `feat/**` push 전용이다 → **태그 경로(사용자에게 도달하는 유일한 경로)에는 보증이 0.**
+2. `bun test` 를 돌리는 CI 스텝은 **`release.yml:147` 단 하나**이고, 그 잡에는
+   `cargo test -p cys-app` 이 없다 → **I6 계약 게이트의 두 반쪽이 같은 잡에 함께 있는 레인이 없다.**
+
+### 7.3 이 공백이 실제로 무엇을 못 잡는가
+
+이 레인이 `src-tauri/src/main.rs` 에 추가한 테스트(정적 계수, `#[test]` 속성 기준):
+
+| 항목 | 값 | 세는 방법 |
+|---|---|---|
+| base `c54c3b2` 의 `#[test]` | **43** | `git show c54c3b2:src-tauri/src/main.rs \| grep -c '#\[test\]'` |
+| freeze `0b6cb24` 의 `#[test]` | **102** | `grep -c '#\[test\]' src-tauri/src/main.rs` |
+| 이 diff 가 추가/삭제한 것 | **+61 / −2** (순증 59) | `git diff c54c3b2..HEAD -- src-tauri/src/main.rs \| grep -c '^+\s*#\[test\]'` |
+| 그중 플랫폼 한정 | `#[cfg(target_os = "macos")]` **7** · `#[cfg(unix)]` **21** | `grep -B1 '#\[test\]' \| grep 'cfg('` |
+
+**이 102개 안에 있는 것**: `adv1`~`adv9`(적대적 재현 회귀핀 9종, `main.rs:8116`~`8412`) ·
+계약 덤프(`dump_report_contract_for_the_ui_gate`, `main.rs:8731`) · 소스 텍스트 불변식 핀(`blockb_no_new_file_level_cfg_gated_items`,
+`main.rs:9286` — 7차 MINOR-4 가 `fn` 전용에서 11종 아이템으로 확장하고 **읽지 못하면 offender 로
+올리도록** 고친 것) · `major1_premise_…`(7차 반증을 못박은 4단 증명, `main.rs:7671`) · Windows E0425 재발 방지 핀.
+**전부 태그 레인 밖이다.**
+
+**I6 게이트가 실제로 어떻게 뚫리는가** — 네 경우로 갈린다:
+
+| 경로 | Rust 덤프(`__contract__.json` 다시 쓰기) | TS 판독(`bun test`) | 필드 이름을 바꾸면? |
+|---|---|---|---|
+| 태그 레인(`release.yml`) | ❌ 안 돈다 | ✅ 돈다 (커밋된 파일을 읽는다) | **초록** — 커밋된 스냅샷이 낡은 채로 TS 와 맞으므로 통과 |
+| `feat/**` 레인(`ci-branch.yml`) | ✅ 돈다 (파일을 덮어쓴다) | ❌ 안 돈다 | **초록** — 파일을 조용히 고쳐 놓고 아무도 안 읽는다. `git diff --exit-code` 도 없다 |
+| 이 레인(`fix/**`) | ❌ | ❌ | 둘 다 안 돈다 |
+| 사람이 로컬에서 `cargo` → `bun` 순서로 | ✅ | ✅ | **빨개진다** ← 지금 이 게이트가 작동하는 **유일한** 조건 |
+
+★그리고 이 사실이 **`clipath.ts:18` 의 "판정의 근거는 그 생성 파일이다"** 와 **이 설계문서 §4.5
+I6 의 "게이트가 빨개진다"** 라는 서술을 부분적으로 거짓으로 만든다. 커밋 `7f8b505` 의
+`Not-tested:` 트레일러도 이 공백을 적지 않았다(적힌 것은 'Windows 실빌드'·'실기 macOS 승격
+왕복' 둘뿐). ★8차 freeze 커밋 `0b6cb24` 의 `Not-tested:` 에는 이 문장이 들어갔다 —
+`★이 diff 의 Rust 테스트는 어떤 CI 레인에서도 실행되지 않음`. **그 고지가 이 절의 씨앗이다.**
+
+### 7.4 닫는 방법 — `release.yml` 에 추가할 정확한 스텝
+
+> ⚠ **이 레인은 `.github/**` 무접촉이 절대 경계다.** 그래서 **문서로 남기는 것이 이번 라운드의
+> 산출물**이다. 아래는 그대로 붙여 넣을 수 있는 형태이며, 붙이는 주체는 master(또는 인수자)다.
+
+**놓을 자리**: `release.yml` 의 `build` 잡, `Rust cache`(`:154`) 스텝 **뒤**,
+`phoenix host-level 로직 게이트`(`:167`) 앞 또는 뒤. 기존 관례대로 macOS 네이티브 레그 1회만 돈다.
+
+```yaml
+      # ★cys-app(src-tauri) 크레이트 테스트 — 태그 레인 편입.
+      #   **왜 여기 있어야 하는가**: 이 크레이트 테스트를 돌리는 레인이 ci-branch.yml
+      #   (push: branches ['feat/**'] 전용) 하나뿐이라, 결함이 사용자에게 도달하는 유일한
+      #   경로(태그)에는 보증이 0이었다. 같은 형태의 사고가 이 리포에 이미 세 번 있었다
+      #   (C-1 / R4 / S26 — ci-branch.yml 머리 주석 참조): 언제나 '레인 하나를 빼먹음'이다.
+      #   ⚠스텁 스테이징 필수: 이 시점에는 bundle-prep 이 아직 돌지 않아 ui/dist·
+      #   src-tauri/binaries·resources 가 없고, tauri-build 2.6.2 는 그 자원의 **실존만**
+      #   검사하므로 없으면 "resource path … doesn't exist" 로 즉사한다(ci-branch.yml 실측 주석).
+      #   touch 는 기존 파일을 절단하지 않아 실물 스테이징이 있는 환경과도 공존한다.
+      - name: cargo test -p cys-app --bins (GUI·CLI PATH 계약 핀 · macOS 네이티브)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 핀 실존 단언(이 리포 관례) — cargo test 필터는 0매치도 초록이라 존재를 먼저 못박는다.
+          grep -q "fn dump_report_contract_for_the_ui_gate" src-tauri/src/main.rs \
+            || { echo "계약 덤프 테스트 부재: src-tauri/src/main.rs (git add 누락 의심)" >&2; exit 1; }
+          grep -q "fn adv9_cysd_shadowing_is_measured_and_reported" src-tauri/src/main.rs \
+            || { echo "적대적 회귀핀 부재: adv9 (git add 누락 의심)" >&2; exit 1; }
+          mkdir -p ui/dist src-tauri/binaries src-tauri/resources src-tauri/runtime
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          touch "src-tauri/binaries/cys-$triple" "src-tauri/binaries/cysd-$triple" \
+                src-tauri/resources/pack.tar.gz src-tauri/resources/pack-manifest.json
+          CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app --bins -- --test-threads=1
+
+      # ★계약 스냅샷 드리프트 hard-gate.
+      #   위 스텝의 dump_report_contract_for_the_ui_gate 가 ui/src/__contract__.json 을 **다시 쓴다**.
+      #   커밋본과 한 글자라도 다르면 "Rust 실물이 바뀌었는데 계약 스냅샷을 갱신하지 않았다"는 뜻이다.
+      #   ★이 스텝이 없으면 위 cargo test 는 파일을 조용히 고쳐 놓고 초록으로 지나간다
+      #     (= ci-branch.yml 레인이 지금 그 상태다).
+      - name: 계약 스냅샷 드리프트 게이트 (ui/src/__contract__.json)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- ui/src/__contract__.json \
+            || { echo "ui/src/__contract__.json 이 Rust 실물과 어긋난다 — 로컬에서 'cargo test -p cys-app --bins' 로 재생성해 커밋하라" >&2; exit 1; }
+```
+
+**이 두 스텝이 함께 있어야 하는 이유**: 첫 번째만 넣으면 파일을 덮어쓰기만 하고 아무도 그 결과를
+읽지 않는다(현재 `ci-branch.yml` 이 정확히 그 상태다). 두 번째만 넣으면 비교할 새 파일이 생기지
+않아 항상 초록이다. **둘이 한 쌍이다.**
+
+**순서에 대한 주의**: `bun test`(`:147`)는 `Setup Rust`(`:149`)보다 **앞**에 있으므로, 위 두
+스텝은 `bun test` 뒤에 온다. 그래도 보증은 성립한다 — 드리프트 게이트가 실패하면 잡 전체가
+실패하기 때문이다. 순서를 더 곧게 하고 싶다면 `bun test` 스텝을 이 두 스텝 **뒤로** 옮기면
+된다(그러면 TS 게이트가 방금 재생성된 파일을 읽는다).
+
+**같은 공백을 `ci-branch.yml` 쪽에서 닫으려면**: 그 잡에 `bun test` 가 0건이므로
+`- run: cd ui && bun test` 를 추가하거나, 위 드리프트 게이트를 그 잡에도 넣는다.
+그리고 **이 레인의 브랜치 접두(`fix/**`)가 어느 워크플로 트리거에도 없다**는 사실 자체가 별개
+문제다 — `ci-branch.yml` 의 `branches:` 목록에 `'fix/**'` 를 더할지는 오너 결정 사항이다
+(러너 비용이 늘어난다).
+
+### 7.5 예산과 위험
+
+- 비용: 콜드 시 tauri 의존 그래프 추가 빌드 수 분(같은 잡의 `Rust cache` 가 흡수) · 웜 실측
+  1초 미만(ci-branch.yml 주석의 실측값). 매트릭스 1레그에서만 돌므로 3배가 되지 않는다.
+- 위험: 러너 환경 의존으로 실패하는 테스트가 나오면, 이 리포의 선례 패턴
+  (`--skip hwmon::` = 하드웨어 의존 모듈 명시 스킵)을 그대로 적용한다. **테스트를 지우지 마라.**
+- `-p cys-app` 는 `ubuntu` 레인(`pack-release.yml`)에 넣을 수 없다 — tauri 스택이 시스템
+  webkit 계 의존을 요구하고 그 레인은 manifest emit 용 `cys` 만 빌드한다(ci-branch.yml 실측 주석).
+
+---
+
+## 8. ★레인 상태 파일이 레포 밖에 있는 이유 (8라운드 MAJOR-4(d) 신설)
+
+### 8.1 무슨 일이 있었나
+
+레인 개설 커밋 `3080315` 은 레포 루트에 `MASTER_TODO.md`(33줄)와 `SESSION_STATE.md`(39줄)를
+만들었다. 후자는 스스로를 **"단일 복원 진실"** 이라고 선언했다. 그런데 4~6차 커밋 `7f8b505` 가
+**그 둘을 삭제했다**(`git show --stat 7f8b505` 실측: `MASTER_TODO.md | 33 -` ·
+`SESSION_STATE.md | 39 -`). 그 커밋 메시지는 트레일러 6종을 갖춘 상세본인데 **두 삭제를 한 글자도
+언급하지 않았고**, 대체물도 남기지 않았다. `_round/handoffs/` 에는 이 레인 파일이 0건이다
+(있는 것은 타 레인 이관용 `boot-chain-evidence-…` 와 `RELEASE_LANES.md` 둘뿐).
+
+8차 판정자가 이것을 인수 경로 단절로 지적했다(4.11 #12). **지적이 옳다 — 삭제 자체보다 침묵이
+결함이다.** 이 절이 그 침묵을 메운다.
+
+### 8.2 왜 레포 밖으로 옮겨야 했나 — 시크릿 스캔 hard gate
+
+`scripts/secret-scan.sh` 는 릴리스의 **차단 게이트**다. `release.yml:124` 의
+`Secret/PII scan (pre-build hard-gate)` 스텝이 빌드 **전에** 돌고, 걸리면 릴리스가 멈춘다.
+
+그 스캐너의 첫 번째 규칙(`scripts/secret-scan.sh:48-49`):
+
+```
+# 1) 개인 절대경로 (/Users/<실명>) — 더미 제외
+grep -nE '/Users/[A-Za-z0-9._-]+' "$f" | grep -vE '/Users/(user|x|youruser|USERNAME|runner|home)(/|"|$)'
+```
+
+즉 **`/Users/<실제 사용자 이름>` 이 들어간 추적 파일이 하나라도 있으면 릴리스가 차단된다.**
+허용되는 것은 제네릭 더미 이름 6종(`user`·`x`·`youruser`·`USERNAME`·`runner`·`home`)뿐이다.
+
+그런데 레인 상태 파일은 **본질적으로 실제 경로를 담는다** — "어느 워크트리에서 작업 중인가",
+"어느 워크트리를 건드리면 안 되는가"가 그 파일의 존재 이유이기 때문이다. 실측: 두 파일 각각
+**2줄**이 이 패턴에 걸린다(`grep -cE '/Users/[A-Za-z0-9._-]+'` = 2, 2).
+
+플레이스홀더로 바꾸면 스캔은 통과하지만 **파일이 자기 역할을 못 한다**(복원 시 어느 경로인지
+읽을 수 없다). 그래서 **레포 밖**으로 옮겼다.
+
+### 8.3 현재 위치와 규칙
+
+```
+<HOME>/.cys/lanes/shell-cli/MASTER_TODO.md      ← 이 레인의 master TODO 정본
+<HOME>/.cys/lanes/shell-cli/SESSION_STATE.md    ← 이 레인의 단일 복원 진실
+```
+
+- **규칙**: 레인의 상태·복원·TODO 파일은 **레포 밖 `<HOME>/.cys/lanes/<레인 이름>/`** 에 둔다.
+  레포에는 **포인터 한 줄**만 남긴다(지금 이 절이 그 포인터다).
+- 이 규칙은 마스터 규약(`상태·복원·todo 파일은 자기 레인의 팩 아래에 둔다`)과 같은 방향이다 —
+  거기에 "**레포는 공개 배송물이므로 개인 경로가 들어가서는 안 된다**"는 근거가 하나 더 붙는다.
+- 이 설계문서를 포함해 **레포 안 문서에는 실제 홈 경로를 쓰지 않는다.** 대신
+  `<WORKTREE>`·`<HOME>`·`<SESSION-DIR>`·`<OTHER-LANE-WORKTREE>` 플레이스홀더를 쓴다.
+  이 문서는 그 규칙을 지키며, `bash scripts/secret-scan.sh --all` 로 확인했다.
+
+### 8.4 `SESSION_STATE.md` 가 지금 들고 있는 미완 항목 (레포 밖 파일의 요약)
+
+인수자가 그 파일을 열지 않고도 무엇이 남았는지 알 수 있도록 여기에 옮겨 적는다:
+
+1. 워크플로우 산출 수령 → BLOCK/MAJOR 반증 수리 → 커밋 *(1~8라운드로 진행됨)*
+2. 성찰 3라운드(R1 설계 이해 / R2 적대적·최고 품질 / R3 30년차 아키텍트 의존성·파급)
+3. 리뷰어 2종(codex · gemini) 의무 리뷰 트리거 ①③④⑤
+4. **상대 레인 태그 대기 → rebase → 릴리스(D2~D4)** ← v0.14.25 는 이미 태그됨. 이 레인은 v0.14.26
+
+---
+
+## 9. ★미결 · 인수인계 (8라운드 MAJOR-4(e) 신설)
+
+> 다음 사람이 이 레인을 이어받는 데 필요한 것 전부. 이 절만 읽고도 착수할 수 있어야 한다.
+
+### 9.1 좌표
+
+| 항목 | 값 |
 |---|---|
-| `src-tauri/src/main.rs` | 순수 판정 함수 전부 + 커맨드 3종 + `generate_handler!` 등록 + `mod tests` |
-| `ui/index.html` | `#cc-header` 안의 `<button id="btn-install-cli">` (hidden 시작) |
-| `ui/src/main.ts` | 버튼 배선(invoke 호출·DOM 갱신). **판정은 하지 않는다** |
-| `ui/src/clipath.ts` | 순수 판정 — 플랫폼 노출·버튼 라벨·결과 토스트 등급을 **여기서만** 정한다 |
-| `ui/src/clipath.test.ts` | 계약-드리프트 가드 + 정규식 재도입 차단 테스트 |
-| `ui/src/__contract__.json` | **(4차 예정)** Rust 테스트가 덤프하는 계약 스냅샷. TS 게이트의 기준 |
-| `docs/INSTALL.md` | §B 설치/해제 안내 · `INST-DENY-02` |
-| `USER-MANUAL.md` | §2.4 사용자 안내 |
-| `docs/plans/2026-06-29-cli-path-install.md` | 최초 신설 시점의 구현 계획(가드 5종 원안) |
-| `docs/plans/2026-08-25-shell-cli-restore-design.md` | **이 문서** — 복원 라운드의 설계 정본 |
+| 워크트리 | `<WORKTREE>` |
+| 브랜치 | `fix/shell-cli-install-restore` |
+| base | `c54c3b2` = v0.14.24 (2026-08-22 릴리스) |
+| freeze(8라운드 판정 대상) | `0b6cb24` |
+| 커밋 7개 | `3080315`(레인 개설) → `0adc45d`(상태) → `0e60b79`(1차) → `6159778`(2차) → `9f47148`(3차) → `7f8b505`(4~6차) → `0b6cb24`(7차) |
+| 규모 | 12파일 **+9,195 / −307**. 큰 것: `src-tauri/src/main.rs` +4,809/−285 · `ui/src/clipath.test.ts` +2,107 · `ui/src/clipath.ts` +1,015 · 이 문서 · `docs/INSTALL.md` +250/−14 |
+| 상태 파일 | `<HOME>/.cys/lanes/shell-cli/` (§8) |
+| 예약 버전 | v0.14.26 (SOT 무접촉 — 범프는 master) |
 
-## 부록 B. 주요 순수 함수 색인 (`main.rs` @ `9f47148`)
+### 9.2 로컬 검증 4종 (CI 가 대신해 주지 않는다 — §7)
+
+`<WORKTREE>` 에서, **순서대로**:
+
+```
+cargo test -p cys-app --bins -- --test-threads=1     # Rust 102종. __contract__.json 을 다시 쓴다
+git diff --exit-code -- ui/src/__contract__.json      # 계약 드리프트 — 변경이 나오면 커밋해야 한다
+cd ui && bun test                                     # TS. clipath.test.ts 201종 포함
+cd ui && bun run typecheck                            # = bunx tsc -p tsconfig.check.json
+bash scripts/secret-scan.sh --all                     # 릴리스 hard-gate 와 같은 스캐너
+```
+
+★**`cargo` 를 두 개 이상 동시에 돌리지 마라** — 타 세션과 CPU·`target/`(14G)을 공유한다.
+★7차 기록값(`0b6cb24` 커밋 메시지): `cargo 102 passed / 0 failed · 경고 0` ·
+`bun 631 pass / 0 fail` · `tsc 0` · `secret-scan clean(844파일)`.
+
+### 9.3 미결 항목
+
+| # | 항목 | 상태·사유 |
+|---|---|---|
+| U1 | **CI 배선**(§7.4의 두 스텝을 `release.yml` 에 추가) | ★미결. `.github/**` 무접촉 경계 때문에 이 레인이 할 수 없다. **문서로만 남겼다** — 붙이는 주체는 master/인수자 |
+| U2 | 설치 스크립트의 `/bin/mv {d} {b}` 백업 목적지 무가드 (`main.rs:1220`) | **의도적 미수리.** 도달성 극히 낮음(같은 epoch 초 재설치 + 두 번 다 남의 파일 존재). ★**`mv -n` 을 붙이는 것은 오답** — `-n` 은 거부해도 exit 0 이라 `&&` 체인이 이어져 `ln -sfn` 이 백업 없이 원본을 덮는다. 고친다면 충돌 시 스탬프를 바꾸거나 **mv 실패를 유도해 체인을 끊는** 형태여야 한다 |
+| U3 | **Windows 실빌드 미검증** | 6차가 E0425 컴파일 즉사를 최소 재현으로 잡고 고쳤지만, **실제 Windows 러너에서 빌드한 적은 없다.** 첫 실측점은 태그 레인의 Windows 레그다 |
+| U4 | **실기 macOS 승격 왕복 미검증** | 관리자 비밀번호를 받아 `/usr/local/bin` 에 실제로 설치·해제하는 왕복은 한 번도 하지 않았다(`/usr/local/bin` 무접촉 경계). 스크립트 검증은 전부 임시 디렉터리 사본 |
+| U5 | `resource_gate_check` 동기 + 무기한 블로킹 | 7차 MAJOR-3 과 **같은 병**이지만 티켓 범위 밖이라 손대지 않았다(`0b6cb24` 의 `Rejected:` 에 기록). 별도 티켓 필요 |
+| U6 | 라운드 종료 서면 보고 | §6.2 마지막 줄. 4차부터 열려 있고 아직 닫히지 않았다 |
+| U7 | 릴리스(D2~D4) | 버전 범프 → CI → DMG 2종 공증 → Windows setup/zip → 홈페이지 downloads 업로드 + SHA256SUMS 갱신. **v0.14.25 는 타 레인이 이미 태그**했으므로 이 레인은 v0.14.26 |
+
+### 9.4 이 레인을 이해하려면 반드시 읽어야 할 것
+
+1. **이 문서 §3**(IPC 계약) — 무엇을 주고받는지. 실물이 이기지만, 어긋나면 그 자체가 결함이다.
+2. **이 문서 §5**(설계 규약 16조) — 여덟 라운드가 산 값이다. 새 라운드는 여기서 시작한다.
+3. **이 문서 §4.12**(master 판단 오류 3건) — 같은 함정을 다시 밟지 않기 위해.
+4. `git log --format='%n=== %h %s%n%b' c54c3b2..HEAD` — 커밋 메시지가 **경량 ADR** 이다.
+   `Constraint:`/`Rejected:`/`Directive:`/`Confidence:`/`Scope-risk:`/`Not-tested:` 트레일러에
+   "왜 그렇게 했는가"와 "무엇을 기각했는가"가 들어 있다.
+5. `src-tauri/src/main.rs` 의 `mod tests`(`:5795` 이하) — 특히 `adv1`~`adv9`(`:8116`~`:8412`).
+   **결함을 재현하던 테스트가 결함 부재를 지키는 핀으로 바뀐 자리**다.
+6. `<HOME>/.cys/lanes/shell-cli/SESSION_STATE.md` — 레인 복원 진실(§8).
+
+### 9.5 라운드를 하나 더 돌린다면
+
+라운드 규약(이 프로젝트의 것)을 그대로 따른다:
+
+```
+수리 → freeze(로컬 커밋으로 리뷰 대상 리비전 확정 · verdict 도착 전 수정 금지)
+     → 이종 판정자 2인이 그 정지한 리비전을 본다
+     → master 반박 ↔ 판정자 재반박(왕복 2회)
+     → 합당한 것만 수용(근거 없는 기각 금지)
+     → 합격 기준 미달 0 또는 10라운드에서 종료
+```
+
+★그리고 **4.12 ②의 교훈을 지켜라**: 쓰는 레인과 읽는 레인을 **동시에** 돌리지 말고, 동시에
+돌려야 한다면 **서로 다른 파일**로 갈라라. 8라운드는 그렇게 했다 — 이 문서 레인이 만진 파일은
+`docs/plans/2026-08-25-shell-cli-restore-design.md` **하나뿐**이다.
+
+## 부록 A. 관련 파일 지도 (`0b6cb24`)
+
+| 파일 | 역할 | 이 레인의 변경 |
+|---|---|---|
+| `src-tauri/src/main.rs` | 순수 판정 함수 전부 + 커맨드 3종 + `generate_handler!` 등록 + `mod tests`(`:5795` 이하) | **+4,809 / −285** |
+| `ui/index.html` | `#cc-header` 안의 `<button id="btn-install-cli" hidden>` (원 위치·원 id) | +1 |
+| `ui/src/main.ts` | 버튼 배선(invoke 호출·DOM 갱신). **판정은 하지 않는다** | +191 / −3 |
+| `ui/src/clipath.ts` | 순수 판정 — 플랫폼 노출·버튼 라벨·결과 토스트 등급·고지 문구를 **여기서만** 정한다 | **+1,015 (신규)** |
+| `ui/src/clipath.test.ts` | 계약-드리프트 가드 + 정규식 재도입 차단 + 문서 대조(doc-sync) 테스트 | **+2,107 (신규)** |
+| `ui/src/__contract__.json` | Rust 테스트가 덤프하는 계약 스냅샷. TS 게이트의 기준. **손으로 고치지 않는다** | +34 (신규) |
+| `ui/src/style.css` | `#cc-header` 오버플로 가드(I7⑤ · 이 규칙에만 손댐) | +7 |
+| `docs/INSTALL.md` | §B 설치/해제 안내 · 수동 폴백 · `INST-DENY-02` | +250 / −14 |
+| `USER-MANUAL.md` | §2.4 사용자 안내 | +22 / −3 |
+| `README.md` · `README.en.md` | §B 서술 정합(MINOR-12) | +4/−1 · +3/−1 |
+| `docs/plans/2026-06-29-cli-path-install.md` | 최초 신설 시점의 구현 계획(가드 5종 원안) | 무변경 |
+| `docs/plans/2026-08-25-shell-cli-restore-design.md` | **이 문서** — 복원 라운드의 설계 정본 | 신규 |
+| `<HOME>/.cys/lanes/shell-cli/{MASTER_TODO,SESSION_STATE}.md` | 레인 TODO·복원 진실 — **레포 밖**(§8) | 레포에서 삭제·이전 |
+
+## 부록 B. CLI PATH 계열 함수·타입 색인 (`main.rs` @ `0b6cb24`)
+
+> ★**line 번호는 이 리비전 기준이다.** 이전 판(4라운드)은 `9f47148` 기준이었고 실물과 570~930줄
+> 어긋나 있었다. 실물이 바뀌면 이 표를 **같은 커밋에서** 갱신한다(머리말의 규칙).
+
+### B.1 백업·설치 스크립트
+
+| 함수 / 타입 / 상수 | line | 책임 |
+|---|---|---|
+| `sh_squote` | 764 | 셸 작은따옴표 인용(설치·해제 공용) |
+| `applescript_str` | 771 | AppleScript 큰따옴표 문자열 리터럴(바깥 래핑 — 작은따옴표는 파스 단계 −2741 거부) |
+| `classify_bundle_dir` | 776 | 번들 위치 분류(Canonical/Translocated/Backup/NonStandard). **`autoregister_allowed` 도 쓴다 — 산탄총 수술 주의** |
+| `backup_stamp` | 1097 | epoch 초 스탬프(Rust 가 생성 — 셸 `date` 금지) |
+| `backup_path_for` | 1108 | 대상 경로 → `<경로>.cys-backup-<stamp>` (생성처 단일화) |
+| `install_backup_needed` | 1127 | (C1) 설치가 이 경로를 백업해야 하는가 — **해제와 같은 순수 함수**(`decide_cli_uninstall`)로 판정 |
+| `plan_install_backups` | 1140 | 관측된 링크 목록 → 백업 계획 `(원본, 백업본)[]` |
+| `observe_existing_backups` | 1159 | 실패 반환 **전** 백업 후보 재관측(MAJOR-N1 수리) |
+| `build_install_script` | 1203 | 승격 설치 스크립트 문자열 — `[ -e ] \|\| [ -L ]` → 우리 링크면 제외 → `mv` → `echo 마커` → `ln -sfn` |
+| `SCRIPT_PATH_PRELUDE` | 1234 | (I4) `export PATH=/usr/bin:/bin:/usr/sbin:/sbin;` — TN2065 대응. 절대경로 호출과 **둘 다** |
+| `BUNDLE_LINK_SUFFIX_CYS` / `_CYSD` | 1246 / 1248 | 우리 번들 접미사(Rust 판정용) |
+| `BUNDLE_LINK_PATTERN` | 1250 | 같은 뜻의 셸 `case` 패턴 — **설치·해제 양쪽이 이 하나를 공유**(파괴 대칭) |
+| `SHELL_PATH_NORMALIZER` | 1263 | (MAJOR-6) 셸에서도 경로 정규화 — 판정과 집행을 같은 규칙으로 |
+| `BACKUP_MARK` / `RESTORE_MARK` | 1267 / 1270 | 스크립트 자기보고 마커(I5·I3③) |
+
+### B.2 osascript 반환값 해석 (5차 BLOCK 계열)
+
+| 함수 | line | 책임 |
+|---|---|---|
+| `split_osascript_lines` | 1289 | ★`do shell script` 반환은 **CR 구분**이다. CR·CRLF·LF 를 전부 나눈다 |
+| `osascript_text_to_lf` | 1317 | 사람에게 보이기 전에 LF 로 편다 |
+| `parse_pair_markers` | 1342 | `MARK:a:b` 자기보고 → `(a, b)[]` |
+| `merge_backup_facts` | 1371 | 자기보고(사실) ∪ 재관측(계획 기반) — 설치 |
+| `merge_restored_facts` | 2728 | 같은 합집합 — 해제(계열 대칭) |
+
+### B.3 PATH 프로브 (그림자 측정)
 
 | 함수 / 타입 | line | 책임 |
 |---|---|---|
-| `sh_squote` | 764 | 셸 작은따옴표 인용(설치·해제 공용) |
-| `classify_bundle_dir` | 776 | 번들 위치 분류(Canonical/Translocated/Backup/NonStandard). **`autoregister_allowed` 도 쓴다 — 산탄총 수술 주의** |
-| `observe_existing_backups` | 1130 | 실패 반환 전 백업 후보 재관측(MAJOR-N1 수리) |
-| `build_install_script` | 1157 | 승격 설치 스크립트 문자열 생성 |
-| `parse_which_a` | 1188 | `which -a` stdout → precedence 순 절대경로 목록 |
-| `strip_data_volume_prefix` | 1306 | `/System/Volumes/Data` 접두 제거(펌링크 별칭 정규화) |
-| `strict_install_bundle_ok` | 1334 | `plan_cli_install` 전용 엄격 위치 판정(D5 · MINOR-6) |
-| `CliInstallPlan` / `plan_cli_install` | 1361 / 1368 | 설치 계획(거부 사유 포함) |
-| `run_capture_with_timeout(_in)` | 1458 / 1470 | 임시 파일 리다이렉트 기반 타임아웃 실행(MAJOR-3 수리) |
-| `WhichProbe` | 1529 | `Completed(Vec<String>)` \| `Unmeasured(String)` |
-| `InstallVerdict` / `classify_install_status` | 1546 / 1575 | status 3값 + `unverified_reason` 판정 |
-| `InstallCliReport` / `install_cli_to_path` | 1627 / 1649 | 설치 리포트 / 커맨드 |
-| `LinkProbe` | 1800 | (경로, 존재, 심링크여부, 링크대상) |
-| `UninstallAction` | 1812 | Remove / SkipAbsent / SkipNotSymlink / SkipForeignTarget |
-| `links_into_cys_bundle` | 1828 | 링크 대상이 cys.app 번들 안인가 |
-| `decide_cli_uninstall` | 1839 | 경로 1개의 해제 판정 |
-| `build_uninstall_script` | 1865 | 승격 해제 스크립트(집행 직전 재검증 포함 — MAJOR-2 수리) |
-| `CliUninstallPlan` / `plan_cli_uninstall` | 1883 / 1890 | 해제 계획(+ `osascript_arg: Option` — None 이면 승격 안 띄움) |
-| `classify_cli_links` | 1947 | absent / ours / partial / foreign |
-| `probe_link` | 1973 | 파일시스템 얇은 래퍼(순수부와 분리) |
-| `UninstallCliReport` / `uninstall_cli_from_path` | 1995 / 2009 | 해제 리포트 / 커맨드 |
-| `CliInstallStatusReport` / `cli_install_status` | 2067 / 2085 | 상태 리포트 / 읽기전용 커맨드 |
+| `parse_which_a` | 1403 | ★시그니처 변경됨: `(stdout, begin, end) -> Result<Vec<String>, String>`. **두 표식 사이의 줄만** 채택하고, 표식이 없거나 순서가 어긋나면 **측정 실패**(C4) |
+| `PROBE_BEGIN_MARK` / `_END_MARK` | 1443 / 1445 | cys 축 구간 표식 |
+| `PROBE_BEGIN_MARK_D` / `_END_MARK_D` | 1449 / 1451 | cysd 축 구간 표식(C5) |
+| `which_probe_command` | 1458 | 프로브 명령 조립(begin echo → which -a → end echo, cys·cysd 양축) |
+| `interpret_which_probe` | 1477 | 종료 상태 + 표식 완주 여부 → `WhichProbe` |
+| `WhichProbePair` | 1499 | cys 축 · cysd 축 두 결과 묶음 |
+| `observe_probe_paths` | 1509 | 채택 경로가 실제로 파일인지 재관측(adv1 가짜 그림자 경화) |
+| `probe_fallback_shell` | 1529 | `$SHELL` 이 `-lc` 를 못 받는 계열(csh/tcsh)이면 폴백 셸 |
+| `run_which_probe` | 1546 | 셸 1회 실행 + 해석 |
+| `ShadowProbe` | 1585 | `{ cys, cysd, shell_name }` |
+| `probe_path_shadows` | 1593 | ★설치·상태 조회가 **같이 쓰는** 관측 헬퍼(G4). 기한 5초 · 폴백 재시도 포함 최대 10초 |
+| `run_capture_with_timeout(_in)` | 1949 / 1961 | 임시 파일 리다이렉트 기반 타임아웃 실행(MAJOR-3 수리 — 파이프·드레인 스레드 없음) |
+| `WhichProbe` | 2020 | `Completed(Vec<String>)` \| `Unmeasured(String)` |
+
+### B.4 경로 정규화 · 위치 판정
+
+| 함수 | line | 책임 |
+|---|---|---|
+| `strip_data_volume_prefix` | 1698 | APFS 펌링크 별칭 `/System/Volumes/Data` 접두 제거(MINOR-N8). `realpath` 로는 안 풀린다 |
+| `normalize_path_str` | 1723 | 연속 슬래시 축약 + 후행 슬래시 제거(I1 · adv2) |
+| `paths_equivalent` | 1745 | 위 둘을 적용한 경로 동일성 판정 — **설치·해제·상태 조회 세 경로 공통** |
+| `same_file_ident` | 1762 | `(dev, ino)` 동일성 이중 확인 |
+| `canonicalize_probe_to_target` | 1788 | 프로브 결과를 target 표기로 수렴 |
+| `strict_install_bundle_ok` | 1821 | `plan_cli_install` 전용 엄격 위치 판정(D5 · MINOR-6). `/Applications` 또는 `<홈>/Applications` 정확 일치 |
+| `install_failure_message` | 1674 | 실패 문구 + "실패 전에 이미 옮겨진 파일" 목록 |
+
+### B.5 설치 계획·등급 판정·커맨드
+
+| 함수 / 타입 | line | 책임 |
+|---|---|---|
+| `CliInstallPlan` / `plan_cli_install` | 1851 / 1859 | 설치 계획(거부 사유 4종 포함 — §3.1.4) |
+| `UNVERIFIED_NOT_ON_PATH` / `_PROBE_FAILED` | 2030 / 2033 | `unverified_reason` enum 상수(계약 v2) |
+| `InstallVerdict` / `classify_install_status` | 2037 / 2066 | status 3값 + `unverified_reason` 판정(순수) |
+| `cysd_shadow_warning` | 2137 | (C5) cysd 그림자 경고. 측정 실패에는 침묵(G3 — 같은 사실 두 번 말하지 않는다) |
+| `path_shadow_note` | 2172 | cys 축 고지 문장 |
+| `InstallCliReport` | 2196 | 설치 리포트(필드 10 — §3.1) |
+| `install_cli_to_path` | 2223 | ★`async fn` 커맨드 |
+
+### B.6 해제 판정·복원·커맨드
+
+| 함수 / 타입 / 상수 | line | 책임 |
+|---|---|---|
+| `LinkProbe` | 2361 | (경로, 존재, 심링크 여부, 링크 대상) — **판정부는 이 값만 본다**(dangling 대응) |
+| `UninstallAction` | 2373 | `Remove` / `SkipAbsent` / `SkipNotSymlink` / `SkipForeignTarget` |
+| `links_into_cys_bundle` | 2394 | 링크 대상이 cys.app 번들 안인가(`ends_with` — 셸 `case` 와 같은 뜻) |
+| `decide_cli_uninstall` | 2404 | 경로 1개의 해제 판정(순수) — **설치의 백업 판정도 이것을 쓴다**(C1) |
+| `build_uninstall_script` | 2440 | 승격 해제 스크립트: 집행 직전 재검증(`-L` + `readlink` 대조 — MAJOR-2) + 복원 `mv`(I3③) |
+| `is_our_backup_name` | 2467 | `<base>.cys-backup-<숫자>` 정확 일치만 우리 것 |
+| `pick_restore_backup` | 2479 | 여러 개면 **스탬프 최대(최신)** |
+| `observe_leftover_backups` | 2512 | `/usr/local/bin` 잔존 백업본 관측 → `backups` 필드 |
+| `CliUninstallPlan` | 2535 | 해제 계획(+ `osascript_arg: Option` — `None` 이면 승격 안 띄움) |
+| `SKIP_REASON_ABSENT` / `_NOT_SYMLINK` / `_FOREIGN_TARGET` | 2555 / 2557 / 2559 | `skipped_reasons` enum 상수(C3) |
+| `skip_reason_tag` | 2563 | 판정 → 기계 태그 |
+| `all_skips_benign` | 2575 | `skipped_benign` 판정 — **해제 등급의 유일 계약** |
+| `plan_cli_uninstall` | 2582 | 해제 계획(+ 복원 후보) |
+| `uninstall_failure_message` | 2650 | 실패 문구 + 이미 제거된 것 / 이미 되돌린 것 / 아직 남은 것(C2) |
+| `observe_removed` | 2687 | 계획 대상 재관측 → (사라진 것, 남은 것). 복원된 자리는 '사라진 것' |
+| `observe_restored` | 2709 | 복원 계획 재관측 |
+| `UninstallCliReport` | 2812 | 해제 리포트(필드 7 — §3.2) |
+| `uninstall_cli_from_path` | 2842 | ★`async fn` 커맨드 |
+
+### B.7 상태 조회
+
+| 함수 / 타입 | line | 책임 |
+|---|---|---|
+| `CliLinkState` | 2742 | `Absent` / `Ours` / `Partial` / `Foreign` |
+| `classify_cli_links` | 2754 | 두 축 판정 → 상태(순수) |
+| `probe_link` | 2791 | 파일시스템 얇은 래퍼(`symlink_metadata`·`read_link`) — 순수부와 분리 |
+| `CliInstallStatusReport` | 2969 | 상태 리포트(필드 7 — §3.3) |
+| `cli_install_status` | 3018 | ★`async fn` 읽기전용 커맨드. `Err` 를 한 번도 반환하지 않는다 |
+
+### B.8 테스트 쪽 앵커
+
+| 이름 | line | 책임 |
+|---|---|---|
+| `mod tests` 시작 | 5795 | `#[cfg(test)]` — 파일 전체 `#[test]` **102개** |
+| `major1_premise_partial_with_notes_does_not_imply_foreign_present` | 7671 | 7차에서 **워커가 master 판정 규칙을 반증**한 4단 증명(4.12 ③) |
+| `adv1`~`adv9` | 8116 · 8151 · 8171 · 8226 · 8277 · 8328 · 8353 · 8379 · 8412 | 적대적 재현 → 결함 부재 회귀핀(4.7 표) |
+| `dump_report_contract_for_the_ui_gate` | 8731 | I6 계약 덤프 — `ui/src/__contract__.json` 을 **쓴 뒤** 자기 점검(§3.4) |
+
+### B.9 UI 쪽 앵커 (`ui/src/clipath.ts` @ `0b6cb24`)
+
+| 이름 | line | 책임 |
+|---|---|---|
+| `CliInstallStatus` 타입 | 129 | `"installed" \| "installed_shadowed" \| "unverified"` |
+| `str` / `strOrNull` / `strList` | 148 / 151 / 154 | 판독기 원시 변환 — **모르면 안전한 쪽으로 접는다** |
+| `readInstallReport` | 160 | 설치 리포트 판독기 |
+| `normalizeInstallStatus` | 183 | 계약 밖 값·누락 → `"unverified"` |
+| `unverifiedCause` | 210 | `unverified_reason` → `"not_on_path"`\|`"probe_failed"`\|`"unknown"` |
+| `installResultToast` | 276 | 설치 결과 → 토스트 등급(installed + warnings 0 만 ✅/volatile) |
+| `CliLinkState` 타입 / `LINK_STATES` | 376 / 405 | `state` enum + 계약 밖 값 방어 |
+| `readCliStatus` | 410 | 상태 리포트 판독기 |
+| `cliButtonView` | 492 | 버튼 라벨·활성 판정 |
+| `cliNoticeLines` | 630 | 고지 줄 조립 |
+| `NOTICE_TITLE_FOREIGN` / `_BACKUP` / `_INFO` / `_PARTIAL` | 676 / 677 / 678 / 680 | 상태 알림 제목 **네 갈래**(7차 MAJOR-1 이 `_PARTIAL` 을 신설) |
+| `statusNoticeKind` | 720 | 어느 제목을 낼지 판정 — `silent`\|`foreign`\|`partial`\|`backup`\|`info` |
+| `readUninstallReport` | 876 | 해제 리포트 판독기 |
+| `uninstallResultToast` | 933 | 해제 결과 → 토스트 등급(`ok` + `skipped_benign` 둘만 본다) |

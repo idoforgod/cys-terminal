@@ -35,6 +35,7 @@ import {
   withCliNotice,
   CLI_NOTICE_HEADING,
   partitionSkips,
+  SKIP_REASON_ABSENT,
   statusNoticePlan,
   statusNoticeKind,
   backupRestoreSpot,
@@ -382,6 +383,273 @@ describe("판독기 — 응답을 있는 그대로 옮기되 미상은 안전한
     const r = readUninstallReport(uninstallReport({ skipped: [SKIP_FOREIGN], warnings: [WARN_LEFTOVER] }));
     expect(r.skipped).toEqual([SKIP_FOREIGN]);
     expect(r.warnings).toEqual([WARN_LEFTOVER]);
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-2(2026-08-25 8R) — 판독기 **관통** 시험: 기계 필드가 사용자 문구까지 살아 도착하는가
+// ══════════════════════════════════════════════════════════════════════════════
+// 전 라운드 반증자 실측: `readInstallReport` 의 `unverified_reason` 을 상수 `null` 로,
+// `readUninstallReport` 의 `restored` 를 상수 `[]` 로 개악해도 **201/201 초록**이었다. 즉
+// MINOR-9(unverified 두 갈래)·I3③(해제 시 원본 복원)을 "닫았다"고 선언한 수리가 회귀로부터
+// 전혀 보호되지 않았다.
+//
+// 원인은 셋이 겹친 것이다:
+//   ① 모든 문구 테스트가 픽스처(**이미 타입이 맞는 객체**)를 UI 함수에 직접 먹여 판독기를 우회했다.
+//   ② 위 "판독기" describe 는 shadowed_by·status·ok·skipped·warnings 몇 개만 덮었다.
+//   ③ expectShape 는 **키 존재와 타입 태그**만 보므로 `null`·`[]` 도 계약을 만족해 통과한다.
+//
+// 그래서 이 블록의 규칙은 하나다 — **입력은 raw(unknown), 출력은 사용자에게 나가는 문자열**이다.
+// 중간에 픽스처를 UI 함수로 직접 넘기지 않는다. 판독기의 한 줄을 죽이면 여기가 먼저 빨개진다.
+//
+// ★전 필드 전수표(이 diff 가 만든 기계 필드 19종 · (리포트, 필드) 쌍으로는 24개):
+//
+//   InstallCliReport      status ✔관통 / unverified_reason ✔관통 / shadowed_by ✔관통 /
+//                         cys_link ✔관통 / cysd_link ✔관통 / warnings ✔관통 /
+//                         ok ▲판독기보존만(UI 소비처 없음 — 등급은 status 가 정한다) /
+//                         target_dir ▲ / source_cys ▲ / effective_cys ▲ (셋 다 UI 소비처 0)
+//   UninstallCliReport    ok ✔ / removed ✔ / skipped ✔ / skipped_benign ✔ / restored ✔ /
+//                         warnings ✔ / skipped_reasons ✔(단 **두 기계 신호가 어긋날 때만**
+//                         화면이 달라진다 — 그 갈래를 그대로 못박는다)
+//   CliInstallStatusReport platform_supported ✔ / installed ✔ / state ✔ / notes ✔ /
+//                         backups ✔ / cys_link ✔(해제 결과의 'sudo rm' 조립) / cysd_link ✔
+//
+//   ▲ 표시 넷은 **화면에 닿지 않는다**(ui/src 전역 grep 0건). 그 사실을 숨기지 않고, 대신
+//     '판독기가 값을 옮긴다'를 양방향으로 못박는다 — 화면 문구를 지어내 관통을 흉내 내면 그것이
+//     곧 장식 테스트이기 때문이다. 소비처가 생기는 날 이 자리에 관통 단언을 더한다.
+
+/// raw(unknown) → **판독기** → 설치 결과 토스트의 사용자 노출면 전체. 픽스처를 UI 에 직접 주지 않는다.
+const installText = (raw: unknown) => {
+  const p = installResultToast(readInstallReport(raw));
+  return [p.title, p.body, `category=${p.category}`, `sticky=${p.sticky}`].join("\n");
+};
+/// raw(unknown) → **판독기** → 해제 결과 토스트의 사용자 노출면 전체.
+const uninstallText = (raw: unknown, links: readonly string[] = CLI_LINKS) => {
+  const p = uninstallResultToast(readUninstallReport(raw), links);
+  return [p.title, p.body, `category=${p.category}`, `sticky=${p.sticky}`].join("\n");
+};
+/// raw(unknown) → **판독기** → 상태 조회가 만드는 표면 셋(상시 고지 토스트 · 버튼 라벨 · 툴팁).
+/// main.ts 의 배선 그대로다: statusNoticePlan(cliStatus) · cliButtonView(button, cliNoticeLines(...)).
+const statusText = (raw: unknown) => {
+  const v = readCliStatus(raw);
+  const n = statusNoticePlan(v);
+  const b = cliButtonView(v.button, cliNoticeLines(v), null);
+  return [
+    n ? [n.title, n.body, `category=${n.category}`].join("\n") : "(무음)",
+    `label=${b.label}`,
+    b.title,
+    `supported=${v.supported}`,
+  ].join("\n");
+};
+
+describe("★MAJOR-2 관통 — InstallCliReport 의 기계 필드가 설치 토스트까지 도착한다", () => {
+  it("status — 세 종단이 각자의 제목으로 갈린다(판독기가 status 를 접으면 전부 '확인 불가'로 무너진다)", () => {
+    expect(installText(installReport())).toContain("✅ 셸 설치 완료");
+    expect(
+      installText(installReport({ ok: false, status: "installed_shadowed", shadowed_by: "/opt/homebrew/bin/cys" })),
+    ).toContain("다른 cys가 앞을 가립니다");
+    expect(installText(installReport({ ok: false, status: "unverified", unverified_reason: "probe_failed" }))).toContain(
+      "⚠ 셸 설치 확인 불가",
+    );
+  });
+
+  it("★unverified_reason — 두 갈래가 서로 다른 문구로 나간다(MINOR-9/N3 의 회귀 자물쇠)", () => {
+    const notOnPath = installText(
+      installReport({ ok: false, status: "unverified", unverified_reason: "not_on_path", effective_cys: null, warnings: [WARN_NOT_ON_PATH] }),
+    );
+    // 원인이 특정된 갈래 — 제목이 원인을 말하고, 본문이 **읽히는 프로필 파일**을 지목한다.
+    expect(notOnPath).toContain("PATH에서 cys를 찾지 못했습니다");
+    expect(notOnPath).toContain(LOGIN_SHELL_PATH_FILES);
+    // 원인 불명 갈래로 떨어지면 이 문장이 나온다 — 그것이 곧 판독기가 필드를 버렸다는 증거다.
+    expect(notOnPath).not.toContain("어느 쪽인지는 단정하지 않습니다");
+
+    const probeFailed = installText(
+      installReport({ ok: false, status: "unverified", unverified_reason: "probe_failed", effective_cys: null, warnings: [WARN_PROBE_FAILED] }),
+    );
+    expect(probeFailed).toContain("확인 명령(which -a cys)이 실패했거나 비정상 종료·무응답이라");
+    expect(probeFailed).not.toContain("어느 쪽인지는 단정하지 않습니다");
+
+    // 그리고 **정말로 없을 때만** 원인 불명 문구가 나온다(구 백엔드 = 필드 부재).
+    expect(installText(installReport({ ok: false, status: "unverified", unverified_reason: null }))).toContain(
+      "어느 쪽인지는 단정하지 않습니다",
+    );
+  });
+
+  it("shadowed_by — 경로가 본문의 파괴적 지시에 들어간다(판독기가 버리면 '(경로 미상)' 로 무너진다)", () => {
+    const t = installText(
+      installReport({ ok: false, status: "installed_shadowed", shadowed_by: "/opt/homebrew/bin/cys", effective_cys: "/opt/homebrew/bin/cys" }),
+    );
+    expect(t).toContain("그 파일(/opt/homebrew/bin/cys)을 지우거나");
+    expect(t).not.toContain("(경로 미상)");
+  });
+
+  it("cys_link · cysd_link — 만들어진 링크 두 경로가 본문에 그대로 나온다", () => {
+    const t = installText(installReport({ cys_link: "/usr/local/bin/cys", cysd_link: "/usr/local/bin/cysd" }));
+    expect(t).toContain("/usr/local/bin/cys · /usr/local/bin/cysd");
+    // 한쪽만 버려도 이 단언이 깨진다(빈 문자열은 filter(Boolean) 에서 사라져 ' · ' 가 없어진다).
+  });
+
+  it("warnings — 백엔드 문장이 한 글자도 줄지 않고 도착하고, 등급까지 낮춘다(G14)", () => {
+    const t = installText(installReport({ warnings: [WARN_BACKUP] }));
+    expect(t).toContain(WARN_BACKUP);
+    expect(t).toContain("⚠ 셸 설치 완료 — 확인할 항목이 있습니다"); // ✅ 안에 ⚠ 가 숨지 않는다
+    expect(t).toContain("sticky=true");
+    // 판독기가 warnings 를 버리면 여기로 무너진다.
+    expect(t).not.toContain("✅ 셸 설치 완료\n");
+  });
+
+  it("▲ok — UI 소비처가 없다(등급은 status 가 정한다). 그래서 관통 대신 **양방향 보존**을 못박는다", () => {
+    // 판독기의 계약은 '있는 그대로 옮긴다' 다 — status 로 다시 계산해 덮지 않는다(둘이 어긋나면
+    // 그 사실이 보여야 한다). 상수로 접는 개악은 둘 중 하나에서 반드시 빨개진다.
+    expect(readInstallReport(installReport({ ok: true, status: "installed" })).ok).toBe(true);
+    expect(readInstallReport(installReport({ ok: false, status: "installed" })).ok).toBe(false);
+  });
+
+  it("▲target_dir · source_cys · effective_cys — UI 소비처 0. 판독기 보존만 못박는다(관통 문구 없음)", () => {
+    const r = readInstallReport(
+      installReport({ target_dir: "/usr/local/bin", source_cys: "/Applications/cys.app/Contents/MacOS/cys", effective_cys: "/usr/local/bin/cys" }),
+    );
+    expect({ target_dir: r.target_dir, source_cys: r.source_cys, effective_cys: r.effective_cys }).toEqual({
+      target_dir: "/usr/local/bin",
+      source_cys: "/Applications/cys.app/Contents/MacOS/cys",
+      effective_cys: "/usr/local/bin/cys",
+    });
+    // Option<String> 의 None 쪽도 옮긴다(빈 문자열로 뭉개지 않는다 — 없음과 ''는 다른 사실이다).
+    expect(readInstallReport(installReport({ effective_cys: null })).effective_cys).toBe(null);
+  });
+});
+
+describe("★MAJOR-2 관통 — UninstallCliReport 의 기계 필드가 해제 토스트까지 도착한다", () => {
+  const CYS = "/usr/local/bin/cys";
+  const CYSD = "/usr/local/bin/cysd";
+
+  it("ok — 등급의 근본 신호. 참/거짓이 서로 다른 제목으로 나간다", () => {
+    expect(uninstallText(uninstallReport({ ok: true, removed: [CYS, CYSD] }))).toContain("✅ 셸 cys 해제 완료");
+    expect(uninstallText(uninstallReport({ ok: false, removed: [CYS] }))).toContain("⚠ 셸 cys 해제 부분 완료");
+  });
+
+  it("removed — 지운 경로가 본문에 나온다(버리면 '지운 것이 없습니다' 로 무너진다)", () => {
+    const t = uninstallText(uninstallReport({ ok: true, removed: [CYS, CYSD] }));
+    expect(t).toContain(`${CYS} · ${CYSD} 를 제거했습니다`);
+    expect(t).not.toContain("해제할 심링크 없음");
+  });
+
+  it("skipped — 건너뛴 줄이 **원문 그대로** 나오고 등급을 낮춘다", () => {
+    const t = uninstallText(
+      uninstallReport({ ok: true, removed: [CYS], skipped: [SKIP_NOT_SYMLINK], skipped_reasons: ["not_symlink"], skipped_benign: false }),
+    );
+    expect(t).toContain("건너뜀 1건 — 직접 확인하세요:");
+    expect(t).toContain(SKIP_NOT_SYMLINK);
+    expect(t).toContain("category=watchdog");
+  });
+
+  it("★skipped_benign — 같은 skip 이 이 bool 하나로 성공/부분완료를 가른다(양방향)", () => {
+    const base = { ok: true, removed: [CYS], skipped: [SKIP_ABSENT], skipped_reasons: [SKIP_REASON_ABSENT] };
+    // true = '애초에 지울 게 없었다' → 정상 해제(✅) + 괄호 안내
+    const benign = uninstallText(uninstallReport({ ...base, skipped_benign: true }));
+    expect(benign).toContain("✅ 셸 cys 해제 완료");
+    expect(benign).toContain("(이미 없던 항목:");
+    // false = '무해하다고 말할 수 없다' → 조치 필요(⚠). 판독기가 bool 을 상수로 접으면 한쪽이 깨진다.
+    const attention = uninstallText(uninstallReport({ ...base, skipped_benign: false }));
+    expect(attention).toContain("⚠ 셸 cys 해제 부분 완료");
+    expect(attention).toContain("건너뜀 1건");
+  });
+
+  it("★skipped_reasons — 줄별 태그. **두 기계 신호가 어긋날 때** 화면이 갈린다(fail-closed 갈래)", () => {
+    // 계약대로면 benign=true 는 '모든 skip 이 absent' 다. 그 둘이 어긋난 응답(= 계약 위반·구
+    // 백엔드)에서, 줄별 태그가 살아 있으면 foreign_target 한 줄이 blocking 으로 잡혀 ⚠ 가 된다.
+    // 태그를 버리면 partitionSkips 가 bool 하나에 맡기고 **정상 해제(✅)로 둔갑**한다 — 그 회귀를
+    // 여기서 잡는다. (태그가 성립하는 정상 응답에서는 두 신호가 같은 답을 내므로 화면이 같다.)
+    const t = uninstallText(
+      uninstallReport({
+        ok: true,
+        removed: [CYS],
+        skipped: [SKIP_ABSENT, SKIP_FOREIGN],
+        skipped_reasons: [SKIP_REASON_ABSENT, "foreign_target"],
+        skipped_benign: true,
+      }),
+    );
+    expect(t).toContain("⚠ 셸 cys 해제 부분 완료");
+    expect(t).toContain(SKIP_FOREIGN);
+    expect(t).not.toContain("✅ 셸 cys 해제 완료");
+  });
+
+  it("★restored — '되돌린 원본'이 문구까지 도착한다(I3③ 의 회귀 자물쇠)", () => {
+    const ok = uninstallText(uninstallReport({ ok: true, removed: [CYS], restored: [CYS], warnings: [WARN_RESTORED] }));
+    expect(ok).toContain("설치 때 백업해 둔 원본 1건을 그 자리에 되돌렸습니다");
+    // 부분 완료 갈래에도 별도 줄로 나간다(실패 알림만 덜 말하지 않는다 — G1 대칭).
+    const partial = uninstallText(
+      uninstallReport({ ok: false, removed: [CYS], restored: [CYS], skipped: [SKIP_FOREIGN], skipped_reasons: ["foreign_target"], skipped_benign: false }),
+    );
+    expect(partial).toContain(`되돌린 원본: ${CYS}`);
+  });
+
+  it("warnings — 성공 등급이라도 문장이 그대로 나가고 수명이 sticky 로 올라간다", () => {
+    const t = uninstallText(uninstallReport({ ok: true, removed: [CYS], restored: [CYS], warnings: [WARN_RESTORED] }));
+    expect(t).toContain("남은 조치·안내:");
+    expect(t).toContain(WARN_RESTORED);
+    expect(t).toContain("sticky=true");
+  });
+});
+
+describe("★MAJOR-2 관통 — CliInstallStatusReport 의 기계 필드가 고지·라벨까지 도착한다", () => {
+  it("platform_supported — Rust 의 명시 부정만 버튼을 되숨긴다(main.ts `if (!cliStatus.supported)`)", () => {
+    expect(statusText(statusReport({ platform_supported: false }))).toContain("supported=false");
+    expect(statusText(statusReport())).toContain("supported=true");
+    // 판독 실패(응답 없음)로는 숨기지 않는다 — 기능이 조용히 사라지는 쪽이 더 나쁘다.
+    expect(readCliStatus(undefined).supported).toBe(true);
+  });
+
+  it("installed — 버튼 라벨이 이 bool 하나로 뒤집힌다", () => {
+    expect(statusText(statusReport({ installed: true, state: "ours" }))).toContain("label=셸 cys 해제");
+    expect(statusText(statusReport({ installed: false, state: "absent" }))).toContain("label=셸에 cys 설치");
+  });
+
+  it("★state — 상시 고지의 **제목(=등급 표시)** 이 이 문자열 하나로 갈린다(MAJOR-D · MAJOR-1)", () => {
+    const foreign = statusText(statusReport({ state: "foreign", notes: [NOTE_NOT_SYMLINK] }));
+    expect(foreign).toContain(NOTICE_TITLE_FOREIGN);
+    const partial = statusText(statusReport({ state: "partial", installed: true, notes: [NOTE_NOT_SYMLINK] }));
+    expect(partial).toContain(NOTICE_TITLE_PARTIAL);
+    expect(partial).toContain("category=watchdog");
+    // 판독기가 state 를 "unknown" 으로 접으면 둘 다 중립 제목으로 강등된다 — 그 회귀를 잡는다.
+    expect(foreign).not.toContain(NOTICE_TITLE_INFO);
+    expect(partial).not.toContain(NOTICE_TITLE_INFO);
+  });
+
+  it("★state — 백업 되돌리기 명령을 **낼지 말지**도 이 필드가 정한다(파괴적 지시 게이트)", () => {
+    const free = statusText(statusReport({ state: "absent", backups: [BACKUP_PATH] }));
+    expect(free).toContain(`되돌리려면 'sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys'`);
+    expect(free).not.toContain("ls -l");
+    const occupied = statusText(statusReport({ state: "ours", installed: true, backups: [BACKUP_PATH] }));
+    expect(occupied).toContain("손으로 옮길 수 없습니다");
+    expect(occupied).not.toContain("sudo mv");
+  });
+
+  it("notes — Rust 산문이 고지 토스트와 버튼 툴팁 **양쪽**에 그대로 도착한다(BLOCK-1(d))", () => {
+    const t = statusText(statusReport({ notes: [NOTE_NOT_SYMLINK] }));
+    expect(t).not.toContain("(무음)");
+    // 두 표면이 같은 문장을 말한다 — 토스트는 60초 뒤 사라지고 툴팁은 상주하므로 둘 다 필요하다.
+    // 개수를 못박지 않는다(표면이 늘어도 거짓 실패를 내지 않게) — '둘 다 도달했는가'만 본다.
+    expect({ 두_표면_모두_도달: t.split(NOTE_NOT_SYMLINK).length - 1 >= 2 }).toEqual({ 두_표면_모두_도달: true });
+  });
+
+  it("backups — 잔존 백업 경로가 UI 조립 문구로 도착한다(I3① · 무음 규약을 깬다)", () => {
+    const t = statusText(statusReport({ state: "absent", backups: [BACKUP_PATH] }));
+    expect(t).toContain(NOTICE_TITLE_BACKUP);
+    expect(t).toContain(BACKUP_PATH);
+    // 버리면 notes 도 없으니 무음(null) 이 되어 사용자는 자기 원본의 행방을 영영 듣지 못한다.
+    expect(statusText(statusReport())).toContain("(무음)");
+  });
+
+  it("★cys_link · cysd_link — 해제 결과의 'sudo rm <경로>' 조립 후보가 여기서 온다(R1 배선)", () => {
+    // main.ts: uninstallResultToast(rep, [cliStatus.cysLink, cliStatus.cysdLink]) — 두 값이 판독기를
+    // 통과해야 복구 명령이 만들어진다. 판독기가 버리면 후보가 사라져 안내가 통째로 없어진다.
+    const v = readCliStatus(statusReport({ installed: true, state: "ours" }));
+    const t = uninstallText(uninstallReport({ ok: false, skipped_benign: true, warnings: [WARN_LEFTOVER] }), [v.cysLink, v.cysdLink]);
+    expect(t).toContain("아직 남아 있는 링크 2건");
+    expect(t).toContain("'sudo rm /usr/local/bin/cys'");
+    expect(t).toContain("'sudo rm /usr/local/bin/cysd'");
   });
 });
 
@@ -2033,11 +2301,45 @@ describe("★MINOR-5 — 화면과 docs/INSTALL.md 가 같은 말을 하는지 �
 // 예전에는 그 한 줄을 아무도 지키지 않았고, 대신 소비되지 않는 ToastEmit.className 이 "계획이
 // 등급색을 정한다"는 거짓 계약만 세워 두었다. 필드를 지운 자리에 **진짜 핀**을 박는다.
 const MAIN_SRC = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+/// ★(MINOR · 2026-08-25 8R) 핀은 **주석을 걷어낸 코드**만 본다.
+///
+/// 반증자 실측: `refreshCliInstallState({ notice: false })` 와 `showCliToast(withCliNotice(…))`
+/// 배선을 지우면서 그 줄을 `// was: …` 주석으로 남기자, G2 계약(한 액션에 한 알림)이 실제로
+/// 깨졌는데도 201/201 초록이었다. 'was:' 주석은 실제 리팩터에서 흔한 형태이므로 이 우회는
+/// 가정이 아니다. 같은 파일이 clipath.ts 쪽에서는 이미 CLIPATH_CODE 로 주석을 걷고 검사하면서
+/// main.ts 계열 핀 7개에만 그 처리를 하지 않은 **비대칭**이었다 — 자리를 하나로 맞춘다.
+///
+/// (한 줄짜리 블록 주석만 걷는다: main.ts 의 `/* … */` 는 실측상 전부 한 줄이고, 여러 줄을 걷는
+///  정규식은 문자열·정규식 리터럴을 삼키는 사고를 만들 수 있다.)
+///
+/// ★그리고 **줄 끝 주석까지** 걷는다. 전줄 주석만 걷던 첫 판은 변이시험에서 살아남았다:
+///   `refreshCliInstallState(), // was: refreshCliInstallState({ notice: false, force: true }),`
+/// 처럼 지운 배선을 **같은 줄 뒤에** 남기면 바늘이 주석 안에서 발견돼 초록이었다. 그것이 실제
+/// 리팩터에서 가장 흔한 형태이므로, 그 자리를 열어 두면 가드가 아니라 장식이다.
+///
+/// `//` 를 주석으로 볼지는 **따옴표 밖인지**로 판정한다(문자열 속 `https://` 오탐 방지):
+/// 앞부분의 홑·겹따옴표·백틱 개수가 각각 짝수여야 코드 문맥으로 본다. 그리고 `//` 바로 앞이
+/// 공백이어야 한다 — `://`·정규식의 `\/\/` 를 주석으로 오인하지 않기 위해서다.
+function stripLineComment(line: string): string {
+  for (let i = 0; i < line.length - 1; i++) {
+    if (line[i] !== "/" || line[i + 1] !== "/") continue;
+    const head = line.slice(0, i);
+    const even = (c: string) => (head.split(c).length - 1) % 2 === 0;
+    if (!even('"') || !even("'") || !even("`")) continue; // 문자열 안 — 코드가 아니다
+    if (i > 0 && !/\s/.test(line[i - 1] as string)) continue; // `://`·`\/\/` 오탐 방지
+    return head;
+  }
+  return line;
+}
+const MAIN_CODE = MAIN_SRC.replace(/\/\*[^\n]*?\*\//g, "")
+  .split("\n")
+  .map(stripLineComment)
+  .join("\n");
 function mainFnBody(name: string): string {
-  const i = MAIN_SRC.indexOf(`function ${name}(`);
+  const i = MAIN_CODE.indexOf(`function ${name}(`);
   expect({ 함수: name, 존재: i >= 0 }).toEqual({ 함수: name, 존재: true });
-  const end = MAIN_SRC.indexOf("\n}\n", i);
-  return MAIN_SRC.slice(i, end > i ? end + 3 : undefined);
+  const end = MAIN_CODE.indexOf("\n}\n", i);
+  return MAIN_CODE.slice(i, end > i ? end + 3 : undefined);
 }
 
 /// 거대 소스(383KB)를 단언에 **직접** 넣으면 실패 출력이 그 전체를 토해 낸다(실측: 389KB).
@@ -2061,15 +2363,19 @@ describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => 
   it("(N4) stickyToast 는 낼 때마다 className 을 현재 등급으로 다시 못박는다(재사용 엘리먼트)", () => {
     pinHas("stickyToast", mainFnBody("stickyToast"), "el.className = toastClassName(category)");
   });
-  it("volatile toast() 도 같은 함수로 등급색을 정한다(단일 진실)", () => {
-    pinHas("toast", mainFnBody("toast"), "toastClassName(category)");
+  it("volatile toast() 도 같은 함수로 등급색을 **대입**한다(단일 진실)", () => {
+    // ★(MINOR · 8R) 예전 바늘은 `"toastClassName(category)"` 였다 — 함수 본문에 그 문자열이
+    // 있기만 하면 통과했다. 반증자 실측: `el.className = "toast"; void toastClassName(category);`
+    // 로 등급색(테두리색 = 등급을 표시하는 유일한 장치)을 완전히 파괴해도 초록이었다.
+    // 형제 핀(stickyToast)은 처음부터 대입을 검사하고 있었으므로, 이쪽만 절반의 거짓이었다.
+    pinHas("toast", mainFnBody("toast"), "el.className = toastClassName(category)");
   });
   it("(I7) main.ts 가 사라진 emit.className 을 참조하지 않는다", () => {
-    pinLacks("main.ts", MAIN_SRC, "emit.className");
+    pinLacks("main.ts", MAIN_CODE, "emit.className");
   });
   it("(I2) 클릭 분기가 cliStatus.button 이 아니라 cliButtonIntent 를 쓴다(라벨과 행동 일치)", () => {
-    pinHas("main.ts", MAIN_SRC, 'cliButtonIntent(cliStatus.button, cliLastInstall) === "uninstall"');
-    pinLacks("main.ts", MAIN_SRC, 'const wantUninstall = cliStatus.button === "installed"');
+    pinHas("main.ts", MAIN_CODE, 'cliButtonIntent(cliStatus.button, cliLastInstall) === "uninstall"');
+    pinLacks("main.ts", MAIN_CODE, 'const wantUninstall = cliStatus.button === "installed"');
   });
   it("(I2) 라벨 산출도 같은 래치를 먹는다(툴팁·라벨과 클릭 분기가 한 판정에서 나온다)", () => {
     pinHas("applyCliButtonView", mainFnBody("applyCliButtonView"), "cliButtonView(cliStatus.button, cliNoticeLines(cliStatus), cliLastInstall)");
@@ -2080,21 +2386,21 @@ describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => 
   it("(I3②) 해제 확인 문구에 현재 상태(notes)와 잔존 백업(backups)을 함께 넘긴다", () => {
     pinHas(
       "main.ts",
-      MAIN_SRC,
+      MAIN_CODE,
       "uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState)",
     );
   });
 
   // ★G2 — 한 액션에 한 알림. 배선이 본체라 여기에 핀을 박는다(순수 함수만으로는 못 지킨다).
   it("(G2) 액션 직후 재조회는 상시 고지 토스트를 내지 않는다", () => {
-    pinHas("main.ts", MAIN_SRC, "refreshCliInstallState({ notice: false })");
+    pinHas("main.ts", MAIN_CODE, "refreshCliInstallState({ notice: false, force: true })");
   });
   it("(G2) 결과 토스트 하나에 고지 줄을 접어 넣는다(cli-install 과 cli-status-notes 가 겹치지 않는다)", () => {
-    pinHas("main.ts", MAIN_SRC, "showCliToast(withCliNotice(plan, cliNoticeLines(cliStatus)))");
+    pinHas("main.ts", MAIN_CODE, "showCliToast(withCliNotice(plan, cliNoticeLines(cliStatus)))");
   });
   it("(G2) 결과 토스트를 재조회 **전에** 따로 내던 옛 배선이 남아 있지 않다", () => {
-    pinLacks("main.ts", MAIN_SRC, "showCliToast(installResultToast(rep))");
-    pinLacks("main.ts", MAIN_SRC, "showCliToast(uninstallResultToast(rep))");
+    pinLacks("main.ts", MAIN_CODE, "showCliToast(installResultToast(rep))");
+    pinLacks("main.ts", MAIN_CODE, "showCliToast(uninstallResultToast(rep))");
   });
   it("(G2) 상시 경로(CC 열기)는 그대로 고지를 낸다 — 억제한 것은 중복뿐이다", () => {
     pinHas("refreshCliInstallState", mainFnBody("refreshCliInstallState"), "statusNoticePlan(cliStatus)");
@@ -2102,6 +2408,98 @@ describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => 
 
   // ★R1 — 복구 명령의 조립 후보(링크 경로)를 넘기는 것은 배선이라 순수 함수만으로는 못 지킨다.
   it("(R1) 해제 결과 토스트에 링크 경로를 넘긴다(그래야 'sudo rm <경로>' 가 조립된다)", () => {
-    pinHas("main.ts", MAIN_SRC, "uninstallResultToast(rep, [cliStatus.cysLink, cliStatus.cysdLink])");
+    pinHas("main.ts", MAIN_CODE, "uninstallResultToast(rep, [cliStatus.cysLink, cliStatus.cysdLink])");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★8R — 핀 자체가 장식이 아님을 먼저 증명한다(주석 걷어내기가 코드를 먹지 않았는가)
+// ══════════════════════════════════════════════════════════════════════════════
+describe("main.ts 핀의 검사 대상 — 주석만 걷고 코드는 남았다", () => {
+  it("MAIN_CODE 가 여전히 우리가 못박는 배선을 담고 있다(빈 문자열을 검사하는 사고 방지)", () => {
+    for (const anchor of [
+      "function refreshCliInstallState(",
+      "el.className = toastClassName(category)",
+      'document.getElementById("btn-install-cli")?.addEventListener("click"',
+    ])
+      expect({ 앵커: anchor, 남음: MAIN_CODE.includes(anchor) }).toEqual({ 앵커: anchor, 남음: true });
+    // 통째로 지워지는 사고(정규식이 코드를 삼킴)를 길이로도 막는다 — 주석 비율은 실측 40% 안팎이다.
+    expect({ 남은_비율_50퍼_이상: MAIN_CODE.length > MAIN_SRC.length * 0.5 }).toEqual({
+      남은_비율_50퍼_이상: true,
+    });
+  });
+  it("★그리고 주석은 실제로 걷혔다 — 'was:' 주석 우회가 더는 통하지 않는다", () => {
+    // 이 파일 자신이 그 우회를 재현해 본다: 주석으로 남긴 배선은 MAIN_CODE 에 없어야 한다.
+    const 위장 = "  // was: refreshCliInstallState({ notice: false, force: true }),\n";
+    const 걷힌 = 위장.replace(/^[ \t]*\/\/.*$/gm, "");
+    expect({ 주석_잔존: 걷힌.includes("refreshCliInstallState") }).toEqual({ 주석_잔존: false });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-2(8R) — 판독기는 **IPC 경계 위에** 있다(관통 시험이 진짜 경로를 묘사하는 근거)
+// ══════════════════════════════════════════════════════════════════════════════
+// 위 관통 시험은 "raw → 판독기 → 문구" 를 검사한다. 그 사슬이 실제 앱의 사슬과 같으려면,
+// main.ts 가 invoke 응답을 **판독기에 먼저** 통과시켜야 한다. 그 한 줄을 여기서 못박는다.
+// (예전 결함의 본체가 정확히 `as T ?? {}` 캐스트였다 — 캐스트는 모양을 검사하지 않는다.)
+describe("★MAJOR-2 — 세 IPC 응답이 모두 판독기를 거친다(캐스트 우회 금지)", () => {
+  it("설치 응답", () => {
+    pinHas("main.ts", MAIN_CODE, 'readInstallReport(await invoke("install_cli_to_path"))');
+  });
+  it("해제 응답", () => {
+    pinHas("main.ts", MAIN_CODE, 'readUninstallReport(await invoke("uninstall_cli_from_path"))');
+  });
+  it("상태 조회 응답", () => {
+    pinHas("refreshCliInstallState", mainFnBody("refreshCliInstallState"), 'readCliStatus(await invoke("cli_install_status"))');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-3(8R) — async 전환이 연 동시성을 배선으로 닫는다
+// ══════════════════════════════════════════════════════════════════════════════
+// 7R 이 Rust `cli_install_status` 를 async 로 내리면서 IPC 핸들러의 직렬화가 사라졌다.
+// 수리의 본체가 main.ts 의 배선이라 순수 함수로는 못 지킨다 — 핀으로 못박는다.
+describe("★MAJOR-3 — 상태 조회 동시성 가드(중복 억제 + 세대 카운터)", () => {
+  const BODY = () => mainFnBody("refreshCliInstallState");
+
+  it("진행 중이면 새 프로브(로그인 셸)를 띄우지 않는다 — 관측 재진입은 버린다", () => {
+    pinHas("refreshCliInstallState", BODY(), "if (cliStatusBusy && !opts.force) return;");
+  });
+
+  it("★세대 카운터로 늦게 온 옛 응답이 최신 상태를 덮지 못한다(last-writer-wins 차단)", () => {
+    pinHas("refreshCliInstallState", BODY(), "const gen = ++cliStatusGen;");
+    pinHas("refreshCliInstallState", BODY(), "if (gen !== cliStatusGen) return;");
+    // ★가드가 장식이 되는 유일한 형태를 막는다: 응답을 await 뒤 **곧바로** cliStatus 에 대입하면
+    // 세대 검사를 할 자리가 없다(대입이 이미 끝났다). 지역 변수로 받아야만 검사가 의미를 갖는다.
+    pinLacks("refreshCliInstallState", BODY(), "cliStatus = readCliStatus(await invoke");
+    pinHas("refreshCliInstallState", BODY(), "view = readCliStatus(await invoke");
+    pinHas("refreshCliInstallState", BODY(), "cliStatus = view;");
+  });
+
+  it("액션 직후 재조회만 억제를 건너뛴다(force) — 라벨·고지 줄이 낡지 않게", () => {
+    pinHas("main.ts", MAIN_CODE, "refreshCliInstallState({ notice: false, force: true })");
+    // 상시 경로(CC 열기)는 force 가 없다 — 여기에 force 를 붙이면 억제가 통째로 무력해진다.
+    pinHas("setCcOpen", mainFnBody("setCcOpen"), "void refreshCliInstallState();");
+  });
+
+  it("★타이머·폴링을 새로 만들지 않았다(이 코드베이스의 상시 원칙)", () => {
+    pinLacks("refreshCliInstallState", BODY(), "setInterval");
+    pinLacks("refreshCliInstallState", BODY(), "setTimeout");
+  });
+
+  it("★해제 경로의 재진입 차단이 확인 모달보다 **앞**에 있다(이중 집행 차단)", () => {
+    // 오버레이(.modal-overlay)는 마우스만 가린다 — 포커스는 방금 누른 버튼에 남고, 전역 키
+    // 핸들러는 수식키 없는 입력을 흘려보내므로(`if (!mod) return`) Enter/Space 로 재진입한다.
+    // 그래서 `b.disabled = true` 는 **첫 await 앞**에 있어야 한다.
+    const disabled = MAIN_CODE.indexOf("b.disabled = true;");
+    const modal = MAIN_CODE.indexOf("await confirmModal(c.title, c.body, c.yes, c.no)");
+    expect({ 둘_다_존재: disabled >= 0 && modal >= 0, 차단이_먼저: disabled >= 0 && modal >= 0 && disabled < modal }).toEqual({
+      둘_다_존재: true,
+      차단이_먼저: true,
+    });
+  });
+
+  it("확인 창을 취소하면 버튼을 되살린다(영구 비활성 금지)", () => {
+    pinHas("main.ts", MAIN_CODE, "      b.disabled = false;\n      return;");
   });
 });
