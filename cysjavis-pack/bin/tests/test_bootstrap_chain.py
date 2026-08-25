@@ -450,6 +450,12 @@ for _tag, _mut, _why in (
      "남의 pane 판정 유입"),
     ("s3 신선도 초과(1h 전)", lambda e: (bind_claim(e, 0), e.update(
         {"CYS_CLAIM_AT": str(int(time.time()) - 3600)})), "낡은 판정 재사용"),
+    # s4: MAX<=0 가드 판별 검체 — CLAIM_AT 를 미래(60s)로 밀어 나이를 음수 skew 허용창 안에
+    #     넣는다. 가드 없으면 -120<=age<0 이 참이 되어 결박(=직접 claim 부재)로 적색이 난다 —
+    #     '0=소비 차단' 수동 튜닝 관용이 유계 음수 허용에 조용히 깨지지 않음을 핀한다.
+    ("s4 MAX_AGE=0 소비 차단(음수 skew 창)", lambda e: (bind_claim(e, 0), e.update(
+        {"CYS_CLAIM_MAX_AGE_S": "0", "CYS_CLAIM_AT": str(int(time.time()) + 60)})),
+     "'0=차단' 관용 보존"),
 ):
     tmp = tempfile.mkdtemp(prefix="boot-t5fbs-")
     env, home = make_env(tmp)
@@ -458,6 +464,44 @@ for _tag, _mut, _why in (
     check("5fb-%s → 무시하고 직접 claim(%s)" % (_tag, _why),
           "cys claim-role" in calls(tmp), "calls=%s" % calls(tmp)[-200:])
     shutil.rmtree(tmp)
+
+# ── 5-fb-t. ★P0-1 결박 신선도=런 시작 기준 핀(CLM-2 라이브락 절단): ①preflight 가 신선도 창을
+#    넘게 오래 걸려도, 훅 스탬프가 **런 시작 시점**에 신선했으면 결박은 소비돼야 한다.
+#    소비 시각(time.time()) 기준이던 구 계약은 이 시나리오에서 만료→직접 claim→재부모화 신원
+#    미해석(rc6)→session_error 였다 — preflight sleep(12s) > CYS_CLAIM_MAX_AGE_S(10s) 로 그 경합을
+#    재현하고, 신 계약(_RUN_T0 기준·나이≈스폰 지연 수백 ms)에서 결박 유지를 핀한다.
+#    ★검체 전제: bind_claim 스탬프→부트 모듈 로드(_RUN_T0 캡처)가 10s 이내여야 한다(정상
+#    수백 ms — 극단 콜드스타트 CI 여유분으로 창을 3s→10s 로 넓혔다). 전제 초과 시 실패 방향은
+#    적색(5fb-t2 가 직접 claim 재호출을 검출 — 가짜 green 없음)이고 calls 로그로 즉시 진단된다.
+tmp = tempfile.mkdtemp(prefix="boot-t5fbt-")
+env, home = make_env(tmp)
+# 스텁 preflight 를 '창보다 긴 지연'으로 교체 — in-run 소요 시뮬레이션(fresh 마커 없음 → 실행됨).
+with open(os.path.join(home, ".cys", "pack", "bin", "javis_preflight.py"),
+          "w", encoding="utf-8", newline="\n") as f:
+    f.write("import sys,time; time.sleep(12); sys.exit(0)\n")
+bind_claim(env, 0, "registered: master → surface:7")
+env["CYS_CLAIM_MAX_AGE_S"] = "10"  # 창(10s) < preflight 소요(12s) — 구 계약이면 여기서 만료된다
+code, out, err = run(env)
+check("5fb-t1 preflight 지연(창 초과)에도 결박 소비 유지 → 체인 계속 exit 0",
+      code == 0, "exit=%d err=%s" % (code, err[-300:]))
+check("5fb-t2 claim-role 재호출 없음(런 시작 기준 나이 — in-run 소요와 무관)",
+      "cys claim-role" not in calls(tmp), "calls=%s" % calls(tmp)[-200:])
+shutil.rmtree(tmp)
+
+# ── 5-fb-u. ★P0-1 유계 음수 스큐 핀: 훅 스탬프가 _RUN_T0 보다 미래(스탬프↔기동 사이 NTP 후퇴)
+#    여도 허용창(-120s) 안이면 결박을 유지한다 — 음수를 미결박으로 접으면 정확히 rc6 재생산.
+#    진단 1줄(stderr)은 남긴다(시계가 움직인 사실은 침묵하지 않는다).
+tmp = tempfile.mkdtemp(prefix="boot-t5fbu-")
+env, home = make_env(tmp)
+bind_claim(env, 0, "registered: master → surface:7")
+env["CYS_CLAIM_AT"] = str(int(time.time()) + 60)   # 60s 미래 — 허용창(120s) 안의 시계 후퇴
+code, out, err = run(env)
+check("5fb-u1 음수 skew(창 내) 결박 소비 유지 → 체인 계속 exit 0",
+      code == 0, "exit=%d err=%s" % (code, err[-300:]))
+check("5fb-u2 claim-role 재호출 없음(유계 음수 허용)",
+      "cys claim-role" not in calls(tmp), "calls=%s" % calls(tmp)[-200:])
+check("5fb-u3 시계 후퇴 stderr 진단 1줄", "시계 후퇴" in err, "err=%s" % err[-300:])
+shutil.rmtree(tmp)
 
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
 # ★마커를 실어 레인 게이트(_is_base_socket)를 실검증한다(2026-08-12 재검증 지적): 마커 없이

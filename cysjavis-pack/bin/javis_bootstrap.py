@@ -270,6 +270,35 @@ PING_RETRY_TOTAL_S = max(0.0, float(os.environ.get(
 PING_RETRY_INTERVAL_S = max(0.05, float(os.environ.get(
     "CYS_BOOT_PING_RETRY_INTERVAL_S", str(_budget_leaf("CYS_PING_RETRY_INTERVAL_S", 3)))))
 
+# ── ③ 선행 claim 결박 신선도의 시간 기준(P0-1 — CLM-2 라이브락 절단) ──
+# ★런 시작 시각 1회 캡처: 결박 나이(_pre_age)의 기준점이다. 종전엔 **소비 시각**(time.time())
+#   기준이라 ①preflight(최대 300s)·②ping(최대 ~45s)의 in-run 소요가 신선도 창(기본 300s)과
+#   동일 자릿수로 경합했다 — 훅이 claim 직후·spawn 이전에 찍은 스탬프(role-bootstrap.sh:674)가
+#   ③ 소비 시점엔 이미 만료 → 미결박 폴백 → 재부모화된 이 프로세스의 직접 claim → 신원
+#   미해석(rc6) → session_error(CLM-2 라이브락). 런 시작 기준이면 in-run 소요와 무관하므로
+#   preflight 예산이 늘어도 재발하지 않는다(창 상수와 preflight 상수의 결합 자체를 절단).
+# ★의미 재정의(P0-1 고지): 이로써 `CYS_CLAIM_MAX_AGE_S`(기본 300)의 의미는
+#   '소비 시각 기준 최대 나이' → '**런 시작 시점 기준** 최대 나이'로 바뀐다. 소비처는 ③의
+#   결박 술어 1곳뿐이라 파급은 그 함수 안으로 닫힌다. 단 MAX<=0 은 종전 관용('0=항상 미결박'
+#   =소비 차단 idiom) 그대로다 — 유계 음수 허용이 이 관용을 시계 후퇴 창에서 조용히 깨지
+#   않도록 ③ 술어에 MAX>0 가드를 둔다.
+# ★벽시계(time.time())인 이유: 비교 상대 CYS_CLAIM_AT 이 훅의 `date +%s`(epoch) 스탬프 —
+#   교차 프로세스라 monotonic 비교가 성립하지 않는다. 같은 기계의 같은 벽시계이므로 스큐
+#   표면은 스탬프↔기동 사이의 NTP 후퇴뿐이고, 그것은 아래 유계 음수 허용이 흡수한다.
+# ★모듈 로드 시각 캡처가 안전한 이유(구조 실측 R3-P01-1): 모듈 최상위는 순수(sys.path
+#   append·stdout reconfigure·env 읽기·budget import)하고, 부트 run 외 경로(issue-ticket·
+#   lane-path·status·assert-ready·--self-test·javis_mission 의 import 경유)는 ③ 신선도 검사에
+#   도달하지 않는다 — 이 캡처는 어느 서브커맨드에도 부작용 0. 훅 spawn 은 스탬프 직후이므로
+#   _RUN_T0 ≈ CYS_CLAIM_AT + ms 단위(Windows Defender 콜드스타트 최악에도 수십 초)다.
+_RUN_T0 = time.time()
+# ★유계 음수 허용(시계 후퇴 흡수): NTP 후퇴가 훅 스탬프와 프로세스 기동 사이에 끼면
+#   _RUN_T0 - CYS_CLAIM_AT < 0 이 된다. 이를 미결박으로 접으면 **정확히 rc6 을 재생산**하므로
+#   -120s 까지는 결박을 인정한다(초과는 미결박 — 무한 음수 허용 아님). 신뢰 모델(헤더 §신뢰
+#   모델: LLM 드리프트 차단 가드이지 보안 경계가 아니다)상 유계 음수는 위조 표면을 넓히지
+#   않는다 — 위조는 어차피 sid 동일성 결박(4개 env 동시 export)을 넘어야 하고, 그 능력자는
+#   pane 안에서 직접 claim 이 가능하다(위협 등급 불변).
+_CLAIM_SKEW_TOL_S = 120.0
+
 # ── exit 코드 단일 소스(A7·A14·A20 — 헤더 exit 표의 진실원천) ──
 # ★타입드 종료: '성공'·'정당거부'·'세션 컨텍스트 오류'·'정상 skip'·'사용오류'가 각자 코드를 갖는다.
 #   구 계약은 정당거부와 인프라 실패를 7 하나로, 정상 skip과 완주를 0 하나로 뭉갰다(RC2).
@@ -2489,19 +2518,36 @@ def _cmd_run_chain(log):
     # 그 경로는 조상 체인이 온전하므로 정상 동작한다(하위호환·스큐 안전).
     # ★판정 결박(무바인딩 env 금지): 정수처럼 보이는 env 하나로 claim 을 건너뛰면, 사용자 셸·
     #   래퍼에 남은 값이 **치지도 않은 claim 을 '실측'으로** boot-last 에 적게 된다(CS-3 보고=실측
-    #   위반). 그래서 판정은 ⓐ같은 surface 귀속(CYS_CLAIM_SID) ⓑ신선도(CYS_CLAIM_AT, 300s)까지
-    #   갖췄을 때만 소비한다. 하나라도 어긋나면 **무시하고 직접 claim** 한다(구 훅·직접 실행과
-    #   동일 경로 — 하위호환이 곧 안전한 기본값이다).
+    #   위반). 그래서 판정은 ⓐ같은 surface 귀속(CYS_CLAIM_SID) ⓑ신선도(CYS_CLAIM_AT — **런 시작
+    #   시각 `_RUN_T0` 기준** CYS_CLAIM_MAX_AGE_S=300s · P0-1 재정의)까지 갖췄을 때만 소비한다.
+    #   하나라도 어긋나면 **무시하고 직접 claim** 한다(구 훅·직접 실행과 동일 경로 — 하위호환이
+    #   곧 안전한 기본값이다). 신선도가 소비 시각이 아니라 런 시작 기준인 이유·의미 재정의
+    #   고지는 상수부 `_RUN_T0` 계약 주석이 정본이다(CLM-2: ①preflight·②ping 의 in-run 소요가
+    #   신선한 claim 을 소비 시점 만료로 접던 결합의 절단).
     _progress("③ master 역할 등록…")
     _pre_rc = os.environ.get("CYS_CLAIM_RC", "").strip()
     _pre_sid = re.sub(r"[^0-9]", "", os.environ.get("CYS_CLAIM_SID", ""))
     _my_sid = re.sub(r"[^0-9]", "", my_surface_id())
     try:
-        _pre_age = time.time() - float(os.environ.get("CYS_CLAIM_AT") or 0)
+        # ★런 시작 기준 나이(P0-1): _RUN_T0 는 모듈 로드(≈훅 spawn 직후)에 1회 캡처된 벽시계 —
+        #   ①②가 여기 도달 전에 아무리 오래 걸려도 이 값은 변하지 않는다. `date +%s` 실패 시
+        #   훅은 0 을 싣는데(role-bootstrap.sh:674) 그 경우 나이 ≈ 현재 epoch(수십억 초)로
+        #   여전히 창 밖 기각 — 종전 안전 거동 불변.
+        _pre_age = _RUN_T0 - float(os.environ.get("CYS_CLAIM_AT") or 0)
     except (TypeError, ValueError):
         _pre_age = float("inf")
-    _pre_bound = (_pre_rc.lstrip("-").isdigit() and _pre_sid and _pre_sid == _my_sid
-                  and 0 <= _pre_age < float(os.environ.get("CYS_CLAIM_MAX_AGE_S") or 300))
+    if _pre_rc and _pre_age < 0:
+        # 음수 = 훅 스탬프가 _RUN_T0 보다 미래(스탬프↔기동 사이 NTP 후퇴). 유계 허용창
+        # (-_CLAIM_SKEW_TOL_S) 안이면 결박은 유지하되, 시계가 움직인 사실 자체는 진단으로 남긴다.
+        sys.stderr.write("[bootstrap] 선행 claim 스탬프가 런 시작보다 미래(%.0fs) — 시계 후퇴 "
+                         "감지(허용창 %.0fs 안이면 결박 유지)\n" % (-_pre_age, _CLAIM_SKEW_TOL_S))
+    _pre_max = float(os.environ.get("CYS_CLAIM_MAX_AGE_S") or 300)
+    # ★MAX<=0 가드(수동 튜닝 관용 보존): 구 술어(0<=age<MAX)에서 MAX=0 은 '항상 미결박'
+    #   (소비 차단 idiom)이었다. 유계 음수 허용(-120s<=age<0)만으로는 시계 후퇴 창에서
+    #   MAX=0 이 결박을 허용하게 되므로, MAX<=0 이면 나이와 무관하게 무조건 미결박으로 접는다.
+    _pre_bound = (_pre_max > 0
+                  and _pre_rc.lstrip("-").isdigit() and _pre_sid and _pre_sid == _my_sid
+                  and -_CLAIM_SKEW_TOL_S <= _pre_age < _pre_max)
     if _pre_rc and not _pre_bound:
         sys.stderr.write("[bootstrap] 선행 claim 판정 미결박 — 무시하고 직접 claim 한다"
                          "(rc=%r sid=%r≠%r age=%.0fs)\n" % (_pre_rc, _pre_sid, _my_sid, _pre_age))
