@@ -52,6 +52,10 @@ import {
   readInstallReport,
   readUninstallReport,
   cliButtonView,
+  cliButtonIntent,
+  cliNoticeLines,
+  withCliNotice,
+  normalizeInstallStatus,
   statusNoticePlan,
   uninstallConfirmText,
   uninstallResultToast,
@@ -60,6 +64,7 @@ import {
   INSTALL_TOAST_ID,
   UNINSTALL_TOAST_ID,
   type CliStatusView,
+  type LastInstallOutcome,
   type ToastPlan,
 } from "./clipath";
 import {
@@ -384,19 +389,29 @@ function applyGlanceFace(face: "live" | "tasks") {
 // 남의 실체 파일이 있다"를 이미 탐지해 문장으로 보내는데, 예전 TS 타입에는 notes 필드 자체가 없어
 // 한 글자도 노출되지 않았다 — 사용자는 버튼을 누르는 순간 자기 파일이 어떻게 되는지 모른 채 눌렀다.
 // 노출 경로는 둘이다: ①버튼 툴팁(상주) ②CC 열 때 sticky 토스트 1회(같은 id 재호출은 갱신).
-let cliStatus: CliStatusView = {
+const CLI_STATUS_UNKNOWN: CliStatusView = {
   supported: true,
   button: "unknown",
   linkState: "unknown",
   notes: [],
+  backups: [],
   cysLink: "",
   cysdLink: "",
 };
+let cliStatus: CliStatusView = { ...CLI_STATUS_UNKNOWN };
+
+// ★(I2 · adv8) 직전 설치 시도의 결과 래치. 상태 조회는 **링크의 존재**만 보므로, 그림자화·확인
+// 불가로 끝난 설치 직후에도 installed=true 를 돌려주고 버튼이 '해제'로 뒤집힌다 — 방금 "미완료"
+// 라고 읽은 사용자가 같은 자리를 누르면 정반대(비가역 해제)가 나간다. 라벨은 이 둘의 합으로 정한다.
+// 래치는 Control Center 를 다시 열 때와 해제 성공 직후에 풀린다(해제 경로가 영영 막히지 않게).
+let cliLastInstall: LastInstallOutcome = null;
 
 function applyCliButtonView() {
   const b = document.getElementById("btn-install-cli") as HTMLButtonElement | null;
   if (!b) return;
-  const v = cliButtonView(cliStatus.button, cliStatus.notes);
+  // (I3①) 툴팁은 토스트와 **같은 고지 줄**을 단다 — 토스트는 60초 뒤 사라지고 툴팁은 상주하므로,
+  // 남는 쪽이 덜 말하면 잔존 백업본 정보가 그대로 소실된다.
+  const v = cliButtonView(cliStatus.button, cliNoticeLines(cliStatus), cliLastInstall);
   b.textContent = v.label;
   b.title = v.title;
   // platform_supported=false 는 Rust 의 명시 부정이다(macOS 아님) — 그때만 되숨긴다.
@@ -420,15 +435,21 @@ function showCliToast(plan: ToastPlan) {
 // 읽기 전용 상태 조회(관리자 승격 없음). ★폴링 금지(WINAUDIT 타이머 증식) — CC 열 때 1회 +
 // 설치/해제 직후 1회뿐이다. 실패해도 기능이 죽지 않는 부수 조회라 조용히 unknown으로 두고,
 // unknown의 라벨은 '설치'다(멱등한 설치 쪽 — 비가역 해제로 기울지 않는다).
-async function refreshCliInstallState() {
+//
+// ★(G2 · 2026-08-25 5R) `notice` 인자: 상시 고지 토스트(cli-status-notes)를 낼 것인가.
+// 설치·해제 **직후**의 재조회에서는 false 다 — 같은 사실(옮겨 둔 원본·남의 파일)이 결과 토스트에
+// 이미 실려 있어서, 그대로 두면 서로 다른 문장의 sticky 가 둘 뜬다(한 사건, 두 알림). 그 경로에서는
+// 호출측이 withCliNotice 로 결과 토스트 **하나**에 접어 넣는다. 정보는 줄지 않는다(툴팁에도 상주).
+async function refreshCliInstallState(opts: { notice?: boolean } = {}) {
   if (!IS_MACOS) return;
   try {
     cliStatus = readCliStatus(await invoke("cli_install_status"));
   } catch {
-    cliStatus = { supported: true, button: "unknown", linkState: "unknown", notes: [], cysLink: "", cysdLink: "" };
+    cliStatus = { ...CLI_STATUS_UNKNOWN };
   }
   applyCliButtonView();
-  const notice = statusNoticePlan(cliStatus); // notes 가 없으면 null(정상은 무음)
+  if (opts.notice === false) return;
+  const notice = statusNoticePlan(cliStatus); // 고지할 것(notes·잔존 백업)이 없으면 null — 정상은 무음
   if (notice) showCliToast(notice);
 }
 
@@ -445,6 +466,9 @@ function setCcOpen(open: boolean) {
     tickCc();
     // 셸 설치 상태는 CC를 열 때 1회만 확인한다(주기 조회 없음). ★반드시 fire-and-forget —
     // 여기서 await 하면 아래 타이머 생성이 응답을 기다리며 막힌다(e2e shim의 invoke는 영구 pending).
+    // (I2) 패널을 다시 여는 것은 '처음부터'의 자연스러운 경계다 — 직전 설치 래치를 여기서 푼다.
+    // 그래야 '다시 설치' 표시가 그 세션의 잔상으로 끝나고, 해제 경로가 영구히 막히지 않는다.
+    cliLastInstall = null;
     void refreshCliInstallState();
     if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
     if (ccHwTimer == null) ccHwTimer = setInterval(refreshHw, 2000) as unknown as number;
@@ -6752,29 +6776,53 @@ if (IS_MACOS) {
 document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
   const b = document.getElementById("btn-install-cli") as HTMLButtonElement | null;
   if (!b || b.disabled) return;
-  const wantUninstall = cliStatus.button === "installed";
+  // ★(I2) 클릭 분기는 **라벨을 만든 그 판정**을 그대로 쓴다. cliStatus.button 만 보면
+  // '다시 설치'라고 적힌 버튼이 해제를 집행하는 창이 열린다(사용자가 본 것과 다른 행동).
+  const wantUninstall = cliButtonIntent(cliStatus.button, cliLastInstall) === "uninstall";
   // 해제는 root 소유 심링크를 지우는 비가역에 가까운 행위 — 클릭 즉시 집행하지 않고 확인을 먼저 받는다.
   // alert()/confirm()은 이 WKWebView에서 억제된다는 실측(B-11)이 있어 순수 DOM confirmModal을 쓴다.
+  // (I3②) 확인 창에 **현재 상태**를 함께 실어 준다 — 남의 파일 고지(notes)와 잔존 백업본(backups).
+  // 문구를 읽어 분류하지 않는다: 분기의 근거는 두 배열의 길이뿐이고, 내용은 옮기거나(notes)
+  // 경로에서 만든다(backups — 백엔드는 사실만, 표현은 UI 소유).
   if (wantUninstall) {
-    const c = uninstallConfirmText();
+    const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups);
     if (!(await confirmModal(c.title, c.body, c.yes, c.no))) return;
   }
   b.disabled = true; // in-flight 이중 클릭 차단(승격 프롬프트가 떠 있는 동안)
+  // ★(G2) 결과 알림은 **이 액션당 정확히 하나**다. 예전에는 여기서 결과 토스트를 내고, finally 의
+  // 재조회가 곧바로 상시 고지 토스트를 또 냈다 — 백업이 일어난 설치 1클릭이 서로 다른 문장의
+  // sticky 두 개(cli-install + cli-status-notes)로 같은 사실을 말했다. 계획을 들고 있다가
+  // 재조회 뒤에 한 번만 낸다(그래야 접어 넣는 고지 줄이 **방금 재조회한 최신 사실**이 된다).
+  let plan: ToastPlan | null = null;
   try {
     // 응답 판독은 read*Report(unknown → 계약 모양)가 한다 — `as T ?? {}` 캐스트로 모양을 가정하면
     // Rust 와 어긋난 채 조용히 통과한다(MAJOR-5 의 본체가 정확히 그 캐스트였다).
-    const t = wantUninstall
-      ? uninstallResultToast(readUninstallReport(await invoke("uninstall_cli_from_path")))
-      : installResultToast(readInstallReport(await invoke("install_cli_to_path")));
-    showCliToast(t);
+    if (wantUninstall) {
+      const rep = readUninstallReport(await invoke("uninstall_cli_from_path"));
+      // 해제가 실측으로 확인됐으면 설치 래치도 함께 푼다 — 지운 뒤에 '다시 설치'가 남으면
+      // 그것 또한 라벨과 상태의 어긋남이다(래치는 잔상이지 상태가 아니다).
+      if (rep.ok) cliLastInstall = null;
+      // (R1) 남은 링크의 복구 명령('sudo rm <경로>')은 **UI 가 조립한다** — 백엔드는 5R 부터
+      // 사실만 보낸다. 조립의 후보는 직전 상태 조회가 준 두 링크 경로이고, 그 값을 못 읽었으면
+      // 빈 문자열이라 후보가 사라진다(없는 경로를 지목하지 않는다).
+      plan = uninstallResultToast(rep, [cliStatus.cysLink, cliStatus.cysdLink]);
+    } else {
+      const rep = readInstallReport(await invoke("install_cli_to_path"));
+      // installed 가 아니면(그림자화·확인 불가) 다음 라벨은 '해제'가 아니라 '다시 설치'다.
+      cliLastInstall = normalizeInstallStatus(rep.status);
+      plan = installResultToast(rep);
+    }
   } catch (e) {
     // 실패(취소·승격 거부·Err)는 볼 것이 남은 결과다 — 60초 sticky 로 낸다.
-    stickyToast(
-      wantUninstall ? UNINSTALL_TOAST_ID : INSTALL_TOAST_ID,
-      "watchdog",
-      wantUninstall ? "셸 cys 해제 실패" : "셸 설치 실패",
-      String(e),
-    );
+    // ★실패도 같은 통로로 낸다(G1 대칭): 승격이 거부돼도 이미 옮겨진 원본이 남아 있을 수 있고,
+    // 그 사실은 실패 알림에도 실려야 한다 — 실패 경로만 덜 말하면 그것이 곧 자기보고 미도달이다.
+    plan = {
+      category: "watchdog",
+      title: wantUninstall ? "셸 cys 해제 실패" : "셸 설치 실패",
+      body: String(e),
+      sticky: true,
+      id: wantUninstall ? UNINSTALL_TOAST_ID : INSTALL_TOAST_ID,
+    };
   } finally {
     // (MINOR-11) 재조회를 **기다린 뒤** 활성화한다. fire-and-forget 이면 버튼이 먼저 살아나
     // 라벨이 아직 이전 상태(예: 방금 설치했는데 '설치')인 창이 열리고, 그 창에서 누르면
@@ -6782,9 +6830,12 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     // 단, 재조회가 영영 돌아오지 않는 환경(응답 없는 invoke)에서 버튼이 **영구 비활성**으로
     // 죽는 것은 더 나쁘다 — 3초 상한을 걸고 그 뒤에는 라벨이 늦더라도 버튼을 돌려준다.
     await Promise.race([
-      refreshCliInstallState(), // 액션 직후 1회 재조회로 라벨 갱신(폴링 아님)
+      // 액션 직후 1회 재조회로 라벨 갱신(폴링 아님). 상시 고지 토스트는 여기서 내지 않는다 —
+      // 아래에서 결과 토스트 하나로 접어 넣는다(G2).
+      refreshCliInstallState({ notice: false }),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
+    if (plan) showCliToast(withCliNotice(plan, cliNoticeLines(cliStatus)));
     b.disabled = false;
   }
 });

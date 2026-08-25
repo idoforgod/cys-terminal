@@ -255,6 +255,13 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px;
   padding: 13px 20px; background: rgba(10,10,10,.85); backdrop-filter: blur(16px);
   border-bottom: 1px solid rgba(255,255,255,.10);
+  /* (I7 · 2026-08-25) 오버플로 가드. 이 줄에는 제목·배지·버튼 넷·시계·닫기(×)가 한 줄로 들어가고
+     그 중 "셸에 cys 설치/해제" 버튼은 상태에 따라 라벨이 길어진다('셸에 cys 다시 설치').
+     nowrap 이던 예전 규칙에서는 창이 좁거나 라벨이 길 때 줄 전체가 넘쳐, **맨 끝의 닫기(×)가
+     화면 밖으로 밀려나** 패널을 마우스로 닫을 수 없었다(ESC 를 모르면 갇힌다).
+     wrap 을 켜면 넘치는 대신 아랫줄로 접히고 × 는 언제나 클릭할 수 있다. 헤더가 한 줄 높아질
+     뿐이고 sticky 라 본문은 그만큼 아래에서 시작한다. `gap:12px` 가 행 간격도 함께 준다. */
+  flex-wrap: wrap;
 }
 .cc-pulse { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; animation: cc-pulse .8s infinite; }
 @keyframes cc-pulse { 0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(239,68,68,.55)} 50%{opacity:.4;box-shadow:0 0 0 6px rgba(239,68,68,0)} }
