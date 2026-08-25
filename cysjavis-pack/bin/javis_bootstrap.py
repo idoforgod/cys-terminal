@@ -66,6 +66,12 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
   boot-last 에 `ok:false` 를 쓰지 않는다(`ok:null` + state=declined|session_error). 같은 레인
   두 번째 pane의 정당한 거부가 건강한 master의 ok:true 를 덮어 §0 소비 술어를 churn 시키는 것을
   막는다. §0 이 읽어야 하는 신호는 '**자기 surface**의 최신 완주 런'이다 — 그래서 귀속이 필수다.
+★세션 오류 재시도 래치(P0-3): boot-last **최상위** `retry` 맵({sid:{count,at}})은 per-surface
+  session_error 재시도 원장이다 — 새 런이 _Log 선기록 **이전**에 스냅샷해 carry-forward(타
+  surface 완주 런이 본체를 덮어도 불소실), session_error 기록 시 자기 sid count+1, 자기 sid
+  정상 완주(ok:true) 시 항목 제거, 24h 경과 회수. `result.retry_eligible=(기록 후 count<=1)`
+  이 §0-A session_error 행(자기 surface 1회 재실행)의 **유일한** 재실행 근거다(오너 결정 ⑬Y:
+  최초 실패=count 1=true · 같은 surface 연속 2회째=false). 상수부 래치 계약 주석이 정본이다.
 
 부서 교리 게이트 (증분2 — D1 옵션 1'):
   ⓐ CEO 티켓 권한 게이트(P7): 부서 레인(CYS_SOCKET=부서 소켓)의 팀 기동은 CEO 발급 티켓 필수.
@@ -272,7 +278,7 @@ PING_RETRY_INTERVAL_S = max(0.05, float(os.environ.get(
 
 # ── ③ 선행 claim 결박 신선도의 시간 기준(P0-1 — CLM-2 라이브락 절단) ──
 # ★런 시작 시각 1회 캡처: 결박 나이(_pre_age)의 기준점이다. 종전엔 **소비 시각**(time.time())
-#   기준이라 ①preflight(최대 300s)·②ping(최대 ~45s)의 in-run 소요가 신선도 창(기본 300s)과
+#   기준이라 ①preflight(상한 300s)·②ping(상한 ~45s)의 in-run 소요가 신선도 창(기본 300s)과
 #   동일 자릿수로 경합했다 — 훅이 claim 직후·spawn 이전에 찍은 스탬프(role-bootstrap.sh:674)가
 #   ③ 소비 시점엔 이미 만료 → 미결박 폴백 → 재부모화된 이 프로세스의 직접 claim → 신원
 #   미해석(rc6) → session_error(CLM-2 라이브락). 런 시작 기준이면 in-run 소요와 무관하므로
@@ -298,6 +304,28 @@ _RUN_T0 = time.time()
 #   않는다 — 위조는 어차피 sid 동일성 결박(4개 env 동시 export)을 넘어야 하고, 그 능력자는
 #   pane 안에서 직접 claim 이 가능하다(위협 등급 불변).
 _CLAIM_SKEW_TOL_S = 120.0
+
+# ── ③′ 세션 오류 재시도 래치(P0-3 — '재시도 주체 0' 봉합의 기계 유계) ──
+# ★boot-last **최상위** "retry" 맵({sid: {count, at}}): per-surface session_error(exit 10)
+#   재시도 원장이다. §0-A 의 session_error 행(자기 surface 1회 재실행)은 이 도구 파생값
+#   `result.retry_eligible` 만을 근거로 발동한다 — '1회 한정'을 LLM 재량·기억이 아니라
+#   도구 출력으로 강제한다(결정론 환원 · R3-P03-1 '지워질 수 없는 카운터').
+# ★carry-forward 가 핵심이다: 슬롯은 레인당 1개라, '직전 런 대조' 방식의 래치는 타 pane 의
+#   완주 런(정당거부 exit 7 포함 — ok:null 이지만 본체는 덮는다)이 끼어들면 소진 증거를 잃고
+#   재무장한다(R3-P03-1 음성 독해 — 기계 유계 붕괴). 그래서 cmd_run 이 _Log 선기록으로 슬롯을
+#   덮기 **이전에** 기존 맵을 스냅샷해 새 레코드로 이월한다(_load_retry_carry) — 래치가 외래
+#   쓰기에 살아남으면서 정본 1곳·단일 writer 불변식은 유지된다(R3-P03-2 ⓐ 채택 · ⓑ별도
+#   원장 파일은 정본 이원화 기각·ⓒ prev 1단 보존은 개입 2회에 깨져 기각).
+# ★유계 2종: surface 당 1항목 + TTL(24h) 경과 회수. boot-last 파손·판독 불가 시 맵 소실 →
+#   재시도 최대 1회 추가(유계 1회 · 수용 — R3-P03-1 잔여 위험). carry-forward 는
+#   read-modify-write 지만 레인 싱글플라이트 락 아래라 경합이 없다.
+# ★오너 결정 ⑬Y(2026-08-25): 최초 부트(자기 이력 0)의 첫 session_error 는 count=1 →
+#   retry_eligible=true(in-pane 1회 자동 재실행 허용 — S1/S3 본 사건 계급의 자가치유 복구).
+#   같은 surface 연속 2회째(count=2)부터 false=소진(오너 보고 후 정지).
+# ★리셋 조건: 자기 sid 의 정상 완주(ok:true)만 항목을 제거한다 — 직전 런 대조가 아니라
+#   완주 관측이 리셋이므로 교차 실행이 래치를 지우지 못한다.
+RETRY_LATCH_TTL_S = 24 * 3600.0
+RETRY_LATCH_MAX = 1          # 기록 후 count <= MAX 일 때만 retry_eligible=true
 
 # ── exit 코드 단일 소스(A7·A14·A20 — 헤더 exit 표의 진실원천) ──
 # ★타입드 종료: '성공'·'정당거부'·'세션 컨텍스트 오류'·'정상 skip'·'사용오류'가 각자 코드를 갖는다.
@@ -748,6 +776,41 @@ STEP_ORDER = tuple(label for _, label in _STEP_DEFS)
 STEP_INDEX = {label: i for i, label in enumerate(STEP_ORDER)}
 
 
+def _load_retry_carry(path):
+    """boot-last 최상위 "retry" 맵의 carry-forward 스냅샷(P0-3 · 파손·부재 안전).
+
+    ★호출 시점 계약: cmd_run 이 **_Log 생성 이전**에 부른다 — _Log.__init__ 은 새 data 딕트의
+      선기록(_persist)으로 슬롯을 즉시 덮으므로, 그 뒤에 읽으면 이월할 원본이 이미 없다
+      (R3-P03-1 실측: __init__ 은 self.path 를 읽지 않는다 — 이 함수가 유일한 선독 지점이다).
+    ★파손·부재는 빈 맵으로 접는다(래치 소실 = 재시도 최대 1회 추가 — 유계·수용). 항목 검증은
+      보수적으로: count 양의 정수·at 실수·TTL(24h) 창 안(미래 스탬프 = 시계 후퇴 잔재도 회수)
+      만 이월한다 — 위조·오염된 항목이 소진(false)을 조작하는 방향보다 '한 번 더 재시도'가
+      싸다(신뢰 모델: 드리프트 가드이지 보안 경계가 아니다).
+    """
+    prev = _read_json(path)
+    out = {}
+    if not isinstance(prev, dict):
+        return out
+    raw = prev.get("retry")
+    if not isinstance(raw, dict):
+        return out
+    now = time.time()
+    for sid, ent in raw.items():
+        if not isinstance(ent, dict):
+            continue
+        try:
+            count = int(ent.get("count", 0) or 0)
+            at = float(ent.get("at", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        if not (0 <= now - at < RETRY_LATCH_TTL_S):   # 만료(24h+)·미래 스탬프 회수(맵 유계)
+            continue
+        out[str(sid)] = {"count": count, "at": at}
+    return out
+
+
 class _Log:
     """단계 결과를 (레인) boot-last 에 누적(진단 가시성 — 각 retry 시도 포함).
 
@@ -766,7 +829,7 @@ class _Log:
       권위값도 아니다. ③ 성공 후 `role_claimed` 를 별도로 남긴다(관측 파생 — 보고=실측).
     """
 
-    def __init__(self):
+    def __init__(self, retry_carry=None):
         started = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.pid = os.getpid()
         self.run_id = "%s-%d" % (started, self.pid)
@@ -779,6 +842,11 @@ class _Log:
                      "surface": self.surface, "role": os.environ.get("CYS_ROLE", ""),
                      "lane": self.lane, "boot_last_path": self.path,
                      "steps": [],
+                     # ★P0-3 재시도 래치 carry-forward: 선기록이 슬롯을 덮어도 per-surface
+                     #   재시도 원장은 이월된다(스냅샷은 호출자 cmd_run 이 _Log 생성 **이전**에
+                     #   뜬다 — _load_retry_carry 계약 주석). 이 맵이 없으면 타 pane 완주 런이
+                     #   본체를 덮을 때마다 소진 래치가 재무장한다(R3-P03-1 음성 독해).
+                     "retry": dict(retry_carry or {}),
                      "socket": os.environ.get("CYS_SOCKET", ""), "base_socket": _is_base_socket(),
                      # ★선기록 — 이 시점 이후 어떤 경로로 죽어도 '진행 중'이 남는다.
                      "result": {"ok": None, "state": "running", "run_id": self.run_id,
@@ -850,7 +918,15 @@ class _Log:
         self._persist()
 
     def result(self, **kw):
-        """단계 성공/강등 경로의 result 기록(귀속 자동 첨부)."""
+        """단계 성공/강등 경로의 result 기록(귀속 자동 첨부).
+
+        ★P0-3 래치 리셋: 자기 sid 의 **정상 완주(ok:true)** 만 재시도 항목을 제거한다 —
+          declined(exit 7)·session_error(exit 10)·dept_fallback 등 ok:null 경로는 리셋이
+          아니다(수리 관측 없이 래치를 풀면 소진 상한이 무의미해진다). 리셋 조건을 '직전 런
+          대조'가 아니라 완주 관측으로 두므로 교차 실행이 래치를 지우지 못한다.
+        """
+        if kw.get("ok") is True:
+            (self.data.get("retry") or {}).pop(self.surface, None)
         self.data["result"] = self._attributed(dict(kw))
         self._persist()
 
@@ -885,9 +961,22 @@ class _Log:
           덮으면 같은 레인의 건강한 master 가 남긴 ok:true 를 남의 pane 이 지워, §0 의 '직접 실행'
           분기를 무한 churn 시킨다(부트 폭풍). 인프라 실패(ping·boot·check·lane-pack)는 그대로
           ok=False 다 — 그건 실제로 이 레인의 부트가 깨진 사실이다.
+        ★P0-3 재시도 래치 기록: state='session_error' 일 때만 자기 sid 의 카운터를 +1 하고
+          result 에 `retry_eligible=(기록 후 count<=RETRY_LATCH_MAX)` 를 파생한다 — §0-A 의
+          session_error 행이 소비하는 **유일한** 재실행 근거다(오너 결정 ⑬Y: 최초 실패
+          count=1=true · 같은 surface 연속 2회째부터 false=소진). session_error 기록 지점은
+          이 함수의 두 호출부(③ 선행/직접 claim 비거부 실패 · ③-d 폴백 전제 미확인)뿐이라
+          여기 한 곳이 래치 갱신의 단일 소유자다.
         """
+        extra = {}
+        if state == "session_error":
+            latch = self.data.setdefault("retry", {})
+            ent = latch.get(self.surface)
+            count = (int(ent.get("count", 0) or 0) if isinstance(ent, dict) else 0) + 1
+            latch[self.surface] = {"count": count, "at": time.time()}
+            extra["retry_eligible"] = (count <= RETRY_LATCH_MAX)
         self.step(name, code, detail)
-        self.result(ok=ok, state=state, failed_step=name, exit=exit_code)
+        self.result(ok=ok, state=state, failed_step=name, exit=exit_code, **extra)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
         # ★실패 가시화(2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
         # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — 알림으로 승격.
@@ -2358,7 +2447,10 @@ def cmd_run():
     """
     if _acquire_singleflight() is None:
         return _emit_skip_verdict()
-    log = _Log()
+    # ★P0-3 래치 스냅샷은 반드시 _Log 생성 **이전**이다 — __init__ 의 선기록(_persist)이 슬롯을
+    #   즉시 덮으므로 순서가 뒤집히면 carry-forward 원본이 사라진다. 싱글플라이트 획득 **후**라
+    #   read-modify-write 경합도 없다(패자는 boot-last 무접촉 exit 11).
+    log = _Log(_load_retry_carry(lane_state_path("boot_last")))
     exit_code = None
     try:
         exit_code = _cmd_run_chain(log)

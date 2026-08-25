@@ -503,6 +503,99 @@ check("5fb-u2 claim-role 재호출 없음(유계 음수 허용)",
 check("5fb-u3 시계 후퇴 stderr 진단 1줄", "시계 후퇴" in err, "err=%s" % err[-300:])
 shutil.rmtree(tmp)
 
+
+# ── 5-fb-v. ★P0-3 재시도 래치(retry_eligible) 핀: session_error(exit 10) 기록이 boot-last
+#    **최상위** "retry" per-surface 맵({sid:{count,at}})을 기계 갱신하고, result.retry_eligible 이
+#    §0-A session_error 행의 유일한 재실행 근거가 된다. 오너 결정 ⑬Y: 최초 실패(자기 이력 0)는
+#    count=1=true(1회 재실행 허용) · 같은 surface 연속 2회째는 count=2=false(소진). 래치는
+#    cmd_run 이 _Log 선기록 **이전에** 스냅샷하는 carry-forward 라, 타 surface 완주 런(정당거부
+#    declined 포함)이 본체 result 를 덮어도 불소실이어야 한다(R3-P03-1 음성 독해 — 소진 증거의
+#    외래 쓰기 소실 = 래치 재무장 = 기계 유계 붕괴의 봉합 검체). ──
+def _bl(home):
+    return json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"),
+                          encoding="utf-8"))
+
+
+tmp = tempfile.mkdtemp(prefix="boot-t5fbv-")
+env, home = make_env(tmp, claim_exit=1)   # 스텁 claim=거부 마커+rc1 — v3 개입 런(직접 claim)용
+env["CYS_DEPT_FALLBACK"] = "0"            # 개입 런을 declined 구계약(exit 7)으로 고정
+bind_claim(env, 6)                        # 자기 surface(7)의 선행 claim rc6 → session_error 확정
+code, out, err = run(env)
+bl = _bl(home)
+check("5fb-v1 최초 session_error exit 10", code == 10, "exit=%d" % code)
+check("5fb-v2 ⑬Y 최초 실패 retry_eligible=true(count=1)",
+      bl.get("result", {}).get("retry_eligible") is True
+      and bl.get("retry", {}).get("7", {}).get("count") == 1,
+      json.dumps({"result": bl.get("result", {}), "retry": bl.get("retry")},
+                 ensure_ascii=False)[:300])
+# 타 surface(8)의 정당거부(declined) 개입 — 본체 result 는 덮이지만 래치 맵은 이월돼야 한다
+env8 = dict(env)
+for _k in ("CYS_CLAIM_RC", "CYS_CLAIM_OUT", "CYS_CLAIM_SID", "CYS_CLAIM_AT"):
+    env8.pop(_k, None)
+env8["CYS_SURFACE_ID"] = "8"
+code8, _, _ = run(env8)
+bl = _bl(home)
+check("5fb-v3 타 surface 개입 런=declined(검체 전제 — 본체 result 를 실제로 덮는다)",
+      code8 == 7 and bl.get("result", {}).get("state") == "declined"
+      and bl.get("result", {}).get("surface") == "8",
+      "exit=%d result=%s" % (code8, json.dumps(bl.get("result", {}), ensure_ascii=False)[:200]))
+check("5fb-v4 개입 후에도 래치 carry-forward 생존(retry['7'] 불소실)",
+      bl.get("retry", {}).get("7", {}).get("count") == 1,
+      json.dumps(bl.get("retry"), ensure_ascii=False)[:200])
+# 같은 surface(7) 2회째 session_error → count=2 → retry_eligible=false(소진 — 기계 유계)
+code, out, err = run(env)
+bl = _bl(home)
+check("5fb-v5 동일 surface 연속 2회째 session_error retry_eligible=false(count=2 소진)",
+      code == 10 and bl.get("result", {}).get("retry_eligible") is False
+      and bl.get("retry", {}).get("7", {}).get("count") == 2,
+      json.dumps({"result": bl.get("result", {}), "retry": bl.get("retry")},
+                 ensure_ascii=False)[:300])
+shutil.rmtree(tmp)
+
+# ── 5-fb-w. ★P0-3 래치 TTL(24h) 회수 핀: at 이 24h 지난 항목은 새 런의 carry-forward 에서
+#    회수된다(surface 는 단명이라 맵의 무한 증식 차단 — 항목 유계 2종의 하나). 회수 뒤의
+#    session_error 는 다시 '최초 실패'(count=1·true)로 판정된다. ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbw-")
+env, home = make_env(tmp)
+bind_claim(env, 6)
+code, out, err = run(env)
+blp = os.path.join(home, ".cys", "state", "boot-last.json")
+bl = json.load(open(blp, encoding="utf-8"))
+check("5fb-w1 래치 선행 적재(count=1 — 검체 전제)",
+      bl.get("retry", {}).get("7", {}).get("count") == 1,
+      json.dumps(bl.get("retry"), ensure_ascii=False)[:200])
+bl["retry"]["7"]["at"] = time.time() - (24 * 3600 + 60)   # 24h+ 경과로 밀어 회수 대상화
+with open(blp, "w", encoding="utf-8") as f:
+    json.dump(bl, f, ensure_ascii=False)
+bind_claim(env, 6)                                        # 신선한 스탬프로 재결박
+code, out, err = run(env)
+bl = json.load(open(blp, encoding="utf-8"))
+check("5fb-w2 24h 경과 항목 회수 → 최초 실패로 재판정(count=1·retry_eligible=true)",
+      code == 10 and bl.get("result", {}).get("retry_eligible") is True
+      and bl.get("retry", {}).get("7", {}).get("count") == 1,
+      json.dumps({"result": bl.get("result", {}), "retry": bl.get("retry")},
+                 ensure_ascii=False)[:300])
+shutil.rmtree(tmp)
+
+# ── 5-fb-x. ★P0-3 래치 리셋 핀: 자기 surface 의 정상 완주(ok:true)가 자기 항목을 제거한다 —
+#    수리된 세션의 다음 session_error 는 다시 '최초 실패'로 판정돼야 한다(리셋 없는 래치는
+#    수리 후에도 영구 소진 = 자가치유 경로 재봉인). declined·session_error 등 ok:null 완주는
+#    리셋이 아니다(5fb-v4 가 그 방향을 함께 핀한다). ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbx-")
+env, home = make_env(tmp)
+bind_claim(env, 6)
+run(env)                                   # count=1 적재
+env_ok = dict(env)
+for _k in ("CYS_CLAIM_RC", "CYS_CLAIM_OUT", "CYS_CLAIM_SID", "CYS_CLAIM_AT"):
+    env_ok.pop(_k, None)
+code, out, err = run(env_ok)               # 스텁 직접 claim rc0 → 정상 완주(ok:true)
+bl = _bl(home)
+check("5fb-x1 정상 완주 exit 0(검체 전제)", code == 0, "exit=%d err=%s" % (code, err[-200:]))
+check("5fb-x2 ok:true 완주가 자기 래치 항목 제거(리셋)",
+      "7" not in (bl.get("retry") or {}),
+      json.dumps(bl.get("retry"), ensure_ascii=False)[:200])
+shutil.rmtree(tmp)
+
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
 # ★마커를 실어 레인 게이트(_is_base_socket)를 실검증한다(2026-08-12 재검증 지적): 마커 없이
 #   돌리면 origin 게이트가 먼저 None 을 반환해 이 핀이 엉뚱한 게이트로 green — 레인 게이트가

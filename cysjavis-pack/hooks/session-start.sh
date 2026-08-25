@@ -219,6 +219,9 @@ if [ "$CYS_ROLE" = "master" ] && [ -f "$BOOT_PY" ]; then
   printf '  %s\n' "$BOOT_CMD"
   echo "  (exit 7=이 surface는 master 아님·인계 / 10=세션 컨텍스트 오류 / 11=다른 런이 부트 중(정상 skip)"
   echo "   / 그 외 비0=단계·원인 그대로 보고 / 완료 선언은 최종 JSON 인용 시에만)"
+  # ★P0-3 session_error 분기(§0-A session_error 행의 브리지면): 재실행 1회의 근거는 문안이 아니라
+  #   boot-last 의 도구 파생값(retry_eligible)이다 — LLM 재량 재시도 금지·기계 래치가 상한을 집행.
+  echo "  (자기 surface 완주 런이 session_error(exit 10)면 boot-last의 result.retry_eligible이 사실이다 — true=위 명령 1회 재실행(§0-A session_error 행이 재실행 금지 행보다 우선) / false=재실행 금지·세션 배선을 오너에 보고)"
 fi
 # ── 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) ──
 # 업데이트·치유 불가침 사용자 확장점(팩 파일 직접 수정 대체 채널). 안전핵 키워드 줄은 주입에서

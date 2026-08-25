@@ -130,7 +130,7 @@ _MOCK_BOOT = "#!/usr/bin/env python3\nprint('MOCK')\n"   # 발화 성공 경로�
 
 
 def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_env=None,
-                   hook_path=None, boot_py=_MOCK_BOOT):
+                   hook_path=None, boot_py=_MOCK_BOOT, cys_body=None):
     """훅을 격리 실행하고 CompletedProcess 를 그대로 돌려준다(stdout/stderr **분리** 관측).
 
     ★W-F2 가 요구한 분리다: note 생존 판정은 stdout 의 JSON 완주가 근거고, 소실 원인 판정은
@@ -138,6 +138,8 @@ def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_e
     hook_path — 기본 None=실제 훅(HOOK). W-F2 음성 대조가 가드를 뗀 변형 사본 경로를 넘긴다.
     boot_py   — 목 javis_bootstrap.py 소스(기본 _MOCK_BOOT=발화 성공). None 이면 **만들지
                 않아** BOOT 부재 경로가 된다(notify_pipe_release 와 같은 방향).
+    cys_body  — 목 cys 전체 소스 오버라이드(기본 None=surface-role 주입 no-op). P0-4 정직 예보
+                검체가 claim-role rc6 을 재현할 때 쓴다(기본 목은 claim rc0 으로 접는다).
     """
     home = tempfile.mkdtemp()
     pack = tempfile.mkdtemp()
@@ -150,7 +152,8 @@ def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_e
     # 목 cys — surface-role만 주입, 나머지 no-op
     cysp = os.path.join(mockbin, "cys")
     with open(cysp, "w") as f:
-        f.write('#!/bin/bash\n[ "$1" = surface-role ] && { echo "%s"; exit %d; }\nexit 0\n'
+        f.write(cys_body if cys_body is not None else
+                '#!/bin/bash\n[ "$1" = surface-role ] && { echo "%s"; exit %d; }\nexit 0\n'
                 % (surface_role, role_rc))
     os.chmod(cysp, 0o755)
     env = dict(os.environ)
@@ -405,6 +408,57 @@ def note_cp949_survival(fails):
                          "(다른 사망 원인 — 검체 무효): %r" % (name, (r.stdout + r.stderr)[:200]))
 
 
+def note_success_named_format(fails):
+    """★P0-4/R3-P04-1 회귀 핀 — 성공 note 는 '파싱 가능한 JSON 1줄'로 발행된다(명명식 포맷).
+
+    결함 클래스(수리 전 실측): 성공 note 는 %s 10개 × **비순차** argv 튜플([6],[6],[7],[8],[3],
+    [5],[1],[4],[2],[6])이라, 문안에 자리표시자 하나를 더하거나 빼며 튜플·인자 목록을 함께 못
+    고치면 python % 가 TypeError 로 죽고 stdout 에 JSON 이 전혀 안 나가 통보가 통째로 소실됐다
+    (spawn 은 이미 끝난 뒤 + 훅은 exit 0 = 완전 침묵 — W-F2 가 문서화한 사고 클래스의 재발
+    경로·비순차 매핑이라 눈 대조도 불가). 수리는 dict(zip(순차 인자)) + %(key)s 명명식 전환이고,
+    이 핀은 그 전환 후의 유일한 안전망이다(새 키 추가 시 셸 인자 누락 = KeyError = 같은 소실).
+
+    검증 2경로(+P0-4 정직 예보 분기):
+      ① claim rc0(기본 목) — note JSON 완주 + 헤드라인 마커 + 종전 예보('팀 세션 기동') +
+         재실행 금지 경고 생존 + 포맷 예외(stderr TypeError/KeyError) 부재.
+      ② claim rc6(목 오버라이드) — 같은 생존 속성 + 정직 예보('결정론적으로 실패한다' ·
+         retry_eligible/§0-A 포인터). 헤드라인 마커·재실행 금지 문구는 rc6 에서도 불변이어야
+         한다(H-DOC-1 ②·'발화됨' substring 판정 훅 테스트의 전복 금지 — P0-4 계약).
+    """
+    cases = (
+        ("rc0", None,
+         ("팀 세션 기동", "생존확인")),
+        ("rc6", ('#!/bin/bash\n'
+                 '[ "$1" = surface-role ] && { echo ""; exit 0; }\n'
+                 '[ "$1" = claim-role ] && exit 6\n'
+                 'exit 0\n'),
+         ("결정론적으로 실패한다", "retry_eligible", "session_error")),
+    )
+    for name, cys_body, frags in cases:
+        try:
+            r = _run_hook_proc("너는 마스터다", cys_body=cys_body)
+        except Exception as e:
+            fails.append("P0-4(%s): 훅 실행 실패(계측 불능은 통과가 아니다): %s" % (name, e))
+            continue
+        ctx = _note_ctx(r.stdout)   # json.loads 완주가 곧 'JSON 1줄' 판정(부분 출력 사망=소실)
+        if "[결정론 부트스트랩 발화됨 — 하네스 강제]" not in ctx:
+            fails.append("P0-4 회귀(%s): 성공 note JSON 소실 또는 헤드라인 마커 훼손 — "
+                         "additionalContext=%r stderr=%r" % (name, ctx[:150], r.stderr[:200]))
+            continue
+        if "재실행하지 마라" not in ctx:
+            fails.append("P0-4 회귀(%s): 재실행 금지 경고가 note 에서 사라졌다(불변 문구)" % name)
+        for frag in frags:
+            if frag not in ctx:
+                fails.append("P0-4 회귀(%s): 예보 문안에 %r 이 없다(정직 예보/종전 예보 분기 "
+                             "훼손): %r" % (name, frag, ctx[:300]))
+        for sig in ("TypeError", "KeyError", "Traceback"):
+            if sig in r.stderr:
+                fails.append("P0-4 회귀(%s): note 포맷 예외 관측(%s) — 침묵 소실 경로 부활: %r"
+                             % (name, sig, r.stderr[:300]))
+        if r.returncode != 0:
+            fails.append("P0-4(%s): 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % (name, r.returncode))
+
+
 # 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
 # 대조한다). 구 훅 시대 회귀 목록(W1a 결정론화분) 전량 보존(회귀 계약). 전 corpus 를 ②로
 # 재실행하지 않는 이유는 비용이다(훅 1회 ≈ 프로세스 3개 — ① 이 전량을 커버한다).
@@ -499,6 +553,9 @@ def main():
     # 10. ★W-F2 note 인코딩 가드 — cp949 스큐에서도 통보 생존(+가드 제거 음성 대조)
     note_cp949_survival(fails)
 
+    # 11. ★P0-4/R3-P04-1 성공 note 명명식 포맷 — 'JSON 1줄' 생존 + rc0/rc6 예보 분기
+    note_success_named_format(fails)
+
     if fails:
         print("FAIL (%d):" % len(fails))
         for f in fails:
@@ -506,7 +563,8 @@ def main():
         sys.exit(1)
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
-          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2"
+          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2 + "
+          "P0-4 note 명명식 rc0/rc6 2"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))
