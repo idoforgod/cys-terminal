@@ -29,6 +29,11 @@
 //   install_cli_to_path()     -> InstallCliReport
 //        ok: bool(= status=="installed") / status: String / target_dir·cys_link·cysd_link·source_cys: String
 //        effective_cys: Option<String> / shadowed_by: Option<String> / warnings: Vec<String>
+//        unverified_reason: Option<String>   ★2026-08-25 계약 확장(N3 / UNRESOLVED-1)
+//          status=="unverified" 일 때만 Some 이고 값은 정확히 "not_on_path" | "probe_failed".
+//          그 외 상태에서는 None(=null).
+//            · "not_on_path"  = 검증 명령이 **정상 종료**했고 로그인 셸 PATH 에서 cys 를 못 찾았다
+//            · "probe_failed" = 검증 명령을 실행하지 못했거나 비정상 종료·타임아웃이다
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── 플랫폼 게이팅 ─────────────────
@@ -50,6 +55,44 @@ export function isMacUserAgent(ua: string): boolean {
 /// 아무 할 일이 없는 성공만 volatile.
 export type ToastPlan = { category: string; title: string; body: string; sticky: boolean; id: string };
 
+// ── (MINOR-N4 · N6) ToastPlan 하나를 실제로 화면에 낼 때의 순수 계획 ─────────────────
+/// main.ts 의 토스트 배선에는 등급이 거짓말을 하는 구멍이 둘 있었다:
+///
+///   (N4) stickyToast 는 같은 id 로 다시 부르면 **엘리먼트를 재사용**하는데 본문(textContent)만
+///        갈아끼우고 className(= 등급 테두리색)은 최초 생성값을 그대로 뒀다. 그래서
+///        "⚠ 설치 실패"(watchdog) 뒤에 "✅ 셸 설치 완료"(system)가 같은 id 로 오면 **문구는 성공,
+///        테두리는 경고색**인 토스트가 남는다. 색이 등급을 표시하는 유일한 장치인데 그 색이 틀린다.
+///
+///   (N6) volatile 토스트는 id 가 없어 같은 id 의 **살아 있는 sticky 를 내리지 못한다**. 재현:
+///        설치 → 관리자 창 Cancel → 실패 sticky(60초) → 곧바로 다시 눌러 성공 → 성공 토스트가
+///        실패 토스트 **옆에** 뜬다. 서로 모순되는 두 알림이 최대 60초 공존한다.
+///
+/// 둘 다 "무엇을 낼지"가 아니라 "어떻게 내는지"의 결정이라 순수 함수로 뽑아 테스트한다.
+/// (이 모듈에 두는 이유: 토스트 수명 모듈 toastttl.ts 가 이 라운드의 수정 허용 범위 밖이다.
+///  stickyToast 는 CLI 전용이 아니므로 className 규칙은 toastClassName 으로 따로 노출한다.)
+export type ToastEmit = {
+  /// sticky(60초·id 갱신) 인가 volatile(8초) 인가 — ToastPlan.sticky 그대로.
+  sticky: boolean;
+  /// 낼 때마다 이 값으로 className 을 **덮어쓴다**(재사용 엘리먼트의 낡은 등급색을 지운다).
+  className: string;
+  /// volatile 을 내기 **전에** 내려야 할 sticky 의 id. sticky 로 낼 때는 null
+  /// (stickyToast 자신이 같은 id 를 갱신하므로 내렸다 다시 만들 필요가 없다).
+  dismissStickyId: string | null;
+};
+
+/// 토스트 엘리먼트의 className — 등급(category)이 곧 테두리색이다. 생성·재사용 양쪽에서 쓴다.
+export function toastClassName(category: string): string {
+  return `toast ${category}`;
+}
+
+export function toastEmitPlan(plan: ToastPlan): ToastEmit {
+  return {
+    sticky: plan.sticky,
+    className: toastClassName(plan.category),
+    dismissStickyId: plan.sticky ? null : plan.id,
+  };
+}
+
 /// sticky 토스트 id — 같은 id 재호출은 갱신(중복 스택 없음). main.ts 배선의 단일 진실.
 export const INSTALL_TOAST_ID = "cli-install";
 export const UNINSTALL_TOAST_ID = "cli-uninstall";
@@ -59,8 +102,9 @@ export const CLI_NOTES_TOAST_ID = "cli-status-notes";
 /// Rust InstallCliReport.status 계약 — 정확히 세 값.
 ///   installed          = 심링크 생성 + 로그인 셸 기준 `which -a cys` 1순위가 /usr/local/bin/cys
 ///   installed_shadowed = 심링크는 생겼으나 PATH 앞을 가리는 다른 cys가 있다
-///   unverified         = 확인을 못 했다(명령 실패·타임아웃) **또는** 로그인 셸 PATH에서 cys를 못 찾았다
-///                        — 두 갈래다(MINOR-9). 어느 쪽인지는 unverifiedCause(warnings)로 가른다.
+///   unverified         = 확인을 못 했다(명령 실패·비정상 종료·타임아웃) **또는** 로그인 셸 PATH에서
+///                        cys를 못 찾았다 — 두 갈래다(MINOR-9). 어느 쪽인지는 **기계 필드**
+///                        `unverified_reason` 하나로 가른다(N3 — 산문 파싱 폐기).
 export type CliInstallStatus = "installed" | "installed_shadowed" | "unverified";
 
 /// Rust `InstallCliReport` 의 TS 사본. **선택 필드가 없다** — Rust 가 항상 전부 보낸다.
@@ -74,6 +118,9 @@ export type InstallCliReport = {
   source_cys: string;
   effective_cys: string | null;
   shadowed_by: string | null;
+  /// (N3) unverified 두 갈래의 **기계 판별자**. status 와 같은 규약으로 `string`(느슨) 으로 받고
+  /// 값 검증은 unverifiedCause 가 한다 — 판독기는 응답을 옮기고, 판정은 판정 함수가 한다.
+  unverified_reason: string | null;
   warnings: string[];
 };
 
@@ -103,6 +150,9 @@ export function readInstallReport(raw: unknown): InstallCliReport {
     source_cys: str(r.source_cys),
     effective_cys: strOrNull(r.effective_cys),
     shadowed_by: strOrNull(r.shadowed_by),
+    // 필드가 없는 구 백엔드는 null 이 되고, null 은 unverifiedCause 에서 "unknown"(원인 불명)으로
+    // 접힌다 — 없는 값을 있는 값으로 추측하지 않는다.
+    unverified_reason: strOrNull(r.unverified_reason),
     warnings: strList(r.warnings),
   };
 }
@@ -114,28 +164,49 @@ export function normalizeInstallStatus(raw: unknown): CliInstallStatus {
   return "unverified";
 }
 
-// ── (MINOR-9) unverified 의 두 갈래 ─────────────────
+// ── (N3 · MINOR-9) unverified 의 두 갈래 — **기계 필드로만** 가른다 ─────────────────
 /// Rust classify_install_status 는 성질이 다른 두 종단을 같은 status("unverified")로 접는다:
-///   ① probe-failed  — 확인 명령 자체를 못 돌렸다(실행 실패·타임아웃). 무엇이 잡히는지 **모른다**.
-///   ② not-on-path   — 확인은 정상이었는데 로그인 셸 PATH에서 cys 를 못 찾았다. 원인이 특정된다
-///                     (PATH에 /usr/local/bin 이 없다). 예전 UI 문구는 이 경우까지 '검증 명령 실패
-///                     또는 응답 없음'으로 단정해 **사실과 달랐다**(docs/INSTALL.md 도 같은 오단정).
+///   ① probe_failed — 확인 명령 자체를 못 돌렸다(실행 실패·비정상 종료·타임아웃).
+///                    무엇이 잡히는지 **모른다**.
+///   ② not_on_path  — 확인은 정상 종료했는데 로그인 셸 PATH에서 cys 를 못 찾았다. 원인이 특정된다
+///                    (PATH에 /usr/local/bin 이 없다). 예전 UI 문구는 이 경우까지 '검증 명령 실패
+///                    또는 응답 없음'으로 단정해 **사실과 달랐다**(docs/INSTALL.md 도 같은 오단정).
 ///
-/// 계약(InstallCliReport)에는 분기 플래그가 없으므로 신호는 warnings 문장이다 — Rust 가 두 갈래에
-/// 서로 다른 문장을 담는다. 문구가 바뀌어 어느 쪽도(또는 양쪽 다) 걸리면 "unknown" 으로 떨어지고,
-/// UI 는 원인을 단정하지 않는 문구를 쓴다(모르면 모른다고 말한다 — 오단정이 이 결함의 본체였다).
-export type UnverifiedCause = "probe-failed" | "not-on-path" | "unknown";
+/// ★2026-08-25 계약 확장(N3 / UNRESOLVED-1): 분기의 유일한 근거는 `unverified_reason` 필드다.
+/// 그 전에는 warnings **산문을 정규식으로 파싱**했는데, 그것이 틀린 이유는 세 겹이었다 —
+///   (1) **계약 불일치**: Rust 는 "경고문 첫 구절(`PATH 확인 결과:` / `PATH 확인 실패:`)을 안정
+///       판별자로 고정한다"고 선언했는데, TS 정규식은 그 접두가 아니라 문장 **속** 어절
+///       ('찾지 못했'·'타임아웃')을 봤다. 양쪽이 서로 다른 것을 계약이라 부르고 있었다.
+///   (2) **판정 대상 오염**: 같은 warnings 배열에 백업 통보문("…로 백업한 뒤 링크를 만들었습니다")
+///       이 합류한다. 남의 문장에 들어 있는 어절이 등급 판정을 흔든다.
+///   (3) **산문은 계약이 될 수 없다**: 문구는 다듬기·번역으로 언제든 바뀌고, 바뀌는 순간 조용히
+///       오분기한다(테스트가 같은 문자열을 픽스처로 쓰고 있으면 초록인 채로 봉인된다).
+/// 값이 없거나(구 백엔드) 계약 밖 값이면 "unknown" 으로 접는다 — 모르면 모른다고 말한다.
+export type UnverifiedReason = "not_on_path" | "probe_failed";
+/// 계약값 둘 + 값이 없을 때의 "unknown"(구 백엔드·미상 — 원인을 단정하지 않는다).
+export type UnverifiedCause = UnverifiedReason | "unknown";
 
-const NOT_ON_PATH_MARK = /찾지 못했|not found/i;
-const PROBE_FAILED_MARK = /확인\(which|타임아웃|timed? ?out|실행 실패|상태 확인 실패|응답 없음/i;
-
-export function unverifiedCause(warnings: readonly string[]): UnverifiedCause {
-  const joined = warnings.join("\n");
-  const notOnPath = NOT_ON_PATH_MARK.test(joined);
-  const probeFailed = PROBE_FAILED_MARK.test(joined);
-  if (notOnPath === probeFailed) return "unknown"; // 둘 다거나 아무것도 아니면 단정하지 않는다
-  return notOnPath ? "not-on-path" : "probe-failed";
+export function unverifiedCause(reason: string | null | undefined): UnverifiedCause {
+  return reason === "not_on_path" || reason === "probe_failed" ? reason : "unknown";
 }
+
+// ── (MINOR-N7) 이 확인이 **무엇을 잰 것인지** 밝히는 단서 ─────────────────
+/// Rust 는 `$SHELL -lc 'which -a cys'` 로 잰다. 그것은 **비대화형 로그인 셸**이라 사용자의 대화형
+/// rc 를 읽지 않는다 — 실측(2026-08-25): `zsh -lc` 는 `.zshenv`·`.zprofile`·`.zlogin` 만 읽고
+/// `.zshrc` 는 건너뛴다(`bash -lc` 도 `.bash_profile` 만 읽고 `.bashrc` 는 건너뛴다).
+/// 그래서 PATH 를 `~/.zshrc` 에 넣어 둔 사용자는 **터미널에서 cys 가 멀쩡히 동작하는데도** 이
+/// 확인만 실패한다. 그 거짓 경고를 그대로 두면 사용자는 고칠 것이 없는 것을 고치러 간다.
+///
+/// ★대화형(-lic)으로 바꾸는 안은 채택하지 않는다: 버튼 클릭의 부작용으로 사용자의 대화형 rc 를
+/// 실행하면 nvm·conda·oh-my-zsh 같은 것이 백그라운드 프로세스를 띄울 수 있다. 정직한 문구가 답이다.
+export const NONINTERACTIVE_PROBE_NOTE =
+  "이 확인은 비대화형 로그인 셸 기준입니다 — 터미널에서 cys 가 이미 동작한다면 무시해도 됩니다.";
+
+/// (MINOR-N7) PATH 를 정말 고쳐야 할 때 **실제로 읽히는 파일**만 지목한다. `~/.zshrc` 를 고치라던
+/// 예전 안내는 그대로 따라도 이 경고가 사라지지 않는 실행 불가능한 지시였다.
+export const LOGIN_SHELL_PATH_FILES =
+  "비대화형 로그인 셸이 실제로 읽는 파일(zsh: ~/.zshenv · ~/.zprofile · ~/.zlogin / " +
+  "bash: ~/.bash_profile)";
 
 /// 설치 결과 → 토스트 등급·문구. installed 만 성공("system"), 나머지 둘은 경고("watchdog")로
 /// 등급을 낮춘다. 이 코드베이스의 토스트 등급은 테두리색 하나뿐이고 watchdog은 완료 알림에도
@@ -173,29 +244,30 @@ export function installResultToast(rep: InstallCliReport): ToastPlan {
     };
   }
 
-  // unverified — 원인 두 갈래를 구분해 말한다(MINOR-9).
-  const cause = unverifiedCause(warn);
-  if (cause === "not-on-path") {
+  // unverified — 원인 두 갈래를 **기계 필드로** 구분해 말한다(N3 · MINOR-9).
+  // warnings 는 여기서 읽지 않는다: tail 로 사용자에게 그대로 보여줄 뿐, 판정 근거로는 쓰지 않는다.
+  const cause = unverifiedCause(rep.unverified_reason);
+  if (cause === "not_on_path") {
     return {
       category: "watchdog",
       title: "⚠ 셸 설치 미완료 — PATH에서 cys를 찾지 못했습니다",
       body:
         `심링크(${links})는 만들었지만, 로그인 셸의 PATH에서 cys 를 찾지 못했습니다 — ` +
         `PATH에 /usr/local/bin 이 들어 있지 않을 수 있습니다(설치 자체가 실패한 것은 아닙니다). ` +
-        `새 터미널에서 'which -a cys' 를 실행해 보고, 아무것도 나오지 않으면 셸 설정 파일에 ` +
-        `/usr/local/bin 을 PATH로 추가하세요.${tail}`,
+        `${NONINTERACTIVE_PROBE_NOTE} 그래도 안 잡히면 ${LOGIN_SHELL_PATH_FILES}에 ` +
+        `/usr/local/bin 을 PATH로 추가하세요 — ~/.zshrc 는 이 확인에서 읽히지 않습니다.${tail}`,
       sticky: true,
       id: INSTALL_TOAST_ID,
     };
   }
-  if (cause === "probe-failed") {
+  if (cause === "probe_failed") {
     return {
       category: "watchdog",
       title: "⚠ 셸 설치 확인 불가",
       body:
-        `심링크(${links})는 만들었지만, 확인 명령(which -a cys)이 실패했거나 응답하지 않아 ` +
+        `심링크(${links})는 만들었지만, 확인 명령(which -a cys)이 실패했거나 비정상 종료·무응답이라 ` +
         `실제로 어떤 cys가 잡히는지 확인하지 못했습니다. 새 터미널에서 'which -a cys' 를 직접 ` +
-        `실행해 1순위가 /usr/local/bin/cys 인지 확인하세요.${tail}`,
+        `실행해 1순위가 /usr/local/bin/cys 인지 확인하세요. ${NONINTERACTIVE_PROBE_NOTE}${tail}`,
       sticky: true,
       id: INSTALL_TOAST_ID,
     };
@@ -206,7 +278,8 @@ export function installResultToast(rep: InstallCliReport): ToastPlan {
     body:
       `심링크(${links})는 만들었지만, 실제로 어떤 cys가 잡히는지 확인하지 못했습니다 — ` +
       `확인 명령이 실패했거나, 로그인 셸의 PATH에 /usr/local/bin 이 없는 경우입니다(어느 쪽인지는 ` +
-      `단정하지 않습니다). 새 터미널에서 'which -a cys' 를 직접 실행해 확인하세요.${tail}`,
+      `단정하지 않습니다). 새 터미널에서 'which -a cys' 를 직접 실행해 확인하세요. ` +
+      `${NONINTERACTIVE_PROBE_NOTE}${tail}`,
     sticky: true,
     id: INSTALL_TOAST_ID,
   };

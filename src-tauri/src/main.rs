@@ -1124,6 +1124,17 @@ fn plan_install_backups(probes: &[LinkProbe], stamp: &str) -> Vec<(String, Strin
         .collect()
 }
 
+/// (MAJOR-N1) 계획된 백업 쌍 중 **파일시스템에 실제로 존재하는 것만** 남긴다(관측 — 판정 없음).
+/// 계획을 그대로 읊으면 생기지도 않은 파일을 되돌리라고 안내하게 되므로 반드시 재관측한다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn observe_existing_backups(planned: &[(String, String)]) -> Vec<(String, String)> {
+    planned
+        .iter()
+        .filter(|(_, bak)| std::path::Path::new(bak).exists())
+        .cloned()
+        .collect()
+}
+
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 생성.
 ///
 /// ★BLOCK-1(2026-08-25) **파괴 금지 → 백업**: 예전 본문은 `ln -sf` 하나였다. `ln -sf` 는 대상이
@@ -1182,6 +1193,129 @@ fn parse_which_a(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// (MINOR-N2/N5) 검증 셸에 태울 명령. 끝에 **완료 표식**을 찍는 것이 요점이다 — `which` 는 못 찾으면
+/// rc=1 로 끝나므로 셸의 종료 상태만으로는 '못 찾음'(정상 측정)과 '셸이 명령을 아예 못 돌림'(측정
+/// 실패)을 구분할 수 없다. 표식 echo 를 뒤에 붙이면 명령 목록이 끝까지 돌았을 때 마지막 명령이
+/// echo 라서 **rc=0** 이 되고, 표식이 stdout 에 남는다. 실측(2026-08-25 이 기계):
+/// - `/bin/zsh -lc "which -a nosuchbinaryxyz; echo <표식>"` → rc=0 · stdout 에 표식 있음
+/// - `/bin/tcsh -lc "…"` → rc=1 · stdout 빈 문자열(표식 없음) = 측정 실패
+/// 표식 줄은 절대경로가 아니므로 `parse_which_a` 가 자동으로 걸러낸다(경로 목록을 오염시키지 않는다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const PROBE_END_MARK: &str = "__cys_probe_end__";
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn which_probe_command() -> String {
+    format!("which -a cys; echo {PROBE_END_MARK}")
+}
+
+/// (MINOR-N2/N5) 검증 셸 실행 결과 → `WhichProbe`(순수). **성공 플래그를 버리지 않는다.**
+///
+/// 예전 코드는 `Ok((_, stdout))` 로 종료 상태를 통째로 폐기했다. 그래서 `-lc` 를 받지 못하는 셸
+/// (실측: `/bin/tcsh`·`/bin/csh` — 둘 다 macOS 동봉이고 `/etc/shells` 에 등재돼 있어 `$SHELL` 로
+/// 실제 존재한다)이 rc=1 + 빈 stdout 을 내면 그것을 `Completed(vec![])` 로 접었고, UI 는 "검증
+/// 명령은 정상 실행됐지만 PATH에서 못 찾았다"는 **거짓말**과 함께 셸 설정에 PATH 를 추가하라는
+/// 틀린 안내를 했다.
+///
+/// 통과 조건은 **둘 다**다: ① 셸이 정상 종료했고 ② 완료 표식이 stdout 에 있다. 하나라도 없으면
+/// 측정 실패로 떨어뜨린다 — 헌장 "측정 불능은 어떤 게이트에서도 통과가 아니다".
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn interpret_which_probe(shell_ok: bool, stdout: &str, shell_name: &str) -> WhichProbe {
+    let marked = stdout.lines().any(|l| l.trim() == PROBE_END_MARK);
+    if shell_ok && marked {
+        return WhichProbe::Completed(parse_which_a(stdout));
+    }
+    WhichProbe::Unmeasured(format!(
+        "{shell_name}가 검증 명령을 끝까지 실행하지 못했습니다(종료상태 {}, 완료표식 {})",
+        if shell_ok { "정상" } else { "비정상" },
+        if marked { "있음" } else { "없음" },
+    ))
+}
+
+/// (MINOR-N5) `$SHELL` 이 `-lc` 계약을 지키지 못할 때 **한 번만** 갈아탈 대체 셸(순수 판정).
+///
+/// 실측(2026-08-25): `/bin/tcsh -lc …` → `Unknown option: '-lc'` + rc=1. csh 계열은 `-l` 을 단독
+/// 플래그로만 받는다. 반대로 sh/bash/zsh/dash/ksh/fish 는 `-lc` 를 받으므로, 이들이 실패했다면
+/// 원인은 셸 계약이 아니라 rc 지연·환경이고 **같은 셸로 재시도해도 같은 결과**다(게다가 5초
+/// 타임아웃을 한 번 더 무는 순손해). 그래서 폴백은 '알려진 -lc 셸이 아닌 경우'에만 준다.
+/// 대체했다는 사실은 셸 이름 문구에 반드시 밝힌다 — 잰 적 없는 것을 잰 척하지 않는다(MAJOR-4).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn probe_fallback_shell(login_shell: &str) -> Option<&'static str> {
+    const LC_CAPABLE: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"];
+    let name = std::path::Path::new(login_shell)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| login_shell.to_string());
+    if LC_CAPABLE.contains(&name.as_str()) {
+        None
+    } else {
+        Some("/bin/zsh")
+    }
+}
+
+/// (MINOR-N2/N5) 한 셸로 검증 프로브를 1회 실행한다(실행부 — 판정은 `interpret_which_probe`).
+/// 기한 5초(D6): 로그인 셸 rc 가 매달려도 버튼은 반드시 돌아온다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn run_which_probe(shell: &str, command: &str, shell_name: &str) -> WhichProbe {
+    match run_capture_with_timeout(
+        shell,
+        &["-lc", command],
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok((shell_ok, stdout)) => interpret_which_probe(shell_ok, &stdout, shell_name),
+        Err(reason) => WhichProbe::Unmeasured(reason),
+    }
+}
+
+/// (MAJOR-N1) 설치 스크립트가 **도중에** 실패했을 때의 에러 문구(순수). 부분 성공은 부분 성공으로
+/// 보고한다.
+///
+/// 실사고: 승격 스크립트는 `cys` 백업+링크까지 끝내고 `cysd` 의 mv 에서 거부돼 전체 rc=1 이 됐는데,
+/// 실패 반환이 백업 보고 루프보다 **앞**에 있어 사용자는 "심볼릭 생성 실패: mv: …" 만 봤다. 남의
+/// 실체 바이너리가 추측 불가능한 이름(`.cys-backup-<epoch초>`)으로 옮겨졌는데 그 사실이 어디에도
+/// 남지 않는다 = 사용자는 자기 파일을 되찾을 방법이 없다.
+///
+/// `found` 는 **실제로 존재함을 재관측한** (원본, 백업본) 쌍만 담는다 — 계획을 그대로 읊으면
+/// 존재하지도 않는 파일을 되돌리라고 안내하게 된다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn install_failure_message(base: &str, found: &[(String, String)]) -> String {
+    if found.is_empty() {
+        return base.to_string();
+    }
+    let mut msg = String::from(base);
+    msg.push_str("\n\n※ 실패 전에 이미 옮겨진 파일이 있습니다 — 그대로 두면 안 됩니다:");
+    for (orig, bak) in found {
+        msg.push_str(&format!(
+            "\n  · {orig} → {bak}\n    되돌리기: sudo mv {bak} {orig}"
+        ));
+    }
+    msg
+}
+
+/// (MINOR-N8) APFS **펌링크(firmlink) 별칭** 정규화(순수). macOS 10.15+ 는 시스템 볼륨과 데이터
+/// 볼륨을 분리하고 `/Applications`·`/Users` 를 데이터 볼륨의 같은 실체에 펌링크로 붙인다 —
+/// 실측(2026-08-25 `ls -di`): `/Applications` 와 `/System/Volumes/Data/Applications` 의 inode 가
+/// **21011 로 동일**하다. 그런데 `std::env::current_exe()` 는 `_NSGetExecutablePath` 가 준 문자열을
+/// 정규화 없이 돌려주므로 데이터 볼륨 경유로 exec 된 세션에서는 번들 조부모가
+/// `/System/Volumes/Data/Applications` 로 잡히고, 문자열 완전일치 판정이 **정상 설치를 거부**한다.
+///
+/// `std::fs::canonicalize` 로는 풀리지 않는다 — 실측(2026-08-25): `realpath` 는
+/// `/System/Volumes/Data/Applications` 를 **그대로** 돌려준다(펌링크는 심볼릭이 아니라 두 경로가
+/// 모두 '진짜'다). 그래서 선행 접두 제거라는 문자열 정규화가 유일하게 성립하는 수단이고, 순수
+/// 함수이므로 **존재하지 않는 경로에서도 안전**하다(설치 가드는 exec 경로를 문자열로만 본다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn strip_data_volume_prefix(p: &std::path::Path) -> std::path::PathBuf {
+    const DATA_VOLUME: &str = "/System/Volumes/Data";
+    let s = p.to_string_lossy();
+    match s.strip_prefix(DATA_VOLUME) {
+        // 데이터 볼륨 루트 그 자체 → `/`.
+        Some(rest) if rest.is_empty() => std::path::PathBuf::from("/"),
+        // 접두 **바로 뒤가 `/`** 일 때만 벗긴다 — `/System/Volumes/DataX/...` 같은 남의 경로를
+        // 잘못 승격시키면 가드에 구멍이 난다.
+        Some(rest) if rest.starts_with('/') => std::path::PathBuf::from(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 /// (MINOR-6) `plan_cli_install` **전용** 엄격 판정(순수): 번들이 정확히 `/Applications/cys.app`
 /// 또는 `<홈>/Applications/cys.app` 인가.
 ///
@@ -1194,8 +1328,14 @@ fn parse_which_a(stdout: &str) -> Vec<String> {
 /// ★그런데 `classify_bundle_dir` 자체는 건드리지 않는다 — `autoregister_allowed`·`boot_path_verdict`
 /// 가 같은 함수를 쓰므로 고치면 부트 전면 게이트까지 함께 좁아지는 산탄총 수술이 된다.
 /// 비가역·root 권한이 걸린 **설치만** 이 엄격 판정을 추가로 통과해야 한다.
+///
+/// ★MINOR-N8(2026-08-25) 비교 전에 **펌링크 별칭을 벗긴다** — `strip_data_volume_prefix` 참조.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn strict_install_bundle_ok(macos_dir: &std::path::Path, home: &std::path::Path) -> bool {
+    // (MINOR-N8) 양쪽을 모두 정규화한다. 번들 경로만 벗기면 홈이
+    // `/System/Volumes/Data/Users/<u>` 로 들어오는 경우(같은 펌링크의 반대편)를 놓친다.
+    let macos_dir = strip_data_volume_prefix(macos_dir);
+    let home = strip_data_volume_prefix(home);
     if macos_dir.file_name().map(|n| n != "MacOS").unwrap_or(true) {
         return false;
     }
@@ -1393,10 +1533,20 @@ enum WhichProbe {
     Unmeasured(String),
 }
 
+/// (계약 v2 · 2026-08-25) `unverified` 의 **기계 판별자**. UI 는 이 값으로만 분기한다.
+/// 검증 명령이 정상 종료했는데 그 셸의 PATH 에서 cys 를 못 찾았다 = 원인은 PATH 구성.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const UNVERIFIED_NOT_ON_PATH: &str = "not_on_path";
+/// (계약 v2) 검증 명령 자체를 못 돌렸다 — 실행 실패·비정상 종료·타임아웃. PATH 안내를 하면 **거짓**이다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const UNVERIFIED_PROBE_FAILED: &str = "probe_failed";
+
 /// (D3) 설치 등급 판정 결과. status 는 정확히 셋뿐이다.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct InstallVerdict {
     status: &'static str,
+    /// (계약 v2) status=="unverified" 일 때만 Some — 그 외에는 반드시 None.
+    unverified_reason: Option<&'static str>,
     effective_cys: Option<String>,
     shadowed_by: Option<String>,
     warnings: Vec<String>,
@@ -1410,12 +1560,13 @@ struct InstallVerdict {
 /// 주장을 했지만 실제로 잰 것은 `bash -lc` 하나였다(macOS 10.15+ 기본 로그인 셸은 zsh 다). 이제
 /// 무엇으로 쟀는지를 `shell_name` 으로 받아 문구에 밝힌다 — 잰 적 없는 것을 잰 척하지 않는다.
 ///
-/// ★MINOR-9(2026-08-25) **unverified 두 분기의 신호**: `unverified` 는 원인이 둘인데 예전에는
-/// UI 가 그것을 구분할 방법이 없어 "검증 명령 실패 또는 응답 없음" 으로 단정 오안내했다.
-/// status 는 계약(3값)이라 늘리지 않고 **경고문 첫 구절을 안정된 판별자로** 고정한다:
-/// - `"PATH 확인 결과: …"` → 측정은 **정상**이었고 그 셸 PATH 에서 cys 를 못 찾았다(원인=PATH 구성).
-/// - `"PATH 확인 실패: …"`  → 검증 명령 자체를 못 돌렸다(실행 실패·타임아웃. 사유 동봉).
-///   UI·문서는 이 두 접두로 문구를 갈라야 한다.
+/// ★계약 v2(2026-08-25) **산문은 계약이 될 수 없다**: MINOR-9 는 "경고문 첫 구절을 안정 판별자로
+/// 고정한다"고 선언했지만, 소비자(TS)는 접두가 아니라 문장 속 어절('찾지 못했'·'타임아웃')을 정규식
+/// 으로 봤고 같은 warnings 배열에 백업 통보문까지 합류해 판정 대상 문자열이 오염됐다. 그래서 판별을
+/// **기계 필드**로 올린다 — `unverified_reason` 이 유일한 계약이고 문구는 사람용 설명일 뿐이다:
+/// - `Some("not_on_path")`  → 측정은 **정상**이었고 그 셸 PATH 에서 cys 를 못 찾았다(원인=PATH 구성).
+/// - `Some("probe_failed")` → 검증 명령 자체를 못 돌렸다(실행 실패·비정상 종료·타임아웃).
+/// - `None`                 → status 가 unverified 가 아니다.
 ///
 /// - `installed`          : which -a cys 1순위 == target_cys
 /// - `installed_shadowed` : 링크는 생겼으나 앞을 가리는 다른 cys 가 있다(사용자가 치는 cys 는 그쪽)
@@ -1430,12 +1581,14 @@ fn classify_install_status(
         WhichProbe::Completed(entries) => match entries.first() {
             Some(first) if first == target_cys => InstallVerdict {
                 status: "installed",
+                unverified_reason: None,
                 effective_cys: Some(first.clone()),
                 shadowed_by: None,
                 warnings: vec![],
             },
             Some(first) => InstallVerdict {
                 status: "installed_shadowed",
+                unverified_reason: None,
                 effective_cys: Some(first.clone()),
                 shadowed_by: Some(first.clone()),
                 warnings: vec![format!(
@@ -1446,17 +1599,20 @@ fn classify_install_status(
             },
             None => InstallVerdict {
                 status: "unverified",
+                unverified_reason: Some(UNVERIFIED_NOT_ON_PATH),
                 effective_cys: None,
                 shadowed_by: None,
                 warnings: vec![format!(
                     "PATH 확인 결과: 검증 명령은 정상 실행됐지만 로그인 셸({shell_name}) PATH에서 cys를 \
-찾지 못했습니다(PATH에 {target_cys}의 폴더가 없을 수 있습니다). 새 터미널을 열어 \
+찾지 못했습니다(PATH에 {target_cys}의 폴더가 없을 수 있습니다). 이 확인은 비대화형 로그인 셸 \
+기준입니다 — 터미널에서 cys가 이미 동작한다면 무시해도 됩니다. 새 터미널을 열어 \
 'which -a cys'로 확인하세요."
                 )],
             },
         },
         WhichProbe::Unmeasured(reason) => InstallVerdict {
             status: "unverified",
+            unverified_reason: Some(UNVERIFIED_PROBE_FAILED),
             effective_cys: None,
             shadowed_by: None,
             warnings: vec![format!(
@@ -1481,6 +1637,10 @@ struct InstallCliReport {
     source_cys: String,
     effective_cys: Option<String>, // which -a cys 1순위
     shadowed_by: Option<String>,   // /usr/local/bin/cys 앞을 가리는 다른 cys
+    /// (계약 v2 · 2026-08-25) `status=="unverified"` 일 때만 Some("not_on_path"|"probe_failed").
+    /// **UI 는 이 필드로만 분기한다** — warnings 문구를 정규식으로 파싱하지 않는다. 산문은 사람용
+    /// 설명이고 계약이 아니다(같은 배열에 백업 통보문도 합류하므로 문자열 판정은 구조적으로 오염된다).
+    unverified_reason: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -1524,10 +1684,22 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             .map_err(|e| format!("osascript 실행 실패: {e}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
+            // ★MAJOR-N1(2026-08-25) 실패 반환 **전에** 백업 후보를 재관측한다. 스크립트는 `cys` 를
+            // 백업하고 링크까지 만든 뒤 `cysd` 에서 실패할 수 있다(부분 성공). 예전에는 여기서 곧장
+            // return 해 아래 백업 보고 루프에 도달하지 못했고, 사용자는 자기 실체 바이너리가
+            // `.cys-backup-<epoch초>` 라는 추측 불가능한 이름으로 옮겨진 사실을 **어디서도** 알 수
+            // 없었다. 취소 분기도 함께 재관측한다 — 인증 취소면 목록이 비어 문구가 그대로다.
+            let observed = observe_existing_backups(&expected_backups);
             if err.contains("-128") || err.contains("User canceled") {
-                return Err("설치가 취소되었습니다.".into());
+                return Err(install_failure_message(
+                    "설치가 취소되었습니다.",
+                    &observed,
+                ));
             }
-            return Err(format!("심볼릭 생성 실패: {}", err.trim()));
+            return Err(install_failure_message(
+                &format!("심볼릭 생성 실패: {}", err.trim()),
+                &observed,
+            ));
         }
 
         // 검증: **사용자의 로그인 셸($SHELL, 없으면 bash) 기준** which -a cys — 전 시스템 PATH 가
@@ -1548,17 +1720,42 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| login_shell.clone());
-        let probe = match run_capture_with_timeout(
-            &login_shell,
-            &["-lc", "which -a cys"],
-            std::time::Duration::from_secs(5),
-        ) {
-            // which 는 못 찾으면 비정상 종료하고 아무것도 출력하지 않는다 — 그건 '측정 실패'가 아니라
-            // '측정 결과 없음'이므로 Completed(빈 목록)으로 넘겨 unverified 로 떨어지게 한다.
-            Ok((_, stdout)) => WhichProbe::Completed(parse_which_a(&stdout)),
-            Err(reason) => WhichProbe::Unmeasured(reason),
+        // ★MINOR-N2/N5(2026-08-25) 종료 상태를 **버리지 않는다**. `which` 는 못 찾으면 rc=1 이므로
+        // 종료 상태만으로는 '못 찾음'과 '셸이 명령을 못 돌림'을 못 가른다 — 그래서 명령 끝에 완료
+        // 표식을 찍고 (rc 정상 && 표식 존재) 일 때만 측정 성공으로 친다(`interpret_which_probe`).
+        let probe_cmd = which_probe_command();
+        let mut probe_shell_name = shell_name.clone();
+        let mut probe = run_which_probe(&login_shell, &probe_cmd, &shell_name);
+        // (MINOR-N5) `$SHELL` 이 `-lc` 를 못 받는 셸(csh/tcsh 계열)이면 표준 셸로 **한 번만** 재시도.
+        // 폴백 사실은 셸 이름 문구에 그대로 드러난다 — 잰 적 없는 셸을 잰 척하지 않는다.
+        let first_failure = match &probe {
+            WhichProbe::Unmeasured(reason) => Some(reason.clone()),
+            _ => None,
         };
-        let verdict = classify_install_status(&probe, &target_cys, &shell_name);
+        if let Some(first_failure) = first_failure {
+            if let Some(candidate) = probe_fallback_shell(&login_shell) {
+                let fb = if std::path::Path::new(candidate).exists() {
+                    candidate
+                } else {
+                    "/bin/bash"
+                };
+                let fb_base = std::path::Path::new(fb)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| fb.to_string());
+                let fb_name = format!("{fb_base}(기본 셸 {shell_name}가 -lc를 받지 못해 대체)");
+                probe = match run_which_probe(fb, &probe_cmd, &fb_name) {
+                    WhichProbe::Completed(paths) => {
+                        probe_shell_name = fb_name;
+                        WhichProbe::Completed(paths)
+                    }
+                    WhichProbe::Unmeasured(second) => WhichProbe::Unmeasured(format!(
+                        "{first_failure} / 대체 셸 {fb} 재시도도 실패: {second}"
+                    )),
+                };
+            }
+        }
+        let verdict = classify_install_status(&probe, &target_cys, &probe_shell_name);
 
         let mut warnings = plan.warnings;
         // (BLOCK-1c) 백업이 정말로 생겼는지 **재관측**해서 보고한다 — 스크립트의 자기신고를 믿지 않는다.
@@ -1587,6 +1784,7 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             source_cys: plan.cys_src.to_string_lossy().to_string(),
             effective_cys: verdict.effective_cys,
             shadowed_by: verdict.shadowed_by,
+            unverified_reason: verdict.unverified_reason.map(|r| r.to_string()),
             warnings,
         })
     }
@@ -4832,8 +5030,6 @@ mod tests {
         assert!(!session_blocks_rotation(&empty_strings), "빈 문자열은 미부착으로 취급");
     }
 
-    /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
-    #[test]
     /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
     /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
     /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
@@ -5618,6 +5814,304 @@ cys is a shell builtin\n\
                 v.warnings[0]
             );
         }
+    }
+
+    // ── 계약 v2: unverified 의 기계 판별자(unverified_reason) ────────────
+    // ★산문은 계약이 될 수 없다. MINOR-9 는 "경고문 첫 구절을 안정 판별자로 고정한다"고 선언했지만
+    // 소비자는 접두가 아니라 문장 속 어절을 정규식으로 봤고, 같은 warnings 배열에 백업 통보문이
+    // 합류해 판정 대상 문자열이 오염됐다. 판별을 필드로 올리고 그 불변식을 여기서 못박는다.
+    #[test]
+    fn unverified_reason_is_machine_readable_and_only_set_when_unverified() {
+        let probe_failed = classify_install_status(
+            &WhichProbe::Unmeasured("zsh 5초 타임아웃".into()),
+            "/usr/local/bin/cys",
+            "zsh",
+        );
+        let not_on_path =
+            classify_install_status(&WhichProbe::Completed(vec![]), "/usr/local/bin/cys", "zsh");
+        let installed = classify_install_status(
+            &WhichProbe::Completed(vec!["/usr/local/bin/cys".into()]),
+            "/usr/local/bin/cys",
+            "zsh",
+        );
+        let shadowed = classify_install_status(
+            &WhichProbe::Completed(vec![
+                "/opt/homebrew/bin/cys".into(),
+                "/usr/local/bin/cys".into(),
+            ]),
+            "/usr/local/bin/cys",
+            "zsh",
+        );
+
+        assert_eq!(probe_failed.unverified_reason, Some(UNVERIFIED_PROBE_FAILED));
+        assert_eq!(not_on_path.unverified_reason, Some(UNVERIFIED_NOT_ON_PATH));
+        assert_eq!(installed.unverified_reason, None);
+        assert_eq!(shadowed.unverified_reason, None);
+        // 값 자체가 계약이다 — 오타 나면 UI 분기가 통째로 죽는다.
+        assert_eq!(UNVERIFIED_PROBE_FAILED, "probe_failed");
+        assert_eq!(UNVERIFIED_NOT_ON_PATH, "not_on_path");
+        // 불변식: unverified 일 때만 Some.
+        for v in [&probe_failed, &not_on_path, &installed, &shadowed] {
+            assert_eq!(
+                v.unverified_reason.is_some(),
+                v.status == "unverified",
+                "unverified 가 아닌데 사유가 붙었거나 그 반대다: {} / {:?}",
+                v.status,
+                v.unverified_reason
+            );
+        }
+    }
+
+    // TS 가 보는 것은 이 JSON 뿐이다 — 키 이름(snake_case)과 null 표현을 고정한다.
+    #[test]
+    fn install_report_serializes_unverified_reason_for_the_ui() {
+        let mk = |status: &str, reason: Option<&str>| InstallCliReport {
+            ok: status == "installed",
+            status: status.to_string(),
+            target_dir: "/usr/local/bin".into(),
+            cys_link: "/usr/local/bin/cys".into(),
+            cysd_link: "/usr/local/bin/cysd".into(),
+            source_cys: "/Applications/cys.app/Contents/MacOS/cys".into(),
+            effective_cys: None,
+            shadowed_by: None,
+            unverified_reason: reason.map(|r| r.to_string()),
+            warnings: vec![],
+        };
+        let j = serde_json::to_value(mk("unverified", Some(UNVERIFIED_PROBE_FAILED))).unwrap();
+        assert_eq!(j["unverified_reason"], serde_json::json!("probe_failed"));
+        let j = serde_json::to_value(mk("unverified", Some(UNVERIFIED_NOT_ON_PATH))).unwrap();
+        assert_eq!(j["unverified_reason"], serde_json::json!("not_on_path"));
+        let j = serde_json::to_value(mk("installed", None)).unwrap();
+        assert!(
+            j.get("unverified_reason").is_some(),
+            "필드는 항상 존재해야 한다(없으면 TS 가 undefined 와 null 을 구분 못 한다): {j}"
+        );
+        assert!(j["unverified_reason"].is_null(), "성공에는 사유가 없다: {j}");
+    }
+
+    // ── MINOR-N2/N5: 검증 셸의 종료 상태를 버리지 않는다 ─────────────────
+    // 예전 코드는 `Ok((_, stdout))` 로 성공 플래그를 폐기해, rc=1 + 빈 stdout 을 Completed(vec![]) 로
+    // 접었다. 그 결과 "검증 명령은 정상 실행됐지만 PATH에서 못 찾았다"는 거짓 진술이 나가고 UI 는
+    // 셸 설정에 PATH 를 추가하라는 틀린 안내를 했다.
+    #[test]
+    fn interpret_which_probe_never_folds_a_failed_shell_into_an_empty_result() {
+        // (1) rc 비정상 + 빈 stdout = /bin/tcsh -lc 의 실측 형태 → 측정 실패여야 한다.
+        match interpret_which_probe(false, "", "tcsh") {
+            WhichProbe::Unmeasured(reason) => {
+                assert!(reason.contains("tcsh"), "무엇으로 쟀는지 밝혀야 한다: {reason}");
+            }
+            WhichProbe::Completed(v) => {
+                panic!("rc!=0 을 '측정 성공 + 결과 없음'으로 접으면 안 된다: {v:?}")
+            }
+        }
+        // (2) rc 는 정상인데 완료 표식이 없다 = 셸이 명령을 끝까지 돌리지 않았다 → 측정 실패.
+        assert!(
+            matches!(
+                interpret_which_probe(true, "/usr/local/bin/cys\n", "zsh"),
+                WhichProbe::Unmeasured(_)
+            ),
+            "완료 표식이 없으면 측정 성공으로 치면 안 된다"
+        );
+        // (3) 표식 + rc 정상 + 경로 없음 = 진짜 '못 찾음'(PATH 문제). zsh 는 못 찾으면 stdout 에
+        //     'cys not found' 를 찍는다(실측) — 절대경로가 아니라 parse_which_a 가 걸러낸다.
+        match interpret_which_probe(true, "cys not found\n__cys_probe_end__\n", "zsh") {
+            WhichProbe::Completed(v) => assert!(v.is_empty(), "잡음이 경로로 격상되면 안 된다: {v:?}"),
+            WhichProbe::Unmeasured(r) => panic!("정상 측정을 실패로 접으면 안 된다: {r}"),
+        }
+        // (4) 표식 + 경로 = 정상 측정. 표식 줄은 목록에 섞이지 않는다.
+        match interpret_which_probe(true, "/usr/local/bin/cys\n__cys_probe_end__\n", "zsh") {
+            WhichProbe::Completed(v) => assert_eq!(v, vec!["/usr/local/bin/cys".to_string()]),
+            WhichProbe::Unmeasured(r) => panic!("정상 측정을 실패로 접으면 안 된다: {r}"),
+        }
+        // 프로브 명령에 표식이 실제로 박혀 있어야 (3)(4)가 성립한다.
+        assert!(which_probe_command().contains(PROBE_END_MARK));
+        assert!(which_probe_command().starts_with("which -a cys"));
+    }
+
+    // ★실물 셸 재현: macOS 동봉 csh 계열은 `-lc` 를 받지 못한다(둘 다 /etc/shells 등재 = $SHELL 로
+    // 실제 존재할 수 있다). 수리 전 코드는 이 결과를 '설치됐지만 PATH에 없음'으로 오보고했다.
+    #[test]
+    fn real_csh_family_login_shell_probe_is_measurement_failure() {
+        let cmd = which_probe_command();
+        let mut checked = 0;
+        for sh in ["/bin/tcsh", "/bin/csh"] {
+            if !std::path::Path::new(sh).exists() {
+                continue;
+            }
+            checked += 1;
+            match run_which_probe(sh, &cmd, sh) {
+                WhichProbe::Unmeasured(_) => {}
+                WhichProbe::Completed(v) => {
+                    panic!("{sh} 는 -lc 를 받지 못한다 — 측정 성공으로 접으면 안 된다: {v:?}")
+                }
+            }
+        }
+        assert!(checked > 0, "macOS 라면 csh 계열이 하나는 있어야 한다(전제 확인)");
+        // 폴백 판정: csh 계열만 대체 셸을 준다. 표준 셸의 실패는 rc·환경 문제라 재시도해도 같다.
+        assert_eq!(probe_fallback_shell("/bin/tcsh"), Some("/bin/zsh"));
+        assert_eq!(probe_fallback_shell("/bin/csh"), Some("/bin/zsh"));
+        assert_eq!(probe_fallback_shell("/bin/zsh"), None);
+        assert_eq!(probe_fallback_shell("/bin/bash"), None);
+        assert_eq!(probe_fallback_shell("/opt/homebrew/bin/fish"), None);
+    }
+
+    // 정상 셸에서는 '찾지 못함'이 측정 실패로 오분류되지 않아야 한다(반대 방향 회귀 핀).
+    #[test]
+    fn real_zsh_probe_reports_not_found_as_a_successful_measurement() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let cmd = format!("which -a cys-no-such-binary-xyz; echo {PROBE_END_MARK}");
+        match run_which_probe("/bin/zsh", &cmd, "zsh") {
+            WhichProbe::Completed(v) => assert!(v.is_empty(), "없는 바이너리인데 경로가 나왔다: {v:?}"),
+            WhichProbe::Unmeasured(r) => panic!("정상 로그인 셸 측정이 실패로 접혔다: {r}"),
+        }
+    }
+
+    // ── MAJOR-N1: 부분 성공은 부분 성공으로 보고한다 ─────────────────────
+    #[test]
+    fn install_failure_message_carries_recovery_command_for_moved_files() {
+        let base = "심볼릭 생성 실패: mv: rename /usr/local/bin/cysd: Operation not permitted";
+        // 옮겨진 것이 없으면 문구를 늘리지 않는다.
+        assert_eq!(install_failure_message(base, &[]), base);
+        let msg = install_failure_message(
+            base,
+            &[(
+                "/usr/local/bin/cys".to_string(),
+                "/usr/local/bin/cys.cys-backup-1756000000".to_string(),
+            )],
+        );
+        assert!(msg.starts_with(base), "원래 실패 사유를 지우면 안 된다: {msg}");
+        assert!(msg.contains("/usr/local/bin/cys.cys-backup-1756000000"), "{msg}");
+        assert!(
+            msg.contains("sudo mv /usr/local/bin/cys.cys-backup-1756000000 /usr/local/bin/cys"),
+            "복구 명령이 없으면 사용자는 되찾을 방법이 없다: {msg}"
+        );
+    }
+
+    // ★실물 셸 재현(요구): 스크립트가 **중간에** 실패하는 시나리오를 sh 로 실제로 돌려, 그 시점의
+    // 에러 문자열에 이미 옮겨진 백업 경로가 들어가는지 단언한다. 수리 전 코드는 rc!=0 이면 백업
+    // 보고 루프에 닿기 전에 return 했으므로 이 문자열이 만들어질 수조차 없었다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn partial_install_failure_reports_the_backup_that_already_moved() {
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!(
+            "cys-n1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let target_dir = root.join("bin");
+        let src_dir = root.join("cys.app/Contents/MacOS");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("cys"), b"src-cys").unwrap();
+        std::fs::write(src_dir.join("cysd"), b"src-cysd").unwrap();
+        // 남의 실체 바이너리(심볼릭 아님) 둘. cysd 는 immutable 로 잠가 mv 를 거부시킨다
+        // (실측: chflags uchg → `mv: rename …: Operation not permitted`, rc=1).
+        std::fs::write(target_dir.join("cys"), b"other-cys").unwrap();
+        std::fs::write(target_dir.join("cysd"), b"other-cysd").unwrap();
+        let cysd_path = target_dir.join("cysd");
+        assert!(Command::new("/usr/bin/chflags")
+            .arg("uchg")
+            .arg(&cysd_path)
+            .status()
+            .unwrap()
+            .success());
+
+        let stamp = "TESTSTAMP";
+        let td = target_dir.to_string_lossy().to_string();
+        // 프로덕션과 같은 순서: 사전 관측 → 백업 계획 → 스크립트 실행 → 재관측 → 문구 합성.
+        let pre: Vec<LinkProbe> = ["cys", "cysd"]
+            .iter()
+            .map(|n| probe_link(&format!("{td}/{n}")))
+            .collect();
+        let planned = plan_install_backups(&pre, stamp);
+        assert_eq!(planned.len(), 2, "전제: 둘 다 백업 대상이다");
+
+        let script = build_install_script(&src_dir.join("cys"), &src_dir.join("cysd"), &td, stamp);
+        let out = Command::new("/bin/sh").arg("-c").arg(&script).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let observed = observe_existing_backups(&planned);
+        let msg = install_failure_message(&format!("심볼릭 생성 실패: {stderr}"), &observed);
+
+        // 뒷정리를 먼저 예약하지 못하므로(패닉 시 잠금 잔존) 단언 전에 푼다.
+        let _ = Command::new("/usr/bin/chflags")
+            .arg("nouchg")
+            .arg(&cysd_path)
+            .status();
+        let cys_bak = format!("{td}/cys.cys-backup-{stamp}");
+        let cys_bak_exists = std::path::Path::new(&cys_bak).exists();
+        let cys_is_symlink = std::fs::symlink_metadata(format!("{td}/cys"))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!out.status.success(), "전제: 스크립트는 중간에 실패해야 한다 (stderr={stderr})");
+        assert!(cys_bak_exists, "전제: cys 는 이미 백업으로 옮겨졌다");
+        assert!(cys_is_symlink, "전제: cys 링크까지 만들어진 부분 성공 상태다");
+        assert_eq!(observed.len(), 1, "실제로 존재하는 백업만 보고한다: {observed:?}");
+        assert!(msg.contains(&cys_bak), "옮겨진 백업 경로가 에러 문구에 없다: {msg}");
+        assert!(
+            msg.contains(&format!("sudo mv {cys_bak} {td}/cys")),
+            "복구 명령이 없다: {msg}"
+        );
+        assert!(msg.contains("mv"), "원래 실패 사유(mv 거부)도 남아야 한다: {msg}");
+    }
+
+    // ── MINOR-N8: APFS 펌링크 별칭을 거부하지 않는다 ─────────────────────
+    #[test]
+    fn strict_install_bundle_ok_accepts_data_volume_firmlink_alias() {
+        use std::path::Path;
+        let home = Path::new("/Users/tester");
+        // 실측(2026-08-25): /Applications 와 /System/Volumes/Data/Applications 는 inode 21011 로 동일.
+        // current_exe() 는 정규화하지 않으므로 데이터 볼륨 경유 exec 세션에서 이 형태가 온다.
+        assert!(strict_install_bundle_ok(
+            Path::new("/System/Volumes/Data/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        assert!(strict_install_bundle_ok(
+            Path::new("/System/Volumes/Data/Users/tester/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        // 홈 쪽만 데이터 볼륨 형태로 들어와도 성립해야 한다(같은 펌링크의 반대편).
+        assert!(strict_install_bundle_ok(
+            Path::new("/Users/tester/Applications/cys.app/Contents/MacOS"),
+            Path::new("/System/Volumes/Data/Users/tester")
+        ));
+        // ★반례: 정규화가 가드를 넓히면 안 된다.
+        for bad in [
+            "/System/Volumes/Data/tmp/Applications/cys.app/Contents/MacOS",
+            "/System/Volumes/Data/Users/other/Applications/cys.app/Contents/MacOS",
+            "/System/Volumes/DataX/Applications/cys.app/Contents/MacOS",
+            "/tmp/Applications/cys.app/Contents/MacOS",
+            "/System/Volumes/Data/Applications/Other.app/Contents/MacOS",
+        ] {
+            assert!(
+                !strict_install_bundle_ok(Path::new(bad), home),
+                "정규화가 가드를 넓혔다: {bad}"
+            );
+        }
+        // 정규화 자체의 경계.
+        assert_eq!(
+            strip_data_volume_prefix(Path::new("/System/Volumes/Data/Applications")),
+            std::path::PathBuf::from("/Applications")
+        );
+        assert_eq!(
+            strip_data_volume_prefix(Path::new("/System/Volumes/Data")),
+            std::path::PathBuf::from("/")
+        );
+        assert_eq!(
+            strip_data_volume_prefix(Path::new("/System/Volumes/DataX/Applications")),
+            std::path::PathBuf::from("/System/Volumes/DataX/Applications")
+        );
+        assert_eq!(
+            strip_data_volume_prefix(Path::new("/Applications")),
+            std::path::PathBuf::from("/Applications")
+        );
     }
 
     // ── D6: which 검증 타임아웃(무기한 hang 차단) ──────────────────────

@@ -12,10 +12,15 @@
 //   그래서 지금은 픽스처를 **Rust 실물 모양 하나**로 통일하고, 그 픽스처가 계약과 같은 모양인지를
 //   먼저 검사한다(아래 "계약 드리프트 가드"). 픽스처가 계약을 벗어나면 그 테스트가 먼저 빨개진다.
 import { describe, it, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   isMacUserAgent,
   normalizeInstallStatus,
   unverifiedCause,
+  toastClassName,
+  toastEmitPlan,
+  NONINTERACTIVE_PROBE_NOTE,
+  LOGIN_SHELL_PATH_FILES,
   installResultToast,
   readInstallReport,
   readUninstallReport,
@@ -50,6 +55,9 @@ const RUST_INSTALL_REPORT: Record<string, string> = {
   source_cys: "string",
   effective_cys: "string|null",
   shadowed_by: "string|null",
+  // ★2026-08-25 계약 확장(N3): unverified 두 갈래의 기계 판별자.
+  // status=="unverified" 일 때만 "not_on_path"|"probe_failed", 그 외에는 null.
+  unverified_reason: "string|null",
   warnings: "string[]",
 };
 const RUST_UNINSTALL_REPORT: Record<string, string> = {
@@ -96,6 +104,7 @@ function installReport(over: Partial<InstallCliReport> = {}): InstallCliReport {
     source_cys: "/Applications/cys.app/Contents/MacOS/cys",
     effective_cys: "/usr/local/bin/cys",
     shadowed_by: null,
+    unverified_reason: null, // installed 이므로 None — 두 갈래 판별자는 unverified 에만 붙는다
     warnings: [],
     ...over,
   };
@@ -125,10 +134,20 @@ const WARN_LEFTOVER =
   "/usr/local/bin/cys 가 아직 남아 있습니다 — 터미널에서 'sudo rm /usr/local/bin/cys' 로 지우세요.";
 const NOTE_NOT_SYMLINK =
   "/usr/local/bin/cys — 심볼릭이 아닌 실제 파일이 이미 있습니다(다른 도구 설치본일 수 있어 자동으로 제거하지 않습니다).";
+// ★2026-08-25(N3): 아래 셋은 Rust 가 **실제로 보내는 문장**의 사본이다(main.rs
+// classify_install_status · install_cli_to_path 의 백업 재관측). 예전 픽스처는 이 실물이 아니라
+// TS 정규식에 맞춰 지어낸 문장이었고, 그래서 "TS 가 Rust 문구를 제대로 가른다"를 한 번도 검사하지
+// 못했다. 지금은 문구가 **판정에 쓰이지 않는다** — 이 상수들은 오직
+//   ① 본문 말미(tail)에 원문 그대로 노출되는지
+//   ② 문구를 어떻게 섞어도 분기가 흔들리지 않는지
+// 를 검사하는 데만 쓴다. 그래서 Rust 가 문구를 다듬어도 이 파일은 빨개지지 않는다(그것이 목적이다).
 const WARN_NOT_ON_PATH =
-  "심볼릭은 만들었지만 로그인 셸 PATH에서 cys를 찾지 못했습니다 (PATH에 /usr/local/bin/cys의 폴더가 없을 수 있습니다). 새 터미널을 열어 'which -a cys'로 확인하세요.";
+  "PATH 확인 결과: 검증 명령은 정상 실행됐지만 로그인 셸(zsh) PATH에서 cys를 찾지 못했습니다(PATH에 /usr/local/bin/cys의 폴더가 없을 수 있습니다). 새 터미널을 열어 'which -a cys'로 확인하세요.";
 const WARN_PROBE_FAILED =
-  "심볼릭은 만들었지만 설치 확인(which -a cys)을 하지 못했습니다: bash 타임아웃(5초 초과). 새 터미널에서 'which -a cys'로 직접 확인하세요.";
+  "PATH 확인 실패: 심볼릭은 만들었지만 로그인 셸(zsh)로 'which -a cys'를 실행하지 못했습니다: zsh 타임아웃(5초 초과). 새 터미널에서 'which -a cys'로 직접 확인하세요.";
+/// 같은 warnings 배열에 **합류하는 남의 문장** — 예전 정규식은 이런 문장까지 함께 읽어 판정했다.
+const WARN_BACKUP =
+  "/usr/local/bin/cys에 심볼릭이 아닌 파일이 있어 지우지 않고 /usr/local/bin/cys.cys-backup-20260825-101112로 백업한 뒤 링크를 만들었습니다. 되돌리려면 'sudo mv /usr/local/bin/cys.cys-backup-20260825-101112 /usr/local/bin/cys', 필요 없으면 'sudo rm /usr/local/bin/cys.cys-backup-20260825-101112' 를 실행하세요.";
 
 describe("계약 드리프트 가드 — 픽스처가 Rust 실물과 같은 모양인가", () => {
   it("InstallCliReport 픽스처는 계약 필드 집합·타입과 일치", () => {
@@ -219,20 +238,25 @@ describe("normalizeInstallStatus — 모르는 값은 전부 unverified", () => 
   });
 });
 
-describe("unverifiedCause — unverified 두 갈래를 warnings 로 가른다(MINOR-9)", () => {
-  it("PATH에서 못 찾음 = not-on-path (측정은 정상이었다)", () => {
-    expect(unverifiedCause([WARN_NOT_ON_PATH])).toBe("not-on-path");
+describe("unverifiedCause — unverified 두 갈래를 **기계 필드**로만 가른다(N3 · MINOR-9)", () => {
+  it("계약값 둘은 그대로 통과한다", () => {
+    expect(unverifiedCause("not_on_path")).toBe("not_on_path");
+    expect(unverifiedCause("probe_failed")).toBe("probe_failed");
   });
-  it("확인 명령 실패·타임아웃 = probe-failed", () => {
-    expect(unverifiedCause([WARN_PROBE_FAILED])).toBe("probe-failed");
-    expect(unverifiedCause(["심볼릭은 만들었지만 설치 확인(which -a cys)을 하지 못했습니다: bash 실행 실패: No such file"])).toBe(
-      "probe-failed",
-    );
+  it("필드가 없으면(구 백엔드) unknown — 원인 불명으로 안전하게 접는다", () => {
+    expect(unverifiedCause(null)).toBe("unknown");
+    expect(unverifiedCause(undefined)).toBe("unknown");
   });
-  it("근거가 없거나 둘 다면 unknown — 원인을 단정하지 않는다", () => {
-    expect(unverifiedCause([])).toBe("unknown");
-    expect(unverifiedCause(["표준 위치가 아닙니다"])).toBe("unknown");
-    expect(unverifiedCause([WARN_NOT_ON_PATH, WARN_PROBE_FAILED])).toBe("unknown");
+  it("계약 밖 값·오타·대소문자 변형은 전부 unknown — 추측하지 않는다", () => {
+    expect(unverifiedCause("")).toBe("unknown");
+    expect(unverifiedCause("NOT_ON_PATH")).toBe("unknown");
+    expect(unverifiedCause("not-on-path")).toBe("unknown"); // 케밥은 계약이 아니다
+    expect(unverifiedCause("probefailed")).toBe("unknown");
+  });
+  it("★경고 문장은 판별자가 아니다 — 문구를 통째로 넘겨도 unknown", () => {
+    // 예전 구현이라면 이 두 줄은 not-on-path / probe-failed 로 갈렸다.
+    expect(unverifiedCause(WARN_NOT_ON_PATH)).toBe("unknown");
+    expect(unverifiedCause(WARN_PROBE_FAILED)).toBe("unknown");
   });
 });
 
@@ -271,9 +295,15 @@ describe("installResultToast — 등급 분리(installed 만 성공)", () => {
     expect(t.sticky).toBe(true);
   });
 
-  it("unverified(probe-failed) → '확인 불가' + 확인 명령이 실패했다고만 말한다", () => {
+  it("unverified(probe_failed) → '확인 불가' + 확인 명령이 실패했다고만 말한다", () => {
     const t = installResultToast(
-      installReport({ ok: false, status: "unverified", effective_cys: null, warnings: [WARN_PROBE_FAILED] }),
+      installReport({
+        ok: false,
+        status: "unverified",
+        effective_cys: null,
+        unverified_reason: "probe_failed",
+        warnings: [WARN_PROBE_FAILED],
+      }),
     );
     expect(t.category).toBe("watchdog");
     expect(t.title).toContain("확인 불가");
@@ -281,9 +311,15 @@ describe("installResultToast — 등급 분리(installed 만 성공)", () => {
     expect(t.sticky).toBe(true);
   });
 
-  it("unverified(not-on-path) → 원인을 PATH로 정확히 말한다 — '검증 명령 실패' 오단정 금지(MINOR-9)", () => {
+  it("unverified(not_on_path) → 원인을 PATH로 정확히 말한다 — '검증 명령 실패' 오단정 금지(MINOR-9)", () => {
     const t = installResultToast(
-      installReport({ ok: false, status: "unverified", effective_cys: null, warnings: [WARN_NOT_ON_PATH] }),
+      installReport({
+        ok: false,
+        status: "unverified",
+        effective_cys: null,
+        unverified_reason: "not_on_path",
+        warnings: [WARN_NOT_ON_PATH],
+      }),
     );
     expect(t.title).toContain("PATH에서 cys를 찾지 못했");
     expect(t.body).toContain("/usr/local/bin 이 들어 있지 않을 수 있습니다");
@@ -292,14 +328,14 @@ describe("installResultToast — 등급 분리(installed 만 성공)", () => {
   });
 
   it("두 갈래의 문구가 서로 다르다(구분의 핵심)", () => {
-    const a = installResultToast(installReport({ status: "unverified", warnings: [WARN_NOT_ON_PATH] }));
-    const b = installResultToast(installReport({ status: "unverified", warnings: [WARN_PROBE_FAILED] }));
+    const a = installResultToast(installReport({ status: "unverified", unverified_reason: "not_on_path" }));
+    const b = installResultToast(installReport({ status: "unverified", unverified_reason: "probe_failed" }));
     expect(a.title).not.toBe(b.title);
     expect(a.body).not.toBe(b.body);
   });
 
-  it("근거가 없으면 원인을 단정하지 않는다(둘 다 가능하다고 말한다)", () => {
-    const t = installResultToast(installReport({ ok: false, status: "unverified", warnings: [] }));
+  it("판별자가 없으면(구 백엔드) 원인을 단정하지 않는다 — 둘 다 가능하다고 말한다", () => {
+    const t = installResultToast(installReport({ ok: false, status: "unverified", unverified_reason: null }));
     expect(t.title).toContain("확인 불가");
     expect(t.body).toContain("단정하지 않습니다");
   });
@@ -320,6 +356,181 @@ describe("installResultToast — 등급 분리(installed 만 성공)", () => {
   it("warnings 는 등급과 무관하게 본문 말미에 붙는다", () => {
     const t = installResultToast(installReport({ warnings: ["표준 위치가 아닙니다"] }));
     expect(t.body).toContain("표준 위치가 아닙니다");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★N3 / UNRESOLVED-1 — TS 는 warnings **산문**을 파싱하지 않는다(정규식 재도입 차단)
+// ══════════════════════════════════════════════════════════════════════════════
+// 이 블록의 목적은 하나다: 누가 편의로 문구 정규식을 되살리면 **여기가 먼저 빨개진다**.
+// 근거(왜 산문이 계약이 될 수 없었나): Rust 는 "경고문 첫 구절(`PATH 확인 결과:`/`PATH 확인 실패:`)"
+// 을 판별자로 선언했는데 TS 정규식은 문장 속 어절('찾지 못했'·'타임아웃')을 봤고, 같은 warnings
+// 배열에 백업 통보문(WARN_BACKUP)까지 합류해 판정 대상 문자열이 오염됐다.
+const CLIPATH_SRC = readFileSync(new URL("./clipath.ts", import.meta.url), "utf8");
+/// 주석을 걷어낸 **코드만**. 옛 결함을 설명하는 주석("… '검증 명령 실패 또는 응답 없음' 으로
+/// 단정해 …")까지 금칙어로 잡으면, 결함의 내력을 기록하지 못하게 만드는 잘못된 가드가 된다.
+/// 우리가 막으려는 것은 문구를 다시 **읽는 코드**다. (전줄 주석만 걷는다 — 문자열 속 `//` 오탐 방지.)
+const CLIPATH_CODE = CLIPATH_SRC.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+
+describe("산문 파싱 금지 가드 — 분기의 유일 근거는 unverified_reason 필드다", () => {
+  it("주석 제거가 코드를 먹지 않았다(가드가 빈 문자열을 검사하는 사고 방지)", () => {
+    expect(CLIPATH_CODE).toContain("export function unverifiedCause");
+    expect(CLIPATH_CODE).toContain("export function installResultToast");
+  });
+
+  it("삭제된 문구 정규식이 코드에 되살아나지 않았다", () => {
+    for (const gone of [
+      "NOT_ON_PATH_MARK",
+      "PROBE_FAILED_MARK",
+      "찾지 못했|not found",
+      "timed? ?out",
+      "상태 확인 실패",
+      "응답 없음",
+    ]) {
+      expect({ 되살아난_패턴: gone, 코드에_존재: CLIPATH_CODE.includes(gone) }).toEqual({
+        되살아난_패턴: gone,
+        코드에_존재: false,
+      });
+    }
+  });
+
+  it("설치 판정 코드가 warnings 를 정규식·문자열 검색으로 읽지 않는다", () => {
+    // installResultToast 본문에서 warnings 에 닿는 연산은 filter(Boolean)·join 둘뿐이어야 한다.
+    const body = CLIPATH_CODE.slice(CLIPATH_CODE.indexOf("export function installResultToast"));
+    const upto = body.slice(0, body.indexOf("\n}\n") + 3);
+    for (const banned of [".test(", ".match(", ".includes(", ".search(", "RegExp"]) {
+      expect({ 금지연산: banned, 사용됨: upto.includes(banned) }).toEqual({ 금지연산: banned, 사용됨: false });
+    }
+  });
+
+  it("★판별자와 문구가 충돌하면 **판별자가 이긴다**(문구는 판정에 관여하지 않는다)", () => {
+    // not_on_path 인데 warnings 는 probe 실패 문구만 담고 있다 → 그래도 not_on_path 문구가 나가야 한다.
+    const a = installResultToast(
+      installReport({ status: "unverified", unverified_reason: "not_on_path", warnings: [WARN_PROBE_FAILED] }),
+    );
+    expect(a.title).toContain("PATH에서 cys를 찾지 못했");
+    // 반대 방향도 같다.
+    const b = installResultToast(
+      installReport({ status: "unverified", unverified_reason: "probe_failed", warnings: [WARN_NOT_ON_PATH] }),
+    );
+    expect(b.title).toContain("확인 불가");
+  });
+
+  it("★warnings 를 어떻게 섞어도 분기가 흔들리지 않는다 — 판별자 하나가 등급을 정한다", () => {
+    const proseSets: string[][] = [
+      [],
+      [WARN_NOT_ON_PATH],
+      [WARN_PROBE_FAILED],
+      [WARN_BACKUP],
+      [WARN_NOT_ON_PATH, WARN_PROBE_FAILED], // 예전 구현이 "unknown" 으로 떨어지던 조합
+      [WARN_BACKUP, WARN_PROBE_FAILED], // 남의 문장이 합류해 판정 대상을 오염시키던 조합
+    ];
+    for (const reason of ["not_on_path", "probe_failed", null]) {
+      const titles = new Set(
+        proseSets.map(
+          (w) =>
+            installResultToast(installReport({ status: "unverified", unverified_reason: reason, warnings: w })).title,
+        ),
+      );
+      expect({ reason, 서로다른_제목수: titles.size }).toEqual({ reason, 서로다른_제목수: 1 });
+    }
+  });
+
+  it("판별자는 문자열 하나다 — warnings 배열을 넘기던 옛 호출 모양은 unknown 으로 떨어진다", () => {
+    expect(unverifiedCause([WARN_NOT_ON_PATH] as unknown as string)).toBe("unknown");
+  });
+
+  it("문구는 그래도 사용자에게 **그대로** 도달한다(판정에서 뺀 것이지 숨긴 것이 아니다)", () => {
+    const t = installResultToast(
+      installReport({ status: "unverified", unverified_reason: "not_on_path", warnings: [WARN_BACKUP] }),
+    );
+    expect(t.body).toContain("cys.cys-backup-20260825-101112");
+    expect(t.body).toContain("sudo mv");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MINOR-N7 — 안내가 실행 가능한가(비대화형 로그인 셸은 ~/.zshrc 를 읽지 않는다)
+// ══════════════════════════════════════════════════════════════════════════════
+// 실측(2026-08-25): `zsh -lc` 는 .zshenv·.zprofile·.zlogin 만 읽고 .zshrc 는 건너뛴다.
+// `bash -lc` 도 .bash_profile 만 읽는다. 그런데 예전 안내는 ~/.zshrc 를 고치라고 했다 —
+// 시키는 대로 해도 경고가 사라지지 않는 **실행 불가능한 지시**였다.
+describe("MINOR-N7 — PATH 안내는 실제로 읽히는 파일을 지목한다", () => {
+  const notOnPath = () =>
+    installResultToast(installReport({ status: "unverified", unverified_reason: "not_on_path" }));
+
+  it("실제로 읽히는 파일 넷을 이름으로 지목한다", () => {
+    const body = notOnPath().body;
+    for (const f of ["~/.zshenv", "~/.zprofile", "~/.zlogin", "~/.bash_profile"]) {
+      expect({ 파일: f, 언급됨: body.includes(f) }).toEqual({ 파일: f, 언급됨: true });
+    }
+  });
+
+  it("~/.zshrc 는 '고치라'가 아니라 '읽히지 않는다'로만 등장한다", () => {
+    expect(notOnPath().body).toContain("~/.zshrc 는 이 확인에서 읽히지 않습니다");
+  });
+
+  it("측정 조건(비대화형 로그인 셸)을 밝혀 거짓 경고에 헛수고하지 않게 한다", () => {
+    expect(NONINTERACTIVE_PROBE_NOTE).toContain("비대화형 로그인 셸");
+    expect(NONINTERACTIVE_PROBE_NOTE).toContain("무시해도 됩니다");
+  });
+
+  it("unverified 세 갈래 **전부**에 그 단서가 붙는다(어느 쪽도 거짓 경고일 수 있다)", () => {
+    for (const reason of ["not_on_path", "probe_failed", null]) {
+      const t = installResultToast(installReport({ status: "unverified", unverified_reason: reason }));
+      expect({ reason, 단서: t.body.includes(NONINTERACTIVE_PROBE_NOTE) }).toEqual({ reason, 단서: true });
+    }
+  });
+
+  it("성공(installed)에는 그 단서를 붙이지 않는다 — 할 일이 없는 결과에 잡음을 넣지 않는다", () => {
+    expect(installResultToast(installReport()).body).not.toContain(NONINTERACTIVE_PROBE_NOTE);
+  });
+
+  it("파일 목록 상수에 ~/.zshrc·~/.bashrc 가 들어가 있지 않다(재발 차단)", () => {
+    expect(LOGIN_SHELL_PATH_FILES).not.toContain("~/.zshrc");
+    expect(LOGIN_SHELL_PATH_FILES).not.toContain("~/.bashrc");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MINOR-N4 · N6 — 토스트 등급색 갱신 / 모순 알림 공존 금지
+// ══════════════════════════════════════════════════════════════════════════════
+describe("toastClassName · toastEmitPlan — 등급이 거짓말하지 않게 하는 순수 계획", () => {
+  it("className 은 등급을 그대로 반영한다(등급색의 단일 진실)", () => {
+    expect(toastClassName("system")).toBe("toast system");
+    expect(toastClassName("watchdog")).toBe("toast watchdog");
+  });
+
+  it("(N4) 낼 때마다 className 이 **현재 등급**으로 나온다 — 재사용 엘리먼트의 낡은 색을 덮는다", () => {
+    const fail = installResultToast(installReport({ ok: false, status: "installed_shadowed" }));
+    const ok = installResultToast(installReport());
+    // 같은 id 로 실패 뒤 성공이 와도 계획의 className 은 각각의 등급을 따른다.
+    expect(fail.id).toBe(ok.id);
+    expect(toastEmitPlan(fail).className).toBe("toast watchdog");
+    expect(toastEmitPlan(ok).className).toBe("toast system");
+    expect(toastEmitPlan(fail).className).not.toBe(toastEmitPlan(ok).className);
+  });
+
+  it("(N6) volatile 은 같은 id 의 살아 있는 sticky 를 먼저 내린다", () => {
+    const ok = installResultToast(installReport()); // 성공 = volatile
+    const emit = toastEmitPlan(ok);
+    expect(emit.sticky).toBe(false);
+    expect(emit.dismissStickyId).toBe(INSTALL_TOAST_ID);
+  });
+
+  it("sticky 로 낼 때는 내리지 않는다(stickyToast 가 같은 id 를 갱신하므로 깜빡임만 생긴다)", () => {
+    const warn = installResultToast(installReport({ ok: false, status: "installed_shadowed" }));
+    const emit = toastEmitPlan(warn);
+    expect(emit.sticky).toBe(true);
+    expect(emit.dismissStickyId).toBeNull();
+  });
+
+  it("해제 쪽도 같은 규약이다 — 성공 volatile 은 남은 해제 sticky 를 내린다", () => {
+    const ok = uninstallResultToast(uninstallReport({ removed: ["/usr/local/bin/cys"] }));
+    expect(toastEmitPlan(ok).dismissStickyId).toBe(UNINSTALL_TOAST_ID);
+    const part = uninstallResultToast(uninstallReport({ ok: false, warnings: [WARN_LEFTOVER] }));
+    expect(toastEmitPlan(part).dismissStickyId).toBeNull();
+    expect(toastEmitPlan(part).className).toBe("toast watchdog");
   });
 });
 

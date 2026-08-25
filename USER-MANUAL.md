@@ -79,9 +79,10 @@ cys daemon uninstall
 - macOS(권장): Control Center 헤더 → **"셸에 cys 설치"** 1클릭(관리자 승인 1회) — `/usr/local/bin/cys`·`cysd` 심볼릭 링크가 생기고, 앱 업데이트에도 자동 추종합니다. 이 버튼은 macOS에서만 나타납니다.
   - 결과 알림이 다음 셋 중 하나로 오면 **아직 끝난 게 아닙니다**(경고 알림은 60초 유지 · 이후 Control Center **알람 탭**에서 다시 볼 수 있습니다):
     - **"다른 cys가 앞을 가립니다"** — 링크는 생겼지만 PATH 앞쪽의 다른 cys가 먼저 잡힙니다.
-    - **"PATH에서 cys를 찾지 못했습니다"** — 확인은 정상이었고, 로그인 셸 PATH에 `/usr/local/bin`이 없는 경우입니다(설치 실패가 아닙니다).
-    - **"확인 불가"** — 확인 명령 자체가 실패·무응답이라 무엇이 잡히는지 모르는 경우입니다.
+    - **"PATH에서 cys를 찾지 못했습니다"** — 확인은 정상 종료했고, 그 셸의 PATH에 `/usr/local/bin`이 없는 경우입니다(설치 실패가 아닙니다).
+    - **"확인 불가"** — 확인 명령을 실행하지 못했거나 비정상 종료·무응답이라 무엇이 잡히는지 모르는 경우입니다.
     어느 쪽이든 새 터미널에서 `which -a cys` 로 1순위가 `/usr/local/bin/cys` 인지 확인하세요(조치 안내는 docs/INSTALL.md §B). 판정은 **로그인 셸(`$SHELL`, 기본 zsh) 기준**입니다.
+  - ⚠ **이 경고는 거짓일 수 있습니다.** 확인은 **비대화형 로그인 셸**(`$SHELL -lc`)로 하는데, 그 셸은 zsh면 `~/.zshenv`·`~/.zprofile`·`~/.zlogin` 만 읽고 **`~/.zshrc`는 읽지 않습니다**(bash면 `~/.bash_profile` 만 읽고 `~/.bashrc`는 읽지 않습니다 — 실측 2026-08-25). PATH를 `~/.zshrc`에만 넣어 두었다면 터미널에서 `cys`가 잘 동작하는데도 이 경고가 뜹니다 — 그때는 **무시하면 됩니다**. 정말 고쳐야 한다면 `~/.zshrc`가 아니라 위에 적힌 **읽히는 파일**(예: `~/.zprofile`)에 `/usr/local/bin`을 추가하세요.
   - 그 자리에 심볼릭이 아닌 **실제 파일**(다른 도구 설치본)이 있으면 버튼을 누르기 전에 고지가 뜨고, 설치는 그 파일을 지우지 않고 `<경로>.cys-backup-<시각>` 으로 옮겨 보관한 뒤 링크를 만듭니다(백업 경로는 결과 알림에 표시).
   - 해제: 같은 버튼이 설치된 상태에서는 **"셸 cys 해제"** 로 바뀝니다(확인 창 → 관리자 승인 1회 → 심볼릭 링크만 제거). 건너뛴 항목·남은 파일이 있으면 **"부분 완료"** 알림이 사유와 복구 명령(`sudo rm <경로>`)을 그대로 보여줍니다.
 - macOS(폴백 · GUI를 못 쓸 때): 터미널에서 `sudo ln -sfn /Applications/cys.app/Contents/MacOS/cys /usr/local/bin/cys && sudo ln -sfn /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd` (1회 · 상세 docs/INSTALL.md §B)

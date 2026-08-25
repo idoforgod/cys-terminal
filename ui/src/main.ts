@@ -55,6 +55,8 @@ import {
   statusNoticePlan,
   uninstallConfirmText,
   uninstallResultToast,
+  toastClassName,
+  toastEmitPlan,
   INSTALL_TOAST_ID,
   UNINSTALL_TOAST_ID,
   type CliStatusView,
@@ -404,8 +406,14 @@ function applyCliButtonView() {
 
 // 결과 토스트 배선 — clipath.ts 가 등급(category)과 **수명(sticky)** 까지 정한다(MINOR-10).
 // 경고 본문은 200자 안팎이라 volatile 8초로는 읽히지 않는다: 아직 할 일이 남은 결과만 60초 sticky.
+//
+// ★(MINOR-N6) volatile 로 낼 때는 같은 id 의 **살아 있는 sticky 를 먼저 내린다**. 예전엔 그러지
+// 않아, 설치 실패 sticky(60초)가 떠 있는 상태에서 다시 눌러 성공하면 '⚠ 실패'와 '✅ 완료'가
+// 최대 60초 나란히 공존했다 — 사용자는 둘 중 무엇이 현재 상태인지 알 수 없다.
 function showCliToast(plan: ToastPlan) {
-  if (plan.sticky) stickyToast(plan.id, plan.category, plan.title, plan.body);
+  const emit = toastEmitPlan(plan);
+  if (emit.dismissStickyId) dismissToast(emit.dismissStickyId);
+  if (emit.sticky) stickyToast(plan.id, plan.category, plan.title, plan.body);
   else toast(plan.category, plan.title, plan.body);
 }
 
@@ -6005,7 +6013,7 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
   recordAlarm(category, name, detail);
   const box = document.getElementById("toasts")!;
   const el = document.createElement("div");
-  el.className = `toast ${category}`;
+  el.className = toastClassName(category); // 등급색 서식의 단일 진실(sticky 와 같은 함수)
   el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
@@ -6035,11 +6043,14 @@ function stickyToast(id: string, category: string, name: string, detail: string)
   let el = prev?.el;
   if (!el) {
     el = document.createElement("div");
-    el.className = `toast ${category}`;
     el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
     addToastCloseButton(el, id);
     box.appendChild(el);
   }
+  // (MINOR-N4) 등급색은 **낼 때마다** 다시 못박는다. 예전에는 생성 시점에 한 번만 정해져,
+  // 같은 id 로 실패(watchdog) → 성공(system)이 오면 본문만 '✅'로 바뀌고 테두리는 경고색 그대로
+  // 남았다 — 등급을 표시하는 유일한 장치가 거짓말을 한다. 자식 노드(본문·닫기 버튼)는 그대로다.
+  el.className = toastClassName(category);
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
   const timer = setTimeout(() => {
