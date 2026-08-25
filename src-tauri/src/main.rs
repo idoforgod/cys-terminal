@@ -1199,6 +1199,26 @@ fn observe_existing_backups(planned: &[(String, String)]) -> Vec<(String, String
 /// 갈아 끼우지 않고 그 디렉터리 **안에** 새 링크를 만든다. 그러면 root 권한 쓰기가 target_dir 밖으로
 /// 새어 나간다(예: `/usr/local/bin/cys` 가 `/etc` 심볼릭이면 `/etc/cys` 가 생긴다).
 /// `-n`(대상 심볼릭을 따라가지 않음)이 그 누출을 구조적으로 막는다.
+///
+/// ★MINOR-7(2026-08-25 10R) **백업 목적지 이름 충돌은 중단**이다 — 문서가 코드보다 안전했던
+/// 비대칭을 닫는다. 9라운드까지 이 자리는 `/bin/mv {d} {b}` 직행이었다. 같은 epoch 초에 두 번
+/// 설치되고 두 번 다 그 자리에 남의 파일이 있으면 `mv` 가 **첫 번째 백업본을 덮어써** 남의 원본
+/// 하나가 영구 소멸한다(도달성은 낮지만 손실은 비가역이다). 같은 절차의 문서 정본
+/// (`docs/INSTALL.md` §B "폴백 — 수동 sudo")은 같은 자리에서 이미
+/// `if [ -e "$b" ] || [ -L "$b" ]; then echo 중단…; exit 1; fi` 로 막고 있었다.
+///
+/// ★**`mv -n` 은 오답이다**(8라운드 판정 3번이 함정으로 기록했고 이 라운드가 그대로 지킨다):
+/// BSD `mv -n` 은 덮기를 **거부하고도 exit 0** 이라 `&&` 체인이 그대로 이어져 `ln -sfn` 이
+/// **백업 없이** 원본을 갈아 끼운다 — 지금보다 나쁜 경로가 열린다. 그래서 문서와 **같은 형태**
+/// (사전 존재 검사 → `exit 1`)로 한다. `exit` 는 `&&` 문맥과 무관하게 셸을 끝내므로 뒤따르는
+/// `ln` 도, 그다음 `cysd` 링크도 실행되지 않는다(규약 ⑥ '앞은 실패' 상태 = 아무것도 만들지 않음).
+/// 사유는 **stderr** 로 낸다 — `do shell script` 는 실패 시 stdout 을 버리고 stderr 만 오류
+/// 문자열에 실으므로, 그래야 `install_cli_to_path` 의 "심볼릭 생성 실패: …" 로 사용자에게 닿는다.
+/// 회귀핀: `install_script_aborts_when_backup_name_collides`.
+///
+/// ★남은 사각(정직 기록): 충돌로 중단하면 `observe_existing_backups` 는 **먼저 있던** 같은 이름의
+/// 백업본을 보고 "백업됐다"고 읽는다(그 함수는 관측만 하고 판정하지 않는다). 이번 중단 메시지가
+/// 그 자리 원본을 건드리지 않았다고 함께 말하지만, 두 문장이 한 화면에 같이 나온다.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn build_install_script(
     cys: &std::path::Path,
@@ -1213,11 +1233,17 @@ fn build_install_script(
         let b = sh_squote(&bak);
         let s = sh_squote(&src.to_string_lossy());
         let mark = sh_squote(&format!("{BACKUP_MARK}{dst}:{bak}"));
+        // (MINOR-7) 충돌 중단 사유. 문서 정본 §B 의 문장과 같은 뜻으로 적는다.
+        let collide = sh_squote(&format!(
+            "{BACKUP_COLLIDE_MSG}{bak} (그 자리의 {dst} 는 그대로 두었습니다. 1초 뒤 다시 시도하세요)"
+        ));
         format!(
             "if [ -e {d} ] || [ -L {d} ]; then _cys_bak=1; \
 if [ -L {d} ]; then _cys_t=$(/usr/bin/readlink {d} | {SHELL_PATH_NORMALIZER}); \
 case \"$_cys_t\" in {BUNDLE_LINK_PATTERN}) _cys_bak=0;; esac; fi; \
-if [ \"$_cys_bak\" = 1 ]; then /bin/mv {d} {b} && echo {mark}; fi; fi && /bin/ln -sfn {s} {d}"
+if [ \"$_cys_bak\" = 1 ]; then \
+if [ -e {b} ] || [ -L {b} ]; then echo {collide} >&2; exit 1; fi; \
+/bin/mv {d} {b} && echo {mark}; fi; fi && /bin/ln -sfn {s} {d}"
         )
     };
     format!(
@@ -1265,6 +1291,10 @@ const SHELL_PATH_NORMALIZER: &str = r"/usr/bin/sed -e 's|//*|/|g' -e 's|\(.\)/$|
 /// (I5) 설치 스크립트 자기보고 표식. `CYS-BACKED-UP:<원본>:<백업본>`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const BACKUP_MARK: &str = "CYS-BACKED-UP:";
+/// (MINOR-7 · 10R) 백업 목적지 이름이 이미 차 있을 때 승격 스크립트가 stderr 로 내는 중단 사유의
+/// 머리말. 스크립트와 회귀핀이 같은 문자열 하나를 보게 해 둔다(문구를 고치면 핀이 같이 움직인다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const BACKUP_COLLIDE_MSG: &str = "중단: 백업 이름이 이미 있습니다 — ";
 /// (I3③) 해제 스크립트 자기보고 표식. `CYS-RESTORED:<백업본>:<원본>`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const RESTORE_MARK: &str = "CYS-RESTORED:";
@@ -6191,17 +6221,24 @@ if [ -e '/usr/local/bin/cys' ] || [ -L '/usr/local/bin/cys' ]; then _cys_bak=1; 
 if [ -L '/usr/local/bin/cys' ]; then _cys_t=$(/usr/bin/readlink '/usr/local/bin/cys' | {NORM}); \
 case \"$_cys_t\" in \
 */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd) _cys_bak=0;; esac; fi; \
-if [ \"$_cys_bak\" = 1 ]; then /bin/mv '/usr/local/bin/cys' '/usr/local/bin/cys.cys-backup-1700000000' \
+if [ \"$_cys_bak\" = 1 ]; then \
+if [ -e '/usr/local/bin/cys.cys-backup-1700000000' ] || [ -L '/usr/local/bin/cys.cys-backup-1700000000' ]; then \
+echo '{MSG}/usr/local/bin/cys.cys-backup-1700000000 (그 자리의 /usr/local/bin/cys 는 그대로 두었습니다. 1초 뒤 다시 시도하세요)' >&2; exit 1; fi; \
+/bin/mv '/usr/local/bin/cys' '/usr/local/bin/cys.cys-backup-1700000000' \
 && echo 'CYS-BACKED-UP:/usr/local/bin/cys:/usr/local/bin/cys.cys-backup-1700000000'; fi; fi && \
 /bin/ln -sfn '/Applications/cys.app/Contents/MacOS/cys' '/usr/local/bin/cys' && \
 if [ -e '/usr/local/bin/cysd' ] || [ -L '/usr/local/bin/cysd' ]; then _cys_bak=1; \
 if [ -L '/usr/local/bin/cysd' ]; then _cys_t=$(/usr/bin/readlink '/usr/local/bin/cysd' | {NORM}); \
 case \"$_cys_t\" in \
 */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd) _cys_bak=0;; esac; fi; \
-if [ \"$_cys_bak\" = 1 ]; then /bin/mv '/usr/local/bin/cysd' '/usr/local/bin/cysd.cys-backup-1700000000' \
+if [ \"$_cys_bak\" = 1 ]; then \
+if [ -e '/usr/local/bin/cysd.cys-backup-1700000000' ] || [ -L '/usr/local/bin/cysd.cys-backup-1700000000' ]; then \
+echo '{MSG}/usr/local/bin/cysd.cys-backup-1700000000 (그 자리의 /usr/local/bin/cysd 는 그대로 두었습니다. 1초 뒤 다시 시도하세요)' >&2; exit 1; fi; \
+/bin/mv '/usr/local/bin/cysd' '/usr/local/bin/cysd.cys-backup-1700000000' \
 && echo 'CYS-BACKED-UP:/usr/local/bin/cysd:/usr/local/bin/cysd.cys-backup-1700000000'; fi; fi && \
 /bin/ln -sfn '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'",
-                NORM = SHELL_PATH_NORMALIZER
+                NORM = SHELL_PATH_NORMALIZER,
+                MSG = BACKUP_COLLIDE_MSG
             )
         );
         // 백업(mv)이 링크 생성보다 **먼저** 와야 한다 — 순서가 뒤집히면 이미 파괴된 뒤다.
@@ -6358,6 +6395,88 @@ if [ \"$_cys_bak\" = 1 ]; then /bin/mv '/usr/local/bin/cysd' '/usr/local/bin/cys
         assert!(
             !bin.join("cys.cys-backup-S2").exists() && !bin.join("cysd.cys-backup-S2").exists(),
             "멱등 재설치가 백업을 쌓았다"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★MINOR-7(2026-08-25 10R) **백업 목적지 이름 충돌 회귀핀 — 문서가 코드보다 안전했던 비대칭.**
+    ///
+    /// 9라운드까지 승격 스크립트는 `/bin/mv {d} {b}` 직행이었다. 같은 epoch 초에 두 번 설치되고 두 번
+    /// 다 그 자리에 남의 파일이 있으면 `mv` 가 **첫 번째 백업본을 덮어써** 남의 원본 하나가 영구
+    /// 소멸했다. 같은 절차의 문서 정본(`docs/INSTALL.md` §B "폴백 — 수동 sudo")은 그 자리에서 이미
+    /// `[ -e "$b" ] || [ -L "$b" ]` 로 중단하고 있었다.
+    ///
+    /// ★이 핀은 **`mv -n` 오답도 함께 잡는다.** `mv -n` 은 덮기를 거부하고도 exit 0 이라 `&&` 체인이
+    /// 이어져 `ln -sfn` 이 백업 없이 원본을 갈아 끼운다 — ①과 ③이 그 결과를 정확히 빨갛게 만든다.
+    #[cfg(unix)]
+    #[test]
+    fn install_script_aborts_when_backup_name_collides() {
+        let base = std::env::temp_dir().join(format!("cys-install-collide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bin = base.join("bin");
+        let src = base.join("cys.app/Contents/MacOS");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("cys"), "OURS").unwrap();
+        std::fs::write(src.join("cysd"), "OURSD").unwrap();
+        // 지금 자리에 있는 남의 실체 파일 + **같은 스탬프의 백업본이 이미 있다**(같은 초 재설치).
+        std::fs::write(bin.join("cys"), "FOREIGN-NOW").unwrap();
+        std::fs::write(bin.join("cys.cys-backup-K1"), "FOREIGN-EARLIER").unwrap();
+
+        let td = bin.to_string_lossy().to_string();
+        let script = build_install_script(&src.join("cys"), &src.join("cysd"), &td, "K1");
+        // 오답 재도입 차단: `mv -n` 은 이 파일에 다시 나타나서는 안 된다.
+        assert!(
+            !script.contains("/bin/mv -n"),
+            "`mv -n` 오답이 재도입됐다(거부해도 exit 0 → 백업 없이 링크): {script}"
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+
+        // ① 중단한다. (`mv -n` 이었다면 여기서 exit 0 이라 통과해 버린다.)
+        assert!(
+            !out.status.success(),
+            "백업 이름이 이미 차 있는데 스크립트가 성공으로 끝났다: {script}"
+        );
+        // ② 먼저 있던 백업본(= 남의 원본의 마지막 사본)이 덮이지 않았다.
+        assert_eq!(
+            std::fs::read_to_string(bin.join("cys.cys-backup-K1")).unwrap_or_default(),
+            "FOREIGN-EARLIER",
+            "이미 있던 백업본을 덮어썼다 — 남의 원본이 영구 소멸한다"
+        );
+        // ③ **백업 없이 링크가 만들어지지 않았다** — 자리에는 남의 실체 파일이 그대로다.
+        assert!(
+            !std::fs::symlink_metadata(bin.join("cys"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "백업에 실패했는데 링크를 만들었다(원본 소멸)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bin.join("cys")).unwrap_or_default(),
+            "FOREIGN-NOW",
+            "중단했는데 그 자리의 남의 파일이 바뀌었다"
+        );
+        // ④ 사유를 **stderr** 로 말한다 — `do shell script` 는 실패 시 stdout 을 버리므로,
+        //    이 경로여야 `install_cli_to_path` 의 "심볼릭 생성 실패: …" 로 사용자에게 닿는다.
+        let said_err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            said_err.contains(BACKUP_COLLIDE_MSG),
+            "중단 사유가 stderr 로 나오지 않았다(사용자에게 도달할 경로가 없다): {said_err:?}"
+        );
+        // ⑤ 하지 않은 일을 했다고 보고하지 않는다(자기보고 0건).
+        let said_out = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            parse_pair_markers(&said_out, BACKUP_MARK).is_empty(),
+            "백업하지 않았는데 자기보고를 냈다: {said_out:?}"
+        );
+        // ⑥ 체인이 실제로 끊겼다 — 뒤따르는 `cysd` 링크도 만들어지지 않는다(규약 ⑥ '앞은 실패').
+        assert!(
+            std::fs::symlink_metadata(bin.join("cysd")).is_err(),
+            "cys 에서 중단했는데 cysd 링크가 만들어졌다(exit 가 체인을 끊지 못했다)"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

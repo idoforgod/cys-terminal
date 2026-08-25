@@ -11,8 +11,40 @@
 //   "모든 skip 이 소멸하고 부분 실패가 성공으로 둔갑한다"는 실제 결함을 한 번도 밟지 않았다.
 //   그래서 지금은 픽스처를 **Rust 실물 모양 하나**로 통일하고, 그 픽스처가 계약과 같은 모양인지를
 //   먼저 검사한다(아래 "계약 드리프트 가드"). 픽스처가 계약을 벗어나면 그 테스트가 먼저 빨개진다.
+//
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MINOR-6(2026-08-25 9R) — 이 파일은 **배포 문서를 읽는다**. 새 결합이 생겼다.
+// ══════════════════════════════════════════════════════════════════════════════
+// 무엇이 무엇을 읽는가 (전부 이 파일 안에서 실행 시각에 읽는다 · 생성물 아님):
+//
+//   이 파일 ──읽음──▶ ../../docs/INSTALL.md      (거울쌍 배터리 · mirrorBattery)
+//           ──읽음──▶ ../../USER-MANUAL.md       (거울쌍 배터리 · mirrorBattery)
+//           ──읽음──▶ ../../docs/**/*.md + 리포 루트 *.md
+//                                                 (코드블록 회귀핀 · scanDocCommands)
+//           ──읽음──▶ ./main.ts                   (배선 핀 · MAIN_CODE)
+//
+// 그래서 **문서만 고쳐도 `bun test` 가 깨질 수 있고, `bun test` 는 릴리스 태그 빌드의 게이트다.**
+// 오탈자 교정 한 줄로 배포가 멈출 수 있다는 뜻이다. 그 대가를 알고 받아들였다 — 화면과 문서가
+// 갈라지는 것이 이 라운드들에서 반복해 사용자 파일을 파괴한 결함이었고, 사람 눈으로 두 곳을
+// 맞추는 방식은 이미 세 번 실패했다(제목 '세 갈래 vs 네 갈래' 드리프트, `mv -n` 뜻풀이의 화면·문서
+// 불일치, 해제 표면 세 곳 중 하나만 수리). 다만 **깨졌을 때 어디를 볼지**는 여기 적어 둔다:
+//
+//   · `★거울쌍 …` 실패      → 화면 상수(clipath.ts)와 그 문서가 다른 말을 한다.
+//                              실패 출력의 `문서:` 가 **어느 문서**인지, `제목:`/`낱말:` 이 **어느
+//                              문자열**이 빠졌는지 그대로 찍는다. 고칠 곳은 둘 중 하나이지, 테스트가
+//                              아니다 — 화면이 옳으면 문서를, 문서가 옳으면 화면 상수를 고친다.
+//                              ★상수를 고치면 **두 문서를 같은 커밋에서** 고쳐야 한다(한쪽만 고치면
+//                              다른 쪽이 빨개진다 — 그것이 이 핀의 목적이다).
+//   · `★전수 — 맨 ln -sf …` 실패 → 어느 문서 코드블록이 "따라 치면 파일이 사라지는" 명령을 얻었다.
+//                              출력이 `파일:줄 [갈래] 명령` 을 그대로 찍는다. 고치는 정본은
+//                              docs/INSTALL.md §B 의 가드 블록이고, 의도된 비가역이라면 그 절의
+//                              `DOC_CMD_ALLOW` 에 **사유와 함께** 올린다(사유 없는 예외는 금지).
+//   · `main.ts 배선 핀 …` 실패 → 문서가 아니라 배선이 바뀌었다. 핀은 주석을 걷은 코드만 본다.
+//
+// 같은 결합이 설계정본(docs/plans/2026-08-25-shell-cli-restore-design.md)에도 적혀 있다 —
+// 문서 쪽에서 이 파일로 오는 길과, 이 파일에서 문서로 가는 길을 **양쪽 다** 열어 둔다.
 import { describe, it, expect } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import {
   isMacUserAgent,
   normalizeInstallStatus,
@@ -40,6 +72,7 @@ import {
   statusNoticeKind,
   backupRestoreSpot,
   MV_EMPTY_CAVEAT,
+  BACKUP_LAST_COPY_WARNING,
   uninstallConfirmText,
   uninstallResultToast,
   uninstallLeftovers,
@@ -620,7 +653,12 @@ describe("★MAJOR-2 관통 — CliInstallStatusReport 의 기계 필드가 고�
   it("★state — 백업 되돌리기 명령을 **낼지 말지**도 이 필드가 정한다(파괴적 지시 게이트)", () => {
     const free = statusText(statusReport({ state: "absent", backups: [BACKUP_PATH] }));
     expect(free).toContain(`되돌리려면 'sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys'`);
-    expect(free).not.toContain("ls -l");
+    // ★(MAJOR-1 · 10R) 예전 단언은 `not.toContain("ls -l")` 였다. 이제 **버리기** 안내가 어느
+    // 갈래에서든 `ls -l <백업본>` 눈확인을 동반하므로 그 단언은 이 절이 보려던 것을 넘어선다.
+    // 여기서 보려는 것은 하나다: 자리가 비었다고 아는 상태에서 **원래 자리를 먼저 확인하라는
+    // 조건부 안내**(unknown 갈래의 형태)가 섞여 나오지 않는가.
+    expect(free).not.toContain("비어 있는지 확인한 뒤");
+    expect(free).not.toContain("ls -l /usr/local/bin/cys'");
     const occupied = statusText(statusReport({ state: "ours", installed: true, backups: [BACKUP_PATH] }));
     expect(occupied).toContain("손으로 옮길 수 없습니다");
     expect(occupied).not.toContain("sudo mv");
@@ -1111,14 +1149,20 @@ describe("backupOrigin · backupNoticeLine — 되돌리기 명령을 UI 가 만
   it("스탬프 앞에 마커가 또 들어 있어도 **마지막** 마커에서 자른다(가장 짧은 원래 경로가 아니라)", () => {
     expect(backupOrigin("/a/cys.cys-backup-1.cys-backup-2")).toBe("/a/cys.cys-backup-1");
   });
-  it("원래 경로를 알고 그 자리가 비어 있으면 복원 명령을, 모르면 삭제 안내만 준다", () => {
+  it("원래 경로를 알고 그 자리가 비어 있으면 복원 명령을, 모르면 확인 안내만 준다", () => {
     // (MAJOR-2) 자리 판정이 free 인 상태(= state "absent")에서만 명령을 그대로 제시한다.
     const known = backupNoticeLine(BACKUP_PATH, "absent");
     expect(known).toContain(`sudo mv -n ${BACKUP_PATH} /usr/local/bin/cys`);
-    expect(known).toContain("sudo rm");
+    expect(known).toContain(`sudo rm ${BACKUP_PATH}`);
+    // ★(MAJOR-1 · 10R) 여기 단언이 예전에는 `toContain("sudo rm /usr/local/bin/weird")` 였다 —
+    // 이름이 우리 백업 규칙과 맞지 않아 **이 앱이 만든 사본이라고 확정할 수 없는** 파일에 대해
+    // 앱이 삭제 명령을 조립하는 것을, 테스트가 오히려 **요구**하고 있었다. 같은 함수가 `mv`
+    // 쪽에서는 이미 "추측한 경로로는 시키지 않는다"(N13)를 지키고 있었으므로 반쪽 계약이었다.
     const unknown = backupNoticeLine("/usr/local/bin/weird", "absent");
     expect(unknown).not.toContain("sudo mv");
-    expect(unknown).toContain("sudo rm /usr/local/bin/weird");
+    expect(unknown).not.toContain("sudo rm");
+    expect(unknown).toContain("/usr/local/bin/weird"); // 경로는 그대로 보여 준다(정보 소실 금지)
+    expect(unknown).toContain("ls -l /usr/local/bin/weird"); // 대신 눈으로 확인하는 길을 준다
   });
 
   // ★MINOR-N13(5R) — 스탬프는 **epoch 초(숫자)** 다. Rust is_our_backup_name 이 숫자가 아닌 스탬프를
@@ -1128,7 +1172,10 @@ describe("backupOrigin · backupNoticeLine — 되돌리기 명령을 UI 가 만
     const dated = "/usr/local/bin/cys.cys-backup-20260825-101112"; // 문서 예시가 쓰던 가짜 형식
     expect(backupOrigin(dated)).toBeNull();
     expect(backupNoticeLine(dated)).not.toContain("sudo mv");
-    expect(backupNoticeLine(dated)).toContain("sudo rm"); // 지우는 안내는 남는다(정보 소실 금지)
+    // ★(MAJOR-1 · 10R) rm 도 같은 이유로 내지 않는다 — Rust 가 되돌리지 않을 이름에 대해 앱이
+    // "지우라"고 말하면, mv 쪽에서 닫은 격차(판정=Rust / 안내=UI)가 rm 쪽으로 그대로 옮겨 간다.
+    expect(backupNoticeLine(dated)).not.toContain("sudo rm");
+    expect(backupNoticeLine(dated)).toContain(`ls -l ${dated}`); // 정보는 남는다(눈으로 확인)
   });
   it("(N13) 숫자 스탬프만 통과한다", () => {
     expect(backupOrigin("/usr/local/bin/cys.cys-backup-0")).toBe("/usr/local/bin/cys");
@@ -1791,6 +1838,106 @@ describe("★MAJOR-2 — 되돌리기 명령이 남의 파일을 덮어쓰게 �
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-1(10R) — 앱이 **마지막 사본을 지우라고** 상시 안내하지 않는다
+// ══════════════════════════════════════════════════════════════════════════════
+// 9R 까지 backupNoticeLine 의 네 갈래가 전부 맨 `sudo rm <절대경로>` 꼬리를 달고 있었다. 위 MAJOR-2
+// 절이 `mv` 쪽에서 닫은 것과 **정확히 같은 결함**이 `rm` 쪽에 그대로 남아 있었던 것이다 — 그리고
+// 이 문장은 상시 상태 토스트·버튼 툴팁·해제 확인 창 세 표면 모두에 상주하므로, 한 번 스치는
+// 안내가 아니라 **상시 권유**였다.
+//
+// 검사 규칙은 mv 와 대칭이다: 우리가 화면에 내는 어떤 `sudo rm <경로>` 도, **같은 문자열 안에**
+// 그 경로에 대한 `ls -l <경로>`(지우기 전 눈확인)가 함께 있어야 한다. 이 규칙은 이미 존재하던
+// 해제 잔존 안내(uninstallResultToast)의 형태와 같으므로, 새 규약을 발명한 것이 아니라 **한 곳에만
+// 적용돼 있던 규약을 계열 전체로 넓힌 것**이다.
+/// 어떤 문자열에서든 `sudo rm <경로>` 를 찾아, 같은 문자열에 `ls -l <경로>` 가 없는 자리를 돌려준다.
+/// (화면 문구는 셸 스크립트가 아니라 한 줄 문장이므로, 가드는 `[ -e ]` 같은 문법이 아니라
+///  "지우기 전에 그 자리를 눈으로 보게 하는가" 라는 **절차**로 잰다.)
+function unguardedRm(text: string): string[] {
+  const bad: string[] = [];
+  const NEEDLE = "sudo rm ";
+  let i = text.indexOf(NEEDLE);
+  while (i >= 0) {
+    const rest = text.slice(i + NEEDLE.length);
+    // 첫 인자만 읽는다 — 따옴표·공백·줄바꿈에서 끊는다(`'sudo rm /a/b'.` 형태를 그대로 다룬다).
+    const path = (rest.split(/['"\s]/)[0] ?? "").replace(/[.,)]+$/, "");
+    if (!path || !text.includes(`ls -l ${path}`)) bad.push(text.slice(i, i + 90));
+    i = text.indexOf(NEEDLE, i + 1);
+  }
+  return bad;
+}
+
+describe("★MAJOR-1 — 버리기 안내에 가드와 비가역 경고가 함께 붙는다", () => {
+  it("★검사기 자체의 변이 — 맨 rm 은 잡고, ls -l 이 함께 있는 형태는 통과한다", () => {
+    // 이 헬퍼가 장식이 아님을 먼저 증명한다(9R 이 반복해 지적한 '초록인 채 봉인' 방지).
+    expect(unguardedRm("필요 없으면 'sudo rm /usr/local/bin/cys.cys-backup-1'.").length).toBe(1);
+    expect(
+      unguardedRm("'ls -l /usr/local/bin/cys.cys-backup-1' 로 본 뒤 'sudo rm /usr/local/bin/cys.cys-backup-1'"),
+    ).toEqual([]);
+    expect(unguardedRm("sudo rm -f /usr/local/bin/cys").length).toBe(1); // 플래그만 있고 눈확인 없음
+    expect(unguardedRm("지우는 명령은 드리지 않습니다")).toEqual([]);
+  });
+
+  it("★네 갈래 전부 — 비가역 경고가 붙고, 맨 rm 이 없다", () => {
+    const STATES: CliLinkState[] = ["absent", "ours", "partial", "foreign"];
+    for (const st of STATES) {
+      const line = backupNoticeLine(BACKUP_PATH, st);
+      expect({
+        상태: st,
+        마지막사본_경고: line.includes(BACKUP_LAST_COPY_WARNING),
+        되돌릴수없음: line.includes("되돌릴 수 없습니다"),
+        눈확인: line.includes(`ls -l ${BACKUP_PATH}`),
+        무방비rm: unguardedRm(line),
+      }).toEqual({ 상태: st, 마지막사본_경고: true, 되돌릴수없음: true, 눈확인: true, 무방비rm: [] });
+    }
+  });
+
+  it("★이름이 우리 규칙이 아니면 삭제 명령을 **아예 내지 않는다**(fail-closed)", () => {
+    for (const bad of ["/usr/local/bin/weird", "/usr/local/bin/cys.cys-backup-20260825-101112", "/usr/local/bin/cys.cys-backup-"]) {
+      const line = backupNoticeLine(bad, "absent");
+      expect({
+        경로: bad,
+        rm: line.includes("sudo rm"),
+        mv: line.includes("sudo mv"),
+        눈확인: line.includes(`ls -l ${bad}`),
+        // 비가역이라는 사실은 여기서도 말한다. 다만 '이것은 마지막 사본이다' 라고 **단정하지는
+        // 않는다** — 이름을 확정하지 못한 파일에 대해 아는 척하지 않는 것이 이 갈래의 요지다.
+        비가역_고지: line.includes("지우면 되돌릴 수 없습니다"),
+        단정하지_않음: !line.includes(BACKUP_LAST_COPY_WARNING),
+      }).toEqual({ 경로: bad, rm: false, mv: false, 눈확인: true, 비가역_고지: true, 단정하지_않음: true });
+    }
+  });
+
+  it("★전수: UI 가 만드는 어떤 화면 문자열에도 눈확인 없는 'sudo rm' 이 없다", () => {
+    // MAJOR-2 의 mv 전수 시험과 **같은 표면 집합**을 훑는다(설치 동의문구·상시 고지·툴팁·해제
+    // 확인 창·결과 토스트). 계열을 지점으로 닫지 않기 위해서다.
+    const STATES: CliLinkState[] = ["absent", "ours", "partial", "foreign", "unsupported", "unknown"];
+    const texts: string[] = [FOREIGN_BACKUP_NOTICE];
+    for (const st of STATES)
+      for (const notes of [[] as string[], [NOTE_NOT_SYMLINK]])
+        for (const backups of [[] as string[], [BACKUP_PATH], ["/usr/local/bin/weird"], [BACKUP_PATH, "/usr/local/bin/cysd.cys-backup-2"]]) {
+          const view = readCliStatus(
+            statusReport({ state: st, installed: st === "ours" || st === "partial", notes, backups }),
+          );
+          const lines = cliNoticeLines(view);
+          texts.push(...lines);
+          texts.push(cliButtonView(view.button, lines).title);
+          texts.push(uninstallConfirmText(notes, backups, st).body);
+          const plan = statusNoticePlan(view);
+          if (plan) texts.push(plan.title, plan.body);
+          texts.push(withCliNotice(installResultToast(installReport()), lines).body);
+        }
+    for (const ok of [true, false])
+      for (const removed of [[], ["/usr/local/bin/cys"]])
+        texts.push(uninstallResultToast(uninstallReport({ ok, removed }), CLI_LINKS).body);
+    const offenders = texts.flatMap(unguardedRm);
+    expect({ 무방비_rm_건수: offenders.length, 예시: offenders.slice(0, 3) }).toEqual({
+      무방비_rm_건수: 0,
+      예시: [],
+    });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ★R1(6R) — 해제 복구 명령('sudo rm')은 **UI 가 조립한다**(백엔드는 사실만 보낸다)
 // ══════════════════════════════════════════════════════════════════════════════
 // 5R 에서 Rust 가 복구 명령 산문을 뺐는데 UI 는 조립하지 않아, 해제가 부분 실패했을 때 사용자가
@@ -2202,7 +2349,7 @@ describe("shadowTarget — 경로로 읽히는 값일 때만 파괴적 지시에
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ★MINOR-5(7R) — 문서가 **존재하지 않는 테스트**를 보증으로 내세우고 있었다
+// ★거울쌍(7R MINOR-5) — 문서가 **존재하지 않는 테스트**를 보증으로 내세우고 있었다
 // ══════════════════════════════════════════════════════════════════════════════
 // docs/INSTALL.md 는 "화면과 문서가 같은 말을 하는지 자동 테스트가 지킵니다" 라고 적어 두었는데,
 // 리포 전체에 docs 를 **읽는** 테스트가 ts·rs·py 어디에도 없었다(grep 0건). 문서의 합격선은
@@ -2210,87 +2357,469 @@ describe("shadowTarget — 경로로 읽히는 값일 때만 파괴적 지시에
 // 이 라운드들이 반복해 온 결함이다 — 그래서 문장을 지우는 (a) 대신 약속한 테스트를 실제로
 // 만드는 (b) 를 택했다. 이제 그 문장은 이 절을 가리킨다.
 //
+// ★MINOR-5(9R) — 그 대조가 **반쪽**이었다. 7R 판은 `../../docs/INSTALL.md` 하나만 읽었고, 같은
+// 사실을 적는 리포 루트 `USER-MANUAL.md` 를 읽는 테스트는 리포 전체에 0건이었다. 가정이 아니다:
+// 상시 고지 제목이 '세 갈래'에서 '네 갈래'로 늘었을 때 INSTALL.md 만 고쳐지고 USER-MANUAL.md 는
+// '세 갈래'로 남아, 손으로 발견될 때까지 살아 있었다(그 사고 기록이 USER-MANUAL.md 그 문단에 그대로
+// 적혀 있다). 한쪽에만 핀을 박으면 정확히 핀이 없는 쪽이 드리프트한다 — 그래서 **같은 배터리**를
+// 두 문서에 건다.
+//
 // 대조는 **낱말 단위**로 한다(문장 전체 일치가 아니라): 문서는 사람이 읽는 산문이라 줄바꿈·강조
 // 표기가 자유롭게 바뀌어야 하고, 그때마다 게이트가 빨개지면 아무도 문서를 손보지 않게 된다.
 // 대신 "같은 말인지"를 결정하는 **핵심 주장**과 **알림 제목 원문**은 반드시 양쪽에 있어야 한다.
-describe("★MINOR-5 — 화면과 docs/INSTALL.md 가 같은 말을 하는지 실제로 대조한다", () => {
-  const DOC_URL = new URL("../../docs/INSTALL.md", import.meta.url);
-  const DOC = readFileSync(DOC_URL, "utf8");
-  // 문서는 줄바꿈·들여쓰기로 접히므로 공백을 하나로 눌러 비교한다(제목이 두 줄에 걸쳐도 잡힌다).
-  // 인용문(`> `) 안에서 접힌 문장도 같은 문장이다 — 줄머리 인용 표식을 먼저 걷어 낸다.
-  const flat = (t: string) => t.replace(/^[ \t]*>[ \t]?/gm, "").replace(/\s+/g, " ").trim();
-  const DOC_FLAT = flat(DOC);
-  const docHas = (t: string) => DOC_FLAT.includes(flat(t));
 
-  it("문서 파일이 실재한다 — 없으면 건너뛰지 않고 실패한다(측정 불능은 통과가 아니다)", () => {
-    expect({ 문서: "docs/INSTALL.md", 읽힘: DOC.length > 2000 }).toEqual({
-      문서: "docs/INSTALL.md",
-      읽힘: true,
+/// 리포 루트(= 이 파일 기준 ../../). 문서 경로는 전부 이 뿌리에서 **리포 상대 경로**로 적는다 —
+/// 실패 메시지에 그 경로가 그대로 찍혀야 "어느 파일을 보라"가 사람에게 전달된다.
+/// cwd 에 기대지 않는다(`bun test` 를 어느 폴더에서 돌리든 같은 파일을 읽어야 한다).
+const REPO_ROOT = new URL("../../", import.meta.url);
+const repoUrl = (rel: string) => new URL(rel, REPO_ROOT);
+
+/// 문서는 줄바꿈·들여쓰기로 접히므로 공백을 하나로 눌러 비교한다(제목이 두 줄에 걸쳐도 잡힌다).
+/// 인용문(`> `) 안에서 접힌 문장도 같은 문장이다 — 줄머리 인용 표식을 먼저 걷어 낸다.
+const flatDoc = (t: string) => t.replace(/^[ \t]*>[ \t]?/gm, "").replace(/\s+/g, " ").trim();
+
+const readRepoDoc = (rel: string) => readFileSync(repoUrl(rel), "utf8");
+
+/// 배포 문서 한 편에 **같은** 거울쌍 배터리를 건다(문서명은 실패 출력에 남는다).
+function mirrorBattery(rel: string) {
+  const DOC = readRepoDoc(rel);
+  const DOC_FLAT = flatDoc(DOC);
+  const docHas = (t: string) => DOC_FLAT.includes(flatDoc(t));
+
+  describe(`★거울쌍 — 화면과 ${rel} 가 같은 말을 하는지 실제로 대조한다`, () => {
+    it("문서 파일이 실재한다 — 없으면 건너뛰지 않고 실패한다(측정 불능은 통과가 아니다)", () => {
+      expect({ 문서: rel, 읽힘: DOC.length > 2000 }).toEqual({ 문서: rel, 읽힘: true });
+    });
+
+    it("★상시 고지 제목 네 개가 화면 문자열 그대로 문서에도 적혀 있다", () => {
+      const titles: [string, string][] = [
+        ["foreign", NOTICE_TITLE_FOREIGN],
+        ["partial", NOTICE_TITLE_PARTIAL],
+        ["backup", NOTICE_TITLE_BACKUP],
+        ["info", NOTICE_TITLE_INFO],
+      ];
+      for (const [kind, t] of titles)
+        expect({ 문서: rel, 갈래: kind, 제목: t, 문서에_있음: docHas(t) }).toEqual({
+          문서: rel,
+          갈래: kind,
+          제목: t,
+          문서에_있음: true,
+        });
+    });
+
+    it("★설치 동의 문구(FOREIGN_BACKUP_NOTICE)의 핵심 주장이 문서에도 있다", () => {
+      // [무엇을 약속하는가, 그 약속을 담은 낱말]. 낱말은 화면·문서 **양쪽**에 있어야 한다.
+      const claims: [string, string][] = [
+        ["남의 실체 파일도 백업한다", "실제 파일"],
+        ["남의 심볼릭 링크도 백업한다", "심볼릭 링크"],
+        ["지우지 않고 옮긴다", "지우지 않고"],
+        ["백업 이름 규칙을 밝힌다", "cys-backup"],
+        ["스탬프는 epoch 초다", "epoch"],
+        ["되돌리는 명령은 덮어쓰기 금지형이다", "sudo mv -n"],
+        ["해제가 자동으로 되돌린다", "되돌립니다"],
+      ];
+      for (const [why, token] of claims)
+        expect({
+          문서: rel,
+          주장: why,
+          낱말: token,
+          화면: FOREIGN_BACKUP_NOTICE.includes(token),
+          문서에_있음: docHas(token),
+        }).toEqual({ 문서: rel, 주장: why, 낱말: token, 화면: true, 문서에_있음: true });
+    });
+
+    it("★`-n` 의 뜻풀이가 화면과 문서 양쪽에 있다(가드를 사용자가 스스로 뜯지 않게)", () => {
+      expect({ 문서: rel, 화면: FOREIGN_BACKUP_NOTICE.includes(MV_EMPTY_CAVEAT), 문서에_있음: docHas(MV_EMPTY_CAVEAT) }).toEqual(
+        { 문서: rel, 화면: true, 문서에_있음: true },
+      );
+    });
+
+    it("★문서가 화면의 '언제 명령을 내고 언제 내지 않는가' 규칙을 그대로 적고 있다", () => {
+      // 화면 쪽 실제 동작(backupRestoreSpot)의 세 갈래가 문서에도 그대로 있어야 한다.
+      expect({
+        문서: rel,
+        비었을때: docHas("sudo mv -n"),
+        차있을때: docHas("아예 내지 않"),
+        모를때: docHas("ls -l <원래 경로>"),
+      }).toEqual({ 문서: rel, 비었을때: true, 차있을때: true, 모를때: true });
     });
   });
+}
 
-  it("★상시 고지 제목 네 개가 화면 문자열 그대로 문서에도 적혀 있다", () => {
-    const titles: [string, string][] = [
-      ["foreign", NOTICE_TITLE_FOREIGN],
-      ["partial", NOTICE_TITLE_PARTIAL],
-      ["backup", NOTICE_TITLE_BACKUP],
-      ["info", NOTICE_TITLE_INFO],
-    ];
-    for (const [kind, t] of titles)
-      expect({ 갈래: kind, 제목: t, 문서에_있음: docHas(t) }).toEqual({
-        갈래: kind,
-        제목: t,
-        문서에_있음: true,
-      });
-  });
+mirrorBattery("docs/INSTALL.md");
+mirrorBattery("USER-MANUAL.md");
 
-  it("★설치 동의 문구(FOREIGN_BACKUP_NOTICE)의 핵심 주장이 문서에도 있다", () => {
-    // [무엇을 약속하는가, 그 약속을 담은 낱말]. 낱말은 화면·문서 **양쪽**에 있어야 한다.
-    const claims: [string, string][] = [
-      ["남의 실체 파일도 백업한다", "실제 파일"],
-      ["남의 심볼릭 링크도 백업한다", "심볼릭 링크"],
-      ["지우지 않고 옮긴다", "지우지 않고"],
-      ["백업 이름 규칙을 밝힌다", "cys-backup"],
-      ["스탬프는 epoch 초다", "epoch"],
-      ["되돌리는 명령은 덮어쓰기 금지형이다", "sudo mv -n"],
-      ["해제가 자동으로 되돌린다", "되돌립니다"],
-    ];
-    for (const [why, token] of claims)
-      expect({
-        주장: why,
-        낱말: token,
-        화면: FOREIGN_BACKUP_NOTICE.includes(token),
-        문서: docHas(token),
-      }).toEqual({ 주장: why, 낱말: token, 화면: true, 문서: true });
-  });
-
-  it("★`-n` 의 뜻풀이가 화면과 문서 양쪽에 있다(가드를 사용자가 스스로 뜯지 않게)", () => {
-    expect({
-      화면: FOREIGN_BACKUP_NOTICE.includes(MV_EMPTY_CAVEAT),
-      문서: docHas(MV_EMPTY_CAVEAT),
-    }).toEqual({ 화면: true, 문서: true });
-  });
-
-  it("★문서의 실행 예시(코드블록)에 -n 없는 'sudo mv' 가 없다", () => {
-    // 산문에는 "예전에는 `-n` 없는 sudo mv 를 안내했다" 는 과거 서술이 남아 있어야 하므로,
-    // 검사 대상은 **따라 치게 되어 있는 코드블록**뿐이다.
-    const blocks = DOC.split("```").filter((_, i) => i % 2 === 1);
-    expect(blocks.length).toBeGreaterThan(3); // 코드블록을 하나도 못 찾는 사고 방지
-    const offenders = blocks.flatMap(unguardedMv);
-    expect({ 무방비_mv: offenders }).toEqual({ 무방비_mv: [] });
-  });
-
-  it("★문서가 화면의 '언제 명령을 내고 언제 내지 않는가' 규칙을 그대로 적고 있다", () => {
-    // 화면 쪽 실제 동작(backupRestoreSpot)의 세 갈래가 문서에도 그대로 있어야 한다.
-    expect({
-      비었을때: docHas("sudo mv -n"),
-      차있을때: docHas("옮기는 명령을 **내지 않습니다.**"),
-      모를때: docHas("ls -l <원래 경로>"),
-    }).toEqual({ 비었을때: true, 차있을때: true, 모를때: true });
-    // 그리고 화면이 정말 그렇게 동작한다(문서만 맞고 화면이 다르면 이 대조는 무의미하다).
+describe("★거울쌍 — 화면이 정말 그렇게 동작한다(문서만 맞고 화면이 다르면 대조는 무의미하다)", () => {
+  it("backupNoticeLine 의 세 갈래가 문서가 약속한 그대로다", () => {
     expect(backupNoticeLine(BACKUP_PATH, "absent")).toContain("sudo mv -n");
     expect(backupNoticeLine(BACKUP_PATH, "ours")).not.toContain("sudo mv");
     expect(backupNoticeLine(BACKUP_PATH, "partial")).toContain("ls -l /usr/local/bin/cys");
+  });
+
+  it("★docs/INSTALL.md 의 실행 예시(코드블록)에 -n 없는 'sudo mv' 가 없다", () => {
+    // 산문에는 "예전에는 `-n` 없는 sudo mv 를 안내했다" 는 과거 서술이 남아 있어야 하므로,
+    // 검사 대상은 **따라 치게 되어 있는 코드블록**뿐이다.
+    const blocks = readRepoDoc("docs/INSTALL.md").split("```").filter((_, i) => i % 2 === 1);
+    expect(blocks.length).toBeGreaterThan(3); // 코드블록을 하나도 못 찾는 사고 방지
+    expect({ 무방비_mv: blocks.flatMap(unguardedMv) }).toEqual({ 무방비_mv: [] });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MINOR-5(9R) — 배포 문서 코드블록 회귀핀(docs/ 전체 + 리포 루트 .md)
+// ══════════════════════════════════════════════════════════════════════════════
+// 위 거울쌍은 "문서가 화면과 같은 말을 하는가" 를 본다. 이 절은 다른 것을 본다 —
+// **문서가 따라 치면 파일이 사라지는 명령을 시키는가.**
+//
+// 이 라운드들에서 실제로 일어난 일이다. docs/INSTALL.md 의 수동 폴백이 맨 `sudo ln -sfn …` 를
+// 주고 있었고(그 자리에 있던 남의 실체 `cys` 가 백업 없이 소멸), docs/GUIDE-clean-reset-KR.md 의
+// '초보자용 완전 초기화' 블록이 맨 `sudo rm -f /usr/local/bin/cys …` 를 주고 있었다(같은 순간
+// GUI 해제 버튼은 '남의 파일일 수 있다'며 거부했다 — **세 해제 표면 중 하나만 지웠다**).
+// 두 자리 모두 손으로 찾아 손으로 고쳤고, 그때마다 **다른 문서에 같은 형태가 또 있었다.**
+//
+// 그래서 사람 눈이 아니라 기계가 전수로 본다. 판정 규칙은 셋이고, 전부 "그 자리에 있는 것이
+// 우리 것인지 보지 않고 파괴하는가" 하나를 묻는다:
+//   ① `ln -sf`/`ln -sfn` — `-f` 는 그 자리에 **실제 파일**이 있어도 묻지 않고 지우고 링크로 갈아
+//      끼운다. 문서 코드블록에 맨 채로 있으면 실패.
+//   ② 절대경로를 그대로 적은 `rm` — `/usr/local/bin/cys` 라는 **이름**은 그것이 우리 것이라는
+//      보장이 되지 못한다(Homebrew·직접 빌드본이 같은 자리에 있다).
+//   ③ `-n` 없는 절대경로 `mv` — 목적지가 차 있으면 말없이 덮어쓴다.
+//
+// **가드 인정 기준은 버튼과 같은 두 검사다**: 같은 코드블록 안에 `[ -L ` 와 `readlink` 가 함께
+// 있으면(=①심볼릭인가 ②그 링크가 우리 번들을 가리키는가) 그 블록은 통과한다. docs/INSTALL.md §B
+// 의 설치·해제 블록이 정확히 그 형태이고, 그것이 이 프로젝트의 **정본**이다 — 정본까지 빨개지는
+// 핀은 아무도 쓰지 않으므로 그 형태는 반드시 통과해야 한다(아래 합성 대조군으로 증명한다).
+//
+// 검사 대상은 **셸 코드블록**뿐이다: 펜스 태그가 없거나 sh·bash·zsh·shell·console 인 블록.
+// ```rust·```ts 처럼 구현을 인용한 블록과 산문·인라인 백틱은 '따라 치는 자리'가 아니다(거기까지
+// 잡으면 오탐이 잦아지고, 오탐이 잦은 게이트는 결국 꺼진다).
+
+type DocCmdKind = "ln" | "rm" | "mv" | "rmitem";
+type DocCmdHit = { line: number; kind: DocCmdKind; code: string };
+
+const SHELLISH_FENCE = new Set(["", "sh", "bash", "zsh", "shell", "console"]);
+/// ★(MINOR-6 · 10R) PowerShell 블록. 태그 없는 블록은 셸일 수도 PowerShell 일 수도 있으므로 양쪽에 든다.
+const PWSH_FENCE = new Set(["", "powershell", "pwsh", "ps", "ps1"]);
+
+/// 줄 전체 주석(`#…`)과 줄 끝 주석(` #…`)을 걷는다. 과거 서술("예전에는 `sudo rm …` 였습니다")이
+/// 코드블록 주석으로 남는 것은 정상이고, 그것까지 잡으면 이력을 지우게 된다.
+function stripShellComment(line: string): string {
+  if (line.trimStart().startsWith("#")) return "";
+  const i = line.indexOf(" #");
+  return i >= 0 ? line.slice(0, i) : line;
+}
+
+/// 명령 한 조각(파이프·`&&`·`;` 로 끊은 단위)을 판정한다. 명령 **위치**에 있을 때만 본다 —
+/// 백틱·따옴표 안의 같은 글자는 명령이 아니다(`sudo ln -sf …` 를 치지 말라는 경고문이 그 형태다).
+function classifyDocCommand(seg: string): DocCmdKind | null {
+  const t = seg.trim().replace(/^sudo\s+(-\S+\s+)*/, "");
+  const m = /^(ln|rm|mv)\s+(.+)$/.exec(t);
+  if (!m) return null;
+  const argv = (m[2] as string).split(/\s+/).filter(Boolean);
+  const flags = argv.filter((a) => a.startsWith("-")).join("");
+  const absolute = argv.some((a) => a.startsWith("/"));
+  if (m[1] === "ln") return flags.includes("s") && flags.includes("f") ? "ln" : null;
+  if (m[1] === "rm") return absolute ? "rm" : null;
+  return absolute && !flags.includes("n") ? "mv" : null;
+}
+
+/// ★(MINOR-6 · 10R) PowerShell 의 '묻지 않고 트리를 지운다' 형태 — `Remove-Item … -Recurse -Force`.
+/// 두 매개변수가 **함께** 있을 때만 본다(하나만으로는 정상 정리 명령이 흔하다: 리포 코드블록 실측
+/// 4줄 중 3줄이 `-Force` 단독이고 전부 파일 하나를 지운다). PowerShell 은 매개변수 이름을 앞부분만 적어도
+/// 받으므로(`-rec`·`-fo`·`-r`) **접두 일치**로 판정한다 — 축약형으로 빠져나가지 못하게.
+///
+/// 셸 `rm` 과 달리 경로 형태(절대·상대)를 보지 않는다. PowerShell 쪽에는 이 핀이 '가드'로 인정할
+/// 수 있는 형태가 아직 정의돼 있지 않아서, 경로가 무엇이든 그 조합 자체를 신호로 쓴다.
+function classifyPwshCommand(seg: string): DocCmdKind | null {
+  const t = seg.trim();
+  if (!/^Remove-Item\b/i.test(t)) return null;
+  let recurse = false;
+  let force = false;
+  for (const a of t.split(/\s+/).slice(1)) {
+    if (!a.startsWith("-")) continue;
+    const tok = a.slice(1).replace(/:.*$/, "").toLowerCase();
+    if (tok.length > 0 && "recurse".startsWith(tok)) recurse = true;
+    if (tok.length > 0 && "force".startsWith(tok)) force = true;
+  }
+  return recurse && force ? "rmitem" : null;
+}
+
+/// 문서 한 편의 **셸 코드블록**만 훑어 위 세 갈래를 찾는다(순수 — 문자열만 먹는다).
+function scanDocCommands(text: string): DocCmdHit[] {
+  const hits: DocCmdHit[] = [];
+  const lines = text.split("\n");
+  let open = false;
+  let tag = "";
+  let block: { n: number; raw: string }[] = [];
+  const flush = () => {
+    const shellish = SHELLISH_FENCE.has(tag);
+    const pwshish = PWSH_FENCE.has(tag);
+    if (!shellish && !pwshish) return;
+    const body = block.map((b) => b.raw).join("\n");
+    // 버튼과 같은 두 검사가 **명령 안에** 있으면 그 블록은 가드된 것이다(§B 정본의 형태).
+    // ★(MINOR-6) 이 면제는 **셸 갈래에만** 적용한다 — 그 두 검사는 PowerShell 명령에 대해
+    //   아무것도 말해 주지 않는다(가드 인정 규칙은 언어마다 따로 있어야 한다).
+    const guarded = body.includes("readlink") && body.includes("[ -L ");
+    for (const { n, raw } of block)
+      for (const seg of stripShellComment(raw).split(/&&|\|\||[;|]/)) {
+        const kind =
+          (shellish && !guarded ? classifyDocCommand(seg) : null) ??
+          (pwshish ? classifyPwshCommand(seg) : null);
+        if (kind) hits.push({ line: n, kind, code: raw.trim().slice(0, 120) });
+      }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const s = (lines[i] as string).trimStart();
+    if (s.startsWith("```")) {
+      if (open) {
+        flush();
+        open = false;
+        tag = "";
+        block = [];
+      } else {
+        open = true;
+        tag = s.slice(3).trim().toLowerCase();
+        block = [];
+      }
+      continue;
+    }
+    if (open) block.push({ n: i + 1, raw: lines[i] as string });
+  }
+  return hits;
+}
+
+/// 검사 대상 = `docs/` 아래 **모든** .md + 리포 루트의 .md. 목록을 손으로 적지 않는다 —
+/// 8R 이 네 파일만 지정했다가 다섯 번째 파일(GUIDE-clean-reset-KR.md)이 사용자 파일을 파괴한
+/// 것이 이 핀을 만든 이유다.
+function listRepoMarkdown(): string[] {
+  const out: string[] = [];
+  const walk = (rel: string) => {
+    for (const e of readdirSync(repoUrl(rel), { withFileTypes: true })) {
+      if (e.isDirectory()) walk(`${rel}${e.name}/`);
+      else if (e.name.endsWith(".md")) out.push(`${rel}${e.name}`);
+    }
+  };
+  walk("docs/");
+  for (const e of readdirSync(REPO_ROOT, { withFileTypes: true }))
+    if (e.isFile() && e.name.endsWith(".md")) out.push(e.name);
+  return out.sort();
+}
+
+/// 예외는 **그 예외가 필요한 문서 자신** 안에 적는다 — 머리에 한 줄:
+///
+///   <!-- doc-command-pin: allow(unguardedLn, unguardedRm) — reason: … -->
+///
+/// ★왜 테스트 파일의 목록이 아니라 문서 안인가: 이 라운드들이 반복해서 낸 결함이 **정본 이원화**다
+/// (같은 절차가 두 곳에 있으면 한쪽만 고쳐진다). 예외를 테스트 파일에 모아 두면, 문서를 읽는
+/// 사람은 자기가 보는 블록이 면제됐다는 사실을 **알 수 없고**, 문서가 지워지거나 이름이 바뀌어도
+/// 목록은 남아 유령 항목이 된다. 예외는 면제받는 그 자리에 있어야 한다.
+///
+/// 규칙 셋(전부 아래 테스트가 집행한다):
+///   ① `reason:` 이 없거나 30자 미만이면 **마커 자체가 실패**다(사유 없는 예외는 구멍이다).
+///   ② 마커는 `docs/plans/` 아래 **이력·설계 문서**에만 놓을 수 있다. 사용자가 따라 치는 문서
+///      (docs/INSTALL.md·GUIDE-*·README·USER-MANUAL 등)에 마커가 붙는 것은 그 자체가 결함이다 —
+///      거기서 필요한 것은 면제가 아니라 **명령 수리**다.
+///   ③ 마커를 단 파일 수에 상한을 둔다. 예외가 늘어나는 것을 조용히 넘기지 않는다.
+///
+/// 현재 마커를 가진 문서는 `docs/plans/2026-06-29-cli-path-install.md` 하나다(2026-06-29 에
+/// 완료되고 2026-08-25 설계정본이 상위대체한 이력 문서 — 원문을 보존해야 "왜 그때 그렇게
+/// 결정했는가"를 되물을 수 있다).
+const DOC_PIN_MARKER = /doc-command-pin:\s*allow\(([^)]*)\)([\s\S]{0,400}?)(?:-->|$)/;
+const MARKER_KIND: Record<string, DocCmdKind> = {
+  unguardedln: "ln",
+  unguardedrm: "rm",
+  unguardedmv: "mv",
+  unguardedremoveitem: "rmitem",
+};
+
+/// 문서 머리의 면제 마커를 읽는다(없으면 null). 사유는 `reason:` 뒤 전부.
+function readDocPinMarker(text: string): { kinds: DocCmdKind[]; reason: string } | null {
+  const m = DOC_PIN_MARKER.exec(text);
+  if (!m) return null;
+  const kinds = (m[1] as string)
+    .split(",")
+    .map((k) => MARKER_KIND[k.trim().toLowerCase()])
+    .filter((k): k is DocCmdKind => !!k);
+  const r = /reason:\s*([\s\S]*)$/.exec(m[2] as string);
+  return { kinds, reason: (r?.[1] ?? "").replace(/\s+/g, " ").trim() };
+}
+
+// ★알려진 한계 — 9R 판은 여기에 **변수 경로 하나만** 적어 두고 "일부러 그렇게 뒀다"로 끝냈다.
+// 그것이 사각의 전부인 것처럼 읽혔지만 아니었다. 10R 실측으로 확인한 사각은 셋이고, 아래가 그
+// 전부다(하나는 이 라운드에서 닫았고, 둘은 못 닫았다 — 못 닫은 것은 이유까지 적는다).
+//
+//   ① **홈 상대경로 — 못 잡는다.** `rm -rf ~/.cys ~/.local/state/cys …` 는 통과한다.
+//      `classifyDocCommand` 가 인자 중 하나라도 `/` 로 시작할 때만 `rm` 을 잡기 때문이다.
+//      범위를 넓히지 **않았다**: 지금 docs/GUIDE-clean-reset-KR.md 의 완전 초기화 절차가 정확히
+//      그 형태로 세 줄(launchd plist · 데이터 폴더 · 웹뷰 저장값) 있고, 그 셋은 문서가 사용자에게
+//      **시키려는 절차 자체**다. 이들을 잡으려면 홈 경로용 '가드 인정' 규칙이 먼저 있어야 하는데,
+//      그런 규칙은 아직 없다 — §B 정본의 `[ -L ]`+`readlink` 는 **링크 자리**에 대한 검사이지
+//      데이터 폴더 삭제에 대한 검사가 아니다. 규칙 없이 범위만 넓히면 정본이 빨개지고, 정본이
+//      빨개지는 핀은 결국 꺼진다. 이 사각은 다른 통제가 덮는다: 그 절차가 앱의 보존 계약
+//      (`src/factory_reset.rs` — 미등록 파일·`local` 오버레이 보존)보다 넓게 지운다는 경고를
+//      문서 자신이 지고 있어야 한다(10R MINOR-5).
+//   ② **PowerShell — 이 라운드에서 닫았다.** `Remove-Item … -Recurse -Force`(매개변수 접두
+//      축약 포함)를 ```powershell·```pwsh·태그 없는 블록에서 잡는다(`classifyPwshCommand`).
+//      넓힐 때 오탐이 없는지 리포 전체로 확인했다 — 현재 .md 전수 결과 이 갈래 0건이고, 코드블록
+//      안의 기존 `Remove-Item` 4줄(전부 docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md · 단일 파일
+//      정리)은 `-Recurse` 가 없어 걸리지 않는다.
+//   ③ **변수 경로 — 못 잡는다.** `D=/usr/local/bin/cys` 로 받아 `rm -f "$D"` 로 지우면 보지
+//      못한다. 그대로 둔다: 세 번의 실제 사고가 전부 **붙여넣는 한 줄**(`sudo ln -sfn <절대>
+//      <절대>` · `sudo rm -f <절대> <절대>` · `sudo mv <절대> <절대>`)의 형태였고, 변수까지
+//      좇으려면 이 리포의 가드 블록들(백업 이름 규칙 검사 · `CFBundleIdentifier` 검사 ·
+//      `[ -e ]`+`[ -L ]` 검사)이 전부 걸려 '가드 인정' 규칙을 한없이 느슨하게 만들어야 한다.
+//      예외가 많은 게이트는 결국 꺼진다. 닫아야 할 사정이 생기면 **가드 인정 규칙을 먼저 정하고**
+//      그다음에 범위를 넓혀라.
+//
+// ★9R 전수 스윕에서 예외 후보로 올라온 둘은 **면제가 아니라 수리로** 닫혔다(기록):
+//   · docs/INSTALL.md "필요 없으면 버리기" — 맨 `sudo rm <절대경로>` → 백업 이름 규칙 검사
+//     (`case "$B" in /usr/local/bin/cys.cys-backup-[0-9]*`) + 존재 검사 + 변수화.
+//   · docs/GUIDE-clean-reset-KR.md ④ 앱 삭제 — 맨 `sudo rm -rf /Applications/cys.app` →
+//     `CFBundleIdentifier` 가 `com.cysjavis.terminal` 일 때만 지우는 블록으로 교체.
+
+describe("★MINOR-5(9R) — 배포 문서 코드블록에 파괴적 명령이 다시 들어오지 못한다", () => {
+  const FILES = listRepoMarkdown();
+
+  it("대상 파일을 실제로 열거했다 — 0건이면 핀이 아니라 장식이다", () => {
+    expect({
+      문서_20편_이상: FILES.length >= 20,
+      정본_포함: FILES.includes("docs/INSTALL.md") && FILES.includes("USER-MANUAL.md"),
+      하위폴더_포함: FILES.some((f) => f.startsWith("docs/plans/")),
+    }).toEqual({ 문서_20편_이상: true, 정본_포함: true, 하위폴더_포함: true });
+  });
+
+  it("★전수 — 맨 `ln -sf`/`ln -sfn`, 가드 없는 절대경로 `rm`, `-n` 없는 절대경로 `mv`, PowerShell `Remove-Item -Recurse -Force` 가 없다", () => {
+    const offenders: string[] = [];
+    for (const rel of FILES) {
+      const text = readRepoDoc(rel);
+      const allow = readDocPinMarker(text)?.kinds ?? [];
+      for (const h of scanDocCommands(text))
+        if (!allow.includes(h.kind)) offenders.push(`${rel}:${h.line} [${h.kind}] ${h.code}`);
+    }
+    expect({ 위반: offenders }).toEqual({ 위반: [] });
+  });
+
+  // ★면제 마커가 **살아 있는 약속**인지 여기서 집행한다. 문서에 적힌 마커를 이 핀이 읽지 않으면
+  // 그 주석은 '있지도 않은 테스트를 보증으로 내세우는' 바로 그 형태가 된다(7R MINOR-5 와 같은 결함).
+  it("★면제 마커 — 사유가 붙어 있고, 이력·설계 문서(docs/plans/)에만 있고, 수가 늘지 않았다", () => {
+    const marked = FILES.map((rel) => ({ rel, m: readDocPinMarker(readRepoDoc(rel)) })).filter(
+      (x): x is { rel: string; m: NonNullable<ReturnType<typeof readDocPinMarker>> } => x.m !== null,
+    );
+    expect({
+      // ① 사유 없는 마커는 마커가 아니다.
+      사유가_부실한_문서: marked.filter((x) => x.m.reason.length < 30).map((x) => x.rel),
+      // ② 사용자가 따라 치는 문서에는 면제가 없다 — 거기서 필요한 것은 수리다.
+      사용자_문서에_붙은_마커: marked.filter((x) => !x.rel.startsWith("docs/plans/")).map((x) => x.rel),
+      // ③ 아무 갈래도 열지 않는 마커(오타)는 조용히 통과하지 않는다.
+      갈래를_못_읽은_마커: marked.filter((x) => x.m.kinds.length === 0).map((x) => x.rel),
+      // ④ 예외가 조용히 늘어나지 않게.
+      마커_셋_이내: marked.length <= 3,
+    }).toEqual({
+      사유가_부실한_문서: [],
+      사용자_문서에_붙은_마커: [],
+      갈래를_못_읽은_마커: [],
+      마커_셋_이내: true,
+    });
+  });
+
+  it("★마커 파서 자체의 변이 — 사유 없는 마커·오타 갈래를 실제로 걸러낸다", () => {
+    const 정상 = readDocPinMarker(
+      "<!-- doc-command-pin: allow(unguardedLn, unguardedRm) — reason: 상위대체된 이력 문서라 원문을 보존해야 이력으로서 값이 있다. 실행 정본은 docs/INSTALL.md §B 다. -->",
+    );
+    expect({ 갈래: 정상?.kinds, 사유가_30자_이상: (정상?.reason.length ?? 0) >= 30 }).toEqual({
+      갈래: ["ln", "rm"],
+      사유가_30자_이상: true,
+    });
+    expect(readDocPinMarker("<!-- doc-command-pin: allow(unguardedLn) -->")?.reason).toBe("");
+    expect(readDocPinMarker("<!-- doc-command-pin: allow(전부) — reason: 아무거나 -->")?.kinds).toEqual([]);
+    expect(readDocPinMarker("면제 마커가 없는 평범한 문서")).toBeNull();
+  });
+
+  // ── 변이시험 — 이 핀이 실제로 빨개지는가 ────────────────────────────────────
+  // 핀은 "지금 초록"이 아니라 "잘못이 들어오면 빨개짐"으로 증명된다. 이 라운드들에서 초록인 채로
+  // 결함을 봉인한 테스트가 여럿 있었으므로(계약 드리프트 픽스처·주석 우회), 합성 변이를 상주시킨다.
+  it("★변이 — 실제로 사고를 낸 세 형태를 그대로 넣으면 셋 다 잡힌다", () => {
+    const 변이 = [
+      "```sh",
+      "sudo ln -sfn /Applications/cys.app/Contents/MacOS/cys /usr/local/bin/cys",
+      "sudo rm -f /usr/local/bin/cys /usr/local/bin/cysd",
+      "sudo mv /usr/local/bin/cys.cys-backup-1756089600 /usr/local/bin/cys",
+      "```",
+    ].join("\n");
+    expect(scanDocCommands(변이).map((h) => h.kind)).toEqual(["ln", "rm", "mv"]);
+  });
+
+  it("★변이 — `&&` 로 이어 붙여도, 태그 없는 펜스여도 잡힌다(우회 형태)", () => {
+    const 변이 = ["```", "mkdir -p /usr/local/bin && ln -sf $SRC/cys /usr/local/bin/cys", "```"].join("\n");
+    expect(scanDocCommands(변이).map((h) => h.kind)).toEqual(["ln"]);
+  });
+
+  it("★대조군 — §B 정본(가드 블록)은 통과한다", () => {
+    const 정본 = [
+      "```sh",
+      "sudo sh -c '",
+      "for d in /usr/local/bin/cys /usr/local/bin/cysd; do",
+      '  if [ -L "$d" ]; then',
+      '    case "$(readlink "$d")" in',
+      '      */cys.app/Contents/MacOS/cys|*/cys.app/Contents/MacOS/cysd) rm -f "$d" ;;',
+      "    esac",
+      "  fi",
+      '  ln -sfn "$SRC/$f" "$d" || exit 1',
+      "done",
+      "'",
+      "```",
+    ].join("\n");
+    expect(scanDocCommands(정본)).toEqual([]);
+  });
+
+  it("★대조군 — 산문·주석·비셸 블록은 잡지 않는다(오탐이 잦은 게이트는 결국 꺼진다)", () => {
+    // ① 코드블록 밖의 경고 산문(문서가 "치지 마세요" 라고 말하는 바로 그 형태)
+    expect(scanDocCommands("⚠ 맨 `sudo ln -sfn …` 를 단독으로 치지 마세요.")).toEqual([]);
+    // ② 코드블록 안의 과거 서술 주석
+    expect(scanDocCommands("```sh\n# 예전에는 sudo rm /usr/local/bin/cys 한 줄이었습니다\n```")).toEqual([]);
+    // ③ 구현을 인용한 비셸 블록
+    expect(scanDocCommands('```rust\nformat!("ln -sf {c} {tc}")\n```')).toEqual([]);
+    // ④ 변수 인자 — 절대경로를 그대로 적은 것만 본다(위 알려진 한계 ③ · **사각이다**)
+    expect(scanDocCommands('```sh\nrm -f "$d"\nmv "$d" "$b"\n```')).toEqual([]);
+    // ⑤ 가드가 붙은 `mv -n`
+    expect(scanDocCommands("```sh\nsudo mv -n /usr/local/bin/cys.cys-backup-1 /usr/local/bin/cys\n```")).toEqual([]);
+  });
+
+  // ── ★MINOR-6(10R) 알려진 한계를 **시험으로** 고정한다 ─────────────────────────
+  // 주석에 "못 잡는다" 라고 적어 두기만 하면, 나중에 누군가 범위를 넓혔을 때 그 주석이 조용히
+  // 거짓이 된다(이 라운드가 반복해 닫는 병의 문서판이다). 사각도 대조군으로 못박아, 사각이
+  // 사각이 아니게 되는 순간 이 시험이 빨개져 주석을 함께 고치게 만든다.
+  it("★사각 ① 홈 상대경로는 아직 못 잡는다 — 주석과 실물이 같은 말을 한다", () => {
+    expect(scanDocCommands("```bash\nrm -rf ~/.cys ~/.local/state/cys\n```")).toEqual([]);
+    expect(scanDocCommands("```bash\nrm -f ~/Library/LaunchAgents/com.cysjavis.cysd.plist\n```")).toEqual([]);
+  });
+
+  it("★사각 ② PowerShell 은 이 라운드에서 닫았다 — `-Recurse -Force` 조합을 잡는다", () => {
+    const 변이 = ["```powershell", 'Remove-Item "$env:LOCALAPPDATA\\cys" -Recurse -Force', "```"].join("\n");
+    expect(scanDocCommands(변이).map((h) => h.kind)).toEqual(["rmitem"]);
+    // 축약형으로 빠져나가지 못한다(PowerShell 은 매개변수 앞부분만 적어도 받는다).
+    expect(scanDocCommands("```pwsh\nRemove-Item C:\\cys -rec -fo\n```").map((h) => h.kind)).toEqual(["rmitem"]);
+    // 태그 없는 블록에 적어도 잡는다(펜스 태그로 빠져나가지 못한다).
+    expect(scanDocCommands("```\nRemove-Item $HOME\\.cys -Recurse -Force\n```").map((h) => h.kind)).toEqual(["rmitem"]);
+  });
+
+  it("★그 확장이 오탐을 내지 않는다 — 리포에 실재하는 `Remove-Item` 형태는 통과한다", () => {
+    // 실물 인용(docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md · docs/RELEASE_NOTES_0.14.19.md).
+    const 실물 = [
+      "```powershell",
+      "Remove-Item $log -ErrorAction SilentlyContinue",
+      'Remove-Item "$INST\\cys.exe" -Force',
+      'Remove-Item "$INST\\cys.exe","$INST\\cys-install-failure.txt" -Force -ErrorAction SilentlyContinue',
+      "Get-Process cys,cysd,cys-app -ErrorAction SilentlyContinue | Stop-Process -Force",
+      "```",
+    ].join("\n");
+    expect(scanDocCommands(실물)).toEqual([]);
+    // 산문 속 되돌리기 안내(코드블록 밖)도 잡지 않는다.
+    expect(scanDocCommands("되돌리기: `Remove-Item $HOME\\.cys\\win-no-alt-screen`.")).toEqual([]);
+  });
+
+  it("★사각 ③ 변수 경로는 아직 못 잡는다 — 주석과 실물이 같은 말을 한다", () => {
+    expect(scanDocCommands('```sh\nD=/usr/local/bin/cys\nrm -f "$D"\n```')).toEqual([]);
   });
 });
 
@@ -2359,16 +2888,96 @@ function pinLacks(where: string, hay: string, needle: string) {
   });
 }
 
-describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => {
-  it("(N4) stickyToast 는 낼 때마다 className 을 현재 등급으로 다시 못박는다(재사용 엘리먼트)", () => {
-    pinHas("stickyToast", mainFnBody("stickyToast"), "el.className = toastClassName(category)");
+/// CLI 설치·해제 버튼의 **클릭 핸들러 한 덩어리**(주석 걷은 코드). 순서를 보는 핀은 반드시 이
+/// 범위 안에서만 봐야 한다 — 파일 전체(383KB)에서 두 바늘의 위치를 비교하면, 다른 곳의 같은
+/// 문자열이 순서를 대신 통과시켜 준다(그것이 MINOR-7 의 검사 쪽 결함이었다).
+function cliClickHandler(): string {
+  const head = 'document.getElementById("btn-install-cli")?.addEventListener("click"';
+  const i = MAIN_CODE.indexOf(head);
+  expect({ 핸들러: "btn-install-cli click", 존재: i >= 0 }).toEqual({
+    핸들러: "btn-install-cli click",
+    존재: true,
   });
-  it("volatile toast() 도 같은 함수로 등급색을 **대입**한다(단일 진실)", () => {
-    // ★(MINOR · 8R) 예전 바늘은 `"toastClassName(category)"` 였다 — 함수 본문에 그 문자열이
-    // 있기만 하면 통과했다. 반증자 실측: `el.className = "toast"; void toastClassName(category);`
-    // 로 등급색(테두리색 = 등급을 표시하는 유일한 장치)을 완전히 파괴해도 초록이었다.
-    // 형제 핀(stickyToast)은 처음부터 대입을 검사하고 있었으므로, 이쪽만 절반의 거짓이었다.
-    pinHas("toast", mainFnBody("toast"), "el.className = toastClassName(category)");
+  const end = MAIN_CODE.indexOf("\n});\n", i);
+  expect({ 핸들러: "btn-install-cli click", 끝을_찾음: end > i }).toEqual({
+    핸들러: "btn-install-cli click",
+    끝을_찾음: true,
+  });
+  const body = MAIN_CODE.slice(i, end + 4);
+  // 빈 조각·파일 끝까지 통째로 삼킨 조각을 검사하는 사고 방지(둘 다 핀을 장식으로 만든다).
+  expect({ 핸들러_길이_적정: body.length > 800 && body.length < 12000 }).toEqual({
+    핸들러_길이_적정: true,
+  });
+  return body;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-3(10R) — 등급색 핀이 **부분 문자열 검사**라 우회됐다(변이 M8)
+// ══════════════════════════════════════════════════════════════════════════════
+// 8R 은 이 핀의 바늘을 `"toastClassName(category)"` 에서 `"el.className = toastClassName(category)"`
+// 로 좁히고 "이 계열을 닫았다"고 적었다. **닫히지 않았다.** 반증자 재현(M8):
+//
+//   main.ts 6098 의 `el.className = toastClassName(category);` 를 **지우지 않고**
+//   바로 다음 줄에 `el.className = "toast";` 를 추가한다.
+//
+// 앱 전역 volatile 토스트의 등급색(테두리색 = 등급을 표시하는 유일한 장치)이 전부 죽는데, 찾던
+// 부분 문자열은 여전히 그 자리에 **있으므로** 핀은 초록이었다. 부분 문자열 검사는 "그 줄이 있는가"
+// 만 묻고 "그 줄이 **끝까지 유효한가**" 는 묻지 못한다 — 마지막 대입이 이긴다는 것이 JS 의 규칙이다.
+//
+// 그래서 검사를 **마지막 대입이 무엇인가** 로 바꾼다. 그리고 대입이 하나뿐임까지 못박는다:
+// 같은 값을 두 번 대입하는 코드는 정상 코드에 없고, 둘 이상이면 그 자체가 이 결함의 형태다.
+//
+// ★알려진 한계(정직): 이 핀은 main.ts 를 **읽는다**(실행하지 않는다). 앱 엔트리는 최상위에서
+// DOM 을 만지므로 테스트에서 import 할 수 없다. 그래서 "실제 DOM 요소의 최종 className" 이 아니라
+// "본문 안의 최종 className **대입식**" 을 본다. 이 함수 밖에서(예: 부모가 나중에) 클래스를 바꾸는
+// 형태는 여전히 보지 못한다 — 그 경우는 el 이 붙는 컨테이너 쪽 핀이 따로 필요하다.
+/// 함수 본문에서 `<식별자>.className = <식>` 대입을 **나온 순서대로** 뽑는다(주석은 이미 걷혔다).
+function classNameAssignments(body: string): { target: string; value: string }[] {
+  const out: { target: string; value: string }[] = [];
+  const re = /(\w+)\.className\s*=\s*([^;\n]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null)
+    out.push({ target: m[1] as string, value: (m[2] as string).trim() });
+  return out;
+}
+
+/// 토스트 엘리먼트의 등급색 대입이 **하나뿐이고, 그 하나가 등급 함수** 인가.
+/// 덧붙여 className 을 우회해 지우는 형태(classList·setAttribute·removeAttribute)도 막는다.
+function pinFinalClassName(fn: string) {
+  const body = mainFnBody(fn);
+  const asgn = classNameAssignments(body);
+  expect({
+    함수: fn,
+    className_대입: asgn.map((a) => `${a.target}.className = ${a.value}`),
+    클래스_우회: [".classList", 'setAttribute("class"', 'removeAttribute("class"'].filter((n) =>
+      body.includes(n),
+    ),
+  }).toEqual({
+    함수: fn,
+    className_대입: ["el.className = toastClassName(category)"],
+    클래스_우회: [],
+  });
+}
+
+describe("main.ts 배선 핀 — 토스트 등급색·CLI 클릭 분기", () => {
+  it("(N4) stickyToast 의 **마지막** className 대입이 현재 등급이다(재사용 엘리먼트)", () => {
+    pinFinalClassName("stickyToast");
+  });
+  it("★(M8) volatile toast() 도 마찬가지 — 뒤에 한 줄 덧대는 우회가 통하지 않는다", () => {
+    pinFinalClassName("toast");
+  });
+  it("★검사기 자체의 변이 — M8 형태(뒤에 덧댄 대입)를 실제로 읽어낸다", () => {
+    // 핀이 장식이 아님을 핀 자신이 증명한다. 아래 두 본문은 **부분 문자열 검사로는 구별되지
+    // 않는다**(둘 다 `el.className = toastClassName(category)` 를 포함한다).
+    const 정상 = 'el.className = toastClassName(category);\nbox.appendChild(el);';
+    const 변이 = 'el.className = toastClassName(category);\nel.className = "toast";\nbox.appendChild(el);';
+    expect(정상.includes("el.className = toastClassName(category)")).toBe(true);
+    expect(변이.includes("el.className = toastClassName(category)")).toBe(true); // ← 옛 핀이 초록이던 이유
+    expect(classNameAssignments(정상).map((a) => a.value)).toEqual(["toastClassName(category)"]);
+    expect(classNameAssignments(변이).map((a) => a.value)).toEqual([
+      "toastClassName(category)",
+      '"toast"',
+    ]);
   });
   it("(I7) main.ts 가 사라진 emit.className 을 참조하지 않는다", () => {
     pinLacks("main.ts", MAIN_CODE, "emit.className");
@@ -2466,14 +3075,110 @@ describe("★MAJOR-3 — 상태 조회 동시성 가드(중복 억제 + 세대 �
     pinHas("refreshCliInstallState", BODY(), "if (cliStatusBusy && !opts.force) return;");
   });
 
-  it("★세대 카운터로 늦게 온 옛 응답이 최신 상태를 덮지 못한다(last-writer-wins 차단)", () => {
+  it("★세대 카운터의 다섯 조각이 전부 제자리에 있다(last-writer-wins 차단의 재료)", () => {
     pinHas("refreshCliInstallState", BODY(), "const gen = ++cliStatusGen;");
     pinHas("refreshCliInstallState", BODY(), "if (gen !== cliStatusGen) return;");
-    // ★가드가 장식이 되는 유일한 형태를 막는다: 응답을 await 뒤 **곧바로** cliStatus 에 대입하면
-    // 세대 검사를 할 자리가 없다(대입이 이미 끝났다). 지역 변수로 받아야만 검사가 의미를 갖는다.
+    // ★(MAJOR-2 · 10R) 8R 주석은 이 자리를 "가드가 장식이 되는 **유일한** 형태를 막는다" 고
+    // 단언했다. **거짓이었다.** `cliStatus = readCliStatus(await invoke` 는 그 병의 한 가지
+    // 표현일 뿐이고, 병 자체는 '검사보다 먼저 쓰기가 일어난다' 는 **순서** 문제다. 지역 변수로
+    // 받아도 대입을 검사 앞으로 한 줄 올리면 그대로 되살아난다(아래 M9 절이 그 자리를 닫는다).
+    // 이 다섯 바늘이 보는 것은 재료의 존재일 뿐, 조립 순서가 아니다 — 그 사실을 여기 적어 둔다.
     pinLacks("refreshCliInstallState", BODY(), "cliStatus = readCliStatus(await invoke");
     pinHas("refreshCliInstallState", BODY(), "view = readCliStatus(await invoke");
     pinHas("refreshCliInstallState", BODY(), "cliStatus = view;");
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ★MAJOR-2(10R) — 순서를 **소스에서 뽑아 실제 비동기로 흘려 본다**(변이 M9)
+  // ══════════════════════════════════════════════════════════════════════════
+  // 반증자 재현(M9): `cliStatus = view;` 를 `if (gen !== cliStatusGen) return;` **앞으로** 한 줄
+  // 옮기면 last-writer-wins 가 되살아나는데, 위 다섯 바늘은 전부 그 자리에 남아 있어 초록이었다.
+  //
+  // main.ts 는 앱 엔트리라 테스트에서 import 할 수 없다(최상위에서 DOM 을 만지고 invoke 를 부른다).
+  // 그래서 부분 문자열을 하나 더 늘리는 대신, 본문에서 **여섯 단계의 순서를 뽑아** 그 순서대로 두
+  // 요청을 진짜 비동기로 흘려 본다. 판정은 지표의 대소 비교가 아니라 결과다 —
+  // **먼저 시작하고 늦게 끝난 옛 요청이 최신 상태를 덮었는가.**
+  //
+  // 모델의 범위(정직): `if (cliStatusBusy && !opts.force) return;` 은 넣지 않는다. 여기서 재현하는
+  // 것은 **force 로 억제를 건너뛰는 두 요청**(설치·해제 직후의 재조회)이 겹치는 실제 경로이고,
+  // 세대 카운터는 바로 그 경로를 위해 존재하기 때문이다. 억제 갈래는 위 별도 핀이 지킨다.
+  type RefreshStep = "gen" | "busyOn" | "await" | "guard" | "busyOff" | "commit";
+  const REFRESH_NEEDLES: [RefreshStep, string][] = [
+    ["gen", "const gen = ++cliStatusGen;"],
+    ["busyOn", "cliStatusBusy = true;"],
+    ["await", "view = readCliStatus(await invoke"],
+    ["guard", "if (gen !== cliStatusGen) return;"],
+    ["busyOff", "cliStatusBusy = false;"],
+    ["commit", "cliStatus = view;"],
+  ];
+
+  /// 본문에서 여섯 단계를 찾아 **나온 순서대로** 돌려준다. 하나라도 없거나 두 번 나오면 실패다
+  /// (없으면 모델이 실물과 다르고, 두 번이면 어느 자리를 흉내 내는지 말할 수 없다).
+  function refreshSteps(): RefreshStep[] {
+    const body = BODY();
+    const found = REFRESH_NEEDLES.map(([step, needle]) => {
+      const i = body.indexOf(needle);
+      expect({ 단계: step, 있음: i >= 0, 중복: i >= 0 && body.indexOf(needle, i + 1) >= 0 }).toEqual({
+        단계: step,
+        있음: true,
+        중복: false,
+      });
+      return { step, i };
+    });
+    return found.sort((a, b) => a.i - b.i).map((f) => f.step);
+  }
+
+  type RefreshWorld = { gen: number; busy: boolean; status: string };
+  /// 뽑은 순서를 그대로 실행한다. `await` 단계에서 실제로 지연이 들어가므로, 두 요청을 겹쳐
+  /// 돌리면 완료 순서가 시작 순서와 **뒤바뀐다**(그것이 이 가드가 존재하는 이유다).
+  async function runRefresh(
+    steps: readonly RefreshStep[],
+    world: RefreshWorld,
+    view: string,
+    delayMs: number,
+  ): Promise<void> {
+    let mine = 0;
+    for (const step of steps) {
+      if (step === "gen") mine = ++world.gen;
+      else if (step === "busyOn") world.busy = true;
+      else if (step === "await") await new Promise((r) => setTimeout(r, delayMs));
+      else if (step === "guard") {
+        if (mine !== world.gen) return; // 내 세대가 더는 최신이 아니다 — 아무것도 쓰지 않고 물러난다
+      } else if (step === "busyOff") world.busy = false;
+      else world.status = view;
+    }
+  }
+
+  it("★(M9) 늦게 끝난 옛 요청이 최신 상태를 덮지 않는다 — 소스의 순서를 그대로 흘려 본 결과", async () => {
+    const steps = refreshSteps();
+    const world: RefreshWorld = { gen: 0, busy: false, status: "초기" };
+    const 옛요청 = runRefresh(steps, world, "옛 응답", 40); // 먼저 시작 · 늦게 끝난다
+    const 새요청 = runRefresh(steps, world, "새 응답", 5); // 나중에 시작 · 먼저 끝난다
+    await Promise.all([옛요청, 새요청]);
+
+    // ★결과와 순서를 **한 단언**에 담는다. 따로 두면 순서 단언이 먼저 터져 정작 중요한 것
+    // (낡은 응답이 최신을 덮었다는 사실)이 출력에서 사라진다 — 실패 메시지도 설계 대상이다.
+    expect({ 최종_상태: world.status, 프로브_표시: world.busy, 본문에서_읽은_순서: steps }).toEqual({
+      최종_상태: "새 응답",
+      프로브_표시: false,
+      본문에서_읽은_순서: ["gen", "busyOn", "await", "guard", "busyOff", "commit"],
+    });
+  });
+
+  it("★모델 자체의 변이 — 대입을 검사 앞으로 옮기면 이 시험이 실제로 빨개진다", () => {
+    // 위 시험이 '순서에 반응하는가' 를 시험 자신이 증명한다. M9 을 손으로 재현한 순서를 넣고
+    // 같은 모델을 돌려, **덮어쓰기가 일어나는지** 확인한다(여기서는 그것이 기대값이다).
+    const 변이순서: RefreshStep[] = ["gen", "busyOn", "await", "commit", "guard", "busyOff"];
+    const world: RefreshWorld = { gen: 0, busy: false, status: "초기" };
+    const p = Promise.all([
+      runRefresh(변이순서, world, "옛 응답", 40),
+      runRefresh(변이순서, world, "새 응답", 5),
+    ]);
+    return p.then(() => {
+      expect({ 변이를_넣었을_때_최종_상태: world.status }).toEqual({
+        변이를_넣었을_때_최종_상태: "옛 응답", // ← 낡은 응답이 최신을 덮는다 = 위 시험이 빨개진다
+      });
+    });
   });
 
   it("액션 직후 재조회만 억제를 건너뛴다(force) — 라벨·고지 줄이 낡지 않게", () => {
@@ -2487,19 +3192,43 @@ describe("★MAJOR-3 — 상태 조회 동시성 가드(중복 억제 + 세대 �
     pinLacks("refreshCliInstallState", BODY(), "setTimeout");
   });
 
-  it("★해제 경로의 재진입 차단이 확인 모달보다 **앞**에 있다(이중 집행 차단)", () => {
-    // 오버레이(.modal-overlay)는 마우스만 가린다 — 포커스는 방금 누른 버튼에 남고, 전역 키
-    // 핸들러는 수식키 없는 입력을 흘려보내므로(`if (!mod) return`) Enter/Space 로 재진입한다.
-    // 그래서 `b.disabled = true` 는 **첫 await 앞**에 있어야 한다.
-    const disabled = MAIN_CODE.indexOf("b.disabled = true;");
-    const modal = MAIN_CODE.indexOf("await confirmModal(c.title, c.body, c.yes, c.no)");
-    expect({ 둘_다_존재: disabled >= 0 && modal >= 0, 차단이_먼저: disabled >= 0 && modal >= 0 && disabled < modal }).toEqual({
-      둘_다_존재: true,
-      차단이_먼저: true,
-    });
+  // ★MINOR-7(9R) — 이 순서 핀이 **전역 indexOf** 였다.
+  //
+  // 오버레이(.modal-overlay)는 마우스만 가린다 — 포커스는 방금 누른 버튼에 남고, 전역 키
+  // 핸들러는 수식키 없는 입력을 흘려보내므로(`if (!mod) return`) Enter/Space 로 재진입한다.
+  // 그래서 `b.disabled = true` 는 **첫 await 앞**에 있어야 한다. 8R 이 그렇게 고쳤는데, 검사는
+  // 파일 **전체**에서 두 바늘의 위치를 비교하고 있었다: 파일 어딘가 다른 곳에 같은 문자열이
+  // 생기면 그쪽이 순서를 대신 통과시켜 주고, 정작 이 핸들러 안에서 가드가 다시 모달 뒤로
+  // 내려가도 초록일 수 있다. 검사 범위를 **그 핸들러 한 덩어리**로 좁힌다.
+  //
+  // 그리고 바늘을 `await confirmModal(...)` 에서 **첫 await 무엇이든**으로 바꾼다 — 해제 경로만
+  // 지키면 설치 경로는 다시 열린다(같은 가드를 경로마다 다른 자리에 두는 것이 8R 이 지적한
+  // 어긋남의 본체였다). 계열로 닫는다.
+  it("★재진입 차단이 **첫 await 앞**에 있다 — 해제·설치 두 경로 모두(계열)", () => {
+    const H = cliClickHandler();
+    const disabled = H.indexOf("b.disabled = true;");
+    const firstAwait = H.indexOf("await ");
+    expect({
+      가드_존재: disabled >= 0,
+      첫_await_존재: firstAwait >= 0,
+      가드가_먼저: disabled >= 0 && firstAwait >= 0 && disabled < firstAwait,
+    }).toEqual({ 가드_존재: true, 첫_await_존재: true, 가드가_먼저: true });
+    // 그 첫 await 가 실제로 확인 모달이다(우리가 재진입을 막으려는 바로 그 창).
+    expect(H.slice(firstAwait, firstAwait + 40)).toContain("confirmModal");
+  });
+
+  it("★핸들러 진입 자체가 disabled 를 먼저 본다(모달이 떠 있는 동안 다시 들어와도 무효)", () => {
+    pinHas("btn-install-cli click", cliClickHandler(), "if (!b || b.disabled) return;");
   });
 
   it("확인 창을 취소하면 버튼을 되살린다(영구 비활성 금지)", () => {
-    pinHas("main.ts", MAIN_CODE, "      b.disabled = false;\n      return;");
+    pinHas("btn-install-cli click", cliClickHandler(), "      b.disabled = false;\n      return;");
+  });
+
+  // ★MINOR-7(9R) 이중 방어 — 호출부 가드는 버튼 하나를 지키고, 이 줄은 confirmModal 을 쓰는
+  // **모든 자리**를 지킨다. 포커스가 확인 창 밖(방금 누른 버튼)에 남아 있는 한, 같은 재진입은
+  // 다른 버튼에서 언제든 다시 열린다 — 지점이 아니라 계열로 닫는다.
+  it("★확인 창이 포커스를 모달 안(취소 쪽)으로 가져간다 — 키보드 재진입의 뿌리", () => {
+    pinHas("confirmModal", mainFnBody("confirmModal"), 'ov.querySelector(".modal-no") as HTMLElement).focus()');
   });
 });
