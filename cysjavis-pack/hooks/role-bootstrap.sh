@@ -543,6 +543,15 @@ if [ -f "$MISSION" ]; then
   MISSION_N="$(cys_native_path "$MISSION")"
   TRIAGE_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 8 "$CYS_PY" "$MISSION_N" hook-triage 2>/dev/null)"
   TRIAGE_RC=$?
+  # ★CRLF 정규화(P0-5 수정 라운드 must_fix — Windows 치명): Windows 파이썬(번들 embeddable 포함)의
+  #   sys.stdout 은 기본 newline 변환으로 \n 을 \r\n 으로 내보낸다(모듈의 reconfigure(encoding=...)
+  #   는 newline 을 바꾸지 않는다). 그대로 두면 아래 sed 의 '$' 앵커가 \r 직전에서 깨져 RECORD_RC
+  #   가 상시 "" 로 접히고(임무 게이트 영구 폐쇄 — 오너가 임무를 지정해도 자율 착수 불가), MO 는
+  #   substring glob 이라 통과해 spawn 만 열리는 조용한 열화가 된다 + note 가 허위 '모듈 부재'
+  #   문안으로 떨어진다. 캡처 직후 여기 **1회** 전량 제거한다 — 반드시 파라미터 확장이어야 한다:
+  #   tr 파이프를 위 명령치환 안에 넣으면 TRIAGE_RC 가 tr 의 rc 로 오염된다(원시 rc 의 유일
+  #   관측점). 프로토콜 라인(rc 정수·대장 경로·MO 토큰)에 \r 이 정당하게 올 자리는 없다.
+  TRIAGE_OUT=${TRIAGE_OUT//$'\r'/}
   if [ "$TRIAGE_RC" = "64" ]; then
     # ★구팩 스큐 폴백(1릴리스 병존 · 조용한 강등 금지 — stderr 1줄): hook-triage 부재 구
     #   javis_mission 은 미지 서브커맨드를 stdin 무소비·EX_USAGE(64)로 거부한다(문서화된 값 —
@@ -767,8 +776,12 @@ else
   #   주석의 실경로 4종 — 모듈 부재 경로에서는 같은 런 stderr 의 '임무 대장 미기록'과 주입문이
   #   자기모순했다). 실행이 확인되지 않은 쓰기를 '기록했다'고 적으면 그 허위가 오너 보고로
   #   중계되므로, 대장 서술은 RECORD_RC 관측치로만 가른다.
+  # ★"" 폴드는 2겹이다(위 RECORD_RC 주석 — P0-5 이후): 모듈 부재 **또는** 배치 왕복의 record
+  #   라인 부재(중도 사망·타임아웃·파싱 실패). 후자에서 모듈은 실재하므로 '부재' 단정은 허위가
+  #   된다 — 어느 쪽인지는 이 훅이 같은 런 stderr 에 남긴 로그(모듈 부재 고지 vs 배치 왕복
+  #   rc=N 진단)만이 가른다. 주입문은 미확인을 미확인이라고만 적는다(정직성 불변식 :63-66).
   if [ -z "$RECORD_RC" ]; then
-    LEDGER_SENT="임무 대장은 기록되지 않았다 — javis_mission.py 부재(훅 stderr 와 동일 사실). 게이트는 fail-closed 로 닫혀 있다."
+    LEDGER_SENT="임무 대장 기록 여부는 미확인이다 — record 판정이 도착하지 않았다(javis_mission.py 부재 또는 hook-triage 배치 왕복의 중도 사망·타임아웃 — 어느 쪽인지는 훅 stderr 가 남겼다). 게이트는 fail-closed 로 닫혀 있다."
   elif [ "$RECORD_RC" = "1" ]; then
     LEDGER_SENT="임무 대장 기록 판정은 exit 1(임무 없음)로 완료됐다. 오너가 친 선언 단독 프롬프트였다면 대장($MISSION_LEDGER)은 mission=null 로 재개장됐고, 기계 유래로 접힌 프롬프트였다면 대장은 무변경이다 — 실제 기록은 이 문안이 아니라 javis_mission.py status 출력이 사실이다."
   else

@@ -477,6 +477,20 @@ _TRIAGE_FULL = _TRIAGE_CALL_LOG + (
     "    sys.stdout.write('machine-origin: human\\n'); sys.stdout.flush()\n"
     "    raise SystemExit(1)\n"
     "raise SystemExit(64)\n")
+# ★CRLF 쌍둥이(리뷰어 R1 must_fix 검체 — Windows 실출력 재현): Windows 파이썬(번들 embeddable
+# 포함)의 sys.stdout 은 기본 newline 변환으로 \n 을 \r\n 으로 내보낸다(모듈의
+# reconfigure(encoding=...)는 newline 을 바꾸지 않는다). write 로 \r\n 을 명시해 POSIX 러너에서도
+# 이 라인 종결 성질을 핀한다 — 훅의 sed '$' 앵커가 \r 비관용이면 RECORD_RC 상시 ""(Windows 임무
+# 게이트 영구 폐쇄)+MO substring 만 통과하는 조용한 열화가 되는데, LF 목만으로는 그 회귀가
+# green 을 통과한다(이 검체가 없어서 실제로 통과했던 이력이 있다).
+_TRIAGE_FULL_CRLF = _TRIAGE_CALL_LOG + (
+    "if cmd == 'hook-triage':\n"
+    "    sys.stdin.read()\n"
+    "    sys.stdout.write('record: rc=1\\r\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\r\\n')\n"
+    "    sys.stdout.write('machine-origin: human\\r\\n'); sys.stdout.flush()\n"
+    "    raise SystemExit(1)\n"
+    "raise SystemExit(64)\n")
 # 중도 사망: record 라인만 flush 하고 즉사(os._exit — MO 라인 없음) = R3-RISK-3 중도 kill 재현
 _TRIAGE_MIDDEATH = _TRIAGE_CALL_LOG + (
     "if cmd == 'hook-triage':\n"
@@ -558,6 +572,8 @@ def triage_batch_protocol(fails):
        재시도하지 않는다(폴백 신호는 rc=64 하나 — wedge 기계 최악 지연 방어).
     ⓒ 구팩 스큐(rc=64): stderr 1줄 고지 후 종전 3왕복 경로로 폴백(조용한 강등 금지) —
        레거시 path·record 소비가 그대로 살아 spawn 까지 완주한다(1릴리스 병존 계약).
+    ⓓ CRLF 쌍둥이(Windows 실출력): 라인 종결이 \\r\\n 이어도 ⓐ 와 동일 소비 — record rc·path·
+       MO 전부 생존하고 note 에 \\r 잔류가 없다(훅 캡처 직후 1회 정규화의 핀).
     """
     # ⓐ 정상 배치 — 왕복 1회 + 라인 소비가 note 문안까지 관통
     r, calls = _run_hook_mission_mock(fails, "정상 배치", _TRIAGE_FULL)
@@ -616,6 +632,28 @@ def triage_batch_protocol(fails):
             fails.append("P0-5 ⓒ: 레거시 path 소비가 note 에 도달하지 않았다: %r" % ctx[:300])
         if r.returncode != 0:
             fails.append("P0-5 ⓒ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    # ⓓ CRLF 쌍둥이(Windows 실출력) — \r\n 라인 종결에서도 ⓐ 와 동일 소비(정규화 회귀 핀)
+    r, calls = _run_hook_mission_mock(fails, "CRLF 배치", _TRIAGE_FULL_CRLF)
+    if r is not None:
+        ctx = _note_ctx(r.stdout)
+        if "record=1" not in r.stderr:
+            fails.append("P0-5 ⓓ: CRLF 라인 종결에서 record rc 소비가 죽었다(sed '$' 앵커 \\r "
+                         "비관용 — Windows 임무 게이트 영구 폐쇄 회귀): %r" % r.stderr[:300])
+        if "발화됨" not in r.stdout:
+            fails.append("P0-5 ⓓ: CRLF 배치에서 spawn 이 열리지 않았다: %r"
+                         % (r.stdout + r.stderr)[:300])
+        if calls != ["hook-triage"]:
+            fails.append("P0-5 ⓓ: CRLF 배치를 오독해 재왕복했다(왕복 1회 계약): %s" % calls)
+        if "exit 1(임무 없음)" not in ctx:
+            fails.append("P0-5 ⓓ: CRLF 에서 record 라인이 note 의 관측 파생 문안으로 소비되지 "
+                         "않았다(허위 '모듈 부재' 문안 의심): %r" % ctx[:300])
+        if "/TRIAGE-PATH-PIN" not in ctx:
+            fails.append("P0-5 ⓓ: CRLF 에서 path 라인이 note 로 소비되지 않았다: %r" % ctx[:300])
+        if "\r" in ctx:
+            fails.append("P0-5 ⓓ: note 에 \\r 잔류 — CRLF 정규화가 캡처 전체(path·MO 포함)에 "
+                         "적용되지 않았다: %r" % ctx[:300])
+        if r.returncode != 0:
+            fails.append("P0-5 ⓓ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
 
 
 # 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
@@ -715,7 +753,7 @@ def main():
     # 11. ★P0-4/R3-P04-1 성공 note 명명식 포맷 — 'JSON 1줄' 생존 + rc0/rc6 예보 분기
     note_success_named_format(fails)
 
-    # 12. ★P0-5 hook-triage 배치 왕복 — 왕복 1회·중도 사망 record 생존·구팩 폴백
+    # 12. ★P0-5 hook-triage 배치 왕복 — 왕복 1회·중도 사망 record 생존·구팩 폴백·CRLF 쌍둥이
     triage_batch_protocol(fails)
 
     if fails:
@@ -726,7 +764,7 @@ def main():
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
           "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2 + "
-          "P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 3(왕복1·중도사망·구팩폴백)"
+          "P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 4(왕복1·중도사망·구팩폴백·CRLF)"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))
