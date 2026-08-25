@@ -459,6 +459,165 @@ def note_success_named_format(fails):
             fails.append("P0-4(%s): 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % (name, r.returncode))
 
 
+# ── ★P0-5 hook-triage 배치 왕복 — 증분 라인 프로토콜 소비면 계측 ─────────────────────────────
+# 목 javis_mission.py 공통 머리: argv 를 HOME/mission-calls.log 에 남긴다(왕복 수 실측의 근거 —
+# 배치 채택의 정량 주장 '선언 경로 mission 계열 3왕복→1왕복'을 계수로 검증한다).
+_TRIAGE_CALL_LOG = (
+    "#!/usr/bin/env python3\n"
+    "import os, sys\n"
+    "open(os.path.join(os.environ['HOME'], 'mission-calls.log'), 'a')"
+    ".write(' '.join(sys.argv[1:]) + '\\n')\n"
+    "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n")
+# 전량 출력(정상 배치): record→path→machine-origin 3라인 완주 + exit 1(=MO human 보조 계약)
+_TRIAGE_FULL = _TRIAGE_CALL_LOG + (
+    "if cmd == 'hook-triage':\n"
+    "    sys.stdin.read()\n"
+    "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\n')\n"
+    "    sys.stdout.write('machine-origin: human\\n'); sys.stdout.flush()\n"
+    "    raise SystemExit(1)\n"
+    "raise SystemExit(64)\n")
+# 중도 사망: record 라인만 flush 하고 즉사(os._exit — MO 라인 없음) = R3-RISK-3 중도 kill 재현
+_TRIAGE_MIDDEATH = _TRIAGE_CALL_LOG + (
+    "if cmd == 'hook-triage':\n"
+    "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
+    "    os._exit(1)\n"
+    "raise SystemExit(64)\n")
+# 구팩 재현: hook-triage 는 stdin 무소비 EX_USAGE(64) 거부(v0.14.25 실측 거동), 구 3서브커맨드만 존재
+_TRIAGE_OLDPACK = _TRIAGE_CALL_LOG + (
+    "if cmd == 'hook-triage':\n"
+    "    sys.stderr.write('usage: javis_mission.py ...\\n')\n"
+    "    raise SystemExit(64)\n"
+    "if cmd == 'record':\n"
+    "    sys.stdin.read(); raise SystemExit(1)\n"
+    "if cmd == 'path':\n"
+    "    sys.stdout.write('/LEGACY-PATH-PIN\\n'); raise SystemExit(0)\n"
+    "if cmd == 'machine-origin':\n"
+    "    sys.stdin.read(); sys.stdout.write('machine-origin: human\\n'); raise SystemExit(1)\n"
+    "raise SystemExit(64)\n")
+
+
+def _run_hook_mission_mock(fails, name, mission_py, prompt="너는 마스터다"):
+    """훅을 격리 실행하되 javis_mission.py 를 **목**으로 바꾼다(P0-5 소비면 계측 전용).
+
+    실훅은 MISSION 을 형제(../bin) 우선으로 해소하므로 훅+_lib.sh 를 격리 디렉터리로 복사하고,
+    형제 bin 에 실 감지기(javis_detect.py — DETECT 는 진짜 판정) + 목 javis_mission.py 를 심는다
+    (관례: run_bootstrap_health H-MISSION-1 ⓕ · 위 note_cp949_survival 뮤테이션 하네스 —
+    실 저장소 파일은 건드리지 않는다). 반환 (CompletedProcess|None, calls: [서브커맨드,...]).
+    """
+    root = tempfile.mkdtemp()
+    hooks = os.path.join(root, "hooks")
+    os.makedirs(hooks)
+    shutil.copy(HOOK, os.path.join(hooks, "role-bootstrap.sh"))
+    shutil.copy(os.path.join(os.path.dirname(HOOK), "_lib.sh"), os.path.join(hooks, "_lib.sh"))
+    binf = os.path.join(root, "bin")
+    os.makedirs(binf)
+    shutil.copy(os.path.join(BIN, "javis_detect.py"), os.path.join(binf, "javis_detect.py"))
+    with open(os.path.join(binf, "javis_mission.py"), "w") as f:
+        f.write(mission_py)
+    home = tempfile.mkdtemp()
+    pack = tempfile.mkdtemp()
+    mockbin = tempfile.mkdtemp()
+    os.makedirs(os.path.join(pack, "bin"), exist_ok=True)
+    with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
+        f.write(_MOCK_BOOT)
+    cysp = os.path.join(mockbin, "cys")
+    with open(cysp, "w") as f:
+        f.write('#!/bin/bash\n[ "$1" = surface-role ] && { echo ""; exit 0; }\nexit 0\n')
+    os.chmod(cysp, 0o755)
+    env = dict(os.environ)
+    env["HOME"] = home
+    env["CYS_PACK_DIR"] = pack
+    env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
+    for k in ("CYS_SOCKET", "CYS_STATE_DIR", "AITERM_SURFACE_ID", "CYS_MISSION"):
+        env.pop(k, None)
+    env["CYS_SURFACE_ID"] = "7"
+    try:
+        r = subprocess.run(["bash", os.path.join(hooks, "role-bootstrap.sh")],
+                           input=json.dumps({"prompt": prompt}),
+                           capture_output=True, text=True, timeout=30, env=env)
+    except Exception as e:
+        fails.append("P0-5(%s): 훅 실행 실패(계측 불능은 통과가 아니다): %s" % (name, e))
+        return None, []
+    calls = []
+    calls_p = os.path.join(home, "mission-calls.log")
+    if os.path.isfile(calls_p):
+        with open(calls_p, encoding="utf-8") as f:
+            calls = [ln.split()[0] for ln in f.read().splitlines() if ln.strip()]
+    return r, calls
+
+
+def triage_batch_protocol(fails):
+    """★P0-5/R3-P05-1/R3-RISK-3 회귀 핀 — hook-triage 배치 왕복의 훅 소비면 3계약.
+
+    ⓐ 정상 배치: mission 계열 파이썬 왕복이 선언 프롬프트에서 **정확히 1회**(종전 3회 —
+       record·path·machine-origin), record rc 라인·path 라인이 성공 note 문안까지 도달하고
+       MO 토큰(human)으로 spawn 이 열린다.
+    ⓑ 중도 사망(record 라인만 나온 채 즉사): record 판정은 생존(stderr record=1)하고 MO 는
+       토큰 부재 → 판정 불가 fail-closed **무스폰**. 크래시를 구팩 폴백으로 오독해 3왕복을
+       재시도하지 않는다(폴백 신호는 rc=64 하나 — wedge 기계 최악 지연 방어).
+    ⓒ 구팩 스큐(rc=64): stderr 1줄 고지 후 종전 3왕복 경로로 폴백(조용한 강등 금지) —
+       레거시 path·record 소비가 그대로 살아 spawn 까지 완주한다(1릴리스 병존 계약).
+    """
+    # ⓐ 정상 배치 — 왕복 1회 + 라인 소비가 note 문안까지 관통
+    r, calls = _run_hook_mission_mock(fails, "정상 배치", _TRIAGE_FULL)
+    if r is not None:
+        ctx = _note_ctx(r.stdout)
+        if "발화됨" not in r.stdout:
+            fails.append("P0-5 ⓐ: MO 토큰 human 인데 spawn 이 열리지 않았다: %r"
+                         % (r.stdout + r.stderr)[:300])
+        if calls != ["hook-triage"]:
+            fails.append("P0-5 ⓐ: mission 계열 왕복이 1회(hook-triage)가 아니다 — 배치 채택의 "
+                         "정량 근거(3→1) 미달성: %s" % calls)
+        if "exit 1(임무 없음)" not in ctx:
+            fails.append("P0-5 ⓐ: record 라인(rc=1)이 note 의 관측 파생 문안으로 소비되지 "
+                         "않았다: %r" % ctx[:300])
+        if "/TRIAGE-PATH-PIN" not in ctx:
+            fails.append("P0-5 ⓐ: path 라인이 note 의 대장 경로로 소비되지 않았다: %r" % ctx[:300])
+        if "record=1" not in r.stderr:
+            fails.append("P0-5 ⓐ: 배치 진단 1줄(record=1)이 stderr 에 없다: %r" % r.stderr[:300])
+        if "구팩" in r.stderr:
+            fails.append("P0-5 ⓐ: 정상 배치를 구팩으로 오판해 폴백했다: %r" % r.stderr[:300])
+        if r.returncode != 0:
+            fails.append("P0-5 ⓐ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    # ⓑ 중도 사망 — record 생존 + MO fail-closed 무스폰 + 재시도 없음
+    r, calls = _run_hook_mission_mock(fails, "중도 사망", _TRIAGE_MIDDEATH)
+    if r is not None:
+        if "발화됨" in r.stdout:
+            fails.append("P0-5 ⓑ: MO 라인 없는 중도 사망인데 spawn 이 열렸다(fail-open — "
+                         "치명): %r" % r.stdout[:300])
+        if "record=1" not in r.stderr:
+            fails.append("P0-5 ⓑ: 중도 사망에서 record 판정이 생존하지 않았다(증분 라인 "
+                         "프로토콜 소실): %r" % r.stderr[:300])
+        if "기계유래 판정 불가" not in r.stderr:
+            fails.append("P0-5 ⓑ: MO 토큰 부재가 판정 불가 fail-closed 로 접히지 않았다: %r"
+                         % r.stderr[:300])
+        if "선언 아님이 아니라 판정 불가다" not in r.stdout:
+            fails.append("P0-5 ⓑ: 판정 불가 주입문(선언 아님/판정 불가 분리)이 없다: %r"
+                         % r.stdout[:300])
+        if calls != ["hook-triage"]:
+            fails.append("P0-5 ⓑ: 크래시(rc≠64)를 폴백 신호로 오독해 재왕복했다(wedge 최악 "
+                         "지연 방어 소실): %s" % calls)
+        if r.returncode != 0:
+            fails.append("P0-5 ⓑ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    # ⓒ 구팩 스큐 — rc64 → stderr 1줄 + 종전 3왕복 폴백 완주
+    r, calls = _run_hook_mission_mock(fails, "구팩 폴백", _TRIAGE_OLDPACK)
+    if r is not None:
+        if "구팩" not in r.stderr or "폴백" not in r.stderr:
+            fails.append("P0-5 ⓒ: 구팩 폴백이 침묵 강등이다(stderr 1줄 고지 계약): %r"
+                         % r.stderr[:300])
+        if "발화됨" not in r.stdout:
+            fails.append("P0-5 ⓒ: 구팩 폴백 경로에서 spawn 이 죽었다(1릴리스 병존 파괴): %r"
+                         % (r.stdout + r.stderr)[:300])
+        if calls != ["hook-triage", "record", "path", "machine-origin"]:
+            fails.append("P0-5 ⓒ: 폴백 왕복 구성이 종전 3왕복(+probe)이 아니다: %s" % calls)
+        ctx = _note_ctx(r.stdout)
+        if "/LEGACY-PATH-PIN" not in ctx:
+            fails.append("P0-5 ⓒ: 레거시 path 소비가 note 에 도달하지 않았다: %r" % ctx[:300])
+        if r.returncode != 0:
+            fails.append("P0-5 ⓒ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+
+
 # 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
 # 대조한다). 구 훅 시대 회귀 목록(W1a 결정론화분) 전량 보존(회귀 계약). 전 corpus 를 ②로
 # 재실행하지 않는 이유는 비용이다(훅 1회 ≈ 프로세스 3개 — ① 이 전량을 커버한다).
@@ -556,6 +715,9 @@ def main():
     # 11. ★P0-4/R3-P04-1 성공 note 명명식 포맷 — 'JSON 1줄' 생존 + rc0/rc6 예보 분기
     note_success_named_format(fails)
 
+    # 12. ★P0-5 hook-triage 배치 왕복 — 왕복 1회·중도 사망 record 생존·구팩 폴백
+    triage_batch_protocol(fails)
+
     if fails:
         print("FAIL (%d):" % len(fails))
         for f in fails:
@@ -564,7 +726,7 @@ def main():
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
           "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2 + "
-          "P0-4 note 명명식 rc0/rc6 2"
+          "P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 3(왕복1·중도사망·구팩폴백)"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))

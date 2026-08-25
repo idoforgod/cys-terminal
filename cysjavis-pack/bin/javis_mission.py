@@ -1868,6 +1868,28 @@ def _record_harness_verdict(reason, prompt, ledger_status):
                         ledger_status=ledger_status)
 
 
+def _read_hook_stdin():
+    """stdin(UserPromptSubmit hook JSON)을 **정확히 1회** 판독 → (ok, prompt, err).
+
+    ★P0-5 배치 왕복의 성립 조건: `cmd_record` 와 `cmd_machine_origin` 은 각각 stdin 전량을
+      읽으므로, 한 프로세스 안에서 cmd_* 래퍼를 연쇄 호출하면 두 번째 읽기가 빈 값이 되어
+      '빈 프롬프트' unknown → 상시 fail-closed 무스폰이 된다(R3-P05-1 함정 ① 실측). 그래서
+      판독을 이 함수 하나로 접고, 판정 본체(_record_step·_machine_origin_step)는 stdin 을
+      건드리지 않는다 — `hook-triage` 는 이 함수를 1회만 부르고 결과를 두 본체에 나눠 준다.
+    ★오류를 여기서 stderr 로 접지 않는 이유: record 와 machine-origin 의 파싱 실패 고지 문안이
+      서로 다르고(각자의 fail-closed 규칙 독립 유지 — 브리프 계약), 어느 쪽이 소비하느냐에
+      따라 사유 문안이 갈려야 하기 때문이다. err 는 예외 문자열만 나른다.
+    """
+    try:
+        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+        payload = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        obj = json.loads(payload)
+        prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
+        return True, prompt, ""
+    except Exception as e:
+        return False, "", "%s" % e
+
+
 def cmd_record(argv):
     """stdin(UserPromptSubmit hook JSON) → 대장 갱신. 훅 전용(1왕복).
 
@@ -1875,17 +1897,27 @@ def cmd_record(argv):
       로 주입문의 착수 규율 문안(MISSION_SENT)만 가르므로(hooks/role-bootstrap.sh — D4-a′
       2026-08-10: spawn 은 감지·기계유래 게이트가 가르고 이 exit 와는 무관하다), 여기서
       독자 규칙으로 답하면 `status` 와 갈릴 수 있다. 판정처는 언제나 `gate()` 하나다.
+    ★P0-5: 판정 본체는 `_record_step` 으로 분리됐다(stdin 무접촉) — 이 래퍼는 stdin 1회
+      판독만 더한다. exit·stderr·대장 부작용은 분리 전과 동일하다(구 서브커맨드 계약 불변).
+    """
+    _ = argv
+    return _record_step(_read_hook_stdin())
+
+
+def _record_step(parsed):
+    """record 판정·기록 본체 — stdin 을 읽지 않는다(parsed = _read_hook_stdin() 결과).
+
+    소비자 둘: ① cmd_record(구 계약 그대로) ② cmd_hook_triage(배치 왕복 — record 최우선).
+    층0(harness) 배제는 **이 함수 전용**이다 — machine-origin 판정(_machine_origin_step)은
+    층1/층2 만 보며, 여기의 층0 폴드가 그쪽으로 새면 안 된다(R3-P05-1 계약 — 판정별
+    fail-closed 규칙 독립).
     """
     detect = _detect_mod()
     if detect is None:
         return EXIT_UNREADABLE
-    try:
-        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
-        payload = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        obj = json.loads(payload)
-        prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
-    except Exception as e:
-        _fail_closed("hook JSON 파싱 실패(%s) — 대장 무변경" % e)
+    ok, prompt, err = parsed
+    if not ok:
+        _fail_closed("hook JSON 파싱 실패(%s) — 대장 무변경" % err)
         return EXIT_UNREADABLE
     if not isinstance(prompt, str) or not prompt.strip():
         return gate()[0]
@@ -2106,21 +2138,33 @@ def cmd_machine_origin(argv):
       원장 판독 불가(unreadable)면 machine_origin 이 층2 라벨 폴백으로 접는 것까지 동일하다
       (라벨 없는 unreadable 상태는 exit 1 — `record` 가 같은 상태에서 임무를 기록하되
       ledger_status=unreadable 로 게이트를 닫는 기존 비대칭과 같은 방향이다).
+    ★P0-5: 판정 본체는 `_machine_origin_step` 으로 분리됐다(stdin 무접촉) — 이 래퍼는 stdin
+      1회 판독+토큰 인쇄만 더한다. exit·토큰 문면·stderr 는 분리 전과 동일하다(:상단 계약과
+      self-test 토큰 핀 보존 — 구 서브커맨드 계약 불변).
     """
     _ = argv
-    try:
-        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
-        payload = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        obj = json.loads(payload)
-        prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
-    except Exception as e:
-        _fail_closed("hook JSON 파싱 실패(%s) — machine-origin 판정 불가" % e)
-        print("machine-origin: unknown")
-        return EXIT_UNREADABLE
+    rc, token = _machine_origin_step(_read_hook_stdin())
+    print("machine-origin: %s" % token)
+    return rc
+
+
+def _machine_origin_step(parsed):
+    """machine-origin 판정 본체 — stdin 을 읽지 않는다. 반환 (rc, 토큰 문자열).
+
+    소비자 둘: ① cmd_machine_origin(구 계약 그대로) ② cmd_hook_triage(배치 왕복 — 토큰
+    라인 발행). 인쇄는 호출자 소관이다 — triage 는 라인 접두("machine-origin: ")를 포함한
+    문면을 **한 글자도 바꾸지 않고** 재사용해야 훅의 토큰 파싱(:role-bootstrap.sh case 글롭)이
+    두 경로에서 동일하게 작동한다.
+    ★층0(harness) 미배선이 계약이다(R3-P05-1): 층0 은 record 전용 배제 축이고, 여기는
+      층1(배달 원장 해시)·층2(push 라벨)만 본다 — 배치화가 두 판정의 규칙을 섞으면 안 된다.
+    """
+    ok, prompt, err = parsed
+    if not ok:
+        _fail_closed("hook JSON 파싱 실패(%s) — machine-origin 판정 불가" % err)
+        return EXIT_UNREADABLE, "unknown"
     if not isinstance(prompt, str) or not prompt.strip():
         _fail_closed("빈 프롬프트 — machine-origin 판정 대상이 없다")
-        print("machine-origin: unknown")
-        return EXIT_UNREADABLE
+        return EXIT_UNREADABLE, "unknown"
     # ★판정 본문 fail-open 봉합(2026-08-10 P3C): 여기서 미포착 예외가 새면 인터프리터 기본
     #   exit 1 이 되는데, 소비자(role-bootstrap.sh)는 1 을 '오너 타이핑 간주'로 읽어 spawn 을
     #   연다 — **허용 방향(1)과 크래시가 같은 값을 공유하면 안 된다.** 크래시는 stderr 1줄
@@ -2134,16 +2178,79 @@ def cmd_machine_origin(argv):
     except Exception as e:
         _fail_closed("machine-origin 판정 본문 예외(%s: %s) — 크래시를 exit 1(스폰 개방)로 "
                      "흘리지 않는다" % (type(e).__name__, e))
-        print("machine-origin: unknown")
-        return EXIT_UNREADABLE
+        return EXIT_UNREADABLE, "unknown"
     if is_machine:
         sys.stderr.write("[mission] machine-origin: 기계 유래 — %s\n" % why)
-        print("machine-origin: machine")
-        return 0
+        return 0, "machine"
     sys.stderr.write("[mission] machine-origin: 기계 유래 아님(오너 타이핑 간주 — "
                      "원장 비일치·무라벨)\n")
-    print("machine-origin: human")
-    return 1
+    return 1, "human"
+
+
+def cmd_hook_triage(argv):
+    """stdin(UserPromptSubmit hook JSON) 1회 판독 → record·path·machine-origin 배치 왕복.
+
+    ## 왜 (P0-5 · 2026-08-25 부트 실패 트리아지)
+    훅(hooks/role-bootstrap.sh)은 선언 프롬프트마다 record(5s)·path(5s)·machine-origin(5s)을
+    **각각 별도 파이썬 프로세스**로 불렀다 — Windows Defender 콜드스타트를 왕복마다 다시
+    지불해 5s 데드라인 초과 → machine-origin 판정불가 → fail-closed 무스폰(부트 침묵)의
+    오탐 갈래가 실재했다. 이 서브커맨드는 세 판정을 **단일 프로세스**로 접는다(선언 경로
+    파이썬 기동 3→1 · 데드라인은 훅이 단일 8s 로 씌운다 — 콜드스타트 1회 상각).
+
+    ## 프로토콜 — 증분 라인(R3-RISK-3 계약 · 훅은 도착한 라인까지만 소비한다)
+      1) "record: rc=N"           — **최우선 실행·완료 즉시 flush**. 프로세스가 이후 어느
+                                    지점에서 죽어도(타임아웃 killpg 포함) record 판정은
+                                    파이프에 남아 생존한다 — 현행 3-프로세스의 독립 생존
+                                    성질을 프로토콜로 보존한다.
+      2) "path: <임무 대장 경로>"  — 경로 판독 불가면 라인 자체를 내지 않는다(훅의 기존
+                                    '경로 판독 실패' 폴드가 그대로 받는다).
+      3) "machine-origin: <token>" — 토큰 문면(machine/human/unknown)·판정 규칙은
+                                    cmd_machine_origin 과 **동일**(층1/층2 만 — 층0 미배선).
+                                    라인 부재 = 훅이 판정불가 fail-closed 무스폰으로 접는다.
+    ★rc 하나로 세 판정을 접지 않는다(W-B '토큰 1차·rc 보조' 교리 — rc 충돌 fail-open 재개방
+      금지): 각 판정은 자기 라인으로만 나른다. 프로세스 exit 는 machine-origin 판정값
+      (0=기계/1=오너/2=판정불가)을 보조 진단으로 되돌린다 — 소비자는 라인이 1차 근거다.
+    ★stdin 은 `_read_hook_stdin` 으로 **1회만** 읽는다 — cmd_* 래퍼 연쇄 금지(두 번째 읽기가
+      빈 값 → 상시 unknown 무스폰, R3-P05-1 함정 ① 실측). 세 단계는 각자 try 로 격리해
+      한 판정의 크래시가 다음 판정을 지우지 않게 한다(독립 생존의 프로세스-내 등가물).
+    ★구 서브커맨드(record/path/machine-origin)는 존치한다 — 구 훅과의 1릴리스 스큐 병존.
+    """
+    _ = argv
+    parsed = _read_hook_stdin()                     # ★stdin 1회 — 아래 두 본체가 공유한다
+    # ① record 최우선 — 임무 관측 기록이 기계유래 판정 실패와 운명을 같이하면 안 된다
+    #    (R3-RISK-3: '판정 실패가 기록까지 지우는' 신규 결합의 프로토콜 절단).
+    try:
+        rec_rc = _record_step(parsed)
+    except Exception as e:
+        # 본체 미포착 예외 — 대장 기록 여부 미확인. 훅의 기존 폴드 어휘('record exit 2 —
+        # 판독 불가 … 기록 여부는 미확인')에 정직하게 접히는 2 를 라인으로 내보낸다.
+        _fail_closed("hook-triage record 단계 예외(%s: %s) — 기록 여부 미확인(rc=2)"
+                     % (type(e).__name__, e))
+        rec_rc = EXIT_UNREADABLE
+    print("record: rc=%d" % rec_rc)
+    sys.stdout.flush()
+    # ② path — 실패는 라인 생략(침묵 아님: 훅이 '경로 판독 실패' 문안으로 정직 강등한다)
+    try:
+        p = ledger_path()
+    except Exception as e:
+        _fail_closed("hook-triage path 단계 예외(%s: %s) — 경로 라인 생략"
+                     % (type(e).__name__, e))
+        p = None
+    if p:
+        print("path: %s" % p)
+        sys.stdout.flush()
+    # ③ machine-origin — 층1/층2 전용 본체 그대로(층0 record 전용 배제가 여기로 새지 않는다)
+    try:
+        mo_rc, token = _machine_origin_step(parsed)
+    except Exception as e:
+        # _machine_origin_step 이 자체 봉합(P3C)을 갖지만, 봉합 밖 예외도 스폰 개방(1)과
+        # 값을 공유하지 않도록 한 겹 더 접는다(fail-closed 방향 동일).
+        _fail_closed("hook-triage machine-origin 단계 예외(%s: %s) — 판정 불가"
+                     % (type(e).__name__, e))
+        mo_rc, token = EXIT_UNREADABLE, "unknown"
+    print("machine-origin: %s" % token)
+    sys.stdout.flush()
+    return mo_rc
 
 
 # ── 밀폐 self-test(assert 배터리 · preflight/CI 관례 — 선례 javis_detect.cmd_self_test) ──
@@ -3436,6 +3543,96 @@ def cmd_self_test():
                     fails.append("층0 추가 후 오너 평문 임무가 기록되지 않는다(mission=%r) — "
                                  "과잉 차단 회귀" % (_hrec3 or {}).get("mission"))
 
+                # ══════════════════════════════════════════════════════════════
+                # ★hook-triage 배치 왕복(P0-5) — stdin 1회·증분 라인 프로토콜·판정 독립
+                #   소비자: hooks/role-bootstrap.sh (record 즉시 소비 · MO 토큰은 DETECT
+                #   발화 후 소비). 여기서 못 박는 것: ⓐ stdin 1회 판독(래퍼 연쇄면 MO 가
+                #   빈 프롬프트 unknown 으로 죽는다 — human 관측이 곧 1회 판독의 증명)
+                #   ⓑ 라인 순서 record→path→machine-origin(record 최우선 = 중도 사망
+                #   생존 계약의 전제) ⓒ 층0 독립(record 전용 harness 배제가 MO 로 새지
+                #   않는다) ⓓ 파싱 실패의 각자 fail-closed(record rc=2 + MO unknown).
+                # ══════════════════════════════════════════════════════════════
+                def _tri_run(payload):
+                    _old_in, _old_out = sys.stdin, sys.stdout
+                    try:
+                        sys.stdin = io.StringIO(payload)   # .buffer 없음 → 텍스트 분기
+                        sys.stdout = io.StringIO()
+                        rc = cmd_hook_triage([])
+                        return rc, sys.stdout.getvalue()
+                    finally:
+                        sys.stdin, sys.stdout = _old_in, _old_out
+
+                def _tri_order(out, what):
+                    """라인 순서 핀 — record 가 어떤 라인보다도 앞이어야 한다(최우선 계약)."""
+                    lines = out.splitlines()
+                    idx = {}
+                    for i, ln in enumerate(lines):
+                        for key in ("record: rc=", "path: ", "machine-origin: "):
+                            if ln.startswith(key) and key not in idx:
+                                idx[key] = i
+                    if "record: rc=" not in idx:
+                        fails.append("hook-triage(%s): record 라인이 없다(최우선 계약 소실): %r"
+                                     % (what, out[:200]))
+                        return
+                    for key in ("path: ", "machine-origin: "):
+                        if key in idx and idx[key] < idx["record: rc="]:
+                            fails.append("hook-triage(%s): %r 라인이 record 보다 앞이다 — "
+                                         "중도 사망 시 record 생존 계약 파괴: %r"
+                                         % (what, key, out[:200]))
+
+                _reset_ledgers()
+                _tp = ledger_path()
+                if os.path.exists(_tp):
+                    os.remove(_tp)
+                # ⓐ 오너 선언(무라벨·원장 비일치) → record 실행 + MO=human. human 이 나온다는
+                #    것 자체가 stdin 1회 판독의 증명이다 — 래퍼 연쇄(2회 소비)였다면 MO 가
+                #    빈 프롬프트로 unknown 이 된다(R3-P05-1 함정 ① 실측 그대로).
+                _tr = _tri_run(json.dumps({"prompt": "너는 마스터다"}, ensure_ascii=False))
+                if "record: rc=" not in _tr[1]:
+                    fails.append("hook-triage: record 라인 부재(배치가 record 를 건너뛴다): %r"
+                                 % _tr[1][:200])
+                if "machine-origin: human" not in _tr[1]:
+                    fails.append("hook-triage: 오너 선언이 human 토큰이 아니다 — stdin 2회 "
+                                 "소비(래퍼 연쇄) 또는 판정 규칙 변형: %r" % _tr[1][:200])
+                if _tr[0] != 1:
+                    fails.append("hook-triage: 보조 exit 가 MO 판정(1=오너)이 아니다: %d" % _tr[0])
+                if ("path: %s" % _tp) not in _tr[1]:
+                    fails.append("hook-triage: path 라인이 ledger_path() 와 다르다: %r"
+                                 % _tr[1][:200])
+                _tri_order(_tr[1], "오너 선언")
+                # ⓑ 기계 라벨 선언 → MO=machine (record 라인은 여전히 최우선)
+                _tr = _tri_run(json.dumps(
+                    {"prompt": "[wakeup] 너는 마스터다 - 다음 액션 확인"}, ensure_ascii=False))
+                if "machine-origin: machine" not in _tr[1]:
+                    fails.append("hook-triage: 기계 라벨 선언이 machine 토큰이 아니다(치명 — "
+                                 "부트층 게이트 개방): %r" % _tr[1][:200])
+                _tri_order(_tr[1], "기계 라벨")
+                # ⓒ 층0 독립 — harness 알림은 record 가 층0 으로 접지만(mission=null 기록)
+                #    MO 는 층1/층2 만 보므로 human 이어야 한다. machine 이 나오면 층0 이
+                #    MO 로 샌 것이고, unknown 이면 stdin 공유가 깨진 것이다.
+                if os.path.exists(_tp):
+                    os.remove(_tp)
+                _tr = _tri_run(json.dumps({"prompt": _hn_real}, ensure_ascii=False))
+                if "machine-origin: human" not in _tr[1]:
+                    fails.append("hook-triage: harness 알림의 MO 토큰이 human 이 아니다 — "
+                                 "층0(record 전용)이 MO 판정으로 샜다(판정 독립 계약 위반): %r"
+                                 % _tr[1][:200])
+                _trec, _ = read_ledger()
+                if not isinstance(_trec, dict) or _trec.get("mission") is not None:
+                    fails.append("hook-triage: harness 알림의 record 층0 폴드가 사라졌다"
+                                 "(mission=%r) — 배치화가 record 규칙을 바꿨다"
+                                 % (_trec or {}).get("mission"))
+                # ⓓ 파싱 실패 → record rc=2 + MO unknown (각자의 fail-closed 독립 유지)
+                _tr = _tri_run("{not json")
+                if "record: rc=2" not in _tr[1]:
+                    fails.append("hook-triage: 파싱 실패의 record 라인이 rc=2 가 아니다: %r"
+                                 % _tr[1][:200])
+                if "machine-origin: unknown" not in _tr[1]:
+                    fails.append("hook-triage: 파싱 실패의 MO 토큰이 unknown 이 아니다"
+                                 "(fail-closed 소실): %r" % _tr[1][:200])
+                if _tr[0] != EXIT_UNREADABLE:
+                    fails.append("hook-triage: 파싱 실패 보조 exit ≠ 2: %d" % _tr[0])
+
                 _reset_ledgers()
                 _mp2 = ledger_path()
                 if os.path.exists(_mp2):
@@ -3490,12 +3687,15 @@ def cmd_self_test():
           "★구조 축 발화조건 ==0(오너 무차단) · 마커 zip 정합 · "
           "★상한 초과도 프리픽스로 판정(무제한 통과 게이트 봉합) · record e2e(mission=null · "
           "source=harness_notification · 게이트 무개방 · 진행 중 오너 임무 무덮어쓰기 · "
-          "오너 평문 임무 정상 기록))"
+          "오너 평문 임무 정상 기록) · "
+          "★hook-triage 배치(P0-5): stdin 1회(오너 선언=human 관측) · 증분 라인 순서 "
+          "record→path→MO · path=ledger_path 일치 · 기계 라벨=machine · 층0 독립(harness "
+          "알림 MO=human·record 폴드 유지) · 파싱 실패=record rc2+MO unknown 각자 fail-closed)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 
 
-_USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|delivery-path|machine-origin] [--self-test]
+_USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|delivery-path|machine-origin|hook-triage] [--self-test]
   record : stdin=UserPromptSubmit hook JSON → 임무 대장 갱신(훅 전용)
   status : 0=임무 있음(자율 착수 가) / 1=임무 없음(보고·정지) / 2=판독 불가(=없음 취급)
   set    : 오너 확인 채널(`cys feed push --wait` exit 0) 승인 시에만 기록
@@ -3505,6 +3705,9 @@ _USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|deliv
   machine-origin : stdin=UserPromptSubmit hook JSON → 기계 유래 **판정만**(무기록·무부작용).
            0=기계 유래(층1 원장 대조·층2 라벨) / 1=아님(오너 타이핑 간주) / 2=판정 불가.
            소비자는 role-bootstrap.sh 스폰 게이트(§4-10 부트층 유사체 차단 · fail-closed)
+  hook-triage : stdin 1회 판독으로 record+path+machine-origin 배치 왕복(P0-5 · 훅 전용).
+           증분 라인 프로토콜 "record: rc=N" → "path: <경로>" → "machine-origin: <token>"
+           (record 최우선·즉시 flush — 중도 사망에도 record 판정 생존). exit=MO 판정(보조).
 """
 
 
@@ -3515,7 +3718,7 @@ def main(argv):
     rest = argv[2:]
     table = {"record": cmd_record, "status": cmd_status, "set": cmd_set,
              "clear": cmd_clear, "path": cmd_path, "delivery-path": cmd_delivery_path,
-             "machine-origin": cmd_machine_origin}
+             "machine-origin": cmd_machine_origin, "hook-triage": cmd_hook_triage}
     fn = table.get(cmd)
     if fn is None:
         sys.stderr.write(_USAGE)

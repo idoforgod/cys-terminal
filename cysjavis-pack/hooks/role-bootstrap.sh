@@ -521,16 +521,51 @@ MISSION_RC=1
 #   '대장에 무엇이 기록됐는가'는 이 원시 rc 로도 단정할 수 없다 — cmd_record 는 기계 유래
 #   폴드(대장 무변경)·판독 불가(2)·타임아웃(124) 경로에서 대장을 쓰지 않고, 선언+실제 임무
 #   프롬프트는 mission=null 이 아닌 값을 쓸 수 있다(ledger_status=unreadable 폐쇄). 그래서 아래
-#   MISSION_SENT 문안은 이 값으로 **서술 강도만** 가른다. "" = record 미실행(모듈 부재).
+#   MISSION_SENT 문안은 이 값으로 **서술 강도만** 가른다. "" = record 미실행(모듈 부재 ·
+#   P0-5 배치의 record 라인 부재 — 프로세스가 record 완료 전에 죽은 경우도 같은 폴드다).
 RECORD_RC=""
 MISSION_LEDGER=""
+# ★P0-5 배치 왕복(hook-triage): 종전엔 record(5s)·path(5s)와 아래 machine-origin(5s)이 각각
+#   별도 파이썬 프로세스였다 — Windows Defender 콜드스타트를 왕복마다 재지불해 5s 데드라인
+#   초과(=machine-origin 판정불가 fail-closed 무스폰 = 부트 침묵)의 오탐 갈래가 실재했다.
+#   이제 세 판정을 hook-triage **1왕복**(단일 8s — 종전 예산 5s×3=15s 보다 총합 축소·기동 1회
+#   상각)으로 받는다. 출력은 증분 라인 프로토콜(R3-RISK-3)이다:
+#     "record: rc=N"(최우선·즉시 flush) → "path: <경로>" → "machine-origin: <token>"
+#   훅은 **도착한 라인까지만** 소비한다 — 중도 사망(타임아웃 killpg 포함)에도 record 판정은
+#   생존하고 machine-origin 만 판정불가(fail-closed 무스폰)로 접힌다: 현행 3-프로세스의
+#   독립 생존 성질을 프로토콜로 보존한다. ★소비 시점 분리 유지(R3-P05-1 ③): record 판정은
+#   여기서 즉시 소비(전 프롬프트 공통)하고, machine-origin 토큰 라인은 DETECT 발화 후의
+#   스폰 게이트에서만 꺼내 판정한다.
+TRIAGE_OUT=""
+TRIAGE_RC=""
+TRIAGE_MODE=""
 if [ -f "$MISSION" ]; then
   MISSION_N="$(cys_native_path "$MISSION")"
-  printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$MISSION_N" record >/dev/null 2>&1
-  RECORD_RC=$?
-  MISSION_RC=$RECORD_RC
-  [ "$MISSION_RC" = "0" ] || MISSION_RC=1
-  MISSION_LEDGER="$(cys_timeout_run 5 "$CYS_PY" "$MISSION_N" path 2>/dev/null </dev/null | tail -1)"
+  TRIAGE_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 8 "$CYS_PY" "$MISSION_N" hook-triage 2>/dev/null)"
+  TRIAGE_RC=$?
+  if [ "$TRIAGE_RC" = "64" ]; then
+    # ★구팩 스큐 폴백(1릴리스 병존 · 조용한 강등 금지 — stderr 1줄): hook-triage 부재 구
+    #   javis_mission 은 미지 서브커맨드를 stdin 무소비·EX_USAGE(64)로 거부한다(문서화된 값 —
+    #   v0.14.25 실측). 64 **만** 스큐 신호다: 타임아웃(124)·크래시까지 폴백으로 접으면 wedge
+    #   기계의 최악 지연이 8s+15s 로 늘어난다 — 그 경우는 아래 라인 부재 폴드(record=""
+    #   미실행 · MO 토큰 부재=fail-closed)가 기존 의미론 그대로 받는다.
+    echo "[cys-hook] role-bootstrap: 구팩 javis_mission(hook-triage 부재 · rc=64) — 종전 3왕복 경로로 폴백" >&2
+    TRIAGE_MODE="legacy"
+    printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$MISSION_N" record >/dev/null 2>&1
+    RECORD_RC=$?
+    MISSION_LEDGER="$(cys_timeout_run 5 "$CYS_PY" "$MISSION_N" path 2>/dev/null </dev/null | tail -1)"
+  else
+    TRIAGE_MODE="batch"
+    # record 라인 소비 — 정수만 인정한다. 라인 부재·비정수 = ""(record 미실행 폴드 — 기존
+    #   어휘 그대로: 대장 기록 여부 미확인의 정직 강등. 아래 LEDGER_SENT 가 그대로 받는다).
+    RECORD_RC="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^record: rc=\([0-9][0-9]*\)$/\1/p' | head -n 1)"
+    MISSION_LEDGER="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^path: \(.*\)$/\1/p' | head -n 1)"
+    # 진단 1줄(관측성): 중도 사망 시나리오에서 'record 는 생존했는가'를 stderr 로 확인할 수
+    # 있는 유일한 자리다(주입 note 는 무스폰 경로에서 RECORD_RC 를 싣지 않는다).
+    echo "[cys-hook] role-bootstrap: hook-triage 배치 왕복(rc=$TRIAGE_RC) — record=${RECORD_RC:-미실행(라인 부재)}" >&2
+  fi
+  MISSION_RC=1
+  [ "$RECORD_RC" = "0" ] && MISSION_RC=0
 else
   echo "[cys-hook] role-bootstrap: javis_mission.py 부재 — 임무 대장 미기록(자율 착수는 fail-closed 로 금지된다)" >&2
 fi
@@ -572,8 +607,19 @@ esac
 MO_RC=""
 MO_OUT=""
 if [ -f "$MISSION" ]; then
-  MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$(cys_native_path "$MISSION")" machine-origin 2>/dev/null)"
-  MO_RC=$?
+  if [ "$TRIAGE_MODE" = "batch" ]; then
+    # ★P0-5: 토큰 라인은 위 T1 의 hook-triage 배치 왕복에서 이미 도착해 있다 — 별도 파이썬
+    #   왕복 없이 여기 **DETECT 발화 후**에만 꺼내 판정한다(소비 시점 분리 — record 즉시
+    #   소비와 달리 MO 는 선언 프롬프트 전용). 라인 부재(중도 사망·타임아웃·8s 소진) =
+    #   MO_OUT 빈 값 → 아래 case 미적중 → 판정 불가 fail-closed 무스폰(기존 의미론 그대로).
+    #   MO_RC 는 triage 프로세스 exit(=MO 판정값 보조 진단 · 타임아웃이면 124)를 병기한다.
+    MO_OUT="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^\(machine-origin: .*\)$/\1/p' | head -n 1)"
+    MO_RC="$TRIAGE_RC"
+  else
+    # 구팩 스큐 폴백(TRIAGE_MODE=legacy) 또는 미배치 경로 — 종전 별도 왕복 그대로.
+    MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$(cys_native_path "$MISSION")" machine-origin 2>/dev/null)"
+    MO_RC=$?
+  fi
 fi
 MO_TOKEN=""
 case "$MO_OUT" in
