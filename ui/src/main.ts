@@ -6856,6 +6856,9 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     // ★(MAJOR-2 · 7R) linkState 도 함께 넘긴다 — 확인 창에 실리는 백업본 줄이 '그 자리가 지금
     // 비어 있는가' 를 알아야 파괴적인 'sudo mv' 를 내지 않는다(자리가 차 있으면 명령 대신
     // "해제하면 앱이 되돌립니다" 라고 말한다).
+    // ★(BLOCK-1 · 12R) 정확히는 **그 자리의 가장 최근 사본 한 줄에만** 그렇게 말한다. 같은 자리의
+    // 옛 사본에는 되돌린다는 약속도, 옮기라는 명령도 붙지 않는다 — 되돌릴 자리가 하나뿐이라
+    // 앱이 되돌리는 것도 하나뿐이기 때문이다(uninstallConfirmText 가 autoRestoredBackups 로 가른다).
     const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState);
     if (!(await confirmModal(c.title, c.body, c.yes, c.no))) {
       // 취소 — 집행한 것이 없으니 재조회도 하지 않는다(쓸데없이 로그인 셸을 띄우지 않는다).

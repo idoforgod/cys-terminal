@@ -96,7 +96,11 @@ export type ToastEmit = {
 ///
 /// ★(N4) 이 함수가 **등급색의 단일 진실**이고, main.ts 의 toast()·stickyToast() 는 낼 때마다
 /// 이것으로 className 을 덮어쓴다(재사용 엘리먼트의 낡은 등급색을 지운다). 그 재적용이 곧 N4 의
-/// 수리 본체이며, clipath.test.ts 의 "main.ts 배선 핀"이 그 한 줄을 못박는다.
+/// 수리 본체다. clipath.test.ts 의 "main.ts 배선 핀"이 **그 한 줄을** 못박는다 — 다만 그 핀이
+/// 지키는 범위는 "그 함수 본문 안에서 className 을 직접 쓰는 자리가 하나이고 그 하나가 이 함수다"
+/// 까지이고, 헬퍼 경유·인라인 스타일·본문 절단은 보지 못한다(12R 실측 · 그 목록은
+/// clipath.test.ts 의 `pinFinalClassName` 위에 있다). 등급색이 실제로 화면에 살아 있는지는
+/// 이 파일의 어떤 시험도 보지 않는다.
 export function toastClassName(category: string): string {
   return `toast ${category}`;
 }
@@ -308,12 +312,27 @@ export function installResultToast(rep: InstallCliReport): ToastPlan {
     };
   }
   if (status === "installed_shadowed") {
-    // (C3 대칭) 경로로 읽히는 값일 때만 그 경로를 지목하고 'rm' 쪽 안내를 붙인다.
+    // (C3 대칭) 경로로 읽히는 값일 때만 그 경로를 지목한다.
+    //
+    // ★(MAJOR-3 · 2026-08-25 11R) 예전 문장은 **삭제를 맨 앞에** 놓았다:
+    //   `그 파일(${by.path})을 지우거나 PATH에서 /usr/local/bin 을 앞으로 옮긴 뒤, `
+    // `shadowed_by` 는 정의상 **우리 것이 아닌** 바이너리다 — Homebrew 설치본·직접 빌드본·
+    // 사용자가 손으로 쓴 ~/bin/cys 스크립트. 정체 확인(`ls -l`)도, 비가역 경고도 없었고,
+    // 아무 파일도 건드리지 않는 대안(PATH 재정렬)보다 **삭제가 먼저** 왔다. 앱이 사용자에게
+    // 남의 바이너리를 지우라고 먼저 말한 셈이다.
+    //
+    // 이 라운드들이 `mv`(MAJOR-2 · 7R)와 `rm`(MAJOR-1 · 10R)에서 세운 규약과 같은 기준으로 맞춘다:
+    //   ① 비파괴 대안을 **먼저** 준다(PATH 재정렬 — 파일을 하나도 건드리지 않는다).
+    //   ② 삭제를 말할 거면 `ls -l <경로>` 정체 확인 + 비가역 경고를 **함께** 단다.
+    // 정보를 없애는 것이 아니라 **파괴적 기본값**을 없애는 것이다(10R 과 같은 방향).
     const by = shadowTarget(rep.shadowed_by);
     const advice = by.path
-      ? `그 파일(${by.path})을 지우거나 PATH에서 /usr/local/bin 을 앞으로 옮긴 뒤, `
+      ? `PATH에서 /usr/local/bin 을 ${by.path} 가 있는 폴더보다 앞으로 옮기면 파일을 하나도 건드리지 않고 ` +
+        `우리 cys 가 먼저 잡힙니다 — 이 방법을 먼저 쓰세요. 그 파일이 무엇인지는 'ls -l ${by.path}' 로 ` +
+        `확인할 수 있습니다(다른 도구가 설치했거나 직접 만든 것일 수 있습니다). 정말 필요 없는 것이라고 ` +
+        `확인한 뒤에만 지우세요 — 지우면 되돌릴 수 없습니다. 그런 뒤 `
       : `가리는 경로를 하나로 특정하지 못했으므로(측정 출력이 경로 한 줄이 아닙니다) 지울 대상을 ` +
-        `단정하지 않습니다 — PATH에서 /usr/local/bin 을 앞으로 옮긴 뒤, `;
+        `단정하지 않습니다. PATH에서 /usr/local/bin 을 앞으로 옮긴 뒤, `;
     return {
       category: "watchdog",
       title: "⚠ 셸 설치 미완료 — 다른 cys가 앞을 가립니다",
@@ -579,6 +598,32 @@ export function backupOrigin(backupPath: string): string | null {
   return isEpochStamp(stamp) ? origin : null;
 }
 
+// ── (MAJOR-6 · 2026-08-25 11R) **되돌아오는 것은 하나뿐이다** ─────────────────
+/// 결함(실측): `cliNoticeLines` 는 backups 를 하나씩 `backupNoticeLine` 에 넘겼고, `ours` 갈래는
+/// 백업본 **각각**에 대해 "'셸 cys 해제' 를 누르면 … 이 원본을 제자리에 되돌립니다" 라고 말했다.
+/// 그런데 Rust `pick_restore_backup`(src-tauri/src/main.rs:2509)은 한 대상 경로에 대해 **스탬프가
+/// 가장 큰 하나만** 고르고, `plan_cli_uninstall` 은 그 하나만 `restore` 쌍에 넣는다. 같은 자리의
+/// 오래된 백업본은 해제해도 **영영 자동 복원되지 않는다.** 그 위에 10R 이 붙인
+/// '⚠ 마지막 사본입니다 … sudo rm' 안내가 같은 줄에 실려, 되돌아오지 않은 옛 사본을 사용자가
+/// 지우게 유도했다 — 앱이 거짓 약속을 하고, 그 거짓을 근거로 파일을 지우게 한 형태다.
+///
+/// 수리 방향은 Rust 를 고치는 것이 아니라 **UI 문구를 Rust 의 실제 동작에 맞추는 것**이다.
+/// 이 함수가 그 거울이다: Rust 와 **같은 규칙**으로 자동 복원되는 경로 집합을 고른다.
+///   · 이름 규칙(`backupOrigin`)에 맞지 않으면 후보에서 버린다 — Rust `is_our_backup_name` 과 같다.
+///   · 같은 원래 경로가 여럿이면 스탬프(epoch 초)가 가장 큰 하나 — Rust 의 `stamp >= best` 와 같다.
+/// 원래 경로가 곧 전체 경로이므로 Rust 의 '같은 디렉터리' 조건은 여기서 자동으로 성립한다.
+export function autoRestoredBackups(backups: readonly string[]): string[] {
+  const best = new Map<string, { stamp: number; path: string }>();
+  for (const b of backups) {
+    const origin = backupOrigin(b);
+    if (!origin) continue; // 우리 이름 규칙이 아니면 Rust 도 되돌리지 않는다
+    const stamp = Number(b.slice(b.lastIndexOf(CYS_BACKUP_MARK) + CYS_BACKUP_MARK.length));
+    const cur = best.get(origin);
+    if (!cur || stamp >= cur.stamp) best.set(origin, { stamp, path: b });
+  }
+  return [...best.values()].map((v) => v.path);
+}
+
 // ── (MAJOR-2 · 2026-08-25 7R) **앱이 스스로 파괴적 명령을 출력하지 않는다** ─────────────────
 /// 결함(실행 재현): 잔존 백업본이 있으면 무조건 "되돌리려면 'sudo mv <백업본> <원래 경로>'" 를 냈다.
 /// `<원래 경로>` 가 지금 비어 있는지 **검사하지 않았고** `mv` 에 `-i`/`-n` 도 없었다. 그래서 같은
@@ -629,7 +674,13 @@ export const BACKUP_LAST_COPY_WARNING =
   "⚠ 이것은 설치 때 밀려난 원본을 되돌릴 마지막 사본입니다 — 지우면 되돌릴 수 없습니다";
 
 /// 버리기 안내 한 조각. `ours` = 이름이 이 앱의 백업 규칙(`<원래 경로>.cys-backup-<epoch초>`)에 맞는가.
-function backupDropLine(backupPath: string, ours: boolean): string {
+///
+/// ★(BLOCK-1 · 2026-08-25 12R) `autoRestored` 도 함께 읽는다. 11R 까지 이 함수는 그 값을 받지
+/// 않아서, 같은 원래 경로에 사본이 둘이면 **양쪽 모두**에게 `⚠ … 마지막 사본입니다` + `sudo rm`
+/// 을 나란히 붙였다(실측 재현: linkState="absent" · 같은 자리 사본 2개 → '마지막 사본' 2회 ·
+/// `sudo rm` 2줄). 사본이 둘인데 각각을 '마지막'이라 부르는 것은 산술적으로 거짓이고, 그 거짓을
+/// 근거로 지워지는 것이 이 기능이 존재하는 이유인 **남의 실체 바이너리**다.
+function backupDropLine(backupPath: string, ours: boolean, autoRestored: boolean): string {
   if (!ours)
     // 이름을 확정하지 못했으므로 "이것은 마지막 사본이다" 라고 **단정하지 않는다** — 모르는 것을
     // 아는 것처럼 말하면, 그 문장을 믿고 내리는 판단이 근거 없는 판단이 된다. 비가역이라는 사실만
@@ -640,30 +691,82 @@ function backupDropLine(backupPath: string, ours: boolean): string {
       `사본이라고 확정할 수 없습니다 — 그래서 지우는 명령은 드리지 않습니다. ` +
       `'ls -l ${backupPath}' 로 무엇인지 직접 확인한 뒤 판단하세요.`
     );
+  if (!autoRestored)
+    // 같은 자리의 사본이 여럿이다 — 그중 어느 것도 '마지막 사본'이 아니다. 단정하지 않고,
+    // 지우는 명령도 내지 않는다(위 `!ours` 갈래가 이름 규칙에서 택한 것과 같은 fail-closed).
+    return (
+      `⚠ 지우면 되돌릴 수 없습니다. 그런데 같은 원래 경로의 백업본이 여럿이라 이것이 마지막 사본인지 ` +
+      `이 앱은 단정하지 않습니다 — 그래서 지우는 명령은 드리지 않습니다. ` +
+      `'ls -l ${backupPath}' 로 무엇인지 직접 확인하고, 가장 최근 사본이 제자리로 돌아간 뒤에 판단하세요.`
+    );
   return (
     `${BACKUP_LAST_COPY_WARNING}. 정말 버릴 때는 'ls -l ${backupPath}' 로 그 파일이 아직 있는지·무엇인지 ` +
     `눈으로 확인한 뒤에만 'sudo rm ${backupPath}' 하세요(이름이 이 앱의 백업 규칙과 맞는 것은 앱이 이미 확인했습니다).`
   );
 }
 
+/// (MAJOR-6 · 11R) 자동 복원되지 않는 사본에 쓰는 사실 문장. 화면·테스트가 같은 문자열을 본다.
+export const BACKUP_NOT_AUTO_RESTORED = "자동으로 되돌아오지 않습니다";
+
 /// 백업본 한 줄의 사용자 문구. 원래 경로를 알고 **그 자리가 비어 있을 때만** 복원 명령을 제시한다.
 /// `linkState` 를 넘기지 않은 호출부는 "unknown" 으로 접힌다 — 기본값이 안전한 쪽이다(fail-closed).
-export function backupNoticeLine(backupPath: string, linkState: CliLinkState = "unknown"): string {
+///
+/// ★(MAJOR-6) `autoRestored` = 해제 때 앱이 **이 사본을** 되돌리는가(= 같은 원래 경로의 백업본
+/// 중 가장 최신인가 · 판정은 `autoRestoredBackups`). 목록 전체를 봐야 알 수 있는 값이므로
+/// 호출부가 계산해 넘긴다. 사본이 하나뿐인 흔한 경우가 곧 기본값(true)이고, 여럿일 때만
+/// 옛 사본이 false 를 받아 **되돌아오지 않는다는 사실**을 말한다.
+///
+/// ★(BLOCK-1 · 12R) 11R 은 그 값을 **네 갈래 중 하나(occupied)에서만** 읽었다. `free`(absent)와
+/// `unknown`(partial·foreign) 갈래는 인자를 아예 쓰지 않아, 같은 자리의 사본 둘에게 **같은
+/// 목적지로 가는 `sudo mv -n` 두 줄**을 나란히 냈다(실측 재현: `cliNoticeLines({backups:[옛,새],
+/// linkState:"absent"})`). macOS(BSD) `mv -n` 은 대상이 **끊어진 심링크**면 비어 있는 것으로 보고
+/// 덮어쓰고 종료코드 0 을 준다(MV_EMPTY_CAVEAT 에 적힌 그 동작). 그래서 첫 줄이 되돌려 놓은 원본이
+/// 둘째 줄에서 조용히 사라지고, 오류가 없으니 사용자는 '둘 다 되돌렸다'고 믿는다.
+/// 그래서 판정은 **네 갈래보다 먼저** 온다: 이 사본이 그 자리의 최신이 아니면 어느 상태에서도
+/// 옮기는 명령을 내지 않는다(되돌릴 자리는 하나뿐이다).
+///
+/// ★(MAJOR-3 · 12R) 그 결과 `linkState="ours"` 에서는 **어떤 갈래에서도** `sudo mv` 가 나오지
+/// 않는다. 11R 의 occupied·`!autoRestored` 갈래가 조건부 `sudo mv -n` 을 내고 있었고, 그것이
+/// docs/INSTALL.md 계약표("원래 자리를 이 앱의 링크가 차지하고 있을 때 — 옮기는 명령을 내지
+/// 않습니다")와 정면으로 어긋났다. 문서가 아니라 **코드를 문서에 맞췄다**(선택지 (a)): 자리가
+/// 찼다고 앱이 아는데 옮기라고 말하지 않는다는 것이 이 라운드들이 세운 규약이기 때문이다.
+export function backupNoticeLine(
+  backupPath: string,
+  linkState: CliLinkState = "unknown",
+  autoRestored: boolean = true,
+): string {
   const origin = backupOrigin(backupPath);
   const head = `${backupPath} — 설치 때 여기로 옮겨 둔 원본입니다.`;
   // ★(MAJOR-1) 버리기 꼬리는 **이름 규칙 판정에 연결된다** — 맨 rm 은 어느 갈래에도 없다.
-  const drop = backupDropLine(backupPath, origin !== null);
+  const drop = backupDropLine(backupPath, origin !== null, autoRestored);
   if (!origin) {
     // 이름이 우리 규칙이 아니면 원래 경로를 추측하지 않는다(N13) — mv 는 아예 만들지 않는다.
     return `${backupPath} — 설치 때 옮겨 둔 원본으로 보입니다(원래 경로를 이름에서 확정하지 못했습니다). ${drop}`;
   }
   const spot = backupRestoreSpot(linkState);
+  // ★(BLOCK-1) 자리 판정보다 **먼저** 온다 — 자리가 비었든 찼든 모르든, 되돌릴 자리는 하나뿐이고
+  // 그 하나로 가는 이동 명령도 하나뿐이어야 한다. 갈래별로 아는 것(자리 상태)은 앞머리에 남긴다.
+  if (!autoRestored) {
+    const where =
+      spot === "occupied"
+        ? `지금 ${origin} 자리는 이 앱이 만든 링크가 차지하고 있습니다. `
+        : spot === "unknown"
+          ? `${origin} 자리에 지금 무엇이 있는지 확정하지 못했습니다. `
+          : "";
+    return (
+      `${head} ${where}${origin} 자리의 백업본이 여럿이라 이 사본은 ${BACKUP_NOT_AUTO_RESTORED} — 앱은 ` +
+      `한 자리에 대해 가장 최근 사본 하나만 되돌립니다. 되돌릴 자리는 하나뿐이므로 이 사본을 옮기는 ` +
+      `명령은 드리지 않습니다. 가장 최근 사본이 제자리로 돌아간 뒤 'ls -l ${origin}' 로 그 자리에 ` +
+      `무엇이 있는지 직접 확인하고 나서 이 사본을 어떻게 할지 판단하세요. ${drop}`
+    );
+  }
   if (spot === "occupied") {
     // 앱이 **알고 있다**: 그 자리는 우리 링크가 차지하고 있다. 손으로 옮기라고 말하지 않는다 —
     // 해제 버튼이 링크를 지운 자리에 이 원본을 되돌려 준다(Rust I3③ restored).
     return (
       `${head} 지금 ${origin} 자리는 이 앱이 만든 링크가 차지하고 있어 손으로 옮길 수 없습니다 — ` +
-      `'셸 cys 해제' 를 누르면 앱이 그 링크를 지우고 이 원본을 제자리에 되돌립니다. ${drop}`
+      `'셸 cys 해제' 를 누르면 앱이 그 링크를 지우고 이 원본을 제자리에 되돌립니다` +
+      `(한 자리에 백업본이 여럿이면 가장 최근 것 하나만 되돌립니다). ${drop}`
     );
   }
   if (spot === "unknown") {
@@ -690,7 +793,11 @@ export function cliNoticeLines(view: {
 }): string[] {
   const lines: string[] = view.notes.filter(Boolean).slice();
   const state: CliLinkState = view.linkState ?? "unknown";
-  for (const b of view.backups.filter(Boolean)) lines.push(backupNoticeLine(b, state));
+  const kept = view.backups.filter(Boolean);
+  // ★(MAJOR-6) 되돌아오는 것은 한 자리에 하나뿐이다 — 목록 전체를 보고 나서야 알 수 있으므로
+  // 여기서 한 번 계산해 줄마다 넘긴다(줄 하나만 보고는 자기가 최신인지 말할 수 없다).
+  const auto = new Set(autoRestoredBackups(kept));
+  for (const b of kept) lines.push(backupNoticeLine(b, state, auto.has(b)));
   return lines;
 }
 
@@ -856,12 +963,14 @@ export function uninstallConfirmText(
   const kept = backups.filter(Boolean);
   const stateLines =
     state.length > 0 ? ["", "현재 /usr/local/bin 상태:", ...state.map((n) => `   • ${n}`)] : [];
+  // ★(MAJOR-6) 확인 창도 같은 사실을 말한다 — 한 자리에 사본이 여럿이면 되돌아오는 것은 하나뿐이다.
+  const auto = new Set(autoRestoredBackups(kept));
   const backupLines =
     kept.length > 0
       ? [
           "",
-          "설치 때 백업해 둔 원본이 남아 있습니다 — 해제하면서 제자리에 되돌립니다(되돌리지 못한 것은 결과 알림에 그대로 남습니다):",
-          ...kept.map((b) => `   • ${backupNoticeLine(b, linkState)}`),
+          "설치 때 백업해 둔 원본이 남아 있습니다 — 해제하면서 제자리에 되돌립니다. 다만 한 자리에 사본이 여럿이면 가장 최근 것 하나만 되돌립니다(되돌리지 못한 것은 결과 알림에 그대로 남습니다):",
+          ...kept.map((b) => `   • ${backupNoticeLine(b, linkState, auto.has(b))}`),
         ]
       : [];
   return {
@@ -870,7 +979,7 @@ export function uninstallConfirmText(
       "/usr/local/bin/cys · /usr/local/bin/cysd 심링크를 제거합니다 (관리자 승인 1회).",
       "",
       "· 제거 대상은 이 앱이 만든 심볼릭 링크뿐입니다. 같은 이름의 일반 파일(다른 도구가 설치한 실체 바이너리)이나 다른 앱을 가리키는 링크는 건드리지 않고 건너뜁니다.",
-      "· 설치할 때 그 자리에 있던 것(실제 파일이든 다른 곳을 가리키던 심볼릭 링크든)을 '<원래 경로>.cys-backup-<숫자>' 로 옮겨 두었다면, 해제하면서 그 원본을 제자리에 되돌립니다(<숫자>는 백업한 시각의 epoch 초 · 되돌린 경로는 결과 알림에 나옵니다).",
+      "· 설치할 때 그 자리에 있던 것(실제 파일이든 다른 곳을 가리키던 심볼릭 링크든)을 '<원래 경로>.cys-backup-<숫자>' 로 옮겨 두었다면, 해제하면서 그 원본을 제자리에 되돌립니다(<숫자>는 백업한 시각의 epoch 초 · 한 자리에 사본이 여럿이면 가장 최근 것 하나만 되돌립니다 · 되돌린 경로는 결과 알림에 나옵니다).",
       "· 해제 후에는 외부 터미널에서 'cys' 명령을 쓸 수 없습니다. 앱 pane 안에서는 PATH가 자동 주입되므로 그대로 동작합니다.",
       "· 다시 필요하면 같은 버튼으로 언제든 설치할 수 있습니다.",
       ...backupLines,
