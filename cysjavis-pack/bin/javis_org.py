@@ -275,7 +275,11 @@ def _audit_formation_mod():
 
 def _audit_daemon_status(socket=None):
     """데몬 org.status 회수(`cys status --json` = org.status RPC) — read-only·autostart 금지.
-    socket=None 은 base(부서 레인에서 실행돼도 CYS_SOCKET 스크럽으로 base 데몬만 본다)."""
+    socket=None 은 base(부서 레인에서 실행돼도 CYS_SOCKET 스크럽으로 base 데몬만 본다).
+    반환 = (dict|None, probe_reason|None) — ★SF-3(P3 수정 라운드): bare `cys` PATH 의존이라
+    'cys 부재'와 '데몬 사망'이 같은 None 으로 접히면 원인 구분이 불가하다 → 실패 사유를
+    문자열로 병기(cys-not-found / timeout / spawn-error / exit-N / bad-json). 판정(alive)은
+    종전과 동일하게 dict 유무만 쓴다(read-only 강등 계약 불변)."""
     env = {**os.environ, "CYS_NO_AUTOSTART": "1"}
     if socket is None:
         env.pop("CYS_SOCKET", None)
@@ -284,15 +288,19 @@ def _audit_daemon_status(socket=None):
         cmd = ["cys", "--socket", socket, "status", "--json"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
+    except FileNotFoundError:
+        return None, "cys-not-found"
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
     except Exception:
-        return None
+        return None, "spawn-error"
     if r.returncode != 0:
-        return None
+        return None, "exit-%d" % r.returncode
     try:
         d = json.loads(r.stdout)
-        return d if isinstance(d, dict) else None
+        return (d, None) if isinstance(d, dict) else (None, "bad-json")
     except Exception:
-        return None
+        return None, "bad-json"
 
 def _audit_seat(surfaces, role):
     """역할 좌석 관측: agent(부착) / empty_shell(좌석만) / absent. agent '존재'를 쓴다 —
@@ -333,7 +341,7 @@ def _audit_ceo_axis(dept_count):
         same = False
     promoted = os.path.exists(pre) or same   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
     is_pending = os.path.exists(pending)
-    base_st = _audit_daemon_status(None)
+    base_st, base_probe = _audit_daemon_status(None)
     base_alive = base_st is not None
     if dept_count >= 1:
         state = "ceo" if (promoted and not is_pending) else ("pending" if is_pending else "unpromoted")
@@ -343,7 +351,8 @@ def _audit_ceo_axis(dept_count):
         conv = not promoted   # 부서 0 이면 base 데몬 생존은 편제 수렴 판정 밖(정보 필드로만)
     return {"state": state, "promoted": promoted, "pending": is_pending,
             "boot_marker": os.path.exists(marker), "receipt": os.path.exists(receipt),
-            "daemon_alive": base_alive, "dept_count": dept_count, "converged": conv}
+            "daemon_alive": base_alive, "daemon_probe": base_probe,  # 실패 사유(생존 시 None·SF-3)
+            "dept_count": dept_count, "converged": conv}
 
 def cmd_org_audit():
     """org-audit — {ceo, depts:{name:{daemon_alive, master_seat, team_state}}} 파생 출력.
@@ -366,7 +375,7 @@ def cmd_org_audit():
     depts_out, all_ok = {}, True
     for name, e in sorted((reg.get("depts") or {}).items()):
         sock = (e or {}).get("socket") or ""
-        st = _audit_daemon_status(sock) if sock else None
+        st, probe = _audit_daemon_status(sock) if sock else (None, "no-socket")
         alive = st is not None
         surfaces = (st or {}).get("surfaces", [])
         master_seat = _audit_seat(surfaces, "master") if alive else "unknown"
@@ -392,6 +401,7 @@ def cmd_org_audit():
         all_ok = all_ok and conv
         depts_out[name] = {"daemon_alive": alive, "master_seat": master_seat,
                            "team_state": team_state, "missing": missing,
+                           "daemon_probe": probe,      # 실패 사유(생존 시 None) — SF-3: cys 부재/사망 구분
                            "ticket": _audit_ticket_state(name),
                            "formation_cache": cache,   # 참고 전용 — 판정은 라이브 관측(위)뿐
                            "converged": conv}

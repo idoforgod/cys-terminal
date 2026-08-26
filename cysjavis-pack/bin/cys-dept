@@ -749,7 +749,11 @@ CEO_PENDING="$HOME/.cys/state/ceo-pending"
 #   막는다(보증이 템플릿 빌드에만 있으면 배포본 드리프트 시 재발 — REPORT DCE-3).
 #   판정 = ref(표준 MASTER 전문) 바이트열이 CEO 템플릿 안에 verbatim 포함되는가(합성 계약
 #   gen_ceo_template: fragment + 구분선 + MASTER 바이트 무수정 연접 — 정상 템플릿은 항상 참).
-#   ref 는 재승격(.pre-ceo 존재 = 현 md 가 이미 CEO 문면)이면 백업 .pre-ceo, 초승격이면 md.
+#   ref 는 OR-포함(★MF-1 수정 라운드): ceo ⊇ md **또는** ceo ⊇ .pre-ceo 중 하나면 통과 —
+#   종전 단일 결박(.pre-ceo 존재=무조건 .pre-ceo 기준)은 교차버전 실사고 형상(팩 업데이트가
+#   md 를 새 표준 MASTER v2 로 갱신·.pre-ceo 엔 구 v1 잔존)에서 정상 v2 템플릿도 영구 보류시켜
+#   반쪽마스터 수복 경로를 자기봉쇄했다. 스텁은 둘 다 미포함 = 차단 강도 불변.
+#   비교는 개행(CRLF→LF) 정규화 후(★SF-2: Windows 체크아웃·에디터 변환 드리프트 false hold 방지).
 #   실패(비포함·판독 불능·검사기 실행 실패)는 전부 보류(fail-closed — '측정 불능은 통과가 아니다').
 ceo_template_superset_ok(){  # $1=CEO 템플릿 경로 $2=기준(표준 MASTER 전문) 경로 — 0=상위집합
   python3 - "$1" "$2" <<'PY'
@@ -762,7 +766,9 @@ except OSError as e:
     sys.stderr.write("[cys-dept] superset 검사 판독 불능: %s\n" % e); sys.exit(2)
 if not ref:
     sys.stderr.write("[cys-dept] superset 검사: 기준본이 비어 있음(%s)\n" % ref_p); sys.exit(2)
-sys.exit(0 if ref in ceo else 1)
+# ★SF-2: 개행 정규화(CRLF→LF) 후 포함 판정 — 개행은 표현 계층이라 인코딩 드리프트만으로
+#   보류하지 않는다(문면 동일성 판정은 유지 — 실내용 결손·스텁은 여전히 비포함=1).
+sys.exit(0 if ref.replace(b"\r\n", b"\n") in ceo.replace(b"\r\n", b"\n") else 1)
 PY
 }
 ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자동 승격 알림 생략
@@ -796,9 +802,18 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   _swap(){
     # ★DCE-3(T10) 1단계 — 스왑 '직전' 상위집합 런타임 검사(락 안 = 검사·스왑 원자). 실패 rc 3
     #   = 스왑 미실행(md·.pre-ceo·영수증 전부 무접촉) — 보류 처리(PENDING 유지+loud)는 호출부.
-    local _ref="$md"
-    [ -f "$md.pre-ceo" ] && _ref="$md.pre-ceo"
-    ceo_template_superset_ok "$ceo" "$_ref" || return 3
+    # ★MF-1(P3 수정 라운드): OR-포함 판정 — ceo ⊇ md 또는 ceo ⊇ .pre-ceo 중 하나면 통과.
+    #   근거: 단일 ref 결박은 '팩 업데이트로 md=새 표준 v2·.pre-ceo=구 v1' 교차버전 형상에서
+    #   정상 템플릿을 영구 보류시킨다(반쪽마스터 실사고의 기계 수복 재차단 — 리뷰어1 MF-1).
+    #   스텁(반쪽마스터)은 md·.pre-ceo 어느 쪽도 포함하지 않아 차단 강도는 불변이다.
+    #   잔존 both-fail 형상(md=구 CEO 문면 + 낡은 .pre-ceo)은 fail-closed 보류가 옳다 —
+    #   해소 절차는 호출부 보류 메시지에 명시(stale .pre-ceo 갱신/제거).
+    local _sup_ok=1
+    ceo_template_superset_ok "$ceo" "$md" && _sup_ok=0
+    if [ "$_sup_ok" -ne 0 ] && [ -f "$md.pre-ceo" ]; then
+      ceo_template_superset_ok "$ceo" "$md.pre-ceo" && _sup_ok=0
+    fi
+    [ "$_sup_ok" -eq 0 ] || return 3
     [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"
     local h
     if h="$(shasum -a 256 "$md" 2>/dev/null)" && [ -n "$h" ]; then
@@ -829,15 +844,21 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     #   exit 5 로 담당). rc 3 = 상위집합 검사 실패(스왑 자체가 미실행 — md·.pre-ceo·영수증
     #   무접촉), 그 외 = 스왑 중 오류(종전엔 set -e 로 스크립트 전체 즉사하던 경로의 가청 강등).
     mkdir -p "$(dirname "$CEO_PENDING")"
-    [ -f "$CEO_PENDING" ] || printf 'pending since %s (superset-hold)\n' \
-      "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$CEO_PENDING"
+    # ★SF-1(P3 수정 라운드): 계약 문면은 'PENDING **유지**'다 — 보류 시 신규 생성은 자동/대기형
+    #   경로 한정. 오너 지명(consented·promote-ceo 1회성) 경로의 보류까지 PENDING 을 생성하면
+    #   지명 실패가 상시 자동승격 예약(집행 틱이 템플릿 수리 후 무제스처 승격)으로 확폭된다.
+    #   기존 PENDING 은 어느 경로든 유지(삭제 없음).
+    if [ ! -f "$CEO_PENDING" ] && [ "${1:-}" != "consented" ]; then
+      printf 'pending since %s (superset-hold)\n' \
+        "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$CEO_PENDING"
+    fi
     if [ "$_swap_rc" -eq 3 ]; then
-      echo "[cys-dept] ★CEO 승격 보류(DCE-3 상위집합 검사 실패) — CEO_TEMPLATE 이 표준 MASTER_DIRECTIVE 전문을 verbatim 포함하지 않는다(스텁/드리프트 의심 — 반쪽마스터 재발 차단). scripts/gen_ceo_template.py 재합성 또는 팩 갱신 후 재시도. PENDING 유지." >&2
+      echo "[cys-dept] ★CEO 승격 보류(DCE-3 상위집합 검사 실패) — CEO_TEMPLATE 이 표준 MASTER_DIRECTIVE 전문(md·.pre-ceo 어느 쪽도)을 verbatim 포함하지 않는다(스텁/드리프트 의심 — 반쪽마스터 재발 차단). 해소: ①스텁이면 scripts/gen_ceo_template.py 재합성 또는 팩 갱신 ②md 가 이미 CEO 문면인데 .pre-ceo 가 낡았으면 .pre-ceo 를 현행 표준 MASTER 전문으로 갱신(또는 제거) 후 재시도. PENDING 유지." >&2
       # 비대기 feed — 제목 완전일치 dedupe(A11 동형): 주기 집행 틱이 10분마다 재밀어도 적체 0.
       if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
            | awk -F'\t' '$4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"{found=1} END{exit !found}'; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(템플릿 상위집합 검사 실패)" \
-          --body "CEO_TEMPLATE.md 가 표준 MASTER_DIRECTIVE.md 전문을 포함하지 않아 승격을 보류했습니다(스텁 교체 = 반쪽마스터 재발 경로 차단). 팩을 갱신하거나 gen_ceo_template.py 로 재합성한 뒤 다시 시도하십시오. 승격 대기(PENDING)는 유지됩니다." >/dev/null 2>&1 || true
+          --body "CEO_TEMPLATE.md 가 표준 MASTER_DIRECTIVE.md 전문(현행 md·백업 .pre-ceo 어느 쪽도)을 포함하지 않아 승격을 보류했습니다(스텁 교체 = 반쪽마스터 재발 경로 차단). 해소: 스텁이면 팩 갱신 또는 gen_ceo_template.py 재합성, .pre-ceo 만 낡은 형상이면 .pre-ceo 를 현행 표준 전문으로 갱신 후 재시도하십시오. 승격 대기(PENDING)는 유지됩니다." >/dev/null 2>&1 || true
       fi
     else
       echo "[cys-dept] WARN: CEO 승격 스왑 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 디스크/권한 점검 후 재시도." >&2

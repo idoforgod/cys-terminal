@@ -7,6 +7,8 @@
   B) worker 좌석 agent 부재 → exit 1(미수렴)·team_state=partial·missing에 worker
   C) ceo-pending 잔존 → exit 1(미수렴)·ceo.state=pending (팀 complete여도)
   D) 부서 데몬 사망 → exit 1·daemon_alive=false·team_state=unknown
+     + ★SF-3(P3 수정 라운드): daemon_probe 실패 사유 병기(exit-1) — 'cys 부재'와 '데몬 사망'이
+       같은 unknown 으로 접히지 않게 원인 구분 필드(생존 시 None — A5)
   E) 부서 0 + 미승격 → exit 0(표준 master 상태 = 수렴)
   RO) read-only 계약: 실행 전후 HOME 트리 파일 집합 불변(영속 쓰기 0 — 정본 이원화 금지)
 """
@@ -125,6 +127,9 @@ check("A3 스키마: daemon_alive/master_seat/team_state",
       and d0.get("team_state") == "complete", json.dumps(d0, ensure_ascii=False))
 check("A4 ceo 축: state=ceo·promoted", (data.get("ceo") or {}).get("state") == "ceo"
       and (data.get("ceo") or {}).get("promoted") is True)
+check("A5 daemon_probe: 생존 시 None(SF-3)", d0.get("daemon_probe") is None
+      and (data.get("ceo") or {}).get("daemon_probe") is None,
+      "d0=%r ceo=%r" % (d0.get("daemon_probe"), (data.get("ceo") or {}).get("daemon_probe")))
 check("A-RO read-only(영속 쓰기 0 — HOME 트리 불변)", before == after,
       "diff=%r" % sorted(after ^ before))
 shutil.rmtree(tmp)
@@ -161,6 +166,8 @@ check("D1 데몬 사망 미수렴 exit 1", code == 1, "exit=%d" % code)
 check("D2 daemon_alive=false·team_state=unknown",
       d0.get("daemon_alive") is False and d0.get("team_state") == "unknown",
       json.dumps(d0, ensure_ascii=False))
+check("D3 daemon_probe 실패 사유 병기(SF-3: 사망=exit-1 — cys 부재와 구분)",
+      d0.get("daemon_probe") == "exit-1", "probe=%r" % d0.get("daemon_probe"))
 shutil.rmtree(tmp)
 
 # ── E. 부서 0 + 미승격 = 표준 master 상태 → 수렴 ──

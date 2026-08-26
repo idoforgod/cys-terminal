@@ -13,6 +13,11 @@
   6) 조건 미충족(부서 0) → no-op
   7) ★T10(DCE-3): CEO_TEMPLATE 이 MASTER_DIRECTIVE 상위집합이 아니면(스텁 주입) 승격 보류 —
      무교체·PENDING 유지·loud (반쪽마스터 재발 차단 — 스왑 직전 런타임 검사)
+  8) ★MF-1(P3 수정 라운드): 교차버전 형상(팩 업데이트 md=v2·낡은 .pre-ceo=v1) — OR-포함
+     (ceo ⊇ md)로 승격 통과·.pre-ceo 무접촉 / 스텁은 여전히 보류(차단 강도 불변)
+  9) ★SF-1: 오너 지명(consented) 경로의 superset 보류는 PENDING 신규 생성 금지
+     (지명 1회성 실패가 상시 자동승격 예약으로 확폭되는 것 차단 — 기존 PENDING 유지는 7c)
+ 10) ★SF-2: CRLF 개행 드리프트만으로 false hold 금지(정규화 후 포함 판정=통과)
 (ceo_demote의 PENDING 청소는 down 경로 통합시험 영역 — 본 파일은 승격 축만.)
 
 ★픽스처 계약(T10): CEO 템플릿은 합성 계약(gen_ceo_template: 머리글+구분선+MASTER 전문 verbatim
@@ -189,6 +194,84 @@ check("7g 보류 feed 고지(비대기)", "CEO 승격 보류(템플릿 상위집
 code, out = run(env, "promote-ceo")
 check("7h 지명 경로 truthful exit 5(승격 미완 보고)", code == 5, "exit=%d" % code)
 check("7i 지명 경로도 무교체", md(home) == MASTER_BODY)
+shutil.rmtree(tmp)
+
+# ── 8. ★MF-1(P3 수정 라운드): 교차버전 형상 — md=v2·낡은 .pre-ceo=v1 → OR-포함으로 승격 통과 ──
+# 반쪽마스터 실사고의 수복 자기봉쇄 재현: 팩 업데이트가 md 를 새 표준(v2)으로 갱신했고 .pre-ceo 엔
+# 구 표준(v1)이 잔존. 종전 단일 ref 결박(.pre-ceo 존재=무조건 .pre-ceo 기준)이면 정상 v2 템플릿도
+# CEO(v2) ⊉ .pre-ceo(v1) 로 영구 보류됐다 — OR-포함(ceo ⊇ md)이 이 형상만 해소한다.
+tmp = tempfile.mkdtemp(prefix="ceo-t8-")
+env, home = setup(tmp)
+mdp, pre, pend, marker = paths(home)
+V2_BODY = "STANDARD-MASTER-V2\n"
+CEO_V2 = "CEO-HEADER\n---\n" + V2_BODY
+_dirs = os.path.join(home, ".cys", "pack", "directives")
+with open(mdp, "w", encoding="utf-8") as f:
+    f.write(V2_BODY)                                # 팩 업데이트: md=새 표준 v2
+with open(pre, "w", encoding="utf-8") as f:
+    f.write(MASTER_BODY)                            # 낡은 백업: .pre-ceo=구 표준 v1
+with open(os.path.join(_dirs, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+    f.write(CEO_V2)                                 # 정상 템플릿(v2 합성)
+with open(marker, "w", encoding="utf-8") as f:
+    f.write("{}")
+os.makedirs(os.path.dirname(pend), exist_ok=True)
+with open(pend, "w", encoding="utf-8") as f:
+    f.write("pending\n")
+code, out = run(env, "promote-if-pending")
+check("8a 교차버전 승격 통과(OR-포함: ceo ⊇ md)", code == 0 and md(home) == CEO_V2,
+      "exit=%d md=%r %s" % (code, md(home)[:40], out[-200:]))
+check("8b 낡은 .pre-ceo 무접촉(백업 덮어쓰기 금지)",
+      open(pre, encoding="utf-8").read() == MASTER_BODY)
+check("8c PENDING 해소", not os.path.exists(pend))
+# 차단 강도 불변: 같은 교차버전 형상에서 스텁은 md·.pre-ceo 둘 다 미포함 = 여전히 보류.
+with open(mdp, "w", encoding="utf-8") as f:
+    f.write(V2_BODY)
+with open(os.path.join(_dirs, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+    f.write("CEO-STUB\n")
+with open(pend, "w", encoding="utf-8") as f:
+    f.write("pending\n")
+code, out = run(env, "promote-if-pending")
+check("8d 스텁은 여전히 보류(차단 강도 불변)",
+      code == 0 and md(home) == V2_BODY and os.path.exists(pend),
+      "exit=%d %s" % (code, out[-200:]))
+shutil.rmtree(tmp)
+
+# ── 9. ★SF-1: 지명(consented) 경로의 superset 보류 = PENDING 신규 생성 금지 ──
+# 계약 문면은 'PENDING 유지'다 — 오너 지명 1회성 경로의 보류가 상시 자동승격 예약(집행 틱이
+# 템플릿 수리 후 무제스처 승격)을 '신설'하면 확폭이다. 기존 PENDING 유지는 7c 가 핀.
+tmp = tempfile.mkdtemp(prefix="ceo-t9-")
+env, home = setup(tmp)
+mdp, pre, pend, marker = paths(home)
+with open(os.path.join(home, ".cys", "pack", "directives", "CEO_TEMPLATE.md"),
+          "w", encoding="utf-8") as f:
+    f.write("CEO-STUB\n")
+with open(marker, "w", encoding="utf-8") as f:
+    f.write("{}")
+code, out = run(env, "promote-ceo")                 # PENDING 부재 상태에서 지명 → 보류
+check("9a 지명 보류 truthful exit 5", code == 5, "exit=%d" % code)
+check("9b PENDING 신규 생성 금지(자동승격 예약 확폭 차단)", not os.path.exists(pend))
+check("9c 무교체", md(home) == MASTER_BODY)
+shutil.rmtree(tmp)
+
+# ── 10. ★SF-2: CRLF 개행 드리프트 = false hold 아님(정규화 후 포함 판정) ──
+tmp = tempfile.mkdtemp(prefix="ceo-t10-")
+env, home = setup(tmp)
+mdp, pre, pend, marker = paths(home)
+CEO_CRLF = "CEO-HEADER\r\n---\r\n" + MASTER_BODY.replace("\n", "\r\n")
+with open(os.path.join(home, ".cys", "pack", "directives", "CEO_TEMPLATE.md"),
+          "w", encoding="utf-8", newline="") as f:
+    f.write(CEO_CRLF)                               # Windows 체크아웃/에디터 변환 재현
+with open(marker, "w", encoding="utf-8") as f:
+    f.write("{}")
+os.makedirs(os.path.dirname(pend), exist_ok=True)
+with open(pend, "w", encoding="utf-8") as f:
+    f.write("pending\n")
+code, out = run(env, "promote-if-pending")
+_md_raw = open(mdp, "rb").read()
+check("10a CRLF 드리프트 통과(정규화 후 ⊇ = 승격)",
+      code == 0 and _md_raw == CEO_CRLF.encode("utf-8"),
+      "exit=%d md=%r %s" % (code, _md_raw[:40], out[-200:]))
+check("10b PENDING 해소", not os.path.exists(pend))
 shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
