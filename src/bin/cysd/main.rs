@@ -42,6 +42,127 @@ type Stream = Box<dyn AsyncReadWrite>;
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+// ═══ 업데이트 잔해(.prev*) 회수 — 판정·행동 규칙 (P1b · Windows 전용 · 회귀 핀 대상) ═══
+//
+// 생성원은 설치기 두 곳뿐이다(src-tauri/nsis-hooks.nsh):
+//   ① CYS_SWAP_IN_PLACE(:130-141)  — `<bin>.prev.exe` · `.prev2.exe` · `.prev3.exe` 고정 3칸 체인
+//   ② unlock-sweep.ps1(:355-371)   — `<원본이름>.prev<rand>` (rand = Get-Random -Maximum 99999)
+// 둘 다 "잠긴 파일을 죽이는 대신 이름을 비우는" 무중단 업데이트의 부산물이고, 그 뒷정리는
+// **새 cysd 기동**이 진다(nsis-hooks.nsh L6).
+//
+// ★2026-08-26 T4-6 회귀에서 드러난 종전 설계의 결손:
+//   삭제(remove_file)는 **매핑된 PE 이미지에 대해 반드시 실패**한다. 종전 코드는 그 실패를
+//   무음 스킵했으므로("다음 기동이 마저 청소한다"), 홀더가 살아있는 한 잔해가 runtime 트리에
+//   영구히 남고 스윕의 사후 상태가 비결정적이었다. 이 수리는 **삭제 실패를 무시하지 않고**
+//   같은 볼륨 격리함으로 rename 해 완결시킨다 — 매핑된 이미지는 삭제는 거부돼도 **rename 은
+//   허용**된다(설치기 unlock-sweep 이 이미 의존하는 Windows 특성이고, 매핑은 경로가 아니라
+//   파일 오브젝트에 걸리므로 홀더 프로세스는 아무 영향을 받지 않는다).
+//   ⇒ 사후 불변식: "부트 후 설치 트리(격리함 제외)에 잔해 0" 이 홀더 생존 여부와 무관하게 성립.
+
+/// 삭제 불가(=아직 매핑 중) 잔해를 모아두는 **설치 루트 하위** 격리 디렉토리 이름.
+/// `runtime\` **밖**이어야 한다 — 격리의 목적이 runtime 트리를 결정론적으로 비우는 것이다.
+/// 설치기 unlock-sweep 은 루트 **최상위 파일**만 보므로(하위 디렉토리 미스캔) 격리본이 다시
+/// rename 대상이 되는 일도 없다.
+#[cfg(any(windows, test))]
+pub(crate) const UPDATE_TRASH_DIR: &str = ".cys-update-trash";
+
+/// 한 부트에서 격리할 수 있는 잔해 상한 — 병리적 트리에서 부트가 길어지지 않게 한다.
+#[cfg(any(windows, test))]
+pub(crate) const MAX_QUARANTINE_PER_BOOT: usize = 500;
+
+/// 업데이트 잔해 파일명 판정(순수 · 회귀 핀).
+///
+/// 종전 규칙은 `name.contains(".prev")` 였다 — `notes.preview.png` 같은 **사용자 파일**까지
+/// 삭제 대상으로 삼는 과대매칭이다. 청소가 실패하는 결함을 고치면서 **범위를 넓히는 대신
+/// 좁힌다**(오너 앵커 ④ — 살아있는 파일을 지우는 방향은 금지). 위 생성원 2종의 명명 규칙만
+/// 매칭한다: 마지막 `.prev` 뒤가 (숫자*) 또는 (숫자* + `.exe`) 인 경우.
+#[cfg(any(windows, test))]
+pub(crate) fn is_update_leftover(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some(i) = lower.rfind(".prev") else {
+        return false;
+    };
+    let tail = &lower[i + ".prev".len()..];
+    let digits_end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    let rest = &tail[digits_end..];
+    rest.is_empty() || rest == ".exe"
+}
+
+/// 격리본의 파일명(순수 · 회귀 핀). **결과 자체가 다시 `is_update_leftover` 를 만족해야 한다** —
+/// 홀더가 죽은 뒤 다음 부트의 스윕이 같은 규칙으로 집어 삭제하는 것이 회수의 마지막 단계다.
+/// `.prev<숫자>` 를 덧붙여 그 계약을 이름으로 강제한다(설치기 unlock-sweep 과 같은 형식).
+#[cfg(any(windows, test))]
+pub(crate) fn quarantine_file_name(orig: &str, stamp: u64, seq: usize) -> String {
+    format!("{orig}.prev{stamp}{seq:03}")
+}
+
+/// 스윕 계수 — 로그(침묵 금지)와 테스트 핀의 관측 지점.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepStats {
+    /// 삭제 성공(홀더 없음).
+    pub removed: usize,
+    /// 삭제 실패 → 격리함으로 rename 성공(홀더 생존 · runtime 트리에서는 사라짐).
+    pub quarantined: usize,
+    /// 삭제도 격리도 실패 — **유일하게 잔존하는 경우**. 반드시 loud 로그.
+    pub stuck: usize,
+}
+
+/// 설치 트리를 재귀 순회하며 업데이트 잔해를 회수한다(삭제 → 실패 시 격리).
+///
+/// `remove`·`relocate` 를 주입받는 이유는 Windows 전용 실패 분기(=매핑된 이미지 삭제 거부)를
+/// 다른 OS 의 단위 테스트에서 결정론으로 재현하기 위함이다(실기기 재현 불가 경로의 박제).
+/// 디렉토리는 삭제 대상이 아니다(설치기는 파일만 rename 한다) — 재귀만 한다.
+#[cfg(any(windows, test))]
+pub(crate) fn sweep_update_leftovers(
+    dir: &std::path::Path,
+    depth: u8,
+    trash: &std::path::Path,
+    stamp: u64,
+    remove: &mut dyn FnMut(&std::path::Path) -> bool,
+    relocate: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> bool,
+    stats: &mut SweepStats,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // 권한·경로 문제로 못 읽는 서브트리는 종전과 동일하게 통째 skip
+    };
+    let in_trash = dir == trash;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            sweep_update_leftovers(&p, depth - 1, trash, stamp, remove, relocate, stats);
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_update_leftover(name) {
+            continue;
+        }
+        if remove(&p) {
+            stats.removed += 1;
+            continue;
+        }
+        // 격리함 **안**에서는 재격리하지 않는다(무한 이동 차단) — 여기 남은 것은 여전히 매핑 중이며
+        // 이미 runtime 트리 밖이므로 다음 부트를 기다리면 된다.
+        if in_trash || stats.quarantined >= MAX_QUARANTINE_PER_BOOT {
+            stats.stuck += 1;
+            continue;
+        }
+        let dest = trash.join(quarantine_file_name(name, stamp, stats.quarantined));
+        if relocate(&p, &dest) {
+            stats.quarantined += 1;
+        } else {
+            stats.stuck += 1;
+        }
+    }
+}
+
 /// Claude Code 세션 안에서 spawn된 데몬이 그 세션의 정체성 env를 PTY 자식들에게
 /// 물려주면, pane의 claude가 **child-session 모드**(부모 세션 종속)로 동작해 트랜스크립트
 /// .jsonl을 영속하지 않는다 — 복원(restore)·recall·사용량 관측(T5)이 전부 깨진다
@@ -153,34 +274,44 @@ async fn async_main() {
     // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
     // <이름>.prev*(cysd/cys 고정 체인 + unlock-sweep의 <이름>.prev<rand> — msys-2.0.dll 등 세션이
-    // 로드한 runtime 이미지)로 밀어두므로, 새 cysd 기동 시 설치 트리를 재귀 순회하며 이름에
-    // ".prev"가 든 파일을 best-effort 삭제한다. lame-duck이 아직 점유 중이면 실패가 정상 —
-    // 조용히 스킵하고 다음 기동이 마저 청소한다(fail-open · 세션 보존 우선). 깊이 상한 12.
+    // 로드한 runtime 이미지)로 밀어두므로, 새 cysd 기동 시 설치 트리를 재귀 순회하며 잔해를
+    // 회수한다. 삭제가 실패하는 경우(=아직 살아있는 홀더가 이미지로 매핑 중)의 처리는
+    // sweep_update_leftovers 주석 참조 — **격리(rename)로 완결**한다. 깊이 상한 12.
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            fn sweep_prev(dir: &std::path::Path, depth: u8) {
-                if depth == 0 {
-                    return;
-                }
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    return;
-                };
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        sweep_prev(&p, depth - 1);
-                    } else if p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.contains(".prev"))
-                        && std::fs::remove_file(&p).is_ok()
-                    {
-                        eprintln!("[cysd] stale update leftover removed: {}", p.display());
-                    }
-                }
+            let trash = dir.join(UPDATE_TRASH_DIR);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut stats = SweepStats::default();
+            let mut remove = |p: &std::path::Path| std::fs::remove_file(p).is_ok();
+            let mut relocate = |src: &std::path::Path, dest: &std::path::Path| {
+                dest.parent()
+                    .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                    && std::fs::rename(src, dest).is_ok()
+            };
+            sweep_update_leftovers(dir, 12, &trash, stamp, &mut remove, &mut relocate, &mut stats);
+            // 격리함이 비었으면 흔적을 남기지 않는다(빈 디렉토리 제거 — 비어있지 않으면 실패=no-op).
+            let _ = std::fs::remove_dir(&trash);
+            if stats.removed + stats.quarantined + stats.stuck > 0 {
+                eprintln!(
+                    "[cysd] update leftovers: removed={} quarantined={} stuck={} (trash={})",
+                    stats.removed,
+                    stats.quarantined,
+                    stats.stuck,
+                    trash.display()
+                );
             }
-            sweep_prev(dir, 12);
+            // ★침묵 금지: 삭제도 격리도 실패한 잔해는 **소리내어** 남긴다. 종전 코드는 삭제 실패를
+            // 무음 스킵해 "청소가 됐는지"를 로그만으로 판정할 수 없었다(이번 T4-6 진단 난항의 원인).
+            if stats.stuck > 0 {
+                eprintln!(
+                    "[cysd] ⚠ 업데이트 잔해 {}개 회수 불가(삭제·격리 모두 실패) — 다음 기동이 재시도한다",
+                    stats.stuck
+                );
+            }
         }
     }
     // ★G34(W3) 데몬측 (소켓,팩) 정합 검사 — 이 데몬이 어떤 레인을 어떤 팩으로 서빙하는지 **기동
@@ -3300,5 +3431,222 @@ mod first_line_idle_tests {
             .unwrap();
         assert!(got > 0 && second.contains("\"ok\":true"), "유휴 뒤 왕복 실패: {second}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 업데이트 잔해(.prev*) 회수 회귀 핀 — Windows 전용 경로의 **로직**을 다른 OS 에서 박제한다.
+//
+// 실기기(Windows) 재현이 불가능한 축은 "매핑된 PE 이미지의 삭제 거부" 하나뿐이라, 그 축만
+// remove 클로저의 반환값으로 주입하고 나머지(판정 규칙·재귀·격리 대상 선정·깊이 상한·
+// 격리함 내부 재격리 금지)는 실제 파일시스템으로 검증한다.
+//   근거: T4-6 FAIL(run 32976498890 · 2026-08-26 · 잔존 9개) — 재설치 순간 살아있던 홀더가
+//   runtime\*.exe|dll 을 매핑 중이라 remove_file 이 전건 실패했고, 종전 코드는 그 실패를
+//   무음 스킵해 잔해가 runtime 트리에 그대로 남았다.
+// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod update_leftover_sweep_tests {
+    use super::{
+        is_update_leftover, quarantine_file_name, sweep_update_leftovers, SweepStats,
+        UPDATE_TRASH_DIR,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn workdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cys-prevsweep-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn real_remove(p: &Path) -> bool {
+        std::fs::remove_file(p).is_ok()
+    }
+
+    fn real_relocate(src: &Path, dest: &Path) -> bool {
+        dest.parent()
+            .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::rename(src, dest).is_ok()
+    }
+
+    /// ① 판정 규칙 — 설치기가 만드는 두 형식만 잔해다. 사용자 파일(`*.preview.*`)은 **불가침**.
+    #[test]
+    fn leftover_rule_matches_installer_forms_only() {
+        // CYS_SWAP_IN_PLACE 3칸 체인 (nsis-hooks.nsh:130-141)
+        for n in ["cysd.prev.exe", "cys.prev2.exe", "cysd.prev3.exe", "CYSD.PREV.EXE"] {
+            assert!(is_update_leftover(n), "체인 잔해를 놓쳤다: {n}");
+        }
+        // unlock-sweep 의 <원본이름>.prev<rand> (nsis-hooks.nsh:355-371)
+        for n in [
+            "msys-2.0.dll.prev4213",
+            "bash.exe.prev0",
+            "python313.dll.prev99999",
+            "vcruntime140.dll.prev",
+        ] {
+            assert!(is_update_leftover(n), "unlock-sweep 잔해를 놓쳤다: {n}");
+        }
+        // 과대매칭 금지 — 종전 `contains(".prev")` 는 아래를 전부 삭제했다.
+        for n in [
+            "notes.preview.png",
+            "release.previous.json",
+            "prev.exe",
+            "cysd.prev.exe.bak",
+            "readme.md",
+        ] {
+            assert!(!is_update_leftover(n), "살아있는 파일을 잔해로 오판했다: {n}");
+        }
+    }
+
+    /// ② 격리본의 이름은 **다시 잔해로 판정**돼야 한다 — 다음 부트가 마저 지우는 유일한 기전.
+    #[test]
+    fn quarantined_name_is_itself_a_leftover() {
+        for n in ["msys-2.0.dll.prev4213", "cysd.prev.exe", "bash.exe.prev0"] {
+            let q = quarantine_file_name(n, 1_756_200_000, 7);
+            assert!(
+                is_update_leftover(&q),
+                "격리본이 다음 스윕에서 회수 불가 이름이 됐다: {n} → {q}"
+            );
+        }
+    }
+
+    /// ③ 정상 경로 — 잔해는 삭제되고 살아있는 파일은 그대로. 디렉토리는 삭제 대상이 아니다.
+    #[test]
+    fn sweep_removes_leftovers_and_spares_live_files() {
+        let root = workdir("plain");
+        touch(&root.join("cysd.prev.exe"));
+        touch(&root.join("cysd.exe"));
+        touch(&root.join("runtime/git/usr/bin/bash.exe"));
+        touch(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"));
+        touch(&root.join("runtime/python/notes.preview.png"));
+        std::fs::create_dir_all(root.join("runtime/x.prev12")).unwrap(); // 디렉토리는 무접촉
+
+        let mut stats = SweepStats::default();
+        sweep_update_leftovers(
+            &root,
+            12,
+            &root.join(UPDATE_TRASH_DIR),
+            1,
+            &mut real_remove,
+            &mut real_relocate,
+            &mut stats,
+        );
+
+        assert_eq!(stats, SweepStats { removed: 2, quarantined: 0, stuck: 0 }, "계수 불일치");
+        assert!(!root.join("cysd.prev.exe").exists());
+        assert!(!root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213").exists());
+        assert!(root.join("cysd.exe").exists(), "살아있는 바이너리를 지웠다");
+        assert!(root.join("runtime/git/usr/bin/bash.exe").exists(), "살아있는 바이너리를 지웠다");
+        assert!(root.join("runtime/python/notes.preview.png").exists(), "사용자 파일을 지웠다");
+        assert!(root.join("runtime/x.prev12").is_dir(), "디렉토리를 건드렸다");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ④ ★T4-6 회귀의 본체 — 삭제가 전건 실패(=홀더 생존)해도 **runtime 트리는 비어야 한다**.
+    ///    종전 구현은 여기서 무음 스킵했고, 그 결과가 `잔존 9개` FAIL 이었다.
+    #[test]
+    fn sweep_quarantines_when_delete_fails_so_runtime_tree_is_empty() {
+        let root = workdir("locked");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        touch(&root.join("cysd.prev.exe"));
+        touch(&root.join("runtime/git/usr/bin/bash.exe.prev777"));
+        touch(&root.join("runtime/python/python313.dll.prev12"));
+
+        let mut stats = SweepStats::default();
+        let mut never_removes = |_: &Path| false; // 매핑된 이미지 = 삭제 거부
+        sweep_update_leftovers(
+            &root,
+            12,
+            &trash,
+            1_756_200_000,
+            &mut never_removes,
+            &mut real_relocate,
+            &mut stats,
+        );
+
+        assert_eq!(stats, SweepStats { removed: 0, quarantined: 3, stuck: 0 });
+        // T4-6 이 세는 바로 그 값 = runtime\ 재귀 잔해 수. 격리 후에는 0 이어야 한다.
+        let rt_left = walk(&root.join("runtime"))
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_update_leftover)
+            })
+            .count();
+        assert_eq!(rt_left, 0, "runtime 트리에 잔해가 남았다(T4-6 FAIL 재현)");
+        assert!(!root.join("cysd.prev.exe").exists(), "루트 체인 잔해가 남았다");
+        assert_eq!(walk(&trash).len(), 3, "격리함에 3건이 모여야 한다");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑤ 격리함 안에서는 재격리하지 않는다(무한 이동·이름 폭주 차단) — 여전히 잠긴 격리본은 stuck.
+    #[test]
+    fn sweep_never_requarantines_inside_trash() {
+        let root = workdir("trash");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        touch(&trash.join("msys-2.0.dll.prev4213.prev1756200000000"));
+
+        let mut stats = SweepStats::default();
+        let mut never_removes = |_: &Path| false;
+        let mut relocate_must_not_run = |_: &Path, _: &Path| {
+            panic!("격리함 안의 파일을 다시 격리하려 했다");
+        };
+        sweep_update_leftovers(
+            &root,
+            12,
+            &trash,
+            1,
+            &mut never_removes,
+            &mut relocate_must_not_run,
+            &mut stats,
+        );
+        assert_eq!(stats, SweepStats { removed: 0, quarantined: 0, stuck: 1 });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑥ 깊이 상한 — 상한 밖 서브트리는 이번 부트에서 손대지 않는다(종전 계약 보존).
+    #[test]
+    fn sweep_respects_depth_cap() {
+        let root = workdir("depth");
+        touch(&root.join("a/b/deep.prev1"));
+
+        let mut stats = SweepStats::default();
+        sweep_update_leftovers(
+            &root,
+            2, // root(1) → a(2) 까지만 — b 는 못 본다
+            &root.join(UPDATE_TRASH_DIR),
+            1,
+            &mut real_remove,
+            &mut real_relocate,
+            &mut stats,
+        );
+        assert_eq!(stats, SweepStats::default(), "깊이 상한을 넘어 순회했다");
+        assert!(root.join("a/b/deep.prev1").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 }
