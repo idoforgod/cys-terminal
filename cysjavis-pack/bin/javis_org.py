@@ -3,6 +3,7 @@
 설계: multi-master-ceo/2026-06-26-org-provisioning-design.md (v2)
 하우스스타일: javis_manifest.py (--self-test 밀폐 검증)
 exit: 0=성공 1=위반/실패 2=입출력 3=권한(CSO아님) 4=대상없음
+(org-audit 동사: 0=수렴 1=미수렴 2=입출력 — read-only 파생 집계·영속 0 · T10/P3-3)
 """
 import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil
 
@@ -249,6 +250,156 @@ def cmd_status(path=None):
     ok = all(r["intake"] for r in rows) if rows else False
     print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows}, ensure_ascii=False))
     return 0 if ok else 1
+
+# ── ★T10(P3-3 최소안) org-audit — pack-only **read-only** 파생 집계 ─────────────────────────
+# 정본 이원화 금지(R3 corrected (b)안): 이미 9갈래 부분 진실(depts.json·topology·org.status·
+# formation 상태파일·티켓·레인 마커·ceo-pending/.pre-ceo/영수증·묘비 쌍·fallback map)이 있고
+# 복원 리바이버(spawn_org_restore)는 depts.json 에 결박돼 있다 — 신설 영속 정본(org-state.json)은
+# 10번째 갈래+복원 이원화라 기각. 이 동사는 **매번 파생 계산**만 하고(영속 쓰기 0) 판정을
+# exit code(0=수렴/1=미수렴/2=입출력)로 낸다. 기존 cmd_status 의 exit 계약(집계=intake 축)은
+# 무접촉 보존 — org-audit 는 편제(편성·승격) 축의 별도 동사다.
+# ★라이브 관측 우선 규약(P3-3 결합 4행): formation 상태파일은 '전이 감지용 캐시'다 — 여기서는
+#   updated_epoch 를 붙인 참고 필드(formation_cache)로만 노출하고, 판정(team_state)은 데몬
+#   org.status(cys status --json) 라이브 관측으로만 한다(캐시를 실시간 사실로 승격 인용 금지).
+
+def _audit_formation_mod():
+    """형제 모듈 javis_formation 로드(REQUIRED_ROLES SOT·캐시 판독기 재사용) — 실패=None(폴백)."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import javis_formation
+        return javis_formation
+    except Exception:
+        return None
+
+def _audit_daemon_status(socket=None):
+    """데몬 org.status 회수(`cys status --json` = org.status RPC) — read-only·autostart 금지.
+    socket=None 은 base(부서 레인에서 실행돼도 CYS_SOCKET 스크럽으로 base 데몬만 본다)."""
+    env = {**os.environ, "CYS_NO_AUTOSTART": "1"}
+    if socket is None:
+        env.pop("CYS_SOCKET", None)
+        cmd = ["cys", "status", "--json"]
+    else:
+        cmd = ["cys", "--socket", socket, "status", "--json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def _audit_seat(surfaces, role):
+    """역할 좌석 관측: agent(부착) / empty_shell(좌석만) / absent. agent '존재'를 쓴다 —
+    부팅 중(미seen) 노드를 결원으로 오판하지 않는 보수 판정(dept_classify_idle 선례)."""
+    for s in surfaces:
+        if s.get("exited"):
+            continue
+        if (s.get("role") or "") != role:
+            continue
+        return "agent" if s.get("agent") is not None else "empty_shell"
+    return "absent"
+
+def _audit_ticket_state(name):
+    """티켓 대장 관측(정보 전용 — 오너 결정 ⑩B: 상비편성이 admission 정본·티켓은 수동 선언
+    레인 전용이라 수렴 판정에 **불참**)."""
+    d = os.path.join(HOME, ".cys", "state", "dept-boot-tickets")
+    if os.path.exists(os.path.join(d, name + ".ticket")):
+        return "present"
+    if os.path.exists(os.path.join(d, name + ".ticket.used")):
+        return "used"
+    return "none"
+
+def _audit_ceo_axis(dept_count):
+    """CEO 축 파생: 마커(부트·pending)·.pre-ceo·영수증·디렉티브 등가로 승격 상태를 계산.
+    수렴 = (부서 0 ∧ 미승격) 또는 (부서 ≥1 ∧ 승격 ∧ PENDING 없음 ∧ base 데몬 생존)."""
+    base_pack = os.path.join(HOME, ".cys", "pack")          # cys-dept PACK_DEFAULT 동일 규약
+    md = os.path.join(base_pack, "directives", "MASTER_DIRECTIVE.md")
+    ceo = os.path.join(base_pack, "directives", "CEO_TEMPLATE.md")
+    pre = md + ".pre-ceo"
+    receipt = os.path.join(base_pack, "directives", ".ceo-template-applied")
+    pending = os.path.join(HOME, ".cys", "state", "ceo-pending")
+    marker = os.path.join(HOME, ".cys", ".master-bootstrapped")
+    same = False
+    try:
+        with open(md, "rb") as a, open(ceo, "rb") as b:
+            same = a.read() == b.read()
+    except OSError:
+        same = False
+    promoted = os.path.exists(pre) or same   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
+    is_pending = os.path.exists(pending)
+    base_st = _audit_daemon_status(None)
+    base_alive = base_st is not None
+    if dept_count >= 1:
+        state = "ceo" if (promoted and not is_pending) else ("pending" if is_pending else "unpromoted")
+        conv = promoted and not is_pending and base_alive
+    else:
+        state = "demote-due" if promoted else "master"
+        conv = not promoted   # 부서 0 이면 base 데몬 생존은 편제 수렴 판정 밖(정보 필드로만)
+    return {"state": state, "promoted": promoted, "pending": is_pending,
+            "boot_marker": os.path.exists(marker), "receipt": os.path.exists(receipt),
+            "daemon_alive": base_alive, "dept_count": dept_count, "converged": conv}
+
+def cmd_org_audit():
+    """org-audit — {ceo, depts:{name:{daemon_alive, master_seat, team_state}}} 파생 출력.
+    exit 0=수렴 / 1=미수렴 / 2=입출력. 영속 쓰기 0 · 스폰 0 · read-only(역할 가드 불요)."""
+    try:
+        reg = load_json(DEPTS, {"depts": {}})
+    except Exception as e:
+        sys.stderr.write("[org-audit] depts.json 판독 실패: %s\n" % e)
+        return 2
+    fm = _audit_formation_mod()
+    required = list(getattr(fm, "REQUIRED_ROLES", None) or
+                    ("master", "cso", "worker", "reviewer-gemini", "reviewer-codex"))
+    external = set()
+    if fm is not None:
+        try:
+            external = set(fm._external_roles())
+        except Exception:
+            external = set()
+    need = [r for r in required if r not in external]
+    depts_out, all_ok = {}, True
+    for name, e in sorted((reg.get("depts") or {}).items()):
+        sock = (e or {}).get("socket") or ""
+        st = _audit_daemon_status(sock) if sock else None
+        alive = st is not None
+        surfaces = (st or {}).get("surfaces", [])
+        master_seat = _audit_seat(surfaces, "master") if alive else "unknown"
+        missing = [r for r in need if _audit_seat(surfaces, r) != "agent"] if alive else list(need)
+        if not alive:
+            team_state = "unknown"
+        elif not missing:
+            team_state = "complete"
+        elif len(missing) == len(need):
+            team_state = "empty"
+        else:
+            team_state = "partial"
+        cache = {}
+        if fm is not None and sock:
+            try:
+                obj = fm._read_state_obj(sock)
+                if obj:
+                    cache = {"state": obj.get("state"),
+                             "updated_epoch": obj.get("updated_epoch")}
+            except Exception:
+                cache = {}
+        conv = alive and master_seat == "agent" and team_state == "complete"
+        all_ok = all_ok and conv
+        depts_out[name] = {"daemon_alive": alive, "master_seat": master_seat,
+                           "team_state": team_state, "missing": missing,
+                           "ticket": _audit_ticket_state(name),
+                           "formation_cache": cache,   # 참고 전용 — 판정은 라이브 관측(위)뿐
+                           "converged": conv}
+    ceo = _audit_ceo_axis(len(depts_out))
+    all_ok = all_ok and ceo["converged"]
+    print(json.dumps({"audit": "converged" if all_ok else "unconverged",
+                      "ceo": ceo, "depts": depts_out}, ensure_ascii=False, indent=1))
+    return 0 if all_ok else 1
 
 def tar_snapshot(key, workdir, dest_dir=None):
     """--purge-workdir 의무 선행. 성공 시 경로 반환, 실패(소스 없음·예외) 시 None → 호출자가 rm 중단."""
@@ -689,6 +840,8 @@ def main():
     a.add_argument("manifest")
     s = sub.add_parser("status", help="부서 착수확인 집계")
     s.add_argument("manifest", nargs="?")
+    sub.add_parser("org-audit",
+                   help="편제 read-only 파생 집계(0=수렴 1=미수렴 2=입출력 · 영속 0 — T10/P3-3)")
     d = sub.add_parser("destroy", help="부서 삭제 (CSO 전용)")
     d.add_argument("--dept"); d.add_argument("--all", action="store_true")
     d.add_argument("--purge", action="store_true")
@@ -701,6 +854,7 @@ def main():
     if args.cmd == "validate": return cmd_validate(args.manifest)
     if args.cmd == "apply": return cmd_apply(args.manifest)
     if args.cmd == "status": return cmd_status(args.manifest)
+    if args.cmd == "org-audit": return cmd_org_audit()
     if args.cmd == "destroy": return cmd_destroy(args)
     return 2
 

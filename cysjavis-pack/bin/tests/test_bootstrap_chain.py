@@ -7,6 +7,8 @@
   ⓑ check 스텁 "N회 실패 후 성공" 시퀀스에서 부트 성공 / 전부 실패 시 상한 내 종료(retry)
   ⓒ (hook 3상태는 test_session_start_hook.py — 본 파일 아님)
   ⓓ ⑦ 호출이 promote-if-pending --request-only(비대기 인자)로 기록됨
+  ⓔ ★T10: 부서 레인 ⑦도 신호 발사 — base 팩 cys-dept 대상 + 스크럽 env(CYS_SOCKET·
+     CYS_PACK_DIR·CYS_ACCOUNT_DIR 제거·CYS_NO_AUTOSTART=1) — 2s 절이 핀
 + 기본 매트릭스: happy path·preflight/ping/boot/claim 실패·assert-ready 3상태·롤백 불변식
   (마커·상태 파일 삭제 = 게이트 전부 현행 거동 복귀 — 부재=제약 없음).
 """
@@ -194,7 +196,45 @@ check("2g 티켓 1회성 소비(.used rename)",
       os.path.exists(os.path.join(home, ".cys", "state", "dept-boot-tickets",
                                   "dept-3.ticket.used")))
 check("2h 팀 기동이어도 base 마커 무접촉", not os.path.exists(marker_path(home)))
-check("2i 부서 컨텍스트 ⑦ 생략", "promote-if-pending" not in calls(tmp))
+# ★T10 계약 전환: 부서 레인 ⑦은 이제 '무조건 생략'이 아니라 **base 팩 cys-dept 로의 신호
+#   발사**다(request-only) — 이 픽스처는 base 팩(~/.cys/pack)이 없으므로 무발사(부재 생략)가
+#   정답이고, 신호 발사·env 스크럽 계약은 2s 절이 base 팩 스텁으로 핀한다.
+check("2i 부서 컨텍스트 ⑦ base 팩 부재 — 신호 무발사(부재 생략)",
+      "promote-if-pending" not in calls(tmp))
+shutil.rmtree(tmp)
+
+# ── 2s. ★T10(P3-2·R3-P03-2): 부서 레인 ⑦ 신호 발사 — base 팩 cys-dept + 스크럽 env ──
+# 계약: 대상=base 팩($HOME/.cys/pack/bin/cys-dept · 부서 팩 PACK 아님) · 인자=promote-if-pending
+# --request-only(무변조 신호) · env=CYS_SOCKET/CYS_PACK_DIR/CYS_ACCOUNT_DIR 스크럽 +
+# CYS_NO_AUTOSTART=1(base 데몬 사망 창의 autostart 가 부서 env 를 상속해 base 소켓에 부서 팩
+# 데몬을 띄우는 교차 오염 봉쇄 — R3-P03-2 치명 결함).
+tmp = tempfile.mkdtemp(prefix="boot-t2s-")
+dept_sock = os.path.join(tmp, "state", "cys-dept-dept-3", "cys.sock")
+env, home = make_env(tmp, socket=dept_sock, pack_dept="dept-3")
+env["CYS_ACCOUNT_DIR"] = "/should/be/scrubbed"   # 스크럽 검증용 오염값
+base_bin = os.path.join(home, ".cys", "pack", "bin")
+os.makedirs(base_bin, exist_ok=True)
+with open(os.path.join(base_bin, "cys-dept"), "w", encoding="utf-8", newline="\n") as f:
+    f.write("#!/bin/sh\n"
+            "echo \"base-dept $* sock=${CYS_SOCKET-unset} pack=${CYS_PACK_DIR-unset}"
+            " acct=${CYS_ACCOUNT_DIR-unset} noauto=${CYS_NO_AUTOSTART-unset}\""
+            " >> \"%s/calls.log\"\nexit 0\n" % tmp)
+os.chmod(os.path.join(base_bin, "cys-dept"), 0o755)
+env_base = dict(env)
+env_base.pop("CYS_SOCKET", None)
+run(env_base, "issue-ticket", "--dept", "dept-3")   # 팀 기동 경로 진입(⑦ 도달)용 티켓
+code, out, err = run(env)
+check("2s-a 티켓 有 부서 부트 exit 0", code == 0, "exit=%d err=%s" % (code, err[-200:]))
+sig = [l for l in calls(tmp).splitlines() if l.startswith("base-dept ")]
+check("2s-b ⑦ 신호 발사(base 팩 cys-dept · request-only)",
+      len(sig) == 1 and "promote-if-pending --request-only" in sig[0],
+      "sig=%r" % sig)
+line = sig[0] if sig else ""
+check("2s-c 스크럽: CYS_SOCKET 제거", "sock=unset" in line, line)
+check("2s-d 스크럽: CYS_PACK_DIR 제거", "pack=unset" in line, line)
+check("2s-e 스크럽: CYS_ACCOUNT_DIR 제거", "acct=unset" in line, line)
+check("2s-f autostart 봉쇄: CYS_NO_AUTOSTART=1", "noauto=1" in line, line)
+check("2s-g base 마커 무접촉 유지", not os.path.exists(marker_path(home)))
 shutil.rmtree(tmp)
 
 # ── 2w. windows pipe 이름도 base로 인정 ──

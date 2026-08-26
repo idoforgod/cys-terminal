@@ -17,7 +17,9 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
   ★exit 2 는 `cys ping` 1회 재확인으로 '데몬 소실'(즉시 이탈)과 '일시 실패/팩 결손 가능성'
   (창 내 계속·별도 상한)을 실측 분리한다 — W-A3)
                                                           ⑥ 완료 마커 write
-  ⑦ cys-dept promote-if-pending --request-only (비대기 — 부트와 승격 동의의 분리)
+  ⑦ cys-dept promote-if-pending --request-only (비대기 — 부트와 승격 동의의 분리.
+  ★T10: 부서 레인도 **신호만** 발사한다 — base 팩 cys-dept 를 CYS_NO_AUTOSTART=1 +
+  CYS_SOCKET·CYS_PACK_DIR·CYS_ACCOUNT_DIR 스크럽 env 로 호출. 집행은 base 스케줄 틱)
   ⑧ 기계 요약 JSON 출력 (master는 이것을 인용해 보고한다)
 
 완료 마커 ~/.cys/.master-bootstrapped 는 base 데몬 전용 단일-writer 마커다:
@@ -517,11 +519,13 @@ def _progress(msg):
         pass
 
 
-def _run(cmd, timeout=120):
-    """서브프로세스 실행 — (exit, stdout+stderr 병합 텍스트). shell 미사용(경로 quoting 안전)."""
+def _run(cmd, timeout=120, env=None):
+    """서브프로세스 실행 — (exit, stdout+stderr 병합 텍스트). shell 미사용(경로 quoting 안전).
+    env=None 이면 상속(종전 계약 그대로) — 명시 dict 는 ⑦ 부서 레인 신호처럼 스크럽이 계약인
+    호출부 전용(additive · 기존 호출자 무영향)."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", env=env)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except FileNotFoundError:
         return 127, "명령 없음: %s" % cmd[0]
@@ -2982,7 +2986,35 @@ def _cmd_run_chain(log):
         else:
             log.step(STEP.PROMOTE_REQUEST, 0, "cys-dept 부재 — 생략")
     else:
-        log.step(STEP.PROMOTE_REQUEST, 0, "부서 컨텍스트 — 생략")
+        # ★T10(P3-2·R3-P03-2): 부서 레인 ⑦ '무조건 생략'을 **신호 발사**로 교체 — 부트와 승격
+        #   동의의 분리는 유지한 채(--request-only 는 무변조·알림뿐), 실제 승격(대기형 집행)은
+        #   base 데몬의 스케줄 틱(role-less)이 담당한다(신호/집행 분리 — cys-dept 승격 조건 3중·
+        #   부트마커 게이트·단일소유 가드·A11 dedupe 전부 무접촉). 게이트 파일 3종(CEO_PENDING·
+        #   BOOT_MARKER·REG)은 $HOME 절대경로라 부서 레인 실행도 base 상태를 그대로 읽고,
+        #   --request-only 는 단일소유 가드 면제(cys-dept 실측)라 부서 master 세션 호출이 통과한다.
+        # ★env 계약(R3-P03-2 치명 결함 봉합): 이 지점의 PACK 은 **부서 팩**이므로 대상 스크립트는
+        #   base 팩($HOME/.cys/pack — cys-dept:PACK_DEFAULT 동일 규약)에서 명시 해석하고,
+        #   ⓐ CYS_NO_AUTOSTART=1 — base 데몬이 죽어 있는 창에서 cys 클라이언트 autostart 가
+        #     부서 env(CYS_PACK_DIR=pack-dept-N)를 상속한 cysd 를 base 소켓에 띄우면 격리·스케줄·
+        #     ACL 교차 오염(ensure_daemon_lane_pack 은 base 소켓 방향 무가드). base 사망 중 신호
+        #     유실은 설계상 흡수 — 집행자(base 스케줄 틱)가 base 부활 시 자가 치유한다.
+        #   ⓑ CYS_SOCKET·CYS_PACK_DIR·CYS_ACCOUNT_DIR 스크럽 — 자식 체인 전체가 base 컨텍스트로만
+        #     붙게 한다(이중 방어 — cys-dept 내부 env -u CYS_SOCKET 과 별개 층).
+        #   best-effort·fail-open(비0 이어도 부트 성공 무관 — base 분기와 동일 규약).
+        base_dept = os.path.join(os.path.expanduser("~"), ".cys", "pack", "bin", "cys-dept")
+        if os.path.isfile(base_dept):
+            _sig_env = dict(os.environ)
+            for _k in ("CYS_SOCKET", "CYS_PACK_DIR", "CYS_ACCOUNT_DIR"):
+                _sig_env.pop(_k, None)
+            _sig_env["CYS_NO_AUTOSTART"] = "1"
+            code, out = _run(["bash", base_dept, "promote-if-pending", "--request-only"],
+                             timeout=30, env=_sig_env)
+            log.step(STEP.PROMOTE_REQUEST, code,
+                     "부서 레인 신호 발사(request-only · env 스크럽: -CYS_SOCKET -CYS_PACK_DIR "
+                     "-CYS_ACCOUNT_DIR +CYS_NO_AUTOSTART=1) — %s" % out)
+        else:
+            log.step(STEP.PROMOTE_REQUEST, 0,
+                     "base 팩 cys-dept 부재 — 신호 생략(집행 틱이 base 부활 시 자가 치유)")
 
     # ⑧ 기계 요약 — master는 이 JSON을 인용해 '기동 완료'를 보고한다(다른 근거 인용 금지)
     summary = {"ok": True, "marker": marker_note,

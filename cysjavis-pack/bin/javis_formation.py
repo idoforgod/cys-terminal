@@ -667,7 +667,11 @@ def _write_state(socket, state, detail, roles_booted, attempts=None):
         sys.stderr.write("[formation] WARN: 상태 dir 생성 실패(%s) — 상태·시도 원장 미영속\n" % e)
         return None
     path = os.path.join(root, _sanitize_key(socket) + ".json")
-    obj = {"state": state, "kind": state_kind(state), "socket": socket or "",
+    # ★P3-3(T10): "_doc" = 두-갈래 오인 차단의 기계 표기 — 이 파일은 전이 감지·시도 원장용
+    #   **파생 캐시**이지 복원 정본이 아니다(정본=depts.json · 복원 리바이버 결박처). 소비자
+    #   (org-audit 등)는 라이브 관측을 우선하고 이 파일은 updated_epoch 붙은 참고로만 쓴다.
+    obj = {"_doc": "파생 캐시 — 복원 정본 아님(정본=depts.json)",
+           "state": state, "kind": state_kind(state), "socket": socket or "",
            "detail": detail, "roles_booted": sorted(roles_booted),
            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "updated_epoch": time.time()}

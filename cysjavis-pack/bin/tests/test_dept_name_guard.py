@@ -28,6 +28,10 @@ import os
 import subprocess
 import sys
 import tempfile
+
+# ★T10(DCE-3) 픽스처 계약: CEO 템플릿 = MASTER 전문의 상위집합(합성 계약 동형) — 스왑 직전
+#   런타임 상위집합 검사를 통과해야 승격 계열 테스트가 승격 상태에 도달한다.
+CEO_BODY = "CEO-HEADER\n---\nSTANDARD-MASTER\n"
 import time
 import unittest
 
@@ -123,13 +127,16 @@ class Base(unittest.TestCase):
         self.assertNotIn(name, read_reg(self.env), "거부됐는데 레지스트리 등재(%s)" % name)
 
     def _seed_promotable(self, ndepts=1):
-        """승격 가능 상태 시드: 디렉티브 쌍 + 부트 마커 + 부서 n개(승격·강등·A11 계열 공용)."""
+        """승격 가능 상태 시드: 디렉티브 쌍 + 부트 마커 + 부서 n개(승격·강등·A11 계열 공용).
+        ★T10(DCE-3): CEO 템플릿은 합성 계약(머리글+구분선+MASTER 전문 verbatim)과 동형인
+        **상위집합**이어야 스왑 직전 런타임 검사를 통과한다(스텁 픽스처는 보류가 정답 —
+        test_ceo_pending_gate #7이 그 축을 핀)."""
         pack = os.path.join(self.home, ".cys", "pack", "directives")
         os.makedirs(pack, exist_ok=True)
         with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
             f.write("STANDARD-MASTER\n")
         with open(os.path.join(pack, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
-            f.write("CEO-TEMPLATE\n")
+            f.write(CEO_BODY)
         with open(os.path.join(self.home, ".cys", ".master-bootstrapped"), "w") as f:
             f.write("{}")
         write_reg(self.env, {("d%d" % i): {"socket": "", "pack_dir": ""}
@@ -352,7 +359,7 @@ class PromotionReceiptAndDemote(Base):
     def test_demote_missing_backup_alerts(self):
         pack = self._seed_promotable(ndepts=1)
         with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
-            f.write("CEO-TEMPLATE\n")   # 승격 표지(md==템플릿) — .pre-ceo는 없음(비가역 상태)
+            f.write(CEO_BODY)   # 승격 표지(md==템플릿) — .pre-ceo는 없음(비가역 상태)
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, "경보 경로가 teardown을 파괴(exit=%d)" % rc)
         self.assertIn("강등 불능", err, "무음 no-op 잔존 — stderr 경보 부재")

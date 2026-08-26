@@ -207,12 +207,34 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // ── ★T10(P3-2) 대기형 CEO 승격 집행 틱 — 신호(부트 ⑦ request-only)/집행 분리의 집행 레인 ──
+        // **신규 id 라 BUILTIN_JOBS_VERSION 범프 불요·금지**(R3-P03-3: 신규 id 는 버전 무관
+        // append — 범프하면 기존 builtin 이 코드 정의로 통째 교체돼 운영자 수기 편집이 무언 소실).
+        // 실행 주체 계약(P3-2 revised_design): 집행은 base 데몬 스케줄 틱의 **role-less** 주체 —
+        // cys-dept 단일소유 가드(roled 세션 대기형 exit 7)·승격 조건 3중(CEO_PENDING+BOOT_MARKER+
+        // 부서≥1)·부트마커 게이트·A11 dedupe 는 전부 cys-dept 내부 소관(무수정). `env -u CYS_ROLE`
+        // 은 roled pane 이 띄운 데몬의 env 상속까지 결정론 차단해 '틱=role-less 주체' 계약을
+        // 기계로 만든다(가드 완화가 아니라 지정 집행자의 신원 고정 — 가드 자체는 무접촉).
+        // 조건 미충족이면 no-op exit 0 멱등(폭주 축 아님 — 승격 자체도 파일 스왑 1회+flock 직렬화·
+        // 스폰 0). 대기형 안의 스왑 직전 상위집합 검사(DCE-3)가 스텁 템플릿 승격을 보류한다.
+        // base_only+fire() 관문: 부서 데몬에 복제 기록된 이 잡이 돌면 게이트 파일이 $HOME
+        // 절대경로라 부서에서도 성공해 base 와 동시 승격 시도(단일소유 위반)가 되므로 base
+        // 레인에서만 발화한다(R3-P03-3 — cys-dept 비경유 재기동은 seed_schedule 청소가 안 돈다).
+        json!({
+            "id": "ceo-promote-pending-tick",
+            "every_minutes": 10,
+            "action": "command",
+            "base_only": true,
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
+            "_builtin": "promote",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
     ]
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
-///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle") → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle"·"formation"·"promote") → 버전 상이 시 교체(갱신)·동버전 무접촉
 ///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
 /// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
 fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
@@ -1379,7 +1401,7 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 7개(phoenix2 + learn2 + cycle2 + formation1) 생성 → changed=true.
+        // 1차: built-in 8개(phoenix2 + learn2 + cycle2 + formation1 + promote1) 생성 → changed=true.
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
@@ -1397,10 +1419,15 @@ mod tests {
             ids.contains(&"formation-heartbeat"),
             "T9 P3-1 ⓑ 상비편성 심박 잡 생성"
         );
+        assert!(
+            ids.contains(&"ceo-promote-pending-tick"),
+            "T10 P3-2 대기형 승격 집행 틱 잡 생성"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 8, "사용자1 + built-in7");
+        assert_eq!(jobs.len(), 9, "사용자1 + built-in8");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080),
-        // cycle tick=매분(1), verifier watchdog=10분(10), formation heartbeat=10분(10).
+        // cycle tick=매분(1), verifier watchdog=10분(10), formation heartbeat=10분(10),
+        // ceo promote tick=10분(10).
         let period = |id: &str| {
             jobs.iter()
                 .find(|j| j["id"].as_str() == Some(id))
@@ -1413,6 +1440,7 @@ mod tests {
         assert_eq!(period("cycle-autopilot-tick"), Some(1), "cycle tick 매분");
         assert_eq!(period("cycle-verifier-watchdog"), Some(10), "verifier watchdog 10분");
         assert_eq!(period("formation-heartbeat"), Some(10), "formation heartbeat 10분");
+        assert_eq!(period("ceo-promote-pending-tick"), Some(10), "promote 집행 틱 10분");
         // ★T9(P3-1 ⓑ) 상비편성 심박 계약 핀: command 레인(매 틱 master stdin 무주입) ·
         //   base_only(부서 데몬 복제 실행 차단 — fire 관문과 쌍) · --force-surface 금지
         //   (주기 잡 스팸 계약 javis_formation._surface) · ensure 호출 실재.
@@ -1431,6 +1459,31 @@ mod tests {
             assert!(
                 !cmd.contains("--force-surface"),
                 "주기 잡에 --force-surface 금지(매 틱 토스트 스팸 계약)"
+            );
+        }
+        // ★T10(P3-2) 대기형 승격 집행 틱 계약 핀: command 레인(master stdin 무주입) ·
+        //   base_only(부서 데몬 복제 실행 = 동시 승격·단일소유 위반 차단 — fire 관문과 쌍) ·
+        //   role-less 주체(env -u CYS_ROLE — 단일소유 가드 무접촉의 기계 보장) ·
+        //   집행 레인이므로 --request-only(신호 레인 전용 인자) 금지.
+        {
+            let pt = jobs
+                .iter()
+                .find(|j| j["id"].as_str() == Some("ceo-promote-pending-tick"))
+                .unwrap();
+            assert_eq!(pt["action"].as_str(), Some("command"), "집행 틱은 command 레인 핀");
+            assert_eq!(pt["base_only"].as_bool(), Some(true), "집행 틱은 base_only 핀");
+            let cmd = pt["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("promote-if-pending"),
+                "집행 틱 command 에 promote-if-pending 부재"
+            );
+            assert!(
+                !cmd.contains("--request-only"),
+                "집행 틱에 --request-only 금지(그건 신호 레인 — 집행은 대기형)"
+            );
+            assert!(
+                cmd.contains("env -u CYS_ROLE"),
+                "집행 틱은 role-less 주체 핀(env -u CYS_ROLE)"
             );
         }
         // ★T9(R3-P03-3) 범프 금지 핀: 신규 id 는 버전 무관 append 라 범프가 불요하고, 범프는
@@ -1460,7 +1513,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 8, "중복 없이 8개 유지");
+        assert_eq!(jobs.len(), 9, "중복 없이 9개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
