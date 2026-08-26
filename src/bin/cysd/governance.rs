@@ -2442,6 +2442,12 @@ fn check_launch_flags(
 }
 
 /// T2-6 토폴로지 영속: role→agent→cwd 매핑을 디스크에 상시 기록 (cys restore의 진실).
+///
+/// ★(P1) seat 토큰 **비편입 계약**: `Surface.seat_token` 은 topology.json 에 **절대 싣지
+/// 않는다**(인메모리+PTY env 한정 — 필드 doc 참조). 영속하면 same-UID 절취 표면이 커지고,
+/// restore 는 어차피 재생성(새 토큰)이라 회복 가치가 0이다. 이 함수는 필드를 손으로 골라
+/// json! 조립하므로 '조립에 추가하지 않는 한' 배제가 기본값이다 — 아래 조립에 seat_token 을
+/// 추가하는 변경은 계약 위반(회귀 핀 `seat_token_never_persisted_or_listed` 가 적색으로 잡는다).
 pub fn persist_topology(daemon: &Arc<Daemon>) {
     let entries: Vec<serde_json::Value> = daemon
         .surfaces
