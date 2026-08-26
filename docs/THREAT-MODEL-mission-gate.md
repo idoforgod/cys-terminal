@@ -429,6 +429,37 @@ OUT OF SCOPE를 상대로 우리가 가진 것은 차단이 아니라 **흔적**
     · **2차 결합(잔여 ⓐ 한정)**: 부활 스폰마다 디렉티브급 push(실측 ~157~208 KB/건 · §4-6
       R7-A 표)가 공유 원장(8 MiB)을 소모해 §4-6ⓑ 회전 꼬리(층1 맹구간)를 앞당긴다.
 
+11. **seat 토큰의 신뢰 등급 — 거버넌스 구분이지 보안 경계가 아니다 (P1 · 2026-08-26 등재 ·
+    수용)** — claim_role·hook.decide 좌석 인가의 1차 축인 seat 토큰(`CYS_SEAT_TOKEN` ·
+    `state.rs::mint_seat_token` — 데몬이 스폰 시 발급해 pane PTY env 로만 배달하는 세대 각인
+    비밀 `"{started_at:x}.{128bit hex}"`)은 이 문서가 임무 게이트에 대해 반복해 온 것과 같은
+    등급이다: **단일 UID 신뢰 노드 모델의 거버넌스 구분**이며, 적대적 보안 격상이 아니다.
+    같은 UID 프로세스는 `ps -E`·`/proc/<pid>/environ` 으로 타 pane env 를 읽어 토큰을 절취할
+    수 있다 — 이는 §1 #13 을 닫은 `operator.token`(같은 UID 가 0600 파일을 그냥 읽으면 되는)과
+    **정확히 등가**의 한계다. 토큰이 격상하는 것은 위조 저항이 아니라 **귀속 신뢰성**이다:
+    Windows 세션 분리·재부모화(ppid→1)로 조상 체인이 끊긴 정당한 pane 자손이 자기 좌석을
+    증명할 결정론 수단을 얻는다(자기신고 `CYS_SURFACE_ID` 와 달리 데몬 발급 비밀의 대조라
+    자기신고 금지 계약의 carve-out — `handlers.rs` hook.decide 인가 계약 주석).
+    · **회전(rotation) 없는 수명(수용)**: 토큰은 spawn 시점 1회 발급으로 고정되며 수명 =
+      데몬 incarnation(started_at) 수명이다. pane 셸만 오래 살아남는 구성에서도 재발급·회전이
+      없다 — 단일 UID 모델에서는 절취가 애초에 등급 밖(§2 와 같은 성질)이라 회전이 막는
+      위협이 없고, 전세대 토큰은 세대 접두 불일치로 결정론 기각(부재 취급 폴백)된다.
+    · **무영속·무노출**: topology.json(persist_topology)·surface.list·이벤트 payload·로그
+      어디에도 싣지 않는다(영속 시 same-UID 절취 표면만 확대 — 회귀 핀
+      `seat_token_never_persisted_or_listed`). 토큰 유래 신원은 caller_cache 에 기록하지
+      않아 경계가 claim+hook 두 입구 밖(send ACL 등 20+ 소비자)으로 번지지 않는다(회귀 핀
+      `seat_token_path_never_records_caller_cache`).
+    · **감사 이벤트 관측**: 이 문서의 교리대로 토큰 축도 차단이 아니라 **흔적**으로 관측한다 —
+      기각은 기존 `role.claim_denied` 버스 이벤트의 payload 에 `error_code` + `reason`
+      (`token_mismatch` = 동세대 불일치·env 오염/토큰 복사 의심 · `token_chain_conflict` =
+      유효 토큰 + 조상 체인이 타 pane 으로 신선 재해석 — 절취/env 이식 의심)을 실어 구분한다.
+      이벤트 이름·rc 계약(rc 6/7)·에러코드 접두는 불변이라 기존 관측자·소비 사슬은 무개정이며,
+      payload 에 토큰 **값**은 싣지 않는다(무노출 계약). 훅 층(hook.decide)의 토큰-체인 모순은
+      기각이 아니라 undecided(셸 레거시 폴백)로 접힌다 — 발화 fail-open/등록 fail-closed 의
+      축별 비대칭이 의도된 골격이다.
+    · **롤백**: `CYS_BOOT_GATES=0` 우산 하나로 주입·검증 분기 전부 비활성(레거시 바이트 동일 —
+      전용 노브 신설 금지, §4-10 과 같은 노브 규율).
+
 > 이상징후 **코드의 등재소(SOT)는 `javis_mission.py::ANOMALY_CODES` 하나**이며, 문서 쪽 1:1
 > 회귀 핀이 걸린 대상은 `directives/MASTER_DIRECTIVE.md` §0-C 열거다(`--self-test`).
 > **이 문서는 코드 전량을 열거하지 않는다** — 여기 적히는 것은 게이트 보장 범위에 영향을 주는

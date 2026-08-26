@@ -10140,7 +10140,7 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
 /// |---|---|---|
 /// | 0 | 등록 성공(멱등 재claim 포함) | 계속 |
 /// | 7 | **정당거부** — 살아있는 보유자가 있다(이 surface 는 그 역할이 아니다) | 지휘 중단·인계. boot-last 오염 금지(ok:null) |
-/// | 6 | **발신 신원 미확정** — 데몬은 응답했으나 발신 pane 을 붙이지 못했다(분리 실행·타 surface) | 세션 배선 점검. **부서 자동 생성 금지** |
+/// | 6 | **발신 신원 미확정** — 데몬은 응답했으나 발신 pane 을 붙이지 못했다(분리 실행·타 surface · seat 토큰 불일치/토큰-체인 모순 포함) | 세션 배선 점검. **부서 자동 생성 금지** |
 /// | 3 | 미도달 — 데몬 미응답·소켓 부재(요청이 데몬에 닿지 못했다) | `cys ping`·데몬 기동 |
 /// | 2 | 식별 불가 — surface 해석 실패·인자 오류(요청을 만들 수조차 없다) | 세션 배선(CYS_SURFACE_ID) 점검 |
 ///
@@ -10154,6 +10154,18 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
 /// ★W1b 의 bootstrap 소비 분기와 정합(H-EXIT-3 발효): bootstrap 은 exit 7 → EXIT_CLAIM_DENIED,
 ///   exit 3/2 → EXIT_SESSION_CONTEXT 로 매핑하며 **둘 다 boot-last 에 ok:null** 을 쓴다(CS-2⑩).
 ///   문자열 grep 은 구 바이너리 하위호환 폴백으로만 남는다.
+///
+/// ★(P1 · seat 토큰) rc 6 가족에 데몬 payload `reason` 2종이 추가됐다 — **rc 값·분기 술어
+///   (에러코드 접두 `claim_caller_unresolved`/`claim_not_owner`)는 불변**이라 구 CLI·bootstrap
+///   소비 사슬은 무개정 정합한다(신설 에러코드 금지 — 구 CLI else 분기가 미지 코드를 rc 3
+///   '미도달'로 오진하는 스큐 함정 · R3-P1-3):
+///   · `claim_caller_unresolved` + reason=`token_mismatch` — 실려 온 seat 토큰이 대상
+///     surface 토큰과 다르고 **동세대**(env 오염·타 surface 토큰 복사 의심 — 의도된 소음).
+///     전세대 토큰은 부재 취급(체인 폴백)이라 이 사유를 내지 않는다.
+///   · `claim_not_owner` + reason=`token_chain_conflict` — 토큰은 유효하나 발신 조상 체인이
+///     **다른** pane 으로 신선 재해석됐다(모순 거부권 — 타 pane 토큰 절취·env 복사 봉쇄).
+///   토큰 부재는 종전 체인 경로 바이트 동일(fail-open 폴백)이므로 rc 6 의 종전 의미
+///   ('체인 단절 ∧ 토큰 부재/불일치')가 그대로 성립한다.
 fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool) -> i32 {
     let sid = match target_surface(&surface, &None) {
         Ok(sid) => sid,
@@ -10162,10 +10174,23 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
             return 2;
         }
     };
-    match request(
-        "system.claim_role",
-        json!({"role": role, "surface_id": sid, "takeover_empty_seat": takeover_empty_seat}),
-    ) {
+    let mut params =
+        json!({"role": role, "surface_id": sid, "takeover_empty_seat": takeover_empty_seat});
+    // ★(P1) seat 토큰 첨부 — 데몬이 pane PTY env(`CYS_SEAT_TOKEN`)로 배달한 발급 비밀을 그대로
+    //   실어 나른다(CLI 는 값을 해석·검증하지 않는다 — 발급·대조·수명은 데몬 소유). additive
+    //   형제 키라 구 데몬은 무시(wire.rs 계약 — 키별 수동 추출·deny_unknown_fields 없음)하고,
+    //   env 부재 시 페이로드는 종전과 **바이트 동일**(수동 실행·구 데몬 스폰 pane·스큐 안전).
+    //   롤백: `CYS_BOOT_GATES=0` 이면 토큰 키 자체를 생략한다 — 데몬 무개정으로도 완전 레거시가
+    //   성립하는 CLI 측 우산(R3-P1-1 · 전용 노브 신설 금지). env_compat 미사용은 의도다 —
+    //   레거시 접두(JAVIS_/AITERM_) 별칭이 없는 신설 키라 정본 키 하나만 판독한다.
+    if !cys::gate_axes_forced_legacy() {
+        if let Some(tok) =
+            std::env::var(cys::ENV_SEAT_TOKEN).ok().filter(|t| !t.is_empty())
+        {
+            params["seat_token"] = json!(tok);
+        }
+    }
+    match request("system.claim_role", params) {
         Ok(r) => {
             println!(
                 "registered: {} → surface:{}",
@@ -10389,13 +10414,24 @@ fn run_hook_user_prompt_submit() -> i32 {
     // ★인가 계약: 요청은 `surface_id` 를 **신고할 수 없다**. 좌석은 데몬이 커널 peer pid 의
     //   조상 체인으로 도출한다(claim_role 과 같은 규약) — 자기신고 surface 는 위조 가능하다.
     //   그래서 이 페이로드에는 좌석 식별자가 없다. 있으면 데몬이 invalid_params 로 거절한다.
+    //   ★(P1) carve-out — `seat_token` 은 이 금지의 예외다: 데몬이 스폰 시 그 pane 의 PTY env
+    //   로만 배달한 **발급 비밀의 대조**라 자기신고가 아니다(위조 불가·검증 가능). 데몬은 좌석
+    //   '해석'만 토큰 1차로 확정하고(체인 단절 rc6 계급 관통), 토큰-체인 모순은 undecided 로
+    //   접는다 — 판정 규칙(진리표)은 무접촉. additive 형제 키라 구 데몬은 무시(스큐 안전)하고,
+    //   env 부재 시 페이로드는 종전과 바이트 동일. `CYS_BOOT_GATES=0` 롤백은 이 함수 선두의
+    //   `gate_axes_forced_legacy()` 마스터 스위치가 전체를 legacy 로 접어 이미 토큰 키 생략을
+    //   포함한다(별도 분기 불요 — RPC 자체가 나가지 않는다).
+    let mut hook_params = json!({
+        "event": HOOK_EVENT_USER_PROMPT_SUBMIT,
+        "contract_version": HOOK_DECIDE_CONTRACT_V,
+    });
+    if let Some(tok) = std::env::var(cys::ENV_SEAT_TOKEN).ok().filter(|t| !t.is_empty()) {
+        hook_params["seat_token"] = json!(tok);
+    }
     let resp = request_on_timeout(
         &socket,
         "hook.decide",
-        json!({
-            "event": HOOK_EVENT_USER_PROMPT_SUBMIT,
-            "contract_version": HOOK_DECIDE_CONTRACT_V,
-        }),
+        hook_params,
         std::time::Duration::from_millis(HOOK_DECIDE_DEADLINE_MS),
     );
     let r = match resp {

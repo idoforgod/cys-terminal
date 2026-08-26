@@ -1776,6 +1776,71 @@ def h_ident_1():
          "CLI 가 신원 실패 코드를 분기하지 않는다 — rc 7(정당거부)로 다시 접힌다")
     notes.append("L1 데몬/CLI: 신원 실패 전용 코드 + rc 6 분기")
 
+    # ── L1-P1 seat 토큰(2026-08-26 · R3-P1-5 P7/P8): 체인 단일채널 → 토큰 1차+모순 거부권 ──
+    # rc 6 의 근본원인(조상 체인 단절)을 관통하는 데몬 발급 토큰 축이 **되돌려지면** 이 검체가
+    # 적색이 된다. 핀은 전부 실제 성질의 좌표다 — 마커 문자열이 아니라 분기·순서·부재를 잰다.
+    # ⓐ 데몬: seat_token param 1차 대조 + 모순 거부권의 신선 재해석(캐시 무효화 → probe 순서).
+    need('param_str(&params, "seat_token")' in h,
+         "데몬 claim 이 seat_token param 을 대조하지 않는다 — 체인 단일채널 회귀(rc6 근본원인 잔존)")
+    need("seat_token_ct_eq" in h,
+         "토큰 대조가 상수시간 비교를 쓰지 않는다(타이밍 누설 — state.rs 헬퍼 미사용)")
+    need('"token_chain_conflict"' in h and '"token_mismatch"' in h,
+         "모순 거부권(token_chain_conflict)·동세대 불일치(token_mismatch) reason 이 없다 — "
+         "이상 신호가 침묵으로 접힌다(1차 성찰의 rc6 뿌리 재현)")
+    # ★슬라이스 앵커는 claim arm 고유 변수명이다 — `param_str(&params, "seat_token")` 은
+    #   hook.decide arm(파일 앞쪽)에도 있어 첫 매치로 자르면 엉뚱한 arm 을 재게 된다.
+    claim_arm = h[h.find("let seat_token_param"):][:3000]
+    i_inval = claim_arm.find(".remove(&p)")
+    i_probe = claim_arm.find("probe_caller_surface_uncached(daemon, p)")
+    need(0 <= i_inval < i_probe,
+         "거부권의 체인 판독이 '캐시 무효화 → 신선 재해석(probe)' 순서가 아니다 — Windows pid "
+         "재사용 stale 양성이 유효 토큰을 오거부한다(false veto · G13 임계영역 내 재검증 위반)")
+    need("boot_gates_master_off_from" in claim_arm,
+         "데몬 토큰 분기에 CYS_BOOT_GATES=0 우산이 없다 — 롤백 불가(노브 규율 위반)")
+    # ⓑ CLI 첨부 배선(P7): claim 은 마스터 스위치 가드 **이후** 첨부, 훅은 스위치가 RPC 자체를
+    #   접으므로(legacy 조기 반환) 그 반환이 페이로드 조립보다 앞이어야 한다.
+    cl = c[c.find("fn run_claim_role("):]
+    cl = cl[:cl.find("\nfn ", 10)]
+    # ★가드 앵커도 실제 코드형이다 — 벌거벗은 `gate_axes_forced_legacy()` 리터럴은 주석에도
+    #   나타나(예: 훅 함수의 carve-out 서술 10422행) 코드가 지워지고 주석만 남아도 초록이
+    #   된다(false green · 우회 가능 핀 금지 — seat_token 앵커와 같은 엄격성).
+    i_guard = cl.find("if !cys::gate_axes_forced_legacy()")
+    i_attach = cl.find('params["seat_token"]')
+    need(i_attach >= 0 and "ENV_SEAT_TOKEN" in cl,
+         "run_claim_role 이 env CYS_SEAT_TOKEN 을 params.seat_token 으로 첨부하지 않는다 — "
+         "데몬 토큰 축이 있어도 CLI 가 실어 나르지 않으면 체인 단일채널 그대로다")
+    need(0 <= i_guard < i_attach,
+         "CYS_BOOT_GATES=0 에서 토큰 키 생략(소스 핀)이 없다 — 첨부가 마스터 스위치 가드 "
+         "이전이라 롤백 우산이 CLI 측에서 성립하지 않는다(R3-P1-1)")
+    hk = c[c.find("fn run_hook_user_prompt_submit("):]
+    hk = hk[:hk.find("\nfn ", 10)]
+    # ★fold 앵커는 `if cys::…` 코드형으로 좁힌다 — 이 함수 안에는 실제 fold(선두 조기 반환)와
+    #   별개로 carve-out 주석이 같은 리터럴을 attach 보다 **앞에** 담고 있어, 벌거벗은 리터럴로
+    #   잡으면 조기 반환이 제거되고 주석만 남아도 순서 판정이 초록으로 남는다(false green).
+    i_fold = hk.find("if cys::gate_axes_forced_legacy()")
+    # ★핀 대상은 실제 대입문이다 — 주석의 'seat_token' 낱말(carve-out 서술)이 아니라. 낱말로
+    #   잡으면 배선을 지우고 주석만 남겨도 초록이 된다(우회 가능 핀 금지).
+    i_hook_attach = hk.find('hook_params["seat_token"]')
+    need(i_hook_attach >= 0 and 0 <= i_fold < i_hook_attach,
+         "훅 hook.decide 페이로드에 seat_token 첨부가 없거나, 마스터 스위치 legacy 조기 반환이 "
+         "첨부보다 뒤다 — 훅 좌석 해석이 체인 단일채널로 회귀(P7 배선 소실)")
+    # ⓒ rc 계약 불변: 토큰 사유는 기존 코드(claim_caller_unresolved/claim_not_owner) payload
+    #   reason 이지 신설 에러코드가 아니다 — CLI 에 token 계열 starts_with 분기가 생기면 구 데몬
+    #   스큐에서 rc 오진 표면이 생긴다(신설 코드 금지 계약의 역방향 핀).
+    need('starts_with("token' not in c,
+         "CLI 가 token 계열을 **에러코드**로 분기한다 — rc 6/7 계약 불변(신설 코드 금지 · "
+         "reason 은 payload 로만) 위반")
+    # ⓓ 경계 회귀 핀(cargo 검체 존재): 무기록·무영속 계약을 재는 rust 테스트가 삭제되면 여기서
+    #   잡는다(기존 테스트 약화·삭제 금지의 기계 집행).
+    need("seat_token_path_never_records_caller_cache" in h,
+         "caller_cache 무기록 회귀 핀(cargo 검체)이 삭제됐다 — 토큰 신원이 send·usage 등 "
+         "20+ 소비자로 번지는 경계 붕괴를 재는 유일 검체다")
+    need("seat_token_never_persisted_or_listed" in h,
+         "무영속·무노출 회귀 핀(cargo 검체)이 삭제됐다 — topology.json/surface.list 등재 회귀를 "
+         "재는 유일 검체다")
+    notes.append("L1-P1 seat 토큰: 데몬 1차 대조+신선 재해석 순서 · CLI/훅 첨부 배선 · "
+                 "BOOT_GATES=0 토큰 생략 · rc 계약 불변 · 경계 회귀 핀 존치")
+
     # ── L2 훅: 조상 체인이 온전한 시점(spawn 이전)의 선행 claim + env 판정 전달 ──
     hook = _read(_hook("role-bootstrap.sh"))
     need("cys claim-role master" in hook,
@@ -1821,7 +1886,13 @@ def h_ident_1():
              "계측 타당성 실패: 구 데몬에 이미 신원 전용 코드가 있다")
         need("CYS_CLAIM_RC" not in old_hook,
              "계측 타당성 실패: 구 훅에 이미 선행 claim 계약이 있다")
-        calib = "구 트리=코드 융합·선행 claim 부재 확인"
+        need("seat_token" not in old_h,
+             "계측 타당성 실패: 구 데몬에 이미 seat 토큰 축이 있다(L1-P1 탐지기 무효)")
+        old_c = _git_show(os.path.join("src", "bin", "cys.rs"))
+        if old_c is not None:
+            need('"seat_token"' not in old_c,
+                 "계측 타당성 실패: 구 CLI 에 이미 토큰 첨부 배선이 있다(L1-P1 탐지기 무효)")
+        calib = "구 트리=코드 융합·선행 claim·seat 토큰 부재 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 

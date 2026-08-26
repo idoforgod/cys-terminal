@@ -39,6 +39,12 @@ pub mod launchd;
 
 pub const ENV_SOCKET: &str = "CYS_SOCKET";
 pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
+/// ★(P1) 좌석 토큰 env 키 — 데몬이 pane 스폰 시 PTY env 로**만** 배달하는 세대 각인 비밀
+/// (`"{daemon.started_at:x}.{128bit hex}"` — 발급·대조·수명은 데몬 소유: cysd/state.rs
+/// `mint_seat_token` · cysd/handlers.rs claim_role/hook.decide). CLI 는 값을 해석하지 않고
+/// 실어 나르기만 한다. `CYS_SURFACE_ID`(자기신고라 위조 가능·신뢰 안 함)와 달리 이 값은
+/// 데몬 발급 비밀의 **대조**라 자기신고가 아니다. 관측 채널(로그·stdout·surface.list) 등재 금지.
+pub const ENV_SEAT_TOKEN: &str = "CYS_SEAT_TOKEN";
 pub const ENV_SURFACE_REF: &str = "CYS_SURFACE_REF";
 pub const ENV_ROLE: &str = "CYS_ROLE";
 
