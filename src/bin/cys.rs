@@ -18770,6 +18770,32 @@ mod tests {
         );
     }
 
+    /// ★서브커맨드명 배선 핀(P2-hook 수정 라운드 SF-2) — `"boot-intent"` 문자열이
+    /// `Command::BootIntent` 로 파싱된다(clap kebab-case 파생). 훅 frontdoor 는 구 CLI
+    /// (rc2 + "unrecognized subcommand")를 **조용한 스큐**로 접어 영구 폴백하도록 설계돼
+    /// 있으므로, variant 개명·명시 name 변경으로 이 배선이 끊기면 전 검체 초록인 채
+    /// 프로덕션 프런트도어가 무음 폴백된다('위임이 죽은 사실을 아무도 모른다' 클래스 —
+    /// 훅 판독기 주석이 스스로 경계하는 그 계급). 위 소스 핀이 훅 쪽 호출 문자열
+    /// (`cys boot-intent`)을 잡고, 이 핀이 CLI 쪽 파서를 잡아 양끝을 결박한다.
+    #[test]
+    fn p2_boot_intent_subcommand_name_is_wired_to_clap() {
+        // 양성: 정확한 이름은 BootIntent 로 파싱된다.
+        let cli = Cli::try_parse_from(["cys", "boot-intent"])
+            .expect("'boot-intent' 서브커맨드가 파싱돼야 한다 — 훅 frontdoor 호출 문자열과 동일");
+        assert!(
+            matches!(cli.command, Command::BootIntent),
+            "'boot-intent' 가 BootIntent 아닌 다른 arm 으로 파싱됐다"
+        );
+        // 음성 대조: 다른 철자는 파싱 실패(구 CLI 모사 rc2 클래스)여야 폴백 판별이 성립한다 —
+        // 이 실패가 참이어야 위 양성이 '아무 문자열이나 통과'가 아님이 증명된다.
+        for wrong in [["cys", "bootintent"], ["cys", "boot_intent"]] {
+            assert!(
+                Cli::try_parse_from(wrong).is_err(),
+                "kebab-case 아닌 철자 {wrong:?} 가 파싱됐다 — 음성 대조 붕괴"
+            );
+        }
+    }
+
     /// ★P1-1(치명) 회귀 박제 — **U-5 argv 승격이 '거짓'도 늘렸다**는 사실의 검체.
     ///
     /// 【기존 검체가 증명하지 못한 것】 `live_argv_promotion_flips_agent_predicates_*`

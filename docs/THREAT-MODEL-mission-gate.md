@@ -428,6 +428,21 @@ OUT OF SCOPE를 상대로 우리가 가진 것은 차단이 아니라 **흔적**
       주입문 고지·감사 흔적이다.
     · **2차 결합(잔여 ⓐ 한정)**: 부활 스폰마다 디렉티브급 push(실측 ~157~208 KB/건 · §4-6
       R7-A 표)가 공유 원장(8 MiB)을 소모해 §4-6ⓑ 회전 꼬리(층1 맹구간)를 앞당긴다.
+    · **P2 잔여 — 부트 인텐트 스풀·`decl_origin` 위조 (2026-08-26 등재 · R3-P2-1 · 성질은 위
+      잔여 ⓑ와 같다)**: 훅 직접 spawn 의 데몬 이관(P2 · `boot.enqueue` → 스풀 → 감독자 스폰)
+      으로 부트 인텐트가 스풀 파일(0700 = same-UID 쓰기 가능)을 거친다. 같은 UID 프로세스는
+      RPC 를 거치지 않고 스풀에 인텐트 파일을 직접 투하할 수 있고, `decl_origin=hook-human`·
+      `claim{rc,at}` 을 위조해 실을 수 있다 — 이 둘은 명령 문자열이 아니라 **행동 조향
+      데이터**다(decl_origin 은 부서 자동 스폰 봉인 `javis_bootstrap.py` 의 hook-human 요구를
+      열고, claim rc=0 은 부트의 claim 생략 소비를 연다). 스풀 직접 투하는 같은 UID 의 의도적
+      위조(§2 OUT OF SCOPE)와 등가라 **새 위협 클래스가 아니며**, 완화는 차단이 아니라
+      결박·유계·흔적이다: ①`surface_id` 는 boot.enqueue 가 자기신고를 invalid_params 로
+      거절하고 커널 도출(`resolve_caller_surface`)로만 채운다(hook.decide 동형) ②claim{rc,at}
+      은 데이터로 실릴 뿐이고, 디스패치 직전 데몬 roles 레지스트리 **재실측**이 참일 때만
+      신선한 시각으로 env 주입된다(불일치 = `Retire("claim_stale")` · 훅 스탬프 이월 금지 —
+      `boot_supervisor.rs` run_ensure_team · R3-P2-5) ③실부트는 레인 싱글플라이트(패자 exit
+      11)·감독자 시도 상한(MAX_ATTEMPTS)으로 유계다 ④흔적: `intent_retired` 이벤트·소진 시
+      `bootstrap-fail` feed(§3 교리 — 차단이 아니라 감사 가능성).
 
 11. **seat 토큰의 신뢰 등급 — 거버넌스 구분이지 보안 경계가 아니다 (P1 · 2026-08-26 등재 ·
     수용)** — claim_role·hook.decide 좌석 인가의 1차 축인 seat 토큰(`CYS_SEAT_TOKEN` ·

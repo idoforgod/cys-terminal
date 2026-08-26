@@ -2606,6 +2606,12 @@ def _cmd_run_chain(log):
     # 이전에 claim 을 끝내고, 이 스크립트는 그 판정을 소비한다(claim 을 두 번 치지 않는다 — 중복
     # claim 은 좌석 프로브·감사 이벤트를 두 번 태운다).
     # 판정 전달은 env 다: CYS_CLAIM_RC(필수·정수) / CYS_CLAIM_OUT(진단 문안·선택).
+    # ★감독자 주입 제3 경로(P2 · R3-P2-7 ⑥): 이 env 4종의 생산자는 훅만이 아니다 — 데몬 부트
+    #   감독자(boot_supervisor.rs run_ensure_team)도 스풀 인텐트 디스패치 직전 자기 roles
+    #   레지스트리 **재실측**이 참일 때만 rc=0·신선한 CYS_CLAIM_AT(훅 스탬프 이월 금지)·
+    #   CYS_CLAIM_OUT="[supervisor] registry re-verified" 를 주입한다(불일치=무스폰 Retire).
+    #   소비 결박(_pre_bound)은 생산자 공통이고 이 스크립트는 생산자를 구분하지 않는다 —
+    #   provenance 는 CYS_CLAIM_OUT 문안이 실어 나른다. 잔여 위조면은 THREAT-MODEL §4-10 등재.
     # env 가 없으면(§0 폴백의 포그라운드 직접 실행·구 훅) 종전대로 여기서 직접 claim 한다 —
     # 그 경로는 조상 체인이 온전하므로 정상 동작한다(하위호환·스큐 안전).
     # ★판정 결박(무바인딩 env 금지): 정수처럼 보이는 env 하나로 claim 을 건너뛰면, 사용자 셸·
