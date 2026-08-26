@@ -22,6 +22,12 @@
 
 인증: `git credential fill`(osxkeychain)에서 GitHub 토큰을 얻는다. gh CLI 불요.
 
+★수신 규율 (2026-08-27 MF-C): 모든 GitHub 호출에 **timeout** 이 걸리고, 읽기(GET·자산
+  다운로드)는 **유계 재시도**(429·5xx·연결 오류/타임아웃 · 상한 MAX_ATTEMPTS)를 탄다.
+  4xx 는 확정 답이라 재시도하지 않고, 상태를 바꾸는 호출(POST 업로드·DELETE)은 멱등하지
+  않아 timeout 만 건다. **크기 대조 fail-closed(1단계)는 그대로다** — 재시도 대상이 아니다.
+  세목은 아래 '수신 규율' 절과 `with_retries()` 주석.
+
 사용:
   python3 scripts/release-postprocess.py v0.14.19           # dry-run(다운로드·생성·검증만)
   python3 scripts/release-postprocess.py v0.14.19 --apply   # 업로드까지
@@ -32,17 +38,80 @@
         `--force-no-verify` 선례와 동형: 어떤 자동 경로도 이 플래그를 실어서는 안 된다)
 """
 import hashlib
+import http.client
 import json
 import os
 import platform
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 REPO = "idoforgod/cys-terminal"
 BACKUP_ROOT = os.path.expanduser("~/cys-release-backup")
 SUMS_NAME = "SHA256SUMS.txt"          # ★과거 관례 — `SHA256SUMS`(확장자 없음) 아님
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ── ★수신 규율 (2026-08-27 MF-C · 무방비 urllib 봉합) ────────────────────────
+# ★배경: `api()`·`download()` 는 `urllib.request.urlopen(req)` 를 **timeout 없이·재시도 없이**
+#   불렀다. 남은 두 축이 그대로였다:
+#     · 일시 5xx/429 가 잡히지 않고 **트레이스백으로 죽는다** — main() 의 except 는 릴리스
+#       조회 한 곳(404 폴백)만 감싼다. CI 직후 GitHub 5xx 블립 한 번이면 후처리 전체가 죽고,
+#       사람은 파이썬 스택을 보고 원인을 뒤진다.
+#     · 멈춘 연결은 timeout 부재로 **무기한 대기**한다(소켓 기본값 = None). 릴리스 절차가
+#       hang 하면 그 자체가 사고다(`retry-loop-needs-stop-condition` 의 반대편 — 정지 조건 부재).
+#
+# ★규율은 이 레인의 다른 두 도구(verify-release-remote.py · deploy-homepage.py)와 같다:
+#     · 재시도 대상 = **429·5xx·연결 오류/타임아웃**('지금 대답을 못 한다')
+#     · 4xx(429 제외) = 원격의 **확정 답** → 재시도하지 않는다(같은 답이 올 뿐)
+#     · 상한은 range() 가 강제 · 재시도 사유는 **반드시 로그로** 남긴다(침묵 금지)
+#     · ★크기·해시 대조 실패는 재시도 대상이 **아니다** — 같은 바이트에 시간만 쓴다.
+#       기존 fail-closed(4단계 앞 크기 대조 → `::error::` + return 1)는 **그대로 보존**한다.
+API_TIMEOUT = 60                 # 릴리스 조회·삭제 1회 상한(초)
+DOWNLOAD_TIMEOUT = 600           # 자산 본문 1회 상한(초) — 269MB DMG 기준
+UPLOAD_TIMEOUT = 900             # 자산 업로드 1회 상한(초)
+MAX_ATTEMPTS = 3                 # ★유계 — 최초 1회 + 재시도 2회
+RETRY_BACKOFF_S = (2.0, 5.0)     # len ≥ MAX_ATTEMPTS-1 (부족하면 마지막 값 반복)
+
+# 재시도 대상 예외 — 연결이 안 되거나(URLError) 멈추거나(timeout) 응답이 끊긴(IncompleteRead)
+# 경우. ★HTTPError 는 URLError 의 하위형이라 **먼저** 걸러 상태코드로 가른다.
+_TRANSIENT_EXC = (urllib.error.URLError, socket.timeout, TimeoutError,
+                  ConnectionError, http.client.HTTPException)
+
+
+def is_transient_status(status):
+    """유계 재시도 대상인가 — **429 와 5xx**. 4xx(429 제외)는 원격의 확정 답이다."""
+    return status == 429 or status >= 500
+
+
+def with_retries(what, fn, attempts=MAX_ATTEMPTS, _sleep=None):
+    """`fn()` 을 유계 재시도로 부른다 → fn 의 반환값.
+
+    ★상한은 `range(attempts)` 가 구조적으로 강제한다(무한 루프 불가).
+    ★소진하면 조용히 넘어가지 않고 `SystemExit("::error::…")` 로 **loud 하게** 죽는다 —
+      후처리가 반쯤 된 상태로 '성공'을 보고하는 경로를 만들지 않기 위해서다.
+    """
+    sleeper = _sleep or time.sleep
+    attempts = max(1, int(attempts))
+    last = "?"
+    for i in range(attempts):                      # ← 유계
+        if i:
+            delay = RETRY_BACKOFF_S[min(i - 1, len(RETRY_BACKOFF_S) - 1)]
+            print("  ↻ 재시도 %d/%d (%.0fs 후) ← %s | %s"
+                  % (i, attempts - 1, delay, last, what), flush=True)   # 침묵 금지
+            sleeper(delay)
+        try:
+            return fn()
+        except urllib.error.HTTPError as ex:
+            if not is_transient_status(ex.code):
+                raise                              # 4xx = 확정 답 — 호출부가 판단한다
+            last = "HTTP %d" % ex.code
+        except _TRANSIENT_EXC as ex:
+            last = "%s: %s" % (type(ex).__name__, ex)
+    raise SystemExit("::error::%s — 유계 재시도 %d회를 소진했다(마지막: %s)"
+                     % (what, attempts, last))
 
 
 def token():
@@ -55,15 +124,32 @@ def token():
     raise SystemExit("::error::GitHub 토큰을 얻지 못했다(git credential fill)")
 
 
-def api(path, tok, method="GET", data=None, ctype="application/json"):
-    req = urllib.request.Request("https://api.github.com" + path, method=method, data=data)
-    req.add_header("Authorization", "Bearer " + tok)
-    req.add_header("Accept", "application/vnd.github+json")
-    if data is not None:
-        req.add_header("Content-Type", ctype)
-    with urllib.request.urlopen(req) as r:
-        body = r.read()
-    return json.loads(body) if body else {}
+def api(path, tok, method="GET", data=None, ctype="application/json",
+        timeout=API_TIMEOUT, retry=None, _opener=None, _sleep=None):
+    """GitHub API 1건. ★timeout 필수 · 재시도는 **읽기(GET)만**.
+
+    ★왜 GET 만 재시도하는가 — DELETE/POST 는 멱등하지 않다. 서버가 처리했는데 응답만
+      유실된 경우 재시도는 두 번째 호출에서 404 를 받고 그걸 확정 오류로 올린다(=없는 실패를
+      만든다). 그래서 상태를 바꾸는 호출은 **timeout 만** 걸고 재시도는 걸지 않는다.
+      `retry=True/False` 로 호출부가 명시적으로 뒤집을 수 있다.
+    """
+    if retry is None:
+        retry = method in ("GET", "HEAD")
+    opener = _opener or urllib.request.urlopen
+
+    def once():
+        req = urllib.request.Request("https://api.github.com" + path, method=method, data=data)
+        req.add_header("Authorization", "Bearer " + tok)
+        req.add_header("Accept", "application/vnd.github+json")
+        if data is not None:
+            req.add_header("Content-Type", ctype)
+        with opener(req, timeout=timeout) as r:
+            body = r.read()
+        return json.loads(body) if body else {}
+
+    if not retry:
+        return once()
+    return with_retries("%s %s" % (method, path), once, _sleep=_sleep)
 
 
 def sha256_file(p):
@@ -74,16 +160,29 @@ def sha256_file(p):
     return h.hexdigest()
 
 
-def download(url, dest, tok):
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", "Bearer " + tok)
-    req.add_header("Accept", "application/octet-stream")
-    with urllib.request.urlopen(req) as r, open(dest, "wb") as fh:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            fh.write(chunk)
+def download(url, dest, tok, timeout=DOWNLOAD_TIMEOUT, _opener=None, _sleep=None):
+    """릴리스 자산 1건을 내려받는다. ★timeout + 유계 재시도(429·5xx·연결 오류/타임아웃).
+
+    ★재시도는 **처음부터 다시 받는다**(Range 이어받기 없음) — `dest` 를 매번 'wb' 로 열어
+      부분 파일이 남지 않게 한다. 이어받기를 하면 '끊긴 지점이 진짜였는지'를 증명해야 하는데
+      이 스크립트에는 그럴 근거가 없다.
+    ★크기 대조는 **여기서 하지 않는다** — 호출부(main 1단계)의 fail-closed 가 정본이고,
+      그 대조 실패는 재시도 대상이 아니다(같은 바이트에 시간만 쓴다). 그 계약을 바꾸지 않는다.
+    """
+    opener = _opener or urllib.request.urlopen
+
+    def once():
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", "Bearer " + tok)
+        req.add_header("Accept", "application/octet-stream")
+        with opener(req, timeout=timeout) as r, open(dest, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+
+    return with_retries("GET %s" % url, once, _sleep=_sleep)
 
 
 GATE_SCRIPT = os.path.join(HERE, "release-gate-gatekeeper.sh")
@@ -267,7 +366,10 @@ def main(argv):
         req = urllib.request.Request(up_base + "?name=" + name, method="POST", data=body)
         req.add_header("Authorization", "Bearer " + tok)
         req.add_header("Content-Type", ctype)
-        with urllib.request.urlopen(req) as r:
+        # ★timeout 은 걸고 재시도는 걸지 않는다 — 업로드 POST 는 멱등하지 않다(서버가 받았는데
+        #   응답만 유실되면 재시도가 중복 자산·422 를 만든다). 멈춘 연결로 후처리가 무기한
+        #   hang 하는 것만 막는다. 실패는 예외로 올라가 loud 하게 죽는다(조용한 성공 금지).
+        with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT) as r:
             r.read()
         print("  ✓ 업로드 %s (%d bytes)" % (name, len(body)))
     print("\n✅ 후처리 완료 — %s" % outdir)

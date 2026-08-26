@@ -10,10 +10,16 @@
 ★이 파일의 핵심은 **음성 대조**다: 부분 본문을 받았을 때 `ftp_put` 이 **한 번도 호출되지
   않는지**를 단언한다. "중단했다고 보고했지만 실은 올렸다"를 구조적으로 봉한다.
 
+★2026-08-27 3라운드(MF-A) 확장 — 같은 무방비가 **FTPS 목록 수신**에도 있었다(`ftp_list` 가
+  rc 를 보지 않고 `[]` 를 돌려줘 '실패'와 '비어 있음'이 같아짐 → 구자산이 한 건도 지워지지
+  않은 채 '구버전 없음' + exit 0). 그 축의 핀은 `FtpListFailClosedTests`·`FtpListContractTests`.
+
 ★설계 — `test_verify_release_remote.py` 의 페이크 curl 관례를 그대로 따른다. 실제로 -o/-D
   파일을 쓰고 rc·%{http_code} 를 돌려주는 호출가능 객체를 주입하고, 계획에 없는 URL 을
-  부르면 즉시 AssertionError(=라이브 접촉 의심). FTP 경로(load_env·ftp_list·ftp_put·
-  ftp_delete·sftp_put)는 전부 스파이로 치환해 **어떤 경우에도 원격에 나가지 않는다.**
+  부르면 즉시 AssertionError(=라이브 접촉 의심). 쓰기 경로(ftp_put·ftp_delete·sftp_put)와
+  자격(load_env)은 스파이로 치환하고, **읽기 경로인 LIST 는 한 칸 아래(`dh.curl`)에서**
+  페이크로 막아 실 `ftp_list` 코드를 그대로 태운다(수리 대상을 건너뛰지 않기 위해).
+  결과적으로 **어떤 경우에도 원격에 나가지 않는다.**
   경로는 전부 tempfile — 개인 경로·실 홈 디렉터리 금지.
 
 사용: python3 scripts/tests/test_deploy_homepage_fetch.py
@@ -135,12 +141,52 @@ class NoSleep(object):
         self.slept.append(sec)
 
 
+class FtpResp(object):
+    """페이크 FTPS 응답 1건 — `subprocess.run` 반환값의 필요한 면만 흉내낸다."""
+
+    def __init__(self, rc=0, stdout=b"", stderr=b""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class FakeFtpCurl(object):
+    """`dh.curl` 치환 — FTPS LIST 를 계획대로 돌려준다(★실 ftp_list 코드를 그대로 태운다).
+
+    ★ftp_list 를 통째로 스텁하지 않는 이유: 이 파일이 검사하려는 결함이 **ftp_list 안**에
+      있다(rc 미검사 → 실패와 빈 목록의 동일 취급). 스텁하면 수리 대상을 건너뛴 채 초록이
+      나온다. 그래서 주입 지점을 한 칸 아래인 `curl` 로 내린다.
+    큐가 마르면 마지막 응답을 반복한다(=재시도해도 같은 답을 주는 원격).
+    """
+
+    def __init__(self, responses):
+        self.queue = list(responses)
+        self.calls = 0
+
+    def __call__(self, args, **kw):
+        self.calls += 1
+        return self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+
+
+def list_body(names, terminated=True):
+    """FTPS LIST 본문 합성. LIST 의 각 줄은 CRLF 로 끝난다 — `terminated=False` 면
+    마지막 줄이 개행 없이 끊긴 **부분 목록**(잘린 이름이 DELE 대상이 되는 형태)."""
+    out = "".join("-rw-r--r-- 1 u u 1 Jan 1 00:00 %s\r\n" % n for n in names)
+    if not terminated:
+        out = out.rstrip("\r\n") + "-set"      # 이름 중간에서 끊긴 꼴
+    return out.encode()
+
+
+OLD_NAMES = [f.replace(VER, PREV) for f in FOUR]
+
+
 class FtpSpy(object):
     """★음성 대조의 눈 — 업로드·삭제가 **호출되었는지**만 기록한다(실행하지 않는다)."""
 
-    def __init__(self):
+    def __init__(self, delete_ok=True):
         self.puts = []
         self.deletes = []
+        self.delete_ok = delete_ok      # False = DELE 가 실패하는 원격
 
     def put(self, e, local, remote):
         self.puts.append(remote)
@@ -148,7 +194,7 @@ class FtpSpy(object):
 
     def delete(self, e, remote):
         self.deletes.append(remote)
-        return True
+        return self.delete_ok
 
 
 def healthy_plan():
@@ -162,13 +208,13 @@ def healthy_plan():
 class DeployFetchGateTests(unittest.TestCase):
 
     def setUp(self):
-        self._real = (dh._run_http_curl, dh.load_env, dh.ftp_list,
+        self._real = (dh._run_http_curl, dh.load_env, dh.curl,
                       dh.ftp_put, dh.ftp_delete, dh.sftp_put, dh.RETRY_BACKOFF_S)
         dh.RETRY_BACKOFF_S = (0.0, 0.0)                 # 테스트는 대기하지 않는다
         dh.load_env = lambda: {"FTP_HOST": "h.invalid", "FTP_USER": "u", "FTP_PASS": "p"}
-        # 라이브 downloads/ 목록 — 구버전 자산이 하나 있는 상태
-        dh.ftp_list = lambda e, path: ["-rw-r--r-- 1 u u 1 Jan 1 00:00 %s"
-                                       % f.replace(VER, PREV) for f in FOUR]
+        # 라이브 downloads/ 목록 — 구버전 자산 4종이 남아 있는 상태(정리 대상)
+        self.ftp = FakeFtpCurl([FtpResp(stdout=list_body(OLD_NAMES))])
+        dh.curl = self.ftp
         self.spy = FtpSpy()
         dh.ftp_put = self.spy.put
         dh.ftp_delete = self.spy.delete
@@ -179,15 +225,18 @@ class DeployFetchGateTests(unittest.TestCase):
                 fh.write(b"A" * 4096)
 
     def tearDown(self):
-        (dh._run_http_curl, dh.load_env, dh.ftp_list,
+        (dh._run_http_curl, dh.load_env, dh.curl,
          dh.ftp_put, dh.ftp_delete, dh.sftp_put, dh.RETRY_BACKOFF_S) = self._real
         for f in os.listdir(self.assets):
             os.remove(os.path.join(self.assets, f))
         os.rmdir(self.assets)
 
-    def _run(self, plan, apply_=True):
+    def _run(self, plan, apply_=True, ftp=None):
         fake = FakeCurl(plan)
         dh._run_http_curl = fake
+        if ftp is not None:
+            self.ftp = ftp
+            dh.curl = ftp
         argv = ["deploy-homepage.py", VER, self.assets] + (["--apply"] if apply_ else [])
         with captured() as (out, err):
             rc = dh.main(argv)
@@ -308,6 +357,139 @@ class DeployFetchGateTests(unittest.TestCase):
         rc, out, _ = self._run(plan)
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.spy.puts, [])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⓖ ★MF-A — FTPS 목록: '받지 못했다'와 '비어 있다'는 다른 사건이다 (2026-08-27 3라운드)
+#
+#   구현은 `curl -s`(--fail 없음)로 LIST 를 받아 **rc 를 보지 않고** `.splitlines()` 했다.
+#   실행 실측: 호스트 해소 실패에서 `curl rc=6` 인데 `ftp_list() → []`.
+#   그 목록이 구동하는 것은 둘 — `old_versions` 보고와 **구버전 자산 삭제 루프**.
+#   귀결: 목록 수신이 실패하면 구자산이 **한 건도 삭제되지 않은 채** '구버전 없음' 으로 찍히고
+#   `✅ 홈페이지 배포 완료` + exit 0 이 난다. v0.13.17 '무증상 구버전 잔존' 클래스이고,
+#   `verify-release-remote.py` 는 페이지 문자열만 보므로 **서버에 남은 구자산을 못 잡는다**.
+#
+#   ★음성 대조가 이 군의 핵심 — test_17 이 "건강하면 실제로 지운다"를 잡아둔다. 그게 없으면
+#     "아무것도 안 지우고 조용히 초록"이 아래 단언들을 전부 통과한다.
+# ──────────────────────────────────────────────────────────────────────────────
+def _legacy_ftp_list(resp):
+    """★구현 재현(테스트 전용) — rc 를 보지 않고 stdout 만 쪼개던 식.
+    실패(rc≠0 · stdout 빈문자)와 '정말 비어 있음'이 **같은 `[]`** 로 접힌다."""
+    return resp.stdout.decode("utf-8", "replace").splitlines()
+
+
+class FtpListFailClosedTests(unittest.TestCase):
+
+    setUp = DeployFetchGateTests.setUp
+    tearDown = DeployFetchGateTests.tearDown
+    _run = DeployFetchGateTests._run
+
+    # ── 음성 대조: 건강하면 실제로 지운다 ────────────────────────────────────
+    def test_17_healthy_cleanup_actually_deletes(self):
+        """★기준선 — 이게 깨지면 아래 '안 지웠다' 단언들은 헛검사가 된다."""
+        rc, out, _ = self._run(healthy_plan())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.spy.deletes, ["downloads/" + n for n in OLD_NAMES], out)
+        self.assertIn("구버전 정리 완료", out)
+
+    # ── 업로드 **전** 목록 실패 = 착수하지 않는다 ─────────────────────────────
+    def test_18_list_failure_before_upload_blocks_everything(self):
+        """★핵심 핀 — rc 6(호스트 해소 실패)을 '목록이 비었다'로 읽지 않는다.
+        구판은 여기서 업로드까지 마치고 '구버전 없음' + exit 0 을 냈다."""
+        dead = FtpResp(rc=6, stderr=b"curl: (6) Could not resolve host: h.invalid\n")
+        self.assertEqual(_legacy_ftp_list(dead), [], "구판 재현이 틀렸다")   # 구판은 []
+        rc, out, _ = self._run(healthy_plan(), ftp=FakeFtpCurl([dead]))
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.spy.puts, [], "목록도 못 받고 업로드했다")
+        self.assertEqual(self.spy.deletes, [])
+        self.assertIn("fail-closed", out)
+        self.assertIn("종료코드 6", out)                  # 침묵 금지 — 사유가 남는다
+        # ★거짓 안심 문면 금지 — 구판은 여기서 "라이브 downloads/ 항목 0 · 구버전 없음" 을
+        #   찍고 그대로 발행했다. 그 보고 줄 자체가 나오면 안 된다.
+        self.assertNotIn("라이브 downloads/ 항목", out)
+        self.assertNotIn("배포 완료", out)
+        self.assertEqual(self.ftp.calls, dh.MAX_ATTEMPTS)  # 유계 재시도
+
+    def test_19_genuinely_empty_listing_is_not_a_failure(self):
+        """★반대편 — rc 0 이고 목록이 정말 비었으면 그건 **정상**이다(지울 것이 없다).
+        수리가 '비었으면 무조건 중단'으로 흐르면 첫 배포·정리 직후 재실행이 죽는다."""
+        rc, out, _ = self._run(healthy_plan(), ftp=FakeFtpCurl([FtpResp(stdout=b"")]))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("index.html", self.spy.puts)
+        self.assertEqual(self.spy.deletes, [], "빈 목록인데 뭔가를 지웠다")
+        self.assertIn("구버전 정리 완료(대상 0건", out)
+
+    def test_20_partial_listing_blocks_and_never_deletes_truncated_name(self):
+        """부분 목록 — 잘린 마지막 줄(`…_x64-set`)을 DELE 대상으로 삼으면 **진짜 파일은
+        살아남고** 없는 이름만 지우려다 만다. 그 전에 멈춘다."""
+        cut = FtpResp(stdout=list_body(OLD_NAMES, terminated=False))
+        rc, out, _ = self._run(healthy_plan(), ftp=FakeFtpCurl([cut]))
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.spy.puts, [])
+        self.assertEqual(self.spy.deletes, [])
+        self.assertIn("부분 목록", out)
+        self.assertNotIn("-set\n", "".join(self.spy.deletes) + "\n")
+
+    # ── 업로드 **후**(정리 단계) 실패 = 롤백 없이 loud + 비영 ──────────────────
+    def test_21_cleanup_list_failure_is_loud_nonzero_without_rollback(self):
+        """★비가역 이후의 실패 — 업로드·페이지 발행은 **되돌리지 않는다**(되돌리면 홈페이지가
+        더 나빠진다). 대신 '정리 미완'을 명시하고 비영 종료한다. 조용한 성공 선언 금지."""
+        ftp = FakeFtpCurl([FtpResp(stdout=list_body(OLD_NAMES)),      # 계획 단계: 정상
+                           FtpResp(rc=7, stderr=b"curl: (7) Failed to connect\n")])
+        rc, out, _ = self._run(healthy_plan(), ftp=ftp)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("index.html", self.spy.puts, "발행이 일어나지 않았다(픽스처 오류)")
+        self.assertEqual(self.spy.deletes, [], "목록도 못 받고 삭제를 시작했다")
+        self.assertIn("정리는 미완", out)
+        self.assertIn("되돌리지 않는다", out)
+        self.assertNotIn("✅", out)                    # ★'완료' 단언 금지
+
+    def test_22_delete_failure_is_reported_and_nonzero(self):
+        """DELE 가 실패하면 구자산이 남는다 — ✗ 만 찍고 exit 0 으로 끝내지 않는다."""
+        self.spy.delete_ok = False
+        rc, out, _ = self._run(healthy_plan())
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(len(self.spy.deletes), len(OLD_NAMES))   # 시도는 전건 했다
+        self.assertIn("삭제 실패", out)
+        self.assertIn("정리는 미완", out)
+        self.assertNotIn("✅", out)
+
+
+class FtpListContractTests(unittest.TestCase):
+    """ftp_list 자체의 계약 — 종단 없이 반환값만 본다."""
+
+    def _e(self):
+        return {"FTP_HOST": "h.invalid", "FTP_USER": "u", "FTP_PASS": "p"}
+
+    def test_23_empty_and_failure_are_different_values(self):
+        """★계약의 본체 — `([], None)` 과 `(None, err)` 은 **다른 값**이다."""
+        with captured():
+            lines, err = dh.ftp_list(self._e(), "downloads/",
+                                     _runner=lambda a, **k: FtpResp(stdout=b""), _sleep=NoSleep())
+        self.assertEqual((lines, err), ([], None))
+        with captured():
+            lines, err = dh.ftp_list(self._e(), "downloads/",
+                                     _runner=lambda a, **k: FtpResp(rc=6), _sleep=NoSleep())
+        self.assertIsNone(lines, "실패를 '빈 목록'으로 돌려줬다")
+        self.assertIn("종료코드 6", err)
+
+    def test_24_list_retry_is_bounded(self):
+        fake = FakeFtpCurl([FtpResp(rc=7)])
+        s = NoSleep()
+        with captured():
+            lines, err = dh.ftp_list(self._e(), "downloads/", _runner=fake, _sleep=s)
+        self.assertIsNone(lines)
+        self.assertEqual(fake.calls, dh.MAX_ATTEMPTS)
+        self.assertEqual(len(s.slept), dh.MAX_ATTEMPTS - 1)
+        self.assertIn("시도 %d회 소진" % dh.MAX_ATTEMPTS, err)
+
+    def test_25_list_recovers_on_retry(self):
+        fake = FakeFtpCurl([FtpResp(rc=7), FtpResp(stdout=list_body(OLD_NAMES))])
+        with captured() as (out, _err):
+            lines, err = dh.ftp_list(self._e(), "downloads/", _runner=fake, _sleep=NoSleep())
+        self.assertIsNone(err)
+        self.assertEqual(len(lines), len(OLD_NAMES))
+        self.assertIn("LIST 재시도 1/2", out.getvalue())      # 침묵 금지
 
 
 class FetchContractTests(unittest.TestCase):

@@ -580,5 +580,119 @@ class EndToEndVerdictTests(unittest.TestCase):
         self.assertIn("판정: 전건 통과", out)
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⓘ ★MF-B — 분류(kind)는 **상태가 정한다**. 혼합이면 둘 다 낸다 (2026-08-27 3라운드)
+#
+#   2라운드 구현은 `check(...)` 에 `kind=` 를 넘기지 않은 자리가 둘 있었고(⑤ 빈 응답·⑥ 총량
+#   실패), 그 자리는 기본값 KIND_CONTENT 로 떨어졌다. 실측 반증:
+#     · `/downloads/` 404      → "적색 — 페이지 내용 불일치(exit 1)"
+#     · `SHA256SUMS.txt` 404   → "적색 — 페이지 내용 불일치(exit 1)"
+#   둘 다 실제로는 **원격 확정 오류(4xx)** 이고, SUMS 미업로드는 오너 체크리스트 ⓑ 의 실제
+#   실패 형태다. 사람은 첫 줄을 읽고 '페이지 카피를 보라'는 **틀린 방향**으로 간다.
+#   또 혼합 실패(③④⑥)를 한 분류로 접어 4xx 를 첫 줄에서 지웠다.
+#
+#   ★음성 대조가 이 군의 핵심이다 — 수리가 "전부 원격 확정 오류"로 밀어버리면 분류는
+#     여전히 쓸모없다. test_34 가 **진짜 내용 실패는 여전히 내용 실패**임을 지킨다.
+# ──────────────────────────────────────────────────────────────────────────────
+def _legacy_fold(remote_bad, content_bad):
+    """★구현 재현(테스트 전용) — 2라운드가 쓰던 접기 식.
+
+    `kind=KIND_CONTENT if content_bad else KIND_REMOTE`. 혼합 실패에서 content_bad 가 하나라도
+    있으면 remote_bad 의 4xx 는 첫 줄에서 **사라진다**. test_35 가 이 식과 수리판의 차이를
+    문자로 못박는다(가드를 되돌리면 그 테스트가 적색).
+    """
+    return vr.KIND_CONTENT if content_bad else vr.KIND_REMOTE
+
+
+class KindClassificationTests(unittest.TestCase):
+    """분류 정규화(kinds_of) 자체 — 종단 없이 계약만 본다."""
+
+    def test_30_kinds_of_normalizes(self):
+        self.assertEqual(vr.kinds_of(vr.KIND_REMOTE), (vr.KIND_REMOTE,))
+        self.assertEqual(vr.kinds_of([vr.KIND_REMOTE, vr.KIND_CONTENT]),
+                         (vr.KIND_REMOTE, vr.KIND_CONTENT))
+        # 중복은 접되 **분류는 잃지 않는다**
+        self.assertEqual(vr.kinds_of([vr.KIND_REMOTE, vr.KIND_REMOTE]), (vr.KIND_REMOTE,))
+        # ★이름 없는 적색 금지 — 빈 목록은 기본 분류로 떨어진다(첫 줄이 비지 않는다)
+        self.assertEqual(vr.kinds_of([]), (vr.KIND_CONTENT,))
+        self.assertEqual(vr.kinds_of([None, ""]), (vr.KIND_CONTENT,))
+
+    def test_31_check_prints_all_kinds(self):
+        vr.results[:] = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            vr.check("X", False, "", kind=[vr.KIND_REMOTE, vr.KIND_CONTENT])
+            rc = vr.verdict()
+        out = buf.getvalue()
+        vr.results[:] = []
+        self.assertEqual(rc, vr.EXIT_FAIL)
+        self.assertIn("[%s + %s] X" % (vr.KIND_REMOTE, vr.KIND_CONTENT), out)
+        self.assertIn(vr.KIND_REMOTE, out.split("판정:")[1])   # 첫 줄에도 남는다
+        self.assertIn(vr.KIND_CONTENT, out.split("판정:")[1])
+
+
+class RemoteKindEndToEndTests(unittest.TestCase):
+    """★MF-B 종단 핀 — 실측된 두 형태(404 두 곳)와 혼합 실패가 첫 줄에서 어떻게 읽히는가.
+
+    ★EndToEndVerdictTests 를 **상속하지 않는다** — 상속하면 상위 16건이 통째로 재실행돼
+      전체 개수만 부풀고 실패 지점이 흐려진다. 하네스(setUp/_run)만 같은 것을 쓴다."""
+
+    setUp = EndToEndVerdictTests.setUp
+    tearDown = EndToEndVerdictTests.tearDown
+    _run = EndToEndVerdictTests._run
+
+    def test_32_downloads_page_404_is_named_remote_not_content(self):
+        """★실측 반증 (a) — `/downloads/` 404 는 **원격 확정 오류**다.
+        구판 문면: '판정: 적색 — 페이지 내용 불일치(exit 1)' ← 사람을 페이지 카피로 보낸다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[vr.SITE + "/downloads/"] = [Resp(http=404)]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_FAIL, out)
+        self.assertIn("판정: 적색 — %s" % vr.KIND_REMOTE, out)
+        self.assertNotIn("판정: 적색 — %s" % vr.KIND_CONTENT, out)
+        self.assertIn("[%s] ⑤" % vr.KIND_REMOTE, out)
+        self.assertIn("HTTP 404", out)
+
+    def test_33_sums_404_is_named_remote_not_content(self):
+        """★실측 반증 (b) — `SHA256SUMS.txt` 404. **오너 체크리스트 ⓑ 의 실제 실패 형태**
+        (후처리 미실행·업로드 누락)이고, 사람이 볼 곳은 페이지가 아니라 릴리스 자산이다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan["%s/downloads/SHA256SUMS.txt" % vr.SITE] = [Resp(http=404)]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_FAIL, out)
+        self.assertIn("판정: 적색 — %s" % vr.KIND_REMOTE, out)
+        self.assertIn("[%s] ⑥" % vr.KIND_REMOTE, out)
+        self.assertIn("HTTP 404", out)          # 상태를 문면에 남긴다(침묵 금지)
+
+    def test_34_true_content_failure_is_still_content(self):
+        """★음성 대조 — 자산은 전부 200 인데 페이지 문자열만 틀린 경우는 **여전히 내용 불일치**다.
+        수리가 전부 '원격 확정 오류'로 밀어버리면 분류는 다시 쓸모없어진다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        body = plan[vr.SITE + "/"][0].body.decode()
+        plan[vr.SITE + "/"] = [Resp(body=body.replace("<html>", "<html><!-- %s -->" % PREV).encode())]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_FAIL, out)
+        self.assertIn("판정: 적색 — %s" % vr.KIND_CONTENT, out)
+        self.assertNotIn(vr.KIND_REMOTE, out.split("=== 판정:")[1])
+        self.assertIn("① 구버전 문자열 0", out)
+
+    def test_35_mixed_failure_names_both_kinds(self):
+        """★혼합 — 한 자산은 404(원격), 다른 자산은 표기 불일치(내용). 첫 줄이 **둘 다** 댄다.
+        구판(`_legacy_fold`)은 content 쪽만 남기고 404 를 지웠다."""
+        self.assertEqual(_legacy_fold(["a"], ["b"]), vr.KIND_CONTENT)      # 구판 재현
+        self.assertNotIn(vr.KIND_REMOTE, _legacy_fold(["a"], ["b"]))       # ★4xx 가 사라진다
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan["HEAD %s/downloads/%s" % (vr.SITE, FOUR[0])] = [Resp(http=404)]
+        # 두 번째 자산은 200 이지만 선언 크기가 페이지 표기(0MB)와 다르다 → 내용 축 실패
+        plan["HEAD %s/downloads/%s" % (vr.SITE, FOUR[1])] = [Resp(clen=5 * 1024 * 1024)]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_FAIL, out)
+        self.assertIn("[%s + %s] ③" % (vr.KIND_REMOTE, vr.KIND_CONTENT), out)
+        head = out.split("=== 판정:")[1]
+        self.assertIn(vr.KIND_REMOTE, head)
+        self.assertIn(vr.KIND_CONTENT, head)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

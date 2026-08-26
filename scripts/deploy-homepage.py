@@ -21,6 +21,13 @@
     `--fail`·종료코드·Content-Length 대조로 수신을 검증하고, 유계 재시도(3회)를 소진하고도
     불확실하면 **치환·업로드로 진행하지 않고 중단**한다. 세목은 아래 '수신 검증 계약' 절.
 
+  · ★**FTPS 목록 수신도 fail-closed 다**(2026-08-27 MF-A). `ftp_list()` 가 rc 를 보지 않고
+    `[]` 를 돌려주면 **'받지 못했다'와 '비어 있다'가 같아진다** — 그러면 구자산이 한 건도
+    삭제되지 않은 채 "구버전 없음"으로 찍히고 `✅ 배포 완료` + exit 0 이 난다(v0.13.17
+    무증상 구버전 잔존 클래스). 이제 목록은 `(줄, err)` 로 오고, **업로드 전** 실패는 즉시
+    중단, **업로드 후**(정리 단계) 실패는 롤백 없이 loud + 비영 종료로 '정리 미완'을 알린다.
+    세목은 `ftp_list()` 주석.
+
 기본은 dry-run. `--apply` 를 줘야 실제로 올린다.
 
 사용:
@@ -28,8 +35,13 @@
   python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --apply   # 집행
   python3 scripts/deploy-homepage.py --self-test                     # 삭제 로직 셀프테스트(무접촉)
 
-종료코드: 0 = 정상(dry-run 포함) · 1 = 중단(수신 미판정 · 원격 확정 오류 · fail-closed 위반 ·
-          업로드 실패) · 2 = 사용법
+종료코드: 0 = 정상(dry-run 포함 · 발행 + 구버전 정리까지 완료) · 2 = 사용법
+          1 = 중단 또는 **정리 미완**. 두 가지가 여기 모인다(문면이 어느 쪽인지 말한다):
+              · 착수 전 중단(수신 미판정 · 원격 확정 오류 · fail-closed 위반 · 목록 미수신 ·
+                업로드 실패) — 라이브는 손대지 않았다
+              · ★발행은 끝났으나 구버전 정리 미완(정리 단계 목록 미수신 · DELE 실패) —
+                **롤백하지 않는다**(비가역이 이미 발생 · 되돌리면 홈페이지가 더 나빠진다).
+                서버에 구자산이 남아 있을 수 있다 → 사람이 확인하고 재실행
 
 동반 회귀 테스트: `python3 scripts/tests/test_deploy_homepage_fetch.py`
   (합성 페이크 curl · 네트워크 불요 · ★부분 본문 수신 시 업로드가 **호출되지 않는지** 음성 대조)
@@ -44,6 +56,15 @@ import time
 ENV = os.path.expanduser("~/.cys/hostinger-ftp.env")
 SITE = "https://www.cysinsight.com"
 UA = "Mozilla/5.0"
+
+# ── 재시도 규율 (HTTP·FTPS 공용) ─────────────────────────────────────────────
+# ★한 곳에만 둔다 — HTTP 수신(fetch)과 FTPS LIST 가 **같은 상한**을 쓴다. 계약의 근거는
+#   아래 '수신 검증 계약' 절이고, 상한 자체의 근거는 `retry-loop-needs-stop-condition`
+#   (정지 조건 없는 재시도 금지)이다. ★파일 앞쪽에 있는 이유: `ftp_list` 의 기본 인자가
+#   정의 시점에 이 값을 읽는다(뒤에 두면 NameError).
+MAX_ATTEMPTS = 3                 # ★유계 — 최초 1회 + 재시도 2회
+RETRY_BACKOFF_S = (2.0, 5.0)     # len ≥ MAX_ATTEMPTS-1 (부족하면 마지막 값 반복)
+HTTP_TIMEOUT = 120               # HTTP 1회 상한(초) — 페이지·HEAD 용
 
 
 def load_env():
@@ -62,7 +83,9 @@ def load_env():
 
 
 def curl(args, **kw):
-    return subprocess.run(["curl", "-s", "--max-time", "600"] + args,
+    """FTPS 계열 실행기. ★반환값의 `returncode` 를 **호출부가 반드시 본다** —
+    `-s` 는 진행 막대만 죽이고 `--show-error` 가 오류 문면을 살린다(침묵 금지)."""
+    return subprocess.run(["curl", "-s", "--show-error", "--max-time", "600"] + args,
                           capture_output=True, **kw)
 
 
@@ -74,9 +97,58 @@ def ftp_auth(e):
     return ["-k", "--ftp-ssl", "-u", "%s:%s" % (e["FTP_USER"], e["FTP_PASS"])]
 
 
-def ftp_list(e, path):
-    r = curl(ftp_auth(e) + [ftp_base(e) + path])
-    return r.stdout.decode("utf-8", "replace").splitlines()
+def _stderr_tail(raw):
+    line = ([l for l in (raw or b"").decode("utf-8", "replace").splitlines() if l.strip()]
+            or [""])[-1].strip()
+    return (" · " + line[:200]) if line else ""
+
+
+def _ftp_list_attempt(e, path, runner):
+    """FTPS LIST 1회 → (줄 목록, err). err != None 이면 **목록을 받지 못한 것**이다."""
+    r = runner(ftp_auth(e) + [ftp_base(e) + path])
+    raw = r.stdout.decode("utf-8", "replace")
+    if r.returncode != 0:
+        return None, "curl 종료코드 %d%s" % (r.returncode, _stderr_tail(r.stderr))
+    if raw and not raw.endswith(("\n", "\r")):
+        # ★부분 목록 — LIST 의 각 줄은 CRLF 로 끝난다. 마지막 줄이 개행 없이 끝났다면
+        #   전송이 줄 중간에서 끊긴 것이다. 그 잘린 이름(`cys_0.99.8_x64-set`)을 DELE 대상으로
+        #   삼으면 **존재하지 않는 이름을 지우려다 진짜 파일은 살아남는다**.
+        return None, ("부분 목록 — 마지막 줄이 개행으로 끝나지 않는다(꼬리 %r)"
+                      % raw.splitlines()[-1][-40:])
+    return raw.splitlines(), None
+
+
+def ftp_list(e, path, attempts=MAX_ATTEMPTS, _runner=None, _sleep=None):
+    """FTPS LIST → **(줄 목록, err)**. ★유계 재시도(MAX_ATTEMPTS).
+
+    ★2026-08-27 MF-A 수리 — 구현은 `curl -s`(--fail 없음)의 **rc 를 보지 않고** 곧바로
+      `.splitlines()` 했다. 실행 실측: 호스트 해소 실패에서 `curl rc=6` 인데 이 함수는
+      `[]` 를 돌려줬다 — **'실패'와 '목록이 비었다'가 구분되지 않았다.**
+
+    ★그 무구분이 만드는 사고 — 이 목록이 구동하는 것은 둘이다:
+        (a) `old_versions` 보고        (b) main() 의 **구버전 자산 삭제 루프**
+      목록 수신이 실패하면 구자산이 **한 건도 삭제되지 않은 채** '구버전 없음'으로 찍히고
+      `✅ 홈페이지 배포 완료` + exit 0 이 난다. 이 레포가 v0.13.17 에서 겪은 **'무증상 구버전
+      잔존'** 클래스 그 자체이고, `verify-release-remote.py` 는 페이지 문자열만 보므로
+      **서버에 남은 구자산을 못 잡는다**(감시 사각).
+
+    ★계약 — `([], None)` 은 "정말로 비어 있다"이고 `(None, err)` 은 "받지 못했다"다.
+      호출부는 이 둘을 **절대 같은 것으로 다루지 않는다**.
+    """
+    runner = _runner or curl
+    sleeper = _sleep or time.sleep
+    attempts = max(1, int(attempts))
+    lines, err = None, None
+    for i in range(attempts):                      # ← 유계
+        if i:
+            delay = RETRY_BACKOFF_S[min(i - 1, len(RETRY_BACKOFF_S) - 1)]
+            print("  ↻ LIST 재시도 %d/%d (%.0fs 후) ← %s | %s%s"
+                  % (i, attempts - 1, delay, err, ftp_base(e), path))
+            sleeper(delay)
+        lines, err = _ftp_list_attempt(e, path, runner)
+        if err is None:
+            return lines, None
+    return None, "%s [시도 %d회 소진]" % (err, attempts)
 
 
 def sftp_put(e, local, remote):
@@ -111,7 +183,10 @@ def ftp_put(e, local, remote):
     r = curl(ftp_auth(e) + ["-T", local, ftp_base(e) + remote])
     if r.returncode == 0:
         return True
-    # FTPS 실패(450 등) → SFTP 폴백(정공법 — 함수 docstring 참조)
+    # FTPS 실패(450 등) → SFTP 폴백(정공법 — 함수 docstring 참조).
+    # ★폴백은 조용하지 않다 — 어느 경로로 올라갔는지 로그에 남아야 사후 추적이 된다.
+    print("    ↳ FTPS 업로드 실패(curl 종료코드 %d%s) — SFTP 폴백"
+          % (r.returncode, _stderr_tail(r.stderr)))
     return sftp_put(e, local, remote)
 
 
@@ -119,7 +194,11 @@ def ftp_delete(e, remote):
     d = os.path.dirname(remote)
     r = curl(ftp_auth(e) + ["-Q", "-DELE %s" % os.path.basename(remote),
                             ftp_base(e) + (d + "/" if d else "")])
-    return r.returncode == 0
+    if r.returncode != 0:
+        # ★침묵 금지 — 삭제 실패는 '구자산 잔존'이고, 호출부가 이를 비영 종료로 올린다.
+        print("    ↳ DELE 실패: curl 종료코드 %d%s" % (r.returncode, _stderr_tail(r.stderr)))
+        return False
+    return True
 
 
 # ── ★수신 검증 계약 (2026-08-27 · '잘린 홈페이지 발행' 사고 봉합) ──────────────────
@@ -137,10 +216,9 @@ def ftp_delete(e, remote):
 #       4xx(429 제외) = 원격의 **확정 답** → 재시도하지 않는다(같은 답이 올 뿐)
 #   판정 3분류(자산/원격 확정 오류/미판정)는 검증기와 같은 어휘를 쓴다 — 두 도구의 문면이
 #   갈리면 사람이 같은 사건을 다르게 읽는다.
-MAX_ATTEMPTS = 3                 # ★유계 — 최초 1회 + 재시도 2회 (`retry-loop-needs-stop-condition`)
-RETRY_BACKOFF_S = (2.0, 5.0)     # len ≥ MAX_ATTEMPTS-1 (부족하면 마지막 값 반복)
-HTTP_TIMEOUT = 120               # 1회 상한(초) — 페이지·HEAD 용
-
+#
+# ★같은 규율이 **FTPS LIST 에도** 적용된다(2026-08-27 MF-A) — `ftp_list()` 주석 참조.
+#   상한 상수(MAX_ATTEMPTS·RETRY_BACKOFF_S·HTTP_TIMEOUT)는 파일 앞쪽 '재시도 규율' 절에 있다.
 _CL_RE = re.compile(r"(?im)^\s*content-length:\s*(\d+)\s*$")
 
 
@@ -544,10 +622,21 @@ def main(argv):
         return 1
 
     # ── 현재 라이브 상태 ──
-    live = ftp_list(e, "downloads/")
+    # ★fail-closed 관문 (2026-08-27 MF-A) — 목록 수신 실패를 '목록이 비었다'로 읽으면
+    #   구자산이 한 건도 정리되지 않은 채 "구버전 없음"으로 찍히고 초록으로 끝난다.
+    #   여기는 **업로드 전**이라 아무 비가역도 일어나지 않았다 → 그냥 중단하는 것이 안전하다.
+    live, live_err = ftp_list(e, "downloads/")
+    if live_err:
+        print("::error::라이브 downloads/ 목록 수신 실패 — 진행하지 않는다(fail-closed).",
+              file=sys.stderr)
+        print("::error::  LIST %sdownloads/ → %s" % (ftp_base(e), live_err), file=sys.stderr)
+        print("::error::  ★실패를 '목록이 비었다'로 읽으면 구버전 자산이 한 건도 정리되지 않은 채 "
+              "'구버전 없음'으로 찍힌다(v0.13.17 무증상 구버전 잔존 클래스). 재실행하라.",
+              file=sys.stderr)
+        return 1
     old_versions = sorted({m.group(1) for l in live for m in [re.search(r"cys_(\d+\.\d+\.\d+)_", l)] if m}
                           - {ver})
-    print("라이브 downloads/ 항목 %d · 구버전 %s" % (len(live), old_versions or "없음"))
+    print("라이브 downloads/ 항목 %d · 구버전 %s" % (len(live), old_versions or "없음(목록 수신 확인됨)"))
 
     # ── 페이지 범프 계획 ──
     # ★fail-closed 관문 (2026-08-27) — 여기서 받은 HTML 이 곧 **업로드될 본문**이다.
@@ -654,13 +743,40 @@ def main(argv):
             if not ok:
                 return 1
 
+    # ── 구버전 자산 정리 (최신 1개 정책) ──
+    # ★여기부터는 업로드·페이지 발행이 **이미 끝났다**(비가역). 그래서 이 단계의 실패는
+    #   롤백하지 않는다 — 되돌리면 홈페이지가 더 나빠진다. 대신 **조용한 성공 선언을 금지**한다:
+    #   loud `::error::` + 비영 종료로 '정리 미완'을 사람에게 넘긴다.
     print("── 구버전 자산 정리 (최신 1개 정책) ──")
-    for l in live:
+    fresh, fresh_err = ftp_list(e, "downloads/")     # ★삭제는 **방금 받은 목록** 위에서만 한다
+    if fresh_err:
+        print("::error::구버전 정리 미완 — 목록을 다시 받지 못해 **삭제를 시작하지 않았다**: %s"
+              % fresh_err, file=sys.stderr)
+        print("::error::  업로드·페이지 발행은 이미 끝났고 되돌리지 않는다(비가역). 구버전 자산이 "
+              "서버에 남아 있을 수 있다 — 목록을 확인하고 재실행하라.", file=sys.stderr)
+        print("\n⚠ 홈페이지 발행은 끝났으나 **구버전 정리는 미완**이다(목록 미수신). 완료가 아니다.")
+        return 1
+
+    stale = []
+    for l in fresh:
         name = l.split()[-1] if l.split() else ""
         m = re.search(r"cys_(\d+\.\d+\.\d+)_", name)
         if m and m.group(1) != ver:
-            print("  %s rm %s" % ("✓" if ftp_delete(e, "downloads/" + name) else "✗", name))
-    print("\n✅ 홈페이지 배포 완료")
+            stale.append(name)
+
+    failed = []
+    for name in stale:
+        okd = ftp_delete(e, "downloads/" + name)
+        print("  %s rm %s" % ("✓" if okd else "✗", name))
+        if not okd:
+            failed.append(name)
+    if failed:
+        print("::error::구버전 자산 삭제 실패 %d건: %s" % (len(failed), ", ".join(failed)),
+              file=sys.stderr)
+        print("\n⚠ 홈페이지 발행은 끝났으나 **구버전 정리는 미완**이다(삭제 실패 %d건). 완료가 아니다."
+              % len(failed))
+        return 1
+    print("\n✅ 홈페이지 발행 완료 · 구버전 정리 완료(대상 %d건 · 삭제 실패 0)" % len(stale))
     return 0
 
 

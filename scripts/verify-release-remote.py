@@ -142,6 +142,14 @@ EXIT_USAGE = 2
 EXIT_DOWNLOAD_FAILED = 3         # 미판정 — 이 도구가 판정하지 못했다. ★적색도 초록도 아니다
 
 # ── 적색의 하위 분류(첫 줄에 이름이 찍힌다) ──
+#
+# ★2026-08-27 MF-B 수리 — 이 분류는 **첫 줄이 사람을 어디로 보내는가**를 정하는 값이다.
+#   ·「원격 확정 오류(4xx)」= 서버에 그게 없다/못 준다 → 사람이 볼 곳은 **업로드·후처리**다
+#   ·「페이지 내용 불일치」= 파일은 있는데 문자열이 안 맞는다 → 사람이 볼 곳은 **페이지 카피**다
+#   구현은 이 값을 붙이는 자리를 여러 군데 빠뜨렸고(⑤ 빈 응답·⑥ 총량 실패), 혼합 실패를
+#   한 분류로 접었다(③④⑥). 실측 반증: `/downloads/` 404 와 `SHA256SUMS.txt` 404 가 둘 다
+#   "적색 — 페이지 내용 불일치"로 찍혔다 — 둘 다 실제로는 원격 확정 오류이고, SUMS 미업로드는
+#   오너 체크리스트 ⓑ 의 실제 실패 형태다. 규율: **분류는 상태(status)가 정하고, 섞이면 둘 다 낸다.**
 KIND_INTEGRITY = "자산 무결성 실패"       # 완전 수신 바이트 ≠ SUMS · 미등재
 KIND_REMOTE = "원격 확정 오류(4xx)"       # 404 등 — 원격이 "없다"고 확정 답을 했다
 KIND_CONTENT = "페이지 내용 불일치"       # 버전·용량·마커 등 문자열 판정 실패
@@ -365,10 +373,31 @@ def fetch(url, timeout=PAGE_TIMEOUT, head=False, want_text=True, want_digest=Fal
     return r
 
 
+def kinds_of(kind):
+    """`kind` 를 **분류 튜플**로 정규화한다 (2026-08-27 MF-B).
+
+    ★왜 튜플인가 — 한 항목이 두 이유로 동시에 실패할 수 있다(예: ③ 에서 자산 하나는 404,
+      다른 하나는 표기 불일치). 구현은 그걸 `A if content_bad else B` 로 **하나로 접었고**,
+      접히는 쪽이 항상 '페이지 내용 불일치'였다. 그러면 첫 줄이 4xx 를 숨긴 채 사람을
+      "페이지 카피를 보라"는 **틀린 방향**으로 보낸다. 분류를 잃지 않고 둘 다 들고 간다.
+    ★빈 목록은 허용하지 않는다 — 이름 없는 적색은 첫 줄이 아무것도 말해주지 못한다.
+    """
+    if isinstance(kind, (list, tuple, set)):
+        out = []
+        for k in kind:
+            if k and k not in out:
+                out.append(k)
+        return tuple(out) or (KIND_CONTENT,)
+    return (kind,)
+
+
 def check(name, ok, detail="", kind=KIND_CONTENT):
-    """PASS/FAIL 을 기록한다. `kind` 는 **적색의 하위 분류**이고 첫 줄 요약에 이름이 찍힌다."""
-    results.append((name, "PASS" if ok else "FAIL", "" if ok else kind))
-    print(("PASS " if ok else "FAIL " + "[%s] " % kind) + name
+    """PASS/FAIL 을 기록한다. `kind` 는 **적색의 하위 분류**이고 첫 줄 요약에 이름이 찍힌다.
+
+    ★`kind` 는 문자열 하나 또는 **여러 분류의 목록**이다(혼합 실패 · kinds_of 주석 참조)."""
+    ks = kinds_of(kind)
+    results.append((name, "PASS" if ok else "FAIL", () if ok else ks))
+    print(("PASS " if ok else "FAIL " + "[%s] " % " + ".join(ks)) + name
           + (" | " + detail if detail else ""))
 
 
@@ -379,7 +408,7 @@ def download_failed(name, reason, detail=""):
       오리진에 실제로 박힌 부분 자산과 경로에서 끊긴 전송은 수신 측에서 같은 증상이고,
       이 도구에는 둘을 가릴 근거가 없다. 말할 수 있는 것은 "확인하지 못했다"뿐이다.
     """
-    results.append((name, "DOWNLOAD_FAILED", KIND_UNDETERMINED))
+    results.append((name, "DOWNLOAD_FAILED", (KIND_UNDETERMINED,)))
     download_failures.append("%s: %s" % (name, reason))
     print("DOWNLOAD_FAILED [미판정] " + name
           + " | 이 도구는 이 항목을 판정하지 못했다(수신 미완결 · 원격 내용 미확인): " + reason
@@ -404,8 +433,10 @@ def verdict():
     tally = "%d/%d PASS" % (npass, len(results))
 
     # ★첫 줄 하나로 "어느 분류인가 · 어떤 exit 인가"가 끝나야 한다.
+    #   ★혼합 실패는 **분류를 전부** 이름 댄다(MF-B) — 하나로 접으면 첫 줄이 4xx 를 숨긴다.
     if fails:
-        head = "적색 — %s (exit %d)" % (" + ".join(sorted({k for _, k in fails})), EXIT_FAIL)
+        head = "적색 — %s (exit %d)" % (
+            " + ".join(sorted({k for _, ks in fails for k in ks})), EXIT_FAIL)
     elif dls:
         head = "미판정 — 이 실행은 원격을 판정하지 못했다 (exit %d)" % EXIT_DOWNLOAD_FAILED
     else:
@@ -414,8 +445,8 @@ def verdict():
           + ((" (미판정 %d건)" % len(dls)) if dls and fails else ""))
 
     if fails:
-        for name, k in fails:
-            print("   · [%s] %s" % (k, name))
+        for name, ks in fails:
+            print("   · [%s] %s" % (" + ".join(ks), name))
     if dls:
         print("\n!! 미판정(DOWNLOAD_FAILED) %d건 — 아래 항목은 이번 실행에서 **판정되지 않았다**."
               % len(dls))
@@ -524,9 +555,12 @@ def main(argv):
             content_bad.append("%s: 표기 %s 없음(실제 %d B)" % (f, tok, h.clen))
     bad = remote_bad + content_bad
     if bad:
+        # ★혼합 실패는 **두 분류를 모두** 낸다(2026-08-27 MF-B). 구현은 content_bad 가 하나라도
+        #   있으면 통째로 '페이지 내용 불일치'로 접었고, 그러면 같은 항목 안의 404 가 첫 줄에서
+        #   사라져 사람이 페이지 카피를 뒤지게 된다.
         check("③ 용량 4토큰 실자산 대조", False,
               "; ".join(bad) + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
-              kind=KIND_CONTENT if content_bad else KIND_REMOTE)
+              kind=([KIND_REMOTE] if remote_bad else []) + ([KIND_CONTENT] if content_bad else []))
     elif dl_bad:
         download_failed("③ 용량 4토큰 실자산 대조", "; ".join(dl_bad))
     else:
@@ -536,18 +570,26 @@ def main(argv):
     urls = set(re.findall(r'href="([^"]*(?:dmg|setup\.exe|setup\.zip))"', main_html))
     urls |= set(re.findall(r"""setAttribute\(\s*['"]href['"]\s*,\s*['"]([^'"]*(?:dmg|setup\.exe|setup\.zip))['"]""", main_html))
     full = sorted((u if u.startswith("http") else SITE + u.lstrip(".")) for u in urls)
-    bad, dl_bad = [], []
+    # ★두 축이 섞인다: **링크 수집 결과**(페이지 내용)와 **각 링크의 원격 응답**(4xx).
+    #   구현은 `len(full) != 4` 이면 4xx 가 있어도 통째로 '페이지 내용 불일치'로 접었다 —
+    #   404 를 첫 줄에서 지우는 같은 결함이다(MF-B). 이제 두 축을 따로 세고 둘 다 이름 댄다.
+    bad_remote, bad_other, dl_bad = [], [], []
     for u in full:
         h = fetch(u, head=True)
         if not h.download_ok:
             dl_bad.append("%s: %s" % (u, h.err))
+        elif h.status >= 400:
+            bad_remote.append("%s(HTTP %d · 원격 확정 답)" % (u, h.status))
         elif h.status != 200:
-            bad.append("%s(HTTP %d)" % (u, h.status))
+            # 3xx 등 — 원격의 확정 오류는 아니고 링크가 가리키는 곳이 이상하다(내용 축).
+            bad_other.append("%s(HTTP %d)" % (u, h.status))
+    bad = bad_remote + bad_other
     if len(full) != 4 or bad:
         check("④ 다운로드 링크 4종 HEAD 200", False,
               "링크 %d개 · 비200 %s" % (len(full), bad or "없음")
               + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
-              kind=KIND_REMOTE if (bad and len(full) == 4) else KIND_CONTENT)
+              kind=([KIND_REMOTE] if bad_remote else [])
+                   + ([KIND_CONTENT] if (len(full) != 4 or bad_other) else []))
     elif dl_bad:
         download_failed("④ 다운로드 링크 4종 HEAD 200", "; ".join(dl_bad),
                         "링크 %d개(수집은 정상)" % len(full))
@@ -589,8 +631,12 @@ def main(argv):
     if not dlp.download_ok:
         download_failed("⑤ Defender 안내 섹션 마커 (다운로드 페이지)", dlp.err)
     elif not dl_html:
+        # ★분류 (2026-08-27 MF-B) — 여기 도달하는 최빈 형태는 **/downloads/ 404** 다
+        #   (4xx 는 download_ok=True · 본문 없음). 그걸 '페이지 내용 불일치'로 적으면
+        #   사람이 없는 페이지의 카피를 뒤진다. 상태로 갈라 이름을 바로 댄다.
         check("⑤ Defender 안내 섹션 마커 (다운로드 페이지)", False,
-              "/downloads/ 빈 응답 · " + http_detail(dlp))
+              "/downloads/ 빈 응답 · " + http_detail(dlp),
+              kind=KIND_REMOTE if dlp.status >= 400 else KIND_CONTENT)
     else:
         mk = dl_html.count(DEFENDER_MARKER)
         # 마커 속성을 지운 **본문**에서만 낱말을 센다(항진명제 차단).
@@ -654,10 +700,11 @@ def main(argv):
         red = mismatch + remote_err
         if red:
             # 적색이 하나라도 확정되면 그게 판정이다(미판정 항목은 곁들여 적는다).
+            # ★혼합(해시 불일치 + 4xx)이면 **둘 다** 이름 댄다 — 접으면 한쪽이 첫 줄에서 사라진다.
             check("⑥ SHA256SUMS.txt 전수·실자산 대조", False,
                   detail + " · 실자산 대조 " + ", ".join(red)
                   + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
-                  kind=KIND_INTEGRITY if mismatch else KIND_REMOTE)
+                  kind=([KIND_INTEGRITY] if mismatch else []) + ([KIND_REMOTE] if remote_err else []))
         elif dl_bad:
             # ★문면 규율(MF2): 여기서 "자산은 정상"이라고 말하지 않는다. 말할 수 있는 것은
             #   **다른** 자산들이 일치했다는 사실과, 이 자산은 확인하지 못했다는 사실뿐이다.
@@ -666,7 +713,13 @@ def main(argv):
         else:
             check("⑥ SHA256SUMS.txt 전수·실자산 대조", True, detail + " · 실자산 대조 4종 일치")
     else:
-        check("⑥ SHA256SUMS.txt 전수·실자산 대조", False, detail)
+        # ★분류 (2026-08-27 MF-B) — 여기 도달하는 최빈 형태는 **SUMS 404**(=오너 체크리스트 ⓑ
+        #   "SHA256SUMS 전 자산 갱신"의 실제 실패 형태: 후처리 미실행·업로드 누락)다. 4xx 는
+        #   download_ok=True 로 오므로 본문이 비어 lines=0 → 여기로 떨어진다. 그걸 '페이지 내용
+        #   불일치'로 적으면 사람이 페이지 카피를 뒤진다. 상태로 갈라 이름을 바로 댄다.
+        check("⑥ SHA256SUMS.txt 전수·실자산 대조", False,
+              detail + " · " + http_detail(sf),
+              kind=KIND_REMOTE if sf.status >= 400 else KIND_CONTENT)
 
     # ⑦ 메인페이지 macOS(Safari) 안내 삭제 확인 (오너 지시 2026-08-24)
     # 이미 받아둔 main_html 을 재사용한다 — 추가 왕복 없음.
