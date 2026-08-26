@@ -6214,31 +6214,42 @@ async function start() {
   // 자연히 안 뜸)이고, 카드가 화면에 남아 있는 동안만 저빈도 재판정을 돌려 설치 감지 시 즉시
   // 내린다. 재판정 루프는 카드 소멸(TTL·수동 닫기)과 함께 스스로 멈춘다 — 상주 폴링 금지,
   // 닫힌 카드를 되살리는 재점등 스팸 금지(재점등은 다음 기동의 재판정 몫).
-  try {
-    const hint = await invoke("claude_missing_hint");
-    if (typeof hint === "string" && hint) {
-      stickyToast("claude-missing", "health", "Claude Code CLI가 없습니다", hint);
-      const recheck = setInterval(() => {
-        if (!stickyToasts.has("claude-missing")) {
-          clearInterval(recheck); // 카드가 이미 없다(TTL 소멸·수동 닫기) — 루프 종료
-          return;
-        }
-        void (async () => {
-          try {
-            const again = await invoke("claude_missing_hint");
-            if (!(typeof again === "string" && again)) {
-              clearInterval(recheck);
-              dismissToast("claude-missing"); // 설치 감지(또는 판정 불가로 전환) — 즉시 제거
-            }
-          } catch {
-            /* 일시 판정 실패는 다음 틱 — 미판정을 미설치로 오보하지 않는다 */
+  // ★SF-1(P4 수정 라운드): fire-and-forget — 이후 부트 코드는 이 결과에 무의존인데 직렬 await 는
+  // 기동을 agent-detect 의 전 어댑터 스윕(어댑터별 which/where 스폰 · Defender 콜드스타트 기계에서
+  // 수백 ms급)만큼 지연시켰다. 비동기 분리로 기동 지연 0 — daemon-ready listen 등록이 그만큼
+  // 앞당겨져 emit-before-listen 창은 오히려 좁아진다(놓친 경우도 300ms daemon_status 프로브가 회수).
+  void (async () => {
+    try {
+      const hint = await invoke("claude_missing_hint");
+      if (typeof hint === "string" && hint) {
+        stickyToast("claude-missing", "health", "Claude Code CLI가 없습니다", hint);
+        const recheck = setInterval(() => {
+          // ★SF-2 결선 명시: 이 루프의 유일한 상시 종료 조건은 stickyToasts 맵에서 id 가 사라지는
+          // 것이고, 삭제 경로는 dismissToast 하나로 수렴한다(TTL 만료 타이머·닫기 버튼
+          // addToastCloseButton·아래 설치 감지 — 전부 dismissToast 호출). dismissToast 가 맵
+          // delete 를 잃으면 이 루프는 "최대 TTL+틱 내 자연 종료" 상한이 깨져 다음 기동까지
+          // 20s 폴링으로 남는다 — stickyToast/dismissToast 의 맵 계약을 바꾸면 이 결선도 함께 보라.
+          if (!stickyToasts.has("claude-missing")) {
+            clearInterval(recheck); // 카드가 이미 없다(TTL 소멸·수동 닫기) — 루프 종료
+            return;
           }
-        })();
-      }, 20_000);
+          void (async () => {
+            try {
+              const again = await invoke("claude_missing_hint");
+              if (!(typeof again === "string" && again)) {
+                clearInterval(recheck);
+                dismissToast("claude-missing"); // 설치 감지(또는 판정 불가로 전환) — 즉시 제거
+              }
+            } catch {
+              /* 일시 판정 실패는 다음 틱 — 미판정을 미설치로 오보하지 않는다 */
+            }
+          })();
+        }, 20_000);
+      }
+    } catch {
+      /* 오라클 실행 실패·판정 불가는 무음(백엔드 계약 ③과 동일 방향) */
     }
-  } catch {
-    /* 오라클 실행 실패·판정 불가는 무음(백엔드 계약 ③과 동일 방향) */
-  }
+  })();
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {

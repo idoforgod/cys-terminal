@@ -7665,10 +7665,12 @@ fn fetch_surfaces() -> Vec<Value> {
 }
 
 /// 플랫폼별 설치 힌트(G29·B8) — 의무 CLI 미설치는 exit 0 성공이 아니라 typed `missing` outcome 이다.
-fn install_hint(agent: &str) -> &'static str {
+/// OS 를 인자로 받는 순수형이 정본이다(lib.rs `bundled_git_bash_path_for` 와 동일 이유 —
+/// 회귀 핀이 다른 플랫폼 CI 에서도 Windows 분기를 실제로 밟게 하기 위해서다 · MF-1 핀).
+fn install_hint_for(agent: &str, os: &str) -> &'static str {
     match agent {
         "claude" => {
-            if cfg!(windows) {
+            if os == "windows" {
                 "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
             } else {
                 "`curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭"
@@ -7681,10 +7683,33 @@ fn install_hint(agent: &str) -> &'static str {
     }
 }
 
+/// 실행 플랫폼용 박피 래퍼 — 기존 호출부(부트 로스터 · agent-detect)는 무변경.
+fn install_hint(agent: &str) -> &'static str {
+    install_hint_for(agent, std::env::consts::OS)
+}
+
 /// B8: agents.json 의 cmd 가 Windows 실설치 경로와 어긋날 때의 안내 — 후보 전탐색까지 빈손일 때만.
-#[cfg(windows)]
+/// (비 Windows 빌드에서는 `full_miss_hint` 회귀 핀만 참조한다 — cfg 게이트 대신 핀 가시성.)
+#[cfg_attr(not(windows), allow(dead_code))]
 const WINDOWS_AGENT_PATH_HINT: &str = "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 \
 (agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex)";
+
+/// B8 전탐색 빈손 시의 **최종 hint 판정**(순수 · OS 무관 컴파일 = 회귀 핀 대상).
+///
+/// ★MF-1(P4 수정 라운드): 의무 CLI `claude` 는 경로수정 힌트로 **치환하지 않는다** —
+///   claude 의 cmd 는 PATH 형(`claude …`)이고 설치기는 네이티브(install.ps1)라 npm 형상이
+///   아니다. 신규 Windows 기계(INST-1 카드의 주 대상)는 감지+B8 전탐색이 반드시 빈손이므로,
+///   일괄 치환하면 카드 본문이 설치 명령(`irm … install.ps1`) 대신 agents.json 경로수정
+///   안내가 된다(브리프 P4-4 '문구 SOT=install_hint' 위반). 경로수정 힌트는 npm 형상의
+///   선택 리뷰어류(agy·codex 등)에만 정답이다.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn full_miss_hint(agent: &str, os: &str) -> &'static str {
+    if os == "windows" && agent != "claude" {
+        WINDOWS_AGENT_PATH_HINT
+    } else {
+        install_hint_for(agent, os)
+    }
+}
 
 /// 어댑터 설치 감지 결과 — `cys agent-detect`·`run_boot` 이 공유하는 **단일 오라클**의 산출물(CS-1③).
 struct AgentDetection {
@@ -7696,7 +7721,8 @@ struct AgentDetection {
     resolved: Option<std::path::PathBuf>,
     /// 사람용 판정 근거 한 줄 (python detect_reviewer 의 reason 과 동형 문면).
     reason: String,
-    /// 미설치 안내 — 기본은 install_hint, Windows 후보 전탐색 실패 시 경로수정 힌트로 대체.
+    /// 미설치 안내 — 기본은 install_hint. Windows 후보 전탐색 실패 시에만 경로수정 힌트로
+    /// 대체하되 **의무 CLI claude 는 제외**한다(판정 단일처=`full_miss_hint` · MF-1).
     hint: String,
 }
 
@@ -7800,12 +7826,12 @@ fn windows_agent_candidates(bin: &str) -> Option<std::path::PathBuf> {
 /// B8 후보 순회는 **Windows 한정** — 다른 OS 빌드에서는 항등(cfg 분기를 함수 두 벌로 갈라
 /// `mut` 미사용 경고 없이 컴파일된다).
 #[cfg(not(windows))]
-fn apply_windows_agent_fallback(d: AgentDetection) -> AgentDetection {
+fn apply_windows_agent_fallback(_agent: &str, d: AgentDetection) -> AgentDetection {
     d
 }
 
 #[cfg(windows)]
-fn apply_windows_agent_fallback(mut d: AgentDetection) -> AgentDetection {
+fn apply_windows_agent_fallback(agent: &str, mut d: AgentDetection) -> AgentDetection {
     if d.installed {
         return d;
     }
@@ -7820,7 +7846,8 @@ fn apply_windows_agent_fallback(mut d: AgentDetection) -> AgentDetection {
                 "{} → Windows 후보(.cmd/.exe/.bat/.ps1 · %APPDATA%\\npm · %LOCALAPPDATA%\\npm) 전부 미발견",
                 d.reason
             );
-            d.hint = WINDOWS_AGENT_PATH_HINT.to_string();
+            // ★hint 치환은 `full_miss_hint` 단일 판정 — claude 는 install_hint 유지(MF-1).
+            d.hint = full_miss_hint(agent, std::env::consts::OS).to_string();
         }
     }
     d
@@ -7864,13 +7891,16 @@ fn detect_agent_binary(agent: &str, agents: &Value) -> AgentDetection {
             (false, None, format!("PATH 미발견 {bin}"))
         }
     };
-    apply_windows_agent_fallback(AgentDetection {
-        installed,
-        bin,
-        resolved,
-        reason,
-        hint: install_hint(agent).to_string(),
-    })
+    apply_windows_agent_fallback(
+        agent,
+        AgentDetection {
+            installed,
+            bin,
+            resolved,
+            reason,
+            hint: install_hint(agent).to_string(),
+        },
+    )
 }
 
 /// `cys agent-detect [--json]` — 어댑터별 설치 감지를 **한 곳에서** 판정해 내보낸다.
@@ -16239,6 +16269,42 @@ mod tests {
         assert_eq!(d.bin, "no-such-agent-xyz");
         assert!(!d.installed);
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★MF-1 회귀 핀(P4 수정 라운드): **Windows 에서 claude 미설치 → hint 에 install.ps1**.
+    ///
+    /// 종전 회귀: B8 전탐색 빈손이면 전 어댑터 일괄 `WINDOWS_AGENT_PATH_HINT` 치환 —
+    /// 신규 Windows 기계(INST-1 카드의 주 대상 · claude cmd 는 PATH 형이라 반드시 빈손)에서
+    /// 카드 본문이 네이티브 설치 명령 대신 agents.json 경로수정 안내가 됐다(브리프 P4-4
+    /// '문구 SOT=install_hint' 위반). 순수형(os 인자) 핀이라 비 Windows CI 에서도 Windows
+    /// 분기를 실제로 밟는다(lib.rs `bundled_git_bash_path_for` 와 동일 규약).
+    #[test]
+    fn full_miss_hint_keeps_claude_installer_on_windows() {
+        // ⓐ 의무 CLI claude: 치환 금지 — install_hint 그대로(네이티브 설치 명령 포함).
+        let h = full_miss_hint("claude", "windows");
+        assert_eq!(
+            h,
+            install_hint_for("claude", "windows"),
+            "claude hint 가 경로수정 힌트로 치환됐다(MF-1 재발)"
+        );
+        assert!(
+            h.contains("irm https://claude.ai/install.ps1 | iex"),
+            "Windows claude 미설치 hint 에 네이티브 설치 명령이 없다: {h}"
+        );
+        assert!(!h.contains("agents.json"), "claude hint 에 경로수정 안내가 섞였다: {h}");
+        // ⓑ 선택 리뷰어류(npm 형상): 종전 계약 유지 — 전탐색 빈손이면 경로수정 힌트.
+        for a in ["gemini", "codex", "grok", "unknown-agent"] {
+            assert_eq!(
+                full_miss_hint(a, "windows"),
+                WINDOWS_AGENT_PATH_HINT,
+                "{a} 는 전탐색 빈손 시 경로수정 힌트여야 한다(종전 계약)"
+            );
+        }
+        // ⓒ 비 Windows: 치환 자체가 없다(항등 — B8 후보 순회는 Windows 한정).
+        for os in ["macos", "linux"] {
+            assert_eq!(full_miss_hint("claude", os), install_hint_for("claude", os));
+            assert_eq!(full_miss_hint("gemini", os), install_hint_for("gemini", os));
+        }
     }
 
     /// ★(W4 · B19) 폴더신뢰 판정이 **어댑터 선언을 실제로 소비**하고, 내장 needle 폴백을
