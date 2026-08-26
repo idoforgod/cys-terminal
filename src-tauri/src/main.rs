@@ -1072,9 +1072,35 @@ fn merge_integrity_pull(
     seal_broken.or(structural)
 }
 
+// ── P4-2: Windows 설치본 runtime 결손 기동 검사(advisory 전용 · stat-only) ────────
+//
+// macOS '반쪽 번들' 검사의 Windows 짝이다 — 감시 대상은 동봉 runtime 4좌표(훅 런처 bash ·
+// MSYS bash · python3 · node, SOT·근거는 `cys::BUNDLED_WINDOWS_RUNTIME_REL` 주석). 주 시나리오는
+// AV **후발 격리**(설치는 성공했는데 나중에 백신이 exe 를 격리 — 설치기 게이트로는 영원히
+// 못 잡는 계급)와 불완전 설치의 잔반이다. 증상은 "훅·자동화가 아무 말 없이 안 돈다"뿐이라,
+// 매 기동 pull 재판정으로 침묵을 깬다.
+//
+// ★왜 부트를 멈추지 않고 '알리기만' 하는가(macOS :916-921 계약의 복제 — P4-2 완화 계약):
+//   여기서 부트를 멈추면 ⓐ 오탐 1건이 정상 사용자의 앱을 통째로 무력화하고 ⓑ 아직 동작하는
+//   기능까지 뺏는다. 사고의 진짜 피해는 "고장을 아무도 말해주지 않은 것"이므로 처방도 알림이다.
+// ★형상 계약(R3-P04-2 ②): stat 수준(ms급)이므로 **pull 시 직접 계산**한다 — 캐시·emit·
+//   setup 삽입 전무 = 기동 지연 0 · 레이스 0. 해시·실행 검사로 격상하려면 SEAL-DIAG 3종 셋
+//   (별도 스레드 + OnceLock 캐시 선적재 + emit)을 미러해야 하며 이 함수에 넣지 않는다.
+// ★패닉 봉인: current_exe 실패·parent 부재는 전부 None(무음)으로 접는다 — 가능-실패 코드만
+//   쓰고 unwrap/expect 가 없다(pull 경로 패닉은 프론트 invoke 에러 = 알림 사망).
+#[cfg(windows)]
+fn windows_runtime_integrity_guidance() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let missing = cys::windows_runtime_missing_for(exe_dir, std::env::consts::OS)?;
+    cys::windows_runtime_damage_notice(&missing)
+}
+
 /// 프론트 pull 경로(`boot_verdict` 와 같은 이유 — emit-before-listen 레이스 회피).
-/// 구조 결손(즉시 판정)과 **캐시된 봉인 파손**(백그라운드 자가진단이 적재 · F3 격차1)을
-/// 합산해 돌려준다. 정상 설치본·번들 밖 실행·비 macOS 는 None.
+/// macOS: 구조 결손(즉시 판정)과 **캐시된 봉인 파손**(백그라운드 자가진단이 적재 · F3 격차1)을
+/// 합산해 돌려준다. Windows(P4-2): 동봉 runtime 4좌표 결손을 pull 시 직접 stat 판정한다
+/// (프론트는 이 값을 무조건 이중 pull + push listen 으로 소비 중이라 UI 변경 0 으로 점등).
+/// 정상 설치본·번들 밖 실행·그 외 OS 는 None.
 #[tauri::command]
 fn bundle_integrity() -> Option<String> {
     #[cfg(target_os = "macos")]
@@ -1082,8 +1108,53 @@ fn bundle_integrity() -> Option<String> {
         let seal = seal_broken_cache().lock().unwrap().clone();
         return merge_integrity_pull(bundle_integrity_guidance(), seal);
     }
+    #[cfg(windows)]
+    {
+        return windows_runtime_integrity_guidance();
+    }
     #[allow(unreachable_code)]
     None
+}
+
+/// INST-1(P4-4): claude CLI 미설치 온보딩 카드의 pull 오라클.
+///
+/// 의무 CLI(claude)가 없으면 팀 부트가 통째로 서는데, 종전 신호(boot-warning 계열)는 실패
+/// 사실만 말하고 "무엇을 어떻게 설치하는지"가 없었다. 이 커맨드는 기동 시 프론트가 pull 해
+/// 미설치일 때만 설치 안내문을 돌려준다.
+///
+/// ★판정 계약 셋:
+///   ① 오라클 단일(CS-1③): 판정은 `cys agent-detect --json` 의 typed `installed:false` 만
+///      소비한다 — 여기서 which/where 를 재구현하거나 화면 문자열을 스니핑하지 않는다
+///      (grok '미설치' 문자열 오탐 발화 전례 · P4-4 orchestration 계약).
+///   ② 문구 SOT 단일: 안내문은 오라클 산출 `hint`(= cys `install_hint`, 플랫폼 분기 완비)를
+///      **그대로** 전달한다 — 사본을 만들면 설치 명령이 두 정의처로 갈라진다.
+///   ③ 미판정 ≠ 미설치: exit 3(판정 불가 — agents.json 미독)·스폰 실패·JSON 파싱 실패는 전부
+///      None(무음)이다 — 판정 불가를 "설치하라"로 오보하지 않는다(run_agent_detect 의 0/3 규약).
+///
+/// 수명 규칙(카드 소멸)은 프론트 몫: 이벤트 소멸 신호 없음 — sticky TTL 자연 소멸 + 매 기동
+/// 이 pull 재판정 + (카드 표시 중 한정) 재판정으로 설치 감지 시 즉시 제거.
+#[tauri::command]
+async fn claude_missing_hint() -> Option<String> {
+    let out = tokio::task::spawn_blocking(|| {
+        let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
+        let mut cmd = std::process::Command::new(&cys);
+        cmd.args(["agent-detect", "--json"]);
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .ok()?
+    .ok()?;
+    // exit 0 = 판정 산출(신뢰) · 그 외(3=판정 불가 등)는 무음 — 계약 ③.
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let claude = v.get("agents")?.get("claude")?;
+    if claude.get("installed")?.as_bool()? {
+        return None;
+    }
+    claude.get("hint")?.as_str().map(str::to_string)
 }
 
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
@@ -3841,6 +3912,8 @@ fn main() {
             boot_verdict,
             // ATOMIC-1 짝: 설치본이 '반쪽 번들'인지 기동 시 스스로 확인해 복구 절차를 준다.
             bundle_integrity,
+            // INST-1(P4-4): claude CLI 미설치 온보딩 카드 pull(agent-detect 단일 오라클 소비).
+            claude_missing_hint,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -6203,6 +6203,42 @@ async function start() {
   } catch {
     /* 비-macOS·번들 밖 실행은 해당 없음 */
   }
+  // ★INST-1 온보딩 카드(P4-4 · claude CLI 미설치): 의무 CLI가 없으면 팀 부트가 통째로 서는데
+  // 종전 신호(boot-warning 계열)는 실패 사실만 말하고 설치 방법이 없었다. 판정·문구는 백엔드
+  // claude_missing_hint가 cys agent-detect 단일 오라클(CS-1③)의 typed installed:false + hint
+  // (= install_hint SOT · 플랫폼 분기 완비)를 그대로 전달한다 — 여기서 판정 재구현·문자열 스니핑·
+  // 문구 사본 금지. 데몬 무의존 판정이라 daemon-ready 대기 **앞**에 둔다(claude 부재 기계에서
+  // 부트가 안 풀려도 이 카드는 뜬다).
+  // 수명 계약(T-0147-3 + P4-4): 이벤트 소멸 신호에 걸지 않는다(발행자 부재 시 불소멸 실사고 —
+  // formation-complete 전례). 기본 소멸은 sticky TTL 자연 소멸 + 매 기동 이 pull 재판정(설치되면
+  // 자연히 안 뜸)이고, 카드가 화면에 남아 있는 동안만 저빈도 재판정을 돌려 설치 감지 시 즉시
+  // 내린다. 재판정 루프는 카드 소멸(TTL·수동 닫기)과 함께 스스로 멈춘다 — 상주 폴링 금지,
+  // 닫힌 카드를 되살리는 재점등 스팸 금지(재점등은 다음 기동의 재판정 몫).
+  try {
+    const hint = await invoke("claude_missing_hint");
+    if (typeof hint === "string" && hint) {
+      stickyToast("claude-missing", "health", "Claude Code CLI가 없습니다", hint);
+      const recheck = setInterval(() => {
+        if (!stickyToasts.has("claude-missing")) {
+          clearInterval(recheck); // 카드가 이미 없다(TTL 소멸·수동 닫기) — 루프 종료
+          return;
+        }
+        void (async () => {
+          try {
+            const again = await invoke("claude_missing_hint");
+            if (!(typeof again === "string" && again)) {
+              clearInterval(recheck);
+              dismissToast("claude-missing"); // 설치 감지(또는 판정 불가로 전환) — 즉시 제거
+            }
+          } catch {
+            /* 일시 판정 실패는 다음 틱 — 미판정을 미설치로 오보하지 않는다 */
+          }
+        })();
+      }, 20_000);
+    }
+  } catch {
+    /* 오라클 실행 실패·판정 불가는 무음(백엔드 계약 ③과 동일 방향) */
+  }
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {

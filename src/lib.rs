@@ -1008,6 +1008,96 @@ pub fn inject_claude_code_git_bash_path_for(
     ));
 }
 
+/// ── P4-2: Windows 설치본 runtime 결손 검사(advisory 전용 · stat-only) ─────────────
+///
+/// 감시 4좌표 — 실측 근거는 릴리스 레인 자신이다(`.github/workflows/windows-build.yml` 이
+/// 네 파일 전부를 빌드 게이트로 단언한다 · `runtime/git/bin/bash.exe` 는 부재 시 FATAL):
+///   ① `runtime\git\bin\bash.exe`   — Claude Code 훅 실행 **런처**(U-20 주입과 동일 파일).
+///      ★[`BUNDLED_GIT_BASH_REL`] 재사용이 계약이다: 좌표 상수를 이원화하면 "결손 통보"와
+///      "U-20 주입"의 판정이 어긋난다(한쪽만 고쳐지는 회귀 — P4-2 couplings[callee]).
+///   ② `runtime\git\usr\bin\bash.exe` — MSYS 실 바이너리. cysd PATH 주입·셸 탐지가 집는 쪽
+///      (windows-build.yml:131 "cysd PATH 주입이 기대하는 정확 경로").
+///   ③ `runtime\python\python3.exe` — 팩 부트 체인(`javis_*.py`)의 인터프리터.
+///   ④ `runtime\node\node.exe`     — npm/npx 동봉(mac 파리티).
+///
+/// 이 검사가 곧 P4-3 '경고 격상'의 실체다: ①이 사라지면 훅 전멸 + U-20 미주입이 **동시에**
+/// 일어나는데 증상은 "아무 일도 안 일어난다" 뿐이다 — 그 침묵을 기동 시 안내로 깬다.
+pub const BUNDLED_WINDOWS_RUNTIME_REL: [&[&str]; 4] = [
+    &BUNDLED_GIT_BASH_REL,
+    &["runtime", "git", "usr", "bin", "bash.exe"],
+    &["runtime", "python", "python3.exe"],
+    &["runtime", "node", "node.exe"],
+];
+
+/// Windows 설치본 runtime 4좌표 결손 목록(부작용: 디렉터리 stat 1회 + 파일 stat ≤4회).
+///
+/// 반환 계약(3값 — '판정 불가'와 '무결'을 섞지 않는다):
+///   · `None`      = 판정하지 않음 — 비 Windows, 또는 `exe_dir\runtime` 디렉터리 자체가 없는
+///     **비설치 레이아웃**(cargo run·CI 테스트 바이너리·포터블 실행). macOS 짝
+///     (`bundle_integrity_guidance` 의 "번들 미탐지 = 완전 무음")과 대칭이다 — 이 가드가 없으면
+///     Windows 개발 빌드 매 기동이 "재설치 필요" 오보가 된다. 대가로 "runtime 디렉터리가
+///     통째로 사라진 설치본"은 이 검사의 사각이다(그 계급은 설치기 게이트의 영토 — P4-1).
+///   · `Some([])`  = 판정했고 무결.
+///   · `Some([..])`= 판정했고 결손 — 항목은 Windows 표기(`runtime\…`) 고정 라벨이라
+///     비 Windows CI 의 회귀 핀에서도 문면이 결정론이다.
+///
+/// OS 를 인자로 받는 이유는 [`bundled_git_bash_path_for`] 와 동일 — 회귀 핀이 다른 플랫폼
+/// CI 에서도 Windows 분기를 실제로 밟게 하기 위해서다.
+pub fn windows_runtime_missing_for(exe_dir: &Path, os: &str) -> Option<Vec<String>> {
+    if os != "windows" {
+        return None;
+    }
+    if !exe_dir.join("runtime").is_dir() {
+        return None;
+    }
+    let mut missing = Vec::new();
+    for coord in BUNDLED_WINDOWS_RUNTIME_REL {
+        let mut p = exe_dir.to_path_buf();
+        for seg in coord {
+            p.push(seg);
+        }
+        if !p.is_file() {
+            missing.push(coord.join("\\"));
+        }
+    }
+    Some(missing)
+}
+
+/// 결손 목록 → 사용자 안내문(순수 함수 = 회귀 핀 대상). 결손 0 이면 None(무음).
+///
+/// ★제목 계약(R3-P04-2 ①): 이 안내는 기존 `bundle-damaged` 채널로 나가고, 그 토스트 제목은
+///   프론트에 "설치본이 온전하지 않습니다 — 재설치 필요"로 하드코딩돼 있다(ui/src/main.ts).
+///   따라서 이 채널에는 **설치 무결성·재설치류 결론의 advisory 만** 싣는다 — AV 격리 복원은
+///   "재설치보다 먼저 시도할 빠른 길"로 본문에 흡수하고(치유가 예외 등록일 수 있음을 정직하게),
+///   재설치와 무관한 다른 처방을 이 채널에 실으면 오도다.
+/// ★경로 표기: 사용자 홈은 env 표기(`%USERPROFILE%`)만 쓴다(예시 경로 규칙 — 시크릿 스캐너가
+///   실계정 절대경로를 차단하는 전례).
+pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let list = missing
+        .iter()
+        .map(|m| format!("\u{2003}- {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "cys 설치본에서 동봉 실행 구성요소가 빠져 있습니다 — 설치가 불완전했거나, \
+         백신(AV)이 설치 후 파일을 격리했을 수 있습니다.\n\
+         빠진 파일(설치 폴더 기준):\n{list}\n\n\
+         이 상태에서는 자동화 훅(bash)·python·node 기반 기능이 조용히 동작하지 않습니다 \
+         (앱 자체는 계속 쓸 수 있습니다 — 이 안내는 기동을 막지 않습니다).\n\n\
+         복구 절차(순서대로):\n\
+         \u{2003}1) 백신의 격리(검역) 목록을 확인해 위 파일이 격리돼 있으면 **복원**하고, \
+         cys 설치 폴더를 백신 검사 예외에 추가합니다.\n\
+         \u{2003}2) 격리 이력이 없거나 복원해도 이 안내가 반복되면, 최신 설치파일로 \
+         **재설치**합니다 — www.cysinsight.com\n\
+         \u{2003}3) 재설치 직후 같은 안내가 다시 뜨면 백신이 새 파일을 또 격리한 것입니다 — \
+         예외 등록 후 한 번 더 재설치하세요.\n\
+         설정·대화기록(%USERPROFILE%\\.cys)은 설치 폴더 밖에 있어 재설치로 지워지지 않습니다."
+    ))
+}
+
 /// 자식 프로세스(pane 스폰·스케줄 발화·GUI 직스폰)에 얹을 env 주입 쌍(OS 무관 컴파일).
 ///
 /// ★'순수' 표기 정정(U-20 · 2026-08-24): 이 자리엔 오래 "(순수 — 회귀 핀·OS 무관 컴파일)"
@@ -2618,6 +2708,123 @@ mod tests {
             "마스터 스위치 판독 규약이 바뀌었다"
         );
         assert_eq!(ENV_BOOT_GATES, "CYS_BOOT_GATES");
+    }
+
+    /// P4-2 픽스처: runtime 4좌표를 전부 깐 가짜 Windows 설치본(u20_fixture 의 확장판).
+    fn p42_fixture(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("cys-p42-{}-{}", tag, std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        for coord in BUNDLED_WINDOWS_RUNTIME_REL {
+            let mut p = base.clone();
+            for seg in coord {
+                p.push(seg);
+            }
+            std::fs::create_dir_all(p.parent().expect("좌표는 항상 부모가 있다"))
+                .expect("픽스처 디렉터리 생성 실패");
+            std::fs::write(&p, b"fixture").expect("픽스처 파일 생성 실패");
+        }
+        base
+    }
+
+    /// ★P4-2 회귀 핀 ⓐ — 3값 반환 계약: 판정 불가(None) / 무결(Some 빈) / 결손(Some 목록).
+    ///
+    /// 특히 "비설치 레이아웃 = None" 가드가 핵심이다 — 이 가드가 사라지면 Windows 개발 빌드
+    /// (cargo run · target\debug)의 **매 기동이 "재설치 필요" 오보**가 된다(macOS
+    /// bundle_integrity_guidance 의 '번들 미탐지 = 무음'과 대칭 계약).
+    #[test]
+    fn windows_runtime_missing_three_value_contract() {
+        let base = p42_fixture("contract");
+        // 무결: 판정했고 결손 0.
+        assert_eq!(
+            windows_runtime_missing_for(&base, "windows"),
+            Some(vec![]),
+            "4좌표 전부 실재인데 무결 판정이 아니다"
+        );
+        // 결손: python3.exe 만 지우면 정확히 그 라벨 하나(Windows 표기 고정 — 비 Windows CI 결정론).
+        std::fs::remove_file(base.join("runtime").join("python").join("python3.exe"))
+            .expect("픽스처 수정 실패");
+        assert_eq!(
+            windows_runtime_missing_for(&base, "windows"),
+            Some(vec![r"runtime\python\python3.exe".to_string()]),
+            "결손 좌표가 정확히 그 라벨로 열거되지 않았다"
+        );
+        // OS 게이트: 비 Windows 는 결손이 있어도 판정하지 않는다(None — U-20 ⓑ와 동일 규약).
+        for os in ["macos", "linux", ""] {
+            assert_eq!(
+                windows_runtime_missing_for(&base, os),
+                None,
+                "OS {os:?} 에서 Windows 전용 판정이 새어 나왔다"
+            );
+        }
+        // 비설치 레이아웃 가드: runtime 디렉터리 자체가 없으면 판정 불가(None) — 결손 아님.
+        let bare = std::env::temp_dir().join(format!("cys-p42-bare-{}", std::process::id()));
+        std::fs::remove_dir_all(&bare).ok();
+        std::fs::create_dir_all(&bare).expect("bare 픽스처 생성 실패");
+        assert_eq!(
+            windows_runtime_missing_for(&bare, "windows"),
+            None,
+            "runtime 디렉터리 부재(개발 빌드·포터블)를 결손으로 오판했다 — 매 기동 오보"
+        );
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    /// ★P4-2 회귀 핀 ⓑ — U-20 좌표 단일 SOT: 결손 통보와 벤더 env 주입이 **같은 파일**을 본다.
+    ///
+    /// 런처 bash 를 지우면 두 판정이 동시에 뒤집혀야 한다(couplings[callee]: 좌표 상수가
+    /// 이원화되면 "훅이 죽었다는 통보"와 "훅 실행기 주입"이 서로 다른 파일을 보게 된다).
+    #[test]
+    fn windows_runtime_check_agrees_with_u20_injection() {
+        let base = p42_fixture("sot");
+        assert!(
+            bundled_git_bash_path_for(&base, "windows").is_some(),
+            "픽스처가 U-20 해소에 실패했다"
+        );
+        std::fs::remove_file(base.join("runtime").join("git").join("bin").join("bash.exe"))
+            .expect("픽스처 수정 실패");
+        let missing = windows_runtime_missing_for(&base, "windows").expect("판정 자체가 사라졌다");
+        assert!(
+            missing.contains(&r"runtime\git\bin\bash.exe".to_string()),
+            "U-20 런처 소실이 결손 목록에 없다 — 좌표 SOT 이원화: {missing:?}"
+        );
+        assert_eq!(
+            bundled_git_bash_path_for(&base, "windows"),
+            None,
+            "결손 통보와 U-20 주입의 판정이 어긋났다(같은 파일을 봐야 한다)"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★P4-2 회귀 핀 ⓒ — 안내문 계약: 결손 0 = None(무음) · 결손 시 파일명 명시 + 재설치류
+    /// 결론(제목 계약 — bundle-damaged 채널 제목이 "재설치 필요"로 고정돼 있으므로 본문이
+    /// 그 결론과 어긋나면 오도) + AV 격리 복원을 먼저 안내(재설치가 유일 처방이 아님을 정직하게).
+    #[test]
+    fn windows_runtime_damage_notice_contract() {
+        assert_eq!(
+            windows_runtime_damage_notice(&[]),
+            None,
+            "결손 0 인데 안내문이 나갔다 — 정상 설치본 매 기동 오보"
+        );
+        let missing = vec![
+            r"runtime\git\bin\bash.exe".to_string(),
+            r"runtime\node\node.exe".to_string(),
+        ];
+        let msg = windows_runtime_damage_notice(&missing).expect("결손인데 안내문이 없다");
+        for m in &missing {
+            assert!(msg.contains(m), "빠진 파일 명시 계약 위반 — {m} 부재:\n{msg}");
+        }
+        assert!(
+            msg.contains("재설치"),
+            "재설치류 결론 부재 — 채널 제목('재설치 필요')과 본문이 어긋난다:\n{msg}"
+        );
+        assert!(
+            msg.contains("격리"),
+            "AV 격리 복원 안내 부재 — 치유가 재설치가 아니라 격리 복원일 수 있다(P4-2 고지):\n{msg}"
+        );
+        assert!(
+            msg.contains("기동을 막지 않습니다"),
+            "advisory 전용 계약 문언 부재 — 사용자가 '앱이 고장'으로 오독한다:\n{msg}"
+        );
     }
 
     /// ★SEAL-1 층3 회귀 핀: 프로세스 env 봉인이 실제로 **상속 가능한 자리**에 심기는가.
