@@ -1070,6 +1070,10 @@ pub fn windows_runtime_missing_for(exe_dir: &Path, os: &str) -> Option<Vec<Strin
 ///   따라서 이 채널에는 **설치 무결성·재설치류 결론의 advisory 만** 싣는다 — AV 격리 복원은
 ///   "재설치보다 먼저 시도할 빠른 길"로 본문에 흡수하고(치유가 예외 등록일 수 있음을 정직하게),
 ///   재설치와 무관한 다른 처방을 이 채널에 실으면 오도다.
+/// ★복구 어순 계약(P4-ref2 SF-A): 격리 복구는 **예외 등록이 먼저, 복원이 그다음**이다 —
+///   복원을 먼저 하면 백신이 그 파일을 즉시 다시 격리해 제자리걸음이 된다.
+///   docs/INSTALL-Windows-KR.md 문제해결 ①과 같은 어순을 유지해야 하며(두 정본 충돌 금지),
+///   회귀 핀(windows_runtime_damage_notice_contract)이 이 어순을 단언한다.
 /// ★경로 표기: 사용자 홈은 env 표기(`%USERPROFILE%`)만 쓴다(예시 경로 규칙 — 시크릿 스캐너가
 ///   실계정 절대경로를 차단하는 전례).
 pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
@@ -1088,8 +1092,9 @@ pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
          이 상태에서는 자동화 훅(bash)·python·node 기반 기능이 조용히 동작하지 않습니다 \
          (앱 자체는 계속 쓸 수 있습니다 — 이 안내는 기동을 막지 않습니다).\n\n\
          복구 절차(순서대로):\n\
-         \u{2003}1) 백신의 격리(검역) 목록을 확인해 위 파일이 격리돼 있으면 **복원**하고, \
-         cys 설치 폴더를 백신 검사 예외에 추가합니다.\n\
+         \u{2003}1) 먼저 cys 설치 폴더를 백신 검사 **예외에 추가**한 뒤, 백신의 격리(검역) \
+         목록에서 위 파일이 격리돼 있으면 **복원**합니다 — 복원을 먼저 하면 백신이 즉시 \
+         다시 격리해 제자리걸음이 됩니다.\n\
          \u{2003}2) 격리 이력이 없거나 복원해도 이 안내가 반복되면, 최신 설치파일로 \
          **재설치**합니다 — www.cysinsight.com\n\
          \u{2003}3) 재설치 직후 같은 안내가 다시 뜨면 백신이 새 파일을 또 격리한 것입니다 — \
@@ -2906,7 +2911,8 @@ mod tests {
 
     /// ★P4-2 회귀 핀 ⓒ — 안내문 계약: 결손 0 = None(무음) · 결손 시 파일명 명시 + 재설치류
     /// 결론(제목 계약 — bundle-damaged 채널 제목이 "재설치 필요"로 고정돼 있으므로 본문이
-    /// 그 결론과 어긋나면 오도) + AV 격리 복원을 먼저 안내(재설치가 유일 처방이 아님을 정직하게).
+    /// 그 결론과 어긋나면 오도) + AV 격리 복원을 재설치보다 먼저 안내(유일 처방 아님을 정직하게)
+    /// + 복구 어순(예외 등록 → 복원) 단언(SF-A — INSTALL-Windows-KR §①과 정본 일치).
     #[test]
     fn windows_runtime_damage_notice_contract() {
         assert_eq!(
@@ -2929,6 +2935,15 @@ mod tests {
         assert!(
             msg.contains("격리"),
             "AV 격리 복원 안내 부재 — 치유가 재설치가 아니라 격리 복원일 수 있다(P4-2 고지):\n{msg}"
+        );
+        // ★SF-A 어순 계약: 예외 등록이 먼저, 복원이 그다음 — docs/INSTALL-Windows-KR.md
+        // 문제해결 ①과 동일 어순(복원 먼저면 즉시 재격리 루프 = 두 정본 충돌 금지).
+        let idx_exclusion = msg.find("예외에 추가").expect("예외 등록 안내 부재");
+        let idx_restore = msg.find("복원").expect("복원 안내 부재");
+        assert!(
+            idx_exclusion < idx_restore,
+            "복구 어순 위반 — 예외 등록보다 복원이 먼저다(INSTALL-Windows-KR §①이 경고한 \
+             즉시 재격리 루프 유도):\n{msg}"
         );
         assert!(
             msg.contains("기동을 막지 않습니다"),
