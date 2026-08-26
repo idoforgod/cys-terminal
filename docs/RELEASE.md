@@ -4,6 +4,10 @@
 > ①버전 범프(아래 §0 4곳)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
 > ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
 > ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
+>  (windows-build.yml PTY 스모크는 **pane env 실주입 관측** — U-20 `CLAUDE_CODE_GIT_BASH_PATH`·
+>  좌석 토큰 `CYS_SEAT_TOKEN` — 까지 게이트한다. 단 **벤더 링크 분절**(claude 가 그 env 로 훅을
+>  **실발화**하는가)은 claude 인증 필요로 CI 게이트化 불가 — §4 「Windows 실기 수동 체크리스트」
+>  수동 행이 그 몫이다. CI 초록을 그 분절의 증거로 읽지 마라)
 > ⑤릴리스 자산·`latest.json`(tauri v2 — darwin-aarch64·darwin-x86_64·windows-x86_64 3키) 실측 확인.
 > Windows 인스톨러는 **NSIS**다(`src-tauri/tauri.windows.conf.json targets:["nsis"]`) — 아래 §2·부록의
 > 수동 MSI/WiX 경로는 **legacy(폐기·참고용)**이며 따르지 마라.
@@ -531,4 +535,27 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       "링크가 200이고 버전이 맞다"는 "밴드가 의도대로 구성됐다"를 뜻하지 않는다.
       구조 자체의 게이트는 홈페이지 리포(`cys-homepage/_round/dlhero/RELEASE_BUMP_CHECK.md`)에
       두는 것이 옳다 — 여기서는 배포 결과 게이트로 고정한다.
+- [ ] **★Windows 실기 수동 체크리스트 — CI 게이트化 불가 분절 (2026-08-26 P4-3 · P1 이월 · 바이너리 릴리스 시)**
+
+      아래 두 행은 **CI 로 게이트化할 수 없음이 확정된** 분절이다 — 어느 CI 초록도 이 행들의
+      증거가 아니다(돌지 않는 초록 금지). 실기 완주 전까지 각 행의 상태는 **'실기 미검증'** 으로
+      정직하게 유지한다. 실기 절차의 몸통(Parallels VM 준비 등)은
+      `docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md` 와 같은 자리에서 함께 1회 완주한다(P7 인접).
+
+      - [ ] **U-20 벤더 존중 확인 — 상태: 실기 미검증** (P4-3 사슬 분절③)
+            CI 가 재는 것은 사슬의 두 분절뿐이다: ①설치 트리에 훅 bash
+            (`runtime\git\bin\bash.exe`) 실재·실행(windows-build.yml 하드 단언) ②pane env 에
+            `CLAUDE_CODE_GIT_BASH_PATH`·`CYS_SEAT_TOKEN` 실주입(같은 워크플로 PTY 스모크의
+            env 관측 스텝). 마지막 분절 — **벤더(claude CLI)가 그 env 를 존중해 훅을 실제
+            발화하는가** — 는 claude 인증이 필요해 어떤 CI 에도 실을 수 없다(src/lib.rs U-20
+            주석 자인: "실제 훅이 뜨는가는 실기 재현의 몫 — 과장하지 않는다"). 실기 판정:
+            Windows 실기의 cys pane 에서 `$env:CLAUDE_CODE_GIT_BASH_PATH` 값 + `Test-Path`
+            확인 → `claude` 기동 → SessionStart 훅 실발화(역할 부트스트랩 배너) 관측.
+            PASS 후에만 이 행의 상태 표기를 갱신한다.
+      - [ ] **P1 좌석 토큰 '체인 단절 + 토큰 = 성공' 확인 — 상태: 실기 미검증** (P1 이월)
+            조상 체인 해석이 끊기는 실기 조건(S1/S3 계급 — `cys claim-role` 이 rc 6 을 내던
+            그 기계 상태)에서, pane PTY env 로 배달된 `CYS_SEAT_TOKEN` 만으로 claim 이
+            성공(rc 0 · `registered:` 출력)해야 한다. CI 는 토큰 **배달**까지만 관측하고
+            (위 ② 분절), 체인 단절 실조건은 실기 claude 세션에서만 재현된다.
+            판정: 종전 rc 6 재현 조건에서 rc 0. PASS 전까지 '실기 미검증' 유지.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성

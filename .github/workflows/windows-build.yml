@@ -159,7 +159,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "동봉 python3 stdlib import 실패" }
           Write-Host "OK: 자기완결 런타임 설치·실행·경로일치 검증 통과"
 
-      - name: PTY 스모크 (검은 pane 회귀 게이트 — ConPTY 셸 출력·실행 실측)
+      - name: PTY 스모크 (검은 pane 회귀 게이트 — ConPTY 셸 출력·실행 + pane env 실주입 실측)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -197,6 +197,41 @@ jobs:
           }
           if (-not $ok) { Write-Host "== screen(roundtrip) =="; Write-Host $screen; throw "실행 왕복 실패 — PTY 입력 또는 셸 실행 경로 결함" }
           Write-Host "OK: ConPTY 프롬프트·실행 왕복 실측 통과"
+          # ③ pane env 실주입 관측 (P4-3 사슬 분절② — E2E 대리검체: 설치 트리 → cysd 스폰 → pane env).
+          #    U-20 사슬의 CI 가능 상한은 두 분절이다 — 분절①(빌드·설치트리에 훅 bash 실재)은 위
+          #    "자기완결 검증" 스텝의 하드 단언이 이미 잰다. 이 블록이 분절②: cysd 가 pane 에
+          #    CLAUDE_CODE_GIT_BASH_PATH(U-20 · spawn_env_pairs)와 CYS_SEAT_TOKEN(P1 · 좌석 토큰)을
+          #    **실제로 싣는가**. 마지막 분절③(벤더 claude 가 그 env 로 훅을 실발화하는가)은 claude
+          #    CLI 인증이 필요해 어떤 CI 로도 게이트化 불가 — docs/RELEASE.md 의 Windows 실기 수동
+          #    체크리스트가 그 몫이다(과장 금지 — 이 스텝의 초록은 분절②까지만 증명한다).
+          #    ★돌지 않는 초록 금지: 아래 단언은 주입 회귀 시 실제로 던진다 — spawn_env_pairs 가
+          #    U-20 쌍을 빼먹으면 u20-env-absent, BUNDLED_GIT_BASH_REL 좌표와 설치 트리가 어긋나면
+          #    u20-env-dangling, mint/주입 회귀면 seat-env-absent 로 각각 폐로한다.
+          #    ★마커는 분할 리터럴("u20-env-"+"ok")로 조립 — 타이핑 에코만으로는 원문이 화면에
+          #    등장하지 않는다(② 'cys-exec-proof' 와 동일 트릭). 프로브는 외부 pwsh 가 아니라
+          #    **pane 속 셸**이 평가한다(외부 단일따옴표 → $env: 리터럴 전달).
+          #    ★CYS_SEAT_TOKEN 값은 화면·로그 어디에도 찍지 않는다(존재 여부만) — 토큰의 관측
+          #    채널 등재 금지 계약(state.rs Surface.seat_token) 준수.
+          & $cys send --surface $ref 'if ($env:CLAUDE_CODE_GIT_BASH_PATH) { if (Test-Path $env:CLAUDE_CODE_GIT_BASH_PATH) { ("u20-env-" + "ok") } else { ("u20-env-" + "dangling ") + $env:CLAUDE_CODE_GIT_BASH_PATH } } else { ("u20-env-" + "absent") }'
+          & $cys send-key --surface $ref Return
+          & $cys send --surface $ref 'if ($env:CYS_SEAT_TOKEN) { ("seat-env-" + "present") } else { ("seat-env-" + "absent") }'
+          & $cys send-key --surface $ref Return
+          $deadline = (Get-Date).AddSeconds(40); $u20 = $false; $seat = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            $screen = (& $cys read-screen --surface $ref) -join "`n"
+            if ($screen -match 'u20-env-ok') { $u20 = $true }
+            if ($screen -match 'seat-env-present') { $seat = $true }
+            if ($u20 -and $seat) { break }
+          }
+          if (-not ($u20 -and $seat)) {
+            Write-Host "== screen(env-probe) =="; Write-Host $screen
+            if ($screen -match 'u20-env-absent')   { throw "U-20 미주입: pane env 에 CLAUDE_CODE_GIT_BASH_PATH 부재 — spawn_env_pairs 주입 회귀(시스템 Git 없는 기계에서 훅 전멸 계급)" }
+            if ($screen -match 'u20-env-dangling') { throw "U-20 좌표 불일치: CLAUDE_CODE_GIT_BASH_PATH 가 실재하지 않는 경로를 가리킴 — BUNDLED_GIT_BASH_REL 과 설치 트리의 어긋남(없는 경로 통보는 미통보보다 나쁘다)" }
+            if ($screen -match 'seat-env-absent')  { throw "좌석 토큰 미배달: pane env 에 CYS_SEAT_TOKEN 부재 — mint_seat_token/주입 회귀(P1 체인 단절 시 claim 폴백 사망 계급)" }
+            throw "pane env 관측 실패: 프로브 마커 미도달 (u20=$u20 seat=$seat) — PTY 입력·실행 경로 또는 주입 회귀"
+          }
+          Write-Host "OK: pane env 실주입 관측 통과 (CLAUDE_CODE_GIT_BASH_PATH=실재 경로 · CYS_SEAT_TOKEN=존재)"
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       # ─────────────────────────────────────────────────────────────────────────

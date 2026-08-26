@@ -48,6 +48,8 @@
 
 [Releases](https://github.com/idoforgod/cys-terminal/releases/latest)에서 받습니다.
 **데몬을 따로 설치할 필요가 없습니다** — 앱이 자동 기동하고 팩도 자동 설치됩니다.
+단 하나의 예외: **AI 노드 CLI `claude`(Claude Code)는 동봉되지 않아 별도 설치**가
+필요합니다(§2.2 Windows 항목·미설치 시 앱이 안내 카드를 띄웁니다).
 
 ### 2.1 macOS (Apple Silicon)
 
@@ -58,7 +60,11 @@
 ### 2.2 Windows (x64)
 
 1. `cys_<버전>_x64-setup.exe`(NSIS) 실행 — **자기완결 설치**: 데몬·CLI·런타임(Git Bash·
-   Python)이 동봉되어 별도 준비물이 없습니다.
+   Python·Node)이 동봉되어 별도 준비물이 없습니다 — **단 예외 하나, AI 노드 CLI
+   `claude`(Claude Code)는 동봉되지 않습니다**. PowerShell 에서
+   `irm https://claude.ai/install.ps1 | iex` 1줄로 설치하세요(**git·node 불요** — 네이티브
+   설치기). 미설치여도 앱·터미널은 정상 동작하며 AI 각성만 안 됩니다(앱이 설치 안내 카드를
+   띄웁니다 — 설치 후 자비스 재시작).
 2. 앱을 1회 실행하면 온보딩이 자동으로 팩 설치·훅 등록·데몬 자동 기동(작업 스케줄러
    ONLOGON)을 마칩니다.
 3. 확인: `dir %USERPROFILE%\.cys\pack` · `schtasks /Query /TN cysd`
