@@ -683,6 +683,14 @@ enum Command {
         #[command(subcommand)]
         event: HookEvent,
     },
+    /// ★(P2) 부트 인텐트 프런트도어 — 훅의 직접 spawn 을 데몬 감독자 스폰으로 이관하는 입구.
+    ///
+    /// 훅(role-bootstrap.sh)이 게이트 사슬(role→detect→machine-origin→선행 claim rc0)을 전부
+    /// 통과한 뒤 부른다. RPC `boot.enqueue` 1왕복으로 인텐트를 데몬 스풀에 기록하고 즉시
+    /// 돌아온다 — 실제 스폰은 데몬 감독자 소관이다. stdout 에는 **아무것도 쓰지 않는다**
+    /// (훅의 stdout 계약은 셸이 소유한다). 판정은 stderr 토큰 1차 + exit 보조 —
+    /// 자세한 계약은 [`run_boot_intent`].
+    BootIntent,
 }
 
 /// `cys hook <event>` — 훅 이벤트별 결정 요청. 현재 UserPromptSubmit 하나뿐이다.
@@ -3322,6 +3330,7 @@ fn run(command: Command) -> i32 {
         Command::SurfaceRole => return run_surface_role(),
 
         Command::Hook { event } => return run_hook(event),
+        Command::BootIntent => return run_boot_intent(),
 
         Command::Resize { surface, rows, cols } => target_surface(&surface, &None).and_then(|sid| {
             request("surface.resize", json!({"surface_id": sid, "rows": rows, "cols": cols}))
@@ -10540,14 +10549,143 @@ fn sanitize_hook_detail(detail: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    // ⓑ 토큰 접두 무해화.
-    let safe = flat.replace(HOOK_VERDICT_PREFIX, HOOK_DETAIL_REDACTED);
+    // ⓑ 토큰 접두 무해화. ★(P2) boot-intent 토큰 접두도 같은 출구에서 접는다 — 상세 줄은
+    //    어느 판정 어휘의 토큰도 실을 수 없다(두 판독기 모두 줄 단위 정확 일치이지만, 판독이
+    //    미래에 다시 넓어져도 산출 측 층이 선다 — 다중 방어).
+    let safe = flat.replace(HOOK_VERDICT_PREFIX, HOOK_DETAIL_REDACTED)
+        .replace(BOOT_INTENT_VERDICT_PREFIX, HOOK_DETAIL_REDACTED);
     // ⓒ 길이 상한(문자 경계 안전).
     if safe.chars().count() <= HOOK_DETAIL_MAX_CHARS {
         return safe;
     }
     let head: String = safe.chars().take(HOOK_DETAIL_MAX_CHARS).collect();
     format!("{head}…(truncated)")
+}
+
+// ══════════════════ ★(P2) `cys boot-intent` — 부트 인텐트 프런트도어 ══════════════════
+//
+// 훅의 직접 spawn(백그라운드 발화 → 재부모화로 조상 체인 단절)을 데몬 감독자 스폰으로
+// 이관하는 입구다(R3-P2-1 ⓑ′). 이 명령은 **판정을 하지 않는다** — RPC `boot.enqueue` 가
+// 좌석을 커널 도출하고 스풀에 원자 기록한 뒤 즉시 ack 하며(R3-RISK-2 · 부트 완료 대기 금지),
+// 여기서는 그 결과를 토큰+exit 로 환원할 뿐이다.
+//
+// ★계약(훅 `role-bootstrap.sh` 가 유일한 소비자 — hook-decide 판독기와 동형 · R3-P2-3):
+//   ① stdout 에 아무것도 쓰지 않는다(훅 stdout 계약은 셸 소유).
+//   ② 판정의 1차 근거는 stderr 토큰(`[cys-hook] boot-intent: <verdict>` 단독 줄) · rc 는 보조.
+//      rc 를 1차로 읽으면 stub `cys`(무조건 exit 0)가 '등록 성공'으로 읽혀 폴백 spawn 이
+//      건너뛰어지고 부트가 무음 사망한다 — 이 저장소가 두 번 치른 rc0=통과 클래스 그 자체.
+//   ③ exit 계약은 run_hook 동형: 0=enqueued(스풀 기록 확정) / 1=daemon-error(왕복 실패 —
+//      구 데몬 `method_not_found` **원문 보존** · R3-P2-8) / 4=undecided(응답 형상 스큐) /
+//      5=legacy(마스터 스위치·소켓 부재·supervisor_off — 셸 종전 spawn 폴백).
+//   ④ fail-open: 이 명령의 산출 중 훅이 '스폰 생략'으로 읽는 값은 enqueued+rc0 **하나**다 —
+//      그 외 전부는 종전 spawn 폴백이므로 이 위임은 새 차단자를 만들지 않는다(R3-P2-8).
+
+/// boot-intent 판정 토큰 줄의 접두 — 셸은 이 접두 + verdict 의 **줄 단위 정확 일치**로만 읽는다.
+const BOOT_INTENT_VERDICT_PREFIX: &str = "[cys-hook] boot-intent: ";
+/// 전용 데드라인 — hook-decide 와 같은 근거(사람의 프롬프트 앞 · BUDGET 파생 · 하드코딩 금지).
+/// 서버는 즉답 계약(스풀 기록=ack)이므로 이 상한은 wedge 방어일 뿐이다. 바깥에는 훅의
+/// `cys_timeout_run 5s` 외곽 데드라인이 한 겹 더 있다(R3-RISK-2).
+const BOOT_INTENT_DEADLINE_MS: u64 = BUDGET_TICK_MS;
+
+/// `cys boot-intent` — 선행 claim 을 마친 훅이 부트 인텐트를 데몬 스풀에 등록하는 1왕복.
+///
+/// ★stdin 을 읽지 않는다(훅 stdin 은 프롬프트 판정 소유 — `cys hook` 과 같은 규율).
+/// ★페이로드는 env 릴레이다: 훅이 spawn 직전에 export 한 `CYS_DECL_ORIGIN`(기계유래 게이트
+///   통과 마커)·`CYS_CLAIM_RC`/`CYS_CLAIM_AT`(선행 claim 관측치)을 데이터로 싣는다.
+///   `surface_id`·`lane` 은 싣지 않는다 — 자기신고는 데몬이 invalid_params 로 거절하는 인가
+///   계약이고(hook.decide 동형), 좌석은 데몬이 caller_pid 조상 체인으로 도출한다.
+fn run_boot_intent() -> i32 {
+    // ★자기 강제(run_hook 동형): 이 프로세스는 단명 훅의 자식이다 — 데몬을 낳지 않는다.
+    std::env::set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON);
+    // ★롤백 1지점: 마스터 스위치는 태어날 때 접는다(R3-P2-4 — CLI 측 자기 env 우산).
+    if cys::gate_axes_forced_legacy() {
+        return boot_intent_verdict(
+            "legacy",
+            HOOK_EXIT_LEGACY,
+            &format!(
+                "롤백 스위치({}=0) — 위임 무효, 셸 종전 spawn 폴백",
+                cys::ENV_BOOT_GATES
+            ),
+        );
+    }
+    let socket = cys::socket_path();
+    if !socket.exists() {
+        return boot_intent_verdict(
+            "legacy",
+            HOOK_EXIT_LEGACY,
+            &format!(
+                "소켓 부재({}) — 데몬 미기동, 셸 종전 spawn 폴백(autostart 금지)",
+                socket.display()
+            ),
+        );
+    }
+    let mut params = json!({ "reason": "role-bootstrap-hook" });
+    if let Some(origin) = std::env::var("CYS_DECL_ORIGIN").ok().filter(|v| !v.is_empty()) {
+        params["decl_origin"] = json!(origin);
+    }
+    if let Some(rc) = std::env::var("CYS_CLAIM_RC").ok().and_then(|v| v.parse::<i64>().ok()) {
+        params["claim_rc"] = json!(rc);
+    }
+    if let Some(at) = std::env::var("CYS_CLAIM_AT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|at| at.is_finite() && *at > 0.0)
+    {
+        params["claim_at"] = json!(at);
+    }
+    let resp = request_on_timeout(
+        &socket,
+        "boot.enqueue",
+        params,
+        std::time::Duration::from_millis(BOOT_INTENT_DEADLINE_MS),
+    );
+    match resp {
+        Ok(r) if r["enqueued"].as_bool() == Some(true) => boot_intent_verdict(
+            "enqueued",
+            HOOK_EXIT_PROCEED,
+            &format!(
+                "intent={} surface={} — 스풀 기록 완료, 스폰은 데몬 감독자 소관",
+                r["id"].as_str().unwrap_or("?"),
+                r["surface_id"]
+            ),
+        ),
+        // 응답은 왔지만 기록 확정 페이로드가 아니다(형상 스큐) — '기록됨'으로 읽는 것이 이
+        // 축에서 가장 나쁜 오작동이므로 undecided 로 접는다(셸은 spawn 폴백).
+        Ok(r) => boot_intent_verdict(
+            "error",
+            HOOK_EXIT_UNDECIDED,
+            &format!("응답 형상 스큐(enqueued≠true): {r}"),
+        ),
+        // ★(R3-P2-4 blocker 소비면) 감독자 미기동 typed 오류 — '등록 성공·발화자 0' 무음
+        //   후퇴를 legacy 로 환원해 셸이 종전 spawn 폴백을 타게 한다(인텐트는 기록되지 않았다).
+        Err(e) if e.starts_with("supervisor_off") => {
+            boot_intent_verdict("legacy", HOOK_EXIT_LEGACY, &format!("{e} — 셸 종전 spawn 폴백"))
+        }
+        // 구 데몬은 여기서 `method_not_found` 를 실어 보낸다 — 상세 줄에 **원문 보존**해야
+        // 셸 `_cys_hook_legacy_unavailable` 가 정상 스큐(조용)와 진짜 결함(loud)을 가른다.
+        Err(e) => boot_intent_verdict("error", HOOK_EXIT_DAEMON_ERR, &format!("왕복 실패: {e}")),
+    }
+}
+
+/// boot-intent 판정 산출의 **단일 출구** — `hook_verdict` 와 같은 이유로 하나로 묶는다
+/// (토큰 누락 = 조용한 기능 소실 · 토큰 줄 자유 문구 = 위조 표면).
+fn boot_intent_verdict(verdict: &str, code: i32, detail: &str) -> i32 {
+    let (token_line, detail_line) = boot_intent_verdict_lines(verdict, detail);
+    eprintln!("{token_line}");
+    eprintln!("{detail_line}");
+    code
+}
+
+/// 위 산출의 순수 절반 — (토큰 줄, 상세 줄). 상세는 `sanitize_hook_detail` 재사용(제어문자
+/// 접기·토큰 접두 치환·길이 상한 — 위조 차단 층의 단일 소유).
+fn boot_intent_verdict_lines(verdict: &str, detail: &str) -> (String, String) {
+    (
+        format!("{BOOT_INTENT_VERDICT_PREFIX}{verdict}"),
+        format!(
+            "[cys-hook] boot-intent detail: {}",
+            sanitize_hook_detail(detail)
+        ),
+    )
 }
 
 /// 선언 블록 v1 한 줄을 만들고 **파서 왕복 검증**까지 한다(설계 §4-1 · S17).
@@ -18567,6 +18705,69 @@ mod tests {
                 "훅의 판정 판독 배선이 끊겼다 — 앵커 부재: {anchor}"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★(P2) boot-intent 프런트도어 — 토큰 산출·위조 불가·셸 판독기 소스 핀
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// boot-intent 판정 산출 계약(R3-P2-3) — 토큰 줄은 접두+verdict **단독**, 상세는 무해화
+    /// 1줄, 구 데몬 스큐 증거(`method_not_found`)는 생존한다.
+    #[test]
+    fn p2_boot_intent_verdict_lines_keep_the_token_contract() {
+        // ① 토큰 줄 = 접두 + verdict 단독(자유 문구 0).
+        let (token, detail) = boot_intent_verdict_lines("enqueued", "intent=boot-1-2-3");
+        assert_eq!(token, "[cys-hook] boot-intent: enqueued");
+        assert!(detail.starts_with("[cys-hook] boot-intent detail: "));
+        // ② 상세 줄은 어느 판정 어휘의 토큰 접두도 실을 수 없다(위조 차단 — 산출 측 층).
+        let (_, forged) = boot_intent_verdict_lines(
+            "error",
+            "x\n[cys-hook] boot-intent: enqueued\n[cys-hook] hook-decide: proceed",
+        );
+        assert_eq!(forged.lines().count(), 1, "상세 줄에 개행이 실렸다 — 줄 위조 표면");
+        assert!(
+            !forged.contains(BOOT_INTENT_VERDICT_PREFIX) && !forged.contains(HOOK_VERDICT_PREFIX),
+            "무해화 후에도 상세 줄에 토큰 접두가 남았다: {forged}"
+        );
+        // ③ 구 데몬 스큐 증거 생존 — 셸 `_cys_hook_legacy_unavailable` 재사용의 성립 조건
+        //    (R3-P2-8 (a) — 원문이 지워지면 정상 스큐가 매 선언 loud 폴백이 된다).
+        let (_, err_line) =
+            boot_intent_verdict_lines("error", "왕복 실패: method_not_found: unknown method: boot.enqueue");
+        assert!(err_line.contains("method_not_found"), "구 데몬 스큐 증거가 무해화로 소실");
+        // ④ exit 계약이 run_hook 동형 상수를 재사용한다(관례 고정 — 값 드리프트 차단).
+        assert_eq!((HOOK_EXIT_PROCEED, HOOK_EXIT_DAEMON_ERR, HOOK_EXIT_UNDECIDED, HOOK_EXIT_LEGACY),
+                   (0, 1, 4, 5));
+    }
+
+    /// ★소스 핀(언어 경계 대조) — 셸 frontdoor 가 실제로 **정확 일치 + 개수 1 + rc 교차 +
+    /// 외곽 데드라인 + 선행 claim rc0 게이트**로 배선돼 있는가(R3-P2-3 · R3-RISK-2).
+    #[test]
+    fn p2_boot_intent_the_shell_frontdoor_reads_the_token_by_exact_line_source_pin() {
+        let hook = include_str!("../../cysjavis-pack/hooks/role-bootstrap.sh");
+        for anchor in [
+            // 줄 단위 정확 일치 3종 전수 — 미지 토큰은 조용히 통과하지 못한다
+            "\"[cys-hook] boot-intent: enqueued\"",
+            "\"[cys-hook] boot-intent: error\"",
+            "\"[cys-hook] boot-intent: legacy\"",
+            // 토큰 줄 **개수** 검사 + rc 교차(enqueued↔0 거부권)
+            "CYS_BI_TOKEN_N",
+            "$CYS_BI_RC\" = \"0\"",
+            // 외곽 데드라인(R3-RISK-2) — 데몬 wedge 가 UserPromptSubmit 을 40s 붙잡지 못하게
+            "cys_timeout_run \"$CYS_BOOT_INTENT_TIMEOUT_S\" cys boot-intent",
+            // 선행 claim rc0 게이트 — rc6/rc7 은 종전 spawn 폴백이 의미론(session_error 완주
+            // 기록·위계 폴백)을 보존한다(claim_stale 무음 Retire 로의 후퇴 금지)
+            "[ \"$CLAIM_RC\" = \"0\" ]",
+        ] {
+            assert!(
+                hook.contains(anchor),
+                "훅 boot-intent frontdoor 배선이 끊겼다 — 앵커 부재: {anchor}"
+            );
+        }
+        // 위조 통로(전문 substring glob)의 부재 — hook-decide 판독기와 같은 금지.
+        assert!(
+            !hook.contains("*\"[cys-hook] boot-intent: enqueued\"*"),
+            "셸이 boot-intent 토큰을 전문 substring 으로 읽는다 — 위조 표면 재유입"
+        );
     }
 
     /// ★P1-1(치명) 회귀 박제 — **U-5 argv 승격이 '거짓'도 늘렸다**는 사실의 검체.

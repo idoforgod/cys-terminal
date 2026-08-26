@@ -304,11 +304,20 @@ def _git_show(relpath, ref=None):
 
 
 def _mock_cys(bindir, tmp, extra_case=""):
-    """호출을 calls.log 에 적재하는 스텁 cys. extra_case = 추가 서브커맨드 분기 sh 코드."""
+    """호출을 calls.log 에 적재하는 스텁 cys. extra_case = 추가 서브커맨드 분기 sh 코드.
+
+    ★P2(R3-P2-7 ⓐ): `boot-intent` 의 기본값은 **구 CLI 모사**(rc2+"unrecognized subcommand")다 —
+      기존 검체 전부가 종전 spawn **폴백 leg** 를 계속 재게 하는 장치다(훅의
+      `_cys_hook_legacy_unavailable` 가 조용한 스큐로 접는 형상). 미지 서브커맨드 기본 rc0 을
+      그대로 두면 토큰 없는 rc0 이 '스큐 증거 없음' loud 폴백이 되어 전 검체 stderr 가 오염되고,
+      frontdoor leg 를 재려는 검체가 어느 leg 를 재는지 불명해진다. frontdoor leg 는 신설 검체
+      (H-BOOT-INTENT-1)가 자기 arm 을 extra_case 로 주입해 전담한다 — extra_case 의 분기가
+      먼저 매치되므로 이 기본값을 이긴다."""
     _w(os.path.join(bindir, "cys"),
        "#!/bin/sh\n"
        'printf "%s\\n" "cys $*" >> "{log}"\n'
        "{extra}\n"
+       "case \"$1\" in boot-intent) echo \"error: unrecognized subcommand 'boot-intent'\" >&2; exit 2;; esac\n"
        "exit 0\n".format(log=os.path.join(tmp, "calls.log"), extra=extra_case))
 
 
@@ -6341,6 +6350,22 @@ def h_doc_1():
     need("next-action" in hook, "훅 note 가 next-action 자율 착수를 가리키지 않는다")
     _no_wait_for_owner(_code_lines(hook), "훅 note")   # 주석(수정 이력 설명)은 스캔 제외
     _mission_gate_pinned(_code_lines(hook), "훅 note")  # ★T1 회귀 핀
+    # ★P2 문안 변형별 핀(R3-P2-7 ④): 발화 note 가 frontdoor(인텐트 기록)·폴백(직접 spawn)
+    #   2벌이 됐다 — 위 파일 전체 grep 1회는 폴백 잔존만으로 초록이 되므로, 헤드라인 마커와
+    #   재실행 금지 규율이 note 조립부 **2곳 전부**에 실려 있음을 계수로 못박는다(주석 제외).
+    #   frontdoor note 의 로그 안내는 role-bootstrap 런 로그가 아니라 감독자 로그로 분기한다
+    #   (R3-P2-7 ⑤) — 그 분기 앵커도 함께 핀한다. 문안의 실행 서술 정직성(백그라운드 서술
+    #   금지 등)은 행동 검체 H-BOOT-INTENT-1 이 실행 산출로 잰다.
+    hook_code = _code_lines(hook)
+    need(hook_code.count(_HOOK_FIRED_MARK) >= 2,
+         "발화 note 헤드라인 마커가 2곳(frontdoor·폴백) 미만이다 — §0-A 리터럴 결박이 한쪽 "
+         "경로에서 끊겼다(마커 출현 %d회)" % hook_code.count(_HOOK_FIRED_MARK))
+    need(hook_code.count("재실행하지 마라") >= 2,
+         "재실행 금지 규율이 2곳(frontdoor·폴백) 미만이다 — frontdoor note 가 규율 문장을 "
+         "잃어도 파일 전체 grep 은 초록이었다(R3-P2-7 ④의 사각)")
+    need("boot-supervisor.log" in hook_code and "데몬 감독자" in hook_code,
+         "frontdoor note 의 로그 안내 경로 분기(boot-supervisor.log·감독자 서술)가 없다"
+         "(R3-P2-7 ⑤)")
     # ★T1: 디렉티브 §0-C(임무 게이트 정의처)와 exit 3 계약이 실재하는가 — 산문만 고치고 도구는
     #      안 고치는(또는 그 반대) 반쪽 수리 차단.
     need("0-C" in md and "임무 게이트" in md, "§0-C 임무 게이트 절이 없다(T1 미착지)")
@@ -9546,7 +9571,9 @@ def h_seed_u19():
     fi = pk.find("pub fn first_run_seed_enabled()")
     need(fi > 0, "env 판독 지점이 없다")
     fbody = pk[fi:pk.find("\n}\n", fi)]
-    need("gate_axes_forced_legacy()" in fbody,
+    # ★P1 이월 정리(false-green 봉인): 앵커는 실제 호출 코드형(crate::…)이다 — 벌거벗은
+    #   리터럴은 주석·독스트링에도 나타날 수 있어 코드가 지워져도 초록이 된다(우회 가능 핀 금지).
+    need("crate::gate_axes_forced_legacy()" in fbody,
          "★새 축이 마스터 스위치(CYS_BOOT_GATES=0)에 접히지 않았다 — 사고 순간에 노브 조합 요구")
     need('env_val == Some("1")' in pk,
          "느슨한 truthy 를 받는다(오타 하나로 시드가 켜진다)")
@@ -10373,7 +10400,11 @@ def _u22_violations(cli, daemon, sh):
     if ru is None:
         v.append("CLI: run_hook_user_prompt_submit 정의를 찾지 못했다(계측 불능)")
     else:
-        if "gate_axes_forced_legacy()" not in ru:
+        # ★P1 이월 정리(false-green 봉인): 앵커는 주석 매치 불가한 **코드형**이다 — 벌거벗은
+        #   `gate_axes_forced_legacy()` 리터럴은 이 함수 안 carve-out 주석에도 나타나, 조기
+        #   반환 코드가 지워지고 주석만 남아도 초록이 됐다(H-IDENT-1 ⓑ의 i_fold 앵커와 동일
+        #   엄격성 — 우회 가능 핀 금지).
+        if "if cys::gate_axes_forced_legacy()" not in ru:
             v.append("CLI: 롤백 마스터 스위치(CYS_BOOT_GATES)를 읽지 않는다 — 새 축이 마스터에 안 접혔다")
         if "request_on_timeout(" not in ru:
             v.append("CLI: 전용 데드라인 왕복(request_on_timeout)을 쓰지 않는다")
@@ -10744,6 +10775,194 @@ def h_hook_decide_4():
                            % (label, fired, want_fire, why, r.stderr[-300:]))
     need(not bad, "위임 라우팅 오작동 %d건: %s" % (len(bad), " / ".join(bad)))
     return "라우팅 %d경로 전건 일치(토큰 부재·proceed·suppress·구 데몬 스큐·미지 토큰·롤백)" % len(routes)
+
+
+@specimen("H-BOOT-INTENT-1", "W6",
+          "P2 boot-intent 프런트도어 — enqueued+rc0=스폰 생략+정직 note · 그 외 전부 spawn 폴백"
+          "(supervisor_off=legacy · 구 CLI 조용 스큐 · rc 불일치·위조 loud · claim rc0 게이트)",
+          ["R3-P2-3", "R3-P2-4", "R3-P2-6", "R3-P2-7", "R3-P2-8"])
+def h_boot_intent_1():
+    """P2(R3-P2-1 ⓑ′): 훅의 직접 spawn 이 `cys boot-intent`(RPC boot.enqueue) 프런트도어로
+    이관됐다 — **enqueued+rc0 만** 스폰 생략(스폰은 데몬 감독자 소관)이고 그 외 전부(토큰 부재·
+    error·legacy·supervisor_off·타임아웃·rc 불일치·선행 claim rc≠0)는 종전 spawn 블록 폴백이다
+    (fail-open — 새 차단자 0 · R3-P2-8). 판독은 hook-decide 판독기 동형 3층(토큰 줄 단위 정확
+    일치 1차 · 줄 개수 1 · rc 교차 거부권)이다 — rc 를 1차로 읽으면 stub cys(무조건 exit 0)가
+    '등록 성공'이 되어 폴백 spawn 이 건너뛰어지고 부트가 무음 사망한다(R3-P2-3 · 이 저장소가
+    두 번 치른 rc0=통과 클래스). 기존 검체군은 `_mock_cys` 의 boot-intent 기본값(구 CLI 모사 —
+    rc2+unrecognized)으로 종전 spawn **폴백 leg** 를 계속 재고, frontdoor leg 는 이 검체가
+    전담한다(R3-P2-7 ⓐ·ⓑ — H-MISSION-1 ⓐ 의 frontdoor 쌍둥이 leg 포함)."""
+    notes = []
+    boot = ("import os, sys\n"
+            "if 'lane-path' in sys.argv:\n"
+            "    print('(mock lane path)')\n"
+            "    raise SystemExit(0)\n"
+            "c = os.path.join(os.environ['HOME'], '.cys', 'state', 'boot-calls')\n"
+            "os.makedirs(os.path.dirname(c), exist_ok=True)\n"
+            "open(c, 'a').write('CALL\\n')\n"
+            "print('MOCK-BOOT')\n")
+
+    def _boot_calls(state, want):
+        """스폰 계수(want>0 이면 bounded 대기 후, 0 이면 정착 창 후 판독)."""
+        p = os.path.join(state, "boot-calls")
+        if want:
+            end = time.time() + 8.0
+            while time.time() < end and not os.path.isfile(p):
+                time.sleep(0.1)
+        else:
+            time.sleep(1.0)     # 버그(비동기 오스폰)가 착지할 시간을 준다 — 정상 경로는 동기 0
+        return _read(p).count("CALL") if os.path.isfile(p) else 0
+
+    def _note_json(stdout, where):
+        for line in stdout.splitlines():
+            if line.startswith('{"hookSpecificOutput"'):
+                try:
+                    return json.loads(line)["hookSpecificOutput"]["additionalContext"]
+                except (ValueError, KeyError, TypeError):
+                    raise Fail("%s: note JSON 이 완주 파싱되지 않는다(부분 출력 사망=소실): %r"
+                               % (where, line[:200]))
+        raise Fail("%s: note JSON 줄이 없다(통보 소실): %r" % (where, stdout[:300]))
+
+    _FRONT_ARM = ('boot-intent) echo "[cys-hook] boot-intent: enqueued" >&2; '
+                  'echo "[cys-hook] boot-intent detail: mock enqueue" >&2; exit 0;;')
+    with tempfile.TemporaryDirectory() as tmp:
+        # ── ⓐ frontdoor 성공(enqueued+rc0 · 임무 미지정 — H-MISSION-1 ⓐ 쌍둥이): 스폰 0 +
+        #    정직 note(인텐트 기록·감독자 서술·로그 경로 분기) + 규율 문장 보존(R3-P2-7 ③④⑤).
+        sb = os.path.join(tmp, "front")
+        env, _h, _p, _b, state = _rb_sandbox(sb, mission=None, boot_body=boot)
+        _mock_cys(os.path.join(sb, "bin"), sb,
+                  'case "$1" in surface-role) echo ""; exit 0;; %s esac' % _FRONT_ARM)
+        r = _run_rb(env)
+        need(r.returncode == 0, "훅이 비0 종료(exit=%d)" % r.returncode)
+        need(_HOOK_FIRED_MARK in r.stdout,
+             "frontdoor note 가 헤드라인 마커를 잃었다(§0-A 리터럴 3중 결박 파괴 · R3-P2-7 ③)")
+        need("boot-intent enqueued" in r.stderr,
+             "frontdoor 판정의 stderr 1줄 로그가 없다: %r" % r.stderr[:300])
+        note = _note_json(r.stdout, "frontdoor")
+        for frag in ("부트 인텐트를 데몬에 기록했다", "데몬 감독자", "최대 3회", "boot-supervisor.log",
+                     "재실행하지 마라", "next-action", "exit 3",
+                     "임무 게이트 폐쇄", "자율 착수"):
+            need(frag in note, "frontdoor note 에 %r 이 없다(정직 서술/규율 문장 결손 — "
+                 "R3-P2-7 ④⑤): %r" % (frag, note[:400]))
+        need("백그라운드로 실행했다" not in note,
+             "frontdoor note 가 spawn 을 서술한다 — 훅은 기록만 했다(정직성 불변식 :63-66 위반)")
+        need(_boot_calls(state, 0) == 0,
+             "frontdoor(enqueued+rc0)인데 훅이 직접 spawn 했다 — 이중 기동 표면(선언당 시도 "
+             "상한 5 초과 방향)")
+        logs = [n for n in (os.listdir(state) if os.path.isdir(state) else [])
+                if re.match(r"^role-bootstrap-\d+-\d+\.log$", n)]
+        need(not logs, "frontdoor 무스폰인데 런 로그가 생겼다(로그 경로 분기 오염): %s" % logs)
+        notes.append("frontdoor: 스폰 0·정직 note·규율 보존")
+        # ── ⓑ supervisor_off(=legacy rc5) → 조용한 spawn 폴백(R3-P2-4 소비면 · 검체 ⓕ) ──
+        sb = os.path.join(tmp, "supoff")
+        env, _h, _p, _b, state = _rb_sandbox(sb, boot_body=boot)
+        _mock_cys(os.path.join(sb, "bin"), sb,
+                  'case "$1" in surface-role) echo ""; exit 0;; '
+                  'boot-intent) echo "[cys-hook] boot-intent: legacy" >&2; '
+                  'echo "[cys-hook] boot-intent detail: supervisor_off — 감독자 미기동, 종전 '
+                  'spawn 폴백을 타라" >&2; exit 5;; esac')
+        r = _run_rb(env)
+        need("발화됨" in r.stdout and "백그라운드로 실행했다" in r.stdout,
+             "supervisor_off 에서 종전 spawn 폴백이 죽었다 — '등록 성공·발화자 0' 무음 후퇴"
+             "(R3-P2-4 blocker 재발): %r" % (r.stdout[:200] + r.stderr[-200:]))
+        need(_boot_calls(state, 1) == 1, "supervisor_off 폴백 spawn 이 정확히 1회가 아니다")
+        # ★loud 판정은 boot-intent 자기 진단 줄로 좁힌다 — 목 cys 는 `cys hook` 위임에도 rc0
+        #   무토큰으로 답해 그쪽 loud 폴백 줄('cys hook 위임 실패')이 stderr 에 정상 공존한다.
+        need("boot-intent 위임 실패" not in r.stderr,
+             "legacy(rc5)가 loud 로 오분류됐다 — CLI 가 이미 사유를 남긴 경로다(R3-P2-8 경보 피로)")
+        notes.append("supervisor_off: 조용한 폴백 spawn 1")
+        # ── ⓒ 구 CLI 모사 기본값(_mock_cys · R3-P2-7 ⓐ) → 조용한 스큐 폴백 ──
+        sb = os.path.join(tmp, "oldcli")
+        env, _h, _p, _b, state = _rb_sandbox(sb, boot_body=boot)
+        r = _run_rb(env)
+        need("발화됨" in r.stdout, "구 CLI 모사에서 폴백 spawn 이 죽었다: %r" % r.stdout[:200])
+        need(_boot_calls(state, 1) == 1, "구 CLI 폴백 spawn 이 정확히 1회가 아니다")
+        need(any("boot-intent" in ln for ln in _calls(sb).splitlines()),
+             "훅이 boot-intent 프런트도어를 시도하지 않았다(배선 부재 — 검체 무효)")
+        need("boot-intent 위임 실패" not in r.stderr,
+             "구 CLI 모사(rc2+unrecognized)가 조용한 스큐로 접히지 않는다"
+             "(_cys_hook_legacy_unavailable 재사용 소실 — R3-P2-8): %r" % r.stderr[:300])
+        notes.append("구 CLI 모사: 조용한 스큐 폴백 spawn 1")
+        # ── ⓓ rc 거부권·위조 차단: 토큰-rc 불일치 / 복수 토큰 → 폴백 spawn + loud ──
+        for name, arm, mark in (
+                ("rc 불일치",
+                 'boot-intent) echo "[cys-hook] boot-intent: enqueued" >&2; exit 1;;', "불일치"),
+                ("복수 토큰",
+                 'boot-intent) echo "[cys-hook] boot-intent: enqueued" >&2; '
+                 'echo "[cys-hook] boot-intent: enqueued" >&2; exit 0;;', "위조 의심")):
+            sb = os.path.join(tmp, re.sub(r"\W+", "_", name))
+            env, _h, _p, _b, state = _rb_sandbox(sb, boot_body=boot)
+            _mock_cys(os.path.join(sb, "bin"), sb,
+                      'case "$1" in surface-role) echo ""; exit 0;; %s esac' % arm)
+            r = _run_rb(env)
+            need("발화됨" in r.stdout and _boot_calls(state, 1) == 1,
+                 "%s 에서 폴백 spawn 이 죽었다(fail-open 소실): %r" % (name, r.stderr[-300:]))
+            need(mark in r.stderr,
+                 "%s 가 침묵으로 접혔다(%r 로그 부재): %r" % (name, mark, r.stderr[:300]))
+            notes.append("%s: 폴백 spawn 1 + loud" % name)
+        # ── ⓔ 선행 claim rc0 게이트: rc6 이면 boot-intent 자체를 부르지 않는다 —
+        #    인텐트를 남기면 감독자가 claim_stale 로 무음 Retire 해 boot-last 완주 기록
+        #    (§0-A session_error 근거·P0-3)이 소실된다. 종전 spawn 폴백이 의미론을 보존한다.
+        sb = os.path.join(tmp, "rc6gate")
+        env, _h, _p, _b, state = _rb_sandbox(sb, boot_body=boot)
+        _mock_cys(os.path.join(sb, "bin"), sb,
+                  'case "$1" in surface-role) echo ""; exit 0;; claim-role) exit 6;; %s esac'
+                  % _FRONT_ARM)
+        r = _run_rb(env)
+        need(not any("boot-intent" in ln for ln in _calls(sb).splitlines()),
+             "선행 claim rc6 인데 boot-intent 를 불렀다 — claim_stale 무음 Retire 로의 후퇴"
+             "(boot-last 완주 기록·§0-A 재시도 근거 소실)")
+        need("발화됨" in r.stdout and _boot_calls(state, 1) == 1,
+             "claim rc6 의 종전 spawn 폴백이 죽었다: %r" % r.stdout[:200])
+        need("결정론적으로 실패한다" in r.stdout,
+             "rc6 정직 예보(P0-4)가 폴백 note 에서 사라졌다: %r" % r.stdout[:300])
+        notes.append("claim rc6: frontdoor 미시도·폴백 spawn 1·정직 예보 보존")
+
+    # ── 소스 핀(판독기 동형 3층 · R3-P2-3) — 훅은 팩에 항상 실재한다 ──
+    hook = _read(_hook("role-bootstrap.sh"))
+    for tk in ("enqueued", "error", "legacy"):
+        need(re.search(r'^\s*"\[cys-hook\] boot-intent: %s"[|)]' % tk, hook, re.M),
+             "훅이 boot-intent 토큰 %r 를 **줄 단위 정확 일치**로 읽지 않는다(A3=B7 계열 위조 "
+             "표면)" % tk)
+        need('*"[cys-hook] boot-intent: %s"*)' % tk not in hook,
+             "★위조 통로 유입 — boot-intent 토큰 %r 를 stderr 전문 substring glob 으로 읽는다" % tk)
+    need('[ "$CYS_BI_TOKEN_N" -ne 1 ]' in hook, "boot-intent 토큰 줄 **개수 1** 판정이 없다")
+    need('[ "$CYS_BI_RC" = "0" ]' in hook, "boot-intent rc 교차(enqueued↔0 거부권)가 없다")
+    need('cys_timeout_run "$CYS_BOOT_INTENT_TIMEOUT_S" cys boot-intent </dev/null 2>&1 >/dev/null'
+         in hook,
+         "boot-intent 호출에 외곽 데드라인·stdin 차단·stdout 버림 규율이 없다(R3-RISK-2 — "
+         "데몬 wedge 가 UserPromptSubmit 을 40s 붙잡는다)")
+    need('[ "$CLAIM_RC" = "0" ] && command -v cys' in hook,
+         "선행 claim rc0 게이트가 없다 — rc6/rc7 인텐트가 claim_stale 무음 Retire 로 후퇴한다")
+    # ── 소스 핀(rust 양면) — 배포 팩(소스 부재)에서는 이 축만 접는다(실행 leg 는 위에서 완주) ──
+    cli_p = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
+    dae_p = os.path.join(REPO_DIR, "src", "bin", "cysd", "handlers.rs")
+    if os.path.isfile(cli_p) and os.path.isfile(dae_p):
+        cli, dae = _read(cli_p), _read(dae_p)
+        need('const BOOT_INTENT_VERDICT_PREFIX: &str = "[cys-hook] boot-intent: ";' in cli,
+             "CLI 토큰 접두 상수 부재/불일치(셸 case 와 갈림 — 위임이 조용히 legacy 로 접힌다)")
+        need('e.starts_with("supervisor_off")' in cli,
+             "CLI 가 supervisor_off 를 legacy(exit 5)로 환원하지 않는다 — R3-P2-4 blocker 의 "
+             "소비면 소실('등록 성공·발화자 0' 무음 후퇴 재개방)")
+        need("fn boot_intent_verdict(" in cli and "boot_intent_verdict_lines(" in cli,
+             "boot-intent 판정 토큰 단일 출구가 없다(토큰 누락·자유 문구 혼입 표면)")
+        need('"", // lane 자기 고정' in dae,
+             "(ⓔ) boot.enqueue arm 의 lane 자기 고정(빈값) 인자가 없다 — 호출자 lane 이 열리면 "
+             "레인↔팩 불일치 표면(R3-P2-6)")
+        need("boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id" in dae,
+             "(ⓔ) 'enqueue 산출 인텐트 lane 항상 빈값' 핀(cargo 검체)이 삭제됐다")
+        need("boot_enqueue_refuses_when_supervisor_is_off" in dae,
+             "(ⓕ 데몬면) supervisor_off 미기록 핀(cargo 검체)이 삭제됐다")
+        notes.append("소스 핀: 훅 판독기 3층 + CLI/데몬 양면")
+    else:
+        notes.append("소스 핀: 훅 판독기 3층(rust 축은 배포 팩이라 생략)")
+    # ── 계측 타당성: 구 훅에는 frontdoor 가 없어야 한다(있으면 이 검체는 무엇도 증명 못 한다) ──
+    old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
+    calib = "skip(no-git)"
+    if old is not None:
+        need("boot-intent" not in old,
+             "계측 타당성 실패: 기준 커밋 훅에 이미 boot-intent 가 있다")
+        calib = "구 훅 frontdoor 부재 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
 

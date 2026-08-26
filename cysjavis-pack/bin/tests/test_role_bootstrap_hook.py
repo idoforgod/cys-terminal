@@ -149,11 +149,16 @@ def _run_hook_proc(prompt, surface_role="", surface_env=True, role_rc=0, extra_e
     if boot_py is not None:
         with open(os.path.join(pack, "bin", "javis_bootstrap.py"), "w") as f:
             f.write(boot_py)
-    # 목 cys — surface-role만 주입, 나머지 no-op
+    # 목 cys — surface-role만 주입, 나머지 no-op.
+    # ★P2(R3-P2-7 ⓐ): boot-intent 기본값 = **구 CLI 모사**(rc2+"unrecognized subcommand") —
+    #   이 파일의 기존 행렬 전부가 종전 spawn **폴백 leg** 를 계속 재게 한다(조용한 스큐 폴백).
+    #   frontdoor leg 는 cys_body 오버라이드(_FRONTDOOR_CYS)가 전담한다.
     cysp = os.path.join(mockbin, "cys")
     with open(cysp, "w") as f:
         f.write(cys_body if cys_body is not None else
-                '#!/bin/bash\n[ "$1" = surface-role ] && { echo "%s"; exit %d; }\nexit 0\n'
+                '#!/bin/bash\n[ "$1" = surface-role ] && { echo "%s"; exit %d; }\n'
+                '[ "$1" = boot-intent ] && { echo "error: unrecognized subcommand '
+                "'boot-intent'\" >&2; exit 2; }\nexit 0\n"
                 % (surface_role, role_rc))
     os.chmod(cysp, 0o755)
     env = dict(os.environ)
@@ -308,11 +313,23 @@ def _note_ctx(stdout):
 
 
 _BOOT_FAIL_PY = "#!/usr/bin/env python3\nimport sys\nsys.exit(7)\n"   # 즉사 rc7 = '발화 실패' 경로
-# (경로명, boot_py, note 마커) — ★W-F2 가 무가드로 남겼던 3블록 전부(발화 성공·발화 실패·BOOT 부재).
+# ★P2 frontdoor 목 cys — boot-intent 가 enqueued 토큰+rc0 을 내 스폰 생략 경로(신설 6번째
+#   note 블록)를 태운다. 판정 채널(surface-role·claim rc0)은 기본 목과 동일하게 즉답한다.
+_FRONTDOOR_CYS = ('#!/bin/bash\n'
+                  '[ "$1" = surface-role ] && { echo ""; exit 0; }\n'
+                  '[ "$1" = boot-intent ] && {\n'
+                  '  echo "[cys-hook] boot-intent: enqueued" >&2\n'
+                  '  echo "[cys-hook] boot-intent detail: mock enqueue" >&2\n'
+                  '  exit 0\n'
+                  '}\n'
+                  'exit 0\n')
+# (경로명, boot_py, note 마커, cys_body 오버라이드) — ★W-F2 가 무가드로 남겼던 3블록 전부
+# (발화 성공·발화 실패·BOOT 부재) + ★P2 frontdoor(6번째 note 블록 — cp949 생존 확장 · R3-P2-7 ⓒ).
 _CP949_PATHS = (
-    ("발화 성공", _MOCK_BOOT, "발화됨"),
-    ("발화 실패", _BOOT_FAIL_PY, "발화 실패"),
-    ("BOOT 부재", None, "부트스트랩 불가"),
+    ("발화 성공", _MOCK_BOOT, "발화됨", None),
+    ("발화 실패", _BOOT_FAIL_PY, "발화 실패", None),
+    ("BOOT 부재", None, "부트스트랩 불가", None),
+    ("frontdoor", _MOCK_BOOT, "데몬 감독자", _FRONTDOOR_CYS),
 )
 
 
@@ -326,10 +343,10 @@ def note_cp949_survival(fails):
     수동 재실행 금지 경고문도 함께 사라졌다. 수리는 훅의 가드 단일 소스 변수(CYS_NOTE_IO_GUARD)다.
 
     3속성:
-      ① 배선 정합(정적) — 5블록 전부가 단일 소스 변수를 쓰고 우회 인라인이 0이어야 한다
-         (인라인 사본 5벌이 반드시 낡는 것이 이번 결함의 형태 그 자체였다).
-      ② cp949 생존(양성) — 성공·발화 실패·BOOT 부재 세 경로 모두 cp949 에서 note JSON 이
-         완주 파싱되고 마커가 남는다(+UnicodeEncodeError 부재·훅 exit 0 계약).
+      ① 배선 정합(정적) — 6블록 전부(★P2 frontdoor 포함)가 단일 소스 변수를 쓰고 우회
+         인라인이 0이어야 한다(인라인 사본이 반드시 낡는 것이 이번 결함의 형태 그 자체였다).
+      ② cp949 생존(양성) — 성공·발화 실패·BOOT 부재·★P2 frontdoor 네 경로 모두 cp949 에서
+         note JSON 이 완주 파싱되고 마커가 남는다(+UnicodeEncodeError 부재·훅 exit 0 계약).
       ③ 음성 대조(계측기 타당성) — 가드 값을 뗀 변형 훅에서는 같은 케이스가 실제로 note 를
          잃고(UnicodeEncodeError 동반) 그래야만 이 계측기가 무언가를 재고 있는 것이다.
     ※발화 조건은 관측만 한다(앵커 ①폭주 — 이 핀은 순수 '출력 생존' 계약이다).
@@ -337,10 +354,11 @@ def note_cp949_survival(fails):
     with open(HOOK, encoding="utf-8") as f:
         hook_src = f.read()
 
-    # ① 배선 정합(정적)
+    # ① 배선 정합(정적) — ★P2 개정: frontdoor note 블록 신설로 5→6(R3-P2-7 ⓒ · 약화 아님,
+    #   블록 수 증가에 따른 계약 핀 갱신 — 훅 정의부 주석 '현재 6곳'과 동기).
     n_sites = hook_src.count('-c "$CYS_NOTE_IO_GUARD"' + "'\n")
-    if n_sites != 5:
-        fails.append("W-F2 배선: 가드 변수 call site %d≠5 — note 블록을 추가/제거했다면 이 핀과 "
+    if n_sites != 6:
+        fails.append("W-F2 배선: 가드 변수 call site %d≠6 — note 블록을 추가/제거했다면 이 핀과 "
                      "훅 정의부 주석을 함께 갱신하라" % n_sites)
     if "-c 'import json,sys" in hook_src:
         fails.append("W-F2 배선: 가드 변수를 우회하는 인라인 `-c 'import json,sys` 블록 잔존"
@@ -352,17 +370,17 @@ def note_cp949_survival(fails):
         # (측정 가능한 것을 정적 FAIL 뒤에 숨기지 않는다). ③ 뮤테이션만 정의 부재로 불능.
         fails.append("W-F2 배선: CYS_NOTE_IO_GUARD 정의에 stdio 재구성 가드가 없다")
 
-    def _proc(name, hook_path=None, boot_py=_MOCK_BOOT):
+    def _proc(name, hook_path=None, boot_py=_MOCK_BOOT, cys_body=None):
         try:
             return _run_hook_proc("너는 마스터다", extra_env={"PYTHONIOENCODING": "cp949"},
-                                  hook_path=hook_path, boot_py=boot_py)
+                                  hook_path=hook_path, boot_py=boot_py, cys_body=cys_body)
         except Exception as e:
             fails.append("W-F2(%s): 훅 실행 실패(계측 불능은 통과가 아니다): %s" % (name, e))
             return None
 
-    # ② cp949 생존(양성) — 실제 훅
-    for name, boot_py, marker in _CP949_PATHS:
-        r = _proc(name, boot_py=boot_py)
+    # ② cp949 생존(양성) — 실제 훅(★P2: frontdoor 6번째 블록 포함 4경로)
+    for name, boot_py, marker, cys_body in _CP949_PATHS:
+        r = _proc(name, boot_py=boot_py, cys_body=cys_body)
         if r is None:
             continue
         ctx = _note_ctx(r.stdout)
@@ -395,8 +413,9 @@ def note_cp949_survival(fails):
         os.symlink(BIN, os.path.join(mut_root, "bin"))
     except OSError:                     # Windows 비대칭(무권한 심링크) — 사본 폴백
         shutil.copytree(BIN, os.path.join(mut_root, "bin"))
-    for name, boot_py, marker in _CP949_PATHS[:2]:      # 성공·실패 양쪽(티켓 요구 범위)
-        r = _proc("음성 " + name, hook_path=mut_hook, boot_py=boot_py)
+    # 성공·실패 양쪽(티켓 요구 범위) + ★P2 frontdoor(신설 블록도 가드 없이는 실제로 죽는가)
+    for name, boot_py, marker, cys_body in _CP949_PATHS[:2] + _CP949_PATHS[3:]:
+        r = _proc("음성 " + name, hook_path=mut_hook, boot_py=boot_py, cys_body=cys_body)
         if r is None:
             continue
         ctx = _note_ctx(r.stdout)
@@ -537,7 +556,10 @@ def _run_hook_mission_mock(fails, name, mission_py, prompt="너는 마스터다"
         f.write(_MOCK_BOOT)
     cysp = os.path.join(mockbin, "cys")
     with open(cysp, "w") as f:
-        f.write('#!/bin/bash\n[ "$1" = surface-role ] && { echo ""; exit 0; }\nexit 0\n')
+        # boot-intent 기본값 = 구 CLI 모사(R3-P2-7 ⓐ — 이 하네스는 종전 spawn 폴백 leg 를 잰다)
+        f.write('#!/bin/bash\n[ "$1" = surface-role ] && { echo ""; exit 0; }\n'
+                '[ "$1" = boot-intent ] && { echo "error: unrecognized subcommand '
+                "'boot-intent'\" >&2; exit 2; }\nexit 0\n")
     os.chmod(cysp, 0o755)
     env = dict(os.environ)
     env["HOME"] = home
@@ -763,8 +785,8 @@ def main():
         sys.exit(1)
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
-          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 3생존/음성대조 2 + "
-          "P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 4(왕복1·중도사망·구팩폴백·CRLF)"
+          "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 4생존(P2 frontdoor 포함)/"
+          "음성대조 3 + P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 4(왕복1·중도사망·구팩폴백·CRLF)"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))
