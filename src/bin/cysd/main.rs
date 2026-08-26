@@ -110,6 +110,55 @@ pub(crate) struct SweepStats {
     /// 격리함 **안**의 미회수분은 여기에 섞이지 않는다(그건 `TrashBoundStats::remaining`).
     /// 이 값이 0 이 아니면 봉쇄 자체가 실패한 것이므로 **무조건 loud**.
     pub stuck: usize,
+    /// 격리는 됐는데 **격리 시각(체류시계)을 심지 못한** 항목 수 — `set_quarantine_stamp` 실패.
+    /// 봉쇄는 성공했고 그 항목은 나이 축에서 '신선'으로 접히므로 지금 할 조치가 없다 = **info**.
+    /// 침묵하지는 않는다: 나이 승격이 그만큼 늦어지는 사실은 로그에 남아야 사후 진단이 된다.
+    pub stamp_failed: usize,
+}
+
+/// 격리 시각을 **격리본 자신에게 심는다** — 유계의 나이 축이 재는 것은 파일 *내용*의 나이가
+/// 아니라 **격리함 체류시간**이기 때문이다.
+///
+/// ★없으면 나이 축의 입력이 통째로 틀린다: 격리는 `fs::rename` 이라 원본 mtime 이 그대로
+///   보존되는데, 격리 대상의 대종인 runtime PE 이미지는 업스트림 아카이브(PortableGit·Python
+///   embeddable 등)에서 풀린 것이라 **수개월 전 mtime** 을 갖는다. 그 값을 나이로 읽으면 격리되는
+///   순간 이미 14일 상한을 넘겨 있어 **업데이트 직후 첫 부팅부터** ⚠ 가 뜬다 — 이 수리가 없애려던
+///   오탐 배너 클래스 그 자체다(CI 실측: 체류 ~7분인데 aged 8건).
+///
+/// ★같은 값으로 다시 부르면 **멱등 no-op** 이다. `bound_update_trash` 가 이 성질을 이용해
+///   "지금 읽은 mtime 이 우리가 심은 스탬프인가"를 값 변경 없이 되묻는다(그쪽 나이 축 주석 참조).
+///
+/// Windows 에서 접근권을 `FILE_WRITE_ATTRIBUTES` 로 **좁혀** 여는 것이 load-bearing 이다:
+/// 격리본은 아직 홀더가 이미지로 매핑 중인 파일이라 `GENERIC_WRITE` 로는 공유 위반으로 열리지
+/// 않는다(로더는 `FILE_SHARE_READ|FILE_SHARE_DELETE` 로 연다). 시각 기록은 데이터 접근이 아니라
+/// **속성** 접근이라 공유 모드 검사에 걸리지 않으므로, 잠긴 이미지에도 스탬프가 박힌다.
+#[cfg(any(windows, test))]
+fn set_quarantine_stamp(path: &std::path::Path, secs: u64) -> bool {
+    let Some(t) = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs)) else {
+        return false;
+    };
+    let times = std::fs::FileTimes::new().set_modified(t);
+    open_for_stamp(path)
+        .and_then(|f| f.set_times(times))
+        .is_ok()
+}
+
+/// 시각 기록 전용 open — 데이터 쓰기 권한을 요구하지 않는다(위 주석의 공유 위반 회피).
+#[cfg(windows)]
+fn open_for_stamp(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004; // READ|WRITE|DELETE
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .open(path)
+}
+
+/// 타 OS(=단위 테스트 레인)에는 속성 전용 접근권이 없다 — 쓰기 열기로 같은 능력을 대표한다.
+#[cfg(all(not(windows), test))]
+fn open_for_stamp(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).open(path)
 }
 
 /// 설치 트리를 재귀 순회하며 업데이트 잔해를 회수한다(삭제 → 실패 시 격리).
@@ -166,6 +215,13 @@ pub(crate) fn sweep_update_leftovers(
         let dest = trash.join(quarantine_file_name(name, stamp, stats.quarantined));
         if relocate(&p, &dest) {
             stats.quarantined += 1;
+            // ★격리 시각을 격리본에 심는다 — 나이 축의 입력을 '내용 mtime'에서 **체류시간**으로
+            //   바꾸는 지점이다(rename 은 원본 mtime 을 보존하므로 심지 않으면 남의 시각을 읽는다).
+            //   실패는 **신선한 쪽으로** 접는다: 등급은 info 이고, 판정 쪽 접힘은
+            //   `bound_update_trash` 의 나이 축이 진다(스탬프 실패가 조기 경고를 만드는 방향 금지).
+            if !set_quarantine_stamp(&dest, stamp) {
+                stats.stamp_failed += 1;
+            }
         } else {
             stats.stuck += 1;
         }
@@ -185,7 +241,9 @@ pub(crate) fn sweep_update_leftovers(
 //   규칙에 맞는 정규 파일**만 만진다. 재귀하지 않고(격리는 항상 격리함 루트에 평평하게 놓는다),
 //   디렉토리·심볼릭링크는 건드리지 않으며, 격리함 밖으로는 어떤 삭제도 넓히지 않는다.
 
-/// **나이 상한 14일.** 격리본이 남아있다는 것은 그 파일 오브젝트를 매핑한 홀더가 아직 살아있다는
+/// **나이 상한 14일.** 재는 축은 파일 *내용*의 나이가 아니라 **격리함 체류시간**이다
+/// (입력은 격리 순간 `set_quarantine_stamp` 이 심는 시각 — 그 함수 주석이 왜인지를 진다).
+/// 격리본이 남아있다는 것은 그 파일 오브젝트를 매핑한 홀더가 아직 살아있다는
 /// 뜻이다(홀더가 죽으면 다음 부트의 회수가 즉시 지운다). 데스크톱 세션이 재부팅 없이 2주를
 /// 넘겨 같은 이미지를 붙들고 있는 것은 정상 범위 밖이므로, 14일을 넘긴 격리본은 "홀더 문제가
 /// 아닌 다른 원인(권한·ACL·백신 잠금)" 신호로 보고 승격 사유로 삼는다.
@@ -316,7 +374,14 @@ pub(crate) fn bound_update_trash(
         }
         stats.remaining += 1;
         stats.remaining_bytes = stats.remaining_bytes.saturating_add(*size);
-        if now_secs.saturating_sub(*mtime) > TRASH_MAX_AGE_SECS {
+        // 나이 축이 재는 것은 **격리함 체류시간**이다 — 격리 순간 `set_quarantine_stamp` 이 심어둔
+        // 시각. 둘째 조건은 "방금 읽은 mtime 이 정말 우리 스탬프인가"를 되묻는다: **같은 값**을 다시
+        // 쓰는 멱등 no-op 이라 시계를 되돌리지 않으면서, 시각을 **쓸 수 없는 파일**(권한·FS 미지원
+        // → 격리 때도 스탬프가 실패했다는 뜻)을 걸러낸다. 그런 항목의 mtime 은 업스트림 아카이브가
+        // 준 남의 시각이라 나이 근거가 될 수 없으므로 **신선한 쪽으로 접는다** — 스탬프 실패가 조기
+        // 경고를 유발하는 방향은 금지다(경고는 조치 가능할 때만 울린다). 늦게 우는 것은 안전하고,
+        // 일찍 우는 것은 오탐 배너 클래스의 재발이다.
+        if now_secs.saturating_sub(*mtime) > TRASH_MAX_AGE_SECS && set_quarantine_stamp(p, *mtime) {
             stats.aged_stuck += 1;
         }
     }
@@ -405,6 +470,18 @@ pub(crate) fn leftover_log_lines(
                 bound.remaining_bytes / 1024,
                 deferred,
                 trash.display()
+            ),
+        ));
+    }
+    // ①-b info — 격리는 됐는데 **체류시계를 심지 못한** 항목이 있다. 그 항목은 나이 축에서
+    //    '신선'으로 접히므로 지금 사용자가 할 조치가 없다(= loud 아님). 다만 나이 승격이 그만큼
+    //    늦어진다는 사실 자체는 남긴다 — 침묵하면 사후에 "왜 안 울렸나"를 되짚을 근거가 사라진다.
+    if sweep.stamp_failed > 0 {
+        out.push((
+            LeftoverLog::Info,
+            format!(
+                "[cysd] update trash: 격리 시각 기록 실패 {}건 — 해당 항목은 나이 축에서 '신선'으로 접는다(조기 경고 방지)",
+                sweep.stamp_failed
             ),
         ));
     }
@@ -3807,7 +3884,11 @@ mod update_leftover_sweep_tests {
             &mut stats,
         );
 
-        assert_eq!(stats, SweepStats { removed: 2, quarantined: 0, stuck: 0 }, "계수 불일치");
+        assert_eq!(
+            stats,
+            SweepStats { removed: 2, quarantined: 0, stuck: 0, stamp_failed: 0 },
+            "계수 불일치"
+        );
         assert!(!root.join("cysd.prev.exe").exists());
         assert!(!root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213").exists());
         assert!(root.join("cysd.exe").exists(), "살아있는 바이너리를 지웠다");
@@ -3839,7 +3920,7 @@ mod update_leftover_sweep_tests {
             &mut stats,
         );
 
-        assert_eq!(stats, SweepStats { removed: 0, quarantined: 3, stuck: 0 });
+        assert_eq!(stats, SweepStats { removed: 0, quarantined: 3, stuck: 0, stamp_failed: 0 });
         // T4-6 이 세는 바로 그 값 = runtime\ 재귀 잔해 수. 격리 후에는 0 이어야 한다.
         let rt_left = walk(&root.join("runtime"))
             .into_iter()
@@ -4148,7 +4229,11 @@ mod update_leftover_sweep_tests {
         let mut bound = TrashBoundStats::default();
         bound_update_trash(&trash, T0, &mut never_removes, &mut bound);
 
-        assert_eq!(sweep, SweepStats { removed: 0, quarantined: 2, stuck: 0 }, "봉쇄가 깨졌다");
+        assert_eq!(
+            sweep,
+            SweepStats { removed: 0, quarantined: 2, stuck: 0, stamp_failed: 0 },
+            "봉쇄가 깨졌다"
+        );
         assert_eq!(bound.remaining, 2, "격리본이 유계 계수에 잡히지 않았다");
         assert!(!bound.over_bound(), "건강한 상태에서 ⚠ 가 울렸다");
         let live_left = walk(&root)
@@ -4173,7 +4258,7 @@ mod update_leftover_sweep_tests {
     #[test]
     fn healthy_pending_trash_emits_no_warning_only_one_info_line() {
         let trash = PathBuf::from("C:\\Program Files\\cys\\.cys-update-trash");
-        let sweep = SweepStats { removed: 0, quarantined: 9, stuck: 0 };
+        let sweep = SweepStats { removed: 0, quarantined: 9, stuck: 0, stamp_failed: 0 };
         let bound = TrashBoundStats {
             reclaimed: 0,
             remaining: 9,
@@ -4193,6 +4278,26 @@ mod update_leftover_sweep_tests {
                 .is_empty(),
             "아무 일도 없는 부트가 로그를 냈다"
         );
+
+        // 체류시계를 못 심은 경우도 **info 로만** 남는다 — 그 항목은 나이 축에서 '신선'으로
+        // 접히므로 사용자가 할 조치가 없다(경고는 조치 가능할 때만 울린다).
+        let unstamped = SweepStats { removed: 0, quarantined: 2, stuck: 0, stamp_failed: 2 };
+        let pending = TrashBoundStats {
+            reclaimed: 0,
+            remaining: 2,
+            remaining_bytes: 8,
+            aged_stuck: 0,
+            deferred: 0,
+        };
+        let lines = leftover_log_lines(&unstamped, &pending, &trash);
+        assert!(
+            lines.iter().all(|(l, _)| *l == LeftoverLog::Info),
+            "스탬프 실패를 ⚠ 로 올렸다: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|(_, s)| s.contains("격리 시각 기록 실패 2건")),
+            "스탬프 실패를 통째로 삼켰다: {lines:?}"
+        );
     }
 
     /// ⑯ 승격 경로 — 봉쇄 실패(살아있는 트리 잔존)와 유계 이탈은 **각각** loud 를 낸다.
@@ -4201,7 +4306,7 @@ mod update_leftover_sweep_tests {
         let trash = PathBuf::from("/tmp/.cys-update-trash");
         // 봉쇄 실패: 삭제도 격리도 실패 → 잔해가 살아있는 설치 트리에 남았다.
         let lines = leftover_log_lines(
-            &SweepStats { removed: 0, quarantined: 0, stuck: 3 },
+            &SweepStats { removed: 0, quarantined: 0, stuck: 3, stamp_failed: 0 },
             &TrashBoundStats::default(),
             &trash,
         );
@@ -4257,6 +4362,86 @@ mod update_leftover_sweep_tests {
             "수렴 후에도 부트가 로그를 냈다"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑱ ★나이 축 **입력**의 회귀 핀 — **sweep 이 방금 격리한 항목은 `aged_stuck` 이 아니다.**
+    ///
+    ///    격리는 `fs::rename` 이라 원본 mtime 이 보존되는데, 격리 대상의 대종인 runtime PE 이미지는
+    ///    업스트림 아카이브(PortableGit·Python embeddable 등)에서 풀려 **수개월 전 mtime** 을 갖는다.
+    ///    나이 축이 그 값을 읽으면 격리되는 순간 이미 14일 상한을 넘겨 있어 **업데이트 직후 첫
+    ///    부팅부터** ⚠ 가 뜬다 — 이 수리가 없애려던 오탐 배너 클래스 그 자체다
+    ///    (CI 실측: 격리함 체류는 ~7분인데 aged 8건).
+    ///
+    ///    기존 핀 ⑨(`trash_aged_stuck_escalates_at_the_age_threshold`)는 mtime 을 **합성 주입**해
+    ///    술어만 보므로 이 사각(입력이 틀린 경우)을 못 잡는다 — 그래서 그 핀을 유지한 채 **추가**한다.
+    #[test]
+    fn freshly_quarantined_item_is_not_aged_even_when_its_content_is_ancient() {
+        let root = workdir("stamp-residency");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        let ancient = T0 - 200 * 24 * 60 * 60; // 업스트림 아카이브가 준 mtime(수개월 전)
+        touch_at(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"), ancient, 64);
+        touch_at(&root.join("cysd.prev.exe"), ancient, 64);
+
+        let mut sweep = SweepStats::default();
+        let mut never_removes = |_: &Path| false; // 홀더 생존 = 삭제 거부 → 격리로 완결
+        sweep_update_leftovers(
+            &root,
+            12,
+            &trash,
+            T0,
+            &mut never_removes,
+            &mut real_relocate,
+            &mut sweep,
+        );
+        assert_eq!(sweep.quarantined, 2, "격리가 안 됐다 — 이 핀의 전제가 깨졌다");
+        assert_eq!(sweep.stamp_failed, 0, "격리 시각을 심지 못했다(체류시계 미기록)");
+
+        // 같은 부트의 유계 패스 — 체류시간 0초다.
+        let mut bound = TrashBoundStats::default();
+        bound_update_trash(&trash, T0, &mut never_removes, &mut bound);
+        assert_eq!(bound.remaining, 2);
+        assert_eq!(bound.aged_stuck, 0, "방금 격리한 항목을 나이초과로 판정했다(오탐 배너 재발)");
+        assert!(!bound.over_bound(), "업데이트 직후 첫 부팅에 ⚠ 가 울렸다");
+
+        // ★대조 — 나이 축을 **죽인 게 아니라 입력을 고친 것**임을 같은 핀에서 못박는다.
+        //   체류가 실제로 상한을 넘기면 그때는 승격한다(⑨ 의 술어가 여전히 살아있다).
+        let mut later = TrashBoundStats::default();
+        bound_update_trash(
+            &trash,
+            T0 + TRASH_MAX_AGE_SECS + 1,
+            &mut never_removes,
+            &mut later,
+        );
+        assert_eq!(later.aged_stuck, 2, "체류가 상한을 넘겼는데 조용했다(나이 축이 죽었다)");
+        assert!(later.over_bound(), "나이 초과 미회수가 승격되지 않았다");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑲ ★실패 방향 규율 — 체류시계를 **쓸 수 없는** 항목은 나이 축에서 '신선'으로 접힌다.
+    ///    스탬프 실패가 조기 경고를 유발하는 방향은 금지다(경고는 조치 가능할 때만 울린다).
+    ///    늦게 우는 것은 안전하고, 일찍 우는 것은 오탐 배너 클래스의 재발이다.
+    #[cfg(unix)]
+    #[test]
+    fn unstampable_item_folds_to_fresh_instead_of_warning_early() {
+        use std::os::unix::fs::PermissionsExt;
+        let trash = workdir("bound-unstampable");
+        let p = trash.join("python313.dll.prev1");
+        touch_at(&p, T0 - TRASH_MAX_AGE_SECS - 1, 8); // 남의 시각(=스탬프가 실패했을 때 남는 값)
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::File::options().write(true).open(&p).is_ok() {
+            // root 로 도는 러너에서는 '쓸 수 없는 파일'을 만들 수 없다 — 이 축은 재현 불가.
+            let _ = std::fs::remove_dir_all(&trash);
+            return;
+        }
+
+        let mut stats = TrashBoundStats::default();
+        let mut never_removes = |_: &Path| false;
+        bound_update_trash(&trash, T0, &mut never_removes, &mut stats);
+
+        assert_eq!(stats.remaining, 1, "잔존 계수에서 빠졌다(성장 은폐)");
+        assert_eq!(stats.aged_stuck, 0, "스탬프를 못 쓰는 항목을 나이초과로 올렸다(조기 경고)");
+        assert!(!stats.over_bound(), "조치할 수 없는 항목에 ⚠ 를 달았다");
+        let _ = std::fs::remove_dir_all(&trash);
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {
