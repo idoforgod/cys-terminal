@@ -1602,6 +1602,20 @@ pub struct Daemon {
     /// 배달 epoch. 재발행이 매번 새 request_id를 받아도(id 기준 억제 실패) 같은 의미 요청의
     /// CEO 이중 주입을 억제한다. 인메모리(세션 한정 — 저볼륨).
     pub auto_route_seen: Mutex<HashMap<String, f64>>,
+    /// ★(P2 · R3-P2-4 blocker) 부트 감독자 **생존 플래그** — `boot_supervisor::spawn` 이
+    /// 롤백 판정을 통과해 태스크를 실제로 기동하기 **직전**에만 set 한다(꺼짐이면 영영 미set).
+    ///
+    /// 왜 필요한가: 감독자 롤백 노브(`CYS_BOOT_GATES=0`·`CYS_BOOT_SUPERVISOR=0`)는 **데몬
+    /// 프로세스의 env** 로 판정되는데, 훅/CLI 는 별개 프로세스라 그 사실을 관측할 수 없다.
+    /// 그 상태에서 `boot.enqueue` 가 스풀에 쓰고 성공을 돌리면 훅은 폴백 spawn 을 건너뛰고,
+    /// 인텐트는 수명 1800s 동안 아무도 집지 않고 썩는다 — **부트 0회**(재시도 주체 0 의 재생산).
+    /// 그래서 enqueue arm 은 이 플래그 미set 이면 스풀에 쓰지 않고 typed 오류("supervisor_off")
+    /// 를 돌려 훅이 종전 spawn 폴백(legacy)을 타게 한다.
+    ///
+    /// 정직한 한계(R3-P2-4 잔여 위험): 기동 **후** 매 틱 패닉 등으로 실질 무능해진 감독자는 이
+    /// 플래그로 잡히지 않는다 — `boot_supervisor.tick_panic` 이벤트가 보조 관측이고, 인텐트
+    /// 수명(1800s)이 피해 상한이다.
+    pub supervisor_alive: AtomicBool,
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
@@ -2257,6 +2271,8 @@ impl Daemon {
             restore_roots: Mutex::new(Vec::new()),
             approval_stats: Mutex::new(HashMap::new()),
             auto_route_seen: Mutex::new(HashMap::new()),
+            // (P2 · R3-P2-4) 기본 false — set 주체는 boot_supervisor::spawn 하나뿐이다.
+            supervisor_alive: AtomicBool::new(false),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);

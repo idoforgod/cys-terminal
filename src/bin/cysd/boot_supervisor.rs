@@ -69,16 +69,22 @@
 //! 손잡이는 마스터 하나다(`lib.rs ENV_BOOT_GATES` 의 규율 — 축마다 노브를 따로 두고 나중에
 //! 합치는 순서는 BLOCK-3 에서 이미 실패했다).
 //!
-//! ## 지금 이 착지의 **정직한 범위**
-//! 인텐트의 **생산자는 아직 없다**(훅·`cys hook` 측 배선은 U-24 소관 — 파일 반경 밖). 그래서
-//! 프로덕션에서 스풀은 항상 비어 있고 감독자는 **아무 일도 하지 않는다** = 행동 무변경.
-//! 이 단위가 착지시키는 것은 **기계장치와 계약과 그 계약을 지키는 검체**이고, 그 능력은
-//! 합성 표본(임시 디렉터리 + 조작된 인텐트)으로 시험된다.
+//! ## 생산자 (P2 — U-24 착지)
+//! 인텐트의 생산자는 `handlers.rs` 의 **`boot.enqueue` RPC arm** 하나다(훅이 게이트 사슬 통과
+//! 후 `cys boot-intent` 로 부른다). 정상 경로에서 스풀의 유일한 writer 는 **데몬 자신**
+//! (`boot.enqueue`→[`enqueue`]) 이므로 writer/reader 스키마 버전은 항상 일치한다.
+//!
+//! ## 재시도의 **정직한 의미론** — 재시도 = **스폰 실패 한정**
+//! 감독자는 자식 exit 을 관측하지 않는다(핸들 즉시 드롭 · [`run_ensure_team`]). 따라서
+//! '스폰 성공 = 인텐트 제거'이고, exit 11(싱글플라이트 skip)도 exit 10(session_error)도
+//! 여기서는 '성공'으로 접힌다. **부트 실패** 계급의 재실행 주체는 여전히 §0-A(P0-3) 가
+//! 유일하다 — 이 감독자가 그것을 대체한다고 서술하면 허위다(2차 성찰 P2-3 판정).
 
 use crate::state::{now_epoch, state_dir, Daemon};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,7 +94,18 @@ use std::time::Duration;
 
 /// 인텐트 **페이로드** 스키마 버전. 다르면 실행하지 않고 폐기한다(전방 호환을 침묵으로 접지
 /// 않는다 — 구 데몬이 신 인텐트를 자기 방식으로 해석하는 것이 가장 나쁜 귀결이다).
-pub const INTENT_SCHEMA_V: u64 = 1;
+///
+/// **v2 (P2)**: `decl_origin`(닫힌 토큰)·`claim{rc,at}`(데이터) 추가. 다운그레이드 스큐에서
+/// 구 감독자(v1)는 신 인텐트를 `schema_mismatch` 로 **시끄럽게 폐기**한다(기존 계약 그대로 ·
+/// R3-P2-1). 미지 필드는 무시하고 **필수 필드 부재만** 폐기한다([`BootIntent::from_str`]).
+pub const INTENT_SCHEMA_V: u64 = 2;
+
+/// (P2 · v2) `decl_origin` 이 나를 수 있는 **유일하게 인정되는 토큰**. 훅의 기계유래 게이트
+/// (`javis_mission machine-origin`)가 human 판정을 완주했을 때만 이 값이 실린다 — 판별의
+/// 소유자는 여전히 훅/javis_mission 이고(P2-5 · 게이트는 훅에 남는다), 이 필드는 **게이트
+/// 통과 사실의 전달**이지 판정의 이동이 아니다. 미지값은 인정이 아니라 폐기다
+/// (`Disposition::Retire("unknown_decl_origin")` — 닫힌 토큰 계약).
+pub const DECL_ORIGIN_HOOK_HUMAN: &str = "hook-human";
 
 /// 스풀 디렉터리 이름. 부모는 `state_dir(socket)` 이므로 **부서 격리를 자동 상속**한다
 /// (Windows 는 `%LOCALAPPDATA%\cys[\<slug>]`, unix 는 소켓과 같은 디렉터리).
@@ -208,6 +225,14 @@ pub struct BootIntent {
     pub next_attempt_at: f64,
     /// 생성 사유(진단 전용 — 판정에 쓰이지 않는다).
     pub reason: String,
+    /// (v2) 선언 유래 — 닫힌 토큰 [`DECL_ORIGIN_HOOK_HUMAN`] 만 인정, 빈 값 = 부재.
+    /// **데이터 필드**다: 명령이 아니고, 부트 자식의 `CYS_DECL_ORIGIN` env 로만 릴레이된다.
+    pub decl_origin: String,
+    /// (v2) 훅 선행 claim 의 rc 릴레이(데이터 — 디스패치 시점 판정은 [`run_ensure_team`] 의
+    /// **레지스트리 재실측**이 한다. 타임스탬프 이월 금지 · R3-P2-5).
+    pub claim_rc: Option<i64>,
+    /// (v2) 훅 선행 claim 시각(epoch 초 · 진단 전용 — 위와 같은 이유로 판정에 쓰지 않는다).
+    pub claim_at: Option<f64>,
 }
 
 impl BootIntent {
@@ -221,6 +246,8 @@ impl BootIntent {
             "attempts": self.attempts,
             "next_attempt_at": self.next_attempt_at,
             "reason": self.reason,
+            "decl_origin": self.decl_origin,
+            "claim": {"rc": self.claim_rc, "at": self.claim_at},
         })
     }
 
@@ -254,6 +281,15 @@ impl BootIntent {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            // (v2) 알려진 키만 판독 — 부재는 빈 값/None(구 v1 파일 하위호환 판독. 단 v1 은
+            // decide() 의 버전 판정에서 어차피 schema_mismatch 로 폐기된다).
+            decl_origin: obj
+                .get("decl_origin")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            claim_rc: obj.get("claim").and_then(|c| c.get("rc")).and_then(|x| x.as_i64()),
+            claim_at: obj.get("claim").and_then(|c| c.get("at")).and_then(|x| x.as_f64()),
         })
     }
 }
@@ -281,6 +317,12 @@ pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
         //   폐기 대상이다 — 이 분기를 지우면 스풀이 곧 명령 실행 표면이 된다.
         return Disposition::Retire("unknown_action");
     };
+    // (P2 · v2) decl_origin 도 닫힌 토큰이다 — 인정 토큰은 hook-human 하나뿐이고 미지값은
+    // 실행이 아니라 폐기다. 정상 경로의 유일 writer(boot.enqueue arm)는 미지값을 애초에
+    // 거절하므로, 여기 도달하는 미지값은 스풀 직접 투하(§4-10 잔여위험 계급)다 — fail-closed.
+    if !it.decl_origin.is_empty() && it.decl_origin != DECL_ORIGIN_HOOK_HUMAN {
+        return Disposition::Retire("unknown_decl_origin");
+    }
     if now - it.created_at > INTENT_MAX_AGE_SECS {
         return Disposition::Retire("expired");
     }
@@ -388,10 +430,9 @@ fn write_intent(dir: &Path, it: &BootIntent) -> Result<PathBuf, String> {
 
 /// 부트 인텐트를 스풀에 등록한다 — **감독자의 유일한 입력구**.
 ///
-/// ★생산자 배선은 이 착지의 범위 밖이다(훅·`cys hook` 측 = U-24 · 파일 반경 밖). 이 API 를
-/// 지금 지우면 U-24 가 계약을 처음부터 다시 발명하게 되므로, 계약을 여기 못박아 둔다.
-/// 단위테스트가 이 경로를 전수 구동한다.
-#[allow(dead_code)]
+/// 생산자는 `handlers.rs` 의 `boot.enqueue` RPC arm 하나다(P2 · U-24 착지). 그 arm 이 지키는
+/// 계약 — surface_id 커널 도출·lane 자기 고정(항상 빈값)·claim 교차검증·감독자 생존 선검사 —
+/// 은 arm 쪽 주석이 정본이고, 이 함수는 검증이 끝난 값을 원자 기록하는 디스크 층이다.
 pub fn enqueue(
     socket_path: &Path,
     id: &str,
@@ -399,6 +440,9 @@ pub fn enqueue(
     lane: &str,
     surface_id: Option<u64>,
     reason: &str,
+    decl_origin: &str,
+    claim_rc: Option<i64>,
+    claim_at: Option<f64>,
 ) -> Result<PathBuf, String> {
     enqueue_in(
         &spool_dir(socket_path),
@@ -407,12 +451,16 @@ pub fn enqueue(
         lane,
         surface_id,
         reason,
+        decl_origin,
+        claim_rc,
+        claim_at,
         now_epoch(),
     )
 }
 
 /// [`enqueue`] 의 **경로·시각 주입판**. 테스트가 임시 디렉터리와 가짜 시각으로 구동한다
 /// (플랫폼별 `state_dir` 해소에 의존하지 않아 Windows 에서도 같은 코드가 시험된다).
+#[allow(clippy::too_many_arguments)]
 fn enqueue_in(
     dir: &Path,
     id: &str,
@@ -420,6 +468,9 @@ fn enqueue_in(
     lane: &str,
     surface_id: Option<u64>,
     reason: &str,
+    decl_origin: &str,
+    claim_rc: Option<i64>,
+    claim_at: Option<f64>,
     now: f64,
 ) -> Result<PathBuf, String> {
     let it = BootIntent {
@@ -432,6 +483,9 @@ fn enqueue_in(
         attempts: 0,
         next_attempt_at: 0.0,
         reason: reason.to_string(),
+        decl_origin: decl_origin.to_string(),
+        claim_rc,
+        claim_at,
     };
     write_intent(dir, &it)
 }
@@ -550,9 +604,19 @@ fn scan_spool(dir: &Path, now: f64, cursor: usize) -> Scan {
 // 실행 — 감독자가 '낳는' 유일한 행위
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// (P2 · R3-P2-5) 실행 실패의 **두 계급** — 접는 방향이 서로 다르다.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunErr {
+    /// 일시 실패(스폰 실패 등) — 백오프 후 **재시도** 대상이다.
+    Retry(String),
+    /// 전제 붕괴(claim_stale 등) — 재시도가 무의미하므로 인텐트를 **폐기**한다.
+    /// 문자열은 폐기 사유(`intent_retired` 이벤트 페이로드로 나간다).
+    Retire(&'static str),
+}
+
 /// 행위 실행자. 함수 포인터인 것은 테스트가 **스폰 없이** 루프를 구동하기 위해서다
 /// (실 프로세스를 낳지 않고 유계성·순서 계약을 전수 시험한다).
-type Runner = fn(&Arc<Daemon>, &BootIntent, BootAction) -> Result<String, String>;
+type Runner = fn(&Arc<Daemon>, &BootIntent, BootAction) -> Result<String, RunErr>;
 
 /// 스풀 항목 **제거자**. 함수 포인터인 것은 `Runner` 와 같은 이유다 — "삭제가 계속 실패한다"
 /// 는 상태를 테스트가 **결정론**으로 만들 수 있어야 한다. 플랫폼 권한 조작(디렉터리 0500·
@@ -601,7 +665,7 @@ fn dispatch_one(
     it: &BootIntent,
     action: BootAction,
     runner: Runner,
-) -> Result<String, String> {
+) -> Result<String, RunErr> {
     crate::delivery::record_audited(
         daemon,
         it.surface_id.unwrap_or(0),
@@ -610,6 +674,40 @@ fn dispatch_one(
         None,
     );
     runner(daemon, it, action)
+}
+
+/// (P2 · R3-P2-5) 레지스트리 재실측의 **순수 판정** — "이 surface 가 지금 master 를 쥐고
+/// 살아 있는가". 디스패치 직전의 신선한 실측이 판정의 전부이며, 인텐트가 나른 claim 타임스탬프
+/// 는 어떤 판정에도 쓰지 않는다(**타임스탬프 이월 금지** — 이월하면 부트의 결박 창 300s 를
+/// 감독자 합법 지연(수명 1800s+백오프)이 넘겨 지연 꼬리에서 rc6 이 결정론으로 재발한다).
+pub fn master_holds(registry_master: Option<u64>, sid: u64, alive: bool) -> bool {
+    registry_master == Some(sid) && alive
+}
+
+/// (P2) PATH **선두에 데몬 exe_dir** 를 얹는다 — 부트 체인은 맨이름 `"cys"` 를 상시 호출하는데
+/// 데몬 env PATH 에는 앱 디렉터리가 없을 수 있다(macOS launchd 최소 PATH·Windows GUI 기동).
+/// 이 주입 없이는 감독자 부트 전량이 첫 `cys` 호출에서 좌초한다 — '맥은 멀쩡한데 Windows 만
+/// 깨지는' 전례 계급 그 자체라, **주입 없이 P2 를 켜지 말 것**(2차 성찰 P2-2 고지).
+fn path_with_exe_dir_first(exe_dir: &Path, current: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    let mut parts: Vec<PathBuf> = vec![exe_dir.to_path_buf()];
+    if let Some(cur) = current {
+        parts.extend(std::env::split_paths(&cur));
+    }
+    // join 실패(경로에 분리자 포함 등 — exe_dir 파생값에선 비실재)는 exe_dir 단독으로 접는다:
+    // 이 주입의 존재 이유가 'cys 해소 보장'이므로 그 한 조각은 어떤 실패에서도 남긴다.
+    std::env::join_paths(parts).unwrap_or_else(|_| exe_dir.as_os_str().to_os_string())
+}
+
+/// boot-supervisor.log 크기 상한 1겹(회전 1회 — 훅 런별 로그 A16/R3 규율의 데몬면).
+/// 단일 append 파일의 무상한 성장을 막는다 — 초과 시 `.1` 로 밀어내고 새로 쓴다.
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+fn rotate_log_if_huge(log: &Path) {
+    let too_big = std::fs::metadata(log).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false);
+    if too_big {
+        let rotated = log.with_extension("log.1");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(log, &rotated);
+    }
 }
 
 /// [`BootAction::EnsureTeam`] 의 프로덕션 실행자 — 부트 체인을 **데몬의 자식으로** 낳는다.
@@ -623,10 +721,43 @@ fn run_ensure_team(
     daemon: &Arc<Daemon>,
     it: &BootIntent,
     _action: BootAction,
-) -> Result<String, String> {
+) -> Result<String, RunErr> {
+    // ── (P2 · R3-P2-5) 디스패치 직전 **레지스트리 재실측** — 타임스탬프 이월 금지 ──────────
+    // 인텐트의 claim{rc,at} 은 데이터(진단)일 뿐, 판정은 지금 이 순간의 roles 레지스트리다.
+    // 참이면 신선한 claim 판정을 env 로 주입하고(레지스트리 소유자의 실측 — CS-3 보고=실측
+    // 정합), 거짓이면 스폰하지 않고 Retire("claim_stale") 로 폐기한다 — 좌석이 죽어 master 가
+    // 사라진 뒤의 재시도 정지는 **정직한 정지**다(오너 재선언이 재개 신호).
+    // 락 규율: roles 락은 단독 획득 후 즉시 해제(중첩 0 — surfaces→roles 순서 규약 무접촉).
+    //
+    // ★(R4 수정 라운드 · 표면 축소) surface_id **부재 = fail-closed 폐기**. 유일한 정상
+    //   생산자(boot.enqueue arm)는 caller_unresolved 거절로 항상 Some(sid)를 보장하므로,
+    //   여기 도달하는 None 은 스풀 직접 투하(§4-10 계급)뿐이다. 종전엔 재실측을 통째로
+    //   건너뛰고 신원 env 0 으로 스폰돼 rc6(session_error)×MAX_ATTEMPTS 를 태웠다 —
+    //   프로덕션 경로 무손실이므로 스폰 전에 접는다(합성 인텐트 검체들은 주입 러너 경유라
+    //   이 게이트와 무접촉).
+    if it.surface_id.is_none() {
+        return Err(RunErr::Retire("no_surface"));
+    }
+    let mut verified_claim: Option<(u64, Option<String>)> = None;
+    if let Some(sid) = it.surface_id {
+        let registry_master = { daemon.roles.lock().unwrap().get("master").copied() };
+        let surface = daemon.get_surface(sid);
+        let alive = surface
+            .as_ref()
+            .is_some_and(|s| !s.exited.load(Ordering::Relaxed));
+        if !master_holds(registry_master, sid, alive) {
+            return Err(RunErr::Retire("claim_stale"));
+        }
+        // (P1×P2 조립점) 살아있는 선언 surface 의 seat 토큰을 자식 env 로 릴레이 — 데몬 자식은
+        // 어느 pane 조상 체인에도 닿지 않으므로, 창 밖 재시도의 claim 은 이 토큰이 완결한다.
+        // 이 릴레이는 pane PTY env 배달과 같은 계급(데몬→자기 자식 1프로세스)이며 관측·영속
+        // 채널(이벤트·로그·topology)에는 싣지 않는다(무영속·무노출 계약 유지).
+        let token = surface.and_then(|s| s.seat_token.clone());
+        verified_claim = Some((sid, token));
+    }
     let script = cys::pack::pack_dir().join("bin").join("javis_bootstrap.py");
     if !script.is_file() {
-        return Err(format!("부트 체인 부재: {}", script.display()));
+        return Err(RunErr::Retry(format!("부트 체인 부재: {}", script.display())));
     }
     let exe_dir = std::env::current_exe()
         .ok()
@@ -642,6 +773,7 @@ fn run_ensure_team(
         .parent()
         .map(|d| d.join("boot-supervisor.log"))
         .unwrap_or_else(|| PathBuf::from("boot-supervisor.log"));
+    rotate_log_if_huge(&log);
     let mut cmd = tokio::process::Command::new(&python);
     cmd.arg(&script)
         .env(cys::ENV_SOCKET, &lane)
@@ -651,7 +783,25 @@ fn run_ensure_team(
         .env("CYS_NO_AUTOSTART", "1")
         // SEAL-1: 번들 python 이 `.pyc` 를 쓰면 코드서명 봉인이 깨진다.
         .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
+        // ★(P2 · R3-P2-1/ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
+        .env("PATH", path_with_exe_dir_first(&exe_dir, std::env::var_os("PATH")))
         .stdin(std::process::Stdio::null());
+    // ── (P2 · R3-P2-5) provenance·claim 주입 — 위 재실측이 참일 때만 ─────────────────────
+    if let Some((sid, token)) = verified_claim {
+        cmd.env("CYS_SURFACE_ID", sid.to_string())
+            .env("CYS_CLAIM_RC", "0")
+            .env("CYS_CLAIM_SID", sid.to_string())
+            // 신선한 시각 = 지금(재실측 시각). 훅 스탬프 이월 금지 — _pre_bound 결박 창(300s)은
+            // 이 값 기준으로 판정되므로, 이월하면 창 밖 디스패치가 전부 rc6 계급으로 떨어진다.
+            .env("CYS_CLAIM_AT", format!("{}", now_epoch() as u64))
+            .env("CYS_CLAIM_OUT", "[supervisor] registry re-verified");
+        if !it.decl_origin.is_empty() {
+            cmd.env("CYS_DECL_ORIGIN", &it.decl_origin);
+        }
+        if let Some(tok) = token {
+            cmd.env("CYS_SEAT_TOKEN", tok);
+        }
+    }
     {
         use crate::state::HideConsole;
         cmd.hide_console();
@@ -672,10 +822,15 @@ fn run_ensure_team(
         Ok(child) => {
             let pid = child.id().unwrap_or(0);
             // 핸들 즉시 드롭 = 기다리지 않는다(감독자 cadence 를 자식이 잡아먹지 않는다).
+            // ★정직 명문(P2 · 2차 성찰 P2-3): 자식 exit 을 관측하지 않으므로 '스폰 성공=인텐트
+            //   제거'이고, exit 11(싱글플라이트 skip)도 exit 10(session_error)도 여기서는
+            //   '성공'으로 접힌다. 감독자의 **재시도 = 스폰 실패 한정**이며, 부트 실패 계급의
+            //   재실행 주체는 §0-A(P0-3)가 유일하다 — 이 서술을 바꾸려면 exit 관측(비동기 wait)
+            //   확장이 선행이다(이번 착지 범위 밖).
             drop(child);
             Ok(format!("pid={pid}"))
         }
-        Err(e) => Err(format!("스폰 실패: {e}")),
+        Err(e) => Err(RunErr::Retry(format!("스폰 실패: {e}"))),
     }
 }
 
@@ -710,6 +865,13 @@ struct SupState {
     budget_pressure_reported: bool,
     /// GC 회전 커서(`scan_spool`).
     cursor: usize,
+    /// (P2 · 오너 결정 ⑧c) **소진 loud 통보 래치** — 인텐트 id 당 정확히 1회.
+    ///
+    /// 소진 종착은 두 지점에서 관측된다(dispatch 실패 3회째 · `attempts_exhausted` 폐기) —
+    /// 삭제 실패로 인텐트가 스풀에 남으면 같은 인텐트가 두 지점을 다 지나므로, 래치 없이는
+    /// 통보가 중복된다. 회수는 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 새 키다),
+    /// 상한은 [`MAX_UNDELETABLE`] 재사용(넘치면 새 키에 침묵 — 유계가 통보보다 앞이다).
+    exhausted_notified: std::collections::HashSet<String>,
 }
 
 /// 스풀 항목 1건을 지우고 **이벤트를 내도 되는지**를 함께 판정한다.
@@ -738,6 +900,52 @@ fn remove_and_gate(
     Some(false)
 }
 
+/// (P2 · 오너 결정 ⑧c) 소진 **loud 종착** — "버스 이벤트만"은 마스터가 아직 태어나지 않은
+/// 시점의 방송이라 청중이 0 인 조용한 포기다(WDSI 좀비 18회의 교훈: 정지 조건 + **가시성**).
+/// 채널 3개: ①기존 버스 이벤트(호출부의 `dispatch_failed`/`intent_retired` — 여기서 내지
+/// 않는다) ②데몬 내부 feed 항목(kind=`bootstrap-fail` — 훅 `_notify_bg` 와 동일 분류)
+/// ③선언 surface 생존 시 **원장 선기록 후** 1줄 정직 통보.
+///
+/// ★③에 `cfg!(unix)` 게이트를 걸지 않는다(`announce_seat_takeover` 와 **다른** 신규 경로):
+///   소진 통보의 주 청중이 정확히 Windows 다(setsid 부재 계급) — 같은 게이트를 답습하면
+///   정확히 필요한 곳에서 침묵한다(2차 성찰 P2-3). 저 함수의 `#` 주석 접두도 쓰지 않는다 —
+///   여기의 대상은 빈 셸 좌석이 아니라 선언 pane(Claude 세션)이고, 기계 push 오인은 원장
+///   선기록(`Origin::Supervisor`)이 이미 봉인한다(delivery.rs 불변식 ①).
+///
+/// 통보는 (인텐트 id)당 정확히 1회다(`SupState::exhausted_notified` — 매 틱 반복 금지).
+fn notify_exhausted(daemon: &Arc<Daemon>, st: &mut SupState, it: &BootIntent, why: &str) {
+    if st.exhausted_notified.contains(&it.id) || st.exhausted_notified.len() >= MAX_UNDELETABLE {
+        return;
+    }
+    st.exhausted_notified.insert(it.id.clone());
+    let text = format!(
+        "[cys-supervisor] 부트 {MAX_ATTEMPTS}회 실패(intent={} why={why}) — boot-last·boot-supervisor.log 확인",
+        it.id
+    );
+    daemon.push_feed_notification("bootstrap-fail", "부트 감독자 소진(팀 미기동)", &text, it.surface_id);
+    if let Some(sid) = it.surface_id {
+        if let Some(s) = daemon.get_surface(sid) {
+            if !s.exited.load(Ordering::Relaxed) {
+                // ★원장 선기록이 주입보다 앞(delivery.rs 불변식 ① — dispatch_one 과 같은 순서).
+                crate::delivery::record_audited(
+                    daemon,
+                    sid,
+                    &text,
+                    crate::delivery::Origin::Supervisor,
+                    None,
+                );
+                // try_send: 채널 포화면 조용히 포기 — 통보는 best-effort 이고 feed·이벤트가
+                // 이미 사실을 남겼다(고지 실패가 유계를 흔들면 안 된다).
+                let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+                    text,
+                    cr_delay_ms: 120,
+                    clear_first: false,
+                });
+            }
+        }
+    }
+}
+
 /// 한 틱. 디스크 I/O + (있으면) 실행. **동기**이며 호출자가 `catch_unwind` 로 감싼다.
 /// 반환값은 이번 틱의 디스패치 횟수(테스트가 유계성을 세는 축).
 fn tick_in(
@@ -748,6 +956,12 @@ fn tick_in(
     remover: Remover,
     now: f64,
 ) -> usize {
+    // ★(P2 · R3-RISK-1) kill-switch 게이트 — pause 중에는 낳지도 지우지도 않는다
+    //   (schedule.rs `scheduler_tick` 선두 게이트와 동형). 오너의 어떤 입력이든 kill-switch 를
+    //   눌렀다는 뜻이고, 그 순간 기계가 새 프로세스를 낳는 것이 정확히 pause 가 막으려는 것이다.
+    if daemon.paused.load(Ordering::Relaxed) {
+        return 0;
+    }
     // ★스풀 권한 **재강제**(unix 0o700) — 있을 때만. 없으면 **만들지 않는다**:
     //   감독자는 관측자이지 생산자가 아니고, 스풀 생성은 인텐트를 적는 쪽의 일이다
     //   (지금 생산자가 없으므로 프로덕션 디스크 자국은 0 이다 = 행동 무변경).
@@ -760,6 +974,8 @@ fn tick_in(
     st.cursor = scan.next_cursor;
     // 음성 캐시 회수 — 파일이 실제로 사라진 키만 버린다(위 필드 주석의 '나이 만료 금지').
     st.undeletable.retain(|(p, _)| Path::new(p).exists());
+    // 소진 통보 래치 회수 — 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 어차피 새 키다).
+    st.exhausted_notified.retain(|id| scan.present.contains(id));
 
     // ── 디스크 GC(파싱 불가·mtime 초과) ────────────────────────────────────────
     for (p, why) in &scan.garbage {
@@ -839,6 +1055,11 @@ fn tick_in(
                                "attempts": attempts, "removed": removed}),
                     );
                 }
+                // (P2 · 오너 결정 ⑧c) 예산 소진 종착은 loud 다 — 래치가 1회로 접는다
+                // (데몬 재시작 후 스풀 픽업으로 소진 인텐트를 처음 보는 경우도 이 지점이 알린다).
+                if why == "attempts_exhausted" {
+                    notify_exhausted(daemon, st, it, why);
+                }
             }
             Disposition::Run(action) => {
                 if suspend_dispatch {
@@ -865,7 +1086,23 @@ fn tick_in(
                                    "persist_error": persist_err}),
                         );
                     }
-                    Err(why) => {
+                    // (P2 · R3-P2-5) 전제 붕괴(claim_stale) — 재시도가 아니라 **폐기**다.
+                    // 좌석이 죽어 레지스트리에서 master 가 사라졌다면 남은 2회 재시도도 같은
+                    // 판정으로 전소할 뿐이다 — 정직한 정지(오너 재선언 = 재개 신호·무스폰).
+                    Err(RunErr::Retire(why)) => {
+                        if let Some(removed) =
+                            remove_and_gate(st, remover, &intent_path(dir, &it.id), why)
+                        {
+                            publish(
+                                daemon,
+                                "boot_supervisor.intent_retired",
+                                json!({"id": it.id, "action": action.as_str(), "why": why,
+                                       "attempt": next, "removed": removed,
+                                       "persist_error": persist_err}),
+                            );
+                        }
+                    }
+                    Err(RunErr::Retry(why)) => {
                         if next >= MAX_ATTEMPTS {
                             let _ = remover(&intent_path(dir, &it.id));
                         }
@@ -876,6 +1113,10 @@ fn tick_in(
                                    "attempt": next, "max": MAX_ATTEMPTS, "why": why,
                                    "persist_error": persist_err}),
                         );
+                        // (P2 · 오너 결정 ⑧c) 마지막 시도까지 스폰이 실패했다 — loud 종착.
+                        if next >= MAX_ATTEMPTS {
+                            notify_exhausted(daemon, st, it, "dispatch_failed");
+                        }
                     }
                 }
             }
@@ -902,6 +1143,10 @@ pub fn spawn(daemon: Arc<Daemon>) {
         eprintln!("[cysd] boot-supervisor disabled (CYS_BOOT_GATES=0 또는 CYS_BOOT_SUPERVISOR=0)");
         return;
     }
+    // ★(P2 · R3-P2-4 blocker) 생존 플래그 — 태스크 기동 **직전**에만 set 한다. 꺼짐(off)이면
+    //   위에서 이미 return 했으므로 영영 미set 이고, `boot.enqueue` arm 은 미set 을 보고 스풀에
+    //   쓰지 않는다('등록 성공·발화자 0' 무음 스큐의 봉인 — Daemon::supervisor_alive 주석 정본).
+    daemon.supervisor_alive.store(true, Ordering::SeqCst);
     tokio::spawn(async move {
         let dir = spool_dir(&daemon.socket_path);
         let mut st = SupState::default();
@@ -936,12 +1181,16 @@ mod tests {
     use super::*;
 
     /// 실 프로세스를 낳지 않는 실행자 — 항상 성공.
-    fn ok_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, String> {
+    fn ok_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
         Ok("test-ok".to_string())
     }
-    /// 항상 실패하는 실행자(유계성 시험용).
-    fn fail_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, String> {
-        Err("test-fail".to_string())
+    /// 항상 실패하는 실행자(유계성 시험용 — 재시도 계급).
+    fn fail_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+        Err(RunErr::Retry("test-fail".to_string()))
+    }
+    /// (P2 · R3-P2-5) 전제 붕괴 계급 실행자 — claim_stale 폐기 경로 시험용.
+    fn stale_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+        Err(RunErr::Retire("claim_stale"))
     }
 
     /// **절대 지우지 못하는** 제거자 — Windows 읽기전용 속성·백신/생산자 셸이 연 파일을 모사.
@@ -1008,6 +1257,9 @@ mod tests {
                 attempts: 0,
                 next_attempt_at: 0.0,
                 reason: String::new(),
+                decl_origin: String::new(),
+                claim_rc: None,
+                claim_at: None,
             };
             assert_eq!(
                 decide(&it, 0, 100.0),
@@ -1030,11 +1282,29 @@ mod tests {
             attempts: 0,
             next_attempt_at: 0.0,
             reason: String::new(),
+            decl_origin: String::new(),
+            claim_rc: None,
+            claim_at: None,
         };
         assert_eq!(decide(&base, 0, 1000.0), Disposition::Run(BootAction::EnsureTeam));
         let mut bad_v = base.clone();
         bad_v.v = INTENT_SCHEMA_V + 1;
         assert_eq!(decide(&bad_v, 0, 1000.0), Disposition::Retire("schema_mismatch"));
+        // (P2 · v2) 구 스키마(v1)도 같은 폐기다 — 다운그레이드/업그레이드 스큐 양방향 fail-closed.
+        let mut old_v = base.clone();
+        old_v.v = 1;
+        assert_eq!(decide(&old_v, 0, 1000.0), Disposition::Retire("schema_mismatch"));
+        // (P2 · v2) decl_origin 닫힌 토큰 — 인정 토큰은 통과, 미지값은 실행이 아니라 폐기.
+        let mut human = base.clone();
+        human.decl_origin = DECL_ORIGIN_HOOK_HUMAN.into();
+        assert_eq!(decide(&human, 0, 1000.0), Disposition::Run(BootAction::EnsureTeam));
+        let mut forged = base.clone();
+        forged.decl_origin = "hook-machine".into();
+        assert_eq!(
+            decide(&forged, 0, 1000.0),
+            Disposition::Retire("unknown_decl_origin"),
+            "미지 decl_origin 이 실행 후보가 됐다(닫힌 토큰 계약 위반)"
+        );
         // 만료가 예산보다 앞이다(늙은 인텐트가 예산을 태우며 프로세스를 낳지 않게).
         assert_eq!(
             decide(&base, 0, 1000.0 + INTENT_MAX_AGE_SECS + 1.0),
@@ -1073,19 +1343,34 @@ mod tests {
 
     // ── 스풀·틱 (합성 표본) ────────────────────────────────────────────────────
 
-    /// 왕복 직렬화 — 적은 것을 그대로 읽는다.
+    /// 왕복 직렬화 — 적은 것을 그대로 읽는다(스키마 **v2** 왕복: decl_origin·claim{rc,at} 보존).
     #[test]
     fn enqueue_roundtrips() {
         let dir = tmp_spool("roundtrip");
-        enqueue_in(&dir, "boot-1", BootAction::EnsureTeam, "/tmp/s.sock", Some(7), "hook", 500.0)
-            .unwrap();
+        enqueue_in(
+            &dir,
+            "boot-1",
+            BootAction::EnsureTeam,
+            "/tmp/s.sock",
+            Some(7),
+            "hook",
+            DECL_ORIGIN_HOOK_HUMAN,
+            Some(0),
+            Some(499.0),
+            500.0,
+        )
+        .unwrap();
         let scan = scan_spool(&dir, 500.0, 0);
         assert_eq!(scan.intents.len(), 1);
         let it = &scan.intents[0];
         assert_eq!(it.id, "boot-1");
+        assert_eq!(it.v, INTENT_SCHEMA_V, "쓰는 버전은 항상 현재 스키마(v2)");
         assert_eq!(it.action_token, "ensure-team");
         assert_eq!(it.surface_id, Some(7));
         assert_eq!(it.attempts, 0);
+        assert_eq!(it.decl_origin, DECL_ORIGIN_HOOK_HUMAN, "v2 decl_origin 왕복 소실");
+        assert_eq!(it.claim_rc, Some(0), "v2 claim.rc 왕복 소실");
+        assert_eq!(it.claim_at, Some(499.0), "v2 claim.at 왕복 소실");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1100,7 +1385,7 @@ mod tests {
     fn retry_is_bounded_by_max_attempts() {
         let d = tmp_daemon("bounded");
         let dir = tmp_spool("bounded");
-        enqueue_in(&dir, "b", BootAction::EnsureTeam, "", None, "t", 0.0).unwrap();
+        enqueue_in(&dir, "b", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
         let mut st = SupState::default();
         let mut total = 0usize;
         let mut now = 1.0;
@@ -1148,7 +1433,7 @@ mod tests {
         let d = tmp_daemon("flood");
         let dir = tmp_spool("flood");
         for i in 0..40 {
-            enqueue_in(&dir, &format!("f{i:03}"), BootAction::EnsureTeam, "", None, "t", 0.0)
+            enqueue_in(&dir, &format!("f{i:03}"), BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0)
                 .unwrap();
         }
         let mut st = SupState::default();
@@ -1161,7 +1446,7 @@ mod tests {
     fn success_retires_the_intent() {
         let d = tmp_daemon("success");
         let dir = tmp_spool("success");
-        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", 0.0).unwrap();
+        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
         let mut st = SupState::default();
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         assert!(!intent_path(&dir, "s").exists(), "성공 후에도 인텐트가 남았다");
@@ -1173,18 +1458,25 @@ mod tests {
     fn hostile_and_broken_intents_are_discarded_without_running() {
         let d = tmp_daemon("hostile");
         let dir = tmp_spool("hostile");
-        raw_intent(&dir, "cmd", r#"{"v":1,"action":"rm -rf /","created_at":0.0}"#);
+        raw_intent(&dir, "cmd", r#"{"v":2,"action":"rm -rf /","created_at":0.0}"#);
         raw_intent(&dir, "oldv", r#"{"v":99,"action":"ensure-team","created_at":0.0}"#);
         raw_intent(&dir, "junk", "not json at all");
-        raw_intent(&dir, "noact", r#"{"v":1,"created_at":0.0}"#);
+        raw_intent(&dir, "noact", r#"{"v":2,"created_at":0.0}"#);
+        // (P2 · v2) 구 스키마(v1)·미지 decl_origin — 둘 다 실행 0·폐기(fail-closed 유지).
+        raw_intent(&dir, "oldschema", r#"{"v":1,"action":"ensure-team","created_at":0.0}"#);
+        raw_intent(
+            &dir,
+            "forged",
+            r#"{"v":2,"action":"ensure-team","created_at":0.0,"decl_origin":"hook-machine"}"#,
+        );
         std::fs::write(dir.join("ignored.log"), "log line").unwrap();
         let mut st = SupState::default();
         // 실행자가 불리면 즉시 실패시켜 '실행 0' 을 증명한다.
-        fn never(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, String> {
+        fn never(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
             panic!("적대적/깨진 인텐트가 실행됐다 — 스풀이 명령 실행 표면이 됐다");
         }
         assert_eq!(tick_in(&d, &dir, &mut st, never, remove_spool_file, 1.0), 0);
-        for id in ["cmd", "oldv", "junk", "noact"] {
+        for id in ["cmd", "oldv", "junk", "noact", "oldschema", "forged"] {
             assert!(!intent_path(&dir, id).exists(), "{id} 가 스풀에 남았다");
         }
         assert!(dir.join("ignored.log").exists(), "인텐트가 아닌 파일을 지웠다");
@@ -1287,7 +1579,7 @@ mod tests {
         let d = tmp_daemon("undeletable");
         let dir = tmp_spool("undeletable");
         raw_intent(&dir, "junk", "{ broken"); // ① 파싱 불가 → garbage GC 축
-        raw_intent(&dir, "unknown", r#"{"v":1,"action":"rm -rf /","created_at":0.0}"#); // ② Retire 축
+        raw_intent(&dir, "unknown", r#"{"v":2,"action":"rm -rf /","created_at":0.0}"#); // ② Retire 축
         let mut st = SupState::default();
         let before = d.bus.latest_seq();
         for _ in 0..200 {
@@ -1367,6 +1659,9 @@ mod tests {
                 "",
                 None,
                 "t",
+                "",
+                None,
+                None,
                 0.0,
             )
             .unwrap();
@@ -1401,7 +1696,7 @@ mod tests {
     fn successful_dispatch_with_undeletable_intent_is_still_bounded() {
         let d = tmp_daemon("okundeletable");
         let dir = tmp_spool("okundeletable");
-        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", 0.0).unwrap();
+        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
         let mut st = SupState::default();
         let before = d.bus.latest_seq();
         let mut total = 0usize;
@@ -1414,12 +1709,254 @@ mod tests {
             total, MAX_ATTEMPTS as usize,
             "지워지지 않는 인텐트가 성공 경로에서 {total}회 프로세스를 낳았다(폭주)"
         );
-        // 원장 1건/디스패치 + dispatched 3 + intent_retired 1 = 7 을 넘지 않는다.
+        // ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 조성 갱신): 소진 종착이 loud 로 격상되어
+        //   `attempts_exhausted` 폐기 시 feed 통보(feed.item.created) 1건이 **추가**됐다.
+        //   조성: dispatched 3 + intent_retired 1 + feed(소진 통보·래치 1회) 1 = 5 ≤ 7
+        //   (원장 record_audited 는 성공 시 무발행). 상한 7 은 그대로 두되, 통보가 래치로
+        //   1회를 넘으면(매 틱 반복) 즉시 이 상한을 뚫으므로 유계 판정력은 종전과 동일하다.
         let published = d.bus.latest_seq() - before;
         assert!(
             published <= 7,
-            "200틱 동안 이벤트 {published}건 — 삭제 실패가 발행을 영구화했다"
+            "200틱 동안 이벤트 {published}건 — 삭제 실패·소진 통보가 발행을 영구화했다"
         );
+        // 소진 loud 통보는 정확히 1건이어야 한다(래치 — 200틱 반복 금지).
+        let fails = d
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.kind == "bootstrap-fail")
+            .count();
+        assert_eq!(fails, 1, "소진 통보가 (인텐트당 1회) 접히지 않았다: {fails}건");
+    }
+
+    // ── (P2) 신설 계약 검체 ────────────────────────────────────────────────────
+
+    /// ★(R3-RISK-1) kill-switch 게이트 — pause 중에는 낳지도 지우지도 않는다.
+    #[test]
+    fn paused_daemon_freezes_the_supervisor_tick() {
+        let d = tmp_daemon("paused");
+        let dir = tmp_spool("paused");
+        enqueue_in(&dir, "p", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        let mut st = SupState::default();
+        d.paused.store(true, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert_eq!(
+                tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0),
+                0,
+                "pause 중에 감독자가 프로세스를 낳았다(kill-switch 관통)"
+            );
+        }
+        assert!(intent_path(&dir, "p").exists(), "pause 중에 스풀을 건드렸다");
+        // 재개하면 종전 그대로 낳는다 — 게이트는 동결이지 폐기가 아니다.
+        d.paused.store(false, Ordering::SeqCst);
+        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0), 1);
+    }
+
+    /// ★(R3-P2-5) 전제 붕괴(claim_stale)는 재시도가 아니라 **폐기**다 — 남은 예산을 태우며
+    /// 같은 판정을 반복하지 않는다(무스폰·이벤트 1건·인텐트 제거).
+    #[test]
+    fn claim_stale_retires_immediately_without_retry() {
+        let d = tmp_daemon("stale");
+        let dir = tmp_spool("stale");
+        enqueue_in(&dir, "c", BootAction::EnsureTeam, "", Some(7), "t", "", None, None, 0.0)
+            .unwrap();
+        let mut st = SupState::default();
+        let mut total = 0usize;
+        let mut now = 1.0;
+        for _ in 0..20 {
+            total += tick_in(&d, &dir, &mut st, stale_runner, remove_spool_file, now);
+            now += 60.0; // 쿨다운을 계속 넘겨 준다 — 재시도 계급이라면 3회까지 갔을 것.
+        }
+        assert_eq!(total, 1, "claim_stale 이 재시도 계급으로 접혔다({total}회 디스패치)");
+        assert!(!intent_path(&dir, "c").exists(), "claim_stale 인텐트가 스풀에 남았다");
+    }
+
+    /// ★(R3-P2-5) 프로덕션 실행자의 레지스트리 재실측 게이트 — roles 에 master 가 없으면
+    /// (또는 다른 surface 가 쥐면) 스폰 없이 `Retire("claim_stale")` 로 돌아온다.
+    /// (성공 leg 는 실 스폰이라 여기서 재지 않는다 — 순수 판정은 아래 진리표가 전수한다.)
+    #[test]
+    fn run_ensure_team_refuses_a_stale_claim_before_any_spawn() {
+        let d = tmp_daemon("regate");
+        let it = BootIntent {
+            id: "r".into(),
+            v: INTENT_SCHEMA_V,
+            action_token: "ensure-team".into(),
+            lane: String::new(),
+            surface_id: Some(7), // 등록된 surface 도, master 보유도 없다.
+            created_at: 0.0,
+            attempts: 0,
+            next_attempt_at: 0.0,
+            reason: String::new(),
+            decl_origin: DECL_ORIGIN_HOOK_HUMAN.into(),
+            claim_rc: Some(0),
+            claim_at: Some(0.0),
+        };
+        assert_eq!(
+            run_ensure_team(&d, &it, BootAction::EnsureTeam),
+            Err(RunErr::Retire("claim_stale")),
+            "레지스트리가 부정하는 claim 으로 스폰 경로에 진입했다"
+        );
+    }
+
+    /// ★(R4 수정 라운드) surface_id 부재 인텐트(스풀 직접 투하 계급)는 프로덕션 실행자가
+    /// 스폰 없이 `Retire("no_surface")` 로 접는다 — 신원 env 0 스폰(rc6 ×MAX_ATTEMPTS)의
+    /// 표면 축소. 정상 생산자(boot.enqueue)는 항상 Some(sid)이므로 프로덕션 경로 무손실.
+    #[test]
+    fn run_ensure_team_refuses_a_surfaceless_intent_before_any_spawn() {
+        let d = tmp_daemon("nosurface");
+        let it = BootIntent {
+            id: "n".into(),
+            v: INTENT_SCHEMA_V,
+            action_token: "ensure-team".into(),
+            lane: String::new(),
+            surface_id: None, // 유일 생산자(boot.enqueue)가 만들 수 없는 형상.
+            created_at: 0.0,
+            attempts: 0,
+            next_attempt_at: 0.0,
+            reason: String::new(),
+            decl_origin: DECL_ORIGIN_HOOK_HUMAN.into(),
+            claim_rc: None,
+            claim_at: None,
+        };
+        assert_eq!(
+            run_ensure_team(&d, &it, BootAction::EnsureTeam),
+            Err(RunErr::Retire("no_surface")),
+            "신원 없는 인텐트가 스폰 경로에 진입했다 — fail-closed 게이트 미동작"
+        );
+    }
+
+    /// (R3-P2-5) 재실측 순수 판정 진리표 — 보유 일치 ∧ 생존일 때만 참.
+    #[test]
+    fn master_holds_truth_table() {
+        assert!(master_holds(Some(7), 7, true), "보유+생존이 거짓으로 판정됐다");
+        assert!(!master_holds(Some(7), 7, false), "죽은 좌석의 claim 이 신선 판정됐다");
+        assert!(!master_holds(Some(8), 7, true), "남이 쥔 master 가 내 claim 으로 판정됐다");
+        assert!(!master_holds(None, 7, true), "빈 레지스트리가 보유로 판정됐다");
+    }
+
+    /// ★(P2-2 · ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
+    /// 기존 PATH 는 순서 그대로 뒤에 보존된다(python3 등 후속 해소를 깨지 않는다).
+    #[test]
+    fn path_injection_puts_exe_dir_first_and_keeps_the_rest() {
+        let exe = std::env::temp_dir().join("cys_bsup_exedir");
+        let old = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let joined = path_with_exe_dir_first(&exe, Some(old));
+        let parts: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(parts.first(), Some(&exe), "exe_dir 가 PATH 선두가 아니다: {parts:?}");
+        assert!(
+            parts[1..].iter().any(|p| p == Path::new("/usr/bin"))
+                && parts[1..].iter().any(|p| p == Path::new("/bin")),
+            "기존 PATH 성분이 소실됐다: {parts:?}"
+        );
+        // PATH 부재(최소 env 데몬)에서도 exe_dir 한 조각은 반드시 남는다.
+        let alone = path_with_exe_dir_first(&exe, None);
+        assert_eq!(
+            std::env::split_paths(&alone).next().as_ref(),
+            Some(&exe),
+            "PATH 부재에서 exe_dir 단독 주입이 안 됐다"
+        );
+    }
+
+    /// boot-supervisor.log 회전 1겹 — 상한 초과에서만 `.1` 로 밀린다.
+    #[test]
+    fn log_rotation_is_one_layer_and_cap_gated() {
+        let dir = tmp_spool("logrot");
+        let log = dir.join("boot-supervisor.log");
+        std::fs::write(&log, b"small").unwrap();
+        rotate_log_if_huge(&log);
+        assert!(log.exists(), "상한 미만 로그가 회전됐다");
+        let big = vec![b'x'; (LOG_MAX_BYTES + 1) as usize];
+        std::fs::write(&log, &big).unwrap();
+        rotate_log_if_huge(&log);
+        assert!(!log.exists(), "상한 초과 로그가 제자리에 남았다");
+        assert!(dir.join("boot-supervisor.log.1").exists(), "회전본(.1)이 없다");
+    }
+
+    /// ★(오너 결정 ⑧c) 소진 종착은 loud 다 — 스폰 실패 소진 시 feed 통보가 나가고, 같은
+    /// 인텐트가 이후 `attempts_exhausted` 폐기 지점을 다시 지나도 통보는 **1회로 접힌다**
+    /// (삭제 실패 최악 형상: 두 관측 지점을 모두 지나는 경로).
+    #[test]
+    fn exhaustion_notification_fires_once_across_both_paths() {
+        let d = tmp_daemon("loudonce");
+        let dir = tmp_spool("loudonce");
+        enqueue_in(&dir, "L", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        let mut st = SupState::default();
+        let mut now = 1.0;
+        for _ in 0..100 {
+            // never_removes: 소진 후에도 파일이 남아 Retire(attempts_exhausted) 지점을 매 틱 지난다.
+            tick_in(&d, &dir, &mut st, fail_runner, never_removes, now);
+            now += 60.0;
+        }
+        let fails = d
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.kind == "bootstrap-fail")
+            .count();
+        assert_eq!(fails, 1, "소진 통보가 1회로 접히지 않았다: {fails}건 (매 틱 반복 = 폭주)");
+    }
+
+    /// ★(오너 결정 ⑧c) 선언 surface 가 살아 있으면 — 원장 **선기록** 후 1줄 통보가 그 pane 으로
+    /// 간다(Windows 포함 — cfg 게이트 없음). 원장(delivery ledger)에 통보 문안이 실재해야 한다.
+    #[test]
+    fn exhaustion_notice_reaches_the_declaring_surface_with_ledger_first() {
+        let d = tmp_daemon("loudpane");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("test surface");
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let dir = tmp_spool("loudpane");
+        enqueue_in(&dir, "N", BootAction::EnsureTeam, "", Some(s.id), "t", "", None, None, 0.0)
+            .unwrap();
+        let mut st = SupState::default();
+        let mut now = 1.0;
+        for _ in 0..10 {
+            tick_in(&d, &dir, &mut st, fail_runner, remove_spool_file, now);
+            now += 60.0;
+        }
+        let items = d.feed_items.lock().unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.kind == "bootstrap-fail")
+            .expect("소진 feed 통보 부재");
+        assert_eq!(item.surface_id, Some(s.id), "통보의 선언 surface 귀속 소실");
+        drop(items);
+        // 원장은 전문이 아니라 preview(64자)+sha256 를 남긴다 — 문안 선두의 안정 마커로 판정.
+        let ledger = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path))
+            .unwrap_or_default();
+        let marker = format!("부트 {MAX_ATTEMPTS}회 실패");
+        assert!(
+            ledger.contains(&marker),
+            "소진 통보가 원장 선기록 없이 나갔다(기계 push 오너 임무 오인 창) — 원장: {ledger:?}"
+        );
+    }
+
+    /// 데몬 재시작 픽업(스풀에 남은 소진 인텐트)도 조용한 폐기가 아니라 loud 종착이다.
+    #[test]
+    fn restart_pickup_of_exhausted_intent_is_loud() {
+        let d = tmp_daemon("pickup");
+        let dir = tmp_spool("pickup");
+        raw_intent(
+            &dir,
+            "old",
+            &format!(
+                r#"{{"v":{INTENT_SCHEMA_V},"action":"ensure-team","lane":"","surface_id":null,
+                    "created_at":1.0,"attempts":{MAX_ATTEMPTS},"next_attempt_at":0.0,"reason":"t"}}"#
+            ),
+        );
+        let mut st = SupState::default();
+        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0), 0);
+        assert!(!intent_path(&dir, "old").exists(), "소진 인텐트가 스풀에 남았다");
+        let fails = d
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.kind == "bootstrap-fail")
+            .count();
+        assert_eq!(fails, 1, "재시작 픽업 소진이 조용히 폐기됐다(통보 {fails}건)");
     }
 
     /// 제거자의 성공 정의 — "이제 이 경로에 파일이 없다"(남이 먼저 지운 경우 포함).
@@ -1468,10 +2005,23 @@ mod tests {
             rec < run,
             "원장 기록이 행위 뒤로 갔다 — 그 창에서 임무 게이트가 기계 push 를 오너 임무로 오인한다"
         );
+        // ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 상한 이동): 소진 loud 통보(notify_exhausted)
+        //   도 pane 주입 전에 같은 유래(Origin::Supervisor)로 원장 선기록해야 하므로 지정 지점이
+        //   dispatch_one + notify_exhausted **정확히 2곳**이 됐다. 여전히 닫힌 집합 단언이다 —
+        //   제3 지점 유입은 이 핀이 계속 적색으로 잡는다(구현 갈라짐 차단 목적 불변).
         assert_eq!(
             prod.matches("crate::delivery::Origin::Supervisor").count(),
-            1,
-            "감독자 원장 유래 지정 지점은 정확히 1곳이어야 한다(구현 갈라짐 차단)"
+            2,
+            "감독자 원장 유래 지정 지점은 정확히 2곳(dispatch_one·notify_exhausted)이어야 한다"
+        );
+        // notify_exhausted 쪽도 순서 불변식이 같다 — 원장 기록이 주입(try_send)보다 앞.
+        let nat = prod.find("fn notify_exhausted(").expect("notify_exhausted 소실");
+        let nbody = &prod[nat..];
+        let nrec = nbody.find("record_audited(").expect("소진 통보 원장 기록 지점 소실");
+        let ninj = nbody.find("write_tx.try_send(").expect("소진 통보 주입 지점 소실");
+        assert!(
+            nrec < ninj,
+            "소진 통보의 원장 기록이 주입 뒤로 갔다 — 기계 push 오너 임무 오인 창"
         );
     }
 
@@ -1511,6 +2061,16 @@ mod tests {
         assert!(
             judge < ret && ret < task,
             "롤백 판정이 태스크 기동보다 뒤다 — 노브를 눌러도 감독자가 뜬다(롤백 사문)"
+        );
+        // ★(P2 · R3-P2-4) 생존 플래그 set 은 조기 return **뒤** · 태스크 기동 **앞**이다.
+        //   return 앞이면 꺼진 감독자가 살아있다고 주장하고(supervisor_off 스큐 재발),
+        //   태스크 뒤면 기동 직후 enqueue 가 잠깐 거절된다(불필요한 legacy 폴백).
+        let alive = body
+            .find("supervisor_alive.store(true")
+            .expect("감독자 생존 플래그 set 지점 소실(R3-P2-4 blocker 재발)");
+        assert!(
+            ret < alive && alive < task,
+            "생존 플래그 set 위치가 계약(조기 return 뒤·태스크 기동 앞)을 벗어났다"
         );
         // env 판독은 이 1지점뿐이다(축별 1지점 규약 — 판독 지점이 늘면 조합이 갈린다).
         assert_eq!(

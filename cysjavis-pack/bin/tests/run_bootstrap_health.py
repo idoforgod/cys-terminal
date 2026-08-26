@@ -10946,8 +10946,20 @@ def _u23_bound_violations(sup, delivery):
         rec, run = body.find("record_audited("), body.find("runner(daemon")
         if rec < 0 or run < 0 or rec > run:
             v.append("원장 기록이 행위보다 앞이 아니다 — 임무 게이트가 기계 push 를 오너 임무로 오인")
-    if c.count("crate::delivery::Origin::Supervisor") != 1:
-        v.append("감독자 원장 유래 지정 지점이 정확히 1곳이 아니다")
+    # ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 상한 이동 1→2): 소진 loud 통보(notify_exhausted)
+    #   도 pane 주입 전에 같은 유래(Origin::Supervisor)로 원장 **선기록**해야 하므로 지정 지점이
+    #   dispatch_one + notify_exhausted 정확히 2곳이 됐다. 여전히 닫힌 집합 단언이다 — 제3 지점
+    #   유입(구현 갈라짐)은 계속 적색. notify_exhausted 의 기록→주입 순서는 아래 별도 축이 핀한다.
+    if c.count("crate::delivery::Origin::Supervisor") != 2:
+        v.append("감독자 원장 유래 지정 지점이 정확히 2곳(dispatch_one·notify_exhausted)이 아니다")
+    ni = c.find("fn notify_exhausted(")
+    if ni < 0:
+        v.append("소진 loud 통보 지점(notify_exhausted)이 없다 — 조용한 포기(청중 0) 회귀")
+    else:
+        nbody = c[ni:]
+        nrec, ninj = nbody.find("record_audited("), nbody.find("write_tx.try_send(")
+        if nrec < 0 or ninj < 0 or nrec > ninj:
+            v.append("소진 통보의 원장 기록이 주입보다 앞이 아니다 — 기계 push 오너 임무 오인 창")
     # ── 오살 금지 ─────────────────────────────────────────────────────────────
     for w in _U23_DESTRUCTIVE:
         if w in c:
