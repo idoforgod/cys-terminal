@@ -1918,9 +1918,24 @@ def h_exit_4():
         need('"%s"' % out in src, "boot --json outcome 값 누락: %s" % out)
     need("fn install_hint(agent: &str)" in src, "플랫폼별 install_hint 파생 함수가 없다(G29·B8)")
     need('"install_hint"' in src, "--json 에 install_hint 필드가 없다")
-    hi = src.find("fn install_hint(")
+    # ★핀 이사(MF-1 · 2026-08-26) — P4 수정 라운드(5b15e87)가 install_hint 를 순수형
+    #   `install_hint_for(agent, os)` + 실행 플랫폼 박피 래퍼로 리팩터했다(os 를 인자로 받아
+    #   비 Windows CI 에서도 Windows 갈래를 실제로 밟는다 — lib.rs bundled_git_bash_path_for
+    #   와 동일 이유). 종전 핀은 `fn install_hint(` 이후 900자 창에서 `cfg!(windows)` 를
+    #   찾았는데, 분기가 순수형의 `os == "windows"` 런타임 분기로 옮겨져 창에서 소실됐다.
+    #   축은 한 톨도 안 바뀐다 — "미설치 힌트가 플랫폼을 가르는가". 오히려 강화: 분기 존재만이
+    #   아니라 **양 갈래 산출물**(windows=네이티브 install.ps1 / unix=install.sh)과 래퍼의
+    #   순수형 위임(힌트 판정 이원화 차단)까지 박는다.
+    need("fn install_hint_for(agent: &str, os: &str)" in src,
+         "순수형 install_hint_for(agent, os) 가 없다(MF-1 형상 소실)")
+    hi = src.find("fn install_hint_for(")
     hint_body = src[hi:hi + 900]
-    need("cfg!(windows)" in hint_body, "install_hint 가 플랫폼 분기를 갖지 않는다(오답 힌트 재발)")
+    need('os == "windows"' in hint_body,
+         "install_hint_for 가 플랫폼 분기를 갖지 않는다(오답 힌트 재발)")
+    need("install.ps1" in hint_body, "Windows 갈래가 네이티브 설치 명령(install.ps1)이 아니다")
+    need("install.sh" in hint_body, "unix 갈래 설치 명령(install.sh)이 소실됐다")
+    need("install_hint_for(agent, std::env::consts::OS)" in src,
+         "실행 플랫폼 래퍼가 순수형에 위임하지 않는다(힌트 판정 이원화)")
     # ★의무 CLI 미설치 ≠ exit 0 성공: missing + mandatory 는 fatal_failed 로 계상된다.
     mi = src.find("outcome\": \"missing\"")
     need(mi > 0, "missing outcome 생성 지점을 못 찾았다")
@@ -3627,7 +3642,12 @@ def h_win_9():
     body = _read(src)
     # ① 후보 순회가 존재하고 단일 오라클(detect_agent_binary)이 그것을 통과한다
     need("fn windows_agent_candidates(" in body, "Windows 후보 순회 함수 부재(B8 미수리)")
-    need("apply_windows_agent_fallback(AgentDetection {" in body,
+    # ★핀 이사(MF-1 · 2026-08-26) — 5b15e87 이 폴백 시그니처를 (agent, AgentDetection)
+    #   2인자로 바꿨다(힌트 치환에서 의무 CLI claude 를 제외하려면 폴백이 agent 이름을 알아야
+    #   한다). 종전 핀 `apply_windows_agent_fallback(AgentDetection {` 는 1인자 호출 리터럴이라
+    #   소실. 축 보존: 단일 오라클(detect_agent_binary) 산출이 폴백을 **통과**한다 — rustfmt
+    #   개행에 흔들리지 않게 공백 관용 regex 로 박는다(정의 2벌은 `_agent: &str` 라 비매치).
+    need(re.search(r"apply_windows_agent_fallback\(\s*agent,\s*AgentDetection\s*\{", body),
          "detect_agent_binary 가 Windows 폴백을 통과하지 않는다(오라클 밖 판정)")
     need(body.count("fn apply_windows_agent_fallback(") == 2,
          "cfg 분기 2벌(windows/not) 형태가 아니다 — 다른 OS 에서 항등 보장 불가")
@@ -3642,7 +3662,21 @@ def h_win_9():
     need("is_executable_file(" in seg, "후보 판정이 실행권을 안 본다(실재만 보면 오탐)")
     # ③ 후보 전부 미발견이면 **힌트가 경로수정 안내로 교체**된다(설치 안내 반복이 아니라 배선 교정)
     need("WINDOWS_AGENT_PATH_HINT" in body, "전탐색 실패 힌트 상수 부재")
-    need("d.hint = WINDOWS_AGENT_PATH_HINT" in body, "후보 전탐색 실패 시 힌트 교체 배선 부재")
+    # ★핀 이사(MF-1 · 2026-08-26) — 치환 배선이 직접 대입(`d.hint = WINDOWS_AGENT_PATH_HINT`)
+    #   에서 단일 판정 함수 `full_miss_hint(agent, os)` 경유로 옮겨졌다: Windows+비claude 만
+    #   경로수정 힌트, 의무 CLI claude 는 install_hint(네이티브 설치 명령) 유지 — 신규 Windows
+    #   기계에서 INST-1 카드 본문이 agents.json 경로수정 안내로 오염되던 것의 수리(P4-4 '문구
+    #   SOT=install_hint'). 축 보존: '전탐색 빈손 → 힌트 교체'는 그대로 + 강화: 치환 판정
+    #   단일처(full_miss_hint)와 claude 면제 술어·양 갈래 실재까지 박는다.
+    need("d.hint = full_miss_hint(agent, " in body,
+         "후보 전탐색 실패 시 힌트 교체 배선 부재(full_miss_hint 경유)")
+    need("fn full_miss_hint(agent: &str, os: &str)" in body, "치환 단일 판정 함수 부재(MF-1)")
+    fh = body[body.index("fn full_miss_hint("):]
+    fh = fh[:fh.index("\n}\n") + 2]
+    need('os == "windows" && agent != "claude"' in fh,
+         "의무 CLI claude 면제 술어가 없다(설치 명령이 경로수정 안내로 치환 — MF-1 재발)")
+    need("WINDOWS_AGENT_PATH_HINT" in fh and "install_hint_for(agent, os)" in fh,
+         "full_miss_hint 가 경로수정/설치 힌트 양 갈래를 갖지 않는다")
     # ④ 소비층 단일화: python 은 자체 판정을 1차로 쓰지 않는다(cys agent-detect 소비)
     orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
     need("cys_agent_detect(" in orch and "agent-detect" in orch,
