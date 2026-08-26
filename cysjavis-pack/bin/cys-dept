@@ -648,6 +648,65 @@ PY
   echo "$HOME/.cys/claude-$acct"
 }
 
+# ── ★T11(P3-5 · R3-P03-5 4조건): Windows 한정 credentials 시드 ────────────────
+# 부서 fork config dir 에 base 계정의 .credentials.json 사본을 1회 심어 부서마다 수동 /login 을
+# 면제한다. 왜 Windows 한정인가(아래 create 의 2026-08-23 실측 정정 주석 참조): macOS 는 토큰이
+# Keychain 에 계정 단위가 **아니라** config dir 경로 단위(서비스명 Claude Code-credentials-
+# <sha256(dir)[:8]>)로 봉인돼 파일 복사로 브리지가 불가하다 — macOS 분기 자체를 만들지 않는다.
+# Windows 는 토큰이 config dir 안의 .credentials.json 파일이라 복사가 성립한다.
+# 4조건(계약 · R3-P03-5):
+#   ① Windows 판별 = 기존 uname case 관례(dept_sock 동형) 재사용.
+#   ② opt-in: CYS_DEPT_SEED_CREDS=1 일 때만(기본 off = 완전 무동작). 근거: OAuth refresh 토큰이
+#      회전형(1회용)이면 N개 사본이 독립 갱신하다 상호 무효화(전 부서 동시 로그아웃)될 수 있다는
+#      **실기 미검증 추정 리스크** — 실기 검증 게이트(Windows 2부서 24h 동시 가동·양쪽 토큰 생존
+#      확인) 통과 전 기본 활성 금지(U-20 동류 계약).
+#   ③ copy-if-absent 만: 대상 기존재=무동작 로그 1줄. 덮어쓰기 절대 금지 — rotate(=launch 재귀)가
+#      fork 의 살아있는(이미 갱신된) 토큰을 base 의 낡은 사본으로 덮으면 그 레인 로그인이 파괴된다.
+#   ④ 3 호출부(launch/allocate/create)의 fork dir mkdir 직후에만 · 원천=resolve_default_base/
+#      카탈로그가 해석한 **그 계정의** base config dir 의 .credentials.json(~/.claude 하드코딩
+#      금지 — 다계정 부서에 타 계정 토큰 주입 차단) · 사본은 소유자 전용 권한(umask 077+chmod 600 —
+#      MSYS 가 Windows ACL 로 근사 매핑·best-effort). create 비primary 분기(공유 계정 dir·포크
+#      없음)는 호출하지 않는다 — 살아있는 계정 자격증명 클로버 금지(원천=대상 동일 belt 겸비).
+# 실패=전부 loud skip(fail-open — 부서 생성 불파괴·수동 /login 폴백 안내). stdout 오염 금지(전 진단 >&2).
+# 잔존 고지: teardown(down/purge-state)은 계정 fork dir 를 지우지 않으므로 사본은 부서 폐기 후에도
+# 디스크에 남는다(자동 삭제는 비가역이라 하지 않는다 — 오너 고지 사항).
+seed_credentials_win(){
+  local srcbase="$1" fork="$2"
+  [ "${CYS_DEPT_SEED_CREDS:-0}" = "1" ] || return 0            # ② opt-in 기본 off — 완전 무동작
+  case "$(uname -s 2>/dev/null)" in                            # ① Windows 한정(관례 재사용)
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) return 0 ;;
+  esac
+  [ -n "$fork" ] || return 0
+  if [ -z "$srcbase" ]; then
+    echo "[cys-dept] WARN: creds 시드 skip — base config dir 유도 실패. 부서 pane에서 수동 /login 필요" >&2
+    return 0
+  fi
+  if [ "${srcbase%/}" = "${fork%/}" ]; then                    # ④ belt: 원천=대상(포크 아님) = 시드 금지
+    echo "[cys-dept] creds 시드 skip: 원천=대상 동일($fork) — 포크 dir 아님(공유 계정 dir 클로버 금지)" >&2
+    return 0
+  fi
+  local src="${srcbase%/}/.credentials.json" dst="${fork%/}/.credentials.json"
+  if [ -e "$dst" ]; then                                       # ③ copy-if-absent — 기존재=무동작(멱등)
+    echo "[cys-dept] creds 시드 무동작: $dst 기존재(덮어쓰기 금지 — rotate 갱신 토큰 보호)" >&2
+    return 0
+  fi
+  if [ ! -f "$src" ]; then
+    echo "[cys-dept] WARN: creds 시드 skip — 원천 부재($src). 부서 pane에서 수동 /login 필요" >&2
+    return 0
+  fi
+  local tmp="$dst.tmp.$$"
+  if ( umask 077 && cp "$src" "$tmp" ) 2>/dev/null \
+     && { chmod 600 "$tmp" 2>/dev/null || true; } \
+     && mv "$tmp" "$dst" 2>/dev/null; then
+    echo "[cys-dept] creds 시드 완료: $src → $dst (사본·소유자 전용 권한 · opt-in CYS_DEPT_SEED_CREDS=1)" >&2
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    echo "[cys-dept] WARN: creds 시드 실패($src → $dst) — 부서 pane에서 수동 /login 필요(fail-open)" >&2
+  fi
+  return 0
+}
+
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).
 # ★NO_AUTOSTART(identify autostart 감사 2026-07-10): 읽기 프로브가 죽은 소켓에서 cysd를 되살리지 않게.
 dept_live_roles(){
@@ -1032,6 +1091,17 @@ case "$cmd" in
     if [ -n "$acctdir" ]; then
       mkdir -p "$acctdir" 2>/dev/null || true
       [ -d "$acctdir" ] || { echo "[cys-dept] ERROR: $name account dir 사용 불가($acctdir) — fail-closed(비격리 기동 금지)" >&2; exit 5; }
+      # ★T11(P3-5): fork dir 확정 직후 creds 시드(Windows·opt-in·copy-if-absent — 함수 계약 참조).
+      #   기본 off 시 유도 자체를 생략(launch=rotate 핫패스에 python spawn 0). 원천은 등재 account
+      #   (create 산출·카탈로그 키)를 우선, 없으면 기본계정 키를 resolve_default_base 로 해석한 그
+      #   계정의 base — 다계정 경계 보존(~/.claude 하드코딩 금지). rotate 재귀에서도 대상 기존재
+      #   무동작(③)이 갱신 토큰을 지킨다.
+      if [ "${CYS_DEPT_SEED_CREDS:-0}" = "1" ]; then
+        _credacct="$(reg_get_field "$name" account 2>/dev/null | tail -1)"
+        [ -n "$_credacct" ] || _credacct="${CYS_DEPT_DEFAULT_ACCOUNT:-default}"
+        _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
+        seed_credentials_win "$_credbase" "$acctdir"
+      fi
     fi
     _spawned=1   # ★⑦: 이번 호출에서 데몬을 실제로 스폰했는가(0=재사용) — 티켓 발급 로그 문면 구분용
     if ready "$sock"; then
@@ -1135,6 +1205,9 @@ PY
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
     [ -d "$acctdir" ] || { echo "[cys-dept] allocate: account fork dir 생성 실패: $acctdir — fail-closed" >&2; exit 5; }
+    # ★T11(P3-5): fork dir mkdir 직후 creds 시드(Windows·opt-in·copy-if-absent — 함수 계약 참조).
+    #   원천은 위에서 해석된 바로 그 계정의 base(resolve_default_base 산출 — 다계정 경계 보존).
+    seed_credentials_win "$base" "$acctdir"
     # ★G3(W3): account_dir 을 레지스트리에 **기록**한다 — rotate/launch 가 계정격리를 복원할 때
     #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
     #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
@@ -1217,7 +1290,13 @@ PY
     #   ∴ dir 를 분리하는 이 줄의 동작(`-<key>` 접미)은 **토큰 공유를 깨뜨린다** — 새로 만든 부서 dir 는
     #   macOS 에서 자체 `/login` 1회가 필요하다(복사·이동으로 브리지 불가). Windows 는 토큰이 config dir 안의
     #   `.credentials.json` 파일이라 복사가 성립한다. 단독 계정(부서 1개)은 이미 단독이라 불변.
-    if [ "$acctkey" = "${CYS_PRIMARY_ACCOUNT:-owner}" ]; then acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"; fi
+    if [ "$acctkey" = "${CYS_PRIMARY_ACCOUNT:-owner}" ]; then
+      _credbase="$acctdir"   # ★T11: 포크 前 값 = 카탈로그 accounts[acct] 해석 base(그 계정 경계 유지)
+      acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"
+      # ★T11(P3-5): 포크 분기에서만 시드(Windows·opt-in·copy-if-absent — 함수 계약 참조).
+      #   비primary 분기(공유 계정 dir·포크 없음)는 시드 금지 — 살아있는 계정 자격증명 클로버 방지.
+      seed_credentials_win "$_credbase" "$acctdir"
+    fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
