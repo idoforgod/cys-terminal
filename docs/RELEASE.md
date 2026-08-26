@@ -561,4 +561,21 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             성공(rc 0 · `registered:` 출력)해야 한다. CI 는 토큰 **배달**까지만 관측하고
             (위 ② 분절), 체인 단절 실조건은 실기 claude 세션에서만 재현된다.
             판정: 종전 rc 6 재현 조건에서 rc 0. PASS 전까지 '실기 미검증' 유지.
+- [ ] **★codex ready_marker 라이브 재주입 왕복 실증 — 상태: 실기 미검증 (P0-6 측정 선행
+      게이트 잔여 분절 · 2026-08-26 등재)**
+
+      P0-6 확정설계의 통과 조건 3분절 중 ③ **'라이브 codex launch-agent → 디렉티브 재주입
+      왕복 1회 실증'**은 선언 커밋(612e95b)이 배달성 검체(fill_missing_fields 픽스처)로
+      갈음했다고 자인한 분절이다 — 어느 CI 초록·PTY 캡처도 이 분절의 증거가 아니다(캡처가
+      실증한 것은 ready 화면 문면 `? for shortcuts` 의 출현·재현성까지다).
+
+      실기 판정: 라이브 codex 로 `cys launch-agent`(reviewer-codex) 기동 → 디렉티브 주입 →
+      재주입 경로(readiness `Site::Reinject` — scrollback 꼬리 마커 감지) 왕복 **1회**가
+      실제 도달해야 PASS. 같은 라이브 런에서 P0-6 분절 ②(업데이트/로그인 화면 비출현)도
+      함께 관측·기록한다.
+
+      **실패 시 처분(안전측)**: `cysjavis-pack/agents.json` codex 항목의 `ready_marker` 키를
+      **제거**한다 — 현행 idle+quiet 폴백 복귀가 안전측이다(오문면 마커는 Reinject 를 영구
+      불능으로 악화 — 마커 선언 어댑터는 폴백으로 흐르지 않는다, readiness.rs 주석 명문).
+      Windows 문면 미측정 고지(612e95b Not-tested)는 이 행의 PASS 와 무관하게 **유지**한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
