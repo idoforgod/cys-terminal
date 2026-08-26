@@ -2523,6 +2523,115 @@ mod tests {
         }
     }
 
+    /// ★SEAL-1 전수 열거 핀(T14 · 2026-08-26 오너 참고 지시 "PYTHONDONTWRITEBYTECODE 전 지점 강제"):
+    /// **python 을 직접 스폰하는 소스 지점의 전수 목록**을 파일별 개수로 박제한다.
+    ///
+    /// 기존 핀들은 전부 **지점별**이다(팩토리 핀·pane 상속 핀·스케줄 SOT 핀·훅 셸 층 H-PYSEAL-1) —
+    /// "새 스폰 지점이 생겼는데 아무 층에도 편입되지 않았다"를 잡는 핀이 없었다. 이 검체가 그
+    /// 구멍을 닫는다: 새 python 직스폰이 추가되면 여기 개수가 어긋나 **적색**이 되고, 실패 메시지가
+    /// 봉인 편입 방법을 지시한다. 열거 갱신은 "봉인을 확인했다"는 선언이다 — 개수만 올리고
+    /// 봉인을 빼먹는 것은 이 검체의 목적 파괴다(리뷰에서 잡을 것).
+    ///
+    /// 탐지 규약(한계 포함 · 정직 고지):
+    ///   · 같은 줄에 `…Command::new(<인자>)` 가 닫히고, 인자에 "py" 또는 줄에 "python" 이 있으면 지점.
+    ///   · 주석 줄(`//`)은 제외. 여러 줄로 쪼갠 스폰·"py" 가 없는 변수명(`interp` 등)은 못 잡는다 —
+    ///     그 잔여는 층3(`seal_python_bytecode_in_process` — 세 바이너리 main 선두)이 프로세스 env
+    ///     바닥으로 받친다(src/·src-tauri/src/ 에 `env_clear` 0 실측 · 2026-08-26).
+    ///   · 셸 층은 별도 핀이 감시한다: 훅 프리루드 = H-PYSEAL-1(run_bootstrap_health.py) ·
+    ///     cys-dept 헤드 export = 아래 shell-layer 단언.
+    #[test]
+    fn bundled_python_spawn_sites_are_enumerated_and_sealed() {
+        // 자기참조 회피: 이 파일 자신을 스캔하므로 니들은 반드시 조각 결합으로 만든다.
+        let needle = concat!("Command", "::", "new(");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        fn rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if p.file_name().is_some_and(|n| n == "vendor" || n == "target") {
+                        continue;
+                    }
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(&root.join("src"), &mut files);
+        rs_files(&root.join("src-tauri").join("src"), &mut files);
+        assert!(files.len() > 10, "소스 트리 스캔 실패(files={}) — 측정 불능은 통과가 아니다", files.len());
+
+        // ── 전수 열거(2026-08-26 실측): 파일 → (python 직스폰 지점 수, 봉인 기전) ──
+        //   src/bin/cys.rs                 1곳 — 테스트(tar escape 재현·호스트 python) · 층3 바닥
+        //   src/bin/cysd/boot_supervisor.rs 1곳 — run_ensure_team · `.env(ENV_PY_NO_BYTECODE)` 직봉인
+        //   src/bin/cysd/main.rs           2곳 — office-bridge(tokio 직봉인) + 테스트(self-test 게이트)
+        //   src-tauri/src/main.rs          4곳 — orchestra/resource-gate/boot/org · inject_runtime_path
+        // (python_command 팩토리 경유 호출부는 구조상 봉인이라 여기 셈에 안 들어간다.)
+        let expected: &[(&str, usize)] = &[
+            ("src/bin/cys.rs", 1),
+            ("src/bin/cysd/boot_supervisor.rs", 1),
+            ("src/bin/cysd/main.rs", 2),
+            ("src-tauri/src/main.rs", 4),
+        ];
+
+        let mut found: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            let rel = f
+                .strip_prefix(root)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                let Some(pos) = t.find(needle) else { continue };
+                let rest = &t[pos + needle.len()..];
+                let Some(close) = rest.find(')') else { continue };
+                let arg = &rest[..close].to_ascii_lowercase();
+                if arg.contains("py") || t.to_ascii_lowercase().contains("python") {
+                    *found.entry(rel.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let want: std::collections::BTreeMap<String, usize> =
+            expected.iter().map(|(f, n)| (f.to_string(), *n)).collect();
+        assert_eq!(
+            found, want,
+            "python 직스폰 지점 전수 열거 불일치 — 새 지점이면: ① std 는 `python_command` 팩토리, \
+             tokio/기타 빌더는 `.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)`, GUI 는 \
+             `inject_runtime_path` 로 **먼저 봉인**하고 ② 이 열거에 등재하라(등재=봉인 확인 선언). \
+             지점 소멸이면 열거에서 내려라. 봉인 없는 등재는 .pyc 번들 오염(코드서명 파손) 재발이다"
+        );
+
+        // 열거된 프로덕션 파일은 봉인 기전 문자열을 실제로 갖고 있어야 한다(개수 위장 차단).
+        for (rel, marker) in [
+            ("src/bin/cysd/boot_supervisor.rs", "ENV_PY_NO_BYTECODE"),
+            ("src/bin/cysd/main.rs", "ENV_PY_NO_BYTECODE"),
+            ("src-tauri/src/main.rs", "inject_runtime_path"),
+        ] {
+            let src = std::fs::read_to_string(root.join(rel)).unwrap();
+            assert!(
+                src.contains(marker),
+                "{rel} 에 봉인 기전({marker}) 부재 — 열거만 남고 봉인이 사라졌다"
+            );
+        }
+
+        // 셸 층(cys-dept): 헤드 단일 지점 export 가 전 자식(cysd·python heredoc·빈 셸)을 덮는다 —
+        // 훅 프리루드(H-PYSEAL-1)와 짝을 이루는 나머지 절반. 값 "1" 까지 고정(빈 값=끔 · CPython 규약).
+        let dept = std::fs::read_to_string(root.join("cysjavis-pack/bin/cys-dept")).unwrap();
+        assert!(
+            dept.contains("export PYTHONDONTWRITEBYTECODE=1"),
+            "cys-dept 헤드 SEAL-1 export 소실 — 부서 spawn 자식 전체가 번들 python 오염 경로로 복귀"
+        );
+    }
+
     /// ★W-B2 회귀 핀(감사 blocker #4 · cp949 즉사): `spawn_env_pairs` 는 PYTHONUTF8=1 을
     /// **항상** 실어야 한다 — PATH 무변경·HOME 유무와 무관한 무조건 쌍이다(③ SEAL-1 과 동형).
     /// 이 쌍이 빠지면 한국어 Windows(cp949)에서 스케줄 발화·GUI 직스폰 python(부트 체인

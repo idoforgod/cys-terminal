@@ -16219,6 +16219,68 @@ mod tests {
         }
     }
 
+    /// ★P0-6(T14 · 오너 승인 ⑦) — codex `ready_marker` 실측 문면 핀 + 배달성 검체.
+    ///
+    /// 실측(2026-08-26 · codex-cli 0.149.1 · macOS PTY 120x40 캡처 2회 바이트 동일)으로 확정한
+    /// ready 화면 푸터 `? for shortcuts` 가 ① 임베드 vendor(agents.json)에 실려 있고
+    /// ② **기존 설치 기계의 구 디스크 codex 항목에 도달**함을 구 파일 픽스처로 실행 확인한다.
+    /// codex 는 이 키가 **원래 없던** 어댑터라 K-1 동결("값으로 이미 있으면 영영 못 받는다")이
+    /// 성립하지 않는다 — 신규 키 배달이므로 fill_missing_fields 계층이 유일하고 충분한 경로다.
+    /// 라이브 재주입 왕복 검증은 이 검체로 갈음한다(티켓 계약 — 소비처 adapter_ready /
+    /// readiness `marker_of` 는 스펙의 이 키 하나만 읽으므로 값 도달 = 판정 도달).
+    #[test]
+    fn p0_6_codex_ready_marker_measured_and_delivered() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-p06codex-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        // ① 임베드 vendor 값 = 실측 문면(측정 없이 이 핀을 고치는 것은 금지 — 측정 불능≠통과).
+        let embed = embedded_agents_json().expect("임베드 agents.json 파싱");
+        assert_eq!(
+            embed["codex"]["ready_marker"].as_str(),
+            Some("? for shortcuts"),
+            "vendor codex ready_marker 가 실측 문면과 다르다 — 재측정 없이 바꾸지 마라"
+        );
+
+        // ② 구 기계 재현: codex 항목은 있으나 ready_marker 키가 없는 디스크 파일(실제 전 기계 형상).
+        let mut old = embed["codex"].clone();
+        let o = old.as_object_mut().unwrap();
+        o.remove("ready_marker");
+        o.insert("notes".into(), json!("MY-EDIT"));
+        let mut disk = serde_json::Map::new();
+        disk.insert("_schema".into(), json!(2));
+        disk.insert("codex".into(), old);
+        std::fs::write(
+            td.join("agents.json"),
+            serde_json::to_string(&Value::Object(disk)).unwrap(),
+        )
+        .unwrap();
+
+        let got = load_agent_spec("codex").expect("로드");
+        assert_eq!(
+            got["ready_marker"].as_str(),
+            Some("? for shortcuts"),
+            "구 디스크 codex 항목에 vendor ready_marker 가 배달되지 않았다 — readiness 시간 폴백 퇴화"
+        );
+        // 사용자 주권 불변: 값이 있는 키는 그대로, 디스크 파일은 무접촉.
+        assert_eq!(got["notes"].as_str(), Some("MY-EDIT"));
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(td.join("agents.json")).unwrap())
+                .unwrap();
+        assert!(
+            on_disk["codex"].get("ready_marker").is_none(),
+            "보강이 사용자 파일에 기록됐다(★W-B 위반)"
+        );
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+    }
+
     /// ★(W4 · CS-1③) 감지 오라클 핀: extract_bin(env-prefix 건너뛰기) + 경로형 실재 + **실행권**.
     /// 종전 부트 인라인 판정은 `exists()` 만 봤다 — 실행권 없는 파일을 '설치됨'으로 오탐하고
     /// 기동에서야 EACCES 로 죽었다. python 오라클(os.access X_OK)과 판정이 어긋난 지점이기도 하다.
