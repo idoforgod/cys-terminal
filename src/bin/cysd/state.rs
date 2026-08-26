@@ -370,6 +370,22 @@ pub struct Surface {
     /// Windows node-recover가 기존 pane 재사용 전, pane env에 CLAUDE_CONFIG_DIR 등이 실려있는지
     /// (=순수 cmd 재기동이 안전한지) 판정하는 근거. env 미주입 pane(수동·구세션) 재사용 시 fail-closed.
     pub env_injected: bool,
+    /// ★(P1) 좌석 토큰 — 데몬이 스폰 시 발급해 pane PTY env(`CYS_SEAT_TOKEN`)로**만** 배달하는
+    /// 세대 각인 비밀(`"{started_at:x}.{128bit hex}"` — §mint_seat_token). claim_role·hook.decide
+    /// 좌석 인가·해석의 1차 축이며, 조상 체인은 보조 인가가 아니라 **모순 거부권**이다.
+    /// · **관측·영속 채널 등재 금지**: persist_topology(topology.json)·surface.list 응답·이벤트
+    ///   payload·로그 어디에도 싣지 않는다 — 회귀 핀 `seat_token_never_persisted_or_listed`.
+    ///   Surface 는 Debug 파생이 없어(트레이트 객체 필드) 파생 출력 노출도 구조적으로 없다
+    ///   (파생 추가 금지). 영속 금지의 근거: pane 은 데몬을 넘겨 살지 못하고(PTY 종료·
+    ///   KILL_ON_JOB_CLOSE) restore 는 재생성(새 토큰)이라 회복 가치가 0이며, 영속하면
+    ///   same-UID 절취 표면만 커진다. stale(전세대) 토큰은 세대 접두 불일치로 결정론 기각(부재 취급).
+    /// · None = 무토큰(mint 실패 강등·`CYS_BOOT_GATES=0` 롤백) — claim 은 토큰 param 부재와
+    ///   동일한 종전 체인 경로라 종전과 동일 동작(fail-open 강등).
+    /// · 정직 고지: 이 토큰은 operator_token 과 동일하게 same-UID **거버넌스 구분**이지 보안
+    ///   경계가 아니다(동일 UID 는 ps -E·/proc/environ 으로 타 pane env 를 읽을 수 있다) —
+    ///   귀속 신뢰성 격상이 목적이다. 신뢰 등급·회전 없는 수명의 서술 정본은
+    ///   `docs/THREAT-MODEL-mission-gate.md` §4-11 이다(여기는 포인터만).
+    pub seat_token: Option<String>,
     pub exited: AtomicBool,
     /// 자력종료(셸 EOF) 시각 — watchdog reap의 grace 측정 기준 (exited와 함께 stamp)
     pub exited_at: Mutex<Option<Instant>>,
@@ -965,6 +981,37 @@ impl CallerCacheEntry {
             gen,
         }
     }
+}
+
+/// ★(P1) 좌석 토큰 mint — `"{daemon.started_at as u64:x}.{128bit 난수 hex}"`.
+/// · 세대 각인: 큐 id `"q{started_at:x}.{seq}"` 선례(§QueueEntry)와 동형 — 전세대(데몬 재시작
+///   이전) 토큰은 접두 불일치로 **결정론** 판별돼 claim 측이 부재 취급(체인 폴백)한다.
+/// · 난수원: channels::random_token_hex(CSPRNG·실패 시 hard-fail — 예측가능 폴백 금지)를
+///   재사용(중복 구현 금지)하고 앞 32 hex(=128bit)만 쓴다.
+/// · 실패(Err)의 소비 계약: 호출자(create_surface_with_env)는 **무토큰 스폰 + 경고**로
+///   강등한다(operator_token 선례) — 스폰 중단으로 설계하면 전 좌석 생성 사망 벡터(치명위험 ④).
+pub fn mint_seat_token(started_at: f64) -> Result<String, String> {
+    let tok = crate::channels::random_token_hex()?;
+    Ok(format!("{:x}.{}", started_at as u64, &tok[..32]))
+}
+
+/// ★(P1) 좌석 토큰 상수시간 비교 — 길이 불일치 즉시 false(길이는 비밀이 아님), 내용 비교는
+/// XOR 누적으로 조기 종료 없이 수행한다. 평문 보관·평문 대조로 충분한 근거: 채널 토큰이
+/// sha256 해시를 쓰는 이유는 SQLite **영속** 때문이고 이 토큰은 무영속(인메모리+env 한정)이다.
+pub fn seat_token_ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// ★(P1) 토큰 세대 판독 — 접두(`.` 이전)가 현 데몬 incarnation(started_at)과 같은가.
+/// claim 측 불일치 의미론(오너 결정 ⑭B + 절충)의 분기 재료: 불일치 + **동세대** = 시끄러운
+/// 기각(token_mismatch — env 오염·타 surface 토큰 복사 의심), 불일치 + 전세대/형식 불명 =
+/// 부재 취급(체인 폴백 — 구버전 훅·래퍼가 남긴 stale env 의 최빈 사례를 조용히 흡수).
+pub fn seat_token_same_generation(token: &str, started_at: f64) -> bool {
+    token.split('.').next() == Some(format!("{:x}", started_at as u64).as_str())
 }
 
 /// 워커 인스턴스 dedup: 복수 워커가 같은 역할명(→같은 todo 파일)을 공유하지 않도록,
@@ -2741,6 +2788,33 @@ impl Daemon {
         for (k, v) in env {
             builder.env(k, v);
         }
+        // ★(P1) 좌석 토큰 주입 — 데몬 발급 비밀을 pane PTY env 로만 배달한다(§Surface.seat_token).
+        // · 주입 위치 계약: **호출자 지정 env 오버레이 이후**(바로 위 루프 다음) — surface.create
+        //   arm 이 호출자 env 의 CYS_SEAT_TOKEN 키를 제거하지만(이중 방어 1층 — handlers.rs),
+        //   여기서도 마지막에 주입해 어떤 호출자 env 도 이 값을 덮지 못하게 한다(2층).
+        // · 5경로(create RPC·launch-agent·boot·restore·schedule if_absent:launch) 전부 surface.create
+        //   → 이 함수 단일 합류점(H-AUTH-SELFLOOP)이라 주입 누락 경로가 원리적으로 없다.
+        // · 실패 = 무토큰 스폰 + 경고(operator_token 선례 — 스폰 중단 금지: 전 좌석 생성 사망
+        //   벡터 차단, 치명위험 ④). 무토큰 pane 은 claim 시 체인 폴백으로 종전과 동일 동작.
+        // · 롤백: CYS_BOOT_GATES=0(스폰 시 판독 — U-20 선례 lib.rs 와 동형) → 미주입 = 완전 레거시.
+        let seat_token: Option<String> = if cys::boot_gates_master_off_from(
+            std::env::var(cys::ENV_BOOT_GATES).ok().as_deref(),
+        ) {
+            None
+        } else {
+            match mint_seat_token(self.started_at) {
+                Ok(tok) => {
+                    builder.env(cys::ENV_SEAT_TOKEN, &tok);
+                    Some(tok)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cysd: seat 토큰 발급 실패(무토큰 스폰 — claim 은 체인 폴백으로 강등): {e}"
+                    );
+                    None
+                }
+            }
+        };
 
         let child = pair
             .slave
@@ -2817,6 +2891,10 @@ impl Daemon {
             //     '격리 키가 pane 에 실렸는가'를 별도 bool 로 기록하는 것이며, 그때 이 주석과
             //     아래 회귀 핀(create_surface_with_env_records_env_injected_flag)을 함께 고쳐라.
             env_injected: !env.is_empty(),
+            // ★(P1) 인메모리 저장이 전부다 — persist_topology(governance.rs)는 필드를 손으로
+            // 골라 조립하므로 이 값이 topology.json 으로 샐 구조적 경로가 없다(명시 제외 불요·
+            // '조립 지점에 추가하지 않는 한' 영속 금지가 기본값). 회귀 핀 P5 가 봉인한다.
+            seat_token,
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
             write_tx,

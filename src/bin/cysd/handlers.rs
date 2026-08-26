@@ -463,13 +463,73 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
         }
     }
     // (P0-2 · TOCTOU 계약) 세대는 pid_to_sid 스냅샷 **이전**에 1회 캡처해 그 값으로 캐시
-    // 항목을 각인한다 — 삽입 시점 재판독 금지. 스냅샷 이후 등록된 surface는 이번 워크가 못
+    // 항목을 각인한다 — 삽입 시점 재판독 금지(스냅샷은 walk_caller_ancestry 내부 — 이 캡처가
+    // 호출보다 앞서므로 순서 계약은 보존된다). 스냅샷 이후 등록된 surface는 이번 워크가 못
     // 찾으므로(음성), 그 사이 등록이 끼면 각인 세대 < 현재 세대가 되어 다음 조회가 반드시
     // 재해석한다. 삽입 시점에 다시 읽으면 '워크 도중 등록'이 이미 오른 세대로 각인돼 일치=
     // 신뢰가 되고, 정확히 이 기제가 닫으려는 레이스(등록 직후 음성 stale 60s)가 되살아난다.
     // 비용: '워크 중 등록·즉시 재조회'는 재해석 1회를 추가로 태운다(정확성 우선 — 스캔 1회
     // 유계).
     let gen_at_snapshot = daemon.caller_gen.load(Ordering::Relaxed);
+    let (found, caller_start) = walk_caller_ancestry(daemon, caller_pid);
+    // 무한 성장 차단: cys CLI는 매 호출이 단명 프로세스라 동일 pid가 사실상 재등장하지
+    // 않는다 → 캐시 히트 경로의 60초 TTL 검사가 영영 발동하지 않아 stale 항목이 데몬 수명
+    // 동안 단조 누적된다(노드 간 push가 빈번한 멀티에이전트 운영에서 가속). 매 캐시-미스
+    // 삽입 때(이미 락을 쥔 임계영역) 만료(now-ts≥60s) 항목을 일괄 회수하고, 60초 창 내
+    // 폭주 대비 하드 캡까지 적용해 캐시를 유한하게 유지한다.
+    const CALLER_CACHE_CAP: usize = 4096;
+    let now = crate::state::now_epoch();
+    let mut cache = daemon.caller_cache.lock().unwrap();
+    cache.retain(|_, e| now - e.ts < 60.0);
+    cache.insert(
+        caller_pid,
+        crate::state::CallerCacheEntry::new(found, now, caller_start, gen_at_snapshot),
+    );
+    if cache.len() > CALLER_CACHE_CAP {
+        // 만료 회수 후에도 캡 초과(60초 내 대량 유입) — 가장 오래된 항목부터 캡까지 솎아낸다.
+        let mut by_age: Vec<(u32, f64)> = cache.iter().map(|(p, e)| (*p, e.ts)).collect();
+        by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (pid, _) in by_age.into_iter().take(cache.len() - CALLER_CACHE_CAP) {
+            cache.remove(&pid);
+        }
+    }
+    found
+}
+
+/// ★(P1 · R3-P1-5 선행 조건) 조상 체인 **probe** 변형 — 캐시를 **거치지 않고**(무판독) 결과를
+/// 캐시에 **기록하지도 않는다**(무기록). seat 토큰 경로(claim_role 모순 거부권의 '신선 재해석
+/// 1회') 전용이다.
+///
+/// **caller_cache 무기록 계약**: 토큰 유래 신원이 어떤 경로로든 caller_cache 에 기록되면
+/// send ACL(check_send_acl)·usage.event·배달 원장·publish 등 20+ 소비자가 그 신원을 상속해,
+/// 선언한 보안 경계(claim_role + hook.decide 한정)가 조용히 20+ 소비자로 번진다 — 회귀 핀
+/// `seat_token_path_never_records_caller_cache` 가 이 계약을 박제한다.
+fn probe_caller_surface_uncached(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
+    walk_caller_ancestry(daemon, caller_pid).0
+}
+
+/// ★(P1) seat 토큰 역조회 — 실려 온 토큰이 어느 surface 의 발급분인지 상수시간 비교로 찾는다
+/// (hook.decide 좌석 해석 전용). 결과는 caller_cache 에 기록하지 않는다(무기록 계약 — 토큰
+/// 유래 신원이 send ACL 등 20+ 소비자로 번지는 것 차단). 미스 = None(부재 취급 — 체인 폴백).
+fn find_surface_by_seat_token(daemon: &Daemon, token: &str) -> Option<u64> {
+    daemon
+        .surfaces
+        .lock()
+        .unwrap()
+        .values()
+        .find(|s| {
+            s.seat_token
+                .as_deref()
+                .is_some_and(|t| crate::state::seat_token_ct_eq(t, token))
+        })
+        .map(|s| s.id)
+}
+
+/// 조상 체인 워크 **공유 코어** — (해석된 소속 surface, caller start_time). 캐시 무접촉.
+/// resolve_caller_surface(캐시 판독→워크→기록)와 probe_caller_surface_uncached(워크만)가
+/// 공유한다 — 워크 규칙이 두 벌로 갈리면 모순 거부권의 '신선 재해석'이 본 해석과 다른
+/// 규칙을 보게 되므로 단일 소유가 계약이다.
+fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Option<u64>) {
     let pid_to_sid: std::collections::HashMap<u32, u64> = daemon
         .surfaces
         .lock()
@@ -499,28 +559,7 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
             _ => break,
         }
     }
-    // 무한 성장 차단: cys CLI는 매 호출이 단명 프로세스라 동일 pid가 사실상 재등장하지
-    // 않는다 → 캐시 히트 경로의 60초 TTL 검사가 영영 발동하지 않아 stale 항목이 데몬 수명
-    // 동안 단조 누적된다(노드 간 push가 빈번한 멀티에이전트 운영에서 가속). 매 캐시-미스
-    // 삽입 때(이미 락을 쥔 임계영역) 만료(now-ts≥60s) 항목을 일괄 회수하고, 60초 창 내
-    // 폭주 대비 하드 캡까지 적용해 캐시를 유한하게 유지한다.
-    const CALLER_CACHE_CAP: usize = 4096;
-    let now = crate::state::now_epoch();
-    let mut cache = daemon.caller_cache.lock().unwrap();
-    cache.retain(|_, e| now - e.ts < 60.0);
-    cache.insert(
-        caller_pid,
-        crate::state::CallerCacheEntry::new(found, now, caller_start, gen_at_snapshot),
-    );
-    if cache.len() > CALLER_CACHE_CAP {
-        // 만료 회수 후에도 캡 초과(60초 내 대량 유입) — 가장 오래된 항목부터 캡까지 솎아낸다.
-        let mut by_age: Vec<(u32, f64)> = cache.iter().map(|(p, e)| (*p, e.ts)).collect();
-        by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (pid, _) in by_age.into_iter().take(cache.len() - CALLER_CACHE_CAP) {
-            cache.remove(&pid);
-        }
-    }
-    found
+    (found, caller_start)
 }
 
 /// ★결함#6-b(2026-08-22 실사고) — ACL `from` 신원 등급 **`owner`** 의 단일 정의처.
@@ -2187,6 +2226,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   규약이다. 자기신고 `CYS_SURFACE_ID` 는 위조 가능하므로 신뢰하지 않으며, 신고 필드가
         //   실려 오면 **조용히 무시하지 않고** invalid_params 로 거절한다(계약 위반을 침묵으로
         //   접으면 다음 호출자가 그 필드를 믿게 된다).
+        //   ★(P1) carve-out — `seat_token` param 은 이 금지의 예외다: 토큰은 **데몬이 스폰 시
+        //   발급해 그 pane 의 PTY env 로만 배달한 비밀의 대조**라 자기신고가 아니다(위조 불가·
+        //   검증 가능 — 후속 수정자는 이 분기를 '자기신고 허용'으로 오인해 제거하지 말 것).
+        //   토큰이 유효하면 좌석 '해석'만 토큰 1차로 확정하고(체인 단절 rc6 계급 관통), 토큰-체인
+        //   모순은 undecided 로 접는다(발화 층은 fail-open — 등록층 claim_role 의 fail-closed
+        //   기각과의 축별 비대칭이 의도된 골격이다). 판정 코어(hook_decide_verdict)는 무접촉.
         //
         // ★`contract_version` 은 페이로드 필드다 — `wire::PROTO_PV` 는 무접촉이다.
         "hook.decide" => {
@@ -2206,12 +2251,32 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 ));
             }
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // ★(P1) 좌석 '해석'만 토큰 1차 — 유효 토큰(어느 살아있는 surface 의 발급분과 상수시간
+            // 일치)이 실렸으면 그 surface 로 좌석을 확정한다. 무효·부재 토큰은 부재 취급(종전
+            // 체인 경로 바이트 동일 — 발화 층 fail-open). 토큰-체인 모순(둘 다 해석됐는데 서로
+            // 다른 pane)은 suppress 가 아니라 **undecided**(셸 레거시 폴백) — 여기의 체인 판독은
+            // 캐시 경유(핫패스·오판이 나도 undecided 는 기각이 아니라 안전)이고, 기각을 발화하는
+            // claim_role 쪽만 신선 재해석(모순 거부권)을 의무로 진다. 진리표 코어는 무접촉.
+            let token_sid: Option<u64> = param_str(&params, "seat_token")
+                .filter(|_| {
+                    !cys::boot_gates_master_off_from(
+                        std::env::var(cys::ENV_BOOT_GATES).ok().as_deref(),
+                    )
+                })
+                .and_then(|tok| find_surface_by_seat_token(daemon, &tok));
             // 좌석 해석은 여기(상태 조회), 판정은 순수 코어(`hook_decide_verdict`)가 소유한다 —
             // 규칙을 arm 안에 인라인하면 진리표를 시험할 수 없고, 시험되지 않는 allowlist 는
             // 반드시 낡는다(A3 가 denylist 였을 때 정확히 그렇게 새어 나갔다).
-            let seat: Result<String, &'static str> = match caller_sid {
-                None => Err("caller_unresolved"),
-                Some(sid) => match daemon.get_surface(sid) {
+            let effective_sid: Result<Option<u64>, &'static str> = match (token_sid, caller_sid) {
+                // 모순 — 어느 쪽도 편들지 않는다(판정 불가·좌석 미확정).
+                (Some(ts), Some(cs)) if ts != cs => Err("token_chain_conflict"),
+                (Some(ts), _) => Ok(Some(ts)),
+                (None, cs) => Ok(cs),
+            };
+            let seat: Result<String, &'static str> = match effective_sid {
+                Err(why) => Err(why),
+                Ok(None) => Err("caller_unresolved"),
+                Ok(Some(sid)) => match daemon.get_surface(sid) {
                     None => Err("surface_not_found"),
                     Some(surface) => {
                         Ok(surface.role.lock().unwrap().clone().unwrap_or_default())
@@ -2228,7 +2293,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 json!({
                     "contract_version": HOOK_DECIDE_CONTRACT_V,
                     "event": event,
-                    "surface_id": caller_sid,
+                    "surface_id": effective_sid.ok().flatten(),
                     "role": role,
                     "verdict": verdict,
                     "reason": reason,
@@ -2431,11 +2496,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             // RC-3(B′): pane env 주입 — Windows launch-agent가 해소된 CLAUDE_CONFIG_DIR 등을 넘긴다
             // (순수 cmd send와 짝). params["env"] 객체(문자열 값만)를 (k,v) 벡터로. 부재 시 빈 벡터.
+            // ★(P1 이중 방어 1층) 호출자 env 의 CYS_SEAT_TOKEN 키는 **버린다** — 좌석 토큰은
+            //   데몬만 발급한다(create_surface_with_env 가 호출자 env **이후** 마지막에 주입 = 2층).
+            //   이 필터가 없으면 위조 토큰 주입 봉쇄가 주입 순서 하나에만 기댄다.
             let env_pairs: Vec<(String, String)> = params
                 .get("env")
                 .and_then(|e| e.as_object())
                 .map(|m| {
                     m.iter()
+                        .filter(|(k, _)| k.as_str() != cys::ENV_SEAT_TOKEN)
                         .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                         .collect()
                 })
@@ -3496,14 +3565,110 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let Some(sid) = resolve_surface_id(&params) else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
             };
+            // ★(P1) 좌석 토큰 **1차 인가** — 이 게이트의 자리는 예약어 게이트(owner/creator)
+            // **뒤**다: 토큰 분기를 예약어 게이트 앞으로 옮기면 토큰이 예약어를 우회해 부서
+            // 자율성 보호가 무력화된다(couplings §security_boundary — 순서가 계약이다).
+            //
+            // 인가 계약(자기신고 금지와의 구분): `CYS_SURFACE_ID` 자기신고는 위조 가능해 신뢰하지
+            // 않지만, seat 토큰은 **데몬이 스폰 시 발급해 그 pane 의 PTY env 로만 배달한 비밀의
+            // 대조**라 자기신고가 아니다(위조 불가·검증 가능 — 후속 수정자는 이 분기를 '자기신고
+            // 허용'으로 오인해 제거하지 말 것). 조상 체인은 보조 인가가 아니라 **모순 거부권**이다.
+            //
+            // 분기 계약(오너 결정 ⑭ · R3-P1-3·R3-P1-6):
+            //   ⓐ 토큰 = 대상 surface 토큰(상수시간 비교 일치) → 모순 거부권: 해당 caller_pid 의
+            //      캐시 무효화 + 신선 재해석 1회(probe — 무캐시·무기록). 체인이 **다른** pane 으로
+            //      해석되면 기존 claim_not_owner 재사용으로 기각(reason=token_chain_conflict —
+            //      신설 에러코드 금지: 구 CLI else 분기가 미지 코드를 rc 3 '미도달'로 오진한다).
+            //      체인 None 또는 동일 pane → 인가(체인 단절 rc6 근본원인의 정확한 관통).
+            //   ⓑ 불일치 + 세대 접두 ≠ 현 데몬(started_at) → **부재 취급**(토큰 없이 온 것과 동일
+            //      = 종전 체인 경로 — 구버전 훅·래퍼가 남긴 stale env 의 최빈 사례를 조용히 흡수).
+            //   ⓒ 불일치 + 세대 동일 → 시끄러운 기각: claim_caller_unresolved 계열(rc6 가족)
+            //      reason=token_mismatch(env 오염·타 surface 토큰 복사 = 의도된 소음).
+            //   토큰 부재 → 아래 종전 체인 경로 **바이트 동일**(fail-open 폴백·양방향 스큐 안전).
+            // 롤백: CYS_BOOT_GATES=0 → 이 분기 전체 비활성(param 무시=부재 취급 → 완전 레거시).
+            // caller_cache 무기록 계약: 토큰 유래 신원은 어떤 경로로도 캐시에 기록하지 않는다
+            // (probe 가 그 집행 — §probe_caller_surface_uncached · 회귀 핀 P6).
+            let seat_token_param = param_str(&params, "seat_token").filter(|_| {
+                !cys::boot_gates_master_off_from(std::env::var(cys::ENV_BOOT_GATES).ok().as_deref())
+            });
+            let mut token_authorized = false;
+            if let Some(supplied) = seat_token_param {
+                let target_token = daemon.get_surface(sid).and_then(|s| s.seat_token.clone());
+                let matched = target_token
+                    .as_deref()
+                    .is_some_and(|t| crate::state::seat_token_ct_eq(t, &supplied));
+                if matched {
+                    // ⓐ 모순 거부권 — 캐시 히트를 그대로 소비하면 pid 재사용 stale 양성이 유효
+                    // 토큰을 오거부(false veto)할 수 있다(G13 '임계영역 내 재검증' 선례). 반드시
+                    // 해당 항목을 무효화하고 신선 재해석 1회의 결과로만 기각을 발화한다.
+                    let fresh = caller_pid.and_then(|p| {
+                        daemon.caller_cache.lock().unwrap().remove(&p);
+                        probe_caller_surface_uncached(daemon, p)
+                    });
+                    match fresh {
+                        Some(cs) if cs != sid => {
+                            daemon.bus.publish(
+                                "role.claim_denied",
+                                "system",
+                                Some(sid),
+                                json!({"role": role, "requested_surface": sid,
+                                       "caller_surface": cs, "caller_pid": caller_pid,
+                                       "error_code": "claim_not_owner",
+                                       "reason": "token_chain_conflict"}),
+                            );
+                            return Reply::Single(err_response(
+                                &id,
+                                "claim_not_owner",
+                                &format!(
+                                    "claim_role: 발신 surface {cs}는 대상 surface {sid}의 소유자가 \
+                                     아니다 — 유효한 seat 토큰이 실렸으나 발신 조상 체인이 다른 \
+                                     pane 으로 해석된다(token_chain_conflict: 타 pane 토큰 절취·\
+                                     env 복사 의심). 역할 등록은 자기 surface에만 허용된다."
+                                ),
+                            ));
+                        }
+                        _ => token_authorized = true,
+                    }
+                } else if crate::state::seat_token_same_generation(&supplied, daemon.started_at) {
+                    // ⓒ 동세대 불일치 — 등록층은 조직 사실을 쓰는 fail-closed 층위: 이상 신호를
+                    // 침묵으로 접지 않는다(1차 성찰이 rc6 뿌리로 지목한 '발화 fail-open 이 이상을
+                    // 삼킨다'의 등록층 재현 금지).
+                    daemon.bus.publish(
+                        "role.claim_denied",
+                        "system",
+                        Some(sid),
+                        json!({"role": role, "requested_surface": sid,
+                               "caller_pid": caller_pid,
+                               "error_code": "claim_caller_unresolved",
+                               "reason": "token_mismatch"}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "claim_caller_unresolved",
+                        &format!(
+                            "claim_role: 실려 온 seat 토큰이 대상 surface {sid}의 토큰과 다르다\
+                             (token_mismatch: 동세대 발급분 — env 오염·타 surface 토큰 복사 의심). \
+                             '살아있는 {role} 보유자가 있다'는 뜻이 **아니다** — 그 pane 의 env \
+                             그대로(pane 안에서) 다시 claim 하라."
+                        ),
+                    ));
+                }
+                // ⓑ 전세대/형식 불명 → 부재 취급: 아래 종전 체인 경로로 폴백(스큐 안전).
+            }
             // 신원·소유 검증: 역할 등록은 자기 surface에 대해서만 허용한다. 대상 surface_id는
             // 클라이언트 자기신고라(어떤 pane이든 위조 가능) 신뢰하지 않고, 항상 커널 peer
             // pid로 발신 pane을 확정해 대조한다 (send ACL과 동일한 신원 모델). 이 게이트가
             // 없으면 워커 pane이 ① 자기 소유가 아닌 임의 surface에 역할을 박거나 ② 'master'
             // 같은 특권 역할을 자기 surface로 재지정해 roles 매핑·거버넌스 감시 대상을 탈취할
             // 수 있다. 발신 신원 해석 실패(외부/추적 불가)도 거부 — 익명 claim 금지.
+            // (P1) 단 데몬 발급 seat 토큰이 위에서 인가됐으면 이 체인 게이트는 건너뛴다 —
+            // 토큰 부재·부재 취급 경로는 아래가 종전과 바이트 동일하게 집행된다.
             // resolve_caller_surface는 내부에서 surfaces 락을 잡으므로 아래 임계영역 진입 전에 호출.
-            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let caller_sid = if token_authorized {
+                Some(sid)
+            } else {
+                caller_pid.and_then(|p| resolve_caller_surface(daemon, p))
+            };
             match caller_sid {
                 Some(cs) if cs == sid => {}
                 _ => {
@@ -6406,7 +6571,7 @@ mod tests {
     /// 못 읽는 순간마다 마스터 부트가 조용히 사라진다(불확실성이 침묵으로 접히는 R2 그 자체).
     #[test]
     fn hook_decide_verdict_truth_table() {
-        let table: [(Result<&str, &'static str>, &str, &str); 10] = [
+        let table: [(Result<&str, &'static str>, &str, &str); 11] = [
             (Ok("master"), "proceed", "master_seat"),
             (Ok(""), "proceed", "unclaimed_seat"),
             (Ok("worker"), "suppress", "non_master_role"),
@@ -6419,6 +6584,11 @@ mod tests {
             (Ok("Master"), "suppress", "non_master_role"),
             (Err("caller_unresolved"), "undecided", "caller_unresolved"),
             (Err("surface_not_found"), "undecided", "surface_not_found"),
+            // ★(P1) 토큰-체인 모순 — 새 Err 어휘도 특별 취급 없이 undecided 로 접힌다. 코어가
+            // 이 특정 Err 를 suppress/proceed 로 승격하는 회귀를 코어 층에서 봉인한다(E2E 핀
+            // hook_decide_seat_token_resolution_and_conflict_undecided ③의 진리표층 대응 —
+            // 모순은 어느 좌석도 편들지 않으며, undecided 는 차단이 아니다).
+            (Err("token_chain_conflict"), "undecided", "token_chain_conflict"),
         ];
         for (seat, want_v, want_r) in table {
             assert_eq!(
@@ -10306,6 +10476,341 @@ mod tests {
         );
         // 역할은 등록되지 않아야 한다.
         assert!(daemon.roles.lock().unwrap().get("master").is_none());
+    }
+
+    // ───────────────────────── (P1) seat 토큰 검체 보조 ─────────────────────────
+    // claim() 헬퍼는 시그니처 보존(R3-P1-5 '기존 테스트 무수정 원칙') — 토큰 변형은 별도 추가.
+
+    /// (P1 검체 공통) ambient `CYS_BOOT_GATES` 중립화 가드 — CI·개발자 셸이 롤백 우산(`=0`)을
+    /// 전역 export 한 환경에서도 검체의 '게이트 기본값(on) → 토큰 주입' 전제를 결정론으로
+    /// 확보한다(전제를 암묵에 두면 ambient 값 하나로 8검체가 일괄 적색 — 환경 결합 오진).
+    /// ACL_ENV_LOCK 보유 중에만 생성할 것(전 env 변이 검체와 같은 직렬화 규약). drop 시 원값
+    /// 복원 — 패닉 경로 포함(락 가드보다 늦게 선언해 락 해제 전에 복원된다).
+    struct BootGatesAmbientGuard(Option<std::ffi::OsString>);
+    impl BootGatesAmbientGuard {
+        fn neutralize() -> Self {
+            let prior = std::env::var_os(cys::ENV_BOOT_GATES);
+            std::env::remove_var(cys::ENV_BOOT_GATES);
+            Self(prior)
+        }
+    }
+    impl Drop for BootGatesAmbientGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(cys::ENV_BOOT_GATES, v),
+                None => std::env::remove_var(cys::ENV_BOOT_GATES),
+            }
+        }
+    }
+
+    /// seat_token 을 params 에 실어 claim 하는 변형(P1 검체 전용).
+    fn claim_with_token(
+        daemon: &Arc<Daemon>,
+        role: &str,
+        surface_id: u64,
+        caller_pid: Option<u32>,
+        token: &str,
+    ) -> Value {
+        let req = Request {
+            id: json!(1),
+            method: "system.claim_role".into(),
+            params: json!({ "role": role, "surface_id": surface_id, "seat_token": token }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    fn seat_token_of(daemon: &Arc<Daemon>, sid: u64) -> String {
+        daemon.surfaces.lock().unwrap()[&sid]
+            .seat_token
+            .clone()
+            .expect("게이트 기본값(on)에서 생성된 surface 는 seat 토큰을 가져야 한다")
+    }
+
+    fn pane_pid_of(daemon: &Arc<Daemon>, sid: u64) -> u32 {
+        daemon.surfaces.lock().unwrap()[&sid].pid
+    }
+
+    fn hook_decide_call(daemon: &Arc<Daemon>, caller_pid: Option<u32>, token: Option<&str>) -> Value {
+        let mut params = json!({ "event": "user-prompt-submit", "contract_version": 1 });
+        if let Some(t) = token {
+            params["seat_token"] = json!(t);
+        }
+        let req = Request { id: json!(1), method: "hook.decide".into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// [P1 핀] 토큰 1차 성공 — 유효 토큰 + orphan pid(체인 미해석) → ok:true·role 등재.
+    /// claim_role_unresolved_caller_is_not_claim_denied(무토큰 폴백 핀)의 정확한 반전이다:
+    /// 같은 체인 단절이라도 데몬 발급 토큰이 실리면 체인 없이 인가된다 — rc6 근본원인
+    /// (세션 분리·재부모화로 끊긴 조상 체인)을 관통하는 수리의 데몬면 박제.
+    #[test]
+    fn claim_role_seat_token_authorizes_orphan_caller() {
+        let _g = ACL_ENV_LOCK.lock().unwrap(); // 롤백 검체의 CYS_BOOT_GATES 변이와 직렬화
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let s = make_surface(&daemon, None);
+        let tok = seat_token_of(&daemon, s);
+        let orphan_pid = 4_294_000_011_u32; // 존재하지 않는 pid — 체인 미해석 재현
+        let resp = claim_with_token(&daemon, "master", s, Some(orphan_pid), &tok);
+        assert_eq!(
+            resp["ok"], json!(true),
+            "유효 seat 토큰 + 체인 단절 claim 이 거부됐다 (응답: {resp})"
+        );
+        assert_eq!(
+            daemon.roles.lock().unwrap().get("master"), Some(&s),
+            "토큰 인가 후 role 이 등재되지 않았다"
+        );
+    }
+
+    /// [P2 핀] 모순 거부권 — 대상 A 의 유효 토큰인데 발신 조상 체인이 B pane 으로 해석되면
+    /// 기존 claim_not_owner **재사용**으로 기각한다(신설 에러코드 금지 — 구 CLI else 분기가
+    /// 미지 코드를 rc 3 '미도달'로 오진). 타 pane 토큰 절취로 남의 좌석에 역할을 박는 신설
+    /// 벡터를 닫는 핀.
+    #[test]
+    fn claim_role_seat_token_chain_conflict_is_vetoed() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let a = make_surface(&daemon, None);
+        let b = make_surface(&daemon, None);
+        let tok_a = seat_token_of(&daemon, a);
+        // 신선 재해석이 B 로 확정되는 발신자 = B pane 셸 프로세스 자신(pid_to_sid 직격 히트 —
+        // 모순 거부권은 캐시를 무효화하고 재해석하므로 합성 캐시 주입만으로는 모순이 안 잡힌다).
+        let b_pid = pane_pid_of(&daemon, b);
+        bind_caller(&daemon, b_pid, b); // stale 캐시도 심어 '무효화 후 재해석' 경로를 관통
+        let resp = claim_with_token(&daemon, "master", a, Some(b_pid), &tok_a);
+        assert_eq!(resp["ok"], json!(false), "토큰-체인 모순 claim 이 통과했다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("claim_not_owner"));
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("token_chain_conflict"), "모순 사유 관측 마커 부재: {msg}");
+        // 소비 사슬 오역 방지: 위계 폴백 마커·보유자 암시 문구 금지(9952-9956 패턴 재사용).
+        assert!(
+            !msg.contains("claim_denied")
+                && !msg.contains("privileged role")
+                && !msg.contains("held by live"),
+            "모순 기각 문안이 정당거부/보유자 있음을 암시한다: {msg}"
+        );
+        assert!(daemon.roles.lock().unwrap().get("master").is_none(), "기각인데 role 이 등재됐다");
+    }
+
+    /// [P3 핀] 신선 재해석 우선(R3-P1-3 ②) — pid 재사용 등으로 남은 stale 양성 캐시(B)가 있어도
+    /// 실제 체인이 A(=대상)면 유효 토큰을 오거부(false veto)하지 않는다: 거부 발화 전 해당
+    /// 캐시 항목을 무효화하고 신선 재해석 1회의 결과로만 기각한다.
+    #[test]
+    fn claim_role_seat_token_veto_uses_fresh_walk_over_stale_cache() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let a = make_surface(&daemon, None);
+        let b = make_surface(&daemon, None);
+        let tok_a = seat_token_of(&daemon, a);
+        let a_pid = pane_pid_of(&daemon, a);
+        bind_caller(&daemon, a_pid, b); // stale 양성: 실제는 A pane 셸인데 캐시는 B 라고 주장
+        let resp = claim_with_token(&daemon, "master", a, Some(a_pid), &tok_a);
+        assert_eq!(
+            resp["ok"], json!(true),
+            "stale 캐시가 유효 토큰을 오거부(false veto)했다 (응답: {resp})"
+        );
+    }
+
+    /// [P4 핀] 세대 불일치 — 전세대(데몬 재시작 이전) started_at 각인 토큰은 인가에 쓰이지
+    /// 못하고(전세대 토큰의 구조적 기각) **부재 취급**으로 체인 폴백한다(오너 결정 ⑭ 절충 —
+    /// 구버전 훅·래퍼가 남긴 stale env 의 최빈 사례를 조용히 흡수·ⓒ 의 시끄러운 기각과 구분).
+    /// 데몬 재시작은 단위 테스트에서 재현 불가라 started_at 값 조작으로 대신한다(R3-P1-5 잔여
+    /// 위험 명기 — incarnation 전환 e2e 는 phoenix 하네스 몫).
+    #[test]
+    fn claim_role_stale_generation_token_is_treated_as_absent() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let s = make_surface(&daemon, None);
+        let real = seat_token_of(&daemon, s);
+        let rand_part = real.split('.').nth(1).expect("토큰은 세대접두.난수 2부 구성");
+        let stale = format!("{:x}.{rand_part}", (daemon.started_at as u64).wrapping_sub(7));
+        // ① 체인도 끊긴 orphan → 부재 취급 폴백의 귀결 = 종전 claim_caller_unresolved(rc6 계열)
+        let orphan_pid = 4_294_000_021_u32;
+        let resp = claim_with_token(&daemon, "master", s, Some(orphan_pid), &stale);
+        assert_eq!(resp["ok"], json!(false), "전세대 토큰이 인가에 쓰였다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("claim_caller_unresolved"));
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !msg.contains("token_mismatch"),
+            "전세대 토큰이 ⓒ(동세대 시끄러운 기각)로 오분류됐다 — ⓑ 부재 취급이어야 한다: {msg}"
+        );
+        // ② 부재 취급의 대칭: 같은 전세대 토큰이라도 체인이 온전하면 종전 체인 경로로 성공한다.
+        let s_pid = pane_pid_of(&daemon, s);
+        let resp2 = claim_with_token(&daemon, "master", s, Some(s_pid), &stale);
+        assert_eq!(
+            resp2["ok"], json!(true),
+            "전세대 토큰의 부재 취급 폴백(종전 체인 경로)이 깨졌다 (응답: {resp2})"
+        );
+    }
+
+    /// [P9 핀] 불일치 의미론(오너 결정 ⑭B) — **동세대** 불일치 토큰은 체인이 온전해도 시끄럽게
+    /// 기각한다(claim_caller_unresolved 계열 rc6 가족·reason=token_mismatch). env 오염·타 surface
+    /// 토큰 복사(사람이 env 를 옮긴 경우)는 침묵으로 접지 않는 것이 계약이다(의도된 소음 —
+    /// 등록층 fail-closed). 전세대 방향의 폴백 반쪽은 P4 핀이 관통한다.
+    #[test]
+    fn claim_role_same_generation_token_mismatch_is_rejected_loudly() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let a = make_surface(&daemon, None);
+        let b = make_surface(&daemon, None);
+        let tok_b = seat_token_of(&daemon, b); // 동세대의 '남의 토큰'
+        let a_pid = pane_pid_of(&daemon, a); // 체인은 온전(A) — 그런데도 기각돼야 한다
+        let resp = claim_with_token(&daemon, "master", a, Some(a_pid), &tok_b);
+        assert_eq!(resp["ok"], json!(false), "동세대 불일치 토큰이 통과했다 (응답: {resp})");
+        assert_eq!(resp["error"]["code"], json!("claim_caller_unresolved"));
+        let msg = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("token_mismatch"), "불일치 사유 관측 마커 부재: {msg}");
+        assert!(
+            !msg.contains("claim_denied")
+                && !msg.contains("privileged role")
+                && !msg.contains("held by live"),
+            "불일치 기각 문안이 정당거부/보유자 있음을 암시한다: {msg}"
+        );
+        assert!(daemon.roles.lock().unwrap().get("master").is_none());
+    }
+
+    /// [P5 핀] 무영속·무노출 — seat 토큰은 topology.json(persist_topology)에도 surface.list
+    /// 응답에도 나타나지 않는다. persist_topology·surface.list 는 필드를 손으로 골라 조립하므로
+    /// '조립 지점에 추가하지 않는 한' 배제가 기본값인데, 이 핀은 그 기본값을 **영원히 안전**으로
+    /// 봉인한다(조립 지점 추가 회귀 검출 — R3-P1-4).
+    #[test]
+    fn seat_token_never_persisted_or_listed() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = isolated_daemon();
+        let s = make_surface(&daemon, Some("worker-1"));
+        let tok = seat_token_of(&daemon, s);
+        crate::governance::persist_topology(&daemon);
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let topo = std::fs::read_to_string(dir.join("topology.json"))
+            .expect("persist_topology 후 topology.json 실재");
+        assert!(
+            !topo.contains("seat_token") && !topo.contains(&tok),
+            "seat 토큰이 topology.json 으로 영속됐다(same-UID 절취 표면 확대)"
+        );
+        let req = Request { id: json!(1), method: "surface.list".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        let listed = resp.to_string();
+        assert!(
+            !listed.contains("seat_token") && !listed.contains(&tok),
+            "seat 토큰이 surface.list 관측 채널로 노출됐다"
+        );
+    }
+
+    /// [P6 핀] caller_cache 무기록 계약 — 토큰 경로(성공·모순 기각 모두)는 어떤 경우에도
+    /// caller_cache 에 해당 pid 항목을 남기지 않는다. 토큰 유래 신원이 캐시로 흘러들면 send
+    /// ACL·usage.event·배달 원장·publish 등 20+ 소비자가 그 신원을 상속해 선언한 보안 경계
+    /// (claim+hook 한정)가 조용히 붕괴한다 — probe/record 분리(R3-P1-5 선행 조건)의 존재 이유.
+    #[test]
+    fn seat_token_path_never_records_caller_cache() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let s = make_surface(&daemon, None);
+        let tok = seat_token_of(&daemon, s);
+        // ① 성공 경로(orphan): probe 는 캐시를 판독하지도 기록하지도 않는다.
+        let orphan_pid = 4_294_000_031_u32;
+        let resp = claim_with_token(&daemon, "master", s, Some(orphan_pid), &tok);
+        assert_eq!(resp["ok"], json!(true), "전제: 토큰 인가 성공 (응답: {resp})");
+        assert!(
+            !daemon.caller_cache.lock().unwrap().contains_key(&orphan_pid),
+            "토큰 성공 경로가 caller_cache 에 기록했다(보안 경계 20+ 소비자 전이)"
+        );
+        // ② 모순 기각 경로: 사전 주입된 항목은 무효화되고 재기록되지 않는다.
+        let b = make_surface(&daemon, None);
+        let b_pid = pane_pid_of(&daemon, b);
+        bind_caller(&daemon, b_pid, b);
+        let resp2 = claim_with_token(&daemon, "worker", s, Some(b_pid), &tok);
+        assert_eq!(resp2["error"]["code"], json!("claim_not_owner"), "전제: 모순 기각 (응답: {resp2})");
+        assert!(
+            !daemon.caller_cache.lock().unwrap().contains_key(&b_pid),
+            "모순 경로가 caller_cache 항목을 잔존/재기록시켰다(무효화+무기록 계약 위반)"
+        );
+    }
+
+    /// [P7 핀] hook.decide 좌석 해석 토큰 1차 — ①토큰만으로 proceed 확정(체인 단절 orphan)
+    /// ②토큰만으로 suppress 확정 ③토큰-체인 모순은 undecided(셸 레거시 폴백 — suppress 오살
+    /// 금지·발화 층 fail-open) ④surface_id 동시 신고는 여전히 invalid_params(기존 핀 존치)
+    /// ⑤무토큰 경로 바이트 동일(종전 caller_unresolved). 판정 코어(hook_decide_verdict) 진리표는
+    /// 무변경 — 바뀐 것은 좌석 '해석'뿐이다.
+    #[test]
+    fn hook_decide_seat_token_resolution_and_conflict_undecided() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
+        let daemon = claim_daemon();
+        let m = make_surface(&daemon, Some("master"));
+        let w = make_surface(&daemon, Some("worker-1"));
+        let tok_m = seat_token_of(&daemon, m);
+        let tok_w = seat_token_of(&daemon, w);
+        let orphan_pid = 4_294_000_041_u32;
+        // ① 토큰만으로 proceed(master 좌석) — 체인 미해석이어도 좌석이 확정된다.
+        let r1 = hook_decide_call(&daemon, Some(orphan_pid), Some(&tok_m));
+        assert_eq!(r1["result"]["verdict"], json!("proceed"), "① 실패: {r1}");
+        assert_eq!(r1["result"]["reason"], json!("master_seat"));
+        assert_eq!(r1["result"]["surface_id"], json!(m));
+        // ② 토큰만으로 suppress(비-master 좌석).
+        let r2 = hook_decide_call(&daemon, Some(orphan_pid), Some(&tok_w));
+        assert_eq!(r2["result"]["verdict"], json!("suppress"), "② 실패: {r2}");
+        assert_eq!(r2["result"]["reason"], json!("non_master_role"));
+        // ③ 모순(토큰=m·체인=w pane) → undecided (suppress 가 아니다 — 오살이 오탐보다 위험).
+        let w_pid = pane_pid_of(&daemon, w);
+        let r3 = hook_decide_call(&daemon, Some(w_pid), Some(&tok_m));
+        assert_eq!(r3["result"]["verdict"], json!("undecided"), "③ 실패: {r3}");
+        assert_eq!(r3["result"]["reason"], json!("token_chain_conflict"));
+        assert_eq!(r3["result"]["surface_id"], json!(null), "모순은 어느 좌석도 편들지 않는다");
+        // ④ surface_id 자기신고 거절 핀 존치(토큰 동승과 무관).
+        let req = Request {
+            id: json!(1),
+            method: "hook.decide".into(),
+            params: json!({ "event": "user-prompt-submit", "surface_id": m, "seat_token": tok_m }),
+        };
+        let Reply::Single(r4) = dispatch(&daemon, req, None) else { panic!("single reply") };
+        assert_eq!(r4["error"]["code"], json!("invalid_params"), "④ 실패: {r4}");
+        // ⑤ 무토큰 경로 바이트 동일 — 종전 undecided(caller_unresolved).
+        let r5 = hook_decide_call(&daemon, Some(orphan_pid), None);
+        assert_eq!(r5["result"]["verdict"], json!("undecided"), "⑤ 실패: {r5}");
+        assert_eq!(r5["result"]["reason"], json!("caller_unresolved"));
+    }
+
+    /// [롤백 우산 핀] CYS_BOOT_GATES=0 → ①스폰 시 토큰 미주입(무토큰 pane) ②claim·hook 의
+    /// 토큰 분기 전부 비활성(param 무시=부재 취급) = 레거시 바이트 동일. 신규 전용 노브 금지 —
+    /// 사고 순간의 손잡이는 마스터 스위치 하나다(노브 규율).
+    #[test]
+    fn seat_token_disabled_by_boot_gates_master_switch() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // 가드가 drop 시 ambient 원값을 복원한다 — 패닉 경로 포함(종전의 수동 remove_var 는
+        // 패닉 시 미복원 + ambient 값이 있던 환경에서는 그 값을 지워버리는 부수 결함).
+        let _bg = BootGatesAmbientGuard::neutralize();
+        std::env::set_var(cys::ENV_BOOT_GATES, "0");
+        let daemon = claim_daemon();
+        let s = make_surface(&daemon, None);
+        let no_token = daemon.surfaces.lock().unwrap()[&s].seat_token.clone();
+        let claim_resp = claim_with_token(
+            &daemon,
+            "master",
+            s,
+            Some(4_294_000_051_u32),
+            &format!("{:x}.{}", daemon.started_at as u64, "ab".repeat(16)),
+        );
+        let hook_resp = hook_decide_call(&daemon, Some(4_294_000_051_u32), Some("ffff.eeee"));
+        assert!(no_token.is_none(), "마스터 스위치 하에 seat 토큰이 주입됐다");
+        // 동세대 형식 토큰이 실려 왔는데도 분기 비활성 → ⓒ 기각이 아니라 종전 체인 경로.
+        assert_eq!(claim_resp["error"]["code"], json!("claim_caller_unresolved"));
+        let msg = claim_resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(!msg.contains("token_mismatch"), "롤백 중 토큰 분기가 살아 있다: {msg}");
+        assert_eq!(hook_resp["result"]["reason"], json!("caller_unresolved"));
     }
 
     fn set_meta(
