@@ -7,7 +7,10 @@
 >  (windows-build.yml PTY 스모크는 **pane env 실주입 관측** — U-20 `CLAUDE_CODE_GIT_BASH_PATH`·
 >  좌석 토큰 `CYS_SEAT_TOKEN` — 까지 게이트한다. 단 **벤더 링크 분절**(claude 가 그 env 로 훅을
 >  **실발화**하는가)은 claude 인증 필요로 CI 게이트化 불가 — §4 「Windows 실기 수동 체크리스트」
->  수동 행이 그 몫이다. CI 초록을 그 분절의 증거로 읽지 마라)
+>  수동 행이 그 몫이다. CI 초록을 그 분절의 증거로 읽지 마라. ★windows-build.yml 은
+>  **태그 push 에 자동 트리거되지 않는다**(트리거=feat/windows-x64-dist push+workflow_dispatch
+>  한정) — 릴리스 SHA 에서 **수동 dispatch** 로 돌려 green 을 받아라. 이전 런의 초록은
+>  릴리스 증거가 아니다)
 > ⑤릴리스 자산·`latest.json`(tauri v2 — darwin-aarch64·darwin-x86_64·windows-x86_64 3키) 실측 확인.
 > Windows 인스톨러는 **NSIS**다(`src-tauri/tauri.windows.conf.json targets:["nsis"]`) — 아래 §2·부록의
 > 수동 MSI/WiX 경로는 **legacy(폐기·참고용)**이며 따르지 마라.
