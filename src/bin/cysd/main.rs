@@ -106,7 +106,9 @@ pub(crate) struct SweepStats {
     pub removed: usize,
     /// 삭제 실패 → 격리함으로 rename 성공(홀더 생존 · runtime 트리에서는 사라짐).
     pub quarantined: usize,
-    /// 삭제도 격리도 실패 — **유일하게 잔존하는 경우**. 반드시 loud 로그.
+    /// 삭제도 격리도 실패 — **살아있는 설치 트리에 잔해가 그대로 남는 유일한 경우**.
+    /// 격리함 **안**의 미회수분은 여기에 섞이지 않는다(그건 `TrashBoundStats::remaining`).
+    /// 이 값이 0 이 아니면 봉쇄 자체가 실패한 것이므로 **무조건 loud**.
     pub stuck: usize,
 }
 
@@ -115,6 +117,12 @@ pub(crate) struct SweepStats {
 /// `remove`·`relocate` 를 주입받는 이유는 Windows 전용 실패 분기(=매핑된 이미지 삭제 거부)를
 /// 다른 OS 의 단위 테스트에서 결정론으로 재현하기 위함이다(실기기 재현 불가 경로의 박제).
 /// 디렉토리는 삭제 대상이 아니다(설치기는 파일만 rename 한다) — 재귀만 한다.
+///
+/// ★격리함(`trash`)은 **통째로 건너뛴다** — 소유자가 하나여야 계수가 정직해진다.
+///   격리함 안의 회수(=삭제 재시도)·유계·승격은 전부 `bound_update_trash` 가 진다.
+///   종전에는 스윕이 격리함 안에서도 삭제를 시도하고 실패분을 `stuck` 에 섞었는데, 그 탓에
+///   "봉쇄 실패(살아있는 트리에 잔해 잔존)"와 "봉쇄 성공 후 정상 대기"가 같은 계수로 합쳐져
+///   같은 ⚠ 경고를 냈다 — 조치할 것이 없는데 부팅마다 울리는 오탐 배너 클래스의 재발이다.
 #[cfg(any(windows, test))]
 pub(crate) fn sweep_update_leftovers(
     dir: &std::path::Path,
@@ -131,10 +139,13 @@ pub(crate) fn sweep_update_leftovers(
     let Ok(entries) = std::fs::read_dir(dir) else {
         return; // 권한·경로 문제로 못 읽는 서브트리는 종전과 동일하게 통째 skip
     };
-    let in_trash = dir == trash;
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
+            // 격리함 서브트리는 재귀조차 하지 않는다 — 재격리(무한 이동)·이중 삭제 시도 원천 차단.
+            if p == trash {
+                continue;
+            }
             sweep_update_leftovers(&p, depth - 1, trash, stamp, remove, relocate, stats);
             continue;
         }
@@ -148,9 +159,7 @@ pub(crate) fn sweep_update_leftovers(
             stats.removed += 1;
             continue;
         }
-        // 격리함 **안**에서는 재격리하지 않는다(무한 이동 차단) — 여기 남은 것은 여전히 매핑 중이며
-        // 이미 runtime 트리 밖이므로 다음 부트를 기다리면 된다.
-        if in_trash || stats.quarantined >= MAX_QUARANTINE_PER_BOOT {
+        if stats.quarantined >= MAX_QUARANTINE_PER_BOOT {
             stats.stuck += 1;
             continue;
         }
@@ -161,6 +170,274 @@ pub(crate) fn sweep_update_leftovers(
             stats.stuck += 1;
         }
     }
+}
+
+// ── 격리함 유계(bound) 정책 ────────────────────────────────────────────────────
+//
+// 격리는 runtime 트리를 결정론적으로 비우지만, **홀더가 끝내 죽지 않는 세션**에서 업데이트가
+// 반복되면 매 세대의 잔해가 격리함에 새로 쌓인다(같은 이름이 아니라 매번 새 파일 오브젝트다).
+// 회수의 유일한 기전은 "홀더가 죽은 뒤의 삭제"이고 그건 우리가 앞당길 수 없으므로, 유계 장치는
+// ①회수 가능한 것은 매 부트 전량 회수하고 ②회수 불가분을 **계산에서 빼지 않고** 그대로 세어
+// ③상한을 넘는 순간 사람에게 소리내어 알리는 것으로 성립한다. 상한 초과를 조용히 삼키면
+// 무한 성장이 은폐된다 — 그것이 이 장치가 막는 실패다.
+//
+// ★안전 경계(오너 앵커 ④): 이 장치는 **우리가 만든 격리함 한 디렉토리의, 우리가 붙인 이름
+//   규칙에 맞는 정규 파일**만 만진다. 재귀하지 않고(격리는 항상 격리함 루트에 평평하게 놓는다),
+//   디렉토리·심볼릭링크는 건드리지 않으며, 격리함 밖으로는 어떤 삭제도 넓히지 않는다.
+
+/// **나이 상한 14일.** 격리본이 남아있다는 것은 그 파일 오브젝트를 매핑한 홀더가 아직 살아있다는
+/// 뜻이다(홀더가 죽으면 다음 부트의 회수가 즉시 지운다). 데스크톱 세션이 재부팅 없이 2주를
+/// 넘겨 같은 이미지를 붙들고 있는 것은 정상 범위 밖이므로, 14일을 넘긴 격리본은 "홀더 문제가
+/// 아닌 다른 원인(권한·ACL·백신 잠금)" 신호로 보고 승격 사유로 삼는다.
+#[cfg(any(windows, test))]
+pub(crate) const TRASH_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// **개수 상한 64.** 한 업데이트 세대가 남기는 잔해는 루트 체인 3칸 + unlock-sweep 이 훑는
+/// runtime 이미지 몇 개 규모다(T4-6 실측 9개). 64 는 그런 세대가 일곱 번 누적되도록 **한 번도**
+/// 회수되지 않은 상태 — "정상 대기 중"이라는 설명이 더는 성립하지 않는 지점이다.
+/// ※ 이 축이 재는 것은 세대 수가 아니라 **현재 점유**다. 한 번의 병리적 업데이트가 단숨에
+///   64 를 넘겨도 발화하는데, 그것도 정당한 신호다(잠긴 이미지 64개 이상은 그 자체로 이상).
+///   홀더가 죽으면 다음 부트의 회수로 0 에 수렴하며 경고도 함께 사라진다 — 자기해소형 경고다.
+#[cfg(any(windows, test))]
+pub(crate) const TRASH_MAX_ENTRIES: usize = 64;
+
+/// **총 바이트 상한 512 MiB.** 격리 대상의 대종은 runtime PE 이미지(msys-2.0.dll·python313.dll·
+/// bash.exe 등 수 MB 단위)다. 개수 상한과 **독립**으로 두는 이유는 소수의 거대 파일이 개수
+/// 상한을 우회하는 경로를 막기 위함이고, 512 MiB 는 사용자가 디스크 압박을 체감하기 시작하는
+/// 규모다.
+#[cfg(any(windows, test))]
+pub(crate) const TRASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// **한 부트의 회수 시도 예산 2000건.** 병리적으로 커진 격리함에서 부트가 길어지지 않게 한다.
+/// 예산은 **오래된 것부터** 쓰고(정렬이 여기서 load-bearing 이다), 예산 밖 항목도 잔존 계수·
+/// 바이트에는 **그대로 포함**한다 — 안 세면 무한 성장이 숨는다.
+/// 한 부트의 격리 상한(`MAX_QUARANTINE_PER_BOOT` = 500)보다 크게 잡아, 직전 부트가 최대로
+/// 격리한 뒤라도 다음 부트가 그 전량에 회수를 시도할 수 있게 한다(예산이 병목이 되지 않는다).
+#[cfg(any(windows, test))]
+pub(crate) const TRASH_MAX_RECLAIM_PER_BOOT: usize = 2_000;
+
+/// 격리함 유계 패스의 계수 — 로그 등급 판정과 테스트 핀의 관측 지점.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrashBoundStats {
+    /// 삭제 성공 = 회수 완료(홀더 사망). 격리함이 줄어드는 **유일한** 경로.
+    pub reclaimed: usize,
+    /// 패스 종료 후 격리함에 남은 항목 수 — 회수 실패분·예산 밖 항목을 **전부 포함**한다.
+    pub remaining: usize,
+    /// 남은 항목의 총 바이트.
+    pub remaining_bytes: u64,
+    /// 나이 상한(`TRASH_MAX_AGE_SECS`) 초과인데 회수도 못한 항목 수 — 승격 사유.
+    pub aged_stuck: usize,
+    /// 회수 시도 예산(`TRASH_MAX_RECLAIM_PER_BOOT`)을 넘겨 이번 부트에 손대지 못한 항목 수.
+    pub deferred: usize,
+}
+
+#[cfg(any(windows, test))]
+impl TrashBoundStats {
+    /// 평시(=정상 대기) 대 이상(=사람이 봐야 함)의 판정. **이 함수 하나가 경고 등급의 정의처다.**
+    ///
+    /// 격리함 안의 미회수분은 그 자체로는 이상이 아니다 — 봉쇄가 성공했고 홀더가 죽기를 기다리는
+    /// 설계된 상태이며, 사용자가 취할 조치가 없다. 조치할 것이 없는데 부팅마다 ⚠ 를 띄우면
+    /// 경고의 신호가치가 죽는다. 그래서 승격은 **유계가 깨졌을 때만** 한다:
+    ///   ① 개수 상한 초과 ② 총 바이트 상한 초과 ③ 나이 상한 초과 미회수분 존재.
+    /// 셋 다 실측 가능한 축이고, 셋 중 하나라도 참이면 "대기"로는 설명되지 않는 상태다.
+    pub fn over_bound(&self) -> bool {
+        self.remaining > TRASH_MAX_ENTRIES
+            || self.remaining_bytes > TRASH_MAX_BYTES
+            || self.aged_stuck > 0
+    }
+}
+
+/// 격리함을 회수·유계한다. 스윕 **뒤**에 돌아야 이번 부트에 새로 격리된 것까지 계산에 든다.
+///
+/// 계약:
+/// - 대상은 `trash` **직속**의 정규 파일 중 `is_update_leftover` 를 만족하는 이름뿐이다
+///   (격리본은 `quarantine_file_name` 계약상 항상 이 규칙을 만족한다 — 회귀 핀 있음).
+///   규칙 밖 파일·디렉토리·심볼릭링크는 **읽지도 지우지도 않는다**.
+/// - 오래된 것부터 처리한다. 예산이 모자라면 오래된 쪽이 먼저 회수되고 새 쪽이 다음 부트로 밀린다.
+/// - 삭제 실패·예산 밖 항목은 `remaining`/`remaining_bytes` 에 그대로 남는다(성장 은폐 금지).
+/// - "나이 초과분 강제 삭제 시도"는 별도 분기가 아니라 **전건 시도의 부분집합**이다 — 매 부트
+///   모든 항목에 삭제를 시도하므로 나이 초과분은 반드시 시도된다. 나이 축은 그 시도가 **실패**
+///   했을 때의 등급(승격)을 정한다.
+#[cfg(any(windows, test))]
+pub(crate) fn bound_update_trash(
+    trash: &std::path::Path,
+    now_secs: u64,
+    remove: &mut dyn FnMut(&std::path::Path) -> bool,
+    stats: &mut TrashBoundStats,
+) {
+    // ★격리함은 **우리가 만든 실제 디렉토리**여야 한다. 심볼릭링크·정션이면 삭제가 링크 너머의
+    //   남의 트리로 새어나간다(오너 앵커 ④ — 살아있는 파일 삭제 금지). symlink_metadata 는 링크를
+    //   따라가지 않으므로 여기서 정확히 갈린다. 링크면 회수를 포기한다 —
+    //   "못 지우고 남는 것"은 다음 부트가 재시도할 수 있지만, "잘못 지운 것"은 되돌릴 수 없다.
+    if !std::fs::symlink_metadata(trash).is_ok_and(|m| m.file_type().is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(trash) else {
+        return; // 격리함 없음 = 유계 대상 없음(정상 · 대다수 부트가 여기)
+    };
+    // (mtime, size, path). DirEntry::metadata 는 심볼릭링크를 따라가지 않는다 — 링크는 is_file
+    // 이 false 가 되어 여기서 탈락한다(링크 너머의 살아있는 파일을 지우는 경로 차단).
+    let mut items: Vec<(u64, u64, std::path::PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_update_leftover(name) {
+            continue; // 우리가 만든 이름이 아니면 남의 파일이다 — 무접촉
+        }
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(now_secs); // mtime 을 못 읽으면 '방금'으로 간주 = 나이 승격 대상 아님(보수적)
+        items.push((mtime, md.len(), p));
+    }
+    // 오래된 것부터. 동률은 경로로 깨서 부트 간 순서를 결정론으로 고정한다.
+    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+
+    for (i, (mtime, size, p)) in items.iter().enumerate() {
+        if i >= TRASH_MAX_RECLAIM_PER_BOOT {
+            // 예산 소진 — 시도는 못 해도 **계수에는 남긴다**.
+            stats.deferred += 1;
+            stats.remaining += 1;
+            stats.remaining_bytes = stats.remaining_bytes.saturating_add(*size);
+            continue;
+        }
+        if remove(p) {
+            stats.reclaimed += 1;
+            continue;
+        }
+        stats.remaining += 1;
+        stats.remaining_bytes = stats.remaining_bytes.saturating_add(*size);
+        if now_secs.saturating_sub(*mtime) > TRASH_MAX_AGE_SECS {
+            stats.aged_stuck += 1;
+        }
+    }
+}
+
+/// 부트 1회의 잔해 유지보수 전체 — 스윕(설치 트리 → 격리함) → 유계(격리함 회수·상한) → 로그.
+///
+/// ★`main()` 의 `#[cfg(windows)]` 블록에는 **이 함수 호출 한 줄만** 남긴다. 실동작 전량을
+/// `cfg(any(windows, test))` 로 끌어올린 이유는 컴파일 커버리지다 — 종전에는 호출·정책·포맷이
+/// 전부 `cfg(windows)` 안에 있어 macOS·Linux 의 `cargo test --bin cysd` 로는 **컴파일조차 되지
+/// 않았고**, Windows CI 는 `--bin cysd` 를 돌리지 않는다(release.yml 은 ubuntu/macOS 레인).
+/// 즉 이 경로는 어느 레인에서도 타입체크되지 않는 사각지대였다. 이제 타 OS 의 단위 테스트가
+/// 같은 코드를 컴파일하고 파일시스템 동작까지 실제로 돌린다.
+///
+/// 반환값은 호출자가 그대로 stderr 로 흘리는 로그 줄이다(등급은 진단·테스트용).
+#[cfg(any(windows, test))]
+pub(crate) fn run_update_leftover_maintenance(
+    dir: &std::path::Path,
+    now_secs: u64,
+) -> Vec<(LeftoverLog, String)> {
+    let trash = dir.join(UPDATE_TRASH_DIR);
+    let mut remove = |p: &std::path::Path| std::fs::remove_file(p).is_ok();
+    let mut relocate = |src: &std::path::Path, dest: &std::path::Path| {
+        dest.parent()
+            .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::rename(src, dest).is_ok()
+    };
+    let mut sweep = SweepStats::default();
+    sweep_update_leftovers(
+        dir,
+        12,
+        &trash,
+        now_secs,
+        &mut remove,
+        &mut relocate,
+        &mut sweep,
+    );
+    // 격리함 회수·유계는 스윕 **뒤**에 — 이번 부트에 새로 격리된 것까지 계산에 들어가야 한다.
+    let mut bound = TrashBoundStats::default();
+    bound_update_trash(&trash, now_secs, &mut remove, &mut bound);
+    // 격리함이 비었으면 흔적을 남기지 않는다(빈 디렉토리 제거 — 비어있지 않으면 실패=no-op).
+    let _ = std::fs::remove_dir(&trash);
+    leftover_log_lines(&sweep, &bound, &trash)
+}
+
+/// 로그 등급. `Loud` 만이 사용자에게 "봐야 할 것이 있다"고 말한다.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeftoverLog {
+    /// 관측 기록 — 사후 진단용. 조치 불요.
+    Info,
+    /// ⚠ — 사람이 봐야 하는 이상. **아껴 쓴다**(남발하면 경고의 신호가치가 죽는다).
+    Loud,
+}
+
+/// 부트 1회의 잔해 처리 결과를 로그 줄로 환원한다(순수 · 회귀 핀).
+///
+/// ★이 함수가 **경고 등급의 유일한 결정처**다. 종전에는 등급 판정이 `#[cfg(windows)]` 블록
+/// 안에만 있어서 macOS·Linux 의 `cargo test` 로는 컴파일조차 되지 않았다 — 정책이 테스트
+/// 사각지대에 갇혀 있었다는 뜻이다. 순수 함수로 끌어내 등급 자체를 박제한다.
+#[cfg(any(windows, test))]
+pub(crate) fn leftover_log_lines(
+    sweep: &SweepStats,
+    bound: &TrashBoundStats,
+    trash: &std::path::Path,
+) -> Vec<(LeftoverLog, String)> {
+    let mut out = Vec::new();
+    // ① info — 이번 부트에 무슨 일이 있었는지 + 격리함의 현재 점유. 격리함에 남은 것은 평시엔
+    //    **정상 대기**(봉쇄 성공 · 홀더가 죽기를 기다리는 설계된 상태 · 사용자 조치 불요)이므로
+    //    여기까지만 말한다. 아무 일도 없었으면 한 줄도 내지 않는다.
+    if sweep.removed + sweep.quarantined + sweep.stuck + bound.reclaimed + bound.remaining > 0 {
+        let deferred = if bound.deferred > 0 {
+            format!(", {} deferred", bound.deferred)
+        } else {
+            String::new()
+        };
+        out.push((
+            LeftoverLog::Info,
+            format!(
+                "[cysd] update leftovers: removed={} quarantined={} stuck={} · trash: reclaimed={} pending={} ({} KiB{}) at {}",
+                sweep.removed,
+                sweep.quarantined,
+                sweep.stuck,
+                bound.reclaimed,
+                bound.remaining,
+                bound.remaining_bytes / 1024,
+                deferred,
+                trash.display()
+            ),
+        ));
+    }
+    // ② loud — 삭제도 격리도 실패 = **살아있는 설치 트리에 잔해가 그대로 남았다**(봉쇄 실패).
+    //    등급 강등 대상이 아니다. 종전 코드는 삭제 실패를 무음 스킵해 "청소가 됐는지"를 로그만으로
+    //    판정할 수 없었다(T4-6 진단 난항의 원인) — 침묵 금지.
+    if sweep.stuck > 0 {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 업데이트 잔해 {}개 회수 불가(삭제·격리 모두 실패) — 다음 기동이 재시도한다",
+                sweep.stuck
+            ),
+        ));
+    }
+    // ③ loud — 격리함이 유계를 벗어났다. **여기까지 와야** 사람이 볼 값어치가 있다
+    //    (상한·근거는 TRASH_MAX_* 상수 주석 · 판정처는 TrashBoundStats::over_bound).
+    if bound.over_bound() {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 격리함 유계 이탈: {}개/{} MiB 미회수(상한 {}개/{} MiB), 나이초과 미회수 {}개 — \
+                 오래 열어둔 세션(터미널·셸)을 닫고 재기동하면 회수된다. 계속되면 {} 를 확인하라",
+                bound.remaining,
+                bound.remaining_bytes / (1024 * 1024),
+                TRASH_MAX_ENTRIES,
+                TRASH_MAX_BYTES / (1024 * 1024),
+                bound.aged_stuck,
+                trash.display()
+            ),
+        ));
+    }
+    out
 }
 
 /// Claude Code 세션 안에서 spawn된 데몬이 그 세션의 정체성 env를 PTY 자식들에게
@@ -280,37 +557,12 @@ async fn async_main() {
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let trash = dir.join(UPDATE_TRASH_DIR);
-            let stamp = std::time::SystemTime::now()
+            let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut stats = SweepStats::default();
-            let mut remove = |p: &std::path::Path| std::fs::remove_file(p).is_ok();
-            let mut relocate = |src: &std::path::Path, dest: &std::path::Path| {
-                dest.parent()
-                    .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-                    && std::fs::rename(src, dest).is_ok()
-            };
-            sweep_update_leftovers(dir, 12, &trash, stamp, &mut remove, &mut relocate, &mut stats);
-            // 격리함이 비었으면 흔적을 남기지 않는다(빈 디렉토리 제거 — 비어있지 않으면 실패=no-op).
-            let _ = std::fs::remove_dir(&trash);
-            if stats.removed + stats.quarantined + stats.stuck > 0 {
-                eprintln!(
-                    "[cysd] update leftovers: removed={} quarantined={} stuck={} (trash={})",
-                    stats.removed,
-                    stats.quarantined,
-                    stats.stuck,
-                    trash.display()
-                );
-            }
-            // ★침묵 금지: 삭제도 격리도 실패한 잔해는 **소리내어** 남긴다. 종전 코드는 삭제 실패를
-            // 무음 스킵해 "청소가 됐는지"를 로그만으로 판정할 수 없었다(이번 T4-6 진단 난항의 원인).
-            if stats.stuck > 0 {
-                eprintln!(
-                    "[cysd] ⚠ 업데이트 잔해 {}개 회수 불가(삭제·격리 모두 실패) — 다음 기동이 재시도한다",
-                    stats.stuck
-                );
+            for (_, line) in run_update_leftover_maintenance(dir, now) {
+                eprintln!("{line}");
             }
         }
     }
@@ -3447,8 +3699,10 @@ mod first_line_idle_tests {
 #[cfg(test)]
 mod update_leftover_sweep_tests {
     use super::{
-        is_update_leftover, quarantine_file_name, sweep_update_leftovers, SweepStats,
-        UPDATE_TRASH_DIR,
+        bound_update_trash, is_update_leftover, leftover_log_lines, quarantine_file_name,
+        run_update_leftover_maintenance, sweep_update_leftovers, LeftoverLog, SweepStats,
+        TrashBoundStats, TRASH_MAX_AGE_SECS, TRASH_MAX_BYTES, TRASH_MAX_ENTRIES,
+        TRASH_MAX_RECLAIM_PER_BOOT, UPDATE_TRASH_DIR,
     };
     use std::path::{Path, PathBuf};
 
@@ -3467,6 +3721,19 @@ mod update_leftover_sweep_tests {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, b"x").unwrap();
     }
+
+    /// 크기·mtime 을 지정해 파일을 만든다 — 유계 3축(개수·나이·바이트)을 결정론으로 재현하기 위함.
+    /// `File::set_modified`(std · 1.75+)를 쓰므로 외부 크레이트·플랫폼 분기가 필요 없다.
+    fn touch_at(p: &Path, mtime_secs: u64, size: usize) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![b'x'; size]).unwrap();
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs))
+            .unwrap();
+    }
+
+    /// 테스트 기준시각 — 실기 시계와 무관하게 나이 축을 계산하기 위한 고정점(2026-08-26).
+    const T0: u64 = 1_756_200_000;
 
     fn real_remove(p: &Path) -> bool {
         std::fs::remove_file(p).is_ok()
@@ -3588,15 +3855,19 @@ mod update_leftover_sweep_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// ⑤ 격리함 안에서는 재격리하지 않는다(무한 이동·이름 폭주 차단) — 여전히 잠긴 격리본은 stuck.
+    /// ⑤ 스윕은 격리함 서브트리를 **통째로 건너뛴다** — 재격리(무한 이동)도, 삭제 시도도 없다.
+    ///    소유자를 하나로 못박는 핀: 격리함 안의 회수·유계·등급은 `bound_update_trash` 전담이고,
+    ///    그래야 `SweepStats::stuck` 이 "살아있는 트리의 봉쇄 실패" 하나만 뜻하게 된다.
     #[test]
-    fn sweep_never_requarantines_inside_trash() {
+    fn sweep_never_touches_trash_subtree() {
         let root = workdir("trash");
         let trash = root.join(UPDATE_TRASH_DIR);
-        touch(&trash.join("msys-2.0.dll.prev4213.prev1756200000000"));
+        let held = trash.join("msys-2.0.dll.prev4213.prev1756200000000");
+        touch(&held);
+        touch(&trash.join("nested/deep.prev7")); // 격리함 하위 디렉토리도 재귀 금지
 
         let mut stats = SweepStats::default();
-        let mut never_removes = |_: &Path| false;
+        let mut remove_must_not_run = |p: &Path| panic!("격리함 안의 파일을 삭제하려 했다: {p:?}");
         let mut relocate_must_not_run = |_: &Path, _: &Path| {
             panic!("격리함 안의 파일을 다시 격리하려 했다");
         };
@@ -3605,11 +3876,13 @@ mod update_leftover_sweep_tests {
             12,
             &trash,
             1,
-            &mut never_removes,
+            &mut remove_must_not_run,
             &mut relocate_must_not_run,
             &mut stats,
         );
-        assert_eq!(stats, SweepStats { removed: 0, quarantined: 0, stuck: 1 });
+        assert_eq!(stats, SweepStats::default(), "격리함이 스윕 계수에 섞였다");
+        assert!(held.exists(), "격리함 파일이 사라졌다");
+        assert!(trash.join("nested/deep.prev7").exists(), "격리함 하위로 재귀했다");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3631,6 +3904,358 @@ mod update_leftover_sweep_tests {
         );
         assert_eq!(stats, SweepStats::default(), "깊이 상한을 넘어 순회했다");
         assert!(root.join("a/b/deep.prev1").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 격리함 유계·경고 등급 핀 ────────────────────────────────────────────────
+    // 마감 ①(경고 등급)·②(유계)의 계약을 박제한다. 등급 판정의 정의처는 `over_bound()` 하나이므로
+    // 임계 3축은 순수 함수로 진리표를 박고, 파일시스템 축(회수·정렬·예산·무접촉)은 실제 디렉토리로 건다.
+
+    /// ⑦ **등급의 정의처** — 격리함에 남은 것은 평시엔 경고가 아니다(조치 불요 = ⚠ 금지).
+    ///    승격은 세 축(개수·바이트·나이) 중 하나가 깨졌을 때만. 상한 **경계값**까지 조용해야 한다.
+    #[test]
+    fn trash_bound_predicate_escalates_only_past_a_threshold() {
+        let quiet = |remaining: usize, bytes: u64, aged: usize| TrashBoundStats {
+            reclaimed: 0,
+            remaining,
+            remaining_bytes: bytes,
+            aged_stuck: aged,
+            deferred: 0,
+        };
+        // 평시: T4-6 이 실제로 본 9개 대기 — 봉쇄 성공 후의 설계된 상태다.
+        assert!(!quiet(9, 9 * 4 * 1024 * 1024, 0).over_bound(), "정상 대기를 경고로 올렸다");
+        // 경계: 상한 '도달'은 아직 조용, '초과'부터 시끄럽다(off-by-one 고정).
+        assert!(!quiet(TRASH_MAX_ENTRIES, 0, 0).over_bound(), "개수 상한 경계에서 조기 발화했다");
+        assert!(quiet(TRASH_MAX_ENTRIES + 1, 0, 0).over_bound(), "개수 상한 초과를 삼켰다");
+        assert!(!quiet(1, TRASH_MAX_BYTES, 0).over_bound(), "바이트 상한 경계에서 조기 발화했다");
+        assert!(quiet(1, TRASH_MAX_BYTES + 1, 0).over_bound(), "바이트 상한 초과를 삼켰다");
+        // 나이 축은 개수·바이트가 아무리 작아도 단독으로 승격시킨다(홀더 문제가 아닌 다른 원인 신호).
+        assert!(quiet(1, 1, 1).over_bound(), "나이 초과 미회수를 삼켰다");
+        assert!(!TrashBoundStats::default().over_bound(), "빈 격리함이 경고를 냈다");
+    }
+
+    /// ⑧ 평시 경로(파일시스템) — 홀더 생존으로 전건 회수 실패해도, 상한 아래면 승격하지 않는다.
+    ///    T5 가 실제로 낸 `stuck=9` 가 바로 이 상태였다(경고가 아니라 대기).
+    #[test]
+    fn trash_pending_under_bound_is_not_a_warning() {
+        let trash = workdir("bound-quiet");
+        for i in 0..9 {
+            touch_at(&trash.join(format!("msys-2.0.dll.prev{i}")), T0 - 60, 1024);
+        }
+        let mut stats = TrashBoundStats::default();
+        let mut never_removes = |_: &Path| false;
+        bound_update_trash(&trash, T0, &mut never_removes, &mut stats);
+
+        assert_eq!(stats.remaining, 9, "잔존 계수가 실제 점유와 다르다");
+        assert_eq!(stats.remaining_bytes, 9 * 1024, "바이트 계수가 실제 점유와 다르다");
+        assert_eq!(stats.aged_stuck, 0);
+        assert!(!stats.over_bound(), "평시 대기에 ⚠ 를 달았다(오탐 배너 재발)");
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    /// ⑨ 나이 축 — 상한을 넘긴 미회수분은 단독으로 승격한다. 경계 바로 아래는 조용.
+    #[test]
+    fn trash_aged_stuck_escalates_at_the_age_threshold() {
+        let trash = workdir("bound-age");
+        let old = T0 - TRASH_MAX_AGE_SECS - 1;
+        touch_at(&trash.join("python313.dll.prev1"), old, 8);
+        touch_at(&trash.join("bash.exe.prev2"), T0 - TRASH_MAX_AGE_SECS, 8); // 경계 = 아직 아님
+
+        let mut stats = TrashBoundStats::default();
+        let mut never_removes = |_: &Path| false;
+        bound_update_trash(&trash, T0, &mut never_removes, &mut stats);
+
+        assert_eq!(stats.remaining, 2);
+        assert_eq!(stats.aged_stuck, 1, "나이 경계 판정이 어긋났다(초과분만 1건이어야 한다)");
+        assert!(stats.over_bound(), "나이 초과 미회수가 조용히 넘어갔다");
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    /// ⑩ 회수 — 홀더가 죽은 것만 지워지고, 남은 것은 계수·바이트에 **그대로** 남는다.
+    ///    (삭제 실패분을 계산에서 빼면 무한 성장이 은폐된다 — 이 장치가 막는 실패.)
+    #[test]
+    fn trash_reclaims_dead_holders_and_still_counts_the_survivors() {
+        let trash = workdir("bound-reclaim");
+        touch_at(&trash.join("a.dll.prev1"), T0 - 10, 100); // 홀더 사망 → 회수
+        touch_at(&trash.join("b.dll.prev2"), T0 - 10, 200); // 홀더 생존 → 잔존
+        touch_at(&trash.join("c.dll.prev3"), T0 - 10, 400); // 홀더 사망 → 회수
+
+        let mut stats = TrashBoundStats::default();
+        let mut selective = |p: &Path| {
+            let held = p.file_name().and_then(|n| n.to_str()) == Some("b.dll.prev2");
+            !held && std::fs::remove_file(p).is_ok()
+        };
+        bound_update_trash(&trash, T0, &mut selective, &mut stats);
+
+        assert_eq!(stats.reclaimed, 2);
+        assert_eq!(stats.remaining, 1);
+        assert_eq!(stats.remaining_bytes, 200, "잔존 바이트가 생존자만 세지 않았다");
+        assert!(!trash.join("a.dll.prev1").exists());
+        assert!(trash.join("b.dll.prev2").exists(), "잠긴 격리본을 지운 척했다");
+        assert!(!trash.join("c.dll.prev3").exists());
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    /// ⑪ 정렬 — 처리는 **가장 오래된 것부터**다. 회수 예산이 모자랄 때 오래된 쪽이 먼저 비워지는
+    ///    성질이 여기에 걸린다(예산이 없으면 정렬은 관측 불가한 내부 사정이 된다).
+    #[test]
+    fn trash_processes_oldest_first() {
+        let trash = workdir("bound-order");
+        // 생성 순서를 나이 순서와 **반대로** 둔다 — read_dir 순서에 기대는 구현이면 여기서 깨진다.
+        touch_at(&trash.join("newest.dll.prev3"), T0 - 10, 8);
+        touch_at(&trash.join("oldest.dll.prev1"), T0 - 3000, 8);
+        touch_at(&trash.join("middle.dll.prev2"), T0 - 300, 8);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut record = |p: &Path| {
+            seen.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            false
+        };
+        let mut stats = TrashBoundStats::default();
+        bound_update_trash(&trash, T0, &mut record, &mut stats);
+
+        assert_eq!(
+            seen,
+            vec!["oldest.dll.prev1", "middle.dll.prev2", "newest.dll.prev3"],
+            "오래된 것부터 돌지 않았다"
+        );
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    /// ⑫ 예산 — 한 부트의 회수 시도는 상한이 있고, 그 예산은 **오래된 것부터** 쓴다.
+    ///    ★예산 밖으로 밀린 항목도 `remaining`/`remaining_bytes` 에 **반드시** 포함된다
+    ///    (안 세면 격리함이 조용히 무한히 자란다 — 은폐 금지).
+    #[test]
+    fn trash_reclaim_budget_defers_newest_but_never_hides_them() {
+        let trash = workdir("bound-budget");
+        let over = 5usize;
+        let total = TRASH_MAX_RECLAIM_PER_BOOT + over;
+        for i in 0..total {
+            // i 가 클수록 새 파일. 이름은 정렬 tie-break 이 아니라 mtime 으로 갈리게 한다.
+            touch_at(&trash.join(format!("img{i:05}.dll.prev1")), T0 - (total - i) as u64, 4);
+        }
+        let mut attempts = 0usize;
+        let mut newest_touched = false;
+        let mut record = |p: &Path| {
+            attempts += 1;
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            if n == format!("img{:05}.dll.prev1", total - 1) {
+                newest_touched = true;
+            }
+            false
+        };
+        let mut stats = TrashBoundStats::default();
+        bound_update_trash(&trash, T0, &mut record, &mut stats);
+
+        assert_eq!(attempts, TRASH_MAX_RECLAIM_PER_BOOT, "부트 예산을 넘겨 시도했다");
+        assert!(!newest_touched, "예산을 새 파일부터 썼다(오래된 것부터가 아니다)");
+        assert_eq!(stats.deferred, over);
+        assert_eq!(stats.remaining, total, "예산 밖 항목이 잔존 계수에서 빠졌다(무한 성장 은폐)");
+        assert_eq!(stats.remaining_bytes, (total * 4) as u64);
+        assert!(stats.over_bound(), "상한을 한참 넘겼는데 조용했다");
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    /// ⑬ ★음성 대조(오너 앵커 ④) — 유계 장치는 **격리함 안의, 우리가 붙인 이름**만 만진다.
+    ///    남의 파일·디렉토리·심볼릭링크·격리함 밖은 어떤 경로로도 삭제되지 않는다.
+    #[test]
+    fn trash_bound_never_reaches_outside_its_own_names() {
+        let root = workdir("bound-safety");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        // 격리함 **안**: 우리 이름 1건(회수 대상) + 남의 파일 2건 + 디렉토리 1건
+        touch_at(&trash.join("ours.dll.prev1"), T0 - 10, 8);
+        touch_at(&trash.join("notes.preview.png"), T0 - 10, 8);
+        touch_at(&trash.join("README.txt"), T0 - 10, 8);
+        std::fs::create_dir_all(trash.join("subdir.prev9")).unwrap();
+        // 격리함 **밖**: 잔해 이름이어도 bound 는 읽지도 않는다(스윕의 관할이다).
+        touch_at(&root.join("outside.dll.prev1"), T0 - 10, 8);
+        touch_at(&root.join("runtime/live.exe"), T0 - 10, 8);
+        // 심볼릭링크: 링크 너머의 살아있는 파일로 삭제가 새는 경로 차단.
+        #[cfg(unix)]
+        {
+            let victim = root.join("runtime/live.exe");
+            std::os::unix::fs::symlink(&victim, trash.join("link.dll.prev2")).unwrap();
+        }
+
+        let mut stats = TrashBoundStats::default();
+        let mut real = |p: &Path| std::fs::remove_file(p).is_ok();
+        bound_update_trash(&trash, T0, &mut real, &mut stats);
+
+        assert_eq!(stats.reclaimed, 1, "우리 격리본 1건만 회수돼야 한다");
+        assert!(!trash.join("ours.dll.prev1").exists());
+        for keep in [
+            trash.join("notes.preview.png"),
+            trash.join("README.txt"),
+            root.join("outside.dll.prev1"),
+            root.join("runtime/live.exe"),
+        ] {
+            assert!(keep.exists(), "만지면 안 되는 파일을 지웠다: {keep:?}");
+        }
+        assert!(trash.join("subdir.prev9").is_dir(), "격리함 안 디렉토리를 지웠다");
+        #[cfg(unix)]
+        {
+            assert!(
+                trash.join("link.dll.prev2").symlink_metadata().is_ok(),
+                "심볼릭링크를 삭제 대상으로 삼았다"
+            );
+            assert!(root.join("runtime/live.exe").exists(), "링크 너머로 삭제가 샜다");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑬-b 격리함 **자신**이 심볼릭링크면 회수를 통째로 포기한다 — 삭제가 링크 너머 남의 트리로
+    ///      새는 경로 차단. 못 지우고 남는 것은 다음 부트가 재시도하지만, 잘못 지운 것은 못 되돌린다.
+    #[cfg(unix)]
+    #[test]
+    fn trash_that_is_a_symlink_is_refused_outright() {
+        let root = workdir("bound-symlink-trash");
+        let victim_dir = root.join("someone-elses");
+        touch_at(&victim_dir.join("their.dll.prev1"), T0 - 10, 8);
+        let trash = root.join(UPDATE_TRASH_DIR);
+        std::os::unix::fs::symlink(&victim_dir, &trash).unwrap();
+
+        let mut stats = TrashBoundStats::default();
+        let mut must_not_run = |p: &Path| panic!("링크 너머 파일을 삭제하려 했다: {p:?}");
+        bound_update_trash(&trash, T0, &mut must_not_run, &mut stats);
+
+        assert_eq!(stats, TrashBoundStats::default(), "링크 격리함을 처리했다");
+        assert!(victim_dir.join("their.dll.prev1").exists(), "링크 너머로 삭제가 샜다");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑭ 부트 파이프라인 전체(스윕 → 유계) — main() 의 호출 순서를 그대로 재현한 통합 핀.
+    ///    홀더 전건 생존 시: 설치 트리 잔해 0(봉쇄 성공·`stuck=0`) + 격리함 대기 + **조용**.
+    #[test]
+    fn boot_pipeline_quarantines_then_bounds_and_stays_quiet_when_healthy() {
+        let root = workdir("bound-pipeline");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        touch(&root.join("cysd.prev.exe"));
+        touch(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"));
+        touch(&root.join("runtime/python/notes.preview.png")); // 사용자 파일 — 불가침
+        touch(&root.join("runtime/git/usr/bin/bash.exe")); // 살아있는 바이너리 — 불가침
+
+        let mut sweep = SweepStats::default();
+        let mut never_removes = |_: &Path| false; // 홀더 전건 생존
+        sweep_update_leftovers(
+            &root,
+            12,
+            &trash,
+            T0,
+            &mut never_removes,
+            &mut real_relocate,
+            &mut sweep,
+        );
+        let mut bound = TrashBoundStats::default();
+        bound_update_trash(&trash, T0, &mut never_removes, &mut bound);
+
+        assert_eq!(sweep, SweepStats { removed: 0, quarantined: 2, stuck: 0 }, "봉쇄가 깨졌다");
+        assert_eq!(bound.remaining, 2, "격리본이 유계 계수에 잡히지 않았다");
+        assert!(!bound.over_bound(), "건강한 상태에서 ⚠ 가 울렸다");
+        let live_left = walk(&root)
+            .into_iter()
+            .filter(|p| !p.starts_with(&trash))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_update_leftover)
+            })
+            .count();
+        assert_eq!(live_left, 0, "살아있는 설치 트리에 잔해가 남았다");
+        assert!(root.join("runtime/python/notes.preview.png").exists());
+        assert!(root.join("runtime/git/usr/bin/bash.exe").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑮ ★마감 ① 의 본체 — **부팅마다 울리던 ⚠ 가 평시엔 사라진다.**
+    ///    T5 가 낸 그 상태(`stuck=9`)를 새 구조로 옮겨 재현: 9건은 격리함 안에서 대기 중이고,
+    ///    사용자가 할 수 있는 조치가 없으므로 loud 는 0줄이어야 한다. 장수 홀더를 가진 실사용자가
+    ///    부팅마다 보던 경고가 바로 이 줄이었다(오탐 배너 클래스 — 반복되면 신호가치가 죽는다).
+    #[test]
+    fn healthy_pending_trash_emits_no_warning_only_one_info_line() {
+        let trash = PathBuf::from("C:\\Program Files\\cys\\.cys-update-trash");
+        let sweep = SweepStats { removed: 0, quarantined: 9, stuck: 0 };
+        let bound = TrashBoundStats {
+            reclaimed: 0,
+            remaining: 9,
+            remaining_bytes: 9 * 4 * 1024 * 1024,
+            aged_stuck: 0,
+            deferred: 0,
+        };
+        let lines = leftover_log_lines(&sweep, &bound, &trash);
+        assert_eq!(lines.len(), 1, "평시에 줄이 늘었다: {lines:?}");
+        assert_eq!(lines[0].0, LeftoverLog::Info, "정상 대기를 ⚠ 로 올렸다");
+        assert!(!lines[0].1.contains('⚠'), "info 줄에 경고 기호가 섞였다");
+        assert!(lines[0].1.contains("pending=9"), "점유가 로그에서 사라졌다: {}", lines[0].1);
+
+        // 완전히 조용한 부트(할 일 없음)는 **한 줄도** 내지 않는다.
+        assert!(
+            leftover_log_lines(&SweepStats::default(), &TrashBoundStats::default(), &trash)
+                .is_empty(),
+            "아무 일도 없는 부트가 로그를 냈다"
+        );
+    }
+
+    /// ⑯ 승격 경로 — 봉쇄 실패(살아있는 트리 잔존)와 유계 이탈은 **각각** loud 를 낸다.
+    #[test]
+    fn broken_containment_and_broken_bound_each_go_loud() {
+        let trash = PathBuf::from("/tmp/.cys-update-trash");
+        // 봉쇄 실패: 삭제도 격리도 실패 → 잔해가 살아있는 설치 트리에 남았다.
+        let lines = leftover_log_lines(
+            &SweepStats { removed: 0, quarantined: 0, stuck: 3 },
+            &TrashBoundStats::default(),
+            &trash,
+        );
+        assert_eq!(lines.iter().filter(|(l, _)| *l == LeftoverLog::Loud).count(), 1);
+        assert!(lines.iter().any(|(_, s)| s.contains("회수 불가")));
+
+        // 유계 이탈: 격리는 됐지만 상한을 넘었다 → 대기로는 설명되지 않는다.
+        let over = TrashBoundStats {
+            reclaimed: 0,
+            remaining: TRASH_MAX_ENTRIES + 1,
+            remaining_bytes: 1024,
+            aged_stuck: 2,
+            deferred: 0,
+        };
+        let lines = leftover_log_lines(&SweepStats::default(), &over, &trash);
+        let loud: Vec<_> = lines.iter().filter(|(l, _)| *l == LeftoverLog::Loud).collect();
+        assert_eq!(loud.len(), 1, "유계 이탈 고지는 1회 loud 여야 한다: {lines:?}");
+        assert!(loud[0].1.contains("유계 이탈"), "{}", loud[0].1);
+        assert!(loud[0].1.contains(&TRASH_MAX_ENTRIES.to_string()), "상한값이 안 보인다");
+    }
+
+    /// ⑰ ★부트 진입점 전체를 실제 파일시스템으로 돌린다 — `main()` 의 `cfg(windows)` 블록이
+    ///    호출하는 바로 그 함수다. 종전에는 이 경로 전체가 타 OS 에서 **컴파일조차 되지 않아**
+    ///    어느 CI 레인에서도 타입체크되지 않았다(Windows CI 는 `--bin cysd` 를 돌리지 않는다).
+    ///    2 부트 수렴까지 건다: 부트1 이 회수·정리하고, 부트2 는 할 일이 없어 **한 줄도 내지 않는다**.
+    #[test]
+    fn maintenance_entrypoint_runs_end_to_end_and_converges_to_silence() {
+        let root = workdir("maintenance");
+        let trash = root.join(UPDATE_TRASH_DIR);
+        touch(&root.join("cysd.prev.exe"));
+        touch(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"));
+        touch(&root.join("runtime/python/notes.preview.png")); // 사용자 파일 — 불가침
+        touch(&root.join("cysd.exe")); // 살아있는 바이너리 — 불가침
+        touch_at(&trash.join("old.dll.prev1"), T0 - 10, 32); // 지난 부트의 격리본(홀더 사망)
+
+        // ── 부트 1 ──
+        let lines = run_update_leftover_maintenance(&root, T0);
+        assert!(
+            lines.iter().all(|(l, _)| *l == LeftoverLog::Info),
+            "건강한 부트에서 ⚠ 가 울렸다: {lines:?}"
+        );
+        assert_eq!(lines.len(), 1, "info 는 1줄이어야 한다: {lines:?}");
+        assert!(lines[0].1.contains("removed=2"), "{}", lines[0].1);
+        assert!(lines[0].1.contains("reclaimed=1"), "{}", lines[0].1);
+        assert!(lines[0].1.contains("pending=0"), "{}", lines[0].1);
+        assert!(!trash.exists(), "빈 격리함이 흔적으로 남았다");
+        assert!(root.join("cysd.exe").exists(), "살아있는 바이너리를 지웠다");
+        assert!(root.join("runtime/python/notes.preview.png").exists(), "사용자 파일을 지웠다");
+
+        // ── 부트 2: 수렴 — 할 일이 없으면 로그도 없다(부팅마다의 소음 0) ──
+        assert!(
+            run_update_leftover_maintenance(&root, T0 + 1).is_empty(),
+            "수렴 후에도 부트가 로그를 냈다"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
