@@ -1,6 +1,35 @@
-# "Install cys command in PATH" 구현 계획 (CLI PATH 통합결함 근본교정)
+<!-- doc-command-pin: allow(unguardedLn, unguardedRm) — reason: 상위대체된 이력 문서.
+     이 파일의 명령 블록은 "지금 실행하라"가 아니라 "2026-06-29 에 무엇을 했는가"의 기록이다.
+     원문을 보존해야 이력으로서 값이 있으므로 명령 텍스트를 고치지 않는다. 실행 정본은
+     docs/INSTALL.md §B 의 가드 블록이다. 이 예외를 다른 파일로 넓히지 마라. -->
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+# ✅ [완료 · 상위대체됨] "Install cys command in PATH" 구현 계획 (CLI PATH 통합결함 근본교정)
+
+> # 🛑 이 문서를 실행 지시로 읽지 마라
+>
+> - **이 플랜은 2026-06-29 에 완료됐다** — 커밋 `1882a5b`
+>   (`feat(cli-path): Control Center button to install cys CLI to PATH`).
+>   아래 체크박스는 그때 전부 이행된 것이며, 남은 작업 목록이 아니다.
+> - **2026-08-25 설계 정본 [`docs/plans/2026-08-25-shell-cli-restore-design.md`](2026-08-25-shell-cli-restore-design.md)
+>   이 이 문서를 상위대체(supersede)한다.** 설계·가드·IPC 계약이 8라운드에 걸쳐 바뀌었고,
+>   이 문서의 설계 결정 중 최소 2건은 **그 라운드들에서 결함으로 판정돼 폐기**됐다(바로 아래).
+> - **여기의 명령을 그대로 복사하지 마라.** `docs/INSTALL.md` §B 의 **가드 블록이 정본**이다.
+>
+> **폐기된 설계 결정 (이 문서 안에 아직 옛 형태로 남아 있는 것)**
+>
+> | 이 문서가 말하는 것 | 지금 사실 | 근거 |
+> |---|---|---|
+> | 가드 5종 ⑤ "멱등·self-heal — `ln -sf` 로 재실행 시 stale 심볼릭 자동 교체"(이 파일 §설계 결정 5번) | **폐기.** `ln -sf` 는 그 자리의 **남의 실체 파일까지 말없이 파괴**한다. 지금은 `[ -e ] \|\| [ -L ]` → `readlink` 로 우리 번들 대조 → 아니면 `<원래 경로>.cys-backup-<epoch초>` 로 **백업**한 뒤 `ln -sfn`. | 설계 정본 §4.1 BLOCK-1 · §5 ② |
+> | Task 5 Step 1 이 `docs/INSTALL.md` §B 에 써 넣으라고 지시하는 **맨 `sudo ln -sf` 두 줄**(이 파일 Task 5 Step 1 의 `INSTALL.md §B 교체안` 블록 안) | **폐기.** 그 두 줄은 2026-08-25 8라운드에 문서에서 제거됐고, 자리에는 백업 선행 가드 블록이 들어갔다. 이 지시를 그대로 따르면 **그 수리가 원상복구된다.** | 설계 정본 §4.11 · `docs/INSTALL.md` §B |
+>
+> **이 문서를 남겨 두는 이유**: 지우면 "왜 그때 그렇게 결정했는가"를 되물을 수 없다.
+> 이력으로 읽되, 실행 지시로는 읽지 마라.
+
+> ~~**For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+> Steps use checkbox (`- [ ]`) syntax for tracking.~~
+> — **무효(2026-08-25).** 이 플랜은 이미 구현·완료됐다. 새로 착수할 대상이 아니다.
+> 이 레인의 현행 지시는 설계 정본 §9(미결·인수인계)에 있다.
 
 **Goal:** macOS DMG로 설치한 사용자가 GUI에서 1번 클릭하면(1회 관리자 승인) `cys`·`cysd`가 `/usr/local/bin`에 심볼릭으로 노출되어 외부 터미널·오케스트레이션에서 즉시 쓰이게 한다.
 
@@ -29,7 +58,9 @@
 2. **translocation 거부** — 번들 경로에 `/AppTranslocation/` 포함 시 거부+"Finder로 Applications에 옮긴 뒤 재시도" 안내(Finder 이동=de-translocate).
 3. **백업 번들 거부** — 번들명이 `cys.app.bak*`/`*.prev*`면 거부(stale 바이너리 심볼릭 차단).
 4. **그림자화 보고(비차단)** — 설치 후 `which -a cys` 1순위가 `/usr/local/bin/cys`가 아니면 경고로 보고(오너 머신의 `/opt/homebrew/bin` 선행을 정직하게 표면화, 단 무손상이므로 차단하지 않음).
-5. **멱등·self-heal** — `ln -sf`로 재실행 시 stale 심볼릭 자동 교체.
+5. ~~**멱등·self-heal** — `ln -sf`로 재실행 시 stale 심볼릭 자동 교체.~~
+   🛑 **폐기(2026-08-25).** `ln -sf` 는 남의 실체 파일도 말없이 파괴한다 — 지금은 백업 선행
+   가드가 정본이다(설계 정본 §4.1 BLOCK-1 · `docs/INSTALL.md` §B).
 
 ---
 
@@ -39,7 +70,7 @@
 - Modify: `src-tauri/src/main.rs` — 헬퍼는 `resolve_sidecar`(`main.rs:460`) 근처에 추가, 테스트는 기존 `#[cfg(test)] mod tests`(파일 말미 `mod tests { use super::*; ... }`) 안에 추가.
 - Test: 동일 파일 `mod tests`.
 
-- [ ] **Step 1: 실패 테스트 작성** — `src-tauri/src/main.rs`의 `mod tests { ... }` 안에 추가:
+- [x] **Step 1: 실패 테스트 작성** — `src-tauri/src/main.rs`의 `mod tests { ... }` 안에 추가:
 
 ```rust
     // ── CLI PATH 설치 헬퍼 ──────────────────────────────────────────
@@ -146,12 +177,12 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     }
 ```
 
-- [ ] **Step 2: 테스트 실패 확인**
+- [x] **Step 2: 테스트 실패 확인**
 
 Run: `cd ~/dev/cys-terminal && cargo test --bin cys-app cli_install 2>&1 | tail -20` (또는 `sh_squote`/`classify_bundle`/`plan_cli`/`build_install`/`parse_which` 이름으로)
 Expected: FAIL — `cannot find function 'sh_squote'`, `cannot find type 'BundleKind'` 등 미정의 오류.
 
-- [ ] **Step 3: 최소 구현** — `main.rs`의 `resolve_sidecar`(약 460행) 바로 위/아래에 추가:
+- [x] **Step 3: 최소 구현** — `main.rs`의 `resolve_sidecar`(약 460행) 바로 위/아래에 추가:
 
 ```rust
 // ── CLI PATH 설치(명시 메뉴) — 가드/스크립트 순수 헬퍼 ─────────────────
@@ -273,12 +304,12 @@ Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도�
 }
 ```
 
-- [ ] **Step 4: 테스트 통과 확인**
+- [x] **Step 4: 테스트 통과 확인**
 
 Run: `cd ~/dev/cys-terminal && cargo test --bin cys-app 2>&1 | tail -25`
 Expected: PASS — 위 8개 테스트 통과, 기존 테스트 무회귀. (경고 `field is never read` 등은 Task 2에서 소비되므로 일시 허용 — `#[allow(dead_code)]`를 `CliInstallPlan`에 임시 부여해도 됨.)
 
-- [ ] **Step 5: 커밋**
+- [x] **Step 5: 커밋**
 
 ```bash
 cd ~/dev/cys-terminal
@@ -294,7 +325,7 @@ git commit -m "feat(cli-path): add guarded pure helpers for /usr/local/bin symli
 - Modify: `src-tauri/src/main.rs` — 커맨드는 Task 1 헬퍼 아래에 추가, 등록은 `tauri::generate_handler![` 리스트(`main.rs:1368`~`1413`, 마지막 항목 `read_dept_catalog,` 다음 줄).
 - Test: 순수 로직은 Task 1에서 검증됨. 승격 경로는 수동(부록 B 체크리스트).
 
-- [ ] **Step 1: 커맨드 구현** — Task 1 헬퍼 아래에 추가:
+- [x] **Step 1: 커맨드 구현** — Task 1 헬퍼 아래에 추가:
 
 ```rust
 #[derive(serde::Serialize)]
@@ -383,7 +414,7 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
 }
 ```
 
-- [ ] **Step 2: `generate_handler!`에 등록** — `main.rs:1412`의 `read_dept_catalog,` 다음 줄에 추가:
+- [x] **Step 2: `generate_handler!`에 등록** — `main.rs:1412`의 `read_dept_catalog,` 다음 줄에 추가:
 
 ```rust
             read_dept_catalog,
@@ -391,17 +422,17 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
         ])
 ```
 
-- [ ] **Step 3: 컴파일 확인**
+- [x] **Step 3: 컴파일 확인**
 
 Run: `cd ~/dev/cys-terminal && cargo check --bin cys-app 2>&1 | tail -15`
 Expected: 0 errors. (Task 1의 `#[allow(dead_code)]` 임시 부여분이 있으면 제거 — 이제 `CliInstallPlan` 필드가 소비됨.)
 
-- [ ] **Step 4: 전체 테스트 무회귀**
+- [x] **Step 4: 전체 테스트 무회귀**
 
 Run: `cd ~/dev/cys-terminal && cargo test --bin cys-app 2>&1 | tail -15`
 Expected: PASS, 무회귀.
 
-- [ ] **Step 5: 커밋**
+- [x] **Step 5: 커밋**
 
 ```bash
 cd ~/dev/cys-terminal
@@ -417,13 +448,13 @@ git commit -m "feat(cli-path): install_cli_to_path command (osascript-elevated /
 - Modify: `ui/index.html` — `#cc-header`(38~48행 근처) 내부에 버튼 추가.
 - Modify: `ui/src/main.ts` — 클릭 핸들러(파일 내 다른 `getElementById(...).addEventListener` 패턴과 동일 위치군에).
 
-- [ ] **Step 1: 버튼 추가** — `ui/index.html`의 `<div id="cc-header">` 안, `#cc-clock` 근처에:
+- [x] **Step 1: 버튼 추가** — `ui/index.html`의 `<div id="cc-header">` 안, `#cc-clock` 근처에:
 
 ```html
         <button id="btn-install-cli" title="외부 터미널에서 cys 명령 쓰기(1회 관리자 승인)">셸에 cys 설치</button>
 ```
 
-- [ ] **Step 2: 핸들러 작성** — `ui/src/main.ts`에서 `invoke`가 정의된 이후(21행 이후) 적절한 초기화 블록에 추가:
+- [x] **Step 2: 핸들러 작성** — `ui/src/main.ts`에서 `invoke`가 정의된 이후(21행 이후) 적절한 초기화 블록에 추가:
 
 ```ts
 document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
@@ -440,12 +471,12 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
 });
 ```
 
-- [ ] **Step 3: UI 빌드 확인**
+- [x] **Step 3: UI 빌드 확인**
 
 Run: `cd ~/dev/cys-terminal && sh ui/build.sh 2>&1 | tail -10`
 Expected: 빌드 성공, `ui/dist` 갱신, TS 타입오류 0.
 
-- [ ] **Step 4: 커밋**
+- [x] **Step 4: 커밋**
 
 ```bash
 cd ~/dev/cys-terminal
@@ -461,7 +492,14 @@ git commit -m "feat(cli-path): Control Center button to install cys CLI to PATH"
 - Modify: `docs/INSTALL.md` — §B(80~87행)와 INST-DENY-02(36행) 정합.
 - Modify: `README.md` — 설치 절에 1줄.
 
-- [ ] **Step 1: INSTALL.md §B 개정** — 기존 §B(80~87행)를 아래로 교체:
+> 🛑 **아래 Step 1 의 블록을 그대로 옮겨 쓰지 마라 — 그 안의 맨 `sudo ln -sf` 두 줄은
+> 2026-08-25 에 결함으로 판정돼 문서에서 제거됐다.** `ln -sf` 는 그 자리에 있는 것이 우리
+> 심볼릭인지 **남의 실체 파일**인지 보지 않고 갈아 끼운다(백업 0 · 경고 0 · 복구 불가).
+> 지금 `docs/INSTALL.md` §B 에 들어 있는 것은 `[ -e ] || [ -L ]` → `readlink` 번들 대조 →
+> `<원래 경로>.cys-backup-<epoch초>` 백업 → `ln -sfn` 순서로 도는 **가드 블록**이며 그것이 정본이다.
+> 아래 텍스트는 2026-06-29 당시의 원안 기록으로만 읽어라.
+
+- [x] **Step 1: INSTALL.md §B 개정** — 기존 §B(80~87행)를 아래로 교체:
 
 ```markdown
 ### 🧑 B. CLI도 외부 터미널에서 쓰려면 (선택)
@@ -479,19 +517,19 @@ sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 (pane *안*에서는 PATH가 자동 주입되므로 이 단계는 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
 ```
 
-- [ ] **Step 2: INST-DENY-02 주석 정합** — `docs/INSTALL.md:36`의 INST-DENY-02 행에 다음 문장을 보강(경계 표현형 충돌 방지):
+- [x] **Step 2: INST-DENY-02 주석 정합** — `docs/INSTALL.md:36`의 INST-DENY-02 행에 다음 문장을 보강(경계 표현형 충돌 방지):
 
 ```markdown
 | INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임. **단, GUI "셸에 cys 설치" 버튼은 사용자 명시 클릭 + osascript 1회 승격이라 이 경계를 위반하지 않음**(워커가 그 버튼을 자율 클릭하는 것은 여전히 금지). |
 ```
 
-- [ ] **Step 3: README 발견성 1줄** — `README.md` 설치 안내("드래그=끝" 부근)에 추가:
+- [x] **Step 3: README 발견성 1줄** — `README.md` 설치 안내("드래그=끝" 부근)에 추가:
 
 ```markdown
 > 외부 터미널에서 `cys` 명령을 쓰려면: 앱 Control Center → **"셸에 cys 설치"** 1클릭(1회 관리자 승인). 자세히는 docs/INSTALL.md §B.
 ```
 
-- [ ] **Step 4: 커밋**
+- [x] **Step 4: 커밋**
 
 ```bash
 cd ~/dev/cys-terminal
@@ -509,13 +547,13 @@ git commit -m "docs(cli-path): document 1-click 'Install cys command' + reconcil
 
 osascript 관리자 프롬프트는 비대화형 자동테스트 불가. 빌드 후 수동 검증:
 
-- [ ] cys.app을 `/Applications`에 두고 정상 실행 → "셸에 cys 설치" 클릭 → 비번 1회 → 성공 알림.
-- [ ] 새 Terminal에서 `which -a cys` → `/usr/local/bin/cys` 출현, `cys --version`(또는 `cys list`) 동작.
-- [ ] `ls -l /usr/local/bin/cys` → 심볼릭이 `/Applications/cys.app/Contents/MacOS/cys` 가리킴.
-- [ ] 재클릭(멱등) → 오류 없이 재성공(self-heal).
-- [ ] 프롬프트에서 취소 → "설치가 취소되었습니다" 반환, 부분상태 없음.
-- [ ] (그림자화 보고) `/opt/homebrew/bin/cys`가 이미 있는 dev 머신 → 성공하되 `shadowed_by`/경고에 `/opt/homebrew/bin` 표면화, 기존 동작 무손상.
-- [ ] (translocation 거부) DMG 마운트 상태로 바로 실행 후 클릭 → "Applications로 옮긴 뒤 재시도" 오류(심볼릭 미생성).
+- [x] cys.app을 `/Applications`에 두고 정상 실행 → "셸에 cys 설치" 클릭 → 비번 1회 → 성공 알림.
+- [x] 새 Terminal에서 `which -a cys` → `/usr/local/bin/cys` 출현, `cys --version`(또는 `cys list`) 동작.
+- [x] `ls -l /usr/local/bin/cys` → 심볼릭이 `/Applications/cys.app/Contents/MacOS/cys` 가리킴.
+- [x] 재클릭(멱등) → 오류 없이 재성공(self-heal).
+- [x] 프롬프트에서 취소 → "설치가 취소되었습니다" 반환, 부분상태 없음.
+- [x] (그림자화 보고) `/opt/homebrew/bin/cys`가 이미 있는 dev 머신 → 성공하되 `shadowed_by`/경고에 `/opt/homebrew/bin` 표면화, 기존 동작 무손상.
+- [x] (translocation 거부) DMG 마운트 상태로 바로 실행 후 클릭 → "Applications로 옮긴 뒤 재시도" 오류(심볼릭 미생성).
 
 ---
 

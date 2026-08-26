@@ -1,0 +1,34 @@
+{
+  "CliInstallStatusReport": {
+    "backups": "string[]",
+    "cys_link": "string",
+    "cysd_link": "string",
+    "installed": "boolean",
+    "notes": "string[]",
+    "platform_supported": "boolean",
+    "state": "string"
+  },
+  "InstallCliReport": {
+    "cys_link": "string",
+    "cysd_link": "string",
+    "effective_cys": "string|null",
+    "ok": "boolean",
+    "shadowed_by": "string|null",
+    "source_cys": "string",
+    "status": "string",
+    "target_dir": "string",
+    "unverified_reason": "string|null",
+    "warnings": "string[]"
+  },
+  "UninstallCliReport": {
+    "ok": "boolean",
+    "removed": "string[]",
+    "restored": "string[]",
+    "skipped": "string[]",
+    "skipped_benign": "boolean",
+    "skipped_reasons": "string[]",
+    "warnings": "string[]"
+  },
+  "_contract": "키 집합 + 타입 태그. TS 게이트(ui/src/clipath.test.ts)의 expectShape 기준. 손으로 고치지 말 것 — cargo test 가 덮어쓴다.",
+  "_generated_by": "src-tauri/src/main.rs :: dump_report_contract_for_the_ui_gate"
+}

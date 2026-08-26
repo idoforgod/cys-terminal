@@ -70,7 +70,9 @@
   **여전히 미서명이라 첫 실행 경고가 뜰 수 있습니다**.
   상세: [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md)
 - 24/365 상시 가동(선택): `cys daemon install` (launchd KeepAlive / 작업 스케줄러).
-- 외부 터미널에서 `cys` 쓰기: [docs/INSTALL.md](docs/INSTALL.md) §B(수동 심링크 1회).
+- 외부 터미널에서 `cys` 쓰기(macOS): Control Center 헤더의 **"셸에 cys 설치"** 1클릭(권장 ·
+  관리자 승인 1회 · 같은 버튼으로 해제)이거나, GUI를 못 쓸 때의 수동 심링크 폴백 —
+  [docs/INSTALL.md](docs/INSTALL.md) §B. Windows 설치기는 PATH를 등록하지 않습니다(§Windows).
 
 설치·제거 상세는 [docs/INSTALL.md](docs/INSTALL.md), 사용법 전체는
 [User Manual](USER-MANUAL.md).

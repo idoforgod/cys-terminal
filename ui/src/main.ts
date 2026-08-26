@@ -46,6 +46,28 @@ import {
 } from "./wheelgate";
 import { ceoPaletteEntries } from "./selfdiag";
 import {
+  isMacUserAgent,
+  installResultToast,
+  readCliStatus,
+  readInstallReport,
+  readUninstallReport,
+  cliButtonView,
+  cliButtonIntent,
+  cliNoticeLines,
+  withCliNotice,
+  normalizeInstallStatus,
+  statusNoticePlan,
+  uninstallConfirmText,
+  uninstallResultToast,
+  toastClassName,
+  toastEmitPlan,
+  INSTALL_TOAST_ID,
+  UNINSTALL_TOAST_ID,
+  type CliStatusView,
+  type LastInstallOutcome,
+  type ToastPlan,
+} from "./clipath";
+import {
   toastTtl,
   toastTimerPlan,
   needsExpiryBanner,
@@ -70,6 +92,9 @@ declare global {
 }
 // 플랫폼 판별은 세션·페인마다 다시 할 이유가 없다 — 모듈 로드 시 1회만 읽는다(마우스 보고 필터가 소비).
 const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
+// 셸 설치/해제 버튼은 macOS 전용(Rust install_cli_to_path 가 그 밖에서는 즉시 Err). 부정 판정
+// (!IS_WINDOWS)이면 Linux가 통과해 "보이는데 안 되는 버튼" 결함이 그대로 재현되므로 양성 판정을 쓴다.
+const IS_MACOS = isMacUserAgent(navigator.userAgent);
 
 const invoke = (cmd: string, args?: Record<string, unknown>) => window.__TAURI__.core.invoke(cmd, args);
 const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
@@ -356,6 +381,120 @@ function applyGlanceFace(face: "live" | "tasks") {
   if (ccDensity === "glance") setCcTab(face);
 }
 
+// ── 셸 cys 설치/해제 버튼(macOS 전용) ─────────────────
+// 버튼 하나가 상태 2종을 겸한다(미설치=설치 / 설치됨=해제). 라벨·툴팁·클릭 분기의 진실은 이 모듈
+// 변수 하나이고, 판정은 clipath.ts 순수 함수가 한다(main.ts는 배선만 — clipath.test.ts가 잠근다).
+//
+// ★(BLOCK-1(d)) cli_install_status 의 notes 를 **반드시 사용자에게 보여준다**. Rust 는 "이 자리에
+// 남의 실체 파일이 있다"를 이미 탐지해 문장으로 보내는데, 예전 TS 타입에는 notes 필드 자체가 없어
+// 한 글자도 노출되지 않았다 — 사용자는 버튼을 누르는 순간 자기 파일이 어떻게 되는지 모른 채 눌렀다.
+// 노출 경로는 둘이다: ①버튼 툴팁(상주) ②CC 열 때 sticky 토스트 1회(같은 id 재호출은 갱신).
+const CLI_STATUS_UNKNOWN: CliStatusView = {
+  supported: true,
+  button: "unknown",
+  linkState: "unknown",
+  notes: [],
+  backups: [],
+  cysLink: "",
+  cysdLink: "",
+};
+let cliStatus: CliStatusView = { ...CLI_STATUS_UNKNOWN };
+
+// ★(I2 · adv8) 직전 설치 시도의 결과 래치. 상태 조회는 **링크의 존재**만 보므로, 그림자화·확인
+// 불가로 끝난 설치 직후에도 installed=true 를 돌려주고 버튼이 '해제'로 뒤집힌다 — 방금 "미완료"
+// 라고 읽은 사용자가 같은 자리를 누르면 정반대(비가역 해제)가 나간다. 라벨은 이 둘의 합으로 정한다.
+// 래치는 Control Center 를 다시 열 때와 해제 성공 직후에 풀린다(해제 경로가 영영 막히지 않게).
+let cliLastInstall: LastInstallOutcome = null;
+
+function applyCliButtonView() {
+  const b = document.getElementById("btn-install-cli") as HTMLButtonElement | null;
+  if (!b) return;
+  // (I3①) 툴팁은 토스트와 **같은 고지 줄**을 단다 — 토스트는 60초 뒤 사라지고 툴팁은 상주하므로,
+  // 남는 쪽이 덜 말하면 잔존 백업본 정보가 그대로 소실된다.
+  const v = cliButtonView(cliStatus.button, cliNoticeLines(cliStatus), cliLastInstall);
+  b.textContent = v.label;
+  b.title = v.title;
+  // platform_supported=false 는 Rust 의 명시 부정이다(macOS 아님) — 그때만 되숨긴다.
+  // 판독 실패(응답 없음)로는 숨기지 않는다: 기능이 조용히 사라지는 쪽이 더 나쁘다.
+  if (!cliStatus.supported) b.hidden = true;
+}
+
+// 결과 토스트 배선 — clipath.ts 가 등급(category)과 **수명(sticky)** 까지 정한다(MINOR-10).
+// 경고 본문은 200자 안팎이라 volatile 8초로는 읽히지 않는다: 아직 할 일이 남은 결과만 60초 sticky.
+//
+// ★(MINOR-N6) volatile 로 낼 때는 같은 id 의 **살아 있는 sticky 를 먼저 내린다**. 예전엔 그러지
+// 않아, 설치 실패 sticky(60초)가 떠 있는 상태에서 다시 눌러 성공하면 '⚠ 실패'와 '✅ 완료'가
+// 최대 60초 나란히 공존했다 — 사용자는 둘 중 무엇이 현재 상태인지 알 수 없다.
+function showCliToast(plan: ToastPlan) {
+  const emit = toastEmitPlan(plan);
+  if (emit.dismissStickyId) dismissToast(emit.dismissStickyId);
+  if (emit.sticky) stickyToast(plan.id, plan.category, plan.title, plan.body);
+  else toast(plan.category, plan.title, plan.body);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ★MAJOR-3(2026-08-25 8R) 상태 조회의 **동시성 가드** — 진행 중 억제 + 세대 카운터
+// ══════════════════════════════════════════════════════════════════════════════
+// 7R 이 Rust `cli_install_status` 를 async 로 내리면서(#[tauri::command] 는 함수의 asyncness 로
+// ExecutionContext 를 정한다) IPC 핸들러의 **직렬화가 사라졌다**. 그 전에는 Blocking 컨텍스트라
+// 조회가 도는 동안 다음 조회가 시작조차 못 했는데, 지금은 Control Center 를 빠르게 여닫는 만큼
+// `$SHELL -lc 'which -a …'` **로그인 셸이 동시에 뜬다**(Rust probe_path_shadows: 기한 5초 +
+// -lc 미지원 셸 폴백 재시도 1회 = 최대 10초/회). 7R 주석은 "새 동시성도 열리지 않는다"고 단정하며
+// 근거로 '버튼 disabled' 를 들었지만, 상태 조회의 실제 호출부는 버튼이 아니라 setCcOpen 안의
+// `void refreshCliInstallState()` 다 — 그 경로에는 가드가 없었다.
+//
+// 둘째 결함은 **last-writer-wins** 였다. `cliStatus = readCliStatus(await invoke(...))` 에 요청
+// 구분이 없어, 늦게 끝난 옛 프로브가 액션 직후의 재조회 결과를 덮을 수 있다. 그러면 결과 토스트에
+// 접어 넣는 고지 줄(withCliNotice)과 버튼 라벨이 **낡은 사실**로 되돌아간다 — I2 가 닫은 '라벨과
+// 실제가 어긋나는 창'과 같은 계열이다.
+//
+// 관례는 이 파일에 이미 있다. 재진입 억제는 `boardBusy`(runSkillButton), 늦은 응답의 덮어쓰기
+// 차단은 **세대 카운터**(trackFilter.generation / clearLedgerIfGeneration) 다. 그 둘을 그대로
+// 쓴다 — 새 타이머·폴링은 만들지 않는다(이 코드베이스의 상시 원칙).
+let cliStatusGen = 0; // 최신 요청 세대. 응답은 자기 세대가 아직 최신일 때만 상태를 쓴다.
+let cliStatusBusy = false; // 프로브가 떠 있는가(= 로그인 셸이 아직 살아 있는가).
+
+// 읽기 전용 상태 조회(관리자 승격 없음). ★폴링 금지(WINAUDIT 타이머 증식) — CC 열 때 1회 +
+// 설치/해제 직후 1회뿐이다. 실패해도 기능이 죽지 않는 부수 조회라 조용히 unknown으로 두고,
+// unknown의 라벨은 '설치'다(멱등한 설치 쪽 — 비가역 해제로 기울지 않는다).
+//
+// ★(G2 · 2026-08-25 5R) `notice` 인자: 상시 고지 토스트(cli-status-notes)를 낼 것인가.
+// 설치·해제 **직후**의 재조회에서는 false 다 — 같은 사실(옮겨 둔 원본·남의 파일)이 결과 토스트에
+// 이미 실려 있어서, 그대로 두면 서로 다른 문장의 sticky 가 둘 뜬다(한 사건, 두 알림). 그 경로에서는
+// 호출측이 withCliNotice 로 결과 토스트 **하나**에 접어 넣는다. 정보는 줄지 않는다(툴팁에도 상주).
+//
+// ★(MAJOR-3) `force`: 액션(설치·해제) **직후**의 재조회인가. 이 한 갈래만 중복 억제를 건너뛴다.
+async function refreshCliInstallState(opts: { notice?: boolean; force?: boolean } = {}) {
+  if (!IS_MACOS) return;
+  // (MAJOR-3) 진행 중이면 **새 로그인 셸을 띄우지 않는다.** 관측만 하는 재진입(CC 토글·팔레트
+  // act:cc·부팅 경로)은 버려도 잃는 것이 없다 — 이미 떠 있는 프로브가 곧 같은 답을 낸다.
+  // 예외는 액션 직후 재조회(force)뿐이다: 그것은 **설치·해제가 일어난 뒤의 사실**을 읽어야 하므로
+  // 액션 이전에 시작된 프로브의 답으로 대신할 수 없다(버리면 라벨과 고지 줄이 낡은 채 남는다 —
+  // MINOR-11 이 닫은 창의 재개방). 그래서 동시 프로브 수의 상한은 '사용자가 누른 액션 수'로 묶인다.
+  if (cliStatusBusy && !opts.force) return;
+  const gen = ++cliStatusGen;
+  cliStatusBusy = true;
+  // 응답은 **지역 변수로 받는다.** await 뒤에 곧바로 cliStatus 에 대입하면 세대 검사를 할 자리가
+  // 없어져(대입이 이미 끝난 뒤다) 가드가 장식이 된다.
+  let view: CliStatusView;
+  try {
+    view = readCliStatus(await invoke("cli_install_status"));
+  } catch {
+    view = { ...CLI_STATUS_UNKNOWN };
+  }
+  // 늦게 도착한 낡은 응답은 최신 상태를 **덮지 않는다**(last-writer-wins 차단). busy 도 최신
+  // 세대만 내린다 — 옛 응답이 내리면 아직 살아 있는 프로브를 '없다'고 말하게 되어 억제가 뚫린다.
+  // (프로브가 영영 돌아오지 않는 환경에서는 busy 가 남아 관측 재조회가 멎지만, 그때는 애초에 읽을
+  //  수 있는 상태가 없다 — 라벨은 안전한 쪽('설치')에 머물고, 다음 액션의 force 가 그 자물쇠를 푼다.)
+  if (gen !== cliStatusGen) return;
+  cliStatusBusy = false;
+  cliStatus = view;
+  applyCliButtonView();
+  if (opts.notice === false) return;
+  const notice = statusNoticePlan(cliStatus); // 고지할 것(notes·잔존 백업)이 없으면 null — 정상은 무음
+  if (notice) showCliToast(notice);
+}
+
 function setCcOpen(open: boolean) {
   ccOpen = open;
   document.getElementById("cc-panel")!.hidden = !open;
@@ -367,6 +506,12 @@ function setCcOpen(open: boolean) {
     refreshControlCenter();
     refreshHw();
     tickCc();
+    // 셸 설치 상태는 CC를 열 때 1회만 확인한다(주기 조회 없음). ★반드시 fire-and-forget —
+    // 여기서 await 하면 아래 타이머 생성이 응답을 기다리며 막힌다(e2e shim의 invoke는 영구 pending).
+    // (I2) 패널을 다시 여는 것은 '처음부터'의 자연스러운 경계다 — 직전 설치 래치를 여기서 푼다.
+    // 그래야 '다시 설치' 표시가 그 세션의 잔상으로 끝나고, 해제 경로가 영구히 막히지 않는다.
+    cliLastInstall = null;
+    void refreshCliInstallState();
     if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
     if (ccHwTimer == null) ccHwTimer = setInterval(refreshHw, 2000) as unknown as number;
     if (ccClockTimer == null) ccClockTimer = setInterval(tickCc, 1000) as unknown as number;
@@ -5517,6 +5662,22 @@ function confirmModal(
       if (e.target === ov) done(false);
     });
     document.body.appendChild(ov);
+    // ★(MINOR-7 · 9R) 포커스를 **모달 안으로** 옮긴다.
+    //
+    // 오버레이(.modal-overlay · position:fixed·inset:0)는 **마우스만** 가린다. 이 줄이 없으면
+    // 포커스는 확인 창을 띄운 그 버튼에 그대로 남고(전역 키 핸들러도 수식키 없는 입력은 흘려보낸다
+    // — 이 파일 말미 `if (!mod) return`), 키보드 사용자가 Enter/Space 를 누르면 확인 창이 떠 있는
+    // 채로 같은 핸들러에 **다시** 들어간다: 확인 창 2개 → 둘 다 승인하면 같은 비가역 커맨드가
+    // 두 번 나가고 관리자 승인 프롬프트도 둘이 뜬다.
+    //
+    // 호출부의 재진입 가드(버튼 disabled)와 **이중 방어**다. 그쪽은 버튼 하나를 지키고 이쪽은
+    // confirmModal 을 쓰는 **모든 자리**를 한 번에 지킨다 — 같은 가드를 자리마다 따로 두는 것이
+    // 이 라운드들에서 반복된 어긋남의 형태였다.
+    //
+    // 기본 포커스는 **취소** 쪽이다: 무심코 친 Enter 가 파괴적 행위를 승인하지 않게(안전한 쪽으로
+    // 틀린다). 그리고 이 줄은 확인 창을 **키보드만으로도** 조작 가능하게 만든다 — 예전에는 Tab 을
+    // 여러 번 눌러 모달까지 들어가야 했다.
+    (ov.querySelector(".modal-no") as HTMLElement).focus();
   });
 }
 
@@ -5934,7 +6095,7 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
   recordAlarm(category, name, detail);
   const box = document.getElementById("toasts")!;
   const el = document.createElement("div");
-  el.className = `toast ${category}`;
+  el.className = toastClassName(category); // 등급색 서식의 단일 진실(sticky 와 같은 함수)
   el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
@@ -5964,11 +6125,14 @@ function stickyToast(id: string, category: string, name: string, detail: string)
   let el = prev?.el;
   if (!el) {
     el = document.createElement("div");
-    el.className = `toast ${category}`;
     el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
     addToastCloseButton(el, id);
     box.appendChild(el);
   }
+  // (MINOR-N4) 등급색은 **낼 때마다** 다시 못박는다. 예전에는 생성 시점에 한 번만 정해져,
+  // 같은 id 로 실패(watchdog) → 성공(system)이 오면 본문만 '✅'로 바뀌고 테두리는 경고색 그대로
+  // 남았다 — 등급을 표시하는 유일한 장치가 거짓말을 한다. 자식 노드(본문·닫기 버튼)는 그대로다.
+  el.className = toastClassName(category);
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
   const timer = setTimeout(() => {
@@ -6706,6 +6870,101 @@ document.getElementById("btn-cc-density")!.addEventListener("click", () =>
 document.getElementById("btn-cc-glance-face")!.addEventListener("click", () =>
   applyGlanceFace(ccGlanceFace === "tasks" ? "live" : "tasks"),
 );
+// 셸 cys 설치/해제 — index.html에서 hidden으로 시작하고 macOS에서만 연다(D2 플랫폼 게이팅).
+// Rust의 non-macOS Err 는 심층방어로 남아 있고, 이 줄은 "보이는데 안 되는 버튼"을 없애는 앞단이다.
+// 요소 참조는 `?.`로 둔다 — 버튼이 다시 삭제되더라도(가역 계약) 모듈 로드가 통째로 죽지 않게.
+if (IS_MACOS) {
+  const cliBtn = document.getElementById("btn-install-cli");
+  if (cliBtn) cliBtn.hidden = false;
+  applyCliButtonView(); // 조회 전 기본 라벨(=HTML 초기값과 동일) 확정 — 상태는 CC 열 때 채운다
+}
+document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
+  const b = document.getElementById("btn-install-cli") as HTMLButtonElement | null;
+  if (!b || b.disabled) return;
+  // ★(I2) 클릭 분기는 **라벨을 만든 그 판정**을 그대로 쓴다. cliStatus.button 만 보면
+  // '다시 설치'라고 적힌 버튼이 해제를 집행하는 창이 열린다(사용자가 본 것과 다른 행동).
+  const wantUninstall = cliButtonIntent(cliStatus.button, cliLastInstall) === "uninstall";
+  // ★(MAJOR-3 · 8R) 재진입 차단을 **첫 await 앞**으로 올린다.
+  //
+  // 예전에는 이 줄이 확인 모달 뒤에 있었다. 그래서 해제 경로만, 모달을 await 하는 동안 버튼이
+  // 살아 있었다 — 오버레이(.modal-overlay · position:fixed·inset:0)가 **마우스**는 가리지만
+  // 포커스는 방금 누른 이 버튼에 그대로 남고, 전역 키 핸들러는 수식키 없는 입력을 그냥 흘려보낸다
+  // (이 파일 말미 `if (!mod) return`). 그래서 Enter/Space 한 번이면 핸들러에 다시 들어와 확인 창이
+  // 둘 뜨고, 둘 다 승인하면 `uninstall_cli_from_path` 가 **동시에 두 번** 나간다(승격 프롬프트도 둘).
+  // 설치 경로는 첫 await 가 invoke 라 원래도 막혀 있었지만, **같은 가드를 경로마다 다른 자리에
+  // 두는 것** 자체가 이 어긋남의 원인이었다 — 자리를 하나로 통일한다.
+  b.disabled = true; // in-flight 이중 진입 차단(확인 모달·승격 프롬프트가 떠 있는 동안)
+  // 해제는 root 소유 심링크를 지우는 비가역에 가까운 행위 — 클릭 즉시 집행하지 않고 확인을 먼저 받는다.
+  // alert()/confirm()은 이 WKWebView에서 억제된다는 실측(B-11)이 있어 순수 DOM confirmModal을 쓴다.
+  // (I3②) 확인 창에 **현재 상태**를 함께 실어 준다 — 남의 파일 고지(notes)와 잔존 백업본(backups).
+  // 문구를 읽어 분류하지 않는다: 분기의 근거는 두 배열의 길이뿐이고, 내용은 옮기거나(notes)
+  // 경로에서 만든다(backups — 백엔드는 사실만, 표현은 UI 소유).
+  if (wantUninstall) {
+    // ★(MAJOR-2 · 7R) linkState 도 함께 넘긴다 — 확인 창에 실리는 백업본 줄이 '그 자리가 지금
+    // 비어 있는가' 를 알아야 파괴적인 'sudo mv' 를 내지 않는다(자리가 차 있으면 명령 대신
+    // "해제하면 앱이 되돌립니다" 라고 말한다).
+    // ★(BLOCK-1 · 12R) 정확히는 **그 자리의 가장 최근 사본 한 줄에만** 그렇게 말한다. 같은 자리의
+    // 옛 사본에는 되돌린다는 약속도, 옮기라는 명령도 붙지 않는다 — 되돌릴 자리가 하나뿐이라
+    // 앱이 되돌리는 것도 하나뿐이기 때문이다(uninstallConfirmText 가 autoRestoredBackups 로 가른다).
+    const c = uninstallConfirmText(cliStatus.notes, cliStatus.backups, cliStatus.linkState);
+    if (!(await confirmModal(c.title, c.body, c.yes, c.no))) {
+      // 취소 — 집행한 것이 없으니 재조회도 하지 않는다(쓸데없이 로그인 셸을 띄우지 않는다).
+      b.disabled = false;
+      return;
+    }
+  }
+  // ★(G2) 결과 알림은 **이 액션당 정확히 하나**다. 예전에는 여기서 결과 토스트를 내고, finally 의
+  // 재조회가 곧바로 상시 고지 토스트를 또 냈다 — 백업이 일어난 설치 1클릭이 서로 다른 문장의
+  // sticky 두 개(cli-install + cli-status-notes)로 같은 사실을 말했다. 계획을 들고 있다가
+  // 재조회 뒤에 한 번만 낸다(그래야 접어 넣는 고지 줄이 **방금 재조회한 최신 사실**이 된다).
+  let plan: ToastPlan | null = null;
+  try {
+    // 응답 판독은 read*Report(unknown → 계약 모양)가 한다 — `as T ?? {}` 캐스트로 모양을 가정하면
+    // Rust 와 어긋난 채 조용히 통과한다(MAJOR-5 의 본체가 정확히 그 캐스트였다).
+    if (wantUninstall) {
+      const rep = readUninstallReport(await invoke("uninstall_cli_from_path"));
+      // 해제가 실측으로 확인됐으면 설치 래치도 함께 푼다 — 지운 뒤에 '다시 설치'가 남으면
+      // 그것 또한 라벨과 상태의 어긋남이다(래치는 잔상이지 상태가 아니다).
+      if (rep.ok) cliLastInstall = null;
+      // (R1) 남은 링크의 복구 명령('sudo rm <경로>')은 **UI 가 조립한다** — 백엔드는 5R 부터
+      // 사실만 보낸다. 조립의 후보는 직전 상태 조회가 준 두 링크 경로이고, 그 값을 못 읽었으면
+      // 빈 문자열이라 후보가 사라진다(없는 경로를 지목하지 않는다).
+      plan = uninstallResultToast(rep, [cliStatus.cysLink, cliStatus.cysdLink]);
+    } else {
+      const rep = readInstallReport(await invoke("install_cli_to_path"));
+      // installed 가 아니면(그림자화·확인 불가) 다음 라벨은 '해제'가 아니라 '다시 설치'다.
+      cliLastInstall = normalizeInstallStatus(rep.status);
+      plan = installResultToast(rep);
+    }
+  } catch (e) {
+    // 실패(취소·승격 거부·Err)는 볼 것이 남은 결과다 — 60초 sticky 로 낸다.
+    // ★실패도 같은 통로로 낸다(G1 대칭): 승격이 거부돼도 이미 옮겨진 원본이 남아 있을 수 있고,
+    // 그 사실은 실패 알림에도 실려야 한다 — 실패 경로만 덜 말하면 그것이 곧 자기보고 미도달이다.
+    plan = {
+      category: "watchdog",
+      title: wantUninstall ? "셸 cys 해제 실패" : "셸 설치 실패",
+      body: String(e),
+      sticky: true,
+      id: wantUninstall ? UNINSTALL_TOAST_ID : INSTALL_TOAST_ID,
+    };
+  } finally {
+    // (MINOR-11) 재조회를 **기다린 뒤** 활성화한다. fire-and-forget 이면 버튼이 먼저 살아나
+    // 라벨이 아직 이전 상태(예: 방금 설치했는데 '설치')인 창이 열리고, 그 창에서 누르면
+    // 사용자가 본 라벨과 다른 행동이 나간다. refreshCliInstallState 는 내부에서 삼키므로 throw 없음.
+    // 단, 재조회가 영영 돌아오지 않는 환경(응답 없는 invoke)에서 버튼이 **영구 비활성**으로
+    // 죽는 것은 더 나쁘다 — 3초 상한을 걸고 그 뒤에는 라벨이 늦더라도 버튼을 돌려준다.
+    await Promise.race([
+      // 액션 직후 1회 재조회로 라벨 갱신(폴링 아님). 상시 고지 토스트는 여기서 내지 않는다 —
+      // 아래에서 결과 토스트 하나로 접어 넣는다(G2).
+      // ★(MAJOR-3) force: 이 재조회만은 중복 억제를 건너뛴다 — CC 를 열 때 시작된 프로브가 아직
+      // 떠 있으면 그 답은 **액션 이전의 사실**이라, 그것으로 대신하면 라벨·고지 줄이 낡는다.
+      refreshCliInstallState({ notice: false, force: true }),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    if (plan) showCliToast(withCliNotice(plan, cliNoticeLines(cliStatus)));
+    b.disabled = false;
+  }
+});
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
@@ -6770,8 +7029,13 @@ document.getElementById("btn-ws-new")!.addEventListener("click", () => {
   void addWorkspace();
 });
 
-// (2026-08-20 P2) ▶CEO/▶부서장/셸설치 버튼 제거 — 기동 경로는 pane 마스터 선언(role-bootstrap 훅 체인)·cys launch-agent·phoenix 복원으로 잔존.
+// (2026-08-20 P2) ▶CEO/▶부서장/셸설치 버튼 3종 제거 — 기동 경로는 pane 마스터 선언(role-bootstrap 훅 체인)·cys launch-agent·phoenix 복원으로 잔존.
 // Rust 커맨드(start_master 등)는 존치(git log 참조). 버튼 복원은 HTML 2줄+핸들러 재추가로 가역.
+// (2026-08-25) ★셸설치 버튼만 복원 — 제거 사유였던 결함 4종을 함께 고쳤다: ①플랫폼 게이팅 없음
+// (macOS 양성 판정 시에만 hidden 해제) ②그림자화·검증실패를 "설치 완료"로 오보고(status 3분류 →
+// 등급 분리) ③해제 경로 부재(같은 버튼이 상태 2종을 겸함 + confirmModal 확인) ④검증 무기한 대기.
+// 배선은 #btn-cc-glance-face 리스너 직후, 판정은 clipath.ts(순수·clipath.test.ts). ▶CEO/▶부서장
+// 두 버튼은 **복원 대상이 아니다** — 위 이원 경로가 정본이다.
 
 // ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
 // "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).

@@ -91,6 +91,16 @@ declare module "node:fs" {
   /** mousefilter.test.ts 의 코퍼스 로딩(URL 경로 — cwd 비의존)만 쓴다. */
   export function existsSync(path: string | URL): boolean;
   export function readFileSync(path: string | URL, encoding: "utf8" | "utf-8"): string;
+  /**
+   * clipath.test.ts 의 **문서 전수 스윕**만 쓴다(docs/ 아래 모든 .md + 리포 루트 .md).
+   * 목록을 손으로 적으면 빠뜨린 파일이 남고, 실제로 그 빠뜨린 파일(docs/GUIDE-clean-reset-KR.md)이
+   * 사용자 파일을 지우는 명령을 들고 있었다 — 그래서 열거를 기계에 맡긴다.
+   * 위 선언과 같은 범위 계약: `withFileTypes: true` 한 형태만 쓰므로 그것만 선언한다.
+   */
+  export function readdirSync(
+    path: string | URL,
+    options: { withFileTypes: true },
+  ): { name: string; isDirectory(): boolean; isFile(): boolean }[];
 }
 
 /**

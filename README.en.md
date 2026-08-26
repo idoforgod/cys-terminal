@@ -84,7 +84,10 @@ pack automatically.
   warning can appear**. See
   [docs/INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md).
 - Optional 24/365 always-on: `cys daemon install` (launchd KeepAlive / Task Scheduler).
-- Use `cys` from an external terminal: [docs/INSTALL.md](docs/INSTALL.md) §B (one-time manual symlink).
+- Use `cys` from an external terminal (macOS): one click on **"셸에 cys 설치"** (Install cys
+  into the shell) in the Control Center header — recommended, one admin prompt, and the same
+  button uninstalls it — or the manual symlink fallback. See
+  [docs/INSTALL.md](docs/INSTALL.md) §B. The Windows installer does not register PATH.
 
 Install/uninstall details: [docs/INSTALL.md](docs/INSTALL.md). Full usage:
 [User Manual](USER-MANUAL.md).
