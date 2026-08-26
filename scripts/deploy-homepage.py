@@ -16,18 +16,30 @@
     바로 아래 형제인 윈도우 안내(`dl-hero__winnote`)는 릴리스 체크리스트 ⓐ 필수 잔존 항목이라
     **반드시 살려둔다**. 세목은 아래 strip_main_macnote() 위 주석 참조.
 
+  · ★**라이브 페이지 수신은 fail-closed 다**(2026-08-27). 이 스크립트가 받은 HTML 이 곧
+    업로드될 본문이라, 부분 본문을 받으면 **잘린 홈페이지가 그대로 발행된다.** 그래서
+    `--fail`·종료코드·Content-Length 대조로 수신을 검증하고, 유계 재시도(3회)를 소진하고도
+    불확실하면 **치환·업로드로 진행하지 않고 중단**한다. 세목은 아래 '수신 검증 계약' 절.
+
 기본은 dry-run. `--apply` 를 줘야 실제로 올린다.
 
 사용:
   python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리>           # 계획만
   python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --apply   # 집행
   python3 scripts/deploy-homepage.py --self-test                     # 삭제 로직 셀프테스트(무접촉)
+
+종료코드: 0 = 정상(dry-run 포함) · 1 = 중단(수신 미판정 · 원격 확정 오류 · fail-closed 위반 ·
+          업로드 실패) · 2 = 사용법
+
+동반 회귀 테스트: `python3 scripts/tests/test_deploy_homepage_fetch.py`
+  (합성 페이크 curl · 네트워크 불요 · ★부분 본문 수신 시 업로드가 **호출되지 않는지** 음성 대조)
 """
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 
 ENV = os.path.expanduser("~/.cys/hostinger-ftp.env")
 SITE = "https://www.cysinsight.com"
@@ -75,19 +87,21 @@ def sftp_put(e, local, remote):
     sftp_root = "domains/cysinsight.com/public_html/"
     with tempfile.TemporaryDirectory() as td:
         batch = os.path.join(td, "b")
-        open(batch, "w").write("put %s %s%s\n" % (local, sftp_root, remote))
+        with open(batch, "w") as fh:      # ★닫고 나서 expect 에 넘긴다(덜 쓰인 배치 방지)
+            fh.write("put %s %s%s\n" % (local, sftp_root, remote))
         exp = os.path.join(td, "e")
-        open(exp, "w").write(
-            'set timeout 300\n'
-            'spawn sftp -P %s -o BatchMode=no -o StrictHostKeyChecking=accept-new '
-            '-b %s %s@%s\n'
-            'expect {\n'
-            '  -re "(?i)password" { send -- "$env(CYS_SFTP_PASS)\\r"; exp_continue }\n'
-            '  eof {}\n'
-            '}\n'
-            'catch wait result\n'
-            'exit [lindex $result 3]\n'
-            % (e.get("FTP_SFTP_PORT", "65002"), batch, e["FTP_USER"], e["FTP_HOST"]))
+        with open(exp, "w") as fh:
+            fh.write(
+                'set timeout 300\n'
+                'spawn sftp -P %s -o BatchMode=no -o StrictHostKeyChecking=accept-new '
+                '-b %s %s@%s\n'
+                'expect {\n'
+                '  -re "(?i)password" { send -- "$env(CYS_SFTP_PASS)\\r"; exp_continue }\n'
+                '  eof {}\n'
+                '}\n'
+                'catch wait result\n'
+                'exit [lindex $result 3]\n'
+                % (e.get("FTP_SFTP_PORT", "65002"), batch, e["FTP_USER"], e["FTP_HOST"]))
         env = dict(os.environ, CYS_SFTP_PASS=e["FTP_PASS"])
         r = subprocess.run(["/usr/bin/expect", exp], capture_output=True, env=env)
         return r.returncode == 0
@@ -108,9 +122,153 @@ def ftp_delete(e, remote):
     return r.returncode == 0
 
 
-def fetch(url):
-    r = curl(["-A", UA, url])
-    return r.stdout.decode("utf-8", "replace")
+# ── ★수신 검증 계약 (2026-08-27 · '잘린 홈페이지 발행' 사고 봉합) ──────────────────
+# ★배경: 이 파일의 fetch() 는 라이브 페이지를 `curl -s`(--fail 없음)로 받아 **종료코드도
+#   수신 바이트수도 보지 않고** 그 문자열 위에서 버전·용량 토큰을 치환한 뒤 **그대로
+#   업로드**했다(main() → strip_main_macnote → ftp_put). 전송이 도중에 끊기면 **잘린
+#   홈페이지가 그대로 발행된다.** 같은 무방비가 구자산 HEAD(용량 토큰 재계산)에도 있어,
+#   잘린 헤더의 Content-Length 가 페이지에 **틀린 용량**으로 박힐 수 있었다.
+#
+# ★원칙 — 배포는 **비가역**이다. 그래서 검증기(`scripts/verify-release-remote.py`)보다
+#   한 칸 더 엄격하다:
+#     · 수신 검증(rc · --fail · Content-Length 대조) 없이는 **치환·업로드로 진행하지 않는다**
+#     · 유계 재시도를 소진하고도 불확실하면 **중단**하고 사유를 loud 로 남긴다(조용한 진행 금지)
+#     · 429·5xx = '원격이 지금 대답을 못 한다' → 재시도 대상
+#       4xx(429 제외) = 원격의 **확정 답** → 재시도하지 않는다(같은 답이 올 뿐)
+#   판정 3분류(자산/원격 확정 오류/미판정)는 검증기와 같은 어휘를 쓴다 — 두 도구의 문면이
+#   갈리면 사람이 같은 사건을 다르게 읽는다.
+MAX_ATTEMPTS = 3                 # ★유계 — 최초 1회 + 재시도 2회 (`retry-loop-needs-stop-condition`)
+RETRY_BACKOFF_S = (2.0, 5.0)     # len ≥ MAX_ATTEMPTS-1 (부족하면 마지막 값 반복)
+HTTP_TIMEOUT = 120               # 1회 상한(초) — 페이지·HEAD 용
+
+_CL_RE = re.compile(r"(?im)^\s*content-length:\s*(\d+)\s*$")
+
+
+class HttpResult(object):
+    """HTTP 수신 1건의 결과.
+
+      · err != None → **미판정**: 수신이 완결되지 못했거나 원격이 일시적으로 대답을 못 했다.
+                      ★이 상태에서 본문을 쓰면 안 된다.
+      · err == None → 수신 완결 + 원격의 확정 답. 그 다음 판정은 status/text 로 한다.
+    """
+
+    __slots__ = ("err", "status", "text", "nbytes", "clen", "tries")
+
+    def __init__(self, err=None, status=0, text="", nbytes=0, clen=None):
+        self.err = err
+        self.status = status
+        self.text = text
+        self.nbytes = nbytes
+        self.clen = clen
+        self.tries = 1
+
+
+def is_transient_status(status):
+    """유계 재시도 대상인가 — **429 와 5xx**('지금 대답을 못 한다'). 4xx 는 확정 답이다."""
+    return status == 429 or status >= 500
+
+
+def http_curl_argv(url, head, dest, hdr):
+    """수신 검증의 뼈대 — `--fail`·`--show-error`·`-D`·`-w` 넷이 계약이다.
+
+      --fail        : 4xx/5xx 오류 페이지를 '본문'으로 착각해 업로드 재료로 쓰지 않는다
+      --show-error  : `-s` 로 눌린 오류 문면을 되살린다(침묵 금지)
+      -D <hdr>      : Content-Length 대조용 헤더 원본
+      -w %{http_code} %{size_download} : rc 에 의존하지 않는 상태·바이트수 관측
+    """
+    a = ["curl", "-s", "--show-error", "--fail", "-A", UA,
+         "--max-time", str(HTTP_TIMEOUT), "-D", hdr, "-o", dest,
+         "-w", "%{http_code} %{size_download}"]
+    if head:
+        a.append("-I")
+    return a + [url]
+
+
+def _run_http_curl(argv):
+    p = subprocess.run(argv, capture_output=True)
+    return (p.returncode,
+            p.stdout.decode("utf-8", "replace"),
+            p.stderr.decode("utf-8", "replace"))
+
+
+def _read_bytes(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def _http_attempt(url, head, runner):
+    with tempfile.TemporaryDirectory() as td:
+        dest, hdr = os.path.join(td, "body"), os.path.join(td, "hdr")
+        rc, w_out, serr = runner(http_curl_argv(url, head, dest, hdr))
+        try:
+            status = int((w_out or "").split()[0])
+        except (IndexError, ValueError):
+            status = 0
+        header_text = _read_bytes(hdr).decode("utf-8", "replace")
+        m = _CL_RE.findall(header_text)
+        clen = int(m[-1]) if m else None            # 리다이렉트 체인 대비 — **마지막** 값
+        blob = _read_bytes(dest)
+        nbytes = len(blob)
+        if status >= 400:
+            if is_transient_status(status):
+                return HttpResult(err="원격 일시 불응답(HTTP %d)" % status,
+                                  status=status, nbytes=nbytes, clen=clen)
+            return HttpResult(status=status, nbytes=nbytes, clen=clen)
+        if rc != 0:
+            tail = ([l for l in (serr or "").splitlines() if l.strip()] or [""])[-1].strip()
+            return HttpResult(err="curl 종료코드 %d%s" % (rc, (" · " + tail[:200]) if tail else ""),
+                              status=status, nbytes=nbytes, clen=clen)
+        if head:
+            # HEAD 는 본문이 없다 — 헤더가 산출물이고 Content-Length 는 '선언된 크기'다.
+            return HttpResult(status=status, text=header_text, nbytes=nbytes, clen=clen)
+        # ★수신 바이트수 vs 선언값 대조 — rc 만으로는 못 잡는 조기 종료가 여기서 걸린다.
+        if clen is not None and clen != nbytes:
+            return HttpResult(err="수신 %dB ≠ Content-Length %dB (부분 본문)" % (nbytes, clen),
+                              status=status, nbytes=nbytes, clen=clen)
+        return HttpResult(status=status, text=blob.decode("utf-8", "replace"),
+                          nbytes=nbytes, clen=clen)
+
+
+def http_fetch(url, head=False, attempts=MAX_ATTEMPTS, _runner=None, _sleep=None):
+    """유계 재시도로 URL 을 받는다 → HttpResult. ★상한은 `range(attempts)` 가 강제한다."""
+    runner = _runner or _run_http_curl
+    sleeper = _sleep or time.sleep
+    attempts = max(1, int(attempts))
+    tries = 0
+    r = None
+    for i in range(attempts):                      # ← 유계
+        if i:
+            delay = RETRY_BACKOFF_S[min(i - 1, len(RETRY_BACKOFF_S) - 1)]
+            print("  ↻ 재시도 %d/%d (%.0fs 후) ← %s | %s" % (i, attempts - 1, delay, r.err, url))
+            sleeper(delay)
+        r = _http_attempt(url, head, runner)
+        tries = i + 1
+        if not r.err:
+            break
+    r.tries = tries
+    if r.err:
+        r.err = "%s [시도 %d회 소진]" % (r.err, tries)
+    return r
+
+
+def fetch(url, _runner=None, _sleep=None):
+    """라이브 페이지 GET — **fail-closed**. 반환 `(text, err)`.
+
+    ★err != None 이면 그 본문 위에서 **아무것도 하지 마라**(치환도 업로드도). 이 함수의
+      반환값이 업로드될 HTML 의 출처이기 때문에, 여기서 통과시킨 부분 본문은 곧바로
+      **잘린 홈페이지 발행**이 된다.
+    """
+    r = http_fetch(url, _runner=_runner, _sleep=_sleep)
+    if r.err:
+        return "", "미판정 — " + r.err
+    if not (200 <= r.status < 300):
+        return "", "원격 확정 오류(HTTP %d)" % r.status
+    if not r.text:
+        return "", "빈 응답(HTTP %d · 수신 %dB)" % (r.status, r.nbytes)
+    return r.text, None
 
 
 def mib(n):
@@ -392,10 +550,18 @@ def main(argv):
     print("라이브 downloads/ 항목 %d · 구버전 %s" % (len(live), old_versions or "없음"))
 
     # ── 페이지 범프 계획 ──
-    main_html = fetch(SITE + "/")
-    dl_html = fetch(SITE + "/downloads/")
-    if not main_html or not dl_html:
-        print("::error::라이브 페이지를 받지 못했다", file=sys.stderr)
+    # ★fail-closed 관문 (2026-08-27) — 여기서 받은 HTML 이 곧 **업로드될 본문**이다.
+    #   수신이 검증되지 않은 문자열 위에서는 치환도 업로드도 하지 않는다. 유계 재시도를
+    #   소진하고도 불확실하면 조용히 넘어가지 않고 **중단**한다(배포는 비가역).
+    main_html, err_main = fetch(SITE + "/")
+    dl_html, err_dl = fetch(SITE + "/downloads/")
+    if err_main or err_dl:
+        print("::error::라이브 페이지 수신 검증 실패 — 치환·업로드로 진행하지 않는다(fail-closed). "
+              "잘린 본문을 올리면 홈페이지가 잘린 채 발행된다.", file=sys.stderr)
+        if err_main:
+            print("::error::  GET %s/ → %s" % (SITE, err_main), file=sys.stderr)
+        if err_dl:
+            print("::error::  GET %s/downloads/ → %s" % (SITE, err_dl), file=sys.stderr)
         return 1
 
     # ── ★메인페이지 전용 삭제 단계 (오너 지시 2026-08-24) ──
@@ -428,12 +594,26 @@ def main(argv):
     if prev:
         for f in four:
             oldf = f.replace(ver, prev)
-            h = curl(["-A", UA, "-I", "%s/downloads/%s" % (SITE, oldf)]).stdout.decode("utf-8", "replace")
-            m = re.search(r"(?i)content-length:\s*(\d+)", h)
-            if not m or int(m.group(1)) == 0:
-                print("  ⚠ 구자산 크기 조회 실패 — 용량 토큰 치환 생략: %s" % oldf)
+            # ★같은 수신 검증 규율을 탄다 — 잘린 헤더의 Content-Length 로 **틀린 용량**을
+            #   페이지에 박는 경로를 봉한다. 3분류로 갈라 처리한다:
+            h = http_fetch("%s/downloads/%s" % (SITE, oldf), head=True)
+            if h.err:
+                # 미판정 — 구자산 크기를 확인하지 못했다. 이대로 두면 페이지에 **구 용량이
+                # 남은 채** 발행되고, 그건 조용한 오배포다. 배포는 비가역이므로 중단한다.
+                print("::error::구자산 크기 미판정 — 중단(fail-closed): %s | %s" % (oldf, h.err),
+                      file=sys.stderr)
+                print("::error::  용량 토큰을 확인 없이 남긴 채 발행하지 않는다. 재실행하라.",
+                      file=sys.stderr)
+                return 1
+            if not (200 <= h.status < 300):
+                # 원격 확정 오류 — 구자산이 이미 정리됐다는 확정 답이다(비교 대상 없음 = 생략).
+                print("  ⚠ 구자산 없음/원격 확정 오류(HTTP %d) — 용량 토큰 치환 생략: %s"
+                      % (h.status, oldf))
                 continue
-            o, n = mib(int(m.group(1))), mib(sizes[f])
+            if not h.clen:
+                print("  ⚠ 구자산 Content-Length 없음/0 — 용량 토큰 치환 생략: %s" % oldf)
+                continue
+            o, n = mib(h.clen), mib(sizes[f])
             if o == n:
                 continue
             tok = "%dMB" % o
@@ -461,8 +641,13 @@ def main(argv):
     print("── 페이지 업로드 ──")
     with tempfile.TemporaryDirectory() as td:
         mp, dp = os.path.join(td, "index.html"), os.path.join(td, "dl.html")
-        open(mp, "w", encoding="utf-8").write(new_main)
-        open(dp, "w", encoding="utf-8").write(new_dl)
+        # ★반드시 닫고 나서 올린다 — 흘려 쓴 핸들(open(...).write(...))은 flush 시점이
+        #   인터프리터 GC 에 달려 있어, **덜 쓰인 파일을 업로드**할 여지를 남긴다.
+        #   이 파일이 봉하려는 결함(부분 본문 발행)과 같은 클래스다.
+        with open(mp, "w", encoding="utf-8") as fh:
+            fh.write(new_main)
+        with open(dp, "w", encoding="utf-8") as fh:
+            fh.write(new_dl)
         for local, remote in ((mp, "index.html"), (dp, "downloads/index.html")):
             ok = ftp_put(e, local, remote)
             print("  %s %s" % ("✓" if ok else "✗", remote))

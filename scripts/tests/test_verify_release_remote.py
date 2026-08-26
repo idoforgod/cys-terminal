@@ -125,11 +125,12 @@ class FakeCurl(object):
         with open(hdr, "w") as fh:
             fh.write(htxt)
 
-        # 실 curl 재현: `-I` 는 헤더를 -o 로 흘리고, `--fail` 은 4xx/5xx 본문을 쓰지 않는다.
-        if head:
-            payload = htxt.encode()
-        elif r.http >= 400:
+        # 실 curl 재현: `--fail` 은 4xx/5xx 응답을 -o 로 **아예 흘리지 않는다**(HEAD 포함).
+        # 성공한 `-I` 는 헤더를 -o 로 흘린다.
+        if r.http >= 400:
             payload = b""
+        elif head:
+            payload = htxt.encode()
         else:
             payload = r.body
         with open(dest, "wb") as fh:
@@ -260,13 +261,101 @@ class BoundedRetryTests(unittest.TestCase):
         self.assertEqual(f.digest, sha(FULL_BODY))
 
     def test_10_http_error_is_not_retried(self):
-        """4xx 는 원격의 상태다 — 재시도해도 같은 답이므로 **한 번만** 부르고 적색 재료로 넘긴다."""
+        """4xx(429 제외)는 원격의 **확정 답**이다 — 재시도해도 같으므로 **한 번만** 부르고
+        적색 재료로 넘긴다."""
         fake = FakeCurl({ASSET_URL: [Resp(http=404)]})
         f = vr.fetch(ASSET_URL, want_text=False, _runner=fake, _sleep=NoSleep())
         self.assertEqual(fake.urls_called(ASSET_URL), 1, "HTTP 404 를 재시도했다")
         self.assertTrue(f.download_ok, "404 를 '다운로드 실패'로 오분류했다")
         self.assertEqual(f.status, 404)
         self.assertFalse(f.http_ok)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⓖ ★MF1 — 429·5xx 는 '원격이 틀렸다'가 아니라 '지금 대답을 못 한다'다 (2026-08-27 2라운드)
+#
+#   1라운드 구현은 `status >= 400` 을 통째로 접어 **시도 1회**로 exit 1 BLOCK 을 냈다.
+#   호스팅/CDN 블립 1회 = 릴리스 BLOCK — 이 파일이 죽이겠다고 선언한 위양성 클래스 그 자체다.
+# ──────────────────────────────────────────────────────────────────────────────
+class TransientStatusTests(unittest.TestCase):
+
+    def test_20_transient_classifier_boundary(self):
+        """경계를 한 곳(is_transient_status)에만 두고 그 경계를 문자로 못박는다."""
+        for s in (429, 500, 502, 503, 504, 599):
+            self.assertTrue(vr.is_transient_status(s), "HTTP %d 를 확정 오류로 접었다" % s)
+        for s in (400, 401, 403, 404, 410, 418, 428, 430, 451):
+            self.assertFalse(vr.is_transient_status(s), "HTTP %d 를 일시 장애로 봤다" % s)
+
+    def test_21_503_is_retried_max_attempts(self):
+        """★MF1 핀 (a) — 503 은 정확히 MAX_ATTEMPTS 회 호출된다(시도 1회로 끝나지 않는다)."""
+        fake = FakeCurl({ASSET_URL: [Resp(http=503)]})
+        s = NoSleep()
+        with quiet():
+            f = vr.fetch(ASSET_URL, want_text=False, _runner=fake, _sleep=s)
+        self.assertEqual(fake.urls_called(ASSET_URL), vr.MAX_ATTEMPTS,
+                         "503 을 재시도하지 않았다 — 블립 1회로 릴리스를 BLOCK 한다")
+        self.assertEqual(len(s.slept), vr.MAX_ATTEMPTS - 1)
+        self.assertFalse(f.download_ok, "503 소진을 '확정 답'으로 접었다")
+        self.assertIn("원격 일시 불응답(HTTP 503)", f.err)
+        self.assertIn("시도 %d회 소진" % vr.MAX_ATTEMPTS, f.err)
+
+    def test_22_429_is_retried(self):
+        """429 는 4xx 지만 rate limit 이다 — 확정 답이 아니므로 재시도한다."""
+        fake = FakeCurl({ASSET_URL: [Resp(http=429)]})
+        with quiet():
+            f = vr.fetch(ASSET_URL, want_text=False, _runner=fake, _sleep=NoSleep())
+        self.assertEqual(fake.urls_called(ASSET_URL), vr.MAX_ATTEMPTS)
+        self.assertFalse(f.download_ok)
+
+    def test_23_transient_then_200_recovers(self):
+        """★MF1 핀 (b) 전반 — 첫 시도 503 → 재시도 200 이면 **회복**이다(재시도 사실은 남는다)."""
+        fake = FakeCurl({ASSET_URL: [Resp(http=503), Resp(body=FULL_BODY)]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            f = vr.fetch(ASSET_URL, want_text=False, want_digest=True,
+                         _runner=fake, _sleep=NoSleep())
+        self.assertTrue(f.download_ok, f.err)
+        self.assertEqual(f.digest, sha(FULL_BODY))
+        self.assertEqual(f.tries, 2)
+        self.assertIn("HTTP 503", buf.getvalue())      # 침묵 금지 — 사유가 남는다
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⓗ ★MF2 — 미판정은 자산 상태를 **어느 방향으로도** 단언하지 않는다 (2026-08-27 2라운드)
+#
+#   1라운드 전: "자산이 썩었다"고 단언 → 1라운드 후: "자산 문제가 아니다"라고 단언.
+#   근거 없는 주장이 방향만 바꿔 살아남았다. 이 도구는 오리진에 박힌 부분 자산과 경로에서
+#   끊긴 전송을 **가릴 근거가 없다**(수신 측에서 같은 증상). 말할 수 있는 건 "판정 못 했다"뿐.
+# ──────────────────────────────────────────────────────────────────────────────
+class UndeterminedWordingTests(unittest.TestCase):
+
+    def test_24_repeated_same_point_failure_is_reported_as_observation(self):
+        """오리진이 CL 8192 를 선언하고 3000B 만 보내고 끊는 경우 — 매 시도 같은 지점에서
+        끝난다. 그 **관측 사실**을 그대로 남기되 원인은 지목하지 않는다."""
+        fake = FakeCurl({ASSET_URL: [Resp(body=b"z" * 3000, rc=0, clen=8192)]})
+        with quiet():
+            f = vr.fetch(ASSET_URL, want_text=False, want_digest=True,
+                         _runner=fake, _sleep=NoSleep())
+        self.assertFalse(f.download_ok)
+        self.assertIn("★관측", f.err)
+        self.assertIn("수신 3000B", f.err)                       # 사실
+        self.assertIn("원인을 판정하지 않는다", f.err)            # 해석 금지 명시
+        self.assertEqual(len(f.attempts_log), vr.MAX_ATTEMPTS)   # 시도별 관측이 다 남는다
+        self.assertIsNone(f.digest)
+
+    def test_25_varying_failure_point_gets_no_sameness_claim(self):
+        """매 시도 다른 지점에서 끝났으면 '같은 지점' 이라는 **사실 주장을 하지 않되**,
+        시도별 값은 그대로 남긴다(주장 금지 ≠ 침묵)."""
+        fake = FakeCurl({ASSET_URL: [Resp(body=b"z" * 100, rc=0, clen=8192),
+                                     Resp(body=b"z" * 900, rc=0, clen=8192),
+                                     Resp(body=b"z" * 2500, rc=0, clen=8192)]})
+        with quiet():
+            f = vr.fetch(ASSET_URL, want_text=False, _runner=fake, _sleep=NoSleep())
+        self.assertFalse(f.download_ok)
+        self.assertNotIn("같은 지점", f.err)        # 없는 규칙성을 주장하지 않는다
+        self.assertIn("시도별", f.err)              # 그래도 사실은 남는다
+        for n in ("100B", "900B", "2500B"):
+            self.assertIn(n, f.err)
 
 
 class CurlArgvContractTests(unittest.TestCase):
@@ -357,8 +446,27 @@ class EndToEndVerdictTests(unittest.TestCase):
         self.assertEqual(rc, vr.EXIT_DOWNLOAD_FAILED, out)
         self.assertIn("DOWNLOAD_FAILED", out)
         self.assertNotIn("해시 불일치", out)      # ★자산을 적색으로 부르지 않는다
-        self.assertIn("자산 적색이 아니다", out)   # ★사람에게 책임 소재를 말한다
+        self.assertIn("미판정", out)               # ★첫 줄이 분류를 이름으로 댄다
+        self.assertIn("판정되지 않았다", out)
+        # ★MF2 (2026-08-27) — 1라운드가 남겼던 **반대 방향의 단언**이 사라졌는지 못박는다.
+        #   구 문면: "이것은 **자산 적색이 아니다**" ← 이 도구가 말할 근거가 없는 주장이다.
+        self.assertNotIn("자산 적색이 아니다", out)
+        self.assertIn("어느 쪽으로도 읽지 마라", out)   # 무판정임을 명시
         self.assertEqual(fake.urls_called(ASSET_URL), vr.MAX_ATTEMPTS)  # 유계 재시도
+
+    def test_14b_origin_serves_partial_asset_is_undetermined_not_green(self):
+        """★MF2 본체 — 오리진이 CL 8192 를 선언하고 3000B 만 보내고 끊는 경우(=실제로 오리진에
+        박힌 부분 자산). 이 도구는 그것과 '경로에서 끊긴 전송'을 가릴 수 없다.
+        요구: **초록이 아니고**(exit != 0) **적색도 아니며**(exit != 1) 관측 사실이 그대로 남는다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[ASSET_URL] = [Resp(body=b"z" * 3000, rc=0, clen=8192)]
+        rc, out, _ = self._run(plan)
+        self.assertNotEqual(rc, vr.EXIT_OK, "부분 자산을 초록으로 통과시켰다\n" + out)
+        self.assertNotEqual(rc, vr.EXIT_FAIL, "판정 근거 없이 적색으로 단언했다\n" + out)
+        self.assertEqual(rc, vr.EXIT_DOWNLOAD_FAILED, out)
+        self.assertIn("★관측", out)               # 사실은 그대로 보고한다
+        self.assertIn("수신 3000B", out)
+        self.assertNotIn("해시 불일치", out)
 
     def test_15_true_hash_mismatch_is_still_exit1_red(self):
         """★음성 대조 — 완전히 수신됐는데 바이트가 다르면 **여전히 자산 적색(exit 1)**이다.
@@ -405,6 +513,71 @@ class EndToEndVerdictTests(unittest.TestCase):
         """네 종료코드가 서로 다른 값이어야 문면 없이도 구분된다."""
         codes = [vr.EXIT_OK, vr.EXIT_FAIL, vr.EXIT_USAGE, vr.EXIT_DOWNLOAD_FAILED]
         self.assertEqual(len(set(codes)), 4, codes)
+
+    # ── ★MF1 종단 핀 (b) — 503 은 exit 로 갈린다 ──────────────────────────────
+    def test_26_persistent_503_is_exit3_not_red(self):
+        """★MF1 핀 (b) 후반 — 503 이 계속되면 **미판정 exit 3**이다.
+        1라운드 구현은 여기서 '자산 부재/오류(HTTP 503)' 문면으로 **exit 1 BLOCK** 을 냈고,
+        사람은 그 문면을 읽고 발행 결함으로 오독했다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[ASSET_URL] = [Resp(http=503)]
+        rc, out, fake = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_DOWNLOAD_FAILED, out)
+        self.assertEqual(fake.urls_called(ASSET_URL), vr.MAX_ATTEMPTS, out)
+        self.assertNotIn("자산 부재", out)          # ★발행 결함으로 오독시키지 않는다
+        self.assertIn("HTTP 503", out)              # 사실은 남는다
+
+    def test_27_503_then_200_is_green(self):
+        """★MF1 핀 (b) 전반 종단 — 첫 시도 503, 재시도 200 이면 **exit 0**이다.
+        호스팅/CDN 블립 1회로 릴리스가 BLOCK 되지 않는다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[ASSET_URL] = [Resp(http=503), Resp(body=FULL_BODY)]
+        rc, out, fake = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_OK, out)
+        self.assertIn("7/7 PASS", out)
+        self.assertIn("재시도 %d회 후 성공" % 1, out)   # 침묵 금지
+        self.assertEqual(fake.urls_called(ASSET_URL), 2)
+
+    def test_28_head_503_is_undetermined_not_red(self):
+        """HEAD 경로(③④)도 같은 규율을 탄다 — 5xx 는 '자산 부재'가 아니다."""
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan["HEAD " + ASSET_URL] = [Resp(http=503)]
+        rc, out, fake = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_DOWNLOAD_FAILED, out)
+        # ③(용량)·④(링크) 가 같은 URL 을 각각 HEAD 한다 → 2 × MAX_ATTEMPTS.
+        self.assertEqual(fake.urls_called(ASSET_URL, head=True), 2 * vr.MAX_ATTEMPTS, out)
+        self.assertNotIn("자산 부재", out)
+
+    def test_29_verdict_headline_names_the_category(self):
+        """★3분류 계약 — 사람이 **첫 줄 + exit** 만 보고 어느 것인지 알아야 한다."""
+        # ⓐ 자산 무결성 실패
+        bodies = {f: FULL_BODY for f in FOUR}
+        bodies[FOUR[0]] = OTHER_BODY
+        rc, out, _ = self._run(build_site(bodies, sums_bodies={f: FULL_BODY for f in FOUR}))
+        self.assertEqual(rc, vr.EXIT_FAIL)
+        self.assertIn("판정: 적색 — %s" % vr.KIND_INTEGRITY, out)
+
+        # ⓑ 원격 확정 오류(4xx)
+        self.setUp()
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[ASSET_URL] = [Resp(http=404)]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_FAIL)
+        self.assertIn("판정: 적색 — %s" % vr.KIND_REMOTE, out)
+
+        # ⓒ 미판정
+        self.setUp()
+        plan = build_site({f: FULL_BODY for f in FOUR})
+        plan[ASSET_URL] = [Resp(http=503)]
+        rc, out, _ = self._run(plan)
+        self.assertEqual(rc, vr.EXIT_DOWNLOAD_FAILED)
+        self.assertIn("판정: %s" % vr.KIND_UNDETERMINED, out)
+
+        # ⓓ 초록
+        self.setUp()
+        rc, out, _ = self._run(build_site({f: FULL_BODY for f in FOUR}))
+        self.assertEqual(rc, vr.EXIT_OK)
+        self.assertIn("판정: 전건 통과", out)
 
 
 if __name__ == "__main__":

@@ -29,9 +29,16 @@
 사용: python3 scripts/verify-release-remote.py 0.14.5 [이전버전]
       (이전버전 생략 시 ① 은 건너뛴다)
       python3 scripts/verify-release-remote.py --self-test   # ⑦ 집계 로직 셀프테스트(무접촉)
-종료코드: 0 = 전건 통과 · 1 = **원격이 틀렸다**(발행 미완 · 자산 적색) · 2 = 사용법
-          3 = **DOWNLOAD_FAILED — 게이트 자신의 다운로드가 실패했다**(원격 판정 불가 · 재실행하라)
-          ★1 과 3 의 구분이 이 스크립트의 계약이다 — 아래 '전송 판정 계약' 절 참조.
+종료코드 — ★판정은 **세 분류**이고 첫 줄이 어느 것인지 말한다(2026-08-27 개정):
+  0 = 전건 통과
+  1 = **적색** — 원격이 틀렸다. 두 종류가 여기 모인다(첫 줄이 어느 쪽인지 이름을 댄다):
+        · 자산 무결성 실패 — 완전히 수신한 바이트가 SHA256SUMS 와 다르다 / 미등재
+        · 원격 확정 오류   — 4xx(429 제외). 원격이 "그건 없다/못 준다"고 **확정 답**을 했다
+  2 = 사용법
+  3 = **미판정(DOWNLOAD_FAILED)** — 이 도구가 그 항목을 **판정하지 못했다**. 수신이 완결되지
+      않았거나(전송 중단·부분 본문) 원격이 일시적으로 대답을 못 했다(429·5xx)이며, 유계 재시도
+      상한(MAX_ATTEMPTS)을 소진한 상태다. ★적색도 초록도 아니다 — 이 도구에는 둘을 가릴 근거가 없다.
+  ★1 과 3 의 구분이 이 스크립트의 계약이다 — 아래 '전송 판정 계약' 절 참조.
 
 동반 회귀 테스트: `python3 scripts/tests/test_verify_release_remote.py` (합성 페이크 curl · 네트워크 불요)
 """
@@ -103,11 +110,26 @@ def macnote_verdict(counts):
 #   구분할 수 없었다.** 같은 무방비가 페이지 GET·HEAD 경로에도 있었다(부분 HTML → 문자열 집계
 #   오답 → ①②③④⑤⑦ 전 항목 위양성).
 #
-# ★수리 원칙 — 판정을 **두 종류로 쪼갠다**:
-#     · 다운로드 실패 = 게이트 자신의 문제 → 유계 재시도 → 그래도 실패면 DOWNLOAD_FAILED(exit 3)
-#     · 원격 내용 불일치(해시 불일치·404·문자열 오집계) = 자산 적색 → FAIL(exit 1)
+# ★수리 원칙 — 판정을 **세 종류로 쪼갠다** (2026-08-27 2라운드 개정):
+#     · 자산 무결성 실패  = 완전 수신한 바이트가 SUMS 와 다르다/미등재  → FAIL(exit 1)
+#     · 원격 확정 오류    = 4xx(429 제외). 원격의 **확정 답**이다        → FAIL(exit 1)
+#     · 미판정            = 전송 미완결(중단·부분 본문) 또는 429·5xx 소진 → DOWNLOAD_FAILED(exit 3)
 #   이유: 게이트가 무작위 적색을 내면 사람은 진짜 적색까지 "또 그거겠지"로 흘린다.
-#   exit·문면이 갈려야 "게이트가 틀렸나 자산이 틀렸나"를 즉시 안다.
+#   exit·첫 줄이 갈려야 "자산이 틀렸나 · 원격이 없다고 했나 · 내가 못 봤나"를 즉시 안다.
+#
+# ★2026-08-27 MF1 수리 — 1라운드 구현은 `status >= 400` 을 통째로 '원격이 틀렸다'로 접고
+#   재시도를 한 번도 하지 않았다. 그 정당화("4xx 는 원격의 상태다 — 재시도해도 같다")는
+#   **4xx 에만** 성립한다. 503·502·504·429 는 '릴리스가 틀렸다'가 아니라 '지금 대답을 못 한다'다.
+#   호스팅/CDN 블립 1회로 릴리스가 BLOCK 되는 것은 이 파일이 죽이겠다고 선언한 위양성
+#   클래스 그 자체다. 이제 429·5xx 는 다운로드 실패와 **같은 유계 재시도**를 타고, 소진되면
+#   적색이 아니라 **미판정**으로 접힌다.
+#
+# ★2026-08-27 MF2 수리 — 미판정의 문면에서 **단언을 제거**했다. 구 문면은 "이것은 자산 적색이
+#   아니다"라고 단언했는데, 이 도구는 그렇게 말할 근거가 없다: 오리진이 Content-Length 8192 를
+#   선언하고 3000B 만 보내고 끊는 **실제 부분 자산**과, 경로에서 전송이 끊긴 경우는 수신 측에서
+#   **같은 증상**이다. 방향만 바뀐 근거 없는 주장은 여전히 근거 없는 주장이다. 그래서 미판정은
+#   "판정하지 못했다"만 말하고, 재시도가 매번 같은 지점에서 끝났다면 그 **관측 사실만** 덧붙인다
+#   (해석·원인 지목 금지 — 판단은 사람 몫).
 MAX_ATTEMPTS = 3                 # ★유계 — 최초 1회 + 재시도 2회. 이 레포의 재시도 규율
                                  #   (`retry-loop-needs-stop-condition`): 상한 없는 재시도 금지.
 RETRY_BACKOFF_S = (2.0, 5.0)     # 지수 백오프 · len ≥ MAX_ATTEMPTS-1 (부족하면 마지막 값 반복)
@@ -115,22 +137,41 @@ PAGE_TIMEOUT = 120               # 페이지·HEAD 1회 상한(초) — 최악 3
 ASSET_TIMEOUT = 600              # 자산 본문 1회 상한(초) — 최악 3×600s = 30분(유계)
 
 EXIT_OK = 0
-EXIT_FAIL = 1                    # 원격이 틀렸다(발행 미완)
+EXIT_FAIL = 1                    # 적색 — 원격이 틀렸다(자산 무결성 실패 · 원격 확정 오류 4xx)
 EXIT_USAGE = 2
-EXIT_DOWNLOAD_FAILED = 3         # 게이트가 못 받았다(판정 불가) — ★자산 적색 아님
+EXIT_DOWNLOAD_FAILED = 3         # 미판정 — 이 도구가 판정하지 못했다. ★적색도 초록도 아니다
+
+# ── 적색의 하위 분류(첫 줄에 이름이 찍힌다) ──
+KIND_INTEGRITY = "자산 무결성 실패"       # 완전 수신 바이트 ≠ SUMS · 미등재
+KIND_REMOTE = "원격 확정 오류(4xx)"       # 404 등 — 원격이 "없다"고 확정 답을 했다
+KIND_CONTENT = "페이지 내용 불일치"       # 버전·용량·마커 등 문자열 판정 실패
+KIND_UNDETERMINED = "미판정"
 
 _CL_RE = re.compile(r"(?im)^\s*content-length:\s*(\d+)\s*$")
 
 
-class Fetched(object):
-    """한 URL 전송의 결과 — **두 실패를 다른 필드로 분리한다.**
+def is_transient_status(status):
+    """유계 재시도 대상인 HTTP 상태인가 — **429 와 5xx**.
 
-      · err  != None → **다운로드 실패**(전송 자체가 끝나지 못했다) = 게이트 문제
-      · err  == None → 전송은 완결됐다. 그 다음 판정은 status/text/digest 로 한다
-                       (status ≥ 400 · 해시 불일치 = **원격 내용 문제** = 적색)
+    ★근거: 이 둘은 "릴리스가 틀렸다"가 아니라 "지금 대답을 못 한다"다(rate limit·게이트웨이·
+      과부하·유지보수). 반면 4xx(429 제외)는 원격의 **확정 답**이라 재시도해도 같다.
+      경계를 여기 한 곳에만 둔다 — 호출부가 각자 상태코드를 해석하지 않게 하기 위해서다.
+    """
+    return status == 429 or status >= 500
+
+
+class Fetched(object):
+    """한 URL 전송의 결과 — **판정 불가와 확정 답을 다른 필드로 분리한다.**
+
+      · err  != None → **미판정 재료**: 수신이 완결되지 못했거나(중단·부분 본문) 원격이
+                       일시적으로 대답을 못 했다(429·5xx). 유계 재시도를 타고, 소진되면
+                       DOWNLOAD_FAILED(exit 3). ★이 도구는 원인을 판정하지 않는다.
+      · err  == None → 원격이 **확정 답**을 줬고 수신도 완결됐다. 그 다음 판정은
+                       status/text/digest 로 한다(4xx · 해시 불일치 = 적색).
     """
 
-    __slots__ = ("err", "status", "text", "digest", "nbytes", "clen", "tries", "retries")
+    __slots__ = ("err", "status", "text", "digest", "nbytes", "clen", "tries", "retries",
+                 "attempts_log")
 
     def __init__(self, err=None, status=0, text="", digest=None, nbytes=0, clen=None):
         self.err = err
@@ -140,7 +181,8 @@ class Fetched(object):
         self.nbytes = nbytes
         self.clen = clen
         self.tries = 1
-        self.retries = []     # 재시도 사유 로그 — ★침묵 금지(있었으면 반드시 남는다)
+        self.retries = []       # 재시도 사유 로그 — ★침묵 금지(있었으면 반드시 남는다)
+        self.attempts_log = []  # 시도별 **관측 사실**(HTTP·수신 바이트) — 해석 없음
 
     @property
     def download_ok(self):
@@ -212,17 +254,25 @@ def _attempt(url, timeout, head, want_text, want_digest, runner):
         rc, w_out, serr = runner(curl_argv(url, timeout, head, dest, hdr))
         status = _http_code(w_out)
         header_text = _read_text(hdr)
-        # ★분기 1 — 응답은 왔고 4xx/5xx 다 → **원격 내용 문제**(재시도해도 같다).
+        nbytes = os.path.getsize(dest) if os.path.exists(dest) else 0
+        clen = _content_length(header_text)
+        # ★분기 1 — 응답은 왔고 상태가 4xx/5xx 다. **여기서 둘로 가른다**(2026-08-27 MF1 수리).
         #   --fail 이 이걸 비0 rc 로 접지만 **rc 값은 믿을 수 없다**: 실측(2026-08-25)에서
         #   HTTP/2 404 는 rc 22 가 아니라 **rc 56**으로 나왔다. 그래서 rc 가 아니라
         #   `%{http_code}` 로 가른다. (rc 검사는 분기 2 가 맡는다.)
         if status >= 400:
-            return Fetched(status=status, text=header_text if head else "")
-        # ★분기 2 — returncode 검사(구현이 통째로 빠뜨렸던 축). 비0 = 다운로드 실패.
+            if is_transient_status(status):
+                # 429·5xx = '지금 대답을 못 한다'. 재시도가 다른 답을 줄 수 있으므로
+                # 다운로드 실패와 **같은 유계 재시도**에 태운다(소진되면 미판정).
+                return Fetched(err="원격 일시 불응답(HTTP %d)" % status,
+                               status=status, nbytes=nbytes, clen=clen)
+            # 4xx(429 제외) = 원격의 **확정 답**. 재시도해도 같다 → 즉시 적색 재료.
+            return Fetched(status=status, text=header_text if head else "",
+                           nbytes=nbytes, clen=clen)
+        # ★분기 2 — returncode 검사(구현이 통째로 빠뜨렸던 축). 비0 = 수신 미완결.
         if rc != 0:
-            return Fetched(err="curl 종료코드 %d%s" % (rc, _tail(serr)), status=status)
-        nbytes = os.path.getsize(dest) if os.path.exists(dest) else 0
-        clen = _content_length(header_text)
+            return Fetched(err="curl 종료코드 %d%s" % (rc, _tail(serr)), status=status,
+                           nbytes=nbytes, clen=clen)
         if head:
             # HEAD 는 본문이 없다 — 헤더가 산출물이고 Content-Length 는 '선언된 크기'다.
             return Fetched(status=status, text=header_text, clen=clen)
@@ -256,12 +306,35 @@ def _tail(serr):
     return (" · " + line[:200]) if line else ""
 
 
+def _repeat_note(seen):
+    """유계 재시도를 소진했을 때 **시도별 관측 사실**을 덧붙인다.
+
+    ★해석 금지 (MF2) — 매 시도가 같은 지점에서 끝났다면 그건 사람이 알아야 할 사실이지만,
+      원인이 오리진(실제로 박힌 부분 자산)인지 경로(전송 절단)인지 이 도구는 **가릴 근거가
+      없다**(수신 측에서 두 증상은 같다). 그래서 원인을 지목하지 않고 관측만 넘긴다.
+    ★침묵 금지 — 지점이 매번 달랐다면 '같다'고 주장하지 않되, 시도별 값은 그대로 남긴다.
+    """
+    if len(seen) < 2:
+        return ""
+    facts = "; ".join("%d회차 HTTP %s · 수신 %dB" % (n + 1, s or "?", b)
+                      for n, (s, b, _) in enumerate(seen))
+    if len({(s, b) for s, b, _ in seen}) == 1:
+        status, nbytes, _ = seen[0]
+        return (" ★관측: 시도 %d회가 모두 같은 지점에서 끝났다(HTTP %s · 수신 %dB) — "
+                "사실만 기록한다(이 도구는 원인을 판정하지 않는다)"
+                % (len(seen), status or "?", nbytes))
+    return (" ★관측: 시도별 [%s] — 사실만 기록한다(이 도구는 원인을 판정하지 않는다)" % facts)
+
+
 def fetch(url, timeout=PAGE_TIMEOUT, head=False, want_text=True, want_digest=False,
           attempts=MAX_ATTEMPTS, _runner=None, _sleep=None):
     """유계 재시도로 URL 을 받는다 → Fetched.
 
-    ★재시도 대상은 **다운로드 실패뿐**이다(전송 중단·부분 본문). HTTP 4xx/5xx 는
-      원격의 상태이므로 재시도하지 않는다 — 같은 답이 올 뿐이고, 적색을 늦출 뿐이다.
+    ★재시도 대상 (2026-08-27 MF1 개정):
+        · 수신 미완결(전송 중단·부분 본문)  → 재시도
+        · **429·5xx**(원격이 지금 대답을 못 함) → 재시도  ← 구현이 빠뜨렸던 축
+        · 4xx(429 제외) = 원격의 확정 답     → 재시도 **안 한다**(같은 답이 올 뿐)
+      해시 불일치도 재시도 대상이 아니다 — 같은 결과에 시간만 쓴다(호출부가 결정한다).
     ★상한은 `range(attempts)` 가 구조적으로 강제한다(무한 루프 불가 · 재시도 규율).
     ★재시도가 있었으면 즉시 로그로 남기고 결과에도 남긴다(침묵 금지).
     """
@@ -269,6 +342,7 @@ def fetch(url, timeout=PAGE_TIMEOUT, head=False, want_text=True, want_digest=Fal
     sleeper = _sleep or time.sleep
     attempts = max(1, int(attempts))
     retries = []
+    seen = []                                      # 시도별 관측 사실(해석 없음)
     r = None
     for i in range(attempts):                      # ← 유계
         if i:
@@ -278,25 +352,37 @@ def fetch(url, timeout=PAGE_TIMEOUT, head=False, want_text=True, want_digest=Fal
             print("  ↻ %s | %s" % (note, url))
             sleeper(delay)
         r = _attempt(url, timeout, head, want_text, want_digest, runner)
+        seen.append((r.status, r.nbytes, r.err))
         if r.download_ok:
             break
     r.tries = len(retries) + 1
     r.retries = retries
+    r.attempts_log = ["시도 %d: HTTP %s · 수신 %dB%s"
+                      % (n + 1, s or "?", b, (" · " + e) if e else "")
+                      for n, (s, b, e) in enumerate(seen)]
     if not r.download_ok:
-        r.err = "%s [시도 %d회 소진]" % (r.err, r.tries)
+        r.err = "%s [시도 %d회 소진]%s" % (r.err, r.tries, _repeat_note(seen))
     return r
 
 
-def check(name, ok, detail=""):
-    results.append((name, "PASS" if ok else "FAIL"))
-    print(("PASS " if ok else "FAIL ") + name + (" | " + detail if detail else ""))
+def check(name, ok, detail="", kind=KIND_CONTENT):
+    """PASS/FAIL 을 기록한다. `kind` 는 **적색의 하위 분류**이고 첫 줄 요약에 이름이 찍힌다."""
+    results.append((name, "PASS" if ok else "FAIL", "" if ok else kind))
+    print(("PASS " if ok else "FAIL " + "[%s] " % kind) + name
+          + (" | " + detail if detail else ""))
 
 
 def download_failed(name, reason, detail=""):
-    """★적색이 아니다 — 게이트가 못 받아서 **판정하지 못했다**는 제3의 결과."""
-    results.append((name, "DOWNLOAD_FAILED"))
+    """★적색도 초록도 아니다 — 이 도구가 그 항목을 **판정하지 못했다**(미판정).
+
+    ★문면 규율 (2026-08-27 MF2): 여기서 자산의 상태를 **어느 방향으로도 단언하지 않는다.**
+      오리진에 실제로 박힌 부분 자산과 경로에서 끊긴 전송은 수신 측에서 같은 증상이고,
+      이 도구에는 둘을 가릴 근거가 없다. 말할 수 있는 것은 "확인하지 못했다"뿐이다.
+    """
+    results.append((name, "DOWNLOAD_FAILED", KIND_UNDETERMINED))
     download_failures.append("%s: %s" % (name, reason))
-    print("DOWNLOAD_FAILED " + name + " | 게이트 다운로드 실패(원격 무결성 판정 불가): " + reason
+    print("DOWNLOAD_FAILED [미판정] " + name
+          + " | 이 도구는 이 항목을 판정하지 못했다(수신 미완결 · 원격 내용 미확인): " + reason
           + ((" | " + detail) if detail else ""))
 
 
@@ -305,28 +391,44 @@ def http_detail(f):
 
 
 def verdict():
-    """세 결과를 **다른 종료코드**로 낸다 — 사람이 문면만 보고 책임 소재를 안다.
+    """세 판정을 **다른 종료코드 + 첫 줄의 이름**으로 낸다.
 
-      · FAIL 하나라도 있음        → 1 (원격이 틀렸다 · 확정 적색이 판정을 지배한다)
-      · FAIL 0 · DOWNLOAD_FAILED  → 3 (게이트가 못 받았다 · **판정 불가** — 적색 아님)
+      · FAIL 하나라도 있음        → 1 적색 (하위 분류를 첫 줄이 이름으로 댄다:
+                                     자산 무결성 실패 / 원격 확정 오류(4xx) / 페이지 내용 불일치)
+      · FAIL 0 · DOWNLOAD_FAILED  → 3 미판정 (**적색도 초록도 아니다**)
       · 전건 PASS                 → 0
     """
-    npass = sum(1 for _, s in results if s == "PASS")
-    nfail = sum(1 for _, s in results if s == "FAIL")
-    ndl = sum(1 for _, s in results if s == "DOWNLOAD_FAILED")
-    line = "\n=== %d/%d PASS ===" % (npass, len(results))
-    if ndl:
-        line += " (DOWNLOAD_FAILED %d건 — 판정 불가)" % ndl
-    print(line)
-    if ndl:
-        print("\n!! DOWNLOAD_FAILED %d건 — 이것은 **자산 적색이 아니다**. 게이트 자신의 다운로드가"
-              " 유계 재시도 %d회를 소진하고 실패했다(전송 중단·부분 본문). 해당 항목의 원격"
-              " 무결성은 이번 실행으로 **판정되지 않았다** — 재실행하라." % (ndl, MAX_ATTEMPTS))
+    npass = sum(1 for r in results if r[1] == "PASS")
+    fails = [(r[0], r[2]) for r in results if r[1] == "FAIL"]
+    dls = [r[0] for r in results if r[1] == "DOWNLOAD_FAILED"]
+    tally = "%d/%d PASS" % (npass, len(results))
+
+    # ★첫 줄 하나로 "어느 분류인가 · 어떤 exit 인가"가 끝나야 한다.
+    if fails:
+        head = "적색 — %s (exit %d)" % (" + ".join(sorted({k for _, k in fails})), EXIT_FAIL)
+    elif dls:
+        head = "미판정 — 이 실행은 원격을 판정하지 못했다 (exit %d)" % EXIT_DOWNLOAD_FAILED
+    else:
+        head = "전건 통과 (exit %d)" % EXIT_OK
+    print("\n=== 판정: %s · %s ===" % (head, tally)
+          + ((" (미판정 %d건)" % len(dls)) if dls and fails else ""))
+
+    if fails:
+        for name, k in fails:
+            print("   · [%s] %s" % (k, name))
+    if dls:
+        print("\n!! 미판정(DOWNLOAD_FAILED) %d건 — 아래 항목은 이번 실행에서 **판정되지 않았다**."
+              % len(dls))
+        print("   수신이 완결되지 않았거나(전송 중단·부분 본문) 원격이 일시적으로 대답을 못 했고"
+              "(HTTP 429·5xx), 유계 재시도 %d회를 소진했다." % MAX_ATTEMPTS)
+        print("   ★이 결과에서 자산의 상태는 **어느 쪽으로도 읽지 마라** — 이 도구에는 '오리진에"
+              " 박힌 부분 자산'과 '경로에서 끊긴 전송'을 가릴 근거가 없다(수신 측에서 같은 증상).")
+        print("   조치: 그대로 재실행하라. 반복되면 아래 관측 사실을 사람이 판단하라.")
         for d in download_failures:
             print("   · " + d)
-    if nfail:
+    if fails:
         return EXIT_FAIL
-    if ndl:
+    if dls:
         return EXIT_DOWNLOAD_FAILED
     return EXIT_OK
 
@@ -382,7 +484,9 @@ def main(argv):
         download_failed("메인 페이지 수신", page.err)
         return verdict()
     if not page.http_ok or not page.text:
-        check("메인 페이지 수신", False, http_detail(page))
+        # 여기 도달하는 상태는 4xx(429 제외)뿐이다 — 429·5xx 는 위 분기에서 미판정으로 접힌다.
+        check("메인 페이지 수신", False, http_detail(page),
+              kind=KIND_REMOTE if page.status >= 400 else KIND_CONTENT)
         return verdict()
     main_html = page.text
 
@@ -400,27 +504,29 @@ def main(argv):
     # ③ 용량 4토큰
     # ★HEAD 도 같은 분리 규율을 탄다 — '자산 부재(404)'와 '내 HEAD 가 실패했다'는 다른 사건이다.
     #   구 구현은 둘 다 "자산 부재"로 적었다(전자만 적색인데 후자까지 적색이 됐다).
-    bad, dl_bad = [], []
+    remote_bad, content_bad, dl_bad = [], [], []
     for f in four:
         h = fetch("%s/downloads/%s" % (SITE, f), head=True)
         if not h.download_ok:
             dl_bad.append("%s: %s" % (f, h.err))
             continue
         if h.status == 404:
-            bad.append("%s: 자산 부재(HTTP 404)" % f)
+            remote_bad.append("%s: 자산 부재(HTTP 404 · 원격 확정 답)" % f)
             continue
         if not h.http_ok:
-            bad.append("%s: HTTP %d" % (f, h.status))
+            remote_bad.append("%s: 원격 확정 오류(HTTP %d)" % (f, h.status))
             continue
         if h.clen is None:
-            bad.append("%s: Content-Length 헤더 없음(HTTP %d)" % (f, h.status))
+            content_bad.append("%s: Content-Length 헤더 없음(HTTP %d)" % (f, h.status))
             continue
         tok = "%dMB" % (h.clen // 1024 // 1024)
         if tok not in main_html:
-            bad.append("%s: 표기 %s 없음(실제 %d B)" % (f, tok, h.clen))
+            content_bad.append("%s: 표기 %s 없음(실제 %d B)" % (f, tok, h.clen))
+    bad = remote_bad + content_bad
     if bad:
         check("③ 용량 4토큰 실자산 대조", False,
-              "; ".join(bad) + ("; [+다운로드 실패 " + "; ".join(dl_bad) + "]" if dl_bad else ""))
+              "; ".join(bad) + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
+              kind=KIND_CONTENT if content_bad else KIND_REMOTE)
     elif dl_bad:
         download_failed("③ 용량 4토큰 실자산 대조", "; ".join(dl_bad))
     else:
@@ -440,7 +546,8 @@ def main(argv):
     if len(full) != 4 or bad:
         check("④ 다운로드 링크 4종 HEAD 200", False,
               "링크 %d개 · 비200 %s" % (len(full), bad or "없음")
-              + ("; [+다운로드 실패 " + "; ".join(dl_bad) + "]" if dl_bad else ""))
+              + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
+              kind=KIND_REMOTE if (bad and len(full) == 4) else KIND_CONTENT)
     elif dl_bad:
         download_failed("④ 다운로드 링크 4종 HEAD 200", "; ".join(dl_bad),
                         "링크 %d개(수집은 정상)" % len(full))
@@ -512,7 +619,7 @@ def main(argv):
     #   먼저 단언하므로, **여기 도달한 해시 불일치는 완전한 본문끼리의 불일치**다 = 진짜 적색.
     #   두 결과를 다른 통에 담는다: mismatch(적색·exit 1) vs dl_bad(판정 불가·exit 3).
     if not sf.download_ok:
-        # SUMS 본문을 못 받았다 = 대조표가 없다 → 적색이 아니라 **판정 불가**(⑦ 은 계속 본다).
+        # SUMS 본문을 못 받았다 = 대조표가 없다 → 적색이 아니라 **미판정**(⑦ 은 계속 본다).
         download_failed("⑥ SHA256SUMS.txt 전수·실자산 대조", sf.err)
     elif ok6:
         want = {}
@@ -520,7 +627,7 @@ def main(argv):
             p = l.split()
             if len(p) == 2:
                 want[p[1]] = p[0]
-        mismatch, dl_bad = [], []
+        mismatch, remote_err, dl_bad, ok_notes = [], [], [], []
         for f in four:
             if f not in want:
                 mismatch.append("%s 미등재" % f)
@@ -531,22 +638,31 @@ def main(argv):
                 dl_bad.append("%s: %s" % (f, a.err))
                 continue
             if not a.http_ok:
-                mismatch.append("%s 자산 부재/오류(HTTP %d)" % (f, a.status))
+                # 여기 도달하는 상태는 4xx(429 제외)뿐 — 429·5xx 는 위에서 미판정으로 접힌다.
+                remote_err.append("%s 원격 확정 오류(HTTP %d)" % (f, a.status))
                 continue
             if a.digest != want[f]:
-                # ★적색 — 완전한 본문(rc 0 · 수신 %dB = Content-Length)끼리의 불일치다.
+                # ★적색 — 완전한 본문(rc 0 · 수신 바이트수 = Content-Length)끼리의 불일치다.
+                #   ★해시 불일치는 재시도 대상이 아니다: 같은 바이트를 다시 받아 같은 결과를
+                #     내고 시간만 쓴다(재시도 규율).
                 mismatch.append("%s 해시 불일치(완전 수신 %dB · 기대 %s… ≠ 실제 %s…)"
                                 % (f, a.nbytes, want[f][:12], (a.digest or "")[:12]))
             elif a.retries:
-                detail += " · [%s 재시도 %d회 후 성공]" % (f, len(a.retries))
-        if mismatch:
-            # 적색이 하나라도 확정되면 그게 판정이다(다운로드 실패는 곁들여 적는다).
+                ok_notes.append("%s 재시도 %d회 후 성공" % (f, len(a.retries)))
+        if ok_notes:
+            detail += " · [" + "; ".join(ok_notes) + "]"     # 침묵 금지
+        red = mismatch + remote_err
+        if red:
+            # 적색이 하나라도 확정되면 그게 판정이다(미판정 항목은 곁들여 적는다).
             check("⑥ SHA256SUMS.txt 전수·실자산 대조", False,
-                  detail + " · 실자산 대조 " + ", ".join(mismatch)
-                  + ("; [+다운로드 실패 " + "; ".join(dl_bad) + "]" if dl_bad else ""))
+                  detail + " · 실자산 대조 " + ", ".join(red)
+                  + ("; [+미판정 " + "; ".join(dl_bad) + "]" if dl_bad else ""),
+                  kind=KIND_INTEGRITY if mismatch else KIND_REMOTE)
         elif dl_bad:
+            # ★문면 규율(MF2): 여기서 "자산은 정상"이라고 말하지 않는다. 말할 수 있는 것은
+            #   **다른** 자산들이 일치했다는 사실과, 이 자산은 확인하지 못했다는 사실뿐이다.
             download_failed("⑥ SHA256SUMS.txt 전수·실자산 대조", "; ".join(dl_bad),
-                            detail + " · 나머지 자산은 해시 일치")
+                            detail + " · (대조에 성공한 나머지 자산은 해시 일치 — 위 항목은 미확인)")
         else:
             check("⑥ SHA256SUMS.txt 전수·실자산 대조", True, detail + " · 실자산 대조 4종 일치")
     else:
