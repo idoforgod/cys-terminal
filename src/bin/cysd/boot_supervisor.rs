@@ -143,6 +143,17 @@ const MAX_UNDELETABLE: usize = 256;
 /// 한 틱이 **낳는** 프로세스 상한. 스캔 상한과 별개 축이다(64건을 읽어도 2건만 낳는다).
 const MAX_DISPATCH_PER_TICK: usize = 2;
 
+/// (★R2) 한 틱이 **pane 에 주입하는** 무스폰 통보 상한. 폐기(`Disposition::Retire`)는 스캔
+/// 상한(64)까지 갈 수 있어서 디스패치 상한이 막아 주지 않는다 — kill-switch pause 가 길게
+/// 유지된 뒤 재개하는 순간 다수가 한꺼번에 `expired` 로 접히면 선언 pane 이 주입 홍수를 맞는다.
+///
+/// ★상한이 걸리는 것은 **pane 채널 하나뿐**이다: feed 항목과 버스 이벤트는 무조건 나간다
+/// (그쪽은 스캔 상한이 이미 유계이고, '조용히 사라지는 갈래 0' 이 이 수리의 목적이다).
+/// 잘림 자체는 `boot_supervisor.notify_capped` 로 1회 가청화한다.
+/// ★폐기(삭제)는 통보 예산과 **무관하게** 계속한다 — 쓰레기·적대 인텐트의 GC 를 통보 예산에
+/// 묶으면 스풀이 줄지 않는다(그 결합은 R2 수리 도중 실측으로 기각됐다).
+const MAX_RETIRE_NOTIFY_PER_TICK: usize = 2;
+
 /// 태스크 로컬 예산 맵의 상한(맵 3종 방어 ①). 넘으면 통째로 비우고 이벤트를 남긴다 —
 /// 24/365 데몬에서 맵이 조용히 자라는 것은 이 저장소의 알려진 누수 양식이다.
 const MAX_TRACKED: usize = 128;
@@ -157,9 +168,18 @@ pub const ENV_SUPERVISOR: &str = "CYS_BOOT_SUPERVISOR";
 
 /// 감독자가 꺼졌는가 — **마스터 스위치에 접힌** 순수 판정.
 ///
-/// `cys::boot_gates_master_off_from` 을 **재사용**한다(규율을 두 벌로 쓰지 않는다). 기본
-/// (미설정)은 켜짐이지만, 생산자가 없는 지금은 켜져 있어도 스풀이 비어 있어 **종전 동작과
-/// 한 글자도 다르지 않다** — 즉 기본값이 곧 종전 동작이다.
+/// `cys::boot_gates_master_off_from` 을 **재사용**한다(규율을 두 벌로 쓰지 않는다).
+///
+/// ## ★기본값의 현행 의미(R2 · 2026-08-26 정정 — 사고 순간의 오판 유도 제거)
+/// 종전 서술은 "생산자가 없는 지금은 켜져 있어도 스풀이 비어 있어 종전 동작과 한 글자도
+/// 다르지 않다 = 기본값이 곧 종전 동작" 이었다. 이 캠페인(P2)이 생산자를 배선하면서 **거짓이
+/// 됐다**: 생산자는 `boot.enqueue` RPC arm 하나이고(모듈 헤더 '생산자' 절), 훅 frontdoor 가
+/// 게이트 사슬을 통과해 인텐트를 남기면 데몬이 **실제로 부트 체인을 스폰한다** — 기본값
+/// (미설정)은 감독자 **가동**이고 행동 변경이 있다.
+/// 롤백은 `CYS_BOOT_GATES=0`(축 단위는 `CYS_BOOT_SUPERVISOR=0`)이 유일 수단이며, 그때
+/// `boot.enqueue` 는 `supervisor_off` 를 돌려 훅이 **종전 spawn 폴백**을 탄다(무손실 강등).
+/// 하필 롤백 노브의 정의처에 붙은 낡은 문장은 사고 순간에 '기본값은 무해하니 서두를 것 없다'는
+/// 정반대 결론을 부른다 — 그래서 이 절은 사실과 함께 유지된다.
 pub fn supervisor_off_from(master_env: Option<&str>, own_env: Option<&str>) -> bool {
     cys::boot_gates_master_off_from(master_env) || own_env == Some("0")
 }
@@ -698,6 +718,20 @@ fn path_with_exe_dir_first(exe_dir: &Path, current: Option<std::ffi::OsString>) 
     std::env::join_paths(parts).unwrap_or_else(|_| exe_dir.as_os_str().to_os_string())
 }
 
+/// boot-supervisor.log 의 **경로 규약 단일 소유자**(★R2 note — 사본 금지).
+///
+/// 스풀의 부모 = 데몬 상태 디렉터리(`state_dir(socket)` — unix 는 소켓의 부모, Windows 는
+/// `%LOCALAPPDATA%\cys[\<slug>]`). 소비자가 셋이라(실행자 `run_ensure_team` · `boot.enqueue`
+/// 응답 · 훅 frontdoor note) 문자열을 세 벌로 쓰면 반드시 갈린다. frontdoor 경로에서는
+/// **부트 출력이 오직 이 파일에만** 가므로(런 로그가 아예 생기지 않는다) 위치를 못 찾는 것이
+/// 그대로 '무엇이 잘못됐는지 알 수 없음'이 된다 — 그래서 규약 소유자에게 물어보게 한다.
+pub fn supervisor_log_path(socket_path: &Path) -> PathBuf {
+    spool_dir(socket_path)
+        .parent()
+        .map(|d| d.join("boot-supervisor.log"))
+        .unwrap_or_else(|| PathBuf::from("boot-supervisor.log"))
+}
+
 /// boot-supervisor.log 크기 상한 1겹(회전 1회 — 훅 런별 로그 A16/R3 규율의 데몬면).
 /// 단일 append 파일의 무상한 성장을 막는다 — 초과 시 `.1` 로 밀어내고 새로 쓴다.
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -769,10 +803,7 @@ fn run_ensure_team(
     } else {
         it.lane.clone()
     };
-    let log = spool_dir(&daemon.socket_path)
-        .parent()
-        .map(|d| d.join("boot-supervisor.log"))
-        .unwrap_or_else(|| PathBuf::from("boot-supervisor.log"));
+    let log = supervisor_log_path(&daemon.socket_path);
     rotate_log_if_huge(&log);
     let mut cmd = tokio::process::Command::new(&python);
     cmd.arg(&script)
@@ -786,6 +817,26 @@ fn run_ensure_team(
         // ★(P2 · R3-P2-1/ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
         .env("PATH", path_with_exe_dir_first(&exe_dir, std::env::var_os("PATH")))
         .stdin(std::process::Stdio::null());
+    // ── ★(R2 · 2026-08-26) provenance 상속 절단 — **주지 않기로 한 값 = 없는 값** ──────────
+    // 【무엇이 틀렸었는가】 아래 주입은 **조건부**인데, 조건이 거짓일 때 상속값을 지우지 않았다.
+    // `tokio::process::Command` 는 기본이 부모(데몬) env 전량 상속이므로, 데몬 env 에 남은 값이
+    // 그대로 자식에게 갔다. 도달 경로는 실재한다 — 훅은 `export CYS_DECL_ORIGIN="hook-human"`
+    // 후 `javis_bootstrap.py` 를 spawn 하고(그 spawn 은 `CYS_NO_AUTOSTART` 를 걸지 않는다),
+    // 체인 안의 `cys` 호출이 죽은 소켓을 만나면 cysd 를 낳는다. 그 cysd 는 `hook-human` 을
+    // **데몬 수명 내내** 들고 있고, 그 뒤 `decl_origin` 이 빈 인텐트(=`decide()` 가 통과시키는
+    // 형상)가 디스패치되면 자식은 기계유래 게이트를 통과한 적 없이 그 마커를 얻어
+    // `javis_bootstrap._dept_fallback` 의 부서 자동 생성 봉인(폭주 봉인 ⓑ)을 무료로 연다.
+    // `CYS_SEAT_TOKEN` 도 같은 형태로, mint 실패 강등 시 **타 pane 의 토큰**이 자식의
+    // `cys claim-role` 에 실려 나간다(세대 접두가 맞으면 claim ⓒ 가 rc6 을 시끄럽게 낸다).
+    // 【수리】 조건 판정 **전에** 무조건 지우고, 필요할 때만 다시 세운다 — 'withheld = absent'
+    // 를 구조로 만든다(else 를 붙이는 것보다 갈래가 하나 적어 미래에 새는 자리가 없다).
+    // `CYS_ROLE` 도 같은 자리에서 끊는다: 데몬이 pane 자손의 autostart 로 떴다면 그 pane 의
+    // 역할(예: worker)을 상속하고, `_Log` 가 그것을 **master 부트의 boot-last `role` 필드**로
+    // 적는다(§0-A 가 사실 원천으로 읽는 파일이 조용히 거짓이 된다). 감독자가 낳는 것은 항상
+    // master 부트이므로 값을 명시한다.
+    cmd.env_remove("CYS_DECL_ORIGIN")
+        .env_remove(cys::ENV_SEAT_TOKEN)
+        .env(cys::ENV_ROLE, "master");
     // ── (P2 · R3-P2-5) provenance·claim 주입 — 위 재실측이 참일 때만 ─────────────────────
     if let Some((sid, token)) = verified_claim {
         cmd.env("CYS_SURFACE_ID", sid.to_string())
@@ -799,7 +850,7 @@ fn run_ensure_team(
             cmd.env("CYS_DECL_ORIGIN", &it.decl_origin);
         }
         if let Some(tok) = token {
-            cmd.env("CYS_SEAT_TOKEN", tok);
+            cmd.env(cys::ENV_SEAT_TOKEN, tok);
         }
     }
     {
@@ -865,13 +916,17 @@ struct SupState {
     budget_pressure_reported: bool,
     /// GC 회전 커서(`scan_spool`).
     cursor: usize,
-    /// (P2 · 오너 결정 ⑧c) **소진 loud 통보 래치** — 인텐트 id 당 정확히 1회.
+    /// (P2 · 오너 결정 ⑧c → R2 확장) **무스폰 loud 통보 래치** — 인텐트 id 당 정확히 1회.
     ///
-    /// 소진 종착은 두 지점에서 관측된다(dispatch 실패 3회째 · `attempts_exhausted` 폐기) —
-    /// 삭제 실패로 인텐트가 스풀에 남으면 같은 인텐트가 두 지점을 다 지나므로, 래치 없이는
-    /// 통보가 중복된다. 회수는 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 새 키다),
-    /// 상한은 [`MAX_UNDELETABLE`] 재사용(넘치면 새 키에 침묵 — 유계가 통보보다 앞이다).
-    exhausted_notified: std::collections::HashSet<String>,
+    /// 무스폰 종착은 여러 지점에서 관측된다(dispatch 실패 3회째 · `attempts_exhausted` 폐기 ·
+    /// `claim_stale`/`no_surface`/`expired`/스키마·토큰 폐기) — 삭제 실패로 인텐트가 스풀에
+    /// 남으면 같은 인텐트가 여러 지점을 다 지나므로, 래치 없이는 통보가 중복된다. 회수는
+    /// 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 새 키다), 상한은 [`MAX_UNDELETABLE`]
+    /// 재사용(넘치면 새 키에 침묵 — 유계가 통보보다 앞이다. 다만 그 침묵은 아래
+    /// `notify_capped_reported` 로 **1회 가청화**한다 — R2 note).
+    no_spawn_notified: std::collections::HashSet<String>,
+    /// (R2 note) 통보 래치 상한 도달을 이미 알렸는가 — 1회성(`budget_pressure_reported` 동형).
+    notify_capped_reported: bool,
 }
 
 /// 스풀 항목 1건을 지우고 **이벤트를 내도 되는지**를 함께 판정한다.
@@ -900,29 +955,73 @@ fn remove_and_gate(
     Some(false)
 }
 
-/// (P2 · 오너 결정 ⑧c) 소진 **loud 종착** — "버스 이벤트만"은 마스터가 아직 태어나지 않은
-/// 시점의 방송이라 청중이 0 인 조용한 포기다(WDSI 좀비 18회의 교훈: 정지 조건 + **가시성**).
-/// 채널 3개: ①기존 버스 이벤트(호출부의 `dispatch_failed`/`intent_retired` — 여기서 내지
-/// 않는다) ②데몬 내부 feed 항목(kind=`bootstrap-fail` — 훅 `_notify_bg` 와 동일 분류)
-/// ③선언 surface 생존 시 **원장 선기록 후** 1줄 정직 통보.
+/// 무스폰 사유의 **사람이 읽는 문면**. 닫힌 집합이며 미지 사유는 일반 문안으로 접힌다
+/// (`decide`·`RunErr` 가 낳는 토큰 전량이 여기 등재된다 — 새 토큰을 추가하면 여기도 함께).
+fn no_spawn_reason(why: &str) -> &'static str {
+    match why {
+        "attempts_exhausted" | "dispatch_failed" => "스폰이 예산(3회)까지 전부 실패했다",
+        "claim_stale" => "선언 좌석이 더 이상 master 가 아니다(좌석 종료·인계) — 남은 재시도도 같은 판정이라 정지했다",
+        "no_surface" => "인텐트에 선언 좌석이 없다(스풀 직접 투하 의심) — 스폰하지 않았다",
+        "expired" => "인텐트가 수명(30분)을 넘겼다(kill-switch pause 지속 등) — 지금 팀을 띄우는 것은 오너가 기대한 인과가 아니라 폐기했다",
+        "schema_mismatch" => "인텐트 스키마가 이 데몬과 다르다(팩·데몬 다운그레이드 스큐)",
+        "unknown_action" | "unknown_decl_origin" => "인텐트가 인정되지 않는 토큰을 날랐다(닫힌 집합 밖) — 실행하지 않고 폐기했다",
+        _ => "부트 감독자가 이 선언으로 팀을 띄우지 못했다",
+    }
+}
+
+/// (P2 · 오너 결정 ⑧c → ★R2 확장) **무스폰 loud 종착** — "버스 이벤트만"은 마스터가 아직
+/// 태어나지 않은 시점의 방송이라 청중이 0 인 조용한 포기다(WDSI 좀비 18회의 교훈: 정지 조건 +
+/// **가시성**). 채널 3개: ①기존 버스 이벤트(호출부의 `dispatch_failed`/`intent_retired` —
+/// 여기서 내지 않는다) ②데몬 내부 feed 항목(kind=`bootstrap-fail` — 훅 `_notify_bg` 와 동일
+/// 분류) ③선언 surface 생존 시 **원장 선기록 후** 1줄 정직 통보.
+///
+/// ## ★트리거 재정의(R2 must_fix · 2026-08-26) — '예산 소진' 이 아니라 '스폰 0회'
+/// 종전 호출부는 `attempts_exhausted`·`dispatch_failed` **둘뿐**이었다. 그런데 P2 frontdoor 는
+/// 훅이 스폰하지 않고 exit 0 한 뒤 모델에게 "곧 스폰하고 … 소진 시 이 화면과 승인 Feed 로
+/// 통보한다" 고 **약속**한다(`hooks/role-bootstrap.sh` frontdoor note). `claim_stale`·
+/// `no_surface`·`expired`·`schema_mismatch`·`unknown_action`·`unknown_decl_origin` 은 그
+/// 약속을 지키지 않고 팀 0노드로 끝났다 — boot-last 기록도 없어 §0-A session_error 행(P0-3)의
+/// 근거조차 생기지 않으므로 사용자 관측은 정확히 '선언했는데 무반응'이다. 그래서 트리거를
+/// **"이 인텐트는 스폰 0회로 끝났다"** 로 옮기고 사유 문안만 분기한다(`no_spawn_reason`).
+/// 유계는 그대로다 — 래치 키는 인텐트 id 이므로 **인텐트당 1회**이고, 호출부는 틱당 통보
+/// 예산(`MAX_RETIRE_NOTIFY_PER_TICK`)을 따로 집행한다.
 ///
 /// ★③에 `cfg!(unix)` 게이트를 걸지 않는다(`announce_seat_takeover` 와 **다른** 신규 경로):
-///   소진 통보의 주 청중이 정확히 Windows 다(setsid 부재 계급) — 같은 게이트를 답습하면
-///   정확히 필요한 곳에서 침묵한다(2차 성찰 P2-3). 저 함수의 `#` 주석 접두도 쓰지 않는다 —
+///   통보의 주 청중이 정확히 Windows 다(setsid 부재 계급) — 같은 게이트를 답습하면 정확히
+///   필요한 곳에서 침묵한다(2차 성찰 P2-3). 저 함수의 `#` 주석 접두도 쓰지 않는다 —
 ///   여기의 대상은 빈 셸 좌석이 아니라 선언 pane(Claude 세션)이고, 기계 push 오인은 원장
 ///   선기록(`Origin::Supervisor`)이 이미 봉인한다(delivery.rs 불변식 ①).
 ///
-/// 통보는 (인텐트 id)당 정확히 1회다(`SupState::exhausted_notified` — 매 틱 반복 금지).
-fn notify_exhausted(daemon: &Arc<Daemon>, st: &mut SupState, it: &BootIntent, why: &str) {
-    if st.exhausted_notified.contains(&it.id) || st.exhausted_notified.len() >= MAX_UNDELETABLE {
+/// `pane_budget` = 이번 틱에 **pane 주입**이 몇 건 더 허용되는가(호출부가 소유·감소시킨다).
+/// feed 항목과 버스 이벤트는 이 예산과 무관하게 나간다 — 잘리는 것은 홍수 채널 하나뿐이다.
+fn notify_no_spawn(
+    daemon: &Arc<Daemon>,
+    st: &mut SupState,
+    it: &BootIntent,
+    why: &str,
+    pane_budget: &mut usize,
+) {
+    if st.no_spawn_notified.contains(&it.id) {
         return;
     }
-    st.exhausted_notified.insert(it.id.clone());
+    if st.no_spawn_notified.len() >= MAX_UNDELETABLE {
+        notify_capped_once(daemon, st, "latch_full", why);
+        return;
+    }
+    st.no_spawn_notified.insert(it.id.clone());
     let text = format!(
-        "[cys-supervisor] 부트 {MAX_ATTEMPTS}회 실패(intent={} why={why}) — boot-last·boot-supervisor.log 확인",
-        it.id
+        "[cys-supervisor] 팀이 이 선언으로 뜨지 않았다(intent={} why={why}) — {}. 재선언이 재개 신호다. 근거: boot-supervisor.log · boot-last",
+        it.id,
+        no_spawn_reason(why)
     );
-    daemon.push_feed_notification("bootstrap-fail", "부트 감독자 소진(팀 미기동)", &text, it.surface_id);
+    // ★feed 는 **무조건**이다 — '조용히 사라지는 갈래 0' 의 하한선.
+    daemon.push_feed_notification("bootstrap-fail", "부트 감독자 무산(팀 미기동)", &text, it.surface_id);
+    // pane 주입만 틱 예산에 걸린다(홍수 방지). 잘려도 feed·이벤트가 사실을 이미 남겼다.
+    if *pane_budget == 0 {
+        notify_capped_once(daemon, st, "pane_per_tick", why);
+        return;
+    }
+    *pane_budget -= 1;
     if let Some(sid) = it.surface_id {
         if let Some(s) = daemon.get_surface(sid) {
             if !s.exited.load(Ordering::Relaxed) {
@@ -946,6 +1045,25 @@ fn notify_exhausted(daemon: &Arc<Daemon>, st: &mut SupState, it: &BootIntent, wh
     }
 }
 
+/// (★R2 note) 통보가 **유계로 잘렸다**는 사실의 1회성 가청화(`budget_pressure_reported` 동형).
+///
+/// 유계가 통보보다 앞이라는 절충은 유지하되, 이 파일의 다른 유계 방어(`undeletable`·
+/// `budget_pressure`)가 전부 최소 1건의 이벤트를 남기는데 통보 절단만 아무 흔적이 없던
+/// 비대칭을 없앤다 — 256건 동시 무산은 이미 병리 상태이고, 정확히 그 순간 침묵하면 안 된다.
+fn notify_capped_once(daemon: &Arc<Daemon>, st: &mut SupState, kind: &str, why: &str) {
+    if st.notify_capped_reported {
+        return;
+    }
+    st.notify_capped_reported = true;
+    publish(
+        daemon,
+        "boot_supervisor.notify_capped",
+        json!({"kind": kind, "why": why,
+               "latch_cap": MAX_UNDELETABLE, "pane_cap_per_tick": MAX_RETIRE_NOTIFY_PER_TICK,
+               "note": "무스폰 통보가 유계로 잘린다(feed·이벤트는 계속 나간다)"}),
+    );
+}
+
 /// 한 틱. 디스크 I/O + (있으면) 실행. **동기**이며 호출자가 `catch_unwind` 로 감싼다.
 /// 반환값은 이번 틱의 디스패치 횟수(테스트가 유계성을 세는 축).
 fn tick_in(
@@ -963,10 +1081,14 @@ fn tick_in(
         return 0;
     }
     // ★스풀 권한 **재강제**(unix 0o700) — 있을 때만. 없으면 **만들지 않는다**:
-    //   감독자는 관측자이지 생산자가 아니고, 스풀 생성은 인텐트를 적는 쪽의 일이다
-    //   (지금 생산자가 없으므로 프로덕션 디스크 자국은 0 이다 = 행동 무변경).
-    //   왜 여기서도 조이는가: 생산자가 셸이면(U-24) umask 에 따라 넓은 권한으로 만들 수 있다.
-    //   그때 이 한 줄이 없으면 스풀은 한 번도 조여지지 않은 채로 남는다.
+    //   감독자는 관측자이지 생산자가 아니고, 스풀 생성은 인텐트를 적는 쪽의 일이다.
+    //   ★현행 사실(R2 · 2026-08-26 정정): 정상 경로의 **유일한 writer 는 데몬 자신**이다
+    //   (`boot.enqueue`→`write_intent`→`ensure_spool` — 0700/0600 원자 기록). 종전 주석은
+    //   '지금 생산자가 없다 = 디스크 자국 0' 과 '생산자가 셸이면(U-24) umask 로 넓어진다'를
+    //   근거로 들었는데 둘 다 이 캠페인으로 낡았다(셸 생산자는 존재하지 않는다).
+    //   그래서 이 재강제는 **잔여 방어**다: 구 릴리스가 남긴 스풀·수동 조작·복원 도구가
+    //   넓혀 놓은 권한을 데몬이 만날 수 있고, 그때 이 한 줄이 없으면 스풀은 한 번도 조여지지
+    //   않은 채로 남는다. 정상 경로에서는 아무 것도 바꾸지 않는 잉여이며 그 사실이 의도다.
     if dir.exists() {
         let _ = ensure_spool(dir);
     }
@@ -974,8 +1096,8 @@ fn tick_in(
     st.cursor = scan.next_cursor;
     // 음성 캐시 회수 — 파일이 실제로 사라진 키만 버린다(위 필드 주석의 '나이 만료 금지').
     st.undeletable.retain(|(p, _)| Path::new(p).exists());
-    // 소진 통보 래치 회수 — 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 어차피 새 키다).
-    st.exhausted_notified.retain(|id| scan.present.contains(id));
+    // 무스폰 통보 래치 회수 — 스풀에서 사라진 id 만(재선언은 선언별 유일 id 라 어차피 새 키다).
+    st.no_spawn_notified.retain(|id| scan.present.contains(id));
 
     // ── 디스크 GC(파싱 불가·mtime 초과) ────────────────────────────────────────
     for (p, why) in &scan.garbage {
@@ -1030,6 +1152,11 @@ fn tick_in(
 
     // ── 판정·실행 ──────────────────────────────────────────────────────────────
     let mut dispatched = 0usize;
+    // ★(R2 must_fix) 무스폰 통보의 **pane 주입 틱 예산**. 폐기는 스캔 상한(64)까지 갈 수
+    //   있으므로 pause 회복 직후처럼 다수가 한꺼번에 `expired` 로 접히는 순간에 선언 pane 이
+    //   주입 홍수를 맞는 것을 막는다. feed·이벤트는 이 예산과 무관하게 나가고, 폐기(삭제)도
+    //   무관하게 계속한다 — 잘리는 것은 홍수 채널 하나뿐이다.
+    let mut pane_notices = MAX_RETIRE_NOTIFY_PER_TICK;
     for it in &scan.intents {
         if dispatched >= MAX_DISPATCH_PER_TICK {
             break;
@@ -1044,7 +1171,16 @@ fn tick_in(
         match decide(it, attempts, now) {
             Disposition::Wait { .. } => {}
             Disposition::Retire(why) => {
-                // 폐기는 예산 포화와 무관하게 계속한다 — 스풀을 줄이는 방향이기 때문이다.
+                // ★(R2 must_fix) **스폰 0회 종착은 전부 loud 다** — 종전엔 `attempts_exhausted`
+                //   하나만 통보하고 claim_stale·no_surface·expired·schema_mismatch·
+                //   unknown_action·unknown_decl_origin 은 버스 이벤트만 낸 채 사라졌다.
+                //   frontdoor note 가 모델에게 '곧 스폰한다 · 소진 시 통보한다'고 약속한 뒤
+                //   훅이 exit 0 한 경로에서는 그 침묵이 곧 '선언했는데 무반응'이다.
+                //   통보가 **삭제보다 앞**이다 — 순서가 뒤집히면 삭제 실패 게이트(음성 캐시)의
+                //   조용한 분기가 통보까지 삼킬 여지가 생긴다.
+                notify_no_spawn(daemon, st, it, why, &mut pane_notices);
+                // 폐기는 통보 예산·삭제 실패와 무관하게 계속한다 — 스풀을 줄이는 방향이고,
+                // 쓰레기·적대 인텐트의 GC 를 통보 예산에 묶으면 스풀이 줄지 않는다.
                 if let Some(removed) =
                     remove_and_gate(st, remover, &intent_path(dir, &it.id), why)
                 {
@@ -1054,11 +1190,6 @@ fn tick_in(
                         json!({"id": it.id, "action": it.action_token, "why": why,
                                "attempts": attempts, "removed": removed}),
                     );
-                }
-                // (P2 · 오너 결정 ⑧c) 예산 소진 종착은 loud 다 — 래치가 1회로 접는다
-                // (데몬 재시작 후 스풀 픽업으로 소진 인텐트를 처음 보는 경우도 이 지점이 알린다).
-                if why == "attempts_exhausted" {
-                    notify_exhausted(daemon, st, it, why);
                 }
             }
             Disposition::Run(action) => {
@@ -1089,7 +1220,12 @@ fn tick_in(
                     // (P2 · R3-P2-5) 전제 붕괴(claim_stale) — 재시도가 아니라 **폐기**다.
                     // 좌석이 죽어 레지스트리에서 master 가 사라졌다면 남은 2회 재시도도 같은
                     // 판정으로 전소할 뿐이다 — 정직한 정지(오너 재선언 = 재개 신호·무스폰).
+                    // ★(R2 must_fix) 실행자가 스폰 **전에** 접은 종착(claim_stale·no_surface)도
+                    //   스폰 0회다 — 위 Disposition::Retire 와 같은 계급으로 loud 다. 여기는
+                    //   MAX_DISPATCH_PER_TICK 이 이미 틱당 2건으로 유계라 별도 통보 예산을
+                    //   두지 않는다(래치가 인텐트당 1회를 마저 집행한다).
                     Err(RunErr::Retire(why)) => {
+                        notify_no_spawn(daemon, st, it, why, &mut pane_notices);
                         if let Some(removed) =
                             remove_and_gate(st, remover, &intent_path(dir, &it.id), why)
                         {
@@ -1115,7 +1251,7 @@ fn tick_in(
                         );
                         // (P2 · 오너 결정 ⑧c) 마지막 시도까지 스폰이 실패했다 — loud 종착.
                         if next >= MAX_ATTEMPTS {
-                            notify_exhausted(daemon, st, it, "dispatch_failed");
+                            notify_no_spawn(daemon, st, it, "dispatch_failed", &mut pane_notices);
                         }
                     }
                 }
@@ -1523,7 +1659,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // 생산자가 넓은 권한으로 만든 스풀을 모사한다(셸 umask 경로 · U-24).
+            // ★(R2 정정) 넓은 권한의 스풀을 모사한다 — 정상 경로의 writer 는 데몬 하나이므로
+            //   (0700 원자 기록) 이 형상의 출처는 **구 릴리스가 남긴 스풀·수동 조작·복원
+            //   도구**다. 재강제는 그 잔여에 대한 방어이고 이 검체가 그것을 잰다.
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
             tick_in(&d, &root, &mut st, ok_runner, remove_spool_file, 1.0);
             let m = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
@@ -1590,8 +1728,13 @@ mod tests {
             );
         }
         let published = d.bus.latest_seq() - before;
+        // ★조성 갱신(R2 — 약화 아님, 상한 이동): `unknown` 은 `unknown_action` 폐기 = **스폰
+        //   0회 종착**이라 이제 loud 통보(feed.item.created 1건)가 붙는다. 조성:
+        //   intent_discarded(junk) 1 + intent_retired(unknown) 1 + feed(무스폰 통보·래치) 1 = 3.
+        //   유계 판정력은 종전과 동일하다 — 셋 다 래치라 200틱을 돌아도 늘지 않으며, 어느
+        //   하나가 매 틱 반복되면 즉시 이 상한을 뚫는다.
         assert_eq!(
-            published, 2,
+            published, 3,
             "삭제 실패 항목 2건이 200틱 동안 이벤트 {published}건을 냈다 \
              — 항목당 1건(사실은 알리되 반복하지 않는다)이어야 한다(재난 ①)"
         );
@@ -1924,13 +2067,86 @@ mod tests {
         assert_eq!(item.surface_id, Some(s.id), "통보의 선언 surface 귀속 소실");
         drop(items);
         // 원장은 전문이 아니라 preview(64자)+sha256 를 남긴다 — 문안 선두의 안정 마커로 판정.
+        // ★마커 갱신(R2): 트리거가 '예산 소진'에서 '스폰 0회'로 넓어지며 문안 선두가 사유
+        //   무관 공통구로 바뀌었다(사유는 뒤쪽 `no_spawn_reason` 분기).
         let ledger = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path))
             .unwrap_or_default();
-        let marker = format!("부트 {MAX_ATTEMPTS}회 실패");
         assert!(
-            ledger.contains(&marker),
-            "소진 통보가 원장 선기록 없이 나갔다(기계 push 오너 임무 오인 창) — 원장: {ledger:?}"
+            ledger.contains("팀이 이 선언으로 뜨지 않았다"),
+            "무스폰 통보가 원장 선기록 없이 나갔다(기계 push 오너 임무 오인 창) — 원장: {ledger:?}"
         );
+    }
+
+    /// ★(R2 must_fix) **스폰 0회 종착은 전부 loud 다** — 종전엔 `attempts_exhausted` 하나만
+    /// 통보했고 `claim_stale` 은 버스 이벤트만 낸 채 사라졌다(frontdoor note 가 '소진 시 이
+    /// 화면과 승인 Feed 로 통보한다'고 약속한 뒤의 침묵). 형제 검체
+    /// `claim_stale_retires_immediately_without_retry` 는 '재시도 안 함'만 재고 통보 유무는
+    /// 재지 않아 GREEN 을 유지했다 — 그 사각을 이 검체가 관통한다.
+    #[test]
+    fn claim_stale_retire_is_loud_not_silent() {
+        let d = tmp_daemon("staleloud");
+        let dir = tmp_spool("staleloud");
+        enqueue_in(&dir, "c", BootAction::EnsureTeam, "", Some(7), "t", "", None, None, 0.0)
+            .unwrap();
+        let mut st = SupState::default();
+        let mut now = 1.0;
+        for _ in 0..10 {
+            tick_in(&d, &dir, &mut st, stale_runner, remove_spool_file, now);
+            now += 60.0;
+        }
+        let items = d.feed_items.lock().unwrap();
+        let hits: Vec<_> = items.iter().filter(|i| i.kind == "bootstrap-fail").collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "claim_stale 폐기의 통보가 {}건이다(0=조용한 포기 / 2+=래치 파손)",
+            hits.len()
+        );
+        assert!(
+            hits[0].body.contains("claim_stale") && hits[0].body.contains("master"),
+            "통보 문안이 사유를 말하지 않는다: {:?}",
+            hits[0].body
+        );
+    }
+
+    /// ★(R2 must_fix) `expired` 폐기도 loud 다 — kill-switch pause 가 30분을 넘겨 유지되면
+    /// 재개 순간 전 인텐트가 이 갈래로 소각된다(도달 경로가 가장 현실적인 침묵 표면).
+    ///
+    /// 동시에 **채널 분리**를 잰다: 3건이 한꺼번에 만료돼도 ⓐ feed 통보는 3건 전부 나가고
+    /// (조용히 사라지는 갈래 0) ⓑ 폐기는 통보 예산과 무관하게 같은 틱에 끝난다(GC 를 통보에
+    /// 묶으면 쓰레기 스풀이 줄지 않는다) ⓒ 반복 틱이 통보를 늘리지 않는다(래치).
+    #[test]
+    fn expired_retire_is_loud_on_every_intent_and_gc_is_not_gated_by_notice() {
+        let d = tmp_daemon("expired");
+        let dir = tmp_spool("expired");
+        for id in ["e1", "e2", "e3"] {
+            enqueue_in(&dir, id, BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0)
+                .unwrap();
+        }
+        let mut st = SupState::default();
+        let now = INTENT_MAX_AGE_SECS + 10.0; // 전건 만료
+        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now), 0);
+        let count_fails = |d: &Arc<Daemon>| {
+            d.feed_items
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| i.kind == "bootstrap-fail")
+                .count()
+        };
+        assert_eq!(
+            count_fails(&d),
+            3,
+            "만료 폐기의 통보가 3건이 아니다 — 조용히 사라지는 갈래가 남았다"
+        );
+        for id in ["e1", "e2", "e3"] {
+            assert!(
+                !intent_path(&dir, id).exists(),
+                "만료 인텐트 {id} 가 스풀에 남았다 — GC 가 통보 예산에 묶였다"
+            );
+        }
+        tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now + 1.0);
+        assert_eq!(count_fails(&d), 3, "반복 틱이 통보를 늘렸다(래치 파손)");
     }
 
     /// 데몬 재시작 픽업(스풀에 남은 소진 인텐트)도 조용한 폐기가 아니라 loud 종착이다.
@@ -2005,23 +2221,91 @@ mod tests {
             rec < run,
             "원장 기록이 행위 뒤로 갔다 — 그 창에서 임무 게이트가 기계 push 를 오너 임무로 오인한다"
         );
-        // ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 상한 이동): 소진 loud 통보(notify_exhausted)
+        // ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 상한 이동): 무스폰 loud 통보(notify_no_spawn)
         //   도 pane 주입 전에 같은 유래(Origin::Supervisor)로 원장 선기록해야 하므로 지정 지점이
-        //   dispatch_one + notify_exhausted **정확히 2곳**이 됐다. 여전히 닫힌 집합 단언이다 —
+        //   dispatch_one + notify_no_spawn **정확히 2곳**이 됐다. 여전히 닫힌 집합 단언이다 —
         //   제3 지점 유입은 이 핀이 계속 적색으로 잡는다(구현 갈라짐 차단 목적 불변).
         assert_eq!(
             prod.matches("crate::delivery::Origin::Supervisor").count(),
             2,
-            "감독자 원장 유래 지정 지점은 정확히 2곳(dispatch_one·notify_exhausted)이어야 한다"
+            "감독자 원장 유래 지정 지점은 정확히 2곳(dispatch_one·notify_no_spawn)이어야 한다"
         );
-        // notify_exhausted 쪽도 순서 불변식이 같다 — 원장 기록이 주입(try_send)보다 앞.
-        let nat = prod.find("fn notify_exhausted(").expect("notify_exhausted 소실");
+        // notify_no_spawn 쪽도 순서 불변식이 같다 — 원장 기록이 주입(try_send)보다 앞.
+        let nat = prod.find("fn notify_no_spawn(").expect("notify_no_spawn 소실");
         let nbody = &prod[nat..];
         let nrec = nbody.find("record_audited(").expect("소진 통보 원장 기록 지점 소실");
         let ninj = nbody.find("write_tx.try_send(").expect("소진 통보 주입 지점 소실");
         assert!(
             nrec < ninj,
             "소진 통보의 원장 기록이 주입 뒤로 갔다 — 기계 push 오너 임무 오인 창"
+        );
+    }
+
+    /// ★(R2) provenance 상속 절단이 **실재 배선**인가 — 소스 단언.
+    ///
+    /// 판정이 '주지 않기로' 결론 낸 값은 상속되는 것이 아니라 **없어야 한다**. 조건부 `env`
+    /// 만 있고 `env_remove` 가 없으면 데몬 env 오염(훅 자손 autostart 로 뜬 cysd 가 들고 있는
+    /// `hook-human`·타 pane 토큰)이 그대로 자식에게 흘러 기계유래 게이트를 통과한 적 없는
+    /// 인텐트가 부서 자동 생성 봉인을 연다. 배선은 두 줄이라 행위 검체를 세우기보다(실 스폰
+    /// 필요) 소스로 못 박는 편이 정직하다.
+    #[test]
+    fn provenance_env_is_withheld_as_absent_not_inherited() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn run_ensure_team(").expect("run_ensure_team 소실");
+        let body = &prod[at..];
+        for key in ["env_remove(\"CYS_DECL_ORIGIN\")", "env_remove(cys::ENV_SEAT_TOKEN)"] {
+            assert!(
+                body.contains(key),
+                "run_ensure_team 에 {key} 가 없다 — 주입하지 않기로 한 값이 데몬 env 에서 \
+                 상속된다(부서 자동 생성 봉인 무료 개방 · 타 pane 좌석 토큰 유출)"
+            );
+        }
+        // 지우기가 조건부 주입보다 **앞**이어야 한다(뒤면 주입을 지운다).
+        let rm = body.find("env_remove(\"CYS_DECL_ORIGIN\")").unwrap();
+        let set = body
+            .find("cmd.env(\"CYS_DECL_ORIGIN\", &it.decl_origin)")
+            .expect("조건부 provenance 주입 소실");
+        assert!(rm < set, "env_remove 가 조건부 주입 뒤로 갔다 — 주입을 지운다");
+        assert!(
+            body.contains("env(cys::ENV_ROLE, \"master\")"),
+            "감독자 자식의 CYS_ROLE 이 명시되지 않았다 — pane 상속 role 이 master 부트의 \
+             boot-last `role` 필드로 기록돼 §0-A 가 읽는 사실이 조용히 거짓이 된다"
+        );
+    }
+
+    /// ★(R2 must_fix) **스폰 0회 종착의 닫힌 집합이 전부 loud 인가** — 소스 단언.
+    ///
+    /// 행위 검체(`claim_stale_retire_is_loud_not_silent`·`expired_retire_is_loud_…`)는 두
+    /// 사유만 관통한다. 종착 갈래는 셋이고(판정 폐기 · 실행자 폐기 · 마지막 시도 실패),
+    /// 새 갈래가 추가되면서 통보를 빠뜨리는 것이 정확히 R2 가 적발한 회귀 양식이라 **갈래
+    /// 수 자체**를 못 박는다. 값이 바뀌어야 한다면 그건 계약 변경이고, 그때 이 주석과 함께
+    /// 갱신하라(정직성 불변식: 훅 frontdoor note 의 '통보한다' 약속과 짝이다).
+    #[test]
+    fn every_no_spawn_terminal_is_loud() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn tick_in(").expect("tick_in 소실");
+        let body = &prod[at..];
+        assert_eq!(
+            body.matches("notify_no_spawn(").count(),
+            3,
+            "tick_in 의 무스폰 통보 지점이 3곳(판정 폐기·실행자 폐기·마지막 시도 실패)이 \
+             아니다 — 종착 갈래가 늘었는데 통보를 빠뜨렸거나, 통보가 사라졌다"
+        );
+        // 판정 폐기 갈래에서는 **통보가 삭제보다 앞**이다(예산 부족 시 '조용히 지우기'가
+        // 아니라 '이번 틱 건너뛰기'로 접히게 하는 순서 — R2 fix_direction 그대로).
+        let arm = body
+            .find("Disposition::Retire(why) => {")
+            .expect("판정 폐기 갈래 소실");
+        let arm_body = &body[arm..];
+        let notify = arm_body.find("notify_no_spawn(").expect("판정 폐기 갈래의 통보 소실");
+        let remove = arm_body.find("remove_and_gate(").expect("판정 폐기 갈래의 삭제 소실");
+        assert!(
+            notify < remove,
+            "판정 폐기 갈래에서 삭제가 통보보다 앞이다 — 통보 예산이 마르면 조용히 지워진다"
         );
     }
 

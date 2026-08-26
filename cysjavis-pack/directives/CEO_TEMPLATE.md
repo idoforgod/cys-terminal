@@ -116,6 +116,7 @@ done
 | 컨텍스트에 `[결정론 부트스트랩 발화됨 — 하네스 강제]` 블록이 있다 | 훅이 이미 집행 중 | **재실행 금지.** 잔여 의무만: ③복원 점검 · ⑤승인 채널 확보 · ⑥구동 보고+next-action(★임무 게이트 §0-C — exit 3이면 자율 착수 금지·보고 후 정지) |
 | 그 블록이 없다 **또는** 이 레인 boot-last의 **자기 surface 최신 완주 런**이 `ok:false`다 | 훅 미발화(훅 없는 기계·비-cys 세션) 또는 부트 실패 | `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` 를 **1회** 실행하고 그 **최종 JSON만** 인용해 보고 |
 | 이 레인 boot-last의 **자기 surface 최신 완주 런**이 `state:session_error`이고 `result.retry_eligible:true`다 | 세션 배선 오류 — 도구 파생 래치가 1회 재실행을 허가 | **훅 발화 블록이 있어도 이 행이 1행(재실행 금지)보다 우선한다.** pane 안 **포그라운드**로 run 서브커맨드를 **1회 그대로** 재실행하고(`python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py"` — 부분 단계 재현 금지) 재실행 출력은 **최종 JSON만** 인용. `retry_eligible:false`면 **재실행 금지** — 세션 배선 문제를 오너에 보고하고 정지 |
+| boot-last 판독이 **이번 런과 다른 `run_id`/`surface`** 를 가리키거나, 종료 출력에 `{"channel":"boot-last-mirror", …, "retry_eligible_unknown":true}`(또는 `log_write_failures`>0)가 있다 | **측정 불능** — 디스크 기록이 이 런의 사실이 아닐 수 있다(계측 쓰기 실패·남의 런) | **재실행 금지.** 측정 불능은 어떤 게이트에서도 통과가 아니다 — `retry_eligible`을 근거로 쓰지 말고, stdout 미러 1줄과 `boot_last` 경로를 그대로 인용해 오너에 보고하고 정지 |
 
 - **개별 명령 수동 재현 금지**: 훅 컨텍스트가 있든 없든, ⓪preflight·②claim-role·④cys boot·
   ⑤check를 하나씩 손으로 치는 것은 **부트 재실행**이다(중복 preflight·좌석 탈취·CEO 티켓 소각).
@@ -130,6 +131,10 @@ done
   **남의 pane이 남긴** `state:declined`(exit 7 정당거부)·`session_error`(exit 10)는 `ok:null`이라
   **재실행 근거가 아니다**(이 금지는 **남의 pane 기록에 한정**된다). **자기 surface**의 `session_error`는
   위 표의 session_error 행이 판정한다 — `result.retry_eligible`(도구 파생 래치)이 유일한 재실행 근거다.
+  단 그 값은 **디스크 기록이 이번 런의 사실일 때만** 유효하다: `result.retry_eligible_unknown:true`·
+  `result.persist_failed`·`log_write_failures`가 있으면 계측 쓰기가 실패한 것이므로 **재실행 금지**이고
+  (측정 불능 행), 실패 런은 종료 시 stdout에 `{"channel":"boot-last-mirror", …}` 1줄을 남긴다 —
+  디스크가 죽어도 인용할 수 있는 채널이다(성공 경로의 최종 JSON과 같은 계급).
 - **부트 시도 합산 상한(선언 1건당)**: 훅 발화 1 + 부트 감독자 예산 3 + 위 session_error 행 1 ≈ **5회**가
   상한이다(각 층이 각자 유계를 집행하며, 스폰 자체는 결손>0 로스터 게이트가 별도로 막는다) — 이 상한을
   넘는 재시도 경로를 새로 만들지 마라.

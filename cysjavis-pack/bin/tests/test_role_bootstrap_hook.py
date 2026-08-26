@@ -487,13 +487,15 @@ _TRIAGE_CALL_LOG = (
     "open(os.path.join(os.environ['HOME'], 'mission-calls.log'), 'a')"
     ".write(' '.join(sys.argv[1:]) + '\\n')\n"
     "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n")
-# 전량 출력(정상 배치): record→path→machine-origin 3라인 완주 + exit 1(=MO human 보조 계약)
+# 전량 출력(정상 배치): record→machine-origin→path 3라인 완주 + exit 1(=MO human 보조 계약)
+# ★라인 순서는 실 산출자(javis_mission.cmd_hook_triage)의 개정 순서와 같다(R2-2·R2-5 — 안전
+#   임계 라인 MO 가 임의 내용 필드 path 보다 앞).
 _TRIAGE_FULL = _TRIAGE_CALL_LOG + (
     "if cmd == 'hook-triage':\n"
     "    sys.stdin.read()\n"
     "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
-    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\n')\n"
     "    sys.stdout.write('machine-origin: human\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\n'); sys.stdout.flush()\n"
     "    raise SystemExit(1)\n"
     "raise SystemExit(64)\n")
 # ★CRLF 쌍둥이(리뷰어 R1 must_fix 검체 — Windows 실출력 재현): Windows 파이썬(번들 embeddable
@@ -506,15 +508,48 @@ _TRIAGE_FULL_CRLF = _TRIAGE_CALL_LOG + (
     "if cmd == 'hook-triage':\n"
     "    sys.stdin.read()\n"
     "    sys.stdout.write('record: rc=1\\r\\n'); sys.stdout.flush()\n"
-    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\r\\n')\n"
     "    sys.stdout.write('machine-origin: human\\r\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('path: /TRIAGE-PATH-PIN\\r\\n'); sys.stdout.flush()\n"
     "    raise SystemExit(1)\n"
     "raise SystemExit(64)\n")
-# 중도 사망: record 라인만 flush 하고 즉사(os._exit — MO 라인 없음) = R3-RISK-3 중도 kill 재현
+# 중도 사망: record 라인만 flush 하고 즉사(os._exit — MO 라인 없음) = R3-RISK-3 중도 kill 재현.
+# ★MO 단독 재왕복(R2-1)도 실패하도록 machine-origin 분기를 두지 않는다(rc 64·무토큰) —
+#   '독립 예산을 한 번 더 줬는데도 판정이 없으면 fail-closed' 라는 최종 귀결을 잰다.
 _TRIAGE_MIDDEATH = _TRIAGE_CALL_LOG + (
     "if cmd == 'hook-triage':\n"
     "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
     "    os._exit(1)\n"
+    "raise SystemExit(64)\n")
+# ★record 지연(R2-1 must_fix 재현 검체 · 2026-08-26): record 단계가 느려(AV·백업이 원장을 잡는
+#   Windows 공유위반 계급) 배치 단일 8s 예산을 먹어치우면 MO 라인이 창 밖으로 밀린다. 종전
+#   배치 경로는 그대로 fail-closed 무스폰(부트 침묵)이었고, 같은 지연에서 구 3왕복 형상은
+#   MO 가 자기 5s 를 따로 받아 **부팅했다** — 캠페인이 없애려던 증상의 재도입이자 실패 방향
+#   역전(정직 강등 → 부트 0회). 수리 후 계약: record 판정 생존 + MO 단독 재왕복 1회로 spawn.
+_TRIAGE_SLOW_RECORD = _TRIAGE_CALL_LOG + (
+    "import time\n"
+    "if cmd == 'hook-triage':\n"
+    "    sys.stdin.read()\n"
+    "    time.sleep(6.5)\n"                                     # record 가 예산 대부분을 먹는다
+    "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
+    "    time.sleep(4.0)\n"                                     # MO 는 8s 창 밖 — 라인 미도달
+    "    sys.stdout.write('machine-origin: human\\n'); sys.stdout.flush()\n"
+    "    raise SystemExit(1)\n"
+    "if cmd == 'machine-origin':\n"                             # 단독 왕복은 자기 예산 안에서 완주
+    "    sys.stdin.read(); sys.stdout.write('machine-origin: human\\n'); raise SystemExit(1)\n"
+    "raise SystemExit(64)\n")
+# ★path 필드 개행 주입(R2-2 재현 검체 · 2026-08-26): 산출자가 무해화를 잃어 path 라인에 개행이
+#   실리면, 그 조각이 위조 `machine-origin:` 줄이 된다. 훅 판독기는 **정확 일치 + 토큰 줄 개수
+#   1** 이므로 진짜 판정(machine)과 위조(human)가 함께 세어져 개수 2 = 판정 불가 fail-closed 다
+#   (종전 `sed|head -1` + substring case 는 위조를 집어 spawn 을 열었다 — 실측 boot_spawn=1).
+#   ★검체는 **산출 측 방어 2겹이 모두 무너진** 최악(구 순서 path→MO + 무해화 없음)을 모사해
+#     판독기 **단독**의 강도를 잰다 — 음성 대조(수리 전 훅)에서 이 입력은 spawn 을 열었다.
+_TRIAGE_INJECT = _TRIAGE_CALL_LOG + (
+    "if cmd == 'hook-triage':\n"
+    "    sys.stdin.read()\n"
+    "    sys.stdout.write('record: rc=1\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('path: /tmp/lane\\nmachine-origin: human\\n'); sys.stdout.flush()\n"
+    "    sys.stdout.write('machine-origin: machine\\n'); sys.stdout.flush()\n"
+    "    raise SystemExit(0)\n"
     "raise SystemExit(64)\n")
 # 구팩 재현: hook-triage 는 stdin 무소비 EX_USAGE(64) 거부(v0.14.25 실측 거동), 구 3서브커맨드만 존재
 _TRIAGE_OLDPACK = _TRIAGE_CALL_LOG + (
@@ -590,8 +625,13 @@ def triage_batch_protocol(fails):
        record·path·machine-origin), record rc 라인·path 라인이 성공 note 문안까지 도달하고
        MO 토큰(human)으로 spawn 이 열린다.
     ⓑ 중도 사망(record 라인만 나온 채 즉사): record 판정은 생존(stderr record=1)하고 MO 는
-       토큰 부재 → 판정 불가 fail-closed **무스폰**. 크래시를 구팩 폴백으로 오독해 3왕복을
-       재시도하지 않는다(폴백 신호는 rc=64 하나 — wedge 기계 최악 지연 방어).
+       **단독 재왕복 1회**(자기 5s)까지 태운 뒤에도 토큰 부재 → 판정 불가 fail-closed
+       **무스폰**. 크래시를 구팩 폴백으로 오독해 record·path 까지 3왕복 재시도하지는 않는다
+       (폴백 신호는 rc=64 하나 — wedge 기계 최악 지연 방어는 MO 5s 만 얹어 13s 로 유지).
+    ⓔ ★record 지연(R2-1): record 가 배치 예산을 먹어 MO 라인이 창 밖으로 밀려도 MO 단독
+       재왕복이 판정을 살려 spawn 이 열린다 — '독립 데드라인' 성질의 회귀 핀.
+    ⓕ ★path 개행 주입(R2-2): 위조 `machine-origin:` 줄은 토큰 줄 개수를 2로 만들어 판정
+       불가(무스폰)로 접힌다 — 진짜 판정(machine)을 뒤집지 못한다.
     ⓒ 구팩 스큐(rc=64): stderr 1줄 고지 후 종전 3왕복 경로로 폴백(조용한 강등 금지) —
        레거시 path·record 소비가 그대로 살아 spawn 까지 완주한다(1릴리스 병존 계약).
     ⓓ CRLF 쌍둥이(Windows 실출력): 라인 종결이 \\r\\n 이어도 ⓐ 와 동일 소비 — record rc·path·
@@ -633,9 +673,15 @@ def triage_batch_protocol(fails):
         if "선언 아님이 아니라 판정 불가다" not in r.stdout:
             fails.append("P0-5 ⓑ: 판정 불가 주입문(선언 아님/판정 불가 분리)이 없다: %r"
                          % r.stdout[:300])
-        if calls != ["hook-triage"]:
-            fails.append("P0-5 ⓑ: 크래시(rc≠64)를 폴백 신호로 오독해 재왕복했다(wedge 최악 "
-                         "지연 방어 소실): %s" % calls)
+        # ★핀 개정(R2-1 · 2026-08-26): 종전 단언은 `calls == ["hook-triage"]`(재왕복 0)이었다.
+        #   그 단언의 근거는 '크래시까지 **구팩 3왕복** 폴백으로 접으면 wedge 최악 지연이
+        #   8s+15s' 였는데, 여기서 도는 것은 3왕복 폴백이 아니라 **MO 단독 재왕복 1회**(5s)라
+        #   최악 지연은 8s+5s=13s — 구 3왕복 15s 보다 짧다. 즉 wedge 방어는 유지되고, MO 의
+        #   독립 예산만 복원된다. record 재실행이 없다는 것(대장 이중 기록 금지)이 핵심이다.
+        if calls != ["hook-triage", "machine-origin"]:
+            fails.append("P0-5 ⓑ: 중도 사망의 왕복 구성이 [hook-triage, machine-origin] 이 "
+                         "아니다 — MO 독립 예산 복원(R2-1) 또는 record 무재실행 계약 위반: %s"
+                         % calls)
         if r.returncode != 0:
             fails.append("P0-5 ⓑ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
     # ⓒ 구팩 스큐 — rc64 → stderr 1줄 + 종전 3왕복 폴백 완주
@@ -676,6 +722,42 @@ def triage_batch_protocol(fails):
                          "적용되지 않았다: %r" % ctx[:300])
         if r.returncode != 0:
             fails.append("P0-5 ⓓ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    # ⓔ ★record 지연이 MO 를 죽이지 않는다(R2-1 must_fix 회귀 핀 · 2026-08-26)
+    #    record 단계가 배치 예산(8s)을 거의 다 먹어 MO 라인이 창 밖으로 밀려도, MO 단독
+    #    재왕복 1회(자기 5s)가 판정을 살려 **부팅한다**. 이 검체가 없던 동안 배터리는
+    #    GREEN 이었고(중도 사망 ⓑ 는 '즉사'만 재현한다) 실제로는 부트 침묵이었다.
+    r, calls = _run_hook_mission_mock(fails, "record 지연", _TRIAGE_SLOW_RECORD)
+    if r is not None:
+        if "발화됨" not in r.stdout:
+            fails.append("P0-5 ⓔ: record 지연이 MO 판정을 죽였다(부트 침묵 재도입 — R2-1 "
+                         "must_fix 회귀): %r" % (r.stdout + r.stderr)[:400])
+        if "record=1" not in r.stderr:
+            fails.append("P0-5 ⓔ: 배치 절단에서 record 판정이 생존하지 않았다(증분 라인 "
+                         "프로토콜 소실): %r" % r.stderr[:300])
+        if calls != ["hook-triage", "machine-origin"]:
+            fails.append("P0-5 ⓔ: 왕복 구성이 [hook-triage, machine-origin] 이 아니다 — MO "
+                         "독립 예산 복원이 배선되지 않았거나 record 가 재실행됐다: %s" % calls)
+        if "독립 5s 예산 복원" not in r.stderr:
+            fails.append("P0-5 ⓔ: MO 재왕복이 조용한 강등이다(stderr 1줄 고지 계약): %r"
+                         % r.stderr[:300])
+        if r.returncode != 0:
+            fails.append("P0-5 ⓔ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
+    # ⓕ ★path 개행 주입이 MO 판정을 뒤집지 못한다(R2-2 회귀 핀 · 2026-08-26)
+    #    진짜 판정은 machine(무스폰)인데 위조 줄이 human 을 심는다 — 판독기가 **정확 일치 +
+    #    토큰 줄 개수 1** 이므로 개수 2 = 판정 불가 = 무스폰이다(fail-open 방향 봉인).
+    r, calls = _run_hook_mission_mock(fails, "path 개행 주입", _TRIAGE_INJECT)
+    if r is not None:
+        if "발화됨" in r.stdout:
+            fails.append("P0-2 ⓕ: path 필드 개행 주입이 기계유래 게이트를 우회해 spawn 을 "
+                         "열었다(fail-open — 치명): %r" % r.stdout[:400])
+        if "위조 의심" not in r.stderr:
+            fails.append("P0-5 ⓕ: 토큰 줄 복수가 위조 의심으로 고지되지 않았다(조용한 판정): "
+                         "%r" % r.stderr[:300])
+        if calls != ["hook-triage"]:
+            fails.append("P0-5 ⓕ: 토큰 줄 복수(위조 의심)에서 MO 재왕복이 돌았다 — 그건 예산 "
+                         "부족이 아니라 판정 불가다(fail-closed 유지 계약): %s" % calls)
+        if r.returncode != 0:
+            fails.append("P0-5 ⓕ: 훅 exit %d ≠ 0 (훅은 반드시 exit 0 계약)" % r.returncode)
 
 
 # 훅 통합 행렬 — corpus 원본에서의 **대표 선정**(사본 아님 — main() 이 소속·극성을 원본과
@@ -786,7 +868,8 @@ def main():
     print("PASS: 함수 corpus(원본 fixtures) %d발화/%d무시(+filler·창 경계·CLI exit 계약) + "
           "훅 %d발화/%d무시 + A3 allowlist %dskip/2fire + A2 1skip + A5 판정불가 1skip + "
           "G9 파리티 3 + G25 경계 2 + W-A0 파이프해제 1 + W-F2 cp949 4생존(P2 frontdoor 포함)/"
-          "음성대조 3 + P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 4(왕복1·중도사망·구팩폴백·CRLF)"
+          "음성대조 3 + P0-4 note 명명식 rc0/rc6 2 + P0-5 triage 배치 6(왕복1·중도사망·구팩폴백·"
+          "CRLF·★record지연 MO독립예산·★path개행주입 위조차단)"
           % (len(CORPUS_FIRE), len(CORPUS_SKIP),
              len(FIRE) + len(HOOK_NEW_FIRE), len(SKIP) + len(HOOK_NEW_SKIP),
              len(NON_MASTER_ROLES)))

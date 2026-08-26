@@ -543,12 +543,16 @@ MISSION_LEDGER=""
 #   초과(=machine-origin 판정불가 fail-closed 무스폰 = 부트 침묵)의 오탐 갈래가 실재했다.
 #   이제 세 판정을 hook-triage **1왕복**(단일 8s — 종전 예산 5s×3=15s 보다 총합 축소·기동 1회
 #   상각)으로 받는다. 출력은 증분 라인 프로토콜(R3-RISK-3)이다:
-#     "record: rc=N"(최우선·즉시 flush) → "path: <경로>" → "machine-origin: <token>"
+#     "record: rc=N"(최우선·즉시 flush) → "machine-origin: <token>" → "path: <경로>"
+#   ★라인 순서 개정(R2-2·R2-5 · 2026-08-26): 안전 임계 라인(MO)이 임의 내용 필드(path)보다
+#     **앞**이다 — 종전 순서에서는 경로의 개행 1개(위조 토큰 선점)·비UTF8 바이트 1개(BSD sed
+#     스트림 중단)가 뒤의 MO 라인을 통째로 삼켰다.
 #   훅은 **도착한 라인까지만** 소비한다 — 중도 사망(타임아웃 killpg 포함)에도 record 판정은
-#   생존하고 machine-origin 만 판정불가(fail-closed 무스폰)로 접힌다: 현행 3-프로세스의
-#   독립 생존 성질을 프로토콜로 보존한다. ★소비 시점 분리 유지(R3-P05-1 ③): record 판정은
-#   여기서 즉시 소비(전 프롬프트 공통)하고, machine-origin 토큰 라인은 DETECT 발화 후의
-#   스폰 게이트에서만 꺼내 판정한다.
+#   생존하고 machine-origin 만 판정불가로 접힌다: 현행 3-프로세스의 독립 **생존** 성질을
+#   프로토콜로 보존한다. ★독립 **예산**은 프로토콜이 보존하지 못하므로(R2-1) MO 라인 부재
+#   시 아래 스폰 게이트가 MO 단독 재왕복 1회(자기 5s)를 태운다 — 그 자리의 주석이 정본이다.
+#   ★소비 시점 분리 유지(R3-P05-1 ③): record 판정은 여기서 즉시 소비(전 프롬프트 공통)하고,
+#   machine-origin 토큰 라인은 DETECT 발화 후의 스폰 게이트에서만 꺼내 판정한다.
 TRIAGE_OUT=""
 TRIAGE_RC=""
 TRIAGE_MODE=""
@@ -580,8 +584,12 @@ if [ -f "$MISSION" ]; then
     TRIAGE_MODE="batch"
     # record 라인 소비 — 정수만 인정한다. 라인 부재·비정수 = ""(record 미실행 폴드 — 기존
     #   어휘 그대로: 대장 기록 여부 미확인의 정직 강등. 아래 LEDGER_SENT 가 그대로 받는다).
-    RECORD_RC="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^record: rc=\([0-9][0-9]*\)$/\1/p' | head -n 1)"
-    MISSION_LEDGER="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^path: \(.*\)$/\1/p' | head -n 1)"
+    # ★`LC_ALL=C sed`(R2-5 · 2026-08-26): BSD sed(macOS)는 현재 로케일이 UTF-8 일 때 비UTF8
+    #   바이트를 만나면 `RE error: illegal byte sequence` 로 **스트림 전체를 중단**한다 — 그
+    #   뒤의 라인이 통째로 소실된다. 프로토콜 라인은 전부 바이트 지향으로 읽어도 무손실이라
+    #   (앵커는 ASCII 이고 경로는 그대로 통과) C 로 고정해 그 갈래를 닫는다.
+    RECORD_RC="$(printf '%s\n' "$TRIAGE_OUT" | LC_ALL=C sed -n 's/^record: rc=\([0-9][0-9]*\)$/\1/p' | head -n 1)"
+    MISSION_LEDGER="$(printf '%s\n' "$TRIAGE_OUT" | LC_ALL=C sed -n 's/^path: \(.*\)$/\1/p' | head -n 1)"
     # 진단 1줄(관측성): 중도 사망 시나리오에서 'record 는 생존했는가'를 stderr 로 확인할 수
     # 있는 유일한 자리다(주입 note 는 무스폰 경로에서 RECORD_RC 를 싣지 않는다).
     echo "[cys-hook] role-bootstrap: hook-triage 배치 왕복(rc=$TRIAGE_RC) — record=${RECORD_RC:-미실행(라인 부재)}" >&2
@@ -626,29 +634,75 @@ esac
 #   그 외(토큰 부재·unknown·타임아웃·실행 실패·모듈 부재) → 판정 불가 = fail-closed 무스폰 +
 #   loud(A5 role 게이트와 같은 방향: 무단 스폰이 판정 보류보다 나쁘다. 모듈 부재는 위 T1 블록의
 #   '임무 대장 미기록' 상태와 정합 — 판별 도구가 없는 레인에서 스폰만 여는 비대칭을 만들지 않는다).
+# ── ★MO 토큰 판독기(R2-2 · 2026-08-26) — 형제 두 판독기와 **동형**으로 격상 ──────────────
+# 【무엇이 틀렸었는가】 같은 파일이 hook-decide 토큰(:220-261)과 boot-intent 토큰에는 '줄 단위
+# 정확 일치 + 토큰 줄 개수 1 + rc 교차' 3중을 걸어 두고, **자율 착수 권한을 가르는** MO 토큰만
+# `sed | head -n 1` + **substring** `case` 로 읽었다. 배치 프로토콜의 `path:`(임의 파일시스템
+# 문자열)가 MO 보다 앞에 서던 종전 순서에서는, 경로에 개행 하나만 있어도 위조 `machine-origin:`
+# 줄이 진짜 판정보다 먼저 서고 `head -1` 이 그것을 집었다(실측: 진짜 판정 machine 인데 spawn 개방).
+# 우회 방향이 machine→human 이라 **fail-open** 이고, 우회된 경로는 그대로 CYS_DECL_ORIGIN=
+# hook-human 을 export 해 부서 자동 생성까지 인가한다.
+# 【다중 방어 3층】 ⓐ 산출 측 무해화(javis_mission `_sanitize_path_line` — path 라인은 제어문자를
+# 실을 수 없다) ⓑ 프로토콜 순서(MO 가 path 보다 **앞**) ⓒ 판독 측 **정확 일치 + 토큰 줄 개수 1**.
+# 하나가 미래에 다시 넓어져도 나머지가 선다. 개수≠1 = 판정 불가 = fail-closed 무스폰이다.
+# 【CR】 구팩 폴백 경로(배치 밖)는 CRLF 정규화를 거치지 않으므로 여기서 줄 끝 CR 을 벗긴다.
+MO_TOKEN=""
+MO_TOKEN_N=0
+_cys_mo_read() {                      # $1 = 판독 대상 텍스트 → 전역 MO_TOKEN·MO_TOKEN_N
+  MO_TOKEN=""
+  MO_TOKEN_N=0
+  while IFS= read -r _mo_line; do
+    _mo_line="${_mo_line%"$CYS_CR"}"
+    case "$_mo_line" in
+      "machine-origin: machine"|"machine-origin: human"|"machine-origin: unknown")
+        MO_TOKEN="${_mo_line#machine-origin: }"
+        MO_TOKEN_N=$((MO_TOKEN_N + 1))
+        ;;
+    esac
+  done <<CYS_MO_EOF
+$1
+CYS_MO_EOF
+  if [ "$MO_TOKEN_N" -ne 1 ]; then
+    [ "$MO_TOKEN_N" -gt 1 ] && echo "[cys-hook] role-bootstrap: machine-origin 토큰 줄이 ${MO_TOKEN_N}개 — 위조 의심, 판정 불가(fail-closed 무스폰)" >&2
+    MO_TOKEN=""                       # 부재도 복수도 똑같이 '판정 불가'다
+  fi
+}
 MO_RC=""
 MO_OUT=""
 if [ -f "$MISSION" ]; then
   if [ "$TRIAGE_MODE" = "batch" ]; then
     # ★P0-5: 토큰 라인은 위 T1 의 hook-triage 배치 왕복에서 이미 도착해 있다 — 별도 파이썬
     #   왕복 없이 여기 **DETECT 발화 후**에만 꺼내 판정한다(소비 시점 분리 — record 즉시
-    #   소비와 달리 MO 는 선언 프롬프트 전용). 라인 부재(중도 사망·타임아웃·8s 소진) =
-    #   MO_OUT 빈 값 → 아래 case 미적중 → 판정 불가 fail-closed 무스폰(기존 의미론 그대로).
+    #   소비와 달리 MO 는 선언 프롬프트 전용).
     #   MO_RC 는 triage 프로세스 exit(=MO 판정값 보조 진단 · 타임아웃이면 124)를 병기한다.
-    MO_OUT="$(printf '%s\n' "$TRIAGE_OUT" | sed -n 's/^\(machine-origin: .*\)$/\1/p' | head -n 1)"
+    _cys_mo_read "$TRIAGE_OUT"
     MO_RC="$TRIAGE_RC"
+    # ── ★MO 독립 예산 복원(R2-1 must_fix · 2026-08-26) ────────────────────────────────
+    # 【무엇이 틀렸었는가】 P0-5 배치가 세 판정을 **단일 8s** 로 접으면서 MO 의 독립 데드라인이
+    # 사라졌다. 종전 3왕복은 record 5s·path 5s·MO 5s 로 각 판정이 자기 예산을 가졌는데, 배치
+    # 에서는 record 가 느리면(AV·백업·인덱서가 임무/배달 원장을 잡는 Windows 공유위반 계급 —
+    # `_persist` docstring 이 실재로 문서화한다) MO 라인이 창 밖으로 밀린다. 증분 라인 프로토콜은
+    # record 의 **생존**만 보존하고 MO 의 **예산**은 보존하지 않는다. 실측(목 하네스): record 가
+    # 7s 걸리면 배치 경로 boot_spawn=0(침묵) · 같은 지연에서 구 3왕복 형상은 spawned=true.
+    # 즉 캠페인이 없애려던 최빈 증상('데드라인 초과 → MO 판정불가 → 부트 침묵')이 다른 결합으로
+    # 재도입됐고, 실패 방향까지 뒤집혔다(구경로=정직 강등 후 부팅 / 신경로=부트 0회).
+    # 【수리】 MO 라인이 **부재**할 때만 종전 계약과 동일한 **MO 단독 재왕복 1회**(자기 5s 예산)를
+    # 허용한다 — 이것이 '독립 예산'의 복원이다. 유계: 선언 프롬프트당 정확히 1회(루프 없음),
+    # 최악 지연 8s+5s=13s 로 **구 3왕복 15s 보다 여전히 짧다**. 토큰 줄 **복수**(위조 의심)는
+    # 재왕복하지 않는다 — 그건 판정 불가이지 예산 부족이 아니다(fail-closed 유지).
+    if [ "$MO_TOKEN_N" -eq 0 ]; then
+      echo "[cys-hook] role-bootstrap: 배치 machine-origin 라인 부재(배치 rc=$TRIAGE_RC) — MO 단독 재왕복 1회(독립 5s 예산 복원)" >&2
+      MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$MISSION_N" machine-origin 2>/dev/null)"
+      MO_RC=$?
+      _cys_mo_read "$MO_OUT"
+    fi
   else
     # 구팩 스큐 폴백(TRIAGE_MODE=legacy) 또는 미배치 경로 — 종전 별도 왕복 그대로.
-    MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$(cys_native_path "$MISSION")" machine-origin 2>/dev/null)"
+    MO_OUT="$(printf '%s' "$INPUT" | cys_timeout_run 5 "$CYS_PY" "$MISSION_N" machine-origin 2>/dev/null)"
     MO_RC=$?
+    _cys_mo_read "$MO_OUT"
   fi
 fi
-MO_TOKEN=""
-case "$MO_OUT" in
-  *"machine-origin: machine"*) MO_TOKEN="machine" ;;
-  *"machine-origin: human"*)   MO_TOKEN="human" ;;
-  *"machine-origin: unknown"*) MO_TOKEN="unknown" ;;
-esac
 if [ "$MO_TOKEN" = "machine" ]; then
   # 기계 유래 확정 — 무스폰. 주입문은 정직하게: 무엇을 감지했고 왜 발화하지 않았는지 + 근거
   # 확인 명령 + 오너 우연 일치(거짓 양성 수용 — 비대칭 원칙) 시의 복구 경로.
@@ -676,7 +730,7 @@ elif [ "$MO_TOKEN" != "human" ]; then
   # 판정 불가(토큰 부재=타임아웃·인터프리터/모듈 문제·모듈 부재 · 토큰 unknown=파싱 실패·빈
   # 프롬프트·판정 본문 크래시) — fail-closed 무스폰 + loud(A22 관례). '선언 아님'과 '판정
   # 불가'를 융합하지 않는다. rc 는 진단용 보조 정보로만 병기한다.
-  MO_WHY="토큰=${MO_TOKEN:-부재} 보조rc=${MO_RC:-모듈 부재(javis_mission.py 없음)}"
+  MO_WHY="토큰=${MO_TOKEN:-부재} 토큰줄수=$MO_TOKEN_N 보조rc=${MO_RC:-모듈 부재(javis_mission.py 없음)}"
   echo "[cys-hook] role-bootstrap: 기계유래 판정 불가(machine-origin $MO_WHY) — 무스폰(fail-closed)" >&2
   _notify_bg "부트스트랩 판정 불가(기계유래 판별 실패)" \
     "마스터 선언은 감지됐지만 javis_mission.py machine-origin 이 오너 타이핑/기계 배달 여부를 판정하지 못했습니다($MO_WHY). 팀 기동이 발화되지 않았습니다."
@@ -921,29 +975,38 @@ CYS_BI_EOF
 fi
 if [ "$CYS_BI_GATE" = "enqueued" ]; then
   echo "[cys-hook] role-bootstrap: boot-intent enqueued(rc=0) — 스폰 생략(데몬 감독자 소관·frontdoor)" >&2
+  # ★(R2 note) 감독자 로그 **실경로** 해소 — 이 경로에서는 부트 출력이 오직 그 파일에만 간다
+  #   (런 로그가 생기지 않는다). 종전 note 의 '데몬 상태 디렉터리의 boot-supervisor.log' 는
+  #   플랫폼별로 갈리는 **미해소 서술**이라 유일한 진단 파일을 찾을 수 없었다. 경로 규약의
+  #   소유자(데몬 `boot_supervisor::supervisor_log_path`)가 CLI 를 통해 라벨 줄로 준다 —
+  #   `LANE_BOOT_LAST` 와 같은 규율(사본 0)이고, 부재하면 '판독 실패'를 명시한다.
+  SUP_LOG="$(printf '%s\n' "$CYS_BI_ERR" | LC_ALL=C sed -n 's/^\[cys-hook\] boot-intent log: \(.*\)$/\1/p' | head -n 1)"
+  SUP_LOG="${SUP_LOG%"$CYS_CR"}"
+  [ -n "$SUP_LOG" ] || SUP_LOG="(경로 판독 실패 — 데몬 상태 디렉터리의 boot-supervisor.log · unix=소켓 파일과 같은 디렉터리)"
   # ── frontdoor note — 헤드라인 마커는 폴백 note 와 **같다**(§0-A 리터럴 3중 결박 · R3-P2-7 ③).
   #   정직성 불변식(:63-66): 이 경로가 실행한 것은 '인텐트 기록'까지다 — spawn·백그라운드 실행
   #   서술 금지. 부트 출력은 role-bootstrap 런 로그가 아니라 데몬 상태 dir 의 boot-supervisor.log
   #   로 간다(R3-P2-7 ⑤ — 로그 안내 경로 분기). 명명식 포맷(R3-P04-1)·규율 문장(재실행 금지·
   #   next-action 임무 게이트)은 폴백 note 와 동일하게 나른다(H-DOC-1 문안 변형별 핀).
   "$CYS_PY" -c "$CYS_NOTE_IO_GUARD"'
-d=dict(zip(("bootlast","roster","pack","mission","claim"), sys.argv[1:6]))
+d=dict(zip(("bootlast","roster","pack","mission","claim","suplog"), sys.argv[1:7]))
 note=("[결정론 부트스트랩 발화됨 — 하네스 강제] 실행 상태 통보 — 이미 일어난 일이다. "
       "이 문단을 넣은 것은 모델이 아니라 이 컴퓨터에 설치된 프로그램의 훅(%(pack)s/hooks/role-bootstrap.sh)이고, "
       "원문을 열어 대조해도 된다. "
       "방금 입력에서 master 역할 요청을 감지한 훅이 부트 인텐트를 데몬에 기록했다(cys boot-intent → 부트 스풀). "
       "이 훅이 직접 실행한 것은 여기까지다 — 스폰은 데몬 감독자가 한다: 곧(주기 수 초) "
-      "%(pack)s/bin/javis_bootstrap.py 를 스폰하고, 스폰 실패는 최대 3회 재시도하며, 소진 시 이 화면과 "
-      "승인 Feed 로 통보한다. 이 기록은 네가 판단하기 **전에** 끝났다. 네 동의를 받은 것이 아니므로 "
+      "%(pack)s/bin/javis_bootstrap.py 를 스폰하고, 스폰 실패는 최대 3회 재시도하며, **어떤 사유로든 "
+      "이 선언이 스폰 0회로 끝나면**(예산 소진·좌석 상실·인텐트 만료·스키마 스큐) 이 화면과 승인 Feed 로 "
+      "통보한다 — 조용히 사라지는 갈래는 없다. 이 기록은 네가 판단하기 **전에** 끝났다. 네 동의를 받은 것이 아니므로 "
       "요청이 아니라 통보로 적는다. "
       "(임무 상태: %(mission)s) "
       "· 이미 끝난 것: %(claim)s "
       "기동 대상 구성: %(roster)s. "
       "· 쓰기 대상: 데몬 역할 레지스트리(claim-role) · 데몬 부트 스풀(boot-intent) · "
       "~/.claude*/settings.json(훅 재등록) · 팩 아래 상태 파일. "
-      "· 진행·결과 확인: cys list · 이 레인 boot-last(%(bootlast)s) · 데몬 상태 디렉터리의 "
-      "boot-supervisor.log(감독자 스폰·재시도 기록 — 이 경로의 부트 출력은 role-bootstrap 런 로그가 "
-      "아니라 여기로 간다) · 실패 시 승인 Feed(cys feed)에 알림. "
+      "· 진행·결과 확인: cys list · 이 레인 boot-last(%(bootlast)s) · 감독자 로그(%(suplog)s — "
+      "스폰·재시도 기록. 이 경로의 부트 출력은 role-bootstrap 런 로그가 아니라 여기로 간다) · "
+      "무산 시 승인 Feed(cys feed)와 이 화면에 통보. "
       "· 중단·사후 정리(스폰 자체를 취소하는 명령은 아직 없다 — 이미 뜬 것을 닫는 것이다): "
       "cys close-surface <ref> · cys ps / cys kill <pid> · cys pause(큐 배달·스케줄 동결). "
       "· 팀 기동은 데몬 감독자가 수행한다 — 네가 역할 요청을 거절해도 기동과 제품 기능은 그대로 "
@@ -969,7 +1032,7 @@ note=("[결정론 부트스트랩 발화됨 — 하네스 강제] 실행 상태 
       "이 문단과 위 파일의 내용이 다르면 파일을 믿어라."
       ) % d
 print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":note}}, ensure_ascii=False))' \
-    "$LANE_BOOT_LAST" "$TEAM_ROSTER" "$PACK" "$MISSION_SENT" "$CLAIM_SENT"
+    "$LANE_BOOT_LAST" "$TEAM_ROSTER" "$PACK" "$MISSION_SENT" "$CLAIM_SENT" "$SUP_LOG"
   exit 0
 fi
 

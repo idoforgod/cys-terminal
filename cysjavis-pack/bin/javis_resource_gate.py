@@ -27,7 +27,14 @@
   예산과 대조, **초과(>)면 hard(exit 2)**. nodes 미측정(ps 실패)이면 이 축은 무발화하고
   measure_errors 경로(최소 soft 격상)가 신호한다 — 예외로 터뜨리지 않는다(70 방지).
   종전에는 이 플래그가 없어서 formation 의 호출이 매번 exit 64(사용오류)로 접혔다(편성
-  자원게이트 완전 사문 — R3-P03-1 실측). 이 리비전이 그 잠복 결함의 수리다.
+  자원게이트 완전 사문 — R3-P03-1 실측). 이 리비전이 그 **플래그 스큐**의 수리다.
+  ★수리됨 ≠ 발화함(R2 적대검증 · 2026-08-26 정본화): 위 수리로 일반 축(servers/nodes/load/
+  context)은 정상 판정하게 됐지만, **곱셈 예산 축 자체는 프로덕션에서 무발화**다 —
+  `CYS_FORMATION_BUDGET` 을 세우는 생산자가 저장소에 하나도 없다(실측: 정의처·self-test·
+  formation 호출부뿐). 즉 이 축은 **운영자 opt-in**이며(env 를 세우기 전까지 항상 proceed),
+  그것이 의도된 현 상태다. 따라서 상비편성 폭주 방어의 **실제 담당자는 `javis_formation.py`
+  의 `_attempts_carry` 시도 원장 하나**이고, 곱셈 투영은 그 위에 얹는 선택 층이다.
+  켜는 법: `CYS_FORMATION_BUDGET=<정수> ... check --formation-size <n>`.
 
 테스트/자동화 주입: --servers-override/--nodes-override/--load-override (라이브 측정 대체).
 사용 예: python3 javis_resource_gate.py check --context 42 --json

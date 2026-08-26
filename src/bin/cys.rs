@@ -10612,6 +10612,11 @@ fn sanitize_hook_detail(detail: &str) -> String {
 
 /// boot-intent 판정 토큰 줄의 접두 — 셸은 이 접두 + verdict 의 **줄 단위 정확 일치**로만 읽는다.
 const BOOT_INTENT_VERDICT_PREFIX: &str = "[cys-hook] boot-intent: ";
+
+/// (★R2 note) 감독자 로그 경로 줄의 접두 — **판정 토큰이 아니다**(셸은 판정을 세 문자열의
+/// 정확 일치로만 읽는다). 훅이 frontdoor note 에 실경로를 싣기 위한 보조 채널이며, 부재해도
+/// 훅은 '판독 실패' 문안으로 정직 강등한다(`LANE_BOOT_LAST` 폴백과 같은 형태).
+const BOOT_INTENT_LOG_PREFIX: &str = "[cys-hook] boot-intent log: ";
 /// 전용 데드라인 — hook-decide 와 같은 근거(사람의 프롬프트 앞 · BUDGET 파생 · 하드코딩 금지).
 /// 서버는 즉답 계약(스풀 기록=ack)이므로 이 상한은 wedge 방어일 뿐이다. 바깥에는 훅의
 /// `cys_timeout_run 5s` 외곽 데드라인이 한 겹 더 있다(R3-RISK-2).
@@ -10670,15 +10675,27 @@ fn run_boot_intent() -> i32 {
         std::time::Duration::from_millis(BOOT_INTENT_DEADLINE_MS),
     );
     match resp {
-        Ok(r) if r["enqueued"].as_bool() == Some(true) => boot_intent_verdict(
-            "enqueued",
-            HOOK_EXIT_PROCEED,
-            &format!(
-                "intent={} surface={} — 스풀 기록 완료, 스폰은 데몬 감독자 소관",
-                r["id"].as_str().unwrap_or("?"),
-                r["surface_id"]
-            ),
-        ),
+        Ok(r) if r["enqueued"].as_bool() == Some(true) => {
+            // ★(R2 note) 감독자 로그 경로를 **별도 라벨 줄**로 흘린다 — frontdoor 경로에서는
+            //   부트 출력이 오직 그 파일에만 가는데, 종전 훅 note 는 '데몬 상태 디렉터리의
+            //   boot-supervisor.log' 라는 미해소 서술이었다(플랫폼별로 갈리는 경로라 독자가
+            //   찾지 못한다 = 유일한 진단 파일의 분실). 경로는 데몬이 준다(규약 소유자).
+            //   ★토큰 줄이 아니다: 셸 판독기는 세 문자열의 **정확 일치**만 세므로 이 줄은
+            //   판정에 관여하지 않는다. 임의 경로를 싣기 때문에 `sanitize_hook_detail` 로
+            //   제어문자·토큰 접두를 접는다(위조 줄 승격 차단 — 상세 줄과 같은 출구 규율).
+            if let Some(log) = r["log"].as_str().filter(|s| !s.is_empty()) {
+                eprintln!("{BOOT_INTENT_LOG_PREFIX}{}", sanitize_hook_detail(log));
+            }
+            boot_intent_verdict(
+                "enqueued",
+                HOOK_EXIT_PROCEED,
+                &format!(
+                    "intent={} surface={} — 스풀 기록 완료, 스폰은 데몬 감독자 소관",
+                    r["id"].as_str().unwrap_or("?"),
+                    r["surface_id"]
+                ),
+            )
+        }
         // 응답은 왔지만 기록 확정 페이로드가 아니다(형상 스큐) — '기록됨'으로 읽는 것이 이
         // 축에서 가장 나쁜 오작동이므로 undecided 로 접는다(셸은 spawn 폴백).
         Ok(r) => boot_intent_verdict(

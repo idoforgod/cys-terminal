@@ -2419,9 +2419,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 claim_at,
             ) {
                 // 스풀 원자 기록 완료 = 즉시 ack — 스폰·부트 완료를 기다리지 않는다(R3-RISK-2).
+                // ★`log`(R2 note): frontdoor 경로에서는 부트 출력이 **오직 이 파일에만** 간다
+                //   (런 로그가 아예 생기지 않는다). 훅 note 가 '데몬 상태 디렉터리의
+                //   boot-supervisor.log' 라는 미해소 서술을 주던 것을 실경로로 바꾸기 위해
+                //   경로 규약 소유자(`boot_supervisor::supervisor_log_path`)가 직접 싣는다.
                 Ok(_) => Reply::Single(ok_response(
                     &id,
-                    json!({"enqueued": true, "id": intent_id, "surface_id": sid}),
+                    json!({"enqueued": true, "id": intent_id, "surface_id": sid,
+                           "log": crate::boot_supervisor::supervisor_log_path(&daemon.socket_path)
+                               .to_string_lossy()}),
                 )),
                 Err(e) => Reply::Single(err_response(
                     &id,

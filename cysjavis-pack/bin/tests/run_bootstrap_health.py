@@ -11199,20 +11199,46 @@ def _u23_bound_violations(sup, delivery):
         rec, run = body.find("record_audited("), body.find("runner(daemon")
         if rec < 0 or run < 0 or rec > run:
             v.append("원장 기록이 행위보다 앞이 아니다 — 임무 게이트가 기계 push 를 오너 임무로 오인")
-    # ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 상한 이동 1→2): 소진 loud 통보(notify_exhausted)
-    #   도 pane 주입 전에 같은 유래(Origin::Supervisor)로 원장 **선기록**해야 하므로 지정 지점이
-    #   dispatch_one + notify_exhausted 정확히 2곳이 됐다. 여전히 닫힌 집합 단언이다 — 제3 지점
-    #   유입(구현 갈라짐)은 계속 적색. notify_exhausted 의 기록→주입 순서는 아래 별도 축이 핀한다.
+    # ★핀 개정(P2 ⑧c → ★R2 must_fix · 2026-08-26 — 약화 아님, 트리거 확대): loud 통보도 pane
+    #   주입 전에 같은 유래(Origin::Supervisor)로 원장 **선기록**해야 하므로 지정 지점이
+    #   dispatch_one + notify_no_spawn 정확히 2곳이다(닫힌 집합 — 제3 지점 유입은 계속 적색).
+    #   ★이름이 notify_exhausted → notify_no_spawn 으로 바뀐 이유가 곧 계약 변경이다: 통보
+    #   트리거가 '예산 소진'이 아니라 **'이 인텐트는 스폰 0회로 끝났다'** 다. 종전엔
+    #   attempts_exhausted 하나만 통보하고 claim_stale·no_surface·expired·schema_mismatch·
+    #   unknown_action·unknown_decl_origin 은 버스 이벤트만 낸 채 사라졌는데, frontdoor note 가
+    #   모델에게 '스폰 실패 소진 시 통보한다'고 약속한 뒤 훅이 exit 0 한 경로에서 그 침묵은
+    #   그대로 '선언했는데 무반응'이다(R2 정적 적대검증 must_fix).
     if c.count("crate::delivery::Origin::Supervisor") != 2:
-        v.append("감독자 원장 유래 지정 지점이 정확히 2곳(dispatch_one·notify_exhausted)이 아니다")
-    ni = c.find("fn notify_exhausted(")
+        v.append("감독자 원장 유래 지정 지점이 정확히 2곳(dispatch_one·notify_no_spawn)이 아니다")
+    ni = c.find("fn notify_no_spawn(")
     if ni < 0:
-        v.append("소진 loud 통보 지점(notify_exhausted)이 없다 — 조용한 포기(청중 0) 회귀")
+        v.append("무스폰 loud 통보 지점(notify_no_spawn)이 없다 — 조용한 포기(청중 0) 회귀")
     else:
         nbody = c[ni:]
         nrec, ninj = nbody.find("record_audited("), nbody.find("write_tx.try_send(")
         if nrec < 0 or ninj < 0 or nrec > ninj:
-            v.append("소진 통보의 원장 기록이 주입보다 앞이 아니다 — 기계 push 오너 임무 오인 창")
+            v.append("무스폰 통보의 원장 기록이 주입보다 앞이 아니다 — 기계 push 오너 임무 오인 창")
+    # ★스폰 0회 종착의 **닫힌 집합이 전부 loud 인가**(R2 must_fix 회귀 핀): tick_in 안의 통보
+    #   지점은 3곳(판정 폐기 · 실행자 폐기 · 마지막 시도 실패)이다. 갈래가 늘면서 통보를
+    #   빠뜨리는 것이 정확히 이 결함의 재발 양식이므로 **갯수 자체**를 못 박는다.
+    ti = c.find("fn tick_in(")
+    if ti < 0:
+        v.append("tick_in(무스폰 종착의 유일 소비 지점) 이 없다")
+    elif c[ti:].count("notify_no_spawn(") != 3:
+        v.append("tick_in 의 무스폰 통보 지점이 3곳(판정 폐기·실행자 폐기·마지막 시도 실패)이 "
+                 "아니다 — 종착 갈래가 늘었는데 통보를 빠뜨렸다(조용한 포기 회귀)")
+    # ★provenance 상속 절단(R2 should_fix): '주지 않기로' 판정한 값은 상속이 아니라 부재여야
+    #   한다 — env_remove 가 없으면 데몬 env 오염(hook-human 마커·타 pane 좌석 토큰)이 자식에게
+    #   흘러 기계유래 게이트를 통과한 적 없는 인텐트가 부서 자동 생성 봉인을 연다.
+    re_i = c.find("fn run_ensure_team(")
+    if re_i < 0:
+        v.append("run_ensure_team(provenance 주입의 유일 지점) 이 없다")
+    else:
+        rbody = c[re_i:]
+        for key in ('env_remove("CYS_DECL_ORIGIN")', "env_remove(cys::ENV_SEAT_TOKEN)"):
+            if key not in rbody:
+                v.append("run_ensure_team 에 %s 가 없다 — 주입하지 않기로 한 값이 데몬 env 에서 "
+                         "상속된다(폭주 봉인 ⓑ 무료 개방)" % key)
     # ── 오살 금지 ─────────────────────────────────────────────────────────────
     for w in _U23_DESTRUCTIVE:
         if w in c:

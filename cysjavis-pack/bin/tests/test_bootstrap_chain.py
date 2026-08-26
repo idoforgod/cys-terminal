@@ -636,6 +636,66 @@ check("5fb-x2 ok:true 완주가 자기 래치 항목 제거(리셋)",
       json.dumps(bl.get("retry"), ensure_ascii=False)[:200])
 shutil.rmtree(tmp)
 
+# ── 5-fb-y. ★R2-3 지속성 교차 핀(2026-08-26 적대검증): boot-last **쓰기가 실패**하면 그 런의
+#    session_error 는 디스크에 반영되지 않는다 — 그런데도 §0-A 가 읽는 유일 채널에는 직전의
+#    ok:true 가 남아 master 가 '기동 완료'를 보고하고, 매 런이 자기 이력 0 으로 재판정돼
+#    retry_eligible 이 항상 true 가 된다(기계 유계 무효화). 수리 계약 셋을 함께 잰다:
+#      ⓐ 쓰기 실패 관측 시 retry_eligible=false + retry_eligible_unknown=true(측정 불능은 통과가
+#        아니다 = 재실행 허가도 아니다)
+#      ⓑ stdout 에 `boot-last-mirror` 1줄(디스크가 죽어도 모델이 인용할 채널 — A7 동형)
+#      ⓒ 정상 경로 무회귀(대조군: 잠금 없이 3연속 → true,false,false)
+#    ★디렉터리 권한(0o500)으로 쓰기를 막는 방식이라 root 나 비-POSIX 파일시스템에서는 계측이
+#      성립하지 않는다 — 그때는 **통과가 아니라 skip 을 명시**한다(측정 불능 은폐 금지).
+tmp = tempfile.mkdtemp(prefix="boot-t5fby-")
+env, home = make_env(tmp)
+bind_claim(env, 6)
+_stdir = os.path.join(home, ".cys", "state")
+os.makedirs(_stdir, exist_ok=True)
+_blp = os.path.join(_stdir, "boot-last.json")
+with open(_blp, "w", encoding="utf-8") as f:                       # 직전 런의 '완주 성공'
+    json.dump({"result": {"ok": True, "state": "completed", "surface": "7", "run_id": "old"}}, f)
+os.chmod(_stdir, 0o500)
+_probe = None
+try:
+    with open(os.path.join(_stdir, ".probe"), "w") as f:            # 계측 타당성 확인
+        f.write("x")
+    _probe = "writable"                                             # 잠금이 안 걸렸다
+    os.remove(os.path.join(_stdir, ".probe"))
+except OSError:
+    _probe = "locked"
+if _probe != "locked":
+    print("  SKIP 5fb-y: state 디렉터리 쓰기 잠금 불성립(%s) — 계측 불능(통과 아님)" % _probe)
+else:
+    code, out, err = run(env)
+    os.chmod(_stdir, 0o700)
+    _disk = json.load(open(_blp, encoding="utf-8"))
+    _mirror = None
+    for _ln in (out or "").splitlines():
+        _ln = _ln.strip()
+        if _ln.startswith("{") and "boot-last-mirror" in _ln:
+            try:
+                _mirror = json.loads(_ln)
+            except ValueError:
+                pass
+    check("5fb-y1 쓰기 실패 런도 exit 10(본체는 계측 실패로 죽지 않는다)", code == 10,
+          "exit=%d err=%s" % (code, err[-200:]))
+    check("5fb-y2 디스크는 남의 완주 성공 그대로(검체 전제 — 쓰기가 실제로 막혔다)",
+          _disk.get("result", {}).get("state") == "completed",
+          json.dumps(_disk.get("result"), ensure_ascii=False)[:200])
+    check("5fb-y3 stdout 미러 1줄 존재(디스크가 죽어도 인용할 채널)",
+          isinstance(_mirror, dict) and _mirror.get("state") == "session_error",
+          "out=%s" % (out or "")[-300:])
+    check("5fb-y4 측정 불능은 재실행 허가가 아니다(retry_eligible=false + unknown 표기)",
+          isinstance(_mirror, dict) and _mirror.get("retry_eligible") is False
+          and _mirror.get("retry_eligible_unknown") is True
+          and (_mirror.get("log_write_failures") or 0) > 0,
+          json.dumps(_mirror, ensure_ascii=False)[:300])
+try:
+    os.chmod(_stdir, 0o700)
+except OSError:
+    pass
+shutil.rmtree(tmp)
+
 # ── 5-fb-win/dept. 게이트 확인: 부서 레인에서는 폴백 미발동(부서 안에 부서 금지) ──
 # ★마커를 실어 레인 게이트(_is_base_socket)를 실검증한다(2026-08-12 재검증 지적): 마커 없이
 #   돌리면 origin 게이트가 먼저 None 을 반환해 이 핀이 엉뚱한 게이트로 green — 레인 게이트가

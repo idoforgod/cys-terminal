@@ -897,6 +897,65 @@ class _Log:
                 pass  # stderr 자체 불능 — 계측의 계측은 여기서 끝낸다(부트 본체가 우선)
             return False
 
+    def write_failures(self):
+        """이번 런에서 boot-last **쓰기가 실패한 횟수**(0 = 지금까지 전부 디스크에 반영됐다).
+
+        `_persist` 가 best-effort 로 흡수한 실패의 유일한 기계 관측점이다. 이 값이 0 이 아니면
+        디스크의 boot-last 는 이 런의 사실을 담고 있지 **않을 수 있다**.
+        """
+        info = self.data.get("log_write_failures") or {}
+        try:
+            return int(info.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _seal_session_error(self, exit_code):
+        """★R2-3(2026-08-26 적대검증) — session_error 종결을 **지속성 관측과 교차**하고
+        디스크가 죽어도 남는 stdout 채널을 만든다.
+
+        ## 무엇이 틀렸었는가
+        P0-3 래치와 §0-A 소비면은 boot-last 쓰기 **하나**에 단일 의존하는데 그 쓰기 실패는
+        `_persist` 가 침묵 흡수한다(부트 본체를 죽이지 않기 위한 정당한 설계). 그래서 정상
+        완주(`ok:true`)가 래치를 비운 뒤 boot-last 쓰기가 영구 실패하면, session_error 런은
+        디스크에 **전혀 반영되지 않고** 모델이 읽는 유일 채널에는 직전의 `ok:true` 가 남는다.
+        실측(모듈 직접 구동): state 디렉터리를 0o500 으로 잠근 뒤 fail(…session_error) →
+        디스크 result = `{ok:true,state:completed}`(무변화) · 인메모리 = session_error ·
+        `log_write_failures.count=5`. 귀결 둘 — ⓐ master 가 팀 0노드에서 '기동 완료'를 보고
+        하고(P0-4 정직 예보가 막으려던 허위 낙관의 디스크면) ⓑ 매 런이 자기 이력 0 으로
+        재판정돼 `retry_eligible` 이 항상 true(기계 유계 무효화).
+        결정적으로 **쓰기 실패의 증거(log_write_failures)가 쓰기에 실패한 바로 그 파일 안에만**
+        저장된다 — 저장소 교리('측정 불능은 어떤 게이트에서도 통과가 아니다')와 반대 방향이다.
+
+        ## 수리
+        ① 지속성 교차 — 이번 런의 `_persist` 가 1회라도 실패했으면 `retry_eligible=false` 로
+           접고 `retry_eligible_unknown=true`·`persist_failed=N` 을 함께 남긴다(측정 불능은
+           통과가 아니다 = 재실행 허가도 아니다).
+        ② stdout 미러 — 성공 경로의 A7 최종 JSON 과 **동형**으로, 실패 경로에도 모델이 인용할
+           수 있는 1줄 기계 JSON 을 남긴다(디스크가 죽어도 이 채널은 산다).
+        ③ 런 정체성 동봉 — run_id·surface 를 실어 §0-A 가 남의 런·묵은 런을 자기 결과로 읽지
+           못하게 한다(판독 규약의 stale 판정 재료).
+        """
+        res = self.data.get("result")
+        if not isinstance(res, dict):
+            return
+        wf = self.write_failures()
+        if wf:
+            res["retry_eligible"] = False
+            res["retry_eligible_unknown"] = True
+            res["persist_failed"] = wf
+            self._persist()          # 되면 좋고, 안 되면 아래 stdout 이 최종 증거다
+        line = {"channel": "boot-last-mirror", "state": res.get("state"),
+                "exit": exit_code, "run_id": self.run_id, "surface": self.surface,
+                "lane": self.lane, "boot_last": self.path,
+                "retry_eligible": res.get("retry_eligible"),
+                "retry_eligible_unknown": bool(res.get("retry_eligible_unknown")),
+                "log_write_failures": wf}
+        try:
+            sys.stdout.write(json.dumps(line, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass                     # stdout 자체 불능 — 계측의 계측은 여기서 끝낸다
+
     def step(self, name, code, detail="", suffix=""):
         """단계 기록. `name` 은 **STEP.* 상수**여야 한다(P3-A-STEP-NAME).
 
@@ -981,6 +1040,8 @@ class _Log:
             extra["retry_eligible"] = (count <= RETRY_LATCH_MAX)
         self.step(name, code, detail)
         self.result(ok=ok, state=state, failed_step=name, exit=exit_code, **extra)
+        if state == "session_error":
+            self._seal_session_error(exit_code)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
         # ★실패 가시화(2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
         # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — 알림으로 승격.

@@ -371,7 +371,8 @@ pub struct Surface {
     /// (=순수 cmd 재기동이 안전한지) 판정하는 근거. env 미주입 pane(수동·구세션) 재사용 시 fail-closed.
     pub env_injected: bool,
     /// ★(P1) 좌석 토큰 — 데몬이 스폰 시 발급해 pane PTY env(`CYS_SEAT_TOKEN`)로**만** 배달하는
-    /// 세대 각인 비밀(`"{started_at:x}.{128bit hex}"` — §mint_seat_token). claim_role·hook.decide
+    /// 세대 각인 비밀(`"{started_at:x}-{pid:x}.{128bit hex}"` — §mint_seat_token·§seat_token_generation).
+    /// claim_role·hook.decide
     /// 좌석 인가·해석의 1차 축이며, 조상 체인은 보조 인가가 아니라 **모순 거부권**이다.
     /// · **관측·영속 채널 등재 금지**: persist_topology(topology.json)·surface.list 응답·이벤트
     ///   payload·로그 어디에도 싣지 않는다 — 회귀 핀 `seat_token_never_persisted_or_listed`.
@@ -983,7 +984,21 @@ impl CallerCacheEntry {
     }
 }
 
-/// ★(P1) 좌석 토큰 mint — `"{daemon.started_at as u64:x}.{128bit 난수 hex}"`.
+/// ★(P1) 좌석 토큰의 **세대 접두** — 데몬 인스턴스 1개를 가리키는 판별자.
+///
+/// `{started_at:x}-{pid:x}`. ★pid 를 넣은 이유(R2 적대검증 note · 2026-08-26): 종전 접두는
+/// **epoch 초 하나**였다. base 데몬과 부서 데몬은 앱 기동·`cys boot` 에서 **같은 초에** 뜨는
+/// 일이 드물지 않고, 그때 A 가 발급한 토큰이 B 에게 '동세대'로 보인다 — 스큐 안전용으로
+/// 설계한 ⓑ(전세대=조용한 부재 취급 폴백) 탈출구가 사라지고 ⓒ 의 시끄러운 rc6 이 나간다
+/// (= 이 캠페인이 없애려던 바로 그 계급). pid 는 같은 순간 살아있는 두 프로세스를 반드시
+/// 가르므로 '남의 데몬 토큰' 은 항상 전세대로 접히고, 동세대 기각은 **진짜 같은 데몬 안의
+/// env 오염**에만 남는다. mint 와 판독이 같은 프로세스(데몬)에서만 일어나므로 pid 를 인자로
+/// 나르지 않고 여기서 직접 읽는다(호출 계약 무변).
+fn seat_token_generation(started_at: f64) -> String {
+    format!("{:x}-{:x}", started_at as u64, std::process::id())
+}
+
+/// ★(P1) 좌석 토큰 mint — `"{세대 접두}.{128bit 난수 hex}"`(§seat_token_generation).
 /// · 세대 각인: 큐 id `"q{started_at:x}.{seq}"` 선례(§QueueEntry)와 동형 — 전세대(데몬 재시작
 ///   이전) 토큰은 접두 불일치로 **결정론** 판별돼 claim 측이 부재 취급(체인 폴백)한다.
 /// · 난수원: channels::random_token_hex(CSPRNG·실패 시 hard-fail — 예측가능 폴백 금지)를
@@ -992,7 +1007,7 @@ impl CallerCacheEntry {
 ///   강등한다(operator_token 선례) — 스폰 중단으로 설계하면 전 좌석 생성 사망 벡터(치명위험 ④).
 pub fn mint_seat_token(started_at: f64) -> Result<String, String> {
     let tok = crate::channels::random_token_hex()?;
-    Ok(format!("{:x}.{}", started_at as u64, &tok[..32]))
+    Ok(format!("{}.{}", seat_token_generation(started_at), &tok[..32]))
 }
 
 /// ★(P1) 좌석 토큰 상수시간 비교 — 길이 불일치 즉시 false(길이는 비밀이 아님), 내용 비교는
@@ -1006,12 +1021,13 @@ pub fn seat_token_ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// ★(P1) 토큰 세대 판독 — 접두(`.` 이전)가 현 데몬 incarnation(started_at)과 같은가.
+/// ★(P1) 토큰 세대 판독 — 접두(`.` 이전)가 현 데몬 인스턴스(§seat_token_generation)와 같은가.
 /// claim 측 불일치 의미론(오너 결정 ⑭B + 절충)의 분기 재료: 불일치 + **동세대** = 시끄러운
 /// 기각(token_mismatch — env 오염·타 surface 토큰 복사 의심), 불일치 + 전세대/형식 불명 =
 /// 부재 취급(체인 폴백 — 구버전 훅·래퍼가 남긴 stale env 의 최빈 사례를 조용히 흡수).
+/// 접두에 pid 가 들어간 근거는 §seat_token_generation(같은 초에 뜬 두 데몬의 오분류 봉인).
 pub fn seat_token_same_generation(token: &str, started_at: f64) -> bool {
-    token.split('.').next() == Some(format!("{:x}", started_at as u64).as_str())
+    token.split('.').next() == Some(seat_token_generation(started_at).as_str())
 }
 
 /// 워커 인스턴스 dedup: 복수 워커가 같은 역할명(→같은 todo 파일)을 공유하지 않도록,
@@ -4037,6 +4053,29 @@ mod tests {
     fn pid_alive_self_and_zero() {
         assert!(pid_alive(std::process::id()), "자기 프로세스는 alive");
         assert!(!pid_alive(0), "pid 0 은 프로브 대상이 아님 — 항상 dead");
+    }
+
+    /// ★(R2 note) 좌석 토큰 세대 접두는 **데몬 인스턴스**에 결박된다 — epoch 초 단독이 아니다.
+    ///
+    /// 같은 초에 뜬 두 데몬(base·부서 — 앱 기동·`cys boot` 에서 드물지 않다)의 토큰이 서로
+    /// '동세대' 로 보이면, 스큐 안전용 ⓑ(전세대=조용한 부재 취급 폴백)가 사라지고 ⓒ 의
+    /// 시끄러운 rc6 이 나간다(이 캠페인이 없애려던 계급). pid 가 그 오분류를 봉인한다.
+    #[test]
+    fn seat_token_generation_is_bound_to_the_daemon_instance_not_just_the_second() {
+        let t0 = 1_700_000_000.0_f64;
+        let mine = mint_seat_token(t0).expect("mint");
+        assert!(seat_token_same_generation(&mine, t0), "자기 세대 판정 실패: {mine}");
+        // ★같은 **초**에 뜬 남의 데몬 토큰 모사 — 접두가 epoch 초 단독이던 종전 형상이다.
+        let rand_part = mine.split('.').nth(1).expect("세대접두.난수 2부 구성");
+        let same_second_other_daemon = format!("{:x}.{rand_part}", t0 as u64);
+        assert!(
+            !seat_token_same_generation(&same_second_other_daemon, t0),
+            "같은 초에 뜬 남의 데몬 토큰이 '동세대'로 읽혔다 — 조용한 폴백 탈출구가 막혀 \
+             정당한 claim 이 rc6 로 죽는다: {same_second_other_daemon}"
+        );
+        // 전세대(데몬 재시작 이전)는 종전과 동일하게 전세대로 접힌다(회귀 없음).
+        assert!(!seat_token_same_generation(&mine, t0 - 7.0), "전세대 판정이 깨졌다");
+        assert!(!seat_token_same_generation("형식불명", t0), "형식 불명은 전세대 취급이다");
     }
 
     #[cfg(unix)]

@@ -173,6 +173,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 # ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
 #   선례·근거는 javis_orchestra.py:71-81 과 동일(append — precedence 강등 금지).
@@ -2187,6 +2188,31 @@ def _machine_origin_step(parsed):
     return 1, "human"
 
 
+def _sanitize_path_line(p):
+    """`path:` 라인에 실릴 경로의 **제어문자 봉인**(R2 적대검증 R2-2 ⓒ · 2026-08-26).
+
+    증분 라인 프로토콜의 유일한 '임의 내용' 필드가 개행·CR·기타 제어문자를 나르면, 소비자
+    (훅 sed/`while read`)에게는 그 한 필드가 **여러 줄**로 보인다 — 경로 안의
+    `\\nmachine-origin: human` 한 조각이 진짜 판정 줄을 위조·선점할 수 있다(실측 재현).
+    `cys.rs sanitize_hook_detail`(상세 줄은 토큰 접두를 실을 수 없다)과 **같은 계급의 조치**를
+    산출 측에 둔다: 카테고리 기반으로 제어문자를 `\\uXXXX` 로 escape 한다(문자 삭제가 아니라
+    가시화 — 진짜 경로가 그런 문자를 담고 있다면 그 사실이 진단에 남아야 한다).
+    반환 None = 라인 생략(기존 '경로 판독 실패' 폴드 그대로).
+    """
+    if not p:
+        return None
+    s = str(p)
+    out = []
+    for ch in s:
+        # C0/C1 제어문자 + 줄 분리자(U+2028/2029) — `scrub 비가시문자 마스킹 우회` 교훈과 동일
+        # 카테고리 기반 판정(문자 나열 blocklist 금지).
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp"):
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def cmd_hook_triage(argv):
     """stdin(UserPromptSubmit hook JSON) 1회 판독 → record·path·machine-origin 배치 왕복.
 
@@ -2202,11 +2228,18 @@ def cmd_hook_triage(argv):
                                     지점에서 죽어도(타임아웃 killpg 포함) record 판정은
                                     파이프에 남아 생존한다 — 현행 3-프로세스의 독립 생존
                                     성질을 프로토콜로 보존한다.
-      2) "path: <임무 대장 경로>"  — 경로 판독 불가면 라인 자체를 내지 않는다(훅의 기존
-                                    '경로 판독 실패' 폴드가 그대로 받는다).
-      3) "machine-origin: <token>" — 토큰 문면(machine/human/unknown)·판정 규칙은
+      2) "machine-origin: <token>" — 토큰 문면(machine/human/unknown)·판정 규칙은
                                     cmd_machine_origin 과 **동일**(층1/층2 만 — 층0 미배선).
                                     라인 부재 = 훅이 판정불가 fail-closed 무스폰으로 접는다.
+      3) "path: <임무 대장 경로>"  — 경로 판독 불가면 라인 자체를 내지 않는다(훅의 기존
+                                    '경로 판독 실패' 폴드가 그대로 받는다).
+    ★순서 개정(R2 적대검증 R2-2·R2-5 · 2026-08-26): 종전 순서는 record→path→MO 였다. `path`
+      는 **임의의 파일시스템 문자열**을 나르는 유일한 라인이고 MO 는 자율 착수 권한을 가르는
+      안전 임계 라인인데, 임의 내용이 안전 임계 라인보다 **앞**에 서면 그 라인의 어떤 사고도
+      뒤를 삼킨다: ⓐ 경로에 개행이 있으면 위조 `machine-origin:` 줄이 진짜 판정보다 먼저 서고
+      ⓑ 경로에 비UTF8 바이트가 섞이면 BSD sed 가 `illegal byte sequence` 로 스트림을 통째로
+      중단해 뒤의 MO 라인이 소실된다(둘 다 실측 재현). 안전 임계 라인을 record flush 직후
+      **두 번째**로 올리고, path 는 아래 `_sanitize_path_line` 으로 제어문자를 봉한다.
     ★rc 하나로 세 판정을 접지 않는다(W-B '토큰 1차·rc 보조' 교리 — rc 충돌 fail-open 재개방
       금지): 각 판정은 자기 라인으로만 나른다. 프로세스 exit 는 machine-origin 판정값
       (0=기계/1=오너/2=판정불가)을 보조 진단으로 되돌린다 — 소비자는 라인이 1차 근거다.
@@ -2229,17 +2262,8 @@ def cmd_hook_triage(argv):
         rec_rc = EXIT_UNREADABLE
     print("record: rc=%d" % rec_rc)
     sys.stdout.flush()
-    # ② path — 실패는 라인 생략(침묵 아님: 훅이 '경로 판독 실패' 문안으로 정직 강등한다)
-    try:
-        p = ledger_path()
-    except Exception as e:
-        _fail_closed("hook-triage path 단계 예외(%s: %s) — 경로 라인 생략"
-                     % (type(e).__name__, e))
-        p = None
-    if p:
-        print("path: %s" % p)
-        sys.stdout.flush()
-    # ③ machine-origin — 층1/층2 전용 본체 그대로(층0 record 전용 배제가 여기로 새지 않는다)
+    # ② machine-origin — 층1/층2 전용 본체 그대로(층0 record 전용 배제가 여기로 새지 않는다).
+    #    ★안전 임계 라인이므로 record flush 직후 **두 번째**다(위 docstring '순서 개정').
     try:
         mo_rc, token = _machine_origin_step(parsed)
     except Exception as e:
@@ -2250,6 +2274,16 @@ def cmd_hook_triage(argv):
         mo_rc, token = EXIT_UNREADABLE, "unknown"
     print("machine-origin: %s" % token)
     sys.stdout.flush()
+    # ③ path — 실패는 라인 생략(침묵 아님: 훅이 '경로 판독 실패' 문안으로 정직 강등한다)
+    try:
+        p = _sanitize_path_line(ledger_path())
+    except Exception as e:
+        _fail_closed("hook-triage path 단계 예외(%s: %s) — 경로 라인 생략"
+                     % (type(e).__name__, e))
+        p = None
+    if p:
+        print("path: %s" % p)
+        sys.stdout.flush()
     return mo_rc
 
 
@@ -3563,7 +3597,12 @@ def cmd_self_test():
                         sys.stdin, sys.stdout = _old_in, _old_out
 
                 def _tri_order(out, what):
-                    """라인 순서 핀 — record 가 어떤 라인보다도 앞이어야 한다(최우선 계약)."""
+                    """라인 순서 핀 — record 최우선 + **MO 가 path 보다 앞**(R2-2·R2-5).
+
+                    두 번째 단언이 새로 붙은 이유: `path` 는 임의 파일시스템 문자열을 나르는
+                    유일한 라인이라, 그것이 안전 임계 라인(MO)보다 앞에 서면 개행 주입(위조
+                    토큰 선점)·비UTF8 바이트(BSD sed 스트림 중단)가 뒤의 MO 를 삼킨다.
+                    """
                     lines = out.splitlines()
                     idx = {}
                     for i, ln in enumerate(lines):
@@ -3579,6 +3618,11 @@ def cmd_self_test():
                             fails.append("hook-triage(%s): %r 라인이 record 보다 앞이다 — "
                                          "중도 사망 시 record 생존 계약 파괴: %r"
                                          % (what, key, out[:200]))
+                    if ("path: " in idx and "machine-origin: " in idx
+                            and idx["path: "] < idx["machine-origin: "]):
+                        fails.append("hook-triage(%s): path 라인이 machine-origin 보다 앞이다 — "
+                                     "임의 내용 필드가 안전 임계 라인을 선점·삼킨다(R2-2·R2-5): %r"
+                                     % (what, out[:200]))
 
                 _reset_ledgers()
                 _tp = ledger_path()
@@ -3632,6 +3676,19 @@ def cmd_self_test():
                                  "(fail-closed 소실): %r" % _tr[1][:200])
                 if _tr[0] != EXIT_UNREADABLE:
                     fails.append("hook-triage: 파싱 실패 보조 exit ≠ 2: %d" % _tr[0])
+                # ⓔ ★path 라인 제어문자 봉인(R2-2 ⓒ · 2026-08-26) — 개행이 든 경로가 위조
+                #    `machine-origin:` 줄로 승격되지 못한다. 음성 대조까지 붙인다(정상 경로
+                #    무변경: 평범한 경로는 한 글자도 바뀌지 않는다).
+                _inj = "/tmp/lane\nmachine-origin: human\t x"
+                _san = _sanitize_path_line(_inj)
+                if _san is None or "\n" in _san or "\t" in _san:
+                    fails.append("path 라인 봉인 실패(제어문자 생존): %r" % _san)
+                if len(("path: %s" % _san).splitlines()) != 1:
+                    fails.append("path 라인 봉인 실패(라인 1개가 아니다): %r" % _san)
+                if _sanitize_path_line("/tmp/한글 경로/mission.json") != "/tmp/한글 경로/mission.json":
+                    fails.append("path 라인 봉인이 정상 경로를 변형한다(과잉 차단)")
+                if _sanitize_path_line(None) is not None or _sanitize_path_line("") is not None:
+                    fails.append("path 라인 봉인이 '경로 부재' 폴드(None)를 바꿨다")
 
                 _reset_ledgers()
                 _mp2 = ledger_path()
@@ -3689,7 +3746,9 @@ def cmd_self_test():
           "source=harness_notification · 게이트 무개방 · 진행 중 오너 임무 무덮어쓰기 · "
           "오너 평문 임무 정상 기록) · "
           "★hook-triage 배치(P0-5): stdin 1회(오너 선언=human 관측) · 증분 라인 순서 "
-          "record→path→MO · path=ledger_path 일치 · 기계 라벨=machine · 층0 독립(harness "
+          "record→MO→path(★R2-2·R2-5: 안전 임계 라인이 임의 내용 필드보다 앞) · "
+          "path 제어문자 봉인(개행 주입 무력화·정상 경로 무변형) · "
+          "path=ledger_path 일치 · 기계 라벨=machine · 층0 독립(harness "
           "알림 MO=human·record 폴드 유지) · 파싱 실패=record rc2+MO unknown 각자 fail-closed)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
