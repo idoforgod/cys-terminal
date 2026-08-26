@@ -20,6 +20,15 @@
   load     soft 1.0×ncpu / hard 2.0×ncpu
   context  soft 50 / hard 60    (60% 도달 전 저장 후 /clear 규칙)
 
+★T9(P3-1·R3-P03-1) 곱셈 편성 예산 축(W6): check --formation-size <n> + env CYS_FORMATION_BUDGET.
+  발화 조건은 **둘 다**다 — formation_size is not None ∧ CYS_FORMATION_BUDGET 정수 파싱 성공.
+  어느 한쪽 부재(또는 env 비정수)=완전 무동작(inert) — 기존 호출자 3곳(bootstrap ④′·
+  completion_guard·formation)의 회귀 0. 발화 시 투영 = 측정 nodes + 활성 부서수×formation_size 를
+  예산과 대조, **초과(>)면 hard(exit 2)**. nodes 미측정(ps 실패)이면 이 축은 무발화하고
+  measure_errors 경로(최소 soft 격상)가 신호한다 — 예외로 터뜨리지 않는다(70 방지).
+  종전에는 이 플래그가 없어서 formation 의 호출이 매번 exit 64(사용오류)로 접혔다(편성
+  자원게이트 완전 사문 — R3-P03-1 실측). 이 리비전이 그 잠복 결함의 수리다.
+
 테스트/자동화 주입: --servers-override/--nodes-override/--load-override (라이브 측정 대체).
 사용 예: python3 javis_resource_gate.py check --context 42 --json
 exit codes(A13 타입드 — 코드 상수와 기계 대조):
@@ -211,6 +220,36 @@ def _rate_checks(a):
     return out
 
 
+# ── ★T9(P3-1·R3-P03-1) 곱셈 편성 예산 축(W6) ──
+def _formation_budget_check(m, a):
+    """check --formation-size + env CYS_FORMATION_BUDGET 의 곱셈 편성 예산 축.
+
+    발화 조건(계약 문면 그대로): formation_size is not None **이면서** CYS_FORMATION_BUDGET 이
+    정수로 파싱될 때만 — 어느 한쪽 부재=완전 무동작(None 반환·기존 호출자 회귀 0).
+    투영 = 측정 nodes + 활성 부서수 × formation_size. 초과(projected > budget)=hard.
+    nodes=None(ps 실패)은 None 반환 — 예외 금지(터지면 70). measure_errors('nodes(ps)')가
+    이미 최소 soft 격상을 담당하므로 '측정 불능=조용한 allow'는 아니다(P-ORCH-1).
+    반환: (check_dict_or_None, warning_str_or_None) — 비정수 env 는 발화 조건 미충족이라
+    verdict 무접촉이되 warning 으로만 가청화한다(침묵 금지·판정 오염 0)."""
+    size = getattr(a, "formation_size", None)
+    if size is None:
+        return None, None
+    raw = os.environ.get("CYS_FORMATION_BUDGET")
+    if raw is None:
+        return None, None
+    try:
+        budget = int(raw.strip())
+    except (ValueError, AttributeError):
+        return None, "formation_budget_env_invalid:%r" % raw
+    nodes = m.get("nodes")
+    if nodes is None:
+        return None, None  # ps 실패 — measure_errors 경로 소관(예외 금지 — 70 방지)
+    projected = nodes + m.get("active_depts", 0) * size
+    level = "hard" if projected > budget else "ok"
+    return {"metric": "formation_budget", "value": projected, "soft": budget,
+            "hard": budget, "level": level}, None
+
+
 def evaluate(m, a):
     checks = []
 
@@ -230,6 +269,11 @@ def evaluate(m, a):
     # 게이트는 master 부트 플로우가 호출하므로 rate로 조직 기동을 막지 않는다(soft만 반영).
     if _rate_enabled(a):
         checks.extend(_rate_checks(a))
+
+    # ★T9(W6) 곱셈 편성 예산 축 — 발화 조건(플래그∧env 정수) 미충족이면 완전 무동작(회귀 0).
+    fb, _fb_warn = _formation_budget_check(m, a)
+    if fb is not None:
+        checks.append(fb)
 
     # 측정 실패는 최소 soft로 격상(조용한 allow 금지 · P-ORCH-1) — 실제 hard 트립이 있으면 hard가 우선.
     worst = "soft" if m.get("measure_errors") else "ok"
@@ -259,6 +303,10 @@ def cmd_check(a):
         warnings.append("measure_error:" + ",".join(m["measure_errors"]))
     if m["context_pct"] is None:
         warnings.append("context_unmeasured")
+    # ★T9: 비정수 CYS_FORMATION_BUDGET 는 판정 무접촉(발화 조건 미충족)이되 침묵하지 않는다.
+    _fb, fb_warn = _formation_budget_check(m, a)
+    if fb_warn:
+        warnings.append(fb_warn)
     result = {"verdict": verdict, "measured": m, "trips": trips,
               "checks": checks, "warnings": warnings}
     if a.json:
@@ -488,6 +536,10 @@ def main(argv=None):
     c.add_argument("--require-context", dest="require_context", action="store_true",
                    help="Phase 1 §2-5: context 미제공 시 context_unmeasured 를 soft(exit 1)로 "
                         "격상 — verify 실행 경로(completion-guard) 전용. 기본 동작 불변")
+    c.add_argument("--formation-size", dest="formation_size", type=int, default=None,
+                   help="★T9(W6): 이 레인 편성 크기 — env CYS_FORMATION_BUDGET(정수)과 둘 다 "
+                        "있을 때만 곱셈 예산 축 발화(투영=nodes+부서수×크기 · 초과=hard). "
+                        "어느 한쪽 부재=완전 무동작(기존 호출자 회귀 0)")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")
@@ -603,6 +655,64 @@ def self_test():
                    "--load-override", "0.0"])
     chk(rc == EXIT_ALLOW, "플래그 없는 context 미제공이 allow 아님(기본 동작 회귀): rc=%r" % rc)
 
+    # ⑩ ★T9(P3-1·R3-P03-1) 곱셈 편성 예산 축 4형상 — 발화는 (--formation-size ∧ env 정수) 둘 다일 때만.
+    #    결정론 확보: --formation-size 0 이면 투영 = nodes_override + depts×0 = nodes_override 라
+    #    라이브 부서 소켓 수(_active_dept_count)와 무관하게 판정이 고정된다(밀폐).
+    base_argv = ["check", "--servers-override", "0", "--nodes-override", "0",
+                 "--load-override", "0.0"]
+    saved_budget = os.environ.pop("CYS_FORMATION_BUDGET", None)
+    try:
+        # (a) 둘 다 + 예산 내(투영 0 ≤ 0) → allow
+        os.environ["CYS_FORMATION_BUDGET"] = "0"
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main(base_argv + ["--formation-size", "0"])
+        chk(rc == EXIT_ALLOW, "예산 내(0≤0)가 allow 아님: rc=%r" % rc)
+        # (b) 둘 다 + 예산 초과(투영 0 > -1) → hard(2) + trips 에 formation_budget
+        os.environ["CYS_FORMATION_BUDGET"] = "-1"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(base_argv + ["--json", "--formation-size", "0"])
+        chk(rc == EXIT_HARD, "예산 초과(0>-1)가 hard(2) 아님: rc=%r" % rc)
+        try:
+            doc = json.loads(buf.getvalue().strip())
+            chk(any(t.get("metric") == "formation_budget" for t in doc.get("trips") or []),
+                "예산 초과 trips 에 formation_budget 부재: %r" % doc.get("trips"))
+        except ValueError as e:
+            fails.append("예산 축 --json 파싱 실패: %s" % e)
+        # (c) 플래그만(env 부재) → 완전 무동작 = allow
+        os.environ.pop("CYS_FORMATION_BUDGET", None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main(base_argv + ["--formation-size", "0"])
+        chk(rc == EXIT_ALLOW, "env 부재인데 예산 축이 발화(무동작 계약 위반): rc=%r" % rc)
+        # (d) env 만(플래그 부재) → 완전 무동작 = allow (기존 호출자 3곳 회귀 0)
+        os.environ["CYS_FORMATION_BUDGET"] = "-1"
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main(base_argv)
+        chk(rc == EXIT_ALLOW, "플래그 부재인데 예산 축이 발화(기존 호출자 회귀): rc=%r" % rc)
+        # (e) env 비정수 + 플래그 → 판정 무접촉(allow) + warning 가청화
+        os.environ["CYS_FORMATION_BUDGET"] = "abc"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(base_argv + ["--json", "--formation-size", "0"])
+        chk(rc == EXIT_ALLOW, "비정수 env 가 판정을 오염: rc=%r" % rc)
+        try:
+            doc = json.loads(buf.getvalue().strip())
+            chk(any(w.startswith("formation_budget_env_invalid") for w in doc.get("warnings") or []),
+                "비정수 env 가 침묵(warning 부재): %r" % doc.get("warnings"))
+        except ValueError as e:
+            fails.append("예산 축(비정수 env) --json 파싱 실패: %s" % e)
+        # (f) nodes 미측정(ps 실패 형상) → 예외 금지(70 방지·None 무발화) — 순수 함수 직접 핀
+        os.environ["CYS_FORMATION_BUDGET"] = "1"
+        ns2 = types.SimpleNamespace(formation_size=5)
+        fb, fw = _formation_budget_check({"nodes": None, "active_depts": 3}, ns2)
+        chk(fb is None and fw is None,
+            "nodes=None(ps 실패)에서 예산 축이 무발화가 아님(70 위험): %r/%r" % (fb, fw))
+    finally:
+        if saved_budget is None:
+            os.environ.pop("CYS_FORMATION_BUDGET", None)
+        else:
+            os.environ["CYS_FORMATION_BUDGET"] = saved_budget
+
     if fails:
         print("javis_resource_gate self-test FAIL:")
         for f in fails:
@@ -611,7 +721,9 @@ def self_test():
     print("javis_resource_gate self-test OK — A13 타입드 exit 9종"
           "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)"
           " + B1 --require-context 5종(미제공 soft·trips 비오염·context 제공 allow/hard·"
-          "무플래그 기본 동작 불변)")
+          "무플래그 기본 동작 불변)"
+          " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
+          "비정수 env 가청화·nodes 미측정 무예외)")
     return 0
 
 

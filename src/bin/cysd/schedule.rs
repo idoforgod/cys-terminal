@@ -66,6 +66,15 @@ pub struct Job {
     /// true면 매 발화마다 새 surface를 기동해 주입 (권한·컨텍스트 상속 차단 — cron 격리)
     #[serde(default)]
     pub fresh: bool,
+    /// ★T9(R3-P03-3): true 면 **base 데몬 전용** 잡 — 부서 소켓 데몬에서는 `fire()` 진입부의
+    /// 단일 관문이 skip 한다(사유 이벤트 1줄). 배경: `ensure_builtin_jobs` 는 모든 cysd 가
+    /// 무조건 호출하고(main.rs) schedule_path 는 CYS_PACK_DIR 을 따르므로 부서 데몬도 자기 팩
+    /// schedule.json 에 builtin 을 복제 기록한다 — cys-dept 정상 경로는 seed_schedule 이 비워
+    /// 주지만, cys 클라이언트 autostart 등 cys-dept 를 경유하지 않는 재기동에서는 seed 가 다시
+    /// 돌지 않아 부서 데몬이 base 전용 잡을 실행한다. 추가-전용 스키마 규약(#[serde(default)])
+    /// — 구 파일·구 데몬과 양방향 호환(미지 필드 무시·부재=false).
+    #[serde(default)]
+    pub base_only: bool,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
 }
@@ -173,6 +182,29 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "action": "command",
             "command": "CYS_PROJECT_ROOT=\"${CYS_PROJECT_ROOT:-$HOME}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\" bootstrap-verifier --ensure",
             "_builtin": "cycle",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+        // ── ★T9(P3-1 ⓑ) 상비편성 심박 — 10분 틱으로 전 부서 formation ensure ────────────
+        // **신규 id 라 BUILTIN_JOBS_VERSION 범프 불요·금지**(R3-P03-3: 신규 id 는 버전 무관
+        // append(:None→push) — 범프하면 기존 builtin 6종이 코드 정의로 통째 교체돼 운영자 수기
+        // 편집이 무언 소실된다). 부서 팩 schedule 은 seed_schedule 이 설계상 비우므로 이 틱의
+        // 소유는 **base 데몬**이고, base_only+fire() 관문이 부서 데몬 복제 실행을 차단한다.
+        // command 레인(스케줄 push 아님 — master stdin 무주입)·`--force-surface` 금지
+        // (javis_formation._surface: 주기 잡에 붙이면 매 틱 토스트 스팸). ensure 자체가
+        // 소켓키 싱글플라이트+시도 원장(역할당 MAX 3·쿨다운)으로 유계라 10분 틱이 폭주 축이
+        // 되지 않는다(P3-1 폭주 앵커 ① 방어). agent 전멸 부서의 유일 자동 복구 경로(치명 ③).
+        // ★한계(SF-3·기지): 전 부서를 fire_command 단일 600s 캡 안에서 직렬 순회
+        // — _boot_node 역할당 200s 상한이라 편성 폭풍 시 1부서만으로 캡 초과 가능. fire_command
+        // 는 kill_on_drop 미설정이라 타임아웃해도 자식은 완주(작업·원장 정상 — 폭주 아님)하고
+        // 그 틱에 'command timed out' 오보 1줄만 남는다. 부서당 timeout 래핑은 플랫폼별
+        // timeout(1) 가용성이 갈려 보류(coreutils 비보장 — macOS 기본엔 없음).
+        json!({
+            "id": "formation-heartbeat",
+            "every_minutes": 10,
+            "action": "command",
+            "base_only": true,
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" --json || true; done",
+            "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
     ]
@@ -698,7 +730,28 @@ pub fn run_now(daemon: &Arc<Daemon>, job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// ★T9(R3-P03-3): base 전용 잡의 부서 데몬 발화 차단 판정(순수 — 회귀 핀 대상).
+/// fire() 진입부가 유일 관문인 이유: scheduler_tick·run_now·핫리로드·파일 복제(부서 팩에
+/// builtin 이 복제 기록되는 기지 소음) 전 경로가 fire 로 수렴한다 — ensure/seed 시점 가드로는
+/// cys-dept 미경유 재기동(클라이언트 autostart)을 막지 못한다. 셸 env 가드([ -n "$CYS_SOCKET" ])
+/// 는 판별자로 부적격(GUI ensure_daemon 이 base cysd 를 env_remove 없이 스폰) — 판별은
+/// 데몬 자신의 socket_path(is_dept_socket) 하나다.
+fn base_only_blocked(job: &Job, socket_path: &std::path::Path) -> bool {
+    job.base_only && cys::is_dept_socket(socket_path)
+}
+
 async fn fire(daemon: Arc<Daemon>, job: Job) {
+    // ★T9 단일 관문: base_only 잡이 부서 소켓 데몬에서 발화하려 하면 skip + 사유 이벤트 1줄.
+    // (예: 상비편성 심박이 부서 데몬에서 돌면 전 부서 이중 ensure — 단일소유 위반.)
+    if base_only_blocked(&job, &daemon.socket_path) {
+        daemon.bus.publish(
+            "schedule.skipped",
+            "schedule",
+            None,
+            json!({"job_id": job.id, "why": "base_only job on dept socket — skip (T9/R3-P03-3)"}),
+        );
+        return;
+    }
     let result = match job.action.as_str() {
         "push" => fire_push(&daemon, &job).await,
         "command" => fire_command(&daemon, &job).await,
@@ -1326,7 +1379,7 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 6개(phoenix2 + learn2 + cycle2) 생성 → changed=true.
+        // 1차: built-in 7개(phoenix2 + learn2 + cycle2 + formation1) 생성 → changed=true.
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
@@ -1340,10 +1393,14 @@ mod tests {
             ids.contains(&"cycle-autopilot-tick") && ids.contains(&"cycle-verifier-watchdog"),
             "R6 W0-4/W0-5 cycle 잡 2종 생성"
         );
+        assert!(
+            ids.contains(&"formation-heartbeat"),
+            "T9 P3-1 ⓑ 상비편성 심박 잡 생성"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 7, "사용자1 + built-in6");
+        assert_eq!(jobs.len(), 8, "사용자1 + built-in7");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080),
-        // cycle tick=매분(1), verifier watchdog=10분(10).
+        // cycle tick=매분(1), verifier watchdog=10분(10), formation heartbeat=10분(10).
         let period = |id: &str| {
             jobs.iter()
                 .find(|j| j["id"].as_str() == Some(id))
@@ -1355,6 +1412,32 @@ mod tests {
         assert_eq!(period("fleet-digest"), Some(10080), "fleet digest 주 1회");
         assert_eq!(period("cycle-autopilot-tick"), Some(1), "cycle tick 매분");
         assert_eq!(period("cycle-verifier-watchdog"), Some(10), "verifier watchdog 10분");
+        assert_eq!(period("formation-heartbeat"), Some(10), "formation heartbeat 10분");
+        // ★T9(P3-1 ⓑ) 상비편성 심박 계약 핀: command 레인(매 틱 master stdin 무주입) ·
+        //   base_only(부서 데몬 복제 실행 차단 — fire 관문과 쌍) · --force-surface 금지
+        //   (주기 잡 스팸 계약 javis_formation._surface) · ensure 호출 실재.
+        {
+            let fh = jobs
+                .iter()
+                .find(|j| j["id"].as_str() == Some("formation-heartbeat"))
+                .unwrap();
+            assert_eq!(fh["action"].as_str(), Some("command"), "심박은 command 레인 핀");
+            assert_eq!(fh["base_only"].as_bool(), Some(true), "심박은 base_only 핀");
+            let cmd = fh["command"].as_str().unwrap();
+            assert!(
+                cmd.contains("javis_formation.py") && cmd.contains("ensure"),
+                "심박 command 에 formation ensure 부재"
+            );
+            assert!(
+                !cmd.contains("--force-surface"),
+                "주기 잡에 --force-surface 금지(매 틱 토스트 스팸 계약)"
+            );
+        }
+        // ★T9(R3-P03-3) 범프 금지 핀: 신규 id 는 버전 무관 append 라 범프가 불요하고, 범프는
+        //   기존 builtin 항목을 코드 정의로 통째 교체해 **운영자 수기 편집을 무언 소실**시킨다.
+        //   builtin 잡 '내용' 변경으로 범프가 정말 필요해지면 이 핀을 의식적으로 함께 고치라
+        //   (그 커밋이 곧 소실 고지다).
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "BUILTIN_JOBS_VERSION 무단 범프 금지(T9)");
         // ★크리틱 B3 ① 회귀 핀: cycle 잡 2종은 push 가 아니라 command 레인이어야 한다
         //   (push 면 매분 master stdin 주입 폭주 + R-CLI-4 정확일치 게이트와 충돌).
         for id in ["cycle-autopilot-tick", "cycle-verifier-watchdog"] {
@@ -1377,7 +1460,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 7, "중복 없이 7개 유지");
+        assert_eq!(jobs.len(), 8, "중복 없이 8개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -1473,6 +1556,50 @@ mod tests {
         }
     }
 
+    // ★T9(R3-P03-3): base_only 단일 관문 판정 — 4형상(base/dept × base_only on/off).
+    //   fire() 진입부가 이 순수 판정을 그대로 소비한다(스케줄 틱·run_now·핫리로드 전 경로 커버).
+    #[test]
+    fn base_only_gate_blocks_only_dept_sockets() {
+        let mut bj = job(None, &[]);
+        bj.base_only = true;
+        let mut nj = job(None, &[]);
+        nj.base_only = false;
+        let base_sock = std::path::Path::new("/tmp/state/cys/cys.sock");
+        let dept_sock = std::path::Path::new("/tmp/state/cys-dept-dept-1/cys.sock");
+        assert!(
+            base_only_blocked(&bj, dept_sock),
+            "base_only 잡이 부서 소켓에서 차단되지 않는다(복제 실행 — 단일소유 위반)"
+        );
+        assert!(
+            !base_only_blocked(&bj, base_sock),
+            "base_only 잡이 base 소켓에서 오차단(심박 사망 — 자가치유 경로 절단)"
+        );
+        assert!(
+            !base_only_blocked(&nj, dept_sock),
+            "일반 잡이 부서 소켓에서 오차단(부서 스케줄 회귀)"
+        );
+        assert!(!base_only_blocked(&nj, base_sock), "일반 잡 base 소켓 회귀");
+        // Windows named pipe 부서 소켓도 동일 판정(is_dept_socket 은 경로 성분 기반).
+        let pipe = std::path::Path::new(r"\\.\pipe\cys-dept-dept-2");
+        assert!(base_only_blocked(&bj, pipe), "named pipe 부서 소켓 미판별");
+    }
+
+    // ★T9: base_only 는 추가-전용 스키마(#[serde(default)]) — 구 파일(필드 부재)=false 로 로드,
+    //   명시 true 는 보존된다(부서 복제 파일에서도 판정 근거가 살아남는 근거).
+    #[test]
+    fn base_only_serde_default_is_false() {
+        let old: Job = serde_json::from_value(json!({
+            "id": "legacy", "action": "push", "to": "master"
+        }))
+        .expect("구 스키마(필드 부재) 역직렬화");
+        assert!(!old.base_only, "필드 부재는 false(구 파일 호환)여야 한다");
+        let new: Job = serde_json::from_value(json!({
+            "id": "fh", "action": "command", "command": "true", "base_only": true
+        }))
+        .expect("신 스키마 역직렬화");
+        assert!(new.base_only, "명시 true 소실 — 관문 판정 근거 붕괴");
+    }
+
     #[test]
     fn run_now_is_frozen_while_paused() {
         // 회귀 가드 (T4-15 kill-switch 비대칭 차단): pause 중이면 run_now도 발화하지 않아야 한다.
@@ -1520,6 +1647,7 @@ mod tests {
             command: None,
             if_absent: None,
             fresh: false,
+            base_only: false,
             launch: None,
         }
     }

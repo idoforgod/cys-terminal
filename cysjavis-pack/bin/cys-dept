@@ -93,6 +93,33 @@ dept_tombstone_remove(){
   python3 "$ph" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
 }
 
+# ★T9(P3-1 ⓐ): 상비편성 배선 — 생성 동사(launch/allocate/create) 성공 꼬리의 편성 ensure.
+# 오너 확정 ②a/⑩B: 상비편성(B)이 부서 팀 admission 의 정본이다 — 여기에 티켓 게이트를 넣지
+# 않는다(티켓 체계 bootstrap ③″는 수동 선언 레인 전용으로 무변경 존치). fail-open 계약:
+# 실패·모듈 부재·행이 부서 생성을 절대 깨지 않는다 — ensure 는 노드 부착(역할당 최대 200s)
+# 을 포함해 수 분을 점유할 수 있으므로 **백그라운드**로 착수한다(동기 호출은 allocate/create
+# 의 stdout name 파싱(Tauri)을 그만큼 지연시켜 '생성 불파괴' 계약을 UX 층에서 깬다).
+# loud 채널: formation 자체의 feed 표면화(침묵 금지 C6) + 부서 로그의 formation.log +
+# 착수 1줄(stderr). 미착수(모듈 부재)도 1줄 남긴다 — 주기 심박(base 스케줄 ⓑ)이 후속 수렴.
+# --force-surface 금지(주기 잡 스팸 계약 javis_formation.py _surface 주석) · CYS_STATE_DIR
+# 무재설정(싱글플라이트 락 불변식 — formation.py _state_root 주석).
+formation_ensure_async(){
+  local name="$1" sock="$2" fm log logdir
+  fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
+  if [ ! -f "$fm" ]; then
+    echo "[cys-dept] WARN: $name 편성 ensure 생략(javis_formation.py 부재) — base 스케줄 심박이 후속 수렴" >&2
+    return 0
+  fi
+  # ★SF-2(P3 수정 라운드): 로그 dir 부재 형상에서 >>"$log" 실패로 서브셸이 침묵 사망하면 아래
+  #   '착수' 1줄이 거짓 주장이 된다 — mkdir 선행·불가 시 /dev/null 폴백(로그만 포기·실행은 보장.
+  #   심박이 후속 수렴하므로 로그 소실은 저위험).
+  logdir="$(dept_logdir "$name")"; log="$logdir/formation.log"
+  mkdir -p "$logdir" 2>/dev/null || log=/dev/null
+  ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+  disown 2>/dev/null || true
+  echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open) — 로그: $log" >&2
+}
+
 # ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
 # --purge-state에서만 호출. 삭제(rm) 아닌 격리라 왕복 복원 가능(mv 역방향). 반환 0=격리 완료 또는
 # 대상 없음(우아·no-op), 비0=부적격명·경로 불일치·사용 중·mv 실패·잔존(강행 금지). preflight stop-and-report 내장.
@@ -965,6 +992,7 @@ case "$cmd" in
     #   ★⑦: 재사용 분기(_spawned=0)에서도 발급한다 — 근거는 dept_issue_ceo_ticket 함수 주석.
     dept_issue_ceo_ticket "$name" "$_spawned"
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
+    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none}). 부서 수=$(reg_count)"
     ;;
   allocate)
@@ -1069,6 +1097,10 @@ PY
     #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
     #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
     #   --role master 필수·--cmd 생략=기본 로그인 셸. CYS_DEPT_NO_MASTER=1=셸도 생략(빈 데몬). 이미 master면 멱등.
+    #   ★후행 결정 갱신(T9·오너 ②a 상비편성(B) — 규범 이중화 방지): 위 '빈 셸만' 문면은 **이 지점의
+    #   즉시 동작**(여기서 직접 각성시키지 않는다)으로 한정된다. 부서 생성의 최종 상태는 상비편성이며,
+    #   실제 팀 완결은 성공 꼬리의 formation_ensure_async(→javis_formation ensure — 빈 셸 입양 포함)가
+    #   담당한다. 즉 '자동 각성 폐지'는 이 인라인 경로의 폐지이지 편성 완결의 폐지가 아니다.
     if [ "${CYS_DEPT_NO_MASTER:-0}" = 1 ]; then
       echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
@@ -1079,6 +1111,7 @@ PY
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 번호 재사용으로 묘비명과 충돌 시 보호 재편입
+    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
     ;;
@@ -1232,6 +1265,8 @@ PY
     #   자동 각성(부트 노드)+미션 자동주입(send --to master)을 폐지 — 사용자가 그 셸에서 직접 claude 를
     #   실행해 부서장으로 연결하고, 부서장이 미션 파일($MISS/$key.md)을 스스로 읽는다. 빈 셸(agent=None)엔
     #   phoenix 각성핑도 미발사(stage_reinject agent-gate) → 빈 zsh 오해석 에러 0. 계정격리·미션파일은 보존.
+    #   ★후행 결정 갱신(T9·오너 ②a 상비편성(B) — 규범 이중화 방지): '빈 셸만'은 이 인라인 지점의 즉시
+    #   동작 한정이다 — 최종 상태는 상비편성이고 팀 완결은 성공 꼬리의 formation_ensure_async 소관이다.
     # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
     if dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
@@ -1241,6 +1276,7 @@ PY
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 삭제→동명 재생성 시 보호 재편입
+    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
     echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock)" >&2
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;

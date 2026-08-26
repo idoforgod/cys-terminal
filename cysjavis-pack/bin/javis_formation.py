@@ -333,6 +333,10 @@ def state_kind(state):
 # ── W3(T3): 배너 수명 신호 매핑 — feed --kind(UI 배너 판정) · EVT 타입(음성/HUD 트랙) ──
 # UI 배너 소멸/갱신은 데몬 feed 버스(feed.item.created, payload.kind)가 담당하고(ui bootbanner.ts),
 # EVT 는 별개 층(음성·HUD, javis_event.py 계약)이다 — handlers.rs:2814 층 분리 주석과 정합.
+# ★기지 한계 명문(T9 오너 고지): 현 앱 리비전의 ui/src 에는 formation-* kind 의 소비자
+# (bootbanner.ts)가 부재하다 — formation-complete 가 boot-warning 배너를 지우는 배선은 별도
+# 앱 릴리스 게이트다. 그래도 feed 발행은 **전이 시에만**(기존 스팸 억제 관례) 유지한다:
+# 소비자가 실리는 순간 이 신호가 그대로 배너 수명이 된다(발행측 무수정).
 _STATE_FEED_KIND = {"complete": "formation-complete", "partial": "formation-partial",
                     "pending-cli": "formation-pending", "pending-resource": "formation-pending",
                     "failed": "formation-failed"}
@@ -467,18 +471,136 @@ def _installed_clis():
 
 
 # ── ④ 곱셈 자원 예산(W6 접점 — hard=pending-resource) ──
-def _resource_ok(socket):
-    """javis_resource_gate.py check → 편성 착수 자원 여유(hard=False). 게이트 부재/내부오류=True(보수).
-    ★W6 곱셈 편성 예산(T4): --formation-size 로 이 레인 편성 크기를 전달 → 게이트가 투영(측정 노드 +
-    부서수×편성크기)을 CYS_FORMATION_BUDGET 과 대조해 초과 시 hard(exit 2)→여기서 False→pending-resource."""
+# 재시도(무플래그) 호출 timeout — 본 호출(30s)보다 짧게(R3-P03-1 권고 15s).
+RESOURCE_RETRY_TIMEOUT_S = 15
+
+
+def _gate_path():
+    """자원 게이트 경로 seam(테스트 치환점) — 부재면 None."""
     gate = os.path.join(PACK_DIR, "bin", "javis_resource_gate.py")
-    if not os.path.isfile(gate):
+    return gate if os.path.isfile(gate) else None
+
+
+def _resource_branch(code):
+    """게이트 exit → 분기(순수·self-test 핀 — ★T9 재명세·R3-P03-1):
+      2        → 'block'     hard 차단(자원 hard 또는 W6 예산 초과)
+      64·70    → 'retry'     스큐(사용오류)/게이트 내부오류 — loud 후 **무플래그 1회 재시도**
+      127      → 'exec-fail' 실행실패 단일 버킷(부재·타임아웃은 _run 이 127 하나로 접는다 —
+                              stderr 로만 구분) — loud·무재시도·진행
+      그 외     → 'proceed'   0 allow·1 soft 등 = 진행"""
+    if code == 2:
+        return "block"
+    if code in (64, 70):
+        return "retry"
+    if code == 127:
+        return "exec-fail"
+    return "proceed"
+
+
+def _resource_ok(socket):
+    """javis_resource_gate.py check → 편성 착수 자원 여유(False=pending-resource).
+
+    ★W6 곱셈 편성 예산: --formation-size 로 이 레인 편성 크기를 전달 → 게이트가 투영
+    (측정 노드+부서수×편성크기)을 CYS_FORMATION_BUDGET 과 대조해 초과 시 hard(exit 2).
+    (T9 에서 게이트 쪽 --formation-size 가 실제로 구현됐다 — 종전에는 매 호출이 exit 64 로
+    접혀 이 게이트가 아무것도 재지 않는 사문이었다. R3-P03-1 실측.)
+
+    ★분기 재명세(T9): '측정 불능=통과' 를 침묵으로 남기지 않되(전 실패 경로 loud), 게이트
+    자체 결함이 편성을 영구 봉쇄하지도 않게 한다(문서화된 절충 — 봉쇄 축 유계는 시도 원장이
+    담당). 64/70 재시도가 무플래그인 이유: 64 는 버전 스큐(구 게이트가 --formation-size 를
+    모름)가 최빈 원인이고 70 도 신축(예산 축) 크래시 가능성이 있어, 축소 호출 1회가 스큐를
+    해소한다. 127 재시도는 원인(실행환경)이 동일해 무의미 — 무재시도."""
+    gate = _gate_path()
+    if gate is None:
         return True
     py = sys.executable or "python3"
-    code, _out, _err = _run(
+    code, _out, err = _run(
         [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], timeout=30)
-    # exit 2 = hard block(자원 hard 또는 W6 예산 초과). 그 외(0 allow·1 soft·기타 내부오류)=진행.
-    return code != 2
+    branch = _resource_branch(code)
+    if branch == "block":
+        return False
+    if branch == "retry":
+        sys.stderr.write("[formation] 자원 게이트 측정 실패(exit %s — 스큐/내부오류) — "
+                         "무플래그 1회 재시도\n" % code)
+        code2, _o2, _e2 = _run([py, gate, "check", "--json"],
+                               timeout=RESOURCE_RETRY_TIMEOUT_S)
+        if code2 == 2:
+            return False
+        if code2 not in (0, 1):
+            sys.stderr.write("[formation] 재시도도 측정 실패(exit %s) — loud 진행"
+                             "(측정불능≠통과 원칙의 문서화된 절충: 게이트 결함이 편성을 "
+                             "영구 봉쇄하지 않게)\n" % code2)
+        return True
+    if branch == "exec-fail":
+        sys.stderr.write("[formation] 자원 게이트 실행 실패(exit 127 — 부재/타임아웃 단일 "
+                         "버킷: %s) — 무재시도·loud 진행\n"
+                         % ((err or "").strip().replace("\n", " ")[:120]))
+        return True
+    return True
+
+
+# ── ★T9(P3-1): 역할별 시도 원장 — boot_supervisor 4중 유계 계약의 pack 측 동형 이식 ──
+# 폭주 앵커 ①의 직접 방어: ensure 에 시도 상한·쿨다운이 전무하면 주기 틱(10분)+크래시루프
+# 조합에서 5좌석×8부서×6회/시 스폰이 무기한 지속된다(P3-1 치명위험 판정). boot_supervisor.rs
+# 의 MAX_ATTEMPTS=3·선형 백오프 쿨다운(RETRY_COOLDOWN_SECS×시도수)을 동형으로 옮긴다
+# (바이너리 무접촉 — 감독자 유계는 P2 인텐트 경로 전용이라 formation 직스폰 경로 비적용).
+# 저장은 formation 상태파일의 "attempts" 키(역할당 1항목 — carry-forward·수명 만료 회수로 유계).
+# 소진(=MAX 도달)은 loud 후 보류하되 **영구 봉쇄는 아니다**: (a)역할 생존 관측 시 리셋
+# (b)FORMATION_ATTEMPT_RESET_S 경과 시 원장 만료 — 유계율(역할당 3회/윈도)로 폭주와
+# 자가치유(편성이 agent 전멸 부서의 유일 복구 경로 — 치명 ③)를 양립시킨다.
+FORMATION_MAX_ATTEMPTS = 3            # boot_supervisor MAX_ATTEMPTS 동형
+FORMATION_RETRY_COOLDOWN_S = 30.0     # boot_supervisor RETRY_COOLDOWN_SECS 동형(선형 백오프)
+FORMATION_ATTEMPT_RESET_S = 21600.0   # 소진 래치 수명(6h) — 만료 후 재시도 재개(영구 봉쇄 방지)
+
+
+def _attempts_carry(prev_obj, live, now=None):
+    """이전 상태파일의 attempts 원장 → 이월본(순수·self-test 핀).
+
+    회수 규칙(유계 보장): ①생존 관측 역할 = 완주 → 항목 리셋(제거) ②수명 만료
+    (now-last_at ≥ FORMATION_ATTEMPT_RESET_S) → 회수 ③파손 항목 → 폐기(원장이 편성을
+    영구 봉쇄하지 않게 — 파손은 재시도 1회 추가로 접힌다·유계 1회·수용)."""
+    now = time.time() if now is None else now
+    out = {}
+    for role, e in (prev_obj.get("attempts") or {}).items():
+        if role in (live or set()):
+            continue
+        try:
+            cnt, last = int(e.get("count", 0)), float(e.get("last_at", 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if cnt <= 0 or now - last >= FORMATION_ATTEMPT_RESET_S:
+            continue
+        out[role] = {"count": cnt, "last_at": last}
+    return out
+
+
+def _attempt_gate(attempts, role, now=None):
+    """역할 스폰 시도 허용 판정(순수·self-test 핀) → (verdict, why).
+    verdict ∈ 'go'(허용) / 'cooldown'(백오프 중 — 이번 틱 skip) / 'exhausted'(소진 — 보류)."""
+    now = time.time() if now is None else now
+    e = attempts.get(role)
+    if not e:
+        return "go", ""
+    cnt, last = e["count"], e["last_at"]
+    if cnt >= FORMATION_MAX_ATTEMPTS:
+        return "exhausted", ("역할 %s 시도 %d/%d 소진 — 보류(리셋: 역할 생존 관측 또는 %.0fs 경과)"
+                             % (role, cnt, FORMATION_MAX_ATTEMPTS, FORMATION_ATTEMPT_RESET_S))
+    wait = FORMATION_RETRY_COOLDOWN_S * max(cnt, 1)   # 선형 백오프(감독자 동형)
+    if now - last < wait:
+        return "cooldown", ("역할 %s 쿨다운(%.0fs 필요·%.0fs 경과) — 이번 틱 skip"
+                            % (role, wait, now - last))
+    return "go", ""
+
+
+def _attempt_record(attempts, role, now=None):
+    """실제 스폰 시도 1회를 원장에 기록(카운트+타임스탬프 — in-place)."""
+    now = time.time() if now is None else now
+    e = attempts.get(role) or {}
+    try:
+        cnt = int(e.get("count", 0))
+    except (TypeError, ValueError):
+        cnt = 0
+    attempts[role] = {"count": cnt + 1, "last_at": now}
 
 
 # ── ⑤⑥ 노드 부착(전부 javis_boot_node 재사용 — 신규 spawn 로직 0) ──
@@ -534,11 +656,15 @@ def _ensure_master_seat(socket, cwd):
 
 
 # ── ⑦ 상태 파일 + feed 표면화(침묵 금지 C6) ──
-def _write_state(socket, state, detail, roles_booted):
+def _write_state(socket, state, detail, roles_booted, attempts=None):
     root = _state_root()
     try:
         os.makedirs(root, exist_ok=True)
-    except OSError:
+    except OSError as e:
+        # ★SF-4(P3 수정 라운드): 원장 영속 실패 무음 금지 — 상태 dir 불가면 싱글플라이트 락
+        #   makedirs 가 먼저 죽어 스폰 폭주는 불가(리뷰어 실측)하나, 침묵 return 은 '측정 불능
+        #   침묵 금지' 위반이라 stderr 1줄 남긴다.
+        sys.stderr.write("[formation] WARN: 상태 dir 생성 실패(%s) — 상태·시도 원장 미영속\n" % e)
         return None
     path = os.path.join(root, _sanitize_key(socket) + ".json")
     obj = {"state": state, "kind": state_kind(state), "socket": socket or "",
@@ -550,13 +676,20 @@ def _write_state(socket, state, detail, roles_booted):
     _ext = sorted(_external_roles())
     if _ext:
         obj["external_roles"] = _ext
+    # ★T9 시도 원장(P3-1) — 비어 있으면 키를 넣지 않는다(위 external_roles 와 같은 규약:
+    # 원장 무사용 레인의 상태파일 바이트 동일 보존).
+    if attempts:
+        obj["attempts"] = attempts
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
             f.write("\n")
         os.replace(tmp, path)
-    except OSError:
+    except OSError as e:
+        # ★SF-4(P3 수정 라운드): 영속 실패가 침묵이면 다음 실행에서 원장 리셋(역할당 최대 3회
+        #   추가 시도)이 무언 발생한다 — loud 1줄로 가시화(폭주 아님·유계는 락이 보장).
+        sys.stderr.write("[formation] WARN: 상태파일 영속 실패(%s) — 시도 원장 리셋 가능성\n" % e)
         return None
     return path
 
@@ -568,15 +701,32 @@ def _feed(title, body, kind="formation"):
          timeout=10)
 
 
+def _install_hint():
+    """claude CLI 설치 안내(순수·플랫폼 분기 — ★INST-4/P4-5). cys.rs install_hint 와 동문 계약:
+    win32 → `irm https://claude.ai/install.ps1 | iex` / 그 외 → curl|bash. 하드코딩 curl|bash
+    단일 문안은 Windows 사용자에게 실행 불능 명령을 안내했다(2차 성찰 실측)."""
+    if os.name == "nt" or sys.platform == "win32":
+        return "PowerShell: `irm https://claude.ai/install.ps1 | iex`"
+    return "`curl -fsSL https://claude.ai/install.sh | bash`"
+
+
 def _feed_for_state(state):
     kind = state_kind(state)
     fk = feed_kind_for_state(state)   # UI 배너 판정용 --kind(complete=소멸·partial=갱신)
     if kind == "pending-cli":
+        # ★INST-4(P4-5): '설치하면 자동으로 편성이 완결됩니다' 약속을 중립 문구로 강등 —
+        #   자동 완결의 정확한 보장 범위(생성 직후 배선 + 주기 심박)는 배선 의미론이 실측으로
+        #   확정된 뒤에만 약속으로 복원한다(거짓 약속 금지 — 2커밋 계약).
         _feed("부서 팀 편성 대기(CLI 미설치)",
               "claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 "
-              "가능). `curl -fsSL https://claude.ai/install.sh | bash` 로 설치하면 자동으로 "
-              "편성이 완결됩니다.", fk)
+              "가능). %s 로 설치한 뒤 앱 재시작 또는 부서 재기동 시 편성이 이어집니다."
+              % _install_hint(), fk)
     elif kind == "partial":
+        # ★SF-1(P3 수정 라운드) 정합 판단 — 이 분기의 '자동 완결' 약속은 유지한다: T9 배선
+        #   (생성 꼬리 ensure + base 스케줄 formation-heartbeat 10분 틱)이 같은 커밋에 실재해,
+        #   partial(일부 노드 이미 기동=데몬 생존) 상태에선 나머지 CLI 설치 후 다음 틱이 ensure
+        #   를 재시도하는 기계 경로가 있다(전제: base 데몬 생존). pending-cli 분기의 중립 강등은
+        #   INST-4 계약 좌표(그 분기 한정)이며 그쪽 약속 복원은 2커밋 계약(위 주석)을 따른다.
         _feed("부서 팀 부분 편성", "설치된 CLI 로 가능한 노드만 기동했습니다(%s). 나머지 CLI "
               "설치 시 자동으로 편성이 완결됩니다." % state, fk)
     elif kind == "pending-resource":
@@ -589,14 +739,20 @@ def _feed_for_state(state):
               "파일에서 원인을 확인하세요." % state, fk)
 
 
-def _read_state(socket):
-    """저장된 이전 상태 문자열(전이 감지용) — 없으면 None. best-effort."""
+def _read_state_obj(socket):
+    """저장된 상태파일 전체 dict(전이 감지 + 시도 원장 carry-forward용) — 없으면 {}. best-effort."""
     path = os.path.join(_state_root(), _sanitize_key(socket) + ".json")
     try:
         with open(path, encoding="utf-8") as f:
-            return (json.load(f) or {}).get("state")
+            obj = json.load(f)
+            return obj if isinstance(obj, dict) else {}
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def _read_state(socket):
+    """저장된 이전 상태 문자열(전이 감지용) — 없으면 None. best-effort."""
+    return _read_state_obj(socket).get("state")
 
 
 def _emit_evt(evt_type, fields):
@@ -638,7 +794,8 @@ def ensure(socket=None, cwd=None, force_surface=False):
     force_surface=True 면 kind 전이가 없어도 현재 상태를 1회 표면화한다(_surface 주석 참조 —
     앱 부트 레인 전용. 주기 잡은 기본값 False 로 스팸 억제 계약을 유지한다). 상태 판정·기록에는
     아무 영향이 없다(INV-1: complete 는 여전히 classify()==complete 일 때만)."""
-    prev = _read_state(socket)   # 전이 감지용(배너 수명 신호는 전이 시에만 표면화)
+    prev_obj = _read_state_obj(socket)   # 전이 감지 + ★T9 시도 원장 carry-forward
+    prev = prev_obj.get("state")         # 배너 수명 신호는 전이 시에만 표면화
     # ① kill-switch — ★fail-closed(2026-08-01 F1): 허용은 exit 0 에서만, 판정 불능도 보류다.
     gate = gate_check()
     if not gate:
@@ -653,7 +810,9 @@ def ensure(socket=None, cwd=None, force_surface=False):
         # ★자기잠금 방지: 무엇에 막혔는지를 상태파일 detail 과 stdout(_cmd_ensure JSON)에 남긴다.
         detail = (getattr(gate, "reason", "")
                   or "kill-switch(paused) — 편성 보류(gate-check 존중)") + _external_note()
-        _write_state(socket, state, detail, live)
+        # 원장은 이월만(보류 경로 = 스폰 0 = 기록 0 — pause 가 래치를 지우면 안 된다)
+        _write_state(socket, state, detail, live,
+                     attempts=_attempts_carry(prev_obj, live))
         return state, detail
 
     # ② 싱글플라이트 락
@@ -673,12 +832,14 @@ def ensure(socket=None, cwd=None, force_surface=False):
         #    formation-complete 를 발행하지 않는다(pending-cli·partial 은 기존 kind 유지 = 기능1
         #    인앱 CLI 설치 온보딩 안내 보존).
         live_now = _live_roles(socket)
+        # ★T9 시도 원장 이월(생존 관측 리셋·수명 만료 회수) — 이하 전 경로가 이 원장을 기록한다.
+        attempts = _attempts_carry(prev_obj, live_now)
         if live_now is not None and classify(installed=installed, live=live_now,
                                              resource_ok=True) == "complete":
             state = "complete"
             detail = ("라이브 로스터 이미 완결(5역할 생존) — 신규 기동 0 · 자원 게이트 무관"
                       + _external_note())
-            _write_state(socket, state, detail, live_now)
+            _write_state(socket, state, detail, live_now, attempts=attempts)
             _surface(socket, prev, state, force=force_surface)
             return state, detail
 
@@ -687,7 +848,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
             live = live_now or set()   # ③′ 관측 재사용(cys list 중복 호출 0)
             state = "pending-resource"
             detail = "곱셈 자원 예산 hard — 편성 대기" + _external_note()
-            _write_state(socket, state, detail, live)
+            _write_state(socket, state, detail, live, attempts=attempts)
             _surface(socket, prev, state, force=force_surface)
             return state, detail
 
@@ -696,12 +857,13 @@ def ensure(socket=None, cwd=None, force_surface=False):
             live = live_now or set()   # ③′ 관측 재사용(cys list 중복 호출 0)
             state = classify(installed=installed, live=live, resource_ok=True)
             detail = "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)" + _external_note()
-            _write_state(socket, state, detail, live)
+            _write_state(socket, state, detail, live, attempts=attempts)
             _surface(socket, prev, state, force=force_surface)
             return state, detail
 
         # ⑤⑥ 설치된 CLI 기준 최대 편성. master 먼저(입양 경로) → CSO → 나머지.
         booted = set()
+        held = []
         # ★외부 역할은 order 에서 뺀다(2026-08-01) — 생성 자체를 하지 않는다. env 미설정이면
         #   effective_required_roles() == REQUIRED_ROLES 라 종전 순서·집합과 완전히 동일하다.
         order = list(effective_required_roles())
@@ -709,6 +871,17 @@ def ensure(socket=None, cwd=None, force_surface=False):
             cli = ROLE_CLI[role]
             if cli not in installed:
                 continue  # 해당 CLI 미설치 = 이 역할 skip(partial)
+            # ★T9 시도 원장 게이트(P3-1) — **비생존 역할의 실스폰 시도**만 유계로 묶는다.
+            #   생존 좌석(입양·already_up 멱등 경로)은 스폰이 아니므로 원장 무카운트·무게이트
+            #   (원장이 입양·복구 경로를 갉아먹지 않게 — 리셋은 _attempts_carry 가 담당).
+            if live_now is None or role not in live_now:
+                verdict, why = _attempt_gate(attempts, role)
+                if verdict != "go":
+                    held.append("%s=%s" % (role, verdict))
+                    if verdict == "exhausted":
+                        sys.stderr.write("[formation] " + why + "\n")   # 소진 = loud 후 보류
+                    continue
+                _attempt_record(attempts, role)
             if role == "master":
                 ok, _d = _ensure_master_seat(socket, cwd)
             else:
@@ -723,7 +896,9 @@ def ensure(socket=None, cwd=None, force_surface=False):
         state = classify(installed=installed, live=live, resource_ok=True)
         detail = "편성 실행 — 기동=%s · 설치CLI=%s" % (
             ",".join(sorted(booted)) or "없음", ",".join(sorted(installed))) + _external_note()
-        _write_state(socket, state, detail, live)
+        if held:
+            detail += " · 시도원장 보류=%s" % ",".join(held)
+        _write_state(socket, state, detail, live, attempts=attempts)
         # ★주기 실행 스팸 차단(2026-07-26): 무조건 _feed_for_state 였던 자리를 _surface(전이 시에만
         # 표면화) 로 교체한다. 편성 ensure 가 스케줄 주기(10분)로 붙으면 매 틱마다 사용자에게 토스트가
         # 갔다. prev 는 ensure 진입부에서 읽은 직전 상태 — 동일 kind 면 _surface 계약대로 생략된다.
@@ -877,6 +1052,87 @@ def self_test():
     ck("판정 불능" in _gate_verdict(3).reason and "3" in _gate_verdict(3).reason,
        "보류 사유(exit 코드 포함)가 detail 로 노출되지 않음 — 자기잠금 진단 불가")
     ck(len(paused_paths()) == 2, "PAUSED kill-switch 파일 2경로 규약(§9-4) 이탈")
+    # ── ★T9 자원 게이트 3분기 재명세(R3-P03-1) — 순수 분기 핀 + end-to-end 재시도 형상 ──
+    ck(_resource_branch(2) == "block", "exit 2 가 block 아님")
+    ck(_resource_branch(64) == "retry" and _resource_branch(70) == "retry",
+       "64/70(스큐·내부오류)이 retry 아님 — 측정불능=통과 회귀")
+    ck(_resource_branch(127) == "exec-fail", "127 이 exec-fail(무재시도 단일 버킷) 아님")
+    ck(_resource_branch(0) == "proceed" and _resource_branch(1) == "proceed"
+       and _resource_branch(3) == "proceed", "0/1/기타가 proceed 아님")
+    g = globals()
+    saved_run, saved_gp = g["_run"], g["_gate_path"]
+    import io as _io
+    import contextlib as _ctx
+    try:
+        g["_gate_path"] = lambda: "/fake/javis_resource_gate.py"
+        # ① rc=2 → False · 재시도 없음(1회 호출)
+        calls = []
+        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, "", ""))
+        with _ctx.redirect_stderr(_io.StringIO()):
+            ck(_resource_ok(None) is False and len(calls) == 1, "rc=2 즉시 차단 회귀")
+        ck(any("--formation-size" in c for c in calls[0][0]), "본 호출에 --formation-size 부재")
+        # ② rc=64 → 무플래그 1회 재시도(timeout 15) rc=0 → True
+        calls = []
+
+        def _r64(argv, timeout=30):
+            calls.append((list(argv), timeout))
+            return (64, "", "") if len(calls) == 1 else (0, "", "")
+        g["_run"] = _r64
+        with _ctx.redirect_stderr(_io.StringIO()):
+            ok64 = _resource_ok(None)
+        ck(ok64 is True and len(calls) == 2, "64 재시도 1회 계약 위반: %d회" % len(calls))
+        ck("--formation-size" not in calls[1][0], "재시도가 무플래그가 아님(스큐 미해소)")
+        ck(calls[1][1] == RESOURCE_RETRY_TIMEOUT_S, "재시도 timeout 15s 계약 위반: %r" % (calls[1][1],))
+        # ③ rc=70 → 재시도 rc=2 → False(재시도 hard 는 차단으로 접힘)
+        calls = []
+
+        def _r70(argv, timeout=30):
+            calls.append((list(argv), timeout))
+            return (70, "", "") if len(calls) == 1 else (2, "", "")
+        g["_run"] = _r70
+        with _ctx.redirect_stderr(_io.StringIO()):
+            ck(_resource_ok(None) is False and len(calls) == 2, "70→재시도 hard 가 False 아님")
+        # ④ rc=127 → 무재시도(1회)·True(loud 진행)
+        calls = []
+        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (127, "", "no such file"))
+        with _ctx.redirect_stderr(_io.StringIO()):
+            ck(_resource_ok(None) is True and len(calls) == 1, "127 무재시도·진행 계약 위반")
+        # ⑤ rc=1(soft) → True·1회
+        calls = []
+        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (1, "", ""))
+        ck(_resource_ok(None) is True and len(calls) == 1, "soft(1) 진행 회귀")
+    finally:
+        g["_run"], g["_gate_path"] = saved_run, saved_gp
+    # ── ★T9 시도 원장 유계(P3-1 — boot_supervisor 동형) — 순수 함수 핀 ──
+    at = {}
+    t0 = 1000.0
+    ck(_attempt_gate(at, "worker", now=t0)[0] == "go", "빈 원장이 go 아님")
+    _attempt_record(at, "worker", now=t0)
+    ck(_attempt_gate(at, "worker", now=t0 + 1)[0] == "cooldown",
+       "쿨다운(30s) 내 재시도를 차단하지 않음")
+    ck(_attempt_gate(at, "worker", now=t0 + 31)[0] == "go", "쿨다운 경과 후 go 아님")
+    _attempt_record(at, "worker", now=t0 + 31)   # 2회
+    ck(_attempt_gate(at, "worker", now=t0 + 32)[0] == "cooldown", "선형 백오프(2회=60s) 미적용")
+    _attempt_record(at, "worker", now=t0 + 100)  # 3회 = MAX
+    ck(_attempt_gate(at, "worker", now=t0 + 500)[0] == "exhausted",
+       "MAX(3) 소진이 exhausted 아님 — 폭주 유계 붕괴")
+    ck(_attempt_gate(at, "cso", now=t0)[0] == "go", "타 역할 원장 오염(역할별 독립 위반)")
+    # carry: 생존 관측 리셋 · 수명 만료 회수 · 파손 폐기
+    prev = {"attempts": {"worker": {"count": 3, "last_at": t0},
+                         "cso": {"count": 2, "last_at": t0},
+                         "reviewer-codex": {"count": "bogus"}}}
+    carried = _attempts_carry(prev, live={"cso"}, now=t0 + 10)
+    ck("cso" not in carried, "생존 관측 역할이 원장 리셋되지 않음")
+    ck(carried.get("worker", {}).get("count") == 3, "비생존 역할 원장 이월 실패(래치 소실)")
+    ck("reviewer-codex" not in carried, "파손 항목이 원장을 오염")
+    carried2 = _attempts_carry(prev, live=set(), now=t0 + FORMATION_ATTEMPT_RESET_S + 1)
+    ck(carried2 == {}, "수명 만료 회수 실패 — 소진 래치가 영구 봉쇄로 퇴화")
+    # ── ★INST-4(P4-5) 설치 안내 플랫폼 분기 핀 ──
+    hint = _install_hint()
+    if os.name == "nt":
+        ck("claude.ai/install.ps1" in hint and "irm" in hint, "Windows 설치 안내가 irm|iex 아님")
+    else:
+        ck("claude.ai/install.sh" in hint and "curl" in hint, "unix 설치 안내가 curl|bash 아님")
     # 두 경로 동등성(plan_roster)
     b, mn = plan_roster("button"), plan_roster("manual")
     ck(b.ensure_fn is mn.ensure_fn, "두 경로 ensure 수렴 실패")
@@ -886,7 +1142,8 @@ def self_test():
         print("javis_formation self-test FAIL: %s" % fails, file=sys.stderr)
         return 1
     print("javis_formation self-test OK (classify 5상태·락 키 유일성·plan_roster 동등성"
-          "·external-roles 제외·gate fail-closed)")
+          "·external-roles 제외·gate fail-closed·T9 자원게이트 3분기+시도원장 유계"
+          "·INST-4 설치안내 분기)")
     return 0
 
 

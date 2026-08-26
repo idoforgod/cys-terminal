@@ -216,9 +216,15 @@ def ensure_order_gate(m):
         check("9b3 CLI 전무 → pending-cli 유지", m.state_kind(state) == "pending-cli",
               "state=%r" % (state,))
         pend = [f for f in feeds if f[0] == "formation-pending"]
-        check("9b4 pending-cli 경로 complete 무발행 + 설치 안내 보존(기능1)",
+        # ★INST-4(P4-5·T9 원자 갱신): 설치 안내는 플랫폼 분기(win32=irm|iex · 그 외=curl|bash —
+        #   cys.rs install_hint 동문)이고, '설치하면 자동으로 편성이 완결됩니다' 거짓 약속은
+        #   중립 문구('설치 후 앱 재시작 또는 부서 재기동')로 강등돼 있어야 한다.
+        want_url = "claude.ai/install.ps1" if os.name == "nt" else "claude.ai/install.sh"
+        check("9b4 pending-cli 경로 complete 무발행 + 설치 안내 보존(기능1·플랫폼 분기)",
               not [f for f in feeds if f[0] == "formation-complete"]
-              and pend and "claude.ai/install.sh" in pend[0][2], "feeds=%r" % (feeds,))
+              and pend and want_url in pend[0][2]
+              and "자동으로 편성이 완결" not in pend[0][2]
+              and "재시작 또는 부서 재기동" in pend[0][2], "feeds=%r" % (feeds,))
 
         # (b3) 로스터 complete 인데 CLI 부분 설치 → complete 로 승격 금지(부분 설치 오판 차단).
         feeds = _ensure_harness(m, live=REQUIRED, installed={"claude"}, resource_ok=False)
@@ -302,6 +308,38 @@ def ensure_order_gate(m):
             m.ensure = saved_ensure
         check("12g CLI --force-surface → ensure(force_surface=True) 배선(미지정=False)",
               seen == [True, False], "seen=%r" % (seen,))
+
+        # ── 13. ★T9(P3-1) 시도 원장 유계 — ensure 레벨 실측(harness 밀폐·라이브 무접촉) ──
+        #   폭주 앵커 ①: 비생존 역할의 실스폰 시도는 역할당 MAX(3)·쿨다운으로 유계여야 한다.
+        #   (a) 쿨다운 0 강제 + 부트 실패 스텁 → 10회 ensure 에도 역할당 시도 정확히 3회(소진 보류).
+        boots = []
+        feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
+        m._boot_node = lambda role, socket, cwd=None, timeout=200: (
+            boots.append(role) or (False, "stub-fail"))
+        saved_cd = m.FORMATION_RETRY_COOLDOWN_S
+        m.FORMATION_RETRY_COOLDOWN_S = 0.0
+        try:
+            for _ in range(10):
+                m.ensure(socket="/tmp/led-a.sock")
+        finally:
+            m.FORMATION_RETRY_COOLDOWN_S = saved_cd
+        check("13a 시도 원장 유계 — 비생존 역할 스폰 시도 = MAX(3)·소진 후 보류",
+              boots.count("worker") == 3 and boots.count("reviewer-gemini") == 3
+              and boots.count("reviewer-codex") == 3,
+              "boots=%r" % {r: boots.count(r) for r in set(boots)})
+        check("13b 생존 좌석(cso)은 원장 무카운트 — 입양·멱등 경로 보존(매 ensure 호출)",
+              boots.count("cso") == 10, "cso=%d" % boots.count("cso"))
+        #   (c) 기본 쿨다운(30s)에서는 연속 10회 ensure 가 역할당 시도 1회로 접힌다(백오프).
+        boots2 = []
+        feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
+        m._boot_node = lambda role, socket, cwd=None, timeout=200: (
+            boots2.append(role) or (False, "stub-fail"))
+        for _ in range(10):
+            m.ensure(socket="/tmp/led-b.sock")
+        check("13c 쿨다운(30s) — 연속 10회 ensure 에 역할당 시도 1회(백오프 유계)",
+              boots2.count("worker") == 1 and boots2.count("reviewer-codex") == 1,
+              "boots=%r" % {r: boots2.count(r) for r in set(boots2)})
+        _ = feeds
     finally:
         for k, v in saved.items():
             setattr(m, k, v)
