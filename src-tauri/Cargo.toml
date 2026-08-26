@@ -1,6 +1,6 @@
 [package]
 name = "cys-app"
-version = "0.14.26"
+version = "0.14.27"
 edition = "2021"
 description = "cys UI shell (Tauri 2) — thin client over the cysd socket"
 license = "MIT"
