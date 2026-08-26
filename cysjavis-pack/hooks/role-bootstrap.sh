@@ -814,8 +814,8 @@ esac
 #   session_error 행(retry_eligible)의 발동 근거다. 차단하면 P0-3 이 무근거가 된다).
 case "$CLAIM_RC" in
   0|7) FORECAST_SENT="" ;;
-  6) FORECAST_SENT="**이 런의 팀 기동은 결정론적으로 실패한다**(선행 claim rc 6): 이 런은 ③ 역할 등록 소비에서 세션 컨텍스트 오류(exit 10)로 종료가 결정돼 있다 — 팀은 이 런으로 뜨지 않는다. preflight 수리·boot-last 기록은 진행된다. 완주 후 이 레인 boot-last 의 result.retry_eligible 값에 따라 MASTER_DIRECTIVE §0-A 의 session_error 행이 1회 재실행을 안내한다(true=그 행대로 1회 / false=재실행 금지·세션 배선을 오너에 보고)." ;;
-  *) FORECAST_SENT="이 런의 팀 기동은 진행되지 않을 가능성이 높다(선행 claim rc $CLAIM_RC — 데몬 미도달·식별 불가·타임아웃 등): 부트 ③ 이 이 판정을 소비하면 세션 컨텍스트 오류(exit 10)로 종료된다. preflight 수리·boot-last 기록은 진행된다. 완주 후 이 레인 boot-last 의 결과(state·retry_eligible)가 사실이다 — session_error 면 §0-A 의 session_error 행을 따르라." ;;
+  6) FORECAST_SENT="**이 런의 팀 기동은 결정론적으로 실패한다**(선행 claim rc 6): 이 런은 ③ 역할 등록 소비에서 세션 컨텍스트 오류(exit 10)로 종료가 결정돼 있다 — 팀은 이 런으로 뜨지 않는다. preflight 수리·boot-last 기록은 진행된다. 완주 후 이 레인 boot-last 의 result.retry_eligible 값이 재실행 권한의 유일 근거다: **true 면 부트 스크립트를 포그라운드로 1회 그대로 재실행**(부분 단계 재현 금지·최종 JSON 만 인용)하고, **false 면 재실행 금지**(세션 배선을 오너에 보고하고 정지). 이 상한 1회는 이 note 자체의 계약이며 설치된 MASTER_DIRECTIVE §0-A 표에 session_error 행이 아직 없어도(user 소유 파일이라 팩 갱신이 덮지 않는다 — 신본은 MASTER_DIRECTIVE.md.new 병치 + cys pack-merge 로 도달) '재실행 금지' 행보다 우선한다. 디렉티브가 최신이면 §0-A 의 session_error 행이 같은 규칙의 정본이다. retry_eligible_unknown·persist_failed·log_write_failures 가 있거나 판독이 다른 run_id/surface 를 가리키면 **측정 불능 — 재실행 금지**(오너 보고 후 정지)." ;;
+  *) FORECAST_SENT="이 런의 팀 기동은 진행되지 않을 가능성이 높다(선행 claim rc $CLAIM_RC — 데몬 미도달·식별 불가·타임아웃 등): 부트 ③ 이 이 판정을 소비하면 세션 컨텍스트 오류(exit 10)로 종료된다. preflight 수리·boot-last 기록은 진행된다. 완주 후 이 레인 boot-last 의 결과(state·retry_eligible)가 사실이다 — session_error 면 **true=1회 그대로 재실행 / false=재실행 금지**(오너 보고 후 정지)이고, 이 상한 1회는 이 note 자체의 계약이다(설치된 §0-A 표에 그 행이 없어도 동일 · 최신 디렉티브에서는 §0-A 의 session_error 행이 정본). 측정 불능 신호(retry_eligible_unknown·persist_failed·log_write_failures·다른 run_id/surface)면 재실행 금지." ;;
 esac
 
 # ── ★D4-a′(2026-08-10 오너 재정): 선언 = 팀 기동 명령 — 임무 유무와 무관하게 부트를 발화한다 ──

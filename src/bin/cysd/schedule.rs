@@ -198,6 +198,14 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
         // 는 kill_on_drop 미설정이라 타임아웃해도 자식은 완주(작업·원장 정상 — 폭주 아님)하고
         // 그 틱에 'command timed out' 오보 1줄만 남는다. 부서당 timeout 래핑은 플랫폼별
         // timeout(1) 가용성이 갈려 보류(coreutils 비보장 — macOS 기본엔 없음).
+        // ★한계(R3-WINTICK-5 · 2026-08-26): 이 페이로드는 POSIX 셸 문법(`${VAR:-}`·`$( )`·
+        //   `for … do … done`)이라 Windows 에서 `command_shell()` 이 **cmd /C 로 폴백하면
+        //   매 틱 실패**한다. 그 폴백 조건은 동봉 `runtime\git\...\bash.exe` 결손 — 즉 P4-2
+        //   advisory 가 진단하는 상태와 **같은 근본원인**이고, 파일 하나가 ⓐ훅 전면 무발화
+        //   (U-20) ⓑ이 편성 심박(agent 전멸 부서의 유일 자동 복구) ⓒ아래 승격 집행 틱을
+        //   동시에 끊는다. 사용자 가시화는 그 advisory 본문이 담당한다(lib.rs
+        //   `windows_runtime_damage_notice` — 회귀 핀 `windows_runtime_damage_notice_contract`
+        //   가 파급 고지 문언을 단언). 여기 관측은 schedule.warning/error 버스 이벤트뿐이다.
         json!({
             "id": "formation-heartbeat",
             "every_minutes": 10,

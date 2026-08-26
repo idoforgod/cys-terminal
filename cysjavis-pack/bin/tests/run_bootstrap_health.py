@@ -6746,6 +6746,63 @@ def h_doc_10():
     return " · ".join(notes)
 
 
+@specimen("H-DOC-11", "W6",
+          "P0-3 재실행 계약의 **배달** — 훅 브리지 자기완결(user-owned 디렉티브 미도달 방어)",
+          ["R3-DELIVERY-1", "P0-3", "①폭주"])
+def h_doc_11():
+    """R3-DELIVERY-1(2026-08-26 적대검증): P0-3 기계 래치(`result.retry_eligible`)는 도달하는데
+    그 값을 소비할 **권한 행**(§0-A session_error 행)은 도달하지 않는 비대칭이 있었다.
+
+    비대칭의 기제는 소유권 등급이다 — `directives/*_DIRECTIVE.md` 는 `src/pack.rs ownership()`
+    상 `Ownership::User` 라 팩 업데이트가 본문을 절대 덮지 않고(신본은 `<rel>.new` 병치 +
+    `cys pack-merge` 대기), 훅은 `System` 이라 강제 치유로 전원에게 도달한다. 그래서 훅이
+    "§0-A 의 session_error 행이 재실행 금지 행보다 우선한다"고 **가리키기만** 하면, 기존 설치본
+    에는 훅만 도착하고 그 행은 없어 '재실행 금지 vs 1회 재실행'의 **이중 진실**이 배포된다 —
+    모델은 그 틈을 재량으로 판결하고, 그것이 정확히 기계 래치가 없애려던 LLM 재량 재시도다.
+
+    수리 계약: 두 훅(session-start.sh 브리지 · role-bootstrap.sh rc6/기타 FORECAST)이 상한
+    1회·측정불능 금지를 **자기 문장으로** 서술한다(§0-A 는 정본 참조로만 남는다). 이 검체가
+    그 자기완결성을 박제한다 — 포인터로 되돌아가면 배달 결손이 다시 침묵한다."""
+    ss = _code_lines(_read(_hook("session-start.sh")))
+    rb = _code_lines(_read(_hook("role-bootstrap.sh")))
+    notes = []
+    # ① 두 훅 모두 '1회'와 '재실행 금지' 양 분기를 자기 문장으로 갖는다(포인터만이면 실패).
+    for rel, body in (("session-start.sh", ss), ("role-bootstrap.sh", rb)):
+        need("retry_eligible" in body,
+             "%s 가 래치 필드명을 인용하지 않는다 — 소비 근거가 문안 재량으로 되돌아갔다" % rel)
+        need("1회" in body and "재실행 금지" in body,
+             "%s 브리지에 상한 1회/재실행 금지 두 분기가 자기 문장으로 없다" % rel)
+        need("pack-merge" in body or "MASTER_DIRECTIVE.md.new" in body,
+             "%s 가 '디렉티브는 user 소유라 팩 갱신이 도달하지 않는다'는 배달 사실을 고지하지 "
+             "않는다 — 결손 기계의 독자가 왜 표에 그 행이 없는지 알 수 없다" % rel)
+        need("측정 불능" in body or "retry_eligible_unknown" in body,
+             "%s 브리지가 측정 불능 금지 분기를 싣지 않는다(측정 불능은 통과가 아니다)" % rel)
+    notes.append("훅 2벌 자기완결(상한·측정불능·배달 고지)")
+    # ② 디렉티브 정본은 여전히 같은 규칙을 말한다(자기완결화가 정본을 지우면 안 된다).
+    md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
+    need("retry_eligible" in md and "session_error" in md,
+         "§0-A 정본에서 session_error 행이 사라졌다 — 자기완결화는 정본 제거가 아니다")
+    notes.append("§0-A 정본 병존")
+    # ③ 결손이 **관측**되는가 — preflight 에 배달 축이 있고, 부트를 볼모로 잡지 않는다(WARN).
+    pf = _read(os.path.join(BIN_DIR, "javis_preflight.py"))
+    need("C03.boot-contract" in pf, "preflight 에 배달 축(C03.boot-contract)이 없다 — 결손 무관측")
+    seg = pf[pf.index("def _c03_boot_contract("):]
+    seg = seg[:seg.index("\n    # ── C04")]
+    need("self.add(cid, FAIL" not in seg,
+         "배달 축이 FAIL 을 낸다 — 병합 전 전 함대가 상시 NOT READY(관측 목적이 부트 준비 "
+         "판정을 볼모로 잡는다). 이 축은 WARN 고정이 계약이다")
+    need(seg.count("self.add(cid, WARN") >= 2 and "self.add(cid, PASS" in seg,
+         "배달 축의 등급 배선(WARN 갈래·PASS 갈래)이 성립하지 않는다")
+    need("pack-merge" in seg, "배달 축이 해소 명령을 싣지 않는다(관측만 하고 처방 없음)")
+    notes.append("preflight 배달 축 WARN 고정")
+    # ④ 탐지력 시험(합성 표본) — 포인터 전용으로 되돌린 본문에서 침묵하면 핀이 무의미하다.
+    synthetic = ss.replace("retry_eligible", "REMOVED")
+    need("retry_eligible" not in synthetic,
+         "계측 타당성 실패: 합성 표본에서 래치 필드명이 지워지지 않았다(탐지기 무효)")
+    notes.append("합성 표본 판별")
+    return " · ".join(notes)
+
+
 @specimen("H-DOC-7", "W4", "agents 스키마 완결성(preflight C71 — 결손 의미 고지·vendor/user 계층)",
           ["B20"])
 def h_doc_7():
@@ -6825,6 +6882,17 @@ def h_doc_8():
     need('"install_hint"' in fseg, "install_hint 를 표출하지 않는다(플랫폼 사본 부활 위험)")
     need("EXIT_BOOT_BUSY" in gui, "busy exit 를 별도 분기하지 않는다(중첩 부트 위경보)")
     need("enum BootSignal" in gui, "신호 등급 타입 부재 — 조용한 실패를 타입으로 막지 못한다")
+    # ④′ ★R3-GUI-4 범위 정직 등재: GUI 경로는 P1(좌석 토큰)·P2(boot-intent 프런트도어) 어느
+    #    쪽도 받지 못한 채 남았고(Tauri 프로세스 자식 = pane env 미상속 · 프런트도어 미경유),
+    #    2차 성찰의 '위탁' 교차참조는 **미구현·미이월**이었다. 미해소 교차참조를 그대로 두면
+    #    다음 독자가 '이미 위탁됐다'고 오독한다 — 함수 doc 의 정직 등재를 핀으로 못박는다.
+    #    (수리가 아니라 등재다: 이 핀이 초록이어도 GUI 경로의 rc 6 클래스는 열려 있다.)
+    need("R3-GUI-4" in gui,
+         "spawn_orchestra_boot doc 에 범위 정직 등재(R3-GUI-4)가 없다 — GUI 경로가 P1·P2 "
+         "미적용인 사실이 코드에서 사라지면 '위탁 완료' 오독이 재발한다")
+    need("CYS_SEAT_TOKEN" in gui and "caller_unresolved" in gui,
+         "정직 등재가 미적용의 **기제**(토큰 미상속·프런트도어 좌석 도출 실패)를 명시하지 "
+         "않는다 — 결론만 있고 근거가 없으면 다음 수정자가 검증 없이 지운다")
     # ⑤ 진입점 전수: 훅·산문도 같은 체인을 가리킨다(산문이 개별 명령 재현을 지시하지 않는다)
     hook = _read(_hook("role-bootstrap.sh"))
     need("javis_bootstrap.py" in hook, "훅이 체인을 발화하지 않는다")

@@ -378,5 +378,82 @@ class FingerprintAndContracts(Base):
                          "dept 면제인데 지문 원장이 기록됨")
 
 
+class BootContractDelivery(Base):
+    """[배달 축] C03.boot-contract — §0-A session_error 행(P0-3 래치 소비면)의 **도달** 관측.
+
+    R3-DELIVERY-1: `directives/*_DIRECTIVE.md` 는 `pack.rs ownership()` 상 User 라 팩 갱신이
+    본문을 덮지 않는다(신본은 `<rel>.new` 병치 + `cys pack-merge`). 그래서 §0-A 개정은 기존
+    설치본에 자동 도달하지 않는데 그 행을 소비하도록 안내하는 훅은 System 등급이라 전원에게
+    도달한다 — 결손이 관측되지 않으면 '재실행 금지 vs 1회 재실행'의 이중 진실이 조용히 남는다.
+    이 축은 **WARN 고정**이다(병합 대기 ≠ 파손 · 기계 거동은 자기완결 훅 브리지가 유지) —
+    FAIL 로 승격하면 병합 전 전 함대가 상시 NOT READY 가 된다."""
+
+    ROW = "state:session_error 이고 result.retry_eligible:true\n"
+
+    def test_present_passes(self):
+        self.wf("MASTER_DIRECTIVE.md", master_body() + self.ROW)
+        self.wf("CEO_TEMPLATE.md", tmpl_body())
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r["status"], PASS)
+        self.assertIn("session_error", r["detail"])
+
+    def test_absent_warns_with_merge_command(self):
+        """결손(구 디렉티브) → WARN + 해소 명령. 부트를 막지 않는 등급이어야 한다."""
+        self.wf("MASTER_DIRECTIVE.md", master_body())      # 캠페인 이전 §0-A(행 부재)
+        self.wf("CEO_TEMPLATE.md", tmpl_body())
+        self.wf("MASTER_DIRECTIVE.md.new", master_body() + self.ROW)   # vendor 신본 병치
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r["status"], WARN, "배달 축이 WARN 이 아니다: %r" % r)
+        self.assertIn("retry_eligible", r["detail"])
+        self.assertIn("pack-merge", r["detail"])
+        self.assertIn("MASTER_DIRECTIVE.md.new", r["detail"])
+        # 핀 축은 이 결손에 **무영향**(독립 축 — 배달 결손이 부트 준비 판정을 볼모로 잡지 않는다)
+        self.assertEqual(self.row(self.run_c03(), "C03.pin.master")["status"], PASS)
+
+    def test_absent_without_new_still_warns(self):
+        """병치본조차 없는 기계(구설치본) — 처방은 init-pack→pack-merge 로 갈린다."""
+        self.wf("MASTER_DIRECTIVE.md", master_body())
+        self.wf("CEO_TEMPLATE.md", tmpl_body())
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r["status"], WARN)
+        self.assertIn("init-pack", r["detail"])
+
+    def test_promoted_machine_gets_promotion_path(self):
+        """승격 기계(md=CEO 템플릿 사본)의 결손은 `--take-new` 가 아니라 재승격 경로다
+        (A12 가드 동형 — 승격 중 MASTER 에 take-new 를 처방하면 CEO 문면이 파괴된다)."""
+        tmpl = tmpl_body()
+        self.wf("MASTER_DIRECTIVE.md", tmpl)      # 바이트 등가 = 승격 표지
+        self.wf("CEO_TEMPLATE.md", tmpl)
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body())
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r["status"], WARN)
+        self.assertIn("promote-ceo", r["detail"])
+        self.assertNotIn("take-new", r["detail"])
+
+    def test_unreadable_is_not_a_pass(self):
+        """판독 불가 = 판정 불가(WARN) — 측정 불능을 초록으로 접지 않는다."""
+        p = self.wf("MASTER_DIRECTIVE.md", master_body())
+        with open(p, "wb") as f:
+            f.write(b"\xff\xfe\x00")              # 비UTF-8 — errors='replace' 로도 행은 부재
+        self.wf("CEO_TEMPLATE.md", tmpl_body())
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertNotEqual(r["status"], PASS)
+
+    def test_dept_pack_exempt(self):
+        """dept/CEO 팩은 커스텀 디렉티브가 정상 — 배달 축도 발화하지 않는다(면제 선행)."""
+        other = os.path.join(self.td, "pack-dept-y")
+        os.makedirs(os.path.join(other, "directives"), exist_ok=True)
+        os.environ["CYS_PACK_DIR"] = other
+        self.no_row(self.run_c03(), "C03.boot-contract")
+
+    def test_skip_is_honored(self):
+        """--skip 은 판정을 건너뛰되 **SKIP 행으로 가시화**한다(조용한 미측정 금지 — 다른
+        축과 동일 관용)."""
+        self.wf("MASTER_DIRECTIVE.md", master_body())
+        self.wf("CEO_TEMPLATE.md", tmpl_body())
+        r = self.row(self.run_c03(skips=["C03.boot-contract"]), "C03.boot-contract")
+        self.assertEqual(r["status"], SKIP)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

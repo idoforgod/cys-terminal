@@ -592,6 +592,40 @@ check("5fb-v5 동일 surface 연속 2회째 session_error retry_eligible=false(c
                  ensure_ascii=False)[:300])
 shutil.rmtree(tmp)
 
+# ── 5-fb-v′. ★R3-ATTR-3 귀속 정규화 핀: `CYS_SURFACE_ID` 의 형식은 진입점마다 다르다 —
+#    데몬 pane 주입·감독자는 `"7"`, GUI '마스터 시작'(spawn_orchestra_boot)은 회수한 참조
+#    `"surface:7"` 을 그대로 싣는다. 래치 키·`result.surface` 귀속 필드가 원문이면 ⓐ같은 물리
+#    좌석이 두 슬롯으로 갈려 §0-A 합산 상한(≈5)이 그 좌석에서 6이 되고 ⓑ '자기 surface' 대조가
+#    GUI 기동 런에 대해 실패해 자가치유가 GUI 인구에게만 조용히 꺼진다. 두 표기가 **같은 슬롯·
+#    같은 귀속 필드**를 산출함을 못박는다(정규화 = 숫자부 · my_surface_key 단일 소유). ──
+tmp = tempfile.mkdtemp(prefix="boot-t5fbv2-")
+env, home = make_env(tmp)
+bind_claim(env, 6)                        # 정수 표기 런: 자기 surface(7) rc6 → session_error
+code, out, err = run(env)
+bl = _bl(home)
+check("5fb-v′1 정수 표기 런 최초 session_error(count=1·true)",
+      code == 10 and bl.get("retry", {}).get("7", {}).get("count") == 1
+      and bl.get("result", {}).get("surface") == "7",
+      json.dumps({"result": bl.get("result", {}), "retry": bl.get("retry")},
+                 ensure_ascii=False)[:300])
+# 같은 좌석을 GUI 표기(`surface:7`)로 재기동 — 정규화가 없으면 새 슬롯("surface:7")이 생겨
+# count=1(=재무장)이 되고 귀속 필드도 "surface:7" 로 갈린다.
+env_gui = dict(env)
+env_gui["CYS_SURFACE_ID"] = "surface:7"
+bind_claim(env_gui, 6)                    # CYS_CLAIM_SID 도 같은 표기로 실린다(GUI 형상 동형)
+code2, _, err2 = run(env_gui)
+bl = _bl(home)
+check("5fb-v′2 GUI 표기(surface:7)도 같은 래치 슬롯 — 소진 승계(count=2·false)",
+      code2 == 10 and bl.get("retry", {}).get("7", {}).get("count") == 2
+      and "surface:7" not in json.dumps(bl.get("retry"), ensure_ascii=False)
+      and bl.get("result", {}).get("retry_eligible") is False,
+      json.dumps({"result": bl.get("result", {}), "retry": bl.get("retry")},
+                 ensure_ascii=False)[:300])
+check("5fb-v′3 귀속 필드도 정규화 — 자기 surface 대조가 표기 차이로 깨지지 않는다",
+      bl.get("result", {}).get("surface") == "7",
+      json.dumps(bl.get("result", {}), ensure_ascii=False)[:200])
+shutil.rmtree(tmp)
+
 # ── 5-fb-w. ★P0-3 래치 TTL(24h) 회수 핀: at 이 24h 지난 항목은 새 런의 carry-forward 에서
 #    회수된다(surface 는 단명이라 맵의 무한 증식 차단 — 항목 유계 2종의 하나). 회수 뒤의
 #    session_error 는 다시 '최초 실패'(count=1·true)로 판정된다. ──

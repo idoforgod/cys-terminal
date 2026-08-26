@@ -45,7 +45,8 @@
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_bootstrap.py" lane-path boot_last` 로 물어라
   (`lane-path all`은 마커·락·skip 경로까지 낸다 · `status`는 이 레인 마커+base 마커를 함께 덤프한다).
 - **boot-last 판독 규약**: 그 파일은 **같은 레인의** 여러 pane이 공유한다. 읽을 것은 `result` 중 **자기 surface**
-  (`surface` 필드 = 이 pane의 `CYS_SURFACE_ID`)의 **완주 런**(`state`가 `completed`·`solo_awakening`·
+  (`surface` 필드 = 이 pane `CYS_SURFACE_ID`의 **숫자부** — 진입점마다 표기가 `12`/`surface:12`로
+  갈리므로 기록·래치 키는 정규화된 숫자부다. 대조도 숫자부끼리 하라)의 **완주 런**(`state`가 `completed`·`solo_awakening`·
   `failed`·`declined`·`session_error` 중 하나 — `running`은 진행 중, `skipped_inflight`는 다른 런 소유)이다.
   **남의 pane이 남긴** `state:declined`(exit 7 정당거부)·`session_error`(exit 10)는 `ok:null`이라
   **재실행 근거가 아니다**(이 금지는 **남의 pane 기록에 한정**된다). **자기 surface**의 `session_error`는

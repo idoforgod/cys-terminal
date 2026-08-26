@@ -1335,6 +1335,8 @@ class Preflight:
         elif grow is not None:
             # master 축이 --skip 됐어도 건전성 축은 독립 발화(지문 dedupe 없이 전문).
             self.add(gcid, grow[0], grow[1])
+        # [배달 축] C03.boot-contract — 아래 참조. 핀/건전성 축과 독립(둘의 skip 여부 무관).
+        self._c03_boot_contract(st)
         # [핀 축 — 그 외 역할 + CEO 템플릿] (master 는 위 승격 축 판정이 대체)
         for f, pins in CONTENT_PINS.items():
             if f == "MASTER_DIRECTIVE.md":
@@ -1354,6 +1356,53 @@ class Preflight:
                          % (f, "; ".join(lost), cause or _C03_RESTORE_GUIDE))
             else:
                 self.add(cid, PASS, "%s 핀 %d개 전부 존재" % (f, len(pins)))
+
+    def _c03_boot_contract(self, st):
+        """[배달 축] C03.boot-contract — P0-3 기계 래치(`result.retry_eligible`)의 **소비 권한
+        행**(§0-A session_error 행)이 *살아있는* MASTER_DIRECTIVE 에 실재하는가.
+
+        ★왜 별도 축인가(R3-DELIVERY-1 · 2026-08-26 적대검증): `directives/*_DIRECTIVE.md` 는
+          pack.rs `ownership()` 상 **Ownership::User** 라, 팩 업데이트는 디스크≠임베드이면
+          매니페스트 해시가 일치해도·`--force` 여도 본문을 덮지 않는다(`decide_file_action` 의
+          User 분기 = `Keep{new_pending}`) — 신본은 `<rel>.new` 병치 + `cys pack-merge` 로만
+          도달한다. 반대로 그 행을 소비하도록 안내하는 훅(role-bootstrap.sh·session-start.sh)은
+          **System 등급이라 강제 치유로 전원에게 도달**한다. 결손이 관측되지 않으면 배포되는
+          것은 침묵이 아니라 '재실행 금지 vs 1회 재실행'의 이중 진실이다.
+        ★WARN 고정(FAIL 금지): 이 행의 부재는 '지금 파손'이 아니라 '병합 대기'다 — 같은 규칙을
+          훅 브리지가 **자기완결**로 싣고 전원에게 도달하므로(두 훅의 R3-DELIVERY-1 문단) 기계
+          거동은 성립한다. CONTENT_PINS 에 편입해 FAIL 로 만들면 병합 전 전 함대가 상시
+          NOT READY 가 되어 관측 목적이 부트 준비 판정을 볼모로 잡는다(demote-guard 의 WARN
+          유지 근거와 동형). 대신 해소 명령을 detail 에 결정론으로 싣는다.
+        """
+        cid = "C03.boot-contract"
+        if self.skipped(cid):
+            return
+        text = st.get("md_text")
+        if text is None:
+            self.add(cid, WARN, "MASTER_DIRECTIVE.md 판독 불가 — 배달 판정 불가"
+                                "(C02·C03.pin 먼저 해결)")
+            return
+        # 소비면의 최소 술어 2개: 래치 필드명 + 그 행이 다루는 상태명.
+        lost = [k for k in ("retry_eligible", "session_error") if k not in text]
+        if not lost:
+            self.add(cid, PASS,
+                     "§0-A session_error 행(P0-3 래치 소비면) 실재 — 훅 브리지와 동일 규칙")
+            return
+        new_p = st.get("new_p")
+        if new_p and os.path.isfile(new_p):
+            fix = ("해소: `cys pack-merge --file directives/MASTER_DIRECTIVE.md`"
+                   "(무수정본이면 `--take-new`) — vendor 신본이 이미 %s 로 병치돼 있다"
+                   % os.path.basename(new_p))
+        elif st.get("marker"):
+            fix = ("해소(승격 기계): CEO_TEMPLATE 재합성/팩 갱신 후 `cys-dept promote-ceo` 재실행 "
+                   "— 승격 md 는 CEO 템플릿 사본이라 표준 전문이 그 경유로만 갱신된다")
+        else:
+            fix = "해소: `cys init-pack` 으로 vendor 신본(.new) 병치 재생성 후 `cys pack-merge`"
+        self.add(cid, WARN,
+                 "살아있는 MASTER_DIRECTIVE 에 §0-A session_error 행이 없다(부재 술어: %s) — "
+                 "user-owned 헌법 파일이라 팩 갱신이 도달하지 않은 상태다. 기계 거동은 훅 브리지"
+                 "(자기완결 문단)가 유지하므로 부트는 정상이나, 디렉티브와 주입문이 서로 다른 "
+                 "지시를 하는 이중 진실이 남는다. %s" % (", ".join(lost), fix))
 
     # ── C04 soul.md 호칭 규정 ──
     def c04_soul(self):

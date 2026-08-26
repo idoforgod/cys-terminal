@@ -221,7 +221,19 @@ if [ "$CYS_ROLE" = "master" ] && [ -f "$BOOT_PY" ]; then
   echo "   / 그 외 비0=단계·원인 그대로 보고 / 완료 선언은 최종 JSON 인용 시에만)"
   # ★P0-3 session_error 분기(§0-A session_error 행의 브리지면): 재실행 1회의 근거는 문안이 아니라
   #   boot-last 의 도구 파생값(retry_eligible)이다 — LLM 재량 재시도 금지·기계 래치가 상한을 집행.
-  echo "  (자기 surface 완주 런이 session_error(exit 10)면 boot-last의 result.retry_eligible이 사실이다 — true=위 명령 1회 재실행(§0-A session_error 행이 재실행 금지 행보다 우선) / false=재실행 금지·세션 배선을 오너에 보고)"
+  # ★R3-DELIVERY-1(2026-08-26 적대검증) — 이 문단은 **자기완결**이어야 한다(포인터 금지).
+  #   근거: §0-A 를 담은 `directives/MASTER_DIRECTIVE.md` 는 pack.rs `ownership()` 상
+  #   Ownership::User 라, 이번 캠페인이 추가한 session_error 행은 **기존 설치본에 자동 도달하지
+  #   않는다**(디스크≠임베드이면 매니페스트 해시가 일치해도·force 여도 `Keep{new_pending}` —
+  #   신본은 `<rel>.new` 병치 + `cys pack-merge` 대기로만 온다). 반면 이 훅은 System 등급이라
+  #   강제 치유로 **전원에게 도달**한다. 따라서 종전처럼 "§0-A 의 session_error 행이 우선한다"고
+  #   **가리키기만** 하면, 훅은 도달하고 그 행은 없는 기계에서 '재실행 금지 vs 1회 재실행'의
+  #   이중 진실이 배포되고 모델은 그 틈을 재량으로 판결한다 — 기계 래치가 없애려던 바로 그
+  #   LLM 재량 재시도다. 그래서 상한·측정불능 규율을 여기서 직접 서술하고, §0-A 는 정본
+  #   **참조**로만 남긴다(디렉티브가 최신이면 두 문안이 같은 규칙을 말한다 — 모순 없음).
+  echo "  (자기 surface 완주 런이 session_error(exit 10)면 boot-last의 result.retry_eligible이 사실이다 — true=위 명령을 포그라운드로 **1회 그대로** 재실행(부분 단계 재현 금지)하고 최종 JSON만 인용 / false=재실행 금지·세션 배선을 오너에 보고하고 정지)"
+  echo "  ★이 브리지 문단 자체가 그 계약이다(상한 1회) — 설치된 MASTER_DIRECTIVE §0-A 표에 session_error 행이 아직 없어도(user 소유 파일이라 팩 갱신이 덮지 않는다 · 신본은 MASTER_DIRECTIVE.md.new 병치 + cys pack-merge 로 도달) 이 문단이 '재실행 금지' 행보다 우선한다. 디렉티브가 최신이면 §0-A의 session_error 행이 같은 규칙의 정본이다."
+  echo "  ★측정 불능이면 재실행 금지: result.retry_eligible_unknown·result.persist_failed·log_write_failures가 있거나 boot-last 판독이 이번 런과 다른 run_id/surface를 가리키면 retry_eligible을 근거로 쓰지 말고 stdout의 boot-last-mirror 1줄과 boot_last 경로를 인용해 오너에 보고하고 정지하라(측정 불능은 어떤 게이트에서도 통과가 아니다)."
 fi
 # ── 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) ──
 # 업데이트·치유 불가침 사용자 확장점(팩 파일 직접 수정 대체 채널). 안전핵 키워드 줄은 주입에서

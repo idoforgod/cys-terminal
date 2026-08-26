@@ -2769,6 +2769,24 @@ fn bootstrap_chain_signal(code: Option<i32>, stdout: &str, stderr: &str) -> Boot
 /// 위 [팀 부트 단일 계약] 주석 참조. fire-and-forget(체인 최악 예산이 길어 UI 무블록).
 /// socket=Some 이면 그 부서 소켓 대상(+레인 팩 동반 주입 — G34), None 이면 본부.
 /// surface_ref=Some 이면 체인의 ③claim-role 이 그 pane 에 귀속된다(없으면 exit 10 을 맞는다).
+///
+/// ★범위 정직 등재(R3-GUI-4 · 2026-08-26 적대검증) — **이 경로는 부트 결정론 캠페인
+/// (P1 좌석 토큰 · P2 boot.enqueue 프런트도어)의 범위 밖이다. 후속 티켓으로 이월했다.**
+/// 근거(오독 방지 — '이미 위탁됐다'고 읽지 마라):
+///   · **P1 미적용**: 좌석 토큰은 pane PTY env 로 배달되는데 이 경로는 **Tauri 프로세스의
+///     자식**으로 체인을 돌린다 — Tauri 프로세스 env 에 `CYS_SEAT_TOKEN` 이 없으므로 토큰이
+///     실리지 않고, `run_claim_role` 은 env 부재 시 종전 조상 체인 경로로 흐른다.
+///   · **P2 미적용**: `cys boot-intent`(프런트도어)를 타지 않는다. 그리고 위탁을 그대로
+///     구현해도 `boot.enqueue` 는 caller_pid 조상 체인으로 좌석을 도출하므로 GUI 호출자는
+///     `caller_unresolved` 로 거절된다 — **설계 자체가 미완**이다(2차 성찰 P1 ⓐ 의
+///     '위탁' 교차참조는 미구현 상태로 남아 있다).
+///   · 따라서 이 경로의 ③ claim 은 조상 체인이 pane 에 닿지 않으면 여전히 rc 6 → exit 10
+///     이라는 캠페인 이전 결말을 유지한다(아래 `bootstrap_chain_signal` 의 exit 10 분기가
+///     그 실재를 이미 문면으로 인정한다). 캠페인의 'rc 6 클래스 소멸' 주장은 훅·§0 두
+///     진입점에 한정되며, 초보자 주 경로인 이 버튼은 **실기 미검증·미수리**다.
+/// 실수리 방향(이월 티켓): GUI 가 `cys launch-agent` 로 얻은 **pane 안에서** 부트를
+/// 트리거하는 구조(pane stdin 주입 또는 pane 자손으로 스폰)로 바꾸면 토큰·조상 체인이
+/// 자연히 성립한다 — 그때 P1·P2 가 이 경로에도 무개조로 적용된다.
 fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>, surface_ref: Option<String>) {
     let cys = resolve_sidecar("cys");
     tokio::task::spawn_blocking(move || {

@@ -15,6 +15,9 @@
      무교체·PENDING 유지·loud (반쪽마스터 재발 차단 — 스왑 직전 런타임 검사)
   8) ★MF-1(P3 수정 라운드): 교차버전 형상(팩 업데이트 md=v2·낡은 .pre-ceo=v1) — OR-포함
      (ceo ⊇ md)로 승격 통과·.pre-ceo 무접촉 / 스텁은 여전히 보류(차단 강도 불변)
+  8′) ★R3-CEO-2: 기승격 기계의 **실제** 업그레이드 후 3파일 형상(md=구 CEO 사본·.pre-ceo=구
+     표준·ceo=신 CEO·.new=vendor 신 표준) — `.new` ref 로 통과(영구 보류 루프 소멸) /
+     같은 형상의 스텁은 3-ref 전부 미포함이라 여전히 보류
   9) ★SF-1: 오너 지명(consented) 경로의 superset 보류는 PENDING 신규 생성 금지
      (지명 1회성 실패가 상시 자동승격 예약으로 확폭되는 것 차단 — 기존 PENDING 유지는 7c)
  10) ★SF-2: CRLF 개행 드리프트만으로 false hold 금지(정규화 후 포함 판정=통과)
@@ -234,6 +237,51 @@ code, out = run(env, "promote-if-pending")
 check("8d 스텁은 여전히 보류(차단 강도 불변)",
       code == 0 and md(home) == V2_BODY and os.path.exists(pend),
       "exit=%d %s" % (code, out[-200:]))
+shutil.rmtree(tmp)
+
+# ── 8′. ★R3-CEO-2: **기승격 기계의 업그레이드 후 3파일 형상** — md=구 CEO 사본 / .pre-ceo=구
+#   표준 v1 / ceo=신 CEO(v2) / .new=vendor 신 표준 v2. `directives/*_DIRECTIVE.md` 는 pack.rs
+#   ownership() 상 User 라 팩 갱신이 md 를 절대 덮지 않으므로(신본은 `.new` 병치만) MF-1 이
+#   상정한 구제 형상(md=v2)은 실제 업데이트 경로에서 발생하지 않는다 — MASTER_DIRECTIVE 본문을
+#   한 줄만 고쳐도 ceo⊇md·ceo⊇.pre-ceo 가 둘 다 거짓이 되어 전 기승격 함대가 rc 3 영구 보류 +
+#   10분 틱 무한 재판정에 빠졌다. `.new` ref 추가가 이 형상만 해소한다(스텁 차단 강도 불변).
+tmp = tempfile.mkdtemp(prefix="ceo-t8b-")
+env, home = setup(tmp)
+mdp, pre, pend, marker = paths(home)
+V2_BODY = "STANDARD-MASTER-V2\n"
+CEO_V1 = "CEO-HEADER\n---\n" + MASTER_BODY          # 승격 당시 적용된 구 CEO 템플릿
+CEO_V2 = "CEO-HEADER\n---\n" + V2_BODY              # 팩 갱신이 치유한 신 CEO 템플릿(System 등급)
+_dirs = os.path.join(home, ".cys", "pack", "directives")
+with open(mdp, "w", encoding="utf-8") as f:
+    f.write(CEO_V1)                                 # md = 구 CEO 사본(User 소유 — 갱신 불가)
+with open(pre, "w", encoding="utf-8") as f:
+    f.write(MASTER_BODY)                            # .pre-ceo = 승격 시점 구 표준 v1
+with open(os.path.join(_dirs, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+    f.write(CEO_V2)
+with open(mdp + ".new", "w", encoding="utf-8") as f:
+    f.write(V2_BODY)                                # vendor 신본 병치(pack.rs new_pending)
+with open(marker, "w", encoding="utf-8") as f:
+    f.write("{}")
+os.makedirs(os.path.dirname(pend), exist_ok=True)
+with open(pend, "w", encoding="utf-8") as f:
+    f.write("pending\n")
+code, out = run(env, "promote-if-pending")
+check("8′a 기승격+팩업데이트 3파일 형상 통과(ref=.new)", code == 0 and md(home) == CEO_V2,
+      "exit=%d md=%r %s" % (code, md(home)[:40], out[-300:]))
+check("8′b 낡은 .pre-ceo 무접촉", open(pre, encoding="utf-8").read() == MASTER_BODY)
+check("8′c PENDING 해소(영구 보류 루프 소멸)", not os.path.exists(pend))
+# 차단 강도 불변: 같은 3파일 형상에서 스텁 템플릿은 md·.new·.pre-ceo 셋 다 미포함 = 보류.
+with open(mdp, "w", encoding="utf-8") as f:
+    f.write(CEO_V1)
+with open(os.path.join(_dirs, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+    f.write("CEO-STUB\n")
+with open(pend, "w", encoding="utf-8") as f:
+    f.write("pending\n")
+code, out = run(env, "promote-if-pending")
+check("8′d 3-ref 전부 미포함 스텁은 여전히 보류(차단 강도 불변)",
+      code == 0 and md(home) == CEO_V1 and os.path.exists(pend),
+      "exit=%d %s" % (code, out[-200:]))
+check("8′e 보류 문안이 교차버전 갈래를 안내(.new 언급)", ".new" in out, out[-300:])
 shutil.rmtree(tmp)
 
 # ── 9. ★SF-1: 지명(consented) 경로의 superset 보류 = PENDING 신규 생성 금지 ──

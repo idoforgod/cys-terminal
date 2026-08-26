@@ -700,6 +700,31 @@ def _my_surface_id():
     return my_surface_id()
 
 
+def my_surface_key():
+    """**귀속 키** 규약 — surface 참조의 표기 차이를 흡수한 정규화 형태(숫자부만).
+
+    ★R3-ATTR-3(2026-08-26 적대검증): `CYS_SURFACE_ID` 의 **형식이 진입점마다 다르다**.
+      데몬이 스폰한 pane 과 부트 감독자 주입은 순수 정수(`"12"`)를 싣는 반면, GUI '마스터 시작'
+      경로는 `launched_surface_ref` 가 회수한 참조를 **그대로** 싣는다(`"surface:12"` —
+      src-tauri/src/main.rs `spawn_orchestra_boot` 의 `cmd.env("CYS_SURFACE_ID", sref)`).
+      선행 claim 결박은 이미 `re.sub(r"[^0-9]", "", …)` 로 정규화하는데(cmd_run·부서 폴백)
+      P0-3 이 새로 하중을 실은 두 식별자 — boot-last 최상위 `retry` 맵의 **키**와 `result.surface`
+      **귀속 필드** — 만 원문이었다. 귀결 둘:
+        ⓐ 같은 물리 좌석이 진입점에 따라 서로 다른 래치 슬롯을 가져 §0-A 가 명문화한 '선언당
+           합산 상한 ≈5' 가 그 좌석에서 6이 되고, 한쪽 경로의 `ok:true` 리셋이 다른 쪽 슬롯을
+           비우지 못한다(래치의 기계 유계가 표기 차이만으로 새어나간다).
+        ⓑ §0-A 판독 규약의 '`surface` 필드 = 이 pane 의 CYS_SURFACE_ID' 대조가 **GUI 기동
+           런에 대해 실패**한다 — GUI 가 남긴 기록은 `"surface:12"`, 그 pane 의 모델이 보는
+           env 는 `"12"` 라서 모델이 자기 좌석의 session_error 를 '남의 pane 기록'으로 접고
+           재실행 권한을 얻지 못한다(자가치유가 GUI 인구에게만 조용히 비활성화).
+      형식 다양성은 **소비 지점에서 흡수**한다 — 진입점이 늘어도 이 한 곳만 계약을 진다.
+    ★폴백: 숫자가 하나도 없는 참조(비정수 이름)는 원문을 그대로 쓴다 — 빈 문자열로 접으면
+      서로 다른 pane 이 한 래치 슬롯으로 수렴한다(정규화가 만들어내는 새 융합 금지).
+    """
+    raw = my_surface_id()
+    return re.sub(r"[^0-9]", "", raw) or raw
+
+
 # ── 단계 정체성 레지스트리 (P3-A-STEP-NAME · W3) ─────────────────────────────
 # ★결함 2건(재검증이 성립 확정한 절반):
 #   ⓐ **동명이의 재사용** — `③′lane-pack` 이 '불량 레인(빈 부서명)'과 '레인↔팩 불일치' **두 개의
@@ -837,7 +862,11 @@ class _Log:
         started = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.pid = os.getpid()
         self.run_id = "%s-%d" % (started, self.pid)
-        self.surface = _my_surface_id()
+        # ★R3-ATTR-3: 귀속은 **정규화 키**(my_surface_key — 숫자부)로 못박는다. 이 값이
+        #   ⓐ boot-last `result.surface` 귀속 필드(§0-A 자기 surface 대조면)와 ⓑ 최상위
+        #   `retry` 맵의 래치 키를 **동시에** 결정하므로, 진입점별 표기 차이(`"12"` vs
+        #   `"surface:12"`)를 여기서 흡수하지 않으면 같은 좌석이 두 슬롯으로 갈린다.
+        self.surface = my_surface_key()
         # ★G15: 기록 대상은 **레인 boot-last** 다(base 레인은 역사적 경로 그대로).
         #   전 레인 공유 단일 파일이던 종전에는 base·부서 동시 부트가 서로의 진단을 덮었다.
         self.path = lane_state_path("boot_last")
@@ -1129,7 +1158,9 @@ def _emit_skip_verdict():
     verdict = {"verdict": "skipped_inflight", "ok": None, "exit": EXIT_SKIPPED_INFLIGHT,
                "reason": "다른 부트스트랩 런이 진행 중(단일 실행 락 비획득) — 즉시 반환",
                "run_id": "%s-%d" % (time.strftime("%Y-%m-%dT%H:%M:%S"), os.getpid()),
-               "pid": os.getpid(), "surface": _my_surface_id(),
+               # ★R3-ATTR-3: 귀속 필드는 _Log 와 **같은 정규화 키** 규약을 쓴다 — skip verdict 의
+               #   surface 만 원문이면 같은 좌석의 두 기록이 서로 다른 문자열로 남는다.
+               "pid": os.getpid(), "surface": my_surface_key(),
                "surface_role": role, "is_master": is_master, "self_check": self_check,
                "lock": _singleflight_path(), "waited": False,
                "boot_last_untouched": True, "record": _skip_record_path()}

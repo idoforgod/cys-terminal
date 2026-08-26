@@ -578,4 +578,39 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       **제거**한다 — 현행 idle+quiet 폴백 복귀가 안전측이다(오문면 마커는 Reinject 를 영구
       불능으로 악화 — 마커 선언 어댑터는 폴백으로 흐르지 않는다, readiness.rs 주석 명문).
       Windows 문면 미측정 고지(612e95b Not-tested)는 이 행의 PASS 와 무관하게 **유지**한다.
+- [ ] **★user-owned 헌법 파일 개정의 배달 고지 (2026-08-26 R3-DELIVERY-1 · 디렉티브·soul·
+      schedule/agents/acl.json 을 건드린 릴리스에서 필수)**
+
+      `directives/*_DIRECTIVE.md`·`soul.md`·`CLAUDE.md`·`schedule.json`·`agents.json`·`acl.json`
+      은 `src/pack.rs ownership()` 상 **`Ownership::User`** 다 — 업데이터는 디스크≠임베드이면
+      매니페스트 해시가 일치해도·`--force` 여도 본문을 **덮지 않는다**(`decide_file_action` 의
+      User 분기 = `Keep{new_pending}`). 즉 이번 릴리스의 그 개정은 **신규 설치본에만 자동
+      도달**하고, 기존 인구에는 `<파일>.new` 병치 + `cys pack-merge` 를 거쳐야 도달한다.
+
+      - [ ] 이번 diff 에서 위 목록의 파일이 바뀌었는지 확인:
+            `git diff <이전태그>..HEAD --name-only -- cysjavis-pack/directives cysjavis-pack/soul.md cysjavis-pack/CLAUDE.md cysjavis-pack/schedule.json cysjavis-pack/agents.json cysjavis-pack/acl.json`
+      - [ ] 바뀌었다면 **릴리스 노트 상단에** 해소 명령을 고지한다 —
+            `cys pack-merge`(대기 목록) → `cys pack-merge --file directives/MASTER_DIRECTIVE.md --take-new`
+            (무수정본) 또는 `--keep-mine`/3-way. **CEO 승격 기계는 md 가 CEO 템플릿 사본이라
+            `--take-new` 를 쓰지 말고** preflight `C03.pin.master` 안내(D1(a)형 갱신)를 따른다.
+      - [ ] 규칙이 **훅·데몬 등 System 층에도 실려** 기존 인구에서 기계 거동이 성립하는지 확인
+            (System 파일은 강제 치유로 전원 도달 — 포인터만 실으면 '문서엔 없는 행'을 가리키는
+            이중 진실이 배포된다). 부트 재실행 계약의 그 결박은 검체 `H-DOC-11` 이 단언한다.
+      - [ ] 관측: 결손 기계에서 preflight `C03.boot-contract` 가 WARN 으로 뜨는지(부트 차단
+            아님 — 병합 대기 가시화). 이 축이 FAIL 로 바뀌면 전 함대 상시 NOT READY 다.
+- [ ] **★caller_cache 세대 무효화(P0-2) 채택 조건 — 상태: 미검증 (2026-08-26 R3-RELGATE-6 등재)**
+
+      2차 성찰이 P0-2 채택의 **조건**으로 못 박은 두 실측이다(조건이 조용히 탈락하면 채택
+      근거가 성립하지 않은 채 배포된다 — 완료정의 축소). 세대 무효화는
+      `resolve_caller_surface` 를 공유하는 20+ 소비자(`check_send_acl` 의 from 등급·
+      `usage.event` 귀속·배달 원장·publish surface 태깅 등)의 신원 해석 **시점**을 바꾼다
+      (음성 60s 고착 → 등록·claim 마다 재해석). 실측 전까지 '미검증'으로 정직 유지.
+
+      - [ ] **세대 무효화 후 send ACL 판정 무회귀** — 부서 자율성 deny 3형상 + external 등급
+            3형상을 재실행해 판정이 종전과 같은지 확인(`cargo test --bin cysd` 의 ACL 검체군
+            전량 green + 라이브 1회). 양성 항목이 세대를 보지 않는 계약은 소스 핀
+            `caller_cache_positive_ignores_generation` 이 지킨다 — 그 핀이 사라졌으면 적색.
+      - [ ] **GUI 타이핑 중 데몬 CPU 프로파일** — 편성/부트로 세대가 연속으로 오르는 구간을
+            포함해 30초 샘플. 채택 근거였던 '장수 음성 peer 의 키스트로크당 전 프로세스
+            스냅샷 방지'가 편성 폭풍 구간에서 부분 무력화되는지 실측으로 판정한다.
 - [ ] 릴리스 노트(RELEASE_NOTES_0.2.0.md) 작성
