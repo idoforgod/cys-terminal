@@ -1,496 +1,642 @@
 ; cys NSIS 설치 훅 — 업그레이드/재설치 시 잠긴 exe("Error opening file for writing") 문제를
-; ★무중단(rename-swap · 2026-07-02)으로 푼다. 종전 taskkill cysd는 마스터·워커·부서 PTY가
-; 전부 cysd 소유라 "업데이트 = 전 세션 사망"이었다(사용자 불안의 근원).
+; ★잠금 무관 배치(lock-tolerant placement · 2026-08-29 W4 재설계)로 푼다.
 ;
-; 원리: Windows는 실행 중 exe의 '덮어쓰기'는 금지하나 '이름 변경(rename)'은 허용(NTFS 동일볼륨).
-;   ① GUI(cys-app.exe)만 종료 — 얇은 클라이언트(main.rs:1 "UI가 죽어도 세션(PTY)은 데몬에
-;      살아있다. UI 재시작 = 재attach") → 세션 무손실.
-;   ② cysd.exe·cys.exe는 죽이지 않고 옆(.prev*.exe)으로 rename → 새 exe를 제자리에 설치.
-;      구 데몬은 renamed 파일로 계속 봉사(lame-duck)하고, 새 cysd 기동이 잔해를 청소한다.
-;   ③ rename이 전부 실패할 때만 구 방식(taskkill) 폴백 — 현재보다 나빠질 수 없는 우아한 강등
-;      (그 경로는 기존 재시작 복원(maybe_apply_pending_update → cys restore)이 받친다).
-; prev 체인(prev→prev2→prev3): 직전 lame-duck이 아직 살아 prev 파일을 점유 중일 수 있어
-; 고정 3칸으로 우회한다(연속 lame-duck 2개 초과는 실사용상 희귀 — 초과 시 폴백 kill).
+; 역사: 종전 kill(cysd)은 마스터·워커·부서 PTY가 전부 cysd 소유라 "업데이트 = 전 세션 사망"
+; 이었고(2026-07-02 rename-swap 도입 사유), rename-swap + 지문(pre/post) 비교는 0.14.27 에서
+; "같은 버전 재설치 → 영원한 exit 4 루프" 와 T3("CLI 소실") 사고 계열을 낳았다
+; (실측 감사: _work/win-installer-verify-fail-20260828/AUDIT-2ND-PASS-2026-08-28.md).
 ;
 ; ══════════════════════════════════════════════════════════════════════════════
-; ★T3 원자화 (2026-08-01 · 윈도우 실사고 "CLI 소실" 근본 수리)
+; 이 파일의 계약 (W4 · 2026-08-29 · IMPL-SPEC §W4)
 ; ══════════════════════════════════════════════════════════════════════════════
-; 실사고: 0.14.8→0.14.9 실행 중 업그레이드 후 %LOCALAPPDATA%\cys 에 cys.exe·cysd.exe 가
-;        **둘 다 부재**하고 .prev.exe 사본만 남아, 사용자가 정지 명령조차 실행 불가했다.
-;
-; 코드 판독으로 확정한 구조적 원인 — 단일 버그가 아니라 '파괴 선행 + 무검증 + 무원복' 3중.
-;
-;  (A) 자리를 먼저 비우고 새 파일은 한참 뒤에 온다 (창(window)이 수십초~수분).
-;      Tauri NSIS 템플릿 `Section Install` 의 실행 순서는 고정이다:
-;         SetOutPath → **NSIS_HOOK_PREINSTALL** → CheckIfAppIsRunning
-;         → File(메인 exe) → File(resources = runtime/ 수백 MB) → File(binaries = cys/cysd)
-;         → 레지스트리 → 바로가기 → **NSIS_HOOK_POSTINSTALL**
-;      즉 **사이드카(cys.exe·cysd.exe)는 맨 마지막에 풀린다**. 구 훅은 PREINSTALL 에서
-;      원본을 .prev 로 rename 해 치워버리므로, 정상 설치에서도 그 사이 내내 cys.exe 가
-;      디스크에 없다 → 그 창에서 `cys ...` 는 'cys: not recognized' 로 실패한다.
-;
-;  (B) 그 창 안에서 설치가 중단되면 **영구 소실**이다. 중단 경로는 템플릿 코드상 실재한다:
-;      ① PREINSTALL 바로 다음의 `CheckIfAppIsRunning` 은 프로세스 kill 실패 시 `Abort` 한다
-;         (우리 훅이 이미 taskkill 했더라도 종료 완료 전 레이스면 Find→Kill 이 실패할 수 있다)
-;      ② 사용자 취소 ③ 디스크 부족 ④ AV 격리.
-;      어느 경로든 **POSTINSTALL 은 실행되지 않는다** → 뒤늦은 검증·원복이 원리적으로 불가능.
-;
-;  (C) `SetOverwrite try` 는 추출 실패를 **조용히 스킵**한다(NSIS 정의: try = 덮어쓰기를 시도하고
-;      실패하면 무통보 생략). 잠긴 파일에서 설치 전체가 Abort 되는 것을 막으려고 넣은 안전장치가,
-;      "새 실행물이 안 들어왔다"는 사실까지 함께 삼켰다.
-;
-; ⇒ 수리 원칙 (이 파일의 계약):
-;   R1. **정식 이름 자리를 '빈 채로' 끝내지 않는다.** 잠긴 원본은 .prev 로 rename 해 이름을
-;       비운 **직후, 곧바로 그 .prev 를 정식 이름으로 복사해 되돌려 놓는다**. 복사본은 아무도
-;       실행 중이 아니라 잠기지 않으므로, 뒤에 오는 File 추출이 그대로 덮어써 신본이 된다.
-;       → 정상 설치에서도 CLI 부재 창이 사라지고(A 해소),
-;       → 중간에 무엇이 Abort 되든 남는 것은 '빈 자리'가 아니라 '구버전 동작본'이다(B 해소).
-;       ※ 정확한 계약 (2026-08-01 적대 검증 지적 반영 — 종전 문언 "한 순간도 비우지 않는다"는
-;         코드와 불일치였다):
-;         · **전이 창은 남는다.** Rename 반환 → cmd 기동 → 복사 완료 사이 수십~수백 ms 동안
-;           정식 이름이 실제로 부재한다. 딱 그 순간에 새 `cys ...` 를 띄우면 not recognized 다.
-;           종전 결함의 창(수십 초~수 분 · 사이드카가 File 목록 맨 끝이라)과는 4~5 자릿수 다르며,
-;           '설치 중 어느 시점에 끊겨도 자리가 비어 남지 않는다'가 이 파일이 보증하는 성질이다.
-;         · **복사가 실패하면 rename 을 되돌린다.** Rename 은 메타데이터 연산이라 디스크 부족으로
-;           실패하지 않고 부분 파일도 남기지 않는다 → '자리가 빈 채 설치가 계속되는' 종단은
-;           구조적으로 제거된다. 되돌린 뒤에는 원본(구본·잠김)이 자리에 있어 추출이 스킵될 수
-;           있고, 그 '반쪽 상태'는 R4 가 잡아 크게 실패시킨다(조용한 통과 없음).
-;   R2. **끝에서 필수 실행물을 검증한다.** POSTINSTALL 에서 cys.exe·cysd.exe·cys-app.exe 의
-;       존재 + 최소 크기를 확인하고, 미달이면 .prev 사본에서 자동 원복한 뒤
-;       **SetErrorLevel + 메시지 + Abort 로 크게 실패**한다(C 해소 · 조용한 성공 위장 금지).
-;   R3. **잠금 처리 규약** (아래 "잠금 규약" 절) 을 명문화하고 스윕의 사정거리를 좁힌다.
-;   R4. **신본이 실제로 들어왔는지를 결정론으로 판정한다** (2026-08-01 적대 검증 FAIL 봉합).
-;       R2 의 '존재 + 64KB' 만으로는 **R1 이 세운 구버전 사본이 그대로 통과**한다 — 추출이
-;       조용히 스킵되면(위 C) 설치기는 반쪽 업그레이드를 '성공'으로 보고한다. 그래서:
-;         · PREINSTALL 이 **추출 직전 상태의 지문**(파일 크기 + 최종수정시각)을 3종 각각에 대해
-;           $PLUGINSDIR 에 적어둔다.
-;         · POSTINSTALL 이 다시 재어 비교한다. **지문이 바뀌었다 = 이번 실행의 File 추출이 그
-;           파일을 썼다(신본 반영) · 그대로다 = 추출이 그 파일을 못 건드렸다(구본 잔존).**
-;         · 근거: 지문을 **스테이징이 끝난 뒤에** 재기 때문에, 이 판정은 `cmd copy` 가 원본의
-;           시각을 보존하는지 여부에 **의존하지 않는다**(복사가 시각을 보존하든 지금 시각으로
-;           갱신하든, 그 결과값이 그대로 기준선이 된다). 비교가 묻는 것은 오직 "스냅샷 이후
-;           이 파일이 바뀌었는가" 이고, 그 사이에 이 파일을 쓸 수 있는 주체는 File 추출뿐이다
-;           (잠금 스윕은 이보다 먼저 끝나고, 필수 3종은 스윕 제외 대상이다 — L5).
-;           그리고 NSIS 는 `SetDateSave` 기본 on 이라 추출이 **빌드 산출물의 최종수정시각을
-;           복원**하므로, 다른 빌드가 들어오면 시각이 반드시 달라진다(같은 패키지를 두 번
-;           설치하는 경우만 같아질 수 있고, 그건 아래 '면제' 가 걷어낸다).
-;           판정은 전부 순수 NSIS(FileSeek·GetFileTime).
-;         · **면제(오탐 차단)**: 같은 버전 재설치·복구설치는 지문이 같아도 정상이다. 직전 설치
-;           버전을 PREINSTALL 에서 두 출처로 읽어(레지스트리 DisplayVersion + 지난 설치가
-;           신선도 게이트를 통과한 뒤에만 남긴 마커 cys-installed-version.txt) 이번 ${VERSION}
-;           과 같거나 **둘 다 알 수 없으면 판정을 면제**한다. 레지스트리를 PREINSTALL 에서만
-;           읽는 이유: 템플릿이 DisplayVersion 을 추출 뒤에 쓰므로 POSTINSTALL 시점에는 이미
-;           신 버전으로 덮여 있다(직전 값을 볼 수 있는 유일한 시점).
-;         · **알려진 한계(의도적)**: 두 출처가 모두 비면 '증거 없음' 으로 보고 고발하지 않는다.
-;           레지스트리를 지운 기계에서 같은 패키지를 재설치할 때 영구 실패 루프에 빠지는 쪽이
-;           더 큰 해악이라 '증거 있을 때만 고발' 을 택했다. 이 경우에도 R2(존재·크기)는 그대로
-;           작동하며, 마커가 도입된 이후 버전부터는 이 구멍이 사실상 닫힌다.
-;       ─ 기각한 대안과 이유 (NSIS 제약 안에서의 택일 근거):
-;         ① 버전 리소스 대조(GetDLLVersion): cys.exe·cysd.exe 는 winres/winresource 계열
-;            빌드스크립트가 없어 **VERSIONINFO 자체가 없다**(Cargo.toml·build.rs 확인) →
-;            항상 오류 플래그 = 전량 오탐. 리소스를 새로 심으려면 빌드 의존성 추가가 필요해
-;            이번 수리의 사정거리를 넘는다.
-;         ② 해시 매니페스트: NSIS 코어에 해시 명령이 없고, Tauri 번들 NSIS 에는 해시 플러그인이
-;            없다. PowerShell Get-FileHash 로 대신하면 **기업 정책 PC 에서 검증 자체가 못 돌아
-;            조용히 통과**하는 구멍이 생겨 R2 의 '판정은 순수 NSIS' 원칙과 정면 충돌한다.
-;         ③ 새 exe 실행 후 --version 대조: 갓 쓰인 실행물을 설치 도중 실행해야 하고(AV 스캔·행),
-;            타임아웃이 나면 '판정 불능' lane 이 생겨 게이트가 흐려진다. 또 cys-app.exe 에는
-;            적용할 수 없다.
-;         ④ witness 파일 동봉(작은 txt 를 같이 추출해 성공 여부 확인): 추출 스킵은 **파일별
-;            잠금**에 좌우되므로, 잠기지 않는 txt 가 들어왔다는 사실은 exe 가 들어왔다는 증거가
-;            전혀 되지 못한다(부당한 안심 = 가짜 게이트).
+;  R1. **정식 이름(`$INSTDIR\cys.exe`·`cysd.exe`·`cys-app.exe`)이 비어 있는 종단을 만들지
+;      않는다.** 데몬 부팅 스윕(cysd P1b)은 정식 부재를 T3 사고로 취급하므로, 어떤 분기에서
+;      끊겨도 정식 자리에는 '동작하는 실행물'(구본 또는 신본)이 있어야 한다.
+;      PREINSTALL 은 정식 3종을 아예 건드리지 않고, POSTINSTALL 배치는 rename 2회(비우기→
+;      채우기) 사이의 모든 실패에서 되돌리며, 콜백(.onInstFailed/.onUserAbort)과 최종
+;      바닥 점검(CYS_LASTDITCH)이 잔여 경로를 받친다.
+;  R2. **신선도 판정은 절대 오라클로 한다** (P1-3B). "지문이 바뀌었나"가 아니라 "정식 자리
+;      파일의 VERSIONINFO DWORD 2개가 이번 빌드 원본의 것과 일치하나"를 묻는다. 기대값은
+;      컴파일 시 `!getdllversion /packed` 로 **같은 원본 파일**에서 뽑는다(형식 불일치 불가).
+;      런타임 GetDLLVersion 실패(리소스 없음·열기 실패)는 **fail-closed**(신본 아님으로 간주).
+;      같은 버전 재설치는 오라클이 "이미 신본"으로 단락하므로 면제 기계가 필요 없다.
+;  R3. **배치는 3종에 걸쳐 트랜잭션이다.** 순서는 cys → cysd → cys-app 고정(cys 를 먼저:
+;      "새 cys + 구 cysd" 는 지원되는 lame-duck 상태지만 "새 cysd + 구 cys" 는 다음 부팅의
+;      phoenix 정체 exit 6 = 전 pane 복원 불가). 어느 하나가 거부되면 이미 배치한 앞선 것을
+;      역순으로 되돌리고, 되돌리기가 실패하면 **거기서 멈춰** 신본 집합이 항상 (cys, cysd,
+;      cys-app) 의 접두(prefix)로 남게 한다.
+;  R4. **모든 rename 은 유한 재시도(5회 × Sleep 1000)** 이고 모든 실패는 유음(loud)이다:
+;      DetailPrint + cys-install-failure.txt 토큰 + SetErrorLevel + Abort. 측정 불능은 통과가
+;      아니다. 성공 위장 금지.
 ;
 ; ── 잠금 규약 (업그레이드 중 데몬·CLI 잠금 처리 · 이 절이 SOT) ────────────────
-;   L1. 죽여도 되는 것은 GUI(cys-app.exe) 뿐이다. cysd.exe 는 마스터·워커·부서 PTY 전부의
-;       소유자이므로 **정상 경로에서 절대 죽이지 않는다**(죽이면 전 세션 사망).
-;   L2. 잠긴 실행 이미지는 '덮어쓰기' 불가·'rename' 가능이다. 따라서 교체는 항상
-;       rename(이름 비우기) → 복사(자리 채우기) → 추출(덮어쓰기) 3단으로 한다. (R1)
-;   L3. rename 대상 prev 슬롯은 3칸(prev·prev2·prev3). 직전 lame-duck 이 점유 중이면 다음 칸.
-;       3칸 전부 실패했을 때만 taskkill 폴백 — 그 경우에도 **원복 재료(.prev 사본)를 먼저 확보**한다.
-;   L4. 잠금 스윕(unlock-sweep)은 `runtime\` 하위 + 설치 루트 최상위 1단만 본다. 설치 루트는
-;       기본 데몬의 상태 디렉터리(%LOCALAPPDATA%\cys)와 **같은 폴더**라 재귀 스윕은 세션 DB·로그
-;       수천 개를 훑는 낭비이자 사고 위험이다.
-;   L5. 스윕은 cys.exe·cysd.exe·cys-app.exe 를 **건드리지 않는다**(위 3단이 전담). 스윕이 이들을
-;       .prev<rand> 로 밀어버리면 R1 이 무력화된다.
-;   L6. 잔해(.prev*) 삭제 책임은 설치기가 아니라 **새 cysd 기동 시 자가청소(P1b)** 다. 설치 중
-;       삭제 시도는 best-effort 이며 실패를 오류로 취급하지 않는다.
+;   L1. 죽여도 되는 것은 GUI(cys-app.exe) 뿐이며 **/T(트리) 없이** 죽인다 — GUI 가 cysd 를
+;       평범한 자식으로 스폰하므로 트리 kill 은 데몬·전 세션 사망이다(0.14.27 실측 결함).
+;       cysd.exe·cys.exe 를 죽이는 코드는 설치 경로에 존재하지 않는다(제거(uninstall)만 예외).
+;   L2. 잠긴 실행 이미지는 '덮어쓰기' 불가·'rename' 가능이다(NTFS 동일 볼륨). 교체는 항상
+;       신본을 옆 이름(`<bin>.new.exe`)에 추출→검증한 뒤, 정식을 prev 슬롯으로 rename 하고
+;       `.new` 를 정식으로 rename 하는 2단으로 한다. 정식 부재 창은 rename 2회 사이의 수 ms 뿐.
+;   L3. prev 슬롯은 prev·prev2·prev3 + tick 슬롯(`<bin>.prev<GetTickCount>.exe` · 음수 방지
+;       마스킹 · 숫자만)이다. 이름들은 cysd 부팅 스윕의 잔해 문법(`is_update_leftover`) 안에
+;       있어 데몬이 자가청소한다. `<bin>.new.exe` 는 그 문법 **밖**이다(설치 중 데몬 재부팅이
+;       신본을 격리하지 못하게 — cysd 쪽 가드가 정식 부재 시 복구 재료로 쓴다).
+;   L4. 잠금 스윕(unlock-sweep)은 `runtime\` 재귀 + 설치 루트 최상위 1단만 본다(설치 루트는
+;       기본 데몬 state dir 와 같은 폴더 — 재귀 스윕은 세션 DB·로그 수천 개를 훑는 사고 위험).
+;   L5. 스윕은 정식 3종을 절대 만지지 않는다(배치가 전담). 스윕 필터는 실행 이미지 확장자
+;       4종(.exe/.dll/.pyd/.node)이고 결과를 `cys-sweep: scanned=N renamed=M` 로 로그에 남긴다.
+;   L6. 잔해(.prev*) 삭제 책임은 설치기가 아니라 새 cysd 기동 자가청소다. 설치 성공 시의
+;       슬롯 정리는 best-effort 이며 실패를 오류로 취급하지 않는다.
 ;
-; ── 인코딩 주의 ───────────────────────────────────────────────────────────────
-;   이 파일은 BOM 없는 UTF-8 이다. NSIS 는 BOM 없는 스크립트를 ACP 로 읽으므로 **한국어는
-;   주석에만** 쓴다(주석은 오독돼도 무해). 사용자에게 보이는 문자열(MessageBox·DetailPrint·
+; ── 컴파일 시점 계약 (실측: tauri-cli v2.11.4 installer.nsi) ──────────────────
+;   훅은 템플릿의 `!define` 들(VERSION:42·MAINBINARYSRCPATH:53·UNINSTKEY:66)보다 **먼저**
+;   include 된다(:34-35). 따라서 템플릿 심볼은 매크로 본문 안(= !insertmacro 시점 :642/:734/
+;   :779 에 평가)에서만 쓰고, 훅 최상단과 콜백 함수(.onInstFailed/.onUserAbort — 템플릿은
+;   이 둘을 정의하지 않음을 실측 확인)에서는 런타임 변수와 훅 자체 define 만 쓴다.
+;   사이드카 원본은 `${__FILEDIR__}\binaries\` 로 훅이 직접 가리킨다(번들러가 훅 경로를
+;   canonicalize 하므로 __FILEDIR__ = src-tauri). 원본 부재·VERSIONINFO 부재는 **빌드 실패**
+;   다(/noerrors 금지 — 무음 실패 금지).
+;   이 파일은 BOM 없는 UTF-8 + CRLF 이며(.gitattributes:70), 번들러가 makensis 를
+;   `-INPUTCHARSET UTF8` 로 부른다. 사용자에게 보이는 문자열(MessageBox·DetailPrint·
 ;   FileWrite·콘솔)은 전부 ASCII 로 적는다 — 깨진 글자로 경고하면 경고가 아니다.
+;
+; ── 레지스터 지도 (POSTINSTALL 트랜잭션 스코프) ───────────────────────────────
+;   $R2 오라클 결과("fresh"/"notfresh"/"absent") · $R3 배치/undo 상태("ok"/"fail"/"undofail")
+;   $R4 placement-refused 목록 · $R6 unrecoverable 목록 · $R7 rolled-back 목록
+;   $R8 not-updated 목록 · $R5/$R9 스크래치(크기·버전·핸들) · $R1 tick(★.R1 — .r1 은 $1 이다)
+;   $5/$6/$7 = cys/cysd/cys-app 의 구본이 쉬고 있는 prev 슬롯 접미(빈 값 = 구본 미대피)
+;   $8 cmd copy 종료코드 · $9 rename 재시도 카운터 · $3 실패 exit 레벨 · $4 파일 핸들
+;   $0 콘솔 핸들(실패 보고). 콜백 함수는 레지스터를 쓰지 않는다(순수 파일 연산).
 ; ══════════════════════════════════════════════════════════════════════════════
 
-; ── 매크로: 잠긴 실행물 1개를 '자리를 비우지 않고' 교체 준비 (R1·L2·L3) ──────
-;   BIN = 확장자 없는 파일 이름(cys · cysd) / TAG = 라벨 접미(영숫자·밑줄만 — NSIS 라벨에
-;   하이픈을 넣지 않기 위해 파일명과 분리한다. 예: BIN="cys-app" → TAG="cysapp").
-!macro CYS_SWAP_IN_PLACE BIN TAG
-  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_swap_done_${TAG}
+; ── 컴파일 상수: 사이드카 원본 경로 + 기대 버전 DWORD (R2 오라클 기대값) ──────
+;   ★훅 최상단이므로 템플릿 define 사용 금지(위 '컴파일 시점 계약'). cys-app 의 원본
+;   (${MAINBINARYSRCPATH})은 매크로 본문(NSIS_HOOK_POSTINSTALL)에서 같은 방식으로 뽑는다.
+!define CYS_HOOK_DIR "${__FILEDIR__}"
+!define CYS_SRC_CYS  "${CYS_HOOK_DIR}\binaries\cys-x86_64-pc-windows-msvc.exe"
+!define CYS_SRC_CYSD "${CYS_HOOK_DIR}\binaries\cysd-x86_64-pc-windows-msvc.exe"
+!if ! /FileExists "${CYS_SRC_CYS}"
+  !error "cys hook: sidecar source not found at compile time: ${CYS_SRC_CYS} (run scripts/bundle-prep.sh first)"
+!endif
+!if ! /FileExists "${CYS_SRC_CYSD}"
+  !error "cys hook: sidecar source not found at compile time: ${CYS_SRC_CYSD} (run scripts/bundle-prep.sh first)"
+!endif
+; VERSIONINFO 없는 사이드카는 여기서 빌드가 깨진다(/noerrors 금지 — 전 기계 exit 4 회귀 차단).
+!getdllversion /packed "${CYS_SRC_CYS}"  CYS_V_CYS_
+!getdllversion /packed "${CYS_SRC_CYSD}" CYS_V_CYSD_
+; ★실측(makensis v3.12 POSIX): 리소스가 없어도 !getdllversion 이 에러 대신 **빈 값**을
+;   정의하고 지나갈 수 있다(하네스 negative control 로 확인). 빈/0 기대값은 오라클 실명
+;   (blind oracle)이므로 여기서 빌드를 끊는다 — I6 계약의 기계적 집행.
+!if "${CYS_V_CYS_High}" == ""
+  !error "cys hook: no VERSIONINFO readable in ${CYS_SRC_CYS} - refusing to build a blind oracle"
+!endif
+!if "${CYS_V_CYSD_High}" == ""
+  !error "cys hook: no VERSIONINFO readable in ${CYS_SRC_CYSD} - refusing to build a blind oracle"
+!endif
+!if "${CYS_V_CYS_High}" == "0"
+!if "${CYS_V_CYS_Low}" == "0"
+  !error "cys hook: ${CYS_SRC_CYS} is stamped 0.0.0.0 - version resource regression"
+!endif
+!endif
+!if "${CYS_V_CYSD_High}" == "0"
+!if "${CYS_V_CYSD_Low}" == "0"
+  !error "cys hook: ${CYS_SRC_CYSD} is stamped 0.0.0.0 - version resource regression"
+!endif
+!endif
 
-  ; ① prev 슬롯 확보 후 rename — 실행 중이어도 rename 은 허용된다(이름만 비운다).
-  Delete "$INSTDIR\${BIN}.prev.exe"          ; 잔해 청소 시도(구 lame-duck 점유 시 실패해도 무시)
+; ── 매크로: rename 유한 재시도 (R4) — 5회 × Sleep 1000 ────────────────────────
+;   성공 = 에러 플래그 clear · 최종 실패 = 에러 플래그 set. $9 를 카운터로 쓴다.
+;   AV·백업·인덱서가 FILE_SHARE_DELETE 없는 핸들을 잠깐 쥐는 경우를 흡수한다(유계).
+!macro CYS_RENAME_RETRY SRC DST TAG
+  StrCpy $9 0
+cys_rr_try_${TAG}:
   ClearErrors
-  Rename "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev.exe"
-  IfErrors 0 cys_swap_back1_${TAG}
-  Delete "$INSTDIR\${BIN}.prev2.exe"
-  ClearErrors
-  Rename "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev2.exe"
-  IfErrors 0 cys_swap_back2_${TAG}
-  Delete "$INSTDIR\${BIN}.prev3.exe"
-  ClearErrors
-  Rename "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev3.exe"
-  IfErrors 0 cys_swap_back3_${TAG}
+  Rename "${SRC}" "${DST}"
+  IfErrors 0 cys_rr_done_${TAG}
+  IntOp $9 $9 + 1
+  IntCmp $9 5 cys_rr_fail_${TAG} 0 cys_rr_fail_${TAG}
+  Sleep 1000
+  Goto cys_rr_try_${TAG}
+cys_rr_fail_${TAG}:
+  SetErrors
+cys_rr_done_${TAG}:
+!macroend
 
-  ; ③ 최후 폴백 — prev 3칸 전부 실패. 프로세스를 죽여 잠금을 푼다(L3).
-  ;    ★폴백에서도 원복 재료를 반드시 남긴다: 이게 없으면 POSTINSTALL 이 되돌릴 것이 없다.
-  ;    ※ 이 경로에는 '되돌리기(undo rename)' 가 없다 — **rename 을 한 적이 없기 때문**이다.
-  ;      원본은 정식 이름 그대로 자리에 있고, 여기의 copy 는 자리를 채우는 게 아니라 원복 재료를
-  ;      뜨는 것이다. 따라서 이 copy 가 실패해도 '빈 자리' 는 생기지 않는다(경고만 남긴다).
-  ;      실패의 결과는 "원복 재료 없음" 이며, 그 상태에서 추출까지 스킵되면 구본이 자리에
-  ;      남는데 — 그 반쪽 상태는 R4(신선도 판정)가 잡는다.
-  nsExec::Exec 'taskkill /F /T /IM ${BIN}.exe'
-  Pop $R0
-  Sleep 300
-  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_swap_done_${TAG}
+; ── 매크로: 절대 신선도 오라클 (R2 · 런타임) ──────────────────────────────────
+;   OUT := "fresh"  = 존재 + 크기 ≥ 64KiB + GetDLLVersion 두 DWORD == 기대값(이번 빌드)
+;          "notfresh" = 존재하나 위 판정 미달(버전 불일치·리소스 없음·열기 실패 = fail-closed)
+;          "absent" = 정식 이름 부재
+;   ★GetDLLVersion 은 DWORD 2개를 준다 — 문자열 버전과 비교하지 않는다(형식 불일치 = 전
+;     기계 오탐). 기대값은 컴파일 시 같은 원본에서 !getdllversion /packed 로 뽑은 상수다.
+;   $R9(상위)·$R5(하위/크기) 를 덮어쓴다.
+!macro CYS_ORACLE BIN TAG EXPHIGH EXPLOW OUT
+  StrCpy ${OUT} "absent"
+  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_or_done_${TAG}
+  StrCpy ${OUT} "notfresh"
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_or_done_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 0 cys_or_done_${TAG} 0
+  ClearErrors
+  GetDLLVersion "$INSTDIR\${BIN}.exe" $R9 $R5
+  IfErrors cys_or_done_${TAG}
+  IntCmp $R9 ${EXPHIGH} 0 cys_or_done_${TAG} cys_or_done_${TAG}
+  IntCmp $R5 ${EXPLOW} 0 cys_or_done_${TAG} cys_or_done_${TAG}
+  StrCpy ${OUT} "fresh"
+cys_or_done_${TAG}:
+  ClearErrors
+!macroend
+
+; ── 매크로: prev 슬롯의 구본을 정식 이름으로 복귀 (배치 실패의 undo 코어) ─────
+;   전제: 정식 이름이 현재 비어 있다. 성공 = 에러 플래그 clear / 실패 = set.
+;   ${SLOTVAR}(레지스터)는 성공·실패와 무관하게 비운다 — 이후 단계(트랜잭션 undo·슬롯
+;   정리)가 이 슬롯을 다시 만지지 않게 하기 위해서다(최종 복구는 CYS_LASTDITCH 가 슬롯
+;   변수 없이 prev 체인을 직접 훑는다).
+;   rename 이 5회 전부 거부되면(공유 위반) copy 로 강등한다 — 실행 중 이미지도 읽기는
+;   허용되므로 copy 는 성립한다. copy 부분 실패(디스크 부족)는 잘린 사본을 지우고 마지막
+;   rename 을 한 번 더 시도한다(rename 은 메타데이터 연산이라 공간 부족으로 실패하지 않는다).
+!macro CYS_RESTORE_SLOT BIN TAG SLOTVAR
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.${SLOTVAR}.exe" "$INSTDIR\${BIN}.exe" "${TAG}a"
+  IfErrors 0 cys_rs_ok_${TAG}
+  nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.${SLOTVAR}.exe" "$INSTDIR\${BIN}.exe"'
+  Pop $8
+  StrCmp $8 "0" cys_rs_ok_${TAG} 0
+  Delete "$INSTDIR\${BIN}.exe"
+  ClearErrors
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.${SLOTVAR}.exe" "$INSTDIR\${BIN}.exe" "${TAG}b"
+  IfErrors 0 cys_rs_ok_${TAG}
+  DetailPrint "cys: FATAL - could not restore ${BIN}.exe from its prev slot"
+  StrCpy ${SLOTVAR} ""
+  SetErrors
+  Goto cys_rs_done_${TAG}
+cys_rs_ok_${TAG}:
+  StrCpy ${SLOTVAR} ""
+  ClearErrors
+cys_rs_done_${TAG}:
+!macroend
+
+; ── 매크로: 바이너리 1종의 잠금 무관 배치 (R2·R3 · IMPL-SPEC §W4-B 8단) ───────
+;   결과: $R3 = "ok"(신본 반영 완료 또는 이미 신본) / "fail"(거부 — $R4 에 사유 축적,
+;   정식 자리는 구본 그대로). ${SLOTVAR} = 구본이 대피한 prev 슬롯 접미(성공 시에만 —
+;   트랜잭션 undo 재료로 쓰이고, 전체 성공 후에야 best-effort 정리한다).
+;   어떤 분기도 정식 이름을 비운 채 끝나지 않는다(R1 — 실패는 전부 '구본 유지' 종단).
+!macro CYS_PLACE BIN TAG SRC EXPHIGH EXPLOW SLOTVAR
+  StrCpy ${SLOTVAR} ""
+  StrCpy $R3 "ok"
+  ; ① 오라클 단락: 정식이 이미 이번 빌드면 아무것도 하지 않는다(같은 버전 재설치·복구
+  ;    설치·추출이 이미 성공한 경우 전부 여기서 끝 — 면제 기계 불요의 근거).
+  !insertmacro CYS_ORACLE "${BIN}" "pl${TAG}" "${EXPHIGH}" "${EXPLOW}" $R2
+  StrCmp $R2 "fresh" 0 cys_pl_need_${TAG}
+  Delete "$INSTDIR\${BIN}.new.exe"
+  ClearErrors
+  Goto cys_pl_done_${TAG}
+cys_pl_need_${TAG}:
+  ; ② 이전 실행의 stale `.new` 는 반드시 완전 제거 — 잠겨서 못 지우면 거부한다.
+  ;    (SetOverwrite try 아래에서 잠긴 stale 위로 추출이 무음 스킵되면, 뒤 단계가 그
+  ;     구버전 `.new` 를 정식으로 세워 **다운그레이드**가 제자리에 들어간다 — 실측 함정.)
+  ClearErrors
+  Delete "$INSTDIR\${BIN}.new.exe"
+  IfErrors 0 cys_pl_extract_${TAG}
+  DetailPrint "cys: placement refused - stale ${BIN}.new.exe is locked"
+  StrCpy $R4 "$R4 ${BIN}.exe(stale-new-locked)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_extract_${TAG}:
+  ; ③ 신본을 옆 이름으로 추출한다(정식은 아직 무손상).
+  ClearErrors
+  File "/oname=$INSTDIR\${BIN}.new.exe" "${SRC}"
+  IfErrors cys_pl_exfail_${TAG}
+  ; ④ 추출물 검증: 존재 + 크기 ≥ 64KiB + 버전 == 이번 빌드 (fail-closed).
+  IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_pl_exfail_${TAG}
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.new.exe" r
+  IfErrors cys_pl_newbad_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 0 cys_pl_newbad_${TAG} 0
+  ClearErrors
+  GetDLLVersion "$INSTDIR\${BIN}.new.exe" $R9 $R5
+  IfErrors cys_pl_newbad_${TAG}
+  IntCmp $R9 ${EXPHIGH} 0 cys_pl_newbad_${TAG} cys_pl_newbad_${TAG}
+  IntCmp $R5 ${EXPLOW} 0 cys_pl_newbad_${TAG} cys_pl_newbad_${TAG}
+  Goto cys_pl_vacate_${TAG}
+cys_pl_exfail_${TAG}:
+  Delete "$INSTDIR\${BIN}.new.exe"
+  ClearErrors
+  DetailPrint "cys: placement refused - could not extract ${BIN}.new.exe"
+  StrCpy $R4 "$R4 ${BIN}.exe(extract-failed)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_newbad_${TAG}:
+  Delete "$INSTDIR\${BIN}.new.exe"
+  ClearErrors
+  DetailPrint "cys: placement refused - ${BIN}.new.exe failed verification (size/version)"
+  StrCpy $R4 "$R4 ${BIN}.exe(new-bad)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_vacate_${TAG}:
+  ; ⑤ 정식(구본·잠겨 있어도 rename 은 허용)을 prev 슬롯으로 대피시킨다.
+  ;    슬롯 순서: prev → prev2 → prev3 → tick. Delete 실패 = 그 슬롯을 lame-duck 이 점유
+  ;    중(실행 이미지 삭제 거부) → 다음 슬롯. tick 슬롯 이름은 항상 새 이름이라 충돌이 없다.
+  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_pl_fill_${TAG}
+  ClearErrors
   Delete "$INSTDIR\${BIN}.prev.exe"
-  nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev.exe"'
-  Pop $R0
-  StrCmp $R0 "0" cys_swap_done_${TAG} 0
-  DetailPrint "cys: WARNING - no rollback copy for ${BIN}.exe (kill fallback; freshness gate still applies)"
-  Goto cys_swap_done_${TAG}
+  IfErrors cys_pl_s2_${TAG}
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev.exe" "${TAG}s1"
+  IfErrors cys_pl_s2_${TAG}
+  StrCpy ${SLOTVAR} "prev"
+  Goto cys_pl_fill_${TAG}
+cys_pl_s2_${TAG}:
+  ClearErrors
+  Delete "$INSTDIR\${BIN}.prev2.exe"
+  IfErrors cys_pl_s3_${TAG}
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev2.exe" "${TAG}s2"
+  IfErrors cys_pl_s3_${TAG}
+  StrCpy ${SLOTVAR} "prev2"
+  Goto cys_pl_fill_${TAG}
+cys_pl_s3_${TAG}:
+  ClearErrors
+  Delete "$INSTDIR\${BIN}.prev3.exe"
+  IfErrors cys_pl_stick_${TAG}
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev3.exe" "${TAG}s3"
+  IfErrors cys_pl_stick_${TAG}
+  StrCpy ${SLOTVAR} "prev3"
+  Goto cys_pl_fill_${TAG}
+cys_pl_stick_${TAG}:
+  ; tick 슬롯 — ★System::Call 출력은 반드시 `.R1`($R1)이다(`.r1` 은 $1). GetTickCount 는
+  ;   24.8일 후 음수가 되므로 마스킹해 숫자만 남긴다(음수 `-` 는 잔해 문법을 벗어난다).
+  System::Call 'kernel32::GetTickCount()i.R1'
+  IntOp $R1 $R1 & 0x7FFFFFFF
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.prev$R1.exe" "${TAG}s4"
+  IfErrors 0 cys_pl_stickok_${TAG}
+  ; 슬롯 전부 거부 — 정식은 손대지 않았다(구본 무손상). 거부하고 크게 알린다.
+  DetailPrint "cys: placement refused - could not move ${BIN}.exe aside (file busy)"
+  StrCpy $R4 "$R4 ${BIN}.exe(vacate-locked)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_stickok_${TAG}:
+  StrCpy ${SLOTVAR} "prev$R1"
+cys_pl_fill_${TAG}:
+  ; ⑥ 검증된 신본을 정식 이름으로 rename(채우기). 여기서부터 정식 부재 창 — 실패는 즉시
+  ;    구본 복귀로 닫는다.
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe" "${TAG}f"
+  IfErrors 0 cys_pl_rv_${TAG}
+  StrCmp ${SLOTVAR} "" cys_pl_fillfail_${TAG}
+  !insertmacro CYS_RESTORE_SLOT "${BIN}" "${TAG}rf" ${SLOTVAR}
+cys_pl_fillfail_${TAG}:
+  DetailPrint "cys: placement refused - could not move ${BIN}.new.exe into place"
+  StrCpy $R4 "$R4 ${BIN}.exe(fill-failed)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_rv_${TAG}:
+  ; ⑦ 재검증 — rename 은 내용을 바꾸지 않지만, AV 격리·파일시스템 이상이 그 사이에 끼어들
+  ;    수 있다. 미달이면 신본을 `.new` 로 되물리고 구본을 복귀시킨 뒤 거부한다.
+  !insertmacro CYS_ORACLE "${BIN}" "rv${TAG}" "${EXPHIGH}" "${EXPLOW}" $R2
+  StrCmp $R2 "fresh" cys_pl_commit_${TAG} 0
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.new.exe" "${TAG}rvv"
+  IfErrors cys_pl_rvstuck_${TAG}
+  StrCmp ${SLOTVAR} "" cys_pl_rvfail_${TAG}
+  !insertmacro CYS_RESTORE_SLOT "${BIN}" "${TAG}rv" ${SLOTVAR}
+cys_pl_rvfail_${TAG}:
+  DetailPrint "cys: placement refused - ${BIN}.exe failed re-verification after placement"
+  StrCpy $R4 "$R4 ${BIN}.exe(reverify-failed)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_rvstuck_${TAG}:
+  ; 재검증 미달본을 비울 수도 없다 — 정식 이름에 '무언가'는 있다(비우지 않는다 — R1).
+  ; 최종 바닥 점검(CYS_LASTDITCH)이 다시 판정한다.
+  DetailPrint "cys: placement refused - ${BIN}.exe failed re-verification (could not roll back)"
+  StrCpy $R4 "$R4 ${BIN}.exe(reverify-failed)"
+  StrCpy $R3 "fail"
+  Goto cys_pl_done_${TAG}
+cys_pl_commit_${TAG}:
+  ; ⑧ 이 바이너리는 완료. `.new` 이름은 rename 으로 이미 비었다(Delete 는 벨트). prev 슬롯은
+  ;    트랜잭션 전체가 끝날 때까지 남긴다(뒤 바이너리 실패 시 undo 재료 — 여기서 지우면
+  ;    트랜잭션이 성립하지 않는다).
+  Delete "$INSTDIR\${BIN}.new.exe"
+  ClearErrors
+cys_pl_done_${TAG}:
+  ClearErrors
+!macroend
 
-  ; ② 이름을 비운 즉시 정식 자리에 '잠기지 않은 동일 사본'을 세운다 (R1 핵심).
-  ;    - 이 사본은 실행 중이 아니므로 뒤따르는 File 추출이 정상 덮어쓴다(신본 반영).
-  ;    - 추출 전에 설치가 중단돼도 사용자에게는 구버전 CLI 가 그대로 남는다(소실 불가).
-  ;    ★copy 성공 판정은 **cmd 종료코드**로 한다(IfFileExists 는 '부분 복사' 를 성공으로 오판한다 —
-  ;      디스크가 도중에 차면 잘린 파일이 남고 copy 는 1 을 반환한다).
-  ;    ★copy 가 실패하면 **rename 을 되돌린다**: Rename 은 메타데이터 연산이라 디스크 부족으로
-  ;      실패하지 않고 부분 파일도 남기지 않으므로, 이 되돌리기로 '빈 자리 종단' 이 구조적으로
-  ;      사라진다(3 슬롯 전수 적용 — 각자 자기가 쓴 슬롯에서만 되돌린다. 공용 되돌리기를 두고
-  ;      prev→prev2→prev3 를 훑으면 이번에 밀어넣은 파일이 아니라 **직전 lame-duck 의 더 오래된
-  ;      사본**을 자리에 세울 수 있다).
-cys_swap_back1_${TAG}:
+; ── 매크로: 배치 완료된 바이너리 1종의 트랜잭션 undo (R3) ─────────────────────
+;   신본(정식)을 `.new` 로 되물리고 prev 슬롯의 구본을 복귀시킨다. 실패하면 $R3="undofail"
+;   — 호출측(POSTINSTALL)은 거기서 undo 를 멈춰 신본 집합의 접두(prefix) 성질을 지킨다
+;   (undo 를 계속 강행하면 "구 cys + 신 cysd" 세대 분할을 스스로 만들 수 있다).
+!macro CYS_UNPLACE BIN TAG SLOTVAR
+  StrCmp ${SLOTVAR} "" cys_up_done_${TAG}
+  ClearErrors
+  Delete "$INSTDIR\${BIN}.new.exe"
+  ClearErrors
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.exe" "$INSTDIR\${BIN}.new.exe" "${TAG}v"
+  IfErrors cys_up_stuck_${TAG}
+  !insertmacro CYS_RESTORE_SLOT "${BIN}" "${TAG}r" ${SLOTVAR}
+  IfErrors cys_up_norestore_${TAG}
+  StrCpy $R8 "$R8 ${BIN}.exe(not-updated)"
+  Goto cys_up_done_${TAG}
+cys_up_norestore_${TAG}:
+  ; 구본 복귀 실패 — 정식이 지금 비어 있다. 신본이라도 되세워 자리를 닫는다(R1 우선).
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe" "${TAG}n"
+  IfErrors 0 cys_up_keepnew_${TAG}
+  DetailPrint "cys: FATAL - ${BIN}.exe rollback lost both builds (final floor check will retry)"
+  StrCpy $R3 "undofail"
+  Goto cys_up_done_${TAG}
+cys_up_keepnew_${TAG}:
+  DetailPrint "cys: WARNING - could not roll back ${BIN}.exe to previous build; new build kept"
+  StrCpy $R3 "undofail"
+  Goto cys_up_done_${TAG}
+cys_up_stuck_${TAG}:
+  DetailPrint "cys: WARNING - could not roll back ${BIN}.exe (rename busy); new build kept"
+  StrCpy $R3 "undofail"
+cys_up_done_${TAG}:
+  ClearErrors
+!macroend
+
+; ── 매크로: 트랜잭션 커밋 후 슬롯 정리 (L6 · best-effort) ─────────────────────
+;   lame-duck 이 슬롯 파일로 실행 중이면 Delete 가 거부된다 — 무시한다(새 cysd 가 청소).
+!macro CYS_SLOT_CLEANUP BIN TAG SLOTVAR
+  StrCmp ${SLOTVAR} "" cys_sc_done_${TAG}
+  Delete "$INSTDIR\${BIN}.${SLOTVAR}.exe"
+  ClearErrors
+cys_sc_done_${TAG}:
+!macroend
+
+; ── 매크로: 최종 바닥 점검 (R1 의 기계적 집행 · 성공/실패 경로 공통) ──────────
+;   무엇이 어떻게 실패했든, 이 매크로 이후 정식 이름에는 '동작하는 실행물'이 있어야 한다.
+;   미달이면 `.new`(이번 빌드 — rename) → prev·prev2·prev3(구본 — copy, 실패 시 rename 승격)
+;   순으로 복구하고, 그래도 안 되면 $R6(unrecoverable · exit 3)에 기록한다. 복구가 구본으로
+;   이뤄지면 $R7(rolled-back)에 기록해 성공으로 위장하지 않는다.
+!macro CYS_LASTDITCH BIN TAG
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_ld_bad_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 cys_ld_done_${TAG} cys_ld_bad_${TAG} cys_ld_done_${TAG}
+cys_ld_bad_${TAG}:
+  DetailPrint "cys: EMERGENCY - ${BIN}.exe missing or truncated; restoring"
+  Delete "$INSTDIR\${BIN}.exe"
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_ld_p1_${TAG}
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe" "${TAG}n"
+  IfErrors cys_ld_p1_${TAG}
+  ; 이번 빌드로 복구됨 — 재검(크기)만 통과하면 보고 목록에 올리지 않는다.
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_ld_p1_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 cys_ld_done_${TAG} 0 cys_ld_done_${TAG}
+  Delete "$INSTDIR\${BIN}.exe"
+  ClearErrors
+cys_ld_p1_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev.exe" 0 cys_ld_p2_${TAG}
   nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R0
-  StrCmp $R0 "0" cys_swap_check_${TAG} 0
-  Delete "$INSTDIR\${BIN}.exe"                 ; 부분 사본 제거(Rename 은 대상이 존재하면 실패한다)
+  Pop $8
+  StrCmp $8 "0" cys_ld_mark_${TAG} 0
+  Delete "$INSTDIR\${BIN}.exe"
   ClearErrors
-  Rename "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe"
-  Goto cys_swap_undo_${TAG}
-cys_swap_back2_${TAG}:
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe" "${TAG}r1"
+  IfErrors cys_ld_p2_${TAG} cys_ld_mark_${TAG}
+cys_ld_p2_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev2.exe" 0 cys_ld_p3_${TAG}
   nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R0
-  StrCmp $R0 "0" cys_swap_check_${TAG} 0
+  Pop $8
+  StrCmp $8 "0" cys_ld_mark_${TAG} 0
   Delete "$INSTDIR\${BIN}.exe"
   ClearErrors
-  Rename "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe"
-  Goto cys_swap_undo_${TAG}
-cys_swap_back3_${TAG}:
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe" "${TAG}r2"
+  IfErrors cys_ld_p3_${TAG} cys_ld_mark_${TAG}
+cys_ld_p3_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev3.exe" 0 cys_ld_fatal_${TAG}
   nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R0
-  StrCmp $R0 "0" cys_swap_check_${TAG} 0
+  Pop $8
+  StrCmp $8 "0" cys_ld_mark_${TAG} 0
   Delete "$INSTDIR\${BIN}.exe"
   ClearErrors
-  Rename "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe"
-
-cys_swap_undo_${TAG}:
-  ; 되돌린 뒤에는 원본(잠긴 구본)이 정식 자리에 있다 → 추출이 스킵될 수 있고, 그 반쪽 상태는
-  ; POSTINSTALL 의 신선도 판정(R4)이 잡아 크게 실패시킨다. 여기서 Abort 하지 않는 이유는 종전과
-  ; 같다(설치 전체를 여기서 끊으면 다른 자산이 어중간하게 남는다).
-  DetailPrint "cys: staging copy of ${BIN}.exe failed - rename undone, previous build kept in place"
-
-cys_swap_check_${TAG}:
-  ; 복사 실패(디스크 부족 등)를 여기서 가시화한다. 치명 판정은 POSTINSTALL 이 최종적으로 내린다
-  ; (여기서 Abort 하면 이미 자리가 빈 채로 끝나 R1 을 스스로 어긴다).
-  IfFileExists "$INSTDIR\${BIN}.exe" cys_swap_done_${TAG} 0
-  DetailPrint "cys: WARNING - could not stage a working copy of ${BIN}.exe (checked again at end of install)"
-
-cys_swap_done_${TAG}:
+  !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe" "${TAG}r3"
+  IfErrors cys_ld_fatal_${TAG} cys_ld_mark_${TAG}
+cys_ld_mark_${TAG}:
   ClearErrors
-!macroend
-
-; ── 매크로: 파일 1개의 '지문' 산출 (R4) ───────────────────────────────────────
-;   지문 = "<바이트 크기>/<최종수정시각 상위>/<최종수정시각 하위>" · 파일이 없으면 "ABSENT".
-;   순수 NSIS(FileOpen/FileSeek/GetFileTime)만 쓴다 — PowerShell 이 막힌 기업 정책 PC 에서도
-;   '측정 자체가 못 돌아 조용히 통과' 하는 일이 없어야 하기 때문(R2 와 동일 원칙).
-;   OUT 에는 결과를 받을 레지스터를 넘긴다(예: $R1). 내부에서 $R2·$R3·$R4·$R5 를 덮어쓴다.
-!macro CYS_FINGERPRINT BIN TAG OUT
-  StrCpy ${OUT} "ABSENT"
-  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_fp_done_${TAG}
-  ClearErrors
-  FileOpen $R5 "$INSTDIR\${BIN}.exe" r
-  IfErrors cys_fp_done_${TAG}                  ; 열 수 없으면 ABSENT 로 둔다(= 비교에서 불일치 처리)
-  FileSeek $R5 0 END $R4
-  FileClose $R5
-  StrCpy $R2 "x"                               ; GetFileTime 이 실패해도 직전 값이 새지 않게 선초기화
-  StrCpy $R3 "x"
-  ClearErrors
-  GetFileTime "$INSTDIR\${BIN}.exe" $R2 $R3
-  StrCpy ${OUT} "$R4/$R2/$R3"
-cys_fp_done_${TAG}:
-  ClearErrors
-!macroend
-
-; ── 매크로: 추출 직전 지문을 $PLUGINSDIR 에 적어둔다 (R4 · PREINSTALL 전용) ────
-;   $PLUGINSDIR 를 쓰는 이유: 설치기 프로세스 1회 실행 동안만 살고 종료 시 자동 삭제된다
-;   (사용자 폴더에 잔해를 남기지 않는다). 레지스터로 넘기지 않는 이유: PREINSTALL 과
-;   POSTINSTALL 사이에 템플릿 코드(CheckIfAppIsRunning·File·GetSize·바로가기 함수)가 돌아
-;   $R* 생존을 보장할 수 없다.
-!macro CYS_SNAPSHOT_PRE BIN TAG
-  !insertmacro CYS_FINGERPRINT "${BIN}" "pre${TAG}" $R1
-  ClearErrors
-  FileOpen $R0 "$PLUGINSDIR\cys-pre-${BIN}.txt" w
-  IfErrors cys_snap_done_${TAG}
-  FileWrite $R0 "$R1"                          ; 개행 없이 딱 지문만 — POSTINSTALL 은 통째로 StrCmp
-  FileClose $R0
-cys_snap_done_${TAG}:
-  ClearErrors
-!macroend
-
-; ── 매크로: 신본 반영 판정 (R4 · POSTINSTALL 전용) ────────────────────────────
-;   $R9 = "same"(같은 버전 재설치/증거 없음)이면 판정을 면제한다.
-;   결과 누적: $R8 = 신본 미반영 목록.
-!macro CYS_ENSURE_FRESH BIN TAG
-  StrCmp $R9 "same" cys_fr_done_${TAG}
-  !insertmacro CYS_FINGERPRINT "${BIN}" "post${TAG}" $R1
-  ClearErrors
-  FileOpen $R0 "$PLUGINSDIR\cys-pre-${BIN}.txt" r
-  IfErrors cys_fr_unver_${TAG}
-  FileRead $R0 $R2
-  FileClose $R0
-  StrCmp $R2 "" cys_fr_unver_${TAG}
-  StrCmp $R2 $R1 0 cys_fr_done_${TAG}          ; 지문이 달라졌다 = 이번 추출이 썼다(신본) → 통과
-  StrCpy $R8 "$R8 ${BIN}.exe(not-updated)"     ; 그대로다 = 추출이 못 건드렸다(구본 잔존)
-  Goto cys_fr_done_${TAG}
-cys_fr_unver_${TAG}:
-  ; 추출 직전 지문을 못 남겼거나 못 읽었다 = '신본이 들어왔다'를 증명할 수 없다.
-  ; 측정 불능을 통과로 취급하지 않는다(fail-closed).
-  StrCpy $R8 "$R8 ${BIN}.exe(unverified)"
-cys_fr_done_${TAG}:
-  ClearErrors
-!macroend
-
-; ── 매크로: 설치 종료 시 필수 실행물 1개 검증 + 자동 원복 (R2) ────────────────
-;   결과 누적: $R6 = 복구 불가 목록 / $R7 = 원복은 됐으나 신본 미반영 목록.
-;   두 목록 중 하나라도 비지 않으면 POSTINSTALL 이 크게 실패시킨다.
-;   ★판정(존재·크기)은 순수 NSIS 명령(FileOpen/FileSeek/IntCmp)만 쓴다 — PowerShell 이 막힌
-;   기업 정책 PC 에서도 '검증 자체가 못 돌아 조용히 통과'하는 일이 없게 한다. 복구 행위(copy)만
-;   cmd 를 쓰며, 그 성공 여부도 다시 순수 NSIS 로 재검사한다(recheck).
-!macro CYS_ENSURE_CRITICAL BIN TAG
-  ClearErrors
-  FileOpen $R5 "$INSTDIR\${BIN}.exe" r
-  IfErrors cys_ens_bad_${TAG}
-  FileSeek $R5 0 END $R4
-  FileClose $R5
-  ; 64KB 미만 = 추출 중단·절단·격리 잔해. 정상 Rust 바이너리는 수 MB 라 오탐 여지가 없다.
-  IntCmp $R4 65536 cys_ens_done_${TAG} cys_ens_bad_${TAG} cys_ens_done_${TAG}
-
-cys_ens_bad_${TAG}:
-  ; 원복: prev → prev2 → prev3 중 첫 실재본을 정식 이름으로 되돌린다.
-  ; ★copy 가 실패하면(디스크 부족·부분 복사) **rename 으로 승격**한다: 여기서의 최우선 목표는
-  ;   "사용자 기계에 동작하는 실행물이 정식 이름으로 있다" 이고, Rename 은 메타데이터 연산이라
-  ;   공간 부족으로 실패하지 않는다. 대가로 prev 슬롯을 소모하지만(사본이 아니라 이동),
-  ;   그 파일로 실행 중인 lame-duck 프로세스는 열린 핸들을 그대로 따라가므로 죽지 않는다.
-  ;   Delete 를 먼저 하는 이유: Rename 은 대상 파일이 존재하면 실패한다(잘린 사본 제거).
-  IfFileExists "$INSTDIR\${BIN}.prev.exe" 0 cys_ens_p2_${TAG}
-  nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R5
-  StrCmp $R5 "0" cys_ens_recheck_${TAG} 0
-  Delete "$INSTDIR\${BIN}.exe"
-  ClearErrors
-  Rename "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe"
-  Goto cys_ens_recheck_${TAG}
-cys_ens_p2_${TAG}:
-  IfFileExists "$INSTDIR\${BIN}.prev2.exe" 0 cys_ens_p3_${TAG}
-  nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R5
-  StrCmp $R5 "0" cys_ens_recheck_${TAG} 0
-  Delete "$INSTDIR\${BIN}.exe"
-  ClearErrors
-  Rename "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe"
-  Goto cys_ens_recheck_${TAG}
-cys_ens_p3_${TAG}:
-  IfFileExists "$INSTDIR\${BIN}.prev3.exe" 0 cys_ens_fatal_${TAG}
-  nsExec::Exec 'cmd /c copy /y /b "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe"'
-  Pop $R5
-  StrCmp $R5 "0" cys_ens_recheck_${TAG} 0
-  Delete "$INSTDIR\${BIN}.exe"
-  ClearErrors
-  Rename "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe"
-
-cys_ens_recheck_${TAG}:
-  ClearErrors
-  FileOpen $R5 "$INSTDIR\${BIN}.exe" r
-  IfErrors cys_ens_fatal_${TAG}
-  FileSeek $R5 0 END $R4
-  FileClose $R5
-  IntCmp $R4 65536 0 cys_ens_fatal_${TAG} 0
-  ; 원복 성공 = 기계는 살았지만 업그레이드는 반영되지 않았다. 성공으로 위장하지 않는다.
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_ld_fatal_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 cys_ld_rolled_${TAG} cys_ld_fatal_${TAG} cys_ld_rolled_${TAG}
+cys_ld_rolled_${TAG}:
   StrCpy $R7 "$R7 ${BIN}.exe"
-  Goto cys_ens_done_${TAG}
-
-cys_ens_fatal_${TAG}:
+  Goto cys_ld_done_${TAG}
+cys_ld_fatal_${TAG}:
+  DetailPrint "cys: FATAL - ${BIN}.exe could not be restored from any material"
   StrCpy $R6 "$R6 ${BIN}.exe"
-
-cys_ens_done_${TAG}:
+cys_ld_done_${TAG}:
   ClearErrors
 !macroend
+
+; ── 매크로: 중단 콜백 구조 (R1 · 콜백 전용) ───────────────────────────────────
+;   설치가 어느 시점에 중단되든(사용자 취소·Abort — 배치 rename 2회 사이 포함) 정식 이름을
+;   비워 두지 않는다: 부재 시 `.new`(이번 빌드) → prev 체인(구본) 순 rename 승격. 정식이
+;   있으면 `.new` 스테이징 잔해만 지운다(정식 존재 시에만 지운다 — cysd 가드와 같은 규칙).
+;   ★콜백 제약: 런타임 변수·리터럴만 사용(템플릿 define 금지 — 훅이 먼저 include 된다).
+!macro CYS_ABORT_RESCUE BIN TAG
+  IfFileExists "$INSTDIR\${BIN}.exe" cys_ar_clean_${TAG} 0
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_ar_p1_${TAG}
+  Rename "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe"
+  IfErrors cys_ar_p1_${TAG} cys_ar_done_${TAG}
+cys_ar_p1_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev.exe" 0 cys_ar_p2_${TAG}
+  Rename "$INSTDIR\${BIN}.prev.exe" "$INSTDIR\${BIN}.exe"
+  IfErrors cys_ar_p2_${TAG} cys_ar_done_${TAG}
+cys_ar_p2_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev2.exe" 0 cys_ar_p3_${TAG}
+  Rename "$INSTDIR\${BIN}.prev2.exe" "$INSTDIR\${BIN}.exe"
+  IfErrors cys_ar_p3_${TAG} cys_ar_done_${TAG}
+cys_ar_p3_${TAG}:
+  ClearErrors
+  IfFileExists "$INSTDIR\${BIN}.prev3.exe" 0 cys_ar_done_${TAG}
+  Rename "$INSTDIR\${BIN}.prev3.exe" "$INSTDIR\${BIN}.exe"
+  Goto cys_ar_done_${TAG}
+cys_ar_clean_${TAG}:
+  Delete "$INSTDIR\${BIN}.new.exe"
+cys_ar_done_${TAG}:
+  ClearErrors
+!macroend
+
+; 콜백 정의 — 실측(tauri-cli v2.11.4 installer.nsi): 템플릿은 .onInstFailed/.onUserAbort 를
+; 정의하지 않는다(.onInit/.onInstSuccess/un.onInit 만). 충돌 없음.
+Function .onInstFailed
+  !insertmacro CYS_ABORT_RESCUE "cys" "if1"
+  !insertmacro CYS_ABORT_RESCUE "cysd" "if2"
+  !insertmacro CYS_ABORT_RESCUE "cys-app" "if3"
+FunctionEnd
+
+Function .onUserAbort
+  !insertmacro CYS_ABORT_RESCUE "cys" "ua1"
+  !insertmacro CYS_ABORT_RESCUE "cysd" "ua2"
+  !insertmacro CYS_ABORT_RESCUE "cys-app" "ua3"
+FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
-  ; ① GUI만 종료(세션은 데몬 소유 — 무손실). updater 경로면 이미 종료 중이라 멱등. (L1)
-  nsExec::Exec 'taskkill /F /T /IM cys-app.exe'
+  ; ① GUI만 종료 — ★/T 금지(L1): GUI 가 cysd 를 평범한 자식으로 스폰하므로 트리 kill 은
+  ;    데몬과 전 PTY 세션을 함께 죽인다(0.14.27 실측 결함). updater 경로면 이미 종료 중이라
+  ;    멱등. 세션은 데몬 소유 — 무손실.
+  nsExec::Exec 'taskkill /F /IM cys-app.exe'
   Pop $R0
 
   ; ★잠금 스윕 일반화(2026-07-02 실장애: msys-2.0.dll Can't write → Installation Aborted).
-  ; 라이브 세션 셸(claude의 bash 훅 등)이 로드한 runtime 이미지(.exe/.dll)는 '덮어쓰기'가 잠기지만
-  ; 'rename'은 허용된다(로드된 PE 이미지의 Windows 특성 — rename-swap과 동일 원리의 전수 일반화).
+  ; 라이브 세션 셸(claude의 bash 훅 등)이 로드한 runtime 이미지(.exe/.dll/.pyd/.node)는
+  ; '덮어쓰기'가 잠기지만 'rename'은 허용된다(로드된 PE 이미지의 Windows 특성).
   ; 잠긴 이미지 파일만 <이름>.prev<rand>로 밀어 이름을 비운다 → 추출이 전부 성공.
   ; 잔해(*.prev*)는 새 cysd 기동이 재귀 청소(P1b·L6). 스크립트는 $PLUGINSDIR에 생성(따옴표 지옥 회피).
   ; ★사정거리 축소(L4)+핵심 3종 제외(L5): 설치 루트는 기본 데몬 state dir 와 같은 폴더라
   ;   재귀 스윕이 세션 DB·로그 수천 개를 훑는다. runtime\ 재귀 + 루트 최상위 1단만 본다.
-  ;   그리고 cys/cysd/cys-app 은 아래 rename-copy 3단이 전담하므로 스윕이 절대 만지지 않는다
-  ;   (만지면 정식 자리를 비워 R1 이 무너진다 — 이번 실사고의 재발 경로).
-  ; ★스윕이 rename 을 시도하려면 원본이 먼저 잠겨 있어야 하므로, 아래 rename-copy 3단보다
-  ;   **먼저** 돈다(사본을 세운 뒤에 스윕하면 갓 만든 사본이 스윕 대상이 될 수 있다).
+  ;   그리고 cys/cysd/cys-app 은 POSTINSTALL 의 잠금 무관 배치가 전담하므로 스윕이 절대
+  ;   만지지 않는다(만지면 정식 자리를 비워 R1 이 무너진다).
+  ;   결과는 `cys-sweep: scanned=N renamed=M` 한 줄로 상세로그에 남는다(CI 가 인용하는 토큰).
   FileOpen $R0 "$PLUGINSDIR\unlock-sweep.ps1" w
   FileWrite $R0 'param([string]$$Root)$\r$\n'
   FileWrite $R0 '$$ErrorActionPreference = "SilentlyContinue"$\r$\n'
   FileWrite $R0 '$$skip = @("cys.exe","cysd.exe","cys-app.exe")$\r$\n'
+  FileWrite $R0 '$$exts = @(".exe",".dll",".pyd",".node")$\r$\n'
+  FileWrite $R0 '$$scanned = 0$\r$\n'
+  FileWrite $R0 '$$renamed = 0$\r$\n'
   FileWrite $R0 '$$targets = @()$\r$\n'
   FileWrite $R0 '$$rt = Join-Path $$Root "runtime"$\r$\n'
   FileWrite $R0 'if (Test-Path -LiteralPath $$rt) { $$targets += Get-ChildItem -LiteralPath $$rt -Recurse -File }$\r$\n'
   FileWrite $R0 '$$targets += Get-ChildItem -LiteralPath $$Root -File$\r$\n'
   FileWrite $R0 'foreach ($$f in $$targets) {$\r$\n'
-  FileWrite $R0 '  if ($$f.Extension -ne ".exe" -and $$f.Extension -ne ".dll") { continue }$\r$\n'
+  FileWrite $R0 '  if ($$exts -notcontains $$f.Extension) { continue }$\r$\n'
   FileWrite $R0 '  if ($$f.Name -like "*.prev*") { continue }$\r$\n'
   FileWrite $R0 '  if ($$skip -contains $$f.Name) { continue }$\r$\n'
+  FileWrite $R0 '  $$scanned++$\r$\n'
   FileWrite $R0 '  try { $$s = [IO.File]::Open($$f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); $$s.Close() }$\r$\n'
-  FileWrite $R0 '  catch { try { [IO.File]::Move($$f.FullName, $$f.FullName + ".prev" + (Get-Random -Maximum 99999)) } catch {} }$\r$\n'
+  FileWrite $R0 '  catch { try { [IO.File]::Move($$f.FullName, $$f.FullName + ".prev" + (Get-Random -Maximum 99999)); $$renamed++ } catch {} }$\r$\n'
   FileWrite $R0 '}$\r$\n'
+  FileWrite $R0 'Write-Output ("cys-sweep: scanned=" + $$scanned + " renamed=" + $$renamed)$\r$\n'
   FileClose $R0
   nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\unlock-sweep.ps1" "$INSTDIR"'
   Pop $R0
 
-  ; ② cysd.exe·cys.exe 는 죽이지 않고 rename → 즉시 사본으로 자리 복원 (R1·L2)
-  !insertmacro CYS_SWAP_IN_PLACE "cysd" "cysd"
-  !insertmacro CYS_SWAP_IN_PLACE "cys" "cys"
-
-  ; ③ ★추출 직전 지문 스냅샷 (R4) — 반드시 위 스테이징 **뒤**, File 추출 **앞** 이어야 한다.
-  ;    여기서 재는 값이 "추출이 손대기 직전의 상태" 이고, POSTINSTALL 이 같은 자를 다시 대어
-  ;    '이번 실행이 이 파일을 썼는가' 를 결정론으로 판정한다.
-  !insertmacro CYS_SNAPSHOT_PRE "cys" "cys"
-  !insertmacro CYS_SNAPSHOT_PRE "cysd" "cysd"
-  !insertmacro CYS_SNAPSHOT_PRE "cys-app" "cysapp"
-
-  ; ④ ★직전 설치 버전 증거 수집 (R4 면제 판정 · 같은 버전 재설치 오탐 차단).
-  ;    출처 ① 레지스트리 DisplayVersion — 템플릿은 이 값을 **추출 뒤에** 덮어쓰므로,
-  ;             '직전 설치 버전' 을 볼 수 있는 시점은 PREINSTALL 뿐이다.
-  ;    출처 ② 마커 파일 — 지난 설치가 **신선도 게이트를 통과한 뒤에만** 남긴 기록이라
-  ;             레지스트리보다 진실에 가깝다(중단·실패한 설치는 마커를 갱신하지 않는다).
-  ;    판정: 어느 출처든 이번 ${VERSION} 과 같으면 "same"(면제) · 둘 다 비어 '증거 없음' 이어도
-  ;          "same"(고발하지 않는다) · 구체적 구버전이 하나라도 있으면 "diff"(신본 반영 강제).
-  StrCpy $R1 ""
-  StrCpy $R2 ""
-  !ifdef UNINSTKEY
-    ReadRegStr $R1 SHCTX "${UNINSTKEY}" "DisplayVersion"
-  !else
-    ReadRegStr $R1 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "DisplayVersion"
-  !endif
-  ClearErrors
-  FileOpen $R3 "$INSTDIR\cys-installed-version.txt" r
-  IfErrors cys_pre_ver_judge
-  FileRead $R3 $R2
-  FileClose $R3
-cys_pre_ver_judge:
-  ClearErrors
-  StrCpy $R4 "same"
-  StrCmp $R1 "${VERSION}" cys_pre_ver_write 0
-  StrCmp $R2 "${VERSION}" cys_pre_ver_write 0
-  StrCmp $R1 "" 0 cys_pre_ver_diff
-  StrCmp $R2 "" cys_pre_ver_write 0
-cys_pre_ver_diff:
-  StrCpy $R4 "diff"
-cys_pre_ver_write:
-  ClearErrors
-  FileOpen $R0 "$PLUGINSDIR\cys-pre-version.txt" w
-  IfErrors cys_pre_ver_done
-  FileWrite $R0 "$R4"
-  FileClose $R0
-cys_pre_ver_done:
-  ClearErrors
-
   ; 벨트-앤-브레이스: 스윕이 못 민 잔여 잠금 파일은 스킵하고 설치를 계속한다(Abort 금지).
   ; runtime은 버전 핀 고정(PortableGit·Python·uv·node)이라 스킵=동일 내용이 사실상 전부다.
-  ; ★단, 이 침묵은 runtime 잔여물에만 허용된다 — 필수 실행물 3종의 침묵은 POSTINSTALL 이 깨뜨린다(R2).
+  ; ★단, 이 침묵은 runtime 잔여물에만 허용된다 — 필수 실행물 3종은 POSTINSTALL 의 배치와
+  ;   오라클이 결정론으로 판정한다(추출 성공 여부와 무관).
   SetOverwrite try
   ClearErrors                                 ; 훅 종료 시 에러 플래그 잔류로 설치기 오판 방지
   Sleep 500
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; ★필수 실행물 검증 게이트 (R2 · 2026-08-01). 이 시점에는 모든 File 추출이 끝나 있다.
-  ; 여기까지 도달하지 못하는 중단(CheckIfAppIsRunning Abort·사용자 취소 등)은 R1 이 이미
-  ; '구버전 동작본이 정식 자리에 있는 상태'로 만들어 두었으므로 소실이 아니다.
-  StrCpy $R6 ""     ; 복구 불가(존재하지 않거나 잘렸고 원복도 실패)
-  StrCpy $R7 ""     ; 구본으로 원복됨(기계는 살았으나 업그레이드 미반영)
-  StrCpy $R8 ""     ; 신본 미반영(파일은 멀쩡하나 이번 추출이 못 들어왔다 — R4)
-  !insertmacro CYS_ENSURE_CRITICAL "cys" "cys"
-  !insertmacro CYS_ENSURE_CRITICAL "cysd" "cysd"
-  !insertmacro CYS_ENSURE_CRITICAL "cys-app" "cysapp"
+  ; cys-app 의 오라클 기대값 — 원본은 템플릿 define ${MAINBINARYSRCPATH}. 훅 최상단에서는
+  ; 쓸 수 없고(훅이 먼저 include), 매크로 본문은 !insertmacro 시점(템플릿 Section 내부)에
+  ; 평가되므로 여기서는 유효하다. VERSIONINFO 부재는 빌드 실패(/noerrors 금지).
+  !ifndef CYS_V_APP_High
+    !if ! /FileExists "${MAINBINARYSRCPATH}"
+      !error "cys hook: main binary source not found at compile time: ${MAINBINARYSRCPATH}"
+    !endif
+    !getdllversion /packed "${MAINBINARYSRCPATH}" CYS_V_APP_
+    !if "${CYS_V_APP_High}" == ""
+      !error "cys hook: no VERSIONINFO readable in ${MAINBINARYSRCPATH} - refusing to build a blind oracle"
+    !endif
+    !if "${CYS_V_APP_High}" == "0"
+    !if "${CYS_V_APP_Low}" == "0"
+      !error "cys hook: ${MAINBINARYSRCPATH} is stamped 0.0.0.0 - version resource regression"
+    !endif
+    !endif
+  !endif
+
+  ; ★잠금 무관 배치 (R2·R3 · IMPL-SPEC §W4-B). 이 시점에는 모든 File 추출이 끝나 있다.
+  ;   - 추출이 이미 신본을 앉혔으면(비잠금 경로) 오라클이 단락한다.
+  ;   - 잠겨서 추출이 스킵됐으면 `.new` 추출→검증→rename 2회로 배치한다.
+  ;   순서 고정 cys → cysd → cys-app (R3: 실패 시에도 세대 집합이 항상 prefix).
+  StrCpy $R4 ""     ; placement-refused (구본 무손상 · 신본 미반영)
+  StrCpy $R6 ""     ; unrecoverable (정식 부재·절단 + 복구 전멸 — 최악)
+  StrCpy $R7 ""     ; rolled-back (비상 복구로 구본 복귀 — 기계는 살았으나 미반영)
+  StrCpy $R8 ""     ; not-updated (트랜잭션 undo 로 구본 복귀)
+  StrCpy $5 ""
+  StrCpy $6 ""
+  StrCpy $7 ""
+  SetOverwrite try
+  !insertmacro CYS_PLACE "cys" "cys" "${CYS_SRC_CYS}" "${CYS_V_CYS_High}" "${CYS_V_CYS_Low}" $5
+  StrCmp $R3 "fail" cys_txn_undo 0
+  !insertmacro CYS_PLACE "cysd" "cysd" "${CYS_SRC_CYSD}" "${CYS_V_CYSD_High}" "${CYS_V_CYSD_Low}" $6
+  StrCmp $R3 "fail" cys_txn_undo 0
+  !insertmacro CYS_PLACE "cys-app" "cysapp" "${MAINBINARYSRCPATH}" "${CYS_V_APP_High}" "${CYS_V_APP_Low}" $7
+  StrCmp $R3 "fail" cys_txn_undo 0
+  Goto cys_txn_commit
+
+cys_txn_undo:
+  ; 역순 undo. "undofail" 이 뜨면 그 자리에서 멈춘다(prefix 보존 — 위 CYS_UNPLACE 주석).
+  !insertmacro CYS_UNPLACE "cys-app" "ucysapp" $7
+  StrCmp $R3 "undofail" cys_txn_after 0
+  !insertmacro CYS_UNPLACE "cysd" "ucysd" $6
+  StrCmp $R3 "undofail" cys_txn_after 0
+  !insertmacro CYS_UNPLACE "cys" "ucys" $5
+  Goto cys_txn_after
+
+cys_txn_commit:
+  ; 3종 전부 반영 — 이제야 undo 재료(prev 슬롯)를 놓아준다(L6 · best-effort).
+  !insertmacro CYS_SLOT_CLEANUP "cys" "ccys" $5
+  !insertmacro CYS_SLOT_CLEANUP "cysd" "ccysd" $6
+  !insertmacro CYS_SLOT_CLEANUP "cys-app" "ccysapp" $7
+
+cys_txn_after:
+  ; ★최종 바닥 점검 (R1) — 성공·실패 어느 경로든 정식 3종이 '동작본'인지 기계로 확인한다.
+  !insertmacro CYS_LASTDITCH "cys" "ldcys"
+  !insertmacro CYS_LASTDITCH "cysd" "ldcysd"
+  !insertmacro CYS_LASTDITCH "cys-app" "ldcysapp"
 
   StrCmp $R6 "" 0 cys_post_fail
   StrCmp $R7 "" 0 cys_post_fail
-
-  ; ★신선도 게이트 (R4) — 3종이 '존재·유효' 로 확인된 뒤에만 "그런데 그게 신본인가?" 를 묻는다.
-  ; (원복이 일어났다면 지문이 당연히 바뀌므로, 그 경우는 위에서 이미 실패로 갈린다.)
-  ; 면제 판정($R9)은 PREINSTALL 이 적어둔 결론을 그대로 읽는다 — 직전 설치 버전은 이 시점에
-  ; 이미 신 버전으로 덮여 있어 여기서 다시 계산할 수 없다.
-  StrCpy $R9 "diff"
-  ClearErrors
-  FileOpen $R5 "$PLUGINSDIR\cys-pre-version.txt" r
-  IfErrors cys_post_verdone
-  FileRead $R5 $R4
-  FileClose $R5
-  StrCmp $R4 "same" 0 cys_post_verdone
-  StrCpy $R9 "same"
-cys_post_verdone:
-  ClearErrors
-  !insertmacro CYS_ENSURE_FRESH "cys" "cys"
-  !insertmacro CYS_ENSURE_FRESH "cysd" "cysd"
-  !insertmacro CYS_ENSURE_FRESH "cys-app" "cysapp"
-  StrCmp $R8 "" cys_post_ok cys_post_fail
+  StrCmp $R8 "" 0 cys_post_fail
+  StrCmp $R4 "" 0 cys_post_fail
+  Goto cys_post_ok
 
 cys_post_fail:
-  ; 큰 소리로 중단한다 — 조용한 반쪽 설치(신 runtime + 구 CLI)는 이번 사고의 본질이었다.
-  ; 흔적을 파일로도 남긴다(무인/silent 설치의 유일한 사후 판독원).
-  ; 종료코드: 3 = 실행물이 없거나 구본으로 원복됨 / 4 = 파일은 멀쩡하나 신본 미반영(구본 잔존).
-  StrCpy $R3 3
+  ; 큰 소리로 중단한다 — 조용한 반쪽 설치(신 runtime + 구 CLI)는 T3 사고의 본질이었다.
+  ; 흔적을 파일로도 남긴다(무인/silent 설치의 유일한 사후 판독원). 토큰 스키마는 동결
+  ; (NSIS-CONTRACT.md) — 소비자: CI T4-13 · 체크리스트 P5 · GUI 리더(Release B).
+  ; 종료코드: 3 = 정식이 없거나 구본으로 비상 복구됨 / 4 = 구본 무손상·신본 미반영(거부).
+  StrCpy $3 3
   StrCmp $R6 "" 0 cys_post_lvl
   StrCmp $R7 "" 0 cys_post_lvl
-  StrCpy $R3 4
+  StrCpy $3 4
 cys_post_lvl:
-  FileOpen $R4 "$INSTDIR\cys-install-failure.txt" w
-  FileWrite $R4 "cys installer: critical executable verification FAILED (exit $R3)$\r$\n"
-  FileWrite $R4 "unrecoverable:$R6$\r$\n"
-  FileWrite $R4 "rolled-back-to-previous:$R7$\r$\n"
-  FileWrite $R4 "not-updated:$R8$\r$\n"
-  FileWrite $R4 "Action: re-run the cys installer. Existing sessions were not killed.$\r$\n"
-  FileWrite $R4 "Note: 'not-updated' means the old build is still in place and works;$\r$\n"
-  FileWrite $R4 "      the new files could not be written (file in use / blocked).$\r$\n"
-  FileClose $R4
-  DetailPrint "cys: FATAL - executable verification failed.  unrecoverable:$R6  rolled-back:$R7  not-updated:$R8"
+  ClearErrors
+  FileOpen $4 "$INSTDIR\cys-install-failure.txt" w
+  IfErrors cys_post_nofile
+  FileWrite $4 "cys installer: critical executable verification FAILED (exit $3)$\r$\n"
+  FileWrite $4 "unrecoverable:$R6$\r$\n"
+  FileWrite $4 "rolled-back-to-previous:$R7$\r$\n"
+  FileWrite $4 "not-updated:$R8$\r$\n"
+  FileWrite $4 "placement-refused:$R4$\r$\n"
+  FileWrite $4 "Action: Do NOT uninstall. Quit cys from the app (it saves sessions),$\r$\n"
+  FileWrite $4 "        wait 10 s, run this installer again and choose 'Do not uninstall'.$\r$\n"
+  FileWrite $4 "Note: tokens above name binaries whose old build is still in place;$\r$\n"
+  FileWrite $4 "      the new files could not be written (file in use / blocked).$\r$\n"
+  FileClose $4
+cys_post_nofile:
+  ClearErrors
+  DetailPrint "cys: FATAL - executable verification failed.  unrecoverable:$R6  rolled-back:$R7  not-updated:$R8  placement-refused:$R4"
   ; 콘솔이 붙어 있으면(silent/CI) 표준출력으로도 외친다 — 템플릿 자체의 실패 통보와 동일 패턴.
   System::Call 'kernel32::AttachConsole(i -1)i.r0'
   StrCmp $0 0 cys_post_nocon 0
   System::Call 'kernel32::GetStdHandle(i -11)i.r0'
-  FileWrite $0 "cys installer FAILED: executable verification.  unrecoverable:$R6  rolled-back:$R7  not-updated:$R8$\r$\n"
+  FileWrite $0 "cys installer FAILED: executable verification.  unrecoverable:$R6  rolled-back:$R7  not-updated:$R8  placement-refused:$R4$\r$\n"
 cys_post_nocon:
   IfSilent cys_post_abort 0
-  MessageBox MB_ICONSTOP "cys installation did not complete correctly.$\r$\n$\r$\nMissing:$R6$\r$\nRolled back to previous:$R7$\r$\nNot updated (old build still in place):$R8$\r$\n$\r$\nYour existing cys still works and no sessions were killed.$\r$\nSee cys-install-failure.txt in the install folder, then run the installer again."
+  MessageBox MB_ICONSTOP "cys installation did not complete correctly.$\r$\n$\r$\nMissing:$R6$\r$\nRolled back to previous:$R7$\r$\nNot updated (old build still in place):$R8$\r$\nPlacement refused (old build still in place):$R4$\r$\n$\r$\nYour existing cys still works and no sessions were killed.$\r$\nDo NOT uninstall. Quit cys from the app (it saves sessions), wait 10 s,$\r$\nthen run this installer again and choose 'Do not uninstall'.$\r$\nSee cys-install-failure.txt in the install folder."
 cys_post_abort:
   ; SetErrorLevel 은 리터럴로만 쓴다(변수 인자 지원 여부를 mac 개발기에서 컴파일로 확인할 수
   ; 없으므로, 검증 못 한 문법에 릴리스를 걸지 않는다 — 분기 4줄이 그 불확실성보다 싸다).
-  StrCmp $R3 "4" 0 cys_post_lvl3
+  StrCmp $3 "4" 0 cys_post_lvl3
   SetErrorLevel 4
   Goto cys_post_end
 cys_post_lvl3:
@@ -500,14 +646,14 @@ cys_post_end:
 
 cys_post_ok:
   Delete "$INSTDIR\cys-install-failure.txt"   ; 지난 실패 흔적 청소(성공 시에만)
-  ; ★버전 마커 — **모든 게이트를 통과한 뒤에만** 쓴다. 다음 설치가 '직전에 실제로 반영된 버전'
-  ; 을 알아 같은 버전 재설치를 면제 판정할 수 있게 하는 근거이며(R4), 레지스트리와 달리
-  ; 실패한 설치로는 갱신되지 않는다(중단 시 옛 값 그대로 = 진실).
+  ; ★버전 마커 — **모든 게이트를 통과한 뒤에만** 쓴다. 오라클 도입으로 판정 재료는 아니게
+  ; 됐지만(정보성), 실패한 설치로는 갱신되지 않는 '직전 반영 버전' 기록으로 유지한다
+  ; (제거 시 삭제 목록·CI·가이드가 아는 이름 — NSIS-CONTRACT.md).
   ClearErrors
-  FileOpen $R4 "$INSTDIR\cys-installed-version.txt" w
+  FileOpen $4 "$INSTDIR\cys-installed-version.txt" w
   IfErrors cys_post_nomarker
-  FileWrite $R4 "${VERSION}"
-  FileClose $R4
+  FileWrite $4 "${VERSION}"
+  FileClose $4
 cys_post_nomarker:
   ClearErrors
 
@@ -540,14 +686,16 @@ cys_post_nomarker:
   nsExec::Exec 'taskkill /F /T /IM cys.prev3.exe'
   Pop $R0
   Sleep 1000
-  Delete "$INSTDIR\cysd.prev.exe"
-  Delete "$INSTDIR\cysd.prev2.exe"
-  Delete "$INSTDIR\cysd.prev3.exe"
-  Delete "$INSTDIR\cys.prev.exe"
-  Delete "$INSTDIR\cys.prev2.exe"
-  Delete "$INSTDIR\cys.prev3.exe"
+  ; 이름 스코프 와일드카드 — tick 슬롯(`<bin>.prev<숫자>.exe`)까지 잡는다. $INSTDIR 는
+  ; 사용자 데이터가 있는 state dir 라 광범위 와일드카드는 금지(우리 이름 문법만).
+  Delete "$INSTDIR\cys.new.exe"
+  Delete "$INSTDIR\cysd.new.exe"
+  Delete "$INSTDIR\cys-app.new.exe"
+  Delete "$INSTDIR\cys.prev*.exe"
+  Delete "$INSTDIR\cysd.prev*.exe"
+  Delete "$INSTDIR\cys-app.prev*.exe"
   Delete "$INSTDIR\cys-install-failure.txt"
-  Delete "$INSTDIR\cys-installed-version.txt"   ; R4 버전 마커(언인스톨러 미추적 파일)
+  Delete "$INSTDIR\cys-installed-version.txt"   ; 버전 마커(언인스톨러 미추적 파일)
   ; 잠금 스윕 잔해(*.prev<rand> — 언인스톨러 미추적 파일)까지 정리해 빈 폴더 잔존을 막는다.
   ; 프로세스는 위에서 전부 종료됐으므로 삭제 가능. runtime은 전량 우리 소유 트리다.
   RMDir /r "$INSTDIR\runtime"
