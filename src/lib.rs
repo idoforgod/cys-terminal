@@ -4459,6 +4459,32 @@ mod spawn_policy_tests {
         );
     }
 
+    /// ★W3 회귀 핀(2026-08-29 · 설치 중 라이벌 데몬 차단): 팩 wakeup 의 liveness 프로브
+    /// (`_target_alive` 의 `cys list`)는 관측이다 — 봉인이 빠지면 "대상이 살았는가"를 묻는
+    /// 행위 자체가 죽은 소켓에서 autostart 게이트를 당겨 **그 순간의 디스크 바이트**(설치
+    /// 창이면 반쯤 추출된 cysd)를 라이벌 데몬으로 띄운다. 주기 자가치유·drain 배달이 이
+    /// 프로브를 **반복** 호출하므로 한 번의 회귀가 반복 점화점이 된다. rust 검체가 팩 파일의
+    /// 계약 문자열을 박제하는 것은 census 검체의 cys-dept 셸 층 단언과 같은 장르다 — 봉인
+    /// 키의 정의처가 이 파일이라 드리프트를 정의처에서 잡는다(파이썬 하네스 아님).
+    #[test]
+    fn pack_wakeup_liveness_probe_seals_autostart() {
+        let py = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cysjavis-pack/bin/javis_wakeup.py"),
+        )
+        .expect("javis_wakeup.py 를 읽지 못했다 — 측정 불능은 통과가 아니다");
+        let start = py
+            .find("def _target_alive")
+            .expect("_target_alive 정의 소실 — 함수명이 바뀌었으면 이 핀도 함께 이사하라");
+        let end = py[start..].find("\ndef ").map(|e| start + e).unwrap_or(py.len());
+        let body = &py[start..end];
+        assert!(
+            body.contains(ENV_NO_AUTOSTART),
+            "_target_alive 의 `cys list` 프로브에 CYS_NO_AUTOSTART 봉인이 없다 — 죽은 대상 \
+             판정이 라이벌 데몬 점화로 뒤집힌다(스펙 W3 · javis_org.dept_status 와 동일 규약)"
+        );
+    }
+
     /// ★실동작 검증(unix): 등급이 실제로 프로세스 그룹을 가르는가.
     /// 소스 핀만으로는 "헬퍼가 no-op 이어도 초록"이 되므로, 진짜 자식을 띄워
     /// `getpgid` 를 재본다 — 분리 등급은 부모와 다른 pgid, `Attached` 는 같은 pgid.

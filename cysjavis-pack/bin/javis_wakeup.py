@@ -227,7 +227,13 @@ def _target_alive(target):
     if not cys:
         return "unknown"
     try:
-        out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10).stdout
+        # ★W3(2026-08-29): liveness 프로브는 관측이다 — 소켓이 죽어 있으면 `cys list` 가
+        #   autostart 게이트로 **그 순간의 디스크 바이트**(설치 창이면 반쯤 추출된 cysd)를
+        #   라이벌 데몬으로 띄운다. 죽은 데몬은 dead/unknown 판정이 정답이지 부활 트리거가
+        #   아니다(javis_org.dept_status 의 동형 봉인 · 회귀 핀 = lib.rs
+        #   pack_wakeup_liveness_probe_seals_autostart).
+        out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10,
+                             env={**os.environ, "CYS_NO_AUTOSTART": "1"}).stdout
         # ★G27: exited 행 배제 + 공유 술어(정확일치·worker 접두)로 해소. 종전의 전문 정규식
         #   경계 매칭은 '부분일치'는 막았지만 '죽은 행'은 못 막았다 — 두 결함은 다른 축이다.
         rows = live_target_rows(out)

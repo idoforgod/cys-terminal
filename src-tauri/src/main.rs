@@ -1154,11 +1154,10 @@ fn bundle_integrity() -> Option<String> {
 #[tauri::command]
 async fn claude_missing_hint() -> Option<String> {
     let out = tokio::task::spawn_blocking(|| {
-        let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
-        let mut cmd = std::process::Command::new(&cys);
-        cmd.args(["agent-detect", "--json"]);
-        no_console(&mut cmd);
-        cmd.output()
+        // ★W3(2026-08-29): 진단 프로브는 관측이다 — 봉인 조립점(sealed_sidecar_cys) 경유로,
+        //   소켓이 죽은 창(설치기가 $INSTDIR 을 갈아끼우는 동안 포함)에 라이벌 cysd 를
+        //   autostart 하지 않는다. 데몬이 없으면 카드 무음(None)이 정답이다(계약 ③과 정합).
+        sealed_sidecar_cys(&["agent-detect", "--json"]).output()
     })
     .await
     .ok()?
@@ -3295,15 +3294,15 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         PendingUpdatePlan::Apply => {}
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
-    let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
     // ★U-19 도달성 앵커(2026-08-24): 인앱 업데이트는 **항상** `--no-install-hook` 이다. 즉
     //   `pack.rs setup_isolated_config_dir` 의 `if !install_hooks { return; }` **아래**에 놓인
     //   시드·치유는 **업데이트로 올라온 사용자 전원에게 영영 도달하지 않는다**(신규 설치에만
     //   닿는다 = `agents.json` 값 수정이 기존 기계에 안 닿는 K-1 과 같은 계열의 도달성 결함).
     //   첫기동 관문 시드(`seed_first_run_gates`)는 그래서 훅과 **독립 플래그**로 제어되며 그
     //   조기 return **위**에 있다 — 순서가 뒤집히면 H-SEED-U19 가 적색이 된다.
-    init_cmd.arg("init-pack").arg("--no-install-hook");
-    no_console(&mut init_cmd);
+    // ★W3(2026-08-29): 봉인 조립점 경유 — 업데이트 적용 창에서 소켓이 죽어 있으면 그 순간의
+    //   디스크 바이트(반추출 가능)가 라이벌 cysd 로 autostart 되는 경로를 봉쇄한다.
+    let mut init_cmd = sealed_sidecar_cys(&["init-pack", "--no-install-hook"]);
     let pack_ok = init_cmd
         .status()
         .map(|s| s.success())
@@ -4036,6 +4035,29 @@ fn no_console(cmd: &mut std::process::Command) {
     {
         let _ = cmd;
     }
+}
+
+/// ★W3(2026-08-29 · 설치 중 라이벌 데몬 차단): GUI 가 낳는 **관측·업데이트류** 사이드카
+/// `cys` 커맨드의 단일 조립점 — `CYS_NO_AUTOSTART=1` 봉인 포함. 소켓이 죽어 있으면 모든
+/// `cys` 호출이 autostart 게이트(cys.rs connect)로 **그 순간의 $INSTDIR 바이트**를 cysd 로
+/// 띄우므로, 설치기가 파일을 갈아끼우는 창에서는 반쯤 추출된 바이너리가 **라이벌 데몬**으로
+/// 부팅한다(스펙 W3 · 2026-08-28 감사 근본원인). 진단(agent-detect)·업데이트 팩 반영(init-pack)·
+/// 재시작 전 drain 은 "데몬이 죽어 있으면 그냥 실패해도 되는" 경로라 autostart 를 봉인한다 —
+/// cysd 형제 스폰 규약(`.no_autostart()` · lib.rs `daemon_spawned_cli_children_seal_autostart`)의
+/// GUI 대칭이며, 호출부마다 `.env` 한 줄씩 더하면 새 스폰이 생길 때 또 빠지므로 조립점 하나에
+/// 둔다(inject_runtime_path 와 같은 논거).
+///
+/// ★범위 계약(스펙 W3 명시): pane env(사용자가 직접 치는 `cys`)는 건드리지 않는다 — 사용자
+/// CLI 의 autostart 는 주인님 앵커다. 사용자 버튼류 스폰(start_master·run_skill 등)과 rotate
+/// 계열 drain 의 편입은 master 결정 사안이라 이 조립점을 태우지 않았다(SPAWN-MAP §C-3).
+fn sealed_sidecar_cys(args: &[&str]) -> std::process::Command {
+    use cys::SpawnPolicy as _;
+    let mut cmd =
+        std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+    cmd.args(args);
+    cmd.no_autostart();
+    no_console(&mut cmd);
+    cmd
 }
 
 /// RC-5: GUI 직스폰(bash/python3)에 동봉 runtime PATH 주입. GUI(Explorer/Finder) 프로세스 PATH엔
@@ -5448,10 +5470,10 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 자체 watchdog(12s)로 hang 시에도 종료되므로 별도 timeout 없이 await해도 업데이트가 멈추지 않는다.
     let _ = app.emit("update-progress", json!({"phase": "drain"}));
     let _ = tokio::task::spawn_blocking(|| {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-        cmd.arg("drain");
-        no_console(&mut cmd);
-        cmd.status()
+        // ★W3(2026-08-29): drain 은 살아있는 데몬에 저장 신호를 주는 협조 경로다 — 소켓이
+        //   이미 죽어 있으면 실패(best-effort)가 정답이지, 그 순간의 $INSTDIR 바이트(설치
+        //   중이면 반쯤 추출된 cysd)를 autostart 로 되살리는 트리거가 아니다(봉인 조립점 경유).
+        sealed_sidecar_cys(&["drain"]).status()
     })
     .await;
     let _ = app.emit("update-progress", json!({"phase": "handoff"}));
@@ -8238,6 +8260,66 @@ echo {PROBE_BEGIN_MARK_D}; which -a cysd-no-such-binary-xyz; echo {PROBE_END_MAR
             "inject_runtime_path 가 바이트코드 쓰기 차단 쌍을 잃었다 — GUI 직스폰 python 이 번들을 오염시킨다"
         );
     }
+
+    /// ★W3 회귀 핀(2026-08-29 · 설치 중 라이벌 데몬 차단): GUI 관측·업데이트류 사이드카
+    /// 조립점(`sealed_sidecar_cys`)은 CYS_NO_AUTOSTART=1 을 **반드시** 실어야 한다 — 빠지면
+    /// 소켓이 죽은 창(특히 설치기가 $INSTDIR 을 갈아끼우는 동안)에 GUI 진단·업데이트 자식이
+    /// 반쯤 추출된 cysd 를 라이벌로 autostart 한다(lib.rs 형제 스폰 핀
+    /// `daemon_spawned_cli_children_seal_autostart` 의 GUI 대칭).
+    #[test]
+    fn gui_sidecar_builder_seals_autostart() {
+        let cmd = sealed_sidecar_cys(&["agent-detect", "--json"]);
+        let got = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(cys::ENV_NO_AUTOSTART))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            got.as_deref(),
+            Some(cys::NO_AUTOSTART_ON),
+            "sealed_sidecar_cys 가 autostart 봉인을 잃었다 — 설치 창 라이벌 데몬 경로 부활"
+        );
+        // 빌더 승격이 인자를 삼키지 않는다 — 커맨드 계약 동시 핀.
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["agent-detect", "--json"]);
+    }
+
+    /// ★W3 지점 핀: 스펙 W3 가 지목한 세 GUI 스폰(진단 `claude_missing_hint` · 업데이트 팩
+    /// 반영 `maybe_apply_pending_update` · 재시작 전 drain `install_update`)이 실제로 봉인
+    /// 조립점을 소비하는지 함수 본문 단위로 박제한다 — 빌더만 남고 호출부가 raw Command 로
+    /// 회귀하면 봉인이 무언으로 풀린다(census 검체의 marker 단언과 같은 장르 · 개수 위장 차단).
+    ///
+    /// ★범위 정직 고지: 사용자 버튼류(start_master·run_skill 등)·rotate 계열 drain·pane env 는
+    /// **의도적으로** 범위 밖이다(스펙 W3 · SPAWN-MAP §C-3 — 그 지점들의 편입은 master 결정).
+    #[test]
+    fn gui_spec_w3_sites_consume_sealed_builder() {
+        let src = include_str!("main.rs");
+        // 자기참조 회피: 이 파일 자신을 스캔하므로 니들은 조각 결합으로 만든다(census 핀 규약).
+        let marker = concat!("sealed_sidecar", "_cys(");
+        for head in [
+            concat!("fn claude_missing", "_hint("),
+            concat!("fn maybe_apply_pending", "_update("),
+            concat!("fn install", "_update("),
+        ] {
+            let start = src.find(head).unwrap_or_else(|| {
+                panic!("{head} 정의를 못 찾았다 — 함수명이 바뀌었으면 이 핀도 함께 이사하라")
+            });
+            // 본문 = 정의부터 첫 최상위 닫는 중괄호(열 0 `}`)까지 — 이 파일의 top-level fn 규약.
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|e| start + e)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains(marker),
+                "{head} 본문에 봉인 조립점({marker}) 소비가 없다 — raw Command 회귀 = 설치 창 라이벌 데몬 재발"
+            );
+        }
+    }
+
     /// ★W-B2 회귀 핀(감사 blocker #4 의 GUI 절반): GUI 직스폰 env 키 집합 ⊇ pane 스폰
     /// **runtime 규약** env 키 집합(PATH·HOME backfill·PYTHONDONTWRITEBYTECODE·PYTHONUTF8).
     /// 종전 누락 2종(PYTHONUTF8·HOME backfill) 탓에 한국어 Windows(cp949) GUI 직스폰
