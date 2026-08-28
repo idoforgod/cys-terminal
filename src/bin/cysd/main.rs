@@ -58,6 +58,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 //   허용**된다(설치기 unlock-sweep 이 이미 의존하는 Windows 특성이고, 매핑은 경로가 아니라
 //   파일 오브젝트에 걸리므로 홀더 프로세스는 아무 영향을 받지 않는다).
 //   ⇒ 사후 불변식: "부트 후 설치 트리(격리함 제외)에 잔해 0" 이 홀더 생존 여부와 무관하게 성립.
+//
+// ★W1(2026-08-29) 잔해 회수 **가드**: 위 규칙 전체는 "정식 파일 `<bin>.exe` 가 살아 있다"는
+//   전제 위에서만 안전하다. 설치 도중 전원 차단·설치기 강제종료로 "정식 없음 + .prev 만 존재"가
+//   되면, 이름 문법만 보는 스윕이 **유일한 동작본을 지운다**(T3 사고 계열 — CLI 영구 소실).
+//   그래서 스윕 전에 가드(guard_canonical_binaries)가 cys·cysd·cys-app 3종의 정식 존재를
+//   확인하고, 부재면 삭제 대신 복구(승격)·동결한다 — 규칙의 정의처는 plan_leftover_action(순수).
+//   설치기가 배치 직전 단계에 만드는 `<bin>.new.exe`(W4-B)는 is_update_leftover 문법 **밖**이다
+//   (설치 중 데몬 재부팅이 신본을 격리하면 안 되므로 의도적) — 가드의 명시 규칙이 전담한다.
 
 /// 삭제 불가(=아직 매핑 중) 잔해를 모아두는 **설치 루트 하위** 격리 디렉토리 이름.
 /// `runtime\` **밖**이어야 한다 — 격리의 목적이 runtime 트리를 결정론적으로 비우는 것이다.
@@ -96,6 +104,290 @@ pub(crate) fn is_update_leftover(name: &str) -> bool {
 #[cfg(any(windows, test))]
 pub(crate) fn quarantine_file_name(orig: &str, stamp: u64, seq: usize) -> String {
     format!("{orig}.prev{stamp}{seq:03}")
+}
+
+// ── W1 부팅 잔해 회수 가드 — 정식(canonical) 부재 시 잔해는 쓰레기가 아니라 복구 재료다 ──
+//
+// 이 가드는 부팅 시퀀스에서 스윕보다 먼저, 소켓 서빙 **전에** 돈다 — 규칙이 틀리면 전 조직의
+// CLI 가 죽는 자리다. 그래서 판정 전량을 순수 함수(plan_leftover_action)에 두고, 파일시스템
+// 배선(guard_canonical_binaries)은 실행·동결만 한다(스윕과 같은 순수판정+배선 구조).
+
+/// 가드 대상 3종 — 설치 루트($INSTDIR)에 정식 이름으로 놓이는 우리 바이너리 전부.
+/// (runtime\ 밑 이미지는 아카이브 전개의 산물이라 `.new` 승격 개념이 없다 — 가드 범위 밖.)
+#[cfg(any(windows, test))]
+pub(crate) const GUARDED_BINS: [&str; 3] = ["cys", "cysd", "cys-app"];
+
+/// 복구 재료로 믿을 최소 크기 64KiB — 설치기 배치 검증(nsis-hooks W4-B ④)과 같은 임계다.
+/// `.new` 는 파일 **복사**의 산물이라 전원 차단 시 잘린 채 남을 수 있고, 잘린 파일을 정식으로
+/// 승격하면 다음 부팅이 "정식 존재"로 오판해 **남은 진짜 재료(.prev)를 지운다** — 승격 실수가
+/// 삭제 사고로 전이되는 유일한 경로라서, prev 에도 같은 문턱을 건다(정상 prev 는 rename 산물
+/// = 원자적이라 잘릴 수 없으므로, 이 문턱이 거르는 것은 병리적 이력의 쓰레기뿐이다).
+#[cfg(any(windows, test))]
+pub(crate) const MIN_PROMOTABLE_BYTES: u64 = 64 * 1024;
+
+/// 승격 후보(.prev 계열)의 관측값 — 판정의 입력. 순수 판정을 위해 파일시스템이 아니라 값으로
+/// 받는다(Windows 전용 상황 "정식 소실"을 어느 OS 의 단위 테스트로도 박제하기 위함).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrevCandidate {
+    pub name: String,
+    /// epoch 초. 못 읽었으면 0 — '가장 오래됨'으로 접혀 mtime 을 아는 후보가 항상 이긴다(보수적).
+    pub mtime: u64,
+    pub size: u64,
+}
+
+/// 한 바이너리 가족에 대한 이번 부트의 행동 계획(순수 · 회귀 핀).
+///
+/// ★배선 실행 순서 계약: 삭제는 어떤 갈래에서든 **정식이 실재하게 된 뒤에만** 한다. 승격
+///   rename 이 실패하면 계획이 무엇이었든 가족 전체를 동결한다 — "정식 부재인데 지운다"로
+///   전이하는 분기가 코드 어디에도 없어야 이 가드가 성립한다.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeftoverPlan {
+    /// 정식 존재 — 가족 잔해는 종전 규칙(스윕)이 지운다. `delete_new` 는 문법 밖 `<bin>.new` 의
+    /// 명시 처분(정식이 있으니 그 신본은 남을 이유가 없는 배치 중단 흔적이다).
+    SweepAll { delete_new: bool },
+    /// 정식 부재 — `<bin>.new`(≥64KiB) 를 정식으로 rename 승격. 성공 시 잔여 prev 는 스윕이 정리.
+    PromoteNew,
+    /// 정식 부재·쓸 만한 `.new` 없음 — `source`(최신 mtime 의 승격 가능 prev)를 정식으로 rename
+    /// 승격. `delete_new` = 미달(잘린) `.new` 의 처분 지시 — 단 **승격 성공 후에만**(위 계약).
+    PromotePrev { source: String, delete_new: bool },
+    /// 정식 부재 + 가족 파일 자체가 하나도 없음 — 지킬 것도 고칠 것도 없다(개발 트리·미설치
+    /// 바이너리의 정상 상태). **조용히** 지나간다 — 매 부팅 우는 배너는 이 파일이 없애온 실패다.
+    NothingToDo,
+    /// 정식 부재 + 재료는 있으나 전부 승격 부적격(미달 크기) — **아무것도 지우지 않는다**.
+    /// 가족 전체 무접촉 동결 + loud. 잘린 재료도 보존한다(다음 설치·수동 복구의 단서).
+    Hold,
+}
+
+/// **판정의 정의처(순수).** 정식 존재 여부 · `.new` 크기 · prev 후보들 → 이번 부트의 행동.
+#[cfg(any(windows, test))]
+pub(crate) fn plan_leftover_action(
+    canonical_exists: bool,
+    new_size: Option<u64>,
+    prevs: &[PrevCandidate],
+) -> LeftoverPlan {
+    if canonical_exists {
+        return LeftoverPlan::SweepAll { delete_new: new_size.is_some() };
+    }
+    if new_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES) {
+        return LeftoverPlan::PromoteNew;
+    }
+    // 최신 mtime 우선 — 가장 마지막까지 정식 자리에 있었던 본이 최신이다. 동률은 이름으로 깨서
+    // 부트 간 순서를 결정론으로 고정한다(read_dir 순서 의존 금지 — 격리함 유계 패스와 같은 규율).
+    let best = prevs
+        .iter()
+        .filter(|p| p.size >= MIN_PROMOTABLE_BYTES)
+        .max_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.name.cmp(&b.name)));
+    if let Some(p) = best {
+        return LeftoverPlan::PromotePrev {
+            source: p.name.clone(),
+            delete_new: new_size.is_some(),
+        };
+    }
+    if new_size.is_none() && prevs.is_empty() {
+        LeftoverPlan::NothingToDo
+    } else {
+        LeftoverPlan::Hold
+    }
+}
+
+/// `<bin>` 가족의 잔해인가(순수) — `is_update_leftover` 문법 위에 "누구의 것인가"를 얹는다.
+/// 마지막 `.prev` 앞 줄기가 정확히 `<bin>` 또는 `<bin>.<ext>` 인 것만 가족이다:
+///   체인 슬롯 `cys.prev.exe`·`cys.prev2.exe`(줄기 cys) · unlock-sweep `cys.exe.prev4213`
+///   (줄기 cys.exe) · W4-B tick 슬롯 `cys.prev<틱>.exe`(줄기 cys). 정확 일치라 `cys` 가족이
+///   `cys-app.prev.exe`·`cysd.prev.exe` 를 삼키는 접두 오염은 구조적으로 불가능하다.
+#[cfg(any(windows, test))]
+pub(crate) fn is_family_leftover(name: &str, bin: &str, ext: &str) -> bool {
+    if !is_update_leftover(name) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    let Some(i) = lower.rfind(".prev") else {
+        return false;
+    };
+    let stem = &lower[..i];
+    let bin_l = bin.to_ascii_lowercase();
+    stem == bin_l || stem == format!("{bin_l}.{}", ext.to_ascii_lowercase())
+}
+
+/// 가드 계수 — 로그(guard_log_lines)와 테스트 핀의 관측 지점. 동결의 계수·고지 소유자는 스윕이
+/// 아니라 가드다(스윕의 hold 스킵은 무계수 — 계수 소유자가 하나여야 정직하다, 격리함 규율과 동형).
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuardStats {
+    /// (정식 이름, 재료 이름) — 정식 부재를 rename 승격으로 복구했다. **항상 loud**.
+    pub promoted: Vec<(String, String)>,
+    /// (정식 이름, 시도한 재료 이름) — 승격 rename 실패. 가족 전체 무접촉 동결. **항상 loud**.
+    pub promote_failed: Vec<(String, String)>,
+    /// (정식 이름, 보존한 가족 파일 수) — 정식 부재 + 승격 가능 재료 전무. 무행동. **항상 loud**.
+    pub held: Vec<(String, usize)>,
+    /// 정식 존재(승격 성공 직후 포함) 하에 지운 `<bin>.new.<ext>` 수 — 문법 밖 명시 규칙의
+    /// 유일한 삭제 경로. info(배치 중단 흔적 청소 — 조치 불요).
+    pub deleted_new: usize,
+}
+
+/// 동결: 가족 잔해 전체를 스윕이 건너뛸 집합에 넣는다(`.new` 는 문법 밖이라 스윕이 원래 못 본다).
+#[cfg(any(windows, test))]
+fn freeze_family(
+    hold: &mut std::collections::HashSet<std::path::PathBuf>,
+    dir: &std::path::Path,
+    family: &[PrevCandidate],
+) {
+    for c in family {
+        hold.insert(dir.join(&c.name));
+    }
+}
+
+/// 가드 배선 — 설치 루트 **최상위**만 본다(정식·`.new`·가족 prev 는 전부 루트에 놓인다: 체인
+/// 슬롯도 unlock-sweep 도 루트만 만든다). 반환값은 스윕이 건너뛸 동결 경로 집합.
+///
+/// `remove`·`promote` 를 주입받는 이유는 스윕과 같다: Windows 전용 실패 분기(잠긴 대상의
+/// rename 거부 등)를 타 OS 의 단위 테스트에서 결정론으로 재현한다. 참고로 승격 rename 은
+/// 매핑 중인(실행 중인) 옛 본이 .prev 를 붙들고 있어도 성공한다 — 매핑은 경로가 아니라 파일
+/// 오브젝트에 걸린다(파일 상단 주석의 unlock-sweep 이 의존하는 그 Windows 특성).
+#[cfg(any(windows, test))]
+pub(crate) fn guard_canonical_binaries(
+    dir: &std::path::Path,
+    ext: &str,
+    remove: &mut dyn FnMut(&std::path::Path) -> bool,
+    promote: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> bool,
+    stats: &mut GuardStats,
+) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut hold = std::collections::HashSet::new();
+    // 루트 잔해를 한 번만 훑어 두고 가족별로 나눈다(가족당 재스캔 금지 — 부트 경로다).
+    // DirEntry::metadata 는 심볼릭링크를 따라가지 않으므로 링크는 is_file 에서 탈락한다
+    // (링크 너머의 살아있는 파일이 승격 rename 으로 이동되는 경로 차단 — 오너 앵커 ④).
+    let mut root_leftovers: Vec<PrevCandidate> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if !md.is_file() {
+                continue; // 디렉토리(격리함 포함)·링크는 가드의 관심 밖
+            }
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_update_leftover(name) {
+                continue;
+            }
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            root_leftovers.push(PrevCandidate {
+                name: name.to_string(),
+                mtime,
+                size: md.len(),
+            });
+        }
+    }
+    for bin in GUARDED_BINS {
+        let canonical_name = format!("{bin}.{ext}");
+        let new_name = format!("{bin}.new.{ext}");
+        let canonical = dir.join(&canonical_name);
+        let canonical_exists = std::fs::metadata(&canonical).is_ok_and(|m| m.is_file());
+        let new_path = dir.join(&new_name);
+        let new_size = std::fs::metadata(&new_path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let family: Vec<PrevCandidate> = root_leftovers
+            .iter()
+            .filter(|c| is_family_leftover(&c.name, bin, ext))
+            .cloned()
+            .collect();
+        match plan_leftover_action(canonical_exists, new_size, &family) {
+            LeftoverPlan::NothingToDo => {}
+            LeftoverPlan::SweepAll { delete_new } => {
+                // 정식이 살아 있으니 가족 prev 는 스윕 관할로 되돌린다(무동결). `.new` 만 여기서
+                // 지운다. 삭제 실패는 조용히 둔다 — 문법 밖이라 스윕도 못 보는 무해 잔류물이고,
+                // 잠겨 있다면 설치기가 진행 중이라는 뜻이라 다투지 않는 쪽이 안전하다(다음 설치의
+                // 배치 단계가 어차피 지운다 — W4-B ②).
+                if delete_new && remove(&new_path) {
+                    stats.deleted_new += 1;
+                }
+            }
+            LeftoverPlan::PromoteNew => {
+                if promote(&new_path, &canonical) {
+                    stats.promoted.push((canonical_name, new_name));
+                    // 잔여 prev 는 정식이 실재하게 됐으므로 스윕이 종전 규칙으로 정리한다(무동결).
+                } else {
+                    stats.promote_failed.push((canonical_name, new_name));
+                    freeze_family(&mut hold, dir, &family);
+                }
+            }
+            LeftoverPlan::PromotePrev { source, delete_new } => {
+                let src = dir.join(&source);
+                if promote(&src, &canonical) {
+                    stats.promoted.push((canonical_name, source));
+                    // ★정식이 이제 실재한다 — 그때만 미달 `.new` 를 처분한다(실행 순서 계약).
+                    if delete_new && remove(&new_path) {
+                        stats.deleted_new += 1;
+                    }
+                } else {
+                    stats.promote_failed.push((canonical_name, source));
+                    freeze_family(&mut hold, dir, &family);
+                }
+            }
+            LeftoverPlan::Hold => {
+                stats
+                    .held
+                    .push((canonical_name, family.len() + usize::from(new_size.is_some())));
+                freeze_family(&mut hold, dir, &family);
+            }
+        }
+    }
+    hold
+}
+
+/// 가드 결과를 로그 줄로 환원한다(순수 · leftover_log_lines 계열 — 같은 stderr 채널로 흘러간다.
+/// 신규 이벤트 타입은 만들지 않는다 — EVENT_CONTRACT 밖 타입은 거부되는 계약).
+/// 복구·동결·실패는 전부 **loud** 다: 정식 부재는 "직전 설치가 도중에 죽었다"는 뜻이라 사용자
+/// 조치(설치기 재실행)가 실재한다 — "조치 가능한 이상만 ⚠"라는 이 파일의 등급 규율에 부합한다.
+#[cfg(any(windows, test))]
+pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> {
+    let mut out = Vec::new();
+    for (canonical, source) in &stats.promoted {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 부팅 복구: 정식 {canonical} 부재 → {source} 를 rename 승격해 재건했다 — \
+                 직전 업데이트가 중단된 흔적이다. 설치기를 다시 실행해 최신본으로 마무리하라"
+            ),
+        ));
+    }
+    for (canonical, source) in &stats.promote_failed {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 정식 {canonical} 부재·복구 승격 실패({source} rename 거부) — 복구 재료 \
+                 보존을 위해 가족 잔해를 무접촉 동결했다. 다음 기동이 재시도한다"
+            ),
+        ));
+    }
+    for (canonical, kept) in &stats.held {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 정식 {canonical} 부재 + 승격 가능한 복구 재료 전무 — 아무것도 지우지 \
+                 않는다(가족 파일 {kept}개 무접촉 보존). 설치기를 다시 실행해 복구하라"
+            ),
+        ));
+    }
+    if stats.deleted_new > 0 {
+        out.push((
+            LeftoverLog::Info,
+            format!(
+                "[cysd] update leftovers: 정식 존재 확인 후 배치 중단 흔적 .new 신본 {}건 삭제",
+                stats.deleted_new
+            ),
+        ));
+    }
+    out
 }
 
 /// 스윕 계수 — 로그(침묵 금지)와 테스트 핀의 관측 지점.
@@ -172,12 +464,17 @@ fn open_for_stamp(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 ///   종전에는 스윕이 격리함 안에서도 삭제를 시도하고 실패분을 `stuck` 에 섞었는데, 그 탓에
 ///   "봉쇄 실패(살아있는 트리에 잔해 잔존)"와 "봉쇄 성공 후 정상 대기"가 같은 계수로 합쳐져
 ///   같은 ⚠ 경고를 냈다 — 조치할 것이 없는데 부팅마다 울리는 오탐 배너 클래스의 재발이다.
+///
+/// ★`hold` 는 W1 가드가 동결한 복구 재료(정식 부재 가족의 잔해)의 경로 집합 — **무접촉으로
+///   건너뛴다**. 계수도 남기지 않는다: 동결의 계수·고지 소유자는 가드(GuardStats)다(위와 같은
+///   소유자 단일화 규율). 가드가 없던 종전 계약은 빈 집합을 넘기는 것과 동치다.
 #[cfg(any(windows, test))]
 pub(crate) fn sweep_update_leftovers(
     dir: &std::path::Path,
     depth: u8,
     trash: &std::path::Path,
     stamp: u64,
+    hold: &std::collections::HashSet<std::path::PathBuf>,
     remove: &mut dyn FnMut(&std::path::Path) -> bool,
     relocate: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> bool,
     stats: &mut SweepStats,
@@ -195,13 +492,18 @@ pub(crate) fn sweep_update_leftovers(
             if p == trash {
                 continue;
             }
-            sweep_update_leftovers(&p, depth - 1, trash, stamp, remove, relocate, stats);
+            sweep_update_leftovers(&p, depth - 1, trash, stamp, hold, remove, relocate, stats);
             continue;
         }
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if !is_update_leftover(name) {
+            continue;
+        }
+        if hold.contains(&p) {
+            // W1 가드가 동결한 복구 재료(정식 부재 가족) — 이번 부트는 무접촉. 계수도 없다:
+            // 동결의 계수·고지는 가드(GuardStats.held)가 이미 졌다(소유자 단일화).
             continue;
         }
         if remove(&p) {
@@ -409,12 +711,19 @@ pub(crate) fn run_update_leftover_maintenance(
             .is_some_and(|d| std::fs::create_dir_all(d).is_ok())
             && std::fs::rename(src, dest).is_ok()
     };
+    // ★W1 가드 — 스윕보다 **먼저**: 정식 부재 가족의 잔해는 쓰레기가 아니라 복구 재료다.
+    //   승격(정식 재건)에 성공한 가족만 스윕에 되돌아가고, 실패·재료 전무 가족은 hold 로 동결된다.
+    let mut promote =
+        |src: &std::path::Path, dest: &std::path::Path| std::fs::rename(src, dest).is_ok();
+    let mut guard = GuardStats::default();
+    let hold = guard_canonical_binaries(dir, "exe", &mut remove, &mut promote, &mut guard);
     let mut sweep = SweepStats::default();
     sweep_update_leftovers(
         dir,
         12,
         &trash,
         now_secs,
+        &hold,
         &mut remove,
         &mut relocate,
         &mut sweep,
@@ -424,7 +733,10 @@ pub(crate) fn run_update_leftover_maintenance(
     bound_update_trash(&trash, now_secs, &mut remove, &mut bound);
     // 격리함이 비었으면 흔적을 남기지 않는다(빈 디렉토리 제거 — 비어있지 않으면 실패=no-op).
     let _ = std::fs::remove_dir(&trash);
-    leftover_log_lines(&sweep, &bound, &trash)
+    // 가드 줄이 먼저다 — 복구·동결이 스윕보다 먼저 일어난 사건이고, 정식 부재는 가장 큰 소식이다.
+    let mut lines = guard_log_lines(&guard);
+    lines.extend(leftover_log_lines(&sweep, &bound, &trash));
+    lines
 }
 
 /// 로그 등급. `Loud` 만이 사용자에게 "봐야 할 것이 있다"고 말한다.
@@ -3776,11 +4088,14 @@ mod first_line_idle_tests {
 #[cfg(test)]
 mod update_leftover_sweep_tests {
     use super::{
-        bound_update_trash, is_update_leftover, leftover_log_lines, quarantine_file_name,
-        run_update_leftover_maintenance, sweep_update_leftovers, LeftoverLog, SweepStats,
-        TrashBoundStats, TRASH_MAX_AGE_SECS, TRASH_MAX_BYTES, TRASH_MAX_ENTRIES,
-        TRASH_MAX_RECLAIM_PER_BOOT, UPDATE_TRASH_DIR,
+        bound_update_trash, guard_canonical_binaries, guard_log_lines, is_family_leftover,
+        is_update_leftover, leftover_log_lines, plan_leftover_action, quarantine_file_name,
+        run_update_leftover_maintenance, sweep_update_leftovers, GuardStats, LeftoverLog,
+        LeftoverPlan, PrevCandidate, SweepStats, TrashBoundStats, MIN_PROMOTABLE_BYTES,
+        TRASH_MAX_AGE_SECS, TRASH_MAX_BYTES, TRASH_MAX_ENTRIES, TRASH_MAX_RECLAIM_PER_BOOT,
+        UPDATE_TRASH_DIR,
     };
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
     fn workdir(tag: &str) -> PathBuf {
@@ -3822,6 +4137,18 @@ mod update_leftover_sweep_tests {
             && std::fs::rename(src, dest).is_ok()
     }
 
+    /// 가드 동결이 없는 종전 스윕 계약을 그대로 핀하기 위한 빈 hold(가드 도입 전과 동치).
+    fn no_hold() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
+    /// 지정 크기·채움 바이트의 파일 — 가드 테스트에서 '온전한 재료'(≥64KiB)와 승격본의 정체
+    /// (어느 파일이 정식이 됐는가)를 내용으로 구별하기 위함.
+    fn touch_sized(p: &Path, size: u64, fill: u8) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![fill; size as usize]).unwrap();
+    }
+
     /// ① 판정 규칙 — 설치기가 만드는 두 형식만 잔해다. 사용자 파일(`*.preview.*`)은 **불가침**.
     #[test]
     fn leftover_rule_matches_installer_forms_only() {
@@ -3844,6 +4171,8 @@ mod update_leftover_sweep_tests {
             "release.previous.json",
             "prev.exe",
             "cysd.prev.exe.bak",
+            "cys.prevX.exe", // .prev 뒤가 숫자가 아니다 — 잔해 아님(W1-5 과매칭 회귀 핀)
+            "cys.new.exe",   // 배치 직전 신본 — 문법 **밖**은 의도다(가드의 명시 규칙 전담)
             "readme.md",
         ] {
             assert!(!is_update_leftover(n), "살아있는 파일을 잔해로 오판했다: {n}");
@@ -3879,6 +4208,7 @@ mod update_leftover_sweep_tests {
             12,
             &root.join(UPDATE_TRASH_DIR),
             1,
+            &no_hold(),
             &mut real_remove,
             &mut real_relocate,
             &mut stats,
@@ -3915,6 +4245,7 @@ mod update_leftover_sweep_tests {
             12,
             &trash,
             1_756_200_000,
+            &no_hold(),
             &mut never_removes,
             &mut real_relocate,
             &mut stats,
@@ -3957,6 +4288,7 @@ mod update_leftover_sweep_tests {
             12,
             &trash,
             1,
+            &no_hold(),
             &mut remove_must_not_run,
             &mut relocate_must_not_run,
             &mut stats,
@@ -3979,6 +4311,7 @@ mod update_leftover_sweep_tests {
             2, // root(1) → a(2) 까지만 — b 는 못 본다
             &root.join(UPDATE_TRASH_DIR),
             1,
+            &no_hold(),
             &mut real_remove,
             &mut real_relocate,
             &mut stats,
@@ -4211,6 +4544,7 @@ mod update_leftover_sweep_tests {
         let root = workdir("bound-pipeline");
         let trash = root.join(UPDATE_TRASH_DIR);
         touch(&root.join("cysd.prev.exe"));
+        touch(&root.join("cysd.exe")); // 정식 존재 — W1 가드가 가족 잔해를 스윕에 되돌리는 상태
         touch(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"));
         touch(&root.join("runtime/python/notes.preview.png")); // 사용자 파일 — 불가침
         touch(&root.join("runtime/git/usr/bin/bash.exe")); // 살아있는 바이너리 — 불가침
@@ -4222,6 +4556,7 @@ mod update_leftover_sweep_tests {
             12,
             &trash,
             T0,
+            &no_hold(),
             &mut never_removes,
             &mut real_relocate,
             &mut sweep,
@@ -4389,6 +4724,7 @@ mod update_leftover_sweep_tests {
             12,
             &trash,
             T0,
+            &no_hold(),
             &mut never_removes,
             &mut real_relocate,
             &mut sweep,
@@ -4442,6 +4778,294 @@ mod update_leftover_sweep_tests {
         assert_eq!(stats.aged_stuck, 0, "스탬프를 못 쓰는 항목을 나이초과로 올렸다(조기 경고)");
         assert!(!stats.over_bound(), "조치할 수 없는 항목에 ⚠ 를 달았다");
         let _ = std::fs::remove_dir_all(&trash);
+    }
+
+    // ── W1 부팅 잔해 회수 가드 핀 — "정식 부재 시 잔해는 복구 재료다"(T3 사고 계열 차단) ──
+
+    /// G① 스펙 W1-1 — 정식 부재 + prev 1개: **삭제 0건**, prev 가 rename 으로 정식에 승격된다.
+    ///    종전 스윕은 여기서 유일한 동작본을 지웠다(CLI 영구 소실) — 이 가드의 존재 이유.
+    #[test]
+    fn guard_promotes_lone_prev_instead_of_deleting_it() {
+        let root = workdir("guard-lone-prev");
+        touch_sized(&root.join("cys.prev.exe"), MIN_PROMOTABLE_BYTES, b'P');
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        let canonical = root.join("cys.exe");
+        assert!(canonical.exists(), "정식이 재건되지 않았다");
+        assert_eq!(
+            std::fs::metadata(&canonical).unwrap().len(),
+            MIN_PROMOTABLE_BYTES,
+            "승격본이 prev 의 내용이 아니다"
+        );
+        assert!(!root.join("cys.prev.exe").exists(), "승격은 rename 이어야 한다(원본 잔류)");
+        assert!(!root.join(UPDATE_TRASH_DIR).exists(), "복구 재료가 격리함으로 갔다");
+        assert_eq!(lines.len(), 1, "복구 1건 = loud 1줄이어야 한다: {lines:?}");
+        assert!(
+            lines[0].0 == LeftoverLog::Loud
+                && lines[0].1.contains("부팅 복구")
+                && lines[0].1.contains("cys.exe"),
+            "복구가 유음으로 기록되지 않았다: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G② 스펙 W1-2 — 정식 부재 + `.new`(≥64KiB) + prev 2개: `.new` 가 1순위로 승격되고,
+    ///    잔여 prev 는 **승격 성공 뒤** 종전 규칙(스윕)으로 정리된다.
+    #[test]
+    fn guard_prefers_new_binary_then_sweeps_the_prevs() {
+        let root = workdir("guard-new-first");
+        touch_sized(&root.join("cysd.new.exe"), MIN_PROMOTABLE_BYTES + 7, b'N');
+        touch_at(&root.join("cysd.prev.exe"), T0 - 10, MIN_PROMOTABLE_BYTES as usize);
+        touch_at(&root.join("cysd.prev2.exe"), T0 - 20, MIN_PROMOTABLE_BYTES as usize);
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert_eq!(
+            std::fs::metadata(root.join("cysd.exe")).unwrap().len(),
+            MIN_PROMOTABLE_BYTES + 7,
+            "승격본이 .new 가 아니다(우선순위 위반)"
+        );
+        assert!(!root.join("cysd.new.exe").exists(), ".new 가 rename 되지 않고 남았다");
+        assert!(
+            !root.join("cysd.prev.exe").exists() && !root.join("cysd.prev2.exe").exists(),
+            "승격 후 잔여 prev 가 정리되지 않았다"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("부팅 복구")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|(_, s)| s.contains("removed=2")),
+            "잔여 prev 정리가 계수되지 않았다: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G③ 스펙 W1-3 — 정식 존재 + prev 3개 + `.new`: 종전과 동일하게 정리되고, 문법 밖의
+    ///    `.new` 는 "정식이 존재할 때만 삭제"라는 명시 규칙으로 함께 지워진다. ⚠ 는 없다.
+    #[test]
+    fn guard_with_canonical_present_sweeps_prevs_and_deletes_new() {
+        let root = workdir("guard-canonical-ok");
+        touch_sized(&root.join("cys.exe"), MIN_PROMOTABLE_BYTES, b'C');
+        touch(&root.join("cys.prev.exe"));
+        touch(&root.join("cys.prev2.exe"));
+        touch(&root.join("cys.exe.prev4213")); // unlock-sweep 형식도 같은 가족
+        touch(&root.join("cys.new.exe"));
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert!(root.join("cys.exe").exists(), "정식을 건드렸다");
+        for gone in ["cys.prev.exe", "cys.prev2.exe", "cys.exe.prev4213", "cys.new.exe"] {
+            assert!(!root.join(gone).exists(), "{gone} 이 정리되지 않았다");
+        }
+        assert!(
+            lines.iter().all(|(l, _)| *l == LeftoverLog::Info),
+            "정상 정리에 ⚠ 가 울렸다: {lines:?}"
+        );
+        assert!(lines.iter().any(|(_, s)| s.contains("removed=3")), "{lines:?}");
+        assert!(
+            lines.iter().any(|(_, s)| s.contains(".new 신본 1건 삭제")),
+            ".new 처분이 침묵했다: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G④ 스펙 W1-4 — 정식 부재 + **승격 가능한** 재료 전무(전부 미달 크기): 무행동 + 경고.
+    ///    잘린 재료를 승격하면 다음 부팅이 "정식 존재"로 오판해 남은 재료를 지운다 — 그 전이를
+    ///    여기서 끊는다. 대조: 가족 파일이 **하나도 없는** 바이너리(개발 트리의 cys-app 등)는
+    ///    지킬 것이 없으므로 조용하다(정식 부재 ≠ 무조건 경고 — 매 부팅 우는 배너 금지).
+    #[test]
+    fn guard_holds_everything_loudly_when_no_usable_material_exists() {
+        let root = workdir("guard-hold");
+        touch(&root.join("cys.prev.exe")); // 1바이트 = 승격 부적격
+        touch_sized(&root.join("cys.new.exe"), 4, b'T'); // 잘린 신본 = 승격 부적격
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert!(root.join("cys.prev.exe").exists(), "동결해야 할 복구 재료를 지웠다");
+        assert!(root.join("cys.new.exe").exists(), "정식 부재인데 .new 를 지웠다");
+        assert!(!root.join("cys.exe").exists(), "미달 재료를 승격했다");
+        assert!(!root.join(UPDATE_TRASH_DIR).exists(), "복구 재료가 격리함으로 갔다");
+        let loud: Vec<_> = lines.iter().filter(|(l, _)| *l == LeftoverLog::Loud).collect();
+        assert_eq!(loud.len(), 1, "무행동 동결은 정확히 1회 loud 여야 한다: {lines:?}");
+        assert!(
+            loud[0].1.contains("복구 재료 전무") && loud[0].1.contains("cys.exe"),
+            "{}",
+            loud[0].1
+        );
+        // 가족이 통째로 없는 cysd·cys-app 은 침묵해야 한다(개발 트리가 매 부팅 울면 안 된다).
+        assert!(
+            !lines.iter().any(|(_, s)| s.contains("cys-app") || s.contains("cysd.exe")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑤ 판정 순수함수 진리표 — 우선순위(정식 > `.new` ≥64KiB > 최신 prev)·문턱·동률 결정론.
+    #[test]
+    fn plan_leftover_action_priority_thresholds_and_determinism() {
+        let pc = |name: &str, mtime: u64, size: u64| PrevCandidate {
+            name: name.into(),
+            mtime,
+            size,
+        };
+        let big = MIN_PROMOTABLE_BYTES;
+        // 정식 존재 → 스윕 위임. `.new` 는 존재할 때만(크기 무관) 삭제 지시 — 명시 규칙.
+        assert_eq!(
+            plan_leftover_action(true, None, &[]),
+            LeftoverPlan::SweepAll { delete_new: false }
+        );
+        assert_eq!(
+            plan_leftover_action(true, Some(3), &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::SweepAll { delete_new: true }
+        );
+        // 정식 부재: 온전한 `.new` 가 prev 보다 우선한다(경계 64KiB 정확히 = 승격 가능).
+        assert_eq!(
+            plan_leftover_action(false, Some(big), &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::PromoteNew
+        );
+        // `.new` 미달(잘림) → 최신 mtime 의 prev 폴백 + 미달 신본은 승격 성공 후 처분 지시.
+        assert_eq!(
+            plan_leftover_action(
+                false,
+                Some(big - 1),
+                &[pc("cys.prev.exe", 5, big), pc("cys.prev2.exe", 9, big)]
+            ),
+            LeftoverPlan::PromotePrev { source: "cys.prev2.exe".into(), delete_new: true }
+        );
+        // prev 중 미달 크기는 최신이어도 건너뛴다 — 잘린 본 승격은 다음 부팅의 "정식 존재" 오판
+        // → 남은 진짜 재료 삭제로 전이된다(가드가 막는 사고 그 자체).
+        assert_eq!(
+            plan_leftover_action(false, None, &[pc("cys.prev.exe", 99, 10), pc("cys.prev2.exe", 5, big)]),
+            LeftoverPlan::PromotePrev { source: "cys.prev2.exe".into(), delete_new: false }
+        );
+        // mtime 동률은 이름으로 깬다 — read_dir 순서와 무관한 부트 간 결정론.
+        assert_eq!(
+            plan_leftover_action(false, None, &[pc("cys.prev.exe", 7, big), pc("cys.prev3.exe", 7, big)]),
+            LeftoverPlan::PromotePrev { source: "cys.prev3.exe".into(), delete_new: false }
+        );
+        // 가족이 통째로 없으면 조용(NothingToDo) · 미달 재료뿐이면 동결(Hold) — 둘은 다른 상태다.
+        assert_eq!(plan_leftover_action(false, None, &[]), LeftoverPlan::NothingToDo);
+        assert_eq!(plan_leftover_action(false, Some(8), &[]), LeftoverPlan::Hold);
+        assert_eq!(
+            plan_leftover_action(false, None, &[pc("cys.prev.exe", 9, 8)]),
+            LeftoverPlan::Hold
+        );
+    }
+
+    /// G⑥ 가족 판정 — 설치기 형식(체인·unlock-sweep·W4-B tick)은 가족이고, 이웃 바이너리·
+    ///    남의 파일·`.new` 는 아니다. 확장자는 순수 로직의 매개변수다(exe 하드코딩 금지).
+    #[test]
+    fn family_membership_matches_exactly_one_binary() {
+        for n in [
+            "cys.prev.exe",      // 체인 슬롯
+            "cys.prev2.exe",
+            "cys.prev1756.exe",  // W4-B tick 슬롯 형식
+            "cys.exe.prev4213",  // unlock-sweep 형식
+            "CYS.PREV.EXE",      // Windows 대소문자 무구분
+            "cys.prev",
+        ] {
+            assert!(is_family_leftover(n, "cys", "exe"), "가족을 놓쳤다: {n}");
+        }
+        for n in [
+            "cysd.prev.exe",         // 이웃 바이너리의 잔해 — 접두 오염 금지
+            "cys-app.prev.exe",
+            "msys-2.0.dll.prev4213", // runtime 이미지 — 가드 범위 밖
+            "cys.new.exe",           // 문법 밖(잔해 아님) — 명시 규칙 전담
+            "cys.prevX.exe",         // 숫자 아님 = 잔해 아님(W1-5 과매칭 핀)
+            "notes.preview.png",
+        ] {
+            assert!(!is_family_leftover(n, "cys", "exe"), "가족 과매칭: {n}");
+        }
+        // 확장자 무관(순수) — unlock-sweep 형식은 exe 없는 세계에서도 같은 문법이다.
+        assert!(is_family_leftover("cys.bin.prev7", "cys", "bin"));
+        assert!(!is_family_leftover("cys.bin.prev7", "cys", "exe"));
+    }
+
+    /// G⑦ 승격 실패는 **동결로 강등**된다 — "정식 부재인데 지운다"로 전이하는 분기가 없음을
+    ///    주입 실패(rename 거부 = 잠긴 대상·권한·설치기 경합)로 박제한다.
+    #[test]
+    fn guard_failed_promotion_freezes_the_family_and_deletes_nothing() {
+        let root = workdir("guard-promote-fail");
+        touch_sized(&root.join("cys-app.new.exe"), MIN_PROMOTABLE_BYTES, b'N');
+        touch_sized(&root.join("cys-app.prev.exe"), MIN_PROMOTABLE_BYTES, b'P');
+        touch_sized(&root.join("cys-app.prev2.exe"), MIN_PROMOTABLE_BYTES, b'Q');
+
+        let mut guard = GuardStats::default();
+        let mut real_rm = |p: &Path| std::fs::remove_file(p).is_ok();
+        let mut refuse_promote = |_: &Path, _: &Path| false;
+        let hold =
+            guard_canonical_binaries(&root, "exe", &mut real_rm, &mut refuse_promote, &mut guard);
+
+        assert_eq!(
+            guard.promote_failed,
+            vec![("cys-app.exe".to_string(), "cys-app.new.exe".to_string())]
+        );
+        assert!(guard.promoted.is_empty() && guard.deleted_new == 0, "{guard:?}");
+        assert_eq!(
+            hold,
+            [root.join("cys-app.prev.exe"), root.join("cys-app.prev2.exe")]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "동결 집합이 가족 잔해 전체가 아니다"
+        );
+        // 동결이 실제로 스윕을 이긴다 — hold 를 그대로 넘긴 스윕은 무접촉·무계수여야 한다.
+        let mut sweep = SweepStats::default();
+        sweep_update_leftovers(
+            &root,
+            12,
+            &root.join(UPDATE_TRASH_DIR),
+            T0,
+            &hold,
+            &mut real_rm,
+            &mut real_relocate,
+            &mut sweep,
+        );
+        assert_eq!(sweep, SweepStats::default(), "동결된 재료를 스윕이 만졌다");
+        for keep in ["cys-app.new.exe", "cys-app.prev.exe", "cys-app.prev2.exe"] {
+            assert!(root.join(keep).exists(), "승격 실패에서 {keep} 를 잃었다");
+        }
+        let lines = guard_log_lines(&guard);
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("승격 실패")),
+            "실패가 침묵했다: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑧ prev 여러 개면 **최신 mtime** 이 승격된다(실제 파일시스템 mtime 배선까지) —
+    ///    가장 마지막까지 정식 자리에 있었던 본이 최신이다. unlock-sweep 형식도 후보다.
+    #[test]
+    fn guard_promotes_the_newest_prev_by_mtime() {
+        let root = workdir("guard-newest-prev");
+        touch_at(&root.join("cysd.prev.exe"), T0 - 100, MIN_PROMOTABLE_BYTES as usize);
+        touch_at(
+            &root.join("cysd.exe.prev777"),
+            T0 - 5,
+            MIN_PROMOTABLE_BYTES as usize + 3,
+        );
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert_eq!(
+            std::fs::metadata(root.join("cysd.exe")).unwrap().len(),
+            MIN_PROMOTABLE_BYTES + 3,
+            "최신 mtime 의 prev 가 아니라 다른 본이 승격됐다"
+        );
+        assert!(!root.join("cysd.exe.prev777").exists(), "승격은 rename 이어야 한다");
+        assert!(!root.join("cysd.prev.exe").exists(), "승격 후 잔여 prev 가 정리되지 않았다");
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("cysd.exe.prev777")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {
