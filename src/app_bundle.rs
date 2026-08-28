@@ -543,9 +543,20 @@ pub fn verify_seal_deep(bundle: &Path) -> SealVerdict {
 ///
 /// ★문구 계약(과장 금지): ⓐ 지금 당장 앱이 못 쓰게 된 게 **아니라는** 사실을 먼저 말한다
 /// (실제로 지금 돌고 있으니까 — 겁주면 오히려 신뢰를 잃는다) ⓑ 실제 위험은 "이 사본을 옮기거나
-/// 다시 받아서 열 때 macOS 가 차단할 수 있다"는 조건부라는 것을 그대로 말한다 ⓒ 해결은 재설치
-/// 하나뿐임을 링크와 함께 준다. 번들 안 파일을 지우라는 '부분 수리'는 **절대 안내하지 않는다**
-/// (App Management 보호에 막히고, 막히지 않아도 added 가 missing 으로 바뀔 뿐이다 — `RECOVERY_STEPS` 참조).
+/// 다시 받아서 열 때 macOS 가 차단할 수 있다"는 조건부라는 것을 그대로 말한다 ⓒ 기본 해결은
+/// 재설치이고 링크와 함께 준다 ⓓ 단 원인이 **번들에 '추가된' 파일뿐이면 그 파일 삭제만으로
+/// 봉인이 복구된다**는 갈래를 함께 준다.
+///
+/// ★ⓓ의 근거(2026-08-28 실측 교정): 추가된 파일은 서명 목록(CodeResources)에 없던 파일이라
+/// 지우면 봉인이 원상이다 — 실사례: 팩 preflight C11b 가 번들 안에 만든 `Contents/MacOS/cys-dept`
+/// 심링크를 `rm` 한 뒤 `spctl` accepted(재설치 불요). 종전 문구의 "지워도 added 가 missing 으로
+/// 바뀔 뿐"은 added 에 대해 거짓이었다(missing 은 서명 목록에 *있는* 파일이 사라진 갈래다) —
+/// e2e 핀 ③이 실 codesign 으로 이 복구를 박제한다. 수정(modified)·누락(missing) 파손의
+/// 되채움('부분 수리')은 계속 안내하지 않는다 — App Management 보호에 막히고, 막히지 않아도
+/// 세대 혼합 번들이 될 뿐이다(`RECOVERY_STEPS` 참조). `SealVerdict` 는 세 갈래를 합본 culprits
+/// 로 들고 오고 시그니처는 GUI 소비처(src-tauri seal_cache_payload)와의 계약이라, 갈래는 분기
+/// 대신 **조건부 문장**으로 넣고 사용자가 codesign 출력(file added:/modified:/missing:)으로
+/// 스스로 판별하게 한다.
 pub fn seal_broken_notice(bundle: &Path, culprits: &[String], self_inflicted: bool) -> String {
     let sample: Vec<&str> = culprits.iter().take(3).map(|s| s.as_str()).collect();
     let more = culprits.len().saturating_sub(sample.len());
@@ -566,15 +577,20 @@ pub fn seal_broken_notice(bundle: &Path, culprits: &[String], self_inflicted: bo
          봉인과 어긋난 파일 {}건: {}{}\n\n\
          지금 실행 중인 이 앱은 계속 사용할 수 있습니다. 다만 이 상태의 사본을 다른 맥으로 옮기거나 \
          내려받아 처음 열면, macOS Gatekeeper 가 \"손상되었기 때문에 열 수 없습니다\"로 차단할 수 있습니다.\n\n\
-         해결 방법은 최신 버전 재설치 하나뿐입니다 — www.cysinsight.com/downloads 에서 내려받아 \
+         기본 해결 방법은 최신 버전 재설치입니다 — www.cysinsight.com/downloads 에서 내려받아 \
          응용 프로그램 폴더의 기존 cys.app 을 휴지통으로 옮긴 뒤 새로 설치해 주세요.\n\
          (설정·대화기록은 앱 밖 ~/.cys 에 있어 재설치로 지워지지 않습니다.)\n\
-         재설치 후 이 앱을 완전히 종료하고 새로 열어 주세요 — 자가진단이 다시 돌아 정상이면 \
+         예외 — 어긋난 파일이 전부 원래 설치에 없던 '추가된' 파일이면(터미널에서 `codesign \
+         --verify --strict --verbose {}` 출력에 file added: 로 표시) 그 파일만 지워도 봉인이 \
+         복구되어 재설치가 필요 없습니다. file modified: 또는 file missing: 이 하나라도 있으면 \
+         재설치가 유일한 해법입니다.\n\
+         재설치(또는 추가 파일 삭제) 후 이 앱을 완전히 종료하고 새로 열어 주세요 — 자가진단이 다시 돌아 정상이면 \
          이 알림은 나타나지 않습니다.",
         bundle.display(),
         culprits.len(),
         sample_line,
-        cause
+        cause,
+        bundle.display()
     )
 }
 
@@ -997,10 +1013,13 @@ mod tests {
         ));
     }
 
-    /// ★SEAL-DIAG 회귀 핀 ②: 사용자 문구가 **정직**한가(과장 금지·부분 수리 금지).
+    /// ★SEAL-DIAG 회귀 핀 ②: 사용자 문구가 **정직**한가(과장 금지·복구 갈래 정확).
     /// 문구는 이 기능의 유일한 산출물이라 내용 계약을 코드로 잠근다.
+    /// (2026-08-28 개정: 종전 계약 '부분 수리 절대 금지'를 실측으로 교정 — **추가된** 파일은
+    ///  삭제만으로 봉인이 복구된다(핀 ③이 실 codesign 으로 증명·실사례 = C11b 의 번들 안
+    ///  cys-dept 심링크). 금지는 수정·누락 파손의 되채움과 위험 명령에만 남는다.)
     #[test]
-    fn seal_broken_notice_is_honest_and_never_suggests_partial_repair() {
+    fn seal_broken_notice_is_honest_and_scopes_repair_to_added_files() {
         let bundle = Path::new("/Applications/cys.app");
         let culprits = vec![
             "Contents/Resources/runtime/python/lib/python3.12/__pycache__/a.pyc".to_string(),
@@ -1019,10 +1038,22 @@ mod tests {
             msg.contains("완전히 종료하고 새로 열어 주세요"),
             "재설치 후 재시작 안내가 있어야 한다(알림 잔존 오독 방지)"
         );
-        // ★번들 안 파일을 지우라는 안내는 절대 나가면 안 된다(App Management 에 막히고,
-        //   막히지 않아도 added 가 missing 으로 바뀔 뿐 봉인은 그대로 깨진 채다).
+        // ★추가 파일 갈래(2026-08-28 실측): 추가된 파일은 삭제만으로 봉인이 복구된다 — 이
+        //   갈래가 빠지면 rm 한 줄로 끝날 일이 통째 재설치로 안내된다(실사고에서 치른 비용).
+        assert!(msg.contains("추가된"), "추가 파일 갈래가 있어야 한다");
+        assert!(msg.contains("file added:"), "판별 기준(codesign 어휘)을 그대로 줘야 한다");
+        assert!(msg.contains("재설치가 필요 없습니다"), "추가-전용 파손은 재설치 불요임을 말한다");
+        assert!(
+            msg.contains("file modified:") && msg.contains("file missing:"),
+            "갈래의 한계(수정·누락이 섞이면 재설치)를 함께 말해야 정직하다"
+        );
+        assert!(
+            msg.contains(&bundle.display().to_string()),
+            "판별 명령은 실제 번들 경로로 줘야 한다(하드코딩 금지)"
+        );
+        // 수정·누락 파손의 되채움·위험 명령 안내는 계속 금지.
         for forbidden in ["rm -rf", "__pycache__ 를 삭제", "codesign --force"] {
-            assert!(!msg.contains(forbidden), "부분 수리 안내 금지: {forbidden}");
+            assert!(!msg.contains(forbidden), "위험/되채움 안내 금지: {forbidden}");
         }
         // 자기유발이 아니면 python 원인 문장이 붙지 않는다(없는 사실을 말하지 않는다).
         let other = seal_broken_notice(bundle, &["Contents/Resources/x".into()], false);
@@ -1086,8 +1117,17 @@ mod tests {
             }
             v => panic!("파일 1개 추가로 봉인이 깨져야 한다: {v:?}"),
         }
-        // 진단은 읽기 전용 — 변이 파일을 지우지 않는다(부분 수리 금지).
+        // 진단은 읽기 전용 — 변이 파일을 지우지 않는다(삭제는 사용자의 결정).
         assert!(pyc.join("_compression.cpython-312.pyc").exists());
+        // ★추가 파일 갈래 실증(2026-08-28 교정의 근거): '추가된' 파일은 서명 목록에 없던
+        //   파일이라 지우면 봉인이 **원상 복구**된다 — 안내 문구의 새 갈래(재설치 불요)가 실
+        //   codesign 에서도 참임을 박제한다(종전 "지워도 missing 으로 바뀔 뿐" 주장의 반증).
+        std::fs::remove_file(pyc.join("_compression.cpython-312.pyc")).unwrap();
+        assert_eq!(
+            verify_seal_deep(&app),
+            SealVerdict::Intact,
+            "추가 파일 삭제 후 봉인은 원상이어야 한다(added ≠ missing)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

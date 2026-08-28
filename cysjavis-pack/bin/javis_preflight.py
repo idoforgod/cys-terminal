@@ -512,6 +512,20 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def base_pack_dir():
+    """C11b 심링크 타깃 전용 — 항상 **base 팩**을 돌려준다(기본 배치에선 `~/.cys/pack`).
+
+    dept 레인에서 pack_dir()(= `~/.cys/pack-dept-<name>` · src/pack.rs lane_pack_for_socket ·
+    javis_org.py create_dept 와 동일 규칙)을 링크 타깃으로 잡으면 base↔dept 레인이 번갈아
+    --fix 를 돌 때마다 ~/.local/bin/cys-dept 타깃이 플랩한다(REFLECTION-RIPPLE Mac-15).
+    부서 팩은 base 의 **형제 디렉터리**이므로 형제 `pack` 으로 승격한다 — 홈 리터럴을 다시
+    쓰지 않는 이유는 env 로 재배치된 팩 루트(레인 격리 규약)를 그대로 따라가기 위해서다."""
+    p = os.path.normpath(pack_dir())
+    if os.path.basename(p).startswith("pack-dept-"):
+        return os.path.join(os.path.dirname(p), "pack")
+    return p
+
+
 # ── B7 레인 분리(T-0147-2 §2 층3 · idle-standby-v5 D2/D3) ────────────────────
 # 델타게이트 상태(대장·카운터·seen-store·배지)는 **데몬(레인)별로 분리**돼야 한다. 공유하면
 # 여러 데몬이 같은 counters 를 밀어 stall 카운터가 배속 증가하고, 한 레인의 배지가 다른 레인의
@@ -2016,49 +2030,140 @@ class Preflight:
             self.add(cid, FAIL, "PATH에 cys 없음 — cys 터미널 설치/PATH 확인 필요")
 
     # ── C11b cys-dept PATH 노출 (Fix3' — CEO fan-out `cys-dept list`가 풀경로 없이 동작) ──
+    #
+    # cys·cysd는 컴파일 바이너리지만 cys-dept는 팩 bash 스크립트라 PATH에 없다 → CEO 디렉티브
+    # (CEO_TEMPLATE.md `cys-dept list` fan-out)·CSO reap·javis_org.py create_dept 의 bare
+    # `cys-dept` 호출이 풀경로 없이 실패한다(GUI/백엔드는 pack_dir()/bin 풀경로라 무관).
+    #
+    # ★2026-08-28 실사고(코드서명 봉인 파손)로 재설계 — 종전 구현은 링크를 `dirname(which("cys"))`
+    #   ("cys 와 같은 PATH dir")에 만들었는데, 페인 PATH **선두**가 `/Applications/cys.app/
+    #   Contents/MacOS` 라서 링크가 **앱 번들 안에** 생겼고 codesign 봉인이 깨졌다(spctl
+    #   "a sealed resource is missing or invalid" — C76 이 검출하는 그 파손의 생산자가 바로 이
+    #   검사였다). 게다가 which("cys-dept") realpath 일치 PASS 단락이 번들 안 링크를 영원히
+    #   PASS 로 덮어 번들 밖으로의 이행이 구조적으로 불가능했다. 재설계 4원칙:
+    #   ① 링크 위치는 `~/.local/bin` 고정(없으면 생성) — *.app 번들 안(특히 Contents/MacOS)에는
+    #      절대 만들지 않는다. `/usr/local/bin` 도 금지(root 소유·sudo 필요·D5 규약 위반).
+    #      해소 보장: unix 페인 PATH 는 `~/.local/bin` 을 말미에 무조건 append 한다(src/lib.rs
+    #      compose_unix_pane_path — bare 소비자 3곳 전부 페인에서 실행되므로 해소된다).
+    #   ② 링크 타깃은 **base 팩**(base_pack_dir()/bin/cys-dept)으로 고정 — dept 레인의 --fix 가
+    #      pack_dir()(=pack-dept-*)을 타깃으로 잡으면 레인이 바뀔 때마다 타깃이 플랩한다.
+    #   ③ 레거시 자기치유: 번들 안에 존재하거나·번들 안을 가리키거나·base 팩이 아닌 곳을
+    #      가리키는 기존 `cys-dept` 심링크는 fix 모드에서 **먼저 unlink** 한다(번들 안 링크는
+    #      '추가된 파일'이라 지우는 것만으로 봉인이 복구된다 — C76 복구 문구와 동일 실측).
+    #   ④ Windows(os.name == "nt")는 SKIP — 심링크에 관리자 권한/개발자 모드가 필요하고
+    #      cys-dept 는 unix 페인 전용이다.
+    #   가역·멱등·자가치유(실파일은 덮지 않음) — 비가역 외부설치가 아니므로 may_mutate 불요
+    #   (reversible local · unlink 대상도 이 검사가 만든 재생성 가능한 심링크뿐).
+
+    @staticmethod
+    def _in_app_bundle(path):
+        """조상 성분에 `*.app` 이 있거나 `Contents/MacOS` 아래인가(문자 판정·심링크 해소 없음).
+        링크 **위치**의 봉인 위반을 묻는 판정이라 realpath 를 쓰지 않는다 — "번들 안을
+        가리키는가"(타깃 판정)가 필요한 호출부는 realpath 를 먼저 적용해 넘긴다."""
+        parts = [p for p in os.path.normpath(os.path.abspath(path)).split(os.sep) if p]
+        dirs = parts[:-1]  # 마지막 성분(링크 자신)은 위치가 아니다
+        if any(c.endswith(".app") for c in dirs):
+            return True
+        return any(a == "Contents" and b == "MacOS" for a, b in zip(dirs, dirs[1:]))
+
     def c11b_cys_dept_path(self):
         cid = "C11b.cys-dept-path"
         if self.skipped(cid):
             return
-        # cys·cysd는 컴파일 바이너리(scripts/deploy_gate.py가 target/release→/opt/homebrew/bin 복사)지만
-        # cys-dept는 팩 bash 스크립트(~/.cys/pack/bin/cys-dept)라 PATH에 없다 → CEO 디렉티브의
-        # `cys-dept list` fan-out이 풀경로 없이 실패한다(GUI/백엔드는 pack_dir()/bin 풀경로라 무관).
-        # cys 옆(=같은 PATH dir)에 팩 스크립트로의 심링크를 둬 노출한다 — 가역·멱등·자가치유(스킬 심링크와
-        # 동일 규약: 실파일은 덮지 않음). 비가역 외부설치가 아니므로 may_mutate 불요(reversible local).
-        src = os.path.join(pack_dir(), "bin", "cys-dept")
+        if os.name == "nt":
+            self.add(cid, SKIP, "Windows — 심링크 권한 제약·cys-dept 는 unix 페인 전용(미해당)")
+            return
+        src = os.path.join(base_pack_dir(), "bin", "cys-dept")
         if not os.path.isfile(src):
-            self.add(cid, WARN, "팩에 bin/cys-dept 없음 — `cys init-pack` 재실행")
+            self.add(cid, WARN, "base 팩에 bin/cys-dept 없음(%s) — `cys init-pack` 재실행" % src)
             return
-        existing = shutil.which("cys-dept")
-        if existing and os.path.realpath(existing) == os.path.realpath(src):
-            self.add(cid, PASS, existing)
+        real_src = os.path.realpath(src)
+        link = os.path.join(os.path.expanduser("~"), ".local", "bin", "cys-dept")
+        if self._in_app_bundle(link):
+            # 정상 기계에선 나올 수 없는 형상(HOME 이 번들 안?)이지만, 어떤 경로로도 번들 안
+            # 생성은 거부한다 — 이 가드가 이 사고의 재발 불변식이다.
+            self.add(cid, WARN, "링크 위치 %s 가 앱 번들 안 — 생성 거부(봉인 보호 불변식)" % link)
             return
+        # 레거시 후보: ⓐ 현재 셸이 해소하는 cys-dept ⓑ 종전 구현의 생성 위치(cys 와 같은 dir)
+        # ⓒ 실사용 번들의 Contents/MacOS(페인 밖 실행이라 ⓐⓑ의 PATH 가 번들을 못 볼 때의 그물)
         cys = shutil.which("cys")
-        if not cys:
-            self.add(cid, SKIP, "cys 부재로 PATH dir 판정 불가 (C11 먼저)")
+        bundle = self._app_bundle_of(cys) if cys else None
+        cands, seen = [], set()
+        for cand in (shutil.which("cys-dept"),
+                     os.path.join(os.path.dirname(cys), "cys-dept") if cys else None,
+                     os.path.join(bundle, "Contents", "MacOS", "cys-dept") if bundle else None):
+            if not cand:
+                continue
+            cand = os.path.abspath(cand)
+            if cand != link and cand not in seen:
+                seen.add(cand)
+                cands.append(cand)
+        legacy, manual = [], []
+        for cand in cands:
+            if os.path.islink(cand):
+                if (self._in_app_bundle(cand)                           # 번들 안에 존재(봉인 파손)
+                        or self._in_app_bundle(os.path.realpath(cand))  # 번들 안을 가리킴
+                        or os.path.realpath(cand) != real_src):         # 오타깃(dept 팩 flap 등)
+                    legacy.append(cand)
+            elif os.path.isfile(cand) and self._in_app_bundle(cand):
+                manual.append(cand)  # 번들 안 '실파일' — 자동 삭제 금지(수동 안내만)
+        ok = self._symlink_ok(link, src)
+        blocked = os.path.exists(link) and not os.path.islink(link)  # 실파일 — 덮지 않는다
+        if ok and not legacy and not manual:
+            self.add(cid, PASS, "%s → %s (unix 페인 PATH 말미에 ~/.local/bin 자동 append — "
+                                "페인 밖 셸은 PATH 에 ~/.local/bin 추가 필요)" % (link, src))
             return
-        link = os.path.join(os.path.dirname(cys), "cys-dept")  # cys와 같은 PATH dir
-        if self._symlink_ok(link, src):
-            self.add(cid, PASS, link)
+        if not self.fix:
+            probs = []
+            if legacy:
+                probs.append("레거시 링크 정리 필요(번들 안 링크는 봉인 파손·오타깃은 flap): %s"
+                             % ", ".join(legacy))
+            if manual:
+                probs.append("번들 안 실파일 %s — 수동 삭제 시 봉인 복구" % ", ".join(manual))
+            if blocked:
+                probs.append("%s 실파일 존재 — 자동 심링크 보류(수동 확인)" % link)
+            elif not ok:
+                probs.append("~/.local/bin/cys-dept 미설치")
+            self.add(cid, WARN, " · ".join(probs)
+                     + " — --fix 로 이관(레거시 unlink → ~/.local/bin 심링크·base 팩 타깃)")
             return
-        if os.path.exists(link) and not os.path.islink(link):
-            self.add(cid, WARN, "%s 실파일 존재 — 자동 심링크 보류(수동 확인)" % link)
-            return
-        if self.fix:
+        # fix: 봉인 우선 — 레거시 unlink 를 생성보다 먼저, 실패해도 나머지 치유는 계속한다.
+        notes = []
+        for cand in legacy:
             try:
-                # PATH 해소(which/셸)는 대상이 실행가능해야 한다 — 팩 cys-dept가 0644면 심링크해도
-                # `cys-dept`가 안 잡힌다. 실행비트를 보강(가역·멱등)한 뒤 심링크한다(Fix1' 실행비트 의존 해소).
-                st = os.stat(src).st_mode
-                if not (st & 0o111):
-                    os.chmod(src, st | 0o111)
+                os.unlink(cand)
+                notes.append("레거시 unlink: %s" % cand)
+            except OSError as e:
+                # 번들 안 삭제는 App Management(TCC)에 막힐 수 있다 — '추가된 파일'이라
+                # 지우면 봉인이 복구되므로 아래 WARN 이 수동 rm 을 안내한다.
+                notes.append("레거시 unlink 실패(%s): %s" % (e, cand))
+        try:
+            # PATH 해소(which/셸)는 대상이 실행가능해야 한다 — 팩 cys-dept가 0644면 심링크해도
+            # `cys-dept`가 안 잡힌다. 실행비트를 보강(가역·멱등)한 뒤 심링크한다(Fix1' 유지).
+            st = os.stat(src).st_mode
+            if not (st & 0o111):
+                os.chmod(src, st | 0o111)
+            if not ok and not blocked:
+                os.makedirs(os.path.dirname(link), exist_ok=True)
                 if os.path.islink(link):
                     os.unlink(link)  # stale/오타깃 심링크 교체
                 os.symlink(src, link)
-                self.add(cid, FIXED, "%s → %s 심링크(PATH 노출·+x 보강)" % (link, src))
-            except OSError as e:
-                self.add(cid, WARN, "심링크/실행비트 실패(%s 쓰기권한?): %s" % (os.path.dirname(link), e))
+                notes.append("%s → %s 심링크(+x 보강)" % (link, src))
+        except OSError as e:
+            self.add(cid, WARN, "심링크/실행비트 실패(%s 쓰기권한?): %s — %s"
+                     % (os.path.dirname(link), e, "; ".join(notes) or "무진행"))
+            return
+        leftovers = [c for c in legacy if os.path.lexists(c)] + manual
+        if blocked:
+            self.add(cid, WARN, "%s 실파일 존재 — 자동 심링크 보류(수동 확인)%s"
+                     % (link, (" · " + "; ".join(notes)) if notes else ""))
+        elif leftovers:
+            self.add(cid, WARN, "이관 부분 완료 — 번들 안 잔재는 수동 rm 필요(추가 파일이라 "
+                                "지우면 봉인 복구): %s · %s"
+                     % (", ".join(leftovers), "; ".join(notes) or "무진행"))
         else:
-            self.add(cid, WARN, "cys-dept PATH 미노출 — --fix로 %s 심링크 생성" % link)
+            self.add(cid, FIXED, "%s (페인 PATH 말미 ~/.local/bin 으로 해소 — "
+                                 "src/lib.rs compose_unix_pane_path)" % ("; ".join(notes) or "정합 확인"))
 
     # ── C12 cysd 데몬 생존 ──
     def c12_daemon(self):
@@ -5109,11 +5214,23 @@ class Preflight:
     #   아니다 — 여기서 FAIL 을 내면 이미 파손된 기계가 READY→NOT READY 로 뒤집혀 부팅
     #   자체가 막힌다(C75 E1-4 선례와 동일 판단). 대신 detail 이 원인 파일과 복구 절차를 말한다.
     # ★판정 불가(비 macOS·번들 미발견·codesign 부재·타임아웃)는 전부 SKIP — 거짓 경보 금지.
-    # ★--fix 에서도 자동 수정 없음: 번들 안 파일 삭제는 App Management(TCC)에 막히고, 막히지
-    #   않아도 added 가 missing 으로 바뀔 뿐 봉인은 복구되지 않는다(통째 재설치만이 복구).
-    APP_SEAL_RECOVERY = ("복구는 번들 통째 재설치뿐 — 새 DMG의 cys.app 을 임시 폴더에 스테이징"
-                         "(ditto --rsrc --extattr --acl) 후 `mv` 로 /Applications 교체"
-                         "(/Applications 안 부분 수정은 App Management 보호에 막힘)")
+    # ★--fix 에서도 자동 수정 없음: 번들 안 파일 삭제는 App Management(TCC)에 막힐 수 있고,
+    #   수정(modified)·누락(missing) 파손은 지워서 복구되지 않는다(통째 재설치만이 복구). 추가
+    #   (added) 파손 중 C11b 가 스스로 만든 심링크만은 C11b --fix 가 unlink 로 자가치유한다
+    #   (생산자=치유자) — 그 밖의 추가 파일은 정체 미상인 채 지우는 자동화가 위험해 수동 안내만.
+    # ★복구 문구 2갈래(2026-08-28 실측 교정 — 종전 "지워도 added 가 missing 으로 바뀔 뿐"은
+    #   added 에 대해 거짓): '추가된' 파일은 서명 목록(CodeResources)에 없던 파일이라 **그
+    #   파일만 지우면 봉인이 원상 복구**된다 — 이 Mac 의 Contents/MacOS/cys-dept 심링크를 rm
+    #   한 뒤 spctl accepted 실측(재설치 불요). missing 은 서명 목록에 *있는* 파일이 사라진
+    #   갈래라 added 삭제로는 생기지 않는다. 수정·누락이 하나라도 섞이면 종전대로 통째 재설치
+    #   만이 복구다(부분 되채움은 TCC 에 막히고 세대 혼합 번들이 될 뿐이다).
+    APP_SEAL_RECOVERY = ("수정·누락 파손의 복구는 번들 통째 재설치뿐 — 새 DMG의 cys.app 을 임시 "
+                         "폴더에 스테이징(ditto --rsrc --extattr --acl) 후 `mv` 로 /Applications "
+                         "교체(/Applications 안 부분 수정은 App Management 보호에 막힘)")
+    APP_SEAL_RECOVERY_ADDED = ("파손이 전부 '추가된 파일'(file added)이라 그 파일만 지우면 "
+                               "봉인이 복구된다 — 재설치 불요(2026-08-28 실측: 번들 안 cys-dept "
+                               "심링크 rm 후 spctl accepted). 삭제가 권한에 막히면(App "
+                               "Management) 통째 재설치로")
 
     @staticmethod
     def _app_bundle_of(path):
@@ -5305,12 +5422,15 @@ class Preflight:
         rel = [c[len(bundle):].lstrip("/") if c.startswith(bundle) else c for c in culprits[:3]]
         pycache = " ★전부 __pycache__ — 번들 안 Python 런타임이 실행 중 스스로 생성(자기유발)" \
             if all("__pycache__" in c for c in culprits) else ""
+        # 추가-전용 파손만 '파일 삭제 = 복구' 갈래가 참이다 — 수정·누락이 섞이면 재설치 문구로.
+        recovery = (self.APP_SEAL_RECOVERY_ADDED if added and not modified and not missing
+                    else self.APP_SEAL_RECOVERY)
         self.add(cid, WARN,
                  "코드서명 봉인 파손 — %s · 추가 %d건·수정 %d건·누락 %d건(예: %s)%s · 이 번들을 "
                  "브라우저로 배포하면 받는 쪽 첫 실행에서 Gatekeeper 가 '손상되었기 때문에 열 수 "
                  "없습니다'로 차단한다(공증·staple 정상이어도) · %s"
                  % (bundle, len(added), len(modified), len(missing), ", ".join(rel), pycache,
-                    self.APP_SEAL_RECOVERY))
+                    recovery))
 
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
