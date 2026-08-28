@@ -3587,6 +3587,93 @@ fn is_transient_event_error(msg: &str) -> bool {
     MARKERS.iter().any(|k| m.contains(k))
 }
 
+/// (2c-gap) events.stream 구독 프레임 조립 — after_seq 커서를 그대로 싣는다.
+/// 순수 조립으로 분리한 이유: replay_gap 재시드 뒤의 재구독이 과거 전량 재생(after_seq=0 류)을
+/// 요청하지 않음을 테스트가 이 함수의 출력으로 직접 박제하기 위해서다(W2).
+fn events_stream_subscribe(after_seq: Option<u64>, names: &[String], categories: &[String]) -> Value {
+    json!({
+        "id": 1, "method": "events.stream",
+        "params": {"after_seq": after_seq, "names": names, "categories": categories},
+    })
+}
+
+/// 스트림 한 줄에 대한 판정 결과 — I/O 없는 순수 산출(stream_events 본선과 테스트가 공유).
+#[derive(Debug, Default, PartialEq)]
+struct StreamLineOutcome {
+    suppress_print: bool,      // --filter 접두 뷰 필터(커서는 전 이벤트에 대해 전진)
+    cursor_write: Option<u64>, // --cursor-file 에 기록할 seq(이벤트 전진 + replay_gap 재시드)
+    gap_notice: Option<String>, // replay_gap 1줄 경고(stderr)용 서버 메시지 — 종료가 아니라 계속의 신호
+    terminate: Option<String>, // Some(code) ⇒ Err 격상 → 재시도 게이트(transient 판정)
+}
+
+/// 스트림 라인 1개를 커서 상태에 적용한다(순수 판정 — 소켓/파일 I/O 는 호출부 배선).
+///
+/// ★replay_gap 계약(W2 · 재스폰 스톰 차단): 데몬 재시작·ring(4096) 밀림으로 커서 이후가
+/// 재생 불가하면 데몬은 ack(latest_seq 동봉) → error/replay_gap 순으로 보낸 뒤 **스트림을
+/// 계속한다**(cysd run_event_stream — warn 후 잔여 replay·live 진행). 종전 CLI 는 이를 Err 로
+/// 격상했고 transient 목록에 없어 프로세스가 종료됐으며 커서 파일도 안 전진해, HUD 브리지가
+/// 같은 구커서로 2초마다 새 cys 를 영원히 재스폰했다(설치 중 cys.exe 상시 재잠금의 결정론
+/// 원인 — REFLECTION-RIPPLE C17). 수리: 종료하지 않고 커서를 서버가 알린 최신 지점
+/// (ack/heartbeat 의 `latest_seq`)으로 재설정, 재료가 없으면 None("지금부터")으로 — 어느
+/// 갈래도 과거 전량 재생을 요청하지 않는다. 구 데몬은 replay_gap 을 보내지 않으므로 동작 불변.
+fn apply_stream_line(
+    l: &str,
+    last_seq: &mut Option<u64>,
+    ack_latest: &mut Option<u64>,
+    filter: Option<&str>,
+) -> StreamLineOutcome {
+    let mut out = StreamLineOutcome::default();
+    if let Ok(v) = serde_json::from_str::<Value>(l) {
+        match v["type"].as_str() {
+            Some("event") => {
+                if let Some(seq) = v["seq"].as_u64() {
+                    *last_seq = Some(seq);
+                    out.cursor_write = Some(seq); // (3) 매 이벤트 원자적 갱신
+                }
+                // --filter 접두 뷰 필터: 이벤트 이름이 접두와 안 맞으면 출력만 건너뛴다(커서는
+                // 전 이벤트에 대해 전진 — 뷰 필터라 replay/커서 단조성은 불변).
+                if let Some(prefix) = filter {
+                    let name = v["name"].as_str().unwrap_or("");
+                    if !name.starts_with(prefix) {
+                        out.suppress_print = true;
+                    }
+                }
+            }
+            Some("ack") => {
+                // 재시드 재료: ack 는 구독 직후의 서버 최신 seq 를 싣는다(구 데몬 무필드 = None 유지).
+                if let Some(latest) = v["latest_seq"].as_u64() {
+                    *ack_latest = Some(latest);
+                }
+                if last_seq.is_none() {
+                    // 첫 이벤트 수신 전 끊겨도 재접속이 구체적 커서로 replay 경로를 타게 시드
+                    *last_seq = v["latest_seq"].as_u64();
+                }
+            }
+            Some("heartbeat") => {
+                // keepalive — 출력만, 커서 영향 없음. latest_seq 는 재시드 재료로만 흡수.
+                if let Some(latest) = v["latest_seq"].as_u64() {
+                    *ack_latest = Some(latest);
+                }
+            }
+            Some("error") if v["ok"] == false => {
+                let code = v["error"]["code"].as_str().unwrap_or("stream_error");
+                if code == "replay_gap" {
+                    // ★종료 금지: 유실 구간은 복구 불가 — 커서만 서버 최신으로 당겨 잇는다.
+                    *last_seq = *ack_latest;
+                    out.cursor_write = *ack_latest;
+                    out.gap_notice =
+                        Some(v["error"]["message"].as_str().unwrap_or("").to_string());
+                } else {
+                    // slow_consumer 등은 종전대로 Err 격상 → 재시도 게이트(transient 판정)
+                    out.terminate = Some(code.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Subscribe to the push event stream and print NDJSON lines.
 fn stream_events(
     after_seq: Option<u64>,
@@ -3612,57 +3699,41 @@ fn stream_events(
         }
         let attempt = (|| -> Result<(), String> {
             let mut stream = connect()?;
-            let req = json!({
-                "id": 1, "method": "events.stream",
-                "params": {"after_seq": last_seq, "names": names, "categories": categories},
-            });
+            let req = events_stream_subscribe(last_seq, &names, &categories);
             let mut line = serde_json::to_string(&req).unwrap();
             line.push('\n');
             stream
                 .write_all(line.as_bytes())
                 .map_err(|e| e.to_string())?;
             let reader = BufReader::new(stream);
+            // (2c-gap) 이 접속에서 서버가 알린 최신 seq — replay_gap 커서 재시드 재료.
+            let mut ack_latest: Option<u64> = None;
             for read in reader.lines() {
                 let l = read.map_err(|e| e.to_string())?;
-                // (2c) 에러 프레임을 행동으로 연결: slow_consumer/replay_gap을 Err로 격상해
-                // 재시도 게이트가 transient 판정을 거치게 한다. 출력 중복을 막으려 should_return
-                // 플래그를 세우고 println은 루프 말미 한 곳에서만 한다.
-                let mut should_return: Option<String> = None;
-                // --filter 접두 뷰 필터: 이벤트 이름이 접두와 안 맞으면 출력만 건너뛴다(커서는
-                // 전 이벤트에 대해 전진 — 뷰 필터라 replay/커서 단조성은 불변).
-                let mut suppress_print = false;
-                if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                    match v["type"].as_str() {
-                        Some("event") => {
-                            if let Some(seq) = v["seq"].as_u64() {
-                                last_seq = Some(seq);
-                                if let Some(cf) = &cursor_file {
-                                    write_event_cursor(cf, seq)?; // (3) 매 이벤트 원자적 갱신
-                                }
-                            }
-                            if let Some(prefix) = filter.as_deref() {
-                                let name = v["name"].as_str().unwrap_or("");
-                                if !name.starts_with(prefix) {
-                                    suppress_print = true;
-                                }
-                            }
-                        }
-                        Some("ack") if last_seq.is_none() => {
-                            // 첫 이벤트 수신 전 끊겨도 재접속이 구체적 커서로 replay 경로를 타게 시드
-                            last_seq = v["latest_seq"].as_u64();
-                        }
-                        Some("heartbeat") => { /* keepalive — 출력만, 커서 영향 없음 */ }
-                        Some("error") if v["ok"] == false => {
-                            let code = v["error"]["code"].as_str().unwrap_or("stream_error");
-                            should_return = Some(code.to_string());
-                        }
-                        _ => {}
+                // (2c) 에러 프레임을 행동으로 연결: slow_consumer 등은 Err 격상 → 재시도
+                // 게이트의 transient 판정. ★replay_gap 만은 종료가 아니라 커서 재시드 후
+                // 계속이다(판정은 apply_stream_line — 무한 재스폰 스톰 차단, W2).
+                let out = apply_stream_line(&l, &mut last_seq, &mut ack_latest, filter.as_deref());
+                if let Some(seq) = out.cursor_write {
+                    if let Some(cf) = &cursor_file {
+                        write_event_cursor(cf, seq)?; // (3) 매 이벤트 원자적 갱신 + gap 재시드
                     }
                 }
-                if !suppress_print {
+                if let Some(msg) = &out.gap_notice {
+                    // 1줄 경고 후 계속(종료 금지) — 서버는 warn 후 잔여 replay·live 를 잇는다
+                    match last_seq {
+                        Some(s) => eprintln!(
+                            "[events] replay_gap: {msg} — 커서를 서버 최신 seq {s} 로 재설정하고 계속합니다"
+                        ),
+                        None => eprintln!(
+                            "[events] replay_gap: {msg} — 재설정 재료가 없어 지금부터(무커서) 이어갑니다"
+                        ),
+                    }
+                }
+                if !out.suppress_print {
                     println!("{l}");
                 }
-                if let Some(c) = should_return {
+                if let Some(c) = out.terminate {
                     return Err(c);
                 }
             }
@@ -17234,6 +17305,89 @@ mod tests {
         // 비-transient는 재연결 금지(즉시 반환)
         assert!(!is_transient_event_error("invalid_params"));
         assert!(!is_transient_event_error("bad cursor in /tmp/cur"));
+    }
+
+    /// ★(2c-gap) W2 회귀 박제 — replay_gap 은 종료가 아니라 "커서 재시드 후 계속"이다.
+    ///
+    /// 데몬 재시작·ring(4096) 밀림 시 cysd 는 ack(latest_seq) → error/replay_gap 순으로 보내고
+    /// 스트림을 계속한다. 종전 CLI 는 replay_gap 을 Err 로 격상했고 transient 목록에도 없어
+    /// 프로세스가 종료됐으며 커서 파일도 안 전진해, HUD 브리지가 같은 구커서로 2초마다 새
+    /// cys 를 영원히 재스폰했다(설치 중 cys.exe 상시 재잠금의 결정론 원인). 모의 스트림으로
+    /// ① 종료하지 않음 ② 커서가 서버 최신으로 갱신됨 ③ 재구독이 과거 전량 재생을 요청하지
+    /// 않음을 박제한다.
+    #[test]
+    fn replay_gap_reseeds_cursor_and_does_not_terminate() {
+        let mut last_seq = Some(3u64); // 링보다 한참 뒤처진 구커서(--cursor-file 시드 가정)
+        let mut ack_latest = None;
+        // 실제 cysd run_event_stream 와이어 순서: ack 먼저(구독 직후 최신 seq 동봉)
+        let ack = r#"{"type":"ack","ok":true,"latest_seq":500,"heartbeat_interval_seconds":15,"resume":{"after_seq":3,"oldest_seq":420,"latest_seq":500,"next_seq":501,"gap":true}}"#;
+        let out = apply_stream_line(ack, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(out.terminate, None);
+        assert_eq!(last_seq, Some(3), "ack 는 무커서일 때만 시드한다(기존 계약 유지)");
+        assert_eq!(ack_latest, Some(500), "재시드 재료(ack latest_seq) 흡수");
+        // 이어서 replay_gap(실제 프레임 형태 — cysd/main.rs run_event_stream)
+        let gap = r#"{"type":"error","ok":false,"error":{"code":"replay_gap","message":"events 4..=419 no longer available (ring evicted or daemon restarted)"}}"#;
+        let out = apply_stream_line(gap, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(out.terminate, None, "① replay_gap 은 종료(Err 격상) 금지 — 스톰의 축");
+        assert_eq!(last_seq, Some(500), "② 커서가 서버 최신으로 재설정");
+        assert_eq!(out.cursor_write, Some(500), "② --cursor-file 재기록 지시");
+        assert!(out.gap_notice.is_some(), "1줄 경고는 남긴다(무음 유실 금지)");
+        assert!(!out.suppress_print, "에러 프레임 원문 에코는 유지(관측 하위호환)");
+        // ③ 재구독 프레임: after_seq=서버 최신 — 과거 전량 재생(0/전체 ring) 요청이 아니다
+        let req = events_stream_subscribe(last_seq, &[], &[]);
+        assert_eq!(req["params"]["after_seq"], json!(500));
+        // slow_consumer 등 여타 에러 코드는 종전대로 Err 격상(transient 게이트로) — 회귀 핀
+        let slow = r#"{"type":"error","ok":false,"error":{"code":"slow_consumer","message":"dropped 9 events"}}"#;
+        let out = apply_stream_line(slow, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(out.terminate.as_deref(), Some("slow_consumer"));
+    }
+
+    /// ★(2c-gap) 재시드 재료가 없으면(이형 데몬 ack 에 latest_seq 부재) "지금부터"다.
+    /// after_seq=None 재구독은 서버 replay 게이트(`if let Some(after)`)를 아예 안 타므로
+    /// 과거 전량 재생이 구조적으로 불가능하다 — 절대 0 으로 폴백하지 않는다(이벤트 폭주 금지).
+    #[test]
+    fn replay_gap_without_server_latest_resumes_from_now_never_from_zero() {
+        let mut last_seq = Some(7u64);
+        let mut ack_latest = None; // latest_seq 없는 ack — 흡수 재료 없음
+        let ack = r#"{"type":"ack","ok":true}"#;
+        let _ = apply_stream_line(ack, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(ack_latest, None);
+        let gap = r#"{"type":"error","ok":false,"error":{"code":"replay_gap","message":"events 8..=99 no longer available (ring evicted or daemon restarted)"}}"#;
+        let out = apply_stream_line(gap, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(out.terminate, None, "① 종료 금지는 재료 유무와 무관");
+        assert_eq!(last_seq, None, "② '지금부터'(after_seq=None) — 0 폴백 금지");
+        assert_eq!(out.cursor_write, None, "커서 파일에 0 을 쓰지 않는다 — 다음 이벤트가 덮는다");
+        let req = events_stream_subscribe(last_seq, &[], &[]);
+        assert!(req["params"]["after_seq"].is_null(), "③ 전량 재생 요청 아님(무커서 구독)");
+    }
+
+    /// (2c-gap) 리팩터 등가성 핀 — apply_stream_line 추출 후에도 기존 라인 의미가 그대로다:
+    /// 이벤트=커서 전진+파일 기록, --filter 는 출력만 억제(커서는 전진), ack 시드는 무커서
+    /// 한정, heartbeat 는 출력 전용(커서 무영향), 비 JSON 라인은 상태 무변경 에코.
+    #[test]
+    fn stream_line_semantics_survive_extraction() {
+        let mut last_seq = None;
+        let mut ack_latest = None;
+        // ack 가 무커서를 시드(첫 이벤트 전 단절 대비 — 기존 계약)
+        let ack = r#"{"type":"ack","ok":true,"latest_seq":41,"resume":{"gap":false}}"#;
+        let _ = apply_stream_line(ack, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(last_seq, Some(41));
+        // 이벤트: 커서 전진 + 파일 기록 지시, 필터 불일치는 출력만 억제
+        let ev = r#"{"type":"event","seq":42,"name":"task.done","payload":{}}"#;
+        let out = apply_stream_line(ev, &mut last_seq, &mut ack_latest, Some("surface."));
+        assert_eq!(last_seq, Some(42));
+        assert_eq!(out.cursor_write, Some(42));
+        assert!(out.suppress_print, "필터 불일치 = 출력 억제(커서는 전진 — 뷰 필터 계약)");
+        assert_eq!(out.terminate, None);
+        // heartbeat: 커서 무영향·출력 유지, latest_seq 는 재시드 재료로만 흡수
+        let hb = r#"{"type":"heartbeat","latest_seq":77}"#;
+        let out = apply_stream_line(hb, &mut last_seq, &mut ack_latest, None);
+        assert_eq!(last_seq, Some(42), "heartbeat 는 커서 무영향(기존 계약)");
+        assert_eq!(ack_latest, Some(77), "재시드 재료는 최신화");
+        assert!(!out.suppress_print);
+        // 비 JSON: 상태 무변경 + 에코
+        let out = apply_stream_line("not-json", &mut last_seq, &mut ack_latest, None);
+        assert_eq!((last_seq, out.suppress_print, out.terminate), (Some(42), false, None));
     }
 
     /// ★회귀 박제 (Windows named pipe busy-retry — ERROR_PIPE_BUSY 231 봉인):

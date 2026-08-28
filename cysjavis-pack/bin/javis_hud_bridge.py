@@ -35,7 +35,9 @@ FLEET_POLL_SECS = float(os.environ.get("HUD_POLL", "2.0"))
 CYS = os.environ.get("HUD_CYS_BIN", "cys")
 # P2-1 부서 이벤트 멀티 구독 슈퍼바이저
 SUB_CAP = int(os.environ.get("HUD_SUB_CAP", "12"))     # 동시 구독 상한(런어웨이 방지)
-SUB_BACKOFF_SECS = 2.0                                   # 구독 재수립 백오프
+SUB_BACKOFF_SECS = 2.0                                   # 구독 재수립 백오프(바닥 — W2 지수의 시작값)
+SUB_BACKOFF_CAP_SECS = 60.0                              # W2: 급속 재종료 지수 백오프 상한
+SUB_STABLE_RESET_SECS = 30.0                             # W2: 이만큼 살았으면 정상 구독 — 백오프 초기화
 SUB_RECONCILE_SECS = 2.0                                 # 타깃 reconcile 주기
 # Windows: 이 브리지는 콘솔 없는 cysd가 NO_WINDOW로 띄운다 — 콘솔 자식(cys.exe)을 그냥
 # 스폰하면 새 콘솔 창이 할당된다(상주 events 자식 = AppData 경로 제목의 검은 WT 탭 실사고
@@ -1474,6 +1476,21 @@ def reconcile_targets(desired, active, cap=SUB_CAP):
     return to_spawn, to_reap
 
 
+def next_sub_backoff(prev, alive_secs, base=SUB_BACKOFF_SECS,
+                     cap=SUB_BACKOFF_CAP_SECS, stable=SUB_STABLE_RESET_SECS):
+    """구독 자식 재수립 대기 산출 (W2 · 순수 로직 — 테스트 대상).
+
+    prev: 직전에 잔 대기(초), None = 첫 재수립. alive_secs: 방금 끝난 자식의 생존 시간(초).
+    안정 생존(>= stable)은 정상 회전이므로 base 로 초기화, 조기 종료는 지수(×2)·cap 상한.
+    고정 2초 재스폰은 즉사하는 events 자식(구 CLI 의 replay_gap 종료 등)과 결합해 새 cys 를
+    영원히 재스폰하는 스톰이었다(설치 중 INSTDIR 의 cys.exe 상시 재잠금·평시 CPU 낭비) —
+    상한 지수로 폭주 축을 끊되, 안정 구독의 정상 회전(데몬 rotate 등)은 벌하지 않는다.
+    """
+    if prev is None or alive_secs >= stable:
+        return base
+    return min(prev * 2.0, cap)
+
+
 class SubscriptionSupervisor:
     """부서별 (slug,socket) 이벤트 구독 fan-out 슈퍼바이저 (P2-1).
 
@@ -1494,7 +1511,10 @@ class SubscriptionSupervisor:
         cursor = os.path.join(self.state_dir, f"cursor-{slug}.seq")
         args_base = [CYS] + (["--socket", socket] if socket else []) + \
                     ["events", "--reconnect", "--cursor-file", cursor]
+        backoff = None    # W2: 직전에 잔 대기(초) — None = 첫 재수립(지수 백오프 상태)
+        last_note = None  # W2: 같은 사유 연속 재종료는 1회만 로그(반복 억제)
         while not stop.is_set():
+            born = time.monotonic()
             proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
             holder[0] = proc
@@ -1523,7 +1543,23 @@ class SubscriptionSupervisor:
                     pass
             if stop.is_set():
                 break
-            time.sleep(SUB_BACKOFF_SECS)   # 구독 재수립 백오프
+            # W2 재스폰 스톰 차단: 조기 종료는 지수 백오프(2→4→…→60s), 안정 생존
+            # (>= SUB_STABLE_RESET_SECS) 후 종료는 정상 회전으로 보고 백오프 초기화.
+            alive = time.monotonic() - born
+            backoff = next_sub_backoff(backoff, alive)
+            try:                      # 종료 코드 회수(좀비 회수 겸) — EOF 후이므로 즉시가 정상
+                rc = proc.wait(timeout=1.0)
+            except Exception:
+                rc = proc.poll()
+            note = (alive < SUB_STABLE_RESET_SECS, rc)
+            if note != last_note:     # 같은 (급속여부, rc) 연속이면 첫 1회만 — 로그 폭주 억제
+                sys.stderr.write(
+                    "[hud-bridge] events 자식 종료 (sub=%s rc=%s alive=%.1fs) — %.0fs 후 재수립%s\n"
+                    % (slug, rc, alive, backoff,
+                       " (지수 백오프)" if note[0] else " (안정 생존 — 백오프 초기화)"))
+                sys.stderr.flush()
+                last_note = note
+            stop.wait(backoff)        # 구독 재수립 백오프 — Event.wait: reap 시 즉시 깨어남
 
     def _spawn(self, slug, socket):
         stop = threading.Event()
