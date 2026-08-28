@@ -24,6 +24,9 @@
   1단(엄격): cys.exe·cysd.exe·cys-browserd.exe 는 vcruntime 임포트 자체가 무조건 실패.
      같은 폴더 DLL 동봉으로도 통과 불가 — DLL 드롭은 런타임엔 유효해도 crt-static 정책
      회귀의 무음 통과 경로가 되므로 봉쇄한다.
+     ★설치 훅 스테이징 별칭(2026-08-29 W4): `<이름>.new.exe`·`<이름>.prev[숫자].exe` 는
+     정식 `<이름>.exe` 와 같은 등급으로 판정한다(canonical_name — NSIS-CONTRACT.md §1).
+     존재하면 정식과 동일하게 검사되고, 부재해도 어떤 검사도 실패하지 않는다.
   2단(규칙): 그 외 exe 는 같은 디렉토리에 vcruntime140.dll 동봉 시만 허용(app-local =
      실제 런타임 안전 불변식. v0.13.22 실측: runtime/python/{python,python3,pythonw}.exe
      3종이 자연 통과. 경로 하드코딩 없음 — 레이아웃 변화 내성).
@@ -38,6 +41,7 @@
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -55,6 +59,31 @@ for _stream in (sys.stdout, sys.stderr):
 
 # 정책 회귀를 무조건 차단하는 우리 바이너리(경로 말단 이름, 소문자).
 STRICT_BINARIES = {"cys.exe", "cysd.exe", "cys-browserd.exe"}
+
+# ── 설치 훅 스테이징 산출물(transient artefacts) 판정 별칭 (W4 · 2026-08-29) ──
+# NSIS 훅의 잠금 무관 배치(src-tauri/nsis-hooks.nsh · NSIS-CONTRACT.md §1)는 신본을
+# `<bin>.new.exe` 로 추출한 뒤 rename 2단으로 정식에 앉히고, 구본은 `<bin>.prev.exe`/
+# `.prev2.exe`/`.prev3.exe`/`.prev<틱숫자>.exe` 슬롯으로 대피시킨다. 이 이름들은 정식
+# 바이너리의 바이트 동일 사본(.new) 또는 구세대 사본(.prev*)이므로 **정식과 같은 등급**으로
+# 판정한다 — `cys.new.exe` 가 규칙 2(app-local DLL 허용)로 미끄러지면 crt-static 정책
+# 회귀가 vcruntime140.dll 동봉으로 무음 통과하는 구멍이 된다(엄격 우회 봉쇄).
+# ★부재는 결코 실패가 아니다: 어느 검사도 이 이름들의 존재를 요구하지 않는다(성공 설치
+# 후 `.new` 는 rename 으로 소멸이 정상 — 훅 ⑧단). 접미 문법은 cysd 부팅 가드의 가족
+# 문법(`prev` + 숫자만)과 일치시킨다 — `cys.prevX.exe`(숫자 아님)는 별칭이 아니다.
+TRANSIENT_SUFFIX_RE = re.compile(r"\.(?:new|prev\d*)\.exe$")
+
+
+def canonical_name(fn):
+    """말단 파일명(소문자화) → 판정용 정식 이름.
+
+    `cys.new.exe`·`cys.prev.exe`·`cys.prev3.exe`·`cys.prev1234567.exe` → `cys.exe`.
+    접미 문법 밖 이름은 소문자화만 하고 그대로 둔다(기존 판정과 동일).
+    """
+    lower = fn.lower()
+    m = TRANSIENT_SUFFIX_RE.search(lower)
+    if m:
+        return lower[: m.start()] + ".exe"
+    return lower
 
 # 0.14.4 수리 세대 마커 — cysd 소스의 FIX_GENERATION const 바이트열(live RPC 참조+main() 부팅로그 임베드 · v4).
 # ★코드 경로 문자열 휴리스틱 폐기(CI run 30357918475 실증 · 2026-07-28):
@@ -169,7 +198,8 @@ def check_imports(tree):
                 continue
             if not any(NEEDLE in d.lower() for d in dlls):
                 continue
-            if fn.lower() in STRICT_BINARIES:
+            # 훅 스테이징 별칭(cys.new.exe 등)도 정식과 같은 등급으로 — 위 canonical_name 주석.
+            if canonical_name(fn) in STRICT_BINARIES:
                 violations.append((rel, "정책 바이너리 — 예외 불허(crt-static 회귀)"))
             elif os.path.isfile(os.path.join(dirpath, "vcruntime140.dll")):
                 allowed.append(rel)
@@ -179,15 +209,28 @@ def check_imports(tree):
 
 
 def check_markers(tree):
-    """검사 B. 반환: (결손 마커 목록, cysd 경로 or None)."""
+    """검사 B. 반환: (결손 마커 목록, cysd 경로 or None).
+
+    정식 `cysd.exe` 를 우선하고, 정식이 트리 어디에도 없을 때만 훅 스테이징 사본
+    `cysd.new.exe`(이번 빌드와 바이트 동일 — NSIS-CONTRACT.md §1)로 폴백한다.
+    훅 도입으로 setup.exe 추출 레이아웃(7z 의 NSIS `File /oname=` 해석)이 정식 이름을
+    어떻게 놓든, 이 빌드의 cysd 바이트가 존재하면 마커 검사가 성립해야 한다 —
+    `.new` 의 **부재**는 어느 경로에서도 실패가 아니다(정식만 있으면 종전과 동일).
+    """
     cysd = None
+    fallback = None
     for dirpath, _, files in os.walk(tree):
         for fn in files:
             if fn.lower() == "cysd.exe":
                 cysd = os.path.join(dirpath, fn)
                 break
+            if fn.lower() == "cysd.new.exe" and fallback is None:
+                fallback = os.path.join(dirpath, fn)
         if cysd:
             break
+    if cysd is None and fallback is not None:
+        print(f"  markers: 정식 cysd.exe 부재 — 스테이징 사본으로 폴백: {fallback}")
+        cysd = fallback
     if cysd is None:
         return [m.decode("utf-8", "replace") for m in FIX_MARKERS], None
     with open(cysd, "rb") as f:

@@ -6075,14 +6075,18 @@ fn seal_rel(bundle: &std::path::Path, p: &str) -> String {
     cys::app_bundle::seal_relative(bundle, p)
 }
 
-/// 봉인 파손 시 사용자에게 주는 **유일하게 통하는 복구 절차**.
-/// /Applications 안에서 파일을 지우는 부분 수정은 App Management(TCC)에 막히므로,
-/// 임시 폴더에 새 번들을 스테이징한 뒤 `mv` 로 통째 교체해야 한다.
-const APP_SEAL_RECOVERY: &str = "복구는 번들 통째 재설치뿐 — ①cys 종료 ②새 DMG의 cys.app 을 임시 폴더에 \
+/// 봉인 파손 시 사용자에게 주는 복구 절차. 기본은 번들 통째 재설치 — 단 2026-08-28 실측 교정:
+/// 원인이 전부 **추가된**(file added:) 파일이면 그 파일 삭제만으로 봉인이 원상 복구된다
+/// (`app_bundle.rs` `seal_broken_notice` 와 같은 계약 · W3c). 수정(modified)·누락(missing)
+/// 파손의 되채움 '부분 수정'은 계속 안내하지 않는다 — App Management(TCC)에 막히고, 막히지
+/// 않아도 봉인은 복구되지 않으므로 임시 폴더 스테이징 후 `mv` 통째 교체가 유일하다.
+const APP_SEAL_RECOVERY: &str = "기본 복구는 번들 통째 재설치 — ①cys 종료 ②새 DMG의 cys.app 을 임시 폴더에 \
 스테이징(`ditto --rsrc --extattr --acl <dmg>/cys.app /tmp/cys-stage/cys.app`) ③`mv /Applications/cys.app \
 ~/.Trash/cys.app.broken` ④`mv /tmp/cys-stage/cys.app /Applications/`. \
-★/Applications 안 번들의 파일을 지우는 '부분 수정'은 App Management 보호에 막히고, 막히지 않아도 \
-봉인은 복구되지 않는다(added 가 missing 으로 바뀔 뿐). ★재설치 전까지 이 사본을 다른 맥으로 \
+★예외 — 어긋남이 원래 설치에 없던 '추가' 파일뿐이면(진단의 수정 0건·누락 0건 = `codesign \
+--verify --strict --verbose /Applications/cys.app` 출력이 전부 file added:) 그 파일만 지워도 봉인이 \
+복구되어 재설치가 필요 없다. file modified: 또는 file missing: 이 하나라도 있으면 재설치뿐 — 그쪽 \
+되채움 '부분 수정'은 App Management 보호에 막히고, 막히지 않아도 봉인은 복구되지 않는다. ★재설치(또는 추가 파일 삭제) 전까지 이 사본을 다른 맥으로 \
 전달하지 말 것 — quarantine 이 붙은 첫 실행에서 '손상되었기 때문에 열 수 없습니다'로 차단된다";
 
 fn diag_app_seal(ctx: &DoctorCtx) -> DiagItem {

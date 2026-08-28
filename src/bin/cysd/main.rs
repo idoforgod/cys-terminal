@@ -44,9 +44,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 // ═══ 업데이트 잔해(.prev*) 회수 — 판정·행동 규칙 (P1b · Windows 전용 · 회귀 핀 대상) ═══
 //
-// 생성원은 설치기 두 곳뿐이다(src-tauri/nsis-hooks.nsh):
-//   ① CYS_SWAP_IN_PLACE(:130-141)  — `<bin>.prev.exe` · `.prev2.exe` · `.prev3.exe` 고정 3칸 체인
-//   ② unlock-sweep.ps1(:355-371)   — `<원본이름>.prev<rand>` (rand = Get-Random -Maximum 99999)
+// 생성원은 설치기 두 곳뿐이다(src-tauri/nsis-hooks.nsh — 라인 대신 매크로·규약 이름으로 인용):
+//   ① CYS_PLACE 배치 트랜잭션 ⑤(구 CYS_SWAP_IN_PLACE) — `<bin>.prev.exe` · `.prev2.exe` ·
+//      `.prev3.exe` 고정 3칸 체인 + tick 슬롯 `<bin>.prev<GetTickCount>.exe`(숫자만 · 훅 잠금 규약 L3)
+//   ② PREINSTALL 의 unlock-sweep(잠금 규약 L4·L5) — `<원본이름>.prev<rand>` (rand = Get-Random -Maximum 99999)
 // 둘 다 "잠긴 파일을 죽이는 대신 이름을 비우는" 무중단 업데이트의 부산물이고, 그 뒷정리는
 // **새 cysd 기동**이 진다(nsis-hooks.nsh L6).
 //
@@ -4152,11 +4153,11 @@ mod update_leftover_sweep_tests {
     /// ① 판정 규칙 — 설치기가 만드는 두 형식만 잔해다. 사용자 파일(`*.preview.*`)은 **불가침**.
     #[test]
     fn leftover_rule_matches_installer_forms_only() {
-        // CYS_SWAP_IN_PLACE 3칸 체인 (nsis-hooks.nsh:130-141)
+        // CYS_PLACE ⑤ 의 prev 3칸 체인 (nsis-hooks.nsh · 구 CYS_SWAP_IN_PLACE)
         for n in ["cysd.prev.exe", "cys.prev2.exe", "cysd.prev3.exe", "CYSD.PREV.EXE"] {
             assert!(is_update_leftover(n), "체인 잔해를 놓쳤다: {n}");
         }
-        // unlock-sweep 의 <원본이름>.prev<rand> (nsis-hooks.nsh:355-371)
+        // unlock-sweep 의 <원본이름>.prev<rand> (nsis-hooks.nsh · PREINSTALL unlock-sweep.ps1)
         for n in [
             "msys-2.0.dll.prev4213",
             "bash.exe.prev0",

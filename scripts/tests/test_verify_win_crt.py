@@ -212,6 +212,86 @@ class GateLogicTests(unittest.TestCase):
             self.assertEqual(len(unparsed), 1)
 
 
+class TransientArtefactTests(unittest.TestCase):
+    """W4(2026-08-29) 훅 스테이징 산출물 판정 — NSIS-CONTRACT.md §1 lock-step.
+
+    훅은 `<bin>.new.exe`(신본 스테이징)·`<bin>.prev[숫자].exe`(구본 대피 슬롯)를 만든다.
+    ①이 이름들이 엄격 검사를 우회하지 못하고(DLL 드롭 포함) ②부재가 어떤 검사도
+    실패시키지 않음을 핀한다.
+    """
+
+    def test_canonical_name_grammar(self):
+        # 별칭 문법 자체를 핀 — cysd 부팅 가드의 가족 문법(prev+숫자만)과 일치.
+        cases = {
+            "cys.new.exe": "cys.exe",
+            "CYS.NEW.EXE": "cys.exe",
+            "cysd.new.exe": "cysd.exe",
+            "cys-app.new.exe": "cys-app.exe",
+            "cys.prev.exe": "cys.exe",
+            "cys.prev2.exe": "cys.exe",
+            "cysd.prev3.exe": "cysd.exe",
+            "cys.prev1234567.exe": "cys.exe",       # tick 슬롯(GetTickCount & 0x7FFFFFFF)
+            "cys.prevX.exe": "cys.prevx.exe",       # 숫자 아님 = 별칭 아님(가족 문법 밖)
+            "cys.new.exe.prev4213": "cys.new.exe.prev4213",  # unlock-sweep 잔해(비 .exe 말단)
+            "tool.exe": "tool.exe",
+        }
+        for fn, want in cases.items():
+            self.assertEqual(gate.canonical_name(fn), want, fn)
+
+    def test_new_exe_cannot_bypass_strict_with_dll_beside(self):
+        # ★핵심 봉쇄: cys.new.exe 가 vcruntime 을 임포트하면 vcruntime140.dll 을 옆에
+        # 동봉해도(규칙 2 미끄럼) 정책 바이너리로서 무조건 위반이어야 한다.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cys.new.exe"), "wb") as f:
+                f.write(make_pe(["VCRUNTIME140.dll"]))
+            with open(os.path.join(d, "vcruntime140.dll"), "wb") as f:
+                f.write(b"\0")
+            violations, unparsed, allowed, total = gate.check_imports(d)
+            self.assertEqual(total, 1)
+            self.assertEqual(len(violations), 1)
+            self.assertIn("정책 바이너리", violations[0][1])
+            self.assertEqual(allowed, [])
+            self.assertEqual(unparsed, [])
+
+    def test_prev_slots_are_strict(self):
+        # prev·prev2·tick 슬롯 전부 정식 등급 — 구본 대피본의 CRT 회귀도 놓치지 않는다.
+        with tempfile.TemporaryDirectory() as d:
+            for fn in ("cysd.prev.exe", "cys.prev2.exe", "cys.prev1234567.exe"):
+                with open(os.path.join(d, fn), "wb") as f:
+                    f.write(make_pe(["vcruntime140.dll"]))
+            violations, _, allowed, total = gate.check_imports(d)
+            self.assertEqual(total, 3)
+            self.assertEqual(len(violations), 3)
+            self.assertEqual(allowed, [])
+
+    def test_clean_transient_passes_and_absence_never_required(self):
+        # 깨끗한(.new 존재) 페이로드 = 위반 0 · .new 부재 트리도 위반 0 — 존재 요구 없음.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cys.exe"), "wb") as f:
+                f.write(make_pe(["KERNEL32.dll"]))
+            with open(os.path.join(d, "cys.new.exe"), "wb") as f:
+                f.write(make_pe(["KERNEL32.dll"]))
+            violations, unparsed, allowed, total = gate.check_imports(d)
+            self.assertEqual((len(violations), len(unparsed), len(allowed), total), (0, 0, 0, 2))
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cys.exe"), "wb") as f:
+                f.write(make_pe(["KERNEL32.dll"]))
+            violations, unparsed, allowed, total = gate.check_imports(d)
+            self.assertEqual((len(violations), len(unparsed), len(allowed), total), (0, 0, 0, 1))
+
+    def test_non_family_prev_name_keeps_rule2_treatment(self):
+        # 우리 3종 밖 이름(tool.prev.exe)은 종전과 동일한 규칙 2(app-local DLL 허용) 유지 —
+        # 별칭 문법이 서드파티 판정을 과잉 강화하지 않는다.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "tool.prev.exe"), "wb") as f:
+                f.write(make_pe(["vcruntime140.dll"]))
+            with open(os.path.join(d, "vcruntime140.dll"), "wb") as f:
+                f.write(b"\0")
+            violations, _, allowed, _ = gate.check_imports(d)
+            self.assertEqual(violations, [])
+            self.assertEqual(len(allowed), 1)
+
+
 class MarkerTests(unittest.TestCase):
     def test_all_markers_present(self):
         with tempfile.TemporaryDirectory() as d:
@@ -233,6 +313,28 @@ class MarkerTests(unittest.TestCase):
             missing, cysd = gate.check_markers(d)
             self.assertIsNone(cysd)
             self.assertEqual(len(missing), len(gate.FIX_MARKERS))
+
+    def test_marker_fallback_to_staging_copy_only_when_canonical_absent(self):
+        # 정식 cysd.exe 부재 + cysd.new.exe 존재 → 폴백으로 마커 검사 성립(같은 빌드 바이트).
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cysd.new.exe"), "wb") as f:
+                f.write(b"pad" + b"".join(gate.FIX_MARKERS) + b"pad")
+            missing, cysd = gate.check_markers(d)
+            self.assertIsNotNone(cysd)
+            self.assertTrue(cysd.endswith("cysd.new.exe"))
+            self.assertEqual(missing, [])
+
+    def test_marker_prefers_canonical_over_staging_copy(self):
+        # 둘 다 있으면 정식 우선 — 마커를 정식에만 넣어 어느 쪽을 읽었는지 증명한다.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "cysd.exe"), "wb") as f:
+                f.write(b"pad" + b"".join(gate.FIX_MARKERS) + b"pad")
+            with open(os.path.join(d, "cysd.new.exe"), "wb") as f:
+                f.write(b"no-markers-here")
+            missing, cysd = gate.check_markers(d)
+            self.assertTrue(cysd.endswith("cysd.exe"))
+            self.assertFalse(cysd.endswith("cysd.new.exe"))
+            self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

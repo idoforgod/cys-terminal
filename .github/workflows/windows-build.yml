@@ -425,10 +425,12 @@ jobs:
           Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"
 
       # ─────────────────────────────────────────────────────────────────────────
-      # T4 무중단 재설치 스모크 (P1 rename-swap + P1b 잔해청소 — nsis-hooks.nsh의 실기기 검증).
+      # T4 무중단 재설치 스모크 (W4 잠금 무관 배치 + P1b 잔해청소 — nsis-hooks.nsh의 실기기 검증).
       # 핵심 assert: 라이브 데몬+세션 위로 setup.exe /S 재설치 → 데몬 PID 불변·세션 생존·
-      # cysd.prev.exe 존재(kill이 아니라 rename이었다는 증거) → 새 cysd 기동 시 prev 청소(P1b).
+      # 배치 증거(★2026-08-29 W4 오라클: 같은 버전 재설치는 스왑을 단락하므로 prev 미생성이 정상 —
+      # "prev 존재 OR 설치 SHA == 소스 SHA" 로 판정) → 새 cysd 기동 시 prev·`.new` 잔해 청소(P1b).
       # + T4-9/10 rotate_daemon 프리미티브(P3 지연 핸드오프): lame-duck 데몬의 drain 봉사·PID 세대교체.
+      # + 다음 스텝 T4-14: 이미지 잠금 업그레이드 회귀(2026-08-28 실사고 재현 — 잠긴 구 CLI 위로 성공).
       # 이 기능은 "업데이트=전 세션 사망" 불안을 없애는 축이라 실기기 검증 없이 출하 금지.
       # ─────────────────────────────────────────────────────────────────────────
       - name: T4 무중단 재설치 스모크 (rename-swap 데몬 생존)
@@ -481,8 +483,22 @@ jobs:
           $after = (Bx $cys @('list') 20000)
           $sessOk = ($after.Code -eq 0 -and $after.Out -match 'role=master')
           Write-Host ("T4-3 RESULT: {0}  pipe+session (code={1})" -f ($(if($sessOk){'PASS'}else{'FAIL'})), $after.Code)
-          $prevOk = Test-Path (Join-Path $dir 'cysd.prev.exe')
-          Write-Host ("T4-4 RESULT: {0}  cysd.prev.exe 존재(rename 증거)" -f ($(if($prevOk){'PASS'}else{'FAIL'})))
+          function ShaOf($p) { if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash } else { 'MISSING' } }
+          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
+          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
+          if (-not $srcCys -or -not $srcCysd) { throw "T4-4/T4-12: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
+          $freshCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
+          $freshCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
+          # ★T4-4 재정의(2026-08-29 W4 · nsis-hooks.nsh CYS_PLACE ① 오라클 단락 :187-193).
+          # 신선도 판정이 절대 오라클(정식의 VERSIONINFO DWORD == 이번 빌드 컴파일 상수)로 바뀌어
+          # **같은 버전 재설치는 스왑 자체를 하지 않는다**(prev 미생성이 정상 — 0.14.27 의
+          # "같은 버전 재설치 → 영원한 exit 4 루프" 수리의 짝). 이 레인은 같은 setup 을 재설치
+          # 하므로 종전 단언("cysd.prev.exe 존재")은 구조적으로 적색이 된다. 새 계약:
+          # 스왑이 일어났으면 prev 가 남고, 단락됐으면 정식이 이미 이번 빌드 바이트다 —
+          # "prev 존재 OR 설치 SHA == 소스 SHA"(NSIS-CONTRACT.md §4 '같은 버전 /S 재설치' 행).
+          $prevExists = Test-Path (Join-Path $dir 'cysd.prev.exe')
+          $prevOk = $prevExists -or $freshCysd
+          Write-Host ("T4-4 RESULT: {0}  배치 증거(cysd.prev 존재={1} OR 설치SHA==소스SHA={2} — 오라클 단락 허용)" -f ($(if($prevOk){'PASS'}else{'FAIL'})), $prevExists, $freshCysd)
           $newOk = Test-Path $cysd
           Write-Host ("T4-5 RESULT: {0}  새 cysd.exe 존재" -f ($(if($newOk){'PASS'}else{'FAIL'})))
           # ★T4-11/T4-12 (2026-08-01 · 윈도우 실사고 "CLI 소실" 회귀 잠금).
@@ -493,12 +509,6 @@ jobs:
           # T4-11 = 존재(소실 회귀), T4-12 = 내용 동일성(신본 반영). 둘 다 결정론이다.
           $cliOk = Test-Path $cys
           Write-Host ("T4-11 RESULT: {0}  새 cys.exe 존재(CLI 소실 회귀 잠금)" -f ($(if($cliOk){'PASS'}else{'FAIL'})))
-          function ShaOf($p) { if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash } else { 'MISSING' } }
-          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
-          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
-          if (-not $srcCys -or -not $srcCysd) { throw "T4-12: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
-          $freshCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
-          $freshCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
           $freshOk = $freshCys -and $freshCysd
           Write-Host ("T4-12 RESULT: {0}  설치된 cys/cysd = 방금 빌드한 사이드카와 바이트 동일(신본 반영 · cys={1} cysd={2})" -f ($(if($freshOk){'PASS'}else{'FAIL'})), $freshCys, $freshCysd)
           $bashAlive = -not $bp.HasExited
@@ -534,6 +544,11 @@ jobs:
           $rootPrev = Test-Path (Join-Path $dir 'cysd.prev.exe')
           $rtLeft = @(Get-ChildItem (Join-Path $dir 'runtime') -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.prev*' })
           $rtPrev = $rtLeft.Count
+          # ★W4(2026-08-29) 추가 단언: 훅 스테이징 산출물 `<bin>.new.exe` 는 성공 설치 후 $INSTDIR
+          #   에 남지 않아야 한다 — 배치 성공 시 rename 으로 소멸 + Delete 벨트(nsis-hooks.nsh:317),
+          #   오라클 단락 시에도 stale `.new` 를 지운다(:191). 정식 존재 시 cysd 부팅 가드(W1)도
+          #   삭제한다. 남아 있으면 배치 트랜잭션 또는 가드 회귀다(NSIS-CONTRACT.md §1).
+          $newLeft = @(Get-ChildItem $dir -File -Filter '*.new.exe' -ErrorAction SilentlyContinue)
           # ★P1b 격리함(정의처 src/bin/cysd/main.rs `UPDATE_TRASH_DIR`). 삭제(remove_file)는 **아직
           # 매핑 중인 PE 이미지에 대해 반드시 실패**하므로(라이브 세션 셸이 runtime\ DLL 을 물고 있는
           # 것이 이 제품의 정상 상태다 — T4 스스로 $bp 로 그 상황을 만든다), 새 cysd 는 삭제 실패
@@ -545,14 +560,16 @@ jobs:
           # 다른 상태이므로 로그가 그 차이를 숨기면 안 된다.
           $qDir = Join-Path $dir '.cys-update-trash'
           $qCount = @(Get-ChildItem $qDir -Recurse -File -ErrorAction SilentlyContinue).Count
-          $cleaned = (-not $rootPrev) -and ($rtPrev -eq 0)
-          Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 prev 잔해 재귀 청소(P1b — root+runtime, 잔존 {1}개 · 격리 {2}개 · rootPrev={3})" -f ($(if($cleaned){'PASS'}else{'FAIL'})), $rtPrev, $qCount, $rootPrev)
+          $cleaned = (-not $rootPrev) -and ($rtPrev -eq 0) -and ($newLeft.Count -eq 0)
+          Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 잔해 청소(P1b — root+runtime prev 잔존 {1}개 · 격리 {2}개 · rootPrev={3} · .new.exe 잔존 {4}개[0 기대])" -f ($(if($cleaned){'PASS'}else{'FAIL'})), $rtPrev, $qCount, $rootPrev, $newLeft.Count)
           if (-not $cleaned) {
             # ★진단 덤프(2026-08-26 회귀 대응): 종전 로그는 '잔존 9개' 하나뿐이라 무엇이 왜 남았는지
             # 알 수 없었다. 잔해 이름 + **설치 트리에서 실행 중인 프로세스**(=삭제 실패의 유일한 원인
             # 인 홀더)를 함께 남겨 다음 실패는 한 번에 규명되게 한다.
             Write-Host "== 잔존 잔해(runtime 재귀) =="
             $rtLeft | ForEach-Object { Write-Host ("  {0}" -f $_.FullName) }
+            Write-Host "== 잔존 .new.exe (배치 트랜잭션/가드 회귀 후보) =="
+            $newLeft | ForEach-Object { Write-Host ("  {0}" -f $_.FullName) }
             Write-Host "== 설치 트리에서 실행 중인 프로세스(홀더 후보) =="
             Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
               $pth = $null; try { $pth = $_.Path } catch {}
@@ -560,9 +577,73 @@ jobs:
             }
           }
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (-not $cleaned) { throw "T4-6: prev 잔해 미청소" }
+          if (-not $cleaned) { throw "T4-6: 잔해 미청소(prev 또는 .new.exe 잔존)" }
           if (-not $swapOk) { throw "T4-10: 데몬 세대교체 실패(PID 불변 — 구 데몬 잔존)" }
           Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T4-14 이미지 잠금 업그레이드 회귀 (2026-08-28 실사고 재현 — W4 잠금 무관 배치의 표적 시험).
+      # 실사고: 구 cys.exe 가 프로세스(브리지 재스폰 스톰)에 이미지 잠금된 채 설치가 돌아 추출이
+      #   무음 스킵(SetOverwrite try)되고, 지문 게이트가 그것을 실패로 판정 → 영원한 exit 4 루프
+      #   + CLI 소실 계열(AUDIT-2ND-PASS-2026-08-28). 새 훅 계약(nsis-hooks.nsh CYS_PLACE ②~⑧ ·
+      #   NSIS-CONTRACT.md §2): 잠긴 실행 이미지는 덮어쓰기 불가·rename 가능이므로 `.new` 추출→
+      #   검증→rename 2단 배치로 **성공해야 한다**(exit 0 + 신버전).
+      # 재현법: 정식 cys.exe 를 '다른 VERSIONINFO 의 자기완결 실행 PE'(cmd.exe 사본 = 구버전
+      #   스탠드인)로 바꾸고 **실행해 진짜 이미지 잠금**을 만든 채 /S 재설치한다. 배타 핸들
+      #   (FileShare None) 잠금과는 다른 계급이다 — 그 쪽은 rename 도 거부돼 exit 4 가 정답
+      #   (체크리스트 P6). 이미지 잠금은 rename 이 허용되므로 성공이 정답이다.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T4-14 이미지 잠금 업그레이드 회귀 (잠긴 구 cys.exe 위로 성공)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T4-14: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $setup) { throw "T4-14: setup.exe 미발견" }
+          # 기대 버전 = 빌드 SOT(루트 Cargo.toml [package].version — cys --version 의 CARGO_PKG_VERSION 원천)
+          $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $expVer) { throw "T4-14: Cargo.toml 버전 파싱 실패" }
+          # ① 구버전 스탠드인: 다른 VERSIONINFO 를 가진 자기완결 PE(cmd.exe 사본)를 정식 자리에 —
+          #    오라클(CYS_ORACLE)이 notfresh 로 판정해 스왑 기계가 실제로 돈다(단락 아님).
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force
+          Write-Host ("스탠드인 배치: cys.exe VERSIONINFO = {0} (이번 빌드 {1} 와 달라야 한다)" -f (Get-Item $cys).VersionInfo.FileVersion, $expVer)
+          # ② 실행 = 진짜 이미지 잠금(덮어쓰기·삭제 거부 / rename 허용) — 실사고의 잠금 계급
+          $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
+          Start-Sleep 2
+          if ($lock.HasExited) { throw "T4-14: 스탠드인 잠금 프로세스 기동 실패" }
+          # ③ 잠긴 채 무인 업그레이드 — 성공(exit 0)해야 한다
+          $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+          $exitOk = ($ri.ExitCode -eq 0)
+          # ④ 정식 = 신본 바이트 + 실행 출력이 신버전. ★바이트 대조를 먼저 한다 — 스왑 실패로
+          #    정식이 아직 cmd 스탠드인이면 `--version` 인자가 대화형 cmd 를 띄워 스텝이 hang 한다.
+          $srcCys = (Get-ChildItem 'src-tauri/binaries/cys-*.exe' | Select-Object -First 1)
+          if (-not $srcCys) { throw "T4-14: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
+          $shaOk = (Get-FileHash -Algorithm SHA256 -LiteralPath $cys).Hash -eq (Get-FileHash -Algorithm SHA256 -LiteralPath $srcCys.FullName).Hash
+          $vOut = ''
+          if ($shaOk) { $vOut = (& $cys --version) -join ' ' }
+          $verOk = $shaOk -and ($vOut -match [regex]::Escape($expVer))
+          $lockAlive = -not $lock.HasExited
+          $noFail = -not (Test-Path (Join-Path $dir 'cys-install-failure.txt'))
+          # 스탠드인은 prev 슬롯으로 rename 대피됐어야 한다(잠금 프로세스가 그 이름으로 생존 —
+          # 커밋 후 슬롯 정리는 best-effort 라 홀더가 쥔 슬롯은 남는 것이 정상 · 훅 L6).
+          $slotCnt = @(Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue).Count
+          $ok = $exitOk -and $verOk -and $lockAlive -and $noFail -and ($slotCnt -ge 1)
+          Write-Host ("T4-14 RESULT: {0}  잠긴 구 cys.exe 위로 업그레이드 (exit={1}[0 기대] · 신본SHA={2} · --version='{3}'[~{4}] · 잠금프로세스 생존={5} · 실패파일 부재={6} · prev 슬롯 대피={7}개[>=1])" -f ($(if($ok){'PASS'}else{'FAIL'})), $ri.ExitCode, $shaOk, $vOut, $expVer, $lockAlive, $noFail, $slotCnt)
+          if (-not $noFail) { Write-Host "== cys-install-failure.txt =="; Get-Content (Join-Path $dir 'cys-install-failure.txt') }
+          # 정리: 잠금 해제 → 스탠드인 대피본 제거(이후 스텝 오염 방지 — 남아도 cysd 스윕이 지우지만 결정성 위해)
+          try { $lock.Kill($true) } catch {}
+          Start-Sleep 1
+          Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "T4-14: 이미지 잠금 업그레이드 회귀 실패 — 2026-08-28 실사고 계열(잠긴 구 CLI 위로 신본 미반영 또는 성공 위장)" }
+          Write-Host "OK: T4-14 — 잠긴 구 CLI 위로 업그레이드 성공 + 신버전 반영 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
       # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 + 진짜 KeepAlive 실측).

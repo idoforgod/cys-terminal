@@ -149,8 +149,23 @@
    taskkill /F /T /IM cys.prev.exe
    taskkill /F /T /IM cys.prev2.exe
    taskkill /F /T /IM cys.prev3.exe
+   taskkill /F /T /IM cys.prev*
+   taskkill /F /T /IM cysd.prev*
+   taskkill /F /T /IM cys-app.prev*
    ```
+   (마지막 별표 세 줄은 업데이트가 옆으로 밀어 둔 **긴 숫자 이름의 옛 프로그램**
+   — 예: `cys.prev1234567.exe` — 까지 한 번에 끄는 줄입니다.)
 3. 다시 1단계(앱 제거) → 2단계(폴더 삭제)를 진행합니다.
+
+> **폴더 안에 이런 이름의 파일이 보여도 놀라지 마세요 — 전부 cys 가 만든 것입니다.**
+> 업데이트 중에 잠깐 쓰는 작업 파일들이라, 2단계에서 폴더째 지우면 함께 사라집니다.
+> - `cys.new.exe` · `cysd.new.exe` · `cys-app.new.exe` — 설치 중간에 새 버전을 옆에
+>   내려받아 두는 파일 (설치가 끝나면 원래는 저절로 없어집니다)
+> - `cys.prev.exe` 처럼 `prev` 가 붙은 파일들(긴 숫자가 붙기도 합니다) — 예전 버전을
+>   잠시 옆으로 밀어 둔 것
+> - `cys-install-failure.txt` · `cys-installed-version.txt` — 설치 결과를 적어 두는 쪽지
+> - 이름 끝에 `.prev` 와 숫자가 붙은 다른 파일들(예: `msys-2.0.dll.prev4213`) — 사용 중이던
+>   부품을 밀어 둔 것
 
 ## 4단계 — 다 지워졌는지 확인
 
