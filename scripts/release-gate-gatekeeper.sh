@@ -23,6 +23,14 @@
 #      8바이트 판독(러너 python3 단일 호출)만 한다. **번들 안 python 실행 절대 금지**: .app 안 바이너리를 한 번
 #      이라도 exec 하면 macOS 가 앱 번들 보호를 걸어 SIGKILL·거짓 PASS 를 만든다
 #      (docs/RELEASE.md 의 ⑥ 확장자 분리 실측 — 같은 함정).
+#   ⑥ 첫-부팅 기록자 모사(설치 후 상태) — W5-4 신설(2026-08-29 · W3b/W3c 회귀 그물의 CI 판).
+#      2026-08-28 실사고에서 봉인을 깬 것은 산출물이 아니라 **제품 자신의 첫-부팅 기록자**였다:
+#      팩 preflight C11b 가 페인 PATH 선두(=번들 Contents/MacOS)를 따라 번들 안에 cys-dept
+#      심링크를 만들었다. ② 는 "빌드 시점 봉인"만 증명하고 이 계급을 못 본다. 여기서는 설치
+#      모사 사본에 그 기록자를 **러너 python3 로 실제 실행**(번들 python 스폰은 여전히 0)한 뒤
+#      ⓐ번들 파일 전수 센서스 diff == 0(예상치 못한 파일 생성 = 이름 지목 FAIL)
+#      ⓑcodesign --verify --deep --strict 재통과 를 단언한다. HOME·PATH·팩 env 는 임시
+#      스크래치로 격리(하네스 test_preflight_c11b_seal.py 와 동형) — 실환경 무접촉.
 #
 # ★스코프 판정(공백 B · Windows 레인 · 2026-08-20): Windows 산출물에는 SEAL-2 선컴파일이 없고
 #   이 게이트도 macOS 전용이다 — 여기서 수리하지 않는다. 오너 앵커: 윈도우 설치파일은 신중 접근,
@@ -49,7 +57,7 @@
 #   bash scripts/release-gate-gatekeeper.sh <DMG경로>
 #   bash scripts/release-gate-gatekeeper.sh /Applications/cys.app      # .app 직접 지정(로컬 스모크)
 #   옵션: --keep(작업 폴더 보존) · --quarantine-value <문자열>(기본 = 실측 Safari 형식)
-#         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤ 강등 평가 · 발행 경로 사용 금지)
+#         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤⑥ 강등 평가 · 발행 경로 사용 금지)
 #         --seal2-only(진단 전용 — 대상 .app 에 ⑤ 전칭 검사만 단독 실행 · 적대 픽스처 테스트의 호출 지점)
 #
 # 종료 코드
@@ -63,7 +71,7 @@
 #   스텝)가 GITHUB_STEP_SUMMARY 로 승격하는 증적 라인이다.
 #
 # scripts/verify-gatekeeper-user-path.sh 와의 관계 — 겹치지 않는 상·하위 게이트다.
-#   그쪽(로컬·수동)은 여기 검사 전부 + ⑥ **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
+#   그쪽(로컬·수동)은 여기 검사에 더해 **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
 #   본다. 대신 대상 아키텍처 python 을 실행하므로 **arm64 러너에서 x64 DMG 를 보려면 Rosetta 2 가
 #   필요**하고(없으면 FAIL) 임시 디스크 ~2GB 를 쓴다 — 그대로 CI 매트릭스에 걸면 x64 레그가
 #   구조적으로 깨진다. 이 스크립트는 실행을 전혀 하지 않는 **정적 평가만** 남겨 양 레그에서
@@ -83,7 +91,7 @@ usage() {
   --keep                    작업 폴더를 지우지 않는다(디버깅)
   --quarantine-value <str>  부착할 com.apple.quarantine 값(기본: <flags>;<epoch16>;CI;<UUID>)
   --diagnose-degraded-ok    진단 전용: degraded(spctl assessments disabled) 폐쇄를 열어
-                            ①②③⑤ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
+                            ①②③⑤⑥ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
   --seal2-only              진단 전용: 대상 .app 에 ⑤ SEAL-2 전칭 검사만 단독 실행
   -h, --help                이 도움말
 종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(degraded 폐쇄 포함)
@@ -126,6 +134,12 @@ for cand in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
   GATE_PY="$cand"; break
 done
 [ -n "$GATE_PY" ] || { echo "✗ 번들 밖 python3 없음 — ⑤ SEAL-2 전칭 판독 불가(측정 불능은 통과가 아니다)" >&2; exit 2; }
+
+# ── ⑥용 팩 preflight 해소(리포 상대) — 첫-부팅 기록자 모사의 실행 대상 스크립트 ──
+# 이 게이트는 리포 체크아웃에서 돈다(release.yml 게이트 스텝·release-postprocess.py — 실측 소비자
+# 전부). 부재는 skip 이 아니라 판정 불가다(⑥ 이 못 돌면 첫-부팅 계급이 무검증 — 함수 안에서 폐쇄).
+GATE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PREFLIGHT_PY="$GATE_SCRIPT_DIR/../cysjavis-pack/bin/javis_preflight.py"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cys-gk-gate.XXXXXX")" || exit 2
 # macOS 는 /var·/tmp 가 심볼릭링크라 mount·codesign 이 실경로(/private/…)로 되돌려 출력한다.
@@ -269,6 +283,122 @@ PYSEAL
 }
 SEAL2_TARGETS=0   # python 런타임을 실제로 검사한 앱 수 — 0이면 판정 불가(측정 불능≠통과)
 
+# ── 봉인 위반 파일 이름 지목(②·⑥ 재검증 실패 시) — codesign 출력에서 file/resource added·
+#    modified·missing 라인만 뽑아 기계 라인(SEAL_CULPRIT:)으로 승격한다. verbatim 덤프는 사람용,
+#    이 라인은 요약·감사가 긁는 판독원이다(2026-08-28 실사고의 culprit 도 'file added' 1줄이었다).
+print_seal_culprits() {
+  local out="$1" app="$2" c
+  c="$(printf '%s\n' "$out" | grep -E '(file|resource) (added|modified|missing)' | sed "s|$app|<app>|g" | head -20 || true)"
+  [ -n "$c" ] || return 0
+  echo "     ── 봉인 위반 파일(이름 지목) ──"
+  printf '%s\n' "$c" | sed 's/^/     SEAL_CULPRIT: /'
+}
+
+# ── ⑥ 첫-부팅 기록자 모사(설치 후 상태) — W3b/W3c 회귀 그물의 CI 판 (헤더 ⑥ 참조) ──
+# 설치 모사 사본($INSTALL_DIR 밑 ditto 본 — 쓰기 가능 = 기록이 실제로 일어날 수 있는 지반)에
+# 팩 preflight C11b(--fix 상당)를 러너 python3 로 실행하고, 실행 전후 번들 전수 센서스 diff 0 과
+# codesign --verify --deep --strict 재통과를 단언한다. ★읽기 전용 DMG 마운트(APP_SRC)가 아니라
+# 사본이어야 한다 — 읽기 전용 지반에선 결함 코드도 쓰기에 실패해 검사가 공허해진다.
+# 반환: 0=수행(위반은 ok/bad 집계) · 2=판정 불가 · 3=대상 아님(Contents/MacOS/cys 부재 — 설치 도우미 등)
+firstboot_sim_check() {
+  local app="$1" name pre post sim_out sim_rc simhome added removed reverify_out reverify_rc viol
+  name="$(basename "$app")"
+  [ -x "$app/Contents/MacOS/cys" ] || return 3
+  if [ ! -f "$PREFLIGHT_PY" ]; then
+    echo "✗ ⑥ 첫-부팅 모사($name): 팩 preflight 부재($PREFLIGHT_PY) — 리포 체크아웃에서 실행하라(측정 불능은 통과가 아니다)" >&2
+    return 2
+  fi
+  pre="$WORK/census-pre.txt"; post="$WORK/census-post.txt"
+  ( cd "$app" && find . \( -type f -o -type l \) -print | LC_ALL=C sort ) > "$pre" || return 2
+  simhome="$WORK/firstboot-home"
+  rm -rf "$simhome"
+  mkdir -p "$simhome/.cys/pack/bin" || return 2
+  printf '#!/bin/sh\nexit 0\n' > "$simhome/.cys/pack/bin/cys-dept"
+  chmod 0755 "$simhome/.cys/pack/bin/cys-dept"
+  # 실사고 형상 재현: HOME=스크래치 · PATH 선두=사본 Contents/MacOS · 팩 env=스크래치 팩.
+  # 전부 파이썬 프로세스 내부 env 로만 존재한다(러너/사용자 실환경 무접촉 · 하네스와 동형).
+  sim_out="$("$GATE_PY" - "$PREFLIGHT_PY" "$app" "$simhome" <<'PYSIM'
+import importlib.util, os, sys
+pre_path, app, simhome = sys.argv[1], sys.argv[2], sys.argv[3]
+os.environ["HOME"] = simhome
+os.environ["PATH"] = os.path.join(app, "Contents", "MacOS")
+sys.path.insert(0, os.path.dirname(pre_path))   # 형제 모듈(javis_lock 등) 해소
+spec = importlib.util.spec_from_file_location("javis_preflight", pre_path)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["javis_preflight"] = mod
+try:
+    spec.loader.exec_module(mod)
+except Exception as e:
+    print("IMPORT-FAIL: %r" % (e,))
+    sys.exit(2)
+for k in getattr(mod, "PACK_DIR_ENV_KEYS", ()) or ("CYS_PACK_DIR",):
+    os.environ.pop(k, None)
+os.environ["CYS_PACK_DIR"] = os.path.join(simhome, ".cys", "pack")
+try:
+    pf = mod.Preflight(fix=True, skips=[])
+    pf.c11b_cys_dept_path()
+except Exception as e:
+    print("RUN-FAIL: %r" % (e,))
+    sys.exit(2)
+rows = [r for r in pf.results if str(r.get("id", "")).startswith("C11b")]
+if not rows:
+    print("NO-RESULT: C11b 가 결과를 내지 않았다 — preflight 구조 변경?")
+    sys.exit(2)
+row = rows[-1]
+print("C11b: %s - %s" % (row["status"], row["detail"]))
+link = os.path.join(simhome, ".local", "bin", "cys-dept")
+bundle_link = os.path.join(app, "Contents", "MacOS", "cys-dept")
+rc = 0
+if os.path.lexists(bundle_link):
+    print("VIOLATION: 기록자가 번들 안에 썼다: Contents/MacOS/cys-dept — 봉인 파손 재발(2026-08-28 계급)")
+    rc = 1
+if row["status"] not in ("PASS", "FIXED"):
+    print("VIOLATION: C11b 판정 %s (기대 PASS/FIXED) — 기록자 행동이 계약과 다르다" % row["status"])
+    rc = 1
+if not os.path.islink(link):
+    print("VIOLATION: 표준 위치(~/.local/bin/cys-dept) 링크 미생성 — 기록 경로가 실행되지 않아 모사가 성립하지 않는다")
+    rc = 1
+if rc == 0:
+    print("OK: 기록자는 번들 밖(%s)에만 썼다" % link)
+sys.exit(rc)
+PYSIM
+)"; sim_rc=$?
+  printf '%s\n' "$sim_out" | sed "s|$app|<app>|g" | sed 's/^/     ⑥ /'
+  if [ "$sim_rc" -ge 2 ]; then
+    echo "✗ ⑥ 첫-부팅 모사($name) 실행 불능(rc=$sim_rc)" >&2
+    return 2
+  fi
+  ( cd "$app" && find . \( -type f -o -type l \) -print | LC_ALL=C sort ) > "$post" || return 2
+  added="$(comm -13 "$pre" "$post")"
+  removed="$(comm -23 "$pre" "$post")"
+  reverify_out="$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1)"; reverify_rc=$?
+  viol=""
+  [ "$sim_rc" -eq 0 ] || viol="기록자 위반(위 ⑥ 출력)"
+  if [ -n "$added" ]; then
+    viol="${viol:+$viol · }번들 안 신규 파일 $(printf '%s\n' "$added" | grep -c .)건"
+    echo "     ── ⑥ 기록자 실행 후 번들 안에 '추가된' 파일(이름 지목) ──"
+    printf '%s\n' "$added" | head -20 | sed 's/^/     SEAL_CULPRIT(added): /'
+  fi
+  if [ -n "$removed" ]; then
+    viol="${viol:+$viol · }번들 파일 소거 $(printf '%s\n' "$removed" | grep -c .)건"
+    echo "     ── ⑥ 기록자 실행 후 번들에서 '사라진' 파일(이름 지목) ──"
+    printf '%s\n' "$removed" | head -20 | sed 's/^/     SEAL_CULPRIT(removed): /'
+  fi
+  if [ "$reverify_rc" -ne 0 ]; then
+    viol="${viol:+$viol · }실행 후 codesign 재검증 실패(rc=$reverify_rc)"
+    echo "     ── ⑥ 실행 후 codesign 출력(verbatim) ──"
+    printf '%s\n' "$reverify_out" | sed "s|$app|<app>|g" | sed 's/^/     | /'
+    print_seal_culprits "$reverify_out" "$app"
+  fi
+  if [ -n "$viol" ]; then
+    bad "⑥ 첫-부팅 기록자 모사($name)" "$viol"
+  else
+    ok "⑥ 첫-부팅 기록자 모사($name)" "기록자 실행 후 센서스 diff 0 · 봉인 재검증 통과(기록은 번들 밖 ~/.local/bin 에만)"
+  fi
+  return 0
+}
+SIM_TARGETS=0     # 첫-부팅 기록자 모사를 실제로 돌린 앱 수 — 0이면 PASS 선언 불가(말미 폐쇄)
+
 # ── 진단 전용: --seal2-only — ⑤ 전칭 검사만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
 #   적대 픽스처 박제(test_release_postprocess_gate.py Seal2UniversalCheckTests)의 호출 지점.
 #   발행 경로(release.yml·release-postprocess.py)가 이 플래그를 싣지 않음은 같은 테스트의 핀이 지킨다.
@@ -321,7 +451,7 @@ if [ "$MODE" = "degraded" ]; then
 !!  ★게이트 강등 — spctl 평가 불능 (assessments disabled)
 !!  이 실행은 Gatekeeper **실평가(spctl --assess)를 수행하지 못했다**.
 !!  codesign 봉인 검증 + stapler 공증 티켓 검증 **단독 모드**로 내려간다.
-!!  skip 이 아니다: ①②③⑤ 는 그대로 필수이며 실패 시 exit 1 이다.
+!!  skip 이 아니다: ①②③⑤⑥ 는 그대로 필수이며 실패 시 exit 1 이다.
 !!  그러나 "Gatekeeper 통과"는 이 실행으로 증명되지 않았다 — 판정 범위가 좁아졌다.
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 BANNER
@@ -423,6 +553,8 @@ for APP_SRC in "${APPS[@]}"; do
     bad "② codesign --verify --deep --strict($APP_NAME)" "rc=$CS_RC"
     echo "     ── codesign 출력(verbatim) ──"
     printf '%s\n' "$CS_OUT" | sed "s|$APP|<app>|g" | sed 's/^/     | /'
+    # 봉인에 속하지 않는 파일이 실렸다면(added/modified/missing) 그 이름을 기계 라인으로 지목한다.
+    print_seal_culprits "$CS_OUT" "$APP"
   fi
 
   # ── ③ 공증 티켓 동봉 (강등 모드의 유일한 공증 증거) ──
@@ -455,6 +587,14 @@ for APP_SRC in "${APPS[@]}"; do
     *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
   esac
 
+  # ── ⑥ 첫-부팅 기록자 모사(설치 후 상태) — 설치 모사 사본($APP = 쓰기 가능 지반)을 대상으로 ──
+  firstboot_sim_check "$APP"; SIM_RC=$?
+  case "$SIM_RC" in
+    0) SIM_TARGETS=$((SIM_TARGETS+1)) ;;
+    3) info "⑥ 첫-부팅 모사($APP_NAME): Contents/MacOS/cys 부재 — 대상 아님(설치 도우미 등)" ;;
+    *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
+  esac
+
   # ── 실패 시 진단: 서명 요약 ──
   if [ "$CS_RC" -ne 0 ] || { [ "$MODE" = "full" ] && [ "${SPCTL_RC:-1}" -ne 0 ]; } || [ "$ST_RC" -ne 0 ]; then
     echo "     ── codesign -dv --verbose=4 요약 ──"
@@ -467,6 +607,14 @@ done
 # 측정 불능은 통과가 아니다. 레이아웃이 정말 바뀌었다면 이 게이트를 의도적으로 갱신하라.
 if [ "$SEAL2_TARGETS" -eq 0 ]; then
   echo "✗ ⑤ SEAL-2: 평가한 앱 어디에도 동봉 python 런타임(Contents/Resources/runtime/python/lib)이 없다" >&2
+  echo; echo "=== 판정 불가 ==="; exit 2
+fi
+# ⑥ 을 한 앱에서도 못 돌렸는데 FAIL 도 0 이라면 "첫-부팅 기록자 모사 없는 PASS" 가 된다 — 측정
+# 불능은 통과가 아니므로 폐쇄한다. FAIL 이 이미 있으면 판정(exit 1)은 성립한 것이라 그대로 둔다
+# (합성 픽스처 하네스(test_release_postprocess_gate.py)의 '판정 도달' 계약도 이 조건이 보존한다 —
+#  MacOS/cys 없는 픽스처 앱은 ②③ FAIL 로 exit 1 에 도달하고, 진짜 산출물의 진짜 PASS 만 ⑥ 을 요구).
+if [ "$SIM_TARGETS" -eq 0 ] && [ "$FAIL_N" -eq 0 ]; then
+  echo "✗ ⑥ 첫-부팅 모사: 평가한 앱 어디에도 Contents/MacOS/cys 가 없다 — 기록자 모사 0회로는 PASS 를 선언할 수 없다(레이아웃이 정말 바뀌었다면 게이트를 의도적으로 갱신하라)" >&2
   echo; echo "=== 판정 불가 ==="; exit 2
 fi
 

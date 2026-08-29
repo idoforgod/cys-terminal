@@ -476,10 +476,17 @@ jobs:
           # ★W8(2026-08-16): v4-repair 스위트 3종 편입 — 부서 이름검증(`launch --help` 실사고 회귀 핀)·
           #   preflight C03 두 축 상태기계·CONTENT_PINS↔디렉티브 패리티(P0 스큐 봉인). 전부 격리
           #   HOME/목 바이너리 하네스라 러너 자기완결(라이브 무접촉) — 3완전 레인 동시 등재(대칭).
+          # ★repair-w3(2026-08-29 · v0.14.28): 수리 회귀 핀 2종 편입 — test_hud_bridge_backoff
+          #   (W2 replay_gap 재스폰 스톰 지수 백오프) · test_preflight_c11b_seal(W3c 번들 봉인
+          #   심링크 이관). 대상 javis_hud_bridge.py·javis_preflight.py 는 배송 팩 내용물인데
+          #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
+          #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
+          #   격리 스크래치 하네스(라이브 무접촉) · 실측 각 ≤0.1s.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
-                   test_role_bootstrap_hook test_seat_latch_negation; do
+                   test_role_bootstrap_hook test_seat_latch_negation \
+                   test_hud_bridge_backoff test_preflight_c11b_seal; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="

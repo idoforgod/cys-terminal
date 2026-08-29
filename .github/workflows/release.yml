@@ -21,6 +21,15 @@ permissions:
 
 env:
   SRC_REPO: idoforgod/cys-terminal              # 공개 소스 repo = 공개 배포 원본 (updater 대상)
+  # ★Tauri CLI 버전 고정 — 단일 SOT (W5-1 · 2026-08-29). NSIS 설치기 템플릿(installer.nsi)은 CLI
+  #   버전에 결박되고, 훅(src-tauri/nsis-hooks.nsh)은 2.11.4 템플릿의 include 순서·define 계약
+  #   (NSIS-CONTRACT.md §7)에 대해 컴파일 검증됐다. 종전 floating `@2` 는 오늘 2.11.4 로 해소돼
+  #   이 고정은 동작 무변경이며, 목적은 미래의 무음 템플릿 교체(=오라클·배치 기계의 전제 붕괴) 차단.
+  #   ★2.11.4(=0.14.27 을 빌드한 버전) 미만으로 낮추지 마라 — `$UpdateMode` 없는 구 템플릿 회귀
+  #     = 인앱 업데이트가 '제거 후 설치'로 강등(무음 재앙 · IMPL-SPEC §W5-1).
+  #   전파 지점: 이 파일의 build(Windows 직접 빌드)·pack-artifacts(signer sign) +
+  #   scripts/build-macos-signed.sh(로컬 동치 기본값 — CI 는 이 env 가 덮는다). 값 변경은 세 곳 동시.
+  TAURI_CLI_VERSION: '2.11.4'
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -309,10 +318,17 @@ jobs:
           # ★W8(2026-08-16): v4-repair 스위트 3종 편입 — 부서 이름검증(`launch --help` 실사고 회귀 핀)·
           #   preflight C03 두 축 상태기계·CONTENT_PINS↔디렉티브 패리티(P0 스큐 봉인 — 신선 설치
           #   C03 FAIL 온보딩 오염의 재발 차단). 격리 HOME/목 바이너리 하네스(라이브 무접촉).
+          # ★repair-w3(2026-08-29 · v0.14.28): 수리 회귀 핀 2종 편입 — test_hud_bridge_backoff
+          #   (W2 replay_gap 재스폰 스톰 지수 백오프) · test_preflight_c11b_seal(W3c 번들 봉인
+          #   심링크 이관). 대상 javis_hud_bridge.py·javis_preflight.py 는 배송 팩 내용물인데
+          #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
+          #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
+          #   격리 스크래치 하네스(라이브 무접촉) · 실측 각 ≤0.1s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
-                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity; do
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
+                   test_hud_bridge_backoff test_preflight_c11b_seal; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -583,7 +599,18 @@ jobs:
             rm -rf "$TD/.fingerprint"/cys-* "$TD"/cys.exe "$TD"/cysd.exe "$TD"/cys-app* "$TD"/deps/cys* 2>/dev/null || true
           done
           # ① NSIS 빌드(beforeBuildCommand=bundle-prep 포함) — 종전 tauri-action 기본 러너와 동일 CLI 경로
-          bun x @tauri-apps/cli@2 build --target "${{ matrix.target }}"
+          #   ★W5-1: CLI 는 워크플로 env TAURI_CLI_VERSION 으로 고정(템플릿 동결 — 파일 머리 env 주석).
+          #   ★W5-2: --verbose + tee 로 makensis 출력을 로그 파일로 가시화하고, 훅의 컴파일 가드
+          #     문자열(NSIS-CONTRACT.md §5 '컴파일 실패 문자열' 3종 — 훅이 !error 로 빌드를 끊는다)을
+          #     로그에서 재검한다. !error 는 makensis 를 이미 hard-fail 시키고 pipefail 이 그 종료코드를
+          #     보존한다(1차 게이트) — grep 은 래퍼가 종료코드를 삼키는 회귀·가드의 경고 강등 회귀까지
+          #     로그 층에서 잡는 2차 벨트다. 토큰은 계약 문서의 문자열 그대로(창작 금지).
+          bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --target "${{ matrix.target }}" --verbose 2>&1 | tee nsis-build.log
+          if grep -E 'refusing to build a blind oracle|sidecar source not found at compile time|version resource regression' nsis-build.log; then
+            echo "::error::NSIS 훅 빌드 가드 발화(위 매치 라인) — 오라클 전제가 깨진 설치기는 출하 금지(NSIS-CONTRACT.md §5)" >&2
+            exit 1
+          fi
+          echo "✓ NSIS 빌드 로그 가드 통과: 훅 컴파일 가드 문자열 0건 (nsis-build.log $(wc -l <nsis-build.log | tr -d ' ')줄)"
           # ② CRT 게이트 — 업로드 전 최종 바이트 검증
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
           SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
@@ -601,6 +628,44 @@ jobs:
           [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
           echo "$NEG_OUT" | grep -q "markers: 0/" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/N 이어야 한다" >&2; exit 1; }
           echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
+
+      # ★Windows VERSIONINFO 상시 게이트 (W5-3 · 2026-08-29 — 업로드 전 · 실패 = 빌드 실패, 경고 아님).
+      #   왜 영구 게이트인가(훅 워커 실측): ①POSIX makensis 3.12 의 !getdllversion 은 리소스 없는 PE 에
+      #   에러 대신 **빈 값**을 정의할 수 있고 ②크로스 빌드된 사이드카는 VERSIONINFO 가 아예 없다
+      #   (winresource 는 cfg(windows) 호스트 게이트 — build.rs). 어느 쪽이든 새 신선도 오라클
+      #   (nsis-hooks.nsh: 설치된 정식의 GetDLLVersion == 컴파일 상수)이 **현장 전 설치를 거부**하는
+      #   전 기계 exit 4 가 된다. 훅의 컴파일 가드(!error 3종)가 1차지만, 이 스텝은 훅과 독립으로
+      #   "세 산출물 모두 수치 VERSIONINFO == 릴리스 버전"을 단언하는 2차 오라클이다(레인 변경·
+      #   가드 회귀에도 생존). 수치 = VS_FIXEDFILEINFO(File{Major,Minor,Build,Private}Part) —
+      #   GetDLLVersion/!getdllversion 이 읽는 바로 그 DWORD 다(문자열 FileVersion 이 아니다).
+      - name: Windows VERSIONINFO 게이트 (cys·cysd·cys-app 수치 버전 == 릴리스 버전)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if (-not $v) { throw 'tauri.conf.json version 파싱 실패' }
+          $expected = "$v.0"
+          $files = @(
+            'src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe',
+            'src-tauri/binaries/cysd-x86_64-pc-windows-msvc.exe',
+            'target/${{ matrix.target }}/release/cys-app.exe'
+          )
+          $bad = @()
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { $bad += "${f}: 파일 부재(빌드 산출 경로 회귀)"; continue }
+            $vi = (Get-Item $f).VersionInfo
+            $num = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
+            if ($num -eq '0.0.0.0') { $bad += "${f}: 수치 VERSIONINFO 부재/0.0.0.0 — 리소스 없는 PE(크로스 빌드·winresource 회귀) = 현장 전 설치 거부(exit 4) 계급"; continue }
+            if ($num -ne $expected) { $bad += "${f}: 수치 VERSIONINFO $num != 기대 $expected (버전 SOT 불일치 또는 스테일 산출물)"; continue }
+            Write-Host "OK  $f  VS_FIXEDFILEINFO=$num"
+          }
+          if ($bad.Count) {
+            $bad | ForEach-Object { Write-Host "::error::VERSIONINFO 게이트: $_" }
+            throw "VERSIONINFO 게이트 실패 ($($bad.Count)건) — 이 산출물은 업로드 금지"
+          }
+          Write-Host "VERSIONINFO 게이트 통과: 3종 전부 수치 버전 == $expected"
+
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
       # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
@@ -732,10 +797,17 @@ jobs:
           fi
           echo "== [pack] todo 선언·유령집계 소비자 회귀 7종(+import 가드)+부트체인 =="
           # ★test_bootstrap_chain 등재(2026-08-12 R3 확정 — 위 build 레그와 동일 사유).
+          # ★repair-w3(2026-08-29 · v0.14.28): 수리 회귀 핀 2종 편입 — test_hud_bridge_backoff
+          #   (W2 replay_gap 재스폰 스톰 지수 백오프) · test_preflight_c11b_seal(W3c 번들 봉인
+          #   심링크 이관). 대상 javis_hud_bridge.py·javis_preflight.py 는 배송 팩 내용물인데
+          #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
+          #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
+          #   격리 스크래치 하네스(라이브 무접촉) · 실측 각 ≤0.1s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
-                   test_role_bootstrap_hook test_seat_latch_negation; do
+                   test_role_bootstrap_hook test_seat_latch_negation \
+                   test_hud_bridge_backoff test_preflight_c11b_seal; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="
@@ -941,7 +1013,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo "::error::TAURI_SIGNING_PRIVATE_KEY 미설정 — 팩 서명 불가"; exit 1; }
-          bunx @tauri-apps/cli@2 signer sign \
+          bunx "@tauri-apps/cli@${TAURI_CLI_VERSION}" signer sign \
             --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
             --password "" \
             pack-manifest.json

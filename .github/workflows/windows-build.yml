@@ -13,6 +13,14 @@ on:
 permissions:
   contents: read
 
+env:
+  # ★Tauri CLI 버전 고정 — release.yml env 와 같은 값(단일 SOT 의 미러 · W5-1 · 2026-08-29).
+  #   NSIS 템플릿(installer.nsi)은 CLI 버전에 결박되고 훅(nsis-hooks.nsh)은 2.11.4 템플릿 계약
+  #   (NSIS-CONTRACT.md §7)에 대해 검증됐다. floating `@2` 는 오늘 2.11.4 로 해소 — 동작 무변경·
+  #   무음 템플릿 교체 차단이 목적. ★2.11.4 미만 금지($UpdateMode 회귀). 값 변경은
+  #   release.yml·scripts/build-macos-signed.sh 와 동시에.
+  TAURI_CLI_VERSION: '2.11.4'
+
 jobs:
   build:
     runs-on: windows-latest
@@ -100,9 +108,19 @@ jobs:
         env:
           PYTHONUTF8: '1'   # Windows Python 기본 cp1252 stdout에서 한국어 print 크래시 방지
         run: |
+          set -euo pipefail
           # createUpdaterArtifacts=false 인라인 override — 이 잡은 서명키 없는 가능성 빌드라
           # updater 서명 산출을 끈다(릴리스 경로 release.yml은 windows conf 기본값 true+서명키 사용).
-          bunx @tauri-apps/cli@2 build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          # ★W5-1: CLI 는 워크플로 env TAURI_CLI_VERSION 으로 고정(파일 머리 env 주석).
+          # ★W5-2: --verbose + tee 로 makensis 출력 가시화 + 훅 컴파일 가드 문자열(NSIS-CONTRACT.md §5
+          #   3종 · !error) 재검. !error 는 빌드를 이미 hard-fail 시킨다(pipefail 보존) — grep 은 종료코드
+          #   삼킴·경고 강등 회귀를 로그 층에서 잡는 2차 벨트. 토큰은 계약 문서 문자열 그대로(창작 금지).
+          bunx "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --config '{"bundle":{"createUpdaterArtifacts":false}}' --verbose 2>&1 | tee nsis-build.log
+          if grep -E 'refusing to build a blind oracle|sidecar source not found at compile time|version resource regression' nsis-build.log; then
+            echo "::error::NSIS 훅 빌드 가드 발화(위 매치 라인) — 오라클 전제가 깨진 설치기는 검증 무의미(NSIS-CONTRACT.md §5)" >&2
+            exit 1
+          fi
+          echo "OK: NSIS 빌드 로그 가드 통과 (훅 컴파일 가드 문자열 0건)"
 
       - name: Upload NSIS installer artifact
         if: always()
@@ -112,6 +130,39 @@ jobs:
           path: |
             target/release/bundle/nsis/*.exe
           if-no-files-found: error
+
+      # ★Windows VERSIONINFO 상시 게이트 (W5-3 · 2026-08-29 — release.yml 동형 · 실패 = 잡 실패).
+      #   훅 신선도 오라클(nsis-hooks.nsh: GetDLLVersion == 컴파일 상수)의 전제 = 세 산출물 모두
+      #   수치 VERSIONINFO(VS_FIXEDFILEINFO) 보유 + 릴리스 버전 일치. 리소스 없는 PE(크로스 빌드
+      #   회귀·winresource 회귀)는 POSIX makensis !getdllversion 이 빈 값을 무음 정의할 수 있고,
+      #   현장에선 전 설치가 exit 4 로 거부된다 — 훅의 !error 가드와 독립인 2차 오라클로 영구 단언.
+      #   이 잡은 --target 없이 빌드하므로 메인 exe 는 target/release/ 에 있다(release.yml 과 경로만 다름).
+      - name: Windows VERSIONINFO 게이트 (cys·cysd·cys-app 수치 버전 == 릴리스 버전)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if (-not $v) { throw 'tauri.conf.json version 파싱 실패' }
+          $expected = "$v.0"
+          $files = @(
+            'src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe',
+            'src-tauri/binaries/cysd-x86_64-pc-windows-msvc.exe',
+            'target/release/cys-app.exe'
+          )
+          $bad = @()
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { $bad += "${f}: 파일 부재(빌드 산출 경로 회귀)"; continue }
+            $vi = (Get-Item $f).VersionInfo
+            $num = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
+            if ($num -eq '0.0.0.0') { $bad += "${f}: 수치 VERSIONINFO 부재/0.0.0.0 — 리소스 없는 PE(크로스 빌드·winresource 회귀) = 현장 전 설치 거부(exit 4) 계급"; continue }
+            if ($num -ne $expected) { $bad += "${f}: 수치 VERSIONINFO $num != 기대 $expected (버전 SOT 불일치 또는 스테일 산출물)"; continue }
+            Write-Host "OK  $f  VS_FIXEDFILEINFO=$num"
+          }
+          if ($bad.Count) {
+            $bad | ForEach-Object { Write-Host "::error::VERSIONINFO 게이트: $_" }
+            throw "VERSIONINFO 게이트 실패 ($($bad.Count)건)"
+          }
+          Write-Host "VERSIONINFO 게이트 통과: 3종 전부 수치 버전 == $expected"
 
       - name: 자기완결 검증 (silent install → 동봉 bash·python3 실행)
         shell: pwsh

@@ -20,6 +20,15 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 VERSION=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')
 
+# ── Tauri CLI 버전 고정 (W5-1 · 2026-08-29) ──
+# 단일 SOT 는 CI 워크플로 env `TAURI_CLI_VERSION`(release.yml·windows-build.yml)이고, 아래 기본값은
+# 로컬 실행용 동치다(CI 는 env 로 이 값을 덮는다 — 값이 갈리면 안 되므로 바꿀 땐 세 곳을 함께).
+# 2.11.4 = 오늘 npm latest 실측이자 0.14.27 을 빌드한 버전 — floating(@2·무버전)도 지금은 2.11.4 로
+# 해소되므로 동작 무변경이며, 목적은 NSIS 템플릿(installer.nsi)·번들러 거동의 무음 교체 차단이다.
+# ★이보다 낮추지 마라: `/UPDATE`→`$UpdateMode` 없는 구 템플릿으로 회귀하면 인앱 업데이트가
+#   '제거 후 설치'로 강등된다(무음 재앙 · IMPL-SPEC §W5-1).
+TAURI_CLI_VERSION="${TAURI_CLI_VERSION:-2.11.4}"
+
 # ── 타깃 아키텍처(무인자=호스트 네이티브 — arm64 경로 완전 불변) ──
 # 사용: scripts/build-macos-signed.sh [aarch64-apple-darwin|x86_64-apple-darwin]
 # arm64 호스트에서 x86_64를 넘기면 크로스빌드 — prep-mac-runtime.sh 도 같은 타깃으로 런타임을 교체한다.
@@ -134,7 +143,7 @@ echo "  ✓ runtime Mach-O ${SIGN_N}개 재서명 (python/node=entitlements·git
 #   (`tauri build --bundles dmg`는 .app을 재빌드해 역참조를 되돌리므로 사용 불가 — 실측 확인).
 echo "== 앱 번들 빌드(서명만·공증 보류) v$VERSION =="
 env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API_ISSUER \
-  bun x @tauri-apps/cli build ${TAURI_TARGET_ARGS[@]+"${TAURI_TARGET_ARGS[@]}"} --bundles app
+  bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" build ${TAURI_TARGET_ARGS[@]+"${TAURI_TARGET_ARGS[@]}"} --bundles app
 
 APP="$BUNDLE_BASE/macos/cys.app"
 DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
@@ -229,7 +238,7 @@ rm -f "$APPZIP"
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   echo "== 업데이터 tar.gz 재생성(dedup 반영) + 재서명 =="
   ( cd "$(dirname "$APP")" && tar czf cys.app.tar.gz cys.app )
-  bun x @tauri-apps/cli signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$APP.tar.gz"
+  bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$APP.tar.gz"
 fi
 
 # ★DMG 델타 실측 (2026-08-01 · SEAL-2 opt 레벨 3종 봉합의 배포 크기 비용)
