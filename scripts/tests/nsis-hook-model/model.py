@@ -34,7 +34,7 @@ WHAT IS MODELED / NOT MODELED
              POSTINSTALL 3-binary transaction (CYS_PLACE ①..⑧, CYS_RESTORE_SLOT,
              CYS_UNPLACE, CYS_SLOT_CLEANUP, CYS_LASTDITCH), failure classification
              (exit 3/4 + 4-token failure file), Abort→.onInstFailed, user cancel
-             →.onUserAbort (CYS_ABORT_RESCUE), hard kill (no callback), NTFS lock
+             →MUI .onUserAbort → cys_on_user_abort (CYS_ABORT_RESCUE), hard kill (no callback), NTFS lock
              classes (running image: rename OK/delete·overwrite DENIED — L2;
              share-read handle: read OK/rename·delete·write DENIED — CONTRACT P6;
              share-none: everything incl. probes DENIED — CONTRACT §9-6).
@@ -106,7 +106,7 @@ EXPECTED_MACROS = {
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "0a4b9e3086187ef0ad7a5ebfa0734b56d3474770cf2659c1f7734f0dc57f7e9c"
+GUARD_PIN = "754b7a9e6bb080412ad757e9ce679b6c5fcd5f0442bbd23d4ea0088c6cc79c8c"
 
 
 def hook_path():
@@ -142,7 +142,8 @@ def hook_guard():
         r"\b(cys_(?:rr|or|rs|pl|up|sc|ld|ar|pre|txn|post)_[a-z0-9]+)_\$?\{?", text))
     census.update("reason:" + r for r in REASONS if ("(%s)" % r) in text or r in text)
     for tok in ("unrecoverable:", "rolled-back-to-previous:", "not-updated:",
-                "placement-refused:", ".onInstFailed", ".onUserAbort",
+                "placement-refused:", ".onInstFailed", "cys_on_user_abort",
+                "MUI_CUSTOMFUNCTION_ABORT",
                 "SetErrorLevel 3", "SetErrorLevel 4", "SetErrorLevel 5",
                 "cys-install-failure.txt", "cys-installed-version.txt"):
         if tok in text:
@@ -174,7 +175,7 @@ def hook_guard():
     bodies.update(re.findall(
         r"(?ms)^Function[ \t]+(\S+)[^\n]*\n(.*?)^FunctionEnd", text))
     for name in sorted((EXPECTED_MACROS - {"NSIS_HOOK_PREUNINSTALL"})
-                       | {".onInstFailed", ".onUserAbort"}):
+                       | {".onInstFailed", "cys_on_user_abort"}):
         if name not in bodies:
             print("FAIL[guard]: cannot extract the body of %s from the hook "
                   "— the body bind needs it (block moved or renamed?)" % name,

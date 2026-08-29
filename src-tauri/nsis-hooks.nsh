@@ -542,7 +542,22 @@ Function .onInstFailed
   !insertmacro CYS_ABORT_RESCUE "cys-app" "if3"
 FunctionEnd
 
-Function .onUserAbort
+; ---------------------------------------------------------------------------
+; MUI2 공존 규약 (2026-08-29 실사고 수리 · CI run 33246693830)
+; 템플릿은 MUI2 를 쓰고, `!insertmacro MUI_LANGUAGE`(installer.nsi:470) 가
+; MUI_FUNCTION_ABORTWARNING (Contrib/Modern UI 2/Interface.nsh:327) 을 통해
+; **`.onUserAbort` 를 스스로 만든다**. 훅이 같은 이름을 정의하면
+; "Function named \".onUserAbort\" already exists." 로 **빌드가 죽는다**(실제 발생).
+; 그래서 MUI 가 공식으로 제공하는 확장점을 쓴다 — Interface.nsh 의
+; `.onUserAbort` 내부가 `Call "${MUI_CUSTOMFUNCTION_ABORT}"` 을 하므로 취소 정리가
+; 그대로 돌아간다. 훅은 installer.nsi:35 에서 include 되므로 이 define 은
+; MUI_LANGUAGE(470) 보다 항상 먼저다.
+; ★ 이미 누가 점유했으면 조용히 정리가 사라지는 것이 더 나쁘다 → 빌드 중단.
+!ifdef MUI_CUSTOMFUNCTION_ABORT
+  !error "cys: MUI_CUSTOMFUNCTION_ABORT already taken - user-cancel cleanup would be silently lost"
+!endif
+!define MUI_CUSTOMFUNCTION_ABORT "cys_on_user_abort"
+Function cys_on_user_abort
   !insertmacro CYS_ABORT_RESCUE "cys" "ua1"
   !insertmacro CYS_ABORT_RESCUE "cysd" "ua2"
   !insertmacro CYS_ABORT_RESCUE "cys-app" "ua3"

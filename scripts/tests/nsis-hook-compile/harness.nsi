@@ -14,6 +14,11 @@
 ; hook's compile-time `!getdllversion /packed` oracle runs for real (no /noerrors).
 Unicode true
 
+; ── MUI2 — 템플릿은 훅보다 먼저 include 한다 (installer.nsi:22) — 순서 패리티
+; ★ 2026-08-29: 이게 없어서 MUI 가 생성하는 .onUserAbort 와의 중복 정의를
+; 로컬에서 못 잡았고 CI(run 33246693830)까지 갔다. 그 공백을 여기서 메운다.
+!include MUI2.nsh
+
 ; ── hook include — MUST stay ahead of the template defines below (template parity) ──
 !include "build\nsis-hooks.nsh"
 
@@ -29,6 +34,13 @@ OutFile "build\harness-setup.exe"
 InstallDir "$TEMP\cys-hook-harness"
 ShowInstDetails show
 SetCompressor /SOLID lzma
+
+; ── MUI 페이지 + 언어 — MUI_LANGUAGE 가 MUI_FUNCTION_ABORTWARNING 을 통해
+;    Function .onUserAbort 를 생성한다 (Contrib/Modern UI 2/Interface.nsh:327).
+;    훅이 같은 이름을 정의하면 여기서 즉시 컴파일 실패한다 = N7 음성대조의 근거.
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
 
 ; template-supplied function the POSTINSTALL hook Calls (installer.nsi:956).
 ; Stub: the harness only proves the hook COMPILES; it is never executed.
