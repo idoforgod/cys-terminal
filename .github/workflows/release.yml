@@ -613,6 +613,12 @@ jobs:
           echo "✓ NSIS 빌드 로그 가드 통과: 훅 컴파일 가드 문자열 0건 (nsis-build.log $(wc -l <nsis-build.log | tr -d ' ')줄)"
           # ② CRT 게이트 — 업로드 전 최종 바이트 검증
           PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          # ★R1-repair(2026-08-29): 게이트 **도구 자체**의 밀폐 스위트를 소비 직전에 돌린다 —
+          #   scripts/tests/test_verify_win_crt.py 는 W4-C 편입 후 어느 CI 레인에서도 0회
+          #   실행이었다("안 도는 검체는 게이트가 아니다"). 합성 PE 픽스처·tempfile 만 사용(러너
+          #   자기완결·플랫폼 무관) · ci-branch 와 같은 커밋 동시 편입 · pack-release 미편입
+          #   사유는 ci-branch '팩 스위트 레인 대조' ALLOWED 등재 참조(팩 내용물이 아니다).
+          "$PY" scripts/tests/test_verify_win_crt.py
           SETUP=(target/${{ matrix.target }}/release/bundle/nsis/cys_*_x64-setup.exe)
           [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
           "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}"

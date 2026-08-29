@@ -232,8 +232,21 @@ def _target_alive(target):
         #   라이벌 데몬으로 띄운다. 죽은 데몬은 dead/unknown 판정이 정답이지 부활 트리거가
         #   아니다(javis_org.dept_status 의 동형 봉인 · 회귀 핀 = lib.rs
         #   pack_wakeup_liveness_probe_seals_autostart).
-        out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10,
-                             env={**os.environ, "CYS_NO_AUTOSTART": "1"}).stdout
+        proc = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10,
+                              env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+        out = proc.stdout
+        # ★★측정 실패 fail-safe(R1 라운드1 2026-08-29 · 드리프트 fail-safe 의 나머지 반쪽):
+        #   NO_AUTOSTART 봉인 아래 소켓이 죽어 있으면 실측 `cys list` 는 **stdout 0바이트 +
+        #   rc!=0**(에러는 stderr뿐)이다. 아래 드리프트 fail-safe 는 "출력이 있는데 못 읽었다"만
+        #   덮어서 이 모양이 'dead' 로 흘렀고, drain 의 zombie 가드가 pending 을 영구 삭제했다 —
+        #   단지 **지금 닿지 않을 뿐**인 데몬인데도(자가치유 무음 소실 · 앵커 ③ 인접). 실패한
+        #   측정은 죽음의 증거가 아니라 **미측정** = unknown(경고 배달 — 계약: 모듈 docstring).
+        #   봉인은 그대로다: 여기서 기동을 유발하지 않고, 판정만 정직하게 강등한다.
+        if proc.returncode != 0 or not (out or "").strip():
+            sys.stderr.write("[wakeup] cys list 측정 실패(rc=%s · stdout %d바이트) — liveness="
+                             "unknown 으로 강등해 배달은 계속한다(자가치유 전멸 방지)\n"
+                             % (proc.returncode, len(out or "")))
+            return "unknown"
         # ★G27: exited 행 배제 + 공유 술어(정확일치·worker 접두)로 해소. 종전의 전문 정규식
         #   경계 매칭은 '부분일치'는 막았지만 '죽은 행'은 못 막았다 — 두 결함은 다른 축이다.
         rows = live_target_rows(out)

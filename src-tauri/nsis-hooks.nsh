@@ -25,6 +25,12 @@
 ;      phoenix 정체 exit 6 = 전 pane 복원 불가). 어느 하나가 거부되면 이미 배치한 앞선 것을
 ;      역순으로 되돌리고, 되돌리기가 실패하면 **거기서 멈춰** 신본 집합이 항상 (cys, cysd,
 ;      cys-app) 의 접두(prefix)로 남게 한다.
+;      ★스코프(정직 · R1 라운드1 정정): 이 prefix 성질은 **훅이 배치한 것**에만 미친다.
+;      비잠금 정식은 POSTINSTALL **이전에** 템플릿 Section 의 File 추출이 제자리에서 신본으로
+;      덮는다(구 바이트 소멸 · 오라클은 '이미 신본' 단락 · 트랜잭션 밖 = undo 재료 없음).
+;      따라서 "cys 만 vacate 거부(share-delete 차단 핸들) + cysd/cys-app 비잠금 추출"이면
+;      exit 4 에서도 구 cys + 신 cysd/cys-app 세대 분할이 도달 가능하다 — 항상 유음
+;      (placement-refused 토큰)이고 잠금 해제 후 재실행이 치유한다(NSIS-CONTRACT §9-5).
 ;  R4. **모든 rename 은 유한 재시도(5회 × Sleep 1000)** 이고 모든 실패는 유음(loud)이다:
 ;      DetailPrint + cys-install-failure.txt 토큰 + SetErrorLevel + Abort. 측정 불능은 통과가
 ;      아니다. 성공 위장 금지.
@@ -439,11 +445,27 @@ cys_ld_done_${TAG}:
 
 ; ── 매크로: 중단 콜백 구조 (R1 · 콜백 전용) ───────────────────────────────────
 ;   설치가 어느 시점에 중단되든(사용자 취소·Abort — 배치 rename 2회 사이 포함) 정식 이름을
-;   비워 두지 않는다: 부재 시 `.new`(이번 빌드) → prev 체인(구본) 순 rename 승격. 정식이
-;   있으면 `.new` 스테이징 잔해만 지운다(정식 존재 시에만 지운다 — cysd 가드와 같은 규칙).
+;   비워 두지 않는다: 동작본 부재 시 `.new`(이번 빌드) → prev 체인(구본) 순 rename 승격.
+;   동작본 정식이 있으면 `.new` 스테이징 잔해만 지운다(그때만 지운다 — cysd 가드와 같은 규칙).
+;   ★정식은 '존재'가 아니라 **크기 프로브(≥65536 = W1 가드·LASTDITCH 와 같은 문턱)** 로 판정
+;     한다(R1 라운드1 수리): 취소가 템플릿 File 의 truncate-write 도중이면 **절단 정식**이
+;     남는데, 그걸 존재로 읽으면 이 갈래가 `.new`(마지막 동작본 재료)를 지운다. 절단 정식은
+;     Delete 로 자리를 비운 뒤 복구 체인으로 간다(Rename 은 실재하는 dest 에 실패하므로 자리
+;     비우기 없는 승격은 성립하지 않는다) · Delete 거부 시 **무접촉 종료**(재료 보존 — cysd
+;     부팅 가드가 2차 복구선) · 프로브 불가(열기 거부)도 판정 불가 = 무접촉 종료.
 ;   ★콜백 제약: 런타임 변수·리터럴만 사용(템플릿 define 금지 — 훅이 먼저 include 된다).
 !macro CYS_ABORT_RESCUE BIN TAG
-  IfFileExists "$INSTDIR\${BIN}.exe" cys_ar_clean_${TAG} 0
+  IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_ar_try_${TAG}
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_ar_done_${TAG}
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 cys_ar_clean_${TAG} 0 cys_ar_clean_${TAG}
+  ClearErrors
+  Delete "$INSTDIR\${BIN}.exe"
+  IfFileExists "$INSTDIR\${BIN}.exe" cys_ar_done_${TAG} cys_ar_try_${TAG}
+cys_ar_try_${TAG}:
   ClearErrors
   IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_ar_p1_${TAG}
   Rename "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe"
@@ -555,7 +577,9 @@ FunctionEnd
   ; ★잠금 무관 배치 (R2·R3 · IMPL-SPEC §W4-B). 이 시점에는 모든 File 추출이 끝나 있다.
   ;   - 추출이 이미 신본을 앉혔으면(비잠금 경로) 오라클이 단락한다.
   ;   - 잠겨서 추출이 스킵됐으면 `.new` 추출→검증→rename 2회로 배치한다.
-  ;   순서 고정 cys → cysd → cys-app (R3: 실패 시에도 세대 집합이 항상 prefix).
+  ;   순서 고정 cys → cysd → cys-app (R3: 실패 시에도 **훅 배치분**의 세대 집합은 항상 prefix
+  ;   — 비잠금 정식은 템플릿 File 이 이미 덮었을 수 있어 전체 3종의 prefix 는 아니다. 스코프와
+  ;   도달 가능한 exit-4 세대 분할은 파일 머리 R3 ★스코프 주석·NSIS-CONTRACT §9-5).
   StrCpy $R4 ""     ; placement-refused (구본 무손상 · 신본 미반영)
   StrCpy $R6 ""     ; unrecoverable (정식 부재·절단 + 복구 전멸 — 최악)
   StrCpy $R7 ""     ; rolled-back (비상 복구로 구본 복귀 — 기계는 살았으나 미반영)

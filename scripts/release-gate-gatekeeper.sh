@@ -369,8 +369,13 @@ PYSIM
     return 2
   fi
   ( cd "$app" && find . \( -type f -o -type l \) -print | LC_ALL=C sort ) > "$post" || return 2
-  added="$(comm -13 "$pre" "$post")"
-  removed="$(comm -23 "$pre" "$post")"
+  # ★R1 라운드1(2026-08-29): comm 도 입력과 같은 LC_ALL=C 여야 한다. 이 게이트는 ko_KR.UTF-8
+  #   로케일의 로컬 맥에서 돈다(D8-4) — UTF-8 콜레이션의 BSD comm 은 C-정렬 입력에서 동기화를
+  #   잃어 유령 SEAL_CULPRIT added+removed 를 뿜고(실측: 1파일 추가에 5+4행), 원리상 실제
+  #   .app 루트 추가를 삼킬 수도 있다(봉인 밖 유일한 그물이 이 센서스다). 동일 센서스에는
+  #   행동 불변(PASS→FAIL 전이 없음) — 정렬·비교의 콜레이션 일치가 전부다.
+  added="$(LC_ALL=C comm -13 "$pre" "$post")"
+  removed="$(LC_ALL=C comm -23 "$pre" "$post")"
   reverify_out="$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1)"; reverify_rc=$?
   viol=""
   [ "$sim_rc" -eq 0 ] || viol="기록자 위반(위 ⑥ 출력)"

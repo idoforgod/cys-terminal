@@ -129,6 +129,16 @@ jobs:
                   "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
                   "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다.",
               ),
+              "test_verify_win_crt": (
+                  {"ci-branch", "release"},
+                  "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
+                  "0레인 실행이었다). 대상 scripts/verify_win_crt.py 는 배송 팩 tar 에 실리지 "
+                  "않고, 소비 지점은 release.yml Windows 레그의 업로드 전 CRT 게이트뿐이다(실측 "
+                  "grep: release.yml 단독). 이것은 **팩 배송과 실제로 무관한** 드문 경우다 — "
+                  "pack-release 는 팩만 서명·배송하며 이 도구를 실행할 일도 실을 일도 없어, "
+                  "편입하면 오히려 근거 없는 목록이 된다(이 게이트 자신의 규율). "
+                  "ci-branch = 브랜치 조기 경보 · release = 소비 직전 도구 증명의 2레인 편입.",
+              ),
           }
           # (2026-08-12 편입 완료: test_bootstrap_chain 을 3레인 전부에 배선 — 위계 폴백의 유일
           #  회귀 핀 세트가 CI 0회 실행이던 격차를 봉합. ALLOWED 예외도 함께 제거 — 대칭이 정본.)
@@ -520,6 +530,22 @@ jobs:
           #   결손 오판 → node-recover 가 살아있는 입력창에 주입 → 전 pane 사망(치명 앵커 ④)
           #   재발 — 그 회귀를 여기서 잡는다. 3완전 레인 동시·대칭 등재 · `test_` 토큰이라 위
           #   '팩 스위트 레인 대조' 게이트가 레인 이탈을 기계로 잡는다.
+
+      # ★R1-repair(2026-08-29 · v0.14.28): W4-C 가 추가한 scripts/tests/test_verify_win_crt.py 가
+      #   어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" — 라운드1 지적).
+      #   대상 scripts/verify_win_crt.py 는 release.yml Windows 레그의 **업로드 전 CRT 게이트**가
+      #   소비하는 도구다 — 도구가 깨진 채 그 판정을 믿는 회귀를 여기(브랜치 조기 경보)와
+      #   release(소비 직전 증명)에서 잡는다. 밀폐 합성 PE 픽스처·tempfile 만 사용(러너 자기완결 ·
+      #   실측 0.01s). 팩 스위트가 아니므로 pack-release 미편입 — 사유는 위 레인 대조 게이트의
+      #   ALLOWED("test_verify_win_crt") 등재 참조(대상이 팩 tar 에 실리지 않는다).
+      - name: verify_win_crt 게이트 도구 밀폐 스위트 (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_verify_win_crt.py"
+          [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          echo "== test_verify_win_crt (mac) =="
+          python3 "$f"
 
       # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
       #   그쪽은 "같은 파일을 같게 판정하는가", 여기는 "**애초에 같은 파일을 보는가**"를 묻는다.

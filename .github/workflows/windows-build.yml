@@ -596,7 +596,7 @@ jobs:
           $rtLeft = @(Get-ChildItem (Join-Path $dir 'runtime') -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.prev*' })
           $rtPrev = $rtLeft.Count
           # ★W4(2026-08-29) 추가 단언: 훅 스테이징 산출물 `<bin>.new.exe` 는 성공 설치 후 $INSTDIR
-          #   에 남지 않아야 한다 — 배치 성공 시 rename 으로 소멸 + Delete 벨트(nsis-hooks.nsh:317),
+          #   에 남지 않아야 한다 — 배치 성공 시 rename 으로 소멸 + Delete 벨트(nsis-hooks.nsh:323),
           #   오라클 단락 시에도 stale `.new` 를 지운다(:191). 정식 존재 시 cysd 부팅 가드(W1)도
           #   삭제한다. 남아 있으면 배치 트랜잭션 또는 가드 회귀다(NSIS-CONTRACT.md §1).
           $newLeft = @(Get-ChildItem $dir -File -Filter '*.new.exe' -ErrorAction SilentlyContinue)

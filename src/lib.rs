@@ -4483,6 +4483,15 @@ mod spawn_policy_tests {
             "_target_alive 의 `cys list` 프로브에 CYS_NO_AUTOSTART 봉인이 없다 — 죽은 대상 \
              판정이 라이벌 데몬 점화로 뒤집힌다(스펙 W3 · javis_org.dept_status 와 동일 규약)"
         );
+        // ★R1 라운드1 짝 핀(2026-08-29): 봉인의 대가를 정직하게 치르는 fail-safe 가 함께 있어야
+        //   한다. 봉인 아래 죽은 소켓의 실측 모양은 stdout 0바이트 + rc!=0 인데(실 바이너리
+        //   실측), 이를 'dead' 로 읽으면 drain 의 zombie 가드가 pending 을 영구 삭제한다 —
+        //   주기 자가치유의 무음 소실(앵커 ③ 인접). 측정 실패 = unknown(경고 배달)이어야 한다.
+        assert!(
+            body.contains("proc.returncode != 0"),
+            "_target_alive 에 측정 실패(rc!=0/빈 stdout → unknown) fail-safe 가 없다 — \
+             NO_AUTOSTART 봉인 아래 '닿지 않는 데몬'이 'dead' 로 접혀 pending 이 영구 삭제된다"
+        );
     }
 
     /// ★실동작 검증(unix): 등급이 실제로 프로세스 그룹을 가르는가.

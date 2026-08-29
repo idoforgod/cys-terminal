@@ -107,7 +107,8 @@ pub(crate) fn quarantine_file_name(orig: &str, stamp: u64, seq: usize) -> String
     format!("{orig}.prev{stamp}{seq:03}")
 }
 
-// ── W1 부팅 잔해 회수 가드 — 정식(canonical) 부재 시 잔해는 쓰레기가 아니라 복구 재료다 ──
+// ── W1 부팅 잔해 회수 가드 — 정식(canonical) **동작본** 부재 시 잔해는 쓰레기가 아니라 복구
+//    재료다(존재해도 <64KiB 절단본이면 부재로 센다 — plan_leftover_action 주석) ──
 //
 // 이 가드는 부팅 시퀀스에서 스윕보다 먼저, 소켓 서빙 **전에** 돈다 — 규칙이 틀리면 전 조직의
 // CLI 가 죽는 자리다. 그래서 판정 전량을 순수 함수(plan_leftover_action)에 두고, 파일시스템
@@ -118,11 +119,18 @@ pub(crate) fn quarantine_file_name(orig: &str, stamp: u64, seq: usize) -> String
 #[cfg(any(windows, test))]
 pub(crate) const GUARDED_BINS: [&str; 3] = ["cys", "cysd", "cys-app"];
 
-/// 복구 재료로 믿을 최소 크기 64KiB — 설치기 배치 검증(nsis-hooks W4-B ④)과 같은 임계다.
+/// 복구 재료로 믿을 최소 크기 64KiB — 설치기 배치 검증(nsis-hooks W4-B ④)·LASTDITCH 크기
+/// 프로브와 같은 임계다.
 /// `.new` 는 파일 **복사**의 산물이라 전원 차단 시 잘린 채 남을 수 있고, 잘린 파일을 정식으로
 /// 승격하면 다음 부팅이 "정식 존재"로 오판해 **남은 진짜 재료(.prev)를 지운다** — 승격 실수가
 /// 삭제 사고로 전이되는 유일한 경로라서, prev 에도 같은 문턱을 건다(정상 prev 는 rename 산물
 /// = 원자적이라 잘릴 수 없으므로, 이 문턱이 거르는 것은 병리적 이력의 쓰레기뿐이다).
+///
+/// ★같은 문턱을 **정식 자신에게도** 건다(R1 라운드1 수리 · 2026-08-29): 새 PREINSTALL 은
+/// 정식 3종을 스윕에서 제외하므로, 비잠금 경로에서는 **템플릿 File 추출이 정식을 제자리
+/// truncate-write** 한다 — 그 도중의 전원 차단·취소는 0바이트/절단 정식을 남긴다. 절단 정식을
+/// '존재'로 읽으면 판정이 SweepAll 로 흘러 살아있는 `.prev`·stale-good `.new` 전부(= 마지막
+/// 동작본들)를 지운다. 그래서 정식은 존재가 아니라 **동작본(≥이 문턱)일 때만 존재**로 센다.
 #[cfg(any(windows, test))]
 pub(crate) const MIN_PROMOTABLE_BYTES: u64 = 64 * 1024;
 
@@ -142,37 +150,51 @@ pub(crate) struct PrevCandidate {
 /// ★배선 실행 순서 계약: 삭제는 어떤 갈래에서든 **정식이 실재하게 된 뒤에만** 한다. 승격
 ///   rename 이 실패하면 계획이 무엇이었든 가족 전체를 동결한다 — "정식 부재인데 지운다"로
 ///   전이하는 분기가 코드 어디에도 없어야 이 가드가 성립한다.
+///   **유일한 예외 = 절단 정식 자신**(`replace_canonical`): 그것은 재료가 아니라 승격 rename 의
+///   장애물이고(Windows rename 은 실재하는 dest 에 실패한다), 동작본 재료를 손에 쥔 승격 갈래
+///   에서만, 승격 **직전**에 치운다. 치우기가 거부되면 승격을 시도하지 않고 동결로 강등한다 —
+///   재료 삭제는 여전히 정식(동작본)이 실재하게 된 뒤에만 한다.
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LeftoverPlan {
-    /// 정식 존재 — 가족 잔해는 종전 규칙(스윕)이 지운다. `delete_new` 는 문법 밖 `<bin>.new` 의
-    /// 명시 처분(정식이 있으니 그 신본은 남을 이유가 없는 배치 중단 흔적이다).
+    /// 정식이 **동작본**(≥64KiB)으로 존재 — 가족 잔해는 종전 규칙(스윕)이 지운다. `delete_new` 는
+    /// 문법 밖 `<bin>.new` 의 명시 처분(정식이 있으니 그 신본은 남을 이유가 없는 배치 중단 흔적이다).
     SweepAll { delete_new: bool },
-    /// 정식 부재 — `<bin>.new`(≥64KiB) 를 정식으로 rename 승격. 성공 시 잔여 prev 는 스윕이 정리.
-    PromoteNew,
-    /// 정식 부재·쓸 만한 `.new` 없음 — `source`(최신 mtime 의 승격 가능 prev)를 정식으로 rename
+    /// 동작본 부재 — `<bin>.new`(≥64KiB) 를 정식으로 rename 승격. 성공 시 잔여 prev 는 스윕이 정리.
+    /// `replace_canonical` = 절단 정식(존재하되 <64KiB)이 자리를 막고 있으니 승격 직전에 치우라.
+    PromoteNew { replace_canonical: bool },
+    /// 동작본 부재·쓸 만한 `.new` 없음 — `source`(최신 mtime 의 승격 가능 prev)를 정식으로 rename
     /// 승격. `delete_new` = 미달(잘린) `.new` 의 처분 지시 — 단 **승격 성공 후에만**(위 계약).
-    PromotePrev { source: String, delete_new: bool },
-    /// 정식 부재 + 가족 파일 자체가 하나도 없음 — 지킬 것도 고칠 것도 없다(개발 트리·미설치
-    /// 바이너리의 정상 상태). **조용히** 지나간다 — 매 부팅 우는 배너는 이 파일이 없애온 실패다.
+    /// `replace_canonical` 은 PromoteNew 와 동일.
+    PromotePrev { source: String, delete_new: bool, replace_canonical: bool },
+    /// 동작본 부재 + 가족 파일 자체가 하나도 없음(절단 정식도 없음) — 지킬 것도 고칠 것도 없다
+    /// (개발 트리·미설치 바이너리의 정상 상태). **조용히** 지나간다 — 매 부팅 우는 배너는 이
+    /// 파일이 없애온 실패다.
     NothingToDo,
-    /// 정식 부재 + 재료는 있으나 전부 승격 부적격(미달 크기) — **아무것도 지우지 않는다**.
-    /// 가족 전체 무접촉 동결 + loud. 잘린 재료도 보존한다(다음 설치·수동 복구의 단서).
+    /// 동작본 부재 + 재료는 있으나 전부 승격 부적격(미달 크기) — **아무것도 지우지 않는다**.
+    /// 가족 전체 무접촉 동결 + loud. 잘린 재료도, 절단 정식도 보존한다(다음 설치·수동 복구의
+    /// 단서 — 절단 정식은 재료가 생겨야만 치울 가치가 있다).
     Hold,
 }
 
-/// **판정의 정의처(순수).** 정식 존재 여부 · `.new` 크기 · prev 후보들 → 이번 부트의 행동.
+/// **판정의 정의처(순수).** 정식 크기(None=부재) · `.new` 크기 · prev 후보들 → 이번 부트의 행동.
+///
+/// ★정식은 `is_file` 존재가 아니라 **크기로** 받는다(R1 라운드1 수리): 절단 정식(<64KiB)을
+///   '존재'로 읽으면 SweepAll 이 마지막 동작본(.prev·stale-good `.new`)을 지운다. 절단 정식은
+///   '부재 + 자리 막힘(replace_canonical)'으로 판정한다.
 #[cfg(any(windows, test))]
 pub(crate) fn plan_leftover_action(
-    canonical_exists: bool,
+    canonical_size: Option<u64>,
     new_size: Option<u64>,
     prevs: &[PrevCandidate],
 ) -> LeftoverPlan {
-    if canonical_exists {
+    if canonical_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES) {
         return LeftoverPlan::SweepAll { delete_new: new_size.is_some() };
     }
+    // 이 아래는 전부 "동작본 부재". 절단 정식이 있으면 승격 갈래에 자리 비우기를 지시한다.
+    let replace_canonical = canonical_size.is_some();
     if new_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES) {
-        return LeftoverPlan::PromoteNew;
+        return LeftoverPlan::PromoteNew { replace_canonical };
     }
     // 최신 mtime 우선 — 가장 마지막까지 정식 자리에 있었던 본이 최신이다. 동률은 이름으로 깨서
     // 부트 간 순서를 결정론으로 고정한다(read_dir 순서 의존 금지 — 격리함 유계 패스와 같은 규율).
@@ -184,9 +206,10 @@ pub(crate) fn plan_leftover_action(
         return LeftoverPlan::PromotePrev {
             source: p.name.clone(),
             delete_new: new_size.is_some(),
+            replace_canonical,
         };
     }
-    if new_size.is_none() && prevs.is_empty() {
+    if canonical_size.is_none() && new_size.is_none() && prevs.is_empty() {
         LeftoverPlan::NothingToDo
     } else {
         LeftoverPlan::Hold
@@ -224,8 +247,12 @@ pub(crate) struct GuardStats {
     /// (정식 이름, 보존한 가족 파일 수) — 정식 부재 + 승격 가능 재료 전무. 무행동. **항상 loud**.
     pub held: Vec<(String, usize)>,
     /// 정식 존재(승격 성공 직후 포함) 하에 지운 `<bin>.new.<ext>` 수 — 문법 밖 명시 규칙의
-    /// 유일한 삭제 경로. info(배치 중단 흔적 청소 — 조치 불요).
+    /// 삭제 경로. info(배치 중단 흔적 청소 — 조치 불요).
     pub deleted_new: usize,
+    /// 동작본 승격 직전에 치운 **절단 정식**(<64KiB · 전원 차단 truncate-write 잔해) 수.
+    /// 유일한 다른 삭제 경로 — 침묵 금지 규율에 따라 계수한다(info: 같은 가족의 promoted loud
+    /// 가 사건 자체는 이미 알리고, 이 줄은 "정식 자리에 있던 것이 쓰레기였다"를 사후 판독에 남긴다).
+    pub truncated_removed: usize,
 }
 
 /// 동결: 가족 잔해 전체를 스윕이 건너뛸 집합에 넣는다(`.new` 는 문법 밖이라 스윕이 원래 못 본다).
@@ -290,7 +317,12 @@ pub(crate) fn guard_canonical_binaries(
         let canonical_name = format!("{bin}.{ext}");
         let new_name = format!("{bin}.new.{ext}");
         let canonical = dir.join(&canonical_name);
-        let canonical_exists = std::fs::metadata(&canonical).is_ok_and(|m| m.is_file());
+        // 존재가 아니라 크기 — 절단 정식(truncate-write 중 사망)을 '존재'로 읽으면 SweepAll 이
+        // 마지막 동작본을 지운다(R1 라운드1 수리 · MIN_PROMOTABLE_BYTES 주석).
+        let canonical_size = std::fs::metadata(&canonical)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
         let new_path = dir.join(&new_name);
         let new_size = std::fs::metadata(&new_path)
             .ok()
@@ -301,7 +333,7 @@ pub(crate) fn guard_canonical_binaries(
             .filter(|c| is_family_leftover(&c.name, bin, ext))
             .cloned()
             .collect();
-        match plan_leftover_action(canonical_exists, new_size, &family) {
+        match plan_leftover_action(canonical_size, new_size, &family) {
             LeftoverPlan::NothingToDo => {}
             LeftoverPlan::SweepAll { delete_new } => {
                 // 정식이 살아 있으니 가족 prev 는 스윕 관할로 되돌린다(무동결). `.new` 만 여기서
@@ -312,32 +344,57 @@ pub(crate) fn guard_canonical_binaries(
                     stats.deleted_new += 1;
                 }
             }
-            LeftoverPlan::PromoteNew => {
-                if promote(&new_path, &canonical) {
-                    stats.promoted.push((canonical_name, new_name));
-                    // 잔여 prev 는 정식이 실재하게 됐으므로 스윕이 종전 규칙으로 정리한다(무동결).
-                } else {
+            LeftoverPlan::PromoteNew { replace_canonical } => {
+                // 절단 정식은 재료가 아니라 승격 rename 의 장애물이다(Windows rename 은 실재하는
+                // dest 에 실패) — 동작본 재료를 손에 쥔 지금만, 승격 **직전**에 치운다. 치우기가
+                // 거부되면(잠금 등) 승격을 시도하지 않고 동결로 강등한다(실행 순서 계약의 예외 조항).
+                if replace_canonical && !remove(&canonical) {
                     stats.promote_failed.push((canonical_name, new_name));
                     freeze_family(&mut hold, dir, &family);
+                } else {
+                    if replace_canonical {
+                        stats.truncated_removed += 1;
+                    }
+                    if promote(&new_path, &canonical) {
+                        stats.promoted.push((canonical_name, new_name));
+                        // 잔여 prev 는 정식이 실재하게 됐으므로 스윕이 종전 규칙으로 정리한다(무동결).
+                    } else {
+                        stats.promote_failed.push((canonical_name, new_name));
+                        freeze_family(&mut hold, dir, &family);
+                    }
                 }
             }
-            LeftoverPlan::PromotePrev { source, delete_new } => {
+            LeftoverPlan::PromotePrev { source, delete_new, replace_canonical } => {
                 let src = dir.join(&source);
-                if promote(&src, &canonical) {
-                    stats.promoted.push((canonical_name, source));
-                    // ★정식이 이제 실재한다 — 그때만 미달 `.new` 를 처분한다(실행 순서 계약).
-                    if delete_new && remove(&new_path) {
-                        stats.deleted_new += 1;
-                    }
-                } else {
+                // 절단 정식 처리는 PromoteNew 와 동일(위 주석).
+                if replace_canonical && !remove(&canonical) {
                     stats.promote_failed.push((canonical_name, source));
                     freeze_family(&mut hold, dir, &family);
+                } else {
+                    if replace_canonical {
+                        stats.truncated_removed += 1;
+                    }
+                    if promote(&src, &canonical) {
+                        stats.promoted.push((canonical_name, source));
+                        // ★정식이 이제 실재한다 — 그때만 미달 `.new` 를 처분한다(실행 순서 계약).
+                        if delete_new && remove(&new_path) {
+                            stats.deleted_new += 1;
+                        }
+                    } else {
+                        stats.promote_failed.push((canonical_name, source));
+                        freeze_family(&mut hold, dir, &family);
+                    }
                 }
             }
             LeftoverPlan::Hold => {
-                stats
-                    .held
-                    .push((canonical_name, family.len() + usize::from(new_size.is_some())));
+                // 절단 정식·미달 `.new` 도 보존 계수에 넣는다 — held 의 둘째 값은 "무접촉으로
+                // 남긴 가족 파일 수"다(계수 소유자 단일 규율).
+                stats.held.push((
+                    canonical_name,
+                    family.len()
+                        + usize::from(new_size.is_some())
+                        + usize::from(canonical_size.is_some()),
+                ));
                 freeze_family(&mut hold, dir, &family);
             }
         }
@@ -356,8 +413,9 @@ pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> 
         out.push((
             LeftoverLog::Loud,
             format!(
-                "[cysd] ⚠ 부팅 복구: 정식 {canonical} 부재 → {source} 를 rename 승격해 재건했다 — \
-                 직전 업데이트가 중단된 흔적이다. 설치기를 다시 실행해 최신본으로 마무리하라"
+                "[cysd] ⚠ 부팅 복구: 정식 {canonical} 동작본 부재 → {source} 를 rename 승격해 \
+                 재건했다 — 직전 업데이트가 중단된 흔적이다. 설치기를 다시 실행해 최신본으로 \
+                 마무리하라"
             ),
         ));
     }
@@ -365,8 +423,9 @@ pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> 
         out.push((
             LeftoverLog::Loud,
             format!(
-                "[cysd] ⚠ 정식 {canonical} 부재·복구 승격 실패({source} rename 거부) — 복구 재료 \
-                 보존을 위해 가족 잔해를 무접촉 동결했다. 다음 기동이 재시도한다"
+                "[cysd] ⚠ 정식 {canonical} 동작본 부재·복구 승격 실패({source} 를 정식 자리에 \
+                 앉히지 못함 — rename/자리 비우기 거부) — 복구 재료 보존을 위해 가족 잔해를 \
+                 무접촉 동결했다. 다음 기동이 재시도한다"
             ),
         ));
     }
@@ -374,8 +433,8 @@ pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> 
         out.push((
             LeftoverLog::Loud,
             format!(
-                "[cysd] ⚠ 정식 {canonical} 부재 + 승격 가능한 복구 재료 전무 — 아무것도 지우지 \
-                 않는다(가족 파일 {kept}개 무접촉 보존). 설치기를 다시 실행해 복구하라"
+                "[cysd] ⚠ 정식 {canonical} 동작본 부재 + 승격 가능한 복구 재료 전무 — 아무것도 \
+                 지우지 않는다(가족 파일 {kept}개 무접촉 보존). 설치기를 다시 실행해 복구하라"
             ),
         ));
     }
@@ -385,6 +444,16 @@ pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> 
             format!(
                 "[cysd] update leftovers: 정식 존재 확인 후 배치 중단 흔적 .new 신본 {}건 삭제",
                 stats.deleted_new
+            ),
+        ));
+    }
+    if stats.truncated_removed > 0 {
+        out.push((
+            LeftoverLog::Info,
+            format!(
+                "[cysd] update leftovers: 절단 정식(truncate-write 중단 잔해 <64KiB) {}건을 동작본 \
+                 승격 직전에 제거",
+                stats.truncated_removed
             ),
         ));
     }
@@ -4675,7 +4744,9 @@ mod update_leftover_sweep_tests {
         touch(&root.join("cysd.prev.exe"));
         touch(&root.join("runtime/git/usr/bin/msys-2.0.dll.prev4213"));
         touch(&root.join("runtime/python/notes.preview.png")); // 사용자 파일 — 불가침
-        touch(&root.join("cysd.exe")); // 살아있는 바이너리 — 불가침
+        // 살아있는 바이너리 — 불가침. ≥64KiB 로 만든다: 정식은 이제 존재가 아니라 **동작본**
+        // (MIN_PROMOTABLE_BYTES)으로 판정한다 — 1바이트 정식은 '건강'이 아니라 절단 잔해다(G⑨~G⑫).
+        touch_sized(&root.join("cysd.exe"), MIN_PROMOTABLE_BYTES, b'C');
         touch_at(&trash.join("old.dll.prev1"), T0 - 10, 32); // 지난 부트의 격리본(홀더 사망)
 
         // ── 부트 1 ──
@@ -4914,45 +4985,74 @@ mod update_leftover_sweep_tests {
             size,
         };
         let big = MIN_PROMOTABLE_BYTES;
-        // 정식 존재 → 스윕 위임. `.new` 는 존재할 때만(크기 무관) 삭제 지시 — 명시 규칙.
+        // 정식 **동작본**(≥64KiB) 존재 → 스윕 위임. `.new` 는 존재할 때만(크기 무관) 삭제 지시.
         assert_eq!(
-            plan_leftover_action(true, None, &[]),
+            plan_leftover_action(Some(big), None, &[]),
             LeftoverPlan::SweepAll { delete_new: false }
         );
         assert_eq!(
-            plan_leftover_action(true, Some(3), &[pc("cys.prev.exe", 9, big)]),
+            plan_leftover_action(Some(big + 9), Some(3), &[pc("cys.prev.exe", 9, big)]),
             LeftoverPlan::SweepAll { delete_new: true }
         );
         // 정식 부재: 온전한 `.new` 가 prev 보다 우선한다(경계 64KiB 정확히 = 승격 가능).
         assert_eq!(
-            plan_leftover_action(false, Some(big), &[pc("cys.prev.exe", 9, big)]),
-            LeftoverPlan::PromoteNew
+            plan_leftover_action(None, Some(big), &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::PromoteNew { replace_canonical: false }
         );
+        // ★R1 라운드1 핀 — **절단 정식**(존재하되 <64KiB · truncate-write 중 사망)은 '존재'가
+        //   아니다. 존재로 읽으면 SweepAll 이 마지막 동작본(.prev·stale-good .new)을 지운다.
+        //   판정은 승격 + 자리 비우기 지시(replace_canonical)다.
+        assert_eq!(
+            plan_leftover_action(Some(0), Some(big), &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::PromoteNew { replace_canonical: true }
+        );
+        assert_eq!(
+            plan_leftover_action(Some(big - 1), None, &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::PromotePrev {
+                source: "cys.prev.exe".into(),
+                delete_new: false,
+                replace_canonical: true
+            }
+        );
+        // 절단 정식 + 승격 가능 재료 전무 → Hold(절단 정식도 지우지 않는다 — 수동 복구 단서).
+        assert_eq!(plan_leftover_action(Some(3), None, &[]), LeftoverPlan::Hold);
         // `.new` 미달(잘림) → 최신 mtime 의 prev 폴백 + 미달 신본은 승격 성공 후 처분 지시.
         assert_eq!(
             plan_leftover_action(
-                false,
+                None,
                 Some(big - 1),
                 &[pc("cys.prev.exe", 5, big), pc("cys.prev2.exe", 9, big)]
             ),
-            LeftoverPlan::PromotePrev { source: "cys.prev2.exe".into(), delete_new: true }
+            LeftoverPlan::PromotePrev {
+                source: "cys.prev2.exe".into(),
+                delete_new: true,
+                replace_canonical: false
+            }
         );
         // prev 중 미달 크기는 최신이어도 건너뛴다 — 잘린 본 승격은 다음 부팅의 "정식 존재" 오판
         // → 남은 진짜 재료 삭제로 전이된다(가드가 막는 사고 그 자체).
         assert_eq!(
-            plan_leftover_action(false, None, &[pc("cys.prev.exe", 99, 10), pc("cys.prev2.exe", 5, big)]),
-            LeftoverPlan::PromotePrev { source: "cys.prev2.exe".into(), delete_new: false }
+            plan_leftover_action(None, None, &[pc("cys.prev.exe", 99, 10), pc("cys.prev2.exe", 5, big)]),
+            LeftoverPlan::PromotePrev {
+                source: "cys.prev2.exe".into(),
+                delete_new: false,
+                replace_canonical: false
+            }
         );
         // mtime 동률은 이름으로 깬다 — read_dir 순서와 무관한 부트 간 결정론.
         assert_eq!(
-            plan_leftover_action(false, None, &[pc("cys.prev.exe", 7, big), pc("cys.prev3.exe", 7, big)]),
-            LeftoverPlan::PromotePrev { source: "cys.prev3.exe".into(), delete_new: false }
+            plan_leftover_action(None, None, &[pc("cys.prev.exe", 7, big), pc("cys.prev3.exe", 7, big)]),
+            LeftoverPlan::PromotePrev {
+                source: "cys.prev3.exe".into(),
+                delete_new: false,
+                replace_canonical: false
+            }
         );
         // 가족이 통째로 없으면 조용(NothingToDo) · 미달 재료뿐이면 동결(Hold) — 둘은 다른 상태다.
-        assert_eq!(plan_leftover_action(false, None, &[]), LeftoverPlan::NothingToDo);
-        assert_eq!(plan_leftover_action(false, Some(8), &[]), LeftoverPlan::Hold);
+        assert_eq!(plan_leftover_action(None, None, &[]), LeftoverPlan::NothingToDo);
+        assert_eq!(plan_leftover_action(None, Some(8), &[]), LeftoverPlan::Hold);
         assert_eq!(
-            plan_leftover_action(false, None, &[pc("cys.prev.exe", 9, 8)]),
+            plan_leftover_action(None, None, &[pc("cys.prev.exe", 9, 8)]),
             LeftoverPlan::Hold
         );
     }
@@ -5066,6 +5166,134 @@ mod update_leftover_sweep_tests {
                 .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("cysd.exe.prev777")),
             "{lines:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑨ R1 라운드1 핀(파일시스템 배선까지) — **절단 정식**(0바이트 · truncate-write 중 전원
+    ///    차단)은 '존재'가 아니다: SweepAll 오판으로 마지막 동작본 prev 를 지우는 대신, 절단
+    ///    정식을 치우고 prev 를 rename 승격한다. rename 은 실재하는 dest 에 실패하므로(Windows)
+    ///    자리 비우기 없는 승격은 성립하지 않는다 — 그 순서까지 여기서 돈다.
+    #[test]
+    fn guard_replaces_truncated_canonical_with_last_working_prev() {
+        let root = workdir("guard-truncated-canonical");
+        touch_sized(&root.join("cys.exe"), 0, b'0'); // 절단 정식(0바이트)
+        touch_sized(&root.join("cys.prev.exe"), MIN_PROMOTABLE_BYTES, b'P');
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert_eq!(
+            std::fs::metadata(root.join("cys.exe")).unwrap().len(),
+            MIN_PROMOTABLE_BYTES,
+            "절단 정식이 마지막 동작본으로 교체되지 않았다"
+        );
+        assert!(!root.join("cys.prev.exe").exists(), "승격은 rename 이어야 한다(원본 잔류)");
+        assert!(!root.join(UPDATE_TRASH_DIR).exists(), "복구 재료가 격리함으로 갔다");
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("부팅 복구")),
+            "복구가 유음으로 기록되지 않았다: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Info && s.contains("절단 정식")),
+            "절단 정식 제거가 침묵했다(삭제 침묵 금지): {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑩ 절단 정식 + 온전한 `.new` — `.new` 1순위 규칙이 절단 정식 자리 비우기와 함께 돈다.
+    ///    (도달 경로: 새 PREINSTALL 은 정식 3종을 스윕에서 제외 → 비잠금 정식은 템플릿 File 이
+    ///    제자리 truncate-write → 그 도중 사망 + 직전 배치의 stale-good `.new` 잔존.)
+    #[test]
+    fn guard_replaces_truncated_canonical_with_new_binary_first() {
+        let root = workdir("guard-truncated-new-first");
+        touch_sized(&root.join("cysd.exe"), 12, b'T'); // 절단 정식(미달 크기)
+        touch_sized(&root.join("cysd.new.exe"), MIN_PROMOTABLE_BYTES + 5, b'N');
+        touch_at(&root.join("cysd.prev.exe"), T0 - 10, MIN_PROMOTABLE_BYTES as usize);
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert_eq!(
+            std::fs::metadata(root.join("cysd.exe")).unwrap().len(),
+            MIN_PROMOTABLE_BYTES + 5,
+            "승격본이 .new 가 아니다(우선순위 위반)"
+        );
+        assert!(!root.join("cysd.new.exe").exists(), ".new 가 rename 되지 않고 남았다");
+        assert!(
+            !root.join("cysd.prev.exe").exists(),
+            "승격 후 잔여 prev 가 정리되지 않았다"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(l, s)| *l == LeftoverLog::Loud && s.contains("부팅 복구")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑪ 절단 정식 + 승격 가능 재료 전무 → **아무것도 지우지 않는다**(절단 정식 포함 보존).
+    ///    절단 정식은 재료가 생겨야만 치울 가치가 있다 — 홀로 남은 그것을 지우면 "무엇이 있던
+    ///    자리인가"라는 수동 복구의 단서까지 없앤다.
+    #[test]
+    fn guard_holds_truncated_canonical_when_no_material_exists() {
+        let root = workdir("guard-truncated-hold");
+        touch_sized(&root.join("cys.exe"), 7, b'T'); // 절단 정식
+        touch(&root.join("cys.prev.exe")); // 1바이트 = 승격 부적격
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert!(root.join("cys.exe").exists(), "재료도 없는데 절단 정식을 지웠다");
+        assert_eq!(std::fs::metadata(root.join("cys.exe")).unwrap().len(), 7);
+        assert!(root.join("cys.prev.exe").exists(), "동결해야 할 재료를 지웠다");
+        let loud: Vec<_> = lines.iter().filter(|(l, _)| *l == LeftoverLog::Loud).collect();
+        assert_eq!(loud.len(), 1, "무행동 동결은 정확히 1회 loud 여야 한다: {lines:?}");
+        assert!(
+            loud[0].1.contains("복구 재료 전무") && loud[0].1.contains("cys.exe"),
+            "{}",
+            loud[0].1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G⑫ 절단 정식 **자리 비우기 거부**(잠금 등)는 승격 시도 없이 동결로 강등된다 — 배선
+    ///    실행 순서 계약의 예외 조항이 실패 방향까지 지켜지는지 주입 실패로 박제한다(재료 무손실).
+    #[test]
+    fn guard_refused_truncated_removal_freezes_without_promoting() {
+        let root = workdir("guard-truncated-remove-refused");
+        let canonical = root.join("cys-app.exe");
+        touch_sized(&canonical, 3, b'T'); // 절단 정식
+        touch_sized(&root.join("cys-app.prev.exe"), MIN_PROMOTABLE_BYTES, b'P');
+
+        let mut guard = GuardStats::default();
+        let mut refuse_canonical_rm = |p: &Path| {
+            assert_ne!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("cys-app.prev.exe"),
+                "동결 대상 재료에 삭제를 시도했다"
+            );
+            false // 절단 정식 제거 거부(잠금 모사)
+        };
+        let mut must_not_promote = |_: &Path, _: &Path| -> bool {
+            panic!("자리 비우기 실패인데 승격을 시도했다(rename 은 실재 dest 에 실패 — 순서 위반)")
+        };
+        let hold = guard_canonical_binaries(
+            &root,
+            "exe",
+            &mut refuse_canonical_rm,
+            &mut must_not_promote,
+            &mut guard,
+        );
+
+        assert_eq!(
+            guard.promote_failed,
+            vec![("cys-app.exe".to_string(), "cys-app.prev.exe".to_string())]
+        );
+        assert_eq!(guard.truncated_removed, 0, "거부됐는데 제거로 계수했다");
+        assert!(hold.contains(&root.join("cys-app.prev.exe")), "가족 재료가 동결되지 않았다");
+        assert!(canonical.exists() && root.join("cys-app.prev.exe").exists(), "무언가를 잃었다");
         let _ = std::fs::remove_dir_all(&root);
     }
 
