@@ -323,6 +323,22 @@ cys_pl_commit_${TAG}:
   Delete "$INSTDIR\${BIN}.new.exe"
   ClearErrors
 cys_pl_done_${TAG}:
+  ; ⑨ 임시 신본(.new.exe) 중앙 정리 — ★조건부다.
+  ;   거부/실패 경로들(vacate-locked · fill-failed · recheck)은 각자 자리에서 지우지 않는다:
+  ;   그 시점의 정식 상태가 경로마다 달라, 일괄 삭제하면 "빈손 삭제"(유일한 복구 재료 소실)가
+  ;   될 수 있기 때문이다. 그래서 여기서 **정식이 건강할 때만** 지운다 — W1 데몬 스윕의
+  ;   `.new.exe` 규칙(정식 존재 시에만 삭제 가능)과 같은 자를 쓴다.
+  ;   실측 근거: CI run 33247539395 T4-15a — 배타 핸들 거부에서 계약 11개 중 10개 통과,
+  ;   `.new` 잔존 하나만 FAIL 이었다(설치기 동작은 정확했고 정리만 빠져 있었다).
+  IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_pl_nodone_${TAG}
+  ClearErrors
+  FileOpen $R9 "$INSTDIR\${BIN}.exe" r
+  IfErrors cys_pl_nodone_${TAG}          ; 정식이 없거나 열 수 없다 = 재료를 지우면 안 된다
+  FileSeek $R9 0 END $R5
+  FileClose $R9
+  IntCmp $R5 65536 0 cys_pl_nodone_${TAG} 0   ; 절단 정식도 "없음"과 같게 본다(재료 보존)
+  Delete "$INSTDIR\${BIN}.new.exe"       ; best-effort — 실패해도 데몬 스윕이 회수한다
+cys_pl_nodone_${TAG}:
   ClearErrors
 !macroend
 

@@ -106,7 +106,7 @@ EXPECTED_MACROS = {
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "754b7a9e6bb080412ad757e9ce679b6c5fcd5f0442bbd23d4ea0088c6cc79c8c"
+GUARD_PIN = "a0f620836f70fb30e6a2065f6b7afb9d74f3247562d470df37c95085572cc5be"
 
 
 def hook_path():
@@ -468,22 +468,33 @@ def place(run, b, src_ok=True):
     cys_pl_commit_.  Returns "ok"/"fail"."""
     n, new = b + ".exe", b + ".new.exe"
     run.slots[b] = None
+
+    def done(res):
+        """⑨ 임시 신본(.new.exe) 중앙 정리 — 훅 cys_pl_done_ 의 미러.
+        ★조건부: 정식이 존재하고 열리며 크기 하한을 넘을 때만 지운다. 경로마다 정식
+        상태가 달라 일괄 삭제는 "빈손 삭제"(유일한 복구 재료 소실)가 될 수 있기 때문이며,
+        W1 데몬 스윕의 `.new.exe` 규칙(정식 존재 시에만 삭제)과 같은 자를 쓴다."""
+        if new in run.files:
+            c = run.files.get(n)
+            if c is not None and c["lock"] != "sharenone" and c["kind"] != "TRUNC":
+                run.op_delete(new, "d-done:" + b)   # best-effort
+        return res
     # ① oracle short-circuit — same-version reinstall / already-extracted path
     if run.oracle(b, "or1:" + b) == "fresh":
         run.op_delete(new, "d-shortcut:" + b)   # best-effort, errors cleared
-        return "ok"
+        return done("ok")
     run.attempted[b] = True
     run.int_point("place:" + b)
     # ② stale .new must be FULLY removed (downgrade trap — see hook comment)
     if not run.op_delete(new, "d-stale:" + b):
         run.refuse(b, "stale-new-locked")
-        return "fail"
+        return done("fail")
     # ③ extract this build to the side name (canonical untouched)
     v = run.fault_variant("extract:" + b, 3)  # 1 write-error, 2 torn<64KiB, 3 torn>=64KiB
     if v == 1:
         run.op_delete(new, "d-exfail:" + b)
         run.refuse(b, "extract-failed")
-        return "fail"
+        return done("fail")
     run.write(new, "NEW" if v == 0 else ("TRUNC" if v == 2 else "NEWBAD"),
               "hook-extract")
     # ④ verify the extract: exists + size floor + oracle DWORDs (fail-closed)
@@ -493,7 +504,7 @@ def place(run, b, src_ok=True):
     if bad:
         run.op_delete(new, "d-newbad:" + b)   # failure ignored by the hook
         run.refuse(b, "new-bad")
-        return "fail"
+        return done("fail")
     # ⑤ vacate the canonical (old build) to a prev slot — absent → straight to ⑥
     slot = None
     if n in run.files:
@@ -513,7 +524,7 @@ def place(run, b, src_ok=True):
                 slot = t
             else:
                 run.refuse(b, "vacate-locked")  # canonical untouched (old intact)
-                return "fail"
+                return done("fail")
         run.slots[b] = slot
     # ⑥ fill: the verified build takes the canonical name (the ms window)
     run.int_point("fill:" + b)
@@ -521,7 +532,7 @@ def place(run, b, src_ok=True):
         if run.slots[b]:
             restore_slot(run, b, run.slots[b])
         run.refuse(b, "fill-failed")          # .new stays on disk (hook leaves it)
-        return "fail"
+        return done("fail")
     run.files[n]["arrival"] = "txn-fill"
     run.int_point("reverify:" + b)
     # ⑦ re-verify — AV quarantine / fs anomaly window (recheck-fail class)
@@ -530,15 +541,15 @@ def place(run, b, src_ok=True):
     if run.oracle(b, "or2:" + b) != "fresh":
         if not run.op_rename(n, new, "rvv:" + b):
             run.refuse(b, "reverify-failed")  # rvstuck: canonical keeps 'something' (R1)
-            return "fail"
+            return done("fail")
         if run.slots[b]:
             restore_slot(run, b, run.slots[b])
         run.refuse(b, "reverify-failed")
-        return "fail"
+        return done("fail")
     # ⑧ commit — .new already gone via rename; Delete is the belt
     run.op_delete(new, "d-commit:" + b)
     run.txn_placed[b] = True
-    return "ok"
+    return done("ok")
 
 
 def unplace(run, b):
