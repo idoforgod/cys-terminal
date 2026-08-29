@@ -383,6 +383,10 @@ cys_sc_done_${TAG}:
 ;     · `.new` 승격 갈래만은 오라클 재검이 안전하다 — `.new` 는 '이번 빌드' 주장이고 이번 빌드는
 ;       VERSIONINFO 를 컴파일 게이트(§5 문자열 3종)로 보증하므로, 아래에서 크기+버전을 함께 재
 ;       크기 통과 절단본(전원차단 tear 의 >99% 지점)의 무검 승격을 끊는다.
+;   ★D11(2026-08-29): 이 `.new` 승격이 성공하고 앞선 바이너리가 구본으로 끝난 조합은 구/신
+;     세대 분할을 exit-4 레인에 남길 수 있다 — 모델 전수 실측에서 분할 종단은 전부 유음
+;     (exit-0 분할 0건 · 상시 핀 lane:D11-ld-split-exit4)이고 설치기 재실행이 치유하며,
+;     근본 봉합(PREINSTALL `.old` 대피)은 D9-b 로 Release B 이월. NSIS-CONTRACT §9-3.
 ;   기대값 ${EXPHIGH}/${EXPLOW} = 이 바이너리의 컴파일 상수(호출부가 CYS_V_* 를 넘긴다).
 !macro CYS_LASTDITCH BIN TAG EXPHIGH EXPLOW
   ClearErrors
@@ -646,8 +650,9 @@ cys_pre_single:
   ;   - 잠겨서 추출이 스킵됐으면 `.new` 추출→검증→rename 2회로 배치한다.
   ;   순서 고정 cys → cysd → cys-app (R3: 실패 시에도 **훅 배치분**의 세대 집합은 항상 prefix
   ;   — 비잠금 정식은 템플릿 File 이 이미 덮었을 수 있어 전체 3종의 prefix 는 아니다. 스코프와
-  ;   도달 가능한 exit-4 세대 분할은 파일 머리 R3 ★스코프 주석·NSIS-CONTRACT §9-5).
-  StrCpy $R4 ""     ; placement-refused (구본 무손상 · 신본 미반영)
+  ;   도달 가능한 exit-4 세대 분할은 파일 머리 R3 ★스코프 주석·NSIS-CONTRACT §9-3
+  ;   (LASTDITCH `.new` 승격 경로 — ★D11)·§9-5(템플릿 경로)).
+  StrCpy $R4 ""     ; placement-refused (구본 무손상 · 신본 미반영 · 예외 = rvstuck 절단 창, NSIS-CONTRACT §9-3 ★D11)
   StrCpy $R6 ""     ; unrecoverable (정식 부재·절단 + 복구 전멸 — 최악)
   StrCpy $R7 ""     ; rolled-back (비상 복구로 구본 복귀 — 기계는 살았으나 미반영)
   StrCpy $R8 ""     ; not-updated (트랜잭션 undo 로 구본 복귀)
@@ -696,6 +701,9 @@ cys_post_fail:
   ; 흔적을 파일로도 남긴다(무인/silent 설치의 유일한 사후 판독원). 토큰 스키마는 동결
   ; (NSIS-CONTRACT.md) — 소비자: CI T4-13 · 체크리스트 P5 · GUI 리더(Release B).
   ; 종료코드: 3 = 정식이 없거나 구본으로 비상 복구됨 / 4 = 구본 무손상·신본 미반영(거부).
+  ;   (★D11 스코프: exit-4 라도 rvstuck 절단 창(NSIS-CONTRACT §9-3)은 정식 자리에 크기
+  ;    통과 절단본을 남길 수 있다 — 항상 유음·토큰 명명, 동작본으로 시작했다면 동작
+  ;    사본이 가족 이름에 잔존 = cysd 부팅 가드 재료. Note 2행은 지배-레인 안내문이다.)
   StrCpy $3 3
   StrCmp $R6 "" 0 cys_post_lvl
   StrCmp $R7 "" 0 cys_post_lvl

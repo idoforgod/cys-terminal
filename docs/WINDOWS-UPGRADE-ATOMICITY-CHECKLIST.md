@@ -217,9 +217,17 @@ icacls "$INST\cys.exe" /inheritance:r /grant:r "$($env:USERNAME):(R)"
 > 종료코드 규약(훅 `cys_post_lvl` 분기 · NSIS-CONTRACT §4): **3 = 정식이 없(었)거나 구본으로 비상
 > 복구됨**(`unrecoverable:`/`rolled-back-to-previous:` 비어있지 않음) · **4 = 거부된
 > 바이너리는 구본 무손상·동작, 그 신본 미반영**(`not-updated:`/`placement-refused:` 만
-> 비어있지 않음 — P6/P10 이 이 쪽을 시험한다. 형제 바이너리는 템플릿 추출로 이미 신본일 수
-> 있다 — 세대 분할 도달 조합·치유는 NSIS-CONTRACT §9-5). 둘 다 "당신의 cys 는 여전히
-> 동작하고 세션도 안 죽었다" 가 전제다 —
+> 비어있지 않음 — P6/P10 이 이 쪽을 시험한다. ★D11 정직 스코프(2026-08-29): "구본 무손상"
+> 은 지배 거부 레인(`vacate-locked` 등)의 서술이다 — `reverify-failed` 절단 창(NSIS-CONTRACT
+> §9-3)에서는 거부 명명 바이너리의 정식 자리에 '크기 통과 절단본'이 남을 수 있다(항상
+> 유음·토큰 명명 · 동작본으로 시작했다면 동작 사본이 가족 이름에 잔존, cysd 부팅 가드가
+> 다음 부팅에 수리). 실패 파일의 Note 2행("old build is still in place…")도 같은 지배-레인
+> 기준 안내문이다 — 기계 판정은 **토큰 4줄·exit 코드로만** 한다. 형제 바이너리는 템플릿
+> 추출로 이미 신본일 수 있고, LASTDITCH `.new` 승격이 만든 세대 분할은 exit-4 레인에서도
+> 도달한다 — 전 분할 종단 유음(모델 실측 5,008/5,008 · 무음 0) · 잠금 해제 후 재실행 치유 ·
+> 근본 봉합(PREINSTALL `.old` 대피)은 D9-b Release B 이월. 도달 조합·치유 상세 =
+> NSIS-CONTRACT §9-3(승격 경로)·§9-5(템플릿 경로)). 둘 다 사용자 안내는 "당신의 cys 는
+> 여전히 동작하고 세션도 안 죽었다" 를 전제로 적혀 있다(지배 레인 기준 · 위 D11 스코프) —
 > 재실행이 정답(안내 문구도 그렇게 적힌다: "Do NOT uninstall. Quit cys from the app
 > (it saves sessions), wait 10 s, run this installer again and choose 'Do not uninstall'."
 > · 실패 파일 Action 2행 = NSIS-CONTRACT §3 동결문).

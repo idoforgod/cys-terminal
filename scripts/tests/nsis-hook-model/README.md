@@ -37,8 +37,10 @@ python3 scripts/tests/nsis-hook-model/model.py     # exit 0 + 탐사 상태 수 
   (항상 유음 + 가족 안에 동작본 재료 잔존)에서만 허용. 크기 통과 절단 정식은
   반드시 명명된다.
 
-돌 때마다 34종 **심층 레인 커버리지 핀**(거부 6코드 전부, rolled-back, undo 3계급,
-LASTDITCH/콜백 승격, tick 슬롯, 세대 분할 유음, §9-3 절단 창, 템플릿 tear, Hold …)
+돌 때마다 36종 **심층 레인 커버리지 핀**(거부 6코드 전부, rolled-back, undo 3계급,
+LASTDITCH/콜백 승격, tick 슬롯, 세대 분할 유음, §9-3 절단 창, 템플릿 tear, Hold,
+★D11 문서-주장 핀 2종 — exit-4 크기 통과 절단 정식 도달 · exit-4 LASTDITCH 승격
+분할 도달(NSIS-CONTRACT §9-3·체크리스트 종료코드 규약의 정정 주장을 코드에 단언) …)
 이 전부 탐사됐는지 재확인한다 — 미러가 분기점을 잃으면 붉는다(무음 위축 차단).
 
 ## 충실도 계약 (훅을 고치는 사람에게)

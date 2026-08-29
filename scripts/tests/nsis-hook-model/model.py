@@ -60,7 +60,7 @@ NSIS-CONTRACT §9 — the model refuses to over-claim):
       - the set of binaries the TRANSACTION placed and kept is always a prefix
         of [cys, cysd, cys-app] on completed runs;
       - ANY old/new generation split among canonicals (template- or
-        emergency-promotion-made — §9-5) is LOUD: never on exit 0.
+        emergency-promotion-made — §9-3/§9-5) is LOUD: never on exit 0.
   I4  Every refusal is loud and the old build survives:
       - completed failing runs write the failure file with the frozen 4-token
         schema and exit 3/4 per the frozen classification (`unrecoverable:` or
@@ -768,7 +768,7 @@ def check(run):
     # ── I3 ──────────────────────────────────────────────────────────────────
     # The phoenix hazard is a NEW build at a LATER canonical while an EARLIER
     # canonical still runs the OLD build ("새 cysd + 구 cys" — hook R3 header).
-    # Hook scope (CONTRACT §2 scope correction + §9-5): such splits are
+    # Hook scope (CONTRACT §2 scope correction + §9-3/§9-5): such splits are
     # reachable through template/emergency combinations, but must NEVER be
     # silent — impossible on exit 0, and on completed runs the OLD-side binary
     # is always named in a token (it got OLD back through a refusal/undo/
@@ -981,6 +981,25 @@ def coverage_of(run):
     if any(kinds[i] == "OLD" and kinds[j] == "NEW"
            for i in range(3) for j in range(i + 1, 3)):
         hit.add("lane:generation-split-loud")
+    # D11 doc-claim pins (2026-08-29): NSIS-CONTRACT §9-3 / checklist exit-code
+    # box corrections stay asserted against the code, not just written down —
+    #   torn-canonical-exit4: an exit-4 terminal CAN hold a size-passing torn
+    #     canonical (the failure file's frozen Note prose overstates there;
+    #     token naming is what I4 asserts),
+    #   ld-split-exit4: the LASTDITCH `.new` promotion lane CAN leave an
+    #     old/new generation split on the exit-4 lane (loudness is I3/I4's job;
+    #     these pins keep the REACHABILITY claims honest).
+    # If a hook redesign (e.g. D9-b PREINSTALL .old evacuation, Release B)
+    # removes these lanes, the pins go red — update NSIS-CONTRACT §9-3 and the
+    # checklist exit-code box in the SAME commit.
+    if run.exit == 4:
+        if any(run.files.get(b + ".exe", {}).get("kind") == "NEWBAD"
+               for b in BINS):
+            hit.add("lane:D11-torn-canonical-exit4")
+        if any(kinds[i] == "OLD" and kinds[j] == "NEW"
+               and run.files[BINS[j] + ".exe"].get("arrival") == "ld-new"
+               for i in range(3) for j in range(i + 1, 3)):
+            hit.add("lane:D11-ld-split-exit4")
     hit.add("exit:%s" % run.exit)
     return hit
 
@@ -995,6 +1014,7 @@ COVERAGE_PINS = (
        "lane:LD-KEEP-SUSPECT", "lane:RESTORE-FATAL", "lane:EMERGENCY",
        "lane:torn-size-passing-canonical", "lane:hold-truncated-canonical",
        "lane:tick-slot", "lane:template-tear", "lane:generation-split-loud",
+       "lane:D11-torn-canonical-exit4", "lane:D11-ld-split-exit4",
        "arrival:ld-new", "arrival:ld-prev", "arrival:cb-new", "arrival:cb-prev",
        "arrival:unplace-reseat", "arrival:restore-old", "arrival:txn-fill",
        "arrival:tpl-extract",
