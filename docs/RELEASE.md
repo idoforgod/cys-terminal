@@ -107,6 +107,25 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 > ⚠한계: 이건 lock 의 **버전 필드 2개**만 본다. 의존 그래프 전체의 최신성은 `--locked` 빌드만이
 > 증명한다.
 
+## 0-B. 빌드 도구 핀 — Tauri CLI 버전 SOT (2026-08-29 · v0.14.28 W5)
+
+> ★릴리스 3레그(macOS 2 + Windows)가 쓰는 **Tauri CLI 는 `2.11.4` 로 고정**한다. 단일 SOT 는
+> `.github/workflows/release.yml` 의 `env: TAURI_CLI_VERSION: "2.11.4"` 이며, 다른 호출 지점
+> (`windows-build.yml` · `scripts/build-macos-signed.sh` — 종전에는 버전 태그조차 없이
+> `@tauri-apps/cli@2` 유동이었다)이 같은 값을 소비한다. 바꿀 때는 **SOT 한 곳만** 고치고
+> 소비 지점이 전파받는지 확인한다.
+>
+> ★하한 계약: 고정 버전을 **0.14.27 을 빌드한 버전(= 2.11.4) 미만으로 내리지 않는다.**
+> 더 낮은 CLI 는 NSIS 템플릿이 `/UPDATE`→`$UpdateMode` 없는 세대로 회귀해 인앱 업데이트가
+> "제거 후 설치"로 빠진다(전 세션 사망 · 무음 재앙). 2.11.4 는 감사가 installer.nsi 라인
+> 단위로 검증한 버전이다(`_work` NSIS-CONTRACT §7).
+>
+> ★VERSIONINFO 상시 게이트(2026-08-29 신설 · W5-3): Windows 빌드 후 사이드카
+> (`src-tauri/binaries/cys-*.exe`·`cysd-*.exe`)와 메인 exe 에 **VERSIONINFO(버전 리소스)가
+> 실재하는지 CI 가 단언하고, 없으면 빌드를 실패**시킨다. 설치 훅의 신선도 판정이
+> `GetDLLVersion` 오라클(fail-closed = unverified)이라, 크로스 빌드 회귀로 버전 리소스가
+> 빠진 채 발행되면 **모든 기계의 설치가 exit 4 로 떨어지기 때문**이다.
+
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 
 > **자동 업데이트가 켜져 있으므로(`createUpdaterArtifacts: true`) 빌드 시 서명 키가 필요합니다.**
