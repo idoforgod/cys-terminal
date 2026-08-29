@@ -133,7 +133,10 @@ jobs:
           #   부서 이름검증·preflight C03 상태기계·CONTENT_PINS↔디렉티브 패리티 — cys-dept·preflight·
           #   디렉티브 전부 이 레인이 서명·배송하는 팩 내용물이라 서명 전 차단이 정위치다.
           # ★repair-w3(2026-08-29 · v0.14.28): 수리 회귀 핀 2종 편입 — test_hud_bridge_backoff
-          #   (W2 replay_gap 재스폰 스톰 지수 백오프) · test_preflight_c11b_seal(W3c 번들 봉인
+          #   (W2 replay_gap 재스폰 스톰 지수 백오프 — ★R2 라운드2에서 _reader 배선 통합 2건 추가)
+          #   · test_wakeup_liveness(★R2 라운드2 신설 — _target_alive 3값 판정+drain zombie 가드
+          #     행동 정본. 종전 유일 가드였던 rust substring 핀은 M8 변이에 초록이라 행동을 못
+          #     지킨다 — lib.rs 역할 경계 주석) · test_preflight_c11b_seal(W3c 번들 봉인
           #   심링크 이관). 대상 javis_hud_bridge.py·javis_preflight.py 는 배송 팩 내용물인데
           #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
           #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
@@ -143,7 +146,7 @@ jobs:
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
-                   test_hud_bridge_backoff test_preflight_c11b_seal; do
+                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="

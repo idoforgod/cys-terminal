@@ -697,6 +697,100 @@ jobs:
           Write-Host "OK: T4-14 — 잠긴 구 CLI 위로 업그레이드 성공 + 신버전 반영 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
+      # T4-15 배타 핸들 거부 회귀 (R2 라운드2 신설 — 체크리스트 P6 · NSIS-CONTRACT §3·§4 의 기계 시험).
+      # 종전 레인의 공백: 훅의 **거부 계열 분기**(CYS_PLACE vacate-locked → 트랜잭션 undo →
+      #   실패 파일 4토큰 → exit 4)는 어느 레인에서도 0회 실행이었다 — T4 는 오라클 단락(성공),
+      #   T4-14 는 이미지 잠금(rename 허용 = 성공)만 밟는다. 배타 핸들(FileShare None)은 rename
+      #   의 DELETE 접근까지 거부하므로 **거부가 정답**인 유일한 잠금 계급이다(P6).
+      # 시나리오(§9-5 의 세대 분할 조합을 의도적으로 재현):
+      #   ① cys.exe = 구버전 스탠드인(cmd 사본)을 **실행**(이미지 잠금 — 훅 배치 경로 강제)
+      #   ② cysd.exe = 구버전 스탠드인 + 이 스텝의 pwsh 가 **거부 계급 핸들**(FileShare Read
+      #      — 쓰기·rename 거부·읽기 허용) 유지
+      #   ③ /S 업그레이드 → cys 는 훅이 배치 성공($5=prev), cysd 는 vacate-locked 거부 →
+      #      트랜잭션 undo 가 cys 를 구본으로 되돌림(not-updated) → exit 4 + 4토큰 실패 파일 +
+      #      콜백(CYS_ABORT_RESCUE)이 스테이징 .new 정리(정식 동작본 확인 시에만 지우는 갈래).
+      #   ④ 핸들 해제 후 재실행 = 치유(exit 0 · 전부 신본 · 실패 파일 삭제) — 계약의 안내문
+      #      ("run this installer again")이 참인지까지 잰다. 스탠드인 프로세스는 내내 생존
+      #      (무사망 — 전 pane kill 금지 앵커의 이 레인 대리검체).
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T4-15 배타 핸들 거부 회귀 (exit 4 + 4토큰 + 구본 무손상 + 재실행 치유)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T4-15: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'; $cysd = Join-Path $dir 'cysd.exe'
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $setup) { throw "T4-15: setup.exe 미발견" }
+          $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          function ShaOf($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash }
+          # ① 사전 정돈 + 구버전 스탠드인 2종 배치(cmd 사본 = 다른 VERSIONINFO → 오라클 notfresh)
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          Get-ChildItem (Join-Path $dir '*') -File -Include 'cys.prev*.exe','cysd.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cysd -Force
+          $oldSha = ShaOf "$env:SystemRoot\System32\cmd.exe"
+          $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
+          Start-Sleep 2
+          if ($lock.HasExited) { throw "T4-15: 스탠드인 잠금 프로세스 기동 실패" }
+          # ② cysd 에 거부 계급 핸들: FileShare **Read** = 쓰기(템플릿 truncate-write)와
+          #    rename(DELETE 접근) 은 거부하되 읽기(오라클 FileOpen/GetDLLVersion)는 허용 —
+          #    AV·백업·인덱서가 쥐는 전형이자 P6("배타 핸들 ⇒ exit 4")이 뜻하는 그 계급이다.
+          #    ⚠FileShare None 은 다른 계급이다: 오라클 읽기까지 눈멀어 LASTDITCH 가 '부재/절단'
+          #    으로 오판(현행 exit 3 + unrecoverable 오분류·무손상은 유지) — 별도 이슈로 기록.
+          $fs = [System.IO.File]::Open($cysd, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+          try {
+            # ③ 잠긴 채 무인 업그레이드 — **거부(exit 4)가 정답**이다(성공 주장 = P6 위반)
+            $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+            $exit4 = ($ri.ExitCode -eq 4)
+            $failMark = Join-Path $dir 'cys-install-failure.txt'
+            $hasMark = Test-Path $failMark
+            $l1Ok = $false; $unrecEmpty = $false; $rbEmpty = $false; $nuOk = $false; $prOk = $false
+            if ($hasMark) {
+              $txt = @(Get-Content $failMark)
+              Write-Host "== cys-install-failure.txt =="; $txt | ForEach-Object { Write-Host "  $_" }
+              $l1Ok      = [bool]($txt[0] -match 'critical executable verification FAILED \(exit 4\)')
+              $unrecEmpty = [bool](($txt | Where-Object { $_ -like 'unrecoverable:*' }) -match '^unrecoverable:\s*$')
+              $rbEmpty    = [bool](($txt | Where-Object { $_ -like 'rolled-back-to-previous:*' }) -match '^rolled-back-to-previous:\s*$')
+              $nuOk       = [bool](($txt | Where-Object { $_ -like 'not-updated:*' }) -match 'cys\.exe\(not-updated\)')
+              $prOk       = [bool](($txt | Where-Object { $_ -like 'placement-refused:*' }) -match 'cysd\.exe\(vacate-locked\)')
+            }
+            # 구본 무손상: cys 는 undo 로 복귀, cysd 는 손도 못 댔다 — 둘 다 스탠드인 바이트 그대로
+            $cysOld  = (ShaOf $cys)  -eq $oldSha
+            $cysdOld = (ShaOf $cysd) -eq $oldSha
+            $lockAlive = -not $lock.HasExited
+            # 콜백 정리 확인: 정식 동작본 확인 갈래가 스테이징 .new 를 지웠다(§1 '콜백' 삭제자)
+            $noNew = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
+            $ok1 = $exit4 -and $hasMark -and $l1Ok -and $unrecEmpty -and $rbEmpty -and $nuOk -and $prOk -and $cysOld -and $cysdOld -and $lockAlive -and $noNew
+            Write-Host ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new정리={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
+            if (-not $ok1) { throw "T4-15a: 거부 계약 위반 — P6(배타 핸들 ⇒ exit 4 + 구본 무손상) 또는 §3 토큰 스키마 회귀" }
+          } finally {
+            $fs.Close()
+          }
+          # ④ 치유: 핸들 해제 후 재실행 — 계약 안내문의 기계 검증(스탠드인 프로세스는 계속 실행 중)
+          $ri2 = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
+          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
+          $healedCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
+          $healedCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
+          $noMark = -not (Test-Path (Join-Path $dir 'cys-install-failure.txt'))
+          $marker = Join-Path $dir 'cys-installed-version.txt'
+          $markerOk = (Test-Path $marker) -and ((Get-Content $marker -Raw) -match [regex]::Escape($expVer))
+          $lockAlive2 = -not $lock.HasExited
+          $ok2 = ($ri2.ExitCode -eq 0) -and $healedCys -and $healedCysd -and $noMark -and $markerOk -and $lockAlive2
+          Write-Host ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2)
+          # 정리(이후 스텝 오염 방지): 잠금 해제 → 스탠드인 대피 잔해 제거
+          try { $lock.Kill($true) } catch {}
+          Start-Sleep 1
+          Get-ChildItem (Join-Path $dir '*') -File -Include 'cys.prev*.exe','cysd.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $ok2) { throw "T4-15b: 재실행 치유 실패 — 계약 안내문('run this installer again')이 거짓" }
+          Write-Host "OK: T4-15 — 배타 핸들 거부(exit 4 + 4토큰 + 구본 무손상 + 무사망) 및 재실행 치유 실증"
+
+      # ─────────────────────────────────────────────────────────────────────────
       # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 + 진짜 KeepAlive 실측).
       # 경로/파이프 매핑·supervisor(schtasks)·재시작 프리미티브(identify→taskkill→파이프해제→retrigger→epoch delta)
       # ·snapshot+독립 runbook(.ps1)·stub restore(M9 VERIFIED)·deploy --plan exit 계약 + ★케이스⑦ 진짜 KeepAlive

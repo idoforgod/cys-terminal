@@ -487,7 +487,10 @@ jobs:
           #   preflight C03 두 축 상태기계·CONTENT_PINS↔디렉티브 패리티(P0 스큐 봉인). 전부 격리
           #   HOME/목 바이너리 하네스라 러너 자기완결(라이브 무접촉) — 3완전 레인 동시 등재(대칭).
           # ★repair-w3(2026-08-29 · v0.14.28): 수리 회귀 핀 2종 편입 — test_hud_bridge_backoff
-          #   (W2 replay_gap 재스폰 스톰 지수 백오프) · test_preflight_c11b_seal(W3c 번들 봉인
+          #   (W2 replay_gap 재스폰 스톰 지수 백오프 — ★R2 라운드2에서 _reader 배선 통합 2건 추가)
+          #   · test_wakeup_liveness(★R2 라운드2 신설 — _target_alive 3값 판정+drain zombie 가드
+          #     행동 정본. 종전 유일 가드였던 rust substring 핀은 M8 변이에 초록이라 행동을 못
+          #     지킨다 — lib.rs 역할 경계 주석) · test_preflight_c11b_seal(W3c 번들 봉인
           #   심링크 이관). 대상 javis_hud_bridge.py·javis_preflight.py 는 배송 팩 내용물인데
           #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
           #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
@@ -496,7 +499,7 @@ jobs:
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
-                   test_hud_bridge_backoff test_preflight_c11b_seal; do
+                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
@@ -723,3 +726,35 @@ jobs:
                 file=sys.stderr)
           sys.exit(1)
           PY
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡3 — NSIS 훅 컴파일 하네스 + 컴파일 가드 negative control (R2 라운드2 편입)
+  #
+  # ★무엇이 결함이었나: scripts/tests/nsis-hook-compile/run.sh 는 어느 CI 레인에서도 0회
+  #   실행이었고(grep 실측 0건), happy path 만 돌아 **가드 삭제를 못 봤다**(E1 변이 실측:
+  #   블라인드-오라클 !error 4종을 지워도 exit 0). run.sh 에 negative control N1~N4 가
+  #   들어갔고(무버전 PE/0.0.0.0/사이드카 부재 = 계약 토큰과 함께 실패해야 통과 · §5 토큰
+  #   verbatim 핀), 이 잡이 그것을 브랜치 CI 에서 상시 실행한다.
+  # ★별도 잡인 이유: 잡1 은 Rust/Bun 셋업이 무겁고 set -e 사슬이라, 앞 스텝이 붉으면 훅
+  #   가드는 아예 재지 않게 된다. 이 잡은 brew nsis 하나만 설치하는 독립·병렬 잡이다.
+  # ★팩 스위트가 아니므로 '팩 스위트 레인 대조' 게이트와 무관(test_ 토큰 아님 — run.sh).
+  #   릴리스 레인은 실빌드가 훅을 컴파일하고 §5 토큰을 build log 에서 grep 한다(그 벨트의
+  #   문구 드리프트를 N4 가 여기서 조기에 잡는다).
+  nsis-hook-harness:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install makensis (brew)
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install nsis
+          makensis -VERSION
+
+      - name: NSIS 훅 컴파일 + 컴파일 가드 negative control (N1~N4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/nsis-hook-compile/run.sh

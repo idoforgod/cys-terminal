@@ -373,7 +373,18 @@ cys_sc_done_${TAG}:
 ;   미달이면 `.new`(이번 빌드 — rename) → prev·prev2·prev3(구본 — copy, 실패 시 rename 승격)
 ;   순으로 복구하고, 그래도 안 되면 $R6(unrecoverable · exit 3)에 기록한다. 복구가 구본으로
 ;   이뤄지면 $R7(rolled-back)에 기록해 성공으로 위장하지 않는다.
-!macro CYS_LASTDITCH BIN TAG
+;   ★크기 프로브의 한계 고지(R2 라운드2 — 64KiB 는 절단의 하한이지 상한이 아니다):
+;     · 진입 판정(아래 첫 블록)과 prev 복귀 재검(cys_ld_mark)은 **크기만** 본다. 더 세게 갈 수
+;       없다: 정식·prev 자리에는 **구본**이 정상 거주하고, 구본(0.14.27 이하)은 VERSIONINFO 가
+;       없을 수 있어 GetDLLVersion 프로브는 '건강한 구본'과 '절단본'을 못 가른다 — 여기서
+;       오라클을 걸면 배타 잠금 exit-4 정경로(P6: 구본 무손상)가 rolled-back/unrecoverable 로
+;       오판돼 동결 계약(§4)이 깨진다. 이 창은 cysd 부팅 가드의 **PE 구조 프로브**(재료가 걸린
+;       SweepAll 직전에만 절단 검사 · main.rs probe_pe_extents)가 다음 부팅에서 받친다.
+;     · `.new` 승격 갈래만은 오라클 재검이 안전하다 — `.new` 는 '이번 빌드' 주장이고 이번 빌드는
+;       VERSIONINFO 를 컴파일 게이트(§5 문자열 3종)로 보증하므로, 아래에서 크기+버전을 함께 재
+;       크기 통과 절단본(전원차단 tear 의 >99% 지점)의 무검 승격을 끊는다.
+;   기대값 ${EXPHIGH}/${EXPLOW} = 이 바이너리의 컴파일 상수(호출부가 CYS_V_* 를 넘긴다).
+!macro CYS_LASTDITCH BIN TAG EXPHIGH EXPLOW
   ClearErrors
   FileOpen $R9 "$INSTDIR\${BIN}.exe" r
   IfErrors cys_ld_bad_${TAG}
@@ -387,13 +398,30 @@ cys_ld_bad_${TAG}:
   IfFileExists "$INSTDIR\${BIN}.new.exe" 0 cys_ld_p1_${TAG}
   !insertmacro CYS_RENAME_RETRY "$INSTDIR\${BIN}.new.exe" "$INSTDIR\${BIN}.exe" "${TAG}n"
   IfErrors cys_ld_p1_${TAG}
-  ; 이번 빌드로 복구됨 — 재검(크기)만 통과하면 보고 목록에 올리지 않는다.
+  ; 이번 빌드로 복구됨 — 재검(크기 + ★오라클)을 통과하면 보고 목록에 올리지 않는다.
   ClearErrors
   FileOpen $R9 "$INSTDIR\${BIN}.exe" r
   IfErrors cys_ld_p1_${TAG}
   FileSeek $R9 0 END $R5
   FileClose $R9
-  IntCmp $R5 65536 cys_ld_done_${TAG} 0 cys_ld_done_${TAG}
+  IntCmp $R5 65536 0 cys_ld_nbad_${TAG} 0
+  ; ★R2 라운드2: `.new` 는 이번 빌드 주장 — 크기 통과 절단본(tear ≥64KiB)을 거르기 위해
+  ;   버전 오라클을 재검한다(구본 갈래와 달리 여기서는 VERSIONINFO 부재 = 진짜 미달이다).
+  ClearErrors
+  GetDLLVersion "$INSTDIR\${BIN}.exe" $R9 $R5
+  IfErrors cys_ld_nsus_${TAG}
+  IntCmp $R9 ${EXPHIGH} 0 cys_ld_nsus_${TAG} cys_ld_nsus_${TAG}
+  IntCmp $R5 ${EXPLOW} 0 cys_ld_nsus_${TAG} cys_ld_nsus_${TAG}
+  Goto cys_ld_done_${TAG}
+cys_ld_nsus_${TAG}:
+  ; 오라클 미달 `.new` 승격본 — **구본 재료가 남아 있을 때만** 처분하고 prev 체인을 계속한다.
+  ; 빈손(잔여 prev 전무)이면 크기 통과분을 그대로 유지한다(빈손 삭제 금지 — 지우면 다음 부팅
+  ; 가드가 NothingToDo 무음으로 접혀 사고가 침묵한다. CYS_ABORT_RESCUE 와 같은 계약).
+  DetailPrint "cys: WARNING - restored ${BIN}.exe failed version re-check (possible torn extract)"
+  IfFileExists "$INSTDIR\${BIN}.prev.exe" cys_ld_nbad_${TAG}
+  IfFileExists "$INSTDIR\${BIN}.prev2.exe" cys_ld_nbad_${TAG}
+  IfFileExists "$INSTDIR\${BIN}.prev3.exe" cys_ld_nbad_${TAG} cys_ld_done_${TAG}
+cys_ld_nbad_${TAG}:
   Delete "$INSTDIR\${BIN}.exe"
   ClearErrors
 cys_ld_p1_${TAG}:
@@ -453,6 +481,13 @@ cys_ld_done_${TAG}:
 ;     Delete 로 자리를 비운 뒤 복구 체인으로 간다(Rename 은 실재하는 dest 에 실패하므로 자리
 ;     비우기 없는 승격은 성립하지 않는다) · Delete 거부 시 **무접촉 종료**(재료 보존 — cysd
 ;     부팅 가드가 2차 복구선) · 프로브 불가(열기 거부)도 판정 불가 = 무접촉 종료.
+;   ★빈손 삭제 금지(R2 라운드2 수리): 절단 정식이라도 **재료(`.new`/`.prev*`)가 하나도 없으면
+;     지우지 않는다** — 재료 없이 자리만 비우면 다음 부팅 가드가 (정식無·재료無)를
+;     NothingToDo(무음)로 접어 사고가 침묵한다. 절단 정식을 남겨야 Hold(매 부팅 loud —
+;     "설치기를 다시 실행하라")가 발화한다. 삭제는 언제나 재료를 손에 쥔 갈래에서만 한다
+;     (cysd 가드 실행 순서 계약·main.rs:150-157 과 동일 규율). prev 프로브는 와일드카드
+;     (`.prev*.exe`)라 tick 슬롯까지 재료로 센다(복구 체인은 고정 3칸이지만, tick 만 남은
+;     경우에도 자리를 비워 두면 다음 부팅 가드의 PromotePrev 가 tick 을 승격한다).
 ;   ★콜백 제약: 런타임 변수·리터럴만 사용(템플릿 define 금지 — 훅이 먼저 include 된다).
 !macro CYS_ABORT_RESCUE BIN TAG
   IfFileExists "$INSTDIR\${BIN}.exe" 0 cys_ar_try_${TAG}
@@ -462,6 +497,10 @@ cys_ld_done_${TAG}:
   FileSeek $R9 0 END $R5
   FileClose $R9
   IntCmp $R5 65536 cys_ar_clean_${TAG} 0 cys_ar_clean_${TAG}
+  ; 절단 정식 — 재료 프로브 선행(빈손이면 무접촉 종료 · 위 ★빈손 삭제 금지).
+  IfFileExists "$INSTDIR\${BIN}.new.exe" cys_ar_mat_${TAG}
+  IfFileExists "$INSTDIR\${BIN}.prev*.exe" cys_ar_mat_${TAG} cys_ar_done_${TAG}
+cys_ar_mat_${TAG}:
   ClearErrors
   Delete "$INSTDIR\${BIN}.exe"
   IfFileExists "$INSTDIR\${BIN}.exe" cys_ar_done_${TAG} cys_ar_try_${TAG}
@@ -506,6 +545,34 @@ Function .onUserAbort
 FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
+  ; ⓪ ★설치기 싱글톤 (R2 라운드2 신설): 동시 2인스턴스는 `.new`/prev/정식 이름 공간을
+  ;    공유해 서로의 트랜잭션을 교차 오염시킨다(실증 트레이스: A 의 fill 5초 재시도 창에서
+  ;    B 가 배치를 끝내면, A 의 copy-복귀가 B 의 검증 완료 정식을 구본으로 덮어 B 의 exit 0
+  ;    주장이 거짓이 된다 — R2-break-windows.log S2). 템플릿 CheckIfAppIsRunning 은 앱만
+  ;    본다(설치기끼리는 무방비). Global\ 이름 뮤텍스로 인스턴스를 1개로 강제한다.
+  ;    · 핸들은 의도적으로 닫지 않는다 — 프로세스 종료가 해제이며, 그 수명이 곧 잠금이다.
+  ;    · 진 쪽은 **Quit**(Abort 아님)으로 나간다: Abort 는 .onInstFailed 콜백(구조 매크로)을
+  ;      발화시켜, 아무것도 안 한 인스턴스가 이긴 쪽의 `.new` 스테이징을 지울 수 있다.
+  ;      Quit 은 콜백 없이 즉시 종료라 부작용이 0이다(이 시점까지 파일 접촉 0).
+  ;    · exit 5 = "다른 설치기 인스턴스 실행 중 · 무접촉"(NSIS-CONTRACT §4 신설 행).
+  ;    · ERROR_ALREADY_EXISTS(183) 외에, 핸들 0 + ERROR_ACCESS_DENIED(5)도 '이미 존재'다
+  ;      (다른 무결성 수준의 인스턴스가 선점). 그 밖의 생성 실패는 fail-open(설치 계속) —
+  ;      뮤텍스는 벨트이지 게이트가 아니고, 여기서 막히면 정상 단독 설치까지 죽는다.
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Global\cys-installer") p .r0 ?e'
+  Pop $1
+  StrCmp $1 "183" cys_pre_dup 0
+  StrCmp $1 "5" 0 cys_pre_single
+  StrCmp $0 "0" cys_pre_dup cys_pre_single
+cys_pre_dup:
+  DetailPrint "cys: another installer instance is running - quitting untouched"
+  IfSilent cys_pre_dupquit 0
+  MessageBox MB_ICONSTOP "Another cys installer is already running.$\r$\nFinish that installation first, then run this one again.$\r$\nNothing was changed by this instance."
+cys_pre_dupquit:
+  SetErrorLevel 5
+  Quit
+cys_pre_single:
+  ClearErrors
+
   ; ① GUI만 종료 — ★/T 금지(L1): GUI 가 cysd 를 평범한 자식으로 스폰하므로 트리 kill 은
   ;    데몬과 전 PTY 세션을 함께 죽인다(0.14.27 실측 결함). updater 경로면 이미 종료 중이라
   ;    멱등. 세션은 데몬 소유 — 무손실.
@@ -613,9 +680,10 @@ cys_txn_commit:
 
 cys_txn_after:
   ; ★최종 바닥 점검 (R1) — 성공·실패 어느 경로든 정식 3종이 '동작본'인지 기계로 확인한다.
-  !insertmacro CYS_LASTDITCH "cys" "ldcys"
-  !insertmacro CYS_LASTDITCH "cysd" "ldcysd"
-  !insertmacro CYS_LASTDITCH "cys-app" "ldcysapp"
+  ;   기대 DWORD 는 `.new` 승격 갈래의 오라클 재검에만 쓰인다(구본 갈래는 크기 프로브 유지).
+  !insertmacro CYS_LASTDITCH "cys" "ldcys" "${CYS_V_CYS_High}" "${CYS_V_CYS_Low}"
+  !insertmacro CYS_LASTDITCH "cysd" "ldcysd" "${CYS_V_CYSD_High}" "${CYS_V_CYSD_Low}"
+  !insertmacro CYS_LASTDITCH "cys-app" "ldcysapp" "${CYS_V_APP_High}" "${CYS_V_APP_Low}"
 
   StrCmp $R6 "" 0 cys_post_fail
   StrCmp $R7 "" 0 cys_post_fail

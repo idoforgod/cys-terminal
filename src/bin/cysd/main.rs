@@ -134,6 +134,108 @@ pub(crate) const GUARDED_BINS: [&str; 3] = ["cys", "cysd", "cys-app"];
 #[cfg(any(windows, test))]
 pub(crate) const MIN_PROMOTABLE_BYTES: u64 = 64 * 1024;
 
+/// ★R2 라운드2 수리 — 크기 프로브의 나머지 반쪽: **크기 통과 절단본**.
+///
+/// 64KiB 는 절단의 하한이지 상한이 아니다 — ~20MB 바이너리의 순차 truncate-write 는 어느
+/// 지점에서 끊겨도 >99% 확률로 64KiB 를 넘긴 채 남는다(헤더는 온전, 후미 소실). 그 절단
+/// 정식을 SweepAll('정식 건강')로 읽으면 스윕이 가족 prev(마지막 동작본)를 지운다 —
+/// exit-4 기계의 재실행 + 전원차단 복합 시나리오에서 실증된 T3 계급 경로다.
+///
+/// 판정 결과 3값. **`Unknown`(측정 불능)은 통과가 아니다** — 재료가 걸린 자리에서는 Torn 과
+/// 같이 '삭제 보류' 방향으로 접는다(측정 실패를 근거로 지우는 것도, 지나가는 것도 금지).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalProbe {
+    /// PE 구조 검증 통과(모든 섹션의 원시 데이터 끝 ≤ 파일 크기) — 절단 반증 없음.
+    Working,
+    /// 구조적 절단 확정 — MZ/PE 서명 부재·섹션 0개(실행물에 불가)·섹션 원시 끝 > 파일 크기.
+    Torn,
+    /// 측정 불능 — 열기/읽기 실패, 또는 헤더가 4KiB 프리픽스 밖(비정형 레이아웃).
+    Unknown,
+}
+
+/// PE 구조 절단 검사(순수) — 파일 프리픽스(≤4KiB)와 실측 파일 크기만으로 판정한다.
+///
+/// 원리: 순차 기록 중 끊긴 파일은 **헤더가 온전**하므로(먼저 써진다) 헤더가 주장하는 섹션
+/// 원시 범위(`PointerToRawData + SizeOfRawData` 의 최댓값)와 실제 파일 크기를 대조하면
+/// 후미 소실을 결정론으로 잡는다. 서명 오버레이(마지막 섹션 뒤 인증서 영역)만 잘린 파일은
+/// 통과한다 — 그 파일은 로드 가능한 바이트가 전부 실재하므로 오탐이 아니다(정직한 한계).
+/// VERSIONINFO 에 의존하지 않으므로 **구본(0.14.27 이하 · 리소스 부재 가능)에도 안전**하다
+/// — GetDLLVersion 계 프로브가 여기 부적격인 이유가 그것이다(건강한 구본을 절단으로 오판).
+#[cfg(any(windows, test))]
+pub(crate) fn pe_extent_verdict(prefix: &[u8], file_size: u64) -> CanonicalProbe {
+    fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+        b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn u32_at(b: &[u8], off: usize) -> Option<u32> {
+        b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    // 호출 전제가 크기 프로브 통과(≥64KiB)이므로, 64B 도 못 읽힌 프리픽스는 그 자체가 병리다.
+    if prefix.len() < 0x40 {
+        return CanonicalProbe::Torn;
+    }
+    if &prefix[0..2] != b"MZ" {
+        return CanonicalProbe::Torn;
+    }
+    let Some(e_lfanew) = u32_at(prefix, 0x3c) else {
+        return CanonicalProbe::Torn;
+    };
+    let pe = e_lfanew as usize;
+    // PE 헤더·섹션 테이블이 프리픽스 밖이면 파싱 불능 = Unknown (비정형이지 절단 증명이 아니다
+    // — 실무 링커의 e_lfanew 는 0x80~0x200 대라 4KiB 프리픽스 안이 정상).
+    let Some(sig) = prefix.get(pe..pe + 4) else {
+        return CanonicalProbe::Unknown;
+    };
+    if sig != b"PE\0\0" {
+        return CanonicalProbe::Torn;
+    }
+    let (Some(nsect), Some(optsz)) = (u16_at(prefix, pe + 6), u16_at(prefix, pe + 20)) else {
+        return CanonicalProbe::Unknown;
+    };
+    // 섹션 0개는 실행물에 존재하지 않고, 96개 초과는 PE 스펙 위반 — 둘 다 쓰레기 확정.
+    if nsect == 0 || nsect > 96 {
+        return CanonicalProbe::Torn;
+    }
+    let table = pe + 24 + optsz as usize;
+    let mut max_end: u64 = 0;
+    for i in 0..nsect as usize {
+        let ent = table + i * 40;
+        let (Some(raw_size), Some(raw_ptr)) = (u32_at(prefix, ent + 16), u32_at(prefix, ent + 20))
+        else {
+            return CanonicalProbe::Unknown;
+        };
+        max_end = max_end.max(raw_ptr as u64 + raw_size as u64);
+    }
+    if max_end > file_size {
+        CanonicalProbe::Torn
+    } else {
+        CanonicalProbe::Working
+    }
+}
+
+/// PE 구조 절단 검사(배선) — 프리픽스 4KiB 읽기 + 크기 실측 후 순수 판정에 위임.
+/// 부트 경로 비용: 크기 프로브를 통과한 정식(가족당 최대 1파일)에만 4KiB 읽기 1회.
+#[cfg(any(windows, test))]
+pub(crate) fn probe_pe_extents(path: &std::path::Path) -> CanonicalProbe {
+    use std::io::Read;
+    let Ok(md) = std::fs::metadata(path) else {
+        return CanonicalProbe::Unknown;
+    };
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return CanonicalProbe::Unknown;
+    };
+    let mut buf = vec![0u8; 4096];
+    let mut got = 0usize;
+    while got < buf.len() {
+        match f.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => return CanonicalProbe::Unknown,
+        }
+    }
+    pe_extent_verdict(&buf[..got], md.len())
+}
+
 /// 승격 후보(.prev 계열)의 관측값 — 판정의 입력. 순수 판정을 위해 파일시스템이 아니라 값으로
 /// 받는다(Windows 전용 상황 "정식 소실"을 어느 OS 의 단위 테스트로도 박제하기 위함).
 #[cfg(any(windows, test))]
@@ -175,20 +277,39 @@ pub(crate) enum LeftoverPlan {
     /// 가족 전체 무접촉 동결 + loud. 잘린 재료도, 절단 정식도 보존한다(다음 설치·수동 복구의
     /// 단서 — 절단 정식은 재료가 생겨야만 치울 가치가 있다).
     Hold,
+    /// ★R2 라운드2 — 정식이 크기 프로브(≥64KiB)는 통과했으나 **PE 구조 검사가 절단 반증에
+    /// 실패**(Torn/Unknown)했고, 승격 가능 재료가 스윕에 걸려 있다: **아무것도 지우지 않는다**
+    /// (스윕 위임 금지 · `.new` 삭제 금지 · 정식 교체도 안 한다 — 프로브는 삭제 보류의 근거이지
+    /// 정식 삭제의 근거로는 쓰지 않는다. 재설치가 오라클로 정식을 재배치하는 것이 치유 경로다).
+    /// 가족 전체 무접촉 동결 + loud. 재료가 안 걸린 자리에서는 이 판정을 내리지 않는다(크기
+    /// 단독 폴백 — 구본·비정형 PE 오탐으로 매 부팅 우는 배너를 만들지 않기 위한 스코프 축소).
+    HoldSuspectCanonical,
 }
 
-/// **판정의 정의처(순수).** 정식 크기(None=부재) · `.new` 크기 · prev 후보들 → 이번 부트의 행동.
+/// **판정의 정의처(순수).** 정식 크기(None=부재)·정식 구조 프로브 · `.new` 크기 · prev 후보들
+/// → 이번 부트의 행동.
 ///
 /// ★정식은 `is_file` 존재가 아니라 **크기로** 받는다(R1 라운드1 수리): 절단 정식(<64KiB)을
 ///   '존재'로 읽으면 SweepAll 이 마지막 동작본(.prev·stale-good `.new`)을 지운다. 절단 정식은
 ///   '부재 + 자리 막힘(replace_canonical)'으로 판정한다.
+/// ★크기 통과 절단본(R2 라운드2): 크기 프로브를 통과한 정식이라도, **승격 가능 재료가 스윕에
+///   걸려 있고** PE 구조 프로브가 절단을 반증하지 못하면(Torn/Unknown — 측정 불능은 통과가
+///   아니다) SweepAll 대신 HoldSuspectCanonical 로 접는다 — 유일하게 파괴적인 갈래(재료 삭제)
+///   앞에서만 더 센 프로브를 요구하고, 재료가 안 걸린 자리는 종전 크기 단독 판정을 유지한다
+///   (구본은 VERSIONINFO 가 없을 수 있어 구조 프로브만이 구본-안전하다 — pe_extent_verdict 주석).
 #[cfg(any(windows, test))]
 pub(crate) fn plan_leftover_action(
     canonical_size: Option<u64>,
+    canonical_probe: CanonicalProbe,
     new_size: Option<u64>,
     prevs: &[PrevCandidate],
 ) -> LeftoverPlan {
     if canonical_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES) {
+        let material_at_stake = new_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES)
+            || prevs.iter().any(|p| p.size >= MIN_PROMOTABLE_BYTES);
+        if material_at_stake && canonical_probe != CanonicalProbe::Working {
+            return LeftoverPlan::HoldSuspectCanonical;
+        }
         return LeftoverPlan::SweepAll { delete_new: new_size.is_some() };
     }
     // 이 아래는 전부 "동작본 부재". 절단 정식이 있으면 승격 갈래에 자리 비우기를 지시한다.
@@ -253,6 +374,9 @@ pub(crate) struct GuardStats {
     /// 유일한 다른 삭제 경로 — 침묵 금지 규율에 따라 계수한다(info: 같은 가족의 promoted loud
     /// 가 사건 자체는 이미 알리고, 이 줄은 "정식 자리에 있던 것이 쓰레기였다"를 사후 판독에 남긴다).
     pub truncated_removed: usize,
+    /// (정식 이름, 보존한 재료 파일 수) — ★R2 라운드2: 크기 통과 정식의 PE 구조 검사 실패
+    /// (절단 의심) + 승격 가능 재료가 걸린 자리 → 가족 전체 무접촉 동결. **항상 loud**.
+    pub suspect_held: Vec<(String, usize)>,
 }
 
 /// 동결: 가족 잔해 전체를 스윕이 건너뛸 집합에 넣는다(`.new` 는 문법 밖이라 스윕이 원래 못 본다).
@@ -270,16 +394,19 @@ fn freeze_family(
 /// 가드 배선 — 설치 루트 **최상위**만 본다(정식·`.new`·가족 prev 는 전부 루트에 놓인다: 체인
 /// 슬롯도 unlock-sweep 도 루트만 만든다). 반환값은 스윕이 건너뛸 동결 경로 집합.
 ///
-/// `remove`·`promote` 를 주입받는 이유는 스윕과 같다: Windows 전용 실패 분기(잠긴 대상의
-/// rename 거부 등)를 타 OS 의 단위 테스트에서 결정론으로 재현한다. 참고로 승격 rename 은
-/// 매핑 중인(실행 중인) 옛 본이 .prev 를 붙들고 있어도 성공한다 — 매핑은 경로가 아니라 파일
+/// `remove`·`promote`·`probe` 를 주입받는 이유는 스윕과 같다: Windows 전용 실패 분기(잠긴
+/// 대상의 rename 거부 등)를 타 OS 의 단위 테스트에서 결정론으로 재현한다. 참고로 승격 rename
+/// 은 매핑 중인(실행 중인) 옛 본이 .prev 를 붙들고 있어도 성공한다 — 매핑은 경로가 아니라 파일
 /// 오브젝트에 걸린다(파일 상단 주석의 unlock-sweep 이 의존하는 그 Windows 특성).
+/// `probe` = 크기 프로브 통과 정식의 PE 구조 절단 검사(실배선 = probe_pe_extents) — 크기
+/// 프로브 미달·부재 정식에는 호출되지 않는다(그 갈래는 종전 판정 그대로).
 #[cfg(any(windows, test))]
 pub(crate) fn guard_canonical_binaries(
     dir: &std::path::Path,
     ext: &str,
     remove: &mut dyn FnMut(&std::path::Path) -> bool,
     promote: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> bool,
+    probe: &mut dyn FnMut(&std::path::Path) -> CanonicalProbe,
     stats: &mut GuardStats,
 ) -> std::collections::HashSet<std::path::PathBuf> {
     let mut hold = std::collections::HashSet::new();
@@ -323,6 +450,13 @@ pub(crate) fn guard_canonical_binaries(
             .ok()
             .filter(|m| m.is_file())
             .map(|m| m.len());
+        // PE 구조 프로브는 크기 프로브 통과분에만 건다(비용·오탐 스코프 축소 — plan 주석).
+        // 통과 못 한 정식의 값은 판정에서 소비되지 않으므로 Working 이 무해한 기본값이다.
+        let canonical_probe = if canonical_size.is_some_and(|s| s >= MIN_PROMOTABLE_BYTES) {
+            probe(&canonical)
+        } else {
+            CanonicalProbe::Working
+        };
         let new_path = dir.join(&new_name);
         let new_size = std::fs::metadata(&new_path)
             .ok()
@@ -333,7 +467,7 @@ pub(crate) fn guard_canonical_binaries(
             .filter(|c| is_family_leftover(&c.name, bin, ext))
             .cloned()
             .collect();
-        match plan_leftover_action(canonical_size, new_size, &family) {
+        match plan_leftover_action(canonical_size, canonical_probe, new_size, &family) {
             LeftoverPlan::NothingToDo => {}
             LeftoverPlan::SweepAll { delete_new } => {
                 // 정식이 살아 있으니 가족 prev 는 스윕 관할로 되돌린다(무동결). `.new` 만 여기서
@@ -397,6 +531,18 @@ pub(crate) fn guard_canonical_binaries(
                 ));
                 freeze_family(&mut hold, dir, &family);
             }
+            LeftoverPlan::HoldSuspectCanonical => {
+                // ★R2 라운드2 — 크기 통과 절단 의심 정식: 재료가 걸린 자리이므로 스윕 위임
+                // 대신 전량 무접촉 동결. `.new` 는 문법 밖이라 동결 불요(SweepAll 의 delete_new
+                // 가 유일한 삭제 경로인데 그 갈래로 가지 않는 것 자체가 보존이다). 정식은
+                // 건드리지 않는다 — 프로브는 재료 삭제를 멈추는 근거이지 정식을 지울 근거가
+                // 아니다(치유 = 재설치의 오라클 재배치 또는 다음 부팅 재판정).
+                stats.suspect_held.push((
+                    canonical_name,
+                    family.len() + usize::from(new_size.is_some()),
+                ));
+                freeze_family(&mut hold, dir, &family);
+            }
         }
     }
     hold
@@ -435,6 +581,17 @@ pub(crate) fn guard_log_lines(stats: &GuardStats) -> Vec<(LeftoverLog, String)> 
             format!(
                 "[cysd] ⚠ 정식 {canonical} 동작본 부재 + 승격 가능한 복구 재료 전무 — 아무것도 \
                  지우지 않는다(가족 파일 {kept}개 무접촉 보존). 설치기를 다시 실행해 복구하라"
+            ),
+        ));
+    }
+    for (canonical, kept) in &stats.suspect_held {
+        out.push((
+            LeftoverLog::Loud,
+            format!(
+                "[cysd] ⚠ 정식 {canonical} 이 크기 프로브(≥64KiB)는 통과했으나 PE 구조 검사에 \
+                 실패했다(절단 의심 — 섹션 원시 데이터가 파일 크기를 초과/헤더 판독 불능). 승격 \
+                 가능한 복구 재료가 걸려 있어 아무것도 지우지 않는다(재료 {kept}개 무접촉 동결). \
+                 설치기를 다시 실행해 정식을 재배치하라"
             ),
         ));
     }
@@ -785,8 +942,10 @@ pub(crate) fn run_update_leftover_maintenance(
     //   승격(정식 재건)에 성공한 가족만 스윕에 되돌아가고, 실패·재료 전무 가족은 hold 로 동결된다.
     let mut promote =
         |src: &std::path::Path, dest: &std::path::Path| std::fs::rename(src, dest).is_ok();
+    // ★R2 라운드2 — 크기 통과 정식의 PE 구조 절단 검사(재료가 걸린 SweepAll 판정에만 소비).
+    let mut probe = |p: &std::path::Path| probe_pe_extents(p);
     let mut guard = GuardStats::default();
-    let hold = guard_canonical_binaries(dir, "exe", &mut remove, &mut promote, &mut guard);
+    let hold = guard_canonical_binaries(dir, "exe", &mut remove, &mut promote, &mut probe, &mut guard);
     let mut sweep = SweepStats::default();
     sweep_update_leftovers(
         dir,
@@ -4159,11 +4318,11 @@ mod first_line_idle_tests {
 mod update_leftover_sweep_tests {
     use super::{
         bound_update_trash, guard_canonical_binaries, guard_log_lines, is_family_leftover,
-        is_update_leftover, leftover_log_lines, plan_leftover_action, quarantine_file_name,
-        run_update_leftover_maintenance, sweep_update_leftovers, GuardStats, LeftoverLog,
-        LeftoverPlan, PrevCandidate, SweepStats, TrashBoundStats, MIN_PROMOTABLE_BYTES,
-        TRASH_MAX_AGE_SECS, TRASH_MAX_BYTES, TRASH_MAX_ENTRIES, TRASH_MAX_RECLAIM_PER_BOOT,
-        UPDATE_TRASH_DIR,
+        is_update_leftover, leftover_log_lines, pe_extent_verdict, plan_leftover_action,
+        quarantine_file_name, run_update_leftover_maintenance, sweep_update_leftovers,
+        CanonicalProbe, GuardStats, LeftoverLog, LeftoverPlan, PrevCandidate, SweepStats,
+        TrashBoundStats, MIN_PROMOTABLE_BYTES, TRASH_MAX_AGE_SECS, TRASH_MAX_BYTES,
+        TRASH_MAX_ENTRIES, TRASH_MAX_RECLAIM_PER_BOOT, UPDATE_TRASH_DIR,
     };
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -4987,27 +5146,27 @@ mod update_leftover_sweep_tests {
         let big = MIN_PROMOTABLE_BYTES;
         // 정식 **동작본**(≥64KiB) 존재 → 스윕 위임. `.new` 는 존재할 때만(크기 무관) 삭제 지시.
         assert_eq!(
-            plan_leftover_action(Some(big), None, &[]),
+            plan_leftover_action(Some(big), CanonicalProbe::Working, None, &[]),
             LeftoverPlan::SweepAll { delete_new: false }
         );
         assert_eq!(
-            plan_leftover_action(Some(big + 9), Some(3), &[pc("cys.prev.exe", 9, big)]),
+            plan_leftover_action(Some(big + 9), CanonicalProbe::Working, Some(3), &[pc("cys.prev.exe", 9, big)]),
             LeftoverPlan::SweepAll { delete_new: true }
         );
         // 정식 부재: 온전한 `.new` 가 prev 보다 우선한다(경계 64KiB 정확히 = 승격 가능).
         assert_eq!(
-            plan_leftover_action(None, Some(big), &[pc("cys.prev.exe", 9, big)]),
+            plan_leftover_action(None, CanonicalProbe::Working, Some(big), &[pc("cys.prev.exe", 9, big)]),
             LeftoverPlan::PromoteNew { replace_canonical: false }
         );
         // ★R1 라운드1 핀 — **절단 정식**(존재하되 <64KiB · truncate-write 중 사망)은 '존재'가
         //   아니다. 존재로 읽으면 SweepAll 이 마지막 동작본(.prev·stale-good .new)을 지운다.
         //   판정은 승격 + 자리 비우기 지시(replace_canonical)다.
         assert_eq!(
-            plan_leftover_action(Some(0), Some(big), &[pc("cys.prev.exe", 9, big)]),
+            plan_leftover_action(Some(0), CanonicalProbe::Working, Some(big), &[pc("cys.prev.exe", 9, big)]),
             LeftoverPlan::PromoteNew { replace_canonical: true }
         );
         assert_eq!(
-            plan_leftover_action(Some(big - 1), None, &[pc("cys.prev.exe", 9, big)]),
+            plan_leftover_action(Some(big - 1), CanonicalProbe::Working, None, &[pc("cys.prev.exe", 9, big)]),
             LeftoverPlan::PromotePrev {
                 source: "cys.prev.exe".into(),
                 delete_new: false,
@@ -5015,11 +5174,12 @@ mod update_leftover_sweep_tests {
             }
         );
         // 절단 정식 + 승격 가능 재료 전무 → Hold(절단 정식도 지우지 않는다 — 수동 복구 단서).
-        assert_eq!(plan_leftover_action(Some(3), None, &[]), LeftoverPlan::Hold);
+        assert_eq!(plan_leftover_action(Some(3), CanonicalProbe::Working, None, &[]), LeftoverPlan::Hold);
         // `.new` 미달(잘림) → 최신 mtime 의 prev 폴백 + 미달 신본은 승격 성공 후 처분 지시.
         assert_eq!(
             plan_leftover_action(
                 None,
+                CanonicalProbe::Working,
                 Some(big - 1),
                 &[pc("cys.prev.exe", 5, big), pc("cys.prev2.exe", 9, big)]
             ),
@@ -5032,7 +5192,7 @@ mod update_leftover_sweep_tests {
         // prev 중 미달 크기는 최신이어도 건너뛴다 — 잘린 본 승격은 다음 부팅의 "정식 존재" 오판
         // → 남은 진짜 재료 삭제로 전이된다(가드가 막는 사고 그 자체).
         assert_eq!(
-            plan_leftover_action(None, None, &[pc("cys.prev.exe", 99, 10), pc("cys.prev2.exe", 5, big)]),
+            plan_leftover_action(None, CanonicalProbe::Working, None, &[pc("cys.prev.exe", 99, 10), pc("cys.prev2.exe", 5, big)]),
             LeftoverPlan::PromotePrev {
                 source: "cys.prev2.exe".into(),
                 delete_new: false,
@@ -5041,7 +5201,7 @@ mod update_leftover_sweep_tests {
         );
         // mtime 동률은 이름으로 깬다 — read_dir 순서와 무관한 부트 간 결정론.
         assert_eq!(
-            plan_leftover_action(None, None, &[pc("cys.prev.exe", 7, big), pc("cys.prev3.exe", 7, big)]),
+            plan_leftover_action(None, CanonicalProbe::Working, None, &[pc("cys.prev.exe", 7, big), pc("cys.prev3.exe", 7, big)]),
             LeftoverPlan::PromotePrev {
                 source: "cys.prev3.exe".into(),
                 delete_new: false,
@@ -5049,12 +5209,159 @@ mod update_leftover_sweep_tests {
             }
         );
         // 가족이 통째로 없으면 조용(NothingToDo) · 미달 재료뿐이면 동결(Hold) — 둘은 다른 상태다.
-        assert_eq!(plan_leftover_action(None, None, &[]), LeftoverPlan::NothingToDo);
-        assert_eq!(plan_leftover_action(None, Some(8), &[]), LeftoverPlan::Hold);
+        assert_eq!(plan_leftover_action(None, CanonicalProbe::Working, None, &[]), LeftoverPlan::NothingToDo);
+        assert_eq!(plan_leftover_action(None, CanonicalProbe::Working, Some(8), &[]), LeftoverPlan::Hold);
         assert_eq!(
-            plan_leftover_action(None, None, &[pc("cys.prev.exe", 9, 8)]),
+            plan_leftover_action(None, CanonicalProbe::Working, None, &[pc("cys.prev.exe", 9, 8)]),
             LeftoverPlan::Hold
         );
+    }
+
+    /// G⑬ ★R2 라운드2 핀(순수) — **크기 통과 절단본**: 크기 프로브(≥64KiB)를 통과한 정식이라도
+    ///    PE 구조 프로브가 절단을 반증하지 못하면(Torn/Unknown — 측정 불능은 통과가 아니다),
+    ///    승격 가능 재료가 걸린 자리에서는 SweepAll(→재료 삭제) 대신 무접촉 동결이다.
+    ///    재료가 안 걸린 자리는 종전 크기 단독 판정 그대로다(스코프 축소 — 오탐 배너 금지).
+    #[test]
+    fn plan_suspect_canonical_never_sweeps_material_away() {
+        let pc = |name: &str, mtime: u64, size: u64| PrevCandidate {
+            name: name.into(),
+            mtime,
+            size,
+        };
+        let big = MIN_PROMOTABLE_BYTES;
+        // 절단 의심 + 승격 가능 prev → 동결(마지막 동작본을 스윕에 넘기지 않는다 — T3 계급 차단).
+        assert_eq!(
+            plan_leftover_action(Some(big * 300), CanonicalProbe::Torn, None, &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::HoldSuspectCanonical
+        );
+        // 절단 의심 + 승격 가능 `.new` → 동결(delete_new 로 마지막 신본 재료를 지우지 않는다).
+        assert_eq!(
+            plan_leftover_action(Some(big), CanonicalProbe::Torn, Some(big), &[]),
+            LeftoverPlan::HoldSuspectCanonical
+        );
+        // 측정 불능(Unknown)도 통과가 아니다 — 재료가 걸려 있으면 같은 동결.
+        assert_eq!(
+            plan_leftover_action(Some(big), CanonicalProbe::Unknown, None, &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::HoldSuspectCanonical
+        );
+        // 구조 검증 통과면 종전 그대로 SweepAll.
+        assert_eq!(
+            plan_leftover_action(Some(big), CanonicalProbe::Working, Some(3), &[pc("cys.prev.exe", 9, big)]),
+            LeftoverPlan::SweepAll { delete_new: true }
+        );
+        // 재료가 안 걸린 자리(미달 재료뿐/전무)는 프로브와 무관하게 크기 단독 판정 유지 —
+        // 지울 가치 있는 것이 없으니 동결이 줄 보호도 없고, 매 부팅 우는 배너만 남는다.
+        assert_eq!(
+            plan_leftover_action(Some(big), CanonicalProbe::Torn, None, &[]),
+            LeftoverPlan::SweepAll { delete_new: false }
+        );
+        assert_eq!(
+            plan_leftover_action(Some(big), CanonicalProbe::Torn, Some(8), &[pc("cys.prev.exe", 9, 8)]),
+            LeftoverPlan::SweepAll { delete_new: true }
+        );
+    }
+
+    /// G⑭ PE 구조 프로브(순수) — 순차 기록 tear 는 "헤더 온전 + 후미 소실"이므로 섹션 원시
+    ///    범위 vs 실측 크기 대조가 결정론으로 잡는다. VERSIONINFO 无 구본도 통과해야 한다
+    ///    (구본-안전이 이 프로브를 GetDLLVersion 대신 채택한 이유다).
+    #[test]
+    fn pe_extent_verdict_separates_torn_from_working() {
+        // 합성 PE 프리픽스: e_lfanew=0x80 · 섹션 1개 · 원시 데이터 [0x400, 0x400+claim).
+        fn pe_prefix(claimed_raw_size: u32) -> Vec<u8> {
+            let mut v = vec![0u8; 4096];
+            v[0] = b'M';
+            v[1] = b'Z';
+            let pe = 0x80usize;
+            v[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+            v[pe..pe + 4].copy_from_slice(b"PE\0\0");
+            v[pe + 6..pe + 8].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections=1
+            v[pe + 20..pe + 22].copy_from_slice(&240u16.to_le_bytes()); // SizeOfOptionalHeader
+            let ent = pe + 24 + 240;
+            v[ent + 16..ent + 20].copy_from_slice(&claimed_raw_size.to_le_bytes());
+            v[ent + 20..ent + 24].copy_from_slice(&0x400u32.to_le_bytes());
+            v
+        }
+        let big = MIN_PROMOTABLE_BYTES;
+        // 온전: 섹션 끝(0x400+0x8000) ≤ 파일 크기 — VERSIONINFO 유무와 무관하게 Working.
+        assert_eq!(pe_extent_verdict(&pe_prefix(0x8000), big), CanonicalProbe::Working);
+        // 절단: 헤더는 20MB 를 주장하는데 실측은 64KiB — 순차 기록 tear 의 전형.
+        assert_eq!(
+            pe_extent_verdict(&pe_prefix(20 * 1024 * 1024), big),
+            CanonicalProbe::Torn
+        );
+        // 경계: 섹션 끝 == 파일 크기 = 온전(오버레이 0).
+        assert_eq!(
+            pe_extent_verdict(&pe_prefix((big - 0x400) as u32), big),
+            CanonicalProbe::Working
+        );
+        // 구조 부재 = 절단 확정 계열: MZ 아님 · PE 서명 아님 · 섹션 0개.
+        assert_eq!(pe_extent_verdict(&vec![0u8; 4096], big), CanonicalProbe::Torn);
+        let mut no_pe = pe_prefix(0x100);
+        no_pe[0x80..0x84].copy_from_slice(b"XX\0\0");
+        assert_eq!(pe_extent_verdict(&no_pe, big), CanonicalProbe::Torn);
+        let mut zero_sect = pe_prefix(0x100);
+        zero_sect[0x86..0x88].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(pe_extent_verdict(&zero_sect, big), CanonicalProbe::Torn);
+        // 파싱 불능 = Unknown (절단 증명이 아니다): e_lfanew 가 프리픽스 밖.
+        let mut far = pe_prefix(0x100);
+        far[0x3c..0x40].copy_from_slice(&0x10000u32.to_le_bytes());
+        assert_eq!(pe_extent_verdict(&far, big), CanonicalProbe::Unknown);
+    }
+
+    /// G⑮ ★R2 라운드2 배선(실 파일시스템 + 실 프로브) — 실증된 복합 시나리오의 박제:
+    ///    "크기 통과 절단 정식(20MB 주장·64KiB 실측) + 살아있는 prev" 부트에서 prev 를 지우지
+    ///    않고(무 SweepAll), 가족을 동결하며, loud 로 고지한다. 수렴 검사 짝: 건강한 PE 정식은
+    ///    같은 재료 배치에서 종전대로 스윕이 prev 를 정리한다.
+    #[test]
+    fn guard_holds_size_passing_torn_canonical_instead_of_sweeping_prevs() {
+        // 합성 PE 파일(실 프로브 probe_pe_extents 가 읽는다): 프리픽스는 G⑭ 와 동일 문법.
+        fn write_pe(path: &Path, file_size: u64, claimed_raw_size: u32) {
+            let mut v = vec![0u8; file_size as usize];
+            v[0] = b'M';
+            v[1] = b'Z';
+            let pe = 0x80usize;
+            v[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+            v[pe..pe + 4].copy_from_slice(b"PE\0\0");
+            v[pe + 6..pe + 8].copy_from_slice(&1u16.to_le_bytes());
+            v[pe + 20..pe + 22].copy_from_slice(&240u16.to_le_bytes());
+            let ent = pe + 24 + 240;
+            v[ent + 16..ent + 20].copy_from_slice(&claimed_raw_size.to_le_bytes());
+            v[ent + 20..ent + 24].copy_from_slice(&0x400u32.to_le_bytes());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, v).unwrap();
+        }
+        let root = workdir("guard-torn-size-passing");
+        // 절단 정식: 64KiB 실측인데 헤더는 20MB 원시 데이터를 주장(전원차단 tear 재현).
+        write_pe(&root.join("cys.exe"), MIN_PROMOTABLE_BYTES, 20 * 1024 * 1024);
+        touch_at(&root.join("cys.prev.exe"), T0 - 10, MIN_PROMOTABLE_BYTES as usize);
+
+        let lines = run_update_leftover_maintenance(&root, T0);
+
+        assert!(root.join("cys.prev.exe").exists(), "절단 의심 정식인데 마지막 동작본 prev 를 지웠다(T3 계급 재발)");
+        assert_eq!(
+            std::fs::metadata(root.join("cys.exe")).unwrap().len(),
+            MIN_PROMOTABLE_BYTES,
+            "동결이어야 하는데 정식을 건드렸다"
+        );
+        assert!(!root.join(UPDATE_TRASH_DIR).exists(), "동결 재료가 격리함으로 갔다");
+        assert!(
+            lines.iter().any(|(l, s)| *l == LeftoverLog::Loud
+                && s.contains("PE 구조 검사")
+                && s.contains("cys.exe")),
+            "절단 의심 동결이 침묵했다: {lines:?}"
+        );
+
+        // 짝 검증: 구조 통과 정식(같은 크기·주장 범위 ≤ 실측)이면 종전대로 prev 는 스윕이 지운다.
+        let root2 = workdir("guard-working-canonical-sweeps");
+        write_pe(&root2.join("cys.exe"), MIN_PROMOTABLE_BYTES, 0x8000);
+        touch_at(&root2.join("cys.prev.exe"), T0 - 10, MIN_PROMOTABLE_BYTES as usize);
+        let _ = run_update_leftover_maintenance(&root2, T0);
+        assert!(
+            !root2.join("cys.prev.exe").exists(),
+            "건강한 정식인데 prev 정리가 멈췄다(스코프 과확장 — 오탐 동결)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 
     /// G⑥ 가족 판정 — 설치기 형식(체인·unlock-sweep·W4-B tick)은 가족이고, 이웃 바이너리·
@@ -5098,8 +5405,15 @@ mod update_leftover_sweep_tests {
         let mut guard = GuardStats::default();
         let mut real_rm = |p: &Path| std::fs::remove_file(p).is_ok();
         let mut refuse_promote = |_: &Path, _: &Path| false;
-        let hold =
-            guard_canonical_binaries(&root, "exe", &mut real_rm, &mut refuse_promote, &mut guard);
+        let mut probe_ok = |_: &Path| CanonicalProbe::Working;
+        let hold = guard_canonical_binaries(
+            &root,
+            "exe",
+            &mut real_rm,
+            &mut refuse_promote,
+            &mut probe_ok,
+            &mut guard,
+        );
 
         assert_eq!(
             guard.promote_failed,
@@ -5279,11 +5593,13 @@ mod update_leftover_sweep_tests {
         let mut must_not_promote = |_: &Path, _: &Path| -> bool {
             panic!("자리 비우기 실패인데 승격을 시도했다(rename 은 실재 dest 에 실패 — 순서 위반)")
         };
+        let mut probe_ok = |_: &Path| CanonicalProbe::Working;
         let hold = guard_canonical_binaries(
             &root,
             "exe",
             &mut refuse_canonical_rm,
             &mut must_not_promote,
+            &mut probe_ok,
             &mut guard,
         );
 

@@ -4466,6 +4466,12 @@ mod spawn_policy_tests {
     /// 프로브를 **반복** 호출하므로 한 번의 회귀가 반복 점화점이 된다. rust 검체가 팩 파일의
     /// 계약 문자열을 박제하는 것은 census 검체의 cys-dept 셸 층 단언과 같은 장르다 — 봉인
     /// 키의 정의처가 이 파일이라 드리프트를 정의처에서 잡는다(파이썬 하네스 아님).
+    ///
+    /// ★역할 경계(R2 라운드2 강등): 이 검체는 **키/조건 문자열의 드리프트 감시**까지만이다 —
+    /// 행동은 못 지킨다(M8 변이 실측: 핀이 찾는 조건줄을 남긴 채 블록 본문을 `return "dead"`
+    /// 로 바꿔도 이 검체는 초록). unknown/dead 3값 판정과 drain 의 "unknown = 배달·유지,
+    /// dead = skip·삭제" 행동의 정본 가드는 파이썬 행동 스위트
+    /// `cysjavis-pack/bin/tests/test_wakeup_liveness.py`(3완전 레인 등재)다.
     #[test]
     fn pack_wakeup_liveness_probe_seals_autostart() {
         let py = std::fs::read_to_string(
@@ -4487,10 +4493,12 @@ mod spawn_policy_tests {
         //   한다. 봉인 아래 죽은 소켓의 실측 모양은 stdout 0바이트 + rc!=0 인데(실 바이너리
         //   실측), 이를 'dead' 로 읽으면 drain 의 zombie 가드가 pending 을 영구 삭제한다 —
         //   주기 자가치유의 무음 소실(앵커 ③ 인접). 측정 실패 = unknown(경고 배달)이어야 한다.
+        // ★이 substring 은 조건줄의 존재만 본다(행동 아님 — 위 역할 경계). 행동 회귀는
+        //   test_wakeup_liveness.py 가 rc=1/빈 stdout/0행/예외 → 'unknown' + drain 유지로 잰다.
         assert!(
             body.contains("proc.returncode != 0"),
-            "_target_alive 에 측정 실패(rc!=0/빈 stdout → unknown) fail-safe 가 없다 — \
-             NO_AUTOSTART 봉인 아래 '닿지 않는 데몬'이 'dead' 로 접혀 pending 이 영구 삭제된다"
+            "_target_alive 에 측정 실패(rc!=0/빈 stdout → unknown) fail-safe 조건줄이 없다 — \
+             키 드리프트: 파이썬 행동 스위트(test_wakeup_liveness.py)와 함께 이사해야 한다"
         );
     }
 

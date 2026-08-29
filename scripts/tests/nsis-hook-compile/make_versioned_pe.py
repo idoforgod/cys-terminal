@@ -60,7 +60,7 @@ def build_rsrc(version_data: bytes):
     return blob + version_data
 
 
-def build_pe(ms: int, ls: int, pad_to: int) -> bytes:
+def build_pe(ms: int, ls: int, pad_to: int, with_version: bool = True) -> bytes:
     rsrc = build_rsrc(build_versioninfo(ms, ls))
     file_align = 0x200
     sect_align = 0x1000
@@ -69,7 +69,11 @@ def build_pe(ms: int, ls: int, pad_to: int) -> bytes:
     dos = b"MZ" + b"\x00" * 58 + struct.pack("<I", 0x40)
     coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 0xF0, 0x0022)
     ddirs = [(0, 0)] * 16
-    ddirs[2] = (sect_align, len(rsrc))  # resource directory
+    if with_version:
+        ddirs[2] = (sect_align, len(rsrc))  # resource directory
+    # with_version=False: keep the section bytes (identical layout) but publish NO resource
+    # directory - the exact shape of a cross-build/winresource regression (valid PE, no
+    # discoverable VS_VERSIONINFO), which `!getdllversion` must fail to read.
     opt = struct.pack(
         "<HBBIIIIIQ", 0x20B, 14, 0, 0, len(rsrc), 0, 0, 0x1000, 0x140000000
     )
@@ -110,6 +114,12 @@ def main():
     ap.add_argument("--version", required=True, help="a.b.c.d")
     ap.add_argument("--out", required=True)
     ap.add_argument("--pad", type=int, default=0, help="pad file to at least N bytes")
+    ap.add_argument(
+        "--no-version",
+        action="store_true",
+        help="emit a valid PE with NO discoverable version resource (negative-control "
+        "input: the blind-oracle guard must fail the hook compile on this file)",
+    )
     args = ap.parse_args()
     parts = [int(x) for x in args.version.split(".")]
     while len(parts) < 4:
@@ -118,8 +128,9 @@ def main():
     ms = (a << 16) | b
     ls = (c << 16) | d
     with open(args.out, "wb") as f:
-        f.write(build_pe(ms, ls, args.pad))
-    print(f"{args.out}: version {a}.{b}.{c}.{d} MS={ms} LS={ls}")
+        f.write(build_pe(ms, ls, args.pad, with_version=not args.no_version))
+    tag = "NO VERSIONINFO" if args.no_version else f"version {a}.{b}.{c}.{d} MS={ms} LS={ls}"
+    print(f"{args.out}: {tag}")
 
 
 if __name__ == "__main__":

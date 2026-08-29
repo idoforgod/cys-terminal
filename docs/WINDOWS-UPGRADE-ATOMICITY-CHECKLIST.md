@@ -8,11 +8,17 @@
 > ★2026-08-29(v0.14.28 · W4) 전면 개정. 2026-08-28 실사고(잠긴 구 `cys.exe` 위로 재설치 →
 > 영원한 exit 4 루프)의 재설계를 반영한다 — 지문(크기+mtime) 비교와 같은버전 면제 기계는
 > **제거**됐고, 판정은 **절대 신선도 오라클**(정식 자리 파일의 VERSIONINFO DWORD 2개 ==
-> 이번 빌드 원본에서 컴파일 시 뽑은 상수 — 훅 `!getdllversion` :90-91 · `CYS_ORACLE` :137-155)
-> 이며, 배치는 `<bin>.new.exe` 추출→검증→**rename 2단**의 3종 트랜잭션(`CYS_PLACE` :190-327 ·
-> 순서 cys→cysd→cys-app :591-595)이다. 기대값의 동결 스키마는
+> 이번 빌드 원본에서 컴파일 시 뽑은 상수 — 훅 컴파일 게이트 `!getdllversion /packed` · 런타임 `CYS_ORACLE`)
+> 이며, 배치는 `<bin>.new.exe` 추출→검증→**rename 2단**의 3종 트랜잭션(`CYS_PLACE` ·
+> 순서 cys→cysd→cys-app = POSTINSTALL 의 `!insertmacro CYS_PLACE` 3행)이다. 기대값의 동결 스키마는
 > `_work/win-installer-fix-20260829/NSIS-CONTRACT.md`(이름·토큰·종료코드 계약)다.
 > 아래 P1/P2/P5/P6/P9/P10/P11 의 기대값은 이 개정 기준이다.
+>
+> ★훅 인용 규약(R3 확립): 이 문서는 훅을 **라인 번호가 아니라 앵커**(매크로명 `CYS_*` ·
+> 본문 라벨(`cys_pl_*`·`cys_ld_*`·`cys_post_*` 류) · 콜백 함수명 · ①~⑧ = NSIS-CONTRACT §2 의
+> 동결 단계번호)로 인용한다. 위치 찾기는 `grep -n '<앵커>' src-tauri/nsis-hooks.nsh`.
+> 라인 번호 인용은 훅 편집마다 썩는 것이 두 번 실측됐고(R2·R3), 앵커의 실재는 컴파일
+> 하네스(`scripts/tests/nsis-hook-compile/run.sh` **N6**)가 매 브랜치 상시 단언한다.
 >
 > 준비물: Parallels Windows 11 VM · 직전 버전 설치본 · 신 버전 `cys_x.y.z_x64-setup.exe`.
 > 모든 PowerShell 은 **관리자 아님**(설치 모드가 currentUser)으로 연다.
@@ -80,15 +86,15 @@ Test-Path "$env:LOCALAPPDATA\cys\cys.exe"; Test-Path "$env:LOCALAPPDATA\cys\cysd
 | 설치 종료 후에도 False | **FAIL** — 즉시 보고. 단 재부팅으로 cysd 가 뜨면 부팅 가드(P11)가 복구해야 한다 — 복구돼도 보고 대상 |
 
 > ★기준의 근거(2026-08-29 W4 개정): 배치는 `<bin>.new.exe` 에 신본을 먼저 추출·검증해 두고
-> **rename 2회**(정식→prev 슬롯 `cys_pl_vacate` 훅 :244-285 → `.new`→정식 `cys_pl_fill` :286-289)
+> **rename 2회**(정식→prev 슬롯 `cys_pl_vacate` → `.new`→정식 `cys_pl_fill`)
 > 로 교체한다. 두 rename 은 모두 메타데이터 연산이라 정식 이름이 비는 창은 **수 ms** 다
-> (훅 L2 :42-44). 종전(0.14.27)의 `Rename → cmd copy` 2단이 만들던 수십~수백 ms 창보다 더
-> 좁아졌고, 같은 버전 재설치는 오라클 단락(`CYS_PLACE` ① :193-199)으로 **아예 스왑을 하지
+> (훅 침불변 L2). 종전(0.14.27)의 `Rename → cmd copy` 2단이 만들던 수십~수백 ms 창보다 더
+> 좁아졌고, 같은 버전 재설치는 오라클 단락(`CYS_PLACE` ①)으로 **아예 스왑을 하지
 > 않으므로** 창 자체가 없다. 200ms 표집에서 False 0~2줄은 정상 범위다.
 >
 > 채우기 rename 이 일시 거부되면(AV 가 `.new` 를 쥔 경우) 유한 재시도(5회×1초 —
-> `CYS_RENAME_RETRY` :115-128)가 도는 동안 창이 최대 ~5초까지 늘 수 있으나, 그 종단은
-> 반드시 **prev 슬롯 복귀**(`CYS_RESTORE_SLOT` :165-183) 후 `placement-refused` 유음 실패다
+> `CYS_RENAME_RETRY`)가 도는 동안 창이 최대 ~5초까지 늘 수 있으나, 그 종단은
+> 반드시 **prev 슬롯 복귀**(`CYS_RESTORE_SLOT`) 후 `placement-refused` 유음 실패다
 > — 즉 "창이 길었는데 설치는 성공" 조합은 존재하지 않는다. 그래서 FAIL 판정은 "긴 창 +
 > exit 0" 조합에 걸며, 설치기가 실패(exit 3/4 + `cys-install-failure.txt`)로 끝났다면 그것은
 > 설계된 유음 경로다(P5/P6 로 이동해 토큰을 판독하라).
@@ -97,7 +103,7 @@ Test-Path "$env:LOCALAPPDATA\cys\cys.exe"; Test-Path "$env:LOCALAPPDATA\cys\cysd
 > (사이드카는 NSIS `File` 목록의 맨 마지막에 풀리기 때문). 즉 이 항목의 핵심 신호는
 > "False 유무" 가 아니라 **"연속 창의 자릿수"** 다 — 수백 줄 vs 0~2줄.
 > 마지막 안전선: 어떤 실패로든 정식이 빈 채 남으면 콜백(`.onInstFailed`/`.onUserAbort`
-> :496-506)과 최종 바닥 점검(`CYS_LASTDITCH` :376-444), 그리고 다음 cysd 부팅의 회수 가드
+> — 본체 `CYS_ABORT_RESCUE`)과 최종 바닥 점검(`CYS_LASTDITCH`), 그리고 다음 cysd 부팅의 회수 가드
 > (P11)가 `.new`(신본) → prev 체인(구본) 순으로 자리를 닫는다. 콜백·부팅 가드는 정식을
 > '존재'가 아니라 **크기(≥64KiB)** 로 판정한다(R1-r1) — 취소가 템플릿 File 의 truncate-write
 > 도중이어서 남은 **절단 정식**은 부재로 취급해 자리를 비운 뒤 같은 순서로 복구한다.
@@ -113,7 +119,7 @@ $INST = "$env:LOCALAPPDATA\cys"
 Test-Path "$INST\cys-install-failure.txt"      # False 여야 한다
 Get-Content "$INST\cys-installed-version.txt"  # 신 버전이어야 한다(전 게이트 통과 후에만 갱신됨)
 Get-ChildItem $INST -Filter '*.prev*.exe'      # lame-duck 잔해(있어도 정상 — 새 cysd 기동이 청소)
-Get-ChildItem $INST -Filter '*.new.exe'        # ★비어 있어야 한다(성공 배치는 rename 으로 소멸 + Delete 벨트 · 훅 :319-324)
+Get-ChildItem $INST -Filter '*.new.exe'        # ★비어 있어야 한다(성공 배치는 rename 으로 소멸 + Delete 벨트 · `CYS_PLACE` ⑧ `cys_pl_commit`)
 ```
 
 PASS 조건: `cys --version` 이 **신 버전** · `cys-install-failure.txt` 부재 ·
@@ -125,13 +131,13 @@ PASS 조건: `cys --version` 이 **신 버전** · `cys-install-failure.txt` 부
 > "같은 버전 재설치 → 영원한 exit 4 루프"(2026-08-28 실사고)를 낳았기 때문이다.
 > 지금은 **절대 오라클**이 판정한다: 정식 자리 파일의 VERSIONINFO DWORD 2개를
 > 이번 빌드 원본에서 컴파일 시 뽑아 둔 상수와 비교한다(기대값 `!getdllversion /packed`
-> 훅 :90-91 · 런타임 `CYS_ORACLE` :137-155 · 배치 후 재검증 :298-302). 읽기 실패·리소스
-> 부재는 **fail-closed**(신본 아님으로 간주 :142-143·:148-149)다. 따라서:
+> 컴파일 게이트 · 런타임 `CYS_ORACLE` · 배치 후 재검증 ⑦ `cys_pl_rv`). 읽기 실패·리소스
+> 부재는 **fail-closed**(`CYS_ORACLE` 의 IfErrors 갈래 = notfresh 간주)다. 따라서:
 > - 신본이 실제로 안 들어왔는데 성공(exit 0)으로 끝나는 조합은 원리적으로 없다 — 보이면
 >   오라클 자체 결함이니 **최우선 보고**.
-> - **같은 버전 재설치는 오라클 단락**(:193-199)으로 아무 스왑 없이 exit 0 이다 — prev
+> - **같은 버전 재설치는 오라클 단락**(`CYS_PLACE` ①)으로 아무 스왑 없이 exit 0 이다 — prev
 >   슬롯이 새로 생기지 않는 것이 정상이다(면제 기계 불요의 근거 · NSIS-CONTRACT §4).
-> `cys-installed-version.txt` 는 이제 판정 재료가 아니라 **정보성 마커**다(훅 :673-680) —
+> `cys-installed-version.txt` 는 이제 판정 재료가 아니라 **정보성 마커**다(성공 종단 `cys_post_ok` 의 마커 쓰기) —
 > 모든 게이트를 통과한 뒤에만 쓰이므로, 실패·중단한 설치로는 갱신되지 않는다
 > (= 이 파일의 값이 '마지막으로 실제 반영된 버전').
 
@@ -169,7 +175,7 @@ Test-Path "$INST\cys.exe"; Test-Path "$INST\cysd.exe"     # 둘 다 True 여야 
 
 | 결과 | 판정 |
 |---|---|
-| 둘 다 True 이고 `cys --version` 이 정상 출력 | **PASS** — 중단이 '빈 자리'가 아니라 '동작본'을 남겼다(콜백 `CYS_ABORT_RESCUE` :457-492 이 `.new` 신본 → prev 구본 순으로 자리를 닫으므로 신·구 어느 쪽이어도 정상) |
+| 둘 다 True 이고 `cys --version` 이 정상 출력 | **PASS** — 중단이 '빈 자리'가 아니라 '동작본'을 남겼다(콜백 `CYS_ABORT_RESCUE` 가 `.new` 신본 → prev 구본 순으로 자리를 닫으므로 신·구 어느 쪽이어도 정상) |
 | 하나라도 False | **FAIL** — 즉시 보고 |
 
 정리: 다시 설치기를 완주해 정상 상태로 되돌린다.
@@ -192,23 +198,23 @@ icacls "$INST\cys.exe" /inheritance:r /grant:r "$($env:USERNAME):(R)"
 이 상태로 설치기를 **완주**시킨다.
 
 **기대 동작**
-- 설치기가 마지막에 **실패**로 끝난다(빨간 중단 · GUI 면 `cys installation did not complete correctly.` 메시지 상자 · 훅 :659).
-- `%LOCALAPPDATA%\cys\cys-install-failure.txt` 가 생긴다(훅 :637-648). 1행은 종전과 같은
+- 설치기가 마지막에 **실패**로 끝난다(빨간 중단 · GUI 면 `cys installation did not complete correctly.` 메시지 상자 · 훅 `cys_post_fail` 경로의 MessageBox).
+- `%LOCALAPPDATA%\cys\cys-install-failure.txt` 가 생긴다(`cys_post_fail` 경로가 쓴다). 1행은 종전과 같은
   형식 `cys installer: critical executable verification FAILED (exit N)` 이고, 그 아래
   **토큰 4줄이 항상 존재**한다(해당 없으면 접두어 뒤 빈 값 — 동결 스키마 NSIS-CONTRACT §3):
   ```
-  unrecoverable:  ← 이 시험에서는 cys.exe 가 여기에 적힌다(0바이트 자리를 어떤 재료로도 못 메움 · CYS_LASTDITCH :439-441)
+  unrecoverable:  ← 이 시험에서는 cys.exe 가 여기에 적힌다(0바이트 자리를 어떤 재료로도 못 메움 · `CYS_LASTDITCH` 의 `cys_ld_fatal` 종단)
   rolled-back-to-previous:
   not-updated:
-  placement-refused:  ← cys.exe(vacate-locked) 도 함께 적힌다(읽기전용 ACL 이 rename 대피를 거부 · :279-282)
+  placement-refused:  ← cys.exe(vacate-locked) 도 함께 적힌다(읽기전용 ACL 이 rename 대피를 거부 · `cys_pl_stick` 거부 종단)
   ```
 - cysd.exe·cys-app.exe 는 토큰 목록에 **없다** — 배치는 cys 부터의 고정 순서 트랜잭션이라
-  (:591-595) 첫 바이너리 거부 시 나머지는 시도조차 하지 않는다(시도 안 한 것은 목록에 없음 —
+  (POSTINSTALL `!insertmacro CYS_PLACE` 3행 · fail 시 `cys_txn_undo`) 첫 바이너리 거부 시 나머지는 시도조차 하지 않는다(시도 안 한 것은 목록에 없음 —
   NSIS-CONTRACT §3). 단 이 시험에서 cysd/cys-app 파일 자체는 잠겨 있지 않았으므로 템플릿
   추출이 이미 신본으로 덮었을 수 있다 — P5 의 판정 대상이 아니다.
 - 무인(silent) 설치라면 종료 코드가 **3**이다:
 
-> 종료코드 규약(훅 :630-634 · NSIS-CONTRACT §4): **3 = 정식이 없(었)거나 구본으로 비상
+> 종료코드 규약(훅 `cys_post_lvl` 분기 · NSIS-CONTRACT §4): **3 = 정식이 없(었)거나 구본으로 비상
 > 복구됨**(`unrecoverable:`/`rolled-back-to-previous:` 비어있지 않음) · **4 = 거부된
 > 바이너리는 구본 무손상·동작, 그 신본 미반영**(`not-updated:`/`placement-refused:` 만
 > 비어있지 않음 — P6/P10 이 이 쪽을 시험한다. 형제 바이너리는 템플릿 추출로 이미 신본일 수
@@ -216,7 +222,7 @@ icacls "$INST\cys.exe" /inheritance:r /grant:r "$($env:USERNAME):(R)"
 > 동작하고 세션도 안 죽었다" 가 전제다 —
 > 재실행이 정답(안내 문구도 그렇게 적힌다: "Do NOT uninstall. Quit cys from the app
 > (it saves sessions), wait 10 s, run this installer again and choose 'Do not uninstall'."
-> · 훅 :644-645).
+> · 실패 파일 Action 2행 = NSIS-CONTRACT §3 동결문).
   ```powershell
   $p = Start-Process "<...>-setup.exe" -ArgumentList '/S' -PassThru -Wait; $p.ExitCode   # 3 기대
   ```
@@ -227,7 +233,7 @@ icacls "$INST\cys.exe" /inheritance:r /grant:r "$($env:USERNAME):(R)"
 icacls "$INST\cys.exe" /reset
 Remove-Item "$INST\cys.exe","$INST\cys-install-failure.txt" -Force -ErrorAction SilentlyContinue
 # cys.new.exe 가 남아 있어도 정상이다(거부된 배치의 스테이징 잔존 — NSIS-CONTRACT §1).
-# 다음 완주가 스스로 지우고 새로 추출하므로(훅 ② :201-205) 손대지 않아도 된다.
+# 다음 완주가 스스로 지우고 새로 추출하므로(`CYS_PLACE` ②) 손대지 않아도 된다.
 # 설치기를 다시 완주 → P2 로 정상 확인
 ```
 
@@ -241,17 +247,20 @@ Remove-Item "$INST\cys.exe","$INST\cys-install-failure.txt" -Force -ErrorAction 
 ## P6 — 잠금 두 계급을 정확히 가른다: 핸들 잠금 = exit 4 거부 · 이미지 잠금 = 성공
 
 ★2026-08-29 기대값 반전(W4). 종전 이 항목은 "배타 핸들이어도 성공" 을 기대했지만, 새 설계에서
-잠금은 **두 계급**이고 정답이 서로 다르다(훅 L2 :42-44 · NSIS-CONTRACT §4):
+잠금은 **두 계급**이고 정답이 서로 다르다(훅 침불변 L2 · NSIS-CONTRACT §4):
 
 - **핸들 잠금(delete 비공유)** — rename(대피)에 필요한 DELETE 접근까지 거부한다. 훅은 정식을
   건드릴 수 없으므로 **거부**한다: `exit 4` + **구본 무손상·동작** + `placement-refused:
-  cys.exe(vacate-locked)`(vacate 전 슬롯 거부 :272-283). "성공" 주장은 없다.
+  cys.exe(vacate-locked)`(vacate 전 슬롯 거부 = `cys_pl_stick` 종단). "성공" 주장은 없다.
 - **이미지 잠금(실행 중 프로세스)** — 덮어쓰기·삭제는 거부되지만 **rename 은 허용**된다
   (로드된 PE 이미지의 Windows 특성). 훅은 정식을 prev 슬롯으로 rename 해 비우고 검증된
   `.new` 를 세운다 → **성공**. 이것이 2026-08-28 실사고(잠긴 구 CLI 위로 영원한 exit 4)의
   수리 표적이며, CI 회귀는 `windows-build.yml` **T4-14** 가 상시로 잰다.
 
 **P6-a. 핸들 잠금 ⇒ exit 4 + 구본 무손상**
+(★R2 라운드2: 이 항목은 CI 로도 기계화됐다 — `windows-build.yml` **T4-15** 가 FileShare Read
+핸들로 cysd 를 잠근 업그레이드에서 exit 4 + §3 4토큰 + 트랜잭션 undo(`not-updated: cys.exe`)
++ 구본 무손상 + 해제 후 재실행 치유까지 상시로 잰다. 아래 수동 절차는 실기 검증용으로 유지.)
 
 ```powershell
 $INST = "$env:LOCALAPPDATA\cys"
@@ -272,7 +281,7 @@ Start-Process "<...>-setup.exe" -ArgumentList '/S' -Wait   # 핸들 해제 후 �
 | 구본이 동작 불능 | **FAIL** — 거부가 기계를 망가뜨렸다, 즉시 보고 |
 
 > ★공유 모드 주의: 위 명령의 셋째 인자(FileShare)가 `Read` 인 것이 요점이다 — 오라클의
-> 읽기 프로브(:141-143)는 통과시키고 rename 만 거부하는, 실세계 AV 잠금의 재현이다.
+> 읽기 프로브(`CYS_ORACLE` 의 FileOpen)는 통과시키고 rename 만 거부하는, 실세계 AV 잠금의 재현이다.
 > 완전 배타(`'None'`) 핸들로 시험하면 오라클·최종 바닥 점검의 **읽기 프로브 자체가 실패**해
 > fail-closed 규약(측정 불능 ≠ 통과)에 따라 `unrecoverable:` 보고(exit 3)로 끝난다 —
 > 파일은 그대로 있으니 기계는 무손상이지만, 판정 코드가 3 으로 달라지는 것이 정상이다.
@@ -323,9 +332,9 @@ Test-Path "$env:LOCALAPPDATA\cys\cys-install-failure.txt"    # False 여야 한�
 ## P9 — 제거(uninstall) 회귀
 
 설정 → 앱 → cys 제거 → 다음이 남지 않아야 한다. (제거는 의도적 전면 종료다 — 세션 보존
-대상이 아니며, PREUNINSTALL 이 잔해를 **이름 스코프 와일드카드**로 정리한다: `.new.exe` 3종
-:715-717 · `<bin>.prev*.exe`(고정 슬롯 + tick 슬롯) :718-720 · 마커 2종 :721-722 ·
-`runtime\` 트리 :701. `$INSTDIR` 에는 사용자 데이터가 있어 광범위 와일드카드는 쓰지 않는다.)
+대상이 아니며, PREUNINSTALL 이 잔해를 **이름 스코프 와일드카드**로 정리한다: `.new.exe` 3종 ·
+`<bin>.prev*.exe`(고정 슬롯 + tick 슬롯) · 마커 2종 · `runtime\` 트리(`RMDir /r`) —
+PREUNINSTALL 의 taskkill 9행 뒤 Delete 블록. `$INSTDIR` 에는 사용자 데이터가 있어 광범위 와일드카드는 쓰지 않는다.)
 
 ```powershell
 Test-Path "$env:LOCALAPPDATA\cys\runtime"
@@ -338,7 +347,7 @@ Test-Path "$env:LOCALAPPDATA\cys\cys-installed-version.txt"
 다섯 줄 모두 비어 있거나 False = PASS.
 
 > 알려진 한계(무해·차기): tick 슬롯 이름(`cys.prev<숫자>.exe`)으로 **실행 중**인 lame-duck
-> 프로세스는 제거기의 고정 kill 목록(:694-711) 밖이라, 그 파일 하나가 삭제를 거부하고 남을
+> 프로세스는 제거기의 고정 kill 목록(PREUNINSTALL 의 taskkill 9행) 밖이라, 그 파일 하나가 삭제를 거부하고 남을
 > 수 있다(NSIS-CONTRACT §8). 보이면 프로세스 종료 후 수동 삭제 — FAIL 이 아니라 기록 대상.
 
 ---
@@ -348,9 +357,10 @@ Test-Path "$env:LOCALAPPDATA\cys\cys-installed-version.txt"
 ★2026-08-29 전면 재작성(W4). 종전 P10 의 주입법(레지스트리 `DisplayVersion` 위장)은 시험할
 기계가 사라졌다 — 지문 비교와 같은버전 **면제 기계 자체가 제거**됐고(훅에 `DisplayVersion`/
 마커 읽기가 더는 존재하지 않는다 — `cys-installed-version.txt` 는 쓰기 전용 정보성 마커
-:677), 판정은 정식 파일의 VERSIONINFO 를 직접 묻는 절대 오라클(:137-155)이다. 그 설계에서
+— `cys_post_ok` 에서만 쓴다), 판정은 정식 파일의 VERSIONINFO 를 직접 묻는 절대
+오라클(`CYS_ORACLE`)이다. 그 설계에서
 "구본 잔존 + 성공 보고" 조합은 종단이 없다: 오라클이 notfresh 로 판정한 바이너리는
-성공(스왑 완료·재검증 통과 :298-302)하거나, 토큰과 함께 exit 3/4 로 거부된다. 이 항목은
+성공(스왑 완료·⑦ `cys_pl_rv` 재검증 통과)하거나, 토큰과 함께 exit 3/4 로 거부된다. 이 항목은
 그 오라클의 **양방향**을 실기로 잰다.
 
 **P10-a. 같은 버전 재설치 = 조용한 성공(0.14.27 "영원한 exit 4 루프" 회귀 핀)**
@@ -360,7 +370,7 @@ $INST  = "$env:LOCALAPPDATA\cys"
 $setup = "<방금 설치한 것과 같은 -setup.exe 전체 경로>"
 # 정상 설치가 끝난 상태(P2 PASS 직후)에서, 같은 설치본을 무인으로 한 번 더:
 $before = @(Get-ChildItem $INST -Filter '*.prev*.exe').Count
-$p = Start-Process $setup -ArgumentList '/S' -PassThru -Wait; $p.ExitCode   # ★0 기대(오라클 단락 :193-199)
+$p = Start-Process $setup -ArgumentList '/S' -PassThru -Wait; $p.ExitCode   # ★0 기대(오라클 단락 `CYS_PLACE` ①)
 Test-Path "$INST\cys-install-failure.txt"                                   # False
 @(Get-ChildItem $INST -Filter '*.prev*.exe').Count                          # $before 보다 늘지 않아야 한다(스왑 미발생 = prev 신규 0 · cysd 스윕이 줄이는 것은 정상)
 & "$INST\cys.exe" --version                                                 # 같은(신) 버전
@@ -381,7 +391,7 @@ Get-Process cys,cysd,cys-app -ErrorAction SilentlyContinue | Stop-Process -Force
 Copy-Item "$env:SystemRoot\System32\cmd.exe" "$INST\cys.exe" -Force
 (Get-Item "$INST\cys.exe").VersionInfo.FileVersion          # 우리 버전이 아님을 확인
 
-$p = Start-Process $setup -ArgumentList '/S' -PassThru -Wait; $p.ExitCode   # 0 기대(notfresh → 스왑 :200-327)
+$p = Start-Process $setup -ArgumentList '/S' -PassThru -Wait; $p.ExitCode   # 0 기대(notfresh → 스왑 `cys_pl_need` 이후 ②~⑧)
 & "$INST\cys.exe" --version                                                 # ★신 버전(스탠드인이 아니라)
 Test-Path "$INST\cys-install-failure.txt"                                   # False
 ```
@@ -400,9 +410,9 @@ Test-Path "$INST\cys-install-failure.txt"                                   # Fa
 
 ## P11 — ★전원 차단 주입: 두 rename 사이에서 죽어도 다음 부팅이 정식을 수리한다 (신설 · W4)
 
-배치의 정식 부재 창은 "정식→prev rename(:244-285)" 과 "`.new`→정식 rename(:286-289)" 사이다.
+배치의 정식 부재 창은 "정식→prev rename(⑤ `cys_pl_vacate`)" 과 "`.new`→정식 rename(⑥ `cys_pl_fill`)" 사이다.
 정확히 그 순간 설치기가 죽으면(전원 차단·강제 종료) 디스크에는 **정식 없음 + `.new`(신본) +
-prev(구본)** 가 남는다 — 훅의 콜백(:496-506)은 프로세스가 죽으면 돌 수 없으므로, 이 상태의
+prev(구본)** 가 남는다 — 훅의 콜백(`.onInstFailed`/`.onUserAbort`)은 프로세스가 죽으면 돌 수 없으므로, 이 상태의
 복구선은 **cysd 부팅 회수 가드**(Wave 1 W1 · `src/bin/cysd/main.rs` sweep — 정식 부재 시
 잔해를 지우는 대신 ① `<bin>.new.exe`(크기 ≥ 64KiB) rename 승격 ② 없으면 최신 mtime 의
 `<bin>.prev*` 승격)다. 훅은 그 재료를 지우지 않고 남긴다(NSIS-CONTRACT §9-1: 무음 소실
@@ -437,6 +447,37 @@ Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force
 
 ---
 
+## 롤백 — 이전 버전으로 되돌리기 (R3 신설 · 절차 없이 실행 금지)
+
+> ★**prev 슬롯은 롤백 수단이 아니다.** `<bin>.prev*.exe` 는 배치 트랜잭션의 undo 재료이자
+> 위생 잔해이며, 성공한 업그레이드 뒤에는 두 겹으로 소멸한다: ①훅 커밋 직후의 best-effort
+> 정리(`CYS_SLOT_CLEANUP` — 3종 전부 성공한 뒤) ②다음 cysd 부팅 스윕(정식이 동작본이면 가족
+> prev 전량 정리 — `src/bin/cysd/main.rs` `plan_leftover_action` 의 SweepAll). 업그레이드 뒤
+> prev 가 남아 있대도 그것은 우연(잠금 거부·lame-duck 점유)이지 보장이 아니다.
+>
+> 유일한 실제 롤백 = **이전 버전 setup.exe 재실행**이다. 단 이전 설치기(v0.14.27 이하)는 이번
+> 릴리스가 제거한 두 kill 경로를 그대로 싣고 있다: PREINSTALL 의 `taskkill /F /T /IM
+> cys-app.exe`(트리 kill — GUI 가 떠 있으면 자식 cysd 와 전 pane 이 함께 죽는다) · 구 스왑
+> 매크로의 `taskkill /F /T` 최후 폴백(prev 3칸이 전부 막혔을 때 발화 — 업그레이드 직후
+> lame-duck 프로세스가 슬롯 파일을 점유 중인 기계가 정확히 그 상태다). **라이브 세션 위로
+> 그냥 돌리면 0.14.27 kill 의미론으로 되돌아간다.**
+
+**절차 — quiesce 선행(실패 파일 안내문과 같은 문구·순서):**
+
+1. 앱에서 cys 를 종료한다 — "Quit cys from the app (it saves sessions)".
+2. **10초 기다린다**("wait 10 s") — cysd 와 lame-duck 프로세스가 내려가 슬롯 점유·잠금이 풀린다.
+3. 이전 버전 `cys_<구버전>_x64-setup.exe` 를 실행한다. **제거(uninstall)는 하지 않는다** —
+   세션·데이터까지 걷어낸다.
+4. `cys --version` 으로 구버전 복귀를 확인한다.
+
+on-disk 문법은 하위 안전이다: 구 cysd(v0.14.27)의 잔해 문법은 "마지막 `.prev` 뒤 = 숫자 0개
+이상(+선택적 `.exe`)"라 이번 릴리스가 만드는 prev 슬롯 이름 전부(고정 `.prev[2|3].exe` ·
+tick `.prev<숫자>.exe`)와 잠금 스윕의 `.prev<rand>` 를 잔해로 정리하고, `<bin>.new.exe` 는 구
+소비자 전부에게 비활성이다(잔존해도 무해 — 다음 0.14.28+ 설치의 stale-`.new` Delete ② 가
+정리한다).
+
+---
+
 ## 결과 기록 양식
 
 | 항목 | PASS/FAIL | 메모 |
@@ -464,11 +505,11 @@ FAIL 이 하나라도 나오면 `%LOCALAPPDATA%\cys\cys-install-failure.txt` 와
 
 | 갭 | 상태 | 근거 |
 |---|---|---|
-| 정식 이름이 **빈 채로 남는 종단** | **닫힘(코드·3중)** | ①배치 실패 전수 슬롯 복귀(`CYS_RESTORE_SLOT` :165-183·undo :329-360) ②콜백+최종 바닥 점검(:376-444·:496-506) ③cysd 부팅 회수 가드(Wave 1 W1 — 설치기 밖 2차 복구선). P1·P4·P11 이 실기로 잰다 |
-| **구본 잔존 미탐**(반쪽 업그레이드를 성공 보고) | **닫힘(코드·설계 교체)** | 지문 대조 폐기 → 절대 오라클(VERSIONINFO == 컴파일 상수 :131-149) + 배치 후 재검증(:298-302). notfresh 종단은 전부 exit 3/4 + 토큰. P10 이 양방향을 잰다 |
-| **같은 버전 재설치 → 영원한 exit 4 루프**(2026-08-28 실사고) | **닫힘(코드)** | 면제 기계 제거 + 오라클 단락(:193-199) — "이미 이번 빌드" 는 무행동 성공. P10-a·CI T4-4 |
-| **이미지 잠금 하 업그레이드 실패**(잠긴 구 CLI 위로) | **닫힘(코드)** | `.new` 추출→rename 2단은 잠긴 정식을 덮지 않고 대피시킨다(:238-283). P6-b·CI T4-14 |
-| **전이 창 자체** | **좁힘(rename 2회 사이 수 ms)** | copy 채움 폐기 — 채움도 rename(:286-289). copy 는 undo 복귀 경로에만 잔존(:168). 잔여 창은 P11 의 부팅 가드가 받친다 |
-| 핸들 잠금(delete 비공유) 기계 | **의도된 거부(exit 4)** | rename 조차 불가한 잠금은 우회 불가 — 구본 무손상으로 거부하고 재실행 안내(:273-277·:620-621). P6-a |
-| 스테이징 사본이 **추출 후에 손상**되는 경우(AV 절단 등) | **좁힘** | `.new` 검증(존재·≥64KiB·버전 :210-222) + 배치 후 오라클 재검증(:298-302)이 잡는다. VERSIONINFO 리소스가 온전한 채 본문만 손상된 파일은 여전히 통과 가능 — 잔여 갭(정직 고지) |
+| 정식 이름이 **빈 채로 남는 종단** | **닫힘(코드·3중)** | ①배치 실패 전수 슬롯 복귀(`CYS_RESTORE_SLOT`·undo `CYS_UNPLACE`) ②콜백+최종 바닥 점검(`CYS_ABORT_RESCUE`·`CYS_LASTDITCH`) ③cysd 부팅 회수 가드(Wave 1 W1 — 설치기 밖 2차 복구선). P1·P4·P11 이 실기로 잰다 |
+| **구본 잔존 미탐**(반쪽 업그레이드를 성공 보고) | **닫힘(코드·설계 교체)** | 지문 대조 폐기 → 절대 오라클(VERSIONINFO == 컴파일 상수 = `CYS_ORACLE`) + 배치 후 재검증(⑦ `cys_pl_rv`). notfresh 종단은 전부 exit 3/4 + 토큰. P10 이 양방향을 잰다 |
+| **같은 버전 재설치 → 영원한 exit 4 루프**(2026-08-28 실사고) | **닫힘(코드)** | 면제 기계 제거 + 오라클 단락(`CYS_PLACE` ①) — "이미 이번 빌드" 는 무행동 성공. P10-a·CI T4-4 |
+| **이미지 잠금 하 업그레이드 실패**(잠긴 구 CLI 위로) | **닫힘(코드)** | `.new` 추출→rename 2단은 잠긴 정식을 덮지 않고 대피시킨다(③ 추출 → ⑤ `cys_pl_vacate`). P6-b·CI T4-14 |
+| **전이 창 자체** | **좁힘(rename 2회 사이 수 ms)** | copy 채움 폐기 — 채움도 rename(⑥ `cys_pl_fill`). copy 는 undo 복귀 경로에만 잔존(`CYS_RESTORE_SLOT` 의 copy 강등). 잔여 창은 P11 의 부팅 가드가 받친다 |
+| 핸들 잠금(delete 비공유) 기계 | **의도된 거부(exit 4)** | rename 조차 불가한 잠금은 우회 불가 — 구본 무손상으로 거부하고 재실행 안내(`cys_pl_stick` 거부 종단 · 안내문 = NSIS-CONTRACT §3 Action 동결문). P6-a |
+| 스테이징 사본이 **추출 후에 손상**되는 경우(AV 절단 등) | **좁힘** | `.new` 검증(존재·≥64KiB·버전 = ④) + 배치 후 오라클 재검증(⑦)이 잡는다. VERSIONINFO 리소스가 온전한 채 본문만 손상된 파일은 여전히 통과 가능 — 잔여 갭(정직 고지) |
 | **실기 실행 검증** | **부분 닫힘(CI)** | `windows-build.yml` T4 레인(T4-1~14)이 실기 1차 검증 — 단 CI 는 같은 버전 재설치라 실제 구→신 업그레이드·GUI 경로는 이 문서(P1~P11) 1회 완주가 여전히 필요 |
