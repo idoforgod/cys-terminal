@@ -758,3 +758,15 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/tests/nsis-hook-compile/run.sh
+
+      # W7 (2026-08-29): 훅 배치 상태기계의 전수 분기 모델. 증명 범위 = "미러 +
+      # census 가드", 그 이상이 아니다: green 은 (a) 훅의 파이썬 미러가 모든 실패
+      # 조합·중단에서 I1/I3/I4 를 지켰고(+심층 레인 커버리지 핀 34종), (b) 훅 실물이
+      # 핀 시점에서 표류하지 않았다(매크로 집합·앵커·토큰 + 정규화 본문 해시 +
+      # POSTINSTALL !insertmacro 시퀀스 — 어느 하나라도 표류하면 exit 2)까지를
+      # 뜻한다. 훅 자체의 실행 증거가 아니다(실기 실행은 windows-build.yml T4 축).
+      - name: NSIS 훅 배치 상태기계 모델 — 전수 분기 + 불변식 (W7)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/tests/nsis-hook-model/model.py
