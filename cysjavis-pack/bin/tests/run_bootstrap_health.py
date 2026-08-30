@@ -9688,7 +9688,7 @@ def h_seed_u19():
 
     # ⓔ GUI 결합 실측 — 인앱 업데이트가 여전히 --no-install-hook 인가(도달성 논거의 전제)
     gui = _repo_file(os.path.join("src-tauri", "src", "main.rs"))
-    need('init_cmd.arg("init-pack").arg("--no-install-hook");' in gui,
+    need('sealed_sidecar_cys(&["init-pack", "--no-install-hook"])' in gui,
          "GUI 인앱 업데이트의 init-pack 호출 형태가 바뀌었다 — U-19 도달성 논거 재검토 필요")
     need("U-19 도달성 앵커" in gui, "GUI 쪽 결합 앵커 주석이 사라졌다(다음 사람이 순서를 뒤집는다)")
     notes.append("GUI 업데이트 경로 --no-install-hook 확인")
@@ -9818,7 +9818,7 @@ def h_timeout_u29():
 
     # ⓒ GUI 결합 실측 — 인앱 업데이트가 여전히 그 플래그로 내려오는가(도달성 논거의 전제)
     gui = _repo_file(os.path.join("src-tauri", "src", "main.rs"))
-    need('init_cmd.arg("init-pack").arg("--no-install-hook");' in gui,
+    need('sealed_sidecar_cys(&["init-pack", "--no-install-hook"])' in gui,
          "GUI 인앱 업데이트의 init-pack 호출 형태가 바뀌었다 — M-09-a 도달성 논거 재검토 필요")
     notes.append("GUI 업데이트 경로 --no-install-hook 확인")
 

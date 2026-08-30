@@ -2460,7 +2460,10 @@ fn create_capture_segment(
 fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
     let dst = dir.join(format!("{rel}.user"));
     let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
-    std::fs::copy(src, &tmp).map_err(|e| format!("바이트 백업 복사 실패 {}: {e}", tmp.display()))?;
+    std::fs::copy(src, &tmp).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("바이트 백업 복사 실패 {}: {e}", tmp.display())
+    })?;
     std::fs::rename(&tmp, &dst).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("바이트 백업 rename 실패 {}: {e}", dst.display())
