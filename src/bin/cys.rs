@@ -15026,7 +15026,11 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
                 let Ok(rel_path) = p.strip_prefix(&prev) else { continue };
                 let rel_s = rel_path.to_string_lossy().replace('\\', "/");
                 // 관리 파일·병치 파일은 후보에서 제외(사용자 멘탈모델 = 팩 본 파일).
-                if rel_s.starts_with('.') || rel_s.ends_with(".user") || rel_s.ends_with(".new") {
+                // ★T3(D12): .base(충돌 조상 사이드카)도 제외 — 무검증 복원 시 사후 3-way 조상
+                // 재료 오염 벡터(pack.prev 전량 복사로 유입 확정 실측).
+                if rel_s.starts_with('.') || rel_s.ends_with(".user") || rel_s.ends_with(".new")
+                    || rel_s.ends_with(".base")
+                {
                     continue;
                 }
                 let prev_bytes = std::fs::read(&p).unwrap_or_default();
@@ -15239,6 +15243,7 @@ fn run_doctor_custom_report() -> i32 {
             }
             let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
             if rel.starts_with('.') || rel.ends_with(".user") || rel.ends_with(".new")
+                || rel.ends_with(".base") // ★T3(D12): 충돌 조상 사이드카 — 자작 파일 아님(관리 파일)
                 || rel.starts_with("memory/") || rel.starts_with("round/")
                 || embedded.contains(rel.as_str())
             {

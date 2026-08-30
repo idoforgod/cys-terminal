@@ -2193,15 +2193,23 @@ pub fn plan_install(
         let path = dir.join(rel);
         let exists = path.exists();
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let mh = manifest.get(rel).map(String::as_str);
+        // ★T3(D9) base lazy 로드 사전 필터 — 이 필터는 **과대포함만 허용**(과소포함=Merge3 침묵
+        // 불발) · decide L3 가 최종 판정. 드리프트 파일에서만 pristine read 가 발생한다(전 파일
+        // read+hash 2배화 회귀 방지 — 실측 통상 0~10건).
+        let verified_base: Option<String> = match (exists, disk.as_deref(), mh) {
+            (true, Some(d), Some(m)) if d != content => load_verified_base(dir, rel, m),
+            _ => None,
+        };
         match decide_file_action(
             rel,
             content,
             exists,
             disk.as_deref(),
-            manifest.get(rel).map(String::as_str),
+            mh,
             force,
             scope,
-            None, // verified_base — base 로드 IO 는 T3.
+            verified_base.as_deref(),
         ) {
             FileAction::Write { heal_user_copy: true } => plan.heal.push(rel.to_string()),
             FileAction::Write { heal_user_copy: false } => {
@@ -2379,15 +2387,97 @@ fn create_tmp_with_mode(tmp: &Path, _mode: Option<u32>) -> std::io::Result<std::
 /// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
 /// **디스크에 실제 적용된** vendor 내용일 때만 호출된다 — user-owned 동결 파일에는 호출하지
 /// 않아 조상이 사용자가 fork 한 시점의 vendor 본으로 남는다(3-way 정확성의 핵심).
+/// ★T3(D8): 본문은 ensure_pristine_checked 로 승격 이관 — 이 래퍼가 기존 호출 2곳(Keep adopt·
+/// 공용 write)과 KeepDrift 백필의 best-effort 계약을 자구 그대로 보존한다.
 fn ensure_pristine(dir: &Path, rel: &str, content: &str) {
+    let _ = ensure_pristine_checked(dir, rel, content);
+}
+
+/// ★T3(D8): ensure_pristine 의 검증형 — 동일 본문·에러 승격. 소비자는 Merge3 성공 경로(④)
+/// 하나다: pristine 전진 실패는 다음 릴리스의 base 소실이므로 침묵 불가 — 실패 시 ④를 중단하고
+/// healed 폴백으로 강등한다(손실 0 · v2 §4).
+fn ensure_pristine_checked(dir: &Path, rel: &str, content: &str) -> Result<(), String> {
     let p = dir.join(PRISTINE_DIR).join(rel);
     if std::fs::read_to_string(&p).ok().as_deref() == Some(content) {
-        return;
+        return Ok(());
     }
     if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("pristine 디렉터리 생성 실패 {}: {e}", parent.display()))?;
     }
-    let _ = write_atomic(&p, content.as_bytes());
+    write_atomic(&p, content.as_bytes())
+        .map_err(|e| format!("pristine 기록 실패 {}: {e}", p.display()))
+}
+
+/// ★T3(D5 · v2 §4 ①): 캡처 루트 — env_compat("CYS_PACK_CAPTURES_DIR") 오버라이드 우선, 기본 =
+/// 설치 대상 dir 의 형제 `pack-captures`(라이브 = ~/.cys/pack-captures — local_dir 전례 동형).
+/// ★pack_dir() 직접 사용 금지(W0-a): 테스트 빌드 env 미설정 panic + staged 설치(dir=staging)
+/// 비수렴 — 반드시 install_into 의 dir 에서 유도한다(staging.parent()==실팩.parent() 실측).
+/// 팩 밖 경로라 write_journal·rollback·prune·pack.prev 전 기계 무접촉 = **트랜잭션 롤백을
+/// 생존하는 증거 저장소**(MERGE_AUDIT 비저널 전례 동형). 캡처 GC 없음(0.14.29 · D15 — 릴리스
+/// 노트 이월 기재).
+pub(crate) fn pack_captures_dir(dir: &Path) -> PathBuf {
+    if let Some(d) = crate::env_compat("CYS_PACK_CAPTURES_DIR") {
+        return PathBuf::from(d);
+    }
+    match dir.parent() {
+        Some(parent) => parent.join("pack-captures"),
+        None => PathBuf::from("pack-captures"),
+    }
+}
+
+/// ★T3(D5): 스윕당 배타 캡처 세그먼트 — `<root>/<pack-basename>/<unix_secs>-<pid>[-n]`.
+/// 배타 fs::create_dir 로 같은 초 재스윕(크래시 직후 재기동)이 최초 사용자본 캡처를 덮는 창을
+/// 봉인한다 — AlreadyExists 는 -1,-2… 접미 루프(결정론·플랫폼 무관 · 콜론 없는 Windows 안전
+/// 명명). 반환 = (절대 경로, 캡처 루트 상대 세그먼트). Err = 캡처 불가(호출자가 healed 폴백 —
+/// §2 원칙 4: 캡처 없이는 병합하지 않는다).
+fn create_capture_segment(
+    root: &Path,
+    pack_basename: &str,
+    now_ts: u64,
+) -> Result<(PathBuf, String), String> {
+    let lane = root.join(pack_basename);
+    std::fs::create_dir_all(&lane)
+        .map_err(|e| format!("캡처 레인 생성 실패 {}: {e}", lane.display()))?;
+    let base_name = format!("{}-{}", now_ts, std::process::id());
+    for n in 0..=999u32 {
+        let name = if n == 0 { base_name.clone() } else { format!("{base_name}-{n}") };
+        let seg = lane.join(&name);
+        match std::fs::create_dir(&seg) {
+            Ok(()) => return Ok((seg, format!("{pack_basename}/{name}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("캡처 세그먼트 생성 실패 {}: {e}", seg.display())),
+        }
+    }
+    Err(format!("캡처 세그먼트 접미 소진(-999): {}", lane.join(&base_name).display()))
+}
+
+/// ★T3(D4): 판독 불가(disk=None) 파일의 바이트 백업 — 기존 `<rel>.user` 슬롯 재사용.
+/// fs::copy 직접 덮어쓰기가 아니라 tmp+copy+rename 원자화(복사 중 크래시의 반파 .user 창 봉인 —
+/// 단일 슬롯 의미론 자체는 유지 · 세대 백업은 0.14.30 회부). 문자열 경로의 read_to_string 멱등
+/// 가드는 비UTF-8 .user 에서 항상 불일치 판정이라 재사용 불가 — 바이트 경로는 무조건 복사한다
+/// (치유 성공 후 L1 재도달 없음 — 재복사는 재손상 시에만).
+fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
+    let dst = dir.join(format!("{rel}.user"));
+    let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
+    std::fs::copy(src, &tmp).map_err(|e| format!("바이트 백업 복사 실패 {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("바이트 백업 rename 실패 {}: {e}", dst.display())
+    })
+}
+
+/// ★T3(D9 · v2 §2 원칙 3): 검증 base lazy 로드 — `.pristine/<rel>` 을 읽어
+/// `content_hash(pristine)==manifest_hash` 일 때만 Some. 불일치·부재·판독 실패 = None = 병합
+/// 미시도(decide L4 종전 거동 낙하) — 크래시·원장 손상·연쇄 릴리스 스큐가 전부 이 게이트에서
+/// "틀린 base 병합" 대신 손실 0 폴백으로 강등된다.
+fn load_verified_base(dir: &Path, rel: &str, manifest_hash: &str) -> Option<String> {
+    let pristine = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel)).ok()?;
+    if content_hash(&pristine) == manifest_hash {
+        Some(pristine)
+    } else {
+        None
+    }
 }
 
 /// PACK 템플릿 설치 (CLI init-pack과 데몬 첫 기동 자동 설치의 공용 코어).
@@ -2935,6 +3025,14 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // 병합 대기 원장(.user/.new)에는 잡히지 않는 등급이라, 여기서 따로 세지 않으면 같은 실행의
     // 사용자 보고("내 커스텀은 지워지지 않았습니다")가 이 파일들을 침묵으로 빠뜨린다.
     let mut unreadable_kept: Vec<String> = Vec::new();
+    // ★T3(D5) Merge3 캡처 상태(스윕당 1세그먼트 · 지연 생성): 첫 병합 시 배타 생성 — 같은 스윕의
+    // 후속 병합 파일은 같은 세그먼트 아래 <rel> 로 쌓인다. 원장 capture = 캡처 루트 상대 경로.
+    let captures_root = pack_captures_dir(&dir);
+    let pack_basename = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pack".to_string());
+    let mut capture_seg: Option<(PathBuf, String)> = None;
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
@@ -2955,9 +3053,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             None
         };
         let content: &str = seed_override.as_deref().unwrap_or(content);
+        // ★T3(D9) base lazy 로드 사전 필터 — 과대포함만 허용(과소포함=Merge3 침묵 불발) ·
+        // decide L3 가 최종 판정. 드리프트 파일 한정 IO(전 파일 pristine read 회귀 방지).
+        let verified_base: Option<String> = match (exists, disk.as_deref(), mhash.as_deref()) {
+            (true, Some(d), Some(m)) if d != content => load_verified_base(&dir, rel, m),
+            _ => None,
+        };
         match decide_file_action(
             rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope,
-            None, // verified_base — base 로드 IO 는 T3.
+            verified_base.as_deref(),
         ) {
             FileAction::Keep { adopt_hash, new_pending } => {
                 if adopt_hash {
@@ -3032,6 +3136,13 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 }) {
                     upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                 }
+                // ★T3 pristine 백필 가드(v2 §4 · v1 감사 D3 — best-effort): .pristine/<rel> 부재 ∧
+                // manifest[rel]==hash(embed)(L2 도달 조건이 이미 증명) → embed 로 백필. 해시
+                // 등식이 embed==마지막 적용 vendor 임을 바이트 수준으로 증명하므로 안전(다음
+                // 릴리스 L3 base 재료 — pristine 부재 레거시 코호트의 병합 진입로).
+                if !dir.join(PRISTINE_DIR).join(rel).exists() {
+                    ensure_pristine(&dir, rel, content);
+                }
                 if unreadable {
                     unreadable_kept.push(rel.to_string());
                 }
@@ -3039,15 +3150,141 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 continue;
             }
             FileAction::Merge3 => {
-                // ★T2 스텁: Write{heal_user_copy:true} 본문과 자구 동형(공용 write 낙하 포함) —
-                // 병합 실행부는 T3. 런타임 도달 불가(호출자 verified_base=None) — match 망라성 전용.
-                // system 강제 치유(P0-4)·force 갱신이 사용자 수정본을 덮기 **전에** 보존(파괴 0).
-                if let Some(d) = disk.as_deref() {
+                // ★T3 실행부(v2 §4 · D10): 검증된 조상 위 자동 3-way 병합. 성공(④)은 자체 continue
+                // 종결 — 공용 write 낙하 재사용 불가(성공 경로는 disk←merged·pristine←embed·
+                // manifest←hash(embed) 로 세 값이 갈라진다 · 성찰 실측). 실패 5경로(캡처·충돌·
+                // json 게이트·손상 의심·pristine 검증형)는 전부 ⑤ healed 폴백 = 현행 Write{heal:
+                // true} 경로 동형 낙하(.user 보존 + vendor 기록 + 원장 conflicted{base_side} +
+                // <rel>.base 조상 사이드카) — 어떤 실패도 "0.14.28 처럼 동작"으로 강등될 뿐 손실 0.
+                let fallback_reason: String; // ⑤ 원장 reason 토큰(T4 doctor 소비) — 전 ⑤ 경로 확정 대입
+                let mut fallback_user_src: Option<String> = None; // pristine-write-failed 만 merged
+                let gates: Result<String, String> = (|| {
+                    let (Some(base), Some(ours)) = (verified_base.as_deref(), disk.as_deref())
+                    else {
+                        // 방어 낙하(도달 불가 — decide L3 가 base·disk 실재를 보장).
+                        return Err("merge-fallback".to_string());
+                    };
+                    // ① 캡처: 사용자본 전문 → 팩 밖 캡처 세그먼트. 실패 = 병합 미시도 → ⑤
+                    //   (§2 원칙 4 — 캡처 없이는 병합하지 않는다) · 감사 append 만 best-effort.
+                    if capture_seg.is_none() {
+                        match create_capture_segment(&captures_root, &pack_basename, now_ts) {
+                            Ok(seg) => capture_seg = Some(seg),
+                            Err(e) => {
+                                eprintln!("[init-pack] ⚠ 병합 캡처 불가({rel}): {e} — 병합 미시도·healed 폴백");
+                                return Err("capture-failed".to_string());
+                            }
+                        }
+                    }
+                    let cap_path = capture_seg.as_ref().unwrap().0.join(rel);
+                    if let Some(parent) = cap_path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("[init-pack] ⚠ 병합 캡처 불가({rel}): {e} — 병합 미시도·healed 폴백");
+                            return Err("capture-failed".to_string());
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&cap_path, ours.as_bytes()) {
+                        eprintln!("[init-pack] ⚠ 병합 캡처 불가({rel}): {e} — 병합 미시도·healed 폴백");
+                        return Err("capture-failed".to_string());
+                    }
+                    if let Err(e) = append_merge_audit(
+                        &dir,
+                        &serde_json::json!({
+                            "kind": "pre-merge-capture", "rel": rel,
+                            "sha": content_hash(ours), "base_sha": content_hash(base),
+                            "theirs_sha": content_hash(content),
+                        }),
+                    ) {
+                        // best-effort 전례 동형(cys.rs audit closure) — loud 경고 후 계속.
+                        eprintln!("[init-pack] 감사 원장 기록 실패(계속 진행): {e}");
+                    }
+                    // ② 병합: diffy 순수 Rust(셸아웃 0) — 충돌 마커 = ⑤.
+                    let merged = match crate::merge3::merge3(base, ours, content) {
+                        crate::merge3::Merge3Outcome::Clean(m) => m,
+                        crate::merge3::Merge3Outcome::Conflict(_) => {
+                            return Err("merge-conflict".to_string())
+                        }
+                    };
+                    // ③ 게이트: *.json 파스 + 손상 의심 휴리스틱(clean-but-wrong 차단 · 이식 ⑥).
+                    if !crate::merge3::json_gate(rel, &merged) {
+                        return Err("json-gate".to_string());
+                    }
+                    if let Some(rsn) = crate::merge3::suspect_damage(base, ours, &merged) {
+                        return Err(format!("suspect:{rsn:?}"));
+                    }
+                    Ok(merged)
+                })();
+                match gates {
+                    Ok(merged) => {
+                        // ④ 기록(성공): disk←merged → pristine←embed(검증형 — 실패는 다음 릴리스
+                        // base 소실이므로 ⑤ 강등) → manifest←hash(embed) → 원장 merged → continue.
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                        }
+                        write_atomic(&path, merged.as_bytes())
+                            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                        match ensure_pristine_checked(&dir, rel, content) {
+                            Ok(()) => {
+                                manifest.insert(rel.to_string(), content_hash(content));
+                                if pending
+                                    .get(rel)
+                                    .and_then(|e| e.get("kind"))
+                                    .and_then(|k| k.as_str())
+                                    == Some("new-pending")
+                                {
+                                    pending.remove(rel);
+                                    pending_dirty = true;
+                                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                                }
+                                let capture_rel =
+                                    format!("{}/{rel}", capture_seg.as_ref().unwrap().1);
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "merged", "side": rel, "capture": capture_rel,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                                // merged 도 이 스윕이 쓴 파일이다(written+kept=처리 파일 수 불변식).
+                                // 병합 건수 가시화는 원장 kind 계상(W-E2/부트 요약)이 담당.
+                                written += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[init-pack] ⚠ pristine 전진 실패({rel}): {e} — healed 폴백 강등(디스크에는 병합본 — .user 소스=병합본 · ours 원본은 캡처 보존)"
+                                );
+                                fallback_reason = "pristine-write-failed".to_string();
+                                fallback_user_src = Some(merged);
+                            }
+                        }
+                    }
+                    Err(reason) => fallback_reason = reason,
+                }
+                // ⑤ healed 폴백 — 현행 Write{heal:true} 경로 동형 낙하 + 충돌 계보 사이드카.
+                //   .user 소스 = 그 시점의 디스크 실체(통상 ours=디스크 원본 · pristine-write-failed
+                //   만 이미 기록된 merged — v2 §4 크래시표 2행 정합 · ours 원본은 ①캡처가 별도 보존).
+                let user_src: Option<String> = fallback_user_src.or_else(|| disk.clone());
+                if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
                     if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
                         let _ = write_atomic(&user_path, d.as_bytes());
                     }
-                    upsert_pending(&mut pending, &mut pending_dirty, rel, "healed", format!("{rel}.user"));
+                    // 충돌 조상 사이드카 <rel>.base — base 전문 기록(사후 3-way 재료 영구 보존 ·
+                    // 이식 ① C안 요소 · backup_set side_paths 등재로 rollback 원자성 편입).
+                    if let Some(b) = verified_base.as_deref() {
+                        let base_path = dir.join(format!("{rel}.base"));
+                        if std::fs::read_to_string(&base_path).ok().as_deref() != Some(b) {
+                            let _ = write_atomic(&base_path, b.as_bytes());
+                        }
+                    }
+                    if let serde_json::Value::Object(entry) = serde_json::json!({
+                        "kind": "conflicted", "side": format!("{rel}.user"),
+                        "base_side": format!("{rel}.base"),
+                        "reason": fallback_reason,
+                        "version": target_version, "ts": now_ts,
+                    }) {
+                        upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                    }
                 }
             }
             FileAction::Write { heal_user_copy } => {
@@ -3065,6 +3302,49 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                             "version": target_version, "ts": now_ts,
                         }) {
                             upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
+                    } else if exists {
+                        // ★T3 L0/L1 실행부(v2 §3 · §2 원칙 4 · D4·D11): 판독 불가(disk=None) —
+                        // 문자열 백업이 구조적으로 못 뜨던 유일 무백업 파괴 edge 를 바이트 백업
+                        // (tmp+copy+rename 원자화)으로 봉인한다.
+                        match byte_backup_user(&dir, rel, &path) {
+                            Ok(()) => {
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "side": format!("{rel}.user"),
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            Err(e) if system_locked(rel) => {
+                                // ★L0(v2 §3): 보안 자산은 백업 실패에도 치유 강행(무결성>보존 —
+                                // §2 원칙 4 의 명시 예외). 원장 side 는 **실백업 성공 시에만**
+                                // "{rel}.user" — 실패는 side 없이 backup:"failed" 기록(존재하지
+                                // 않는 .user 를 '보존됨'으로 오보하지 않는다 · D11).
+                                eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 바이트 백업 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "healed", "backup": "failed",
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                            }
+                            Err(e) => {
+                                // ★D11 quarantined 전이(fail-closed): 백업 없이는 덮지 않는다 —
+                                // write/manifest.insert/ensure_pristine/written 증가 전부 스킵.
+                                // manifest 미전진 = 재스윕 L1 재도달(수렴 조건 — 전진시키면 자동갱신
+                                // fast-path 가 손상본을 비수정으로 오판할 수 있다).
+                                eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 판독 불가 + 백업 실패({e}). 파일 무접촉 보존 — UTF-8 회복(또는 백업 가능 회복) 후 재스윕 시 정상 치유 대상.");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "quarantined", "reason": "backup-failed", "side": rel,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                                unreadable_kept.push(rel.to_string());
+                                kept += 1;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -3637,6 +3917,7 @@ where
                 format!("{}/{rel}", PRISTINE_DIR),
                 format!("{rel}.new"),
                 format!("{rel}.user"),
+                format!("{rel}.base"), // ★T3(v2 §4 ⑤): 충돌 조상 사이드카 — rollback 원자성 편입
             ]
         })
         .collect();
@@ -4611,10 +4892,30 @@ mod tests {
         let kd_embed = PACK_ALL.iter().find(|(r, _)| *r == kd_rel).map(|(_, c)| *c)
             .expect("팩에 CLAUDE.md.template 부재(system 픽스처)");
         std::fs::write(td.join(kd_rel), "KD-DRIFT-EDIT").unwrap();
+        // ★T3(커밋② · D9·D10): 병합 성공 경로 plan=actual — `.pristine` 실재+검증 통과 픽스처
+        // (현행 픽스처는 pristine 부재라 병합 경로가 무검증이던 사각의 봉인 · v1 감사 D6).
+        // base = 임베드 머리에 LEGACY 헤더를 얹은 구본 · ours = base⊕꼬리 δ · theirs = 임베드
+        // (머리 제거) — 머리/꼬리 분리라 clean 병합 = 임베드⊕δ.
+        let m3_rel = "directives/CEO_TEMPLATE.md";
+        let m3_embed = PACK_ALL.iter().find(|(r, _)| *r == m3_rel).map(|(_, c)| *c)
+            .expect("팩에 CEO_TEMPLATE.md 부재(system 픽스처)");
+        let m3_base = format!("LEGACY-HEADER\n{m3_embed}");
+        let m3_ours = format!("LEGACY-HEADER\n{m3_embed}M3-USER-TAIL\n");
+        {
+            let p = td.join(m3_rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &m3_ours).unwrap();
+            let pp = td.join(PRISTINE_DIR).join(m3_rel);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, &m3_base).unwrap();
+        }
+        // 캡처는 td 내부로 격리(공유 temp 오염 방지 — env 오버라이드 경로 검증 겸용).
+        let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", td.join("cap-root"));
         let manifest = serde_json::json!({
             "README.md": content_hash("OLD-INSTALLED"),
             "soul.md": content_hash("OLD-SOUL-BASE"),
             kd_rel: content_hash(kd_embed),
+            m3_rel: content_hash(&m3_base),
         });
         std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
 
@@ -4627,6 +4928,9 @@ mod tests {
         assert!(plan.kept_drift.iter().any(|r| r == kd_rel),
                 "★T3: system 수정+vendor 미전진 → kept_drift 버킷");
         assert!(!plan.heal.iter().any(|r| r == kd_rel), "kept-drift 를 heal 로 오보 금지(R7)");
+        assert!(plan.merge3.iter().any(|r| r == m3_rel),
+                "★T3(커밋②): 수정+vendor 전진+검증 base → merge3 버킷");
+        assert!(!plan.heal.iter().any(|r| r == m3_rel), "merge3 를 heal 로 오보 금지(R7)");
         // 실제 install 이 플랜과 같은 행동을 하는지 대조.
         install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
@@ -4635,11 +4939,18 @@ mod tests {
         assert!(td.join("alerts-config.json.user").exists());
         // ★T3 plan=actual 확장: kept-drift 는 제자리 보존 + 원장 계상(파일 쓰기 0).
         assert_eq!(read(kd_rel), "KD-DRIFT-EDIT", "kept-drift 제자리 보존(plan=actual)");
+        let pend = load_merge_pending(&td);
         assert_eq!(
-            load_merge_pending(&td).get(kd_rel).and_then(|e| e["kind"].as_str()),
+            pend.get(kd_rel).and_then(|e| e["kind"].as_str()),
             Some("kept-drift"),
             "kept-drift 원장 계상(plan=actual)"
         );
+        // ★T3(커밋②) plan=actual 병합 확장: install 후 disk=병합본 · 원장 merged · pristine 전진.
+        assert_eq!(read(m3_rel), format!("{m3_embed}M3-USER-TAIL\n"),
+                   "병합 성공: disk = 임베드⊕δ (plan=actual)");
+        assert_eq!(pend.get(m3_rel).and_then(|e| e["kind"].as_str()), Some("merged"),
+                   "merged 원장 계상(plan=actual)");
+        assert_eq!(read(&format!("{PRISTINE_DIR}/{m3_rel}")), m3_embed, "pristine = 임베드 전진");
 
         let _ = std::fs::remove_dir_all(&td);
     }
@@ -4695,6 +5006,29 @@ mod tests {
         assert_eq!(std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap(), bytes,
                    "at-rest 재스윕이 원장을 rewrite(멱등 위반)");
 
+        // ★T3(커밋②) healed 쪽: 크래시 광폭 창(disk=병합본·pristine=E1·manifest=hash(E0)) 재스윕
+        // → base 검증 실패 → L4 healed — kind 는 전환되지만 capture 는 승계된다(소실 금지 · D7).
+        let e0 = "VENDOR-V0\ncommon\n";
+        {
+            let pp = pd.join(PRISTINE_DIR).join(rel);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, e1).unwrap();
+        }
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash(e0) }).to_string(),
+        )
+        .unwrap();
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        let pend2 = load_merge_pending(&pd);
+        let ent2 = pend2.get(rel).expect("healed 전환 후 항목 잔존");
+        assert_eq!(ent2["kind"].as_str(), Some("healed"), "★D7 healed 쪽: kind 전환 허용");
+        assert_eq!(ent2["capture"].as_str(), Some(capture_ptr),
+                   "★D7 healed 쪽: capture 승계(크래시 창 캡처 포인터 소실 금지)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged_disk,
+                   ".user = 병합본 바이트 보존(손실 0)");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), e1, "disk = vendor 보증(healed)");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4718,6 +5052,363 @@ mod tests {
             (2, 1, 1, 1, 1, 1),
             "kind 별 명시 계상 위반 — 빼기 산식이면 미지 kind 가 기존 버킷에 오계상된다"
         );
+    }
+
+    /// ★T3 통합 핀 ①(v2 §4 크래시 수렴 · 출하 차단): 크래시 직후 상태를 직접 구성해(txn_prestate
+    /// 전례 동형 — 프로세스 킬 불요) 재스윕이 "재병합 수렴" 또는 "healed(.user)" 로만 낙하함을
+    /// 증명한다 — 침묵 실패 0 · 바이트 손실 0. 레인: [W1 캡처 후 병합 전] [W2 disk 기록 후
+    /// pristine 전] [W3 광폭 창(★다중 파일 3본 · capture 승계)] [배타 캡처 세그먼트]
+    /// [W-cap 캡처 금지(루트 파일 점유 → 병합 미시도 → conflicted 폴백)].
+    #[test]
+    fn merge3_crash_windows_converge() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base_td = std::env::temp_dir().join(format!("cys-t3-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_td);
+        let pd = base_td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base_td.join("claude"));
+        let _cap_env = EnvGuard::remove("CYS_PACK_CAPTURES_DIR"); // 기본 유도(dir 형제) 검증
+
+        let e_old = "head-old\ncommon body\n";
+        let e1 = "head-new\ncommon body\n";
+        let ours = "head-old\ncommon body\nuser-tail-delta\n"; // δ=꼬리(머리/꼬리 분리 → clean)
+        let merged = "head-new\ncommon body\nuser-tail-delta\n";
+        let seed = |rel: &str, disk: &str, pristine: &str| {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, disk).unwrap();
+            let pp = pd.join(PRISTINE_DIR).join(rel);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, pristine).unwrap();
+        };
+
+        // ── [W1] 캡처 후 병합 전 크래시: disk=ours·pristine=E_old·manifest=hash(E_old)
+        //    → 동일 판정 재도달·clean 병합(캡처는 ts 세그먼트라 중복 무해). ──
+        let w1 = "skills/w1/SKILL.md";
+        seed(w1, ours, e_old);
+        std::fs::write(pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ w1: content_hash(e_old) }).to_string()).unwrap();
+        install_from_iter([(w1, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(w1)).unwrap(), merged, "[W1] clean 재병합 수렴");
+        let pend1 = load_merge_pending(&pd);
+        assert_eq!(pend1.get(w1).and_then(|e| e["kind"].as_str()), Some("merged"), "[W1] 원장 merged");
+        let cap_rel = pend1.get(w1).and_then(|e| e["capture"].as_str())
+            .expect("[W1] capture 필드").to_string();
+        let cap_root = base_td.join("pack-captures");
+        assert_eq!(std::fs::read_to_string(cap_root.join(&cap_rel)).unwrap(), ours,
+                   "[W1] 캡처 = 사용자본 전문(팩 밖 증거)");
+        assert!(cap_rel.starts_with("pack/") && cap_rel.ends_with(w1),
+                "[W1] capture = 캡처 루트 상대 <pack-basename>/<seg>/<rel>: {cap_rel}");
+        // 세그먼트 디렉터리명 규약 = <unix_secs>-<pid>[-n](콜론 0 — Windows 안전).
+        let seg_name = cap_rel.split('/').nth(1).unwrap().to_string();
+        let parts: Vec<&str> = seg_name.split('-').collect();
+        assert!((2..=3).contains(&parts.len()) && parts.iter().all(|p| p.parse::<u64>().is_ok()),
+                "[W1] 캡처 세그먼트 명명 규약 위반: {seg_name}");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(w1)).unwrap(), e1,
+                   "[W1] pristine=E1 전진");
+        let audit = std::fs::read_to_string(pd.join(MERGE_AUDIT_FILE)).unwrap();
+        assert!(audit.contains("pre-merge-capture") && audit.contains(w1),
+                "[W1] 감사 원장 pre-merge-capture 라인(원장 save 전 크래시 창의 증거)");
+
+        // ── [W2] disk 기록 후 pristine 전 크래시: disk=merged·pristine=E_old·manifest=hash(E_old)
+        //    → base(E_old) 검증 통과 → 재병합(ours⊇theirs) clean 수렴 · .user 미생성. ──
+        let w2 = "skills/w2/SKILL.md";
+        seed(w2, merged, e_old);
+        std::fs::write(pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ w1: content_hash(e1), w2: content_hash(e_old) }).to_string()).unwrap();
+        install_from_iter([(w1, e1), (w2, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(w2)).unwrap(), merged,
+                   "[W2] 재병합 clean 수렴 — δ·Δvendor 동시 잔존");
+        assert!(!pd.join(format!("{w2}.user")).exists(), "[W2] clean 수렴 — .user 미생성");
+        assert_eq!(load_merge_pending(&pd).get(w2).and_then(|e| e["kind"].as_str()),
+                   Some("merged"), "[W2] 원장 merged");
+
+        // ── [W3] 광폭 창(★다중 파일 3본): disk=merged·pristine=E1·manifest=hash(E_old)
+        //    → base 검증 실패(hash(E1)≠hash(E_old)) → L4 healed — 시끄러운 손실 0 폴백.
+        //    사전 시드된 merged 항목의 capture 는 healed 전환 후에도 승계된다(★D7). ──
+        let w3s = ["skills/w3a/SKILL.md", "skills/w3b/SKILL.md", "skills/w3c/SKILL.md"];
+        let mut mani = serde_json::Map::new();
+        mani.insert(w1.to_string(), serde_json::json!(content_hash(e1)));
+        mani.insert(w2.to_string(), serde_json::json!(content_hash(e1)));
+        let mut pend_seed = load_merge_pending(&pd);
+        for rel in w3s {
+            seed(rel, merged, e1);
+            mani.insert(rel.to_string(), serde_json::json!(content_hash(e_old)));
+            pend_seed.insert(rel.to_string(), serde_json::json!({
+                "kind": "merged", "side": rel, "capture": format!("pack/1-1/{rel}"),
+                "version": "1.1.0", "ts": 1
+            }));
+        }
+        std::fs::write(pd.join(INSTALL_MANIFEST),
+            serde_json::Value::Object(mani).to_string()).unwrap();
+        std::fs::write(pd.join(MERGE_PENDING_FILE),
+            serde_json::to_string_pretty(&serde_json::Value::Object(pend_seed)).unwrap()).unwrap();
+        let items3: Vec<(&str, &str)> =
+            vec![(w1, e1), (w2, e1), (w3s[0], e1), (w3s[1], e1), (w3s[2], e1)];
+        install_from_iter(items3.iter().copied(), false, "1.1.0", false, None).unwrap();
+        let pend3 = load_merge_pending(&pd);
+        for rel in w3s {
+            assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), e1,
+                       "[W3] disk=vendor 보증(healed) — {rel}");
+            assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
+                       "[W3] .user=병합본 바이트 보존(손실 0) — {rel}");
+            let e = pend3.get(rel).unwrap();
+            assert_eq!(e["kind"].as_str(), Some("healed"), "[W3] kind=healed — {rel}");
+            assert_eq!(e["capture"].as_str(), Some(format!("pack/1-1/{rel}").as_str()),
+                       "[W3] ★D7: merged 항목의 capture 승계 — {rel}");
+        }
+        // 침묵 0: 변경 3파일 전원이 원장에 계상됐다(계상 합 = 변경 파일 수).
+        assert!(w3s.iter().all(|r| pend3.contains_key(*r)), "[W3] 침묵 파일 존재");
+
+        // ── [배타 세그먼트] 새 vendor E2 재스윕 → 두 번째 캡처 — 최초 캡처 바이트 불변
+        //    (같은 초 재기동이어도 배타 create_dir + 접미 루프가 덮어쓰기를 봉인). ──
+        let e2 = "head-v2\ncommon body\n";
+        install_from_iter([(w1, e2), (w2, e2)], false, "1.2.0", false, None).unwrap();
+        let lane = cap_root.join("pack");
+        let segs: Vec<String> = std::fs::read_dir(&lane).unwrap()
+            .filter_map(|d| d.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert!(segs.len() >= 2, "배타 세그먼트 — 스윕별 캡처 디렉터리 실재(2본+): {segs:?}");
+        assert_eq!(std::fs::read_to_string(cap_root.join(&cap_rel)).unwrap(), ours,
+                   "최초 캡처 바이트 불변(증거의 자기 소실 금지)");
+
+        // ── [W-cap] 캡처 금지: 캡처 루트 자리를 파일이 점유 → create_dir_all 결정론 실패 →
+        //    병합 미시도 → healed 폴백(원장 conflicted{reason:capture-failed} + .base 조상). ──
+        let base2 = std::env::temp_dir().join(format!("cys-t3-crash-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base2);
+        let pd2 = base2.join("pack");
+        std::fs::create_dir_all(&pd2).unwrap();
+        let _env2 = set_pack_env(&pd2, base2.join("claude"));
+        std::fs::write(base2.join("pack-captures"), "OCCUPIED").unwrap();
+        let wc = "skills/wc/SKILL.md";
+        {
+            let p = pd2.join(wc);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, ours).unwrap();
+            let pp = pd2.join(PRISTINE_DIR).join(wc);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, e_old).unwrap();
+        }
+        std::fs::write(pd2.join(INSTALL_MANIFEST),
+            serde_json::json!({ wc: content_hash(e_old) }).to_string()).unwrap();
+        install_from_iter([(wc, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd2.join(wc)).unwrap(), e1, "[W-cap] vendor 본 기록");
+        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wc}.user"))).unwrap(), ours,
+                   "[W-cap] .user=사용자본(캡처 실패 시에도 §2 원칙 4 보존)");
+        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wc}.base"))).unwrap(), e_old,
+                   "[W-cap] .base=조상 전문(사후 3-way 재료)");
+        let pend_c = load_merge_pending(&pd2);
+        let ec = pend_c.get(wc).unwrap();
+        assert_eq!(ec["kind"].as_str(), Some("conflicted"), "[W-cap] 원장 conflicted");
+        assert_eq!(ec["reason"].as_str(), Some("capture-failed"), "[W-cap] reason 토큰");
+        assert_eq!(ec["base_side"].as_str(), Some(format!("{wc}.base").as_str()),
+                   "[W-cap] base_side 포인터");
+
+        let _ = std::fs::remove_dir_all(&base_td);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    /// ★T3 통합 핀 ②(v2 §3 연쇄 릴리스 · 출하 차단): E0⊕δ → E1 → E2 2연쇄에서 δ 생존 —
+    /// keep-mine 없이도 병합 기점(pristine·manifest)이 자동 전진함의 박제. δ 는 머리/꼬리 분리
+    /// 배치(vendor 는 머리만·사용자 δ 는 꼬리만 — diffy 보수 충돌 회피).
+    #[test]
+    fn chained_release_double_merge() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-t3-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base.join("claude"));
+        let _cap_env = EnvGuard::remove("CYS_PACK_CAPTURES_DIR");
+
+        let rel = "skills/chain/SKILL.md";
+        let e0 = "v0-head\ncommon body\n";
+        let e1 = "v1-head\ncommon body\n";
+        let e2 = "v2-head\ncommon body\n";
+        let with_delta = |head: &str| format!("{head}user-tail-delta\n");
+        // E0 설치(v1.0.0) — manifest·pristine 기준선.
+        install_from_iter([(rel, e0)], false, "1.0.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), e0);
+        // δ 주입(사용자 편집 — 규율 요구 0: 그냥 파일을 고친다).
+        std::fs::write(pd.join(rel), with_delta(e0)).unwrap();
+        // E1 릴리스(v1.1.0) — 자동 3-way: δ 가 E1 위에 재적용.
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), with_delta(e1),
+                   "1연쇄: disk=E1⊕δ(δ 생존 + vendor 전진 수용)");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), e1,
+                   "1연쇄: pristine=E1");
+        let mani1: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
+                .unwrap();
+        assert_eq!(mani1.get(rel), Some(&content_hash(e1)), "1연쇄: manifest=hash(E1)");
+        assert_eq!(load_merge_pending(&pd).get(rel).and_then(|e| e["kind"].as_str()),
+                   Some("merged"), "1연쇄: 원장 merged");
+        assert!(!pd.join(format!("{rel}.user")).exists(), "clean 병합 — .user 미생성");
+        // E2 릴리스(v1.2.0) — base=E1 검증 통과 재병합: δ 재생존 + E2 마커(연쇄 자연 처리 §3).
+        install_from_iter([(rel, e2)], false, "1.2.0", false, None).unwrap();
+        let disk = std::fs::read_to_string(pd.join(rel)).unwrap();
+        assert_eq!(disk, with_delta(e2), "2연쇄: disk=E2⊕δ(δ 생존)");
+        assert!(disk.contains("v2-head") && disk.contains("user-tail-delta"),
+                "2연쇄: E2 마커·δ 동시 잔존");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), e2,
+                   "2연쇄: pristine=E2(병합 기점 자동 전진)");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★T3 통합 핀 ③(v2 §3 자연 보존 · 출하 차단): 병합 at-rest 본문은 ⓐ결손 스윕(정적)에
+    /// KeepDrift 로 불가침(kind 불덮힘·state=at-rest·.user 미생성·쓰기 0) ⓑprune 에 수정본
+    /// 분류로 생존한다 — manifest 의미론 무변("마지막 적용 vendor 해시")의 구조 보존 박제.
+    #[test]
+    fn at_rest_merged_survives_static_sweep_and_prune() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-t3-atrest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base.join("claude"));
+        let _cap_env = EnvGuard::remove("CYS_PACK_CAPTURES_DIR");
+
+        let rel = "skills/atrest/SKILL.md";
+        let e0 = "v0-head\ncommon body\n";
+        let e1 = "v1-head\ncommon body\n";
+        install_from_iter([(rel, e0)], false, "1.0.0", false, None).unwrap();
+        std::fs::write(pd.join(rel), format!("{e0}user-tail-delta\n")).unwrap();
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        let merged = format!("{e1}user-tail-delta\n");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), merged, "전제: 병합 완료");
+        let capture0 = load_merge_pending(&pd).get(rel)
+            .and_then(|e| e["capture"].as_str()).expect("전제: capture 실재").to_string();
+
+        // ⓐ 같은 릴리스 재스윕(정적) → KeepDrift: 본문·계보 불가침 + state=at-rest.
+        let (w, _k) = install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(w, 0, "ⓐ정적 재스윕 쓰기 0(병합본 치유 금지)");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), merged, "ⓐ본문 바이트 불변");
+        let pend = load_merge_pending(&pd);
+        let entry = pend.get(rel).unwrap();
+        assert_eq!(entry["kind"].as_str(), Some("merged"), "ⓐkind 불덮힘(★D7)");
+        assert_eq!(entry["capture"].as_str(), Some(capture0.as_str()), "ⓐcapture 보존");
+        assert_eq!(entry["state"].as_str(), Some("at-rest"), "ⓐstate=at-rest");
+        assert!(!pd.join(format!("{rel}.user")).exists(), "ⓐ.user 미생성");
+
+        // ⓑ 해당 rel 제외 차기 릴리스(폐기) — prune: manifest(hash E1)≠hash(disk=E1⊕δ) → 보존.
+        let plan = plan_install(&pd, &[("other.txt", "OTHER")], false, "1.3.0");
+        assert!(plan.prune_keep_modified.iter().any(|r| r == rel),
+                "ⓑplan: 폐기지만 수정본 보존 분류");
+        install_from_iter([("other.txt", "OTHER")], false, "1.3.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), merged,
+                   "ⓑprune 생존(§3 자연 보존)");
+        let mani: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
+                .unwrap();
+        assert!(mani.contains_key(rel), "ⓑ매니페스트 유지(수정본 보존 arm)");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★T3(D4·D11 · v2 §3 L1): 판독 불가 system — 바이트 백업 성공 시 치유(.user=원본 바이트),
+    /// 백업 실패 시 quarantined 전이(무접촉·manifest 미전진 = fail-closed 수렴 조건) 후 백업
+    /// 가능 회복 시 치유로 수렴한다.
+    #[test]
+    fn unreadable_system_byte_backup() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-t3-quar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base.join("claude"));
+
+        const CP949: &[u8] = b"\x23\x20\xb8\xb6\xbd\xba\xc5\xcd\x0a";
+        assert!(String::from_utf8(CP949.to_vec()).is_err(), "픽스처 전제: 비UTF-8");
+        let rel = "alerts-config.json";
+        let vendor = "{\"alerts\":\"v2\"}\n";
+        std::fs::write(pd.join(rel), CP949).unwrap();
+        std::fs::write(pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash("OLD-VENDOR-BASE") }).to_string()).unwrap();
+        // 결정론 실패 주입: `<rel>.user` 자리에 디렉터리 — tmp 복사는 성공·rename 이 실패한다.
+        std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+
+        install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
+        assert_eq!(std::fs::read(pd.join(rel)).unwrap(), CP949,
+                   "★D11: 백업 실패 시 덮지 않는다(무접촉 — §2 원칙 4)");
+        let mani: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
+                .unwrap();
+        assert_eq!(mani.get(rel), Some(&content_hash("OLD-VENDOR-BASE")),
+                   "★D11: manifest 미전진(재스윕 L1 재도달 = 수렴 조건)");
+        let pend = load_merge_pending(&pd);
+        assert_eq!(pend.get(rel).and_then(|e| e["kind"].as_str()), Some("quarantined"));
+        assert_eq!(pend.get(rel).and_then(|e| e["reason"].as_str()), Some("backup-failed"));
+        // 멱등: 격리 재스윕 동일 상태·원장 no-op.
+        let bytes = std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap();
+        install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
+        assert_eq!(std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap(), bytes,
+                   "격리 재스윕 원장 no-op(rewrite 방지)");
+        assert_eq!(std::fs::read(pd.join(rel)).unwrap(), CP949, "격리 재스윕 무접촉");
+        // 백업 가능 회복(디렉터리 제거) → 재스윕: 바이트 백업 후 치유로 수렴.
+        std::fs::remove_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+        install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), vendor, "회복 후 치유");
+        assert_eq!(std::fs::read(pd.join(format!("{rel}.user"))).unwrap(), CP949,
+                   "바이트 백업 = CP949 원본 왕복");
+        let pend2 = load_merge_pending(&pd);
+        assert_eq!(pend2.get(rel).and_then(|e| e["kind"].as_str()), Some("healed"),
+                   "격리 해소 — healed 전환");
+        assert_eq!(pend2.get(rel).and_then(|e| e["side"].as_str()),
+                   Some(format!("{rel}.user").as_str()), "side=실백업 경로");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★T3(v2 §3 L0 · D11): 잠금 보안 자산(trusted-keys.json) — 백업 선행 시도하되, 백업 실패
+    /// 시에도 치유를 강행한다(무결성>보존 — §2 원칙 4 의 유일 예외). 원장 side 는 **실백업 성공
+    /// 시에만** 기록(실패 시 side 부재 + backup:"failed" — 존재하지 않는 .user 를 '보존됨'으로
+    /// 오보하지 않는다).
+    #[test]
+    fn unreadable_locked_byte_backup() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        const CP949: &[u8] = b"\x23\x20\xb8\xb6\xbd\xba\xc5\xcd\x0a";
+        let vendor = "{\"keys\":[\"v2\"]}\n";
+        let rel = "trusted-keys.json";
+
+        // ① 백업 성공 레인: 바이트 백업 선행 + 치유 + side=실백업 경로.
+        let base1 = std::env::temp_dir().join(format!("cys-t3-lock1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base1);
+        let pd1 = base1.join("pack");
+        std::fs::create_dir_all(&pd1).unwrap();
+        {
+            let _env = set_pack_env(&pd1, base1.join("claude"));
+            std::fs::write(pd1.join(rel), CP949).unwrap();
+            install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
+            assert_eq!(std::fs::read_to_string(pd1.join(rel)).unwrap(), vendor, "①L0 치유");
+            assert_eq!(std::fs::read(pd1.join(format!("{rel}.user"))).unwrap(), CP949,
+                       "①바이트 백업 선행(무백업 edge 봉인)");
+            let p1 = load_merge_pending(&pd1);
+            assert_eq!(p1.get(rel).and_then(|e| e["kind"].as_str()), Some("healed"));
+            assert_eq!(p1.get(rel).and_then(|e| e["side"].as_str()),
+                       Some(format!("{rel}.user").as_str()), "①side=실백업 경로");
+        }
+
+        // ② 백업 실패 레인: 치유 강행 + side 부재 + backup:"failed".
+        let base2 = std::env::temp_dir().join(format!("cys-t3-lock2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base2);
+        let pd2 = base2.join("pack");
+        std::fs::create_dir_all(&pd2).unwrap();
+        {
+            let _env = set_pack_env(&pd2, base2.join("claude"));
+            std::fs::write(pd2.join(rel), CP949).unwrap();
+            std::fs::create_dir_all(pd2.join(format!("{rel}.user"))).unwrap(); // rename 결정론 실패
+            install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
+            assert_eq!(std::fs::read_to_string(pd2.join(rel)).unwrap(), vendor,
+                       "②★L0: 백업 실패에도 치유 강행(무결성>보존)");
+            let p2 = load_merge_pending(&pd2);
+            assert_eq!(p2.get(rel).and_then(|e| e["kind"].as_str()), Some("healed"));
+            assert!(p2.get(rel).and_then(|e| e.get("side")).is_none(),
+                    "②side 부재 — 실패한 백업을 '보존됨'으로 오보 금지");
+            assert_eq!(p2.get(rel).and_then(|e| e["backup"].as_str()), Some("failed"));
+        }
+        let _ = std::fs::remove_dir_all(&base1);
+        let _ = std::fs::remove_dir_all(&base2);
     }
 
     #[test]
@@ -4978,12 +5669,25 @@ mod tests {
                    "SYS-EDIT-XYZ", "③치유 전 사용자본 .user 보존(종전 동작 불변)");
         assert_eq!(std::fs::read(pd.join(unreadable_sys)).unwrap(), embed_of(unreadable_sys).as_bytes(),
                    "③system 은 판독 불가여도 치유 — 수리가 Keep 범위를 넓히지 않았다");
+        // ★T3(커밋② · D4·D11) ③-b: L1 바이트 백업 사이드카 — CP949 원본 **바이트 왕복**(.user)
+        //   + 원장 정합(kind=healed · side=실백업 경로).
+        assert_eq!(std::fs::read(pd.join(format!("{unreadable_sys}.user"))).unwrap(), CP949,
+                   "③-b 판독 불가 system 치유 전 바이트 백업(.user=CP949 원본 왕복)");
+        let pend_b = load_merge_pending(&pd);
+        assert_eq!(pend_b.get(unreadable_sys).and_then(|e| e["kind"].as_str()), Some("healed"),
+                   "③-b 원장 kind=healed");
+        assert_eq!(pend_b.get(unreadable_sys).and_then(|e| e["side"].as_str()),
+                   Some(format!("{unreadable_sys}.user").as_str()),
+                   "③-b 원장 side=실백업 경로(.user)");
 
         // ④ 멱등: 판독 불가 파일이 남아 있어도 재실행이 상태를 흔들지 않는다.
         install_staged(true, None).unwrap();
         for rel in unreadable_user {
             assert_eq!(std::fs::read(pd.join(rel)).unwrap(), CP949, "④재실행 후에도 불변 — {rel}");
         }
+        // ★T3 ③-b 재스윕 생존: 치유된 disk 는 판독 가능이라 재백업 비발동 — .user 바이트 불변.
+        assert_eq!(std::fs::read(pd.join(format!("{unreadable_sys}.user"))).unwrap(), CP949,
+                   "④재스윕 후에도 바이트 백업 생존(단일 슬롯 재복사 없음)");
 
         // ⑤ 병합 대기 중이던 파일이 판독 불가가 되면 대기를 **해소로 오인하지 않는다**.
         //    (읽지 못한 것은 '사용자가 vendor 본을 채택했다'는 증거가 아니다 — .new·원장 유지.)
