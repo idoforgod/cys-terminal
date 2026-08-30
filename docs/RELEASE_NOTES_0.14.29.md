@@ -100,6 +100,11 @@ GUI 리팩터(봉인 조립점)로 낡아진 건강성 검체 앵커 2건을 실
 - **mixed-EOL 은 자동 병합 효용이 0 입니다** — base 가 LF 인 파일을 CRLF 로 재저장하면 벤더
   전진 시 전 파일 충돌→치유 강등이 구조적으로 반복됩니다(손실 0이나 Windows 체감 직격).
   병합 전 EOL 정규화는 바이트 보존 원칙과 긴장하는 설계 변경이라 0.14.30 오너 결정 사항입니다.
+- **새 보존·병합 실행 경로의 Windows 실기 통합 검증은 엔진 단위까지입니다** — 태그 레인의
+  Windows 레그는 `merge3::`(순수 인메모리 엔진)·factory_reset·alt_screen 필터만 실행하고,
+  kept-drift 보존·Merge3 실행부(install 스윕)·바이트 백업 등 fs-heavy 통합 핀은 macOS 완전
+  레인에서만 돕니다(신거동 코드의 플랫폼 분기 0 · Windows 항목은 위 mixed-EOL 실측뿐 —
+  실기 통합 검증 범위의 정직한 기재).
 - **User 9건·SeedOnce 4건은 자동 병합 밖입니다** — soul.md·CLAUDE.md·디렉티브·schedule.json
   등은 현행 `.new` 병치+수동 `pack-merge` 유지(헌법 파일 자동 병합 금지), memory/·round 상태는
   불가침입니다. **현 라이브 팩의 드리프트 5건이 전부 이 영역**이므로, "수정 파일 자동 병합"의
