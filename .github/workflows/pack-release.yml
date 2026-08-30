@@ -42,14 +42,20 @@ jobs:
       #   (같은 규칙의 본체 레인 대응물 = release.yml 의 `PACK_MIN_BINARY`. 두 레인은 **따로**
       #    고쳐야 한다 — 한쪽만 고치면 다른 문으로 같은 실패가 들어온다. 이게 S26 의 실제 사고다.)
       #
-      # 현재 값 0.14.2 의 근거: v0.14.2 팩의 javis_orchestra.py 가 `cys todo-path --emit-decl`
+      # 현재 값 0.14.29 의 근거(2026-08-31 · T5T6 R1-적대 차단 수리 · master 결재): 0.14.29 팩의
+      #   pack-guard.sh 가 "이 수정은 보존됩니다(kept-drift)" 를 약속하는데, 그 거동(수정 system
+      #   파일의 벤더 미전진 보존·전진 시 자동 3-way)은 0.14.29 바이너리에서 처음 생긴다 —
+      #   ≤0.14.28 스윕은 종전대로 치유해 팩 자신의 약속이 거짓이 된다(기능 의존).
+      #   release.yml PACK_MIN_BINARY 와 동시 상향 — 두 값 동일 계약(RELEASE.md).
+      #
+      # 구 값 0.14.2 의 근거(이력): v0.14.2 팩의 javis_orchestra.py 가 `cys todo-path --emit-decl`
       #   실행을 지시하는데 그 플래그는 이 레인에서 v0.14.2 에 처음 생긴다(≤0.14.1 에는 부재 —
       #   `git show v0.14.1:src/bin/cys.rs | grep -c emit_decl` → 0 으로 실측).
       #   상향 시 release.yml 의 PACK_MIN_BINARY 와 **같은 값인지** 확인할 것.
       #
       # 값 지정 시 정책이 무시되고 "min_binary 정책 오버라이드 사용" ::warning 이 로그에 남는다
       #   (아래 Compute min_binary 스텝) — 의도된 흔적이다. 근거를 커밋에 남길 것.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.2'
+      PACK_MIN_BINARY_OVERRIDE: '0.14.29'
     steps:
       - uses: actions/checkout@v4
 

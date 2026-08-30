@@ -768,7 +768,12 @@ jobs:
       #   CLI 표면은 `claim-role --takeover-empty-seat` · `status --json` 뿐이고 둘 다 ≤0.14.2 에
       #   존재한다. 신 데몬의 rc 6 은 **진단 품질**만 좌우하고 구 바이너리에서도 폴백 가드가
       #   부서 증식을 막는다(스큐 S3 안전) → 상향 불필요, 0.14.2 유지.
-      PACK_MIN_BINARY: '0.14.2'
+      # ★0.14.29 상향(2026-08-31 · T5T6 R1-적대 차단 수리 · master 결재). 이 릴리스 팩의
+      #   pack-guard.sh 가 "이 수정은 보존됩니다(kept-drift)" 를 **약속**하는데, 그 거동(수정된
+      #   system 파일의 벤더 미전진 보존·전진 시 자동 3-way)은 0.14.29 바이너리에서 처음 생긴다 —
+      #   ≤0.14.28 스윕은 종전대로 vendor 본으로 치유해 팩 자신의 약속이 거짓이 된다(기능 의존 —
+      #   RELEASE.md 불변 규칙). pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 동시 상향(두 값 동일 계약).
+      PACK_MIN_BINARY: '0.14.29'
     steps:
       - uses: actions/checkout@v4
 
