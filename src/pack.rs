@@ -1706,7 +1706,8 @@ pub fn content_hash_pub(content: &str) -> String {
 }
 
 /// ★B2(§2 축B 소유권 매니페스트): 팩 파일의 system|user 소유권 축. **기본값=system**(임베드 진실 —
-/// 해시 불일치 시 강제 갱신), **user 는 화이트리스트만**(사용자 수정 보존). 화이트리스트를 좁게 유지해
+/// 벤더 전진 시 갱신·병합, 벤더 미전진 드리프트는 kept-drift 제자리 보존 · v2 §3 L0-L4),
+/// **user 는 화이트리스트만**(사용자 수정 보존). 화이트리스트를 좁게 유지해
 /// '조용한 탈락'(system 인데 user 로 오분류돼 스큐가 동결)을 방지한다.
 ///   user(preserve)  = 디렉티브(*_DIRECTIVE.md)·헌법(soul.md)·CLAUDE.md — CEO/사용자 커스텀 대상.
 ///   system(update)  = bin/*.py·hooks/*·skills·schemas·templates 등 그 외 전부(cysd 소유·스큐 금지).
@@ -1736,7 +1737,8 @@ pub(crate) fn is_seed_once(rel: &str) -> bool {
 /// 호출 순서에 숨는다 — 단일 match 가 배타 등급 하나만 반환하게 구조로 보장한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ownership {
-    /// 임베드 진실(기본값) — 불일치 시 강제 치유(P0-4)·비수정 자동 갱신·prune 대상.
+    /// 임베드 진실(기본값) — 벤더 전진 불일치 시 치유/3-way 병합(P0-4 계승) · 벤더 미전진
+    /// 드리프트는 kept-drift 보존 · 비수정 자동 갱신·prune 대상.
     System,
     /// 사용자 주권(디렉티브·soul·CLAUDE·schedule) — 영구 보존, 임베드 신버전은 `.new` 병치.
     User,
@@ -1789,6 +1791,15 @@ pub(crate) fn ownership(rel: &str) -> Ownership {
         return Ownership::User;
     }
     Ownership::System
+}
+
+/// 잠금 보안 자산(v2 §7 — enum 분할 기각: 암묵 else 침묵 미구현 위험 R7). 디스크 사본은 현행
+/// 런타임 비소비(서명 키링은 컴파일타임 임베드 — packsig.rs embedded_keyring)이나 ①팩 배포 신뢰
+/// 자산의 드리프트는 정당한 사용자 확장 사례 0(수정=변조 신호) ②미래 키 회전·오신뢰 표면 차단 —
+/// 방어적 무결성 계약(v2 §2 원칙 4의 예외).
+pub(crate) const SYSTEM_LOCKED: &[&str] = &["trusted-keys.json"];
+pub(crate) fn system_locked(rel: &str) -> bool {
+    SYSTEM_LOCKED.contains(&rel)
 }
 
 /// 소유권 분류의 CLI 노출용 이름(외부 crate 인 bin/cys.rs 는 pub(crate) ownership() 을 못 본다).
@@ -1855,7 +1866,8 @@ pub fn ownership_name_scoped(rel: &str, pack: &Path) -> &'static str {
 //   보존되지만 영구 동결(병합 경로 없음) — 업데이트가 커스텀을 무효화한다는 사용자 항의의 실체.
 //   절충(dpkg conffile/rpmnew·rpmsave 패턴):
 //     - user-owned 수정본 + 임베드 신버전 변경 → 보존 유지 + `<rel>.new` 병치(병합 대기)
-//     - system 수정본 치유 → 덮어쓰기 **전에** `<rel>.user` 로 사용자본 보존(파괴 0)
+//     - system 수정본: 벤더 미전진=제자리 보존(kept-drift) · 벤더 전진=검증 base 3-way(실패
+//       전부 치유 폴백) · 치유 시 덮어쓰기 전에 <rel>.user 보존(파괴 0)
 //     - `.pristine/<rel>` = 마지막으로 디스크에 적용된 vendor 원본(3-way 병합의 공통 조상)
 //     - `.merge-pending.json` = 병합 대기 원장 — `cys pack-merge` 가 소비
 //   판정은 decide_file_action(순수)로 추출해 install_into(쓰기)와 plan_install(드라이런)이
@@ -1888,17 +1900,23 @@ pub fn local_dir() -> PathBuf {
 /// 파일 1건의 설치 판정(순수·부수효과 0) — install_into 와 plan_install 공용.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileAction {
-    /// 임베드 내용을 디스크에 기록. heal_user_copy=true 면 사용자 수정본을 `<rel>.user` 로 먼저 보존.
+    /// 임베드 내용을 디스크에 기록. heal_user_copy=true 면 사용자 수정본을 `<rel>.user` 로 먼저 보존
+    /// — 판독 가능이면 `<rel>.user` · 판독 불가(L0·L1)는 바이트 백업(실행부 T3 — T2 인터림은 현행
+    /// 실행부 그대로 백업 미실행).
     Write { heal_user_copy: bool },
     /// 디스크 유지. adopt_hash=true 면 매니페스트에 현재 임베드 해시 채택(구설치본 승계).
     /// new_pending=true 면 임베드 신버전을 `<rel>.new` 로 병치(병합 대기 — user-owned 동결 해소 경로).
     Keep { adopt_hash: bool, new_pending: bool },
+    /// ★NEW(v2 §3 L2): 벤더 미전진 + system 드리프트 — 제자리 보존. 원장 kept-drift 계상·pristine
+    /// 백필 가드는 T3.
+    KeepDrift,
+    /// ★NEW(v2 §3 L3): 벤더 전진 + 드리프트 + 검증된 base — 3-way 병합 시도(실행부 T3 · 실패 전부
+    /// healed 폴백).
+    Merge3,
 }
 
-/// 현행 install_into 분기(★B2 user-owned 영구 보존 · P0-4 system 강제 치유 · 비수정 자동 갱신)를
-/// 글자 그대로 보존한 순수 판정 + 신규 부수효과 플래그(heal_user_copy·new_pending)만 추가한다.
-/// ★G3 축2: `scope` 는 데이터 파라미터(순수성 유지) — Base 면 종전 등급표와 byte-identical 이고
-/// (기존 핀 전량이 Base 셈으로 무수정 초록 = 하위호환의 기계 증거), Dept 면 soul.md 만 SeedOnce.
+/// 순수 판정 SOT — User·SeedOnce 조기 분기 불변, system은 L0(locked 즉시 치유)/L1(판독불가 백업 후
+/// 치유)/L2(벤더 미전진 kept-drift)/L3(벤더 전진 검증 base 3-way)/L4(레거시 종전 거동) 판정표(v2 §3).
 pub(crate) fn decide_file_action(
     rel: &str,
     embed: &str,
@@ -1907,6 +1925,10 @@ pub(crate) fn decide_file_action(
     manifest_hash: Option<&str>,
     force: bool,
     scope: PackScope,
+    // 호출자가 content_hash(pristine)==manifest_hash 검증을 마친 base(v2 §2 원칙 3). 미검증·부재·
+    // manifest 부재면 None — IO·해시 검증은 호출자 몫(순수성 유지·scope 주입과 동형). T2 호출자
+    // 전원 None(L3 도달 불가·배선은 T3).
+    verified_base: Option<&str>,
 ) -> FileAction {
     // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도) — 부재 시에만 아래 시드 설치.
     // (dept 스코프의 soul.md 도 이 조기 반환을 탄다 — 병치 판정보다 먼저라 결함4 가 구조 소멸.)
@@ -1933,7 +1955,7 @@ pub(crate) fn decide_file_action(
             // ★백업 후 교체가 아니라 Keep 이 기본인 이유: 백업 실행부(install_into 의 heal_user_copy)
             // 자체가 `disk.as_deref()` 의 Some 에 갇혀 있어 disk=None 에선 어떤 백업도 뜨지 못한다
             // — 플래그만 켜는 수리는 실효 0(측정 완료). 읽을 수 없는 사용자 파일은 더더욱 덮으면
-            // 안 된다. system 등급은 이 분기 밖이라 P0-4 강제 치유는 그대로 유지된다.
+            // 안 된다. system 등급은 이 분기 밖 — L0/L1이 치유+백업 의무로 처리(v2 §3).
             return FileAction::Keep { adopt_hash: false, new_pending: false };
         }
     }
@@ -1954,7 +1976,28 @@ pub(crate) fn decide_file_action(
                     // 리팩터링으로 흔들려도 force=false 경로의 보존은 여기서 한 번 더 성립한다.
                     return FileAction::Keep { adopt_hash: false, new_pending: false };
                 }
-                // system: 강제 치유(P0-4 — 임베드 진실). 진짜 사용자 수정본이면 먼저 .user 보존.
+                // ★L0(v2 §3·§7): 잠금 보안 자산 — 전 클래스 즉시 치유(벤더 미전진·판독 불가 포함).
+                //   disk=Some(d)면 이 arm 도달 조건상 d != embed ∧ manifest != hash(d)라 현행 heal 식과 동치(항상 true).
+                //   disk=None은 L0 하위 케이스 명문(v2 §3) — 바이트 백업 의무 신호(실행부 T3 · T2 런타임 쓰기는 현행 동형).
+                if system_locked(rel) {
+                    return FileAction::Write { heal_user_copy: true };
+                }
+                // ★L1(v2 §3): 판독 불가(비UTF-8·권한·잠금) — 치유 유지 + 백업 의무 신호(현행 heal:false→true 전환).
+                if disk.is_none() {
+                    return FileAction::Write { heal_user_copy: true };
+                }
+                // ★L2(v2 §3 — v1 Patch 1 흡수): 벤더 미전진 + 드리프트 → 제자리 보존(kept-drift).
+                //   이 arm 도달 조건상 disk=Some(d) ∧ d != embed (arm1·fast-path 선점) — matches! 가드는 리팩터링 내성용.
+                let vendor_advanced = manifest_hash != Some(content_hash(embed).as_str());
+                if !vendor_advanced && matches!(disk, Some(d) if d != embed) {
+                    return FileAction::KeepDrift;
+                }
+                // ★L3(v2 §3): 벤더 전진 + 드리프트 + 검증된 base → 3-way(실행부 T3 — T2는 호출자 verified_base=None 고정이라 도달 불가).
+                //   manifest_hash.is_some() 방어 conjunct(master 결정): base 검증 계약이 manifest 부재에선 불성립 — 계약 위반 입력은 L4로.
+                if manifest_hash.is_some() && vendor_advanced && verified_base.is_some() {
+                    return FileAction::Merge3;
+                }
+                // L4: 레거시(manifest 부재)·base 미검증 — 종전 P0-4 거동(치유 + .user 보존).
                 let heal = matches!(disk, Some(d) if d != embed
                     && manifest_hash != Some(content_hash(d).as_str()));
                 return FileAction::Write { heal_user_copy: heal };
@@ -1962,9 +2005,13 @@ pub(crate) fn decide_file_action(
         }
     }
     // 신규 생성 또는 force 갱신 — force 로 수정본을 덮을 때도 사용자본은 보존한다(파괴 0).
+    // ★v2 §3(이식 ⑤): 판독 불가(disk=None)도 백업 의무 신호(heal:true) — 이 지점 도달 ∧ disk=None ⇒ system 전용
+    //   (User disk=None은 W-1 조기 분기가, SeedOnce는 조기 반환이 force 무관 선행). !exists는 exists&& 가드로 heal=false 불변.
+    //   T2 런타임 FS 파급 0: 백업 실행부가 Some(d) 게이트(install_into)라 disk=None에선 플래그 무력 — w1 bytewise 핀 무수정 초록이 기계 증거.
     let heal = exists
-        && matches!(disk, Some(d) if d != embed
-            && manifest_hash != Some(content_hash(d).as_str()));
+        && (disk.is_none()
+            || matches!(disk, Some(d) if d != embed
+                && manifest_hash != Some(content_hash(d).as_str())));
     FileAction::Write { heal_user_copy: heal }
 }
 
@@ -2059,6 +2106,7 @@ pub fn plan_install(
             manifest.get(rel).map(String::as_str),
             force,
             scope,
+            None, // verified_base — base 로드 IO 는 T3.
         ) {
             FileAction::Write { heal_user_copy: true } => plan.heal.push(rel.to_string()),
             FileAction::Write { heal_user_copy: false } => {
@@ -2079,6 +2127,8 @@ pub fn plan_install(
                     plan.unchanged += 1;
                 }
             }
+            FileAction::KeepDrift => { plan.unchanged += 1; } // ★D1 인터림 — System 전용 도달·T3에서 kept_drift 버킷 신설 예정
+            FileAction::Merge3 => plan.heal.push(rel.to_string()), // Write{heal:true} 동형
         }
     }
     // prune 프리뷰(install_into prune 블록과 동일 판정).
@@ -2759,8 +2809,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     let mut written = 0;
     let mut kept = 0;
     // ★커스터마이즈 절충 원장(②): .new/.user 병치·pristine 미러·병합 대기 기록.
-    // 판정 자체는 decide_file_action(순수 — ★B2 user-owned 영구 보존 · P0-4 system 강제 치유 ·
-    // 비수정 자동 갱신을 글자 그대로 보존)에 위임하고, 여기는 부수효과만 수행한다.
+    // 판정 자체는 decide_file_action(순수 — ★B2 user-owned 영구 보존 · system 은 L0-L4 판정표
+    // (v2 §3) · 비수정 자동 갱신)에 위임하고, 여기는 부수효과만 수행한다.
     let mut pending = load_merge_pending(&dir);
     let mut pending_dirty = false;
     let now_ts = std::time::SystemTime::now()
@@ -2810,8 +2860,10 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             None
         };
         let content: &str = seed_override.as_deref().unwrap_or(content);
-        match decide_file_action(rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope)
-        {
+        match decide_file_action(
+            rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope,
+            None, // verified_base — base 로드 IO 는 T3.
+        ) {
             FileAction::Keep { adopt_hash, new_pending } => {
                 if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
@@ -2847,6 +2899,35 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 }
                 kept += 1;
                 continue;
+            }
+            FileAction::KeepDrift => {
+                // ★T2 스텁(v2 §12): 실행 동형 = Keep{adopt_hash:false,new_pending:false} — 쓰기 0.
+                //   ★D1 인터림 침묵: kept-drift 원장·plan 버킷·가시화 4채널은 T3 — T3 병합 전 릴리스 태그 금지.
+                if !unreadable
+                    && pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str())
+                        == Some("new-pending")
+                {
+                    pending.remove(rel);
+                    pending_dirty = true;
+                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                }
+                if unreadable {
+                    unreadable_kept.push(rel.to_string());
+                }
+                kept += 1;
+                continue;
+            }
+            FileAction::Merge3 => {
+                // ★T2 스텁: Write{heal_user_copy:true} 본문과 자구 동형(공용 write 낙하 포함) —
+                // 병합 실행부는 T3. 런타임 도달 불가(호출자 verified_base=None) — match 망라성 전용.
+                // system 강제 치유(P0-4)·force 갱신이 사용자 수정본을 덮기 **전에** 보존(파괴 0).
+                if let Some(d) = disk.as_deref() {
+                    let user_path = dir.join(format!("{rel}.user"));
+                    if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
+                        let _ = write_atomic(&user_path, d.as_bytes());
+                    }
+                    upsert_pending(&mut pending, &mut pending_dirty, rel, "healed", format!("{rel}.user"));
+                }
             }
             FileAction::Write { heal_user_copy } => {
                 if heal_user_copy {
@@ -3535,6 +3616,7 @@ mod tests {
     /// 로컬 fn 이 glob import(super::decide_file_action)를 가리므로 기존 6-인자 호출이 전부 이
     /// 셈을 통해 Base 등급표로 돈다 = `ownership(rel)==ownership_scoped(rel, Base)` 항등과
     /// "base 레인 거동 byte-identical" 의 기계 증거. dept 스코프 검증은 super:: 경로로 명시 호출.
+    /// ★T2: Base+무base 셈 — 종전 6인자 핀 전량이 L4/조기분기 등가로 무수정 관통(verified_base=None).
     fn decide_file_action(
         rel: &str,
         embed: &str,
@@ -3543,7 +3625,7 @@ mod tests {
         manifest_hash: Option<&str>,
         force: bool,
     ) -> FileAction {
-        super::decide_file_action(rel, embed, exists, disk, manifest_hash, force, PackScope::Base)
+        super::decide_file_action(rel, embed, exists, disk, manifest_hash, force, PackScope::Base, None)
     }
 
     /// [G3 회귀 핀 셈] 기존 install_staged 핀 전량을 무수정 초록으로 유지 — install_hooks=true
@@ -4579,13 +4661,14 @@ mod tests {
         assert_eq!(decide_file_action("soul.md", embed, false, None, None, true),
                    Write { heal_user_copy: false }, "②-b 부재 → 신규 설치(수리가 막지 않는다)");
 
-        // ③ system-owned **불변**: 판독 불가여도 P0-4 강제 치유 유지(동결 = 배포 스큐 재앙의 근원).
+        // ③ system-owned: 판독 불가여도 치유 유지 + ★L1/force 백업 의무 플래그(바이트 백업
+        //    실행부는 T3 — T2 런타임 쓰기는 현행 byte-identical).
         for rel in ["bin/javis_phoenix.py", "alerts-config.json", "README.md", "CLAUDE.md.template",
                     "directives/CEO_TEMPLATE.md"] {
             assert_eq!(decide_file_action(rel, embed, true, None, None, true),
-                       Write { heal_user_copy: false }, "③system·판독불가·force → 치유 유지: {rel}");
+                       Write { heal_user_copy: true }, "③system·판독불가·force → 치유 유지: {rel}");
             assert_eq!(decide_file_action(rel, embed, true, None, None, false),
-                       Write { heal_user_copy: false }, "③system·판독불가·비force → 치유 유지: {rel}");
+                       Write { heal_user_copy: true }, "③system·판독불가·비force → 치유 유지: {rel}");
         }
         assert_eq!(decide_file_action("alerts-config.json", embed, true, Some("SYS-DRIFT"), None, true),
                    Write { heal_user_copy: true }, "③system 수정본은 .user 보존 후 치유(종전 동일)");
@@ -4815,39 +4898,129 @@ mod tests {
         // dept × soul 유: vendor 전진(매니페스트 구해시)이어도 병치 없이 불가침.
         assert_eq!(
             super::decide_file_action("soul.md", embed, true, Some("DEPT-SOUL"),
-                Some(content_hash("EMBED-V1").as_str()), false, d),
+                Some(content_hash("EMBED-V1").as_str()), false, d, None),
             Keep { adopt_hash: false, new_pending: false },
             "dept soul 전진에도 .new 병치 없음(결함4 구조 소멸)"
         );
         // dept × soul 유 + force: 여전히 불가침(SeedOnce 조기 반환).
         assert_eq!(
-            super::decide_file_action("soul.md", embed, true, Some("DEPT-SOUL"), None, true, d),
+            super::decide_file_action("soul.md", embed, true, Some("DEPT-SOUL"), None, true, d, None),
             Keep { adopt_hash: false, new_pending: false },
             "dept soul 은 force 여도 불가침"
         );
         // dept × soul 무: 시드 설치(Write) — 승계 본문 치환은 install_into 의 seed-from-base 소관.
         assert_eq!(
-            super::decide_file_action("soul.md", embed, false, None, None, false, d),
+            super::decide_file_action("soul.md", embed, false, None, None, false, d, None),
             Write { heal_user_copy: false }
         );
         // base × soul 유(수정+전진): 기존 계약 그대로 .new 병치(대조 핀 — 기존 threeway 매트릭스와 동일).
         assert_eq!(
             super::decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
-                Some(content_hash("EMBED-V1").as_str()), false, PackScope::Base),
+                Some(content_hash("EMBED-V1").as_str()), false, PackScope::Base, None),
             Keep { adopt_hash: false, new_pending: true },
             "base soul 은 종전대로 병치(base 레인 불변)"
         );
         // base × soul 무: 신규 생성(기존 계약).
         assert_eq!(
-            super::decide_file_action("soul.md", embed, false, None, None, false, PackScope::Base),
+            super::decide_file_action("soul.md", embed, false, None, None, false, PackScope::Base, None),
             Write { heal_user_copy: false }
         );
         // dept 에서 soul 외 파일은 base 등급표 그대로(system 강제 치유 불변).
         assert_eq!(
-            super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false, d),
+            super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false, d, None),
             Write { heal_user_copy: true },
             "dept 스코프가 system 치유를 흔들면 안 된다"
         );
+    }
+
+    /// [T2 회귀 핀·v2 §3] L0-L4 판정표 전수 — super:: 8인자 직호출(embed="E2", eh=hash("E2")).
+    #[test]
+    fn decide_file_action_l0_l4_matrix() {
+        use super::FileAction::*;
+        let embed = "E2";
+        let eh = content_hash(embed);
+        let e1h = content_hash("E1");
+
+        // L0: 잠금 보안 자산 — 전 클래스 즉시 치유.
+        assert_eq!(super::decide_file_action("trusted-keys.json", embed, true, Some("HACK"),
+                       Some(eh.as_str()), false, PackScope::Base, None),
+                   Write { heal_user_copy: true },
+                   "★L0>L2: locked 는 벤더 미전진 드리프트도 치유");
+        assert_eq!(super::decide_file_action("trusted-keys.json", embed, true, None,
+                       None, false, PackScope::Base, None),
+                   Write { heal_user_copy: true }, "L0: 판독 불가도 즉시 치유+백업 의무");
+        assert_eq!(super::decide_file_action("trusted-keys.json", embed, true, Some("HACK"),
+                       Some(e1h.as_str()), false, PackScope::Base, Some("E1")),
+                   Write { heal_user_copy: true }, "★L0>L3: locked 병합 금지");
+
+        // L1: 판독 불가 — 치유 유지 + 백업 의무 신호.
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, None,
+                       None, false, PackScope::Base, None),
+                   Write { heal_user_copy: true }, "L1: 판독 불가 → 치유+백업 의무");
+        assert_eq!(super::decide_file_action("bin/x.py", embed, true, None,
+                       Some(eh.as_str()), false, PackScope::Base, None),
+                   Write { heal_user_copy: true }, "★L1>L2: 판독 불가는 벤더 미전진이어도 치유");
+
+        // L2: 벤더 미전진 + 드리프트 → 제자리 보존(kept-drift).
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
+                       Some(eh.as_str()), false, PackScope::Base, None),
+                   KeepDrift, "L2: 벤더 미전진 드리프트 → kept-drift");
+        assert_eq!(super::decide_file_action("bin/x.py", embed, true, Some("DRIFT"),
+                       Some(eh.as_str()), false, PackScope::Base, Some("E1")),
+                   KeepDrift, "★L2>L3: 벤더 미전진이면 base 있어도 보존");
+
+        // L3: 벤더 전진 + 드리프트 + 검증된 base → 3-way.
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
+                       Some(e1h.as_str()), false, PackScope::Base, Some("E1")),
+                   Merge3, "L3: 벤더 전진+검증 base → Merge3");
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
+                       None, false, PackScope::Base, Some("B")),
+                   Write { heal_user_copy: true },
+                   "★방어: manifest=None∧base=Some 계약위반 입력 → L4(Merge3 아님)");
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
+                       Some(e1h.as_str()), false, PackScope::Base, None),
+                   Write { heal_user_copy: true }, "★base=None: 벤더 전진+base 부재 → L4 치유");
+
+        // force 폴백: 판독 불가 heal 개정 + !exists 불변.
+        assert_eq!(super::decide_file_action("alerts-config.json", embed, true, None,
+                       Some(eh.as_str()), true, PackScope::Base, None),
+                   Write { heal_user_copy: true }, "force·판독불가 → 백업 의무(폴백 개정)");
+        assert_eq!(super::decide_file_action("bin/x.py", embed, false, None,
+                       None, true, PackScope::Base, None),
+                   Write { heal_user_copy: false }, "force·부재 → 신규 설치(!exists 불변)");
+
+        // fast-path 대조군: 디스크=임베드 → Keep{adopt:true} — verified_base 미참조 증명.
+        assert_eq!(super::decide_file_action("bin/x.py", embed, true, Some(embed),
+                       None, false, PackScope::Base, Some("E1")),
+                   Keep { adopt_hash: true, new_pending: false },
+                   "fast-path: base=Some 주입에도 Keep{{adopt:true}} 불변(verified_base 미참조)");
+    }
+
+    /// [T2 봉인·v2 §7] SYSTEM_LOCKED 3단 census — ①전 항목 팩 실재 ②전 항목 양 스코프 System
+    /// (등급 이탈 = User/SeedOnce 조기 분기가 L0 를 그림자화 — 기계 봉인) ③스냅샷 항등 + 파일명
+    /// 패턴 스윕(trusted-keys|.pub|minisign 매치 ⊆ SYSTEM_LOCKED).
+    #[test]
+    fn system_locked_census() {
+        // ① SYSTEM_LOCKED 전 항목이 임베드 팩(PACK_ALL)에 실재.
+        for &rel in SYSTEM_LOCKED {
+            assert!(PACK_ALL.iter().any(|(r, _)| *r == rel), "SYSTEM_LOCKED 항목 팩 부재: {rel}");
+        }
+        // ② 전 항목 양 스코프 System — 조기 분기의 L0 그림자화 봉인.
+        for &rel in SYSTEM_LOCKED {
+            assert_eq!(ownership_scoped(rel, PackScope::Base), Ownership::System,
+                       "②Base 스코프 System 이탈: {rel}");
+            assert_eq!(ownership_scoped(rel, PackScope::Dept), Ownership::System,
+                       "②Dept 스코프 System 이탈: {rel}");
+        }
+        // ③ 스냅샷 항등 + 패턴 스윕(신규 신뢰 자산이 잠금 등재 없이 팩에 들어오면 여기서 걸린다).
+        let locked: Vec<&str> = PACK_ALL.iter().map(|(r, _)| *r)
+            .filter(|&r| system_locked(r)).collect();
+        assert_eq!(locked, vec!["trusted-keys.json"], "③system_locked 스냅샷 항등");
+        for &(rel, _) in PACK_ALL.iter() {
+            if rel.contains("trusted-keys") || rel.ends_with(".pub") || rel.contains("minisign") {
+                assert!(system_locked(rel), "③패턴 스윕: 신뢰 자산 후보가 SYSTEM_LOCKED 밖: {rel}");
+            }
+        }
     }
 
     #[test]
@@ -6666,26 +6839,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// user-edit 보존: force=false 재설치가 사용자 편집 파일을 덮지 않는다(init-pack '4 preserved' 정합).
+    /// ★후계ⓐ(B2 전환 · v2 §6): 벤더 전진 + base 미검증 드리프트 → 치유 불변(healed).
+    /// 픽스처는 의도적으로 base 검증 실패 형상(manifest≠hash(pristine)) — T3 이후에도 L4 healed
+    /// 레인 핀으로 영속(병합 성공 레인은 T3 통합 핀이 별도 담당 — 이 핀을 Merge3 기대로 오개정 금지).
     #[test]
-    fn install_staged_preserves_user_edit() {
+    fn system_edit_healed_when_vendor_advanced() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let base = std::env::temp_dir().join(format!("cys-staged-pres-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cys-staged-healA-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
         let _env = set_pack_env(&pd, base.join("claude"));
 
         install_staged(false, None).unwrap();
-        // ★B2: user 소유 파일(soul.md 등 — 디렉티브 제외)의 편집은 보존, system 파일 편집은 강제 갱신.
+        let sys = "alerts-config.json";
+        let sys_embed = PACK_ALL.iter().find(|(r, _)| *r == sys).map(|(_, c)| *c)
+            .expect("팩에 alerts-config.json 실재");
+        std::fs::write(pd.join(sys), "SYS-EDIT-XYZ").unwrap();
+        // 벤더 전진 시뮬(w1 bytewise 전례 동형): 마지막 적용본 해시를 과거로 되감는다.
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(sys.to_string(), content_hash("OLD-VENDOR-BASE"));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+        // base 미검증 고정: pristine 사본 제거(manifest≠hash(pristine) 형상 — L3 아닌 L4 레인).
+        let _ = std::fs::remove_file(pd.join(PRISTINE_DIR).join(sys));
+
+        install_staged(false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(sys)).unwrap(),
+            sys_embed,
+            "★후계ⓐ(B2 전환 · v2 §6): 벤더 전진+base 미검증 드리프트 → 치유 불변(healed)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pd.join(format!("{sys}.user"))).unwrap(),
+            "SYS-EDIT-XYZ",
+            "치유 전 사용자본 보존 파괴 0 불변"
+        );
+        assert_eq!(
+            load_merge_pending(&pd).get(sys).and_then(|e| e["kind"].as_str()),
+            Some("healed"),
+            "원장 kind==healed"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★후계ⓑ(B2 전환 · v2 §6): 벤더 미전진 드리프트 → kept-drift 제자리 보존.
+    /// 현행 픽스처 그대로(1차 설치 후 sys 편집 → manifest 는 자연히 hash(embed)) — user_target
+    /// 보존 assert 는 원 핀(install_staged_preserves_user_edit)에서 승계.
+    #[test]
+    fn system_edit_kept_when_vendor_static() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-staged-keptB-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        let _env = set_pack_env(&pd, base.join("claude"));
+
+        install_staged(false, None).unwrap();
+        // ★B2: user 소유 파일(soul.md 등 — 디렉티브 제외) 편집 보존 — 원 핀 픽스처 그대로.
         let user_target = PACK_ALL
             .iter()
             .find(|(rel, content)| is_user_owned(rel) && !rel.ends_with("_DIRECTIVE.md") && !content.starts_with("#!"))
             .map(|(rel, _)| *rel)
             .expect("user 소유 비-디렉티브 임베드 파일(soul.md 등) 존재");
-        let (sys_target, sys_embed) = PACK_ALL
+        let sys_target = PACK_ALL
             .iter()
             .find(|(rel, content)| !is_user_owned(rel) && !content.starts_with("#!"))
-            .map(|(rel, c)| (*rel, *c))
+            .map(|(rel, _)| *rel)
             .expect("system 비-shebang 임베드 파일 존재");
         std::fs::write(pd.join(user_target), "USER-EDIT-XYZ").unwrap();
         std::fs::write(pd.join(sys_target), "SYS-EDIT-XYZ").unwrap();
@@ -6698,8 +6918,16 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(pd.join(sys_target)).unwrap(),
-            sys_embed,
-            "★B2: system 파일 편집은 임베드로 강제 갱신(스큐 동결 금지)"
+            "SYS-EDIT-XYZ",
+            "★후계ⓑ(B2 전환 · v2 §6): 벤더 미전진 드리프트 → kept-drift 제자리 보존"
+        );
+        assert!(!pd.join(format!("{sys_target}.user")).exists(), "kept-drift 는 .user 미생성");
+        // 재실행 멱등: kept-drift 가 상태를 흔들지 않는다.
+        install_staged(false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(sys_target)).unwrap(),
+            "SYS-EDIT-XYZ",
+            "재실행 멱등"
         );
 
         let _ = std::fs::remove_dir_all(&base);
