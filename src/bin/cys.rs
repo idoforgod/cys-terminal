@@ -425,6 +425,9 @@ enum Command {
         /// 소실 승인 명시 플래그(기본 거부 rc=7 · 검사·감사 원장 기록은 계속 수행)
         #[arg(long)]
         force_unsafe_core: bool,
+        /// (merged 전용) 자동 병합 1명령 가역화 — 캡처본 복원·원장 conflicted 강등(manifest·pristine 불변)
+        #[arg(long, value_name = "REL")]
+        revert_merge: Option<String>,
     },
     /// 팩 상대경로의 소유권 등급(system|user|seed-once) 판정 — pack-guard hook·스크립트용 결정론 조회
     #[command(name = "pack-ownership")]
@@ -466,6 +469,33 @@ enum Command {
         /// 소실을 검출해도 강제 진행 — 소실 승인 명시 플래그(기본 거부 rc=7)
         #[arg(long)]
         force_unsafe_core: bool,
+    },
+    /// 사건 복구 원클릭 — 치유로 파킹된 내 수정본(.user)을 팩 제자리로 복권(스윕 생존 검증 동반)
+    #[command(name = "pack-adopt")]
+    PackAdopt {
+        /// 대상 팩 상대경로(생략+--all 부재 = 복권 가능 목록 표시)
+        rel: Option<String>,
+        /// 원장 healed·conflicted 전 항목 순회 복권
+        #[arg(long)]
+        all: bool,
+        /// 원장 밖 명시 소스 경로에서 복원(<rel> 필수 동반)
+        #[arg(long)]
+        from: Option<String>,
+        /// vendor 전진 검출 시 착수 거부 대신 복원+즉시 전량 스윕(자동 병합) — 단건 전용 옵트인
+        #[arg(long)]
+        merge_after: bool,
+        /// 확인 프롬프트 없이 적용
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 명시 치유 — 드리프트 파일을 embed 본으로 복원(백업 선행 · 원장 kind 표시 확인 · system 전용)
+    #[command(name = "pack-heal")]
+    PackHeal {
+        /// 대상 팩 상대경로
+        rel: String,
+        /// 확인 프롬프트 없이 적용(병합 결과(kind=merged)에는 비허용 — 대화형 확인 또는 --revert-merge)
+        #[arg(long)]
+        yes: bool,
     },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
@@ -3216,11 +3246,11 @@ fn run(command: Command) -> i32 {
         Command::PackPlan { force } => return run_pack_plan(force),
         Command::PackMerge {
             file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor, dry_run,
-            force_unsafe_core,
+            force_unsafe_core, revert_merge,
         } => {
             return run_pack_merge(
                 file, take_new, keep_mine, ai, to_local, propose, yes, force_vendor, dry_run,
-                force_unsafe_core,
+                force_unsafe_core, revert_merge,
             );
         }
         Command::PackOwnership { rel, quiet } => {
@@ -3256,6 +3286,10 @@ fn run(command: Command) -> i32 {
         Command::PackRollback { file, yes, force_vendor, force_unsafe_core } => {
             return run_pack_rollback(file, yes, force_vendor, force_unsafe_core);
         }
+        Command::PackAdopt { rel, all, from, merge_after, yes } => {
+            return run_pack_adopt(rel, all, from, merge_after, yes);
+        }
+        Command::PackHeal { rel, yes } => return run_pack_heal(&rel, yes),
         Command::HooksPrune { pack_dir, dry_run, allow_base } => {
             return run_hooks_prune(&pack_dir, dry_run, allow_base);
         }
@@ -14571,6 +14605,7 @@ fn run_pack_merge(
     force_vendor: bool,
     dry_run: bool,
     force_unsafe_core: bool,
+    revert_merge: Option<String>,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
     let mut pending = cys::pack::load_merge_pending(&dir);
@@ -14583,6 +14618,14 @@ fn run_pack_merge(
     if dry_run && !(take_new || keep_mine) {
         eprintln!("--dry-run 은 --take-new/--keep-mine 과 함께 사용(해소 예정 판정·쓰기 0)");
         return 1;
+    }
+    // ★T4: --revert-merge 단독 계약(fail-closed — 침묵 무시 금지 · G3-축3 동형) — merged 전용 가역화.
+    if let Some(rrel) = revert_merge {
+        if file.is_some() || take_new || keep_mine || ai || to_local || propose || dry_run {
+            eprintln!("--revert-merge 는 단독 사용(merged 원장 전용 가역화) — 다른 해소 플래그와 조합 불가");
+            return 1;
+        }
+        return run_pack_revert_merge(&dir, &rrel, yes);
     }
     let Some(rel) = file else {
         // 목록 모드
@@ -14602,6 +14645,27 @@ fn run_pack_merge(
                 "healed" => println!(
                     "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--propose|--keep-mine(보존본 정리)]"
                 ),
+                "kept-drift" => println!(
+                    "  📌 {rel} — 내 수정본 제자리 보존 중(vendor {ver} 미전진 — 다음 전진 때 자동 병합)\n     → 그대로 두면 됨 · vendor 복귀: cys pack-heal {rel} (= --take-new)"
+                ),
+                "merged" => println!(
+                    "  🧬 {rel} — vendor {ver} 위 자동 병합 완료(원본 캡처 보존)\n     → 되돌리기: cys pack-merge --revert-merge {rel}"
+                ),
+                "conflicted" => {
+                    let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                    let at_rest = if e.get("state").and_then(|v| v.as_str()) == Some("at-rest") {
+                        " (at-rest)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  ⚡ {rel} — 자동 병합 실패({reason}) — vendor 본 적용·내 수정본 {rel}.user·조상 {rel}.base 보존{at_rest}\n     → cys pack-adopt {rel}(복권) | --to-local | --keep-mine(정리)"
+                    );
+                }
+                "quarantined" => println!(
+                    "  🚧 {rel} — 판독 불가+백업 실패로 무접촉 보존 — UTF-8 회복 후 재스윕 또는 cys pack-heal {rel}"
+                ),
+                "adopted" => println!("  ↩ {rel} — 복권됨(다음 스윕에 kept-drift 정규화)"),
                 _ => println!("  ? {rel} ({kind})"),
             }
         }
@@ -14816,7 +14880,7 @@ fn run_pack_merge(
                 }
             }
         }
-        "healed" => {
+        "healed" | "conflicted" => {
             let user_path = dir.join(format!("{rel}.user"));
             if to_local {
                 // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
@@ -14877,6 +14941,10 @@ fn run_pack_merge(
                 }
                 if confirm(&format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")) {
                     resolve(&mut pending, ".user");
+                    if kind == "conflicted" {
+                        // 충돌 조상 사이드카 동반 정리(정리 확정 시에만 — 복권 경로는 .base 유지).
+                        let _ = std::fs::remove_file(dir.join(format!("{rel}.base")));
+                    }
                     // 디스크 본문 무변경 해소 — before==after 로 '정리' 사실만 원장에 남긴다.
                     let cur = std::fs::read_to_string(&target).unwrap_or_default();
                     let action = if take_new { "take-new" } else { "keep-mine" };
@@ -14891,6 +14959,7 @@ fn run_pack_merge(
                     "'{rel}' 은 system 파일 — 직접 되쓰기하면 다음 스윕부터 제자리 보존(kept-drift)됩니다(vendor 전진 시 자동 병합·충돌은 vendor+.user 강등). 원장 해소:\n\
                      \x20 cys pack-merge --file {rel} --to-local  # 사용자본을 오버레이로(스킬 shadowing)\n\
                      \x20 cys pack-merge --file {rel} --keep-mine # vendor 본 유지 확정(보존본 정리)\n\
+                     \x20 cys pack-adopt {rel}                    # 보존본을 팩 제자리로 복권(스윕 생존 검증)\n\
                      \x20 (되쓰기 후 vendor 복귀는 cys pack-heal {rel})\n\
                      보존본 위치: {}",
                     user_path.display()
@@ -14898,11 +14967,476 @@ fn run_pack_merge(
                 0
             }
         }
+        "kept-drift" => {
+            // ★T4 계약: --take-new = 명시 치유(pack-heal 동일 경로) · --keep-mine = 무조치 확인 ·
+            //   그 외 플래그 = 거부(to-local 비지원 — 소비 채널 부재 · adopt 비대상).
+            if dry_run {
+                if take_new {
+                    println!("(dry-run · 쓰기 0) '{rel}' ← vendor 본 복원(pack-heal 동일 경로) 예정");
+                } else {
+                    println!("(dry-run · 쓰기 0) '{rel}' — 조치 불요(kept-drift 보존 확정 상태)");
+                }
+                return 0;
+            }
+            if take_new {
+                return run_pack_heal(&rel, yes);
+            }
+            if keep_mine {
+                println!("'{rel}' 은 이미 보존 확정 상태(kept-drift — 조치 불요·다음 vendor 전진 때 자동 병합)");
+                return 0;
+            }
+            eprintln!(
+                "'{rel}' 은 kept-drift(제자리 보존) — 지원 해소: --take-new(vendor 복귀 = cys pack-heal {rel}) · --keep-mine(무조치 확인)"
+            );
+            1
+        }
+        "merged" => {
+            if take_new || keep_mine || to_local {
+                eprintln!(
+                    "'{rel}' 은 자동 병합 결과(merged) — cys pack-merge --revert-merge {rel}(가역화) 또는 cys pack-heal {rel}(vendor 복귀)를 쓰세요"
+                );
+                return 1;
+            }
+            println!(
+                "'{rel}' — vendor 위 자동 병합 완료 상태(원본 캡처 보존). 되돌리기: cys pack-merge --revert-merge {rel}"
+            );
+            0
+        }
+        "quarantined" => {
+            eprintln!(
+                "'{rel}' 은 격리(quarantined) — 판독 불가+백업 실패로 무접촉 보존. UTF-8 회복 후 재스윕(cys init-pack) 또는 cys pack-heal {rel}"
+            );
+            1
+        }
+        "adopted" => {
+            println!("'{rel}' — 복권됨(다음 스윕에 kept-drift 정규화 — 조치 불요)");
+            0
+        }
         other => {
             eprintln!("알 수 없는 원장 kind '{other}' — 수동 확인 필요");
             1
         }
     }
+}
+
+/// ★T4 공용: 현재 unix 초.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// ★T4 공용: 감사 flags — 판단에 영향을 준 승인 플래그만(추적의 재료).
+fn t4_flags(yes: bool) -> Vec<String> {
+    if yes {
+        vec!["yes".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// ★T4 공용: 단순 y/N 확인 — 비대화형(stdin EOF)=빈 입력=거절(fail-closed).
+fn confirm_stdin(prompt: &str) -> bool {
+    print!("{prompt} [y/N] ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    matches!(line.trim(), "y" | "Y" | "yes")
+}
+
+/// ★T4 순수 헬퍼(문구 핀 단독 검증 대상): pack-heal 확인 프롬프트 자구.
+/// kind=merged 는 병합 결과 self-소거 오조작 방지 문구(ts=unix 초 → UTC %Y-%m-%d — 결정론).
+fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
+    if kind == Some("merged") {
+        let date = ts
+            .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t as i64, 0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "?".into());
+        format!(
+            "이 드리프트는 {date} 자동 병합 결과입니다. 정말 vendor 본으로 되돌립니까? (내 수정분은 {rel}.user 로 보존)"
+        )
+    } else {
+        format!("'{rel}' 을 vendor 본으로 복원(내 수정분은 {rel}.user 보존)?")
+    }
+}
+
+/// ★T4(v2 §5): 명시 치유 동사 — 드리프트 system 파일을 embed 본으로 복원(백업 선행 · 3중 전진 ·
+/// 원장 healed 전환). kept-drift 해소의 --take-new 와 동일 코드 경로다.
+/// ★소유권 게이트(시드 무언급 신규 안전 게이트 — deviations 보고): PACK_ALL 미등재·비system rel
+/// 거부 — User·SeedOnce 불가침(그대로면 User 파일 파괴 동사가 된다 · 해소는 pack-merge 경로 안내).
+/// ★백업 실패 = 무조건 fail-closed 거부 — L0(system_locked)의 '백업 실패 시 강행' 예외는 무인
+/// 스윕 전용이며 명시 동사에 미적용. 원장 kind=merged 는 --yes 비허용(병합본 self-소거 오조작
+/// 방지 — 대화형 확인 또는 pack-merge --revert-merge). --yes 여도 원장 kind 표시 줄은 남긴다.
+fn run_pack_heal(rel: &str, yes: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    // ① embed 조회 — 부재 = 거부.
+    let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
+    else {
+        eprintln!("'{rel}' 은 임베드 팩에 없음(자작·폐기 파일) — pack-heal 대상 아님");
+        return 1;
+    };
+    // ② system 전용(User·SeedOnce 불가침).
+    let own = cys::pack::ownership_name_scoped(rel, &dir);
+    if own != "system" {
+        eprintln!("'{rel}' 은 system 소유가 아님({own}) — 헌법·user 파일의 해소는 cys pack-merge 경로를 쓰세요");
+        return 1;
+    }
+    // ③ 이미 vendor 본과 동일 = 조치 불요.
+    let target = dir.join(rel);
+    let disk = std::fs::read_to_string(&target).ok();
+    if disk.as_deref() == Some(embed) {
+        println!("'{rel}' 은 이미 vendor 본과 동일 — 조치 불요");
+        return 0;
+    }
+    // ④ 원장 kind 표시 확인 — merged 는 --yes 비허용(프롬프트 없이 즉시 거부).
+    let mut pending = cys::pack::load_merge_pending(&dir);
+    let kind = pending
+        .get(rel)
+        .and_then(|e| e.get("kind"))
+        .and_then(|k| k.as_str())
+        .map(str::to_string);
+    let ts = pending.get(rel).and_then(|e| e.get("ts")).and_then(|t| t.as_u64());
+    if kind.as_deref() == Some("merged") && yes {
+        eprintln!("병합 결과 되돌림은 --yes 비허용 — 대화형 확인 또는 cys pack-merge --revert-merge {rel}");
+        return 1;
+    }
+    if let Some(k) = kind.as_deref() {
+        println!("원장 kind: {k}");
+    }
+    if !yes && !confirm_stdin(&heal_prompt_line(kind.as_deref(), ts, rel)) {
+        println!("보류 — 무변경");
+        return 0;
+    }
+    // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
+    if let Some(d) = disk.as_deref() {
+        if let Err(e) = cys::pack::write_atomic(&dir.join(format!("{rel}.user")), d.as_bytes()) {
+            eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
+            return 1;
+        }
+    } else if target.exists() {
+        if let Err(e) = cys::pack::byte_backup_user(&dir, rel, &target) {
+            eprintln!("바이트 백업 실패({e}) — fail-closed 거부(무변경 · L0 강행 예외는 무인 스윕 전용)");
+            return 1;
+        }
+    }
+    // ⑥ 복원 + 3중 전진(manifest·pristine ← embed).
+    if let Err(e) = cys::pack::write_atomic(&target, embed.as_bytes()) {
+        eprintln!("복원 쓰기 실패: {e}");
+        return 1;
+    }
+    advance_vendor_baseline(&dir, rel, embed);
+    // ⑦ 원장 healed 전환(merged 였으면 capture 승계 — upsert_pending_v2 계보 규칙) → save.
+    let mut dirty = false;
+    if let serde_json::Value::Object(entry) = serde_json::json!({
+        "kind": "healed", "side": format!("{rel}.user"),
+        "version": env!("CARGO_PKG_VERSION"), "ts": unix_now(),
+    }) {
+        cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
+    }
+    cys::pack::save_merge_pending(&dir, &pending);
+    // ⑧ 감사(기록 실패는 loud 경고 후 계속 — 관측이지 게이트가 아니다).
+    let before = disk.unwrap_or_default();
+    if let Err(e) = cys::pack::append_merge_audit(
+        &dir,
+        &merge_audit_entry(rel, "pack-heal", &before, embed, "n/a", &t4_flags(yes)),
+    ) {
+        eprintln!("⚠ 감사 원장 기록 실패(치유는 완료): {e}");
+    }
+    // ⑨ 복권 경로 안내.
+    println!("✅ {rel} ← vendor 본 복원(내 수정분은 {rel}.user 보존) — 복권(제자리 복귀)은 cys pack-adopt {rel}");
+    0
+}
+
+/// ★T4(v2 §5): --revert-merge — 자동 병합 1명령 가역화(merged 원장 전용). 순서 고정:
+/// 캡처 부재=fail-closed 거부(무변경) → 확인 → 현 디스크 전문 {rel}.user 백업(병합 후 사용자
+/// 재수정 보호 — 원칙 4) → disk←캡처본 → manifest·pristine 불변 → 원장 conflicted 강등
+/// (reason:"revert-merge" · capture 승계 자동) → 감사. 다음 스윕은 vendor 미전진이면 KeepDrift
+/// (kind 불변·at-rest), 다음 릴리스에 L3 재병합 기회.
+fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool) -> i32 {
+    let mut pending = cys::pack::load_merge_pending(dir);
+    let Some(entry) = pending.get(rel).cloned() else {
+        eprintln!("'{rel}' 은 병합 대기 목록에 없음 — `cys pack-merge` 로 목록 확인");
+        return 1;
+    };
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    if kind != "merged" {
+        eprintln!("--revert-merge 는 kind=merged 전용(현재 '{kind}') — 해소는 cys pack-merge --file {rel}");
+        return 1;
+    }
+    // capture 상대경로 → pack-captures 루트 해소. 부재·읽기 실패 = fail-closed 거부(무변경).
+    let Some(capture) = entry.get("capture").and_then(|v| v.as_str()) else {
+        eprintln!("'{rel}' merged 원장에 capture 포인터가 없음 — fail-closed 거부(원장·디스크 무변경)");
+        return 1;
+    };
+    let cap_path = cys::pack::pack_captures_dir(dir).join(capture);
+    let captured = match std::fs::read_to_string(&cap_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("캡처본 읽기 실패 {}: {e} — fail-closed 거부(원장·디스크 무변경)", cap_path.display());
+            return 1;
+        }
+    };
+    if !yes
+        && !confirm_stdin(&format!(
+            "'{rel}' 자동 병합을 되돌려 캡처본(병합 전 내 수정본)으로 복원합니까? (현 병합본은 {rel}.user 로 보존)"
+        ))
+    {
+        println!("보류 — 무변경");
+        return 0;
+    }
+    // 현 디스크 전문 → {rel}.user 백업(병합 후 사용자 재수정 보호).
+    let target = dir.join(rel);
+    let merged_now = std::fs::read_to_string(&target).unwrap_or_default();
+    if let Err(e) = cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes()) {
+        eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
+        return 1;
+    }
+    if let Err(e) = cys::pack::write_atomic(&target, captured.as_bytes()) {
+        eprintln!("복원 쓰기 실패: {e}");
+        return 1;
+    }
+    // manifest·pristine 불변 — 원장만 conflicted 강등(capture 승계는 upsert_pending_v2 자동).
+    let mut dirty = false;
+    if let serde_json::Value::Object(e) = serde_json::json!({
+        "kind": "conflicted", "side": format!("{rel}.user"), "reason": "revert-merge",
+        "version": env!("CARGO_PKG_VERSION"), "ts": unix_now(),
+    }) {
+        cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, e);
+    }
+    cys::pack::save_merge_pending(dir, &pending);
+    if let Err(e) = cys::pack::append_merge_audit(
+        dir,
+        &merge_audit_entry(rel, "revert-merge", &merged_now, &captured, "n/a", &t4_flags(yes)),
+    ) {
+        eprintln!("⚠ 감사 원장 기록 실패(복원은 완료): {e}");
+    }
+    println!(
+        "✅ {rel} ← 캡처본 복원(병합본은 {rel}.user 보존) — 원장 conflicted 강등(manifest·pristine 불변). 다음 vendor 전진 때 재병합 기회가 있습니다."
+    );
+    0
+}
+
+/// ★T4(v2 §9): 사건 복구 원클릭 — 치유·충돌로 파킹된 내 수정본(.user)을 팩 제자리로 복권.
+/// 판정 시뮬(cys::pack::decide_file_action 직호출 — 재구현 금지)로 스윕 생존을 선검증:
+/// vendor 미전진(KeepDrift·Keep)=착수 · 전진(Merge3·Write)=기본 착수 거부 + --merge-after
+/// 옵트인(복원+즉시 전량 재스윕=자동 병합 · 단건 전용). 소스 .user 는 {rel}.user.adopted-<ts>
+/// 개명 보존 · 원장 adopted(다음 스윕에 kept-drift 정규화 · conflicted 였으면 capture·base_side
+/// 승계 — .base 파일은 유지: 사후 3-way 재료).
+fn run_pack_adopt(
+    rel: Option<String>,
+    all: bool,
+    from: Option<String>,
+    merge_after: bool,
+    yes: bool,
+) -> i32 {
+    let dir = cys::pack::pack_dir();
+    // 조합 게이트(fail-closed — 침묵 무시 금지).
+    if all && (rel.is_some() || from.is_some()) {
+        eprintln!("--all 은 단독 사용(원장 순회) — <rel>·--from 과 조합 불가");
+        return 1;
+    }
+    if from.is_some() && rel.is_none() {
+        eprintln!("--from 은 <rel> 필수 동반(어느 팩 경로로 복원할지 명시)");
+        return 1;
+    }
+    if merge_after && all {
+        eprintln!("--merge-after 는 단건 전용 — --all 과 조합 불가");
+        return 1;
+    }
+    let pending = cys::pack::load_merge_pending(&dir);
+    if rel.is_none() && !all {
+        // 복권 가능 목록(kind∈{healed,conflicted} ∧ .user 실재) — 읽기 전용.
+        let mut n = 0usize;
+        for (r, e) in pending.iter() {
+            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            if matches!(kind, "healed" | "conflicted") && dir.join(format!("{r}.user")).is_file() {
+                println!("  {r} [{kind}] → cys pack-adopt {r}");
+                n += 1;
+            }
+        }
+        if n == 0 {
+            println!("복권 가능한 보존본 없음(원장 healed·conflicted ∧ <rel>.user 실재 기준)");
+        }
+        return 0;
+    }
+    let targets: Vec<String> = if all {
+        pending
+            .iter()
+            .filter(|(_, e)| {
+                matches!(e.get("kind").and_then(|v| v.as_str()), Some("healed") | Some("conflicted"))
+            })
+            .map(|(r, _)| r.clone())
+            .collect()
+    } else {
+        vec![rel.clone().unwrap_or_default()]
+    };
+    if targets.is_empty() {
+        println!("복권 대상 없음(원장 healed·conflicted 0건)");
+        return 0;
+    }
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for r in &targets {
+        match adopt_one(&dir, r, from.as_deref(), merge_after, yes) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                eprintln!("✗ {r}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    if all {
+        println!("복권 요약: 성공 {ok} · 실패 {failed}");
+    }
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// pack-adopt 파일별 절차(v2 §9 순서 고정) — Err = 해당 건 거부 사유(그 파일 무변경).
+fn adopt_one(
+    dir: &std::path::Path,
+    rel: &str,
+    from: Option<&str>,
+    merge_after: bool,
+    yes: bool,
+) -> Result<(), String> {
+    // ① 소스 결정 — read_to_string 실패(비UTF-8·부재) = 거부(수동 복구 안내).
+    let (src_label, src_path) = match from {
+        Some(p) => (p.to_string(), std::path::PathBuf::from(p)),
+        None => (format!("{rel}.user"), dir.join(format!("{rel}.user"))),
+    };
+    let source = std::fs::read_to_string(&src_path).map_err(|e| {
+        format!("소스 {} 판독 실패({e}) — 비UTF-8·부재는 수동 복구 대상", src_path.display())
+    })?;
+    // ② embed 조회 — 부재 rel 은 --from 명시 시에만 허용(custom 복원 · 판정 시뮬 생략).
+    let embed: Option<&str> = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c);
+    if embed.is_none() && from.is_none() {
+        return Err("임베드에 없는 rel — 원장 밖 custom 복원은 --from <경로> 로 명시하라".into());
+    }
+    // 소유권 게이트(pack-heal 동형): 임베드 실재 rel 은 system 전용(User·SeedOnce 불가침).
+    if embed.is_some() {
+        let own = cys::pack::ownership_name_scoped(rel, dir);
+        if own != "system" {
+            return Err(format!("system 소유가 아님({own}) — user 파일 해소는 cys pack-merge 경로"));
+        }
+    }
+    // ③ 타깃 가드 — 치유 후 재수정 보호(fail-closed) · disk==소스 = 원장 정리+개명만.
+    let target = dir.join(rel);
+    let disk = std::fs::read_to_string(&target).ok();
+    let cleanup_only = disk.as_deref() == Some(source.as_str());
+    if !cleanup_only {
+        match embed {
+            Some(em) => {
+                if disk.as_deref() != Some(em) {
+                    return Err(
+                        "디스크본이 vendor 본도 소스본도 아님(치유 후 재수정·판독 불가 감지) — 수동 병합 후 재시도"
+                            .into(),
+                    );
+                }
+            }
+            None => {
+                if disk.is_some() {
+                    return Err("디스크본이 이미 존재하고 소스와 다름 — 수동 확인 후 재시도".into());
+                }
+            }
+        }
+    }
+    // ④ 판정 시뮬 — 복원 후 상태(disk=소스)로 decide_file_action 직호출(재구현 금지 — SOT 단일).
+    if let Some(em) = embed {
+        if !cleanup_only {
+            let scope = cys::pack::pack_scope_of(dir);
+            let manifest: std::collections::BTreeMap<String, String> =
+                std::fs::read_to_string(dir.join(cys::pack::INSTALL_MANIFEST))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+            let mhash = manifest.get(rel).cloned();
+            let verified_base = mhash.as_deref().and_then(|mh| {
+                std::fs::read_to_string(dir.join(cys::pack::PRISTINE_DIR).join(rel))
+                    .ok()
+                    .filter(|p| cys::pack::content_hash_pub(p) == mh)
+            });
+            let action = cys::pack::decide_file_action(
+                rel,
+                em,
+                true,
+                Some(&source),
+                mhash.as_deref(),
+                false,
+                scope,
+                verified_base.as_deref(),
+            );
+            match action {
+                cys::pack::FileAction::KeepDrift | cys::pack::FileAction::Keep { .. } => {
+                    // vendor 미전진 — 복원본이 다음 스윕을 그대로 생존(kept-drift 정규화 예정).
+                }
+                cys::pack::FileAction::Merge3 | cys::pack::FileAction::Write { .. } => {
+                    if !merge_after {
+                        return Err(
+                            "vendor 전진 검출 — 복원 즉시 재병합/재치유 예상. 착수하려면 --merge-after(복원+즉시 전량 스윕=자동 병합) 옵트인"
+                                .into(),
+                        );
+                    }
+                    println!("⚠ {rel}: vendor 전진 — --merge-after 로 복원 후 즉시 재스윕(자동 병합)합니다");
+                }
+            }
+        }
+    }
+    // ⑤ 확인(--yes 통과).
+    if !yes && !confirm_stdin(&format!("'{rel}' ← {src_label} 복권(팩 제자리 복원)?")) {
+        return Err("사용자 보류(무변경)".into());
+    }
+    // ⑥ 복원 쓰기(disk==소스면 생략).
+    if !cleanup_only {
+        cys::pack::write_atomic(&target, source.as_bytes())
+            .map_err(|e| format!("복원 쓰기 실패: {e}"))?;
+    }
+    // ⑦ 원장 adopted 전환(conflicted 였으면 capture·base_side 승계 — .base 파일 유지) → save.
+    let mut pending = cys::pack::load_merge_pending(dir);
+    let now = unix_now();
+    let mut dirty = false;
+    if let serde_json::Value::Object(entry) = serde_json::json!({
+        "kind": "adopted", "side": rel, "from": src_label,
+        "version": env!("CARGO_PKG_VERSION"), "ts": now,
+    }) {
+        cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
+    }
+    cys::pack::save_merge_pending(dir, &pending);
+    // ⑧ .user 소스 개명 보존(--from 소스는 원위치 무접촉).
+    if from.is_none() {
+        let _ = std::fs::rename(&src_path, dir.join(format!("{rel}.user.adopted-{now}")));
+    }
+    // ⑨ 감사.
+    let before = disk.unwrap_or_default();
+    if let Err(e) = cys::pack::append_merge_audit(
+        dir,
+        &merge_audit_entry(rel, "adopt", &before, &source, "n/a", &t4_flags(yes)),
+    ) {
+        eprintln!("⚠ 감사 원장 기록 실패(복권은 완료): {e}");
+    }
+    println!("✅ {rel} ← 복권(소스 {src_label} · 다음 스윕에 kept-drift 정규화)");
+    // ⑩ --merge-after: 전량 재스윕(재구현 0 · install 멱등) 후 rel 결과 kind 보고.
+    if merge_after {
+        match cys::pack::install(false, Some(cys::pack::PackWriteAuth::production())) {
+            Ok((w, k)) => {
+                let after = cys::pack::load_merge_pending(dir);
+                let kind_now = after
+                    .get(rel)
+                    .and_then(|e| e.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(원장 무등재)");
+                println!("재스윕 완료(갱신 {w}·보존 {k}) — {rel} 결과 kind: {kind_now}");
+            }
+            Err(e) => {
+                eprintln!("⚠ 재스윕 실패({e}) — 복원 자체는 완료, cys init-pack 으로 수동 재스윕");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// ★W-F2(개선 환류 채널): 내 수정본과 vendor 본의 diff 를 제안 patch 파일로 생성.
@@ -14929,6 +15463,33 @@ fn run_pack_propose(dir: &std::path::Path, rel: &str, kind: &str, embed_now: Opt
                 Err(_) => embed_now.map(str::to_string).unwrap_or_default(),
             },
         ),
+        // ★T4: kept-drift(사용자 확장 제자리 보존)는 환류 채널의 1급 대상 — mine=디스크 본체.
+        "kept-drift" => (
+            dir.join(rel),
+            match embed_now {
+                Some(c) => c.to_string(),
+                None => {
+                    eprintln!("'{rel}' 은 현 임베드에 없음(폐기된 파일) — 제안 대상 아님");
+                    return 1;
+                }
+            },
+        ),
+        "merged" => {
+            eprintln!(
+                "'{rel}' 은 자동 병합 결과(merged) — 먼저 cys pack-merge --revert-merge {rel} 로 되돌린 뒤 내 수정본 기준으로 제안을 생성하세요"
+            );
+            return 1;
+        }
+        "conflicted" => {
+            eprintln!(
+                "'{rel}' 은 병합 충돌(conflicted) — 먼저 cys pack-adopt {rel} 로 내 수정본({rel}.user)을 복권한 뒤 제안을 생성하세요"
+            );
+            return 1;
+        }
+        "quarantined" => {
+            eprintln!("'{rel}' 은 격리(quarantined · 판독 불가) — UTF-8 회복 후 재스윕이 먼저입니다");
+            return 1;
+        }
         other => {
             eprintln!("알 수 없는 원장 kind '{other}' — 제안 생성 불가");
             return 1;
@@ -22190,6 +22751,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(rc, 0, "keep-mine 해소 성공");
         assert_eq!(
@@ -22219,6 +22781,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(rc, 0, "take-new 해소 성공");
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "vendor 신버전 채택");
@@ -22226,5 +22789,319 @@ mod tests {
         assert!(cys::pack::load_merge_pending(&td).get(&rel).is_none(), "원장 해소");
         assert_triple_advanced(&td, &rel, &embed);
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★T4 커밋2 — 신규 동사 E2E 핀(게이트 ⓕ)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// ★T4 커밋2 공통 픽스처: temp 팩 + env 3종(RAII — ENV_PACK_DIR·ENV_CONFIG_DIR·캡처 루트)
+    /// + system rel 동적 선택(잠금 자산 trusted-keys.json 제외 — kept-drift 세계 대표 검체).
+    fn t4_system_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, String, String, [cys::pack::EnvGuard; 3]) {
+        let base = std::env::temp_dir().join(format!("cys-t4v-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let td = base.join("pack");
+        std::fs::create_dir_all(&td).unwrap();
+        let guards = [
+            cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &td),
+            cys::pack::EnvGuard::set(cys::pack::ENV_CONFIG_DIR, base.join("cfg")),
+            cys::pack::EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures")),
+        ];
+        let (rel, embed) = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| {
+                cys::pack::ownership_name_scoped(r, &td) == "system" && *r != "trusted-keys.json"
+            })
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .expect("system rel 실재");
+        let target = td.join(&rel);
+        if let Some(par) = target.parent() {
+            std::fs::create_dir_all(par).unwrap();
+        }
+        (td, rel, embed, guards)
+    }
+
+    fn t4_write_ledger(td: &std::path::Path, rel: &str, entry: serde_json::Value) {
+        let mut pending = serde_json::Map::new();
+        if let serde_json::Value::Object(o) = entry {
+            pending.insert(rel.to_string(), serde_json::Value::Object(o));
+        }
+        cys::pack::save_merge_pending(td, &pending);
+    }
+
+    fn t4_manifest_set(td: &std::path::Path, rel: &str, content: &str) {
+        let mpath = td.join(cys::pack::INSTALL_MANIFEST);
+        let mut m: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&mpath)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        m.insert(rel.to_string(), cys::pack::content_hash_pub(content));
+        std::fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+    }
+
+    fn t4_pristine_set(td: &std::path::Path, rel: &str, content: &str) {
+        let bp = td.join(cys::pack::PRISTINE_DIR).join(rel);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, content).unwrap();
+    }
+
+    fn t4_ledger_kind(td: &std::path::Path, rel: &str) -> Option<String> {
+        cys::pack::load_merge_pending(td)
+            .get(rel)
+            .and_then(|e| e.get("kind"))
+            .and_then(|k| k.as_str())
+            .map(str::to_string)
+    }
+
+    /// ★T4(ⓕ): pack-adopt --all E2E — healed 보존본 복권 → 원장 adopted·.user 개명 보존 →
+    /// 전량 재스윕에서 복원본 생존(디스크 불변 = 스윕 생존 검증의 실증)·kept-drift 정규화.
+    #[test]
+    fn pack_adopt_e2e_all() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("adoptall");
+        let custom = "MY CUSTOM WORK v1\n";
+        std::fs::write(td.join(&rel), &embed).unwrap(); // healed 상태 = 디스크는 vendor 본
+        std::fs::write(td.join(format!("{rel}.user")), custom).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "healed", "side": format!("{rel}.user"),
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_adopt(None, true, None, false, true);
+        assert_eq!(rc, 0, "adopt --all 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), custom, "복권 완료");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("adopted"), "원장 adopted");
+        assert!(!td.join(format!("{rel}.user")).exists(), ".user 원본 슬롯 소거(개명)");
+        let base_name = td.join(&rel).file_name().unwrap().to_string_lossy().into_owned();
+        let renamed: Vec<std::path::PathBuf> = std::fs::read_dir(td.join(&rel).parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(&format!("{base_name}.user.adopted-")))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(renamed.len(), 1, ".user.adopted-<ts> 개명 보존");
+        assert_eq!(std::fs::read_to_string(&renamed[0]).unwrap(), custom, "개명본 내용 보존");
+
+        cys::pack::install(false, None).expect("재스윕");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), custom, "재스윕 생존(쓰기 0)");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("kept-drift"), "kept-drift 정규화");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4(ⓕ): pack-adopt --from — 원장 무등재 rel 을 명시 소스에서 복원(원장 adopted 신설 ·
+    /// --from 소스 원본은 무접촉).
+    #[test]
+    fn pack_adopt_from_source() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("adoptfrom");
+        let custom = "MY EXTERNAL SOURCE v2\n";
+        std::fs::write(td.join(&rel), &embed).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        let src = td.parent().unwrap().join("ext-src.md");
+        std::fs::write(&src, custom).unwrap();
+
+        let rc = run_pack_adopt(
+            Some(rel.clone()),
+            false,
+            Some(src.to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+        assert_eq!(rc, 0, "adopt --from 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), custom, "명시 소스 복원");
+        let pending = cys::pack::load_merge_pending(&td);
+        let e = pending.get(&rel).and_then(|v| v.as_object()).expect("원장 adopted 신설");
+        assert_eq!(e.get("kind").and_then(|v| v.as_str()), Some("adopted"));
+        assert_eq!(
+            e.get("from").and_then(|v| v.as_str()),
+            Some(src.to_string_lossy().as_ref()),
+            "from 소스 표기"
+        );
+        assert!(src.is_file(), "--from 소스 원본 무접촉(개명 없음)");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4(ⓕ): vendor 전진 검출 시 기본 착수 거부(무변경 — 판정 시뮬 = decide_file_action 직호출)
+    /// — --merge-after 옵트인 시에만 복원+즉시 전량 재스윕 → merged/conflicted 결과.
+    #[test]
+    fn pack_adopt_refuses_on_vendor_advanced_without_merge_after() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("adoptadv");
+        let old_vendor = "OLD VENDOR BASELINE v0\nshared line\n";
+        let custom = "OLD VENDOR BASELINE v0\nshared line\nMY ADDED LINE\n";
+        std::fs::write(td.join(&rel), &embed).unwrap(); // 치유 후 디스크 = 현 vendor 본
+        std::fs::write(td.join(format!("{rel}.user")), custom).unwrap();
+        t4_manifest_set(&td, &rel, old_vendor); // manifest = 구 vendor 해시(전진 검출 조건)
+        t4_pristine_set(&td, &rel, old_vendor);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "healed", "side": format!("{rel}.user"),
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_adopt(Some(rel.clone()), false, None, false, true);
+        assert_ne!(rc, 0, "vendor 전진 — 기본 착수 거부");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "디스크 무변경");
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            custom,
+            ".user 무변경"
+        );
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 무변경");
+
+        let rc2 = run_pack_adopt(Some(rel.clone()), false, None, true, true);
+        assert_eq!(rc2, 0, "--merge-after 옵트인 진행");
+        let kind = t4_ledger_kind(&td, &rel);
+        assert!(
+            matches!(kind.as_deref(), Some("merged") | Some("conflicted")),
+            "재스윕 후 merged/conflicted 기대 — 실측 {kind:?}"
+        );
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4(ⓕ): pack-heal 왕복 — kept-drift 를 --yes 로 치유: .user 백업 선행·disk←embed·
+    /// 3중 전진·원장 healed 전환(해소 경로가 rel 본체를 삭제하지 않음도 동반 확인).
+    #[test]
+    fn pack_heal_kept_drift_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("healkd");
+        let drift = "MY DRIFT EDIT\n";
+        std::fs::write(td.join(&rel), drift).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "kept-drift", "side": rel,
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_heal(&rel, true);
+        assert_eq!(rc, 0, "pack-heal 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "vendor 본 복원");
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            drift,
+            ".user 백업 선행"
+        );
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 healed 전환");
+        assert_triple_advanced(&td, &rel, &embed);
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4(ⓕ): merged 원장의 pack-heal --yes = 프롬프트 없이 즉시 거부(rc 1·전면 무변경 —
+    /// 병합본 self-소거 오조작 방지) + 프롬프트 자구는 순수 heal_prompt_line 단독 핀(UTC 결정론).
+    #[test]
+    fn pack_heal_merged_guard_refuses_yes() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("healmg");
+        let merged_disk = "AUTO MERGED BODY\n";
+        std::fs::write(td.join(&rel), merged_disk).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "merged", "side": rel, "capture": "pack/1-2/x",
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_heal(&rel, true);
+        assert_eq!(rc, 1, "merged + --yes = 즉시 거부");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), merged_disk, "디스크 무변경");
+        assert!(!td.join(format!("{rel}.user")).exists(), "백업도 미생성(전면 무변경)");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("merged"), "원장 무변경");
+
+        assert_eq!(
+            heal_prompt_line(Some("merged"), Some(0), "soul.md"),
+            "이 드리프트는 1970-01-01 자동 병합 결과입니다. 정말 vendor 본으로 되돌립니까? (내 수정분은 soul.md.user 로 보존)",
+            "merged 프롬프트 자구 핀(ts=0 → 1970-01-01 UTC)"
+        );
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4(ⓕ): --revert-merge 왕복 — 캡처본 복원·병합본 .user 보존·manifest/pristine 불변·
+    /// 원장 conflicted{reason:revert-merge} 강등(capture 승계) → 재스윕 KeepDrift(kind 불변·at-rest).
+    #[test]
+    fn revert_merge_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("revmg");
+        let captured = "MY ORIGINAL BEFORE AUTO-MERGE\n";
+        let merged_disk = "AUTO MERGED RESULT\n";
+        std::fs::write(td.join(&rel), merged_disk).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        // 캡처 픽스처 — create_capture_segment 형식("<basename>/<ts>-<pid>/<rel>") 합성.
+        let cap_rel = format!("pack/100-42/{rel}");
+        let cap_path = cys::pack::pack_captures_dir(&td).join(&cap_rel);
+        std::fs::create_dir_all(cap_path.parent().unwrap()).unwrap();
+        std::fs::write(&cap_path, captured).unwrap();
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "merged", "side": rel, "capture": cap_rel,
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_merge(
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            Some(rel.clone()),
+        );
+        assert_eq!(rc, 0, "revert-merge 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), captured, "캡처본 복원");
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            merged_disk,
+            "병합본 .user 보존(재수정 보호)"
+        );
+        assert_triple_advanced(&td, &rel, &embed); // manifest·pristine 불변(픽스처 그대로)
+        let pend = cys::pack::load_merge_pending(&td);
+        let e = pend.get(&rel).and_then(|v| v.as_object()).expect("원장 잔존");
+        assert_eq!(e.get("kind").and_then(|v| v.as_str()), Some("conflicted"), "conflicted 강등");
+        assert_eq!(e.get("reason").and_then(|v| v.as_str()), Some("revert-merge"));
+        assert_eq!(
+            e.get("capture").and_then(|v| v.as_str()),
+            Some(cap_rel.as_str()),
+            "capture 승계(증거 포인터 불소실)"
+        );
+        assert_eq!(e.get("side").and_then(|v| v.as_str()), Some(format!("{rel}.user").as_str()));
+
+        cys::pack::install(false, None).expect("재스윕");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), captured, "재스윕 생존(KeepDrift)");
+        let pend2 = cys::pack::load_merge_pending(&td);
+        let e2 = pend2.get(&rel).and_then(|v| v.as_object()).unwrap();
+        assert_eq!(e2.get("kind").and_then(|v| v.as_str()), Some("conflicted"), "LINEAGE kind 불변");
+        assert_eq!(e2.get("state").and_then(|v| v.as_str()), Some("at-rest"), "at-rest 전이");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 }

@@ -1898,8 +1898,9 @@ pub fn local_dir() -> PathBuf {
 }
 
 /// 파일 1건의 설치 판정(순수·부수효과 0) — install_into 와 plan_install 공용.
+/// ★T4 CLI 동사 소비(pack-adopt 판정 시뮬 결과 타입) — 재구현 금지.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FileAction {
+pub enum FileAction {
     /// 임베드 내용을 디스크에 기록. heal_user_copy=true 면 사용자 수정본을 `<rel>.user` 로 먼저 보존
     /// — 판독 가능이면 `<rel>.user` · 판독 불가(L0·L1)는 바이트 백업(실행부 T3 — T2 인터림은 현행
     /// 실행부 그대로 백업 미실행).
@@ -1917,7 +1918,8 @@ pub(crate) enum FileAction {
 
 /// 순수 판정 SOT — User·SeedOnce 조기 분기 불변, system은 L0(locked 즉시 치유)/L1(판독불가 백업 후
 /// 치유)/L2(벤더 미전진 kept-drift)/L3(벤더 전진 검증 base 3-way)/L4(레거시 종전 거동) 판정표(v2 §3).
-pub(crate) fn decide_file_action(
+/// ★T4 CLI 동사 소비(pack-adopt 스윕 생존 판정 시뮬) — 재구현 금지.
+pub fn decide_file_action(
     rel: &str,
     embed: &str,
     exists: bool,
@@ -2068,7 +2070,8 @@ pub(crate) const LINEAGE_KINDS: [&str; 2] = ["merged", "conflicted"];
 ///   후속 upsert 도 떨어뜨리지 않는다.
 /// - 전 필드(ts 제외) same 비교 후 upsert — 같으면 no-op(매 기동 install 의 원장 rewrite 방지
 ///   계약 유지 · ts 는 최초 기록 시각 보존).
-fn upsert_pending_v2(
+/// ★T4 CLI 동사 소비(pack-heal·pack-adopt·revert-merge 원장 계보 전환) — 재구현 금지.
+pub fn upsert_pending_v2(
     pending: &mut serde_json::Map<String, serde_json::Value>,
     dirty: &mut bool,
     rel: &str,
@@ -2416,7 +2419,8 @@ fn ensure_pristine_checked(dir: &Path, rel: &str, content: &str) -> Result<(), S
 /// 팩 밖 경로라 write_journal·rollback·prune·pack.prev 전 기계 무접촉 = **트랜잭션 롤백을
 /// 생존하는 증거 저장소**(MERGE_AUDIT 비저널 전례 동형). 캡처 GC 없음(0.14.29 · D15 — 릴리스
 /// 노트 이월 기재).
-pub(crate) fn pack_captures_dir(dir: &Path) -> PathBuf {
+/// ★T4 CLI 동사 소비(revert-merge 캡처 상대경로 해소) — 재구현 금지.
+pub fn pack_captures_dir(dir: &Path) -> PathBuf {
     if let Some(d) = crate::env_compat("CYS_PACK_CAPTURES_DIR") {
         return PathBuf::from(d);
     }
@@ -2457,7 +2461,8 @@ fn create_capture_segment(
 /// 단일 슬롯 의미론 자체는 유지 · 세대 백업은 0.14.30 회부). 문자열 경로의 read_to_string 멱등
 /// 가드는 비UTF-8 .user 에서 항상 불일치 판정이라 재사용 불가 — 바이트 경로는 무조건 복사한다
 /// (치유 성공 후 L1 재도달 없음 — 재복사는 재손상 시에만).
-fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
+/// ★T4 CLI 동사 소비(pack-heal 판독 불가 파일 바이트 백업) — 재구현 금지.
+pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
     let dst = dir.join(format!("{rel}.user"));
     let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
     std::fs::copy(src, &tmp).map_err(|e| {
