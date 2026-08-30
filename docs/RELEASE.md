@@ -42,11 +42,13 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 
 1. 버전 범프(§0) → `cargo build --release --bin cys` (Tauri 빌드 불요 — cys 단독).
 2. pack 3종 생성 — release.yml `pack-artifacts` 잡과 동일 파라미터(스캔 게이트 2종 선행 포함):
-   `cys pack-manifest --key-id … --signed-at … --expires-at … --min-binary-version 0.12.48 > pack-manifest.json`
+   `cys pack-manifest --key-id … --signed-at … --expires-at … --min-binary-version $PACK_MIN_BINARY > pack-manifest.json`
+   (`$PACK_MIN_BINARY` = release.yml `PACK_MIN_BINARY` env 와 **동일값** — 현행 0.14.29. 수기 리터럴 금지:
+   두 레인 값보다 낮게 서명하면 아래 불변 규칙이 막은 스큐가 이 수동 문으로 재개방된다.)
    → 결정론 tar(`--mtime` 고정) → minisign 서명.
 3. **직전 릴리스의 latest.json + 바이너리 업데이트 자산을 그대로 동봉**해 새 릴리스를 만들고
    `--latest`로 마킹한다(바이너리 버전은 그대로 → 바이너리 배지 안 뜸).
-4. 검증: 앱 배지 = `↻`(무중단 팩)만 표시, `!`(바이너리) 미표시. 구버전(≤0.12.47) 기기는
+4. 검증: 앱 배지 = `↻`(무중단 팩)만 표시, `!`(바이너리) 미표시. 구버전(min_binary 하한 미만) 기기는
    "바이너리 업데이트 필요" 안내가 뜨는 것이 정상(하한 게이트 동작).
 
 **불변 규칙 (실사고 이력 근거 — 위반 금지)**:
