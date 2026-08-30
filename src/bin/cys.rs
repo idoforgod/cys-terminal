@@ -6223,8 +6223,10 @@ fn diag_app_seal(ctx: &DoctorCtx) -> DiagItem {
 
 /// ★T4: 팩 드리프트 관측 — 읽기 전용(--fix 무관 · "pack 본체 불가침" 계약 유지).
 /// manifest↔디스크 해시 대조 + 원장 kind 별 계상(pending_kind_counts 자구 동형 — pub(crate)라
-/// bin 비가시·직접 집계) + 손상 의심 라벨(cys::merge3::suspect_damage import 소비 — 재구현 금지 ·
-/// T1 doc 계약 · base=pristine·관측 전용 게이트 아님) + bin/** 별도 카운트(phoenix 디스크 폴백
+/// bin 비가시·직접 집계) + 손상 의심 라벨(cys::merge3::suspect_damage + json_gate import 소비 —
+/// 재구현 금지 · T1 doc 계약 · base=pristine·관측 전용 게이트 아님. v2 §5-3 라벨 5종: 크기 90%+
+/// 붕괴·마커 잔존·빈 내용·shebang 소실=suspect_damage / *.json parse 실패=json_gate — 후자는
+/// pristine 무관이라 pristine 부재 드리프트에서도 발동) + bin/** 별도 카운트(phoenix 디스크 폴백
 /// 고지 — v2 §13-4 · cysd 임베드 1차 경로 무영향) + pack-captures 용량 1줄.
 /// 등급 계약(doctor exit 회귀 방지): 드리프트 계상=Ok(kept-drift 세계의 정상 상태) · 손상 의심>0
 /// ∨ quarantined>0 = Warn · Fail 미사용 · manifest 부재 = Skip(판정 불가 — 거짓 OK/FAIL 동시 금지).
@@ -6264,12 +6266,20 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
         match std::fs::read_to_string(&p) {
             Ok(d) => {
                 if &cys::pack::content_hash_pub(&d) != mhash {
+                    let mut labeled = false;
                     if let Ok(pristine) = std::fs::read_to_string(
                         ctx.pack_dir.join(cys::pack::PRISTINE_DIR).join(rel),
                     ) {
                         if let Some(r) = cys::merge3::suspect_damage(&pristine, &d, &d) {
                             suspects.push(format!("{rel}({r:?})"));
+                            labeled = true;
                         }
+                    }
+                    // ★성찰 차단 수리(v2 §5-3 라벨 5종 완비): *.json parse 실패 — pristine 무관
+                    // (디스크본만으로 판정)·merge3::json_gate 재사용(재구현 금지). suspect_damage
+                    // 선라벨 시 생략해 파일당 라벨 1개 유지(계상 "N건" = 파일 수 자구 보존).
+                    if !labeled && !cys::merge3::json_gate(rel, &d) {
+                        suspects.push(format!("{rel}(JsonParseFail)"));
                     }
                     drift.push(rel.clone());
                 }
@@ -23301,6 +23311,50 @@ mod tests {
         assert!(it.detail.contains("손상 의심 1건"), "{}", it.detail);
         assert!(it.detail.contains("PureDeletionMajority"), "{}", it.detail);
         assert!(it.detail.contains("quarantined 1"), "{}", it.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★성찰 차단 수리 핀(v2 §5-3): 손상 의심 라벨 5종 중 "*.json parse 실패" — 파스 불능 JSON
+    /// 드리프트는 ⓐpristine 실재·suspect_damage 무발동(사건 실측: ':'→';' 치환 = 크기 동일이라
+    /// 종전 4종 전부 비발동 → 무라벨 통과) ⓑpristine 부재 양쪽에서 JsonParseFail 라벨 + Warn.
+    /// 대조군: 파스 가능한 JSON 드리프트는 무라벨(과라벨 방지) — merge3::json_gate 재사용 계약의 박제.
+    #[test]
+    fn diag_pack_drift_labels_json_parse_fail() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("cys-doc-jsonfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        std::fs::create_dir_all(ctx.pack_dir.join(cys::pack::PRISTINE_DIR)).unwrap();
+        let good = "{\"alerts\": {\"enabled\": true}}\n";
+        let bad = good.replace(':', ";"); // 크기 동일·파스 불능(사건 재현 형상)
+        // ⓐ pristine 실재 + 종전 4종 비발동 형상.
+        std::fs::write(ctx.pack_dir.join("alerts-config.json"), &bad).unwrap();
+        std::fs::write(ctx.pack_dir.join(cys::pack::PRISTINE_DIR).join("alerts-config.json"), good)
+            .unwrap();
+        // ⓑ pristine 부재 — json 검사는 디스크본만으로 발동해야 한다.
+        std::fs::write(ctx.pack_dir.join("no-pristine.json"), "{broken\n").unwrap();
+        // 대조군: 드리프트지만 파스 가능한 JSON — 무라벨이어야 한다.
+        std::fs::write(ctx.pack_dir.join("ok-drift.json"), "{\"v\": 2}\n").unwrap();
+        let manifest = serde_json::json!({
+            "alerts-config.json": cys::pack::content_hash_pub(good),
+            "no-pristine.json": cys::pack::content_hash_pub("{\"was\": 1}\n"),
+            "ok-drift.json": cys::pack::content_hash_pub("{\"v\": 1}\n"),
+        });
+        std::fs::write(
+            ctx.pack_dir.join(cys::pack::INSTALL_MANIFEST),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("드리프트 3건"), "{}", it.detail);
+        assert!(it.detail.contains("손상 의심 2건"), "{}", it.detail);
+        assert!(it.detail.contains("alerts-config.json(JsonParseFail)"), "{}", it.detail);
+        assert!(it.detail.contains("no-pristine.json(JsonParseFail)"), "{}", it.detail);
+        assert!(!it.detail.contains("ok-drift.json(JsonParseFail)"), "과라벨 금지: {}", it.detail);
         let _ = std::fs::remove_dir_all(&base);
     }
 
