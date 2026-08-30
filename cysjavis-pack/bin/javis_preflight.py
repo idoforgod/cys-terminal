@@ -4475,8 +4475,11 @@ class Preflight:
                       if isinstance(v, dict) and v.get("kind") == "new-pending")
         # ★T3(D2): Merge3 폴백(conflicted)·백업 실패 격리(quarantined) 가시화 — 2026-07-12 사고
         # 시정 채널(C62)이 신 충돌 클래스를 못 보는 사각의 봉인. kept-drift·merged(at-rest)는
-        # 조치 불요 보존 상태라 이 WARN 채널 비대상(부트 요약 1줄·pack-plan 이 담당).
-        conflicted = sorted(r for r, v in pending.items()
+        # 조치 불요 보존 상태라 WARN "판정 집합" 비대상(발동 조건 불변 — 부트 요약 1줄·pack-plan
+        # 이 담당)이며, ★T4: WARN 발동 시 상세 문자열에만 정보 병기한다(단독 존재 = PASS 유지 ·
+        # at-rest state 가 붙은 conflicted 항목도 "(at-rest)" 병기 — 제외 아님 · master 결정).
+        conflicted = sorted(r + (" (at-rest)" if v.get("state") == "at-rest" else "")
+                            for r, v in pending.items()
                             if isinstance(v, dict) and v.get("kind") == "conflicted")
         quarantined = sorted(r for r, v in pending.items()
                              if isinstance(v, dict) and v.get("kind") == "quarantined")
@@ -4500,6 +4503,14 @@ class Preflight:
             parts.append("★격리(quarantined) %d건 — 판독 불가 + 백업 실패로 손대지 않음(파일 그대로 · UTF-8 회복 후 재스윕): %s%s"
                          % (len(quarantined), ", ".join(quarantined[:8]),
                             " 외 %d건" % (len(quarantined) - 8) if len(quarantined) > 8 else ""))
+        # ★T4: at-rest kind(kept-drift·merged) 정보 병기 — WARN 발동 시 상세에만(판정 집합 불변).
+        atrest_kd = sum(1 for v in pending.values()
+                        if isinstance(v, dict) and v.get("kind") == "kept-drift")
+        atrest_mg = sum(1 for v in pending.values()
+                        if isinstance(v, dict) and v.get("kind") == "merged")
+        if atrest_kd or atrest_mg:
+            parts.append("(at-rest) kept-drift %d건·merged %d건 — 조치 불요 보존 상태(정보 병기)"
+                         % (atrest_kd, atrest_mg))
         self.add(cid, WARN, "; ".join(parts)
                  + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)"
                  + " · 방금 원복된 파일의 원커맨드 복원: `cys pack-rollback --file <파일>`")

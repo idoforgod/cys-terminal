@@ -6221,11 +6221,132 @@ fn diag_app_seal(ctx: &DoctorCtx) -> DiagItem {
     }
 }
 
+/// ★T4: 팩 드리프트 관측 — 읽기 전용(--fix 무관 · "pack 본체 불가침" 계약 유지).
+/// manifest↔디스크 해시 대조 + 원장 kind 별 계상(pending_kind_counts 자구 동형 — pub(crate)라
+/// bin 비가시·직접 집계) + 손상 의심 라벨(cys::merge3::suspect_damage import 소비 — 재구현 금지 ·
+/// T1 doc 계약 · base=pristine·관측 전용 게이트 아님) + bin/** 별도 카운트(phoenix 디스크 폴백
+/// 고지 — v2 §13-4 · cysd 임베드 1차 경로 무영향) + pack-captures 용량 1줄.
+/// 등급 계약(doctor exit 회귀 방지): 드리프트 계상=Ok(kept-drift 세계의 정상 상태) · 손상 의심>0
+/// ∨ quarantined>0 = Warn · Fail 미사용 · manifest 부재 = Skip(판정 불가 — 거짓 OK/FAIL 동시 금지).
+fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
+    let name = "pack-drift";
+    let action =
+        "손상 의심: cys pack-heal <rel>(백업 후 vendor 복원) · 드리프트 검토: cys pack-merge"
+            .to_string();
+    let mpath = ctx.pack_dir.join(cys::pack::INSTALL_MANIFEST);
+    let manifest: std::collections::BTreeMap<String, String> = match std::fs::read_to_string(&mpath)
+    {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(m) => m,
+            Err(e) => {
+                return DiagItem {
+                    name,
+                    status: DiagStatus::Warn,
+                    detail: format!("설치 매니페스트 파싱 실패({e}) — 대조 불가"),
+                    action: "cys init-pack 재실행으로 매니페스트 재생성".into(),
+                };
+            }
+        },
+        Err(_) => {
+            return DiagItem {
+                name,
+                status: DiagStatus::Skip,
+                detail: "팩 미설치/구설치본 — 매니페스트 부재로 대조 불가".into(),
+                action,
+            };
+        }
+    };
+    let mut drift: Vec<String> = Vec::new();
+    let mut suspects: Vec<String> = Vec::new();
+    let mut unreadable = 0usize;
+    for (rel, mhash) in &manifest {
+        let p = ctx.pack_dir.join(rel);
+        match std::fs::read_to_string(&p) {
+            Ok(d) => {
+                if &cys::pack::content_hash_pub(&d) != mhash {
+                    if let Ok(pristine) = std::fs::read_to_string(
+                        ctx.pack_dir.join(cys::pack::PRISTINE_DIR).join(rel),
+                    ) {
+                        if let Some(r) = cys::merge3::suspect_damage(&pristine, &d, &d) {
+                            suspects.push(format!("{rel}({r:?})"));
+                        }
+                    }
+                    drift.push(rel.clone());
+                }
+            }
+            Err(_) if p.exists() => unreadable += 1,
+            Err(_) => {}
+        }
+    }
+    let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
+    let count_kind = |k: &str| -> usize {
+        pending.values().filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some(k)).count()
+    };
+    let (n_healed, n_new) = (count_kind("healed"), count_kind("new-pending"));
+    let (n_kd, n_mg) = (count_kind("kept-drift"), count_kind("merged"));
+    let (n_cf, n_qr, n_ad) =
+        (count_kind("conflicted"), count_kind("quarantined"), count_kind("adopted"));
+    // bin/** 별도: drift ∪ 원장{kept-drift,merged} 중 bin/ 접두(중복 없이).
+    let mut bin_set: std::collections::BTreeSet<String> =
+        drift.iter().filter(|r| r.starts_with("bin/")).cloned().collect();
+    for (r, e) in pending.iter() {
+        if r.starts_with("bin/")
+            && matches!(
+                e.get("kind").and_then(|v| v.as_str()),
+                Some("kept-drift") | Some("merged")
+            )
+        {
+            bin_set.insert(r.clone());
+        }
+    }
+    // pack-captures 용량(재귀 합산 — 읽기 전용).
+    let cap_root = cys::pack::pack_captures_dir(&ctx.pack_dir);
+    let (mut cap_n, mut cap_bytes) = (0usize, 0u64);
+    let mut stack = vec![cap_root];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                cap_n += 1;
+                cap_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    let mut parts: Vec<String> = vec![format!(
+        "드리프트 {}건(원장: healed {n_healed}·new-pending {n_new}·kept-drift {n_kd}·merged {n_mg}·conflicted {n_cf}·quarantined {n_qr}·adopted {n_ad})",
+        drift.len()
+    )];
+    if unreadable > 0 {
+        parts.push(format!("판독 불가 {unreadable}건"));
+    }
+    if !suspects.is_empty() {
+        parts.push(format!("★손상 의심 {}건: {}", suspects.len(), suspects.join(", ")));
+    }
+    if !bin_set.is_empty() {
+        parts.push(format!(
+            "bin 계열 드리프트 {}건 — phoenix closure 수정 시 디스크 폴백 비활성(임베드 1차 경로 무영향·fail-closed feed 통지)",
+            bin_set.len()
+        ));
+    }
+    parts.push(format!(
+        "캡처 저장소 {cap_n}건 · {}(GC 없음 — 수동 정리 가능)",
+        fmt_bytes(cap_bytes)
+    ));
+    let status =
+        if !suspects.is_empty() || n_qr > 0 { DiagStatus::Warn } else { DiagStatus::Ok };
+    DiagItem { name, status, detail: parts.join(" · "), action }
+}
+
 fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
     vec![
         diag_pack_version(ctx),
         diag_pack_state(ctx),
         diag_install_manifest(ctx),
+        // ★T4: 팩 드리프트 관측(읽기 전용 · --fix 무관 — pack 본체 불가침).
+        diag_pack_drift(ctx),
         diag_hook(ctx, fix),
         diag_dept_hook_residue(ctx, fix),
         diag_dept_awakening_seed(ctx),
@@ -15770,6 +15891,8 @@ fn run_doctor_custom_report() -> i32 {
     // ② 보존본(.user)·병치본(.new) 잔존 — 원장 밖 잔존물 포함(파일명만).
     let mut users: Vec<String> = Vec::new();
     let mut news: Vec<String> = Vec::new();
+    let mut bases: Vec<String> = Vec::new(); // ★T4: 충돌 조상 사이드카(.base)
+    let mut adopted_n = 0usize; // ★T4: 복권 이력(.user.adopted-*)
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
@@ -15783,21 +15906,31 @@ fn run_doctor_custom_report() -> i32 {
                 continue;
             }
             let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
-            if rel.ends_with(".user") {
+            if rel.contains(".user.adopted-") {
+                adopted_n += 1;
+            } else if rel.ends_with(".user") {
                 users.push(rel);
             } else if rel.ends_with(".new") {
                 news.push(rel);
+            } else if rel.ends_with(".base") {
+                bases.push(rel);
             }
         }
     }
     users.sort();
     news.sort();
+    bases.sort();
     md.push_str(&format!("\n## 보존본 .user ({}건)\n", users.len()));
     for r in &users {
         md.push_str(&format!("- {r}\n"));
     }
+    md.push_str(&format!("복권 이력 .user.adopted-* {adopted_n}건\n"));
     md.push_str(&format!("\n## 병치본 .new ({}건)\n", news.len()));
     for r in &news {
+        md.push_str(&format!("- {r}\n"));
+    }
+    md.push_str(&format!("\n## 충돌 조상 .base ({}건)\n", bases.len()));
+    for r in &bases {
         md.push_str(&format!("- {r}\n"));
     }
     // ③ 오버레이(~/.cys/local) 실사용 — 카테고리별 파일 수만(내용 비수집).
@@ -15827,6 +15960,7 @@ fn run_doctor_custom_report() -> i32 {
             let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
             if rel.starts_with('.') || rel.ends_with(".user") || rel.ends_with(".new")
                 || rel.ends_with(".base") // ★T3(D12): 충돌 조상 사이드카 — 자작 파일 아님(관리 파일)
+                || rel.contains(".user.adopted-") // ★T4: 복권 이력 — 자작 아님(관리 파일)
                 || rel.starts_with("memory/") || rel.starts_with("round/")
                 || embedded.contains(rel.as_str())
             {
@@ -23037,6 +23171,48 @@ mod tests {
             "merged 프롬프트 자구 핀(ts=0 → 1970-01-01 UTC)"
         );
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4 커밋3: diag_pack_drift — drift 1 · 손상 의심 1(순삭제 60% = PureDeletionMajority) ·
+    /// quarantined 원장 1 픽스처 → Warn + 계상 일치(드리프트 자체는 Ok 등급 — 의심·격리가 Warn).
+    #[test]
+    fn diag_pack_drift_counts_and_suspect() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("cys-doc-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        // base 10줄 → 디스크 4줄(순삭제 60%) = 드리프트 + PureDeletionMajority 의심.
+        let full: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        let cut: String = (1..=4).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(ctx.pack_dir.join("notes.md"), &cut).unwrap();
+        let manifest = serde_json::json!({ "notes.md": cys::pack::content_hash_pub(&full) });
+        std::fs::write(
+            ctx.pack_dir.join(cys::pack::INSTALL_MANIFEST),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(ctx.pack_dir.join(cys::pack::PRISTINE_DIR)).unwrap();
+        std::fs::write(ctx.pack_dir.join(cys::pack::PRISTINE_DIR).join("notes.md"), &full)
+            .unwrap();
+        let mut pending = serde_json::Map::new();
+        pending.insert(
+            "weird.bin".into(),
+            serde_json::json!({
+                "kind": "quarantined", "reason": "backup-failed", "side": "weird.bin",
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+        cys::pack::save_merge_pending(&ctx.pack_dir, &pending);
+
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("드리프트 1건"), "{}", it.detail);
+        assert!(it.detail.contains("손상 의심 1건"), "{}", it.detail);
+        assert!(it.detail.contains("PureDeletionMajority"), "{}", it.detail);
+        assert!(it.detail.contains("quarantined 1"), "{}", it.detail);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★T4(ⓕ): --revert-merge 왕복 — 캡처본 복원·병합본 .user 보존·manifest/pristine 불변·
