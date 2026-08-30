@@ -5331,6 +5331,158 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// ★성찰 차단 수리 2R-4 공통 픽스처: Merge3 유발 형상 시드(disk=ours · pristine=base ·
+    /// manifest=hash(base)) — 캡처 루트는 base/caps 로 고정해 캡처 실물 검증 가능.
+    fn seed_merge3_shape(pd: &std::path::Path, rel: &str, ours: &str, base: &str) {
+        let p = pd.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, ours).unwrap();
+        let pp = pd.join(PRISTINE_DIR).join(rel);
+        std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        std::fs::write(&pp, base).unwrap();
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash(base) }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// 캡처 루트 아래에서 rel 캡처 실물을 찾아 내용 반환(세그먼트 ts-pid 동적 명명 대응).
+    fn find_capture(cap_root: &std::path::Path, rel: &str) -> Option<String> {
+        let lane = cap_root.join("pack");
+        for seg in std::fs::read_dir(lane).ok()?.filter_map(|e| e.ok()) {
+            let cand = seg.path().join(rel);
+            if cand.is_file() {
+                return std::fs::read_to_string(cand).ok();
+            }
+        }
+        None
+    }
+
+    /// ★성찰 차단 수리 2R-4 핀 ⓐ(뮤테이션 생존 봉인 — v2 §4 clean-but-wrong 차단): install_into
+    /// Merge3 실행부의 *.json 게이트 배선을 스윕 경로 통합으로 박제. 픽스처: base/theirs 는 머리
+    /// 값 전진, ours 는 꼬리 닫는 중괄호 삭제(50% 미만 — suspect 비발동 격리) → clean 병합이나
+    /// 결과는 파스 불능 → conflicted{reason:json-gate} + vendor 보증 + .user/.base/캡처 보존.
+    /// (M8 실측: 이 배선을 꺼도 종전 스위트는 전 초록 — merge3.rs 단위 핀만으로는 실행부 회귀를
+    /// 못 잡는다.)
+    #[test]
+    fn merge3_json_gate_wired_in_install_sweep() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base_td = std::env::temp_dir().join(format!("cys-2r4-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_td);
+        let pd = base_td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base_td.join("claude"));
+        let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base_td.join("caps"));
+
+        let rel = "skills/wjson/config.json";
+        let base = "{\n  \"alpha\": 1,\n  \"beta\": 2,\n  \"gamma\": 3,\n  \"delta\": 4,\n  \"epsilon\": 5,\n  \"zeta\": 6\n}\n";
+        let theirs = "{\n  \"alpha\": 10,\n  \"beta\": 2,\n  \"gamma\": 3,\n  \"delta\": 4,\n  \"epsilon\": 5,\n  \"zeta\": 6\n}\n";
+        let ours = "{\n  \"alpha\": 1,\n  \"beta\": 2,\n  \"gamma\": 3,\n  \"delta\": 4,\n  \"epsilon\": 5,\n  \"zeta\": 6\n";
+        // 전제 자가검증: 이 3자는 clean 병합되며 그 결과가 파스 불능이어야 한다(픽스처 유효성).
+        match crate::merge3::merge3(base, ours, theirs) {
+            crate::merge3::Merge3Outcome::Clean(m) => {
+                assert!(serde_json::from_str::<serde_json::Value>(&m).is_err(),
+                    "픽스처 전제: clean-but-wrong(파스 불능)");
+            }
+            crate::merge3::Merge3Outcome::Conflict(_) => panic!("픽스처 전제: clean 병합이어야 함"),
+        }
+        seed_merge3_shape(&pd, rel, ours, base);
+        install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[json-gate] disk=vendor 보증(healed 폴백)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
+            "[json-gate] .user=사용자본 보존");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
+            "[json-gate] .base=조상 보존(사후 3-way 재료)");
+        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
+            "[json-gate] 캡처 보존(병합 시도 전 원본)");
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).unwrap();
+        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[json-gate] 원장 conflicted");
+        assert_eq!(e["reason"].as_str(), Some("json-gate"), "[json-gate] reason 토큰");
+        let _ = std::fs::remove_dir_all(&base_td);
+    }
+
+    /// ★성찰 차단 수리 2R-4 핀 ⓑ(v2 §6 계층2 순삭제 세탁 조준 방어): base 10줄 · ours 꼬리
+    /// 5줄 순삭제(정확 50%) · theirs 머리만 전진(비접촉) → clean 병합으로 손상이 "사용자 삭제
+    /// δ" 로 세탁되는 시나리오 — 스윕 경로에서 suspect_damage 배선이 이를 잡아
+    /// conflicted{reason:suspect:PureDeletionMajority…} 로 강등함을 박제.
+    #[test]
+    fn merge3_suspect_deletion_laundering_wired_in_install_sweep() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base_td = std::env::temp_dir().join(format!("cys-2r4-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_td);
+        let pd = base_td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base_td.join("claude"));
+        let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base_td.join("caps"));
+
+        let rel = "skills/wdel/SKILL.md";
+        let base = "head-old\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let theirs = "head-new\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let ours = "head-old\nl2\nl3\nl4\nl5\n"; // 꼬리 5/10 순삭제(잘림 손상과 문자적 동형)
+        seed_merge3_shape(&pd, rel, ours, base);
+        install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[suspect] disk=vendor 보증(세탁 clean 병합 차단)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
+            "[suspect] .user=사용자본 보존");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
+            "[suspect] .base=조상 보존");
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).unwrap();
+        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[suspect] 원장 conflicted");
+        let reason = e["reason"].as_str().unwrap_or("");
+        assert!(reason.starts_with("suspect:PureDeletionMajority"),
+            "[suspect] reason=순삭제 휴리스틱 토큰(실측: {reason})");
+        let _ = std::fs::remove_dir_all(&base_td);
+    }
+
+    /// ★성찰 차단 수리 2R-4 핀 ⓒ(v2 §4 ④ pristine 검증형 승격): pristine 기록 실패 주입
+    /// (write_atomic 의 tmp 슬롯 `.{fname}.tmp.{pid}` 자리 디렉터리 점유 — 플랫폼 공통 실패)
+    /// 시 ④ 를 중단하고 ⑤ healed 폴백으로 강등 — .user=병합본(ours 원본은 캡처) ·
+    /// conflicted{reason:pristine-write-failed} · pristine 미전진을 박제.
+    #[test]
+    fn merge3_pristine_write_failure_downgrades_to_conflicted() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base_td = std::env::temp_dir().join(format!("cys-2r4-pri-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_td);
+        let pd = base_td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base_td.join("claude"));
+        let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base_td.join("caps"));
+
+        let rel = "skills/wpri/SKILL.md";
+        let base = "head-old\ncommon body\n";
+        let theirs = "head-new\ncommon body\n";
+        let ours = "head-old\ncommon body\nuser-tail-delta\n";
+        let merged = "head-new\ncommon body\nuser-tail-delta\n";
+        seed_merge3_shape(&pd, rel, ours, base);
+        // 주입: pristine write_atomic 의 tmp 경로를 디렉터리로 점유(생성 실패 결정론).
+        let tmp_slot = pd
+            .join(PRISTINE_DIR)
+            .join("skills/wpri")
+            .join(format!(".SKILL.md.tmp.{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_slot).unwrap();
+        install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[pristine-fail] disk=vendor 보증(⑤ 강등 후 공용 레인)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
+            "[pristine-fail] .user=병합본(크래시표 2행 정합 — ours 원본은 캡처 보존)");
+        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
+            "[pristine-fail] 캡처=ours 원본");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), base,
+            "[pristine-fail] pristine 미전진(실패 격리)");
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).unwrap();
+        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[pristine-fail] 원장 conflicted");
+        assert_eq!(e["reason"].as_str(), Some("pristine-write-failed"), "[pristine-fail] reason 토큰");
+        assert_eq!(e["base_side"].as_str(), Some(format!("{rel}.base").as_str()),
+            "[pristine-fail] base_side 포인터");
+        let _ = std::fs::remove_dir_all(&base_td);
+    }
+
     /// ★T3 통합 핀 ②(v2 §3 연쇄 릴리스 · 출하 차단): E0⊕δ → E1 → E2 2연쇄에서 δ 생존 —
     /// keep-mine 없이도 병합 기점(pristine·manifest)이 자동 전진함의 박제. δ 는 머리/꼬리 분리
     /// 배치(vendor 는 머리만·사용자 δ 는 꼬리만 — diffy 보수 충돌 회피).
