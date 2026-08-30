@@ -14422,11 +14422,33 @@ fn report_overlay_skill_drift() {
     }
 }
 
+/// ★T4(v2 §5): 3중 전진 프리미티브 — manifest[rel]←hash(content) · `.pristine/<rel>`←content.
+/// pristine 미전진이면 다음 릴리스 base 검증(load_verified_base)이 실패해 3-way 없이 healed 로
+/// 강등된다(현행 keep-mine·take-new 미전진 버그 수리). manifest·pristine 은 반드시 **같은
+/// content 바이트**에서 전진한다 — content_hash(pristine)==manifest[rel] 불변식이 계약이다
+/// (스테일 .new 엣지에서 embed 소스 전진은 이 불변식을 깨 L4 낙하한다).
+fn advance_vendor_baseline(dir: &std::path::Path, rel: &str, content: &str) {
+    let mpath = dir.join(cys::pack::INSTALL_MANIFEST);
+    let mut m: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&mpath)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    m.insert(rel.to_string(), cys::pack::content_hash_pub(content));
+    if let Ok(json) = serde_json::to_string_pretty(&m) {
+        let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
+    }
+    let bp = dir.join(cys::pack::PRISTINE_DIR).join(rel);
+    if let Some(p) = bp.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = cys::pack::write_atomic(&bp, content.as_bytes());
+}
+
 /// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
 ///   --take-new(신버전 채택) · --keep-mine(내 수정 유지·이번 신버전 소화) ·
 ///   diff3/--ai 3-way 병합(base=.pristine 조상) · --to-local(healed system 파일을 오버레이로 이동).
-/// system(healed) 파일은 rel 로 되쓰기 금지 — 다음 기동 install 이 다시 치유(P0-4)하므로
-/// 지원 경로는 to-local(스킬 shadowing)뿐임을 명시한다.
+/// system(healed) 파일의 직접 되쓰기는 T3 이후 제자리 보존(kept-drift)된다 — 해소 경로는
+/// to-local(스킬 shadowing)·keep-mine(정리)·pack-heal(vendor 복귀).
 /// ★A12 코드 가드(v4 · W4 — 결정 D8: override 플래그명 `--force-vendor`).
 ///
 /// CEO 승격 중(= `<pack>/directives/MASTER_DIRECTIVE.md.pre-ceo` 실재)의 base MASTER 를
@@ -14646,18 +14668,10 @@ fn run_pack_merge(
         f.extend(extra.iter().map(|s| s.to_string()));
         f
     };
-    // user-owned 해소 시 매니페스트 base 전진(같은 vendor 버전으로 .new 재병치 방지).
-    let advance_manifest_base = |content: &str| {
-        let mpath = dir.join(cys::pack::INSTALL_MANIFEST);
-        let mut m: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&mpath)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        m.insert(rel.clone(), cys::pack::content_hash_pub(content));
-        if let Ok(json) = serde_json::to_string_pretty(&m) {
-            let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
-        }
-    };
+    // user-owned 해소 시 vendor 기준선 전진(같은 vendor 버전으로 .new 재병치 방지) —
+    // ★T4: manifest+pristine 3중 전진 프리미티브 위임(keep-mine·take-new·m==ours 경로의
+    // pristine 미전진 버그 수리 — 호출 4곳 자동 수혜).
+    let advance_manifest_base = |content: &str| advance_vendor_baseline(&dir, &rel, content);
     match kind {
         "new-pending" => {
             let new_path = dir.join(format!("{rel}.new"));
@@ -14782,10 +14796,7 @@ fn run_pack_merge(
                             eprintln!("쓰기 실패: {e}");
                             return 1;
                         }
-                        advance_manifest_base(&theirs);
-                        // 병합본의 새 조상 = 이번 vendor 본(다음 3-way 정확성).
-                        let _ = std::fs::create_dir_all(base_path.parent().unwrap_or(&dir));
-                        let _ = cys::pack::write_atomic(&base_path, theirs.as_bytes());
+                        advance_manifest_base(&theirs); // 병합본의 새 조상 = 이번 vendor 본(pristine 동반 전진)
                         resolve(&mut pending, ".new");
                         println!("✅ {rel} ← 3-way 병합 적용");
                     } else {
@@ -14795,7 +14806,7 @@ fn run_pack_merge(
                 }
                 None => {
                     println!(
-                        "자동 병합 불가(충돌 또는 도구 부재). 선택지:\n\
+                        "자동 병합 불가(충돌). 선택지:\n\
                          \x20 cys pack-merge --file {rel} --take-new   # vendor 신버전 채택\n\
                          \x20 cys pack-merge --file {rel} --keep-mine # 내 수정 유지\n\
                          \x20 cys pack-merge --file {rel} --ai        # AI 3-way 병합 제안\n\
@@ -14836,6 +14847,16 @@ fn run_pack_merge(
                             }
                         }
                         resolve(&mut pending, ".user");
+                        // ★T4: 소비 채널 실증 경고 — local 오버레이의 실소비는 skills(shadowing)뿐
+                        // (디렉티브는 .local.md·훅은 .d 채널만 실소비 — vibe-regression.sh 실증).
+                        if !rel.starts_with("skills/") {
+                            println!(
+                                "⚠ '{rel}' 은 skills/ 밖 — ~/.cys/local 사본은 소비 채널이 없어 침묵 비활성이 됩니다(디렉티브는 .local.md·훅은 .d 채널만 실소비 — vibe-regression.sh 실증). 팩 내 복권은 cys pack-adopt 를 쓰세요."
+                            );
+                        }
+                        audit(&merge_audit_entry(
+                            &rel, "to-local", &content, &content, "n/a", &flag_list(&[]),
+                        ));
                         println!(
                             "✅ {rel} 사용자본 → {} (오버레이 — 업데이트 불가침{})",
                             dest.display(),
@@ -14867,9 +14888,10 @@ fn run_pack_merge(
                 0
             } else {
                 println!(
-                    "'{rel}' 은 system 파일 — 직접 되쓰기는 다음 기동 때 다시 치유(P0-4)되므로 지원하지 않음.\n\
-                     \x20 cys pack-merge --file {rel} --to-local  # 사용자본을 ~/.cys/local 오버레이로(스킬 shadowing)\n\
+                    "'{rel}' 은 system 파일 — 직접 되쓰기하면 다음 스윕부터 제자리 보존(kept-drift)됩니다(vendor 전진 시 자동 병합·충돌은 vendor+.user 강등). 원장 해소:\n\
+                     \x20 cys pack-merge --file {rel} --to-local  # 사용자본을 오버레이로(스킬 shadowing)\n\
                      \x20 cys pack-merge --file {rel} --keep-mine # vendor 본 유지 확정(보존본 정리)\n\
+                     \x20 (되쓰기 후 vendor 복귀는 cys pack-heal {rel})\n\
                      보존본 위치: {}",
                     user_path.display()
                 );
@@ -14992,8 +15014,8 @@ fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
 /// ★W-E1(신뢰의 결정론 증명): 직전 설치 보존본(<pack>.prev — atomic_swap 이 1세대 보존)에서
 /// **파일 단위** 복원. 전량 스왑 롤백은 업데이트 후 쌓인 런타임 상태(memory/·SESSION_STATE)까지
 /// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
-/// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원은 다음 부트 스윕이
-/// 재치유함을 정직하게 고지 — 영속 경로(--to-local/--propose)로 안내한다.
+/// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원본은 kept-drift 로
+/// 제자리 보존됨을 고지 — 영속 경로(--to-local/--propose)로 안내한다.
 fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_unsafe_core: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let prev = cys::pack::pack_prev_dir(&dir);
@@ -15156,9 +15178,9 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
     match own {
         "user" => println!("✅ {rel} 복원(user 소유 — 업데이트가 덮지 않으므로 이대로 유지됩니다)"),
         _ => println!(
-            "✅ {rel} 복원(system 소유 — 다음 부트 설치 스윕이 vendor 본으로 재치유하며, 그때 \
-             이 복원본은 {rel}.user 로 보존됩니다. 영속화: cys pack-merge --file {rel} --to-local(스킬) \
-             또는 --propose(개선 제안)"
+            "✅ {rel} 복원(system 소유 — 복원본은 제자리 보존(kept-drift)됩니다. 다음 vendor 전진 때 \
+             자동 병합되며, vendor 본 복귀는 cys pack-heal {rel}. 영속화: cys pack-merge --file {rel} \
+             --to-local(스킬) 또는 --propose(개선 제안)"
         ),
     }
     0
@@ -15296,26 +15318,15 @@ fn walk_count(root: &std::path::Path) -> usize {
     n
 }
 
-/// diff3 -m 3-way 병합(결정론) — base 부재·diff3 부재·충돌이면 None(호출측이 대안 안내).
+/// 순수 Rust 3-way(crate::merge3 위임 — diff3 셸아웃 소멸·스윕 경로와 엔진 통일 §8).
+/// base 부재·충돌=None(호출측 대안 안내). 충돌 판정은 GNU diff3 보다 보수적(인접 헝크·무개행
+/// 말미·mixed-EOL 충돌側)=안전측 — 릴리스 노트 기재. 대화형 경로엔 json_gate·suspect_damage
+/// 미적용 — diff 표시+인간 승인이 게이트다.
 fn diff3_merge(base: Option<&str>, ours: &str, theirs: &str) -> Option<String> {
     let base = base?;
-    let tmp = std::env::temp_dir().join(format!("cys-merge-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).ok()?;
-    let (po, pb, pt) = (tmp.join("ours"), tmp.join("base"), tmp.join("theirs"));
-    std::fs::write(&po, ours).ok()?;
-    std::fs::write(&pb, base).ok()?;
-    std::fs::write(&pt, theirs).ok()?;
-    let out = std::process::Command::new("diff3")
-        .arg("-m")
-        .args([&po, &pb, &pt])
-        .output()
-        .ok()?;
-    let _ = std::fs::remove_dir_all(&tmp);
-    // exit 0 = 무충돌 병합, 1 = 충돌(마커 포함 출력), 2+ = 에러.
-    if out.status.code() == Some(0) {
-        String::from_utf8(out.stdout).ok()
-    } else {
-        None
+    match cys::merge3::merge3(base, ours, theirs) {
+        cys::merge3::Merge3Outcome::Clean(m) => Some(m),
+        cys::merge3::Merge3Outcome::Conflict(_) => None,
     }
 }
 
@@ -15373,7 +15384,7 @@ fn ai_three_way_merge(rel: &str, base: Option<&str>, ours: &str, theirs: &str) -
                     if std::time::Instant::now() > deadline {
                         let _ = c.kill();
                         let _ = c.wait(); // zombie 수거(드레인 스레드도 EOF 로 종료)
-                        eprintln!("claude 헤드리스 180초 타임아웃 — diff3/수동 경로를 사용하라");
+                        eprintln!("claude 헤드리스 180초 타임아웃 — 3-way/수동 경로를 사용하라");
                         break None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -15391,7 +15402,7 @@ fn ai_three_way_merge(rel: &str, base: Option<&str>, ours: &str, theirs: &str) -
         }
     });
     if result.is_none() {
-        eprintln!("claude 헤드리스 병합 제안 실패 — diff3/수동 경로를 사용하라");
+        eprintln!("claude 헤드리스 병합 제안 실패 — 3-way/수동 경로를 사용하라");
     }
     result
 }
@@ -22106,5 +22117,114 @@ mod tests {
         }
         // 목록 자체도 핀 — 면제 집합이 조용히 비지 않게
         assert_eq!(RPC_STREAMING_METHODS, ["events.stream", "surface.attach"]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★T4 커밋1 — 해소 동사 3중 전진(v2 §5) 핀
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// user-owned 비헌법 rel + .new/new-pending 픽스처를 temp 팩에 구성(ENV_PACK_DIR 가드 반환).
+    fn t4_new_pending_fixture(tag: &str) -> (std::path::PathBuf, String, String, cys::pack::EnvGuard) {
+        let td = std::env::temp_dir().join(format!("cys-t4-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let env = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &td);
+        // user-owned 비헌법 rel 동적 선택(하드코딩 금지 — 팩 진실에서 취득).
+        let (rel, embed) = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| {
+                cys::pack::ownership_name_scoped(r, &td) == "user"
+                    && !cys::pack::is_constitution_file(r)
+            })
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .expect("user-owned 비헌법 rel 실재");
+        let target = td.join(&rel);
+        if let Some(par) = target.parent() {
+            std::fs::create_dir_all(par).unwrap();
+        }
+        std::fs::write(&target, "MY-EDIT\n").unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), &embed).unwrap();
+        let mut pending = serde_json::Map::new();
+        pending.insert(
+            rel.clone(),
+            serde_json::json!({
+                "kind": "new-pending", "side": format!("{rel}.new"),
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+        cys::pack::save_merge_pending(&td, &pending);
+        (td, rel, embed, env)
+    }
+
+    /// 3중 전진 불변식 공용 assert — manifest[rel]==hash(pristine) ∧ pristine==theirs.
+    fn assert_triple_advanced(td: &std::path::Path, rel: &str, theirs: &str) {
+        let manifest: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(td.join(cys::pack::INSTALL_MANIFEST)).unwrap(),
+        )
+        .unwrap();
+        let pristine =
+            std::fs::read_to_string(td.join(cys::pack::PRISTINE_DIR).join(rel)).unwrap();
+        assert_eq!(pristine, theirs, "pristine ← theirs 동반 전진(같은 바이트)");
+        assert_eq!(
+            manifest.get(rel),
+            Some(&cys::pack::content_hash_pub(&pristine)),
+            "content_hash(pristine)==manifest[rel] 불변식(load_verified_base 게이트 유지)"
+        );
+    }
+
+    /// ★T4: keep-mine 해소가 manifest 와 .pristine 을 같은 theirs 바이트로 동반 전진하는지 —
+    /// pristine 미전진이면 다음 릴리스 load_verified_base 게이트 실패 → 3-way 없이 healed 강등
+    /// 되던 버그(v2 §5 표)의 회귀 핀. 해소 경로 파일 삭제는 사이드카(.new)뿐임도 함께 못 박는다.
+    #[test]
+    fn keep_mine_advances_pristine() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_new_pending_fixture("keepmine");
+        let rc = run_pack_merge(
+            Some(rel.clone()),
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(rc, 0, "keep-mine 해소 성공");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            "MY-EDIT\n",
+            "내 수정 유지(본체 무접촉)"
+        );
+        assert!(!td.join(format!("{rel}.new")).exists(), ".new 사이드카 소거");
+        assert!(cys::pack::load_merge_pending(&td).get(&rel).is_none(), "원장 해소");
+        assert_triple_advanced(&td, &rel, &embed);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★T4: take-new 해소 동형 — vendor 본 채택 + 3중 전진 불변식.
+    #[test]
+    fn take_new_advances_pristine() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_new_pending_fixture("takenew");
+        let rc = run_pack_merge(
+            Some(rel.clone()),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(rc, 0, "take-new 해소 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "vendor 신버전 채택");
+        assert!(!td.join(format!("{rel}.new")).exists(), ".new 사이드카 소거");
+        assert!(cys::pack::load_merge_pending(&td).get(&rel).is_none(), "원장 해소");
+        assert_triple_advanced(&td, &rel, &embed);
+        let _ = std::fs::remove_dir_all(&td);
     }
 }
