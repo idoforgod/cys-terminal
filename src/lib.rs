@@ -20,6 +20,7 @@ pub mod first_run_gates;
 /// 전송 직전에 한 번 더 화면을 본다. 생애 창은 첫 각성 ack 이전으로 상한이 걸려 있다.
 pub mod inject_guard;
 pub mod license;
+pub mod merge3;
 pub mod pack;
 /// 프로필 인증 전제 판정기(U-17) — "이 프로필로 좌석을 만들면 로그인 관문 앞에 서는가".
 /// 시드(U-19)는 로그인 화면을 **지우므로** 판정이 시드보다 먼저 있어야 한다. 판정은 순수함수
