@@ -2951,6 +2951,11 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
 /// ★G3 축2: `scope` 는 **호출자가 논리 대상에서 산출**해 넘긴다(install_from_iter=pack_dir,
 /// install_staged=pack_dir — staging 의 basename `.pack-staging-init-*` 에는 부서 정보가 없어
 /// 여기서 dir 재판정하면 부서 팩이 Base 로 오판된다). Base 스코프 거동은 byte-identical.
+/// ★캡처 레인 명명도 같은 계약(v2 §4 ① — 성찰 차단 수리): `capture_ns` = 캡처 레인 basename.
+/// None = dir 자신에서 유도(직설치 — dir 이 곧 논리 대상). install_staged 는 물리 staging
+/// basename(`.pack-staging-init-<pid>` — ls 비표시 dot·pid 휘발 명명)이 아니라 **논리 대상
+/// (pack_dir) basename** 을 데이터로 주입한다 — 스코프의 "staging basename 재판정 금지" 와
+/// 자기모순이던 내부 계약의 정합화(캡처 실파일·원장 capture 포인터가 은닉 레인에 흩어지는 것 차단).
 pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     dir: PathBuf,
     items: I,
@@ -2960,6 +2965,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     setup_config: bool,
     scope: PackScope,
     auth: Option<PackWriteAuth>,
+    capture_ns: Option<&str>,
 ) -> Result<(usize, usize), String> {
     // ★W0-d 양성 인가 게이트(최후 방어) — 어떤 부수효과보다 먼저. 대상이 라이브 기본 경로면
     // 인가 없이는 하드 거부한다(테스트 재오염 벡터 구조적 봉인). 비라이브·인가 보유는 통과.
@@ -3036,9 +3042,10 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     // ★T3(D5) Merge3 캡처 상태(스윕당 1세그먼트 · 지연 생성): 첫 병합 시 배타 생성 — 같은 스윕의
     // 후속 병합 파일은 같은 세그먼트 아래 <rel> 로 쌓인다. 원장 capture = 캡처 루트 상대 경로.
     let captures_root = pack_captures_dir(&dir);
-    let pack_basename = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+    // 레인 basename = 논리 대상(capture_ns 주입 시) > 물리 dir basename(직설치 — 동일 값) 순.
+    let pack_basename = capture_ns
+        .map(str::to_string)
+        .or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "pack".to_string());
     let mut capture_seg: Option<(PathBuf, String)> = None;
     for (rel, content) in items.iter().copied() {
@@ -3550,7 +3557,7 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     let dir = pack_dir();
     // ★G3 축2: 스코프는 실 pack_dir 에서 산출(부서 데몬 자동설치가 이 경로 — dept soul 승계·불가침).
     let scope = pack_scope_of(&dir);
-    install_into(dir, items, force, target_version, transactional, true, scope, auth)
+    install_into(dir, items, force, target_version, transactional, true, scope, auth, None)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3674,6 +3681,10 @@ pub fn install_staged(
     // **논리 대상**(pack_dir)에서 산출해 데이터로 주입한다 — 부서 팩의 init-pack 도 staged 경로를
     // 타므로, 여기서 산출하지 않으면 dept soul 이 Base(User) 로 오판돼 결함4(.new 병치)가 재발한다.
     let scope = pack_scope_of(&dir);
+    // ★캡처 레인도 스코프와 동일 계약(v2 §4 ①): 물리 staging basename 이 아니라 논리 대상
+    // (pack_dir) basename 을 데이터로 주입 — 캡처가 `.pack-staging-init-<pid>` 은닉·휘발 레인에
+    // 생성되는 것을 차단한다(원장 capture 포인터·실파일·doctor 계상 전부 논리 레인으로 수렴).
+    let capture_ns = dir.file_name().map(|n| n.to_string_lossy().to_string());
     // ★W0-d: 최종 commit/rename(atomic_swap)이 라이브 기본 경로를 원자 교체하므로, 어떤 staging
     // 작업보다 먼저 인가를 검사한다(비라이브 대상·인가 보유는 통과 — 테스트는 temp 대상이라 무영향).
     authorize_pack_write(&dir, auth)?;
@@ -3699,6 +3710,7 @@ pub fn install_staged(
         false,
         scope, // 논리 대상(pack_dir)의 스코프 — staging basename 재판정 금지(위 주석).
         None, // staging은 비라이브 형제 경로 — 여기 쓰기는 인가 불요(라이브 인가는 위 swap 게이트가 담당).
+        capture_ns.as_deref(), // 캡처 레인 = 논리 대상 basename(스코프와 동일 주입 계약).
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -6226,6 +6238,7 @@ mod tests {
                 true,
                 pack_scope_of(&dpack),
                 None,
+                None,
             )
             .unwrap();
         }
@@ -6259,6 +6272,7 @@ mod tests {
                 false,
                 true,
                 pack_scope_of(&dpack3),
+                None,
                 None,
             )
             .unwrap();
@@ -6311,6 +6325,7 @@ mod tests {
             false,
             pack_scope_of(&dpack),
             None,
+            None,
         )
         .unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
@@ -6357,6 +6372,7 @@ mod tests {
             false,
             pack_scope_of(&dpack),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(read(&dpack.join("soul.md")), seeded, "vendor 전진에도 부서 soul 불가침");
@@ -6381,6 +6397,7 @@ mod tests {
             false,
             false,
             pack_scope_of(&dpack3),
+            None,
             None,
         )
         .unwrap();
@@ -6419,6 +6436,7 @@ mod tests {
             false,
             false,
             pack_scope_of(&dpack4),
+            None,
             None,
         )
         .unwrap();
@@ -6489,6 +6507,7 @@ mod tests {
             false,
             pack_scope_of(&dpack),
             None,
+            None,
         )
         .unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
@@ -6548,6 +6567,7 @@ mod tests {
             false,
             false,
             pack_scope_of(&bpack),
+            None,
             None,
         )
         .unwrap();
@@ -6620,6 +6640,7 @@ mod tests {
             false,
             false,
             pack_scope_of(&dpack),
+            None,
             None,
         )
         .unwrap();
@@ -6988,6 +7009,7 @@ mod tests {
             false,
             pack_scope_of(&live),
             None,
+            None,
         );
         assert!(res.is_err(), "인가 없는 라이브 쓰기는 Err여야 한다: {res:?}");
         assert!(!live.join("probe.txt").exists(), "거부 후 파일이 쓰이면 안 된다");
@@ -7002,6 +7024,7 @@ mod tests {
             false,
             pack_scope_of(&live),
             Some(PackWriteAuth::for_test()),
+            None,
         );
         assert!(ok.is_ok(), "인가 부여 시 라이브 쓰기는 성공해야 한다: {ok:?}");
         assert!(live.join("probe.txt").exists(), "인가 쓰기 후 파일이 존재해야 한다");
@@ -7042,6 +7065,7 @@ mod tests {
             false,
             false,
             pack_scope_of(&via_symlink),
+            None,
             None,
         );
         assert!(res.is_err(), "심링크 경유 라이브 쓰기는 거부돼야 한다: {res:?}");
@@ -7777,6 +7801,72 @@ mod tests {
         assert_eq!(w2, 0, "멱등 재설치 written=0");
         assert!(pack_prev_dir(&pd).exists(), "재설치는 .prev 1세대 보존");
         assert!(pd.join(rel0).is_file(), "재설치 후 임베드 온전");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★성찰 차단 수리 핀(v2 §4 ① — staged 프로덕션 형상): init-pack(install_staged) 경유
+    /// Merge3 의 캡처 레인은 물리 staging basename(`.pack-staging-init-<pid>` — ls 비표시 dot·
+    /// pid 마다 레인 분산)이 아니라 **논리 대상(pack_dir) basename** 아래 생성된다 — 스코프의
+    /// "staging basename 재판정 금지" 계약과의 정합(원장 capture 포인터·실파일 동시 검증).
+    /// 비스테이징 형상은 merge3_crash_windows_converge 가 박제 — 이 핀이 staged 무핀 사각을 봉인.
+    #[test]
+    fn install_staged_capture_lane_uses_logical_pack_basename() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-staged-caplane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        let _env = set_pack_env(&pd, base.join("claude"));
+        let _cap_env = EnvGuard::remove("CYS_PACK_CAPTURES_DIR"); // 기본 유도(dir 형제) 검증
+
+        install_staged(false, None).unwrap();
+
+        // Merge3 픽스처(크래시 핀 [W1] 동형 — 머리/꼬리 분리 δ = clean): 조상 = 임베드 앞에
+        // 구 헤더 1줄, ours = 조상 + 사용자 꼬리 1줄, theirs = 현 임베드(헤더 제거 = 벤더 전진).
+        let (rel, embed) = PACK_ALL
+            .iter()
+            .find(|(r, c)| r.starts_with("skills/") && r.ends_with("/SKILL.md") && c.ends_with('\n'))
+            .map(|(r, c)| (*r, *c))
+            .expect("skills/*/SKILL.md 임베드 실재");
+        let e_old = format!("LEGACY-HEAD-v0\n{embed}");
+        let ours = format!("{e_old}USER-TAIL-DELTA\n");
+        std::fs::write(pd.join(rel), &ours).unwrap();
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(rel.to_string(), content_hash(&e_old));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+        let pp = pd.join(PRISTINE_DIR).join(rel);
+        std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+        std::fs::write(&pp, &e_old).unwrap();
+
+        install_staged(false, None).unwrap(); // 프로덕션 staged 스윕 → Merge3
+
+        let pend = load_merge_pending(&pd);
+        let entry = pend.get(rel).expect("원장 등재");
+        assert_eq!(entry["kind"].as_str(), Some("merged"), "clean 병합: {entry}");
+        let cap_rel = entry["capture"].as_str().expect("capture 필드").to_string();
+        assert!(
+            cap_rel.starts_with("pack/"),
+            "캡처 레인 = 논리 팩 basename(스코프 주입 계약 동형): {cap_rel}"
+        );
+        assert!(
+            !cap_rel.contains(".pack-staging"),
+            "물리 staging basename 은닉·휘발 레인 금지: {cap_rel}"
+        );
+        // 실파일도 논리 레인 아래(원장 포인터로 해소 가능 = revert-merge 재료).
+        let cap_path = base.join("pack-captures").join(&cap_rel);
+        assert_eq!(
+            std::fs::read_to_string(&cap_path).unwrap(),
+            ours,
+            "캡처 = 사용자본 전문(팩 밖 증거): {}",
+            cap_path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(pd.join(rel)).unwrap(),
+            format!("{embed}USER-TAIL-DELTA\n"),
+            "병합 결과 = 벤더 전진 + 사용자 δ 생존"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
