@@ -348,11 +348,17 @@ jobs:
           #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
           #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 스크래치 하네스(라이브 무접촉) · 실측 각 ≤0.1s.
+          # ★2R-6(2026-08-31 · 0.14.29 성찰): test_preflight_c62_c68_ledger 편입 — T5 의 C62
+          #   conflicted/quarantined 신설 판정·at-rest 병기와 T3 의 C68 영속 kind 기한 제외
+          #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
+          #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
+          #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
-                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness; do
+                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
+                   test_preflight_c62_c68_ledger; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -842,11 +848,17 @@ jobs:
           #   두 핀 모두 어느 CI 레인에서도 0회 실행이었다("안 도는 검체는 게이트가 아니다" —
           #   W-CI 2026-08-21 동형 격차의 재발). 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 스크래치 하네스(라이브 무접촉) · 실측 각 ≤0.1s.
+          # ★2R-6(2026-08-31 · 0.14.29 성찰): test_preflight_c62_c68_ledger 편입 — T5 의 C62
+          #   conflicted/quarantined 신설 판정·at-rest 병기와 T3 의 C68 영속 kind 기한 제외
+          #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
+          #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
+          #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
-                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness; do
+                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
+                   test_preflight_c62_c68_ledger; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="
