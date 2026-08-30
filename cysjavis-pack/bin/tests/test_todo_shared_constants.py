@@ -333,6 +333,44 @@ class MarkerDecorCharset(unittest.TestCase):
             TD.is_retire_marker_line("<!-- 이 파일은 STALE 무효화 대상이 **아니다** -->"))
 
 
+class MergeLedgerKinds(unittest.TestCase):
+    """★0.14.29 성찰 차단 수리(계상 SOT 3분산) — 병합 원장 kind 목록의 2언어 기계 대조.
+
+    정본 = src/pack.rs `LEDGER_KINDS`(유일 등재소 · Rust 계상기 3벌은 위임 소비로 단일화).
+    파이썬 미러 = javis_preflight `MERGE_LEDGER_KINDS`(C62/C68 이 같은 kind 문자열 계약을
+    독립 재구현하는 자리). 실측 결함: T4 신 kind 'adopted' 가 Rust 에만 존재해 C68 분류
+    누락 → 14일 후 wakeup 일일 재배달 소음. 신 kind 1종 추가 시 이 대조가 멈춰 파이썬
+    분류 결정을 강제한다."""
+
+    def rust_ledger_kinds(self):
+        src = rust_source("src/pack.rs")
+        m = re.search(r"pub const LEDGER_KINDS: \[&str; \d+\] =\s*\[(.*?)\];", src, re.S)
+        self.assertTrue(m, "src/pack.rs 에서 LEDGER_KINDS 를 찾지 못했다 "
+                           "(표현이 바뀌었다면 이 대조를 함께 갱신하라 — 조용한 통과 금지)")
+        kinds = []
+        for tok in strip_line_comments(m.group(1)).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            mm = re.fullmatch(r'"([^"]+)"', tok)
+            self.assertTrue(mm, "예상 밖 항목: %r" % tok)
+            kinds.append(mm.group(1))
+        return kinds
+
+    def test_python_mirror_matches_rust(self):
+        rust = self.rust_ledger_kinds()
+        self.assertEqual(list(PFL.MERGE_LEDGER_KINDS), rust,
+                         "병합 원장 kind 목록이 2언어에서 갈렸다 — C62/C68 분류 누락 = "
+                         "wakeup 스팸/침묵 사각의 재현 조건(adopted 사건 동형)")
+
+    def test_c68_exempt_is_subset_of_ledger_kinds(self):
+        rust = set(self.rust_ledger_kinds())
+        exempt = set(PFL.C68_EXEMPT_KINDS)
+        self.assertTrue(exempt, "C68 제외 집합이 비었다 — 영속 kind 일일 재배달 재발(T3 D1 역행)")
+        self.assertLessEqual(exempt, rust,
+                             "C68_EXEMPT_KINDS 에 미등재 kind: %r" % sorted(exempt - rust))
+
+
 class LabelNormalization(unittest.TestCase):
     """라벨은 게이트·HUD의 **조인 키**다 — 정규화 규칙이 갈리면 조인이 조용히 전패한다."""
 

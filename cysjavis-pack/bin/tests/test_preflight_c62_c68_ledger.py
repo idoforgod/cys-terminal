@@ -223,5 +223,36 @@ class TestC68(Base):
         self.assertIn("hooks/x.sh", detail)
 
 
+# ══ kind 전수 행동 census — MERGE_LEDGER_KINDS(정본 미러) ↔ C62·C68 분류 완전성 ═════
+class TestKindCensus(Base):
+    """★0.14.29 성찰 차단 수리(계상 SOT): 등재 kind 전수의 (C62, C68@30일) 판정을 박제한다.
+    기대표 키 집합 == MERGE_LEDGER_KINDS 를 강제하므로, 신 kind 가 정본(src/pack.rs
+    LEDGER_KINDS → 2언어 census)을 거쳐 들어오면 여기서 분류 미결정으로 멈춘다 —
+    'adopted 분류 누락 → wakeup 일일 재배달' 사각의 구조 봉인."""
+
+    # kind → (C62 판정, C68 판정 @ 체류 30일). C62: 판정 집합 = healed·new-pending·
+    # conflicted·quarantined(가시화 대상)만 WARN. C68: C68_EXEMPT_KINDS + state:at-rest 만
+    # 기한 제외.
+    EXPECTED = {
+        "healed": (WARN, WARN),
+        "new-pending": (WARN, WARN),
+        "kept-drift": (PASS, PASS),
+        "merged": (PASS, PASS),
+        "conflicted": (WARN, WARN),
+        "quarantined": (WARN, WARN),
+        "adopted": (PASS, PASS),
+    }
+
+    def test_every_registered_kind_is_classified(self):
+        self.assertEqual(set(self.EXPECTED), set(pf.MERGE_LEDGER_KINDS),
+                         "기대표 ≠ 등재 kind 집합 — 신 kind 의 C62/C68 분류를 여기서 결정하라")
+        for kind, (want62, want68) in sorted(self.EXPECTED.items()):
+            self.ledger({"f/%s.txt" % kind: {"kind": kind, "ts": time.time() - 30.0 * DAY}})
+            st62, d62 = self.c62()
+            self.assertEqual(st62, want62, "C62[%s]: %s" % (kind, d62))
+            st68, d68 = self.c68()
+            self.assertEqual(st68, want68, "C68[%s]: %s" % (kind, d68))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

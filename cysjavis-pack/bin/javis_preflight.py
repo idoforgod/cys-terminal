@@ -502,6 +502,16 @@ AUTOPILOT_MEMORY_INDEX_LINE = (
 #   봐서 **검사 대상과 실사용 팩이 갈렸다**. 목록을 4키로 맞추고 주장을 참으로 만든다.
 PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
 
+# ★병합 원장 kind 계약 미러 — 정본(SOT)은 src/pack.rs `LEDGER_KINDS`(유일 등재소).
+#   C62/C68 은 이 kind 문자열 계약을 독립 재구현해 왔고, T4 신 kind 'adopted' 분류 누락이
+#   실제로 wakeup 일일 재배달 소음(C68)으로 실현됐다(0.14.29 성찰 차단). 미러가 정본과 갈리면
+#   bin/tests/test_todo_shared_constants.py 의 census 핀이 멈추고, 신 kind 의 C62/C68 분류
+#   미결정은 bin/tests/test_preflight_c62_c68_ledger.py 의 행동 census 가 멈춘다.
+MERGE_LEDGER_KINDS = ("healed", "new-pending", "kept-drift", "merged",
+                      "conflicted", "quarantined", "adopted")
+# C68 기한 제외 kind — kept-drift·merged(at-rest 보존)·adopted(복권 확정 = 스윕 대기 정상 체류).
+C68_EXEMPT_KINDS = ("kept-drift", "merged", "adopted")
+
 
 def pack_dir():
     """pack 위치 결정 — src/pack.rs pack_dir()의 4단 폴백(PACK_DIR_ENV_KEYS)을 그대로 미러링한다."""
@@ -4555,8 +4565,10 @@ class Preflight:
         # actionable 로 계상하면 스윕 0회(버전 무변경+init-pack 무실행) 14일 후 C62 PASS ∧
         # C68 WARN 비대칭 + fingerprint(일 단위 oldest) 일일 갱신 = wakeup 큐 일일 재배달
         # 소음원이 된다(픽스처 실측). 복권 완료 = 스윕 대기 정상 체류.
+        # 제외 kind 집합 = 모듈 상수 C68_EXEMPT_KINDS(정본 src/pack.rs LEDGER_KINDS 의 부분집합
+        # — census 핀 대조 대상)로 단일화.
         def _exempt(v):
-            return (v.get("kind") in ("kept-drift", "merged", "adopted")
+            return (v.get("kind") in C68_EXEMPT_KINDS
                     or v.get("state") == "at-rest")
 
         stale = sorted(

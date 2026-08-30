@@ -2058,6 +2058,22 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
 /// 포인터를 지운다 — 아래 upsert_pending_v2 가 유일한 보존 경로다.
 pub(crate) const LINEAGE_KINDS: [&str; 2] = ["merged", "conflicted"];
 
+/// ★성찰 차단 수리(계상 SOT 3분산): 병합 대기 원장(.merge-pending.json) kind 문자열 전체
+/// 목록의 **유일 등재소**. 종전에는 같은 목록이 ①pending_kind_counts ②doctor pack-drift
+/// count_kind 클로저 ③pack-plan n_kind 클로저 + 파이썬 javis_preflight C62/C68 에 자구
+/// 재구현으로 4분산돼, 신 kind 1종(실례: T4 adopted — 부트 요약 무계상·doctor 만 계상·C68
+/// 분류 누락)마다 동시 수정을 사람이 기억해야 했다. 이제 ②③은 pending_kind_counts 를 위임
+/// 소비하고(계상기 단일화 = 상호 일치가 구조로 박제), 파이썬 미러(MERGE_LEDGER_KINDS·
+/// C68_EXEMPT_KINDS)는 test_todo_shared_constants 의 census 핀이 이 상수와 대조한다.
+///
+/// **신 kind 추가 절차(기계가 강제)**: 여기 등재 → pending_kind_counts 버킷 추가(census 핀
+/// `ledger_kinds_census_bijective_with_counter` 의 전필드 struct 리터럴이 컴파일로 강제) →
+/// javis_preflight MERGE_LEDGER_KINDS 등재 + C62/C68 분류 결정(2언어 census 핀 + 행동 census
+/// `test_kind_census_c62_c68_classification` 이 강제). 주의: 감사 원장(.merge-audit)의
+/// "pre-merge-capture" 는 다른 파일의 다른 계약이다 — 여기 등재 대상이 아니다.
+pub const LEDGER_KINDS: [&str; 7] =
+    ["healed", "new-pending", "kept-drift", "merged", "conflicted", "quarantined", "adopted"];
+
 /// ★T3(D7): 계보 인지 원장 upsert — 기존 upsert_pending 클로저는 자구 불변(new-pending 현행
 /// 경로 회귀 0)이며, 신 kind(kept-drift·merged·conflicted·quarantined)와 healed 의 계보 승계는
 /// 전부 이 헬퍼를 경유한다.
@@ -2080,6 +2096,14 @@ pub fn upsert_pending_v2(
     let old = pending.get(rel).and_then(|e| e.as_object()).cloned();
     let old_kind = old.as_ref().and_then(|o| o.get("kind")).and_then(|k| k.as_str());
     let new_kind = entry.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    // ★성찰 차단 수리(계상 SOT): 이 바이너리가 **쓰는** kind 는 등재 필수 — LEDGER_KINDS 에
+    // 없는 kind 를 쓰면 부트 요약·doctor·pack-plan·preflight 분류가 전부 '미지'로 빠진다.
+    // debug 빌드(cargo test 포함)에서만 검사 — 신 바이너리가 남긴 원장을 구 바이너리가 읽는
+    // forward-compat 관용(읽기·보존)은 불변이다(승계 항목이 아니라 신규 entry 만 본다).
+    debug_assert!(
+        LEDGER_KINDS.contains(&new_kind),
+        "미등재 원장 kind 쓰기: {new_kind:?} — src/pack.rs LEDGER_KINDS 에 등재 후 사용(계상 SOT)"
+    );
     if let Some(ok) = old_kind {
         if LINEAGE_KINDS.contains(&ok) && new_kind == "kept-drift" {
             // kind 불변 — state:"at-rest" 만(멱등 · no-op 시 dirty 미발생 = 원장 rewrite 0).
@@ -2117,17 +2141,36 @@ pub fn upsert_pending_v2(
 /// ★T3(D13): 병합 원장 kind 별 명시 계상 — **빼기 산식 금지**(구 `new_n = len - healed_n` 산식은
 /// 신 kind 4종을 전부 '.new 병치'로 오보했다 — W-E2 오계상·성찰 4렌즈 공통 실측). 부트 요약
 /// 1줄(v2 §5 채널 1)과 W-E2 사용자 언어 요약이 같은 산식을 공유한다.
+/// ★성찰 차단 수리(계상 SOT 3분산): pub 승격 — doctor pack-drift·pack-plan(bin)이 자구 동형
+/// 클로저 재구현 대신 이 함수를 위임 소비한다(계상기 3벌 → 1벌 · 상호 일치 = 구조 보장).
+/// 버킷은 LEDGER_KINDS 와 1:1 + unknown(미지 kind 명시 계상 — 기존 버킷 오계상 금지는
+/// 유지하되, 종전 `_ => {}` 무계상과 달리 안전측 가시로 센다). adopted 는 여기서 세지만 부트
+/// 요약 1줄 조건·문구에는 넣지 않는다(복권 확정 = 다음 스윕 정규화 대기 — 설계 의도의 명문화,
+/// doctor 는 표시).
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct PendingKindCounts {
+pub struct PendingKindCounts {
     pub healed: usize,
     pub new_pending: usize,
     pub kept_drift: usize,
     pub merged: usize,
     pub conflicted: usize,
     pub quarantined: usize,
+    pub adopted: usize,
+    pub unknown: usize,
 }
 
-pub(crate) fn pending_kind_counts(
+impl PendingKindCounts {
+    /// 조치 가능(actionable) 명시 합 — at-rest 보존 kind(kept-drift·merged)만 제외한 전 버킷
+    /// 합(빼기 산식 금지 규율 준수). 미지 kind 는 안전측(가시)으로 포함하고, adopted 도 현행
+    /// pack-plan 자구('kept-drift·merged 외 전부 검토 대상')를 보존해 포함한다 — pack-merge
+    /// 목록이 '조치 불요(복권됨)' 안내로 해소하는 일시 상태라 과보고가 안전측이다.
+    pub fn actionable(&self) -> usize {
+        self.healed + self.new_pending + self.conflicted + self.quarantined + self.adopted
+            + self.unknown
+    }
+}
+
+pub fn pending_kind_counts(
     pending: &serde_json::Map<String, serde_json::Value>,
 ) -> PendingKindCounts {
     let mut c = PendingKindCounts::default();
@@ -2139,7 +2182,8 @@ pub(crate) fn pending_kind_counts(
             Some("merged") => c.merged += 1,
             Some("conflicted") => c.conflicted += 1,
             Some("quarantined") => c.quarantined += 1,
-            _ => {} // 미지 kind — 어느 버킷에도 오계상하지 않는다(빼기 산식 금지의 요점)
+            Some("adopted") => c.adopted += 1,
+            _ => c.unknown += 1, // 미지 kind — 기존 버킷 오계상 금지(명시 unknown 계상)
         }
     }
     c
@@ -5094,12 +5138,90 @@ mod tests {
         pending.insert("f".into(), mk("quarantined"));
         pending.insert("g".into(), mk("future-unknown-kind"));
         pending.insert("h".into(), mk("healed"));
+        pending.insert("i".into(), mk("adopted"));
         let c = pending_kind_counts(&pending);
         assert_eq!(
             (c.healed, c.new_pending, c.kept_drift, c.merged, c.conflicted, c.quarantined),
             (2, 1, 1, 1, 1, 1),
             "kind 별 명시 계상 위반 — 빼기 산식이면 미지 kind 가 기존 버킷에 오계상된다"
         );
+        // ★성찰 차단 수리(계상 SOT): adopted 명시 버킷 + 미지 kind 안전측 가시(unknown) 계상.
+        assert_eq!(
+            (c.adopted, c.unknown),
+            (1, 1),
+            "adopted 는 명시 버킷, 미지 kind 는 unknown 버킷 — 무계상 침묵 금지"
+        );
+        assert_eq!(
+            c.actionable(),
+            pending
+                .values()
+                .filter(|e| {
+                    !matches!(
+                        e.get("kind").and_then(|v| v.as_str()),
+                        Some("kept-drift") | Some("merged")
+                    )
+                })
+                .count(),
+            "actionable() ≠ pack-plan 현행 자구(kept-drift·merged 외 전부) — 위임 소비 등가성 파괴"
+        );
+    }
+
+    /// ★성찰 차단 수리 census 핀(계상 SOT 3분산): LEDGER_KINDS(유일 등재소) ↔
+    /// pending_kind_counts 버킷의 전단사 박제. ①등재 kind 각 1건 → 대응 명시 버킷 정확 1 ·
+    /// unknown 0 (등재만 하고 버킷을 안 만들면 unknown 으로 새서 실패) ②전필드 struct 리터럴
+    /// 대조(`..Default` 금지) — 버킷 필드를 추가하고 여기를 안 고치면 **컴파일이 거부**한다
+    /// (등재 없는 유령 버킷의 역방향 봉인) ③미지 kind → unknown(안전측 가시).
+    #[test]
+    fn ledger_kinds_census_bijective_with_counter() {
+        // ① 등재 kind 각각 단독 1건 — 명시 버킷 정확 1 + unknown 0.
+        for kind in LEDGER_KINDS {
+            let mut pending = serde_json::Map::new();
+            pending.insert(
+                "x".into(),
+                serde_json::json!({"kind": kind, "side": "x", "version": "1.0.0", "ts": 1}),
+            );
+            let c = pending_kind_counts(&pending);
+            assert_eq!(c.unknown, 0, "등재 kind {kind:?} 가 unknown 으로 샜다 — 버킷 누락");
+            let named_sum = c.healed
+                + c.new_pending
+                + c.kept_drift
+                + c.merged
+                + c.conflicted
+                + c.quarantined
+                + c.adopted;
+            assert_eq!(named_sum, 1, "등재 kind {kind:?} 계상 오류(명시 버킷 합 {named_sum})");
+        }
+        // ② 전 kind 1건씩 — 전필드 struct 리터럴(컴파일 강제: 필드 추가 시 여기 미갱신 = 거부).
+        let mut pending = serde_json::Map::new();
+        for kind in LEDGER_KINDS {
+            pending.insert(
+                kind.to_string(),
+                serde_json::json!({"kind": kind, "side": kind, "version": "1.0.0", "ts": 1}),
+            );
+        }
+        assert_eq!(
+            pending_kind_counts(&pending),
+            PendingKindCounts {
+                healed: 1,
+                new_pending: 1,
+                kept_drift: 1,
+                merged: 1,
+                conflicted: 1,
+                quarantined: 1,
+                adopted: 1,
+                unknown: 0,
+            },
+            "LEDGER_KINDS ↔ 버킷 전단사 파괴"
+        );
+        // ③ 미등재 kind → unknown 안전측 가시(리터럴 대신 변수 경유 — 등재 강제 대상 아님).
+        let ghost = format!("future-{}", "kind");
+        let mut pending = serde_json::Map::new();
+        pending.insert(
+            "y".into(),
+            serde_json::json!({"kind": ghost, "side": "y", "version": "1.0.0", "ts": 1}),
+        );
+        let c = pending_kind_counts(&pending);
+        assert_eq!((c.unknown, c.actionable()), (1, 1), "미지 kind 는 unknown + actionable 가시");
     }
 
     /// ★T3 통합 핀 ①(v2 §4 크래시 수렴 · 출하 차단): 크래시 직후 상태를 직접 구성해(txn_prestate

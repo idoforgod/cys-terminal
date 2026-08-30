@@ -6289,13 +6289,13 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
         }
     }
     let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
-    let count_kind = |k: &str| -> usize {
-        pending.values().filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some(k)).count()
-    };
-    let (n_healed, n_new) = (count_kind("healed"), count_kind("new-pending"));
-    let (n_kd, n_mg) = (count_kind("kept-drift"), count_kind("merged"));
-    let (n_cf, n_qr, n_ad) =
-        (count_kind("conflicted"), count_kind("quarantined"), count_kind("adopted"));
+    // ★성찰 차단 수리(계상 SOT 3분산): 자구 동형 count_kind 클로저 재구현 제거 —
+    // pack::pending_kind_counts(pub 승격) 위임 소비. 신 kind 추가 시 계상기는 한 곳이고,
+    // LEDGER_KINDS census 핀(ledger_kinds_census_bijective_with_counter)이 일치를 박제한다.
+    let c = cys::pack::pending_kind_counts(&pending);
+    let (n_healed, n_new) = (c.healed, c.new_pending);
+    let (n_kd, n_mg) = (c.kept_drift, c.merged);
+    let (n_cf, n_qr, n_ad) = (c.conflicted, c.quarantined, c.adopted);
     // bin/** 별도: drift ∪ 원장{kept-drift,merged} 중 bin/ 접두(중복 없이).
     let mut bin_set: std::collections::BTreeSet<String> =
         drift.iter().filter(|r| r.starts_with("bin/")).cloned().collect();
@@ -6325,8 +6325,11 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
             }
         }
     }
+    // 미지 kind(신 바이너리 원장 등) — 종전 계상기는 침묵 누락했다. 0 이 아닐 때만 병기(안전측 가시).
+    let n_unk_seg =
+        if c.unknown > 0 { format!("·미지 {}", c.unknown) } else { String::new() };
     let mut parts: Vec<String> = vec![format!(
-        "드리프트 {}건(원장: healed {n_healed}·new-pending {n_new}·kept-drift {n_kd}·merged {n_mg}·conflicted {n_cf}·quarantined {n_qr}·adopted {n_ad})",
+        "드리프트 {}건(원장: healed {n_healed}·new-pending {n_new}·kept-drift {n_kd}·merged {n_mg}·conflicted {n_cf}·quarantined {n_qr}·adopted {n_ad}{n_unk_seg})",
         drift.len()
     )];
     if unreadable > 0 {
@@ -14519,23 +14522,13 @@ fn run_pack_plan(force: bool) -> i32 {
     if !pending.is_empty() {
         // ★T3(D14): kind 분리 계상 — at-rest kind(kept-drift·merged)는 '병합 대기'가 아니라 보존
         // 상태다(체류가 정상). 미지 kind 는 안전측(가시)으로 검토 대상에 계상한다.
-        let n_kind = |k: &str| {
-            pending
-                .values()
-                .filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some(k))
-                .count()
-        };
-        let kept_n = n_kind("kept-drift");
-        let merged_n = n_kind("merged");
-        let actionable = pending
-            .values()
-            .filter(|e| {
-                !matches!(
-                    e.get("kind").and_then(|v| v.as_str()),
-                    Some("kept-drift") | Some("merged")
-                )
-            })
-            .count();
+        // ★성찰 차단 수리(계상 SOT 3분산): 자구 동형 n_kind 클로저 재구현 제거 —
+        // pack::pending_kind_counts 위임 소비. actionable() 은 현행 자구(kept-drift·merged 외
+        // 전부 = 미지 kind 포함 안전측)의 명시 합 등가(w_e2 핀이 등가성 박제).
+        let c = cys::pack::pending_kind_counts(&pending);
+        let kept_n = c.kept_drift;
+        let merged_n = c.merged;
+        let actionable = c.actionable();
         if actionable > 0 {
             println!("※ 기존 병합 대기 {actionable}건 — `cys pack-merge` 로 검토");
         }
