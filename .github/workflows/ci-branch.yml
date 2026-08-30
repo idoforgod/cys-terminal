@@ -595,6 +595,17 @@ jobs:
           set -euo pipefail
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
 
+      # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
+      #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한
+      #   완전 --lib 레인이다 — release.yml 은 태그 시점(Windows 레그는 필터 3종), 여기는 조기
+      #   경보. 격리·직렬화 근거는 위 리허설 스텝과 동일(CYS_PACK_DIR mktemp = 러너 실팩·홈
+      #   의존 차단 · --test-threads=1 = env 뮤텍스 스위트 직렬 실행).
+      - name: cargo test --lib (팩 계약·병합 엔진 스위트 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
+
       # ★W-CI2(2026-08-21 · Wave 2): `cargo test -p cys-app --bins` — GUI env 대칭 핀 편입.
       #   전수 실측(cargo test grep): cys-app(src-tauri) 크레이트 테스트를 돌리는 CI 레인이
       #   **0곳**이었다 — release.yml 은 루트 크레이트만(--bin cysd·--lib·--bin cys ×2잡),

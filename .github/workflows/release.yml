@@ -219,6 +219,27 @@ jobs:
             sh scripts/version-check.sh
           fi
 
+      # ★T6(v2 §12 이월): 인터림 트리 태그 거부 게이트 — kept-drift/merge3 부분 랜딩 회귀 방지.
+      #   0.14.29 T2~T4 는 변형(enum)을 먼저 넣고 원장 kind·병합 엔진을 뒤에 배선하는 순서로
+      #   랜딩했다 — 그 중간 형상(KeepDrift 변형만 있고 원장 kind "kept-drift" 부재 · Merge3
+      #   변형만 있고 merge3:: 배선 부재)이 미래의 부분 revert·cherry-pick 으로 재현된 채 태그로
+      #   봉인되는 것을 grep 게이트로 거부한다. 태그 레인 한정 — 브랜치 개발의 중간 형상은 막지
+      #   않는다(cargo test 에 넣지 않는 이유이기도 하다). 현 트리는 양쪽 통과(실측: KeepDrift
+      #   13건 ∧ "kept-drift" 9건 · FileAction::Merge3 3곳 ∧ crate::merge3:: 배선 실재).
+      - name: Interim-tree tag gate (kept-drift/merge3 partial-landing hard-gate)
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if grep -q "KeepDrift" src/pack.rs && ! grep -q '"kept-drift"' src/pack.rs; then
+              echo '::error::인터림 트리 — KeepDrift 변형은 있는데 원장 kind "kept-drift" 가 없다(부분 랜딩). 태그 거부.'
+              exit 1
+            fi
+            if grep -q "FileAction::Merge3" src/pack.rs && ! grep -q "merge3::" src/pack.rs; then
+              echo '::error::인터림 트리 — Merge3 변형은 있는데 merge3:: 엔진 배선이 없다(부분 랜딩). 태그 거부.'
+              exit 1
+            fi
+          fi
+
       # 프런트엔드 번들러(ui/build.sh가 bun 사용). beforeBuildCommand가 bun을 호출하므로 PATH 필수.
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -578,13 +599,14 @@ jobs:
       #   비용은 0 에 가깝다 — lib 은 바로 위 factory_reset 스텝에서 이미 컴파일돼 있고,
       #   D5 핀은 순수 문자열 매핑이라 실행이 밀리초다.
       #   ⚠필터를 지우지 마라. 지우면 이 레인은 다시 '돌지 않는 초록'이 된다.
-      - name: cargo test --lib factory_reset + D5 (Windows 계약 · 태그 레인)
+      - name: cargo test --lib factory_reset + D5 + merge3 (Windows 계약 · 태그 레인)
         if: matrix.platform == 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib claude_alt_screen -- --test-threads=1
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib merge3:: -- --test-threads=1
 
       - name: Windows 직접 빌드 + CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers · 업로드 전)
         if: matrix.platform == 'windows-latest'

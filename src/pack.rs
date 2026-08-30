@@ -7902,6 +7902,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// ★T6(R9 · v2 §7): 0.14.27 잔류 dept 스코프 팩의 릴리스 경계 스윕 — L0-L4 판정 레인이
+    /// base 팩과 동일하게 흐른다(dept 분기 = soul 계열 SeedOnce 조기 반환뿐 · 판정·실행부는
+    /// scope 파라미터 동일 적용). 픽스처: 실설치 dept 팩(pack-dept-2)의 .pack-version 을
+    /// 0.14.27 로 되감은 잔류 형상(구 릴리스가 남긴 팩·구 manifest) → 현행 바이너리 스윕 1회.
+    /// 검체 5종 — L0 잠금 자산 즉시 치유(벤더 미전진에도) · L1 판독 불가 바이트 백업 후 치유 ·
+    /// L2 벤더 미전진 kept-drift 제자리 보존 · L3 벤더 전진+검증 base → Merge3(3자 상이 충돌
+    /// → conflicted 폴백·.base 조상 보존) · L4 벤더 전진+base 미검증 → 종전 healed.
+    /// soul.md 는 dept 스코프 SeedOnce 조기 반환이라 검체로 쓰지 않는다(함정 명문).
+    #[test]
+    fn dept_residual_pack_release_boundary_rides_l0_l4() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "cys-dept-l0l4-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dpack = base.join("pack-dept-2");
+        std::fs::create_dir_all(&dpack).unwrap();
+        let _env = set_pack_env(&dpack, base.join("cfg"));
+        let _cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+        assert_eq!(pack_scope_of(&dpack), PackScope::Dept, "dept 스코프 전제");
+
+        install_staged(false, None).unwrap();
+        // 0.14.27 잔류 형상: 구 릴리스가 남긴 팩(.pack-version 되감기 — manifest·pristine 완비).
+        std::fs::write(dpack.join(PACK_VERSION_FILE), "0.14.27").unwrap();
+
+        // 검체 선별(동적·잠금 제외·상호 상이) — L1~L4 용 system rel 4종.
+        let picks: Vec<&str> = PACK_ALL
+            .iter()
+            .filter(|(r, _)| ownership_name_scoped(r, &dpack) == "system" && !system_locked(r))
+            .take(4)
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(picks.len(), 4, "system 검체 4종 실재");
+        let (l1, l2, l3, l4) = (picks[0], picks[1], picks[2], picks[3]);
+        let embed_of =
+            |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c).unwrap();
+        let manifest_rewind = |rel: &str, base_content: &str| {
+            let mpath = dpack.join(INSTALL_MANIFEST);
+            let mut m: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+            m.insert(rel.to_string(), content_hash(base_content));
+            std::fs::write(&mpath, serde_json::to_string(&m).unwrap()).unwrap();
+        };
+
+        // L0: 잠금 자산 드리프트(벤더 미전진) — 그래도 즉시 치유 대상.
+        let l0 = "trusted-keys.json";
+        std::fs::write(dpack.join(l0), "TAMPERED-KEYRING\n").unwrap();
+        // L1: 판독 불가(CP949 바이트) 드리프트(벤더 미전진) — 바이트 백업 후 치유.
+        let l1_raw: &[u8] = &[0xC7, 0xD1, 0xB1, 0xDB, 0x0A];
+        std::fs::write(dpack.join(l1), l1_raw).unwrap();
+        // L2: 가독 드리프트(벤더 미전진) — kept-drift 제자리 보존.
+        std::fs::write(dpack.join(l2), "DEPT-DRIFT-L2\n").unwrap();
+        // L3: 벤더 전진 + 검증 base(manifest==hash(pristine)) + 3자 상이 → 충돌 폴백.
+        let l3_base = "L3-OLD-VENDOR-BASE\n";
+        let l3_mine = "L3-MY-DEPT-EDIT\n";
+        assert_ne!(embed_of(l3), l3_base, "L3 전제: 벤더 전진(embed≠base)");
+        std::fs::write(dpack.join(l3), l3_mine).unwrap();
+        manifest_rewind(l3, l3_base);
+        let bp = dpack.join(PRISTINE_DIR).join(l3);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, l3_base).unwrap();
+        // L4: 벤더 전진 + base 미검증(pristine 제거) — 종전 healed 거동(B2 후계ⓐ 동형).
+        std::fs::write(dpack.join(l4), "DEPT-DRIFT-L4\n").unwrap();
+        manifest_rewind(l4, "OLD-VENDOR-BASE");
+        let _ = std::fs::remove_file(dpack.join(PRISTINE_DIR).join(l4));
+
+        install_staged(false, None).unwrap(); // 릴리스 경계 스윕(0.14.27 → 현행)
+
+        let read = |rel: &str| std::fs::read_to_string(dpack.join(rel)).unwrap();
+        let kind = |rel: &str| {
+            load_merge_pending(&dpack)
+                .get(rel)
+                .and_then(|e| e["kind"].as_str())
+                .map(str::to_string)
+        };
+        // L0: 즉시 치유 + .user 백업(벤더 미전진에도 — kept-drift 로 새지 않는다).
+        assert_eq!(read(l0), embed_of(l0), "L0 잠금 자산 즉시 치유");
+        assert_eq!(read(&format!("{l0}.user")), "TAMPERED-KEYRING\n", "L0 .user 백업");
+        assert_eq!(kind(l0).as_deref(), Some("healed"), "L0 원장 healed");
+        // L1: 치유 + 바이트 백업(무백업 파괴 edge 봉인).
+        assert_eq!(read(l1), embed_of(l1), "L1 판독 불가 치유");
+        assert_eq!(
+            std::fs::read(dpack.join(format!("{l1}.user"))).unwrap(),
+            l1_raw,
+            "L1 바이트 백업"
+        );
+        assert_eq!(kind(l1).as_deref(), Some("healed"), "L1 원장 healed");
+        // L2: kept-drift 제자리 보존(.user 미생성).
+        assert_eq!(read(l2), "DEPT-DRIFT-L2\n", "L2 제자리 보존");
+        assert!(!dpack.join(format!("{l2}.user")).exists(), "L2 .user 미생성");
+        assert_eq!(kind(l2).as_deref(), Some("kept-drift"), "L2 원장 kept-drift");
+        // L3: Merge3 → 3자 상이 충돌 → vendor 본 + .user + .base 조상 + 원장 conflicted.
+        assert_eq!(read(l3), embed_of(l3), "L3 충돌 폴백 = vendor 본");
+        assert_eq!(read(&format!("{l3}.user")), l3_mine, "L3 .user 보존");
+        assert_eq!(read(&format!("{l3}.base")), l3_base, "L3 .base 조상 보존");
+        assert_eq!(kind(l3).as_deref(), Some("conflicted"), "L3 원장 conflicted");
+        // L4: base 미검증 — 종전 healed(치유 + .user 보존).
+        assert_eq!(read(l4), embed_of(l4), "L4 종전 healed 거동");
+        assert_eq!(read(&format!("{l4}.user")), "DEPT-DRIFT-L4\n", "L4 .user 보존");
+        assert_eq!(kind(l4).as_deref(), Some("healed"), "L4 원장 healed");
+        // 릴리스 경계 완주: .pack-version 현행 재기록(잔류 해소).
+        assert_eq!(
+            std::fs::read_to_string(dpack.join(PACK_VERSION_FILE)).unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            "릴리스 경계 스윕 후 .pack-version 현행"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// [회귀 핀·G3] --no-install-hook 일관성 — ① install_hooks=false 는 격리 config 의 라우터
     /// (CLAUDE.md — 훅 아님)는 시드하되 **훅 계열은 0**(settings.json 자체 미생성 = hooks 키 부재)
     /// ② install_hooks=true 는 종전 거동 그대로 소망 훅 집합 완비(기존 계약 핀). 종전엔 이
