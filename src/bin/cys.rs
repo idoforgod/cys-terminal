@@ -3276,7 +3276,7 @@ fn run(command: Command) -> i32 {
                         "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
                         "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
                         "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
-                        _ => "vendor 소유 — 수정본은 다음 설치 스윕에 치유(수정 전 .user 보존). 자작은 새 파일로",
+                        _ => "vendor 소유 — 수정본은 제자리 보존(kept-drift)·벤더 전진 시 자동 병합(충돌 시 .user 보존). 자작은 새 파일로",
                     }
                 };
                 println!("{rel}: {name} — {meaning}");
@@ -4086,13 +4086,13 @@ fn run_skill(action: SkillAction) -> i32 {
             }
             // ★W-G1(커스텀 생존 설계 2026-07-17): 자작 스킬의 기본 거처 = local 오버레이(업데이트
             // 불가침 — §12.7 문서와 CLI 의 비대칭 해소). --pack 은 upstream 승격 예정 전용이며,
-            // vendor 임베드와 동명이면 다음 스윕에 치유(교체)되므로 생성 자체를 거부한다.
+            // vendor 임베드와 동명이면 vendor 본과 영구 드리프트(kept-drift)가 되므로 생성 자체를 거부한다.
             let vendor_rel = format!("skills/{name}/SKILL.md");
             let vendor_exists = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == vendor_rel);
             let root = if pack {
                 if vendor_exists {
                     return Err(format!(
-                        "vendor 스킬 '{name}' 이 이미 출하됨 — 팩 안 동명 생성은 다음 스윕에 치유(소실)됩니다. \
+                        "vendor 스킬 '{name}' 이 이미 출하됨 — 팩 안 동명 생성은 vendor 본과 영구 드리프트(kept-drift·병합 충돌원)가 됩니다. \
                          오버레이 생성(기본값·shadowing) 또는 다른 이름을 쓰세요."
                     ));
                 }
@@ -14779,9 +14779,17 @@ fn run_pack_merge(
                     } else {
                         ""
                     };
-                    println!(
-                        "  ⚡ {rel} — 자동 병합 실패({reason}) — vendor 본 적용·내 수정본 {rel}.user·조상 {rel}.base 보존{at_rest}\n     → cys pack-adopt {rel}(복권) | --to-local | --keep-mine(정리)"
-                    );
+                    // ★T5(T4 이월 ⓐ): revert-merge 아형 — 자동 병합 실패가 아니라 사용자가 병합을
+                    // 되돌린 상태(디스크=캡처 원본·병합본은 .user 보존)라 안내·처방이 다르다.
+                    if reason == "revert-merge" {
+                        println!(
+                            "  ↩ {rel} — 자동 병합 되돌림(revert-merge) — 디스크=캡처 원본·병합본은 {rel}.user 보존{at_rest}\n     → 다음 vendor 전진 때 재병합 · cys pack-adopt {rel}(병합본 복권) | --keep-mine(정리)"
+                        );
+                    } else {
+                        println!(
+                            "  ⚡ {rel} — 자동 병합 실패({reason}) — vendor 본 적용·내 수정본 {rel}.user·조상 {rel}.base 보존{at_rest}\n     → cys pack-adopt {rel}(복권) | --to-local | --keep-mine(정리)"
+                        );
+                    }
                 }
                 "quarantined" => println!(
                     "  🚧 {rel} — 판독 불가+백업 실패로 무접촉 보존 — UTF-8 회복 후 재스윕 또는 cys pack-heal {rel}"
@@ -15969,6 +15977,7 @@ fn run_doctor_custom_report() -> i32 {
     let mut news: Vec<String> = Vec::new();
     let mut bases: Vec<String> = Vec::new(); // ★T4: 충돌 조상 사이드카(.base)
     let mut adopted_n = 0usize; // ★T4: 복권 이력(.user.adopted-*)
+    let mut prev_n = 0usize; // ★T5: heal 세대 보존(.user.prev-*)
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
@@ -15984,6 +15993,8 @@ fn run_doctor_custom_report() -> i32 {
             let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
             if rel.contains(".user.adopted-") {
                 adopted_n += 1;
+            } else if rel.contains(".user.prev-") {
+                prev_n += 1;
             } else if rel.ends_with(".user") {
                 users.push(rel);
             } else if rel.ends_with(".new") {
@@ -16001,6 +16012,7 @@ fn run_doctor_custom_report() -> i32 {
         md.push_str(&format!("- {r}\n"));
     }
     md.push_str(&format!("복권 이력 .user.adopted-* {adopted_n}건\n"));
+    md.push_str(&format!("보존 세대 .user.prev-* {prev_n}건\n"));
     md.push_str(&format!("\n## 병치본 .new ({}건)\n", news.len()));
     for r in &news {
         md.push_str(&format!("- {r}\n"));
@@ -16037,6 +16049,7 @@ fn run_doctor_custom_report() -> i32 {
             if rel.starts_with('.') || rel.ends_with(".user") || rel.ends_with(".new")
                 || rel.ends_with(".base") // ★T3(D12): 충돌 조상 사이드카 — 자작 파일 아님(관리 파일)
                 || rel.contains(".user.adopted-") // ★T4: 복권 이력 — 자작 아님(관리 파일)
+                || rel.contains(".user.prev-") // ★T5: heal 세대 보존 사이드카 — 자작 아님(관리 파일)
                 || rel.starts_with("memory/") || rel.starts_with("round/")
                 || embedded.contains(rel.as_str())
             {
@@ -23474,5 +23487,161 @@ mod tests {
             "custom rel 원장 무기록 + 잔존 정리(C68 스팸 원천 봉인)"
         );
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T5(v2 §9): 2026-08-30 사건 형상 재현 E2E — 실설치 팩(embed 전량 = manifest·pristine
+    /// 완비)에 훅 3 + bin 2 = system 5건의 치유 잔재(.user 사이드카 + 원장 healed)를 주입하고
+    /// `pack-adopt --all` 원클릭 복구를 통합 검증한다: 전건 복원(rel별 상이 내용 = 교차 배선
+    /// 검출) → 원장 adopted → .user.adopted-<ts> 개명 보존 → **원장 밖 6번째 rel 무접촉**(순회
+    /// 정의만으로 구조적 도달 불가 — vibe-regression.sh 형상 박제) → --from 명시 소스 레인 →
+    /// 전량 재스윕 생존(kept-drift 정규화·개명 사이드카 스윕/prune 생존).
+    #[test]
+    fn pack_adopt_incident_shape_e2e() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("cys-t5-incident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let td = base.join("pack");
+        std::fs::create_dir_all(&td).unwrap();
+        let _guards = [
+            cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &td),
+            cys::pack::EnvGuard::set(cys::pack::ENV_CONFIG_DIR, base.join("cfg")),
+            cys::pack::EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures")),
+        ];
+        cys::pack::install(false, None).expect("선행 실설치(manifest·pristine 완비)");
+
+        // 사건 형상 검체 선별(동적 — 하드코딩 금지): system(잠금 제외) hooks/ 3 + bin/ 2 + 6번째.
+        let sys_rels = |prefix: &str, skip: usize, n: usize| -> Vec<String> {
+            cys::pack::PACK_ALL
+                .iter()
+                .filter(|(r, _)| {
+                    r.starts_with(prefix)
+                        && cys::pack::ownership_name_scoped(r, &td) == "system"
+                        && *r != "trusted-keys.json"
+                })
+                .skip(skip)
+                .take(n)
+                .map(|(r, _)| r.to_string())
+                .collect()
+        };
+        let hooks = sys_rels("hooks/", 0, 3);
+        let bins = sys_rels("bin/", 0, 2);
+        assert_eq!(hooks.len(), 3, "system hooks/ 검체 3건 실재");
+        assert_eq!(bins.len(), 2, "system bin/ 검체 2건 실재");
+        let five: Vec<String> = hooks.iter().chain(bins.iter()).cloned().collect();
+        let rel6 = sys_rels("hooks/", 3, 1).pop().expect("--from 용 6번째 system rel 실재");
+        let embed6 = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| *r == rel6)
+            .map(|(_, c)| c.to_string())
+            .unwrap();
+        let custom_of = |i: usize, rel: &str| format!("INCIDENT-{i}-{rel}\n");
+        let adopted_sidecars = |rel: &str| -> Vec<std::path::PathBuf> {
+            let base_name = td.join(rel).file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::read_dir(td.join(rel).parent().unwrap())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| {
+                            n.to_string_lossy()
+                                .starts_with(&format!("{base_name}.user.adopted-"))
+                        })
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+
+        // 사건 상태 주입(5건): 디스크=embed 유지 · {rel}.user=custom_i · 원장 healed 일괄.
+        let mut pending = serde_json::Map::new();
+        for (i, rel) in five.iter().enumerate() {
+            std::fs::write(td.join(format!("{rel}.user")), custom_of(i, rel)).unwrap();
+            pending.insert(
+                rel.clone(),
+                serde_json::json!({
+                    "kind": "healed", "side": format!("{rel}.user"),
+                    "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+                }),
+            );
+        }
+        cys::pack::save_merge_pending(&td, &pending);
+
+        // ① 원클릭 복구.
+        assert_eq!(run_pack_adopt(None, true, None, false, true), 0, "adopt --all 성공");
+        for (i, rel) in five.iter().enumerate() {
+            // ② 전건 복원(rel별 상이 내용 — 교차 배선 검출).
+            assert_eq!(
+                std::fs::read_to_string(td.join(rel)).unwrap(),
+                custom_of(i, rel),
+                "복원 내용 일치: {rel}"
+            );
+            // ③ 원장 adopted.
+            assert_eq!(t4_ledger_kind(&td, rel).as_deref(), Some("adopted"), "원장 adopted: {rel}");
+            // ④ .user 소거 ∧ .user.adopted-<ts> 정확 1건·내용 보존.
+            assert!(!td.join(format!("{rel}.user")).exists(), ".user 원본 슬롯 소거: {rel}");
+            let renamed = adopted_sidecars(rel);
+            assert_eq!(renamed.len(), 1, ".user.adopted-<ts> 정확 1건: {rel}");
+            assert_eq!(
+                std::fs::read_to_string(&renamed[0]).unwrap(),
+                custom_of(i, rel),
+                "개명본 내용 보존: {rel}"
+            );
+        }
+        // ⑤ 6번째 rel — --all 무접촉(원장 순회 정의만으로 구조적 도달 불가 박제).
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel6)).unwrap(),
+            embed6,
+            "rel6 디스크=embed 무접촉"
+        );
+        assert!(cys::pack::load_merge_pending(&td).get(&rel6).is_none(), "rel6 원장 무항목");
+
+        // ⑥ --from 명시 소스 레인(원장 밖 복원 — vibe-regression.sh 형상).
+        let custom6 = custom_of(5, &rel6);
+        let src = base.join("ext-incident-src.sh");
+        std::fs::write(&src, &custom6).unwrap();
+        assert_eq!(
+            run_pack_adopt(
+                Some(rel6.clone()),
+                false,
+                Some(src.to_string_lossy().into_owned()),
+                false,
+                true,
+            ),
+            0,
+            "adopt --from 성공"
+        );
+        assert_eq!(std::fs::read_to_string(td.join(&rel6)).unwrap(), custom6, "명시 소스 복원");
+        let pend = cys::pack::load_merge_pending(&td);
+        let e6 = pend.get(&rel6).and_then(|v| v.as_object()).expect("원장 adopted 신설");
+        assert_eq!(e6.get("kind").and_then(|v| v.as_str()), Some("adopted"), "rel6 kind adopted");
+        assert_eq!(
+            e6.get("from").and_then(|v| v.as_str()),
+            Some(src.to_string_lossy().as_ref()),
+            "from 필드 = 명시 소스"
+        );
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), custom6, "--from 소스 원본 무접촉");
+
+        // ⑦ 전량 재스윕 — 6건 전부 디스크 불변·원장 kept-drift 정규화·개명 사이드카 생존.
+        cys::pack::install(false, None).expect("재스윕");
+        for (i, rel) in five.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(td.join(rel)).unwrap(),
+                custom_of(i, rel),
+                "재스윕 생존(쓰기 0): {rel}"
+            );
+            assert_eq!(
+                t4_ledger_kind(&td, rel).as_deref(),
+                Some("kept-drift"),
+                "kept-drift 정규화: {rel}"
+            );
+            assert_eq!(adopted_sidecars(rel).len(), 1, "개명 사이드카 스윕·prune 생존: {rel}");
+        }
+        assert_eq!(std::fs::read_to_string(td.join(&rel6)).unwrap(), custom6, "rel6 재스윕 생존");
+        assert_eq!(
+            t4_ledger_kind(&td, &rel6).as_deref(),
+            Some("kept-drift"),
+            "rel6 kept-drift 정규화"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

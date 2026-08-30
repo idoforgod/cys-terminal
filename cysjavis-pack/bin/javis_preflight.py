@@ -997,8 +997,10 @@ class Preflight:
         return False  # report 모드: 관찰만, 부작용 없음
 
     # ── 공용 수리: cys init-pack — 누락 항목 재설치 + 비수정 파일 신버전 갱신 + **수정된
-    #    system 파일은 임베드로 치유**(수정본 <rel>.user 보존·C62 원장 보고). 불가침은
-    #    user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(memory/·round 상태)뿐이다.
+    #    system 파일은 제자리 보존(kept-drift — 벤더 미전진)·벤더 전진 시 자동 3-way 병합**(충돌 =
+    #    vendor 본 채택 + 수정본 <rel>.user 보존·C62 원장 보고). 보안 잠금(trusted-keys.json)만
+    #    즉시 치유. 불가침은 user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(memory/·round
+    #    상태)뿐이다.
     #    (구 문구 "사용자 수정본 불가침"은 user-owned에만 참 — 오독이 실사고를 낳아 시정.) ──
     def repair_via_init_pack(self):
         if self._init_pack_ran is not None:
@@ -3240,7 +3242,7 @@ class Preflight:
             self.add(cid, FAIL,
                      "work 스킬 결함: %s — `cys init-pack` 또는 --fix"
                      "(파일이 존재하되 깨진/약화된 경우 init-pack은 보존한다 — "
-                     "강제 복원 플래그는 사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 "
+                     "강제 복원 플래그는 사용자 수정을 전량 vendor 본으로 되돌리는 광범위 조작이라(<rel>.user 백업은 남는다) "
                      "쓰지 않는다. 백업 선행 + 주인님 보고 후 복구 · 운영계약 §11-13)"
                      % "; ".join(problems))
         elif repaired:
@@ -4451,6 +4453,8 @@ class Preflight:
     # user-owned 신버전은 <rel>.new로 병치되고 .merge-pending.json 원장에 기록되는데, 이
     # 원장을 아무도 읽지 않아 라이브 수정 소실이 무통보로 반복됐다(로컬·배포 사용자 양쪽
     # 실측 사고). 부트 ⓪ 출력에 병합 대기를 올려 치유 발생을 관측 가능하게 한다.
+    # (현행 0.14.29: healed는 벤더 전진 충돌 시에만 발생 — 벤더 미전진 드리프트는 kind
+    #  kept-drift로 제자리 보존·기한 검사 제외는 C68 참조.)
     # 체크 목록 '마지막' 고정: 같은 런의 --fix(repair_via_init_pack)가 남긴 신규 원장까지
     # 이 런에서 보여야 한다. 읽기 전용(report 병렬 안전)·WARN(READY 미차단).
     def c62_pack_heal_ledger(self):

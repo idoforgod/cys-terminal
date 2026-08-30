@@ -1,6 +1,6 @@
 #!/bin/bash
 # ★W-C1 pack-guard(커스텀 생존 설계 2026-07-17) — PostToolUse(Write|Edit|MultiEdit):
-#   vendor(system·임베드) 팩 파일 수정 감지 → "다음 부트 치유" 예고 + 정식 영속 경로 안내.
+#   vendor(system·임베드) 팩 파일 수정 감지 → kept-drift 보존 고지 + 벤더 전진 시 자동 병합 예고 + 정식 영속 경로 안내.
 # 채널: additionalContext(모델 주입) — commit-memory-nudge.sh 와 동일한 검증된 패턴.
 # 경계: 오너 Rejected "오버레이 BLOCK 게이트(자기발화 봉쇄)" 준수 — 어떤 실패에도 exit 0(비차단).
 # 판정 SOT: `cys pack-ownership --quiet`(임베드 여부 포함 effective 등급) — sh 재구현 금지(SOT 분산 차단).
@@ -49,7 +49,7 @@ OWN=$(cys pack-ownership --quiet "$REL" 2>/dev/null)
 [ "$OWN" = "system" ] || exit 0
 : > "$STAMP" 2>/dev/null
 
-MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 다음 부트 설치 스윕에 vendor 본으로 치유됩니다(수정본은 $REL.user 로 보존·병합 원장 기록). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ vendor 개선 제안은 cys pack-merge --file $REL --propose. (WARN — 차단 아님·개발 기계의 upstream 승격 작업이면 무시)"
+MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 보존됩니다(kept-drift). 다음 벤더 업데이트 때 자동 병합되며, 충돌 시 vendor 본 + $REL.user 보존 + 원장 기록으로 안내됩니다. 보안 잠금 파일(trusted-keys.json)은 예외 — 즉시 vendor 본으로 치유($REL.user 백업). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ vendor 개선 제안은 cys pack-merge --file $REL --propose. (WARN — 차단 아님·개발 기계의 upstream 승격 작업이면 무시)"
 
 printf '%s' "$MSG" | "$CYS_PY" -c "import json,sys
 print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse','additionalContext':sys.stdin.read()}}, ensure_ascii=False))" 2>/dev/null

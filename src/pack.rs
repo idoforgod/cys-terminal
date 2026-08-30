@@ -2936,8 +2936,8 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
 /// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
 /// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
-/// force=false: user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(상태·기억) 불가침, **수정된
-/// system 파일은 임베드로 치유**(사용자본 `<rel>.user` 보존), 비수정 파일은 입력 신버전으로 자동 갱신.
+/// force=false: user-owned·seed-once 불가침, 수정된 system 파일은 벤더 미전진=kept-drift 제자리
+/// 보존·벤더 전진=검증 base 3-way(충돌=치유+`<rel>.user` 보존), 비수정 파일은 입력 신버전으로 자동 갱신.
 /// ("사용자 수정 파일 불가침" 구 문구는 user-owned 등급에만 참인데 전체로 읽혀 배포 현장의 오판을
 /// 낳았다 — 2026-07-12 치유 원복 사고 시정.) 반환: (written, kept).
 /// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
