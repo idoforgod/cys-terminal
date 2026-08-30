@@ -15073,24 +15073,66 @@ fn run_pack_merge(
                     }
                 }
             } else if keep_mine || take_new {
-                // healed 의 '해소' = 보존본 정리(vendor 본 유지가 이미 디스크 상태).
+                // ★성찰 차단 수리 2R-1(v2 §2 원칙 5 — 침묵 금지): 이 arm 의 전제 "vendor 본 유지가
+                // 이미 디스크 상태"는 revert-merge(디스크=캡처 원본)·치유 후 재수정에서 깨진다 —
+                // disk==embed 검증을 선행한다. 어긋난 상태의 take-new 는 "정리"가 아니라 vendor 본
+                // 실기록이 명시 요청이므로 pack-heal 동일 경로로 위임(kept-drift arm 전례 — 기존
+                // .user 세대 보존 + 현 디스크 백업 + 3중 전진 + 원장 healed). keep-mine 은 문구를
+                // 사실화하고 .user(이 상태에서는 병합본 등의 유일 사본) 삭제 전 상태를 고지한다.
+                let disk_now = std::fs::read_to_string(&target).ok();
+                let disk_is_vendor = match embed_now {
+                    // 임베드 소멸 rel — vendor 본 실체가 없어 비교 불능 = 종전 정리 거동 유지.
+                    None => true,
+                    Some(em) => disk_now.as_deref() == Some(em),
+                };
+                if take_new && !disk_is_vendor {
+                    if dry_run {
+                        println!(
+                            "(dry-run · 쓰기 0) '{rel}' 디스크≠vendor 본(revert-merge·재수정 상태) — vendor 본 실기록(pack-heal 동일 경로 · 현 디스크본은 {rel}.user 백업·기존 보존본은 세대 보존) 예정"
+                        );
+                        return 0;
+                    }
+                    return run_pack_heal(&rel, yes);
+                }
+                let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                let user_desc = if reason == "revert-merge" { "병합본" } else { "보존본" };
                 if dry_run {
-                    println!("(dry-run · 쓰기 0) '{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정) 예정");
+                    if disk_is_vendor {
+                        println!("(dry-run · 쓰기 0) '{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정) 예정");
+                    } else {
+                        println!(
+                            "(dry-run · 쓰기 0) '{rel}' — 내 수정 유지(현 디스크≠vendor 본) · {user_desc}({rel}.user) 삭제 예정"
+                        );
+                    }
                     return 0;
                 }
-                if confirm(&format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")) {
+                let prompt = if disk_is_vendor {
+                    format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")
+                } else {
+                    format!(
+                        "'{rel}' 내 수정 유지 — 현 디스크본은 vendor 본이 아니라 그대로 남고(다음 스윕부터 kept-drift 보존), {user_desc}({rel}.user)은 삭제됩니다. 정리?"
+                    )
+                };
+                if confirm(&prompt) {
                     resolve(&mut pending, ".user");
                     if kind == "conflicted" {
                         // 충돌 조상 사이드카 동반 정리(정리 확정 시에만 — 복권 경로는 .base 유지).
                         let _ = std::fs::remove_file(dir.join(format!("{rel}.base")));
                     }
                     // 디스크 본문 무변경 해소 — before==after 로 '정리' 사실만 원장에 남긴다.
-                    let cur = std::fs::read_to_string(&target).unwrap_or_default();
+                    let cur = disk_now.unwrap_or_default();
                     let action = if take_new { "take-new" } else { "keep-mine" };
                     audit(&merge_audit_entry(
-                        &rel, action, &cur, &cur, "n/a", &flag_list(&["healed-cleanup"]),
+                        &rel, action, &cur, &cur, "n/a",
+                        &flag_list(&[if disk_is_vendor { "healed-cleanup" } else { "drift-keep-cleanup" }]),
                     ));
-                    println!("✅ {rel} — vendor 본 유지 확정, 보존본 정리");
+                    if disk_is_vendor {
+                        println!("✅ {rel} — vendor 본 유지 확정, 보존본 정리");
+                    } else {
+                        println!(
+                            "✅ {rel} — 내 수정 유지(디스크=캡처본·재수정본 그대로 — 다음 스윕부터 kept-drift 보존), {user_desc}({rel}.user) 정리"
+                        );
+                    }
                 }
                 0
             } else {
@@ -23474,6 +23516,124 @@ mod tests {
         let e2 = pend2.get(&rel).and_then(|v| v.as_object()).unwrap();
         assert_eq!(e2.get("kind").and_then(|v| v.as_str()), Some("conflicted"), "LINEAGE kind 불변");
         assert_eq!(e2.get("state").and_then(|v| v.as_str()), Some("at-rest"), "at-rest 전이");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★성찰 차단 수리 2R-1 공통 픽스처: revert-merge 직후 상태 — disk=캡처 원본 ·
+    /// .user=병합본(유일 사본) · 원장 conflicted{reason:revert-merge, capture 승계} ·
+    /// manifest·pristine=embed(병합 때 전진 후 revert 불변).
+    fn t4_revert_state_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, String, String, String, String, [cys::pack::EnvGuard; 3]) {
+        let (td, rel, embed, guards) = t4_system_fixture(tag);
+        let captured = "MY ORIGINAL BEFORE AUTO-MERGE\n".to_string();
+        let merged_disk = "AUTO MERGED RESULT\n".to_string();
+        std::fs::write(td.join(&rel), &merged_disk).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        let cap_rel = format!("pack/100-42/{rel}");
+        let cap_path = cys::pack::pack_captures_dir(&td).join(&cap_rel);
+        std::fs::create_dir_all(cap_path.parent().unwrap()).unwrap();
+        std::fs::write(&cap_path, &captured).unwrap();
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "merged", "side": rel, "capture": cap_rel,
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+        let rc = run_pack_merge(
+            None, false, false, false, false, false, true, false, false, false,
+            Some(rel.clone()),
+        );
+        assert_eq!(rc, 0, "픽스처 전제: revert-merge 성공");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            captured,
+            "픽스처 전제: disk=캡처 원본"
+        );
+        (td, rel, embed, captured, merged_disk, guards)
+    }
+
+    /// ★성찰 차단 수리 2R-1 핀(v2 §2 원칙 5): revert-merge 상태(디스크=캡처 원본≠vendor)의
+    /// --take-new 는 '보존본 정리' 허위 성공이 아니라 vendor 본 실기록이어야 한다 — pack-heal
+    /// 동일 경로 위임으로 ⓐdisk←embed ⓑ현 디스크본 .user 백업 ⓒ기존 .user(병합본=유일 사본)
+    /// 세대 보존 ⓓ원장 healed(capture 승계) ⓔ3중 전진을 박제. 수리 전 실측: exit 0
+    /// "vendor 본 유지 확정" 출력 후 디스크는 캡처본 그대로 + 병합본 .user 무백업 삭제.
+    #[test]
+    fn conflicted_revert_state_take_new_writes_vendor() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, captured, merged_disk, _env) = t4_revert_state_fixture("revtn");
+        let rc = run_pack_merge(
+            Some(rel.clone()), true, false, false, false, false, true, false, false, false, None,
+        );
+        assert_eq!(rc, 0, "take-new 성공");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            embed,
+            "vendor 본 실기록(허위 성공 보고 봉인)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            captured,
+            "현 디스크본(캡처 원본) → .user 백업(원칙 4)"
+        );
+        // 병합본(이전 .user)은 무백업 삭제가 아니라 .user.prev-<ts> 세대 보존.
+        let target = td.join(&rel);
+        let fname = target.file_name().unwrap().to_string_lossy().into_owned();
+        let prev: Vec<std::path::PathBuf> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with(&format!("{fname}.user.prev-"))
+            })
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(prev.len(), 1, "병합본 세대 보존 1본({fname}.user.prev-*)");
+        assert_eq!(
+            std::fs::read_to_string(&prev[0]).unwrap(),
+            merged_disk,
+            "세대 보존 내용 = 병합본(무백업 삭제 봉인)"
+        );
+        let pend = cys::pack::load_merge_pending(&td);
+        let e = pend.get(&rel).and_then(|v| v.as_object()).expect("원장 잔존(healed)");
+        assert_eq!(e.get("kind").and_then(|v| v.as_str()), Some("healed"), "원장 healed 전환");
+        assert_eq!(
+            e.get("capture").and_then(|v| v.as_str()),
+            Some(format!("pack/100-42/{rel}").as_str()),
+            "capture 승계(증거 포인터 불소실)"
+        );
+        assert_triple_advanced(&td, &rel, &embed);
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★성찰 차단 수리 2R-1 핀(keep-mine 절): revert-merge 상태의 --keep-mine 은 디스크(캡처
+    /// 원본)를 그대로 두는 정리(문구 사실화 — "vendor 본 유지 확정" 오보 금지)이며, 다음 스윕이
+    /// 이를 kept-drift 로 보존함을 실스윕으로 증명한다(.user 삭제는 프롬프트 고지 후 확정 정리).
+    #[test]
+    fn conflicted_revert_state_keep_mine_keeps_disk_and_survives_sweep() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, _embed, captured, _merged_disk, _env) = t4_revert_state_fixture("revkm");
+        let rc = run_pack_merge(
+            Some(rel.clone()), false, true, false, false, false, true, false, false, false, None,
+        );
+        assert_eq!(rc, 0, "keep-mine 정리 성공");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            captured,
+            "디스크=캡처 원본 무변경(내 수정 유지)"
+        );
+        assert!(!td.join(format!("{rel}.user")).exists(), "보존본 정리(고지 후 삭제)");
+        assert!(cys::pack::load_merge_pending(&td).get(&rel).is_none(), "원장 해소");
+        // 다음 스윕: manifest==hash(embed)(vendor 미전진) ∧ disk≠embed → L2 kept-drift 보존.
+        cys::pack::install(false, None).expect("재스윕");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            captured,
+            "재스윕 생존(kept-drift 제자리 보존)"
+        );
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("kept-drift"), "kept-drift 정규화");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
