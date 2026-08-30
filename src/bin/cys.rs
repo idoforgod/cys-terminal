@@ -14343,6 +14343,8 @@ fn run_pack_plan(force: bool) -> i32 {
     section("🔄 자동 갱신", &plan.update, "비수정 — 그대로 갱신됨");
     section("✨ 신규 생성", &plan.create, "");
     section("🛠 강제 치유", &plan.heal, "system 수정본 — 덮기 전 사용자본을 <파일>.user 로 보존");
+    section("🧬 자동 병합(3-way)", &plan.merge3, "수정본+vendor 전진 — 검증된 조상 위 자동 병합(충돌·실패는 치유+.user 강등)");
+    section("📌 제자리 보존(kept-drift)", &plan.kept_drift, "system 수정본+vendor 미전진 — 그대로 둠(다음 vendor 전진 때 자동 병합 후보)");
     section("⏸ 보존+병합 대기", &plan.merge_new, "user-owned 수정본 유지 + 신버전 <파일>.new 병치 → cys pack-merge");
     section("🔒 보존", &plan.keep_user, "user-owned 수정본 — 건드리지 않음");
     section("🗑 정리(폐기 파일)", &plan.prune_delete, "임베드에서 제거된 비수정 파일");
@@ -14350,7 +14352,34 @@ fn run_pack_plan(force: bool) -> i32 {
     println!("\n= 변화 없음(최신) {}건", plan.unchanged);
     let pending = cys::pack::load_merge_pending(&dir);
     if !pending.is_empty() {
-        println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
+        // ★T3(D14): kind 분리 계상 — at-rest kind(kept-drift·merged)는 '병합 대기'가 아니라 보존
+        // 상태다(체류가 정상). 미지 kind 는 안전측(가시)으로 검토 대상에 계상한다.
+        let n_kind = |k: &str| {
+            pending
+                .values()
+                .filter(|e| e.get("kind").and_then(|v| v.as_str()) == Some(k))
+                .count()
+        };
+        let kept_n = n_kind("kept-drift");
+        let merged_n = n_kind("merged");
+        let actionable = pending
+            .values()
+            .filter(|e| {
+                !matches!(
+                    e.get("kind").and_then(|v| v.as_str()),
+                    Some("kept-drift") | Some("merged")
+                )
+            })
+            .count();
+        if actionable > 0 {
+            println!("※ 기존 병합 대기 {actionable}건 — `cys pack-merge` 로 검토");
+        }
+        if kept_n + merged_n > 0 {
+            println!(
+                "※ 제자리 보존 상태 {}건 (kept-drift {kept_n}건 · 병합 완료 merged {merged_n}건) — 조치 불요(병합 대기 아님)",
+                kept_n + merged_n
+            );
+        }
     }
     println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
     report_overlay_skill_drift();

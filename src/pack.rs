@@ -2051,6 +2051,97 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
         .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
 
+/// ★T3(D7 · v2 §4 이식 ①): 계보 kind — merged·conflicted 원장 항목은 계보 포인터(capture·
+/// base_side)를 갖는 영속 kind 다. 무규칙 upsert 는 rel 당 1항목 계약(upsert_pending)상 이
+/// 포인터를 지운다 — 아래 upsert_pending_v2 가 유일한 보존 경로다.
+pub(crate) const LINEAGE_KINDS: [&str; 2] = ["merged", "conflicted"];
+
+/// ★T3(D7): 계보 인지 원장 upsert — 기존 upsert_pending 클로저는 자구 불변(new-pending 현행
+/// 경로 회귀 0)이며, 신 kind(kept-drift·merged·conflicted·quarantined)와 healed 의 계보 승계는
+/// 전부 이 헬퍼를 경유한다.
+/// - kept-drift 인입 + 기존 kind∈LINEAGE → kind 불변, `state:"at-rest"` 만 갱신(멱등 — 이미
+///   at-rest 면 no-op·dirty 미발생). 정적 재스윕이 merged/conflicted 계보·캡처 포인터를 지우지
+///   않는다(v2 §4 KeepDrift arm 쓰기 0 규칙 · merged_kind_not_clobbered 핀).
+/// - 그 외 kind 인입 = kind 전환 허용하되 **capture·base_side 는 신 항목에 승계**(신 항목이 자체
+///   값을 갖지 않는 필드만 — 소실 금지. 크래시 창 재스윕 healed 가 영속된 merged 항목의 캡처
+///   포인터를 지우는 창의 봉인 · v2 §4). 승계는 old kind 무관 — 한 번 실린 증거 포인터는 어떤
+///   후속 upsert 도 떨어뜨리지 않는다.
+/// - 전 필드(ts 제외) same 비교 후 upsert — 같으면 no-op(매 기동 install 의 원장 rewrite 방지
+///   계약 유지 · ts 는 최초 기록 시각 보존).
+fn upsert_pending_v2(
+    pending: &mut serde_json::Map<String, serde_json::Value>,
+    dirty: &mut bool,
+    rel: &str,
+    mut entry: serde_json::Map<String, serde_json::Value>,
+) {
+    let old = pending.get(rel).and_then(|e| e.as_object()).cloned();
+    let old_kind = old.as_ref().and_then(|o| o.get("kind")).and_then(|k| k.as_str());
+    let new_kind = entry.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if let Some(ok) = old_kind {
+        if LINEAGE_KINDS.contains(&ok) && new_kind == "kept-drift" {
+            // kind 불변 — state:"at-rest" 만(멱등 · no-op 시 dirty 미발생 = 원장 rewrite 0).
+            let mut e = old.unwrap();
+            if e.get("state").and_then(|s| s.as_str()) != Some("at-rest") {
+                e.insert("state".to_string(), serde_json::json!("at-rest"));
+                pending.insert(rel.to_string(), serde_json::Value::Object(e));
+                *dirty = true;
+            }
+            return;
+        }
+    }
+    // 계보 필드 승계(capture·base_side) — 신 항목이 자체 값을 갖지 않을 때만 구 항목에서 복사.
+    for k in ["capture", "base_side"] {
+        if !entry.contains_key(k) {
+            if let Some(v) = old.as_ref().and_then(|o| o.get(k)) {
+                entry.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    let same = old.as_ref().is_some_and(|o| {
+        let strip = |m: &serde_json::Map<String, serde_json::Value>| {
+            let mut c = m.clone();
+            c.remove("ts");
+            c
+        };
+        strip(o) == strip(&entry)
+    });
+    if !same {
+        pending.insert(rel.to_string(), serde_json::Value::Object(entry));
+        *dirty = true;
+    }
+}
+
+/// ★T3(D13): 병합 원장 kind 별 명시 계상 — **빼기 산식 금지**(구 `new_n = len - healed_n` 산식은
+/// 신 kind 4종을 전부 '.new 병치'로 오보했다 — W-E2 오계상·성찰 4렌즈 공통 실측). 부트 요약
+/// 1줄(v2 §5 채널 1)과 W-E2 사용자 언어 요약이 같은 산식을 공유한다.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingKindCounts {
+    pub healed: usize,
+    pub new_pending: usize,
+    pub kept_drift: usize,
+    pub merged: usize,
+    pub conflicted: usize,
+    pub quarantined: usize,
+}
+
+pub(crate) fn pending_kind_counts(
+    pending: &serde_json::Map<String, serde_json::Value>,
+) -> PendingKindCounts {
+    let mut c = PendingKindCounts::default();
+    for e in pending.values() {
+        match e.get("kind").and_then(|k| k.as_str()) {
+            Some("healed") => c.healed += 1,
+            Some("new-pending") => c.new_pending += 1,
+            Some("kept-drift") => c.kept_drift += 1,
+            Some("merged") => c.merged += 1,
+            Some("conflicted") => c.conflicted += 1,
+            Some("quarantined") => c.quarantined += 1,
+            _ => {} // 미지 kind — 어느 버킷에도 오계상하지 않는다(빼기 산식 금지의 요점)
+        }
+    }
+    c
+}
+
 /// install 드라이런 리포트(④ 투명성) — `cys pack-plan` 이 설치 **전에** 사용자에게 보여준다.
 #[derive(Debug, Default)]
 pub struct InstallPlan {
@@ -2059,6 +2150,10 @@ pub struct InstallPlan {
     pub heal: Vec<String>,                // 수정본 강제 치유(사용자본 `<rel>.user` 보존 후 덮어씀)
     pub merge_new: Vec<String>,           // user-owned 보존 + 신버전 `<rel>.new` 병치(병합 대기)
     pub keep_user: Vec<String>,           // user-owned 보존(신버전 병치 불요)
+    // ★T3(v2 §4 plan_install · v1 감사 D6): 신설 2버킷 — heal 버킷 재사용 금지(재검증 R7:
+    // 재사용은 컴파일은 통과하나 pack-plan 이 병합을 치유로 오보하는 의미 드리프트).
+    pub kept_drift: Vec<String>,          // ★L2: system 수정본 + vendor 미전진 — 제자리 보존(kept-drift)
+    pub merge3: Vec<String>,              // ★L3: 수정본 + vendor 전진 + 검증 base — 자동 3-way 병합
     pub unchanged: usize,                 // 최신(변화 없음)
     pub prune_delete: Vec<String>,        // 폐기 파일 제거(비수정)
     pub prune_keep_modified: Vec<String>, // 폐기됐지만 수정본이라 보존
@@ -2127,8 +2222,8 @@ pub fn plan_install(
                     plan.unchanged += 1;
                 }
             }
-            FileAction::KeepDrift => { plan.unchanged += 1; } // ★D1 인터림 — System 전용 도달·T3에서 kept_drift 버킷 신설 예정
-            FileAction::Merge3 => plan.heal.push(rel.to_string()), // Write{heal:true} 동형
+            FileAction::KeepDrift => plan.kept_drift.push(rel.to_string()), // ★T3(D14): 전용 버킷 계상
+            FileAction::Merge3 => plan.merge3.push(rel.to_string()),        // ★T3(D14): 전용 버킷 계상
         }
     }
     // prune 프리뷰(install_into prune 블록과 동일 판정).
@@ -2872,6 +2967,24 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         .entry(rel.to_string())
                         .or_insert_with(|| content_hash(content));
                     ensure_pristine(&dir, rel, content);
+                    // ★T3(D6) 원장 수명 — disk==embed 재일치 합류점: kept-drift·quarantined 는
+                    // 제거(new-pending 청소 동형 — 방치 시 유령 계상 영구화 실측), merged·conflicted
+                    // 는 보존하되 state:"at-rest" 만 갱신(capture·base_side 계보 가치 — v2 §4).
+                    match pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()) {
+                        Some("kept-drift") | Some("quarantined") => {
+                            pending.remove(rel);
+                            pending_dirty = true;
+                        }
+                        Some(k) if LINEAGE_KINDS.contains(&k) => {
+                            if let Some(serde_json::Value::Object(e)) = pending.get_mut(rel) {
+                                if e.get("state").and_then(|s| s.as_str()) != Some("at-rest") {
+                                    e.insert("state".to_string(), serde_json::json!("at-rest"));
+                                    pending_dirty = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 if new_pending {
                     // user-owned 보존 + 임베드 신버전 병치(idempotent) — '영구 동결'을 '보이는 병합 대기'로.
@@ -2901,8 +3014,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 continue;
             }
             FileAction::KeepDrift => {
-                // ★T2 스텁(v2 §12): 실행 동형 = Keep{adopt_hash:false,new_pending:false} — 쓰기 0.
-                //   ★D1 인터림 침묵: kept-drift 원장·plan 버킷·가시화 4채널은 T3 — T3 병합 전 릴리스 태그 금지.
+                // ★T3(v2 §3 L2 · v1 Patch 1 흡수): 벤더 미전진 + system 드리프트 — 제자리 보존.
+                // 파일 쓰기 0(Keep 동형) + 원장 kept-drift 계상(가시화 4채널의 원천 · D1 인터림 해소).
                 if !unreadable
                     && pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str())
                         == Some("new-pending")
@@ -2910,6 +3023,14 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     pending.remove(rel);
                     pending_dirty = true;
                     let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                }
+                // 원장 계상(kind:"kept-drift", side:rel) — 기존 kind∈LINEAGE(merged·conflicted)면
+                // kind 불변·state:"at-rest" 만(upsert_pending_v2 계보 규칙 · no-op 시 rewrite 0).
+                if let serde_json::Value::Object(entry) = serde_json::json!({
+                    "kind": "kept-drift", "side": rel,
+                    "version": target_version, "ts": now_ts,
+                }) {
+                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                 }
                 if unreadable {
                     unreadable_kept.push(rel.to_string());
@@ -2937,7 +3058,14 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
                             let _ = write_atomic(&user_path, d.as_bytes());
                         }
-                        upsert_pending(&mut pending, &mut pending_dirty, rel, "healed", format!("{rel}.user"));
+                        // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
+                        // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
+                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                            "kind": "healed", "side": format!("{rel}.user"),
+                            "version": target_version, "ts": now_ts,
+                        }) {
+                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
                     }
                 }
             }
@@ -2978,22 +3106,31 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         );
     }
     if !pending.is_empty() {
-        // ★W-E2: 사용자 언어 요약 — "지워진 게 아니라 보존됐다"를 등급별 수치로 즉시 증명.
-        let healed_n = pending.values()
-            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("healed"))
-            .count();
-        let new_n = pending.len() - healed_n;
+        // ★W-E2 · ★T3(D13): 사용자 언어 요약 — kind 별 **명시** 계상(빼기 산식 전면 개정: 구
+        // `new_n = len - healed_n` 은 kept-drift/merged/conflicted/quarantined 를 전부 '.new 병치'
+        // 로 오보했다 — 성찰 4렌즈 공통 실측). at-rest kind(kept-drift·merged)는 '병합 대기'가
+        // 아니라 보존 상태다 — 아래 부트 요약 1줄(v2 §5 채널 1)이 분리 보고한다.
+        let c = pending_kind_counts(&pending);
         // ★W-1: 판독 불가 보존분은 원장에 없다 — 위 수치가 '전량'으로 읽히지 않게 같은 줄에 덧붙인다.
         let unreadable_note = if unreadable_kept.is_empty() {
             String::new()
         } else {
             format!(" · 판독 불가라 손대지 않음 {}건(위 안내)", unreadable_kept.len())
         };
-        println!(
-            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건){}\n\
-             \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
-            pending.len(), healed_n, new_n, unreadable_note
-        );
+        if c.healed + c.new_pending > 0 {
+            println!(
+                "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건){}\n\
+                 \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
+                c.healed + c.new_pending, c.healed, c.new_pending, unreadable_note
+            );
+        }
+        // ★T3(D13 · v2 §5 가시성 채널 1): 부트 요약 1줄 — 어느 하나라도 0 이 아닐 때만.
+        if c.healed + c.merged + c.kept_drift + c.conflicted + c.quarantined > 0 {
+            println!(
+                "[init-pack] pack: healed={} merged={} kept-drift={} conflicted={} quarantined={} — cys pack-merge 로 확인",
+                c.healed, c.merged, c.kept_drift, c.conflicted, c.quarantined
+            );
+        }
     }
     // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
     // 비수정(설치-당시 해시 == 현재 디스크 해시)만 삭제하고, 사용자 수정본·*_DIRECTIVE.md는 보존(안전측).
@@ -4468,9 +4605,16 @@ mod tests {
         std::fs::write(td.join("README.md"), "OLD-INSTALLED").unwrap();
         std::fs::write(td.join("soul.md"), "USER-SOUL").unwrap();
         std::fs::write(td.join("alerts-config.json"), "SYS-DRIFT").unwrap(); // system 대조군(W-ACL 이후)
+        // ★T3(커밋① · D14): kept-drift 픽스처 — manifest[rel]==hash(embed)(벤더 미전진 증명) +
+        // 드리프트 → plan.kept_drift 버킷(unchanged 오계상·heal 버킷 재사용 금지의 박제).
+        let kd_rel = "CLAUDE.md.template";
+        let kd_embed = PACK_ALL.iter().find(|(r, _)| *r == kd_rel).map(|(_, c)| *c)
+            .expect("팩에 CLAUDE.md.template 부재(system 픽스처)");
+        std::fs::write(td.join(kd_rel), "KD-DRIFT-EDIT").unwrap();
         let manifest = serde_json::json!({
             "README.md": content_hash("OLD-INSTALLED"),
             "soul.md": content_hash("OLD-SOUL-BASE"),
+            kd_rel: content_hash(kd_embed),
         });
         std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
 
@@ -4480,14 +4624,100 @@ mod tests {
         assert!(plan.update.iter().any(|r| r == "README.md"), "비수정 → update");
         assert!(plan.merge_new.iter().any(|r| r == "soul.md"), "user-owned+전진 → merge_new");
         assert!(plan.heal.iter().any(|r| r == "alerts-config.json"), "system 수정 → heal");
+        assert!(plan.kept_drift.iter().any(|r| r == kd_rel),
+                "★T3: system 수정+vendor 미전진 → kept_drift 버킷");
+        assert!(!plan.heal.iter().any(|r| r == kd_rel), "kept-drift 를 heal 로 오보 금지(R7)");
         // 실제 install 이 플랜과 같은 행동을 하는지 대조.
         install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
         assert_eq!(read("soul.md"), "USER-SOUL");
         assert!(td.join("soul.md.new").exists());
         assert!(td.join("alerts-config.json.user").exists());
+        // ★T3 plan=actual 확장: kept-drift 는 제자리 보존 + 원장 계상(파일 쓰기 0).
+        assert_eq!(read(kd_rel), "KD-DRIFT-EDIT", "kept-drift 제자리 보존(plan=actual)");
+        assert_eq!(
+            load_merge_pending(&td).get(kd_rel).and_then(|e| e["kind"].as_str()),
+            Some("kept-drift"),
+            "kept-drift 원장 계상(plan=actual)"
+        );
 
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★T3(D7 · v2 §4 이식 ① — 원장 계보 보존 핀): merged 항목 위에 후속 upsert 가 와도
+    /// 계보(kind·capture)가 소실되지 않는다. 커밋① = KeepDrift 쪽(정적 재스윕 → kind 불변·
+    /// state:"at-rest" 만 · no-op 멱등). healed 쪽(크래시 창 재스윕 → kind 전환·capture 승계)은
+    /// 커밋②에서 확장.
+    #[test]
+    fn merged_kind_not_clobbered() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-t3-lineage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base.join("claude"));
+
+        let rel = "skills/t3-lineage/SKILL.md";
+        let e1 = "VENDOR-V1\ncommon\n";
+        let merged_disk = "VENDOR-V1\ncommon\nUSER-DELTA\n";
+        let capture_ptr = "pack/100-1/skills/t3-lineage/SKILL.md";
+        // 병합 직후 at-rest 상태 구성: disk=E1⊕δ · manifest=hash(E1) · 원장 merged{capture}.
+        let p = pd.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, merged_disk).unwrap();
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash(e1) }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            pd.join(MERGE_PENDING_FILE),
+            serde_json::json!({
+                rel: {"kind": "merged", "side": rel, "capture": capture_ptr,
+                      "version": "1.1.0", "ts": 100}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 정적 재스윕(벤더 미전진 — 같은 E1) → decide=KeepDrift.
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).expect("원장 항목 잔존");
+        assert_eq!(e["kind"].as_str(), Some("merged"),
+                   "★D7: KeepDrift upsert 가 merged kind 를 덮었다(계보 소실)");
+        assert_eq!(e["capture"].as_str(), Some(capture_ptr), "capture 포인터 소실");
+        assert_eq!(e["state"].as_str(), Some("at-rest"), "state:\"at-rest\" 갱신 누락");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), merged_disk, "at-rest 본문 불가침");
+        // 멱등: 재스윕 no-op(원장 바이트 불변 — dirty 미발생 계약).
+        let bytes = std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap();
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap(), bytes,
+                   "at-rest 재스윕이 원장을 rewrite(멱등 위반)");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★T3(D13): W-E2/부트 요약 계상 산식 — kind 별 **명시** count(빼기 산식 금지). 미지 kind 는
+    /// 어느 버킷에도 오계상되지 않는다(구 산식은 신 kind 전부를 '.new 병치'로 오보 — 성찰 실측).
+    #[test]
+    fn w_e2_summary_counts_by_kind_explicit() {
+        let mk = |kind: &str| serde_json::json!({"kind": kind, "side": "x", "version": "1.0.0", "ts": 1});
+        let mut pending = serde_json::Map::new();
+        pending.insert("a".into(), mk("healed"));
+        pending.insert("b".into(), mk("new-pending"));
+        pending.insert("c".into(), mk("kept-drift"));
+        pending.insert("d".into(), mk("merged"));
+        pending.insert("e".into(), mk("conflicted"));
+        pending.insert("f".into(), mk("quarantined"));
+        pending.insert("g".into(), mk("future-unknown-kind"));
+        pending.insert("h".into(), mk("healed"));
+        let c = pending_kind_counts(&pending);
+        assert_eq!(
+            (c.healed, c.new_pending, c.kept_drift, c.merged, c.conflicted, c.quarantined),
+            (2, 1, 1, 1, 1, 1),
+            "kind 별 명시 계상 위반 — 빼기 산식이면 미지 kind 가 기존 버킷에 오계상된다"
+        );
     }
 
     #[test]
@@ -6922,12 +7152,39 @@ mod tests {
             "★후계ⓑ(B2 전환 · v2 §6): 벤더 미전진 드리프트 → kept-drift 제자리 보존"
         );
         assert!(!pd.join(format!("{sys_target}.user")).exists(), "kept-drift 는 .user 미생성");
+        // ★T3(커밋①) 원장 계상: kind:"kept-drift" · side=rel — 가시화 4채널의 원천.
+        let pend = load_merge_pending(&pd);
+        assert_eq!(
+            pend.get(sys_target).and_then(|e| e["kind"].as_str()),
+            Some("kept-drift"),
+            "★T3: kept-drift 원장 계상 부재 — D1 인터림 침묵 재발"
+        );
+        assert_eq!(
+            pend.get(sys_target).and_then(|e| e["side"].as_str()),
+            Some(sys_target),
+            "kept-drift side=rel(제자리 보존 — 사이드카 아님)"
+        );
+        let ledger_bytes = std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap();
         // 재실행 멱등: kept-drift 가 상태를 흔들지 않는다.
         install_staged(false, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(pd.join(sys_target)).unwrap(),
             "SYS-EDIT-XYZ",
             "재실행 멱등"
+        );
+        // ★T3: 재실행 원장 no-op(ts 포함 바이트 불변) — 매 기동 원장 rewrite 방지 계약.
+        assert_eq!(
+            std::fs::read(pd.join(MERGE_PENDING_FILE)).unwrap(),
+            ledger_bytes,
+            "재실행이 원장을 rewrite 했다(upsert same-check 위반)"
+        );
+        // ★T3(D6) 수명: 드리프트 소멸(disk==embed 재일치)이면 kept-drift 항목 자동 제거.
+        let sys_embed = PACK_ALL.iter().find(|(r, _)| *r == sys_target).map(|(_, c)| *c).unwrap();
+        std::fs::write(pd.join(sys_target), sys_embed).unwrap();
+        install_staged(false, None).unwrap();
+        assert!(
+            load_merge_pending(&pd).get(sys_target).is_none(),
+            "★T3(D6): disk==embed 재일치 후에도 kept-drift 원장 유령 잔존"
         );
 
         let _ = std::fs::remove_dir_all(&base);

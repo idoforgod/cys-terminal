@@ -4473,7 +4473,14 @@ class Preflight:
                         if isinstance(v, dict) and v.get("kind") == "healed")
         newp = sorted(r for r, v in pending.items()
                       if isinstance(v, dict) and v.get("kind") == "new-pending")
-        if not healed and not newp:
+        # ★T3(D2): Merge3 폴백(conflicted)·백업 실패 격리(quarantined) 가시화 — 2026-07-12 사고
+        # 시정 채널(C62)이 신 충돌 클래스를 못 보는 사각의 봉인. kept-drift·merged(at-rest)는
+        # 조치 불요 보존 상태라 이 WARN 채널 비대상(부트 요약 1줄·pack-plan 이 담당).
+        conflicted = sorted(r for r, v in pending.items()
+                            if isinstance(v, dict) and v.get("kind") == "conflicted")
+        quarantined = sorted(r for r, v in pending.items()
+                             if isinstance(v, dict) and v.get("kind") == "quarantined")
+        if not healed and not newp and not conflicted and not quarantined:
             self.add(cid, PASS, "병합 대기 0건")
             return
         parts = []
@@ -4485,6 +4492,14 @@ class Preflight:
             parts.append("신버전 대기(.new) %d건: %s%s"
                          % (len(newp), ", ".join(newp[:8]),
                             " 외 %d건" % (len(newp) - 8) if len(newp) > 8 else ""))
+        if conflicted:
+            parts.append("★병합 충돌(conflicted) %d건 — vendor 본 적용·내 수정본 <파일>.user·조상 <파일>.base 보존: %s%s"
+                         % (len(conflicted), ", ".join(conflicted[:8]),
+                            " 외 %d건" % (len(conflicted) - 8) if len(conflicted) > 8 else ""))
+        if quarantined:
+            parts.append("★격리(quarantined) %d건 — 판독 불가 + 백업 실패로 손대지 않음(파일 그대로 · UTF-8 회복 후 재스윕): %s%s"
+                         % (len(quarantined), ", ".join(quarantined[:8]),
+                            " 외 %d건" % (len(quarantined) - 8) if len(quarantined) > 8 else ""))
         self.add(cid, WARN, "; ".join(parts)
                  + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)"
                  + " · 방금 원복된 파일의 원커맨드 복원: `cys pack-rollback --file <파일>`")
@@ -4515,13 +4530,25 @@ class Preflight:
         except ValueError:
             max_days = 14.0
         now = time.time()
+
+        # ★T3(D1): 영속 kind 는 기한 개념이 없다(체류가 정상 상태) — kept-drift·merged(∨ state
+        # at-rest)는 stale 산식에서 제외한다. 제외 없이는 fingerprint(일 단위 oldest)가 매일
+        # 새 멱등키를 만들어 wakeup 큐 일일 재배달 폭주가 확정된다(성찰 4렌즈 공통 실측).
+        # conflicted·quarantined·healed·new-pending 은 조치 가능(actionable)이라 기한 유지.
+        def _exempt(v):
+            return v.get("kind") in ("kept-drift", "merged") or v.get("state") == "at-rest"
+
         stale = sorted(
             (rel, (now - float(v.get("ts", now))) / 86400.0)
             for rel, v in pending.items()
-            if isinstance(v, dict) and (now - float(v.get("ts", now))) / 86400.0 > max_days
+            if isinstance(v, dict) and not _exempt(v)
+            and (now - float(v.get("ts", now))) / 86400.0 > max_days
         )
+        exempt_n = sum(1 for v in pending.values() if isinstance(v, dict) and _exempt(v))
         if not stale:
-            self.add(cid, PASS, "병합 대기 %d건 — 전부 기한(%.0f일) 이내" % (len(pending), max_days))
+            self.add(cid, PASS, "병합 대기 %d건 — 전부 기한(%.0f일) 이내%s"
+                     % (len(pending), max_days,
+                        " (영속 kind 기한 제외 %d건)" % exempt_n if exempt_n else ""))
             return
         # 소비 강제 신호: master wakeup 큐 enqueue(멱등 키=원장 지문 — 같은 잔존 상태로 재부트해도 1건).
         # ★모드 계약 준수(C28 관례와 동일 `self.fix` 게이트): report=관찰만·safe/dry=무변경이므로
