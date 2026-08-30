@@ -15492,6 +15492,25 @@ fn run_pack_adopt(
     }
 }
 
+/// ★성찰 차단 수리(v2 §9 사건표 스킬 4건 처분 — "이중 활성 방지 안내"): skills/ rel 에 동명
+/// 로컬 오버레이(`~/.cys/local/skills/<skill>`)가 실재하면 스킬 색인 shadowing(compose_directive
+/// — 동명은 local 이 이긴다)이 팩 사본을 침묵 비활성화한다. 사건 복구로 오버레이가 활성인 스킬의
+/// 팩 사본을 복권·수정하면 이번 릴리스가 잡으려던 사건 클래스(침묵 비활성)가 무고지로 재생산되는
+/// 경로의 봉인 — 조건부(오버레이 실재 시) 1줄 고지. None = 비스킬 rel 또는 오버레이 부재.
+/// pack-guard.sh 도 같은 조건으로 동승 고지한다(경로 유도 규약 동형 — local_dir 기본 = pack 형제).
+fn skills_overlay_shadowing_notice(rel: &str) -> Option<String> {
+    let skill_dir = rel.strip_prefix("skills/")?.split('/').next().filter(|s| !s.is_empty())?;
+    let overlay = cys::pack::local_dir().join("skills").join(skill_dir);
+    if overlay.exists() {
+        Some(format!(
+            "⚠ 동명 로컬 오버레이 실재({}) — shadowing 으로 로컬이 이겨 이 팩 사본 수정·복권분은 비활성입니다(활성 반영은 로컬 오버레이 쪽에서).",
+            overlay.display()
+        ))
+    } else {
+        None
+    }
+}
+
 /// pack-adopt 파일별 절차(v2 §9 순서 고정) — Err = 해당 건 거부 사유(그 파일 무변경).
 fn adopt_one(
     dir: &std::path::Path,
@@ -15633,6 +15652,10 @@ fn adopt_one(
         println!("✅ {rel} ← 복권(소스 {src_label} · 다음 스윕에 kept-drift 정규화)");
     } else {
         println!("✅ {rel} ← custom 복원(소스 {src_label} · 임베드 밖 — 원장 정규화 없음)");
+    }
+    // ★v2 §9 이중 활성 방지 안내(조건부 — 동명 로컬 오버레이 실재 시에만 1줄).
+    if let Some(notice) = skills_overlay_shadowing_notice(rel) {
+        println!("{notice}");
     }
     // ⑩ --merge-after: 전량 재스윕(재구현 0 · install 멱등) 후 rel 결과 kind 보고.
     if merge_after {
@@ -23165,6 +23188,36 @@ mod tests {
         );
         assert!(src.is_file(), "--from 소스 원본 무접촉(개명 없음)");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★성찰 차단 수리 핀(v2 §9 — 이중 활성 방지 안내 조건): skills/ rel ∧ 동명 로컬 오버레이
+    /// 실재에서만 Some(고지 1줄), 오버레이 부재·비스킬 rel 은 None(무고지 — 소음 방지).
+    /// 스킬 하위 자산 rel(assets/README.md)도 같은 스킬 디렉터리로 귀속 판정(사건 4건 중 1건 형상).
+    #[test]
+    fn skills_overlay_shadowing_notice_conditional() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("cys-t5-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let td = base.join("pack");
+        std::fs::create_dir_all(&td).unwrap();
+        let _guards = [
+            cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &td),
+            cys::pack::EnvGuard::set("CYS_LOCAL_DIR", base.join("local")),
+        ];
+        // 오버레이 부재 → None.
+        assert_eq!(skills_overlay_shadowing_notice("skills/grill-me/SKILL.md"), None);
+        // 오버레이 실재 → Some(자구: shadowing·비활성).
+        std::fs::create_dir_all(base.join("local/skills/grill-me")).unwrap();
+        let n = skills_overlay_shadowing_notice("skills/grill-me/SKILL.md")
+            .expect("오버레이 실재 시 고지");
+        assert!(n.contains("shadowing") && n.contains("비활성"), "{n}");
+        // 스킬 하위 자산 rel 도 같은 스킬 디렉터리 귀속.
+        assert!(skills_overlay_shadowing_notice("skills/grill-me/assets/README.md").is_some());
+        // 타 스킬·비스킬 rel 은 None.
+        assert_eq!(skills_overlay_shadowing_notice("skills/other-skill/SKILL.md"), None);
+        assert_eq!(skills_overlay_shadowing_notice("bin/javis_distill.py"), None);
+        assert_eq!(skills_overlay_shadowing_notice("skills/"), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★T4(ⓕ): vendor 전진 검출 시 기본 착수 거부(무변경 — 판정 시뮬 = decide_file_action 직호출)

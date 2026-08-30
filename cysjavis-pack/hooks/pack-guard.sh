@@ -51,6 +51,20 @@ OWN=$(cys pack-ownership --quiet "$REL" 2>/dev/null)
 
 MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 보존됩니다(kept-drift). 다음 벤더 업데이트 때 자동 병합되며, 충돌 시 vendor 본 + $REL.user 보존 + 원장 기록으로 안내됩니다. 보안 잠금 파일(trusted-keys.json)은 예외 — 즉시 vendor 본으로 치유($REL.user 백업). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ vendor 개선 제안은 cys pack-merge --file $REL --propose. (WARN — 차단 아님·개발 기계의 upstream 승격 작업이면 무시)"
 
+# ── ★v2 §9 이중 활성 방지 안내(사건표 스킬 4건 처분 — 조건부 동승) ──
+# skills/ rel 에 동명 로컬 오버레이(~/.cys/local/skills/<skill>)가 실재하면 스킬 색인
+# shadowing(동명 = local 승리)으로 이 팩 사본 수정은 침묵 비활성 — 오버레이 실재 시에만 1줄 고지.
+# 경로 유도는 Rust local_dir() 규약 동형: CYS_LOCAL_DIR > pack 형제 local(정규화 경로 기준).
+case "$REL" in
+  skills/*/*)
+    _SKILL_DIR="${REL#skills/}"; _SKILL_DIR="${_SKILL_DIR%%/*}"
+    _LOCAL_ROOT="${CYS_LOCAL_DIR:-$(dirname "$_PACK_N")/local}"
+    if [ -e "$_LOCAL_ROOT/skills/$_SKILL_DIR" ]; then
+      MSG="$MSG ★동명 로컬 오버레이($_LOCAL_ROOT/skills/$_SKILL_DIR)가 실재 — shadowing 으로 로컬이 이겨 이 팩 사본 수정은 비활성입니다(활성 반영은 로컬 오버레이 쪽에서)."
+    fi
+    ;;
+esac
+
 printf '%s' "$MSG" | "$CYS_PY" -c "import json,sys
 print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse','additionalContext':sys.stdin.read()}}, ensure_ascii=False))" 2>/dev/null
 exit 0
