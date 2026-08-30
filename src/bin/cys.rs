@@ -15190,6 +15190,32 @@ fn run_pack_merge(
             1
         }
         "adopted" => {
+            // ★성찰 차단 수리 2R-3(G3-축3 동형 — 플래그 침묵 무시 금지): 종전엔 플래그 불문
+            // 단일 println 후 exit 0 이라, 다음 스윕 전까지(부트 간격만큼) 명시 --take-new
+            // (vendor 채택 — doctor 손상 라벨의 처방 종착지)가 "조치 불요" 오보로 침묵
+            // 무시됐다. kept-drift arm 과 동형 계약: --take-new = 명시 치유(pack-heal 동일
+            // 경로) · --keep-mine = 무조치 확인 · 그 외 플래그 = exit 1 거부.
+            if dry_run {
+                if take_new {
+                    println!("(dry-run · 쓰기 0) '{rel}' ← vendor 본 복원(pack-heal 동일 경로) 예정");
+                } else {
+                    println!("(dry-run · 쓰기 0) '{rel}' — 조치 불요(복권 확정 상태 · 다음 스윕에 kept-drift 정규화)");
+                }
+                return 0;
+            }
+            if take_new {
+                return run_pack_heal(&rel, yes);
+            }
+            if keep_mine {
+                println!("'{rel}' 은 이미 복권 확정 상태(adopted — 조치 불요·다음 스윕에 kept-drift 정규화)");
+                return 0;
+            }
+            if to_local {
+                eprintln!(
+                    "'{rel}' 은 복권(adopted) 상태 — 지원 해소: --take-new(vendor 복귀 = cys pack-heal {rel}) · --keep-mine(무조치 확인)"
+                );
+                return 1;
+            }
             println!("'{rel}' — 복권됨(다음 스윕에 kept-drift 정규화 — 조치 불요)");
             0
         }
@@ -23634,6 +23660,60 @@ mod tests {
             "재스윕 생존(kept-drift 제자리 보존)"
         );
         assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("kept-drift"), "kept-drift 정규화");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★성찰 차단 수리 2R-3 핀: adopted 원장 kind 에서 --take-new/--keep-mine 플래그가 침묵
+    /// 무시되던 구멍 — 실측 사건 형상(0바이트 복권본·doctor Empty 라벨)에서 --take-new --yes 가
+    /// "조치 불요" exit 0 오보 후 파일은 0바이트 그대로였다. 수리 계약(kept-drift arm 동형):
+    /// take-new=pack-heal 위임(vendor 실기록+백업+원장 healed) · keep-mine=무조치 확인 exit 0 ·
+    /// to-local=exit 1 거부(플래그 침묵 무시 금지 — G3-축3 동형).
+    #[test]
+    fn adopted_take_new_heals_and_unsupported_flags_refused() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("adopttn");
+        std::fs::write(td.join(&rel), "").unwrap(); // 사건 형상: 0바이트 복권본
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "adopted", "side": rel, "from": format!("{rel}.user"),
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+        // ⓐ to-local = 지원 밖 → exit 1 거부(무변경).
+        let rc = run_pack_merge(
+            Some(rel.clone()), false, false, false, true, false, true, false, false, false, None,
+        );
+        assert_eq!(rc, 1, "to-local 은 adopted 지원 밖 — exit 1 거부");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), "", "거부 = 무변경");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("adopted"), "거부 = 원장 무변경");
+        // ⓑ keep-mine = 무조치 확인(exit 0 · 무변경 · 원장 유지).
+        let rc = run_pack_merge(
+            Some(rel.clone()), false, true, false, false, false, true, false, false, false, None,
+        );
+        assert_eq!(rc, 0, "keep-mine = 무조치 확인");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), "", "무조치 = 무변경");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("adopted"), "원장 유지");
+        // ⓒ take-new = pack-heal 동일 경로(vendor 실기록 · 0바이트본 .user 백업 · 원장 healed).
+        let rc = run_pack_merge(
+            Some(rel.clone()), true, false, false, false, false, true, false, false, false, None,
+        );
+        assert_eq!(rc, 0, "take-new 성공");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            embed,
+            "vendor 본 실기록(침묵 무시 봉인)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            "",
+            "0바이트 복권본 .user 백업(원칙 4)"
+        );
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 healed 전환");
+        assert_triple_advanced(&td, &rel, &embed);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
