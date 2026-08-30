@@ -179,6 +179,27 @@ class TestC68(Base):
         self.assertEqual(st, PASS, detail)
         self.assertIn("영속 kind 기한 제외 1건", detail)
 
+    def test_adopted_exempt_from_age(self):
+        """★0.14.29 성찰 차단 수리(T4 신 kind 분류 누락): adopted(복권 확정 — 다음 스윕에
+        kept-drift 정규화)는 워커가 할 일이 없는 스윕 대기 정상 체류다. 수리 전 실측:
+        adopted 15일 원장 → C62 PASS '병합 대기 0건' ∧ C68 WARN '기한(14일) 초과 1건'
+        비대칭 + fingerprint 일일 갱신 = wakeup 일일 재배달. 수리 후 = 양쪽 PASS.
+        (기존 11검체에 adopted 0건이던 격차의 봉합 픽스처.)"""
+        self.ledger({"hooks/x.sh": {"kind": "adopted", "side": "hooks/x.sh",
+                                    "ts": self.old(15.0)}})
+        st62, detail62 = self.c62()
+        self.assertEqual(st62, PASS, "adopted 는 C62 판정 집합 비대상 유지: %s" % detail62)
+        st, detail = self.c68()
+        self.assertEqual(st, PASS, "adopted 15일 체류는 기한 제외여야 함: %s" % detail)
+        self.assertIn("영속 kind 기한 제외 1건", detail)
+        # 계측 타당성(판정 뒤집힘): 같은 픽스처에서 kind 만 healed 로 바꾸면 WARN — 제외가
+        # kind 판별에서 나오는지(전면 PASS 하네스가 아닌지)를 잰다.
+        self.ledger({"hooks/x.sh": {"kind": "healed", "side": "hooks/x.sh.user",
+                                    "ts": self.old(15.0)}})
+        st2, detail2 = self.c68()
+        self.assertEqual(st2, WARN, "kind 치환이 WARN 으로 뒤집히지 않음: %s" % detail2)
+        self.assertIn("기한(14일) 초과 1건", detail2)
+
     def test_actionable_within_deadline_pass_and_flip(self):
         """healed 신선(1일) = PASS → 같은 항목 ts 만 30일로 되감으면 WARN — 판정이 실제로
         뒤집히는지(계측 타당성)."""

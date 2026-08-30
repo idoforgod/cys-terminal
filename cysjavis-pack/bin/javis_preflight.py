@@ -4550,8 +4550,14 @@ class Preflight:
         # at-rest)는 stale 산식에서 제외한다. 제외 없이는 fingerprint(일 단위 oldest)가 매일
         # 새 멱등키를 만들어 wakeup 큐 일일 재배달 폭주가 확정된다(성찰 4렌즈 공통 실측).
         # conflicted·quarantined·healed·new-pending 은 조치 가능(actionable)이라 기한 유지.
+        # ★0.14.29 성찰 차단 수리: T4 신설 adopted(복권 확정 — 다음 스윕에 kept-drift 정규화·
+        # state 무부여)도 제외 — 워커가 할 일이 없는 상태(pack-merge 표시 "↩ 복권됨"뿐)를
+        # actionable 로 계상하면 스윕 0회(버전 무변경+init-pack 무실행) 14일 후 C62 PASS ∧
+        # C68 WARN 비대칭 + fingerprint(일 단위 oldest) 일일 갱신 = wakeup 큐 일일 재배달
+        # 소음원이 된다(픽스처 실측). 복권 완료 = 스윕 대기 정상 체류.
         def _exempt(v):
-            return v.get("kind") in ("kept-drift", "merged") or v.get("state") == "at-rest"
+            return (v.get("kind") in ("kept-drift", "merged", "adopted")
+                    or v.get("state") == "at-rest")
 
         stale = sorted(
             (rel, (now - float(v.get("ts", now))) / 86400.0)
