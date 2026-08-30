@@ -61,6 +61,43 @@ can corrupt it. Three structural seals enforce this — you normally do nothing:
 Release binaries are unaffected: the sandbox env only exists under cargo, so a
 shipped `cys` still resolves `~/.cys/pack` normally.
 
+## E2E isolation — HOME sandbox (W0-E2E)
+
+The W0 seals cover `cargo test`/`cargo run` only. A **built binary** run by an
+E2E is a production entry point, and one write surface ignores the pack env
+isolation entirely: `cys init-pack` registers the awakening hooks into every
+personal profile `$HOME/.claude*/settings.json` discovered via
+`dirs::home_dir()` (`run_init_pack` → `discover_claude_settings` →
+`pack::personal_profile_settings_paths`), even when `CYS_PACK_DIR`,
+`CYS_CONFIG_DIR` and `CYS_PACK_CAPTURES_DIR` all point into a scratch dir —
+those vars isolate the pack/config/captures paths, not the hook-registration
+target. The daemon-side merge (`merge_awakening_hooks_into_personal_profiles`)
+skips non-default pack dirs; the CLI target-discovery loop has no such gate yet.
+
+Measured incident (2026-08-31): verification-round E2Es that isolated all three
+vars but not `HOME` accumulated 3 pairs of dead SessionStart/UserPromptSubmit
+hooks (session-scratchpad and `/var/folders/…` pack paths) in each of the
+user's four live `~/.claude*/settings.json`, so every live session start and
+prompt attempted to run missing scripts until the entries were pruned
+(`cys hooks-prune --pack-dir <scratch>/pack --allow-base`).
+
+Therefore, for any E2E that executes a built `cys` (`init-pack`,
+pack-update/downgrade, boot):
+
+- **Sandbox `HOME` too** — `HOME=$(mktemp -d)` in the E2E env, in addition to
+  the pack vars above. This is mandatory, not optional hygiene.
+- Belt and suspenders when invoking `init-pack` directly: pass
+  `--no-install-hook` (suppresses hook registration at every tier) or an
+  explicit `--claude-settings <path-in-sandbox>`; `CYS_NO_PERSONAL_HOOK_MERGE=1`
+  additionally disarms the daemon-path personal-profile merge.
+- Post-run check: `grep -l '<scratch path>' ~/.claude*/settings.json` must
+  match nothing before the E2E counts as clean.
+
+Root fix is ticketed for 0.14.30 (`docs/RELEASE_NOTES_0.14.29.md`, limits
+section): port the daemon path's base-location gate to the CLI hook-target
+discovery so a scratch-pack `init-pack` never touches personal profiles even
+without a HOME sandbox.
+
 ## Licensing
 
 By contributing you agree your contributions are licensed under the MIT License.

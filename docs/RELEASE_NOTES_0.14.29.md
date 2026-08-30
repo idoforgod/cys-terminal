@@ -110,6 +110,13 @@ GUI 리팩터(봉인 조립점)로 낡아진 건강성 검체 앵커 2건을 실
   불가침입니다. **현 라이브 팩의 드리프트 5건이 전부 이 영역**이므로, "수정 파일 자동 병합"의
   실사용 체감은 System 확장이 발생한 설치본부터 나타납니다.
 - **캡처 GC 는 아직 없습니다**(0.14.30) — 병합 캡처는 쌓이기만 합니다(팩 밖 디렉터리).
+- **`cys init-pack` 의 훅 등록 대상은 팩 env 격리 밖입니다**(0.14.30) — `CYS_PACK_DIR`/
+  `CYS_CONFIG_DIR`/`CYS_PACK_CAPTURES_DIR` 를 스크래치로 격리해도 각성 훅은 `dirs::home_dir()` 로
+  찾은 실 `~/.claude*/settings.json` 에 등록됩니다(데몬 경로 병합의 비기본 팩 스킵 게이트가 CLI
+  대상 탐색엔 없음). 그때까지 빌드 바이너리 E2E 는 **HOME 샌드박스가 필수**입니다(CONTRIBUTING
+  'E2E isolation — HOME sandbox (W0-E2E)' · 2026-08-31 실측: 미샌드박스 검증 라운드가 실사용
+  프로필 4본에 죽은 스크래치 훅 3쌍씩을 누적 → `cys hooks-prune` 으로 정리). CLI 경로에 동일
+  게이트 이식이 0.14.30 후보입니다.
 - **phoenix 디스크 폴백** — 부활 도구의 디스크 폴백 경로는 해당 bin 파일이 kept-drift 상태면
   비활성입니다(임베드 1차 경로는 무영향 · fail-closed 통지).
 - **구 바이너리와 팩 하한(min_binary)** — 이 판의 팩은 두 레인(`PACK_MIN_BINARY`·
