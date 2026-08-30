@@ -3282,7 +3282,35 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
                     if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
-                        let _ = write_atomic(&user_path, d.as_bytes());
+                        match write_atomic(&user_path, d.as_bytes()) {
+                            Ok(()) => {}
+                            Err(e) if fallback_reason == "capture-failed" => {
+                                // ★성찰 차단 수리 2R-5(v2 §2 원칙 4 — 백업 불가면 덮지 않는다):
+                                // capture-failed 레인은 ①캡처가 없어 .user 가 유일 보존본인데 그
+                                // 쓰기 실패가 best-effort 로 침묵 통과되면 아래 공용 레인의 vendor
+                                // 기록이 사용자 바이트를 완전 소실시킨다(이중 실패 = 유일한 무캡처
+                                // 손실 경로). L1 바이트 백업과 동일하게 fail-closed: vendor 기록·
+                                // manifest 전진·pristine 전진 전부 스킵 + quarantined 전이(D11
+                                // 수렴 기전 재사용 — manifest 미전진이라 백업 가능 회복 후 재스윕
+                                // 시 동일 Merge3 판정 재도달 = 수렴 · 회복 전까지 파일 무접촉).
+                                eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 병합 캡처·.user 백업 이중 실패({e}). 파일 무접촉 보존 — 백업 가능 회복 후 재스윕 시 정상 병합 대상.");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "quarantined", "reason": "user-backup-failed", "side": rel,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                                kept += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                // 캡처 실재 레인(충돌·게이트·pristine 실패): 사용자 바이트는 ①캡처가
+                                // 이미 보존하므로 .user 는 이차 사본 — 종전 best-effort 유지하되
+                                // 침묵은 금지(v2 §2 원칙 5 · loud 경고 — 원장 side 는 기록되므로
+                                // doctor·사용자가 .user 부재를 관측·추적 가능).
+                                eprintln!("[init-pack] ⚠ {rel}: .user 백업 기록 실패({e}) — 사용자본은 병합 캡처에 보존(원장 capture 경로 참조)");
+                            }
+                        }
                     }
                     // 충돌 조상 사이드카 <rel>.base — base 전문 기록(사후 3-way 재료 영구 보존 ·
                     // 이식 ① C안 요소 · backup_set side_paths 등재로 rollback 원자성 편입).
@@ -5226,6 +5254,81 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_td);
         let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    /// ★성찰 차단 수리 2R-5 핀(v2 §2 원칙 4 — 손실 0 계약): capture-failed 레인의 .user 백업
+    /// 이중 실패(캡처 루트 파일 점유 + <rel>.user 자리 디렉터리 점유 — 양쪽 다 이 스위트의 기존
+    /// 픽스처 프리미티브)에서 vendor 기록·manifest·pristine 전진을 전부 중단하고 quarantined
+    /// 전이(D11 수렴 기전)함을 박제. 수리 전: .user 쓰기 실패가 `let _ =` 로 침묵 통과된 뒤
+    /// 공용 레인이 vendor 본을 무조건 기록 — 무캡처 상태의 사용자 바이트 완전 소실 경로.
+    /// 회복(점유 해제) 후 재스윕이 정상 Merge3 로 수렴함까지 함께 잰다.
+    #[test]
+    fn merge3_capture_failed_user_backup_double_failure_quarantines() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-2r5-dbl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, base.join("claude"));
+        let _cap_env = EnvGuard::remove("CYS_PACK_CAPTURES_DIR"); // 기본 유도(dir 형제)
+
+        let e_old = "head-old\ncommon body\n";
+        let e1 = "head-new\ncommon body\n";
+        let ours = "head-old\ncommon body\nuser-tail-delta\n";
+        let rel = "skills/wdbl/SKILL.md";
+        {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, ours).unwrap();
+            let pp = pd.join(PRISTINE_DIR).join(rel);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, e_old).unwrap();
+        }
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash(e_old) }).to_string(),
+        )
+        .unwrap();
+        // 이중 실패 주입: ①캡처 루트 자리 파일 점유(W-cap 프리미티브 — 캡처 불가) ②<rel>.user
+        // 자리 디렉터리 점유(rename 불가 — .user 백업 불가).
+        std::fs::write(base.join("pack-captures"), "OCCUPIED").unwrap();
+        std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(rel)).unwrap(),
+            ours,
+            "이중 실패 = 파일 무접촉(vendor 기록 스킵 — 사용자 바이트 소실 경로 봉인)"
+        );
+        let mani: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
+                .unwrap();
+        assert_eq!(mani.get(rel), Some(&content_hash(e_old)), "manifest 미전진(재스윕 수렴 조건)");
+        assert_eq!(
+            std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(),
+            e_old,
+            "pristine 미전진"
+        );
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).unwrap();
+        assert_eq!(e["kind"].as_str(), Some("quarantined"), "원장 quarantined 전이(D11 동형)");
+        assert_eq!(e["reason"].as_str(), Some("user-backup-failed"), "이중 실패 사유 토큰");
+
+        // 회복 후 재스윕 = 동일 Merge3 판정 재도달 → 정상 병합 수렴(침묵 실패 0 · 손실 0).
+        std::fs::remove_file(base.join("pack-captures")).unwrap();
+        std::fs::remove_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+        install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(rel)).unwrap(),
+            "head-new\ncommon body\nuser-tail-delta\n",
+            "회복 후 재스윕 = 정상 3-way 수렴(δ 생존)"
+        );
+        assert_eq!(
+            load_merge_pending(&pd).get(rel).and_then(|e| e["kind"].as_str()),
+            Some("merged"),
+            "원장 merged 정규화"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★T3 통합 핀 ②(v2 §3 연쇄 릴리스 · 출하 차단): E0⊕δ → E1 → E2 2연쇄에서 δ 생존 —
