@@ -15615,9 +15615,36 @@ fn adopt_one(
         match embed {
             Some(em) => {
                 if disk.as_deref() != Some(em) {
-                    return Err(
-                        "디스크본이 vendor 본도 소스본도 아님(치유 후 재수정·판독 불가 감지) — 수동 병합 후 재시도"
-                            .into(),
+                    // ★성찰 차단 수리 2R-2(안내 사슬 실효화): revert-merge 상태는 disk=캡처
+                    // 원본(vendor 본도 소스본도 아님)이라 이 가드가 구조적으로 항상 거부해 —
+                    // pack-merge 목록·pack-adopt 후보가 권하는 "pack-adopt <rel>(병합본 복권)"
+                    // 이 전부 막혔다(--all 필연 부분 실패 포함). 원장 capture 포인터와 disk 를
+                    // 대조해 disk==캡처본이면 병합본(.user) 복권을 허용한다(그 외 미지 상태는
+                    // 종전 fail-closed 거부 유지 — revert 후 재수정도 캡처 불일치로 거부).
+                    let revert_state = (|| -> Option<bool> {
+                        let pending = cys::pack::load_merge_pending(dir);
+                        let e = pending.get(rel)?;
+                        if e.get("kind").and_then(|v| v.as_str()) != Some("conflicted")
+                            || e.get("reason").and_then(|v| v.as_str()) != Some("revert-merge")
+                        {
+                            return None;
+                        }
+                        let capture = e.get("capture").and_then(|v| v.as_str())?;
+                        let cap = std::fs::read_to_string(
+                            cys::pack::pack_captures_dir(dir).join(capture),
+                        )
+                        .ok()?;
+                        Some(disk.as_deref() == Some(cap.as_str()))
+                    })()
+                    .unwrap_or(false);
+                    if !revert_state {
+                        return Err(
+                            "디스크본이 vendor 본도 소스본도 아님(치유 후 재수정·revert 후 재수정·판독 불가 감지) — 수동 병합 후 재시도"
+                                .into(),
+                        );
+                    }
+                    println!(
+                        "↩ {rel}: revert-merge 상태(디스크=캡처 원본 대조 일치) — 병합본({src_label}) 복권 진행"
                     );
                 }
             }
@@ -23715,6 +23742,73 @@ mod tests {
         assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 healed 전환");
         assert_triple_advanced(&td, &rel, &embed);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★성찰 차단 수리 2R-2 핀: revert-merge 상태(disk=캡처 원본)에서 pack-merge 목록이 권하는
+    /// `pack-adopt <rel>(병합본 복권)` 이 adopt ③ 타깃 가드(disk≠vendor∧disk≠소스)에 구조적으로
+    /// 항상 거부되던 안내 사슬 단절의 봉합 — 원장 capture 포인터 대조(disk==캡처본)로 복권을
+    /// 허용: 병합본 디스크 복귀 · .user.adopted-<ts> 개명 보존 · 원장 adopted(capture 승계) ·
+    /// 재스윕 생존. 음성 대조군: revert 후 재수정(disk≠캡처본)은 종전 fail-closed 거부
+    /// 유지(가드 완화 아님).
+    #[test]
+    fn pack_adopt_reinstates_merged_copy_in_revert_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, _embed, _captured, merged_disk, _env) = t4_revert_state_fixture("revadopt");
+        let rc = run_pack_adopt(Some(rel.clone()), false, None, false, true);
+        assert_eq!(rc, 0, "revert 상태 병합본 복권 성공(안내 사슬 실효화)");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            merged_disk,
+            "디스크 = 병합본 복귀"
+        );
+        assert!(!td.join(format!("{rel}.user")).exists(), ".user 소스는 소거가 아니라 개명");
+        let target = td.join(&rel);
+        let fname = target.file_name().unwrap().to_string_lossy().into_owned();
+        let adopted: Vec<std::path::PathBuf> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with(&format!("{fname}.user.adopted-"))
+            })
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(adopted.len(), 1, ".user.adopted-<ts> 개명 보존 1본");
+        assert_eq!(
+            std::fs::read_to_string(&adopted[0]).unwrap(),
+            merged_disk,
+            "개명 보존 내용 = 병합본"
+        );
+        let pend = cys::pack::load_merge_pending(&td);
+        let e = pend.get(&rel).and_then(|v| v.as_object()).expect("원장 잔존");
+        assert_eq!(e.get("kind").and_then(|v| v.as_str()), Some("adopted"), "원장 adopted 전환");
+        assert_eq!(
+            e.get("capture").and_then(|v| v.as_str()),
+            Some(format!("pack/100-42/{rel}").as_str()),
+            "capture 승계(증거 포인터 불소실)"
+        );
+        cys::pack::install(false, None).expect("재스윕");
+        assert_eq!(
+            std::fs::read_to_string(td.join(&rel)).unwrap(),
+            merged_disk,
+            "재스윕 생존(vendor 미전진 — kept-drift 정규화 예정 경로)"
+        );
+        let td1_base = td.parent().unwrap().to_path_buf();
+
+        // 음성 대조군 — revert 후 재수정: disk≠캡처본이면 종전 fail-closed 거부(전면 무변경).
+        let (td2, rel2, _embed2, _cap2, _merged2, _env2) = t4_revert_state_fixture("revadoptneg");
+        let remod = "REMODIFIED AFTER REVERT\n";
+        std::fs::write(td2.join(&rel2), remod).unwrap();
+        let rc2 = run_pack_adopt(Some(rel2.clone()), false, None, false, true);
+        assert_ne!(rc2, 0, "재수정(캡처 불일치) = 착수 거부 유지");
+        assert_eq!(std::fs::read_to_string(td2.join(&rel2)).unwrap(), remod, "거부 = 디스크 무변경");
+        assert!(td2.join(format!("{rel2}.user")).exists(), "거부 = .user 무접촉");
+        assert_eq!(
+            t4_ledger_kind(&td2, &rel2).as_deref(),
+            Some("conflicted"),
+            "거부 = 원장 무변경"
+        );
+        let _ = std::fs::remove_dir_all(&td1_base);
+        let _ = std::fs::remove_dir_all(td2.parent().unwrap());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
