@@ -15183,6 +15183,36 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
     }
 }
 
+/// ★T4-fix(R1-적대 #2): `{rel}.user` 세대 보존 — 백업 덮어쓰기 직전, 기존 보존본이 있고 내용이
+/// 이번에 쓸 내용과 다르면 `{rel}.user.prev-<ts>[-n]` 으로 원자 개명해 이전 세대를 지킨다.
+/// conflicted(reason:capture-failed) 원장의 .user 는 자동 병합 실패 때 살아남은 유일 원본 —
+/// 단일 슬롯(.user) 재사용이 이를 침묵 클로버하면 영구 소실이었다(캡처 없음). 동일 내용이면
+/// 무조치(멱등 재실행의 세대 증식 방지) · 개명 실패 = Err(호출측 fail-closed 거부 의무).
+fn preserve_prior_user_generation(
+    dir: &std::path::Path,
+    rel: &str,
+    incoming: Option<&[u8]>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let prior = dir.join(format!("{rel}.user"));
+    if !prior.exists() {
+        return Ok(None);
+    }
+    if let Some(inc) = incoming {
+        if std::fs::read(&prior).ok().as_deref() == Some(inc) {
+            return Ok(None);
+        }
+    }
+    let ts = unix_now();
+    let mut dest = dir.join(format!("{rel}.user.prev-{ts}"));
+    let mut n = 1u32;
+    while dest.exists() {
+        n += 1;
+        dest = dir.join(format!("{rel}.user.prev-{ts}-{n}"));
+    }
+    std::fs::rename(&prior, &dest).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
+    Ok(Some(dest))
+}
+
 /// ★T4(v2 §5): 명시 치유 동사 — 드리프트 system 파일을 embed 본으로 복원(백업 선행 · 3중 전진 ·
 /// 원장 healed 전환). kept-drift 해소의 --take-new 와 동일 코드 경로다.
 /// ★소유권 게이트(시드 무언급 신규 안전 게이트 — deviations 보고): PACK_ALL 미등재·비system rel
@@ -15190,6 +15220,8 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
 /// ★백업 실패 = 무조건 fail-closed 거부 — L0(system_locked)의 '백업 실패 시 강행' 예외는 무인
 /// 스윕 전용이며 명시 동사에 미적용. 원장 kind=merged 는 --yes 비허용(병합본 self-소거 오조작
 /// 방지 — 대화형 확인 또는 pack-merge --revert-merge). --yes 여도 원장 kind 표시 줄은 남긴다.
+/// ★기존 .user 세대 보존(R1-적대 #2): 백업이 이전 보존본과 다른 내용을 덮으려면 .user.prev-<ts>
+/// 개명 선행 — conflicted(무캡처)의 유일 원본 침묵 클로버 봉인.
 fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     // ① embed 조회 — 부재 = 거부.
@@ -15229,6 +15261,20 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     if !yes && !confirm_stdin(&heal_prompt_line(kind.as_deref(), ts, rel)) {
         println!("보류 — 무변경");
         return 0;
+    }
+    // ⑤-0 ★T4-fix(R1-적대 #2): 기존 {rel}.user 세대 보존 선행 — conflicted(reason:
+    // capture-failed) 의 .user 는 자동 병합 실패 때 살아남은 유일 원본이라, 아래 백업이 이를
+    // 침묵 클로버하면 영구 소실이었다. 이번 백업 내용(현 디스크 바이트)과 다르면
+    // .user.prev-<ts> 세대 개명 후 진행 · 개명 실패 = fail-closed 거부(무변경).
+    if target.exists() {
+        match preserve_prior_user_generation(&dir, rel, std::fs::read(&target).ok().as_deref()) {
+            Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e} — fail-closed 거부(무변경)");
+                return 1;
+            }
+        }
     }
     // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
     if let Some(d) = disk.as_deref() {
@@ -15271,8 +15317,9 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
 }
 
 /// ★T4(v2 §5): --revert-merge — 자동 병합 1명령 가역화(merged 원장 전용). 순서 고정:
-/// 캡처 부재=fail-closed 거부(무변경) → 확인 → 현 디스크 전문 {rel}.user 백업(병합 후 사용자
-/// 재수정 보호 — 원칙 4) → disk←캡처본 → manifest·pristine 불변 → 원장 conflicted 강등
+/// 캡처 부재=fail-closed 거부(무변경) → 확인 → 기존 .user 세대 보존(R1-적대 #2 동계열) →
+/// 현 디스크 전문 {rel}.user 백업(병합 후 사용자 재수정 보호 — 원칙 4) → disk←캡처본 →
+/// manifest·pristine 불변 → 원장 conflicted 강등
 /// (reason:"revert-merge" · capture 승계 자동) → 감사. 다음 스윕은 vendor 미전진이면 KeepDrift
 /// (kind 불변·at-rest), 다음 릴리스에 L3 재병합 기회.
 fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool) -> i32 {
@@ -15310,6 +15357,15 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool) -> i32 {
     // 현 디스크 전문 → {rel}.user 백업(병합 후 사용자 재수정 보호).
     let target = dir.join(rel);
     let merged_now = std::fs::read_to_string(&target).unwrap_or_default();
+    // ★T4-fix(R1-적대 #2 동계열): 이전 세대 .user(병합 이전 치유·충돌의 보존본) 침묵 클로버 방지.
+    match preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes())) {
+        Ok(Some(prev)) => println!("기존 보존본 세대 보존: {}", prev.display()),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{e} — fail-closed 거부(무변경)");
+            return 1;
+        }
+    }
     if let Err(e) = cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes()) {
         eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
         return 1;
@@ -15344,7 +15400,8 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool) -> i32 {
 /// vendor 미전진(KeepDrift·Keep)=착수 · 전진(Merge3·Write)=기본 착수 거부 + --merge-after
 /// 옵트인(복원+즉시 전량 재스윕=자동 병합 · 단건 전용). 소스 .user 는 {rel}.user.adopted-<ts>
 /// 개명 보존 · 원장 adopted(다음 스윕에 kept-drift 정규화 · conflicted 였으면 capture·base_side
-/// 승계 — .base 파일은 유지: 사후 3-way 재료).
+/// 승계 — .base 파일은 유지: 사후 3-way 재료). ★embed 부재(custom) rel 은 원장 무기록+잔존
+/// 정리(R1-적대 #3 — 스윕이 정규화 못 하는 영구 항목은 C68 wakeup 스팸의 원천).
 fn run_pack_adopt(
     rel: Option<String>,
     all: bool,
@@ -15460,8 +15517,14 @@ fn adopt_one(
                 }
             }
             None => {
-                if disk.is_some() {
-                    return Err("디스크본이 이미 존재하고 소스와 다름 — 수동 확인 후 재시도".into());
+                // ★T4-fix(R1-적대 #1): 가드는 '존재'로 판정 — read_to_string().ok() 는 '부재'와
+                // '판독 불가(비UTF-8) 실재'를 모두 None 으로 합쳐 비UTF-8 custom 파일이
+                // 무백업 클로버되던 구멍. 실재 파일은 내용 불문 fail-closed 거부(전면 무변경).
+                if target.exists() {
+                    return Err(
+                        "디스크본이 이미 존재하고 소스와 다름(또는 판독 불가) — 수동 확인 후 재시도"
+                            .into(),
+                    );
                 }
             }
         }
@@ -15516,17 +15579,26 @@ fn adopt_one(
         cys::pack::write_atomic(&target, source.as_bytes())
             .map_err(|e| format!("복원 쓰기 실패: {e}"))?;
     }
-    // ⑦ 원장 adopted 전환(conflicted 였으면 capture·base_side 승계 — .base 파일 유지) → save.
+    // ⑦ 원장 — pack rel 만 adopted 전환(conflicted 였으면 capture·base_side 승계 — .base 파일
+    //    유지) → save. ★T4-fix(R1-적대 #3): embed 부재(custom) rel 은 기록 생략+잔존 정리 —
+    //    install 스윕은 PACK_ALL 만 순회해 custom adopted 는 영원히 정규화되지 않고, C68 이
+    //    14일 후 actionable 로 계상해 fingerprint 일일 갱신 → wakeup 큐 일일 재배달의 영구
+    //    원천이 된다(소비자 0 — 관측은 ⑨ 감사 원장이 담당).
     let mut pending = cys::pack::load_merge_pending(dir);
     let now = unix_now();
-    let mut dirty = false;
-    if let serde_json::Value::Object(entry) = serde_json::json!({
-        "kind": "adopted", "side": rel, "from": src_label,
-        "version": env!("CARGO_PKG_VERSION"), "ts": now,
-    }) {
-        cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
+    if embed.is_some() {
+        let mut dirty = false;
+        if let serde_json::Value::Object(entry) = serde_json::json!({
+            "kind": "adopted", "side": rel, "from": src_label,
+            "version": env!("CARGO_PKG_VERSION"), "ts": now,
+        }) {
+            cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
+        }
+        cys::pack::save_merge_pending(dir, &pending);
+    } else if pending.remove(rel).is_some() {
+        // 구 바이너리가 남긴 custom adopted 잔존 정리(스팸 원천 소거).
+        cys::pack::save_merge_pending(dir, &pending);
     }
-    cys::pack::save_merge_pending(dir, &pending);
     // ⑧ .user 소스 개명 보존(--from 소스는 원위치 무접촉).
     if from.is_none() {
         let _ = std::fs::rename(&src_path, dir.join(format!("{rel}.user.adopted-{now}")));
@@ -15539,7 +15611,11 @@ fn adopt_one(
     ) {
         eprintln!("⚠ 감사 원장 기록 실패(복권은 완료): {e}");
     }
-    println!("✅ {rel} ← 복권(소스 {src_label} · 다음 스윕에 kept-drift 정규화)");
+    if embed.is_some() {
+        println!("✅ {rel} ← 복권(소스 {src_label} · 다음 스윕에 kept-drift 정규화)");
+    } else {
+        println!("✅ {rel} ← custom 복원(소스 {src_label} · 임베드 밖 — 원장 정규화 없음)");
+    }
     // ⑩ --merge-after: 전량 재스윕(재구현 0 · install 멱등) 후 rel 결과 kind 보고.
     if merge_after {
         match cys::pack::install(false, Some(cys::pack::PackWriteAuth::production())) {
@@ -23278,6 +23354,125 @@ mod tests {
         let e2 = pend2.get(&rel).and_then(|v| v.as_object()).unwrap();
         assert_eq!(e2.get("kind").and_then(|v| v.as_str()), Some("conflicted"), "LINEAGE kind 불변");
         assert_eq!(e2.get("state").and_then(|v| v.as_str()), Some("at-rest"), "at-rest 전이");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★T4-fix — R1-적대 차단 3건 회귀 핀
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// ★T4-fix(R1-적대 #1): --from 복권의 custom(embed 부재) 타깃 가드는 '존재'로 판정 —
+    /// 비UTF-8 실재 파일이 read_to_string().ok()=None 으로 '부재' 취급되어 무백업 클로버되던
+    /// 구멍의 회귀 핀(fail-closed · 전면 무변경).
+    #[test]
+    fn pack_adopt_from_refuses_unreadable_custom_target() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("adoptbin");
+        let rel = "zz-my-custom.dat";
+        assert!(cys::pack::PACK_ALL.iter().all(|(r, _)| *r != rel), "custom rel 전제");
+        let raw: &[u8] = b"\xff\xfeBINARY-ORIGINAL\x00";
+        std::fs::write(td.join(rel), raw).unwrap();
+        let src = td.parent().unwrap().join("src.txt");
+        std::fs::write(&src, "utf8 replacement\n").unwrap();
+
+        let rc = run_pack_adopt(
+            Some(rel.to_string()),
+            false,
+            Some(src.to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+        assert_ne!(rc, 0, "비UTF-8 실재 타깃 = 착수 거부");
+        assert_eq!(std::fs::read(td.join(rel)).unwrap(), raw, "원본 바이트 무변경(클로버 봉인)");
+        assert!(!td.join(format!("{rel}.user")).exists(), "백업 부산물 없음(전면 무변경)");
+        assert!(cys::pack::load_merge_pending(&td).get(rel).is_none(), "원장 무변경");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4-fix(R1-적대 #2): conflicted(reason:capture-failed — 무캡처)의 .user = 자동 병합 실패
+    /// 때 살아남은 유일 원본 W1. heal --yes 가 이를 현 디스크 W2 로 침묵 클로버해 영구 소실하던
+    /// 구멍 — .user.prev-<ts> 세대 개명 보존 후 진행의 회귀 핀.
+    #[test]
+    fn pack_heal_preserves_conflicted_user_generation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("healgen");
+        let w1 = "W1 ORIGINAL SURVIVOR (capture-failed)\n";
+        let w2 = "W2 RE-EDIT AFTER CONFLICT\n";
+        std::fs::write(td.join(&rel), w2).unwrap();
+        std::fs::write(td.join(format!("{rel}.user")), w1).unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        t4_write_ledger(
+            &td,
+            &rel,
+            serde_json::json!({
+                "kind": "conflicted", "reason": "capture-failed", "state": "at-rest",
+                "side": format!("{rel}.user"),
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_heal(&rel, true);
+        assert_eq!(rc, 0, "heal 성공");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "vendor 본 복원");
+        assert_eq!(
+            std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(),
+            w2,
+            "현 디스크 백업이 .user 슬롯"
+        );
+        let base_name = td.join(&rel).file_name().unwrap().to_string_lossy().into_owned();
+        let prevs: Vec<std::path::PathBuf> = std::fs::read_dir(td.join(&rel).parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|nm| nm.to_string_lossy().starts_with(&format!("{base_name}.user.prev-")))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(prevs.len(), 1, ".user.prev-<ts> 세대 보존 1건");
+        assert_eq!(std::fs::read_to_string(&prevs[0]).unwrap(), w1, "W1 원본 생존(영구 소실 봉인)");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 healed 전환");
+        assert_triple_advanced(&td, &rel, &embed);
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T4-fix(R1-적대 #3): embed 부재(custom) rel 의 --from 복권은 원장 기록을 남기지 않는다 —
+    /// install 스윕(PACK_ALL 순회)이 영원히 정규화하지 못해 C68 14일 후 일일 wakeup 스팸의 영구
+    /// 원천이 되던 구멍. 구 바이너리가 남긴 잔존 adopted 항목도 재복권 시 정리(회귀 핀).
+    #[test]
+    fn pack_adopt_custom_skips_ledger_and_clears_stale() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("adoptcust");
+        let rel = "zz-my-notes.md";
+        assert!(cys::pack::PACK_ALL.iter().all(|(r, _)| *r != rel), "custom rel 전제");
+        let content = "CUSTOM NOTES v1\n";
+        let src = td.parent().unwrap().join("notes-src.md");
+        std::fs::write(&src, content).unwrap();
+        // 구 바이너리 잔존 시나리오: custom rel 의 adopted 항목이 이미 원장에 남아 있다.
+        t4_write_ledger(
+            &td,
+            rel,
+            serde_json::json!({
+                "kind": "adopted", "side": rel, "from": "old-run",
+                "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+            }),
+        );
+
+        let rc = run_pack_adopt(
+            Some(rel.to_string()),
+            false,
+            Some(src.to_string_lossy().into_owned()),
+            false,
+            true,
+        );
+        assert_eq!(rc, 0, "custom 복원 성공");
+        assert_eq!(std::fs::read_to_string(td.join(rel)).unwrap(), content, "명시 소스 복원");
+        assert!(
+            cys::pack::load_merge_pending(&td).get(rel).is_none(),
+            "custom rel 원장 무기록 + 잔존 정리(C68 스팸 원천 봉인)"
+        );
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 }
