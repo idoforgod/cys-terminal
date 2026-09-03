@@ -4514,6 +4514,26 @@ pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine
     }
 }
 
+/// 미제출 입력 바이트 계수의 순수 전이함수 — `input_line_state` 의 1차 축을 만드는 자리.
+///
+/// 데몬이 소유한 PTY 로 나가는 모든 바이트는 핸들러(`surface.send_text`·`surface.send_key`)와
+/// 큐 배달(`WriteReq::Inject`)을 지난다. 그래서 '아직 제출되지 않은 입력이 얼마나 쌓였나' 는
+/// 화면을 보지 않고도 셀 수 있다. 고스트 텍스트(prompt suggestions)는 이 경로를 **지나지 않아**
+/// 원리상 계수되지 않는다 — 그것이 이 축을 1차로 두는 이유다.
+///
+/// 전이 규칙: 쓰인 바이트에 **제출·취소 제어문자**(CR `\r` · LF `\n` · Ctrl-U `0x15` ·
+/// Ctrl-C `0x03`)가 있으면 계수는 **마지막 그 문자 이후의 바이트 수**로 재시작한다(그 앞은
+/// 제출됐거나 지워졌다). 없으면 누적한다.
+pub(crate) fn pending_input_after(prev: u64, written: &[u8]) -> u64 {
+    match written
+        .iter()
+        .rposition(|b| matches!(b, b'\r' | b'\n' | 0x15 | 0x03))
+    {
+        Some(i) => (written.len() - i - 1) as u64,
+        None => prev.saturating_add(written.len() as u64),
+    }
+}
+
 /// 프롬프트 경계 판정 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptBoundary {
@@ -4543,6 +4563,62 @@ pub(crate) fn prompt_boundary_verdict(
     } else {
         PromptBoundary::NotReady
     }
+}
+
+/// 어댑터 `ready_marker` 해소 — 디스크 agents.json 우선, 없으면 임베드 vendor 정의
+/// (`merged_approval_patterns` 와 같은 우선순위 규약). 빈 문자열은 **미정의와 동일**하게
+/// 다룬다(readiness::marker_of 규약 — 빈 마커는 모든 화면에 매치돼 판정을 무의미하게 만든다).
+fn merged_ready_marker(
+    disk: &serde_json::Value,
+    embed: &serde_json::Value,
+    agent: &str,
+) -> Option<String> {
+    for v in [disk, embed] {
+        if let Some(m) = v
+            .get(agent)
+            .and_then(|a| a.get("ready_marker"))
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            return Some(m.to_string());
+        }
+    }
+    None
+}
+
+/// 프롬프트 경계 판정의 **화면 재료**를 vt100 그리드에서 뽑는다(판정은 하지 않는다).
+///
+/// 반환 `(marker_seen, line)`:
+/// * `marker_seen` — 화면 전량에 어댑터 마커가 보이는가.
+/// * `line` — 커서 행이 마커를 담고 있으면 `(커서 앞, 커서 이후)` 문자열 쌍. 커서 행에 마커가
+///   없으면(프롬프트가 포커스를 잃었거나 다른 화면) `None` — 호출부는 이것을 `Unknown` 으로
+///   받아 배달하지 않는다(fail-closed).
+///
+/// 파서 락은 순간만 보유하고 소유 문자열로 복사해 나온다(check_approvals 의 스냅샷 관례와 동일).
+fn observe_prompt(
+    s: &Arc<crate::state::Surface>,
+    marker: &str,
+) -> (bool, Option<(String, String)>) {
+    let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+    let screen = p.screen();
+    let (rows, cols) = screen.size();
+    let (cr, cc) = screen.cursor_position();
+    let marker_seen = screen.contents().contains(marker);
+    if cr >= rows {
+        return (marker_seen, None);
+    }
+    let before_all = screen.contents_between(cr, 0, cr, cc);
+    let row_all = screen.contents_between(cr, 0, cr, cols);
+    let line = before_all.rfind(marker).map(|i| {
+        let before_cursor = before_all[i + marker.len()..].to_string();
+        // 커서 이후 구간은 관측·로그용이다(판정에 쓰지 않는다 — 고스트가 여기 산다).
+        let after = row_all
+            .strip_prefix(before_all.as_str())
+            .unwrap_or("")
+            .to_string();
+        (before_cursor, after)
+    });
+    (marker_seen, line)
 }
 
 /// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
@@ -4746,6 +4822,8 @@ pub(crate) fn deliver_head_locked(
     };
     // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
     *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+    // ★B1(0.14.30): Inject 는 본문+CR 을 원자로 보내 줄을 제출한다 → 미제출 계수 0.
+    s.pending_input_bytes.store(0, Ordering::Relaxed);
     // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
     // 배열인 이유 — javis_wakeup 의 digest 모드(층1 I6)가 같은 target 의 N건을 1회
     // Inject 로 병합하므로, 병합된 **전** W-id 가 ack 돼야 critical-tier 가 disarm 된다.
@@ -4975,6 +5053,10 @@ fn deliver_queued(
     let quiet = queue_quiet_secs();
     let max_wait = queue_max_wait_secs();
     let overdue_quiet = queue_overdue_quiet_secs();
+    // ★B1(0.14.30): 어댑터 정의는 **틱당 1회**만 읽는다(좌석마다 읽으면 같은 틱 안에서 판정이
+    //   갈린다 — check_approvals 의 env 1회 로드 규약과 동형). 큐가 전부 비면 아래 루프가
+    //   먼저 continue 하므로 평시 비용은 0 이다(지연 로드).
+    let mut adapters: Option<(serde_json::Value, serde_json::Value)> = None;
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     for s in surfaces {
@@ -5012,17 +5094,72 @@ fn deliver_queued(
         // 아직 바쁨(출력 중) — steer는 즉시 전송이 담당, 큐는 기다린다.
         // ★G1(W2-D): busy 판정만 단계형 순수 판정자로 치환 — 기본 노브(max_wait=0)에서는
         // 현행 quiet 3s 규칙과 바이트 동일하게 동작한다(무회귀 절대 불변).
+        // ★B1(0.14.30): 준비 판정 — 어댑터 마커를 아는 좌석은 **프롬프트 경계**로, 모르는
+        //   좌석(맨 셸·마커 미선언 어댑터)은 종전 **출력 quiet** 규칙으로 판정한다(무회귀).
+        //   기아(#1)의 본체가 여기다: quiet 규칙은 연속 도구 실행 노드에서 영구히 성립하지
+        //   않는다(dept-1 실측 idle 0s 953s 지속). 프롬프트 박스가 열려 있으면 출력 중이라도
+        //   주입은 안전하다 — 벤더 문서상 처리 중 제출은 중단이 아니라 큐잉이고 다음 도구
+        //   경계에서 모델에 전달된다(prompt_boundary_verdict doc 의 인용 참조).
+        let marker = s.agent_meta.lock().unwrap().clone().and_then(|(agent, _)| {
+            let (disk, embed) = adapters.get_or_insert_with(|| {
+                let disk = std::fs::read_to_string(cys::pack::pack_dir().join("agents.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let embed = cys::pack::PACK_ALL
+                    .iter()
+                    .find(|(r, _)| *r == "agents.json")
+                    .and_then(|(_, c)| serde_json::from_str(c).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                (disk, embed)
+            });
+            merged_ready_marker(disk, embed, &agent)
+        });
         let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
-        let overdue = match queue_quiet_verdict(head_wait, quiet_for, quiet, max_wait, overdue_quiet)
-        {
-            QuietVerdict::WaitBusy => {
-                alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
+        let overdue = if let Some(marker) = marker.as_deref() {
+            let (marker_seen, line) = observe_prompt(&s, marker);
+            let pending = s.pending_input_bytes.load(Ordering::Relaxed);
+            let input = input_line_state(
+                pending,
+                line.as_ref().map(|(b, a)| PromptLine {
+                    before_cursor: b,
+                    at_or_after_cursor: a,
+                }),
+            );
+            let approval_pending = !pending_gate_items(daemon, s.id).is_empty();
+            let verdict = prompt_boundary_verdict(
+                marker_seen,
+                input,
+                s.alt_screen.load(Ordering::Relaxed),
+                approval_pending,
+            );
+            if verdict == PromptBoundary::NotReady {
+                // 사유를 갈라 기록한다 — 손잡이가 다르다(입력줄 점유는 사람이 비워야 풀리고,
+                // 경계 미도달은 화면이 바뀌면 저절로 풀린다).
+                let why = match input {
+                    InputLine::Occupied => "input_pending(입력줄에 미제출 입력)",
+                    InputLine::Unknown => "prompt_unknown(프롬프트 경계 관측 불능)",
+                    InputLine::Empty => "prompt_not_ready(프롬프트 경계 미도달)",
+                };
+                alert_queue_depth_if_high(daemon, &s, depth_alerted, why);
                 alert_queue_starved_if_stalled(
-                    daemon, &s, starve_alerted, "busy(출력 중)", &head, head_wait, depth,
+                    daemon, &s, starve_alerted, why, &head, head_wait, depth,
                 );
                 continue;
             }
-            QuietVerdict::Deliver { overdue } => overdue,
+            // 프롬프트 경계 배달은 quiet 대기를 거치지 않는다 — overdue(제한 배달) 표식도 아니다.
+            false
+        } else {
+            match queue_quiet_verdict(head_wait, quiet_for, quiet, max_wait, overdue_quiet) {
+                QuietVerdict::WaitBusy => {
+                    alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
+                    alert_queue_starved_if_stalled(
+                        daemon, &s, starve_alerted, "busy(출력 중)", &head, head_wait, depth,
+                    );
+                    continue;
+                }
+                QuietVerdict::Deliver { overdue } => overdue,
+            }
         };
         // 사람 입력 흔적이 식기 전 배달 금지 — 미완성 입력에 이어붙기/제출 차단(R1 MED-2).
         // ★G1(W2-D): 이 게이트는 단계형 완화(overdue)의 면제 대상이 **절대 아니다** —
@@ -7770,6 +7907,206 @@ mod tests {
             prompt_boundary_verdict(true, input, false, false),
             PromptBoundary::Ready,
             "quiet 를 조건에 넣으면 연속 도구 실행 노드가 자기 큐를 영구히 굶는다"
+        );
+    }
+
+    // ─────────── ★B1(0.14.30): 프롬프트 경계 배달 — 배선 게이트 핀(b1_gate_*) ───────────
+    //
+    // 아래 6핀은 `deliver_queued` 를 **실제로 돌려** 판정이 배달/보류로 이어지는지 본다.
+    // 마커를 아는 좌석(agent_meta=claude)만 새 경로를 타고, 모르는 좌석은 종전 quiet 규칙을
+    // 그대로 탄다(기존 핀 `deliver_queued_default_knobs_keep_current_quiet_rule` 가 그 축).
+
+    /// 테스트용 pane 화면 조립 — vt100 파서에 직접 바이트를 먹인다(PTY 프로그램 무관).
+    /// `ghost` 는 커서를 되돌린 뒤 남는 텍스트 = Claude Code prompt suggestions 의 렌더 형태.
+    fn paint_prompt(s: &Arc<crate::state::Surface>, typed: &str, ghost: &str) {
+        let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+        p.process(format!("\r\x1b[2K❯ {typed}").as_bytes());
+        if !ghost.is_empty() {
+            // ★열 계산을 손으로 하지 않는다: 고스트를 쓰기 **전** 커서를 파서에게 물어 그 자리로
+            //   절대 복귀시킨다. 폭 계산(한글·이모지 = 2열)을 테스트가 재구현하면 그 산술이
+            //   틀리는 순간 오라클이 조용히 뒤집힌다(실측: chars().count() 만큼 되돌리면 한글
+            //   고스트의 절반이 커서 앞에 남아 '사람 입력' 으로 오판됐다).
+            let (row, col) = p.screen().cursor_position();
+            p.process(ghost.as_bytes());
+            p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+    }
+
+    /// 마커 좌석 1개 + 큐 1건을 세운다. `CYS_PACK_DIR` 을 빈 임시 디렉토리로 돌려
+    /// agents.json 디스크본을 배제하고 **임베드 vendor 정의**(claude ready_marker=❯)로 고정한다
+    /// (실사용 팩 상태에 테스트가 의존하지 않게 — W0 봉인 규약).
+    fn marker_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".to_string(), "worker".to_string()));
+        let e = daemon.next_queue_entry("[보고] 프롬프트 경계 배달 핀".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        (daemon, s)
+    }
+
+    fn empty_pack_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cys-b1-pack-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&d).expect("temp pack dir");
+        d
+    }
+
+    /// ★기아 본체 핀: **출력이 방금 있었어도**(quiet 0초) 프롬프트 박스가 열려 있으면 배달한다.
+    /// 종전 quiet 3s 규칙에서는 이 상황이 영구 보류였다(dept-1 실측 953s·p90 4,056s).
+    #[test]
+    fn b1_gate_delivers_at_prompt_boundary_while_output_streams() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("stream");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MAX_WAIT_SECS", "0"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-stream");
+        paint_prompt(&s, "", "");
+        // 지금 막 출력이 있었다(스피너 재그리기와 같은 상태) → 종전 규칙이면 보류.
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)"
+        );
+    }
+
+    /// 입력줄에 사람이 친 미제출 텍스트가 있으면 배달 0 + 사유가 남는다(이어붙이기·오제출 차단).
+    #[test]
+    fn b1_gate_input_pending_blocks_delivery_with_reason() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("pending");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_DEPTH_ALERT", "1"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-pending");
+        paint_prompt(&s, "버그 수정 착수한다", "");
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "미제출 입력이 있는 줄에는 주입하지 않는다(§9 실사고)"
+        );
+        let alert = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.depth_high")
+            .expect("적체 사유가 침묵하면 안 된다");
+        assert!(
+            alert["payload"]["blocked_by"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("input_pending"),
+            "사유가 입력줄 점유로 기록돼야 손잡이가 맞는다: {alert}"
+        );
+    }
+
+    /// 고스트 텍스트(커서 뒤 제안문)는 배달을 막지 않는다 — 2h10m 영구 보류 사고의 회귀 핀.
+    #[test]
+    fn b1_gate_ghost_text_never_blocks_delivery() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("ghost");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-ghost");
+        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "커서 뒤 제안문을 입력으로 오판하면 배달이 영구 보류된다(2026-09-03 13:27~15:37 실사고)"
+        );
+    }
+
+    /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
+    #[test]
+    fn b1_gate_pending_bytes_block_even_on_blank_prompt() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("bytes");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-bytes");
+        paint_prompt(&s, "", "");
+        s.pending_input_bytes.store(7, AtomicOrdering::Relaxed);
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+    }
+
+    /// 사람 입력 흔적(30s) 가드는 프롬프트 경계 배달에서도 **면제되지 않는다**(R1 MED-2 불변).
+    #[test]
+    fn b1_gate_human_typing_guard_is_never_exempt_at_prompt_boundary() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("human");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-human");
+        paint_prompt(&s, "", "");
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "프롬프트 경계라도 사람 흔적이 신선하면 배달 0 — 안전 게이트 면제 없음"
+        );
+    }
+
+    /// 커서 행에 마커가 없으면(프롬프트 비포커스·다른 화면) 관측 불능 → 배달하지 않는다.
+    #[test]
+    fn b1_gate_unknown_prompt_is_fail_closed() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("unknown");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-unknown");
+        {
+            // 마커는 화면 위쪽에 남아 있으나 커서는 다른 행에 있다(스크롤·전체화면 전환 형태).
+            let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+            p.process(b"\xe2\x9d\xaf old prompt\r\n\r\n>>> other screen");
+        }
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "판정 불능은 배달 방향으로 열리지 않는다(fail-closed)"
         );
     }
 

@@ -3061,6 +3061,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
+            // ★B1(0.14.30): 미제출 입력 계수 — 큐 배달의 '입력줄 점유' 1차 축(화면 무의존).
+            //   clear_first 주입은 Ctrl-U 선정리 + 본문 + CR 을 원자로 보내 **줄을 비우고 제출**
+            //   하므로 계수는 0 이다. 그 외 본문(사람 키·프로그램 미제출 본문)은 누적한다 —
+            //   제출 CR 이 별도 send_key 로 오기 전까지 그 줄은 점유 상태다.
+            {
+                let next = if clear_first {
+                    0
+                } else {
+                    crate::governance::pending_input_after(
+                        surface.pending_input_bytes.load(Ordering::Relaxed),
+                        text.as_bytes(),
+                    )
+                };
+                surface.pending_input_bytes.store(next, Ordering::Relaxed);
+            }
             if !human_verified {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
@@ -3212,6 +3227,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //     enqueue 시각이 되어 writer 적체 구간에서 간격이 0 으로 붕괴한다. 기준은
             //     writer 가 **실제로 본문을 쓴 시각**이어야 하고, 그 판단은 writer 몫이다.
             //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
+            let key_bytes = bytes.clone();
             let write_req = match submit_gap_for_key(&key, cr_min_gap_ms()) {
                 Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
@@ -3219,6 +3235,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
+            // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
+            //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
+            //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
+            surface.pending_input_bytes.store(
+                crate::governance::pending_input_after(
+                    surface.pending_input_bytes.load(Ordering::Relaxed),
+                    &key_bytes,
+                ),
+                Ordering::Relaxed,
+            );
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "key": key, "sent": true}),

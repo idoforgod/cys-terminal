@@ -415,6 +415,11 @@ pub struct Surface {
     pub agent_exit_notified: AtomicBool,
     /// T3-13 타이핑 가드: 사람(UI) 입력의 마지막 시각 — 원격 주입 충돌 보호
     pub last_human_input: Mutex<Option<Instant>>,
+    /// ★B1(0.14.30): 이 pane 에 쓰였으나 **제출(CR)·선정리(Ctrl-U/Ctrl-C)를 아직 보지 못한**
+    /// 입력 바이트 수. 큐 배달의 '입력줄 점유' 1차 축이다(화면 무의존 결정론 신호 —
+    /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
+    /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
+    pub pending_input_bytes: AtomicU64,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
@@ -2959,6 +2964,7 @@ impl Daemon {
             crash_notified: AtomicBool::new(false),
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
+            pending_input_bytes: AtomicU64::new(0),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
             last_injected: Mutex::new(None),
