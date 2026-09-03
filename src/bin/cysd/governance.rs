@@ -3632,6 +3632,13 @@ pub(crate) struct ProcObs {
     /// 관측 시점의 나이(초). 종단점 스코프의 **오탐 완충**에만 쓴다 — `psql --port 5432` 같은
     /// 클라이언트 도구가 잠깐 겹쳐 뜬 것을 "서버 2개 점유"로 오판하지 않게 한다.
     pub age_secs: f64,
+    /// ★B3(#20 · 0.14.30): `cmdline` 이 **실제 argv** 인가(`CmdSource::Argv`), 아니면 `name()`
+    /// 한 토큰으로 접힌 폴백인가. 폴백이면 서로 다른 스크립트가 같은 문자열(`python3`)로
+    /// 보이므로 **동일 명령 판정의 근거가 될 수 없다** — 그 오판이 백로그 #20 이다
+    /// (팩 스크립트·MCP 서버 여럿이 한 좌석에서 "중복 서버 3개: python3" 로 발화).
+    /// 이 구분은 `CmdSource` doc 의 원칙("폴백에 플래그가 없는 것은 부재가 아니라 미관측")을
+    /// 중복 판정에도 적용한 것이다.
+    pub cmd_observed: bool,
 }
 
 /// 중복으로 판정된 한 그룹.
@@ -3731,6 +3738,12 @@ pub(crate) fn plan_duplicate_alerts(
         let (scope, key) = match endpoint_key(&o.cmdline) {
             Some(ep) => ("endpoint", ep),
             // surface 스코프 키: `<sid>#<cmdline>` — sid 는 숫자이므로 `#` 하나로 모호성이 없다.
+            // ★불변식 ⑦(B3 #20): argv 를 **실제로 관측한** 항목만 이 스코프에 넣는다. 이름
+            //   폴백(`python3` 한 토큰)은 "같은 명령"이 아니라 "명령을 못 읽었다" 이므로,
+            //   그것으로 묶으면 서로 다른 팩 스크립트·MCP 서버가 한 그룹이 돼 정상 편성이
+            //   중복으로 발화한다(#20 실사고). 종단점 스코프는 cmdline 에 포트·소켓이 있어야
+            //   성립하므로 폴백 문자열에서는 애초에 키가 만들어지지 않는다(영향 없음).
+            None if !o.cmd_observed => continue,
             None => ("surface", format!("{}#{}", o.surface_id, o.cmdline)), // 불변식 ②
         };
         groups.entry((scope, key)).or_default().push(o);
@@ -3837,7 +3850,9 @@ fn check_surfaces(
         // 이름 → 전체 argv 로 바꾸면 그룹 경계가 재정의되어 **자동 kill 의 폭발 반경이 이동**하고
         // 그것은 이 단위(관측 정확도)가 아니라 별도 단위의 판정이다. 안전측 기본값으로
         // 종전 관측(이름)을 유지한다 — 완화가 아니라 **무변경**이다.
-        let descendants = collect_descendants(sys, *root_pid);
+        // ★B3(#20): 중복 판정에 쓰는 관측은 **argv 승격판**이어야 한다 — 이름 폴백은
+        //   서로 다른 파이썬 스크립트를 한 문자열로 접어 정상 편성을 중복으로 만든다.
+        let descendants = collect_descendants_with_cmd_src(sys, *root_pid);
         if descendants.len() > daemon.config.proc_count_threshold {
             // 디바운스 — 임계 초과 상태가 지속돼도 5초마다 영구 발행하지 않는다
             let now = now_epoch();
@@ -3856,7 +3871,7 @@ fn check_surfaces(
             }
         }
         let obs_now = now_epoch();
-        for (pid, cmdline) in descendants {
+        for (pid, cmdline, src) in descendants {
             if cmdline.is_empty() {
                 continue;
             }
@@ -3876,6 +3891,7 @@ fn check_surfaces(
                 node_owned: is_node_owned(&cmdline, &agent_bins),
                 cmdline,
                 age_secs,
+                cmd_observed: src == CmdSource::Argv,
             });
         }
     }
@@ -6723,6 +6739,7 @@ mod tests {
                     node_owned: is_node_owned(&cmdline, &agent_bins),
                     cmdline,
                     age_secs: 3600.0,
+                    cmd_observed: true,
                 });
             }
         }
@@ -6753,6 +6770,85 @@ mod tests {
         assert!(obs.iter().all(|o| o.node_owned), "노드 인프라 소유 판정 누락: {obs:#?}");
     }
 
+    // ─────────── ★B3(#20 · 0.14.30): 인터프리터 오탐 봉인 핀(b3_dup_*) ───────────
+
+    /// 이름 폴백(argv 미관측)은 **동일 명령의 근거가 아니다** — 서로 다른 팩 스크립트·MCP
+    /// 서버가 한 좌석에서 `python3` 한 토큰으로 접혀 "중복 서버 3개"로 발화하던 오탐(#20)의
+    /// 회귀 핀. 관측 실패를 부정 판정의 근거로 쓰지 않는다(CmdSource doc 의 원칙).
+    #[test]
+    fn b3_dup_name_fallback_never_counts_as_duplicate() {
+        let mk = |pid: u32| ProcObs {
+            pid,
+            ppid: 1,
+            surface_id: 7,
+            cmdline: "python3".into(), // name() 폴백 — 어느 스크립트인지 모른다
+            node_owned: false,
+            age_secs: 3600.0,
+            cmd_observed: false,
+        };
+        let obs = vec![mk(101), mk(102), mk(103), mk(104)];
+        assert!(
+            plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty(),
+            "argv 를 못 읽은 프로세스들을 같은 명령으로 묶으면 정상 편성이 중복으로 발화한다"
+        );
+    }
+
+    /// argv 를 실제로 읽었다면 **서로 다른 스크립트**는 다른 그룹이다(오탐 0).
+    #[test]
+    fn b3_dup_distinct_scripts_under_one_interpreter_are_not_duplicates() {
+        let mk = |pid: u32, script: &str| ProcObs {
+            pid,
+            ppid: 1,
+            surface_id: 7,
+            cmdline: format!("python3 /pack/bin/{script}"),
+            node_owned: false,
+            age_secs: 3600.0,
+            cmd_observed: true,
+        };
+        let obs = vec![
+            mk(201, "javis_report.py"),
+            mk(202, "javis_mission.py"),
+            mk(203, "notebooklm_mcp.py"),
+        ];
+        assert!(plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty());
+    }
+
+    /// 진짜 중복(같은 스크립트 3개)은 여전히 잡는다 — 수리가 탐지력을 죽이지 않았음의 증거.
+    #[test]
+    fn b3_dup_same_observed_command_still_fires() {
+        let mk = |pid: u32| ProcObs {
+            pid,
+            ppid: 1,
+            surface_id: 7,
+            cmdline: "python3 /pack/bin/javis_report.py --loop".into(),
+            node_owned: false,
+            age_secs: 3600.0,
+            cmd_observed: true,
+        };
+        let obs = vec![mk(301), mk(302), mk(303)];
+        let groups = plan_duplicate_alerts(&obs, 3, 2, 45.0);
+        assert_eq!(groups.len(), 1, "같은 명령 3개는 진짜 중복이다");
+        assert_eq!(groups[0].scope, "surface");
+        assert_eq!(groups[0].pids, vec![301, 302, 303]);
+    }
+
+    /// 종단점 스코프는 이 변경의 영향을 받지 않는다(포트·소켓이 있으면 argv 를 읽은 것이다).
+    #[test]
+    fn b3_dup_endpoint_scope_unaffected_by_observation_axis() {
+        let mk = |pid: u32, sid: u64| ProcObs {
+            pid,
+            ppid: 0,
+            surface_id: sid,
+            cmdline: "srv --port 9000".into(),
+            node_owned: false,
+            age_secs: 3600.0,
+            cmd_observed: true,
+        };
+        let groups = plan_duplicate_alerts(&[mk(1, 1), mk(2, 2)], 3, 2, 45.0);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].scope, "endpoint");
+    }
+
     /// 노드가 20개로 늘어도 경보는 0 — "편성 규모가 곧 경보"였던 구조적 결함의 회귀 가드.
     #[test]
     fn formation_scale_does_not_create_alerts() {
@@ -6768,6 +6864,7 @@ mod tests {
                     &agent_bins,
                 ),
                 age_secs: 3600.0,
+                cmd_observed: true,
             })
             .collect();
         assert!(plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty());
@@ -6783,6 +6880,7 @@ mod tests {
             cmdline: cmd.to_string(),
             node_owned: false,
             age_secs: 3600.0,
+            cmd_observed: true,
         };
         let obs = vec![
             mk(2001, 1, "bun /work/api/server.ts --port 3000"),
@@ -6809,6 +6907,7 @@ mod tests {
             cmdline: "bun /work/server.ts".into(),
             node_owned: false,
             age_secs: 3600.0,
+            cmd_observed: true,
         };
         let obs = vec![mk(3003), mk(3001), mk(3002)];
         let alerts = plan_duplicate_alerts(&obs, 3, 2, 45.0);
@@ -6829,6 +6928,7 @@ mod tests {
             cmdline: "python3 -m http.server".into(),
             node_owned: false,
             age_secs: 3600.0,
+            cmd_observed: true,
         };
         let obs = vec![mk(4001, 1), mk(4002, 2), mk(4003, 3), mk(4004, 4)];
         assert!(plan_duplicate_alerts(&obs, 3, 2, 45.0).is_empty());
@@ -6838,9 +6938,9 @@ mod tests {
     #[test]
     fn wrapper_parent_and_child_sharing_endpoint_collapse_to_one() {
         let obs = vec![
-            ProcObs { pid: 100, ppid: 1, surface_id: 1, age_secs: 3600.0,
+            ProcObs { pid: 100, ppid: 1, surface_id: 1, age_secs: 3600.0, cmd_observed: true,
                       cmdline: "sh -c bun server.ts --port 8080".into(), node_owned: false },
-            ProcObs { pid: 101, ppid: 100, surface_id: 1, age_secs: 3600.0,
+            ProcObs { pid: 101, ppid: 100, surface_id: 1, age_secs: 3600.0, cmd_observed: true,
                       cmdline: "bun server.ts --port 8080".into(), node_owned: false },
         ];
         assert!(
@@ -6862,6 +6962,7 @@ mod tests {
                 cmdline: "claude --resume".into(),
                 node_owned: is_node_owned("claude --resume", &agent_bins),
                 age_secs: 3600.0,
+                cmd_observed: true,
             })
             .collect();
         assert!(
@@ -6910,7 +7011,8 @@ mod tests {
             surface_id: sid,
             cmdline: cmd.to_string(),
             node_owned: false,
-            age_secs: 3.0, // 방금 뜸
+            age_secs: 3.0, // 방금 뜸,
+            cmd_observed: true,
         };
         // 종단점: 둘 다 어리면 발화하지 않는다
         let obs = vec![
@@ -6936,8 +7038,8 @@ mod tests {
     #[test]
     fn zero_threshold_disables_scope() {
         let obs = vec![
-            ProcObs { pid: 1, ppid: 0, surface_id: 1, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0 },
-            ProcObs { pid: 2, ppid: 0, surface_id: 2, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0 },
+            ProcObs { pid: 1, ppid: 0, surface_id: 1, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0, cmd_observed: true },
+            ProcObs { pid: 2, ppid: 0, surface_id: 2, cmdline: "srv --port 9000".into(), node_owned: false, age_secs: 3600.0, cmd_observed: true },
         ];
         assert_eq!(plan_duplicate_alerts(&obs, 3, 2, 45.0).len(), 1);
         assert!(plan_duplicate_alerts(&obs, 3, 0, 45.0).is_empty(), "endpoint 임계 0 = 비활성");
@@ -7015,6 +7117,7 @@ mod tests {
                                 cmdline,
                                 node_owned: false,
                                 age_secs: 0.0,
+                                cmd_observed: true,
                             })
                     })
                     .collect();
