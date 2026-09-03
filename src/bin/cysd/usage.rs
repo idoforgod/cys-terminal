@@ -192,9 +192,7 @@ fn collect_for(
     } else {
         let need_discovery = match tails.get(&s.id) {
             None => true,
-            Some(t) => {
-                !t.path.exists() || (t.heuristic && now - t.last_discovery > REDISCOVER_SECS)
-            }
+            Some(t) => needs_rediscovery(t.path.exists(), t.heuristic, now, t.last_discovery),
         };
         let existing = || {
             tails
@@ -636,6 +634,20 @@ pub(crate) fn mapping_is_fresh(heuristic: bool, now: f64, session_mtime: f64, ma
         return true;
     }
     now - session_mtime <= max_age
+}
+
+/// ★B6 재발견 필요 판정(순수) — 신선도 가드가 `last_discovery = 0.0` 으로 강제하는 그 판정.
+///
+/// 왜 함수로 뽑았는가(CEO 요구 2026-09-04): 가드는 stale 을 표기하고 재발견을 **강제한다고
+/// 주장**하지만, 그 강제가 실제로 발견 경로를 다시 태우는지는 인라인 조건식이던 동안 검체가
+/// 잡을 수 없었다. 그러면 "`:stale` 만 붙고 값은 영영 안 돌아오는" 회귀를 아무도 못 잡는다.
+/// 이제 판정이 여기 하나뿐이라 ⓐ 가드가 쓰는 필드와 ⓑ 발견 분기가 읽는 필드가 같음이 코드로
+/// 닫히고, 아래 검체가 `last_discovery = 0.0` → 재발견 true 를 직접 고정한다.
+///
+/// * 파일이 사라졌으면 매핑 종류와 무관하게 재발견한다(등록 매핑도 파일은 사라질 수 있다).
+/// * 등록 매핑(`heuristic=false`)은 나이로 재발견하지 않는다 — 소유자가 명시한 고정 매핑이다.
+fn needs_rediscovery(path_exists: bool, heuristic: bool, now: f64, last_discovery: f64) -> bool {
+    !path_exists || (heuristic && now - last_discovery > REDISCOVER_SECS)
 }
 
 fn source_label(base: &str, heuristic: bool) -> String {
@@ -1440,6 +1452,118 @@ mod tests {
             u.session_file, "/x/rollout-old.jsonl",
             "어느 파일이 낡았는지는 진단에 필요한 사실이라 보존한다"
         );
+    }
+
+    /// ★CEO 요구 증거(2026-09-04): stale 이 붙은 뒤 **재발견이 실제로 다시 돈다**.
+    ///
+    /// 가드는 `state.last_discovery = 0.0` 을 쓰는데, 그 쓰기가 발견 분기를 다시 태우지
+    /// 못하면 좌석은 `:stale` 만 단 채 값이 영영 돌아오지 않는다(무음 영구 침묵). 여기서
+    /// 가드가 쓰는 값 그대로를 판정자에 넣어 재발견 true 를 고정한다.
+    #[test]
+    fn b6_stale_reset_forces_rediscovery_next_tick() {
+        let now = 1_700_000_000.0;
+        // 가드가 남긴 상태: 파일은 아직 있고, 휴리스틱이며, last_discovery 는 0.0.
+        assert!(
+            needs_rediscovery(true, true, now, 0.0),
+            "가드의 last_discovery=0.0 이 재발견을 트리거하지 못한다 — stale 만 붙고 값이 안 돌아온다"
+        );
+        // 음성 대조 ①: 방금 발견한 휴리스틱 매핑은 재발견하지 않는다(매 틱 lsof 금지 —
+        // 자원 거버넌스). 이 false 가 있어야 위 true 가 '항상 참' 이 아님이 증명된다.
+        assert!(
+            !needs_rediscovery(true, true, now, now - 1.0),
+            "방금 발견한 매핑까지 매 틱 재발견하면 lsof 셸아웃이 폭주한다"
+        );
+        assert!(
+            !needs_rediscovery(true, true, now, now - REDISCOVER_SECS),
+            "경계값(정확히 임계)은 아직 재발견 아님"
+        );
+        assert!(
+            needs_rediscovery(true, true, now, now - REDISCOVER_SECS - 0.1),
+            "임계를 넘기면 재발견"
+        );
+        // 음성 대조 ②: 등록 매핑(heuristic=false)은 나이로 재발견하지 않는다 —
+        // 신선도 가드의 범위(휴리스틱 한정)와 같은 경계다.
+        assert!(
+            !needs_rediscovery(true, false, now, 0.0),
+            "등록 매핑을 나이로 갈아치우면 소유자 명시가 무의미해진다"
+        );
+        // 파일이 사라지면 매핑 종류와 무관하게 재발견한다.
+        assert!(needs_rediscovery(false, false, now, now));
+    }
+
+    /// ★CEO 요구 증거(2026-09-04): 재발견이 타는 순서가 **결정론 우선**이다 —
+    /// codex 는 lsof(열린 fd 직독)를 1순위로, 휴리스틱(날짜 디렉터리 최신 mtime)을
+    /// 폴백으로만 쓴다. 이 순서가 뒤집히면 stale 을 유발한 바로 그 휴리스틱이 재발견에서도
+    /// 1순위가 되어 같은 낡은 파일을 다시 집는다(가드가 무한 공회전).
+    #[test]
+    fn b6_rediscovery_prefers_deterministic_lsof_over_heuristic() {
+        let src = include_str!("usage.rs");
+        let body = src
+            .split("fn discover_session_file(")
+            .nth(1)
+            .expect("discover_session_file 소실");
+        let arm = body.find("\"codex\" =>").expect("codex 분기 소실");
+        // 바이트 슬라이스로 자르지 않는다(멀티바이트 경계에서 패닉) — 시작만 잘라 상대 위치로 잰다.
+        let tail = &body[arm..];
+        let lsof = tail
+            .find("discover_codex_rollout_lsof")
+            .expect("결정론(lsof) 해소기 배선 소실");
+        let heur = tail
+            .find("or_else(|| discover_codex_rollout(")
+            .expect("휴리스틱 폴백 배선 소실");
+        assert!(
+            lsof < heur,
+            "휴리스틱이 lsof 보다 먼저 불린다 — 재발견이 낡은 파일을 다시 집는다"
+        );
+        assert!(heur < 300, "두 배선이 codex 분기 밖에서 잡혔다(위치 {heur}) — 핀이 헐겁다");
+        // 결정론 해소기가 실제로 lsof 를 부르는지(이름만 그럴듯한 함수 아님).
+        let resolver = src
+            .split("fn discover_codex_rollout_lsof(")
+            .nth(1)
+            .expect("해소기 본문 소실");
+        let call = resolver
+            .find("Command::new(\"lsof\")")
+            .expect("해소기가 lsof 를 부르지 않는다 — '결정론 경로' 라는 이름만 남는다");
+        assert!(call < 300, "lsof 호출이 함수 본문 앞머리에 없다(위치 {call})");
+    }
+
+    /// ★CEO 요구 증거(2026-09-04 · 행위 검증): 결정론 해소기가 **실제로 열린 fd 를 읽어**
+    /// rollout 경로를 돌려준다. 위 두 검체가 배선을 잡는다면 이것은 그 배선의 끝이 실제로
+    /// 동작함을 잡는다 — 자기 프로세스가 연 파일을 자기 pid 로 되찾는다.
+    ///
+    /// macOS 한정인 이유: cargo test 레인이 macos-latest(.github/workflows/ci-branch.yml:29)
+    /// 이고 `lsof` 는 그 플랫폼의 기본 바이너리(/usr/sbin/lsof)라 환경 때문에 조용히
+    /// 무의미해지는 일이 없다. 다른 플랫폼에서는 위 배선 핀 둘이 계약을 지킨다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn b6_lsof_resolver_reads_open_rollout_fd() {
+        use std::io::Write;
+        let td = std::env::temp_dir().join(format!("cys-b6-lsof-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let target = sessions.join("rollout-2026-09-04T04-00-00-abc.jsonl");
+        let decoy = td.join("not-a-rollout.log");
+        // 열어둔 채로 유지해야 lsof 가 본다(닫으면 fd 목록에서 사라진다).
+        let mut f = std::fs::File::create(&target).unwrap();
+        f.write_all(b"{}\n").unwrap();
+        let mut d = std::fs::File::create(&decoy).unwrap();
+        d.write_all(b"x\n").unwrap();
+
+        // lsof 는 정규화된 경로를 낸다(macOS /var → /private/var 심링크) — 같은 기준으로 비교한다.
+        let want = std::fs::canonicalize(&target).unwrap();
+        let got = discover_codex_rollout_lsof(std::process::id());
+        assert_eq!(
+            got.as_deref(),
+            Some(want.as_path()),
+            "자기 pid 가 연 rollout fd 를 결정론으로 되찾지 못했다"
+        );
+        // 음성 대조: 패턴에 맞지 않는 열린 파일은 고르지 않는다(아무 fd 나 집는 것이 아님).
+        let decoy_canon = std::fs::canonicalize(&decoy).unwrap();
+        assert_ne!(got.as_deref(), Some(decoy_canon.as_path()));
+
+        drop(f);
+        drop(d);
+        let _ = std::fs::remove_dir_all(&td);
     }
     use super::*;
 
