@@ -123,6 +123,30 @@ pub struct QueueEntry {
 /// exited 예외**(exited_reclaim — 죽은 좌석 회수의 큐 인멸을 명시 행위로 감사)를 경유할
 /// 때만 Some((cleared_by_surface, via)) — {cleared_by, via} 두 키를 additive 로 얹는다.
 /// 자기 큐 clear·자력종료·close drain 등 기존 경로는 전부 None(payload 바이트 동일 유지).
+/// ★B3 #19 `surface.exited` payload — 자력 종료(셸 EOF) 통지의 스키마 단일 소유.
+///
+/// 왜 role·agent 를 싣는가: 종전 payload 는 `surface_ref` 하나뿐이라 **어느 역할 좌석이
+/// 죽었는지**를 이 이벤트만으로 알 수 없었다. 그 사실은 60초 grace 뒤 reap 이 내는
+/// `surface.reaped`(role 포함)에서야 처음 등장하고, `CYS_REAP_EXITED=0` 이면 영영 오지
+/// 않는다 — 감시자가 "master 좌석이 죽었다"를 1분 늦게 알거나 못 알게 된다.
+///
+/// 이 빌더는 **역할 반납을 하지 않는다**(관측 층). 반납은 reap → `close_surface` 가 하며
+/// 그 사이의 grace 는 크래시 포렌식·노드 복구 창으로 의도된 것이다(governance
+/// `exited_surface_due` 주석). 주소 해석은 별도로 이미 안전하다 — `system.resolve_role`
+/// 이 exited 보유자를 not_found 로 강등한다.
+///
+/// 계약: 기존 키 `surface_ref` 불변 · `role`/`agent` 는 additive 이며 **부재 시 null**
+/// (역할 없는 스크래치 pane 과 역할 좌석을 소비부가 구분할 수 있어야 한다). `agent` 는
+/// surface.list 와 같은 형태(이름 문자열)다 — 같은 사실을 두 표면이 다른 모양으로 내면
+/// 소비부가 좌석마다 다른 것을 본다.
+pub fn surface_exited_payload(sid: u64, role: Option<String>, agent: Option<String>) -> Value {
+    json!({
+        "surface_ref": cys::surface_ref(sid),
+        "role": role,
+        "agent": agent,
+    })
+}
+
 pub fn queue_dropped_payload(
     reason: &str,
     dropped: &[QueueEntry],
@@ -1188,6 +1212,35 @@ mod dedup_tests {
 
     fn roles(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    /// ★B3 #19: `surface.exited` 는 **어느 역할 좌석이 죽었는지**를 그 자리에서 말한다.
+    ///
+    /// 종전엔 `surface_ref` 하나뿐이라 감시자가 역할 사실을 60초 뒤 `surface.reaped` 에서야
+    /// 얻었고(`CYS_REAP_EXITED=0` 이면 영영), 그 1분이 곧 "master 가 죽은 줄 모르는 창" 이었다.
+    #[test]
+    fn b3_surface_exited_payload_carries_role_and_agent() {
+        let p = super::surface_exited_payload(
+            7,
+            Some("master".to_string()),
+            Some("claude".to_string()),
+        );
+        assert_eq!(p["surface_ref"], serde_json::json!("surface:7"), "기존 키 불변");
+        assert_eq!(p["role"], serde_json::json!("master"), "역할 좌석 사실이 실려야 한다");
+        assert_eq!(p["agent"], serde_json::json!("claude"), "agent 는 이름 문자열(surface.list 형태)");
+    }
+
+    /// 음성 대조: 역할 없는 스크래치 pane 은 role·agent 가 **null** 이어야 한다 —
+    /// 키를 항상 채우거나(빈 문자열) 아예 빼면 소비부가 '역할 좌석 사망'과 '스크래치 종료'를
+    /// 구분하지 못한다. 이 단언이 없으면 "무조건 master 를 싣는" 구현도 위 검체를 통과한다.
+    #[test]
+    fn b3_surface_exited_payload_distinguishes_roleless_pane() {
+        let p = super::surface_exited_payload(9, None, None);
+        assert_eq!(p["surface_ref"], serde_json::json!("surface:9"));
+        assert!(p["role"].is_null(), "역할 부재는 null 이어야 한다: {}", p["role"]);
+        assert!(p["agent"].is_null(), "agent 부재는 null 이어야 한다: {}", p["agent"]);
+        // 키 자체는 존재해야 한다(부재와 null 은 다른 사실이다 — 소비부가 키로 스키마를 판별한다).
+        assert!(p.get("role").is_some() && p.get("agent").is_some(), "키는 항상 존재");
     }
 
     #[test]
@@ -3245,11 +3298,25 @@ impl Daemon {
                     queue_dropped_payload("process_exited", &dropped, None),
                 );
             }
+            // ★B3 #19: 자력 종료(셸 EOF)한 좌석이 **역할을 쥐고 있었다는 사실**을 이 시점에
+            //   싣는다(additive — 기존 키 불변). 종전 페이로드에는 role 이 없어 "어느 역할
+            //   좌석이 죽었나" 를 여기서 알 수 없었고, 그 사실은 **60초 뒤** reap 의
+            //   `surface.reaped`(role 포함)에서야 처음 등장했다 — `CYS_REAP_EXITED=0` 이면
+            //   영영 오지 않는다. 역할 반납 자체는 reap→close_surface 가 이미 하므로(grace 는
+            //   크래시 포렌식·노드복구 창) 여기서 roles 맵을 건드리지 않는다 — 이 수정은
+            //   **경고(관측)** 층이다.
+            let exited_role = surf.role.lock().unwrap().clone();
+            let exited_agent = surf
+                .agent_meta
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(name, _)| name.clone());
             daemon.bus.publish(
                 "surface.exited",
                 "surface",
                 Some(surf.id),
-                json!({"surface_ref": cys::surface_ref(surf.id)}),
+                surface_exited_payload(surf.id, exited_role, exited_agent),
             );
         });
 
