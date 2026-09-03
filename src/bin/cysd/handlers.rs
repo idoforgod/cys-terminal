@@ -6281,6 +6281,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
         "queue.list" => {
             let filter_sid = resolve_surface_id(&params);
+            // ★B3 #11: 전문(`text`)은 **요청 시에만** 싣는다. 기본 응답은 preview 80자 그대로라
+            //   행 계약(cols[3]=preview)·팩 파서(javis_boot_node)·응답 크기가 전부 불변이다.
+            //   opt-in 으로 두는 이유: 큐에는 수천 자 본문이 쌓일 수 있고, 목록 조회가 그것을
+            //   기본으로 실어 나르면 관측이 부하가 된다.
+            let full = params.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
             // ★락 순서 계약(큐 계열): 전역 순서는 **restored_queue → surfaces → pending_queue** 다
             //   (Daemon::rehome_restored_queue 가 이 순서로 잡는다 — state.rs). 종전 이 핸들러는
             //   surfaces 가드를 **쥔 채** 아래에서 restored_queue 를 잡아 rehome 과 정면 역전(AB-BA)
@@ -6307,7 +6312,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
                     // 조준 id 와 기아 나이(age_secs)를 여기서 얻는다. age 는 음수 클램프 0
                     // (시계 스큐 방어 — wait_secs 계약과 동형).
-                    out.push(json!({
+                    let mut row = json!({
                         "surface_id": s.id, "surface_ref": surface_ref(s.id),
                         "index": i, "bytes": e.text.len(),
                         "preview": e.text.chars().take(80).collect::<String>(),
@@ -6315,7 +6320,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "age_secs": (now - e.enqueued_at).max(0.0) as u64,
                         "from": e.from, "origin": e.origin,
                         "blocked_by": blocked_by, "blocked_since": blocked_since,
-                    }));
+                    });
+                    if full {
+                        row["text"] = json!(e.text);
+                    }
+                    out.push(row);
                 }
             }
             // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
@@ -6333,7 +6342,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let text = it.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                out.push(json!({
+                let mut row = json!({
                     "surface_id": sid_v, "restored": true,
                     "mid": it.get("mid").cloned().unwrap_or(Value::Null),
                     "bytes": text.len(),
@@ -6348,7 +6357,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap_or(Value::Null),
                     "from": it.get("from").cloned().unwrap_or(Value::Null),
                     "origin": it.get("origin").cloned().unwrap_or(Value::Null),
-                }));
+                });
+                if full {
+                    row["text"] = json!(text);
+                }
+                out.push(row);
             }
             Reply::Single(ok_response(&id, json!({"entries": out})))
         }
@@ -12727,6 +12740,75 @@ mod tests {
         assert!((49..=120).contains(&age), "age_secs ≈ 50 (실측 {age})");
         assert_eq!(row["from"], json!("surface:2"));
         assert_eq!(row["origin"], json!("send"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B3 #11: 전문(`text`)은 `full=true` 일 때만 실린다. 기본 응답은 preview 80자만 —
+    /// 행 계약(cols[3]=preview)·팩 파서·응답 크기가 불변이어야 한다.
+    ///
+    /// 음성 대조가 이 검체의 핵심이다: ⓐ 기본 조회에서 `text` 키가 **부재**함을 단언하지 않으면
+    /// "무조건 전문 노출" 구현도 통과한다(opt-in 계약이 증명되지 않는다).
+    #[test]
+    fn b3_queue_list_full_exposes_text_only_when_requested() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-b3-qfull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        // 200자 본문 — preview(80자) 절단이 실제로 일어나는 길이여야 대조가 성립한다.
+        let body: String = std::iter::repeat('가').take(200).collect();
+        let at = crate::state::now_epoch() - 5.0;
+        std::fs::write(
+            dir.join("queue-state.json"),
+            format!(
+                r#"[{{"id":"qf.1","seq":1,"surface_id":21,"role":"b3-qfull","text":"{body}","enqueued_at":{at},"from":"surface:3","origin":"send"}}]"#
+            ),
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+
+        let ask = |params: Value| {
+            let req = Request { id: json!(1), method: "queue.list".into(), params };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "queue.list 실패 (응답: {resp})");
+            resp["result"]["entries"]
+                .as_array()
+                .expect("entries 배열")
+                .iter()
+                .find(|e| e["restored"] == json!(true))
+                .cloned()
+                .expect("restored 행")
+        };
+
+        // ⓐ 기본: 전문 키 부재 · preview 는 80자 절단.
+        let plain = ask(json!({}));
+        assert!(
+            plain.get("text").is_none(),
+            "기본 조회가 전문을 실었다 — opt-in 계약 붕괴(응답 크기·파서 계약 위반)"
+        );
+        assert_eq!(
+            plain["preview"].as_str().unwrap().chars().count(),
+            80,
+            "preview 는 80자 절단본이어야 한다"
+        );
+        assert_eq!(plain["bytes"], json!(body.len()), "bytes 는 전문 길이 그대로");
+
+        // ⓑ full=true: 전문 실림 · preview 는 여전히 80자(기존 키 불변 = additive).
+        let full = ask(json!({"full": true}));
+        assert_eq!(full["text"].as_str(), Some(body.as_str()), "전문이 원문과 달라졌다");
+        assert_eq!(
+            full["preview"].as_str().unwrap().chars().count(),
+            80,
+            "full 이 preview 를 덮어쓰면 안 된다(additive 계약)"
+        );
+        // ⓒ full=false 를 명시해도 기본과 같다(플래그 해석이 뒤집히지 않았음).
+        assert!(ask(json!({"full": false})).get("text").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

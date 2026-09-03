@@ -775,6 +775,10 @@ enum QueueAction {
         /// RPC entries 원문(JSON 배열) 그대로 출력 — 텍스트 열 파싱 없이 기계 소비
         #[arg(long)]
         json: bool,
+        /// ★B3 #11 미배달 본문 **전문** 출력(preview 80자 절단 해제). 텍스트 모드는 행 뒤에
+        /// 블록으로 찍고(6열 행 계약 불변), --json 이면 각 entry 에 `text` 키가 실린다.
+        #[arg(long)]
+        full: bool,
     },
     /// Drop all undelivered queued messages for a surface
     Clear { surface: String },
@@ -897,9 +901,68 @@ fn queue_list_row(e: &Value) -> String {
     )
 }
 
+/// ★B3 #11 `--full` 전문 블록 렌더(순수) — 행 **뒤**에 붙는 여러 줄.
+///
+/// 왜 행이 아니라 블록인가: `cys queue list` 행은 6열 탭 구분 계약이고 팩 파서가 cols[3]=preview
+/// 를 읽는다(queue_list_row doc). 전문을 그 열에 넣으면 개행·탭이 열을 쪼개 파서를 깨뜨린다.
+/// 그래서 행은 그대로 두고 아래에 `    │ ` 접두 블록으로 찍는다 — 사람·운영자 전용 표면이다.
+///
+/// `text` 키 부재면 빈 Vec 을 낸다(구 데몬 스큐 안전 — `--full` 을 모르는 데몬에 붙어도 조용히
+/// 행만 나온다). 부재를 오류로 접으면 신 CLI 가 구 데몬에 붙는 순간 목록 조회 자체가 죽는다.
+fn queue_list_full_block(e: &Value) -> Vec<String> {
+    let Some(text) = e["text"].as_str() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = text.lines().map(|l| format!("    │ {l}")).collect();
+    out.push(String::new());
+    out
+}
+
 #[cfg(test)]
 mod queue_list_row_tests {
     use super::*;
+
+    /// ★B3 #11: 전문 블록은 줄 단위로 접두되고, `text` 부재(구 데몬)면 조용히 비어야 한다.
+    #[test]
+    fn b3_queue_list_full_block_renders_lines_and_tolerates_missing_text() {
+        let e = serde_json::json!({"text": "a\nb"});
+        assert_eq!(
+            queue_list_full_block(&e),
+            vec!["    │ a".to_string(), "    │ b".to_string(), String::new()],
+            "전문은 줄마다 접두하고 끝에 빈 줄로 항목을 가른다"
+        );
+        // 음성 대조 ①: text 부재(구 데몬 · --full 미지원)면 빈 Vec — 목록 자체는 살아야 한다.
+        assert!(
+            queue_list_full_block(&serde_json::json!({"preview": "a"})).is_empty(),
+            "text 부재를 오류로 접으면 신 CLI 가 구 데몬에 붙는 순간 조회가 죽는다"
+        );
+        // 음성 대조 ②: 빈 문자열 본문은 블록이 없다(lines() 가 0줄) — 빈 줄만 찍지 않는다.
+        assert_eq!(
+            queue_list_full_block(&serde_json::json!({"text": ""})),
+            vec![String::new()]
+        );
+        // 탭은 보존한다 — 블록 행은 열 파싱 대상이 아니다(행 계약과 반대 방향).
+        let tabbed = queue_list_full_block(&serde_json::json!({"text": "a\tb"}));
+        assert!(tabbed[0].contains('\t'), "블록은 탭을 공백으로 바꾸지 않는다");
+    }
+
+    /// ★B3 #11: 행 계약은 `--full` 여부와 무관하게 불변이다 — 전문이 실린 entry 에서도
+    /// cols[3] 은 여전히 **preview**(80자 절단본)이고 열 개수는 6이다. 이것이 깨지면
+    /// javis_boot_node 파서가 본문 개행에 밀린다.
+    #[test]
+    fn b3_queue_list_row_ignores_full_text_key() {
+        let e = serde_json::json!({
+            "surface_ref": "surface:2", "index": 0, "bytes": 300,
+            "preview": "머리 80자", "text": "머리 80자 …그리고\t나머지 전문\n둘째 줄",
+            "id": "qx.9", "age_secs": 12
+        });
+        let row = queue_list_row(&e);
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 6, "전문 키가 열을 늘리면 안 된다");
+        assert_eq!(cols[3], "머리 80자", "cols[3] 은 preview 여야 한다(전문 아님)");
+        assert!(!row.contains('\n'), "행은 항상 한 줄");
+        assert_eq!(cols[4], "qx.9");
+    }
 
     /// 열 위치 회귀 핀 — cols[3]=preview 는 javis_boot_node 파싱 계약(위 doc comment).
     /// 신규 열(id·age)은 말미(cols[4]·cols[5])에만 있다.
@@ -3060,8 +3123,8 @@ fn run(command: Command) -> i32 {
 
         Command::Queue { action } => {
             return match action {
-                QueueAction::List { surface, json: as_json } => parse_explicit_surface(&surface)
-                    .and_then(|sid| request("queue.list", json!({"surface_id": sid})))
+                QueueAction::List { surface, json: as_json, full } => parse_explicit_surface(&surface)
+                    .and_then(|sid| request("queue.list", json!({"surface_id": sid, "full": full})))
                     .map(|r| {
                         let entries = r["entries"].as_array().cloned().unwrap_or_default();
                         // --json: RPC entries 원문 — 텍스트 열 계약과 무관한 기계 소비 경로.
@@ -3072,10 +3135,24 @@ fn run(command: Command) -> i32 {
                         if entries.is_empty() {
                             println!("(queue empty)");
                         }
+                        if full {
+                            // ★B3 #11 운영자 안내(stdout 아닌 stderr — 행 파서 무오염):
+                            //   "목록이 비었는데 본문은 어디 있나" 의 답이다. 미배달 본문의 정본은
+                            //   데몬 state_dir 의 queue-state.json(WAL) 이며 **미배달분만** 담는다 —
+                            //   전부 배달되면 `[]` 가 정상이고 그것은 결함이 아니다(배달 이력은
+                            //   배달 원장 소관). 부서 데몬은 소켓이 다르면 state_dir 도 다르다.
+                            eprintln!(
+                                "[queue] 미배달 본문 정본(WAL) = <state_dir>/queue-state.json — \
+                                 미배달분만 담기므로 전량 배달 후 [] 는 정상이다"
+                            );
+                        }
                         for e in entries {
                             // ★G1(W2-B): 행 렌더는 queue_list_row 단일 소유 — 열 위치
                             // 계약(cols[3]=preview)과 회귀 핀은 그 정의부에 있다.
                             println!("{}", queue_list_row(&e));
+                            for line in queue_list_full_block(&e) {
+                                println!("{line}");
+                            }
                         }
                         0
                     })

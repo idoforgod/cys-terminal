@@ -31,6 +31,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CYSD = os.path.join(ROOT, "target", "debug", "cysd")
+CYS = os.path.join(ROOT, "target", "debug", "cys")
 FAIL = []
 NOTES = []
 
@@ -325,6 +326,73 @@ def main():
             "⑦ 고스트 텍스트(커서 뒤 제안문)는 배달을 막지 않는다",
             ok3,
             f"대기 {waited3:.1f}s",
+        )
+
+        # ── ⑧ B3 #11 전문 조회(--full) + queue-state.json 판독 계약 ────────────────
+        #    사람 입력이 있는 pane 은 배달이 보류되므로(⑤) 미배달 상태를 안정적으로 관측한다.
+        sid4 = make_surface(d, "full", mode="idle", typed="사람이 치는 중")
+        body = "가" * 300
+        enqueue(d, sid4, body, frm="surface:98")
+        time.sleep(1.0)
+        rows = d.queue_rows(sid4)
+        check("⑧a 보류 항목이 큐에 남는다(관측 전제)", len(rows) == 1, f"rows={len(rows)}")
+        if rows:
+            check(
+                "⑧b 기본 조회는 preview 80자 절단 · 전문 키 부재",
+                len(rows[0].get("preview", "")) == 80 and "text" not in rows[0],
+                f"preview={len(rows[0].get('preview',''))}자 text키={'있음' if 'text' in rows[0] else '없음'}",
+            )
+        fr = d.rpc("queue.list", {"surface_id": sid4, "full": True})
+        full_rows = [
+            e
+            for e in (fr.get("entries") or fr.get("result", {}).get("entries") or [])
+            if e.get("surface_id") == sid4
+        ]
+        check(
+            "⑧c full=true 는 전문을 원문 그대로 싣는다",
+            len(full_rows) == 1 and full_rows[0].get("text") == body,
+            f"rows={len(full_rows)} 일치={bool(full_rows) and full_rows[0].get('text') == body}",
+        )
+        # CLI 표면도 같은 계약인지(--full --json 의 text 키) — RPC 만 맞고 CLI 가 안 맞는 스큐 차단.
+        cli = subprocess.run(
+            [CYS, "--socket", d.sock, "queue", "list", "--surface", f"surface:{sid4}",
+             "--full", "--json"],
+            env=d.env, capture_output=True,
+        )
+        cli_ok = False
+        if cli.returncode == 0:
+            try:
+                cli_ok = any(e.get("text") == body for e in json.loads(cli.stdout.decode()))
+            except Exception:
+                cli_ok = False
+        check("⑧d CLI `queue list --full --json` 도 전문을 낸다", cli_ok,
+              f"rc={cli.returncode} {cli.stderr.decode(errors='replace')[:120]}")
+        # WAL 계약: 미배달 본문의 정본은 queue-state.json 이며 **미배달분만** 담는다.
+        # ★경로 주의(설계 B3 #11 ①): unix 의 state_dir 는 **소켓의 부모**다 — 소켓이 다른
+        #   부서 데몬은 WAL 파일도 다르다. 본부 파일을 열고 "빈 배열" 이라 판정하는 오독이
+        #   여기서 나온다. 환경변수 CYS_STATE_DIR 쪽도 함께 훑어 실재 경로를 특정한다.
+        wal_candidates = [
+            os.path.join(os.path.dirname(d.sock), "queue-state.json"),
+            os.path.join(d.state_dir, "queue-state.json"),
+        ]
+        wal_path = next((p for p in wal_candidates if os.path.exists(p)), wal_candidates[0])
+        wal = json.load(open(wal_path, encoding="utf-8")) if os.path.exists(wal_path) else None
+        check(
+            "⑧e queue-state.json(WAL) 에 미배달 전문이 실재한다",
+            isinstance(wal, list) and any(x.get("text") == body for x in wal),
+            f"path={wal_path} 항목={len(wal) if isinstance(wal, list) else 'NONE'}",
+        )
+        d.rpc("queue.clear", {"surface_id": sid4})
+        time.sleep(0.5)
+        wal2 = json.load(open(wal_path, encoding="utf-8")) if os.path.exists(wal_path) else None
+        check(
+            "⑧f 큐가 비면 WAL 에서도 사라진다 — '빈 배열'은 결함이 아니라 정상",
+            isinstance(wal2, list) and not any(x.get("text") == body for x in wal2),
+            f"잔여={len(wal2) if isinstance(wal2, list) else 'NONE'}",
+        )
+        NOTES.append(
+            "⑧ queue-state.json 은 미배달 WAL(이력 원장 아님) — 전량 배달 후 [] 가 정상이다. "
+            "배달 이력은 배달 원장(delivery.rs)이 담당한다."
         )
 
         print()
