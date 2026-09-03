@@ -4954,6 +4954,9 @@ pub(crate) fn deliver_head_locked(
                     "enqueued_at": e.enqueued_at,
                     "wait_secs": (now - e.enqueued_at).max(0.0),
                     "chars": e.text.chars().count(),
+                    // ★항목별 sha — 원장만으로 '보낸 것이 전부 배달됐나' 를 대조할 수 있어야
+                    //   한다(수용 기준 §7 ① 유실 0). 합성본 sha 는 전문 레코드에 따로 있다.
+                    "sha256": crate::delivery::digest_text(&e.text),
                 })
             })
             .collect();

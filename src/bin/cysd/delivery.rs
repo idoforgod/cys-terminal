@@ -292,6 +292,16 @@ fn digest_normalized(norm: &str) -> String {
 /// python `javis_mission.delivery_digest` 와의 동치를 박제하는 것이 이 함수의 유일한 임무다).
 #[cfg(test)]
 pub fn digest(text: &str) -> String {
+    digest_text(text)
+}
+
+/// ★B1(0.14.30): 원문 → 정규화 → sha256(원장 대조 키와 **같은 산식**).
+///
+/// 왜 생산 경로에 필요해졌나: 병합 배달(다이제스트)은 여러 항목을 한 본문으로 주입하므로
+/// 전문 레코드의 sha 는 합성본의 것이다. 그러면 "보낸 항목이 전부 배달됐나(유실 0)" 를 원장만
+/// 보고는 확인할 수 없다 — 수용 기준 §7 ①이 요구하는 sha 전수 대조가 성립하려면 항목별 sha 가
+/// 원장에 있어야 한다. `digest_parts[].sha256` 이 그 자리다.
+pub fn digest_text(text: &str) -> String {
     digest_normalized(&normalize(text))
 }
 
