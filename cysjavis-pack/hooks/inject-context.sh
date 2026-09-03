@@ -189,7 +189,7 @@ fi
 #     보여 `-c claude` 가 0건이다. 그래서 pid 선택은 ps 로 하고 lsof 는 `-a -p … -d cwd` 로 cwd 만
 #     묻는다. 선택 형태 3종(실측 2026-09-03): ⓐ 런처 실행 comm=claude(또는 /…/bin/claude)
 #     ⓑ node 래퍼 comm=node ∧ args 에 claude-code(npm 설치) — codex 도 node 라 args 로 가른다
-#     ⓒ 버전 경로 직접 실행 — ps comm 이 16자로 절단(`/Users/cys/.loca`)되므로 comm 이 아니라
+#     ⓒ 버전 경로 직접 실행 — ps comm 이 16자로 절단(`/Users/<user>/.lo…` 형태 · 실경로 미기재)되므로
 #        command 첫 토큰의 `/claude/versions/` 로 판별(lsof COMMAND 는 `2.1.259`).
 # pid 결합은 awk 안에서 한다(paste 비의존 — PortableGit 최소 셸 패리티).
 if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CWD" ]; then
