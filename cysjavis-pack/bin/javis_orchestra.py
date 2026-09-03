@@ -1109,6 +1109,26 @@ def load_invariants(path, max_lines=20):
     return bullets[:max_lines] or None
 
 
+def verdict_json_path(task, rnd, evaluator):
+    """리뷰어 verdict JSON 의 **정본 경로**(레인별 유일) — `<팩>/round/_reviews/<task>-r<N>-<evaluator>.json`.
+
+    ★왜 파일이 정본이어야 하는가(dept-1 실측 2026-09-04 · CEO 상신): reviewer-codex R3 verdict
+      (7,581B)가 `_reviews/` 에 0건이었고 **유일한 완전본이 부서장 좌석 큐 안에만** 있었다 — 큐 배달
+      전에 좌석이 정리됐다면 판정 근거가 통째로 휘발됐을 것이다(화면 캡처는 pane 폭 때문에 1,533B
+      부분본에 그쳤다). 본부의 14건도 사람이 손으로 JSON 을 만든 것이지 도구가 강제한 것이 아니다.
+      `round-log` 는 리뷰어 행에 `--verdict-json <파일>` 을 **요구**하는데 정작 의뢰문은 그 파일을
+      어디에 쓰라고 말하지 않았다 — 요구와 지시가 갈린 자리를 이 함수가 잇는다.
+    경로는 `pack_dir()` 파생이라 **레인(부서 팩)마다 유일**하고, 슬러그 규칙은 `phase_index_path` 와
+    같다(경로 탈출 문자는 전부 `_` 로 접힌다 — basename 분리자 0)."""
+    safe = re.sub(r"[^0-9A-Za-z가-힣_.-]", "_", task or "")[:80] or "task"
+    ev = re.sub(r"[^0-9A-Za-z_.-]", "_", str(evaluator or "reviewer"))[:40] or "reviewer"
+    try:
+        n = int(rnd or 1)
+    except (TypeError, ValueError):
+        n = 1
+    return os.path.join(pack_dir(), "round", "_reviews", "%s-r%d-%s.json" % (safe, n, ev))
+
+
 def cmd_review_prompt(args):
     bullets = extract_constraints()
     if not bullets:
@@ -1175,6 +1195,25 @@ def cmd_review_prompt(args):
     if rnd and rnd > 1:
         lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 재귀적 개선 관점에서 "
                      "평가한다(단순 코드수정 금지). 이 라운드의 종결 조건도 위 통과 조건과 같다." % rnd)
+    # ★A8(2026-09-04 CEO 지시 · dept-1 상신): verdict 의 **파일 정본화**를 의뢰문이 강제한다.
+    #   round-log 가 리뷰어 행에 `--verdict-json <파일>` 을 요구하는 것과 짝이며, 좌석 큐·화면
+    #   캡처만 남아 판정 근거가 휘발되는 경로를 닫는다. 평가자 표기는 `--reviewer`(gemini|codex)를
+    #   쓰고, 미지정이면 앵커 역할(reviewer1|reviewer2)로 접어 **항상 구체 경로**를 낸다
+    #   (플레이스홀더를 남기면 사람이 매번 다른 곳에 저장해 정본이 흩어진다).
+    _ev = getattr(args, "reviewer", None) or getattr(args, "reviewer_role", None) or "reviewer1"
+    _vp = verdict_json_path(args.task, rnd, _ev)
+    lines.append("")
+    lines.append("verdict 정본 저장(필수 — 이 경로에 JSON 파일로 저장하라):")
+    lines.append("  %s" % _vp)
+    lines.append("  · 디렉터리가 없으면 먼저 만들어라: mkdir -p \"%s\"" % os.path.dirname(_vp))
+    lines.append("  · 스키마 = _round/REVIEWER_VERDICT_CONTRACT.md "
+                 "(verdict enum + evidence file:line · score(0-100) 금지).")
+    lines.append("  · master 의 `javis_orchestra.py round-log --verdict-json <파일>` 은 **이 파일만** "
+                 "받는다 — 산문 전사는 거부된다.")
+    lines.append("  · 화면 출력·push 본문은 사본이다(pane 폭에서 잘리고 좌석이 정리되면 사라진다). "
+                 "**파일이 정본**이다.")
+    lines.append("완료 기준(파일 실재): 위 경로에 verdict JSON 이 **실재**할 때 이 라운드가 제출된 "
+                 "것으로 본다 — 파일이 없으면 미제출이며 라운드는 종결되지 않는다.")
     lines.append("회신: `cys send --queued --to master \"[리뷰] ...\"` (자동 Return 배달 — "
                  "타이핑 가드 안전·send-key 불필요).")
     print("\n".join(lines))
@@ -2418,6 +2457,23 @@ def cmd_self_test(args):
         for must in ("엄격 제약", "배회 금지", "문제점", "회신",
                      "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
+        # ★A8: verdict 파일 정본화 — 저장 지시·경로·파일 실재 성공기준이 항상 주입된다.
+        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "완료 기준(파일 실재)",
+                     "round/_reviews/"):
+            assert must in out, "review-prompt에 A8 '%s' 누락" % must
+        assert verdict_json_path("T", 2, "reviewer1") in out, "A8 저장 경로 불일치"
+        # 경로 탈출 0(phase_index_path 와 같은 슬러그 규칙) — 판정 축은 **분리자 잔존 0** 과
+        # **_reviews 이탈 0** 이다. `..` 이 파일명 *글자*로 남는 것(`.._.._etc_passwd-r1-…`)은
+        # 탈출이 아니다 — 접미(`-rN-<ev>.json`) 때문에 그 이름이 `.`/`..` 자체가 될 수 없다.
+        _rev_dir = os.path.join(pack_dir(), "round", "_reviews")
+        for _evil in ("../../etc/passwd", "a/b", "..", "T\x00"):
+            _vp_e = verdict_json_path(_evil, 1, "codex")
+            _bn = os.path.basename(_vp_e)
+            assert "/" not in _bn and "\\" not in _bn, \
+                "verdict_json_path basename 분리자 잔존: %s" % _bn
+            assert _bn not in (".", ".."), "basename 이 디렉터리 참조가 됐다: %s" % _bn
+            assert os.path.normpath(_vp_e).startswith(os.path.normpath(_rev_dir) + os.sep), \
+                "verdict_json_path 가 _reviews 밖으로 나갔다: %s" % _vp_e
         # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
         import tempfile as _tf
         _prev_root = os.environ.get("JAVIS_ROOT")
