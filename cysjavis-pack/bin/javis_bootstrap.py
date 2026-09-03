@@ -2815,6 +2815,35 @@ def _cmd_run_chain(log):
                  ("CEO 티켓 부재/만료 — base CEO 에 발급을 **요청**하고 유계 대기한다. 사유: %s"
                   % why))
         if not ok:
+            # ── ★#13(PREP #13) 결손 0이면 티켓 요청을 발사하지 않는다 ─────────────────────
+            # 실측(2026-09-03 09:28·10:04·13:10 3회): 부서장 재기동 때마다 **의무 역할 9좌석이
+            # 전원 생존**인데도 아래 요청 push 가 나가 CEO 큐에 소음이 쌓였다. 티켓의 용도는
+            # '팀 기동 권한'이고 결손 0 이면 기동할 것이 없으므로(④ 도 `if has_deficit:` 로
+            # 스폰 경로에 진입하지 않는다) 요청 자체가 무의미하다.
+            # ★판정은 ④ 와 **같은 술어**(_team_has_deficit — orchestra 정본 위임)로 한다. 신호
+            #   원천이 실패하면 그 함수가 보수적으로 True(결손 가정)를 돌려주므로, **측정 실패는
+            #   요청 생략의 근거가 되지 않는다**(측정 불능은 통과가 아니다 — 종전 동작 유지).
+            has_deficit_now, deficit_why_now = _team_has_deficit()
+            if not has_deficit_now:
+                note = ("CEO 티켓 부재이나 **결손 0** — 의무 역할 전원 생존이라 팀 기동이 불요하고, "
+                        "따라서 티켓 요청도 보내지 않았다(CEO 큐 소음 차단 · PREP #13). "
+                        "판정 근거: %s / 티켓 상태: %s" % (deficit_why_now, why))
+                log.step(STEP.CEO_TICKET_REQUEST, 1,
+                         "결손 0(의무 역할 전원 생존) — CEO 티켓 요청 생략(재기동 소음 차단 · "
+                         "PREP #13). %s" % deficit_why_now)
+                _progress(note)
+                summary = {"ok": True, "marker": "부서장 각성(팀 이미 완결 · CEO 티켓 불요)",
+                           # ★solo_awakening=False 가 사실이다 — 팀이 살아 있으므로 '단독 각성'이
+                           #   아니다. 거짓 플래그를 원장에 박지 않는다(A2 라벨 결함과 같은 계열).
+                           "solo_awakening": False, "team_complete": True, "dept": dept,
+                           "ticket_requested": False, "ticket_request_detail": deficit_why_now,
+                           "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
+                           "lane": log.lane, "boot_last": log.path}
+                log.result(ok=True, state="team_complete", solo_awakening=False,
+                           team_complete=True, reason=deficit_why_now,
+                           ticket_requested=False, exit=EXIT_OK)
+                print(json.dumps(summary, ensure_ascii=False))
+                return EXIT_OK
             # ★2026-08-22 결함 #2 봉합: 종전엔 여기서 안내문만 출력하고 끝나 부서장이 팀 없이
             #   대기했고, **오너가 추가 명령을 쳐야** CEO 에게 요청이 갔다(실측 06:20→06:26→06:29).
             #   오너 절대규칙은 "선언자는 새 부서장이 되며 팀이 기동돼야 한다"이므로 요청은
