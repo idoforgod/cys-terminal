@@ -1160,6 +1160,73 @@ def harness_origin(prompt):
     return False, ""
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 층0-c(병렬 축) — **기동 명령문** 필터 : 사람이 친 것도, 기계 알림도 아닌 제3의 오염원
+# ══════════════════════════════════════════════════════════════════════════════
+# ★왜 축이 하나 더 필요한가 (2026-09-03 21:19:23 실사고 · PREP #2)
+#   임무 대장이 이렇게 덮였다 —
+#     {"mission": "cys launch-agent --role master --agent claude",
+#      "source": "prompt", "reason": "잔여문 45자 — 오너 임무로 인정"}
+#   이것은 **기동 명령문**이다. 오너가 노드를 띄우려고 친 셸 한 줄이거나, 운영 절차를 복사해
+#   붙인 문장이지 "이 세션에서 무엇을 하라"는 임무가 아니다. 그런데 세 층 어디에도 안 걸린다:
+#     · 층1(배달 원장) — 데몬이 주입한 것이 아니라 원장에 없다.
+#     · 층2(라벨)       — `[`로 시작하지 않는다.
+#     · 층0(harness)    — XML 마커 태그가 없어 잔여문이 45자로 살아남는다.
+#   그 결과 **자율 착수 게이트가 열린다**(gate() exit 0). 임무를 지정받지 않은 세션이 자기
+#   기동 명령을 근거로 일을 시작하는 것이 이 사고의 형태다.
+#
+# ★판정 규칙 — 네 조건을 **전부** 만족할 때만 기계로 접는다(좁게 잡는다):
+#   ① 공백을 접으면 **한 줄**이다(개행이 남으면 사람이 쓴 문단일 가능성이 크다)
+#   ② **한글이 한 글자도 없다** — 오너의 지시문에는 사실상 항상 한글이 있다(이 팩의 사용 언어)
+#   ③ 길이가 MISSION_MAX_CHARS 이하다(긴 붙여넣기는 이 축의 대상이 아니다)
+#   ④ 전체가 **cys 서브커맨드 형태**(A) 또는 **에이전트 CLI 기동 형태**(B)와 정확히 일치한다
+#
+# ★거짓 양성(오너 임무 삼킴)이 이 모듈에서 가장 비싼 실패라는 비대칭은 층0 과 동일하다.
+#   그래서 규칙을 '문장 전체 일치'로 좁혔다 — 명령이 **인용된** 문장은 전부 통과한다:
+#     · "cys launch-agent --role master --agent claude 가 왜 임무로 잡혔는지 조사해"  → ②로 통과
+#     · "cys boot 실행하고 결과 보고해"                                              → ②로 통과
+#     · "run cys boot and report"                                                    → ④로 통과(뒤에 산문)
+#   **받아들이는 대가**: 오너가 영어로 `cys boot` **한 줄만** 쳐서 그것을 임무로 삼으려 하면
+#   기계로 접힌다. 그때는 한 마디를 덧붙이면 되고(예: "cys boot 해줘"), 반대 방향 실패(기계
+#   문장이 임무가 되어 자율 착수가 열리는 것)는 그렇게 값싸게 되돌릴 수 없다.
+#
+# ★대장 표기: mission=null · source="boot_command" — 층0 의 harness_notification 과 같은 층위로
+#   **판정 근거를 대장에 남긴다**(다음 사고에서 오너가 1초 만에 읽는 자리).
+_HANGUL = re.compile(r"[가-힣ㄱ-ㆎ]")
+# (A) cys 기동·역할 서브커맨드 — 노드를 띄우거나 좌석을 잡는 계열만 좁게 열거한다.
+#     (`cys send`·`cys status` 류 조회·발신 명령은 일부러 뺐다 — 그 문장을 임무로 주는 경우가 있다.)
+_BOOT_CYS = re.compile(
+    r"^cys\s+(launch-agent|boot|boot-node|node-recover|new-surface|claim-role|cycle-agent|init-pack)"
+    r"(\s+\S+)*$")
+# (B) 에이전트 CLI 직접 기동 — 실행 파일명 + 플래그만으로 이루어진 줄.
+_BOOT_CLI = re.compile(
+    r"^(claude|claude-[A-Za-z0-9_-]+|agy|codex|gemini)"
+    r"(\s+-{1,2}[A-Za-z0-9_=.,/:-]+)*$")
+
+
+def boot_command_origin(prompt):
+    """(bool, 사유) — 이 프롬프트가 **기동 명령문**인가(임무가 아니다).
+
+    층0(harness)·층1(원장)·층2(라벨)과 **병렬**이며 서로를 대체하지 않는다. 부작용 0.
+    판정 규칙과 그 비대칭 근거는 위 섹션 주석 참조(좁게 잡는다 = 애매하면 통과)."""
+    p = _WS.sub(" ", (prompt or "").strip())
+    if not p:
+        return False, ""
+    if len(p) > MISSION_MAX_CHARS:
+        return False, ""
+    if _HANGUL.search(p):                      # ② 한글이 있으면 오너 문장으로 본다
+        return False, ""
+    if "\n" in (prompt or "").strip():         # ① 원문이 여러 줄이면 대상 아님
+        return False, ""
+    if _BOOT_CYS.match(p):
+        return True, ("기동 명령문(cys 서브커맨드 전체 일치 · 한글 0자 · %d자) — "
+                      "노드 기동 명령이지 이 세션의 임무가 아니다: %r" % (len(p), p[:80]))
+    if _BOOT_CLI.match(p):
+        return True, ("기동 명령문(에이전트 CLI 기동 전체 일치 · 한글 0자 · %d자) — "
+                      "노드 기동 명령이지 이 세션의 임무가 아니다: %r" % (len(p), p[:80]))
+    return False, ""
+
+
 def _delivery_spans(norm, delivery):
     """(spans, capped) — 정규화 프롬프트 안에서 원장 레코드와 **정확히 일치**하는 구간 전부.
 
@@ -1869,6 +1936,18 @@ def _record_harness_verdict(reason, prompt, ledger_status):
                         ledger_status=ledger_status)
 
 
+def _record_boot_command_verdict(reason, prompt, ledger_status):
+    """층0-c(기동 명령문) 판정을 대장에 **mission=null 로** 남긴다 — `_record_harness_verdict` 동형.
+
+    진행 중 오너 임무는 **덮지 않는다**(반대 방향 사고 차단 — 같은 함수의 불변식)."""
+    rec, _bad = read_ledger()
+    if isinstance(rec, dict) and rec.get("mission"):
+        _persist_anomalies(ledger_status)
+        return None
+    return write_ledger(None, "boot_command", reason, prompt,
+                        ledger_status=ledger_status)
+
+
 def _read_hook_stdin():
     """stdin(UserPromptSubmit hook JSON)을 **정확히 1회** 판독 → (ok, prompt, err).
 
@@ -1955,6 +2034,15 @@ def _record_step(parsed):
         sys.stderr.write("[mission] harness 내부 알림 — 임무 아님(대장 오염 차단): %s\n" % hwhy)
         _stderr_anomalies()
         _record_harness_verdict(hwhy, prompt, lstatus)
+        return gate()[0]
+    # ── ★층0-c(병렬 축) 기동 명령문 배제 (2026-09-03 21:19 실사고 · PREP #2) ──────────────
+    # 층1(원장 미경유)·층2(무라벨)·층0(마커 없음) 셋 다 구조적으로 못 보는 제3의 오염원이다.
+    # 위 층들의 판정·이상징후 리포팅은 건드리지 않고, 통과분만 여기서 한 번 더 거른다.
+    is_boot, bwhy = boot_command_origin(prompt)
+    if is_boot:
+        sys.stderr.write("[mission] 기동 명령문 프롬프트 — 임무 아님(대장 오염 차단): %s\n" % bwhy)
+        _stderr_anomalies()
+        _record_boot_command_verdict(bwhy, prompt, lstatus)
         return gate()[0]
     v = detect.detect(prompt)
     mission, reason = extract_mission(prompt, detect)
@@ -2575,6 +2663,35 @@ def cmd_self_test():
         if harness_origin(p)[0]:
             fails.append("★구조 축이 오너 프롬프트를 접었다 %r (%s) — 발화 조건이 0 보다 "
                          "느슨하거나 계수 기준이 문자 종류를 재단하고 있다" % (p, why))
+    # ── ★층0-c 기동 명령문 축(2026-09-03 21:19 실사고 · PREP #2) — 양방향 corpus ──────────
+    #   접힘 corpus 만 늘리면 "전부 접는 구현"이, 통과 corpus 만 늘리면 "아무것도 안 접는
+    #   구현"이 만점을 받는다(층0 과 같은 양방향 의무). 두 표가 동시에 green 일 때만 증거다.
+    for p, why in (
+        ("cys launch-agent --role master --agent claude", "★실사고 문자열(45자 · 대장 오등록)"),
+        ("cys boot", "인자 없는 기동 명령"),
+        ("cys claim-role worker", "좌석 선점 명령"),
+        ("cys new-surface --role worker --cwd /tmp", "좌석 생성 명령"),
+        ("claude --dangerously-skip-permissions", "에이전트 CLI 직접 기동"),
+        ("codex --dangerously-bypass-approvals-and-sandbox", "타 에이전트 CLI 기동"),
+    ):
+        _bok, _bwhy = boot_command_origin(p)
+        if not _bok:
+            fails.append("★기동 명령문 미탐 %r (%s) — 이 문장이 임무가 되면 임무 미지정 세션에서 "
+                         "자율 착수 게이트가 열린다(2026-09-03 21:19 사고 재발)" % (p, why))
+        elif "기동 명령문" not in _bwhy:
+            fails.append("기동 명령문 판정 사유에 축 이름이 없다(%r)" % _bwhy)
+    for p, why in (
+        ("cys launch-agent --role master --agent claude 가 왜 임무로 잡혔는지 조사해",
+         "명령을 **인용한** 오너 지시(한글 동반)"),
+        ("cys boot 실행하고 결과 보고해", "명령 + 한글 지시"),
+        ("부서 문서 정리 착수해줘", "평범한 오너 임무"),
+        ("run cys boot and report the result", "영어 산문 지시(전체 일치 아님)"),
+        ("cys send --to master 'hi'", "열거 밖 서브커맨드(조회·발신 계열은 대상 아님)"),
+        ("cys launch-agent --role master --agent claude\n그리고 상태를 알려줘", "다중 줄"),
+    ):
+        if boot_command_origin(p)[0]:
+            fails.append("★기동 명령문 축이 오너 프롬프트를 접었다 %r (%s) — 거짓 양성은 이 "
+                         "모듈에서 가장 비싼 실패다(오너 지시 삼킴)" % (p[:60], why))
     #    ⓪ 상한 — 초과해도 **통과시키지 않는다**(치명3 2회차: 무제한 통과 게이트 봉합)
     _big = ("<task-notification><task-id>abcdefgh</task-id><status>completed</status>"
             "<summary>done</summary></task-notification>\n") * 2000
