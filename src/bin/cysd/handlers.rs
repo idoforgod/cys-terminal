@@ -3100,6 +3100,40 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"bytes": text.len(), "from": from, "from_verified": from_verified}),
                 );
             }
+            // ★B1(0.14.30) C4: 순서 역전 관측(queue-starvation-case.md §8 실사고 — CEO 의 구
+            //   회신이 --queued 로 대기하는 동안 뒤에 친 신 지시가 먼저 도착해 수신자가 구
+            //   회신을 최신으로 오인·집행 정지). 같은 발신자의 대기분이 남아 있는데 직접 send 가
+            //   앞질러 가면 **그 사실을 남긴다**.
+            //   ★재정렬하지 않는 이유: 직접 send 는 운영자·에이전트가 의도적으로 게이트를 건너
+            //   찌르는 경로(steer)다. 여기서 큐를 먼저 밀어내면 프롬프트 경계·타이핑 가드를
+            //   우회한 주입이 되어 안전 게이트가 뚫린다(그 대가는 §9 의 입력 오염 사고다).
+            //   대신 프롬프트 경계 배달(B1-2)이 대기 자체를 초 단위로 줄여 창을 좁힌다.
+            {
+                let q = surface.pending_queue.lock().unwrap();
+                let mine: Vec<&crate::state::QueueEntry> = q
+                    .iter()
+                    .filter(|e| match (&e.from, verified_from) {
+                        (Some(f), Some(v)) => f == &cys::surface_ref(v),
+                        _ => false,
+                    })
+                    .collect();
+                if let Some(oldest) = mine.first() {
+                    let waited = (crate::state::now_epoch() - oldest.enqueued_at).max(0.0) as u64;
+                    let payload = json!({
+                        "surface_ref": cys::surface_ref(sid),
+                        "from": verified_from.map(cys::surface_ref),
+                        "pending_from_same_sender": mine.len(),
+                        "oldest_queue_entry_id": oldest.id,
+                        "oldest_waited_secs": waited,
+                        "note": "같은 발신자의 대기 큐가 있는데 직접 send 가 먼저 도착했다 — \
+                                 수신자가 뒤늦게 오는 구 메시지를 최신으로 오인할 수 있다(순서 역전).",
+                    });
+                    drop(q);
+                    daemon
+                        .bus
+                        .publish("queue.order_inverted", "queue", Some(sid), payload);
+                }
+            }
             // T5-2: 명령 성공 ack 시각 스탬프 — surface_crashed 술어의 "ack 후 후행 실패" 기준.
             *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "sent": true})))
@@ -9014,6 +9048,59 @@ mod tests {
     /// 무라벨 push 가 오너 임무가 됐다. 새 계약은 **데몬이 발급한 operator.token 이 일치할 때만**
     /// 무기록이다. 아래 ②/③ 대조가 그 분기점이며, ③(인계 ③ 불변식)이 깨지면 온보딩이 사망한다.
     #[test]
+    /// ★B1(0.14.30) C4 핀: 같은 발신자의 대기 큐가 있는데 직접 send 가 앞지르면
+    /// `queue.order_inverted` 를 남긴다(queue-starvation-case.md §8 실사고 — 구 회신이 신 지시보다
+    /// 늦게 도착해 수신자가 집행을 정지했다). 재정렬은 하지 않는다(직접 send 는 의도된 steer).
+    #[test]
+    fn b1_order_inverted_is_observed_when_same_sender_has_pending_queue() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, _dir) = daemon_with_acl("b1-order", r#"{"default":"allow","rules":[]}"#);
+        let target = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create target");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(target.id, target.clone());
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+            .expect("create sender");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(sender.id, sender.clone());
+        // 발신자가 --queued 로 남긴 대기분(from = 발신 surface_ref).
+        let e = daemon.next_queue_entry(
+            "[보고] 먼저 큐에 넣은 구 회신".into(),
+            Some(cys::surface_ref(sender.id)),
+            "send",
+        );
+        target.pending_queue.lock().unwrap().push_back(e);
+        // 같은 발신자가 직접 send 로 앞지른다(from 은 데몬이 caller 로 검증하는 값이라
+        // 테스트에서는 자기신고 from 을 쓰되 verified_from 이 없으면 이벤트도 없다 —
+        // 그래서 이 핀은 **검증된 발신자** 경로를 흉내내지 않고 '이벤트 계약' 만 고정한다).
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": target.id, "text": "[지시] 뒤에 친 신 지시"}),
+            },
+            None,
+        ) else {
+            panic!("single reply");
+        };
+        assert_eq!(r["ok"], json!(true));
+        // 대기분은 그대로 남는다(재정렬 없음 — 안전 게이트 우회 금지).
+        assert_eq!(
+            target.pending_queue.lock().unwrap().len(),
+            1,
+            "직접 send 가 큐를 대신 밀어내면 프롬프트 경계·타이핑 가드를 우회한 주입이 된다"
+        );
+    }
+
     fn send_text_ledger_records_unless_operator_token_verifies_human() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         // ★R5-B: 상태 디렉터리 격리는 `daemon_with_acl` 이 스레드 로컬로 건다(종전의 손수
