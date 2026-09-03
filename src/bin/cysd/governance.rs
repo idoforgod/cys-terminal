@@ -4290,6 +4290,19 @@ fn pop_delivered_head(q: &mut std::collections::VecDeque<crate::state::QueueEntr
     }
 }
 
+/// ★B1(0.14.30): 병합 배달분 제거 — 인계에 성공한 id 집합만 큐에서 뺀다(순서 보존·나머지 유지).
+/// 단건이면 `pop_delivered_head` 와 결과가 같다(머리 1개 제거). 인계 실패 경로에서는 호출되지
+/// 않으므로 '보내지 않은 항목을 지운다' 는 경로가 구조적으로 없다.
+fn pop_delivered_ids(
+    q: &mut std::collections::VecDeque<crate::state::QueueEntry>,
+    ids: &[String],
+) {
+    if ids.is_empty() {
+        return;
+    }
+    q.retain(|e| !ids.iter().any(|id| id == &e.id));
+}
+
 /// queued 배달의 '조용함' 임계(초) — 기본 3초. 출력이 잦은 pane(master 등)에는 큐가
 /// 오래 막힐 수 있어 환경별 조정을 허용한다(CYS_QUEUE_QUIET_SECS).
 fn queue_quiet_secs() -> u64 {
@@ -4773,12 +4786,98 @@ fn wakeup_entry_ids(text: &str) -> Vec<String> {
     out
 }
 
+// ─── ★B1(0.14.30) C3: 발신자별 병합 배달 + 다이제스트 상한 ─────────────────────────────
+//
+// 왜(queue-starvation-case.md §1·§4-ⓑ·§7 Q-C): 배달은 틱당 좌석 1건이라 대기분 N 건이 quiet
+// 순간 N 턴 연속으로 쏟아진다(12h 실측: 155건 중 107건 69% 가 60초 내 3건+ 버스트 · 최대 13건).
+// 수신자는 그 턴을 "지연 배달·이미 답함" 으로 소모했다(29턴/12h). 발신자별로 1턴에 묶으면
+// 시뮬레이션 기준 버스트 턴이 107 → 18 로 줄었다(§2).
+//
+// 그런데 **상한 없는 병합은 주의 희석**이다(§7 Q-C: 최대 13건·11,041자 · "측정 불가 영역").
+// 그래서 건수·문자 상한을 두고 **초과분은 자르지 않고 다음 배달로 이월**한다(유실 0 · §7 수용
+// 기준 ①). 상한은 즉시 복원 가능한 노브다(1 로 두면 종전과 같은 1건 배달).
+//
+// ★순서 계약: 같은 발신자 안의 순서는 큐 순서 그대로 보존한다(§8 이 요구한 축). 서로 다른
+// 발신자 사이의 상대 순서는 병합으로 바뀔 수 있다 — 그 축은 종전에도 '조용해진 시점' 에
+// 좌우돼 보장이 없었고(§8 이 기록한 역전 사고가 그 증거), 대안(인접분만 병합)은 실측 버스트
+// (발신자가 교대로 섞임)에서 감축이 거의 없다. 대신 다이제스트 머리에 발신자를 적어 수신자가
+// 출처를 오해하지 않게 한다.
+
+/// 다이제스트 1회 배달의 최대 항목 수(기본 5 · `CYS_QUEUE_DIGEST_MAX_ITEMS`). 1 = 병합 비활성.
+fn queue_digest_max_items() -> usize {
+    std::env::var("CYS_QUEUE_DIGEST_MAX_ITEMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+        .max(1)
+}
+
+/// 다이제스트 1회 배달의 최대 문자 수(기본 4,000 · `CYS_QUEUE_DIGEST_MAX_CHARS`).
+/// **머리 1건은 이 상한을 넘어도 단독 배달한다** — 자르면 유실이고, 막으면 기아다.
+fn queue_digest_max_chars() -> usize {
+    std::env::var("CYS_QUEUE_DIGEST_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4000)
+        .max(1)
+}
+
+/// 병합 대상 선택(순수) — 큐 순서대로 훑어 **머리와 같은 발신자**인 항목의 인덱스를 모은다.
+/// 머리는 항상 포함하고(0번), 상한(건수·문자)에 닿으면 멈춘다. 반환은 큐 인덱스 오름차순이라
+/// 발신자 내부 순서가 보존된다.
+pub(crate) fn plan_queue_merge(
+    froms: &[Option<String>],
+    chars: &[usize],
+    max_items: usize,
+    max_chars: usize,
+) -> Vec<usize> {
+    if froms.is_empty() {
+        return Vec::new();
+    }
+    let head_from = froms[0].clone();
+    let mut picked = vec![0usize];
+    let mut total = chars.first().copied().unwrap_or(0);
+    for i in 1..froms.len() {
+        if picked.len() >= max_items {
+            break;
+        }
+        if froms[i] != head_from {
+            continue; // 다른 발신자는 이번 다이제스트에 섞지 않는다
+        }
+        let next = total.saturating_add(chars[i]);
+        if next > max_chars {
+            break; // 상한 초과분은 **자르지 않고** 다음 배달로 이월한다(유실 0)
+        }
+        total = next;
+        picked.push(i);
+    }
+    picked
+}
+
+/// 다이제스트 본문 렌더(순수) — 각 항목 원문을 **그대로** 담고 번호만 덧댄다(바이트 보존 =
+/// 원장 sha 전수 대조가 성립하는 조건). 1건이면 원문 그대로 반환한다(종전 배달과 바이트 동일).
+pub(crate) fn render_queue_digest(from: Option<&str>, texts: &[String]) -> String {
+    if texts.len() <= 1 {
+        return texts.first().cloned().unwrap_or_default();
+    }
+    let who = from.unwrap_or("unknown");
+    let mut out = format!("[큐 다이제스트 {}건 · 발신 {}]\n", texts.len(), who);
+    for (i, t) in texts.iter().enumerate() {
+        out.push_str(&format!("[{}/{}] {}\n", i + 1, texts.len(), t));
+    }
+    out
+}
+
 /// ★G1(W2-D): 배달 성과 — deliver_head_locked 의 반환값. queue.deliver RPC(W2-E)가
 /// 응답({queue_entry_id, seq, remaining})을 조립하는 재료를 겸한다.
 #[derive(Debug)]
 pub(crate) struct Delivered {
     pub entry: crate::state::QueueEntry,
     pub remaining: usize,
+    /// ★B1(0.14.30): 이 배달에 함께 실린 항목 id 전량(머리 포함 · 단건이면 1개).
+    pub merged_ids: Vec<String>,
+    /// 실제로 주입된 본문(병합이면 다이제스트 · 단건이면 항목 원문과 동일).
+    pub body: String,
 }
 
 /// ★G1(W2-D): 배달 임계영역 **단일 헬퍼** — watchdog 틱(deliver_queued)과 queue.deliver
@@ -4817,14 +4916,51 @@ pub(crate) fn deliver_head_locked(
         if expect_head_id.is_some_and(|want| want != entry.id) {
             return None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
+        // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
+        //   강제 배달(queue.deliver RPC)과 조준 배달은 **병합하지 않는다** — 운영자가 지목한
+        //   항목 1건만 나가는 것이 그 명령의 계약이다.
+        let merge_on = !forced && expect_head_id.is_none();
+        let picked: Vec<usize> = if merge_on && q.len() > 1 {
+            let froms: Vec<Option<String>> = q.iter().map(|e| e.from.clone()).collect();
+            let chars: Vec<usize> = q.iter().map(|e| e.text.chars().count()).collect();
+            plan_queue_merge(
+                &froms,
+                &chars,
+                queue_digest_max_items(),
+                queue_digest_max_chars(),
+            )
+        } else {
+            vec![0]
+        };
+        let merged: Vec<crate::state::QueueEntry> =
+            picked.iter().filter_map(|&i| q.get(i).cloned()).collect();
+        let texts: Vec<String> = merged.iter().map(|e| e.text.clone()).collect();
+        let body = render_queue_digest(entry.from.as_deref(), &texts);
+        let merged_ids: Vec<String> = merged.iter().map(|e| e.id.clone()).collect();
         // ★B1(0.14.30): 큐 배달만 아는 사실을 원장에 동봉한다 — 원장 한 파일로 전수 지연을
         //   계산할 수 있어야 한다(queue-starvation-case.md §4-ⓓ: enqueue 시각 부재 때문에
         //   그 문서의 표본이 155건 중 18건에 그쳤다).
-        let wait_secs = (now_epoch() - entry.enqueued_at).max(0.0);
+        let now = now_epoch();
+        let wait_secs = (now - entry.enqueued_at).max(0.0);
+        // 원장은 **주입되는 본문 그대로**(합성 포함) 기록한다 — 임무 게이트가 제출 프롬프트의
+        // sha 로 기계 배달을 판별하므로, 합성 본문이 원장에 없으면 그 턴이 오너 입력으로
+        // 오분류된다(§7 Q-D 와 같은 층의 위험). 부분별 사실은 additive 로 함께 싣는다.
+        let parts: Vec<serde_json::Value> = merged
+            .iter()
+            .map(|e| {
+                json!({
+                    "queue_entry_id": e.id,
+                    "queue_seq": e.seq,
+                    "enqueued_at": e.enqueued_at,
+                    "wait_secs": (now - e.enqueued_at).max(0.0),
+                    "chars": e.text.chars().count(),
+                })
+            })
+            .collect();
         crate::delivery::record_audited_with(
             daemon,
             s.id,
-            &entry.text,
+            &body,
             crate::delivery::Origin::Queue,
             None,
             &json!({
@@ -4832,19 +4968,22 @@ pub(crate) fn deliver_head_locked(
                 "queue_seq": entry.seq,
                 "enqueued_at": entry.enqueued_at,
                 "wait_secs": wait_secs,
+                "digest_items": merged.len(),
+                "digest_parts": parts,
             }),
         );
         let req = crate::state::WriteReq::Inject {
-            text: entry.text.clone(),
+            text: body.clone(),
             cr_delay_ms: 400,
             clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
         };
         if s.write_tx.try_send(req).is_err() {
             return None; // 인계 실패 — 메시지 보존, 다음 틱 재시도
         }
-        // ★G1(W2-A): pop 판정은 방금 인계한 항목의 **id** — 동일 텍스트 중복 항목 오삼킴 차단.
-        pop_delivered_head(&mut q, &entry.id);
-        Delivered { entry, remaining: q.len() }
+        // ★G1(W2-A)+B1: pop 판정은 방금 인계한 항목의 **id 집합** — 동일 텍스트 중복 항목
+        //   오삼킴을 차단하면서 병합분 전체를 한 번에 제거한다(단건이면 종전과 동일 동작).
+        pop_delivered_ids(&mut q, &merged_ids);
+        Delivered { entry, remaining: q.len(), merged_ids, body }
     };
     // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
     *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
@@ -4860,7 +4999,9 @@ pub(crate) fn deliver_head_locked(
     // ★G1(W2-B): payload는 공용 빌더 — 기존 4키 불변 + queue_entry_id/seq/enqueued_at/
     // delivered_at/wait_secs additive. W-id 에코는 **원문 text 스캔** 그대로다.
     // ★G1(W2-D): overdue/forced 는 이벤트 층 additive — 원장(delivery.rs)은 무변경.
-    let entry_ids = wakeup_entry_ids(&delivered.entry.text);
+    // ★B1: W-id 스캔은 **실제 주입된 본문**에서 한다 — 병합분의 W-id 가 하나라도 빠지면
+    //   javis_wakeup 의 critical-tier 가 disarm 되지 못해 그 사건이 TTL 마다 영구 재enqueue 된다.
+    let entry_ids = wakeup_entry_ids(&delivered.body);
     daemon.bus.publish(
         "queue.delivered",
         "queue",
@@ -4873,6 +5014,7 @@ pub(crate) fn deliver_head_locked(
             now_epoch(),
             overdue,
             forced,
+            &delivered.merged_ids,
         ),
     );
     // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
@@ -8143,6 +8285,132 @@ mod tests {
             s.pending_queue.lock().unwrap().len(),
             1,
             "판정 불능은 배달 방향으로 열리지 않는다(fail-closed)"
+        );
+    }
+
+    // ─────────── ★B1(0.14.30) C3: 발신자별 병합·다이제스트 상한 핀(b1_merge_*) ───────────
+
+    use super::{plan_queue_merge, render_queue_digest};
+
+    /// 같은 발신자만 모으고 상한(건수)에서 멈춘다 — 다른 발신자는 섞이지 않는다.
+    #[test]
+    fn b1_merge_plan_picks_same_sender_up_to_item_cap() {
+        let froms = vec![
+            Some("surface:19".to_string()),
+            Some("surface:12".to_string()),
+            Some("surface:19".to_string()),
+            Some("surface:19".to_string()),
+            None,
+            Some("surface:19".to_string()),
+        ];
+        let chars = vec![10, 10, 10, 10, 10, 10];
+        assert_eq!(
+            plan_queue_merge(&froms, &chars, 3, 10_000),
+            vec![0, 2, 3],
+            "머리와 같은 발신자만 큐 순서대로 · 건수 상한에서 정지"
+        );
+        assert_eq!(
+            plan_queue_merge(&froms, &chars, 1, 10_000),
+            vec![0],
+            "상한 1 = 병합 비활성(종전 1건 배달과 동일)"
+        );
+    }
+
+    /// 문자 상한을 넘는 항목은 **자르지 않고** 이월한다(유실 0 · §7 수용 기준 ①).
+    #[test]
+    fn b1_merge_plan_carries_over_instead_of_truncating() {
+        let froms = vec![Some("a".into()), Some("a".into()), Some("a".into())];
+        let chars = vec![3000, 1500, 100];
+        let picked = plan_queue_merge(&froms, &chars, 5, 4000);
+        assert_eq!(picked, vec![0], "3000+1500 > 4000 → 둘째부터 이월");
+        // 머리 단독이 상한을 넘어도 배달은 막지 않는다(막으면 그 자체가 기아다).
+        let big = vec![Some("a".into()), Some("a".into())];
+        assert_eq!(plan_queue_merge(&big, &[9000, 10], 5, 4000), vec![0]);
+    }
+
+    /// 발신자가 없는(None) 항목끼리도 같은 축으로 묶인다 — 판정은 값 동등성 하나다.
+    #[test]
+    fn b1_merge_plan_treats_missing_sender_as_its_own_group() {
+        let froms = vec![None, Some("a".into()), None];
+        assert_eq!(plan_queue_merge(&froms, &[1, 1, 1], 5, 4000), vec![0, 2]);
+    }
+
+    /// 다이제스트는 각 항목 **원문을 그대로** 담는다(바이트 보존 = sha 전수 대조 성립 조건).
+    #[test]
+    fn b1_merge_digest_preserves_every_item_verbatim() {
+        let texts = vec![
+            "[보고] 첫째 줄\n둘째 줄".to_string(),
+            "[질의] 백틱 `echo` 와 따옴표 \"큰\" 보존".to_string(),
+        ];
+        let out = render_queue_digest(Some("surface:19"), &texts);
+        for t in &texts {
+            assert!(out.contains(t), "원문이 변형됐다 — sha 대조가 깨진다: {out}");
+        }
+        assert!(out.contains("[1/2]") && out.contains("[2/2]"), "항목 번호 부재: {out}");
+        assert!(out.contains("surface:19"), "발신자 표기 부재: {out}");
+    }
+
+    /// 1건이면 종전과 **바이트 동일**(다이제스트 머리말을 붙이지 않는다 — 무회귀).
+    #[test]
+    fn b1_merge_single_item_is_byte_identical() {
+        let one = vec!["[보고] 단건".to_string()];
+        assert_eq!(render_queue_digest(Some("surface:19"), &one), "[보고] 단건");
+        assert_eq!(render_queue_digest(None, &[]), "");
+    }
+
+    /// 배달 경로 통합: 같은 발신자 3건이 **한 턴**으로 나가고 큐가 비며, 원장에 부분별 사실이
+    /// 남는다(버스트 봉인 · 유실 0 의 기계 증거).
+    #[test]
+    fn b1_merge_delivers_same_sender_burst_in_one_turn() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("merge");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_DIGEST_MAX_ITEMS", "5"),
+            ("CYS_QUEUE_DIGEST_MAX_CHARS", "4000"),
+        ]);
+        let (daemon, s) = marker_seat("b1-merge");
+        // 머리(marker_seat 가 넣은 1건)는 from=None 이므로 같은 축(None)으로 2건 더 넣는다.
+        for i in 0..2 {
+            let e = daemon.next_queue_entry(format!("[보고] 추가 {i}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        // 다른 발신자 1건 — 섞이면 안 된다.
+        let other = daemon.next_queue_entry(
+            "[다른발신] 섞이면 안 된다".into(),
+            Some("surface:99".into()),
+            "test",
+        );
+        s.pending_queue.lock().unwrap().push_back(other);
+        paint_prompt(&s, "", "");
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "같은 발신자 3건이 한 턴으로 나가고 다른 발신자 1건만 남아야 한다"
+        );
+        let ev = daemon
+            .bus
+            .tail(30)
+            .into_iter()
+            .find(|e| e["name"] == "queue.delivered")
+            .expect("배달 이벤트");
+        assert_eq!(ev["payload"]["merged"], serde_json::json!(3));
+        let path = crate::delivery::ledger_path(&daemon.socket_path);
+        let body = std::fs::read_to_string(&path).expect("원장");
+        let rec: serde_json::Value = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["digest_items"] == serde_json::json!(3))
+            .unwrap_or_else(|| panic!("다이제스트 레코드 부재: {body}"));
+        assert_eq!(
+            rec["digest_parts"].as_array().map(|a| a.len()),
+            Some(3),
+            "부분별 사실이 원장에 남아야 전수 지연·유실 0 을 사후 계산할 수 있다"
         );
     }
 

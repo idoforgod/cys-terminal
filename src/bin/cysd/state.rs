@@ -175,9 +175,15 @@ pub fn queue_delivered_payload(
     delivered_at: f64,
     overdue: bool,
     forced: bool,
+    merged: &[String],
 ) -> Value {
     json!({
         "bytes": entry.text.len(),
+        // ★B1(0.14.30): 이 배달에 **함께 실린** 항목 id 전량(머리 포함 · 단건이면 1개).
+        //   병합 배달(발신자별 다이제스트)에서 소비자가 "몇 건이 한 턴에 갔나" 를 알아야
+        //   버스트 감축을 사후 측정할 수 있다(수용 기준 ③ 버스트 0).
+        "merged_ids": merged,
+        "merged": merged.len(),
         "remaining": remaining,
         "entry_ids": wakeup_ids,
         "surface_ref": surface_ref,
@@ -6973,7 +6979,7 @@ mod tests {
     fn queue_delivered_payload_pins_wid_echo_and_wait_clamp() {
         let e = w2b_entry("qc.9", 9, "[wakeup W-a1b2] 보고", 100.0);
         let wids = vec!["W-a1b2".to_string()];
-        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9, false, false);
+        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9, false, false, &[e.id.clone()]);
         assert_eq!(p["bytes"], json!(e.text.len()), "기존 키 bytes 불변");
         assert_eq!(p["remaining"], json!(4), "기존 키 remaining 불변");
         assert_eq!(
@@ -6995,14 +7001,14 @@ mod tests {
         assert_eq!(p["overdue"], json!(false), "additive overdue — 정상 배달은 false");
         assert_eq!(p["forced"], json!(false), "additive forced — watchdog 배달은 false");
         // W-id 봉입 없는 일반 배달 = 빈 배열(키는 항상 존재 — 에코 계약).
-        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0, false, false);
+        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0, false, false, &[e.id.clone()]);
         assert_eq!(p0["entry_ids"], json!([] as [&str; 0]));
         assert_eq!(p0["wait_secs"], json!(0), "시계 역행(delivered < enqueued)은 0 클램프");
         // overdue(단계형 제한 배달)·forced(운영자 강제) 표기는 이벤트 층에서만 구분된다.
-        let po = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, true, false);
+        let po = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, true, false, &[e.id.clone()]);
         assert_eq!(po["overdue"], json!(true));
         assert_eq!(po["forced"], json!(false));
-        let pf = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, false, true);
+        let pf = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, false, true, &[e.id.clone()]);
         assert_eq!(pf["forced"], json!(true));
         // W-id 에코·기존 키는 overdue/forced 와 무관하게 동일(계약 불변).
         assert_eq!(po["bytes"], p["bytes"]);
