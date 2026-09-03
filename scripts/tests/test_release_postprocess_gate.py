@@ -400,17 +400,13 @@ class DmgAxisTests(unittest.TestCase):
         self.assertLess(i_axis, i_attach, "⑦ 가 hdiutil attach 뒤로 밀렸다")
         # ⑦-b 는 ④ 와 같은 관례로 full 모드에서만 돈다(측정 불능을 통과로 세지 않는다).
         self.assertIn('if [ "$MODE" = "full" ]', src)
-        # ★R2 교정 핀(2026-09-04 · codex 감사 REVISE ①) — 문서-동작 정합을 기계가 지킨다.
-        #   기본(발행) 모드의 degraded 는 F2 폐쇄(exit 2)가 ⑦ 보다 **앞**이라 ⑦ 이 실행되지 않는다.
-        #   그래서 ⑦-a 는 "모드 무관"이 아니라 "full·--diagnose-degraded-ok 두 모드에서만" 돈다.
-        #   순서가 뒤집히거나 옛 '모드 무관' 문안이 되돌아오면 절차서가 다시 거짓이 되므로 여기서 잡는다.
+        # ★기본(발행) 모드의 degraded 는 F2 폐쇄(exit 2)가 ⑦ 보다 앞이라 ⑦ 이 실행되지 않는다.
+        #   그 순서가 뒤집히면 fail-closed 이전에 ⑦ 가 도는 동작 회귀다 — 위 quarantine·attach
+        #   순서 핀과 같은 계급이라 여기서 잡는다.
+        #   (주석 문구 자체를 매칭하던 단언은 2026-09-04 오너 지시 §4 '텍스트 매칭 게이트 신설
+        #    금지'에 따라 제거했다 — 게이트는 시스템의 실제 동작을 재는 것만 둔다.)
         i_f2_close = src.index("✗ degraded(spctl assessments disabled)")
-        self.assertLess(i_f2_close, i_axis,
-                        "F2 degraded 폐쇄가 ⑦ 뒤로 밀렸다 — 머리말·docs/RELEASE.md 서술도 함께 고쳐야 한다")
-        # assertNotIn 이 아니라 assertFalse 다 — 전자는 실패 시 소스 전문(수만 자)을 덤프해
-        # CI 로그를 못 읽게 만든다(2026-09-04 실측 42KB). 판정은 같고 메시지만 짧다.
-        self.assertFalse("⑦-a 는 모드 무관" in src,
-                         "머리말이 옛 '모드 무관' 약속으로 회귀했다(R2 교정 되돌림)")
+        self.assertLess(i_f2_close, i_axis, "F2 degraded 폐쇄가 ⑦ 뒤로 밀렸다")
 
     # ── (b) 음성 대조 — darwin 한정 ───────────────────────────────────────
     @unittest.skipUnless(sys.platform == "darwin",
