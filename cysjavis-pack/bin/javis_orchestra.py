@@ -1441,13 +1441,16 @@ def todo_file_name(role):
     return "%s_TODO.md" % role.upper().replace("-", "_")
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
     tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
     probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
     삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
-    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증)."""
+    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증).
+    task_id(#10 · PREP #10): 장부(`javis_task.py`) 태스크 id. 지정 시 E1·P3 블록의 `<id>`·`<task-id>`
+    **플레이스홀더를 실 id 로 치환**하고 증거 경로도 그 id 로 확정한다. 미지정이면 종전 문안 그대로
+    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
@@ -1520,20 +1523,31 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     #   --task 없는 무-task 영수증은 done 대조에서 대상 불일치로 거부된다. task-prompt는 작업
     #   서술만 알고 장부 task-id를 모르므로 `<task-id>` 플레이스홀더로 출력하고 워커가 치환한다.
     if probes:
-        lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
-                     "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
-                     "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
-                     "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
-                     "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
+        if task_id:
+            lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                         "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                         "--task %s …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                         "미실행·FAIL 시 done 거부." % (", ".join(probes), task_id))
+        else:
+            lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                         "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                         "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                         "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
+                         "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
         lines.append("  ⚠ relaxed probe(submit·ctx-compare·kill-preflight)는 `--task` 없이 "
                      "실행하면 무-task 영수증이 되어 done 대조에서 대상 불일치로 거부된다 — "
                      "반드시 --task를 동반하라.")
     # E1 증거의 기계화(설계 §E1): 태스크 done 전이는 실제 검증 산출물 파일을 제출해야 통과(strict).
+    # ★#10(PREP #10): 장부 id 를 알면 플레이스홀더를 남기지 않는다 — 워커가 `<id>` 를 그대로 두고
+    #   done 을 치면 게이트가 대상 불일치로 거부하고, 그 실패는 티켓을 읽은 시점이 아니라 **완료
+    #   보고 직전**에 드러나 재작업이 된다. 발부자가 아는 값을 발부 시점에 박는 것이 정위치다.
+    _tid = task_id or "<id>"
+    _ev_dir = "_round/evidence/%s/" % (task_id or "<task-id>")
     lines.append("완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물"
-                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 "
-                 "`javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — "
+                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `%s`)을 만들고 "
+                 "`javis_task.py set-status %s done --evidence-artifact <경로>`로 제출하라 — "
                  "파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 "
-                 "--skip-reason, skip_audit.jsonl 감사 기록).")
+                 "--skip-reason, skip_audit.jsonl 감사 기록)." % (_ev_dir, _tid))
     if prereq_block:
         lines.append("")
         lines.append(prereq_block)
@@ -1590,11 +1604,24 @@ def cmd_task_prompt(args):
         _split_csv(getattr(args, "requires_skills", None)),
         _split_csv(getattr(args, "related_memory", None)),
         os.path.join(pack_dir(), "memory"))
+    # ★#10(PREP #10) 장부 id — 지정 시 E1·P3 플레이스홀더를 실 id 로 확정하고, 미지정이면
+    #   **그 사실을 stderr 1줄로 고지**한다. 종전에는 `<id>`·`<task-id>` 가 조용히 그대로 나가서
+    #   워커가 치환을 잊으면 done 게이트가 대상 불일치로 거부했다(실패가 완료 보고 직전에 드러남).
+    #   stdout(티켓 본문)은 오염시키지 않는다 — 발부 파이프라인이 그대로 소비한다.
+    task_id = getattr(args, "task_id", None)
+    if task_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", task_id):
+        print("[task-prompt] --task-id 는 영숫자·.·_·- 만 허용: %r" % task_id, file=sys.stderr)
+        return 2
+    if not task_id:
+        print("[task-prompt] 장부 task id 미지정 — 티켓의 <id>/<task-id> 플레이스홀더를 워커가 "
+              "스스로 치환해야 한다(javis_task.py create 로 등재 후 --task-id 전달 권장 · PREP #10)",
+              file=sys.stderr)
     print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
                             output_format=getattr(args, "output_format", None),
                             prereq_block=prereq, dont=getattr(args, "dont", None),
                             tier_hint=getattr(args, "tier", None),
-                            probes=_split_csv(getattr(args, "probes", None))))
+                            probes=_split_csv(getattr(args, "probes", None)),
+                            task_id=task_id))
     return 0
 
 
@@ -2475,6 +2502,23 @@ def cmd_self_test(args):
         # E1·P3 공존: probes 지정 시에도 E1 블록이 함께 존재(둘 다 명시)
         assert "완료 증거(E1 evidence-artifact 게이트" in tp_probe and "done 증거 게이트(P3)" in tp_probe, \
             "E1·P3 evidence 게이트 공존 실패"
+        # ★#10(PREP #10) --task-id: 지정 시 플레이스홀더가 실 id 로 확정되고, 미지정 시 종전
+        #   문안이 **byte-동일**로 남는다(하위호환). 두 방향을 함께 못박는다 — 한쪽만 보면
+        #   "항상 치환" 또는 "항상 플레이스홀더" 구현이 만점을 받는다.
+        _tk_noid = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                     probes=["submit"])
+        _tk_id = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                   probes=["submit"], task_id="t-abc.1")
+        assert "set-status <id> done" in _tk_noid and "<task-id>" in _tk_noid, \
+            "task_id 미지정인데 플레이스홀더가 사라졌다(하위호환 위반)"
+        assert "set-status t-abc.1 done" in _tk_id, "task_id 지정인데 E1 set-status 가 미치환"
+        assert "_round/evidence/t-abc.1/" in _tk_id, "task_id 지정인데 증거 경로가 미치환"
+        assert "--task t-abc.1" in _tk_id, "task_id 지정인데 probe --task 가 미치환"
+        assert "<id>" not in _tk_id and "<task-id>" not in _tk_id, \
+            "task_id 지정인데 플레이스홀더가 잔존(워커가 치환을 잊으면 done 게이트가 거부한다)"
+        assert build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES) == \
+            build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES, task_id=None), \
+            "task_id=None 이 기본값과 다른 티켓을 만든다(byte-동일 계약 위반)"
         # 폴백 단독으로도 4규칙 마커 전부를 갖는다(디렉티브 부재 환경의 최후 방어선)
         fb = "\n".join(FALLBACK_RULES)
         for mark in RULE_MARKERS:
@@ -3138,6 +3182,10 @@ def main():
                     help="이 태스크의 필수 probe 목록(쉼표 구분 — 예: 'submit,artifact'). 지정 시 "
                          "티켓에 done 전 각 probe PASS 영수증 필수 블록 삽입(P3 · 설계 §2.2·§4 컴포넌트 C·"
                          "javis_actprobe.py 대조). 미지정 시 블록 부재 → 티켓 byte-동일(하위호환)")
+    tp.add_argument("--task-id", dest="task_id", default=None,
+                    help="장부(javis_task.py) 태스크 id — 지정 시 티켓의 E1·P3 플레이스홀더"
+                         "(<id>·<task-id>)를 실 id 로 확정하고 증거 경로도 그 id 로 박는다(PREP #10). "
+                         "미지정 시 티켓은 종전과 byte-동일이고 stderr 로 1줄 고지한다.")
     tp.add_argument("--no-survival-gate", action="store_true",
                     help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
                          "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")
