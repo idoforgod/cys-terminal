@@ -214,6 +214,11 @@ jobs:
       - name: Version SOT check (drift hard-gate)
         shell: bash
         run: |
+          # ★음성 대조 선행(2026-09-04 W-C R2 ②): 아래 version-check.sh 를 발행 차단 근거로
+          #   신뢰하기 **직전에**, 그 게이트가 8곳 중 하나만 누락돼도 실제로 죽는지 증명한다.
+          #   통과만 보이는 게이트는 '언제나 초록인 검사'와 구별되지 않는다. 하네스는 임시
+          #   디렉터리 사본만 변조하므로 작업 트리를 건드리지 않는다(stdlib 전용·네트워크 0).
+          python3 scripts/tests/test_version_sot_mutation.py
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             sh scripts/version-check.sh "$GITHUB_REF_NAME"
           else

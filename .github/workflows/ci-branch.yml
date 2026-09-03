@@ -129,6 +129,15 @@ jobs:
                   "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
                   "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다.",
               ),
+              "test_version_sot_mutation": (
+                  {"ci-branch", "release"},
+                  "버전 SOT 8곳 게이트(scripts/version-check.sh)의 음성 대조. 팩-only 레인은 본체 "
+                  "버전을 범프하지 않고 version-check 도 돌리지 않는다 — scripts/release-lane-check.sh "
+                  "가 PACK-ONLY 판정에서 '버전 8곳 범프 불요·version-check 불요'라고 명시한다. "
+                  "그 레인에 편입하면 그 레인이 쓰지도 않는 게이트를 검증하는 근거 없는 목록이 된다. "
+                  "ci-branch = 브랜치 조기 경보 · release = 그 게이트를 발행 차단 근거로 신뢰하기 "
+                  "직전 증명의 2레인 편입.",
+              ),
               "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -554,6 +563,21 @@ jobs:
           f="scripts/tests/test_verify_win_crt.py"
           [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           echo "== test_verify_win_crt (mac) =="
+          python3 "$f"
+
+      # ★버전 SOT 게이트의 음성 대조(2026-09-04 W-C R2 ②). scripts/version-check.sh 는 발행을
+      #   차단하는 hard-gate 인데, 그 게이트가 **무력해지는 회귀**(selector 오조준·판정식 완화)는
+      #   통과 경로만 봐서는 보이지 않는다. 8 selector 를 하나씩 구버전으로 되돌린 변조 8종이
+      #   전부 비영 종료하는지 + 무변조 사본은 통과하는지(양성 대조)를 여기서 잡는다.
+      #   임시 디렉터리 사본만 변조 · stdlib 전용 · 네트워크 0 · 실측 1초 미만.
+      #   pack-release 미편입 사유는 위 '팩 스위트 레인 대조' ALLOWED 등재 참조.
+      - name: 버전 SOT 게이트 음성 대조 (mutation · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_version_sot_mutation.py"
+          [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          echo "== test_version_sot_mutation (mac) =="
           python3 "$f"
 
       # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
