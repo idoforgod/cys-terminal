@@ -296,7 +296,10 @@ def _git_show(relpath, ref=None):
       (G30·G31·G32·P3-A-FILLER 의 문구면)은 그 트리에서 이미 수리돼 있어 탐지기가 FIRE 하지
       않는다 — 그 경우 계측 대조는 **W0 이전 트리**(`PRE_W0_REF`)로 해야 유효하다. 잘못된 기준에서
       "구 코드가 안 잡힌다"는 결과는 탐지기 파손이 아니라 기준 선택 오류다(오보 방지)."""
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    # ★`.git` 은 디렉터리가 아닐 수 있다 — **worktree 체크아웃에서는 파일**(gitdir 포인터)이다.
+    #   isdir 로 게이트하면 worktree 에서 전 검체의 계측 대조가 조용히 skip 되어, "구 코드가
+    #   결함을 재현하는가" 를 아무도 재지 않은 채 GREEN 이 난다(계측 타당성 무효화).
+    if not os.path.exists(os.path.join(REPO_DIR, ".git")):
         return None
     r = _run(["git", "-C", REPO_DIR, "show", "%s:%s" % (ref or CALIBRATION_REF, relpath)],
              timeout=30)
@@ -8205,36 +8208,198 @@ def h_obs_2():
 
 
 
-@specimen("H-OBS-3", "W1a", "다중 세션 카운트가 comm=claude 프로세스를 계수", ["G33"])
+# ── A1(G34) 공용 목 하네스: ps 3형태 픽스처 + lsof AND/OR 분기 ─────────────────
+# 픽스처 8행 중 cwd==proj 는 6행(claude 3형태 + codex·zsh·python3)이고 그중 **claude 형태만**
+# 3행이다. 목 lsof 는 호출 형태로 갈린다 — `-p <csv>` 면 그 pid 의 cwd 만(신 훅 = AND),
+# `-c` 만이면 **전 프로세스 cwd**(구 훅 = OR 과대계수 재현). 그래서 같은 목 하나로 신·구를
+# 나란히 돌려 "정답 3 vs 과대계수 6" 을 실행 시점에 재현한다(MEMORY 계측 타당성 3칙).
+def _a1_mock_env(tmp):
+    """반환 (env, proj) — 목 ps/lsof 가 PATH 선두에 있는 격리 실행 환경."""
+    proj = os.path.join(tmp, "proj")
+    other = os.path.join(tmp, "other")
+    os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
+    os.makedirs(other, exist_ok=True)
+    _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
+    fx = os.path.join(tmp, "fixture.tsv")
+    rows = [
+        ("101", "claude", "claude --dangerously-skip-permissions", proj),          # ⓐ 런처(comm)
+        ("102", "/x/.local/bin/claude", "/x/.local/bin/claude --flag", proj),      # ⓐ 런처(경로)
+        ("103", "node", "node /x/lib/node_modules/@anthropic-ai/claude-code/cli.js", proj),  # ⓑ npm
+        ("104", "node", "node /x/.local/bin/codex --dangerously-bypass", proj),    # 음성: codex 도 node
+        ("105", "zsh", "-zsh", proj),                                              # 음성: cwd 만 일치
+        ("106", "python3", "python3 x.py", proj),                                  # 음성: cwd 만 일치
+        ("107", "/x/.local/share/", "/x/.local/share/claude/versions/2.1.259 -p", other),  # ⓒ 버전경로
+        ("108", "claude", "claude", other),                                        # 타 cwd
+    ]
+    with open(fx, "w", encoding="utf-8", newline="\n") as f:
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+    binp = os.path.join(tmp, "mockbin")
+    _w(os.path.join(binp, "ps"),
+       '#!/bin/sh\nawk -F"\\t" \'{printf "%5s %s %s\\n", $1, $2, $3}\' "' + fx + '"\n')
+    _w(os.path.join(binp, "lsof"),
+       '#!/bin/sh\n'
+       'mode=all; pids=""\n'
+       'while [ $# -gt 0 ]; do\n'
+       '  case "$1" in -p) mode=pids; pids="$2"; shift;; esac\n'
+       '  shift\n'
+       'done\n'
+       'if [ "$mode" = pids ]; then\n'
+       '  echo "$pids" | tr "," "\\n" | while read -r p; do\n'
+       '    awk -F"\\t" -v p="$p" \'$1==p {print "p" $1; print "n" $4}\' "' + fx + '"\n'
+       '  done\n'
+       'else\n'
+       '  awk -F"\\t" \'{print "p" $1; print "n" $4}\' "' + fx + '"\n'
+       'fi\n')
+    env = _base_env({"HOME": os.path.join(tmp, "home"),
+                     "CYS_PACK_DIR": os.path.join(tmp, "nopack"),
+                     "PATH": binp + os.pathsep + os.environ.get("PATH", "")})
+    return env, proj
+
+
+@specimen("H-OBS-3", "W1a",
+          "다중 세션 카운트가 ps 로 claude 3형태만 고르고 lsof -a -p 로 cwd 를 AND 판정", ["G33", "G34"])
 def h_obs_3():
     body = _read(os.path.join(HOOKS_DIR, "inject-context.sh"))
-    need("-c claude" in body, "lsof 계측이 claude 프로세스를 세지 않는다(계측기 타당성)")
+    need("lsof -a -p" in body,
+         "lsof 선택자 AND(`-a -p`)가 없다 — `-c … -d cwd` 는 OR 이라 cwd 만 맞으면 전부 센다")
+    need("lsof -c node -c claude" not in body, "구식 OR 선택자(`-c node -c claude`) 잔존")
+    need("ps -eo" in body, "pid 선택이 ps 로 넘어오지 않았다(네이티브 claude 는 lsof COMMAND 가 버전 문자열)")
     with tempfile.TemporaryDirectory() as tmp:
+        env, proj = _a1_mock_env(tmp)
+        payload = json.dumps({"source": "clear", "cwd": proj})
+        r = _run([BASH, _hook("inject-context.sh")], env=env, input=payload)
+        need(r.returncode == 0, "훅이 비0 종료(%d): %r" % (r.returncode, r.stderr[-300:]))
+        need("동시에 도는 claude 세션이 3개 감지됨" in r.stdout,
+             "claude 3형태(런처·npm node·버전경로)만 정확히 계수하지 못했다: %r" % r.stdout[-500:])
+        # ── 계측 타당성(음성 대조): 구 훅을 **같은 목**에 돌리면 과대계수가 나야 한다 ──
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh")
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r2 = _run([BASH, os.path.join(oldd, "inject-context.sh")], env=env, input=payload)
+            m = re.search(r"세션이 (\d+)개 감지됨", r2.stdout)
+            need(m is not None and int(m.group(1)) >= 5,
+                 "계측 타당성 실패: 구 훅이 같은 목에서 과대계수를 내지 않는다 — 목이 결함을 "
+                 "재현하지 못하므로 신 훅의 '3' 은 아무것도 증명하지 않는다: %r" % r2.stdout[-400:])
+            calib = "구 훅 과대계수 %s 재현" % m.group(1)
+    return "목 ps/lsof 로 claude 3형태만 계수(정답 3) · 계측검증=%s" % calib
+
+
+@specimen("H-SOUL-LANE-1", "W1a", "soul 해소가 레인 팩(CYS_PACK_DIR/soul.md)을 본부 soul 보다 앞세운다",
+          ["A4-15"])
+def h_soul_lane_1():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        lane = os.path.join(tmp, "lanepack")          # ★`pack-dept-` 접두 회피(부서 분기 무개입)
         proj = os.path.join(tmp, "proj")
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
-        binp = os.path.join(tmp, "bin")
-        # 목 lsof: `-c claude` 가 인자에 있을 때만 cwd 행 2개를 낸다(=네이티브 claude 2세션)
-        _w(os.path.join(binp, "lsof"),
-           '#!/bin/sh\nfor a in "$@"; do [ "$a" = claude ] && '
-           '{ printf "n%%s\\nn%%s\\n" "%s" "%s"; exit 0; }; done\nexit 0\n' % (proj, proj))
-        for tool in ("sed", "grep", "date", "wc", "tr", "awk", "head", "tail", "cat",
-                     "dirname", "basename", "ls", "rm", "mkdir", "python3", "sh", "bash"):
-            src = shutil.which(tool)
-            if src and not os.path.exists(os.path.join(binp, tool)):
-                os.symlink(src, os.path.join(binp, tool))
-        env = _base_env({"HOME": os.path.join(tmp, "home"), "PATH": binp,
-                         "CYS_PACK_DIR": os.path.join(tmp, "nopack")})
-        r = _run([BASH, _hook("inject-context.sh")], env=env,
-                 input=json.dumps({"source": "clear", "cwd": proj}))
-        need("동시에 도는 claude 세션이 2개 감지됨" in r.stdout,
-             "claude 세션 2개를 계수하지 못했다: %r" % r.stdout[-500:])
-    calib = "skip(no-git)"
-    old = _git_show("cysjavis-pack/hooks/inject-context.sh")
-    if old is not None:
-        need("-c claude" not in old, "계측 타당성 실패: 구 코드가 이미 claude 를 셌다")
-        calib = "구 코드 node 전용 계측 확인"
-    return "목 lsof 로 claude 2세션 계수 확인 · 계측검증=%s" % calib
+        _w(os.path.join(home, ".claude", "soul.md"),
+           "# hq\n## [HQ-ANCHOR]\nHQ-SOUL-MARKER\n", 0o644)
+        _w(os.path.join(lane, "soul.md"),
+           "# lane\n## [LANE-ANCHOR]\nLANE-SOUL-MARKER\n", 0o644)
+        payload = json.dumps({"source": "startup", "cwd": proj})
+        env = _base_env({"HOME": home, "CYS_PACK_DIR": lane})
+        r = _run([BASH, _hook("inject-context.sh")], env=env, input=payload)
+        need(r.returncode == 0, "훅이 비0 종료(%d)" % r.returncode)
+        need("LANE-SOUL-MARKER" in r.stdout, "레인 soul 이 주입되지 않았다: %r" % r.stdout[:400])
+        need("HQ-SOUL-MARKER" not in r.stdout,
+             "레인 pane 인데 **본부 soul** 이 주입됐다(레인 정체가 덮인다): %r" % r.stdout[:400])
+        # 회귀 0: 레인에 soul 이 없으면 종전대로 레거시 ~/.claude/soul.md 로 폴백한다
+        nosoul = os.path.join(tmp, "lanepack-nosoul")
+        os.makedirs(nosoul, exist_ok=True)
+        r2 = _run([BASH, _hook("inject-context.sh")],
+                  env=_base_env({"HOME": home, "CYS_PACK_DIR": nosoul}), input=payload)
+        need("HQ-SOUL-MARKER" in r2.stdout,
+             "레인 soul 부재 시 레거시 폴백이 끊겼다(회귀): %r" % r2.stdout[:400])
+        # 계측 타당성: 구 훅은 같은 조건에서 **본부 soul** 을 주입해야 한다(결함 재현)
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh")
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r3 = _run([BASH, os.path.join(oldd, "inject-context.sh")], env=env, input=payload)
+            need("HQ-SOUL-MARKER" in r3.stdout,
+                 "계측 타당성 실패: 구 훅이 같은 조건에서 본부 soul 을 주입하지 않는다 — "
+                 "결함 미재현: %r" % r3.stdout[:400])
+            calib = "구 훅 본부 soul 주입 재현"
+    return "레인 soul 우선 · 부재 시 레거시 폴백 보존 · 계측검증=%s" % calib
+
+
+@specimen("H-LANE-GUARD-1", "W1a",
+          "레인 가드가 **타 팩** 훅만 조기 종료하고 같은 팩·비-팩 레인·opt-out·사용자 오버레이는 통과",
+          ["A4-16"])
+def h_lane_guard_1():
+    lib = _read(os.path.join(HOOKS_DIR, "_lib.sh"))
+    need("cys_lane_guard" in lib, "레인 가드가 프리루드에 없다")
+    need("hooks/_lib.sh" in lib, "판별자가 양쪽 대칭(`<루트>/hooks/_lib.sh` 실재)으로 서술돼 있지 않다")
+    MSG = "타 레인 팩 훅 조기 종료"
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
+        _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
+        payload = json.dumps({"source": "clear", "cwd": proj})
+        hook = _hook("inject-context.sh")
+
+        def run(pack, extra=None, path=hook):
+            e = {"HOME": home, "CYS_PACK_DIR": pack}
+            if extra:
+                e.update(extra)
+            return _run([BASH, path], env=_base_env(e), input=payload)
+
+        # ① 양성 — 진짜 다른 팩(hooks/_lib.sh 실재) 레인에서 본부 훅이 발화 → 조기 종료
+        other = os.path.join(tmp, "otherpack")
+        _w(os.path.join(other, "hooks", "_lib.sh"), lib, 0o644)
+        r1 = run(other)
+        need(r1.returncode == 0, "조기 종료가 exit 0 이 아니다(%d)" % r1.returncode)
+        need(r1.stdout == "",
+             "타 레인 팩 훅인데 가드가 발화하지 않았다(주입 누수): %r" % r1.stdout[:300])
+        # ①' stderr 문구는 **프리루드를 직접 로드하는** 경로에서 잰다 — 훅의 규약 문장은
+        #    `. "…/_lib.sh" 2>/dev/null` 이라 source 명령 전체의 stderr 가 억제된다(그 억제는
+        #    이 커밋 범위 밖의 기존 계약이다). 문구가 실재한다는 사실 자체는 여기서 못박는다.
+        hookpack = os.path.join(tmp, "hookpack")      # 훅 쪽도 진짜 팩 형상이어야 판정이 선다
+        _w(os.path.join(hookpack, "hooks", "_lib.sh"), lib, 0o644)
+        probe = os.path.join(hookpack, "hooks", "probe.sh")
+        _w(probe, '#!/bin/sh\n. "$(dirname "$0")/_lib.sh"\necho REACHED >&2\n')
+        rp = _run(["sh", probe], env=_base_env({"HOME": home, "CYS_PACK_DIR": other}))
+        need(MSG in rp.stderr, "가드 stderr 문구가 없다: %r" % rp.stderr[:300])
+        need("REACHED" not in rp.stderr, "가드가 조기 종료시키지 않았다(호출측이 계속 돈다)")
+        # ② 음성 — 같은 팩(자기 레인). ★라이브 PACK_DIR 을 CYS_PACK_DIR 로 주지 않는다:
+        #    이 러너는 사용자 트리 무접촉이 계약인데(모듈 헤더), 라이브 팩을 레인으로 지목하면
+        #    그 env 를 물려받은 자식이 팩 치유·설치 경로를 건드릴 표면이 열린다(2026-09-04 실측:
+        #    워크트리 팩에 0.14.29 설치본 아티팩트 `.pristine`·`.merge-pending.json` 과 80건
+        #    모드 변경이 남았다). **팩 형상 사본**으로 같은 판정을 낸다.
+        selfpack = os.path.join(tmp, "selfpack")
+        _w(os.path.join(selfpack, "hooks", "_lib.sh"), lib, 0o644)
+        selfhook = os.path.join(selfpack, "hooks", "inject-context.sh")
+        _w(selfhook, _read(hook))
+        r2 = run(selfpack, path=selfhook)
+        need(MSG not in r2.stderr, "같은 팩인데 가드가 발화했다: %r" % r2.stderr[:300])
+        need(r2.stdout != "", "같은 팩에서 훅 본체가 죽었다")
+        # ③ 음성 — hooks/_lib.sh 가 없는 임시 팩(테스트 하네스·부분 팩 형상)
+        r3 = run(os.path.join(tmp, "nopack"))
+        need(MSG not in r3.stderr, "비-팩 레인에서 가드가 발화했다(판정 불능은 통과여야 한다)")
+        need(r3.stdout != "", "비-팩 레인에서 훅 본체가 죽었다")
+        # ④ 음성 — opt-out
+        r4 = run(other, {"CYS_HOOK_LANE_GUARD": "0"})
+        need(MSG not in r4.stderr, "opt-out(CYS_HOOK_LANE_GUARD=0)이 듣지 않는다")
+        need(r4.stdout != "", "opt-out 인데 훅 본체가 죽었다")
+        # ⑤ ★음성 — 사용자 로컬 오버레이 형상(`~/.cys/local/hooks/<이벤트>.d/`): 그 트리에는
+        #    `hooks/_lib.sh` 가 **없다**. 한쪽만 보는 판별자였다면 여기서 전면 무발동한다.
+        ov = os.path.join(tmp, "local", "hooks", "sub", "inject-context.sh")
+        _w(ov, _read(hook))
+        r5 = run(selfpack, path=ov)
+        need(r5.returncode == 0, "오버레이 훅이 비0 종료(%d)" % r5.returncode)
+        need(MSG not in r5.stderr,
+             "사용자 로컬 오버레이 훅을 가드가 죽였다 — 업데이트 불가침 확장점 파괴: %r"
+             % r5.stderr[:300])
+        need(r5.stdout != "", "오버레이 훅 본체가 죽었다(2단 프리루드 폴백 경로)")
+    return "양성 1(조기 종료·stdout 0) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
