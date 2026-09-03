@@ -279,9 +279,14 @@ bash scripts/release-gate-gatekeeper.sh <DMG | .app>
   평가한다. 그런데 사용자가 브라우저로 받은 격리 DMG 를 여는 순간 Gatekeeper 가 보는 것은
   **DMG 자신의 서명·공증 티켓**이다 — 봉투가 빠지거나 깨지면 앱이 온전해도 열리지 않는다.
   그래서 ① 에서 격리 속성을 부착한 **사본**에 대해 **마운트 전에** 두 검사를 더 돈다:
-  ⑦-a `xcrun stapler validate`(모드 무관 — 오프라인 공증 증거) · ⑦-b
+  ⑦-a `xcrun stapler validate`(오프라인 공증 증거 — spctl 정책에 의존하지 않아 **full 과
+  `--diagnose-degraded-ok` 두 모드에서 조건 없이** 돈다) · ⑦-b
   `spctl --assess --type open --context context:primary-signature`(④ 와 같이 full 모드에서만 ·
-  degraded 진단 강등에서는 SKIP 1줄 고지). 결과는 PASS/FAIL 집계에 들어가 말미 판정·종료 코드에
+  degraded 진단 강등에서는 SKIP 1줄 고지).
+  · ★**기본(발행) 모드에서 spctl 이 degraded 면 ⑦ 은 실행되지 않는다** — F2 폐쇄가 대상 분기보다
+    앞서 `exit 2`(판정 불가)로 닫기 때문이다. 종전 "모드 무관" 표기는 도달 가능한 두 모드 안에서만
+    참이어서 증적 생성 조건을 잘못 약속했다(2026-09-04 R2 교정 · codex 감사 REVISE ①).
+  결과는 PASS/FAIL 집계에 들어가 말미 판정·종료 코드에
   반영되고, `.app` 직접 지정 모드에서는 "대상 아님(DMG 없음)" info 1줄만 남는다.
   · **왜 여기인가** — `scripts/build-macos-signed.sh:332` 가 같은 평가식을 이미 쓰지만 그것은
     빌드 시점 러너 산출물 검사다. 이 게이트는 업로드 **전**(release.yml)과 발행 후처리
