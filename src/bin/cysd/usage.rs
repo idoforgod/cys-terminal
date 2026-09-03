@@ -390,9 +390,24 @@ fn collect_for(
         return;
     }
 
-    let Some(new) = next else {
+    let Some(mut new) = next else {
         return;
     };
+
+    // ★B6: 휴리스틱 매핑이 낡았으면 **값을 내지 않는다**(판정 불가를 값으로 위장 금지).
+    //   session_file 의 mtime 으로 판정한다 — 그 파일이 이 좌석의 현 세션이라면 방금 쓰였어야
+    //   한다. 낡았다는 것은 세션이 교체됐는데 매핑이 따라가지 못했다는 뜻이다(실측 사고).
+    //   함께 재발견을 강제해 다음 틱이 lsof(결정론)부터 다시 시도하게 한다.
+    if !new.session_file.is_empty() {
+        let mt = mtime_epoch(std::path::Path::new(&new.session_file));
+        if !mapping_is_fresh(state.heuristic, now, mt, usage_max_session_age_secs()) {
+            new.ctx_tokens = None;
+            new.ctx_window = None;
+            new.ctx_pct = None;
+            new.source = format!("{}:stale", new.source);
+            state.last_discovery = 0.0; // 다음 틱 재발견 강제(세션 교체 추적)
+        }
+    }
 
     // ── 스냅샷 갱신 + 이벤트 (정수 % 변화시에만 — 이벤트 폭주 차단) ──
     let changed = prev
@@ -583,6 +598,44 @@ fn external_role(path: &Path) -> String {
         }
     }
     "external".into()
+}
+
+// ─── ★B6(0.14.30): 휴리스틱 매핑 신선도 가드 — 낡은 세션 파일을 값으로 위장하지 않는다 ───
+//
+// 【실측 사고 · CEO 2026-09-04 04:0x】 본부 reviewer-codex 의 usage 가
+// `source=rollout:heuristic · tok=184,535 · pct=71%` 로 표시되는데 그 `session_file` 의 mtime 은
+// **9시간 전**이었고 실제 최신 rollout 은 4분 전이었다 — 데몬이 옛 rollout 에 고정돼 있었다.
+// dept-1 은 오차가 더 컸다: 매핑값 197,878 vs 최신 rollout 120,811 = **1.64배 과대**(세션 파일
+// 20.9시간 전). 컨텍스트 임계 판정이 이 값을 쓰므로 과대면 작업 중 노드를 불필요하게 clear 하고
+// (산출 소실) 과소면 임계 초과를 방치한다 — 어느 방향이든 판정이 무력화된다.
+//
+// 【왜 '값을 주지 않는다' 가 옳은 처리인가】 이 시스템의 계약은 "측정 불능은 통과가 아니다" 다.
+// 낡은 값을 그대로 내보내면 소비자(사이클 판정)는 그것을 **측정된 사실**로 읽는다. 그래서
+// 신선도 임계를 넘긴 휴리스틱 매핑은 토큰·퍼센트를 **비우고** source 에 `:stale` 을 달아
+// '판정 불가' 를 그대로 드러낸다(rate·session_file 은 관측 사실이므로 보존한다).
+//
+// 【범위】 이 가드는 **휴리스틱 매핑에만** 건다. 등록 매핑(usage.register)·statusline(서버가
+// 직접 보고하는 진실)은 이 경로를 타지 않는다 — claude statusline 분기는 무변경이다(회귀 0).
+
+/// 휴리스틱 세션 파일이 '지금 그 좌석의 것' 이라고 믿을 수 있는 최대 나이(초).
+/// 기본 900(15분) · `CYS_USAGE_MAX_SESSION_AGE_SECS` 로 조정 · 0 = 가드 비활성(구동작 복원).
+fn usage_max_session_age_secs() -> f64 {
+    std::env::var("CYS_USAGE_MAX_SESSION_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900.0)
+}
+
+/// 매핑 신선도 순수 판정자 — 시계·파일을 읽지 않는다(입력만으로 판정).
+///
+/// * `heuristic=false`(등록 매핑) → 언제나 신선 취급: 소유자가 명시한 매핑이라 나이로 부정하지 않는다.
+/// * `max_age <= 0` → 가드 비활성(종전 동작).
+/// * `mtime` 이 미래(시계 스큐)면 신선으로 본다 — 스큐를 stale 로 접으면 정상 좌석이 침묵한다.
+pub(crate) fn mapping_is_fresh(heuristic: bool, now: f64, session_mtime: f64, max_age: f64) -> bool {
+    if !heuristic || max_age <= 0.0 {
+        return true;
+    }
+    now - session_mtime <= max_age
 }
 
 fn source_label(base: &str, heuristic: bool) -> String {
@@ -1259,6 +1312,135 @@ pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
 
 #[cfg(test)]
 mod tests {
+
+    // ─────────── ★B6(0.14.30): 휴리스틱 매핑 신선도 가드 핀(b6_*) ───────────
+
+    use super::{mapping_is_fresh, usage_max_session_age_secs};
+
+    /// 낡은 세션 파일은 **값의 근거가 아니다** — 실측 사고(9시간·20.9시간 전 매핑에서 1.64배
+    /// 과대)를 재현하는 나이에서 stale 로 떨어져야 한다.
+    #[test]
+    fn b6_stale_heuristic_mapping_is_not_fresh() {
+        let now = 1_000_000.0;
+        // 9시간 전(본부 실측) · 20.9시간 전(dept-1 실측) 둘 다 stale.
+        assert!(!mapping_is_fresh(true, now, now - 9.0 * 3600.0, 900.0));
+        assert!(!mapping_is_fresh(true, now, now - 20.9 * 3600.0, 900.0));
+        // 임계 직전은 신선(경계 포함).
+        assert!(mapping_is_fresh(true, now, now - 900.0, 900.0));
+        assert!(mapping_is_fresh(true, now, now - 60.0, 900.0));
+    }
+
+    /// 등록 매핑(usage.register)·가드 비활성은 나이로 부정하지 않는다 — 이 가드는 **휴리스틱
+    /// 전용**이고, claude statusline 경로는 애초에 이 판정을 타지 않는다(회귀 0).
+    #[test]
+    fn b6_registered_mapping_and_disabled_knob_are_always_fresh() {
+        let now = 1_000_000.0;
+        assert!(
+            mapping_is_fresh(false, now, now - 48.0 * 3600.0, 900.0),
+            "등록 매핑은 소유자가 명시한 것이라 나이로 부정하지 않는다"
+        );
+        assert!(
+            mapping_is_fresh(true, now, now - 48.0 * 3600.0, 0.0),
+            "임계 0 = 가드 비활성 = 종전 동작(즉시 복원 스위치)"
+        );
+    }
+
+    /// 시계 스큐(미래 mtime)를 stale 로 접으면 정상 좌석이 침묵한다 — 신선으로 본다.
+    #[test]
+    fn b6_future_mtime_from_clock_skew_is_treated_as_fresh() {
+        let now = 1_000_000.0;
+        assert!(mapping_is_fresh(true, now, now + 120.0, 900.0));
+    }
+
+    /// 기본 임계는 15분이다(설정 가능) — 기본값이 곧 계약이므로 상수를 핀한다.
+    #[test]
+    fn b6_default_max_session_age_is_fifteen_minutes() {
+        let prev = std::env::var("CYS_USAGE_MAX_SESSION_AGE_SECS").ok();
+        std::env::remove_var("CYS_USAGE_MAX_SESSION_AGE_SECS");
+        let got = usage_max_session_age_secs();
+        match prev {
+            Some(v) => std::env::set_var("CYS_USAGE_MAX_SESSION_AGE_SECS", v),
+            None => std::env::remove_var("CYS_USAGE_MAX_SESSION_AGE_SECS"),
+        }
+        assert_eq!(got, 900.0);
+    }
+
+    /// 실파일 픽스처 — mtime 을 실제로 읽어 판정한다(판정자 단독 단위 테스트의 사각지대인
+    /// "파일에서 시각을 못 읽으면 어떻게 되나"를 포함해 고정한다).
+    #[test]
+    fn b6_file_fixtures_are_classified_by_real_mtime() {
+        let dir = std::env::temp_dir().join(format!("cys-b6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fresh = dir.join("rollout-fresh.jsonl");
+        std::fs::write(&fresh, b"{}\n").expect("write");
+        let mt = mtime_epoch(&fresh);
+        let now = crate::state::now_epoch();
+        assert!(
+            mapping_is_fresh(true, now, mt, 900.0),
+            "방금 쓴 파일이 stale 로 떨어지면 정상 좌석이 통째로 침묵한다"
+        );
+        // 같은 파일을 '10시간 뒤 시점' 에서 보면 stale — 실측 사고(9시간·20.9시간)의 재현.
+        assert!(!mapping_is_fresh(true, now + 10.0 * 3600.0, mt, 900.0));
+        // 없는 파일: mtime_epoch 이 0 을 내므로 stale 로 떨어진다(값 미제공 = 안전 방향).
+        let missing = dir.join("nope.jsonl");
+        assert!(!mapping_is_fresh(true, now, mtime_epoch(&missing), 900.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★생산 배선 핀(#4 회귀 0): 가드는 ⓐ statusline 조기 반환 **뒤**에 있고 ⓑ 세 수치를
+    /// 비우며 ⓒ `:stale` 을 붙이고 ⓓ 재발견을 강제한다. claude statusline 경로는 이 지점에
+    /// 도달하지 않으므로 무영향이다(그 순서가 깨지면 claude 값이 지워질 수 있다).
+    #[test]
+    fn b6_guard_sits_after_statusline_return_and_clears_numbers() {
+        let src = include_str!("usage.rs");
+        let body = src
+            .split("fn collect_for(")
+            .nth(1)
+            .expect("collect_for 소실");
+        let sl = body.find("if statusline_fresh {").expect("statusline 조기 반환 소실");
+        let guard = body.find("mapping_is_fresh(").expect("신선도 가드 소실");
+        assert!(
+            sl < guard,
+            "가드가 statusline 조기 반환보다 앞에 있으면 claude 서버 진실값이 지워진다"
+        );
+        let tail = &body[guard..guard + 600.min(body.len() - guard)];
+        for needle in [
+            "ctx_tokens = None",
+            "ctx_window = None",
+            "ctx_pct = None",
+            ":stale",
+            "last_discovery = 0.0",
+        ] {
+            assert!(tail.contains(needle), "가드 계약 누락: {needle}");
+        }
+    }
+
+    /// 소비자 계약 핀: stale 표기는 `:stale` 접미로 드러나고 값은 비어 있다(판정 불가를 값으로
+    /// 위장하지 않는다). 여기서는 그 조립 규칙 자체를 고정한다.
+    #[test]
+    fn b6_stale_snapshot_carries_no_numbers_but_keeps_provenance() {
+        let mut u = ObservedUsage {
+            agent: "codex".into(),
+            ctx_tokens: Some(184_535),
+            ctx_window: Some(258_400),
+            ctx_pct: Some(71),
+            rate: Vec::new(),
+            source: "rollout:heuristic".into(),
+            session_file: "/x/rollout-old.jsonl".into(),
+            updated_at: 1.0,
+        };
+        // 생산 코드와 같은 전이(값 비우기 + :stale 표기).
+        u.ctx_tokens = None;
+        u.ctx_window = None;
+        u.ctx_pct = None;
+        u.source = format!("{}:stale", u.source);
+        assert_eq!(u.source, "rollout:heuristic:stale");
+        assert!(u.ctx_tokens.is_none() && u.ctx_pct.is_none());
+        assert_eq!(
+            u.session_file, "/x/rollout-old.jsonl",
+            "어느 파일이 낡았는지는 진단에 필요한 사실이라 보존한다"
+        );
+    }
     use super::*;
 
     // ── 외부(비-pane) 세션 수집 — 귀속·판정 핀 ──
