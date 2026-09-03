@@ -4421,6 +4421,130 @@ pub(crate) fn queue_head_wait_secs(
     (now - anchor).max(0.0) as u64
 }
 
+// ─── ★B1(0.14.30): 프롬프트 경계 준비판정 — 큐 기아(백로그 #1) 봉인의 판정부 ──────────────
+//
+// ## 이 단위가 고치는 결함 (실측 · `ceo/report-cadence-audit/queue-starvation-case.md` §1·§3)
+//
+// 배달 자격이 '출력 quiet'(`queue_quiet_secs` 기본 3s) 였다. Claude Code 는 도구를 연속
+// 실행하는 동안 상태줄 스피너를 계속 다시 그리므로 `last_output` 이 영구 갱신되고, 그 pane 은
+// **구조적으로 자기 큐를 굶긴다**: dept-1 실측 2026-09-03 22:05 — master 좌석 idle 0s 가
+// 953s 지속, 큐 23건 미배달, 화면에는 `❯` **빈 입력줄**이 스피너와 나란히 보였다
+// (`impl/live-evidence/dept1-queue-starvation-2205.txt`). 12h 표본의 지연 p90 은 4,056s 였다.
+//
+// ## 왜 '프롬프트 박스가 보이면 주입해도 되는가' (벤더 문서 확증 — 추측 아님)
+//
+// Claude Code 공식 문서 <https://code.claude.com/docs/en/interactive-mode.md> 원문:
+//   "Type a message and press `Enter` while Claude is working. Claude Code queues the message
+//    instead of interrupting the turn, and lists the queued entries above the input box until it
+//    sends them." · "if you queue a message while Claude is running tool calls, Claude Code
+//    passes it to Claude as soon as those tool calls finish, within the same turn."
+// 즉 처리 중 주입은 **턴 중단이 아니라 큐잉**이고 모델은 다음 도구 경계에서 그것을 본다.
+// 그러므로 출력이 흐르는 중이라도 프롬프트 박스가 있으면 주입은 안전하며, quiet 대기는 지연만
+// 만든다. (같은 문서 "Press `Esc` to interrupt the turn" — 데몬은 **Esc 를 절대 보내지 않는다**.)
+//
+// ## 고스트 텍스트는 입력 버퍼가 아니다 (PREP '백로그 #1 보정' 의 2h10m 실사고)
+//
+// 종전 수정안의 '입력줄이 비어 있음' 요구를 화면 문자 유무로 판정하면 **Claude Code 의 프롬프트
+// 제안**(공식명 prompt suggestions · 위 문서 §Prompt suggestions: "Claude Code shows a grayed-out
+// example command in the prompt input … Press `Tab` or `Right arrow` to place the suggestion in the
+// prompt input")을 사람 입력으로 오판해 배달을 영구 보류한다(13:27~15:37 실측 2h10m).
+//
+// **판별 축은 커서다.** 사람이 친 텍스트는 커서 **앞**에 쌓이고, 제안문은 커서 **뒤**에 렌더된다
+// (제안을 채택하는 키가 `Tab`/`Right arrow` 라는 것이 그 자리에 커서가 있다는 벤더 측 증거다).
+// ★색·dim 축을 쓰지 않는 이유(실측): 이 저장소가 쓰는 `vt100 0.15.2` 의 `Cell` 은 bold·italic·
+// underline·inverse·fgcolor·bgcolor 만 노출하고 **dim(SGR 2) 비트가 없다**(crate `src/attrs.rs`
+// 의 TEXT_MODE_* 4종). 그래서 'grayed-out' 을 속성으로 읽을 수단이 애초에 없다 — 커서 축이
+// 화면에서 얻을 수 있는 유일한 결정론 판별자다.
+//
+// ## 1차 방어는 화면이 아니다 (미주입 원천 차단)
+//
+// 위 문서는 `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` 가 설정보다 우선해 이 기능을 끈다고
+// 적는다("which takes precedence over the setting"). 그래서 cys 가 띄우는 pane 에는 그 env 를
+// **키 부재 시에만** 주입하는 것이 근본 방어이고(어댑터 env 를 덮지 않는 D5 주입 규약과 동형 —
+// `cys::ENV_CLAUDE_NO_ALT_SCREEN` 헬퍼 자리), 아래 판정자는 그 env 가 닿지 않는 pane
+// (사용자 직접 기동·구세션·다른 어댑터)을 위한 **2차 방어**다.
+//
+// ## 판정식
+//
+// ```text
+// ready = 마커 노출 ∧ 입력줄 비어 있음 ∧ ¬대체화면 ∧ ¬승인대기
+// ```
+// 두 판정자 모두 **호출부가 관측해 넘긴 값**으로만 계산한다(시계·env·락·화면을 스스로 읽지
+// 않는다 — `readiness::Observed` 규약과 동형). 판정 불능은 배달 금지 방향으로만 떨어진다.
+
+/// 프롬프트 행의 커서 기준 2분할 — `input_line_state` 의 화면 축 입력.
+///
+/// 호출부(`prompt_line_of`)가 vt100 그리드에서 ready_marker 가 있는 행을 찾아 마커 뒤 텍스트를
+/// 커서 열에서 자른다. 자를 수 없으면(프롬프트 행 부재·커서가 그 행 밖) `None` 을 넘겨야 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptLine<'a> {
+    /// 마커 뒤 ~ 커서 열 **앞**: 사람이 친 미제출 텍스트가 놓이는 구간.
+    pub(crate) before_cursor: &'a str,
+    /// 커서 열 **이후**: Claude Code prompt suggestions(고스트)가 렌더되는 구간. 판정에 쓰지
+    /// 않고 관측·로그용으로만 보존한다(이 필드를 판정에 쓰면 2h10m 사고가 재현된다).
+    pub(crate) at_or_after_cursor: &'a str,
+}
+
+/// 입력줄 점유 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputLine {
+    /// 미제출 입력 없음 — 주입 가능(고스트 텍스트만 있는 상태도 여기다).
+    Empty,
+    /// 미제출 입력 있음 — **주입 금지**(이어붙이기·오제출 차단 · 경보 후 보류).
+    Occupied,
+    /// 관측 불능 — fail-closed 로 `Occupied` 와 같게 취급한다(판정부는 사실만 돌려준다).
+    Unknown,
+}
+
+/// 입력줄 점유 순수 판정자.
+///
+/// `pending_input_bytes` = 데몬이 그 pane 에 쓴 뒤 **제출(CR)·선정리(Ctrl-U/Ctrl-C)를 아직 보지
+/// 못한** 입력 바이트 수(사람 키 입력 + 미제출 프로그램 본문). 데몬이 소유한 PTY 의 모든 쓰기는
+/// writer 스레드를 지나므로 이 계수는 화면 렌더에 의존하지 않는 **결정론 신호**이고, 고스트
+/// 텍스트는 이 경로를 지나지 않아 원리상 계수되지 않는다. 단 휘발이므로(재기동 시 0) 화면 축이
+/// 2차로 남는다 — `queue_head_wait_secs` 가 부트 직후를 uptime 으로 클램프하는 것과 같은 이유다.
+pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine<'_>>) -> InputLine {
+    if pending_input_bytes > 0 {
+        return InputLine::Occupied;
+    }
+    match line {
+        None => InputLine::Unknown,
+        Some(l) if !l.before_cursor.trim().is_empty() => InputLine::Occupied,
+        Some(_) => InputLine::Empty,
+    }
+}
+
+/// 프롬프트 경계 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptBoundary {
+    /// 프롬프트 박스가 열려 있고 입력줄이 비었다 — 큐 배달 자격(출력 quiet 무관).
+    Ready,
+    /// 아직 아니다 — 이번 틱 보류(사유는 호출부가 blocked_by 로 기록).
+    NotReady,
+}
+
+/// 프롬프트 경계 순수 판정자 — 네 축의 AND. 하나라도 관측 불능이면 `NotReady`(fail-closed).
+///
+/// * `marker_seen` — 화면 꼬리에 어댑터 `ready_marker` 가 보이는가(claude `❯` · codex·gemini
+///   `? for shortcuts`). 마커를 모르는 어댑터·맨 셸은 호출부가 이 판정을 쓰지 않고 종전 quiet
+///   규칙으로 폴백한다(무회귀).
+/// * `input` — `input_line_state` 결과. `Unknown` 은 `Occupied` 와 같이 막는다.
+/// * `alt_screen` — vt100 대체화면(전체화면 TUI·대화상자). 그 화면의 입력줄은 프롬프트가 아니다.
+/// * `approval_pending` — 어댑터 `approval_patterns` 가 걸린 승인 대기 화면. 그 창에 본문을
+///   꽂으면 Return 이 승인 버튼을 누른다(readiness 모듈이 박제한 관문 사고와 같은 부류).
+pub(crate) fn prompt_boundary_verdict(
+    marker_seen: bool,
+    input: InputLine,
+    alt_screen: bool,
+    approval_pending: bool,
+) -> PromptBoundary {
+    if marker_seen && input == InputLine::Empty && !alt_screen && !approval_pending {
+        PromptBoundary::Ready
+    } else {
+        PromptBoundary::NotReady
+    }
+}
+
 /// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
 /// 모든 '막힘' 분기에서 공통 호출한다(한 분기라도 빠지면 그 사유의 적체가 침묵한다).
 fn alert_queue_depth_if_high(
@@ -7545,6 +7669,108 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // ─────────── ★B1(0.14.30): 프롬프트 경계 준비판정 — 순수 판정자 핀 ───────────
+
+    use super::{input_line_state, prompt_boundary_verdict, InputLine, PromptBoundary, PromptLine};
+
+    /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
+    /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
+    #[test]
+    fn b1_input_line_ghost_after_cursor_is_empty() {
+        let line = PromptLine { before_cursor: "", at_or_after_cursor: "try running the tests" };
+        assert_eq!(
+            input_line_state(0, Some(line)),
+            InputLine::Empty,
+            "커서 뒤 제안문을 입력 버퍼로 오판하면 배달이 영구 보류된다"
+        );
+    }
+
+    /// 사람이 친 텍스트는 커서 **앞**에 쌓인다 → 점유(주입 금지).
+    #[test]
+    fn b1_input_line_typed_before_cursor_is_occupied() {
+        let line = PromptLine { before_cursor: "버그 수정 착수한다", at_or_after_cursor: "" };
+        assert_eq!(input_line_state(0, Some(line)), InputLine::Occupied);
+    }
+
+    /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 점유다(결정론 신호 우선).
+    #[test]
+    fn b1_input_line_pending_bytes_win_over_screen() {
+        let line = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        assert_eq!(input_line_state(1, Some(line)), InputLine::Occupied);
+        assert_eq!(input_line_state(4096, None), InputLine::Occupied);
+    }
+
+    /// 프롬프트 행·커서를 관측하지 못하면 Unknown — 호출부가 fail-closed 로 막는다.
+    #[test]
+    fn b1_input_line_unobserved_prompt_is_unknown() {
+        assert_eq!(input_line_state(0, None), InputLine::Unknown);
+    }
+
+    /// 커서 앞이 공백뿐이면 비어 있음(프롬프트 마커 뒤 여백 한 칸은 입력이 아니다).
+    #[test]
+    fn b1_input_line_blank_before_cursor_is_empty() {
+        let line = PromptLine { before_cursor: "   ", at_or_after_cursor: "" };
+        assert_eq!(input_line_state(0, Some(line)), InputLine::Empty);
+    }
+
+    /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).
+    #[test]
+    fn b1_prompt_boundary_is_conjunction_of_four_axes() {
+        for marker in [false, true] {
+            for input in [InputLine::Empty, InputLine::Occupied, InputLine::Unknown] {
+                for alt in [false, true] {
+                    for approval in [false, true] {
+                        let want = marker && input == InputLine::Empty && !alt && !approval;
+                        let got = prompt_boundary_verdict(marker, input, alt, approval)
+                            == PromptBoundary::Ready;
+                        assert_eq!(
+                            got, want,
+                            "marker={marker} input={input:?} alt={alt} approval={approval}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 관측 불능(Unknown)은 배달 자격이 아니다 — 판정 실패가 주입 방향으로 열리지 않는다.
+    #[test]
+    fn b1_prompt_boundary_unknown_input_is_never_ready() {
+        assert_eq!(
+            prompt_boundary_verdict(true, InputLine::Unknown, false, false),
+            PromptBoundary::NotReady
+        );
+    }
+
+    /// 승인 대기·대체화면에서는 절대 배달하지 않는다(관문 창 오제출 = 좌석 사망 경로).
+    #[test]
+    fn b1_prompt_boundary_alt_screen_or_approval_blocks_delivery() {
+        assert_eq!(
+            prompt_boundary_verdict(true, InputLine::Empty, true, false),
+            PromptBoundary::NotReady,
+            "대체화면(전체화면 TUI·대화상자)의 입력줄은 프롬프트가 아니다"
+        );
+        assert_eq!(
+            prompt_boundary_verdict(true, InputLine::Empty, false, true),
+            PromptBoundary::NotReady,
+            "승인 대기 화면에 본문을 꽂으면 Return 이 승인 버튼을 누른다"
+        );
+    }
+
+    /// 출력이 흐르는 중이어도(스피너 재그리기) 프롬프트 박스가 열려 있으면 배달 자격이다 —
+    /// 벤더 문서상 처리 중 제출은 중단이 아니라 큐잉이고 다음 도구 경계에서 모델에 전달된다
+    /// (<https://code.claude.com/docs/en/interactive-mode.md>). 이 핀이 기아(#1)의 본체다.
+    #[test]
+    fn b1_prompt_boundary_ready_while_output_streams() {
+        let line = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        let input = input_line_state(0, Some(line));
+        assert_eq!(
+            prompt_boundary_verdict(true, input, false, false),
+            PromptBoundary::Ready,
+            "quiet 를 조건에 넣으면 연속 도구 실행 노드가 자기 큐를 영구히 굶는다"
+        );
     }
 
     // ─────────── ★G1(W2-D): 단계형 quiet(기아 봉인) — 순수 판정자·uptime 클램프 핀 ───────────
