@@ -5,7 +5,8 @@
 - Paperclip의 진짜 런어웨이 차단 = "새 run 시작 전 라이브 재계산해 초과면 착수 거부"(사전 게이트).
 - 승인 패턴은 **구독제(정액) 전용·종량제 과금 금지**다. 정액 구독엔 달러 예산이라는 브레이크가
   아예 없으므로(쓴 만큼 청구되는 축이 없다) metric을 달러가 아닌 자원으로 치환한다:
-    servers  = 로컬 dev/서버 프로세스 수         (자원 거버넌스 '서버 누적' 사고 이력)
+    servers  = 로컬 dev/서버 **논리** 개수(`cys ps` 원장 항목 · A3-b) — 원장 조회 실패 시에만
+               ps 패턴 체인 루트 계수로 폴백(자원 거버넌스 '서버 누적' 사고 이력)
     nodes    = claude/agy/codex 노드 프로세스 수
     load     = 1분 load average / CPU 코어 수 비율
     context  = 자기보고 컨텍스트 %               (60% /clear 규칙)
@@ -53,10 +54,12 @@ exit codes(A13 타입드 — 코드 상수와 기계 대조):
 자체검증: python3 javis_resource_gate.py --self-test
 """
 import argparse
+import errno
 import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -105,12 +108,52 @@ NODES_HARD_DEFAULT = 18   # STEP A 정적 floor(구 12) — depts 0~1일 때도 
 NODES_HARD_BASE = 12      # STEP B 동적 base — 12 + Σ좌석 이 floor 18 을 넘으면 그 값이 hard
 DEPT_SOCKET_GLOB = "~/.local/state/cys-dept-*/cys.sock"
 DEPT_STATUS_TIMEOUT = 5   # 부서 데몬 응답 대기(초) — 초과 = 그 부서 dept(<이름>) 오류(계상 제외)
+LEDGER_TIMEOUT = 5        # ★A3-b: `cys ps` 원장 조회 대기(초) — 초과 = 원장 신뢰 불가(패턴 폴백)
 
 
 def _active_dept_count():
     """호환 래퍼 — 부서 소켓(cys-dept-*/cys.sock) 파일 존재 개수(구 '활성 부서' 정의).
     ★A3 이후 measure() 는 이 값을 쓰지 않는다(활성 = 데몬 응답 · _dept_roster). 외부 호출자 보존용."""
     return len(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB)))
+
+
+SOCKET_PROBE_TIMEOUT = 0.3   # ★A3-c: 리스너 유무만 보는 연결 프로브(로컬 unix 소켓 · 밀리초 단위)
+# 확실한 죽음으로 판정하는 errno 집합 — 그 밖은 '판정 불가'라 종전 경로(cys status 왕복)로 간다.
+_ERRNO_DEAD = (errno.ECONNREFUSED, errno.ENOENT, errno.ENOTSOCK)
+
+
+def _socket_listening(path):
+    """unix 소켓에 **리스너가 있는가**(스폰 0 · 밀리초). 판정 불가는 True(종전 경로로 진행).
+
+    ★왜 True 로 접는가: 이 프로브의 목적은 '확실히 죽은 소켓에서 5초를 태우지 않는 것' 하나다.
+      애매한 경우(Windows named pipe·AF_UNIX 미지원·권한 오류 등)까지 여기서 죽이면 프로브가
+      판정기가 되어 버린다 — 판정은 여전히 `cys status` 왕복이 한다(측정 불능은 통과가 아니라
+      **종전 경로로 진행**이다)."""
+    if os.name == "nt":
+        return True                      # named pipe — AF_UNIX 프로브 대상 아님(분기 보존)
+    af_unix = getattr(socket, "AF_UNIX", None)
+    if af_unix is None:
+        return True
+    s = None
+    try:
+        s = socket.socket(af_unix, socket.SOCK_STREAM)
+        s.settimeout(SOCKET_PROBE_TIMEOUT)
+        s.connect(path)
+        return True
+    except OSError as e:
+        # ★'확실한 죽음' 3종만 False 다(실측 2026-09-03): ECONNREFUSED = 소켓은 있으나 리스너
+        #   없음(데몬 비정상 종료 잔재의 전형) · ENOENT = 경로 소멸(glob 과 프로브 사이 레이스) ·
+        #   ENOTSOCK = 소켓이 아닌 일반 파일이 그 자리에 있다(errno 38 — 잔재·오생성). 그 밖의
+        #   OSError(권한·타임아웃·미지원)는 **판정 불가**이므로 True 로 접어 종전 경로로 보낸다.
+        if e.errno in (_ERRNO_DEAD):
+            return False
+        return True
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def _dept_roster(override=None):
@@ -129,6 +172,17 @@ def _dept_roster(override=None):
         name = os.path.basename(os.path.dirname(sock))
         if name.startswith("cys-dept-"):
             name = name[len("cys-dept-"):]
+        # ★A3-c(2026-09-03 23:1x 실측): 죽은 데몬이 남긴 **stale 소켓 파일** 하나당 이 루프가
+        #   DEPT_STATUS_TIMEOUT(5s)을 통째로 태운다(실측 5.11s). 이 게이트는 부트 ④′와 formation
+        #   심박(10분)이 부르는 경로라 그 지연이 그대로 부트에 얹힌다. 리스너 유무는 connect
+        #   프로브로 **밀리초 안에** 판정되므로 스폰 전에 먼저 묻는다 — 판정(오류 계상·soft 격상)은
+        #   종전과 동일하고 **시간만** 줄인다. 정상 teardown 은 상태 디렉터리를 cys-trash 로
+        #   격리해 glob 이 무매치이므로(cys-dept dept_tombstone) 이 형상은 비정상 종료 잔재다.
+        #   Windows: 부서 소켓은 named pipe 라 AF_UNIX 프로브 대상이 아니다 → 프로브를 건너뛰고
+        #   종전 경로(cys status 왕복)로 간다(분기 보존).
+        if not _socket_listening(sock):
+            roster["errors"].append("dept(%s)" % name)
+            continue
         try:
             p = subprocess.run(["cys", "status", "--json", "--socket", sock],
                                capture_output=True, encoding="utf-8", errors="replace",
@@ -149,6 +203,19 @@ def _dept_roster(override=None):
         roster["seats"] += seats
         roster["depts"].append({"name": name, "seats": seats})
     return roster
+
+
+def _ledger_override_arg(raw):
+    """--servers-ledger-override 의 argparse type — 형식 위반은 인자 오류(EX_USAGE 64)다
+    (_roster_override_arg 와 동일 원칙: 조용한 라이브 폴백·내부 예외 융합 금지)."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("servers-ledger-override JSON 파싱 실패: %s" % e)
+    if not isinstance(doc, dict):
+        raise argparse.ArgumentTypeError(
+            "servers-ledger-override 는 JSON 객체({lane,depts})여야 한다")
+    return doc
 
 
 def _roster_override_arg(raw):
@@ -196,13 +263,24 @@ def measure(a):
     lines = _ps_lines() if need_ps else None
     ps_failed = need_ps and lines is None
 
+    # ★A3-b(dept-1 22:05 실측): servers 의 정본은 **프로세스 원장**(`cys ps`)이다 — 논리 서버 1개가
+    #   래퍼 체인(cys run → npm exec vite → node vite) 때문에 ps 패턴에서 3으로 세어져 hard(3)에
+    #   걸렸다. 원장은 `cys run` 1회당 항목 1개라 체인과 무관하다. 원장 조회가 실패할 때만 패턴으로
+    #   폴백하되, 그때도 **체인 루트만** 세고(_server_procs collapse) 그 사실을 measure_errors 로
+    #   신호한다(조용한 과대계수 금지). 임계(soft 2/hard 3)는 그대로다 — 근본은 계수였다.
     if a.servers_override is not None:
         servers = a.servers_override
-    elif ps_failed:
-        errors.append("servers(ps)")
-        servers = None
     else:
-        servers = _count_matching(lines, SERVER_PATTERNS, SERVER_EXCLUDE_PATTERNS)
+        led, led_errors = _ledger_servers(getattr(a, "servers_ledger_override", None))
+        errors.extend(led_errors)
+        if led is not None:
+            servers = led
+        elif ps_failed:
+            errors.append("servers(ps)")
+            servers = None
+        else:
+            roots = _server_procs(lines)          # 패턴 폴백(체인 루트 접기)
+            servers = len(roots)
 
     if a.nodes_override is not None:
         nodes = a.nodes_override
@@ -428,8 +506,13 @@ def cmd_classify(a):
 
 
 # ── ★G12(cokacdir 성찰 2026-07-04): hard_block '판정'과 분리돼 있던 '집행' ──
-def _server_procs(lines=None):
-    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함)."""
+def _server_procs(lines=None, collapse=True):
+    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함).
+
+    ★A3-b(2026-09-03 dept-1 실측): collapse=True 면 **체인 루트만** 남긴다 — 매칭된 프로세스의
+      조상이 이미 매칭돼 있으면 그것은 같은 논리 서버의 자식이다(`cys run -- npm exec vite` →
+      `npm exec vite` → `node …/vite` 3프로세스 = 서버 1개). kill 대상 집합은 바뀌지 않는다
+      (호출부가 roots ∪ _descendants(roots) 를 죽인다) — 바뀌는 것은 **계수**뿐이다."""
     lines = lines if lines is not None else (_ps_lines() or [])
     regs = [re.compile(p) for p in SERVER_PATTERNS]
     excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
@@ -443,7 +526,110 @@ def _server_procs(lines=None):
             continue
         if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
             out.append((pid, cmd))
-    return out
+    return _collapse_to_roots(out) if collapse else out
+
+
+def _ppid_map():
+    """pid → ppid. 조회 실패는 None(체인 접기 불가 — 호출부가 measure_errors 로 신호한다)."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    m = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            m[int(f[0])] = int(f[1])
+    return m
+
+
+def _collapse_to_roots(procs, ppid=None):
+    """매칭 프로세스 목록 → **체인 루트만**(조상이 이미 매칭이면 제외). ppid 조회 실패 시 원본 그대로.
+
+    ★왜 계수를 접는가(A3-b · dept-1 22:05 실측 근거 impl/live-evidence/dept1-queue-starvation-2205.txt:56):
+      논리 서버 1개가 래퍼 체인 때문에 3으로 세어져 servers hard(3)에 걸렸다 — '서버 누적'을 막는
+      임계가 **하나도 안 띄운 상태에서** 착수를 거부한 것이다. 임계는 그대로 두고(근본은 계수)
+      같은 트리에 속한 자식을 접는다."""
+    if not procs:
+        return procs
+    pm = _ppid_map() if ppid is None else ppid
+    if not pm:
+        return procs                       # 체인 판정 불가 — 종전 계수(보수적 과대) 유지
+    matched = {p for p, _c in procs}
+    roots = []
+    for pid, cmd in procs:
+        cur, depth, has_matched_ancestor = pm.get(pid), 0, False
+        while cur and cur > 1 and depth < 64:      # depth 상한 = 순환 방어
+            if cur in matched:
+                has_matched_ancestor = True
+                break
+            cur, depth = pm.get(cur), depth + 1
+        if not has_matched_ancestor:
+            roots.append((pid, cmd))
+    return roots
+
+
+def _ledger_servers(override=None, socket_path=None):
+    """`cys ps` **프로세스 원장** 기준 논리 서버 수 → (개수 or None, 오류 목록).
+
+    ★A3-b: 원장은 `cys run -- <명령>` 1회당 항목 1개다(래퍼 체인이 몇 프로세스든). 그래서 계수의
+      정본은 ps 패턴이 아니라 원장이다. 단 원장은 서버 전용이 아니므로(dept-1 실측: `cys events
+      --category … --reconnect` 가 등재돼 있다) **SERVER_PATTERNS 매칭 항목만** 센다.
+    범위: 현재 레인(`cys ps`) + 부서 소켓(`cys ps --socket <sock>`) 합집합 · pid 중복 제거.
+    실패: 현재 레인 조회 실패 → (None, ["servers(ledger)"]) 로 호출부가 **패턴 폴백**하게 한다.
+      부서 조회 실패는 그 부서만 제외하고 `servers-ledger(<이름>)` 오류로 남긴다(전면 폴백 아님).
+    출력 형식(실측): `pid=<p>\\tpgid=<g>\\tscoped=<b>\\tsurface=<id>\\t<cmd>` 또는 `(ledger empty)`.
+    override(--servers-ledger-override)는 {"lane": "<텍스트>", "depts": {"<sock>": "<텍스트>"}}."""
+    regs = [re.compile(p) for p in SERVER_PATTERNS]
+    excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
+    errors, seen = [], {}
+
+    def _consume(text):
+        for line in (text or "").splitlines():
+            if not line.startswith("pid="):
+                continue                    # "(ledger empty)" · 잡음 행
+            fields = line.split("\t")
+            try:
+                pid = int(fields[0][len("pid="):])
+            except (ValueError, IndexError):
+                continue
+            cmd = fields[-1] if len(fields) >= 5 else ""
+            if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
+                seen[pid] = cmd
+
+    def _run_ps(argv):
+        p = subprocess.run(argv, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=LEDGER_TIMEOUT)
+        if p.returncode != 0:
+            raise ValueError("rc=%d" % p.returncode)
+        return p.stdout
+
+    if override is not None:
+        _consume(override.get("lane") or "")
+        for _sock, text in (override.get("depts") or {}).items():
+            _consume(text)
+        return len(seen), errors
+
+    try:
+        _consume(_run_ps(["cys", "ps"]))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None, ["servers(ledger)"]     # 현재 레인 실패 = 원장 신뢰 불가 → 패턴 폴백
+    lane_sock = os.environ.get("CYS_SOCKET")
+    for sock in sorted(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB))):
+        if lane_sock and os.path.abspath(sock) == os.path.abspath(lane_sock):
+            continue                         # 현재 레인과 같은 소켓 — 이미 셌다
+        name = os.path.basename(os.path.dirname(sock))
+        if name.startswith("cys-dept-"):
+            name = name[len("cys-dept-"):]
+        if not _socket_listening(sock):      # A3-c 프로브 재사용(stale 소켓에서 대기 0)
+            errors.append("servers-ledger(%s)" % name)
+            continue
+        try:
+            _consume(_run_ps(["cys", "ps", "--socket", sock]))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            errors.append("servers-ledger(%s)" % name)
+    return len(seen), errors
 
 
 def _descendants(roots):
@@ -612,6 +798,11 @@ def main(argv=None):
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--load-override", type=float, default=None, help="테스트 주입")
+    c.add_argument("--servers-ledger-override", dest="servers_ledger_override",
+                   type=_ledger_override_arg, default=None,
+                   help="★A3-b 테스트 주입 — 원장 텍스트 JSON {\"lane\":\"<cys ps 출력>\","
+                        "\"depts\":{\"<sock>\":\"<출력>\"}}. 지정 시 라이브 `cys ps` 조회를 "
+                        "전부 생략한다(결정론). 잘못된 JSON=EX_USAGE 64")
     c.add_argument("--dept-roster-override", dest="dept_roster_override", default=None,
                    type=_roster_override_arg,
                    help="테스트 주입 — 부서 로스터 JSON {active,seats,errors,depts}(라이브 "
@@ -891,16 +1082,37 @@ def self_test():
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
                 {"surfaces": [{"exited": False}, {"exited": False}, {"exited": True}]}), stderr="")
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="connect: refused")
-    saved_run, saved_glob = subprocess.run, glob.glob
+    # ★A3-c 축 분리: 리스너 프로브는 별도 축이다(전용 핀 = tests/test_resource_gate.py
+    #   TestSocketProbe · 실소켓 픽스처). 여기서 재는 것은 '데몬 응답 → 좌석 계상' 이므로
+    #   가짜 경로에서 프로브가 먼저 죽지 않게 통과로 고정한다(이 시뮬의 대상이 아니다).
+    _g = globals()
+    saved_run, saved_glob, saved_probe = subprocess.run, glob.glob, _g["_socket_listening"]
     try:
         subprocess.run = _fake_run
+        _g["_socket_listening"] = lambda _p: True
         glob.glob = lambda *_x, **_k: ["/h/.local/state/cys-dept-b/cys.sock",
                                        "/h/.local/state/cys-dept-a/cys.sock"]
         r = _dept_roster()
     finally:
         subprocess.run, glob.glob = saved_run, saved_glob
+        _g["_socket_listening"] = saved_probe
     chk(r == {"active": 1, "seats": 2, "errors": ["dept(b)"], "depts": [{"name": "a", "seats": 2}]},
         "라이브 경로 시뮬 로스터 불일치: %r" % r)
+    # ★A3-c: 프로브가 죽었다고 판정하면 **스폰 0** 으로 그 부서를 오류 계상한다(5s 절감의 본체).
+    _spawned = []
+    saved_run2, saved_glob2, saved_probe2 = subprocess.run, glob.glob, _g["_socket_listening"]
+    try:
+        subprocess.run = lambda *a2, **k2: _spawned.append(a2) or subprocess.CompletedProcess(
+            a2[0] if a2 else [], 0, stdout="{}", stderr="")
+        _g["_socket_listening"] = lambda _p: False
+        glob.glob = lambda *_x, **_k: ["/h/.local/state/cys-dept-dead/cys.sock"]
+        r2 = _dept_roster()
+    finally:
+        subprocess.run, glob.glob = saved_run2, saved_glob2
+        _g["_socket_listening"] = saved_probe2
+    chk(r2 == {"active": 0, "seats": 0, "errors": ["dept(dead)"], "depts": []},
+        "프로브 죽음 판정이 오류 계상으로 이어지지 않음: %r" % r2)
+    chk(not _spawned, "프로브가 죽음으로 판정했는데 cys status 를 스폰했다(지연 절감 무효)")
 
     if fails:
         print("javis_resource_gate self-test FAIL:")

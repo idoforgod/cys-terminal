@@ -12,7 +12,12 @@
 + ④ A1 픽스처(SURVEY A5 표 · F-a 4 · DESIGN A1): claude argv 2형태의 NODE_PATTERNS 계수 특성화 핀.
 """
 import json
+import argparse
 import os
+import time
+import tempfile
+import socket
+import shutil
 import subprocess
 import sys
 import types
@@ -35,6 +40,11 @@ def make_args(**over):
         load_soft_ratio=1.0, load_hard_ratio=2.0,
         context_soft=50, context_hard=60,
         dept_roster_override=None,
+        # ★A3-b 밀폐: measure() 는 servers 를 **원장**(`cys ps`)에서 먼저 읽는다. 기본값을
+        #   '빈 원장' 으로 주입해 단위 테스트가 실행 기계의 라이브 데몬에 의존하지 않게 한다
+        #   (라이브 의존 = 기계마다 다른 결과 = 결정론 파괴). 폴백 경로를 재는 테스트는
+        #   _ledger_servers 를 명시 패치한다.
+        servers_ledger_override={"lane": "(ledger empty)", "depts": {}},
     )
     for k, v in over.items():
         setattr(a, k, v)
@@ -208,7 +218,11 @@ class TestDeptRosterLive(unittest.TestCase):
     def _roster_for(self, *keys):
         self.calls = []
         socks = [self.SOCKS[k] for k in keys]
+        # ★A3-c 축 분리: 리스너 프로브(_socket_listening)는 **별도 축**이며 TestSocketProbe 가
+        #   실소켓 픽스처로 잠근다. 여기서 재는 것은 '데몬 응답 → 좌석 계상' 이므로 프로브는
+        #   통과로 고정한다(가짜 경로에 실소켓이 없어 프로브가 먼저 죽으면 이 축을 못 잰다).
         with mock.patch.object(G.glob, "glob", return_value=socks), \
+                mock.patch.object(G, "_socket_listening", return_value=True), \
                 mock.patch.object(G.subprocess, "run", side_effect=self._run_side_effect):
             return G._dept_roster()
 
@@ -285,6 +299,7 @@ class TestDeptRosterLive(unittest.TestCase):
         a = make_args(servers_override=0, nodes_override=0, load_override=0.0)
         self.calls = []
         with mock.patch.object(G.glob, "glob", return_value=[self.SOCKS["ok"], self.SOCKS["rc1"]]), \
+                mock.patch.object(G, "_socket_listening", return_value=True), \
                 mock.patch.object(G.subprocess, "run", side_effect=self._run_side_effect):
             m = G.measure(a)
         self.assertEqual(m["active_depts"], 1)
@@ -293,6 +308,199 @@ class TestDeptRosterLive(unittest.TestCase):
         self.assertEqual(m["measure_errors"], ["dept(rc1)"])
         self.assertEqual(m["nodes_hard_effective"], G.NODES_HARD_DEFAULT)
         self.assertEqual(G.evaluate(m, a)[0], "soft")
+
+
+
+class TestSocketProbe(unittest.TestCase):
+    """④ A3-c 리스너 프로브 — stale 소켓에서 5초를 태우지 않기 위한 축(실측 근거: 프로브 이전
+    stale 소켓 1개당 게이트 왕복 5.11s → 이후 0.07s). **판정은 바뀌지 않고 시간만 줄어든다** —
+    죽은 소켓은 종전에도 `dept(<이름>)` 오류로 계상됐다.
+
+    ★설계 원칙: '확실한 죽음'만 False 다. 판정 불가(권한·미지원·그 밖의 OSError)는 True 로 접어
+    종전 경로(`cys status` 왕복)로 보낸다 — 프로브가 판정기가 되면 안 된다(측정 불능은 통과가
+    아니라 '종전 경로로 진행'이다)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="probe-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_plain_file_is_dead(self):
+        # 잔재가 소켓이 아닌 일반 파일인 형상 — macOS 실측 errno 38(ENOTSOCK)
+        p = os.path.join(self.tmp, "plain.sock")
+        open(p, "w").close()
+        self.assertFalse(G._socket_listening(p))
+
+    def test_missing_path_is_dead(self):
+        # glob 과 프로브 사이 레이스로 경로가 사라진 형상 — ENOENT
+        self.assertFalse(G._socket_listening(os.path.join(self.tmp, "nope.sock")))
+
+    def test_bound_but_not_listening_is_dead(self):
+        # ★가장 현실적인 잔재: 데몬이 비정상 종료해 소켓 inode 만 남은 형상 — ECONNREFUSED
+        p = os.path.join(self.tmp, "dead.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(p)
+        s.close()
+        self.assertTrue(os.path.exists(p), "픽스처가 소켓 파일을 남기지 못했다")
+        self.assertFalse(G._socket_listening(p))
+
+    def test_listening_socket_is_alive(self):
+        p = os.path.join(self.tmp, "live.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(p)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        self.assertTrue(G._socket_listening(p))
+
+    def test_unknown_oserror_is_not_a_verdict(self):
+        # 권한 오류(EACCES) 등 '판정 불가'는 True — 종전 경로로 보내고 프로브가 결론내지 않는다.
+        with mock.patch.object(G.socket, "socket",
+                               side_effect=PermissionError(13, "Permission denied")):
+            self.assertTrue(G._socket_listening("/whatever.sock"))
+
+    def test_timeout_is_not_a_verdict(self):
+        # 연결이 매달리는 형상(socket.timeout ⊂ OSError · errno 없음) → 판정 불가 → True
+        class _S:
+            def settimeout(self, _t):
+                pass
+
+            def connect(self, _p):
+                raise socket.timeout("timed out")
+
+            def close(self):
+                pass
+        with mock.patch.object(G.socket, "socket", return_value=_S()):
+            self.assertTrue(G._socket_listening("/slow.sock"))
+
+    def test_windows_skips_probe(self):
+        # Windows 부서 소켓은 named pipe — AF_UNIX 프로브 대상이 아니다(분기 보존).
+        with mock.patch.object(G.os, "name", "nt"):
+            self.assertTrue(G._socket_listening("\\\\.\\pipe\\cys-dept-x"))
+
+    def test_probe_timeout_constant_is_subsecond(self):
+        # 프로브가 초 단위면 목적(5s 절감)을 잃는다 — 상한을 상수로 못박는다.
+        self.assertLessEqual(G.SOCKET_PROBE_TIMEOUT, 1.0)
+
+    def test_stale_socket_roster_is_fast_and_counted_as_error(self):
+        """★A3-c 목적 자체의 핀: stale 소켓이 있어도 로스터 산출이 **1초 안에** 끝나고
+        그 부서는 오류로 계상된다(판정 무변경 · 시간만 감소). 프로브 이전에는 여기서
+        DEPT_STATUS_TIMEOUT(5s)이 통째로 소요됐다."""
+        p = os.path.join(self.tmp, "stale.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(p)
+        s.close()
+        calls = []
+
+        def _never(argv, **kw):
+            calls.append(argv)
+            raise AssertionError("stale 소켓에 cys status 를 스폰했다(프로브 미발화)")
+
+        t0 = time.monotonic()
+        with mock.patch.object(G.glob, "glob", return_value=[p]), \
+                mock.patch.object(G.subprocess, "run", side_effect=_never):
+            roster = G._dept_roster()
+        elapsed = time.monotonic() - t0
+        self.assertEqual(roster["active"], 0)
+        self.assertEqual(roster["seats"], 0)
+        self.assertEqual(len(roster["errors"]), 1, roster)
+        self.assertFalse(calls, "스폰 0 계약 위반")
+        self.assertLess(elapsed, 1.0, "stale 소켓에서 %0.2fs 소요 — 프로브가 무효" % elapsed)
+
+
+
+class TestServersLedger(unittest.TestCase):
+    """⑤ A3-b servers 축 — 논리 서버는 **프로세스 원장**(`cys ps`) 항목 수다.
+
+    근거(dept-1 실측 22:05 · impl/live-evidence/dept1-queue-starvation-2205.txt:56): 논리 서버
+    1개가 래퍼 체인(`cys run -- npm exec vite` → `npm exec vite` → `node …/vite`) 때문에 ps
+    패턴에서 3으로 세어져 servers hard(3)에 걸렸다 — 아무 서버도 새로 띄우지 않은 레인이
+    '서버 누적' 판정으로 착수를 거부당했다. 임계는 그대로 두고(근본은 계수) 계수를 고친다."""
+
+    LEDGER = ("pid=101\tpgid=101\tscoped=true\tsurface=3\tcys run -- npm exec vite\n"
+              "pid=202\tpgid=202\tscoped=true\tsurface=4\tcys events --category queue --reconnect\n")
+
+    def test_ledger_counts_only_server_entries(self):
+        # 원장에 서버 1 + 비서버 1 → 1 (원장은 서버 전용이 아니다 — dept-1 실측 형상)
+        n, errs = G._ledger_servers({"lane": self.LEDGER, "depts": {}})
+        self.assertEqual((n, errs), (1, []))
+
+    def test_empty_ledger_is_zero(self):
+        self.assertEqual(G._ledger_servers({"lane": "(ledger empty)", "depts": {}}), (0, []))
+
+    def test_dept_ledgers_are_summed_and_pid_deduped(self):
+        dept = ("pid=101\tpgid=101\tscoped=true\tsurface=9\tcys run -- npm exec vite\n"
+                "pid=303\tpgid=303\tscoped=true\tsurface=9\tnode /srv/server.js\n")
+        n, errs = G._ledger_servers({"lane": self.LEDGER, "depts": {"/x/cys.sock": dept}})
+        self.assertEqual((n, errs), (2, []), "pid 101 중복 계상 또는 부서 합산 누락")
+
+    def test_chain_of_three_processes_is_one_logical_server(self):
+        """★재현 픽스처: 같은 체인 3프로세스 → 패턴 폴백 계수 1. 음성 대조로 **구 계수식**
+        (_count_matching)이 같은 입력에서 3 을 내는 것까지 확인한다 — 픽스처가 결함을
+        실제로 재현한다는 증거가 없으면 이 테스트는 아무것도 증명하지 못한다."""
+        lines = ["  101 cys run -- npm exec vite",
+                 "  102 npm exec vite",
+                 "  103 node /Users/x/proj/node_modules/.bin/vite --port 5173"]
+        ppid = {101: 1, 102: 101, 103: 102}
+        self.assertEqual(G._count_matching(lines, G.SERVER_PATTERNS, G.SERVER_EXCLUDE_PATTERNS), 3,
+                         "음성 대조 실패 — 픽스처가 구 계수식에서 3 을 재현하지 못한다")
+        with mock.patch.object(G, "_ppid_map", return_value=ppid):
+            roots = G._server_procs(lines)
+        self.assertEqual([p for p, _c in roots], [101], "체인 루트 접기 실패")
+
+    def test_two_independent_servers_stay_two(self):
+        # 접기가 서로 다른 트리까지 합치면 실서버 누적을 놓친다(반대 방향 회귀 차단).
+        lines = ["  101 cys run -- npm exec vite", "  201 uvicorn app:main"]
+        with mock.patch.object(G, "_ppid_map", return_value={101: 1, 201: 1}):
+            roots = G._server_procs(lines)
+        self.assertEqual(sorted(p for p, _c in roots), [101, 201])
+
+    def test_ppid_unavailable_keeps_conservative_count(self):
+        # 체인 판정 불가 → 접지 않는다(과대계수는 보수적 방향 — 조용한 과소계수 금지)
+        lines = ["  101 cys run -- npm exec vite", "  102 npm exec vite"]
+        with mock.patch.object(G, "_ppid_map", return_value=None):
+            self.assertEqual(len(G._server_procs(lines)), 2)
+
+    def test_lane_ledger_failure_falls_back_to_pattern_with_error(self):
+        a = make_args(nodes_override=0, load_override=0.0, servers_ledger_override=None)
+        lines = ["  101 cys run -- npm exec vite", "  102 npm exec vite"]
+        with mock.patch.object(G, "_ledger_servers", return_value=(None, ["servers(ledger)"])), \
+                mock.patch.object(G, "_ps_lines", return_value=lines), \
+                mock.patch.object(G, "_ppid_map", return_value={101: 1, 102: 101}), \
+                mock.patch.object(G, "_dept_roster", return_value={
+                    "active": 0, "seats": 0, "errors": [], "depts": []}):
+            m = G.measure(a)
+        self.assertEqual(m["servers"], 1, "폴백에서도 체인은 1개로 세어야 한다")
+        self.assertIn("servers(ledger)", m["measure_errors"])
+        self.assertEqual(G.evaluate(m, a)[0], "soft", "원장 실패는 최소 soft 로 신호해야 한다")
+
+    def test_dept_ledger_failure_is_partial_not_total(self):
+        # 부서 원장 실패는 그 부서만 빠지고 전면 폴백이 아니다(오류만 남는다).
+        n, errs = G._ledger_servers({"lane": self.LEDGER, "depts": {}})
+        self.assertEqual(n, 1)
+        with mock.patch.object(G.glob, "glob", return_value=["/h/.local/state/cys-dept-x/cys.sock"]), \
+                mock.patch.object(G, "_socket_listening", return_value=False), \
+                mock.patch.object(G.subprocess, "run",
+                                  return_value=_cp(["cys", "ps"], 0, self.LEDGER)):
+            n2, errs2 = G._ledger_servers()
+        self.assertEqual(n2, 1, "현재 레인 원장은 그대로 세어야 한다")
+        self.assertEqual(errs2, ["servers-ledger(x)"])
+
+    def test_threshold_unchanged(self):
+        """★임계 상향 금지(CEO 지시 — 근본은 계수다). **프로덕션 기본값**으로 잰다.
+
+        주의: 이 파일의 `make_args` 대역은 servers_hard=4 로 프로덕션 argparse 기본값(3)과
+        다르다(선행 코드의 대역 값 — 이 커밋에서 건드리지 않는다). 임계 계약은 대역이 아니라
+        실제 CLI 기본값으로 확인해야 의미가 있으므로 main() 경로를 그대로 탄다."""
+        import contextlib
+        import io
+        argv = ["check", "--json", "--nodes-override", "0", "--load-override", "0.0",
+                "--dept-roster-override", '{"active":0,"seats":0,"errors":[],"depts":[]}',
+                "--servers-ledger-override", '{"lane":"(ledger empty)","depts":{}}']
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_soft = G.main(argv + ["--servers-override", "2"])
+            rc_hard = G.main(argv + ["--servers-override", "3"])
+        self.assertEqual(rc_soft, G.EXIT_SOFT, "servers 2 가 soft 가 아니다 — 임계가 움직였다")
+        self.assertEqual(rc_hard, G.EXIT_HARD, "servers 3 이 hard 가 아니다 — 임계가 움직였다")
+        self.assertEqual(G.NODES_HARD_DEFAULT, 18)
 
 
 class TestClaudeArgvForms(unittest.TestCase):
