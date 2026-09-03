@@ -6,7 +6,7 @@ name: release
 #   (P0 이력: 과거 '--draft=수동 Publish 누락 위험'으로 자동 발행을 썼으나, v0.14.0(2026-07-28)부터
 #    draft 생성까지만 CI — 공개 발행·latest 마킹은 오너 승인 후 별도 집행이 정책이다. 되돌리지 마라.
 #    구 배포 repo cys-terminal-releases는 Archive — 마지막 미러가 구 설치본 이주 경로로 영구 생존.)
-# 사용: 버전 6곳 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
+# 사용: 버전 8곳(수동 6 + Cargo.lock 2패키지) 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
 #       (수동 실행도 가능 — Actions 탭 Run workflow)
 # 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY
 
@@ -208,7 +208,8 @@ jobs:
         shell: bash
         run: bash scripts/secret-scan.sh --all
 
-      # 버전 SOT 6곳 일치 hard-gate — 드리프트인 채 발행 차단(v0.12.11에서 wxs 2곳 0.12.10 잔류
+      # 버전 SOT 8곳(수동 6 + Cargo.lock 2패키지) 일치 hard-gate — 드리프트인 채 발행 차단
+      # (v0.12.11에서 wxs 2곳 0.12.10 잔류
       # 실증·2026-07-05). 태그 push면 태그=소스 버전까지 단언, workflow_dispatch(브랜치)면 상호 일치만.
       - name: Version SOT check (drift hard-gate)
         shell: bash

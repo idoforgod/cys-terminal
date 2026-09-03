@@ -1,7 +1,8 @@
 # 릴리스 절차 (cys 터미널)
 
 > **현행 표준 절차(2026-07 정정)**: 릴리스는 **release.yml 자동화**가 정본이다 —
-> ①버전 범프(아래 §0 4곳)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
+> ①버전 범프(아래 §0 **8곳** = 수동 6 + `Cargo.lock` 2패키지)+`cargo build`(Cargo.lock 재생성)
+> +로컬 `bash scripts/secret-scan.sh --all` clean 확인
 > ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
 > ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
 >  (windows-build.yml PTY 스모크는 **pane env 실주입 관측** — U-20 `CLAUDE_CODE_GIT_BASH_PATH`·
@@ -434,8 +435,8 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] `cargo build --release` 무오류 · `cargo clippy --bins` 0경고 · `cargo test` 통과
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
-- [ ] 버전 문자열 4곳(+wxs 2곳) 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
-      (**Cargo.lock 2패키지 포함 8곳**. 범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
+- [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
+      (범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
 - [ ] **★★실사용자 경로 게이트 — DMG 2종 전부 exit 0 (2026-08-01 신설 · 필수 · 생략 불가)**
 

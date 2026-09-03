@@ -1,7 +1,8 @@
 #!/bin/sh
 # version-check.sh — 버전 SOT 8곳 일치 검증 (드리프트 차단)
 #
-# 왜: 릴리스 버전이 Cargo/tauri/ui/wxs 6곳에 흩어져 수동 동기화된다(docs/RELEASE.md §0).
+# 왜: 릴리스 버전이 **8곳(수동 6 + Cargo.lock 2패키지)**에 흩어져 있다(docs/RELEASE.md §0).
+#     그중 수동 동기화 대상은 Cargo/tauri/ui/wxs 6곳이고, Cargo.lock 2패키지는 cargo 재생성물이다.
 #     0.4.0→0.4.1 범프에서 wxs 2곳이 누락돼 드리프트가 발생한 적이 있다.
 #     이 가드를 release.yml build job 첫 step + 로컬 preflight로 걸면 불일치 시 빌드/발행이 차단된다.
 #
