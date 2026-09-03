@@ -283,6 +283,29 @@ reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.
 #   Windows python 이 FileNotFoundError 로 죽고, 파이프 소비자(rotate 등재 게이트)·reg_count 캡처
 #   ("부서 수" 산정·down 의 강등 판정)가 전부 빈 값이 됐다(win 잠복 결함).
 reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1]))['depts']]" "$REG" | tr -d '\r'; }
+
+# ★A2(SURVEY B3): 등재(SOT=depts.json)에 없는데 **소켓 디렉터리만** 남은 부서를 stderr 로 고지한다.
+#   정상 teardown 은 상태 디렉터리를 TRASH_ROOT 로 격리하므로 이 형상은 **비정상 종료 잔재**다.
+#   방치하면 자원 게이트가 유령 소켓의 응답을 타임아웃까지 기다린다(실측 5.1s/개 — A3-c).
+#   ★stdout 은 건드리지 않는다: 심박·fan-out 소비자(`for d in $(cys-dept list)`)의 계약이
+#   stdout 이라, 경고를 거기 섞으면 유령 이름이 부서명으로 소비된다. 경고는 stderr 전용이다.
+#   Windows named pipe(`\\.\pipe\cys-dept-<n>`)는 파일이 아니라 glob 대상이 아니므로 unix 한정
+#   (dept_sock:47 의 분기 관례 재사용 — Windows 거동 무변경).
+dept_warn_unregistered_socks(){
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+  esac
+  local names d n
+  names="${1-}"
+  for d in "$HOME"/.local/state/cys-dept-*/; do
+    [ -d "$d" ] || continue
+    n="${d%/}"; n="${n##*/cys-dept-}"
+    [ -n "$n" ] || continue
+    if printf '%s\n' "$names" | grep -Fxq -- "$n"; then continue; fi
+    echo "[cys-dept] 미등재 소켓 디렉터리: $n (${d%/}) — depts.json 에 없다(비정상 종료 잔재 가능). 자원 게이트 지연의 원인이니 정리하라." >&2
+  done
+  return 0
+}
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
 reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
@@ -1693,7 +1716,12 @@ EOF
       echo "[cys-dept] promote-if-pending: 조건 미충족 — no-op"
     fi
     ;;
-  list) reg_names ;;
+  list)
+    # stdout=등재명만(소비자 계약 불변) · 유령 소켓 디렉터리 고지는 stderr 로만(A2).
+    _dl_names="$(reg_names)"
+    if [ -n "$_dl_names" ]; then printf '%s\n' "$_dl_names"; fi
+    dept_warn_unregistered_socks "$_dl_names"
+    ;;
   sock)
     name="${2:-}"
     # ★D3(i): sock은 read-only(방송 fan-out 루프 `sock "$d"` 호출부)라 기존 등재의 레거시 비정형명
