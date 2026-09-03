@@ -246,15 +246,27 @@ def ensure_order_gate(m):
         feeds = _ensure_harness(m, live={"master", "cso"}, installed=all_clis, resource_ok=True)
         for _ in range(10):
             m.ensure(socket="/tmp/c2.sock")
-        check("10b 편성 실행 경로 10회 → 표면화 1회(final 경로 스팸 게이트 = _surface 교체)",
-              len(feeds) == 1 and feeds[0][0] == "formation-partial", "feeds=%r" % (feeds,))
+        # ★A2(2026-09-03 · SURVEY B3 Q2-①) 이후 feed 는 **두 축**이다 — 상태 kind 전이 축과
+        #   시도 원장 보류 축(m.HELD_FEED_TITLE). 종전 `len(feeds) == 1` 은 두 축을 한 통에 세서
+        #   원장 축이 생기는 순간 뒤집힌다. 축을 갈라 **각각** 10회에 1회임을 못박는다(총수 검사보다
+        #   강한 단언: 어느 한 축이 매 틱 발화하면 그 축의 계수에서 즉시 잡힌다).
+        state_feeds = [f for f in feeds if f[1] != m.HELD_FEED_TITLE]
+        held_feeds = [f for f in feeds if f[1] == m.HELD_FEED_TITLE]
+        check("10b 편성 실행 경로 10회 → 전이 표면화 1회(final 경로 스팸 게이트 = _surface 교체)",
+              len(state_feeds) == 1 and state_feeds[0][0] == "formation-partial",
+              "feeds=%r" % (feeds,))
+        check("10c ★원장 보류 축도 10회 → feed 1회(보류 목록 무변화 시 침묵 · A2)",
+              len(held_feeds) == 1 and "cooldown" in held_feeds[0][2],
+              "held_feeds=%r" % (held_feeds,))
 
         # (d) kind 전이 → 표면화 재발화(침묵 금지 C6 보존 — 스팸 억제가 침묵으로 퇴화하지 않음).
         m._live_roles = lambda socket=None, require_live_agent=True: {"master", "cso"}
         m._resource_ok = lambda socket=None: True
         m.ensure(socket="/tmp/c.sock")
+        state_feeds = [f for f in feeds if f[1] != m.HELD_FEED_TITLE]   # A2 축 분리(위 10b 주석)
         check("11 kind 전이(complete→partial) → 표면화 재발화",
-              len(feeds) == 2 and feeds[1][0] == "formation-partial", "feeds=%r" % (feeds,))
+              len(state_feeds) == 2 and state_feeds[1][0] == "formation-partial",
+              "feeds=%r" % (feeds,))
 
         # ── 12. ★force_surface 양방향 핀(2026-07-26 · 앱 부트 배너 소멸 갭 수리) ──
         #   배경: 표면화를 '전이 시에만'으로 좁히자 **앱 재시작** 구멍이 생겼다 — UI 의 중복 억제
