@@ -10,7 +10,8 @@
 사용:
     python3 javis_memory.py add --type feedback --name <kebab-slug> \
         --desc "<한 줄 요약>" --body "<사실 본문>"        # 증류 1건 (원자적)
-    python3 javis_memory.py verify [--json]               # 색인↔파일 정합 기계검증
+    python3 javis_memory.py verify [--json] [--desc-strict]  # 색인↔파일 정합 + 훅↔description 대조
+    python3 javis_memory.py update --name <slug> [--desc "..."] [--body "..."]  # 갱신(원자적·롤백)
     python3 javis_memory.py recent --minutes 1440 [--json] # 최근 증류 목록 (게이트 증거)
     python3 javis_memory.py --self-test                    # 결정론 자기검증 (preflight C18)
 
@@ -29,6 +30,7 @@ import re
 import sys
 import tempfile
 import time
+import unicodedata
 
 # ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
 #   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**
@@ -273,6 +275,100 @@ def cmd_add(mdir, args):
     return 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# A7(0.14.30): 색인 훅 ↔ 파일 description 대조
+# ─────────────────────────────────────────────────────────────────────────────
+# 왜 필요한가(dept-1 실측 + 본부 재현 2026-09-04): `verify` 는 '색인↔파일 정합 기계검증'을
+# 자칭하면서 **색인 줄의 훅 문장과 파일 frontmatter 의 description 을 대조하지 않았다**. 도구에
+# 수정 명령도 없어(add·verify·recent·health·audit·scan·graph) 갱신할 때 한쪽만 손편집되고
+# verify 는 그것을 못 잡았다. 실해가 큰 이유: **색인은 매 세션 전 노드에 자동 주입**되고 파일
+# 본문은 필요할 때만 열리므로, 색인이 철회된 처방을 계속 전파한다(dept-1 60건 중 5건 드리프트,
+# 그중 2건은 방향이 정반대였다).
+INDEX_ROW_RE = re.compile(r"^\s*-\s*\[[^\]]*\]\(([^)\s]+\.md)\)\s*(?:—|–|-)\s*(.*)$")
+_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍﻿"), None)
+# ★극성 쌍 — containment 를 통과해도 **방향이 뒤집힌** 서술을 '정합'으로 접지 않기 위한 별도 축.
+#   (dept-1 의 '정본 2건이 방향 정반대' 케이스가 이 축의 존재 이유다.)
+POLARITY_PAIRS = (("미부여", "부여"), ("금지", "허용"), ("상주", "제거"),
+                  ("활성", "비활성"), ("없음", "있음"), ("불가", "가능"),
+                  ("차단", "통과"), ("실패", "성공"))
+
+
+def normalize_desc(s):
+    """대조용 정규화 — NFKC → 마크다운 강조(`**`)·백틱 제거 → 제로폭 제거 → 공백 1칸 붕괴 →
+    양끝 공백·구두점 제거 → casefold. **표기 차이는 드리프트가 아니다**(오탐 차단)."""
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("**", "").replace("`", "")
+    s = s.translate(_ZERO_WIDTH)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.strip(" .,·:;—–-()[]").casefold()
+
+
+def polarity_tokens(s):
+    """극성 토큰 집합 — 각 쌍에서 **긴 토큰 우선**으로 하나만 센다(`미부여` ⊃ `부여` 오검출 차단)."""
+    n = normalize_desc(s)
+    out = set()
+    for a, b in POLARITY_PAIRS:
+        long_t, short_t = (a, b) if len(a) >= len(b) else (b, a)
+        if long_t.casefold() in n:
+            out.add(long_t)
+        elif short_t.casefold() in n:
+            out.add(short_t)
+    return out
+
+
+def index_rows(index_text):
+    """색인 본문 → [(파일명, 훅 문장)] — HTML 주석·코드펜스 안의 예시는 색인이 아니다
+    (index_links 와 같은 가시성 규약)."""
+    visible = FENCED_CODE_RE.sub("", HTML_COMMENT_RE.sub("", index_text))
+    rows = []
+    for line in visible.splitlines():
+        m = INDEX_ROW_RE.match(line)
+        if not m:
+            continue
+        fn = m.group(1)
+        if "/" in fn or fn == INDEX_FILE:
+            continue
+        rows.append((fn, m.group(2)))
+    return rows
+
+
+def collect_desc_problems(mdir):
+    """색인 훅 ↔ 파일 description 대조 결과(순수 판정 · 없으면 빈 리스트).
+
+    규칙(테스트가 못박는 정의): 정규화 후 **양방향 containment** — 훅 ⊆ description 또는
+    description ⊆ 훅 이면 정합이다(색인이 요약본인 현행 관행을 보존한다 = 과잉 차단 0).
+    어느 쪽도 아니면 `desc_drift`. 정합이더라도 **극성 토큰 집합이 다르면** `desc_polarity` 로
+    별도 계상한다.
+    ★이 목록은 기본적으로 **exit 코드를 바꾸지 않는다** — 사유는 cmd_verify 주석 참조."""
+    problems = []
+    index_path = os.path.join(mdir, INDEX_FILE)
+    if not os.path.isfile(index_path):
+        return problems
+    index_text = open(index_path, encoding="utf-8", errors="replace").read()
+    for fn, hook in index_rows(index_text):
+        fpath = os.path.join(mdir, fn)
+        if not os.path.isfile(fpath):
+            continue                      # dangling 은 collect_problems 의 축이다(중복 계상 금지)
+        fm = parse_frontmatter(open(fpath, encoding="utf-8", errors="replace").read())
+        desc = fm.get("description")
+        if desc is None:
+            continue                      # frontmatter 불량도 collect_problems 축이다
+        h, d = normalize_desc(hook), normalize_desc(desc)
+        if not h or not d:
+            continue                      # 빈 훅·빈 설명은 형식 축(여기서 이중 계상하지 않는다)
+        if h in d or d in h:
+            ph, pd = polarity_tokens(hook), polarity_tokens(desc)
+            if ph != pd:
+                problems.append(
+                    "%s: desc_polarity — 색인 훅과 description 의 방향이 다르다 "
+                    "(훅=%s · description=%s)" % (fn, sorted(ph) or "-", sorted(pd) or "-"))
+        else:
+            problems.append(
+                "%s: desc_drift — 색인 훅과 파일 description 이 서로를 포함하지 않는다 "
+                "(훅=%r · description=%r)" % (fn, hook.strip()[:80], desc.strip()[:80]))
+    return problems
+
+
 def collect_problems(mdir):
     """색인↔파일 정합·형식 문제 목록 (없으면 빈 리스트) — verify의 본체."""
     problems = []
@@ -316,18 +412,159 @@ def collect_problems(mdir):
     return problems
 
 
-def cmd_verify(mdir, as_json):
+def _fm_bounds(text):
+    """frontmatter 구간 (시작줄 idx, 끝 '---' 줄 idx) — 형식 불량이면 None."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return (0, i)
+    return None
+
+
+def _replace_fm_description(text, desc):
+    """frontmatter 안의 description 줄만 교체(본문 무접촉). 없으면 None."""
+    b = _fm_bounds(text)
+    if b is None:
+        return None
+    lines = text.split("\n")
+    for i in range(b[0] + 1, b[1]):
+        if lines[i].strip().startswith("description:"):
+            lines[i] = "description: %s" % desc.strip()
+            return "\n".join(lines)
+    return None
+
+
+def _replace_body(text, body):
+    """frontmatter 는 그대로 두고 본문만 교체. 형식 불량이면 None."""
+    b = _fm_bounds(text)
+    if b is None:
+        return None
+    lines = text.split("\n")
+    return "\n".join(lines[:b[1] + 1]) + "\n\n" + body.strip() + "\n"
+
+
+def _replace_index_hook(index_text, fn, desc):
+    """색인에서 `fn` 항목의 훅 문장만 교체 → (새 색인, 교체 건수).
+    코드펜스·HTML 주석 안의 예시 줄은 애초에 매칭 대상이 아니어야 하므로, 교체 건수가 정확히
+    1 이 아니면 호출측이 거부한다(0=미등재 · 2+=중복 등재)."""
+    out, changed = [], 0
+    fenced = False
+    for line in index_text.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        m = None if fenced else INDEX_ROW_RE.match(line)
+        if m and m.group(1) == fn:
+            out.append(line[:m.start(2)] + desc.strip())
+            changed += 1
+        else:
+            out.append(line)
+    return "\n".join(out), changed
+
+
+def cmd_update(mdir, args):
+    """★A7: 파일(frontmatter description·본문)과 색인 1줄을 **한 번에** 갱신한다.
+
+    이 명령이 없어서 갱신은 늘 손편집이었고, 한쪽만 고쳐도 verify 가 못 잡았다(그 두 결함이
+    같은 뿌리다). add 의 원자성 규약을 그대로 재사용한다 — 잠금 하에서 파일을 원자 교체하고,
+    **색인 쓰기가 실패하면 파일을 원상 복구**한다(부분 갱신 0)."""
+    desc = getattr(args, "desc", None)
+    body = getattr(args, "body", None)
+    if desc is None and body is None:
+        return fail(2, "--desc 또는 --body 중 최소 하나는 필요하다")
+    if desc is not None and not desc.strip():
+        return fail(2, "--desc 는 비울 수 없다")
+    if body is not None and not body.strip():
+        return fail(2, "--body 는 비울 수 없다")
+    index_path = os.path.join(mdir, INDEX_FILE)
+    if not os.path.isfile(index_path):
+        return fail(2, "%s 없음 — verify 로 정합부터 복구하라" % INDEX_FILE)
+
+    matches = []
+    for fn in memory_files(mdir):
+        text = open(os.path.join(mdir, fn), encoding="utf-8", errors="replace").read()
+        fm = parse_frontmatter(text)
+        if fm["name"] == args.name:
+            matches.append((fn, text))
+    if not matches:
+        return fail(2, "미등재 슬러그: %r — 파일 frontmatter 의 name 과 일치해야 한다" % args.name)
+    if len(matches) > 1:
+        return fail(2, "중복 슬러그: %r (%s) — verify 로 정합부터 복구하라"
+                    % (args.name, ", ".join(fn for fn, _ in matches)))
+    fn, old_text = matches[0]
+    fpath = os.path.join(mdir, fn)
+
+    new_text = old_text
+    if desc is not None:
+        new_text = _replace_fm_description(new_text, desc)
+        if new_text is None:
+            return fail(2, "%s: frontmatter 형식 불량 — description 줄을 찾지 못했다" % fn)
+    if body is not None:
+        new_text = _replace_body(new_text, body)
+        if new_text is None:
+            return fail(2, "%s: frontmatter 형식 불량 — 본문 경계를 찾지 못했다" % fn)
+
+    try:
+        with FileLock(index_path):
+            index_text = open(index_path, encoding="utf-8", errors="replace").read()
+            new_index, changed = (index_text, 0)
+            if desc is not None:
+                new_index, changed = _replace_index_hook(index_text, fn, desc)
+                if changed != 1:
+                    return fail(2, "색인 항목이 %d 건 — %s 는 정확히 1건이어야 한다"
+                                   "(verify 로 정합부터 복구하라)" % (changed, fn))
+            _write_text_atomic(fpath, new_text)
+            if desc is not None:
+                try:
+                    _write_text_atomic(index_path, new_index)
+                except Exception as e:      # OSError 뿐 아니라 주입 실패도 잡아 롤백한다
+                    try:
+                        _write_text_atomic(fpath, old_text)   # ★롤백 — 부분 갱신 금지
+                    except Exception:
+                        return fail(3, "색인 갱신 실패 + 본문 롤백 실패(%s) — 수동 복구 필요" % e)
+                    return fail(3, "색인 갱신 실패(본문 원복됨): %s" % e)
+    except TimeoutError as e:
+        return fail(3, str(e))
+
+    print(json.dumps({"updated": fn,
+                      "fields": [k for k, v in (("description", desc), ("body", body))
+                                 if v is not None],
+                      "index_updated": desc is not None},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_verify(mdir, as_json, desc_strict=False):
+    """색인↔파일 정합 + (A7) 색인 훅↔description 대조.
+
+    ★기본값이 report-only 인 이유(실측 근거): preflight `C18.memory-engine` 이 이 명령의
+      **exit 코드를 그대로 소비**해 비0이면 FAIL 을 찍는다(javis_preflight.py:2550-2564).
+      description 축을 기본으로 exit 에 넣으면 표기 차이 한 건이 **전 설치의 preflight 를
+      적색으로 만든다** — 라이브 색인 사본 실측에서도 13건 중 1건이 드리프트로 뒤집혔다.
+      색인은 세션 주입 경로이고 이 축은 **보고용**이라는 설계 조문(“exit 코드 계약 불변 ·
+      preflight 를 죽이지 않는다”)을 그대로 구현한 것이다. 게이트로 쓰려면 `--desc-strict`
+      로 **명시 옵트인**한다(그때만 problems 에 합류해 exit 1 이 된다)."""
     problems = collect_problems(mdir)
+    desc_probs = collect_desc_problems(mdir)
+    if desc_strict:
+        problems = problems + desc_probs
     if as_json:
         print(json.dumps({"ok": not problems, "dir": mdir,
-                          "files": len(memory_files(mdir)), "problems": problems},
+                          "files": len(memory_files(mdir)), "problems": problems,
+                          "desc_problems": desc_probs, "desc_strict": bool(desc_strict)},
                          ensure_ascii=False, indent=2))
     else:
         for p in problems:
             print("[FAIL] %s" % p)
-        print("verify: %s — 파일 %d · 문제 %d (%s)"
+        if not desc_strict:
+            for p in desc_probs:
+                print("[DESC] %s" % p)
+        print("verify: %s — 파일 %d · 문제 %d · description 드리프트 %d%s (%s)"
               % ("OK" if not problems else "NOT OK",
-                 len(memory_files(mdir)), len(problems), mdir))
+                 len(memory_files(mdir)), len(problems), len(desc_probs),
+                 "" if desc_strict else "(보고용 — exit 무영향 · 게이트로 쓰려면 --desc-strict)",
+                 mdir))
         if problems:
             print("이 출력 외의 추론으로 정합을 선언하지 마라.")
     return 0 if not problems else 1
@@ -701,6 +938,19 @@ def main():
 
     v = sub.add_parser("verify", help="색인↔파일 정합 기계검증 (0=정합 1=부정합)")
     v.add_argument("--json", action="store_true")
+    # A7: description 대조 축은 **기본 보고용**(exit 무영향 — preflight C18 이 exit 를 소비한다).
+    #     게이트로 쓰려면 --desc-strict 로 명시 옵트인한다. 두 스위치는 상호 배타다.
+    vg = v.add_mutually_exclusive_group()
+    vg.add_argument("--desc-strict", dest="desc_strict", action="store_true",
+                    help="색인 훅↔description 드리프트를 problems 로 계상(exit 1) — 게이트용 옵트인")
+    vg.add_argument("--desc-report-only", dest="desc_strict", action="store_false",
+                    help="(기본) 드리프트를 목록으로만 보고하고 exit 코드는 바꾸지 않는다")
+    v.set_defaults(desc_strict=False)
+
+    u = sub.add_parser("update", help="기존 증류 1건 갱신 — 파일 + 색인 1줄 (원자적·롤백)")
+    u.add_argument("--name", required=True, help="kebab 슬러그(파일 frontmatter 의 name)")
+    u.add_argument("--desc", default=None, help="새 한 줄 요약(파일 description + 색인 훅 동시 갱신)")
+    u.add_argument("--body", default=None, help="새 본문(frontmatter 는 보존)")
 
     r = sub.add_parser("recent", help="최근 N분 내 증류 목록 (게이트 증거)")
     r.add_argument("--minutes", type=int, default=1440)
@@ -727,7 +977,9 @@ def main():
     if args.cmd == "add":
         return cmd_add(mdir, args)
     if args.cmd == "verify":
-        return cmd_verify(mdir, args.json)
+        return cmd_verify(mdir, args.json, getattr(args, "desc_strict", False))
+    if args.cmd == "update":
+        return cmd_update(mdir, args)
     if args.cmd == "recent":
         return cmd_recent(mdir, args.minutes, args.json)
     if args.cmd == "health":
