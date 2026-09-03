@@ -12,11 +12,38 @@
 # 냈다. 여기서 끊으면 미무장 pane 은 **프로세스 스폰 0**이고, 아래 외곽 데드라인(경로에 따라
 # python 실행기 1개)의 비용도 미무장 pane 에는 지워지지 않는다.
 # ※ 판정 SOT 는 guard main() 이다 — env 이름이 바뀌면 양쪽을 함께 고쳐야 한다.
-[ "${CYS_COMPLETION_GUARD:-}" = "1" ] || exit 0
+# ★env 휴면 1회 고지(0.14.30 · SURVEY 2026-09-03 §C1 '이중 휴면'): 이 훅의 휴면은 두 층이다 —
+#   등록 휴면(Stop 미등록 · 어떤 등록기도 자동 등록하지 않는다 · 유일 등록기 javis_guard_register.py 는
+#   수동·dry-run 기본) + env 휴면(등록돼도 무장 env 미설정 → 여기서 exit 0). 둘 다 무음이라 "등록했는데
+#   왜 안 도나"가 증상 없는 실패였다(OT-DOSSIER:88 · hook-targets.json.example:88 "실제 격리는 pane 단위
+#   env 뿐"). 미무장 exit 0 계약은 그대로 두고, 그 직전에 stderr 1줄만 남긴다 — surface 당 1회.
+#   ★마커 이름에 `$(id -u)`·`$(date)` 를 쓰지 않는 이유: 위 :10-13 계약(미무장 pane = 프로세스 스폰 0)을
+#     지켜야 하므로 외부 명령 스폰이 금지다. `${CYS_SURFACE_ID}` 는 cysd 가 pane 에 주입한 env
+#     (_lib.sh:47)라 스폰 없이 pane 식별이 되고, cys 밖 세션은 nosurface 한 장으로 코얼레싱된다.
+#     `[ -f ]`·`:`·리다이렉션·echo 는 전부 셸 내장(PortableGit sh 포함) · 마커 위치는 TMPDIR(:44 와
+#     동일 규약 — 저장소·팩 오염 금지). 마커 생성 실패는 무시한다(고지가 turn 마다 반복될 뿐 차단·스폰 0).
+#   무장 절차·되돌리기는 hooks/README.md §3.
+if [ "${CYS_COMPLETION_GUARD:-}" != "1" ]; then
+  _cg_dormant="${TMPDIR:-/tmp}/.cys-guard-env-dormant-${CYS_SURFACE_ID:-nosurface}"
+  if [ ! -f "$_cg_dormant" ]; then
+    : > "$_cg_dormant" 2>/dev/null || :
+    echo "[cys-hook] completion-guard: env 휴면 — CYS_COMPLETION_GUARD=1 미설정이라 등록돼 있어도 무발동(무장은 pane 기동 env 로만 · hooks/README.md 참조)" >&2
+  fi
+  exit 0
+fi
 
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 # 대상 존재 가드 — .py 부재 시 exec 실패로 hook이 exit 2(오류)를 내는 걸 막고 조용히 통과(H-HOOK-2).
-[ -f "$PACK/bin/javis_completion_guard.py" ] || exit 0
+# ★본체 부재도 1회 고지(SURVEY §C1): 0.14.29 배포본엔 본체가 있다(sha 3곳 동일)지만 구세대·부분 복사 팩에서는
+#   이 분기가 '무장까지 했는데 무발동'의 세 번째 무음 축이 된다. exit 0(H-HOOK-2) 불변 · 마커 규약은 위와 같다.
+if [ ! -f "$PACK/bin/javis_completion_guard.py" ]; then
+  _cg_absent="${TMPDIR:-/tmp}/.cys-guard-body-absent-${CYS_SURFACE_ID:-nosurface}"
+  if [ ! -f "$_cg_absent" ]; then
+    : > "$_cg_absent" 2>/dev/null || :
+    echo "[cys-hook] completion-guard: 본체 bin/javis_completion_guard.py 부재 — 무발동" >&2
+  fi
+  exit 0
+fi
 # G22: 인터프리터 해소(python3→python→py) + cygpath 네이티브 경로. 미해소면 통과(기존 계약).
 [ -n "$CYS_PY" ] || exit 0
 
