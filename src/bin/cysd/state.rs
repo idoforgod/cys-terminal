@@ -420,6 +420,10 @@ pub struct Surface {
     /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     pub pending_input_bytes: AtomicU64,
+    /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
+    /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
+    /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
+    pub queue_blocked: Mutex<Option<(String, f64)>>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
@@ -2965,6 +2969,7 @@ impl Daemon {
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             pending_input_bytes: AtomicU64::new(0),
+            queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
             last_injected: Mutex::new(None),

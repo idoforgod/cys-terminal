@@ -4358,7 +4358,12 @@ fn queue_starve_alert_secs() -> u64 {
     std::env::var("CYS_QUEUE_STARVE_ALERT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+        // ★B1(0.14.30): 기본 0(비활성) → **600**. 기아가 실제로 났는데 아무도 몰랐던 것이
+        //   이 결함의 절반이다(queue-starvation-case.md §4-ⓓ "보이지 않는다" · 그 밤 stall 22건·
+        //   idle 122건이 찍혔지만 큐 기아를 가리키는 신호는 0). 경보는 **발행뿐**이고 자동
+        //   조치는 없다(LLM 자동 반응 금지 계약 불변 — state.rs::QUEUE_STARVED_HINT).
+        //   즉시 복원: 데몬 env 에 CYS_QUEUE_STARVE_ALERT_SECS=0.
+        .unwrap_or(600)
 }
 
 /// ★G1(W2-D): 단계형 quiet 판정 결과 — 순수 판정자(queue_quiet_verdict)의 어휘.
@@ -4621,6 +4626,17 @@ fn observe_prompt(
     (marker_seen, line)
 }
 
+/// ★B1(0.14.30): 마지막 보류 사유를 surface 에 남긴다(경보와 별개 축 — 경보는 쿨다운·임계에
+/// 걸려 매 틱 말하지 않지만, 이 값은 상시 사실이라 `queue.list` 가 바로 읽는다).
+/// 같은 사유가 이어지면 **최초 시각을 보존**한다(얼마나 오래 막혔나가 사유보다 중요하다).
+fn mark_queue_blocked(s: &Arc<crate::state::Surface>, reason: &str) {
+    let mut slot = s.queue_blocked.lock().unwrap();
+    match slot.as_ref() {
+        Some((prev, _)) if prev == reason => {}
+        _ => *slot = Some((reason.to_string(), now_epoch())),
+    }
+}
+
 /// 배달이 막힌 surface의 적체 경보(쿨다운 5분) — quiet 미충족·human 흔적·pause 등
 /// 모든 '막힘' 분기에서 공통 호출한다(한 분기라도 빠지면 그 사유의 적체가 침묵한다).
 fn alert_queue_depth_if_high(
@@ -4801,12 +4817,22 @@ pub(crate) fn deliver_head_locked(
         if expect_head_id.is_some_and(|want| want != entry.id) {
             return None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
-        crate::delivery::record_audited(
+        // ★B1(0.14.30): 큐 배달만 아는 사실을 원장에 동봉한다 — 원장 한 파일로 전수 지연을
+        //   계산할 수 있어야 한다(queue-starvation-case.md §4-ⓓ: enqueue 시각 부재 때문에
+        //   그 문서의 표본이 155건 중 18건에 그쳤다).
+        let wait_secs = (now_epoch() - entry.enqueued_at).max(0.0);
+        crate::delivery::record_audited_with(
             daemon,
             s.id,
             &entry.text,
             crate::delivery::Origin::Queue,
             None,
+            &json!({
+                "queue_entry_id": entry.id,
+                "queue_seq": entry.seq,
+                "enqueued_at": entry.enqueued_at,
+                "wait_secs": wait_secs,
+            }),
         );
         let req = crate::state::WriteReq::Inject {
             text: entry.text.clone(),
@@ -5085,6 +5111,7 @@ fn deliver_queued(
             .map(|t| t > std::time::Instant::now())
             .unwrap_or(false)
         {
+            mark_queue_blocked(&s, "queue_paused(헬스 조치)");
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "queue_paused(헬스 조치)");
             alert_queue_starved_if_stalled(
                 daemon, &s, starve_alerted, "queue_paused(헬스 조치)", &head, head_wait, depth,
@@ -5141,6 +5168,7 @@ fn deliver_queued(
                     InputLine::Unknown => "prompt_unknown(프롬프트 경계 관측 불능)",
                     InputLine::Empty => "prompt_not_ready(프롬프트 경계 미도달)",
                 };
+                mark_queue_blocked(&s, why);
                 alert_queue_depth_if_high(daemon, &s, depth_alerted, why);
                 alert_queue_starved_if_stalled(
                     daemon, &s, starve_alerted, why, &head, head_wait, depth,
@@ -5152,6 +5180,7 @@ fn deliver_queued(
         } else {
             match queue_quiet_verdict(head_wait, quiet_for, quiet, max_wait, overdue_quiet) {
                 QuietVerdict::WaitBusy => {
+                    mark_queue_blocked(&s, "busy(출력 중)");
                     alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
                     alert_queue_starved_if_stalled(
                         daemon, &s, starve_alerted, "busy(출력 중)", &head, head_wait, depth,
@@ -5171,6 +5200,7 @@ fn deliver_queued(
             .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
             .unwrap_or(false);
         if human_recent {
+            mark_queue_blocked(&s, "human_typing(사람 입력 직후)");
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "human_typing(사람 입력 직후)");
             alert_queue_starved_if_stalled(
                 daemon, &s, starve_alerted, "human_typing(사람 입력 직후)", &head, head_wait, depth,
@@ -5192,6 +5222,7 @@ fn deliver_queued(
         if s.role.lock().unwrap().is_some()
             && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
         {
+            mark_queue_blocked(&s, "empty_seat(좌석에 에이전트 미연결)");
             alert_queue_depth_if_high(
                 daemon,
                 &s,
@@ -5215,6 +5246,8 @@ fn deliver_queued(
         if deliver_head_locked(daemon, &s, false, overdue, None).is_some() {
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
+            // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
+            *s.queue_blocked.lock().unwrap() = None;
         }
     }
 }
@@ -7810,7 +7843,10 @@ mod tests {
 
     // ─────────── ★B1(0.14.30): 프롬프트 경계 준비판정 — 순수 판정자 핀 ───────────
 
-    use super::{input_line_state, prompt_boundary_verdict, InputLine, PromptBoundary, PromptLine};
+    use super::{
+        input_line_state, prompt_boundary_verdict, queue_starve_alert_secs, InputLine,
+        PromptBoundary, PromptLine,
+    };
 
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
     /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
@@ -8107,6 +8143,91 @@ mod tests {
             s.pending_queue.lock().unwrap().len(),
             1,
             "판정 불능은 배달 방향으로 열리지 않는다(fail-closed)"
+        );
+    }
+
+    // ─────────── ★B1(0.14.30): 관측성 핀(b1_obs_*) — "보이지 않는다" 의 봉인 ───────────
+
+    /// 큐 배달 원장에 enqueue 사실이 실린다 — 원장 한 파일로 전수 지연을 계산할 수 있어야 한다
+    /// (queue-starvation-case.md §4-ⓓ: 이 필드가 없어 155건 중 18건만 측정됐다).
+    #[test]
+    fn b1_obs_ledger_carries_enqueue_facts() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("ledger");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-ledger");
+        paint_prompt(&s, "", "");
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        *s.last_human_input.lock().unwrap() = None;
+        let want_id = s.pending_queue.lock().unwrap().front().unwrap().id.clone();
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "배달 전제 미충족");
+        let path = crate::delivery::ledger_path(&daemon.socket_path);
+        let body = std::fs::read_to_string(&path).expect("배달 원장 파일");
+        let rec: serde_json::Value = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["origin"] == "queue" && r["queue_entry_id"] == serde_json::json!(want_id))
+            .unwrap_or_else(|| panic!("큐 레코드가 원장에 없다: {body}"));
+        assert!(
+            rec["enqueued_at"].as_f64().is_some_and(|v| v > 0.0),
+            "enqueue 시각이 원장에 없다 — 사후 전수 지연 계산이 불가능해진다: {rec}"
+        );
+        assert!(rec["wait_secs"].as_f64().is_some(), "대기초 부재: {rec}");
+        assert!(
+            rec["sha256"].as_str().is_some_and(|v| !v.is_empty()),
+            "기존 키(sha256)가 사라졌다 — additive 계약 위반: {rec}"
+        );
+    }
+
+    /// 기아 경보 기본값은 **활성**(600초)이다 — 종전 기본 0(비활성)이 "아무도 몰랐다" 의 원인.
+    #[test]
+    fn b1_obs_starved_alert_is_enabled_by_default() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("CYS_QUEUE_STARVE_ALERT_SECS").ok();
+        std::env::remove_var("CYS_QUEUE_STARVE_ALERT_SECS");
+        let got = queue_starve_alert_secs();
+        match prev {
+            Some(v) => std::env::set_var("CYS_QUEUE_STARVE_ALERT_SECS", v),
+            None => std::env::remove_var("CYS_QUEUE_STARVE_ALERT_SECS"),
+        }
+        assert_eq!(got, 600, "기본 비활성으로 되돌아가면 기아가 다시 침묵한다");
+    }
+
+    /// 막힘 사유는 배달될 때까지 남고, 배달되면 지워진다(낡은 사유 오독 차단).
+    #[test]
+    fn b1_obs_blocked_reason_is_recorded_until_delivery() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("reason");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("b1-reason");
+        paint_prompt(&s, "미제출 초안", "");
+        *s.last_output.lock().unwrap() =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+        *s.last_human_input.lock().unwrap() = None;
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        let blocked = s.queue_blocked.lock().unwrap().clone();
+        assert!(
+            blocked
+                .as_ref()
+                .is_some_and(|(why, at)| why.starts_with("input_pending") && *at > 0.0),
+            "보류 사유가 기록되지 않으면 queue.list 가 이유를 말할 수 없다: {blocked:?}"
+        );
+        // 입력줄을 비우면 같은 좌석이 배달되고 사유는 사라진다.
+        paint_prompt(&s, "", "");
+        deliver_queued(&daemon, &mut depth, &mut starve);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "해소 후 배달 실패");
+        assert!(
+            s.queue_blocked.lock().unwrap().is_none(),
+            "배달 후에도 낡은 사유가 남으면 운영자가 오독한다"
         );
     }
 

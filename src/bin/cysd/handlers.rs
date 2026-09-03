@@ -6262,6 +6262,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let now = crate::state::now_epoch();
+                // ★B1(0.14.30): 마지막 보류 사유·시각 — 운영자가 "왜 안 가나" 를 화면 폴링
+                //   없이 안다(경보는 쿨다운·임계에 걸려 매 틱 말하지 않는다). 배달되면 지워진다.
+                let (blocked_by, blocked_since) = match s.queue_blocked.lock().unwrap().clone() {
+                    Some((why, at)) => (json!(why), json!(at)),
+                    None => (Value::Null, Value::Null),
+                };
                 let q = s.pending_queue.lock().unwrap();
                 for (i, e) in q.iter().enumerate() {
                     // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
@@ -6274,6 +6280,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "id": e.id, "seq": e.seq, "enqueued_at": e.enqueued_at,
                         "age_secs": (now - e.enqueued_at).max(0.0) as u64,
                         "from": e.from, "origin": e.origin,
+                        "blocked_by": blocked_by, "blocked_since": blocked_since,
                     }));
                 }
             }

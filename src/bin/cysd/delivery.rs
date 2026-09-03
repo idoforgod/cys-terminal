@@ -633,6 +633,18 @@ pub fn record_full(
     origin: Origin,
     from_surface: Option<u64>,
 ) -> RecordReport {
+    record_full_with(socket_path, surface_id, text, origin, from_surface, &Value::Null)
+}
+
+/// `record_full` + 추가 사실 병합(계약은 `record_audited_with` doc 참조).
+pub fn record_full_with(
+    socket_path: &Path,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+    extra: &Value,
+) -> RecordReport {
     let blank = |o: Outcome| RecordReport {
         outcome: o,
         parts_written: 0,
@@ -674,6 +686,12 @@ pub fn record_full(
         //   판독자가 "프롬프트가 이 레코드의 조각인가" 를 물을 필요조차 없는 레코드다.
         "units": units.len(),
     });
+    // ★B1: 호출부가 아는 사실을 병합 — 기존 키는 절대 덮지 않는다(스키마 계약).
+    if let (Some(add), Some(dst)) = (extra.as_object(), rec.as_object_mut()) {
+        for (k, v) in add {
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
     if dropped > 0 {
         // ★R7 — **판독자가 볼 수 있는 자리**에 초과 사실을 남긴다.
         //   종전에는 데몬 버스 이벤트(`delivery.parts_incomplete`)뿐이었고, 임무 게이트는 버스를
@@ -743,7 +761,27 @@ pub fn record_audited(
     origin: Origin,
     from_surface: Option<u64>,
 ) -> bool {
-    let report = record_full(&daemon.socket_path, surface_id, text, origin, from_surface);
+    record_audited_with(daemon, surface_id, text, origin, from_surface, &Value::Null)
+}
+
+/// ★B1(0.14.30): `record_audited` + **호출부가 아는 추가 사실**을 같은 레코드에 실는다.
+///
+/// 왜 필요한가(queue-starvation-case.md §4-ⓓ): 원장에는 배달 시각만 있고 **enqueue 시각이
+/// 없어** 사후에 전수 지연을 계산할 수 없었다(그 문서의 표본이 18건에 그친 이유). 큐 배달만
+/// 아는 사실(항목 id·enqueue 시각·대기초)을 여기서 실어 원장 한 파일로 전수 측정이 되게 한다.
+///
+/// `extra` 는 객체여야 하며 **기존 키를 덮지 않는다**(충돌 키는 무시 — 스키마 계약 보호).
+/// 객체가 아니면(Null 등) 종전 레코드와 바이트 동일하다.
+pub fn record_audited_with(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+    extra: &Value,
+) -> bool {
+    let report =
+        record_full_with(&daemon.socket_path, surface_id, text, origin, from_surface, extra);
     // ★R6: 조각(제출 단위) 기록이 불완전하면 그 행들은 층1 미대조다 — 차단할 수 없으니 드러낸다.
     if report.parts_dropped > 0 || report.parts_failed.is_some() {
         let path = ledger_path(&daemon.socket_path);
