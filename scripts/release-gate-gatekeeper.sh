@@ -31,6 +31,20 @@
 #      ⓐ번들 파일 전수 센서스 diff == 0(예상치 못한 파일 생성 = 이름 지목 FAIL)
 #      ⓑcodesign --verify --deep --strict 재통과 를 단언한다. HOME·PATH·팩 env 는 임시
 #      스크래치로 격리(하네스 test_preflight_c11b_seal.py 와 동형) — 실환경 무접촉.
+#   ⑦ DMG 봉투(envelope) 축 — 격리 부착 사본 DMG **자신**에 (a) xcrun stapler validate ·
+#      (b) spctl --assess --type open --context context:primary-signature — W-C C2 신설(2026-09-03).
+#      DMG 마다 1회(앱 단위가 아니다) · ⑦-a 는 모드 무관 실행, ⑦-b 는 ④ 와 같이 full 모드에서만
+#      (degraded 진단 강등은 SKIP 1줄 고지).
+#      ★왜 신설하는가: 사용자가 브라우저로 받은 격리 DMG 를 여는 순간 Gatekeeper 가 보는 것은
+#      **DMG 자신의 서명·공증 티켓**인데, ①~⑥ 은 DMG 안의 앱만 평가해 봉투(DMG 서명·staple
+#      누락)를 놓쳤다. scripts/build-macos-signed.sh:325-336 이 같은 두 검사를 하지만 그것은
+#      빌드 시점 러너 산출물 검사라 발행될(다운로드된) 실물 바이트가 아니며, 이 게이트는
+#      release-postprocess.py 가 draft 백업 DMG 에 재실행하므로 여기가 발행 전 마지막 지점이다.
+#      ★평가식 근거: spctl(8) "-t open to assess the opening of documents" · 실측 2026-09-03
+#      v0.14.29 DMG 2종(aarch64·x64) 격리 사본 — stapler validate rc=0("The validate action
+#      worked!") · spctl -t open accepted(source=Notarized Developer ID) · 미서명 합성 DMG
+#      (hdiutil create · Fake.app)는 stapler 비영·spctl rejected(test_release_postprocess_gate.py
+#      DmgAxisTests 가 음성 대조로 박제).
 #
 # ★스코프 판정(공백 B · Windows 레인 · 2026-08-20): Windows 산출물에는 SEAL-2 선컴파일이 없고
 #   이 게이트도 macOS 전용이다 — 여기서 수리하지 않는다. 오너 앵커: 윈도우 설치파일은 신중 접근,
@@ -470,6 +484,8 @@ echo
 
 APPS=()          # 평가 대상 .app 원본 경로
 SRC_KIND=""
+# ⑦ DMG 봉투 축 결과(dmg 분기에서만 채워진다) — set -u 안전 초기화 · 미실행 = 빈 값(0 으로 오독 금지)
+ST7_OUT=""; ST7_RC=""; SP7_OUT=""; SP7_RC=""
 
 case "$TARGET" in
   *.dmg)
@@ -486,6 +502,31 @@ case "$TARGET" in
     else
       bad "① quarantine 부착(DMG)" "xattr -w 실패 — 이후 검사는 실사용자 경로가 아니다"
       echo; echo "=== 판정 불가 ==="; exit 2
+    fi
+
+    # ── ⑦ DMG 봉투 축 — 격리 부착 사본 DMG 자신의 공증 티켓·Gatekeeper 열기 평가 (헤더 ⑦ 참조) ──
+    #   ①~⑥ 은 DMG 안의 앱만 본다. 사용자가 격리 DMG 를 여는 순간 평가되는 것은 DMG 자신의
+    #   서명·staple 이므로 마운트 전에 사본 "$DMG" 를 직접 평가한다(원본 무변경 계약 유지).
+    #   build-macos-signed.sh:325-336 과 같은 두 검사지만 대상이 발행될 실물 바이트다.
+    # ⑦-a 공증 티켓 동봉(DMG) — 모드 무관(오프라인 증거 · ③ 과 같은 관례)
+    ST7_OUT="$(xcrun stapler validate "$DMG" 2>&1)"; ST7_RC=$?
+    if [ "$ST7_RC" -eq 0 ]; then
+      ok "⑦-a stapler validate(DMG)" "공증 티켓 동봉 확인"
+    else
+      bad "⑦-a stapler validate(DMG)" "rc=$ST7_RC · $(printf '%s' "$ST7_OUT" | tail -2 | tr '\n' ' ')"
+    fi
+    # ⑦-b Gatekeeper 열기 평가(DMG) — full 모드에서만(④ 와 같은 관례 · spctl(8) -t open = 문서 열기 평가)
+    if [ "$MODE" = "full" ]; then
+      SP7_OUT="$(spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG" 2>&1)"; SP7_RC=$?
+      if [ "$SP7_RC" -eq 0 ] && printf '%s' "$SP7_OUT" | grep -q "accepted"; then
+        ok "⑦-b spctl --assess --type open --context context:primary-signature(DMG)" "$(printf '%s' "$SP7_OUT" | tr '\n' ' ' | sed "s|$DMG|<dmg>|g")"
+      else
+        bad "⑦-b spctl --assess --type open --context context:primary-signature(DMG)" "rc=$SP7_RC"
+        echo "     ── spctl 출력(verbatim) ──"
+        printf '%s\n' "$SP7_OUT" | sed "s|$DMG|<dmg>|g" | sed 's/^/     | /'
+      fi
+    else
+      echo "SKIP ⑦-b spctl --assess --type open(DMG) — assessments disabled (진단 전용 강등 · --diagnose-degraded-ok · 위 배너 참조)"
     fi
 
     MP="$WORK/mnt"
@@ -518,6 +559,7 @@ case "$TARGET" in
     SRC_KIND="app"
     APPS+=("$TARGET")
     info ".app 직접 지정 모드 — DMG 마운트 없이 사본에 quarantine 을 직접 부착한다"
+    info "⑦ DMG 축: .app 직접 지정 모드 — 대상 아님(DMG 없음)"
     ;;
   *)
     echo "✗ 대상은 .dmg 파일 또는 .app 디렉터리여야 한다: $TARGET" >&2; exit 2 ;;
