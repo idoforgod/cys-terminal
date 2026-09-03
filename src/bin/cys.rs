@@ -68,8 +68,18 @@ enum Command {
         /// 입력 버퍼 선정리(Ctrl-U) — launch-agent 등록 에이전트 pane 한정 (TUI별 의미 상이)
         #[arg(long)]
         clear_first: bool,
+        /// ★B3 #4 본문을 표준입력 전문으로 받는다 — quoted heredoc(`<<'EOF'`)이면 발신 셸이
+        /// 백틱·$( )·$VAR 를 치환하지 않는다(argv 채널의 구조적 우회로).
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        /// ★B3 #4 본문을 UTF-8 파일 전문으로 받는다(표준입력을 쓸 수 없는 호출자용).
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
         /// Text to inject (multiple args are joined with spaces)
-        #[arg(required = true)]
+        #[arg(
+            required_unless_present_any = ["stdin", "file"],
+            conflicts_with_all = ["stdin", "file"]
+        )]
         text: Vec<String>,
     },
     /// Inject a named key (Return, Tab, C-c, Up, ...) into a surface's stdin
@@ -1424,6 +1434,64 @@ fn should_queue_fallback_send(queued: bool, clear_first: bool, err: &str) -> boo
     !queued && !clear_first && is_typing_guard_err(err)
 }
 
+/// ★B3 #4 `cys send` 본문 결정(순수) — argv 대신 **바이트 전문**을 본문으로 삼는 경로.
+///
+/// 왜 필요한가(실사고): 본문 채널이 argv 하나뿐이라 발신 셸이 큰따옴표 안의 백틱·`$( )`·
+/// `$VAR` 를 **CLI 에 닿기 전에 이미 치환**한다. 2026-09-03 13:31 CSO push 본문의
+/// `` `cys claim-role worker` `` 가 zsh 에서 실행돼 CSO 좌석이 worker 로 강등됐다(같은 기제로
+/// 3건). 문서 규칙(백틱 금지)은 자율 준수에 의존해 3회 재발했으므로, 여기서는 셸을 거치지
+/// 않는 **다른 채널**(quoted heredoc 표준입력 · 파일)을 만들어 구조적으로 봉인한다.
+///
+/// 규칙(설계 design/B3.md ②4-3):
+/// - `raw` 가 있으면 argv(`parts`)를 무시하고 바이트를 본문으로 쓴다(채널 우선순위 단일화).
+/// - UTF-8 이 아니면 거부한다 — `surface.send_text` 의 `text` 는 JSON 문자열이라 무언의
+///   손실 변환을 하면 본문이 조용히 훼손된다.
+/// - 말미 개행은 **정확히 1개**(`\n` 또는 `\r\n`)만 벗긴다. heredoc·파일은 개행으로 끝나는
+///   것이 정상이고, Send 의 계약은 "no trailing newline; follow with send-key Return" 이다.
+///   2개 이상 벗기면 의도한 빈 줄이 사라진다.
+/// - 내부 개행·백틱·따옴표·`$` 는 **바이트 그대로** 둔다(이 함수의 존재 이유).
+/// - 공백뿐인 본문은 거부한다(`:2912` stdin 관례와 동형) — 빈 Enter 를 보내는 사고 방지.
+fn send_body_from_bytes(parts: &[String], raw: Option<&[u8]>) -> Result<String, String> {
+    let Some(bytes) = raw else {
+        return Ok(parts.join(" "));
+    };
+    let mut body = String::from_utf8(bytes.to_vec())
+        .map_err(|_| "본문이 UTF-8 이 아니다 — UTF-8 파이프/파일로 보내라".to_string())?;
+    if body.ends_with('\n') {
+        body.pop();
+        if body.ends_with('\r') {
+            body.pop();
+        }
+    }
+    if body.trim().is_empty() {
+        return Err("빈 본문 — 표준입력/파일에 보낼 내용이 없다".to_string());
+    }
+    Ok(body)
+}
+
+/// ★B3 #4 위 순수 판정의 얇은 I/O 래퍼 — 표준입력·파일을 읽어 바이트를 넘긴다.
+///
+/// I/O 를 분리해 두는 이유: 본문 규칙(개행·UTF-8·공백)은 파일시스템 없이 단위 테스트로
+/// 고정하고, 여기서는 읽기 실패 문안만 책임진다.
+fn read_send_body(
+    parts: &[String],
+    stdin: bool,
+    file: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let raw = if stdin {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("표준입력 읽기 실패: {e}"))?;
+        Some(buf)
+    } else if let Some(p) = file {
+        Some(std::fs::read(p).map_err(|e| format!("본문 파일 읽기 실패 {}: {e}", p.display()))?)
+    } else {
+        None
+    };
+    send_body_from_bytes(parts, raw.as_deref())
+}
+
 /// ★B3 보조 — 큐 전환 직후 데몬이 pause 중이면 한 줄 경고한다.
 ///
 /// pause 중에는 큐 배달이 동결되므로(kill-switch 의미론 — 이 코드는 그 의미론을 **바꾸지
@@ -2733,11 +2801,12 @@ fn run(command: Command) -> i32 {
             }
         }),
 
-        Command::Send { surface, to, queued, clear_first, text } => {
+        Command::Send { surface, to, queued, clear_first, stdin, file, text } => {
             resolve_targets(&surface, &to).and_then(|sids| {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 let multi = sids.len() > 1;
-                let body = text.join(" ");
+                // ★B3 #4: 본문 채널은 argv·표준입력·파일 셋이며 결정은 한 곳에서 한다.
+                let body = read_send_body(&text, stdin, file.as_deref())?;
                 for sid in sids {
                     let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
@@ -24077,5 +24146,128 @@ mod tests {
             "rel6 kept-drift 정규화"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★B3 #4-①: 본문 채널 3종은 **상호배타**다(clap 규칙). 셋 중 둘을 동시에 주면 어느
+    /// 것이 본문인지 호출자와 CLI 의 해석이 갈리고, 그 모호함이 곧 "보냈다고 믿었는데 다른
+    /// 것이 갔다" 는 무음 사고다.
+    #[test]
+    fn b3_send_stdin_conflicts_with_positional_text() {
+        for bad in [
+            vec!["cys", "send", "--to", "m", "--stdin", "hello"],
+            vec!["cys", "send", "--to", "m", "--stdin", "--file", "/x"],
+            vec!["cys", "send", "--to", "m", "--file", "/x", "hello"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&bad).is_err(),
+                "본문 채널 중복 {bad:?} 이 통과했다 — 상호배타 규칙 붕괴"
+            );
+        }
+        // 음성 대조: `--stdin` 단독은 **정상**이며 argv 본문은 비어 있다 —
+        // 위 실패들이 '아무 조합이나 거부' 가 아님을 증명한다.
+        let cli = Cli::try_parse_from(["cys", "send", "--to", "m", "--stdin"])
+            .expect("--stdin 단독은 파싱돼야 한다");
+        match cli.command {
+            Command::Send { stdin, file, text, .. } => {
+                assert!(stdin, "--stdin 플래그가 꺼져서 파싱됐다");
+                assert!(file.is_none(), "--file 없는데 값이 붙었다");
+                assert!(text.is_empty(), "argv 본문이 비어야 한다: {text:?}");
+            }
+            _ => panic!("send 가 다른 arm 으로 파싱됐다"),
+        }
+    }
+
+    /// ★B3 #4-②: 본문 원천이 **하나는 반드시** 있어야 한다. 종전 `required = true` 의
+    /// 계약(본문 없는 send 는 사용 오류)이 신설 옵션 때문에 느슨해지면, 빈 본문이 그대로
+    /// 좌석에 주입되는 새 사고 경로가 열린다.
+    #[test]
+    fn b3_send_requires_one_body_source() {
+        assert!(
+            Cli::try_parse_from(["cys", "send", "--to", "m"]).is_err(),
+            "본문 원천이 하나도 없는데 파싱됐다 — required 계약 회귀"
+        );
+        let cli = Cli::try_parse_from(["cys", "send", "--to", "m", "hello"])
+            .expect("argv 본문 경로는 종전대로 파싱돼야 한다");
+        match cli.command {
+            Command::Send { stdin, file, text, .. } => {
+                assert!(!stdin);
+                assert!(file.is_none());
+                assert_eq!(text, vec!["hello".to_string()], "argv 본문 회귀");
+            }
+            _ => panic!("send 가 다른 arm 으로 파싱됐다"),
+        }
+        let cli = Cli::try_parse_from(["cys", "send", "--to", "m", "--file", "/x"])
+            .expect("--file 단독은 파싱돼야 한다");
+        match cli.command {
+            Command::Send { file, text, .. } => {
+                assert_eq!(file.as_deref(), Some(std::path::Path::new("/x")));
+                assert!(text.is_empty());
+            }
+            _ => panic!("send 가 다른 arm 으로 파싱됐다"),
+        }
+    }
+
+    /// ★B3 #4-③(사고 직결): 백틱·`$( )`·`$VAR`·따옴표가 **바이트 그대로** 살아남고 내부
+    /// 개행도 보존된다. 이 단언이 깨지면 전문 채널을 만든 이유 자체가 사라진다 —
+    /// 2026-09-03 CSO 좌석 강등(`cys claim-role worker` 백틱 실행)의 재발 방지선이다.
+    #[test]
+    fn b3_send_body_preserves_backticks_quotes_and_interior_newlines() {
+        let raw = "[보고] `cys claim-role worker` \"a\" 'b' $HOME $(id -u)\n둘째줄\n";
+        let body = send_body_from_bytes(&[], Some(raw.as_bytes())).expect("전문 본문");
+        assert_eq!(
+            body, "[보고] `cys claim-role worker` \"a\" 'b' $HOME $(id -u)\n둘째줄",
+            "전문 채널이 본문을 변형했다"
+        );
+        for token in ["`cys claim-role worker`", "$HOME", "$(id -u)", "\"a\"", "'b'"] {
+            assert!(body.contains(token), "치환 방지 실패 — {token} 가 사라졌다");
+        }
+        assert!(body.contains('\n'), "내부 개행이 사라졌다");
+    }
+
+    /// ★B3 #4-④: 말미 개행은 **정확히 1개**만 벗긴다. heredoc·파일은 개행으로 끝나는 것이
+    /// 정상이고 Send 계약은 말미 개행 없음이다. 2개를 벗기면 의도한 빈 줄이 사라지고,
+    /// 0개를 벗기면 본문이 곧바로 제출(Enter)돼 버린다.
+    #[test]
+    fn b3_send_body_strips_exactly_one_trailing_newline() {
+        let cases = [("a\n\n", "a\n"), ("a\r\n", "a"), ("a\n", "a"), ("a", "a")];
+        for (raw, want) in cases {
+            let got = send_body_from_bytes(&[], Some(raw.as_bytes())).expect("본문");
+            assert_eq!(got, want, "말미 개행 처리 불일치: {raw:?}");
+        }
+    }
+
+    /// ★B3 #4-⑤: 빈 본문·비 UTF-8 은 **거부**한다. 무언의 손실 변환은 본문을 조용히
+    /// 훼손하고(JSON 문자열 계약), 빈 본문은 좌석에 맨 Enter 를 넣는다.
+    #[test]
+    fn b3_send_body_rejects_empty_and_non_utf8() {
+        for raw in [&b""[..], &b"\n"[..], &b"  \n"[..]] {
+            let e = send_body_from_bytes(&[], Some(raw)).expect_err("빈 본문은 거부돼야 한다");
+            assert!(e.contains("빈 본문"), "빈 본문 거부 문안 불일치: {e}");
+        }
+        let e = send_body_from_bytes(&[], Some(&[0xff, 0xfe][..]))
+            .expect_err("비 UTF-8 은 거부돼야 한다");
+        assert!(e.contains("UTF-8"), "UTF-8 거부 문안 불일치: {e}");
+        // 음성 대조: 같은 거부 조건이 argv 경로에는 적용되지 않는다(raw=None) —
+        // 거부가 전문 채널 특이 조건임을 증명한다.
+        assert_eq!(
+            send_body_from_bytes(&["x".to_string()], None).expect("argv 경로"),
+            "x"
+        );
+    }
+
+    /// ★B3 #4-⑥: 전문(`raw`)이 없으면 종전 argv 합류(`join(" ")`) 그대로다 — 신설 채널이
+    /// 기존 호출자의 본문 의미를 바꾸지 않았음을 고정한다.
+    #[test]
+    fn b3_send_body_argv_path_joins_with_spaces() {
+        let parts = ["[보고]".to_string(), "완료".to_string(), "8/8".to_string()];
+        assert_eq!(
+            send_body_from_bytes(&parts, None).expect("argv 본문"),
+            "[보고] 완료 8/8"
+        );
+        // 전문이 오면 argv 는 **무시**된다(채널 우선순위 단일화).
+        assert_eq!(
+            send_body_from_bytes(&parts, Some(b"raw wins\n")).expect("전문 본문"),
+            "raw wins"
+        );
     }
 }
