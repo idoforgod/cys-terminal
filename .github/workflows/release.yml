@@ -538,7 +538,10 @@ jobs:
       #   돌지 않아, 봉인이 깨진 앱도 조용히 통과한다(2026-08-01 실사고 "손상되었기 때문에 열 수
       #   없습니다" — 공증·staple 은 정상이었고 동봉 python 의 .pyc 쓰기가 봉인을 깼다. 당시 검증은
       #   curl 사본=quarantine 없음만 봐서 사고 경로를 한 번도 재현하지 못했다).
-      #   이 스텝은 그 경로를 CI 에서 기계로 재현한다 — 사본에 quarantine 부착 → 마운트 → ditto 설치
+      #   이 스텝은 그 경로를 CI 에서 기계로 재현한다 — 사본에 quarantine 부착 → ⑦ DMG 봉투 평가
+      #   (xcrun stapler validate + spctl --assess --type open --context context:primary-signature ·
+      #   W-C 신설 2026-09-03: 종전 ①~⑥ 은 DMG **안의 앱**만 봤고, 사용자가 격리 DMG 를 여는 순간
+      #   평가되는 DMG 자신의 서명·공증 티켓은 무검증이었다) → 마운트 → ditto 설치
       #   모사 → codesign --verify --deep --strict + stapler validate + spctl --assess.
       # **왜 여기(업로드 앞)인가**: Windows CRT 게이트와 동형. tauri-action(수집·업로드) 뒤에 두면
       #   draft 정책이 뒤집히는 순간 공개된 산출물을 사후 실패시키는 구조 의존이 된다. 앞에 세워
@@ -575,6 +578,7 @@ jobs:
               echo "### macOS Gatekeeper 게이트 — $(basename "$d") (${{ matrix.target }})"
               grep -E '^GATE_MODE=' "$GLOG" | tail -1 || echo 'GATE_MODE=(미출력 — 태그 트리의 게이트 스크립트가 구판)'
               grep -E '^spctl: ' "$GLOG" | tail -1 || true
+              grep -E '^(PASS|FAIL) ⑦' "$GLOG" || echo '⑦ DMG 축 (미출력 — 태그 트리의 게이트 스크립트가 구판)'
               echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가·degraded 폐쇄 포함)"
               echo
             } >> "$GITHUB_STEP_SUMMARY"

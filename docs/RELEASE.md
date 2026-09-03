@@ -275,6 +275,26 @@ bash scripts/release-gate-gatekeeper.sh <DMG | .app>
   강등 평가가 필요한 진단은 `--diagnose-degraded-ok`(LOUD 고지 · **발행 경로 사용 금지**
   — release.yml·release-postprocess.py 가 이 플래그를 싣지 않음은
   `scripts/tests/test_release_postprocess_gate.py` 의 문자열 핀이 지킨다)로만 연다.
+- ★**⑦ DMG 봉투(envelope) 축 — 2026-09-03 신설(W-C C2)**: 위 검사들은 DMG **안의 앱**만
+  평가한다. 그런데 사용자가 브라우저로 받은 격리 DMG 를 여는 순간 Gatekeeper 가 보는 것은
+  **DMG 자신의 서명·공증 티켓**이다 — 봉투가 빠지거나 깨지면 앱이 온전해도 열리지 않는다.
+  그래서 ① 에서 격리 속성을 부착한 **사본**에 대해 **마운트 전에** 두 검사를 더 돈다:
+  ⑦-a `xcrun stapler validate`(모드 무관 — 오프라인 공증 증거) · ⑦-b
+  `spctl --assess --type open --context context:primary-signature`(④ 와 같이 full 모드에서만 ·
+  degraded 진단 강등에서는 SKIP 1줄 고지). 결과는 PASS/FAIL 집계에 들어가 말미 판정·종료 코드에
+  반영되고, `.app` 직접 지정 모드에서는 "대상 아님(DMG 없음)" info 1줄만 남는다.
+  · **왜 여기인가** — `scripts/build-macos-signed.sh:332` 가 같은 평가식을 이미 쓰지만 그것은
+    빌드 시점 러너 산출물 검사다. 이 게이트는 업로드 **전**(release.yml)과 발행 후처리
+    (`scripts/release-postprocess.py` 가 draft 백업 DMG = **발행될 실물 바이트**에 재실행)에서
+    돌므로 발행 전 마지막 지점이다.
+  · **평가식 근거** — `spctl(8)`: "-t open to assess the opening of documents".
+  · **실측(2026-09-03 · macOS 27.0 · assessments enabled)** — v0.14.29 DMG 2종(aarch64·x64)
+    격리 사본: `stapler validate` rc=0 · `spctl -t open --context context:primary-signature`
+    **accepted**(source=Notarized Developer ID) · 게이트 전체 exit 0 · `GATE_MODE=full`.
+    음성 대조로 `hdiutil create` 로 만든 미서명·미공증 합성 DMG 는 두 검사 모두 **rejected/FAIL**
+    (밀폐 테스트 `scripts/tests/test_release_postprocess_gate.py` DmgAxisTests 가 박제).
+  · CI 요약(`GITHUB_STEP_SUMMARY`)에는 `GATE_MODE`·`spctl:` 줄과 함께 **⑦ 라인도 승격**된다 —
+    태그 트리의 게이트 스크립트가 구판이면 "미출력" 고지가 대신 찍혀 그 사실이 증적에 남는다.
 - **`verify-gatekeeper-user-path.sh` 와의 관계 — 겹치지 않는 상·하위 게이트다.** 그쪽
   (로컬·수동)은 여기 검사 전부 + ⑥ **봉인 자기파괴 재현**(동봉 python 을 실제로 스폰)까지
   본다. 대신 대상 아키텍처 python 을 실행하므로 arm64 러너에서 x64 DMG 를 보려면 Rosetta 2

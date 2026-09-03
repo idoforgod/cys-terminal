@@ -21,6 +21,9 @@
   · F2 — degraded(spctl 실평가 불능)=판정 불가(exit 2) 폐쇄 + 진단 플래그
     (--diagnose-degraded-ok·--seal2-only)가 발행 경로(release-postprocess.py·release.yml)에
     실리지 않는다는 문자열 핀 2건.
+  · ⑦ — DMG 봉투 축(격리 사본 DMG 자체의 stapler validate + spctl --type open
+    --context context:primary-signature · W-C C2 2026-09-03)의 소스 계약·음성 대조·.app 모드
+    비적용·release.yml 요약 승격 4건(DmgAxisTests).
 
 사용: python3 scripts/tests/test_release_postprocess_gate.py
 """
@@ -321,6 +324,150 @@ class DegradedClosureTests(unittest.TestCase):
         self.assertEqual(lines[-1], "GATE_MODE=degraded", p.stdout)
         loud = [ln for ln in p.stdout.splitlines() if ln.startswith("!!!!")]
         self.assertGreaterEqual(len(loud), 2, "LOUD 고지 2줄 계약 위반: %r" % p.stdout)
+
+
+class DmgAxisTests(unittest.TestCase):
+    """⑦ DMG 봉투 축 — 격리 사본 **DMG 자신**의 공증 티켓·Gatekeeper 열기 평가 (W-C C2 · 2026-09-03).
+
+    ★왜 이 축이 필요한가: ①~⑥ 은 DMG **안의 앱**만 평가한다. 그런데 사용자가 브라우저로 받은
+      격리 DMG 를 여는 순간 Gatekeeper 가 보는 것은 DMG 자신의 서명·staple 이다 — 봉투가
+      빠지거나 깨지면 앱이 온전해도 열리지 않는다. 그 계급을 이 축이 본다.
+    ★여기서 못박는 것: (a) 소스 계약(라벨 문자열 + 호출 위치가 ① 부착 뒤·마운트 앞)
+      (b) 음성 대조 — 미서명·미공증 합성 DMG 는 두 검사 모두 FAIL 이고 게이트가 비영 종료한다
+      (c) `.app` 직접 지정 모드에서는 PASS 를 만들지 않고 "대상 아님" 으로만 남는다
+      (d) release.yml 이 ⑦ 라인을 요약으로 승격한다.
+    ★(b)(c) 는 macOS 도구(hdiutil·spctl·codesign)를 요구해 darwin 한정이고, (a)(d) 는
+      소스 문자열 검사라 플랫폼 무관이다 — 그래서 클래스 단위 skip 을 걸지 않고 메서드별로 건다
+      (플랫폼 무관 핀이 macOS 밖 레인에서 조용히 사라지지 않게).
+    """
+
+    # ⑦ 라벨 — 게이트 스크립트와 **글자 단위로** 같아야 한다(release.yml 승격 grep 도 이 형식을 본다).
+    A_LABEL = "⑦-a stapler validate(DMG)"
+    B_LABEL = "⑦-b spctl --assess --type open --context context:primary-signature(DMG)"
+    APP_MODE_INFO = "⑦ DMG 축: .app 직접 지정 모드 — 대상 아님(DMG 없음)"
+
+    @staticmethod
+    def _gate_src():
+        with open(_GATE_SH, encoding="utf-8") as fh:
+            return fh.read()
+
+    @staticmethod
+    def _fake_app_tree(root):
+        """실행 가능 바이너리만 가진 최소 .app — 서명·공증이 없다(음성 대조의 재료)."""
+        macos = os.path.join(root, "Fake.app", "Contents", "MacOS")
+        os.makedirs(macos)
+        exe = os.path.join(macos, "fake")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(exe, 0o755)
+        return os.path.join(root, "Fake.app")
+
+    @staticmethod
+    def _mini_python_app(root):
+        """SEAL-2(⑤)를 통과하는 합성 .app — DegradedClosureTests._mini_app 과 동형 픽스처."""
+        pkg = os.path.join(root, "Fake.app", "Contents", "Resources", "runtime",
+                           "python", "lib", "pkg")
+        cache = os.path.join(pkg, "__pycache__")
+        os.makedirs(cache)
+        with open(os.path.join(pkg, "a.py"), "w") as fh:
+            fh.write("x = 1\n")
+        for opt in ("", ".opt-1", ".opt-2"):
+            with open(os.path.join(cache, "a.cpython-312%s.pyc" % opt), "wb") as fh:
+                fh.write(b"\x6f\x0d\x0d\x0a" + struct.pack("<I", 1) + b"\x00" * 8)
+        return os.path.join(root, "Fake.app")
+
+    def _run_gate(self, target):
+        p = subprocess.run(["bash", _GATE_SH, target], capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    # ── (a) 소스 계약 — 플랫폼 무관 ────────────────────────────────────────
+    def test_20_dmg_axis_source_pins(self):
+        """라벨이 바뀌거나 호출이 마운트 뒤로 밀리면 이 핀이 빨개진다.
+
+        위치가 계약인 이유: ⑦ 은 **격리 속성이 붙은 사본**을 평가해야 하고(부착 전이면 격리
+        경로가 아니다), 마운트 뒤로 밀면 봉투가 깨진 DMG 가 attach 단계에서 먼저 죽어 어느
+        검사도 그 사실을 이름으로 지목하지 못한다.
+        """
+        src = self._gate_src()
+        for token in (self.A_LABEL, self.B_LABEL, self.APP_MODE_INFO,
+                      'xcrun stapler validate "$DMG"',
+                      "--context context:primary-signature"):
+            self.assertIn(token, src, "⑦ 계약 문자열 부재: %r" % token)
+        i_quarantine = src.index('ok "① quarantine 부착(DMG)"')
+        i_axis = src.index('xcrun stapler validate "$DMG"')
+        i_attach = src.index('hdiutil attach "$DMG"')
+        self.assertLess(i_quarantine, i_axis, "⑦ 가 ① quarantine 부착보다 앞이다")
+        self.assertLess(i_axis, i_attach, "⑦ 가 hdiutil attach 뒤로 밀렸다")
+        # ⑦-b 는 ④ 와 같은 관례로 full 모드에서만 돈다(측정 불능을 통과로 세지 않는다).
+        self.assertIn('if [ "$MODE" = "full" ]', src)
+
+    # ── (b) 음성 대조 — darwin 한정 ───────────────────────────────────────
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "합성 DMG 생성·평가는 macOS 도구(hdiutil·spctl)를 요구한다")
+    def test_21_unsigned_dmg_fails_dmg_axis(self):
+        """미서명·미공증 DMG 가 ⑦ 에서 FAIL 하고 게이트가 비영 종료한다.
+
+        이 음성 대조가 없으면 ⑦ 은 '항상 초록인 검사'일 수 있다(vacuous pass).
+        종료 코드는 1(FAIL) 또는 2(판정 불가)를 모두 허용한다 — 합성 DMG 에는 동봉 python
+        런타임이 없어 ⑤ SEAL-2 가 대상 0으로 폐쇄(2)되는 경로가 정상이기 때문이다.
+        어느 쪽이든 **0 이 아니어야** 한다(업로드 금지).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src_dir = os.path.join(td, "src")
+            os.makedirs(src_dir)
+            self._fake_app_tree(src_dir)
+            dmg = os.path.join(td, "fake-unsigned.dmg")
+            mk = subprocess.run(["hdiutil", "create", "-volname", "FakeNeg",
+                                 "-srcfolder", src_dir, "-ov", "-format", "UDZO", dmg],
+                                capture_output=True, text=True)
+            if mk.returncode != 0 or not os.path.exists(dmg):
+                # 측정 불능은 통과가 아니다 — 그러나 밀폐 테스트가 러너 환경 문제로 CI 를
+                # 세우는 것도 옳지 않으므로 사유를 남기고 skip 한다(판정은 실물 게이트 실행이 진다).
+                self.skipTest("hdiutil create 실패 — 합성 DMG 없음: %s"
+                              % (mk.stderr or mk.stdout).strip()[:200])
+            rc, out = self._run_gate(dmg)
+            self.assertIn("FAIL " + self.A_LABEL, out, out[-2000:])
+            self.assertIn("FAIL " + self.B_LABEL, out, out[-2000:])
+            self.assertNotEqual(rc, 0, "미서명 DMG 가 통과했다(rc=0)\n%s" % out[-2000:])
+            self.assertIn(rc, (1, 2), "예상 밖 종료 코드 rc=%d\n%s" % (rc, out[-2000:]))
+
+    # ── (c) .app 모드 비적용 — darwin 한정 ────────────────────────────────
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "게이트 전체 실행은 macOS 도구(codesign·spctl 등)를 요구한다")
+    def test_22_app_mode_marks_dmg_axis_not_applicable(self):
+        """`.app` 직접 지정 모드에서 ⑦ 은 '대상 아님' info 로만 남고 PASS 를 만들지 않는다.
+
+        PASS 를 만들면 DMG 봉투를 **평가하지 않은 실행**이 봉투 통과로 집계돼, 로컬 스모크가
+        발행 승인 신호를 위조하게 된다(측정 불능 ≠ 통과).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            app = self._mini_python_app(td)
+            rc, out = self._run_gate(app)
+            self.assertIn(self.APP_MODE_INFO, out, out[-2000:])
+            axis_pass = [ln for ln in out.splitlines() if ln.startswith("PASS ⑦")]
+            self.assertEqual(axis_pass, [], "app 모드에서 ⑦ PASS 가 났다: %r" % axis_pass)
+            # 합성 앱은 서명·공증이 없어 ②③(④)이 FAIL 이다 — 판정에 도달했음을 함께 확인한다
+            # (게이트가 ⑦ info 만 찍고 조용히 성공하는 경로가 없어야 한다).
+            self.assertNotEqual(rc, 0, out[-2000:])
+
+    # ── (d) CI 승격 배선 — 플랫폼 무관 ────────────────────────────────────
+    def test_23_release_yml_promotes_dmg_axis_lines(self):
+        """release.yml 이 ⑦ 라인을 GITHUB_STEP_SUMMARY 로 승격한다(+ 진단 플래그 부재 유지).
+
+        승격이 없으면 ⑦ 의 FAIL·미출력이 20분짜리 로그 안에만 남아 라운드 감사에서 묻힌다
+        (GATE_MODE 승격을 넣은 F1 검증 공백 수리와 같은 근거).
+        """
+        with open(_RELEASE_YML, encoding="utf-8") as fh:
+            yml = fh.read()
+        # 핀의 전제: 게이트 스텝 실재(스텝이 사라지면 승격 단언은 공허하다 — test_14 관례).
+        self.assertIn("release-gate-gatekeeper.sh", yml,
+                      "게이트 스텝이 release.yml 에서 사라졌다 — 무검증 발행 경로")
+        # 승격 grep 은 게이트 스크립트가 내는 라벨 형식(^PASS/FAIL + ⑦)과 결박된다.
+        needle = 'grep -E \'^(PASS|FAIL) ⑦\' "$GLOG"'
+        self.assertIn(needle, yml, '⑦ 라인 요약 승격 배선이 없다')
+        for flag in DiagnoseFlagAbsencePins.DIAG_FLAGS:
+            self.assertNotIn(flag, yml,
+                             "release.yml 이 진단 전용 플래그를 실었다: %s" % flag)
 
 
 if __name__ == "__main__":
