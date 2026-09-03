@@ -222,12 +222,15 @@ HARNESS_PIN = "98a36f4b9aee761f208aa559c2e1f7c755f7c9a6"
 HARNESS_KEY_FILES = ("emit_orchestrator.py", "validate_harness.py", "warrant.py",
                      "genome/soul.md")
 
-# NotebookLM SOT 도구(nlm) 핀 — 2026-06-12 감사 커밋(v0.7.3).
-# PyPI에 0.7.3+가 배포되면 "notebooklm-mcp-cli>=0.7.3" 핀으로 전환하라.
-# (PyPI 0.7.2 이하는 질의 짧은답 누락·auth 오판·silent failure 미수정 — 핀 하향 금지)
-NLM_MIN_VERSION = (0, 7, 3)
-NLM_PIN = ("notebooklm-mcp-cli @ git+https://github.com/jacob-bd/notebooklm-mcp-cli"
-           "@6d41c75e21dae89d7bf6f43a71e3095239a28281")
+# NotebookLM SOT 도구(nlm) 핀 — ★2026-09-03 PyPI 정식판으로 전환(PREP #12).
+# 종전 핀은 git 커밋 6d41c75(v0.7.3)였다. 그 리비전은 **구 호스트 전용**이라 `--fix` 가 그것을
+# 재설치하면 로그인이 되지 않는 버전이 깔린다(CSO 실측: 0.7.3 `nlm login` exit 1). 즉 자동 수리
+# 경로가 도구를 고장 난 상태로 되돌리는 형상이었다 — 핀은 '고정'이지 '옛것 유지'가 아니다.
+# 지금은 PyPI 에 정식 배포본이 있다(실측 2026-09-03: latest 0.10.0 · 총 128 릴리스 ·
+# `curl -s https://pypi.org/pypi/notebooklm-mcp-cli/json`). 이 머신 설치본도 `nlm version 0.10.0`.
+# 최소 버전은 0.9.3 — 그 이하는 구 호스트 인증 경로가 남아 있어 login 이 흔들린다(하향 금지).
+NLM_MIN_VERSION = (0, 9, 3)
+NLM_PIN = "notebooklm-mcp-cli==0.10.0"
 
 TODO_FILES = ["MASTER_TODO.md", "CSO_TODO.md", "WORKER_TODO.md", "REVIEWER_TODO.md"]
 
