@@ -692,7 +692,17 @@ jobs:
           #   배타 핸들이라 타이밍 민감 축이고 IG-9 를 재는 자리라, 행 단위로 좁혀지지 않으면
           #   비싸다. throw 를 Die 로 바꿔 사유를 요약에 올린다 — Write-Host 후 throw 이므로
           #   실패는 그대로 유지된다(스텝은 여전히 붉다).
-          function Die($m){ Write-Host ("::error title=T4-14::" + $m); throw $m }
+          $script:cysDied = $false
+          function Die($m){ $script:cysDied = $true; Write-Host ("::error title=T4-14::" + $m); throw $m }
+          # ★미가드 예외 포집(W-C 실증 33915014824 · 같은 축 세 번째): 가드는 **열거**이고 예외
+          #   경로는 열거가 아니다. 조회를 다 막으니 이번엔 상태 변경 명령(Copy-Item·Get-Item·
+          #   Start-Process·Get-FileHash)이 남았고, 그것도 다 막으면 또 다른 것이 남는다. 그래서
+          #   개별 명령이 아니라 **스텝 경계 한 자리**에서 잡는다 — 지금 남은 경로와 앞으로 생길
+          #   경로를 함께 덮는 유일한 형태다. catch 는 삼킬지 재던질지가 코드에 명시되므로 trap 과
+          #   달리 로컬 검증 없이도 의미가 모호하지 않다(W-C 지적 수용).
+          # ★본문을 일부러 재들여쓰지 않는다 — 재들여쓰기는 60~90줄짜리 공백 diff 를 만들어 행 번호
+          #   참조와 리뷰를 통째로 무효화한다(PowerShell 은 들여쓰기에 의미가 없다).
+          try {
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
           if (-not $inst) { Die "T4-14: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
@@ -745,6 +755,16 @@ jobs:
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $ok) { Die "T4-14: 이미지 잠금 업그레이드 회귀 실패 — 2026-08-28 실사고 계열(잠긴 구 CLI 위로 신본 미반영 또는 성공 위장)" }
           Write-Host "OK: T4-14 — 잠긴 구 CLI 위로 업그레이드 성공 + 신버전 반영 실증"
+          } catch {
+            # Die 가 이미 사유를 올렸으면 중복 annotation 을 내지 않는다 — 한 실패에 한 줄이어야
+            # 판독이 흐려지지 않는다. 재던지므로 스텝은 그대로 붉다(판정 완화 0).
+            # ★줄 번호를 함께 싣는다: 그래야 '타이밍으로 좁힌 추정' 이 '지목' 이 된다.
+            if (-not $script:cysDied) {
+              $m = ($_.Exception.Message -replace '\r?\n', ' ')
+              Write-Host ("::error title=T4-14::미가드 예외(line " + $_.InvocationInfo.ScriptLineNumber + "): " + $m)
+            }
+            throw
+          }
 
       # ─────────────────────────────────────────────────────────────────────────
       # T4-15 배타 핸들 거부 회귀 (R2 라운드2 신설 — 체크리스트 P6 · NSIS-CONTRACT §3·§4 의 기계 시험).
@@ -772,8 +792,18 @@ jobs:
           #   배타 핸들이라 타이밍 민감 축이고 IG-9 를 재는 자리라, 행 단위로 좁혀지지 않으면
           #   비싸다. throw 를 Die 로 바꿔 사유를 요약에 올린다 — Write-Host 후 throw 이므로
           #   실패는 그대로 유지된다(스텝은 여전히 붉다).
-          function Die($m){ Write-Host ("::error title=T4-15::" + $m); throw $m }
+          $script:cysDied = $false
+          function Die($m){ $script:cysDied = $true; Write-Host ("::error title=T4-15::" + $m); throw $m }
           $ErrorActionPreference = 'Stop'
+          # ★미가드 예외 포집(W-C 실증 33915014824 · 같은 축 세 번째): 가드는 **열거**이고 예외
+          #   경로는 열거가 아니다. 조회를 다 막으니 이번엔 상태 변경 명령(Copy-Item·Get-Item·
+          #   Start-Process·Get-FileHash)이 남았고, 그것도 다 막으면 또 다른 것이 남는다. 그래서
+          #   개별 명령이 아니라 **스텝 경계 한 자리**에서 잡는다 — 지금 남은 경로와 앞으로 생길
+          #   경로를 함께 덮는 유일한 형태다. catch 는 삼킬지 재던질지가 코드에 명시되므로 trap 과
+          #   달리 로컬 검증 없이도 의미가 모호하지 않다(W-C 지적 수용).
+          # ★본문을 일부러 재들여쓰지 않는다 — 재들여쓰기는 60~90줄짜리 공백 diff 를 만들어 행 번호
+          #   참조와 리뷰를 통째로 무효화한다(PowerShell 은 들여쓰기에 의미가 없다).
+          try {
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
           if (-not $inst) { Die "T4-15: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
@@ -853,6 +883,16 @@ jobs:
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $ok2) { Die "T4-15b: 재실행 치유 실패 — 계약 안내문('run this installer again')이 거짓" }
           Write-Host "OK: T4-15 — 배타 핸들 거부(exit 4 + 4토큰 + 구본 무손상 + 무사망) 및 재실행 치유 실증"
+          } catch {
+            # Die 가 이미 사유를 올렸으면 중복 annotation 을 내지 않는다 — 한 실패에 한 줄이어야
+            # 판독이 흐려지지 않는다. 재던지므로 스텝은 그대로 붉다(판정 완화 0).
+            # ★줄 번호를 함께 싣는다: 그래야 '타이밍으로 좁힌 추정' 이 '지목' 이 된다.
+            if (-not $script:cysDied) {
+              $m = ($_.Exception.Message -replace '\r?\n', ' ')
+              Write-Host ("::error title=T4-15::미가드 예외(line " + $_.InvocationInfo.ScriptLineNumber + "): " + $m)
+            }
+            throw
+          }
 
       # ─────────────────────────────────────────────────────────────────────────
       # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 + 진짜 KeepAlive 실측).
