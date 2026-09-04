@@ -960,14 +960,6 @@ jobs:
           #   "`*.new.exe` … ★비어 있어야 한다(성공 배치는 rename 으로 소멸 + Delete 벨트 ·
           #    `CYS_PLACE` ⑧ `cys_pl_commit`)" · `:125-126` PASS 조건에도 "잔존 0" 명기.
           #   ④ 재실행 치유는 exit 0 의 **성공 배치**이므로 이 단언의 정당한 자리가 여기다.
-          # ═══ [MUTATION · revert 예정] 음성 대조 — 이 3줄은 다음 커밋에서 git revert 된다 ═══
-          #   목적: 새로 옮긴 `$noNew2` 단언이 **실제로 무는지**를 실증한다. 설치기는 건드리지
-          #   않는다(master 판정: Delete 벨트 무력화 불허) — 검체 측에서 치유 완주 직후·단언 직전에
-          #   더미 `.new` 를 심어 '성공 배치인데 .new 가 남은' 상태를 인위로 만든다.
-          #   기대: T4-15b RED · throw 문구에 ':122 위반' · notice/error 에 `.new잔존0[계약:122]=False`.
-          Set-Content -LiteralPath (Join-Path $dir 'cys.new.exe') -Value 'MUTATION' -Encoding Ascii
-          Write-Host "::warning title=T4-15b-MUTATION::음성 대조용 더미 cys.new.exe 를 심었다 — 이 런의 T4-15b RED 는 **의도된 결과**다(다음 커밋에서 revert)"
-          # ═══ [/MUTATION] ═══
           $noNew2 = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
           $ok2 = ($ri2.ExitCode -eq 0) -and $healedCys -and $healedCysd -and $noMark -and $markerOk -and $lockAlive2 -and $noNew2
           $res2 = ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6} · .new잔존0[계약:122]={7})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2, $noNew2)
