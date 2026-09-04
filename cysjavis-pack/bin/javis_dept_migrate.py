@@ -45,7 +45,12 @@ BOOTSTRAP_REL = os.path.join("bin", "javis_bootstrap.py")
 #   구 목록(훅+부트스트랩 2개)은 그 의존을 몰랐다 — 레거시 부서 팩이 정확히 그 상태로 남는다.
 PRELUDE_REL = os.path.join("hooks", "_lib.sh")
 DETECT_REL = os.path.join("bin", "javis_detect.py")
-REQUIRED_PACK_FILES = [HOOK_REL, PRELUDE_REL, BOOTSTRAP_REL, DETECT_REL]
+#   ★부트 v2 A2(2026-09-04): 훅이 **런처 + 본체** 2파일로 갈렸다. 등록되는 것은 런처
+#   (`role-bootstrap.sh`)뿐이지만 런처는 본체가 없으면 아무 일도 못 한다 — 본체가 빠진 부서
+#   레인에서는 매 선언이 '부트 본체 부재' 고지로 끝난다(위 구 목록이 몰랐던 이음매와 정확히
+#   같은 형상). 그래서 본체를 복제 목록에 **명시 등재**한다.
+LEGACY_REL = os.path.join("hooks", "role-bootstrap-legacy.sh")
+REQUIRED_PACK_FILES = [HOOK_REL, LEGACY_REL, PRELUDE_REL, BOOTSTRAP_REL, DETECT_REL]
 DIRECTIVE_REL = os.path.join("directives", "MASTER_DIRECTIVE.md")
 STALE_DOCTRINE_MARK = "[부서장 스코프 절대규칙]"   # 폐기 교리 heading(2026-07-11 구본)
 CURRENT_DOCTRINE_MARK = "④-c"                      # 현행 교리 분기(D1 옵션 1')

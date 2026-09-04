@@ -1,0 +1,41 @@
+{
+ "started": "<ts>",
+ "run_id": "<run_id>",
+ "pid": 0,
+ "surface": "7",
+ "role": "master",
+ "lane": "base",
+ "boot_last_path": "<boot_last>",
+ "steps": [
+  {
+   "step": "③claim-role-context",
+   "exit": 6,
+   "detail": "<detail>",
+   "order": 7
+  }
+ ],
+ "retry": {
+  "7": {
+   "count": 1,
+   "at": 0
+  }
+ },
+ "socket": "",
+ "base_socket": true,
+ "result": {
+  "ok": null,
+  "state": "session_error",
+  "failed_step": "③claim-role-context",
+  "exit": 10,
+  "retry_eligible": true,
+  "run_id": "<run_id>",
+  "surface": "7",
+  "pid": 0,
+  "notify": {
+   "attempted": true,
+   "channel": "<channel>"
+  }
+ },
+ "ended": "<ts>",
+ "exit": 10
+}

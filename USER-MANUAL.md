@@ -387,6 +387,16 @@ cys set-status --state working --context 57 --task "리팩터링 중"
 
 컨텍스트%가 임계(기본 60%)에 닿으면 데몬이 `context.threshold` 이벤트로 통보합니다.
 
+**각성 ACK(부트 v2)** — 부트가 노드에 지침을 주입한 직후 데몬은 그 좌석에 **논스**(1회용
+난수)를 arm 하고, 노드가 그 논스를 되돌려주면 "지침을 실제로 읽었다"로 판정합니다. Claude
+좌석은 훅(UserPromptSubmit)이 자동으로 제출하므로 사람이 칠 일이 없고, agy·codex 리뷰어는
+`REVIEWER_DIRECTIVE.md` §1-1 절차대로 직접 제출합니다. arm 이전에 도착한 제출은 **무시**됩니다
+(사전 ACK 봉인). ACK 가 없으면 부트는 실패가 아니라 `completed_degraded{ack_pending}` 로 닫히고
+**리뷰 게이트만** 막힙니다(`orchestra check`·`review-prompt`·`round-init` 의 exit 12 — §12.3).
+⚠ 신고용 플래그 `cys set-status --ack <논스>` 는 **이 문서 작성 시점(0.14.29) CLI 에 아직
+없습니다** — 착지 전까지 화면 출력(에코) 경로만 유효합니다. 되돌리는 손잡이는
+`CYS_BOOT_GATES=0` 입니다.
+
 ### 5.6 컨텍스트 사이클·복구
 
 ```bash
@@ -632,11 +642,23 @@ python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_preflight.py" --fix
 
 존재·매핑·훅 등록 검증은 **이 스크립트의 출력만이 사실**입니다(자연어 재추론 금지).
 
+**부트 v2 의 수명 계약** — 선언 1건은 **인텐트 1건**으로 원자 등록되고, 인텐트 1건은 러너
+1개가 집행하며, 그 끝은 **terminal 정확히 1개**입니다(`completed` / `completed_degraded` /
+`declined` / `session_error` / `aborted` / `crashed` / `superseded` / `expired` /
+`attempts_exhausted` / `skipped_inflight` / `state_unreadable` — 11종. 전문은
+`MASTER_DIRECTIVE.md` §0-A). 같은 좌석에 이미 진행 중인 인텐트가 있으면 새 선언은 **기록되되
+`superseded` 로 닫힙니다**(0건도 2건 실행도 아님). 실패했을 때 사용자가 볼 수 있는 것은 두
+가지입니다 — 레인별 `boot-last.json`(경로는 `javis_bootstrap.py lane-path boot_last` 가
+산출)과, 디스크 쓰기가 실패해도 남는 **stdout 미러 1줄**(`{"channel":"boot-last-mirror", …}`).
+
 ### 12.3 위임 루프 (orchestra)
 
 ```bash
 P=${CYS_PACK_DIR:-$HOME/.cys/pack}/bin
 python3 $P/javis_orchestra.py check           # 필수 노드 생존 결정론 확인
+                                              #   exit 0=READY · 1=미달 · 2=측정불가
+                                              #   12=ack_pending(노드는 다 떴으나 리뷰어
+                                              #      각성 ACK 미확인 → 리뷰 게이트만 차단)
 python3 $P/javis_orchestra.py task-prompt --task "<T>" --scope "<범위>" --success "<기준>"   # 위임 티켓 생성
 python3 $P/javis_orchestra.py gate-status --task "<T>"   # 게이트 수렴 판정 (CONVERGED=다음 단계)
 python3 $P/javis_orchestra.py next-action                # 다음 액션 큐 결정론 추출

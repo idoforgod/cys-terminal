@@ -769,7 +769,145 @@ def _shared_verdict_deficit(status, requery=None, tick_s=None, detect=None, agen
                 % (", ".join(verdicts), note)), axes)
 
 
-def _check_payload(verdicts, roster, alive_optional, axes):
+# ─────────────────── (부트 v2 §2-9) check exit 표 · ACK 축 · 주소 게이트 ───────────────────
+# ★exit 표는 **보존 + 추가**다(명세 §4 · K3 계약 추가-only). 값을 이름으로 드러내는 이유는
+#   두 가지다: ①`2`(측정불가)가 리터럴로만 존재하면 "1 미달과 무엇이 다른가"가 코드에서
+#   사라진다 — 이 파일의 `_check_unknown_payload` 가 지키는 계약(측정 없음 ≠ 측정 결과)이
+#   곧 그 차이다. ②새 코드 `12` 가 기존 코드와 **같은 표**에 산다는 사실을 기계가 볼 수 있다.
+CHECK_EXIT_READY = 0            # 필수 전원 ready ∧ (측정됐다면) ACK 확인
+CHECK_EXIT_MISSING = 1          # ready 미달(부재·관문보류·주소 미해소)
+CHECK_EXIT_UNJUDGEABLE = 2      # ★보존 — 판정 불가(데몬 소실 등). 통과도 실패도 아니다
+CHECK_EXIT_ACK_PENDING = 12     # ★신설 — ready 는 전원 충족인데 각성 ACK 미확인
+
+
+def ack_axis_enabled(status):
+    """ACK 축이 **측정 가능한가** — 스위치 SOT 는 데몬이다(명세 §5).
+
+    ★왜 자체 env 노브를 만들지 않는가: 명세 §5 가 "훅·GUI·감독자 **셋 다 이 값을 읽는다**
+      (각자 env 판독 금지)"로 스위치 소유를 데몬 하나에 묶었다. check 가 자기 env 를 따로
+      보면 같은 기계에서 훅은 v2, check 는 v1 인 **반쯤 켜진 조합**이 생기고, 사고 순간에
+      사람이 그 조합을 되돌리지 못한다(같은 파일 `awake_axis_enabled` 의 BLOCK-3 교훈).
+    ★단 마스터 킬스위치(`CYS_BOOT_GATES=0`)만은 형제 게이트와 동일하게 우선한다 — 그것이
+      이 팩의 '전부 되돌린다' 단일 손잡이다.
+    ★데몬이 키를 아예 노출하지 않으면(구 데몬·부트 v2 미배선) **축은 꺼진 것으로 본다**.
+      키 부재를 '켜짐'으로 읽으면 오늘 모든 기계에서 ACK 가 미측정인 채 12 가 쏟아진다."""
+    if os.environ.get(BOOT_GATES_ENV) == "0":
+        return False
+    return bool((status or {}).get("boot_v2_enabled"))
+
+
+def _row_ack_state(row):
+    """데몬 표 행 → "ok" | "pending" | **None(미측정)**. 순수 함수.
+
+    ★`ack_nonce_ok`(명세 §2-8)는 3상이다: True=논스 대조 성공 · False=arm 됐는데 미확인 ·
+      **키 부재/null=측정 자체가 없었다**. null 을 False 로 접으면 부트 v2 가 반쯤 깔린
+      기계에서 정상 팀이 전부 ACK 미확인으로 집계된다 — 같은 파일 awake 축의 BLOCK-4 형."""
+    if not isinstance(row, dict) or "ack_nonce_ok" not in row:
+        return None
+    v = row.get("ack_nonce_ok")
+    if v is None:
+        return None
+    return "ok" if v else "pending"
+
+
+def ack_axis(status, verdicts, roster):
+    """★(부트 v2 §2-9) 리뷰어 각성 ACK 축 — 순수 함수(status·판정만 · 데몬 왕복 0).
+
+    반환 {"axis": bool, "pending": [role]|None, "ok": [role]|None, "unmeasured": [role]|None}
+
+    · `axis=False`(스위치 off·구 데몬)면 나머지 셋은 전부 **None** 이다. 빈 목록으로 두지
+      않는 이유는 이 파일이 `awake_pending` 에서 이미 밝힌 것과 같다 — 빈 목록은 "재어 보니
+      전원 ACK"라는 **거짓 초록**이고, 측정 불능은 통과가 아니다.
+    · 대상은 **리뷰어 역할**뿐이다(명세 [가정 A]: Claude 좌석은 결정론 ACK, 리뷰어만
+      degraded terminal 을 정상으로 인정하되 리뷰 게이트를 막는다). 로스터가 실충전자를
+      알려주므로 대체 좌석(reviewer-claude-N)도 그 이름의 행에서 읽는다.
+    · ready 미충족 역할은 아예 세지 않는다 — 그쪽은 `ready_missing` 이 말하는 **다른 사실**
+      (좌석이 없다)이고, 없는 좌석의 ACK 를 pending 이라 부르면 처방이 겹쳐 뒤집힌다.
+    """
+    reviewer_roles = [e["role"] for e in (roster or []) if e.get("role") in (verdicts or {})]
+    if not ack_axis_enabled(status):
+        return {"axis": False, "pending": None, "ok": None, "unmeasured": None}
+    rows = {}
+    for s in (status or {}).get("surfaces", []):
+        if s.get("role") and not s.get("exited"):
+            rows.setdefault(s.get("role"), s)
+    pending, ok, unmeasured = [], [], []
+    for r in reviewer_roles:
+        v = verdicts.get(r) or {}
+        if not v.get("satisfied"):
+            continue
+        state = _row_ack_state(rows.get(v.get("filler") or r))
+        (ok if state == "ok" else pending if state == "pending" else unmeasured).append(r)
+    return {"axis": True, "pending": pending, "ok": ok, "unmeasured": unmeasured}
+
+
+def check_exit_code(axes, ack):
+    """★exit 단일 정의 — 사람용 경로와 `--json` 이 **같은 함수**로 코드를 만든다.
+
+    두 벌로 적으면 한쪽만 12 를 배우는 드리프트가 생긴다(이 파일이 `ready_missing`·`gated`
+    를 표현 이전으로 끌어올린 것과 같은 이유). 우선순위: ready 미달(1) > ACK 미확인(12) > 0.
+    ready 가 미달인데 12 를 내면 '팀이 섰다'는 거짓이 실린다 — 축의 계급을 뒤집지 않는다."""
+    if axes.get("ready_missing"):
+        return CHECK_EXIT_MISSING
+    if (ack or {}).get("pending"):
+        return CHECK_EXIT_ACK_PENDING
+    return CHECK_EXIT_READY
+
+
+def ack_remedy(roles):
+    """ACK 미확인 좌석의 **실재하는** 처방 1줄(순수 함수).
+
+    ★명세 §3-2 는 처방으로 `javis_boot_node.py --role <r> --verify` 를 적었으나 그 플래그는
+      실재하지 않는다(javis_boot_node.py 의 argparse 실측 — --role/--agent/--reclaim/
+      --self-test/--json/--idle/--timeout 뿐). 없는 명령을 처방으로 내면 이 파일이 U-10 에서
+      스스로 금지한 **거짓 처방**이 된다. 그래서 실재 경로 둘로 적는다."""
+    if not roles:
+        return ""
+    agents = []
+    for r in roles:
+        a = next((ag for role, ag, _p in BOOT_PLAN if role == r), None)
+        agents.append("javis_boot_node.py --role %s%s" % (r, (" --agent %s" % a) if a else ""))
+    return ("javis_orchestra.py boot-reviewers (감지·대체 폴백 포함) 또는 %s"
+            % " · ".join(agents))
+
+
+def addr_unresolved_roles(status, verdicts):
+    """★(부트 v2 §2-9) **역할 주소 resolve 게이트** — 순수 함수.
+
+    슬롯이 해소돼 satisfied 인 요건이라도, 데몬 표에 **그 실충전자 이름을 `role` 로 가진
+    비종료 행**이 없으면 `cys send --to <역할>` 이 닿지 않는다. 좌석이 살아 있다는 사실과
+    그 좌석에 **주소로 배달할 수 있다**는 사실은 다른 명제이고, 후자가 거짓인 채 READY 를
+    내면 위임 티켓이 허공으로 간다(배달 0인데 발신 성공).
+
+    ★게이트를 `check_verdicts` 가 아니라 여기(check 소비 지점)에 두는 이유: 같은 판정 함수를
+      javis_bootstrap 결손 판정·wakeup zombie 가드·reclaim 이 공유한다. 그쪽의 satisfied 를
+      함께 뒤집으면 주소 등록이 잠깐 늦은 좌석 위에 중복 스폰이 얹힌다(자가치유가 아니라
+      자가교란). 명세 §2-9 도 이 게이트를 `check` 항목 아래 둔다."""
+    live = live_role_names(status or {})
+    return [r for r, v in (verdicts or {}).items()
+            if v.get("satisfied") and (v.get("filler") or r) not in live]
+
+
+def mark_addr_unresolved(verdicts, roles):
+    """주소 미해소 역할을 **ready 미달로 접은** 새 판정 dict(순수 · 입력 무변조)."""
+    if not roles:
+        return verdicts
+    out = {}
+    for r, v in verdicts.items():
+        if r in roles:
+            v = dict(v)
+            v["satisfied"] = False
+            if "ready" in v:
+                v["ready"] = False          # ready 는 satisfied 의 별칭 — 함께 접는다
+            if "awake" in v:
+                v["awake"] = False          # ready 아닌 좌석은 awake 가 성립하지 않는다
+            v["why"] = "%s · addr_unresolved(데몬 표에 role %s 비종료 행 없음)" % (
+                v.get("why", ""), v.get("filler") or r)
+        out[r] = v
+    return out
+
+
+def _check_payload(verdicts, roster, alive_optional, axes, ack=None, why=None):
     """`check --json` 의 기계 판독 payload(순수 구성 — 부작용 0).
 
     ★1단 계약: `exit` 은 **ready 축**(종전과 완전히 동일)이고 `awake`·`awake_pending` 은
@@ -780,7 +918,9 @@ def _check_payload(verdicts, roster, alive_optional, axes):
       그대로 실어 나른다 — 강등이 조용히 사라지지 않는다."""
     return {
         "schema": "orchestra-check/v1",
-        "exit": 1 if axes["ready_missing"] else 0,
+        # ★exit 은 사람용 경로와 **같은 함수**가 만든다(check_exit_code) — 12 를 한쪽만
+        #   배우는 드리프트 차단. 12 의 추가는 additive 다: 0/1/2 의 의미는 무변경이다.
+        "exit": check_exit_code(axes, ack),
         "axis": axes["axis"],
         "ready": axes["ready"],
         "ready_missing": axes["ready_missing"],
@@ -791,7 +931,12 @@ def _check_payload(verdicts, roster, alive_optional, axes):
         "verdicts": verdicts,
         "roster": roster,
         "optional": {r: bool(alive_optional.get(r)) for r in OPTIONAL_ROLES},
-        "why": None,
+        # ★기존 13필드는 **한 개도 지우지 않는다**(K3 추가-only). `why` 는 종전에도 있던
+        #   필드이고 값만 채워진다(주소 미해소 사유) — 종전 경로에서는 여전히 null 이다.
+        "why": why,
+        # 14번째 — 부트 v2 §2-9 ACK 축. `pending`/`ok`/`unmeasured` 가 null 이면 **미측정**
+        # (축 off·구 데몬)이지 '전원 ACK'가 아니다.
+        "ack": ack,
     }
 
 
@@ -819,6 +964,8 @@ def _check_unknown_payload(why):
         "roster": None,
         "optional": None,
         "why": why,
+        # ★판정 불가에서는 ACK 도 **측정되지 않았다** — 스키마 모양을 맞추되 전부 null 이다.
+        "ack": None,
     }
 
 
@@ -839,22 +986,29 @@ def cmd_check(args):
     # ★판정은 순수 함수(check_verdicts)에 있고 여기는 표현만 한다 — 같은 함수를 bootstrap 결손
     #   판정·wakeup zombie 가드·reclaim 이 소비하므로 판정 이원화가 구조적으로 불가능하다(A1 클래스).
     verdicts, roster = check_verdicts(status)
+    # ★(부트 v2 §2-9) 역할 주소 resolve 게이트 — 슬롯이 해소돼도 그 이름의 비종료 행이
+    #   데몬 표에 없으면 주소 배달이 불가능하다. 게이트는 **check 한정**이다(위 함수 주석).
+    unresolved = addr_unresolved_roles(status, verdicts)
+    verdicts = mark_addr_unresolved(verdicts, unresolved)
     required = list(verdicts.keys())
     alive_optional = live_roles(status)
     # ★(U-25 1단) 분류를 **표현 이전으로** 끌어낸다. 종전엔 missing·gated 를 아래 print 루프
     #   안에서 만들었다 — 같은 규칙을 사람용·기계용 두 벌로 적지 않기 위한 것이고, 목록의
     #   값·순서(요건 순서)는 종전과 동일하다(사람용 출력 바이트 무변경).
     axes = verdict_axes(verdicts)
+    # ★(부트 v2 §2-9) ACK 축 — 순수 함수(추가 데몬 왕복 0 · 관찰 멱등 화이트리스트 불변).
+    ack = ack_axis(status, verdicts, roster)
     missing, gated = axes["ready_missing"], axes["gated"]
+    _why = ("addr_unresolved: %s" % ", ".join(unresolved)) if unresolved else None
     if getattr(args, "json", False):
         # ★기계 소비 전용 경로: 사람용 산문('READY' 토큰 포함)은 **한 줄도 내지 않는다**.
         #   디렉티브·C03 핀이 인용하는 문안은 아래 기본 경로에 그대로 있다.
         #   ★`getattr` 기본값이 필요한 이유: `javis_idempotency._spy_cmd_check` 가 속성이 없는
         #     빈 Args 로 이 함수를 부른다(관찰 멱등 negative assertion). `args.json` 직접
         #     참조는 그 검체를 AttributeError 로 죽인다.
-        print(json.dumps(_check_payload(verdicts, roster, alive_optional, axes),
+        print(json.dumps(_check_payload(verdicts, roster, alive_optional, axes, ack, _why),
                          ensure_ascii=False, sort_keys=True))
-        return 1 if missing else 0
+        return check_exit_code(axes, ack)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
     # 리뷰어 대체 고지(2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
@@ -871,7 +1025,10 @@ def cmd_check(args):
             #   여기서 "→ `cys boot` 로 기동하라"고 적으면 **거짓 처방**이다(boot 은 이 좌석을
             #   스폰도 회수도 하지 않는다 — 그게 옳은 동작이다). 사람이 관문을 한 번 통과시켜야
             #   한다. 미충족 계상·exit 계약은 **그대로**(1) 두고 라벨과 처방만 정확하게 만든다.
-            if r in gated:
+            if r in unresolved:
+                # ★'미기동'이라 적으면 거짓 처방이 된다(프로세스는 살아 있다) — U-10 과 같은 계급.
+                print("  ✗ %s — 역할 주소 미해소 (addr_unresolved · %s)" % (r, v["why"]))
+            elif r in gated:
                 print("  ✗ %s — 첫기동 관문 보류 (%s)" % (r, v["why"]))
             else:
                 print("  ✗ %s — 미기동 (%s)" % (r, v["why"]))
@@ -901,9 +1058,28 @@ def cmd_check(args):
             print("  ※ 관문 보류(%s): 기동 명령으로 풀리지 않는다. 해당 pane 에서 첫기동 관문을 "
                   "사람이 1회 통과시킨 뒤 재부트하라 — 좌석·프로세스는 살아 있다"
                   "(`cys read-screen --surface <ref>` 로 화면 확인)." % ", ".join(gated))
-        return 1
-    print("종합: %d종 의무 노드 전부 생존 — LLM orchestrating READY" % len(required))
-    return 0
+        if unresolved:
+            print("  ※ 역할 주소 미해소(%s): 좌석·프로세스는 살아 있으나 데몬 표에 그 role 을 "
+                  "가진 비종료 행이 없다 — `cys send --to <역할>` 이 닿지 않는다(위임 티켓이 "
+                  "허공으로 간다). `cys list` 의 role 열을 확인하고 해당 노드에서 "
+                  "`cys claim-role <역할>` 로 주소를 재등록하라 — 기동 명령으로는 풀리지 않는다."
+                  % ", ".join(unresolved))
+    elif ack["pending"]:
+        # ★(부트 v2 §2-9) ready 는 전원 충족인데 각성 ACK 만 미확인이다.
+        print("종합: %d종 의무 노드 전부 생존(ready) — 그러나 각성 ACK 미확인: %s"
+              % (len(required), ", ".join(ack["pending"])))
+        print("  ※ 부트 완주는 막지 않는다(⑤check 소비자는 12 를 0 으로 접는다) — 막히는 것은 "
+              "**리뷰 게이트**(review-prompt·round-init)뿐이다. 처방: %s"
+              % ack_remedy(ack["pending"]))
+    else:
+        if ack["axis"] and ack["unmeasured"]:
+            # 축은 켜졌는데 행에 ack 필드가 없다 = 부분 배포. **미측정을 초록으로 접지 않는다**.
+            print("  · 각성 ACK 미측정(%s) — 데몬 표에 ack 필드가 없다(부분 배포·스큐). "
+                  "미측정은 '전원 ACK'가 아니다." % ", ".join(ack["unmeasured"]))
+        print("종합: %d종 의무 노드 전부 생존 — LLM orchestrating READY" % len(required))
+    # ★exit 은 **한 곳**에서만 만든다 — 사람용 경로가 규칙을 다시 적으면 `--json` 과 갈린다
+    #   (음성 대조 검체가 실제로 그 사본을 잡아냈다). 표현은 위에서, 판정은 여기서.
+    return check_exit_code(axes, ack)
 
 
 # ── boot-reviewers: 리뷰어 감지→기동, 미감지 시 Claude 대체 자동 폴백(멈춤 없음) ──
@@ -1109,7 +1285,70 @@ def load_invariants(path, max_lines=20):
     return bullets[:max_lines] or None
 
 
+def verdict_json_path(task, rnd, evaluator):
+    """리뷰어 verdict JSON 의 **정본 경로**(레인별 유일) — `<팩>/round/_reviews/<task>-r<N>-<evaluator>.json`.
+
+    ★왜 파일이 정본이어야 하는가(dept-1 실측 2026-09-04 · CEO 상신): reviewer-codex R3 verdict
+      (7,581B)가 `_reviews/` 에 0건이었고 **유일한 완전본이 부서장 좌석 큐 안에만** 있었다 — 큐 배달
+      전에 좌석이 정리됐다면 판정 근거가 통째로 휘발됐을 것이다(화면 캡처는 pane 폭 때문에 1,533B
+      부분본에 그쳤다). 본부의 14건도 사람이 손으로 JSON 을 만든 것이지 도구가 강제한 것이 아니다.
+      `round-log` 는 리뷰어 행에 `--verdict-json <파일>` 을 **요구**하는데 정작 의뢰문은 그 파일을
+      어디에 쓰라고 말하지 않았다 — 요구와 지시가 갈린 자리를 이 함수가 잇는다.
+    경로는 `pack_dir()` 파생이라 **레인(부서 팩)마다 유일**하고, 슬러그 규칙은 `phase_index_path` 와
+    같다(경로 탈출 문자는 전부 `_` 로 접힌다 — basename 분리자 0)."""
+    safe = re.sub(r"[^0-9A-Za-z가-힣_.-]", "_", task or "")[:80] or "task"
+    ev = re.sub(r"[^0-9A-Za-z_.-]", "_", str(evaluator or "reviewer"))[:40] or "reviewer"
+    try:
+        n = int(rnd or 1)
+    except (TypeError, ValueError):
+        n = 1
+    return os.path.join(pack_dir(), "round", "_reviews", "%s-r%d-%s.json" % (safe, n, ev))
+
+
+def ack_gate_precheck(cmd_label):
+    """★(부트 v2 §2-9) **리뷰 게이트 사전검사** — 반환 (blocked: bool, lines: [str]).
+
+    명세의 소비자 매핑에서 `review-prompt`·`round-init` 만이 ACK 미확인을 **차단**한다.
+    나머지 소비자(⑤check·phoenix·formation·GUI)는 경고 후 통과한다 — 부트 완주를 막으면
+    리뷰어 하나의 확률적 각성이 팀 전체의 기동을 인질로 잡는다([가정 A] 의 요지).
+
+    ★in-process 로 판정하는 이유(명세 문언은 "`check --json` 호출"): 같은 파일의 순수 함수
+      (`check_verdicts`·`ack_axis`)를 그대로 소비하면 **정의가 하나**다. 서브프로세스로
+      자기 자신을 부르면 같은 규칙의 사본이 프로세스 경계에 하나 더 생기고(파싱·타임아웃·
+      exit 해석), 그 사본이 드리프트하는 순간 게이트가 조용히 열린다. 데몬 왕복 1회
+      (`cys status`)는 어느 쪽이든 동일하다.
+    ★측정 불가(데몬 소실·cys 부재)는 **차단하지 않는다**: 그것은 '재어 보니 미확인'이 아니라
+      '재지 못했다'이고, 데몬이 죽었다고 리뷰 **의뢰문 생성**까지 막으면 이 게이트가 새로운
+      정지 사유를 만든다(이 파일 exit 2 계약과 같은 계급). 대신 그 사실을 stderr 로 고지한다."""
+    status = cys_status()
+    if status is None:
+        return False, ["[%s] ACK 사전검사 미측정 — cys status 수집 실패(데몬 미가동·cys 부재). "
+                       "차단하지 않는다(측정 불능은 미확인과 다르다)." % cmd_label]
+    verdicts, roster = check_verdicts(status)
+    ack = ack_axis(status, verdicts, roster)
+    if not ack["pending"]:
+        if ack["axis"] and ack["unmeasured"]:
+            return False, ["[%s] ACK 미측정(%s) — 데몬 표에 ack 필드 없음(부분 배포). "
+                           "차단하지 않는다." % (cmd_label, ", ".join(ack["unmeasured"]))]
+        return False, []
+    return True, [
+        "[%s] 차단: 각성 ACK 미확인 좌석 — %s" % (cmd_label, ", ".join(ack["pending"])),
+        "  근거: 데몬 표 `ack_nonce_ok` 가 false(논스 arm 후 ACK 미도착). 지침을 못 읽은 "
+        "좌석에 리뷰를 의뢰하면 '지침 없는 리뷰어'의 판정이 게이트를 통과한다.",
+        "  처방: %s" % ack_remedy(ack["pending"]),
+        "  ※ 부트 완주는 막히지 않는다(check exit 12 는 ⑤에서 0 으로 접힌다) — 막히는 것은 "
+        "이 리뷰 게이트뿐이다. 되돌리려면 `CYS_BOOT_GATES=0`(마스터 킬스위치).",
+    ]
+
+
 def cmd_review_prompt(args):
+    # ★(부트 v2 §2-9 · A1-5) ACK 사전검사 — **의뢰문을 내기 전에** 막는다. stdout 은 리뷰어에게
+    #   그대로 먹이는 프롬프트라 진단 한 줄도 섞으면 안 된다(고지는 stderr).
+    _blocked, _lines = ack_gate_precheck("review-prompt")
+    for _l in _lines:
+        print(_l, file=sys.stderr)
+    if _blocked:
+        return CHECK_EXIT_ACK_PENDING
     bullets = extract_constraints()
     if not bullets:
         # 디렉티브 추출 실패 시에도 제약 누락은 허용 불가 — REVIEWER_DIRECTIVE §2 원문과
@@ -1175,6 +1414,25 @@ def cmd_review_prompt(args):
     if rnd and rnd > 1:
         lines.append("라운드 %d: 직전 산출물을 해당 분야 최고 전문가 관점으로 재귀적 개선 관점에서 "
                      "평가한다(단순 코드수정 금지). 이 라운드의 종결 조건도 위 통과 조건과 같다." % rnd)
+    # ★A8(2026-09-04 CEO 지시 · dept-1 상신): verdict 의 **파일 정본화**를 의뢰문이 강제한다.
+    #   round-log 가 리뷰어 행에 `--verdict-json <파일>` 을 요구하는 것과 짝이며, 좌석 큐·화면
+    #   캡처만 남아 판정 근거가 휘발되는 경로를 닫는다. 평가자 표기는 `--reviewer`(gemini|codex)를
+    #   쓰고, 미지정이면 앵커 역할(reviewer1|reviewer2)로 접어 **항상 구체 경로**를 낸다
+    #   (플레이스홀더를 남기면 사람이 매번 다른 곳에 저장해 정본이 흩어진다).
+    _ev = getattr(args, "reviewer", None) or getattr(args, "reviewer_role", None) or "reviewer1"
+    _vp = verdict_json_path(args.task, rnd, _ev)
+    lines.append("")
+    lines.append("verdict 정본 저장(필수 — 이 경로에 JSON 파일로 저장하라):")
+    lines.append("  %s" % _vp)
+    lines.append("  · 디렉터리가 없으면 먼저 만들어라: mkdir -p \"%s\"" % os.path.dirname(_vp))
+    lines.append("  · 스키마 = _round/REVIEWER_VERDICT_CONTRACT.md "
+                 "(verdict enum + evidence file:line · score(0-100) 금지).")
+    lines.append("  · master 의 `javis_orchestra.py round-log --verdict-json <파일>` 은 **이 파일만** "
+                 "받는다 — 산문 전사는 거부된다.")
+    lines.append("  · 화면 출력·push 본문은 사본이다(pane 폭에서 잘리고 좌석이 정리되면 사라진다). "
+                 "**파일이 정본**이다.")
+    lines.append("완료 기준(파일 실재): 위 경로에 verdict JSON 이 **실재**할 때 이 라운드가 제출된 "
+                 "것으로 본다 — 파일이 없으면 미제출이며 라운드는 종결되지 않는다.")
     lines.append("회신: `cys send --queued --to master \"[리뷰] ...\"` (자동 Return 배달 — "
                  "타이핑 가드 안전·send-key 불필요).")
     print("\n".join(lines))
@@ -1441,13 +1699,16 @@ def todo_file_name(role):
     return "%s_TODO.md" % role.upper().replace("-", "_")
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
     tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
     probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
     삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
-    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증)."""
+    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증).
+    task_id(#10 · PREP #10): 장부(`javis_task.py`) 태스크 id. 지정 시 E1·P3 블록의 `<id>`·`<task-id>`
+    **플레이스홀더를 실 id 로 치환**하고 증거 경로도 그 id 로 확정한다. 미지정이면 종전 문안 그대로
+    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
@@ -1520,20 +1781,31 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     #   --task 없는 무-task 영수증은 done 대조에서 대상 불일치로 거부된다. task-prompt는 작업
     #   서술만 알고 장부 task-id를 모르므로 `<task-id>` 플레이스홀더로 출력하고 워커가 치환한다.
     if probes:
-        lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
-                     "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
-                     "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
-                     "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
-                     "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
+        if task_id:
+            lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                         "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                         "--task %s …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                         "미실행·FAIL 시 done 거부." % (", ".join(probes), task_id))
+        else:
+            lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                         "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                         "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                         "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
+                         "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
         lines.append("  ⚠ relaxed probe(submit·ctx-compare·kill-preflight)는 `--task` 없이 "
                      "실행하면 무-task 영수증이 되어 done 대조에서 대상 불일치로 거부된다 — "
                      "반드시 --task를 동반하라.")
     # E1 증거의 기계화(설계 §E1): 태스크 done 전이는 실제 검증 산출물 파일을 제출해야 통과(strict).
+    # ★#10(PREP #10): 장부 id 를 알면 플레이스홀더를 남기지 않는다 — 워커가 `<id>` 를 그대로 두고
+    #   done 을 치면 게이트가 대상 불일치로 거부하고, 그 실패는 티켓을 읽은 시점이 아니라 **완료
+    #   보고 직전**에 드러나 재작업이 된다. 발부자가 아는 값을 발부 시점에 박는 것이 정위치다.
+    _tid = task_id or "<id>"
+    _ev_dir = "_round/evidence/%s/" % (task_id or "<task-id>")
     lines.append("완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물"
-                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 "
-                 "`javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — "
+                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `%s`)을 만들고 "
+                 "`javis_task.py set-status %s done --evidence-artifact <경로>`로 제출하라 — "
                  "파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 "
-                 "--skip-reason, skip_audit.jsonl 감사 기록).")
+                 "--skip-reason, skip_audit.jsonl 감사 기록)." % (_ev_dir, _tid))
     if prereq_block:
         lines.append("")
         lines.append(prereq_block)
@@ -1590,11 +1862,24 @@ def cmd_task_prompt(args):
         _split_csv(getattr(args, "requires_skills", None)),
         _split_csv(getattr(args, "related_memory", None)),
         os.path.join(pack_dir(), "memory"))
+    # ★#10(PREP #10) 장부 id — 지정 시 E1·P3 플레이스홀더를 실 id 로 확정하고, 미지정이면
+    #   **그 사실을 stderr 1줄로 고지**한다. 종전에는 `<id>`·`<task-id>` 가 조용히 그대로 나가서
+    #   워커가 치환을 잊으면 done 게이트가 대상 불일치로 거부했다(실패가 완료 보고 직전에 드러남).
+    #   stdout(티켓 본문)은 오염시키지 않는다 — 발부 파이프라인이 그대로 소비한다.
+    task_id = getattr(args, "task_id", None)
+    if task_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", task_id):
+        print("[task-prompt] --task-id 는 영숫자·.·_·- 만 허용: %r" % task_id, file=sys.stderr)
+        return 2
+    if not task_id:
+        print("[task-prompt] 장부 task id 미지정 — 티켓의 <id>/<task-id> 플레이스홀더를 워커가 "
+              "스스로 치환해야 한다(javis_task.py create 로 등재 후 --task-id 전달 권장 · PREP #10)",
+              file=sys.stderr)
     print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
                             output_format=getattr(args, "output_format", None),
                             prereq_block=prereq, dont=getattr(args, "dont", None),
                             tier_hint=getattr(args, "tier", None),
-                            probes=_split_csv(getattr(args, "probes", None))))
+                            probes=_split_csv(getattr(args, "probes", None)),
+                            task_id=task_id))
     return 0
 
 
@@ -1671,7 +1956,17 @@ def round_path(task):
     return os.path.join(pack_dir(), "round", "ORCHESTRATION-%s.md" % safe)
 
 
-def cmd_round_init(args):
+def cmd_round_init(args, gate=True):
+    # ★(부트 v2 §2-9 · A1-6) ACK 사전검사. `gate=False` 경로가 있는 이유: `cmd_round_log` 가
+    #   장부 부재 시 이 함수를 **내부 호출**해 장부를 만든다. 그 호출까지 막으면 round-log 가
+    #   없는 파일에 append 하려다 죽는다 — 명세가 게이트를 건 대상은 `round-init` **명령**이지
+    #   장부 생성이라는 기계 행위가 아니다(round-log 는 소비자 표에 없다).
+    if gate:
+        _blocked, _lines = ack_gate_precheck("round-init")
+        for _l in _lines:
+            print(_l, file=sys.stderr)
+        if _blocked:
+            return CHECK_EXIT_ACK_PENDING
     p = round_path(args.task)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     if os.path.exists(p):
@@ -1697,7 +1992,7 @@ def _cell(s):
 def cmd_round_log(args):
     p = round_path(args.task)
     if not os.path.exists(p):
-        cmd_round_init(args)
+        cmd_round_init(args, gate=False)     # 내부 장부 생성 — 게이트 대상 아님(위 주석)
     # ★전환 게이트 §9-7-2 부수 1: --score 플래그를 제거했다(§6-4 점수 금지).
     #   기록값 칸의 기본은 "-" 이며, --from-cmd 경로에서만 기계검증 출력 꼬리를 담는다
     #   (등급이 아니라 증거 발췌다 — 평균·다수결 affordance 없음).
@@ -2391,6 +2686,23 @@ def cmd_self_test(args):
         for must in ("엄격 제약", "배회 금지", "문제점", "회신",
                      "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
+        # ★A8: verdict 파일 정본화 — 저장 지시·경로·파일 실재 성공기준이 항상 주입된다.
+        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "완료 기준(파일 실재)",
+                     "round/_reviews/"):
+            assert must in out, "review-prompt에 A8 '%s' 누락" % must
+        assert verdict_json_path("T", 2, "reviewer1") in out, "A8 저장 경로 불일치"
+        # 경로 탈출 0(phase_index_path 와 같은 슬러그 규칙) — 판정 축은 **분리자 잔존 0** 과
+        # **_reviews 이탈 0** 이다. `..` 이 파일명 *글자*로 남는 것(`.._.._etc_passwd-r1-…`)은
+        # 탈출이 아니다 — 접미(`-rN-<ev>.json`) 때문에 그 이름이 `.`/`..` 자체가 될 수 없다.
+        _rev_dir = os.path.join(pack_dir(), "round", "_reviews")
+        for _evil in ("../../etc/passwd", "a/b", "..", "T\x00"):
+            _vp_e = verdict_json_path(_evil, 1, "codex")
+            _bn = os.path.basename(_vp_e)
+            assert "/" not in _bn and "\\" not in _bn, \
+                "verdict_json_path basename 분리자 잔존: %s" % _bn
+            assert _bn not in (".", ".."), "basename 이 디렉터리 참조가 됐다: %s" % _bn
+            assert os.path.normpath(_vp_e).startswith(os.path.normpath(_rev_dir) + os.sep), \
+                "verdict_json_path 가 _reviews 밖으로 나갔다: %s" % _vp_e
         # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
         import tempfile as _tf
         _prev_root = os.environ.get("JAVIS_ROOT")
@@ -2475,6 +2787,23 @@ def cmd_self_test(args):
         # E1·P3 공존: probes 지정 시에도 E1 블록이 함께 존재(둘 다 명시)
         assert "완료 증거(E1 evidence-artifact 게이트" in tp_probe and "done 증거 게이트(P3)" in tp_probe, \
             "E1·P3 evidence 게이트 공존 실패"
+        # ★#10(PREP #10) --task-id: 지정 시 플레이스홀더가 실 id 로 확정되고, 미지정 시 종전
+        #   문안이 **byte-동일**로 남는다(하위호환). 두 방향을 함께 못박는다 — 한쪽만 보면
+        #   "항상 치환" 또는 "항상 플레이스홀더" 구현이 만점을 받는다.
+        _tk_noid = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                     probes=["submit"])
+        _tk_id = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                   probes=["submit"], task_id="t-abc.1")
+        assert "set-status <id> done" in _tk_noid and "<task-id>" in _tk_noid, \
+            "task_id 미지정인데 플레이스홀더가 사라졌다(하위호환 위반)"
+        assert "set-status t-abc.1 done" in _tk_id, "task_id 지정인데 E1 set-status 가 미치환"
+        assert "_round/evidence/t-abc.1/" in _tk_id, "task_id 지정인데 증거 경로가 미치환"
+        assert "--task t-abc.1" in _tk_id, "task_id 지정인데 probe --task 가 미치환"
+        assert "<id>" not in _tk_id and "<task-id>" not in _tk_id, \
+            "task_id 지정인데 플레이스홀더가 잔존(워커가 치환을 잊으면 done 게이트가 거부한다)"
+        assert build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES) == \
+            build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES, task_id=None), \
+            "task_id=None 이 기본값과 다른 티켓을 만든다(byte-동일 계약 위반)"
         # 폴백 단독으로도 4규칙 마커 전부를 갖는다(디렉티브 부재 환경의 최후 방어선)
         fb = "\n".join(FALLBACK_RULES)
         for mark in RULE_MARKERS:
@@ -3064,12 +3393,92 @@ def cmd_self_test(args):
         assert classify_call_exit(1)[0] == EXIT_CLASS_TRANSIENT, "exit 1 이 재시도 대상 아님(보수 이탈)"
         assert "재시도는 무의미" in classify_call_exit(127)[1], "영구 실패에 재시도 금지 처방 누락"
         assert _boot_node_outer_timeout() >= 100, "boot_node 외부 상한이 비정상(예산 파생 실패)"
+
+        # ── (부트 v2 §2-9) exit 표 보존 · ACK 축 · 주소 게이트 (A1) ──
+        assert (CHECK_EXIT_READY, CHECK_EXIT_MISSING, CHECK_EXIT_UNJUDGEABLE,
+                CHECK_EXIT_ACK_PENDING) == (0, 1, 2, 12), "check exit 표 값 드리프트"
+        _v_ok = {"cso": {"satisfied": True, "filler": "cso"},
+                 "reviewer-gemini": {"satisfied": True, "filler": "reviewer-gemini"}}
+        _rost = [{"role": "reviewer-gemini"}]
+        # ① 축 off(구 데몬 = boot_v2_enabled 키 부재) → 전부 None. 빈 목록이면 '거짓 초록'.
+        _a = ack_axis({"surfaces": []}, _v_ok, _rost)
+        assert _a == {"axis": False, "pending": None, "ok": None, "unmeasured": None}, \
+            "축 off 인데 ACK 가 측정된 것처럼 접혔다: %r" % (_a,)
+        assert check_exit_code({"ready_missing": []}, _a) == CHECK_EXIT_READY, "축 off 에서 12 유출"
+        # ② 축 on · 행에 ack 필드 없음 → unmeasured(=pending 아님). exit 은 종전 0.
+        _st_on = {"boot_v2_enabled": True,
+                  "surfaces": [{"role": "cso"}, {"role": "reviewer-gemini"}]}
+        _a = ack_axis(_st_on, _v_ok, _rost)
+        assert _a["axis"] and _a["unmeasured"] == ["reviewer-gemini"] and _a["pending"] == [], \
+            "ack 필드 부재를 미확인으로 오접음: %r" % (_a,)
+        assert check_exit_code({"ready_missing": []}, _a) == CHECK_EXIT_READY, "미측정이 12 로 승격"
+        # ③ ack_nonce_ok=None(3상의 셋째) 도 미측정이다.
+        _st_null = {"boot_v2_enabled": True,
+                    "surfaces": [{"role": "reviewer-gemini", "ack_nonce_ok": None}]}
+        assert ack_axis(_st_null, _v_ok, _rost)["unmeasured"] == ["reviewer-gemini"], \
+            "ack_nonce_ok=null 을 false 로 접음(BLOCK-4 형)"
+        # ④ ack_nonce_ok=False → pending → 12. True → ok → 0.
+        _st_p = {"boot_v2_enabled": True,
+                 "surfaces": [{"role": "reviewer-gemini", "ack_nonce_ok": False}]}
+        _a = ack_axis(_st_p, _v_ok, _rost)
+        assert _a["pending"] == ["reviewer-gemini"] and _a["ok"] == [], "pending 판정 실패: %r" % (_a,)
+        assert check_exit_code({"ready_missing": []}, _a) == CHECK_EXIT_ACK_PENDING, "12 미발화"
+        # ⑤ ready 미달이면 ACK 가 pending 이어도 **1 이 이긴다**(축 계급 역전 금지).
+        assert check_exit_code({"ready_missing": ["cso"]}, _a) == CHECK_EXIT_MISSING, "축 계급 역전"
+        _st_ok = {"boot_v2_enabled": True,
+                  "surfaces": [{"role": "reviewer-gemini", "ack_nonce_ok": True}]}
+        assert ack_axis(_st_ok, _v_ok, _rost)["ok"] == ["reviewer-gemini"], "ok 판정 실패"
+        # ⑥ 마스터 킬스위치(CYS_BOOT_GATES=0)가 축을 끈다.
+        _prev = os.environ.get(BOOT_GATES_ENV)
+        try:
+            os.environ[BOOT_GATES_ENV] = "0"
+            assert ack_axis(_st_p, _v_ok, _rost)["axis"] is False, "킬스위치가 ACK 축을 못 끈다"
+        finally:
+            if _prev is None:
+                os.environ.pop(BOOT_GATES_ENV, None)
+            else:
+                os.environ[BOOT_GATES_ENV] = _prev
+        # ⑦ ready 미충족 좌석의 ACK 는 세지 않는다(처방 겹침 방지).
+        _v_absent = {"reviewer-gemini": {"satisfied": False, "filler": None}}
+        assert ack_axis(_st_p, _v_absent, _rost) == {"axis": True, "pending": [], "ok": [],
+                                                     "unmeasured": []}, "부재 좌석을 pending 계상"
+        # ⑧ 처방은 **실재 명령**이다(없는 --verify 를 내지 않는다).
+        _rem = ack_remedy(["reviewer-gemini"])
+        assert "--verify" not in _rem and "javis_boot_node.py --role reviewer-gemini" in _rem, \
+            "거짓 처방(존재하지 않는 플래그): %r" % _rem
+        # ⑨ 주소 resolve 게이트 — 좌석은 satisfied 인데 데몬 표에 그 role 행이 없다.
+        _st_addr = {"surfaces": [{"role": "cso"}]}          # reviewer-gemini 행 없음
+        assert addr_unresolved_roles(_st_addr, _v_ok) == ["reviewer-gemini"], "주소 게이트 미발화"
+        assert addr_unresolved_roles({"surfaces": [{"role": "cso"},
+                                                   {"role": "reviewer-gemini"}]}, _v_ok) == [], \
+            "주소가 있는데 미해소로 오판"
+        assert addr_unresolved_roles({"surfaces": [{"role": "cso"},
+                                                   {"role": "reviewer-gemini",
+                                                    "exited": True}]}, _v_ok) == ["reviewer-gemini"], \
+            "종료된 행을 주소로 인정"
+        _m = mark_addr_unresolved(_v_ok, ["reviewer-gemini"])
+        assert _m["reviewer-gemini"]["satisfied"] is False and _v_ok["reviewer-gemini"]["satisfied"] \
+            is True, "mark_addr_unresolved 가 입력을 변조했다(순수성 위반)"
+        assert "addr_unresolved" in _m["reviewer-gemini"]["why"], "사유 라벨 누락"
+        assert verdict_axes(_m)["ready_missing"] == ["reviewer-gemini"], "주소 미해소가 exit 1 로 안 접힘"
+        # ⑩ `--json` payload — 기존 13필드 **전부 보존** + ack 1개 추가(계약 추가-only).
+        _base13 = {"schema", "exit", "axis", "ready", "ready_missing", "gated", "awake",
+                   "awake_pending", "required", "verdicts", "roster", "optional", "why"}
+        _pl = _check_payload(_v_ok, _rost, {}, verdict_axes(_v_ok), _a, None)
+        assert _base13 <= set(_pl), "13필드 중 누락: %s" % (_base13 - set(_pl))
+        assert set(_pl) - _base13 == {"ack"}, "추가 필드가 ack 하나가 아니다: %s" % (set(_pl) - _base13)
+        assert _pl["exit"] == CHECK_EXIT_ACK_PENDING, "payload exit 이 12 를 못 싣는다"
+        _un = _check_unknown_payload("x")
+        assert _base13 <= set(_un) and _un["exit"] == CHECK_EXIT_UNJUDGEABLE and _un["ack"] is None, \
+            "판정불가 payload 계약 파손(exit 2 보존·ack null)"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
     print("javis_orchestra self-test OK (W2: PLAN 정책열·slot_satisfied 3케이스·check_verdicts "
           "강등라벨·A12 exit 분류 + U-25 완주 2축(ready 별칭 불변·awake 관측·축 집계·"
           "결손 2원소 호환[합성 3원소 표본]·check --json·마스터/축 롤백 2노브) + "
+          "부트v2 A1(exit 표 0/1/2/12 · ACK 축 3상[off·미측정·pending/ok] · 축 계급 · "
+          "킬스위치 · 실재 처방 · 주소 resolve 게이트 4케이스 · payload 13필드 보존+ack) + "
           "4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
           "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
     return 0
@@ -3138,6 +3547,10 @@ def main():
                     help="이 태스크의 필수 probe 목록(쉼표 구분 — 예: 'submit,artifact'). 지정 시 "
                          "티켓에 done 전 각 probe PASS 영수증 필수 블록 삽입(P3 · 설계 §2.2·§4 컴포넌트 C·"
                          "javis_actprobe.py 대조). 미지정 시 블록 부재 → 티켓 byte-동일(하위호환)")
+    tp.add_argument("--task-id", dest="task_id", default=None,
+                    help="장부(javis_task.py) 태스크 id — 지정 시 티켓의 E1·P3 플레이스홀더"
+                         "(<id>·<task-id>)를 실 id 로 확정하고 증거 경로도 그 id 로 박는다(PREP #10). "
+                         "미지정 시 티켓은 종전과 byte-동일이고 stderr 로 1줄 고지한다.")
     tp.add_argument("--no-survival-gate", action="store_true",
                     help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
                          "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")

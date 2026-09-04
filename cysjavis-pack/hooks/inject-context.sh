@@ -40,8 +40,16 @@ print('__CYS_END__')" 2>/dev/null | tr -d '\r')
 CWD="$(cys_norm_cwd "$CWD")"
 cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
-SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
-[ -f "$SOUL" ] || SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자)
+# ── #15: soul 해소는 **레인을 존중**한다 (2026-09-04 W-A) ──
+# 종전 순서(CYS_SOUL → ~/.claude/soul.md → ~/.cys/pack/soul.md)는 부서 레인 팩
+# (CYS_PACK_DIR=~/.cys/pack-<부서>)에서 돌아도 **본부 soul** 을 주입했다 — 레인의 정체가
+# 본부 문안으로 덮이는 경로다(프리루드 계약 ⓔ '팩 경로는 레인을 존중한다'와 불일치).
+# 순서: CYS_SOUL(명시) → $CYS_PACK_DIR/soul.md(레인) → ~/.claude/soul.md(레거시) → 배포 기본.
+SOUL=""
+[ -n "${CYS_SOUL:-}" ] && [ -f "$CYS_SOUL" ] && SOUL="$CYS_SOUL"
+[ -z "$SOUL" ] && [ -n "${CYS_PACK_DIR:-}" ] && [ -f "$CYS_PACK_DIR/soul.md" ] && SOUL="$CYS_PACK_DIR/soul.md"
+[ -z "$SOUL" ] && [ -f "$HOME/.claude/soul.md" ] && SOUL="$HOME/.claude/soul.md"   # 레거시 경로
+[ -z "$SOUL" ] && SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자 · 종전 최종 폴백 불변)
 ROOT="${CYS_ROOT:-$HOME}"
 OUT=""
 
@@ -173,9 +181,31 @@ fi
 # ── G33: 계측기 자체가 대상을 못 재던 결함 수리 ──
 # 종전 `lsof -c node` 는 **node로 실행되는 claude**만 셌다. claude Code는 네이티브 바이너리
 # (comm=claude)로 설치되는 경로가 주류라 이 경고는 상시 불발이었다(계측기 타당성 실패 — MEMORY
-# '디버깅 계측 타당성 게이트'와 동일 클래스). `-c` 는 반복 지정이 OR이라 스폰 1회로 둘 다 센다.
-if command -v lsof >/dev/null 2>&1 && [ -n "$CWD" ]; then
-  SHARE=$(lsof -c node -c claude -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
+# '디버깅 계측 타당성 게이트'와 동일 클래스).
+# ── G34(2026-09-03 survey A5 · R1): G33 은 두 가지를 놓쳤다 ──
+#  ① lsof 선택자는 기본 OR — `-c … -d cwd` 는 `-a` 없이는 "(-c 매치) ∪ (모든 프로세스의 cwd)" 라
+#     cwd=$CWD 인 zsh·python·codex 까지 전부 셌다(man lsof: "-a causes all list selection options
+#     to be ANDed"). ② 네이티브 claude 는 lsof COMMAND 열에 실행파일명(버전 문자열 `2.1.259`)으로
+#     보여 `-c claude` 가 0건이다. 그래서 pid 선택은 ps 로 하고 lsof 는 `-a -p … -d cwd` 로 cwd 만
+#     묻는다. 선택 형태 3종(실측 2026-09-03): ⓐ 런처 실행 comm=claude(또는 /…/bin/claude)
+#     ⓑ node 래퍼 comm=node ∧ args 에 claude-code(npm 설치) — codex 도 node 라 args 로 가른다
+#     ⓒ 버전 경로 직접 실행 — ps comm 이 16자로 절단(`/Users/<user>/.lo…` 형태 · 실경로 미기재)되므로
+#        command 첫 토큰의 `/claude/versions/` 로 판별(lsof COMMAND 는 `2.1.259`).
+# pid 결합은 awk 안에서 한다(paste 비의존 — PortableGit 최소 셸 패리티).
+if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CWD" ]; then
+  _CPIDS=$(ps -eo pid=,comm=,command= 2>/dev/null | awk '{
+    pid=$1; comm=$2; n=split(comm,a,"/"); base=a[n]; first=$3; m=split(first,b,"/"); fbase=b[m];
+    hit=0;
+    if (base=="claude" || fbase=="claude") hit=1;
+    else if ((base=="node" || fbase=="node") && ($0 ~ /claude-code|\/claude(\/|$)/)) hit=1;
+    else if (first ~ /\/claude\/versions\//) hit=1;
+    if (hit) { out = (out == "" ? pid : out "," pid) }
+  } END { print out }')
+  if [ -n "$_CPIDS" ]; then
+    SHARE=$(lsof -a -p "$_CPIDS" -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
+  else
+    SHARE=0
+  fi
   if [ "${SHARE:-0}" -ge 2 ]; then
     OUT="${OUT}⚠ 같은 작업폴더($(_esc "$CWD"))에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
   fi

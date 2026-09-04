@@ -50,7 +50,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 | `queue.depth_high` | 한 노드행 queued 배달이 막힌 채 적체(기본 depth 5+ · blocked_by에 사유) | read-screen으로 대상 노드 점검 → 막힘 원인(연속 출력·사람 입력·queue pause) 해소 또는 master 보고 |
 | `queue.starved` | 큐 **머리**가 임계 이상 배달이 막힌 채 장기 대기(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 **별도 축** · blocked_by에 사유) | depth_high와 동일하게 원인(연속 출력·사람 입력·queue pause)을 해소하거나 master 보고. **★강제 배달 `cys queue deliver`는 사람 운영자 전용이다 — LLM 에이전트(CSO·master 포함)는 자동 강제배달 금지·사람 판단에 맡긴다**(경보는 발행뿐, 자동 조치 없음이 계약) |
 | `master.idle` | master **생존 확정 + 장기 침묵**(category=info · 사망 축 `master.deadman`과 분리 — idle은 alert가 아니다) | 정보층은 조치 불요(리포트 게이트 대장이 회수·기록). 게이트가 3×임계에서 critical push로 너를 깨우면 read-screen으로 master 상태 확인 → hang이면 회생 조치(키 입력/재기동 건의) |
-| `[gate] …` wakeup (델타게이트 push) | **네가 게이트 push의 1차 수신자다**(T-0147-2 층2 수신 계층) | **처리 계약**: ①먼저 `cys control alerts`의 `node_liveness` 배지와 게이트 대장(`javis_report_gate.py status`)으로 근거를 확인한다 ②네 권한으로 해소되면 해소하고 **master에 보고하지 않는다**(master stdin 보존이 이 설계의 목적이다) ③해소 불가·판단 필요일 때만 master에 1줄 보고한다. 게이트는 idle·context·feed를 **더 이상 push하지 않는다** — 그것들은 배지·대장·EVT로만 오므로 네가 주기 점검으로 잡는다. |
+| `[gate] …` wakeup (델타게이트 push) | **네가 게이트 push의 1차 수신자다**(T-0147-2 층2 수신 계층) | **처리 계약**: ①먼저 `cys status --json`의 surfaces[].agent_alive·exited(노드 생존)와 게이트 대장(`javis_report_gate.py status`)으로 근거를 확인한다 ②네 권한으로 해소되면 해소하고 **master에 보고하지 않는다**(master stdin 보존이 이 설계의 목적이다) ③해소 불가·판단 필요일 때만 master에 1줄 보고한다. 게이트는 idle·context·feed를 **더 이상 push하지 않는다** — 그것들은 배지·대장·EVT로만 오므로 네가 주기 점검으로 잡는다. |
 
 ## 2. 노드 생애 관리
 - 죽은 노드(`surface.exited`)는 master와 협의해 재기동한다: `cys launch-agent --role <역할> --agent <cli>`.

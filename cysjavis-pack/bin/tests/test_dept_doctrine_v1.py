@@ -40,6 +40,10 @@ def _seed_main_pack_hook_deps(main_pack):
     os.makedirs(os.path.join(main_pack, "hooks"), exist_ok=True)
     os.makedirs(os.path.join(main_pack, "bin"), exist_ok=True)
     _write_exec(os.path.join(main_pack, "hooks", "role-bootstrap.sh"), "#!/bin/bash\nexit 0\n")
+    # ★부트 v2 A2(2026-09-04): 훅이 런처 + 본체로 갈렸다 — 등록되는 것은 런처뿐이지만 런처는
+    #   본체 없이는 아무 일도 못 한다(부서 레인에서 매 선언이 '본체 부재' 고지로 끝난다).
+    #   그래서 복제 필수 목록에 본체가 들어갔고, 이 픽스처 메인 팩도 그것을 갖고 있어야 한다.
+    _write_exec(os.path.join(main_pack, "hooks", "role-bootstrap-legacy.sh"), "#!/bin/bash\nexit 0\n")
     _write_exec(os.path.join(main_pack, "hooks", "_lib.sh"), "#!/bin/sh\n:\n")
     _write_exec(os.path.join(main_pack, "bin", "javis_bootstrap.py"), "#!/usr/bin/env python3\n")
     _write_exec(os.path.join(main_pack, "bin", "javis_detect.py"), "#!/usr/bin/env python3\n")
@@ -332,7 +336,8 @@ class MigrateIdempotent(unittest.TestCase):
         self.assertTrue(os.path.isfile(settings + ".bak-migrate"), "백업 미생성")
         self.assertTrue(os.path.isfile(os.path.join(dept_pack, "hooks", "role-bootstrap.sh")),
                         "부서 팩에 훅 미복사")
-        for _rel in (("hooks", "_lib.sh"), ("bin", "javis_detect.py")):
+        for _rel in (("hooks", "role-bootstrap-legacy.sh"), ("hooks", "_lib.sh"),
+                     ("bin", "javis_detect.py")):
             self.assertTrue(os.path.isfile(os.path.join(dept_pack, *_rel)),
                             "부서 팩에 훅 의존(%s) 미복사 — 부서 레인 훅이 강등된다" % "/".join(_rel))
         self.assertTrue(os.path.isfile(os.path.join(dept_pack, "bin", "javis_bootstrap.py")),
