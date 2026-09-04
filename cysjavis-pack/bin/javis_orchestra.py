@@ -778,6 +778,22 @@ CHECK_EXIT_READY = 0            # 필수 전원 ready ∧ (측정됐다면) ACK 
 CHECK_EXIT_MISSING = 1          # ready 미달(부재·관문보류·주소 미해소)
 CHECK_EXIT_UNJUDGEABLE = 2      # ★보존 — 판정 불가(데몬 소실 등). 통과도 실패도 아니다
 CHECK_EXIT_ACK_PENDING = 12     # ★신설 — ready 는 전원 충족인데 각성 ACK 미확인
+CHECK_EXIT_USAGE = 64           # ★사용 오류(argparse) — **측정불가(2)와 다른 사건**이다
+
+
+class UsageExitParser(argparse.ArgumentParser):
+    """사용 오류를 **exit 64** 로 내는 파서(부트 v2 명세 §4 잠근 exit 표 · R1 codex #3).
+
+    ★왜 기본값 2 를 쓰면 안 되는가: 이 도구에서 `2` 는 **판정 불가**(데몬 소실·status 수집 실패)
+      라는 확정된 의미를 갖는다. argparse 기본값도 2 라서, 오타 하나가 '데몬이 죽었다'와 같은
+      코드로 나가고 소비자는 `cys ping` 을 확인하는 **틀린 처방**을 탄다. 실제로
+      `javis_bootstrap` ⑤ 는 exit 2 를 보면 ping 을 한 번 더 치고 '팩 결손 가능성'을 진단한다 —
+      인자 오타에 그 진단이 붙는다. 두 사건은 처방이 정반대이므로 코드도 갈라야 한다.
+    ★`--help`(exit 0)와 정상 종료는 건드리지 않는다 — `error()` 경로만 64 다."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(CHECK_EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
 
 
 def ack_axis_enabled(status):
@@ -1135,8 +1151,14 @@ def classify_call_exit(rc, target="호출"):
         return EXIT_CLASS_OK, "성공"
     if rc == 2:
         return EXIT_CLASS_PERMANENT, (
-            "%s 치명(exit 2 — 데몬 다운 또는 인자 오류): 재시도는 무의미하다. "
-            "`cys ping` 으로 데몬을 확인하고 인자를 점검하라." % target)
+            "%s 치명(exit 2 — **판정 불가**: 데몬 다운·status 수집 실패): 재시도는 무의미하다. "
+            "`cys ping` 으로 데몬을 확인하라(인자 오류는 exit %d 로 따로 나온다)."
+            % (target, CHECK_EXIT_USAGE))
+    if rc == CHECK_EXIT_USAGE:
+        return EXIT_CLASS_PERMANENT, (
+            "%s 사용 오류(exit %d — 인자·서브커맨드 오타): 재시도는 무의미하다. "
+            "`--help` 로 인자를 확인하라(데몬 문제가 아니다 — `cys ping` 은 처방이 아니다)."
+            % (target, CHECK_EXIT_USAGE))
     if rc == 127:
         return EXIT_CLASS_PERMANENT, (
             "%s 부재(exit 127 — 스크립트/인터프리터 없음): 재시도는 무의미하다. "
@@ -3491,7 +3513,16 @@ def cmd_self_test(args):
 
         # ── (부트 v2 §2-9) exit 표 보존 · ACK 축 · 주소 게이트 (A1) ──
         assert (CHECK_EXIT_READY, CHECK_EXIT_MISSING, CHECK_EXIT_UNJUDGEABLE,
-                CHECK_EXIT_ACK_PENDING) == (0, 1, 2, 12), "check exit 표 값 드리프트"
+                CHECK_EXIT_ACK_PENDING, CHECK_EXIT_USAGE) == (0, 1, 2, 12, 64), \
+            "check exit 표 값 드리프트(명세 §4 잠근 표)"
+        # ★사용 오류(64)와 판정 불가(2)는 **다른 사건**이다 — 처방이 정반대라 코드가 갈려야 한다.
+        assert classify_call_exit(CHECK_EXIT_USAGE)[0] == EXIT_CLASS_PERMANENT, \
+            "exit 64 가 영구 실패로 분류되지 않는다(오타에 24회 재시도)"
+        assert "ping" not in classify_call_exit(CHECK_EXIT_USAGE)[1] or \
+            "처방이 아니다" in classify_call_exit(CHECK_EXIT_USAGE)[1], \
+            "사용 오류에 데몬 처방(`cys ping`)이 붙었다 — 처방 오귀속"
+        assert "판정 불가" in classify_call_exit(2)[1], "exit 2 의 의미가 '판정 불가'가 아니다"
+        assert issubclass(UsageExitParser, argparse.ArgumentParser), "파서 계약 파손"
         _v_ok = {"cso": {"satisfied": True, "filler": "cso"},
                  "reviewer-gemini": {"satisfied": True, "filler": "reviewer-gemini"}}
         _rost = [{"role": "reviewer-gemini"}]
@@ -3567,7 +3598,7 @@ def cmd_self_test(args):
     print("javis_orchestra self-test OK (W2: PLAN 정책열·slot_satisfied 3케이스·check_verdicts "
           "강등라벨·A12 exit 분류 + U-25 완주 2축(ready 별칭 불변·awake 관측·축 집계·"
           "결손 2원소 호환[합성 3원소 표본]·check --json·마스터/축 롤백 2노브) + "
-          "부트v2 A1(exit 표 0/1/2/12 · ACK 축 3상[off·미측정·pending/ok] · 축 계급 · "
+          "부트v2 A1(exit 표 0/1/2/12/64 · 사용오류↔판정불가 분리 · ACK 축 3상[off·미측정·pending/ok] · 축 계급 · "
           "킬스위치 · 실재 처방 · 주소 resolve 게이트 4케이스 · payload 13필드 보존+ack) + "
           "4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
           "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
@@ -3583,7 +3614,9 @@ def main():
     if "--note-team-roster" in sys.argv:
         print(team_roster_note())
         return 0
-    ap = argparse.ArgumentParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
+    # ★사용 오류는 **64**로 나간다(명세 §4 잠근 exit 표) — 서브파서도 같은 클래스를 물려받는다
+    #   (argparse 의 `add_subparsers` 는 기본 `parser_class=type(self)`).
+    ap = UsageExitParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     ck = sub.add_parser("check", help="4종 의무 노드 생존 판정")

@@ -137,6 +137,19 @@ try:
     check("1e 판정불가 ack = null(미측정)", "ack" in pl2 and pl2["ack"] is None, repr(pl2.get("ack")))
     check("1f 판정불가는 ready 를 false 로 두지 않는다(측정 없음 ≠ 측정 결과)",
           pl2.get("ready") is None, repr(pl2.get("ready")))
+    # ─────────────── ①-b exit 64 = **사용 오류**(측정불가 2 와 분리 · R1 codex #3) ───────────────
+    for _args, _label in ((["--no-such-flag"], "최상위 오타"),
+                          (["check", "--no-such-flag"], "서브커맨드 오타"),
+                          (["nosuchcmd"], "미지 서브커맨드"),
+                          (["review-prompt"], "필수 인자 누락")):
+        _rr = run(_args, base)
+        check("1g %s → exit 64" % _label, _rr.returncode == 64,
+              repr((_rr.returncode, _rr.stderr[-120:])))
+    check("1h `--help` 는 0 유지(사용 오류가 아니다)", run(["--help"], base).returncode == 0)
+    check("1i 64 와 2 는 **다른 값**이다(합치면 오타에 `cys ping` 처방이 붙는다)",
+          run(["check"], env_nostatus).returncode == 2
+          and run(["nosuchcmd"], base).returncode == 64)
+
 
     # ─────────────── ② 정상(구 데몬 = boot_v2_enabled 없음) → exit 0 · 축 off ───────────────
     write_status(st, {"surfaces": surfaces()})
