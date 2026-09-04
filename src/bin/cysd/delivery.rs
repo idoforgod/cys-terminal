@@ -218,6 +218,11 @@ pub enum Origin {
     /// 오발급한다. 그래서 감독자는 **행위보다 먼저** 이 유래로 기록한다
     /// (`boot_supervisor::dispatch_one` · 순서 불변식은 같은 파일의 소스 핀이 지킨다).
     Supervisor,
+    /// ★환경 진단 고지(`# [cys] …` 주석 1줄 주입) — npm 번들 오염 경고가 첫 소비자다.
+    ///
+    /// `SeatTakeover` 와 같은 성격이다: 사용자에게 **보여 주려고** pane 에 밀어 넣는 기계
+    /// 문장이므로 원장에 근거가 있어야 한다. 없으면 임무 게이트가 이 주석을 오너 임무로 읽는다.
+    EnvAdvisory,
 }
 
 impl Origin {
@@ -232,6 +237,7 @@ impl Origin {
             Origin::Boot => "boot",
             Origin::GuiAuto => "gui_auto",
             Origin::Supervisor => "supervisor",
+            Origin::EnvAdvisory => "env_advisory",
         }
     }
 }

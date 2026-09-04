@@ -1112,7 +1112,7 @@ pub fn npm_config_prefix_verdict_for(
 ) -> NpmPrefixVerdict {
     if let Some(uv) = user_value.filter(|v| !v.trim().is_empty()) {
         let scope_root = install_scope_root_for(exe_dir, os);
-        if path_is_within(Path::new(uv), &scope_root) {
+        if path_is_within_for(uv, &scope_root.to_string_lossy(), os) {
             return NpmPrefixVerdict::WarnBundlePolluted {
                 user_value: uv.to_string(),
                 scope_root,
@@ -1137,6 +1137,73 @@ pub fn path_is_within(candidate: &Path, root: &Path) -> bool {
     !root.as_os_str().is_empty() && candidate.starts_with(root)
 }
 
+/// 경로 비교용 **어휘 정규화**(순수·디스크 무접촉) — `(절대경로인가, 컴포넌트 목록)`.
+///
+/// os 를 인자로 받는 이유는 [`npm_config_prefix_default_for`] 와 같다: mac CI 가 Windows 분기를
+/// **실제로 밟아야** 한다. `std::path` 로는 그럴 수 없다 — unix 빌드의 `Path` 는 `\` 를 구분자로
+/// 보지 않아 `C:\Program Files\cys` 가 컴포넌트 **한 개**가 된다. 그래서 종전 검체(POSIX 경로만)는
+/// Windows 오염을 한 건도 재현하지 못했다(codex R1 #8 · "실제 Windows 오염 prefix 미탐").
+///
+/// windows 규칙 셋 — 셋 다 **미탐**(오염인데 경고 없음)을 만들던 축이다:
+///   ⓐ `\` 와 `/` 를 **둘 다** 구분자로 본다(`C:/Program Files/cys` 도 같은 경로다)
+///   ⓑ ASCII 대소문자를 접는다(`c:\program files\cys` 는 `C:\Program Files\cys` 다)
+///   ⓒ `.` 을 버리고 `..` 을 **어휘적으로** 되감는다(`…\other\..\cys\x` 는 `…\cys\x` 다)
+///
+/// 그 외 OS 는 `/` 만 구분자이고 **대소문자를 접지 않는다**. mac 도 실제로는 대소문자 무시
+/// 파일시스템이 흔하지만 그것은 **파일시스템의 성질**이라 경로 문자열만 보고 단정할 수 없다 —
+/// 접지 않는 쪽이 오탐을 만들지 않는다. `.`·`..` 정리는 OS 무관하게 한다(어휘 규칙이다).
+///
+/// ★`..` 되감기의 정직한 한계: 심볼릭 링크는 풀지 않으므로 링크를 관통하는 `..` 은 커널 해석과
+/// 다를 수 있다. `canonicalize` 를 부르지 않는 이유는 [`path_is_within`] 주석 그대로다(순수성
+/// 상실 + "존재하지 않는 경로는 판정 불가"라는 새 실패 모드). 되감지 **않던** 종전 동작은
+/// 미탐(`…/other/../cys`)과 오탐(`…/cys/../evil`)을 **둘 다** 만들었으므로 양방향으로 낫다.
+fn path_lexical_parts(p: &str, os: &str) -> (bool, Vec<String>) {
+    let win = os == "windows";
+    let is_sep = |c: char| c == '/' || (win && c == '\\');
+    // 드라이브 문자(`C:`)로 시작하는 Windows 경로도 절대경로다 — 선행 구분자가 없어도.
+    let drive_rooted = win && {
+        let mut it = p.chars();
+        matches!((it.next(), it.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+    };
+    let abs = p.starts_with(is_sep) || drive_rooted;
+    let mut out: Vec<String> = Vec::new();
+    for raw in p.split(is_sep) {
+        if raw.is_empty() || raw == "." {
+            continue;
+        }
+        if raw == ".." {
+            // 되감을 것이 없으면(루트 위 · 선행 `..`) **리터럴로 남긴다** — 조용히 삼키면
+            // 서로 다른 경로가 같아 보인다.
+            match out.last() {
+                Some(last) if last != ".." => {
+                    out.pop();
+                }
+                _ => out.push("..".to_string()),
+            }
+            continue;
+        }
+        out.push(if win { raw.to_ascii_lowercase() } else { raw.to_string() });
+    }
+    (abs, out)
+}
+
+/// `candidate` 가 `root` 아래(또는 root 자신)인가 — **OS 규칙을 인자로 받는** 순수 판정.
+/// [`path_lexical_parts`] 로 양쪽을 같은 규칙에 태운 뒤 **컴포넌트 단위**로 접두 비교한다.
+///
+/// 계약 넷(①~③은 [`path_is_within`] 에서 그대로 옮겨온 것이다):
+///   ① 빈 루트는 "모든 경로가 그 아래"가 아니다 — 스코프 소실 시 전면 경고를 막는다.
+///   ② 컴포넌트 단위라 `…/cys.app-old` 는 `…/cys.app` 아래가 아니다(형제 접두 음성 대조).
+///   ③ 루트 자신은 루트 아래로 본다.
+///   ④ 절대·상대 성질이 다르면 아래로 보지 않는다(정규화가 선행 `/` 를 지우므로 명시 비교).
+pub fn path_is_within_for(candidate: &str, root: &str, os: &str) -> bool {
+    let (root_abs, root_parts) = path_lexical_parts(root, os);
+    if root_parts.is_empty() {
+        return false; // ①
+    }
+    let (cand_abs, cand_parts) = path_lexical_parts(candidate, os);
+    cand_abs == root_abs && cand_parts.starts_with(&root_parts) // ②③④
+}
+
 /// 번들 오염 경고 문안(순수) — pane 첫 줄 고지와 preflight 가 **같은 문자열**을 쓴다.
 /// 문안을 두 벌 두면 한쪽만 고쳐져 사용자가 서로 다른 처방을 받는다.
 pub fn npm_prefix_bundle_warning(user_value: &str, scope_root: &Path) -> String {
@@ -1152,6 +1219,42 @@ pub fn npm_prefix_bundle_warning(user_value: &str, scope_root: &Path) -> String 
             "$HOME/.local"
         }
     )
+}
+
+/// 번들 오염 **1줄 고지**(pane 주입 전용 렌더). 문안의 단일 진실은 여전히
+/// [`npm_prefix_bundle_warning`] 하나이고 여기서는 **접기만** 한다 — 두 벌을 두면 한쪽만
+/// 고쳐져 사용자가 pane 과 preflight 에서 서로 다른 처방을 받는다.
+///
+/// 왜 1줄이어야 하는가: 좌석은 셸이라 텍스트 주입이 곧 '입력'이고 **개행은 곧 Enter** 다.
+/// 여러 줄을 넣으면 프롬프트에 미제출 잔재가 남아 사용자의 다음 Return 이 그것을 명령으로
+/// 실행한다(고지가 사고를 만든다). `#` 접두는 실행돼도 no-op 이고 scrollback 에는 남는다 —
+/// `announce_seat_takeover` 가 같은 이유로 같은 모양을 쓴다.
+pub fn npm_prefix_bundle_warning_line(user_value: &str, scope_root: &Path) -> String {
+    let full = npm_prefix_bundle_warning(user_value, scope_root);
+    // 공백 런(개행·U+2003 들여쓰기 포함)을 ASCII 공백 1개로 접는다 — 문안의 글자는 하나도
+    // 버리지 않는다(요약이 아니라 렌더 변경이다).
+    let folded = full.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("# {folded}")
+}
+
+/// 번들이 오염됐는가 — **모든 소비자가 쓰는 단 하나의 술어**(codex R1 #2 수리).
+///
+/// 소비자마다 `matches!` 를 손으로 쓰면 한쪽만 고쳐져 "pane 에는 경고가 뜨는데 `org.status`
+/// 는 깨끗하다" 같은 진단 분열이 난다. 판정은 [`npm_config_prefix_verdict_for`] 하나, 그
+/// 판정의 해석도 여기 하나다.
+pub fn npm_prefix_polluted(v: &NpmPrefixVerdict) -> bool {
+    matches!(v, NpmPrefixVerdict::WarnBundlePolluted { .. })
+}
+
+/// 오염이면 pane 에 넣을 **1줄 고지**, 아니면 `None`.
+/// [`npm_prefix_polluted`] 와 같은 사실의 두 표현이며, 호출부가 판정을 다시 풀지 않게 한다.
+pub fn npm_prefix_pollution_notice(v: &NpmPrefixVerdict) -> Option<String> {
+    match v {
+        NpmPrefixVerdict::WarnBundlePolluted { user_value, scope_root } => {
+            Some(npm_prefix_bundle_warning_line(user_value, scope_root))
+        }
+        _ => None,
+    }
 }
 
 /// `npm_config_prefix` 주입의 **순수 코어**. 불가침 계약은
@@ -1203,6 +1306,20 @@ pub fn npm_config_prefix_verdict_from_process(exe_dir: &Path) -> NpmPrefixVerdic
         localappdata.as_deref(),
         user.as_deref(),
     )
+}
+
+/// [`npm_config_prefix_verdict_from_process`] 를 **현재 실행물의 디렉터리**로 부른다.
+///
+/// exe_dir 해소를 고지 호출부마다 복붙하지 않게 하는 얇은 층이다. 해소가 실패하면 빈 경로를
+/// 넘긴다 — 그러면 스코프 루트가 비어 [`path_is_within_for`] 계약 ①이 발동해 **경고하지
+/// 않는다**(스코프를 모르면 오염 여부도 모른다 · 없는 근거로 겁주지 않는다). 사용자 값이
+/// 없을 때의 기본값 산출은 exe_dir 에 의존하지 않으므로 그대로 유효하다.
+pub fn npm_config_prefix_verdict_from_exe() -> NpmPrefixVerdict {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    npm_config_prefix_verdict_from_process(&exe_dir)
 }
 
 /// ── P4-2: Windows 설치본 runtime 결손 검사(advisory 전용 · stat-only) ─────────────
@@ -3577,6 +3694,127 @@ mod tests {
         assert!(path_is_within(Path::new("/Applications/cys.app"), Path::new("/Applications/cys.app")));
         // ── 음성 대조 ③: 빈 루트는 "모든 경로가 그 아래" 가 아니다(스코프 소실 시 전면 경고 차단).
         assert!(!path_is_within(Path::new("/anything"), Path::new("")));
+    }
+
+    /// ★H-NPM-2W(codex R1 #8 · major): **Windows 설치범위 판정의 경로 정규화.**
+    ///
+    /// 종전 판정은 `Path::starts_with` 하나였다. unix 빌드의 `Path` 는 `\` 를 구분자로 보지
+    /// 않으므로 `C:\Program Files\cys` 는 컴포넌트 **한 개**이고, 그래서 종전 검체(POSIX 경로만)
+    /// 로는 Windows 경로가 한 번도 시험되지 않았다 — 실기에서 대소문자만 달라도 **미탐**
+    /// (오염인데 경고 없음)이었다. 이 검체는 그 축을 mac CI 에서 실제로 밟는다.
+    ///
+    /// ★정직 고지: 여기서 증명되는 것은 **판정 규칙**뿐이다. 실기 Windows 에서 이 경고가 pane
+    /// 에 실제로 뜨는가는 windows-health 잡과 실기 재현의 몫이다(과장하지 않는다).
+    #[test]
+    fn npm_prefix_windows_scope_folds_case_slash_and_dotdot() {
+        let exe_dir = Path::new(r"C:\Program Files\cys");
+        assert_eq!(
+            install_scope_root_for(exe_dir, "windows"),
+            PathBuf::from(r"C:\Program Files\cys"),
+            "windows 는 exe_dir 이 곧 설치 디렉터리다"
+        );
+        let verdict = |uv: &str| {
+            npm_config_prefix_verdict_for(
+                "windows",
+                exe_dir,
+                Some(Path::new(r"C:\Users\u")),
+                Some(Path::new(r"C:\Users\u\AppData\Local")),
+                Some(uv),
+            )
+        };
+
+        // ── 양성: 넷 다 종전 구현이 **미탐**하던 모양이다 ────────────────────
+        for uv in [
+            r"C:\Program Files\cys\node_modules",          // ⓐ 그대로
+            r"c:\program files\CYS\node_modules",          // ⓑ 대소문자(드라이브 문자 포함)
+            r"C:/Program Files/cys/lib",                   // ⓒ 슬래시 혼용
+            r"C:\Program Files\other\..\cys\lib",          // ⓓ dot-dot 우회
+            r"C:\Program Files\.\cys\lib",                 // ⓔ 단일 점
+            r"C:\Program Files\cys",                       // ⓕ 루트 자신
+        ] {
+            assert!(
+                matches!(verdict(uv), NpmPrefixVerdict::WarnBundlePolluted { .. }),
+                "설치본 안({uv})인데 오염으로 보지 않았다 — 미탐(경고 0)이다: {:?}",
+                verdict(uv)
+            );
+        }
+
+        // ── 음성: 과잉 경고 차단(사용자 소유물을 오염으로 몰지 않는다) ────────
+        for uv in [
+            r"C:\Program Files\cys-extra\bin",             // ⓐ 형제 접두
+            r"C:\Users\u\AppData\Local\cys-npm",           // ⓑ 설치본 밖(우리 기본값 자리)
+            r"C:\Program Files\cys\..\evil",               // ⓒ dot-dot 로 **밖으로** 나감
+            r"D:\Program Files\cys\x",                     // ⓓ 다른 드라이브
+            r"Program Files\cys\x",                        // ⓔ 상대경로(절대 성질 불일치)
+        ] {
+            assert_eq!(
+                verdict(uv),
+                NpmPrefixVerdict::KeepUser,
+                "설치본 밖({uv})을 오염으로 경고했다 — 사용자 값을 잘못 나무란다"
+            );
+        }
+
+        // ── 같은 정규화가 POSIX 에서도 양방향으로 작동한다 ────────────────────
+        //    종전엔 ⓐ가 미탐, ⓑ가 오탐이었다(둘 다 `..` 를 되감지 않아서).
+        assert!(
+            path_is_within_for("/Applications/other/../cys.app/x", "/Applications/cys.app", "macos"),
+            "ⓐ dot-dot 우회 미탐"
+        );
+        assert!(
+            !path_is_within_for("/Applications/cys.app/../evil", "/Applications/cys.app", "macos"),
+            "ⓑ dot-dot 로 밖으로 나갔는데 안이라고 했다"
+        );
+        // 대소문자는 **접지 않는다**(mac 파일시스템 성질을 경로 문자열로 단정하지 않는다).
+        assert!(
+            !path_is_within_for("/Applications/CYS.app/x", "/Applications/cys.app", "macos"),
+            "비-windows 에서 대소문자를 접었다 — 오탐 창구다"
+        );
+        // 계약 ①③ 재확인 + 선행 `..` 는 삼키지 않는다(서로 다른 경로가 같아 보이면 안 된다).
+        assert!(!path_is_within_for("/anything", "", "macos"), "빈 루트가 전부를 삼켰다");
+        assert!(path_is_within_for("/a/b", "/a/b", "macos"), "루트 자신은 루트 아래다");
+        assert!(!path_is_within_for("../a/b", "/a/b", "macos"), "선행 .. 가 절대경로와 같아졌다");
+    }
+
+    /// ★H-NPM-3(codex R1 #2 · blocking 의 순수 절반): **경고에 소비자가 있다**의 전제 —
+    /// 판정 → 술어 → 1줄 문안이 한 사슬로 이어지고, 그 문안이 셸에 안전한 모양인가.
+    ///
+    /// pane 주입은 개행이 곧 Enter 라서 여러 줄이면 **고지가 사고를 만든다**(미제출 잔재를
+    /// 사용자의 다음 Return 이 명령으로 실행한다). 그래서 1줄·`#` 접두는 문서가 아니라 계약이다.
+    #[test]
+    fn npm_prefix_pollution_notice_is_one_shell_safe_line_from_the_same_verdict() {
+        let scope = Path::new("/Applications/cys.app");
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let v = NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: polluted.to_string(),
+            scope_root: scope.to_path_buf(),
+        };
+        assert!(npm_prefix_polluted(&v), "오염 판정인데 술어가 false 다");
+        let line = npm_prefix_pollution_notice(&v).expect("오염이면 고지 문안이 있어야 한다");
+
+        // ① 셸 안전: 정확히 1줄이고 `#` 로 시작한다(실행돼도 no-op).
+        assert!(!line.contains('\n'), "고지가 여러 줄이다 — 개행이 Enter 가 된다: {line:?}");
+        assert!(!line.contains('\r'), "CR 이 섞였다: {line:?}");
+        assert!(line.starts_with("# "), "주석 접두가 없다 — 사용자의 다음 Return 이 실행한다");
+
+        // ② 사실 보존: 접기는 렌더 변경이지 요약이 아니다 — 세 사실이 모두 남는다.
+        for needle in [polluted, "/Applications/cys.app", "npm_config_prefix"] {
+            assert!(line.contains(needle), "고지에 {needle} 이 없다: {line}");
+        }
+        // ③ 문안 SOT 는 하나다 — 여러 줄 원문의 낱말이 1줄 렌더에 그대로 있다.
+        let full = npm_prefix_bundle_warning(polluted, scope);
+        for w in full.split_whitespace() {
+            assert!(line.contains(w), "1줄 렌더가 낱말 {w:?} 를 잃었다(문안 분열)");
+        }
+
+        // ④ 음성 대조: 오염이 아닌 세 판정은 **아무 말도 하지 않는다**(과잉 고지 차단).
+        for other in [
+            NpmPrefixVerdict::KeepUser,
+            NpmPrefixVerdict::NoDefault,
+            NpmPrefixVerdict::Inject(PathBuf::from("/home/u/.local")),
+        ] {
+            assert!(!npm_prefix_polluted(&other), "{other:?} 를 오염으로 봤다");
+            assert!(npm_prefix_pollution_notice(&other).is_none(), "{other:?} 에서 고지가 나갔다");
+        }
     }
 
     #[test]

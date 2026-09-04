@@ -431,6 +431,65 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
     }
 }
 
+/// ★번들 오염 고지 — **무음 경고 금지**(codex R1 #2 수리).
+///
+/// `NpmPrefixVerdict::WarnBundlePolluted` 는 env 주입을 멈추기만 할 뿐 **아무 데도 말하지
+/// 않았다**. 시뮬 T2-4 가 정한 것은 "덮지 말고 **경고만** 하라"이지 "조용히 넘어가라"가 아니다
+/// — 생산 소비자가 0이면 사용자는 자기 npm 전역 설치가 설치본 서명을 깨뜨리는 중이라는 사실을
+/// **다음 실행이 차단되고 나서야** 안다(그때는 이미 봉인이 깨져 있다).
+///
+/// 채널 2개는 [`announce_seat_takeover`] 와 **같은 규율**이다:
+///   ①`env.advisory` 이벤트(GUI·구독자·저널) ②새 pane 화면의 **셸 주석 1줄**.
+/// `#` 접두·unix 한정·배달 원장 **선기록**의 근거는 전부 그 함수의 주석과 동일하다
+/// (특히 선기록: 이 주석도 기계 유래이므로 원장에 근거가 없으면 임무 게이트가 오너 임무로 읽는다).
+///
+/// 세 번째 소비자는 여기가 아니라 `org.status` 의 `daemon.npm_prefix_polluted` 다 — 그쪽은
+/// preflight·doctor 가 **폴링**으로 읽는 진단 축이고, 이쪽은 사람이 pane 에서 보는 고지다.
+/// 두 소비자는 같은 술어([`cys::npm_prefix_polluted`])와 같은 판정 함수를 공유한다.
+fn announce_npm_prefix_pollution(daemon: &Arc<Daemon>, sid: u64) {
+    announce_npm_prefix_pollution_with(daemon, sid, &cys::npm_config_prefix_verdict_from_exe());
+}
+
+/// [`announce_npm_prefix_pollution`] 의 **판정 주입판**(관측층/집행층 분리).
+///
+/// 판정은 env·`current_exe` 를 보는 관측이고 고지는 순수 집행이다. 둘을 한 함수에 두면 검체가
+/// 프로세스 전역 env 를 흔들어야만 채널을 잴 수 있고, 그러면 병렬 테스트끼리 서로를 오염시킨다
+/// (`npm_config_prefix_verdict_for` 가 os 를 인자로 받는 것과 **같은 규율**).
+fn announce_npm_prefix_pollution_with(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    verdict: &cys::NpmPrefixVerdict,
+) {
+    let Some(line) = cys::npm_prefix_pollution_notice(verdict) else {
+        return; // 오염 아님 — 종전과 완전히 동일(쌍도 이벤트도 늘지 않는다)
+    };
+    daemon.bus.publish(
+        "env.advisory",
+        "system",
+        Some(sid),
+        json!({"kind": "npm_prefix_bundle_polluted", "surface": sid, "text": line}),
+    );
+    if cfg!(unix) {
+        if let Some(s) = daemon.get_surface(sid) {
+            // ★배달 원장 — 주입보다 앞(delivery.rs 불변식 ①).
+            crate::delivery::record_audited(
+                daemon,
+                sid,
+                &line,
+                crate::delivery::Origin::EnvAdvisory,
+                None,
+            );
+            // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고 실패가 pane 생성을
+            // 막아선 안 된다. 이벤트 채널과 status 축이 이미 사실을 남긴다.
+            let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+                text: line,
+                cr_delay_ms: 120,
+                clear_first: false,
+            });
+        }
+    }
+}
+
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
 /// (cys CLI 프로세스는 pane 셸의 자손이므로 조상 추적으로 소속 pane이 확정된다)
 fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
@@ -2722,6 +2781,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             announce_seat_takeover(daemon, prev, &role_for_announce, "surface.create");
                         }
                     }
+                    // ★번들 오염 고지(codex R1 #2) — 승계 여부와 무관하게 **모든** 새 pane 에.
+                    //   이 pane 은 방금 오염된 env 를 상속받았으므로 고지 대상이 곧 이 좌석이다.
+                    announce_npm_prefix_pollution(daemon, s.id);
                     // ★T-0147-4 생성자 기록 — 발신이 pane(surface)으로 해석될 때만. 이 한 줄이
                     // launch-agent 롤백(surface.close{cause:"reap"})의 유일한 증명이다(§state::create_owner).
                     // 익명 발신(데몬 내부·pane 밖 CLI)은 기록하지 않는다 — 이미 close 게이트를 통과하므로
@@ -5883,7 +5945,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "embedded_pack_hash": cys::pack::embedded_pack_hash(),
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
-                               "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
+                               "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               // ★codex R1 #2 — T2-4 '경고만' 정책의 **폴링 소비자**.
+                               //   pane 고지는 그 자리에 있던 사람만 보지만 preflight·doctor 는
+                               //   이 축을 읽어 "봉인이 깨질 예정"을 상시 진단한다. 판정·술어는
+                               //   pane 고지와 **같은 함수**를 쓴다(분열 방지).
+                               "npm_prefix_polluted":
+                                   cys::npm_prefix_polluted(&cys::npm_config_prefix_verdict_from_exe())},
                     "surfaces": list,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
@@ -9959,6 +10027,148 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         s.id
+    }
+
+    /// ★H-NPM-4(codex R1 #2 · blocking): **번들 오염 경고에 실제 소비자가 있다 — pane 채널.**
+    ///
+    /// 종전 결함: `WarnBundlePolluted` 는 env 주입만 멈추고 아무 데도 말하지 않았다(생산
+    /// 소비자 0). T2-4 는 "덮지 말고 경고만"이지 "무음"이 아니다 — 소비자가 없으면 사용자는
+    /// 자기 npm 전역 설치가 설치본 서명을 깨뜨리는 중임을 **차단당한 뒤에야** 안다.
+    ///
+    /// 이 검체가 재는 것 셋(하나라도 없으면 FAIL):
+    ///   ① `env.advisory` 이벤트에 경고 문안이 실린다(GUI·구독자·저널 채널)
+    ///   ② 배달 원장에 **주입보다 먼저** 기록된다(없으면 임무 게이트가 이 주석을 오너 임무로 읽는다)
+    ///   ③ 오염이 아닌 판정에서는 **아무것도** 나가지 않는다(과잉 고지 차단 · 음성 대조)
+    #[test]
+    fn npm_prefix_pollution_is_announced_to_pane_channel_and_ledger() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        let mut rx = daemon.bus.subscribe();
+        let scope = std::path::PathBuf::from("/Applications/cys.app");
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let verdict = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: polluted.to_string(),
+            scope_root: scope.clone(),
+        };
+        let expect_line =
+            cys::npm_prefix_pollution_notice(&verdict).expect("오염 판정에 문안이 없다");
+
+        announce_npm_prefix_pollution_with(&daemon, sid, &verdict);
+
+        // ① 이벤트 채널.
+        let mut seen: Option<String> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("env.advisory")
+                && ev["payload"]["kind"].as_str() == Some("npm_prefix_bundle_polluted")
+            {
+                seen = ev["payload"]["text"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(
+            seen.as_deref(),
+            Some(expect_line.as_str()),
+            "env.advisory 이벤트에 경고가 없다 — T2-4 '경고만' 정책이 무음으로 방치된다"
+        );
+
+        // ② 배달 원장 선기록(unix 주입 경로 한정 — 주입이 없는 곳엔 기록할 유래도 없다).
+        if cfg!(unix) {
+            let led = crate::delivery::ledger_path(&daemon.socket_path);
+            let raw = std::fs::read_to_string(&led).unwrap_or_default();
+            assert!(
+                raw.contains("env_advisory"),
+                "고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
+                led.display()
+            );
+            assert!(
+                raw.contains("npm_config_prefix"),
+                "원장 레코드가 이 고지의 것이 아니다: {raw}"
+            );
+        }
+
+        // ③ 음성 대조 — 오염이 아니면 이벤트도 원장도 늘지 않는다.
+        let daemon2 = isolated_daemon();
+        let sid2 = make_surface(&daemon2, None);
+        let mut rx2 = daemon2.bus.subscribe();
+        for clean in [
+            cys::NpmPrefixVerdict::KeepUser,
+            cys::NpmPrefixVerdict::NoDefault,
+            cys::NpmPrefixVerdict::Inject(std::path::PathBuf::from("/home/u/.local")),
+        ] {
+            announce_npm_prefix_pollution_with(&daemon2, sid2, &clean);
+        }
+        while let Ok(ev) = rx2.try_recv() {
+            assert_ne!(
+                ev["name"].as_str(),
+                Some("env.advisory"),
+                "오염이 아닌데 고지가 나갔다 — 과잉 경고는 진짜 경고를 묻는다: {ev}"
+            );
+        }
+    }
+
+    /// ★H-NPM-5(codex R1 #2 · blocking): **두 번째 소비자 — `org.status` 폴링 축.**
+    ///
+    /// pane 고지는 그 자리에 있던 사람만 본다. preflight·doctor 는 사람이 없어도 읽어야 하므로
+    /// `daemon.npm_prefix_polluted` 가 그 축이다. 이 검체는 키의 **실재**와 **판정 추종**을 함께
+    /// 잰다 — 키만 있고 항상 false 인 배선(가짜 소비자)은 여기서 죽는다.
+    #[test]
+    fn org_status_exposes_npm_prefix_pollution_for_preflight() {
+        let daemon = isolated_daemon();
+        let status = |n: u64| {
+            let req = Request { id: json!(n), method: "org.status".into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            resp
+        };
+        // 이 테스트 바이너리의 exe_dir 이 곧 설치 스코프다(번들 레이아웃이 아니므로 그대로).
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .expect("current_exe");
+        let prev = std::env::var(cys::ENV_NPM_CONFIG_PREFIX).ok();
+
+        // ⓐ 오염: 사용자 값이 설치 스코프 **안**을 가리킨다.
+        std::env::set_var(
+            cys::ENV_NPM_CONFIG_PREFIX,
+            exe_dir.join("npm-inside-the-bundle"),
+        );
+        let row = status(1);
+        assert_eq!(
+            row["result"]["daemon"]["npm_prefix_polluted"],
+            json!(true),
+            "설치본 오염인데 status 가 깨끗하다고 보고한다 — preflight 가 영영 못 본다: {}",
+            row["result"]["daemon"]
+        );
+
+        // ⓑ 무오염: 설치본 **밖** 값은 사용자 소유물이다(경고 대상 아님).
+        std::env::set_var(cys::ENV_NPM_CONFIG_PREFIX, "/tmp/cys-npm-outside");
+        assert_eq!(
+            status(2)["result"]["daemon"]["npm_prefix_polluted"],
+            json!(false),
+            "설치본 밖 값을 오염으로 보고했다 — 진짜 경고가 묻힌다"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(cys::ENV_NPM_CONFIG_PREFIX, v),
+            None => std::env::remove_var(cys::ENV_NPM_CONFIG_PREFIX),
+        }
+    }
+
+    /// ★H-NPM-6(codex R1 #2 · 배선 소실 방지 소스 핀): `surface.create` 가 고지 호출을 잃으면
+    /// 위 두 검체는 여전히 초록인데 **실사용에서는 아무 pane 도 경고를 못 받는다**.
+    /// (state.rs `pane_children_inherit_no_bytecode_env` · boot_supervisor 순서 핀과 같은 관례.)
+    #[test]
+    fn surface_create_still_announces_npm_prefix_pollution() {
+        let src = include_str!("handlers.rs");
+        let start = src.find("\"surface.create\" =>").expect("surface.create 아크 소실");
+        let end = start
+            + src[start..]
+                .find("\n        \"surface.close\"")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        assert!(
+            src[start..end].contains("announce_npm_prefix_pollution(daemon, s.id)"),
+            "surface.create 가 번들 오염 고지를 잃었다 — 경고에 소비자가 다시 0이 된다"
+        );
     }
 
     /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
