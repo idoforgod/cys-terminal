@@ -71,6 +71,7 @@ import argparse
 import copy
 import datetime
 import hashlib
+import contextlib
 import json
 import os
 import shutil
@@ -373,6 +374,51 @@ def _serialize(obj, text):
     return out
 
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   선례 `javis_preflight.py:33-35` · `javis_bootstrap.py:127-129`(append 인 이유도 같다:
+#   발견이 목적이지 stdlib precedence 를 강등하지 않는다) · 계약 `tests/test_import_guard.py`.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# ★공용 락 소비(2026-09-04 P0 · master 지시 ②). 이 모듈은 settings.json 의 **5 writer 중 하나**
+#   인데 종전엔 자기 mkstemp+replace 만 했다 — 발행은 원자적이라 파손은 없지만 **직렬화가 없어
+#   lost update 가 난다**(실측: python 3 writer × 6 프로세스 동시 실행 6/6 시행에서 marks 38~46/72
+#   유실 · 파손은 0). preflight `_settings_rmw` 와 **같은 락 파일**(`<settings>.cys-lock`)을 잡아
+#   같은 소유자를 경유하게 만든다.
+#   import 실패(팩 스큐·부분 배포)는 등록을 죽이지 않는다 — 락 없이 진행하되 조용하지 않게 stderr.
+try:
+    import javis_lock as _lock
+except Exception:
+    _lock = None
+
+
+@contextlib.contextmanager
+def _settings_lock(settings_path):
+    """settings.json 파일별 공용 락. 획득 실패·백엔드 부재는 **열화**이지 중단이 아니다
+    (등록을 포기하면 훅이 사라진다 — 가용성 우선 · preflight 와 동일 판단)."""
+    lk = None
+    if _lock is not None:
+        try:
+            lk = _lock.FileLock(settings_path + ".cys-lock", owner="guard-register",
+                                blocking=True, timeout=10.0, soft=True)
+            lk.acquire()
+            if lk.status != _lock.ACQUIRED:
+                sys.stderr.write("[guard-register] settings 락 미획득(%s) — 직렬화 없이 진행: %s\n"
+                                 % (lk.status, settings_path))
+        except Exception as e:
+            sys.stderr.write("[guard-register] settings 락 사용 불가(%s) — 직렬화 없이 진행\n" % e)
+            lk = None
+    try:
+        yield
+    finally:
+        if lk is not None:
+            try:
+                lk.release()
+            except Exception:
+                pass
+
+
 def _atomic_write(path, data):
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(prefix=".guardreg-", dir=d)
@@ -452,90 +498,91 @@ def process(profiles, hook_key, apply_, force_master, pack, out=None,
 
     for prof in profiles:
         sp = _resolve_settings(prof)
-        base = _profile_basename(sp)
-        row = {"profile": base, "settings": sp, "action": None, "note": ""}
+        with _settings_lock(sp):   # ★읽기→쓰기 전 구간을 직렬화(lost update 차단)
+            base = _profile_basename(sp)
+            row = {"profile": base, "settings": sp, "action": None, "note": ""}
 
-        # 역할 경계(§1-3 대상표 분리 독립) — 판정은 **쓰기 전**에 한다.
-        ok, why = _decide(table, base, hook_key, spec, force_master, force_unknown)
-        if not ok:
-            row["action"] = "REFUSED"
-            row["note"] = why
-            rows.append(row)
-            rc = EXIT_TARGET
-            continue
-        if why:
-            row["note"] = why
+            # 역할 경계(§1-3 대상표 분리 독립) — 판정은 **쓰기 전**에 한다.
+            ok, why = _decide(table, base, hook_key, spec, force_master, force_unknown)
+            if not ok:
+                row["action"] = "REFUSED"
+                row["note"] = why
+                rows.append(row)
+                rc = EXIT_TARGET
+                continue
+            if why:
+                row["note"] = why
 
-        text, obj, err = _read_settings(sp)
-        if err:
-            row["action"] = "ERROR"
-            row["note"] = err
-            rows.append(row)
-            rc = EXIT_TARGET
-            continue
+            text, obj, err = _read_settings(sp)
+            if err:
+                row["action"] = "ERROR"
+                row["note"] = err
+                rows.append(row)
+                rc = EXIT_TARGET
+                continue
 
-        n = _count_registered(obj, spec["event"], command)
-        stale = [c for c in _script_registered_any(obj, spec["event"], script_base) if c != command]
-        if stale:
-            row["note"] = "다른 경로로 등록된 동일 스크립트 %d건: %s" % (len(stale), "; ".join(stale))
-        if n >= 1:
-            row["action"] = "ALREADY(%d)" % n
-            if n > 1:
-                row["note"] = (row["note"] + " · " if row["note"] else "") + \
-                    "중복 등록 %d건 — Stop 체인 %d회 실행(수동 정리 필요·이 도구는 삭제하지 않는다)" % (n, n)
-            # E1-2(R-01): 기존 등록의 timeout 필드 대조 — 불일치는 loud 하게 적는다.
-            want_to = spec.get("timeout")
-            found = _registered_timeouts(obj, spec["event"], command)
-            if want_to is not None and any(t != want_to for t in found):
-                row["timeout_mismatch"] = found
-                row["note"] = (row["note"] + " · " if row["note"] else "") + \
-                    ("timeout 불일치 %s (기대 %s) — 상한 사다리 바깥 겹 부재/상이"
-                     % (found, want_to))
-                if repair_timeout:
-                    new_obj = _with_timeout_repaired(obj, spec, command)
-                    new_text = _serialize(new_obj, text)
-                    if not apply_:
-                        row["action"] = "WOULD-FIX-TIMEOUT"
+            n = _count_registered(obj, spec["event"], command)
+            stale = [c for c in _script_registered_any(obj, spec["event"], script_base) if c != command]
+            if stale:
+                row["note"] = "다른 경로로 등록된 동일 스크립트 %d건: %s" % (len(stale), "; ".join(stale))
+            if n >= 1:
+                row["action"] = "ALREADY(%d)" % n
+                if n > 1:
+                    row["note"] = (row["note"] + " · " if row["note"] else "") + \
+                        "중복 등록 %d건 — Stop 체인 %d회 실행(수동 정리 필요·이 도구는 삭제하지 않는다)" % (n, n)
+                # E1-2(R-01): 기존 등록의 timeout 필드 대조 — 불일치는 loud 하게 적는다.
+                want_to = spec.get("timeout")
+                found = _registered_timeouts(obj, spec["event"], command)
+                if want_to is not None and any(t != want_to for t in found):
+                    row["timeout_mismatch"] = found
+                    row["note"] = (row["note"] + " · " if row["note"] else "") + \
+                        ("timeout 불일치 %s (기대 %s) — 상한 사다리 바깥 겹 부재/상이"
+                         % (found, want_to))
+                    if repair_timeout:
+                        new_obj = _with_timeout_repaired(obj, spec, command)
+                        new_text = _serialize(new_obj, text)
+                        if not apply_:
+                            row["action"] = "WOULD-FIX-TIMEOUT"
+                        else:
+                            backup = "%s.bak-guard-%s" % (sp, _now_tag())
+                            shutil.copy2(sp, backup)
+                            _atomic_write(sp, new_text)
+                            row["action"] = "FIXED-TIMEOUT"
+                            row["note"] += " · 백업 %s" % backup
                     else:
-                        backup = "%s.bak-guard-%s" % (sp, _now_tag())
-                        shutil.copy2(sp, backup)
-                        _atomic_write(sp, new_text)
-                        row["action"] = "FIXED-TIMEOUT"
-                        row["note"] += " · 백업 %s" % backup
-                else:
-                    rc = EXIT_TARGET   # 무시 금지 — 호출자가 exit code 로 알아채야 한다
-                    row["note"] += " · 정정: --repair-timeout"
-            rows.append(row)
-            continue
+                        rc = EXIT_TARGET   # 무시 금지 — 호출자가 exit code 로 알아채야 한다
+                        row["note"] += " · 정정: --repair-timeout"
+                rows.append(row)
+                continue
 
-        try:
-            new_obj = _with_hook(obj, spec, command)
-        except ValueError as e:
-            row["action"] = "ERROR"
-            row["note"] = str(e)
-            rows.append(row)
-            rc = EXIT_TARGET
-            continue
-        new_text = _serialize(new_obj, text)
+            try:
+                new_obj = _with_hook(obj, spec, command)
+            except ValueError as e:
+                row["action"] = "ERROR"
+                row["note"] = str(e)
+                rows.append(row)
+                rc = EXIT_TARGET
+                continue
+            new_text = _serialize(new_obj, text)
 
-        if new_text == text:      # byte-identical — 쓸 것이 없다(멱등)
-            row["action"] = "IDENTICAL"
-            rows.append(row)
-            continue
+            if new_text == text:      # byte-identical — 쓸 것이 없다(멱등)
+                row["action"] = "IDENTICAL"
+                rows.append(row)
+                continue
 
-        if not apply_:
-            row["action"] = "WOULD-ADD"
-            row["note"] = (row["note"] + " · " if row["note"] else "") + \
-                "sha256 %s → %s" % (_sha(text)[:12], _sha(new_text)[:12])
-            rows.append(row)
-            continue
+            if not apply_:
+                row["action"] = "WOULD-ADD"
+                row["note"] = (row["note"] + " · " if row["note"] else "") + \
+                    "sha256 %s → %s" % (_sha(text)[:12], _sha(new_text)[:12])
+                rows.append(row)
+                continue
 
-        backup = "%s.bak-guard-%s" % (sp, _now_tag())
-        shutil.copy2(sp, backup)
-        _atomic_write(sp, new_text)
-        row["action"] = "ADDED"
-        row["note"] = (row["note"] + " · " if row["note"] else "") + "백업 %s" % backup
-        rows.append(row)
+            backup = "%s.bak-guard-%s" % (sp, _now_tag())
+            shutil.copy2(sp, backup)
+            _atomic_write(sp, new_text)
+            row["action"] = "ADDED"
+            row["note"] = (row["note"] + " · " if row["note"] else "") + "백업 %s" % backup
+            rows.append(row)
 
     # ── 등록 후 전수 재확인(쓴 것만이 아니라 인자 전부를 다시 읽는다) ──
     print("\n── 전수 재확인(인자 대상 %d개 · 재판독) ──" % len(profiles), file=out)
