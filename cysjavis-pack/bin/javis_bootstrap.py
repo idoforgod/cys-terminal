@@ -2996,10 +2996,32 @@ def _cmd_run_chain(log):
     code, out = 1, "orchestra 부재"
     unjudgeable = None      # 'daemon_gone' | 'interpreter_gone' | None — 즉시 이탈 확정 사유
     unjudgeable_seen = 0    # exit 2 를 '계속'으로 접은 횟수(ping 생존 재확인 성공 시에만 증가)
+    ack_pending = False     # ★(부트 v2 §2-9) check exit 12 를 0 으로 접었는가 — 마커에 정직 기록
+    # ★exit 12 상수는 정본(javis_orchestra)에서 가져온다 — 리터럴 사본을 두면 정본이 움직일 때
+    #   이 소비자만 옛 값을 보고 '미기동'으로 오접는다(구 팩 스큐에서만 리터럴 폴백 · 값 동일).
+    try:
+        import javis_orchestra as _orch_ck
+        CHECK_ACK_PENDING = getattr(_orch_ck, "CHECK_EXIT_ACK_PENDING", 12)
+    except Exception:
+        CHECK_ACK_PENDING = 12
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=check_timeout)
         log.step(STEP.CHECK, code, out, suffix="#%d" % attempt)
         if code == 0:
+            break
+        # ★(부트 v2 §2-9 소비자 매핑) exit 12 = ack_pending — **필수 4종은 전원 ready** 이고
+        #   리뷰어 각성 ACK 만 미확인이다. 부트 완주의 기준은 ready 축이므로 여기서는 0 으로
+        #   접고 라벨만 남긴다. 차단은 리뷰 게이트(review-prompt·round-init)가 소유한다 —
+        #   리뷰어 하나의 확률적 각성이 팀 전체 기동을 인질로 잡으면 안 된다([가정 A]).
+        #   ★재시도하지 않는 이유: 12 는 '아직 안 섰다'가 아니라 '섰는데 ACK 만 없다'라서
+        #     같은 창을 더 돌아도 바뀌는 것은 ACK 뿐이고, 그 대기는 러너 AckWait 의 몫이다.
+        if code == CHECK_ACK_PENDING:
+            ack_pending = True
+            log.step(STEP.CHECK, 0,
+                     "check exit %d(ack_pending — ready 전원 충족·각성 ACK 미확인) → **0 취급**. "
+                     "부트는 계속한다. 차단되는 것은 리뷰 게이트(review-prompt·round-init)뿐이다."
+                     "\n%s" % (code, out), suffix="#%d-ack" % attempt)
+            code = 0
             break
         # ★G32/H-EXIT-7 + W-A3 정밀 분기 — check exit 2 는 '노드 미기동'이 아니라 **판정 불가**다.
         #   그런데 exit 2 하나에 성질이 다른 사건들이 겹친다:
@@ -3087,6 +3109,11 @@ def _cmd_run_chain(log):
         "surface_ref": os.environ.get("CYS_SURFACE_ID", ""),
         "lane": lane_key(),
         "socket": os.environ.get("CYS_SOCKET", ""), "orchestra_check": "exit 0"}
+    # ★(부트 v2 §2-9) 12 를 0 으로 접었으면 **접었다는 사실**을 마커에 남긴다(additive 키 —
+    #   기존 `orchestra_check` 값·기존 핀 무변경). 접힘이 기록 없이 사라지면 나중에 "왜 리뷰
+    #   게이트만 막히나"를 추적할 수 없다(조용한 강등 금지).
+    if ack_pending:
+        _marker_payload["orchestra_check_ack_pending"] = True
     _marker_path = lane_state_path("marker")
     _atomic_write_json(_marker_path, _marker_payload)
     if _is_base_socket():
