@@ -1230,11 +1230,59 @@ pub fn npm_prefix_bundle_warning(user_value: &str, scope_root: &Path) -> String 
 /// 실행한다(고지가 사고를 만든다). `#` 접두는 실행돼도 no-op 이고 scrollback 에는 남는다 —
 /// `announce_seat_takeover` 가 같은 이유로 같은 모양을 쓴다.
 pub fn npm_prefix_bundle_warning_line(user_value: &str, scope_root: &Path) -> String {
+    npm_prefix_bundle_warning_line_for(user_value, scope_root, POSIX_SHELL_FOR_NOTICE)
+}
+
+/// 고지 렌더의 **기준 셸** — 위 함수가 유지하는 종전 계약(`#` 접두)의 근거를 이름으로 못박는다.
+/// 이벤트 채널(`env.advisory`)도 이 표기를 쓴다: 이벤트는 셸이 아니라 GUI·저널이 읽으므로
+/// pane 마다 달라지면 안 되고, 사람이 눈으로 대조할 **정본 표기**가 하나 있어야 한다.
+pub const POSIX_SHELL_FOR_NOTICE: &str = "sh";
+
+/// 이 셸에서 **한 줄 주석**을 여는 접두(순수 · os 비의존).
+///
+/// ★왜 필요한가(codex R2 #2 · blocking): 고지는 pane 셸에 **입력으로** 들어가므로 접두가
+/// 그 셸의 주석이 아니면 고지가 곧 명령이 된다. 종전 코드는 그 위험을 `cfg!(unix)` 로 피했고
+/// (cmd.exe 가 `#` 를 오류로 뱉는다는 근거) 그 대가로 **Windows pane 은 아무 고지도 못 받았다**
+/// — 정작 봉인이 깨지는 사고는 Windows 에서 더 잦다. 접두를 셸별로 고르면 둘 다 지킬 수 있다.
+///
+/// ★`os` 가 아니라 **셸 이름**을 받는 이유: Windows pane 의 기본 셸은 `powershell.exe`
+/// (`cysd/state.rs` `default_shell`)이고 `#` 는 PowerShell 에서 **정상 주석**이다. 즉 위험한
+/// 것은 "Windows" 가 아니라 "cmd.exe" 하나다. 게다가 `CYS_SHELL` 로 어느 OS 에서든 셸이
+/// 바뀌므로 os 로 가르면 틀린다 — 판정 입력은 실제 셸이어야 한다(`windows_exec_flag` 와 동일 규율).
+///
+/// 인자를 받는 순수 함수라 mac CI 가 cmd.exe 분기를 **실제로 밟는다**
+/// (`npm_config_prefix_default_for` 가 `os` 를 받는 것과 같은 이유).
+pub fn shell_comment_prefix(shell: &str) -> &'static str {
+    // 경로·확장자를 떼고 베이스 이름만 소문자로 비교(`C:\Windows\System32\cmd.exe` → `cmd`).
+    // `cysd::state::windows_exec_flag` 와 **같은 정규화**다 — 한쪽만 고치면 갈린다.
+    let base = shell
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(shell)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE")
+        .to_ascii_lowercase();
+    // cmd.exe 만 `#` 를 모른다. `rem` 은 cmd 의 주석 명령이고 실행돼도 no-op 이다.
+    // (`::` 도 주석으로 쓰이지만 파이프·괄호 안에서 깨지는 알려진 함정이 있어 `rem` 을 쓴다.)
+    if base == "cmd" {
+        "rem "
+    } else {
+        "# "
+    }
+}
+
+/// [`npm_prefix_bundle_warning_line`] 의 **셸 주입판**. 문안의 단일 진실은 여전히
+/// [`npm_prefix_bundle_warning`] 하나이고, 여기서 바뀌는 것은 **주석 접두뿐**이다
+/// (한 글자도 버리지 않는다 — 요약이 아니라 렌더 변경이다).
+pub fn npm_prefix_bundle_warning_line_for(
+    user_value: &str,
+    scope_root: &Path,
+    shell: &str,
+) -> String {
     let full = npm_prefix_bundle_warning(user_value, scope_root);
-    // 공백 런(개행·U+2003 들여쓰기 포함)을 ASCII 공백 1개로 접는다 — 문안의 글자는 하나도
-    // 버리지 않는다(요약이 아니라 렌더 변경이다).
+    // 공백 런(개행·U+2003 들여쓰기 포함)을 ASCII 공백 1개로 접는다.
     let folded = full.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("# {folded}")
+    format!("{}{folded}", shell_comment_prefix(shell))
 }
 
 /// 번들이 오염됐는가 — **모든 소비자가 쓰는 단 하나의 술어**(codex R1 #2 수리).
@@ -1249,9 +1297,15 @@ pub fn npm_prefix_polluted(v: &NpmPrefixVerdict) -> bool {
 /// 오염이면 pane 에 넣을 **1줄 고지**, 아니면 `None`.
 /// [`npm_prefix_polluted`] 와 같은 사실의 두 표현이며, 호출부가 판정을 다시 풀지 않게 한다.
 pub fn npm_prefix_pollution_notice(v: &NpmPrefixVerdict) -> Option<String> {
+    npm_prefix_pollution_notice_for(v, POSIX_SHELL_FOR_NOTICE)
+}
+
+/// 오염이면 **그 셸에 안전한** 1줄 고지, 아니면 `None`(codex R2 #2).
+/// pane 주입은 반드시 이쪽을 쓴다 — 실제로 그 셸이 읽을 문자열이어야 하기 때문이다.
+pub fn npm_prefix_pollution_notice_for(v: &NpmPrefixVerdict, shell: &str) -> Option<String> {
     match v {
         NpmPrefixVerdict::WarnBundlePolluted { user_value, scope_root } => {
-            Some(npm_prefix_bundle_warning_line(user_value, scope_root))
+            Some(npm_prefix_bundle_warning_line_for(user_value, scope_root, shell))
         }
         _ => None,
     }

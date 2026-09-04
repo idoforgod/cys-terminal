@@ -469,25 +469,64 @@ fn announce_npm_prefix_pollution_with(
         Some(sid),
         json!({"kind": "npm_prefix_bundle_polluted", "surface": sid, "text": line}),
     );
-    if cfg!(unix) {
-        if let Some(s) = daemon.get_surface(sid) {
-            // ★배달 원장 — 주입보다 앞(delivery.rs 불변식 ①).
-            crate::delivery::record_audited(
-                daemon,
-                sid,
-                &line,
-                crate::delivery::Origin::EnvAdvisory,
-                None,
-            );
-            // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고 실패가 pane 생성을
-            // 막아선 안 된다. 이벤트 채널과 status 축이 이미 사실을 남긴다.
-            let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
-                text: line,
-                cr_delay_ms: 120,
-                clear_first: false,
-            });
-        }
-    }
+    // ★codex R2 #2(blocking): 종전엔 여기가 `cfg!(unix)` 였고 **Windows pane 은 고지를 한 줄도
+    //   받지 못했다**. 근거는 "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은
+    //   `powershell.exe`(state.rs `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 즉 위험한
+    //   것은 OS 가 아니라 cmd.exe 하나였다. 접두를 **셸별로** 고르면 두 가지를 다 지킨다
+    //   ([`cys::shell_comment_prefix`]). 정작 봉인이 깨지는 사고는 Windows 에서 더 잦다.
+    let Some(s) = daemon.get_surface(sid) else {
+        return;
+    };
+    // 실제 pane 셸(`Surface::cmd`)로 렌더한다 — 프로세스 env 나 `cfg!` 가 아니라 **이 좌석이
+    // 실제로 돌리는 셸**이 판정 입력이다(`CYS_SHELL` 로 어느 OS 에서든 바뀐다).
+    let Some(req) = npm_prefix_pane_notice_req(verdict, &s.cmd) else {
+        return;
+    };
+    // ★배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 원장에는 **실제로 주입할 문자열**을
+    //   남긴다(정본 `#` 표기를 남기면 해시가 갈려 층1 대조가 이 고지를 못 알아본다).
+    // ★원장에 남기는 문자열은 **주입할 그 문자열이어야 한다**. 정본(`#`) 표기를 남기면
+    //   `cmd.exe` pane 에서 해시가 갈려 층1 대조가 이 고지를 못 알아보고, 라벨도 없으므로
+    //   임무 게이트가 **기계 고지를 오너 임무로 읽는다**(사고 재발 경로). 그래서 값을 따로
+    //   만들지 않고 **보낼 req 에서 그대로 꺼낸다** — 둘이 갈릴 자리를 없앤다.
+    let crate::state::WriteReq::Inject { text: injected, .. } = &req else {
+        unreachable!("npm_prefix_pane_notice_req 는 Inject 만 만든다");
+    };
+    crate::delivery::record_audited(
+        daemon,
+        sid,
+        injected,
+        crate::delivery::Origin::EnvAdvisory,
+        None,
+    );
+    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고 실패가 pane 생성을
+    // 막아선 안 된다. 이벤트 채널과 status 축이 이미 사실을 남긴다.
+    let _ = s.write_tx.try_send(req);
+}
+
+/// pane 에 넣을 고지 `WriteReq` — **순수**(채널도 데몬도 만지지 않는다).
+///
+/// 집행(`try_send`)에서 분리한 이유는 codex R2 #2 의 "Inject 수신 단언" 때문이다: 실제 채널로
+/// 보내는 경로를 검체가 재려면 그 앞 단계가 값으로 잡혀야 하고, 그래야 **양 OS 의 셸 분기를
+/// mac CI 에서 전수로** 밟을 수 있다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
+fn npm_prefix_pane_notice_req(
+    verdict: &cys::NpmPrefixVerdict,
+    shell: &str,
+) -> Option<crate::state::WriteReq> {
+    let text = cys::npm_prefix_pollution_notice_for(verdict, shell)?;
+    Some(crate::state::WriteReq::Inject { text, cr_delay_ms: 120, clear_first: false })
+}
+
+/// `org.status` 의 `daemon.npm_prefix_polluted` 필드 — **판정 주입판**(codex R2 #8).
+///
+/// 종전 검체는 이 필드가 판정을 따라가는지 재려고 **프로세스 전역** `npm_config_prefix` 를
+/// 직렬화 없이 바꿨다. cargo 는 검체를 한 프로세스 안에서 **병렬**로 돌리므로 그 순간 같은 env 를
+/// 읽는 다른 검체가 무작위로 깨지고(재현 불가 flake), 도중에 panic 하면 복원도 안 돼 **뒤이은
+/// 검체까지 오염**된다. env 관측은 호출부에 두고 판정→필드 변환만 순수 함수로 내리면 검체는
+/// 전역 상태를 건드리지 않고 같은 계약을 전수로 잰다(`announce_npm_prefix_pollution_with` 가
+/// 판정을 인자로 받는 것과 **같은 규율** — 관측층/집행층 분리).
+fn npm_prefix_polluted_field(verdict: &cys::NpmPrefixVerdict) -> bool {
+    // 소비자마다 `matches!` 를 손으로 쓰지 않는다 — pane 고지와 **같은 술어**다(분열 방지).
+    cys::npm_prefix_polluted(verdict)
 }
 
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
@@ -5951,7 +5990,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                //   이 축을 읽어 "봉인이 깨질 예정"을 상시 진단한다. 판정·술어는
                                //   pane 고지와 **같은 함수**를 쓴다(분열 방지).
                                "npm_prefix_polluted":
-                                   cys::npm_prefix_polluted(&cys::npm_config_prefix_verdict_from_exe())},
+                                   npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())},
                     "surfaces": list,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
@@ -10105,55 +10144,69 @@ mod tests {
         }
     }
 
-    /// ★H-NPM-5(codex R1 #2 · blocking): **두 번째 소비자 — `org.status` 폴링 축.**
+    /// ★H-NPM-5(codex R1 #2 · blocking / **R2 #8 재작성**): 두 번째 소비자 — `org.status` 폴링 축.
     ///
     /// pane 고지는 그 자리에 있던 사람만 본다. preflight·doctor 는 사람이 없어도 읽어야 하므로
     /// `daemon.npm_prefix_polluted` 가 그 축이다. 이 검체는 키의 **실재**와 **판정 추종**을 함께
     /// 잰다 — 키만 있고 항상 false 인 배선(가짜 소비자)은 여기서 죽는다.
+    ///
+    /// ★R2 #8 수리: 종전 판은 판정 추종을 재려고 **프로세스 전역** `npm_config_prefix` 를
+    /// 직렬화 없이 바꾸고 panic-safe 복원도 하지 않았다(병렬 검체 오염 · 재현 불가 flake).
+    /// 이제 세 축으로 나눠 **전역 상태를 한 번도 건드리지 않고** 같은 계약을 잰다:
+    ///   ① 판정→필드 변환을 전수로(`npm_prefix_polluted_field` · 4판정 전부)
+    ///   ② 키가 실제 `org.status` 응답에 있다(배선 실재 — env 무관)
+    ///   ③ 소스 핀: 그 자리에 **관측 함수가 그대로 물려 있다**(①이 초록인데 배선이 상수로
+    ///      바뀌는 경로를 막는다 — ①②만으로는 못 잡는다)
     #[test]
     fn org_status_exposes_npm_prefix_pollution_for_preflight() {
-        let daemon = isolated_daemon();
-        let status = |n: u64| {
-            let req = Request { id: json!(n), method: "org.status".into(), params: json!({}) };
-            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
-                panic!("expected single reply");
-            };
-            resp
+        // ① 판정 → 필드. 4판정 전수(오염만 true · 나머지 전부 false).
+        let polluted = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: "/Applications/cys.app/Contents/Resources/npm".to_string(),
+            scope_root: std::path::PathBuf::from("/Applications/cys.app"),
         };
-        // 이 테스트 바이너리의 exe_dir 이 곧 설치 스코프다(번들 레이아웃이 아니므로 그대로).
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .expect("current_exe");
-        let prev = std::env::var(cys::ENV_NPM_CONFIG_PREFIX).ok();
-
-        // ⓐ 오염: 사용자 값이 설치 스코프 **안**을 가리킨다.
-        std::env::set_var(
-            cys::ENV_NPM_CONFIG_PREFIX,
-            exe_dir.join("npm-inside-the-bundle"),
+        assert!(
+            npm_prefix_polluted_field(&polluted),
+            "설치본 오염인데 status 가 깨끗하다고 보고한다 — preflight 가 영영 못 본다"
         );
-        let row = status(1);
-        assert_eq!(
-            row["result"]["daemon"]["npm_prefix_polluted"],
-            json!(true),
-            "설치본 오염인데 status 가 깨끗하다고 보고한다 — preflight 가 영영 못 본다: {}",
-            row["result"]["daemon"]
-        );
-
-        // ⓑ 무오염: 설치본 **밖** 값은 사용자 소유물이다(경고 대상 아님).
-        std::env::set_var(cys::ENV_NPM_CONFIG_PREFIX, "/tmp/cys-npm-outside");
-        assert_eq!(
-            status(2)["result"]["daemon"]["npm_prefix_polluted"],
-            json!(false),
-            "설치본 밖 값을 오염으로 보고했다 — 진짜 경고가 묻힌다"
-        );
-
-        match prev {
-            Some(v) => std::env::set_var(cys::ENV_NPM_CONFIG_PREFIX, v),
-            None => std::env::remove_var(cys::ENV_NPM_CONFIG_PREFIX),
+        for clean in [
+            cys::NpmPrefixVerdict::KeepUser,
+            cys::NpmPrefixVerdict::NoDefault,
+            cys::NpmPrefixVerdict::Inject(std::path::PathBuf::from("/home/u/.local")),
+        ] {
+            assert!(
+                !npm_prefix_polluted_field(&clean),
+                "설치본 밖 값을 오염으로 보고했다 — 진짜 경고가 묻힌다: {clean:?}"
+            );
         }
-    }
 
+        // ② 키 실재 — 실제 응답에 있어야 preflight 가 읽을 수 있다(전역 env 무접촉).
+        let daemon = isolated_daemon();
+        let req = Request { id: json!(1), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert!(
+            resp["result"]["daemon"]["npm_prefix_polluted"].is_boolean(),
+            "org.status 에 npm_prefix_polluted 키가 없다(또는 bool 이 아니다): {}",
+            resp["result"]["daemon"]
+        );
+
+        // ③ 소스 핀 — 필드가 **관측 함수**에서 오는지. ①이 초록인 채로 배선만 상수가 되는
+        //    경로(가짜 소비자)는 ①②로는 안 잡힌다.
+        // ★핀은 반드시 **org.status 아크 안**만 본다. 파일 전체를 뒤지면 이 assert 문자열
+        //   자체가 매치돼 스스로를 만족시킨다(가짜 핀 — mutation 으로 실측해 잡았다).
+        let src = include_str!("handlers.rs");
+        let start = src.find("\n        \"org.status\" => {").expect("org.status 아크 소실");
+        let end = start
+            + src[start..]
+                .find("\n        \"control.dashboard\" => {")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        assert!(
+            src[start..end]
+                .contains("npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())"),
+            "org.status 가 실제 env 판정을 잃었다 — 필드가 상수로 굳으면 오염이 영영 안 보인다"
+        );
+    }
     /// ★H-NPM-6(codex R1 #2 · 배선 소실 방지 소스 핀): `surface.create` 가 고지 호출을 잃으면
     /// 위 두 검체는 여전히 초록인데 **실사용에서는 아무 pane 도 경고를 못 받는다**.
     /// (state.rs `pane_children_inherit_no_bytecode_env` · boot_supervisor 순서 핀과 같은 관례.)
@@ -10168,6 +10221,106 @@ mod tests {
         assert!(
             src[start..end].contains("announce_npm_prefix_pollution(daemon, s.id)"),
             "surface.create 가 번들 오염 고지를 잃었다 — 경고에 소비자가 다시 0이 된다"
+        );
+    }
+
+    /// ★H-NPM-7(codex R2 #2 · blocking): **고지가 Windows pane 에도 실제로 주입된다.**
+    ///
+    /// 종전 결함: 주입이 `cfg!(unix)` 안에 있어 Windows pane 은 한 줄도 못 받았다. 근거는
+    /// "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은 `powershell.exe`
+    /// (`state.rs` `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 위험한 것은 OS 가 아니라
+    /// **cmd.exe 하나**였다. 그 하나 때문에 정작 봉인 사고가 잦은 플랫폼 전체가 무음이 됐다.
+    ///
+    /// 이 검체가 재는 것 넷:
+    ///   ① 셸별 주석 접두가 맞다(powershell·pwsh·zsh·bash → `# ` / cmd → `rem `)
+    ///   ② 경로·대소문자·확장자가 섞여도 같은 판정(`C:\WINDOWS\SYSTEM32\CMD.EXE`)
+    ///   ③ **실제 `write_tx` 로 `Inject` 가 도착한다** — 양 셸 모두. mac CI 가 Windows 분기를
+    ///      실제로 밟는다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
+    ///   ④ 문안은 한 글자도 안 버린다(접두만 다르고 본문은 정본과 동일)
+    #[test]
+    fn npm_prefix_notice_reaches_the_pane_on_windows_shells_too() {
+        use crate::state::WriteReq;
+
+        // ① 셸별 접두.
+        for (shell, want) in [
+            ("powershell.exe", "# "),
+            ("pwsh", "# "),
+            ("/bin/zsh", "# "),
+            ("/bin/bash", "# "),
+            ("cmd.exe", "rem "),
+            // ② 경로·대소문자·확장자 정규화.
+            ("C:\\WINDOWS\\SYSTEM32\\CMD.EXE", "rem "),
+            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "# "),
+        ] {
+            assert_eq!(
+                cys::shell_comment_prefix(shell),
+                want,
+                "셸 {shell:?} 의 주석 접두가 틀렸다 — 고지가 곧 명령이 되거나 무음이 된다"
+            );
+        }
+
+        let verdict = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: "C:\\Program Files\\cys\\runtime\\npm".to_string(),
+            scope_root: std::path::PathBuf::from("C:\\Program Files\\cys"),
+        };
+
+        // ③ 실제 채널 수신 — 양 셸 모두 `Inject` 가 도착한다.
+        for (shell, want_prefix) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
+            let req = npm_prefix_pane_notice_req(&verdict, shell)
+                .unwrap_or_else(|| panic!("셸 {shell:?} 에서 고지가 만들어지지 않았다"));
+            tx.try_send(req).expect("채널 전송 실패");
+            match rx.try_recv().expect("pane 이 고지를 못 받았다 — Windows 무음 회귀") {
+                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                    assert!(
+                        text.starts_with(want_prefix),
+                        "셸 {shell:?} 에 안전하지 않은 접두로 주입됐다: {text:?}"
+                    );
+                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
+                    assert!(!clear_first, "고지가 화면을 지웠다 — 사용자 작업 파괴");
+                    // ④ 본문은 정본과 동일(접두만 다르다 · 요약 금지).
+                    let canon = cys::npm_prefix_pollution_notice(&verdict).expect("정본 문안 부재");
+                    assert_eq!(
+                        text.trim_start_matches(want_prefix),
+                        canon.trim_start_matches("# "),
+                        "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 처방을 받는다"
+                    );
+                    assert!(!text.contains('\n'), "고지에 개행이 남았다 — 개행은 곧 Enter 다");
+                }
+                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
+            }
+        }
+
+        // 음성 대조 — 오염이 아니면 어떤 셸에서도 아무것도 만들지 않는다.
+        for clean in [cys::NpmPrefixVerdict::KeepUser, cys::NpmPrefixVerdict::NoDefault] {
+            for shell in ["powershell.exe", "cmd.exe", "/bin/zsh"] {
+                assert!(
+                    npm_prefix_pane_notice_req(&clean, shell).is_none(),
+                    "오염이 아닌데 고지가 만들어졌다({shell}) — 과잉 경고는 진짜 경고를 묻는다"
+                );
+            }
+        }
+
+        // 배선 소실 방지 — 주입이 다시 `cfg!(unix)` 뒤로 숨으면 위 검체는 초록인 채로
+        // 실사용에서만 무음이 된다(H-NPM-6 와 같은 관례).
+        let src = include_str!("handlers.rs");
+        let start = src
+            .find("fn announce_npm_prefix_pollution_with(")
+            .expect("고지 함수 소실");
+        let end = start
+            + src[start..]
+                .find("\nfn npm_prefix_pane_notice_req(")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        // 주석은 걷어내고 **실제 코드**만 본다 — 이 결함의 내력을 설명하는 주석 자체가
+        // `cfg!(unix)` 를 인용하므로, 문자열만 찾으면 자기 설명에 걸려 영구 적색이 된다.
+        let code_only: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("cfg!(unix)"),
+            "고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
         );
     }
 
