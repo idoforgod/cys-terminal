@@ -50,6 +50,11 @@ case "$1" in
     if [ -f "$FAKE_CYS_STATUS" ]; then cat "$FAKE_CYS_STATUS"; exit 0; fi
     exit 1 ;;
   agent-detect) cat "$FAKE_CYS_DETECT"; exit 0 ;;
+  list)
+    # ★역할 **주소 레지스트리**(surface.list) — `status`(프로세스 표)와 **다른 자료원**이다.
+    #   파일이 없으면 아무것도 내지 않는다 = 레지스트리 미측정(게이트 불참).
+    if [ -n "${FAKE_CYS_LIST:-}" ] && [ -f "$FAKE_CYS_LIST" ]; then cat "$FAKE_CYS_LIST"; fi
+    exit 0 ;;
   ping) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -69,6 +74,13 @@ def surfaces(ack=None, roles=("cso", "worker", "reviewer-gemini", "reviewer-code
             row["ack_nonce_ok"] = ack
         out.append(row)
     return out
+
+
+def write_list(path, roles):
+    """`cys list` 출력 모사 — `javis_boot_node.cys_list_rows` 가 파싱하는 탭 구분 행."""
+    with io.open(path, "w", encoding="utf-8", newline="\n") as f:
+        for i, r in enumerate(roles, start=10):
+            f.write("surface:%d\trole=%s\tpid=%d\texited=false\n" % (i, r, 1000 + i))
 
 
 def write_status(path, payload):
@@ -256,18 +268,54 @@ try:
     check("9e 기존 마커 키·값 무변경(기존 핀 보존)",
           '"orchestra_check": "exit 0"}' in src_bs)
 
-    # ─────────────── ⑩ H-ADDR-1 — 역할 주소 resolve 게이트(순수 함수) ───────────────
+    # ─────────── ⑩ H-ADDR-1 — 역할 주소 resolve 게이트 (★실경로) ───────────
+    # ★★R1 codex #1(blocking) 반영: 종전 이 축은 **순수 함수만** 쟀고, 거기 넣던 입력은
+    #   실경로에서 만들어질 수 없는 값이었다 — 주소 판정이 생존 판정과 **같은 집합**을
+    #   재검사했기 때문이다(게이트 도달 불가 · 검체는 불가능한 중간값으로 공허하게 통과).
+    #   이제 주소성은 `cys list`(좌석 레지스트리)에서, 생존은 `cys status`(프로세스 표)에서
+    #   온다 — **좌석은 살려 둔 채 레지스트리에서 역할만 지우면** 진짜 갈래가 만들어진다.
+    lst = os.path.join(root, "list.txt")
+    env_addr = dict(base)
+    env_addr["FAKE_CYS_LIST"] = lst
+    write_status(st, {"surfaces": surfaces()})                # 좌석 4종 전부 **살아 있다**
+    write_list(lst, ["cso", "worker", "reviewer-gemini", "reviewer-codex"])
+    r = run(["check"], env_addr)
+    check("ADDR-E2E-1 레지스트리가 온전하면 종전대로 exit 0", r.returncode == 0,
+          repr((r.returncode, r.stdout[-160:])))
+    write_list(lst, ["cso", "worker", "reviewer-codex"])      # ★주소만 사라짐(좌석은 생존)
+    r = run(["check"], env_addr)
+    check("ADDR-E2E-2 좌석은 살아 있는데 **주소만** 없으면 exit 1(실경로 발화)",
+          r.returncode == 1, repr((r.returncode, r.stdout[-260:])))
+    check("ADDR-E2E-3 라벨이 '미기동'이 아니라 '주소 미해소'다(거짓 처방 차단)",
+          "주소 미해소" in r.stdout and "claim-role" in r.stdout, repr(r.stdout[-320:]))
+    rj = run(["check", "--json"], env_addr)
+    plj = json.loads(rj.stdout.strip().splitlines()[-1])
+    check("ADDR-E2E-4 `--json` 이 사유를 기계 판독 가능하게 싣는다",
+          rj.returncode == 1 and plj["exit"] == 1
+          and "addr_unresolved" in (plj.get("why") or "")
+          and plj["ready_missing"] == ["reviewer-gemini"],
+          repr((rj.returncode, plj.get("why"), plj.get("ready_missing"))))
+    r = run(["check"], base)                                  # FAKE_CYS_LIST 없음 = 미측정
+    check("ADDR-E2E-5 레지스트리 미측정은 결손이 아니다(exit 0 + 고지)",
+          r.returncode == 0 and "레지스트리 미측정" in r.stdout,
+          repr((r.returncode, r.stdout[-200:])))
+    _src_a = io.open(ORC, encoding="utf-8").read()
+    check("ADDR-E2E-6 소스 핀: 주소 판정이 생존 판정과 **같은 자료원**으로 되돌아가지 않았다",
+          "def addr_registry_roles(" in _src_a and "cys_list_rows" in _src_a
+          and "live_role_names(status or {})" not in _src_a,
+          "같은 집합을 재검사하면 게이트가 다시 공허해진다")
+
+    # ─────────── ⑩-b 순수 함수 축(입력 = 레지스트리 집합) ───────────
     V = {"cso": {"satisfied": True, "filler": "cso", "why": "x"},
          "reviewer-gemini": {"satisfied": True, "filler": "reviewer-gemini", "why": "x"}}
-    S_ok = {"surfaces": [{"role": "cso"}, {"role": "reviewer-gemini"}]}
-    S_gone = {"surfaces": [{"role": "cso"}]}
-    S_exit = {"surfaces": [{"role": "cso"}, {"role": "reviewer-gemini", "exited": True}]}
-    check("10a 주소 있으면 미해소 0", orch.addr_unresolved_roles(S_ok, V) == [])
-    check("10b role 행 부재 → 미해소", orch.addr_unresolved_roles(S_gone, V) == ["reviewer-gemini"])
-    check("10c 종료된 행은 주소가 아니다",
-          orch.addr_unresolved_roles(S_exit, V) == ["reviewer-gemini"])
+    check("10a 주소 있으면 미해소 0",
+          orch.addr_unresolved_roles({"cso", "reviewer-gemini"}, V) == [])
+    check("10b 레지스트리에 role 없음 → 미해소",
+          orch.addr_unresolved_roles({"cso"}, V) == ["reviewer-gemini"])
+    check("10c 레지스트리 미측정(None)은 결손이 아니다",
+          orch.addr_unresolved_roles(None, V) == [])
     check("10d 미충족 좌석은 이 게이트가 다루지 않는다(ready_missing 소관)",
-          orch.addr_unresolved_roles(S_gone,
+          orch.addr_unresolved_roles({"cso"},
                                      {"reviewer-gemini": {"satisfied": False,
                                                           "filler": None}}) == [])
     M = orch.mark_addr_unresolved(V, ["reviewer-gemini"])
@@ -279,7 +327,7 @@ try:
     check("10f 입력 무변조(순수)", V["reviewer-gemini"]["satisfied"] is True)
     check("10g 실충전자(대체 좌석) 이름으로 판정한다 — B2 대체 슬롯 무회귀",
           orch.addr_unresolved_roles(
-              {"surfaces": [{"role": "reviewer-claude-1"}]},
+              {"reviewer-claude-1"},
               {"reviewer-gemini": {"satisfied": True, "filler": "reviewer-claude-1"}}) == [])
 
     # ─────────────── ⑪ ★음성 대조 — ACK 축을 제거한 변조본은 12 를 못 낸다 ───────────────

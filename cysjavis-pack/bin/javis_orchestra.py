@@ -871,8 +871,33 @@ def ack_remedy(roles):
             % " · ".join(agents))
 
 
-def addr_unresolved_roles(status, verdicts):
-    """★(부트 v2 §2-9) **역할 주소 resolve 게이트** — 순수 함수.
+def addr_registry_roles():
+    """★역할 **주소 레지스트리** — `cys list`(surface.list RPC) 비종료 행의 role 집합 | **None(미측정)**.
+
+    ★생존 판정과 **다른 자료원**이어야 하는 이유(R1 codex #1 blocking): 종전 구현은
+      `live_role_names(status)` 를 다시 봤다 — `check_verdicts` 가 슬롯을 해소할 때 쓴 **바로 그
+      집합**이다. 같은 집합을 두 번 보면 불일치가 구조적으로 발생할 수 없고, 게이트는 실경로에서
+      **도달 불가**가 되며 검체는 불가능한 중간값을 주입해야만 적색이 나는 **공허한 통과**가 된다.
+      주소성의 진짜 오라클은 `cys send --to <역할>` 이 쓰는 **좌석 레지스트리**(`surface.list`)이고,
+      그것은 `cys status --json`(프로세스 표 스냅샷)과 **다른 RPC·다른 직렬화**다. 둘이 갈리는
+      순간이 정확히 "좌석은 살아 있는데 주소가 없다"이며 이 게이트가 잡아야 할 상태다.
+    ★파서를 새로 쓰지 않고 `javis_boot_node.cys_list_rows` 를 소비한다 — 같은 표를 두 벌로 읽으면
+      그 사본이 곧 다음 드리프트다(이 파일이 반복해서 경계하는 형상).
+    반환 None = **미측정**(공유 모듈 소비 불가·cys 부재·rc≠0·행 0) — 미측정은 실패가 아니다."""
+    bn = _boot_node()
+    if bn is None:
+        return None
+    try:
+        rows = bn.cys_list_rows()
+    except Exception:
+        return None
+    if not rows:                      # rc≠0 도 [] 를 낸다 — 구분 불가라 보수적으로 미측정
+        return None
+    return {r.get("role") for r in rows if r.get("role") and r.get("exited") is False}
+
+
+def addr_unresolved_roles(registry, verdicts):
+    """★(부트 v2 §2-9) **역할 주소 resolve 게이트** — 순수 함수(입력 = 레지스트리 집합).
 
     슬롯이 해소돼 satisfied 인 요건이라도, 데몬 표에 **그 실충전자 이름을 `role` 로 가진
     비종료 행**이 없으면 `cys send --to <역할>` 이 닿지 않는다. 좌석이 살아 있다는 사실과
@@ -882,10 +907,13 @@ def addr_unresolved_roles(status, verdicts):
     ★게이트를 `check_verdicts` 가 아니라 여기(check 소비 지점)에 두는 이유: 같은 판정 함수를
       javis_bootstrap 결손 판정·wakeup zombie 가드·reclaim 이 공유한다. 그쪽의 satisfied 를
       함께 뒤집으면 주소 등록이 잠깐 늦은 좌석 위에 중복 스폰이 얹힌다(자가치유가 아니라
-      자가교란). 명세 §2-9 도 이 게이트를 `check` 항목 아래 둔다."""
-    live = live_role_names(status or {})
+      자가교란). 명세 §2-9 도 이 게이트를 `check` 항목 아래 둔다.
+    ★`registry is None`(미측정)이면 **빈 목록**이다 — 재지 못한 것을 결손으로 접지 않는다(이 파일
+      exit 2 계약과 같은 계급). 호출부가 그 사실을 라벨로 고지한다."""
+    if registry is None:
+        return []
     return [r for r, v in (verdicts or {}).items()
-            if v.get("satisfied") and (v.get("filler") or r) not in live]
+            if v.get("satisfied") and (v.get("filler") or r) not in registry]
 
 
 def mark_addr_unresolved(verdicts, roles):
@@ -988,7 +1016,8 @@ def cmd_check(args):
     verdicts, roster = check_verdicts(status)
     # ★(부트 v2 §2-9) 역할 주소 resolve 게이트 — 슬롯이 해소돼도 그 이름의 비종료 행이
     #   데몬 표에 없으면 주소 배달이 불가능하다. 게이트는 **check 한정**이다(위 함수 주석).
-    unresolved = addr_unresolved_roles(status, verdicts)
+    _addr_registry = addr_registry_roles()
+    unresolved = addr_unresolved_roles(_addr_registry, verdicts)
     verdicts = mark_addr_unresolved(verdicts, unresolved)
     required = list(verdicts.keys())
     alive_optional = live_roles(status)
@@ -1059,8 +1088,9 @@ def cmd_check(args):
                   "사람이 1회 통과시킨 뒤 재부트하라 — 좌석·프로세스는 살아 있다"
                   "(`cys read-screen --surface <ref>` 로 화면 확인)." % ", ".join(gated))
         if unresolved:
-            print("  ※ 역할 주소 미해소(%s): 좌석·프로세스는 살아 있으나 데몬 표에 그 role 을 "
-                  "가진 비종료 행이 없다 — `cys send --to <역할>` 이 닿지 않는다(위임 티켓이 "
+            print("  ※ 역할 주소 미해소(%s): 좌석·프로세스는 살아 있으나(status 기준) **좌석 "
+                  "레지스트리(`cys list`)** 에 그 role 을 가진 비종료 행이 없다 — "
+                  "`cys send --to <역할>` 이 닿지 않는다(위임 티켓이 "
                   "허공으로 간다). `cys list` 의 role 열을 확인하고 해당 노드에서 "
                   "`cys claim-role <역할>` 로 주소를 재등록하라 — 기동 명령으로는 풀리지 않는다."
                   % ", ".join(unresolved))
@@ -1072,6 +1102,10 @@ def cmd_check(args):
               "**리뷰 게이트**(review-prompt·round-init)뿐이다. 처방: %s"
               % ack_remedy(ack["pending"]))
     else:
+        if _addr_registry is None:
+            # 주소 레지스트리를 재지 못했다 — 초록으로도 적색으로도 접지 않고 사실만 남긴다.
+            print("  · 역할 주소 레지스트리 미측정(`cys list` 판독 불가) — 주소성 축은 이번 "
+                  "판정에 참여하지 않았다(미측정은 '전원 주소 해소'가 아니다).")
         if ack["axis"] and ack["unmeasured"]:
             # 축은 켜졌는데 행에 ack 필드가 없다 = 부분 배포. **미측정을 초록으로 접지 않는다**.
             print("  · 각성 ACK 미측정(%s) — 데몬 표에 ack 필드가 없다(부분 배포·스큐). "
@@ -2388,23 +2422,52 @@ def cmd_gate_status(args):
     return 0
 
 
+# ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
+# ★오너 승인 개정(2026-09-04 전면 감사): 종전에는 라운드 종료마다
+#   `cys feed push --kind learn_proposal` 로 **건별 승인 요청**을 자동 발행했다. 승인권은
+#   오너뿐인데 자동 생성분이 6건(최고령 19h48m) 적체했고, 그 소음이 **실제 승인 요청**
+#   (SSH 프로브 9.5h)을 덮었다. RSI_LEARNING_DIRECTIVE §7-4 의 "접점 신설 시 다이제스트가
+#   기본값(승인 피로 봉쇄 불변식)"이 이미 정본이므로, 이 변경은 새 규범이 아니라 **코드가
+#   그 정본을 따르게 하는 정합 수정**이다(§3 도 같은 날 함께 개정).
+#   · 자동 트리거(라운드 종료·ceiling)는 **feed 를 쏘지 않는다** — 큐에만 적재한다.
+#   · 사람이 실제 착수를 원할 때의 승인 요청 경로(`javis_learn propose` → feed)는 불변이다.
+# ★큐 경로·레코드 모양은 javis_rsi.py 의 동명 함수와 **바이트 동형**이어야 한다 —
+#   두 모듈이 같은 큐에 쓰므로, 모양이 갈리면 다이제스트가 한쪽을 못 읽는다.
+#   패리티는 bin/tests/test_learn_digest_queue.py 가 기계 검증한다.
+LEARN_DIGEST_QUEUE = "digest_queue.jsonl"
+
+
+def learn_digest_queue_path():
+    """주간 다이제스트 큐 파일 — `<팩>/round/learn/digest_queue.jsonl`(레인별 유일)."""
+    return os.path.join(pack_dir(), "round", "learn", LEARN_DIGEST_QUEUE)
+
+
+def enqueue_learn_digest(reason, topic, source):
+    """추천 1건을 다이제스트 큐에 적재(best-effort) — 실패는 무시한다(추천은 비핵심 부가 신호).
+    반환: 적재했으면 True. feed 는 **쏘지 않는다**(위 개정 근거)."""
+    try:
+        path = learn_digest_queue_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": time.time(), "reason": reason, "topic": topic, "source": source,
+               "status": "queued_for_weekly_digest"}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def _recommend_learn_once(reason, topic, marker_key):
-    """RSI 학습 자율추천(best-effort) — marker_key당 1회 feed 추천(추천까지만 자율·착수 사람 승인·
-    directive §4). cys 부재·데몬 미가동·오류·중복 마커는 무시(추천은 비핵심·핵심 판정 불간섭)."""
-    import shutil
+    """RSI 학습 자율추천(best-effort) — marker_key당 1회 **다이제스트 큐 적재**(feed 발행 0).
+    추천까지만 자율·착수는 사람 승인이라는 directive §4 계약은 그대로다 — 바뀐 것은 **배달
+    채널**뿐이다(건별 feed → 주간 다이제스트 1건). 중복 마커·오류는 무시한다."""
     learn_dir = os.path.join(pack_dir(), "round", "learn")
     marker = os.path.join(learn_dir, ".rec_" + marker_key)
-    if os.path.exists(marker) or not shutil.which("cys"):
+    if os.path.exists(marker):
         return
-    body = ('{"reason":"%s","topic":"%s","status":"awaiting_approval"} — '
-            "feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 착수. directive §4: 추천까지만 자율." % (reason, topic))
     try:
         os.makedirs(learn_dir, exist_ok=True)
-        r = subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
-                            # 제목 포맷은 cysd RPC 생산자(handlers.rs learn_proposal)와 동일 규격 유지.
-                            "--title", "[RSI 학습 추천] %s — %s" % (reason, topic), "--body", body],
-                           capture_output=True, timeout=5)
-        if r.returncode == 0:
+        if enqueue_learn_digest(reason, topic, "orchestra.gate-status"):
             open(marker, "w").close()
     except Exception:
         pass
@@ -3204,7 +3267,8 @@ def cmd_self_test(args):
         #   트리에 위반이 0 이라 탐지기가 고장나도 초록이 되는 항(반환 호환성 핀)은 **합성
         #   표본**(하드 3원소·1원소 튜플)으로 탐지 능력 자체를 시험한다.
         _axis_prev = {k: os.environ.get(k) for k in (AWAKE_AXIS_ENV, BOOT_GATES_ENV)}
-        _globals_prev = {n: globals()[n] for n in ("cys_status", "reviewer_roster")}
+        _globals_prev = {n: globals()[n]
+                         for n in ("cys_status", "reviewer_roster", "addr_registry_roles")}
         try:
             for _k in (AWAKE_AXIS_ENV, BOOT_GATES_ENV):
                 os.environ.pop(_k, None)        # 기본(축 켜짐)을 명시적으로 만든다
@@ -3303,6 +3367,10 @@ def cmd_self_test(args):
                  "substituted_for": None, "reason": "테스트 주입"},
                 {"role": "reviewer-codex", "agent": "codex", "native": True,
                  "substituted_for": None, "reason": "테스트 주입"}]
+            # ★주소 레지스트리도 밀폐 주입한다 — 실 `cys list` 를 타면 합성 status 의 역할이
+            #   레지스트리에 없어 전원 addr_unresolved 로 접힌다(검체가 기계에 의존하게 된다).
+            _reg_full = {"cso", "worker", "reviewer-gemini", "reviewer-codex"}
+            globals()["addr_registry_roles"] = lambda: set(_reg_full)
 
             class _CkJson(object):
                 json = True
@@ -3318,6 +3386,33 @@ def cmd_self_test(args):
             _jout, _hout = _jb.getvalue(), _hb.getvalue()
             assert _rc_j == 0 and _rc_h == 0, \
                 "정상 팀에서 exit 0 이 아니다(exit 계약 변형): json=%s human=%s" % (_rc_j, _rc_h)
+            # ★★주소 게이트 **실경로** 발화(R1 codex #1): 좌석은 그대로 살아 있고(status 불변)
+            #   레지스트리에서 역할 하나만 사라지면 — 이것이 "좌석은 사는데 주소가 없다" 다 —
+            #   `cmd_check` 가 exit 1 을 내야 한다. 종전 구현은 생존 판정과 **같은 집합**을 다시
+            #   봐서 이 상태를 만들 수조차 없었다(게이트 도달 불가·검체 공허).
+            globals()["addr_registry_roles"] = lambda: _reg_full - {"reviewer-gemini"}
+            _ab = io.StringIO()
+            with contextlib.redirect_stdout(_ab):
+                _rc_addr = cmd_check(_CkBare())
+            _aout = _ab.getvalue()
+            assert _rc_addr == CHECK_EXIT_MISSING, \
+                "레지스트리에서 주소만 사라졌는데 exit 1 이 아니다(게이트 도달 불가): %s" % _rc_addr
+            assert "주소 미해소" in _aout and "reviewer-gemini" in _aout, \
+                "주소 미해소 라벨이 산문에 없다: %r" % _aout[-200:]
+            _aj = io.StringIO()
+            with contextlib.redirect_stdout(_aj):
+                _rc_aj = cmd_check(_CkJson())
+            _apl = json.loads(_aj.getvalue().strip().splitlines()[-1])
+            assert _rc_aj == CHECK_EXIT_MISSING and _apl["exit"] == CHECK_EXIT_MISSING \
+                and _apl["why"] and "addr_unresolved" in _apl["why"], \
+                "`--json` 이 주소 미해소를 기계 판독 가능하게 싣지 않는다: %r" % (_apl.get("why"),)
+            # 미측정(None)은 초록으로도 적색으로도 접지 않는다 — exit 는 종전대로 0.
+            globals()["addr_registry_roles"] = lambda: None
+            _nb = io.StringIO()
+            with contextlib.redirect_stdout(_nb):
+                _rc_none = cmd_check(_CkBare())
+            assert _rc_none == CHECK_EXIT_READY and "레지스트리 미측정" in _nb.getvalue(), \
+                "레지스트리 미측정을 결손으로 접었거나 고지하지 않았다: %s" % _rc_none
             assert "READY" not in _jout, "--json stdout 에 사람용 산문이 섞였다(기계 소비 파손)"
             _pl = json.loads(_jout)               # 1줄 JSON — 산문 혼입이면 여기서 죽는다
             assert _pl["exit"] == 0 and _pl["ready"] is True and _pl["awake"] is True, \
@@ -3447,15 +3542,10 @@ def cmd_self_test(args):
         assert "--verify" not in _rem and "javis_boot_node.py --role reviewer-gemini" in _rem, \
             "거짓 처방(존재하지 않는 플래그): %r" % _rem
         # ⑨ 주소 resolve 게이트 — 좌석은 satisfied 인데 데몬 표에 그 role 행이 없다.
-        _st_addr = {"surfaces": [{"role": "cso"}]}          # reviewer-gemini 행 없음
-        assert addr_unresolved_roles(_st_addr, _v_ok) == ["reviewer-gemini"], "주소 게이트 미발화"
-        assert addr_unresolved_roles({"surfaces": [{"role": "cso"},
-                                                   {"role": "reviewer-gemini"}]}, _v_ok) == [], \
-            "주소가 있는데 미해소로 오판"
-        assert addr_unresolved_roles({"surfaces": [{"role": "cso"},
-                                                   {"role": "reviewer-gemini",
-                                                    "exited": True}]}, _v_ok) == ["reviewer-gemini"], \
-            "종료된 행을 주소로 인정"
+        assert addr_unresolved_roles({"cso"}, _v_ok) == ["reviewer-gemini"], "주소 게이트 미발화"
+        assert addr_unresolved_roles({"cso", "reviewer-gemini"}, _v_ok) == [], "주소 있는데 오판"
+        # ★미측정(None)은 결손이 아니다 — 재지 못한 것을 적색으로 접지 않는다.
+        assert addr_unresolved_roles(None, _v_ok) == [], "미측정을 주소 미해소로 접었다"
         _m = mark_addr_unresolved(_v_ok, ["reviewer-gemini"])
         assert _m["reviewer-gemini"]["satisfied"] is False and _v_ok["reviewer-gemini"]["satisfied"] \
             is True, "mark_addr_unresolved 가 입력을 변조했다(순수성 위반)"
