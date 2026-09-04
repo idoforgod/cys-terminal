@@ -4069,72 +4069,157 @@ mod tests {
         );
     }
 
-    /// ★R6 [1](codex R5 · IG-28) — **준비도 주장은 빌드를 앞지를 수 없다.**
+    /// ★R7 [1](codex R6 · master 심판 · IG-28) — **준비도 주장은 빌드를 앞지를 수 없다.**
     ///
-    /// 준비도 칸은 '그렇게 되기를 바란다' 가 아니라 '이 빌드에 실재한다' 는 주장이다. 누가
-    /// `admission_reserved` 를 true 로 뒤집는데 예약 배선이 없으면, fence(감독자 층)만 배포되고
-    /// admission 수리(B4)는 빠진 조합이 arm 될 수 있다 — codex 가 지목한 **분리 배포**다.
-    /// readiness AND 는 '칸이 false 면 못 켠다' 를 보증하지만 '칸이 참이면 근거가 있다' 는
-    /// 보증하지 않는다. 그 나머지 절반을 여기서 닫는다.
+    /// ## R6 판의 결함 — 무측정을 막는 핀이 그 자체로 무측정이었다
+    /// R6 판은 증거 마커의 **이름 문자열 존재**만 봤다. 그러면 `fn reserve_admission() {}` 처럼
+    /// **빈 채로 정의만 된**(아무도 부르지 않는) 함수가 있어도 통과한다 — 배포 결박이 아니다.
+    /// 게다가 나는 그때 "합성 표본으로 탐지력을 증명했다" 고 적었는데, 증명한 것은 '칸을
+    /// 뒤집으면 이름이 없어 적발된다' 뿐이었다. **이름이 있는 경우를 재지 않았으니 반쪽이었다.**
+    /// 이 세션이 반복해 말한 계급(초록인 것과 옳은 이유로 초록인 것은 다르다)이 핀 자신에게
+    /// 적용된 것이다(codex 정확).
     ///
-    /// ★탐지력을 함께 증명한다: 지금 트리에는 위반이 0 이라(전부 false) 실제 값만 재면 탐지기가
-    /// 고장나도 초록이다. 합성 표본으로 칸을 뒤집어 반드시 적발되는지, 그리고 증거가 있으면
-    /// 통과하는지(항상 적색인 사문이 아닌지)를 둘 다 잰다.
+    /// ## 지금 재는 것 — 이름이 아니라 **배선**
+    /// 증거가 있다 = ①정의가 있다 ②생산 경로에서 **실제로 불린다**(정의 자신을 뺀 호출 ≥1)
+    /// ③본문이 비어 있지 않다. 셋을 다 만족해야 그 칸을 참이라 주장할 수 있다.
+    ///
+    /// ## 두 파일을 함께 훑는다
+    /// `lease_ok` 는 이 파일에 정의되고 `handlers.rs` 에서 불린다. 한 파일만 보면 **배선된 것을
+    /// 미배선으로 오판**해 이번엔 반대 방향의 거짓 적색이 된다.
     #[test]
     fn readiness_claims_cannot_outrun_the_build() {
-        // IG-28 의 증거 마커 — B4 가 이 이름으로 착지시키거나, 다른 이름을 쓰면 이 핀을 함께
-        // 고친다. 어느 쪽이든 **눈에 보이는 결박**이고, 조용히 어긋날 수는 없다.
-        const ADMISSION_EVIDENCE: &str = "reserve_admission(";
-        const EXIT_ACK_EVIDENCE: &str = "release_confirmed_exit(";
-        fn missing(r: RunnerReadiness, prod: &str) -> Vec<&'static str> {
-            [
-                (r.admission_reserved, "admission_reserved", ADMISSION_EVIDENCE),
-                (
-                    r.confirmed_exit_observed,
-                    "confirmed_exit_observed",
-                    EXIT_ACK_EVIDENCE,
-                ),
-            ]
-            .into_iter()
-            .filter(|(claimed, _, marker)| *claimed && !prod.contains(*marker))
-            .map(|(_, name, _)| name)
-            .collect()
+        /// 이 이름이 **배선**돼 있는가 — 정의·호출·비어있지 않은 본문 셋 다.
+        fn wired(name: &str, src: &str) -> bool {
+            let def = format!("fn {name}(");
+            let Some(dpos) = src.find(&def) else {
+                return false;
+            };
+            let calls = src
+                .matches(&format!("{name}("))
+                .count()
+                .saturating_sub(src.matches(&def).count());
+            if calls == 0 {
+                return false; // 정의만 있고 아무도 부르지 않는다 = 배선이 아니다
+            }
+            let after = &src[dpos..];
+            let Some(open) = after.find('{') else {
+                return false;
+            };
+            let mut depth = 0i32;
+            let mut end = 0usize;
+            for (i, b) in after[open..].bytes().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end == 0 {
+                return false;
+            }
+            !after[open + 1..open + end].trim().is_empty() // 빈 본문 = 배선이 아니다
         }
-        let src = include_str!("boot_supervisor.rs");
-        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
-        let prod = strip_line_comments(raw);
-        // ① 실제 빌드 — 주장이 없으니 결손도 없다.
+
+        // IG-28 증거 마커 — **8칸 전부** 대응한다(R6 판은 2칸만 봤다). B4 가 이 이름으로
+        // 착지시키거나 다른 이름을 쓰면 이 표를 함께 고친다 — 어느 쪽이든 눈에 보이는 결박이다.
+        const EVIDENCE: [(&str, &str); 8] = [
+            ("lease_cas_closed", "lease_ok"),
+            ("atomic_handler", "commit_terminal_atomic"),
+            ("epoch_propagated", "propagate_epoch_to_runner"),
+            ("self_terminate", "runner_self_exit_on_stale_lease"),
+            ("boot_last_writer", "write_boot_last"),
+            ("durable_history", "persist_fenced_history"),
+            ("admission_reserved", "reserve_admission"),
+            ("confirmed_exit_observed", "release_confirmed_exit"),
+        ];
+        fn claimed(r: RunnerReadiness, field: &str) -> bool {
+            match field {
+                "lease_cas_closed" => r.lease_cas_closed,
+                "atomic_handler" => r.atomic_handler,
+                "epoch_propagated" => r.epoch_propagated,
+                "self_terminate" => r.self_terminate,
+                "boot_last_writer" => r.boot_last_writer,
+                "durable_history" => r.durable_history,
+                "admission_reserved" => r.admission_reserved,
+                _ => r.confirmed_exit_observed,
+            }
+        }
+        fn missing(r: RunnerReadiness, src: &str, ev: &[(&'static str, &str)]) -> Vec<&'static str> {
+            ev.iter()
+                .filter(|(f, m)| claimed(r, f) && !wired(m, src))
+                .map(|(f, _)| *f)
+                .collect()
+        }
+
+        let prod = format!(
+            "{}{}",
+            strip_line_comments(
+                &include_str!("boot_supervisor.rs")
+                    [..include_str!("boot_supervisor.rs").find("#[cfg(test)]").unwrap()]
+            ),
+            strip_line_comments(
+                &include_str!("handlers.rs")[..include_str!("handlers.rs").find("#[cfg(test)]").unwrap()]
+            ),
+        );
+        let ev: Vec<(&'static str, &str)> = EVIDENCE.to_vec();
+
+        // ① 실제 빌드 — 주장이 없으니(전부 false) 결손도 없다.
         assert!(
-            missing(RUNNER_READINESS, &prod).is_empty(),
-            "준비도 칸이 근거 없이 참이다: {:?}",
-            missing(RUNNER_READINESS, &prod)
+            missing(RUNNER_READINESS, &prod, &ev).is_empty(),
+            "준비도 칸이 배선 없이 참이다: {:?}",
+            missing(RUNNER_READINESS, &prod, &ev)
         );
-        // ② 합성 — 칸만 뒤집으면 반드시 적발된다(분리 배포 차단의 실체).
-        let mut a = RUNNER_READINESS;
-        a.admission_reserved = true;
-        assert_eq!(
-            missing(a, &prod),
-            vec!["admission_reserved"],
-            "예약 배선 없이 admission_reserved 주장을 통과시켰다 — fence 만 배포되는 문이 열린다"
-        );
-        let mut b = RUNNER_READINESS;
-        b.confirmed_exit_observed = true;
-        assert_eq!(
-            missing(b, &prod),
-            vec!["confirmed_exit_observed"],
-            "회수 배선 없이 confirmed_exit_observed 주장을 통과시켰다"
-        );
-        // ③ 증거가 실재하면 통과한다 — 항상 적색인 사문이 아니다.
-        let with_evidence = format!(
-            "{prod}\nfn reserve_admission() {{}}\nfn release_confirmed_exit() {{}}"
-        );
-        let mut both = RUNNER_READINESS;
-        both.admission_reserved = true;
-        both.confirmed_exit_observed = true;
+        // ② ★실제 코드에서 **양성**도 잰다 — 이것이 R6 판에 없던 절반이다.
+        //    `lease_ok` 는 이 파일에 정의되고 handlers.rs 에서 불린다. 여기서 false 가 나오면
+        //    이 핀은 '항상 미배선' 이라 어떤 칸도 영영 참이 될 수 없다(반대 방향의 무측정).
         assert!(
-            missing(both, &with_evidence).is_empty(),
-            "증거가 있는데도 막았다 — 이 핀은 B4 착지를 방해하는 것이 아니라 결박하는 것이다"
+            wired("lease_ok", &prod),
+            "실재하는 배선(lease_ok — 정의는 감독자, 호출은 handlers)을 미배선으로 읽었다 \
+             — 이 핀은 항상 적색이라 사문이다"
         );
+        // ③ ★핀 자신의 검출력 — codex 가 지목한 '빈 채 정의만' 을 실제로 잡는가.
+        let empty_only = "fn reserve_admission() {}";
+        assert!(
+            !wired("reserve_admission", empty_only),
+            "빈 채 정의만 된 함수를 배선으로 읽었다 — R6 판의 결함 그대로다"
+        );
+        let defined_but_never_called = "fn reserve_admission() { do_work(); }";
+        assert!(
+            !wired("reserve_admission", defined_but_never_called),
+            "아무도 부르지 않는 함수를 배선으로 읽었다"
+        );
+        let fully_wired = "fn reserve_admission() { do_work(); }\nfn t() { reserve_admission(); }";
+        assert!(
+            wired("reserve_admission", fully_wired),
+            "정의·호출·본문이 다 있는데 미배선으로 읽었다 — 항상 적색인 사문이다"
+        );
+        // ④ 합성 준비도 — 칸을 뒤집으면 배선 없는 것이 전부 적발된다(8칸 전수).
+        for (field, _) in EVIDENCE {
+            if field == "lease_cas_closed" {
+                continue; // 이 칸의 배선은 실재한다(② 에서 확인) — 뒤집어도 결손이 아니다
+            }
+            let mut r = RUNNER_READINESS;
+            match field {
+                "atomic_handler" => r.atomic_handler = true,
+                "epoch_propagated" => r.epoch_propagated = true,
+                "self_terminate" => r.self_terminate = true,
+                "boot_last_writer" => r.boot_last_writer = true,
+                "durable_history" => r.durable_history = true,
+                "admission_reserved" => r.admission_reserved = true,
+                _ => r.confirmed_exit_observed = true,
+            }
+            assert_eq!(
+                missing(r, &prod, &ev),
+                vec![field],
+                "{field} 를 배선 없이 참으로 주장했는데 통과했다 — 분리 배포가 열린다"
+            );
+        }
     }
 
     /// ★R5 [4] 소스핀 — 나이는 **삭제에 쓰이지 않는다**.
