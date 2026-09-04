@@ -10,6 +10,7 @@ pub mod factory_reset;
 /// 재발 차단. SEAL-1(아래 `ENV_PY_NO_BYTECODE`)이 **번들이 스스로 봉인을 깨는 것**을 막는다면,
 /// 이쪽은 **교체가 반쪽으로 끝나는 것**을 막는다(같은 사고의 다른 절반).
 pub mod app_bundle;
+pub mod declaration;
 pub mod directive_compose;
 pub mod edit_kinds;
 /// 첫기동 관문 코퍼스 — **코드 임베드 정본**(U-12 · K-1). `agents.json` 값 수정은 사용자 소유
