@@ -223,6 +223,102 @@ else:
           "이 성질 때문에 CYS_STATE_DIR 누락이 곧 본 레인 조준이 된다")
     check("4c 부서 레인만 분리된다(cys-dept- 성분)", 'part.starts_with("cys-dept-")' in body)
 
+# ── 5. 팩 내장 하네스(javis_phoenix_harness) 격리 — 실사고의 진짜 오염자 ──────────
+#    2026-09-04: 오염자는 손으로 만든 샌드박스가 아니라 **팩이 스스로 돌리는 시험 하네스**였다.
+#    `_daemon_env()` 가 `CYS_SOCKET` 만 주고 `CYS_STATE_DIR` 을 주지 않아, 레인 키가 base 인
+#    하네스 데몬이 본 레인 `delivery-base.*` 를 덮어썼다(`test_seat_revival` 이 그 경로로 돈다).
+sys.path.insert(0, BIN)
+try:
+    import javis_phoenix_harness as HARN
+except Exception as e:                      # 스큐·의존 부재는 SKIP(미측정을 통과로 접지 않는다)
+    print("SKIP 5 팩 내장 하네스 격리(import 실패: %s)" % e)
+    HARN = None
+
+if HARN is not None:
+    live_root = os.path.realpath(os.path.join(os.path.expanduser("~"), ".cys", "state"))
+    henv = HARN._daemon_env()
+    hstate = henv.get("CYS_STATE_DIR", "")
+    check("5 하네스가 CYS_STATE_DIR 을 **반드시** 설정한다", bool(hstate), repr(hstate))
+    hreal = os.path.realpath(hstate) if hstate else ""
+    check("5b 그 경로가 라이브 원장 루트 밖이다",
+          bool(hreal) and hreal != live_root and not hreal.startswith(live_root + os.sep),
+          "state=%r live=%r" % (hreal, live_root))
+    check("5c 하네스 상태가 HARN_DIR 아래에 있다(격리 자리 고정)",
+          bool(hreal) and hreal.startswith(os.path.realpath(HARN.HARN_DIR)),
+          "%r ⊄ %r" % (hreal, HARN.HARN_DIR))
+
+    # ★음성 대조(결측형): **종전 하네스**(CYS_STATE_DIR 미설정)를 그대로 재현하면 원장이
+    #   라이브 루트로 떨어진다는 것을 **경로 계산으로** 증명한다(데몬 미기동 = 재오염 0).
+    try:
+        import javis_lane as LANE
+        prev = os.environ.get("CYS_STATE_DIR")
+        os.environ.pop("CYS_STATE_DIR", None)     # 종전 하네스 상태 모사
+        try:
+            old_ledger = os.path.realpath(LANE.lane_state_path("delivery", HARN.HARN_SOCK))
+            old_epoch = os.path.realpath(LANE.lane_state_path("delivery_epoch", HARN.HARN_SOCK))
+        finally:
+            if prev is None:
+                os.environ.pop("CYS_STATE_DIR", None)
+            else:
+                os.environ["CYS_STATE_DIR"] = prev
+        check("5d 음성 대조: 종전 하네스(CYS_STATE_DIR 미설정)는 **라이브 원장**을 겨냥했다",
+              old_ledger.startswith(live_root + os.sep) and old_epoch.startswith(live_root + os.sep),
+              "ledger=%r epoch=%r" % (old_ledger, old_epoch))
+        check("5e 그 표적이 정확히 base 레인 파일이다(소켓 이름이 cys.sock 이라서)",
+              os.path.basename(old_epoch) == "delivery-base.epoch.json",
+              os.path.basename(old_epoch))
+    except Exception as e:
+        print("SKIP 5d/5e 음성 대조(javis_lane 미사용: %s)" % e)
+
+    # C5 가드가 원장 경로를 실제로 본다 — 라이브 루트를 겨냥하면 거부해야 한다.
+    try:
+        import contextlib
+        _save_state, _save_sock = HARN.HARN_STATE, HARN.HARN_SOCK
+        HARN.HARN_STATE = os.path.join(live_root, "state-probe")
+        raised = False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                HARN.guard_isolation()
+        except SystemExit:
+            raised = True
+        finally:
+            HARN.HARN_STATE, HARN.HARN_SOCK = _save_state, _save_sock
+        check("5f C5 가드가 **원장 경로**로 라이브를 잡는다(종전엔 소켓 자리만 봤다)", raised,
+              "라이브 루트를 겨냥하자 거부(SystemExit)" if raised
+              else "guard 가 통과시켰다 — 원장 축이 여전히 사각")
+    except Exception as e:
+        print("SKIP 5f C5 가드 확장(%s)" % e)
+
+    # 하네스를 import 하는 검체들이 이 격리를 **상속**한다.
+    #   ★오라클 주의: "파일에 CYS_STATE_DIR 문자열이 있는가"로 재면 오탐이다 —
+    #     `run_bootstrap_health.py` 는 자기 격리 샌드박스에 그것을 정당하게 쓰고,
+    #     이 검체 자신도 이름을 언급한다. 재는 것은 **하네스의 격리 상수를 덮어쓰는가** 다
+    #     (덮어쓰면 상속이 끊겨 그 검체만 라이브로 샐 수 있다).
+    importers, breakers = [], []
+    for f in sorted(os.listdir(SELF)):
+        if not f.endswith(".py") or f == os.path.basename(__file__):
+            continue
+        try:
+            with io.open(os.path.join(SELF, f), encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        if "javis_phoenix_harness" not in body:
+            continue
+        importers.append(f)
+        # 격리 상수 재정의 = 상속 파기 — **단, 가드를 시험하려고 복원과 함께 하는 것은 정당**하다
+        #   (`test_phoenix_w3_corruption` 이 라이브를 겨냥해 `guard_isolation()` 이 거부하는지
+        #    재고 finally 로 되돌린다 · 데몬은 띄우지 않는다). 그것까지 적색으로 만들면
+        #   **가드를 시험하는 행위 자체가 금지**되어 오라클이 목적을 배반한다.
+        reassigns = any(tok in body for tok in (".HARN_STATE =", ".HARN_DIR =", ".HARN_SOCK =",
+                                                "_daemon_env ="))
+        exercises_guard = "guard_isolation" in body and "finally:" in body
+        if reassigns and not exercises_guard:
+            breakers.append(f)
+    check("5g 하네스 소비 검체가 격리를 상속한다(격리 상수 재정의 0)",
+          not breakers, "소비=%r · 파기=%r" % (importers, breakers))
+    check("5h 하네스 소비 검체가 실재한다(무측정 방지)", bool(importers), repr(importers))
+
 if fails:
     print("\n%d FAIL: %s" % (len(fails), ", ".join(fails)))
     sys.exit(1)
