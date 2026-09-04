@@ -6356,22 +6356,33 @@ mod tests {
         );
     }
 
-    /// `collect_descendants_with_cmd_src` 가 출처를 정직하게 싣는가 — 얇은 래퍼가 종전 반환값과
-    /// 완전히 동형인지도 함께 확인한다(기존 소비자 거동 무변 증명).
+    /// `collect_descendants_with_cmd_src` 가 출처를 정직하게 싣는가 — **1회 호출**의 원소 불변식.
+    ///
+    /// ## FLAKE-GOVERNANCE-1 (2026-09-05 · master 결박 · W-C 규명)
+    /// 종전 이 검체는 `collect_descendants_with_cmd_src` 와 `collect_descendants_with_cmd` 를
+    /// **각각 한 번씩** 부르고 그 결과를 비교했다(`folded == plain`). 그런데 후자는 얇은 래퍼가
+    /// 아니라 **전자를 그대로 재호출**하고 3번째 원소만 떨구며, 그 함수는 매 호출
+    /// `argv_snapshot` 에서 **새 `System` 을 만들어 argv 를 실시간 재판독**한다. 즉 그 단언은
+    /// **live 판독 2회를 서로 비교**한 것이었다.
+    ///
+    /// 귀결이 둘이고 둘 다 나쁘다:
+    ///  · **검출력 0** — 같은 함수를 두 번 부르므로 그 단언은 구조적으로 항상 참이다. 누가
+    ///    래퍼를 다른 구현으로 바꾸는 **진짜 회귀는 잡지 못한다**.
+    ///  · **거짓 적색** — 오직 타이밍으로만 거짓이 된다. 두 호출 사이에 자손이 `exec` 하면
+    ///    (실측: `/bin/zsh -lc "…; sleep 30"` → `sleep 30`) 앞뒤 판독이 갈려 적색이 난다.
+    ///    이 저장소가 계속 잡아온 '초록인데 아무것도 안 잼' 의 **거울상**이다 — 적색인데 결함이
+    ///    아니고 그나마 잴 것도 없다.
+    ///
+    /// 그래서 축을 둘로 **분리**한다: 여기서는 **1회 호출**의 원소 불변식만 재고(경합 없음),
+    /// 래퍼 동형성은 아래 소스핀이 구조로 못박는다(타이밍 무관).
     #[cfg(unix)]
     #[test]
-    fn cmd_source_is_reported_and_wrapper_stays_identical() {
+    fn cmd_source_is_reported_for_every_element() {
         use super::CmdSource;
         let mut sys = sysinfo::System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let me = std::process::id();
         let with_src = super::collect_descendants_with_cmd_src(&sys, me);
-        let plain = super::collect_descendants_with_cmd(&sys, me);
-        let folded: Vec<(u32, String)> = with_src
-            .iter()
-            .map(|(p, c, _)| (*p, c.clone()))
-            .collect();
-        assert_eq!(folded, plain, "얇은 래퍼가 종전 반환값과 달라졌다(소비자 거동 변경)");
         for (pid, cmd, src) in &with_src {
             match src {
                 // argv 로 읽었다면 문자열이 비지 않는다(argv_snapshot 은 빈 argv 를 넣지 않는다).
@@ -6380,6 +6391,33 @@ mod tests {
                 CmdSource::NameFallback => {}
             }
         }
+    }
+
+    /// ★FLAKE-GOVERNANCE-1 ② — **래퍼 동형성은 구조로 못박는다**(in-crate 소스핀 · U-22 패턴).
+    ///
+    /// 런타임 비교로는 이 계약을 잴 수 없다(위 참조 — 두 호출이 각자 실시간 판독이라 타이밍만
+    /// 잰다). 대신 "래퍼가 승격판을 **그대로 부르고** 3번째 원소만 떨군다"는 것을 소스에서
+    /// 확인한다. 이러면 누가 래퍼를 **다른 구현으로 갈아끼우는** 진짜 회귀가 잡히고, 프로세스
+    /// 표의 경합과는 무관해진다.
+    #[test]
+    fn wrapper_delegates_to_the_promoted_collector_source_pin() {
+        let src = include_str!("governance.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("프로덕션 구간 분리 실패");
+        let at = prod
+            .find("pub fn collect_descendants_with_cmd(")
+            .expect("래퍼가 사라졌다");
+        let body = &prod[at..prod[at..].find("\n}\n").map(|i| at + i).unwrap_or(prod.len())];
+        assert!(
+            body.contains("collect_descendants_with_cmd_src(sys, root)"),
+            "래퍼가 승격판에 위임하지 않는다 — 두 구현이 갈리면 소비자 거동이 조용히 바뀐다"
+        );
+        assert!(
+            body.contains(".map(|(pid, cmd, _)| (pid, cmd))"),
+            "래퍼가 '3번째 원소만 떨군다' 형상이 아니다 — 변환이 끼면 그것이 곧 거동 변경이다"
+        );
     }
 
     /// 승격판이 argv 를 못 읽는 프로세스에서 **종전 동작으로 떨어지는가**(fail-same).
