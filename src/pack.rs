@@ -567,6 +567,46 @@ fn raise_hook_timeout_in(
     changed
 }
 
+/// `<settings>.cys-lock` 파일락 획득 — settings.json RMW 직렬화의 **단일 소유자**(G16 · H-CONC-3).
+///
+/// python preflight 는 `javis_lock.FileLock(<settings>.cys-lock)` 으로 RMW 를 직렬화한다
+/// (`javis_preflight.py::_settings_rmw`). Rust 쪽 두 writer([`merge_desired_hooks`] ·
+/// `factory_reset::strip_settings_matching`)가 락 없이 RMW 하면 preflight C28 재등록과 교차해
+/// **lost-update**(한쪽 쓰기 증발)가 난다 — 원자 쓰기는 *반쪽 파일*만 막고 read-modify-write 의
+/// 경합은 막지 못한다. 그래서 **같은 이름의 같은 락 파일**로 직렬화한다.
+///  · unix: `flock(LOCK_EX)` **블로킹**(보유 창 = 파일 1개 RMW · 수 ms) · 락 파일 열기 실패는
+///    `None`(직렬화만 포기하고 작업은 진행 — 락 실패가 치유를 막으면 잔존 훅이 영구화된다).
+///  · windows: **미획득(None) — 감수 범위 명기**. python 백엔드가 msvcrt 바이트락이라 flock 과
+///    상호 배제가 성립하지 않는다(이종 락). 파손은 원자 교체가 차단하고 최악은 lost-update 로
+///    다음 preflight C28·부트 시드가 재수렴한다. 승격 조건은 `LockFileEx` 동형 배선이다.
+///
+/// ★반환 핸들이 **살아 있는 동안만** 락이 선다(drop = 해제). 호출부는 RMW 가 끝날 때까지 이름
+/// 있는 바인딩으로 붙들어라 — `let _ = ...` 는 즉시 drop 이라 락이 아예 서지 않는다.
+///
+/// ★사본 금지: 종전엔 이 본문이 `src/bin/cys.rs` 에만 있었고 다른 두 writer 는 락이 없었다.
+/// 소유자를 여기 하나로 모아 세 writer 가 **같은 락 파일**을 잡는다.
+pub fn acquire_settings_lock(settings: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = PathBuf::from(format!("{}.cys-lock", settings.display()));
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return None;
+        }
+        Some(f)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = settings;
+        None
+    }
+}
+
 /// 소망 훅을 settings.json 에 **이벤트 단위로 멱등 병합**한다(A9).
 ///
 /// 계약(사용자 불가침 — ★W-B seed-once 교리 정합):
@@ -594,6 +634,11 @@ pub fn merge_desired_hooks(
             settings_path.display()
         ));
     }
+    // ★H-CONC-3: read → modify → write 전 구간을 공용 락으로 직렬화한다(python preflight 와
+    //   **같은** `<settings>.cys-lock`). 원자 쓰기는 반쪽 파일만 막는다 — 두 writer 가 같은
+    //   스냅샷을 읽어 각자 append 하면 나중 쓰기가 앞 append 를 통째로 지운다(lost update).
+    //   바인딩 이름을 `_lock` 으로 두는 것이 계약이다(`_` 하나면 즉시 drop = 락 미성립).
+    let _lock = acquire_settings_lock(settings_path);
     let existed = settings_path.exists();
     let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
         Ok(s) if s.trim().is_empty() => serde_json::json!({}),
@@ -2385,9 +2430,43 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
     let fname = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
-    let tmp = parent.join(format!(".{fname}.tmp.{}", std::process::id()));
+    // ★H-CONC-3(2026-09-05): tmp 이름은 **호출마다 유일**해야 한다.
+    //   종전 이름은 `.{fname}.tmp.{pid}` 로 **pid 당 하나로 고정**이었다. 프로세스가 다르면
+    //   이름이 갈려 안전하므로 다중 **프로세스** 하네스(6 writer)는 파손 0 을 냈지만, 같은
+    //   프로세스의 두 호출(데몬의 연결별 tokio task · GUI setup 의 병행 시드)은 **같은 tmp
+    //   inode** 를 공유했다. `File::create` 는 O_TRUNC 라 뒤 호출이 앞 호출의 본문을 0 으로
+    //   자르고 짧은 문서를 쓰며, 앞 호출이 자기 오프셋(=긴 문서 끝)에서 꼬리를 마저 쓰면
+    //   **짧은 문서 + 구멍 + 긴 꼬리**가 rename 된다 → 소비자는 `Extra data: line 1 column NN`
+    //   으로 죽는다(원자 교체는 *프로세스 간* 파손만 막지 이 축을 막지 못한다).
+    //   `lib.rs::atomic_write_bytes`(A13)가 이미 같은 계약을 문서화해 두었으므로 이름 생성기
+    //   `crate::tmp_path_for` 를 **공유**한다 — 사본을 만들지 않는다(이 저장소가 반복해서 맞은
+    //   것이 사본 드리프트다).
+    let (tmp, mut f) = {
+        let mut last: Option<std::io::Error> = None;
+        let mut got: Option<(PathBuf, std::fs::File)> = None;
+        for _ in 0..crate::TMP_NAME_TRIES {
+            let cand = crate::tmp_path_for(parent, fname);
+            match create_tmp_with_mode(&cand, mode) {
+                Ok(f) => {
+                    got = Some((cand, f));
+                    break;
+                }
+                // 이름 충돌은 **다음 후보로** — 남의 tmp 를 지우고 열지 않는다(진행 중인 남의
+                // 쓰기를 파손하는 경로다 · A13 주석의 같은 금지).
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        match got {
+            Some(v) => v,
+            None => {
+                return Err(last.unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "tmp 이름 고갈")
+                }))
+            }
+        }
+    };
     let res = (|| -> std::io::Result<()> {
-        let mut f = create_tmp_with_mode(&tmp, mode)?;
         f.write_all(bytes)?;
         f.sync_all()?; // 파일 본문 fsync (rename 전)
         std::fs::rename(&tmp, path)?; // 원자 교체
@@ -2409,26 +2488,26 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
 }
 
 /// tmp 파일 생성 — `mode=Some(m)` 이면 **생성 시점부터** 그 퍼미션이다(사후 chmod 창 0).
-/// `mode=None` 이면 `File::create` 와 동치(종전 경로 무변경).
+/// `mode=None` 이면 종전과 같은 기본 퍼미션(umask 적용)이다.
+///
+/// ★H-CONC-3: 두 갈래 모두 `create_new`(O_EXCL)다 — 커널이 이름 유일성을 보증하므로 호출부가
+/// 충돌을 **관측**해 다음 후보로 넘어갈 수 있다. `create`+truncate 는 충돌을 조용히 삼켜 두
+/// writer 가 같은 inode 에 겹쳐 쓴다(그것이 이 결함의 기제였다). 잔여 tmp 를 지우고 여는 종전
+/// 경로도 함께 사라진다 — 그것은 **남의 진행 중 쓰기**를 파손할 수 있었다.
 #[cfg(unix)]
 fn create_tmp_with_mode(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
-    let Some(m) = mode else {
-        return std::fs::File::create(tmp);
-    };
     use std::os::unix::fs::OpenOptionsExt;
-    // 잔여 tmp 가 있으면 `.mode()` 는 적용되지 않는다(생성 시에만 유효) — 먼저 치운다.
-    let _ = std::fs::remove_file(tmp);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(m)
-        .open(tmp)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    if let Some(m) = mode {
+        opts.mode(m);
+    }
+    opts.open(tmp)
 }
 
 #[cfg(not(unix))]
 fn create_tmp_with_mode(tmp: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::File> {
-    std::fs::File::create(tmp)
+    std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
 }
 
 /// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
@@ -5561,10 +5640,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
-    /// ★성찰 차단 수리 2R-4 핀 ⓒ(v2 §4 ④ pristine 검증형 승격): pristine 기록 실패 주입
-    /// (write_atomic 의 tmp 슬롯 `.{fname}.tmp.{pid}` 자리 디렉터리 점유 — 플랫폼 공통 실패)
-    /// 시 ④ 를 중단하고 ⑤ healed 폴백으로 강등 — .user=병합본(ours 원본은 캡처) ·
+    /// ★성찰 차단 수리 2R-4 핀 ⓒ(v2 §4 ④ pristine 검증형 승격): pristine 기록 실패 주입 시
+    /// ④ 를 중단하고 ⑤ healed 폴백으로 강등 — .user=병합본(ours 원본은 캡처) ·
     /// conflicted{reason:pristine-write-failed} · pristine 미전진을 박제.
+    ///
+    /// ## ★주입 기제 교체(2026-09-05 · H-CONC-3)
+    /// 종전 주입은 "`write_atomic` 의 tmp 슬롯 `.{fname}.tmp.{pid}` 자리를 디렉터리로 점유"였다.
+    /// 그 주입은 **결함 자체에 기대고 있었다** — tmp 이름이 pid 고정이라 미리 알 수 있었던 것이
+    /// 곧 H-CONC-3 의 근인이다. 이름이 호출마다 유일해지자 점유는 아무것도 막지 못하고 ④ 가
+    /// 성공해 이 핀이 조용히 무력화됐다(실측: 이 검체가 유일하게 적색으로 그것을 알렸다).
+    /// 그래서 **이름에 의존하지 않는** 기제로 바꾼다:
+    ///  · unix — 부모 디렉터리를 `0o555` 로. tmp 생성 자체가 `EACCES` 라 이름과 무관하다.
+    ///  · windows — 대상 파일을 읽기전용으로. `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` 이
+    ///    읽기전용 대상을 거부한다는 문서 근거로 배선했다. **이 갈래는 unix 기계에서 미검증**
+    ///    이므로, Windows 러너에서 적색이 나면 그것은 결함이 아니라 이 주입의 재선택 신호다.
+    /// 두 갈래 모두 **기존 pristine 파일을 읽을 수 있게** 남긴다(아래 '미전진' 단언 유지).
     #[test]
     fn merge3_pristine_write_failure_downgrades_to_conflicted() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -5581,13 +5671,28 @@ mod tests {
         let ours = "head-old\ncommon body\nuser-tail-delta\n";
         let merged = "head-new\ncommon body\nuser-tail-delta\n";
         seed_merge3_shape(&pd, rel, ours, base);
-        // 주입: pristine write_atomic 의 tmp 경로를 디렉터리로 점유(생성 실패 결정론).
-        let tmp_slot = pd
-            .join(PRISTINE_DIR)
-            .join("skills/wpri")
-            .join(format!(".SKILL.md.tmp.{}", std::process::id()));
-        std::fs::create_dir_all(&tmp_slot).unwrap();
-        install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
+        // 주입(이름 비의존 · 위 머리말 참조) — 결정론으로 pristine 기록만 실패시킨다.
+        #[cfg(unix)]
+        let restore = {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = pd.join(PRISTINE_DIR).join("skills/wpri");
+            let prev = std::fs::metadata(&dir).unwrap().permissions();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            (dir, prev)
+        };
+        #[cfg(not(unix))]
+        let restore = {
+            let f = pd.join(PRISTINE_DIR).join(rel);
+            let prev = std::fs::metadata(&f).unwrap().permissions();
+            let mut ro = prev.clone();
+            ro.set_readonly(true);
+            std::fs::set_permissions(&f, ro).unwrap();
+            (f, prev)
+        };
+        let installed = install_from_iter([(rel, theirs)], false, "1.1.0", false, None);
+        // 단언 **전에** 원복한다 — 패닉으로 빠져나가도 읽기전용 잔재가 다음 런을 막지 않게.
+        std::fs::set_permissions(&restore.0, restore.1).unwrap();
+        installed.unwrap();
         assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
             "[pristine-fail] disk=vendor 보증(⑤ 강등 후 공용 레인)");
         assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
@@ -8944,6 +9049,10 @@ mod tests {
                 0o600
             );
             // 잔여 tmp 가 있어도 목표 mode 로 만들어진다(`.mode()` 는 생성 시에만 유효).
+            // ★H-CONC-3 이후 계약 갱신: 종전엔 잔여 tmp 를 **지우고** 그 자리를 열어서 mode 를
+            //   맞췄다. 지금은 이름이 호출마다 유일하고 O_EXCL 이라 그 자리를 아예 건드리지
+            //   않는다 — 남의 tmp 를 지우는 것은 **진행 중인 남의 쓰기를 파손**하는 경로였다.
+            //   그래서 mode 단언에 '남의 tmp 무접촉' 단언을 한 줄 더 건다.
             let c = td.join("stale.txt");
             let tmp = td.join(format!(".stale.txt.tmp.{}", std::process::id()));
             std::fs::write(&tmp, b"junk").unwrap();
@@ -8953,6 +9062,11 @@ mod tests {
                 std::fs::metadata(&c).unwrap().permissions().mode() & 0o777,
                 0o600,
                 "잔여 tmp 때문에 퍼미션이 넓어졌다"
+            );
+            assert_eq!(
+                std::fs::read(&tmp).unwrap(),
+                b"junk",
+                "남의 tmp 를 지우거나 덮어썼다 — 진행 중인 남의 쓰기를 파손하는 경로다"
             );
         }
         let _ = std::fs::remove_dir_all(&td);
@@ -8976,5 +9090,194 @@ mod tests {
         assert!(p.added.is_empty(), "설치 시점 호출부가 무언가를 쓰려 한다: {:?}", p.added);
         // 스위치 기본값도 꺼짐이다.
         assert!(!first_run_seed_enabled_from(None, false));
+    }
+
+    /// 리포 관례(위 검체들과 동일): temp_dir + 태그·pid — 시작 시 청소, 종료 후 잔존 허용.
+    fn conc_dir(tag: &str) -> PathBuf {
+        let td = std::env::temp_dir().join(format!("cys-conc3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        td
+    }
+
+    /// ★H-CONC-3 ①(재현 프로브 · 2026-09-05): **같은 프로세스**의 두 writer 가 원자 쓰기를
+    /// 겹쳐도 최종 파일은 언제나 **둘 중 하나의 온전한 문서**다.
+    ///
+    /// ## 무엇이 결함이었나
+    /// [`write_atomic_mode`] 의 tmp 이름이 `.{fname}.tmp.{pid}` 로 **pid 당 하나**였다. 프로세스가
+    /// 다르면 이름이 갈리므로 다중 **프로세스** 하네스(python 6 writer × 12 iter)는 파손 0 을
+    /// 냈다 — 그래서 이 결함은 그 축에서 **보이지 않았다**. 같은 프로세스의 두 호출만
+    /// `File::create`(O_TRUNC)로 **같은 inode** 를 공유해 서로를 잘랐고, 소비자가 본 증상이
+    /// `Extra data: line 1 column NN` 이다.
+    ///
+    /// ## 왜 결정론이어야 하는가
+    /// 재현을 스레드 스케줄에 맡기면 CI 에서 간헐 적색이 되고, 그 간헐성이 바로 IG-18 판정을
+    /// 흐리던 것이다. 그래서 ⓐ는 기제를 **핸들 인터리브로 직접** 재현한다(매 실행 재현).
+    #[test]
+    fn h_conc_3_same_process_writers_never_tear_the_file() {
+        let td = conc_dir("tear");
+        let target = td.join("settings.json");
+        let long = serde_json::to_vec(&serde_json::json!({"who": "long", "pad": "x".repeat(4000)}))
+            .unwrap();
+        let short = serde_json::to_vec(&serde_json::json!({"who": "short"})).unwrap();
+
+        // ⓐ 음성 대조군(결정론) — 구 규칙(고정 tmp 이름 + O_TRUNC)의 기제를 그 자리에 재현한다.
+        //    이것이 파손을 못 내면 아래 ⓑ의 GREEN 은 **검출력 미확인**이다(측정 실패).
+        //
+        //    ★W-C 17차 반증가능 예측(2026-09-05)의 검증도 여기서 한다: daemon 레인은 실패 col 이
+        //    두 런 모두 **44 고정**인데 release 레인은 매번 달랐다(52·44·28). 기전이 이것이라면
+        //    col 은 우연이 아니라 **먼저 착지한 짧은 문서의 길이 + 1** 이어야 한다 — 레인마다
+        //    겹치는 문서 쌍이 고정이면 col 도 고정되고, 변하면 col 도 변한다. 아래가 그 예측을
+        //    두 단언으로 건다(일반식 하나 + daemon 관측값 44 직접 재현 하나).
+        let tear_once = |name: &str, long: &[u8], short: &[u8]| -> serde_json::Error {
+            use std::io::Write;
+            let dst = td.join(name);
+            let fixed = td.join(format!(".{name}.tmp.{}", std::process::id()));
+            let mut a = std::fs::File::create(&fixed).unwrap(); // writer A 가 tmp 를 연다
+            a.write_all(&long[..long.len() / 2]).unwrap(); //      A 가 앞 절반을 쓴다
+            let mut b = std::fs::File::create(&fixed).unwrap(); // B 가 **같은 이름**을 연다(truncate)
+            b.write_all(short).unwrap(); //                       B 의 짧은 문서가 앞을 덮는다
+            a.write_all(&long[long.len() / 2..]).unwrap(); //      A 는 자기 오프셋에서 꼬리를 마저 쓴다
+            std::fs::rename(&fixed, &dst).unwrap(); //             먼저 끝난 쪽이 교체한다
+            let torn = std::fs::read(&dst).unwrap();
+            assert!(torn.len() > short.len(), "짧은 문서 뒤 꼬리가 없다 — 기제 미재현");
+            serde_json::from_slice::<serde_json::Value>(&torn)
+                .expect_err("구 규칙 재현이 파손을 못 냈다 — 이 검체는 검출력이 없다(측정 실패)")
+        };
+        let err = tear_once("settings.json", &long, &short);
+        assert!(
+            err.to_string().contains("trailing characters"),
+            "재현된 파손이 기대한 계급이 아니다(python 소비자의 Extra data 대응): {err}"
+        );
+        assert_eq!(
+            err.column(),
+            short.len() + 1,
+            "col 이 '먼저 착지한 짧은 문서 길이 + 1' 이 아니다 — 기전 해석이 틀렸다"
+        );
+        // daemon 레인 관측값 직접 재현: 43바이트 문서가 먼저 착지하면 col 은 정확히 44 다.
+        let short43 = format!("{{\"pad\":\"{}\"}}", "x".repeat(33)).into_bytes();
+        assert_eq!(short43.len(), 43, "검체 자기검증 실패 — 43바이트가 아니다");
+        assert_eq!(
+            tear_once("daemon-col44.json", &long, &short43).column(),
+            44,
+            "daemon 레인 관측 col 44 를 결정론 재현하지 못했다 — 기전 재규명 필요"
+        );
+
+        // ⓑ 현행 계약 — 2스레드 경합 중 **어느 시점에 읽어도** 둘 중 하나의 온전한 문서다.
+        //    오라클(파싱·동일성)의 검출력은 ⓐ가 이미 증명했다.
+        std::fs::write(&target, &long).unwrap();
+        let iters = 120usize;
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let tears = std::sync::Mutex::new(Vec::<String>::new());
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                for _ in 0..iters {
+                    write_atomic(&target, &long).unwrap();
+                }
+            });
+            sc.spawn(|| {
+                for _ in 0..iters {
+                    write_atomic(&target, &short).unwrap();
+                }
+            });
+            sc.spawn(|| {
+                for _ in 0..iters * 4 {
+                    let Ok(cur) = std::fs::read(&target) else {
+                        continue;
+                    };
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cur != long && cur != short {
+                        tears.lock().unwrap().push(format!(
+                            "{}B: {}",
+                            cur.len(),
+                            String::from_utf8_lossy(&cur[..cur.len().min(60)])
+                        ));
+                    }
+                }
+            });
+        });
+        let n = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(n > 0, "판독 0회 — 측정 실패다(RAN=0 는 '미적발'이 아니다)");
+        let t = tears.lock().unwrap();
+        assert!(
+            t.is_empty(),
+            "원자 쓰기가 찢겼다 {}건 / 판독 {n}회: {:?}",
+            t.len(),
+            &t[..t.len().min(3)]
+        );
+
+        // ⓒ 잔재 0 — tmp 는 rename 으로 사라지고 pid 고정 이름은 더 이상 만들어지지 않는다.
+        let left: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-") || n.contains(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "tmp 잔재: {left:?}");
+    }
+
+    /// ★H-CONC-3 ②(공용 락): [`merge_desired_hooks`] 가 python preflight 와 **같은**
+    /// `<settings>.cys-lock` 을 잡아 read-modify-write 를 직렬화한다.
+    ///
+    /// 원자 쓰기는 *반쪽 파일*만 막는다 — 두 writer 가 같은 스냅샷을 읽어 각자 append 하면
+    /// 나중 쓰기가 앞 append 를 통째로 지운다(lost update). 그 축은 락으로만 닫힌다.
+    ///
+    /// 오라클: 락을 **먼저 잡아 붙들고 있으면** 병합기는 해제 전에 끝날 수 없다. 같은 창에서
+    /// 락을 안 잡는 RMW 를 먼저 재어 이 시간 오라클이 '락 없음'을 실제로 구별함을 보인다 —
+    /// 구별 못 하는 오라클로 얻은 GREEN 은 아무것도 증명하지 않는다.
+    #[test]
+    fn h_conc_3_settings_writers_share_the_preflight_lock() {
+        use std::time::{Duration, Instant};
+        let td = conc_dir("lock");
+        let pack = td.join("pack");
+        let settings = td.join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{\"theme\":\"dark\"}").unwrap();
+        let hold = Duration::from_millis(150);
+
+        let guard = acquire_settings_lock(&settings).expect("공용 락을 잡지 못했다");
+        let t0 = Instant::now();
+
+        // 음성 대조군 — 락을 잡지 않는 RMW 는 보유 창 안에서 끝난다(오라클이 '락 없음'을 구별한다).
+        let s2 = settings.clone();
+        let naive_took = std::thread::spawn(move || {
+            let raw = std::fs::read_to_string(&s2).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            v["naive"] = serde_json::json!(1);
+            write_atomic(&s2, serde_json::to_string(&v).unwrap().as_bytes()).unwrap();
+            t0.elapsed()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            naive_took < hold,
+            "시간 오라클 무효 — 락 없는 RMW 도 보유 창을 넘겼다({naive_took:?} ≥ {hold:?})"
+        );
+
+        // 본 판정 — 병합기는 같은 락을 잡으므로 해제 전에 끝날 수 없다.
+        let s3 = settings.clone();
+        let p3 = pack.clone();
+        let merged = std::thread::spawn(move || {
+            merge_desired_hooks(&s3, &p3, &AWAKENING_HOOKS).unwrap();
+            t0.elapsed()
+        });
+        std::thread::sleep(hold);
+        drop(guard);
+        let merge_took = merged.join().unwrap();
+        assert!(
+            merge_took >= hold,
+            "병합기가 공용 락을 잡지 않았다 — 보유 중에 통과했다({merge_took:?} < {hold:?})"
+        );
+
+        // 대기만 하고 실패하면 무의미하다 — 해제 후 실제로 병합돼야 한다.
+        assert!(
+            verify_desired_hooks_registered(&settings, &pack, &AWAKENING_HOOKS).is_empty(),
+            "락 대기 후 병합이 적용되지 않았다"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(after["theme"], "dark", "사용자 키 소실");
+        // 락 보유 중 먼저 착지한 쓰기가 병합기의 RMW 에 삼켜지지 않았다(lost update 0 표식).
+        assert_eq!(after["naive"], 1, "선행 쓰기가 병합기 RMW 에 지워졌다(lost update)");
     }
 }

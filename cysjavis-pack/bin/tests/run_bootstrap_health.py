@@ -2667,10 +2667,19 @@ def h_conc_3():
     """★실측 정정(N13 · 2026-08-24): 이 검체는 settings.json 을 **3-writer** 대상이라고 적고
     있었다. 전수로 세면 **5**다 — preflight `_settings_rmw`(락 O) · `javis_guard_register.py`
     `_atomic_write`(락 X) · `javis_dept_migrate.py` `_register_hook`(락 X · 고정 `.tmp`) ·
-    `src/pack.rs::merge_desired_hooks`(락 X) · `src/factory_reset.rs::strip_settings_matching`
-    (락 X). 근거·잔여 위험은 `javis_preflight.py` 의 `_settings_rmw` 머리 주석이 정본이다.
+    `src/pack.rs::merge_desired_hooks`(**락 O** · 2026-09-05) ·
+    `src/factory_reset.rs::strip_settings_matching`(**락 O** · 2026-09-05).
+    근거·잔여 위험은 `javis_preflight.py` 의 `_settings_rmw` 머리 주석이 정본이다.
     이 검체가 실측하는 것은 그중 **preflight 레인**(등록기 4종 + 공용 락)이며, 아래 ⓑ가
-    Rust 두 writer 의 원자 쓰기를 소스핀으로 대조한다.
+    Rust 두 writer 의 원자 쓰기·유일 tmp·공용 락을 소스핀으로 대조한다.
+
+    ★H-CONC-3 daemon 레인 근인(W-B 실측 2026-09-05 · 수리 완료): `pack::write_atomic_mode` 의
+    tmp 이름이 `.<파일명>.tmp.<pid>` 로 **pid 당 하나로 고정**이었다. 프로세스가 다르면 이름이
+    갈리므로 위 ⓒ의 **6 프로세스** 경합은 파손 0 을 냈고 — 그래서 이 축에서는 보이지 않았다 —
+    같은 프로세스의 두 호출(데몬의 연결별 tokio task)만 `File::create`(O_TRUNC)로 같은 inode 를
+    공유해 서로를 잘랐다. 실패 col 이 daemon 레인에서 **44 고정**이던 것(W-C 17차 관측)은
+    `col = 먼저 착지한 짧은 문서 길이 + 1` 이기 때문이며, Rust 검체
+    `h_conc_3_same_process_writers_never_tear_the_file` 이 col 44 를 결정론 재현한다.
 
     G16: preflight 의 네 등록기가 각자 `open(path + ".tmp")` → `os.replace` 를 재구현했고
     tmp 이름이 **고정**이었다 — 동시 writer 가 서로의 임시 파일에 써서 교차 파손(반쪽 JSON)을 만들고,
@@ -2702,7 +2711,39 @@ def h_conc_3():
     cy = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("std::fs::write(settings_path" not in _code_lines(cy),
          "init-pack 이 비원자 write 로 되돌아갔다(다중 writer 파손 축 복귀)")
-    notes.append("Rust 시드 원자 쓰기")
+    # ★유일 tmp — pid 고정 이름이 되돌아오면 같은 프로세스 두 writer 가 같은 inode 를 공유한다.
+    #   ★검사 범위를 **함수 본문**으로 좁힌다: 파일 전체로 보면 재현 프로브(음성 대조군)가 구
+    #   규칙 문자열을 일부러 갖고 있어 영구 적색이 된다(대조군을 결함으로 오판하는 자충수).
+    wi = pk.find("pub fn write_atomic_mode(")
+    need(wi > 0, "Rust 원자 쓰기 소유자(write_atomic_mode)를 못 찾았다")
+    wbody = pk[wi:pk.find("\n}\n", wi)]
+    need('.tmp.{}", std::process::id()' not in wbody,
+         "pid 고정 tmp 이름이 되돌아왔다 — 같은 프로세스 두 writer 가 같은 inode 를 공유한다")
+    need("crate::tmp_path_for(" in wbody,
+         "호출마다 유일한 tmp 이름 생성기(A13 공용)를 쓰지 않는다")
+    ci = pk.find("fn create_tmp_with_mode(")
+    need(ci > 0, "tmp 생성기를 못 찾았다")
+    cbody = pk[ci:pk.find("\n}\n", ci)]
+    need("create_new(true)" in cbody,
+         "tmp 생성이 O_EXCL 이 아니다 — 이름 충돌을 조용히 삼켜 겹쳐 쓴다")
+    # ★공용 락 — 원자 쓰기는 반쪽 파일만 막고 lost update 는 락으로만 닫힌다.
+    need("acquire_settings_lock(settings_path)" in mbody,
+         "Rust 병합기가 공용 락(<settings>.cys-lock)을 잡지 않는다(lost update 축)")
+    need("cys-lock" in _code_lines(pk),
+         "공용 락 소유자가 pack.rs 에 없다(사본 분화 — cys.rs 단독 구현으로 회귀)")
+    fr = _repo_file(os.path.join("src", "factory_reset.rs"))
+    si = fr.find("fn strip_settings_matching(")
+    need(si > 0, "Rust 제거기를 못 찾았다")
+    sbody = fr[si:fr.find("\n}\n", si)]
+    need("acquire_settings_lock(settings_path)" in sbody,
+         "Rust 제거기가 공용 락을 잡지 않는다(preflight C28 재등록과 교차해 lost update)")
+    # ★중첩 금지 — flock 은 **open file description** 단위라 같은 프로세스가 같은 파일에 두 번
+    #   걸면 영구 교착이다(실측 확인). 락 소유자를 말단 writer 로 옮긴 뒤 호출부(cys.rs 의
+    #   hooks-prune·doctor --fix 3곳)가 바깥에서 또 잡던 것을 걷어냈다 — 되돌아오면 `cys doctor
+    #   --fix` 가 그 자리에서 멈춘다(사용자 대면 치유 경로의 hang).
+    need("_lock = acquire_settings_lock" not in _code_lines(cy),
+         "cys.rs 가 말단 writer 바깥에서 같은 락을 다시 잡는다 — 중첩 flock = 자기교착")
+    notes.append("Rust 시드 원자 쓰기 · 유일 tmp(O_EXCL) · 공용 락 2 writer")
     # ⓒ 실측 경합: 6 writer × 12 iter 동시 실행 → 파손 0 · lost update 0 · 훅 6종 전원 등록
     pairs = [("session-start.sh", "SessionStart"), ("role-bootstrap.sh", "UserPromptSubmit"),
              ("save-state.sh", "Stop"), ("save-state.sh", "PreCompact"),

@@ -2121,6 +2121,14 @@ fn strip_settings_matching(
     // 심링크 규약은 탐지판과 공용 단일 판정(resolve_symlinked_settings doc 참조).
     let target = resolve_symlinked_settings(settings_path, cys_base)?;
     let settings_path = target.as_path();
+    // ★H-CONC-3: RMW 전 구간을 python preflight·`pack::merge_desired_hooks` 와 **같은 락 파일**로
+    //   직렬화한다. 파일이 없으면 할 일도 없으므로 락 파일을 만들지 않는다 — 흔적을 지우러 온
+    //   경로가 새 잔재(`settings.json.cys-lock`)를 남기면 자기모순이다(위 stale 리포터가 그것을
+    //   센다). 바인딩 이름은 `_lock`(`_` 하나면 즉시 drop = 락 미성립).
+    let _lock = settings_path
+        .exists()
+        .then(|| crate::pack::acquire_settings_lock(settings_path))
+        .flatten();
     let raw = match std::fs::read_to_string(settings_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),

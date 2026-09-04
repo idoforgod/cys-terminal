@@ -4940,41 +4940,6 @@ fn hooks_prune_gate_refused(pack: &std::path::Path, allow_base: bool) -> bool {
     cys::pack::dept_scope_of(pack).is_none() && !allow_base
 }
 
-/// `<settings>.cys-lock` 파일락 획득(G16 3-writer 직렬화)[MAJOR 명기].
-///
-/// python preflight 는 settings.json RMW 를 파일별 락 `<settings>.cys-lock`(javis_lock.FileLock ·
-/// unix=flock/win=msvcrt)으로 직렬화한다(javis_preflight.py G16 계약). Rust 신규 작성자
-/// (hooks-prune·doctor --fix 의 잔존 제거)가 락 없이 RMW 하면 C28 재등록과 교차해 lost-update
-/// (한쪽 쓰기 증발)가 난다 — 같은 락 파일로 직렬화한다.
-///  · unix: flock(LOCK_EX) **블로킹**(보유 창 = 파일 1개 RMW, 수 ms) · 락 파일 열기 실패 = None
-///    (직렬화만 포기하고 치유는 진행 — write_atomic 이 파손은 이미 차단, 락 실패가 치유를 막으면
-///    잔존 훅이 영구화된다).
-///  · windows: **미획득(None) — 감수 범위 명기**: python 쪽 백엔드가 msvcrt 바이트락이라 flock 과
-///    상호 배제가 성립하지 않고(이종 락), Windows 부서 churn 표면은 현 릴리스에 없다. 파손은
-///    원자 교체가 차단하며 최악은 RMW lost-update(다음 preflight C28/부트 시드가 재수렴). 승격 시
-///    LockFileEx 동형 배선이 조건이다.
-fn acquire_settings_lock(settings: &std::path::Path) -> Option<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let lock_path = std::path::PathBuf::from(format!("{}.cys-lock", settings.display()));
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&lock_path)
-            .ok()?;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return None;
-        }
-        Some(f)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = settings;
-        None
-    }
-}
-
 /// hooks-prune 의 대상 settings 목록 — 공용 격리 config(팩 부모/claude · 결함2 의 오염 표면) +
 /// 개인 프로필(~/.claude*) 전부. 부서 자신의 acctdir 는 대상이 아니다(그곳의 훅은 그 부서의
 /// 정당한 시드 — teardown 후엔 아무도 그 dir 로 claude 를 띄우지 않으므로 무해 잔존).
@@ -5022,8 +4987,10 @@ fn run_hooks_prune(pack_dir_arg: &str, dry_run: bool, allow_base: bool) -> i32 {
         let res = if dry_run {
             cys::factory_reset::hooks_pointing_into_pack(&t, &pack)
         } else {
-            // 락은 파일별 · RMW 구간만 보유(스코프 drop 해제). 규약·감수 범위는 acquire 문서 참조.
-            let _lock = acquire_settings_lock(&t);
+            // ★H-CONC-3: 락은 이제 **말단 writer**(`factory_reset::strip_settings_matching`)가
+            //   RMW 구간에 직접 잡는다. 여기서 또 잡으면 같은 프로세스가 같은 파일에 flock 을
+            //   두 번 거는 꼴이라 **영구 교착**이다(실측: 같은 프로세스의 두 fd 는 서로 충돌한다
+            //   — flock 은 open file description 단위이지 프로세스 단위가 아니다).
             cys::factory_reset::strip_hooks_pointing_into_pack(&t, &pack, None)
         };
         match res {
@@ -5403,8 +5370,8 @@ fn diag_hook_dept(ctx: &DoctorCtx, fix: bool, acct_env: Option<&str>) -> DiagIte
         if let Some(parent) = settings.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // G16 3-writer 직렬화 — preflight C28·hooks-prune 과 같은 락 파일(<settings>.cys-lock).
-        let _lock = acquire_settings_lock(&settings);
+        // ★H-CONC-3: G16 직렬화는 말단 writer(`pack::merge_desired_hooks`)가 같은 락 파일로
+        //   수행한다 — 여기서 다시 잡으면 자기교착이다(위 hooks-prune 과 같은 이유).
         return match install_claude_hook(&settings.to_string_lossy(), &ctx.pack_dir) {
             Ok(_) => DiagItem {
                 name: "hook",
@@ -5555,7 +5522,7 @@ fn diag_dept_hook_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                 continue;
             }
         }
-        let _lock = acquire_settings_lock(t);
+        // ★H-CONC-3: 락은 말단 writer 소유 — 여기서 다시 잡으면 자기교착이다.
         match cys::factory_reset::strip_hooks_pointing_into_pack(t, pack, None) {
             Ok(labels) => removed.push(format!("{}: {}", t.display(), labels.join("·"))),
             Err(e) => errs.push(format!("{}: {e}", t.display())),
