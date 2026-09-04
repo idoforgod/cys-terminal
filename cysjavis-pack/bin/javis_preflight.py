@@ -345,6 +345,21 @@ SELFCORR_HOOKS = [
     ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
 ]
 
+# ★훅 **본체** — 실재 전용(등록 대상 아님 · 부트 v2 A2 분할 2026-09-04).
+#   `role-bootstrap.sh` 는 자기완결 **런처**이고 실제 부트 본체는 `role-bootstrap-legacy.sh` 다.
+#   본체가 없으면 런처는 고지 1줄을 내고 `exit 0` 한다 — 즉 **훅은 정상 종료하는데 부트만 안
+#   난다**. 종전에는 어떤 preflight 축도 본체 실재를 재지 않아 이 상태가 **무관측**이었다
+#   (부서 팩 복제 목록 결손·부분 배포에서 확정적으로 재현되는 갈래다).
+#   ★`SELFCORR_HOOKS` 에 넣으면 안 되는 이유: 그 목록은 C28 이 settings.json 에 **등록**하는
+#     집합이다. 본체를 등록하면 같은 이벤트에 훅이 둘(런처+본체) 달려 선언 1건이 두 번 처리되고,
+#     본체는 런처가 넘겨주던 `$1` 없이 직접 불려 stdin 계약으로 되돌아간다. 그래서 **실재만**
+#     요구하는 목록을 따로 둔다.
+#   티어: owner 가 각성 훅(`AWAKENING_SCRIPTS`)이면 **FAIL**(C08·각성 훅 미등록과 대칭) —
+#   본체 부재는 등록 결손과 **같은 결과**(부트 발화 0)를 낳으므로 보고 크기도 같아야 한다.
+HOOK_BODY_FILES = [
+    (os.path.join("hooks", "role-bootstrap-legacy.sh"), "role-bootstrap.sh"),
+]
+
 # ★소망상태 매니페스트의 파이썬 측 — **각성 티어**(awakening tier · A9 · W3).
 #   "없으면 부트 발화 자체가 사라지는" 훅 집합이다: SessionStart(=/clear 후 지침 재주입) +
 #   UserPromptSubmit(=마스터 선언 부트 발화). Rust 측 정본은 `src/pack.rs AWAKENING_HOOKS` 이고
@@ -3744,7 +3759,9 @@ class Preflight:
         cid = "C28.self-correction"
         if self.skipped(cid):
             return
-        fixed, warns = [], []
+        # ★`fails` 를 여기서 만든다 — (a) 실재 검사에서도 **각성 티어 FAIL** 이 나올 수 있다
+        #   (훅 본체 부재). 종전엔 (b) 등록 루프 직전에 만들어 (a)는 WARN 밖에 못 냈다.
+        fixed, warns, fails = [], [], []
         # (a) hook 스크립트 4종 + javis_reflect.py 존재·실행권한
         rels = [os.path.join("hooks", s) for s, _ in SELFCORR_HOOKS]
         rels.append(os.path.join("bin", "javis_reflect.py"))
@@ -3761,17 +3778,52 @@ class Preflight:
                 if not mode & stat.S_IXUSR and self.fix:
                     os.chmod(p, mode | 0o755)
                     fixed.append("%s 실행권한" % os.path.basename(p))
+        # (a-2) ★훅 **본체** 실재(부트 v2 A2 · 등록 대상 아님 — 위 HOOK_BODY_FILES 주석 참조)
+        for _rel, _owner in HOOK_BODY_FILES:
+            _p = os.path.join(pack_dir(), _rel)
+            if not os.path.isfile(_p):
+                if self.fix and self.repair_via_init_pack() and os.path.isfile(_p):
+                    pass
+                else:
+                    (fails if _owner in AWAKENING_SCRIPTS else warns).append(
+                        "%s 부재 — 훅 본체가 없으면 `%s`(런처)는 고지 1줄만 내고 **부트를 발화하지 "
+                        "않는다**(훅 자체는 exit 0 이라 무관측이었다). init-pack 재실행·pack-update "
+                        "로 복구하라" % (_rel, _owner))
+                    continue
+            if os.name == "posix":
+                _mode = os.stat(_p).st_mode
+                if not _mode & stat.S_IXUSR and self.fix:
+                    os.chmod(_p, _mode | 0o755)
+                    fixed.append("%s 실행권한" % os.path.basename(_p))
+
         # (b) 이벤트별 등록 (멱등 — 구 .config 경로는 미인정이라 패키지 경로로 신규 등록)
         # ★G1 sentinel: 격리(부서/임시) 팩은 글로벌 폴백 없이 등록 0 — 폴백은 resolve 가 소유한다.
         targets, forbidden = resolve_registration_targets()
         if forbidden and not targets:
-            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
+            # ★"등록 대상이 없다"는 사실이 **파일 실재 사실을 지우지 않는다** — 두 축은 별개다.
+            #   종전엔 여기서 즉시 SKIP 해 (a)·(a-2)가 이미 찾은 결손(훅 스크립트·reflect 엔진·
+            #   훅 **본체** 부재)이 통째로 버려졌다. 격리 팩·부서 팩처럼 등록이 금지된 컨텍스트가
+            #   바로 팩 복제 결손이 실제로 발생하는 곳인데, 거기서 preflight 가 SKIP(초록에 가까움)
+            #   이었다 — 관측이 가장 필요한 자리에서 관측이 꺼져 있었다.
+            _note = "등록 대상 없음 — %s" % forbidden
+            _base = "자기교정·영속성 hook 파일 실재(등록은 이 컨텍스트에서 금지)"
+            if fails:
+                self.add(cid, FAIL,
+                         _base + " · ★각성 훅 본체/스크립트 결손(부트 발화 불가 — C08 대칭 FAIL): "
+                         + " | ".join(fails[:6])
+                         + (" · 기타: " + " | ".join(warns[:3]) if warns else "")
+                         + " · " + _note)
+            elif warns:
+                self.add(cid, WARN, _base + " · " + " | ".join(warns[:6]) + " · " + _note)
+            elif fixed:
+                self.add(cid, FIXED, _base + " · " + "; ".join(fixed[:6]) + " · " + _note)
+            else:
+                self.add(cid, SKIP, _note)
             return
         # ★A21(W3) 훅별 중요도 티어: **각성 훅**(role-bootstrap→UserPromptSubmit) 미등록은
         #   C08(session-start)과 **대칭으로 FAIL** 이다. 종전엔 C28 전체가 WARN 이라, 부트 발화의
         #   유일한 트리거가 빠져 있어도 preflight 가 초록에 가까웠다(C08=FAIL vs C28=WARN 비대칭 —
         #   재감사 A21 확증). 나머지 자기교정 훅(inject·save·reflect·nudge·pack-guard)은 종전대로 WARN.
-        fails = []
         for t in targets:
             for script_name, events in SELFCORR_HOOKS:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
@@ -3817,7 +3869,8 @@ class Preflight:
             detail += " · " + shown
         if fails:
             self.add(cid, FAIL,
-                     detail + " · ★각성 훅 미등록(부트 발화 불가 — C08 대칭 FAIL): "
+                     detail + " · ★각성 훅 결손(미등록 또는 **본체 부재** — 부트 발화 불가 · "
+                     "C08 대칭 FAIL): "
                      + " | ".join(fails[:6])
                      + (" · 기타: " + " | ".join(warns[:3]) if warns else ""))
         elif warns:
