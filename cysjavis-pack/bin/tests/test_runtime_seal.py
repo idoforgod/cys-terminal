@@ -18,6 +18,9 @@
   ⑨ 결정론 — 같은 트리는 같은 바이트(뮤테이션 대조가 이것에 의존한다)
   ⑩ 판정 불가는 통과가 아니다 — 트리 부재·매니페스트 부재·형식 오류는 전부 rc 2
   ⑪ 매니페스트가 트리 안에 놓여도 자기 자신을 봉인 대상으로 세지 않는다
+  ⑫ 판독 거부(권한·잠금)는 불일치가 아니라 판정 불가다 — **트리 파일과 매니페스트 자신 둘 다**.
+     Windows 에서도 실제로 주입한다(msvcrt 바이트 잠금) — 그 오류군을 skip 으로 비우면
+     "안 재고 초록"이 된다(R1 codex #7 · R2 codex #5).
 """
 
 import json
@@ -71,6 +74,18 @@ class RuntimeSealTests(unittest.TestCase):
         for p in getattr(self, "_chmodded", []):
             try:
                 os.chmod(p, 0o755)
+            except OSError:
+                pass
+        # Windows 잠금 해제 — 열린 핸들이 남으면 임시폴더 삭제가 거부된다.
+        for f, size in getattr(self, "_locked", []):
+            try:
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, size)
+            except OSError:
+                pass
+            try:
+                f.close()
             except OSError:
                 pass
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -200,9 +215,39 @@ class RuntimeSealTests(unittest.TestCase):
     #   Windows 의 sharing violation(WinError 32)과 POSIX 의 EACCES 는 같은 계급이다 —
     #   "봉인이 깨졌다"가 아니라 "재지 못했다". 둘을 같은 exit 로 내보내면 소비자가 구분할 수
     #   없고, 특히 rc 1(불일치)로 새면 **없는 파손을 보고**하게 된다.
+    #   ★R2 codex #5: Windows 에서 이 계급을 통째로 skip 하면 "그 오류군을 안 재고 초록"이 된다.
+    #   그래서 파일 판독 거부는 **양 플랫폼에서 실제로 주입**한다 — POSIX 는 chmod 000,
+    #   Windows 는 stdlib `msvcrt.locking` 으로 바이트 영역을 잠근다(다른 프로세스가 읽으면
+    #   WinError 33 → PermissionError). 판독기는 subprocess 라 같은 프로세스 면제를 받지 않는다.
+    def _deny_file_read(self, path):
+        """파일 판독을 실제로 거부시킨다(양 플랫폼). 주입 불가 환경만 명시 skip."""
+        if os.name == "nt":
+            import msvcrt
+            size = max(1, os.path.getsize(path))
+            f = open(path, "r+b")
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, size)
+            except OSError as e:
+                f.close()
+                self.skipTest("Windows 잠금 주입 실패(%s) — 무측정을 명시 skip 한다" % e)
+            self._locked = getattr(self, "_locked", [])
+            self._locked.append((f, size))
+            return
+        if os.geteuid() == 0:
+            self.skipTest("root 는 권한 거부를 주입할 수 없다 — 무측정을 명시 skip 한다")
+        self._chmodded = getattr(self, "_chmodded", [])
+        self._chmodded.append(path)
+        os.chmod(path, 0o000)
+        if os.access(path, os.R_OK):
+            self.skipTest("이 파일계가 권한을 강제하지 않는다 — 주입 실패(명시 skip)")
+
     def _drop_read_permission(self, path):
+        """디렉터리 판독 거부 — POSIX 형상 전용 주입이다(Windows 에는 대응 원시가 없다).
+        ★파일 계급은 `_deny_file_read` 가 양 플랫폼에서 재므로, 이 skip 이 오류군 전체를
+        가리지 않는다(R2 codex #5 의 요구는 그 구분이다)."""
         if os.name != "posix" or os.geteuid() == 0:
-            self.skipTest("권한 거부를 주입할 수 없는 환경(root·비 POSIX) — 무측정을 명시 skip 한다")
+            self.skipTest("디렉터리 권한 거부를 주입할 수 없는 환경(root·비 POSIX) — "
+                          "파일 계급은 _deny_file_read 가 이 플랫폼에서도 잰다")
         self._chmodded = getattr(self, "_chmodded", [])
         self._chmodded.append(path)
         os.chmod(path, 0o000)
@@ -211,10 +256,24 @@ class RuntimeSealTests(unittest.TestCase):
 
     def test_unreadable_file_is_undecidable_not_mismatch(self):
         target = os.path.join(self.root, "python", "lib", "mod.py")
-        self._drop_read_permission(target)
+        self._deny_file_read(target)
         rc, d = self._verify()
         self.assertEqual(2, rc, "판독 실패가 rc %d 로 샜다(1이면 '없는 파손'을 보고한 것) — %r" % (rc, d))
         self.assertTrue(d.get("undecidable"), "JSON 에 판정 불가 표기가 없다: %r" % d)
+        self.assertFalse(d.get("ok"))
+
+    # ── ⑬ **매니페스트 자신**의 판독 거부도 같은 계급이다 (R2 codex #5) ──
+    #   R1 #7 은 트리 대조(classify)만 OSError 로 닫았고 매니페스트 open 은 열려 있었다.
+    #   PermissionError·Windows 공유위반이 uncaught 로 새면 파이썬 기본 종료코드 1 = 이 계약의
+    #   '불일치'가 되어 **없는 파손을 보고**하고, `--json` 은 객체를 한 줄도 내지 않았다.
+    def test_unreadable_manifest_is_undecidable_not_mismatch(self):
+        self._deny_file_read(self.man)
+        rc, d = self._verify()
+        self.assertEqual(
+            2, rc,
+            "매니페스트 판독 실패가 rc %d 로 샜다(1이면 '없는 파손'을 보고한 것) — %r" % (rc, d))
+        self.assertTrue(d.get("undecidable"),
+                        "판정 불가인데 --json 이 객체를 내지 않았다(소비자가 읽을 것이 없다): %r" % d)
         self.assertFalse(d.get("ok"))
 
     def test_unreadable_directory_is_undecidable_not_missing(self):

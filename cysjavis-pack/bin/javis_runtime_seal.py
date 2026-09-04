@@ -215,24 +215,27 @@ def _cmd_verify(a):
     if not os.path.isdir(a.root):
         print("✗ 대상 트리 없음: %s — 판정 불가(측정 불능은 통과가 아니다)" % a.root, file=sys.stderr)
         return 2
+    # ★단일 판정 불가 경계(R2 codex #5). 매니페스트 판독과 트리 대조를 **한 경계**로 감싼다.
+    #   R1 #7 은 classify 만 OSError 로 닫았고 load_manifest 는 FileNotFoundError·ValueError 만
+    #   잡았다. 그래서 매니페스트 open 의 **PermissionError·Windows 공유위반(WinError 32)** 이
+    #   uncaught 로 새고, 파이썬 기본 종료코드 1 = 이 계약의 '불일치'가 되어 **없는 파손을 보고**
+    #   했다. 게다가 그 경로에서는 `--json` 이 객체를 한 줄도 내지 않아 소비자가 아무것도 못 읽었다.
+    #   이제 어느 갈래로 실패하든 `--json` 은 객체 1줄, 종료는 반드시 2다.
     try:
         m = load_manifest(a.manifest)
-    except FileNotFoundError:
-        print("✗ 매니페스트 없음: %s — 판정 불가" % a.manifest, file=sys.stderr)
-        return 2
-    except (ValueError, json.JSONDecodeError) as e:
-        print("✗ 매니페스트 판독 실패(%s) — 판정 불가" % e, file=sys.stderr)
-        return 2
-    # ★classify 는 트리를 실제로 읽는다 — 여기서 나는 OSError 도 rc 2 다(R1 codex #7).
-    #   종전에는 load_manifest 만 감싸 있어 공유위반·권한 거부가 uncaught traceback +
-    #   rc 1(=불일치)로 새어 나갔다. 그러면 "봉인 파손"과 "판정 불가"가 같은 코드가 된다.
-    try:
         d = classify(m, a.root)
-    except OSError as e:
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        # 사람용 문장만 갈래를 구분한다(기계 계약은 rc 2 + undecidable 하나로 동일).
+        if isinstance(e, FileNotFoundError) and getattr(e, "filename", None) == a.manifest:
+            why = "매니페스트 없음: %s" % a.manifest
+        elif isinstance(e, OSError):
+            why = "판독 실패(%s)" % e
+        else:
+            why = "매니페스트 형식 오류(%s)" % e
         if a.json:
             print(json.dumps({"ok": False, "undecidable": True, "reason": str(e)},
                              ensure_ascii=False, sort_keys=True))
-        print("✗ 트리 판독 실패(%s) — 판정 불가(측정 불능은 통과가 아니다)" % e, file=sys.stderr)
+        print("✗ %s — 판정 불가(측정 불능은 통과가 아니다)" % why, file=sys.stderr)
         return 2
     total = len(d["missing"]) + len(d["added"]) + len(d["changed"])
     if a.json:
