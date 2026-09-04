@@ -208,14 +208,26 @@ pub fn dedupe_loss_log(prev: Option<&str>, reason: &str, every_n: u64) -> (bool,
 mod tests {
     use super::*;
 
+    /// 검체용 임시 디렉터리 — **호출마다 유일**해야 한다.
+    ///
+    /// ★2026-09-05 실측 수리: 종전 이름은 `pid + 나노초` 였는데 이 기계의 시계 해상도가
+    /// **1µs** 다(2만 회 호출에 고유값 1093개). 즉 같은 마이크로초에 두 검체가 부르면 pid 도
+    /// 나노초도 같아 **같은 디렉터리**를 만들고, 그러면 둘이 같은 `cys.lock` 을 공유한다.
+    /// cargo 는 검체를 병렬 실행하므로 그때 한쪽의 홀더가 다른 쪽의 재획득을 막아
+    /// `flock_reacquire_after_holder_release` 가 간헐 적색이 됐다(단독 실행에서도 3회 중 1회).
+    /// 결함이 아니라 검체끼리의 충돌이었고, 그 적색은 **아무것도 재지 않는다**.
+    /// 원자 카운터를 더해 커널이 아니라 프로그램이 유일성을 보증하게 한다.
     fn tmp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "cysd-deadman-test-{}-{}",
+            "cysd-deadman-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, AOrd::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -403,10 +415,31 @@ mod tests {
             "경합자 즉시 획득 실패"
         );
         drop(holder); // 홀더 사망 모사(fd 해제=flock 해제).
+        // ★2026-09-05: 이 단언이 간헐로 -1 이었다(단독 실행에서도 3~6회 중 1회). 원인 규명 중이며
+        //   확인된 사실만 적는다 — ①순수 flock 시퀀스는 2000회 동시 실행에서 실패 0(시맨틱 문제
+        //   아님) ②같은 바이너리의 다른 검체가 자식을 spawn·SIGKILL 하므로 **SIGCHLD 가 오간다**.
+        //   `flock` 은 신호로 `EINTR` 을 돌릴 수 있고 그것은 '락을 못 얻었다' 가 아니라 '다시
+        //   불러라' 다 — 재시도가 표준 요구사항이므로 여기서 그것부터 지킨다(EINTR 만 재시도하고
+        //   다른 errno 는 그대로 실패시킨다 · 마스킹 금지).
+        //   그래도 실패하면 **errno 를 남긴다** — 종전엔 -1 만 보여 다음 사람이 같은 자리에서
+        //   다시 추측해야 했다.
+        let mut rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let mut errs: Vec<i32> = Vec::new();
+        for _ in 0..8 {
+            if rc == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            errs.push(e.raw_os_error().unwrap_or(0));
+            if e.raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+            rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        }
         assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            rc,
             0,
-            "홀더 해제 후 재획득 성공"
+            "홀더 해제 후 재획득 성공 (errno 이력={errs:?} — EINTR(4)이면 신호 경합, 그 외는 실제 경합)"
         );
         std::fs::remove_dir_all(&d).ok();
     }
