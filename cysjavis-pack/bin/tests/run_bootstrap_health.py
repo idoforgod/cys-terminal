@@ -5534,15 +5534,28 @@ def h_pred_6():
     need(not bad, "BUDGET 상수 파리티 붕괴: %r" % bad)
     # ★PEND 는 "아직 이 레인에 없다"이지 "안 잰다"가 아니다. 목록 밖 부재는 위에서 이미 적색이고,
     #   통합 트리에서는 **PEND 0** 이 조건이다(C4 판독 · 그래야 무측정이 남지 않는다).
-    _allowed_pend = BU.RUST_PARITY_PENDING | set(BU.CYSD_DERIVED_PINS)
+    _allowed_pend = BU.RUST_PARITY_PENDING
     _stray = [x for x in pend if x.split()[0] not in _allowed_pend]
     need(not _stray, "PEND 목록 밖 상수 부재(무측정): %r" % _stray)
+    # ★사유 계약(2026-09-05 · master 승인): PEND 는 이름만으로 판독할 수 없다 — "다른 레인에 있어
+    #   병합으로 풀린다(merge)" 와 "어디에도 없어 누가 구현해야 한다(impl)" 는 조치가 정반대인데
+    #   화면에서 같아 보인다(원인 구별 불가 = 무측정의 변종). 그래서 ⓐ PEND 가 될 수 있는 모든 이름은
+    #   사유를 지녀야 하고 ⓑ 해소 경로 어휘는 둘로 닫혀 있어야 한다(자유 문장으로 흐르면 다시 못 읽는다).
+    _pend_names = BU.RUST_PARITY_PENDING | set(BU.CYSD_DERIVED_PINS)
+    _no_reason = sorted(n for n in _pend_names if n not in BU.RUST_PARITY_PENDING_REASON)
+    need(not _no_reason,
+         "사유 없는 PEND 항목(판독자가 '병합 대기'와 '구현 대기'를 구별할 수 없다): %r" % _no_reason)
+    _bad_kind = sorted(n for n, (k, _w) in BU.RUST_PARITY_PENDING_REASON.items()
+                       if k not in BU.PENDING_KINDS)
+    need(not _bad_kind,
+         "PEND 해소 경로 어휘 이탈(%r 만 허용): %r" % (list(BU.PENDING_KINDS), _bad_kind))
+    _pend_desc = "; ".join(BU.pending_note(x.split()[0]) for x in pend)
     notes.append("BUDGET 상수 %d종 rust↔python 파리티(cys.rs %d · cysd 감독자 %d · 유도식 핀 %d) · PEND %d종%s"
                  % (len(BU.RUST_PARITY_CONSTS),
                     sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] == "cys"),
                     sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] != "cys"),
                     len(BU.CYSD_DERIVED_PINS), len(pend),
-                    (" — " + "; ".join(pend)) if pend else ""))
+                    (" — " + _pend_desc) if pend else ""))
     return " · ".join(notes)
 
 
@@ -6401,6 +6414,10 @@ SCAN_TARGETS = {
     # ★(U-17) 프로필 인증 전제 판정기. 신설 파일 하나이며 `cys profile-auth` 배선이 CLI 로
     #   내려가면 **여기에 그 경로를 추가**한다(판정부는 이 파일에 남으므로 둘 다 유지).
     "profile_gate": (os.path.join("src", "profile_gate.rs"),),
+    # ★(2026-09-05) 부트 감독자 — 예산 파리티가 이 파일의 임계 상수를 핀한다(H-PRED-6 ⓓ).
+    #   등재하는 이유: 이 경로를 검체가 직접 들면 파일이 이사할 때 그 핀만 조용히 죽는다.
+    #   B3-3 이 fence·progress 상수를 더 넣을 자리이므로 독자가 늘기 전에 소유를 여기로 모은다.
+    "boot_supervisor": (os.path.join("src", "bin", "cysd", "boot_supervisor.rs"),),
 }
 
 # 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.

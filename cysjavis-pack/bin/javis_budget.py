@@ -343,10 +343,29 @@ RUST_PARITY_CONSTS = {
     "PROGRESS_STALL_SECS": ("BOOT_NODE_OUTER_S", "cysd_boot_supervisor", "f64"),
 }
 
-# 이 레인에 **아직 없어도 적색이 아닌** 항목(C4 유입 대기 · 미발효 PEND). 소스에 나타나는 순간
-#   자동으로 발효한다. ★목록을 정확히 고정하는 것이 요점이다 — 여기 없는 상수가 사라지면 그건
-#   PEND 가 아니라 적색이다(부재를 SKIP 으로 접는 무측정 방지).
-RUST_PARITY_PENDING = {"HB_STALL_SECS", "PROGRESS_STALL_SECS"}
+# 이 레인에 **아직 없어도 적색이 아닌** 항목(미발효 PEND). 소스에 나타나는 순간 자동으로 발효한다.
+#   ★목록을 정확히 고정하는 것이 요점이다 — 여기 없는 상수가 사라지면 그건 PEND 가 아니라
+#     적색이다(부재를 SKIP 으로 접는 무측정 방지).
+#   ★사유를 함께 지는 이유(2026-09-05 · master 승인 · W-C 지적): 이름만 찍히면 판독자가
+#     "아직 이 레인에 없다(병합으로 해소)" 와 "아직 아무도 안 썼다(구현 대기)" 를 **구별할 수 없다**.
+#     둘은 조치가 정반대인데 화면에서는 같아 보인다 — 무측정과 같은 계급(원인 구별 불가)이다.
+#   해소 경로 어휘는 둘뿐이다: `merge`(다른 레인에 실재 · C4 유입으로 발효) · `impl`(어느 레인에도
+#     없음 · 누군가 구현해야 발효). 사유 없는 PEND 는 **구조적으로 불가능**하다 — 아래 집합이
+#     이 표에서 파생되므로, 사유를 안 적으면 애초에 PEND 목록에 오르지 못하고 곧바로 적색이 된다.
+RUST_PARITY_PENDING_REASON = {
+    "HB_STALL_SECS": ("merge", "daemon boot_supervisor.rs 에 실재 — C4 유입 시 발효"),
+    "MAX_LIVE_BOOT_RUNS": ("merge", "daemon 유도 상수 — C4 유입 시 발효"),
+    "FENCED_REAP_AGE_SECS": ("merge", "daemon 유도 상수 — C4 유입 시 발효"),
+    "PROGRESS_STALL_SECS": ("impl", "B3-3 미구현 — 세 레인 어디에도 Rust 상수 없음(선등재 핀)"),
+}
+PENDING_KINDS = ("merge", "impl")
+RUST_PARITY_PENDING = frozenset(RUST_PARITY_PENDING_REASON)
+
+
+def pending_note(name):
+    """PEND 한 줄 서술 — 판독자가 조치를 바로 고를 수 있게 해소 경로를 함께 적는다."""
+    kind, why = RUST_PARITY_PENDING_REASON.get(name, ("?", "사유 미등재"))
+    return "%s: %s(%s)" % (name, why, kind)
 
 # 유도 상수는 **값을 python 에 복제하지 않는다**(복제 자체가 새 드리프트면 — W-B 지적 수용).
 #   대신 **유도식 자체를 핀**한다: 누가 유도를 리터럴로 굳히면 잡힌다.
