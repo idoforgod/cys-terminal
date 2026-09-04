@@ -277,6 +277,25 @@ fn question_rx() -> &'static Regex {
     })
 }
 
+// ── 절 술어(공개) — `mission_gate::extract_mission` 이 유일 소비자다 ─────────────────
+/// 이 절이 **선언절**인가(`DECL_KO` ∪ `DECL_EN`). python `extract_mission` ①.
+///
+/// 정규식이 아니라 **술어를 공개**하는 이유는 [`CLAUSE_BOUNDARY`] 와 같다 — 선언 어휘의 유일
+/// 소유자는 이 모듈이고 소비자에게 필요한 것은 판정뿐이다. 정규식을 내보내면 소비자가 자기
+/// 플래그를 붙여 부르기 시작하고, 그 순간 판정이 두 벌로 갈린다.
+pub fn is_declaration_clause(clause: &str) -> bool {
+    decl_ko().is_match(clause) || decl_en().is_match(clause)
+}
+
+/// 이 절이 **질의·인용절**인가(`QUESTION`). python `extract_mission` ②.
+///
+/// ★이 술어가 임무 추출에서 하는 일은 "오늘 뭐부터 할까?" 를 임무에서 빼는 것이다 — 보고를
+/// 요구하는 문장은 착수 권한이 아니다. 절 경계가 **경계 문자를 앞 절에 포함**하기 때문에
+/// (`split_clauses`) 여기의 `\?` 가 실제로 매치된다 — 그 규약이 깨지면 이 술어가 조용히 죽는다.
+pub fn is_question_clause(clause: &str) -> bool {
+    question_rx().is_match(clause)
+}
+
 // ── 문자 술어 ─────────────────────────────────────────────────────────────────────
 /// python `str.isspace()` 와 동일 집합(29 코드포인트 — 실측 확인).
 /// Rust `char::is_whitespace` 는 `\x1C`–`\x1F` 를 **포함하지 않아** 그것만 더한다.
