@@ -157,14 +157,33 @@ fi
 #   해소 순서 — ①BASH_SOURCE 디렉터리(argv0 이 이름뿐이어도 정확하다 · 실측 확인)
 #              ②$0 디렉터리(슬래시가 있을 때만) ③팩 계약 경로(프리루드와 동형 2단 폴백)
 #              ④그래도 없으면 **정직 실패**(CWD 상대 추정 금지 — 무음 통과보다 정직한 고지).
+# ★구분자 정규화가 **먼저**다(IG-11 2차 · 2026-09-04 Windows 실기 적발).
+#   `${p%/*}` 는 **슬래시에서만** 자른다. Git Bash 가 넘기는 백슬래시 절대경로
+#   (`C:\Users\…\hooks\role-bootstrap.sh`)에는 `/` 가 하나도 없어서 `%/*` 가 **원문을
+#   그대로** 돌려주고, "슬래시가 없다"는 판정과 구별되지 않아 두 후보가 **동시에 빈손**이 된다.
+#   그러면 팩 폴백(③)만 남는데 격리 하네스의 가짜 팩에는 본체가 없어 '부재'로 정직 실패한다 —
+#   1차 수리(CWD 제거)가 결함을 한 층 위로 옮겼을 뿐이었다. macOS 는 ①이 성공해 로컬만 초록이었다
+#   (로컬↔CI 갈림의 정체가 이것이다).
+#   Git Bash 는 슬래시 경로를 그대로 받으므로 **백슬래시를 슬래시로 바꾼 뒤** 자른다.
+#   드라이브 문자(`C:`)는 건드리지 않는다 — 정규화는 구분자에만 적용된다.
+_cys_dirpart() {
+  [ -n "${1:-}" ] || return 1
+  _cdp=$(printf '%s' "$1" | tr '\\' '/')
+  case "$_cdp" in
+    */*) printf '%s' "${_cdp%/*}" ;;
+    *)   return 1 ;;
+  esac
+}
 _LEGACY=""
-if [ -n "${BASH_SOURCE:-}" ] && [ "${BASH_SOURCE%/*}" != "${BASH_SOURCE}" ] &&
-   [ -f "${BASH_SOURCE%/*}/role-bootstrap-legacy.sh" ]; then
-  _LEGACY="${BASH_SOURCE%/*}/role-bootstrap-legacy.sh"
+_BD=$(_cys_dirpart "${BASH_SOURCE:-}") || _BD=""
+if [ -n "$_BD" ] && [ -f "$_BD/role-bootstrap-legacy.sh" ]; then
+  _LEGACY="$_BD/role-bootstrap-legacy.sh"
 fi
-if [ -z "$_LEGACY" ] && [ "${0%/*}" != "${0:-}" ] &&
-   [ -f "${0%/*}/role-bootstrap-legacy.sh" ]; then
-  _LEGACY="${0%/*}/role-bootstrap-legacy.sh"
+if [ -z "$_LEGACY" ]; then
+  _AD=$(_cys_dirpart "${0:-}") || _AD=""
+  if [ -n "$_AD" ] && [ -f "$_AD/role-bootstrap-legacy.sh" ]; then
+    _LEGACY="$_AD/role-bootstrap-legacy.sh"
+  fi
 fi
 if [ -z "$_LEGACY" ] && [ -f "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/role-bootstrap-legacy.sh" ]; then
   _LEGACY="${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/role-bootstrap-legacy.sh"

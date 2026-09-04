@@ -277,6 +277,46 @@ try:
           "부트 본체" in (rcn.stdout + rcn.stderr) and rcn.returncode == 0,
           repr((rcn.stdout + rcn.stderr)[-220:]))
 
+    # ───────── ★H-HOOK-CWD-2: 구분자 정규화 — Windows 백슬래시 절대경로 (IG-11 2차) ─────
+    #   1차 수리(CWD 제거)는 결함을 **한 층 위로 옮겼을 뿐**이었다. `${p%/*}` 는 슬래시에서만
+    #   자르는데 Git Bash 가 넘기는 `C:\Users\…\hooks\role-bootstrap.sh` 에는 `/` 가 없어
+    #   `%/*` 가 원문을 그대로 돌려준다 → BASH_SOURCE·argv0 두 후보가 **동시에 빈손** → 팩
+    #   폴백만 남고, 격리 하네스의 가짜 팩엔 본체가 없어 '부재'로 정직 실패한다.
+    #   macOS 는 후보 ①이 성공해 **로컬만 초록**이었다 — 로컬↔CI 갈림의 정체가 이것이다.
+    #   ★검체는 런처에서 **실제 함수를 추출해** 돌린다(사본 금지 — 사본은 갈리고도 초록이다).
+    lsrc = rd(LAUNCHER)
+    m_start = lsrc.find("_cys_dirpart() {")
+    m_end = lsrc.find("\n}", m_start)
+    check("CWD-2a 런처가 구분자 정규화 함수를 보유", m_start > 0 and m_end > m_start)
+    fn = lsrc[m_start:m_end + 2] if m_start > 0 else ""
+    drv = os.path.join(root, "dirpart.sh")
+    w(drv, fn + """
+for P in 'C:\\Users\\cys\\pack\\hooks\\role-bootstrap.sh' \
+         '/u/p/hooks/role-bootstrap.sh' 'role-bootstrap.sh' \
+         'C:/u/p/hooks/role-bootstrap.sh'; do
+  if D=$(_cys_dirpart "$P"); then printf 'OK|%s\n' "$D"; else printf 'EMPTY|\n'; fi
+done
+""", 0o644)
+    rd2 = subprocess.run(["sh", drv], capture_output=True, text=True, timeout=30)
+    lines = [l for l in rd2.stdout.splitlines() if l]
+    check("CWD-2b 백슬래시 절대경로에서 디렉터리를 얻는다(드라이브 문자 보존)",
+          len(lines) > 0 and lines[0] == "OK|C:/Users/cys/pack/hooks", repr(lines[:1]))
+    check("CWD-2c POSIX 절대경로 동작 보존",
+          len(lines) > 1 and lines[1] == "OK|/u/p/hooks", repr(lines[1:2]))
+    check("CWD-2d 이름만이면 빈손(=다음 후보로 넘어간다)",
+          len(lines) > 2 and lines[2] == "EMPTY|", repr(lines[2:3]))
+    check("CWD-2e 슬래시형 Windows 경로 동작 보존",
+          len(lines) > 3 and lines[3] == "OK|C:/u/p/hooks", repr(lines[3:4]))
+    # ★음성 대조: **정규화를 뺀** 구 형태는 같은 입력에서 빈손이 된다(=이 축의 검출력 증명).
+    drv2 = os.path.join(root, "dirpart_old.sh")
+    w(drv2, """
+P='C:\\Users\\cys\\pack\\hooks\\role-bootstrap.sh'
+if [ "${P%/*}" != "$P" ]; then printf 'OK|%s\n' "${P%/*}"; else printf 'EMPTY|\n'; fi
+""", 0o644)
+    rd3 = subprocess.run(["sh", drv2], capture_output=True, text=True, timeout=30)
+    check("CWD-2f 음성 대조: 정규화 없는 구 형태는 백슬래시 경로에서 **빈손**",
+          rd3.stdout.strip() == "EMPTY|", repr(rd3.stdout.strip()))
+
     # ───────── 프리루드: **있으면 소비 · 없으면 자기완결 강등**(master 판정 ②) ─────────
     hooks, binp, state, env, mark = lab(root, "prelude")
     w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
