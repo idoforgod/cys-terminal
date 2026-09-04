@@ -2548,11 +2548,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "hook.machine_origin: prompt_norm 또는 prompt_digest 중 하나는 있어야 한다",
                 ));
             }
-            if norm.chars().count() > cys::mission_gate::HARNESS_SCAN_MAX_CHARS {
+            // ★(A14) 단위는 **바이트**다 — 전송을 끊는 것이 `MAX_REQUEST_LINE`(바이트)이므로
+            //   검증도 같은 단위여야 한다. 종전 문자 상한은 CJK 에서 **도달 불가**였다(실측).
+            if norm.len() > cys::mission_gate::LAYER1_PROMPT_MAX_BYTES {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "hook.machine_origin: prompt_norm 이 상한을 넘었다 — truncated 로 잘라 보내라",
+                    "hook.machine_origin: prompt_norm 이 바이트 상한을 넘었다 — truncated 로 잘라 보내라",
                 ));
             }
             // digest 동반 시 **대조**(조용한 한쪽 채택 금지).

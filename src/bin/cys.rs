@@ -10952,16 +10952,27 @@ fn hook_layer12_via_daemon(
     let norm = cys::mission_gate::normalize(prompt);
     // 상한 초과분은 잘라 보내고 사실을 표기한다(A12) — 자르고 침묵하면 데몬이 부분 판정을
     // 전부 본 것으로 오인한다.
-    let cap = cys::mission_gate::HARNESS_SCAN_MAX_CHARS;
-    let truncated = norm.chars().count() > cap;
-    let sent: String = if truncated { norm.chars().take(cap).collect() } else { norm };
-    let digest = cys::mission_gate::digest_normalized(&sent);
-    let r = request_on_timeout(
+    // ★(A14) 단위는 **바이트**다. 종전 문자 상한(5,000,000자)은 한글이면 원시 14.3 MiB 라
+    //   데몬 `MAX_REQUEST_LINE`(10 MiB)에 먼저 걸려 **한 번도 발효하지 못했고**, 같은 상한이
+    //   ASCII 에서는 발효했다 — 같은 계약이 언어마다 다른 것을 뜻했다. 바이트로 통일한다.
+    let (sent, truncated) =
+        cys::mission_gate::truncate_utf8_bytes(&norm, cys::mission_gate::LAYER1_PROMPT_MAX_BYTES);
+    // digest 는 **보낸 문자열**로 계산한다(데몬이 대조한다 — 원문으로 계산하면 즉시 불일치).
+    let digest = cys::mission_gate::digest_normalized(sent);
+    layer12_from_reply(request_on_timeout(
         socket,
         HOOK_ORIGIN_METHOD,
         json!({"prompt_norm": sent, "prompt_digest": digest, "truncated": truncated}),
         std::time::Duration::from_millis(HOOK_DECIDE_DEADLINE_MS),
-    );
+    ))
+}
+
+/// 층1 RPC **응답 → 판정**(순수) — 데몬 없이 전수로 잰다.
+///
+/// ★(A14 ⓒ) 이 함수가 못박는 계약 하나: **왕복이 실패하면 legacy(rc5)** 다. 상한 초과·구 데몬·
+/// 데몬 사망 어느 쪽이든 훅은 판정을 참칭하지 않고 셸 본체에 넘긴다 — 그래야 상한 정책이
+/// 바뀌어도 **무음 사망이 아니라 종전 경로**로 접힌다(fail-open 방향의 기계 증거).
+fn layer12_from_reply(r: Result<serde_json::Value, String>) -> (Layer12, Layer12Facts) {
     let r = match r {
         Ok(v) => v,
         // 구 데몬은 `method_not_found` 를 싣는다. 그 밖의 왕복 실패도 같은 방향(legacy)으로
@@ -18029,6 +18040,39 @@ mod tests {
             body.matches("\"system.claim_role\"").count(),
             "claim RPC 호출부가 이 함수 밖에도 있다 — 훅이 자기 사본으로 부른다는 뜻"
         );
+    }
+
+    /// ★H-A14-3(v2.1 A14 ⓒ · master 지시): **왕복 실패는 legacy(rc5)** 로 접힌다 — 무음 사망 아님.
+    ///
+    /// 상한 정책이 바뀌면 데몬이 `invalid_params` 로 거절할 수 있다. 그때 훅이 판정을 참칭하거나
+    /// (기계로 접어 오너 프롬프트를 삼키거나) 조용히 통과시키면 그것이 무음 사망이다. 계약은
+    /// 하나다: **판정을 못 받으면 셸 본체에 넘긴다.** 응답 매핑을 값으로 뽑아 전수로 잰다.
+    #[test]
+    fn layer1_roundtrip_failure_falls_back_to_legacy_not_silent_death() {
+        for err in [
+            "invalid_params: hook.machine_origin: prompt_norm 이 바이트 상한을 넘었다 — truncated 로 잘라 보내라",
+            "invalid_params: hook.machine_origin: prompt_digest 가 prompt_norm 과 불일치한다",
+            "method_not_found",
+            "connect 실패",
+        ] {
+            let (v, facts) = layer12_from_reply(Err(err.to_string()));
+            assert!(matches!(v, Layer12::Legacy(_)), "왕복 실패가 legacy 가 아니다: {err}");
+            // legacy 는 **대장도 건드리지 않는다**(판정자 부재 · 사실도 비어 있어야 한다).
+            assert!(facts.ledger_status.is_empty() && facts.anomalies.is_empty());
+            assert!(
+                origin_from_layer12(&v).is_none(),
+                "legacy 인데 대장 기록 입력이 만들어졌다: {err}"
+            );
+        }
+        // 정상 응답은 그대로 판정으로 산다(대조군 — 위 단언이 '전부 legacy' 로 뭉개지지 않는다).
+        let (v, facts) = layer12_from_reply(Ok(serde_json::json!({
+            "origin": "machine", "layer": 1, "reason": "전문 일치",
+            "ledger_status": "ok",
+            "anomalies": [{"code": "delivery_out_of_window", "detail": "창 밖"}]
+        })));
+        assert!(matches!(v, Layer12::Machine(_)), "정상 응답까지 legacy 로 접혔다");
+        assert_eq!(facts.ledger_status, "ok");
+        assert_eq!(facts.anomalies.len(), 1, "기록용 사실이 실려 오지 않았다");
     }
 
     /// ★H-ORIGIN-MAP-1(B2-c · mutation 실측으로 신설): 층1·층2 판정이 **대장까지 살아서 간다.**

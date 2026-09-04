@@ -208,6 +208,47 @@ pub const HARNESS_SCAN_MAX_CHARS: usize = 5_000_000;
 /// 기울므로 삼킴 위험을 늘리지 않는다.
 pub const HARNESS_SCAN_PREFIX_CHARS: usize = 200_000;
 
+/// ★(v2.1 **A14** · master 채택 2026-09-04) 층1 RPC `prompt_norm` 의 **전송 상한 — 바이트**.
+///
+/// ## 왜 문자가 아니라 바이트인가(실측)
+/// 종전 상한은 [`HARNESS_SCAN_MAX_CHARS`](5,000,000 **자**)였고, 그것은 **판정 비용** 축의
+/// 단위다. 그런데 이 값이 RPC 검증에도 쓰이면서 단위가 섞였다 — 전송을 끊는 것은 데몬의
+/// `MAX_REQUEST_LINE`(10 MiB **바이트**)이기 때문이다. 실측 결과 상한의 의미가 **입력 언어에
+/// 따라 달라졌다**:
+///   · 한글 5,000,000자 = 원시 14.3 MiB → **와이어 상한 초과로 애초에 전송 불가**(문자 상한은
+///     한 번도 발효하지 못한다 · CJK 3 B/자)
+///   · 같은 5,000,000자가 ASCII 면 4.8 MiB 라 전송된다
+/// 즉 같은 계약 문장이 언어마다 다른 것을 뜻했다. A14 는 이것을 바이트로 통일한다.
+///
+/// ## 값의 근거(전부 실측 · 2026-09-04)
+/// serde_json 직렬화의 **자당 최대 팽창은 6배**다(제어문자 → `\uXXXX` 6 B · 실측: 한글 3 ·
+/// ASCII 1 · 따옴표·역슬래시 2 · U+0001 **6**). 봉투(메서드·digest 64자·플래그)는 **178 B**다.
+/// 그래서 원시 1 MiB 는 최악의 입력에서도 `1 MiB × 6 + 178 B ≈ 6 MiB < 10 MiB` 로 **입력 내용과
+/// 무관하게** 와이어 상한 아래임이 보장된다 — 상한이 조건부로 발효하지 않는다는 것이 요점이다.
+/// 상용 규모 대조: 한글 200,000자 = 0.57 MiB · 한글 349,525자가 이 상한이다(실전 프롬프트를
+/// 자르지 않는다). 이 부등식은 검체 `H-A14-1` 이 `MAX_REQUEST_LINE` 소스 핀과 함께 기계 대조한다.
+pub const LAYER1_PROMPT_MAX_BYTES: usize = 1024 * 1024;
+
+/// [`LAYER1_PROMPT_MAX_BYTES`] 산출 근거의 상수 — 자당 최대 직렬화 팽창(제어문자 `\uXXXX`).
+/// 검체가 이 값으로 부등식을 다시 계산한다(주석의 숫자가 아니라 **값**이 근거다).
+pub const JSON_WORST_EXPANSION: usize = 6;
+
+/// 층1 전송용 **바이트 절단** — UTF-8 경계를 지키며 `max` 이하로 자른다. `(자른 문자열, 잘렸는가)`.
+///
+/// 문자 경계에서 자르는 것이 계약이다: 바이트로 무작정 자르면 다중바이트 문자가 반토막 나
+/// **유효하지 않은 UTF-8** 이 되고, 그 문자열은 JSON 직렬화에서 죽거나 대체문자로 바뀌어
+/// digest 대조가 조용히 깨진다(층1 이 통째로 무력화되는 경로).
+pub fn truncate_utf8_bytes(s: &str, max: usize) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
 /// 알림 전용 마커 — harness 가 turn 자체를 합성할 때만 나온다.
 pub const HARNESS_NOTIFY_MARKERS: [&str; 12] = [
     "task-notification",
@@ -2306,6 +2347,60 @@ mod tests {
         let unit = r["unit"].as_str().expect("repeat.unit");
         let times = r["times"].as_u64().expect("repeat.times") as usize;
         unit.repeat(times)
+    }
+
+    /// ★H-A14-1(v2.1 A14 · master 채택): 층1 전송 상한이 **와이어 상한 아래임이 보장되는가.**
+    ///
+    /// 주석의 숫자가 아니라 **값으로** 부등식을 다시 계산한다:
+    ///   `LAYER1_PROMPT_MAX_BYTES × JSON_WORST_EXPANSION + 봉투 < MAX_REQUEST_LINE`
+    /// 좌변이 우변을 넘으면 상한이 **조건부로만** 발효한다 — 그것이 A14 가 없앤 결함이다
+    /// (종전 문자 상한은 CJK 에서 도달 불가였고 ASCII 에서만 발효했다).
+    /// 우변은 데몬 소스에서 **핀**한다(cysd 는 바이너리 크레이트라 상수를 import 할 수 없다) —
+    /// 누군가 와이어 상한을 낮추면 이 검체가 먼저 적색이 된다.
+    #[test]
+    fn layer1_byte_cap_is_provably_under_the_wire_limit() {
+        let daemon_src = include_str!("bin/cysd/main.rs");
+        assert!(
+            daemon_src.contains("const MAX_REQUEST_LINE: usize = 10 * 1024 * 1024;"),
+            "와이어 상한 소스 핀이 깨졌다 — 상한 부등식의 우변을 다시 확인하라"
+        );
+        let wire = 10 * 1024 * 1024usize;
+        // 봉투 실측(2026-09-04): 메서드·digest(64자)·플래그 포함 178 B. 여유를 크게 잡아도 성립한다.
+        let envelope = 1024usize;
+        let worst = LAYER1_PROMPT_MAX_BYTES * JSON_WORST_EXPANSION + envelope;
+        assert!(
+            worst < wire,
+            "상한이 와이어 아래임을 보장하지 못한다: 최악 {worst} B ≥ 와이어 {wire} B"
+        );
+        // ★음성 대조: 종전 문자 상한을 CJK(3 B/자)로 환산하면 **와이어를 넘는다** — 그것이
+        //   '문자 상한이 한 번도 발효하지 못한' 이유다. 이 단언이 깨지면 전제가 바뀐 것이다.
+        assert!(
+            HARNESS_SCAN_MAX_CHARS * 3 > wire,
+            "전제 붕괴: 문자 상한이 CJK 에서도 와이어 아래다 — A14 의 근거를 다시 재라"
+        );
+    }
+
+    /// ★H-A14-2: 바이트 절단이 **UTF-8 경계를 지킨다**(다중바이트 반토막 금지).
+    ///
+    /// 반토막이 나면 그 문자열은 직렬화에서 대체문자로 바뀌고 digest 대조가 **조용히** 깨진다 —
+    /// 층1 이 통째로 무력화되는 경로(데몬이 불일치로 거절 → legacy 폴백 → 원장 대조 0회).
+    #[test]
+    fn byte_truncation_never_splits_a_multibyte_char() {
+        // 한글 3바이트 × 4 = 12바이트. 상한을 문자 경계가 아닌 곳에 둔다.
+        let s = "가나다라";
+        for max in 0..=s.len() + 2 {
+            let (cut, truncated) = truncate_utf8_bytes(s, max);
+            assert!(std::str::from_utf8(cut.as_bytes()).is_ok(), "유효하지 않은 UTF-8: max={max}");
+            assert!(cut.len() <= max.min(s.len()), "상한을 넘겨 잘랐다: max={max}");
+            assert_eq!(truncated, s.len() > max, "truncated 표기가 사실과 다르다: max={max}");
+            assert!(s.starts_with(cut), "앞부분이 보존되지 않았다: max={max}");
+        }
+        // 상한 이하면 **원본 그대로**(복사·변형 없음)이고 잘리지 않았다고 말한다.
+        let (whole, t) = truncate_utf8_bytes(s, 1024);
+        assert_eq!((whole, t), (s, false));
+        // ASCII 는 문자 = 바이트라 경계 문제가 없다(대조군).
+        let (a, t2) = truncate_utf8_bytes("abcdef", 3);
+        assert_eq!((a, t2), ("abc", true));
     }
 
     /// ★H-MISSION-R1(층0 파리티): 마커 블록을 걷어낸 **잔여문**과 태그 밖 **자유 텍스트**가
