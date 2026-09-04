@@ -437,6 +437,142 @@ pub fn next_busy_delay(prev: std::time::Duration, rand01: f64) -> std::time::Dur
     PIPE_BUSY_RETRY_INTERVAL + std::time::Duration::from_secs_f64(span.as_secs_f64() * r)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 상태 JSON 원자 쓰기 — python `javis_lock.atomic_write_json` 파리티 (명세 v2.1 **A13**)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ★왜 `pack::write_atomic_mode` 를 쓰지 않는가(두 벌인 이유):
+//   그쪽 tmp 이름은 `.{fname}.tmp.{pid}` 로 **pid 당 하나로 고정**이다. 같은 pid 안에서 두
+//   task 가 같은 파일을 쓰면 서로의 tmp 를 파손한다 — python 이 주석으로 못박은 바로 그 실패
+//   모드다("고정 `.tmp` 이름을 쓰면 동시 writer가 서로의 임시 파일을 파손"). 데몬은 연결별
+//   tokio task 로 병행하므로 이 축에서는 **호출마다 유일한** 이름이 필요하다. 그쪽은 설치
+//   경로용(fsync + unix mode)이고 이쪽은 상태 파일용(무 fsync + 유일 tmp)이라 목적도 갈린다.
+//
+// ★재시도를 넣지 않는 이유(A13 · 실측으로 확정): python 정본은 재시도를 **위험해서 기각**했다
+//   — `javis_bootstrap._Log._persist` 원문: "쓰기 재시도 루프: 공유 위반은 수 초 지속될 수
+//   있고 부트 경로의 동기 재시도는 **싱글플라이트 락 보유 연장(치명 앵커 ③)** 이다. 어차피
+//   다음 단계의 write 가 곧 같은 내용을 다시 시도한다(유실 없음)". 명세 초안의 '5회 백오프'는
+//   오기였고 master 가 A13 으로 정정했다.
+//
+// ★실패 계수·미러 1줄은 **호출부** 몫이다(python 도 `_Log._persist` 가 진다) — 이 함수는
+//   `io::Result` 를 정직하게 돌려주기만 한다. 계수를 여기 넣으면 "어느 파일의 실패인지"를
+//   잃고, 호출부마다 다른 누적 정책이 필요해진다.
+
+/// 상태 JSON 을 원자적으로 쓴다 — python `javis_lock.atomic_write_json` 과 **바이트 동일**.
+///
+/// 바이트 계약: `indent=1`(공백 **한 칸**) · `ensure_ascii=false`(한글 그대로) · **말미 개행**.
+/// 세 가지가 다 맞아야 두 구현이 같은 파일을 낳는다 — 하나라도 갈리면 골든 대조가 깨진다.
+///
+/// tmp 이름은 `.tmp-<basename>-<rand>` 로 **호출마다 유일**하며(python `mkstemp` 동형 · pid 를
+/// 넣지 않는다), 성공하면 rename 으로 사라지고 실패하면 `finally` 자리에서 **자기 것만** 지운다
+/// (남의 tmp 를 pid 로 스캔해 지우지 않는다 — 남의 진행 중 쓰기를 파손하는 경로다).
+///
+/// ## ★키 순서 — 골든 대조를 하려면 **타입 구조체**로 넘겨라 (실측으로 확정)
+/// `serde_json` 은 `preserve_order` 없이 빌드돼 있어 [`serde_json::Value`] 의 객체가 내부적으로
+/// `BTreeMap` 이다 — 즉 **키가 알파벳순으로 정렬돼** 나간다. python `json.dump` 는 **삽입
+/// 순서**를 보존하므로, 같은 내용을 `Value` 로 넘기면 들여쓰기·escape 는 같은데 **키 순서만
+/// 갈린다**(실측: `{"result","n","t"}` → Rust `n,result,t` / python `result,n,t`).
+///
+/// 그래서 이 함수는 `T: Serialize` 로 **제네릭**이다. serde 는 구조체를 **필드 선언 순서**로
+/// 직렬화하므로, python 과 같은 순서로 필드를 선언한 구조체를 넘기면 바이트가 정확히 같아진다
+/// (`LedgerRecord` 가 이미 그 방식이다). boot-last 골든 writer(B4-4)도 반드시 구조체여야 한다.
+///
+/// `preserve_order` 피처를 켜지 않는 이유: 크레이트 **전역**이라 데몬 프로토콜 JSON 의 키 순서
+/// 까지 바꾼다 — 폭발 반경이 이 축의 이득보다 크다.
+pub fn atomic_write_json<T>(path: &Path, value: &T) -> std::io::Result<()>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    value
+        .serialize(&mut ser)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    buf.push(b'\n');
+    atomic_write_bytes(path, &buf)
+}
+
+/// [`atomic_write_json`] 의 바이트 절반 — 같은 tmp·rename 규약을 쓰는 비-JSON 소비자용.
+pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "파일명 없음"))?;
+
+    // mkstemp 동형 — `create_new`(O_EXCL)가 커널 수준 유일성을 보증한다(house 관행:
+    // `boot_supervisor::insert_intent_exclusive`). 충돌하면 다음 후보로 넘어간다.
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..TMP_NAME_TRIES {
+        let tmp = tmp_path_for(dir, base);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o644); // python `atomic_write_bytes` 의 mode=0o644 와 같다
+        }
+        let mut f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue; // 이름 충돌뿐 — 다른 후보로(이것은 '재시도'가 아니라 이름 뽑기다)
+            }
+            Err(e) => return Err(e),
+        };
+        // 여기서부터는 tmp 가 **내 것**이다 — 어느 경로로 빠져나가든 내가 치운다.
+        let res = f.write_all(data).and_then(|_| {
+            drop(f); // Windows: 열려 있는 핸들이 있으면 rename 이 공유위반으로 막힌다
+            // `std::fs::rename` 은 Windows 에서 MoveFileEx REPLACE_EXISTING 의미다(대상 덮어씀).
+            std::fs::rename(&tmp, path)
+        });
+        return match res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // ★자기 것만 지운다. 재시도하지 않는다(A13) — 실패는 호출부가 계수·보고한다.
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        };
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "tmp 이름을 얻지 못했다")
+    }))
+}
+
+/// tmp 이름 후보 수 — 이름 **충돌**에만 쓰이며 쓰기 실패 재시도가 아니다(A13: 재시도 0).
+const TMP_NAME_TRIES: usize = 16;
+
+/// tmp **경로**를 만든다 — 호출마다 다른 이름이어야 한다.
+///
+/// 이름 구성을 따로 뽑은 이유(mutation A-M3 이 드러낸 사각): `tmp_suffix()` 만 시험하면
+/// "난수는 유일한데 쓰기 경로가 그것을 **안 쓰는**" 변이를 못 잡는다. 성공 경로는 tmp 를
+/// rename 으로 지우므로 이름을 사후에 관측할 수도 없다. 그래서 **구성 함수 자체**를 박는다.
+fn tmp_path_for(dir: &Path, base: &str) -> PathBuf {
+    dir.join(format!(".tmp-{base}-{}", tmp_suffix()))
+}
+
+/// tmp 이름의 난수 꼬리(python `mkstemp` 의 무작위 부분 대응).
+/// 암호학적 품질 불요 — 같은 디렉터리 안에서 **동시 writer 끼리 갈리기만** 하면 된다.
+fn tmp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    // pid 를 **이름에 넣지 않는다**(A13) — 그러나 프로세스 간 충돌을 줄이려 섞기에는 쓴다.
+    let mixed = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(seq.wrapping_mul(1442695040888963407))
+        .wrapping_add(std::process::id() as u64);
+    format!("{mixed:016x}")
+}
+
 /// jitter 전용 저비용 난수(∈[0,1)) — 암호학적 품질 불요(토큰 생성 금지, 위상 분산 전용).
 /// 시계 나노초 + pid 해시라 프로세스·호출 간 위상이 갈린다.
 pub fn rand01_cheap() -> f64 {
@@ -3579,6 +3715,162 @@ mod tests {
     /// 이 검체가 지키는 것은 네 불가침 계약이다(⑤ `inject_claude_code_git_bash_path_for` 동형):
     /// ①사용자 값 불가침 ②이미 쌓인 쌍 불가침 ③좌표 부재 시 fail-open ④마스터 스위치 복귀.
     /// 각 항마다 **음성 대조**를 함께 둔다 — 양성만 보면 "무조건 얹는" 구현도 초록이 된다.
+    /// ★H-ATOMIC-1(B4 T2-6 선분리 · 명세 v2.1 **A13**): `atomic_write_json` 의 **바이트 파리티**.
+    ///
+    /// 기대값은 추측이 아니라 **python 정본 실측**이다 — `javis_lock.atomic_write_json` 을
+    /// 인터프리터로 돌려 나온 바이트를 그대로 박았다. 세 계약이 **동시에** 맞아야 한다:
+    ///   ⓐ `indent=1`(공백 **한 칸** — serde 기본은 2칸이라 그냥 두면 갈린다)
+    ///   ⓑ `ensure_ascii=false`(한글이 `\uXXXX` 로 escape 되지 않는다)
+    ///   ⓒ **말미 개행**
+    /// 하나라도 갈리면 같은 상태를 두 구현이 서로 다른 파일로 낳고, boot-last 골든 대조가 깨진다.
+    #[test]
+    fn atomic_write_json_bytes_match_python_javis_lock() {
+        let td = std::env::temp_dir().join(format!("cys-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let write = |name: &str, v: serde_json::Value| -> String {
+            let p = td.join(name);
+            atomic_write_json(&p, &v).expect("원자 쓰기 실패");
+            std::fs::read_to_string(&p).expect("판독 실패")
+        };
+        // python 실측 5종(evidence/atomic-write-parity.txt).
+        assert_eq!(
+            write("a.json", serde_json::json!({"a": 1, "b": "x"})),
+            "{\n \"a\": 1,\n \"b\": \"x\"\n}\n",
+            "indent=1 또는 말미 개행이 python 과 갈렸다"
+        );
+        assert_eq!(
+            write("b.json", serde_json::json!({"mission": "릴리스 게이트를 통과시켜라", "source": "prompt"})),
+            "{\n \"mission\": \"릴리스 게이트를 통과시켜라\",\n \"source\": \"prompt\"\n}\n",
+            "ensure_ascii=false 파리티가 깨졌다 — 한글이 escape 됐다"
+        );
+        // ★중첩 + **키 순서** — 타입 구조체로 넘기면 serde 가 **필드 선언 순서**로 쓰므로
+        //   python 삽입 순서와 정확히 같아진다. 이것이 골든 대조가 성립하는 유일한 방식이다.
+        #[derive(serde::Serialize)]
+        struct Inner {
+            state: &'static str,
+            steps: [u8; 3],
+        }
+        #[derive(serde::Serialize)]
+        struct Outer {
+            result: Inner,
+            n: Option<u8>,
+            t: bool,
+        }
+        let p = td.join("c.json");
+        atomic_write_json(&p, &Outer { result: Inner { state: "ok", steps: [1, 2, 3] }, n: None, t: true })
+            .expect("원자 쓰기 실패");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "{\n \"result\": {\n  \"state\": \"ok\",\n  \"steps\": [\n   1,\n   2,\n   3\n  ]\n },\n \"n\": null,\n \"t\": true\n}\n",
+            "타입 구조체 경로가 python 과 갈렸다 — 골든 대조가 불가능해진다"
+        );
+
+        // ★음성 대조 — **같은 내용을 `Value` 로 넘기면 키가 알파벳순으로 정렬된다**.
+        //   `serde_json` 이 `preserve_order` 없이 빌드되기 때문이며, 이것을 모르고 boot-last
+        //   골든을 `Value` 로 쓰면 python 과 조용히 갈린다. 사실을 검체로 박아 둔다.
+        assert_eq!(
+            write("c-value.json", serde_json::json!({"result": {"state": "ok"}, "n": null, "t": true})),
+            "{\n \"n\": null,\n \"result\": {\n  \"state\": \"ok\"\n },\n \"t\": true\n}\n",
+            "Value 경로의 키 정렬 성질이 바뀌었다 — preserve_order 가 켜졌는지 확인하라"
+        );
+        assert_eq!(write("d.json", serde_json::json!({})), "{}\n", "빈 객체 표기가 갈렸다");
+        assert_eq!(
+            write("e.json", serde_json::json!({"xs": [{"k": "v"}, []]})),
+            "{\n \"xs\": [\n  {\n   \"k\": \"v\"\n  },\n  []\n ]\n}\n",
+            "배열·빈 배열 표기가 갈렸다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-ATOMIC-2(A13): tmp 규약 — **유일 이름 · 자기 것만 청소 · 재시도 0**.
+    ///
+    /// 재는 것 넷:
+    ///   ① 성공 경로에 **tmp 잔재가 없다**(rename 으로 사라진다)
+    ///   ② tmp 이름이 **호출마다 다르다** — 고정 이름이면 같은 pid 의 두 task 가 서로의 tmp 를
+    ///      파손한다(python 이 주석으로 못박은 지배 실패 모드). pid 는 이름에 **넣지 않는다**.
+    ///   ③ 실패 경로(부모가 파일)에서도 **남의 tmp 를 지우지 않는다**
+    ///   ④ 덮어쓰기가 원자적이다 — 기존 파일이 있어도 rename 이 교체한다(Windows
+    ///      MoveFileEx REPLACE_EXISTING 의미)
+    #[test]
+    fn atomic_write_leaves_no_tmp_and_never_reuses_a_fixed_name() {
+        let td = std::env::temp_dir().join(format!("cys-atomic2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let target = td.join("state.json");
+
+        // ④ 기존 파일을 덮어쓴다.
+        std::fs::write(&target, b"old").unwrap();
+        atomic_write_json(&target, &serde_json::json!({"v": 1})).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\n \"v\": 1\n}\n");
+        atomic_write_json(&target, &serde_json::json!({"v": 2})).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\n \"v\": 2\n}\n");
+
+        // ① 성공 경로 tmp 잔재 0.
+        let leftovers: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "성공 경로에 tmp 가 남았다: {leftovers:?}");
+
+        // ② 쓰기 경로가 **실제로 쓰는** 이름이 호출마다 다르다(고정 이름 금지).
+        //    ★`tmp_suffix()` 만 재면 "난수는 유일한데 경로가 그것을 안 쓰는" 변이를 놓친다
+        //      (mutation A-M3 이 그 사각을 드러냈다) — 구성 함수 자체를 박는다.
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..64 {
+            names.insert(tmp_path_for(&td, "state.json"));
+        }
+        assert_eq!(
+            names.len(),
+            64,
+            "tmp 경로가 반복된다 — 같은 pid 의 두 task 가 서로의 임시 파일을 파손한다"
+        );
+        let pid = std::process::id().to_string();
+        let one = tmp_path_for(&td, "state.json").file_name().unwrap().to_string_lossy().into_owned();
+        assert!(one.starts_with(".tmp-state.json-"), "tmp 이름 규약이 갈렸다: {one}");
+        assert!(
+            !one.contains(&pid),
+            "tmp 이름에 pid 가 그대로 들어갔다 — python mkstemp 규약(A13)과 다르다: {one}"
+        );
+
+        // ③ 실패 경로: **tmp 가 만들어진 뒤에** rename 이 실패해야 청소 코드가 실제로 돈다.
+        //    ★대상 자리가 **디렉터리**면 write 는 성공하고 rename 이 실패한다 — 부모가 파일인
+        //      경우(create_dir_all 단계 실패)로는 이 경로를 한 번도 밟지 못한다(A-M4 가 그
+        //      사각을 드러냈다).
+        let victim = td.join(".tmp-someone-else-cafe");
+        std::fs::write(&victim, b"not mine").unwrap();
+        let target_is_dir = td.join("iam-a-dir");
+        std::fs::create_dir_all(&target_is_dir).unwrap();
+        let r = atomic_write_json(&target_is_dir, &serde_json::json!({"x": 1}));
+        assert!(r.is_err(), "대상이 디렉터리인데 쓰기가 성공했다");
+        assert!(
+            victim.exists(),
+            "실패 경로가 **남의** tmp 를 지웠다 — 진행 중인 동시 쓰기를 파손한다"
+        );
+        // 내 tmp 는 치웠다 — 남은 `.tmp-` 는 victim 하나뿐이어야 한다.
+        let tmps: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert_eq!(
+            tmps,
+            vec![".tmp-someone-else-cafe".to_string()],
+            "실패 경로가 자기 tmp 를 남겼거나 남의 것을 지웠다: {tmps:?}"
+        );
+
+        // 부모가 파일인 경우도 여전히 오류다(create_dir_all 단계).
+        let blocker = td.join("blocked");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        assert!(
+            atomic_write_json(&blocker.join("deep.json"), &serde_json::json!({"x": 1})).is_err(),
+            "부모가 파일인데 쓰기가 성공했다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     #[test]
     fn npm_config_prefix_injects_only_when_absent() {
         let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
