@@ -159,21 +159,44 @@ def _append_ledger(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _recommend_learn(reason, topic):
-    """RSI 학습 자율추천(best-effort) — feed 추천 항목만 생성한다(추천까지만 자율·착수는 사람
-    승인·directive §4). cys 부재·데몬 미가동·오류는 무시(추천은 비핵심 부가 신호 — 핵심 판정 불간섭)."""
-    import shutil
-    if not shutil.which("cys"):
-        return
-    body = ('{"reason":"%s","topic":"%s","status":"awaiting_approval"} — '
-            "feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 착수. directive §4: 추천까지만 자율." % (reason, topic))
+# ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
+# ★오너 승인 개정(2026-09-04 전면 감사): 자동 트리거(라운드 종료·eval ceiling)는 더 이상
+#   `cys feed push --kind learn_proposal` 로 **건별 승인 요청**을 발행하지 않는다. 승인권은
+#   오너뿐인데 자동 생성분 6건(최고령 19h48m)이 적체해 **실제 승인 요청**(SSH 프로브 9.5h)을
+#   덮었다. RSI_LEARNING_DIRECTIVE §7-4 "접점 신설 시 다이제스트가 기본값"이 이미 정본이므로
+#   코드를 정본에 맞춘 정합 수정이다(§3 도 같은 날 함께 개정).
+# ★큐 경로·레코드 모양은 javis_orchestra.py 의 동명 함수와 **동형**이어야 한다(같은 큐에 쓴다).
+#   패리티는 bin/tests/test_learn_digest_queue.py 가 기계 검증한다.
+#   경로 해소는 이 모듈의 기존 규약 `_learn_state_dir()` 을 그대로 쓴다 — 생산 형상에서는
+#   `<팩>/round/learn` 으로 orchestra 와 같고, `CYS_ROUND_DIR` 이 설정된 데몬 미러 형상에서만
+#   그 값을 따른다(이 모듈이 원래 갖고 있던 오버라이드 — 새로 만든 갈래가 아니다).
+LEARN_DIGEST_QUEUE = "digest_queue.jsonl"
+
+
+def learn_digest_queue_path():
+    """주간 다이제스트 큐 파일 — `<팩>/round/learn/digest_queue.jsonl`."""
+    return os.path.join(_learn_state_dir(), LEARN_DIGEST_QUEUE)
+
+
+def enqueue_learn_digest(reason, topic, source):
+    """추천 1건을 다이제스트 큐에 적재(best-effort). feed 는 **쏘지 않는다**. 반환: 적재 여부."""
     try:
-        subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
-                        # 제목 포맷은 cysd RPC 생산자(handlers.rs learn_proposal)와 동일 규격 유지.
-                        "--title", "[RSI 학습 추천] %s — %s" % (reason, topic), "--body", body],
-                       capture_output=True, timeout=5)
+        path = learn_digest_queue_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": time.time(), "reason": reason, "topic": topic, "source": source,
+               "status": "queued_for_weekly_digest"}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _recommend_learn(reason, topic):
+    """RSI 학습 자율추천(best-effort) — **다이제스트 큐 적재**만 한다(feed 발행 0).
+    추천까지만 자율·착수는 사람 승인이라는 directive §4 계약은 그대로이고, 바뀐 것은 **배달
+    채널**뿐이다. 오류는 무시한다(추천은 비핵심 부가 신호 — 핵심 판정 불간섭)."""
+    enqueue_learn_digest(reason, topic, "rsi.ceiling")
 
 
 # ───────────────────────── 명령 ─────────────────────────
