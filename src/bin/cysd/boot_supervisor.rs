@@ -317,6 +317,11 @@ impl TerminalKind {
     }
 
     /// 전 종착 열거 — 검체가 "빠짐 없음"(H-TERMINAL-1 열거 파리티)을 이것으로 잰다.
+    ///
+    /// ★`allow(dead_code)` 의 시한(정직 고지): 지금은 **검체만** 소비한다. 프로덕션 소비자는
+    /// B3(감독자 terminal 전이 — `Retire` 사유를 이 표로 합류시키는 지점)와 B4(러너 exit →
+    /// terminal 전사)이며, 그 두 티켓이 착지하면 이 속성은 **제거한다**. 영구 은폐가 아니다.
+    #[allow(dead_code)]
     pub const ALL: [TerminalKind; 11] = [
         TerminalKind::Completed,
         TerminalKind::CompletedDegraded,
@@ -333,6 +338,7 @@ impl TerminalKind {
 
     /// 구 `Disposition::Retire(why)` 문자열 → 종착 종류. 감독자의 종전 폐기 사유를 새 대수로
     /// **합류**시키는 유일 지점이다(사유 문자열 자체는 이벤트 호환을 위해 그대로 보존된다).
+    #[allow(dead_code)] // ← B3 감독자 terminal 전이가 소비한다(위 ALL 주석의 시한과 같다)
     pub fn from_retire_reason(why: &str) -> TerminalKind {
         match why {
             "expired" => TerminalKind::Expired,
@@ -745,6 +751,7 @@ impl EnqueueOutcome {
             EnqueueOutcome::Superseded { .. } => "superseded",
         }
     }
+    #[allow(dead_code)] // ← B2-b 훅 CLI 고지문이 경로를 인용한다(위 ALL 주석의 시한과 같다)
     pub fn path(&self) -> &Path {
         match self {
             EnqueueOutcome::Enqueued { path }
