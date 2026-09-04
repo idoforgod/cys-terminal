@@ -5510,9 +5510,70 @@ class Preflight:
     #   무엇인지 모르는 파일을 지우는 자동화가 더 위험하다. 처방만 말한다.
     # ★구버전은 SKIP: 매니페스트는 v0.14.30 부터 실린다. 그 이전 설치본에 없는 것은 정상이며
     #   경고할 일이 아니다(거짓 경보 금지 — C76 의 '판정 불가는 SKIP' 규율과 동형).
+    #   ★단 "부재=무조건 SKIP" 은 틀렸다(R1 codex #6): 0.14.30 **이상** 설치본에서 매니페스트만
+    #   사라진 경우까지 정상으로 덮으면, Windows 에서 유일한 변조 감지축이 조용히 없어진다
+    #   (mac 은 코드서명이 남지만 Windows 는 남는 게 0). 그래서 부재를 만나면 **설치본 버전을
+    #   판독해** 갈래를 나눈다 — 구버전이면 SKIP, 봉인 탑재 버전이면 WARN, 판독 불가면
+    #   '판정 불가' SKIP(측정 불능은 통과가 아니다 · R1 codex #7 에서 세운 같은 규율).
     RUNTIME_SEAL_RECOVERY = ("복구는 v0.14.30 이상으로 재설치 — 설치기가 .app(또는 설치 폴더)을 "
                              "**통째로 교체**하므로 오염 파일이 함께 사라지고 봉인이 자연 복원된다"
                              "(부분 삭제 불요·권장하지 않음). 상세 진단은 `cys doctor`")
+
+    # 이 봉인(runtime-manifest)이 실리기 시작한 버전. 이보다 낮은 설치본에 없는 것은 정상이다.
+    RUNTIME_SEAL_SINCE = "0.14.30"
+
+    def _installed_version_near(self, root):
+        """설치본 버전 판독 → (버전문자열|None, 판독처 설명). 판독처는 **설치 형태**가 정한다.
+
+        · macOS 번들: `<bundle>/Contents/Info.plist` 의 `CFBundleShortVersionString`
+          (실측 2026-09-04: 오너 설치본 `/Applications/cys.app` = "0.14.29" · XML plist).
+        · 그 외(Windows NSIS 포함): 설치 루트의 `cys-installed-version.txt`.
+          이 마커는 NSIS 훅이 **모든 게이트를 통과한 뒤에만** 쓴다(src-tauri/nsis-hooks.nsh:784
+          `cys_post_ok`) — 즉 '마지막으로 실제 반영된 버전'이다. 판정 재료로서는 정보성이지만
+          (WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:140), 여기서 묻는 것은 '설치가 성공한 버전이
+          무엇인가' 하나뿐이라 이 용도에는 정확하다.
+        판독 실패는 거짓말하지 않고 None 을 돌려준다 — 호출자가 '판정 불가'로 표현한다."""
+        bundle = self._app_bundle_of(root)
+        if bundle:
+            plist = os.path.join(bundle, "Contents", "Info.plist")
+            try:
+                import plistlib
+                with open(plist, "rb") as f:
+                    d = plistlib.load(f)
+                v = d.get("CFBundleShortVersionString") if isinstance(d, dict) else None
+            except Exception as e:  # noqa: BLE001 — 손상 plist·바이너리 형식 등
+                return None, "%s 판독 실패(%s)" % (plist, e)
+            if not isinstance(v, str) or not v.strip():
+                return None, "%s 에 CFBundleShortVersionString 없음" % plist
+            return v.strip(), plist
+        marker = os.path.join(os.path.dirname(root), "cys-installed-version.txt")
+        try:
+            with open(marker, encoding="utf-8", errors="replace") as f:
+                v = f.read().strip()
+        except OSError as e:
+            return None, "%s 판독 실패(%s)" % (marker, e)
+        if not v:
+            return None, "%s 가 비어 있음" % marker
+        return v, marker
+
+    def _runtime_seal_expected(self, ver):
+        """이 버전의 설치본은 매니페스트를 **싣고 있어야 하는가**. True/False/None(판정 불가).
+
+        비교는 결정론 도구(`javis_semver`)에 위임한다 — 문자열 대소 비교를 여기서 재발명하면
+        "0.14.9 vs 0.14.30" 같은 사전식 함정을 다시 만든다. `compare(기준선, 설치본)` 의
+        MAIN_AHEAD = 설치본이 기준선보다 낮다 = 구버전(SKIP).
+        ★알려진 경계: `0.14.30-rc1` 은 semver 상 0.14.30 미만이라 구버전으로 접힌다 —
+        정식 릴리스에만 걸리는 게이트라는 뜻이고, 거짓 경보보다 이쪽이 안전하다(fail-safe)."""
+        if not ver:
+            return None
+        try:
+            import javis_semver as _sv
+        except Exception:  # noqa: BLE001 — 팩에서 빠졌으면 판정 불가(추측 금지)
+            return None
+        verdict, _ev = _sv.compare(self.RUNTIME_SEAL_SINCE, ver)
+        if verdict == _sv.INCOMPARABLE:
+            return None
+        return verdict != _sv.MAIN_AHEAD
 
     def _find_runtime_seal_pair(self):
         """(매니페스트 경로, runtime 트리 경로) 또는 None. 설치 형태별 후보를 전부 본다."""
@@ -5554,8 +5615,24 @@ class Preflight:
             self.add(cid, SKIP, "동봉 런타임 트리 미발견(비번들 설치·개발 빌드) — 검사 대상 없음")
             return
         if not man:
-            self.add(cid, SKIP, "runtime-manifest 부재 — v0.14.30 이전 설치본이면 정상"
-                                "(이 봉인은 0.14.30 부터 실린다) · 트리: %s" % root)
+            # 부재를 만나면 설치본 버전으로 갈래를 나눈다(R1 codex #6) — 무조건 SKIP 은
+            # "신규 설치에서 매니페스트만 소실"을 정상으로 덮어 감지축을 통째로 없앤다.
+            ver, where = self._installed_version_near(root)
+            expected = self._runtime_seal_expected(ver)
+            if expected is None:
+                self.add(cid, SKIP, "runtime-manifest 부재 + 설치본 버전 판독 불가(%s) — "
+                                    "판정 불가(통과가 아니다) · 트리: %s" % (where, root))
+                return
+            if not expected:
+                self.add(cid, SKIP, "runtime-manifest 부재 — 설치본 %s 는 봉인 도입(v%s) 이전이라 "
+                                    "정상 · 판독처: %s · 트리: %s"
+                         % (ver, self.RUNTIME_SEAL_SINCE, where, root))
+                return
+            self.add(cid, WARN,
+                     "runtime-manifest 부재 — 설치본 %s 는 봉인 탑재 버전(v%s 이상)인데 매니페스트가 "
+                     "없다: 설치 후 runtime/** 변조를 잡을 축이 사라진 상태다(Windows 에는 코드서명 "
+                     "봉인이 없어 이것이 유일한 축) · 판독처: %s · 트리: %s · %s"
+                     % (ver, self.RUNTIME_SEAL_SINCE, where, root, self.RUNTIME_SEAL_RECOVERY))
             return
         try:
             m = _seal.load_manifest(man)
