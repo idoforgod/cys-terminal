@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""javis_todo_decl — todo 선언 블록 v1 파서·분류기 (DESIGN_declared-state.md §4-1·§4-2).
+r"""javis_todo_decl — todo 선언 블록 v1 파서·분류기 (DESIGN_declared-state.md §4-1·§4-2).
 
 todo 파일의 귀속·유효성을 **파일 안의 선언**으로만 판정한다(ADR-1). 파일명·경로·mtime은
 판정 입력이 아니다 — 이 사고의 6개 실패가 전부 "추론으로 메운 자리"에서 났기 때문이다.
