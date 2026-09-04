@@ -697,11 +697,17 @@ jobs:
           if (-not $inst) { Die "T4-14: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'
-          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          # ★가드 도달성(W-C 실증 · 33907581917): $ErrorActionPreference=Stop 아래서 글롭 미스는
+          #   조회 그 자리에서 throw 하므로 바로 다음 줄 Die 가 실행되지 않는다 — 가드가 자기가
+          #   보고하려는 바로 그 조건에서 사문이 된다. SilentlyContinue 로 조회를 비치명화해 가드를
+          #   도달 가능하게 만든다. Select-String 은 무매치일 때 .Matches[0] 인라인 접근이 제2의
+          #   throw 지점이라 조회와 가드를 분리해야 닫힌다(부착만으로는 안 닫힌다).
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $setup) { Die "T4-14: setup.exe 미발견" }
           # 기대 버전 = 빌드 SOT(루트 Cargo.toml [package].version — cys --version 의 CARGO_PKG_VERSION 원천)
-          $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if (-not $expVer) { Die "T4-14: Cargo.toml 버전 파싱 실패" }
+          $verHit = Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $verHit) { Die "T4-14: Cargo.toml 버전 파싱 실패" }
+          $expVer = $verHit.Matches[0].Groups[1].Value
           # ① 구버전 스탠드인: 다른 VERSIONINFO 를 가진 자기완결 PE(cmd.exe 사본)를 정식 자리에 —
           #    오라클(CYS_ORACLE)이 notfresh 로 판정해 스왑 기계가 실제로 돈다(단락 아님).
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -718,7 +724,7 @@ jobs:
           $exitOk = ($ri.ExitCode -eq 0)
           # ④ 정식 = 신본 바이트 + 실행 출력이 신버전. ★바이트 대조를 먼저 한다 — 스왑 실패로
           #    정식이 아직 cmd 스탠드인이면 `--version` 인자가 대화형 cmd 를 띄워 스텝이 hang 한다.
-          $srcCys = (Get-ChildItem 'src-tauri/binaries/cys-*.exe' | Select-Object -First 1)
+          $srcCys = (Get-ChildItem 'src-tauri/binaries/cys-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
           if (-not $srcCys) { Die "T4-14: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
           $shaOk = (Get-FileHash -Algorithm SHA256 -LiteralPath $cys).Hash -eq (Get-FileHash -Algorithm SHA256 -LiteralPath $srcCys.FullName).Hash
           $vOut = ''
@@ -772,9 +778,16 @@ jobs:
           if (-not $inst) { Die "T4-15: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'; $cysd = Join-Path $dir 'cysd.exe'
-          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          # ★가드 도달성(W-C 실증 · 33907581917): $ErrorActionPreference=Stop 아래서 글롭 미스는
+          #   조회 그 자리에서 throw 하므로 바로 다음 줄 Die 가 실행되지 않는다 — 가드가 자기가
+          #   보고하려는 바로 그 조건에서 사문이 된다. SilentlyContinue 로 조회를 비치명화해 가드를
+          #   도달 가능하게 만든다. Select-String 은 무매치일 때 .Matches[0] 인라인 접근이 제2의
+          #   throw 지점이라 조회와 가드를 분리해야 닫힌다(부착만으로는 안 닫힌다).
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $setup) { Die "T4-15: setup.exe 미발견" }
-          $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $verHit = Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $verHit) { Die "T4-15: Cargo.toml 버전 파싱 실패" }
+          $expVer = $verHit.Matches[0].Groups[1].Value
           function ShaOf($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash }
           # ① 사전 정돈 + 구버전 스탠드인 2종 배치(cmd 사본 = 다른 VERSIONINFO → 오라클 notfresh)
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -822,8 +835,9 @@ jobs:
           }
           # ④ 치유: 핸들 해제 후 재실행 — 계약 안내문의 기계 검증(스탠드인 프로세스는 계속 실행 중)
           $ri2 = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
-          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
-          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
+          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  -ErrorAction SilentlyContinue | Select-Object -First 1)
+          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
+          if (-not $srcCys -or -not $srcCysd) { Die "T4-15: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
           $healedCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
           $healedCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
           $noMark = -not (Test-Path (Join-Path $dir 'cys-install-failure.txt'))
