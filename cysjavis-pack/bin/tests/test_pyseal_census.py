@@ -209,6 +209,12 @@ REF_EXTS = (".rs", ".sh", ".py", ".ts", ".js", ".md", ".toml", ".yml", ".yaml", 
 REF_SKIP_DIRS = frozenset(("target", "node_modules", "_worktrees", ".git"))
 REF_NEEDLES = (b"PYTHONDONTWRITEBYTECODE", b"ENV_PY_NO_BYTECODE")
 REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와 동일) · 중복 없음
+    # ★2026-09-04 W-A 등재(IG-9 워크플로 생산자 쌍 `67e4849`/`9d452d9` 로 유입).
+    #   **봉인 점검 결과(등재 = 이 선언)**: 이것은 **진짜 강제점**이다 — 주석·문서 언급이 아니라
+    #   스텝 env 로 `PYTHONDONTWRITEBYTECODE: '1'` 을 실제로 건다(`:255`). 그 스텝이 Windows
+    #   러너에서 python 을 호출하므로 봉인이 그 실행에 **적용된다**. 따라서 니들 보유는 정상이며
+    #   제거 대상이 아니다(제거하면 그 레인만 봉인이 빠진다).
+    ".github/workflows/windows-build.yml",
     "cysjavis-pack/bin/tests/run_bootstrap_health.py",
     # ★2026-09-04 W-A A2 등재 — 훅 런처/본체 분할 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   python 서브프로세스를 하나도 띄우지 않는다(스폰 대상은 전부 `sh`/`dash`/`bash` 런처다) —
