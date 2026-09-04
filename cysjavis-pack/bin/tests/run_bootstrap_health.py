@@ -10745,7 +10745,17 @@ def _u22_violations(cli, daemon, sh):
     elif "set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON)" not in rh:
         v.append("CLI: run_hook 이 CYS_NO_AUTOSTART 를 자기 강제하지 않는다 — 단명 훅이 데몬을 낳는다(R2)")
 
-    ru = _u22_fn_body(cli, "fn run_hook_user_prompt_submit()")
+    # ★앵커를 **열린 괄호까지만** 잡는다(2026-09-04 · W-B 규명 · master 지시).
+    #   종전 앵커는 빈 인자 리터럴 `…submit()` 이었는데 B2-b(`7d99300`)에서 그 함수에 `input`
+    #   인자가 생겨 시그니처가 `(input: Option<&std::path::Path>)` 로 바뀌었다. 함수는 **실재**
+    #   하는데 앵커만 낡아, 그 리비전 이후 이 축은 "정의를 찾지 못했다(계측 불능)"로 **적색**이
+    #   됐다 — 시끄럽되 **사실 검증은 0회**인 무측정 적색이다(종전 '무음 통과'의 반대 극이며
+    #   같은 계급의 거짓 신호다: 하나는 결함을 숨기고 하나는 결함이 아닌 것을 결함이라 외친다).
+    #   이 축은 U-22 배선(fail-open · 전용 데드라인 · NO_AUTOSTART 자기강제 · 데몬 핫패스 금지)을
+    #   재는 **유일한 축**이라 방치하면 그 4종이 통째로 무관측이 된다.
+    #   ★오포착 없음(음성 대조 실측): `fn run_hook_user_prompt_submit(` 는 두 리비전 모두
+    #     **정확히 1건**이고 `…submit<접미>(` 형태의 유사 함수는 **0건**이다.
+    ru = _u22_fn_body(cli, "fn run_hook_user_prompt_submit(")
     if ru is None:
         v.append("CLI: run_hook_user_prompt_submit 정의를 찾지 못했다(계측 불능)")
     else:
