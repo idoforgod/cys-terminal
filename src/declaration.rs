@@ -323,9 +323,34 @@ fn starts_with_at(flat: &[char], at: usize, needle: &str) -> bool {
 }
 
 // ── lookahead 술어(정규식 밖으로 꺼낸 부분 — 의미는 python 과 동일) ────────────────
-/// `(?= {lo,hi}[가-힣])` — 리터럴 공백 `lo..=hi` 개 뒤에 한글 음절.
-/// python 의 `{n,m}` 은 탐욕적 백트래킹이지만 lookahead 는 **존재 판정**이라
-/// "어떤 k 가 성립하는가" 로 환원된다(결과 동일).
+//
+// ★원식 인용(master 조건 ① · `javis_detect.py` 원문 그대로 — 옮겨 쓰지 않고 **복사**한다):
+//
+//   _QGAP_ANY   = r"[^0-9A-Za-z가-힣]{0,%d}" % QUOTATIVE_GAP_MAX      # 일반 간격: 공백 포함
+//   _QGAP_STICK = r"[^\s0-9A-Za-z가-힣]{0,%d}" % QUOTATIVE_GAP_MAX   # 부착 간격: 공백 배제
+//   _QUOT_AUX = r"(?:는|은|도|두|만|까지|조차|마저|부터|라도|라두|나|야|요|유|여|밖에|밖엔|들|서)"
+//   QUOTATIVE = re.compile(
+//       "(?:"
+//       + _QGAP_STICK
+//       + r"(이?라고(?= {0,2}[가-힣])|면서(?=" + _QUOT_AUX + r"|$|[^가-힣]))"
+//       + "|" + _QGAP_ANY
+//       + r"(이?라고(?= {1,2}[가-힣]|" + _QUOT_AUX + r")|이?라(?:면서|는|며)|이?라니(?= {1,2}[가-힣])"
+//       + r"|처럼|가 ?뭐|가 무|[?？])"
+//       + ")")
+//
+// 이 정규식이 쓰는 look-around 는 **셋**이며 아래 세 술어가 1:1로 대응한다:
+//   ① `(?= {0,2}[가-힣])` · `(?= {1,2}[가-힣])`  → [`la_spaces_then_hangul`]
+//   ② `(?=` + `_QUOT_AUX` + `)`                  → [`la_quot_aux`]
+//   ③ `(?=_QUOT_AUX|$|[^가-힣])`                 → [`la_myeonseo`]
+// 나머지(`이?라(?:면서|는|며)`·`처럼`·`가 ?뭐`·`[?？]`)는 look-around 가 없어 문자 그대로 옮겼다.
+
+/// 원식: `(?= {0,2}[가-힣])`(부착군 `이?라고`) · `(?= {1,2}[가-힣])`(일반군 `이?라고`·`이?라니`).
+/// 즉 **리터럴 공백** `lo..=hi` 개 뒤에 한글 음절이 오는가.
+///
+/// ★python 의 `{n,m}` 은 탐욕적 백트래킹이지만 lookahead 는 **존재 판정**이라
+/// "어떤 k 가 성립하는가"로 환원된다(결과 동일). 그래서 `lo..=hi` 를 전수로 돈다.
+/// ★`[가-힣]` 은 **완성형 음절 블록**이며 자모(`ㄱ`·`ㅏ`)는 포함하지 않는다 —
+/// [`is_hangul_syllable`] 이 그 경계를 든다(검체가 자모 음성 대조를 박는다).
 fn la_spaces_then_hangul(flat: &[char], at: usize, lo: usize, hi: usize) -> bool {
     for k in lo..=hi {
         if at + k < flat.len()
@@ -338,12 +363,23 @@ fn la_spaces_then_hangul(flat: &[char], at: usize, lo: usize, hi: usize) -> bool
     false
 }
 
-/// `(?=<보조사>)` — 폐집합 보조사 중 하나가 그 자리에서 시작하는가.
+/// 원식: `(?=` + `_QUOT_AUX` + `)` — 폐집합 보조사 중 하나가 **그 자리에서 시작**하는가.
+///
+/// 원식의 `_QUOT_AUX` 는 교대(`|`)라 python 은 적힌 순서대로 시도하지만, 여기서는 **존재
+/// 판정**뿐이라 순서가 결과를 바꾸지 않는다(어느 하나라도 맞으면 참). 그래서 [`QUOT_AUX`] 는
+/// 순서 무관 배열이다 — 다만 집합이 갈리면 갈리므로 원소는 python 과 **같아야** 한다.
 fn la_quot_aux(flat: &[char], at: usize) -> bool {
     QUOT_AUX.iter().any(|a| starts_with_at(flat, at, a))
 }
 
-/// `면서(?=<보조사>|$|[^가-힣])`.
+/// 원식: `면서(?=` + `_QUOT_AUX` + `|$|[^가-힣])` — `면서` **뒤**의 경계 판정 3택.
+///
+/// 세 대안이 각각 다른 사실을 말한다(하나라도 빠뜨리면 극성이 뒤집힌다):
+///   ⓐ `_QUOT_AUX`  — 보조사 직결 = 조사의 연장 → **억제**(예: `면서는`)
+///   ⓑ `$`          — 문자열 끝 → **억제**
+///   ⓒ `[^가-힣]`   — 비한글(공백·구두점·영숫자·자모) → **억제**
+/// 그 여집합, 곧 **한글 음절 직결**은 단어 어두라 억제하지 않는다(예: `면서기` = 面書記).
+/// 이 극성이 뒤집히면 "…면서 기다려" 류가 전부 발화하거나(과발화) `면서기` 가 억제된다.
 fn la_myeonseo(flat: &[char], at: usize) -> bool {
     la_quot_aux(flat, at) || at >= flat.len() || !is_hangul_syllable(flat[at])
 }
@@ -722,6 +758,92 @@ mod tests {
         // 단조성 — 억제된 후보가 앞에 있어도 억제되지 않은 선언 하나면 FIRE.
         let mono = detect("'너는 마스터다'가 무슨 뜻? 아무튼 너는 마스터다.");
         assert!(mono.fire(), "단조성 위반(억제 후보가 정당 선언을 삼켰다): {mono:?}");
+    }
+
+    /// ★H-LA-BOUNDARY-1(master 조건 ① · 2026-09-04): **lookahead 술어의 경계 극성**을
+    /// 양성·음성 **각각** 박는다.
+    ///
+    /// 왜 코퍼스 파리티만으로는 부족한가: 코퍼스 93건은 실문장이라 경계가 **우연히** 통과할 수
+    /// 있다(실제로 `면서` lookahead 를 무조건 참으로 바꿔도 93건이 전부 초록이었다 — 그 사고가
+    /// `lookahead-pins.json` 을 낳았다). 여기서는 술어를 **직접**, 경계 문자 하나 단위로 잰다.
+    ///
+    /// 기대값의 출처는 추측이 아니라 **python 원식 직접 실측**이다: `javis_detect.py` 의
+    /// `_QUOT_AUX`·`QUOTATIVE` 에서 look-around 조각만 떼어 단독 판정시킨 표
+    /// (`evidence/b1-lookahead-boundary.txt`)를 그대로 옮겼다.
+    #[test]
+    fn lookahead_predicate_boundaries_match_the_measured_python_polarity() {
+        let f = |s: &str| -> Vec<char> { s.chars().collect() };
+
+        // ── ① `(?= {0,2}[가-힣])` — 부착군 `이?라고` 뒤 ──────────────────────────────
+        // 양성: 공백 0·1·2칸 뒤 한글 음절.
+        for after in ["가", " 가", "  가", "가나"] {
+            assert!(
+                la_spaces_then_hangul(&f(after), 0, 0, QUOTATIVE_GAP_MAX),
+                "{after:?} 는 양성이어야 한다(공백 0~2칸 + 한글)"
+            );
+        }
+        // 음성: 공백 3칸(상한 초과) · 비한글 · **자모**(완성형 아님) · 끝 · 공백만.
+        for after in ["   가", "A", "ㄱ", "", " ", "  "] {
+            assert!(
+                !la_spaces_then_hangul(&f(after), 0, 0, QUOTATIVE_GAP_MAX),
+                "{after:?} 는 음성이어야 한다 — 극성이 뒤집히면 과억제(무발화)로 기운다"
+            );
+        }
+
+        // ── ② `(?= {1,2}[가-힣])` — 일반군 `이?라고`·`이?라니` 뒤(공백 **필수**) ────────
+        // ★①과 갈리는 유일한 자리가 '공백 0칸'이다. 이것이 뒤집히면 두 군의 구분이 사라진다.
+        assert!(
+            !la_spaces_then_hangul(&f("가"), 0, 1, QUOTATIVE_GAP_MAX),
+            "일반군은 공백 0칸을 받지 않는다 — 부착군과 구분이 사라진다"
+        );
+        for after in [" 가", "  가"] {
+            assert!(la_spaces_then_hangul(&f(after), 0, 1, QUOTATIVE_GAP_MAX), "{after:?}");
+        }
+        for after in ["   가", "A", "", " "] {
+            assert!(!la_spaces_then_hangul(&f(after), 0, 1, QUOTATIVE_GAP_MAX), "{after:?}");
+        }
+
+        // ── ③ `(?=_QUOT_AUX)` — 폐집합 보조사 ────────────────────────────────────────
+        // 양성: 집합 20종 **전수**(하나라도 빠지면 그 형태가 조용히 발화한다).
+        for aux in QUOT_AUX {
+            assert!(
+                la_quot_aux(&f(aux), 0),
+                "_QUOT_AUX 원소 {aux:?} 가 술어에서 빠졌다"
+            );
+        }
+        assert_eq!(QUOT_AUX.len(), 20, "_QUOT_AUX 집합 크기가 python(20종)과 갈렸다");
+        // 음성: 집합 밖 한글 · 끝 · 자모.
+        for after in ["가", "", "한", "ㄴ"] {
+            assert!(
+                !la_quot_aux(&f(after), 0),
+                "{after:?} 가 보조사로 잡혔다 — 집합이 열리면 과억제된다"
+            );
+        }
+
+        // ── ④ `면서(?=_QUOT_AUX|$|[^가-힣])` — 3택 경계 ──────────────────────────────
+        // 양성 = **억제** 방향. 세 대안이 각각 다른 사실이다.
+        for (after, why) in [
+            ("는", "ⓐ 보조사 직결 = 조사의 연장"),
+            ("요", "ⓐ 보조사(요-변이)"),
+            ("들", "ⓐ 보조사(복수)"),
+            ("", "ⓑ 문자열 끝"),
+            ("  ", "ⓒ 비한글(공백)"),
+            ("A", "ⓒ 비한글(영문)"),
+            ("ㄱ", "ⓒ 비한글(자모 — 완성형 아님)"),
+            ("?", "ⓒ 비한글(구두점)"),
+        ] {
+            assert!(
+                la_myeonseo(&f(after), 0),
+                "면서 뒤 {after:?} 는 양성이어야 한다({why})"
+            );
+        }
+        // 음성 = **발화** 방향: 한글 음절 직결은 단어 어두다(`면서기` = 面書記).
+        for after in ["기", "가"] {
+            assert!(
+                !la_myeonseo(&f(after), 0),
+                "면서 뒤 한글 음절 {after:?} 가 억제됐다 — `면서기` 같은 단어가 통째로 죽는다"
+            );
+        }
     }
 
     /// ★lookahead 술어 판별 핀(**mutation 이 뚫고 나간 자리를 메운다**).
