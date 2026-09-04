@@ -108,19 +108,37 @@ try:
     check("4b 레코드 키 집합 동형", set(rows[0]) == set(rows[-1]), repr((sorted(rows[0]), sorted(rows[-1]))))
     check("4c 파일명 상수 동형", O.LEARN_DIGEST_QUEUE == R.LEARN_DIGEST_QUEUE)
 
-    # ⑤ ★음성 대조 — HEAD 의 구 javis_rsi 는 같은 목에서 feed 를 쏜다
-    old = None
+    # ⑤ ★음성 대조 — 구 javis_rsi 는 같은 목에서 feed 를 쏜다
+    #
+    # ★기준점을 HEAD 에서 **이력 탐색**으로 옮겼다(2026-09-04 실측 수리). 두 결함이 겹쳐 있었다:
+    #   ⓐ **이동하는 기준점**: 개정이 커밋되는 순간 HEAD 는 개정본이 된다 — 이 대조는 '개정 전'을
+    #      필요로 하므로 HEAD 기준은 개정 커밋 **전에만** 유효했다(커밋과 동시에 자기 파괴).
+    #   ⓑ **산문이 판별자를 통과했다**: 가드가 `"feed" not in old` 였는데, 개정본의 주석이 폐지
+    #      사유를 설명하며 `cys feed push --kind learn_proposal` 을 **그대로 인용**한다. 그래서
+    #      가드는 "구본이다"라고 오판했고, 개정본을 구본으로 실행해 ⑤·⑤b 가 함께 적색이 됐다.
+    # 그래서 판별을 **호출 형상**(`"cys", "feed", "push"` — 산문에는 없고 argv 리터럴에만 있다)으로
+    # 바꾸고, 그 형상을 가진 **가장 최근 블롭**을 이력에서 찾는다. 못 찾으면 조용히 통과하지 않고
+    # SKIP 사유를 출력한다.
+    CALL_PIN = '"cys", "feed", "push"'
+    REL = "cysjavis-pack/bin/javis_rsi.py"
+    old = old_sha = None
     if shutil.which("git") and os.path.exists(os.path.join(REPO, ".git")):
-        r = subprocess.run(["git", "-C", REPO, "show", "HEAD:cysjavis-pack/bin/javis_rsi.py"],
-                           capture_output=True, text=True, timeout=30)
-        if r.returncode == 0:
-            old = r.stdout
+        lg = subprocess.run(["git", "-C", REPO, "log", "--format=%H", "-n", "80", "--", REL],
+                            capture_output=True, text=True, timeout=60)
+        for sha in (lg.stdout or "").split():
+            b = subprocess.run(["git", "-C", REPO, "show", "%s:%s" % (sha, REL)],
+                               capture_output=True, text=True, timeout=30)
+            if b.returncode == 0 and CALL_PIN in b.stdout:
+                old, old_sha = b.stdout, sha
+                break
     if old is None:
-        print("SKIP 5 구 코드 대조 — git 부재/조회 실패(조용한 통과 아님: 이 줄이 그 사실이다)")
-    elif "feed" not in old or "learn_proposal" not in old:
-        check("5 구 코드가 feed 발행 코드를 갖고 있다", False,
-              "HEAD 가 이미 개정본이다 — 이 대조는 개정 커밋 **전**에만 유효하다")
+        print("SKIP 5 구 코드 대조 — 이력에서 feed 호출 판(%s)을 못 찾았다(git 부재·얕은 클론·"
+              "이력 절단). 조용한 통과 아님: 이 줄이 그 사실이다" % CALL_PIN)
     else:
+        check("5-0 판별자가 **호출 형상**이다(산문 인용에 속지 않는다)",
+              CALL_PIN in old and CALL_PIN not in open(
+                  os.path.join(PACK, "bin", "javis_rsi.py"), encoding="utf-8").read(),
+              "구본 %s 에는 있고 개정본에는 없어야 한다" % (old_sha or "")[:8])
         oldp = os.path.join(root, "old_javis_rsi.py")
         open(oldp, "w", encoding="utf-8", newline="\n").write(old)
         spec = importlib.util.spec_from_file_location("old_javis_rsi", oldp)
