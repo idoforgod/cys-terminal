@@ -141,18 +141,31 @@ try:
     check("1e 판정불가 ack = null(미측정)", "ack" in pl2 and pl2["ack"] is None, repr(pl2.get("ack")))
     check("1f 판정불가는 ready 를 false 로 두지 않는다(측정 없음 ≠ 측정 결과)",
           pl2.get("ready") is None, repr(pl2.get("ready")))
-    # ─────────────── ①-b exit 64 = **사용 오류**(측정불가 2 와 분리 · R1 codex #3) ───────────────
-    for _args, _label in ((["--no-such-flag"], "최상위 오타"),
-                          (["check", "--no-such-flag"], "서브커맨드 오타"),
-                          (["nosuchcmd"], "미지 서브커맨드"),
-                          (["review-prompt"], "필수 인자 누락")):
+    # ───────── ①-b 사용 오류 exit — **`check` 한정 64**(R1 codex #3 · 범위 R2 codex #3) ─────────
+    #   64 의 근거는 "`check` 에서 2 가 **판정 불가**라는 의미를 이미 갖는다"였다. 그 충돌은
+    #   check 에만 있으므로 `review-prompt`·`task-prompt`·최상위의 2 는 **뺏지 않는다** —
+    #   R1 구현은 최상위 파서를 갈아 전 명령을 64 로 만들었고 그것이 범위 밖 계약 변경이었다.
+    for _args, _label, _want in ((["check", "--no-such-flag"], "check 오타", 64),
+                                 (["check", "--json", "--no-such-flag"], "check 오타(플래그 뒤)", 64),
+                                 (["--no-such-flag"], "최상위 오타(서브커맨드 없음)", 2),
+                                 (["nosuchcmd"], "미지 서브커맨드", 2),
+                                 (["review-prompt"], "review-prompt 필수 인자 누락", 2),
+                                 (["review-prompt", "--no-such-flag"], "review-prompt 오타", 2),
+                                 (["task-prompt"], "task-prompt 필수 인자 누락", 2)):
         _rr = run(_args, base)
-        check("1g %s → exit 64" % _label, _rr.returncode == 64,
+        check("1g %s → exit %d" % (_label, _want), _rr.returncode == _want,
               repr((_rr.returncode, _rr.stderr[-120:])))
-    check("1h `--help` 는 0 유지(사용 오류가 아니다)", run(["--help"], base).returncode == 0)
+    check("1h `--help` 는 0 유지(사용 오류가 아니다 · 3경로)",
+          run(["--help"], base).returncode == 0
+          and run(["check", "--help"], base).returncode == 0
+          and run(["review-prompt", "--help"], base).returncode == 0)
     check("1i 64 와 2 는 **다른 값**이다(합치면 오타에 `cys ping` 처방이 붙는다)",
           run(["check"], env_nostatus).returncode == 2
-          and run(["nosuchcmd"], base).returncode == 64)
+          and run(["check", "--no-such-flag"], base).returncode == 64)
+    check("1j ★비-check 명령의 2 를 뺏지 않는다(R2 #3 — 범위 밖 계약 변경 차단)",
+          run(["review-prompt"], base).returncode == 2
+          and run(["nosuchcmd"], base).returncode == 2,
+          "이 축이 무너지면 R1 의 '전 명령 64' 로 되돌아간 것이다")
 
 
     # ─────────────── ② 정상(구 데몬 = boot_v2_enabled 없음) → exit 0 · 축 off ───────────────
@@ -277,6 +290,16 @@ try:
           'getattr(_orch_ck, "CHECK_EXIT_ACK_PENDING", 12)' in src_bs)
     check("9b 폴백 리터럴이 정본 값과 같다", orch.CHECK_EXIT_ACK_PENDING == 12,
           repr(orch.CHECK_EXIT_ACK_PENDING))
+    # ★사용 오류 exit 규칙의 **정본은 순수 함수**다 — 프로세스를 띄우지 않고 argv 조합을 직접 먹인다
+    check("9b-2 usage_exit_code: `check` 만 64, 나머지·서브커맨드 부재는 종전 2",
+          orch.usage_exit_code(["check", "--x"]) == 64
+          and orch.usage_exit_code(["check"]) == 64
+          and orch.usage_exit_code(["review-prompt", "--x"]) == 2
+          and orch.usage_exit_code(["nosuchcmd"]) == 2
+          and orch.usage_exit_code(["--x"]) == 2
+          and orch.usage_exit_code([]) == 2,
+          repr([orch.usage_exit_code(a) for a in
+                (["check", "--x"], ["review-prompt", "--x"], ["--x"], [])]))
     check("9c ⑤ 루프가 12 를 0 으로 접고 라벨을 남긴다",
           "if code == CHECK_ACK_PENDING:" in src_bs and "ack_pending = True" in src_bs
           and "0 취급" in src_bs)

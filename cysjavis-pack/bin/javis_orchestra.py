@@ -782,18 +782,38 @@ CHECK_EXIT_USAGE = 64           # ★사용 오류(argparse) — **측정불가(
 
 
 class UsageExitParser(argparse.ArgumentParser):
-    """사용 오류를 **exit 64** 로 내는 파서(부트 v2 명세 §4 잠근 exit 표 · R1 codex #3).
+    """사용 오류 exit 를 **호출 대상별로** 정하는 파서(부트 v2 명세 §4 잠근 exit 표 · R1 codex #3).
 
-    ★왜 기본값 2 를 쓰면 안 되는가: 이 도구에서 `2` 는 **판정 불가**(데몬 소실·status 수집 실패)
-      라는 확정된 의미를 갖는다. argparse 기본값도 2 라서, 오타 하나가 '데몬이 죽었다'와 같은
-      코드로 나가고 소비자는 `cys ping` 을 확인하는 **틀린 처방**을 탄다. 실제로
-      `javis_bootstrap` ⑤ 는 exit 2 를 보면 ping 을 한 번 더 치고 '팩 결손 가능성'을 진단한다 —
-      인자 오타에 그 진단이 붙는다. 두 사건은 처방이 정반대이므로 코드도 갈라야 한다.
-    ★`--help`(exit 0)와 정상 종료는 건드리지 않는다 — `error()` 경로만 64 다."""
+    ★왜 `check` 에서 기본값 2 를 쓰면 안 되는가: **그 명령에서** `2` 는 **판정 불가**(데몬
+      소실·status 수집 실패)라는 확정된 의미를 갖는다. argparse 기본값도 2 라서, 오타 하나가
+      '데몬이 죽었다'와 같은 코드로 나가고 소비자는 `cys ping` 을 확인하는 **틀린 처방**을 탄다.
+      실제로 `javis_bootstrap` ⑤ 는 exit 2 를 보면 ping 을 한 번 더 치고 '팩 결손 가능성'을
+      진단한다 — 인자 오타에 그 진단이 붙는다. 두 사건은 처방이 정반대이므로 코드도 갈라야 한다.
+    ★그러나 그 충돌은 **`check` 에만 있다**(R2 codex #3 major). `review-prompt`·`task-prompt` 등
+      다른 명령의 2 는 판정 불가라는 의미를 갖지 않으므로, 64 로 바꾸면 **범위 밖 계약 변경**이고
+      기존 소비자가 기대하던 값을 조용히 뺏는다. 그래서 기본값은 **종전 argparse 그대로 2**이고,
+      `check` 를 향한 호출만 64 로 올린다(최상위 오타·형제 서브커맨드 무영향).
+    ★`--help`(exit 0)와 정상 종료는 건드리지 않는다 — `error()` 경로만 이 값을 쓴다.
+    ★왜 파서 인스턴스 플래그가 아니라 **argv 판별**인가(실측): argparse 의 서브파서는 남는
+      토큰을 extras 로 **위로 올리고** 최상위 `parse_args` 가 "unrecognized arguments" 로
+      종료시킨다. 즉 `check --오타` 의 오류 **주체는 check 파서가 아니라 최상위 파서**다 —
+      `ck.usage_exit = 64` 만으로는 정작 그 갈래가 안 잡힌다(rc 2 로 떨어지는 것을 실측했다).
+      그래서 "이 호출이 **어느 서브커맨드를 향했는가**"로 판별한다."""
 
     def error(self, message):
         self.print_usage(sys.stderr)
-        self.exit(CHECK_EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+        self.exit(usage_exit_code(sys.argv[1:]), "%s: error: %s\n" % (self.prog, message))
+
+
+def usage_exit_code(argv):
+    """사용 오류 exit 코드 — **`check` 를 향한 호출만 64**, 그 밖은 종전 argparse **2**(순수 함수).
+
+    순수 함수로 빼는 이유: 검체가 프로세스를 띄우지 않고 argv 조합을 직접 먹여 경계를 잴 수 있다
+    (그리고 이 규칙이 한 곳에만 적힌다). 판별 = **첫 위치인자**(서브커맨드 자리)."""
+    for a in argv:
+        if not a.startswith("-"):
+            return CHECK_EXIT_USAGE if a == "check" else 2
+    return 2                        # 서브커맨드 없음(최상위 오타·플래그만) = 종전 2
 
 
 def ack_axis_enabled(status):
@@ -3545,6 +3565,15 @@ def cmd_self_test(args):
             "사용 오류에 데몬 처방(`cys ping`)이 붙었다 — 처방 오귀속"
         assert "판정 불가" in classify_call_exit(2)[1], "exit 2 의 의미가 '판정 불가'가 아니다"
         assert issubclass(UsageExitParser, argparse.ArgumentParser), "파서 계약 파손"
+        # ★사용 오류 64 는 **`check` 한정**이다(R2 codex #3). R1 구현은 최상위 파서를 갈아
+        #   `review-prompt` 등 비-check 명령의 종전 2 까지 64 로 바꿨다 — 범위 밖 계약 변경이다.
+        assert usage_exit_code(["check"]) == CHECK_EXIT_USAGE \
+            and usage_exit_code(["check", "--x"]) == CHECK_EXIT_USAGE, "check 사용 오류가 64 가 아니다"
+        assert usage_exit_code(["review-prompt", "--x"]) == 2 \
+            and usage_exit_code(["task-prompt"]) == 2 and usage_exit_code(["nosuchcmd"]) == 2, \
+            "비-check 명령의 종전 exit 2 를 뺏었다(R2 #3 회귀)"
+        assert usage_exit_code(["--x"]) == 2 and usage_exit_code([]) == 2, \
+            "서브커맨드가 없는 최상위 오타는 종전 2 다"
         _v_ok = {"cso": {"satisfied": True, "filler": "cso"},
                  "reviewer-gemini": {"satisfied": True, "filler": "reviewer-gemini"}}
         _rost = [{"role": "reviewer-gemini"}]
@@ -3636,8 +3665,8 @@ def main():
     if "--note-team-roster" in sys.argv:
         print(team_roster_note())
         return 0
-    # ★사용 오류는 **64**로 나간다(명세 §4 잠근 exit 표) — 서브파서도 같은 클래스를 물려받는다
-    #   (argparse 의 `add_subparsers` 는 기본 `parser_class=type(self)`).
+    # ★사용 오류 exit: 최상위·비-check 서브커맨드는 **종전 argparse 2** 그대로이고 `check` 하나만
+    #   64 다(명세 §4 잠근 exit 표 · R2 codex #3 — 규칙 정본은 `usage_exit_code`).
     ap = UsageExitParser(description="LLM 오케스트레이션 결정론 도구(앵커4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
