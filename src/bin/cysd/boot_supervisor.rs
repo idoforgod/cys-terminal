@@ -592,6 +592,18 @@ pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
             until: it.next_attempt_at,
         };
     }
+    // ★B3(명세 §2-6): `running` 은 **러너가 소유**한다 — 감독자는 재디스패치하지 않는다.
+    //   종전엔 성공 디스패치가 파일을 지웠으므로 이 상태가 스풀에 존재할 수 없었다. 이제
+    //   남으므로, 이 게이트가 없으면 다음 틱이 같은 인텐트를 **또 낳는다**(폭주 = 치명위험 ①).
+    //   ★현재 해제 조건은 위의 수명 상한(`expired` · [`INTENT_MAX_AGE_SECS`]) 하나다. hb 정지·
+    //   progress 불변·절대 마감으로 정밀화하는 것이 fence(§2-6)이고 **B3 다음 단위**다 —
+    //   그때까지 죽은 러너의 인텐트는 최대 수명만큼 남는다(유계 · 조용하지 않다: 같은 좌석의
+    //   새 선언은 `superseded` 로 **기록+처방**이 나간다).
+    if it.state == IntentState::Running {
+        return Disposition::Wait {
+            until: it.next_attempt_at,
+        };
+    }
     Disposition::Run(action)
 }
 
@@ -1593,18 +1605,37 @@ fn tick_in(
                 // 다음 세대가 시도 수를 잃지 않는다(예산의 안전 방향 = 과소가 아니라 과다).
                 let mut persisted = it.clone();
                 persisted.attempts = next;
+                // ★B3(명세 §2-6): `generation+1` 도 **스폰 전에** 영속한다. 이 값이 곧 lease 이고
+                //   러너의 side-effect RPC 는 이것으로 CAS 된다 — 스폰 뒤에 올리면 그 사이 살아난
+                //   러너가 **낡은 세대**로 RPC 를 통과시킨다(fencing 의 존재 이유가 사라진다).
+                persisted.generation = it.generation.saturating_add(1);
                 persisted.next_attempt_at = backoff_until(next, now);
                 let persist_err = write_intent(dir, &persisted).err();
-                let outcome = dispatch_one(daemon, it, action, runner);
+                // 러너에게는 **새 세대를 실은 인텐트**를 넘긴다(원장 줄의 attempts 도 실제로 실행된
+                // 값이 된다 — 종전엔 한 세대 낡은 값이 실렸다).
+                let outcome = dispatch_one(daemon, &persisted, action, runner);
                 match outcome {
                     Ok(detail) => {
-                        let removed = remover(&intent_path(dir, &it.id));
+                        // ★B3(명세 §2-6): 스폰 성공은 인텐트를 **지우지 않는다** — `state=running`
+                        //   으로 전이해 러너가 소유권(lease)을 갖는다. 종전의 삭제는 "실행됐다"는
+                        //   사실과 "누가 몇 세대로 실행 중인가"를 **동시에 잃었다**: 그래서 재개도
+                        //   fencing 도 불가능했고, 크래시한 러너와 살아 있는 러너를 구별할 근거가
+                        //   디스크에 남지 않았다.
+                        //   전이 실패는 삼키지 않는다(`transition_error`) — 실패하면 파일은 여전히
+                        //   `pending` 이라 수명 안에서 재디스패치가 일어날 수 있다. 그것은 유계이고
+                        //   (attempts 상한) 조용하지 않은 것이 조용한 것보다 낫다.
+                        let mut running = persisted.clone();
+                        running.state = IntentState::Running;
+                        let transition_err = write_intent(dir, &running).err();
                         publish(
                             daemon,
                             "boot_supervisor.dispatched",
                             json!({"id": it.id, "action": action.as_str(),
-                                   "attempt": next, "detail": detail, "removed": removed,
-                                   "persist_error": persist_err}),
+                                   "attempt": next, "detail": detail,
+                                   "state": running.state.as_str(),
+                                   "generation": running.generation,
+                                   "persist_error": persist_err,
+                                   "transition_error": transition_err}),
                         );
                     }
                     // (P2 · R3-P2-5) 전제 붕괴(claim_stale) — 재시도가 아니라 **폐기**다.
@@ -2138,16 +2169,68 @@ mod tests {
         assert_eq!(n, MAX_DISPATCH_PER_TICK, "틱당 상한 위반 — 폭주 차단 실패");
     }
 
-    /// 성공하면 인텐트는 사라진다(재실행 0).
+    /// ★B3(§2-6) 계약 개정: 성공하면 인텐트는 **사라지지 않고** `state=running` 으로 전이한다.
+    ///
+    /// 종전 계약("성공하면 사라진다")은 재실행 0 을 **삭제**로 얻었고, 그 대가로 "누가 몇
+    /// 세대로 실행 중인가"를 디스크에서 통째로 잃었다 — 그래서 재개도 fencing 도 불가능했다.
+    /// 이제 재실행 0 은 **상태 게이트**(`decide` 의 running 분기)가 세운다. 이 검체는 계약이
+    /// 바뀐 자리와 **바뀌지 않은 보증**을 함께 박제한다: 파일은 남되 **재실행은 여전히 0**이다.
     #[test]
-    fn success_retires_the_intent() {
+    fn success_transitions_the_intent_to_running_and_never_reruns() {
         let d = tmp_daemon("success");
         let dir = tmp_spool("success");
         enqueue_in(&dir, &req("s", None), 0.0).unwrap();
         let mut st = SupState::default();
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
-        assert!(!intent_path(&dir, "s").exists(), "성공 후에도 인텐트가 남았다");
-        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 100.0), 0, "재실행이 일어났다");
+        let p = intent_path(&dir, "s");
+        assert!(p.exists(), "성공 디스패치가 인텐트를 지웠다 — 소유권·세대 근거가 사라진다");
+        let after = BootIntent::from_str("s", &std::fs::read_to_string(&p).unwrap())
+            .expect("전이 후 인텐트가 판독 불가다");
+        assert_eq!(after.state, IntentState::Running, "성공 후 state 가 running 이 아니다");
+        assert_eq!(after.generation, 1, "lease 세대가 오르지 않았다(fencing 근거 부재)");
+        // ★바뀌지 않은 보증 — 다음 틱이 같은 인텐트를 또 낳지 않는다(폭주 = 치명위험 ①).
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 100.0),
+            0,
+            "running 인텐트가 재실행됐다 — 상태 게이트가 삭제를 대체하지 못했다"
+        );
+    }
+
+    /// ★B3(§2-6) 단위1 — `generation+1` 은 **스폰 전에** 영속된다.
+    ///
+    /// 순서가 계약인 이유: 이 값이 곧 lease 이고 러너의 side-effect RPC 가 이것으로 CAS 된다.
+    /// 스폰 뒤에 올리면 그 사이 살아난 러너가 **낡은 세대**로 RPC 를 통과시켜 fencing 이 무의미해진다.
+    /// 그래서 ⓐ러너가 받은 값과 ⓑ스폰이 **실패해도** 디스크에 남는 값 둘 다로 순서를 증명한다.
+    #[test]
+    fn dispatch_persists_the_new_lease_before_spawn() {
+        use std::sync::atomic::{AtomicU32, Ordering as AOrd};
+        static SEEN_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+        fn gen_probe(_d: &Arc<Daemon>, i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+            SEEN_GEN.store(i.generation, AOrd::Relaxed);
+            Ok("ok".into())
+        }
+        fn gen_probe_fail(_d: &Arc<Daemon>, i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+            SEEN_GEN.store(i.generation, AOrd::Relaxed);
+            Err(RunErr::Retry("spawn_failed".into()))
+        }
+        // ⓐ 러너는 **올라간 뒤의** 세대를 본다.
+        let d = tmp_daemon("lease");
+        let dir = tmp_spool("lease");
+        enqueue_in(&dir, &req("g", None), 0.0).unwrap();
+        let mut st = SupState::default();
+        assert_eq!(tick_in(&d, &dir, &mut st, gen_probe, remove_spool_file, 1.0), 1);
+        assert_eq!(SEEN_GEN.load(AOrd::Relaxed), 1, "러너가 낡은 세대(0)를 받았다 — 스폰 후 증가");
+
+        // ⓑ 스폰이 실패해도 세대는 이미 디스크에 있다(순서가 결과와 무관함을 보인다).
+        let d2 = tmp_daemon("leasefail");
+        let dir2 = tmp_spool("leasefail");
+        enqueue_in(&dir2, &req("g", None), 0.0).unwrap();
+        let mut st2 = SupState::default();
+        assert_eq!(tick_in(&d2, &dir2, &mut st2, gen_probe_fail, remove_spool_file, 1.0), 1);
+        let left = BootIntent::from_str("g", &std::fs::read_to_string(intent_path(&dir2, "g")).unwrap())
+            .expect("스폰 실패 후 인텐트가 판독 불가다");
+        assert_eq!(left.generation, 1, "스폰 실패 시 세대가 영속되지 않았다");
+        assert_eq!(left.state, IntentState::Pending, "스폰 실패인데 running 으로 전이했다");
     }
 
     /// 합성 표본 — 적대적/깨진 인텐트는 **실행되지 않고** 사라진다.
@@ -2379,13 +2462,21 @@ mod tests {
         );
     }
 
-    /// ★**성공했는데 파일이 지워지지 않는** 경우에도 낳는 프로세스와 이벤트는 유계다.
+    /// ★**성공했는데 파일이 스풀에 남는** 경우에도 낳는 프로세스와 이벤트는 유계다.
     ///
-    /// 삭제 실패의 가장 나쁜 형태는 GC 축이 아니라 **성공 축**이다: 성공 후 인텐트가 남으면
-    /// 다음 틱이 같은 인텐트를 다시 실행한다. 여기서 유계를 세우는 것은 예산 두 축이고,
-    /// 마지막 `attempts_exhausted` 폐기 이벤트도 음성 캐시가 1건으로 접는다.
+    /// ★B3(§2-6) 이후 이것은 예외가 아니라 **정상 경로**다 — 성공 디스패치는 인텐트를 지우지
+    /// 않고 `state=running` 으로 전이한다. 그래서 유계의 근거가 **삭제에서 상태 게이트로**
+    /// 옮겨졌고, 이 검체가 그 이동을 박제한다.
+    ///
+    /// 두 축을 함께 잰다 — 게이트가 **있을 때**와 **없을 때**의 유계는 서로 다른 기구가 세운다:
+    ///  ⓐ 게이트 정상: 삭제가 한 번도 성공하지 않아도(`never_removes`) 재실행 **0**.
+    ///  ⓑ 게이트 부재(음성 대조군): 전이 기록이 실패하면 파일은 `pending` 으로 남아 재디스패치가
+    ///    되살아난다. 그때 유계를 세우는 것은 **예산 두 축**이고, 디스크가 통째로 거짓말해도
+    ///    (attempts 가 영원히 0) 메모리측 예산이 혼자 `MAX_ATTEMPTS` 로 접는다(머리말 ③).
+    ///    ⓑ가 없으면 ⓐ의 GREEN 은 "게이트가 유일한 방어"라는 잘못된 안심을 준다.
     #[test]
     fn successful_dispatch_with_undeletable_intent_is_still_bounded() {
+        // ── ⓐ 상태 게이트가 재실행을 0 으로 막는다(삭제 전무) ──
         let d = tmp_daemon("okundeletable");
         let dir = tmp_spool("okundeletable");
         enqueue_in(&dir, &req("s", None), 0.0).unwrap();
@@ -2398,28 +2489,44 @@ mod tests {
             now += 5.0; // 쿨다운을 계속 넘겨 준다 — 그래도 유계여야 한다.
         }
         assert_eq!(
-            total, MAX_ATTEMPTS as usize,
-            "지워지지 않는 인텐트가 성공 경로에서 {total}회 프로세스를 낳았다(폭주)"
+            total, 1,
+            "running 전이 후에도 {total}회 프로세스를 낳았다(상태 게이트 무력 = 폭주)"
         );
-        // ★핀 개정(P2 · 오너 결정 ⑧c — 약화 아님, 조성 갱신): 소진 종착이 loud 로 격상되어
-        //   `attempts_exhausted` 폐기 시 feed 통보(feed.item.created) 1건이 **추가**됐다.
-        //   조성: dispatched 3 + intent_retired 1 + feed(소진 통보·래치 1회) 1 = 5 ≤ 7
-        //   (원장 record_audited 는 성공 시 무발행). 상한 7 은 그대로 두되, 통보가 래치로
-        //   1회를 넘으면(매 틱 반복) 즉시 이 상한을 뚫으므로 유계 판정력은 종전과 동일하다.
         let published = d.bus.latest_seq() - before;
         assert!(
             published <= 7,
-            "200틱 동안 이벤트 {published}건 — 삭제 실패·소진 통보가 발행을 영구화했다"
+            "200틱 동안 이벤트 {published}건 — 지워지지 않는 인텐트가 발행을 영구화했다"
         );
-        // 소진 loud 통보는 정확히 1건이어야 한다(래치 — 200틱 반복 금지).
-        let fails = d
-            .feed_items
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|i| i.kind == "bootstrap-fail")
-            .count();
-        assert_eq!(fails, 1, "소진 통보가 (인텐트당 1회) 접히지 않았다: {fails}건");
+
+        // ── ⓑ 음성 대조군: 상태 게이트가 **서지 않을 때**도 예산이 접는가 ──
+        //    매 틱 인텐트를 `pending`·`attempts=0` 으로 되살려 전이가 한 번도 붙지 않는 상황을
+        //    만든다(리포 관례 — `budget_is_bounded_even_when_disk_never_persists` 와 같은 기법).
+        //    ⓑ가 없으면 ⓐ의 GREEN 은 "게이트가 유일한 방어"라는 잘못된 안심을 준다.
+        //    ★읽기전용 스풀로 주입하려던 첫 시도는 실패했고, 그것이 사실을 하나 알려 줬다 —
+        //      `tick_in` 선두의 `ensure_spool` 이 unix 권한을 0o700 으로 **재강제**하므로
+        //      읽기전용 스풀은 다음 틱에 스스로 치유된다. 그 경로로는 '디스크가 거짓말하는'
+        //      상황을 만들 수 없다(그래서 인텐트 되살리기로 갈았다).
+        let d2 = tmp_daemon("nogate");
+        let dir2 = tmp_spool("nogate");
+        let mut st2 = SupState::default();
+        let mut total2 = 0usize;
+        let mut now2 = 1.0;
+        for _ in 0..200 {
+            raw_intent(
+                &dir2,
+                "s",
+                &format!(
+                    r#"{{"v":{INTENT_SCHEMA_V},"action":"ensure-team","lane":"","surface_id":null,
+                        "created_at":0.0,"attempts":0,"next_attempt_at":0.0,"reason":"t"}}"#
+                ),
+            );
+            total2 += tick_in(&d2, &dir2, &mut st2, ok_runner, never_removes, now2);
+            now2 += 5.0;
+        }
+        assert!(
+            total2 <= MAX_ATTEMPTS as usize,
+            "상태 게이트가 서지 않는데 {total2}회 낳았다 — 예산 축이 혼자서는 유계를 못 세운다"
+        );
     }
 
     // ── (P2) 신설 계약 검체 ────────────────────────────────────────────────────
