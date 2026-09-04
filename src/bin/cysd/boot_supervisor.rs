@@ -98,7 +98,32 @@ use std::time::Duration;
 /// **v2 (P2)**: `decl_origin`(닫힌 토큰)·`claim{rc,at}`(데이터) 추가. 다운그레이드 스큐에서
 /// 구 감독자(v1)는 신 인텐트를 `schema_mismatch` 로 **시끄럽게 폐기**한다(기존 계약 그대로 ·
 /// R3-P2-1). 미지 필드는 무시하고 **필수 필드 부재만** 폐기한다([`BootIntent::from_str`]).
-pub const INTENT_SCHEMA_V: u64 = 2;
+pub const INTENT_SCHEMA_V: u64 = 3;
+
+/// (부트 v2 · 명세 §2-5) **승격 판독** 대상인 구 스키마. 구 데몬이 남긴 잔여 인텐트는
+/// 폐기가 아니라 3 으로 승격해 읽는다(`executor` 는 빈 값, `state` 는 pending, `generation`
+/// 은 0 으로 기본값 채움) — 업그레이드 순간에 대기 중이던 오너 선언을 죽이지 않기 위해서다.
+/// 반대 방향(미래 스키마·v1 이하)은 여전히 fail-closed 폐기다.
+pub const INTENT_SCHEMA_V_LEGACY: u64 = 2;
+
+/// (부트 v2 · 명세 §2-5) GUI ▶버튼 유래. `operator_token` 이 데몬 발급값과 일치할 때만
+/// 인정된다 — 훅과 달리 GUI 는 `surface_id` 를 **명시**할 수 있고 그 인가 근거가 이 토큰이다
+/// (`handlers::operator_token_ok` · feed.reply 면제와 같은 신뢰 계급).
+pub const DECL_ORIGIN_GUI_OPERATOR: &str = "gui-operator";
+
+/// 인텐트를 실행할 주체. 롤백 스위치 값의 **스냅샷**이며, 전환 중에도 인텐트는 태어날 때의
+/// 결정대로 완주한다(명세 §5).
+pub const EXECUTOR_RUNNER: &str = "runner";
+/// 구 경로 — `javis_bootstrap.py` 직접 spawn.
+pub const EXECUTOR_PYTHON: &str = "python";
+
+/// terminal 로 닫힌 인텐트 파일에 붙는 접미사. GC 는 **이것만** 지운다.
+///
+/// ★왜 즉시 rename 인가(시뮬 T1-3 — 이 한 줄이 없으면 G1 이 깨진다): 스풀 파일명이
+/// `<decl_id>.json` 이고 terminal 파일이 GC 될 때까지 남아 있으면, 같은 프롬프트를 오너가
+/// **실패 후 다시** 쳤을 때 `O_EXCL` 이 실패해 `dedup` 으로 접힌다 = **정당한 재선언이
+/// 삼켜진다**. terminal 전이 시점에 이름을 바꿔 두면 새 선언은 언제나 새 파일이다.
+pub const DONE_SUFFIX: &str = ".done";
 
 /// (P2 · v2) `decl_origin` 이 나를 수 있는 **유일하게 인정되는 토큰**. 훅의 기계유래 게이트
 /// (`javis_mission machine-origin`)가 human 판정을 완주했을 때만 이 값이 실린다 — 판별의
@@ -162,6 +187,19 @@ const MAX_TRACKED: usize = 128;
 /// 축 단위 조정용이다.
 pub const ENV_SUPERVISOR: &str = "CYS_BOOT_SUPERVISOR";
 
+/// (부트 v2 · 명세 §5) 부트 v2 경로의 **롤백 스위치**. 기본은 켜짐이고 `0` 만 끔이다.
+///
+/// ★스위치의 단일 진실은 **데몬**이다(`status --json`.`boot_v2_enabled` 로 노출). 훅·GUI·
+/// 감독자가 각자 env 를 읽으면 세 주체의 판단이 갈릴 수 있고, 사고 순간에 "누가 어느 값을
+/// 봤는가" 를 재구성하는 것은 거의 불가능하다. 그래서 판독은 데몬 1회이고 나머지는 물어본다.
+pub const ENV_BOOT_V2: &str = "CYS_BOOT_V2";
+
+/// [`ENV_BOOT_V2`] 판독(순수). `Some("0")` 만 끔 — 미설정·빈값·그 외는 켜짐이다.
+/// (`supervisor_off_from` 과 **반대 극성**인 점에 주의: 그쪽은 "꺼짐인가", 이쪽은 "켜짐인가".)
+pub fn boot_v2_enabled_from(env_val: Option<&str>) -> bool {
+    env_val != Some("0")
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // 순수 코어 — 데몬 상태도 디스크도 읽지 않는다(진리표 대상).
 // ══════════════════════════════════════════════════════════════════════════════
@@ -212,6 +250,153 @@ impl BootAction {
     }
 }
 
+/// 인텐트의 **종착 종류**(명세 §3-2 단일 enum). 감독자의 구 `Retire(...)` 사유와 러너의
+/// exit 코드가 **전부 이 표로 합류**한다 — 종착이 두 어휘로 갈려 있으면 "왜 안 떴나" 를 한
+/// 곳에서 답할 수 없다(G2 완주 결정론).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKind {
+    /// ⑤ READY.
+    Completed,
+    /// READY 이나 리뷰어 ack 미확인 — **정상 종착**이되 리뷰 게이트만 닫는다(가정 A).
+    CompletedDegraded,
+    /// claim 정당 거부(러너 rc 7) — 다른 master 가 살아 있다.
+    Declined,
+    /// claim 컨텍스트 오류(rc 10) — 좌석 소실·데몬 부재.
+    SessionError,
+    /// 전제 붕괴로 중단(master_gone · busy_other_executor · resource_hard · lease_fenced ·
+    /// version_incompatible · 구 Retire 사유 전반).
+    Aborted,
+    /// 러너 예외.
+    Crashed,
+    /// 같은 좌석에 진행 중 인텐트가 있는데 새 선언이 왔다 — 기록 1 · 실행 0.
+    Superseded,
+    /// 감독자 수명 만료([`INTENT_MAX_AGE_SECS`]).
+    Expired,
+    /// 감독자 시도 상한([`MAX_ATTEMPTS`]).
+    AttemptsExhausted,
+    /// 레인 락 패자(rc 11) — 정상이며 처방이 없다.
+    SkippedInflight,
+    /// 인텐트 파일 JSON 파싱 실패.
+    StateUnreadable,
+}
+
+impl TerminalKind {
+    /// 와이어 철자. 파일·이벤트에 적히는 값이며 이 철자가 곧 계약이다.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TerminalKind::Completed => "completed",
+            TerminalKind::CompletedDegraded => "completed_degraded",
+            TerminalKind::Declined => "declined",
+            TerminalKind::SessionError => "session_error",
+            TerminalKind::Aborted => "aborted",
+            TerminalKind::Crashed => "crashed",
+            TerminalKind::Superseded => "superseded",
+            TerminalKind::Expired => "expired",
+            TerminalKind::AttemptsExhausted => "attempts_exhausted",
+            TerminalKind::SkippedInflight => "skipped_inflight",
+            TerminalKind::StateUnreadable => "state_unreadable",
+        }
+    }
+
+    /// 와이어 철자 → enum. **미지 토큰은 `None`** 이다(fail-closed — 조용한 기본값 금지).
+    pub fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "completed" => TerminalKind::Completed,
+            "completed_degraded" => TerminalKind::CompletedDegraded,
+            "declined" => TerminalKind::Declined,
+            "session_error" => TerminalKind::SessionError,
+            "aborted" => TerminalKind::Aborted,
+            "crashed" => TerminalKind::Crashed,
+            "superseded" => TerminalKind::Superseded,
+            "expired" => TerminalKind::Expired,
+            "attempts_exhausted" => TerminalKind::AttemptsExhausted,
+            "skipped_inflight" => TerminalKind::SkippedInflight,
+            "state_unreadable" => TerminalKind::StateUnreadable,
+            _ => return None,
+        })
+    }
+
+    /// 전 종착 열거 — 검체가 "빠짐 없음"(H-TERMINAL-1 열거 파리티)을 이것으로 잰다.
+    pub const ALL: [TerminalKind; 11] = [
+        TerminalKind::Completed,
+        TerminalKind::CompletedDegraded,
+        TerminalKind::Declined,
+        TerminalKind::SessionError,
+        TerminalKind::Aborted,
+        TerminalKind::Crashed,
+        TerminalKind::Superseded,
+        TerminalKind::Expired,
+        TerminalKind::AttemptsExhausted,
+        TerminalKind::SkippedInflight,
+        TerminalKind::StateUnreadable,
+    ];
+
+    /// 구 `Disposition::Retire(why)` 문자열 → 종착 종류. 감독자의 종전 폐기 사유를 새 대수로
+    /// **합류**시키는 유일 지점이다(사유 문자열 자체는 이벤트 호환을 위해 그대로 보존된다).
+    pub fn from_retire_reason(why: &str) -> TerminalKind {
+        match why {
+            "expired" => TerminalKind::Expired,
+            "attempts_exhausted" => TerminalKind::AttemptsExhausted,
+            // schema_mismatch·unknown_action·unknown_decl_origin·claim_stale·no_surface 는
+            // 전부 "전제가 무너져 실행하지 않는다" = aborted 다(사유는 reason 이 나른다).
+            _ => TerminalKind::Aborted,
+        }
+    }
+}
+
+/// 종착 1건 — 종류·사유·처방. `remedy` 는 **사람이 읽고 바로 실행할 한 줄**이다(빈 문자열 =
+/// 처방 불요, 예: `skipped_inflight` 는 정상 경로다).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Terminal {
+    pub kind: TerminalKind,
+    pub reason: String,
+    pub remedy: String,
+}
+
+impl Terminal {
+    pub fn new(kind: TerminalKind, reason: &str, remedy: &str) -> Self {
+        Terminal { kind, reason: reason.to_string(), remedy: remedy.to_string() }
+    }
+    fn to_value(&self) -> serde_json::Value {
+        json!({"kind": self.kind.as_str(), "reason": self.reason, "remedy": self.remedy})
+    }
+    fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Terminal {
+            kind: TerminalKind::parse(v.get("kind")?.as_str()?)?,
+            reason: v.get("reason").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            remedy: v.get("remedy").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        })
+    }
+}
+
+/// 인텐트 수명 상태(명세 §2-5 schema 3). 종전에는 "파일이 있으면 대기 / 지우면 끝" 이라
+/// **실행 중**이라는 상태가 표현되지 않았고, 그래서 재개가 "처음부터"밖에 될 수 없었다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntentState {
+    Pending,
+    Running,
+    Terminal,
+}
+
+impl IntentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IntentState::Pending => "pending",
+            IntentState::Running => "running",
+            IntentState::Terminal => "terminal",
+        }
+    }
+    /// 미지 토큰은 `None` — 구 파일(필드 부재)은 호출부가 `Pending` 으로 승격한다.
+    pub fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "pending" => IntentState::Pending,
+            "running" => IntentState::Running,
+            "terminal" => IntentState::Terminal,
+            _ => return None,
+        })
+    }
+}
+
 /// 인텐트 1건에 대한 이번 틱의 **귀결**.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Disposition {
@@ -253,6 +438,20 @@ pub struct BootIntent {
     pub claim_rc: Option<i64>,
     /// (v2) 훅 선행 claim 시각(epoch 초 · 진단 전용 — 위와 같은 이유로 판정에 쓰지 않는다).
     pub claim_at: Option<f64>,
+    /// (v3 · 명세 §2-5) **선언 id** — `sha256(lane | surface_id | session_id |
+    /// digest_normalized(prompt))[:32]`. 데몬이 계산하며(클라이언트는 재료만 준다) 스풀
+    /// **파일명**이 곧 이 값이다. 같은 선언 이벤트의 재전송은 같은 id 라 `O_EXCL` 이 dedup
+    /// 으로 접는다 — 종전의 '유일 카운터 id' 는 재전송과 재선언을 구별하지 못했다.
+    pub decl_id: String,
+    /// (v3) 실행 주체 스냅샷 — [`EXECUTOR_RUNNER`]·[`EXECUTOR_PYTHON`]. 롤백 스위치가 도중에
+    /// 뒤집혀도 인텐트는 **태어날 때의 결정대로** 완주한다(명세 §5).
+    pub executor: String,
+    /// (v3) lease 세대. 디스패치마다 +1 되며 side-effect RPC 의 CAS 근거다(명세 §2-6).
+    pub generation: u32,
+    /// (v3) 수명 상태.
+    pub state: IntentState,
+    /// (v3) 종착(있으면). `state == Terminal` 일 때만 채워진다.
+    pub terminal: Option<Terminal>,
 }
 
 impl BootIntent {
@@ -268,6 +467,12 @@ impl BootIntent {
             "reason": self.reason,
             "decl_origin": self.decl_origin,
             "claim": {"rc": self.claim_rc, "at": self.claim_at},
+            // (v3) 추가-only — 구 판독자는 미지 키를 무시한다(`from_str` 은 알려진 키만 본다).
+            "decl_id": self.decl_id,
+            "executor": self.executor,
+            "generation": self.generation,
+            "state": self.state.as_str(),
+            "terminal": self.terminal.as_ref().map(|t| t.to_value()),
         })
     }
 
@@ -310,6 +515,22 @@ impl BootIntent {
                 .to_string(),
             claim_rc: obj.get("claim").and_then(|c| c.get("rc")).and_then(|x| x.as_i64()),
             claim_at: obj.get("claim").and_then(|c| c.get("at")).and_then(|x| x.as_f64()),
+            // ── (v3) 승격 판독(명세 §2-5 · §5) ────────────────────────────────────
+            // 구 스키마(v2) 파일에는 이 키들이 없다. **폐기가 아니라 기본값 승격**이다 —
+            // 업그레이드 순간에 대기 중이던 오너 선언을 죽이지 않기 위해서다.
+            //   · decl_id 부재 → 파일명(id). 그 파일의 유일 식별자는 이름이다.
+            //   · executor 부재 → 빈 값. 디스패치 시점에 감독자가 스위치 값으로 채운다
+            //     (여기서 env 를 읽지 않는 이유: `from_str` 이 순수해야 진리표로 시험된다).
+            //   · state 부재/미지 → pending(가장 보수적 — 실행 전으로 본다).
+            //   · terminal 형상 불량 → None(있다고 거짓말하지 않는다).
+            decl_id: obj.get("decl_id").and_then(|x| x.as_str())
+                .filter(|x| !x.is_empty()).unwrap_or(id).to_string(),
+            executor: obj.get("executor").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            generation: u32::try_from(obj.get("generation").and_then(|x| x.as_u64()).unwrap_or(0))
+                .unwrap_or(u32::MAX),
+            state: obj.get("state").and_then(|x| x.as_str()).and_then(IntentState::parse)
+                .unwrap_or(IntentState::Pending),
+            terminal: obj.get("terminal").and_then(Terminal::from_value),
         })
     }
 }
@@ -329,8 +550,16 @@ pub fn effective_attempts(file_attempts: u32, mem_attempts: u32) -> u32 {
 /// (만료를 예산보다 **앞**에 두는 이유: 30분 지난 인텐트는 예산이 남아 있어도 실행 대상이
 /// 아니다. 반대로 두면 늙은 인텐트가 예산을 태우며 3번 더 프로세스를 낳는다.)
 pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
-    if it.v != INTENT_SCHEMA_V {
+    // (v3 · 명세 §5) **승격 판독** — 현행(3)과 구 스키마(2)를 모두 받는다. 구 데몬이 남긴
+    // 인텐트를 폐기하면 업그레이드 순간에 대기 중이던 오너 선언이 죽는다. 반대 방향(미래
+    // 스키마·v1 이하)은 여전히 fail-closed 다 — 모르는 형상을 실행하지 않는다.
+    if it.v != INTENT_SCHEMA_V && it.v != INTENT_SCHEMA_V_LEGACY {
         return Disposition::Retire("schema_mismatch");
+    }
+    // (v3) 이미 닫힌 인텐트는 실행 후보가 아니다 — GC 가 `.done` 을 걷어갈 때까지 남아 있어도
+    // 다시 낳지 않는다(종전엔 '파일 존재 = 대기' 라 이 상태가 표현되지 않았다).
+    if it.state == IntentState::Terminal {
+        return Disposition::Retire("already_terminal");
     }
     let Some(action) = BootAction::parse(&it.action_token) else {
         // ★여기가 '명령 문자열 없음' 계약의 집행 지점이다. 미지 토큰은 실행 후보가 아니라
@@ -340,7 +569,10 @@ pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
     // (P2 · v2) decl_origin 도 닫힌 토큰이다 — 인정 토큰은 hook-human 하나뿐이고 미지값은
     // 실행이 아니라 폐기다. 정상 경로의 유일 writer(boot.enqueue arm)는 미지값을 애초에
     // 거절하므로, 여기 도달하는 미지값은 스풀 직접 투하(§4-10 잔여위험 계급)다 — fail-closed.
-    if !it.decl_origin.is_empty() && it.decl_origin != DECL_ORIGIN_HOOK_HUMAN {
+    if !it.decl_origin.is_empty()
+        && it.decl_origin != DECL_ORIGIN_HOOK_HUMAN
+        && it.decl_origin != DECL_ORIGIN_GUI_OPERATOR
+    {
         return Disposition::Retire("unknown_decl_origin");
     }
     if now - it.created_at > INTENT_MAX_AGE_SECS {
@@ -448,66 +680,217 @@ fn write_intent(dir: &Path, it: &BootIntent) -> Result<PathBuf, String> {
     Ok(final_path)
 }
 
-/// 부트 인텐트를 스풀에 등록한다 — **감독자의 유일한 입력구**.
+/// 선언 id 산출(명세 §2-5). **데몬이 계산한다** — 클라이언트는 재료(`session_id`·
+/// `prompt_digest`)만 주고 `surface_id`·`lane` 은 데몬이 도출한 값이다.
 ///
-/// 생산자는 `handlers.rs` 의 `boot.enqueue` RPC arm 하나다(P2 · U-24 착지). 그 arm 이 지키는
-/// 계약 — surface_id 커널 도출·lane 자기 고정(항상 빈값)·claim 교차검증·감독자 생존 선검사 —
-/// 은 arm 쪽 주석이 정본이고, 이 함수는 검증이 끝난 값을 원자 기록하는 디스크 층이다.
-pub fn enqueue(
-    socket_path: &Path,
-    id: &str,
-    action: BootAction,
+/// 왜 id 를 선언 내용에서 뽑는가: 종전 id 는 `데몬세대-epoch-sid-카운터` 라 **매 호출이 새 id**
+/// 였다. 그래서 같은 선언 이벤트가 재전송돼도(훅 재실행·중복 배달) 인텐트가 하나 더 생겼다.
+/// 내용 기반 id 는 재전송을 `O_EXCL` 로 접고(dedup), 오너의 **정당한 재선언**은 앞 인텐트가
+/// terminal 로 `.done` 이 되어 있으므로 새 파일로 통과한다(시뮬 T1-3).
+///
+/// 32 자로 자르는 이유: 이 값이 파일명이며 sha256 전문(64)은 Windows 경로 예산을 필요 이상으로
+/// 먹는다. hex 32 = 128 비트라 우발 충돌은 실무상 0 이다.
+pub fn compute_decl_id(
     lane: &str,
     surface_id: Option<u64>,
-    reason: &str,
-    decl_origin: &str,
-    claim_rc: Option<i64>,
-    claim_at: Option<f64>,
+    session_id: &str,
+    prompt_digest: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    // 구분자를 넣는 이유: 없으면 ("ab","c") 와 ("a","bc") 가 같은 해시가 된다.
+    h.update(lane.as_bytes());
+    h.update(b"|");
+    h.update(surface_id.map(|s| s.to_string()).unwrap_or_default().as_bytes());
+    h.update(b"|");
+    h.update(session_id.as_bytes());
+    h.update(b"|");
+    h.update(prompt_digest.as_bytes());
+    format!("{:x}", h.finalize()).chars().take(32).collect()
+}
+
+/// [`enqueue`] 요청. 종전 9개 위치 인자는 호출부에서 순서를 틀리기 쉬웠다(같은 타입이 이웃한
+/// `reason`/`decl_origin`, `claim_rc`/`claim_at` 자리).
+pub struct EnqueueReq<'a> {
+    pub decl_id: &'a str,
+    pub action: BootAction,
+    /// 레인 소켓 경로. **항상 빈 값**이다(수신 데몬 자신의 레인 — R3-P2-6).
+    pub lane: &'a str,
+    pub surface_id: Option<u64>,
+    pub reason: &'a str,
+    pub decl_origin: &'a str,
+    pub claim_rc: Option<i64>,
+    pub claim_at: Option<f64>,
+    /// 실행 주체 스냅샷([`EXECUTOR_RUNNER`]·[`EXECUTOR_PYTHON`]).
+    pub executor: &'a str,
+}
+
+/// [`enqueue`] 의 귀결. 셋 다 **정상**이며 오류가 아니다 — 훅은 이 값을 그대로 고지한다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// 새 인텐트가 원자적으로 등록됐다.
+    Enqueued { path: PathBuf },
+    /// 같은 `decl_id` 가 이미 있다 = **같은 선언 이벤트의 재전송**. 새 파일 0.
+    Dedup { path: PathBuf },
+    /// 같은 좌석에 진행 중 인텐트가 있다 — **기록은 하되 실행하지 않는다**(G1: 1 기록·0 실행).
+    Superseded { path: PathBuf, by: String },
+}
+
+impl EnqueueOutcome {
+    /// 와이어 철자(훅 고지·RPC 응답 토큰).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EnqueueOutcome::Enqueued { .. } => "enqueued",
+            EnqueueOutcome::Dedup { .. } => "dedup",
+            EnqueueOutcome::Superseded { .. } => "superseded",
+        }
+    }
+    pub fn path(&self) -> &Path {
+        match self {
+            EnqueueOutcome::Enqueued { path }
+            | EnqueueOutcome::Dedup { path }
+            | EnqueueOutcome::Superseded { path, .. } => path,
+        }
+    }
+}
+
+/// 인텐트를 **원자적으로** 새로 만든다(`O_EXCL`). 이미 있으면 `Ok(None)` = dedup.
+///
+/// 왜 tmp→rename 이 아니라 `create_new` 인가: tmp→rename 은 **덮어쓰기**라 두 연결이 같은
+/// decl_id 로 동시에 들어오면 둘 다 성공하고 뒤엣것이 앞엣것의 `attempts` 를 0 으로 되돌린다
+/// (시도 상한의 조용한 확장). `create_new` 는 커널이 유일성을 보증한다 — 연결별 tokio task
+/// 병행에서도 원자다.
+fn insert_intent_exclusive(dir: &Path, it: &BootIntent) -> Result<Option<PathBuf>, String> {
+    ensure_spool(dir).map_err(|e| format!("스풀 생성 실패: {e}"))?;
+    let body = serde_json::to_string(&it.to_value()).map_err(|e| format!("직렬화 실패: {e}"))?;
+    let path = intent_path(dir, &it.id);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(body.as_bytes()).map_err(|e| format!("쓰기 실패: {e}"))?;
+            Ok(Some(path))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(format!("인텐트 생성 실패: {e}")),
+    }
+}
+
+/// terminal 기록 + **즉시 `.done` rename**(시뮬 T1-3).
+///
+/// rename 이 실패해도 terminal 기록 자체는 남는다(파일 **내용**이 진실이고 이름은 GC 편의다).
+/// 다만 그 경우 다음 재선언이 dedup 으로 접힐 수 있으므로 오류를 삼키지 않고 돌려준다.
+pub fn close_intent(
+    dir: &Path,
+    it: &BootIntent,
+    t: Terminal,
+    now: f64,
 ) -> Result<PathBuf, String> {
-    enqueue_in(
-        &spool_dir(socket_path),
-        id,
-        action,
-        lane,
-        surface_id,
-        reason,
-        decl_origin,
-        claim_rc,
-        claim_at,
-        now_epoch(),
-    )
+    let mut closed = it.clone();
+    closed.state = IntentState::Terminal;
+    closed.terminal = Some(t);
+    write_intent(dir, &closed)?;
+    let from = intent_path(dir, &it.id);
+    let to = dir.join(format!("{}.{}{}", it.id, now as u64, DONE_SUFFIX));
+    std::fs::rename(&from, &to).map_err(|e| format!("done rename 실패: {e}"))?;
+    Ok(to)
+}
+
+/// 같은 좌석에 **진행 중**(pending|running)인 다른 선언이 있으면 그 id.
+///
+/// 스풀을 훑는 비용을 감수하는 이유: 이 판정이 곧 G1("실행은 항상 ≤1")이다. 상한은
+/// [`MAX_GC_ENTRIES`] 와 같은 계급으로 유계이며 `.done` 은 애초에 후보가 아니다.
+fn inflight_other_for_surface(
+    dir: &Path,
+    surface_id: Option<u64>,
+    decl_id: &str,
+) -> Option<String> {
+    let sid = surface_id?;
+    let rd = std::fs::read_dir(dir).ok()?;
+    for ent in rd.flatten().take(MAX_GC_ENTRIES) {
+        let p = ent.path();
+        let name = p.file_name()?.to_string_lossy().into_owned();
+        if name.ends_with(DONE_SUFFIX) || !name.ends_with(".json") {
+            continue;
+        }
+        let stem = name.trim_end_matches(".json").to_string();
+        if stem == decl_id {
+            continue; // 자기 자신은 이 축의 대상이 아니다(그건 dedup 축이다).
+        }
+        let Ok(body) = std::fs::read_to_string(&p) else { continue };
+        // 손상 파일은 여기서 판정하지 않는다 — 감독자가 state_unreadable 로 닫는다.
+        let Some(other) = BootIntent::from_str(&stem, &body) else { continue };
+        if other.surface_id == Some(sid)
+            && matches!(other.state, IntentState::Pending | IntentState::Running)
+        {
+            return Some(other.id);
+        }
+    }
+    None
+}
+
+/// 부트 인텐트를 스풀에 등록한다 — **감독자의 유일한 입력구**.
+///
+/// 생산자는 `handlers.rs` 의 `boot.enqueue` RPC arm 하나다. 그 arm 이 지키는 계약 —
+/// surface_id 커널 도출(GUI 는 `operator_token` 인가)·lane 자기 고정(항상 빈값)·claim
+/// 교차검증·감독자 생존 선검사 — 은 arm 쪽 주석이 정본이고, 이 함수는 검증이 끝난 값을 원자
+/// 기록하는 디스크 층이다.
+pub fn enqueue(socket_path: &Path, req: &EnqueueReq) -> Result<EnqueueOutcome, String> {
+    enqueue_in(&spool_dir(socket_path), req, now_epoch())
 }
 
 /// [`enqueue`] 의 **경로·시각 주입판**. 테스트가 임시 디렉터리와 가짜 시각으로 구동한다
 /// (플랫폼별 `state_dir` 해소에 의존하지 않아 Windows 에서도 같은 코드가 시험된다).
-#[allow(clippy::too_many_arguments)]
-fn enqueue_in(
-    dir: &Path,
-    id: &str,
-    action: BootAction,
-    lane: &str,
-    surface_id: Option<u64>,
-    reason: &str,
-    decl_origin: &str,
-    claim_rc: Option<i64>,
-    claim_at: Option<f64>,
-    now: f64,
-) -> Result<PathBuf, String> {
+fn enqueue_in(dir: &Path, req: &EnqueueReq, now: f64) -> Result<EnqueueOutcome, String> {
+    let id = sanitize_id(req.decl_id);
     let it = BootIntent {
-        id: sanitize_id(id),
+        id: id.clone(),
         v: INTENT_SCHEMA_V,
-        action_token: action.as_str().to_string(),
-        lane: lane.to_string(),
-        surface_id,
+        action_token: req.action.as_str().to_string(),
+        lane: req.lane.to_string(),
+        surface_id: req.surface_id,
         created_at: now,
         attempts: 0,
         next_attempt_at: 0.0,
-        reason: reason.to_string(),
-        decl_origin: decl_origin.to_string(),
-        claim_rc,
-        claim_at,
+        reason: req.reason.to_string(),
+        decl_origin: req.decl_origin.to_string(),
+        claim_rc: req.claim_rc,
+        claim_at: req.claim_at,
+        decl_id: id,
+        executor: req.executor.to_string(),
+        generation: 0,
+        state: IntentState::Pending,
+        terminal: None,
     };
-    write_intent(dir, &it)
+    ensure_spool(dir).map_err(|e| format!("스풀 생성 실패: {e}"))?;
+    // ★순서 계약: **원자 insert 가 먼저**다. 진행 중 판정을 먼저 하면 그 사이에 다른 연결이
+    //   같은 decl_id 를 넣어 두 파일이 생길 수 있다 — 유일성은 커널이 보증하게 두고, 그 다음에
+    //   좌석 점유를 판정한다.
+    let Some(path) = insert_intent_exclusive(dir, &it)? else {
+        return Ok(EnqueueOutcome::Dedup { path: intent_path(dir, &it.id) });
+    };
+    if let Some(by) = inflight_other_for_surface(dir, req.surface_id, &it.id) {
+        // G1: **기록 1 · 실행 0**. 기록조차 안 하면 오너에겐 "선언했는데 아무 흔적도 없다" 가
+        // 되고, 실행까지 하면 같은 좌석에 부트가 둘이 된다.
+        let closed = close_intent(
+            dir,
+            &it,
+            Terminal::new(
+                TerminalKind::Superseded,
+                &format!("by:{by}"),
+                &format!("진행 중 부트 {by} 가 끝난 뒤 다시 선언하십시오"),
+            ),
+            now,
+        )?;
+        return Ok(EnqueueOutcome::Superseded { path: closed, by });
+    }
+    Ok(EnqueueOutcome::Enqueued { path })
 }
 
 /// 스풀 1회 스캔 결과.
@@ -1317,6 +1700,28 @@ mod tests {
     use super::*;
 
     /// 실 프로세스를 낳지 않는 실행자 — 항상 성공.
+    /// 검체용 인텐트 — v3 필드까지 채운 기본형. 리터럴을 검체마다 두면 필드가 늘 때마다
+    /// 전부 고쳐야 하고, 그 수선이 곧 "이 검체가 무엇을 재는지" 를 흐린다.
+    fn intent(id: &str) -> BootIntent {
+        BootIntent {
+            id: id.into(), v: INTENT_SCHEMA_V, action_token: "ensure-team".into(),
+            lane: String::new(), surface_id: None, created_at: 1000.0, attempts: 0,
+            next_attempt_at: 0.0, reason: String::new(), decl_origin: String::new(),
+            claim_rc: None, claim_at: None,
+            decl_id: id.into(), executor: EXECUTOR_RUNNER.into(), generation: 0,
+            state: IntentState::Pending, terminal: None,
+        }
+    }
+
+    /// 검체용 enqueue 요청 — 좌석 축만 바꿔 가며 쓴다.
+    fn req<'a>(decl_id: &'a str, surface_id: Option<u64>) -> EnqueueReq<'a> {
+        EnqueueReq {
+            decl_id, action: BootAction::EnsureTeam, lane: "", surface_id,
+            reason: "t", decl_origin: "", claim_rc: None, claim_at: None,
+            executor: EXECUTOR_RUNNER,
+        }
+    }
+
     fn ok_runner(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
         Ok("test-ok".to_string())
     }
@@ -1383,20 +1788,9 @@ mod tests {
             "ensure_team",
         ] {
             assert_eq!(BootAction::parse(hostile), None, "미지 토큰이 통과했다: {hostile:?}");
-            let it = BootIntent {
-                id: "x".into(),
-                v: INTENT_SCHEMA_V,
-                action_token: hostile.into(),
-                lane: String::new(),
-                surface_id: None,
-                created_at: 100.0,
-                attempts: 0,
-                next_attempt_at: 0.0,
-                reason: String::new(),
-                decl_origin: String::new(),
-                claim_rc: None,
-                claim_at: None,
-            };
+            let mut it = intent("x");
+            it.action_token = hostile.into();
+            it.created_at = 100.0;
             assert_eq!(
                 decide(&it, 0, 100.0),
                 Disposition::Retire("unknown_action"),
@@ -1408,20 +1802,7 @@ mod tests {
     /// 판정 우선순위 전수 — 형상 → 미지 → 만료 → 예산 → 쿨다운 → 실행.
     #[test]
     fn decide_truth_table() {
-        let base = BootIntent {
-            id: "i".into(),
-            v: INTENT_SCHEMA_V,
-            action_token: "ensure-team".into(),
-            lane: String::new(),
-            surface_id: None,
-            created_at: 1000.0,
-            attempts: 0,
-            next_attempt_at: 0.0,
-            reason: String::new(),
-            decl_origin: String::new(),
-            claim_rc: None,
-            claim_at: None,
-        };
+        let base = intent("i");
         assert_eq!(decide(&base, 0, 1000.0), Disposition::Run(BootAction::EnsureTeam));
         let mut bad_v = base.clone();
         bad_v.v = INTENT_SCHEMA_V + 1;
@@ -1485,14 +1866,17 @@ mod tests {
         let dir = tmp_spool("roundtrip");
         enqueue_in(
             &dir,
-            "boot-1",
-            BootAction::EnsureTeam,
-            "/tmp/s.sock",
-            Some(7),
-            "hook",
-            DECL_ORIGIN_HOOK_HUMAN,
-            Some(0),
-            Some(499.0),
+            &EnqueueReq {
+                decl_id: "boot-1",
+                action: BootAction::EnsureTeam,
+                lane: "/tmp/s.sock",
+                surface_id: Some(7),
+                reason: "hook",
+                decl_origin: DECL_ORIGIN_HOOK_HUMAN,
+                claim_rc: Some(0),
+                claim_at: Some(499.0),
+                executor: EXECUTOR_RUNNER,
+            },
             500.0,
         )
         .unwrap();
@@ -1500,7 +1884,7 @@ mod tests {
         assert_eq!(scan.intents.len(), 1);
         let it = &scan.intents[0];
         assert_eq!(it.id, "boot-1");
-        assert_eq!(it.v, INTENT_SCHEMA_V, "쓰는 버전은 항상 현재 스키마(v2)");
+        assert_eq!(it.v, INTENT_SCHEMA_V, "쓰는 버전은 항상 현재 스키마(v3)");
         assert_eq!(it.action_token, "ensure-team");
         assert_eq!(it.surface_id, Some(7));
         assert_eq!(it.attempts, 0);
@@ -1515,13 +1899,184 @@ mod tests {
         }
     }
 
+    /// ★H-ENQ-ATOMIC-1(부트 v2 · 명세 §2-5): 같은 `decl_id` 를 여러 번 밀어 넣어도 **파일은
+    /// 하나**이고 응답은 `enqueued` 1 + `dedup` n-1 이다.
+    ///
+    /// 왜 이 축이 중요한가: 종전 id 는 매 호출이 새 값이라 **같은 선언 이벤트의 재전송**(훅
+    /// 재실행·중복 배달)이 인텐트를 하나 더 낳았다 = 같은 좌석에 부트 둘. 유일성을 커널
+    /// (`O_EXCL`)에 맡기는 것이 이 검체가 지키는 계약이다.
+    #[test]
+    fn enqueue_is_atomic_on_decl_id() {
+        let dir = tmp_spool("atomic");
+        let mut enq = 0;
+        let mut dedup = 0;
+        for _ in 0..8 {
+            match enqueue_in(&dir, &req("d-same", Some(7)), 100.0).unwrap() {
+                EnqueueOutcome::Enqueued { .. } => enq += 1,
+                EnqueueOutcome::Dedup { .. } => dedup += 1,
+                other => panic!("예상 밖 귀결: {other:?}"),
+            }
+        }
+        assert_eq!((enq, dedup), (1, 7), "원자 insert 실패 — 재전송이 인텐트를 늘렸다");
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        assert_eq!(files.len(), 1, "파일이 하나가 아니다: {files:?}");
+        // decl_id 는 재료가 같으면 같고, 하나만 달라도 갈린다(구분자 없는 연접 사고 차단).
+        let a = compute_decl_id("/l.sock", Some(7), "sess", "dig");
+        assert_eq!(a, compute_decl_id("/l.sock", Some(7), "sess", "dig"), "결정론 위반");
+        assert_ne!(a, compute_decl_id("/l.sock", Some(7), "ses", "sdig"), "구분자 부재 충돌");
+        assert_ne!(a, compute_decl_id("/l.sock", Some(8), "sess", "dig"), "좌석 축 미반영");
+        assert_eq!(a.len(), 32, "id 길이 계약(파일명 예산)");
+    }
+
+    /// ★H-ENQ-SUPERSEDE-1(명세 §2-5 · G1): 같은 좌석에 진행 중 인텐트가 있는데 다른 선언이
+    /// 오면 **기록 1 · 실행 0** 이다. 기록조차 안 하면 오너에겐 "선언했는데 흔적이 없다" 가
+    /// 되고, 실행까지 하면 같은 좌석에 부트가 둘이 된다 — 그 사이의 유일한 정답이 superseded.
+    #[test]
+    fn second_declaration_on_a_busy_surface_is_superseded_not_run() {
+        let d = tmp_daemon("supersede");
+        let dir = tmp_spool("supersede");
+        assert!(matches!(
+            enqueue_in(&dir, &req("first", Some(7)), 100.0).unwrap(),
+            EnqueueOutcome::Enqueued { .. }
+        ));
+        let out = enqueue_in(&dir, &req("second", Some(7)), 101.0).unwrap();
+        match &out {
+            EnqueueOutcome::Superseded { by, path } => {
+                assert_eq!(by, "first");
+                assert!(
+                    path.to_string_lossy().ends_with(DONE_SUFFIX),
+                    "superseded 기록이 즉시 .done 으로 닫히지 않았다: {path:?}"
+                );
+            }
+            other => panic!("superseded 가 아니다: {other:?}"),
+        }
+        // ★음성 대조 — 실행은 **한 번뿐**이다(두 인텐트가 다 돌면 좌석에 부트가 둘).
+        let mut st = SupState::default();
+        let n = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 200.0);
+        assert_eq!(n, 1, "superseded 인텐트까지 실행됐다 — G1 위반");
+        // 다른 좌석의 선언은 superseded 대상이 아니다(과잉 억제 차단).
+        assert!(matches!(
+            enqueue_in(&dir, &req("other-seat", Some(9)), 102.0).unwrap(),
+            EnqueueOutcome::Enqueued { .. }
+        ));
+    }
+
+    /// ★H-ENQ-REDECLARE-1(시뮬 **T1-3** — 명세만 읽고 짰다면 났을 사고): 오너가 같은 프롬프트를
+    /// **실패 후 다시** 치면 그것은 정당한 재선언이다.
+    ///
+    /// 파일명이 `<decl_id>.json` 이고 terminal 파일이 GC 될 때까지 남아 있으면 `O_EXCL` 이
+    /// 실패해 `dedup` 으로 접힌다 = **재선언이 삼켜진다**(G1 위반). terminal 전이 시점의
+    /// `.done` rename 이 그것을 막는다 — 이 검체가 그 한 줄을 지킨다.
+    #[test]
+    fn redeclaration_after_terminal_is_not_swallowed_as_dedup() {
+        let dir = tmp_spool("redeclare");
+        let first = enqueue_in(&dir, &req("same-decl", Some(7)), 100.0).unwrap();
+        assert!(matches!(first, EnqueueOutcome::Enqueued { .. }));
+        // 앞 인텐트를 종착시킨다(러너가 완주했거나 감독자가 접은 상태).
+        let it = intent("same-decl");
+        close_intent(&dir, &it, Terminal::new(TerminalKind::Completed, "", ""), 150.0).unwrap();
+        // ★같은 decl_id 로 다시 선언 — dedup 이 아니라 새 인텐트여야 한다.
+        let again = enqueue_in(&dir, &req("same-decl", Some(7)), 200.0).unwrap();
+        assert!(
+            matches!(again, EnqueueOutcome::Enqueued { .. }),
+            "정당한 재선언이 삼켜졌다(T1-3 회귀): {again:?}"
+        );
+        // ★그리고 닫힌 인텐트는 **다시 실행되지 않는다**(.done 이 남아 있어도).
+        let closed = intent("x");
+        let mut term = closed.clone();
+        term.state = IntentState::Terminal;
+        term.terminal = Some(Terminal::new(TerminalKind::Completed, "", ""));
+        assert_eq!(decide(&term, 0, 1000.0), Disposition::Retire("already_terminal"));
+    }
+
+    /// ★H-TERMINAL-1(명세 §3-2): terminal 대수는 **11종 전수**이고 철자 왕복이 항등이며,
+    /// 감독자의 구 `Retire` 사유가 **빠짐없이** 이 표로 합류한다.
+    #[test]
+    fn terminal_algebra_is_total_and_roundtrips() {
+        assert_eq!(TerminalKind::ALL.len(), 11, "명세 §3-2 의 종착 수와 다르다");
+        let mut seen = std::collections::BTreeSet::new();
+        for k in TerminalKind::ALL {
+            assert!(seen.insert(k.as_str()), "철자 중복: {}", k.as_str());
+            assert_eq!(TerminalKind::parse(k.as_str()), Some(k), "왕복 실패: {}", k.as_str());
+        }
+        assert_eq!(TerminalKind::parse("made-up"), None, "미지 토큰이 통과했다(fail-closed 위반)");
+        // 구 폐기 사유 전수 — 하나도 표 밖으로 새지 않는다.
+        for why in [
+            "schema_mismatch", "unknown_action", "unknown_decl_origin", "expired",
+            "attempts_exhausted", "claim_stale", "no_surface", "already_terminal",
+        ] {
+            let k = TerminalKind::from_retire_reason(why);
+            assert!(TerminalKind::ALL.contains(&k), "{why} 가 표 밖으로 샜다");
+        }
+        assert_eq!(TerminalKind::from_retire_reason("expired"), TerminalKind::Expired);
+        assert_eq!(
+            TerminalKind::from_retire_reason("attempts_exhausted"),
+            TerminalKind::AttemptsExhausted
+        );
+        assert_eq!(TerminalKind::from_retire_reason("claim_stale"), TerminalKind::Aborted);
+        // 상태 enum 도 같은 계약(미지 = None → 호출부가 pending 으로 승격).
+        for st in [IntentState::Pending, IntentState::Running, IntentState::Terminal] {
+            assert_eq!(IntentState::parse(st.as_str()), Some(st));
+        }
+        assert_eq!(IntentState::parse("halfway"), None);
+    }
+
+    /// ★schema 2 **승격 판독**(명세 §5): 구 데몬이 남긴 인텐트는 폐기가 아니라 기본값 승격이다.
+    /// 업그레이드 순간에 대기 중이던 오너 선언을 죽이지 않는 것이 이 계약의 목적이다.
+    #[test]
+    fn schema_two_intents_are_promoted_not_retired() {
+        let dir = tmp_spool("promote");
+        raw_intent(
+            &dir,
+            "legacy",
+            r#"{"v":2,"action":"ensure-team","created_at":0.0,"surface_id":7,"decl_origin":"hook-human"}"#,
+        );
+        let scan = scan_spool(&dir, 1.0, 0);
+        assert_eq!(scan.intents.len(), 1, "구 스키마가 스캔에서 사라졌다");
+        let it = &scan.intents[0];
+        assert_eq!(it.v, INTENT_SCHEMA_V_LEGACY);
+        assert_eq!(it.decl_id, "legacy", "decl_id 부재 → 파일명으로 승격되어야 한다");
+        assert_eq!(it.state, IntentState::Pending, "state 부재 → 가장 보수적인 pending");
+        assert_eq!(it.generation, 0);
+        assert!(it.terminal.is_none());
+        assert!(it.executor.is_empty(), "executor 는 디스패치 시점에 채운다(순수 판독 유지)");
+        // ★핵심: **실행 후보로 남는다**(폐기가 아니다).
+        assert_eq!(decide(it, 0, 1.0), Disposition::Run(BootAction::EnsureTeam));
+        // 음성 대조 — 미래 스키마·v1 은 여전히 fail-closed.
+        let mut future = intent("f");
+        future.v = INTENT_SCHEMA_V + 1;
+        assert_eq!(decide(&future, 0, 1.0), Disposition::Retire("schema_mismatch"));
+        let mut v1 = intent("o");
+        v1.v = 1;
+        assert_eq!(decide(&v1, 0, 1.0), Disposition::Retire("schema_mismatch"));
+    }
+
+    /// ★롤백 스위치 판독(명세 §5) — 기본 켜짐, `0` 만 끔. `supervisor_off_from` 과 **극성이
+    /// 반대**라 한쪽을 복사해 쓰면 조용히 뒤집힌다.
+    #[test]
+    fn boot_v2_switch_defaults_on_and_only_zero_turns_it_off() {
+        assert!(boot_v2_enabled_from(None), "미설정은 켜짐이어야 한다");
+        assert!(boot_v2_enabled_from(Some("")), "빈값은 켜짐");
+        assert!(boot_v2_enabled_from(Some("1")));
+        assert!(boot_v2_enabled_from(Some("yes")));
+        assert!(!boot_v2_enabled_from(Some("0")), "0 이 끔이어야 한다");
+        // 극성 대조 — 두 스위치를 헷갈리면 롤백이 정반대로 동작한다.
+        assert!(supervisor_off_from(Some("0"), None));
+        assert!(!supervisor_off_from(None, None));
+    }
+
     /// ★유계성 — 실패하는 실행자에 대해 디스패치 총량이 `MAX_ATTEMPTS` 를 넘지 않는다.
     /// (틱을 100회 돌려도 프로세스는 3번만 태어난다.)
     #[test]
     fn retry_is_bounded_by_max_attempts() {
         let d = tmp_daemon("bounded");
         let dir = tmp_spool("bounded");
-        enqueue_in(&dir, "b", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        enqueue_in(&dir, &req("b", None), 0.0).unwrap();
         let mut st = SupState::default();
         let mut total = 0usize;
         let mut now = 1.0;
@@ -1569,8 +2124,7 @@ mod tests {
         let d = tmp_daemon("flood");
         let dir = tmp_spool("flood");
         for i in 0..40 {
-            enqueue_in(&dir, &format!("f{i:03}"), BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0)
-                .unwrap();
+            enqueue_in(&dir, &req(&format!("f{i:03}"), None), 0.0).unwrap();
         }
         let mut st = SupState::default();
         let n = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0);
@@ -1582,7 +2136,7 @@ mod tests {
     fn success_retires_the_intent() {
         let d = tmp_daemon("success");
         let dir = tmp_spool("success");
-        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        enqueue_in(&dir, &req("s", None), 0.0).unwrap();
         let mut st = SupState::default();
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         assert!(!intent_path(&dir, "s").exists(), "성공 후에도 인텐트가 남았다");
@@ -1795,19 +2349,7 @@ mod tests {
         let d = tmp_daemon("gcstarve");
         let dir = tmp_spool("gcstarve");
         for i in 0..MAX_SCAN_ENTRIES {
-            enqueue_in(
-                &dir,
-                &format!("a{i:03}"),
-                BootAction::EnsureTeam,
-                "",
-                None,
-                "t",
-                "",
-                None,
-                None,
-                0.0,
-            )
-            .unwrap();
+            enqueue_in(&dir, &req(&format!("a{i:03}"), None), 0.0).unwrap();
         }
         const GARBAGE: usize = 400; // > MAX_GC_ENTRIES — 상한만 키우는 수리는 통과 못 한다.
         for i in 0..GARBAGE {
@@ -1839,7 +2381,7 @@ mod tests {
     fn successful_dispatch_with_undeletable_intent_is_still_bounded() {
         let d = tmp_daemon("okundeletable");
         let dir = tmp_spool("okundeletable");
-        enqueue_in(&dir, "s", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        enqueue_in(&dir, &req("s", None), 0.0).unwrap();
         let mut st = SupState::default();
         let before = d.bus.latest_seq();
         let mut total = 0usize;
@@ -1880,7 +2422,7 @@ mod tests {
     fn paused_daemon_freezes_the_supervisor_tick() {
         let d = tmp_daemon("paused");
         let dir = tmp_spool("paused");
-        enqueue_in(&dir, "p", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        enqueue_in(&dir, &req("p", None), 0.0).unwrap();
         let mut st = SupState::default();
         d.paused.store(true, Ordering::SeqCst);
         for _ in 0..5 {
@@ -1902,7 +2444,7 @@ mod tests {
     fn claim_stale_retires_immediately_without_retry() {
         let d = tmp_daemon("stale");
         let dir = tmp_spool("stale");
-        enqueue_in(&dir, "c", BootAction::EnsureTeam, "", Some(7), "t", "", None, None, 0.0)
+        enqueue_in(&dir, &req("c", Some(7)), 0.0)
             .unwrap();
         let mut st = SupState::default();
         let mut total = 0usize;
@@ -1921,20 +2463,12 @@ mod tests {
     #[test]
     fn run_ensure_team_refuses_a_stale_claim_before_any_spawn() {
         let d = tmp_daemon("regate");
-        let it = BootIntent {
-            id: "r".into(),
-            v: INTENT_SCHEMA_V,
-            action_token: "ensure-team".into(),
-            lane: String::new(),
-            surface_id: Some(7), // 등록된 surface 도, master 보유도 없다.
-            created_at: 0.0,
-            attempts: 0,
-            next_attempt_at: 0.0,
-            reason: String::new(),
-            decl_origin: DECL_ORIGIN_HOOK_HUMAN.into(),
-            claim_rc: Some(0),
-            claim_at: Some(0.0),
-        };
+        let mut it = intent("r");
+        it.surface_id = Some(7); // 등록된 surface 도, master 보유도 없다.
+        it.created_at = 0.0;
+        it.decl_origin = DECL_ORIGIN_HOOK_HUMAN.into();
+        it.claim_rc = Some(0);
+        it.claim_at = Some(0.0);
         assert_eq!(
             run_ensure_team(&d, &it, BootAction::EnsureTeam),
             Err(RunErr::Retire("claim_stale")),
@@ -1948,20 +2482,10 @@ mod tests {
     #[test]
     fn run_ensure_team_refuses_a_surfaceless_intent_before_any_spawn() {
         let d = tmp_daemon("nosurface");
-        let it = BootIntent {
-            id: "n".into(),
-            v: INTENT_SCHEMA_V,
-            action_token: "ensure-team".into(),
-            lane: String::new(),
-            surface_id: None, // 유일 생산자(boot.enqueue)가 만들 수 없는 형상.
-            created_at: 0.0,
-            attempts: 0,
-            next_attempt_at: 0.0,
-            reason: String::new(),
-            decl_origin: DECL_ORIGIN_HOOK_HUMAN.into(),
-            claim_rc: None,
-            claim_at: None,
-        };
+        let mut it = intent("n");
+        it.surface_id = None; // 유일 생산자(boot.enqueue)가 만들 수 없는 형상.
+        it.created_at = 0.0;
+        it.decl_origin = DECL_ORIGIN_HOOK_HUMAN.into();
         assert_eq!(
             run_ensure_team(&d, &it, BootAction::EnsureTeam),
             Err(RunErr::Retire("no_surface")),
@@ -2023,7 +2547,7 @@ mod tests {
     fn exhaustion_notification_fires_once_across_both_paths() {
         let d = tmp_daemon("loudonce");
         let dir = tmp_spool("loudonce");
-        enqueue_in(&dir, "L", BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0).unwrap();
+        enqueue_in(&dir, &req("L", None), 0.0).unwrap();
         let mut st = SupState::default();
         let mut now = 1.0;
         for _ in 0..100 {
@@ -2051,7 +2575,7 @@ mod tests {
             .expect("test surface");
         d.surfaces.lock().unwrap().insert(s.id, s.clone());
         let dir = tmp_spool("loudpane");
-        enqueue_in(&dir, "N", BootAction::EnsureTeam, "", Some(s.id), "t", "", None, None, 0.0)
+        enqueue_in(&dir, &req("N", Some(s.id)), 0.0)
             .unwrap();
         let mut st = SupState::default();
         let mut now = 1.0;
@@ -2086,7 +2610,7 @@ mod tests {
     fn claim_stale_retire_is_loud_not_silent() {
         let d = tmp_daemon("staleloud");
         let dir = tmp_spool("staleloud");
-        enqueue_in(&dir, "c", BootAction::EnsureTeam, "", Some(7), "t", "", None, None, 0.0)
+        enqueue_in(&dir, &req("c", Some(7)), 0.0)
             .unwrap();
         let mut st = SupState::default();
         let mut now = 1.0;
@@ -2120,7 +2644,7 @@ mod tests {
         let d = tmp_daemon("expired");
         let dir = tmp_spool("expired");
         for id in ["e1", "e2", "e3"] {
-            enqueue_in(&dir, id, BootAction::EnsureTeam, "", None, "t", "", None, None, 0.0)
+            enqueue_in(&dir, &req(id, None), 0.0)
                 .unwrap();
         }
         let mut st = SupState::default();

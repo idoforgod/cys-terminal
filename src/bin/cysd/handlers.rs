@@ -2319,11 +2319,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   자기 소켓)에 적힌다 — 호출자 lane 을 열면 데몬 A 의 팩을 레인 B 소켓으로 낳는
         //   레인↔팩 불일치 표면이 생긴다. 위반은 조용한 무시가 아니라 invalid_params 거절이다.
         "boot.enqueue" => {
-            if params.get("surface_id").is_some() {
+            // ★(부트 v2 · 명세 §2-5) GUI 인가 — `operator_token` 이 **데몬 발급값과 일치할
+            //   때만** surface_id 신고를 허용한다. 근거 계급은 feed.reply 면제와 같다: 토큰은
+            //   데몬이 자기 상태 디렉터리에 0600 으로 쓰고(state.rs::write_operator_token)
+            //   붙이는 지점은 Tauri 백엔드 한 곳뿐이다(CLI 는 0건).
+            let gui_authorized = operator_token_ok(daemon, &params);
+            if params.get("surface_id").is_some() && !gui_authorized {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "boot.enqueue: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다",
+                    "boot.enqueue: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다\
+                     (GUI 는 operator_token 으로 인가받는다)",
                 ));
             }
             if params.get("lane").is_some() {
@@ -2336,7 +2342,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★(R3-P2-4 blocker) 감독자 생존 선검사 — 미기동(롤백 노브·미배선)이면 스풀에
             //   **쓰지 않고** typed 오류를 돌린다. 여기서 성공을 돌리면 훅이 폴백 spawn 을
             //   건너뛰고 인텐트는 수명 1800s 동안 아무도 집지 않는다(부트 0회 무음 후퇴).
-            //   CLI 는 이 코드를 legacy 계열(exit 5)로 환원해 종전 spawn 폴백을 태운다.
             if !daemon.supervisor_alive.load(Ordering::Relaxed) {
                 return Reply::Single(err_response(
                     &id,
@@ -2345,19 +2350,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                      CYS_BOOT_SUPERVISOR=0 또는 구 기동) — 스풀 미기록, 종전 spawn 폴백을 타라",
                 ));
             }
-            // decl_origin 닫힌 토큰 — 미지값은 침묵 수용이 아니라 거절(계약 위반을 침묵으로
-            // 접으면 다음 호출자가 그 값을 믿게 된다 — hook.decide 의 신고 거절과 같은 규율).
+            // decl_origin 닫힌 토큰 — 미지값은 침묵 수용이 아니라 거절. 인정 토큰은 둘이며
+            // `gui-operator` 는 **토큰 인가를 통과했을 때만** 인정한다(참칭 차단).
             let decl_origin = param_str(&params, "decl_origin").unwrap_or_default();
-            if !decl_origin.is_empty()
-                && decl_origin != crate::boot_supervisor::DECL_ORIGIN_HOOK_HUMAN
-            {
+            let origin_known = decl_origin.is_empty()
+                || decl_origin == crate::boot_supervisor::DECL_ORIGIN_HOOK_HUMAN
+                || (decl_origin == crate::boot_supervisor::DECL_ORIGIN_GUI_OPERATOR
+                    && gui_authorized);
+            if !origin_known {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
                     &format!("boot.enqueue: 미지 decl_origin: {decl_origin:?}"),
                 ));
             }
-            let Some(sid) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) else {
+            // 좌석 도출: GUI 인가면 신고값, 그 외는 종전대로 커널 peer pid 조상 체인.
+            let sid = if gui_authorized {
+                match params.get("surface_id").and_then(|v| v.as_u64()) {
+                    Some(s) => Some(s),
+                    None => caller_pid.and_then(|p| resolve_caller_surface(daemon, p)),
+                }
+            } else {
+                caller_pid.and_then(|p| resolve_caller_surface(daemon, p))
+            };
+            let Some(sid) = sid else {
                 return Reply::Single(err_response(
                     &id,
                     "caller_unresolved",
@@ -2370,8 +2386,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★claim 교차검증(R3-P2-1): rc=0 주장이 실려 오면 데몬 자신의 roles 레지스트리로
             //   그 사실을 확인한다(env 릴레이보다 강한 근거). 불일치면 태어날 때부터 거짓인
             //   데이터를 스풀에 적지 않는다 — 훅은 폴백 spawn 으로 마무리하므로 liveness 무손실.
-            //   (디스패치 시점에는 run_ensure_team 이 어차피 재실측한다 — 이 검사는 기록 시점의
-            //    정직성 층이다.)
             if claim_rc == Some(0) {
                 let holder = { daemon.roles.lock().unwrap().get("master").copied() };
                 if holder != Some(sid) {
@@ -2390,45 +2404,63 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .chars()
                 .take(256)
                 .collect();
-            // ★선언별 **유일 id**(P2-4 · 고정 id 금지): 소진된 메모리측 예산이 1800s 보존되므로
-            //   고정 id 는 정당한 재선언을 최대 30분 즉시 Retire 하는 liveness 함정이다.
-            //   **데몬 세대(started_at 16진 — seat 토큰 `q{:x}` 선례)**·epoch·sid·수명 단조
-            //   카운터의 조합이 유일성을 보장한다. 세대 접두가 필요한 이유(R4 수정 라운드):
-            //   카운터는 프로세스 static 이라 데몬 재시작이 0 부터 다시 세는데, 재시작이 직전
-            //   enqueue 와 같은 epoch 초에 떨어지면 세대 없인 id 가 충돌해 스풀 파일을
-            //   덮어쓴다(디스크측 attempts 리셋 = 선언당 시도 상한의 조용한 확장).
-            static BOOT_INTENT_SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = BOOT_INTENT_SEQ.fetch_add(1, Ordering::Relaxed);
-            let intent_id = format!(
-                "boot-{:x}-{}-{}-{}",
-                daemon.started_at as u64,
-                crate::state::now_epoch() as u64,
-                sid,
-                n
-            );
-            match crate::boot_supervisor::enqueue(
-                &daemon.socket_path,
-                &intent_id,
-                crate::boot_supervisor::BootAction::EnsureTeam,
-                "", // lane 자기 고정(R3-P2-6) — 빈값 = 감독자 자신의 소켓.
+            // ★(부트 v2 · 명세 §2-5) **선언 id** — 내용에서 뽑는다. 종전 id 는
+            //   `데몬세대-epoch-sid-카운터` 라 매 호출이 새 id 였고, 그래서 같은 선언 이벤트의
+            //   재전송(훅 재실행·중복 배달)이 인텐트를 하나 더 낳았다. 세션 축은 훅이 주는
+            //   `session_id`(GUI 는 `gui_click_id`)이고, 본문 축은 클라이언트가 계산해 보내는
+            //   `prompt_digest` 다 — 데몬은 프롬프트 원문을 받지 않는다(본문 무전송 계약).
+            let session_axis = param_str(&params, "session_id")
+                .or_else(|| param_str(&params, "gui_click_id"))
+                .unwrap_or_default();
+            let prompt_digest = param_str(&params, "prompt_digest").unwrap_or_default();
+            let decl_id = crate::boot_supervisor::compute_decl_id(
+                &daemon.socket_path.to_string_lossy(),
                 Some(sid),
-                &reason,
-                &decl_origin,
+                &session_axis,
+                &prompt_digest,
+            );
+            // 실행 주체 **스냅샷**(명세 §5) — 스위치가 도중에 뒤집혀도 이 인텐트는 태어날 때의
+            // 결정대로 완주한다. 스위치 판독은 데몬 1회이며 훅·GUI 는 이 값을 물어본다.
+            let executor = if crate::boot_supervisor::boot_v2_enabled_from(
+                std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok().as_deref(),
+            ) {
+                crate::boot_supervisor::EXECUTOR_RUNNER
+            } else {
+                crate::boot_supervisor::EXECUTOR_PYTHON
+            };
+            let req = crate::boot_supervisor::EnqueueReq {
+                decl_id: &decl_id,
+                action: crate::boot_supervisor::BootAction::EnsureTeam,
+                lane: "", // lane 자기 고정(R3-P2-6) — 빈값 = 감독자 자신의 소켓.
+                surface_id: Some(sid),
+                reason: &reason,
+                decl_origin: &decl_origin,
                 claim_rc,
                 claim_at,
-            ) {
+                executor,
+            };
+            match crate::boot_supervisor::enqueue(&daemon.socket_path, &req) {
                 // 스풀 원자 기록 완료 = 즉시 ack — 스폰·부트 완료를 기다리지 않는다(R3-RISK-2).
-                // ★`log`(R2 note): frontdoor 경로에서는 부트 출력이 **오직 이 파일에만** 간다
-                //   (런 로그가 아예 생기지 않는다). 훅 note 가 '데몬 상태 디렉터리의
-                //   boot-supervisor.log' 라는 미해소 서술을 주던 것을 실경로로 바꾸기 위해
-                //   경로 규약 소유자(`boot_supervisor::supervisor_log_path`)가 직접 싣는다.
-                Ok(_) => Reply::Single(ok_response(
-                    &id,
-                    json!({"enqueued": true, "id": intent_id, "surface_id": sid,
-                           "log": crate::boot_supervisor::supervisor_log_path(&daemon.socket_path)
-                               .to_string_lossy()}),
-                )),
+                // 세 귀결(enqueued·dedup·superseded)은 **전부 정상**이며 훅이 그대로 고지한다.
+                Ok(outcome) => {
+                    let by = match &outcome {
+                        crate::boot_supervisor::EnqueueOutcome::Superseded { by, .. } => {
+                            Some(by.clone())
+                        }
+                        _ => None,
+                    };
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"enqueued": matches!(outcome,
+                                   crate::boot_supervisor::EnqueueOutcome::Enqueued { .. }),
+                               "outcome": outcome.as_str(),
+                               "id": decl_id, "decl_id": decl_id, "surface_id": sid,
+                               "superseded_by": by,
+                               "executor": executor,
+                               "log": crate::boot_supervisor::supervisor_log_path(&daemon.socket_path)
+                                   .to_string_lossy()}),
+                    ))
+                }
                 Err(e) => Reply::Single(err_response(
                     &id,
                     "enqueue_failed",
@@ -10043,11 +10075,20 @@ mod tests {
         assert!(spool_intents(&daemon).is_empty(), "모순 claim 인텐트가 기록됐다");
     }
 
-    /// ★[성공 계약 핀] 커널 도출 surface + 레지스트리 일치 claim → v2 인텐트가 원자 기록되고
-    /// 즉시 ack. **lane 은 항상 빈값**(자기 레인 고정 — R3-P2-7 ⓔ의 데몬면), id 는 선언별
-    /// 유일값이다(고정 id 금지 — P2-4 liveness 함정).
+    /// ★[성공 계약 핀 · **부트 v2 로 계약 교체**] 커널 도출 surface + 레지스트리 일치 claim →
+    /// 인텐트가 원자 기록되고 즉시 ack. **lane 은 항상 빈값**(자기 레인 고정).
+    ///
+    /// ★종전 계약과 무엇이 달라졌는가(정직 기록): 이 검체는 원래 "재선언은 **다른** id 를
+    /// 받는다" 를 박제했다. 근거는 "고정 id 면 소진된 예산이 1800s 동안 정당한 재선언을 즉시
+    /// Retire 한다(무반응 함정)" 였다. 부트 v2 는 그 함정을 **다른 수단**으로 막는다 —
+    /// id 는 선언 **내용**에서 뽑고(`decl_id`), terminal 전이 시점에 파일을 `.done` 으로
+    /// rename 해 재선언이 언제나 새 파일이 되게 한다(시뮬 T1-3). 그래서 여기서는
+    ///   ⓐ 같은 선언의 **재전송**은 `dedup`(인텐트 1건 — 종전엔 2건이 생겼다)
+    ///   ⓑ 그 함정 자체가 열리지 않는다는 것은 supervisor 의
+    ///      `redeclaration_after_terminal_is_not_swallowed_as_dedup` 이 잰다
+    /// 를 박제한다. **목적은 보존하고 수단만 바꾼 것**이며, 목적을 재는 검체가 사라지지 않았다.
     #[test]
-    fn boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id() {
+    fn boot_enqueue_writes_a_v3_intent_with_own_lane_and_content_derived_id() {
         let daemon = isolated_daemon();
         daemon.supervisor_alive.store(true, Ordering::SeqCst);
         let sid = make_surface(&daemon, Some("master"));
@@ -10058,30 +10099,85 @@ mod tests {
             "claim_rc": 0,
             "claim_at": crate::state::now_epoch(),
             "reason": "hook",
+            "session_id": "sess-1",
+            "prompt_digest": "d-1",
         });
         let r1 = boot_enqueue_call(&daemon, Some(pid), params.clone());
         assert_eq!(r1["result"]["enqueued"], json!(true), "응답: {r1}");
+        assert_eq!(r1["result"]["outcome"], json!("enqueued"));
         assert_eq!(r1["result"]["surface_id"], json!(sid));
+        assert_eq!(r1["result"]["executor"], json!("runner"), "기본 스위치는 v2 러너다");
+        // ⓐ 같은 선언 이벤트의 **재전송** → dedup · 파일 1건(종전엔 2건이 생겼다).
         let r2 = boot_enqueue_call(&daemon, Some(pid), params);
+        assert_eq!(r2["result"]["outcome"], json!("dedup"), "재전송이 dedup 이 아니다: {r2}");
+        assert_eq!(r2["result"]["enqueued"], json!(false));
         let (id1, id2) = (r1["result"]["id"].as_str().unwrap(), r2["result"]["id"].as_str().unwrap());
-        assert_ne!(id1, id2, "재선언이 같은 인텐트 id 를 받았다 — 소진 예산 1800s 그림자(무반응 함정)");
-        // (R4 수정 라운드) 데몬 세대 접두 핀 — 없으면 같은 epoch 초 안의 데몬 재시작이 seq 0
-        // 부터 다시 세며 직전 id 와 충돌, 스풀 파일 덮어쓰기로 디스크측 attempts 가 리셋된다.
-        let gen_prefix = format!("boot-{:x}-", daemon.started_at as u64);
-        assert!(
-            id1.starts_with(&gen_prefix) && id2.starts_with(&gen_prefix),
-            "인텐트 id 에 데몬 세대 접두 부재({id1}) — 같은 초 재시작 id 충돌(스풀 덮어쓰기) 재개방"
+        assert_eq!(id1, id2, "같은 선언 재전송이 다른 id 를 받았다 — 내용 기반 id 계약 붕괴");
+        assert_eq!(id1.len(), 32, "decl_id 길이 계약(파일명 예산)");
+        // ⓑ **다른** 선언(프롬프트가 다르다)은 같은 좌석이라 superseded 로 기록된다.
+        let r3 = boot_enqueue_call(
+            &daemon,
+            Some(pid),
+            json!({"decl_origin": "hook-human", "session_id": "sess-1", "prompt_digest": "d-2"}),
         );
+        assert_eq!(r3["result"]["outcome"], json!("superseded"), "응답: {r3}");
+        assert_eq!(r3["result"]["superseded_by"], json!(id1));
         let intents = spool_intents(&daemon);
-        assert_eq!(intents.len(), 2, "인텐트 파일 수 불일치: {intents:?}");
+        assert_eq!(intents.len(), 1, "진행 중 인텐트는 1건이어야 한다: {intents:?}");
         for it in &intents {
             assert_eq!(it["v"], json!(crate::boot_supervisor::INTENT_SCHEMA_V));
-            assert_eq!(it["lane"], json!(""), "enqueue 산출 인텐트의 lane 이 빈값이 아니다: {it}");
-            assert_eq!(it["surface_id"], json!(sid), "커널 도출 surface 미탑재: {it}");
-            assert_eq!(it["decl_origin"], json!("hook-human"));
-            assert_eq!(it["claim"]["rc"], json!(0));
-            assert_eq!(it["action"], json!("ensure-team"), "닫힌 enum 토큰 이탈: {it}");
+            assert_eq!(it["lane"], json!(""), "lane 자기 고정 위반");
+            assert_eq!(it["surface_id"], json!(sid));
+            assert_eq!(it["state"], json!("pending"));
+            assert_eq!(it["executor"], json!("runner"));
+            assert_eq!(it["generation"], json!(0));
         }
+    }
+
+    /// ★H-ENQ-GUI-1(명세 §2-5 · §2-11): `operator_token` 이 데몬 발급값과 **일치할 때만**
+    /// GUI 가 `surface_id` 를 명시할 수 있고 `gui-operator` 유래가 인정된다.
+    ///
+    /// 왜 이 인가가 필요한가: 훅은 커널 peer pid 로 좌석을 도출할 수 있지만 GUI ▶버튼은 자기
+    /// pane 이 없다 — 좌석을 말할 수 없으면 GUI 는 부트를 발화할 수 없다. 토큰은 데몬이 자기
+    /// 상태 디렉터리에 0600 으로 쓰고 붙이는 지점이 Tauri 백엔드 한 곳뿐이라(CLI 는 0건)
+    /// feed.reply 면제와 같은 신뢰 계급이다.
+    #[test]
+    fn boot_enqueue_authorizes_gui_only_with_the_operator_token() {
+        let daemon = isolated_daemon();
+        daemon.supervisor_alive.store(true, Ordering::SeqCst);
+        let sid = make_surface(&daemon, Some("master"));
+        let tok = daemon.operator_token.clone().expect("데몬이 토큰을 발급하지 않았다");
+        // ⓐ 토큰 일치 → surface_id 명시 허용 + gui-operator 인정. caller_pid 없이도 성립한다
+        //    (GUI 는 pane 이 없다 — 그것이 이 인가가 존재하는 이유다).
+        let ok = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"operator_token": tok, "surface_id": sid,
+                   "decl_origin": "gui-operator", "gui_click_id": "click-1",
+                   "prompt_digest": "g-1"}),
+        );
+        assert_eq!(ok["result"]["outcome"], json!("enqueued"), "응답: {ok}");
+        assert_eq!(ok["result"]["surface_id"], json!(sid));
+        let intents = spool_intents(&daemon);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0]["decl_origin"], json!("gui-operator"));
+        // ⓑ ★음성 대조 — 토큰 **불일치**면 surface_id 신고는 종전대로 거절이다.
+        let bad = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"operator_token": "not-the-token", "surface_id": sid,
+                   "decl_origin": "gui-operator", "prompt_digest": "g-2"}),
+        );
+        assert_eq!(bad["error"]["code"], json!("invalid_params"), "응답: {bad}");
+        // ⓒ ★음성 대조 — 토큰 **부재**로 gui-operator 만 주장하면 미지 유래로 거절이다
+        //    (유래 토큰이 인가 없이 통과하면 그 철자는 아무것도 증명하지 못한다).
+        let forged = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"decl_origin": "gui-operator", "prompt_digest": "g-3"}),
+        );
+        assert_eq!(forged["error"]["code"], json!("invalid_params"), "응답: {forged}");
+        assert_eq!(spool_intents(&daemon).len(), 1, "거절된 요청이 스풀에 적혔다");
     }
 
     /// 게이트 박제: clear_first(원자 Ctrl-U 선정리)는 launch-agent 등록 pane 한정 —
