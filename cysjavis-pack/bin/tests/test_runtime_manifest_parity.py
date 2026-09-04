@@ -176,6 +176,28 @@ class ManifestSchemaParityTests(unittest.TestCase):
         self.assertEqual(2, window.count("$markerVer -ne $expVer"),
                          "마커 존재만 보고 값을 대조하지 않으면 잔존 설치를 걸러내지 못한다")
 
+    # ── ⑥ 같은 결함 계급을 **레인 전체**에서 봉인 (master 판정 2026-09-04) ──
+    def test_no_step_in_the_windows_lane_searches_for_the_install_recursively(self):
+        """#9 는 두 스텝만 지목했지만 결함 계급은 레인 전체의 것이다 — 나머지 스모크 스텝들도
+        같은 재귀 검색을 쓰고 있었다(PTY·T3·T4·T4-14·T4-15·T5·T6 7곳). 한 곳이라도 남으면
+        그 스텝의 초록이 '잔존 설치를 봤을 수도 있는 초록'이 된다. 레인 전체에서 0 을 못 박는다."""
+        src = read(os.path.join(REPO, ".github", "workflows", "windows-build.yml"))
+        code = "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("#"))
+        self.assertNotIn('Get-ChildItem "$env:LOCALAPPDATA" -Recurse', code,
+                         "설치 트리를 재귀 검색하는 스텝이 남아 있다 — 잔존 설치를 검증할 수 있다")
+        # 확정값 생산은 정확히 1곳(설치 스텝), 소비는 그 뒤 전 스텝.
+        self.assertEqual(1, code.count('"CYS_INSTALL_DIR=$dir"'),
+                         "설치 경로 확정은 설치 스텝 한 곳에서만 나와야 한다(생산자 단일)")
+        self.assertEqual(1, code.count('"CYS_INSTALL_VER=$markerVer"'),
+                         "검증된 마커 값 확정도 한 곳에서만 나와야 한다")
+        consumers = code.count("$dir = $env:CYS_INSTALL_DIR")
+        self.assertGreaterEqual(consumers, 7,
+                                "확정값을 받는 스텝이 7곳 미만이다 — 어딘가 자체 탐색으로 돌아갔다")
+        # 소비 스텝은 전부 **그 사이 설치본이 바뀌지 않았음**까지 확인해야 한다.
+        self.assertEqual(consumers - 1, code.count("-ne $env:CYS_INSTALL_VER"),
+                         "확정값을 받고도 마커 동일성을 확인하지 않는 스텝이 있다 "
+                         "(매니페스트 검증 스텝 1곳만 자체 SOT 대조를 쓴다)")
+
     def test_windows_lane_ships_the_manifest_as_a_bundle_resource(self):
         conf = os.path.join(REPO, "src-tauri", "tauri.windows.conf.json")
         self.assertTrue(os.path.isfile(conf))

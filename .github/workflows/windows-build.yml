@@ -200,8 +200,9 @@ jobs:
           if (-not (Test-Path $marker)) { throw "버전 마커 부재: $marker — 무인 설치가 성공 종단(cys_post_ok)에 도달하지 못했다" }
           $markerVer = (Get-Content $marker -Raw).Trim()
           if ($markerVer -ne $expVer) { throw "설치본 동일성 실패: 마커=$markerVer · 이번 빌드=$expVer — 방금 설치한 산출물이 아니라 잔존 설치를 보고 있다" }
-          # 뒤 스텝(runtime-manifest 실기 검증)이 **같은 트리**를 보도록 확정값을 넘긴다.
-          "CYS_INSTALL_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # 뒤 스텝들이 **같은 트리**를 보도록 확정값을 넘긴다(경로 + 검증된 마커 값).
+          "CYS_INSTALL_DIR=$dir"        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CYS_INSTALL_VER=$markerVer"  | Out-File -FilePath $env:GITHUB_ENV -Append
           $rt = Join-Path $dir 'runtime'
           Write-Host "install dir: $dir  (버전 마커=$markerVer == 이번 빌드 $expVer)"
           Write-Host "== runtime top-level =="; if (Test-Path $rt) { Get-ChildItem $rt | Select-Object -ExpandProperty Name } else { throw "runtime 폴더 없음: $rt" }
@@ -285,9 +286,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $inst) { throw "설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "설치 트리 확인: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "설치 트리 확인: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "설치 트리 확인: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $cys = Join-Path $dir 'cys.exe'
           # list가 형제 cysd를 자동 기동(4초 대기 내장) — ping은 순수 프로브라 autostart가
           # 의도적으로 꺼져 있어(cys.rs) 부트스트랩에 못 쓴다. 첫 시도 실패 시 1회 재시도.
@@ -368,9 +374,14 @@ jobs:
         shell: pwsh
         timeout-minutes: 20   # ★백스톱: 어떤 하위 호출이 hang해도 20분에 스텝 종료(6h 방지 · W8 preflight 전수 실행 예산 포함)
         run: |
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $inst) { throw "설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "설치 트리 확인: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "설치 트리 확인: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "설치 트리 확인: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $cys = Join-Path $dir 'cys.exe'
           $results = @{}
           $userHome = $env:USERPROFILE
@@ -568,9 +579,15 @@ jobs:
               return @{Code=$p.ExitCode;Out="$(Get-Content $o -Raw -ErrorAction SilentlyContinue)$(Get-Content $e -Raw -ErrorAction SilentlyContinue)"}
             } finally { Remove-Item $o,$e -Force -ErrorAction SilentlyContinue }
           }
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T4: 설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName; $cys = Join-Path $dir 'cys.exe'; $cysd = $inst.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T4: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "T4: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T4: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
+          $cys = Join-Path $dir 'cys.exe'; $cysd = $inst.FullName
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           if (-not $setup) { throw "T4: setup.exe 미발견" }
 
@@ -720,9 +737,14 @@ jobs:
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T4-14: 설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T4-14: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "T4-14: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T4-14: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $cys = Join-Path $dir 'cys.exe'
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           if (-not $setup) { throw "T4-14: setup.exe 미발견" }
@@ -789,9 +811,14 @@ jobs:
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T4-15: 설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T4-15: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "T4-15: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T4-15: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $cys = Join-Path $dir 'cys.exe'; $cysd = Join-Path $dir 'cysd.exe'
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           if (-not $setup) { throw "T4-15: setup.exe 미발견" }
@@ -876,9 +903,14 @@ jobs:
           PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
         run: |
           $ErrorActionPreference = 'Stop'
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T5: 설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T5: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "T5: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T5: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $cys = Join-Path $dir 'cys.exe'
           $cysd = $inst.FullName
           $py = Join-Path $dir 'runtime\python\python3.exe'
@@ -923,9 +955,14 @@ jobs:
           PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
         run: |
           $ErrorActionPreference = 'Stop'
-          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T6: 설치된 cysd.exe 미발견" }
-          $dir = $inst.Directory.FullName
+          # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
+          #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
+          #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T6: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if (-not (Test-Path (Join-Path $dir 'cysd.exe'))) { throw "T6: 설치 디렉터리에 cysd.exe 가 없다: $dir" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T6: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
+          $inst = Get-Item (Join-Path $dir 'cysd.exe')
           $py  = Join-Path $dir 'runtime\python\python3.exe'
           $pth = Join-Path $dir 'runtime\python\python312._pth'
           if (-not (Test-Path $py))  { throw "T6: 동봉 python3.exe 미발견: $py" }
