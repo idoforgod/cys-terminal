@@ -1,0 +1,36 @@
+{
+ "started": "<ts>",
+ "run_id": "<run_id>",
+ "pid": 0,
+ "surface": "7",
+ "role": "master",
+ "lane": "base",
+ "boot_last_path": "<boot_last>",
+ "steps": [
+  {
+   "step": "⑤check",
+   "exit": 1,
+   "detail": "<detail>",
+   "order": 33
+  }
+ ],
+ "retry": {},
+ "socket": "",
+ "base_socket": true,
+ "result": {
+  "ok": false,
+  "state": "failed",
+  "failed_step": "⑤check",
+  "exit": 6,
+  "run_id": "<run_id>",
+  "surface": "7",
+  "pid": 0,
+  "notify": {
+   "attempted": true,
+   "channel": "<channel>"
+  }
+ },
+ "role_claimed": "master",
+ "ended": "<ts>",
+ "exit": 6
+}

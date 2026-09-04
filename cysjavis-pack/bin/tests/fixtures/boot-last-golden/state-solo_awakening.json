@@ -1,0 +1,34 @@
+{
+ "started": "<ts>",
+ "run_id": "<run_id>",
+ "pid": 0,
+ "surface": "7",
+ "role": "master",
+ "lane": "base",
+ "boot_last_path": "<boot_last>",
+ "steps": [
+  {
+   "step": "③″ceo-ticket-solo",
+   "exit": 0,
+   "detail": "<detail>",
+   "order": 19
+  }
+ ],
+ "retry": {},
+ "socket": "",
+ "base_socket": true,
+ "result": {
+  "ok": true,
+  "state": "solo_awakening",
+  "solo_awakening": true,
+  "reason": "<prose>",
+  "ticket_requested": true,
+  "exit": 0,
+  "run_id": "<run_id>",
+  "surface": "7",
+  "pid": 0
+ },
+ "role_claimed": "master",
+ "ended": "<ts>",
+ "exit": 0
+}
