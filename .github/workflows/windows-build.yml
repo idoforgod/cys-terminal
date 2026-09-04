@@ -311,7 +311,15 @@ jobs:
           $cys = Join-Path $dir 'cys.exe'
           $results = @{}
           $userHome = $env:USERPROFILE
-          function Rec($id,$ok,$note){ $results["$id"] = [bool]$ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
+          # ★annotation 승격(2026-09-05 · W-C 요청 · IG-23): 종전엔 행별 결과가 **stdout 에만**
+          #   남아, 실패하면 요약에 "exit code 1" 한 줄뿐이라 **어느 행이 깨졌는지 판독 불가**였다
+          #   (3032847 windows-build #13 이 정확히 그 상태였다). FAIL 행마다 `::error::` 를 내어
+          #   로그를 내려받지 않고도 좁혀지게 한다. PASS 는 승격하지 않는다(요약 소음).
+          function Rec($id,$ok,$note){
+            $results["$id"] = [bool]$ok
+            Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note)
+            if (-not $ok) { Write-Host ("::error title=T3-{0} FAIL::{1}" -f $id, $note) }
+          }
           # ★바운드 실행: 외부 exe가 hang해도 스텝이 멈추지 않게 timeout kill. @{Code;Out} 반환(Code=-1=timeout).
           function Bx($exe,$argv,$ms){
             $o=[System.IO.Path]::GetTempFileName(); $e=[System.IO.Path]::GetTempFileName()
@@ -480,7 +488,14 @@ jobs:
           # ★W8 확장 행 전부 크리티컬 — A13 이 이 판독을 릴리스 차단 게이트의 증적으로 지정한다.
           $crit = @('1','2','1b','pipe','13','ng1','ng2','ng3','tpl','c03','alt')
           $failed = $crit | Where-Object { -not $results["$_"] }
-          if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
+          # 미실행 행도 드러낸다 — `$results` 에 키가 없으면 그 행은 **재지 못한 것**이지
+          # 통과가 아니다(무측정을 통과로 읽지 않는다는 이 저장소의 규율).
+          $missing = $crit | Where-Object { -not $results.ContainsKey("$_") }
+          if ($missing) { Write-Host ("::error title=T3 미실행 행::" + ($missing -join ',') + " — 측정되지 않았다(통과 아님)") }
+          if ($failed) {
+            Write-Host ("::error title=T3 크리티컬 실패::" + ($failed -join ','))
+            throw ("크리티컬 T3 행 실패: " + ($failed -join ','))
+          }
           Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"
 
       # ─────────────────────────────────────────────────────────────────────────
