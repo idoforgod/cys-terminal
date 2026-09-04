@@ -2392,6 +2392,38 @@ fn hook_decide_verdict(seat: Result<&str, &'static str>) -> (&'static str, &'sta
     }
 }
 
+/// (B3-4 · T3-1) 요청에 `lease` 가 실려 있으면 **CAS 한다** — 거절이면 `Some(Reply)`,
+/// 통과하거나 애초에 안 실렸으면 `None`.
+///
+/// 표 잠금 실패(poison)는 **거절**이다. 소유권을 확인할 수 없는데 통과시키는 것이 이 축에서
+/// 가장 나쁜 실패다 — 감독자 `admission_state` 의 fail-closed 와 같은 규율이다.
+fn lease_gate(daemon: &Arc<Daemon>, params: &Value, id: &Value, path: &str) -> Option<Reply> {
+    let supplied = params.get("lease").and_then(Value::as_u64)?;
+    let (ok, current) = match daemon.boot_run_active.lock() {
+        Ok(g) => (
+            crate::boot_supervisor::lease_ok(Some(supplied), g.as_ref()),
+            g.as_ref().map(|r| r.generation),
+        ),
+        Err(_) => (false, None),
+    };
+    if ok {
+        return None;
+    }
+    daemon.bus.publish(
+        "boot_supervisor.lease_stale",
+        "boot_supervisor",
+        None,
+        json!({"path": path, "supplied": supplied, "current": current}),
+    );
+    Some(Reply::Single(err_response(
+        id,
+        "lease_stale",
+        &format!(
+            "{path}: lease {supplied} is stale (current {current:?}) — this runner no longer owns the boot run"
+        ),
+    )))
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
@@ -2745,6 +2777,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         }
 
         "surface.create" => {
+            // ★T3-1: 러너가 lease 를 실었으면 **PTY 를 띄우기 전에** CAS 한다. 뒤로 미루면
+            //   소유권을 잃은 러너가 좌석을 하나 만들고 나서야 거절당한다(좀비 셸).
+            if let Some(reply) = lease_gate(daemon, &params, &id, "surface.create") {
+                return reply;
+            }
             let rows = match param_dim(&params, "rows", DEFAULT_ROWS, MAX_ROWS) {
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
@@ -5564,6 +5601,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   (자기보고로 '검증됨'을 위조하면 검증이 무의미해진다). cysd-매개 발신(launch-agent·
         //   node-recover 같은 일시적 CLI, caller_sid None)만 쓸 수 있다.
         "directive.verify" => {
+            // ★T3-1: 소유권을 잃은 러너의 뒤늦은 각성 보고를 원장에 남기지 않는다.
+            if let Some(reply) = lease_gate(daemon, &params, &id, "directive.verify") {
+                return reply;
+            }
             let Some(sid) = resolve_surface_id(&params) else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
             };
@@ -6152,6 +6193,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                //   pane 고지와 **같은 함수**를 쓴다(분열 방지).
                                "npm_prefix_polluted":
                                    npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())},
+                    // ★B3-4(명세 §5): 부트 v2 스위치의 **단일 진실은 데몬**이다. 훅·GUI·감독자가
+                    //   각자 env 를 읽으면 같은 순간에 서로 다른 답을 갖는다(프로세스마다 env 가
+                    //   다를 수 있다). 여기서 한 번 노출하고 모두 이 값을 읽는다.
+                    "boot_v2_enabled": crate::boot_supervisor::boot_v2_enabled_from(
+                        std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok().as_deref(),
+                    ),
                     "surfaces": list,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
@@ -8666,6 +8713,129 @@ mod tests {
         assert_eq!(r2["ok"], json!(true), "기존 GUI 오퍼레이터 승인이 깨졌다 ({r2})");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B3-4(T3-1 · 명세 §2-7) — **선택적 lease CAS 가 배선돼 있다.**
+    ///
+    /// 순수 술어만 옳고 핸들러가 부르지 않으면 검체는 초록인데 프로덕션은 구 러너를 그대로
+    /// 받는다(공허 통과). 네 갈래를 dispatch 로 직접 잰다.
+    #[test]
+    fn optional_lease_is_cas_checked_before_any_side_effect() {
+        let dir = std::env::temp_dir().join(format!("cysd-lease-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        // 진행 중인 부트 런 — 세대 7 을 소유한다.
+        *daemon.boot_run_active.lock().unwrap() = Some(crate::state::BootRunActive {
+            intent: "i".into(),
+            generation: 7,
+            roles: Vec::new(),
+            hb: 1.0,
+            progress_step: String::new(),
+            progress_at: 1.0,
+            started: 1.0,
+            pid: None,
+            epoch: 1,
+        });
+        let call = |method: &str, params: Value| {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: method.into(), params },
+                None,
+            ) else {
+                panic!("expected single reply");
+            };
+            r
+        };
+        // ① 구 세대 → **좌석을 만들기 전에** 거절한다.
+        let before = daemon.surfaces.lock().unwrap().len();
+        let stale = call("surface.create", json!({"lease": 6}));
+        assert_eq!(
+            stale["error"]["code"],
+            json!("lease_stale"),
+            "구 세대 러너의 좌석 생성이 통과했다 — fence 의 CAS 거절이 집행되지 않는다 ({stale})"
+        );
+        assert_eq!(
+            daemon.surfaces.lock().unwrap().len(),
+            before,
+            "거절했는데 좌석이 생겼다 — 게이트가 부수효과보다 뒤에 있다(좀비 셸)"
+        );
+        // ② directive.verify 도 같은 게이트를 진다.
+        let stale2 = call(
+            "directive.verify",
+            json!({"surface_id": 1, "verified": true, "lease": 6}),
+        );
+        assert_eq!(
+            stale2["error"]["code"],
+            json!("lease_stale"),
+            "소유권 잃은 러너의 각성 보고가 원장에 남는다 ({stale2})"
+        );
+        // ③ 세대 일치 → 이 게이트는 통과한다(뒤에서 다른 사유로 막히는 것은 이 검체의 관심 밖).
+        //    없으면 '무차별 거절' 구현도 ①②를 통과해 초록이 된다 — 그 공허를 막는다.
+        let same = call(
+            "directive.verify",
+            json!({"surface_id": 999_999, "verified": true, "lease": 7}),
+        );
+        assert_ne!(
+            same["error"]["code"],
+            json!("lease_stale"),
+            "일치하는 lease 를 거절했다 — 게이트가 무차별 거절이다 ({same})"
+        );
+        // ④ 미제출 → 종전 경로. 사람·GUI 가 막히면 안 된다(추가만 계약).
+        let none = call(
+            "directive.verify",
+            json!({"surface_id": 999_999, "verified": true}),
+        );
+        assert_ne!(
+            none["error"]["code"],
+            json!("lease_stale"),
+            "lease 를 안 실은 종전 호출이 막혔다 — 추가만이라는 계약 위반 ({none})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★B3-4 소스핀 — lease 게이트가 두 arm 에서 **어떤 부수효과보다 앞**이다.
+    #[test]
+    fn lease_gate_precedes_any_side_effect_in_both_arms() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        for (arm, path, first_effect) in [
+            ("\"surface.create\" => {", "surface.create", "param_dim(&params, \"rows\""),
+            ("\"directive.verify\" => {", "directive.verify", "resolve_surface_id(&params)"),
+        ] {
+            let at = prod.find(arm).unwrap_or_else(|| panic!("{arm} arm 소실"));
+            let body = &prod[at..];
+            let gate = body
+                .find(&format!("lease_gate(daemon, &params, &id, \"{path}\")"))
+                .unwrap_or_else(|| panic!("{path} 에 lease 게이트 호출이 없다 — 순수 술어가 공허해진다"));
+            let eff = body
+                .find(first_effect)
+                .unwrap_or_else(|| panic!("{path} 의 첫 부수효과 앵커 소실"));
+            assert!(
+                gate < eff,
+                "{path} 의 lease 게이트가 첫 부수효과 뒤로 갔다 — 소유권 잃은 러너가 그것을 먼저 일으킨다"
+            );
+        }
+    }
+
+    /// ★B3-4(명세 §5) — 부트 v2 스위치를 **데몬이 노출한다**(훅·GUI·감독자가 각자 env 를 읽으면
+    /// 같은 순간에 서로 다른 답을 갖는다). 값 자체가 아니라 **노출된다는 사실**을 잰다.
+    #[test]
+    fn status_exposes_the_boot_v2_switch_from_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("cysd-bv2-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            r["result"]["boot_v2_enabled"].is_boolean(),
+            "org.status 가 boot_v2_enabled 를 노출하지 않는다 — 스위치 SOT 가 데몬이 아니게 된다 ({r})"
+        );
     }
 
     /// ★결함#6-b 예약어 핀 — `owner` 는 데몬이 **도출**하는 신원 등급이지 pane 이 자칭할 수

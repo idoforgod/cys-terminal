@@ -903,6 +903,33 @@ const FENCED_REAP_AGE_SECS: f64 = INTENT_MAX_AGE_SECS;
 /// 순수 함수인 이유: 배선 안에서는 이 갈래에 결정론으로 도달시킬 방법이 없어 검체가 공허해진다
 /// (실측으로 확인했다 — 표·스냅샷 세대가 이미 일치해야 판정이 나므로 그때 디스크만 따로 움직이는
 /// 상태를 틱 밖에서 만들 수 없다). 그래서 **판정을 값으로 뽑아** 직접 잰다.
+/// (B3-4 · T3-1 · 명세 §2-7) **선택적 lease 검증** — 실려 왔을 때만 잰다.
+///
+/// ## 왜 선택적인가 — 추가만 하고 종전을 막지 않는다
+/// `surface.create`·`directive.verify` 는 러너만 부르지 않는다(사람·GUI·다른 노드도 부른다).
+/// 그들은 lease 를 모르므로 필수로 만들면 종전 경로가 전부 막힌다. 그래서 없으면 종전 그대로
+/// 통과시키고, **실려 왔을 때만** 현재 소유권과 대조한다.
+///
+/// ## 이것이 막는 것 — fence 직후의 구 러너
+/// 감독자가 fence 로 세대를 올린 직후, 구 러너가 보낸 `surface.create{lease: 옛 세대}` 가 뒤늦게
+/// 도착할 수 있다. 그 요청을 그대로 처리하면 fence 가 회수했다고 믿은 소유권이 실제로는 계속
+/// 쓰이는 것이다 — fence 의 안전성이 전적으로 기대는 그 CAS 거절이 여기서 집행된다.
+///
+/// ## 정직한 한계 — generation 만으로는 재시작을 넘지 못한다
+/// 데몬이 재시작하면 표가 비고 세대가 되감길 수 있어, 옛 러너가 든 generation 이 새 런의 그것과
+/// **우연히 같아질** 수 있다(ABA). 그것을 가르는 축은 epoch 이고, epoch 를 러너까지 실어 보내는
+/// 것은 §2-7 러너(B4 · [`RunnerReadiness::epoch_propagated`])다. 그때 이 술어에 축 하나를 더하면
+/// 닫힌다 — 지금 재는 것은 **같은 데몬 수명 안에서의** 세대 경합이고, 그 범위를 넘겨 주장하지
+/// 않는다.
+pub fn lease_ok(supplied: Option<u64>, active: Option<&BootRunActive>) -> bool {
+    match supplied {
+        // 미제출 = 종전 경로. 검사하지 않는 것과 통과시키는 것은 다르지만, 여기서는 같게 둔다
+        // (추가만 한다는 계약이 그것이다).
+        None => true,
+        Some(g) => active.is_some_and(|r| u64::from(r.generation) == g),
+    }
+}
+
 pub fn fence_cas_ok(fresh: Option<&BootIntent>, expected_generation: u32) -> bool {
     fresh.is_some_and(|f| {
         f.state == IntentState::Running && f.generation == expected_generation
@@ -3915,6 +3942,41 @@ mod tests {
         assert_ne!(a, b, "연속 기동이 같은 epoch 를 냈다 — 재시작 간 ABA 가 열린다");
         assert_eq!(on_disk, b, "디스크에 최신 epoch 가 없다 — 다음 기동이 재사용을 못 피한다");
         assert!(leftovers.is_empty(), "tmp 잔해가 남았다: {leftovers:?}");
+    }
+
+    /// ★B3-4(T3-1) — **선택적** lease 검증의 네 갈래.
+    ///
+    /// ①이 계약의 핵심이다: 안 실으면 종전 그대로 통과한다. 이것을 필수로 바꾸면
+    /// `surface.create` 를 부르는 사람·GUI·다른 노드가 전부 막힌다(추가만 한다는 계약).
+    #[test]
+    fn optional_lease_only_checks_when_supplied() {
+        let run = |generation: u32| BootRunActive {
+            intent: "i".into(),
+            generation,
+            roles: Vec::new(),
+            hb: 1.0,
+            progress_step: String::new(),
+            progress_at: 1.0,
+            started: 1.0,
+            pid: None,
+            epoch: 1,
+        };
+        let active = run(7);
+        // ① 미제출 — 종전 경로. 활성 런이 있든 없든 통과한다.
+        assert!(lease_ok(None, Some(&active)), "lease 를 안 실은 호출을 막았다 — 추가만 계약 위반");
+        assert!(lease_ok(None, None), "활성 런이 없을 때도 종전 호출은 통과해야 한다");
+        // ② 일치 — 통과.
+        assert!(lease_ok(Some(7), Some(&active)), "일치하는 lease 를 거절했다");
+        // ③ 불일치(fence 로 세대가 오른 뒤 도착한 구 러너) — 거절.
+        assert!(
+            !lease_ok(Some(6), Some(&active)),
+            "구 세대 lease 를 통과시켰다 — fence 가 회수했다고 믿은 소유권이 계속 쓰인다"
+        );
+        // ④ 활성 런이 없는데 lease 를 실었다 — 거절(대조할 소유권이 없다).
+        assert!(
+            !lease_ok(Some(7), None),
+            "소유권 표가 비었는데 lease 를 통과시켰다 — 대조 없는 통과다"
+        );
     }
 
     /// ★B3-2R ③(codex③) — fence 의 **CAS 술어**를 직접 잰다.
