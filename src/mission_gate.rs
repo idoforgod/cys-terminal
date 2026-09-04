@@ -691,6 +691,19 @@ pub enum LedgerStatus {
     Unreadable,}
 
 impl LedgerStatus {
+    /// 와이어 어휘 → 상태. **미지 값은 판독 불가(fail-closed)** 로 접는다.
+    ///
+    /// 왜 `Absent` 나 `Ok` 로 접지 않는가: 이 값은 "무슨 근거로 판정했는가"이고, 근거를
+    /// **해석하지 못한 채** 정상으로 접으면 판정 근거가 없는 임무가 게이트를 연다. 모르는
+    /// 어휘는 계약 스큐(구·신 데몬 혼재)이지 정상 상태가 아니다.
+    pub fn from_wire(s: &str) -> LedgerStatus {
+        match s {
+            "absent" => LedgerStatus::Absent,
+            "ok" => LedgerStatus::Ok,
+            _ => LedgerStatus::Unreadable,
+        }
+    }
+
     /// python 상수(`LEDGER_ABSENT`·`LEDGER_OK`·`LEDGER_UNREADABLE`)와 **같은 문자열**.
     /// 대장·verdict JSON 이 이 어휘를 그대로 싣는다 — 갈리면 소비자가 상태를 못 읽는다.
     pub fn as_str(self) -> &'static str {
@@ -2072,6 +2085,36 @@ pub fn record_fold(
     ledger: &LedgerRead,
     read_anomalies: &[(String, String)],
 ) -> RecordDecision {
+    // 빈 프롬프트는 **원장을 보기 전에** 접는다 — 종전 순서 그대로다(여기서 machine_origin 을
+    // 부르면 판정도 이상징후도 없는 입력에 탐색 예산을 쓴다).
+    if prompt.trim_matches(is_py_space).is_empty() {
+        return RecordDecision {
+            fold: RecordFold::EmptyPrompt,
+            plan: LedgerPlan::Nothing,
+            anomalies: dedup_anomalies(read_anomalies),
+            notice: None,
+        };
+    }
+    let v = machine_origin(prompt, delivery, ledger_status);
+    record_fold_from_origin(prompt, &v, ledger, read_anomalies)
+}
+
+/// [`record_fold`] 의 **판정 주입형**(명세 §2-2 e · B2-c) — 층1·층2 판정을 **값으로** 받는다.
+///
+/// 왜 필요한가: 훅 CLI 는 층1 을 스스로 판정하지 않고 **데몬에게 묻는다**(A12 ·
+/// `hook.machine_origin`). 원장 경로 규약의 소유자가 데몬 하나이기 때문이다. 그래서 CLI 에는
+/// [`DeliveryMap`] 이 없고, [`record_fold`] 를 그대로 부를 수 없다. 그렇다고 CLI 가 층0·층0-c·
+/// 선언·임무 추출의 **순서를 다시 적으면** 그것이 곧 두 번째 규칙 사본이다 — 순서가 이 함수의
+/// 본체이므로(층1/2 → 층0 → 층0-c → 선언 → 임무) 규칙은 여기 한 곳에 두고 판정만 주입한다.
+///
+/// `origin.anomalies` 는 이 함수가 `read_anomalies` 와 함께 병합·중복제거한다. 데몬 RPC 가 이미
+/// 병합해 보낸 경우에는 같은 (code, detail) 쌍이라 dedup 이 흡수한다(이중 계상 없음).
+pub fn record_fold_from_origin(
+    prompt: &str,
+    origin: &OriginVerdict,
+    ledger: &LedgerRead,
+    read_anomalies: &[(String, String)],
+) -> RecordDecision {
     let mut anomalies: Vec<(String, String)> = read_anomalies.to_vec();
 
     if prompt.trim_matches(is_py_space).is_empty() {
@@ -2084,7 +2127,7 @@ pub fn record_fold(
     }
 
     // ── 1. 층1·층2 — 기계 유래는 대장을 읽지도 쓰지도 않는다 ────────────────────────
-    let v = machine_origin(prompt, delivery, ledger_status);
+    let v = origin;
     anomalies.extend(v.anomalies.iter().cloned());
     if v.machine {
         return RecordDecision {

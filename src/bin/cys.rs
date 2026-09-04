@@ -10877,6 +10877,19 @@ fn hook_ack_boot_nonce(socket: &std::path::Path, prompt: &str) -> Option<String>
 /// 대조하므로 해시 하나로는 원리적으로 불가능하다. 데몬은 그 텍스트를 pane 에 쓴 당사자이고
 /// 원장에 preview 를 이미 갖고 있어 같은 UID 소켓 위의 본문 전송은 새 노출면이 아니다
 /// (master 판정 · A12). `prompt_digest` 를 함께 보내 데몬이 **대조**하게 한다.
+/// 층1 RPC 가 함께 실어 오는 **기록용 사실**(판정 입력이 아니다 · 명세 §2-2 e).
+///
+/// 대장 record 는 "무엇으로 판정했는가"(`ledger_status`)와 "무엇을 보았는가"(`anomalies`)를
+/// 레코드에 박아야 한다 — 판정 근거가 없는 채로 발급된 임무는 게이트가 열지 않고(fail-closed),
+/// 차단할 수 없는 조작이라도 **흔적은 남아야** 하기 때문이다. 판정 자체는 [`Layer12`] 가 진다.
+#[derive(Default)]
+struct Layer12Facts {
+    /// 원장 판독 3상 어휘 원문(`absent`|`ok`|`unreadable`). 미지 값은 판독 불가로 접는다.
+    ledger_status: String,
+    /// 데몬이 **병합해** 보낸 이상징후(원장 판독분 + 층1 판정분 + env).
+    anomalies: Vec<(String, String)>,
+}
+
 enum Layer12 {
     Machine(String),
     Human,
@@ -10886,7 +10899,10 @@ enum Layer12 {
     Legacy(String),
 }
 
-fn hook_layer12_via_daemon(socket: &std::path::Path, prompt: &str) -> Layer12 {
+fn hook_layer12_via_daemon(
+    socket: &std::path::Path,
+    prompt: &str,
+) -> (Layer12, Layer12Facts) {
     let norm = cys::mission_gate::normalize(prompt);
     // 상한 초과분은 잘라 보내고 사실을 표기한다(A12) — 자르고 침묵하면 데몬이 부분 판정을
     // 전부 본 것으로 오인한다.
@@ -10905,10 +10921,25 @@ fn hook_layer12_via_daemon(socket: &std::path::Path, prompt: &str) -> Layer12 {
         // 구 데몬은 `method_not_found` 를 싣는다. 그 밖의 왕복 실패도 같은 방향(legacy)으로
         // 접는다 — 판정을 못 받은 채 fail-closed 로 접으면 데몬이 잠깐 죽은 것만으로 오너
         // 프롬프트가 전부 막힌다(가용성 파괴).
-        Err(e) => return Layer12::Legacy(format!("{e}")),
+        Err(e) => return (Layer12::Legacy(format!("{e}")), Layer12Facts::default()),
     };
     let why = r["reason"].as_str().unwrap_or("").to_string();
-    match r["origin"].as_str() {
+    // 기록용 사실 — 판정과 **같은 응답**에서 뽑는다(두 번 묻지 않는다 · 두 값이 갈리지 않는다).
+    let facts = Layer12Facts {
+        ledger_status: r["ledger_status"].as_str().unwrap_or_default().to_string(),
+        anomalies: r["anomalies"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|it| {
+                        let code = it["code"].as_str()?;
+                        Some((code.to_string(), it["detail"].as_str().unwrap_or("").to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let verdict = match r["origin"].as_str() {
         Some("machine") => Layer12::Machine(format!(
             "층{} — {why}",
             r["layer"].as_u64().map(|l| l.to_string()).unwrap_or_else(|| "?".into())
@@ -10921,7 +10952,8 @@ fn hook_layer12_via_daemon(socket: &std::path::Path, prompt: &str) -> Layer12 {
         }),
         // 미지 형상 = 계약 스큐. 믿고 진행하지 않는다(legacy 로 접어 셸이 종전 판정을 한다).
         other => Layer12::Legacy(format!("미지 origin({other:?})")),
-    }
+    };
+    (verdict, facts)
 }
 
 /// 층1·층2 판정 RPC — 신설 RPC 3축 실재 검사 대상(master 상설 지시).
@@ -11103,32 +11135,194 @@ fn hook_prompt_axis(
     let ack = hook_ack_boot_nonce(socket, &inp.prompt);
     let ack_note = ack.map(|a| format!(" · {a}")).unwrap_or_default();
 
-    // ★순서는 명세 §2-2 그대로 **층1·층2 → 층0 → 층0-c** 다. 층1/2 가 앞이라 push 본문에 섞인
-    //   "너는 마스터다" 도 뒤 단계로 새지 못한다(record_fold 와 같은 우선순위).
-    let machine = match hook_layer12_via_daemon(socket, &inp.prompt) {
-        Layer12::Machine(why) => Some(why),
-        // ★fail-closed(master 판정): 판정 근거가 없으면 **기계로 접는다**. 거짓 양성은 한 번 더
-        //   묻는 것(경미)이고, 거짓 음성은 기계 push 가 오너 임무가 되는 것(치명)이다.
-        Layer12::Unknown(why) => Some(format!("판정 불가 — fail-closed: {why}")),
-        Layer12::Human => None,
-        // 구 데몬·데몬 사망은 **legacy** 다 — 셸 본체가 종전 판정(python)을 수행한다.
-        Layer12::Legacy(why) => {
-            return hook_verdict(
-                "legacy",
-                HOOK_EXIT_LEGACY,
-                &format!("층1 판정 위임 불가({why}) — 셸 종전 게이트로 반환{ack_note}"),
-            );
+    // ★순서는 명세 §2-2 그대로 **층1·층2 → 층0 → 층0-c → 선언** 이다. 층1/2 가 앞이라 push
+    //   본문에 섞인 "너는 마스터다" 도 뒤 단계로 새지 못한다.
+    //   ★그 순서를 **여기에 다시 적지 않는다**(B2-c e): 순서가 곧 규칙이고 규칙의 소유자는
+    //   `mission_gate::record_fold_from_origin` 하나다. 층1/2 판정만 값으로 주입한다.
+    let (layer12, facts) = hook_layer12_via_daemon(socket, &inp.prompt);
+    // 구 데몬·데몬 사망은 **legacy** 다 — 셸 본체가 종전 판정(python)을 수행한다.
+    //   ★대장도 건드리지 않는다: 판정자가 없는데 기록하면 근거 없는 레코드가 남는다.
+    let Some(origin) = origin_from_layer12(&layer12) else {
+        let why = match &layer12 {
+            Layer12::Legacy(w) => w.clone(),
+            // 도달 불가(위 매핑이 Legacy 에서만 None 이다) — 그래도 침묵하지 않는다.
+            other => format!("판정 환원 실패({})", layer12_name(other)),
+        };
+        return hook_verdict(
+            "legacy",
+            HOOK_EXIT_LEGACY,
+            &format!("층1 판정 위임 불가({why}) — 셸 종전 게이트로 반환{ack_note}"),
+        );
+    };
+    let rec = hook_record_mission(
+        &cys::lane::mission_path(socket),
+        &cys::lane::epoch_path(socket),
+        &inp.prompt,
+        &origin,
+        cys::mission_gate::LedgerStatus::from_wire(&facts.ledger_status),
+        &facts.anomalies,
+    );
+    let machine = fold_machine_reason(&rec.decision.fold);
+    let (verdict, code, detail) = hook_prompt_outcome(machine.as_deref(), role, seat_reason);
+    hook_verdict(verdict, code, &format!("{detail}{ack_note}{}", rec.note_suffix()))
+}
+
+/// 층1·층2 판정(데몬 RPC 환원) → **대장 record 에 주입할 판정 값**. `None` = legacy(판정자 부재).
+///
+/// ★왜 순수 함수로 뽑았는가(mutation 실측 2026-09-04): 이 매핑을 호출부 안에 인라인으로 두면
+///   `machine:` 한 글자를 `false` 로 바꿔도 **전 검체가 초록**이었다(실측 — 변이 M3 미적발).
+///   그 변이의 뜻은 "층1 판정을 통째로 버린다" 이고, 그러면 **모든 기계 push 가 오너 임무**가
+///   된다(2026-08-01 사고의 기제 그 자체). 값으로 뽑으면 데몬 없이 네 갈래를 전수로 잰다
+///   (`hook_prompt_outcome` 과 같은 규율 — 계약은 값이어야 검체가 닿는다).
+///
+/// fail-closed 의 방향이 여기서 확정된다: `Unknown`(원장 판독 불가)은 **기계로 접는다**.
+/// 거짓 양성은 한 번 더 묻는 것(경미)이고, 거짓 음성은 기계 push 가 오너 임무가 되는 것(치명)이다.
+fn origin_from_layer12(v: &Layer12) -> Option<cys::mission_gate::OriginVerdict> {
+    let reason = match v {
+        Layer12::Machine(why) => why.clone(),
+        Layer12::Unknown(why) => format!("판정 불가 — fail-closed: {why}"),
+        Layer12::Human => String::new(),
+        Layer12::Legacy(_) => return None,
+    };
+    Some(cys::mission_gate::OriginVerdict {
+        machine: !matches!(v, Layer12::Human),
+        // 진단용 층 번호는 이미 사유 문자열("층1 — …")에 들어 있다 — 두 벌로 나르지 않는다.
+        layer: None,
+        reason,
+        // ★비운다: 데몬이 판독분·판정분·env 를 **이미 병합**해 `Layer12Facts` 로 보냈다.
+        //   여기에 또 실으면 '누가 관측했는가'가 흐려진다 — 관측자는 원장을 읽은 데몬 하나다.
+        anomalies: Vec::new(),
+    })
+}
+
+/// [`Layer12`] 의 갈래 이름 — 진단 문자열 전용(판정 입력 아님).
+fn layer12_name(v: &Layer12) -> &'static str {
+    match v {
+        Layer12::Machine(_) => "machine",
+        Layer12::Human => "human",
+        Layer12::Unknown(_) => "unknown",
+        Layer12::Legacy(_) => "legacy",
+    }
+}
+
+/// 대장 판정 폴드 → **기계 유래 사유**(없으면 오너 프롬프트).
+///
+/// 층 접두를 여기서 붙이는 이유: 폴드는 판정이고 접두는 사람이 읽는 라벨이라 층이 다르다.
+/// `MachineOrigin` 만 접두가 없는데, 그 사유는 데몬 RPC 가 이미 `"층1 — …"` 로 만들어 준다.
+fn fold_machine_reason(fold: &cys::mission_gate::RecordFold) -> Option<String> {
+    use cys::mission_gate::RecordFold as F;
+    match fold {
+        F::MachineOrigin(why) => Some(why.clone()),
+        F::Harness(why) => Some(format!("층0 harness — {why}")),
+        F::BootCommand(why) => Some(format!("층0-c 기동 명령문 — {why}")),
+        F::DeclarationResidual(_) | F::Prompt(_) | F::NoMission(_) | F::EmptyPrompt => None,
+    }
+}
+
+/// [`hook_record_mission`] 의 결과 — 판정과 **사람용 고지**를 함께 돌려준다.
+struct MissionRecord {
+    decision: cys::mission_gate::RecordDecision,
+    /// 은폐 금지 규약의 고지(판정 입력 아님) — 대장 판독 불가·쓰기 실패·폴드 사유.
+    notes: Vec<String>,
+}
+
+impl MissionRecord {
+    /// 판정 상세 줄에 이어 붙일 꼬리(없으면 빈 문자열). 상세는 **항상 한 줄**이라 이어 붙인다.
+    fn note_suffix(&self) -> String {
+        if self.notes.is_empty() {
+            return String::new();
+        }
+        format!(" · {}", self.notes.join(" · "))
+    }
+}
+
+/// ★(B2-c · 명세 §2-2 e) **임무 대장 record** — 판정 결과를 대장에 기록한다.
+///
+/// 명세의 한 문장("record 가 층0/1/2 폴드를 내포한다")이 이 함수의 전부다: 순서는 **판정 → 기록**
+/// 이며 기록은 판정 결과를 쓴다. 판정 규칙은 [`cys::mission_gate::record_fold_from_origin`] 이
+/// 소유하고(순수), 여기가 지는 것은 **파일 세 개의 I/O** 뿐이다 — 대장 판독·기동 표식 판독·
+/// 대장 쓰기.
+///
+/// ## 이 함수가 지키는 불변식 셋(전부 mission_gate 의 계획이 정하고 여기는 집행만 한다)
+///   ⓐ **기계 유래는 판정 필드를 쓰지 않는다** — 기계가 자기 착수 권한을 발급하는 것이
+///     2026-08-01 사고의 본체다. 흔적(`anomalies`)만 병합한다.
+///   ⓑ **진행 중 오너 임무를 지우지 않는다** — 워커 push 가 오너 임무를 취소하면 반대 방향
+///     사고다(`owner_safe_null_write`).
+///   ⓒ **판독 불가 대장은 덮지 않는다** — 덮으면 손상의 원인이 사라진다.
+///
+/// ## 쓰기 실패는 판정을 바꾸지 않는다
+/// 대장을 못 써도 이 프롬프트의 판정(기계/오너)은 이미 났다. 실패는 고지로만 남긴다 —
+/// 여기서 판정을 뒤집으면 디스크 사고가 게이트 판정을 흔든다.
+///
+/// ## python 과의 표기 차이(정직 고지)
+/// python `write_ledger` 는 `json.dumps(..., ensure_ascii=False)`(압축·개행 없음)로 쓰고 이쪽은
+/// [`cys::atomic_write_json`](indent 1칸 + 말미 개행 · A13)으로 쓴다. **스키마·값은 같고 표기만
+/// 다르다** — 소비자는 둘 다 `json.loads` 로 읽는다. 명세 §2-3 이 대장 writer 를 훅(Rust) 하나로
+/// 정한 뒤에는 표기가 한 벌로 수렴하며, 그때까지의 병존은 판독에 영향이 없다.
+fn hook_record_mission(
+    mission_p: &std::path::Path,
+    epoch_p: &std::path::Path,
+    prompt: &str,
+    origin: &cys::mission_gate::OriginVerdict,
+    ledger_status: cys::mission_gate::LedgerStatus,
+    read_anomalies: &[(String, String)],
+) -> MissionRecord {
+    use cys::mission_gate as mg;
+    let mut notes: Vec<String> = Vec::new();
+
+    // ── 대장 판독 — '부재'와 '판독 불가'를 **융합하지 않는다**(융합하면 손상이 정상으로 은폐돼
+    //    게이트가 열린다 · `hook_machine_origin_verdict` 의 원장 판독과 같은 규율).
+    let ledger = match std::fs::metadata(mission_p) {
+        Err(_) => mg::LedgerRead::Absent,
+        Ok(m) if m.is_dir() => {
+            mg::LedgerRead::Unreadable(format!("자리가 파일이 아니다: {}", mission_p.display()))
+        }
+        Ok(_) => match std::fs::read(mission_p) {
+            Ok(b) => mg::parse_ledger(Some(&b)),
+            Err(e) => mg::LedgerRead::Unreadable(format!("판독 실패({e})")),
+        },
+    };
+    if let mg::LedgerRead::Unreadable(why) = &ledger {
+        notes.push(format!("임무 대장 판독 불가(덮어쓰지 않는다): {why}"));
+    }
+
+    // ── 기동 표식(세션 결박) — 없으면 `None` 으로 강등한다(python `daemon_epoch` 와 같은 계약:
+    //    표식이 없으면 TTL 만 남는 degrade 이지 실패가 아니다).
+    let boot_epoch = std::fs::read(epoch_p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["daemon_epoch"].as_f64());
+
+    let decision = mg::record_fold_from_origin(prompt, origin, &ledger, read_anomalies);
+    if let Some(n) = &decision.notice {
+        notes.push(n.clone());
+    }
+
+    // surface 결박 — python `javis_mission._surface()`(= `javis_bootstrap.my_surface_id`)와 **같은
+    // 값**이어야 한다. 게이트가 `rec["surface"] != _surface()` 로 남의 임무를 거르기 때문이다.
+    // (`env_compat` 은 구 `AITERM_`·`JAVIS_` 접두까지 본다 — python 은 앞의 둘만 보므로 이쪽이
+    //  상위집합이다. 구 env 로만 선 pane 에서 결박이 빈 문자열로 무너지지 않는 방향이다.)
+    let surface = cys::env_compat(cys::ENV_SURFACE_ID).unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    if let Some(rec) = mg::apply_plan(
+        &decision.plan,
+        &ledger,
+        &surface,
+        now,
+        boot_epoch,
+        ledger_status,
+        &decision.anomalies,
+        Some(prompt.chars().count()),
+    ) {
+        if let Err(e) = cys::atomic_write_json(mission_p, &rec) {
+            notes.push(format!("대장 쓰기 실패({e}) — 판정 무영향"));
         }
     }
-    .or_else(|| {
-        cys::mission_gate::harness_origin(&inp.prompt).map(|w| format!("층0 harness — {w}"))
-    })
-    .or_else(|| {
-        cys::mission_gate::boot_command_origin(&inp.prompt)
-            .map(|w| format!("층0-c 기동 명령문 — {w}"))
-    });
-    let (verdict, code, detail) = hook_prompt_outcome(machine.as_deref(), role, seat_reason);
-    hook_verdict(verdict, code, &format!("{detail}{ack_note}"))
+    MissionRecord { decision, notes }
 }
 
 /// 층 판정 → (토큰, exit, 상세)의 **순수 매핑**(master 계약 확정 2026-09-04).
@@ -17224,6 +17418,212 @@ mod tests {
             read_hook_input(&td.join("nope.json")).is_err(),
             "없는 파일이 정상 판독됐다"
         );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// B2-c 대장 검체 공용 — 격리 디렉터리 + 기동 표식 1개(세션 결박 값이 실제로 실리는지 잰다).
+    ///
+    /// ★실 HOME 을 절대 건드리지 않는다: 경로를 **인자로** 넘기는 설계라 env 격리도 필요 없다
+    /// (IG-13 의 요구를 구조로 만족한다 — 잊을 자리가 없다).
+    fn mission_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let td = std::env::temp_dir().join(format!("cys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let epoch = td.join("delivery-base.epoch.json");
+        std::fs::write(&epoch, br#"{"v":1,"daemon_epoch":1725400000.5,"pid":1}"#).unwrap();
+        (td.clone(), td.join("mission.json"), epoch)
+    }
+
+    fn read_ledger_json(p: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(p).expect("대장이 없다")).expect("대장 JSON 파손")
+    }
+
+    fn human_origin() -> cys::mission_gate::OriginVerdict {
+        cys::mission_gate::OriginVerdict {
+            machine: false,
+            layer: None,
+            reason: String::new(),
+            anomalies: Vec::new(),
+        }
+    }
+
+    /// ★H-ORIGIN-MAP-1(B2-c · mutation 실측으로 신설): 층1·층2 판정이 **대장까지 살아서 간다.**
+    ///
+    /// 이 검체가 없을 때 변이 M3(`machine:` → `false` · "층1 판정을 통째로 버린다")가 **전
+    /// 검체를 통과했다**(실측). 그 변이의 귀결은 모든 기계 push 가 오너 임무가 되는 것 —
+    /// 2026-08-01 무한 작업 사고의 기제 그 자체다. 그래서 네 갈래를 전수로 잰다.
+    #[test]
+    fn layer12_verdict_survives_into_the_ledger_record_input() {
+        // ① 기계 확정 — 사유가 보존되고 machine 이 선다.
+        let m = origin_from_layer12(&Layer12::Machine("층1 — 전문 일치".into())).expect("machine");
+        assert!(m.machine, "층1 기계 판정이 대장 입력에서 사라졌다 — 기계 push 가 오너가 된다");
+        assert_eq!(m.reason, "층1 — 전문 일치");
+
+        // ② 판독 불가 = **fail-closed**(기계로 접는다). 방향이 뒤집히면 여기서 적색.
+        let u = origin_from_layer12(&Layer12::Unknown("원장 판독 불가".into())).expect("unknown");
+        assert!(u.machine, "판정 근거 부재가 오너로 접혔다 — fail-closed 방향이 뒤집혔다");
+        assert!(u.reason.contains("fail-closed"), "사유가 근거를 잃었다: {}", u.reason);
+
+        // ③ 사람 — 유일하게 machine 이 서지 않는 갈래다.
+        let h = origin_from_layer12(&Layer12::Human).expect("human");
+        assert!(!h.machine, "오너 프롬프트가 기계로 접혔다 — 부트가 죽는다");
+        assert!(h.reason.is_empty());
+
+        // ④ legacy = 판정자 부재 → **대장을 건드리지 않는다**(None 이면 호출부가 rc5 로 접는다).
+        assert!(
+            origin_from_layer12(&Layer12::Legacy("method_not_found".into())).is_none(),
+            "판정자가 없는데 대장 기록으로 넘어갔다"
+        );
+
+        // ⑤ 이상징후는 이 매핑이 나르지 않는다(관측자는 데몬 하나 · 이중 계상 방지).
+        assert!(m.anomalies.is_empty() && u.anomalies.is_empty());
+    }
+
+    /// ★H-MISSION-REC-1(B2-c · 명세 §2-2 e): **오너 선언이 대장에 기록된다.**
+    ///
+    /// 이 검체가 지키는 것: 훅(Rust)이 python `write_ledger` 와 **같은 자리에 같은 스키마**를
+    /// 쓴다는 사실이다. 게이트(python)는 이 레코드를 읽어 자율 착수 권한을 판정하므로, 필드가
+    /// 하나라도 비면 "임무가 있는데 없다"는 무음 결함이 된다 — 그래서 판정 입력 전부를 잰다.
+    #[test]
+    fn hook_record_writes_the_owner_declaration_into_the_mission_ledger() {
+        let (td, mission, epoch) = mission_fixture("rec1");
+        let out = hook_record_mission(
+            &mission,
+            &epoch,
+            "너는 마스터다. 릴리스 게이트를 통과시켜라",
+            &human_origin(),
+            cys::mission_gate::LedgerStatus::Ok,
+            &[],
+        );
+        // 오너 프롬프트다 — 기계 사유가 붙으면 훅이 rc6 로 접어 부트가 죽는다.
+        assert!(
+            fold_machine_reason(&out.decision.fold).is_none(),
+            "오너 선언이 기계로 접혔다: {:?}",
+            out.decision.fold
+        );
+        let rec = read_ledger_json(&mission);
+        assert_eq!(rec["schema"], 1);
+        assert_eq!(rec["source"], "declaration_residual", "선언 = 세션 재개장 어휘여야 한다");
+        assert_eq!(
+            rec["boot_epoch"], 1725400000.5,
+            "세션 결박이 기동 표식에서 오지 않았다 — 과거 임무가 무기한 유효해진다"
+        );
+        assert_eq!(rec["ledger_status"], "ok", "판정 근거가 기록되지 않았다(fail-closed 축)");
+        assert!(rec["ts_epoch"].as_f64().unwrap_or(0.0) > 0.0, "ts_epoch 가 판정 불가 값이다");
+        assert_eq!(
+            rec["prompt_chars"].as_u64(),
+            Some("너는 마스터다. 릴리스 게이트를 통과시켜라".chars().count() as u64),
+            "prompt_chars 는 python len(prompt)(코드포인트)와 같아야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-MISSION-REC-2(B2-c · 불변식 ⓐⓑ): **기계 push 는 판정 필드를 한 글자도 못 바꾼다.**
+    ///
+    /// 두 방향을 한 검체에서 잰다 — ⓐ 기계가 자기 임무를 발급하지 못하고(2026-08-01 사고의
+    /// 본체), ⓑ 진행 중 오너 임무를 취소하지도 못한다(반대 방향 사고). 그러면서 **흔적은
+    /// 남아야** 한다: 차단할 수 없는 조작이라도 다음 사고에서 읽혀야 하기 때문이다.
+    #[test]
+    fn hook_record_never_lets_a_machine_push_touch_the_verdict_fields() {
+        let (td, mission, epoch) = mission_fixture("rec2");
+        let prior = r#"{"schema":1,"mission":"릴리스를 발행하라","source":"prompt","reason":"오너 지시","surface":"7","ts":"2026-09-04T00:00:00+0900","ts_epoch":1725400000.0,"boot_epoch":1725400000.5,"ledger_status":"ok","anomalies":[]}"#;
+        std::fs::write(&mission, prior).unwrap();
+        let machine = cys::mission_gate::OriginVerdict {
+            machine: true,
+            layer: Some(1),
+            reason: "층1 — 전문 일치".to_string(),
+            anomalies: Vec::new(),
+        };
+        let out = hook_record_mission(
+            &mission,
+            &epoch,
+            "[wakeup] 다음 액션 착수",
+            &machine,
+            cys::mission_gate::LedgerStatus::Ok,
+            &[("delivery_out_of_window".to_string(), "창 밖 배달과 전문 일치".to_string())],
+        );
+        assert!(fold_machine_reason(&out.decision.fold).is_some(), "기계 push 가 오너로 접혔다");
+        let rec = read_ledger_json(&mission);
+        assert_eq!(rec["mission"], "릴리스를 발행하라", "기계 push 가 오너 임무를 갈아치웠다");
+        assert_eq!(rec["source"], "prompt", "판정 어휘가 바뀌었다");
+        assert_eq!(rec["ts_epoch"], 1725400000.0, "판정 시각이 갱신됐다 — TTL 이 늘어난다");
+        assert_eq!(
+            rec["anomalies"][0]["code"], "delivery_out_of_window",
+            "흔적이 영속되지 않았다 — 훅은 stderr 를 버리므로 여기 없으면 어디에도 없다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-MISSION-REC-3(B2-c · 불변식 ⓒ): **판독 불가 대장은 덮지 않는다.**
+    ///
+    /// 손상 파일을 덮으면 원인이 사라진다. 그래서 흔적 병합 경로(기계 유래)는 손상 대장을
+    /// 만나면 **아무것도 쓰지 않고** 고지만 남긴다 — 바이트 동일성으로 못박는다.
+    #[test]
+    fn hook_record_leaves_a_corrupt_ledger_untouched() {
+        let (td, mission, epoch) = mission_fixture("rec3");
+        let broken = b"{oops-this-is-not-json";
+        std::fs::write(&mission, broken).unwrap();
+        let machine = cys::mission_gate::OriginVerdict {
+            machine: true,
+            layer: Some(2),
+            reason: "층2 — push 라벨".to_string(),
+            anomalies: Vec::new(),
+        };
+        let out = hook_record_mission(
+            &mission,
+            &epoch,
+            "[worker-b 완료] 커밋 sha 보고",
+            &machine,
+            cys::mission_gate::LedgerStatus::Ok,
+            &[("ledger_bad_lines".to_string(), "해석 불가 줄".to_string())],
+        );
+        assert_eq!(
+            std::fs::read(&mission).unwrap(),
+            broken,
+            "손상 대장이 덮였다 — 원인이 사라진다"
+        );
+        assert!(
+            out.note_suffix().contains("판독 불가"),
+            "판독 불가를 조용히 삼켰다(은폐 금지): {:?}",
+            out.notes
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-MISSION-REC-4(B2-c · 층0 경로): harness 알림은 **mission=null 을 명시로 박는다.**
+    ///
+    /// 층1·층2 가 구조적으로 못 보는 경로(원장 미경유·무라벨)라 여기서 접지 않으면 도구 알림이
+    /// 오너 임무가 된다(2026-08-22 부서 대장 오염 실사고). '기록하지 않음'이 아니라 **null 을
+    /// 기록**하는 것이 요점이다 — 실사고의 증거가 대장 그 자체였으므로 같은 자리에 판정 근거가
+    /// 남아야 다음 사고에서 1초 만에 읽힌다.
+    #[test]
+    fn hook_record_pins_a_null_mission_for_harness_notifications() {
+        let (td, mission, epoch) = mission_fixture("rec4");
+        let harness = "<system-reminder>\n이것은 도구 내부 알림이다\n</system-reminder>";
+        let out = hook_record_mission(
+            &mission,
+            &epoch,
+            harness,
+            &human_origin(),
+            cys::mission_gate::LedgerStatus::Absent,
+            &[],
+        );
+        let why = fold_machine_reason(&out.decision.fold);
+        match &out.decision.fold {
+            cys::mission_gate::RecordFold::Harness(_) => {
+                assert!(
+                    why.as_deref().unwrap_or_default().starts_with("층0 harness — "),
+                    "층 접두가 사라졌다: {why:?}"
+                );
+                let rec = read_ledger_json(&mission);
+                assert!(rec["mission"].is_null(), "harness 알림이 임무로 박혔다: {rec}");
+                assert_eq!(rec["source"], "harness_notification");
+                assert_eq!(rec["ledger_status"], "absent", "판정 근거가 원문 어휘로 안 남았다");
+            }
+            // 층0 코퍼스가 이 문안을 harness 로 접지 않는다면 판정 규칙이 바뀐 것이다 —
+            // 조용히 통과시키지 않는다(검체가 무엇을 재는지 잃지 않게).
+            other => panic!("층0 harness 로 접히지 않았다: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&td);
     }
 
