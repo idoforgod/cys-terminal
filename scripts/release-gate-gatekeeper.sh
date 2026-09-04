@@ -79,6 +79,7 @@
 #   옵션: --keep(작업 폴더 보존) · --quarantine-value <문자열>(기본 = 실측 Safari 형식)
 #         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤⑥ 강등 평가 · 발행 경로 사용 금지)
 #         --seal2-only(진단 전용 — 대상 .app 에 ⑤ 전칭 검사만 단독 실행 · 적대 픽스처 테스트의 호출 지점)
+#         --runtime-manifest-only(진단 전용 — 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행)
 #
 # 종료 코드
 #   0 = 전 검사 PASS (기본 모드에선 full 에서만 도달 가능 · --diagnose-degraded-ok 의 0 은 진단용이다)
@@ -113,6 +114,7 @@ usage() {
   --diagnose-degraded-ok    진단 전용: degraded(spctl assessments disabled) 폐쇄를 열어
                             ①②③⑤⑥ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
   --seal2-only              진단 전용: 대상 .app 에 ⑤ SEAL-2 전칭 검사만 단독 실행
+  --runtime-manifest-only   진단 전용: 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행
   -h, --help                이 도움말
 종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(degraded 폐쇄 포함)
 USAGE
@@ -124,6 +126,7 @@ while [ $# -gt 0 ]; do
     --quarantine-value) QVAL="${2:-}"; shift 2 ;;
     --diagnose-degraded-ok) DIAG_DEGRADED=1; shift ;;
     --seal2-only) SEAL2_ONLY=1; shift ;;
+    --runtime-manifest-only) RTMAN_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; usage >&2; exit 2 ;;
     *) TARGET="$1"; shift ;;
@@ -134,7 +137,7 @@ done
 
 # ── 도구 fail-closed (없으면 판정 불가 = exit 2 · 통과 아님) ──
 # --seal2-only(진단)는 ⑤ 만 돌므로 러너 python3 해소만 요구한다 — macOS 밖(픽스처 테스트)에서도 돈다.
-if [ "$SEAL2_ONLY" != "1" ]; then
+if [ "$SEAL2_ONLY" != "1" ] && [ "${RTMAN_ONLY:-0}" != "1" ]; then
   for t in hdiutil spctl codesign xattr ditto find uuidgen; do
     command -v "$t" >/dev/null 2>&1 || { echo "✗ 필수 도구 없음: $t (macOS + Xcode CLT 필요)" >&2; exit 2; }
   done
@@ -160,6 +163,8 @@ done
 # 전부). 부재는 skip 이 아니라 판정 불가다(⑥ 이 못 돌면 첫-부팅 계급이 무검증 — 함수 안에서 폐쇄).
 GATE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PREFLIGHT_PY="$GATE_SCRIPT_DIR/../cysjavis-pack/bin/javis_preflight.py"
+# ── ⑧용 런타임 봉인 판독기(리포 상대) — 같은 이유로 부재는 skip 이 아니라 판정 불가다. ──
+SEAL_PY_TOOL="$GATE_SCRIPT_DIR/../cysjavis-pack/bin/javis_runtime_seal.py"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cys-gk-gate.XXXXXX")" || exit 2
 # macOS 는 /var·/tmp 가 심볼릭링크라 mount·codesign 이 실경로(/private/…)로 되돌려 출력한다.
@@ -302,6 +307,7 @@ PYSEAL
   return 0
 }
 SEAL2_TARGETS=0   # python 런타임을 실제로 검사한 앱 수 — 0이면 판정 불가(측정 불능≠통과)
+RTMAN_TARGETS=0
 
 # ── 봉인 위반 파일 이름 지목(②·⑥ 재검증 실패 시) — codesign 출력에서 file/resource added·
 #    modified·missing 라인만 뽑아 기계 라인(SEAL_CULPRIT:)으로 승격한다. verbatim 덤프는 사람용,
@@ -320,6 +326,47 @@ print_seal_culprits() {
 # codesign --verify --deep --strict 재통과를 단언한다. ★읽기 전용 DMG 마운트(APP_SRC)가 아니라
 # 사본이어야 한다 — 읽기 전용 지반에선 결함 코드도 쓰기에 실패해 검사가 공허해진다.
 # 반환: 0=수행(위반은 ok/bad 집계) · 2=판정 불가 · 3=대상 아님(Contents/MacOS/cys 부재 — 설치 도우미 등)
+# ── ⑧ runtime-manifest 축 (부트 v2 §2-10 G5 · W-C C1 신설 2026-09-04) ─────────────────
+# ★왜 ②(codesign)와 별개인가: ② 는 **이 산출물이 mac 에서 봉인돼 있는가**를 본다. ⑧ 은
+#   **배송될 매니페스트가 실제 트리와 맞는가**를 본다 — 그 매니페스트는 Windows 설치본에서
+#   코드서명이 없는 자리를 대신할 유일한 변조 탐지 수단이므로, 틀린 채로 나가면 그 레인의
+#   봉인이 통째로 거짓이 된다. mac DMG 에서 미리 잡는 이유가 그것이다(같은 생성기·같은 스키마).
+# ★등급: 여기서는 FAIL 이다(master 판정 2026-09-04 D1 · 레인 분리). 기계 preflight(C80)는
+#   부팅을 막지 않으려 WARN 이지만, **발행은 막는다** — 산출물은 고칠 수 있고 사용자 기계는
+#   그렇지 않다.
+# ★번들 안 exec 0: 판독기는 러너 python($GATE_PY)으로 돌리고 트리는 읽기만 한다(⑤ 와 동형).
+# 반환: 0=검사 수행(위반은 bad 로 집계) · 2=판정 불가 · 3=대상 아님(런타임 미동봉 앱)
+runtime_manifest_check() {
+  local app="$1" name man rt out rc n
+  name="$(basename "$app")"
+  rt="$app/Contents/Resources/runtime"
+  man="$app/Contents/Resources/runtime-manifest.json"
+  [ -d "$rt" ] || return 3
+  if [ ! -f "$SEAL_PY_TOOL" ]; then
+    echo "✗ ⑧ runtime-manifest($name): 판독기 부재($SEAL_PY_TOOL) — 리포 체크아웃에서 실행하라(측정 불능은 통과가 아니다)" >&2
+    return 2
+  fi
+  if [ ! -f "$man" ]; then
+    bad "⑧ runtime-manifest($name)" "매니페스트 부재 — runtime/ 을 동봉하는 산출물은 반드시 함께 실어야 한다(설치 후 변조 탐지의 유일 수단 · Windows 레인엔 코드서명 대체물이 없다)"
+    return 0
+  fi
+  out="$("$GATE_PY" "$SEAL_PY_TOOL" verify --root "$rt" --manifest "$man" --max-list 20 2>&1)"; rc=$?
+  case "$rc" in
+    0)
+      n="$(printf '%s' "$out" | sed -n 's/.*항목 \([0-9]*\)개 일치.*/\1/p' | head -1)"
+      ok "⑧ runtime-manifest($name)" "봉인 무결 — 항목 ${n:-?}개 일치"
+      return 0 ;;
+    1)
+      bad "⑧ runtime-manifest($name)" "매니페스트와 실제 runtime 트리가 불일치 — 배송 전 산출물이 이미 어긋났다"
+      printf '%s\n' "$out" | sed 's/^/     | /'
+      return 0 ;;
+    *)
+      echo "✗ ⑧ runtime-manifest($name): 판독 실패(rc=$rc) — 판정 불가" >&2
+      printf '%s\n' "$out" | sed 's/^/     | /' >&2
+      return 2 ;;
+  esac
+}
+
 firstboot_sim_check() {
   local app="$1" name pre post sim_out sim_rc simhome added removed reverify_out reverify_rc viol
   name="$(basename "$app")"
@@ -435,6 +482,24 @@ if [ "$SEAL2_ONLY" = "1" ]; then
   case "$SEAL2_RC" in
     0) ;;
     3) echo "✗ --seal2-only: 동봉 python 런타임 없음(Contents/Resources/runtime/python/lib)" >&2; exit 2 ;;
+    *) exit 2 ;;
+  esac
+  [ "$FAIL_N" -gt 0 ] && exit 1
+  exit 0
+fi
+
+# ── 진단 전용: --runtime-manifest-only — ⑧ 만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
+#   --seal2-only 와 같은 계약: 적대 픽스처 박제의 호출 지점이고, 발행 경로가 이 플래그를 싣지
+#   않음은 test_release_postprocess_gate.py 의 핀이 지킨다. macOS 도구를 요구하지 않으므로
+#   합성 픽스처만으로 축의 양·음성을 전부 잰다.
+if [ "${RTMAN_ONLY:-0}" = "1" ]; then
+  TARGET="${TARGET%/}"
+  [ -d "$TARGET" ] || { echo "✗ --runtime-manifest-only 대상 없음(.app 디렉터리 필요): $TARGET" >&2; exit 2; }
+  echo "[진단 전용] --runtime-manifest-only: $TARGET — ⑧ 만 돈다(발행 판정 아님)"
+  runtime_manifest_check "$TARGET"; RTMAN_RC=$?
+  case "$RTMAN_RC" in
+    0) ;;
+    3) echo "✗ --runtime-manifest-only: 동봉 런타임 없음(Contents/Resources/runtime)" >&2; exit 2 ;;
     *) exit 2 ;;
   esac
   [ "$FAIL_N" -gt 0 ] && exit 1
@@ -650,6 +715,14 @@ for APP_SRC in "${APPS[@]}"; do
     *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
   esac
 
+  # ── ⑧ runtime-manifest 대조 — 원본 트리(마운트된 DMG 안 / 직접 지정 .app) 판독 전용 ──
+  runtime_manifest_check "$APP_SRC"; RTMAN_RC=$?
+  case "$RTMAN_RC" in
+    0) RTMAN_TARGETS=$((RTMAN_TARGETS+1)) ;;
+    3) info "⑧ runtime-manifest($APP_NAME): 동봉 런타임 없음 — 대상 아님(설치 도우미 등)" ;;
+    *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
+  esac
+
   # ── 실패 시 진단: 서명 요약 ──
   if [ "$CS_RC" -ne 0 ] || { [ "$MODE" = "full" ] && [ "${SPCTL_RC:-1}" -ne 0 ]; } || [ "$ST_RC" -ne 0 ]; then
     echo "     ── codesign -dv --verbose=4 요약 ──"
@@ -670,6 +743,13 @@ fi
 #  MacOS/cys 없는 픽스처 앱은 ②③ FAIL 로 exit 1 에 도달하고, 진짜 산출물의 진짜 PASS 만 ⑥ 을 요구).
 if [ "$SIM_TARGETS" -eq 0 ] && [ "$FAIL_N" -eq 0 ]; then
   echo "✗ ⑥ 첫-부팅 모사: 평가한 앱 어디에도 Contents/MacOS/cys 가 없다 — 기록자 모사 0회로는 PASS 를 선언할 수 없다(레이아웃이 정말 바뀌었다면 게이트를 의도적으로 갱신하라)" >&2
+  echo; echo "=== 판정 불가 ==="; exit 2
+fi
+
+# ⑧ 도 같다 — 런타임을 동봉하는 산출물에서 한 번도 대조하지 못했는데 FAIL 이 0 이면
+# "매니페스트 검증 0회의 PASS" 다. ⑤·⑥ 과 같은 폐쇄를 건다.
+if [ "$RTMAN_TARGETS" -eq 0 ] && [ "$FAIL_N" -eq 0 ]; then
+  echo "✗ ⑧ runtime-manifest: 평가한 앱 어디에도 Contents/Resources/runtime 이 없다 — 대조 0회로는 PASS 를 선언할 수 없다" >&2
   echo; echo "=== 판정 불가 ==="; exit 2
 fi
 

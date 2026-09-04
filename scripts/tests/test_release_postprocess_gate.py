@@ -477,5 +477,104 @@ class DmgAxisTests(unittest.TestCase):
                              "release.yml 이 진단 전용 플래그를 실었다: %s" % flag)
 
 
+class RuntimeManifestAxisTests(unittest.TestCase):
+    """⑧ runtime-manifest 축 — 합성 .app 으로 양·음성을 전부 잰다(부트 v2 §2-10 G5 · W-C C1).
+
+    이 축이 존재하는 이유: ②(codesign)는 **이 산출물이 mac 에서 봉인돼 있는가**를 보고,
+    ⑧ 은 **배송될 매니페스트가 실제 트리와 맞는가**를 본다. 그 매니페스트는 Windows 설치본에서
+    코드서명이 없는 자리를 대신할 유일한 변조 탐지 수단이라, 틀린 채로 나가면 그 레인의 봉인이
+    통째로 거짓이 된다. 등급은 FAIL 이다(발행 차단 — master 판정 2026-09-04 D1 레인 분리).
+
+    호출은 --runtime-manifest-only(⑧ 단독 · hdiutil/spctl/codesign 불요)라 macOS 도구 없이 돈다.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.app = os.path.join(self._tmp.name, "Fake.app")
+        self.res = os.path.join(self.app, "Contents", "Resources")
+        self.rt = os.path.join(self.res, "runtime")
+        os.makedirs(os.path.join(self.rt, "python", "bin"))
+        with open(os.path.join(self.rt, "python", "bin", "python3"), "w") as fh:
+            fh.write("ELF-ish\n")
+        os.makedirs(os.path.join(self.rt, "node", "bin"))
+        os.makedirs(os.path.join(self.rt, "node", "lib", "node_modules", "npm", "bin"))
+        with open(os.path.join(self.rt, "node", "lib", "node_modules", "npm", "bin",
+                               "npm-cli.js"), "w") as fh:
+            fh.write("#!/usr/bin/env node\n")
+        os.symlink("../lib/node_modules/npm/bin/npm-cli.js",
+                   os.path.join(self.rt, "node", "bin", "npm"))
+        self.man = os.path.join(self.res, "runtime-manifest.json")
+        self._emit()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _emit(self):
+        seal = os.path.join(_HERE, "..", "..", "cysjavis-pack", "bin", "javis_runtime_seal.py")
+        p = subprocess.run([sys.executable, seal, "emit", "--root", self.rt,
+                            "--out", self.man, "--app-version", V, "--source", "test"],
+                           capture_output=True, text=True)
+        self.assertEqual(0, p.returncode, "픽스처 매니페스트 산출 실패: %s" % (p.stdout + p.stderr))
+
+    def _run(self):
+        p = subprocess.run(["bash", _GATE_SH, "--runtime-manifest-only", self.app],
+                           capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_20_baseline_matching_manifest_passes(self):
+        """기준선 rc=0 — 이게 깨지면 아래 FAIL 단언들은 '무조건 빨간 검사'를 오독한 것이다."""
+        rc, out = self._run()
+        self.assertEqual(0, rc, out)
+        self.assertIn("PASS ⑧", out)
+
+    def test_21_added_file_blocks_release(self):
+        """설치 후 오염 계급(npm i -g 가 번들 안으로) — 2026-09-04 오너 머신 실사고와 같은 형상."""
+        d = os.path.join(self.rt, "node", "lib", "node_modules", "@openai", "codex")
+        os.makedirs(d)
+        with open(os.path.join(d, "package.json"), "w") as fh:
+            fh.write("{}\n")
+        rc, out = self._run()
+        self.assertEqual(1, rc, out)
+        self.assertIn("FAIL ⑧", out)
+        self.assertIn("@openai", out, "원인 파일을 지목해야 안내다")
+
+    def test_22_symlink_replaced_by_copy_blocks_release(self):
+        """★`find -type f` 기반 매니페스트가 구조적으로 눈머는 자리 — 링크가 실복사본이 되면
+        번들 npm 호출 전체가 MODULE_NOT_FOUND 로 깨진다(restore-runtime-symlinks.sh:11-13)."""
+        link = os.path.join(self.rt, "node", "bin", "npm")
+        target = os.path.join(self.rt, "node", "lib", "node_modules", "npm", "bin", "npm-cli.js")
+        os.remove(link)
+        with open(target) as src, open(link, "w") as dst:
+            dst.write(src.read())
+        rc, out = self._run()
+        self.assertEqual(1, rc, out)
+        self.assertIn("node/bin/npm", out)
+
+    def test_23_missing_manifest_blocks_release(self):
+        """산출물이 runtime/ 을 실으면서 매니페스트를 빠뜨리면 발행 금지 — Windows 레인의
+        변조 탐지가 통째로 사라지기 때문이다(그 레인엔 코드서명 대체물이 없다)."""
+        os.remove(self.man)
+        rc, out = self._run()
+        self.assertEqual(1, rc, out)
+        self.assertIn("매니페스트 부재", out)
+
+    def test_24_no_runtime_tree_is_undecidable_not_pass(self):
+        """런타임 미동봉 앱은 '통과'가 아니라 '대상 아님/판정 불가'(exit 2)다 — 측정 불능을
+        초록으로 접지 않는다(이 게이트 전체의 규율)."""
+        import shutil as _sh
+        _sh.rmtree(self.rt)
+        rc, out = self._run()
+        self.assertEqual(2, rc, out)
+        self.assertNotIn("PASS ⑧", out)
+
+    def test_25_release_paths_carry_no_diagnostic_flag(self):
+        """--runtime-manifest-only 는 진단 전용이다. 발행 경로가 이걸 실으면 ⑧ 만 돌고
+        ①~⑦ 이 통째로 건너뛰어진다 — --seal2-only 와 같은 계급의 핀."""
+        for path in (_RP_PATH, _RELEASE_YML):
+            with open(path, encoding="utf-8") as fh:
+                self.assertNotIn("--runtime-manifest-only", fh.read(),
+                                 "발행 경로가 진단 전용 플래그를 실었다: %s" % path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
