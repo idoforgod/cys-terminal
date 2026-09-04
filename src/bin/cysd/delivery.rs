@@ -334,151 +334,29 @@ fn default_state_root() -> PathBuf {
     tests::unisolated_sandbox_root()
 }
 
-/// `javis_bootstrap._socket_is_base` 미러. 소켓 미설정('')=base.
-fn socket_is_base(sock: &str) -> bool {
-    let sock = sock.trim();
-    if sock.is_empty() {
-        return true;
-    }
-    let norm = sock.replace('\\', "/");
-    if sock.starts_with("\\\\") || norm.to_ascii_lowercase().starts_with("//./pipe/") {
-        // Windows named pipe — 성분 분해 부적합. 기존 basename 동작 보존.
-        let last = norm.rsplit('/').next().unwrap_or("");
-        return last == "cys" || last == "cys.sock";
-    }
-    for part in norm.split('/') {
-        if part.starts_with("cys-dept-") {
-            return false;
-        }
-    }
-    // ★P0 수리(2026-09-04 실사고): 종전엔 **basename 만** 봤다 — 디렉터리를 무시했으므로
-    //   `~/.cys/state-harness/cys.sock` · `/var/folders/…/l1-new-*/cys.sock` 처럼 **관례적
-    //   파일명을 유지한 격리 소켓이 전부 base 로 접혔고**, 그 데몬들이 본 레인
-    //   `delivery-base.jsonl`·`.epoch.json` 에 썼다(실측: 외부 좌석 레코드 70건 · epoch 덮어씀).
-    //   귀결은 본부 임무 게이트 오탐 폐쇄 + 전 노드 층1 원장 오염이다.
-    //
-    //   역설이 이 결함의 핵심이었다: `/tmp/whatever.sock` 처럼 **파일명이 다르면** 올바로
-    //   격리됐다. 즉 **가장 흔한 격리 방식**(관례 파일명 유지 + 디렉터리 분리)만 조용히 실패했다.
-    //
-    //   수리: 기본 소켓은 **`…/state/cys/cys.sock`** 이므로 **부모 디렉터리 이름까지** 본다.
-    //   `cys` 디렉터리 안의 `cys.sock` 만 base 이고 나머지는 전부 자기 레인이다(fail-closed).
-    //
-    //   ★기계 독립 판정을 유지한다: 이 기계의 실제 홈 경로와 비교하지 않고 **경로 모양**만 본다.
-    //   그래야 python 과 공유하는 소켓→lane_key 매트릭스 fixture 가 기계마다 같은 답을 낸다.
-    //   하위호환: 진짜 기본 소켓은 여전히 base(기존 `delivery-base.jsonl` 유효) ·
-    //   `cys-dept-`·`/tmp/whatever.sock` 은 종전대로 비-base. **바뀌는 것은 누출 경로 하나뿐이다.**
-    //
-    //   ★**알려진 한계**(숨기지 않는다 · master 조건 ① 2026-09-04): 부모 **이름**만 보므로
-    //   `<임의>/cys/cys.sock`(기본 트리를 다른 곳에 그대로 미러한 경로 · 예 `/tmp/cys/cys.sock`)
-    //   은 **여전히 base 로 접힌다**. 절대경로를 플랫폼 기본 경로와 통째로 비교하면 막을 수
-    //   있으나 그러면 판정이 **기계(홈 경로)에 의존**해 공유 fixture 가 기계마다 다른 답을 내고
-    //   2언어 파리티가 깨진다 — 기계 독립을 택하고 한계를 명시한다.
-    //   그런 형태로 격리할 때는 **`CYS_STATE_DIR` 를 함께 지정**해야 안전하다(상태 파일이 그
-    //   디렉터리 안에만 생긴다 — W-A 실기동 실측). 이 한계는 fixture 에 `known_limitation` 으로
-    //   고정돼 있고, 가시화(경고 이벤트)는 master 조건 ② 의 별건이다.
-    let mut it = norm.rsplit('/');
-    let last = it.next().unwrap_or("");
-    if last != "cys" && last != "cys.sock" {
-        return false;
-    }
-    // 부모 디렉터리가 정확히 `cys` 여야 한다(기본 소켓 `…/state/cys/cys.sock` 의 모양).
-    it.next() == Some("cys")
-}
-
-/// SHA-1 hex — **비암호학적 용도 전용**(파일명 슬러그가 `javis_bootstrap._sanitize_sock_key`
-/// (`hashlib.sha1(...).hexdigest()[:16]`)와 **정확히** 같아야 하기 때문에 존재한다).
-/// 새 크레이트를 들이지 않는다(오프라인 빌드 계약 · sha1 은 Cargo.lock 에 전이로도 없다).
-/// 서명·인증에 쓰지 말 것 — 그쪽은 `sha2`/`minisign-verify` 가 소유한다.
-/// 정확성은 표준 시험벡터(`sha1("abc")`)로 박제한다.
-fn sha1_hex(data: &[u8]) -> String {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, c) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let tmp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = tmp;
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-    }
-    h.iter().map(|v| format!("{v:08x}")).collect()
-}
-
-/// `javis_bootstrap._sanitize_sock_key` 미러(경로 구분자·':' → '_' · 과길면 앞 120자+sha1 16자).
-fn sanitize_sock_key(sock: &str) -> String {
-    let mut raw = sock.trim().to_string();
-    if raw.is_empty() {
-        raw = "base".to_string();
-    }
-    // python 은 os.sep, '/', '\\', ':' 를 치환한다. unix os.sep='/', windows os.sep='\\' 이므로
-    // 셋의 합집합은 어느 OS 에서도 {'/','\\',':'} 로 동일하다.
-    raw = raw
-        .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
-        .collect();
-    let raw = raw.trim_matches('_').to_string();
-    let mut raw = if raw.is_empty() { "base".to_string() } else { raw };
-    if raw.chars().count() > 160 {
-        let head: String = raw.chars().take(120).collect();
-        let h = sha1_hex(raw.as_bytes());
-        raw = format!("{head}-{}", &h[..16]);
-    }
-    raw
-}
-
-/// 이 데몬이 속한 레인 키 — `javis_bootstrap.lane_key` 미러.
-/// pane 은 `CYS_SOCKET`(= 이 데몬의 socket_path, state.rs 가 주입)을 보므로 양쪽 값이 일치한다.
-pub fn lane_key(socket_path: &Path) -> String {
-    let s = socket_path.to_string_lossy();
-    if socket_is_base(&s) {
-        "base".to_string()
-    } else {
-        sanitize_sock_key(&s)
-    }
-}
-
+/// 레인 판정 원시(`socket_is_base`·`sanitize_sock_key`·`lane_key`)의 **소유자는 lib
+/// [`cys::lane`] 하나다**(2026-09-04 B2-c e-1로 이관 · 규칙·값 무변경).
+///
+/// 왜 옮겼는가: 훅 CLI(`cys hook user-prompt-submit`)가 **임무 대장** 경로를 같은 레인 규약으로
+/// 만들어야 하는데(명세 §2-2 e), 판정이 이 데몬 바이너리 안에만 있으면 CLI 는 **복사**할 수밖에
+/// 없다. 복사본은 갈리고, 갈리는 순간 대장과 원장이 서로 다른 레인을 가리켜 층1 이 **조용히**
+/// 무력화된다 — 2026-09-04 P0(레인 격리 누출)의 반대 방향 사고다.
+///
+/// 여기 남는 것은 **경로 두 개**뿐이다(호출부 무개정). `lane_key` 는 이름조차 남기지 않았다 —
+/// 얇은 재수출도 '두 번째 이름'이라 언젠가 한쪽만 고쳐진다. 상태 루트만 데몬 것을 쓴다 —
+/// `pack_state_dir()` 은 테스트 빌드에서 실 HOME 대신 샌드박스로 접히고(R5-B), 그 방어선을
+/// lib 으로 끌고 가지 않는 것이 이 분리의 요점이다.
 /// 배달 원장 경로 — **항상 레인 접미**(base 레인도 `delivery-base.jsonl`).
 /// skip·lock 과 같은 규약이다: 역사적 무접미 경로가 없으므로 base 예외를 만들 이유가 없고,
 /// 접미가 항상 있으면 "이 파일이 어느 레인 것인가"가 파일명만으로 결정론이다.
+/// 이름 규칙은 [`cys::lane::ledger_path_in`] 이 소유하고, 여기서는 **루트만** 데몬 것을 준다.
 pub fn ledger_path(socket_path: &Path) -> PathBuf {
-    pack_state_dir().join(format!("delivery-{}.jsonl", lane_key(socket_path)))
+    cys::lane::ledger_path_in(&pack_state_dir(), socket_path)
 }
 
 /// 데몬 인스턴스 표식 경로 — 임무의 **세션 결박**(過去 임무 무기한 유효 차단)에 쓴다.
 pub fn epoch_path(socket_path: &Path) -> PathBuf {
-    pack_state_dir().join(format!("delivery-{}.epoch.json", lane_key(socket_path)))
+    cys::lane::epoch_path_in(&pack_state_dir(), socket_path)
 }
 
 fn iso_utc(epoch: f64) -> String {
@@ -875,6 +753,9 @@ pub fn record_audited_with(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// 레인 판정 원시는 lib [`cys::lane`] 이 소유한다(B2-c e-1 이관) — 아래 검체 3종은
+    /// **데몬이 실제로 부르는 그 함수**를 그대로 부른다(목·사본 금지 · 판정 규칙 무변경).
+    use cys::lane::{lane_key, socket_is_base};
 
     // ══════════════════════════════════════════════════════════════════════════
     // ★R5-B 테스트 상태 격리 — "라이브 원장을 테스트가 더럽히지 않는다"
@@ -1304,37 +1185,6 @@ pub(crate) mod tests {
             digest("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn sha1_matches_standard_vectors() {
-        // FIPS 180-1 부록 시험벡터 — python hashlib.sha1 과의 동치를 박제한다.
-        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(
-            sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
-        );
-        // 64바이트 경계(패딩이 블록을 하나 더 만드는 지점)
-        assert_eq!(
-            sha1_hex(&[b'a'; 64]),
-            "0098ba824b5c16427bd7a1122a5a442a25ec644d"
-        );
-    }
-
-    #[test]
-    fn long_socket_path_key_uses_sha1_tail_like_pack() {
-        // python: raw[:120] + "-" + sha1(raw)[:16]  (raw = 새니타이즈 결과 · 앞뒤 '_' strip 뒤)
-        // 비-base 여야 이 분기에 온다 → cys-dept- 성분을 넣는다.
-        let long = format!("/{}/cys-dept-x/cys.sock", "d".repeat(200));
-        let k = lane_key(Path::new(&long));
-        assert_eq!(k.chars().count(), 120 + 1 + 16);
-        let raw = format!("{}_cys-dept-x_cys.sock", "d".repeat(200));
-        assert!(k.ends_with(&sha1_hex(raw.as_bytes())[..16]), "sha1 꼬리 불일치: {k}");
-        assert!(k.starts_with(&"d".repeat(120)));
-        // ★교차언어 앵커: 아래 리터럴은 `javis_bootstrap.lane_key(동일 입력)` 실측값이다.
-        //   양쪽이 갈리면 원장이 **조용히** 무력화되므로 값 자체를 박제한다.
-        assert_eq!(k, format!("{}-24618710175be9a6", "d".repeat(120)));
     }
 
     #[test]

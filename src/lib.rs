@@ -21,6 +21,9 @@ pub mod first_run_gates;
 /// ready 를 잘못 선언했을 때 실제로 좌석을 죽이는 것은 **제출 Return** 이므로, 판정(U-13)과 별개로
 /// 전송 직전에 한 번 더 화면을 본다. 생애 창은 첫 각성 ack 이전으로 상한이 걸려 있다.
 pub mod inject_guard;
+/// 레인 판정·경로 규약의 **단일 소유자**(2026-09-04 B2-c e-1) — 데몬(원장·표식)·훅 CLI(임무 대장)·
+/// python(`javis_lane`) 셋이 같은 규칙을 써야 하고, 사본이 갈리면 층1 판정이 조용히 무력화된다.
+pub mod lane;
 pub mod license;
 pub mod merge3;
 pub mod pack;
