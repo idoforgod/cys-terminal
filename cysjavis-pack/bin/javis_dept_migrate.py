@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 
 HOME = os.path.expanduser("~")
 CYS_DIR = os.path.join(HOME, ".cys")
@@ -143,10 +144,26 @@ def _register_hook(settings_path, cmd, do_fix):
     if not have:
         kept.append({"hooks": [{"type": "command", "command": cmd}]})
     arr[:] = kept
-    tmp = settings_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False, indent=2))
-    os.replace(tmp, settings_path)
+    # ★고정 `.tmp` 금지(2026-09-04 실측 재현). 종전 이 자리는 `settings_path + ".tmp"` 라
+    #   **모든 프로세스가 같은 스테이징 파일**을 열었다. `os.replace` 는 원자적이지만 그것은
+    #   **발행**만 원자적이라는 뜻이고, 스테이징을 공유하면 그 보장이 통째로 사라진다:
+    #     P1 이 큰 본문을 tmp 에 쓰는 도중 P2 가 **같은 tmp 를 truncate** 하고 짧게 써서 replace
+    #     하면, P1 의 fd 는 이미 발행된 파일을 계속 가리켜 자기 오프셋에 이어 쓴다 →
+    #     최종 settings.json = "완결 JSON + NUL 패딩 + 잔여 꼬리" = **JSONDecodeError: Extra data**.
+    #   실측 재현(6 writer 자연 부하로는 창이 좁아 안 나고, 큰 본문·청크 쓰기로 창을 넓히면 난다):
+    #     `{"theme":"dark","who":"SMALL"}` + NUL + `AAA…"}`  → Extra data: line 1 column 34.
+    #   이것이 H-CONC-3 이 preflight 에서 걷어낸 A8 지배 실패 모드(교차 파손)와 **같은 형상**이며,
+    #   그 검체의 구조 핀은 preflight 만 훑어 이 파일의 잔존 인스턴스를 못 봤다.
+    d = os.path.dirname(os.path.abspath(settings_path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-deptmig-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, settings_path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
     return "fixed", "UserPromptSubmit←role-bootstrap.sh 등록(백업 .bak-migrate)"
 
 

@@ -2693,7 +2693,19 @@ def h_conc_3():
         body = code[i:code.find("\n    def ", i + 10)]
         need("_settings_rmw(" in body, "%s 가 단일 RMW 소유자를 경유하지 않는다" % fn)
     need("javis_lock" in code and "FileLock(" in code, "preflight 가 공용 락을 소비하지 않는다")
-    notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0")
+    # ★같은 금지를 **다른 writer 들까지** 넓힌다(2026-09-04 실측). 종전 이 핀은 javis_preflight.py
+    #   **하나만** 훑었다. 그런데 이 검체의 docstring 이 5 writer 중 하나로 직접 지목한
+    #   `javis_dept_migrate.py _register_hook(락 X · 고정 .tmp)` 에 그 패턴이 **그대로 살아 있었다** —
+    #   금지 문장은 있는데 대상 밖이라 무관측이었다(핀의 사각).
+    #   기제는 실측 재현됐다: 큰 본문을 쓰는 P1 과 같은 tmp 를 truncate 하는 P2 가 겹치면 최종
+    #   settings.json 이 "완결 JSON + NUL + 잔여 꼬리" 가 되어 `JSONDecodeError: Extra data` 를 낸다.
+    for _mod in ("javis_dept_migrate.py", "javis_guard_register.py", "javis_bootstrap.py"):
+        _mp = os.path.join(BIN_DIR, _mod)
+        if os.path.isfile(_mp):
+            need('settings_path + ".tmp"' not in _code_lines(_read(_mp)),
+                 "%s 에 고정 .tmp 재구현이 남아 있다(교차 파손 경로 · 발행만 원자적이고 "
+                 "스테이징을 공유하면 원자성이 사라진다)" % _mod)
+    notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0(preflight+dept_migrate+guard_register+bootstrap)")
     # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 실측 5 writer 중 Rust 두 축
     pk = _repo_file(os.path.join("src", "pack.rs"))
     mi = pk.find("pub fn merge_desired_hooks(")
@@ -2735,7 +2747,24 @@ def h_conc_3():
         need(not fails, "경합 writer 실패: %r" % fails)
         # 파손 0: 파싱 성공 + 사용자 키 보존
         raw = _read(target)
-        data = json.loads(raw)          # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        # ★맨몸 `json.loads` 금지(2026-09-04): 종전 이 줄은 파손 시 **JSONDecodeError 로 크래시**해
+        #   검체가 FAIL 이 아니라 traceback 으로 죽었다 — 판정이 아니라 계측기 사망이라 원인 추적이
+        #   불가능했고(파일 내용이 사라진다), 재현 시도마다 '플레이크' 로 접힐 위험이 있었다.
+        #   파손은 **판정 결과**(FAIL)여야 하고, 그 증거(파일 원문)는 남아야 한다.
+        try:
+            data = json.loads(raw)      # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        except ValueError as _je:
+            _ev = os.path.join(tempfile.gettempdir(),
+                               "h-conc-3-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_ev, "w", encoding="utf-8") as _f:
+                    _f.write(raw)
+            except OSError:
+                _ev = "(증거 보존 실패)"
+            need(False,
+                 "settings.json 교차 파손 — %s · %d바이트 · 머리 80=%r · 꼬리 80=%r · 증거=%s "
+                 "(‘Extra data’ 는 찢긴 쓰기의 서명이다: 완결 JSON 뒤에 남은 이전 본문의 꼬리)"
+                 % (_je, len(raw), raw[:80], raw[-80:], _ev))
         need(data.get("theme") == "dark", "경합이 사용자 키를 지웠다")
         # lost update 0: 모든 writer 의 모든 mark 가 남는다
         marks = data.get("marks") or []
