@@ -54,6 +54,8 @@ MASTER_MD = os.path.join(DIRECTIVES, "MASTER_DIRECTIVE.md")
 CEO_MD = os.path.join(DIRECTIVES, "CEO_TEMPLATE.md")
 FRAGMENT = os.path.join(SCRIPTS, "ceo_template_header.md")
 SESSION_START = os.path.join(HOOKS, "session-start.sh")
+MANUAL_MD = os.path.join(REPO, "USER-MANUAL.md")
+CYS_RS = os.path.join(REPO, "src", "bin", "cys.rs")
 ORCHESTRA_PY = os.path.join(BIN, "javis_orchestra.py")
 BOOTSTRAP_PY = os.path.join(BIN, "javis_bootstrap.py")
 
@@ -162,6 +164,25 @@ def terminal_kinds_missing(master_text):
     return [k for k in TERMINAL_KINDS if ("`%s`" % k) not in master_text]
 
 
+def setstatus_has_ack(cys_rs_text):
+    """`cys set-status --ack` 가 **코드에 실재하는가**(clap `SetStatus` 블록 안의 필드).
+
+    ★파일 전역이 아니라 블록으로 좁히는 이유: `ack` 는 이 리포에서 흔한 낱말이라 전역 검색은
+      항상 참이 된다(게이트가 상수로 퇴화). 판정 범위는 `SetStatus {` 부터 그 블록의 닫는 `},` 까지다.
+    반환 True(실재) · False(부재) · **None(판정 불가 — 소스 부재·블록 미검출)**.
+    측정 불능을 False 로 접지 않는 이유는 이 팩의 exit 2 계약과 같다."""
+    if not cys_rs_text:
+        return None
+    i = cys_rs_text.find("\n    SetStatus {")
+    if i < 0:
+        return None
+    j = cys_rs_text.find("\n    },", i)
+    if j < 0:
+        return None
+    block = cys_rs_text[i:j]
+    return ("ack:" in block) or ("--ack" in block)
+
+
 def exit_owner_violations(master_text):
     """③b exit 주체 귀속 — 위반 목록(빈 목록 = 통과).
 
@@ -256,9 +277,22 @@ try:
     check("1c ACK 절이 §2 앵커보다 앞(추출 정규식 무해)",
           "## 1-1." in reviewer
           and reviewer.index("## 1-1.") < reviewer.index("## 2. 엄격 제약"))
-    check("1d `--ack` 미착지 사실이 병기됨(거짓 처방 차단)",
-          "아직 없다" in reviewer or "미착지" in reviewer,
-          "현행 CLI 실측 고지 부재")
+    # ★1d 는 **양방향 결박**이다(R2 적대검증 MAJOR 반영). 종전 판정은 "'미착지' 문자열이 있는가"
+    #   한 방향뿐이라 W-B B5 가 `--ack` 를 착지시키면 두 갈래 모두 틀린 신호를 냈다 —
+    #   ⓐ정직한 편집자가 낡은 경고를 지우면(문서가 옳아진 순간) FAIL 하고
+    #   ⓑ경고를 방치해 문서가 거짓이 되면 그대로 PASS 한다.
+    #   그래서 **코드의 실재 여부**를 읽어 문서 주장과 대조한다(같은 파일 3c 가 이미 쓰는 규약).
+    _ack_in_code = setstatus_has_ack(read(CYS_RS))
+    _doc_says_missing = ("아직 없다" in reviewer) or ("미착지" in reviewer)
+    if _ack_in_code is None:
+        check("1d `--ack` 문서↔코드 결박(판정 불가 — Rust 소스 부재)", True,
+              "측정 불능은 실패가 아니다(배포 팩 경로)")
+    elif _ack_in_code:
+        check("1d 코드에 `--ack` 가 착지했으면 문서의 '미착지' 경고는 **사라져야** 한다",
+              not _doc_says_missing, "B5 착지 후에도 문서가 '없다'고 말한다 — 거짓 서술")
+    else:
+        check("1d 코드에 `--ack` 가 없으면 문서가 그 사실을 **병기해야** 한다",
+              _doc_says_missing, "현행 CLI 실측 고지 부재 — 거짓 처방")
 
     # ─────────── ② 파생값·논스 리터럴 부재 (T1-7 · 음성 방향) ───────────
     forged = forgeable_literals(reviewer)
@@ -273,6 +307,19 @@ try:
     ghost = ghost_exit_violations(bootstrap_src, orchestra_src)
     check("3c 코드 상수 대조(bootstrap 13/14/15 부재 · check 12 실재)", not ghost,
           "위반: %s" % ghost)
+
+    # ─────────── ④ USER-MANUAL 교차 결박 (R2 적대검증 MAJOR 반영) ───────────
+    # ★USER-MANUAL 이 terminal 11종 enum 을 **통째로 복제**하는데 3a 는 MASTER 쪽만 핀했다.
+    #   enum 이 바뀌면 MASTER 는 적색으로 잡히고 매뉴얼은 **조용히 드리프트**해 사용자에게
+    #   존재하지 않는 kind 를 계속 안내한다(사본은 낡는다 — 이 리포의 반복 형상).
+    manual = read(MANUAL_MD)
+    check("4a USER-MANUAL 이 부트 v2 절을 담는다(티켓 4항 산출물의 기계 검증)",
+          bool(manual) and "completed_degraded" in manual, "매뉴얼에 부트 v2 서술이 없다")
+    _mmiss = [k for k in TERMINAL_KINDS if k not in manual] if manual else TERMINAL_KINDS
+    check("4b 매뉴얼의 terminal 열거가 MASTER 와 **같은 11종**(사본 드리프트 차단)",
+          not _mmiss, "매뉴얼 부재: %s" % _mmiss)
+    check("4c 매뉴얼에도 위조 가능 리터럴 0(T1-7 동일 규율)",
+          not forgeable_literals(manual or ""), "발견: %s" % forgeable_literals(manual or "")[:3])
 
     # ─────────── ④ session-start.sh ack 줄 부재 (T1-8 · 음성 방향) ───────────
     ack_lines = session_start_ack_lines(hook)
@@ -330,6 +377,23 @@ try:
               bool(ceo_drift(read_bytes(FRAGMENT), read_bytes(MASTER_MD),
                              read_bytes(CEO_MD) + b"x", gen.SEPARATOR)),
               "변조본이 통과했다(계측 무효)")
+    # ★변조⑥⑦ — 이번 라운드 신설 두 축(1d 양방향 · 4b 매뉴얼 교차)이 실제로 재고 있는가.
+    _rs = read(CYS_RS)
+    if _rs:
+        _mut_rs = _rs.replace("\n    SetStatus {",
+                              "\n    SetStatus {\n        #[arg(long)]\n        ack: Option<String>,", 1)
+        check("6h 변조⑥ 앵커 실재(SetStatus 블록)", _mut_rs != _rs)
+        check("6i 변조⑥ 코드에 --ack 를 넣으면 1d 가 **방향을 뒤집는다**",
+              setstatus_has_ack(_mut_rs) is True and setstatus_has_ack(_rs) is False,
+              "양방향 결박이 아니면 두 값이 같다: %r/%r"
+              % (setstatus_has_ack(_mut_rs), setstatus_has_ack(_rs)))
+    if manual:
+        _mut_manual = manual.replace("attempts_exhausted", "attempts_gone", 1)
+        check("6j 변조⑦ 앵커 실재(매뉴얼 enum)", _mut_manual != manual)
+        check("6k 변조⑦ 매뉴얼에서 kind 1종을 바꾸면 교차 결박이 잡는다",
+              [k for k in TERMINAL_KINDS if k not in _mut_manual] == ["attempts_exhausted"],
+              "매뉴얼 드리프트가 무측정이면 이 축은 장식이다")
+
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
