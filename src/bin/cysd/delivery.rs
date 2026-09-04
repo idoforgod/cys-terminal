@@ -1180,7 +1180,7 @@ pub(crate) mod tests {
 
         // 실사고에서 관측된 격리 소켓 2종.
         let leaky = [
-            "/Users/cys/.cys/state-harness/cys.sock",
+            "/Users/x/.cys/state-harness/cys.sock",
             "/var/folders/ab/T/l1-new-1234/cys.sock",
         ];
         for sock in leaky {

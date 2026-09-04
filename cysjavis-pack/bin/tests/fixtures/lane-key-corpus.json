@@ -25,7 +25,7 @@
     {"sock": "/nonexistent/machine/.local/state/cys/cys.sock", "is_base": true, "why": "기계 독립 — 존재하지 않는 경로도 모양만 맞으면 base"},
     {"sock": "/Users/x/.local/state/cys/cys", "is_base": true, "why": "basename `cys`(확장자 없는 변형)도 허용 — 종전 계약 보존"},
 
-    {"sock": "/Users/cys/.cys/state-harness/cys.sock", "is_base": false, "why": "★실사고 격리 소켓 ① — 수리 전에는 base 로 접혀 본 레인을 오염시켰다"},
+    {"sock": "/Users/x/.cys/state-harness/cys.sock", "is_base": false, "why": "★실사고 격리 소켓 ① — 수리 전에는 base 로 접혀 본 레인을 오염시켰다"},
     {"sock": "/var/folders/ab/T/l1-new-1234/cys.sock", "is_base": false, "why": "★실사고 격리 소켓 ② — 동일"},
 
     {"sock": "/Users/x/.local/state/cys-harness/cys.sock", "is_base": false, "why": "부모가 `cys` 로 **시작**하지만 `cys` 가 아니다 — 접두 비교로 완화하면 여기서 적색"},
