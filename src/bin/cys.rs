@@ -17977,6 +17977,81 @@ mod tests {
         }
     }
 
+    /// ★H-U22-PIN-1(master 승인 2026-09-05): U-22 배선 **4종**을 cargo 에서도 잰다.
+    ///
+    /// ## 왜 여기에도 두는가
+    /// 이 축의 정본은 팩 검체 `H-HOOK-DECIDE-1`(run_bootstrap_health.py)이다. 그런데 그 검체는
+    /// **7d99300 부터 계측 불능**이었다 — 앵커가 빈 인자 리터럴이라 `--input` 인자가 생긴 순간
+    /// 함수를 못 찾았고, 그 뒤로 U-22 배선은 **한 번도 검증되지 않았다**(적색으로 시끄러웠을 뿐
+    /// 사실 확인은 0회). 러너가 하나뿐인 축은 그 러너가 눈을 감으면 그대로 사각이 된다.
+    /// 그래서 같은 4종을 다른 러너(cargo)에서도 잰다 — 두 진영이 1:1 로 대조된다.
+    ///
+    /// ## 축 어휘는 W-A 와 맞춘 넷이다(판정 대조 가능하게)
+    ///   ① **fail-open** — suppress 를 내는 자리가 정확히 하나(새 차단자 신설 금지).
+    ///   ② **전용 데드라인** — 프롬프트 앞에 선 경로라 상한이 있고, 그 값은 BUDGET 파생이다.
+    ///   ③ **NO_AUTOSTART 자기강제** — 단명 훅이 데몬을 낳지 않는다.
+    ///   ④ **데몬 핫패스 금지** — autostart 경로 `request()` 금지 · stdout 오염 금지 ·
+    ///      자기신고 `surface_id` 금지.
+    ///
+    /// ## 앵커 규약(이번 회귀의 교훈 · W-A 5eb079b 와 동일)
+    /// 함수 존재 확인은 **이름 + 여는 괄호**까지만 본다 — 인자는 보지 않는다. 시그니처를 통째로
+    /// 매칭하면 다음 인자 변경에서 또 깨지고, 그때 검체는 '위반'이 아니라 **계측 불능**이 된다.
+    #[test]
+    fn u22_hook_wiring_facts_are_measurable_from_cargo_too() {
+        let src = include_str!("cys.rs");
+        // 팩 검체 `_u22_fn_body` 와 같은 규칙: 시그니처부터 첫 최상위 닫힘까지.
+        let body = |sig: &str| -> String {
+            let i = src.find(sig).unwrap_or_else(|| panic!("{sig} 정의를 찾지 못했다(계측 불능)"));
+            let j = src[i..].find("\n}\n").map(|n| i + n).unwrap_or(src.len());
+            src[i..j].to_string()
+        };
+        // 앵커 규약 자체를 못박는다 — 이름+여는 괄호가 **정확히 한 번** 나온다.
+        for sig in ["fn run_hook(", "fn run_hook_user_prompt_submit("] {
+            let code = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+            assert_eq!(code.matches(sig).count(), 1, "앵커가 유일하지 않다: {sig}");
+        }
+
+        // ③ NO_AUTOSTART 자기강제 — 단명 훅이 데몬을 낳지 않는다.
+        let rh = body("fn run_hook(");
+        assert!(
+            rh.contains("set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON)"),
+            "run_hook 이 CYS_NO_AUTOSTART 를 자기 강제하지 않는다 — 단명 훅이 데몬을 낳는다"
+        );
+
+        let ru = body("fn run_hook_user_prompt_submit(");
+        // ② 전용 데드라인 — 소비와 파생 둘 다.
+        assert!(ru.contains("request_on_timeout("), "전용 데드라인 왕복을 쓰지 않는다");
+        assert!(ru.contains("HOOK_DECIDE_DEADLINE_MS"), "전용 데드라인 상수를 소비하지 않는다");
+        assert!(
+            src.contains("const HOOK_DECIDE_DEADLINE_MS: u64 = BUDGET_TICK_MS;"),
+            "전용 데드라인이 BUDGET 파생이 아니다(하드코딩 의심 — 예산이 바뀌어도 안 따라온다)"
+        );
+        // ④ 데몬 핫패스 금지 3종.
+        assert!(
+            !ru.contains(" request(") && !ru.contains("=request("),
+            "autostart 경로 request() 를 쓴다 — 단명 훅에서 데몬 기동 금지"
+        );
+        assert!(
+            !ru.replace("eprintln!", "").contains("println!"),
+            "훅 판정 경로가 stdout 에 쓴다 — 고지 JSON 한 줄 계약이 오염된다"
+        );
+        assert!(
+            !ru.contains("\"surface_id\""),
+            "요청 페이로드에 surface_id 를 싣는다 — 자기신고 금지(인가 계약 위반)"
+        );
+        // ① fail-open — suppress 는 정확히 한 자리에서만 난다.
+        assert_eq!(
+            ru.matches("HOOK_EXIT_SUPPRESS").count(),
+            1,
+            "suppress 반환 지점이 1곳이 아니다 — 새 차단자 신설 위험(fail-open 붕괴)"
+        );
+        // 롤백 마스터 스위치를 **코드로** 읽는다(주석만 남는 false-green 봉인 · 팩 검체와 동일).
+        assert!(
+            ru.contains("if cys::gate_axes_forced_legacy()"),
+            "롤백 마스터 스위치(CYS_BOOT_GATES)를 읽지 않는다 — 새 축이 마스터에 안 접혔다"
+        );
+    }
+
     /// ★H-CLAIM-PIN-1(2026-09-04 CI 회귀로 신설): claim 의 두 사실이 **함수 본문 안에** 있다.
     ///
     /// ## 왜 in-crate 소스 핀인가 — 커버리지 공백을 메운다
