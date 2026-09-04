@@ -681,10 +681,11 @@ pub const ENV_FENCE_ARMED: &str = "CYS_FENCE_ARMED";
 /// 우리는 '무해해졌다' 고 믿으면서 실제로는 아무것도 막지 못한 채 표와 파일만 흔든다.
 /// 스위치는 **의도**를 나타내고 준비도는 **능력**을 나타낸다 — 다른 사실이므로 AND 여야 한다.
 ///
-/// ## 왜 bool 하나가 아니라 여섯 칸인가
+/// ## 왜 bool 하나가 아니라 여덟 칸인가
 /// `ready == false` 만 남으면 **무엇이 없어서 못 켜는지** 알 수 없고, 그 상태는 판독자에게
 /// '아직 안 됨' 과 '고장' 을 같아 보이게 한다(이 저장소가 PEND 사유 계약에서 이미 값을 치른
-/// 계급이다). 여섯 칸은 codex 가 지목한 목록 그대로이고, B4 가 하나씩 착지시킬 때마다 그
+/// 계급이다). 여덟 칸은 codex 가 지목한 목록 그대로이고(R3 여섯 + R5 [5] 둘), B4 가 하나씩
+/// 착지시킬 때마다 그
 /// 칸만 뒤집는다 — 무엇이 남았는지가 항상 [`RunnerReadiness::missing`] 으로 화면에 있다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunnerReadiness {
@@ -714,7 +715,13 @@ pub struct RunnerReadiness {
 }
 
 impl RunnerReadiness {
-    /// 여섯이 **전부** 참일 때만 준비됐다. 하나라도 비면 fence 는 막는 것 없이 표만 흔든다.
+    /// 여덟이 **전부** 참일 때만 준비됐다. 하나라도 비면 fence 는 막는 것 없이 표만 흔든다.
+    ///
+    /// ★(R6 [1] · IG-28) 이 칸들은 '그렇게 되기를 바란다' 가 아니라 **'빌드에 실재한다' 는
+    /// 주장**이다. 그래서 주장이 빌드를 앞지를 수 없게 소스핀이 증거 마커를 요구한다 —
+    /// `admission_reserved` 는 `reserve_admission(`, `confirmed_exit_observed` 는
+    /// `release_confirmed_exit(` 가 생산 코드에 실재해야 true 가 될 수 있다(B4 가 그 이름으로
+    /// 착지시키거나, 다른 이름을 쓰면 핀을 함께 고친다 — 어느 쪽이든 **눈에 보이는 결박**이다).
     pub const fn ready(&self) -> bool {
         self.lease_cas_closed
             && self.atomic_handler
@@ -1741,8 +1748,15 @@ struct SupState {
     admission_capped_reported: bool,
     /// (R3 #7) fence 미무장 고지 래치 — 감독자 수명 1회.
     fence_disarmed_reported: bool,
-    /// (R4 [5]) armed 경로에서 나이 회수를 **보류했다**는 고지 래치 — 감독자 수명 1회.
+    /// (R4 [5]) 고아를 **보유하고 있다**는 고지 래치 — 감독자 수명 1회.
     orphan_hold_reported: bool,
+    /// (R6 [3] · codex R5) 보유 중 하나가 **처음으로 나이 임계를 넘었다**는 고지 래치 — 별도다.
+    ///
+    /// 왜 나눴는가: 종전에는 래치 하나가 둘을 함께 덮어서, young 상태에서 한 번 발화하면
+    /// 나중에 aged 로 **전이되는 순간이 영영 보고되지 않았다**. 나이를 '진단 축' 으로 남긴
+    /// 의미(R5 [4])가 바로 그 래치에 삼켜지고 있었다 — 남긴 신호가 도달하지 않으면 안 남긴
+    /// 것과 같다.
+    orphan_aged_reported: bool,
     /// (R3 #7) fence 무장 여부. **기본 false** — 켜는 쪽만 명시적이다.
     fence_armed: bool,
     /// (R3 #2) 이 감독자 수명의 영속 epoch — lease identity 의 한 축.
@@ -1945,6 +1959,26 @@ fn notify_orphan_hold_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize,
     );
 }
 
+/// (R6 [3] · codex R5) 보유 고아가 **처음으로 나이 임계를 넘은 순간**의 1회성 고지.
+///
+/// 보유 고지와 **다른 래치**를 쓴다. 같은 래치를 공유하면 young 일 때 한 번 발화한 뒤 aged 로
+/// 전이되는 순간이 조용해진다 — 나이를 진단 축으로 남긴 이유가 그 자리에서 사라진다.
+/// 이 이벤트가 "오래 쥐고 있다" 를 처음으로 말하는 지점이고, 회수 주체가 없는 상태
+/// (`confirmed_exit_observed=false`)에서 원장이 굳고 있다는 신호다.
+fn notify_orphan_aged_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize, aged: usize) {
+    if st.orphan_aged_reported {
+        return;
+    }
+    st.orphan_aged_reported = true;
+    publish(
+        daemon,
+        "boot_supervisor.orphan_aged",
+        json!({"held": held, "aged": aged, "cap": MAX_LIVE_BOOT_RUNS,
+               "age_threshold_secs": FENCED_REAP_AGE_SECS,
+               "note": "보유 고아가 인텐트 수명만큼 오래됐다 — 지우지는 않는다(확인된 exit 만이 근거). 회수 주체(A18 [5] · B4)가 없는 동안 원장이 굳고 있다는 진단 신호다"}),
+    );
+}
+
 fn notify_capped_once(daemon: &Arc<Daemon>, st: &mut SupState, kind: &str, why: &str) {
     if st.notify_capped_reported {
         return;
@@ -2072,6 +2106,11 @@ fn tick_in(
     };
     if held > 0 {
         notify_orphan_hold_once(daemon, st, held, aged);
+    }
+    // ★R6 [3]: aged 전이는 **별도 래치**다. 위 고지와 같은 래치를 쓰면 young 에서 한 번
+    //   발화한 뒤 aged 가 되는 순간이 영영 조용해진다(나이를 진단 축으로 남긴 의미 소실).
+    if aged > 0 {
+        notify_orphan_aged_once(daemon, st, held, aged);
     }
 
     // ── 판정·실행 ──────────────────────────────────────────────────────────────
@@ -3606,6 +3645,158 @@ mod tests {
         );
     }
 
+    /// ★R6 [3](codex R5) — **aged 전이는 보유 고지와 다른 래치로 따로 보고된다.**
+    ///
+    /// 종전에는 래치 하나가 둘을 덮어서, young 상태에서 한 번 발화하면 나중에 aged 가 되는
+    /// 순간이 영영 조용했다. 나이를 '진단 축' 으로 남긴 의미(R5 [4])가 정확히 그 자리에서
+    /// 사라진다 — 남긴 신호가 도달하지 않으면 안 남긴 것과 같다.
+    #[test]
+    fn aged_transition_is_reported_separately_from_the_first_hold() {
+        let d = tmp_daemon("aged");
+        let dir = tmp_spool("aged");
+        let now = 1.0 + FENCED_REAP_AGE_SECS + 1.0;
+        // ★고아를 **둘** 넣고 나이를 다르게 준다. 하나뿐이면 held 와 aged 가 같은 값이 되어
+        //   "aged 자리에 held 를 실었다" 는 오염을 검체가 **구별하지 못한다**(변이로 실측했다).
+        {
+            let mut g = d.boot_fenced.lock().unwrap();
+            for (id, at) in [("old", 1.0), ("young", now - 1.0)] {
+                g.push(crate::state::FencedRun {
+                    intent: id.into(),
+                    epoch: 0,
+                    generation: 1,
+                    pid: None,
+                    why: "hb_stall",
+                    at,
+                });
+            }
+        }
+        let names = |v: &[serde_json::Value]| {
+            v.iter().map(|e| e["name"].clone()).collect::<Vec<_>>()
+        };
+        let mut st = SupState::default();
+        // ① young 틱 — 보유 고지만 나고 aged 는 0 이다.
+        let s0 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0);
+        let e1 = d.bus.replay_after(s0);
+        let hold1: Vec<_> = e1
+            .iter()
+            .filter(|e| e["name"] == "boot_supervisor.orphan_hold")
+            .collect();
+        assert_eq!(hold1.len(), 1, "young 틱의 보유 고지가 1회가 아니다: {:?}", names(&e1));
+        assert_eq!(hold1[0]["payload"]["aged"], json!(0), "young 인데 aged 가 0 이 아니다");
+        assert!(
+            !e1.iter().any(|e| e["name"] == "boot_supervisor.orphan_aged"),
+            "아직 젊은데 aged 전이를 보고했다: {:?}",
+            names(&e1)
+        );
+        // ② aged 틱 — ★래치를 공유했다면 정확히 여기가 조용했다.
+        let s1 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now);
+        let e2 = d.bus.replay_after(s1);
+        let aged: Vec<_> = e2
+            .iter()
+            .filter(|e| e["name"] == "boot_supervisor.orphan_aged")
+            .collect();
+        assert_eq!(
+            aged.len(),
+            1,
+            "aged 전이가 보고되지 않았다 — 래치를 공유하면 정확히 이 자리가 조용해진다: {:?}",
+            names(&e2)
+        );
+        assert_eq!(
+            aged[0]["payload"]["aged"],
+            json!(1),
+            "aged 값이 실제 나이 초과 수와 다르다(둘 중 하나만 늙었다)"
+        );
+        assert_eq!(
+            aged[0]["payload"]["held"],
+            json!(2),
+            "held 값이 보유 총수와 다르다 — held 와 aged 가 같은 값으로 무너지면 오염을 못 가른다"
+        );
+        assert!(
+            !e2.iter().any(|e| e["name"] == "boot_supervisor.orphan_hold"),
+            "보유 고지가 두 번 났다 — 그쪽 래치가 안 걸렸다"
+        );
+        // ③ aged 고지도 1회성이다(반복 소음 금지).
+        let s2 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now + 1.0);
+        assert!(
+            !d.bus
+                .replay_after(s2)
+                .iter()
+                .any(|e| e["name"] == "boot_supervisor.orphan_aged"),
+            "aged 고지가 매 틱 반복된다 — 래치가 없다"
+        );
+    }
+
+    /// ★R6 [1](codex R5 · IG-28) — **준비도 주장은 빌드를 앞지를 수 없다.**
+    ///
+    /// 준비도 칸은 '그렇게 되기를 바란다' 가 아니라 '이 빌드에 실재한다' 는 주장이다. 누가
+    /// `admission_reserved` 를 true 로 뒤집는데 예약 배선이 없으면, fence(감독자 층)만 배포되고
+    /// admission 수리(B4)는 빠진 조합이 arm 될 수 있다 — codex 가 지목한 **분리 배포**다.
+    /// readiness AND 는 '칸이 false 면 못 켠다' 를 보증하지만 '칸이 참이면 근거가 있다' 는
+    /// 보증하지 않는다. 그 나머지 절반을 여기서 닫는다.
+    ///
+    /// ★탐지력을 함께 증명한다: 지금 트리에는 위반이 0 이라(전부 false) 실제 값만 재면 탐지기가
+    /// 고장나도 초록이다. 합성 표본으로 칸을 뒤집어 반드시 적발되는지, 그리고 증거가 있으면
+    /// 통과하는지(항상 적색인 사문이 아닌지)를 둘 다 잰다.
+    #[test]
+    fn readiness_claims_cannot_outrun_the_build() {
+        // IG-28 의 증거 마커 — B4 가 이 이름으로 착지시키거나, 다른 이름을 쓰면 이 핀을 함께
+        // 고친다. 어느 쪽이든 **눈에 보이는 결박**이고, 조용히 어긋날 수는 없다.
+        const ADMISSION_EVIDENCE: &str = "reserve_admission(";
+        const EXIT_ACK_EVIDENCE: &str = "release_confirmed_exit(";
+        fn missing(r: RunnerReadiness, prod: &str) -> Vec<&'static str> {
+            [
+                (r.admission_reserved, "admission_reserved", ADMISSION_EVIDENCE),
+                (
+                    r.confirmed_exit_observed,
+                    "confirmed_exit_observed",
+                    EXIT_ACK_EVIDENCE,
+                ),
+            ]
+            .into_iter()
+            .filter(|(claimed, _, marker)| *claimed && !prod.contains(*marker))
+            .map(|(_, name, _)| name)
+            .collect()
+        }
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        // ① 실제 빌드 — 주장이 없으니 결손도 없다.
+        assert!(
+            missing(RUNNER_READINESS, &prod).is_empty(),
+            "준비도 칸이 근거 없이 참이다: {:?}",
+            missing(RUNNER_READINESS, &prod)
+        );
+        // ② 합성 — 칸만 뒤집으면 반드시 적발된다(분리 배포 차단의 실체).
+        let mut a = RUNNER_READINESS;
+        a.admission_reserved = true;
+        assert_eq!(
+            missing(a, &prod),
+            vec!["admission_reserved"],
+            "예약 배선 없이 admission_reserved 주장을 통과시켰다 — fence 만 배포되는 문이 열린다"
+        );
+        let mut b = RUNNER_READINESS;
+        b.confirmed_exit_observed = true;
+        assert_eq!(
+            missing(b, &prod),
+            vec!["confirmed_exit_observed"],
+            "회수 배선 없이 confirmed_exit_observed 주장을 통과시켰다"
+        );
+        // ③ 증거가 실재하면 통과한다 — 항상 적색인 사문이 아니다.
+        let with_evidence = format!(
+            "{prod}\nfn reserve_admission() {{}}\nfn release_confirmed_exit() {{}}"
+        );
+        let mut both = RUNNER_READINESS;
+        both.admission_reserved = true;
+        both.confirmed_exit_observed = true;
+        assert!(
+            missing(both, &with_evidence).is_empty(),
+            "증거가 있는데도 막았다 — 이 핀은 B4 착지를 방해하는 것이 아니라 결박하는 것이다"
+        );
+    }
+
     /// ★R5 [4] 소스핀 — 나이는 **삭제에 쓰이지 않는다**.
     ///
     /// 행위 검체만 있으면 누가 조건을 되살렸을 때 '고아를 안 넣는 형상' 에서는 조용히 초록일 수
@@ -3631,6 +3822,12 @@ mod tests {
             prod.matches("notify_orphan_hold_once(").count(),
             2,
             "고아 보유 통보의 정의 1 + 호출 1 이어야 한다 — 호출이 빠지면 정지가 조용해진다"
+        );
+        // ★R6 [3]: aged 전이 통보도 같은 계급이다(정의 1 + 호출 1).
+        assert_eq!(
+            prod.matches("notify_orphan_aged_once(").count(),
+            2,
+            "aged 전이 통보의 정의 1 + 호출 1 이어야 한다 — 빠지면 나이를 진단 축으로 남긴 의미가 사라진다"
         );
     }
 
