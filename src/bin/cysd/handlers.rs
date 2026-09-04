@@ -394,9 +394,16 @@ fn migrate_seat_queue(
 /// 채널 2개: ①`role.takeover` 이벤트(GUI·구독자·저널) ②구 좌석 화면의 **셸 주석 1줄**.
 ///
 /// 주석을 쓰는 이유: 좌석은 셸이므로 텍스트 주입은 곧 '입력'이다 — 평문을 넣으면 프롬프트에
-/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). `#` 접두는
-/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다. cmd.exe 는 `#` 를 오류로 뱉으므로
-/// unix 한정으로 주입한다(Windows 는 이벤트 채널로 고지 — 셸 오염보다 안전 우선).
+/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). 주석 접두는
+/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다.
+///
+/// ★종전엔 여기가 `cfg!(unix)` 였다("cmd.exe 는 `#` 를 오류로 뱉는다") — 그래서 **Windows pane 은
+/// 승계 고지를 한 줄도 받지 못했고**, 사용자는 자기 좌석이 조용히 강등된 것을 영영 몰랐다
+/// (이 함수가 막으려던 "내 pane 이 조용히 강등됐다"는 온보딩 불신 그 자체다). 근거였던 전제가
+/// 틀렸다: Windows pane 의 기본 셸은 `powershell.exe`(`state.rs` `default_shell`)이고 거기서 `#`
+/// 는 정상 주석이다 — 위험한 것은 OS 가 아니라 **cmd.exe 하나**였다. 접두를 셸별로 고르면
+/// (`cys::shell_comment_prefix`) 안전과 가시성을 둘 다 지킨다(codex R2 #2 와 **같은 결함**이며
+/// npm 축을 고칠 때 형제로 보고해 master 가 범위에 넣었다).
 /// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
 fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
     daemon.bus.publish(
@@ -406,29 +413,40 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
         json!({"role": role, "prev_surface": prev_sid, "path": path,
                "reason": "empty seat (no descendant process, no agent meta, no recent input)"}),
     );
-    if cfg!(unix) {
-        if let Some(s) = daemon.get_surface(prev_sid) {
-            let text = format!(
-                "# [cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
-                 (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
-            );
-            // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
-            crate::delivery::record_audited(
-                daemon,
-                prev_sid,
-                &text,
-                crate::delivery::Origin::SeatTakeover,
-                None,
-            );
-            // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
-            // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
-            let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
-                text,
-                cr_delay_ms: 120,
-                clear_first: false,
-            });
-        }
-    }
+    let Some(s) = daemon.get_surface(prev_sid) else {
+        return;
+    };
+    // 렌더 입력은 **그 좌석이 실제로 돌리는 셸**(`Surface::cmd`)이다 — `CYS_SHELL` 로 어느 OS
+    // 에서든 바뀌므로 `cfg!` 로 가르면 틀린다(npm 축과 같은 규율).
+    let text = seat_takeover_notice(role, &s.cmd);
+    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
+    // 원장에는 **주입할 그 문자열**을 남긴다(접두가 갈리면 층1 대조가 이 고지를 못 알아보고,
+    // 라벨도 없으므로 임무 게이트가 기계 고지를 오너 임무로 읽는다).
+    crate::delivery::record_audited(
+        daemon,
+        prev_sid,
+        &text,
+        crate::delivery::Origin::SeatTakeover,
+        None,
+    );
+    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
+    // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
+    let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+        text,
+        cr_delay_ms: 120,
+        clear_first: false,
+    });
+}
+
+/// 좌석 승계 고지 1줄 — **순수**(셸별 주석 접두 · 개행 없음).
+///
+/// 개행이 없어야 하는 이유는 접두와 같다: 좌석은 셸이고 **개행은 곧 Enter** 다.
+fn seat_takeover_notice(role: &str, shell: &str) -> String {
+    format!(
+        "{}[cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
+         (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다.",
+        cys::shell_comment_prefix(shell)
+    )
 }
 
 /// ★번들 오염 고지 — **무음 경고 금지**(codex R1 #2 수리).
@@ -10321,6 +10339,98 @@ mod tests {
         assert!(
             !code_only.contains("cfg!(unix)"),
             "고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
+        );
+    }
+
+    /// ★H-SEAT-WIN-1(codex R2 #2 의 **형제 결함** · master 범위 판정 2026-09-04):
+    /// 좌석 승계 고지도 Windows pane 에 실제로 주입된다.
+    ///
+    /// npm 축을 고치며 발견해 보고한 같은 결함이다 — 주입이 `cfg!(unix)` 안에 있어 Windows
+    /// pane 은 승계 고지를 한 줄도 못 받았다. 이 함수가 막으려던 것이 "내 pane 이 조용히
+    /// 강등됐다"는 온보딩 불신인데, **정작 Windows 사용자에게는 조용히 강등되고 있었다.**
+    ///
+    /// 재는 것 넷: ①셸별 접두 ②실제 `write_tx` **Inject 수신**(powershell·cmd 양 셸)
+    /// ③개행 부재(개행은 곧 Enter) ④`cfg!(unix)` 회귀 소스핀(주석 제외 후 검사).
+    #[test]
+    fn seat_takeover_notice_reaches_the_pane_on_windows_shells_too() {
+        use crate::state::WriteReq;
+
+        // ① 셸별 접두 — 문안 본문은 접두만 빼면 동일해야 한다(요약·분기 금지).
+        let ps = seat_takeover_notice("master", "powershell.exe");
+        let cmd = seat_takeover_notice("master", "cmd.exe");
+        assert!(ps.starts_with("# "), "powershell pane 에 잘못된 접두: {ps:?}");
+        assert!(cmd.starts_with("rem "), "cmd.exe pane 에 안전하지 않은 접두: {cmd:?}");
+        assert_eq!(
+            ps.trim_start_matches("# "),
+            cmd.trim_start_matches("rem "),
+            "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 고지를 받는다"
+        );
+        assert!(ps.contains("master"), "역할명이 고지에서 빠졌다: {ps:?}");
+
+        // ③ 개행 부재 — 좌석은 셸이고 개행은 곧 Enter 다.
+        for (shell, line) in [("powershell.exe", &ps), ("cmd.exe", &cmd)] {
+            assert!(!line.contains('\n'), "고지에 개행이 남았다({shell}) — 미제출 잔재가 실행된다");
+        }
+
+        // ② 실제 채널 수신 — 양 셸 모두.
+        for (shell, want) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
+            tx.try_send(WriteReq::Inject {
+                text: seat_takeover_notice("worker", shell),
+                cr_delay_ms: 120,
+                clear_first: false,
+            })
+            .expect("채널 전송 실패");
+            match rx.try_recv().expect("pane 이 승계 고지를 못 받았다 — Windows 무음 회귀") {
+                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                    assert!(text.starts_with(want), "셸 {shell:?} 접두 오류: {text:?}");
+                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
+                    assert!(!clear_first, "승계 고지가 화면을 지웠다 — 사용자 작업 파괴");
+                }
+                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
+            }
+        }
+
+        // ④ 회귀 소스핀 — 주입이 다시 unix 뒤로 숨으면 위 검체는 초록인 채 실사용만 무음이 된다.
+        //    주석은 걷어내고 **실제 코드**만 본다(이 결함의 내력을 적은 주석이 cfg!(unix) 를 인용한다).
+        let src = include_str!("handlers.rs");
+        let start = src.find("fn announce_seat_takeover(").expect("승계 고지 함수 소실");
+        let end = start
+            + src[start..]
+                .find("\nfn seat_takeover_notice(")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        let code_only: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("cfg!(unix)"),
+            "승계 고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
+        );
+
+        // ⑤ **종단 확인** — 순수 함수만 재면 `announce_seat_takeover` 가 그 산출을 주입 직전에
+        //    변형하는 결함(예: 접두 strip)을 못 잡는다. mutation S-M3 이 그 사각을 드러냈다.
+        //    실제 함수를 돌려 **배달 원장에 실제로 남은 문자열**을 본다(원장은 주입과 같은 값을
+        //    받으므로, 여기서 접두가 살아 있으면 pane 에 들어간 것도 안전하다).
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        announce_seat_takeover(&daemon, sid, "master", "/tmp/lane");
+        let led = crate::delivery::ledger_path(&daemon.socket_path);
+        let raw = std::fs::read_to_string(&led).unwrap_or_default();
+        assert!(
+            raw.contains("seat_takeover"),
+            "승계 고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
+            led.display()
+        );
+        // 원장 레코드의 preview 는 정규화된 본문이다. 접두가 살아 있어야 셸이 이 줄을 주석으로
+        // 읽는다 — strip 되면 그대로 **명령**이 된다.
+        let prefix = cys::shell_comment_prefix(
+            &daemon.get_surface(sid).expect("surface").cmd,
+        );
+        assert!(
+            raw.contains(prefix.trim_end()),
+            "원장에 남은 승계 고지에 주석 접두가 없다 — pane 에 들어간 줄도 명령이 된다: {raw}"
         );
     }
 
