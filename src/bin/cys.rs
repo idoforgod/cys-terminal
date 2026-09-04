@@ -10607,6 +10607,53 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
 ///     **다른** pane 으로 신선 재해석됐다(모순 거부권 — 타 pane 토큰 절취·env 복사 봉쇄).
 ///   토큰 부재는 종전 체인 경로 바이트 동일(fail-open 폴백)이므로 rc 6 의 종전 의미
 ///   ('체인 단절 ∧ 토큰 부재/불일치')가 그대로 성립한다.
+/// claim 정당거부 — 살아있는 보유자가 그 역할을 쥐고 있다(조직 사실).
+const CLAIM_RC_DENIED: i32 = 7;
+/// 발신 신원 미확정 — 데몬은 응답했으나 발신 pane 을 붙이지 못했다(**조직 사실이 아니다**).
+const CLAIM_RC_UNRESOLVED: i32 = 6;
+/// 식별 불가 — 요청 인자·surface 해석 실패(요청을 만들 수조차 없다).
+const CLAIM_RC_UNIDENTIFIED: i32 = 2;
+/// 미도달 — 데몬 왕복 실패(요청이 데몬에 닿지 못했거나 판정을 못 받았다).
+const CLAIM_RC_UNREACHABLE: i32 = 3;
+
+/// `system.claim_role` 페이로드 — CLI(`cys claim-role`)와 훅(§2-2 g)이 **같은 것**을 보낸다.
+///
+/// ★(P1) seat 토큰 첨부 — 데몬이 pane PTY env(`CYS_SEAT_TOKEN`)로 배달한 발급 비밀을 그대로
+///   실어 나른다(CLI 는 값을 해석·검증하지 않는다 — 발급·대조·수명은 데몬 소유). additive
+///   형제 키라 구 데몬은 무시(wire.rs 계약 — 키별 수동 추출·deny_unknown_fields 없음)하고,
+///   env 부재 시 페이로드는 종전과 **바이트 동일**(수동 실행·구 데몬 스폰 pane·스큐 안전).
+///   롤백: `CYS_BOOT_GATES=0` 이면 토큰 키 자체를 생략한다 — 데몬 무개정으로도 완전 레거시가
+///   성립하는 CLI 측 우산(R3-P1-1 · 전용 노브 신설 금지). env_compat 미사용은 의도다 —
+///   레거시 접두(JAVIS_/AITERM_) 별칭이 없는 신설 키라 정본 키 하나만 판독한다.
+fn claim_role_params(role: &str, sid: u64, takeover_empty_seat: bool) -> serde_json::Value {
+    let mut params =
+        json!({"role": role, "surface_id": sid, "takeover_empty_seat": takeover_empty_seat});
+    if !cys::gate_axes_forced_legacy() {
+        if let Some(tok) = std::env::var(cys::ENV_SEAT_TOKEN).ok().filter(|t| !t.is_empty()) {
+            params["seat_token"] = json!(tok);
+        }
+    }
+    params
+}
+
+/// 데몬 에러 문자열 → claim **타입드 exit**(순수 · 위 표와 같은 대수).
+///
+/// 값으로 뽑은 이유: 이 대수를 소비하는 곳이 셋이 됐다(CLI 출구 · 훅 §2-2 g · `boot.enqueue`
+/// 의 `claim_rc` 릴레이). 분기 술어를 문자열 비교로 흩뿌리면 한 곳만 낡는다 — 실제로 종전
+/// 소비부는 **에러 문자열을 grep** 했고 그것이 A20 이 없앤 드리프트 시한폭탄이다.
+/// **미지 코드는 미도달(3)** 로 접는다: 판정을 받지 못한 것과 같은 계급이지 정당거부가 아니다.
+fn claim_err_exit_code(e: &str) -> i32 {
+    if e.starts_with("claim_denied") {
+        CLAIM_RC_DENIED
+    } else if e.starts_with("claim_caller_unresolved") || e.starts_with("claim_not_owner") {
+        CLAIM_RC_UNRESOLVED
+    } else if e.starts_with("invalid_params") || e.starts_with("not_found") {
+        CLAIM_RC_UNIDENTIFIED
+    } else {
+        CLAIM_RC_UNREACHABLE
+    }
+}
+
 fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool) -> i32 {
     let sid = match target_surface(&surface, &None) {
         Ok(sid) => sid,
@@ -10615,22 +10662,7 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
             return 2;
         }
     };
-    let mut params =
-        json!({"role": role, "surface_id": sid, "takeover_empty_seat": takeover_empty_seat});
-    // ★(P1) seat 토큰 첨부 — 데몬이 pane PTY env(`CYS_SEAT_TOKEN`)로 배달한 발급 비밀을 그대로
-    //   실어 나른다(CLI 는 값을 해석·검증하지 않는다 — 발급·대조·수명은 데몬 소유). additive
-    //   형제 키라 구 데몬은 무시(wire.rs 계약 — 키별 수동 추출·deny_unknown_fields 없음)하고,
-    //   env 부재 시 페이로드는 종전과 **바이트 동일**(수동 실행·구 데몬 스폰 pane·스큐 안전).
-    //   롤백: `CYS_BOOT_GATES=0` 이면 토큰 키 자체를 생략한다 — 데몬 무개정으로도 완전 레거시가
-    //   성립하는 CLI 측 우산(R3-P1-1 · 전용 노브 신설 금지). env_compat 미사용은 의도다 —
-    //   레거시 접두(JAVIS_/AITERM_) 별칭이 없는 신설 키라 정본 키 하나만 판독한다.
-    if !cys::gate_axes_forced_legacy() {
-        if let Some(tok) =
-            std::env::var(cys::ENV_SEAT_TOKEN).ok().filter(|t| !t.is_empty())
-        {
-            params["seat_token"] = json!(tok);
-        }
-    }
+    let params = claim_role_params(role, sid, takeover_empty_seat);
     match request("system.claim_role", params) {
         Ok(r) => {
             println!(
@@ -10642,9 +10674,11 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
         }
         Err(e) => {
             eprintln!("[claim-role] 실패: {e}");
-            // 데몬이 낸 에러 **코드**로 분기한다(request 가 "code: message" 로 합성한다).
+            // 데몬이 낸 에러 **코드**로 분기한다(request 가 "code: message" 로 합성한다 ·
+            // 대수의 소유자는 `claim_err_exit_code` 하나다).
             // claim_denied = 데몬의 정당거부 마커(특권 역할 live 보유자·live-slot 보호·타 surface claim).
-            if e.starts_with("claim_denied") {
+            let rc = claim_err_exit_code(&e);
+            if rc == CLAIM_RC_DENIED {
                 eprintln!(
                     "[claim-role] 정당거부(rc=7): 살아있는 보유자가 그 역할을 쥐고 있다. \
                      이 surface 는 그 역할이 아니다 — 지휘를 중단하고 기존 보유자에게 인계하라."
@@ -10662,7 +10696,7 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
                     );
                 }
                 7
-            } else if e.starts_with("claim_caller_unresolved") || e.starts_with("claim_not_owner") {
+            } else if rc == CLAIM_RC_UNRESOLVED {
                 // ★신원 실패는 조직 사실이 아니다(rc=6 · 2026-08-16) — 정당거부(7)와 융합 금지.
                 eprintln!(
                     "[claim-role] 발신 신원 미확정(rc=6): 데몬은 응답했으나 이 프로세스를 발신 \
@@ -10670,7 +10704,7 @@ fn run_claim_role(role: &str, surface: Option<String>, takeover_empty_seat: bool
                      살아있는 보유자가 있다는 뜻이 **아니다** — 세션 배선을 점검하라."
                 );
                 6
-            } else if e.starts_with("invalid_params") || e.starts_with("not_found") {
+            } else if rc == CLAIM_RC_UNIDENTIFIED {
                 eprintln!("[claim-role] 식별 불가(rc=2): 요청 인자·surface 해석 실패.");
                 2
             } else {
@@ -10816,6 +10850,10 @@ const HOOK_EXIT_HANDLED: i32 = 6;
 struct HookInput {
     #[serde(default)]
     prompt: String,
+    /// 하네스 세션 축 — `boot.enqueue` v3 **선언 id** 의 두 축 중 하나다(다른 하나는 프롬프트
+    /// digest). 없으면 빈 문자열이고 그때는 세션 축 없이 id 가 만들어진다(구 하네스 스큐 안전).
+    #[serde(default)]
+    session_id: String,
 }
 
 /// `--input` 파일 판독(§2-2 a · T1-2). 실패는 사유 문자열로 돌려준다.
@@ -11163,6 +11201,20 @@ fn hook_prompt_axis(
         &facts.anomalies,
     );
     let machine = fold_machine_reason(&rec.decision.fold);
+    // ── f. 선언 감지 — 판정은 이미 났다(`record_fold_from_origin` 안의 `declaration::detect`).
+    //    여기서 다시 감지하지 않는 것이 요점이다: 두 번 감지하면 두 답이 갈릴 수 있고, 갈리면
+    //    "대장에는 선언인데 부트는 안 뜬" 상태가 된다.
+    if machine.is_none()
+        && matches!(rec.decision.fold, cys::mission_gate::RecordFold::DeclarationResidual(_))
+    {
+        let (verdict, code, detail) =
+            hook_declaration_path(socket, &inp.prompt, &inp.session_id);
+        return hook_verdict(
+            verdict,
+            code,
+            &format!("{detail}{ack_note}{}", rec.note_suffix()),
+        );
+    }
     let (verdict, code, detail) = hook_prompt_outcome(machine.as_deref(), role, seat_reason);
     hook_verdict(verdict, code, &format!("{detail}{ack_note}{}", rec.note_suffix()))
 }
@@ -11202,6 +11254,126 @@ fn layer12_name(v: &Layer12) -> &'static str {
         Layer12::Human => "human",
         Layer12::Unknown(_) => "unknown",
         Layer12::Legacy(_) => "legacy",
+    }
+}
+
+/// 선언 유래 토큰 — 데몬 `boot_supervisor::DECL_ORIGIN_HOOK_HUMAN` 과 **같은 문자열**이어야 한다.
+///
+/// 데몬은 이 토큰을 **닫힌 집합**으로 검사해 미지값을 거절한다(침묵 수용 아님). 그래서 오타는
+/// 조용히 통과하지 않고 `invalid_params` 로 죽지만, 그 죽음은 훅에서 legacy 폴백으로 접히므로
+/// **부트가 조용히 구 경로로만 도는** 상태가 된다. 검체 H-DECL-ORIGIN-1 이 데몬 소스와 이 값을
+/// 기계 대조한다(cysd 는 바이너리 크레이트라 상수를 import 할 수 없다 — 소스 핀이 그 대안이다).
+const BOOT_DECL_ORIGIN_HOOK_HUMAN: &str = "hook-human";
+
+/// claim 전용 데드라인 — 레거시 본체의 `CYS_CLAIM_TIMEOUT_S=10` 과 **같은 크기**다
+/// (`BUDGET_TICK_MS`×4 ≈ 10s · 하드코딩 금지 · `surface-role` 과 같은 파생).
+/// 판정 왕복(1틱)보다 길게 잡는 이유: claim 은 실패해도 폴백이 있는 판정이 아니라 **등록**이라,
+/// 여기서 성급히 끊으면 좌석이 없는 채로 인텐트가 기록된다.
+const HOOK_CLAIM_DEADLINE_MS: u64 = BUDGET_TICK_MS * 4;
+
+/// ★(B2-c · 명세 §2-2 g·h) **선언 경로** — claim-role master → `boot.enqueue` v3 → 처리완료.
+///
+/// 이 함수가 성공하면 훅은 **rc6(HANDLED)** 를 내고 런처는 레거시 본체를 돌리지 않는다.
+/// 그 한 갈래만이 "훅이 처리를 끝냈다"이고, **나머지 전부는 rc5(legacy)** 로 접어 셸 본체가
+/// 종전 경로(python 부트스트랩 spawn)를 수행한다 — 이 위임은 새 차단자를 만들지 않는다
+/// (`run_boot_intent` 의 fail-open 규율과 같은 방향 · R3-P2-8).
+///
+/// ## 왜 claim 이 실패하면 legacy 인가
+/// claim rc 7(살아있는 master 보유자)·rc 6(신원 미확정)은 **조직 판정**이고, 그 판정을 소비해
+/// 위계 폴백(부서 창설)이나 세션 배선 보고를 하는 것은 python 부트스트랩(③)의 일이다. 훅이
+/// 여기서 rc6 를 내면 그 판정이 **아무에게도 전달되지 않고 사라진다**. 그래서 넘긴다.
+/// 데몬도 같은 방향으로 판정한다 — `boot.enqueue` 는 `claim_rc=0` 주장을 자기 레지스트리와
+/// 교차검증해 불일치면 스풀에 적지 않는다(태어날 때부터 거짓인 데이터를 남기지 않는다).
+fn hook_declaration_path(
+    socket: &std::path::Path,
+    prompt: &str,
+    session_id: &str,
+) -> (&'static str, i32, String) {
+    let sid = match target_surface(&None, &None) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "legacy",
+                HOOK_EXIT_LEGACY,
+                format!("좌석 해석 실패({e}) — 셸 종전 경로로 반환"),
+            )
+        }
+    };
+    // ── g. claim-role master(빈 좌석 인수 허용 — 레거시 본체의 `--takeover-empty-seat` 와 동일)
+    let claim_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let claim = request_on_timeout(
+        socket,
+        "system.claim_role",
+        claim_role_params("master", sid, true),
+        std::time::Duration::from_millis(HOOK_CLAIM_DEADLINE_MS),
+    );
+    if let Err(e) = claim {
+        let rc = claim_err_exit_code(&e);
+        return (
+            "legacy",
+            HOOK_EXIT_LEGACY,
+            format!("claim-role master 미성립(rc={rc} · {e}) — 판정을 셸 본체가 소비한다"),
+        );
+    }
+    // ── h. `boot.enqueue` v3 — 선언 id 의 두 축(세션·본문 digest)을 **훅이** 준다.
+    //    종전 `cys boot-intent`(env 릴레이)는 이 두 축을 몰라 같은 선언의 재전송이 인텐트를
+    //    하나 더 낳았다. 훅은 프롬프트를 들고 있으므로 여기서 축을 채울 수 있다.
+    let params = json!({
+        "reason": "role-bootstrap-hook",
+        "decl_origin": BOOT_DECL_ORIGIN_HOOK_HUMAN,
+        "claim_rc": 0,
+        "claim_at": claim_at,
+        "session_id": session_id,
+        "prompt_digest": cys::mission_gate::digest_text(prompt),
+    });
+    enqueue_verdict(request_on_timeout(
+        socket,
+        "boot.enqueue",
+        params,
+        std::time::Duration::from_millis(BOOT_INTENT_DEADLINE_MS),
+    ))
+}
+
+/// `boot.enqueue` 응답 → (판정 토큰, exit, 상세). **순수** — 데몬 없이 전수로 잰다.
+///
+/// 이 축의 계약이 여기 다 있다: **rc6 는 인텐트가 실재할 때만** 나오고 그 밖은 전부 rc5 다.
+/// 값으로 뽑은 이유는 [`origin_from_layer12`] 와 같다 — 판정이 왕복 안에 묻히면 검체가 닿지
+/// 못하고, 닿지 못하는 계약은 언젠가 조용히 뒤집힌다(변이 M3 의 교훈).
+fn enqueue_verdict(resp: Result<serde_json::Value, String>) -> (&'static str, i32, String) {
+    match resp {
+        Ok(r) => {
+            let outcome = r["outcome"].as_str().unwrap_or_default().to_string();
+            // ★세 귀결이 **전부 정상**이다: 새로 적혔거나(enqueued), 같은 선언이 이미 있거나
+            //   (dedup), 더 새 선언이 앞선다(superseded). 셋 다 **인텐트는 존재**하므로 감독자가
+            //   집는다 — 여기서 spawn 폴백을 타면 그것이 곧 중복 기동이다.
+            if matches!(outcome.as_str(), "enqueued" | "dedup" | "superseded") {
+                return (
+                    "handled",
+                    HOOK_EXIT_HANDLED,
+                    format!(
+                        "선언 처리완료 — intent={} outcome={outcome} surface={} (스폰은 데몬 감독자 소관)",
+                        r["decl_id"].as_str().unwrap_or("?"),
+                        r["surface_id"]
+                    ),
+                );
+            }
+            // 미지 형상 = 계약 스큐. '기록됨'으로 읽는 것이 이 축에서 가장 나쁜 오작동이다.
+            (
+                "legacy",
+                HOOK_EXIT_LEGACY,
+                format!("boot.enqueue 응답 형상 스큐(outcome={outcome:?}) — 셸 종전 spawn 폴백"),
+            )
+        }
+        // 감독자 미기동(supervisor_off)·구 데몬·왕복 실패 — 전부 **셸 종전 spawn 폴백**이다
+        // (인텐트는 기록되지 않았다 · fail-open 방향: 이 위임은 새 차단자를 만들지 않는다).
+        Err(e) => (
+            "legacy",
+            HOOK_EXIT_LEGACY,
+            format!("boot.enqueue 미성립({e}) — 셸 종전 spawn 폴백"),
+        ),
     }
 }
 
@@ -17445,6 +17617,84 @@ mod tests {
             reason: String::new(),
             anomalies: Vec::new(),
         }
+    }
+
+    /// ★H-DECL-ORIGIN-1(B2-c g·h): 선언 유래 토큰이 **데몬이 인정하는 그 문자열**인가.
+    ///
+    /// 데몬은 `decl_origin` 을 닫힌 집합으로 검사해 미지값을 `invalid_params` 로 거절한다.
+    /// 오타가 나면 훅은 조용히 legacy 폴백으로만 돌고(부트는 뜨지만 **v2 경로가 영영 안 쓰인다**)
+    /// 아무도 그것을 모른다 — 컴파일러가 잡지 못하는 문자열 계약이라 **소스 핀**으로 잰다
+    /// (`cysd` 는 바이너리 크레이트라 상수를 import 할 수 없다).
+    #[test]
+    fn boot_decl_origin_token_matches_the_daemon_source_pin() {
+        let sup = include_str!("cysd/boot_supervisor.rs");
+        assert!(
+            sup.contains(&format!(
+                "pub const DECL_ORIGIN_HOOK_HUMAN: &str = \"{BOOT_DECL_ORIGIN_HOOK_HUMAN}\";"
+            )),
+            "데몬의 decl_origin 상수와 훅의 토큰이 갈렸다 — 데몬이 invalid_params 로 거절하고 \
+             훅은 조용히 legacy 로만 돈다"
+        );
+        // 죽은/오기 이름이 되살아나지 않는다(H-HOOK-ACK-1 과 같은 3축 규율).
+        assert!(!sup.contains("\"hook_human\""), "언더스코어 오기가 부활했다");
+        assert_eq!(BOOT_DECL_ORIGIN_HOOK_HUMAN, "hook-human");
+    }
+
+    /// ★H-ENQ-VERDICT-1(B2-c h · master 목표 검체의 rc 축): **rc6 는 인텐트가 실재할 때만.**
+    ///
+    /// master 가 잠근 성공 기준은 "오너 선언 → rc6 · legacy 0회 · 인텐트 1건"이다. 그 중 rc 축을
+    /// 여기서 전수로 잰다 — 세 정상 귀결(enqueued·dedup·superseded)은 **인텐트가 존재**하므로
+    /// 처리완료(6)이고, 나머지 전부는 legacy(5)다. 이 방향이 뒤집히면 둘 중 하나가 일어난다:
+    ///   · rc6 를 남발 → 인텐트가 없는데 셸이 spawn 을 건너뛰어 **부트 0회 무음 사망**.
+    ///   · rc5 를 남발 → 인텐트가 있는데 셸도 spawn 해 **중복 기동**.
+    #[test]
+    fn enqueue_verdict_returns_handled_only_when_an_intent_exists() {
+        for outcome in ["enqueued", "dedup", "superseded"] {
+            let (v, code, detail) = enqueue_verdict(Ok(serde_json::json!({
+                "outcome": outcome, "decl_id": "d-1", "surface_id": 101, "enqueued": outcome == "enqueued"
+            })));
+            assert_eq!(code, HOOK_EXIT_HANDLED, "{outcome} 이 처리완료가 아니다 — 셸이 중복 기동한다");
+            assert_eq!(v, "handled");
+            assert!(detail.contains("d-1") && detail.contains(outcome), "상세가 근거를 잃었다: {detail}");
+        }
+        // ① 미지 outcome = 계약 스큐 → 폴백(믿고 넘어가지 않는다).
+        let (v, code, _) = enqueue_verdict(Ok(serde_json::json!({"outcome": "spooled?"})));
+        assert_eq!((v, code), ("legacy", HOOK_EXIT_LEGACY));
+        // ② outcome 키 자체가 없는 구 형상도 같은 방향.
+        let (_, code, _) = enqueue_verdict(Ok(serde_json::json!({"enqueued": true})));
+        assert_eq!(code, HOOK_EXIT_LEGACY, "형상 스큐를 '기록됨'으로 읽었다");
+        // ③ 감독자 미기동·구 데몬·왕복 실패 = 인텐트 미기록 → 셸 종전 spawn 폴백.
+        for err in ["supervisor_off: 감독자 미기동", "method_not_found", "connect 실패"] {
+            let (v, code, detail) = enqueue_verdict(Err(err.to_string()));
+            assert_eq!((v, code), ("legacy", HOOK_EXIT_LEGACY), "{err} 에서 폴백이 끊겼다");
+            assert!(detail.contains(err), "사유 원문이 사라졌다(스큐 분류 근거): {detail}");
+        }
+    }
+
+    /// ★H-CLAIM-RC-1(B2-c g): claim **타입드 exit** 대수가 한 곳에서 나온다.
+    ///
+    /// 종전 소비부는 에러 **문자열을 grep** 해 정당거부와 세션 오류를 갈랐다(A20 이 없앤 드리프트
+    /// 시한폭탄). 이제 소비처가 셋(CLI 출구·훅 선언경로·`claim_rc` 릴레이)이므로 대수를 값으로
+    /// 못박는다. **미지 코드는 미도달(3)** 이다 — 판정을 못 받은 것이지 정당거부가 아니다.
+    #[test]
+    fn claim_error_codes_map_to_the_typed_exit_algebra() {
+        assert_eq!(claim_err_exit_code("claim_denied: 보유자 있음"), CLAIM_RC_DENIED);
+        assert_eq!(claim_err_exit_code("claim_caller_unresolved: 체인 단절"), CLAIM_RC_UNRESOLVED);
+        assert_eq!(claim_err_exit_code("claim_not_owner: 토큰-체인 모순"), CLAIM_RC_UNRESOLVED);
+        assert_eq!(claim_err_exit_code("invalid_params: surface"), CLAIM_RC_UNIDENTIFIED);
+        assert_eq!(claim_err_exit_code("not_found: surface"), CLAIM_RC_UNIDENTIFIED);
+        assert_eq!(claim_err_exit_code("timeout"), CLAIM_RC_UNREACHABLE);
+        assert_eq!(claim_err_exit_code("완전히 새로운 코드"), CLAIM_RC_UNREACHABLE);
+        // 대수 자체가 A20 표와 같은 값인가(소비 스크립트가 이 숫자로 분기한다).
+        assert_eq!(
+            (CLAIM_RC_DENIED, CLAIM_RC_UNRESOLVED, CLAIM_RC_UNIDENTIFIED, CLAIM_RC_UNREACHABLE),
+            (7, 6, 2, 3)
+        );
+        // 페이로드는 CLI·훅이 **같은 것**을 보낸다(자기신고 surface 금지 계약의 형상).
+        let p = claim_role_params("master", 101, true);
+        assert_eq!(p["role"], "master");
+        assert_eq!(p["surface_id"], 101);
+        assert_eq!(p["takeover_empty_seat"], true);
     }
 
     /// ★H-ORIGIN-MAP-1(B2-c · mutation 실측으로 신설): 층1·층2 판정이 **대장까지 살아서 간다.**
