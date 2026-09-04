@@ -623,8 +623,57 @@ pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
     Disposition::Run(action)
 }
 
-/// (B3 · 명세 §2-6 ⓐ) 러너 생존 신고가 끊긴 것으로 보는 한계. 명세가 준 리터럴이다.
+/// (B3 · 명세 §2-6 ⓐ) 러너 생존 신고가 끊긴 것으로 보는 한계.
+///
+/// **명세 리터럴이다** — 유도가 아니다(W-A 가 명세 원문 §2-6 을 확인했다). python 의
+/// `BOOT_NODE_TOTAL_S` 도 90 이지만 명세가 그 leaf 를 보고 썼다는 근거는 없으므로 **없는 계보를
+/// 지어내지 않는다**. 값의 소유자는 python 의 `BOOT_HB_STALL_S` 이고 예산 파리티가 대조한다.
 pub const HB_STALL_SECS: f64 = 90.0;
+
+/// (R3 #7 · codex BLOCK · master 심판) **fence 무장 스위치 — 기본 꺼짐.**
+///
+/// ## 왜 스위치가 필요한가
+/// fence 의 안전성은 "세대가 오르면 구 러너의 side-effect RPC 가 전부 거절된다"에 **전적으로**
+/// 기댄다. 그런데 그 거절을 집행하는 주체(§2-7 러너의 CAS·자멸)가 **아직 없다**(B4). 그 전에
+/// 세대만 올리면 우리는 '무해해졌다' 고 믿으면서 실제로는 아무것도 막지 못한 채 표와 파일만
+/// 흔드는 셈이다 — TOCTOU·ABA·admission 부정확이 그 창에서 **실제 위험**이 된다.
+///
+/// 그래서 '아직 발효하지 않는다' 를 주석이 아니라 **코드 게이트**로 세운다. 꺼져 있으면
+/// **판정·세대 상승·재개가 전부 금지**된다. 켜는 조건은 B4 의 RPC CAS 계약과 그 검체가 닫히는
+/// 것이고, 그때 이 상수 하나만 뒤집으면 경로 전체가 살아난다.
+///
+/// ★종전(B3-2R-1)에는 `hb <= started` 라는 **데이터 조건**이 사실상 같은 역할을 했다. 그러나
+/// 데이터 조건은 데이터가 바뀌면 조용히 열린다 — 러너가 hb 를 한 번이라도 쓰기 시작하는 순간
+/// 무장 여부와 무관하게 fence 가 살아난다. 게이트는 그 우연을 막는다(codex #7 의 요지다).
+pub const ENV_FENCE_ARMED: &str = "CYS_FENCE_ARMED";
+
+/// [`ENV_FENCE_ARMED`] 판독 — **기본 false**(미설정·미지값 전부 꺼짐).
+/// 켜는 쪽만 명시적이어야 한다: 오타 하나로 위험한 경로가 열리면 안 된다.
+pub fn fence_armed_from(env_val: Option<&str>) -> bool {
+    matches!(env_val.map(str::trim), Some("1") | Some("true"))
+}
+
+/// (R3 #2 · codex BLOCK) **재시작마다 유일한 영속 epoch** 를 하나 올려 돌려준다.
+///
+/// generation 만으로는 ABA 를 막지 못한다: 데몬이 재시작하면 인메모리 표가 비고 세대가 되감길
+/// 수 있어, 옛 러너가 든 (intent, generation) 이 새 런의 그것과 **우연히 같아질** 수 있다.
+/// epoch 를 lease identity 에 넣으면 그 재사용이 끊긴다.
+///
+/// 파일 하나에 카운터를 영속한다 — 판독 실패·파손은 **0 으로 보지 않고** 시각 기반 값으로
+/// 접는다(0 으로 접으면 재시작마다 같은 값이 되어 이 함수의 존재 이유가 사라진다).
+pub fn bump_boot_epoch(dir: &Path) -> u64 {
+    let p = dir.join("boot-epoch");
+    let prev = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let next = match prev {
+        Some(v) => v.saturating_add(1),
+        // 없거나 판독 불가 — 시계에서 시작한다(재시작 간 충돌 가능성을 낮춘다).
+        None => now_epoch() as u64,
+    };
+    let _ = std::fs::write(&p, next.to_string());
+    next
+}
 
 /// (B3-2R ④ⓓ) **전역 동시 런 상한** — 살아 있는 런 + 회수하지 못한 fence 고아의 합.
 ///
@@ -1409,6 +1458,12 @@ struct SupState {
     notify_capped_reported: bool,
     /// (B3-2R ④ⓓ) 전역 상한 정지 통보 래치 — 감독자 수명 1회.
     admission_capped_reported: bool,
+    /// (R3 #7) fence 미무장 고지 래치 — 감독자 수명 1회.
+    fence_disarmed_reported: bool,
+    /// (R3 #7) fence 무장 여부. **기본 false** — 켜는 쪽만 명시적이다.
+    fence_armed: bool,
+    /// (R3 #2) 이 감독자 수명의 영속 epoch — lease identity 의 한 축.
+    epoch: u64,
 }
 
 /// 스풀 항목 1건을 지우고 **이벤트를 내도 되는지**를 함께 판정한다.
@@ -1532,6 +1587,17 @@ fn notify_no_spawn(
 /// 유계가 통보보다 앞이라는 절충은 유지하되, 이 파일의 다른 유계 방어(`undeletable`·
 /// `budget_pressure`)가 전부 최소 1건의 이벤트를 남기는데 통보 절단만 아무 흔적이 없던
 /// 비대칭을 없앤다 — 256건 동시 무산은 이미 병리 상태이고, 정확히 그 순간 침묵하면 안 된다.
+/// (R3 #3 · codex BLOCK) admission 관측 — **fail-closed**.
+///
+/// 잠금 획득에 실패하면(Mutex poison 등) `None` 을 돌리고 호출부는 **상한에 걸린 것으로** 친다.
+/// 못 세는데 낳는 것이 이 축에서 가장 나쁜 실패다 — 세지 못하는 상태에서 프로세스를 늘리면
+/// 유계가 무너진 것을 아무도 모른다. 관측 불능은 통과가 아니다(이 세션의 규율 그대로).
+fn admission_state(daemon: &Arc<Daemon>) -> Option<(usize, usize)> {
+    let orphans = daemon.boot_fenced.lock().ok()?.len();
+    let active = usize::from(daemon.boot_run_active.lock().ok()?.is_some());
+    Some((orphans, active))
+}
+
 /// (B3-2R ④ⓓ) **전역 상한 정지 통보.**
 ///
 /// `notify_no_spawn` 을 쓰지 않는 이유는 트리거가 다르기 때문이다 — 그쪽의 계약은 "이 인텐트는
@@ -1540,23 +1606,40 @@ fn notify_no_spawn(
 ///
 /// 그래도 조용하면 안 된다: 상한에 걸린 동안 **부트가 하나도 나지 않는다**. 래치는 감독자
 /// 수명 1회다(매 틱 반복 금지).
-fn notify_admission_capped(
-    daemon: &Arc<Daemon>,
-    st: &mut SupState,
-    orphans: usize,
-    active: usize,
-) {
+fn notify_admission_capped(daemon: &Arc<Daemon>, st: &mut SupState, counts: Option<(usize, usize)>) {
     if st.admission_capped_reported {
         return;
     }
     st.admission_capped_reported = true;
-    daemon.push_feed_notification(
-        "bootstrap-fail",
-        "부트 감독자 일시 정지 — 동시 실행 상한",
-        &format!(
-            "회수하지 못한 부트 고아 {orphans}건 + 진행 중 {active}건이 상한              {MAX_LIVE_BOOT_RUNS}에 도달해 새 부트를 낳지 않습니다. 이 감독자는 프로세스를              죽이지 않으므로(오살 0 계약) 고아는 스스로 끝나거나 최대 30분 뒤 원장에서 접힙니다.              지금 확인하려면 cys ps 로 부트 프로세스를 보십시오(표에 pid 가 실려 있습니다).",
+    let body = match counts {
+        Some((orphans, active)) => format!(
+            "회수하지 못한 부트 고아 {orphans}건 + 진행 중 {active}건이 상한 {MAX_LIVE_BOOT_RUNS}에 \
+             도달해 새 부트를 낳지 않습니다. 이 감독자는 프로세스를 죽이지 않으므로(오살 0 계약) \
+             고아는 스스로 끝나거나 최대 30분 뒤 원장에서 접힙니다. 지금 확인하려면 cys ps 로 \
+             부트 프로세스를 보십시오(표에 pid 가 실려 있습니다)."
         ),
-        None,
+        // ★R3 #3: 관측 자체가 안 되는 경우다. 이때 낳지 않는 것이 fail-closed 이고, 그 사실이
+        //   상한 도달과 **구별되어** 보여야 한다 — 원인이 다르면 처방도 다르다.
+        None => "부트 감독자가 동시 실행 수를 관측하지 못해(내부 표 잠금 실패) 새 부트를 낳지 \
+                 않습니다. 세지 못하는 상태에서 프로세스를 늘리면 유계가 무너진 것을 아무도 \
+                 모르므로 안전한 쪽으로 멈춥니다. 데몬 재기동이 이 상태를 해소합니다."
+            .to_string(),
+    };
+    daemon.push_feed_notification("bootstrap-fail", "부트 감독자 일시 정지 — 동시 실행 상한", &body, None);
+}
+
+/// (R3 #7) fence 미무장 고지 — 감독자 수명 1회. 조용히 안 하는 것과 **안 하기로 정한 것**은
+/// 다르고, 그 차이가 보이지 않으면 다음 사람이 fence 가 도는 줄 안다.
+fn notify_fence_disarmed_once(daemon: &Arc<Daemon>, st: &mut SupState) {
+    if st.fence_disarmed_reported {
+        return;
+    }
+    st.fence_disarmed_reported = true;
+    publish(
+        daemon,
+        "boot_supervisor.fence_disarmed",
+        json!({"env": ENV_FENCE_ARMED, "armed": false,
+               "note": "fence 판정·세대 상승·재개 전면 금지 — 러너 CAS·자멸(B4) 착지 전 봉인"}),
     );
 }
 
@@ -1699,7 +1782,15 @@ fn tick_in(
         //   그래서 **순수 안전인 절반만** 넣는다: 세대를 올려 구 러너를 무력화한다. 새 프로세스는
         //   낳지 않으므로 가정이 틀려도 손해가 없고, 가정이 확정되면 재개는 덧붙이면 된다.
         //   fence 된 런은 종전대로 수명 상한(`expired`)이 걷는다.
-        if it.state == IntentState::Running {
+        if it.state == IntentState::Running && !st.fence_armed {
+            // ★R3 #7(codex BLOCK · master 심판): **무장 전에는 판정조차 하지 않는다.**
+            //   세대 상승·재개는 물론이고 판정 자체를 막는 이유는, 판정이 이벤트로 나가면
+            //   '무장했다' 는 잘못된 인상을 주고 다음 사람이 그 위에 재개를 얹기 때문이다.
+            //   fence 의 안전성은 '세대가 오르면 구 러너의 RPC 가 거절된다' 에 전적으로 기대는데
+            //   그 거절을 집행할 주체(§2-7 러너 CAS·자멸)가 아직 없다 — 그 창에서 세대만 올리면
+            //   막은 것 없이 표와 파일만 흔든다.
+            notify_fence_disarmed_once(daemon, st);
+        } else if it.state == IntentState::Running {
             let verdict = daemon.boot_run_active.lock().ok().and_then(|g| {
                 g.as_ref()
                     .filter(|r| r.intent == it.id && r.generation == it.generation)
@@ -1735,26 +1826,37 @@ fn tick_in(
                             json!({"id": it.id, "why": why, "error": e, "fenced": false}),
                         ),
                         Ok(_) => {
-                            if let Ok(mut g) = daemon.boot_run_active.lock() {
-                                if let Some(r) = g.as_mut() {
-                                    if r.intent == it.id {
-                                        r.generation = fenced.generation;
-                                    }
+                            // ★R3 #4(codex): active → fenced 를 **두 표를 동시에 쥔 채** 옮긴다.
+                            //   잠금 순서를 고정한다(fenced → active) — 이 둘이 함께 잡히는 곳은
+                            //   여기뿐이라 고정 순서로 교착이 없다. 종전엔 표의 세대만 올려서
+                            //   '활성인데 fence 된' 중간 상태가 존재했다.
+                            //   ★재fence 금지(#9): 같은 (intent, epoch, generation) 이 이미 원장에
+                            //   있으면 넣지 않는다 — 중복은 admission 분모를 부풀려 부트를 이유
+                            //   없이 멈춘다. epoch 가 키에 있어 재시작 전후가 갈린다.
+                            if let (Ok(mut hist), Ok(mut act)) =
+                                (daemon.boot_fenced.lock(), daemon.boot_run_active.lock())
+                            {
+                                let key = (it.id.as_str(), st.epoch, it.generation);
+                                let dup = hist.iter().any(|f| f.key() == key);
+                                if !dup && hist.len() < MAX_LIVE_BOOT_RUNS {
+                                    hist.push(FencedRun {
+                                        intent: it.id.clone(),
+                                        epoch: st.epoch,
+                                        generation: it.generation,
+                                        pid,
+                                        why,
+                                        at: now,
+                                    });
+                                }
+                                // 소유권을 잃은 런은 **활성이 아니다** — 표에서 뺀다(원자 이동).
+                                if act.as_ref().is_some_and(|r| r.intent == it.id) {
+                                    *act = None;
                                 }
                             }
                             // ★B3-2R ⑥ fence 된 시도는 **terminal 과 다른 칸**에 남긴다. terminal 은
                             //   '이 인텐트가 어떻게 끝났는가' 하나뿐이라 거기 쓰면 마지막 하나만
                             //   남고 앞의 이력이 사라진다(codex⑤). 이 원장은 동시에 ④ⓓ 전역
                             //   상한의 분모이기도 하다 — 무kill 이라 이 고아는 살아 있을 수 있다.
-                            if let Ok(mut g) = daemon.boot_fenced.lock() {
-                                g.push(FencedRun {
-                                    intent: it.id.clone(),
-                                    generation: it.generation,
-                                    pid,
-                                    why,
-                                    at: now,
-                                });
-                            }
                             publish(
                                 daemon,
                                 "boot_supervisor.fenced",
@@ -1794,6 +1896,32 @@ fn tick_in(
                 if suspend_dispatch {
                     continue; // 예산 포화 — 유계가 우선이다(낳지 않는다).
                 }
+                // ★R3 #6(codex): admission 을 **예산 소비보다 먼저** 검사한다. 종전엔 attempts·
+                //   generation 을 올려 영속한 **뒤** 상한을 봤는데, 그러면 상한에 걸릴 때마다 낳지도
+                //   않고 예산만 태운다 — 세 번 걸리면 그 선언은 `attempts_exhausted` 로 **영영 뜨지
+                //   못한다**. 일시 정지가 조용히 종착이 되는 자리라 순서가 계약이다.
+                // ★R3 #3(codex): 관측 실패는 **상한으로 친다**(fail-closed). 못 세는데 낳는 것이
+                //   이 축에서 가장 나쁜 실패다 — 유계가 무너진 것을 아무도 모르게 된다.
+                let Some((orphans, active)) = admission_state(daemon) else {
+                    notify_admission_capped(daemon, st, None);
+                    publish(
+                        daemon,
+                        "boot_supervisor.admission_unobservable",
+                        json!({"id": it.id, "spawned": false,
+                               "why": "표 잠금 실패(poison 등) — 관측 불능은 통과가 아니다"}),
+                    );
+                    continue;
+                };
+                if orphans + active >= MAX_LIVE_BOOT_RUNS {
+                    notify_admission_capped(daemon, st, Some((orphans, active)));
+                    publish(
+                        daemon,
+                        "boot_supervisor.admission_capped",
+                        json!({"id": it.id, "orphans": orphans, "active": active,
+                               "max": MAX_LIVE_BOOT_RUNS, "spawned": false}),
+                    );
+                    continue;
+                }
                 let next = attempts + 1;
                 st.budget.insert(it.id.clone(), (next, now));
                 // 디스크측 예산 선기록 — 실행 **전**에 올려 둬야 이 사이에 데몬이 죽어도
@@ -1819,23 +1947,6 @@ fn tick_in(
                     );
                     continue;
                 }
-                // ★B3-2R ④ⓓ **전역 admission 상한** — 살아 있는 런 + 회수 못 한 fence 고아.
-                //   무kill 이라 fence 된 러너는 살아 있을 수 있고, 그 누적이 전역 총량을 뚫는다.
-                //   상한에 걸리면 **낳지 않고 시끄럽게** 멈춘다(유계가 liveness 보다 앞이다).
-                let orphans = daemon.boot_fenced.lock().map(|g| g.len()).unwrap_or(0);
-                let active = usize::from(
-                    daemon.boot_run_active.lock().map(|g| g.is_some()).unwrap_or(false),
-                );
-                if orphans + active >= MAX_LIVE_BOOT_RUNS {
-                    notify_admission_capped(daemon, st, orphans, active);
-                    publish(
-                        daemon,
-                        "boot_supervisor.admission_capped",
-                        json!({"id": it.id, "orphans": orphans, "active": active,
-                               "max": MAX_LIVE_BOOT_RUNS, "spawned": false}),
-                    );
-                    continue;
-                }
                 dispatched += 1;
                 // ★B3(§3-3): 데몬 표 등록은 **스폰 전**이다 — 스폰 뒤에 등록하면 먼저 도착한
                 //   러너 RPC 가 CAS 할 표를 못 찾아 거절된다(경주에서 정상 부트가 진다).
@@ -1850,6 +1961,7 @@ fn tick_in(
                         progress_step: String::new(),
                         started: now,
                         pid: None,
+                        epoch: st.epoch,
                     });
                 }
                 // 러너에게는 **새 세대를 실은 인텐트**를 넘긴다(원장 줄의 attempts 도 실제로 실행된
@@ -1958,6 +2070,15 @@ pub fn spawn(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
         let dir = spool_dir(&daemon.socket_path);
         let mut st = SupState::default();
+        // ★R3 #7: fence 무장은 **env 로만** 켜진다(기본 꺼짐). 켜는 조건은 §2-7 러너의 CAS·자멸
+        //   계약과 그 검체가 닫히는 것이고(B4), 그때 이 스위치 하나로 경로 전체가 살아난다.
+        st.fence_armed = fence_armed_from(std::env::var(ENV_FENCE_ARMED).ok().as_deref());
+        // ★R3 #2: lease identity 의 epoch 는 **데몬 수명당 하나**이고 디스크에 영속한다.
+        //   스풀이 아니라 그 부모(상태 디렉터리)에 둔다 — 스풀은 인텐트 스캔·GC 의 대상이다.
+        st.epoch = bump_boot_epoch(dir.parent().unwrap_or(&dir));
+        if st.fence_armed {
+            eprintln!("[cysd] boot-supervisor: fence ARMED (epoch={})", st.epoch);
+        }
         loop {
             tokio::time::sleep(Duration::from_secs(SUPERVISOR_INTERVAL_SECS)).await;
             // 패닉 격리 — watchdog 과 같은 규약. 한 틱의 패닉이 감독자를 데몬 수명 내내
@@ -2796,6 +2917,7 @@ mod tests {
             progress_step: String::new(),
             started,
             pid: None,
+            epoch: 0,
         };
         // ① 미보고(hb == started) — 아무리 오래 지나도 fence 하지 않는다.
         assert_eq!(
@@ -2830,6 +2952,7 @@ mod tests {
         let dir = tmp_spool("fence");
         enqueue_in(&dir, &req("f", None), 0.0).unwrap();
         let mut st = SupState::default();
+        st.fence_armed = true; // ★R3 #7: 무장해야 fence 경로가 열린다(기본은 봉인).
         // 1틱: 디스패치 → running(세대 1) · 표 등록.
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         // 러너가 한 번 보고한 것으로 만든다(그래야 fence 가 발효 조건을 통과한다).
@@ -2845,11 +2968,16 @@ mod tests {
         let after = BootIntent::from_str("f", &std::fs::read_to_string(intent_path(&dir, "f")).unwrap())
             .expect("fence 후 인텐트 판독 불가");
         assert_eq!(after.generation, 2, "fence 가 파일 세대를 올리지 않았다(구 러너가 무력화되지 않는다)");
-        assert_eq!(
-            d.boot_run_active.lock().unwrap().as_ref().unwrap().generation,
-            2,
-            "표 세대가 오르지 않았다 — 파일과 갈리면 CAS 판정이 둘로 나뉜다"
+        // ★R3 #4: 소유권을 잃은 런은 **활성이 아니다** — 표에서 빠지고 고아 원장으로 옮겨간다.
+        //   종전엔 표의 세대만 올려 '활성인데 fence 된' 중간 상태가 남았다.
+        assert!(
+            d.boot_run_active.lock().unwrap().is_none(),
+            "fence 됐는데 활성 표에 남아 있다 — admission 분모가 이중 계상된다"
         );
+        let hist = d.boot_fenced.lock().unwrap();
+        assert_eq!(hist.len(), 1, "고아 원장에 정확히 1건이 아니다: {}", hist.len());
+        assert_eq!(hist[0].key(), ("f", 0, 1), "원장 유일 키가 (intent, epoch, generation) 이 아니다");
+        drop(hist);
         assert_eq!(after.state, IntentState::Running, "fence 가 상태를 바꿨다 — 재개는 아직 없다");
     }
 
@@ -2906,6 +3034,7 @@ mod tests {
             for i in 0..MAX_LIVE_BOOT_RUNS {
                 g.push(crate::state::FencedRun {
                     intent: format!("orphan{i}"),
+                    epoch: 0,
                     generation: 1,
                     pid: Some(1000 + i as u32),
                     why: "hb_stall",
@@ -2938,6 +3067,7 @@ mod tests {
             for i in 0..MAX_LIVE_BOOT_RUNS {
                 g.push(crate::state::FencedRun {
                     intent: format!("old{i}"),
+                    epoch: 0,
                     generation: 1,
                     pid: None,
                     why: "hb_stall",
@@ -2959,6 +3089,160 @@ mod tests {
             d.boot_fenced.lock().unwrap().is_empty(),
             "나이 넘긴 고아가 원장에 남았다"
         );
+    }
+
+    /// ★R3 #3(codex BLOCK) — 관측이 안 되면 **낳지 않는다**(fail-closed).
+    ///
+    /// 못 세는데 낳는 것이 이 축에서 가장 나쁜 실패다: 유계가 무너진 것을 아무도 모른다.
+    /// Mutex 를 실제로 poison 시켜(락을 쥔 스레드가 패닉) 관측 불능 상태를 **결정론으로** 만든다.
+    #[test]
+    fn admission_is_fail_closed_when_the_table_cannot_be_observed() {
+        let d = tmp_daemon("poison");
+        let dir = tmp_spool("poison");
+        enqueue_in(&dir, &req("p", None), 0.0).unwrap();
+        // 고아 원장 Mutex 를 poison 한다 — 락을 쥔 채 패닉하면 이후 lock() 이 Err 다.
+        let d2 = d.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = d2.boot_fenced.lock().unwrap();
+            panic!("의도적 poison");
+        })
+        .join();
+        assert!(d.boot_fenced.lock().is_err(), "검체 자기검증: poison 이 걸리지 않았다");
+        fn never(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+            panic!("관측 불능인데 스폰했다 — 세지 못하는 상태에서 프로세스를 늘렸다");
+        }
+        let mut st = SupState::default();
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, never, remove_spool_file, 1.0),
+            0,
+            "관측 불능에서 디스패치가 계상됐다"
+        );
+        // 조용하지 않아야 한다 — 부트가 안 나는 상태다.
+        assert!(
+            !d.feed_items.lock().unwrap().is_empty(),
+            "관측 불능 정지가 조용하다"
+        );
+    }
+
+    /// ★R3 #6(codex) — admission 상한에 걸려도 **시도 예산을 태우지 않는다**.
+    ///
+    /// 종전엔 attempts·generation 을 올려 영속한 **뒤** 상한을 봤다. 그러면 상한에 걸릴 때마다
+    /// 예산만 소진되어 세 번이면 그 선언은 `attempts_exhausted` 로 **영영 뜨지 못한다** —
+    /// 일시 정지가 조용히 종착이 되는 자리다.
+    #[test]
+    fn admission_cap_does_not_consume_the_attempt_budget() {
+        let d = tmp_daemon("nobudget");
+        let dir = tmp_spool("nobudget");
+        enqueue_in(&dir, &req("b", None), 0.0).unwrap();
+        {
+            let mut g = d.boot_fenced.lock().unwrap();
+            for i in 0..MAX_LIVE_BOOT_RUNS {
+                g.push(crate::state::FencedRun {
+                    intent: format!("o{i}"),
+                    epoch: 0,
+                    generation: 1,
+                    pid: None,
+                    why: "hb_stall",
+                    at: 1.0,
+                });
+            }
+        }
+        fn never(_d: &Arc<Daemon>, _i: &BootIntent, _a: BootAction) -> Result<String, RunErr> {
+            panic!("상한인데 스폰했다");
+        }
+        let mut st = SupState::default();
+        let mut now = 2.0;
+        for _ in 0..MAX_ATTEMPTS + 2 {
+            assert_eq!(tick_in(&d, &dir, &mut st, never, remove_spool_file, now), 0);
+            now += 60.0;
+        }
+        // 디스크 예산도 메모리 예산도 오르지 않아야 한다.
+        let left = BootIntent::from_str("b", &std::fs::read_to_string(intent_path(&dir, "b")).unwrap())
+            .expect("상한 정지가 인텐트를 지웠다");
+        assert_eq!(left.attempts, 0, "상한에 걸렸는데 디스크 시도 예산이 탔다");
+        assert_eq!(left.generation, 0, "상한에 걸렸는데 lease 세대가 소비됐다");
+        assert!(
+            st.budget.get("b").is_none_or(|(n, _)| *n == 0),
+            "상한에 걸렸는데 메모리 예산이 탔다"
+        );
+    }
+
+    /// ★R3 #4(codex) — **2틱 음성 검체**: 한 번 fence 된 런은 다시 fence 되지 않는다.
+    ///
+    /// 재fence 는 고아 원장을 중복으로 채워 admission 분모를 부풀리고, 그러면 부트가 이유 없이
+    /// 멈춘다. 원자 이동(활성 표에서 뺀다)과 유일 키(intent·epoch·generation) 둘이 함께 막는다.
+    #[test]
+    fn a_fenced_run_is_not_fenced_again_on_the_next_tick() {
+        let d = tmp_daemon("refence");
+        let dir = tmp_spool("refence");
+        enqueue_in(&dir, &req("r", None), 0.0).unwrap();
+        let mut st = SupState::default();
+        st.fence_armed = true;
+        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
+        {
+            let mut g = d.boot_run_active.lock().unwrap();
+            g.as_mut().unwrap().hb = 10.0;
+        }
+        let t = 10.0 + HB_STALL_SECS + 1.0;
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, t);
+        assert_eq!(d.boot_fenced.lock().unwrap().len(), 1, "1틱: 고아 1건이 아니다");
+        // ── 2틱: 같은 런을 다시 fence 하지 않는다 ──
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, t + 60.0);
+        assert_eq!(
+            d.boot_fenced.lock().unwrap().len(),
+            1,
+            "2틱에 재fence 됐다 — 원장이 중복돼 admission 분모가 부푼다"
+        );
+        let after = BootIntent::from_str("r", &std::fs::read_to_string(intent_path(&dir, "r")).unwrap())
+            .expect("판독 불가");
+        assert_eq!(after.generation, 2, "2틱에 세대가 또 올랐다");
+    }
+
+    /// ★R3 #7(codex BLOCK · master 심판) — **무장 전에는 fence 가 전면 봉인된다.**
+    ///
+    /// 이 검체가 지키는 것: hb 가 끊긴 런이 있어도 무장하지 않으면 **세대가 오르지 않고**
+    /// 고아 원장에도 들어가지 않는다. 그리고 그 정지는 조용하지 않다(미무장 고지 1회).
+    ///
+    /// 왜 데이터 조건이 아니라 게이트인가: 종전의 `hb <= started` 는 데이터가 바뀌면 **조용히
+    /// 열린다** — 러너가 hb 를 한 번이라도 쓰기 시작하는 순간 무장 여부와 무관하게 fence 가
+    /// 살아난다. 게이트는 그 우연을 막는다.
+    #[test]
+    fn fence_is_sealed_until_armed() {
+        let d = tmp_daemon("disarmed");
+        let dir = tmp_spool("disarmed");
+        enqueue_in(&dir, &req("s", None), 0.0).unwrap();
+        let mut st = SupState::default();
+        assert!(!st.fence_armed, "기본값이 무장이면 봉인이 아니다");
+        assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
+        {
+            let mut g = d.boot_run_active.lock().unwrap();
+            g.as_mut().unwrap().hb = 10.0; // 보고 1회 = hb 가드는 통과하는 상태
+        }
+        let before = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 10.0 + HB_STALL_SECS + 1.0);
+        let after = BootIntent::from_str("s", &std::fs::read_to_string(intent_path(&dir, "s")).unwrap())
+            .expect("판독 불가");
+        assert_eq!(after.generation, 1, "미무장인데 세대가 올랐다 — 봉인이 뚫렸다");
+        assert!(
+            d.boot_fenced.lock().unwrap().is_empty(),
+            "미무장인데 고아 원장에 기록됐다"
+        );
+        assert!(
+            d.bus.latest_seq() > before,
+            "미무장 정지가 조용하다 — 안 하기로 정한 것과 그냥 안 하는 것은 다르다"
+        );
+    }
+
+    /// ★R3 #7 — 무장 판독은 **켜는 쪽만 명시적**이다(오타 하나로 위험 경로가 열리면 안 된다).
+    #[test]
+    fn fence_arm_switch_defaults_to_off() {
+        assert!(!fence_armed_from(None), "미설정이 무장이면 안 된다");
+        assert!(!fence_armed_from(Some("")), "빈 값이 무장이면 안 된다");
+        assert!(!fence_armed_from(Some("0")), "0 이 무장이면 안 된다");
+        assert!(!fence_armed_from(Some("yes")), "미지값이 무장이면 안 된다(켜는 쪽만 명시적)");
+        assert!(fence_armed_from(Some("1")));
+        assert!(fence_armed_from(Some("true")));
+        assert!(fence_armed_from(Some(" 1 ")), "공백은 다듬어 받는다");
     }
 
     /// ★B3-2R ③(codex③) — fence 의 **CAS 술어**를 직접 잰다.
@@ -3020,6 +3304,9 @@ mod tests {
         let dir = tmp_spool("nofence");
         enqueue_in(&dir, &req("n", None), 0.0).unwrap();
         let mut st = SupState::default();
+        // ★무장한다 — 그래야 이 검체가 재는 것이 **hb 가드**이지 무장 게이트가 아니다.
+        //   무장 안 하면 어느 쪽이 막았는지 구별되지 않아 공허한 통과가 된다.
+        st.fence_armed = true;
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         // hb 를 건드리지 않는다 = 한 번도 보고하지 않은 런.
         let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0 + HB_STALL_SECS * 10.0);

@@ -1743,6 +1743,12 @@ pub struct BootRunActive {
     /// (B3-2R ④ⓑ) 낳은 프로세스의 pid. **관측용이지 종료용이 아니다** — 이 데몬은 아무것도
     /// 죽이지 않는다. 고아가 생겼을 때 사람이 `cys ps`·watchdog 으로 **찾아갈 수 있게** 싣는다.
     pub pid: Option<u32>,
+    /// (R3 #2 · codex) **재시작마다 유일한 영속 epoch** — lease identity 의 한 축이다.
+    ///
+    /// generation 만으로는 ABA 를 막지 못한다: 데몬이 재시작하면 이 표가 비고 세대가 되감길 수
+    /// 있어 옛 러너의 (intent, generation) 이 새 런의 그것과 **우연히 같아질** 수 있다. epoch 가
+    /// 그 재사용을 끊는다. 디스크에 영속하므로 재시작을 건너뛰지 않는다.
+    pub epoch: u64,
 }
 
 /// (B3-2R ⑥) **fence 된 런의 별도 원장**. terminal 과 섞지 않는다 — terminal 은 '이 인텐트가
@@ -1754,10 +1760,20 @@ pub struct BootRunActive {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FencedRun {
     pub intent: String,
+    /// (R3 #9) 유일 키의 한 축 — 재시작 전후를 가른다.
+    pub epoch: u64,
     pub generation: u32,
     pub pid: Option<u32>,
     pub why: &'static str,
     pub at: f64,
+}
+
+impl FencedRun {
+    /// (R3 #9) **중복 방지 키** — 같은 (intent, epoch, generation) 을 두 번 기록하지 않는다.
+    /// 중복이 들어가면 admission 분모가 부풀어 부트가 이유 없이 멈춘다.
+    pub fn key(&self) -> (&str, u64, u32) {
+        (self.intent.as_str(), self.epoch, self.generation)
+    }
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
