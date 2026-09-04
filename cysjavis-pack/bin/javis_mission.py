@@ -2401,7 +2401,7 @@ def cmd_hook_triage(argv):
 #                         self-test 가 의미 있게 돌아야 한다). 라벨로 폴백 사실을 드러낸다.
 #   · fixture 존재+불량 → **hard fail**(조용한 폴백은 corpus 부식을 통과로 접는다).
 #   · 정상              → fixture ⊇ 내장 리터럴 불변식까지 검사.
-MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2")
+MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2", "digest_vectors")
 
 # 내장 폴백(= fixture 의 진부분집합). 축마다 **양방향**(접힘 1 · 통과 1)을 갖춘다 — 한 방향만
 # 두면 "전부 접는다"·"전부 통과시킨다"는 무력화가 초록으로 지나간다.
@@ -2415,6 +2415,16 @@ MISSION_CORPUS_FALLBACK = {
          "text": "<div><p>x</p></div> 고쳐",
          "expect": {"harness": False, "residual": "<div><p>x</p></div> 고쳐",
                     "blocks": 1, "free_meaningful": 2}},
+    ],
+    "digest_vectors": [
+        # 폴백은 **최소 2건**이다(fixture 부재 = 설치본 경로). 대칭 이탈 탐지의 핵심 두 축만 —
+        # ⓐ sha256 표준 벡터(대조 키가 진짜 sha256 인가) ⓑ 공백 재배치 내성(정규화가 사는가).
+        {"name": "N-sha-vector", "text": "abc",
+         "expect": {"normalized": "abc",
+                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}},
+        {"name": "N-fold-ws", "text": "  a \t\n b  ",
+         "expect": {"normalized": "a b",
+                    "sha256": "c8687a08aa5d6ed2044328fa6a697ab8e96dc34291e8c2034ae8c38e6fcc6d65"}},
     ],
     "layer0c": [
         {"name": "L0c-cys-launch-agent",
@@ -2667,6 +2677,17 @@ def _selftest_mission_corpus(fails):
     for c in data["layer0c"]:
         _eq("layer0c", c["name"], "boot_command",
             boot_command_origin(_corpus_text(c["text"]))[0], c["expect"]["boot_command"])
+
+    # ── ⑤-b 정규화·해시 골든 벡터 — **2언어 대칭 이탈**의 유일한 탐지기 ─────────────────
+    # 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어진다. 그래서
+    # python 과 Rust 가 **같은 방향으로 함께 틀리면** 층1 케이스는 전부 초록인 채 원장 대조가
+    # 통째로 무력화된다. 리터럴 골든만이 그 대칭 이탈을 가른다 — 그리고 그것이 fixture 안에
+    # 있어야 Rust 가 `include_str!` 로 **같은 값을** 본다(인라인 리터럴이면 사본이 하나 더 생긴다).
+    for c in data.get("digest_vectors") or []:
+        t = _corpus_text(c["text"])
+        _eq("digest_vectors", c["name"], "normalized",
+            _normalize_delivery(t), c["expect"]["normalized"])
+        _eq("digest_vectors", c["name"], "sha256", delivery_digest(t), c["expect"]["sha256"])
 
     # ── ⑥ 층2 — push 규약 라벨 ───────────────────────────────────────────────
     for c in data["layer2"]:
@@ -4196,7 +4217,8 @@ def cmd_self_test():
     print("javis_mission self-test OK (선언단독=임무없음 · 질의절 배제 · ack 배제 · "
           "선언+임무=임무있음 · 최소 %d자 경계 · 게이트 기본값 fail-closed · "
           "층2 라벨 배제 corpus 14종 + 오너문장 무오탐 5종 · 층1 배달원장 관통공격 10종 · "
-          "정규화/해시 교차언어 앵커 · CYS_STATE_DIR 밀폐 · surface 결박 · "
+          "정규화/해시 교차언어 앵커(인라인 + ★fixture digest_vectors 골든) · "
+          "CYS_STATE_DIR 밀폐 · surface 결박 · "
           "TTL %ds 결박 · 데몬 세션 결박 · 원장 판독불가 fail-closed · 디렉터리=판독불가 · "
           "★R4: 밀어내기 4500건 무력화 차단 · 스캔상한 초과=판독불가 · 회전세대(.1) 판독 · "
           "고대 ts 조기종료 금지 · 0바이트=손상 · 표식有+원장無=손상 · 기동표식 정상판독 · "
