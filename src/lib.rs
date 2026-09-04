@@ -3771,8 +3771,8 @@ mod tests {
             npm_config_prefix_verdict_for(
                 "windows",
                 exe_dir,
-                Some(Path::new(r"C:\Users\u")),
-                Some(Path::new(r"C:\Users\u\AppData\Local")),
+                Some(Path::new(r"C:\Users\x")),
+                Some(Path::new(r"C:\Users\x\AppData\Local")),
                 Some(uv),
             )
         };
@@ -3796,7 +3796,7 @@ mod tests {
         // ── 음성: 과잉 경고 차단(사용자 소유물을 오염으로 몰지 않는다) ────────
         for uv in [
             r"C:\Program Files\cys-extra\bin",             // ⓐ 형제 접두
-            r"C:\Users\u\AppData\Local\cys-npm",           // ⓑ 설치본 밖(우리 기본값 자리)
+            r"C:\Users\x\AppData\Local\cys-npm",           // ⓑ 설치본 밖(우리 기본값 자리)
             r"C:\Program Files\cys\..\evil",               // ⓒ dot-dot 로 **밖으로** 나감
             r"D:\Program Files\cys\x",                     // ⓓ 다른 드라이브
             r"Program Files\cys\x",                        // ⓔ 상대경로(절대 성질 불일치)
