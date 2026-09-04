@@ -289,6 +289,16 @@ def _shell_hooks():
     return sorted(out)
 
 
+# ★부트 v2 A2(2026-09-04): UserPromptSubmit 훅이 **런처 + 본체** 2파일로 갈렸다.
+#   · 등록·실행 진입점 = `role-bootstrap.sh`(자기완결 런처) — E2E 는 여전히 이 파일을 돌린다.
+#   · 판독 규칙·문안·note 블록이 사는 곳 = `role-bootstrap-legacy.sh`(본체).
+#   그래서 **내용 핀은 본체를**, **실행은 런처를** 본다. 둘을 섞으면 이 하네스가 조용히
+#   아무것도 재지 않게 된다(계측 무효화 — 이 파일이 반복해서 경계한 형상).
+#   구 커밋 대조(`_git_show`)는 분할 이전 트리를 읽으므로 경로가 그대로다(자기완결 구 훅).
+ROLE_HOOK = "role-bootstrap.sh"                 # 런처(등록·실행)
+ROLE_BODY = "role-bootstrap-legacy.sh"          # 본체(내용 핀)
+
+
 def _git_show(relpath, ref=None):
     """기준 커밋의 파일 내용(계측기 자기검증용). 레포가 아니거나 실패면 None.
 
@@ -915,7 +925,7 @@ def h_detect_5():
     need(D.detect(inside)["fire"], "문자 200 경계 미발화(바이트 슬라이스 회귀)")
     need(not D.detect(outside)["fire"], "감지창 밖 선언이 발화(창 미적용)")
     # 셸 슬라이스 제거 확인(정적) — 훅에 cut -c·bashism 슬라이스가 남아 있으면 회귀다
-    hook = _code_lines(_read(_hook("role-bootstrap.sh")))
+    hook = _code_lines(_read(_hook(ROLE_BODY)))
     need("cut -c" not in hook, "훅에 `cut -c` 바이트 슬라이스가 남았다(G25 미수리)")
     need(not re.search(r"\$\{[A-Za-z_][A-Za-z0-9_]*:\d+:", hook), "훅에 bashism 슬라이스가 남았다")
     need("tr '\\n' ' '" not in hook, "훅에 개행 평탄화가 남았다(창 판정이 두 곳에 존재)")
@@ -1040,7 +1050,7 @@ def h_detect_8():
     # 계측 타당성: 프리루드에 데드라인 실행기가 존재하고 훅이 그것으로 감싼다
     need("cys_timeout_run()" in _read(os.path.join(HOOKS_DIR, "_lib.sh")),
          "프리루드에 데드라인 실행기(cys_timeout_run)가 없다")
-    need("cys_timeout_run" in _read(_hook("role-bootstrap.sh")),
+    need("cys_timeout_run" in _read(_hook(ROLE_BODY)),
          "훅이 surface-role 을 데드라인으로 감싸지 않는다")
     old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
     calib = "skip(no-git)"
@@ -1278,9 +1288,11 @@ def h_mission_1():
         #    판정 보류보다 나쁘다. T1 블록의 '임무 대장 미기록' fail-closed 와도 정합).
         #    주입문은 '선언 아님'과 '판정 불가'를 융합하지 않고 미발화를 명시해야 한다.
         #    훅을 팩 밖으로 복사해 형제 해소(../bin)를 끊고, 감지기만 팩에 심어 감지는 살린다.
-        cur = _read(_hook("role-bootstrap.sh"))
-        curhook = os.path.join(tmp, "curhook-nomission", "role-bootstrap.sh")
-        _w(curhook, cur)
+        # ★A2 분할 이후: 팩 밖 사본은 **런처와 본체를 함께** 복사해야 돈다(런처 단독이면
+        #   '부트 본체 부재' 고지에서 끝나 이 검체가 재려는 경로에 도달하지 못한다).
+        curhook = os.path.join(tmp, "curhook-nomission", ROLE_HOOK)
+        _w(curhook, _read(_hook(ROLE_HOOK)))
+        _w(os.path.join(os.path.dirname(curhook), ROLE_BODY), _read(_hook(ROLE_BODY)))
         _w(os.path.join(os.path.dirname(curhook), "_lib.sh"),
            _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
         env3, _h3, pack3, _b3, _s3 = _rb_sandbox(os.path.join(tmp, "c"), mission=None)
@@ -1854,7 +1866,7 @@ def h_ident_1():
                  "BOOT_GATES=0 토큰 생략 · rc 계약 불변 · 경계 회귀 핀 존치")
 
     # ── L2 훅: 조상 체인이 온전한 시점(spawn 이전)의 선행 claim + env 판정 전달 ──
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     need("cys claim-role master" in hook,
          "훅이 선행 claim 을 하지 않는다 — 분리된 부트가 claim 하면 언제나 신원 미해석이다")
     need("export CYS_CLAIM_RC=" in hook, "훅이 claim 판정을 부트에 넘기지 않는다(env 계약 부재)")
@@ -5336,7 +5348,7 @@ def h_pred_5():
     need(not uncovered, "발권 role 이 소비처에서 미해소(B10): %r" % uncovered)
     # ③ 셸 훅 case 전수(G2/A3): session-start 는 전체 role 문자열을 받는다
     ss = _read(_hook("session-start.sh"))
-    rb = _read(_hook("role-bootstrap.sh"))
+    rb = _read(_hook(ROLE_BODY))
     need("reviewer-gemini" in ss or "reviewer-*" in ss or "reviewer*" in ss,
          "session-start role case 가 리뷰어 전체 이름을 커버하지 않는다(G2)")
     need("master|\"\"" in rb.replace(" ", "") or 'master|"")' in rb,
@@ -6126,7 +6138,7 @@ def h_time_2():
     import javis_budget as BU
     notes = []
     # ⓐ 훅 안내가 파생값을 주입한다(하드코딩 '120s' grep 0)
-    rb = _read(_hook("role-bootstrap.sh"))
+    rb = _read(_hook(ROLE_BODY))
     need("javis_budget.py\" --note-check-window" in rb or "--note-check-window" in rb,
          "훅 안내가 예산 파생값을 주입하지 않는다")
     need("생존확인(최대 120s)" not in rb, "훅 안내에 하드코딩 120s 잔존")
@@ -6371,7 +6383,7 @@ def h_doc_1():
     달랐다. 계약을 §0-A 단일 표로 모으고 나머지는 **포인터**로 만든 뒤, 그 정합을 기계로 못박는다.
     P3-A-TEMPLATE: 훅 없는 기계의 폴백 절차("스크립트 1회")가 보존돼야 한다 — 산문 체인 금지."""
     md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     notes = []
     # ① §0-A 조건부 단일 계약이 존재하고 두 분기를 명시하는가
     need("0-A" in md and "실행 주체 단일 계약" in md, "§0-A 단일 계약 절이 없다(A10 미착지)")
@@ -6477,7 +6489,7 @@ def h_doc_2():
     ★금지 방향 ②: 숫자를 맞추려고 `REQUIRED_ROLES` 에 master 를 넣으면 check 의 required 가 master 를
       요구하게 되고, 레거시 master 조합에서 **부트 전체가 사망**한다. master 는 안내에서만 +1 이다."""
     orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     # ① 파생 소스가 존재하고 master 는 required 밖이다
     need("def team_roster_note(" in orch, "팀 구성 안내 파생 함수 부재(리터럴 잔존 위험)")
     r = _run([PY, os.path.join(BIN_DIR, "javis_orchestra.py"), "--note-team-roster"])
@@ -6767,7 +6779,7 @@ def h_doc_11():
     1회·측정불능 금지를 **자기 문장으로** 서술한다(§0-A 는 정본 참조로만 남는다). 이 검체가
     그 자기완결성을 박제한다 — 포인터로 되돌아가면 배달 결손이 다시 침묵한다."""
     ss = _code_lines(_read(_hook("session-start.sh")))
-    rb = _code_lines(_read(_hook("role-bootstrap.sh")))
+    rb = _code_lines(_read(_hook(ROLE_BODY)))
     notes = []
     # ① 두 훅 모두 '1회'와 '재실행 금지' 양 분기를 자기 문장으로 갖는다(포인터만이면 실패).
     for rel, body in (("session-start.sh", ss), ("role-bootstrap.sh", rb)):
@@ -6897,7 +6909,7 @@ def h_doc_8():
          "정직 등재가 미적용의 **기제**(토큰 미상속·프런트도어 좌석 도출 실패)를 명시하지 "
          "않는다 — 결론만 있고 근거가 없으면 다음 수정자가 검증 없이 지운다")
     # ⑤ 진입점 전수: 훅·산문도 같은 체인을 가리킨다(산문이 개별 명령 재현을 지시하지 않는다)
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     need("javis_bootstrap.py" in hook, "훅이 체인을 발화하지 않는다")
     md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
     need("javis_bootstrap.py" in md and ("수동 재현 금지" in md or "산문 체인" in md),
@@ -10837,7 +10849,7 @@ def _u22_violations(cli, daemon, sh):
 def h_hook_decide_1():
     cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
         raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
     need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
@@ -10893,7 +10905,7 @@ def h_hook_decide_1():
 def h_hook_decide_2():
     cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
         raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
     # ① contract_version 3중 일치
@@ -10956,7 +10968,7 @@ def h_hook_decide_2():
           "U-22 구 경로 판정기 동적 시험 — 합성 표본 3종 참 · 음성대조 6종 거짓(스큐로 결함 삼킴 방지)",
           ["R2"])
 def h_hook_decide_3():
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
     m = re.search(r"^_cys_hook_legacy_unavailable\(\)\s*\{.*?^\}", sh, re.S | re.M)
     need(m, "_cys_hook_legacy_unavailable 정의를 추출하지 못했다 — 판정기 부재")
@@ -11185,7 +11197,7 @@ def h_boot_intent_1():
         notes.append("claim rc6: frontdoor 미시도·폴백 spawn 1·정직 예보 보존")
 
     # ── 소스 핀(판독기 동형 3층 · R3-P2-3) — 훅은 팩에 항상 실재한다 ──
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     for tk in ("enqueued", "error", "legacy"):
         need(re.search(r'^\s*"\[cys-hook\] boot-intent: %s"[|)]' % tk, hook, re.M),
              "훅이 boot-intent 토큰 %r 를 **줄 단위 정확 일치**로 읽지 않는다(A3=B7 계열 위조 "

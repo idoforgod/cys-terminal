@@ -34,6 +34,10 @@ import time
 
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # cysjavis-pack/bin
 HOOK = os.path.join(os.path.dirname(BIN), "hooks", "role-bootstrap.sh")
+# ★부트 v2 A2(2026-09-04): 훅이 **런처(HOOK) + 본체(HOOK_BODY)** 로 갈렸다. 실행 진입점은
+#   여전히 HOOK 이고, note 블록·가드 변수 같은 **내용 핀은 본체**에 있다. 팩 밖 사본을 만들어
+#   실행하는 하네스는 **두 파일을 함께** 복사해야 한다(런처 단독이면 '본체 부재' 고지로 끝난다).
+HOOK_BODY = os.path.join(os.path.dirname(HOOK), "role-bootstrap-legacy.sh")
 sys.path.insert(0, BIN)
 import javis_detect  # noqa: E402  (형제 모듈 — 감지기 단일 소유)
 
@@ -351,7 +355,7 @@ def note_cp949_survival(fails):
          잃고(UnicodeEncodeError 동반) 그래야만 이 계측기가 무언가를 재고 있는 것이다.
     ※발화 조건은 관측만 한다(앵커 ①폭주 — 이 핀은 순수 '출력 생존' 계약이다).
     """
-    with open(HOOK, encoding="utf-8") as f:
+    with open(HOOK_BODY, encoding="utf-8") as f:      # note 블록·가드 변수는 본체에 산다
         hook_src = f.read()
 
     # ① 배선 정합(정적) — ★P2 개정: frontdoor note 블록 신설로 5→6(R3-P2-7 ⓒ · 약화 아님,
@@ -405,9 +409,11 @@ def note_cp949_survival(fails):
     if "_s.reconfigure" in mut_src:
         fails.append("W-F2 음성 대조 무효: 변형본에 재구성 가드 잔존(뮤테이션 미적중)")
         return
-    mut_hook = os.path.join(mut_hooks, "role-bootstrap.sh")
-    with open(mut_hook, "w", encoding="utf-8") as f:
+    # 변조 대상은 **본체**이고, 실행 진입점으로는 무변조 런처를 함께 둔다(A2 분할).
+    with open(os.path.join(mut_hooks, "role-bootstrap-legacy.sh"), "w", encoding="utf-8") as f:
         f.write(mut_src)
+    mut_hook = os.path.join(mut_hooks, "role-bootstrap.sh")
+    shutil.copy(HOOK, mut_hook)
     shutil.copy(os.path.join(os.path.dirname(HOOK), "_lib.sh"), os.path.join(mut_hooks, "_lib.sh"))
     try:
         os.symlink(BIN, os.path.join(mut_root, "bin"))
@@ -577,6 +583,7 @@ def _run_hook_mission_mock(fails, name, mission_py, prompt="너는 마스터다"
     hooks = os.path.join(root, "hooks")
     os.makedirs(hooks)
     shutil.copy(HOOK, os.path.join(hooks, "role-bootstrap.sh"))
+    shutil.copy(HOOK_BODY, os.path.join(hooks, "role-bootstrap-legacy.sh"))
     shutil.copy(os.path.join(os.path.dirname(HOOK), "_lib.sh"), os.path.join(hooks, "_lib.sh"))
     binf = os.path.join(root, "bin")
     os.makedirs(binf)
