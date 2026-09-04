@@ -142,6 +142,40 @@ done
 - **exit 판독**: 0=완료(또는 부서 단독 각성) · 7=이 surface는 master 아님(인계) ·
   10=세션 컨텍스트 오류(‘남이 master’ 아님 — 세션 배선 확인) · 11=다른 런이 부트 중(정상 skip·
   실패 아님) · 그 외 비0=단계 실패(출력의 단계·원인을 그대로 보고, 자연어 재추론 금지).
+- **exit 판독의 주체 구분 (부트 v2 · 추가 — 위 줄은 지우지 않는다)**: 바로 위 exit 값
+  (0·7·10·11)은 **`javis_bootstrap.py` 의 exit 공간**이다. 부트 v2 는 주체가 셋으로 갈리므로
+  값을 한 표에 뭉치지 마라 — **같은 숫자가 주체마다 다른 사실**을 뜻하고, 뭉치는 순간 처방이
+  뒤집힌다.
+  - `javis_bootstrap.py`(현행 폴백 경로) — 0·3·4·5·6·7·8·9·10·11·64. **13·14·15 를 내지
+    않는다**(코드 상수 실측) — 이 셋을 이 주체에 적으면 유령 계약이다.
+  - `javis_orchestra.py check` — 0 READY · 1 미달(부재·관문보류·**역할 주소 미해소**) ·
+    **2 측정불가(보존 — 통과도 실패도 아니다)** · **12 ack_pending**(4종 생존은 충족인데 리뷰어
+    각성 ACK 미확인) · 64. **12 의 소비자 매핑**: `review-prompt`·`round-init` 는 **자기 exit 12
+    로 차단**(리뷰 의뢰문을 내지 않는다) · ⑤check 단계는 **0 으로 접고 라벨만** 붙인다(부트
+    완주는 막지 않는다) · `gate-status` 는 **무접촉**. 되돌리는 손잡이는 `CYS_BOOT_GATES=0`.
+  - `cys boot-run`(부트 v2 러너) — 0 completed · 7 declined · 9 resource_hard ·
+    10 session_error · 11 skipped_inflight · **13 aborted** · **14 completed_degraded** ·
+    **15 crashed** · 그 외 미지 값은 `crashed{reason=exit:<n>}` 로 접는다.
+    ★**현행 빌드에 `cys boot-run` 서브커맨드는 아직 없다**(실측 2026-09-04) — 착지 전까지
+    13/14/15 를 boot-last 에서 찾지 마라.
+- **terminal 대수 (부트 v2 §3-2 · 인텐트 1건 → terminal 정확히 1개)**: 러너·감독자가 인텐트를
+  닫는 방식은 아래 11종이 **전부**다. 표에 없는 값이 오면 지어내 해석하지 말고 **측정 불능**으로
+  다뤄 오너에 보고하라. ★현행 폴백 경로(`javis_bootstrap.py`)의 boot-last 에는 `terminal`
+  필드가 **없다** — 없으면 위 exit 판독 줄로 읽고, 이 표를 있는 것처럼 인용하지 마라.
+
+| terminal.kind | 뜻(발생) | reason | 네가 할 일(처방) |
+|---|---|---|---|
+| `completed` | ⑤check READY — 정상 완주 | — | 없음 |
+| `completed_degraded` | READY 이나 리뷰어 각성 ACK 미확인 | `ack_pending` | 막히는 것은 **리뷰 게이트뿐**이다 — `javis_orchestra.py boot-reviewers` 또는 `javis_boot_node.py --role <역할> --agent <에이전트>` 로 그 좌석만 재각성 |
+| `declined` | claim 정당거부(rc 7) — 살아있는 master 가 이미 있다 | `master_held_elsewhere` | 기존 master 에 인계하고 정지 |
+| `session_error` | claim 컨텍스트 오류(rc 10) | `surface_missing` / `daemon_unreachable` | 위 boot-last `retry_eligible` 규약을 따른다(값이 없거나 측정 불능이면 **재실행 금지**) |
+| `aborted` | 실행 전제가 깨져 중단 | `master_gone` / `busy_other_executor` / `resource_hard`(rc 9) / `lease_fenced` / `version_incompatible` | reason 별 처방 — `resource_hard` 는 자원 정리 후 재선언 · `lease_fenced` 는 **무조치**(새 러너가 소유) |
+| `crashed` | 러너 예외 · 미지 exit | traceback 요약 / `exit:<n>` | 감독자 재개를 기다린다(손으로 재실행하지 마라 — 시도 합산 상한) |
+| `superseded` | 같은 좌석에 진행 중 인텐트가 있어 이 선언은 **실행 0** | `by:<id>` | 진행 중 인텐트를 참조 — **재선언하지 마라** |
+| `expired` | 감독자 수명(30분) 만료 | `expired` | 다시 선언한다 |
+| `attempts_exhausted` | 감독자 스폰 예산(3회) 소진 | `attempts_exhausted` | 재선언 전에 boot-last 진단부터 읽는다 |
+| `skipped_inflight` | 락 패자(rc 11) — **정상** | `inflight` | 없음(실패 아님) |
+| `state_unreadable` | 인텐트·상태 JSON 손상 | `parse_error` | 파일을 **격리**(삭제 아님)한 뒤 재선언 |
 
 ### 0-B. 단계 명세 (javis_bootstrap.py가 집행 — 손으로 재현하지 마라)
 ⓪ **결정론 프리플라이트 (생략 금지·최우선)**:
