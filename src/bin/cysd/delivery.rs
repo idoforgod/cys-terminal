@@ -367,6 +367,15 @@ fn socket_is_base(sock: &str) -> bool {
     //   그래야 python 과 공유하는 소켓→lane_key 매트릭스 fixture 가 기계마다 같은 답을 낸다.
     //   하위호환: 진짜 기본 소켓은 여전히 base(기존 `delivery-base.jsonl` 유효) ·
     //   `cys-dept-`·`/tmp/whatever.sock` 은 종전대로 비-base. **바뀌는 것은 누출 경로 하나뿐이다.**
+    //
+    //   ★**알려진 한계**(숨기지 않는다 · master 조건 ① 2026-09-04): 부모 **이름**만 보므로
+    //   `<임의>/cys/cys.sock`(기본 트리를 다른 곳에 그대로 미러한 경로 · 예 `/tmp/cys/cys.sock`)
+    //   은 **여전히 base 로 접힌다**. 절대경로를 플랫폼 기본 경로와 통째로 비교하면 막을 수
+    //   있으나 그러면 판정이 **기계(홈 경로)에 의존**해 공유 fixture 가 기계마다 다른 답을 내고
+    //   2언어 파리티가 깨진다 — 기계 독립을 택하고 한계를 명시한다.
+    //   그런 형태로 격리할 때는 **`CYS_STATE_DIR` 를 함께 지정**해야 안전하다(상태 파일이 그
+    //   디렉터리 안에만 생긴다 — W-A 실기동 실측). 이 한계는 fixture 에 `known_limitation` 으로
+    //   고정돼 있고, 가시화(경고 이벤트)는 master 조건 ② 의 별건이다.
     let mut it = norm.rsplit('/');
     let last = it.next().unwrap_or("");
     if last != "cys" && last != "cys.sock" {
@@ -1232,6 +1241,17 @@ pub(crate) mod tests {
         // ⑥ 기계 독립 — 이 판정은 **경로 모양**만 본다(실제 홈·존재 여부 무관).
         //    그래야 python 과 공유하는 소켓→lane_key 매트릭스가 기계마다 같은 답을 낸다.
         assert!(socket_is_base("/nonexistent/machine/.local/state/cys/cys.sock"));
+
+        // ⑦ ★**알려진 한계를 검체로 고정한다**(master 조건 ①) — 숨기거나 '없는 셈' 치지 않는다.
+        //    기본 트리를 다른 곳에 미러한 `<임의>/cys/cys.sock` 은 **여전히 base 로 접힌다.**
+        //    이 단언이 깨지면(즉 누군가 절대경로 비교로 바꿔 막으면) 기계 의존이 생겼다는 뜻이니
+        //    공유 fixture 부터 다시 보라 — 그때는 이 핀을 **의도적으로** 갱신해야 한다.
+        for mirrored in ["/tmp/cys/cys.sock", "/var/tmp/mirror/cys/cys.sock"] {
+            assert!(
+                socket_is_base(mirrored),
+                "알려진 한계가 조용히 바뀌었다 — 절대경로 비교로 막았다면 기계 의존이 생긴 것이다: {mirrored}"
+            );
+        }
     }
 
     /// (env 를 건드리지 않으므로 병렬 러너에서 다른 테스트와 간섭하지 않는다 — 그것이 채택 이유다.)
