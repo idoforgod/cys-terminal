@@ -7909,6 +7909,27 @@ fn fetch_surfaces() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 번들 안 npm 으로 전역 설치해 앱 봉인이 깨진 사용자를 위한 복구 1문장.
+///
+/// ★왜 매크로(리터럴 조각)인가: `install_hint_for` 는 `&'static str` 을 돌려주므로 런타임
+///   포맷이 불가하다. 그런데 이 문장은 **두 곳 이상**에서 같아야 한다 — 힌트와
+///   `WINDOWS_AGENT_PATH_HINT`, 그리고 팩 preflight C80(런타임 봉인)의 처방까지.
+///   두 곳이 다른 말을 하면 사용자는 어느 쪽을 믿을지 모른다. `concat!` 은 리터럴만 받으므로
+///   조각을 매크로로 두어 **단일 출처**를 만든다(핀: `npm_hints_share_one_recovery_sentence`).
+///
+/// ★사실 관계: 번들 node 의 npm 은 기본 전역 prefix 가 **node 설치 루트(=번들 안)** 라,
+///   제품이 안내하는 `npm i -g` 를 그대로 따르면 패키지가 앱 번들 안에 설치되어 코드서명
+///   봉인이 깨진다. 2026-09-04 실측으로 오너 머신이 정확히 그 상태였다
+///   (`codesign --verify` → file added 11줄 · 전부 `@openai/codex`). 그래서 이 안내가
+///   설치 위치를 명시하고, 이미 당한 사용자에게 복구 경로를 준다.
+macro_rules! bundle_npm_recovery {
+    () => {
+        "이미 번들 안 npm 으로 설치해 앱 봉인이 깨졌다면 그 패키지를 번들 밖으로 옮긴 뒤 앱을 \
+재설치하십시오 — 설치기가 앱을 통째로 교체하므로 봉인이 자연 복원됩니다(부분 삭제는 권장하지 \
+않습니다 · 진단은 `cys doctor`)"
+    };
+}
+
 /// 플랫폼별 설치 힌트(G29·B8) — 의무 CLI 미설치는 exit 0 성공이 아니라 typed `missing` outcome 이다.
 /// OS 를 인자로 받는 순수형이 정본이다(lib.rs `bundled_git_bash_path_for` 와 동일 이유 —
 /// 회귀 핀이 다른 플랫폼 CI 에서도 Windows 분기를 실제로 밟게 하기 위해서다 · MF-1 핀).
@@ -7921,7 +7942,10 @@ fn install_hint_for(agent: &str, os: &str) -> &'static str {
                 "`curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭"
             }
         }
-        "codex" => "`npm i -g @openai/codex` (선택 리뷰어)",
+        "codex" => concat!(
+            "`npm i -g @openai/codex` (선택 리뷰어) — 사용자 공간(npm_config_prefix 기본값)에 ",
+            "설치됩니다. ", bundle_npm_recovery!()
+        ),
         "gemini" => "Antigravity CLI `agy` 설치 후 agents.json 의 cmd 경로 확인 (선택 리뷰어)",
         "grok" => "grok CLI 설치 (선택 리뷰어 — 미설치면 건너뜀이 정상)",
         _ => "해당 CLI 설치 후 agents.json 의 cmd 를 확인 (선택 노드)",
@@ -7936,8 +7960,11 @@ fn install_hint(agent: &str) -> &'static str {
 /// B8: agents.json 의 cmd 가 Windows 실설치 경로와 어긋날 때의 안내 — 후보 전탐색까지 빈손일 때만.
 /// (비 Windows 빌드에서는 `full_miss_hint` 회귀 핀만 참조한다 — cfg 게이트 대신 핀 가시성.)
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_AGENT_PATH_HINT: &str = "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 \
-(agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex)";
+const WINDOWS_AGENT_PATH_HINT: &str = concat!(
+    "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 ",
+    "(agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex). ",
+    "전역 설치는 사용자 공간(npm_config_prefix 기본값)에 놓입니다. ", bundle_npm_recovery!()
+);
 
 /// B8 전탐색 빈손 시의 **최종 hint 판정**(순수 · OS 무관 컴파일 = 회귀 핀 대상).
 ///
@@ -17410,6 +17437,38 @@ mod tests {
         for os in ["macos", "linux"] {
             assert_eq!(full_miss_hint("claude", os), install_hint_for("claude", os));
             assert_eq!(full_miss_hint("gemini", os), install_hint_for("gemini", os));
+        }
+    }
+
+    /// ★C1-6(부트 v2 · 2026-09-04) — npm 형 설치 안내 2곳이 **같은 복구 문장**을 갖는지.
+    ///
+    /// 왜: 제품이 `npm i -g` 를 안내하는데 번들 node 의 기본 전역 prefix 가 번들 안이라,
+    /// 그 안내를 따른 사용자의 앱 봉인이 실제로 깨졌다(2026-09-04 오너 머신 실측 —
+    /// `codesign --verify` file added 11줄이 전부 @openai/codex). 안내가 설치 위치를 말하지
+    /// 않으면 같은 사고가 반복되고, 두 안내가 서로 다른 복구를 말하면 사용자는 어느 쪽을
+    /// 믿을지 모른다. 문장 하나를 매크로로 공유하는 구조 자체를 여기서 못박는다.
+    #[test]
+    fn npm_hints_share_one_recovery_sentence() {
+        let codex = install_hint_for("codex", "macos");
+        // ⓐ 설치 위치를 명시한다 — "어디에 깔리는가"를 말하지 않는 안내가 사고의 원인이었다.
+        assert!(codex.contains("사용자 공간"), "codex 힌트가 설치 위치를 말하지 않는다: {codex}");
+        assert!(codex.contains("npm_config_prefix"), "prefix 기준을 명시해야 한다: {codex}");
+        // ⓑ 이미 당한 사용자의 복구 경로가 있다.
+        assert!(codex.contains(bundle_npm_recovery!()), "codex 힌트에 복구 문장이 없다: {codex}");
+        // ⓒ 두 안내가 **같은 문장**을 쓴다(복사본 드리프트 차단).
+        assert!(
+            WINDOWS_AGENT_PATH_HINT.contains(bundle_npm_recovery!()),
+            "Windows 경로수정 힌트가 다른 복구 문장을 쓴다 — 두 안내가 갈리면 사용자가 헷갈린다"
+        );
+        // ⓓ 복구 문장은 '통째 교체' 를 말한다(부분 삭제 유도 금지 — preflight C80 처방과 동형).
+        assert!(bundle_npm_recovery!().contains("통째로 교체"));
+        assert!(bundle_npm_recovery!().contains("cys doctor"));
+        // ⓔ 의무 CLI claude 는 npm 형이 아니므로 이 문장이 섞이면 안 된다(MF-1 계급 오염 방지).
+        for os in ["macos", "windows", "linux"] {
+            assert!(
+                !install_hint_for("claude", os).contains(bundle_npm_recovery!()),
+                "claude 힌트에 npm 복구 문장이 섞였다({os}) — 네이티브 설치기와 무관하다"
+            );
         }
     }
 
