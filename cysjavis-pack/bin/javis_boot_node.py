@@ -231,13 +231,32 @@ def cys_status():
         return None
 
 
+def cys_list_probe():
+    """**(ok, rows)** — `cys list` 의 **명령 성공 여부**와 파싱된 행을 분리해 돌려준다.
+
+    ★왜 갈라야 하는가(R2 codex #1 blocking): `cys_list_rows()` 는 rc≠0 에도 `[]` 를 낸다.
+      그래서 소비자는 **"재지 못했다"(rc≠0)** 와 **"재 보니 비어 있다"(rc 0 · 행 0)** 를 구분할
+      수 없었다. 주소 게이트가 그 둘을 모두 '미측정'으로 접는 바람에, 좌석 레지스트리가 통째로
+      비어 있어도 `check` 가 READY/0 을 냈다 — 게이트가 가장 크게 발화해야 할 상태에서 침묵했다.
+      두 사실은 **계급이 다르다**: 전자는 판정 유보(고지 후 통과), 후자는 결손(차단)이다.
+      이 파일이 exit 2(판정 불가)를 실패와 가르는 것과 **같은 계급 구분**이다.
+    `cys_list_rows()` 는 이 함수의 얇은 래퍼로 남는다 — 기존 소비자 계약(항상 list)은 불변이다."""
+    rc, out, _ = run(["cys", "list"], timeout=12)
+    if rc != 0:
+        return False, []
+    return True, _parse_cys_list(out)
+
+
 def cys_list_rows():
     """cys list 의 모든 행을 {surface_ref, role, pid, exited} 로 파싱.
-    ★key=value 컬럼을 위치가정 없이 전부 훑는다(codex R1 논쟁점: 컬럼순서 변동 견고화)."""
-    rc, out, _ = run(["cys", "list"], timeout=12)
+    ★key=value 컬럼을 위치가정 없이 전부 훑는다(codex R1 논쟁점: 컬럼순서 변동 견고화).
+    ★계약 불변: **실패도 `[]`** 다. 실패와 빈 결과를 갈라야 하면 `cys_list_probe()` 를 써라."""
+    return cys_list_probe()[1]
+
+
+def _parse_cys_list(out):
+    """`cys list` stdout → 행 목록(순수 파싱 · 부작용 0). 표를 두 벌로 읽지 않기 위한 단일 지점."""
     rows = []
-    if rc != 0:
-        return rows
     for ln in out.splitlines():
         cols = ln.split("\t")
         if not cols or not cols[0].strip().startswith("surface:"):

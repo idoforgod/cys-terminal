@@ -899,15 +899,25 @@ def addr_registry_roles():
       순간이 정확히 "좌석은 살아 있는데 주소가 없다"이며 이 게이트가 잡아야 할 상태다.
     ★파서를 새로 쓰지 않고 `javis_boot_node.cys_list_rows` 를 소비한다 — 같은 표를 두 벌로 읽으면
       그 사본이 곧 다음 드리프트다(이 파일이 반복해서 경계하는 형상).
-    반환 None = **미측정**(공유 모듈 소비 불가·cys 부재·rc≠0·행 0) — 미측정은 실패가 아니다."""
+    ★**성공한 빈 결과 ≠ 측정 실패**(R2 codex #1 blocking). 종전 구현은 `cys_list_rows()` 의
+      `[]` 하나로 두 사실을 받았다 — 그 함수는 rc≠0 에도 `[]` 를 내므로 "레지스트리가 비었다"와
+      "재지 못했다"가 **구분 불가**였고, 보수적으로 둘 다 미측정으로 접었다. 그 결과 **주소
+      레지스트리가 통째로 비어 있어도 check 가 READY/0** 을 냈다 — 이 게이트가 가장 크게
+      발화해야 할 상태(전 좌석 주소 소실)에서 정확히 침묵한 것이다. 성공했는데 행이 0 이면
+      그것은 **측정된 빈 집합**이고, satisfied 인 요건은 전부 주소 미해소가 맞다.
+    반환: `None` = **미측정**(공유 모듈 소비 불가 · 구 팩 스큐 · `cys list` rc≠0) ·
+          `set()` = **측정된 빈 레지스트리**(결손 — 전원 addr_unresolved) · 그 밖 = 역할 집합."""
     bn = _boot_node()
     if bn is None:
         return None
+    probe = getattr(bn, "cys_list_probe", None)
+    if probe is None:                 # 구 팩(분리 이전 boot_node) — 가를 수 없으면 미측정이 옳다
+        return None
     try:
-        rows = bn.cys_list_rows()
+        ok, rows = probe()
     except Exception:
         return None
-    if not rows:                      # rc≠0 도 [] 를 낸다 — 구분 불가라 보수적으로 미측정
+    if not ok:                        # ★명령 실패만 미측정이다(빈 결과는 아래로 내려간다)
         return None
     return {r.get("role") for r in rows if r.get("role") and r.get("exited") is False}
 
@@ -3428,6 +3438,18 @@ def cmd_self_test(args):
             assert _rc_aj == CHECK_EXIT_MISSING and _apl["exit"] == CHECK_EXIT_MISSING \
                 and _apl["why"] and "addr_unresolved" in _apl["why"], \
                 "`--json` 이 주소 미해소를 기계 판독 가능하게 싣지 않는다: %r" % (_apl.get("why"),)
+            # ★★성공한 **빈 레지스트리**는 미측정이 아니라 결손이다(R2 codex #1 blocking).
+            #   `cys list` 가 rc 0 인데 행이 0 이면 그것은 "재 보니 아무 주소도 없다"이고,
+            #   satisfied 인 요건은 **전부** 주소 미해소다. 종전엔 이 상태가 None(미측정)으로
+            #   접혀 전 좌석 주소가 소실돼도 exit 0 이 나갔다 — 게이트의 최대 발화 지점에서의 침묵.
+            globals()["addr_registry_roles"] = lambda: set()
+            _eb = io.StringIO()
+            with contextlib.redirect_stdout(_eb):
+                _rc_empty = cmd_check(_CkBare())
+            assert _rc_empty == CHECK_EXIT_MISSING, \
+                "성공한 빈 레지스트리를 미측정으로 접었다(전원 주소 미해소여야 한다): %s" % _rc_empty
+            assert "레지스트리 미측정" not in _eb.getvalue(), \
+                "측정된 빈 집합을 '미측정'으로 고지했다 — 두 사실이 다시 붙었다: %r" % _eb.getvalue()[-200:]
             # 미측정(None)은 초록으로도 적색으로도 접지 않는다 — exit 는 종전대로 0.
             globals()["addr_registry_roles"] = lambda: None
             _nb = io.StringIO()

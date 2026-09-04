@@ -52,9 +52,13 @@ case "$1" in
   agent-detect) cat "$FAKE_CYS_DETECT"; exit 0 ;;
   list)
     # ★역할 **주소 레지스트리**(surface.list) — `status`(프로세스 표)와 **다른 자료원**이다.
-    #   파일이 없으면 아무것도 내지 않는다 = 레지스트리 미측정(게이트 불참).
-    if [ -n "${FAKE_CYS_LIST:-}" ] && [ -f "$FAKE_CYS_LIST" ]; then cat "$FAKE_CYS_LIST"; fi
-    exit 0 ;;
+    # ★★두 실패 갈래를 **rc 로 가른다**(R2 codex #1 blocking). 종전 이 스텁은 파일이 없어도
+    #   rc 0 + 무출력을 냈다 — 즉 "재지 못했다"와 "재 보니 비었다"를 **스텁 자신이 이미 섞고
+    #   있었고**, 그래서 검체는 소비자의 접힘을 드러낼 수 없었다.
+    #     · 파일 미지정/부재 → **rc 1 = 측정 실패**(미측정 · 게이트 불참)
+    #     · 빈 파일        → **rc 0 · 행 0 = 측정된 빈 레지스트리**(결손 · 전원 미해소)
+    if [ -n "${FAKE_CYS_LIST:-}" ] && [ -f "$FAKE_CYS_LIST" ]; then cat "$FAKE_CYS_LIST"; exit 0; fi
+    exit 1 ;;
   ping) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -308,15 +312,45 @@ try:
           and "addr_unresolved" in (plj.get("why") or "")
           and plj["ready_missing"] == ["reviewer-gemini"],
           repr((rj.returncode, plj.get("why"), plj.get("ready_missing"))))
-    r = run(["check"], base)                                  # FAKE_CYS_LIST 없음 = 미측정
-    check("ADDR-E2E-5 레지스트리 미측정은 결손이 아니다(exit 0 + 고지)",
+    r = run(["check"], base)                                  # `cys list` rc≠0 = 측정 실패
+    check("ADDR-E2E-5 레지스트리 **측정 실패**는 결손이 아니다(exit 0 + 고지)",
           r.returncode == 0 and "레지스트리 미측정" in r.stdout,
           repr((r.returncode, r.stdout[-200:])))
+
+    # ── ★음성 대조 2종(R2 codex #1 blocking) — 성공한 빈 결과 ≠ 측정 실패 ──────────────
+    #   종전 구현은 `cys_list_rows()` 의 `[]` 하나로 두 사실을 받았다(그 함수는 rc≠0 에도 []).
+    #   그래서 **좌석 레지스트리가 통째로 비어도 check 가 READY/0** 을 냈다 — 게이트가 가장
+    #   크게 발화해야 할 상태에서 정확히 침묵했다. 아래 두 케이스가 그 접힘의 유일한 탐지기다.
+    empty = os.path.join(root, "list-empty.txt")
+    io.open(empty, "w", encoding="utf-8", newline="\n").write("")   # rc 0 · 행 0
+    env_empty = dict(base)
+    env_empty["FAKE_CYS_LIST"] = empty
+    write_status(st, {"surfaces": surfaces()})                # 좌석 4종은 **전부 살아 있다**
+    r = run(["check"], env_empty)
+    check("ADDR-NEG-1 성공한 **빈 레지스트리**는 결손이다(전원 주소 미해소 → exit 1)",
+          r.returncode == 1, repr((r.returncode, r.stdout[-260:])))
+    check("ADDR-NEG-2 빈 레지스트리를 '미측정'으로 고지하지 않는다(두 사실 분리)",
+          "레지스트리 미측정" not in r.stdout and "주소 미해소" in r.stdout,
+          repr(r.stdout[-260:]))
+    rj = run(["check", "--json"], env_empty)
+    plj = json.loads(rj.stdout.strip().splitlines()[-1])
+    check("ADDR-NEG-3 빈 레지스트리에서 satisfied 요건이 **전부** 미해소로 실린다",
+          rj.returncode == 1 and "addr_unresolved" in (plj.get("why") or "")
+          and set(plj["ready_missing"]) == {"cso", "worker",
+                                            "reviewer-gemini", "reviewer-codex"},
+          repr((rj.returncode, plj.get("ready_missing"), plj.get("why"))))
+    # 대조군: **같은 스텁**에서 rc≠0(파일 미지정)만 다르면 판정이 뒤집힌다 = rc 가 실제로 축이다
+    check("ADDR-NEG-4 계측 타당성 — 같은 좌석·같은 스텁에서 rc 만 갈라도 판정이 갈린다",
+          run(["check"], base).returncode == 0 and run(["check"], env_empty).returncode == 1,
+          "rc 를 안 보면 두 케이스가 같은 값을 낸다(종전 결함의 형상)")
     _src_a = io.open(ORC, encoding="utf-8").read()
     check("ADDR-E2E-6 소스 핀: 주소 판정이 생존 판정과 **같은 자료원**으로 되돌아가지 않았다",
-          "def addr_registry_roles(" in _src_a and "cys_list_rows" in _src_a
+          "def addr_registry_roles(" in _src_a and "cys_list_probe" in _src_a
           and "live_role_names(status or {})" not in _src_a,
           "같은 집합을 재검사하면 게이트가 다시 공허해진다")
+    check("ADDR-E2E-7 소스 핀: 성공/실패를 rows 로 되돌려 판정하지 않는다(접힘 회귀 차단)",
+          "if not ok:" in _src_a and "if not rows:" not in _src_a,
+          "rows 의 진위로 미측정을 판정하면 빈 레지스트리가 다시 초록이 된다")
 
     # ─────────── ⑩-b 순수 함수 축(입력 = 레지스트리 집합) ───────────
     V = {"cso": {"satisfied": True, "filler": "cso", "why": "x"},
