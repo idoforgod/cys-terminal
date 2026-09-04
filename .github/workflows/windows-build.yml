@@ -373,7 +373,22 @@ jobs:
             $deadline=(Get-Date).AddSeconds(40)
             while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(Bx $cys @('read-screen','--to','worker') 15000).Out; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
             if (-not $envProof) { Write-Host "== stub screen =="; Write-Host $scr }
-            Rec 3 $envProof "env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 오너 실기 마커)"
+            # ★판별자(2026-09-05 · W-C 요청 · IG-23): 실패가 어느 계급인지를 **annotation 에**
+            #   싣는다. 종전엔 화면을 stdout 에만 덤프해 로그를 내려받아야 보였고, 그러면 간헐
+            #   (스텁이 늦게 뜸)과 진짜 회귀(주입값이 틀림)가 요약에서 구별되지 않는다.
+            #   ★이 행은 크리티컬이 아니라 스텝을 붉히지 않는다 — 그래서 더더욱 판독 가능해야
+            #     한다(도는데 아무도 안 보는 행이 되지 않게).
+            $why = ''
+            if (-not $envProof) {
+              if ([string]::IsNullOrWhiteSpace($scr)) {
+                $why = ' — 스텁 화면이 비었다(에이전트 미기동 의심 · launch-agent 90s + 폴링 40s 타이밍 축)'
+              } elseif ($scr -match 'CCDFRESH=\S*') {
+                $why = ' — 주입은 됐으나 값이 기대와 다르다: ' + $Matches[0]
+              } else {
+                $why = ' — 화면에 CCDFRESH= 자체가 없다(send/send-key 미도달 또는 셸 미기동)'
+              }
+            }
+            Rec 3 $envProof ("env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 오너 실기 마커)" + $why)
           } catch { Rec 3 $false "$_" }
 
           # ── T3-7/T3-10: 부서 스폰·로그(RC-5/6/15·단일부서·전부 바운드) ──
@@ -672,15 +687,21 @@ jobs:
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
+          # ★annotation 승격(2026-09-05 · W-C 요청 · IG-23): 이 스텝은 실패 시 annotation 에
+          #   exit code 1 한 줄만 남아 **어느 단언이 깨졌는지 판독 불가**였다. T4-14/15 는 잠금·
+          #   배타 핸들이라 타이밍 민감 축이고 IG-9 를 재는 자리라, 행 단위로 좁혀지지 않으면
+          #   비싸다. throw 를 Die 로 바꿔 사유를 요약에 올린다 — Write-Host 후 throw 이므로
+          #   실패는 그대로 유지된다(스텝은 여전히 붉다).
+          function Die($m){ Write-Host ("::error title=T4-14::" + $m); throw $m }
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T4-14: 설치된 cysd.exe 미발견" }
+          if (-not $inst) { Die "T4-14: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "T4-14: setup.exe 미발견" }
+          if (-not $setup) { Die "T4-14: setup.exe 미발견" }
           # 기대 버전 = 빌드 SOT(루트 Cargo.toml [package].version — cys --version 의 CARGO_PKG_VERSION 원천)
           $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if (-not $expVer) { throw "T4-14: Cargo.toml 버전 파싱 실패" }
+          if (-not $expVer) { Die "T4-14: Cargo.toml 버전 파싱 실패" }
           # ① 구버전 스탠드인: 다른 VERSIONINFO 를 가진 자기완결 PE(cmd.exe 사본)를 정식 자리에 —
           #    오라클(CYS_ORACLE)이 notfresh 로 판정해 스왑 기계가 실제로 돈다(단락 아님).
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -691,14 +712,14 @@ jobs:
           # ② 실행 = 진짜 이미지 잠금(덮어쓰기·삭제 거부 / rename 허용) — 실사고의 잠금 계급
           $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
           Start-Sleep 2
-          if ($lock.HasExited) { throw "T4-14: 스탠드인 잠금 프로세스 기동 실패" }
+          if ($lock.HasExited) { Die "T4-14: 스탠드인 잠금 프로세스 기동 실패" }
           # ③ 잠긴 채 무인 업그레이드 — 성공(exit 0)해야 한다
           $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
           $exitOk = ($ri.ExitCode -eq 0)
           # ④ 정식 = 신본 바이트 + 실행 출력이 신버전. ★바이트 대조를 먼저 한다 — 스왑 실패로
           #    정식이 아직 cmd 스탠드인이면 `--version` 인자가 대화형 cmd 를 띄워 스텝이 hang 한다.
           $srcCys = (Get-ChildItem 'src-tauri/binaries/cys-*.exe' | Select-Object -First 1)
-          if (-not $srcCys) { throw "T4-14: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
+          if (-not $srcCys) { Die "T4-14: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
           $shaOk = (Get-FileHash -Algorithm SHA256 -LiteralPath $cys).Hash -eq (Get-FileHash -Algorithm SHA256 -LiteralPath $srcCys.FullName).Hash
           $vOut = ''
           if ($shaOk) { $vOut = (& $cys --version) -join ' ' }
@@ -716,7 +737,7 @@ jobs:
           Start-Sleep 1
           Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "T4-14: 이미지 잠금 업그레이드 회귀 실패 — 2026-08-28 실사고 계열(잠긴 구 CLI 위로 신본 미반영 또는 성공 위장)" }
+          if (-not $ok) { Die "T4-14: 이미지 잠금 업그레이드 회귀 실패 — 2026-08-28 실사고 계열(잠긴 구 CLI 위로 신본 미반영 또는 성공 위장)" }
           Write-Host "OK: T4-14 — 잠긴 구 CLI 위로 업그레이드 성공 + 신버전 반영 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
@@ -740,13 +761,19 @@ jobs:
         shell: pwsh
         timeout-minutes: 10
         run: |
+          # ★annotation 승격(2026-09-05 · W-C 요청 · IG-23): 이 스텝은 실패 시 annotation 에
+          #   exit code 1 한 줄만 남아 **어느 단언이 깨졌는지 판독 불가**였다. T4-14/15 는 잠금·
+          #   배타 핸들이라 타이밍 민감 축이고 IG-9 를 재는 자리라, 행 단위로 좁혀지지 않으면
+          #   비싸다. throw 를 Die 로 바꿔 사유를 요약에 올린다 — Write-Host 후 throw 이므로
+          #   실패는 그대로 유지된다(스텝은 여전히 붉다).
+          function Die($m){ Write-Host ("::error title=T4-15::" + $m); throw $m }
           $ErrorActionPreference = 'Stop'
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
-          if (-not $inst) { throw "T4-15: 설치된 cysd.exe 미발견" }
+          if (-not $inst) { Die "T4-15: 설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'; $cysd = Join-Path $dir 'cysd.exe'
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "T4-15: setup.exe 미발견" }
+          if (-not $setup) { Die "T4-15: setup.exe 미발견" }
           $expVer = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           function ShaOf($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash }
           # ① 사전 정돈 + 구버전 스탠드인 2종 배치(cmd 사본 = 다른 VERSIONINFO → 오라클 notfresh)
@@ -758,7 +785,7 @@ jobs:
           $oldSha = ShaOf "$env:SystemRoot\System32\cmd.exe"
           $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
           Start-Sleep 2
-          if ($lock.HasExited) { throw "T4-15: 스탠드인 잠금 프로세스 기동 실패" }
+          if ($lock.HasExited) { Die "T4-15: 스탠드인 잠금 프로세스 기동 실패" }
           # ② cysd 에 거부 계급 핸들: FileShare **Read** = 쓰기(템플릿 truncate-write)와
           #    rename(DELETE 접근) 은 거부하되 읽기(오라클 FileOpen/GetDLLVersion)는 허용 —
           #    AV·백업·인덱서가 쥐는 전형이자 P6("배타 핸들 ⇒ exit 4")이 뜻하는 그 계급이다.
@@ -789,7 +816,7 @@ jobs:
             $noNew = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
             $ok1 = $exit4 -and $hasMark -and $l1Ok -and $unrecEmpty -and $rbEmpty -and $nuOk -and $prOk -and $cysOld -and $cysdOld -and $lockAlive -and $noNew
             Write-Host ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new정리={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
-            if (-not $ok1) { throw "T4-15a: 거부 계약 위반 — P6(배타 핸들 ⇒ exit 4 + 구본 무손상) 또는 §3 토큰 스키마 회귀" }
+            if (-not $ok1) { Die "T4-15a: 거부 계약 위반 — P6(배타 핸들 ⇒ exit 4 + 구본 무손상) 또는 §3 토큰 스키마 회귀" }
           } finally {
             $fs.Close()
           }
@@ -810,7 +837,7 @@ jobs:
           Start-Sleep 1
           Get-ChildItem (Join-Path $dir '*') -File -Include 'cys.prev*.exe','cysd.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (-not $ok2) { throw "T4-15b: 재실행 치유 실패 — 계약 안내문('run this installer again')이 거짓" }
+          if (-not $ok2) { Die "T4-15b: 재실행 치유 실패 — 계약 안내문('run this installer again')이 거짓" }
           Write-Host "OK: T4-15 — 배타 핸들 거부(exit 4 + 4토큰 + 구본 무손상 + 무사망) 및 재실행 치유 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
