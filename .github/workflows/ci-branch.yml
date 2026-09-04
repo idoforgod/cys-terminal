@@ -600,11 +600,44 @@ jobs:
       #   `--skip hwmon::` 선례 패턴(가상 러너 하드웨어 의존 모듈 명시 스킵)을 그대로 적용하라.
       #   CYS_PACK_DIR 임시 격리는 이 파일 다른 스텝들과 같은 근거 — 러너 실팩·홈 의존 차단.
       # 예산: 콜드 수 분·캐시 히트 시 단축(위 Rust cache 스텝이 그 근거).
+      # ★판독 배선(W-C 실증 · 2026-09-05 · 22% 간헐 재발): 이 스텝은 실패해도 annotation 에
+      #   exit code 한 줄만 남아 **무엇이 깨졌는지 판독 불가**였다. W-C 가 16e0d602 실패를
+      #   3연속 성공을 보고 '일과성' 으로 내렸다가 d9e65e4 에서 재발해 판정을 정정했다
+      #   (이력 2/9 ≈ 22% · 간헐 22%면 3연속 성공 확률이 약 0.47 이라 우연히도 흔하다).
+      #   재발했는데 여전히 판독 불가면 다음 라운드도 같은 자리에 선다 — 그래서 배선을 세운다.
+      #   ★셋 중 ③이 이 축에 결정적이다(W-C 설계): **exit 101 은 러스트 패닉 코드**라 개별
+      #   테스트 실패가 아니라 **하네스 자체 패닉**일 수 있고, 그러면 '실패한 테스트 이름' 만
+      #   올리는 배선은 목록이 비어 "실패한 테스트가 없으니 이상 없음" 으로 읽힌다. rc≠0 인데
+      #   failed==0 인 조합을 **측정 실패**라는 별도 계급으로 못 박는다 — 이 저장소의 규율
+      #   그대로다: 측정 불능은 통과가 아니다.
+      #   ★파이프로 받지 않는다(`| tee` 금지) — 파이프 뒤 `$?` 는 마지막 명령의 것이라 적색을
+      #   통과로 오독한다. 파일로 받고 rc 를 직독한 뒤 원문을 그대로 출력한다.
       - name: cargo test --bin cys (릴리스 승격 전 리허설 · macOS)
         shell: bash
         run: |
-          set -euo pipefail
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
+          set -uo pipefail
+          LOG="$(mktemp)"
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1 > "$LOG" 2>&1
+          rc=$?
+          cat "$LOG"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          summary="$(grep -E '^test result:' "$LOG" | tail -1)"
+          passed="$(printf '%s' "$summary" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)"
+          failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || true)"
+          names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | tr '\n' ' ')"
+          panic="$(grep -m1 'panicked at' "$LOG" || true)"
+          if [ -z "$summary" ]; then
+            echo "::error title=cys-rehearsal 측정 실패::rc=$rc 인데 'test result' 요약이 없다 — 컴파일 실패이거나 하네스가 요약을 내기 전에 죽었다. 실패한 테스트가 없다는 뜻이 아니다"
+          elif [ "${failed:-0}" -eq 0 ]; then
+            echo "::error title=cys-rehearsal 측정 실패::rc=$rc 인데 failed=0 이다(passed=${passed:-?}). 개별 테스트 실패가 아니라 하네스 자체 이상이다(101=러스트 패닉). '실패한 테스트 없음' 을 '이상 없음' 으로 읽지 마라"
+          else
+            echo "::error title=cys-rehearsal 테스트 실패::failed=$failed passed=${passed:-?} rc=$rc — $names"
+          fi
+          if [ -n "$panic" ]; then
+            echo "::error title=cys-rehearsal 패닉 문면::$panic"
+          fi
+          echo "::notice title=cys-rehearsal 요약::${summary:-(요약 없음)}"
+          exit "$rc"
 
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
       #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한
