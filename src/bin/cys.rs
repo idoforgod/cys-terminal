@@ -741,7 +741,18 @@ enum Command {
 #[derive(Subcommand)]
 enum HookEvent {
     /// UserPromptSubmit 훅(`hooks/role-bootstrap.sh`)의 role 게이트 위임.
-    UserPromptSubmit,
+    UserPromptSubmit {
+        /// ★(B2-b · 명세 §2-2) 훅 이벤트 JSON 파일. 주면 좌석 판정 **뒤에** 프롬프트 축
+        /// (층0·층0-c·층2 기계 유래 · T1-8 ack)까지 이 1왕복에서 처리하고 **exit 6 HANDLED**
+        /// 로 런처에 "더 할 일 없음"을 알린다. 주지 않으면 **종전과 완전히 같다**(rc0 proceed
+        /// 불변) — 구 런처·구 설정이 그대로 돈다.
+        ///
+        /// ★stdin 이 아니라 파일인 이유: 런처가 stdin 을 이미 읽어 버렸을 수 있고(레거시 본체가
+        /// `$1` 파일을 받는 구조로 이관됐다 · A2), 훅은 1왕복 안에 끝나야 해서 재판독 가능한
+        /// 자료원이 필요하다.
+        #[arg(long, value_name = "FILE")]
+        input: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -10787,6 +10798,81 @@ const HOOK_EXIT_SUPPRESS: i32 = 3;
 const HOOK_EXIT_UNDECIDED: i32 = 4;
 /// 위임이 성립하지 않는다(롤백 스위치 · 소켓 부재) — 셸이 종전 게이트 수행.
 const HOOK_EXIT_LEGACY: i32 = 5;
+
+/// ★(v2.1 개정 A1) 훅이 **처리를 끝냈다** — 런처는 더 할 일이 없으니 종료한다
+/// (런처 규칙 `6|3) 종료 ;; *) legacy`).
+///
+/// 왜 rc0 를 재사용하지 않았는가(W-A 질의 ① · 음성 대조로 재현): rc0 는 이미 **proceed**
+/// (= 셸이 자기 게이트를 계속 수행한다)라서, 처리완료를 rc0 로 실으면 런처가 "계속 진행"으로
+/// 읽고 **아무 일도 일어나지 않은 채 조용히 죽는다**(무음 사망). 처리완료와 진행지시는 다른
+/// 사실이므로 다른 코드를 준다.
+///
+/// ★구 CLI 스큐: `--input` 을 모르는 구 `cys` 는 clap 이 **rc2**(사용 오류)로 죽는다. 런처의
+/// `*) legacy` 가 그것을 종전 경로로 접으므로 신 런처 × 구 CLI 조합이 안전하다(rc2 핀 참조).
+const HOOK_EXIT_HANDLED: i32 = 6;
+
+/// UserPromptSubmit 훅 이벤트 JSON(§2-2 a). 훅이 주는 키 중 **이 축이 쓰는 것만** 받는다.
+#[derive(serde::Deserialize)]
+struct HookInput {
+    #[serde(default)]
+    prompt: String,
+}
+
+/// `--input` 파일 판독(§2-2 a · T1-2). 실패는 사유 문자열로 돌려준다.
+///
+/// ★BOM: `serde_json` 은 선두 U+FEFF 를 **문법 오류로 거부**한다. Windows 도구가 UTF-8 BOM 을
+/// 붙여 쓰는 일은 흔하고, 그때 훅이 통째로 죽으면 오너 프롬프트가 게이트를 못 지난다 —
+/// 그래서 BOM 은 판독 단계에서 벗긴다.
+/// ★CRLF: JSON 문법에서 `\r` 은 공백이라 무해하다(별도 처리 불요). 이 함수가 CRLF 를
+/// **건드리지 않는 것**이 정답이며, 문자열 값 안의 `\r` 을 지우면 프롬프트가 변형된다.
+fn read_hook_input(path: &std::path::Path) -> Result<HookInput, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("판독 실패({e}): {}", path.display()))?;
+    let text = String::from_utf8_lossy(&raw);
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    serde_json::from_str::<HookInput>(text).map_err(|e| format!("JSON 형식 오류({e})"))
+}
+
+/// T1-8 — Claude 결정론 ACK. env `CYS_BOOT_NONCE` 가 있고 **그 논스가 프롬프트에 실려 있으면**
+/// 주입된 디렉티브가 실제로 도착했다는 뜻이므로 그 자리에서 데몬에 ack 를 신고한다.
+///
+/// ★왜 session-start 가 아니라 여기인가: session-start 는 **주입 전**(세션 시작 시)에 돌아
+/// arm 전 ack 가 되어 무시된다(T1-8 결함). 주입된 디렉티브는 UserPromptSubmit 으로 도착하므로
+/// 이 자리가 "주입 직후·arm 직후"이며 결정론이다.
+/// ★왜 논스 포함을 확인하는가: env 만 보고 ack 하면 **아무 프롬프트나** ack 가 된다.
+fn hook_ack_boot_nonce(socket: &std::path::Path, prompt: &str) -> Option<String> {
+    let nonce = std::env::var(cys::ENV_BOOT_NONCE).ok().filter(|n| !n.is_empty())?;
+    if !prompt.contains(&nonce) {
+        return None;
+    }
+    // ★메서드명은 `status.set` 이다. 명세 §2-8 이 적은 `surface.set_status` 는 이 저장소에
+    //   **존재하지 않는다**(실측: 그 이름의 아크 0건). 명세 문자열을 그대로 옮겼다면 이 ack 는
+    //   영원히 method_not_found 로 죽으면서 아래 Err 가지가 그것을 삼켜 **조용히 아무 일도
+    //   안 하는 소비자**가 됐을 것이다 — codex 가 npm 축에서 두 번 잡은 그 결함 계급이다.
+    let sid = match target_surface(&None, &None) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("ack 좌석 해석 실패({e}) — 판정 무영향")),
+    };
+    // `ack` 는 **additive 형제 키**다. 구 데몬(및 B5 이전 현 데몬)은 모르는 키를 무시하므로
+    // 스큐 안전이고, B5 가 저장 모델을 붙이면 그 순간부터 실제로 기록된다.
+    let r = request_on_timeout(
+        socket,
+        HOOK_ACK_METHOD,
+        json!({"surface_id": sid, "ack": {"nonce": nonce, "source": "hook"}}),
+        std::time::Duration::from_millis(HOOK_DECIDE_DEADLINE_MS),
+    );
+    match r {
+        Ok(_) => Some("ack 신고(source=hook)".to_string()),
+        // ack 실패가 게이트 판정을 바꾸면 안 된다 — 사유만 남긴다.
+        Err(e) => Some(format!("ack 신고 실패({e}) — 판정 무영향")),
+    }
+}
+
+/// T1-8 ack 가 쓰는 RPC — `cys set-status` 와 **같은 메서드**여야 한다.
+///
+/// 상수로 뽑는 이유: 이름을 문자열로 흩뿌리면 오타·명세 오인이 조용히 통과한다(실제로 명세의
+/// `surface.set_status` 를 그대로 옮겼다가 잡았다). 검체가 이 상수와 `Command::SetStatus` 의
+/// 호출부를 **같이** 대조한다.
+const HOOK_ACK_METHOD: &str = "status.set";
 /// `hook.decide` **페이로드** 계약 버전. 전송 프로토콜(`wire::PROTO_PV`)은 무접촉이다 —
 /// 이 메서드의 응답 형상만 버전한다. cysd 측 상수와 **같은 값**이어야 하고 그 정합은
 /// 검체 H-HOOK-DECIDE-2 가 3중(cys.rs · handlers.rs · role-bootstrap.sh)으로 기계 대조한다.
@@ -10805,7 +10891,7 @@ fn run_hook(event: HookEvent) -> i32 {
     //   가용성은 잃지 않는다 — **새 경로만** 봉인한다.
     std::env::set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON);
     match event {
-        HookEvent::UserPromptSubmit => run_hook_user_prompt_submit(),
+        HookEvent::UserPromptSubmit { input } => run_hook_user_prompt_submit(input.as_deref()),
     }
 }
 
@@ -10813,7 +10899,7 @@ fn run_hook(event: HookEvent) -> i32 {
 ///
 /// ★stdin 을 읽지 않는다. 훅 본체는 이 호출 **뒤에** `INPUT=$(cat)` 으로 hook JSON 을 먹으므로,
 /// 여기서 stdin 을 건드리면 프롬프트 판정이 무음 실패한다(셸 쪽도 `</dev/null` 로 이중 방어).
-fn run_hook_user_prompt_submit() -> i32 {
+fn run_hook_user_prompt_submit(input: Option<&std::path::Path>) -> i32 {
     // ★롤백 1지점(설계 U-22 롤백 = "항상 즉시 반환 · 데몬 미조회"). 새 판정 축은 **태어날 때**
     //   마스터 스위치에 접는다 — 사고 순간에 사람이 노브를 조합할 수는 없다(BLOCK-3 이 그 값을
     //   치렀다). `CYS_BOOT_GATES=0` 하나로 이 위임 전체가 무효가 되고 셸은 종전 게이트를 그대로
@@ -10889,11 +10975,16 @@ fn run_hook_user_prompt_submit() -> i32 {
     let reason = r["reason"].as_str().unwrap_or("");
     let role = r["role"].as_str().unwrap_or("");
     match r["verdict"].as_str().unwrap_or("") {
-        "proceed" => hook_verdict(
-            "proceed",
-            HOOK_EXIT_PROCEED,
-            &format!("role={role:?} · {reason} — 데몬 권위 판정"),
-        ),
+        // ★(B2-b) 좌석이 proceed 일 때만 프롬프트 축으로 넘어간다 — suppress/undecided 는
+        //   좌석 자체가 이 게이트의 주체가 아니라는 뜻이라 프롬프트를 볼 이유가 없다.
+        "proceed" => match input {
+            None => hook_verdict(
+                "proceed",
+                HOOK_EXIT_PROCEED,
+                &format!("role={role:?} · {reason} — 데몬 권위 판정"),
+            ),
+            Some(path) => hook_prompt_axis(&socket, path, role, reason),
+        },
         "suppress" => hook_verdict(
             "suppress",
             HOOK_EXIT_SUPPRESS,
@@ -10909,6 +11000,72 @@ fn run_hook_user_prompt_submit() -> i32 {
             "undecided",
             HOOK_EXIT_UNDECIDED,
             &format!("미지 verdict({other:?}) — 판정 불가로 처리"),
+        ),
+    }
+}
+
+/// ★(B2-b · 명세 §2-2 c·d + T1-8) 프롬프트 축 — 좌석이 proceed 인 뒤에만 온다.
+///
+/// 순서는 명세 그대로 **판정 → 기록**이며, 여기서 하는 것은 판정과 ack 둘이다:
+///   ① 파일 판독(§2-2 a · BOM/CRLF) — 실패는 `undecided`(4) 로 접는다. 프롬프트를 못 읽었으면
+///      기계 유래인지 **알 수 없고**, 모르는 채로 처리완료(6)를 내면 오너 프롬프트가 조용히
+///      사라진다(무음 사망).
+///   ② T1-8 ack — 판정보다 **먼저** 한다. 논스가 실려 왔다는 것은 디렉티브가 도착했다는 뜻이고,
+///      그 사실은 이 프롬프트가 기계 유래로 접히든 아니든 **똑같이 참**이다.
+///   ③ 층0(harness)·층0-c(기동 명령문)·층2(push 라벨) — 걸리면 **HANDLED(6)**.
+///
+/// ★★정직 고지 — **층1(배달 원장 대조)은 아직 이 CLI 에 배선되지 않았다.**
+/// 층1 은 원장 파일 경로를 알아야 하는데 그 규약의 소유자는 현재 `cysd::delivery::ledger_path`
+/// 하나이고(사본 금지 규율), `cys` 바이너리에서 부를 수 없다. 경로 규약을 여기 복사하면 두 벌이
+/// 되어 반드시 갈린다. 그래서 **복사하지 않고 비워 두었다.** 결과: 라벨 없는 기계 push 는 이
+/// 축에서 아직 접히지 않고 종전대로 rc0 로 나간다(= **현재 동작과 동일** · 회귀는 아니지만
+/// **게이트는 미완**이다). 해소는 둘 중 하나이며 master 판정 사항이다:
+///   ⓐ 경로 규약(`pack_state_dir`/`lane_key`/`ledger_path`)을 lib 로 이관해 두 바이너리가 공유
+///   ⓑ 판정을 데몬 RPC 로 물어본다(데몬이 이미 원장 소유자다)
+fn hook_prompt_axis(
+    socket: &std::path::Path,
+    path: &std::path::Path,
+    role: &str,
+    seat_reason: &str,
+) -> i32 {
+    let inp = match read_hook_input(path) {
+        Ok(v) => v,
+        Err(why) => {
+            return hook_verdict(
+                "undecided",
+                HOOK_EXIT_UNDECIDED,
+                &format!("--input {why} — 프롬프트 판정 불가(셸 종전 게이트로 반환)"),
+            );
+        }
+    };
+    let ack = hook_ack_boot_nonce(socket, &inp.prompt);
+    let ack_note = ack.map(|a| format!(" · {a}")).unwrap_or_default();
+
+    // 층0 → 층0-c → 층2. 층1 은 위 고지 참조(미배선).
+    let machine = cys::mission_gate::harness_origin(&inp.prompt)
+        .map(|w| format!("층0 harness — {w}"))
+        .or_else(|| {
+            cys::mission_gate::boot_command_origin(&inp.prompt)
+                .map(|w| format!("층0-c 기동 명령문 — {w}"))
+        })
+        .or_else(|| {
+            cys::mission_gate::has_machine_label(&inp.prompt).then(|| {
+                format!(
+                    "층2 push 규약 라벨 선두({:?})",
+                    cys::mission_gate::label_head(&inp.prompt)
+                )
+            })
+        });
+    match machine {
+        Some(why) => hook_verdict(
+            "handled",
+            HOOK_EXIT_HANDLED,
+            &format!("기계 유래 — 임무 아님({why}){ack_note}"),
+        ),
+        None => hook_verdict(
+            "proceed",
+            HOOK_EXIT_PROCEED,
+            &format!("role={role:?} · {seat_reason} — 오너 프롬프트{ack_note}"),
         ),
     }
 }
@@ -16928,6 +17085,153 @@ mod tests {
         // 접두 판정 핀: 게이트 코드가 문자열 중간·유사 접두에 있어도 오분류하지 않는다.
         assert_eq!(queue_deliver_exit_code("paused_x: y"), 1, "유사 접두는 게이트 아님");
         assert_eq!(queue_deliver_exit_code("error: paused: nested"), 1, "중간 등장은 게이트 아님");
+    }
+
+    /// ★H-HOOK-IN-3(B2-b · 시뮬 T1-2): `--input` 파일 판독이 **BOM·CRLF 를 견딘다**.
+    ///
+    /// `serde_json` 은 선두 U+FEFF 를 문법 오류로 거부한다. Windows 도구가 UTF-8 BOM 을 붙여
+    /// 쓰는 일은 흔하고, 그때 훅이 통째로 죽으면 **오너 프롬프트가 게이트를 못 지난다**.
+    /// 반대로 CRLF 는 JSON 공백이라 건드리면 안 된다 — 값 **안**의 `\r` 을 지우면 프롬프트가
+    /// 변형되므로, 이 검체는 "BOM 은 벗기고 CRLF 는 보존한다"는 **양방향**을 잰다.
+    #[test]
+    fn hook_input_tolerates_bom_and_preserves_crlf() {
+        let td = std::env::temp_dir().join(format!("cys-hookin-{}", std::process::id()));
+        std::fs::create_dir_all(&td).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let f = td.join(name);
+            std::fs::write(&f, bytes).unwrap();
+            f
+        };
+        let body = r#"{"prompt":"릴리스 게이트를 통과시켜라","hook_event_name":"UserPromptSubmit"}"#;
+
+        // ① 평문.
+        let f = write("plain.json", body.as_bytes());
+        assert_eq!(
+            read_hook_input(&f).expect("평문 판독 실패").prompt,
+            "릴리스 게이트를 통과시켜라"
+        );
+
+        // ② UTF-8 BOM 선두 — 벗겨야 한다.
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(body.as_bytes());
+        let f = write("bom.json", &bom);
+        assert_eq!(
+            read_hook_input(&f).expect("BOM 파일이 거부됐다 — 훅이 죽는다").prompt,
+            "릴리스 게이트를 통과시켜라"
+        );
+
+        // ③ 구조적 CRLF(문법 공백) — 무해해야 한다.
+        let crlf = "{\r\n  \"prompt\": \"배포해라\"\r\n}";
+        let f = write("crlf.json", crlf.as_bytes());
+        assert_eq!(read_hook_input(&f).expect("CRLF 파일이 거부됐다").prompt, "배포해라");
+
+        // ④ 값 **안**의 CRLF 는 **보존**한다(프롬프트 변형 금지).
+        let f = write("inner.json", b"{\"prompt\":\"a\\r\\nb\"}");
+        assert_eq!(
+            read_hook_input(&f).expect("판독 실패").prompt,
+            "a\r\nb",
+            "프롬프트 값 안의 CRLF 가 지워졌다 — 훅이 오너 문장을 변형했다"
+        );
+
+        // ⑤ 판독 실패는 **오류로 드러난다**(조용히 빈 프롬프트로 접히지 않는다).
+        let f = write("broken.json", b"{oops");
+        assert!(read_hook_input(&f).is_err(), "깨진 JSON 이 정상 판독됐다");
+        assert!(
+            read_hook_input(&td.join("nope.json")).is_err(),
+            "없는 파일이 정상 판독됐다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-HOOK-EXIT-1(B2-b · 명세 v2.1 개정 A1): 훅 exit 대수의 **불변식**.
+    ///
+    /// 이 검체가 지키는 것 셋:
+    ///   ① `6 = HANDLED` 신설이고 기존 5종(0/1/3/4/5)의 값은 **한 글자도 안 바뀐다**
+    ///      (런처·레거시 본체가 그 값으로 분기한다 — 계약 추가-only).
+    ///   ② `HANDLED ≠ PROCEED` — 둘을 같은 값으로 두면 런처가 처리완료를 "계속 진행"으로 읽어
+    ///      **아무 일도 없이 조용히 죽는다**(W-A 질의 ① 무음 사망). 이것이 6 이 생긴 이유다.
+    ///   ③ **rc2 는 우리가 절대 내지 않는다** — 2 는 구 CLI 가 `--input` 을 몰라 clap 이 내는
+    ///      사용 오류 코드이고, 런처의 `*) legacy` 가 그것을 종전 경로로 접는다. 우리가 2 를
+    ///      쓰기 시작하면 "구 CLI 스큐"와 "신 CLI 판정"이 **구별 불가**가 된다.
+    #[test]
+    fn hook_exit_algebra_is_additive_and_reserves_rc2_for_old_cli_skew() {
+        assert_eq!(HOOK_EXIT_PROCEED, 0, "rc0 proceed 는 불변 계약이다");
+        assert_eq!(HOOK_EXIT_DAEMON_ERR, 1);
+        assert_eq!(HOOK_EXIT_SUPPRESS, 3);
+        assert_eq!(HOOK_EXIT_UNDECIDED, 4);
+        assert_eq!(HOOK_EXIT_LEGACY, 5);
+        assert_eq!(HOOK_EXIT_HANDLED, 6, "처리완료 = 6(v2.1 A1)");
+
+        let all = [
+            HOOK_EXIT_PROCEED,
+            HOOK_EXIT_DAEMON_ERR,
+            HOOK_EXIT_SUPPRESS,
+            HOOK_EXIT_UNDECIDED,
+            HOOK_EXIT_LEGACY,
+            HOOK_EXIT_HANDLED,
+        ];
+        assert_ne!(
+            HOOK_EXIT_HANDLED, HOOK_EXIT_PROCEED,
+            "처리완료와 진행지시가 같은 코드다 — 런처가 무음 사망한다"
+        );
+        assert!(
+            !all.contains(&2),
+            "훅이 rc2 를 쓴다 — 구 CLI 스큐(clap 사용 오류)와 구별 불가가 된다"
+        );
+        let mut uniq = all.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), all.len(), "훅 exit 코드가 겹친다: {all:?}");
+    }
+
+    /// ★H-HOOK-ACK-1(B2-b · T1-8): ack RPC 의 **메서드명이 실재한다**.
+    ///
+    /// 명세 §2-8 은 `surface.set_status` 라고 적었지만 이 저장소에 그 이름의 아크는 **0건**이다.
+    /// 그 문자열을 그대로 옮기면 ack 는 영원히 `method_not_found` 로 죽고, 실패를 삼키는 설계
+    /// (판정 무영향)가 그것을 감춰 **조용히 아무 일도 안 하는 소비자**가 된다 — codex 가 npm 축
+    /// 에서 두 번 잡은 결함 계급이다. 그래서 이름을 상수로 뽑고 **실재를 검체로 박는다**.
+    ///
+    /// ★이 검체는 "ack 가 기록된다"를 재지 않는다 — 저장 모델은 **B5** 소관이고 `ack` 키는
+    /// 그때까지 additive 로 무시된다. 여기서 재는 것은 "부르는 문이 실제로 있는가" 하나다.
+    #[test]
+    fn hook_ack_method_name_actually_exists_in_this_repo() {
+        assert_eq!(HOOK_ACK_METHOD, "status.set");
+        let src = include_str!("cys.rs");
+        // `cys set-status` 가 쓰는 것과 **같은 메서드**여야 한다(두 벌이면 한쪽만 산다).
+        assert!(
+            src.contains(&format!("\"{HOOK_ACK_METHOD}\",")),
+            "ack 메서드명이 이 파일의 실제 호출부에 없다 — 이름이 갈렸다"
+        );
+        // 명세가 적은 이름은 이 저장소에 없다. 되살아나면 ack 가 조용히 죽는다.
+        assert!(
+            !src.contains("\"surface.set_status\""),
+            "존재하지 않는 RPC 이름(surface.set_status)이 코드에 되살아났다 — ack 가 무음 실패한다"
+        );
+    }
+
+    /// ★H-HOOK-IN-4(B2-b): `--input` 이 **없으면 종전과 완전히 같다**(rc0 proceed 불변).
+    ///
+    /// clap 수준에서 `input` 이 **선택**임을 박는다 — 필수가 되는 순간 구 런처(`cys hook
+    /// user-prompt-submit` 단독 호출)가 전부 rc2 로 죽어 **모든 좌석이 legacy 로 떨어진다**.
+    #[test]
+    fn hook_input_is_optional_so_old_launchers_keep_working() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["cys", "hook", "user-prompt-submit"])
+            .expect("구 런처 호출형(--input 없음)이 거부됐다 — 전 좌석 legacy 낙하");
+        match c.command {
+            Command::Hook { event: HookEvent::UserPromptSubmit { input } } => {
+                assert!(input.is_none(), "--input 없이 값이 생겼다");
+            }
+            _ => panic!("hook user-prompt-submit 파싱 실패"),
+        }
+        let c = Cli::try_parse_from(["cys", "hook", "user-prompt-submit", "--input", "/tmp/x.json"])
+            .expect("--input 형이 거부됐다");
+        match c.command {
+            Command::Hook { event: HookEvent::UserPromptSubmit { input } } => {
+                assert_eq!(input.as_deref(), Some(std::path::Path::new("/tmp/x.json")));
+            }
+            _ => panic!("--input 파싱 실패"),
+        }
     }
 
     /// ★G3 축1 hooks-prune 게이트 exit 계약 핀 — base 팩 대상 + --allow-base 부재 = 7

@@ -48,6 +48,12 @@ pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
 /// 실어 나르기만 한다. `CYS_SURFACE_ID`(자기신고라 위조 가능·신뢰 안 함)와 달리 이 값은
 /// 데몬 발급 비밀의 **대조**라 자기신고가 아니다. 관측 채널(로그·stdout·surface.list) 등재 금지.
 pub const ENV_SEAT_TOKEN: &str = "CYS_SEAT_TOKEN";
+
+/// ★(B5 · 명세 §2-8 · T1-8) 부트 논스 — 데몬이 pane 스폰 시 PTY env 로만 배달하는 발급 비밀.
+/// 훅(`cys hook user-prompt-submit --input`)이 **이 값이 프롬프트에 실려 도착했는지**를 보고
+/// 그 자리에서 ack 를 신고한다. env 로만 오므로 프롬프트가 이 값을 담고 있다는 사실 자체가
+/// "데몬이 주입한 디렉티브가 실제로 이 세션에 도착했다"는 증거다.
+pub const ENV_BOOT_NONCE: &str = "CYS_BOOT_NONCE";
 pub const ENV_SURFACE_REF: &str = "CYS_SURFACE_REF";
 pub const ENV_ROLE: &str = "CYS_ROLE";
 
