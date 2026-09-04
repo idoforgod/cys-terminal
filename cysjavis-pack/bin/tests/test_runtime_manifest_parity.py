@@ -149,6 +149,33 @@ class ManifestSchemaParityTests(unittest.TestCase):
         self.assertIn('RUNTIME_MANIFEST: &str = "Resources/%s"' % name, rust,
                       "Rust 상수의 파일명이 생성기와 갈렸다 — 판독기가 파일을 못 찾는다")
 
+    # ── ⑤ 설치본 검체가 **방금 설치한 트리**를 보는가 (R1 codex #9) ───────
+    def test_windows_install_probe_is_pinned_to_the_installer_contract_path(self):
+        """LOCALAPPDATA 재귀 검색의 첫 cysd.exe 를 쓰면 잔존 설치를 검증할 수 있다 —
+        초록이 거짓이 되는 무증상 오검증이다. 매니페스트 실기 검증과 그 앞의 설치 스텝은
+        installer 계약 경로(%LOCALAPPDATA%\\cys · installMode=currentUser + productName=cys)와
+        버전 마커 동일성(cys-installed-version.txt == 이번 빌드)으로 고정돼야 한다."""
+        wb = os.path.join(REPO, ".github", "workflows", "windows-build.yml")
+        self.assertTrue(os.path.isfile(wb), "windows-build.yml 이 사라졌다")
+        src = read(wb)
+        i = src.find("- name: 자기완결 검증")
+        j = src.find("- name: PTY 스모크")
+        self.assertGreater(i, 0, "설치 스텝이 사라졌다 — 검체의 앵커가 없다")
+        self.assertGreater(j, i, "PTY 스모크가 설치 스텝 뒤에 없다 — 스텝 순서 회귀")
+        # 주석은 빼고 **실행되는 줄**만 센다 — 설명문에 이름이 적혀 있다고 배선은 아니다.
+        window = "\n".join(l for l in src[i:j].split("\n") if not l.lstrip().startswith("#"))
+        self.assertNotIn('Get-ChildItem "$env:LOCALAPPDATA" -Recurse', window,
+                         "설치본 검체가 재귀 검색으로 되돌아갔다 — 잔존 설치를 검증할 수 있다")
+        self.assertIn("Join-Path $env:LOCALAPPDATA 'cys'", window,
+                      "installer 계약 경로(%LOCALAPPDATA%\\cys)로 고정돼 있지 않다")
+        self.assertEqual(2, window.count("cys-installed-version.txt"),
+                         "두 스텝 모두 버전 마커로 동일성을 확인해야 한다(방금 설치한 트리인가)")
+        self.assertIn("CYS_INSTALL_DIR", window,
+                      "매니페스트 검증 스텝이 앞 스텝의 확정값을 받지 않는다 — 두 스텝이 다른 트리를 볼 수 있다")
+        # 마커 대조는 '있는지'가 아니라 '이번 빌드 버전과 같은지'여야 한다.
+        self.assertEqual(2, window.count("$markerVer -ne $expVer"),
+                         "마커 존재만 보고 값을 대조하지 않으면 잔존 설치를 걸러내지 못한다")
+
     def test_windows_lane_ships_the_manifest_as_a_bundle_resource(self):
         conf = os.path.join(REPO, "src-tauri", "tauri.windows.conf.json")
         self.assertTrue(os.path.isfile(conf))
