@@ -371,7 +371,8 @@ jobs:
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
-                   test_runtime_seal test_preflight_c80_runtime_seal; do
+                   test_runtime_seal test_preflight_c80_runtime_seal \
+                   test_runtime_manifest_parity; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -665,6 +666,15 @@ jobs:
           #     로그에서 재검한다. !error 는 makensis 를 이미 hard-fail 시키고 pipefail 이 그 종료코드를
           #     보존한다(1차 게이트) — grep 은 래퍼가 종료코드를 삼키는 회귀·가드의 경고 강등 회귀까지
           #     로그 층에서 잡는 2차 벨트다. 토큰은 계약 문서의 문자열 그대로(창작 금지).
+          # ── runtime-manifest 번들링 직전 자기대조 (부트 v2 §2-10 · 티켓 C1·D3) ──
+          # 잴 수 있는 것만 잰다: "**실을 매니페스트**가 **실을 트리**와 맞는가". prep 에서 뜬 뒤
+          # 여기까지 오는 사이에 트리를 건드린 스텝이 있으면 여기서 걸린다(무음 드리프트 차단).
+          # ★설치본 트리와의 대조는 여기서 못 한다 — setup.exe 안 레이아웃은 풀어봐야 알고,
+          #   그 실측은 windows-build.yml 의 **실제 무인 설치 후 대조** 스텝이 담당한다.
+          #   이 레인은 그보다 약한, 그러나 확실한 축만 맡는다(측정 못 하는 것을 측정한 척하지 않는다).
+          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py verify \
+            --root src-tauri/runtime --manifest src-tauri/resources/runtime-manifest.json \
+            --max-list 30 || { echo "::error::runtime-manifest 가 번들링 직전 트리와 불일치 — 발행 차단" >&2; exit 1; }
           bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --target "${{ matrix.target }}" --verbose 2>&1 | tee nsis-build.log
           if grep -E 'refusing to build a blind oracle|sidecar source not found at compile time|version resource regression' nsis-build.log; then
             echo "::error::NSIS 훅 빌드 가드 발화(위 매치 라인) — 오라클 전제가 깨진 설치기는 출하 금지(NSIS-CONTRACT.md §5)" >&2
@@ -894,7 +904,8 @@ jobs:
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
-                   test_runtime_seal test_preflight_c80_runtime_seal; do
+                   test_runtime_seal test_preflight_c80_runtime_seal \
+                   test_runtime_manifest_parity; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="
