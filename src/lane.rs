@@ -197,6 +197,25 @@ pub fn mission_path_in(dir: &Path, socket_path: &Path) -> PathBuf {
     }
 }
 
+/// 부트 결과 파일 경로 — python `lane_state_path("boot_last")` 미러.
+///
+/// `mission` 과 같은 접미 규약이다(`ALWAYS_LANE_SUFFIXED` **밖**): base 레인은 역사적 무접미
+/// `boot-last.json` 이고 비-base 레인만 `boot-last-<lane>.json` 이다. 훅 고지(§2-2 i)가 "이 레인의
+/// boot-last 를 보라"고 가리키는 그 경로이며, 접미를 틀리면 **없는 파일을 가리키는 안내**가 된다.
+pub fn boot_last_path_in(dir: &Path, socket_path: &Path) -> PathBuf {
+    let key = lane_key(socket_path);
+    if key == "base" {
+        dir.join("boot-last.json")
+    } else {
+        dir.join(format!("boot-last-{key}.json"))
+    }
+}
+
+/// [`boot_last_path_in`] + [`state_dir`] — 훅 고지가 싣는 생산 경로.
+pub fn boot_last_path(socket_path: &Path) -> PathBuf {
+    boot_last_path_in(&state_dir(), socket_path)
+}
+
 /// [`mission_path_in`] + [`state_dir`] — 훅 CLI 의 생산 경로.
 pub fn mission_path(socket_path: &Path) -> PathBuf {
     mission_path_in(&state_dir(), socket_path)
@@ -288,6 +307,15 @@ mod tests {
         assert_eq!(
             epoch_path_in(dir, custom),
             dir.join("delivery-tmp_whatever.sock.epoch.json")
+        );
+
+        // boot_last 도 mission 과 같은 접미 규약이다(python 실측: base=boot-last.json ·
+        // 비-base=boot-last-<lane>.json). 훅 고지가 이 경로를 안내하므로 틀리면 **없는 파일**을
+        // 가리킨다.
+        assert_eq!(boot_last_path_in(dir, base), dir.join("boot-last.json"));
+        assert_eq!(
+            boot_last_path_in(dir, custom),
+            dir.join("boot-last-tmp_whatever.sock.json")
         );
 
         // ★음성 대조: mission 에 항상-접미 규약을 잘못 적용하면 base 에서 이 단언이 깨진다.
