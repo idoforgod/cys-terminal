@@ -165,6 +165,13 @@ pub const RETRY_COOLDOWN_SECS: f64 = 30.0;
 
 /// 인텐트 수명(초). 이보다 오래된 것은 실행하지 않고 폐기한다 — 30분 전 프롬프트가 지금
 /// 팀을 기동시키는 것은 사용자가 기대한 인과가 아니다.
+///
+/// ★**이 상수는 두 계약을 진다**(A17 · master 판정 (d) · B3-3). 명세 §2-6 ⓒ 의 **절대 마감**도
+/// 이 값이 겸한다. 별도 마감 기구를 두지 않는 이유는 명세가 지목한 예산 leaf
+/// `bootstrap_chain_worst_s`(3020초)가 이 수명(1800초)보다 **길어** 원리적으로 발효할 수 없기
+/// 때문이다 — 그 기구를 만들면 태어날 때부터 죽은 코드다(측정되지 않는 코드는 있는 것보다
+/// 나쁘다). 따라서 여기서 수명을 늘리면 절대 마감도 함께 늘어난다. **모르고 늘리지 마라.**
+/// python 대응 `javis_budget.CYSD_SUPERVISOR_SOT["BOOT_INTENT_MAX_AGE_S"]` 에 같은 고지가 있다.
 pub const INTENT_MAX_AGE_SECS: f64 = 1800.0;
 
 /// 한 틱이 **본문을 읽어 판정하는** 스풀 엔트리 상한. 스풀이 홍수여도 틱 길이는 유계다.
@@ -630,6 +637,23 @@ pub fn decide(it: &BootIntent, attempts: u32, now: f64) -> Disposition {
 /// 지어내지 않는다**. 값의 소유자는 python 의 `BOOT_HB_STALL_S` 이고 예산 파리티가 대조한다.
 pub const HB_STALL_SECS: f64 = 90.0;
 
+/// (B3-3 · 명세 §2-6 ⓑ) 러너가 **같은 단계에 머물러 있는** 것으로 보는 한계.
+///
+/// ## 왜 126 인가 — 지어낸 숫자가 아니라 python 파생값의 사본이다
+/// 값의 소유자는 python `javis_budget.boot_node_outer_s()` 다(= `boot_node_inner_worst_s()` +
+/// 마진 · 실측 126). 한 노드가 자기 **outer 예산을 꽉 써도** fence 되면 안 되므로 그 축의 상한을
+/// 쓴다 — `BOOT_NODE_TOTAL_S`(90)나 inner(105)로 내리면 **경계에서 건강한 런을 자른다**. leaf 가
+/// 커지면 이 임계도 함께 커져야 하고, 그 드리프트는 예산 파리티 핀(H-TIME-1 ⓓ ·
+/// `RUST_PARITY_CONSTS["PROGRESS_STALL_SECS"]`)이 잡는다. W-A 가 이 상수보다 **먼저** 핀을
+/// 등재해 뒀으므로(선등재) 이 줄은 태어나는 순간부터 대조를 받는다 — 드리프트가 생길 창이 없다.
+///
+/// ## 정직 고지 — 이것은 T3-3 의 런타임 판독이 아니다
+/// 시뮬 T3-3 은 단계 예산 SOT 를 `cys budget --json` 으로 **런타임 판독**하라고 적는다. 그 판독의
+/// 주체는 §2-7 러너(B4)다. 감독자는 매 틱 도는 경로라 여기서 python 을 부르면 틱 길이가 외부
+/// 프로세스에 묶인다(유계 상실). 그래서 감독자는 컴파일 타임 상수를 쓰고, python 과의 정합은
+/// 위 파리티 핀이 지킨다 — 판독 위치는 다르되 **SOT 는 하나**다.
+pub const PROGRESS_STALL_SECS: f64 = 126.0;
+
 /// (R3 #7 · codex BLOCK · master 심판) **fence 무장 스위치 — 기본 꺼짐.**
 ///
 /// ## 왜 스위치가 필요한가
@@ -730,6 +754,35 @@ pub fn fence_verdict(run: &BootRunActive, now: f64) -> Option<&'static str> {
     }
     if now - run.hb > HB_STALL_SECS {
         return Some("hb_stall");
+    }
+    None
+}
+
+/// ★B3-3(§2-6 ⓑ) **진행 정체 판정 — 순수 함수**. [`fence_verdict`] **위에 독립으로 얹는 층**이다.
+///
+/// ## 왜 [`fence_verdict`] 안에 넣지 않았는가
+/// 그 함수의 설계는 R3 리뷰 verdict 가 날 때까지 **동결**돼 있다(master 지시). 두 축을 한 함수에
+/// 합치면 리뷰가 ⓐ 설계를 되돌릴 때 ⓑ 까지 함께 흔들리고, 반대로 ⓑ 를 고칠 때마다 동결된
+/// 코드를 건드리게 된다. 층을 나누면 공유하는 것은 호출부 한 줄(`or_else`)뿐이고 두 축은 서로를
+/// 모른다 — 어느 쪽이 바뀌어도 다른 쪽 검체는 그대로 유효하다.
+///
+/// ## 발효 조건은 ⓐ 와 **동형**이다 — 미보고 런은 자르지 않는다
+/// `progress_step` 이 비어 있으면 "**한 번도 단계를 보고하지 않았다**"는 뜻이고, 그때 '단계가
+/// 멎었다'와 '보고 배선이 아직 없다'는 **구별되지 않는다**. 구별 못 하는 신호로 파괴적 조치를
+/// 하면 건강한 부트를 다시 낳는다(이 저장소가 반복해서 맞은 계급이다).
+///
+/// 보고 주체는 §2-7 러너(B4)라 지금 프로덕션의 모든 런은 이 갈래에 있다 — 즉 이 판정은 배선돼
+/// 있으나 **사실상 미발효**다(그 위에 [`SupervisorState::fence_armed`] 봉인이 한 겹 더 있다).
+/// B4 가 단계를 보고하기 시작하면 **코드 변경 없이** 발효한다. 그때까지의 안전망은 인텐트
+/// 수명([`INTENT_MAX_AGE_SECS`])이다.
+///
+/// (ⓒ 절대 마감은 별도 기구를 두지 않는다 — A17 · [`INTENT_MAX_AGE_SECS`] 문서 참조.)
+pub fn progress_verdict(run: &BootRunActive, now: f64) -> Option<&'static str> {
+    if run.progress_step.is_empty() {
+        return None;
+    }
+    if now - run.progress_at > PROGRESS_STALL_SECS {
+        return Some("progress_stall");
     }
     None
 }
@@ -1794,7 +1847,14 @@ fn tick_in(
             let verdict = daemon.boot_run_active.lock().ok().and_then(|g| {
                 g.as_ref()
                     .filter(|r| r.intent == it.id && r.generation == it.generation)
-                    .and_then(|r| fence_verdict(r, now).map(|why| (why, r.pid)))
+                    // ★B3-3: ⓑ 진행 정체는 ⓐ hb 정지 **위에 독립으로** 얹는다(동결된
+                    //   `fence_verdict` 본문 무접촉). 먼저 잡히는 축이 사유가 되고, 둘 다
+                    //   침묵하면 fence 하지 않는다.
+                    .and_then(|r| {
+                        fence_verdict(r, now)
+                            .or_else(|| progress_verdict(r, now))
+                            .map(|why| (why, r.pid))
+                    })
             });
             if let Some((why, pid)) = verdict {
                 // ★B3-2R ③(codex③) **fence 자체가 CAS 다.** 스캔은 스냅샷이라, 그 사이 러너가
@@ -1959,6 +2019,10 @@ fn tick_in(
                         roles: Vec::new(),
                         hb: now,
                         progress_step: String::new(),
+                        // ★B3-3: 정체 기준 시각은 등록 시각에서 출발한다. 단계 이름이 비어
+                        //   있는 동안은 판정이 발효하지 않으므로(동형 게이트) 이 값은 B4 가
+                        //   첫 단계를 보고할 때 비로소 의미를 갖는다 — **둘은 함께 움직인다**.
+                        progress_at: now,
                         started: now,
                         pid: None,
                         epoch: st.epoch,
@@ -2915,6 +2979,7 @@ mod tests {
             roles: Vec::new(),
             hb,
             progress_step: String::new(),
+            progress_at: started,
             started,
             pid: None,
             epoch: 0,
@@ -2936,6 +3001,122 @@ mod tests {
             fence_verdict(&mk(200.0, 100.0), 200.0 + HB_STALL_SECS - 1.0),
             None,
             "신선한 런을 fence 했다 — 상한 경계가 어긋났다"
+        );
+    }
+
+    /// ★B3-3(§2-6 ⓑ) H-LEASE — 진행 정체 판정의 **세 갈래 + 축 분리**를 순수 함수 층에서 단언한다.
+    ///
+    /// ⓐ(hb)와 같은 이유로 ①이 가장 중요하다: **한 번도 단계를 보고하지 않은 런은 자르지
+    /// 않는다.** 보고 주체가 §2-7 러너(B4)라 지금은 프로덕션의 모든 런이 ①에 있다 — 이 축은
+    /// 배선돼 있으나 **미발효**이고, 그 미발효가 우연이 아니라 **의도**임을 이 검체가 못 박는다.
+    /// 없으면 다음 사람이 "왜 빈 단계는 안 자르지?" 하며 조건을 지우고, 그 순간 건강한 부트가
+    /// 126초마다 잘린다.
+    #[test]
+    fn progress_verdict_holds_back_until_the_runner_has_ever_stepped() {
+        let mk = |step: &str, progress_at: f64, hb: f64| BootRunActive {
+            intent: "i".into(),
+            generation: 1,
+            roles: Vec::new(),
+            hb,
+            progress_step: step.into(),
+            progress_at,
+            started: 100.0,
+            pid: None,
+            epoch: 0,
+        };
+        // ① 미보고(단계 이름 없음) — 아무리 오래 지나도 자르지 않는다.
+        assert_eq!(
+            progress_verdict(&mk("", 100.0, 100.0), 100.0 + PROGRESS_STALL_SECS * 100.0),
+            None,
+            "단계를 한 번도 보고하지 않은 런을 fence 했다 — 정체와 미배선을 구별하지 \
+             못한 채 자른 것이다"
+        );
+        // ② 보고 뒤 같은 단계에 머묾 — 상한을 넘기면 fence 한다.
+        assert_eq!(
+            progress_verdict(&mk("claim_role", 200.0, 200.0), 200.0 + PROGRESS_STALL_SECS + 1.0),
+            Some("progress_stall"),
+            "단계가 멎은 런을 fence 하지 않았다"
+        );
+        // ③ 경계 바로 안쪽 — 자르지 않는다. 한 노드가 **outer 예산을 꽉 써도** 건강하다.
+        assert_eq!(
+            progress_verdict(&mk("claim_role", 200.0, 200.0), 200.0 + PROGRESS_STALL_SECS - 1.0),
+            None,
+            "outer 예산 안에서 도는 런을 잘랐다 — 임계를 inner(105)나 TOTAL(90)로 내리면 \
+             생기는 회귀다"
+        );
+        // ④ **시뮬 T3-3 시나리오 6** — heartbeat 스레드는 살아 있고 본 단계만 멎었다.
+        //    ⓐ 는 침묵하고 ⓑ 만 잡는 자리다. 두 축을 한 함수에 합쳤다면 이 구별이 사라진다.
+        let now4 = 200.0 + PROGRESS_STALL_SECS + 1.0;
+        let alive_but_stuck = mk("claim_role", 200.0, now4);
+        assert_eq!(
+            fence_verdict(&alive_but_stuck, now4),
+            None,
+            "hb 가 방금 도착했는데 ⓐ 가 잘랐다 — 축이 섞였다"
+        );
+        assert_eq!(
+            progress_verdict(&alive_but_stuck, now4),
+            Some("progress_stall"),
+            "hb 만 살아 있고 단계가 멎은 런을 아무도 잡지 못했다 — T3-3 시나리오 6 재발"
+        );
+    }
+
+    /// ★B3-3 소스핀 — ⓑ 는 **호출부에서 합성**되고, `progress_step` 대입은 `progress_at` 과
+    /// 짝을 이루며, 상수 리터럴은 예산 파리티가 훑는 **형식**을 유지한다.
+    ///
+    /// 세 함정을 닫는다:
+    ///  ⓐ **합성 소실** — 순수 함수만 있고 호출부가 부르지 않으면 검체는 초록인데 프로덕션은
+    ///     아무것도 재지 않는다(공허 통과 · 이 세션이 이미 두 번 겪은 계급).
+    ///  ⓑ **짝 붕괴** — B4 가 `progress_step` 만 갱신하고 `progress_at` 을 두면 진행 중인 런이
+    ///     등록 시각 기준으로 **전부 정체로 보인다**(건강한 부트를 자른다).
+    ///  ⓒ **핀 공허화** — 예산 파리티(H-TIME-1 ⓓ)는 `const PROGRESS_STALL_SECS: f64 = <숫자>;`
+    ///     형태만 훑는다. 형식이 깨지면 정규식이 한 건도 못 잡아 python↔Rust 대조가 조용히
+    ///     사라진다(무측정). **값 자체는 python 이 소유하므로 여기 복제하지 않는다** — 형식만
+    ///     못 박는다.
+    #[test]
+    fn progress_axis_is_wired_at_the_call_site_and_moves_in_pairs() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        // ⓐ 합성 지점은 정확히 1곳.
+        assert_eq!(
+            prod.matches("or_else(|| progress_verdict(").count(),
+            1,
+            "ⓑ 합성 지점이 정확히 1곳이 아니다 — 0이면 순수 함수가 프로덕션에서 돌지 않고 \
+             (공허 통과), 2 이상이면 판정이 갈라진다"
+        );
+        // 동결 계약: ⓐ 판정 함수 본문은 ⓑ 를 모른다(R3 verdict 전 재작업 금지 · master 지시).
+        let fat = prod.find("pub fn fence_verdict(").expect("fence_verdict 소실");
+        let fbody = &prod[fat..];
+        let fend = fbody.find("\n}").expect("fence_verdict 본문 끝 소실");
+        assert!(
+            !fbody[..fend].contains("progress"),
+            "동결된 fence_verdict 본문에 진행 축이 섞여 들어갔다 — 리뷰 대상 설계가 흔들린다"
+        );
+        // ⓑ 짝 계약: 생산 코드에서 **두 이름의 등장 수가 같아야** 한다.
+        //   ★콜론 붙은 구조체 필드(`progress_step:`)만 세면 B4 가 실제로 할 **필드 대입**
+        //     (`r.progress_step = step;`)을 한 건도 못 잡는다 — 핀이 이름 붙인 바로 그 함정을
+        //     비껴간다. 그래서 이름 자체를 센다: 한쪽을 늘리면 다른 쪽도 늘려야 통과한다.
+        assert_eq!(
+            prod.matches("progress_step").count(),
+            prod.matches("progress_at").count(),
+            "progress_step 과 progress_at 의 등장 수가 다르다 — 한쪽만 움직이면 진행 중인 \
+             런이 등록 시각 기준으로 정체처럼 보여 건강한 부트가 잘린다"
+        );
+        assert!(
+            prod.contains("progress_at:"),
+            "생산 코드에 progress_at 대입이 없다 — 표 등록이 정체 기준 시각을 남기지 않는다"
+        );
+        // ⓒ 파리티 핀이 훑는 리터럴 형식.
+        const DECL: &str = "const PROGRESS_STALL_SECS: f64 = ";
+        let lit = prod
+            .find(DECL)
+            .map(|i| &prod[i + DECL.len()..])
+            .and_then(|t| t.find(';').map(|e| &t[..e]))
+            .expect("PROGRESS_STALL_SECS 선언 소실 — 파리티 핀이 훑을 대상이 없다");
+        assert!(
+            !lit.is_empty() && lit.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "리터럴 형식 이탈({lit:?}) — 예산 파리티 정규식이 못 잡으면 python↔Rust 대조가 \
+             조용히 공허해진다(무측정)"
         );
     }
 

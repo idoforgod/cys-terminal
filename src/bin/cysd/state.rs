@@ -1737,7 +1737,19 @@ pub struct BootRunActive {
     /// 뜻이다(그 구별이 fence 발효 조건이다 — [`crate::boot_supervisor::fence_verdict`]).
     pub hb: f64,
     /// 러너가 보고한 단계 이름. 이 값이 변하지 않는 동안이 진행 정체의 척도다(ⓑ · B3-3).
+    ///
+    /// ★[`BootRunActive::progress_at`] 과 **반드시 함께** 움직인다. 한쪽만 갱신하면 진행 중인
+    /// 런이 등록 시각 기준으로 정체처럼 보여 **건강한 부트가 잘린다** — 이 저장소가 반복해서
+    /// 맞은 계급이라 소스핀이 그 짝을 강제한다
+    /// ([`crate::boot_supervisor`] 의 `progress_axis_is_wired_at_the_call_site_and_moves_in_pairs`).
     pub progress_step: String,
+    /// (B3-3 · §2-6 ⓑ) [`BootRunActive::progress_step`] 이 **마지막으로 바뀐** 시각(epoch 초).
+    ///
+    /// 등록 시각(= `started`)으로 초기화한다. 정체 판정의 기준은 이 값이지만, 단계 이름이 비어
+    /// 있는 동안 — 즉 **한 번도 보고하지 않은 동안** — 은 발효하지 않는다. `hb <= started` 가 ⓐ
+    /// 에서 하는 역할과 **동형**이다: '멎었다'와 '보고 배선이 아직 없다'를 구별하지 못하는 신호로
+    /// 파괴적 조치를 하면 안 된다. 보고 주체가 §2-7 러너(B4)라 지금은 항상 비어 있다.
+    pub progress_at: f64,
     /// 이 세대가 시작된 시각(epoch 초) — 절대 마감의 기준(ⓒ · B3-3).
     pub started: f64,
     /// (B3-2R ④ⓑ) 낳은 프로세스의 pid. **관측용이지 종료용이 아니다** — 이 데몬은 아무것도
