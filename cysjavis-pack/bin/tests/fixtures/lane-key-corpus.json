@@ -41,7 +41,7 @@
       "why": "★진짜 기본 소켓 — 반드시 base 여야 기존 delivery-base.jsonl 이 유효하다"
     },
     {
-      "sock": "/home/u/.local/state/cys/cys.sock",
+      "sock": "/home/x/.local/state/cys/cys.sock",
       "is_base": true,
       "why": "리눅스 기본 소켓 모양"
     },
