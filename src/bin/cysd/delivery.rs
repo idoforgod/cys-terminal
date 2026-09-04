@@ -351,8 +351,29 @@ fn socket_is_base(sock: &str) -> bool {
             return false;
         }
     }
-    let last = norm.rsplit('/').next().unwrap_or("");
-    last == "cys" || last == "cys.sock"
+    // ★P0 수리(2026-09-04 실사고): 종전엔 **basename 만** 봤다 — 디렉터리를 무시했으므로
+    //   `~/.cys/state-harness/cys.sock` · `/var/folders/…/l1-new-*/cys.sock` 처럼 **관례적
+    //   파일명을 유지한 격리 소켓이 전부 base 로 접혔고**, 그 데몬들이 본 레인
+    //   `delivery-base.jsonl`·`.epoch.json` 에 썼다(실측: 외부 좌석 레코드 70건 · epoch 덮어씀).
+    //   귀결은 본부 임무 게이트 오탐 폐쇄 + 전 노드 층1 원장 오염이다.
+    //
+    //   역설이 이 결함의 핵심이었다: `/tmp/whatever.sock` 처럼 **파일명이 다르면** 올바로
+    //   격리됐다. 즉 **가장 흔한 격리 방식**(관례 파일명 유지 + 디렉터리 분리)만 조용히 실패했다.
+    //
+    //   수리: 기본 소켓은 **`…/state/cys/cys.sock`** 이므로 **부모 디렉터리 이름까지** 본다.
+    //   `cys` 디렉터리 안의 `cys.sock` 만 base 이고 나머지는 전부 자기 레인이다(fail-closed).
+    //
+    //   ★기계 독립 판정을 유지한다: 이 기계의 실제 홈 경로와 비교하지 않고 **경로 모양**만 본다.
+    //   그래야 python 과 공유하는 소켓→lane_key 매트릭스 fixture 가 기계마다 같은 답을 낸다.
+    //   하위호환: 진짜 기본 소켓은 여전히 base(기존 `delivery-base.jsonl` 유효) ·
+    //   `cys-dept-`·`/tmp/whatever.sock` 은 종전대로 비-base. **바뀌는 것은 누출 경로 하나뿐이다.**
+    let mut it = norm.rsplit('/');
+    let last = it.next().unwrap_or("");
+    if last != "cys" && last != "cys.sock" {
+        return false;
+    }
+    // 부모 디렉터리가 정확히 `cys` 여야 한다(기본 소켓 `…/state/cys/cys.sock` 의 모양).
+    it.next() == Some("cys")
 }
 
 /// SHA-1 hex — **비암호학적 용도 전용**(파일명 슬러그가 `javis_bootstrap._sanitize_sock_key`
@@ -1093,6 +1114,126 @@ pub(crate) mod tests {
     }
 
     /// ★R5-B 회귀: 스레드 로컬 격리가 실제로 원장 경로를 접고, drop 후 복원되는가.
+    /// 소켓→레인 판정 **공유 코퍼스** — python `javis_lane` 이 소비하는 **같은 파일**을
+    /// 컴파일 타임에 싣는다. 경로가 바뀌면 여기서 빌드가 깨진다(사본 분화를 컴파일러가 막는다).
+    const LANE_CORPUS: &str = include_str!("../../../cysjavis-pack/bin/tests/fixtures/lane-key-corpus.json");
+
+    /// ★H-LANE-2(P0 파리티): 소켓→base 판정이 **공유 코퍼스**와 일치한다.
+    ///
+    /// H-LANE-ISO 가 사고 재현·회귀 방지를 맡는다면 이 검체는 **2언어 대칭 이탈 탐지기**다 —
+    /// python `javis_lane.socket_is_base` 가 같은 파일을 소비하므로, 한쪽만 고쳐지면 그 순간
+    /// 한쪽이 적색이 된다. 레인 판정이 갈리면 두 구현이 **서로 다른 원장 파일**을 읽어
+    /// 층1 이 조용히 실패한다(오염의 반대 방향 사고).
+    #[test]
+    fn socket_base_verdict_matches_the_shared_lane_corpus() {
+        let c: serde_json::Value =
+            serde_json::from_str(LANE_CORPUS).expect("lane-key-corpus.json 판독 불가");
+        let cases = c["cases"].as_array().expect("cases 배열 부재");
+        assert!(cases.len() >= 17, "레인 코퍼스가 줄었다: {}", cases.len());
+        let mut fails: Vec<String> = Vec::new();
+        for it in cases {
+            let sock = it["sock"].as_str().expect("sock");
+            let want = it["is_base"].as_bool().expect("is_base");
+            let got = socket_is_base(sock);
+            if got != want {
+                fails.push(format!(
+                    "{sock:?}: 기대 is_base={want} / 실측 {got} — why: {}",
+                    it["why"].as_str().unwrap_or("")
+                ));
+            }
+            // lane_key 도 함께 대조한다 — base 면 정확히 "base", 아니면 절대 "base" 가 아니다.
+            let k = lane_key(Path::new(sock));
+            if want && k != "base" {
+                fails.push(format!("{sock:?}: base 인데 lane_key={k}"));
+            }
+            if !want && k == "base" {
+                fails.push(format!("{sock:?}: 비-base 인데 lane_key=base — 본 레인을 공유한다"));
+            }
+        }
+        assert!(fails.is_empty(), "레인 판정 파리티 이탈:\n  - {}", fails.join("\n  - "));
+    }
+
+    /// ★H-LANE-ISO(P0 · master 등재 2026-09-04): **격리 소켓이 본 레인을 오염시키지 않는다.**
+    ///
+    /// 실사고: `~/.cys/state-harness/cys.sock` · `/var/folders/…/l1-new-*/cys.sock` 로 띄운
+    /// 데몬이 본 레인 `delivery-base.jsonl`·`.epoch.json` 에 썼다(외부 좌석 레코드 70건 ·
+    /// epoch 덮어씀) → 본부 임무 게이트 오탐 폐쇄 + 전 노드 층1 원장 오염.
+    ///
+    /// 원인: 종전 `socket_is_base` 가 **basename 만** 봐서 디렉터리를 무시했다. 역설적으로
+    /// `/tmp/whatever.sock` 처럼 **파일명이 다르면** 올바로 격리됐다 — 즉 **가장 흔한 격리
+    /// 방식**(관례 파일명 유지 + 디렉터리 분리)만 조용히 실패했다.
+    ///
+    /// ★이 검체는 **음성 대조군을 내장**한다: 구 규칙(basename 판정)을 그 자리에서 재현해
+    /// 오염이 **실제로 일어났음**을 먼저 보이고, 신 규칙이 그것을 막는 것을 보인다. 그래야
+    /// "이 검체가 무엇을 지키는지"가 검체 안에서 자명하다.
+    #[test]
+    fn isolated_socket_never_folds_into_the_base_lane() {
+        // 구 규칙 재현 — basename 만 보던 판정(음성 대조군).
+        let old_rule = |sock: &str| -> bool {
+            let norm = sock.replace('\\', "/");
+            if norm.split('/').any(|p| p.starts_with("cys-dept-")) {
+                return false;
+            }
+            let last = norm.rsplit('/').next().unwrap_or("");
+            last == "cys" || last == "cys.sock"
+        };
+
+        // 실사고에서 관측된 격리 소켓 2종.
+        let leaky = [
+            "/Users/cys/.cys/state-harness/cys.sock",
+            "/var/folders/ab/T/l1-new-1234/cys.sock",
+        ];
+        for sock in leaky {
+            // ① 음성 대조 — 구 규칙에서는 **base 로 접혔다**(사고 재현).
+            assert!(
+                old_rule(sock),
+                "음성 대조군이 성립하지 않는다 — 구 규칙에서 이 소켓이 base 가 아니면 \
+                 이 검체는 사고를 재현하지 못한다: {sock}"
+            );
+            // ② 신 규칙 — 자기 레인이다.
+            assert!(!socket_is_base(sock), "격리 소켓이 아직도 base 로 접힌다: {sock}");
+            let k = lane_key(Path::new(sock));
+            assert_ne!(k, "base", "레인 키가 base 다 — 본 레인 파일을 공유한다: {sock}");
+            // ③ 그래서 원장·epoch 파일이 **본 레인과 다른 이름**이다.
+            let led = ledger_path(Path::new(sock));
+            let ep = epoch_path(Path::new(sock));
+            let base_led = ledger_path(Path::new("/Users/x/.local/state/cys/cys.sock"));
+            let base_ep = epoch_path(Path::new("/Users/x/.local/state/cys/cys.sock"));
+            assert_ne!(led, base_led, "격리 데몬이 본 레인 원장에 쓴다: {}", led.display());
+            assert_ne!(ep, base_ep, "격리 데몬이 본 레인 epoch 을 덮는다: {}", ep.display());
+            assert!(
+                led.file_name().unwrap().to_string_lossy().starts_with("delivery-"),
+                "원장 파일명 규약이 깨졌다: {}", led.display()
+            );
+        }
+
+        // ④ 하위호환 — **진짜 기본 소켓은 여전히 base** 다(기존 delivery-base.jsonl 유효).
+        for ok in ["/Users/x/.local/state/cys/cys.sock", "/home/u/.local/state/cys/cys.sock", ""] {
+            assert!(socket_is_base(ok), "기본 소켓이 base 에서 빠졌다 — 기존 원장이 고아가 된다: {ok:?}");
+        }
+        // ⑤ 종전에 이미 비-base 였던 것들은 그대로다(회귀 없음).
+        for no in ["/tmp/whatever.sock", "/Users/x/.local/state/cys-dept-sales/cys.sock"] {
+            assert!(!socket_is_base(no), "비-base 판정이 뒤집혔다: {no}");
+        }
+        // ⑥ ★부모 이름은 **정확히** `cys` 여야 한다 — 접두 비교로 완화하면 `cys` 로 시작하는
+        //    아무 디렉터리나 base 특권을 얻는다(mutation P-M2 가 이 사각을 드러냈다).
+        //    `cys-dept-` 는 앞선 가드가 먼저 잡으므로 그것만으로는 이 자리를 못 잰다.
+        for near in [
+            "/Users/x/.local/state/cys-harness/cys.sock",
+            "/Users/x/.local/state/cystest/cys.sock",
+            "/Users/x/.local/state/cys2/cys.sock",
+            "/Users/x/.cys/cys.sock",
+        ] {
+            assert!(
+                !socket_is_base(near),
+                "부모 이름이 `cys` 가 아닌데 base 로 접혔다 — 접두 비교로 완화된 것 같다: {near}"
+            );
+        }
+        // ⑥ 기계 독립 — 이 판정은 **경로 모양**만 본다(실제 홈·존재 여부 무관).
+        //    그래야 python 과 공유하는 소켓→lane_key 매트릭스가 기계마다 같은 답을 낸다.
+        assert!(socket_is_base("/nonexistent/machine/.local/state/cys/cys.sock"));
+    }
+
     /// (env 를 건드리지 않으므로 병렬 러너에서 다른 테스트와 간섭하지 않는다 — 그것이 채택 이유다.)
     #[test]
     fn isolate_state_dir_scopes_paths_to_this_thread_and_restores() {
