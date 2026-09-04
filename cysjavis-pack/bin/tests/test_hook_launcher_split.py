@@ -291,7 +291,7 @@ try:
     fn = lsrc[m_start:m_end + 2] if m_start > 0 else ""
     drv = os.path.join(root, "dirpart.sh")
     w(drv, fn + """
-for P in 'C:\\Users\\cys\\pack\\hooks\\role-bootstrap.sh' \
+for P in 'C:\\pk\\hooks\\role-bootstrap.sh' \
          '/u/p/hooks/role-bootstrap.sh' 'role-bootstrap.sh' \
          'C:/u/p/hooks/role-bootstrap.sh'; do
   if D=$(_cys_dirpart "$P"); then printf 'OK|%s\n' "$D"; else printf 'EMPTY|\n'; fi
@@ -300,7 +300,7 @@ done
     rd2 = subprocess.run(["sh", drv], capture_output=True, text=True, timeout=30)
     lines = [l for l in rd2.stdout.splitlines() if l]
     check("CWD-2b 백슬래시 절대경로에서 디렉터리를 얻는다(드라이브 문자 보존)",
-          len(lines) > 0 and lines[0] == "OK|C:/Users/cys/pack/hooks", repr(lines[:1]))
+          len(lines) > 0 and lines[0] == "OK|C:/pk/hooks", repr(lines[:1]))
     check("CWD-2c POSIX 절대경로 동작 보존",
           len(lines) > 1 and lines[1] == "OK|/u/p/hooks", repr(lines[1:2]))
     check("CWD-2d 이름만이면 빈손(=다음 후보로 넘어간다)",
@@ -310,7 +310,7 @@ done
     # ★음성 대조: **정규화를 뺀** 구 형태는 같은 입력에서 빈손이 된다(=이 축의 검출력 증명).
     drv2 = os.path.join(root, "dirpart_old.sh")
     w(drv2, """
-P='C:\\Users\\cys\\pack\\hooks\\role-bootstrap.sh'
+P='C:\\pk\\hooks\\role-bootstrap.sh'
 if [ "${P%/*}" != "$P" ]; then printf 'OK|%s\n' "${P%/*}"; else printf 'EMPTY|\n'; fi
 """, 0o644)
     rd3 = subprocess.run(["sh", drv2], capture_output=True, text=True, timeout=30)
