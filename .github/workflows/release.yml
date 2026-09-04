@@ -598,6 +598,23 @@ jobs:
       #   그 플래그 문자열 자체를 싣지 않음은 test_release_postprocess_gate.py 의 핀이 지키므로
       #   여기 주석에도 문자열을 쓰지 않는다. v0.14.19 실측
       #   (run 32039644404) 두 레그 모두 full 모드였으므로 이 폐쇄의 릴리스 경로 회귀는 0이다.
+      # ★게이트의 회귀 그물을 **게이트 직전에** 돌린다 (R1 codex #10 · 2026-09-04).
+      #   종전에 test_release_postprocess_gate.py 는 **어느 레인에서도 실행 0회**였다 —
+      #   release.yml 안 유일 등장이 주석 한 줄(:559)이었고 레인 대조 게이트는 주석을 제거한
+      #   뒤 스캔하므로 그 비대칭조차 보이지 않았다. 30 검체가 ①~⑧ 축·진단 플래그 부재 핀·
+      #   후처리 배선을 지키는데, 그것들이 검증 0회로 발행 경로에 실려 있었다.
+      #   여기(게이트 호출 직전)가 자리인 이유: 아래 게이트를 **발행 차단 근거로 신뢰하기
+      #   직전에** 그 게이트가 실제로 결함을 잡는지 증명한다(version-check 음성 대조와 같은 규율).
+      #   합성 픽스처·tempfile 전용(러너 자기완결·산출물 무접촉) · 실측 약 8s.
+      - name: 릴리스 게이트 회귀 그물 (test_release_postprocess_gate · 게이트 신뢰 직전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_release_postprocess_gate.py"
+          [ -f "$f" ] || { echo "::error::게이트 회귀 그물 누락: $f (git add 누락 의심) — 이 파일 없이 게이트를 신뢰할 수 없다" >&2; exit 1; }
+          python3 "$f"
+
       - name: macOS Gatekeeper 게이트 (quarantine 부착 + spctl 실평가 · 업로드 전)
         if: matrix.platform == 'macos-latest'
         shell: bash

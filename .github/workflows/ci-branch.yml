@@ -143,7 +143,19 @@ jobs:
                   "ci-branch = 브랜치 조기 경보 · release = 그 게이트를 발행 차단 근거로 신뢰하기 "
                   "직전 증명의 2레인 편입.",
               ),
-              "test_verify_win_crt": (
+              "test_release_postprocess_gate": (
+                  {"ci-branch", "release"},
+                  "scripts/tests/ 스위트(팩 스위트 아님 · R1 codex #10 수리 2026-09-04 편입 — 그 "
+                  "전에는 **0레인 실행**이었다: release.yml 안 유일 등장이 주석 한 줄이었고 이 "
+                  "게이트는 주석을 제거한 뒤 스캔하므로 비대칭조차 보이지 않았다). 대상 "
+                  "scripts/release-gate-gatekeeper.sh·release-postprocess.py 는 배송 팩 tar 에 "
+                  "실리지 않고, 소비 지점은 release.yml 의 macOS 발행 게이트뿐이다 — pack-release "
+                  "는 팩만 서명·배송하며 이 도구를 실행할 일도 실을 일도 없어, 편입하면 오히려 "
+                  "근거 없는 목록이 된다(test_verify_win_crt 와 같은 계급의 정당한 비대칭). "
+                  "ci-branch = 브랜치 조기 경보 · release = 그 게이트를 발행 차단 근거로 신뢰하기 "
+                  "직전 증명의 2레인 편입.",
+              ),
+                            "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
                   "0레인 실행이었다). 대상 scripts/verify_win_crt.py 는 배송 팩 tar 에 실리지 "
@@ -592,6 +604,17 @@ jobs:
           f="scripts/tests/test_version_sot_mutation.py"
           [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           echo "== test_version_sot_mutation (mac) =="
+          python3 "$f"
+
+      # ★릴리스 게이트 회귀 그물 — 브랜치 조기 경보 (R1 codex #10 · 2026-09-04).
+      #   release 레인과 **같은 커밋에 동시 편입**한다(한쪽만 넣으면 그 레인의 초록이 거짓 신호).
+      #   pack-release 미편입 사유는 위 '팩 스위트 레인 대조' ALLOWED 등재 참조.
+      - name: 릴리스 게이트 회귀 그물 음성 대조 (test_release_postprocess_gate · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_release_postprocess_gate.py"
+          [ -f "$f" ] || { echo "::error::게이트 회귀 그물 누락: $f (git add 누락 의심) — 이 파일 없이 게이트를 신뢰할 수 없다" >&2; exit 1; }
           python3 "$f"
 
       # ★todo **스캔 집합** 2언어 파리티(설계 §14 S18 · W14). 위 파서 파리티와 **다른 표면**이다:
