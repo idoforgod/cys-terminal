@@ -474,8 +474,22 @@ pub struct BootIntent {
     /// **파일명**이 곧 이 값이다. 같은 선언 이벤트의 재전송은 같은 id 라 `O_EXCL` 이 dedup
     /// 으로 접는다 — 종전의 '유일 카운터 id' 는 재전송과 재선언을 구별하지 못했다.
     pub decl_id: String,
-    /// (v3) 실행 주체 스냅샷 — [`EXECUTOR_RUNNER`]·[`EXECUTOR_PYTHON`]. 롤백 스위치가 도중에
-    /// 뒤집혀도 인텐트는 **태어날 때의 결정대로** 완주한다(명세 §5).
+    /// (v3) 실행 주체 스냅샷 — [`EXECUTOR_RUNNER`]·[`EXECUTOR_PYTHON`].
+    ///
+    /// ## '태어날 때의 결정대로 완주' 는 **이미 착수한 것**에만 적용된다 (B3-5 · T3-2)
+    /// 명세 §5 의 그 문장과 시뮬 T3-2 는 처음 읽으면 어긋나 보인다 — T3-2 는 "OFF 전환 시
+    /// pending 인텐트는 python 으로 재스냅샷(running 은 완주)" 이다. 정합하는 읽기는 하나뿐이다:
+    ///  · `running` = 이미 러너가 소유했다 → **태어난 대로 완주**한다(중간에 주체를 바꾸면
+    ///    소유권이 갈린다).
+    ///  · `pending` = 아직 아무도 착수하지 않았다 → 사용자가 스위치를 내린 것은 **지금 당장**
+    ///    롤백하겠다는 뜻이고, 그 기대를 다음 인텐트까지 미룰 이유가 없다.
+    /// 이 세분이 주석에 없으면 다음 사람이 두 문장 중 하나만 근거로 반대 방향으로 고친다.
+    /// 판정은 [`resnapshot_executor`] 하나이고, 다시 찍는 방향은 **runner → python 한쪽**이다
+    /// (되돌리기는 보수적인 쪽이라 스위치를 두 번 뒤집어도 python 에 머문다).
+    ///
+    /// ★현재 이 값의 **소비자는 아직 없다**(감독자 dispatch 는 읽지 않는다) — 읽을 주체가
+    /// §2-7 러너(B4)다. 그러니 지금 이 재스냅샷은 B4 가 그 값을 신뢰하기 전에 기록을 정직하게
+    /// 만들어 두는 일이다.
     pub executor: String,
     /// (v3) lease 세대. 디스패치마다 +1 되며 side-effect RPC 의 CAS 근거다(명세 §2-6).
     pub generation: u32,
@@ -1020,6 +1034,105 @@ pub fn progress_verdict(run: &BootRunActive, now: f64) -> Option<&'static str> {
         return Some("progress_stall");
     }
     None
+}
+
+/// (B3-5 · T3-2 · 명세 §5) 롤백 스위치가 꺼진 뒤 **아직 착수하지 않은** 인텐트의 실행 주체를
+/// 다시 찍어야 하는가 — 찍어야 하면 새 값을 돌려준다.
+///
+/// 세 갈래로 **찍지 않는다**: 스위치가 켜져 있거나(롤백이 아니다), 이미 `running` 이거나
+/// (러너가 소유했다 — 태어난 대로 완주한다), 이미 python 이거나(멱등 — 매 틱 쓰기를 막는다).
+/// 방향이 한쪽뿐인 것은 의도다: 스위치를 다시 올려도 python 으로 남는다(보수적인 쪽).
+pub fn resnapshot_executor(
+    state: IntentState,
+    current: &str,
+    v2_enabled: bool,
+) -> Option<&'static str> {
+    if v2_enabled || state != IntentState::Pending || current == EXECUTOR_PYTHON {
+        return None;
+    }
+    Some(EXECUTOR_PYTHON)
+}
+
+/// 손상 인텐트의 미러 줄에 싣는 원문 앞부분 길이 — 전문을 실으면 로그가 폭주한다.
+const UNREADABLE_SNIPPET_CHARS: usize = 200;
+
+/// 감독자 수명당 남기는 `state_unreadable` **terminal 기록 수 상한**.
+///
+/// ## 왜 상한이 필요한가 — 두 계약이 부딪힌다
+/// 명세 §2-6 은 손상 인텐트를 terminal 로 **기록**하라고 하고, 이 모듈의 다른 불변식은 스풀이
+/// **무한 성장하지 않을 것**을 요구한다(`gc_is_not_starved_by_the_judgement_cap`). 손상 파일이
+/// 홍수처럼 들어오면 둘은 정면으로 부딪힌다 — 전부 기록하면 `.done` 이 그만큼 쌓인다.
+///
+/// 해소는 '기록을 포기' 가 아니라 **유계**다: 현실적인 손상(몇 건)은 전부 기록으로 남고, 홍수는
+/// 상한에서 멈춘 뒤 종전 삭제 경로로 흘러간다. 그리고 **멈췄다는 사실 자체가 가청화된다** —
+/// 이 모듈이 `undeletable`·`budget_pressure` 에서 쓰는 규약 그대로다. 남는 기록 수가 손상 파일
+/// 수와 무관한 상수라는 점이 핵심이다(상한만 키우는 수리로는 통과하지 못한다).
+const MAX_UNREADABLE_RECORDS: usize = 8;
+
+/// (B3-5 · 명세 §2-6 · H-LEASE-3) 손상 인텐트를 **terminal `state_unreadable` 로 닫는다**.
+///
+/// 종전에는 `intent_discarded` 한 줄만 남기고 파일을 지웠다. 그러면 나중에 "그 선언이 실행됐는가 ·
+/// 왜 사라졌는가" 를 판정할 근거가 **디스크에 남지 않는다** — 명세가 terminal 기록을 요구하는
+/// 이유이고, `TerminalKind::StateUnreadable` 이 열거에만 있고 아무도 쓰지 않던 이유이기도 하다.
+///
+/// 손상 파일에는 파싱된 인텐트가 없다(그래서 이 갈래가 미구현으로 남았다). 파일 stem 을 id 로
+/// 삼아 **최소 인텐트를 합성**해 닫는다. 손상 바이트 자체는 교체되지만 앞부분을 미러 줄에 실어
+/// 포렌식 가치를 남긴다.
+///
+/// 반환 = 닫는 데 성공했는가. **실패하면 호출부가 종전 삭제 경로로 흘려보낸다** — 어느 쪽으로도
+/// 쓰레기가 영원히 남으면 안 된다. 성공했으면 파일은 이미 `.done` 으로 이름이 바뀌었으므로
+/// 호출부는 삭제를 시도하지 않는다(시도하면 실패해 `undeletable` 캐시에 쌓이고 매 틱 소음이 된다).
+fn close_unreadable(daemon: &Arc<Daemon>, dir: &Path, p: &Path, now: f64) -> bool {
+    let Some(id) = p.file_stem().and_then(|s| s.to_str()).map(sanitize_id) else {
+        return false;
+    };
+    let head: String = std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .chars()
+        .take(UNREADABLE_SNIPPET_CHARS)
+        .collect();
+    let synth = BootIntent {
+        id: id.clone(),
+        v: INTENT_SCHEMA_V,
+        action_token: String::new(),
+        lane: String::new(),
+        surface_id: None,
+        created_at: now,
+        attempts: 0,
+        next_attempt_at: 0.0,
+        reason: String::new(),
+        decl_origin: String::new(),
+        claim_rc: None,
+        claim_at: None,
+        decl_id: id.clone(),
+        executor: String::new(),
+        generation: 0,
+        state: IntentState::Pending,
+        terminal: None,
+    };
+    let t = Terminal::new(
+        TerminalKind::StateUnreadable,
+        "인텐트 JSON 을 판독할 수 없다(파싱 실패)",
+        "재선언이 재개 신호다 — 같은 좌석에서 다시 선언하면 새 인텐트로 처리된다",
+    );
+    match close_intent(dir, &synth, t, now) {
+        Ok(_) => {
+            publish(
+                daemon,
+                "boot_supervisor.state_unreadable",
+                json!({"id": id, "path": p.to_string_lossy(), "head": head}),
+            );
+            true
+        }
+        Err(e) => {
+            publish(
+                daemon,
+                "boot_supervisor.state_unreadable_failed",
+                json!({"id": id, "path": p.to_string_lossy(), "error": e}),
+            );
+            false
+        }
+    }
 }
 
 /// 실패 후 다음 시도 시각 — **선형 백오프**(쿨다운 × 시도횟수).
@@ -1750,6 +1863,10 @@ struct SupState {
     fence_disarmed_reported: bool,
     /// (R4 [5]) 고아를 **보유하고 있다**는 고지 래치 — 감독자 수명 1회.
     orphan_hold_reported: bool,
+    /// (B3-5 · H-LEASE-3) 이 감독자 수명 동안 남긴 `state_unreadable` terminal 기록 수.
+    unreadable_records: usize,
+    /// (B3-5) 기록 상한에 걸려 **더는 남기지 않는다**는 고지 래치 — 감독자 수명 1회.
+    unreadable_capped_reported: bool,
     /// (R6 [3] · codex R5) 보유 중 하나가 **처음으로 나이 임계를 넘었다**는 고지 래치 — 별도다.
     ///
     /// 왜 나눴는가: 종전에는 래치 하나가 둘을 함께 덮어서, young 상태에서 한 번 발화하면
@@ -1759,6 +1876,20 @@ struct SupState {
     orphan_aged_reported: bool,
     /// (R3 #7) fence 무장 여부. **기본 false** — 켜는 쪽만 명시적이다.
     fence_armed: bool,
+    /// (B3-5 · T3-2) 부트 v2 롤백 스위치가 **내려갔는가**(`CYS_BOOT_V2=0`).
+    ///
+    /// ## 왜 틱 안에서 env 를 읽지 않고 여기에 두는가
+    /// `tick_in` 안에서 `std::env::var` 를 읽으면 **모든 틱 검체가 프로세스 전역 env 에
+    /// 의존하게 된다** — ambient 값 하나로 무관한 검체들의 동작이 조용히 바뀌고, 검체가 그
+    /// env 를 만지면 병렬로 도는 다른 검체가 그 값을 본다. 이 저장소가 방금 값을 치른 계급이
+    /// 정확히 그것이다(auth 게이트 ↔ 마스터 스위치 락 사건). 그래서 판독은 [`spawn`] 1회이고
+    /// 틱은 이 스냅샷을 본다 — `fence_armed`·`epoch` 와 같은 규약이다.
+    ///
+    /// ## 왜 '꺼짐' 이 아니라 '내려갔는가' 인가(역극성)
+    /// `Default` 가 `false` 이므로 이 이름이면 기본이 **'스위치는 올라가 있다'**(= v2 켜짐)가
+    /// 된다. 그것이 실제 기본값이다(`CYS_BOOT_V2` 는 `Some("0")` 만 끔). 이름을 뒤집지 않으면
+    /// 검체가 기본 상태에서 롤백 경로를 타 버린다.
+    boot_v2_off: bool,
     /// (R3 #2) 이 감독자 수명의 영속 epoch — lease identity 의 한 축.
     epoch: u64,
 }
@@ -2030,6 +2161,26 @@ fn tick_in(
 
     // ── 디스크 GC(파싱 불가·mtime 초과) ────────────────────────────────────────
     for (p, why) in &scan.garbage {
+        // ★B3-5(§2-6 · H-LEASE-3): 파싱 불가는 **조용히 지우지 않는다** — terminal 로 닫고
+        //   미러 줄을 남긴다. 닫는 데 성공하면 파일은 이미 `.done` 이므로 삭제를 시도하지
+        //   않는다(시도하면 실패해 undeletable 캐시에 쌓이고 매 틱 소음이 된다).
+        if *why == "unparsable" {
+            if st.unreadable_records < MAX_UNREADABLE_RECORDS {
+                if close_unreadable(daemon, dir, p, now) {
+                    st.unreadable_records += 1;
+                    continue;
+                }
+                // 닫지 못했으면 아래 종전 삭제 경로로 흘려보낸다(쓰레기를 남기지 않는다).
+            } else if !st.unreadable_capped_reported {
+                st.unreadable_capped_reported = true;
+                publish(
+                    daemon,
+                    "boot_supervisor.unreadable_records_capped",
+                    json!({"cap": MAX_UNREADABLE_RECORDS,
+                           "note": "손상 인텐트 terminal 기록이 상한에 걸렸다 — 이후로는 기록 없이 폐기한다(스풀 무한 성장 방지). 상한에 걸린 것 자체가 병리 신호다"}),
+                );
+            }
+        }
         if let Some(removed) = remove_and_gate(st, remover, p, why) {
             publish(
                 daemon,
@@ -2121,6 +2272,34 @@ fn tick_in(
     //   무관하게 계속한다 — 잘리는 것은 홍수 채널 하나뿐이다.
     let mut pane_notices = MAX_RETIRE_NOTIFY_PER_TICK;
     for it in &scan.intents {
+        // ★재스냅샷은 디스패치 예산 **앞**이다: 스위치를 내린 사람은 즉시 롤백을 기대하는데,
+        //   예산에 걸려 뒤로 밀리면 그 기대가 틱 수만큼 늦어진다. 스캔 상한(64)이 이미 유계다.
+        // ★다시 찍었으면 **이 틱의 나머지도 새 값을 봐야 한다.** 처음 배선은 디스크만 고치고
+        //   `it` 은 낡은 값 그대로였는데, 같은 틱의 디스패치가 그 낡은 값으로 파일을 다시 써서
+        //   재스냅샷을 통째로 덮었다(검체가 잡았다). 스냅샷은 한 곳에서만 진실이어야 한다.
+        let mut resnapped: Option<BootIntent> = None;
+        if let Some(next) = resnapshot_executor(it.state, &it.executor, !st.boot_v2_off) {
+            let mut re = it.clone();
+            re.executor = next.to_string();
+            match write_intent(dir, &re) {
+                Ok(_) => {
+                    publish(
+                        daemon,
+                        "boot_supervisor.executor_resnapshot",
+                        json!({"id": it.id, "from": it.executor, "to": next,
+                               "note": "롤백 스위치가 꺼졌다 — 아직 착수하지 않은 인텐트만 다시 찍는다(running 은 태어난 대로 완주)"}),
+                    );
+                    resnapped = Some(re);
+                }
+                // 실패는 삼키지 않는다 — 다음 틱이 같은 판정으로 다시 시도한다(멱등).
+                Err(e) => publish(
+                    daemon,
+                    "boot_supervisor.executor_resnapshot_failed",
+                    json!({"id": it.id, "to": next, "error": e}),
+                ),
+            }
+        }
+        let it = resnapped.as_ref().unwrap_or(it);
         if dispatched >= MAX_DISPATCH_PER_TICK {
             break;
         }
@@ -2467,6 +2646,9 @@ pub fn spawn(daemon: Arc<Daemon>) {
         //   계약과 그 검체가 닫히는 것이고(B4), 그때 이 스위치 하나로 경로 전체가 살아난다.
         let arm_req = std::env::var(ENV_FENCE_ARMED).ok();
         st.fence_armed = fence_armed_from(arm_req.as_deref(), RUNNER_READINESS);
+        // ★B3-5(T3-2): 롤백 스위치도 **여기서 1회** 판독해 틱에 넘긴다(틱이 env 를 읽으면
+        //   모든 틱 검체가 프로세스 전역 상태에 묶인다).
+        st.boot_v2_off = !boot_v2_enabled_from(std::env::var(ENV_BOOT_V2).ok().as_deref());
         // ★R3 #2: lease identity 의 epoch 는 **데몬 수명당 하나**이고 디스크에 영속한다.
         //   스풀이 아니라 그 부모(상태 디렉터리)에 둔다 — 스풀은 인텐트 스캔·GC 의 대상이다.
         st.epoch = epoch;
@@ -3231,14 +3413,30 @@ mod tests {
             tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now);
             now += 5.0;
         }
-        let left = std::fs::read_dir(&dir)
+        let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with('z'))
-            .count();
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('z'))
+            .collect();
+        // ★계약 정련(B3-5 · H-LEASE-3): 이 검체가 지키는 불변식은 "0건" 이 아니라 **무한 성장
+        //   금지**다. 명세 §2-6 이 손상 인텐트의 terminal 기록을 요구하므로 이제 앞쪽 몇 건은
+        //   `.done` 기록으로 남는다 — 다만 그 수는 [`MAX_UNREADABLE_RECORDS`] 상수이고 **쓰레기
+        //   개수와 무관**하다. 그 독립성이 "상한만 키우는 수리는 통과 못 한다" 는 원래 의도를
+        //   그대로 지킨다(GARBAGE 를 4000 으로 올려도 남는 수는 같다).
+        let unhandled = names.iter().filter(|n| !n.ends_with(DONE_SUFFIX)).count();
+        let records = names.len() - unhandled;
         assert_eq!(
-            left, 0,
-            "판정 상한 뒤쪽 쓰레기 {left}건이 GC 되지 않았다 — 스풀이 무한 성장한다"
+            unhandled, 0,
+            "판정 상한 뒤쪽 쓰레기 {unhandled}건이 처리되지 않았다 — 스풀이 무한 성장한다"
+        );
+        assert!(
+            records <= MAX_UNREADABLE_RECORDS,
+            "손상 terminal 기록이 상한을 넘었다: {records} > {MAX_UNREADABLE_RECORDS}"
+        );
+        assert!(
+            records < GARBAGE,
+            "기록 수가 쓰레기 수를 따라간다 — 유계가 아니라 비례다(무한 성장의 다른 이름)"
         );
     }
 
@@ -3642,6 +3840,148 @@ mod tests {
             d.boot_fenced.lock().unwrap().len(),
             MAX_LIVE_BOOT_RUNS,
             "armed 에서 나이만으로 고아를 지웠다"
+        );
+    }
+
+    /// ★B3-5(T3-2) — 재스냅샷 판정의 **네 갈래**.
+    ///
+    /// ②가 계약의 핵심이다: `running` 은 이미 러너가 소유했으므로 스위치가 내려가도 태어난 대로
+    /// 완주한다. 중간에 주체를 바꾸면 소유권이 갈린다.
+    #[test]
+    fn only_unstarted_intents_are_resnapshotted_on_rollback() {
+        // ① 스위치가 켜져 있으면 손대지 않는다.
+        assert_eq!(resnapshot_executor(IntentState::Pending, EXECUTOR_RUNNER, true), None);
+        // ② running 은 태어난 대로 완주한다 — 스위치가 내려가도 바꾸지 않는다.
+        assert_eq!(
+            resnapshot_executor(IntentState::Running, EXECUTOR_RUNNER, false),
+            None,
+            "이미 착수한 런의 실행 주체를 바꿨다 — 소유권이 갈린다"
+        );
+        // ③ pending + 스위치 내려감 → python 으로 다시 찍는다.
+        assert_eq!(
+            resnapshot_executor(IntentState::Pending, EXECUTOR_RUNNER, false),
+            Some(EXECUTOR_PYTHON),
+            "롤백인데 미착수 인텐트가 runner 로 남았다 — 사용자는 즉시 롤백을 기대한다"
+        );
+        // ④ 이미 python 이면 다시 찍지 않는다(멱등 — 매 틱 쓰기 금지).
+        assert_eq!(
+            resnapshot_executor(IntentState::Pending, EXECUTOR_PYTHON, false),
+            None,
+            "이미 python 인데 또 썼다 — 매 틱 디스크 쓰기가 된다"
+        );
+    }
+
+    /// ★B3-5(T3-2) — 재스냅샷이 **실제로 배선**돼 디스크에 착지한다(순수 판정만으로는 공허).
+    #[test]
+    fn rollback_resnapshots_pending_intents_on_disk() {
+        let d = tmp_daemon("resnap");
+        let dir = tmp_spool("resnap");
+        enqueue_in(&dir, &req("a", None), 0.0).unwrap();
+        // running 대조군 — 같은 틱에서 손대지 않아야 한다.
+        let mut running = intent("b");
+        running.state = IntentState::Running;
+        running.executor = EXECUTOR_RUNNER.into();
+        write_intent(&dir, &running).unwrap();
+
+        let mut st = SupState::default();
+        st.boot_v2_off = true; // 롤백 스위치가 내려갔다
+        let s0 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0);
+
+        let a = BootIntent::from_str("a", &std::fs::read_to_string(intent_path(&dir, "a")).unwrap())
+            .expect("a 판독 불가");
+        assert_eq!(a.executor, EXECUTOR_PYTHON, "미착수 인텐트가 다시 찍히지 않았다");
+        let b = BootIntent::from_str("b", &std::fs::read_to_string(intent_path(&dir, "b")).unwrap())
+            .expect("b 판독 불가");
+        assert_eq!(
+            b.executor, EXECUTOR_RUNNER,
+            "running 인텐트의 실행 주체가 바뀌었다 — 태어난 대로 완주 계약 위반"
+        );
+        assert!(
+            d.bus.replay_after(s0).iter()
+                .any(|e| e["name"] == "boot_supervisor.executor_resnapshot"),
+            "재스냅샷이 조용하다 — 롤백이 실제로 반영됐는지 밖에서 알 수 없다"
+        );
+        // 멱등: 한 번 더 돌려도 다시 쓰지 않는다.
+        let s1 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0);
+        assert!(
+            !d.bus.replay_after(s1).iter()
+                .any(|e| e["name"] == "boot_supervisor.executor_resnapshot"),
+            "이미 python 인데 매 틱 다시 쓴다"
+        );
+    }
+
+    /// ★B3-5(§2-6 · H-LEASE-3) — **손상 인텐트는 조용히 지워지지 않는다.**
+    ///
+    /// 종전에는 `intent_discarded` 한 줄만 남기고 파일이 사라졌다. 그러면 "그 선언이 실행됐는가 ·
+    /// 왜 사라졌는가" 를 판정할 근거가 디스크에 없다. `TerminalKind::StateUnreadable` 이 열거에만
+    /// 있고 아무도 쓰지 않던 미구현분이 정확히 이것이다.
+    #[test]
+    fn unparsable_intents_are_closed_as_state_unreadable_not_just_deleted() {
+        let d = tmp_daemon("unread");
+        let dir = tmp_spool("unread");
+        raw_intent(&dir, "junk", "{ broken json here");
+        let mut st = SupState::default();
+        let s0 = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0);
+
+        assert!(
+            !intent_path(&dir, "junk").exists(),
+            "손상 파일이 원래 이름으로 남았다"
+        );
+        // `.done` 으로 닫혔고 terminal 이 state_unreadable 이어야 한다.
+        let done: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("junk.") && p.to_string_lossy().ends_with(DONE_SUFFIX))
+            .collect();
+        assert_eq!(done.len(), 1, "state_unreadable terminal 기록이 없다: {done:?}");
+        let body = std::fs::read_to_string(&done[0]).unwrap();
+        let closed = BootIntent::from_str("junk", &body).expect("terminal 기록을 판독할 수 없다");
+        assert_eq!(closed.state, IntentState::Terminal);
+        assert_eq!(
+            closed.terminal.as_ref().map(|t| t.kind),
+            Some(TerminalKind::StateUnreadable),
+            "terminal 종류가 state_unreadable 이 아니다"
+        );
+        // 미러 줄에 손상 원문 앞부분이 실려야 한다(포렌식).
+        let evts = d.bus.replay_after(s0);
+        let mirror = evts
+            .iter()
+            .find(|e| e["name"] == "boot_supervisor.state_unreadable")
+            .expect("미러 줄이 없다");
+        assert!(
+            mirror["payload"]["head"].as_str().unwrap_or_default().contains("broken"),
+            "미러 줄에 손상 원문이 실리지 않았다 — 포렌식 가치가 사라진다"
+        );
+        // ★삭제 경로를 타지 않았어야 한다(탔다면 원본이 없어 실패하고 undeletable 소음이 된다).
+        assert!(
+            !evts.iter().any(|e| e["name"] == "boot_supervisor.intent_discarded"
+                && e["payload"]["why"] == "unparsable"),
+            "닫고 나서 삭제까지 시도했다 — 실패해 undeletable 캐시에 쌓이고 매 틱 소음이 된다"
+        );
+    }
+
+    /// ★B3-5 소스핀 — **틱은 프로세스 전역 env 를 읽지 않는다.**
+    ///
+    /// 틱이 env 를 읽으면 모든 틱 검체가 전역 상태에 묶인다 — ambient 값 하나로 무관한 검체의
+    /// 동작이 조용히 바뀌고, 검체가 그 env 를 만지면 병렬로 도는 다른 검체가 그 값을 본다.
+    /// 이 저장소가 방금 값을 치른 계급이다(auth 게이트 ↔ 마스터 스위치 락 사건). 판독은
+    /// `spawn` 1회이고 틱은 스냅샷을 본다.
+    #[test]
+    fn the_tick_reads_no_process_env() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn tick_in(").expect("tick_in 소실");
+        let body = &prod[at..];
+        let end = body.find("\n}").expect("tick_in 본문 끝 소실");
+        assert!(
+            !body[..end].contains("std::env::var"),
+            "틱이 프로세스 전역 env 를 읽는다 — 모든 틱 검체가 그 값에 묶이고, 검체 간 간섭이 \
+             열린다. 판독은 spawn 1회이고 틱은 SupState 스냅샷을 봐야 한다"
         );
     }
 
