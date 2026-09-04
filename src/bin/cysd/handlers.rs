@@ -11855,14 +11855,67 @@ mod tests {
     /// 확보한다(전제를 암묵에 두면 ambient 값 하나로 8검체가 일괄 적색 — 환경 결합 오진).
     /// ACL_ENV_LOCK 보유 중에만 생성할 것(전 env 변이 검체와 같은 직렬화 규약). drop 시 원값
     /// 복원 — 패닉 경로 포함(락 가드보다 늦게 선언해 락 해제 전에 복원된다).
-    struct BootGatesAmbientGuard(Option<std::ffi::OsString>);
+    /// ★2026-09-05 실측 수리: 이 가드는 **두 락**을 잡는다(ACL 은 호출부, AUTH 는 여기서).
+    ///
+    /// `CYS_BOOT_GATES` 는 **마스터 스위치**라 seat 토큰 축만 끄는 것이 아니라 **auth 게이트도
+    /// 함께 끈다**(`AUTH_GATE_PRESCRIPTION` 의 되돌리기 문안이 그 사실을 적고 있다). 그런데
+    /// 종전에는 이 축이 `ACL_ENV_LOCK` 만, auth 검체는 `AUTH_GATE_ENV_LOCK` 만 잡아 **두 락이
+    /// 서로를 배제하지 않았다**. 그래서 둘이 병렬로 겹치면 auth 게이트가 프로세스 전역에서 꺼진
+    /// 채 차단 검체가 돌아 "미인증 프로필이 좌석을 얻었다" 는 적색이 났다(전수 게이트에서 실측).
+    ///
+    /// ★그 적색은 **가장 나쁜 종류의 거짓 신호**다: 보안 게이트가 뚫린 것처럼 보이는데 실제
+    /// 원인은 검체 격리이고, 몇 번 재실행하면 사라져 '간헐' 로 접히기 쉽다. 그렇게 접히면 진짜
+    /// 우회가 생겼을 때 같은 모양이라 구별되지 않는다.
+    ///
+    /// 락 순서는 **ACL → AUTH** 로 고정한다(호출부가 ACL 을 먼저 잡고 여기서 AUTH 를 잡는다).
+    /// 순환은 없다 — auth 검체는 ACL 을 잡지 않는다(실측 확인). 9개 호출 지점을 하나씩 고치는
+    /// 대신 가드가 잡게 한 이유: 하나씩이면 다음에 추가되는 열 번째가 조용히 빠진다.
+    struct BootGatesAmbientGuard(
+        Option<std::ffi::OsString>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
     impl BootGatesAmbientGuard {
         fn neutralize() -> Self {
+            // AUTH 락을 **env 를 만지기 전에** 잡는다 — 잡기 전에 지우면 그 창에서 auth 검체가
+            // 꺼진 게이트를 본다.
+            let auth = AUTH_GATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prior = std::env::var_os(cys::ENV_BOOT_GATES);
             std::env::remove_var(cys::ENV_BOOT_GATES);
-            Self(prior)
+            Self(prior, auth)
         }
     }
+    /// ★소스핀(2026-09-05) — 마스터 스위치 가드는 **auth 락도** 잡고, env 를 만지기 **전에** 잡는다.
+    ///
+    /// 이 결박이 풀리면 다시 "미인증 프로필이 좌석을 얻었다" 는 적색이 간헐로 난다. 그 적색은
+    /// 보안 게이트가 뚫린 것처럼 보이지만 실제 원인은 검체 격리이고, 몇 번 재실행하면 사라져
+    /// '간헐' 로 접히기 쉽다 — 그렇게 접히면 **진짜 우회가 생겼을 때 같은 모양이라 구별되지
+    /// 않는다.** 행위로는 경주라 결정론으로 잴 수 없으므로 소스로 못 박는다.
+    #[test]
+    fn boot_gates_guard_also_serializes_with_the_auth_gate_lock() {
+        let src = include_str!("handlers.rs");
+        let at = src
+            .find("impl BootGatesAmbientGuard {")
+            .expect("마스터 스위치 가드 impl 소실");
+        let body = &src[at..];
+        let body = &body[..body.find("\n    }").expect("가드 impl 끝 소실")];
+        assert!(
+            body.contains("AUTH_GATE_ENV_LOCK.lock()"),
+            "마스터 스위치 가드가 auth 락을 놓았다 — CYS_BOOT_GATES=0 은 auth 게이트도 끄므로 \
+             그 창에서 차단 검체가 꺼진 게이트를 보고 적색이 난다(락은 env 하나가 아니라 \
+             '이 게이트를 끌 수 있는 축 전부' 를 지켜야 한다)"
+        );
+        let lock = body
+            .find("AUTH_GATE_ENV_LOCK.lock()")
+            .expect("auth 락 획득 지점 소실");
+        let rm = body
+            .find("remove_var(cys::ENV_BOOT_GATES)")
+            .expect("중립화 지점 소실");
+        assert!(
+            lock < rm,
+            "auth 락 획득이 env 변이 뒤로 갔다 — 잡기 전에 지우면 그 창이 그대로 남는다"
+        );
+    }
+
     impl Drop for BootGatesAmbientGuard {
         fn drop(&mut self) {
             match self.0.take() {
@@ -15809,7 +15862,15 @@ mod tests {
     ///
     /// `CYS_PROFILE_GATE_OBSERVE_ONLY` 는 **프로세스 전역**이라, 롤백 테스트가 그것을 켠 순간
     /// 병렬로 도는 차단 테스트가 조용히 통과해 버린다(= 검체가 사문화된다). 그 창을 이 락 하나로
-    /// 닫는다. 이 env 의 소비자는 `profile_gate::observe_only()` 뿐이라 다른 레인과는 겹치지 않는다.
+    /// 닫는다.
+    ///
+    /// ★전제 정정(2026-09-05 실측): 종전 주석은 "이 env 의 소비자는 `profile_gate::observe_only()`
+    /// 뿐이라 다른 레인과는 겹치지 않는다" 고 적었다. **틀렸다.** auth 게이트는
+    /// `CYS_PROFILE_GATE_OBSERVE_ONLY` 뿐 아니라 **마스터 스위치 `CYS_BOOT_GATES=0`** 으로도
+    /// 꺼진다(위 `AUTH_GATE_PRESCRIPTION` 의 되돌리기 문안이 그 사실이다). 그 축은 다른 락
+    /// (`ACL_ENV_LOCK`)이 지키고 있었고, 두 락이 서로를 배제하지 않아 병렬 겹침에서 이 락이
+    /// 사문화됐다. 지금은 `BootGatesAmbientGuard` 가 이 락도 함께 잡아 그 창을 닫는다 —
+    /// **락은 env 하나가 아니라 '이 게이트를 끌 수 있는 축 전부' 를 지켜야 한다.**
     static AUTH_GATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// ★독약 내성 획득 — 한 검체가 적색이면 락이 poison 되고, 뒤이은 검체들이 `PoisonError` 로
