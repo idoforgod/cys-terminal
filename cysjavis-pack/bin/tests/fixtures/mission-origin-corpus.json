@@ -287,11 +287,11 @@
   },
   {
    "name": "L0c-cli-claude-flag",
-   "text": "claude-ysfuture --dangerously-skip-permissions",
+   "text": "claude-launcher --dangerously-skip-permissions",
    "expect": {
     "boot_command": true
    },
-   "why": "규칙 B(에이전트 CLI 기동 전체 일치)"
+   "why": "규칙 B(에이전트 CLI 기동 전체 일치 · `claude-<접미>` 분기). ★실제 런처 이름은 오너 계정 핸들을 포함하므로 **일부러 싣지 않는다** — 팩은 전 사용자에게 배포되고 발행 차단 게이트(secret-scan HANDLE)가 그 문자열을 적색으로 잡는다. 판정 축은 접미 유무이지 접미의 내용이 아니라서 합성 이름으로 같은 분기를 탄다."
   },
   {
    "name": "L0c-cli-agy-bare",
