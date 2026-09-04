@@ -359,12 +359,19 @@ jobs:
           #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
           #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
+          # ★C1(2026-09-04 · 부트 v2 W-C): test_runtime_seal 편입 — 동봉 런타임 봉인 매니페스트
+          #   (javis_runtime_seal.py)의 회귀 핀. 대상 모듈은 배송 팩 내용물이고, Windows 는
+          #   코드서명 sealed-resource 봉인이 없어 **설치 후 runtime/** 오염을 잡을 유일한 수단**이다.
+          #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
+          #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
+          #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
-                   test_preflight_c62_c68_ledger; do
+                   test_preflight_c62_c68_ledger \
+                   test_runtime_seal; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== declared-state test: $t =="
@@ -456,6 +463,18 @@ jobs:
             exit 1
           fi
           ls -la "$RT/git/bin/bash.exe"
+          # ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1) ──
+          # Windows 에는 코드서명 sealed-resource 봉인이 없다 — 설치 후 runtime/** 오염
+          # (예: npm i -g 가 번들 안으로)을 탐지할 수단이 이 매니페스트뿐이다.
+          # mac 과 달리 여기는 소스 트리에서 떠도 된다: Windows 레그엔 inside-out 재서명도
+          # 심볼릭링크 역참조도 없어 이 트리가 그대로 NSIS 에 실린다. **그 전제 자체를**
+          # windows-build.yml 의 설치 후 검증 스텝이 실기로 대조한다(가정을 측정으로 바꾼다).
+          # 러너 python 을 쓴다(동봉 python 으로 돌리면 그 import 가 트리 안에 __pycache__ 를
+          # 써서 검증 대상을 오염시킨다 — SEAL-1 과 같은 계급).
+          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+            --root "$RT" --out src-tauri/resources/runtime-manifest.json \
+            --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
+            --source win-src
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
       # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를
@@ -863,12 +882,19 @@ jobs:
           #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
           #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
+          # ★C1(2026-09-04 · 부트 v2 W-C): test_runtime_seal 편입 — 동봉 런타임 봉인 매니페스트
+          #   (javis_runtime_seal.py)의 회귀 핀. 대상 모듈은 배송 팩 내용물이고, Windows 는
+          #   코드서명 sealed-resource 봉인이 없어 **설치 후 runtime/** 오염을 잡을 유일한 수단**이다.
+          #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
+          #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
+          #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
-                   test_preflight_c62_c68_ledger; do
+                   test_preflight_c62_c68_ledger \
+                   test_runtime_seal; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="

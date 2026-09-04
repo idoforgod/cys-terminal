@@ -102,6 +102,13 @@ jobs:
           fi
           ls -la "$RT/git/bin/bash.exe"
           du -sh "$RT" "$RT/git" "$RT/python" || true
+          # ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1 · release.yml 과 동일 절차) ──
+          # 이 레인이 매니페스트의 **실기 검증처**다: 아래 자기완결 검증 스텝이 실제 설치본 트리와
+          # 이 파일을 대조해, "소스 트리 해시가 NSIS 를 거쳐 설치본까지 살아남는가"를 측정한다.
+          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+            --root "$RT" --out src-tauri/resources/runtime-manifest.json \
+            --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
+            --source win-src
 
       - name: Build Windows x64 (Tauri → NSIS setup.exe)
         shell: bash
@@ -209,6 +216,44 @@ jobs:
           & $py.FullName -c "import sqlite3, ssl, json, hashlib, urllib.request, ast; print('embeddable stdlib OK (sqlite3+ssl+json+hashlib+urllib+ast)')"
           if ($LASTEXITCODE -ne 0) { throw "동봉 python3 stdlib import 실패" }
           Write-Host "OK: 자기완결 런타임 설치·실행·경로일치 검증 통과"
+
+      # ── runtime-manifest 실기 검증 (부트 v2 티켓 C1·C5 · 2026-09-04 신설) ─────────────────
+      # ★이 스텝이 존재하는 이유: mac 은 코드서명이 runtime/** 을 파일 단위로 봉인하지만
+      #   **Windows 에는 그런 봉인이 없다**. 설치 후 오염(npm i -g 가 번들 안으로 들어가는 계급 —
+      #   2026-09-04 오너 머신 mac 실측 사례)을 잡을 수단이 이 매니페스트뿐이다.
+      # ★그리고 이 스텝은 **가정을 측정으로 바꾼다**. 매니페스트는 소스 트리(src-tauri/runtime)
+      #   에서 떴는데, 그 해시가 Tauri 번들러 → NSIS → 설치를 거쳐 살아남는지는 **문서로 단정할
+      #   수 없다**(실기 없이는 추측이다). 여기서 실제 설치본 트리와 대조해 그 전제를 못박는다.
+      #   ①매니페스트가 설치 루트에 실렸는가(NSIS 의 "./" 목적지 해소 — 실측으로만 알 수 있다)
+      #   ②소스 해시가 설치본과 일치하는가(번들러가 바이트를 보존하는가)
+      # ★러너 python 을 쓴다 — 동봉 python 으로 돌리면 그 import 가 검증 대상 트리 안에
+      #   __pycache__ 를 새로 써서 스스로를 오염시킨다(SEAL-1 과 같은 계급).
+      - name: runtime-manifest 실기 검증 (설치본 트리 ↔ 출고 매니페스트)
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $inst) { throw "설치 후 cysd.exe 미발견 — 앞 스텝과 모순" }
+          $dir = $inst.Directory.FullName
+          $rt  = Join-Path $dir 'runtime'
+          # NSIS 가 bundle.resources 의 "./" 목적지를 어디로 푸는지는 실측 대상이다 — 두 후보를 다 본다.
+          $cands = @((Join-Path $dir 'runtime-manifest.json'), (Join-Path $dir 'resources\runtime-manifest.json'))
+          $man = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $man) {
+            Write-Host "== 설치 루트 목록(진단) =="; Get-ChildItem $dir | Select-Object -ExpandProperty Name
+            throw ("runtime-manifest.json 미발견 — 후보: {0}. bundle.resources 의 './' 해소 위치를 이 목록으로 판정하고 tauri.windows.conf.json 을 교정하라." -f ($cands -join ' | '))
+          }
+          Write-Host "manifest: $man"
+          Write-Host ("manifest size: {0} KB" -f [math]::Round((Get-Item $man).Length/1KB,1))
+          # 판정: exit 0=일치 · 1=불일치(3분류) · 2=판정 불가(측정 불능은 통과가 아니다)
+          & python cysjavis-pack/bin/javis_runtime_seal.py verify --root $rt --manifest $man --max-list 40
+          $rc = $LASTEXITCODE
+          if ($rc -eq 1) {
+            throw "runtime-manifest 불일치 — 소스 트리 해시가 NSIS 설치를 거치며 달라졌다. 위 3분류 목록이 어느 파일인지 지목한다(번들러 변환·설치 후 생성물 중 하나)."
+          }
+          if ($rc -ne 0) { throw "runtime-manifest 검증 판정 불가(exit=$rc) — 통과가 아니다" }
+          Write-Host "OK: 설치본 runtime 트리가 출고 매니페스트와 완전 일치"
 
       - name: PTY 스모크 (검은 pane 회귀 게이트 — ConPTY 셸 출력·실행 + pane env 실주입 실측)
         shell: pwsh
