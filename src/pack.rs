@@ -757,6 +757,14 @@ pub fn retune_registered_hook_timeouts(
             settings_path.display()
         ));
     }
+    // ★IG-23(2026-09-05): 이 함수도 **read-modify-write** 다 — 읽고 timeout 만 올려 다시 쓴다.
+    //   H-CONC-3 수리에서 `merge_desired_hooks`·`strip_settings_matching` 둘만 잠그고 **여기를
+    //   빠뜨렸다**(master 지시로 Rust writer 를 전수 색출하다 찾았다). 락이 없으면 preflight
+    //   C28 재등록·병합기와 교차해 lost-update 가 난다 — 원자 쓰기는 반쪽 파일만 막고 RMW
+    //   경합은 막지 못한다는, 다른 두 writer 와 똑같은 이유다.
+    //   존재 검사 뒤에 잡는다: 파일이 없으면 만질 것도 없고, 그때 락 파일을 만들면 '없으면
+    //   만들지 않는다' 경계(위 한 줄)를 잔재로 뚫는다.
+    let _lock = acquire_settings_lock(settings_path);
     let mut root: serde_json::Value = match std::fs::read_to_string(settings_path) {
         // 빈 파일 = 등록 0 — 만질 것이 없다(빈 객체로 덮어쓰지 않는다).
         Ok(s) if s.trim().is_empty() => return Ok(vec![]),
@@ -9124,11 +9132,9 @@ mod tests {
         // ⓐ 음성 대조군(결정론) — 구 규칙(고정 tmp 이름 + O_TRUNC)의 기제를 그 자리에 재현한다.
         //    이것이 파손을 못 내면 아래 ⓑ의 GREEN 은 **검출력 미확인**이다(측정 실패).
         //
-        //    ★W-C 17차 반증가능 예측(2026-09-05)의 검증도 여기서 한다: daemon 레인은 실패 col 이
-        //    두 런 모두 **44 고정**인데 release 레인은 매번 달랐다(52·44·28). 기전이 이것이라면
-        //    col 은 우연이 아니라 **먼저 착지한 짧은 문서의 길이 + 1** 이어야 한다 — 레인마다
-        //    겹치는 문서 쌍이 고정이면 col 도 고정되고, 변하면 col 도 변한다. 아래가 그 예측을
-        //    두 단언으로 건다(일반식 하나 + daemon 관측값 44 직접 재현 하나).
+        //    ★일반식 `col = 먼저 착지한 짧은 문서의 길이 + 1` 을 두 길이로 건다. 이 식 자체는
+        //    참이고 유용하지만, **CI 에서 관측된 col 44/52 의 출처는 이 코드가 아니다** — 하네스
+        //    음성 대조군의 급수(`8N+11`)였다(2026-09-05 W-A 최종 특정 · 위 주석 참조).
         let tear_once = |name: &str, long: &[u8], short: &[u8]| -> serde_json::Error {
             use std::io::Write;
             let dst = td.join(name);
@@ -9154,13 +9160,17 @@ mod tests {
             short.len() + 1,
             "col 이 '먼저 착지한 짧은 문서 길이 + 1' 이 아니다 — 기전 해석이 틀렸다"
         );
-        // daemon 레인 관측값 직접 재현: 43바이트 문서가 먼저 착지하면 col 은 정확히 44 다.
+        // ★인과 정정(2026-09-05): 아래 43바이트 사례는 **CI 관측의 재현이 아니다.** CI 의 col
+        //   44/52 는 하네스 음성 대조군(`naive.json`)의 급수 `8N+11` 에서 나온 것이고(N=4·N=5),
+        //   settings.json 은 indent=2 라 그 서명이 원리적으로 불가능하다(W-A 최종 특정).
+        //   그래서 이 사례는 '일반식 col = 짧은 문서 길이 + 1' 을 **길이를 바꿔 한 번 더** 거는
+        //   경계 검사로만 남긴다 — 이 결함의 근거는 위 ⓑ 2스레드 프로브와 변이 검증이다.
         let short43 = format!("{{\"pad\":\"{}\"}}", "x".repeat(33)).into_bytes();
         assert_eq!(short43.len(), 43, "검체 자기검증 실패 — 43바이트가 아니다");
         assert_eq!(
-            tear_once("daemon-col44.json", &long, &short43).column(),
+            tear_once("len43.json", &long, &short43).column(),
             44,
-            "daemon 레인 관측 col 44 를 결정론 재현하지 못했다 — 기전 재규명 필요"
+            "43바이트 선착에서 col 이 44 가 아니다 — 일반식이 길이에 따라 깨진다"
         );
 
         // ⓑ 현행 계약 — 2스레드 경합 중 **어느 시점에 읽어도** 둘 중 하나의 온전한 문서다.
@@ -9214,6 +9224,45 @@ mod tests {
             .filter(|n| n.starts_with(".tmp-") || n.contains(".tmp."))
             .collect();
         assert!(left.is_empty(), "tmp 잔재: {left:?}");
+    }
+
+    /// ★IG-23(2026-09-05 · W-C 23차 요청): **원자 교체와 tmp 잔재**를 플랫폼 중립으로 못박는다.
+    ///
+    /// 왜 이 검체가 생겼나: H-CONC-3 수리로 tmp 이름이 호출마다 유일해지고 `create_new`(O_EXCL)로
+    /// 바뀌면서 "잔여 tmp 를 지우고 그 자리를 연다"는 종전 동작이 사라졌다. 그래서 W-C 가
+    /// ①대상이 존재할 때 교체가 성립하는가 ②실패한 쓰기가 tmp 를 남기지 않는가 를 물었다.
+    /// 둘 다 **계약**이므로 추정이 아니라 검체로 답한다.
+    ///
+    /// Windows 시맨틱은 std 소스로 확정했다(추정 아님):
+    ///  · `rename` = `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` + ACCESS_DENIED 시
+    ///    `FILE_RENAME_FLAG_REPLACE_IF_EXISTS|POSIX_SEMANTICS` 폴백 → 대상 존재·읽기전용 모두 교체.
+    ///  · `OpenOptions` 기본 share_mode 에 `FILE_SHARE_DELETE` 포함 → **열린 핸들 상태에서도**
+    ///    rename 이 성립하며, 이는 `File::create` 와 `create_new` **양쪽 동일**이라 이번 변경의
+    ///    델타가 아니다.
+    #[test]
+    fn atomic_write_replaces_an_existing_target_and_leaves_no_tmp() {
+        let td = conc_dir("residue");
+        // ① 대상이 이미 있어도 교체된다(A13 rename 계약).
+        let target = td.join("settings.json");
+        std::fs::write(&target, b"old-content").unwrap();
+        write_atomic(&target, b"new-content").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-content", "대상 존재 시 교체가 안 됐다");
+        let residue = |dir: &std::path::Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".tmp-") || n.contains(".tmp."))
+                .collect()
+        };
+        assert!(residue(&td).is_empty(), "성공 후 tmp 잔재: {:?}", residue(&td));
+
+        // ② **실패한 쓰기도** 자기 tmp 를 남기지 않는다 — 대상 자리를 디렉터리로 막아 rename 을
+        //    결정론으로 실패시킨다(플랫폼 공통: 파일을 디렉터리 위로 rename 할 수 없다).
+        let blocked = td.join("blocked.json");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let err = write_atomic(&blocked, b"x").expect_err("디렉터리 위 교체가 성공했다");
+        assert!(residue(&td).is_empty(), "실패 후 tmp 잔재: {:?} (err={err})", residue(&td));
     }
 
     /// ★H-CONC-3 ②(공용 락): [`merge_desired_hooks`] 가 python preflight 와 **같은**

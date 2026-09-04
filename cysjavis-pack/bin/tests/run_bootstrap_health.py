@@ -2677,9 +2677,17 @@ def h_conc_3():
     tmp 이름이 `.<파일명>.tmp.<pid>` 로 **pid 당 하나로 고정**이었다. 프로세스가 다르면 이름이
     갈리므로 위 ⓒ의 **6 프로세스** 경합은 파손 0 을 냈고 — 그래서 이 축에서는 보이지 않았다 —
     같은 프로세스의 두 호출(데몬의 연결별 tokio task)만 `File::create`(O_TRUNC)로 같은 inode 를
-    공유해 서로를 잘랐다. 실패 col 이 daemon 레인에서 **44 고정**이던 것(W-C 17차 관측)은
-    `col = 먼저 착지한 짧은 문서 길이 + 1` 이기 때문이며, Rust 검체
-    `h_conc_3_same_process_writers_never_tear_the_file` 이 col 44 를 결정론 재현한다.
+    공유해 서로를 잘랐다.
+
+    ★★인과 정정(2026-09-05 · W-A 최종 특정 · master 수용) — **이 결함은 CI H-CONC-3 적색의
+    원인이 아니었다.** 그 적색의 출처는 아래 ⓓ **음성 대조군 `naive.json`** 이다: 대조군 문서는
+    마크 N개일 때 `8N+11` 바이트라 이어붙은 다음 열이 `8N+12` 이고 **N=4 → col 44 · N=5 → col 52**
+    다. daemon 레인 사본이 그 파일을 맨몸 `json.loads` 로 읽어 **판정이 아니라 traceback 으로
+    죽은 것**이 적색의 실체다(pack 레인은 `e1ae6ce` 로 판정화). 그리고 settings.json 은 indent=2
+    라 1행이 여는 중괄호 하나뿐이어서 이 서명이 **원리적으로 불가능**하다.
+    ⓒ 경합에 Rust writer 는 애초에 참여하지 않는다(자식은 preflight 두 함수만 부른다).
+    즉 위 pid 고정 tmp 결함의 근거는 **Rust 2스레드 프로브와 변이 검증**이지 CI 의 col 숫자가
+    아니다 — 숫자가 우연히 맞았을 뿐이다(W-B 자기 정정).
 
     G16: preflight 의 네 등록기가 각자 `open(path + ".tmp")` → `os.replace` 를 재구현했고
     tmp 이름이 **고정**이었다 — 동시 writer 가 서로의 임시 파일에 써서 교차 파손(반쪽 JSON)을 만들고,
@@ -2731,6 +2739,14 @@ def h_conc_3():
          "Rust 병합기가 공용 락(<settings>.cys-lock)을 잡지 않는다(lost update 축)")
     need("cys-lock" in _code_lines(pk),
          "공용 락 소유자가 pack.rs 에 없다(사본 분화 — cys.rs 단독 구현으로 회귀)")
+    # ★IG-23: **세 번째** Rust RMW writer — `retune_registered_hook_timeouts` 도 읽고 다시 쓴다.
+    #   2026-09-05 최초 수리가 이것을 빠뜨렸다(writer 전수 색출로 발견). 목록으로 세지 말고
+    #   **함수 본문마다** 핀한다 — 목록은 새 writer 가 생기면 조용히 낡는다.
+    ri = pk.find("pub fn retune_registered_hook_timeouts(")
+    need(ri > 0, "Rust timeout 재조정기를 못 찾았다")
+    rbody = pk[ri:pk.find("\n}\n", ri)]
+    need("acquire_settings_lock(settings_path)" in rbody,
+         "retune_registered_hook_timeouts 가 공용 락을 잡지 않는다(세 번째 RMW writer)")
     fr = _repo_file(os.path.join("src", "factory_reset.rs"))
     si = fr.find("fn strip_settings_matching(")
     need(si > 0, "Rust 제거기를 못 찾았다")
@@ -2743,7 +2759,7 @@ def h_conc_3():
     #   --fix` 가 그 자리에서 멈춘다(사용자 대면 치유 경로의 hang).
     need("_lock = acquire_settings_lock" not in _code_lines(cy),
          "cys.rs 가 말단 writer 바깥에서 같은 락을 다시 잡는다 — 중첩 flock = 자기교착")
-    notes.append("Rust 시드 원자 쓰기 · 유일 tmp(O_EXCL) · 공용 락 2 writer")
+    notes.append("Rust 시드 원자 쓰기 · 유일 tmp(O_EXCL) · 공용 락 3 writer")
     # ⓒ 실측 경합: 6 writer × 12 iter 동시 실행 → 파손 0 · lost update 0 · 훅 6종 전원 등록
     pairs = [("session-start.sh", "SessionStart"), ("role-bootstrap.sh", "UserPromptSubmit"),
              ("save-state.sh", "Stop"), ("save-state.sh", "PreCompact"),
