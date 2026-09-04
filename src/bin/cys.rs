@@ -24453,12 +24453,18 @@ mod tests {
         let wd = RpcWatchdog::new(Duration::from_millis(200), move || {
             h.fetch_add(1, Ordering::SeqCst);
         });
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "상한 전에 발화했다 — 정상 왕복을 자르는 방향"
-        );
+        // ★부하 면역 단언(2026-09-05 · W-C 실증): 종전에는 60ms 자고 hits==0 을 요구했다.
+        //   여유가 200 對 60 = 3.3배뿐이라 러너가 밀리면 **로직이 옳아도** 적색이 난다.
+        //   '아직 발화하지 않았다' 는 **대리 관측**이고, 계약 자체는 '상한이 now+timeout 에
+        //   있다' 이다. 그것을 괄호로 재면 러너가 아무리 밀려도 괄호가 함께 벌어져
+        //   **구조적으로 거짓 적색이 불가능**하다.
+        {
+            let dl = wd.state.0.lock().unwrap().deadline;
+            assert!(
+                dl > std::time::Instant::now(),
+                "생성 직후 상한이 이미 지나 있다 — 첫 왕복부터 잘린다"
+            );
+        }
         std::thread::sleep(Duration::from_millis(500));
         let fired = hits.load(Ordering::SeqCst);
         assert!(fired >= 1, "무진행인데 발화하지 않았다(= 무한 대기 부활)");
@@ -24466,14 +24472,31 @@ mod tests {
         drop(wd);
 
         // ② touch(진행)가 상한을 재장전한다 — 정상 전송 중인 큰 응답이 잘리지 않는 근거
+        //    ★상한을 길게 잡는다: 이 구간이 재는 축은 **재장전**이지 만료가 아니다. 짧은 상한을
+        //      쓰면 만료가 개입해 두 축이 한 검체에서 섞이고, 그 섞임이 곧 벽시계 의존이었다.
+        const RELOAD_TIMEOUT: Duration = Duration::from_secs(3600);
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
-        let wd = RpcWatchdog::new(Duration::from_millis(200), move || {
+        let wd = RpcWatchdog::new(RELOAD_TIMEOUT, move || {
             h.fetch_add(1, Ordering::SeqCst);
         });
-        for _ in 0..8 {
-            std::thread::sleep(Duration::from_millis(60));
+        // ★여기가 실제로 깨졌던 자리다(W-C 실증 · cys.rs:24468 · 러너 부하). 종전에는
+        //   60ms 슬립 + touch 를 8회 돌고 hits==0 을 요구했다 — 한 주기가 상한(200ms)을 넘기면
+        //   워치독이 **옳게** 발화하는데 검체는 적색이 된다. 로직 결함이 아니라 벽시계 의존이다.
+        //   ★주입 시계를 쓰지 않는 이유: 프로덕션 API 를 검체 사정으로 바꾸는 대가가 있고,
+        //   시계를 주입해도 결국 재는 것은 같은 상태다. touch 의 계약이
+        //   `deadline = now + timeout` 이므로 **괄호로 재면 부하에 면역**이다 —
+        //   before/after 사이에 러너가 아무리 밀려도 괄호가 함께 벌어진다.
+        for i in 0..8 {
+            let before = std::time::Instant::now();
             wd.touch();
+            let after = std::time::Instant::now();
+            let dl = wd.state.0.lock().unwrap().deadline;
+            assert!(
+                dl >= before + RELOAD_TIMEOUT && dl <= after + RELOAD_TIMEOUT,
+                "{i}번째 touch 가 상한을 now+timeout 으로 재장전하지 않았다 — 정상 전송 중인 \
+                 큰 응답이 잘린다"
+            );
         }
         assert_eq!(
             hits.load(Ordering::SeqCst),
