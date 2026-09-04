@@ -189,8 +189,15 @@ else:
                           if f.startswith("delivery-")) if os.path.isdir(fake_live) else []
         check("3 음성 대조: CYS_STATE_DIR 누락이 '본 레인'을 오염시킨다(검출력 확인)",
               bool(polluted), repr(polluted) or "오염 0 — 이 검체는 아무것도 재지 못한다")
-        check("3b 오염 파일명이 **base 레인**을 겨냥한다(소켓 격리로는 안 막힌다)",
-              any(f.startswith("delivery-base.") for f in polluted), repr(polluted))
+        # ★3b 개정(P0 레인 규칙 수리 반영): 기대값이 뒤집혔다. 수리 전에는 관례 파일명
+        #   (`cys.sock`)을 유지한 격리 소켓이 basename 만으로 **base 로 접혀**
+        #   `delivery-base.*` 를 정확히 겨냥했다(그것이 실사고의 급소였다). 수리 후에는
+        #   부모 디렉터리까지 보므로 **자기 레인**으로 떨어진다.
+        #   그래서 이 축이 지키는 것은 "base 를 겨냥하지 않는다"(2층 방어)로 바뀐다 —
+        #   "라이브 루트 안에 쓴다"는 여전한 사실이고 그것은 위 3 이 잡는다.
+        check("3b 레인 규칙 수리 후: 오염 파일이 base 레인을 겨냥하지 않는다(2층 방어)",
+              polluted and not any(f.startswith("delivery-base.") for f in polluted),
+              repr(polluted))
     finally:
         _stop(p2)
         shutil.rmtree(sb2, ignore_errors=True)
@@ -264,9 +271,23 @@ if HARN is not None:
         check("5d 음성 대조: 종전 하네스(CYS_STATE_DIR 미설정)는 **라이브 원장**을 겨냥했다",
               old_ledger.startswith(live_root + os.sep) and old_epoch.startswith(live_root + os.sep),
               "ledger=%r epoch=%r" % (old_ledger, old_epoch))
-        check("5e 그 표적이 정확히 base 레인 파일이다(소켓 이름이 cys.sock 이라서)",
-              os.path.basename(old_epoch) == "delivery-base.epoch.json",
+        # ★5e 개정(P0 레인 규칙 수리 반영 · 2026-09-04): **이 축의 기대값이 뒤집혔다.**
+        #   수리 전에는 `state-harness/cys.sock` 이 basename 만으로 base 로 접혀 표적이
+        #   `delivery-base.epoch.json` 이었고, 그래서 본 레인 표식이 덮여 임무 게이트가 닫혔다.
+        #   수리 후에는 부모 디렉터리(`cys`)까지 보므로 **자기 레인**으로 떨어진다 — 즉
+        #   CYS_STATE_DIR 를 빠뜨려도 최소한 **base 파일은 더 이상 겨냥하지 않는다**(2층 방어).
+        #   ※ 그래도 라이브 원장 **루트 안**에 쓰는 것은 여전하다 — 그 축은 위 5d 가 지킨다.
+        check("5e 레인 규칙 수리 후: 격리 소켓이 base 로 접히지 않는다(2층 방어)",
+              not os.path.basename(old_epoch).startswith("delivery-base."),
               os.path.basename(old_epoch))
+        try:
+            sys.path.insert(0, BIN)
+            import javis_lane as _L
+            check("5e2 python 판정도 같은 답(공유 코퍼스 계약)",
+                  _L.socket_is_base(HARN.HARN_SOCK) is False,
+                  "socket_is_base(%r)=%r" % (HARN.HARN_SOCK, _L.socket_is_base(HARN.HARN_SOCK)))
+        except Exception as _e:
+            check("5e2 python 판정도 같은 답(공유 코퍼스 계약)", False, "javis_lane 소비 실패: %s" % _e)
     except Exception as e:
         print("SKIP 5d/5e 음성 대조(javis_lane 미사용: %s)" % e)
 
