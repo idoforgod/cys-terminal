@@ -223,6 +223,60 @@ try:
           not os.path.exists(os.path.join(os.path.dirname(hooks), "WINPFX::")),
           str(os.listdir(os.path.dirname(hooks))))
 
+    # ───────── ★H-HOOK-CWD-1: 본체 경로가 **CWD 에 의존하지 않는다**(A2 회귀 · W-C 적발) ─────
+    #   결함: `_LEGACY="${0%/*}/…"` 는 `$0` 에 슬래시가 없으면 `${0%/*}` 가 `$0` 를 그대로
+    #   돌려주고, 그 폴백이 **CWD 상대** `./role-bootstrap-legacy.sh` 였다. PATH 경유 호출
+    #   (`bash -c 'role-bootstrap.sh'`)처럼 `$0` 가 이름뿐이면, 본체가 **실재하는데도**
+    #   '부재 — 부트 미발화'로 판정된다(windows-health H-WIN-11·H-MISSION-1·H-DETECT-10 적색).
+    #   무음이 아니라 **거짓 고지**라 더 나쁘다 — 팩 재설치를 처방하지만 팩은 멀쩡하다.
+    hooks, binp, state, env, mark = lab(root, "cwd")
+    w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
+    w(os.path.join(binp, "cys"), stub_cys(supports_input=False), 0o755)
+    os.chmod(os.path.join(hooks, "role-bootstrap.sh"), 0o755)
+    elsewhere = os.path.join(root, "cwd-elsewhere")
+    os.makedirs(elsewhere, exist_ok=True)
+    env_path = dict(env, PATH=hooks + os.pathsep + env["PATH"])   # 런처를 PATH 로 찾게 한다
+    rc = subprocess.run(["bash", "role-bootstrap.sh"], input='{"prompt":"너는 마스터다"}',
+                        capture_output=True, text=True, timeout=90, env=env_path, cwd=elsewhere)
+    #   ※ 호출 형태 주의: `bash -c 'name'` 은 **전체 경로로 exec** 되어 argv0 에 슬래시가 생기므로
+    #     결함을 재현하지 못한다(실측). `bash <name>` 이라야 PATH 해소 + argv0 이 이름 그대로다.
+    check("CWD-1a $0 에 슬래시가 없어도 본체를 찾는다(PATH 경유·다른 CWD)",
+          rd(mark).count("BODY-RAN") == 1,
+          "mark=%r stderr=%r" % (rd(mark), rc.stderr[-220:]))
+    check("CWD-1b 본체가 실재하는데 '부재' 고지를 내지 않는다",
+          "부트 본체" not in (rc.stdout + rc.stderr),
+          repr((rc.stdout + rc.stderr)[-220:]))
+    check("CWD-1c 반드시 exit 0(사람 프롬프트 불가침)", rc.returncode == 0, str(rc.returncode))
+
+    # ★③ Git Bash 경로형에서도 같은 단언(H-HOOK-WIN-PATH 와 같은 실험실 조건 = cygpath 보유)
+    hooks, binp, state, env, mark = lab(root, "cwd-win")
+    w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
+    w(os.path.join(binp, "cys"), stub_cys(rc_input=6, supports_input=True), 0o755)
+    w(os.path.join(binp, "cygpath"),
+      '#!/bin/sh\ncase "$1" in\n  -u) printf "%s" "$2" ;;\n'
+      '  -w) printf "WINPFX::%s" "$2" ;;\n  *) printf "%s" "$2" ;;\nesac\n', 0o755)
+    os.chmod(os.path.join(hooks, "role-bootstrap.sh"), 0o755)
+    env_pathw = dict(env, PATH=hooks + os.pathsep + env["PATH"])
+    rcw = subprocess.run(["bash", "role-bootstrap.sh"], input='{"prompt":"너는 마스터다"}',
+                         capture_output=True, text=True, timeout=90, env=env_pathw, cwd=elsewhere)
+    #   rc6 이라 본체는 건너뛰는 것이 정상 — 여기서 재는 것은 **'부재' 오판이 없는가** 다.
+    check("CWD-1d Git Bash 경로형에서도 '본체 부재' 오판 0",
+          "부트 본체" not in (rcw.stdout + rcw.stderr),
+          repr((rcw.stdout + rcw.stderr)[-220:]))
+    check("CWD-1e Git Bash 경로형도 exit 0", rcw.returncode == 0, str(rcw.returncode))
+
+    # ★계측 타당성(음성 대조): 본체를 **정말로** 치우면 그때는 '부재' 고지가 나야 한다 —
+    #   위 CWD-1b/1d 가 "고지 없음"을 재므로, 고지가 영영 안 나오는 런처였다면 무의미하다.
+    hooks, binp, state, env, mark = lab(root, "cwd-truly-absent")
+    w(os.path.join(binp, "cys"), stub_cys(supports_input=False), 0o755)
+    os.chmod(os.path.join(hooks, "role-bootstrap.sh"), 0o755)
+    env_pathn = dict(env, PATH=hooks + os.pathsep + env["PATH"])
+    rcn = subprocess.run(["bash", "role-bootstrap.sh"], input='{"prompt":"너는 마스터다"}',
+                         capture_output=True, text=True, timeout=90, env=env_pathn, cwd=elsewhere)
+    check("CWD-1f 본체가 진짜 없으면 정직하게 '부재' 고지(무음 통과 금지)",
+          "부트 본체" in (rcn.stdout + rcn.stderr) and rcn.returncode == 0,
+          repr((rcn.stdout + rcn.stderr)[-220:]))
+
     # ───────── 프리루드: **있으면 소비 · 없으면 자기완결 강등**(master 판정 ②) ─────────
     hooks, binp, state, env, mark = lab(root, "prelude")
     w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)

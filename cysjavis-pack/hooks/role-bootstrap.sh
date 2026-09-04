@@ -148,9 +148,28 @@ if command -v cys >/dev/null 2>&1 \
 fi
 
 # ── ⑦ 본체 위임(그 밖의 모든 rc · 구 CLI · cys 부재) ────────────────────────────────────
-_LEGACY="${0%/*}/role-bootstrap-legacy.sh"
-[ "${0%/*}" = "${0:-}" ] && _LEGACY="./role-bootstrap-legacy.sh"
-if [ ! -f "$_LEGACY" ]; then
+# ★본체 경로는 **CWD 에 의존하지 않는다**(A2 회귀 · windows-health 가 적발).
+#   종전: `_LEGACY="${0%/*}/…"` + `$0` 에 슬래시가 없으면 `./role-bootstrap-legacy.sh`.
+#   그런데 `sh role-bootstrap.sh`(인터프리터 + 이름만 · PATH 해소)로 부르면 argv0 이
+#   이름뿐이라 `${0%/*}` 가 `$0` 를 그대로 돌려주고, 폴백이 **CWD 상대**가 된다.
+#   그러면 본체가 **실재하는데도** '부재 — 부트 미발화'로 판정된다(무음이 아니라 **거짓 고지**라
+#   더 나쁘다: 팩 재설치를 처방하지만 팩은 멀쩡하다). 실측 적발: H-WIN-11·H-MISSION-1·H-DETECT-10.
+#   해소 순서 — ①BASH_SOURCE 디렉터리(argv0 이 이름뿐이어도 정확하다 · 실측 확인)
+#              ②$0 디렉터리(슬래시가 있을 때만) ③팩 계약 경로(프리루드와 동형 2단 폴백)
+#              ④그래도 없으면 **정직 실패**(CWD 상대 추정 금지 — 무음 통과보다 정직한 고지).
+_LEGACY=""
+if [ -n "${BASH_SOURCE:-}" ] && [ "${BASH_SOURCE%/*}" != "${BASH_SOURCE}" ] &&
+   [ -f "${BASH_SOURCE%/*}/role-bootstrap-legacy.sh" ]; then
+  _LEGACY="${BASH_SOURCE%/*}/role-bootstrap-legacy.sh"
+fi
+if [ -z "$_LEGACY" ] && [ "${0%/*}" != "${0:-}" ] &&
+   [ -f "${0%/*}/role-bootstrap-legacy.sh" ]; then
+  _LEGACY="${0%/*}/role-bootstrap-legacy.sh"
+fi
+if [ -z "$_LEGACY" ] && [ -f "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/role-bootstrap-legacy.sh" ]; then
+  _LEGACY="${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/role-bootstrap-legacy.sh"
+fi
+if [ ! -f "${_LEGACY:-}" ]; then
   # 명세 초안은 무조건 `exec` 이었다 — 본체가 없으면 exit 127 이 나가 '반드시 exit 0' 계약이
   # 깨진다. 부서 팩 복제 목록에 본체가 빠지면 확정적으로 재현되는 갈래라 명시 고지로 닫는다.
   rm -f "$IN" 2>/dev/null
