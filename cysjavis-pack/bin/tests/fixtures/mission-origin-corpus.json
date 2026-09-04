@@ -5,7 +5,8 @@
   "소비자: javis_mission.py --self-test(부재 시 내장 리터럴 폴백 · 존재하는데 불량이면 hard fail) · bin/tests/test_mission_origin_parity.py · (예정) Rust src/mission_gate.rs 의 include_str! 파리티.",
   "불변식: 이 파일은 javis_mission.py 내장 MISSION_CORPUS_FALLBACK 의 상위집합이어야 하고(self-test 가 검사), anomaly_codes 는 ANOMALY_CODES 키 집합과 **정확히 같아야** 하며(확장 창구가 아니라 사본이다 — 코드 추가는 javis_mission.py 의 리터럴 발행 지점 + MASTER_DIRECTIVE §0-C 가 함께 움직일 때만), harness_markers 는 HARNESS_NOTIFY/CONTEXT_MARKERS 와 순서까지 같아야 한다.",
   "확장 규칙: 새 케이스는 여기 먼저 넣는다. 기대값은 **판정 함수를 실제로 돌려 뽑은 값**이지 손으로 쓴 값이 아니다. 한국어 진단 산문은 계약면에 넣지 않는다(문구를 다듬는 순간 계측기가 거짓말을 시작한다 — parity_todo_decl.py:17-20). 층1 의 ⓐ전문 일치와 층2 라벨은 둘 다 이상징후를 발행하지 않으므로, 두 축(machine·label)과 ledger_status·anomalies 네 필드의 조합으로 구별된다 — 케이스를 추가할 때 이 구별이 유지되는지 확인하라.",
-  "digest_vectors(2026-09-04 R2 적대검증 MAJOR 반영): 정규화·해시 골든 벡터 10건. **왜 필요한가** — 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어지므로, python↔Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은 그 케이스들로 탐지되지 않는다. 명세 §2-3 이 층1 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized(delivery.rs:709 재사용)` 다. 종전에는 이 앵커가 python self-test **인라인 리터럴**에만 있어 include_str! 로 Rust 에 전달되지 않았고, B1 은 사본을 다시 쓸 수밖에 없었다(이 fixture 가 없애려던 바로 그것). `normalized`·`sha256` 은 실측값이다."
+  "digest_vectors(2026-09-04 R2 적대검증 MAJOR 반영): 정규화·해시 골든 벡터 10건. **왜 필요한가** — 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어지므로, python↔Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은 그 케이스들로 탐지되지 않는다. 명세 §2-3 이 층1 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized(delivery.rs:709 재사용)` 다. 종전에는 이 앵커가 python self-test **인라인 리터럴**에만 있어 include_str! 로 Rust 에 전달되지 않았고, B1 은 사본을 다시 쓸 수밖에 없었다(이 fixture 가 없애려던 바로 그것). `normalized`·`sha256` 은 실측값이다.",
+  "mission_extract(2026-09-04 · B1-5 대장 writer 파리티): `extract_mission` 골든 10건. **왜 필요한가** — 층0/층0-c/층1/층2 는 전부 대장의 **reader**(무엇을 기계유래로 볼 것인가)를 재고, 대장에 무엇이 **쓰이는가**(writer)는 어느 축도 재지 않았다. 임무 문자열이 갈리면 reader 가 아무리 정확해도 자율 착수 게이트가 다른 값을 본다. 기대값은 python `extract_mission` 실측이며(impl/W-B/evidence/b15-python-parity.txt 와 10/10 일치) Rust 측이 include_str! 로 **같은 값을** 소비한다. `expect.mission` 은 문자열·null 또는 {repeat:{unit,times}} 이며, **사유(reason) 산문은 계약면에 넣지 않는다** — 한국어 진단 문구를 다듬는 순간 계측기가 거짓말을 시작한다(위 확장 규칙과 같은 근거)."
  ],
  "$constants": {
   "SCHEMA_VERSION": 1,
@@ -1144,6 +1145,98 @@
     "sha256": "0e9f64031fcb2bc708b531c2a20441580425d151a38503f38592a7dd36019d3b"
    },
    "why": "내부 다중 공백 → 각 1칸"
+  }
+ ],
+ "mission_extract": [
+  {
+   "name": "ME-decl-only",
+   "text": "너는 마스터이다.",
+   "expect": {
+    "mission": null
+   },
+   "why": "선언절 자체는 임무가 아니다 — 제외 후 잔여 0자"
+  },
+  {
+   "name": "ME-question-only",
+   "text": "오늘 뭐부터 할까?",
+   "expect": {
+    "mission": null
+   },
+   "why": "질의절은 **보고 요구**지 임무가 아니다(자율 착수 게이트를 열면 안 된다)"
+  },
+  {
+   "name": "ME-ack-ko",
+   "text": "응",
+   "expect": {
+    "mission": null
+   },
+   "why": "ack 단독절 — 승인·수긍은 임무 지정이 아니다"
+  },
+  {
+   "name": "ME-ack-en-spaced",
+   "text": "  O K  ",
+   "expect": {
+    "mission": null
+   },
+   "why": "공백이 섞인 ok 도 ack 다 — 판정이 원문 공백에 의존하지 않는다"
+  },
+  {
+   "name": "ME-ack-ko-short",
+   "text": "ㅇㅋ",
+   "expect": {
+    "mission": null
+   },
+   "why": "한국어 축약 ack"
+  },
+  {
+   "name": "ME-ack-thanks",
+   "text": "감사합니다",
+   "expect": {
+    "mission": null
+   },
+   "why": "감사절도 임무가 아니다 — 잔여문이 남아도 ack 계열이면 제외"
+  },
+  {
+   "name": "ME-decl-plus-task",
+   "text": "너는 마스터이다. 릴리스 게이트를 통과시켜라.",
+   "expect": {
+    "mission": "릴리스 게이트를 통과시켜라."
+   },
+   "why": "★핵심 양성 — 선언 **뒤**의 임무는 추출된다(선언절만 제외하고 나머지를 살린다)"
+  },
+  {
+   "name": "ME-one-char",
+   "text": "ㄱ",
+   "expect": {
+    "mission": null
+   },
+   "why": "경계 하한 — 잔여 1자 < MISSION_MIN_CHARS(3). 제외 사유 없이도 짧으면 임무가 아니다"
+  },
+  {
+   "name": "ME-long-450",
+   "text": {
+    "repeat": {
+     "unit": "가",
+     "times": 450
+    }
+   },
+   "expect": {
+    "mission": {
+     "repeat": {
+      "unit": "가",
+      "times": 400
+     }
+    }
+   },
+   "why": "★상한 절단 — writer 가 400자로 자른다. 잘린 **길이**가 계약이므로 골든으로 박는다"
+  },
+  {
+   "name": "ME-bare-task",
+   "text": "릴리스 게이트를 통과시켜라.",
+   "expect": {
+    "mission": "릴리스 게이트를 통과시켜라."
+   },
+   "why": "선언이 없어도 임무는 임무다 — 선언 존재를 임무의 전제로 삼지 않는다"
   }
  ]
 }

@@ -2401,7 +2401,8 @@ def cmd_hook_triage(argv):
 #                         self-test 가 의미 있게 돌아야 한다). 라벨로 폴백 사실을 드러낸다.
 #   · fixture 존재+불량 → **hard fail**(조용한 폴백은 corpus 부식을 통과로 접는다).
 #   · 정상              → fixture ⊇ 내장 리터럴 불변식까지 검사.
-MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2", "digest_vectors")
+MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2", "digest_vectors",
+                           "mission_extract")
 
 # 내장 폴백(= fixture 의 진부분집합). 축마다 **양방향**(접힘 1 · 통과 1)을 갖춘다 — 한 방향만
 # 두면 "전부 접는다"·"전부 통과시킨다"는 무력화가 초록으로 지나간다.
@@ -2453,6 +2454,15 @@ MISSION_CORPUS_FALLBACK = {
          "expect": {"label": True, "head": "["}},
         {"name": "L2-owner-plain", "text": "다음 액션 착수해줘",
          "expect": {"label": False, "head": "다"}},
+    ],
+    # 대장 **writer**(extract_mission) 골든. reader 축들과 달리 "대장에 무엇이 쓰이는가"를 잰다.
+    "mission_extract": [
+        {"name": "ME-decl-only", "text": "너는 마스터이다.",
+         "expect": {"mission": None}},
+        {"name": "ME-decl-plus-task", "text": "너는 마스터이다. 릴리스 게이트를 통과시켜라.",
+         "expect": {"mission": "릴리스 게이트를 통과시켜라."}},
+        {"name": "ME-long-450", "text": {"repeat": {"unit": "가", "times": 450}},
+         "expect": {"mission": {"repeat": {"unit": "가", "times": 400}}}},
     ],
 }
 
@@ -2688,6 +2698,19 @@ def _selftest_mission_corpus(fails):
         _eq("digest_vectors", c["name"], "normalized",
             _normalize_delivery(t), c["expect"]["normalized"])
         _eq("digest_vectors", c["name"], "sha256", delivery_digest(t), c["expect"]["sha256"])
+
+    # ── ⑤-c mission_extract — 대장 **writer** 파리티(B1-5 · python 실측 10건) ──────────
+    # 층0/0-c/1/2 는 전부 대장의 **reader**(무엇을 기계유래로 볼 것인가)를 잰다. 그런데 대장에
+    # 무엇이 **쓰이는가**(writer)는 어느 축도 재지 않았다 — 임무 문자열이 갈리면 reader 가 아무리
+    # 정확해도 자율 착수 게이트는 다른 값을 본다. 특히 400자 **상한 절단**은 길이가 곧 계약이라
+    # 골든이 아니면 2언어가 조용히 갈린다(층1 레코드처럼 소비자가 만들어 내는 값이 아니다).
+    _me_detect = _detect_mod()
+    for c in data.get("mission_extract") or []:
+        _want = c["expect"]["mission"]
+        if _want is not None:
+            _want = _corpus_text(_want)
+        _eq("mission_extract", c["name"], "mission",
+            extract_mission(_corpus_text(c["text"]), _me_detect)[0], _want)
 
     # ── ⑥ 층2 — push 규약 라벨 ───────────────────────────────────────────────
     for c in data["layer2"]:
@@ -4254,6 +4277,7 @@ def cmd_self_test():
           "path=ledger_path 일치 · 기계 라벨=machine · 층0 독립(harness "
           "알림 MO=human·record 폴드 유지) · 파싱 실패=record rc2+MO unknown 각자 fail-closed) · "
           "★판정표 단일 원본(A3 · tests/fixtures/mission-origin-corpus.json): 층0/층0-c/층1/층2 "
+          "+ ★mission_extract(대장 writer 골든 10건 · 400자 상한 절단 포함) "
           "케이스 소비 + $constants·ANOMALY_CODES·HARNESS_MARKERS 열거 파리티 + fixture ⊇ 내장 "
           "리터럴 불변식(부재면 내장 폴백 · 불량이면 hard fail)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
