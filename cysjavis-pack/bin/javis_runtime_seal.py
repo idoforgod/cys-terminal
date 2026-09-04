@@ -83,7 +83,15 @@ def walk_entries(root, exclude=()):
     """
     entries = {}
     root = os.path.abspath(root)
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+
+    def _raise(err):
+        """★`os.walk` 는 기본값(onerror=None)에서 디렉터리 판독 오류를 **조용히 삼킨다**.
+        그러면 권한 없는 디렉터리가 통째로 스캔에서 빠져 그 아래 항목이 전부 '누락(missing)'
+        으로 보고된다 — 즉 **판정 불가가 봉인 파손으로 둔갑**한다. 여기서 올려 보내
+        호출측이 exit 2 로 닫게 한다(R1 codex #7)."""
+        raise err
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise):
         dirnames.sort()
         filenames.sort()
         # os.walk 는 심링크 디렉토리를 dirnames 에 넣고 followlinks=False 면 내려가지 않는다.
@@ -182,11 +190,19 @@ def _cmd_emit(a):
     if not os.path.isdir(a.root):
         print("✗ 대상 트리 없음: %s" % a.root, file=sys.stderr)
         return 2
-    m = build_manifest(a.root, app_version=a.app_version or "", source=a.source or "")
-    out = os.path.abspath(a.out)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(dumps(m))
+    # ★판독 실패는 traceback 이 아니라 **판정 불가(exit 2)** 다(R1 codex #7).
+    #   권한 거부·Windows 공유위반(WinError 32)·경로 소멸은 "봉인이 깨졌다"가 아니라
+    #   "재지 못했다"이며, 그 둘을 같은 코드로 내보내면 소비자가 구분할 수 없다.
+    try:
+        m = build_manifest(a.root, app_version=a.app_version or "", source=a.source or "")
+        out = os.path.abspath(a.out)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(dumps(m))
+    except OSError as e:
+        print("✗ 트리 판독·산출 실패(%s) — 판정 불가(측정 불능은 통과가 아니다)" % e,
+              file=sys.stderr)
+        return 2
     c = m["counts"]
     print("✓ runtime-manifest: 파일 %d · 심링크 %d · 기타 %d · digest %s → %s"
           % (c["files"], c["symlinks"], c["other"], m["digest"][:16], out))
@@ -207,7 +223,17 @@ def _cmd_verify(a):
     except (ValueError, json.JSONDecodeError) as e:
         print("✗ 매니페스트 판독 실패(%s) — 판정 불가" % e, file=sys.stderr)
         return 2
-    d = classify(m, a.root)
+    # ★classify 는 트리를 실제로 읽는다 — 여기서 나는 OSError 도 rc 2 다(R1 codex #7).
+    #   종전에는 load_manifest 만 감싸 있어 공유위반·권한 거부가 uncaught traceback +
+    #   rc 1(=불일치)로 새어 나갔다. 그러면 "봉인 파손"과 "판정 불가"가 같은 코드가 된다.
+    try:
+        d = classify(m, a.root)
+    except OSError as e:
+        if a.json:
+            print(json.dumps({"ok": False, "undecidable": True, "reason": str(e)},
+                             ensure_ascii=False, sort_keys=True))
+        print("✗ 트리 판독 실패(%s) — 판정 불가(측정 불능은 통과가 아니다)" % e, file=sys.stderr)
+        return 2
     total = len(d["missing"]) + len(d["added"]) + len(d["changed"])
     if a.json:
         print(json.dumps({"ok": total == 0, "counts": {k: len(v) for k, v in d.items()},

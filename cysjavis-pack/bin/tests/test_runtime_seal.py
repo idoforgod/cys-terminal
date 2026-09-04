@@ -65,6 +65,14 @@ class RuntimeSealTests(unittest.TestCase):
         self.assertEqual(0, self._emit())
 
     def tearDown(self):
+        # ★권한을 되돌린 뒤에 지운다. addCleanup 은 tearDown **뒤**에 돌아 이미 삭제된 경로를
+        #   만지고, rmtree 는 0o000 디렉터리를 지우지 못해(ignore_errors 로 조용히) 임시폴더를
+        #   남긴다 — 둘 다 여기서 막는다.
+        for p in getattr(self, "_chmodded", []):
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ── 하네스 ──────────────────────────────────────────────────────────
@@ -187,6 +195,44 @@ class RuntimeSealTests(unittest.TestCase):
             json.dump({"schema": 99, "entries": {}}, f)
         rc, _ = self._verify(man=wrong)
         self.assertEqual(2, rc, "미지 schema 가 통과로 접혔다")
+
+    # ── ⑫ 판독 실패(권한·공유위반)는 불일치가 아니라 판정 불가다 (R1 codex #7) ──
+    #   Windows 의 sharing violation(WinError 32)과 POSIX 의 EACCES 는 같은 계급이다 —
+    #   "봉인이 깨졌다"가 아니라 "재지 못했다". 둘을 같은 exit 로 내보내면 소비자가 구분할 수
+    #   없고, 특히 rc 1(불일치)로 새면 **없는 파손을 보고**하게 된다.
+    def _drop_read_permission(self, path):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("권한 거부를 주입할 수 없는 환경(root·비 POSIX) — 무측정을 명시 skip 한다")
+        self._chmodded = getattr(self, "_chmodded", [])
+        self._chmodded.append(path)
+        os.chmod(path, 0o000)
+        if os.access(path, os.R_OK):
+            self.skipTest("이 파일계가 권한을 강제하지 않는다 — 주입 실패(명시 skip)")
+
+    def test_unreadable_file_is_undecidable_not_mismatch(self):
+        target = os.path.join(self.root, "python", "lib", "mod.py")
+        self._drop_read_permission(target)
+        rc, d = self._verify()
+        self.assertEqual(2, rc, "판독 실패가 rc %d 로 샜다(1이면 '없는 파손'을 보고한 것) — %r" % (rc, d))
+        self.assertTrue(d.get("undecidable"), "JSON 에 판정 불가 표기가 없다: %r" % d)
+        self.assertFalse(d.get("ok"))
+
+    def test_unreadable_directory_is_undecidable_not_missing(self):
+        """★os.walk 기본값이 디렉터리 오류를 삼키면 그 아래가 전부 '누락' 으로 둔갑한다."""
+        target = os.path.join(self.root, "git", "libexec", "git-core")
+        self._drop_read_permission(target)
+        rc, d = self._verify()
+        self.assertEqual(2, rc,
+                         "권한 없는 디렉터리가 '누락' 으로 보고됐다(rc %d · %r) — 판정 불가여야 한다"
+                         % (rc, d))
+        self.assertTrue(d.get("undecidable"))
+
+    def test_emit_read_failure_is_undecidable(self):
+        target = os.path.join(self.root, "python", "bin", "python3")
+        self._drop_read_permission(target)
+        out = os.path.join(self.tmp, "emit-fail.json")
+        rc = self._emit(out=out)
+        self.assertEqual(2, rc, "emit 판독 실패가 rc %d — 판정 불가(2)여야 한다" % rc)
 
     # ── ⑪ 매니페스트 자기 제외 ─────────────────────────────────────────
     def test_manifest_inside_root_is_self_excluded(self):
