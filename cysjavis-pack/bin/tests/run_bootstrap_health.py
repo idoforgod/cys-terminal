@@ -5500,19 +5500,49 @@ def h_pred_6():
         need(B._socket_is_base(sock) is want,
              "부서 판정 불일치: %s → %r(기대 %r)" % (sock, B._socket_is_base(sock), want))
     notes.append("부서 판정(셸↔python) 정합")
-    # ⓓ BUDGET 상수 파리티(H-TIME-1 과 짝) — Rust 블록 ↔ python leaf
-    csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    # ⓓ BUDGET 상수 파리티(H-TIME-1 과 짝) — Rust 블록 ↔ python SOT
+    #   ★확장(2026-09-05 · master 지시 · W-B 조율): 종전엔 `src/bin/cys.rs` 의 **u64 리터럴**만
+    #     훑어서 cysd 감독자 상수(f64·u32·usize)가 통째로 대조 밖이었다 — python 이 값을 바꿔도
+    #     아무도 모르는 무측정 계급이다. 이제 표가 (python 키 · 소스 · 타입)을 지고 감독자 파일도 훑는다.
     import javis_budget as BU
-    bad = []
-    for rust_name, py_name in BU.RUST_PARITY_CONSTS.items():
-        m = re.search(r"const %s: u64 = (\d+);" % re.escape(rust_name), csrc)
+    _PARITY_SRC = {"cys": os.path.join("src", "bin", "cys.rs"),
+                   "cysd_boot_supervisor": os.path.join("src", "bin", "cysd", "boot_supervisor.rs")}
+    _NUM = {"u64": r"\d+", "u32": r"\d+", "usize": r"\d+", "f64": r"\d+(?:\.\d+)?"}
+    _src_cache, bad, pend = {}, [], []
+    for rust_name, (py_name, src_key, kind) in BU.RUST_PARITY_CONSTS.items():
+        if src_key not in _src_cache:
+            _src_cache[src_key] = _repo_file(_PARITY_SRC[src_key])
+        m = re.search(r"const %s: %s = (%s);" % (re.escape(rust_name), kind, _NUM[kind]),
+                      _src_cache[src_key])
         if not m:
-            bad.append("%s 상수 부재" % rust_name)
+            (pend if rust_name in BU.RUST_PARITY_PENDING else bad).append(
+                "%s 상수 부재(%s)" % (rust_name, src_key))
             continue
-        if int(m.group(1)) != int(BU.leaf(py_name)):
-            bad.append("%s=%s ≠ python %s=%s" % (rust_name, m.group(1), py_name, BU.leaf(py_name)))
+        if float(m.group(1)) != float(BU.parity_value(py_name)):
+            bad.append("%s=%s ≠ python %s=%s"
+                       % (rust_name, m.group(1), py_name, BU.parity_value(py_name)))
+    # 유도 상수는 값이 아니라 **유도식**을 핀한다 — python 에 값을 복제하면 그 복제가 새 드리프트면이
+    #   되기 때문이다(W-B 지적 수용). 누가 유도를 리터럴로 굳히면 여기서 잡힌다.
+    _dsrc = _src_cache.get("cysd_boot_supervisor") or _repo_file(_PARITY_SRC["cysd_boot_supervisor"])
+    for rust_name, expr in BU.CYSD_DERIVED_PINS.items():
+        m = re.search(r"const %s: [a-z0-9]+ = (.+?);" % re.escape(rust_name), _dsrc)
+        if not m:
+            pend.append("%s 유도 상수 부재" % rust_name)
+        elif m.group(1).strip() != expr:
+            bad.append("%s 유도식 변경: %r(기대 %r) — 리터럴로 굳히면 SOT 가 둘이 된다"
+                       % (rust_name, m.group(1).strip(), expr))
     need(not bad, "BUDGET 상수 파리티 붕괴: %r" % bad)
-    notes.append("BUDGET 상수 %d종 rust↔python 파리티" % len(BU.RUST_PARITY_CONSTS))
+    # ★PEND 는 "아직 이 레인에 없다"이지 "안 잰다"가 아니다. 목록 밖 부재는 위에서 이미 적색이고,
+    #   통합 트리에서는 **PEND 0** 이 조건이다(C4 판독 · 그래야 무측정이 남지 않는다).
+    _allowed_pend = BU.RUST_PARITY_PENDING | set(BU.CYSD_DERIVED_PINS)
+    _stray = [x for x in pend if x.split()[0] not in _allowed_pend]
+    need(not _stray, "PEND 목록 밖 상수 부재(무측정): %r" % _stray)
+    notes.append("BUDGET 상수 %d종 rust↔python 파리티(cys.rs %d · cysd 감독자 %d · 유도식 핀 %d) · PEND %d종%s"
+                 % (len(BU.RUST_PARITY_CONSTS),
+                    sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] == "cys"),
+                    sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] != "cys"),
+                    len(BU.CYSD_DERIVED_PINS), len(pend),
+                    (" — " + "; ".join(pend)) if pend else ""))
     return " · ".join(notes)
 
 
@@ -6227,6 +6257,16 @@ def h_time_1():
     csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("BUDGET_HEARTBEAT_INTERVAL_SECS" in csrc, "cys boot 하트비트 상수가 없다")
     notes.append("하트비트 3지점(stderr)")
+    # ⓖ cysd 감독자 상수가 파리티 표에 **등재돼 있는가**(값 대조는 짝 검체 H-PRED-6 ⓓ 가 한다).
+    #   ★이 축의 이유(2026-09-05 · master 지시): 감독자 임계가 표 밖에 있으면 python 이 값을 바꿔도
+    #     조용히 드리프트한다 — 등재 자체가 무측정 방지의 첫 관문이다.
+    _cysd_reg = {k for k, v in BU.RUST_PARITY_CONSTS.items() if v[1] == "cysd_boot_supervisor"}
+    for _must in ("INTENT_MAX_AGE_SECS", "RETRY_COOLDOWN_SECS", "MAX_ATTEMPTS",
+                  "SUPERVISOR_INTERVAL_SECS", "HB_STALL_SECS", "PROGRESS_STALL_SECS"):
+        need(_must in _cysd_reg, "cysd 감독자 상수 %s 가 파리티 표에 없다(조용한 드리프트 면)" % _must)
+    need(set(BU.CYSD_DERIVED_PINS) == {"MAX_LIVE_BOOT_RUNS", "FENCED_REAP_AGE_SECS"},
+         "유도식 핀 목록이 바뀌었다 — 유도를 리터럴로 굳히는 변경은 표와 함께 와야 한다")
+    notes.append("cysd 감독자 상수 %d종 등재 + 유도식 핀 2종" % len(_cysd_reg))
     r = _run([PY, os.path.join(BIN_DIR, "javis_budget.py"), "--self-test"], timeout=60)
     need(r.returncode == 0, "javis_budget self-test 실패:\n%s" % r.stdout[-600:])
     return " · ".join(notes) + " · budget self-test PASS"
