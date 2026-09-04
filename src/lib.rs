@@ -908,7 +908,10 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
         let fresh = windows_registry_path();
         let home = home_dir();
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        let user_bins: Vec<String> = windows_user_bin_dirs(&home, appdata.as_deref())
+        // ★B7: `%LOCALAPPDATA%\cys-npm` 는 ⑥이 얹는 npm 기본 prefix 다 — 주입과 발견은 한 쌍.
+        let localappdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let user_bins: Vec<String> =
+            windows_user_bin_dirs(&home, appdata.as_deref(), localappdata.as_deref())
             .into_iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -1007,6 +1010,197 @@ pub fn inject_claude_code_git_bash_path_for(
         ENV_CLAUDE_CODE_GIT_BASH_PATH.to_string(),
         p.to_string_lossy().into_owned(),
     ));
+}
+
+/// ── B7(F4 · 명세 §2-10 · 시뮬 T2-4): npm 전역 prefix ────────────────────────────
+///
+/// npm 전역 설치 prefix 를 지정하는 env 키. npm 은 `npm_config_<key>` **소문자** 규약으로
+/// 설정을 env 에서 읽는다(대문자 `NPM_CONFIG_PREFIX` 도 npm 이 접지만, 우리가 쓰는 철자는
+/// 하나로 고정한다 — 두 철자를 동시에 얹으면 어느 쪽이 이겼는지 진단이 불가능해진다).
+pub const ENV_NPM_CONFIG_PREFIX: &str = "npm_config_prefix";
+
+/// Windows 기본 prefix 가 놓이는 `%LOCALAPPDATA%` 하위 디렉터리 이름.
+///
+/// `%LOCALAPPDATA%\npm`(npm 관례)이 아니라 **전용 이름**을 쓰는 이유: 우리가 만들어 준
+/// 기본값과 사용자가 스스로 쓰던 npm 트리를 구별할 수 있어야 G5(봉인) 진단이 "누가 넣었나"를
+/// 말할 수 있다. `%APPDATA%\npm` 은 [`windows_user_bin_dirs`] 가 PATH 후보로 이미 싣는다.
+pub const NPM_PREFIX_WIN_SUBDIR: &str = "cys-npm";
+
+/// `npm_config_prefix` 기본값(**순수** — env 도 디스크도 보지 않는다).
+///
+/// os 를 인자로 받는 이유는 [`bundled_git_bash_path_for`] 와 동일하다 — 회귀 핀이 mac CI 에서도
+/// Windows 분기를 **실제로 밟는다**(cfg 로 갈라 두면 그 분기는 영원히 시험되지 않는다).
+///
+///   · `windows` → `%LOCALAPPDATA%\cys-npm`
+///   · 그 외      → `$HOME/.local`  (claude native 설치 위치 `~/.local/bin` 의 부모 =
+///     [`compose_unix_pane_path`] 가 이미 PATH 말미에 얹는 그 트리와 같은 곳이다)
+///
+/// 근거 좌표(home·localappdata)가 없으면 `None` = **무주입**(fail-open). 없는 경로를 prefix 로
+/// 통보하는 쪽이 미통보보다 나쁘다(npm 이 그 경로에 설치를 시도하다 실패한다).
+pub fn npm_config_prefix_default_for(
+    os: &str,
+    home: Option<&Path>,
+    localappdata: Option<&Path>,
+) -> Option<PathBuf> {
+    if os == "windows" {
+        return localappdata
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(NPM_PREFIX_WIN_SUBDIR));
+    }
+    home.filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(".local"))
+}
+
+/// 설치 스코프 루트(**순수**) — "이 트리 아래는 우리 설치본이다" 의 좌표.
+///
+/// macOS 는 실행물이 `…/X.app/Contents/MacOS/` 에 있으므로 exe_dir 자신이 아니라 **번들
+/// 루트**(`X.app`)가 스코프다. 그 레이아웃 판정의 SOT 는 [`crate::app_bundle::enclosing_bundle`]
+/// 하나이며 여기서 **재사용**한다 — 규칙 사본을 만들면 한쪽만 고쳐지는 회귀가 난다
+/// (`BUNDLED_GIT_BASH_REL` 재사용 계약과 같은 규율). 입력 arity 만 다르므로(그쪽은 exe 경로,
+/// 여기는 exe_dir) 더미 파일명을 얹어 같은 규칙에 태운다.
+///
+/// Windows·Linux 는 설치 디렉터리가 곧 exe_dir 이다(NSIS `<install>\cys.exe`).
+/// 번들 레이아웃이 아니면 exe_dir 을 그대로 돌려준다 — 개발 빌드(`target/debug/`)에서는
+/// 그 디렉터리 아래를 prefix 로 쓰는 사람이 없으므로 무해하다.
+pub fn install_scope_root_for(exe_dir: &Path, os: &str) -> PathBuf {
+    if os == "macos" {
+        if let Some(root) = crate::app_bundle::enclosing_bundle(&exe_dir.join("x")) {
+            return root;
+        }
+    }
+    exe_dir.to_path_buf()
+}
+
+/// `npm_config_prefix` 에 대한 **판정**(순수). 네 값은 서로 배타적이며 각각 다른 행동을 낳는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpmPrefixVerdict {
+    /// 사용자 값 부재 → 기본값을 얹는다.
+    Inject(PathBuf),
+    /// 사용자 값 존재 · 설치본 **밖** → 무접촉. 그 값이 우리 것보다 나쁘더라도 **사용자
+    /// 소유물**이다(⑤ 불가침 계약 ①과 같은 규율).
+    KeepUser,
+    /// 사용자 값 존재 · 설치본 **내부** → 무접촉 + **경고**.
+    ///
+    /// ★시뮬 T2-4 가 명세 §2-10 을 뒤집은 지점이다(§4 반영 목록 = v2.1 · 명세보다 우선).
+    /// v2 초안은 "기본값으로 **덮고** 고지"였다. 그러나 그것은 사용자가 **의도적으로** 설정한
+    /// 값을 우리가 말없이 무효화하는 것이라 MAJ#1(fail-open) 정신과 정면으로 충돌한다.
+    /// 그래서 덮지 않고 **경고만** 한다 — G5(봉인 보존)의 정의를 "우리 기본값이 번들을
+    /// 오염시키지 않는다"로 **정직하게 축소**하고, 사용자의 의도적 오염은 보장 밖으로 둔다.
+    WarnBundlePolluted {
+        /// 사용자가 설정한 값(원문).
+        user_value: String,
+        /// 그 값이 그 아래에 있다고 판정된 설치 스코프 루트.
+        scope_root: PathBuf,
+    },
+    /// 기본값 좌표가 없다(home·%LOCALAPPDATA% 부재) → 무접촉. **fail-open**.
+    NoDefault,
+}
+
+/// [`NpmPrefixVerdict`] 산출(**순수**). env·디스크는 호출부가 관측해 인자로 넘긴다.
+///
+/// 판정 순서가 곧 우선순위다: 사용자 값 있음(→ 번들 내부인가) → 없음(→ 기본값 있는가).
+/// 사용자 값을 먼저 보는 이유는 ①이 불가침이기 때문이다 — 기본값 계산 실패가 사용자 값
+/// 존중을 뒤집어선 안 된다.
+pub fn npm_config_prefix_verdict_for(
+    os: &str,
+    exe_dir: &Path,
+    home: Option<&Path>,
+    localappdata: Option<&Path>,
+    user_value: Option<&str>,
+) -> NpmPrefixVerdict {
+    if let Some(uv) = user_value.filter(|v| !v.trim().is_empty()) {
+        let scope_root = install_scope_root_for(exe_dir, os);
+        if path_is_within(Path::new(uv), &scope_root) {
+            return NpmPrefixVerdict::WarnBundlePolluted {
+                user_value: uv.to_string(),
+                scope_root,
+            };
+        }
+        return NpmPrefixVerdict::KeepUser;
+    }
+    match npm_config_prefix_default_for(os, home, localappdata) {
+        Some(p) => NpmPrefixVerdict::Inject(p),
+        None => NpmPrefixVerdict::NoDefault,
+    }
+}
+
+/// `candidate` 가 `root` 아래(또는 root 자신)인가 — **순수·어휘적 판정**(디스크 무접촉).
+///
+/// `starts_with` 를 쓰는 이유이자 그 한계: `Path::starts_with` 는 **컴포넌트 단위**로 비교하므로
+/// `/a/bc` 가 `/a/b` 아래로 잘못 잡히는 접두 사고가 없다(문자열 비교였다면 났다).
+/// 대신 심볼릭 링크·`..`·대소문자(Windows)는 **풀지 않는다** — 이 판정의 소비자는 경고 한 줄
+/// 뿐이라 오탐·미탐의 대가가 모두 작고, 여기서 `canonicalize` 를 부르면 순수성과 함께
+/// "존재하지 않는 경로는 판정 불가" 라는 새 실패 모드가 생긴다(그쪽이 더 나쁘다).
+pub fn path_is_within(candidate: &Path, root: &Path) -> bool {
+    !root.as_os_str().is_empty() && candidate.starts_with(root)
+}
+
+/// 번들 오염 경고 문안(순수) — pane 첫 줄 고지와 preflight 가 **같은 문자열**을 쓴다.
+/// 문안을 두 벌 두면 한쪽만 고쳐져 사용자가 서로 다른 처방을 받는다.
+pub fn npm_prefix_bundle_warning(user_value: &str, scope_root: &Path) -> String {
+    format!(
+        "[cys] npm_config_prefix 가 설치본 안({})을 가리킵니다: {user_value}\n\
+         \u{2003}npm 전역 설치가 설치본을 변경하면 코드서명·봉인이 깨져 다음 실행이 차단될 수 \
+         있습니다(그래도 값은 덮지 않습니다 — 사용자 설정입니다).\n\
+         \u{2003}설치본 밖(예: {}) 으로 옮기시길 권합니다.",
+        scope_root.display(),
+        if cfg!(windows) {
+            "%LOCALAPPDATA%\\cys-npm"
+        } else {
+            "$HOME/.local"
+        }
+    )
+}
+
+/// `npm_config_prefix` 주입의 **순수 코어**. 불가침 계약은
+/// [`inject_claude_code_git_bash_path_for`] 와 **동형**이다:
+///   ① 사용자가 값을 가졌으면 절대 덮지 않는다(판정이 `Inject` 가 아닌 모든 경우).
+///   ② 이미 쌓인 쌍에 같은 키가 있으면 손대지 않는다(later-wins 뒤집기·중복 금지).
+///   ③ 기본값 좌표가 없으면 아무것도 얹지 않는다 — fail-open.
+///   ④ `master_off`(`CYS_BOOT_GATES=0`)면 주입하지 않는다 = 종전 동작 완전 복귀.
+///      이 축 전용 노브는 **만들지 않는다**(⑤ 주석의 규율 — 사고 순간에 사람은 노브를
+///      조합하지 못한다).
+pub fn inject_npm_config_prefix_for(
+    env_pairs: &mut Vec<(String, String)>,
+    verdict: &NpmPrefixVerdict,
+    master_off: bool,
+) {
+    if master_off {
+        return;
+    }
+    let NpmPrefixVerdict::Inject(p) = verdict else {
+        return;
+    };
+    if env_pairs.iter().any(|(k, _)| k == ENV_NPM_CONFIG_PREFIX) {
+        return;
+    }
+    env_pairs.push((
+        ENV_NPM_CONFIG_PREFIX.to_string(),
+        p.to_string_lossy().into_owned(),
+    ));
+}
+
+/// [`npm_config_prefix_verdict_for`] 를 **현재 프로세스 env** 로 계산한다(관측 층).
+///
+/// 경고 문안이 필요한 소비자(pane 첫 줄 고지·preflight 브리지)가 `spawn_env_pairs` 의
+/// 반환값(쌍 목록)에서는 판정을 되읽을 수 없으므로, 같은 판정을 **한 번 더** 부르는 이
+/// 접근자를 둔다. 판정은 순수 함수 하나뿐이라 두 호출이 갈릴 수 없다.
+pub fn npm_config_prefix_verdict_from_process(exe_dir: &Path) -> NpmPrefixVerdict {
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(home_dir);
+    let localappdata = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let user = std::env::var(ENV_NPM_CONFIG_PREFIX).ok();
+    npm_config_prefix_verdict_for(
+        std::env::consts::OS,
+        exe_dir,
+        Some(home.as_path()),
+        localappdata.as_deref(),
+        user.as_deref(),
+    )
 }
 
 /// ── P4-2: Windows 설치본 runtime 결손 검사(advisory 전용 · stat-only) ─────────────
@@ -1185,6 +1379,18 @@ pub fn spawn_env_pairs(
         std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH).is_some(),
         boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
     );
+    // ⑥ npm_config_prefix(B7 · F4 · 명세 §2-10 + 시뮬 T2-4): npm 전역 설치가 **설치본 안**에
+    //    쓰이면 코드서명 봉인이 깨진다(SEAL-1 이 .pyc 로 겪은 그 사고의 npm 판). 그래서 키가
+    //    **부재할 때만** 설치본 밖 기본값을 얹는다. 사용자 값이 이미 있으면 그것이 설치본
+    //    안이더라도 **덮지 않고 경고만** 한다(T2-4 — 의도적 설정을 말없이 무효화하지 않는다).
+    //    ⑤와 같이 조건부 쌍이다 — 조건 미충족 시 아무것도 얹지 않아 종전과 완전히 동일하다.
+    //    경고 문안이 필요한 소비자는 `npm_config_prefix_verdict_from_process` 로 같은 판정을
+    //    되읽는다(판정은 순수 함수 하나뿐이라 두 호출이 갈릴 수 없다).
+    inject_npm_config_prefix_for(
+        &mut env,
+        &npm_config_prefix_verdict_from_process(exe_dir),
+        boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
+    );
     env
 }
 
@@ -1267,13 +1473,32 @@ pub fn expand_windows_env(s: &str, lookup: impl Fn(&str) -> Option<String>) -> S
     out
 }
 
-/// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin` 와
-/// npm 전역 `%APPDATA%\npm`. 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
+/// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin`,
+/// npm 전역 `%APPDATA%\npm`, 그리고 ★B7 이 추가한 우리 기본 prefix `%LOCALAPPDATA%\cys-npm\bin`.
+/// 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
 /// (셸은 없는 PATH 항목을 무시·claude 설치 직후 재시작 없이 발견). OS 무관 컴파일(순수·테스트 가능).
-pub fn windows_user_bin_dirs(home: &Path, appdata: Option<&Path>) -> Vec<PathBuf> {
+///
+/// ★B7(명세 §2-10) 시그니처 확장 — `localappdata` 3번째 인자 추가. 이유: [`spawn_env_pairs`] ⑥이
+/// `npm_config_prefix` 를 `%LOCALAPPDATA%\cys-npm` 로 **얹기만 하고** 그 아래 `bin` 을 PATH 후보로
+/// 넣지 않으면, 사용자가 `npm i -g <도구>` 를 해도 그 도구를 **영원히 발견하지 못한다**(claude
+/// native 설치가 `~/.local/bin` 을 rc 에 안 넣어 겪은 그 결함과 동형). 주입과 발견은 한 쌍이다.
+///
+/// npm 은 Windows 에서 prefix **직하**에 `.cmd` 셈을 놓는 구현과 `prefix\bin` 을 쓰는 구현이
+/// 섞여 있어(설정·버전 의존) **둘 다** 후보로 넣는다 — is_dir 게이트가 없으므로 없는 쪽은
+/// 셸이 조용히 무시하고, 있는 쪽만 효력을 갖는다(과잉 후보의 대가 = 0).
+pub fn windows_user_bin_dirs(
+    home: &Path,
+    appdata: Option<&Path>,
+    localappdata: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut v = vec![home.join(".local").join("bin")];
     if let Some(a) = appdata {
         v.push(a.join("npm"));
+    }
+    if let Some(l) = localappdata.filter(|p| !p.as_os_str().is_empty()) {
+        let root = l.join(NPM_PREFIX_WIN_SUBDIR);
+        v.push(root.join("bin"));
+        v.push(root);
     }
     v
 }
@@ -3143,15 +3368,213 @@ mod tests {
     fn windows_user_bin_dirs_composition() {
         let home = Path::new(r"C:\Users\x");
         let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
-        let with = windows_user_bin_dirs(home, Some(&appdata));
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        let with = windows_user_bin_dirs(home, Some(&appdata), None);
         let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
         assert_eq!(got.len(), 2);
         assert!(got[0].contains(".local") && got[0].ends_with("bin"), "local/bin: {got:?}");
         assert!(got[1].ends_with("npm"), "appdata/npm: {got:?}");
         // APPDATA 부재 시 .local/bin 만.
-        let none = windows_user_bin_dirs(home, None);
+        let none = windows_user_bin_dirs(home, None, None);
         assert_eq!(none.len(), 1);
+
+        // ★B7(H-NPM-2 일부): %LOCALAPPDATA% 가 있으면 우리 기본 prefix 의 `bin` 과 루트가
+        //   **둘 다** 후보로 붙는다(npm 구현에 따라 `prefix\` 직하 또는 `prefix\bin`).
+        //   주입(⑥)만 하고 발견(PATH)을 빠뜨리면 `npm i -g` 산출물이 영원히 안 보인다.
+        let full = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
+        let fg: Vec<String> = full.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(fg.len(), 4, "후보 4종(.local/bin · appdata/npm · cys-npm/bin · cys-npm): {fg:?}");
+        assert!(
+            fg[2].contains(NPM_PREFIX_WIN_SUBDIR) && fg[2].ends_with("bin"),
+            "cys-npm/bin 누락: {fg:?}"
+        );
+        assert!(fg[3].ends_with(NPM_PREFIX_WIN_SUBDIR), "cys-npm 루트 누락: {fg:?}");
+        // 음성 대조 — 빈 %LOCALAPPDATA% 는 좌표가 아니다(빈 경로 후보를 PATH 에 흘리지 않는다).
+        let empty = windows_user_bin_dirs(home, Some(&appdata), Some(Path::new("")));
+        assert_eq!(empty.len(), 2, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
+    }
+
+    /// ★H-NPM-1(B7 · 명세 §2-10): `npm_config_prefix` 는 **키가 부재할 때만** 얹는다.
+    ///
+    /// 이 검체가 지키는 것은 네 불가침 계약이다(⑤ `inject_claude_code_git_bash_path_for` 동형):
+    /// ①사용자 값 불가침 ②이미 쌓인 쌍 불가침 ③좌표 부재 시 fail-open ④마스터 스위치 복귀.
+    /// 각 항마다 **음성 대조**를 함께 둔다 — 양성만 보면 "무조건 얹는" 구현도 초록이 된다.
+    #[test]
+    fn npm_config_prefix_injects_only_when_absent() {
+        let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
+        let home = PathBuf::from("/Users/user");
+        let lad = PathBuf::from(r"C:\Users\x\AppData\Local");
+
+        // ── 기본값 산출(순수) ────────────────────────────────────────────────
+        assert_eq!(
+            npm_config_prefix_default_for("macos", Some(&home), None),
+            Some(PathBuf::from("/Users/user/.local")),
+            "unix 기본값은 $HOME/.local"
+        );
+        assert_eq!(
+            npm_config_prefix_default_for("linux", Some(&home), None),
+            Some(PathBuf::from("/Users/user/.local"))
+        );
+        let win = npm_config_prefix_default_for("windows", Some(&home), Some(&lad))
+            .expect("windows 기본값 부재");
+        assert!(
+            win.to_string_lossy().ends_with(NPM_PREFIX_WIN_SUBDIR),
+            "windows 기본값은 %LOCALAPPDATA%\\cys-npm: {win:?}"
+        );
+        // ③ 좌표 부재 → None(fail-open). windows 는 home 이 있어도 LOCALAPPDATA 가 없으면 없다.
+        assert_eq!(npm_config_prefix_default_for("windows", Some(&home), None), None);
+        assert_eq!(npm_config_prefix_default_for("macos", None, Some(&lad)), None);
+        assert_eq!(
+            npm_config_prefix_default_for("macos", Some(Path::new("")), None),
+            None,
+            "빈 HOME 은 좌표가 아니다"
+        );
+
+        // ── 판정(순수) ───────────────────────────────────────────────────────
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, None),
+            NpmPrefixVerdict::Inject(PathBuf::from("/Users/user/.local")),
+            "키 부재 → 주입"
+        );
+        // ① 사용자 값 불가침 — 설치본 밖이면 무접촉.
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, Some("/opt/mynpm")),
+            NpmPrefixVerdict::KeepUser
+        );
+        // 공백뿐인 값은 '값 없음'이다(npm 도 그렇게 읽는다) → 주입 대상.
+        assert!(matches!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, Some("   ")),
+            NpmPrefixVerdict::Inject(_)
+        ));
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, None, None, None),
+            NpmPrefixVerdict::NoDefault
+        );
+
+        // ── 주입 코어(순수) ─────────────────────────────────────────────────
+        let inject = NpmPrefixVerdict::Inject(PathBuf::from("/Users/user/.local"));
+        let mut env: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut env, &inject, false);
+        assert_eq!(
+            env.iter().find(|(k, _)| k == ENV_NPM_CONFIG_PREFIX).map(|(_, v)| v.as_str()),
+            Some("/Users/user/.local")
+        );
+        // ④ 마스터 스위치 — CYS_BOOT_GATES=0 이면 이 축은 통째로 종전(무주입)이다.
+        let mut off: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut off, &inject, true);
+        assert!(off.is_empty(), "master_off 인데 쌍이 나갔다: {off:?}");
+        // ② 이미 쌓인 쌍 불가침(later-wins 뒤집기·중복 금지).
+        let mut pre = vec![(ENV_NPM_CONFIG_PREFIX.to_string(), "/keep/me".to_string())];
+        inject_npm_config_prefix_for(&mut pre, &inject, false);
+        assert_eq!(pre.len(), 1, "중복 쌍이 생겼다: {pre:?}");
+        assert_eq!(pre[0].1, "/keep/me", "선행 쌍을 덮었다");
+        // ①③ 주입 판정이 아닌 모든 값은 쌍을 만들지 않는다.
+        for v in [
+            NpmPrefixVerdict::KeepUser,
+            NpmPrefixVerdict::NoDefault,
+            NpmPrefixVerdict::WarnBundlePolluted {
+                user_value: "/x".into(),
+                scope_root: PathBuf::from("/x"),
+            },
+        ] {
+            let mut e: Vec<(String, String)> = Vec::new();
+            inject_npm_config_prefix_for(&mut e, &v, false);
+            assert!(e.is_empty(), "{v:?} 인데 쌍이 나갔다");
+        }
+
+        // ── ★생산 배선 핀: `spawn_env_pairs` 가 실제로 ⑥을 부르는가 ─────────────
+        //   순수 코어 검체만으로는 호출부가 사라져도 초록이다. 그렇다고 프로세스 env 를
+        //   set_var 로 흔들면(테스트 병렬 실행) 다른 검체를 오염시킨다 — 그래서 **같은
+        //   판정자**를 이 자리에서 한 번 더 불러 결과와 쌍의 유무를 대조한다. 호출부를
+        //   지우면 Inject 분기에서 즉시 붉어진다.
+        let pairs = spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None);
+        let got = pairs
+            .iter()
+            .find(|(k, _)| k == ENV_NPM_CONFIG_PREFIX)
+            .map(|(_, v)| v.clone());
+        let master_off = boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref());
+        match npm_config_prefix_verdict_from_process(exe_dir) {
+            NpmPrefixVerdict::Inject(p) if !master_off => assert_eq!(
+                got.as_deref(),
+                Some(p.to_string_lossy().as_ref()),
+                "⑥ 배선 소실 — spawn_env_pairs 가 npm_config_prefix 를 얹지 않았다"
+            ),
+            _ => assert_eq!(got, None, "주입 판정이 아닌데 쌍이 나갔다"),
+        }
+    }
+
+    /// ★H-NPM-2(B7 · 시뮬 **T2-4** — 명세 §2-10 을 뒤집은 반영분): 사용자 값이 설치본
+    /// **안**을 가리켜도 **덮지 않는다**. 경고만 한다.
+    ///
+    /// 왜 이 음성 대조가 검체의 본체인가: v2 명세 초안은 "기본값으로 **덮고** 고지"였다.
+    /// 그 구현도 "번들 오염을 막는다"는 목적에는 초록으로 보인다 — 그래서 `Inject` 가
+    /// 아님을 **명시적으로** 잠그지 않으면 설계 회귀가 조용히 통과한다.
+    #[test]
+    fn npm_prefix_inside_bundle_warns_but_never_overwrites() {
+        // mac: exe_dir = <root>/Contents/MacOS → 스코프는 번들 루트(.app)다.
+        let exe_dir = Path::new("/Applications/cys.app/Contents/MacOS");
+        assert_eq!(
+            install_scope_root_for(exe_dir, "macos"),
+            PathBuf::from("/Applications/cys.app"),
+            "mac 스코프는 exe_dir 이 아니라 .app 루트다(app_bundle::enclosing_bundle SOT 재사용)"
+        );
+        // 번들 레이아웃이 아니면 exe_dir 자신(개발 빌드·Windows 설치본).
+        assert_eq!(
+            install_scope_root_for(Path::new("/opt/cys"), "macos"),
+            PathBuf::from("/opt/cys")
+        );
+        assert_eq!(
+            install_scope_root_for(exe_dir, "windows"),
+            PathBuf::from("/Applications/cys.app/Contents/MacOS"),
+            "windows 는 exe_dir 이 곧 설치 디렉터리다"
+        );
+
+        // ── 오염 판정 + **무접촉** ───────────────────────────────────────────
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let v = npm_config_prefix_verdict_for(
+            "macos",
+            exe_dir,
+            Some(Path::new("/Users/user")),
+            None,
+            Some(polluted),
+        );
+        match &v {
+            NpmPrefixVerdict::WarnBundlePolluted { user_value, scope_root } => {
+                assert_eq!(user_value, polluted);
+                assert_eq!(scope_root, &PathBuf::from("/Applications/cys.app"));
+            }
+            other => panic!("번들 내부 값인데 판정이 {other:?} 다"),
+        }
+        // ★T2-4 의 심장: 덮지 않는다. `Inject` 가 아니고 쌍도 나가지 않는다.
+        assert!(!matches!(v, NpmPrefixVerdict::Inject(_)), "사용자 값을 덮었다(T2-4 위반)");
+        let mut env: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut env, &v, false);
+        assert!(env.is_empty(), "번들 오염 경고 경로에서 쌍이 나갔다: {env:?}");
+
+        // ── 경고 문안은 사실을 담는다(pane·preflight 공용 SOT) ────────────────
+        let msg = npm_prefix_bundle_warning(polluted, Path::new("/Applications/cys.app"));
+        for needle in [polluted, "/Applications/cys.app", "npm_config_prefix"] {
+            assert!(msg.contains(needle), "경고 문안에 {needle} 이 없다: {msg}");
+        }
+
+        // ── 음성 대조 ①: 번들 **밖**은 오염이 아니다(과잉 경고 차단). ─────────
+        assert_eq!(
+            npm_config_prefix_verdict_for(
+                "macos",
+                exe_dir,
+                Some(Path::new("/Users/user")),
+                None,
+                Some("/Users/user/.local")
+            ),
+            NpmPrefixVerdict::KeepUser
+        );
+        // ── 음성 대조 ②: 컴포넌트 경계 — `/a/bc` 는 `/a/b` 아래가 아니다.
+        //    문자열 접두 비교였다면 여기서 거짓 양성이 났다.
+        assert!(!path_is_within(Path::new("/Applications/cys.app-old/x"), Path::new("/Applications/cys.app")));
+        assert!(path_is_within(Path::new("/Applications/cys.app"), Path::new("/Applications/cys.app")));
+        // ── 음성 대조 ③: 빈 루트는 "모든 경로가 그 아래" 가 아니다(스코프 소실 시 전면 경고 차단).
+        assert!(!path_is_within(Path::new("/anything"), Path::new("")));
     }
 
     #[test]
