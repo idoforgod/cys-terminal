@@ -7,7 +7,15 @@ name: windows-build (feasibility)
 
 on:
   push:
-    branches: ['feat/windows-x64-dist']
+    # ★fix/** 편입(2026-09-04 · master 판정 — ci-branch.yml 의 D4 편입과 같은 논리).
+    #   Windows 는 설치·봉인·무중단 재설치의 **유일한 실기 검증처**인데, 트리거가
+    #   feat/windows-x64-dist 하나뿐이라 수리 레인(fix/0.14.30-*)의 Windows 변경이
+    #   **어느 레인에서도 돌지 않았다** — 태그 레인에 가서야 드러난다는 뜻이고, 그때는
+    #   되돌리는 비용이 가장 비싸다. IG-4 가 요구하는 'Windows CI green 증적'도 이 트리거
+    #   없이는 workflow_dispatch 수단이 있어야만 얻을 수 있었다(실측: gh 미설치 환경에서 불가).
+    #   대가는 fix/** 푸시마다 ~20분 레인이 도는 것이며, master 가 품질 우선으로 수용했다.
+    #   태그·발행 트리거는 여전히 없다 — 이 파일은 어떤 릴리스도 만들지 않는다.
+    branches: ['feat/windows-x64-dist', 'fix/**']
   workflow_dispatch:
 
 permissions:
